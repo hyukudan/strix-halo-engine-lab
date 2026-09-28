@@ -1,0 +1,115 @@
+{
+  "match": "k_attn_fa2",
+  "functions": 26,
+  "instructions": 222647,
+  "groups": {
+    "matrix": 832,
+    "global_load": 4402,
+    "global_store": 3328,
+    "lds_read": 2904,
+    "lds_write": 882,
+    "valu_fp_fma_mul_add": 40565,
+    "valu_integer_address": 23356,
+    "valu_convert": 3830,
+    "valu_packed_dot": 0,
+    "vopd_dual_issue": 6021,
+    "cross_lane": 0,
+    "wait": 5710,
+    "barrier": 80,
+    "branch": 8492
+  },
+  "top_opcodes": [
+    [
+      "s_delay_alu",
+      44133
+    ],
+    [
+      "v_fma_f32",
+      14438
+    ],
+    [
+      "s_or_b32",
+      9125
+    ],
+    [
+      "v_mul_f32_e32",
+      8326
+    ],
+    [
+      "s_and_saveexec_b32",
+      7544
+    ],
+    [
+      "v_fmac_f32_e32",
+      7473
+    ],
+    [
+      "v_add_f32_e32",
+      7346
+    ],
+    [
+      "v_div_scale_f32",
+      7072
+    ],
+    [
+      "v_mad_i64_i32",
+      6708
+    ],
+    [
+      "v_mov_b32_e32",
+      6479
+    ],
+    [
+      "s_waitcnt",
+      5702
+    ],
+    [
+      "v_cndmask_b32_e32",
+      5648
+    ],
+    [
+      "s_cbranch_execz",
+      4762
+    ],
+    [
+      "v_add3_u32",
+      4049
+    ],
+    [
+      "v_exp_f32_e32",
+      3962
+    ],
+    [
+      "v_ldexp_f32",
+      3962
+    ],
+    [
+      "v_sub_f32_e32",
+      3910
+    ],
+    [
+      "v_rndne_f32_e32",
+      3830
+    ],
+    [
+      "v_cmp_nlt_f32_e32",
+      3830
+    ],
+    [
+      "v_cvt_i32_f32_e32",
+      3830
+    ]
+  ],
+  "largest_function_instruction_counts": [
+    8831,
+    8831,
+    8829,
+    8829,
+    8799,
+    8793,
+    8791,
+    8781,
+    8559,
+    8543
+  ]
+}

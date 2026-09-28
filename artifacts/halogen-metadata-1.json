@@ -1,0 +1,121 @@
+{
+  "kernel_count": 172,
+  "wavefront_counts": {
+    "32": 172
+  },
+  "max_vgpr": 256,
+  "max_sgpr": 100,
+  "max_lds_bytes": 61952,
+  "kernels_with_spills": 8,
+  "top_families": [
+    [
+      "k_dnc",
+      172
+    ]
+  ],
+  "largest_lds": [
+    {
+      "family": "k_dnc",
+      "group_segment_fixed_size": 61952,
+      "private_segment_fixed_size": 0,
+      "sgpr_count": 64,
+      "sgpr_spill_count": 0,
+      "vgpr_count": 254,
+      "vgpr_spill_count": 0,
+      "wavefront_size": 32,
+      "max_flat_workgroup_size": 128
+    },
+    {
+      "family": "k_dnc",
+      "group_segment_fixed_size": 61952,
+      "private_segment_fixed_size": 0,
+      "sgpr_count": 73,
+      "sgpr_spill_count": 0,
+      "vgpr_count": 224,
+      "vgpr_spill_count": 0,
+      "wavefront_size": 32,
+      "max_flat_workgroup_size": 128
+    },
+    {
+      "family": "k_dnc",
+      "group_segment_fixed_size": 61952,
+      "private_segment_fixed_size": 0,
+      "sgpr_count": 73,
+      "sgpr_spill_count": 0,
+      "vgpr_count": 224,
+      "vgpr_spill_count": 0,
+      "wavefront_size": 32,
+      "max_flat_workgroup_size": 128
+    }
+  ],
+  "largest_vgpr": [
+    {
+      "family": "k_dnc",
+      "group_segment_fixed_size": 61952,
+      "private_segment_fixed_size": 20,
+      "sgpr_count": 100,
+      "sgpr_spill_count": 0,
+      "vgpr_count": 256,
+      "vgpr_spill_count": 4,
+      "wavefront_size": 32,
+      "max_flat_workgroup_size": 128
+    },
+    {
+      "family": "k_dnc",
+      "group_segment_fixed_size": 61952,
+      "private_segment_fixed_size": 132,
+      "sgpr_count": 54,
+      "sgpr_spill_count": 0,
+      "vgpr_count": 256,
+      "vgpr_spill_count": 46,
+      "wavefront_size": 32,
+      "max_flat_workgroup_size": 128
+    },
+    {
+      "family": "k_dnc",
+      "group_segment_fixed_size": 61952,
+      "private_segment_fixed_size": 28,
+      "sgpr_count": 58,
+      "sgpr_spill_count": 0,
+      "vgpr_count": 256,
+      "vgpr_spill_count": 6,
+      "wavefront_size": 32,
+      "max_flat_workgroup_size": 128
+    }
+  ],
+  "spilling": [
+    {
+      "family": "k_dnc",
+      "group_segment_fixed_size": 61952,
+      "private_segment_fixed_size": 20,
+      "sgpr_count": 100,
+      "sgpr_spill_count": 0,
+      "vgpr_count": 256,
+      "vgpr_spill_count": 4,
+      "wavefront_size": 32,
+      "max_flat_workgroup_size": 128
+    },
+    {
+      "family": "k_dnc",
+      "group_segment_fixed_size": 61952,
+      "private_segment_fixed_size": 132,
+      "sgpr_count": 54,
+      "sgpr_spill_count": 0,
+      "vgpr_count": 256,
+      "vgpr_spill_count": 46,
+      "wavefront_size": 32,
+      "max_flat_workgroup_size": 128
+    },
+    {
+      "family": "k_dnc",
+      "group_segment_fixed_size": 61952,
+      "private_segment_fixed_size": 28,
+      "sgpr_count": 58,
+      "sgpr_spill_count": 0,
+      "vgpr_count": 256,
+      "vgpr_spill_count": 6,
+      "wavefront_size": 32,
+      "max_flat_workgroup_size": 128
+    }
+  ]
+}

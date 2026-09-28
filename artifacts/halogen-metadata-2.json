@@ -1,0 +1,129 @@
+{
+  "kernel_count": 62,
+  "wavefront_counts": {
+    "32": 62
+  },
+  "max_vgpr": 256,
+  "max_sgpr": 86,
+  "max_lds_bytes": 64340,
+  "kernels_with_spills": 8,
+  "top_families": [
+    [
+      "k_attn",
+      59
+    ],
+    [
+      "k_ix",
+      2
+    ],
+    [
+      "other",
+      1
+    ]
+  ],
+  "largest_lds": [
+    {
+      "family": "k_attn",
+      "group_segment_fixed_size": 64340,
+      "private_segment_fixed_size": 232,
+      "sgpr_count": 28,
+      "sgpr_spill_count": 0,
+      "vgpr_count": 256,
+      "vgpr_spill_count": 57,
+      "wavefront_size": 32,
+      "max_flat_workgroup_size": 128
+    },
+    {
+      "family": "k_attn",
+      "group_segment_fixed_size": 64340,
+      "private_segment_fixed_size": 200,
+      "sgpr_count": 25,
+      "sgpr_spill_count": 0,
+      "vgpr_count": 256,
+      "vgpr_spill_count": 49,
+      "wavefront_size": 32,
+      "max_flat_workgroup_size": 128
+    },
+    {
+      "family": "k_attn",
+      "group_segment_fixed_size": 64340,
+      "private_segment_fixed_size": 0,
+      "sgpr_count": 26,
+      "sgpr_spill_count": 0,
+      "vgpr_count": 215,
+      "vgpr_spill_count": 0,
+      "wavefront_size": 32,
+      "max_flat_workgroup_size": 128
+    }
+  ],
+  "largest_vgpr": [
+    {
+      "family": "k_attn",
+      "group_segment_fixed_size": 9920,
+      "private_segment_fixed_size": 204,
+      "sgpr_count": 37,
+      "sgpr_spill_count": 0,
+      "vgpr_count": 256,
+      "vgpr_spill_count": 50,
+      "wavefront_size": 32,
+      "max_flat_workgroup_size": 32
+    },
+    {
+      "family": "k_attn",
+      "group_segment_fixed_size": 34880,
+      "private_segment_fixed_size": 324,
+      "sgpr_count": 24,
+      "sgpr_spill_count": 0,
+      "vgpr_count": 256,
+      "vgpr_spill_count": 80,
+      "wavefront_size": 32,
+      "max_flat_workgroup_size": 128
+    },
+    {
+      "family": "k_attn",
+      "group_segment_fixed_size": 64340,
+      "private_segment_fixed_size": 232,
+      "sgpr_count": 28,
+      "sgpr_spill_count": 0,
+      "vgpr_count": 256,
+      "vgpr_spill_count": 57,
+      "wavefront_size": 32,
+      "max_flat_workgroup_size": 128
+    }
+  ],
+  "spilling": [
+    {
+      "family": "k_attn",
+      "group_segment_fixed_size": 9920,
+      "private_segment_fixed_size": 204,
+      "sgpr_count": 37,
+      "sgpr_spill_count": 0,
+      "vgpr_count": 256,
+      "vgpr_spill_count": 50,
+      "wavefront_size": 32,
+      "max_flat_workgroup_size": 32
+    },
+    {
+      "family": "k_attn",
+      "group_segment_fixed_size": 34880,
+      "private_segment_fixed_size": 324,
+      "sgpr_count": 24,
+      "sgpr_spill_count": 0,
+      "vgpr_count": 256,
+      "vgpr_spill_count": 80,
+      "wavefront_size": 32,
+      "max_flat_workgroup_size": 128
+    },
+    {
+      "family": "k_attn",
+      "group_segment_fixed_size": 64340,
+      "private_segment_fixed_size": 232,
+      "sgpr_count": 28,
+      "sgpr_spill_count": 0,
+      "vgpr_count": 256,
+      "vgpr_spill_count": 57,
+      "wavefront_size": 32,
+      "max_flat_workgroup_size": 128
+    }
+  ]
+}
