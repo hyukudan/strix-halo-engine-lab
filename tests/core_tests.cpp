@@ -1,10 +1,15 @@
+#include "strix/gguf_reader.hpp"
 #include "strix/memory_plan.hpp"
 #include "strix/oracles.hpp"
 
 #include <cmath>
 #include <iostream>
 #include <limits>
+#include <sstream>
 #include <stdexcept>
+#include <string>
+#include <type_traits>
+#include <vector>
 
 namespace {
 
@@ -24,6 +29,79 @@ void expect_overflow(Function&& function, const char* message) {
         expect(false, message);
     } catch (const std::overflow_error&) {
     }
+}
+
+template <typename Function>
+void expect_runtime_error(Function&& function, const char* message) {
+    try {
+        function();
+        expect(false, message);
+    } catch (const std::runtime_error&) {
+    }
+}
+
+template <typename T>
+void append_le(std::string& bytes, T value) {
+    static_assert(std::is_unsigned_v<T>);
+    for (std::size_t index = 0; index < sizeof(T); ++index) {
+        bytes.push_back(static_cast<char>((value >> (index * 8U)) & 0xffU));
+    }
+}
+
+void append_string(std::string& bytes, const std::string& value) {
+    append_le<std::uint64_t>(bytes, value.size());
+    bytes.append(value);
+}
+
+std::string valid_gguf(std::uint64_t tensor_offset = 0,
+                       std::uint32_t tensor_type = 1) {
+    std::string bytes = "GGUF";
+    append_le<std::uint32_t>(bytes, 3);
+    append_le<std::uint64_t>(bytes, 1);
+    append_le<std::uint64_t>(bytes, 2);
+
+    append_string(bytes, "general.architecture");
+    append_le<std::uint32_t>(bytes, 8);
+    append_string(bytes, "qwen4exp");
+    append_string(bytes, "general.alignment");
+    append_le<std::uint32_t>(bytes, 4);
+    append_le<std::uint32_t>(bytes, 32);
+
+    append_string(bytes, "blk.0.weight");
+    append_le<std::uint32_t>(bytes, 2);
+    append_le<std::uint64_t>(bytes, 16);
+    append_le<std::uint64_t>(bytes, 32);
+    append_le<std::uint32_t>(bytes, tensor_type);
+    append_le<std::uint64_t>(bytes, tensor_offset);
+    while (bytes.size() % 32 != 0) {
+        bytes.push_back('\0');
+    }
+    bytes.append(1024, '\0');
+    return bytes;
+}
+
+std::string array_gguf() {
+    std::string bytes = "GGUF";
+    append_le<std::uint32_t>(bytes, 3);
+    append_le<std::uint64_t>(bytes, 0);
+    append_le<std::uint64_t>(bytes, 1);
+    append_string(bytes, "test.values");
+    append_le<std::uint32_t>(bytes, 9);
+    append_le<std::uint32_t>(bytes, 4);
+    append_le<std::uint64_t>(bytes, 3);
+    append_le<std::uint32_t>(bytes, 10);
+    append_le<std::uint32_t>(bytes, 20);
+    append_le<std::uint32_t>(bytes, 30);
+    while (bytes.size() % 32 != 0) {
+        bytes.push_back('\0');
+    }
+    return bytes;
+}
+
+strix::gguf::FileInfo parse_gguf(const std::string& bytes,
+                                 const strix::gguf::Limits& limits = {}) {
+    std::istringstream input(bytes, std::ios::in | std::ios::binary);
+    return strix::gguf::read(input, bytes.size(), limits);
 }
 
 }  // namespace
@@ -89,6 +167,68 @@ int main() {
         expect(false, "candidate top-k rejects NaN");
     } catch (const std::invalid_argument&) {
     }
+
+    const auto gguf_bytes = valid_gguf();
+    const auto gguf = parse_gguf(gguf_bytes);
+    expect(gguf.version == 3, "GGUF v3 fixture parses");
+    expect(gguf.alignment == 32, "GGUF alignment metadata is applied");
+    expect(gguf.metadata.size() == 2, "GGUF metadata count is preserved");
+    expect(gguf.tensors.size() == 1, "GGUF tensor directory parses");
+    expect(gguf.tensors[0].absolute_offset == gguf.data_offset,
+           "GGUF relative tensor offset resolves from data section");
+    const auto* architecture = gguf.find_metadata("general.architecture");
+    expect(architecture != nullptr && architecture->string_value == "qwen4exp",
+           "GGUF architecture metadata is available");
+
+    expect_runtime_error(
+        [] {
+            auto bytes = valid_gguf();
+            bytes[0] = 'B';
+            static_cast<void>(parse_gguf(bytes));
+        },
+        "GGUF rejects invalid magic");
+    expect_runtime_error(
+        [] { static_cast<void>(parse_gguf(valid_gguf(1))); },
+        "GGUF rejects unaligned tensor offsets");
+    expect_runtime_error(
+        [] { static_cast<void>(parse_gguf(valid_gguf(0, 31))); },
+        "GGUF rejects removed tensor types");
+    expect_runtime_error(
+        [] {
+            auto bytes = valid_gguf();
+            strix::gguf::Limits limits;
+            limits.max_string_bytes = 4;
+            static_cast<void>(parse_gguf(bytes, limits));
+        },
+        "GGUF enforces string limits before allocation");
+
+    expect_runtime_error(
+        [] {
+            std::string bytes = "GGUF";
+            append_le<std::uint32_t>(bytes, 3);
+            append_le<std::uint64_t>(bytes, 0);
+            append_le<std::uint64_t>(bytes, 1);
+            append_string(bytes, "test.flag");
+            append_le<std::uint32_t>(bytes, 7);
+            append_le<std::uint8_t>(bytes, 2);
+            while (bytes.size() % 32 != 0) {
+                bytes.push_back('\0');
+            }
+            static_cast<void>(parse_gguf(bytes));
+        },
+        "GGUF rejects non-canonical booleans");
+
+    const auto array_info = parse_gguf(array_gguf());
+    expect(array_info.metadata[0].array_element_type == strix::gguf::ValueType::uint32 &&
+               array_info.metadata[0].array_length == 3,
+           "GGUF array summary parses without retaining its payload");
+    expect_runtime_error(
+        [] {
+            strix::gguf::Limits limits;
+            limits.max_total_array_elements = 2;
+            static_cast<void>(parse_gguf(array_gguf(), limits));
+        },
+        "GGUF enforces aggregate array element limit");
 
     if (failures == 0) {
         std::cout << "all core tests passed\n";

@@ -20,6 +20,7 @@ automáticamente en fuente canónica de nuestro motor.
 | Hyper-connections/output gate | Config oficial (`hc_count=4`, `hc_lowrank=320`, sigmoid) y paper/código Qwen | Qwen Community License 1.0 | mezcla residual, scratch y orden numérico pendientes | **P0 abierto** |
 | mRoPE parcial/interleaved | Config oficial fijado (`partial_rotary_factor=0.25`) y código Qwen | Qwen Community License 1.0 | posiciones multimodales y oráculo texto pendientes | Abierto |
 | Ideas de optimización Strix Halo | `pwilkin/strix-halo@f73872fe20dfdef460653f18e2fe63e5366ae958`; ramas fijadas en `PWILKIN_REVIEW.md` | Sitio/instalador MIT; dependencias separadas | Solo hipótesis y protocolo, sin importar implementación | Referencia secundaria |
+| Estructura GGUF v3 | `ggml-org/ggml@353b63b439f27ab2cc19dac97ab1681ba6d2d084`, `docs/gguf.md` | MIT del proyecto; especificación pública | Fixtures propios de parseo, límites y offsets | Fuente primaria fijada para A0.2 |
 
 ## Regla de aprobación
 

@@ -15,6 +15,7 @@ contiene código derivado de Halogen ni modifica GUFO.
 - [`PWILKIN_REVIEW.md`](PWILKIN_REVIEW.md): ideas, resultados negativos y protocolo extraídos de pwilkin.
 - [`MEMORY_BUDGET.md`](MEMORY_BUDGET.md): política propuesta de UMA/GTT y guardas de admisión.
 - [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md): código disponible, reproducción y bloqueos.
+- [`GGUF_READER.md`](GGUF_READER.md): contrato, defensas y límites del lector GGUF propio.
 - [`tools/`](tools): analizadores que conservan solo metadatos y recuentos agregados.
 
 ## Referencias locales

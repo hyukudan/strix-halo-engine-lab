@@ -36,3 +36,17 @@ El indexer es una estimación provisional derivada del config. Se puede excluir
 con `--no-indexer`. `--rollback-full` permite cuantificar por qué copiar el
 estado GDN completo por borrador no escala; el camino objetivo será snapshot
 mínimo más recompute si el contrato lo permite.
+
+## Slice A0.2 — inspección GGUF
+
+Implementado en `include/strix/gguf_reader.hpp` y `src/gguf_reader.cpp`: lector
+GGUF v3 little-endian defensivo y CLI `strix-inspect-gguf`. Valida metadata,
+arrays, directorio tensorial, alineación y offsets sin tocar los datos de pesos.
+Las limitaciones y la revisión canónica se documentan en `GGUF_READER.md`.
+
+Validación actual:
+
+- build `RelWithDebInfo` con `-Werror`;
+- fixtures válidos y corruptos en CTest;
+- build Debug con AddressSanitizer y UndefinedBehaviorSanitizer;
+- 100 % de las pruebas actuales superadas en ambos builds.
