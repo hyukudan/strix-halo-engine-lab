@@ -41,7 +41,8 @@ mínimo más recompute si el contrato lo permite.
 
 Implementado en `include/strix/gguf_reader.hpp` y `src/gguf_reader.cpp`: lector
 GGUF v3 little-endian defensivo y CLI `strix-inspect-gguf`. Valida metadata,
-arrays, directorio tensorial, alineación y offsets sin tocar los datos de pesos.
+arrays, directorio tensorial, geometría de bloques, tamaños, alineación, rangos
+y solapamientos sin cargar los datos de pesos.
 Las limitaciones y la revisión canónica se documentan en `GGUF_READER.md`.
 
 Validación actual:

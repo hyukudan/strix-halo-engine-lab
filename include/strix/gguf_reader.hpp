@@ -52,6 +52,8 @@ struct TensorInfo {
     std::uint32_t ggml_type = 0;
     std::uint64_t relative_offset = 0;
     std::uint64_t absolute_offset = 0;
+    std::uint64_t byte_size = 0;
+    std::uint64_t absolute_end = 0;
 };
 
 struct FileInfo {

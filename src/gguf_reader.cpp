@@ -1,9 +1,11 @@
 #include "strix/gguf_reader.hpp"
 
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <fstream>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <type_traits>
 #include <unordered_set>
@@ -74,7 +76,13 @@ public:
             if (tensor.absolute_offset > file_size_) {
                 fail("tensor offset exceeds file size");
             }
+            tensor.byte_size = tensor_size(tensor);
+            tensor.absolute_end = checked_add(tensor.absolute_offset, tensor.byte_size);
+            if (tensor.absolute_end > file_size_) {
+                fail("tensor data range exceeds file size");
+            }
         }
+        validate_non_overlapping(info.tensors);
         return info;
     }
 
@@ -295,6 +303,81 @@ private:
         }
     }
 
+    struct TypeGeometry {
+        std::uint64_t block_elements;
+        std::uint64_t block_bytes;
+    };
+
+    static std::optional<TypeGeometry> type_geometry(std::uint32_t type) {
+        switch (type) {
+        case 0: return TypeGeometry{1, 4};
+        case 1: return TypeGeometry{1, 2};
+        case 2: return TypeGeometry{32, 18};
+        case 3: return TypeGeometry{32, 20};
+        case 6: return TypeGeometry{32, 22};
+        case 7: return TypeGeometry{32, 24};
+        case 8: return TypeGeometry{32, 34};
+        case 9: return TypeGeometry{32, 36};
+        case 10: return TypeGeometry{256, 84};
+        case 11: return TypeGeometry{256, 110};
+        case 12: return TypeGeometry{256, 144};
+        case 13: return TypeGeometry{256, 176};
+        case 14: return TypeGeometry{256, 210};
+        case 15: return TypeGeometry{256, 292};
+        case 16: return TypeGeometry{256, 66};
+        case 17: return TypeGeometry{256, 74};
+        case 18: return TypeGeometry{256, 98};
+        case 19: return TypeGeometry{256, 50};
+        case 20: return TypeGeometry{32, 18};
+        case 21: return TypeGeometry{256, 110};
+        case 22: return TypeGeometry{256, 82};
+        case 23: return TypeGeometry{256, 136};
+        case 24: return TypeGeometry{1, 1};
+        case 25: return TypeGeometry{1, 2};
+        case 26: return TypeGeometry{1, 4};
+        case 27: return TypeGeometry{1, 8};
+        case 28: return TypeGeometry{1, 8};
+        case 29: return TypeGeometry{256, 56};
+        case 30: return TypeGeometry{1, 2};
+        case 34: return TypeGeometry{256, 54};
+        case 35: return TypeGeometry{256, 66};
+        case 39: return TypeGeometry{32, 17};
+        default: return std::nullopt;
+        }
+    }
+
+    static std::uint64_t tensor_size(const TensorInfo& tensor) {
+        const auto geometry = type_geometry(tensor.ggml_type);
+        if (!geometry.has_value()) {
+            fail("GGML tensor type has no pinned storage geometry");
+        }
+        if (tensor.dimensions[0] % geometry->block_elements != 0) {
+            fail("tensor row is not divisible by its quantization block size");
+        }
+        auto bytes = checked_mul(tensor.dimensions[0] / geometry->block_elements,
+                                 geometry->block_bytes);
+        for (std::size_t dimension = 1; dimension < tensor.dimensions.size(); ++dimension) {
+            bytes = checked_mul(bytes, tensor.dimensions[dimension]);
+        }
+        return bytes;
+    }
+
+    static void validate_non_overlapping(const std::vector<TensorInfo>& tensors) {
+        std::vector<const TensorInfo*> ordered;
+        ordered.reserve(tensors.size());
+        for (const auto& tensor : tensors) {
+            ordered.push_back(&tensor);
+        }
+        std::sort(ordered.begin(), ordered.end(), [](const auto* left, const auto* right) {
+            return left->absolute_offset < right->absolute_offset;
+        });
+        for (std::size_t index = 1; index < ordered.size(); ++index) {
+            if (ordered[index]->absolute_offset < ordered[index - 1]->absolute_end) {
+                fail("GGUF tensor data ranges overlap");
+            }
+        }
+    }
+
     static std::uint64_t align_up(std::uint64_t value, std::uint64_t alignment) {
         const auto remainder = value % alignment;
         return remainder == 0 ? value : checked_add(value, alignment - remainder);
@@ -305,6 +388,13 @@ private:
             throw std::overflow_error("GGUF offset overflow");
         }
         return left + right;
+    }
+
+    static std::uint64_t checked_mul(std::uint64_t left, std::uint64_t right) {
+        if (left != 0 && right > std::numeric_limits<std::uint64_t>::max() / left) {
+            throw std::overflow_error("GGUF tensor-size overflow");
+        }
+        return left * right;
     }
 
     static std::size_t to_size(std::uint64_t value) {

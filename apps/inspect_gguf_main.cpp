@@ -1,8 +1,8 @@
 #include "strix/gguf_reader.hpp"
 
-#include <array>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 
@@ -38,6 +38,13 @@ int main(int argc, char** argv) try {
         architecture != nullptr && architecture->string_value.has_value()
             ? *architecture->string_value
             : "";
+    std::uint64_t tensor_bytes = 0;
+    for (const auto& tensor : info.tensors) {
+        if (tensor.byte_size > std::numeric_limits<std::uint64_t>::max() - tensor_bytes) {
+            throw std::overflow_error("aggregate tensor byte count overflow");
+        }
+        tensor_bytes += tensor.byte_size;
+    }
 
     std::cout << "{\n"
               << "  \"version\": " << info.version << ",\n"
@@ -46,6 +53,7 @@ int main(int argc, char** argv) try {
               << "  \"data_offset\": " << info.data_offset << ",\n"
               << "  \"metadata_count\": " << info.metadata.size() << ",\n"
               << "  \"tensor_count\": " << info.tensors.size() << ",\n"
+              << "  \"tensor_bytes\": " << tensor_bytes << ",\n"
               << "  \"architecture\": \"" << json_escape(architecture_value) << "\"\n"
               << "}\n";
     return 0;

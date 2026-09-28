@@ -98,6 +98,28 @@ std::string array_gguf() {
     return bytes;
 }
 
+std::string two_tensor_gguf(std::uint64_t second_offset) {
+    std::string bytes = "GGUF";
+    append_le<std::uint32_t>(bytes, 3);
+    append_le<std::uint64_t>(bytes, 2);
+    append_le<std::uint64_t>(bytes, 0);
+    const auto append_tensor = [&](const std::string& name, std::uint64_t offset) {
+        append_string(bytes, name);
+        append_le<std::uint32_t>(bytes, 2);
+        append_le<std::uint64_t>(bytes, 16);
+        append_le<std::uint64_t>(bytes, 32);
+        append_le<std::uint32_t>(bytes, 1);
+        append_le<std::uint64_t>(bytes, offset);
+    };
+    append_tensor("first.weight", 0);
+    append_tensor("second.weight", second_offset);
+    while (bytes.size() % 32 != 0) {
+        bytes.push_back('\0');
+    }
+    bytes.append(2048, '\0');
+    return bytes;
+}
+
 strix::gguf::FileInfo parse_gguf(const std::string& bytes,
                                  const strix::gguf::Limits& limits = {}) {
     std::istringstream input(bytes, std::ios::in | std::ios::binary);
@@ -176,6 +198,9 @@ int main() {
     expect(gguf.tensors.size() == 1, "GGUF tensor directory parses");
     expect(gguf.tensors[0].absolute_offset == gguf.data_offset,
            "GGUF relative tensor offset resolves from data section");
+    expect(gguf.tensors[0].byte_size == 1024 &&
+               gguf.tensors[0].absolute_end == gguf_bytes.size(),
+           "GGUF F16 tensor range is computed exactly");
     const auto* architecture = gguf.find_metadata("general.architecture");
     expect(architecture != nullptr && architecture->string_value == "qwen4exp",
            "GGUF architecture metadata is available");
@@ -193,6 +218,23 @@ int main() {
     expect_runtime_error(
         [] { static_cast<void>(parse_gguf(valid_gguf(0, 31))); },
         "GGUF rejects removed tensor types");
+    expect_runtime_error(
+        [] { static_cast<void>(parse_gguf(valid_gguf(0, 2))); },
+        "GGUF rejects rows not divisible by quantization block size");
+    expect_runtime_error(
+        [] {
+            auto bytes = valid_gguf();
+            bytes.pop_back();
+            static_cast<void>(parse_gguf(bytes));
+        },
+        "GGUF rejects tensor ranges extending beyond the file");
+    const auto two_tensors = parse_gguf(two_tensor_gguf(1024));
+    expect(two_tensors.tensors[1].absolute_offset ==
+               two_tensors.tensors[0].absolute_end,
+           "GGUF permits adjacent non-overlapping tensor ranges");
+    expect_runtime_error(
+        [] { static_cast<void>(parse_gguf(two_tensor_gguf(0))); },
+        "GGUF rejects overlapping tensor data ranges");
     expect_runtime_error(
         [] {
             auto bytes = valid_gguf();
