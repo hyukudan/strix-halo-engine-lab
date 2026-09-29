@@ -3,6 +3,7 @@ cmake_minimum_required(VERSION 3.24)
 project(strix_engine_lab VERSION 0.1.0 LANGUAGES CXX)
 
 option(STRIX_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" ON)
+option(STRIX_ENABLE_HIP_RUNTIME "Build optional HIP allocation/runtime support" OFF)
 
 function(strix_target_warnings target)
     if(MSVC)
@@ -233,4 +234,27 @@ if(BUILD_TESTING)
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/oracles/test_qwen4_exp_oracle.py
         )
     endif()
+endif()
+
+
+if(STRIX_ENABLE_HIP_RUNTIME)
+    find_package(hip REQUIRED CONFIG)
+
+    add_library(strix_hip_runtime STATIC
+        src/hip_runtime_allocator.cpp
+    )
+    target_include_directories(strix_hip_runtime PUBLIC include)
+    target_compile_features(strix_hip_runtime PUBLIC cxx_std_20)
+    target_link_libraries(strix_hip_runtime PUBLIC strix_core hip::host)
+    strix_target_warnings(strix_hip_runtime)
+
+    add_executable(
+        strix-hip-runtime-allocator
+        apps/hip_runtime_allocator_main.cpp
+    )
+    target_link_libraries(
+        strix-hip-runtime-allocator
+        PRIVATE strix_hip_runtime
+    )
+    strix_target_warnings(strix-hip-runtime-allocator)
 endif()
