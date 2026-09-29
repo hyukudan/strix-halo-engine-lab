@@ -47,12 +47,15 @@ int main() {
     expect(io.injection_slots == 1 &&
                io.route_index_slots == 1 &&
                io.route_weight_slots == 1 &&
-               io.logits_slots == 1,
+               io.logits_slots == 1 &&
+               io.mlp_intermediate_slots == 1,
            "IO plan reuses one side-value slot per serial lifetime class");
 
     std::uint32_t ple_count = 0;
     std::uint32_t combine_count = 0;
     std::uint32_t lm_head_count = 0;
+    std::uint32_t shared_temp_count = 0;
+    std::uint32_t routed_temp_count = 0;
 
     for (const auto& step : io.steps) {
         if (step.op == strix::SerialOp::ple) {
@@ -65,6 +68,25 @@ int main() {
                            strix::ExecutionBufferClass::expanded_hidden &&
                        step.reads[0].buffer.slot != step.writes[0].buffer.slot,
                    "PLE ping-pongs expanded hidden state");
+        }
+
+
+        if (step.op == strix::SerialOp::shared_expert) {
+            ++shared_temp_count;
+            expect(
+                step.temporaries.size() == 1 &&
+                step.temporaries[0].buffer.buffer_class ==
+                    strix::ExecutionBufferClass::mlp_intermediate,
+                "shared expert owns one step-local MLP temporary");
+        }
+
+        if (step.op == strix::SerialOp::moe_experts) {
+            ++routed_temp_count;
+            expect(
+                step.temporaries.size() == 1 &&
+                step.temporaries[0].buffer.buffer_class ==
+                    strix::ExecutionBufferClass::mlp_intermediate,
+                "routed experts own one step-local MLP temporary");
         }
 
         if (step.op == strix::SerialOp::moe_combine) {
@@ -104,6 +126,9 @@ int main() {
            "IO plan includes one MoE combine per layer");
     expect(lm_head_count == 1,
            "IO plan includes one final LM head");
+    expect(shared_temp_count == 48 &&
+               routed_temp_count == 48,
+           "every MoE branch step receives one temporary workspace");
 
     auto invalid = io;
     invalid.steps.back().reads[0].buffer =
