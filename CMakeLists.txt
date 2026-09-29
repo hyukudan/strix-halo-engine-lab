@@ -33,6 +33,7 @@ add_library(strix_core STATIC
     src/execution_resources.cpp
     src/gguf_reader.cpp
     src/kernel_registry.cpp
+    src/mapped_model_file.cpp
     src/iq4_xs.cpp
     src/launch_dispatch.cpp
     src/memory_plan.cpp
@@ -99,6 +100,11 @@ if(BUILD_TESTING)
     target_link_libraries(strix-model-content-hash-tests PRIVATE strix_core)
     strix_target_warnings(strix-model-content-hash-tests)
     add_test(NAME strix-model-content-hash-tests COMMAND strix-model-content-hash-tests)
+
+    add_executable(strix-mapped-model-file-tests tests/mapped_model_file_tests.cpp)
+    target_link_libraries(strix-mapped-model-file-tests PRIVATE strix_core)
+    strix_target_warnings(strix-mapped-model-file-tests)
+    add_test(NAME strix-mapped-model-file-tests COMMAND strix-mapped-model-file-tests)
 
     add_executable(strix-model-tensor-index-tests tests/model_tensor_index_tests.cpp)
     target_link_libraries(strix-model-tensor-index-tests PRIVATE strix_core)
