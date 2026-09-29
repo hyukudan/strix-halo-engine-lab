@@ -16,7 +16,7 @@
 namespace {
 
 constexpr unsigned kThreads = 256;
-constexpr unsigned kMaximumTopK = 8;
+constexpr unsigned kMaximumTopK = 16;
 
 void check(hipError_t error, const char* operation) {
     if (error != hipSuccess) {
@@ -543,6 +543,205 @@ void run_fixture(std::uint32_t rows) {
 }
 
 
+
+struct FunctionStats {
+    int max_threads_per_block = 0;
+    int num_registers = 0;
+    std::size_t static_shared_bytes = 0;
+    std::size_t local_bytes = 0;
+};
+
+FunctionStats function_stats(const void* function) {
+    hipFuncAttributes attributes{};
+    check(hipFuncGetAttributes(&attributes, function),
+          "hipFuncGetAttributes");
+    return FunctionStats{
+        attributes.maxThreadsPerBlock,
+        attributes.numRegs,
+        attributes.sharedSizeBytes,
+        attributes.localSizeBytes,
+    };
+}
+
+template <typename Launch>
+double benchmark_kernel_us(Launch&& launch,
+                           unsigned warmup = 20,
+                           unsigned iterations = 200) {
+    for (unsigned iteration = 0; iteration < warmup; ++iteration) {
+        launch();
+    }
+    check(hipGetLastError(), "benchmark warmup launch");
+    check(hipDeviceSynchronize(), "benchmark warmup sync");
+
+    hipEvent_t start{};
+    hipEvent_t stop{};
+    check(hipEventCreate(&start), "hipEventCreate start");
+    check(hipEventCreate(&stop), "hipEventCreate stop");
+
+    check(hipEventRecord(start), "hipEventRecord start");
+    for (unsigned iteration = 0; iteration < iterations; ++iteration) {
+        launch();
+    }
+    check(hipGetLastError(), "benchmark measured launch");
+    check(hipEventRecord(stop), "hipEventRecord stop");
+    check(hipEventSynchronize(stop), "hipEventSynchronize stop");
+
+    float milliseconds = 0.0F;
+    check(hipEventElapsedTime(&milliseconds, start, stop),
+          "hipEventElapsedTime");
+    check(hipEventDestroy(start), "hipEventDestroy start");
+    check(hipEventDestroy(stop), "hipEventDestroy stop");
+
+    return static_cast<double>(milliseconds) * 1000.0 /
+           static_cast<double>(iterations);
+}
+
+struct BenchmarkResults {
+    double rms_norm_us = 0.0;
+    double residual_add_us = 0.0;
+    double partial_rope_us = 0.0;
+    double argmax_us = 0.0;
+    double top_k_us = 0.0;
+};
+
+BenchmarkResults run_benchmarks() {
+    constexpr std::uint32_t hidden_size = 2560;
+    constexpr std::uint32_t attention_heads = 24;
+    constexpr std::uint32_t head_dim = 256;
+    constexpr std::uint32_t rotary_dim = 64;
+    constexpr std::uint32_t vocab_size = 248320;
+    constexpr std::uint32_t experts = 512;
+    constexpr std::uint32_t expert_top_k = 10;
+
+    std::vector<float> hidden(hidden_size, 0.25F);
+    std::vector<float> residual(hidden_size, 0.125F);
+    std::vector<float> weight(hidden_size, 0.0F);
+    std::vector<float> heads(
+        static_cast<std::size_t>(attention_heads) * head_dim,
+        0.2F);
+    std::vector<float> cosine(rotary_dim, 1.0F);
+    std::vector<float> sine(rotary_dim, 0.0F);
+    std::vector<float> logits(vocab_size);
+    std::vector<float> router(experts);
+
+    for (std::uint32_t index = 0; index < vocab_size; ++index) {
+        logits[index] =
+            static_cast<float>((index * 17U) % 1009U) / 1009.0F;
+    }
+    for (std::uint32_t index = 0; index < experts; ++index) {
+        router[index] =
+            static_cast<float>((index * 29U) % 521U) / 521.0F;
+    }
+
+    DeviceBuffer<float> d_hidden(hidden.size());
+    DeviceBuffer<float> d_residual(residual.size());
+    DeviceBuffer<float> d_weight(weight.size());
+    DeviceBuffer<float> d_heads(heads.size());
+    DeviceBuffer<float> d_cosine(cosine.size());
+    DeviceBuffer<float> d_sine(sine.size());
+    DeviceBuffer<float> d_hidden_output(hidden.size());
+    DeviceBuffer<float> d_heads_output(heads.size());
+    DeviceBuffer<float> d_logits(logits.size());
+    DeviceBuffer<float> d_router(router.size());
+    DeviceBuffer<std::uint32_t> d_argmax(1);
+    DeviceBuffer<std::uint32_t> d_top_k(expert_top_k);
+
+    copy_to_device(d_hidden, hidden);
+    copy_to_device(d_residual, residual);
+    copy_to_device(d_weight, weight);
+    copy_to_device(d_heads, heads);
+    copy_to_device(d_cosine, cosine);
+    copy_to_device(d_sine, sine);
+    copy_to_device(d_logits, logits);
+    copy_to_device(d_router, router);
+
+    BenchmarkResults results;
+
+    results.rms_norm_us = benchmark_kernel_us([&] {
+        hipLaunchKernelGGL(
+            rms_norm_kernel,
+            dim3(1),
+            dim3(kThreads),
+            kThreads * sizeof(float),
+            0,
+            d_hidden.pointer,
+            d_weight.pointer,
+            d_hidden_output.pointer,
+            1,
+            hidden_size,
+            1e-6F);
+    });
+
+    results.residual_add_us = benchmark_kernel_us([&] {
+        hipLaunchKernelGGL(
+            residual_add_kernel,
+            dim3((hidden_size + kThreads - 1U) / kThreads),
+            dim3(kThreads),
+            0,
+            0,
+            d_hidden.pointer,
+            d_residual.pointer,
+            d_hidden_output.pointer,
+            static_cast<std::uint64_t>(hidden_size));
+    });
+
+    results.partial_rope_us = benchmark_kernel_us([&] {
+        hipLaunchKernelGGL(
+            partial_rope_kernel,
+            dim3(attention_heads),
+            dim3(kThreads),
+            0,
+            0,
+            d_heads.pointer,
+            d_cosine.pointer,
+            d_sine.pointer,
+            d_heads_output.pointer,
+            attention_heads,
+            head_dim,
+            rotary_dim);
+    });
+
+    results.argmax_us = benchmark_kernel_us([&] {
+        hipLaunchKernelGGL(
+            argmax_kernel,
+            dim3(1),
+            dim3(kThreads),
+            kThreads * sizeof(Candidate),
+            0,
+            d_logits.pointer,
+            d_argmax.pointer,
+            1,
+            vocab_size);
+    });
+
+    results.top_k_us = benchmark_kernel_us([&] {
+        hipLaunchKernelGGL(
+            top_k_kernel,
+            dim3(1),
+            dim3(kThreads),
+            kThreads * sizeof(Candidate),
+            0,
+            d_router.pointer,
+            d_top_k.pointer,
+            1,
+            experts,
+            expert_top_k);
+    });
+
+    return results;
+}
+
+void print_function_stats(const char* name, const FunctionStats& stats) {
+    std::cout << "    \"" << name << "\": {"
+              << "\"max_threads_per_block\":"
+              << stats.max_threads_per_block << ','
+              << "\"num_registers\":" << stats.num_registers << ','
+              << "\"static_shared_bytes\":"
+              << stats.static_shared_bytes << ','
+              << "\"local_bytes\":" << stats.local_bytes
+              << '}';
+}
+
 void run_row_invariance_fixture() {
     constexpr std::uint32_t rows = 2;
     constexpr std::uint32_t hidden_size = 16;
@@ -747,13 +946,49 @@ int main() try {
     run_fixture(2);
     run_row_invariance_fixture();
 
+    const auto benchmark_results = run_benchmarks();
+
+    const auto rms_stats = function_stats(
+        reinterpret_cast<const void*>(rms_norm_kernel));
+    const auto residual_stats = function_stats(
+        reinterpret_cast<const void*>(residual_add_kernel));
+    const auto rope_stats = function_stats(
+        reinterpret_cast<const void*>(partial_rope_kernel));
+    const auto argmax_stats = function_stats(
+        reinterpret_cast<const void*>(argmax_kernel));
+    const auto top_k_stats = function_stats(
+        reinterpret_cast<const void*>(top_k_kernel));
+
     std::cout << "{\n"
               << "  \"status\": \"pass\",\n"
               << "  \"gpu_arch\": \"" << architecture << "\",\n"
               << "  \"wave_size\": " << STRIX_WAVE_SIZE << ",\n"
               << "  \"threads\": " << kThreads << ",\n"
               << "  \"precision\": \"fp32\",\n"
-              << "  \"row_invariance_fixture\": true\n"
+              << "  \"row_invariance_fixture\": true,\n"
+              << "  \"benchmarks_us\": {\n"
+              << "    \"rms_norm_c1_h2560\": "
+              << benchmark_results.rms_norm_us << ",\n"
+              << "    \"residual_c1_h2560\": "
+              << benchmark_results.residual_add_us << ",\n"
+              << "    \"partial_rope_24x256_r64\": "
+              << benchmark_results.partial_rope_us << ",\n"
+              << "    \"argmax_vocab248320\": "
+              << benchmark_results.argmax_us << ",\n"
+              << "    \"top10_experts512\": "
+              << benchmark_results.top_k_us << "\n"
+              << "  },\n"
+              << "  \"function_attributes\": {\n";
+    print_function_stats("rms_norm", rms_stats);
+    std::cout << ",\n";
+    print_function_stats("residual_add", residual_stats);
+    std::cout << ",\n";
+    print_function_stats("partial_rope", rope_stats);
+    std::cout << ",\n";
+    print_function_stats("argmax", argmax_stats);
+    std::cout << ",\n";
+    print_function_stats("top_k", top_k_stats);
+    std::cout << "\n  }\n"
               << "}\n";
     return 0;
 } catch (const std::exception& error) {
