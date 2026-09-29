@@ -270,9 +270,9 @@ A complete serial request runs through the local engine with reproducible output
 
 ### A1.6 — Greedy speculative execution
 
-Status: **greedy acceptance/crop contract implemented; controller and executor integration in progress**.
+Status: **greedy acceptance/crop contract and depth controller implemented; executor/state integration pending**.
 
-The host-side contract now implements contiguous target-argmax matching, the mandatory target bonus token, EOS/max-length cropping, recomputed accepted-match count and exact speculative-tail crop count. The contract is pinned to the same immutable assisted-generation source revision as the other semantic oracles. Sampled speculative mathematics is identified separately, but exact sampled replay remains blocked on RNG identity/consumption.
+The host-side contract now implements contiguous target-argmax matching, the mandatory target bonus token, EOS/max-length cropping, recomputed accepted-match count and exact speculative-tail crop count. The depth controller requires a qualified depth-zero baseline, compares complete cycle cost per expected committed token across qualified positive depths, and applies switch hysteresis so noisy marginal gains do not flap the runtime policy. The contract is pinned to the same immutable assisted-generation source revision as the other semantic oracles. Sampled speculative mathematics is identified separately, but exact sampled replay remains blocked on RNG identity/consumption.
 
 Add:
 
