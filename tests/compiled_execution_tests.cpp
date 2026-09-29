@@ -216,6 +216,15 @@ int main() {
                compiled.execution_identity,
            "arena layout identity participates in compiled execution identity");
 
+    strix::ExecutionMemoryBinding memory;
+    memory.execution_identity =
+        compiled.execution_identity;
+    memory.arena_base =
+        static_cast<std::uintptr_t>(0x20000000ULL);
+    memory.arena_bytes =
+        compiled.arena.total_bytes;
+    memory.allocation_generation = 1;
+
     strix::EagerExecutionRequest run;
     run.logical_rows = 1;
     run.request_concurrency = 1;
@@ -225,6 +234,7 @@ int main() {
     const auto result =
         strix::execute_compiled_serial_eager(
             compiled,
+            memory,
             run,
             dispatcher);
     expect(result.completed_steps ==
@@ -244,6 +254,7 @@ int main() {
         static_cast<void>(
             strix::execute_compiled_serial_eager(
                 compiled,
+                memory,
                 wrong_shape,
                 unused));
     } catch (const std::invalid_argument&) {
