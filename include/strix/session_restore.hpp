@@ -20,7 +20,9 @@ struct SessionRestoreRange {
 };
 
 struct SerialSessionRestorePlan {
+    std::uint64_t compiled_execution_identity = 0;
     std::uint64_t runtime_compatibility_identity = 0;
+    std::uint64_t snapshot_plan_identity = 0;
     std::uint64_t state_layout_identity = 0;
     std::uint64_t next_position = 0;
     std::uint64_t committed_tokens = 0;
