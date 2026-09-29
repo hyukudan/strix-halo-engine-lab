@@ -202,11 +202,11 @@ Host-side planning implemented:
 - activation input/output byte accounting;
 - serial repeated-weight traffic versus ideal reused-weight lower bound;
 - overflow and quant-block divisibility checks;
-- CTest coverage including Q4_K and Q8_0 geometry.
+- CTest coverage including Q4_K, Q8_0 and IQ4_XS geometry;\n- independent IQ4_XS 136-byte block/dequant contract with nonlinear codebook and 6-bit local-scale extraction;\n- host IQ4_XS fixture compiled with strict warnings and passing.
 
 Standalone `lab/packed_projection/` implemented:
 
-- Q8_0 packed reference kernel for `gfx1151`;
+- Q8_0 packed reference kernel for `gfx1151`;\n- IQ4_XS compact packed candidate for `gfx1151`;
 - packed block is consumed directly inside compute; no full dequantized weight tensor;
 - compile-time C1/2/4/8 logical-row variants;
 - each decoded packed weight is reused across active logical rows;
@@ -222,7 +222,7 @@ Still pending:
 
 - native Strix Halo build/profile;
 - canonical compact checkpoint format selection;
-- compact-format decode kernel, likely from the formats that satisfy the mononode memory envelope;
+- native compile/profile of the IQ4_XS compact path and comparison against Q8_0;\n- canonical checkpoint-format decision after quality plus full memory/runtime qualification;
 - BF16/mixed-precision activation variants;
 - profiler spill/LDS/VALU/WMMA analysis;
 - promotion into a target-qualified kernel plan.
