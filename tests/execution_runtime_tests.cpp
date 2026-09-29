@@ -35,12 +35,28 @@ struct RecordingDispatcher final
         expect(context.kernel_id.has_value() &&
                    !context.kernel_id->empty(),
                "kernel dispatch carries a kernel id");
+        expect(context.arena != nullptr,
+               "dispatch context exposes its arena plan");
         if (context.op == strix::SerialOp::lm_head) {
             expect(context.reads.size() == 1 &&
                        context.writes.size() == 1 &&
                        context.reads[0].generation > 0 &&
                        context.writes[0].generation == 1,
                    "kernel dispatch receives versioned IO bindings");
+            if (context.arena != nullptr) {
+                const auto* input =
+                    strix::find_arena_allocation(
+                        *context.arena,
+                        context.reads[0]);
+                const auto* output =
+                    strix::find_arena_allocation(
+                        *context.arena,
+                        context.writes[0]);
+                expect(input != nullptr &&
+                           output != nullptr &&
+                           input->offset != output->offset,
+                       "LM-head dispatch resolves non-aliased arena buffers");
+            }
         }
         kernel_steps.push_back(context.step_id);
     }
@@ -124,6 +140,11 @@ int main() {
         strix::build_serial_decode_execution_plan(model);
     const auto io =
         strix::build_serial_execution_io_plan(plan);
+    strix::ExecutionBufferRequest buffer_request;
+    buffer_request.logical_rows = 1;
+    const auto arena =
+        strix::build_serial_execution_arena_plan(
+            model, buffer_request, plan, io, 256);
     auto bindings = fully_bound(plan);
 
     strix::EagerExecutionRequest request;
@@ -134,7 +155,7 @@ int main() {
     RecordingDispatcher dispatcher;
     const auto result =
         strix::execute_serial_eager(
-            plan, bindings, io, request, dispatcher);
+            plan, bindings, io, arena, request, dispatcher);
 
     expect(result.completed_steps == plan.steps.size(),
            "eager executor completes every serial-plan step");
@@ -179,7 +200,7 @@ int main() {
         RecordingDispatcher unused;
         static_cast<void>(
             strix::execute_serial_eager(
-                plan, incomplete, io, request, unused));
+                plan, incomplete, io, arena, request, unused));
     } catch (const std::invalid_argument&) {
         preflight_rejected = true;
     }
@@ -194,7 +215,7 @@ int main() {
         RecordingDispatcher unused;
         static_cast<void>(
             strix::execute_serial_eager(
-                plan, bindings, io, unavailable_state, unused));
+                plan, bindings, io, arena, unavailable_state, unused));
     } catch (const std::invalid_argument&) {
         state_rejected = true;
     }
@@ -219,7 +240,7 @@ int main() {
     try {
         static_cast<void>(
             strix::execute_serial_eager(
-                plan, bindings, io, request, failing));
+                plan, bindings, io, arena, request, failing));
     } catch (const std::runtime_error&) {
         injected_failure = true;
     }
@@ -242,6 +263,7 @@ int main() {
                 plan,
                 bindings,
                 io,
+                arena,
                 generation_overflow,
                 overflow_dispatcher));
     } catch (const std::overflow_error&) {
@@ -266,6 +288,7 @@ int main() {
                 plan,
                 bad_runtime_binding,
                 io,
+                arena,
                 request,
                 unused));
     } catch (const std::invalid_argument&) {
@@ -284,6 +307,7 @@ int main() {
                 bad_dependency_plan,
                 bindings,
                 io,
+                arena,
                 request,
                 unused));
     } catch (const std::invalid_argument&) {
