@@ -16,6 +16,7 @@ Implemented:
 - Gated Residual/Hyper-Connection mixing with synthetic matrix fixtures;
 - QSA block pooling/selection for fixtures whose cutoff has no score tie;
 - MoE softmax/top-k routing for fixtures without cutoff ties;
+- greedy MTP/assisted verification acceptance, bonus-token and cache-crop semantics;
 - fresh-versus-resumed equivalence tests for recurrent and n-gram state.
 
 The numerical functions use Python double-precision arithmetic so that GPU-specific reduction order and lower-precision rounding are not accidentally baked into the reference.
@@ -49,7 +50,7 @@ The fixtures are intentionally tiny and human-auditable.
 The following MUST NOT be treated as closed by this first slice:
 
 - canonical sampling RNG and exact sampled replay;
-- MTP acceptance algorithm;
+- sampled MTP RNG identity and exact sampled replay;
 - QSA tie semantics where the upstream primitive does not specify a stable tie order;
 - full QSA mask/selection fixture coverage;
 - Gated Residual/Hyper-Connection fixtures from the pinned real checkpoint;
