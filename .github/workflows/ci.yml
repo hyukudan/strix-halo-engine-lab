@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  host-build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure core
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+
+      - name: Build core
+        run: cmake --build build
+
+      - name: Test core and oracles
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Configure UMA host lab
+        run: cmake -S lab/uma_residency -B build/uma-residency -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build UMA host lab
+        run: cmake --build build/uma-residency --target strix-uma-host
+
+      - name: Configure transport lab
+        run: cmake -S lab/transport -B build/transport-lab -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build transport lab
+        run: cmake --build build/transport-lab
+
+      - name: TCP ping-pong smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./build/transport-lab/strix-transport-tcp server --bind 127.0.0.1 --port 19090 --max-bytes 1MiB --verify > server-ping.json &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true' EXIT
+          sleep 0.2
+          ./build/transport-lab/strix-transport-tcp client --host 127.0.0.1 --port 19090 --mode pingpong --bytes 64KiB --warmup 2 --iterations 10 --verify > client-ping.json
+          wait "$server_pid"
+          trap - EXIT
+          cat client-ping.json
+          cat server-ping.json
+
+      - name: TCP stream smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./build/transport-lab/strix-transport-tcp server --bind 127.0.0.1 --port 19091 --max-bytes 1MiB --verify > server-stream.json &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true' EXIT
+          sleep 0.2
+          ./build/transport-lab/strix-transport-tcp client --host 127.0.0.1 --port 19091 --mode stream --bytes 256KiB --warmup 2 --iterations 10 --verify > client-stream.json
+          wait "$server_pid"
+          trap - EXIT
+          cat client-stream.json
+          cat server-stream.json
