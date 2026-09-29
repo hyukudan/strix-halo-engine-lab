@@ -290,3 +290,26 @@ MoE format constraint discovered:
 - IQ4_XS cannot directly represent the 640-wide real down input under the current pinned GGML row geometry;
 - Q8_0 block geometry (32 elements) is compatible with both dimensions;
 - the canonical expert checkpoint may therefore require mixed per-projection formats or an explicitly defined lossless repack/padding layout.
+
+
+## Slice A1.4 — sparse lookup path
+
+Initial host-side implementation:
+
+- sparse lookup planner with requested/unique row accounting;
+- deterministic contiguous-run construction;
+- bounded LRU hit/miss simulation and physical row-read byte model;
+- standalone Linux benchmark for mmap, pread, pread+LRU and per-window coalesced pread;
+- deterministic PLE-like access pattern with 16 logical head partitions;
+- additional random, hot-set and contiguous-run controls;
+- materialized-file preparation mode so sparse holes are not mistaken for real storage performance;
+- cold-cache hinting and major/minor page-fault telemetry.
+
+Still pending:
+
+- exact production table file/shard layout from the canonical checkpoint;
+- real PLE row traces from model execution;
+- NVMe and page-cache qualification on the Strix Halo hosts;
+- CPU gather into registered/staging buffers under simultaneous GPU load;
+- direct GPU-visible sparse access experiment;
+- bounded asynchronous I/O and request coalescing integrated with the executor.
