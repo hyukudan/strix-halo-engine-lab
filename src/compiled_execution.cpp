@@ -56,6 +56,7 @@ void hash_model(
     hash_u64(hash, model.ngram_size);
     hash_u64(hash, model.heads_per_ngram);
     hash_u64(hash, model.hc_count);
+    hash_u64(hash, model.hc_lowrank);
     hash_u64(hash, model.full_attention_layers);
     hash_u64(hash, model.gdn_layers);
     hash_u64(hash, model.attention_heads);
