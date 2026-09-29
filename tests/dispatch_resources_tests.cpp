@@ -111,10 +111,22 @@ int main() {
             0,
         });
 
+    strix::ExecutionTensorAccessPlan tensor_access;
+    tensor_access.manifest_layout_identity =
+        manifest.layout_identity;
+    tensor_access.plan_identity = 0x9999ULL;
+    strix::ExecutionTensorAccess access;
+    access.step_id = 7;
+    access.op = strix::SerialOp::token_embedding;
+    access.binding_slot = 0;
+    access.tensor_indices = {0};
+    tensor_access.accesses.push_back(access);
+
     strix::ExecutionRuntimeResources resources;
     resources.scratch = &scratch;
     resources.model_manifest = &manifest;
     resources.model_weights = &weights;
+    resources.tensor_access = &tensor_access;
     resources.session_state_layout =
         &state_layout;
     resources.session_state_memory =
@@ -124,6 +136,8 @@ int main() {
     const std::array writes{write_use};
 
     strix::ExecutionDispatchContext context;
+    context.step_id = 7;
+    context.op = strix::SerialOp::token_embedding;
     context.reads = reads;
     context.writes = writes;
     context.arena = &arena;
@@ -154,6 +168,13 @@ int main() {
                state_memory.device_base &&
                recurrent.allocation_generation == 3,
            "dispatch state resolver uses persistent device pool");
+
+    const auto& tensor_access =
+        strix::resolve_dispatch_tensor_access(
+            context, 0);
+    expect(tensor_access.tensor_indices.size() == 1 &&
+               tensor_access.tensor_indices[0] == 0,
+           "dispatch tensor slot resolves precompiled tensor indices");
 
     const auto& tensor_by_index =
         strix::resolve_dispatch_tensor(
