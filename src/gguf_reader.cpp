@@ -303,51 +303,8 @@ private:
         }
     }
 
-    struct TypeGeometry {
-        std::uint64_t block_elements;
-        std::uint64_t block_bytes;
-    };
-
-    static std::optional<TypeGeometry> type_geometry(std::uint32_t type) {
-        switch (type) {
-        case 0: return TypeGeometry{1, 4};
-        case 1: return TypeGeometry{1, 2};
-        case 2: return TypeGeometry{32, 18};
-        case 3: return TypeGeometry{32, 20};
-        case 6: return TypeGeometry{32, 22};
-        case 7: return TypeGeometry{32, 24};
-        case 8: return TypeGeometry{32, 34};
-        case 9: return TypeGeometry{32, 36};
-        case 10: return TypeGeometry{256, 84};
-        case 11: return TypeGeometry{256, 110};
-        case 12: return TypeGeometry{256, 144};
-        case 13: return TypeGeometry{256, 176};
-        case 14: return TypeGeometry{256, 210};
-        case 15: return TypeGeometry{256, 292};
-        case 16: return TypeGeometry{256, 66};
-        case 17: return TypeGeometry{256, 74};
-        case 18: return TypeGeometry{256, 98};
-        case 19: return TypeGeometry{256, 50};
-        case 20: return TypeGeometry{32, 18};
-        case 21: return TypeGeometry{256, 110};
-        case 22: return TypeGeometry{256, 82};
-        case 23: return TypeGeometry{256, 136};
-        case 24: return TypeGeometry{1, 1};
-        case 25: return TypeGeometry{1, 2};
-        case 26: return TypeGeometry{1, 4};
-        case 27: return TypeGeometry{1, 8};
-        case 28: return TypeGeometry{1, 8};
-        case 29: return TypeGeometry{256, 56};
-        case 30: return TypeGeometry{1, 2};
-        case 34: return TypeGeometry{256, 54};
-        case 35: return TypeGeometry{256, 66};
-        case 39: return TypeGeometry{32, 17};
-        default: return std::nullopt;
-        }
-    }
-
     static std::uint64_t tensor_size(const TensorInfo& tensor) {
-        const auto geometry = type_geometry(tensor.ggml_type);
+        const auto geometry = tensor_type_geometry(tensor.ggml_type);
         if (!geometry.has_value()) {
             fail("GGML tensor type has no pinned storage geometry");
         }
@@ -432,6 +389,46 @@ private:
 };
 
 }  // namespace
+
+
+std::optional<TensorTypeGeometry> tensor_type_geometry(
+    std::uint32_t type) noexcept {
+    switch (type) {
+    case 0: return TensorTypeGeometry{1, 4};
+    case 1: return TensorTypeGeometry{1, 2};
+    case 2: return TensorTypeGeometry{32, 18};
+    case 3: return TensorTypeGeometry{32, 20};
+    case 6: return TensorTypeGeometry{32, 22};
+    case 7: return TensorTypeGeometry{32, 24};
+    case 8: return TensorTypeGeometry{32, 34};
+    case 9: return TensorTypeGeometry{32, 36};
+    case 10: return TensorTypeGeometry{256, 84};
+    case 11: return TensorTypeGeometry{256, 110};
+    case 12: return TensorTypeGeometry{256, 144};
+    case 13: return TensorTypeGeometry{256, 176};
+    case 14: return TensorTypeGeometry{256, 210};
+    case 15: return TensorTypeGeometry{256, 292};
+    case 16: return TensorTypeGeometry{256, 66};
+    case 17: return TensorTypeGeometry{256, 74};
+    case 18: return TensorTypeGeometry{256, 98};
+    case 19: return TensorTypeGeometry{256, 50};
+    case 20: return TensorTypeGeometry{32, 18};
+    case 21: return TensorTypeGeometry{256, 110};
+    case 22: return TensorTypeGeometry{256, 82};
+    case 23: return TensorTypeGeometry{256, 136};
+    case 24: return TensorTypeGeometry{1, 1};
+    case 25: return TensorTypeGeometry{1, 2};
+    case 26: return TensorTypeGeometry{1, 4};
+    case 27: return TensorTypeGeometry{1, 8};
+    case 28: return TensorTypeGeometry{1, 8};
+    case 29: return TensorTypeGeometry{256, 56};
+    case 30: return TensorTypeGeometry{1, 2};
+    case 34: return TensorTypeGeometry{256, 54};
+    case 35: return TensorTypeGeometry{256, 66};
+    case 39: return TensorTypeGeometry{32, 17};
+    default: return std::nullopt;
+    }
+}
 
 const MetadataEntry* FileInfo::find_metadata(const std::string& key) const {
     for (const auto& entry : metadata) {
