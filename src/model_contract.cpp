@@ -19,6 +19,10 @@ std::string ModelContract::validate() const {
         hidden_layers / full_attention_interval != full_attention_layers ||
         ple_layer_1based == 0 ||
         ple_layer_1based > hidden_layers ||
+        ple_embed_dim == 0 ||
+        ple_conv_kernel_size <= 1 ||
+        ngram_size < 2 ||
+        heads_per_ngram == 0 ||
         hc_count <= 1) {
         return "layer pattern, PLE layer and hyper-connection geometry must be valid";
     }
