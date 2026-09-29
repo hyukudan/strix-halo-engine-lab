@@ -355,7 +355,11 @@ Initial semantic foundation implemented:
 - max-length/token-budget truncation;
 - accepted-match recomputation after truncation;
 - exact speculative target-state tail crop count;
-- zero-match cycle reduces to one ordinary target token.
+- zero-match cycle reduces to one ordinary target token;
+- qualified depth controller with mandatory serial baseline;
+- complete proposal + verify + commit/replay + uncovered communication + control cost accounting;
+- expected committed-token normalization;
+- hysteresis before switching between serial and speculative depths.
 
 Sampled speculative mathematics is source-identified (acceptance ratio and
 residual fallback), but sampled execution remains disabled until RNG stream
