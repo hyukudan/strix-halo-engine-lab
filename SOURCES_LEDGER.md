@@ -21,6 +21,7 @@ automáticamente en fuente canónica de nuestro motor.
 | mRoPE parcial/interleaved | Config oficial fijado (`partial_rotary_factor=0.25`) y código Qwen | Qwen Community License 1.0 | posiciones multimodales y oráculo texto pendientes | Abierto |
 | Ideas de optimización Strix Halo | `pwilkin/strix-halo@f73872fe20dfdef460653f18e2fe63e5366ae958`; ramas fijadas en `PWILKIN_REVIEW.md` | Sitio/instalador MIT; dependencias separadas | Solo hipótesis y protocolo, sin importar implementación | Referencia secundaria |
 | Transformers `qwen4_exp` semantics | `huggingface/transformers@ebd5de00b43e94cae2da6d7aeb5a76ecdda51dae`, `src/transformers/models/qwen4_exp/modeling_qwen4_exp.py` | Apache-2.0 | Independent tiny fixtures for RMSNorm, partial RoPE, recurrent GDN and PLE n-gram hashing | **Pinned for A0.5b; sampling/MTP/QSA ties remain open** |
+| IQ4_XS storage/dequant contract | `ggml-org/llama.cpp@8019dc563b1ecbae6b161a70c3a1359f1b206c1e`, `ggml/src/ggml-common.h` and `ggml/src/ggml-quants.c` | MIT | Independent byte-layout parser, FP16 conversion and full 256-value dequant fixture | **Pinned for A1.1 compact-format experiments; not a canonical checkpoint decision** |
 | Estructura GGUF v3 | `ggml-org/ggml@353b63b439f27ab2cc19dac97ab1681ba6d2d084`, `docs/gguf.md`; geometrías en `ggml-org/llama.cpp@6c7a87f7e5e5cd75b8a641c3471f2dee84a6ed17` | MIT de ambos proyectos; especificación/catálogo públicos | Fixtures propios de parseo, límites, bloques y rangos | Fuente primaria fijada para A0.2/A0.3 |
 
 ## Regla de aprobación
