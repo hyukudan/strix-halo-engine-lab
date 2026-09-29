@@ -97,7 +97,8 @@ int main() {
         bad.sessions =
             std::numeric_limits<std::uint32_t>::max();
         auto huge = model;
-        huge.gdn_layers =
+        huge.gdn_key_heads = 1;
+        huge.gdn_value_heads =
             std::numeric_limits<std::uint64_t>::max();
         static_cast<void>(
             strix::build_recurrent_window_plan(
