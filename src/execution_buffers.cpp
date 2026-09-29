@@ -96,6 +96,36 @@ ExecutionBufferPlan build_serial_execution_buffer_plan(
                 2ULL),
             request.mlp_intermediate_element_bytes);
 
+    const auto gdn_key_width =
+        checked_mul(
+            model.gdn_key_heads,
+            model.gdn_key_head_dim);
+    const auto gdn_value_width =
+        checked_mul(
+            model.gdn_value_heads,
+            model.gdn_value_head_dim);
+    const auto gdn_conv_width =
+        checked_add(
+            checked_mul(
+                gdn_key_width,
+                2ULL),
+            gdn_value_width);
+    const auto gdn_workspace_elements =
+        checked_add(
+            checked_add(
+                gdn_conv_width,
+                gdn_value_width),
+            checked_add(
+                checked_mul(
+                    model.gdn_value_heads,
+                    2ULL),
+                gdn_value_width));
+    plan.gdn_workspace_bytes =
+        product(
+            request.logical_rows,
+            gdn_workspace_elements,
+            request.activation_element_bytes);
+
     const auto attn_inject_peak =
         checked_add(
             checked_add(
@@ -120,8 +150,15 @@ ExecutionBufferPlan build_serial_execution_buffer_plan(
                     plan.route_weight_bytes),
                 plan.mlp_intermediate_bytes));
 
+    const auto gdn_core_peak =
+        checked_add(
+            attn_inject_peak,
+            plan.gdn_workspace_bytes);
+
     plan.peak_internal_bytes =
-        std::max(attn_inject_peak, moe_branch_peak);
+        std::max(
+            gdn_core_peak,
+            moe_branch_peak);
 
     const auto logits_stage_peak =
         checked_add(plan.hidden_bytes, plan.logits_bytes);
