@@ -75,6 +75,8 @@ int main(int argc, char** argv) try {
     print_field("base_kv", plan.base_kv);
     print_field("mtp_kv", plan.mtp_kv);
     print_field("provisional_indexer", plan.provisional_indexer);
+    print_field("gdn_matrix_state", plan.gdn_matrix_state);
+    print_field("gdn_conv_state", plan.gdn_conv_state);
     print_field("gdn_state", plan.gdn_state);
     print_field("rollback", plan.rollback);
     print_field("resident_model", plan.resident_model);
