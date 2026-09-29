@@ -25,6 +25,7 @@ add_library(strix_core STATIC
     src/model_contract.cpp
     src/model_manifest.cpp
     src/oracles.cpp
+    src/packed_projection.cpp
     src/platform_probe.cpp
     src/transport.cpp
 )
@@ -69,6 +70,11 @@ if(BUILD_TESTING)
     target_link_libraries(strix-kernel-registry-tests PRIVATE strix_core)
     strix_target_warnings(strix-kernel-registry-tests)
     add_test(NAME strix-kernel-registry-tests COMMAND strix-kernel-registry-tests)
+
+    add_executable(strix-packed-projection-tests tests/packed_projection_tests.cpp)
+    target_link_libraries(strix-packed-projection-tests PRIVATE strix_core)
+    strix_target_warnings(strix-packed-projection-tests)
+    add_test(NAME strix-packed-projection-tests COMMAND strix-packed-projection-tests)
 
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
