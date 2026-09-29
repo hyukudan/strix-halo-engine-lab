@@ -250,6 +250,10 @@ EagerExecutionResult execute_serial_eager(
         context.logical_rows = request.logical_rows;
         context.request_concurrency =
             request.request_concurrency;
+        context.input_token_id =
+            request.input_token_id;
+        context.position =
+            request.position;
 
         if (binding.host_or_runtime_step) {
             dispatcher.dispatch_runtime_step(context);
