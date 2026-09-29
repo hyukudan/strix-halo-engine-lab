@@ -117,6 +117,62 @@ int main() {
     expect(overflow_rejected,
            "state memory rejects device address overflow");
 
+
+    expect(
+        strix::gdn_layer_ordinal(model, 0) == 0 &&
+            strix::gdn_layer_ordinal(model, 1) == 1 &&
+            strix::gdn_layer_ordinal(model, 2) == 2 &&
+            strix::gdn_layer_ordinal(model, 4) == 3,
+        "GDN ordinal skips indexed-attention layers");
+
+    bool indexed_rejected = false;
+    try {
+        static_cast<void>(
+            strix::gdn_layer_ordinal(
+                model,
+                3));
+    } catch (const std::invalid_argument&) {
+        indexed_rejected = true;
+    }
+    expect(
+        indexed_rejected,
+        "indexed-attention layer is rejected by GDN state resolver");
+
+    const auto layer0_matrix =
+        strix::resolve_gdn_layer_state(
+            layout,
+            memory,
+            model,
+            0,
+            strix::SessionStateComponent::recurrent_matrix);
+    const auto layer4_matrix =
+        strix::resolve_gdn_layer_state(
+            layout,
+            memory,
+            model,
+            4,
+            strix::SessionStateComponent::recurrent_matrix);
+    expect(
+        layer0_matrix.bytes ==
+            strix::gdn_matrix_state_bytes_per_layer(model) &&
+            layer4_matrix.address ==
+                layer0_matrix.address +
+                3ULL *
+                    strix::gdn_matrix_state_bytes_per_layer(model),
+        "GDN matrix layer slice uses compact GDN ordinal");
+
+    const auto layer2_conv =
+        strix::resolve_gdn_layer_state(
+            layout,
+            memory,
+            model,
+            2,
+            strix::SessionStateComponent::gdn_convolution);
+    expect(
+        layer2_conv.bytes ==
+            strix::gdn_conv_state_bytes_per_layer(model),
+        "GDN convolution slice exposes one layer only");
+
     if (failures == 0) {
         std::cout << "session state memory tests passed\n";
     }
