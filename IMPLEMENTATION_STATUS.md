@@ -189,3 +189,40 @@ Still pending:
 - graph-capture qualification;
 - promotion of any kernel from experimental to target-qualified;
 - BF16/mixed-precision variants, which require separate numerical identities.
+
+
+## Slice A1.1 — packed low-row projection
+
+Host-side planning implemented:
+
+- GGML tensor storage geometry is now a public contract shared by the loader and kernel planning;
+- explicit low-row classes 1/2/4/8;
+- exact block geometry and packed bytes per output row;
+- exact tensor weight bytes;
+- activation input/output byte accounting;
+- serial repeated-weight traffic versus ideal reused-weight lower bound;
+- overflow and quant-block divisibility checks;
+- CTest coverage including Q4_K and Q8_0 geometry.
+
+Standalone `lab/packed_projection/` implemented:
+
+- Q8_0 packed reference kernel for `gfx1151`;
+- packed block is consumed directly inside compute; no full dequantized weight tensor;
+- compile-time C1/2/4/8 logical-row variants;
+- each decoded packed weight is reused across active logical rows;
+- native Wave32 and explicit Wave64 builds;
+- device-side wave-size verification;
+- CPU packed-format reference and true row-invariance test;
+- model-shape benchmark at 2560x2560;
+- HIP-event timings;
+- physical packed-weight GiB/s and serial-equivalent weight-traffic metric;
+- per-variant register/shared/local-memory attributes.
+
+Still pending:
+
+- native Strix Halo build/profile;
+- canonical compact checkpoint format selection;
+- compact-format decode kernel, likely from the formats that satisfy the mononode memory envelope;
+- BF16/mixed-precision activation variants;
+- profiler spill/LDS/VALU/WMMA analysis;
+- promotion into a target-qualified kernel plan.
