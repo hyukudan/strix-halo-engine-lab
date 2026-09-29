@@ -28,6 +28,7 @@ add_library(strix_core STATIC
     src/execution_memory.cpp
     src/execution_plan.cpp
     src/execution_runtime.cpp
+    src/execution_tensor_access.cpp
     src/execution_resources.cpp
     src/gguf_reader.cpp
     src/kernel_registry.cpp
@@ -166,6 +167,11 @@ if(BUILD_TESTING)
     target_link_libraries(strix-execution-resources-tests PRIVATE strix_core)
     strix_target_warnings(strix-execution-resources-tests)
     add_test(NAME strix-execution-resources-tests COMMAND strix-execution-resources-tests)
+
+    add_executable(strix-execution-tensor-access-tests tests/execution_tensor_access_tests.cpp)
+    target_link_libraries(strix-execution-tensor-access-tests PRIVATE strix_core)
+    strix_target_warnings(strix-execution-tensor-access-tests)
+    add_test(NAME strix-execution-tensor-access-tests COMMAND strix-execution-tensor-access-tests)
 
     add_executable(strix-dispatch-resources-tests tests/dispatch_resources_tests.cpp)
     target_link_libraries(strix-dispatch-resources-tests PRIVATE strix_core)
