@@ -98,6 +98,9 @@ std::uint64_t build_identity(
     std::uint64_t hash = fnv_offset;
     hash_u64(
         hash,
+        plan.compiled_execution_identity);
+    hash_u64(
+        hash,
         plan.runtime_compatibility_identity);
     hash_u64(
         hash,
@@ -152,6 +155,10 @@ build_serial_session_snapshot_plan(
         throw std::invalid_argument(
             "snapshot requires a valid session-state layout");
     }
+    if (request.compiled_execution_identity == 0) {
+        throw std::invalid_argument(
+            "snapshot requires compiled execution identity");
+    }
     if (request.runtime_compatibility_identity == 0) {
         throw std::invalid_argument(
             "snapshot requires runtime compatibility identity");
@@ -167,6 +174,8 @@ build_serial_session_snapshot_plan(
     }
 
     SerialSessionSnapshotPlan plan;
+    plan.compiled_execution_identity =
+        request.compiled_execution_identity;
     plan.runtime_compatibility_identity =
         request.runtime_compatibility_identity;
     plan.state_layout_identity =
