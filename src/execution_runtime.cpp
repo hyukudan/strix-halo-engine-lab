@@ -1,0 +1,215 @@
+#include "strix/execution_runtime.hpp"
+
+#include <limits>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+namespace strix {
+namespace {
+
+constexpr std::array<PersistentState, 6> state_flags{
+    PersistentState::attention_kv,
+    PersistentState::recurrent_matrix,
+    PersistentState::convolution_history,
+    PersistentState::sparse_index,
+    PersistentState::ngram_history,
+    PersistentState::position_history,
+};
+
+std::uint32_t state_bits(PersistentState value) noexcept {
+    return static_cast<std::uint32_t>(value);
+}
+
+bool subset(
+    PersistentState available,
+    PersistentState required) noexcept {
+    const auto have = state_bits(available);
+    const auto need = state_bits(required);
+    return (have & need) == need;
+}
+
+const ExecutionKernelBinding& binding_for(
+    const ExecutionBindingPlan& bindings,
+    std::uint32_t step_id) {
+    if (step_id >= bindings.bindings.size()) {
+        throw std::invalid_argument(
+            "execution binding is missing a step id");
+    }
+    return bindings.bindings[step_id];
+}
+
+void validate_step_identity(
+    const ExecutionStep& step,
+    const ExecutionKernelBinding& binding) {
+    if (binding.step_id != step.id ||
+        binding.op != step.op) {
+        throw std::invalid_argument(
+            "execution binding identity does not match the serial plan");
+    }
+
+    if (binding.host_or_runtime_step) {
+        if (binding.kernel_id.has_value()) {
+            throw std::invalid_argument(
+                "runtime-managed execution step must not bind a kernel");
+        }
+        return;
+    }
+
+    if (!binding.family.has_value() ||
+        !binding.kernel_id.has_value() ||
+        binding.kernel_id->empty()) {
+        throw std::invalid_argument(
+            "kernel execution step is not fully bound");
+    }
+}
+
+}  // namespace
+
+bool PersistentStateGenerations::contains(
+    PersistentState required) const noexcept {
+    return subset(valid, required);
+}
+
+void PersistentStateGenerations::publish_write(
+    PersistentState written) {
+    if (written == PersistentState::none) {
+        return;
+    }
+
+    valid = valid | written;
+    for (std::size_t index = 0;
+         index < state_flags.size();
+         ++index) {
+        if (!has_state(written, state_flags[index])) {
+            continue;
+        }
+        if (generations[index] ==
+            std::numeric_limits<std::uint64_t>::max()) {
+            throw std::overflow_error(
+                "persistent-state generation overflow");
+        }
+        ++generations[index];
+    }
+}
+
+void validate_eager_execution_preflight(
+    const SerialExecutionPlan& plan,
+    const ExecutionBindingPlan& bindings,
+    const EagerExecutionRequest& request) {
+    if (request.logical_rows == 0 ||
+        request.request_concurrency == 0) {
+        throw std::invalid_argument(
+            "eager execution rows and concurrency must be non-zero");
+    }
+
+    if (bindings.bindings.size() != plan.steps.size()) {
+        throw std::invalid_argument(
+            "binding count does not match serial execution plan");
+    }
+    if (bindings.missing_steps != 0) {
+        throw std::invalid_argument(
+            "eager execution requires a fully bound plan");
+    }
+
+    PersistentState available = request.state.valid;
+
+    for (std::size_t index = 0;
+         index < plan.steps.size();
+         ++index) {
+        const auto& step = plan.steps[index];
+        if (step.id != index) {
+            throw std::invalid_argument(
+                "serial execution step ids must be dense and ordered");
+        }
+
+        const auto& binding =
+            binding_for(bindings, step.id);
+        validate_step_identity(step, binding);
+
+        for (const auto dependency : step.dependencies) {
+            if (dependency >= step.id ||
+                dependency >= plan.steps.size()) {
+                throw std::invalid_argument(
+                    "serial execution dependency is not backward-only");
+            }
+        }
+
+        if (!subset(available, step.reads_state)) {
+            throw std::invalid_argument(
+                "persistent state required by an execution step is unavailable");
+        }
+
+        // Preflight reasons about object existence, not mutations. A step that
+        // writes a previously empty-but-created state may make it available to
+        // later steps in the same request.
+        available = available | step.writes_state;
+    }
+}
+
+EagerExecutionResult execute_serial_eager(
+    const SerialExecutionPlan& plan,
+    const ExecutionBindingPlan& bindings,
+    const EagerExecutionRequest& request,
+    EagerExecutionDispatcher& dispatcher) {
+    validate_eager_execution_preflight(
+        plan, bindings, request);
+
+    EagerExecutionResult result;
+    result.state = request.state;
+    result.completion_order.reserve(plan.steps.size());
+
+    std::vector<bool> completed(
+        plan.steps.size(), false);
+
+    for (const auto& step : plan.steps) {
+        for (const auto dependency : step.dependencies) {
+            if (!completed[dependency]) {
+                throw std::logic_error(
+                    "execution dependency was not completed");
+            }
+        }
+
+        if (!result.state.contains(step.reads_state)) {
+            throw std::logic_error(
+                "persistent state disappeared after preflight");
+        }
+
+        const auto& binding =
+            binding_for(bindings, step.id);
+
+        ExecutionDispatchContext context;
+        context.step_id = step.id;
+        context.op = step.op;
+        context.layer = step.layer;
+        context.reads_state = step.reads_state;
+        context.writes_state = step.writes_state;
+        context.logical_rows = request.logical_rows;
+        context.request_concurrency =
+            request.request_concurrency;
+
+        if (binding.host_or_runtime_step) {
+            dispatcher.dispatch_runtime_step(context);
+            ++result.runtime_steps;
+        } else {
+            context.kernel_id =
+                std::string_view(*binding.kernel_id);
+            dispatcher.dispatch_kernel(context);
+            ++result.kernel_steps;
+        }
+
+        // Publish persistent-state generations only after the dispatcher
+        // returns successfully. A failed step cannot make partial state
+        // visible to subsequent steps.
+        result.state.publish_write(
+            step.writes_state);
+
+        completed[step.id] = true;
+        result.completion_order.push_back(step.id);
+        ++result.completed_steps;
+    }
+
+    return result;
+}
+
+}  // namespace strix
