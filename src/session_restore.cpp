@@ -20,16 +20,6 @@ void hash_u64(
     }
 }
 
-std::uint64_t checked_add(
-    std::uint64_t left,
-    std::uint64_t right) {
-    if (right >
-        std::numeric_limits<std::uint64_t>::max() - left) {
-        throw std::overflow_error(
-            "session restore byte overflow");
-    }
-    return left + right;
-}
 
 bool same_snapshot_structure(
     const SerialSessionSnapshotPlan& left,
@@ -40,6 +30,8 @@ bool same_snapshot_structure(
             right.device_bytes ||
         left.host_bytes !=
             right.host_bytes ||
+        left.alignment !=
+            right.alignment ||
         left.ranges.size() !=
             right.ranges.size()) {
         return false;
@@ -136,6 +128,8 @@ build_serial_session_restore_plan(
         snapshot.next_position;
     expected_request.committed_tokens =
         snapshot.committed_tokens;
+    expected_request.alignment =
+        snapshot.alignment;
     expected_request.state =
         snapshot.state;
 
