@@ -137,8 +137,21 @@ int main() {
            "MTP KV is 2 KiB/token/session");
     expect(strix::provisional_indexer_bytes_per_token(model) == 768ULL,
            "provisional indexer estimate is 768 B/token/session");
-    expect(strix::gdn_state_bytes_per_session(model) == 108ULL * 1024ULL * 1024ULL,
-           "minimal GDN FP32 state is 108 MiB/session");
+    expect(model.gdn_key_heads == 16 &&
+               model.gdn_key_head_dim == 128 &&
+               model.gdn_value_heads == 48 &&
+               model.gdn_value_head_dim == 128 &&
+               model.gdn_conv_kernel == 4,
+           "official GDN geometry is explicit");
+    expect(strix::gdn_matrix_state_bytes_per_session(model) ==
+               108ULL * 1024ULL * 1024ULL,
+           "GDN FP32 matrix state is 108 MiB/session");
+    expect(strix::gdn_conv_state_bytes_per_session(model) ==
+               2880ULL * 1024ULL,
+           "GDN convolution history is 2880 KiB/session");
+    expect(strix::gdn_state_bytes_per_session(model) ==
+               110ULL * 1024ULL * 1024ULL + 832ULL * 1024ULL,
+           "complete GDN state includes recurrent matrix and convolution history");
 
     strix::MemoryPlanRequest request;
     request.context_tokens = 262'144;
@@ -154,8 +167,11 @@ int main() {
     request.draft_tokens = 7;
     const auto c4 = strix::build_memory_plan(model, request);
     expect(c4.base_kv == strix::gib(24), "C4 base KV is 24 GiB");
-    expect(c4.rollback == 3ULL * strix::gib(1) - 48ULL * 1024ULL * 1024ULL,
-           "C4 seven-snapshot rollback is 3024 MiB");
+    expect(c4.rollback ==
+               3ULL * strix::gib(1) +
+                   30ULL * 1024ULL * 1024ULL +
+                   768ULL * 1024ULL,
+           "C4 seven-snapshot rollback includes convolution history");
 
     const strix::HostBudget host{strix::gib(128), strix::gib(2), strix::gib(18)};
     auto small = strix::MemoryPlanRequest{};
