@@ -2,12 +2,23 @@
 
 #include "strix/model_manifest.hpp"
 
+#include <array>
 #include <cstdint>
 #include <optional>
 #include <string_view>
 #include <vector>
 
 namespace strix {
+
+struct ModelContentIdentity {
+    std::array<std::uint8_t, 32> bytes{};
+
+    [[nodiscard]] bool valid() const noexcept;
+
+    friend constexpr bool operator==(
+        const ModelContentIdentity&,
+        const ModelContentIdentity&) = default;
+};
 
 enum class RuntimeTensorStorage {
     resident,
@@ -32,7 +43,7 @@ struct ModelRuntimeBinding {
     // Content identity is supplied by the loader after hashing all
     // execution-relevant model files. This is deliberately separate from the
     // manifest layout identity.
-    std::uint64_t model_content_identity = 0;
+    ModelContentIdentity model_content_identity;
 
     std::vector<RuntimeTensorBinding> tensors;
 };
