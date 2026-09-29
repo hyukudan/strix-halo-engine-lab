@@ -1,6 +1,7 @@
 #pragma once
 
 #include "strix/execution_binding.hpp"
+#include "strix/execution_io.hpp"
 #include "strix/execution_plan.hpp"
 
 #include <array>
@@ -17,6 +18,8 @@ struct ExecutionDispatchContext {
     SerialOp op = SerialOp::token_embedding;
     std::optional<std::uint32_t> layer;
     std::optional<std::string_view> kernel_id;
+    std::span<const ExecutionBufferUse> reads;
+    std::span<const ExecutionBufferUse> writes;
     PersistentState reads_state = PersistentState::none;
     PersistentState writes_state = PersistentState::none;
     std::uint32_t logical_rows = 1;
@@ -65,11 +68,13 @@ struct EagerExecutionResult {
 void validate_eager_execution_preflight(
     const SerialExecutionPlan& plan,
     const ExecutionBindingPlan& bindings,
+    const SerialExecutionIoPlan& io_plan,
     const EagerExecutionRequest& request);
 
 [[nodiscard]] EagerExecutionResult execute_serial_eager(
     const SerialExecutionPlan& plan,
     const ExecutionBindingPlan& bindings,
+    const SerialExecutionIoPlan& io_plan,
     const EagerExecutionRequest& request,
     EagerExecutionDispatcher& dispatcher);
 
