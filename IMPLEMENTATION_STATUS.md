@@ -130,11 +130,14 @@ Initial host-independent core implemented:
 - deterministic single-link cost estimation;
 - flow scheduling that reacts to queued bytes;
 - dual-link striping only when both links are explicitly qualified as independent and the estimated complete transfer beats the single-link path;
-- unit tests for ownership, stale/oversized descriptors, single-link selection, queue-aware selection and striping.
+- unit tests for ownership, stale/oversized descriptors, single-link selection, queue-aware selection and striping;
+- standalone TCP ping-pong and stream benchmark harness;
+- framed payload validation, optional checksums, warmup exclusion and JSON latency/throughput output;
+- host-side CI workflow covering the core, oracles, UMA host lab and TCP smoke tests.
 
 Still pending on the target hosts:
 
-- TCP/network baseline backend and measurements;
+- real two-host TCP/network baseline measurements;
 - direct USB4 streaming backend;
 - interrupt/event versus polling progress modes;
 - mapped/registered transport-buffer tiers;
