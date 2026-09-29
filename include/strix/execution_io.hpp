@@ -27,11 +27,20 @@ struct ExecutionBufferRef {
         const ExecutionBufferRef&) = default;
 };
 
+struct ExecutionBufferUse {
+    ExecutionBufferRef buffer;
+    std::uint64_t generation = 0;
+
+    friend constexpr bool operator==(
+        const ExecutionBufferUse&,
+        const ExecutionBufferUse&) = default;
+};
+
 struct ExecutionStepIo {
     std::uint32_t step_id = 0;
     SerialOp op = SerialOp::token_embedding;
-    std::vector<ExecutionBufferRef> reads;
-    std::vector<ExecutionBufferRef> writes;
+    std::vector<ExecutionBufferUse> reads;
+    std::vector<ExecutionBufferUse> writes;
 };
 
 struct SerialExecutionIoPlan {
