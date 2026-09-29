@@ -28,6 +28,14 @@ std::string ModelContract::validate() const {
     if (indexer_compress_ratio == 0) {
         return "indexer compression ratio must be non-zero";
     }
+    if (hidden_size == 0 ||
+        moe_intermediate_size == 0 ||
+        shared_expert_intermediate_size == 0 ||
+        num_experts == 0 ||
+        num_experts_per_token == 0 ||
+        num_experts_per_token > num_experts) {
+        return "MoE and hidden dimensions must be valid and non-zero";
+    }
     return {};
 }
 
