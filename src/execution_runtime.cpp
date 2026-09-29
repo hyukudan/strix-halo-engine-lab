@@ -39,6 +39,77 @@ const ExecutionKernelBinding& binding_for(
     return bindings.bindings[step_id];
 }
 
+
+bool has_component(
+    const SerialSessionStateLayout& layout,
+    SessionStateComponent component) noexcept {
+    return find_session_state_allocation(
+               layout, component) != nullptr;
+}
+
+void require_component(
+    const SerialSessionStateLayout& layout,
+    SessionStateComponent component,
+    const char* message) {
+    if (!has_component(layout, component)) {
+        throw std::invalid_argument(message);
+    }
+}
+
+void validate_state_component_for_step(
+    const SerialSessionStateLayout& layout,
+    const ExecutionStep& step) {
+    const auto required =
+        step.reads_state | step.writes_state;
+
+    if (has_state(required, PersistentState::attention_kv)) {
+        require_component(
+            layout,
+            SessionStateComponent::attention_kv,
+            "execution step requires attention KV storage");
+    }
+    if (has_state(required, PersistentState::recurrent_matrix)) {
+        require_component(
+            layout,
+            SessionStateComponent::recurrent_matrix,
+            "execution step requires recurrent matrix storage");
+    }
+    if (has_state(required, PersistentState::convolution_history)) {
+        if (step.op == SerialOp::ple) {
+            require_component(
+                layout,
+                SessionStateComponent::ple_convolution,
+                "PLE step requires PLE convolution storage");
+        } else if (step.op == SerialOp::gated_delta_net) {
+            require_component(
+                layout,
+                SessionStateComponent::gdn_convolution,
+                "GDN step requires GDN convolution storage");
+        } else {
+            throw std::invalid_argument(
+                "convolution-history state is attached to an unsupported operator");
+        }
+    }
+    if (has_state(required, PersistentState::sparse_index)) {
+        require_component(
+            layout,
+            SessionStateComponent::sparse_index,
+            "execution step requires sparse-index storage");
+    }
+    if (has_state(required, PersistentState::ngram_history)) {
+        require_component(
+            layout,
+            SessionStateComponent::ngram_history,
+            "execution step requires n-gram history storage");
+    }
+    if (has_state(required, PersistentState::position_history)) {
+        require_component(
+            layout,
+            SessionStateComponent::position_history,
+            "execution step requires position-history storage");
+    }
+}
+
 void validate_step_identity(
     const ExecutionStep& step,
     const ExecutionKernelBinding& binding) {
@@ -99,7 +170,9 @@ void validate_eager_execution_preflight(
     const ExecutionBindingPlan& bindings,
     const SerialExecutionIoPlan& io_plan,
     const ExecutionArenaPlan& arena_plan,
-    const EagerExecutionRequest& request) {
+    const EagerExecutionRequest& request,
+    const SerialSessionStateLayout* session_state_layout,
+    const SessionStateMemoryBinding* session_state_memory) {
     if (request.logical_rows == 0 ||
         request.request_concurrency == 0) {
         throw std::invalid_argument(
@@ -134,6 +207,22 @@ void validate_eager_execution_preflight(
             "eager execution requires a fully bound plan");
     }
 
+    if ((session_state_layout == nullptr) !=
+        (session_state_memory == nullptr)) {
+        throw std::invalid_argument(
+            "session state layout and memory must be supplied together");
+    }
+    if (session_state_layout != nullptr) {
+        validate_session_state_memory_binding(
+            *session_state_layout,
+            *session_state_memory);
+        if (request.position >=
+            session_state_layout->context_tokens) {
+            throw std::out_of_range(
+                "execution position exceeds allocated session-state capacity");
+        }
+    }
+
     std::array<std::uint64_t, 6> pending_writes{};
 
     std::uint32_t actual_bound = 0;
@@ -162,6 +251,10 @@ void validate_eager_execution_preflight(
 
         const auto required_objects =
             step.reads_state | step.writes_state;
+        if (session_state_layout != nullptr) {
+            validate_state_component_for_step(
+                *session_state_layout, step);
+        }
         if (!subset(request.state.valid, required_objects)) {
             throw std::invalid_argument(
                 "persistent state object required by an execution step is unavailable");
@@ -210,9 +303,12 @@ EagerExecutionResult execute_serial_eager(
     const ExecutionArenaPlan& arena_plan,
     const EagerExecutionRequest& request,
     EagerExecutionDispatcher& dispatcher,
-    const ExecutionMemoryBinding* memory) {
+    const ExecutionMemoryBinding* memory,
+    const SerialSessionStateLayout* session_state_layout,
+    const SessionStateMemoryBinding* session_state_memory) {
     validate_eager_execution_preflight(
-        plan, bindings, io_plan, arena_plan, request);
+        plan, bindings, io_plan, arena_plan, request,
+        session_state_layout, session_state_memory);
 
     EagerExecutionResult result;
     result.state = request.state;
@@ -247,6 +343,8 @@ EagerExecutionResult execute_serial_eager(
         context.writes = io.writes;
         context.arena = &arena_plan;
         context.memory = memory;
+        context.session_state_layout = session_state_layout;
+        context.session_state_memory = session_state_memory;
         context.reads_state = step.reads_state;
         context.writes_state = step.writes_state;
         context.logical_rows = request.logical_rows;
