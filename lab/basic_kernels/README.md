@@ -32,9 +32,7 @@ strix-basic-kernels-w32
 strix-basic-kernels-w64
 ```
 
-The two binaries are compiled with the corresponding AMD wavefront-size flag.
-Wave32 and wave64 are therefore independent candidates rather than a global
-architecture assumption.
+Wave32 uses the native RDNA compile mode. Wave64 is compiled separately with the documented experimental `-mwavefrontsize64` option. The device-side harness also checks `warpSize` at runtime so a toolchain that ignores or rejects the requested mode cannot silently qualify the binary.
 
 ## Build
 
