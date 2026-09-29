@@ -87,6 +87,29 @@ int main() {
     expect(wrong_op_rejected,
            "position launcher rejects wrong operator binding");
 
+
+    strix::ExecutionLauncherRegistry registry;
+    strix::register_default_runtime_launchers(
+        registry);
+    const auto* registered =
+        registry.find_runtime_launcher(
+            strix::SerialOp::position_prepare);
+    expect(registered != nullptr &&
+               registered->implementation_identity ==
+                   strix::position_prepare_launcher_identity &&
+               registered->function != nullptr,
+           "default runtime launcher registration exposes position prepare");
+
+    bool duplicate_default_rejected = false;
+    try {
+        strix::register_default_runtime_launchers(
+            registry);
+    } catch (const std::invalid_argument&) {
+        duplicate_default_rejected = true;
+    }
+    expect(duplicate_default_rejected,
+           "default runtime launcher registration rejects duplicate installation");
+
     if (failures == 0) {
         std::cout << "runtime launcher tests passed\n";
     }
