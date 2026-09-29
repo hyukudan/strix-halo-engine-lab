@@ -364,3 +364,33 @@ Initial semantic foundation implemented:
 Sampled speculative mathematics is source-identified (acceptance ratio and
 residual fallback), but sampled execution remains disabled until RNG stream
 identity and rejected-draft consumption are fixed.
+
+
+## Slice A1.5b — compiled eager serial runtime
+
+Implemented on the host side:
+
+- canonical public shape mapping shared by registry/binder/tooling;
+- full-plan kernel binding with strict no-missing-kernel preflight;
+- versioned per-step buffer IO for hyper, hidden, injection, routing and logits;
+- buffer generations reject stale reads and skipped writes;
+- liveness-derived physical arena with deterministic first-fit reuse;
+- alignment-aware arena layout and exact generation-to-offset lookup;
+- C1 analytical peak reproduced by the liveness allocator at byte alignment;
+- compiled kernel-plan identity plus complete execution identity including arena offsets;
+- benchmark-time noise excluded from execution identity;
+- eager dispatcher receives token id, absolute position, kernel id, state masks, exact buffer generations and arena layout;
+- persistent-state generation accounting with overflow rejected before dispatch;
+- serial session wrapper with vocabulary/context guards;
+- successful token commit advances position/state metadata only after the complete DAG;
+- mid-dispatch failure poisons the session instead of pretending persistent device state rolled back;
+- preflight failures remain recoverable and touch no dispatcher.
+
+Still pending:
+
+- target-device arena allocation and stable base pointer;
+- HIP dispatcher table for real bound kernels;
+- concrete KV/GDN/convolution/QSA state storage;
+- real token-embedding, attention, PLE and LM-head integration;
+- snapshot-backed recovery of poisoned sessions;
+- first real token/logit replay against the canonical checkpoint.
