@@ -1,0 +1,166 @@
+#include "strix/execution_binding.hpp"
+
+#include <stdexcept>
+
+namespace strix {
+namespace {
+
+kernels::ShapeClass shape_for(
+    const ModelContract& model,
+    SerialOp op,
+    const ExecutionBindingRequest& request) {
+    kernels::ShapeClass shape;
+    shape.logical_rows = request.logical_rows;
+    shape.request_concurrency = request.request_concurrency;
+    shape.hidden_size =
+        static_cast<std::uint32_t>(model.hidden_size);
+
+    switch (op) {
+    case SerialOp::gated_delta_net:
+        shape.auxiliary_size =
+            static_cast<std::uint32_t>(
+                model.gdn_value_head_dim);
+        break;
+    case SerialOp::indexed_attention:
+        shape.auxiliary_size =
+            static_cast<std::uint32_t>(model.head_dim);
+        break;
+    case SerialOp::moe_route:
+        shape.auxiliary_size =
+            static_cast<std::uint32_t>(model.num_experts);
+        break;
+    case SerialOp::moe_experts:
+    case SerialOp::shared_expert:
+        shape.auxiliary_size =
+            static_cast<std::uint32_t>(
+                model.moe_intermediate_size);
+        break;
+    case SerialOp::lm_head:
+        shape.auxiliary_size =
+            static_cast<std::uint32_t>(model.vocab_size);
+        break;
+    case SerialOp::attn_hyper_mix:
+    case SerialOp::mlp_hyper_mix:
+    case SerialOp::final_hyper_mix:
+    case SerialOp::hyper_expand:
+    case SerialOp::attn_inject:
+    case SerialOp::mlp_inject:
+        shape.auxiliary_size =
+            static_cast<std::uint32_t>(model.hc_count);
+        break;
+    case SerialOp::ple:
+        shape.auxiliary_size = 16;
+        break;
+    default:
+        shape.auxiliary_size = 0;
+        break;
+    }
+
+    return shape;
+}
+
+bool host_or_runtime_step(SerialOp op) noexcept {
+    return op == SerialOp::position_prepare;
+}
+
+}  // namespace
+
+std::optional<kernels::OperatorFamily>
+operator_family_for(SerialOp op) noexcept {
+    using kernels::OperatorFamily;
+    switch (op) {
+    case SerialOp::token_embedding:
+        return OperatorFamily::embedding_lookup;
+    case SerialOp::position_prepare:
+        return std::nullopt;
+    case SerialOp::hyper_expand:
+        return OperatorFamily::hyper_expand;
+    case SerialOp::ple:
+        return OperatorFamily::sparse_lookup;
+    case SerialOp::attn_hyper_mix:
+    case SerialOp::mlp_hyper_mix:
+    case SerialOp::final_hyper_mix:
+        return OperatorFamily::hyper_mix;
+    case SerialOp::gated_delta_net:
+        return OperatorFamily::recurrent;
+    case SerialOp::indexed_attention:
+        return OperatorFamily::indexed_attention;
+    case SerialOp::attn_inject:
+    case SerialOp::mlp_inject:
+        return OperatorFamily::elementwise_inject;
+    case SerialOp::moe_route:
+        return OperatorFamily::moe_route;
+    case SerialOp::moe_experts:
+        return OperatorFamily::moe_expert;
+    case SerialOp::shared_expert:
+        return OperatorFamily::shared_expert;
+    case SerialOp::moe_combine:
+        return OperatorFamily::moe_combine;
+    case SerialOp::lm_head:
+        return OperatorFamily::lm_head;
+    }
+    return std::nullopt;
+}
+
+ExecutionBindingPlan bind_serial_execution_plan(
+    const ModelContract& model,
+    const SerialExecutionPlan& plan,
+    const kernels::KernelRegistry& registry,
+    const ExecutionBindingRequest& request) {
+    if (const auto error = model.validate(); !error.empty()) {
+        throw std::invalid_argument(error);
+    }
+    if (request.logical_rows == 0 ||
+        request.request_concurrency == 0) {
+        throw std::invalid_argument(
+            "execution binding rows and concurrency must be non-zero");
+    }
+
+    ExecutionBindingPlan output;
+    output.bindings.reserve(plan.steps.size());
+
+    for (const auto& step : plan.steps) {
+        ExecutionKernelBinding binding;
+        binding.step_id = step.id;
+        binding.op = step.op;
+
+        if (host_or_runtime_step(step.op)) {
+            binding.host_or_runtime_step = true;
+            ++output.host_or_runtime_steps;
+            output.bindings.push_back(std::move(binding));
+            continue;
+        }
+
+        binding.family = operator_family_for(step.op);
+        if (!binding.family.has_value()) {
+            ++output.missing_steps;
+            output.bindings.push_back(std::move(binding));
+            continue;
+        }
+
+        kernels::KernelQuery query;
+        query.family = *binding.family;
+        query.phase = kernels::ExecutionPhase::decode;
+        query.shape = shape_for(model, step.op, request);
+        query.require_graph_safe =
+            request.require_graph_safe;
+        query.require_row_invariant = true;
+        query.require_deterministic = true;
+        query.minimum_qualification =
+            request.minimum_qualification;
+
+        const auto* selected = registry.select(query);
+        if (selected == nullptr) {
+            ++output.missing_steps;
+        } else {
+            binding.kernel_id = selected->id;
+            ++output.bound_steps;
+        }
+
+        output.bindings.push_back(std::move(binding));
+    }
+
+    return output;
+}
+
+}  // namespace strix
