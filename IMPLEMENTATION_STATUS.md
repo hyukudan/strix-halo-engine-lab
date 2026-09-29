@@ -313,3 +313,27 @@ Still pending:
 - CPU gather into registered/staging buffers under simultaneous GPU load;
 - direct GPU-visible sparse access experiment;
 - bounded asynchronous I/O and request coalescing integrated with the executor.
+
+
+## Slice A1.5 — correct serial executor
+
+Static execution planning implemented:
+
+- pinned serial-decode dependency DAG;
+- exact 36 recurrent / 12 indexed-attention layer pattern;
+- exact single PLE placement at the pinned one-based layer;
+- explicit attention and MLP gated-residual boundaries;
+- MoE router and shared-expert branches can begin from the same MLP input;
+- routed experts depend on routing; combine depends on routed and shared outputs;
+- persistent-state read/write masks for KV, recurrent matrix, convolution history, sparse index, n-gram history and position history;
+- conservative graph-safety and dynamic-shape flags per logical operation;
+- tests ensure stable IDs and backward-only DAG dependencies.
+
+Still pending:
+
+- binding each logical operation to qualified kernel-registry variants;
+- buffer/lifetime planning for side values such as hyper inputs and injection weights;
+- concrete KV and indexed-attention state objects;
+- real PLE asynchronous lookup integration;
+- executable eager decode loop;
+- logits/sampling/token replay against the canonical checkpoint.
