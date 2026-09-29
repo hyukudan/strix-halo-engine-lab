@@ -331,5 +331,28 @@ if(STRIX_ENABLE_HIP_RUNTIME)
             NAME strix-hip-runtime-launchers-tests
             COMMAND strix-hip-runtime-launchers-tests
         )
+
+        add_executable(
+            strix-hip-moe-route-launcher-tests
+            tests/hip_moe_route_launcher_tests.hip
+        )
+        set_target_properties(
+            strix-hip-moe-route-launcher-tests
+            PROPERTIES
+            HIP_STANDARD 20
+            HIP_STANDARD_REQUIRED ON
+            HIP_ARCHITECTURES gfx1151
+        )
+        target_link_libraries(
+            strix-hip-moe-route-launcher-tests
+            PRIVATE strix_hip_runtime
+        )
+        strix_target_warnings(
+            strix-hip-moe-route-launcher-tests
+        )
+        add_test(
+            NAME strix-hip-moe-route-launcher-tests
+            COMMAND strix-hip-moe-route-launcher-tests
+        )
     endif()
 endif()
