@@ -341,3 +341,22 @@ Still pending:
 - real PLE asynchronous lookup integration;
 - executable eager decode loop;
 - logits/sampling/token replay against the canonical checkpoint.
+
+
+## Slice A1.6 — greedy speculative execution
+
+Initial semantic foundation implemented:
+
+- pinned greedy assisted-verification contract;
+- contiguous candidate/target matching to first mismatch;
+- mandatory target-produced bonus token;
+- all-candidates-match bonus behavior;
+- EOS-inclusive truncation;
+- max-length/token-budget truncation;
+- accepted-match recomputation after truncation;
+- exact speculative target-state tail crop count;
+- zero-match cycle reduces to one ordinary target token.
+
+Sampled speculative mathematics is source-identified (acceptance ratio and
+residual fallback), but sampled execution remains disabled until RNG stream
+identity and rejected-draft consumption are fixed.
