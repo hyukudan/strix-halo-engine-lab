@@ -356,10 +356,35 @@ void validate_serial_execution_io_plan(
             }
         }
 
+        for (const auto& use : io.temporaries) {
+            const auto buffer = use.buffer;
+            if (buffer.slot >=
+                slot_limit(
+                    io_plan,
+                    buffer.buffer_class)) {
+                throw std::invalid_argument(
+                    "execution IO temporary uses an invalid buffer slot");
+            }
+            if (contains_buffer(io.reads, buffer) ||
+                contains_buffer(io.writes, buffer)) {
+                throw std::invalid_argument(
+                    "execution IO temporary aliases a semantic read/write buffer");
+            }
+            const auto flat = flat_index(buffer);
+            if (use.generation != generation[flat] + 1ULL) {
+                throw std::invalid_argument(
+                    "execution IO temporary generation is not the next slot generation");
+            }
+        }
+
         for (const auto& use : io.writes) {
             const auto flat = flat_index(use.buffer);
             generation[flat] = use.generation;
             produced[flat] = true;
+        }
+        for (const auto& use : io.temporaries) {
+            const auto flat = flat_index(use.buffer);
+            generation[flat] = use.generation;
         }
     }
 }
