@@ -188,6 +188,8 @@ void restore_serial_session_snapshot(
     const SessionSnapshotMemoryBinding& snapshot_memory,
     SessionSnapshotTransferBackend& backend) {
     if (session.execution_identity == 0 ||
+        session.execution_identity !=
+            restore.compiled_execution_identity ||
         session.runtime_compatibility_identity == 0 ||
         session.state_layout_identity == 0) {
         throw std::invalid_argument(
@@ -203,6 +205,8 @@ void restore_serial_session_snapshot(
             "restore plan is incompatible with serial session");
     }
     if (snapshot_memory.snapshot_plan_identity == 0 ||
+        snapshot_memory.snapshot_plan_identity !=
+            restore.snapshot_plan_identity ||
         snapshot_memory.allocation_generation == 0) {
         throw std::invalid_argument(
             "restore requires initialized snapshot memory");
