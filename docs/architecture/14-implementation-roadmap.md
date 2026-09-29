@@ -137,6 +137,12 @@ The runtime has measured transport capabilities and can schedule independent tra
 
 ### A1.0 — Kernel registry and basic exact kernels
 
+Status: **registry and basic gfx1151 kernel harness implemented; native qualification pending**.
+
+The host-side registry now records operator family, execution phase, exact shape class, wave size, workgroup/resource metadata, numerical contract, graph-safety status, qualification state, compiler identity and measured cost. Selection is deterministic and plan identity excludes benchmark noise.
+
+The standalone HIP lab now contains FP32 RMSNorm, residual add, partial RoPE, deterministic argmax and deterministic small-k top-k. It builds native Wave32 and explicit Wave64 candidates for `gfx1151`, verifies the compiled device `warpSize`, tests true solo-versus-batched row invariance, and emits timing plus function-resource metadata. No variant is target-qualified until it runs on the native Strix Halo host.
+
 Implement:
 
 - kernel registry;
