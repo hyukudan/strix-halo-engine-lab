@@ -240,7 +240,7 @@ std::string json_string_or_null(const std::optional<std::string>& value) {
     if (!value.has_value()) {
         return "null";
     }
-    std::string escaped = """;
+    std::string escaped = "\"";
     for (const char character : *value) {
         if (character == '\\' || character == '"') {
             escaped.push_back('\\');
