@@ -17,7 +17,7 @@ The distributed design SHOULD support:
 - memory-capacity aggregation;
 - two-node low-latency execution as the primary distributed case;
 - three-node direct-link topologies where available;
-- multiple physical links between the same two nodes;
+- multiple physical USB4 links between the same two nodes;
 - graceful fallback to a simpler transport.
 
 The primary optimization target remains low-latency local inference, not large-cluster throughput.
@@ -33,13 +33,30 @@ A transport instance SHOULD report capabilities such as:
 - full-duplex capability;
 - maximum practical transfer size;
 - number of physical links;
-- whether links are independent;
+- whether links are independently schedulable;
+- whether links share an upstream bottleneck;
 - host-copy requirements;
 - GPU-visible mapped-buffer capability;
 - completion semantics;
 - disconnect and recovery behavior.
 
 Model code MUST NOT call sockets, character devices, or kernel-specific APIs directly.
+
+## Transport API shape
+
+The transport abstraction SHOULD be able to express operations equivalent to:
+
+```text
+capabilities(peer)
+prepare_send(buffer, bytes, metadata)
+prepare_recv(buffer, bytes, metadata)
+submit()
+poll_or_wait()
+cancel()
+health()
+```
+
+The exact API may differ, but ownership and completion MUST remain explicit.
 
 ## Control plane and data plane
 
@@ -70,9 +87,9 @@ Bulk data includes:
 - logits or partial logits;
 - other explicitly planned tensor boundaries.
 
-## USB4STREAM
+## USB4 direct streaming
 
-Where the deployed Linux kernel provides USB4STREAM, it SHOULD be evaluated as the preferred direct host-to-host bulk transport.
+Where the deployed Linux kernel provides direct USB4 streaming support, it SHOULD be evaluated as the preferred direct host-to-host bulk transport.
 
 The architecture SHOULD treat it as a byte-stream/message transport over USB4 rather than as conventional IP networking.
 
@@ -95,7 +112,7 @@ A single USB4 link MUST be qualified before link aggregation.
 
 The baseline qualification MUST measure:
 
-- QD1 one-way latency;
+- queue-depth-one one-way latency;
 - round-trip latency;
 - sustained one-way bandwidth;
 - simultaneous bidirectional bandwidth;
@@ -111,15 +128,18 @@ A transport microbenchmark is not sufficient; the same link MUST be measured ins
 
 Systems with two usable USB4 ports MAY connect both ports between the same two hosts.
 
-The engine SHOULD support dual-link operation as a transport capability, not as an assumption.
+Dual-link operation is an explicit target.
+
+The engine SHOULD expose each physical link separately to the transport scheduler.
 
 Two links MUST NOT be treated as twice the bandwidth until topology and simultaneous-transfer measurements prove it.
 
-The platform probe SHOULD identify:
+The platform probe MUST attempt to identify:
 
 - physical USB4 host routers;
 - port-to-router mapping;
 - negotiated link rate per port;
+- peer mapping;
 - shared upstream topology;
 - interrupt affinity;
 - whether each link remains fully active under simultaneous traffic.
@@ -128,13 +148,13 @@ The platform probe SHOULD identify:
 
 The transport layer SHOULD support several policies.
 
-### 1. Independent directional links
+### Independent directional links
 
 One physical link MAY primarily carry A-to-B traffic and the other B-to-A traffic.
 
 This is attractive when the workload is naturally full duplex and can reduce contention without requiring message striping.
 
-### 2. Message striping
+### Message striping
 
 Large tensors MAY be divided into chunks and transferred over both links concurrently.
 
@@ -147,13 +167,13 @@ Striping MUST preserve:
 
 Small latency-sensitive tensors SHOULD NOT be striped unless measurements show a benefit, because synchronization and reassembly overhead can exceed transfer time.
 
-### 3. Flow-level distribution
+### Flow-level distribution
 
 Independent tensor transfers MAY be assigned to different links.
 
 This is often preferable to striping because it avoids reassembly and can overlap different pipeline stages.
 
-### 4. Role specialization
+### Role specialization
 
 One link MAY be reserved for a latency-critical class while the other carries larger or background transfers.
 
@@ -169,7 +189,10 @@ The distributed scheduler SHOULD know:
 - available links;
 - recent per-link latency;
 - recent per-link bandwidth;
-- current in-flight bytes.
+- directional utilization;
+- current in-flight bytes;
+- reassembly cost;
+- whether another independent tensor can use the second link.
 
 It MAY choose the link policy per tensor.
 
@@ -206,7 +229,7 @@ The engine MUST therefore measure:
 - direct mapped output;
 - GPU-to-staging copy;
 - CPU-assisted staging;
-- file or network-stack alternatives where relevant.
+- network-stack baseline where relevant.
 
 ## Model partitioning
 
@@ -245,7 +268,7 @@ Overlap MUST NOT change the deterministic single-node semantic contract.
 
 Two nodes connected directly are the primary distributed target.
 
-Where both systems expose two qualified USB4 ports, dual-link direct connection SHOULD be tested.
+Where both systems expose two qualified USB4 ports, dual-link direct connection SHOULD be tested and retained as a first-class topology.
 
 ### Three nodes
 
@@ -259,7 +282,7 @@ Larger clusters are secondary.
 
 They MAY use:
 
-- a mixed USB4 and Ethernet topology;
+- mixed USB4 and Ethernet topology;
 - host-specific high-speed NICs;
 - external switches or adapters.
 
@@ -290,8 +313,9 @@ Multi-node execution is qualified only when it passes:
 - reconnect tests;
 - peer restart tests;
 - one-link and dual-link tests;
+- directional, flow-level and striped dual-link policies;
 - simultaneous bidirectional stress;
-- memory-pressure tests on both hosts;
+- memory-pressure tests on all hosts;
 - repeated model load/unload;
 - sustained soak tests.
 
