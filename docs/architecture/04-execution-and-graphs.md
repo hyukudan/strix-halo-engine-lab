@@ -67,6 +67,44 @@ Full-vocabulary logits are accounted separately from internal decode scratch. Th
 
 Future LM-head/sampling fusion MAY avoid materializing the full logits buffer, but that optimization must preserve the sampling contract.
 
+
+## Compiled execution identity
+
+Before a serial plan can execute, the runtime SHOULD compile the following into one immutable execution object:
+
+- static operator DAG;
+- selected kernel ids;
+- versioned buffer reads and writes;
+- liveness-derived arena offsets;
+- persistent-state access masks;
+- logical row and concurrency shape.
+
+The compiled identity MUST change when any execution-relevant model geometry, kernel identity, buffer layout, numerical-plan input or arena layout changes.
+
+Measured benchmark time MUST NOT contribute to this identity.
+
+Snapshots and future graph instances MAY reference the compiled execution identity rather than reconstructing compatibility from individual flags.
+
+## Buffer generations and arena layout
+
+Physical scratch reuse MUST be derived from logical buffer generations.
+
+Each write creates a new generation. Every read binds to the exact generation it consumes.
+
+The static arena allocator MAY alias two generations only when their live intervals do not overlap.
+
+A dispatcher MUST receive both the logical generation and the resolved arena plan so a reused physical address cannot be mistaken for the previous contents of that slot.
+
+## Eager failure containment
+
+Eager execution performs a complete structural/state preflight before the first dispatch.
+
+Preflight failure leaves the session reusable.
+
+Once dispatch begins, a device kernel may mutate persistent KV, recurrent or sparse state before a later step fails. Unless an explicit rollback snapshot has been restored, such a session MUST be marked poisoned and MUST NOT continue decoding.
+
+Position, committed-token counters and published generation metadata advance only after the complete serial DAG succeeds.
+
 ## Graph capture
 
 HIP graph capture SHOULD be used for stable decode and verification shapes when it measurably reduces launch overhead.
