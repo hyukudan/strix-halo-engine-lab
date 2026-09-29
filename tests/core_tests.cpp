@@ -148,6 +148,9 @@ int main() {
     expect(model.hc_count == 4 &&
                model.hc_lowrank == 320,
            "official hyper-connection geometry is explicit");
+    expect(model.rms_norm_epsilon == 1e-6F &&
+               model.norm_topk_probability,
+           "official RMS/router policy is explicit");
     expect(model.hidden_size == 2560 &&
                model.moe_intermediate_size == 640 &&
                model.shared_expert_intermediate_size == 640 &&
