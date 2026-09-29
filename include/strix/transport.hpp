@@ -44,9 +44,13 @@ enum class PlanKind {
 struct TransferDescriptor {
     std::uint32_t protocol_version = 1;
     std::uint64_t connection_epoch = 0;
+    std::uint64_t model_plan_id = 0;
     std::uint64_t request_id = 0;
     std::uint64_t generation = 0;
+    std::uint64_t boundary_id = 0;
     std::uint64_t sequence = 0;
+    std::uint64_t shape_fingerprint = 0;
+    std::uint32_t dtype_id = 0;
     std::uint64_t byte_length = 0;
 };
 
