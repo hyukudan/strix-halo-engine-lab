@@ -160,6 +160,12 @@ Basic optimized GPU operations match their references and can be selected reprod
 
 ### A1.1 — Packed decode projection
 
+Status: **packed-projection planner and Q8_0 reference kernel harness implemented; canonical compact format pending**.
+
+The core now exposes GGML physical block geometry and a low-row planner for row classes 1/2/4/8. It reports exact packed bytes per output row, total tensor bytes, activation bytes, serial repeated-weight traffic and the ideal lower bound when one packed weight stream is reused across rows.
+
+The standalone HIP lab implements Q8_0 as an auditable packed-format reference. One workgroup owns one output feature and decodes each packed weight once while accumulating all compile-time logical rows. Separate Wave32 and Wave64 builds verify row invariance, report timing/resource metadata and expose how register/LDS cost grows with row count. Q8_0 is not the canonical single-node checkpoint decision.
+
 Implement the first low-row-count projection kernel that consumes packed weights directly.
 
 Target order:
