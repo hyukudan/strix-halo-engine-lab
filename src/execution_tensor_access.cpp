@@ -102,12 +102,12 @@ build_serial_execution_tensor_requirements(
             push(step, 2, TensorRole::dense_projection,
                  TensorRequirementCardinality::exactly_one,
                  "hc_attn_up");
+            push(step, 3, TensorRole::dense_projection,
+                 TensorRequirementCardinality::exactly_one,
+                 "hc_attn_inject");
             break;
 
         case SerialOp::attn_inject:
-            push(step, 0, TensorRole::dense_projection,
-                 TensorRequirementCardinality::exactly_one,
-                 "hc_attn_inject");
             break;
 
         case SerialOp::mlp_hyper_mix:
@@ -120,12 +120,12 @@ build_serial_execution_tensor_requirements(
             push(step, 2, TensorRole::dense_projection,
                  TensorRequirementCardinality::exactly_one,
                  "hc_ffn_up");
+            push(step, 3, TensorRole::dense_projection,
+                 TensorRequirementCardinality::exactly_one,
+                 "hc_ffn_inject");
             break;
 
         case SerialOp::mlp_inject:
-            push(step, 0, TensorRole::dense_projection,
-                 TensorRequirementCardinality::exactly_one,
-                 "hc_ffn_inject");
             break;
 
         case SerialOp::gated_delta_net:
