@@ -8,6 +8,27 @@
 namespace strix {
 namespace {
 
+
+constexpr std::uint64_t fnv_offset =
+    14695981039346656037ULL;
+constexpr std::uint64_t fnv_prime =
+    1099511628211ULL;
+
+void hash_u64(std::uint64_t& hash, std::uint64_t value) noexcept {
+    for (unsigned shift = 0; shift < 64; shift += 8) {
+        hash ^= (value >> shift) & 0xffULL;
+        hash *= fnv_prime;
+    }
+}
+
+void hash_text(std::uint64_t& hash, std::string_view value) noexcept {
+    for (const unsigned char byte : value) {
+        hash ^= static_cast<std::uint64_t>(byte);
+        hash *= fnv_prime;
+    }
+    hash_u64(hash, value.size());
+}
+
 bool contains(std::string_view value, std::string_view needle) noexcept {
     return value.find(needle) != std::string_view::npos;
 }
@@ -147,6 +168,45 @@ std::string_view to_string(PlacementKind kind) noexcept {
     return "local";
 }
 
+
+std::uint64_t model_manifest_layout_identity(
+    const ModelManifest& manifest) noexcept {
+    std::uint64_t hash = fnv_offset;
+    hash_text(hash, manifest.architecture);
+    hash_u64(hash, manifest.tensors.size());
+
+    for (const auto& tensor : manifest.tensors) {
+        hash_text(hash, tensor.name);
+        hash_u64(hash, tensor.dimensions.size());
+        for (const auto dimension : tensor.dimensions) {
+            hash_u64(hash, dimension);
+        }
+        hash_u64(hash, tensor.ggml_type);
+        hash_u64(hash, tensor.byte_size);
+        hash_u64(hash, tensor.absolute_offset);
+        hash_u64(
+            hash,
+            static_cast<std::uint64_t>(
+                tensor.role));
+        hash_u64(
+            hash,
+            static_cast<std::uint64_t>(
+                tensor.residency));
+        hash_u64(
+            hash,
+            static_cast<std::uint64_t>(
+                tensor.placement.kind));
+        hash_u64(hash, tensor.placement.node);
+        hash_u64(
+            hash,
+            tensor.layer.has_value()
+                ? static_cast<std::uint64_t>(*tensor.layer) + 1ULL
+                : 0ULL);
+    }
+
+    return hash;
+}
+
 ModelManifest build_model_manifest(const gguf::FileInfo& info) {
     ModelManifest manifest;
     if (const auto* architecture = info.find_metadata("general.architecture");
@@ -178,6 +238,12 @@ ModelManifest build_model_manifest(const gguf::FileInfo& info) {
             ++manifest.unknown_tensor_count;
         }
         manifest.tensors.push_back(std::move(entry));
+    }
+    manifest.layout_identity =
+        model_manifest_layout_identity(manifest);
+    if (manifest.layout_identity == 0) {
+        throw std::logic_error(
+            "model manifest layout identity must be non-zero");
     }
     return manifest;
 }
