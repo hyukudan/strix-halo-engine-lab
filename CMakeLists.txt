@@ -22,6 +22,7 @@ add_library(strix_core STATIC
     src/execution_binding.cpp
     src/execution_buffers.cpp
     src/execution_plan.cpp
+    src/execution_runtime.cpp
     src/gguf_reader.cpp
     src/kernel_registry.cpp
     src/iq4_xs.cpp
@@ -119,6 +120,11 @@ if(BUILD_TESTING)
     target_link_libraries(strix-execution-binding-tests PRIVATE strix_core)
     strix_target_warnings(strix-execution-binding-tests)
     add_test(NAME strix-execution-binding-tests COMMAND strix-execution-binding-tests)
+
+    add_executable(strix-execution-runtime-tests tests/execution_runtime_tests.cpp)
+    target_link_libraries(strix-execution-runtime-tests PRIVATE strix_core)
+    strix_target_warnings(strix-execution-runtime-tests)
+    add_test(NAME strix-execution-runtime-tests COMMAND strix-execution-runtime-tests)
 
     add_executable(strix-speculation-tests tests/speculation_tests.cpp)
     target_link_libraries(strix-speculation-tests PRIVATE strix_core)
