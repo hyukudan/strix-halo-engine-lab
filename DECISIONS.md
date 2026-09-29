@@ -15,6 +15,7 @@
 | D-009 | Separar motor, gateway/chat y administración como dominios de privilegio. | Una UI cómoda no debe ganar control directo del proceso GPU ni shell. | E-016, O-14, O-15. | Permanente salvo modelo de amenazas revisado. |
 | D-010 | Tratar repositorio, paper y checkpoint oficiales de Qwen como fuente primaria de arquitectura. | Permite especificar contratos sin inferirlos de motores ajenos. | E-020, E-021. | Reabrir si Qwen publica revisión incompatible; fijar siempre SHA. |
 | D-011 | Exponer GTT casi máximo, pero admitir cargas con una reserva efectiva independiente de 16–20 GiB. | GTT amplía el mapping; no crea RAM ni protege al host de OOM. | E-022, E-023, `MEMORY_BUDGET.md`. | Ajustar reserva solo con telemetría del hardware real. |
+| D-012 | Mantener inicialmente el perfil mononodo de 128 GiB dentro de un envelope aproximado de 100 GiB de pesos residentes, hasta que A0.6 justifique otro límite. | Preserva la reserva efectiva y deja capacidad para KV, recurrencia, scratch, runtime y recuperación; evita convertir el GTT máximo en presupuesto de carga. | E-011, E-028, E-032, E-033. | Reabrir tras medidas UMA reales y calidad de las cuantizaciones candidatas. |
 
 ## Pendientes
 
