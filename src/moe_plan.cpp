@@ -125,3 +125,47 @@ MoeRoutePlan build_moe_route_plan(const MoeRouteRequest& request) {
 }
 
 }  // namespace strix
+
+
+namespace strix {
+
+MoeGroupingPlan build_moe_grouping_plan(
+    const MoeRouteRequest& request) {
+    // Reuse route validation and counts so grouping cannot accept a route that
+    // the cost planner would reject.
+    const auto route = build_moe_route_plan(request);
+
+    MoeGroupingPlan plan;
+    plan.expert_count = request.expert_count;
+    plan.assignments = route.assignments;
+    plan.expert_offsets.resize(
+        static_cast<std::size_t>(request.expert_count) + 1U, 0);
+
+    for (std::uint32_t expert = 0; expert < request.expert_count; ++expert) {
+        plan.expert_offsets[static_cast<std::size_t>(expert) + 1U] =
+            plan.expert_offsets[expert] +
+            route.expert_assignment_counts[expert];
+    }
+
+    plan.assignment_rows.resize(
+        static_cast<std::size_t>(route.assignments));
+    plan.assignment_slots.resize(
+        static_cast<std::size_t>(route.assignments));
+
+    auto cursors = plan.expert_offsets;
+    for (std::uint32_t row = 0; row < request.rows; ++row) {
+        const auto begin =
+            static_cast<std::size_t>(row) * request.experts_per_row;
+        for (std::uint32_t slot = 0; slot < request.experts_per_row; ++slot) {
+            const auto expert = request.selected_experts[begin + slot];
+            auto& cursor = cursors[expert];
+            const auto output = static_cast<std::size_t>(cursor++);
+            plan.assignment_rows[output] = row;
+            plan.assignment_slots[output] = slot;
+        }
+    }
+
+    return plan;
+}
+
+}  // namespace strix
