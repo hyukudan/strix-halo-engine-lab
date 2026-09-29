@@ -4,7 +4,7 @@ This directory is the normative architecture guide for the inference engine.
 
 It intentionally contains no project comparisons, repository names, benchmark anecdotes, reverse-engineering notes, or source-provenance discussion. It describes only the technical decisions that should shape an inference runtime designed specifically for AMD Strix Halo-class systems.
 
-The target is a Linux-native, ROCm/HIP inference engine optimized first for `gfx1151`, unified physical memory, high memory capacity, low-latency local serving, and an optional multi-node extension over high-speed direct host links.
+The target is a Linux-native, ROCm/HIP inference engine optimized first for `gfx1151`, unified physical memory, high memory capacity, low-latency local serving, and optional multi-node execution over direct high-speed host links.
 
 ## Decision language
 
@@ -26,7 +26,8 @@ In order:
 5. Long-context capacity without destabilizing the host.
 6. Reproducible kernel selection and tuning.
 7. Multi-node scaling without penalizing the single-node fast path.
-8. Operational recoverability.
+8. Topology-aware use of one or more direct USB4 links.
+9. Operational recoverability.
 
 Peak microbenchmark throughput is never sufficient by itself to justify a design.
 
@@ -45,6 +46,7 @@ Peak microbenchmark throughput is never sufficient by itself to justify a design
 - [11 — Runtime observability and recovery](architecture/11-runtime-observability-and-recovery.md)
 - [12 — Multi-node and USB4 interconnect](architecture/12-multi-node-and-usb4.md)
 - [13 — Platform discovery and capability negotiation](architecture/13-platform-discovery.md)
+- [14 — Implementation roadmap](architecture/14-implementation-roadmap.md)
 
 ## Change rule
 
