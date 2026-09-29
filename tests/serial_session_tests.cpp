@@ -445,10 +445,17 @@ int main() {
             0,
         });
 
+    strix::ExecutionTensorAccessPlan model_tensor_access;
+    model_tensor_access.manifest_layout_identity =
+        manifest.layout_identity;
+    model_tensor_access.plan_identity =
+        0xfaceULL;
+
     strix::ExecutionRuntimeResources resources;
     resources.scratch = &memory;
     resources.model_manifest = &manifest;
     resources.model_weights = &model_weights;
+    resources.tensor_access = &model_tensor_access;
     resources.session_state_layout =
         &state_layout;
     resources.session_state_memory =
