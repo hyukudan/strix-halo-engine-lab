@@ -11,14 +11,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Configure core
-        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
-
-      - name: Build core
-        run: cmake --build build
-
-      - name: Test core and oracles
-        run: ctest --test-dir build --output-on-failure
+      - name: Configure, build and test core
+        shell: bash
+        run: |
+          set -o pipefail
+          {
+            cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+            cmake --build build
+            ctest --test-dir build --output-on-failure
+          } 2>&1 | tee host-build.log
 
       - name: Configure UMA host lab
         run: cmake -S lab/uma_residency -B build/uma-residency -G Ninja -DCMAKE_BUILD_TYPE=Release
@@ -69,6 +70,14 @@ jobs:
           cat client-stream.json
           cat server-stream.json
 
+      - name: Upload host build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: host-build-log
+          path: host-build.log
+          if-no-files-found: ignore
+
 
   hip-offline-build:
     runs-on: ubuntu-latest
@@ -78,21 +87,31 @@ jobs:
       - name: Build gfx1151 HIP labs offline
         shell: bash
         run: |
-          set -euo pipefail
-          image='rocm/dev-ubuntu-24.04@sha256:bdc8e61026cbb844ede93d44d2c50055f51ebb2041906b60182bf3bee3139054'
-          docker pull "$image"
-          docker run --rm \
-            -v "$PWD:/work" \
-            -w /work \
-            "$image" \
-            bash -lc '
-              set -euo pipefail
-              apt-get update
-              DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends cmake ninja-build
-              cmake -S lab/basic_kernels -B build/basic-kernels-offline -G Ninja -DCMAKE_BUILD_TYPE=Release
-              cmake --build build/basic-kernels-offline
-              cmake -S lab/packed_projection -B build/packed-projection-offline -G Ninja -DCMAKE_BUILD_TYPE=Release
-              cmake --build build/packed-projection-offline
-              cmake -S lab/uma_residency -B build/uma-residency-hip-offline -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRIX_UMA_ENABLE_HIP=ON
-              cmake --build build/uma-residency-hip-offline --target strix-uma-hip
-            '
+          set -o pipefail
+          {
+            image='rocm/dev-ubuntu-24.04@sha256:bdc8e61026cbb844ede93d44d2c50055f51ebb2041906b60182bf3bee3139054'
+            docker pull "$image"
+            docker run --rm \
+              -v "$PWD:/work" \
+              -w /work \
+              "$image" \
+              bash -lc '
+                set -euo pipefail
+                apt-get update
+                DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends cmake ninja-build
+                cmake -S lab/basic_kernels -B build/basic-kernels-offline -G Ninja -DCMAKE_BUILD_TYPE=Release
+                cmake --build build/basic-kernels-offline
+                cmake -S lab/packed_projection -B build/packed-projection-offline -G Ninja -DCMAKE_BUILD_TYPE=Release
+                cmake --build build/packed-projection-offline
+                cmake -S lab/uma_residency -B build/uma-residency-hip-offline -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRIX_UMA_ENABLE_HIP=ON
+                cmake --build build/uma-residency-hip-offline --target strix-uma-hip
+              '
+          } 2>&1 | tee hip-offline-build.log
+
+      - name: Upload HIP offline build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hip-offline-build-log
+          path: hip-offline-build.log
+          if-no-files-found: ignore
