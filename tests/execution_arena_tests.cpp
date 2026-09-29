@@ -2,6 +2,8 @@
 
 #include "strix/model_contract.hpp"
 
+#include <algorithm>
+
 #include <iostream>
 #include <stdexcept>
 
@@ -61,6 +63,37 @@ int main() {
     expect(aligned.total_bytes <
                aligned.naive_nonaliased_bytes,
            "aligned arena still reuses dead lifetimes");
+
+
+    const auto shared_it =
+        std::find_if(
+            io.steps.begin(),
+            io.steps.end(),
+            [](const auto& step) {
+                return step.op ==
+                    strix::SerialOp::shared_expert;
+            });
+    expect(
+        shared_it != io.steps.end() &&
+            shared_it->temporaries.size() == 1,
+        "arena fixture exposes shared-expert temporary");
+    if (shared_it != io.steps.end() &&
+        !shared_it->temporaries.empty()) {
+        const auto* temporary =
+            strix::find_arena_allocation(
+                aligned,
+                shared_it->temporaries[0]);
+        expect(
+            temporary != nullptr &&
+                temporary->first_step ==
+                    temporary->last_step,
+            "temporary workspace has one-step lifetime");
+        expect(
+            temporary != nullptr &&
+                temporary->bytes ==
+                    sizes.mlp_intermediate_bytes,
+            "temporary workspace uses analytical MLP size");
+    }
 
     const auto& lm_io = io.steps.back();
     expect(lm_io.op == strix::SerialOp::lm_head &&
