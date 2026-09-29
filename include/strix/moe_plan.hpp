@@ -1,0 +1,40 @@
+#pragma once
+
+#include <cstdint>
+#include <span>
+#include <vector>
+
+namespace strix {
+
+struct MoeRouteRequest {
+    std::uint32_t rows = 0;
+    std::uint32_t experts_per_row = 0;
+    std::uint32_t expert_count = 0;
+    std::uint64_t packed_weight_bytes_per_expert = 0;
+    std::span<const std::uint32_t> selected_experts;
+};
+
+struct MoeRoutePlan {
+    std::uint32_t rows = 0;
+    std::uint32_t experts_per_row = 0;
+    std::uint32_t expert_count = 0;
+    std::uint32_t distinct_experts = 0;
+    std::uint32_t maximum_rows_per_expert = 0;
+    std::uint32_t minimum_rows_per_touched_expert = 0;
+    double mean_rows_per_touched_expert = 0.0;
+    double mean_adjacent_row_overlap = 0.0;
+
+    std::uint64_t assignments = 0;
+    std::uint64_t packed_weight_bytes_per_expert = 0;
+    std::uint64_t direct_assignment_weight_bytes = 0;
+    std::uint64_t ideal_grouped_weight_bytes = 0;
+    std::uint64_t ideal_grouped_weight_bytes_saved = 0;
+
+    std::vector<std::uint32_t> expert_assignment_counts;
+    std::vector<std::uint32_t> touched_experts;
+};
+
+[[nodiscard]] MoeRoutePlan build_moe_route_plan(
+    const MoeRouteRequest& request);
+
+}  // namespace strix
