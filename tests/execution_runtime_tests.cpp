@@ -134,7 +134,7 @@ int main() {
     RecordingDispatcher dispatcher;
     const auto result =
         strix::execute_serial_eager(
-            plan, bindings, request, dispatcher);
+            plan, bindings, io, request, dispatcher);
 
     expect(result.completed_steps == plan.steps.size(),
            "eager executor completes every serial-plan step");
