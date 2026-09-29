@@ -34,6 +34,18 @@ int main() {
     expect(strix::classify_tensor_role("blk.7.shared_expert.gate_proj.weight") ==
                TensorRole::dense_projection,
            "shared expert is not misclassified as routed expert");
+    expect(strix::classify_tensor_role("blk.7.ffn_gate_up_exps.weight") ==
+               TensorRole::moe_expert,
+           "Qwen4Exp packed expert tensor is classified as routed expert");
+    expect(strix::classify_tensor_role("blk.7.ffn_gate_inp_shexp.weight") ==
+               TensorRole::dense_projection,
+           "Qwen4Exp shared-expert gate is not classified as router");
+    expect(strix::classify_tensor_role("blk.7.hc_attn_down.weight") ==
+               TensorRole::dense_projection,
+           "Qwen4Exp hyper-connection projection is classified");
+    expect(strix::classify_tensor_role("blk.1.ple_key.weight") ==
+               TensorRole::ple_parameter,
+           "Qwen4Exp PLE parameter is not treated as n-gram table");
     expect(strix::default_residency(TensorRole::moe_expert) == ResidencyPolicy::resident,
            "experts remain resident by default");
     expect(strix::default_residency(TensorRole::ngram_table) ==
