@@ -20,6 +20,7 @@ endfunction()
 
 add_library(strix_core STATIC
     src/compiled_execution.cpp
+    src/dispatch_resources.cpp
     src/execution_arena.cpp
     src/execution_binding.cpp
     src/execution_buffers.cpp
@@ -159,6 +160,11 @@ if(BUILD_TESTING)
     target_link_libraries(strix-execution-resources-tests PRIVATE strix_core)
     strix_target_warnings(strix-execution-resources-tests)
     add_test(NAME strix-execution-resources-tests COMMAND strix-execution-resources-tests)
+
+    add_executable(strix-dispatch-resources-tests tests/dispatch_resources_tests.cpp)
+    target_link_libraries(strix-dispatch-resources-tests PRIVATE strix_core)
+    strix_target_warnings(strix-dispatch-resources-tests)
+    add_test(NAME strix-dispatch-resources-tests COMMAND strix-dispatch-resources-tests)
 
     add_executable(strix-compiled-execution-tests tests/compiled_execution_tests.cpp)
     target_link_libraries(strix-compiled-execution-tests PRIVATE strix_core)
