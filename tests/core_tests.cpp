@@ -145,6 +145,9 @@ int main() {
            "official layer pattern and hyper-connection geometry are explicit");
     expect(model.max_position_embeddings == 262144,
            "official maximum context is explicit");
+    expect(model.hc_count == 4 &&
+               model.hc_lowrank == 320,
+           "official hyper-connection geometry is explicit");
     expect(model.hidden_size == 2560 &&
                model.moe_intermediate_size == 640 &&
                model.shared_expert_intermediate_size == 640 &&
