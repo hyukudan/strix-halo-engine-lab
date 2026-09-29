@@ -23,6 +23,7 @@ struct SerialSessionContext {
 [[nodiscard]] EagerExecutionResult execute_serial_token(
     const CompiledSerialExecution& compiled,
     SerialSessionContext& session,
+    const ExecutionMemoryBinding& memory,
     std::uint32_t input_token_id,
     EagerExecutionDispatcher& dispatcher);
 
