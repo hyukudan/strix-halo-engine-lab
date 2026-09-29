@@ -10,6 +10,9 @@ namespace strix {
 struct ModelContract {
     std::uint64_t hidden_size = 2560;
     std::uint64_t hidden_layers = 48;
+    std::uint64_t full_attention_interval = 4;
+    std::uint64_t ple_layer_1based = 2;
+    std::uint64_t hc_count = 4;
     std::uint64_t full_attention_layers = 12;
     std::uint64_t gdn_layers = 36;
     std::uint64_t attention_heads = 24;
