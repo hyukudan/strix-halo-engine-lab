@@ -106,6 +106,27 @@ More advanced modes MAY use:
 
 Every more direct mode MUST retain a simpler fallback.
 
+## Transport capability tiers
+
+Direct USB4 streaming describes the inter-host transport path; it does not by itself imply mapped userspace buffers, DMA-BUF interoperability or GPU-direct DMA.
+
+The runtime SHOULD qualify transport in explicit tiers:
+
+1. copy-based userspace streaming;
+2. registered or mapped host buffers when supported;
+3. GPU-visible shared staging with proven ownership and visibility;
+4. external-DMA production or consumption only when the exact kernel/runtime/driver synchronization contract is proven.
+
+A higher tier MUST NOT be inferred from the presence of a direct-stream device.
+
+## Logical streams and physical links
+
+A logical transport stream MUST reference a physical-link identity.
+
+Multiple logical streams over one physical connection MAY improve flow separation or software scheduling, but they MUST share the measured capacity budget of that physical link.
+
+The scheduler MUST NOT count logical device nodes as independent physical bandwidth resources.
+
 ## One link first
 
 A single USB4 link MUST be qualified before link aggregation.
@@ -198,6 +219,17 @@ It MAY choose the link policy per tensor.
 
 Static round-robin SHOULD be only a baseline.
 
+Striping thresholds SHOULD be derived from an end-to-end transfer cost model equivalent to:
+
+```text
+single = setup_single + payload / measured_single_bandwidth
+striped = setup_dual + reassembly + payload / measured_concurrent_bandwidth
+```
+
+The measured concurrent bandwidth MUST come from simultaneous operation, not the sum of isolated link results.
+
+Small latency-critical messages SHOULD prefer flow-level scheduling or one-link transfer unless striping proves a complete-path benefit.
+
 ## Buffer ownership
 
 Transport buffers require explicit ownership states.
@@ -213,6 +245,8 @@ A buffer SHOULD move through states similar to:
 7. reusable.
 
 GPU and external-DMA synchronization MUST be proven for the exact buffer type in use.
+
+Transport completion MUST distinguish local submission, local buffer-reuse permission, remote receive completion and semantic commit. These events MUST NOT be collapsed into one completion flag unless the backend contract proves they are equivalent.
 
 A device synchronization primitive that only orders GPU queues MUST NOT be assumed to establish visibility for writes performed by an external DMA engine.
 
@@ -233,7 +267,13 @@ The engine MUST therefore measure:
 
 ## Model partitioning
 
-The first distributed partition SHOULD minimize transfers on the decode critical path.
+The first distributed partition SHOULD minimize uncovered transfers on the decode critical path.
+
+Distributed planning MUST identify its objective as latency, throughput or capacity.
+
+A whole-layer or block partition SHOULD be qualified as the simplest capacity-oriented baseline because persistent layer state can remain with its owner and boundary count is small.
+
+Tensor-parallel or operator-parallel candidates MUST NOT be rejected merely because they introduce more synchronization. They SHOULD be compared when concurrent compute or reduced local memory traffic may outweigh communication.
 
 Partition decisions MUST consider:
 
@@ -246,6 +286,8 @@ Partition decisions MUST consider:
 - speculative verification traffic.
 
 A mathematically balanced partition can still be slower if it crosses the interconnect too often.
+
+The relevant latency comparison is total critical-path compute plus uncovered communication and synchronization, not parameter balance or synchronization count in isolation.
 
 The engine SHOULD prefer partitions with fewer, larger, predictable boundary transfers over many small synchronization-heavy transfers.
 
@@ -274,6 +316,8 @@ Where both systems expose two qualified USB4 ports, dual-link direct connection 
 
 With two ports per node, a three-node direct ring or triangle MAY be supported.
 
+A three-node triangle that consumes both ports of every node provides one direct physical connection per pair; it does not also provide dual physical links between each pair. Topology profiles MUST represent these as different capabilities.
+
 Topology-aware placement SHOULD prefer a direct neighbor for latency-critical communication.
 
 ### More nodes
@@ -301,6 +345,29 @@ On link failure, the engine SHOULD:
 5. fail the request cleanly if semantic continuity cannot be guaranteed.
 
 A failed second link MUST NOT force failure if the workload can continue correctly on one link.
+
+## Framing, epochs and stale-work rejection
+
+Every bulk transfer SHOULD be bounded and associated with enough metadata to reject stale or mismatched work, including concepts equivalent to:
+
+- protocol and model/partition identity;
+- peer and connection epoch;
+- request/session identity;
+- generation and speculative-round identity;
+- tensor role, dtype, shape and byte length;
+- sequence number or boundary position.
+
+Bounds MUST be validated before allocating or exposing a receive buffer.
+
+After reconnect, tensors from an older connection epoch MUST NOT advance committed model state.
+
+A local write completion MUST NOT be interpreted as remote semantic commit.
+
+## Progress modes
+
+Interrupt/event-driven progress and dedicated busy-poll progress SHOULD be treated as distinct backend modes when the transport exposes different completion behavior.
+
+Each mode MUST be qualified for CPU consumption, interrupt behavior, latency distribution and interference with inference memory bandwidth and package power.
 
 ## Qualification gates
 

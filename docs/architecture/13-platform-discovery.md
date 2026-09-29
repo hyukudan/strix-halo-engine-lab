@@ -75,7 +75,23 @@ For each candidate port or link the probe SHOULD attempt to record:
 - lane count when observable;
 - domain/path identity;
 - interrupt vector and affinity;
-- associated direct-stream device if present.
+- associated direct-stream device if present;
+- peer-service or XDomain identity where available;
+- logical stream identifiers associated with the same physical path;
+- progress and buffer-interface capabilities exposed by the active backend.
+
+The probe SHOULD build a stable mapping equivalent to:
+
+```text
+host
+  -> controller / host router
+    -> physical port
+      -> peer route
+        -> logical stream/device
+          -> qualification profile
+```
+
+Multiple logical streams attached to one physical path MUST NOT create multiple physical edges in the topology graph.
 
 Finding two host routers does not prove that two links provide independent bandwidth. Independence requires an active simultaneous-transfer test.
 
@@ -114,6 +130,8 @@ A capability SHOULD move through explicit states:
 
 Presence MUST NOT be treated as qualification.
 
+A capability that cannot be inspected because of permissions, missing kernel telemetry or unavailable active testing SHOULD be reported as unknown or inaccessible rather than absent.
+
 ## Transport negotiation
 
 When multiple nodes connect, each side SHOULD exchange a compact capability record containing:
@@ -125,6 +143,8 @@ When multiple nodes connect, each side SHOULD exchange a compact capability reco
 - number of qualified links;
 - measured payload limits;
 - mapped-buffer capabilities relevant to transport;
+- progress/completion modes;
+- physical-link identifiers associated with each logical stream;
 - model/partition identity.
 
 A negotiated session MUST choose the intersection of compatible capabilities.

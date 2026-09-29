@@ -54,6 +54,21 @@ Next gate on native Strix Halo hardware:
 - effective mapping limits;
 - graph and library capability inventory.
 
+### A0.5b — Semantic and numerical oracle
+
+Before optimized model kernels become authoritative, establish independent fixtures or a trusted reference for:
+
+- model-specific operator semantics;
+- recurrent update order;
+- sparse-selection boundaries and deterministic ties;
+- sampling semantics;
+- fresh versus resumed state;
+- serial row behavior for the first target checkpoint.
+
+Exit gate:
+
+Optimized paths can fail against an independent reference rather than only against another path in the same engine.
+
 ### A0.6 — UMA residency lab
 
 Status: **harness implemented; native-hardware qualification pending**.
@@ -67,7 +82,9 @@ Compare:
 - anonymous/copied buffers;
 - optional huge-page buffers;
 - random file-backed lookup;
-- bounded staging.
+- bounded staging;
+- buffer-purpose-specific coherence and cache policies;
+- producer/consumer visibility for any transport-visible allocation.
 
 Measure:
 
@@ -96,7 +113,9 @@ Qualify:
 - dual-link simultaneous traffic;
 - directional split;
 - flow-level distribution;
-- large-message striping.
+- large-message striping;
+- logical-stream to physical-link mapping;
+- interrupt/event-driven versus dedicated polling progress.
 
 The first version MAY use copies. Mapped or external-DMA modes are later capability tiers.
 
@@ -140,6 +159,8 @@ Exit gate:
 
 Packed decode beats a conservative baseline without model-wide weight expansion.
 
+Qualification MUST include row classes relevant to serial decode and speculative verification, effective weight traffic, dequantization/repack cost, register/LDS pressure and spill checks.
+
 ### A1.2 — Recurrent fast path
 
 Implement the recurrent layer contract and optimize state traffic.
@@ -156,7 +177,23 @@ Exit gate:
 
 The recurrent operator is correct, replayable and has an identified `gfx1151` fast path.
 
-### A1.3 — Sparse lookup path
+Full snapshots, pre-window snapshot plus replay, and sparse-checkpoint replay have been compared by complete-cycle time, retained bytes and state-write traffic.
+
+### A1.3 — MoE routing and expert execution
+
+Implement and compare:
+
+- device-resident deterministic routing;
+- a direct tiny-row expert path;
+- grouped expert execution for reusable routes;
+- row restoration without host synchronization;
+- routing histograms and expert-union metrics.
+
+Exit gate:
+
+The engine selects expert execution from measured route distributions and complete operator cost rather than row count alone.
+
+### A1.4 — Sparse lookup path
 
 Implement large lookup-table access as a separate subsystem.
 
@@ -172,7 +209,7 @@ Exit gate:
 
 The lookup path has predictable memory use and does not destabilize long-context admission.
 
-### A1.4 — Correct serial executor
+### A1.5 — Correct serial executor
 
 Integrate:
 
@@ -190,7 +227,7 @@ Exit gate:
 
 A complete serial request runs through the local engine with reproducible output and full memory accounting.
 
-### A1.5 — Greedy speculative execution
+### A1.6 — Greedy speculative execution
 
 Add:
 
@@ -198,7 +235,11 @@ Add:
 - verify windows;
 - minimal snapshot/recompute;
 - exact accepted-state commit;
-- HIP graph replay where safe.
+- HIP graph replay where safe;
+- a controller that compares depth zero with qualified positive depths;
+- cost accounting for proposal, verification, commit/replay and exposed communication;
+- bounded exploration and hysteresis;
+- optional cheaper proposal paths that never alter target verification semantics.
 
 Exit gate:
 
@@ -239,6 +280,16 @@ Exit gate:
 
 At least one useful two-node placement is identified or the evidence shows that the tested partition is not worthwhile.
 
+The evaluation MUST distinguish:
+
+- a capacity-oriented whole-layer/block baseline;
+- latency candidates that may use finer tensor/operator partitioning;
+- critical-path compute saved;
+- uncovered communication;
+- synchronization/control cost.
+
+Synchronization count alone MUST NOT reject a candidate.
+
 ### A2.2 — Dual-link USB4 scheduler
 
 Enable:
@@ -278,6 +329,22 @@ The following remain deliberately later unless measurements move them forward:
 - generic multi-vendor support;
 - arbitrary model-family abstraction;
 - transport-specific kernel logic.
+
+## Integrated optimization sequence
+
+The preferred progression is:
+
+1. semantic oracle and real platform truth;
+2. packed low-row projection;
+3. recurrent state-traffic optimization;
+4. MoE routing/expert-path selection;
+5. correct serial executor;
+6. bounded graph replay and adaptive speculative execution;
+7. prefix/fairness qualification;
+8. one-link and dual-link transport qualification;
+9. distributed placement search.
+
+Transport discovery and microbenchmarks MAY proceed earlier as isolated host-side work, but distributed execution MUST NOT become a dependency of the single-node fast path.
 
 ## Ordering rule
 
