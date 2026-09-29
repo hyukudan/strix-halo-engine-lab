@@ -142,6 +142,8 @@ int main() {
     temporary_use.buffer.slot = 0;
     temporary_use.generation = 1;
     const std::array temporaries{temporary_use};
+    arena.allocations.push_back(
+        {temporary_use, 7, 7, 1536, 128});
 
     strix::ExecutionDispatchContext context;
     context.step_id = 7;
@@ -173,7 +175,7 @@ int main() {
            "dispatch scratch resolver uses compiled arena offsets");
     expect(
         temporary.address ==
-            scratch.arena_base + 768,
+            scratch.arena_base + 1536,
         "dispatch temporary resolver uses compiled arena offsets");
 
     const auto recurrent =
