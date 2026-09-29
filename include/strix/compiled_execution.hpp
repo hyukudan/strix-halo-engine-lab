@@ -9,6 +9,8 @@
 #include "strix/execution_runtime.hpp"
 #include "strix/kernel_registry.hpp"
 #include "strix/model_contract.hpp"
+#include "strix/session_state_layout.hpp"
+#include "strix/session_state_memory.hpp"
 
 #include <cstdint>
 
@@ -43,6 +45,8 @@ struct CompiledSerialExecution {
 [[nodiscard]] EagerExecutionResult execute_compiled_serial_eager(
     const CompiledSerialExecution& compiled,
     const ExecutionMemoryBinding& memory,
+    const SerialSessionStateLayout& session_state_layout,
+    const SessionStateMemoryBinding& session_state_memory,
     const EagerExecutionRequest& request,
     EagerExecutionDispatcher& dispatcher);
 
