@@ -40,9 +40,13 @@ int main() {
     TransferDescriptor good;
     good.protocol_version = 3;
     good.connection_epoch = 9;
+    good.model_plan_id = 0x101;
     good.request_id = 17;
     good.generation = 4;
+    good.boundary_id = 0x202;
     good.sequence = 11;
+    good.shape_fingerprint = 0x303;
+    good.dtype_id = 1;
     good.byte_length = 512;
     expect(validate_descriptor(good, limits), "bounded current-epoch descriptor validates");
 
@@ -54,6 +58,11 @@ int main() {
     zero_epoch_limits.connection_epoch = 0;
     expect(!validate_descriptor(good, zero_epoch_limits),
            "uninitialized expected epoch is rejected");
+
+    auto wrong_shape = good;
+    wrong_shape.shape_fingerprint = 0;
+    expect(!validate_descriptor(wrong_shape, limits),
+           "missing shape identity is rejected");
 
     auto oversized = good;
     oversized.byte_length = 2048;
