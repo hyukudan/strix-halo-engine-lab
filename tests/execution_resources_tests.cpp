@@ -40,8 +40,9 @@ int main() {
     strix::ModelRuntimeBinding weights;
     weights.manifest_layout_identity =
         manifest.layout_identity;
-    weights.model_content_identity =
-        0xabcdefULL;
+    weights.model_content_identity.bytes[0] =
+        static_cast<std::uint8_t>(0xabcdefULL & 0xffULL);
+    weights.model_content_identity.bytes[1] = 0x5a;
     weights.tensors.push_back(
         strix::RuntimeTensorBinding{
             0,
@@ -142,7 +143,7 @@ int main() {
            "physical scratch relocation changes binding identity only");
 
     auto changed_content = weights;
-    ++changed_content.model_content_identity;
+    ++changed_content.model_content_identity.bytes[0];
     auto changed_resources = resources;
     changed_resources.model_weights =
         &changed_content;
