@@ -60,11 +60,16 @@ int main() {
     expect(!valid_variant(invalid_threads),
            "workgroup must be an integer number of waves");
 
+    auto unmeasured_qualified = valid;
+    unmeasured_qualified.measured_seconds = 0.0;
+    expect(!valid_variant(unmeasured_qualified),
+           "target-qualified kernel requires a measured cost");
+
     KernelRegistry registry;
     registry.add(valid);
     registry.add(variant("rms.w64", WaveSize::wave64, 1.5e-6));
-    registry.add(variant("rms.unmeasured", WaveSize::wave32, 0.0,
-                         QualificationStatus::production));
+    registry.add(variant("rms.oracle-only", WaveSize::wave32, 0.0,
+                         QualificationStatus::oracle_matched));
 
     bool duplicate_rejected = false;
     try {
@@ -107,6 +112,15 @@ int main() {
     const std::vector<const KernelVariant*> reversed{second, first};
     expect(plan_identity(reversed) != identity_a,
            "plan identity preserves operator order");
+
+    KernelRegistry same_kernel_new_measurement;
+    auto remeasured = variant("rms.w32", WaveSize::wave32, 9e-6);
+    same_kernel_new_measurement.add(remeasured);
+    const std::vector<const KernelVariant*> original_plan{registry.find("rms.w32")};
+    const std::vector<const KernelVariant*> remeasured_plan{
+        same_kernel_new_measurement.find("rms.w32")};
+    expect(plan_identity(original_plan) == plan_identity(remeasured_plan),
+           "measurement noise does not alter plan identity");
 
     if (failures == 0) {
         std::cout << "kernel registry tests passed\n";
