@@ -57,6 +57,23 @@ struct CompiledStepLauncher {
     void* user_data = nullptr;
 };
 
+struct MissingLauncher {
+    std::uint32_t step_id = 0;
+    SerialOp op = SerialOp::token_embedding;
+    bool runtime_step = false;
+    std::string key;
+};
+
+struct LauncherCoverage {
+    std::uint32_t covered_steps = 0;
+    std::uint32_t missing_steps = 0;
+    std::vector<MissingLauncher> missing;
+};
+
+[[nodiscard]] LauncherCoverage audit_launcher_coverage(
+    const CompiledSerialExecution& compiled,
+    const ExecutionLauncherRegistry& launchers);
+
 struct CompiledLaunchPlan {
     std::uint64_t execution_identity = 0;
     std::uint64_t plan_identity = 0;
