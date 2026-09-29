@@ -104,6 +104,7 @@ std::uint64_t build_identity(
         plan.state_layout_identity);
     hash_u64(hash, plan.next_position);
     hash_u64(hash, plan.committed_tokens);
+    hash_u64(hash, plan.alignment);
     hash_u64(
         hash,
         static_cast<std::uint64_t>(
@@ -174,6 +175,8 @@ build_serial_session_snapshot_plan(
         request.next_position;
     plan.committed_tokens =
         request.committed_tokens;
+    plan.alignment =
+        request.alignment;
     plan.state = request.state;
 
     for (const auto& allocation :
