@@ -25,6 +25,12 @@ void check(hipError_t error, const char* operation) {
     }
 }
 
+__global__ void report_wave_size_kernel(std::uint32_t* output) {
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        output[0] = static_cast<std::uint32_t>(warpSize);
+    }
+}
+
 __device__ bool better(float left_value,
                        std::uint32_t left_index,
                        float right_value,
@@ -717,6 +723,24 @@ int main() try {
         throw std::runtime_error(
             "basic kernel lab requires a gfx1151 device; got " +
             architecture);
+    }
+
+    DeviceBuffer<std::uint32_t> d_wave(1);
+    hipLaunchKernelGGL(
+        report_wave_size_kernel,
+        dim3(1),
+        dim3(1),
+        0,
+        0,
+        d_wave.pointer);
+    check(hipGetLastError(), "report_wave_size_kernel launch");
+    check(hipDeviceSynchronize(), "report_wave_size_kernel sync");
+    const auto runtime_wave = copy_from_device(d_wave, 1);
+    if (runtime_wave[0] != STRIX_WAVE_SIZE) {
+        throw std::runtime_error(
+            "compiled wave size mismatch: expected " +
+            std::to_string(STRIX_WAVE_SIZE) + ", device kernel reported " +
+            std::to_string(runtime_wave[0]));
     }
 
     run_fixture(1);
