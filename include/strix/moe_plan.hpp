@@ -34,7 +34,23 @@ struct MoeRoutePlan {
     std::vector<std::uint32_t> touched_experts;
 };
 
+struct MoeGroupingPlan {
+    std::uint32_t expert_count = 0;
+    std::uint64_t assignments = 0;
+
+    // CSR-style expert ranges. Size is expert_count + 1.
+    std::vector<std::uint64_t> expert_offsets;
+
+    // Grouped assignment payload. Entries in
+    // [expert_offsets[e], expert_offsets[e+1]) belong to expert e.
+    std::vector<std::uint32_t> assignment_rows;
+    std::vector<std::uint32_t> assignment_slots;
+};
+
 [[nodiscard]] MoeRoutePlan build_moe_route_plan(
+    const MoeRouteRequest& request);
+
+[[nodiscard]] MoeGroupingPlan build_moe_grouping_plan(
     const MoeRouteRequest& request);
 
 }  // namespace strix
