@@ -48,6 +48,27 @@ int main() {
     expect(q4k_plan.total_weight_bytes == 3'686'400,
            "Q4_K 2560x2560 tensor bytes are exact");
 
+    auto iq4_xs = q4k;
+    iq4_xs.ggml_type = 23;
+    iq4_xs.logical_rows = 4;
+    const auto iq4_xs_plan =
+        strix::build_packed_projection_plan(iq4_xs);
+    expect(iq4_xs_plan.block_elements == 256 &&
+               iq4_xs_plan.block_bytes == 136,
+           "IQ4_XS storage geometry is exact");
+    expect(iq4_xs_plan.blocks_per_output_row == 10,
+           "IQ4_XS 2560-wide row contains ten blocks");
+    expect(iq4_xs_plan.weight_bytes_per_output_row == 1360,
+           "IQ4_XS physical bytes per output row are exact");
+    expect(iq4_xs_plan.total_weight_bytes == 3'481'600,
+           "IQ4_XS 2560x2560 tensor bytes are exact");
+    expect(iq4_xs_plan.serial_weight_traffic_bytes ==
+               4ULL * iq4_xs_plan.total_weight_bytes,
+           "IQ4_XS four-row serial traffic is explicit");
+    expect(iq4_xs_plan.ideal_reused_weight_traffic_bytes ==
+               iq4_xs_plan.total_weight_bytes,
+           "IQ4_XS ideal four-row path reads packed weights once");
+
     auto q8 = q4k;
     q8.ggml_type = 8;
     q8.logical_rows = 4;
