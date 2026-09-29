@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <optional>
 #include <stdexcept>
@@ -302,6 +303,43 @@ __device__ float load_norm_weight(
     }
 }
 
+
+template <typename Storage>
+__device__ float normalized_input_value(
+    const Storage* expanded_input,
+    const void* norm_weight,
+    std::uint32_t norm_type,
+    const float* inverse_rms,
+    std::uint32_t row,
+    std::uint32_t hidden_size,
+    std::uint32_t hc_count,
+    std::uint32_t stream,
+    std::uint32_t feature) {
+    const auto expanded_width =
+        hidden_size * hc_count;
+    const auto local_index =
+        stream * hidden_size +
+        feature;
+    const auto source_index =
+        static_cast<std::uint64_t>(
+            row) *
+            expanded_width +
+        local_index;
+    const float source =
+        load_activation(
+            expanded_input,
+            source_index);
+    const float weight =
+        load_norm_weight(
+            norm_weight,
+            norm_type,
+            local_index);
+    return
+        source *
+        inverse_rms[stream] *
+        (1.0F + weight);
+}
+
 __device__ float sigmoid(
     float value) {
     return
@@ -414,32 +452,6 @@ void hyper_mix_kernel(
     }
     __syncthreads();
 
-    const auto normalized_value =
-        [&](std::uint32_t stream,
-            std::uint32_t feature) {
-            const auto local_index =
-                stream * hidden_size +
-                feature;
-            const auto source_index =
-                static_cast<std::uint64_t>(
-                    row) *
-                    expanded_width +
-                local_index;
-            const float source =
-                load_activation(
-                    expanded_input,
-                    source_index);
-            const float weight =
-                load_norm_weight(
-                    norm_weight,
-                    norm_type,
-                    local_index);
-            return
-                source *
-                inverse_rms[stream] *
-                (1.0F + weight);
-        };
-
     for (std::uint32_t output = lane;
          output < lowrank;
          output += blockDim.x) {
@@ -455,7 +467,14 @@ void hyper_mix_kernel(
                         hidden_size +
                     feature;
                 sum +=
-                    normalized_value(
+                    normalized_input_value(
+                        expanded_input,
+                        norm_weight,
+                        norm_type,
+                        inverse_rms,
+                        row,
+                        hidden_size,
+                        hc_count,
                         stream,
                         feature) *
                     load_linear_weight(
@@ -490,7 +509,14 @@ void hyper_mix_kernel(
                         hidden_size +
                     feature;
                 sum +=
-                    normalized_value(
+                    normalized_input_value(
+                        expanded_input,
+                        norm_weight,
+                        norm_type,
+                        inverse_rms,
+                        row,
+                        hidden_size,
+                        hc_count,
                         stream,
                         feature) *
                     load_linear_weight(
@@ -539,7 +565,14 @@ void hyper_mix_kernel(
             }
             mixed +=
                 sigmoid(up) *
-                normalized_value(
+                normalized_input_value(
+                    expanded_input,
+                    norm_weight,
+                    norm_type,
+                    inverse_rms,
+                    row,
+                    hidden_size,
+                    hc_count,
                     stream,
                     feature);
         }
