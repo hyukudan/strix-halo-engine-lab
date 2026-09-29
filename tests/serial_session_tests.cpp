@@ -169,6 +169,7 @@ int main() {
         strix::execute_serial_token(
             compiled,
             session,
+            memory,
             123,
             first);
 
@@ -186,6 +187,7 @@ int main() {
         strix::execute_serial_token(
             compiled,
             session,
+            memory,
             456,
             second));
     expect(session.next_position == 2 &&
