@@ -10,6 +10,10 @@ EagerExecutionResult execute_serial_token(
     SerialSessionContext& session,
     std::uint32_t input_token_id,
     EagerExecutionDispatcher& dispatcher) {
+    if (session.health != SerialSessionHealth::ready) {
+        throw std::logic_error(
+            "serial session is poisoned and requires recovery");
+    }
     if (compiled.logical_rows != 1 ||
         compiled.request_concurrency != 1) {
         throw std::invalid_argument(
@@ -49,11 +53,22 @@ EagerExecutionResult execute_serial_token(
     // execute_compiled_serial_eager works on a copy of the state-generation
     // metadata. No session metadata is published until the complete DAG
     // returns successfully.
-    auto result =
-        execute_compiled_serial_eager(
-            compiled,
-            request,
-            dispatcher);
+    EagerExecutionResult result;
+    try {
+        result =
+            execute_compiled_serial_eager(
+                compiled,
+                request,
+                dispatcher);
+    } catch (...) {
+        // Preflight inside execute_compiled_serial_eager runs before the first
+        // dispatcher call, but once dispatch begins persistent device state may
+        // have been modified in place. Without an explicit rollback snapshot we
+        // cannot safely reuse the session after an execution failure.
+        session.health =
+            SerialSessionHealth::poisoned;
+        throw;
+    }
 
     session.state = result.state;
     ++session.next_position;
