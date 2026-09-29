@@ -52,6 +52,30 @@ The controller SHOULD use bounded exploration and hysteresis so noisy measuremen
 
 Greedy speculative decoding SHOULD be qualified first because it provides the simplest exact-replay contract.
 
+
+## Greedy acceptance contract
+
+Greedy verification is now a pinned semantic contract.
+
+For a draft of length `N`, the target evaluates `N + 1` greedy token
+selections:
+
+1. compare each draft token with the target-selected token at the same position;
+2. accept only the contiguous matching prefix;
+3. append exactly one target-selected bonus token at the first mismatch position;
+4. if all `N` candidates match, append the target-selected token at position `N`;
+5. crop the resulting continuation to the remaining length budget;
+6. crop inclusively at the first EOS token when applicable;
+7. recompute accepted candidate matches as `valid_token_count - 1`;
+8. discard target-side speculative state for
+   `candidate_length - accepted_matches` candidate positions.
+
+With zero matches, the cycle reduces to one normal target token.
+
+The verification contract is independent of the proposal mechanism. An MTP
+predictor, prompt lookup or another qualified drafter may propose tokens, but
+the unchanged target owns acceptance.
+
 ## Sampling
 
 Sampled speculative decoding MUST NOT be enabled until RNG semantics are fully specified.
