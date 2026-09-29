@@ -32,6 +32,11 @@ struct Q8Block {
     std::int8_t values[32];
 };
 
+struct IQ4NLBlock {
+    __half d;
+    std::uint8_t qs[16];
+};
+
 struct IQ4XSBlock {
     __half d;
     std::uint16_t scales_h;
@@ -40,6 +45,7 @@ struct IQ4XSBlock {
 };
 
 static_assert(sizeof(Q8Block) == 34);
+static_assert(sizeof(IQ4NLBlock) == 18);
 static_assert(sizeof(IQ4XSBlock) == 136);
 
 __device__ __constant__
@@ -55,6 +61,7 @@ enum class WeightKind {
     f16,
     bf16,
     q8_0,
+    iq4_nl,
     iq4_xs,
 };
 
@@ -118,11 +125,12 @@ WeightKind weight_kind(
     case 0: return WeightKind::f32;
     case 1: return WeightKind::f16;
     case 8: return WeightKind::q8_0;
+    case 20: return WeightKind::iq4_nl;
     case 23: return WeightKind::iq4_xs;
     case 30: return WeightKind::bf16;
     default:
         throw std::invalid_argument(
-            "HIP shared expert supports F32, F16, BF16, Q8_0 and IQ4_XS");
+            "HIP shared expert supports F32, F16, BF16, Q8_0, IQ4_NL and IQ4_XS");
     }
 }
 
@@ -255,6 +263,36 @@ __device__ float load_weight<WeightKind::q8_0>(
 }
 
 template <>
+__device__ float load_weight<WeightKind::iq4_nl>(
+    const void* weights,
+    std::uint32_t row_width,
+    std::uint32_t row,
+    std::uint32_t feature) {
+    const auto* blocks =
+        static_cast<const IQ4NLBlock*>(weights);
+    const auto blocks_per_row =
+        row_width / 32U;
+    const auto& block =
+        blocks[
+            static_cast<std::uint64_t>(row) *
+                blocks_per_row +
+            feature / 32U];
+    const auto within =
+        feature % 32U;
+    const auto packed =
+        block.qs[within % 16U];
+    const auto code =
+        within < 16U
+            ? static_cast<std::uint8_t>(
+                  packed & 0x0fU)
+            : static_cast<std::uint8_t>(
+                  packed >> 4U);
+    return __half2float(block.d) *
+           static_cast<float>(
+               iq4_codebook[code]);
+}
+
+template <>
 __device__ float load_weight<WeightKind::iq4_xs>(
     const void* weights,
     std::uint32_t row_width,
@@ -325,6 +363,16 @@ std::uint64_t required_weight_bytes(
                 input / 32U) *
             output *
             sizeof(Q8Block);
+    case WeightKind::iq4_nl:
+        if (input % 32U != 0) {
+            throw std::invalid_argument(
+                "IQ4_NL shared-expert input width must be divisible by 32");
+        }
+        return
+            static_cast<std::uint64_t>(
+                input / 32U) *
+            output *
+            sizeof(IQ4NLBlock);
     case WeightKind::iq4_xs:
         if (input % 256U != 0) {
             throw std::invalid_argument(
@@ -701,6 +749,7 @@ void launch_projection_by_kind(
     case WeightKind::f16: STRIX_LAUNCH_CASE(f16); break;
     case WeightKind::bf16: STRIX_LAUNCH_CASE(bf16); break;
     case WeightKind::q8_0: STRIX_LAUNCH_CASE(q8_0); break;
+    case WeightKind::iq4_nl: STRIX_LAUNCH_CASE(iq4_nl); break;
     case WeightKind::iq4_xs: STRIX_LAUNCH_CASE(iq4_xs); break;
     }
 #undef STRIX_LAUNCH_CASE
@@ -722,6 +771,7 @@ void launch_scalar_by_kind(
     case WeightKind::f16: STRIX_SCALAR_CASE(f16); break;
     case WeightKind::bf16: STRIX_SCALAR_CASE(bf16); break;
     case WeightKind::q8_0: STRIX_SCALAR_CASE(q8_0); break;
+    case WeightKind::iq4_nl: STRIX_SCALAR_CASE(iq4_nl); break;
     case WeightKind::iq4_xs: STRIX_SCALAR_CASE(iq4_xs); break;
     }
 #undef STRIX_SCALAR_CASE
@@ -745,6 +795,7 @@ void launch_down_by_kind(
     case WeightKind::f16: STRIX_DOWN_CASE(f16); break;
     case WeightKind::bf16: STRIX_DOWN_CASE(bf16); break;
     case WeightKind::q8_0: STRIX_DOWN_CASE(q8_0); break;
+    case WeightKind::iq4_nl: STRIX_DOWN_CASE(iq4_nl); break;
     case WeightKind::iq4_xs: STRIX_DOWN_CASE(iq4_xs); break;
     }
 #undef STRIX_DOWN_CASE
