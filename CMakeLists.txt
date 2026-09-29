@@ -19,6 +19,7 @@ function(strix_target_warnings target)
 endfunction()
 
 add_library(strix_core STATIC
+    src/execution_binding.cpp
     src/execution_buffers.cpp
     src/execution_plan.cpp
     src/gguf_reader.cpp
@@ -111,6 +112,11 @@ if(BUILD_TESTING)
     target_link_libraries(strix-execution-buffer-tests PRIVATE strix_core)
     strix_target_warnings(strix-execution-buffer-tests)
     add_test(NAME strix-execution-buffer-tests COMMAND strix-execution-buffer-tests)
+
+    add_executable(strix-execution-binding-tests tests/execution_binding_tests.cpp)
+    target_link_libraries(strix-execution-binding-tests PRIVATE strix_core)
+    strix_target_warnings(strix-execution-binding-tests)
+    add_test(NAME strix-execution-binding-tests COMMAND strix-execution-binding-tests)
 
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
