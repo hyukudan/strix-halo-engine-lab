@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <iostream>
 #include <iterator>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -218,6 +219,49 @@ int main() {
     expect(!failing.kernel_steps.empty() &&
                failing.kernel_steps.back() != recurrent_step,
            "failed kernel is not recorded as completed by the dispatcher");
+
+
+    auto generation_overflow = request;
+    generation_overflow.state.generations[
+        generation_index(strix::PersistentState::recurrent_matrix)] =
+        std::numeric_limits<std::uint64_t>::max() - 35ULL;
+    bool generation_rejected = false;
+    RecordingDispatcher overflow_dispatcher;
+    try {
+        static_cast<void>(
+            strix::execute_serial_eager(
+                plan,
+                bindings,
+                generation_overflow,
+                overflow_dispatcher));
+    } catch (const std::overflow_error&) {
+        generation_rejected = true;
+    }
+    expect(generation_rejected,
+           "generation overflow fails before dispatch");
+    expect(overflow_dispatcher.kernel_steps.empty() &&
+               overflow_dispatcher.runtime_steps.empty(),
+           "generation-overflow preflight touches no dispatcher");
+
+    auto bad_runtime_binding = bindings;
+    const auto runtime_step_id =
+        dispatcher.runtime_steps.front();
+    bad_runtime_binding.bindings[runtime_step_id].family =
+        strix::kernels::OperatorFamily::partial_rope;
+    bool runtime_binding_rejected = false;
+    try {
+        RecordingDispatcher unused;
+        static_cast<void>(
+            strix::execute_serial_eager(
+                plan,
+                bad_runtime_binding,
+                request,
+                unused));
+    } catch (const std::invalid_argument&) {
+        runtime_binding_rejected = true;
+    }
+    expect(runtime_binding_rejected,
+           "runtime-managed step rejects an attached kernel family");
 
     auto bad_dependency_plan = plan;
     bad_dependency_plan.steps[1].dependencies.push_back(1);
