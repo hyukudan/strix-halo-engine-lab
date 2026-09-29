@@ -51,6 +51,20 @@ bool matches_selector(
             std::string::npos) {
         return false;
     }
+    if (!selector.name_contains_any.empty()) {
+        const auto found =
+            std::any_of(
+                selector.name_contains_any.begin(),
+                selector.name_contains_any.end(),
+                [&](std::string_view needle) {
+                    return !needle.empty() &&
+                           tensor.name.find(needle) !=
+                               std::string::npos;
+                });
+        if (!found) {
+            return false;
+        }
+    }
     return true;
 }
 
