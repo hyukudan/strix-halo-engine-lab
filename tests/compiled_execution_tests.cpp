@@ -216,6 +216,26 @@ int main() {
                compiled.execution_identity,
            "arena layout identity participates in compiled execution identity");
 
+    strix::SerialSessionStateLayoutRequest state_request;
+    state_request.context_tokens = 32;
+    const auto state_layout =
+        strix::build_serial_session_state_layout(
+            model, state_request);
+
+    strix::SessionStateMemoryBinding state_memory;
+    state_memory.layout_identity =
+        state_layout.layout_identity;
+    state_memory.device_base =
+        static_cast<std::uintptr_t>(0x21000000ULL);
+    state_memory.device_bytes =
+        state_layout.device_total_bytes;
+    state_memory.device_allocation_generation = 1;
+    state_memory.host_base =
+        static_cast<std::uintptr_t>(0x22000000ULL);
+    state_memory.host_bytes =
+        state_layout.host_total_bytes;
+    state_memory.host_allocation_generation = 1;
+
     strix::ExecutionMemoryBinding memory;
     memory.execution_identity =
         compiled.execution_identity;
@@ -235,6 +255,8 @@ int main() {
         strix::execute_compiled_serial_eager(
             compiled,
             memory,
+            state_layout,
+            state_memory,
             run,
             dispatcher);
     expect(result.completed_steps ==
@@ -255,6 +277,8 @@ int main() {
             strix::execute_compiled_serial_eager(
                 compiled,
                 memory,
+                state_layout,
+                state_memory,
                 wrong_shape,
                 unused));
     } catch (const std::invalid_argument&) {
@@ -262,6 +286,37 @@ int main() {
     }
     expect(shape_rejected,
            "compiled execution rejects runtime shape mismatch");
+
+
+    auto no_sparse_request = state_request;
+    no_sparse_request.include_sparse_index_candidate = false;
+    const auto no_sparse_layout =
+        strix::build_serial_session_state_layout(
+            model, no_sparse_request);
+    auto no_sparse_memory = state_memory;
+    no_sparse_memory.layout_identity =
+        no_sparse_layout.layout_identity;
+    no_sparse_memory.device_bytes =
+        no_sparse_layout.device_total_bytes;
+    no_sparse_memory.host_bytes =
+        no_sparse_layout.host_total_bytes;
+
+    bool sparse_rejected = false;
+    try {
+        NullDispatcher unused;
+        static_cast<void>(
+            strix::execute_compiled_serial_eager(
+                compiled,
+                memory,
+                no_sparse_layout,
+                no_sparse_memory,
+                run,
+                unused));
+    } catch (const std::invalid_argument&) {
+        sparse_rejected = true;
+    }
+    expect(sparse_rejected,
+           "missing sparse state is rejected before compiled dispatch");
 
     if (failures == 0) {
         std::cout << "compiled execution tests passed\n";
