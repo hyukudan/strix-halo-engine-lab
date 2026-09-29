@@ -47,6 +47,7 @@ void hash_model(
     const ModelContract& model) noexcept {
     hash_u64(hash, model.vocab_size);
     hash_u64(hash, model.hidden_size);
+    hash_u64(hash, model.max_position_embeddings);
     hash_u64(hash, model.hidden_layers);
     hash_u64(hash, model.full_attention_interval);
     hash_u64(hash, model.ple_layer_1based);
@@ -203,6 +204,9 @@ CompiledSerialExecution compile_serial_execution(
         binding_request.logical_rows;
     compiled.request_concurrency =
         binding_request.request_concurrency;
+    compiled.vocab_size = model.vocab_size;
+    compiled.max_position_embeddings =
+        model.max_position_embeddings;
 
     compiled.execution =
         build_serial_decode_execution_plan(model);
