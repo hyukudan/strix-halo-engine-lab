@@ -1,5 +1,7 @@
 #include "strix/model_contract.hpp"
 
+#include <cmath>
+
 namespace strix {
 
 ModelContract ModelContract::qwen38_flash_next() {
