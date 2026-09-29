@@ -34,6 +34,23 @@ struct MoeRoutePlan {
     std::vector<std::uint32_t> touched_experts;
 };
 
+struct MoeExpertBatch {
+    std::uint32_t expert = 0;
+    std::uint64_t assignment_offset = 0;
+    std::uint32_t logical_rows = 0;
+};
+
+struct MoeExpertExecutionPlan {
+    std::uint64_t assignments = 0;
+    std::uint64_t expert_batches = 0;
+    std::uint64_t direct_weight_traversals = 0;
+    std::uint64_t grouped_weight_traversals = 0;
+    std::uint64_t direct_weight_bytes = 0;
+    std::uint64_t grouped_weight_bytes = 0;
+    std::uint64_t grouped_weight_bytes_saved = 0;
+    std::vector<MoeExpertBatch> batches;
+};
+
 struct MoeGroupingPlan {
     std::uint32_t expert_count = 0;
     std::uint64_t assignments = 0;
@@ -51,6 +68,9 @@ struct MoeGroupingPlan {
     const MoeRouteRequest& request);
 
 [[nodiscard]] MoeGroupingPlan build_moe_grouping_plan(
+    const MoeRouteRequest& request);
+
+[[nodiscard]] MoeExpertExecutionPlan build_moe_expert_execution_plan(
     const MoeRouteRequest& request);
 
 }  // namespace strix
