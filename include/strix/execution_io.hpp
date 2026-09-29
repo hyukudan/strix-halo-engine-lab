@@ -16,6 +16,7 @@ enum class ExecutionBufferClass {
     route_weights,
     logits,
     mlp_intermediate,
+    gdn_workspace,
 };
 
 struct ExecutionBufferRef {
@@ -54,6 +55,7 @@ struct SerialExecutionIoPlan {
     std::uint32_t route_weight_slots = 0;
     std::uint32_t logits_slots = 0;
     std::uint32_t mlp_intermediate_slots = 0;
+    std::uint32_t gdn_workspace_slots = 0;
 };
 
 [[nodiscard]] SerialExecutionIoPlan build_serial_execution_io_plan(
