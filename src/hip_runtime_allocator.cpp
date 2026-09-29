@@ -2,6 +2,7 @@
 
 #include <hip/hip_runtime.h>
 
+#include <algorithm>
 #include <cstdlib>
 #include <limits>
 #include <new>
@@ -105,8 +106,6 @@ std::uintptr_t HipRuntimeAllocator::allocate_device(
                 });
         static_cast<void>(iterator);
         if (!inserted) {
-            static_cast<void>(
-                hipFree(raw));
             throw std::runtime_error(
                 "duplicate aligned HIP device allocation address");
         }
@@ -127,11 +126,15 @@ std::uintptr_t HipRuntimeAllocator::allocate_host(
     if (host_mode_ ==
         HipHostAllocationMode::pageable_aligned) {
         void* pointer = nullptr;
+        const auto host_alignment =
+            std::max<std::uint64_t>(
+                alignment,
+                sizeof(void*));
         const auto result =
             posix_memalign(
                 &pointer,
                 static_cast<std::size_t>(
-                    alignment),
+                    host_alignment),
                 static_cast<std::size_t>(
                     bytes));
         if (result != 0 ||
@@ -183,8 +186,6 @@ std::uintptr_t HipRuntimeAllocator::allocate_host(
                 });
         static_cast<void>(iterator);
         if (!inserted) {
-            static_cast<void>(
-                hipHostFree(raw));
             throw std::runtime_error(
                 "duplicate aligned HIP host allocation address");
         }
