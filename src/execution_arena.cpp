@@ -19,17 +19,6 @@ std::uint64_t checked_add(
     return left + right;
 }
 
-std::uint64_t checked_mul(
-    std::uint64_t left,
-    std::uint64_t right) {
-    if (left != 0 &&
-        right >
-            std::numeric_limits<std::uint64_t>::max() / left) {
-        throw std::overflow_error(
-            "execution arena multiplication overflow");
-    }
-    return left * right;
-}
 
 std::uint64_t align_up(
     std::uint64_t value,
@@ -73,18 +62,6 @@ std::uint64_t bytes_for(
         "unknown execution buffer class");
 }
 
-bool overlaps(
-    std::uint64_t left_offset,
-    std::uint64_t left_bytes,
-    std::uint64_t right_offset,
-    std::uint64_t right_bytes) {
-    const auto left_end =
-        checked_add(left_offset, left_bytes);
-    const auto right_end =
-        checked_add(right_offset, right_bytes);
-    return left_offset < right_end &&
-           right_offset < left_end;
-}
 
 }  // namespace
 
@@ -221,22 +198,23 @@ ExecutionArenaPlan build_serial_execution_arena_plan(
         for (const auto* other : active) {
             candidate =
                 align_up(candidate, alignment);
-            if (!overlaps(
+            const auto candidate_end =
+                checked_add(
                     candidate,
-                    allocation.bytes,
-                    other->offset,
-                    other->bytes)) {
-                if (checked_add(
-                        candidate,
-                        allocation.bytes) <=
-                    other->offset) {
-                    break;
-                }
-            }
-            candidate =
+                    allocation.bytes);
+            const auto other_end =
                 checked_add(
                     other->offset,
                     other->bytes);
+
+            if (candidate_end <= other->offset) {
+                break;
+            }
+            if (candidate >= other_end) {
+                continue;
+            }
+
+            candidate = other_end;
         }
 
         allocation.offset =
