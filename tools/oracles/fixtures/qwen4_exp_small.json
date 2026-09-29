@@ -317,5 +317,23 @@
       1,
       6
     ]
+  },
+  "moe_route_no_ties": {
+    "logits": [
+      2,
+      0,
+      1,
+      -1
+    ],
+    "top_k": 2,
+    "normalize_selected": true,
+    "expected_indices": [
+      0,
+      2
+    ],
+    "expected_weights": [
+      0.7310585786300049,
+      0.2689414213699951
+    ]
   }
 }
