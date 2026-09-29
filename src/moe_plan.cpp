@@ -169,3 +169,62 @@ MoeGroupingPlan build_moe_grouping_plan(
 }
 
 }  // namespace strix
+
+
+namespace strix {
+namespace {
+
+std::uint32_t largest_supported_chunk(std::uint64_t remaining) {
+    if (remaining >= 8) return 8;
+    if (remaining >= 4) return 4;
+    if (remaining >= 2) return 2;
+    if (remaining >= 1) return 1;
+    return 0;
+}
+
+}  // namespace
+
+MoeExpertExecutionPlan build_moe_expert_execution_plan(
+    const MoeRouteRequest& request) {
+    const auto route = build_moe_route_plan(request);
+    const auto grouping = build_moe_grouping_plan(request);
+
+    MoeExpertExecutionPlan plan;
+    plan.assignments = route.assignments;
+    plan.direct_weight_traversals = route.assignments;
+    plan.direct_weight_bytes = checked_mul(
+        route.assignments, request.packed_weight_bytes_per_expert);
+
+    for (std::uint32_t expert = 0; expert < request.expert_count; ++expert) {
+        auto offset = grouping.expert_offsets[expert];
+        auto remaining =
+            grouping.expert_offsets[static_cast<std::size_t>(expert) + 1U] -
+            offset;
+
+        while (remaining != 0) {
+            const auto rows = largest_supported_chunk(remaining);
+            if (rows == 0) {
+                throw std::logic_error("MoE expert batch decomposition failed");
+            }
+            plan.batches.push_back(
+                MoeExpertBatch{expert, offset, rows});
+            offset += rows;
+            remaining -= rows;
+        }
+    }
+
+    plan.expert_batches =
+        static_cast<std::uint64_t>(plan.batches.size());
+    plan.grouped_weight_traversals = plan.expert_batches;
+    plan.grouped_weight_bytes = checked_mul(
+        plan.grouped_weight_traversals,
+        request.packed_weight_bytes_per_expert);
+    plan.grouped_weight_bytes_saved =
+        plan.direct_weight_bytes >= plan.grouped_weight_bytes
+            ? plan.direct_weight_bytes - plan.grouped_weight_bytes
+            : 0;
+
+    return plan;
+}
+
+}  // namespace strix
