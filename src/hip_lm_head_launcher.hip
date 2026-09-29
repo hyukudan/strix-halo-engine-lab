@@ -28,6 +28,11 @@ struct Q8Block {
     std::int8_t values[32];
 };
 
+struct IQ4NLBlock {
+    __half d;
+    std::uint8_t qs[16];
+};
+
 struct IQ4XSBlock {
     __half d;
     std::uint16_t scales_h;
@@ -36,6 +41,7 @@ struct IQ4XSBlock {
 };
 
 static_assert(sizeof(Q8Block) == 34);
+static_assert(sizeof(IQ4NLBlock) == 18);
 static_assert(sizeof(IQ4XSBlock) == 136);
 
 __device__ __constant__
@@ -51,6 +57,7 @@ enum class WeightKind {
     f16,
     bf16,
     q8_0,
+    iq4_nl,
     iq4_xs,
 };
 
@@ -109,11 +116,12 @@ WeightKind weight_kind(
     case 0: return WeightKind::f32;
     case 1: return WeightKind::f16;
     case 8: return WeightKind::q8_0;
+    case 20: return WeightKind::iq4_nl;
     case 23: return WeightKind::iq4_xs;
     case 30: return WeightKind::bf16;
     default:
         throw std::invalid_argument(
-            "HIP LM head supports F32, F16, BF16, Q8_0 and IQ4_XS");
+            "HIP LM head supports F32, F16, BF16, Q8_0, IQ4_NL and IQ4_XS");
     }
 }
 
@@ -228,6 +236,36 @@ __device__ float load_weight<WeightKind::q8_0>(
 }
 
 template <>
+__device__ float load_weight<WeightKind::iq4_nl>(
+    const void* weights,
+    std::uint32_t row_width,
+    std::uint32_t row,
+    std::uint32_t feature) {
+    const auto* blocks =
+        static_cast<const IQ4NLBlock*>(weights);
+    const auto blocks_per_row =
+        row_width / 32U;
+    const auto& block =
+        blocks[
+            static_cast<std::uint64_t>(row) *
+                blocks_per_row +
+            feature / 32U];
+    const auto within =
+        feature % 32U;
+    const auto packed =
+        block.qs[within % 16U];
+    const auto code =
+        within < 16U
+            ? static_cast<std::uint8_t>(
+                  packed & 0x0fU)
+            : static_cast<std::uint8_t>(
+                  packed >> 4U);
+    return __half2float(block.d) *
+           static_cast<float>(
+               iq4_codebook[code]);
+}
+
+template <>
 __device__ float load_weight<WeightKind::iq4_xs>(
     const void* weights,
     std::uint32_t row_width,
@@ -298,6 +336,16 @@ std::uint64_t required_weight_bytes(
                 row_width / 32U) *
             rows *
             sizeof(Q8Block);
+    case WeightKind::iq4_nl:
+        if (row_width % 32U != 0) {
+            throw std::invalid_argument(
+                "IQ4_NL LM-head row width must be divisible by 32");
+        }
+        return
+            static_cast<std::uint64_t>(
+                row_width / 32U) *
+            rows *
+            sizeof(IQ4NLBlock);
     case WeightKind::iq4_xs:
         if (row_width % 256U != 0) {
             throw std::invalid_argument(
@@ -419,6 +467,10 @@ void launch_by_weight(
         return;
     case WeightKind::q8_0:
         launch_typed<Input, WeightKind::q8_0>(
+            weights, config, hidden, logits);
+        return;
+    case WeightKind::iq4_nl:
+        launch_typed<Input, WeightKind::iq4_nl>(
             weights, config, hidden, logits);
         return;
     case WeightKind::iq4_xs:
