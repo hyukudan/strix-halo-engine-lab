@@ -137,6 +137,12 @@ int main() {
            "MTP KV is 2 KiB/token/session");
     expect(strix::provisional_indexer_bytes_per_token(model) == 768ULL,
            "provisional indexer estimate is 768 B/token/session");
+    expect(model.hidden_size == 2560 &&
+               model.moe_intermediate_size == 640 &&
+               model.shared_expert_intermediate_size == 640 &&
+               model.num_experts == 512 &&
+               model.num_experts_per_token == 10,
+           "official MoE geometry is explicit");
     expect(model.gdn_key_heads == 16 &&
                model.gdn_key_head_dim == 128 &&
                model.gdn_value_heads == 48 &&
