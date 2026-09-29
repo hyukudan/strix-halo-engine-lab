@@ -122,6 +122,96 @@ strix::ExecutionDispatchContext make_context(
     return context;
 }
 
+
+void test_launcher_bundle() {
+    strix::CompiledSerialExecution compiled;
+    compiled.execution_identity = 0x445566ULL;
+
+    const auto add_step =
+        [&](std::uint32_t id,
+            strix::SerialOp op,
+            std::string kernel_id) {
+            strix::ExecutionStep step;
+            step.id = id;
+            step.op = op;
+            compiled.execution.steps.push_back(step);
+
+            strix::ExecutionKernelBinding binding;
+            binding.step_id = id;
+            binding.op = op;
+            binding.family =
+                strix::operator_family_for(op);
+            binding.kernel_id =
+                std::move(kernel_id);
+            compiled.bindings.bindings.push_back(
+                std::move(binding));
+            ++compiled.bindings.bound_steps;
+        };
+
+    add_step(
+        0,
+        strix::SerialOp::hyper_expand,
+        "hip.hyper_expand");
+    add_step(
+        1,
+        strix::SerialOp::attn_inject,
+        "hip.inject");
+    add_step(
+        2,
+        strix::SerialOp::mlp_inject,
+        "hip.inject");
+    add_step(
+        3,
+        strix::SerialOp::moe_combine,
+        "hip.moe_combine");
+
+    strix::HipElementwiseLauncherConfig config;
+    config.hidden_size = 2560;
+    config.hc_count = 4;
+    config.activation =
+        strix::HipActivationStorage::bf16;
+
+    strix::HipElementwiseLauncherBundle bundle(
+        config);
+    strix::ExecutionLauncherRegistry registry;
+    bundle.register_for_compiled_execution(
+        compiled,
+        registry);
+
+    expect(
+        registry.find_kernel_launcher(
+            "hip.hyper_expand") != nullptr &&
+        registry.find_kernel_launcher(
+            "hip.inject") != nullptr &&
+        registry.find_kernel_launcher(
+            "hip.moe_combine") != nullptr,
+        "HIP elementwise launcher bundle registers selected kernel ids");
+
+    const auto* inject =
+        registry.find_kernel_launcher(
+            "hip.inject");
+    expect(
+        inject != nullptr &&
+            inject->implementation_identity != 0,
+        "HIP elementwise launcher bundle deduplicates compatible inject kernel ids");
+
+    auto collision = compiled;
+    collision.bindings.bindings[3].kernel_id =
+        "hip.inject";
+    strix::ExecutionLauncherRegistry bad_registry;
+    bool collision_rejected = false;
+    try {
+        bundle.register_for_compiled_execution(
+            collision,
+            bad_registry);
+    } catch (const std::invalid_argument&) {
+        collision_rejected = true;
+    }
+    expect(
+        collision_rejected,
+        "HIP elementwise launcher bundle rejects one id with incompatible semantics");
+}
+
 void run_fixture(
     strix::HipActivationStorage storage) {
     const auto model =
@@ -562,6 +652,7 @@ void run_fixture(
 }  // namespace
 
 int main() try {
+    test_launcher_bundle();
     run_fixture(
         strix::HipActivationStorage::bf16);
     run_fixture(
