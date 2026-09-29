@@ -33,6 +33,7 @@ add_library(strix_core STATIC
     src/memory_plan.cpp
     src/model_contract.cpp
     src/model_manifest.cpp
+    src/model_runtime_binding.cpp
     src/moe_plan.cpp
     src/oracles.cpp
     src/packed_projection.cpp
@@ -77,6 +78,11 @@ if(BUILD_TESTING)
     target_link_libraries(strix-manifest-platform-tests PRIVATE strix_core)
     strix_target_warnings(strix-manifest-platform-tests)
     add_test(NAME strix-manifest-platform-tests COMMAND strix-manifest-platform-tests)
+
+    add_executable(strix-model-runtime-binding-tests tests/model_runtime_binding_tests.cpp)
+    target_link_libraries(strix-model-runtime-binding-tests PRIVATE strix_core)
+    strix_target_warnings(strix-model-runtime-binding-tests)
+    add_test(NAME strix-model-runtime-binding-tests COMMAND strix-model-runtime-binding-tests)
 
     add_executable(strix-transport-tests tests/transport_tests.cpp)
     target_link_libraries(strix-transport-tests PRIVATE strix_core)
