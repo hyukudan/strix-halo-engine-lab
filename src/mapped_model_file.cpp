@@ -128,6 +128,12 @@ MappedModelFile MappedModelFile::open_read_only(
         mapped.bytes_ =
             static_cast<std::uint64_t>(
                 before.st_size);
+        if (mapped.bytes_ >
+            static_cast<std::uint64_t>(
+                std::numeric_limits<std::size_t>::max())) {
+            throw std::overflow_error(
+                "model file size does not fit host size_t");
+        }
 
         const auto proc_path =
             std::filesystem::path(
