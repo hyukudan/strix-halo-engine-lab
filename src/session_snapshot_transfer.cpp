@@ -2,6 +2,7 @@
 
 #include <limits>
 #include <stdexcept>
+#include <string>
 
 namespace strix {
 namespace {
@@ -131,31 +132,27 @@ void capture_serial_session_snapshot(
                 "snapshot capture range does not match state component");
         }
 
-        if (range.source_offset <
-            (source.address -
-             (source.storage ==
-                      SessionStateStorage::device
-                  ? state_memory.device_base
-                  : state_memory.host_base))) {
-            throw std::invalid_argument(
-                "snapshot source offset precedes component allocation");
-        }
-
-        const auto component_offset =
-            range.source_offset -
-            (source.storage ==
-                     SessionStateStorage::device
-                 ? find_session_state_allocation(
-                       state_layout,
-                       range.component)
-                       ->offset
-                 : find_session_state_allocation(
-                       state_layout,
-                       range.component)
-                       ->offset);
-        if (component_offset != 0) {
+        const auto* allocation =
+            find_session_state_allocation(
+                state_layout,
+                range.component);
+        if (allocation == nullptr ||
+            range.source_offset !=
+                allocation->offset) {
             throw std::invalid_argument(
                 "snapshot capture currently requires component-prefix ranges");
+        }
+
+        const auto expected_source =
+            (range.storage ==
+                     SessionStateStorage::device
+                 ? state_memory.device_base
+                 : state_memory.host_base) +
+            static_cast<std::uintptr_t>(
+                range.source_offset);
+        if (source.address != expected_source) {
+            throw std::invalid_argument(
+                "snapshot source offset does not match bound state layout");
         }
 
         const auto destination =
