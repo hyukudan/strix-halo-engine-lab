@@ -5,9 +5,8 @@
 #include <utility>
 
 namespace strix {
-namespace {
 
-kernels::ShapeClass shape_for(
+kernels::ShapeClass execution_shape_for(
     const ModelContract& model,
     SerialOp op,
     const ExecutionBindingRequest& request) {
@@ -60,6 +59,8 @@ kernels::ShapeClass shape_for(
 
     return shape;
 }
+
+namespace {
 
 bool host_or_runtime_step(SerialOp op) noexcept {
     return op == SerialOp::position_prepare;
@@ -157,7 +158,7 @@ ExecutionBindingPlan bind_serial_execution_plan(
         kernels::KernelQuery query;
         query.family = *binding.family;
         query.phase = kernels::ExecutionPhase::decode;
-        query.shape = shape_for(model, step.op, request);
+        query.shape = execution_shape_for(model, step.op, request);
         query.require_graph_safe =
             request.require_graph_safe;
         query.require_row_invariant = true;
