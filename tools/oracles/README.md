@@ -15,6 +15,7 @@ Implemented:
 - hashed PLE/n-gram row IDs;
 - Gated Residual/Hyper-Connection mixing with synthetic matrix fixtures;
 - QSA block pooling/selection for fixtures whose cutoff has no score tie;
+- MoE softmax/top-k routing for fixtures without cutoff ties;
 - fresh-versus-resumed equivalence tests for recurrent and n-gram state.
 
 The numerical functions use Python double-precision arithmetic so that GPU-specific reduction order and lower-precision rounding are not accidentally baked into the reference.
