@@ -45,6 +45,28 @@ A captured graph MUST be bound to an allocation generation for every buffer whos
 
 Growing, replacing or repacking such a buffer MUST invalidate affected graph instances unless a supported graph-update path has been proven correct for the exact change.
 
+
+## Buffer lifetime planning
+
+Side values and branch outputs MUST have explicit lifetimes.
+
+The first serial decode plan reserves separate logical classes for:
+
+- two expanded hyper-state buffers used as ping-pong storage across reinjection boundaries;
+- hidden-width scratch for attention/MLP intermediates;
+- simultaneous routed-expert and shared-expert outputs;
+- hyper-connection injection weights;
+- route indices and route weights;
+- final logits when they are materialized.
+
+A buffer may be physically reused only after every DAG consumer of its current generation has completed.
+
+The initial conservative plan keeps three hidden-width buffers available during the MoE branch so route input, routed output and shared-expert output cannot alias accidentally.
+
+Full-vocabulary logits are accounted separately from internal decode scratch. The peak with materialized logits is the maximum of the internal execution peak and the final-hidden-plus-logits stage, not their sum.
+
+Future LM-head/sampling fusion MAY avoid materializing the full logits buffer, but that optimization must preserve the sampling contract.
+
 ## Graph capture
 
 HIP graph capture SHOULD be used for stable decode and verification shapes when it measurably reduces launch overhead.
