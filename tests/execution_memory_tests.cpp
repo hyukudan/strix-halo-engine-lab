@@ -110,13 +110,16 @@ int main() {
     memory.allocation_generation = 7;
 
     strix::validate_execution_memory_binding(
-        compiled, memory);
+        compiled.execution_identity,
+        compiled.arena,
+        memory);
 
     const auto& lm_io =
         compiled.io.steps.back();
     const auto input =
         strix::resolve_execution_buffer(
-            compiled,
+            compiled.execution_identity,
+            compiled.arena,
             memory,
             lm_io.reads[0]);
     const auto output =
@@ -141,7 +144,9 @@ int main() {
     bool identity_rejected = false;
     try {
         strix::validate_execution_memory_binding(
-            compiled, wrong_identity);
+            compiled.execution_identity,
+            compiled.arena,
+            wrong_identity);
     } catch (const std::invalid_argument&) {
         identity_rejected = true;
     }
@@ -153,7 +158,9 @@ int main() {
     bool size_rejected = false;
     try {
         strix::validate_execution_memory_binding(
-            compiled, undersized);
+            compiled.execution_identity,
+            compiled.arena,
+            undersized);
     } catch (const std::invalid_argument&) {
         size_rejected = true;
     }
@@ -165,7 +172,9 @@ int main() {
     bool null_rejected = false;
     try {
         strix::validate_execution_memory_binding(
-            compiled, null_base);
+            compiled.execution_identity,
+            compiled.arena,
+            null_base);
     } catch (const std::invalid_argument&) {
         null_rejected = true;
     }
@@ -180,7 +189,9 @@ int main() {
     bool overflow_rejected = false;
     try {
         strix::validate_execution_memory_binding(
-            compiled, overflow);
+            compiled.execution_identity,
+            compiled.arena,
+            overflow);
     } catch (const std::overflow_error&) {
         overflow_rejected = true;
     }
