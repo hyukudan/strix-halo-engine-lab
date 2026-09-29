@@ -50,6 +50,7 @@ struct TransferDescriptor {
 
 struct DescriptorLimits {
     std::uint32_t protocol_version = 1;
+    std::uint64_t connection_epoch = 0;
     std::uint64_t maximum_bytes = 0;
 };
 
