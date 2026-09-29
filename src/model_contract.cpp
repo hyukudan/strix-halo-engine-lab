@@ -40,6 +40,9 @@ std::string ModelContract::validate() const {
     if (indexer_compress_ratio == 0) {
         return "indexer compression ratio must be non-zero";
     }
+    if (hc_count <= 1 || hc_lowrank == 0) {
+        return "hyper-connection count must exceed one and low-rank width must be non-zero";
+    }
     if (vocab_size == 0 ||
         hidden_size == 0 ||
         max_position_embeddings == 0 ||
