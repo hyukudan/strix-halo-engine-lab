@@ -1,5 +1,6 @@
 #include "strix/model_content_hash.hpp"
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
