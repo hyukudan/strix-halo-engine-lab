@@ -536,6 +536,173 @@ void run_fixture(std::uint32_t rows) {
     }
 }
 
+
+void run_row_invariance_fixture() {
+    constexpr std::uint32_t rows = 2;
+    constexpr std::uint32_t hidden_size = 16;
+    constexpr std::uint32_t rotary_dim = 8;
+    constexpr std::uint32_t top_k = 3;
+
+    std::vector<float> input(
+        static_cast<std::size_t>(rows) * hidden_size);
+    std::vector<float> weight(hidden_size);
+    std::vector<float> cosine(rotary_dim);
+    std::vector<float> sine(rotary_dim);
+
+    for (std::size_t index = 0; index < input.size(); ++index) {
+        input[index] =
+            static_cast<float>((static_cast<int>(index % 13U) - 6)) /
+            9.0F;
+    }
+    for (std::uint32_t index = 0; index < hidden_size; ++index) {
+        weight[index] =
+            static_cast<float>((static_cast<int>(index % 5U) - 2)) /
+            40.0F;
+    }
+    for (std::uint32_t index = 0; index < rotary_dim; ++index) {
+        const float angle = 0.07F * static_cast<float>(index + 1U);
+        cosine[index] = std::cos(angle);
+        sine[index] = std::sin(angle);
+    }
+
+    std::vector<float> solo_input(
+        input.begin() + hidden_size,
+        input.begin() + 2U * hidden_size);
+
+    DeviceBuffer<float> d_batch(input.size());
+    DeviceBuffer<float> d_solo(solo_input.size());
+    DeviceBuffer<float> d_weight(weight.size());
+    DeviceBuffer<float> d_cosine(cosine.size());
+    DeviceBuffer<float> d_sine(sine.size());
+    DeviceBuffer<float> d_batch_output(input.size());
+    DeviceBuffer<float> d_solo_output(solo_input.size());
+    DeviceBuffer<std::uint32_t> d_batch_indices(rows * top_k);
+    DeviceBuffer<std::uint32_t> d_solo_indices(top_k);
+
+    copy_to_device(d_batch, input);
+    copy_to_device(d_solo, solo_input);
+    copy_to_device(d_weight, weight);
+    copy_to_device(d_cosine, cosine);
+    copy_to_device(d_sine, sine);
+
+    hipLaunchKernelGGL(
+        rms_norm_kernel,
+        dim3(rows),
+        dim3(kThreads),
+        kThreads * sizeof(float),
+        0,
+        d_batch.pointer,
+        d_weight.pointer,
+        d_batch_output.pointer,
+        rows,
+        hidden_size,
+        1e-6F);
+    check(hipGetLastError(), "row-invariant batch RMSNorm launch");
+
+    hipLaunchKernelGGL(
+        rms_norm_kernel,
+        dim3(1),
+        dim3(kThreads),
+        kThreads * sizeof(float),
+        0,
+        d_solo.pointer,
+        d_weight.pointer,
+        d_solo_output.pointer,
+        1,
+        hidden_size,
+        1e-6F);
+    check(hipGetLastError(), "row-invariant solo RMSNorm launch");
+    check(hipDeviceSynchronize(), "row-invariant RMSNorm sync");
+
+    const auto batch_rms = copy_from_device(d_batch_output, input.size());
+    const auto solo_rms = copy_from_device(d_solo_output, solo_input.size());
+    const std::vector<float> batch_second_rms(
+        batch_rms.begin() + hidden_size,
+        batch_rms.begin() + 2U * hidden_size);
+    expect_close(
+        batch_second_rms,
+        solo_rms,
+        1e-7F,
+        "RMSNorm row invariance");
+
+    hipLaunchKernelGGL(
+        partial_rope_kernel,
+        dim3(rows),
+        dim3(kThreads),
+        0,
+        0,
+        d_batch.pointer,
+        d_cosine.pointer,
+        d_sine.pointer,
+        d_batch_output.pointer,
+        rows,
+        hidden_size,
+        rotary_dim);
+    check(hipGetLastError(), "row-invariant batch RoPE launch");
+
+    hipLaunchKernelGGL(
+        partial_rope_kernel,
+        dim3(1),
+        dim3(kThreads),
+        0,
+        0,
+        d_solo.pointer,
+        d_cosine.pointer,
+        d_sine.pointer,
+        d_solo_output.pointer,
+        1,
+        hidden_size,
+        rotary_dim);
+    check(hipGetLastError(), "row-invariant solo RoPE launch");
+    check(hipDeviceSynchronize(), "row-invariant RoPE sync");
+
+    const auto batch_rope = copy_from_device(d_batch_output, input.size());
+    const auto solo_rope = copy_from_device(d_solo_output, solo_input.size());
+    const std::vector<float> batch_second_rope(
+        batch_rope.begin() + hidden_size,
+        batch_rope.begin() + 2U * hidden_size);
+    expect_close(
+        batch_second_rope,
+        solo_rope,
+        0.0F,
+        "RoPE row invariance");
+
+    hipLaunchKernelGGL(
+        top_k_kernel,
+        dim3(rows),
+        dim3(kThreads),
+        kThreads * sizeof(Candidate),
+        0,
+        d_batch.pointer,
+        d_batch_indices.pointer,
+        rows,
+        hidden_size,
+        top_k);
+    check(hipGetLastError(), "row-invariant batch top-k launch");
+
+    hipLaunchKernelGGL(
+        top_k_kernel,
+        dim3(1),
+        dim3(kThreads),
+        kThreads * sizeof(Candidate),
+        0,
+        d_solo.pointer,
+        d_solo_indices.pointer,
+        1,
+        hidden_size,
+        top_k);
+    check(hipGetLastError(), "row-invariant solo top-k launch");
+    check(hipDeviceSynchronize(), "row-invariant top-k sync");
+
+    const auto batch_topk = copy_from_device(d_batch_indices, rows * top_k);
+    const auto solo_topk = copy_from_device(d_solo_indices, top_k);
+    for (std::uint32_t rank = 0; rank < top_k; ++rank) {
+        if (batch_topk[top_k + rank] != solo_topk[rank]) {
+            throw std::runtime_error("top-k row invariance mismatch");
+        }
+    }
+}
+
 }  // namespace
 
 int main() try {
@@ -554,6 +721,7 @@ int main() try {
 
     run_fixture(1);
     run_fixture(2);
+    run_row_invariance_fixture();
 
     std::cout << "{\n"
               << "  \"status\": \"pass\",\n"
