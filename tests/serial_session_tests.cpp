@@ -103,11 +103,28 @@ struct SessionDispatcher final
                "dispatch receives session input token");
         expect(context.position == expected_position,
                "dispatch receives session position");
+        expect(context.session_state_layout != nullptr &&
+                   context.session_state_memory != nullptr,
+               "dispatch receives persistent state layout and memory");
     }
 
     void dispatch_kernel(
         const strix::ExecutionDispatchContext& context) override {
         verify_scalars(context);
+        if (context.op ==
+                strix::SerialOp::gated_delta_net &&
+            context.session_state_layout != nullptr &&
+            context.session_state_memory != nullptr) {
+            const auto recurrent =
+                strix::resolve_session_state(
+                    *context.session_state_layout,
+                    *context.session_state_memory,
+                    strix::SessionStateComponent::recurrent_matrix);
+            expect(recurrent.storage ==
+                       strix::SessionStateStorage::device &&
+                       recurrent.address != 0,
+                   "GDN dispatch resolves recurrent device state");
+        }
         if (fail_on_first_recurrent &&
             !failed &&
             context.op ==
@@ -122,6 +139,20 @@ struct SessionDispatcher final
     void dispatch_runtime_step(
         const strix::ExecutionDispatchContext& context) override {
         verify_scalars(context);
+        if (context.op ==
+                strix::SerialOp::position_prepare &&
+            context.session_state_layout != nullptr &&
+            context.session_state_memory != nullptr) {
+            const auto position =
+                strix::resolve_session_state(
+                    *context.session_state_layout,
+                    *context.session_state_memory,
+                    strix::SessionStateComponent::position_history);
+            expect(position.storage ==
+                       strix::SessionStateStorage::host &&
+                       position.address != 0,
+                   "position step resolves host state");
+        }
         ++calls;
     }
 };
@@ -148,6 +179,26 @@ int main() {
             buffer_request,
             256);
 
+    strix::SerialSessionStateLayoutRequest state_request;
+    state_request.context_tokens = 4;
+    const auto state_layout =
+        strix::build_serial_session_state_layout(
+            model, state_request);
+
+    strix::SessionStateMemoryBinding state_memory;
+    state_memory.layout_identity =
+        state_layout.layout_identity;
+    state_memory.device_base =
+        static_cast<std::uintptr_t>(0x31000000ULL);
+    state_memory.device_bytes =
+        state_layout.device_total_bytes;
+    state_memory.device_allocation_generation = 3;
+    state_memory.host_base =
+        static_cast<std::uintptr_t>(0x32000000ULL);
+    state_memory.host_bytes =
+        state_layout.host_total_bytes;
+    state_memory.host_allocation_generation = 5;
+
     strix::ExecutionMemoryBinding memory;
     memory.execution_identity =
         compiled.execution_identity;
@@ -160,6 +211,8 @@ int main() {
     strix::SerialSessionContext session;
     session.execution_identity =
         compiled.execution_identity;
+    session.state_layout_identity =
+        state_layout.layout_identity;
     session.state.valid = all_state();
 
     SessionDispatcher first;
@@ -170,6 +223,8 @@ int main() {
             compiled,
             session,
             memory,
+            state_layout,
+            state_memory,
             123,
             first);
 
@@ -188,6 +243,8 @@ int main() {
             compiled,
             session,
             memory,
+            state_layout,
+            state_memory,
             456,
             second));
     expect(session.next_position == 2 &&
@@ -207,6 +264,8 @@ int main() {
                 compiled,
                 session,
                 memory,
+                state_layout,
+                state_memory,
                 789,
                 failing));
     } catch (const std::runtime_error&) {
@@ -235,6 +294,8 @@ int main() {
                 compiled,
                 session,
                 memory,
+                state_layout,
+                state_memory,
                 1,
                 unused));
     } catch (const std::logic_error&) {
@@ -255,6 +316,8 @@ int main() {
                 compiled,
                 missing_state,
                 memory,
+                state_layout,
+                state_memory,
                 1,
                 unused));
     } catch (const std::invalid_argument&) {
@@ -275,6 +338,8 @@ int main() {
                 compiled,
                 wrong_identity,
                 memory,
+                state_layout,
+                state_memory,
                 1,
                 unused));
     } catch (const std::invalid_argument&) {
@@ -282,6 +347,27 @@ int main() {
     }
     expect(identity_rejected,
            "session compiled-plan identity mismatch is rejected");
+
+
+    auto wrong_state_layout = before_failure;
+    ++wrong_state_layout.state_layout_identity;
+    bool state_layout_identity_rejected = false;
+    try {
+        SessionDispatcher unused;
+        static_cast<void>(
+            strix::execute_serial_token(
+                compiled,
+                wrong_state_layout,
+                memory,
+                state_layout,
+                state_memory,
+                1,
+                unused));
+    } catch (const std::invalid_argument&) {
+        state_layout_identity_rejected = true;
+    }
+    expect(state_layout_identity_rejected,
+           "state-layout identity mismatch is rejected");
 
     bool token_rejected = false;
     try {
@@ -291,6 +377,8 @@ int main() {
                 compiled,
                 before_failure,
                 memory,
+                state_layout,
+                state_memory,
                 static_cast<std::uint32_t>(
                     compiled.vocab_size),
                 unused));
@@ -302,7 +390,7 @@ int main() {
 
     auto full_context = before_failure;
     full_context.next_position =
-        compiled.max_position_embeddings;
+        state_layout.context_tokens;
     bool context_rejected = false;
     try {
         SessionDispatcher unused;
@@ -311,13 +399,15 @@ int main() {
                 compiled,
                 full_context,
                 memory,
+                state_layout,
+                state_memory,
                 1,
                 unused));
     } catch (const std::out_of_range&) {
         context_rejected = true;
     }
     expect(context_rejected,
-           "maximum context is enforced before dispatch");
+           "allocated session context capacity is enforced before dispatch");
 
     if (failures == 0) {
         std::cout << "serial session tests passed\n";
