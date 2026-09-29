@@ -85,6 +85,10 @@ TensorRole classify_tensor_role(std::string_view name) noexcept {
     if (contains(name, "ngram") || contains(name, "ple.")) {
         return TensorRole::ngram_table;
     }
+    if (contains(name, ".ple_") ||
+        starts_with(name, "ple_")) {
+        return TensorRole::ple_parameter;
+    }
     if (contains(name, "indexer") || contains(name, "sparse_index") ||
         contains(name, "attn_index")) {
         return TensorRole::sparse_index;
@@ -94,14 +98,16 @@ TensorRole classify_tensor_role(std::string_view name) noexcept {
         return TensorRole::recurrent_state;
     }
     if (contains(name, "shared_expert") ||
-        contains(name, "shared_experts")) {
+        contains(name, "shared_experts") ||
+        contains(name, "_shexp")) {
         return TensorRole::dense_projection;
     }
     if (contains(name, "experts.") || contains(name, ".expert.") ||
-        contains(name, "expert_")) {
+        contains(name, "expert_") || contains(name, "_exps")) {
         return TensorRole::moe_expert;
     }
-    if (contains(name, "router") || contains(name, "gate_inp")) {
+    if (contains(name, "router") ||
+        (contains(name, "gate_inp") && !contains(name, "_shexp"))) {
         return TensorRole::moe_router;
     }
     if (starts_with(name, "token_embd.") || starts_with(name, "tok_embeddings.") ||
@@ -113,6 +119,16 @@ TensorRole classify_tensor_role(std::string_view name) noexcept {
     }
     if (contains(name, "norm")) {
         return TensorRole::normalization;
+    }
+    if (contains(name, "hc_attn_down") ||
+        contains(name, "hc_attn_up") ||
+        contains(name, "hc_attn_inject") ||
+        contains(name, "hc_ffn_down") ||
+        contains(name, "hc_ffn_up") ||
+        contains(name, "hc_ffn_inject") ||
+        starts_with(name, "output_hc_down") ||
+        starts_with(name, "output_hc_up")) {
+        return TensorRole::dense_projection;
     }
     if (contains(name, "attn_q") || contains(name, "attn_k") ||
         contains(name, "attn_v") || contains(name, "attn_output") ||
@@ -150,6 +166,7 @@ std::string_view to_string(TensorRole role) noexcept {
     case TensorRole::recurrent_state: return "recurrent_state";
     case TensorRole::sparse_index: return "sparse_index";
     case TensorRole::ngram_table: return "ngram_table";
+    case TensorRole::ple_parameter: return "ple_parameter";
     case TensorRole::mtp: return "mtp";
     }
     return "unknown";
