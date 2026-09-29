@@ -9,12 +9,24 @@ EagerExecutionResult execute_serial_token(
     const CompiledSerialExecution& compiled,
     SerialSessionContext& session,
     const ExecutionMemoryBinding& memory,
+    const SerialSessionStateLayout& session_state_layout,
+    const SessionStateMemoryBinding& session_state_memory,
     std::uint32_t input_token_id,
     EagerExecutionDispatcher& dispatcher) {
     validate_execution_memory_binding(
         compiled.execution_identity,
         compiled.arena,
         memory);
+    validate_session_state_memory_binding(
+        session_state_layout,
+        session_state_memory);
+
+    if (session.state_layout_identity == 0 ||
+        session.state_layout_identity !=
+            session_state_layout.layout_identity) {
+        throw std::invalid_argument(
+            "serial session state-layout identity does not match allocated state");
+    }
 
     if (session.health != SerialSessionHealth::ready) {
         throw std::logic_error(
@@ -39,9 +51,11 @@ EagerExecutionResult execute_serial_token(
     }
     if (compiled.max_position_embeddings == 0 ||
         session.next_position >=
-            compiled.max_position_embeddings) {
+            compiled.max_position_embeddings ||
+        session.next_position >=
+            session_state_layout.context_tokens) {
         throw std::out_of_range(
-            "serial session reached compiled maximum context");
+            "serial session reached allocated context capacity");
     }
     if (session.committed_tokens ==
         std::numeric_limits<std::uint64_t>::max()) {
@@ -64,7 +78,9 @@ EagerExecutionResult execute_serial_token(
         compiled.bindings,
         compiled.io,
         compiled.arena,
-        request);
+        request,
+        &session_state_layout,
+        &session_state_memory);
 
     // execute_compiled_serial_eager works on a copy of the state-generation
     // metadata. Once dispatch begins, however, persistent device state may be
@@ -75,6 +91,8 @@ EagerExecutionResult execute_serial_token(
             execute_compiled_serial_eager(
                 compiled,
                 memory,
+                session_state_layout,
+                session_state_memory,
                 request,
                 dispatcher);
     } catch (...) {
