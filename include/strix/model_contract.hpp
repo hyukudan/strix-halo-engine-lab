@@ -19,6 +19,7 @@ struct ModelContract {
     std::uint64_t ngram_size = 3;
     std::uint64_t heads_per_ngram = 8;
     std::uint64_t hc_count = 4;
+    std::uint64_t hc_lowrank = 320;
     std::uint64_t full_attention_layers = 12;
     std::uint64_t gdn_layers = 36;
     std::uint64_t attention_heads = 24;
