@@ -259,6 +259,8 @@ Routing foundation implemented:
 - host-side route planner with per-expert assignment histogram;
 - distinct-expert union and adjacent-row route-overlap metrics;
 - direct-assignment versus ideal grouped packed-weight traffic accounting;
+- deterministic CSR-style expert grouping plan;
+- grouped assignments retain original row and top-k slot identity for exact output restoration;
 - duplicate/out-of-range route validation;
 - dependency-free semantic oracle for FP32 softmax, no-tie top-k and selected-weight renormalization;
 - standalone `gfx1151` HIP routing baseline for 1/2/4/8 logical rows;
