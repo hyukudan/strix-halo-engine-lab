@@ -6,6 +6,7 @@
 #include "strix/hip_launcher_catalog.hpp"
 #include "strix/hip_lm_head_launcher.hpp"
 #include "strix/hip_moe_route_launcher.hpp"
+#include "strix/hip_moe_experts_launcher.hpp"
 #include "strix/hip_shared_expert_launcher.hpp"
 #include "strix/hip_runtime_launchers.hpp"
 #include "strix/kernel_registry.hpp"
@@ -43,6 +44,7 @@ bool catalog_supported(strix::SerialOp op) {
     case SerialOp::final_hyper_mix:
     case SerialOp::lm_head:
     case SerialOp::shared_expert:
+    case SerialOp::moe_experts:
         return true;
     default:
         return false;
@@ -135,6 +137,20 @@ int main() {
         model, request, hyper_mix, kernels);
     strix::register_hip_moe_route_kernel_variant(
         model, request, route, kernels);
+
+    strix::HipMoeExpertsLauncherConfig experts;
+    experts.hidden_size =
+        static_cast<std::uint32_t>(model.hidden_size);
+    experts.intermediate_size =
+        static_cast<std::uint32_t>(model.moe_intermediate_size);
+    experts.expert_count =
+        static_cast<std::uint32_t>(model.num_experts);
+    experts.top_k =
+        static_cast<std::uint32_t>(model.num_experts_per_token);
+    experts.activation =
+        strix::HipActivationStorage::bf16;
+    strix::register_hip_moe_experts_kernel_variant(
+        model, request, experts, kernels);
 
     strix::HipLmHeadLauncherConfig lm_head;
     lm_head.hidden_size =
@@ -231,7 +247,7 @@ int main() {
     }
 
     expect(
-        coverage.missing_steps == 97,
+        coverage.missing_steps == 49,
         "catalog exposes exact current launcher gap count");
     expect(
         missing_by_op[strix::SerialOp::ple] == 1,
@@ -243,8 +259,8 @@ int main() {
         missing_by_op[strix::SerialOp::indexed_attention] == 12,
         "indexed-attention launcher gaps are explicit");
     expect(
-        missing_by_op[strix::SerialOp::moe_experts] == 48,
-        "routed-expert launcher gaps are explicit");
+        missing_by_op[strix::SerialOp::moe_experts] == 0,
+        "routed-expert launcher is covered");
     expect(
         missing_by_op[strix::SerialOp::shared_expert] == 0,
         "shared-expert launcher is covered");
@@ -252,7 +268,7 @@ int main() {
         missing_by_op[strix::SerialOp::lm_head] == 0,
         "LM-head launcher is covered");
     expect(
-        missing_by_op.size() == 4,
+        missing_by_op.size() == 3,
         "no already-supported operator appears in missing coverage");
 
     expect(
