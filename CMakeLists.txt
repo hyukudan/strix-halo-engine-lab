@@ -19,6 +19,7 @@ function(strix_target_warnings target)
 endfunction()
 
 add_library(strix_core STATIC
+    src/execution_plan.cpp
     src/gguf_reader.cpp
     src/kernel_registry.cpp
     src/iq4_xs.cpp
@@ -99,6 +100,11 @@ if(BUILD_TESTING)
     target_link_libraries(strix-sparse-lookup-tests PRIVATE strix_core)
     strix_target_warnings(strix-sparse-lookup-tests)
     add_test(NAME strix-sparse-lookup-tests COMMAND strix-sparse-lookup-tests)
+
+    add_executable(strix-execution-plan-tests tests/execution_plan_tests.cpp)
+    target_link_libraries(strix-execution-plan-tests PRIVATE strix_core)
+    strix_target_warnings(strix-execution-plan-tests)
+    add_test(NAME strix-execution-plan-tests COMMAND strix-execution-plan-tests)
 
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
