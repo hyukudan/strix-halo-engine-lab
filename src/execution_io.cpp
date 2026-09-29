@@ -52,6 +52,12 @@ constexpr Buffer mlp_intermediate() {
         0};
 }
 
+constexpr Buffer gdn_workspace() {
+    return Buffer{
+        ExecutionBufferClass::gdn_workspace,
+        0};
+}
+
 bool contains_buffer(
     std::span<const ExecutionBufferUse> values,
     Buffer needle) {
@@ -81,6 +87,8 @@ std::uint32_t slot_limit(
         return plan.logits_slots;
     case ExecutionBufferClass::mlp_intermediate:
         return plan.mlp_intermediate_slots;
+    case ExecutionBufferClass::gdn_workspace:
+        return plan.gdn_workspace_slots;
     }
     return 0;
 }
@@ -106,11 +114,12 @@ SerialExecutionIoPlan build_serial_execution_io_plan(
     output.route_weight_slots = 1;
     output.logits_slots = 1;
     output.mlp_intermediate_slots = 1;
+    output.gdn_workspace_slots = 1;
     output.steps.reserve(
         execution_plan.steps.size());
 
     constexpr std::size_t maximum_buffers =
-        7U * 8U;
+        8U * 8U;
     std::array<std::uint64_t, maximum_buffers> generations{};
 
     const auto read_use = [&](Buffer buffer) {
@@ -175,6 +184,14 @@ SerialExecutionIoPlan build_serial_execution_io_plan(
             break;
 
         case SerialOp::gated_delta_net:
+            io.reads = {read_use(hidden(0))};
+            io.writes = {write_use(hidden(1))};
+            io.temporaries = {
+                temporary_use(
+                    gdn_workspace()),
+            };
+            break;
+
         case SerialOp::indexed_attention:
             io.reads = {read_use(hidden(0))};
             io.writes = {write_use(hidden(1))};
@@ -280,7 +297,7 @@ void validate_serial_execution_io_plan(
     }
 
     constexpr std::size_t maximum_buffers =
-        7U * 8U;
+        8U * 8U;
     std::array<bool, maximum_buffers> produced{};
     std::array<std::uint64_t, maximum_buffers> generation{};
 
