@@ -216,6 +216,55 @@ int main() {
                compiled.execution_identity,
            "arena layout identity participates in compiled execution identity");
 
+
+    auto different_numerics_model =
+        model;
+    different_numerics_model.rms_norm_epsilon =
+        2e-6F;
+    const auto different_numerics =
+        strix::compile_serial_execution(
+            different_numerics_model,
+            registry,
+            binding_request,
+            buffer_request,
+            256);
+    expect(
+        different_numerics.execution_identity !=
+            compiled.execution_identity,
+        "RMS epsilon changes compiled execution identity");
+
+    auto different_router_model =
+        model;
+    different_router_model.norm_topk_probability =
+        !model.norm_topk_probability;
+    const auto different_router_policy =
+        strix::compile_serial_execution(
+            different_router_model,
+            registry,
+            binding_request,
+            buffer_request,
+            256);
+    expect(
+        different_router_policy.execution_identity !=
+            compiled.execution_identity,
+        "router normalization policy changes compiled execution identity");
+
+    auto different_temporary_request =
+        buffer_request;
+    different_temporary_request.mlp_intermediate_element_bytes =
+        2;
+    const auto different_temporary =
+        strix::compile_serial_execution(
+            model,
+            registry,
+            binding_request,
+            different_temporary_request,
+            256);
+    expect(
+        different_temporary.execution_identity !=
+            compiled.execution_identity,
+        "MLP temporary storage contract changes compiled execution identity");
+
     strix::SerialSessionStateLayoutRequest state_request;
     state_request.context_tokens = 32;
     const auto state_layout =
