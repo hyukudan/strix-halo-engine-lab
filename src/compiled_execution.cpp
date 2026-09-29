@@ -316,12 +316,17 @@ CompiledSerialExecution compile_serial_execution(
 EagerExecutionResult execute_compiled_serial_eager(
     const CompiledSerialExecution& compiled,
     const ExecutionMemoryBinding& memory,
+    const SerialSessionStateLayout& session_state_layout,
+    const SessionStateMemoryBinding& session_state_memory,
     const EagerExecutionRequest& request,
     EagerExecutionDispatcher& dispatcher) {
     validate_execution_memory_binding(
         compiled.execution_identity,
         compiled.arena,
         memory);
+    validate_session_state_memory_binding(
+        session_state_layout,
+        session_state_memory);
 
     if (request.logical_rows !=
             compiled.logical_rows ||
@@ -338,7 +343,9 @@ EagerExecutionResult execute_compiled_serial_eager(
         compiled.arena,
         request,
         dispatcher,
-        &memory);
+        &memory,
+        &session_state_layout,
+        &session_state_memory);
 }
 
 }  // namespace strix
