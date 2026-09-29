@@ -44,6 +44,12 @@ struct CompiledSerialExecution {
 
 [[nodiscard]] EagerExecutionResult execute_compiled_serial_eager(
     const CompiledSerialExecution& compiled,
+    const ExecutionRuntimeResources& resources,
+    const EagerExecutionRequest& request,
+    EagerExecutionDispatcher& dispatcher);
+
+[[nodiscard]] EagerExecutionResult execute_compiled_serial_eager(
+    const CompiledSerialExecution& compiled,
     const ExecutionMemoryBinding& memory,
     const SerialSessionStateLayout& session_state_layout,
     const SessionStateMemoryBinding& session_state_memory,
