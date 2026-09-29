@@ -148,6 +148,35 @@ int main() {
                    "shared_expert",
            "canonical requirements keep shared expert separate from routed experts");
 
+    const auto inject_requirement =
+        std::find_if(
+            canonical_requirements.begin(),
+            canonical_requirements.end(),
+            [](const auto& requirement) {
+                return requirement.op ==
+                           strix::SerialOp::attn_inject ||
+                       requirement.op ==
+                           strix::SerialOp::mlp_inject;
+            });
+    expect(inject_requirement ==
+               canonical_requirements.end(),
+           "inject application steps require no model tensors");
+
+    const auto hyper_inject_requirement =
+        std::find_if(
+            canonical_requirements.begin(),
+            canonical_requirements.end(),
+            [](const auto& requirement) {
+                return requirement.op ==
+                           strix::SerialOp::attn_hyper_mix &&
+                       requirement.binding_slot == 3 &&
+                       requirement.selector.name_contains ==
+                           "hc_attn_inject";
+            });
+    expect(hyper_inject_requirement !=
+               canonical_requirements.end(),
+           "attention hyper-mix owns injection projection weight");
+
     std::vector<strix::ExecutionTensorRequirement>
         requirements;
 
