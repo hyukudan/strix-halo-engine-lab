@@ -62,7 +62,6 @@ void hash_u64(
 
 std::uint64_t bytes_for_component(
     const ModelContract& model,
-    const SerialSessionStateLayout& layout,
     const SessionStateAllocation& allocation,
     std::uint64_t next_position) {
     switch (allocation.component) {
@@ -188,7 +187,6 @@ build_serial_session_snapshot_plan(
         const auto bytes =
             bytes_for_component(
                 model,
-                layout,
                 allocation,
                 request.next_position);
         if (bytes == 0) {
