@@ -19,6 +19,10 @@ namespace strix {
     const ExecutionDispatchContext& context,
     SessionStateComponent component);
 
+[[nodiscard]] const ExecutionTensorAccess& resolve_dispatch_tensor_access(
+    const ExecutionDispatchContext& context,
+    std::uint32_t binding_slot);
+
 [[nodiscard]] const RuntimeTensorBinding& resolve_dispatch_tensor(
     const ExecutionDispatchContext& context,
     std::uint32_t tensor_index);
