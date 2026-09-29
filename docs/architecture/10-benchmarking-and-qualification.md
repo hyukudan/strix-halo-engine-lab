@@ -174,6 +174,50 @@ Qualification SHOULD include:
 - one-link versus dual-link equivalence;
 - reconnect and fallback without stale tensor reuse.
 
+
+## Multi-node qualification
+
+A multi-node benchmark MUST additionally record:
+
+- node count;
+- placement-plan identity;
+- transport implementation;
+- physical link count;
+- negotiated rate per link;
+- USB4 router and port topology;
+- link-to-peer mapping;
+- interrupt affinity;
+- transport-buffer mode;
+- transport scheduler policy.
+
+The required transport matrix is:
+
+```text
+single link
+dual link, same direction
+dual link, opposite directions
+dual link, flow-level distribution
+dual link, large-message striping
+```
+
+For each mode measure:
+
+- queue-depth-one one-way latency;
+- round-trip latency;
+- p50/p95/p99 transfer latency;
+- effective payload bandwidth;
+- simultaneous bidirectional bandwidth;
+- CPU utilization;
+- interrupt rate;
+- synchronization and reassembly overhead;
+- end-to-end tokens/s;
+- time/token;
+- time to first token.
+
+Two links qualify as useful only if they improve the real model workload. A mode that raises aggregate bandwidth but worsens interactive decode latency SHOULD NOT become the default.
+
+Transport message sizes SHOULD be derived from real execution boundaries such as hidden states, partial reductions, expert payloads, prefill boundaries and logits rather than only synthetic powers of two.
+
 ## A/B discipline
 
 Comparisons MUST change one material factor at a time where practical.
