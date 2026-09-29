@@ -96,6 +96,29 @@ MoE qualification SHOULD record:
 
 The engine SHOULD maintain at least a direct tiny-row expert path and a grouped path where route reuse is sufficient. Total row count alone is not enough to choose between them.
 
+
+### Per-projection expert formats
+
+MoE expert storage MUST be planned per projection, not per expert as one monolithic dtype choice.
+
+For the pinned target geometry:
+
+- hidden size is 2560;
+- expert intermediate size is 640;
+- there are 512 routed experts;
+- top-k is 10.
+
+A quantization block that divides the 2560-wide `gate_up` input may still be incompatible with the 640-wide `down` input.
+
+Therefore:
+
+- `gate_up` and `down` MAY use different storage formats or layouts;
+- the planner MUST validate each input dimension against the selected physical block geometry;
+- an incompatible tensor MUST NOT be assigned a synthetic padded byte count unless a lossless padding/repack format is explicitly defined and qualified;
+- grouped execution MAY share packed weight reads only within a projection whose physical layout is valid.
+
+IQ4_XS grouped execution is currently an experimental weight-reuse vehicle, not a declaration that all routed-expert tensors in the canonical checkpoint should use IQ4_XS.
+
 ## Recurrent kernels
 
 Recurrent or scan-style layers SHOULD keep state on chip across multiple logical updates when this reduces repeated global-memory traffic and preserves exact update order.
