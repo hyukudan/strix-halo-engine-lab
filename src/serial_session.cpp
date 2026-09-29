@@ -50,9 +50,19 @@ EagerExecutionResult execute_serial_token(
     request.position = session.next_position;
     request.state = session.state;
 
+    // Reject every deterministic plan/state error before dispatch. These
+    // failures do not mutate persistent device state and therefore do not
+    // poison the session.
+    validate_eager_execution_preflight(
+        compiled.execution,
+        compiled.bindings,
+        compiled.io,
+        compiled.arena,
+        request);
+
     // execute_compiled_serial_eager works on a copy of the state-generation
-    // metadata. No session metadata is published until the complete DAG
-    // returns successfully.
+    // metadata. Once dispatch begins, however, persistent device state may be
+    // modified in place; any subsequent failure therefore poisons the session.
     EagerExecutionResult result;
     try {
         result =
