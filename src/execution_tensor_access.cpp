@@ -157,14 +157,23 @@ build_serial_execution_tensor_requirements(
 
         case SerialOp::moe_experts:
             push(step, 0, TensorRole::moe_expert,
-                 TensorRequirementCardinality::one_or_more,
-                 "_exps");
+                 TensorRequirementCardinality::one_or_more);
+            requirements.back().selector.name_contains_any = {
+                "_exps",
+                "experts.",
+                ".expert.",
+                "expert_",
+            };
             break;
 
         case SerialOp::shared_expert:
             push(step, 0, TensorRole::dense_projection,
-                 TensorRequirementCardinality::one_or_more,
-                 "_shexp");
+                 TensorRequirementCardinality::one_or_more);
+            requirements.back().selector.name_contains_any = {
+                "_shexp",
+                "shared_expert",
+                "shared_experts",
+            };
             break;
 
         case SerialOp::final_hyper_mix:
