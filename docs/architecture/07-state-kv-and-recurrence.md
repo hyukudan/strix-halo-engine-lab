@@ -48,7 +48,15 @@ Recurrent state MUST have a canonical update order.
 
 Speculative execution MUST NOT commit recurrent state until the corresponding tokens are accepted.
 
-Where full snapshots are expensive, the preferred strategy is:
+Rollback design MUST compare at least these candidate strategies when recurrent state is material:
+
+- full per-candidate snapshots;
+- one pre-window snapshot plus accepted-prefix replay/recompute;
+- sparse checkpoints inside a window plus bounded replay.
+
+The comparison MUST include retained bytes, bytes written per speculative cycle, replay arithmetic, extra input retention and rejection position. Snapshot size alone is not a sufficient metric.
+
+Where full snapshots are expensive, the preferred starting strategy is:
 
 1. retain the minimal pre-update state needed;
 2. verify candidate tokens;
@@ -58,6 +66,10 @@ Where full snapshots are expensive, the preferred strategy is:
 ## Snapshots
 
 Snapshots SHOULD store only valid state, not full allocated capacity.
+
+Snapshot validity MUST include partially completed auxiliary structures such as sparse-index blocks, convolution windows, short histories and any other state whose logical boundary may lag the accepted token position.
+
+Transient speculative state SHOULD be released when no active round needs it; retained conversation state MUST NOT keep draft-only capacity indefinitely.
 
 Persistent snapshots MUST include enough identity to reject incompatible reuse, including:
 

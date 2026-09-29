@@ -31,7 +31,18 @@ The engine SHOULD expose:
 - active placement-plan identity;
 - prompt and decode throughput;
 - speculative acceptance;
-- prefill chunk progress.
+- prefill chunk progress;
+- current speculative depth and verify width;
+- proposed and committed tokens per speculative cycle;
+- estimated and observed cost per committed token;
+- active allocation/graph generation.
+
+### Routing and state
+- distinct routed experts per active round where applicable;
+- rows per expert and grouping mode;
+- persistent-state bytes read and written when available;
+- rollback/replay count;
+- retained speculative-state bytes.
 
 ### GPU
 - utilization;
@@ -57,9 +68,13 @@ For every physical and logical link:
 - interrupt rate;
 - active transport mode;
 - mapped/copy/staging mode;
-- current scheduler role.
+- current scheduler role;
+- physical-link identity distinct from logical stream identity;
+- progress mode such as interrupt-driven or dedicated polling.
 
 When two links connect the same node pair, telemetry MUST keep them independently visible.
+
+Logical streams sharing one physical link MUST be reported against the same physical capacity budget rather than appearing as independent bandwidth resources.
 
 
 ## Transport telemetry

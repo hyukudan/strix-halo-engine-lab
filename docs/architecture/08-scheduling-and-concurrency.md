@@ -79,6 +79,8 @@ The engine SHOULD chunk prefill and allow decode opportunities between chunks wh
 
 The policy should be controlled by measured time share, not by arbitrary token counts alone.
 
+Scheduling a yield between prompt chunks MUST be separated from changing the arithmetic chunk plan. If chunk decomposition is part of the numerical-plan identity, fairness may pause between canonical chunks but MUST NOT rewrite them opportunistically.
+
 In multi-node mode, the scheduler SHOULD also avoid letting large prefill transfers block latency-critical decode transfers when separate link capacity is available.
 
 ## Shared rounds
@@ -113,6 +115,12 @@ FIFO is an acceptable baseline.
 The scheduler MAY add bounded prioritization for active decoders over new long prefills to protect interactive latency.
 
 Starvation is forbidden.
+
+## CPU participation budget
+
+CPU lookup workers, transport progress threads, tokenization and page preparation share host memory and package resources with the GPU workload.
+
+The scheduler SHOULD bound and tune CPU helper activity under real GPU load. Thread count, busy polling and prefetch depth MUST NOT be selected from isolated CPU throughput alone.
 
 ## Backpressure
 

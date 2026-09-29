@@ -25,7 +25,10 @@ Every benchmark result MUST record:
 - concurrency;
 - speculative settings;
 - cache state;
-- engine commit.
+- engine commit;
+- numerical-plan identity;
+- kernel-plan identity;
+- graph/allocation generation policy where applicable.
 
 For multi-node results it MUST additionally record:
 
@@ -141,6 +144,20 @@ Report separately:
 
 Never mix prompt and decode throughput into one headline number.
 
+## Operator traffic diagnostics
+
+When qualifying low-row, recurrent or MoE fast paths, the benchmark SHOULD also capture:
+
+- effective packed-weight bytes consumed;
+- repack or dequantization bytes and time;
+- persistent-state bytes read and written;
+- distinct experts touched per round;
+- rows per expert and grouping/padding overhead;
+- launch count and exposed synchronization;
+- replay or rollback work per committed token.
+
+These diagnostics explain why a faster microkernel can still lose in complete inference.
+
 ## Memory metrics
 
 Capture:
@@ -202,7 +219,7 @@ dual link, large-message striping
 
 For each mode measure:
 
-- queue-depth-one one-way latency;
+- queue-depth-one one-way latency when a defensible cross-host clock method is available;
 - round-trip latency;
 - p50/p95/p99 transfer latency;
 - effective payload bandwidth;
@@ -213,6 +230,10 @@ For each mode measure:
 - end-to-end tokens/s;
 - time/token;
 - time to first token.
+
+If one-way latency is estimated from round-trip time rather than measured with synchronized clocks, the result MUST be labelled as an estimate.
+
+Distributed results MUST state whether the objective is latency, throughput or memory capacity. A capacity-improving placement MUST NOT be presented as a latency speedup without evidence.
 
 Two links qualify as useful only if they improve the real model workload. A mode that raises aggregate bandwidth but worsens interactive decode latency SHOULD NOT become the default.
 
@@ -225,3 +246,5 @@ Comparisons MUST change one material factor at a time where practical.
 Order SHOULD be alternated to reduce thermal, cache and background-load bias.
 
 Results that cannot be reproduced across repeated runs MUST be treated as noise until explained.
+
+Ablations SHOULD isolate high-level mechanisms as well as kernel choices. At minimum, relevant comparisons SHOULD include serial versus speculative, full-state snapshot versus replay-oriented rollback, direct versus grouped experts, eager versus graph replay, and one-link versus each qualified dual-link policy.

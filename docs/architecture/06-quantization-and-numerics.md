@@ -6,6 +6,16 @@ Numerical behavior is part of the engine contract.
 
 Quantization, kernel fusion, speculative verification and batching MUST be qualified against explicit references.
 
+## Validation layers
+
+The engine MUST distinguish three different claims:
+
+1. **model fidelity** — the engine implements the intended model and operator semantics, checked against an independent trusted oracle or fixtures;
+2. **within-plan execution equivalence** — serial/optimized, solo/shared, fresh/resumed and speculative/serial paths preserve the same declared numerical plan;
+3. **alternative numerical modes** — a different quantization, accumulation, prefill decomposition or distributed reduction plan may be valid, but requires separate fidelity qualification.
+
+Agreement between two optimized paths is not sufficient proof of model fidelity because both paths can preserve the same implementation error.
+
 ## Separate contracts
 
 The engine MUST distinguish:
@@ -18,6 +28,19 @@ The engine MUST distinguish:
 - sampling precision.
 
 Changing one does not authorize changing the others.
+
+## Numerical-plan identity
+
+Every qualified execution plan SHOULD identify at least:
+
+- weight interpretation and execution layout;
+- activation and accumulator precision;
+- reduction and contraction policy;
+- sampling algorithm and deterministic tie rules;
+- prefill arithmetic/chunk plan when relevant;
+- distributed partition and reduction order when relevant.
+
+Retained state, snapshots, graph plans and tuning records MUST be invalidated when an incompatible numerical-plan component changes.
 
 ## Packed execution
 
@@ -51,6 +74,8 @@ The rule MUST be identical between:
 - optimized kernel;
 - batched execution;
 - speculative verification.
+
+Sampling randomness SHOULD be keyed to stable logical properties such as an explicit seed and absolute token position. It MUST NOT depend on a transient worker slot, rejected speculative work, transport epoch or the node that happens to execute the sampler.
 
 ## KV quantization
 
