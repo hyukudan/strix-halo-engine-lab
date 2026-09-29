@@ -647,6 +647,155 @@ ExecutionLauncher make_launcher(
 
 }  // namespace
 
+
+namespace {
+
+const char* activation_name(
+    HipActivationStorage storage) noexcept {
+    switch (storage) {
+    case HipActivationStorage::bf16:
+        return "bf16";
+    case HipActivationStorage::fp32:
+        return "fp32";
+    }
+    return "unknown";
+}
+
+kernels::KernelVariant make_elementwise_variant(
+    std::string id,
+    kernels::OperatorFamily family,
+    const kernels::ShapeClass& shape,
+    const HipElementwiseLauncherConfig& config,
+    kernels::QualificationStatus qualification) {
+    kernels::KernelVariant variant;
+    variant.id = std::move(id);
+    variant.family = family;
+    variant.phase =
+        kernels::ExecutionPhase::decode;
+    variant.shape = shape;
+    variant.wave =
+        kernels::WaveSize::wave32;
+    variant.resources.workgroup_threads = 256;
+    variant.numerics.input_precision =
+        activation_name(config.activation);
+    variant.numerics.accumulator_precision = "fp32";
+    variant.numerics.output_precision =
+        activation_name(config.activation);
+    variant.numerics.row_invariant = true;
+    variant.numerics.deterministic = true;
+    variant.qualification = qualification;
+    variant.graph_safe = true;
+    variant.input_layout = "row-major";
+    variant.output_layout = "row-major";
+    variant.compiler_identity =
+        "hip-gfx1151-elementwise-v1";
+    variant.measured_seconds = 0.0;
+    return variant;
+}
+
+std::string elementwise_kernel_id(
+    std::string_view operation,
+    const ExecutionBindingRequest& request,
+    const HipElementwiseLauncherConfig& config) {
+    return
+        "hip." +
+        std::string(operation) +
+        "." +
+        activation_name(config.activation) +
+        ".h" +
+        std::to_string(config.hidden_size) +
+        ".hc" +
+        std::to_string(config.hc_count) +
+        ".r" +
+        std::to_string(request.logical_rows) +
+        ".c" +
+        std::to_string(request.request_concurrency);
+}
+
+}  // namespace
+
+void register_hip_elementwise_kernel_variants(
+    const ModelContract& model,
+    const ExecutionBindingRequest& request,
+    const HipElementwiseLauncherConfig& config,
+    kernels::KernelRegistry& registry,
+    kernels::QualificationStatus qualification) {
+    if (const auto error = model.validate();
+        !error.empty()) {
+        throw std::invalid_argument(error);
+    }
+    if (request.logical_rows == 0 ||
+        request.request_concurrency == 0) {
+        throw std::invalid_argument(
+            "HIP elementwise variants require non-zero rows and concurrency");
+    }
+    if (config.hidden_size != model.hidden_size ||
+        config.hc_count != model.hc_count) {
+        throw std::invalid_argument(
+            "HIP elementwise variant geometry does not match model contract");
+    }
+    if (qualification ==
+            kernels::QualificationStatus::target_qualified ||
+        qualification ==
+            kernels::QualificationStatus::production ||
+        qualification ==
+            kernels::QualificationStatus::rejected) {
+        throw std::invalid_argument(
+            "unmeasured HIP elementwise catalog may only register experimental or oracle-matched variants");
+    }
+    static_cast<void>(
+        activation_bytes(config));
+
+    const auto hyper_shape =
+        execution_shape_for(
+            model,
+            SerialOp::hyper_expand,
+            request);
+    const auto inject_shape =
+        execution_shape_for(
+            model,
+            SerialOp::attn_inject,
+            request);
+    const auto combine_shape =
+        execution_shape_for(
+            model,
+            SerialOp::moe_combine,
+            request);
+
+    registry.add(
+        make_elementwise_variant(
+            elementwise_kernel_id(
+                "hyper_expand",
+                request,
+                config),
+            kernels::OperatorFamily::hyper_expand,
+            hyper_shape,
+            config,
+            qualification));
+
+    registry.add(
+        make_elementwise_variant(
+            elementwise_kernel_id(
+                "inject",
+                request,
+                config),
+            kernels::OperatorFamily::elementwise_inject,
+            inject_shape,
+            config,
+            qualification));
+
+    registry.add(
+        make_elementwise_variant(
+            elementwise_kernel_id(
+                "moe_combine",
+                request,
+                config),
+            kernels::OperatorFamily::moe_combine,
+            combine_shape,
+            config,
+            qualification));
+}
+
 std::uint64_t
 hip_elementwise_launcher_identity(
     std::uint64_t operation_tag,
