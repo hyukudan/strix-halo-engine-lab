@@ -86,6 +86,7 @@ build_serial_execution_tensor_requirements(
             push(step, 0, TensorRole::ngram_table,
                  TensorRequirementCardinality::exactly_one,
                  "per_layer_token_embd");
+            requirements.back().selector.layer.reset();
             push(step, 1, TensorRole::ple_parameter,
                  TensorRequirementCardinality::one_or_more,
                  "ple_");
