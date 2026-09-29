@@ -6,6 +6,7 @@
 #include "strix/hip_launcher_catalog.hpp"
 #include "strix/hip_lm_head_launcher.hpp"
 #include "strix/hip_moe_route_launcher.hpp"
+#include "strix/hip_shared_expert_launcher.hpp"
 #include "strix/hip_runtime_launchers.hpp"
 #include "strix/kernel_registry.hpp"
 #include "strix/model_contract.hpp"
@@ -41,6 +42,7 @@ bool catalog_supported(strix::SerialOp op) {
     case SerialOp::mlp_inject:
     case SerialOp::final_hyper_mix:
     case SerialOp::lm_head:
+    case SerialOp::shared_expert:
         return true;
     default:
         return false;
@@ -144,6 +146,17 @@ int main() {
     strix::register_hip_lm_head_kernel_variant(
         model, request, lm_head, kernels);
 
+    strix::HipSharedExpertLauncherConfig shared;
+    shared.hidden_size =
+        static_cast<std::uint32_t>(model.hidden_size);
+    shared.intermediate_size =
+        static_cast<std::uint32_t>(
+            model.shared_expert_intermediate_size);
+    shared.activation =
+        strix::HipActivationStorage::bf16;
+    strix::register_hip_shared_expert_kernel_variant(
+        model, request, shared, kernels);
+
     const auto execution =
         strix::build_serial_decode_execution_plan(model);
 
@@ -218,7 +231,7 @@ int main() {
     }
 
     expect(
-        coverage.missing_steps == 145,
+        coverage.missing_steps == 97,
         "catalog exposes exact current launcher gap count");
     expect(
         missing_by_op[strix::SerialOp::ple] == 1,
@@ -233,13 +246,13 @@ int main() {
         missing_by_op[strix::SerialOp::moe_experts] == 48,
         "routed-expert launcher gaps are explicit");
     expect(
-        missing_by_op[strix::SerialOp::shared_expert] == 48,
-        "shared-expert launcher gaps are explicit");
+        missing_by_op[strix::SerialOp::shared_expert] == 0,
+        "shared-expert launcher is covered");
     expect(
         missing_by_op[strix::SerialOp::lm_head] == 0,
         "LM-head launcher is covered");
     expect(
-        missing_by_op.size() == 5,
+        missing_by_op.size() == 4,
         "no already-supported operator appears in missing coverage");
 
     expect(
