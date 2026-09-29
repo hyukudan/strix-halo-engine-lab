@@ -87,7 +87,10 @@ The engine SHOULD generate a machine-readable inventory containing:
 - execution node;
 - partition descriptor if applicable;
 - selected kernel family;
-- any repack cache identity.
+- any repack cache identity;
+- explicit execution-boundary descriptors when placement can become remote.
+
+A remote-capable execution boundary SHOULD identify the exact tensor shape, dtype, logical stream structure, byte range, auxiliary state and producer/consumer operators. Distributed planning MUST NOT estimate boundary traffic from hidden size alone when the actual representation is wider or carries additional state.
 
 This inventory should be inspectable without running inference.
 
@@ -156,7 +159,19 @@ The planner SHOULD estimate:
 - expected transport overlap;
 - memory saved per node.
 
-A placement that balances model bytes but increases critical-path synchronization SHOULD be rejected.
+A placement MUST be evaluated by total critical-path cost, not synchronization count alone.
+
+For a latency objective, a candidate SHOULD be compared using a model equivalent to:
+
+```text
+critical_path = concurrent_compute
+              + uncovered_communication
+              + synchronization_and_control
+```
+
+Additional synchronization does not by itself disqualify a placement if parallel compute or reduced local memory traffic more than pays for it.
+
+A placement optimized for memory capacity MAY remain useful even when it does not improve single-request latency, but that objective MUST be identified explicitly.
 
 ## Integrity
 

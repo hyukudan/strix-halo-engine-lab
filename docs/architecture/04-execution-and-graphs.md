@@ -41,6 +41,10 @@ Reusing a buffer before a prior launch has finished is forbidden.
 
 Versioned slots or generation counters SHOULD be used wherever asynchronous replay could observe stale input.
 
+A captured graph MUST be bound to an allocation generation for every buffer whose address, size or lifetime affects replay.
+
+Growing, replacing or repacking such a buffer MUST invalidate affected graph instances unless a supported graph-update path has been proven correct for the exact change.
+
 ## Graph capture
 
 HIP graph capture SHOULD be used for stable decode and verification shapes when it measurably reduces launch overhead.
@@ -55,6 +59,8 @@ Graph capture MUST be disabled for paths that:
 - perform unsupported dynamic control.
 
 The eager path MUST remain correct and available as a fallback.
+
+Graph capture and explicit graph construction SHOULD be compared when both are available. A captured execution that preserves unnecessary cross-stream ordering or retains excessive buffers MUST NOT be preferred merely because it uses graph replay.
 
 ## Shape policy
 
@@ -73,6 +79,10 @@ A shape variant should exist only if traces show it is useful.
 ## Prefill
 
 Prefill SHOULD prioritize throughput and bounded working memory rather than graph reuse.
+
+A retained prefix or snapshot MUST carry the identity of any prefill arithmetic plan whose chunk decomposition, reduction order or kernel selection can affect state.
+
+The scheduler MAY yield between canonical chunks to protect decode latency, but it MUST NOT silently change the numerical prefill plan merely because another request arrived.
 
 Chunk size MUST be selected with total memory pressure in mind.
 

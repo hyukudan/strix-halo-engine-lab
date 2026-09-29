@@ -60,6 +60,16 @@ The design SHOULD have dedicated low-row-count kernels rather than forcing decod
 
 Prefill MAY use separate matrix kernels, precision or tiling because its arithmetic and shape priorities differ.
 
+### Low-row packed projection
+
+Decode and speculative verification SHOULD have explicit low-row shape classes, beginning with one row and adding wider variants only when traces justify them.
+
+A multi-row projection SHOULD seek to reuse packed-weight loads, scale metadata and dequantization work while preserving the declared arithmetic contract of each logical row.
+
+Vector/VALU execution and architecture-native matrix instructions MUST be treated as competing implementation candidates. Tile padding, layout conversion, accumulator precision and masked-row cost are part of the comparison.
+
+An integer low-precision matrix instruction MUST NOT be used to justify silently quantizing activations or changing the checkpoint's declared quantization semantics.
+
 ## MoE
 
 Mixture-of-experts execution SHOULD:
@@ -73,6 +83,17 @@ Mixture-of-experts execution SHOULD:
 
 Host-visible routing in the critical path SHOULD be avoided when it forces synchronization.
 
+MoE qualification SHOULD record:
+
+- distinct experts touched per round;
+- rows assigned per expert;
+- overlap of expert sets across adjacent or speculative rows;
+- routed weight bytes;
+- sorting, grouping and padding overhead;
+- shared-expert cost where applicable.
+
+The engine SHOULD maintain at least a direct tiny-row expert path and a grouped path where route reuse is sufficient. Total row count alone is not enough to choose between them.
+
 ## Recurrent kernels
 
 Recurrent or scan-style layers SHOULD keep state on chip across multiple logical updates when this reduces repeated global-memory traffic and preserves exact update order.
@@ -80,6 +101,10 @@ Recurrent or scan-style layers SHOULD keep state on chip across multiple logical
 State tiling, register retention, DPP exchange and LDS exchange SHOULD all be evaluated as alternatives.
 
 The best variant is the one with the lowest full-step cost under the required numerical contract.
+
+Recurrent qualification MUST count persistent-state bytes read and written, not only arithmetic throughput.
+
+A kernel that keeps state on chip but materializes every speculative intermediate state can still lose to a design that writes less state and replays accepted updates.
 
 ## Attention
 
@@ -101,3 +126,11 @@ High VGPR or LDS use is acceptable when it improves full-step performance.
 A kernel MUST NOT be rejected solely because it reduces theoretical occupancy.
 
 Spills, however, MUST be measured under realistic shapes because they can turn register pressure into hidden memory traffic.
+
+## Compatible projection fusion
+
+Projections sharing the same input MAY be stacked, packed or fused when the transformation is lossless and the complete operator sequence improves.
+
+The plan MUST account for extra persistent repacked weight bytes, peak repack workspace, changed cache behavior, launch savings, dequantization reuse and graph compatibility.
+
+Source weights SHOULD remain available when needed for a reference path or when the execution cache is rebuildable rather than authoritative.

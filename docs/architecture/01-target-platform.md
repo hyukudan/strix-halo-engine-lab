@@ -37,6 +37,14 @@ The engine SHOULD prefer compile-time specialization over runtime generality whe
 
 GPU architecture identity MUST be part of every tuning-plan and cache fingerprint.
 
+### Target-specific cost model
+
+Performance thresholds, tile sizes, wave choices, speculative widths, CPU helper counts and transport policies MUST be derived from measurements on the target system.
+
+Values learned on another GPU, memory architecture or interconnect MAY be used only as experiment seeds. They MUST NOT become production defaults without qualification on the target.
+
+Generated GPU code SHOULD be inspectable for the selected `gfx1151` plan, including instruction selection, register pressure, LDS use and spills.
+
 ### Wave size
 
 Wave32 and wave64 MUST be treated as independent implementation candidates.

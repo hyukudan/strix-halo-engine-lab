@@ -27,6 +27,20 @@ Every allocation or mapping MUST belong to a visible category:
 
 No significant pool may remain "miscellaneous".
 
+## Buffer-purpose policy
+
+Sharing one physical DRAM pool does not make every mapping or coherence mode equally suitable for every buffer.
+
+The memory plan SHOULD distinguish at least:
+
+- hot packed weights optimized for repeated GPU reads;
+- persistent KV and recurrent state optimized for predictable GPU update patterns;
+- large sparse or lookup data that may remain reclaimable and file-backed;
+- bounded transport staging optimized for producer/consumer ownership transitions;
+- small control regions where stronger coherence may be justified.
+
+The runtime SHOULD qualify mappings by purpose rather than seek one universal allocation mode.
+
 ## Admission model
 
 Admission MUST be based on physical-memory safety, not only on nominal GPU allocation.
@@ -101,6 +115,12 @@ The engine MUST track registered bytes explicitly.
 Registration SHOULD be limited to hot regions whose benefit is demonstrated.
 
 Whole-model registration MUST NOT be a default until measured against alternatives.
+
+A CPU-visible or GPU-visible mapping MUST NOT be described as zero-copy merely because both processors can address the same physical memory.
+
+The engine MUST measure cacheability, coherence cost, page-fault behavior and producer-to-consumer visibility for the exact allocation type.
+
+Visibility guarantees for CPU/GPU synchronization MUST NOT be assumed to cover writes performed by an external DMA engine. External-DMA transport requires its own proven synchronization contract.
 
 ## Huge pages
 

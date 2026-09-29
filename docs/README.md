@@ -31,6 +31,14 @@ In order:
 
 Peak microbenchmark throughput is never sufficient by itself to justify a design.
 
+## Optimization objective
+
+The engine SHOULD optimize **end-to-end cost per committed token** under the required numerical and memory contract.
+
+Optimization decisions MUST consider the complete path, including packed-weight traffic, persistent-state traffic, launch and synchronization cost, speculative proposal/verification/commit work, expert-routing locality, page faults and staging, host participation, uncovered inter-node communication, and memory retained to enable the fast path.
+
+A wider kernel, larger speculative window, second node or second physical link is useful only when the complete qualified workload improves.
+
 ## Documents
 
 - [01 — Target platform](architecture/01-target-platform.md)
@@ -47,6 +55,7 @@ Peak microbenchmark throughput is never sufficient by itself to justify a design
 - [12 — Multi-node and USB4 interconnect](architecture/12-multi-node-and-usb4.md)
 - [13 — Platform discovery and capability negotiation](architecture/13-platform-discovery.md)
 - [14 — Implementation roadmap](architecture/14-implementation-roadmap.md)
+- [15 — Optimization strategy](architecture/15-optimization-strategy.md)
 
 ## Change rule
 
