@@ -1,5 +1,7 @@
 #include "strix/moe_plan.hpp"
 
+#include "strix/gguf_reader.hpp"
+
 #include <algorithm>
 #include <limits>
 #include <stdexcept>
@@ -16,6 +18,70 @@ std::uint64_t checked_mul(std::uint64_t left, std::uint64_t right) {
 }
 
 }  // namespace
+
+
+MoeExpertStoragePlan build_moe_expert_storage_plan(
+    const MoeExpertStorageRequest& request) {
+    if (request.hidden_size == 0 ||
+        request.intermediate_size == 0 ||
+        request.expert_count == 0) {
+        throw std::invalid_argument(
+            "MoE storage dimensions must be non-zero");
+    }
+
+    const auto gate_geometry =
+        gguf::tensor_type_geometry(request.gate_up_ggml_type);
+    const auto down_geometry =
+        gguf::tensor_type_geometry(request.down_ggml_type);
+    if (!gate_geometry.has_value() || !down_geometry.has_value()) {
+        throw std::invalid_argument(
+            "MoE storage type has no pinned GGML geometry");
+    }
+
+    MoeExpertStoragePlan plan;
+    plan.gate_up_compatible =
+        request.hidden_size % gate_geometry->block_elements == 0;
+    plan.down_compatible =
+        request.intermediate_size % down_geometry->block_elements == 0;
+
+    if (plan.gate_up_compatible) {
+        const auto blocks_per_output =
+            request.hidden_size / gate_geometry->block_elements;
+        const auto gate_outputs =
+            checked_mul(request.intermediate_size, 2ULL);
+        plan.gate_up_bytes_per_expert =
+            checked_mul(
+                checked_mul(blocks_per_output,
+                            gate_geometry->block_bytes),
+                gate_outputs);
+    }
+
+    if (plan.down_compatible) {
+        const auto blocks_per_output =
+            request.intermediate_size / down_geometry->block_elements;
+        plan.down_bytes_per_expert =
+            checked_mul(
+                checked_mul(blocks_per_output,
+                            down_geometry->block_bytes),
+                request.hidden_size);
+    }
+
+    if (plan.gate_up_compatible && plan.down_compatible) {
+        if (plan.down_bytes_per_expert >
+            std::numeric_limits<std::uint64_t>::max() -
+                plan.gate_up_bytes_per_expert) {
+            throw std::overflow_error("MoE expert storage addition overflow");
+        }
+        plan.total_bytes_per_expert =
+            plan.gate_up_bytes_per_expert +
+            plan.down_bytes_per_expert;
+        plan.total_bytes_all_experts =
+            checked_mul(plan.total_bytes_per_expert,
+                        request.expert_count);
+    }
+
+    return plan;
+}
 
 MoeRoutePlan build_moe_route_plan(const MoeRouteRequest& request) {
     if (request.rows == 0 || request.experts_per_row == 0 ||
