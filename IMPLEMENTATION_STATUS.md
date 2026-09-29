@@ -226,3 +226,27 @@ Still pending:
 - BF16/mixed-precision activation variants;
 - profiler spill/LDS/VALU/WMMA analysis;
 - promotion into a target-qualified kernel plan.
+
+
+## Slice A1.2 — recurrent fast path
+
+Initial implementation:
+
+- host-side recurrent window planner with exact persistent-state byte accounting;
+- rollback planner for full candidate snapshots, pre-window replay and sparse checkpoints;
+- retained bytes, maximum replay, expected replay and worst-case replay-state-I/O metrics;
+- standalone `gfx1151` HIP GDN state-update lab;
+- 128-lane key-axis decomposition and 32-column value tiles;
+- compile-time retained windows for 1/2/4/8 logical tokens;
+- serial one-token-launch baseline versus retained-window path;
+- CPU-reference comparison for final state and per-token outputs;
+- kernel timing and HIP resource metadata output.
+
+Still pending:
+
+- native Strix Halo performance/resource qualification;
+- spill inspection for each token-window size;
+- Wave32/Wave64 alternatives where useful;
+- surrounding convolution/projection integration;
+- long-window fresh/resumed qualification;
+- end-to-end speculative replay measurements.
