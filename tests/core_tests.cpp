@@ -137,6 +137,10 @@ int main() {
            "MTP KV is 2 KiB/token/session");
     expect(strix::provisional_indexer_bytes_per_token(model) == 768ULL,
            "provisional indexer estimate is 768 B/token/session");
+    expect(model.full_attention_interval == 4 &&
+               model.ple_layer_1based == 2 &&
+               model.hc_count == 4,
+           "official layer pattern and hyper-connection geometry are explicit");
     expect(model.hidden_size == 2560 &&
                model.moe_intermediate_size == 640 &&
                model.shared_expert_intermediate_size == 640 &&
