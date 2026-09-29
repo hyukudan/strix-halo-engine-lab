@@ -98,8 +98,9 @@ int main() {
     strix::ModelRuntimeBinding weights;
     weights.manifest_layout_identity =
         manifest.layout_identity;
-    weights.model_content_identity =
-        0x3333ULL;
+    weights.model_content_identity.bytes[0] =
+        static_cast<std::uint8_t>(0x3333ULL & 0xffULL);
+    weights.model_content_identity.bytes[1] = 0x5a;
     weights.tensors.push_back(
         {
             0,
