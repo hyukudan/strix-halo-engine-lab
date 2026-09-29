@@ -133,6 +133,7 @@ Initial host-independent core implemented:
 - unit tests for ownership, stale/oversized descriptors, single-link selection, queue-aware selection and striping;
 - standalone TCP ping-pong and stream benchmark harness;
 - direct USB4STREAM read/write benchmark harness;
+- dual-link parallel-flow runner with configurable payload split and aggregate JSON metrics;
 - read-only capture of configured stream index, busy-poll, ring-size, throttling and HopIDs;
 - framed payload validation, optional checksums, warmup exclusion and JSON latency/throughput output;
 - host-side CI workflow covering the core, oracles, UMA host lab and TCP smoke tests.
