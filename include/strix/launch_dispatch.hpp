@@ -1,0 +1,92 @@
+#pragma once
+
+#include "strix/compiled_execution.hpp"
+#include "strix/execution_runtime.hpp"
+
+#include <cstdint>
+#include <string>
+#include <string_view>
+#include <vector>
+
+namespace strix {
+
+using ExecutionLaunchFunction = void (*)(
+    const ExecutionDispatchContext& context,
+    void* user_data);
+
+struct ExecutionLauncher {
+    std::string key;
+    std::uint64_t implementation_identity = 0;
+    ExecutionLaunchFunction function = nullptr;
+    void* user_data = nullptr;
+};
+
+class ExecutionLauncherRegistry {
+public:
+    void add_kernel_launcher(
+        ExecutionLauncher launcher);
+
+    void add_runtime_launcher(
+        SerialOp op,
+        ExecutionLauncher launcher);
+
+    [[nodiscard]] const ExecutionLauncher*
+    find_kernel_launcher(
+        std::string_view kernel_id) const noexcept;
+
+    [[nodiscard]] const ExecutionLauncher*
+    find_runtime_launcher(
+        SerialOp op) const noexcept;
+
+private:
+    struct RuntimeLauncherEntry {
+        SerialOp op = SerialOp::position_prepare;
+        ExecutionLauncher launcher;
+    };
+
+    std::vector<ExecutionLauncher> kernel_launchers_;
+    std::vector<RuntimeLauncherEntry> runtime_launchers_;
+};
+
+struct CompiledStepLauncher {
+    std::uint32_t step_id = 0;
+    SerialOp op = SerialOp::token_embedding;
+    bool runtime_step = false;
+    std::uint64_t implementation_identity = 0;
+    ExecutionLaunchFunction function = nullptr;
+    void* user_data = nullptr;
+};
+
+struct CompiledLaunchPlan {
+    std::uint64_t execution_identity = 0;
+    std::uint64_t plan_identity = 0;
+    std::vector<CompiledStepLauncher> steps;
+};
+
+[[nodiscard]] CompiledLaunchPlan compile_launch_plan(
+    const CompiledSerialExecution& compiled,
+    const ExecutionLauncherRegistry& launchers);
+
+class DirectLaunchDispatcher final
+    : public EagerExecutionDispatcher {
+public:
+    explicit DirectLaunchDispatcher(
+        const CompiledLaunchPlan& plan)
+        : plan_(plan) {}
+
+    void dispatch_kernel(
+        const ExecutionDispatchContext& context) override;
+
+    void dispatch_runtime_step(
+        const ExecutionDispatchContext& context) override;
+
+private:
+    [[nodiscard]] const CompiledStepLauncher&
+    launcher_for(
+        const ExecutionDispatchContext& context,
+        bool runtime_step) const;
+
+    const CompiledLaunchPlan& plan_;
+};
+
+}  // namespace strix
