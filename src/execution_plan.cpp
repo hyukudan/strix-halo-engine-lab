@@ -1,5 +1,6 @@
 #include "strix/execution_plan.hpp"
 
+#include <limits>
 #include <stdexcept>
 #include <utility>
 
