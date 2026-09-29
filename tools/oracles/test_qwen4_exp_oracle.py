@@ -10,6 +10,7 @@ import unittest
 from qwen4_exp_oracle import (
     apply_partial_rope,
     gated_residual,
+    moe_route_no_ties,
     ngram_ids,
     qsa_select_tokens_no_ties,
     recurrent_gated_delta_rule,
@@ -138,6 +139,17 @@ class OracleTests(unittest.TestCase):
             eps=fixture["eps"],
         )
         self.assertEqual(selected, fixture["expected"])
+
+
+    def test_moe_route_no_ties_fixture(self) -> None:
+        fixture = FIXTURE["moe_route_no_ties"]
+        indices, weights = moe_route_no_ties(
+            fixture["logits"],
+            top_k=fixture["top_k"],
+            normalize_selected=fixture["normalize_selected"],
+        )
+        self.assertEqual(indices, fixture["expected_indices"])
+        assert_nested_close(self, weights, fixture["expected_weights"])
 
     def test_stable_top_k_policy(self) -> None:
         fixture = FIXTURE["top_k"]
