@@ -117,6 +117,27 @@ SessionStateAddress resolve_dispatch_state(
         component);
 }
 
+
+const ExecutionTensorAccess& resolve_dispatch_tensor_access(
+    const ExecutionDispatchContext& context,
+    std::uint32_t binding_slot) {
+    if (context.resources == nullptr ||
+        context.resources->tensor_access == nullptr) {
+        throw std::invalid_argument(
+            "dispatch context has no tensor access plan");
+    }
+    const auto* access =
+        find_execution_tensor_access(
+            *context.resources->tensor_access,
+            context.step_id,
+            binding_slot);
+    if (access == nullptr) {
+        throw std::invalid_argument(
+            "dispatch tensor binding slot is not present for this step");
+    }
+    return *access;
+}
+
 const RuntimeTensorBinding& resolve_dispatch_tensor(
     const ExecutionDispatchContext& context,
     std::uint32_t tensor_index) {
