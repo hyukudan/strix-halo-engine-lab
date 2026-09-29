@@ -5,6 +5,15 @@
 
 namespace strix {
 
+bool ModelContentIdentity::valid() const noexcept {
+    for (const auto byte : bytes) {
+        if (byte != 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void validate_model_runtime_binding(
     const ModelManifest& manifest,
     const ModelRuntimeBinding& binding) {
@@ -14,7 +23,7 @@ void validate_model_runtime_binding(
         throw std::invalid_argument(
             "model runtime binding manifest identity mismatch");
     }
-    if (binding.model_content_identity == 0) {
+    if (!binding.model_content_identity.valid()) {
         throw std::invalid_argument(
             "model runtime binding requires non-zero content identity");
     }
