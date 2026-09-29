@@ -1,5 +1,6 @@
 #pragma once
 
+#include "strix/execution_arena.hpp"
 #include "strix/execution_binding.hpp"
 #include "strix/execution_io.hpp"
 #include "strix/execution_plan.hpp"
@@ -20,6 +21,7 @@ struct ExecutionDispatchContext {
     std::optional<std::string_view> kernel_id;
     std::span<const ExecutionBufferUse> reads;
     std::span<const ExecutionBufferUse> writes;
+    const ExecutionArenaPlan* arena = nullptr;
     PersistentState reads_state = PersistentState::none;
     PersistentState writes_state = PersistentState::none;
     std::uint32_t logical_rows = 1;
@@ -69,12 +71,14 @@ void validate_eager_execution_preflight(
     const SerialExecutionPlan& plan,
     const ExecutionBindingPlan& bindings,
     const SerialExecutionIoPlan& io_plan,
+    const ExecutionArenaPlan& arena_plan,
     const EagerExecutionRequest& request);
 
 [[nodiscard]] EagerExecutionResult execute_serial_eager(
     const SerialExecutionPlan& plan,
     const ExecutionBindingPlan& bindings,
     const SerialExecutionIoPlan& io_plan,
+    const ExecutionArenaPlan& arena_plan,
     const EagerExecutionRequest& request,
     EagerExecutionDispatcher& dispatcher);
 
