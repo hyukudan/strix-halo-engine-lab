@@ -125,6 +125,39 @@ int main() {
                runtime_counter.last_step == 1,
            "runtime launcher dispatches by dense step id");
 
+
+    const auto complete_coverage =
+        strix::audit_launcher_coverage(
+            compiled,
+            registry);
+    expect(
+        complete_coverage.covered_steps == 2 &&
+            complete_coverage.missing_steps == 0 &&
+            complete_coverage.missing.empty(),
+        "coverage audit reports complete launcher registry");
+
+    strix::ExecutionLauncherRegistry kernel_only;
+    kernel_only.add_kernel_launcher(
+        {
+            "kernel.embedding",
+            0x1001ULL,
+            &count_launch,
+            &kernel_counter,
+        });
+    const auto missing_coverage =
+        strix::audit_launcher_coverage(
+            compiled,
+            kernel_only);
+    expect(
+        missing_coverage.covered_steps == 1 &&
+            missing_coverage.missing_steps == 1 &&
+            missing_coverage.missing.size() == 1 &&
+            missing_coverage.missing[0].step_id == 1 &&
+            missing_coverage.missing[0].op ==
+                strix::SerialOp::position_prepare &&
+            missing_coverage.missing[0].runtime_step,
+        "coverage audit reports missing launchers with step identity");
+
     auto registry_changed =
         strix::ExecutionLauncherRegistry{};
     registry_changed.add_kernel_launcher(
