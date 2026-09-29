@@ -160,11 +160,11 @@ Basic optimized GPU operations match their references and can be selected reprod
 
 ### A1.1 — Packed decode projection
 
-Status: **packed-projection planner and Q8_0 reference kernel harness implemented; canonical compact format pending**.
+Status: **packed-projection planner, Q8_0 reference path and IQ4_XS compact candidate implemented; native qualification and canonical format decision pending**.
 
 The core now exposes GGML physical block geometry and a low-row planner for row classes 1/2/4/8. It reports exact packed bytes per output row, total tensor bytes, activation bytes, serial repeated-weight traffic and the ideal lower bound when one packed weight stream is reused across rows.
 
-The standalone HIP lab implements Q8_0 as an auditable packed-format reference. One workgroup owns one output feature and decodes each packed weight once while accumulating all compile-time logical rows. Separate Wave32 and Wave64 builds verify row invariance, report timing/resource metadata and expose how register/LDS cost grows with row count. Q8_0 is not the canonical single-node checkpoint decision.
+The standalone HIP lab implements Q8_0 as an auditable packed-format reference. One workgroup owns one output feature and decodes each packed weight once while accumulating all compile-time logical rows. Separate Wave32 and Wave64 builds verify row invariance, report timing/resource metadata and expose how register/LDS cost grows with row count. Q8_0 is not the canonical single-node checkpoint decision.\n\nAn independent IQ4_XS byte-layout/dequant contract is now pinned in the host core and a matching packed HIP candidate applies the same C1/2/4/8 weight-reuse structure to the compact 136-byte/256-element block. IQ4_XS remains experimental until quality and native hardware measurements close the checkpoint decision.
 
 Implement the first low-row-count projection kernel that consumes packed weights directly.
 
