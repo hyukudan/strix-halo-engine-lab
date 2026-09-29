@@ -53,6 +53,38 @@ int main() {
     expect(plan.ideal_grouped_weight_bytes_saved == 6'000,
            "MoE plan exposes grouped weight-traffic upper bound");
 
+
+    request.rows = 4;
+    request.experts_per_row = 3;
+    request.expert_count = 8;
+    request.selected_experts = routes;
+    const auto grouping =
+        strix::build_moe_grouping_plan(request);
+    expect(grouping.expert_offsets.size() == 9,
+           "grouping plan exposes expert_count + 1 offsets");
+    expect(grouping.expert_offsets[0] == 0 &&
+               grouping.expert_offsets[1] == 0 &&
+               grouping.expert_offsets[2] == 2 &&
+               grouping.expert_offsets[3] == 6 &&
+               grouping.expert_offsets[4] == 8,
+           "grouping plan builds deterministic expert ranges");
+
+    const auto expert_two_begin =
+        static_cast<std::size_t>(grouping.expert_offsets[2]);
+    const auto expert_two_end =
+        static_cast<std::size_t>(grouping.expert_offsets[3]);
+    expect(expert_two_end - expert_two_begin == 4,
+           "expert two receives four grouped assignments");
+    expect(grouping.assignment_rows[expert_two_begin] == 0 &&
+               grouping.assignment_slots[expert_two_begin] == 1 &&
+               grouping.assignment_rows[expert_two_begin + 1] == 1 &&
+               grouping.assignment_slots[expert_two_begin + 1] == 0 &&
+               grouping.assignment_rows[expert_two_begin + 2] == 2 &&
+               grouping.assignment_slots[expert_two_begin + 2] == 0 &&
+               grouping.assignment_rows[expert_two_begin + 3] == 3 &&
+               grouping.assignment_slots[expert_two_begin + 3] == 1,
+           "grouped assignments preserve row and top-k slot identity");
+
     const std::vector<std::uint32_t> unique_routes{
         0, 1,
         2, 3,
