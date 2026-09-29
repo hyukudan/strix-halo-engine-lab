@@ -37,6 +37,11 @@ struct ExecutionBindingPlan {
 [[nodiscard]] std::optional<kernels::OperatorFamily>
 operator_family_for(SerialOp op) noexcept;
 
+[[nodiscard]] kernels::ShapeClass execution_shape_for(
+    const ModelContract& model,
+    SerialOp op,
+    const ExecutionBindingRequest& request);
+
 [[nodiscard]] ExecutionBindingPlan bind_serial_execution_plan(
     const ModelContract& model,
     const SerialExecutionPlan& plan,
