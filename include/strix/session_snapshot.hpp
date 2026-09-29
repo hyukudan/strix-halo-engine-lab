@@ -33,6 +33,7 @@ struct SerialSessionSnapshotPlan {
     std::uint64_t state_layout_identity = 0;
     std::uint64_t next_position = 0;
     std::uint64_t committed_tokens = 0;
+    std::uint64_t alignment = 64;
     PersistentStateGenerations state;
 
     std::uint64_t device_bytes = 0;
