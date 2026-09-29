@@ -57,17 +57,32 @@ TransferPlan striped_pair(std::span<const LinkProfile> links,
         return {};
     }
 
-    const long double fraction =
-        static_cast<long double>(a.payload_bytes_per_second) /
-        static_cast<long double>(bandwidth_sum);
-    auto first_bytes = static_cast<std::uint64_t>(
-        static_cast<long double>(bytes) * fraction);
-    first_bytes = std::min(first_bytes, bytes);
-    const auto second_bytes = bytes - first_bytes;
+    // Minimize max(completion_a, completion_b), including each link's
+    // measured latency and already queued bytes. Solve the equal-completion
+    // point, then clamp to a real two-slice transfer.
+    const long double bw_a = static_cast<long double>(a.payload_bytes_per_second);
+    const long double bw_b = static_cast<long double>(b.payload_bytes_per_second);
+    const long double fixed_a =
+        static_cast<long double>(a.one_way_latency_seconds) +
+        static_cast<long double>(a.in_flight_bytes) / bw_a;
+    const long double fixed_b =
+        static_cast<long double>(b.one_way_latency_seconds) +
+        static_cast<long double>(b.in_flight_bytes) / bw_b;
+    const long double denominator = (1.0L / bw_a) + (1.0L / bw_b);
+    const long double equal_point =
+        (fixed_b - fixed_a + static_cast<long double>(bytes) / bw_b) /
+        denominator;
 
-    if (first_bytes == 0 || second_bytes == 0) {
+    const auto maximum_first = bytes - 1;
+    auto first_bytes = equal_point <= 1.0L
+        ? std::uint64_t{1}
+        : equal_point >= static_cast<long double>(maximum_first)
+            ? maximum_first
+            : static_cast<std::uint64_t>(equal_point);
+    if (first_bytes == 0 || first_bytes >= bytes) {
         return {};
     }
+    const auto second_bytes = bytes - first_bytes;
 
     const auto first_seconds = estimate_single_link_seconds(a, first_bytes);
     const auto second_seconds = estimate_single_link_seconds(b, second_bytes);
@@ -109,7 +124,8 @@ bool can_transition(BufferOwnership from, BufferOwnership to) noexcept {
 bool validate_descriptor(const TransferDescriptor& descriptor,
                          const DescriptorLimits& limits) noexcept {
     if (descriptor.protocol_version != limits.protocol_version ||
-        descriptor.connection_epoch == 0 ||
+        limits.connection_epoch == 0 ||
+        descriptor.connection_epoch != limits.connection_epoch ||
         descriptor.request_id == 0 ||
         descriptor.byte_length == 0 ||
         limits.maximum_bytes == 0 ||
