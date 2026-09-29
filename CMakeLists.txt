@@ -289,6 +289,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         src/hip_embedding_launcher.hip
         src/hip_hyper_mix_launcher.hip
         src/hip_lm_head_launcher.hip
+        src/hip_shared_expert_launcher.hip
     )
     target_include_directories(strix_hip_runtime PUBLIC include)
     target_compile_features(strix_hip_runtime PUBLIC cxx_std_20)
