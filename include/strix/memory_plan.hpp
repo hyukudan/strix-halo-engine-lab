@@ -30,6 +30,9 @@ struct MemoryBreakdown {
     std::uint64_t gdn_matrix_state = 0;
     std::uint64_t gdn_conv_state = 0;
     std::uint64_t gdn_state = 0;
+    std::uint64_t ple_conv_state = 0;
+    std::uint64_t ngram_history = 0;
+    std::uint64_t position_history = 0;
     std::uint64_t rollback = 0;
     std::uint64_t resident_model = 0;
     std::uint64_t bounded_cache = 0;
@@ -58,6 +61,12 @@ struct AdmissionDecision {
 [[nodiscard]] std::uint64_t gdn_conv_state_bytes_per_session(
     const ModelContract& model);
 [[nodiscard]] std::uint64_t gdn_state_bytes_per_session(
+    const ModelContract& model);
+[[nodiscard]] std::uint64_t ple_conv_state_bytes_per_session(
+    const ModelContract& model);
+[[nodiscard]] std::uint64_t ngram_history_bytes_per_session(
+    const ModelContract& model);
+[[nodiscard]] std::uint64_t position_history_bytes_per_session(
     const ModelContract& model);
 [[nodiscard]] MemoryBreakdown build_memory_plan(
     const ModelContract& model,
