@@ -58,6 +58,36 @@ health()
 
 The exact API may differ, but ownership and completion MUST remain explicit.
 
+
+## Backend completion contract
+
+Transport backends MUST expose completion as transport events, not model events.
+
+The backend interface SHOULD distinguish at least:
+
+- local buffer reusable;
+- receive complete;
+- remote transport acknowledgement;
+- failed operation.
+
+A transport backend MUST NOT emit or imply semantic model commit.
+
+Every bulk transfer descriptor SHOULD bind the payload to:
+
+- protocol version;
+- connection epoch;
+- model/placement-plan identity;
+- request identity;
+- generation or speculative-round identity;
+- execution-boundary identity;
+- sequence;
+- shape fingerprint;
+- dtype identity;
+- byte length.
+
+A descriptor from an older connection epoch or with a mismatched execution
+identity MUST be rejected before its payload can advance runtime state.
+
 ## Control plane and data plane
 
 Control traffic and bulk tensor traffic SHOULD be separable.
