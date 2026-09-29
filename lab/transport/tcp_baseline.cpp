@@ -468,16 +468,11 @@ void run_server(const ServerOptions& options) {
         payload_bytes += header.bytes;
     }
 
-    std::cout << "{
-"
-              << "  \"role\": \"server\",
-"
-              << "  \"messages\": " << messages << ",
-"
-              << "  \"payload_bytes_received\": " << payload_bytes << "
-"
-              << "}
-";
+    std::cout << '{' << '\n'
+              << "  \"role\": \"server\"," << '\n'
+              << "  \"messages\": " << messages << ',' << '\n'
+              << "  \"payload_bytes_received\": " << payload_bytes << '\n'
+              << '}' << '\n';
 }
 
 void run_client(const ClientOptions& options) {
@@ -554,35 +549,23 @@ void run_client(const ClientOptions& options) {
         ? 0.0
         : *std::max_element(measured.begin(), measured.end()) * 1e6;
 
-    std::cout << "{
-"
-              << "  \"role\": \"client\",
-"
+    std::cout << '{' << '\n'
+              << "  \"role\": \"client\"," << '\n'
               << "  \"mode\": \""
-              << (options.mode == WireKind::ping ? "pingpong" : "stream") << "\",
-"
-              << "  \"bytes\": " << options.bytes << ",
-"
-              << "  \"warmup\": " << options.warmup << ",
-"
-              << "  \"iterations\": " << options.iterations << ",
-"
-              << "  \"verify\": " << (options.verify ? "true" : "false") << ",
-"
-              << "  \"measured_seconds\": " << total_seconds << ",
-"
-              << "  \"effective_payload_gib_s\": " << payload_gib_s << ",
-"
-              << "  \"transaction_p50_us\": " << p50 << ",
-"
-              << "  \"transaction_p95_us\": " << p95 << ",
-"
-              << "  \"transaction_p99_us\": " << p99 << ",
-"
-              << "  \"transaction_max_us\": " << maximum << "
-"
-              << "}
-";
+              << (options.mode == WireKind::ping ? "pingpong" : "stream")
+              << "\"," << '\n'
+              << "  \"bytes\": " << options.bytes << ',' << '\n'
+              << "  \"warmup\": " << options.warmup << ',' << '\n'
+              << "  \"iterations\": " << options.iterations << ',' << '\n'
+              << "  \"verify\": " << (options.verify ? "true" : "false")
+              << ',' << '\n'
+              << "  \"measured_seconds\": " << total_seconds << ',' << '\n'
+              << "  \"effective_payload_gib_s\": " << payload_gib_s << ',' << '\n'
+              << "  \"transaction_p50_us\": " << p50 << ',' << '\n'
+              << "  \"transaction_p95_us\": " << p95 << ',' << '\n'
+              << "  \"transaction_p99_us\": " << p99 << ',' << '\n'
+              << "  \"transaction_max_us\": " << maximum << '\n'
+              << '}' << '\n';
 }
 
 }  // namespace
