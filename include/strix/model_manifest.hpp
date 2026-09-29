@@ -22,6 +22,7 @@ enum class TensorRole {
     recurrent_state,
     sparse_index,
     ngram_table,
+    ple_parameter,
     mtp,
 };
 
