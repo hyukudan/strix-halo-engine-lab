@@ -125,6 +125,9 @@ Still open:
 Initial host-independent core implemented:
 
 - explicit producer/transport/consumer buffer ownership state machine;
+- abstract asynchronous transport-backend interface with prepare/submit/poll/cancel;
+- distinct local-reuse, receive-complete and remote-transport-ack completion kinds; semantic commit remains above transport;
+- transfer descriptors bound to epoch, model-plan, request, generation, execution boundary, shape, dtype and byte length;
 - bounded transfer descriptors with protocol version and connection epoch;
 - qualified-link profiles with latency, payload bandwidth and in-flight accounting;
 - deterministic single-link cost estimation;
