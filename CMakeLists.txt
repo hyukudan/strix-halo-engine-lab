@@ -21,6 +21,7 @@ endfunction()
 add_library(strix_core STATIC
     src/execution_binding.cpp
     src/execution_buffers.cpp
+    src/execution_io.cpp
     src/execution_plan.cpp
     src/execution_runtime.cpp
     src/gguf_reader.cpp
@@ -125,6 +126,11 @@ if(BUILD_TESTING)
     target_link_libraries(strix-execution-runtime-tests PRIVATE strix_core)
     strix_target_warnings(strix-execution-runtime-tests)
     add_test(NAME strix-execution-runtime-tests COMMAND strix-execution-runtime-tests)
+
+    add_executable(strix-execution-io-tests tests/execution_io_tests.cpp)
+    target_link_libraries(strix-execution-io-tests PRIVATE strix_core)
+    strix_target_warnings(strix-execution-io-tests)
+    add_test(NAME strix-execution-io-tests COMMAND strix-execution-io-tests)
 
     add_executable(strix-speculation-tests tests/speculation_tests.cpp)
     target_link_libraries(strix-speculation-tests PRIVATE strix_core)
