@@ -26,6 +26,12 @@ jobs:
       - name: Build UMA host lab
         run: cmake --build build/uma-residency --target strix-uma-host
 
+      - name: Configure sparse lookup lab
+        run: cmake -S lab/sparse_lookup -B build/sparse-lookup -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build sparse lookup lab
+        run: cmake --build build/sparse-lookup
+
       - name: Configure transport lab
         run: cmake -S lab/transport -B build/transport-lab -G Ninja -DCMAKE_BUILD_TYPE=Release
 
