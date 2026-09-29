@@ -89,6 +89,7 @@ void hash_model(
         sizeof(rms_epsilon_bits));
     hash_u64(hash, rms_epsilon_bits);
     hash_bool(hash, model.norm_topk_probability);
+    hash_bool(hash, model.gdn_output_gate_sigmoid);
 
     hash_u64(hash, model.bytes_bf16);
     hash_u64(hash, model.bytes_fp32);
