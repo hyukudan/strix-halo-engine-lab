@@ -259,6 +259,10 @@ Routing foundation implemented:
 - host-side route planner with per-expert assignment histogram;
 - distinct-expert union and adjacent-row route-overlap metrics;
 - direct-assignment versus ideal grouped packed-weight traffic accounting;
+- per-projection expert storage compatibility planner;
+- real target geometry pinned at hidden=2560, intermediate=640, experts=512, top-k=10;
+- grouped expert batches decomposed into realizable 8/4/2/1 row classes without padding;
+- packed IQ4_XS MoE reuse harness for compatible synthetic gate/up and down geometry;
 - deterministic CSR-style expert grouping plan;
 - grouped assignments retain original row and top-k slot identity for exact output restoration;
 - duplicate/out-of-range route validation;
@@ -278,3 +282,11 @@ Still pending:
 - packed grouped expert execution with real weight reuse;
 - shared-expert integration;
 - route-distribution qualification on the canonical checkpoint.
+
+
+MoE format constraint discovered:
+
+- IQ4_XS block geometry (256 elements) is compatible with the 2560-wide routed gate/up input;
+- IQ4_XS cannot directly represent the 640-wide real down input under the current pinned GGML row geometry;
+- Q8_0 block geometry (32 elements) is compatible with both dimensions;
+- the canonical expert checkpoint may therefore require mixed per-projection formats or an explicitly defined lossless repack/padding layout.
