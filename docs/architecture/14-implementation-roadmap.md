@@ -188,6 +188,10 @@ Qualification MUST include row classes relevant to serial decode and speculative
 
 ### A1.2 — Recurrent fast path
 
+Status: **recurrent planner and tiled HIP harness implemented; native qualification pending**.
+
+The host planner now models retained-state traffic and explicit rollback strategies: full candidate snapshots, one pre-window snapshot plus replay, and sparse checkpoints with bounded replay. The standalone HIP lab implements the pinned sequential recurrent state update with 128 key lanes and 32-value tiles, retaining each state tile across compile-time 1/2/4/8-token windows before one writeback. It compares that path with repeated one-token launches and checks output/state against a CPU reference.
+
 Implement the recurrent layer contract and optimize state traffic.
 
 Explore:
