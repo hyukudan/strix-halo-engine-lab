@@ -12,6 +12,7 @@ struct ExecutionBufferRequest {
     std::uint32_t control_element_bytes = 4;
     std::uint32_t index_element_bytes = 4;
     std::uint32_t logit_element_bytes = 4;
+    std::uint32_t mlp_intermediate_element_bytes = 4;
 };
 
 struct ExecutionBufferPlan {
@@ -23,6 +24,7 @@ struct ExecutionBufferPlan {
     std::uint64_t route_index_bytes = 0;
     std::uint64_t route_weight_bytes = 0;
     std::uint64_t logits_bytes = 0;
+    std::uint64_t mlp_intermediate_bytes = 0;
 
     std::uint32_t expanded_hidden_buffers = 2;
     std::uint32_t hidden_buffers = 3;
