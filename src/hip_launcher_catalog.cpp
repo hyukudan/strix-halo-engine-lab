@@ -80,6 +80,25 @@ hyper_mix_config(
     return config;
 }
 
+
+HipLmHeadLauncherConfig
+lm_head_config(
+    const ModelContract& model,
+    HipActivationStorage activation) {
+    HipLmHeadLauncherConfig config;
+    config.hidden_size =
+        checked_u32(
+            model.hidden_size,
+            "hidden_size");
+    config.vocab_size =
+        checked_u32(
+            model.vocab_size,
+            "vocab_size");
+    config.input =
+        activation;
+    return config;
+}
+
 HipMoeRouteLauncherConfig
 moe_route_config(
     const ModelContract& model,
@@ -124,6 +143,10 @@ HipLauncherCatalog::HipLauncherCatalog(
       moe_route_(
           moe_route_config(
               model,
+              config.activation)),
+      lm_head_(
+          lm_head_config(
+              model,
               config.activation)) {
     if (const auto error =
             model.validate();
@@ -152,6 +175,10 @@ register_for_compiled_execution(
             compiled,
             registry);
     moe_route_.
+        register_for_compiled_execution(
+            compiled,
+            registry);
+    lm_head_.
         register_for_compiled_execution(
             compiled,
             registry);
