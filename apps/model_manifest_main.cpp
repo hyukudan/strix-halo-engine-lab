@@ -49,6 +49,7 @@ int main(int argc, char** argv) try {
 
     std::cout << "{\n"
               << "  \"architecture\": \"" << json_escape(manifest.architecture) << "\",\n"
+              << "  \"layout_identity\": " << manifest.layout_identity << ",\n"
               << "  \"total_tensor_bytes\": " << manifest.total_tensor_bytes << ",\n"
               << "  \"file_backed_candidate_bytes\": " << manifest.file_backed_candidate_bytes << ",\n"
               << "  \"bounded_cache_candidate_bytes\": " << manifest.bounded_cache_candidate_bytes << ",\n"
