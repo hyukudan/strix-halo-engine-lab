@@ -136,11 +136,19 @@ int main() {
     const std::array reads{read_use};
     const std::array writes{write_use};
 
+    strix::ExecutionBufferUse temporary_use;
+    temporary_use.buffer.buffer_class =
+        strix::ExecutionBufferClass::mlp_intermediate;
+    temporary_use.buffer.slot = 0;
+    temporary_use.generation = 1;
+    const std::array temporaries{temporary_use};
+
     strix::ExecutionDispatchContext context;
     context.step_id = 7;
     context.op = strix::SerialOp::token_embedding;
     context.reads = reads;
     context.writes = writes;
+    context.temporaries = temporaries;
     context.arena = &arena;
     context.memory = &scratch;
     context.session_state_layout =
@@ -155,11 +163,18 @@ int main() {
     const auto output =
         strix::resolve_dispatch_write(
             context, 0);
+    const auto temporary =
+        strix::resolve_dispatch_temporary(
+            context, 0);
     expect(input.address ==
                scratch.arena_base &&
                output.address ==
                    scratch.arena_base + 512,
            "dispatch scratch resolver uses compiled arena offsets");
+    expect(
+        temporary.address ==
+            scratch.arena_base + 768,
+        "dispatch temporary resolver uses compiled arena offsets");
 
     const auto recurrent =
         strix::resolve_dispatch_state(
