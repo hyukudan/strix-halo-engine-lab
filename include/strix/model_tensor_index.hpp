@@ -16,6 +16,7 @@ struct ModelTensorSelector {
     std::optional<PlacementKind> placement;
     std::string_view exact_name;
     std::string_view name_contains;
+    std::vector<std::string_view> name_contains_any;
 };
 
 struct ModelTensorIndex {
