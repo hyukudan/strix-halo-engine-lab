@@ -386,11 +386,27 @@ Implemented on the host side:
 - mid-dispatch failure poisons the session instead of pretending persistent device state rolled back;
 - preflight failures remain recoverable and touch no dispatcher.
 
+Additional A1.5 runtime work now implemented:
+
+- deterministic ModelManifest layout identity, explicitly distinct from model-content hash;
+- model runtime tensor binding with resident, file-mapped, repacked-cache and remote storage identities;
+- local tensor address/allocation-generation validation and remote tensors without fake pointers;
+- explicit physical scratch-memory binding;
+- explicit serial session-state layout for KV, recurrent matrix, GDN convolution, PLE convolution, provisional sparse-index storage, n-gram history and position history;
+- separate host/device session-state pools with allocation generations;
+- PLE persistent-state accounting corrected to include the exact 180 KiB short-convolution state plus resume metadata;
+- allocated context capacity enforced independently from the model maximum;
+- common dispatch resolvers for scratch reads/writes, persistent state and model tensors;
+- complete runtime resource bundle;
+- compatibility identity binding compiled plan + manifest layout + model content + state layout;
+- separate physical binding identity adding addresses and allocation generations;
+- model-bound serial sessions reject a different checkpoint before dispatch and cannot bypass content checks through the structural/legacy path.
+
 Still pending:
 
-- target-device arena allocation and stable base pointer;
+- exact canonical-checkpoint tensor-to-operator binding;
+- target-device allocation backend rather than externally supplied opaque addresses;
 - HIP dispatcher table for real bound kernels;
-- concrete KV/GDN/convolution/QSA state storage;
-- real token-embedding, attention, PLE and LM-head integration;
-- snapshot-backed recovery of poisoned sessions;
+- real token-embedding, GDN/attention, PLE, MoE and LM-head integration through that dispatcher;
+- snapshot serialization/restoration and poisoned-session recovery;
 - first real token/logit replay against the canonical checkpoint.
