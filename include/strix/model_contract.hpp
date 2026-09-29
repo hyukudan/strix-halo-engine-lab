@@ -8,6 +8,7 @@ namespace strix {
 // Captured from the official Qwen config pinned in artifacts/. These values
 // describe shapes only; they do not define operator semantics.
 struct ModelContract {
+    std::uint64_t vocab_size = 248320;
     std::uint64_t hidden_size = 2560;
     std::uint64_t hidden_layers = 48;
     std::uint64_t full_attention_interval = 4;
