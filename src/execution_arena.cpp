@@ -59,6 +59,8 @@ std::uint64_t bytes_for(
         return sizes.logits_bytes;
     case ExecutionBufferClass::mlp_intermediate:
         return sizes.mlp_intermediate_bytes;
+    case ExecutionBufferClass::gdn_workspace:
+        return sizes.gdn_workspace_bytes;
     }
     throw std::logic_error(
         "unknown execution buffer class");
