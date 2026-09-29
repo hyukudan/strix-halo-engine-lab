@@ -118,3 +118,24 @@ Still open:
 - Gated Residual/Hyper-Connection checkpoint fixtures;
 - tokenizer/chat-template golden tokens;
 - first-layer/logit replay from the canonical development checkpoint.
+
+
+## Slice A0.7 — transport core
+
+Initial host-independent core implemented:
+
+- explicit producer/transport/consumer buffer ownership state machine;
+- bounded transfer descriptors with protocol version and connection epoch;
+- qualified-link profiles with latency, payload bandwidth and in-flight accounting;
+- deterministic single-link cost estimation;
+- flow scheduling that reacts to queued bytes;
+- dual-link striping only when both links are explicitly qualified as independent and the estimated complete transfer beats the single-link path;
+- unit tests for ownership, stale/oversized descriptors, single-link selection, queue-aware selection and striping.
+
+Still pending on the target hosts:
+
+- TCP/network baseline backend and measurements;
+- direct USB4 streaming backend;
+- interrupt/event versus polling progress modes;
+- mapped/registered transport-buffer tiers;
+- real single-link and dual-link topology qualification.
