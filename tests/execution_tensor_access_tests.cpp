@@ -1,5 +1,6 @@
 #include "strix/execution_tensor_access.hpp"
 
+#include <algorithm>
 #include <iostream>
 #include <stdexcept>
 #include <vector>
