@@ -85,3 +85,34 @@ justifies it.
 The canonical single-node checkpoint format must be selected from full memory,
 quality and runtime measurements. A later compact-format kernel receives a
 different kernel ID and numerical contract.
+
+
+## IQ4_XS compact candidate
+
+The same lab now also contains an experimental IQ4_XS projection path.
+
+IQ4_XS is represented as its exact 136-byte / 256-element packed block:
+
+- one FP16 global scale;
+- eight 6-bit local scales, one per 32 values;
+- 128 packed 4-bit code bytes;
+- a fixed 16-entry nonlinear signed codebook.
+
+The host core owns an independent byte-layout/dequant contract and tests it
+without HIP. The GPU lab then consumes the packed block directly and reuses each
+decoded weight across compile-time logical-row classes 1/2/4/8.
+
+Build outputs:
+
+```text
+strix-iq4-xs-projection-w32
+strix-iq4-xs-projection-w64
+```
+
+As with the Q8_0 reference path, Wave32 is native and Wave64 is a separate
+experimental compile.
+
+IQ4_XS is a strong compact-format candidate because it satisfies the current
+single-node memory envelope substantially better than heavier K-quants, but it
+is not yet the canonical checkpoint decision. Quality, real Strix Halo
+throughput, resource pressure and full-model behavior still decide that.
