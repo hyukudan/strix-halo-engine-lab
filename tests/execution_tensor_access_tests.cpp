@@ -144,8 +144,8 @@ int main() {
                canonical_requirements.end() &&
                shared_requirement->selector.role ==
                    strix::TensorRole::dense_projection &&
-               shared_requirement->selector.name_contains ==
-                   "shared_expert",
+               shared_requirement->selector.name_contains.empty() &&
+               shared_requirement->selector.name_contains_any.size() == 3,
            "canonical requirements keep shared expert separate from routed experts");
 
     const auto inject_requirement =
