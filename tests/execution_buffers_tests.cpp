@@ -40,6 +40,9 @@ int main() {
            "C1 route metadata matches top-10");
     expect(c1.logits_bytes == 248320ULL * 4ULL,
            "C1 full logits materialization is explicit");
+    expect(c1.mlp_intermediate_bytes ==
+               2ULL * 640ULL * 4ULL,
+           "C1 MoE temporary stores FP32 gate/up intermediates");
     expect(c1.expanded_hidden_buffers == 2 &&
                c1.hidden_buffers == 3,
            "serial plan reserves ping-pong hyper state and MoE branch buffers");
@@ -54,7 +57,9 @@ int main() {
     expect(r8.expanded_hidden_bytes ==
                8ULL * c1.expanded_hidden_bytes &&
                r8.logits_bytes ==
-                   8ULL * c1.logits_bytes,
+                   8ULL * c1.logits_bytes &&
+               r8.mlp_intermediate_bytes ==
+                   8ULL * c1.mlp_intermediate_bytes,
            "buffer planner scales explicitly with logical row class");
 
     bool invalid = false;
