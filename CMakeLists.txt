@@ -474,5 +474,28 @@ if(STRIX_ENABLE_HIP_RUNTIME)
             NAME strix-hip-shared-expert-launcher-tests
             COMMAND strix-hip-shared-expert-launcher-tests
         )
+
+        add_executable(
+            strix-hip-moe-experts-launcher-tests
+            tests/hip_moe_experts_launcher_tests.hip
+        )
+        set_target_properties(
+            strix-hip-moe-experts-launcher-tests
+            PROPERTIES
+            HIP_STANDARD 20
+            HIP_STANDARD_REQUIRED ON
+            HIP_ARCHITECTURES gfx1151
+        )
+        target_link_libraries(
+            strix-hip-moe-experts-launcher-tests
+            PRIVATE strix_hip_runtime
+        )
+        strix_target_warnings(
+            strix-hip-moe-experts-launcher-tests
+        )
+        add_test(
+            NAME strix-hip-moe-experts-launcher-tests
+            COMMAND strix-hip-moe-experts-launcher-tests
+        )
     endif()
 endif()
