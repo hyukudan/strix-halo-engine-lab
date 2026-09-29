@@ -21,6 +21,14 @@ enum class OperatorFamily {
     moe_route,
     moe_expert,
     sparse_lookup,
+    embedding_lookup,
+    indexed_attention,
+    hyper_mix,
+    hyper_expand,
+    elementwise_inject,
+    shared_expert,
+    moe_combine,
+    lm_head,
 };
 
 enum class ExecutionPhase {
