@@ -248,9 +248,9 @@ The lookup path has predictable memory use and does not destabilize long-context
 
 ### A1.5 — Correct serial executor
 
-Status: **static serial decode DAG implemented; kernel binding and execution pending**.
+Status: **compiled eager serial runtime implemented; concrete HIP dispatch and model-state objects pending**.
 
-The host-side plan now encodes the pinned layer order as a dependency DAG rather than a generic dynamic operator list. It represents token embedding, position preparation, hyper expansion, the single PLE insertion, attention hyper-mix, recurrent or indexed attention by exact layer pattern, attention reinjection, MLP hyper-mix, MoE routing, routed and shared expert branches, MoE combine, MLP reinjection, final hyper mixing and LM head. Persistent-state read/write masks are explicit for KV, recurrent matrix, convolution history, sparse index, n-gram history and position history. Route/shared-expert parallelism is represented through dependencies rather than hidden scheduling rules.
+The host-side plan now encodes the pinned layer order as a dependency DAG rather than a generic dynamic operator list. The compiled plan now freezes DAG topology, kernel bindings, versioned buffer IO, liveness-derived arena offsets and a stable execution identity. The eager runtime performs complete preflight before dispatch, exposes exact buffer generations and physical arena layout to the backend, and tracks persistent-state generations. A C1 serial-session wrapper carries token id/position and commits metadata only after the whole DAG succeeds; mid-dispatch failure poisons the session because persistent GPU state may have been modified in place. It represents token embedding, position preparation, hyper expansion, the single PLE insertion, attention hyper-mix, recurrent or indexed attention by exact layer pattern, attention reinjection, MLP hyper-mix, MoE routing, routed and shared expert branches, MoE combine, MLP reinjection, final hyper mixing and LM head. Persistent-state read/write masks are explicit for KV, recurrent matrix, convolution history, sparse index, n-gram history and position history. Route/shared-expert parallelism is represented through dependencies rather than hidden scheduling rules.
 
 Integrate:
 
