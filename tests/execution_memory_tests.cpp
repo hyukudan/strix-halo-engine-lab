@@ -1,3 +1,4 @@
+#include "strix/compiled_execution.hpp"
 #include "strix/execution_memory.hpp"
 
 #include <set>
