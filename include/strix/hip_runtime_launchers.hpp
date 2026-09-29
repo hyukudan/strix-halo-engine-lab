@@ -1,5 +1,6 @@
 #pragma once
 
+#include "strix/execution_binding.hpp"
 #include "strix/launch_dispatch.hpp"
 
 #include <cstdint>
@@ -18,6 +19,14 @@ struct HipElementwiseLauncherConfig {
     HipActivationStorage activation =
         HipActivationStorage::bf16;
 };
+
+void register_hip_elementwise_kernel_variants(
+    const ModelContract& model,
+    const ExecutionBindingRequest& request,
+    const HipElementwiseLauncherConfig& config,
+    kernels::KernelRegistry& registry,
+    kernels::QualificationStatus qualification =
+        kernels::QualificationStatus::experimental);
 
 [[nodiscard]] std::uint64_t
 hip_elementwise_launcher_identity(
