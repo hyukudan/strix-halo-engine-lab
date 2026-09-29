@@ -10,6 +10,7 @@ namespace strix {
 struct ModelContract {
     std::uint64_t vocab_size = 248320;
     std::uint64_t hidden_size = 2560;
+    std::uint64_t max_position_embeddings = 262144;
     std::uint64_t hidden_layers = 48;
     std::uint64_t full_attention_interval = 4;
     std::uint64_t ple_layer_1based = 2;
