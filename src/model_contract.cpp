@@ -14,6 +14,14 @@ std::string ModelContract::validate() const {
         gdn_layers != hidden_layers - full_attention_layers) {
         return "full-attention plus GDN layers must equal hidden layers";
     }
+    if (full_attention_interval == 0 ||
+        hidden_layers % full_attention_interval != 0 ||
+        hidden_layers / full_attention_interval != full_attention_layers ||
+        ple_layer_1based == 0 ||
+        ple_layer_1based > hidden_layers ||
+        hc_count <= 1) {
+        return "layer pattern, PLE layer and hyper-connection geometry must be valid";
+    }
     if (kv_heads == 0 || head_dim == 0 || bytes_bf16 == 0 || bytes_fp32 == 0) {
         return "head and dtype dimensions must be non-zero";
     }
