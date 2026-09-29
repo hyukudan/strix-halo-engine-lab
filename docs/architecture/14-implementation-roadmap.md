@@ -108,6 +108,10 @@ Default residency policies are selected from real Strix Halo measurements.
 
 ### A0.7 — Transport micro-lab
 
+Status: **transport core implemented; physical-link qualification pending**.
+
+The core now defines explicit buffer ownership transitions, bounded transfer descriptors with connection epochs, measured link profiles, single-link cost estimation and a dual-link scheduler that only stripes links already qualified as independent. Real TCP/direct-stream backends and host-to-host measurements remain pending.
+
 Build the transport abstraction before distributed model execution.
 
 Qualify:
