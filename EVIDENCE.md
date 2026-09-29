@@ -44,6 +44,8 @@ permitidos son: **observado**, **publicado**, **inferido**, **hipótesis** y
 | E-033 | inferido | Con una reserva efectiva de 16–20 GiB y el resto del estado C1, un objetivo inicial de aproximadamente 100 GiB o menos de pesos residentes deja margen razonable en una máquina de 128 GiB; Q4_K_M no cumple ese margen y Q4_K_S queda muy próximo al límite antes de A0.6. | E-011, E-028, E-032 y `MEMORY_BUDGET.md`. | Fijar un envelope mononodo conservador; P-002 sigue pendiente de calidad y medidas reales. |
 | E-034 | publicado | El config público actual de Qwen3.8-Flash-Next declara `hidden_size=2560`, 24 cabezas de atención, `head_dim=256`, `partial_rotary_factor=0.25`, vocabulario 248.320, 512 expertos y top-10 por token. | Config público de Qwen3.8-Flash-Next, captura 2026-09-29. | Usar estas geometrías como shapes representativas en los microbenchmarks A1.0/A1.1, sin convertirlas en resultados de rendimiento. |
 
+| E-035 | publicado + observado | La revisión fijada de GGML define IQ4_XS como bloques de 256 elementos y 136 bytes: escala FP16 global, 8 escalas locales de 6 bits y 128 bytes de códigos de 4 bits contra una tabla no lineal de 16 valores. El core ya tiene un contrato de bytes y fixture independiente que cubre escalas positivas, negativas y cero. | `ggml-org/llama.cpp@8019dc563b1ecbae6b161a70c3a1359f1b206c1e`; `include/strix/iq4_xs.hpp`; `src/iq4_xs.cpp`; `tests/iq4_xs_tests.cpp`. | IQ4_XS puede pasar a kernel experimental A1.1 sin copiar una implementación backend y sin cerrar todavía P-002. |
+
 ## Regla para nuevas entradas
 
 Cada evidencia nueva debe incluir identidad del artefacto, comando o prueba,
