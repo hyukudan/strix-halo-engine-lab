@@ -89,6 +89,156 @@ def apply_partial_rope(
     return rope + [float(x) for x in values[rotary_dim:]]
 
 
+
+def _linear(weight: list[list[float]], values: list[float]) -> list[float]:
+    output: list[float] = []
+    for row in weight:
+        if len(row) != len(values):
+            raise ValueError("linear weight width does not match input")
+        output.append(sum(float(w) * float(x) for w, x in zip(row, values)))
+    return output
+
+
+def _sigmoid(value: float) -> float:
+    if value >= 0.0:
+        z = math.exp(-value)
+        return 1.0 / (1.0 + z)
+    z = math.exp(value)
+    return z / (1.0 + z)
+
+
+def _silu(value: float) -> float:
+    return value * _sigmoid(value)
+
+
+def gated_residual(
+    hyper_input: list[float],
+    *,
+    hc_count: int,
+    hidden_size: int,
+    norm_weight: list[float],
+    down_weight: list[list[float]],
+    up_weight: list[list[float]],
+    inject_weight: list[list[float]] | None = None,
+    eps: float = 1e-6,
+) -> tuple[list[float], list[float] | None]:
+    """Reference gated residual mix for one logical row.
+
+    This follows the declared numerical order: grouped centred RMSNorm, low-rank
+    down projection divided by hc_count, SiLU, up projection, sigmoid, per-stream
+    elementwise weighting and mean. Optional injection weights are
+    2 * sigmoid(linear(normed) / hc_count).
+    """
+
+    if hc_count <= 0 or hidden_size <= 0:
+        raise ValueError("hc_count and hidden_size must be positive")
+    expected = hc_count * hidden_size
+    if len(hyper_input) != expected or len(norm_weight) != expected:
+        raise ValueError("hyper-connection width does not match configuration")
+
+    normed = rms_norm(
+        hyper_input, norm_weight, eps=eps, group_size=hidden_size
+    )
+    low_rank = [
+        _silu(value / float(hc_count))
+        for value in _linear(down_weight, normed)
+    ]
+    expanded = [_sigmoid(value) for value in _linear(up_weight, low_rank)]
+    if len(expanded) != expected:
+        raise ValueError("up projection does not produce hc_count * hidden_size")
+
+    mixed: list[float] = []
+    for feature in range(hidden_size):
+        mixed.append(
+            sum(
+                expanded[stream * hidden_size + feature]
+                * normed[stream * hidden_size + feature]
+                for stream in range(hc_count)
+            )
+            / float(hc_count)
+        )
+
+    injection = None
+    if inject_weight is not None:
+        raw = _linear(inject_weight, normed)
+        if len(raw) != hc_count:
+            raise ValueError("inject projection does not produce hc_count values")
+        injection = [
+            2.0 * _sigmoid(value / float(hc_count)) for value in raw
+        ]
+    return mixed, injection
+
+
+def qsa_select_tokens_no_ties(
+    query_heads: list[list[float]],
+    raw_keys: list[list[float]],
+    visible_indices: list[int],
+    *,
+    compress_ratio: int,
+    token_budget: int,
+    key_norm_weight: list[float],
+    eps: float = 1e-6,
+) -> list[int]:
+    """Reference QSA block pooling/scoring for a no-tie fixture.
+
+    query_heads are the already-normalized/rotated query heads. raw_keys are the
+    cached unpooled key rows before block pooling. The function intentionally
+    refuses a score tie that could affect top-k membership because upstream tie
+    semantics are not yet a canonical contract.
+    """
+
+    if compress_ratio <= 0 or token_budget <= 0:
+        raise ValueError("compress_ratio and token_budget must be positive")
+    if token_budget % compress_ratio != 0:
+        raise ValueError("token_budget must be divisible by compress_ratio")
+    if not query_heads or not query_heads[0]:
+        raise ValueError("query heads must not be empty")
+    head_dim = len(query_heads[0])
+    if len(key_norm_weight) != head_dim:
+        raise ValueError("key norm weight width does not match head dimension")
+    if any(len(head) != head_dim for head in query_heads):
+        raise ValueError("query head dimensions do not match")
+    if any(len(key) != head_dim for key in raw_keys):
+        raise ValueError("raw key dimensions do not match")
+    if any(index < 0 or index >= len(raw_keys) for index in visible_indices):
+        raise ValueError("visible key index is out of range")
+
+    complete = len(visible_indices) // compress_ratio
+    selected: list[int] = []
+    if complete:
+        blocks = [
+            visible_indices[
+                block * compress_ratio : (block + 1) * compress_ratio
+            ]
+            for block in range(complete)
+        ]
+        scores: list[float] = []
+        for block in blocks:
+            pooled = [
+                sum(float(raw_keys[index][feature]) for index in block)
+                / float(compress_ratio)
+                for feature in range(head_dim)
+            ]
+            pooled = rms_norm(pooled, key_norm_weight, eps=eps)
+            score = 0.0
+            for query in query_heads:
+                dot = sum(float(q) * float(k) for q, k in zip(query, pooled))
+                score += max(0.0, dot)
+            scores.append(score / math.sqrt(float(head_dim)))
+
+        block_topk = min(token_budget // compress_ratio, complete)
+        ordered = sorted(range(complete), key=lambda index: -scores[index])
+        if block_topk < complete and block_topk > 0:
+            cutoff = scores[ordered[block_topk - 1]]
+            next_score = scores[ordered[block_topk]]
+            if cutoff == next_score:
+                raise ValueError("QSA top-k cutoff has unresolved score tie")
+        for block_index in ordered[:block_topk]:
+            selected.extend(blocks[block_index])
+
+    selected.extend(visible_indices[complete * compress_ratio :])
+    return selected
+
 def stable_top_k(values: list[float], k: int) -> list[int]:
     """Candidate deterministic top-k policy: larger value, then lower index."""
 
