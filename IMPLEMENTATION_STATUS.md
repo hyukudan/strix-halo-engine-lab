@@ -94,3 +94,27 @@ Not yet qualified on the target hardware:
 - graph and library capability inventory.
 
 Those require native Linux measurements on the Strix Halo hosts.
+
+
+## Slice A0.5b — semantic and numerical oracle
+
+Partially implemented in `tools/oracles/`:
+
+- dependency-free Python reference code, separate from runtime inference;
+- centred and grouped RMSNorm;
+- partial rotary application;
+- sequential Gated DeltaNet recurrent update in double precision;
+- PLE/n-gram hashed row IDs with EOS-aware history;
+- deterministic candidate top-k policy;
+- tiny frozen fixtures;
+- fresh-versus-resumed equivalence tests for recurrent and n-gram state;
+- optional CTest integration when Python 3 is available.
+
+Still open:
+
+- canonical sampled RNG/replay semantics;
+- MTP acceptance algorithm;
+- complete QSA selection and tie fixtures;
+- Gated Residual/Hyper-Connection checkpoint fixtures;
+- tokenizer/chat-template golden tokens;
+- first-layer/logit replay from the canonical development checkpoint.
