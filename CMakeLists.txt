@@ -34,6 +34,7 @@ add_library(strix_core STATIC
     src/recurrent_plan.cpp
     src/sparse_lookup.cpp
     src/speculation.cpp
+    src/speculation_controller.cpp
     src/platform_probe.cpp
     src/transport.cpp
 )
@@ -123,6 +124,11 @@ if(BUILD_TESTING)
     target_link_libraries(strix-speculation-tests PRIVATE strix_core)
     strix_target_warnings(strix-speculation-tests)
     add_test(NAME strix-speculation-tests COMMAND strix-speculation-tests)
+
+    add_executable(strix-speculation-controller-tests tests/speculation_controller_tests.cpp)
+    target_link_libraries(strix-speculation-controller-tests PRIVATE strix_core)
+    strix_target_warnings(strix-speculation-controller-tests)
+    add_test(NAME strix-speculation-controller-tests COMMAND strix-speculation-controller-tests)
 
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
