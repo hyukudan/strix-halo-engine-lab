@@ -3,6 +3,7 @@
 #include "strix/execution_arena.hpp"
 #include "strix/execution_binding.hpp"
 #include "strix/execution_io.hpp"
+#include "strix/execution_memory.hpp"
 #include "strix/execution_plan.hpp"
 
 #include <array>
@@ -22,6 +23,7 @@ struct ExecutionDispatchContext {
     std::span<const ExecutionBufferUse> reads;
     std::span<const ExecutionBufferUse> writes;
     const ExecutionArenaPlan* arena = nullptr;
+    const ExecutionMemoryBinding* memory = nullptr;
     PersistentState reads_state = PersistentState::none;
     PersistentState writes_state = PersistentState::none;
     std::uint32_t logical_rows = 1;
@@ -84,6 +86,7 @@ void validate_eager_execution_preflight(
     const SerialExecutionIoPlan& io_plan,
     const ExecutionArenaPlan& arena_plan,
     const EagerExecutionRequest& request,
-    EagerExecutionDispatcher& dispatcher);
+    EagerExecutionDispatcher& dispatcher,
+    const ExecutionMemoryBinding* memory = nullptr);
 
 }  // namespace strix
