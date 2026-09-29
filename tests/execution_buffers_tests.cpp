@@ -43,6 +43,9 @@ int main() {
     expect(c1.mlp_intermediate_bytes ==
                2ULL * 640ULL * 4ULL,
            "C1 MoE temporary stores FP32 gate/up intermediates");
+    expect(c1.gdn_workspace_bytes ==
+               22'624ULL * 4ULL,
+           "C1 FP32 analytical GDN workspace covers qkv z a b and core");
     expect(c1.expanded_hidden_buffers == 2 &&
                c1.hidden_buffers == 3,
            "serial plan reserves ping-pong hyper state and MoE branch buffers");
@@ -59,7 +62,9 @@ int main() {
                r8.logits_bytes ==
                    8ULL * c1.logits_bytes &&
                r8.mlp_intermediate_bytes ==
-                   8ULL * c1.mlp_intermediate_bytes,
+                   8ULL * c1.mlp_intermediate_bytes &&
+               r8.gdn_workspace_bytes ==
+                   8ULL * c1.gdn_workspace_bytes,
            "buffer planner scales explicitly with logical row class");
 
     bool invalid = false;
