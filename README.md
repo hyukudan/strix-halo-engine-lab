@@ -3,6 +3,10 @@
 Este directorio separa nuestro trabajo de los repositorios de referencia. No
 contiene código derivado de Halogen ni modifica GUFO.
 
+## Architecture documentation
+
+The normative, source-independent technical decisions for the Strix Halo runtime live in [`docs/`](docs/README.md). Research notes and evidence remain separate from the architecture guide.
+
 ## Documentos
 
 - [`RESEARCH.md`](RESEARCH.md): hechos observados, comparación y límites de licencia.
