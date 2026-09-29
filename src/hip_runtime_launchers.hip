@@ -693,3 +693,120 @@ make_hip_moe_combine_launcher(
 }
 
 }  // namespace strix
+
+
+namespace strix {
+namespace {
+
+enum class ElementwiseLauncherKind {
+    hyper_expand,
+    inject,
+    moe_combine,
+};
+
+std::optional<ElementwiseLauncherKind>
+elementwise_launcher_kind(
+    SerialOp op) noexcept {
+    switch (op) {
+    case SerialOp::hyper_expand:
+        return ElementwiseLauncherKind::hyper_expand;
+    case SerialOp::attn_inject:
+    case SerialOp::mlp_inject:
+        return ElementwiseLauncherKind::inject;
+    case SerialOp::moe_combine:
+        return ElementwiseLauncherKind::moe_combine;
+    default:
+        return std::nullopt;
+    }
+}
+
+}  // namespace
+
+void HipElementwiseLauncherBundle::
+register_for_compiled_execution(
+    const CompiledSerialExecution& compiled,
+    ExecutionLauncherRegistry& registry) {
+    if (compiled.execution_identity == 0 ||
+        compiled.execution.steps.size() !=
+            compiled.bindings.bindings.size()) {
+        throw std::invalid_argument(
+            "HIP launcher bundle requires a valid compiled execution");
+    }
+
+    struct Registered {
+        std::string kernel_id;
+        ElementwiseLauncherKind kind;
+    };
+    std::vector<Registered> registered;
+
+    for (std::size_t index = 0;
+         index < compiled.execution.steps.size();
+         ++index) {
+        const auto& step =
+            compiled.execution.steps[index];
+        const auto kind =
+            elementwise_launcher_kind(
+                step.op);
+        if (!kind.has_value()) {
+            continue;
+        }
+
+        const auto& binding =
+            compiled.bindings.bindings[index];
+        if (binding.host_or_runtime_step ||
+            !binding.kernel_id.has_value() ||
+            binding.kernel_id->empty()) {
+            throw std::invalid_argument(
+                "HIP elementwise step is not bound to a kernel id");
+        }
+
+        const auto existing =
+            std::find_if(
+                registered.begin(),
+                registered.end(),
+                [&](const Registered& value) {
+                    return value.kernel_id ==
+                           *binding.kernel_id;
+                });
+
+        if (existing != registered.end()) {
+            if (existing->kind != *kind) {
+                throw std::invalid_argument(
+                    "one kernel id is bound to incompatible HIP elementwise semantics");
+            }
+            continue;
+        }
+
+        ExecutionLauncher launcher;
+        switch (*kind) {
+        case ElementwiseLauncherKind::hyper_expand:
+            launcher =
+                make_hip_hyper_expand_launcher(
+                    *binding.kernel_id,
+                    &config_);
+            break;
+        case ElementwiseLauncherKind::inject:
+            launcher =
+                make_hip_inject_launcher(
+                    *binding.kernel_id,
+                    &config_);
+            break;
+        case ElementwiseLauncherKind::moe_combine:
+            launcher =
+                make_hip_moe_combine_launcher(
+                    *binding.kernel_id,
+                    &config_);
+            break;
+        }
+
+        registry.add_kernel_launcher(
+            std::move(launcher));
+        registered.push_back(
+            Registered{
+                *binding.kernel_id,
+                *kind,
+            });
+    }
+}
+
+}  // namespace strix
