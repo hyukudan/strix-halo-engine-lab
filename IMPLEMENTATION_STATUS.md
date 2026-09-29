@@ -250,3 +250,26 @@ Still pending:
 - surrounding convolution/projection integration;
 - long-window fresh/resumed qualification;
 - end-to-end speculative replay measurements.
+
+
+## Slice A1.3 — MoE routing and expert execution
+
+Routing foundation implemented:
+
+- host-side route planner with per-expert assignment histogram;
+- distinct-expert union and adjacent-row route-overlap metrics;
+- direct-assignment versus ideal grouped packed-weight traffic accounting;
+- duplicate/out-of-range route validation;
+- dependency-free semantic oracle for FP32 softmax, no-tie top-k and selected-weight renormalization;
+- standalone `gfx1151` HIP routing baseline for 1/2/4/8 logical rows;
+- routing timing, exact-index agreement, weight error, expert-union and kernel-resource output.
+
+Still pending:
+
+- canonical top-k cutoff tie contract;
+- wave-parallel/hierarchical routing candidates;
+- fused touched-expert bitmap and route grouping metadata;
+- direct tiny-row expert path;
+- grouped expert execution;
+- shared-expert integration;
+- route-distribution qualification on the canonical checkpoint.
