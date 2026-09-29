@@ -1,6 +1,8 @@
 #include "strix/speculation.hpp"
 
 #include <algorithm>
+#include <cstddef>
+#include <limits>
 #include <stdexcept>
 
 namespace strix {
@@ -24,6 +26,13 @@ GreedyVerificationPlan verify_greedy_candidates(
     if (request.token_budget == 0) {
         throw std::invalid_argument(
             "greedy verification token budget must be non-zero");
+    }
+
+    if (request.candidate_tokens.size() >
+        static_cast<std::size_t>(
+            std::numeric_limits<std::uint32_t>::max())) {
+        throw std::overflow_error(
+            "candidate sequence is too large for verification plan");
     }
 
     GreedyVerificationPlan plan;
