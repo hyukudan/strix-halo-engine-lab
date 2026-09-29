@@ -34,6 +34,7 @@ int main() {
 
     DescriptorLimits limits;
     limits.protocol_version = 3;
+    limits.connection_epoch = 9;
     limits.maximum_bytes = 1024;
 
     TransferDescriptor good;
@@ -46,8 +47,13 @@ int main() {
     expect(validate_descriptor(good, limits), "bounded current-epoch descriptor validates");
 
     auto stale = good;
-    stale.connection_epoch = 0;
-    expect(!validate_descriptor(stale, limits), "zero epoch is rejected");
+    stale.connection_epoch = 8;
+    expect(!validate_descriptor(stale, limits), "stale epoch is rejected");
+
+    auto zero_epoch_limits = limits;
+    zero_epoch_limits.connection_epoch = 0;
+    expect(!validate_descriptor(good, zero_epoch_limits),
+           "uninitialized expected epoch is rejected");
 
     auto oversized = good;
     oversized.byte_length = 2048;
@@ -85,6 +91,16 @@ int main() {
     expect(large.slices[0].byte_length + large.slices[1].byte_length ==
                (16ULL << 20U),
            "striped plan covers the payload exactly");
+
+    links[0].in_flight_bytes = 2ULL << 20U;
+    const auto imbalanced_stripe = plan_transfer(
+        links, 16ULL << 20U, TransferPriority::bulk, policy);
+    expect(imbalanced_stripe.kind == PlanKind::striped,
+           "queued link can still participate when striping remains faster");
+    expect(imbalanced_stripe.slices[0].byte_length <
+               imbalanced_stripe.slices[1].byte_length,
+           "queued striped split compensates for link backlog");
+    links[0].in_flight_bytes = 0;
 
     links[1].independent_for_striping = false;
     const auto shared = plan_transfer(
