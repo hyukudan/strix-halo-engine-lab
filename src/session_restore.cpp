@@ -60,7 +60,13 @@ std::uint64_t build_identity(
     std::uint64_t hash = fnv_offset;
     hash_u64(
         hash,
+        plan.compiled_execution_identity);
+    hash_u64(
+        hash,
         plan.runtime_compatibility_identity);
+    hash_u64(
+        hash,
+        plan.snapshot_plan_identity);
     hash_u64(
         hash,
         plan.state_layout_identity);
@@ -122,6 +128,8 @@ build_serial_session_restore_plan(
     }
 
     SerialSessionSnapshotRequest expected_request;
+    expected_request.compiled_execution_identity =
+        snapshot.compiled_execution_identity;
     expected_request.runtime_compatibility_identity =
         snapshot.runtime_compatibility_identity;
     expected_request.next_position =
@@ -147,8 +155,12 @@ build_serial_session_restore_plan(
     }
 
     SerialSessionRestorePlan restore;
+    restore.compiled_execution_identity =
+        snapshot.compiled_execution_identity;
     restore.runtime_compatibility_identity =
         runtime_compatibility_identity;
+    restore.snapshot_plan_identity =
+        snapshot.plan_identity;
     restore.state_layout_identity =
         destination_layout.layout_identity;
     restore.next_position =
