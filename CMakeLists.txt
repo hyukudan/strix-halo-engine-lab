@@ -284,6 +284,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
     add_library(strix_hip_runtime STATIC
         src/hip_runtime_allocator.cpp
         src/hip_runtime_launchers.hip
+        src/hip_moe_route_launcher.hip
     )
     target_include_directories(strix_hip_runtime PUBLIC include)
     target_compile_features(strix_hip_runtime PUBLIC cxx_std_20)
