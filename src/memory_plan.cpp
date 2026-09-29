@@ -81,6 +81,39 @@ std::uint64_t gdn_state_bytes_per_session(
         gdn_conv_state_bytes_per_session(model));
 }
 
+
+std::uint64_t ple_conv_state_bytes_per_session(
+    const ModelContract& model) {
+    const auto short_state_len =
+        checked_mul(
+            model.ple_conv_kernel_size - 1ULL,
+            model.ngram_size);
+    const auto hc_hidden =
+        checked_mul(
+            model.hc_count,
+            model.hidden_size);
+    return product({
+        hc_hidden,
+        short_state_len,
+        model.bytes_bf16,
+    });
+}
+
+std::uint64_t ngram_history_bytes_per_session(
+    const ModelContract& model) {
+    // Token ids fit in uint32 for the pinned vocabulary. Only ngram_size - 1
+    // preceding ids are needed to resume the hash stream.
+    return checked_mul(
+        model.ngram_size - 1ULL,
+        sizeof(std::uint32_t));
+}
+
+std::uint64_t position_history_bytes_per_session(
+    const ModelContract&) {
+    // Text-only serial decode needs the next absolute position as host state.
+    return sizeof(std::uint64_t);
+}
+
 MemoryBreakdown build_memory_plan(const ModelContract& model,
                                   const MemoryPlanRequest& request) {
     if (const auto error = model.validate(); !error.empty()) {
@@ -107,6 +140,15 @@ MemoryBreakdown build_memory_plan(const ModelContract& model,
         gdn_conv_state_bytes_per_session(model), request.sessions);
     plan.gdn_state = checked_add(
         plan.gdn_matrix_state, plan.gdn_conv_state);
+    plan.ple_conv_state = checked_mul(
+        ple_conv_state_bytes_per_session(model),
+        request.sessions);
+    plan.ngram_history = checked_mul(
+        ngram_history_bytes_per_session(model),
+        request.sessions);
+    plan.position_history = checked_mul(
+        position_history_bytes_per_session(model),
+        request.sessions);
     plan.rollback = request.rollback == RollbackPolicy::full_gdn_snapshots
                         ? product({gdn_state_bytes_per_session(model),
                                    request.sessions, request.draft_tokens})
@@ -118,6 +160,9 @@ MemoryBreakdown build_memory_plan(const ModelContract& model,
     add_to_total(plan, plan.mtp_kv);
     add_to_total(plan, plan.provisional_indexer);
     add_to_total(plan, plan.gdn_state);
+    add_to_total(plan, plan.ple_conv_state);
+    add_to_total(plan, plan.ngram_history);
+    add_to_total(plan, plan.position_history);
     add_to_total(plan, plan.rollback);
     add_to_total(plan, plan.resident_model);
     add_to_total(plan, plan.bounded_cache);
