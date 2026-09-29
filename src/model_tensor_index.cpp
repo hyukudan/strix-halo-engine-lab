@@ -11,6 +11,8 @@ void validate_index(
     const ModelManifest& manifest,
     const ModelTensorIndex& index) {
     if (manifest.layout_identity == 0 ||
+        manifest.layout_identity !=
+            model_manifest_layout_identity(manifest) ||
         index.manifest_layout_identity !=
             manifest.layout_identity) {
         throw std::invalid_argument(
@@ -113,7 +115,10 @@ const ManifestTensor* find_manifest_tensor(
     const ModelManifest& manifest,
     const ModelTensorIndex& index,
     std::string_view exact_name) noexcept {
-    if (index.manifest_layout_identity !=
+    if (manifest.layout_identity == 0 ||
+        manifest.layout_identity !=
+            model_manifest_layout_identity(manifest) ||
+        index.manifest_layout_identity !=
             manifest.layout_identity ||
         index.name_order.size() !=
             manifest.tensors.size()) {
