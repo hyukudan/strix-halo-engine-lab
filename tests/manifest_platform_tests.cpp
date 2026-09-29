@@ -46,6 +46,12 @@ int main() {
     expect(strix::classify_tensor_role("blk.1.ple_key.weight") ==
                TensorRole::ple_parameter,
            "Qwen4Exp PLE parameter is not treated as n-gram table");
+    expect(strix::classify_tensor_role("per_layer_token_embd.weight") ==
+               TensorRole::ngram_table,
+           "per-layer PLE table is classified as n-gram storage");
+    expect(strix::classify_tensor_role("blk.3.attn_gate.weight") ==
+               TensorRole::attention_projection,
+           "Qwen4Exp attention gate is classified with attention projections");
     expect(strix::default_residency(TensorRole::moe_expert) == ResidencyPolicy::resident,
            "experts remain resident by default");
     expect(strix::default_residency(TensorRole::ngram_table) ==
