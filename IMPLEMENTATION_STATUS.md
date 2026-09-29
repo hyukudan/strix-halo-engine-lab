@@ -17,7 +17,6 @@ No implementado o deliberadamente bloqueado:
 
 - semántica QSA canónica, n-gram/PLE, hyper-connections y GDN: esperan contratos
   oficiales/oráculos antes de crear kernels;
-- parser GGUF y mapa de tensores;
 - allocator/residency HIP y kernels `gfx1151`;
 - MTP sampled;
 - servidor y panel administrativo.
@@ -30,6 +29,8 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ./build/strix-memory-plan --tokens 32768 --sessions 1 \
   --resident-gib 68 --baseline-gib 2 --reserve-gib 18
+./build/strix-platform-probe
+./build/strix-model-manifest MODEL.gguf
 ```
 
 El indexer es una estimación provisional derivada del config. Se puede excluir

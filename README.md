@@ -53,3 +53,13 @@ contrastar cada objeción contra evidencia concreta.
 El slice A0.1 ya contiene un núcleo C++20 portable y el ejecutable
 `strix-memory-plan`. Véase `IMPLEMENTATION_STATUS.md` para compilarlo en Linux o
 WSL y obtener un desglose JSON consumible por la futura WebUI.
+
+
+## Current host-side tools
+
+- `strix-memory-plan`: conservative UMA admission planning.
+- `strix-inspect-gguf`: defensive GGUF structure and storage inspection.
+- `strix-model-manifest`: logical tensor roles, bytes, residency candidates and node placement.
+- `strix-platform-probe`: read-only Linux discovery for RAM, KFD GPU identity, ROCm and USB4/USB4STREAM topology.
+
+These tools remain usable before the HIP execution layer is implemented.
