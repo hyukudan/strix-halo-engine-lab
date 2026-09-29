@@ -2,6 +2,8 @@
 
 #include "strix/model_contract.hpp"
 
+#include <algorithm>
+
 #include <iostream>
 #include <stdexcept>
 
@@ -211,6 +213,33 @@ int main() {
     }
     expect(skipped_generation_rejected,
            "skipped write generation is rejected");
+
+
+    auto stale_temporary = io;
+    const auto temp_step =
+        std::find_if(
+            stale_temporary.steps.begin(),
+            stale_temporary.steps.end(),
+            [](const auto& step) {
+                return !step.temporaries.empty();
+            });
+    expect(
+        temp_step != stale_temporary.steps.end(),
+        "IO fixture contains at least one temporary");
+    if (temp_step != stale_temporary.steps.end()) {
+        temp_step->temporaries[0].generation = 0;
+        bool rejected = false;
+        try {
+            strix::validate_serial_execution_io_plan(
+                plan,
+                stale_temporary);
+        } catch (const std::invalid_argument&) {
+            rejected = true;
+        }
+        expect(
+            rejected,
+            "stale temporary generation is rejected");
+    }
 
     if (failures == 0) {
         std::cout << "execution IO tests passed\n";
