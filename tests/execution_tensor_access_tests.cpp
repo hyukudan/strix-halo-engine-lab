@@ -78,6 +78,68 @@ int main() {
         strix::build_model_tensor_index(
             manifest);
 
+
+    const auto canonical_requirements =
+        strix::build_serial_execution_tensor_requirements(
+            execution);
+    expect(!canonical_requirements.empty(),
+           "canonical requirement generator covers the serial plan");
+
+    const auto embedding_requirement =
+        std::find_if(
+            canonical_requirements.begin(),
+            canonical_requirements.end(),
+            [](const auto& requirement) {
+                return requirement.op ==
+                           strix::SerialOp::token_embedding &&
+                       requirement.binding_slot == 0;
+            });
+    expect(embedding_requirement !=
+               canonical_requirements.end() &&
+               embedding_requirement->selector.role ==
+                   strix::TensorRole::embedding &&
+               embedding_requirement->cardinality ==
+                   strix::TensorRequirementCardinality::exactly_one,
+           "canonical requirements make embedding unique");
+
+    const auto routed_requirement =
+        std::find_if(
+            canonical_requirements.begin(),
+            canonical_requirements.end(),
+            [](const auto& requirement) {
+                return requirement.op ==
+                           strix::SerialOp::moe_experts &&
+                       requirement.binding_slot == 0 &&
+                       requirement.selector.layer.has_value() &&
+                       *requirement.selector.layer == 0;
+            });
+    expect(routed_requirement !=
+               canonical_requirements.end() &&
+               routed_requirement->selector.role ==
+                   strix::TensorRole::moe_expert &&
+               routed_requirement->cardinality ==
+                   strix::TensorRequirementCardinality::one_or_more,
+           "canonical requirements bind routed expert family per layer");
+
+    const auto shared_requirement =
+        std::find_if(
+            canonical_requirements.begin(),
+            canonical_requirements.end(),
+            [](const auto& requirement) {
+                return requirement.op ==
+                           strix::SerialOp::shared_expert &&
+                       requirement.binding_slot == 0 &&
+                       requirement.selector.layer.has_value() &&
+                       *requirement.selector.layer == 0;
+            });
+    expect(shared_requirement !=
+               canonical_requirements.end() &&
+               shared_requirement->selector.role ==
+                   strix::TensorRole::dense_projection &&
+               shared_requirement->selector.name_contains ==
+                   "shared_expert",
+           "canonical requirements keep shared expert separate from routed experts");
+
     std::vector<strix::ExecutionTensorRequirement>
         requirements;
 
