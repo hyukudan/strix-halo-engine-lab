@@ -305,7 +305,8 @@ EagerExecutionResult execute_serial_eager(
     EagerExecutionDispatcher& dispatcher,
     const ExecutionMemoryBinding* memory,
     const SerialSessionStateLayout* session_state_layout,
-    const SessionStateMemoryBinding* session_state_memory) {
+    const SessionStateMemoryBinding* session_state_memory,
+    const ExecutionRuntimeResources* resources) {
     validate_eager_execution_preflight(
         plan, bindings, io_plan, arena_plan, request,
         session_state_layout, session_state_memory);
@@ -345,6 +346,7 @@ EagerExecutionResult execute_serial_eager(
         context.memory = memory;
         context.session_state_layout = session_state_layout;
         context.session_state_memory = session_state_memory;
+        context.resources = resources;
         context.reads_state = step.reads_state;
         context.writes_state = step.writes_state;
         context.logical_rows = request.logical_rows;
