@@ -49,9 +49,10 @@ void validate_step_identity(
     }
 
     if (binding.host_or_runtime_step) {
-        if (binding.kernel_id.has_value()) {
+        if (binding.family.has_value() ||
+            binding.kernel_id.has_value()) {
             throw std::invalid_argument(
-                "runtime-managed execution step must not bind a kernel");
+                "runtime-managed execution step must not bind a kernel family");
         }
         return;
     }
@@ -112,7 +113,10 @@ void validate_eager_execution_preflight(
             "eager execution requires a fully bound plan");
     }
 
-    PersistentState available = request.state.valid;
+    std::array<std::uint64_t, 6> pending_writes{};
+
+    std::uint32_t actual_bound = 0;
+    std::uint32_t actual_runtime = 0;
 
     for (std::size_t index = 0;
          index < plan.steps.size();
@@ -135,15 +139,46 @@ void validate_eager_execution_preflight(
             }
         }
 
-        if (!subset(available, step.reads_state)) {
+        const auto required_objects =
+            step.reads_state | step.writes_state;
+        if (!subset(request.state.valid, required_objects)) {
             throw std::invalid_argument(
-                "persistent state required by an execution step is unavailable");
+                "persistent state object required by an execution step is unavailable");
         }
 
-        // Preflight reasons about object existence, not mutations. A step that
-        // writes a previously empty-but-created state may make it available to
-        // later steps in the same request.
-        available = available | step.writes_state;
+        if (binding.host_or_runtime_step) {
+            ++actual_runtime;
+        } else {
+            ++actual_bound;
+        }
+
+        for (std::size_t state_index = 0;
+             state_index < state_flags.size();
+             ++state_index) {
+            if (has_state(step.writes_state, state_flags[state_index])) {
+                ++pending_writes[state_index];
+            }
+        }
+    }
+
+    if (actual_bound != bindings.bound_steps ||
+        actual_runtime != bindings.host_or_runtime_steps ||
+        actual_bound + actual_runtime != plan.steps.size()) {
+        throw std::invalid_argument(
+            "execution binding counters do not match binding contents");
+    }
+
+    for (std::size_t state_index = 0;
+         state_index < state_flags.size();
+         ++state_index) {
+        const auto writes = pending_writes[state_index];
+        const auto generation =
+            request.state.generations[state_index];
+        if (writes >
+            std::numeric_limits<std::uint64_t>::max() - generation) {
+            throw std::overflow_error(
+                "persistent-state generation would overflow during execution");
+        }
     }
 }
 
