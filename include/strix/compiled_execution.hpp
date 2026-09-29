@@ -4,6 +4,7 @@
 #include "strix/execution_binding.hpp"
 #include "strix/execution_buffers.hpp"
 #include "strix/execution_io.hpp"
+#include "strix/execution_memory.hpp"
 #include "strix/execution_plan.hpp"
 #include "strix/execution_runtime.hpp"
 #include "strix/kernel_registry.hpp"
@@ -41,6 +42,7 @@ struct CompiledSerialExecution {
 
 [[nodiscard]] EagerExecutionResult execute_compiled_serial_eager(
     const CompiledSerialExecution& compiled,
+    const ExecutionMemoryBinding& memory,
     const EagerExecutionRequest& request,
     EagerExecutionDispatcher& dispatcher);
 
