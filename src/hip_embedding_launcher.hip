@@ -1,0 +1,780 @@
+#include "strix/hip_embedding_launcher.hpp"
+
+#include "strix/dispatch_resources.hpp"
+
+#include <hip/hip_fp16.h>
+#include <hip/hip_runtime.h>
+
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <limits>
+#include <stdexcept>
+#include <string>
+#include <utility>
+
+namespace strix {
+namespace {
+
+constexpr std::uint32_t kThreads = 256;
+constexpr std::uint64_t kLauncherTag =
+    0x454d42454444494eULL;
+constexpr std::uint64_t fnv_offset =
+    14695981039346656037ULL;
+constexpr std::uint64_t fnv_prime =
+    1099511628211ULL;
+
+struct Q8Block {
+    __half scale;
+    std::int8_t values[32];
+};
+
+struct IQ4XSBlock {
+    __half d;
+    std::uint16_t scales_h;
+    std::uint8_t scales_l[4];
+    std::uint8_t qs[128];
+};
+
+static_assert(sizeof(Q8Block) == 34);
+static_assert(sizeof(IQ4XSBlock) == 136);
+
+__device__ __constant__
+std::int8_t iq4_codebook[16] = {
+    -127, -104, -83, -65,
+    -49, -35, -22, -10,
+       1,   13,  25,  38,
+      53,   69,  89, 113,
+};
+
+enum class EmbeddingWeightKind {
+    f32,
+    f16,
+    bf16,
+    q8_0,
+    iq4_xs,
+};
+
+void hash_u64(
+    std::uint64_t& hash,
+    std::uint64_t value) noexcept {
+    for (unsigned shift = 0;
+         shift < 64;
+         shift += 8) {
+        hash ^=
+            (value >> shift) &
+            0xffULL;
+        hash *= fnv_prime;
+    }
+}
+
+void check_hip(
+    hipError_t error,
+    const char* operation) {
+    if (error != hipSuccess) {
+        throw std::runtime_error(
+            std::string(operation) +
+            ": " +
+            hipGetErrorString(error));
+    }
+}
+
+void validate_config(
+    const HipEmbeddingLauncherConfig& config) {
+    if (config.hidden_size == 0) {
+        throw std::invalid_argument(
+            "HIP embedding hidden size must be non-zero");
+    }
+    if (config.output !=
+            HipActivationStorage::bf16 &&
+        config.output !=
+            HipActivationStorage::fp32) {
+        throw std::invalid_argument(
+            "HIP embedding output storage is unsupported");
+    }
+}
+
+const char* storage_name(
+    HipActivationStorage storage) noexcept {
+    switch (storage) {
+    case HipActivationStorage::bf16:
+        return "bf16";
+    case HipActivationStorage::fp32:
+        return "fp32";
+    }
+    return "unknown";
+}
+
+EmbeddingWeightKind weight_kind(
+    std::uint32_t ggml_type) {
+    switch (ggml_type) {
+    case 0:
+        return EmbeddingWeightKind::f32;
+    case 1:
+        return EmbeddingWeightKind::f16;
+    case 8:
+        return EmbeddingWeightKind::q8_0;
+    case 23:
+        return EmbeddingWeightKind::iq4_xs;
+    case 30:
+        return EmbeddingWeightKind::bf16;
+    default:
+        throw std::invalid_argument(
+            "HIP embedding currently supports only F32, F16, BF16, Q8_0 and IQ4_XS");
+    }
+}
+
+__device__ float bf16_to_float(
+    std::uint16_t bits) {
+    return __uint_as_float(
+        static_cast<std::uint32_t>(
+            bits) << 16U);
+}
+
+__device__ void store_output(
+    float* destination,
+    float value) {
+    *destination = value;
+}
+
+__device__ void store_output(
+    std::uint16_t* destination,
+    float value) {
+    const auto bits =
+        __float_as_uint(value);
+    const auto rounded =
+        bits +
+        0x7fffU +
+        ((bits >> 16U) & 1U);
+    *destination =
+        static_cast<std::uint16_t>(
+            rounded >> 16U);
+}
+
+__device__ std::uint8_t iq4_local_scale(
+    const IQ4XSBlock& block,
+    std::uint32_t subblock) {
+    const auto low_byte =
+        block.scales_l[
+            subblock / 2U];
+    const auto low =
+        static_cast<std::uint8_t>(
+            (low_byte >>
+             (4U *
+              (subblock % 2U))) &
+            0x0fU);
+    const auto high =
+        static_cast<std::uint8_t>(
+            (block.scales_h >>
+             (2U * subblock)) &
+            0x03U);
+    return
+        static_cast<std::uint8_t>(
+            low |
+            static_cast<std::uint8_t>(
+                high << 4U));
+}
+
+template <EmbeddingWeightKind Kind>
+__device__ float load_weight(
+    const void* weights,
+    std::uint32_t row_width,
+    std::uint32_t row,
+    std::uint32_t feature);
+
+template <>
+__device__ float load_weight<
+    EmbeddingWeightKind::f32>(
+    const void* weights,
+    std::uint32_t row_width,
+    std::uint32_t row,
+    std::uint32_t feature) {
+    const auto* values =
+        static_cast<const float*>(
+            weights);
+    return values[
+        static_cast<std::uint64_t>(
+            row) *
+            row_width +
+        feature];
+}
+
+template <>
+__device__ float load_weight<
+    EmbeddingWeightKind::f16>(
+    const void* weights,
+    std::uint32_t row_width,
+    std::uint32_t row,
+    std::uint32_t feature) {
+    const auto* values =
+        static_cast<const __half*>(
+            weights);
+    return __half2float(
+        values[
+            static_cast<std::uint64_t>(
+                row) *
+                row_width +
+            feature]);
+}
+
+template <>
+__device__ float load_weight<
+    EmbeddingWeightKind::bf16>(
+    const void* weights,
+    std::uint32_t row_width,
+    std::uint32_t row,
+    std::uint32_t feature) {
+    const auto* values =
+        static_cast<const std::uint16_t*>(
+            weights);
+    return bf16_to_float(
+        values[
+            static_cast<std::uint64_t>(
+                row) *
+                row_width +
+            feature]);
+}
+
+template <>
+__device__ float load_weight<
+    EmbeddingWeightKind::q8_0>(
+    const void* weights,
+    std::uint32_t row_width,
+    std::uint32_t row,
+    std::uint32_t feature) {
+    const auto* blocks =
+        static_cast<const Q8Block*>(
+            weights);
+    const auto blocks_per_row =
+        row_width / 32U;
+    const auto& block =
+        blocks[
+            static_cast<std::uint64_t>(
+                row) *
+                blocks_per_row +
+            feature / 32U];
+    return __half2float(
+               block.scale) *
+           static_cast<float>(
+               block.values[
+                   feature % 32U]);
+}
+
+template <>
+__device__ float load_weight<
+    EmbeddingWeightKind::iq4_xs>(
+    const void* weights,
+    std::uint32_t row_width,
+    std::uint32_t row,
+    std::uint32_t feature) {
+    const auto* blocks =
+        static_cast<const IQ4XSBlock*>(
+            weights);
+    const auto blocks_per_row =
+        row_width / 256U;
+    const auto& block =
+        blocks[
+            static_cast<std::uint64_t>(
+                row) *
+                blocks_per_row +
+            feature / 256U];
+
+    const auto within =
+        feature % 256U;
+    const auto subblock =
+        within / 32U;
+    const auto suboffset =
+        within % 32U;
+    const auto packed =
+        block.qs[
+            subblock * 16U +
+            (suboffset % 16U)];
+    const auto code =
+        suboffset < 16U
+            ? static_cast<std::uint8_t>(
+                  packed & 0x0fU)
+            : static_cast<std::uint8_t>(
+                  packed >> 4U);
+    const int local =
+        static_cast<int>(
+            iq4_local_scale(
+                block,
+                subblock)) -
+        32;
+
+    return
+        __half2float(block.d) *
+        static_cast<float>(local) *
+        static_cast<float>(
+            iq4_codebook[code]);
+}
+
+template <
+    typename Output,
+    EmbeddingWeightKind Kind>
+__global__ void embedding_kernel(
+    const void* weights,
+    std::uint32_t row_width,
+    std::uint32_t token_id,
+    Output* output) {
+    for (std::uint32_t feature =
+             static_cast<std::uint32_t>(
+                 blockIdx.x) *
+                 blockDim.x +
+             threadIdx.x;
+         feature < row_width;
+         feature +=
+             static_cast<std::uint32_t>(
+                 gridDim.x) *
+             blockDim.x) {
+        store_output(
+            &output[feature],
+            load_weight<Kind>(
+                weights,
+                row_width,
+                token_id,
+                feature));
+    }
+}
+
+std::uint64_t required_weight_bytes(
+    EmbeddingWeightKind kind,
+    std::uint32_t row_width,
+    std::uint64_t rows) {
+    switch (kind) {
+    case EmbeddingWeightKind::f32:
+        return
+            static_cast<std::uint64_t>(
+                row_width) *
+            rows *
+            4ULL;
+    case EmbeddingWeightKind::f16:
+    case EmbeddingWeightKind::bf16:
+        return
+            static_cast<std::uint64_t>(
+                row_width) *
+            rows *
+            2ULL;
+    case EmbeddingWeightKind::q8_0:
+        if (row_width % 32U != 0) {
+            throw std::invalid_argument(
+                "Q8_0 embedding row width must be divisible by 32");
+        }
+        return
+            static_cast<std::uint64_t>(
+                row_width / 32U) *
+            rows *
+            sizeof(Q8Block);
+    case EmbeddingWeightKind::iq4_xs:
+        if (row_width % 256U != 0) {
+            throw std::invalid_argument(
+                "IQ4_XS embedding row width must be divisible by 256");
+        }
+        return
+            static_cast<std::uint64_t>(
+                row_width / 256U) *
+            rows *
+            sizeof(IQ4XSBlock);
+    }
+    throw std::logic_error(
+        "unreachable embedding weight kind");
+}
+
+template <
+    typename Output,
+    EmbeddingWeightKind Kind>
+void launch_typed(
+    const RuntimeTensorBinding& weight,
+    const HipEmbeddingLauncherConfig& config,
+    std::uint32_t token_id,
+    const ExecutionBufferAddress& output) {
+    const auto blocks =
+        std::min<std::uint32_t>(
+            32U,
+            (config.hidden_size +
+             kThreads - 1U) /
+                kThreads);
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME(
+            embedding_kernel<
+                Output,
+                Kind>),
+        dim3(blocks),
+        dim3(kThreads),
+        0,
+        0,
+        reinterpret_cast<const void*>(
+            weight.address),
+        config.hidden_size,
+        token_id,
+        reinterpret_cast<Output*>(
+            output.address));
+    check_hip(
+        hipGetLastError(),
+        "HIP embedding kernel launch");
+}
+
+template <typename Output>
+void launch_by_weight(
+    EmbeddingWeightKind kind,
+    const RuntimeTensorBinding& weight,
+    const HipEmbeddingLauncherConfig& config,
+    std::uint32_t token_id,
+    const ExecutionBufferAddress& output) {
+    switch (kind) {
+    case EmbeddingWeightKind::f32:
+        launch_typed<
+            Output,
+            EmbeddingWeightKind::f32>(
+                weight,
+                config,
+                token_id,
+                output);
+        return;
+    case EmbeddingWeightKind::f16:
+        launch_typed<
+            Output,
+            EmbeddingWeightKind::f16>(
+                weight,
+                config,
+                token_id,
+                output);
+        return;
+    case EmbeddingWeightKind::bf16:
+        launch_typed<
+            Output,
+            EmbeddingWeightKind::bf16>(
+                weight,
+                config,
+                token_id,
+                output);
+        return;
+    case EmbeddingWeightKind::q8_0:
+        launch_typed<
+            Output,
+            EmbeddingWeightKind::q8_0>(
+                weight,
+                config,
+                token_id,
+                output);
+        return;
+    case EmbeddingWeightKind::iq4_xs:
+        launch_typed<
+            Output,
+            EmbeddingWeightKind::iq4_xs>(
+                weight,
+                config,
+                token_id,
+                output);
+        return;
+    }
+    throw std::logic_error(
+        "unreachable embedding weight kind");
+}
+
+void launch_embedding(
+    const ExecutionDispatchContext& context,
+    void* user_data) {
+    if (context.op !=
+        SerialOp::token_embedding) {
+        throw std::invalid_argument(
+            "HIP embedding launcher attached to wrong operator");
+    }
+    if (!context.reads.empty() ||
+        context.writes.size() != 1) {
+        throw std::invalid_argument(
+            "HIP embedding expects no scratch reads and one write");
+    }
+    if (context.logical_rows != 1 ||
+        context.request_concurrency != 1) {
+        throw std::invalid_argument(
+            "HIP embedding v1 supports only C1 one-row execution");
+    }
+    if (user_data == nullptr) {
+        throw std::invalid_argument(
+            "HIP embedding launcher requires configuration");
+    }
+
+    const auto& config =
+        *static_cast<
+            HipEmbeddingLauncherConfig*>(
+                user_data);
+    validate_config(config);
+
+    const auto output =
+        resolve_dispatch_write(
+            context, 0);
+    const auto& access =
+        resolve_dispatch_tensor_access(
+            context, 0);
+    if (access.tensor_indices.size() != 1U) {
+        throw std::invalid_argument(
+            "HIP embedding requires exactly one embedding tensor");
+    }
+    if (context.resources == nullptr ||
+        context.resources->model_manifest ==
+            nullptr) {
+        throw std::invalid_argument(
+            "HIP embedding requires model manifest resources");
+    }
+
+    const auto tensor_index =
+        access.tensor_indices.front();
+    if (tensor_index >=
+        context.resources->
+            model_manifest->
+            tensors.size()) {
+        throw std::out_of_range(
+            "HIP embedding tensor index exceeds manifest");
+    }
+    const auto& manifest_tensor =
+        context.resources->
+            model_manifest->
+            tensors[tensor_index];
+    const auto& runtime_tensor =
+        resolve_dispatch_tensor(
+            context,
+            tensor_index);
+
+    if (manifest_tensor.role !=
+            TensorRole::embedding ||
+        manifest_tensor.dimensions.size() < 2 ||
+        manifest_tensor.dimensions[0] !=
+            config.hidden_size) {
+        throw std::invalid_argument(
+            "HIP embedding tensor geometry does not match contract");
+    }
+    if (context.input_token_id >=
+        manifest_tensor.dimensions[1]) {
+        throw std::out_of_range(
+            "HIP embedding token id exceeds embedding rows");
+    }
+    if ((runtime_tensor.storage !=
+             RuntimeTensorStorage::resident &&
+         runtime_tensor.storage !=
+             RuntimeTensorStorage::repacked_cache) ||
+        runtime_tensor.address == 0) {
+        throw std::invalid_argument(
+            "HIP embedding requires resident or repacked GPU-visible weights");
+    }
+
+    const auto kind =
+        weight_kind(
+            manifest_tensor.ggml_type);
+    const auto required =
+        required_weight_bytes(
+            kind,
+            config.hidden_size,
+            manifest_tensor.dimensions[1]);
+    if (runtime_tensor.bytes < required) {
+        throw std::invalid_argument(
+            "HIP embedding runtime weight binding is undersized");
+    }
+
+    const auto output_bytes =
+        static_cast<std::uint64_t>(
+            config.hidden_size) *
+        static_cast<std::uint32_t>(
+            config.output);
+    if (output.bytes <
+        output_bytes) {
+        throw std::invalid_argument(
+            "HIP embedding output buffer is undersized");
+    }
+
+    switch (config.output) {
+    case HipActivationStorage::bf16:
+        launch_by_weight<
+            std::uint16_t>(
+                kind,
+                runtime_tensor,
+                config,
+                context.input_token_id,
+                output);
+        return;
+    case HipActivationStorage::fp32:
+        launch_by_weight<float>(
+            kind,
+            runtime_tensor,
+            config,
+            context.input_token_id,
+            output);
+        return;
+    }
+    throw std::logic_error(
+        "unreachable embedding output storage");
+}
+
+std::string kernel_id(
+    const ExecutionBindingRequest& request,
+    const HipEmbeddingLauncherConfig& config) {
+    return
+        "hip.embedding." +
+        std::string(
+            storage_name(
+                config.output)) +
+        ".h" +
+        std::to_string(
+            config.hidden_size) +
+        ".r" +
+        std::to_string(
+            request.logical_rows) +
+        ".c" +
+        std::to_string(
+            request.request_concurrency);
+}
+
+std::uint64_t implementation_identity(
+    const HipEmbeddingLauncherConfig& config) noexcept {
+    std::uint64_t hash = fnv_offset;
+    hash_u64(hash, kLauncherTag);
+    hash_u64(hash, config.hidden_size);
+    hash_u64(
+        hash,
+        static_cast<std::uint64_t>(
+            config.output));
+    return hash;
+}
+
+}  // namespace
+
+void register_hip_embedding_kernel_variant(
+    const ModelContract& model,
+    const ExecutionBindingRequest& request,
+    const HipEmbeddingLauncherConfig& config,
+    kernels::KernelRegistry& registry,
+    kernels::QualificationStatus qualification) {
+    if (const auto error =
+            model.validate();
+        !error.empty()) {
+        throw std::invalid_argument(
+            error);
+    }
+    validate_config(config);
+    if (config.hidden_size !=
+        model.hidden_size) {
+        throw std::invalid_argument(
+            "HIP embedding config does not match model hidden size");
+    }
+    if (request.logical_rows != 1 ||
+        request.request_concurrency != 1) {
+        throw std::invalid_argument(
+            "HIP embedding v1 registers only C1 one-row variants");
+    }
+    if (qualification ==
+            kernels::QualificationStatus::target_qualified ||
+        qualification ==
+            kernels::QualificationStatus::production ||
+        qualification ==
+            kernels::QualificationStatus::rejected) {
+        throw std::invalid_argument(
+            "unmeasured HIP embedding may only be experimental or oracle-matched");
+    }
+
+    kernels::KernelVariant variant;
+    variant.id =
+        kernel_id(
+            request,
+            config);
+    variant.family =
+        kernels::OperatorFamily::
+            embedding_lookup;
+    variant.phase =
+        kernels::ExecutionPhase::decode;
+    variant.shape =
+        execution_shape_for(
+            model,
+            SerialOp::token_embedding,
+            request);
+    variant.wave =
+        kernels::WaveSize::wave32;
+    variant.resources.workgroup_threads =
+        kThreads;
+    variant.numerics.input_precision =
+        "ggml-packed";
+    variant.numerics.accumulator_precision =
+        "fp32";
+    variant.numerics.output_precision =
+        storage_name(
+            config.output);
+    variant.numerics.row_invariant = true;
+    variant.numerics.deterministic = true;
+    variant.qualification =
+        qualification;
+
+    // token_id is currently a by-value launch parameter. Do not mark this
+    // launcher graph-safe until graph parameter update/stable token storage is
+    // part of the runtime contract.
+    variant.graph_safe = false;
+    variant.input_layout =
+        "ggml-row";
+    variant.output_layout =
+        "row-major";
+    variant.compiler_identity =
+        "hip-gfx1151-embedding-v1";
+    variant.measured_seconds = 0.0;
+
+    registry.add(
+        std::move(variant));
+}
+
+ExecutionLauncher
+make_hip_embedding_launcher(
+    std::string kernel_id_value,
+    HipEmbeddingLauncherConfig* config) {
+    if (kernel_id_value.empty() ||
+        config == nullptr) {
+        throw std::invalid_argument(
+            "HIP embedding launcher requires id and config");
+    }
+    validate_config(*config);
+    return ExecutionLauncher{
+        std::move(kernel_id_value),
+        implementation_identity(
+            *config),
+        &launch_embedding,
+        config,
+    };
+}
+
+void HipEmbeddingLauncherBundle::
+register_for_compiled_execution(
+    const CompiledSerialExecution& compiled,
+    ExecutionLauncherRegistry& registry) {
+    if (compiled.execution_identity == 0 ||
+        compiled.execution.steps.size() !=
+            compiled.bindings.bindings.size()) {
+        throw std::invalid_argument(
+            "HIP embedding bundle requires valid compiled execution");
+    }
+
+    for (std::size_t index = 0;
+         index <
+            compiled.execution.steps.size();
+         ++index) {
+        if (compiled.execution.steps[index].op !=
+            SerialOp::token_embedding) {
+            continue;
+        }
+
+        const auto& binding =
+            compiled.bindings.bindings[index];
+        if (binding.host_or_runtime_step ||
+            !binding.kernel_id.has_value() ||
+            binding.kernel_id->empty()) {
+            throw std::invalid_argument(
+                "HIP embedding step has no kernel binding");
+        }
+
+        registry.add_kernel_launcher(
+            make_hip_embedding_launcher(
+                *binding.kernel_id,
+                &config_));
+        return;
+    }
+
+    throw std::invalid_argument(
+        "compiled execution has no token embedding step");
+}
+
+}  // namespace strix
