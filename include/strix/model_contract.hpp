@@ -14,6 +14,10 @@ struct ModelContract {
     std::uint64_t hidden_layers = 48;
     std::uint64_t full_attention_interval = 4;
     std::uint64_t ple_layer_1based = 2;
+    std::uint64_t ple_embed_dim = 2560;
+    std::uint64_t ple_conv_kernel_size = 4;
+    std::uint64_t ngram_size = 3;
+    std::uint64_t heads_per_ngram = 8;
     std::uint64_t hc_count = 4;
     std::uint64_t full_attention_layers = 12;
     std::uint64_t gdn_layers = 36;
