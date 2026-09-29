@@ -123,3 +123,65 @@ will run two qualified endpoints concurrently and compare:
 Do not use operating-system bonding as the reference for engine-level
 multi-link scheduling: the engine needs per-link latency, queue and failure
 visibility.
+
+
+## Direct USB4STREAM baseline
+
+On a Linux kernel with direct USB4 streaming support, configure a named stream
+through configfs on both hosts. Once the stream is active, its `index`
+attribute identifies the matching `/dev/tbstreamX` character device.
+
+Example receiver:
+
+```bash
+./build/transport-lab/strix-transport-tbstream server \
+  --device /dev/tbstream0 \
+  --config /sys/kernel/config/thunderbolt/stream/0-1.0/data \
+  --max-bytes 64MiB --verify
+```
+
+Example sender:
+
+```bash
+./build/transport-lab/strix-transport-tbstream client \
+  --device /dev/tbstream0 \
+  --config /sys/kernel/config/thunderbolt/stream/0-3.0/data \
+  --mode stream --bytes 16MiB --warmup 5 --iterations 50 --verify
+```
+
+The direct backend deliberately uses only normal `read(2)` and `write(2)`.
+It does not assume mmap, DMA-BUF, ioctls, GPU-direct DMA or message boundaries
+provided by the character device.
+
+The optional `--config` path is read-only. Benchmark JSON records:
+
+- stream index;
+- busy-poll mode;
+- ring size;
+- interrupt throttling;
+- input HopID;
+- output HopID.
+
+Those settings are part of the benchmark identity.
+
+### Progress modes
+
+Run separate qualifications with interrupt-driven completion and
+`busy_poll=1`.
+
+Busy polling may reduce latency but consumes CPU and changes polling semantics,
+so it is a distinct transport mode rather than a hidden tuning flag.
+
+### Ring and interrupt tuning
+
+The direct-stream ring size and interrupt-throttling value are tunable kernel
+attributes. Tune them offline as a matrix and record them with each result.
+Never infer the best decode setting from bulk throughput alone.
+
+### Config responsibility
+
+The benchmark does not create or modify configfs streams.
+
+Stream creation, HopID allocation and tuning require system-level coordination
+between both hosts and remain an explicit deployment step. This keeps the
+benchmark read-only with respect to transport configuration.
