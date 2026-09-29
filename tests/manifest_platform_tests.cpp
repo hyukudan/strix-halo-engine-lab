@@ -84,6 +84,7 @@ int main() {
     std::filesystem::create_directories(root / "sys/bus/thunderbolt/devices/domain0");
     std::filesystem::create_directories(root / "sys/bus/thunderbolt/devices/0-0");
     std::filesystem::create_directories(root / "sys/module/thunderbolt_stream");
+    std::filesystem::create_directories(root / "sys/kernel/config/thunderbolt/stream/0-1.0/data");
     std::filesystem::create_directories(root / "dev");
 
     {
@@ -109,6 +110,17 @@ int main() {
         out << '\n';
     }
 
+    {
+        const auto stream = root / "sys/kernel/config/thunderbolt/stream/0-1.0/data";
+        std::ofstream(stream / "index") << "0\n";
+        std::ofstream(stream / "busy_poll") << "1\n";
+        std::ofstream(stream / "ring_size") << "512\n";
+        std::ofstream(stream / "throttling") << "4096\n";
+        std::ofstream(stream / "in_hopid") << "8\n";
+        std::ofstream(stream / "out_hopid") << "9\n";
+    }
+
+
     const auto platform = strix::probe_platform(root);
     expect(platform.mem_total_bytes == 131072ULL * 1024ULL,
            "platform probe parses MemTotal");
@@ -127,6 +139,19 @@ int main() {
            "platform probe discovers USB4 stream device");
     expect(platform.usb4.stream_driver_present,
            "platform probe detects USB4 stream driver");
+    expect(platform.usb4.configured_streams.size() == 1,
+           "platform probe discovers configured USB4 stream");
+    if (platform.usb4.configured_streams.size() == 1) {
+        const auto& stream = platform.usb4.configured_streams[0];
+        expect(stream.service == "0-1.0" && stream.name == "data" &&
+                   stream.index.has_value() && *stream.index == 0 &&
+                   stream.busy_poll.has_value() && *stream.busy_poll &&
+                   stream.ring_size.has_value() && *stream.ring_size == 512 &&
+                   stream.throttling_ns.has_value() && *stream.throttling_ns == 4096 &&
+                   stream.in_hopid.has_value() && *stream.in_hopid == 8 &&
+                   stream.out_hopid.has_value() && *stream.out_hopid == 9,
+               "configured USB4 stream attributes are parsed");
+    }
 
     std::filesystem::remove_all(root, error);
 
