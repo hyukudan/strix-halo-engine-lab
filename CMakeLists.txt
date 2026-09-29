@@ -37,6 +37,7 @@ add_library(strix_core STATIC
     src/launch_dispatch.cpp
     src/memory_plan.cpp
     src/model_contract.cpp
+    src/model_content_hash.cpp
     src/model_manifest.cpp
     src/model_runtime_binding.cpp
     src/model_tensor_index.cpp
@@ -93,6 +94,11 @@ if(BUILD_TESTING)
     target_link_libraries(strix-model-runtime-binding-tests PRIVATE strix_core)
     strix_target_warnings(strix-model-runtime-binding-tests)
     add_test(NAME strix-model-runtime-binding-tests COMMAND strix-model-runtime-binding-tests)
+
+    add_executable(strix-model-content-hash-tests tests/model_content_hash_tests.cpp)
+    target_link_libraries(strix-model-content-hash-tests PRIVATE strix_core)
+    strix_target_warnings(strix-model-content-hash-tests)
+    add_test(NAME strix-model-content-hash-tests COMMAND strix-model-content-hash-tests)
 
     add_executable(strix-model-tensor-index-tests tests/model_tensor_index_tests.cpp)
     target_link_libraries(strix-model-tensor-index-tests PRIVATE strix_core)
