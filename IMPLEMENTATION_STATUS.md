@@ -132,13 +132,15 @@ Initial host-independent core implemented:
 - dual-link striping only when both links are explicitly qualified as independent and the estimated complete transfer beats the single-link path;
 - unit tests for ownership, stale/oversized descriptors, single-link selection, queue-aware selection and striping;
 - standalone TCP ping-pong and stream benchmark harness;
+- direct USB4STREAM read/write benchmark harness;
+- read-only capture of configured stream index, busy-poll, ring-size, throttling and HopIDs;
 - framed payload validation, optional checksums, warmup exclusion and JSON latency/throughput output;
 - host-side CI workflow covering the core, oracles, UMA host lab and TCP smoke tests.
 
 Still pending on the target hosts:
 
 - real two-host TCP/network baseline measurements;
-- direct USB4 streaming backend;
+- real two-host direct USB4STREAM measurements;
 - interrupt/event versus polling progress modes;
 - mapped/registered transport-buffer tiers;
 - real single-link and dual-link topology qualification.
