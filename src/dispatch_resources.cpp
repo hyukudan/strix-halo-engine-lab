@@ -108,6 +108,28 @@ ExecutionBufferAddress resolve_dispatch_write(
         context.writes[index]);
 }
 
+
+ExecutionBufferAddress resolve_dispatch_temporary(
+    const ExecutionDispatchContext& context,
+    std::size_t index) {
+    if (context.arena == nullptr) {
+        throw std::invalid_argument(
+            "dispatch context has no arena plan");
+    }
+    if (index >= context.temporaries.size()) {
+        throw std::out_of_range(
+            "dispatch temporary index is out of range");
+    }
+
+    const auto& memory =
+        scratch_memory(context);
+    return resolve_execution_buffer(
+        memory.execution_identity,
+        *context.arena,
+        memory,
+        context.temporaries[index]);
+}
+
 SessionStateAddress resolve_dispatch_state(
     const ExecutionDispatchContext& context,
     SessionStateComponent component) {
