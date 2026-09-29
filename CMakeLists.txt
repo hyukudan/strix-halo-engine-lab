@@ -25,6 +25,7 @@ add_library(strix_core STATIC
     src/model_manifest.cpp
     src/oracles.cpp
     src/platform_probe.cpp
+    src/transport.cpp
 )
 target_include_directories(strix_core PUBLIC include)
 target_compile_features(strix_core PUBLIC cxx_std_20)
@@ -57,6 +58,11 @@ if(BUILD_TESTING)
     target_link_libraries(strix-manifest-platform-tests PRIVATE strix_core)
     strix_target_warnings(strix-manifest-platform-tests)
     add_test(NAME strix-manifest-platform-tests COMMAND strix-manifest-platform-tests)
+
+    add_executable(strix-transport-tests tests/transport_tests.cpp)
+    target_link_libraries(strix-transport-tests PRIVATE strix_core)
+    strix_target_warnings(strix-transport-tests)
+    add_test(NAME strix-transport-tests COMMAND strix-transport-tests)
 
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
