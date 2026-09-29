@@ -5,6 +5,7 @@
 #include "strix/execution_io.hpp"
 #include "strix/execution_memory.hpp"
 #include "strix/execution_plan.hpp"
+#include "strix/execution_resources.hpp"
 #include "strix/session_state_layout.hpp"
 #include "strix/session_state_memory.hpp"
 
@@ -28,6 +29,7 @@ struct ExecutionDispatchContext {
     const ExecutionMemoryBinding* memory = nullptr;
     const SerialSessionStateLayout* session_state_layout = nullptr;
     const SessionStateMemoryBinding* session_state_memory = nullptr;
+    const ExecutionRuntimeResources* resources = nullptr;
     PersistentState reads_state = PersistentState::none;
     PersistentState writes_state = PersistentState::none;
     std::uint32_t logical_rows = 1;
@@ -84,7 +86,8 @@ void validate_eager_execution_preflight(
     const ExecutionArenaPlan& arena_plan,
     const EagerExecutionRequest& request,
     const SerialSessionStateLayout* session_state_layout = nullptr,
-    const SessionStateMemoryBinding* session_state_memory = nullptr);
+    const SessionStateMemoryBinding* session_state_memory = nullptr,
+    const ExecutionRuntimeResources* resources = nullptr);
 
 [[nodiscard]] EagerExecutionResult execute_serial_eager(
     const SerialExecutionPlan& plan,
