@@ -118,6 +118,33 @@ shared_expert_config(
     return config;
 }
 
+
+HipMoeExpertsLauncherConfig
+moe_experts_config(
+    const ModelContract& model,
+    HipActivationStorage activation) {
+    HipMoeExpertsLauncherConfig config;
+    config.hidden_size =
+        checked_u32(
+            model.hidden_size,
+            "hidden_size");
+    config.intermediate_size =
+        checked_u32(
+            model.moe_intermediate_size,
+            "moe_intermediate_size");
+    config.expert_count =
+        checked_u32(
+            model.num_experts,
+            "num_experts");
+    config.top_k =
+        checked_u32(
+            model.num_experts_per_token,
+            "num_experts_per_token");
+    config.activation =
+        activation;
+    return config;
+}
+
 HipMoeRouteLauncherConfig
 moe_route_config(
     const ModelContract& model,
@@ -163,6 +190,10 @@ HipLauncherCatalog::HipLauncherCatalog(
           moe_route_config(
               model,
               config.activation)),
+      moe_experts_(
+          moe_experts_config(
+              model,
+              config.activation)),
       lm_head_(
           lm_head_config(
               model,
@@ -198,6 +229,10 @@ register_for_compiled_execution(
             compiled,
             registry);
     moe_route_.
+        register_for_compiled_execution(
+            compiled,
+            registry);
+    moe_experts_.
         register_for_compiled_execution(
             compiled,
             registry);
