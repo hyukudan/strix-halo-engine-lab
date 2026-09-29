@@ -4,6 +4,7 @@
 #include "strix/hip_hyper_mix_launcher.hpp"
 #include "strix/hip_lm_head_launcher.hpp"
 #include "strix/hip_moe_route_launcher.hpp"
+#include "strix/hip_shared_expert_launcher.hpp"
 #include "strix/hip_runtime_launchers.hpp"
 #include "strix/launch_dispatch.hpp"
 #include "strix/model_contract.hpp"
@@ -44,6 +45,7 @@ private:
     HipHyperMixLauncherBundle hyper_mix_;
     HipMoeRouteLauncherBundle moe_route_;
     HipLmHeadLauncherBundle lm_head_;
+    HipSharedExpertLauncherBundle shared_expert_;
 };
 
 }  // namespace strix
