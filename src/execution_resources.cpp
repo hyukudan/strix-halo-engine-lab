@@ -41,6 +41,7 @@ void validate_execution_runtime_resources(
     if (resources.scratch == nullptr ||
         resources.model_manifest == nullptr ||
         resources.model_weights == nullptr ||
+        resources.tensor_access == nullptr ||
         resources.session_state_layout == nullptr ||
         resources.session_state_memory == nullptr) {
         throw std::invalid_argument(
@@ -54,6 +55,12 @@ void validate_execution_runtime_resources(
     validate_model_runtime_binding(
         *resources.model_manifest,
         *resources.model_weights);
+    if (resources.tensor_access->manifest_layout_identity !=
+            resources.model_manifest->layout_identity ||
+        resources.tensor_access->plan_identity == 0) {
+        throw std::invalid_argument(
+            "tensor access plan manifest identity mismatch");
+    }
     validate_session_state_memory_binding(
         *resources.session_state_layout,
         *resources.session_state_memory);
@@ -88,6 +95,9 @@ build_runtime_execution_identities(
     hash_u64(
         compatibility,
         resources.model_weights->model_content_identity);
+    hash_u64(
+        compatibility,
+        resources.tensor_access->plan_identity);
     hash_u64(
         compatibility,
         resources.session_state_layout->layout_identity);
