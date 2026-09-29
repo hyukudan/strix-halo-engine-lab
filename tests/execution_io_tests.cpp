@@ -17,12 +17,12 @@ void expect(bool condition, const char* message) {
 }
 
 bool has_buffer(
-    const std::vector<strix::ExecutionBufferRef>& values,
+    const std::vector<strix::ExecutionBufferUse>& values,
     strix::ExecutionBufferClass buffer_class,
     std::uint32_t slot) {
-    for (const auto value : values) {
-        if (value.buffer_class == buffer_class &&
-            value.slot == slot) {
+    for (const auto& value : values) {
+        if (value.buffer.buffer_class == buffer_class &&
+            value.buffer.slot == slot) {
             return true;
         }
     }
@@ -59,11 +59,11 @@ int main() {
             ++ple_count;
             expect(step.reads.size() == 1 &&
                        step.writes.size() == 1 &&
-                       step.reads[0].buffer_class ==
+                       step.reads[0].buffer.buffer_class ==
                            strix::ExecutionBufferClass::expanded_hidden &&
-                       step.writes[0].buffer_class ==
+                       step.writes[0].buffer.buffer_class ==
                            strix::ExecutionBufferClass::expanded_hidden &&
-                       step.reads[0].slot != step.writes[0].slot,
+                       step.reads[0].buffer.slot != step.writes[0].buffer.slot,
                    "PLE ping-pongs expanded hidden state");
         }
 
@@ -106,7 +106,7 @@ int main() {
            "IO plan includes one final LM head");
 
     auto invalid = io;
-    invalid.steps.back().reads[0] =
+    invalid.steps.back().reads[0].buffer =
         strix::ExecutionBufferRef{
             strix::ExecutionBufferClass::hidden,
             7};
@@ -121,7 +121,7 @@ int main() {
            "invalid buffer slot is rejected");
 
     invalid = io;
-    invalid.steps[2].reads[0] =
+    invalid.steps[2].reads[0].buffer =
         strix::ExecutionBufferRef{
             strix::ExecutionBufferClass::route_indices,
             0};
@@ -136,8 +136,8 @@ int main() {
            "read-before-produce is rejected");
 
     invalid = io;
-    invalid.steps[2].writes[0] =
-        invalid.steps[2].reads[0];
+    invalid.steps[2].writes[0].buffer =
+        invalid.steps[2].reads[0].buffer;
     bool alias_rejected = false;
     try {
         strix::validate_serial_execution_io_plan(
@@ -147,6 +147,31 @@ int main() {
     }
     expect(alias_rejected,
            "same-step read/write alias is rejected");
+
+
+    invalid = io;
+    invalid.steps.back().reads[0].generation -= 1;
+    bool stale_generation_rejected = false;
+    try {
+        strix::validate_serial_execution_io_plan(
+            execution, invalid);
+    } catch (const std::invalid_argument&) {
+        stale_generation_rejected = true;
+    }
+    expect(stale_generation_rejected,
+           "stale buffer generation is rejected");
+
+    invalid = io;
+    invalid.steps.back().writes[0].generation += 1;
+    bool skipped_generation_rejected = false;
+    try {
+        strix::validate_serial_execution_io_plan(
+            execution, invalid);
+    } catch (const std::invalid_argument&) {
+        skipped_generation_rejected = true;
+    }
+    expect(skipped_generation_rejected,
+           "skipped write generation is rejected");
 
     if (failures == 0) {
         std::cout << "execution IO tests passed\n";
