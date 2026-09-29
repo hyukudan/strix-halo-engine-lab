@@ -38,6 +38,7 @@ std::string ModelContract::validate() const {
     }
     if (vocab_size == 0 ||
         hidden_size == 0 ||
+        max_position_embeddings == 0 ||
         moe_intermediate_size == 0 ||
         shared_expert_intermediate_size == 0 ||
         num_experts == 0 ||
