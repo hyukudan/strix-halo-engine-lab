@@ -98,6 +98,12 @@ public:
     finalize() {
         const auto message_bytes =
             total_bytes_;
+        if (message_bytes >
+            std::numeric_limits<std::uint64_t>::max() /
+                8ULL) {
+            throw std::overflow_error(
+                "message length exceeds SHA-256 64-bit bit counter");
+        }
         const auto bit_length =
             message_bytes * 8ULL;
 
@@ -398,7 +404,8 @@ ModelContentIdentity build_model_content_identity(
         const auto digest =
             hash_file_stable(file->path);
         aggregate.update_u64(
-            file->logical_name.size());
+            static_cast<std::uint64_t>(
+                file->logical_name.size()));
         aggregate.update(
             file->logical_name);
         aggregate.update_u64(
