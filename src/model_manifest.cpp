@@ -82,7 +82,9 @@ TensorRole classify_tensor_role(std::string_view name) noexcept {
     if (contains(name, "mtp")) {
         return TensorRole::mtp;
     }
-    if (contains(name, "ngram") || contains(name, "ple.")) {
+    if (contains(name, "ngram") ||
+        contains(name, "ple.") ||
+        starts_with(name, "per_layer_token_embd")) {
         return TensorRole::ngram_table;
     }
     if (contains(name, ".ple_") ||
@@ -133,7 +135,8 @@ TensorRole classify_tensor_role(std::string_view name) noexcept {
     if (contains(name, "attn_q") || contains(name, "attn_k") ||
         contains(name, "attn_v") || contains(name, "attn_output") ||
         contains(name, "q_proj") || contains(name, "k_proj") ||
-        contains(name, "v_proj") || contains(name, "o_proj")) {
+        contains(name, "v_proj") || contains(name, "o_proj") ||
+        contains(name, "attn_gate")) {
         return TensorRole::attention_projection;
     }
     if (contains(name, "ffn_") || contains(name, "mlp.") ||
