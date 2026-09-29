@@ -31,6 +31,9 @@ int main() {
            "expert role is classified");
     expect(strix::classify_tensor_role("ple.ngram_embedding.shard_3") == TensorRole::ngram_table,
            "n-gram role is classified");
+    expect(strix::classify_tensor_role("blk.7.shared_expert.gate_proj.weight") ==
+               TensorRole::dense_projection,
+           "shared expert is not misclassified as routed expert");
     expect(strix::default_residency(TensorRole::moe_expert) == ResidencyPolicy::resident,
            "experts remain resident by default");
     expect(strix::default_residency(TensorRole::ngram_table) ==
