@@ -6,15 +6,16 @@
 namespace strix {
 
 void validate_execution_memory_binding(
-    const CompiledSerialExecution& compiled,
+    std::uint64_t execution_identity,
+    const ExecutionArenaPlan& arena,
     const ExecutionMemoryBinding& memory) {
-    if (compiled.execution_identity == 0 ||
+    if (execution_identity == 0 ||
         memory.execution_identity !=
-            compiled.execution_identity) {
+            execution_identity) {
         throw std::invalid_argument(
             "execution memory binding identity does not match compiled plan");
     }
-    if (compiled.arena.total_bytes == 0) {
+    if (arena.total_bytes == 0) {
         throw std::invalid_argument(
             "compiled execution arena must be non-empty");
     }
@@ -23,7 +24,7 @@ void validate_execution_memory_binding(
             "execution memory binding has a null arena base");
     }
     if (memory.arena_bytes <
-        compiled.arena.total_bytes) {
+        arena.total_bytes) {
         throw std::invalid_argument(
             "execution memory binding is smaller than compiled arena");
     }
@@ -34,7 +35,7 @@ void validate_execution_memory_binding(
 
     const auto maximum =
         std::numeric_limits<std::uintptr_t>::max();
-    if (compiled.arena.total_bytes >
+    if (arena.total_bytes >
         static_cast<std::uint64_t>(
             maximum - memory.arena_base)) {
         throw std::overflow_error(
@@ -43,15 +44,18 @@ void validate_execution_memory_binding(
 }
 
 ExecutionBufferAddress resolve_execution_buffer(
-    const CompiledSerialExecution& compiled,
+    std::uint64_t execution_identity,
+    const ExecutionArenaPlan& arena,
     const ExecutionMemoryBinding& memory,
     ExecutionBufferUse use) {
     validate_execution_memory_binding(
-        compiled, memory);
+        execution_identity,
+        arena,
+        memory);
 
     const auto* allocation =
         find_arena_allocation(
-            compiled.arena, use);
+            arena, use);
     if (allocation == nullptr) {
         throw std::invalid_argument(
             "execution buffer generation is not present in compiled arena");
