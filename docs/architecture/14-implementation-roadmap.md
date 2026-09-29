@@ -248,6 +248,10 @@ The lookup path has predictable memory use and does not destabilize long-context
 
 ### A1.5 — Correct serial executor
 
+Status: **static serial decode DAG implemented; kernel binding and execution pending**.
+
+The host-side plan now encodes the pinned layer order as a dependency DAG rather than a generic dynamic operator list. It represents token embedding, position preparation, hyper expansion, the single PLE insertion, attention hyper-mix, recurrent or indexed attention by exact layer pattern, attention reinjection, MLP hyper-mix, MoE routing, routed and shared expert branches, MoE combine, MLP reinjection, final hyper mixing and LM head. Persistent-state read/write masks are explicit for KV, recurrent matrix, convolution history, sparse index, n-gram history and position history. Route/shared-expert parallelism is represented through dependencies rather than hidden scheduling rules.
+
 Integrate:
 
 - model manifest;
