@@ -210,9 +210,9 @@ Full snapshots, pre-window snapshot plus replay, and sparse-checkpoint replay ha
 
 ### A1.3 — MoE routing and expert execution
 
-Status: **route planner and HIP routing baseline implemented; expert execution pending**.
+Status: **route planner, routing baseline and expert-execution correctness harness implemented; packed grouped reuse pending**.
 
-The host planner now measures touched-expert union, assignments per expert, adjacent-row route overlap, and an upper bound on packed expert-weight traffic saved by grouping. It also emits a deterministic CSR-style expert grouping plan with expert offsets plus original row/top-k-slot identity for every assignment. The semantic oracle covers FP32 softmax, no-tie top-k and selected-weight renormalization. A standalone HIP baseline routes explicit 1/2/4/8-row classes and reports route latency, index agreement, weight error, expert union and resource metadata. Cutoff-tie semantics remain intentionally unresolved until a canonical contract is fixed.
+The host planner now measures touched-expert union, assignments per expert, adjacent-row route overlap, and an upper bound on packed expert-weight traffic saved by grouping. It also emits a deterministic CSR-style expert grouping plan with expert offsets plus original row/top-k-slot identity for every assignment. The semantic oracle covers FP32 softmax, no-tie top-k and selected-weight renormalization. A separate FP32 expert-execution harness now compares direct assignment order with deterministic expert-major grouping and validates both against a CPU reference before packed-weight reuse is introduced. A standalone HIP baseline routes explicit 1/2/4/8-row classes and reports route latency, index agreement, weight error, expert union and resource metadata. Cutoff-tie semantics remain intentionally unresolved until a canonical contract is fixed.
 
 Implement and compare:
 
