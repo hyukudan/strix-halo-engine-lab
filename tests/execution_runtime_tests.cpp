@@ -1,6 +1,8 @@
 #include "strix/execution_runtime.hpp"
 
+#include <algorithm>
 #include <iostream>
+#include <iterator>
 #include <stdexcept>
 #include <string>
 #include <vector>
