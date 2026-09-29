@@ -110,12 +110,10 @@ ExecutionBufferPlan build_serial_execution_buffer_plan(
     plan.peak_internal_bytes =
         std::max(attn_inject_peak, moe_branch_peak);
 
+    const auto logits_stage_peak =
+        checked_add(plan.hidden_bytes, plan.logits_bytes);
     plan.peak_with_materialized_logits_bytes =
-        checked_add(
-            std::max(
-                plan.peak_internal_bytes,
-                plan.hidden_bytes),
-            plan.logits_bytes);
+        std::max(plan.peak_internal_bytes, logits_stage_peak);
 
     return plan;
 }
