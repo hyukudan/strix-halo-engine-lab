@@ -313,6 +313,39 @@ CompiledSerialExecution compile_serial_execution(
     return compiled;
 }
 
+
+EagerExecutionResult execute_compiled_serial_eager(
+    const CompiledSerialExecution& compiled,
+    const ExecutionRuntimeResources& resources,
+    const EagerExecutionRequest& request,
+    EagerExecutionDispatcher& dispatcher) {
+    validate_execution_runtime_resources(
+        compiled.execution_identity,
+        compiled.arena,
+        resources,
+        request.position);
+
+    if (request.logical_rows !=
+            compiled.logical_rows ||
+        request.request_concurrency !=
+            compiled.request_concurrency) {
+        throw std::invalid_argument(
+            "runtime shape does not match compiled serial execution");
+    }
+
+    return execute_serial_eager(
+        compiled.execution,
+        compiled.bindings,
+        compiled.io,
+        compiled.arena,
+        request,
+        dispatcher,
+        resources.scratch,
+        resources.session_state_layout,
+        resources.session_state_memory,
+        &resources);
+}
+
 EagerExecutionResult execute_compiled_serial_eager(
     const CompiledSerialExecution& compiled,
     const ExecutionMemoryBinding& memory,
