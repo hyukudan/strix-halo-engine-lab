@@ -62,3 +62,31 @@ jobs:
           trap - EXIT
           cat client-stream.json
           cat server-stream.json
+
+
+  hip-offline-build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build gfx1151 HIP labs offline
+        shell: bash
+        run: |
+          set -euo pipefail
+          image='rocm/dev-ubuntu-24.04@sha256:bdc8e61026cbb844ede93d44d2c50055f51ebb2041906b60182bf3bee3139054'
+          docker pull "$image"
+          docker run --rm \
+            -v "$PWD:/work" \
+            -w /work \
+            "$image" \
+            bash -lc '
+              set -euo pipefail
+              apt-get update
+              DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends cmake ninja-build
+              cmake -S lab/basic_kernels -B build/basic-kernels-offline -G Ninja -DCMAKE_BUILD_TYPE=Release
+              cmake --build build/basic-kernels-offline
+              cmake -S lab/packed_projection -B build/packed-projection-offline -G Ninja -DCMAKE_BUILD_TYPE=Release
+              cmake --build build/packed-projection-offline
+              cmake -S lab/uma_residency -B build/uma-residency-hip-offline -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRIX_UMA_ENABLE_HIP=ON
+              cmake --build build/uma-residency-hip-offline --target strix-uma-hip
+            '
