@@ -149,3 +149,89 @@ RecurrentWindowPlan build_recurrent_window_plan(
 }
 
 }  // namespace strix
+
+
+namespace strix {
+
+RecurrentRollbackPlan build_recurrent_rollback_plan(
+    const ModelContract& model,
+    const RecurrentRollbackRequest& request) {
+    if (const auto error = model.validate(); !error.empty()) {
+        throw std::invalid_argument(error);
+    }
+    if (request.logical_tokens == 0 || request.sessions == 0) {
+        throw std::invalid_argument(
+            "recurrent rollback tokens and sessions must be non-zero");
+    }
+
+    RecurrentWindowRequest window;
+    window.logical_tokens = request.logical_tokens;
+    window.sessions = request.sessions;
+    window.include_conv_state = request.include_conv_state;
+    const auto base = build_recurrent_window_plan(model, window);
+
+    RecurrentRollbackPlan plan;
+    plan.strategy = request.strategy;
+    plan.logical_tokens = request.logical_tokens;
+    plan.sessions = request.sessions;
+    plan.persistent_state_bytes = base.persistent_state_bytes_all_layers;
+
+    switch (request.strategy) {
+    case RecurrentRollbackStrategy::full_candidate_snapshots:
+        plan.checkpoint_interval = 1;
+        plan.checkpoint_count = request.logical_tokens;
+        plan.maximum_replay_tokens = 0;
+        plan.expected_replay_tokens_uniform_rejection = 0.0;
+        plan.retained_checkpoint_bytes =
+            checked_mul(plan.persistent_state_bytes, request.logical_tokens);
+        plan.worst_case_replay_state_io_bytes = 0;
+        break;
+
+    case RecurrentRollbackStrategy::pre_window_replay:
+        plan.checkpoint_interval = request.logical_tokens;
+        plan.checkpoint_count = 1;
+        plan.maximum_replay_tokens =
+            request.logical_tokens > 0 ? request.logical_tokens - 1U : 0U;
+        plan.expected_replay_tokens_uniform_rejection =
+            static_cast<double>(plan.maximum_replay_tokens) / 2.0;
+        plan.retained_checkpoint_bytes = plan.persistent_state_bytes;
+        plan.worst_case_replay_state_io_bytes =
+            checked_mul(
+                checked_mul(plan.persistent_state_bytes,
+                            plan.maximum_replay_tokens),
+                2ULL);
+        break;
+
+    case RecurrentRollbackStrategy::sparse_checkpoints: {
+        if (request.checkpoint_interval == 0 ||
+            request.checkpoint_interval > request.logical_tokens) {
+            throw std::invalid_argument(
+                "sparse checkpoint interval must be within the logical window");
+        }
+        plan.checkpoint_interval = request.checkpoint_interval;
+        plan.checkpoint_count =
+            static_cast<std::uint32_t>(
+                (static_cast<std::uint64_t>(request.logical_tokens) +
+                 request.checkpoint_interval - 1ULL) /
+                request.checkpoint_interval);
+        plan.maximum_replay_tokens =
+            request.checkpoint_interval > 0
+                ? request.checkpoint_interval - 1U
+                : 0U;
+        plan.expected_replay_tokens_uniform_rejection =
+            static_cast<double>(plan.maximum_replay_tokens) / 2.0;
+        plan.retained_checkpoint_bytes =
+            checked_mul(plan.persistent_state_bytes, plan.checkpoint_count);
+        plan.worst_case_replay_state_io_bytes =
+            checked_mul(
+                checked_mul(plan.persistent_state_bytes,
+                            plan.maximum_replay_tokens),
+                2ULL);
+        break;
+    }
+    }
+
+    return plan;
+}
+
+}  // namespace strix
