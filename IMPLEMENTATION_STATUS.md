@@ -148,3 +148,44 @@ Still pending on the target hosts:
 - interrupt/event versus polling progress modes;
 - mapped/registered transport-buffer tiers;
 - real single-link and dual-link topology qualification.
+
+
+## Slice A1.0 — kernel registry and basic gfx1151 kernels
+
+Host-side registry implemented:
+
+- explicit operator family and execution phase;
+- exact logical-row, request-concurrency and geometry shape classes;
+- independent Wave32/Wave64 identity;
+- workgroup, LDS/register/scratch metadata fields;
+- numerical contract with row-invariance and deterministic flags;
+- graph-safety and qualification state;
+- compiler identity and measured cost;
+- deterministic selector;
+- stable plan identity that deliberately excludes measured-time noise;
+- qualified/production variants require a non-zero measured cost;
+- CTest coverage for validation, selection, wave filtering and plan identity.
+
+Standalone `lab/basic_kernels/` implemented for native ROCm:
+
+- `gfx1151`-only build;
+- native Wave32 candidate;
+- explicit `-mwavefrontsize64` Wave64 candidate;
+- device-side `warpSize` verification;
+- FP32 centred RMSNorm;
+- FP32 residual add;
+- FP32 partial RoPE;
+- deterministic argmax;
+- deterministic top-k baseline up to k=16;
+- solo-versus-batched row-invariance fixture;
+- model-representative microbenchmarks for hidden size 2560, 24x256 partial RoPE, vocab 248320 and expert top-10 of 512;
+- HIP-event timings and `hipFuncGetAttributes` resource reporting.
+
+Still pending:
+
+- native M5/Strix Halo build and execution;
+- Wave32 versus Wave64 measurements;
+- profiler-derived VGPR/LDS/spill confirmation;
+- graph-capture qualification;
+- promotion of any kernel from experimental to target-qualified;
+- BF16/mixed-precision variants, which require separate numerical identities.
