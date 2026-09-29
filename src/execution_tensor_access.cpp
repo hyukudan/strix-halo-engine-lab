@@ -51,6 +51,105 @@ std::uint64_t plan_identity(
 
 }  // namespace
 
+
+std::vector<ExecutionTensorRequirement>
+build_serial_execution_tensor_requirements(
+    const SerialExecutionPlan& execution_plan) {
+    std::vector<ExecutionTensorRequirement> requirements;
+
+    const auto push =
+        [&](const ExecutionStep& step,
+            std::uint32_t slot,
+            TensorRole role,
+            TensorRequirementCardinality cardinality,
+            std::string_view name_contains = {}) {
+            ExecutionTensorRequirement requirement;
+            requirement.step_id = step.id;
+            requirement.op = step.op;
+            requirement.binding_slot = slot;
+            requirement.selector.role = role;
+            requirement.selector.layer = step.layer;
+            requirement.selector.name_contains = name_contains;
+            requirement.cardinality = cardinality;
+            requirements.push_back(requirement);
+        };
+
+    for (const auto& step : execution_plan.steps) {
+        switch (step.op) {
+        case SerialOp::token_embedding:
+            push(step, 0, TensorRole::embedding,
+                 TensorRequirementCardinality::exactly_one);
+            break;
+
+        case SerialOp::ple:
+            push(step, 0, TensorRole::ngram_table,
+                 TensorRequirementCardinality::one_or_more);
+            break;
+
+        case SerialOp::attn_hyper_mix:
+        case SerialOp::attn_inject:
+        case SerialOp::mlp_hyper_mix:
+        case SerialOp::mlp_inject:
+            push(step, 0, TensorRole::normalization,
+                 TensorRequirementCardinality::one_or_more);
+            push(step, 1, TensorRole::dense_projection,
+                 TensorRequirementCardinality::one_or_more);
+            break;
+
+        case SerialOp::gated_delta_net:
+            push(step, 0, TensorRole::recurrent_state,
+                 TensorRequirementCardinality::one_or_more);
+            push(step, 1, TensorRole::attention_projection,
+                 TensorRequirementCardinality::one_or_more);
+            push(step, 2, TensorRole::dense_projection,
+                 TensorRequirementCardinality::one_or_more);
+            break;
+
+        case SerialOp::indexed_attention:
+            push(step, 0, TensorRole::attention_projection,
+                 TensorRequirementCardinality::one_or_more);
+            push(step, 1, TensorRole::sparse_index,
+                 TensorRequirementCardinality::one_or_more);
+            push(step, 2, TensorRole::normalization,
+                 TensorRequirementCardinality::one_or_more);
+            break;
+
+        case SerialOp::moe_route:
+            push(step, 0, TensorRole::moe_router,
+                 TensorRequirementCardinality::exactly_one);
+            break;
+
+        case SerialOp::moe_experts:
+            push(step, 0, TensorRole::moe_expert,
+                 TensorRequirementCardinality::one_or_more);
+            break;
+
+        case SerialOp::shared_expert:
+            push(step, 0, TensorRole::dense_projection,
+                 TensorRequirementCardinality::one_or_more,
+                 "shared_expert");
+            break;
+
+        case SerialOp::final_hyper_mix:
+            push(step, 0, TensorRole::normalization,
+                 TensorRequirementCardinality::one_or_more);
+            break;
+
+        case SerialOp::lm_head:
+            push(step, 0, TensorRole::output_head,
+                 TensorRequirementCardinality::exactly_one);
+            break;
+
+        case SerialOp::position_prepare:
+        case SerialOp::hyper_expand:
+        case SerialOp::moe_combine:
+            break;
+        }
+    }
+
+    return requirements;
+}
+
 ExecutionTensorAccessPlan
 compile_execution_tensor_access_plan(
     const SerialExecutionPlan& execution_plan,
