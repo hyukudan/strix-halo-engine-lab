@@ -1,5 +1,6 @@
 #include "strix/compiled_execution.hpp"
 
+#include <cstring>
 #include <span>
 #include <stdexcept>
 #include <string_view>
@@ -77,6 +78,18 @@ void hash_model(
         model.shared_expert_intermediate_size);
     hash_u64(hash, model.num_experts);
     hash_u64(hash, model.num_experts_per_token);
+
+    std::uint32_t rms_epsilon_bits = 0;
+    static_assert(
+        sizeof(rms_epsilon_bits) ==
+        sizeof(model.rms_norm_epsilon));
+    std::memcpy(
+        &rms_epsilon_bits,
+        &model.rms_norm_epsilon,
+        sizeof(rms_epsilon_bits));
+    hash_u64(hash, rms_epsilon_bits);
+    hash_bool(hash, model.norm_topk_probability);
+
     hash_u64(hash, model.bytes_bf16);
     hash_u64(hash, model.bytes_fp32);
 }
@@ -116,6 +129,9 @@ std::uint64_t build_execution_identity(
     hash_u64(
         hash,
         buffer_request.logit_element_bytes);
+    hash_u64(
+        hash,
+        buffer_request.mlp_intermediate_element_bytes);
 
     hash_u64(hash, compiled.arena.alignment);
     hash_u64(hash, compiled.arena.total_bytes);
@@ -176,6 +192,12 @@ std::uint64_t build_execution_identity(
         hash_u64(
             hash,
             0xfffffffffffffffdULL);
+        for (const auto use : step.temporaries) {
+            hash_buffer_use(hash, use);
+        }
+        hash_u64(
+            hash,
+            0xfffffffffffffffbULL);
     }
 
     return hash;
