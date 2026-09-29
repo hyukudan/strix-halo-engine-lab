@@ -20,6 +20,7 @@ endfunction()
 
 add_library(strix_core STATIC
     src/gguf_reader.cpp
+    src/kernel_registry.cpp
     src/memory_plan.cpp
     src/model_contract.cpp
     src/model_manifest.cpp
@@ -63,6 +64,11 @@ if(BUILD_TESTING)
     target_link_libraries(strix-transport-tests PRIVATE strix_core)
     strix_target_warnings(strix-transport-tests)
     add_test(NAME strix-transport-tests COMMAND strix-transport-tests)
+
+    add_executable(strix-kernel-registry-tests tests/kernel_registry_tests.cpp)
+    target_link_libraries(strix-kernel-registry-tests PRIVATE strix_core)
+    strix_target_warnings(strix-kernel-registry-tests)
+    add_test(NAME strix-kernel-registry-tests COMMAND strix-kernel-registry-tests)
 
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
