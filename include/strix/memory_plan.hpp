@@ -27,6 +27,8 @@ struct MemoryBreakdown {
     std::uint64_t base_kv = 0;
     std::uint64_t mtp_kv = 0;
     std::uint64_t provisional_indexer = 0;
+    std::uint64_t gdn_matrix_state = 0;
+    std::uint64_t gdn_conv_state = 0;
     std::uint64_t gdn_state = 0;
     std::uint64_t rollback = 0;
     std::uint64_t resident_model = 0;
@@ -51,7 +53,12 @@ struct AdmissionDecision {
 [[nodiscard]] std::uint64_t base_kv_bytes_per_token(const ModelContract& model);
 [[nodiscard]] std::uint64_t mtp_kv_bytes_per_token(const ModelContract& model);
 [[nodiscard]] std::uint64_t provisional_indexer_bytes_per_token(const ModelContract& model);
-[[nodiscard]] std::uint64_t gdn_state_bytes_per_session(const ModelContract& model);
+[[nodiscard]] std::uint64_t gdn_matrix_state_bytes_per_session(
+    const ModelContract& model);
+[[nodiscard]] std::uint64_t gdn_conv_state_bytes_per_session(
+    const ModelContract& model);
+[[nodiscard]] std::uint64_t gdn_state_bytes_per_session(
+    const ModelContract& model);
 [[nodiscard]] MemoryBreakdown build_memory_plan(
     const ModelContract& model,
     const MemoryPlanRequest& request);
