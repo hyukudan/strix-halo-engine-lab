@@ -185,3 +185,46 @@ The benchmark does not create or modify configfs streams.
 Stream creation, HopID allocation and tuning require system-level coordination
 between both hosts and remain an explicit deployment step. This keeps the
 benchmark read-only with respect to transport configuration.
+
+
+## Dual-link parallel-flow runner
+
+Before treating two physical USB4 links as one striped tensor transport, measure
+whether they can sustain useful traffic concurrently.
+
+On the receiving host:
+
+```bash
+python3 lab/transport/dual_tbstream.py server \
+  --left-device /dev/tbstream0 \
+  --right-device /dev/tbstream1 \
+  --left-config /sys/kernel/config/thunderbolt/stream/0-1.0/data0 \
+  --right-config /sys/kernel/config/thunderbolt/stream/1-1.0/data1 \
+  --verify
+```
+
+On the sending host:
+
+```bash
+python3 lab/transport/dual_tbstream.py client \
+  --left-device /dev/tbstream0 \
+  --right-device /dev/tbstream1 \
+  --left-config /sys/kernel/config/thunderbolt/stream/0-3.0/data0 \
+  --right-config /sys/kernel/config/thunderbolt/stream/1-3.0/data1 \
+  --bytes 33554432 --left-share 0.5 \
+  --mode stream --warmup 5 --iterations 50 --verify
+```
+
+This runner launches one benchmark process per physical stream concurrently and
+reports both lane results plus aggregate useful payload throughput.
+
+It is intentionally called **parallel flows**, not single-tensor striping:
+
+- it tests whether the two physical paths interfere;
+- it avoids hiding one weak link behind a reassembly policy;
+- it can vary the left/right payload share;
+- it provides the evidence needed before enabling the core scheduler's striped
+  plan for a workload class.
+
+A later single-tensor striping harness must add reassembly cost to the measured
+critical path.
