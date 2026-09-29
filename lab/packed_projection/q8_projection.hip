@@ -372,7 +372,7 @@ KernelAttributes attributes() {
         hipFuncGetAttributes(
             &value,
             reinterpret_cast<const void*>(
-                HIP_KERNEL_NAME(q8_projection_kernel<Rows>))),
+                q8_projection_kernel<Rows>)),
         "hipFuncGetAttributes q8 projection");
     return KernelAttributes{
         value.numRegs,
