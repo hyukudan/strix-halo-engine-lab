@@ -666,8 +666,7 @@ KernelAttributes attributes() {
         hipFuncGetAttributes(
             &value,
             reinterpret_cast<const void*>(
-                HIP_KERNEL_NAME(
-                    iq4_xs_projection_kernel<Rows>))),
+                iq4_xs_projection_kernel<Rows>)),
         "hipFuncGetAttributes IQ4_XS");
     return KernelAttributes{
         value.numRegs,
