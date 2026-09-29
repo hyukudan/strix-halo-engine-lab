@@ -41,7 +41,8 @@ ExecutionBufferPlan build_serial_execution_buffer_plan(
         request.activation_element_bytes == 0 ||
         request.control_element_bytes == 0 ||
         request.index_element_bytes == 0 ||
-        request.logit_element_bytes == 0) {
+        request.logit_element_bytes == 0 ||
+        request.mlp_intermediate_element_bytes == 0) {
         throw std::invalid_argument(
             "execution buffer row and element sizes must be non-zero");
     }
@@ -85,6 +86,16 @@ ExecutionBufferPlan build_serial_execution_buffer_plan(
             model.vocab_size,
             request.logit_element_bytes);
 
+    plan.mlp_intermediate_bytes =
+        product(
+            request.logical_rows,
+            checked_mul(
+                std::max(
+                    model.moe_intermediate_size,
+                    model.shared_expert_intermediate_size),
+                2ULL),
+            request.mlp_intermediate_element_bytes);
+
     const auto attn_inject_peak =
         checked_add(
             checked_add(
@@ -104,8 +115,10 @@ ExecutionBufferPlan build_serial_execution_buffer_plan(
                         plan.hidden_buffers)),
                 plan.injection_weight_bytes),
             checked_add(
-                plan.route_index_bytes,
-                plan.route_weight_bytes));
+                checked_add(
+                    plan.route_index_bytes,
+                    plan.route_weight_bytes),
+                plan.mlp_intermediate_bytes));
 
     plan.peak_internal_bytes =
         std::max(attn_inject_peak, moe_branch_peak);
