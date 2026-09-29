@@ -10,7 +10,8 @@ std::string ModelContract::validate() const {
     if (hidden_layers == 0 || full_attention_layers == 0 || gdn_layers == 0) {
         return "layer counts must be non-zero";
     }
-    if (full_attention_layers + gdn_layers != hidden_layers) {
+    if (full_attention_layers > hidden_layers ||
+        gdn_layers != hidden_layers - full_attention_layers) {
         return "full-attention plus GDN layers must equal hidden layers";
     }
     if (kv_heads == 0 || head_dim == 0 || bytes_bf16 == 0 || bytes_fp32 == 0) {
