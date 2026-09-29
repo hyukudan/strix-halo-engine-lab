@@ -376,6 +376,10 @@ Result bench_mmap(
     const std::vector<std::uint64_t>& rows) {
     const auto file_bytes =
         checked_mul(options.table_rows, options.row_bytes);
+    if (file_bytes >
+        static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
+        throw std::overflow_error("mapped sparse table does not fit size_t");
+    }
     void* mapping =
         mmap(nullptr, static_cast<std::size_t>(file_bytes),
              PROT_READ, MAP_SHARED, fd, 0);
