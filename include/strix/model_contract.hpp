@@ -40,6 +40,7 @@ struct ModelContract {
     std::uint64_t num_experts_per_token = 10;
     float rms_norm_epsilon = 1e-6F;
     bool norm_topk_probability = true;
+    bool gdn_output_gate_sigmoid = true;
     std::uint64_t bytes_bf16 = 2;
     std::uint64_t bytes_fp32 = 4;
 
