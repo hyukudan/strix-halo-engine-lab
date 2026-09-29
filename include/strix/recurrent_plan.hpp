@@ -6,6 +6,35 @@
 
 namespace strix {
 
+enum class RecurrentRollbackStrategy {
+    full_candidate_snapshots,
+    pre_window_replay,
+    sparse_checkpoints,
+};
+
+struct RecurrentRollbackRequest {
+    std::uint32_t logical_tokens = 1;
+    std::uint32_t sessions = 1;
+    RecurrentRollbackStrategy strategy =
+        RecurrentRollbackStrategy::pre_window_replay;
+    std::uint32_t checkpoint_interval = 0;
+    bool include_conv_state = true;
+};
+
+struct RecurrentRollbackPlan {
+    RecurrentRollbackStrategy strategy =
+        RecurrentRollbackStrategy::pre_window_replay;
+    std::uint32_t logical_tokens = 0;
+    std::uint32_t sessions = 0;
+    std::uint32_t checkpoint_interval = 0;
+    std::uint32_t checkpoint_count = 0;
+    std::uint32_t maximum_replay_tokens = 0;
+    double expected_replay_tokens_uniform_rejection = 0.0;
+    std::uint64_t persistent_state_bytes = 0;
+    std::uint64_t retained_checkpoint_bytes = 0;
+    std::uint64_t worst_case_replay_state_io_bytes = 0;
+};
+
 struct RecurrentWindowRequest {
     std::uint32_t logical_tokens = 1;
     std::uint32_t sessions = 1;
@@ -36,5 +65,9 @@ struct RecurrentWindowPlan {
 [[nodiscard]] RecurrentWindowPlan build_recurrent_window_plan(
     const ModelContract& model,
     const RecurrentWindowRequest& request);
+
+[[nodiscard]] RecurrentRollbackPlan build_recurrent_rollback_plan(
+    const ModelContract& model,
+    const RecurrentRollbackRequest& request);
 
 }  // namespace strix
