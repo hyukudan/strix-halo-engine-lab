@@ -148,10 +148,13 @@ Implement the first low-row-count projection kernel that consumes packed weights
 
 Target order:
 
-1. C1;
-2. C2;
-3. C4;
-4. prefill form separately.
+1. one logical row;
+2. two logical rows;
+3. four logical rows;
+4. eight logical rows where useful;
+5. prefill form separately.
+
+These row classes are not concurrency classes. Qualify the local C1 request path first, then test how C2/C4 scheduling composes multiple request rows with the same kernels or separate shared-round variants.
 
 Compare wave sizes and tiling from end-to-end operator cost.
 

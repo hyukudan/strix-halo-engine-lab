@@ -48,6 +48,8 @@ A later step MAY be prototyped earlier, but it MUST NOT become a production depe
 
 Speculative verification creates an opportunity to amortize packed-weight traffic across multiple logical rows.
 
+Logical verification width and request concurrency are separate axes. One C1 request can produce a multi-row verify window; C2 or C4 can additionally combine work from independent requests.
+
 The engine SHOULD:
 
 - retain a first-class single-row path;

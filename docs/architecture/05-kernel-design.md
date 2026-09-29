@@ -64,6 +64,8 @@ Prefill MAY use separate matrix kernels, precision or tiling because its arithme
 
 Decode and speculative verification SHOULD have explicit low-row shape classes, beginning with one row and adding wider variants only when traces justify them.
 
+Logical row count and request concurrency are independent dimensions. A single active request may verify multiple candidate rows, while multiple active requests may each contribute one or more rows to a shared round. Kernel identities and benchmarks MUST record both dimensions where both affect the shape.
+
 A multi-row projection SHOULD seek to reuse packed-weight loads, scale metadata and dequantization work while preserving the declared arithmetic contract of each logical row.
 
 Vector/VALU execution and architecture-native matrix instructions MUST be treated as competing implementation candidates. Tile padding, layout conversion, accumulator precision and masked-row cost are part of the comparison.
