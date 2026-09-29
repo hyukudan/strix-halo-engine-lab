@@ -92,10 +92,16 @@ int main() {
         state_layout.host_total_bytes;
     state_memory.host_allocation_generation = 9;
 
+    strix::ExecutionTensorAccessPlan tensor_access;
+    tensor_access.manifest_layout_identity =
+        manifest.layout_identity;
+    tensor_access.plan_identity = 0x4444ULL;
+
     strix::ExecutionRuntimeResources resources;
     resources.scratch = &scratch;
     resources.model_manifest = &manifest;
     resources.model_weights = &weights;
+    resources.tensor_access = &tensor_access;
     resources.session_state_layout =
         &state_layout;
     resources.session_state_memory =
@@ -176,6 +182,21 @@ int main() {
     }
     expect(missing_rejected,
            "runtime resources require model weight binding");
+
+    missing = resources;
+    missing.tensor_access = nullptr;
+    bool access_rejected = false;
+    try {
+        strix::validate_execution_runtime_resources(
+            scratch.execution_identity,
+            arena,
+            missing,
+            0);
+    } catch (const std::invalid_argument&) {
+        access_rejected = true;
+    }
+    expect(access_rejected,
+           "runtime resources require pre-resolved tensor access plan");
 
     if (failures == 0) {
         std::cout << "execution resources tests passed\n";
