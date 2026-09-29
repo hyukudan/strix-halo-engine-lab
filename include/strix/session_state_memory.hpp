@@ -40,4 +40,15 @@ void validate_session_state_memory_binding(
     const SessionStateMemoryBinding& memory,
     SessionStateComponent component);
 
+[[nodiscard]] std::uint32_t gdn_layer_ordinal(
+    const ModelContract& model,
+    std::uint32_t zero_based_layer);
+
+[[nodiscard]] SessionStateAddress resolve_gdn_layer_state(
+    const SerialSessionStateLayout& layout,
+    const SessionStateMemoryBinding& memory,
+    const ModelContract& model,
+    std::uint32_t zero_based_layer,
+    SessionStateComponent component);
+
 }  // namespace strix
