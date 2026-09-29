@@ -69,8 +69,9 @@ int main() {
     strix::ModelRuntimeBinding binding;
     binding.manifest_layout_identity =
         manifest.layout_identity;
-    binding.model_content_identity =
-        0x12345678ULL;
+    binding.model_content_identity.bytes[0] =
+        static_cast<std::uint8_t>(0x12345678ULL & 0xffULL);
+    binding.model_content_identity.bytes[1] = 0x5a;
 
     strix::RuntimeTensorBinding local;
     local.tensor_index = 0;
@@ -130,7 +131,7 @@ int main() {
            "runtime binding rejects manifest identity mismatch");
 
     auto zero_content = binding;
-    zero_content.model_content_identity = 0;
+    zero_content.model_content_identity = {};
     bool content_rejected = false;
     try {
         strix::validate_model_runtime_binding(
