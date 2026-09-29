@@ -4,7 +4,7 @@
 
 Model loading is a validated planning stage, not a file-copy operation.
 
-The loader MUST separate logical model interpretation from physical storage and execution layout.
+The loader MUST separate logical model interpretation from physical storage, execution layout, memory residency and execution placement.
 
 ## Stages
 
@@ -17,13 +17,34 @@ A model load SHOULD proceed through:
 5. calculate physical byte ranges;
 6. verify non-overlap and file bounds;
 7. build a logical tensor map;
-8. choose execution layouts;
-9. build a memory plan;
-10. admit or reject;
-11. establish mappings and residency;
-12. create execution objects.
+8. assign default tensor ownership and execution placement;
+9. choose execution layouts;
+10. build a memory plan;
+11. build a transport plan if any tensor boundary is remote;
+12. admit or reject;
+13. establish mappings and residency;
+14. create execution objects.
 
 No GPU kernel should run before the model has passed structural and memory validation.
+
+## Model manifest
+
+The loader SHOULD produce a machine-readable `ModelManifest` that is independent of the execution backend.
+
+The manifest SHOULD describe at least:
+
+- model identity;
+- architecture revision;
+- tensor inventory;
+- logical tensor roles;
+- persistent state classes;
+- execution placement;
+- memory-residency policy;
+- transport boundaries;
+- quantization metadata;
+- execution-layout identity.
+
+The manifest is the boundary between model interpretation and runtime execution.
 
 ## Storage format
 
@@ -62,6 +83,9 @@ The engine SHOULD generate a machine-readable inventory containing:
 - execution dtype;
 - execution layout;
 - resident or file-backed status;
+- owner node;
+- execution node;
+- partition descriptor if applicable;
 - selected kernel family;
 - any repack cache identity.
 
@@ -87,11 +111,22 @@ The loader MAY keep them file-backed and use bounded host-side row staging when:
 - keeping them resident would materially reduce context capacity;
 - I/O latency can be overlapped or bounded.
 
+For multi-node execution, sparse tables MAY be replicated or partitioned independently from dense weights when that reduces communication on the decode path.
+
 ## Placement
 
 Placement is explicit in the logical manifest from the first implementation.
 
 Every tensor MUST carry a placement record even when all tensors are local. The single-node default is local node zero.
+
+The manifest SHOULD be able to represent concepts equivalent to:
+
+```text
+Local(node=0, device=gfx1151)
+Remote(owner_node=N)
+Replicated(nodes=[...])
+Partitioned(axis=..., ranges=[...])
+```
 
 A future partitioner MAY change a tensor or operator group to a remote node, but storage format, logical role and numerical semantics MUST remain independent of transport choice.
 
@@ -105,8 +140,26 @@ Residency and placement are separate decisions:
 
 The initial manifest MUST remain conservative for memory accounting. A tensor is considered resident unless there is a specific, architecture-supported reason to classify it as a file-backed candidate.
 
+Supporting placement metadata MUST NOT impose a runtime cost on the single-node executor when every tensor is local.
+
+## Partition planning
+
+A distributed placement plan MUST be evaluated by bytes crossing node boundaries per inference step, not only by parameter count.
+
+The planner SHOULD estimate:
+
+- bytes transferred per generated token;
+- transfers per layer or stage;
+- synchronization points;
+- persistent state owned by each node;
+- expected compute imbalance;
+- expected transport overlap;
+- memory saved per node.
+
+A placement that balances model bytes but increases critical-path synchronization SHOULD be rejected.
+
 ## Integrity
 
 The runtime SHOULD support model identity based on hashes of all execution-relevant files.
 
-Snapshots, tuning plans and persistent caches MUST be invalidated when execution-relevant model identity changes.
+Snapshots, tuning plans, placement plans and persistent caches MUST be invalidated when execution-relevant model identity changes.
