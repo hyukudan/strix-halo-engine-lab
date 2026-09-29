@@ -55,10 +55,30 @@ std::uint64_t provisional_indexer_bytes_per_token(const ModelContract& model) {
     return uncompressed / model.indexer_compress_ratio;
 }
 
-std::uint64_t gdn_state_bytes_per_session(const ModelContract& model) {
+std::uint64_t gdn_matrix_state_bytes_per_session(
+    const ModelContract& model) {
     return product({model.gdn_layers, model.gdn_value_heads,
-                    model.gdn_value_head_dim, model.gdn_value_head_dim,
+                    model.gdn_key_head_dim, model.gdn_value_head_dim,
                     model.bytes_fp32});
+}
+
+std::uint64_t gdn_conv_state_bytes_per_session(
+    const ModelContract& model) {
+    const auto key_width =
+        product({model.gdn_key_heads, model.gdn_key_head_dim});
+    const auto value_width =
+        product({model.gdn_value_heads, model.gdn_value_head_dim});
+    const auto conv_width =
+        checked_add(checked_mul(key_width, 2), value_width);
+    return product({model.gdn_layers, conv_width,
+                    model.gdn_conv_kernel, model.bytes_bf16});
+}
+
+std::uint64_t gdn_state_bytes_per_session(
+    const ModelContract& model) {
+    return checked_add(
+        gdn_matrix_state_bytes_per_session(model),
+        gdn_conv_state_bytes_per_session(model));
 }
 
 MemoryBreakdown build_memory_plan(const ModelContract& model,
@@ -81,7 +101,12 @@ MemoryBreakdown build_memory_plan(const ModelContract& model,
                                          provisional_indexer_bytes_per_token(model),
                                          positions)
                                    : 0;
-    plan.gdn_state = checked_mul(gdn_state_bytes_per_session(model), request.sessions);
+    plan.gdn_matrix_state = checked_mul(
+        gdn_matrix_state_bytes_per_session(model), request.sessions);
+    plan.gdn_conv_state = checked_mul(
+        gdn_conv_state_bytes_per_session(model), request.sessions);
+    plan.gdn_state = checked_add(
+        plan.gdn_matrix_state, plan.gdn_conv_state);
     plan.rollback = request.rollback == RollbackPolicy::full_gdn_snapshots
                         ? product({gdn_state_bytes_per_session(model),
                                    request.sessions, request.draft_tokens})
