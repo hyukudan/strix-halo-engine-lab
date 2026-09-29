@@ -25,6 +25,7 @@ struct ExecutionDispatchContext {
     std::optional<std::string_view> kernel_id;
     std::span<const ExecutionBufferUse> reads;
     std::span<const ExecutionBufferUse> writes;
+    std::span<const ExecutionBufferUse> temporaries;
     const ExecutionArenaPlan* arena = nullptr;
     const ExecutionMemoryBinding* memory = nullptr;
     const SerialSessionStateLayout* session_state_layout = nullptr;
