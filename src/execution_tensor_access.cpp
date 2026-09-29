@@ -78,66 +78,110 @@ build_serial_execution_tensor_requirements(
         switch (step.op) {
         case SerialOp::token_embedding:
             push(step, 0, TensorRole::embedding,
-                 TensorRequirementCardinality::exactly_one);
+                 TensorRequirementCardinality::exactly_one,
+                 "token_embd");
             break;
 
         case SerialOp::ple:
             push(step, 0, TensorRole::ngram_table,
-                 TensorRequirementCardinality::one_or_more);
+                 TensorRequirementCardinality::exactly_one,
+                 "per_layer_token_embd");
+            push(step, 1, TensorRole::ple_parameter,
+                 TensorRequirementCardinality::one_or_more,
+                 "ple_");
             break;
 
         case SerialOp::attn_hyper_mix:
-        case SerialOp::attn_inject:
-        case SerialOp::mlp_hyper_mix:
-        case SerialOp::mlp_inject:
             push(step, 0, TensorRole::normalization,
-                 TensorRequirementCardinality::one_or_more);
+                 TensorRequirementCardinality::exactly_one,
+                 "hc_attn_norm");
             push(step, 1, TensorRole::dense_projection,
-                 TensorRequirementCardinality::one_or_more);
+                 TensorRequirementCardinality::exactly_one,
+                 "hc_attn_down");
+            push(step, 2, TensorRole::dense_projection,
+                 TensorRequirementCardinality::exactly_one,
+                 "hc_attn_up");
+            break;
+
+        case SerialOp::attn_inject:
+            push(step, 0, TensorRole::dense_projection,
+                 TensorRequirementCardinality::exactly_one,
+                 "hc_attn_inject");
+            break;
+
+        case SerialOp::mlp_hyper_mix:
+            push(step, 0, TensorRole::normalization,
+                 TensorRequirementCardinality::exactly_one,
+                 "hc_ffn_norm");
+            push(step, 1, TensorRole::dense_projection,
+                 TensorRequirementCardinality::exactly_one,
+                 "hc_ffn_down");
+            push(step, 2, TensorRole::dense_projection,
+                 TensorRequirementCardinality::exactly_one,
+                 "hc_ffn_up");
+            break;
+
+        case SerialOp::mlp_inject:
+            push(step, 0, TensorRole::dense_projection,
+                 TensorRequirementCardinality::exactly_one,
+                 "hc_ffn_inject");
             break;
 
         case SerialOp::gated_delta_net:
             push(step, 0, TensorRole::recurrent_state,
-                 TensorRequirementCardinality::one_or_more);
+                 TensorRequirementCardinality::one_or_more,
+                 "ssm_");
             push(step, 1, TensorRole::attention_projection,
-                 TensorRequirementCardinality::one_or_more);
-            push(step, 2, TensorRole::dense_projection,
-                 TensorRequirementCardinality::one_or_more);
+                 TensorRequirementCardinality::one_or_more,
+                 "attn_");
             break;
 
         case SerialOp::indexed_attention:
             push(step, 0, TensorRole::attention_projection,
-                 TensorRequirementCardinality::one_or_more);
+                 TensorRequirementCardinality::one_or_more,
+                 "attn_");
             push(step, 1, TensorRole::sparse_index,
-                 TensorRequirementCardinality::one_or_more);
+                 TensorRequirementCardinality::one_or_more,
+                 "indexer.");
             push(step, 2, TensorRole::normalization,
-                 TensorRequirementCardinality::one_or_more);
+                 TensorRequirementCardinality::one_or_more,
+                 "_norm");
             break;
 
         case SerialOp::moe_route:
             push(step, 0, TensorRole::moe_router,
-                 TensorRequirementCardinality::exactly_one);
+                 TensorRequirementCardinality::exactly_one,
+                 "ffn_gate_inp");
             break;
 
         case SerialOp::moe_experts:
             push(step, 0, TensorRole::moe_expert,
-                 TensorRequirementCardinality::one_or_more);
+                 TensorRequirementCardinality::one_or_more,
+                 "_exps");
             break;
 
         case SerialOp::shared_expert:
             push(step, 0, TensorRole::dense_projection,
                  TensorRequirementCardinality::one_or_more,
-                 "shared_expert");
+                 "_shexp");
             break;
 
         case SerialOp::final_hyper_mix:
             push(step, 0, TensorRole::normalization,
-                 TensorRequirementCardinality::one_or_more);
+                 TensorRequirementCardinality::exactly_one,
+                 "output_hc_norm");
+            push(step, 1, TensorRole::dense_projection,
+                 TensorRequirementCardinality::exactly_one,
+                 "output_hc_down");
+            push(step, 2, TensorRole::dense_projection,
+                 TensorRequirementCardinality::exactly_one,
+                 "output_hc_up");
             break;
 
         case SerialOp::lm_head:
             push(step, 0, TensorRole::output_head,
-                 TensorRequirementCardinality::exactly_one);
+                 TensorRequirementCardinality::exactly_one,
+                 "output");
             break;
 
         case SerialOp::position_prepare:
