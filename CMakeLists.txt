@@ -285,6 +285,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         src/hip_runtime_allocator.cpp
         src/hip_runtime_launchers.hip
         src/hip_moe_route_launcher.hip
+        src/hip_embedding_launcher.hip
     )
     target_include_directories(strix_hip_runtime PUBLIC include)
     target_compile_features(strix_hip_runtime PUBLIC cxx_std_20)
@@ -353,6 +354,29 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         add_test(
             NAME strix-hip-moe-route-launcher-tests
             COMMAND strix-hip-moe-route-launcher-tests
+        )
+
+        add_executable(
+            strix-hip-embedding-launcher-tests
+            tests/hip_embedding_launcher_tests.hip
+        )
+        set_target_properties(
+            strix-hip-embedding-launcher-tests
+            PROPERTIES
+            HIP_STANDARD 20
+            HIP_STANDARD_REQUIRED ON
+            HIP_ARCHITECTURES gfx1151
+        )
+        target_link_libraries(
+            strix-hip-embedding-launcher-tests
+            PRIVATE strix_hip_runtime
+        )
+        strix_target_warnings(
+            strix-hip-embedding-launcher-tests
+        )
+        add_test(
+            NAME strix-hip-embedding-launcher-tests
+            COMMAND strix-hip-embedding-launcher-tests
         )
     endif()
 endif()
