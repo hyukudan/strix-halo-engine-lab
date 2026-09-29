@@ -38,6 +38,8 @@ int main() {
             layout_request);
 
     strix::SerialSessionSnapshotRequest request;
+    request.compiled_execution_identity =
+        0x1234ULL;
     request.runtime_compatibility_identity =
         0x11112222ULL;
     request.next_position = 64;
