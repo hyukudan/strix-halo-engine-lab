@@ -25,6 +25,7 @@ add_library(strix_core STATIC
     src/memory_plan.cpp
     src/model_contract.cpp
     src/model_manifest.cpp
+    src/moe_plan.cpp
     src/oracles.cpp
     src/packed_projection.cpp
     src/recurrent_plan.cpp
@@ -87,6 +88,11 @@ if(BUILD_TESTING)
     target_link_libraries(strix-recurrent-plan-tests PRIVATE strix_core)
     strix_target_warnings(strix-recurrent-plan-tests)
     add_test(NAME strix-recurrent-plan-tests COMMAND strix-recurrent-plan-tests)
+
+    add_executable(strix-moe-plan-tests tests/moe_plan_tests.cpp)
+    target_link_libraries(strix-moe-plan-tests PRIVATE strix_core)
+    strix_target_warnings(strix-moe-plan-tests)
+    add_test(NAME strix-moe-plan-tests COMMAND strix-moe-plan-tests)
 
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
