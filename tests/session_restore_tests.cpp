@@ -96,6 +96,25 @@ int main() {
                "restore range targets current session-state layout");
     }
 
+
+    auto aligned_request = request;
+    aligned_request.alignment = 256;
+    const auto aligned_snapshot =
+        strix::build_serial_session_snapshot_plan(
+            model,
+            layout,
+            aligned_request);
+    const auto aligned_restore =
+        strix::build_serial_session_restore_plan(
+            model,
+            layout,
+            request.runtime_compatibility_identity,
+            aligned_snapshot);
+    expect(aligned_snapshot.alignment == 256 &&
+               aligned_restore.ranges.size() ==
+                   aligned_snapshot.ranges.size(),
+           "non-default snapshot alignment round-trips through restore");
+
     bool compatibility_rejected = false;
     try {
         static_cast<void>(
