@@ -46,13 +46,15 @@ constexpr Buffer logits() {
         0};
 }
 
-bool contains(
-    std::span<const Buffer> values,
+bool contains_buffer(
+    std::span<const ExecutionBufferUse> values,
     Buffer needle) {
-    return std::find(
+    return std::find_if(
                values.begin(),
                values.end(),
-               needle) != values.end();
+               [&](const ExecutionBufferUse& use) {
+                   return use.buffer == needle;
+               }) != values.end();
 }
 
 std::uint32_t slot_limit(
@@ -98,6 +100,26 @@ SerialExecutionIoPlan build_serial_execution_io_plan(
     output.steps.reserve(
         execution_plan.steps.size());
 
+    constexpr std::size_t maximum_buffers =
+        6U * 8U;
+    std::array<std::uint64_t, maximum_buffers> generations{};
+
+    const auto read_use = [&](Buffer buffer) {
+        return ExecutionBufferUse{
+            buffer,
+            generations[flat_index(buffer)],
+        };
+    };
+    const auto write_use = [&](Buffer buffer) {
+        auto& generation =
+            generations[flat_index(buffer)];
+        ++generation;
+        return ExecutionBufferUse{
+            buffer,
+            generation,
+        };
+    };
+
     std::uint32_t current_hyper = 0;
 
     for (const auto& step : execution_plan.steps) {
@@ -107,110 +129,109 @@ SerialExecutionIoPlan build_serial_execution_io_plan(
 
         switch (step.op) {
         case SerialOp::token_embedding:
-            io.writes = {hidden(0)};
+            io.writes = {write_use(hidden(0))};
             break;
 
         case SerialOp::position_prepare:
             break;
 
         case SerialOp::hyper_expand:
-            io.reads = {hidden(0)};
-            io.writes = {hyper(current_hyper)};
+            io.reads = {read_use(hidden(0))};
+            io.writes = {write_use(hyper(current_hyper))};
             break;
 
         case SerialOp::ple: {
             const auto next = current_hyper ^ 1U;
-            io.reads = {hyper(current_hyper)};
-            io.writes = {hyper(next)};
+            io.reads = {read_use(hyper(current_hyper))};
+            io.writes = {write_use(hyper(next))};
             current_hyper = next;
             break;
         }
 
         case SerialOp::attn_hyper_mix:
-            io.reads = {hyper(current_hyper)};
+            io.reads = {read_use(hyper(current_hyper))};
             io.writes = {
-                hidden(0),
-                injection(),
+                write_use(hidden(0)),
+                write_use(injection()),
             };
             break;
 
         case SerialOp::gated_delta_net:
         case SerialOp::indexed_attention:
-            io.reads = {hidden(0)};
-            io.writes = {hidden(1)};
+            io.reads = {read_use(hidden(0))};
+            io.writes = {write_use(hidden(1))};
             break;
 
         case SerialOp::attn_inject: {
             const auto next = current_hyper ^ 1U;
             io.reads = {
-                hyper(current_hyper),
-                hidden(1),
-                injection(),
+                read_use(hyper(current_hyper)),
+                read_use(hidden(1)),
+                read_use(injection()),
             };
-            io.writes = {hyper(next)};
+            io.writes = {write_use(hyper(next))};
             current_hyper = next;
             break;
         }
 
         case SerialOp::mlp_hyper_mix:
-            io.reads = {hyper(current_hyper)};
+            io.reads = {read_use(hyper(current_hyper))};
             io.writes = {
-                hidden(0),
-                injection(),
+                write_use(hidden(0)),
+                write_use(injection()),
             };
             break;
 
         case SerialOp::moe_route:
-            io.reads = {hidden(0)};
+            io.reads = {read_use(hidden(0))};
             io.writes = {
-                route_indices(),
-                route_weights(),
+                write_use(route_indices()),
+                write_use(route_weights()),
             };
             break;
 
         case SerialOp::shared_expert:
-            io.reads = {hidden(0)};
-            io.writes = {hidden(1)};
+            io.reads = {read_use(hidden(0))};
+            io.writes = {write_use(hidden(1))};
             break;
 
         case SerialOp::moe_experts:
             io.reads = {
-                hidden(0),
-                route_indices(),
-                route_weights(),
+                read_use(hidden(0)),
+                read_use(route_indices()),
+                read_use(route_weights()),
             };
-            io.writes = {hidden(2)};
+            io.writes = {write_use(hidden(2))};
             break;
 
         case SerialOp::moe_combine:
             io.reads = {
-                hidden(1),
-                hidden(2),
+                read_use(hidden(1)),
+                read_use(hidden(2)),
             };
-            // hidden(0) is dead after route/shared/routed expert consumers.
-            io.writes = {hidden(0)};
+            io.writes = {write_use(hidden(0))};
             break;
 
         case SerialOp::mlp_inject: {
             const auto next = current_hyper ^ 1U;
             io.reads = {
-                hyper(current_hyper),
-                hidden(0),
-                injection(),
+                read_use(hyper(current_hyper)),
+                read_use(hidden(0)),
+                read_use(injection()),
             };
-            io.writes = {hyper(next)};
+            io.writes = {write_use(hyper(next))};
             current_hyper = next;
             break;
         }
 
         case SerialOp::final_hyper_mix:
-            io.reads = {hyper(current_hyper)};
-            io.writes = {hidden(0)};
+            io.reads = {read_use(hyper(current_hyper))};
+            io.writes = {write_use(hidden(0))};
             break;
 
         case SerialOp::lm_head:
-            io.reads = {hidden(0)};
-            io.writes = {logits()};
+            io.reads = {read_use(hidden(0))};
+            io.writes = {write_use(logits())};
             break;
         }
 
@@ -235,6 +256,7 @@ void validate_serial_execution_io_plan(
     constexpr std::size_t maximum_buffers =
         6U * 8U;
     std::array<bool, maximum_buffers> produced{};
+    std::array<std::uint64_t, maximum_buffers> generation{};
 
     for (std::size_t index = 0;
          index < execution_plan.steps.size();
@@ -250,7 +272,8 @@ void validate_serial_execution_io_plan(
                 "execution IO identity does not match execution step");
         }
 
-        for (const auto buffer : io.reads) {
+        for (const auto& use : io.reads) {
+            const auto buffer = use.buffer;
             if (buffer.slot >=
                 slot_limit(
                     io_plan,
@@ -258,13 +281,19 @@ void validate_serial_execution_io_plan(
                 throw std::invalid_argument(
                     "execution IO read uses an invalid buffer slot");
             }
-            if (!produced[flat_index(buffer)]) {
+            const auto flat = flat_index(buffer);
+            if (!produced[flat]) {
                 throw std::invalid_argument(
                     "execution IO reads a buffer before it is produced");
             }
+            if (use.generation != generation[flat]) {
+                throw std::invalid_argument(
+                    "execution IO read references a stale buffer generation");
+            }
         }
 
-        for (const auto buffer : io.writes) {
+        for (const auto& use : io.writes) {
+            const auto buffer = use.buffer;
             if (buffer.slot >=
                 slot_limit(
                     io_plan,
@@ -272,14 +301,22 @@ void validate_serial_execution_io_plan(
                 throw std::invalid_argument(
                     "execution IO write uses an invalid buffer slot");
             }
-            if (contains(io.reads, buffer)) {
+            if (contains_buffer(io.reads, buffer)) {
                 throw std::invalid_argument(
                     "execution IO step aliases a read and write buffer");
             }
+
+            const auto flat = flat_index(buffer);
+            if (use.generation != generation[flat] + 1ULL) {
+                throw std::invalid_argument(
+                    "execution IO write generation is not the next slot generation");
+            }
         }
 
-        for (const auto buffer : io.writes) {
-            produced[flat_index(buffer)] = true;
+        for (const auto& use : io.writes) {
+            const auto flat = flat_index(use.buffer);
+            generation[flat] = use.generation;
+            produced[flat] = true;
         }
     }
 }
