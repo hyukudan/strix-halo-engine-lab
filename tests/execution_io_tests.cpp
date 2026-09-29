@@ -48,7 +48,8 @@ int main() {
                io.route_index_slots == 1 &&
                io.route_weight_slots == 1 &&
                io.logits_slots == 1 &&
-               io.mlp_intermediate_slots == 1,
+               io.mlp_intermediate_slots == 1 &&
+               io.gdn_workspace_slots == 1,
            "IO plan reuses one side-value slot per serial lifetime class");
 
     std::uint32_t ple_count = 0;
@@ -56,6 +57,7 @@ int main() {
     std::uint32_t lm_head_count = 0;
     std::uint32_t shared_temp_count = 0;
     std::uint32_t routed_temp_count = 0;
+    std::uint32_t gdn_temp_count = 0;
 
     for (const auto& step : io.steps) {
         if (step.op == strix::SerialOp::ple) {
@@ -70,6 +72,16 @@ int main() {
                    "PLE ping-pongs expanded hidden state");
         }
 
+
+
+        if (step.op == strix::SerialOp::gated_delta_net) {
+            ++gdn_temp_count;
+            expect(
+                step.temporaries.size() == 1 &&
+                step.temporaries[0].buffer.buffer_class ==
+                    strix::ExecutionBufferClass::gdn_workspace,
+                "GDN owns one step-local workspace");
+        }
 
         if (step.op == strix::SerialOp::shared_expert) {
             ++shared_temp_count;
@@ -129,6 +141,8 @@ int main() {
     expect(shared_temp_count == 48 &&
                routed_temp_count == 48,
            "every MoE branch step receives one temporary workspace");
+    expect(gdn_temp_count == 36,
+           "every recurrent layer receives one GDN workspace");
 
     auto invalid = io;
     invalid.steps.back().reads[0].buffer =
