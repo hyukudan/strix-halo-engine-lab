@@ -35,6 +35,13 @@ struct RecordingDispatcher final
         expect(context.kernel_id.has_value() &&
                    !context.kernel_id->empty(),
                "kernel dispatch carries a kernel id");
+        if (context.op == strix::SerialOp::lm_head) {
+            expect(context.reads.size() == 1 &&
+                       context.writes.size() == 1 &&
+                       context.reads[0].generation > 0 &&
+                       context.writes[0].generation == 1,
+                   "kernel dispatch receives versioned IO bindings");
+        }
         kernel_steps.push_back(context.step_id);
     }
 
@@ -115,6 +122,8 @@ int main() {
         strix::ModelContract::qwen38_flash_next();
     const auto plan =
         strix::build_serial_decode_execution_plan(model);
+    const auto io =
+        strix::build_serial_execution_io_plan(plan);
     auto bindings = fully_bound(plan);
 
     strix::EagerExecutionRequest request;
@@ -170,7 +179,7 @@ int main() {
         RecordingDispatcher unused;
         static_cast<void>(
             strix::execute_serial_eager(
-                plan, incomplete, request, unused));
+                plan, incomplete, io, request, unused));
     } catch (const std::invalid_argument&) {
         preflight_rejected = true;
     }
@@ -185,7 +194,7 @@ int main() {
         RecordingDispatcher unused;
         static_cast<void>(
             strix::execute_serial_eager(
-                plan, bindings, unavailable_state, unused));
+                plan, bindings, io, unavailable_state, unused));
     } catch (const std::invalid_argument&) {
         state_rejected = true;
     }
@@ -210,7 +219,7 @@ int main() {
     try {
         static_cast<void>(
             strix::execute_serial_eager(
-                plan, bindings, request, failing));
+                plan, bindings, io, request, failing));
     } catch (const std::runtime_error&) {
         injected_failure = true;
     }
@@ -232,6 +241,7 @@ int main() {
             strix::execute_serial_eager(
                 plan,
                 bindings,
+                io,
                 generation_overflow,
                 overflow_dispatcher));
     } catch (const std::overflow_error&) {
@@ -255,6 +265,7 @@ int main() {
             strix::execute_serial_eager(
                 plan,
                 bad_runtime_binding,
+                io,
                 request,
                 unused));
     } catch (const std::invalid_argument&) {
@@ -272,6 +283,7 @@ int main() {
             strix::execute_serial_eager(
                 bad_dependency_plan,
                 bindings,
+                io,
                 request,
                 unused));
     } catch (const std::invalid_argument&) {
