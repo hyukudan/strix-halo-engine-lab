@@ -4,12 +4,15 @@
 
 #include <hip/hip_runtime.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace strix {
 namespace {
