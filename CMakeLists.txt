@@ -19,6 +19,7 @@ function(strix_target_warnings target)
 endfunction()
 
 add_library(strix_core STATIC
+    src/execution_arena.cpp
     src/execution_binding.cpp
     src/execution_buffers.cpp
     src/execution_io.cpp
@@ -131,6 +132,11 @@ if(BUILD_TESTING)
     target_link_libraries(strix-execution-io-tests PRIVATE strix_core)
     strix_target_warnings(strix-execution-io-tests)
     add_test(NAME strix-execution-io-tests COMMAND strix-execution-io-tests)
+
+    add_executable(strix-execution-arena-tests tests/execution_arena_tests.cpp)
+    target_link_libraries(strix-execution-arena-tests PRIVATE strix_core)
+    strix_target_warnings(strix-execution-arena-tests)
+    add_test(NAME strix-execution-arena-tests COMMAND strix-execution-arena-tests)
 
     add_executable(strix-speculation-tests tests/speculation_tests.cpp)
     target_link_libraries(strix-speculation-tests PRIVATE strix_core)
