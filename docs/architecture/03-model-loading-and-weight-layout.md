@@ -46,6 +46,33 @@ The manifest SHOULD describe at least:
 
 The manifest is the boundary between model interpretation and runtime execution.
 
+
+## Runtime tensor binding
+
+The manifest and the loaded tensor addresses are separate objects.
+
+Each runtime tensor binding MUST identify:
+
+- manifest tensor index;
+- storage mode;
+- local address when locally addressable;
+- bound bytes;
+- allocation generation;
+- owner node.
+
+Supported storage identities SHOULD distinguish at least:
+
+- resident local tensor;
+- file-mapped local tensor;
+- lossless repacked cache;
+- remote tensor.
+
+A remote tensor MUST NOT expose a fake local address.
+
+The runtime MUST validate manifest layout identity before a tensor binding can be used.
+
+The loader MUST additionally supply a non-zero content identity derived from hashes of all execution-relevant model files. Manifest layout identity alone is insufficient because two checkpoints can share the same tensor geometry.
+
 ## Storage format
 
 The input format is an interchange/storage representation.
