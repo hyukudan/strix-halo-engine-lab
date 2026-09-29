@@ -113,7 +113,7 @@ int main() {
         if (stream.out_hopid.has_value()) std::cout << *stream.out_hopid; else std::cout << "null";
         std::cout << '}' << (index + 1 == info.usb4.configured_streams.size() ? '\n' : ',') << '\n';
     }
-    std::cout << "    ],";
+    std::cout << "    ]";
     std::cout << ",\n    \"stream_driver_present\": "
               << (info.usb4.stream_driver_present ? "true" : "false")
               << "\n  }\n}\n";
