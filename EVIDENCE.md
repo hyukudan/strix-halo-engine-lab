@@ -39,6 +39,11 @@ permitidos son: **observado**, **publicado**, **inferido**, **hipótesis** y
 
 | E-031 | publicado + observado | La revisión fijada de la implementación pública `qwen4_exp` define explícitamente RMSNorm centrado, RoPE parcial, la actualización recurrente Gated DeltaNet y el hashing PLE/n-gram; se han creado oráculos independientes y fixtures pequeños con replay fresh/resumed. | `huggingface/transformers@ebd5de00b43e94cae2da6d7aeb5a76ecdda51dae`; `tools/oracles/`. | A0.5b queda parcialmente implementado; sampling/MTP y semántica completa QSA siguen bloqueados. |
 
+
+| E-032 | publicado | Los GGUF públicos actuales de Qwen3.8-Flash-Next sitúan aproximadamente Q8_0 en 188,26 GB, Q6_K en 168,11 GB, Q5_K_M en 134,67 GB, Q5_K_S en 128,10 GB, Q4_K_M en 119,60 GB, Q4_K_S en 113,14 GB, Q4_0 en 100,60 GB e IQ4_XS en 97,68 GB. | Catálogo público actual de GGUF Qwen3.8-Flash-Next, captura 2026-09-29. | Un perfil mononodo de 128 GiB no puede seleccionar cuantización solo por calidad nominal; debe dejar RAM física para reserva, runtime, KV, recurrencia y scratch. |
+| E-033 | inferido | Con una reserva efectiva de 16–20 GiB y el resto del estado C1, un objetivo inicial de aproximadamente 100 GiB o menos de pesos residentes deja margen razonable en una máquina de 128 GiB; Q4_K_M no cumple ese margen y Q4_K_S queda muy próximo al límite antes de A0.6. | E-011, E-028, E-032 y `MEMORY_BUDGET.md`. | Fijar un envelope mononodo conservador; P-002 sigue pendiente de calidad y medidas reales. |
+| E-034 | publicado | El config público actual de Qwen3.8-Flash-Next declara `hidden_size=2560`, 24 cabezas de atención, `head_dim=256`, `partial_rotary_factor=0.25`, vocabulario 248.320, 512 expertos y top-10 por token. | Config público de Qwen3.8-Flash-Next, captura 2026-09-29. | Usar estas geometrías como shapes representativas en los microbenchmarks A1.0/A1.1, sin convertirlas en resultados de rendimiento. |
+
 ## Regla para nuevas entradas
 
 Cada evidencia nueva debe incluir identidad del artefacto, comando o prueba,
