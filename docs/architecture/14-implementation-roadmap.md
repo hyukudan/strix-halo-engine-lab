@@ -56,6 +56,12 @@ Next gate on native Strix Halo hardware:
 
 ### A0.5b — Semantic and numerical oracle
 
+Status: **partially implemented**.
+
+The first dependency-free oracle slice now covers centred/grouped RMSNorm, partial RoPE, sequential recurrent Gated DeltaNet, PLE/n-gram row hashing, deterministic candidate top-k, and fresh-versus-resumed state equivalence.
+
+Still open before the slice is complete: sampled RNG semantics, MTP acceptance, complete QSA selection/tie fixtures, Gated Residual matrix fixtures, tokenizer/template fixtures and first-layer/logit replay from the canonical development checkpoint.
+
 Before optimized model kernels become authoritative, establish independent fixtures or a trusted reference for:
 
 - model-specific operator semantics;
