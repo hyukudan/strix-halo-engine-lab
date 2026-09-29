@@ -57,4 +57,12 @@ if(BUILD_TESTING)
     target_link_libraries(strix-manifest-platform-tests PRIVATE strix_core)
     strix_target_warnings(strix-manifest-platform-tests)
     add_test(NAME strix-manifest-platform-tests COMMAND strix-manifest-platform-tests)
+
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+        add_test(
+            NAME strix-python-oracle-tests
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/oracles/test_qwen4_exp_oracle.py
+        )
+    endif()
 endif()
