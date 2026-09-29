@@ -140,6 +140,8 @@ int main() {
     state_memory.host_allocation_generation = 2;
 
     strix::SerialSessionSnapshotRequest request;
+    request.compiled_execution_identity =
+        0x1234ULL;
     request.runtime_compatibility_identity =
         0xabcdefULL;
     request.next_position = 2;
@@ -208,6 +210,25 @@ int main() {
         request.runtime_compatibility_identity;
     session.state_layout_identity =
         layout.layout_identity;
+
+    auto wrong_snapshot_memory =
+        snapshot_memory;
+    ++wrong_snapshot_memory.snapshot_plan_identity;
+    bool wrong_snapshot_identity_rejected = false;
+    try {
+        strix::restore_serial_session_snapshot(
+            session,
+            restore,
+            layout,
+            state_memory,
+            wrong_snapshot_memory,
+            backend);
+    } catch (const std::invalid_argument&) {
+        wrong_snapshot_identity_rejected = true;
+    }
+    expect(wrong_snapshot_identity_rejected,
+           "wrong snapshot payload identity is rejected");
+
     session.health =
         strix::SerialSessionHealth::poisoned;
 
