@@ -1,5 +1,7 @@
 #include "strix/execution_plan.hpp"
 
+#include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <iostream>
 #include <stdexcept>
