@@ -4,6 +4,7 @@
 #include "strix/hip_embedding_launcher.hpp"
 #include "strix/hip_hyper_mix_launcher.hpp"
 #include "strix/hip_launcher_catalog.hpp"
+#include "strix/hip_lm_head_launcher.hpp"
 #include "strix/hip_moe_route_launcher.hpp"
 #include "strix/hip_runtime_launchers.hpp"
 #include "strix/kernel_registry.hpp"
@@ -39,6 +40,7 @@ bool catalog_supported(strix::SerialOp op) {
     case SerialOp::moe_combine:
     case SerialOp::mlp_inject:
     case SerialOp::final_hyper_mix:
+    case SerialOp::lm_head:
         return true;
     default:
         return false;
@@ -132,6 +134,16 @@ int main() {
     strix::register_hip_moe_route_kernel_variant(
         model, request, route, kernels);
 
+    strix::HipLmHeadLauncherConfig lm_head;
+    lm_head.hidden_size =
+        static_cast<std::uint32_t>(model.hidden_size);
+    lm_head.vocab_size =
+        static_cast<std::uint32_t>(model.vocab_size);
+    lm_head.input =
+        strix::HipActivationStorage::bf16;
+    strix::register_hip_lm_head_kernel_variant(
+        model, request, lm_head, kernels);
+
     const auto execution =
         strix::build_serial_decode_execution_plan(model);
 
@@ -206,7 +218,7 @@ int main() {
     }
 
     expect(
-        coverage.missing_steps == 146,
+        coverage.missing_steps == 145,
         "catalog exposes exact current launcher gap count");
     expect(
         missing_by_op[strix::SerialOp::ple] == 1,
@@ -224,10 +236,10 @@ int main() {
         missing_by_op[strix::SerialOp::shared_expert] == 48,
         "shared-expert launcher gaps are explicit");
     expect(
-        missing_by_op[strix::SerialOp::lm_head] == 1,
-        "LM-head launcher gap is explicit");
+        missing_by_op[strix::SerialOp::lm_head] == 0,
+        "LM-head launcher is covered");
     expect(
-        missing_by_op.size() == 6,
+        missing_by_op.size() == 5,
         "no already-supported operator appears in missing coverage");
 
     expect(
