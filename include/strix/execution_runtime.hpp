@@ -26,6 +26,8 @@ struct ExecutionDispatchContext {
     PersistentState writes_state = PersistentState::none;
     std::uint32_t logical_rows = 1;
     std::uint32_t request_concurrency = 1;
+    std::uint32_t input_token_id = 0;
+    std::uint64_t position = 0;
 };
 
 class EagerExecutionDispatcher {
@@ -53,6 +55,8 @@ struct PersistentStateGenerations {
 struct EagerExecutionRequest {
     std::uint32_t logical_rows = 1;
     std::uint32_t request_concurrency = 1;
+    std::uint32_t input_token_id = 0;
+    std::uint64_t position = 0;
 
     // Callers explicitly declare which persistent-state objects have been
     // created for this request. Fresh zero/empty state still counts as valid.
