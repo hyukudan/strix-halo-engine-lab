@@ -1,6 +1,6 @@
 #pragma once
 
-#include "strix/compiled_execution.hpp"
+#include "strix/execution_arena.hpp"
 #include "strix/execution_io.hpp"
 
 #include <cstdint>
@@ -22,11 +22,13 @@ struct ExecutionBufferAddress {
 };
 
 void validate_execution_memory_binding(
-    const CompiledSerialExecution& compiled,
+    std::uint64_t execution_identity,
+    const ExecutionArenaPlan& arena,
     const ExecutionMemoryBinding& memory);
 
 [[nodiscard]] ExecutionBufferAddress resolve_execution_buffer(
-    const CompiledSerialExecution& compiled,
+    std::uint64_t execution_identity,
+    const ExecutionArenaPlan& arena,
     const ExecutionMemoryBinding& memory,
     ExecutionBufferUse use);
 
