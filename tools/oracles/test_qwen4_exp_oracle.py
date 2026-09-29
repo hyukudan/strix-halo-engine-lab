@@ -9,7 +9,9 @@ import unittest
 
 from qwen4_exp_oracle import (
     apply_partial_rope,
+    gated_residual,
     ngram_ids,
+    qsa_select_tokens_no_ties,
     recurrent_gated_delta_rule,
     rms_norm,
     stable_top_k,
@@ -107,6 +109,35 @@ class OracleTests(unittest.TestCase):
         )
         self.assertEqual(first_rows + second_rows, rows)
         self.assertEqual(second_context, context)
+
+
+    def test_gated_residual_fixture(self) -> None:
+        fixture = FIXTURE["gated_residual"]
+        mixed, injection = gated_residual(
+            fixture["hyper_input"],
+            hc_count=fixture["hc_count"],
+            hidden_size=fixture["hidden_size"],
+            norm_weight=fixture["norm_weight"],
+            down_weight=fixture["down_weight"],
+            up_weight=fixture["up_weight"],
+            inject_weight=fixture["inject_weight"],
+            eps=fixture["eps"],
+        )
+        assert_nested_close(self, mixed, fixture["expected_mixed"])
+        assert_nested_close(self, injection, fixture["expected_injection"])
+
+    def test_qsa_no_tie_fixture(self) -> None:
+        fixture = FIXTURE["qsa_no_ties"]
+        selected = qsa_select_tokens_no_ties(
+            fixture["query_heads"],
+            fixture["raw_keys"],
+            fixture["visible_indices"],
+            compress_ratio=fixture["compress_ratio"],
+            token_budget=fixture["token_budget"],
+            key_norm_weight=fixture["key_norm_weight"],
+            eps=fixture["eps"],
+        )
+        self.assertEqual(selected, fixture["expected"])
 
     def test_stable_top_k_policy(self) -> None:
         fixture = FIXTURE["top_k"]
