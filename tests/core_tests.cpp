@@ -163,6 +163,12 @@ int main() {
                model.gdn_value_head_dim == 128 &&
                model.gdn_conv_kernel == 4,
            "official GDN geometry is explicit");
+    expect(strix::gdn_matrix_state_bytes_per_layer(model) ==
+               3ULL * 1024ULL * 1024ULL,
+           "one GDN matrix layer is 3 MiB");
+    expect(strix::gdn_conv_state_bytes_per_layer(model) ==
+               80ULL * 1024ULL,
+           "one GDN convolution layer is 80 KiB");
     expect(strix::gdn_matrix_state_bytes_per_session(model) ==
                108ULL * 1024ULL * 1024ULL,
            "GDN FP32 matrix state is 108 MiB/session");
