@@ -36,7 +36,8 @@ std::string ModelContract::validate() const {
     if (indexer_compress_ratio == 0) {
         return "indexer compression ratio must be non-zero";
     }
-    if (hidden_size == 0 ||
+    if (vocab_size == 0 ||
+        hidden_size == 0 ||
         moe_intermediate_size == 0 ||
         shared_expert_intermediate_size == 0 ||
         num_experts == 0 ||
