@@ -126,7 +126,11 @@ bool validate_descriptor(const TransferDescriptor& descriptor,
     if (descriptor.protocol_version != limits.protocol_version ||
         limits.connection_epoch == 0 ||
         descriptor.connection_epoch != limits.connection_epoch ||
+        descriptor.model_plan_id == 0 ||
         descriptor.request_id == 0 ||
+        descriptor.boundary_id == 0 ||
+        descriptor.shape_fingerprint == 0 ||
+        descriptor.dtype_id == 0 ||
         descriptor.byte_length == 0 ||
         limits.maximum_bytes == 0 ||
         descriptor.byte_length > limits.maximum_bytes) {
