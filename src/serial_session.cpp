@@ -8,8 +8,14 @@ namespace strix {
 EagerExecutionResult execute_serial_token(
     const CompiledSerialExecution& compiled,
     SerialSessionContext& session,
+    const ExecutionMemoryBinding& memory,
     std::uint32_t input_token_id,
     EagerExecutionDispatcher& dispatcher) {
+    validate_execution_memory_binding(
+        compiled.execution_identity,
+        compiled.arena,
+        memory);
+
     if (session.health != SerialSessionHealth::ready) {
         throw std::logic_error(
             "serial session is poisoned and requires recovery");
@@ -68,6 +74,7 @@ EagerExecutionResult execute_serial_token(
         result =
             execute_compiled_serial_eager(
                 compiled,
+                memory,
                 request,
                 dispatcher);
     } catch (...) {
