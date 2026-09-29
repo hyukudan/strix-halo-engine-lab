@@ -1,6 +1,8 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -56,6 +58,53 @@ struct DescriptorLimits {
 
 [[nodiscard]] bool validate_descriptor(const TransferDescriptor& descriptor,
                                        const DescriptorLimits& limits) noexcept;
+
+
+using TransferHandle = std::uint64_t;
+
+enum class CompletionKind {
+    local_buffer_reusable,
+    receive_complete,
+    remote_transport_ack,
+    failed,
+};
+
+struct Completion {
+    TransferHandle handle = 0;
+    CompletionKind kind = CompletionKind::failed;
+    std::uint64_t bytes = 0;
+};
+
+struct BackendCapabilities {
+    std::string name;
+    std::uint64_t maximum_payload_bytes = 0;
+    bool full_duplex = false;
+    bool busy_poll = false;
+    bool mapped_host_buffers = false;
+    bool gpu_visible_buffers = false;
+    bool external_dma = false;
+};
+
+class TransportBackend {
+public:
+    virtual ~TransportBackend() = default;
+
+    [[nodiscard]] virtual BackendCapabilities capabilities() const = 0;
+
+    [[nodiscard]] virtual TransferHandle prepare_send(
+        const TransferDescriptor& descriptor,
+        std::span<const std::byte> payload) = 0;
+
+    [[nodiscard]] virtual TransferHandle prepare_receive(
+        const TransferDescriptor& descriptor,
+        std::span<std::byte> destination) = 0;
+
+    virtual void submit(TransferHandle handle) = 0;
+
+    [[nodiscard]] virtual std::optional<Completion> poll() = 0;
+
+    virtual void cancel(TransferHandle handle) = 0;
+};
 
 struct LinkProfile {
     std::string id;
