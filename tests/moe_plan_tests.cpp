@@ -152,16 +152,16 @@ int main() {
     expect(execution.assignments == 20 &&
                execution.direct_weight_traversals == 20,
            "direct expert path traverses one weight set per assignment");
-    expect(execution.batches.size() == 13,
-           "grouped execution emits thirteen row-class batches");
+    expect(execution.batches.size() == 12,
+           "grouped execution emits twelve row-class batches");
     expect(execution.batches[0].expert == 0 &&
                execution.batches[0].logical_rows == 8 &&
                execution.batches[1].expert == 0 &&
                execution.batches[1].logical_rows == 2,
            "expert execution plan decomposes reuse into 8/4/2/1 row classes");
-    expect(execution.grouped_weight_traversals == 13 &&
-               execution.grouped_weight_bytes == 13'000 &&
-               execution.grouped_weight_bytes_saved == 7'000,
+    expect(execution.grouped_weight_traversals == 12 &&
+               execution.grouped_weight_bytes == 12'000 &&
+               execution.grouped_weight_bytes_saved == 8'000,
            "execution plan models realizable grouped weight traffic without padding");
 
     bool duplicate_rejected = false;
