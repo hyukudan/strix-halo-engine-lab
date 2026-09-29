@@ -1,0 +1,200 @@
+#include "strix/dispatch_resources.hpp"
+
+#include <array>
+#include <iostream>
+#include <stdexcept>
+
+namespace {
+
+int failures = 0;
+
+void expect(bool condition, const char* message) {
+    if (!condition) {
+        std::cerr << "FAIL: " << message << '\n';
+        ++failures;
+    }
+}
+
+}  // namespace
+
+int main() {
+    strix::ExecutionBufferUse read_use{
+        {
+            strix::ExecutionBufferClass::hidden,
+            0,
+        },
+        1,
+    };
+    strix::ExecutionBufferUse write_use{
+        {
+            strix::ExecutionBufferClass::logits,
+            0,
+        },
+        1,
+    };
+
+    strix::ExecutionArenaPlan arena;
+    arena.alignment = 256;
+    arena.total_bytes = 2048;
+    arena.allocations.push_back(
+        {read_use, 0, 1, 0, 512});
+    arena.allocations.push_back(
+        {write_use, 1, 1, 512, 1024});
+
+    strix::ExecutionMemoryBinding scratch;
+    scratch.execution_identity = 0x1111ULL;
+    scratch.arena_base =
+        static_cast<std::uintptr_t>(
+            0x80000000ULL);
+    scratch.arena_bytes = arena.total_bytes;
+    scratch.allocation_generation = 2;
+
+    strix::SerialSessionStateLayout state_layout;
+    state_layout.context_tokens = 8;
+    state_layout.device_alignment = 256;
+    state_layout.host_alignment = 64;
+    state_layout.device_total_bytes = 1024;
+    state_layout.host_total_bytes = 64;
+    state_layout.layout_identity = 0x2222ULL;
+    state_layout.allocations.push_back(
+        {
+            strix::SessionStateComponent::recurrent_matrix,
+            strix::PersistentState::recurrent_matrix,
+            strix::SessionStateStorage::device,
+            0,
+            1024,
+            false,
+        });
+
+    strix::SessionStateMemoryBinding state_memory;
+    state_memory.layout_identity =
+        state_layout.layout_identity;
+    state_memory.device_base =
+        static_cast<std::uintptr_t>(
+            0x81000000ULL);
+    state_memory.device_bytes = 1024;
+    state_memory.device_allocation_generation = 3;
+    state_memory.host_base =
+        static_cast<std::uintptr_t>(
+            0x82000000ULL);
+    state_memory.host_bytes = 64;
+    state_memory.host_allocation_generation = 4;
+
+    strix::ModelManifest manifest;
+    manifest.architecture = "fixture";
+    strix::ManifestTensor mt;
+    mt.name = "token_embd.weight";
+    mt.dimensions = {64, 64};
+    mt.ggml_type = 1;
+    mt.byte_size = 8192;
+    mt.absolute_offset = 4096;
+    mt.role = strix::TensorRole::embedding;
+    manifest.tensors.push_back(mt);
+    manifest.total_tensor_bytes = mt.byte_size;
+    manifest.layout_identity =
+        strix::model_manifest_layout_identity(
+            manifest);
+
+    strix::ModelRuntimeBinding weights;
+    weights.manifest_layout_identity =
+        manifest.layout_identity;
+    weights.model_content_identity =
+        0x3333ULL;
+    weights.tensors.push_back(
+        {
+            0,
+            strix::RuntimeTensorStorage::resident,
+            static_cast<std::uintptr_t>(
+                0x83000000ULL),
+            mt.byte_size,
+            5,
+            0,
+        });
+
+    strix::ExecutionRuntimeResources resources;
+    resources.scratch = &scratch;
+    resources.model_manifest = &manifest;
+    resources.model_weights = &weights;
+    resources.session_state_layout =
+        &state_layout;
+    resources.session_state_memory =
+        &state_memory;
+
+    const std::array reads{read_use};
+    const std::array writes{write_use};
+
+    strix::ExecutionDispatchContext context;
+    context.reads = reads;
+    context.writes = writes;
+    context.arena = &arena;
+    context.memory = &scratch;
+    context.session_state_layout =
+        &state_layout;
+    context.session_state_memory =
+        &state_memory;
+    context.resources = &resources;
+
+    const auto input =
+        strix::resolve_dispatch_read(
+            context, 0);
+    const auto output =
+        strix::resolve_dispatch_write(
+            context, 0);
+    expect(input.address ==
+               scratch.arena_base &&
+               output.address ==
+                   scratch.arena_base + 512,
+           "dispatch scratch resolver uses compiled arena offsets");
+
+    const auto recurrent =
+        strix::resolve_dispatch_state(
+            context,
+            strix::SessionStateComponent::recurrent_matrix);
+    expect(recurrent.address ==
+               state_memory.device_base &&
+               recurrent.allocation_generation == 3,
+           "dispatch state resolver uses persistent device pool");
+
+    const auto& tensor_by_index =
+        strix::resolve_dispatch_tensor(
+            context, 0);
+    const auto& tensor_by_name =
+        strix::resolve_dispatch_tensor(
+            context,
+            "token_embd.weight");
+    expect(tensor_by_index.address ==
+               weights.tensors[0].address &&
+               tensor_by_name.address ==
+                   weights.tensors[0].address,
+           "dispatch tensor resolver uses model runtime binding");
+
+    bool read_rejected = false;
+    try {
+        static_cast<void>(
+            strix::resolve_dispatch_read(
+                context, 1));
+    } catch (const std::out_of_range&) {
+        read_rejected = true;
+    }
+    expect(read_rejected,
+           "dispatch read resolver checks index bounds");
+
+    auto no_model = resources;
+    no_model.model_weights = nullptr;
+    context.resources = &no_model;
+    bool model_rejected = false;
+    try {
+        static_cast<void>(
+            strix::resolve_dispatch_tensor(
+                context, 0));
+    } catch (const std::invalid_argument&) {
+        model_rejected = true;
+    }
+    expect(model_rejected,
+           "dispatch tensor resolver requires model weights");
+
+    if (failures == 0) {
+        std::cout << "dispatch resource tests passed\n";
+    }
+    return failures == 0 ? 0 : 1;
+}
