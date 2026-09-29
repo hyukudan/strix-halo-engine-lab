@@ -65,6 +65,10 @@ int main() {
 
     const auto manifest = strix::build_model_manifest(file);
     expect(manifest.architecture == "test_arch", "architecture is copied into manifest");
+    expect(manifest.layout_identity != 0 &&
+               manifest.layout_identity ==
+                   strix::model_manifest_layout_identity(manifest),
+           "manifest layout identity is stable");
     expect(manifest.total_tensor_bytes == 65536, "manifest totals tensor bytes");
     expect(manifest.file_backed_candidate_bytes == 32768,
            "manifest totals file-backed candidates");
@@ -73,6 +77,12 @@ int main() {
     expect(manifest.tensors[0].placement.kind == strix::PlacementKind::local &&
                manifest.tensors[0].placement.node == 0,
            "manifest defaults to local node zero");
+
+    auto changed_manifest = manifest;
+    ++changed_manifest.tensors[0].absolute_offset;
+    expect(strix::model_manifest_layout_identity(changed_manifest) !=
+               manifest.layout_identity,
+           "tensor-layout change invalidates manifest layout identity");
 
     const auto root = std::filesystem::temp_directory_path() / "strix-platform-probe-test";
     std::error_code error;
