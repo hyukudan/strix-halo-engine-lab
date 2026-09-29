@@ -18,7 +18,7 @@ strix::ModelManifest fixture() {
     strix::ModelManifest manifest;
     manifest.architecture = "fixture";
 
-    const auto add =
+    auto add =
         [&](std::string name,
             strix::TensorRole role,
             std::optional<std::uint32_t> layer,
