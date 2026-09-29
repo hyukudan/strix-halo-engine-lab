@@ -58,6 +58,8 @@ int main() {
 
     expect(snapshot.plan_identity != 0,
            "snapshot plan has non-zero identity");
+    expect(snapshot.alignment == request.alignment,
+           "snapshot preserves requested compact-payload alignment");
     expect(snapshot.ranges.size() == 7,
            "snapshot contains every valid serial state component");
 
