@@ -93,6 +93,10 @@ TensorRole classify_tensor_role(std::string_view name) noexcept {
         contains(name, "recurrent") || contains(name, ".ssm_")) {
         return TensorRole::recurrent_state;
     }
+    if (contains(name, "shared_expert") ||
+        contains(name, "shared_experts")) {
+        return TensorRole::dense_projection;
+    }
     if (contains(name, "experts.") || contains(name, ".expert.") ||
         contains(name, "expert_")) {
         return TensorRole::moe_expert;
