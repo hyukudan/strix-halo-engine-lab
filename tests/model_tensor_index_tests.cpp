@@ -155,6 +155,23 @@ int main() {
     expect(stale_index,
            "tensor index rejects changed manifest identity");
 
+
+    strix::ModelTensorSelector alias_selector;
+    alias_selector.role =
+        strix::TensorRole::dense_projection;
+    alias_selector.name_contains_any = {
+        "_shexp",
+        "shared_expert",
+    };
+    const auto aliases =
+        strix::select_manifest_tensors(
+            manifest,
+            index,
+            alias_selector);
+    expect(
+        !aliases.empty(),
+        "contains-any selector accepts naming aliases");
+
     if (failures == 0) {
         std::cout << "model tensor index tests passed\n";
     }
