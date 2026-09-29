@@ -34,6 +34,7 @@ add_library(strix_core STATIC
     src/gguf_reader.cpp
     src/kernel_registry.cpp
     src/iq4_xs.cpp
+    src/launch_dispatch.cpp
     src/memory_plan.cpp
     src/model_contract.cpp
     src/model_manifest.cpp
@@ -44,6 +45,7 @@ add_library(strix_core STATIC
     src/packed_projection.cpp
     src/recurrent_plan.cpp
     src/runtime_allocator.cpp
+    src/runtime_launchers.cpp
     src/serial_session.cpp
     src/session_state_layout.cpp
     src/session_state_memory.cpp
@@ -181,6 +183,16 @@ if(BUILD_TESTING)
     target_link_libraries(strix-dispatch-resources-tests PRIVATE strix_core)
     strix_target_warnings(strix-dispatch-resources-tests)
     add_test(NAME strix-dispatch-resources-tests COMMAND strix-dispatch-resources-tests)
+
+    add_executable(strix-launch-dispatch-tests tests/launch_dispatch_tests.cpp)
+    target_link_libraries(strix-launch-dispatch-tests PRIVATE strix_core)
+    strix_target_warnings(strix-launch-dispatch-tests)
+    add_test(NAME strix-launch-dispatch-tests COMMAND strix-launch-dispatch-tests)
+
+    add_executable(strix-runtime-launchers-tests tests/runtime_launchers_tests.cpp)
+    target_link_libraries(strix-runtime-launchers-tests PRIVATE strix_core)
+    strix_target_warnings(strix-runtime-launchers-tests)
+    add_test(NAME strix-runtime-launchers-tests COMMAND strix-runtime-launchers-tests)
 
     add_executable(strix-compiled-execution-tests tests/compiled_execution_tests.cpp)
     target_link_libraries(strix-compiled-execution-tests PRIVATE strix_core)
