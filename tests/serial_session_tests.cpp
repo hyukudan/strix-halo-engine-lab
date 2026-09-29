@@ -210,9 +210,27 @@ int main() {
                    before_failure.state.generations &&
                session.state.valid ==
                    before_failure.state.valid,
-           "failed serial token publishes no session metadata");
+           "failed serial token does not publish committed metadata");
+    expect(session.health ==
+               strix::SerialSessionHealth::poisoned,
+           "mid-execution failure poisons the session until recovery");
 
-    auto wrong_identity = session;
+    bool poisoned_rejected = false;
+    try {
+        SessionDispatcher unused;
+        static_cast<void>(
+            strix::execute_serial_token(
+                compiled,
+                session,
+                1,
+                unused));
+    } catch (const std::logic_error&) {
+        poisoned_rejected = true;
+    }
+    expect(poisoned_rejected,
+           "poisoned session cannot continue decoding");
+
+    auto wrong_identity = before_failure;
     ++wrong_identity.execution_identity;
     bool identity_rejected = false;
     try {
@@ -235,7 +253,7 @@ int main() {
         static_cast<void>(
             strix::execute_serial_token(
                 compiled,
-                session,
+                before_failure,
                 static_cast<std::uint32_t>(
                     compiled.vocab_size),
                 unused));
@@ -245,7 +263,7 @@ int main() {
     expect(token_rejected,
            "out-of-vocabulary input token is rejected before dispatch");
 
-    auto full_context = session;
+    auto full_context = before_failure;
     full_context.next_position =
         compiled.max_position_embeddings;
     bool context_rejected = false;
