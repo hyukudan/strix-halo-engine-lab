@@ -5,6 +5,107 @@
 
 namespace strix {
 
+
+EagerExecutionResult execute_serial_token(
+    const CompiledSerialExecution& compiled,
+    SerialSessionContext& session,
+    const ExecutionRuntimeResources& resources,
+    std::uint32_t input_token_id,
+    EagerExecutionDispatcher& dispatcher) {
+    validate_execution_runtime_resources(
+        compiled.execution_identity,
+        compiled.arena,
+        resources,
+        session.next_position);
+
+    const auto identities =
+        build_runtime_execution_identities(
+            compiled.execution_identity,
+            compiled.arena,
+            resources);
+
+    if (session.runtime_compatibility_identity == 0 ||
+        session.runtime_compatibility_identity !=
+            identities.compatibility_identity) {
+        throw std::invalid_argument(
+            "serial session runtime compatibility identity does not match resources");
+    }
+    if (session.state_layout_identity == 0 ||
+        session.state_layout_identity !=
+            resources.session_state_layout->layout_identity) {
+        throw std::invalid_argument(
+            "serial session state-layout identity does not match resources");
+    }
+    if (session.health != SerialSessionHealth::ready) {
+        throw std::logic_error(
+            "serial session is poisoned and requires recovery");
+    }
+    if (compiled.logical_rows != 1 ||
+        compiled.request_concurrency != 1) {
+        throw std::invalid_argument(
+            "serial token execution requires a compiled C1 one-row plan");
+    }
+    if (compiled.execution_identity == 0 ||
+        session.execution_identity !=
+            compiled.execution_identity) {
+        throw std::invalid_argument(
+            "serial session execution identity does not match compiled plan");
+    }
+    if (compiled.vocab_size == 0 ||
+        static_cast<std::uint64_t>(input_token_id) >=
+            compiled.vocab_size) {
+        throw std::invalid_argument(
+            "serial input token is outside compiled vocabulary");
+    }
+    if (session.next_position >=
+            compiled.max_position_embeddings ||
+        session.next_position >=
+            resources.session_state_layout->context_tokens) {
+        throw std::out_of_range(
+            "serial session reached allocated context capacity");
+    }
+    if (session.committed_tokens ==
+        std::numeric_limits<std::uint64_t>::max()) {
+        throw std::overflow_error(
+            "serial committed-token counter overflow");
+    }
+
+    EagerExecutionRequest request;
+    request.logical_rows = 1;
+    request.request_concurrency = 1;
+    request.input_token_id = input_token_id;
+    request.position = session.next_position;
+    request.state = session.state;
+
+    validate_eager_execution_preflight(
+        compiled.execution,
+        compiled.bindings,
+        compiled.io,
+        compiled.arena,
+        request,
+        resources.session_state_layout,
+        resources.session_state_memory);
+
+    EagerExecutionResult result;
+    try {
+        result =
+            execute_compiled_serial_eager(
+                compiled,
+                resources,
+                request,
+                dispatcher);
+    } catch (...) {
+        session.health =
+            SerialSessionHealth::poisoned;
+        throw;
+    }
+
+    session.state = result.state;
+    ++session.next_position;
+    ++session.committed_tokens;
+    return result;
+}
+
 EagerExecutionResult execute_serial_token(
     const CompiledSerialExecution& compiled,
     SerialSessionContext& session,
@@ -13,6 +114,11 @@ EagerExecutionResult execute_serial_token(
     const SessionStateMemoryBinding& session_state_memory,
     std::uint32_t input_token_id,
     EagerExecutionDispatcher& dispatcher) {
+    if (session.runtime_compatibility_identity != 0) {
+        throw std::invalid_argument(
+            "model-bound serial session requires complete runtime resources");
+    }
+
     validate_execution_memory_binding(
         compiled.execution_identity,
         compiled.arena,
