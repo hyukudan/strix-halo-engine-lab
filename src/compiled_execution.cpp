@@ -113,6 +113,14 @@ std::uint64_t build_execution_identity(
 
     hash_u64(hash, compiled.arena.alignment);
     hash_u64(hash, compiled.arena.total_bytes);
+    for (const auto& allocation : compiled.arena.allocations) {
+        hash_buffer_use(hash, allocation.use);
+        hash_u64(hash, allocation.first_step);
+        hash_u64(hash, allocation.last_step);
+        hash_u64(hash, allocation.offset);
+        hash_u64(hash, allocation.bytes);
+    }
+    hash_u64(hash, 0xfffffffffffffffcULL);
 
     for (const auto& step :
          compiled.execution.steps) {
