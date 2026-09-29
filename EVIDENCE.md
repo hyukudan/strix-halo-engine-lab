@@ -46,6 +46,8 @@ permitidos son: **observado**, **publicado**, **inferido**, **hipótesis** y
 
 | E-035 | publicado + observado | La revisión fijada de GGML define IQ4_XS como bloques de 256 elementos y 136 bytes: escala FP16 global, 8 escalas locales de 6 bits y 128 bytes de códigos de 4 bits contra una tabla no lineal de 16 valores. El core ya tiene un contrato de bytes y fixture independiente que cubre escalas positivas, negativas y cero. | `ggml-org/llama.cpp@8019dc563b1ecbae6b161a70c3a1359f1b206c1e`; `include/strix/iq4_xs.hpp`; `src/iq4_xs.cpp`; `tests/iq4_xs_tests.cpp`. | IQ4_XS puede pasar a kernel experimental A1.1 sin copiar una implementación backend y sin cerrar todavía P-002. |
 
+| E-036 | publicado + observado | La revisión fijada de Transformers define assisted greedy verification como aceptación del prefijo candidato contiguo igual al `argmax` del target, seguido de un token bonus del target; tras EOS/longitud recompone `n_matches = valid_tokens - 1` y recorta `candidate_length - n_matches` posiciones de cache. La misma revisión define sampled speculative con ratio `p/q` y fallback `[p-q]+`, pero su replay exacto depende del RNG. | `huggingface/transformers@ebd5de00b43e94cae2da6d7aeb5a76ecdda51dae`, `generation/utils.py`, `generation/candidate_generator.py`; `include/strix/speculation.hpp`; `tests/speculation_tests.cpp`. | Cerrar aceptación MTP greedy; mantener sampled bloqueado hasta fijar stream/consumo RNG. |
+
 ## Regla para nuevas entradas
 
 Cada evidencia nueva debe incluir identidad del artefacto, comando o prueba,
