@@ -278,13 +278,22 @@ endif()
 
 
 if(STRIX_ENABLE_HIP_RUNTIME)
+    enable_language(HIP)
     find_package(hip REQUIRED CONFIG)
 
     add_library(strix_hip_runtime STATIC
         src/hip_runtime_allocator.cpp
+        src/hip_runtime_launchers.hip
     )
     target_include_directories(strix_hip_runtime PUBLIC include)
     target_compile_features(strix_hip_runtime PUBLIC cxx_std_20)
+    set_target_properties(
+        strix_hip_runtime
+        PROPERTIES
+        HIP_STANDARD 20
+        HIP_STANDARD_REQUIRED ON
+        HIP_ARCHITECTURES gfx1151
+    )
     target_link_libraries(strix_hip_runtime PUBLIC strix_core hip::host)
     strix_target_warnings(strix_hip_runtime)
 
@@ -297,4 +306,29 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         PRIVATE strix_hip_runtime
     )
     strix_target_warnings(strix-hip-runtime-allocator)
+
+    if(BUILD_TESTING)
+        add_executable(
+            strix-hip-runtime-launchers-tests
+            tests/hip_runtime_launchers_tests.hip
+        )
+        set_target_properties(
+            strix-hip-runtime-launchers-tests
+            PROPERTIES
+            HIP_STANDARD 20
+            HIP_STANDARD_REQUIRED ON
+            HIP_ARCHITECTURES gfx1151
+        )
+        target_link_libraries(
+            strix-hip-runtime-launchers-tests
+            PRIVATE strix_hip_runtime
+        )
+        strix_target_warnings(
+            strix-hip-runtime-launchers-tests
+        )
+        add_test(
+            NAME strix-hip-runtime-launchers-tests
+            COMMAND strix-hip-runtime-launchers-tests
+        )
+    endif()
 endif()
