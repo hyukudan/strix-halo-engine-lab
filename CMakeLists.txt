@@ -21,6 +21,7 @@ endfunction()
 add_library(strix_core STATIC
     src/gguf_reader.cpp
     src/kernel_registry.cpp
+    src/iq4_xs.cpp
     src/memory_plan.cpp
     src/model_contract.cpp
     src/model_manifest.cpp
@@ -75,6 +76,11 @@ if(BUILD_TESTING)
     target_link_libraries(strix-packed-projection-tests PRIVATE strix_core)
     strix_target_warnings(strix-packed-projection-tests)
     add_test(NAME strix-packed-projection-tests COMMAND strix-packed-projection-tests)
+
+    add_executable(strix-iq4-xs-tests tests/iq4_xs_tests.cpp)
+    target_link_libraries(strix-iq4-xs-tests PRIVATE strix_core)
+    strix_target_warnings(strix-iq4-xs-tests)
+    add_test(NAME strix-iq4-xs-tests COMMAND strix-iq4-xs-tests)
 
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
