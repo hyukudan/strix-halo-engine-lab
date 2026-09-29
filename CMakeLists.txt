@@ -38,6 +38,7 @@ add_library(strix_core STATIC
     src/packed_projection.cpp
     src/recurrent_plan.cpp
     src/serial_session.cpp
+    src/session_state_layout.cpp
     src/sparse_lookup.cpp
     src/speculation.cpp
     src/speculation_controller.cpp
@@ -155,6 +156,11 @@ if(BUILD_TESTING)
     target_link_libraries(strix-serial-session-tests PRIVATE strix_core)
     strix_target_warnings(strix-serial-session-tests)
     add_test(NAME strix-serial-session-tests COMMAND strix-serial-session-tests)
+
+    add_executable(strix-session-state-layout-tests tests/session_state_layout_tests.cpp)
+    target_link_libraries(strix-session-state-layout-tests PRIVATE strix_core)
+    strix_target_warnings(strix-session-state-layout-tests)
+    add_test(NAME strix-session-state-layout-tests COMMAND strix-session-state-layout-tests)
 
     add_executable(strix-speculation-tests tests/speculation_tests.cpp)
     target_link_libraries(strix-speculation-tests PRIVATE strix_core)
