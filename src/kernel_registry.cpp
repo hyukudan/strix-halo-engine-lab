@@ -1,7 +1,6 @@
 #include "strix/kernel_registry.hpp"
 
 #include <algorithm>
-#include <bit>
 #include <cmath>
 #include <limits>
 #include <stdexcept>
@@ -63,7 +62,9 @@ bool valid_variant(const KernelVariant& variant) noexcept {
         variant.input_layout.empty() || variant.output_layout.empty() ||
         variant.compiler_identity.empty() ||
         !std::isfinite(variant.measured_seconds) ||
-        variant.measured_seconds < 0.0) {
+        variant.measured_seconds < 0.0 ||
+        (qualification_rank(variant.qualification) >= 2 &&
+         variant.measured_seconds <= 0.0)) {
         return false;
     }
 
@@ -178,7 +179,14 @@ std::uint64_t plan_identity(
         hash_u64(hash, variant->shape.auxiliary_size);
         hash_u64(hash, static_cast<std::uint64_t>(variant->wave));
         hash_bytes(hash, variant->compiler_identity);
-        hash_u64(hash, std::bit_cast<std::uint64_t>(variant->measured_seconds));
+        hash_bytes(hash, variant->input_layout);
+        hash_bytes(hash, variant->output_layout);
+        hash_bytes(hash, variant->numerics.input_precision);
+        hash_bytes(hash, variant->numerics.accumulator_precision);
+        hash_bytes(hash, variant->numerics.output_precision);
+        hash_u64(hash, variant->numerics.row_invariant ? 1ULL : 0ULL);
+        hash_u64(hash, variant->numerics.deterministic ? 1ULL : 0ULL);
+        hash_u64(hash, variant->graph_safe ? 1ULL : 0ULL);
     }
     return hash;
 }
