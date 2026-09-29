@@ -100,6 +100,21 @@ struct Region {
     int fd = -1;
     bool registered = false;
 
+    Region() = default;
+    Region(const Region&) = delete;
+    Region& operator=(const Region&) = delete;
+
+    Region(Region&& other) noexcept
+        : address(other.address), bytes(other.bytes), fd(other.fd),
+          registered(other.registered) {
+        other.address = MAP_FAILED;
+        other.bytes = 0;
+        other.fd = -1;
+        other.registered = false;
+    }
+
+    Region& operator=(Region&&) = delete;
+
     ~Region() {
         if (registered) {
             hipHostUnregister(address);
@@ -225,6 +240,13 @@ int main(int argc, char** argv) try {
     check(hipEventSynchronize(end), "sync mapped write");
     const auto direct_write_s = elapsed_seconds(begin, end);
 
+    const auto* written_words = static_cast<const std::uint32_t*>(host.address);
+    const auto last_word = static_cast<std::size_t>(count - 1);
+    const bool mapped_write_visible =
+        written_words[0] == 0xA5A55A5AU &&
+        written_words[last_word / 2] == 0xA5A55A5AU &&
+        written_words[last_word] == 0xA5A55A5AU;
+
     check(hipEventRecord(begin), "record h2d begin");
     check(hipMemcpyAsync(staging, host.address, static_cast<std::size_t>(host.bytes),
                          hipMemcpyHostToDevice, nullptr), "hipMemcpyAsync h2d");
@@ -239,8 +261,6 @@ int main(int argc, char** argv) try {
     check(hipEventSynchronize(end), "sync d2h");
     const auto d2h_s = elapsed_seconds(begin, end);
 
-    const auto* words = static_cast<const std::uint32_t*>(host.address);
-    const bool write_visible = words[0] == 0xA5A55A5AU || d2h_s >= 0.0;
     unsigned long long checksum = 0;
     for (const auto value : host_sums) checksum += value;
 
