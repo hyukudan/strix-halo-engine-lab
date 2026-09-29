@@ -42,6 +42,7 @@ add_library(strix_core STATIC
     src/oracles.cpp
     src/packed_projection.cpp
     src/recurrent_plan.cpp
+    src/runtime_allocator.cpp
     src/serial_session.cpp
     src/session_state_layout.cpp
     src/session_state_memory.cpp
@@ -209,6 +210,11 @@ if(BUILD_TESTING)
     target_link_libraries(strix-session-restore-tests PRIVATE strix_core)
     strix_target_warnings(strix-session-restore-tests)
     add_test(NAME strix-session-restore-tests COMMAND strix-session-restore-tests)
+
+    add_executable(strix-runtime-allocator-tests tests/runtime_allocator_tests.cpp)
+    target_link_libraries(strix-runtime-allocator-tests PRIVATE strix_core)
+    strix_target_warnings(strix-runtime-allocator-tests)
+    add_test(NAME strix-runtime-allocator-tests COMMAND strix-runtime-allocator-tests)
 
     add_executable(strix-speculation-tests tests/speculation_tests.cpp)
     target_link_libraries(strix-speculation-tests PRIVATE strix_core)
