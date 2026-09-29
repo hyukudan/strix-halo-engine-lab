@@ -212,7 +212,7 @@ Full snapshots, pre-window snapshot plus replay, and sparse-checkpoint replay ha
 
 Status: **route planner and HIP routing baseline implemented; expert execution pending**.
 
-The host planner now measures touched-expert union, assignments per expert, adjacent-row route overlap, and an upper bound on packed expert-weight traffic saved by grouping. The semantic oracle covers FP32 softmax, no-tie top-k and selected-weight renormalization. A standalone HIP baseline routes explicit 1/2/4/8-row classes and reports route latency, index agreement, weight error, expert union and resource metadata. Cutoff-tie semantics remain intentionally unresolved until a canonical contract is fixed.
+The host planner now measures touched-expert union, assignments per expert, adjacent-row route overlap, and an upper bound on packed expert-weight traffic saved by grouping. It also emits a deterministic CSR-style expert grouping plan with expert offsets plus original row/top-k-slot identity for every assignment. The semantic oracle covers FP32 softmax, no-tie top-k and selected-weight renormalization. A standalone HIP baseline routes explicit 1/2/4/8-row classes and reports route latency, index agreement, weight error, expert union and resource metadata. Cutoff-tie semantics remain intentionally unresolved until a canonical contract is fixed.
 
 Implement and compare:
 
