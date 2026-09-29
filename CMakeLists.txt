@@ -292,6 +292,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         src/hip_launcher_catalog.cpp
         src/hip_runtime_launchers.hip
         src/hip_moe_route_launcher.hip
+        src/hip_moe_experts_launcher.hip
         src/hip_embedding_launcher.hip
         src/hip_hyper_mix_launcher.hip
         src/hip_lm_head_launcher.hip
