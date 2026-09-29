@@ -201,6 +201,12 @@ void validate_eager_execution_preflight(
                     "eager execution arena is missing a write generation");
             }
         }
+        for (const auto use : io.temporaries) {
+            if (find_arena_allocation(arena_plan, use) == nullptr) {
+                throw std::invalid_argument(
+                    "eager execution arena is missing a temporary generation");
+            }
+        }
     }
     if (bindings.missing_steps != 0) {
         throw std::invalid_argument(
@@ -342,6 +348,8 @@ EagerExecutionResult execute_serial_eager(
         context.layer = step.layer;
         context.reads = io.reads;
         context.writes = io.writes;
+        context.temporaries =
+            io.temporaries;
         context.arena = &arena_plan;
         context.memory = memory;
         context.session_state_layout = session_state_layout;
