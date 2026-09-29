@@ -13,3 +13,17 @@ else()
         -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror
     )
 endif()
+
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(strix-transport-tbstream tbstream_baseline.cpp)
+    target_compile_features(strix-transport-tbstream PRIVATE cxx_std_20)
+    if(MSVC)
+        target_compile_options(strix-transport-tbstream PRIVATE /W4 /WX)
+    else()
+        target_compile_options(
+            strix-transport-tbstream PRIVATE
+            -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror
+        )
+    endif()
+endif()
