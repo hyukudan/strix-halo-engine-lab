@@ -2,6 +2,7 @@
 
 #include "strix/hip_embedding_launcher.hpp"
 #include "strix/hip_hyper_mix_launcher.hpp"
+#include "strix/hip_lm_head_launcher.hpp"
 #include "strix/hip_moe_route_launcher.hpp"
 #include "strix/hip_runtime_launchers.hpp"
 #include "strix/launch_dispatch.hpp"
@@ -42,6 +43,7 @@ private:
     HipEmbeddingLauncherBundle embedding_;
     HipHyperMixLauncherBundle hyper_mix_;
     HipMoeRouteLauncherBundle moe_route_;
+    HipLmHeadLauncherBundle lm_head_;
 };
 
 }  // namespace strix
