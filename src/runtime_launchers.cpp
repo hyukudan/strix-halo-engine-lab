@@ -50,4 +50,11 @@ make_position_prepare_launcher() {
     };
 }
 
+void register_default_runtime_launchers(
+    ExecutionLauncherRegistry& registry) {
+    registry.add_runtime_launcher(
+        SerialOp::position_prepare,
+        make_position_prepare_launcher());
+}
+
 }  // namespace strix
