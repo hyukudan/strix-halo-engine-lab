@@ -105,6 +105,49 @@ Once dispatch begins, a device kernel may mutate persistent KV, recurrent or spa
 
 Position, committed-token counters and published generation metadata advance only after the complete serial DAG succeeds.
 
+
+## Runtime resource identities
+
+The execution plan identity and the loaded runtime identity are separate.
+
+A runtime execution binds three resource classes:
+
+- scratch arena;
+- persistent per-session state;
+- model tensors/weights.
+
+The model manifest layout identity describes tensor structure and placement. It MUST NOT be presented as a content hash.
+
+A separate model-content identity MUST be supplied by the loader after hashing all execution-relevant model files.
+
+Two derived identities serve different purposes:
+
+### Compatibility identity
+
+Includes:
+
+- compiled execution identity;
+- manifest layout identity;
+- model-content identity;
+- session-state layout identity.
+
+It excludes physical addresses.
+
+Snapshots and semantic replay compatibility SHOULD use this identity so relocation after restart does not invalidate otherwise compatible state.
+
+### Binding identity
+
+Extends the compatibility identity with:
+
+- scratch base address and allocation generation;
+- host/device session-state bases and allocation generations;
+- every local model-tensor address/allocation generation;
+- remote tensor ownership descriptors.
+
+Graph captures and any object containing baked pointers MUST use the binding identity.
+
+A physical relocation MUST invalidate binding identity without changing compatibility identity.
+
 ## Graph capture
 
 HIP graph capture SHOULD be used for stable decode and verification shapes when it measurably reduces launch overhead.
