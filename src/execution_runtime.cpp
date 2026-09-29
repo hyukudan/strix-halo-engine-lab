@@ -209,7 +209,8 @@ EagerExecutionResult execute_serial_eager(
     const SerialExecutionIoPlan& io_plan,
     const ExecutionArenaPlan& arena_plan,
     const EagerExecutionRequest& request,
-    EagerExecutionDispatcher& dispatcher) {
+    EagerExecutionDispatcher& dispatcher,
+    const ExecutionMemoryBinding* memory) {
     validate_eager_execution_preflight(
         plan, bindings, io_plan, arena_plan, request);
 
@@ -245,6 +246,7 @@ EagerExecutionResult execute_serial_eager(
         context.reads = io.reads;
         context.writes = io.writes;
         context.arena = &arena_plan;
+        context.memory = memory;
         context.reads_state = step.reads_state;
         context.writes_state = step.writes_state;
         context.logical_rows = request.logical_rows;
