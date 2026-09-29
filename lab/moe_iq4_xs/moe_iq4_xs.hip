@@ -207,7 +207,7 @@ std::vector<IQ4XSBlock> make_expert_weights(
          block_index < weights.size(); ++block_index) {
         auto& block = weights[block_index];
         block.d = __float2half(
-            0.0002F *
+            0.00001F *
             static_cast<float>(((block_index + salt) % 7U) + 1U));
         block.scales_h = 0;
         for (auto& value : block.scales_l) {
@@ -663,6 +663,7 @@ double benchmark_batches(
                 batch, hidden, rows, route_weights, gate_up, down,
                 gate_up_temp, intermediate_temp, output, nullptr);
         }
+        check(hipGetLastError(), "packed MoE batch launch");
     }
     check(hipEventRecord(end), "hipEventRecord end");
     check(hipEventSynchronize(end), "hipEventSynchronize end");
@@ -800,6 +801,7 @@ int main(int argc, char** argv) try {
             d_gate_up, d_down, d_gate_up_temp, d_intermediate_temp,
             d_output, nullptr);
     }
+    check(hipGetLastError(), "direct packed MoE launch");
     check(hipDeviceSynchronize(), "direct sync");
 
     std::vector<float> direct_output(reference.size());
@@ -826,6 +828,7 @@ int main(int argc, char** argv) try {
             d_gate_up, d_down, d_gate_up_temp, d_intermediate_temp,
             d_output, nullptr);
     }
+    check(hipGetLastError(), "grouped packed MoE launch");
     check(hipDeviceSynchronize(), "grouped sync");
 
     std::vector<float> grouped_output(reference.size());
