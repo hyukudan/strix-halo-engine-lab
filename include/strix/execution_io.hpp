@@ -15,6 +15,7 @@ enum class ExecutionBufferClass {
     route_indices,
     route_weights,
     logits,
+    mlp_intermediate,
 };
 
 struct ExecutionBufferRef {
@@ -41,6 +42,7 @@ struct ExecutionStepIo {
     SerialOp op = SerialOp::token_embedding;
     std::vector<ExecutionBufferUse> reads;
     std::vector<ExecutionBufferUse> writes;
+    std::vector<ExecutionBufferUse> temporaries;
 };
 
 struct SerialExecutionIoPlan {
@@ -51,6 +53,7 @@ struct SerialExecutionIoPlan {
     std::uint32_t route_index_slots = 0;
     std::uint32_t route_weight_slots = 0;
     std::uint32_t logits_slots = 0;
+    std::uint32_t mlp_intermediate_slots = 0;
 };
 
 [[nodiscard]] SerialExecutionIoPlan build_serial_execution_io_plan(
