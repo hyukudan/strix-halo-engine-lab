@@ -37,6 +37,29 @@ struct RecordingDispatcher final
                "kernel dispatch carries a kernel id");
         expect(context.arena != nullptr,
                "dispatch context exposes its arena plan");
+
+        if (context.op ==
+                strix::SerialOp::shared_expert ||
+            context.op ==
+                strix::SerialOp::moe_experts) {
+            expect(
+                context.temporaries.size() == 1 &&
+                    context.temporaries[0].buffer.buffer_class ==
+                        strix::ExecutionBufferClass::mlp_intermediate,
+                "dispatch context exposes step-local temporaries");
+            if (context.arena != nullptr) {
+                const auto* temporary =
+                    strix::find_arena_allocation(
+                        *context.arena,
+                        context.temporaries[0]);
+                expect(
+                    temporary != nullptr &&
+                        temporary->first_step ==
+                            temporary->last_step,
+                    "dispatch temporary resolves one-step arena lifetime");
+            }
+        }
+
         if (context.op == strix::SerialOp::lm_head) {
             expect(context.reads.size() == 1 &&
                        context.writes.size() == 1 &&
