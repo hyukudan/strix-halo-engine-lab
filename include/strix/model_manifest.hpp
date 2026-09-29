@@ -55,6 +55,7 @@ struct ManifestTensor {
 
 struct ModelManifest {
     std::string architecture;
+    std::uint64_t layout_identity = 0;
     std::uint64_t total_tensor_bytes = 0;
     std::uint64_t file_backed_candidate_bytes = 0;
     std::uint64_t bounded_cache_candidate_bytes = 0;
@@ -67,6 +68,8 @@ struct ModelManifest {
 [[nodiscard]] std::string_view to_string(TensorRole role) noexcept;
 [[nodiscard]] std::string_view to_string(ResidencyPolicy policy) noexcept;
 [[nodiscard]] std::string_view to_string(PlacementKind kind) noexcept;
+[[nodiscard]] std::uint64_t model_manifest_layout_identity(
+    const ModelManifest& manifest) noexcept;
 [[nodiscard]] ModelManifest build_model_manifest(const gguf::FileInfo& info);
 
 }  // namespace strix
