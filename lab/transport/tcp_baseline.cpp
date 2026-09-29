@@ -14,6 +14,7 @@
 #include <limits>
 #include <netdb.h>
 #include <netinet/tcp.h>
+#include <numeric>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -409,6 +410,10 @@ ClientOptions parse_client(int argc, char** argv) {
     if (options.bytes == 0 || options.iterations == 0) {
         throw std::invalid_argument("bytes and iterations must be non-zero");
     }
+    if (options.bytes >
+        static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
+        throw std::invalid_argument("payload does not fit this host");
+    }
     return options;
 }
 
@@ -491,7 +496,6 @@ void run_client(const ClientOptions& options) {
     measured.reserve(static_cast<std::size_t>(options.iterations));
 
     const auto total_iterations = options.warmup + options.iterations;
-    const auto measured_start = std::chrono::steady_clock::now();
 
     for (std::uint64_t iteration = 0; iteration < total_iterations; ++iteration) {
         const auto sequence = iteration + 1;
@@ -527,12 +531,11 @@ void run_client(const ClientOptions& options) {
         }
     }
 
-    const auto measured_stop = std::chrono::steady_clock::now();
     const auto stop = encode(WireKind::stop, total_iterations + 1, 0, 0);
     send_all(peer.fd, &stop, sizeof(stop));
 
     const auto total_seconds =
-        std::chrono::duration<double>(measured_stop - measured_start).count();
+        std::accumulate(measured.begin(), measured.end(), 0.0);
     const auto direction_multiplier =
         options.mode == WireKind::ping ? std::uint64_t{2} : std::uint64_t{1};
     const long double total_payload =
