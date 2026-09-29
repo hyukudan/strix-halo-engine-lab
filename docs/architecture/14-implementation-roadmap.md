@@ -108,9 +108,9 @@ Default residency policies are selected from real Strix Halo measurements.
 
 ### A0.7 — Transport micro-lab
 
-Status: **transport core and TCP baseline harness implemented; physical-link qualification pending**.
+Status: **transport core, TCP baseline and direct-stream harness implemented; physical-link qualification pending**.
 
-The core now defines explicit buffer ownership transitions, bounded transfer descriptors with connection epochs, measured link profiles, single-link cost estimation and a dual-link scheduler that only stripes links already qualified as independent. A standalone TCP ping-pong/stream harness now provides the reproducible network-stack baseline. Direct USB4 streaming, dual-link host measurements and transport-buffer capability tiers remain pending.
+The core now defines explicit buffer ownership transitions, bounded transfer descriptors with connection epochs, measured link profiles, single-link cost estimation and a dual-link scheduler that only stripes links already qualified as independent. A standalone TCP ping-pong/stream harness provides the network-stack baseline, and a direct-stream harness now exercises configured USB4 character devices through the documented read/write interface while recording configfs tuning state. Real host-to-host qualification, dual-link measurements and higher transport-buffer capability tiers remain pending.
 
 Build the transport abstraction before distributed model execution.
 
