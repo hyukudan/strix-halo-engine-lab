@@ -432,8 +432,9 @@ int main() {
     strix::ModelRuntimeBinding model_weights;
     model_weights.manifest_layout_identity =
         manifest.layout_identity;
-    model_weights.model_content_identity =
-        0xfeedbeefULL;
+    model_weights.model_content_identity.bytes[0] =
+        static_cast<std::uint8_t>(0xfeedbeefULL & 0xffULL);
+    model_weights.model_content_identity.bytes[1] = 0x5a;
     model_weights.tensors.push_back(
         {
             0,
@@ -489,7 +490,7 @@ int main() {
            "model-bound session executes with complete runtime resources");
 
     auto changed_weights = model_weights;
-    ++changed_weights.model_content_identity;
+    ++changed_weights.model_content_identity.bytes[0];
     auto changed_resources = resources;
     changed_resources.model_weights =
         &changed_weights;
