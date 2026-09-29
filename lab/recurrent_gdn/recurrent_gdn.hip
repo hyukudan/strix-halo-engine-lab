@@ -89,6 +89,7 @@ void gdn_window_kernel(
     const float* __restrict__ value,
     const float* __restrict__ decay,
     const float* __restrict__ beta,
+    int heads,
     float* __restrict__ state,
     float* __restrict__ output) {
     const int lane = static_cast<int>(threadIdx.x);
@@ -112,13 +113,13 @@ void gdn_window_kernel(
     #pragma unroll
     for (int token = 0; token < Tokens; ++token) {
         const float d = decay[static_cast<std::size_t>(token) *
-                              gridDim.y + head];
+                              heads + head];
         const float b = beta[static_cast<std::size_t>(token) *
-                             gridDim.y + head];
+                             heads + head];
         const float k = key[(static_cast<std::size_t>(token) *
-                             gridDim.y + head) * kKeyDim + lane];
+                             heads + head) * kKeyDim + lane];
         const float q = query[(static_cast<std::size_t>(token) *
-                               gridDim.y + head) * kKeyDim + lane];
+                               heads + head) * kKeyDim + lane];
 
         #pragma unroll
         for (int column = 0; column < kValueTile; ++column) {
@@ -145,7 +146,7 @@ void gdn_window_kernel(
                 const int value_index = value_base + column;
                 const float target =
                     value[(static_cast<std::size_t>(token) *
-                           gridDim.y + head) * kValueDim + value_index];
+                           heads + head) * kValueDim + value_index];
                 delta[column] =
                     (target - reduction[column]) * b;
                 reduction[column] = delta[column];
@@ -177,7 +178,7 @@ void gdn_window_kernel(
             for (int column = 0; column < kValueTile; ++column) {
                 const int value_index = value_base + column;
                 output[(static_cast<std::size_t>(token) *
-                        gridDim.y + head) * kValueDim + value_index] =
+                        heads + head) * kValueDim + value_index] =
                     reduction[column];
             }
         }
@@ -253,12 +254,6 @@ void launch_window(
     float* state,
     float* output,
     hipStream_t stream) {
-    const dim3 grid(static_cast<unsigned>(heads * kTiles),
-                    static_cast<unsigned>(heads), 1U);
-    // blockIdx.x already encodes head+tile. grid.y is used only as head count
-    // inside indexing, so launch one y-plane and pass head count separately is
-    // preferable. Keep y=heads here solely to expose it through gridDim.y.
-    // Only blockIdx.y==0 blocks should execute.
     const dim3 launch_grid(static_cast<unsigned>(heads * kTiles), 1U, 1U);
     hipLaunchKernelGGL(
         HIP_KERNEL_NAME(gdn_window_kernel<Tokens>),
@@ -266,7 +261,7 @@ void launch_window(
         dim3(kThreads),
         0,
         stream,
-        query, key, value, decay, beta, state, output);
+        query, key, value, decay, beta, heads, state, output);
 }
 
 template <int Tokens>
@@ -413,14 +408,18 @@ int main(int argc, char** argv) try {
     std::vector<float> beta(scalar_elements);
 
     for (std::size_t i = 0; i < initial_state.size(); ++i) {
-        initial_state[i] = static_cast<float>((i % 37U) - 18U) * 0.0005F;
+        initial_state[i] =
+            static_cast<float>(static_cast<int>(i % 37U) - 18) * 0.0005F;
     }
     for (std::size_t i = 0; i < query.size(); ++i) {
-        query[i] = static_cast<float>((i % 17U) - 8U) * 0.01F;
-        key[i] = static_cast<float>((i % 13U) - 6U) * 0.01F;
+        query[i] =
+            static_cast<float>(static_cast<int>(i % 17U) - 8) * 0.01F;
+        key[i] =
+            static_cast<float>(static_cast<int>(i % 13U) - 6) * 0.01F;
     }
     for (std::size_t i = 0; i < value.size(); ++i) {
-        value[i] = static_cast<float>((i % 29U) - 14U) * 0.02F;
+        value[i] =
+            static_cast<float>(static_cast<int>(i % 29U) - 14) * 0.02F;
     }
     for (std::size_t i = 0; i < scalar_elements; ++i) {
         decay[i] = 0.97F - static_cast<float>(i % 3U) * 0.01F;
