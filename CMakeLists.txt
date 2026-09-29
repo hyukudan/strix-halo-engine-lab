@@ -27,6 +27,7 @@ add_library(strix_core STATIC
     src/model_manifest.cpp
     src/oracles.cpp
     src/packed_projection.cpp
+    src/recurrent_plan.cpp
     src/platform_probe.cpp
     src/transport.cpp
 )
@@ -81,6 +82,11 @@ if(BUILD_TESTING)
     target_link_libraries(strix-iq4-xs-tests PRIVATE strix_core)
     strix_target_warnings(strix-iq4-xs-tests)
     add_test(NAME strix-iq4-xs-tests COMMAND strix-iq4-xs-tests)
+
+    add_executable(strix-recurrent-plan-tests tests/recurrent_plan_tests.cpp)
+    target_link_libraries(strix-recurrent-plan-tests PRIVATE strix_core)
+    strix_target_warnings(strix-recurrent-plan-tests)
+    add_test(NAME strix-recurrent-plan-tests COMMAND strix-recurrent-plan-tests)
 
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
