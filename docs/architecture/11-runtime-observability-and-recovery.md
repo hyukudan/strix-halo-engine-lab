@@ -61,6 +61,31 @@ For every physical and logical link:
 
 When two links connect the same node pair, telemetry MUST keep them independently visible.
 
+
+## Transport telemetry
+
+For every physical and logical link the runtime SHOULD expose:
+
+- peer node;
+- physical port and host-router identity;
+- negotiated link rate;
+- health state;
+- bytes sent and received;
+- current in-flight bytes;
+- completions;
+- errors and retries;
+- recent payload bandwidth;
+- p50/p95/p99 transfer latency;
+- interrupt rate;
+- active copy, staging or mapped-buffer mode;
+- current scheduler role.
+
+When two physical links connect the same node pair, telemetry MUST keep them independently visible.
+
+A failed secondary link SHOULD be isolated without terminating the node when the active placement can continue correctly over another qualified path.
+
+If transport generation, completion or ownership state is uncertain after a failure, affected in-flight tensors MUST be discarded rather than reused.
+
 ## Structured logs
 
 Critical events MUST be structured and include:
