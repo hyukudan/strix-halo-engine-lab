@@ -6,6 +6,8 @@ The first production target is AMD Strix Halo on Linux, compiled specifically fo
 
 Portability is secondary to extracting the best behavior from this memory and execution architecture.
 
+The single-node path is the first qualification target, but the architecture MUST preserve a clean path to multi-node execution across direct high-speed host links.
+
 ## Platform assumptions
 
 The design assumes:
@@ -14,7 +16,8 @@ The design assumes:
 - GPU-visible memory is limited by mapping policy as well as physical RAM;
 - host activity, page cache, GPU allocations, registered memory and file-backed mappings all compete for the same physical capacity;
 - CPU-to-GPU copies are not automatically useful merely because conventional discrete-GPU runtimes use them;
-- low concurrency and decode-heavy workloads are first-class use cases.
+- low concurrency and decode-heavy workloads are first-class use cases;
+- many Strix Halo systems expose two native USB4 links that can potentially be used independently or together for direct node-to-node transport.
 
 ## Required consequences
 
@@ -22,9 +25,9 @@ The design assumes:
 
 The primary runtime MUST be Linux-native.
 
-Subsystems that depend on GPU memory registration, page residency, huge pages, NUMA behavior, kernel parameters, power state, or device telemetry MUST be validated on the real native Linux host.
+Subsystems that depend on GPU memory registration, page residency, huge pages, NUMA behavior, kernel parameters, power state, device telemetry, or direct host-to-host transport MUST be validated on the real native Linux host.
 
-Virtualized environments MAY be used for host-only development, parsers, tests and cross-compilation, but MUST NOT qualify performance or residency behavior.
+Virtualized environments MAY be used for host-only development, parsers, tests and cross-compilation, but MUST NOT qualify performance, residency, or interconnect behavior.
 
 ### gfx1151 specialization
 
@@ -53,9 +56,23 @@ It MAY perform:
 - request scheduling;
 - tokenization and template work;
 - asynchronous I/O;
+- inter-node control and transport coordination;
 - background checkpoint persistence.
 
 CPU work MUST NOT create an unbounded dependency chain in the decode critical path.
+
+### Multi-node readiness
+
+The core executor MUST NOT depend on multi-node execution, but model partitioning, tensor ownership and scheduler interfaces SHOULD avoid assumptions that make a later two-node fast path invasive.
+
+Distributed execution MUST be an optional layer over the single-node engine.
+
+The initial interconnect target is direct USB4 between Strix Halo hosts. A transport abstraction MUST allow:
+
+- standard network transport as a baseline and control path;
+- direct USB4 streaming when supported by the host kernel;
+- one or more independent physical links;
+- future lower-latency transports without changing model semantics.
 
 ### NPU
 
@@ -70,6 +87,6 @@ The first architecture MUST NOT be distorted to support:
 - arbitrary GPU vendors;
 - generic graph execution frameworks;
 - arbitrary model architectures;
-- large distributed deployments.
+- datacenter-scale distributed fabrics.
 
-Those can be added only after the single-node Strix Halo fast path is mature.
+Small multi-node Strix Halo deployments are explicitly in scope, provided they remain optional and do not slow the single-node path.
