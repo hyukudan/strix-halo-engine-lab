@@ -36,6 +36,7 @@ add_library(strix_core STATIC
     src/oracles.cpp
     src/packed_projection.cpp
     src/recurrent_plan.cpp
+    src/serial_session.cpp
     src/sparse_lookup.cpp
     src/speculation.cpp
     src/speculation_controller.cpp
@@ -143,6 +144,11 @@ if(BUILD_TESTING)
     target_link_libraries(strix-compiled-execution-tests PRIVATE strix_core)
     strix_target_warnings(strix-compiled-execution-tests)
     add_test(NAME strix-compiled-execution-tests COMMAND strix-compiled-execution-tests)
+
+    add_executable(strix-serial-session-tests tests/serial_session_tests.cpp)
+    target_link_libraries(strix-serial-session-tests PRIVATE strix_core)
+    strix_target_warnings(strix-serial-session-tests)
+    add_test(NAME strix-serial-session-tests COMMAND strix-serial-session-tests)
 
     add_executable(strix-speculation-tests tests/speculation_tests.cpp)
     target_link_libraries(strix-speculation-tests PRIVATE strix_core)
