@@ -87,6 +87,24 @@ The loader MAY keep them file-backed and use bounded host-side row staging when:
 - keeping them resident would materially reduce context capacity;
 - I/O latency can be overlapped or bounded.
 
+## Placement
+
+Placement is explicit in the logical manifest from the first implementation.
+
+Every tensor MUST carry a placement record even when all tensors are local. The single-node default is local node zero.
+
+A future partitioner MAY change a tensor or operator group to a remote node, but storage format, logical role and numerical semantics MUST remain independent of transport choice.
+
+Placement metadata MUST NOT imply that a remote tensor can be accessed transparently. Remote execution requires an explicit execution boundary and transport plan.
+
+Residency and placement are separate decisions:
+
+- a local tensor can be resident or file-backed;
+- a remote tensor can be resident or file-backed on its owning node;
+- transport staging is not model residency.
+
+The initial manifest MUST remain conservative for memory accounting. A tensor is considered resident unless there is a specific, architecture-supported reason to classify it as a file-backed candidate.
+
 ## Integrity
 
 The runtime SHOULD support model identity based on hashes of all execution-relevant files.

@@ -44,6 +44,7 @@ Peak microbenchmark throughput is never sufficient by itself to justify a design
 - [10 — Benchmarking and qualification](architecture/10-benchmarking-and-qualification.md)
 - [11 — Runtime observability and recovery](architecture/11-runtime-observability-and-recovery.md)
 - [12 — Multi-node and USB4 interconnect](architecture/12-multi-node-and-usb4.md)
+- [13 — Platform discovery and capability negotiation](architecture/13-platform-discovery.md)
 
 ## Change rule
 

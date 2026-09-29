@@ -51,3 +51,45 @@ Validación actual:
 - fixtures válidos y corruptos en CTest;
 - build Debug con AddressSanitizer y UndefinedBehaviorSanitizer;
 - 100 % de las pruebas actuales superadas en ambos builds.
+
+
+## Slice A0.4 — model manifest
+
+Implemented:
+
+- logical tensor manifest derived from validated GGUF metadata;
+- conservative tensor-role classification;
+- per-tensor physical bytes and offsets;
+- layer extraction for common block naming;
+- explicit residency policy;
+- explicit placement with local node zero as the default;
+- n-gram/sparse-table storage can be marked as a file-backed candidate without changing admission semantics for ordinary weights;
+- JSON CLI `strix-model-manifest`;
+- dedicated unit tests.
+
+The manifest is intentionally conservative. Unknown tensors remain visible and resident by default. Complete architecture-specific tensor-name validation remains a later gate once the canonical development checkpoint is fixed.
+
+## Slice A0.5 — platform capability probe
+
+Implemented:
+
+- dependency-free Linux host probe;
+- physical RAM from `/proc/meminfo`;
+- KFD GPU topology and `gfx_target_version`;
+- derivation of `gfx1151` and compute-unit count when KFD exposes the required fields;
+- ROCm version-file and `hipcc` presence checks;
+- Thunderbolt/USB4 domains and host-router discovery from sysfs;
+- USB4STREAM driver and `/dev/tbstream*` discovery;
+- JSON CLI `strix-platform-probe`;
+- fake-sysfs unit test for deterministic host-independent validation.
+
+Not yet qualified on the target hardware:
+
+- real port-to-router mapping;
+- negotiated USB4 link rate;
+- simultaneous dual-link independence;
+- HIP runtime/device capabilities;
+- GTT/TTM effective mapping limits;
+- graph and library capability inventory.
+
+Those require native Linux measurements on the Strix Halo hosts.
