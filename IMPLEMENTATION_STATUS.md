@@ -264,6 +264,9 @@ Routing foundation implemented:
 - duplicate/out-of-range route validation;
 - dependency-free semantic oracle for FP32 softmax, no-tie top-k and selected-weight renormalization;
 - standalone `gfx1151` HIP routing baseline for 1/2/4/8 logical rows;
+- standalone FP32 expert-execution correctness harness;
+- direct assignment and expert-major grouped GPU schedules compared against the same CPU reference;
+- grouped schedule preserves original row restoration through explicit assignment metadata;
 - routing timing, exact-index agreement, weight error, expert-union and kernel-resource output.
 
 Still pending:
@@ -271,7 +274,7 @@ Still pending:
 - canonical top-k cutoff tie contract;
 - wave-parallel/hierarchical routing candidates;
 - fused touched-expert bitmap and route grouping metadata;
-- direct tiny-row expert path;
-- grouped expert execution;
+- packed direct tiny-row expert path;
+- packed grouped expert execution with real weight reuse;
 - shared-expert integration;
 - route-distribution qualification on the canonical checkpoint.
