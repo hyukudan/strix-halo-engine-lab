@@ -15,6 +15,10 @@ namespace strix {
     const ExecutionDispatchContext& context,
     std::size_t index);
 
+[[nodiscard]] ExecutionBufferAddress resolve_dispatch_temporary(
+    const ExecutionDispatchContext& context,
+    std::size_t index);
+
 [[nodiscard]] SessionStateAddress resolve_dispatch_state(
     const ExecutionDispatchContext& context,
     SessionStateComponent component);
