@@ -37,6 +37,10 @@ struct ExecutionTensorAccessPlan {
     std::vector<ExecutionTensorAccess> accesses;
 };
 
+[[nodiscard]] std::vector<ExecutionTensorRequirement>
+build_serial_execution_tensor_requirements(
+    const SerialExecutionPlan& execution_plan);
+
 [[nodiscard]] ExecutionTensorAccessPlan
 compile_execution_tensor_access_plan(
     const SerialExecutionPlan& execution_plan,
