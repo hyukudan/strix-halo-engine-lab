@@ -97,6 +97,7 @@ void PersistentStateGenerations::publish_write(
 void validate_eager_execution_preflight(
     const SerialExecutionPlan& plan,
     const ExecutionBindingPlan& bindings,
+    const SerialExecutionIoPlan& io_plan,
     const EagerExecutionRequest& request) {
     if (request.logical_rows == 0 ||
         request.request_concurrency == 0) {
@@ -108,6 +109,7 @@ void validate_eager_execution_preflight(
         throw std::invalid_argument(
             "binding count does not match serial execution plan");
     }
+    validate_serial_execution_io_plan(plan, io_plan);
     if (bindings.missing_steps != 0) {
         throw std::invalid_argument(
             "eager execution requires a fully bound plan");
@@ -185,10 +187,11 @@ void validate_eager_execution_preflight(
 EagerExecutionResult execute_serial_eager(
     const SerialExecutionPlan& plan,
     const ExecutionBindingPlan& bindings,
+    const SerialExecutionIoPlan& io_plan,
     const EagerExecutionRequest& request,
     EagerExecutionDispatcher& dispatcher) {
     validate_eager_execution_preflight(
-        plan, bindings, request);
+        plan, bindings, io_plan, request);
 
     EagerExecutionResult result;
     result.state = request.state;
@@ -212,11 +215,15 @@ EagerExecutionResult execute_serial_eager(
 
         const auto& binding =
             binding_for(bindings, step.id);
+        const auto& io =
+            io_plan.steps[step.id];
 
         ExecutionDispatchContext context;
         context.step_id = step.id;
         context.op = step.op;
         context.layer = step.layer;
+        context.reads = io.reads;
+        context.writes = io.writes;
         context.reads_state = step.reads_state;
         context.writes_state = step.writes_state;
         context.logical_rows = request.logical_rows;
