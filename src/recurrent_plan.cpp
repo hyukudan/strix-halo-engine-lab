@@ -1,5 +1,6 @@
 #include "strix/recurrent_plan.hpp"
 
+#include <initializer_list>
 #include <limits>
 #include <stdexcept>
 
