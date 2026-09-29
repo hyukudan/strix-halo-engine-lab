@@ -19,6 +19,15 @@ void hash_u64(
     }
 }
 
+void hash_content_identity(
+    std::uint64_t& hash,
+    const ModelContentIdentity& identity) noexcept {
+    for (const auto byte : identity.bytes) {
+        hash ^= static_cast<std::uint64_t>(byte);
+        hash *= fnv_prime;
+    }
+}
+
 void hash_ptr(
     std::uint64_t& hash,
     std::uintptr_t value) noexcept {
@@ -92,7 +101,7 @@ build_runtime_execution_identities(
     hash_u64(
         compatibility,
         resources.model_manifest->layout_identity);
-    hash_u64(
+    hash_content_identity(
         compatibility,
         resources.model_weights->model_content_identity);
     hash_u64(
