@@ -56,6 +56,10 @@ Next gate on native Strix Halo hardware:
 
 ### A0.6 — UMA residency lab
 
+Status: **harness implemented; native-hardware qualification pending**.
+
+The standalone lab contains a Linux host path for mmap, prefault, page-fault and access-pattern measurements, plus an optional HIP path for registered mapped memory versus explicit staging.
+
 Compare:
 
 - file mapping;
