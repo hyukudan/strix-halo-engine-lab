@@ -1,6 +1,8 @@
 #include "strix/execution_binding.hpp"
 
+#include <limits>
 #include <stdexcept>
+#include <utility>
 
 namespace strix {
 namespace {
@@ -114,6 +116,20 @@ ExecutionBindingPlan bind_serial_execution_plan(
         request.request_concurrency == 0) {
         throw std::invalid_argument(
             "execution binding rows and concurrency must be non-zero");
+    }
+
+    constexpr auto maximum_shape =
+        static_cast<std::uint64_t>(
+            std::numeric_limits<std::uint32_t>::max());
+    if (model.hidden_size > maximum_shape ||
+        model.gdn_value_head_dim > maximum_shape ||
+        model.head_dim > maximum_shape ||
+        model.num_experts > maximum_shape ||
+        model.moe_intermediate_size > maximum_shape ||
+        model.vocab_size > maximum_shape ||
+        model.hc_count > maximum_shape) {
+        throw std::overflow_error(
+            "execution binding dimensions exceed registry shape fields");
     }
 
     ExecutionBindingPlan output;
