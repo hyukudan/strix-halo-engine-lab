@@ -320,6 +320,10 @@ Still pending:
 Static execution planning implemented:
 
 - pinned serial-decode dependency DAG;
+- serial decode buffer-lifetime planner;
+- two hyper-expanded ping-pong buffers and three hidden-width MoE branch buffers modeled explicitly;
+- route metadata, injection controls and full-logit materialization accounted separately;
+- internal scratch peak separated from final hidden + logits peak;
 - exact 36 recurrent / 12 indexed-attention layer pattern;
 - exact single PLE placement at the pinned one-based layer;
 - explicit attention and MLP gated-residual boundaries;
