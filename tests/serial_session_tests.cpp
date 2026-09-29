@@ -230,6 +230,27 @@ int main() {
     expect(poisoned_rejected,
            "poisoned session cannot continue decoding");
 
+
+    auto missing_state = before_failure;
+    missing_state.state.valid =
+        strix::PersistentState::none;
+    bool missing_state_rejected = false;
+    try {
+        SessionDispatcher unused;
+        static_cast<void>(
+            strix::execute_serial_token(
+                compiled,
+                missing_state,
+                1,
+                unused));
+    } catch (const std::invalid_argument&) {
+        missing_state_rejected = true;
+    }
+    expect(missing_state_rejected &&
+               missing_state.health ==
+                   strix::SerialSessionHealth::ready,
+           "preflight state failure does not poison session");
+
     auto wrong_identity = before_failure;
     ++wrong_identity.execution_identity;
     bool identity_rejected = false;
