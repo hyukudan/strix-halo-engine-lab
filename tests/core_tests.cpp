@@ -166,12 +166,24 @@ int main() {
     expect(strix::gdn_state_bytes_per_session(model) ==
                110ULL * 1024ULL * 1024ULL + 832ULL * 1024ULL,
            "complete GDN state includes recurrent matrix and convolution history");
+    expect(strix::ple_conv_state_bytes_per_session(model) ==
+               180ULL * 1024ULL,
+           "PLE short convolution state is 180 KiB");
+    expect(strix::ngram_history_bytes_per_session(model) == 8,
+           "PLE resume history keeps two uint32 token ids");
+    expect(strix::position_history_bytes_per_session(model) == 8,
+           "text serial position history is one uint64");
 
     strix::MemoryPlanRequest request;
     request.context_tokens = 262'144;
     request.sessions = 1;
     request.include_provisional_indexer = false;
     const auto one_session = strix::build_memory_plan(model, request);
+    expect(one_session.ple_conv_state == 180ULL * 1024ULL,
+           "memory plan includes PLE convolution state");
+    expect(one_session.ngram_history == 8 &&
+               one_session.position_history == 8,
+           "memory plan includes host resume metadata");
     expect(one_session.base_kv == strix::gib(6), "262K base KV is 6 GiB");
     expect(one_session.mtp_kv == strix::gib(0) + 512ULL * 1024ULL * 1024ULL,
            "262K MTP KV is 512 MiB");
