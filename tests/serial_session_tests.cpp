@@ -148,6 +148,15 @@ int main() {
             buffer_request,
             256);
 
+    strix::ExecutionMemoryBinding memory;
+    memory.execution_identity =
+        compiled.execution_identity;
+    memory.arena_base =
+        static_cast<std::uintptr_t>(0x30000000ULL);
+    memory.arena_bytes =
+        compiled.arena.total_bytes;
+    memory.allocation_generation = 1;
+
     strix::SerialSessionContext session;
     session.execution_identity =
         compiled.execution_identity;
@@ -195,6 +204,7 @@ int main() {
             strix::execute_serial_token(
                 compiled,
                 session,
+                memory,
                 789,
                 failing));
     } catch (const std::runtime_error&) {
@@ -222,6 +232,7 @@ int main() {
             strix::execute_serial_token(
                 compiled,
                 session,
+                memory,
                 1,
                 unused));
     } catch (const std::logic_error&) {
@@ -241,6 +252,7 @@ int main() {
             strix::execute_serial_token(
                 compiled,
                 missing_state,
+                memory,
                 1,
                 unused));
     } catch (const std::invalid_argument&) {
@@ -260,6 +272,7 @@ int main() {
             strix::execute_serial_token(
                 compiled,
                 wrong_identity,
+                memory,
                 1,
                 unused));
     } catch (const std::invalid_argument&) {
@@ -275,6 +288,7 @@ int main() {
             strix::execute_serial_token(
                 compiled,
                 before_failure,
+                memory,
                 static_cast<std::uint32_t>(
                     compiled.vocab_size),
                 unused));
@@ -294,6 +308,7 @@ int main() {
             strix::execute_serial_token(
                 compiled,
                 full_context,
+                memory,
                 1,
                 unused));
     } catch (const std::out_of_range&) {
