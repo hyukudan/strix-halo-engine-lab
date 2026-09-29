@@ -25,6 +25,7 @@ struct ExecutionBufferPlan {
     std::uint64_t route_weight_bytes = 0;
     std::uint64_t logits_bytes = 0;
     std::uint64_t mlp_intermediate_bytes = 0;
+    std::uint64_t gdn_workspace_bytes = 0;
 
     std::uint32_t expanded_hidden_buffers = 2;
     std::uint32_t hidden_buffers = 3;
