@@ -13,6 +13,8 @@ Implemented:
 - deterministic candidate top-k policy;
 - sequential Gated DeltaNet state update;
 - hashed PLE/n-gram row IDs;
+- Gated Residual/Hyper-Connection mixing with synthetic matrix fixtures;
+- QSA block pooling/selection for fixtures whose cutoff has no score tie;
 - fresh-versus-resumed equivalence tests for recurrent and n-gram state.
 
 The numerical functions use Python double-precision arithmetic so that GPU-specific reduction order and lower-precision rounding are not accidentally baked into the reference.
@@ -49,7 +51,7 @@ The following MUST NOT be treated as closed by this first slice:
 - MTP acceptance algorithm;
 - QSA tie semantics where the upstream primitive does not specify a stable tie order;
 - full QSA mask/selection fixture coverage;
-- Gated Residual/Hyper-Connection matrix fixtures from a pinned checkpoint;
+- Gated Residual/Hyper-Connection fixtures from the pinned real checkpoint;
 - tokenizer and chat-template token fixtures;
 - full first-layer and logit replay from the canonical development checkpoint.
 
