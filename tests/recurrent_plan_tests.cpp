@@ -78,6 +78,57 @@ int main() {
                108ULL * 1024ULL * 1024ULL,
            "matrix-only total is 108 MiB");
 
+
+    strix::RecurrentRollbackRequest full_rollback;
+    full_rollback.logical_tokens = 8;
+    full_rollback.sessions = 1;
+    full_rollback.strategy =
+        strix::RecurrentRollbackStrategy::full_candidate_snapshots;
+    const auto full_rollback_plan =
+        strix::build_recurrent_rollback_plan(model, full_rollback);
+    expect(full_rollback_plan.checkpoint_count == 8 &&
+               full_rollback_plan.maximum_replay_tokens == 0 &&
+               full_rollback_plan.retained_checkpoint_bytes ==
+                   8ULL * plan.persistent_state_bytes_all_layers,
+           "full rollback retains one state per candidate token");
+
+    auto pre_window = full_rollback;
+    pre_window.strategy =
+        strix::RecurrentRollbackStrategy::pre_window_replay;
+    const auto pre_window_plan =
+        strix::build_recurrent_rollback_plan(model, pre_window);
+    expect(pre_window_plan.checkpoint_count == 1 &&
+               pre_window_plan.maximum_replay_tokens == 7 &&
+               pre_window_plan.retained_checkpoint_bytes ==
+                   plan.persistent_state_bytes_all_layers,
+           "pre-window rollback retains one state and replays accepted work");
+
+    auto sparse = full_rollback;
+    sparse.strategy =
+        strix::RecurrentRollbackStrategy::sparse_checkpoints;
+    sparse.checkpoint_interval = 2;
+    const auto sparse_plan =
+        strix::build_recurrent_rollback_plan(model, sparse);
+    expect(sparse_plan.checkpoint_count == 4 &&
+               sparse_plan.maximum_replay_tokens == 1 &&
+               sparse_plan.retained_checkpoint_bytes ==
+                   4ULL * plan.persistent_state_bytes_all_layers,
+           "sparse rollback interval two trades checkpoints for bounded replay");
+    expect(sparse_plan.expected_replay_tokens_uniform_rejection == 0.5,
+           "sparse rollback exposes expected replay cost");
+
+    bool bad_sparse = false;
+    try {
+        auto invalid_sparse = sparse;
+        invalid_sparse.checkpoint_interval = 0;
+        static_cast<void>(
+            strix::build_recurrent_rollback_plan(model, invalid_sparse));
+    } catch (const std::invalid_argument&) {
+        bad_sparse = true;
+    }
+    expect(bad_sparse,
+           "sparse rollback requires a non-zero checkpoint interval");
+
     bool invalid = false;
     try {
         auto bad = request;
