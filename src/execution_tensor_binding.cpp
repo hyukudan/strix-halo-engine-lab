@@ -51,12 +51,14 @@ bool role_matches_step(const ManifestTensor& tensor,
                 !tensor.layer.has_value());
 
     case SerialOp::attn_hyper_mix:
-    case SerialOp::attn_inject:
     case SerialOp::mlp_hyper_mix:
-    case SerialOp::mlp_inject:
         return layer_matches(tensor, step.layer) &&
                (tensor.role == TensorRole::normalization ||
                 tensor.role == TensorRole::dense_projection);
+
+    case SerialOp::attn_inject:
+    case SerialOp::mlp_inject:
+        return false;
 
     case SerialOp::gated_delta_net:
         return layer_matches(tensor, step.layer) &&
@@ -95,6 +97,8 @@ bool role_matches_step(const ManifestTensor& tensor,
 
     case SerialOp::position_prepare:
     case SerialOp::hyper_expand:
+    case SerialOp::attn_inject:
+    case SerialOp::mlp_inject:
     case SerialOp::moe_combine:
         return false;
     }
@@ -113,12 +117,10 @@ bool requires_tensor_family(SerialOp op) noexcept {
     case SerialOp::attn_hyper_mix:
     case SerialOp::gated_delta_net:
     case SerialOp::indexed_attention:
-    case SerialOp::attn_inject:
     case SerialOp::mlp_hyper_mix:
     case SerialOp::moe_route:
     case SerialOp::moe_experts:
     case SerialOp::shared_expert:
-    case SerialOp::mlp_inject:
     case SerialOp::final_hyper_mix:
     case SerialOp::lm_head:
         return true;
@@ -144,7 +146,7 @@ std::string requirement_description(SerialOp op) {
     case SerialOp::indexed_attention:
         return "requires layer indexed-attention tensor family";
     case SerialOp::attn_inject:
-        return "requires layer attention injection tensor family";
+        return "consumes precomputed attention injection buffer";
     case SerialOp::mlp_hyper_mix:
         return "requires layer MLP hyper-mix tensor family";
     case SerialOp::moe_route:
@@ -154,7 +156,7 @@ std::string requirement_description(SerialOp op) {
     case SerialOp::shared_expert:
         return "requires layer shared-expert tensor family";
     case SerialOp::mlp_inject:
-        return "requires layer MLP injection tensor family";
+        return "consumes precomputed MLP injection buffer";
     case SerialOp::final_hyper_mix:
         return "requires final hyper-mix tensor family";
     case SerialOp::lm_head:
