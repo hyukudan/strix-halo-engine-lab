@@ -99,6 +99,41 @@ int main() {
                unique.ideal_grouped_weight_bytes_saved == 0,
            "grouping has no ideal weight-reuse benefit when every assignment is unique");
 
+
+    const std::vector<std::uint32_t> reuse_routes{
+        0, 1,
+        0, 2,
+        0, 3,
+        0, 4,
+        0, 5,
+        0, 6,
+        0, 7,
+        0, 8,
+        0, 9,
+        0, 10,
+    };
+    request.rows = 10;
+    request.experts_per_row = 2;
+    request.expert_count = 11;
+    request.packed_weight_bytes_per_expert = 1000;
+    request.selected_experts = reuse_routes;
+    const auto execution =
+        strix::build_moe_expert_execution_plan(request);
+    expect(execution.assignments == 20 &&
+               execution.direct_weight_traversals == 20,
+           "direct expert path traverses one weight set per assignment");
+    expect(execution.batches.size() == 13,
+           "grouped execution emits thirteen row-class batches");
+    expect(execution.batches[0].expert == 0 &&
+               execution.batches[0].logical_rows == 8 &&
+               execution.batches[1].expert == 0 &&
+               execution.batches[1].logical_rows == 2,
+           "expert execution plan decomposes reuse into 8/4/2/1 row classes");
+    expect(execution.grouped_weight_traversals == 13 &&
+               execution.grouped_weight_bytes == 13'000 &&
+               execution.grouped_weight_bytes_saved == 7'000,
+           "execution plan models realizable grouped weight traffic without padding");
+
     bool duplicate_rejected = false;
     try {
         const std::vector<std::uint32_t> duplicate{1, 1};
