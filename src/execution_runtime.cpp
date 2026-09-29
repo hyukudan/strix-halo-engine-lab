@@ -98,6 +98,7 @@ void validate_eager_execution_preflight(
     const SerialExecutionPlan& plan,
     const ExecutionBindingPlan& bindings,
     const SerialExecutionIoPlan& io_plan,
+    const ExecutionArenaPlan& arena_plan,
     const EagerExecutionRequest& request) {
     if (request.logical_rows == 0 ||
         request.request_concurrency == 0) {
@@ -110,6 +111,24 @@ void validate_eager_execution_preflight(
             "binding count does not match serial execution plan");
     }
     validate_serial_execution_io_plan(plan, io_plan);
+    if (arena_plan.total_bytes == 0) {
+        throw std::invalid_argument(
+            "eager execution requires a non-empty arena plan");
+    }
+    for (const auto& io : io_plan.steps) {
+        for (const auto use : io.reads) {
+            if (find_arena_allocation(arena_plan, use) == nullptr) {
+                throw std::invalid_argument(
+                    "eager execution arena is missing a read generation");
+            }
+        }
+        for (const auto use : io.writes) {
+            if (find_arena_allocation(arena_plan, use) == nullptr) {
+                throw std::invalid_argument(
+                    "eager execution arena is missing a write generation");
+            }
+        }
+    }
     if (bindings.missing_steps != 0) {
         throw std::invalid_argument(
             "eager execution requires a fully bound plan");
@@ -188,10 +207,11 @@ EagerExecutionResult execute_serial_eager(
     const SerialExecutionPlan& plan,
     const ExecutionBindingPlan& bindings,
     const SerialExecutionIoPlan& io_plan,
+    const ExecutionArenaPlan& arena_plan,
     const EagerExecutionRequest& request,
     EagerExecutionDispatcher& dispatcher) {
     validate_eager_execution_preflight(
-        plan, bindings, io_plan, request);
+        plan, bindings, io_plan, arena_plan, request);
 
     EagerExecutionResult result;
     result.state = request.state;
@@ -224,6 +244,7 @@ EagerExecutionResult execute_serial_eager(
         context.layer = step.layer;
         context.reads = io.reads;
         context.writes = io.writes;
+        context.arena = &arena_plan;
         context.reads_state = step.reads_state;
         context.writes_state = step.writes_state;
         context.logical_rows = request.logical_rows;
