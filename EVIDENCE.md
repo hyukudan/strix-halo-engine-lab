@@ -37,6 +37,8 @@ permitidos son: **observado**, **publicado**, **inferido**, **hipótesis** y
 | E-029 | pendiente | El inventario offline `gfx1151` de rocBLAS/hipBLASLt no pudo repetirse en esta sesión porque el backend Linux de Docker Desktop no expuso su API, aunque el cliente y el proceso backend existen. | `docker info` contra `desktop-linux`, 2026-09-28. | P-011 sigue abierto; no inferir cobertura de librerías a partir de que el probe HIP compile. |
 | E-030 | observado | El lector GGUF propio parsea v3 little-endian y rechaza límites, booleanos, tipos, bloques, alineación, rangos y solapamientos inválidos; ASan+UBSan no detectan fallos. | CTest en builds `build-wsl` y `build-sanitize`, código A0.2/A0.3 y geometrías fijadas de llama.cpp. | Ya se puede inspeccionar metadata/directorio y verificar el rango físico sin cargar pesos. |
 
+| E-031 | publicado + observado | La revisión fijada de la implementación pública `qwen4_exp` define explícitamente RMSNorm centrado, RoPE parcial, la actualización recurrente Gated DeltaNet y el hashing PLE/n-gram; se han creado oráculos independientes y fixtures pequeños con replay fresh/resumed. | `huggingface/transformers@ebd5de00b43e94cae2da6d7aeb5a76ecdda51dae`; `tools/oracles/`. | A0.5b queda parcialmente implementado; sampling/MTP y semántica completa QSA siguen bloqueados. |
+
 ## Regla para nuevas entradas
 
 Cada evidencia nueva debe incluir identidad del artefacto, comando o prueba,
