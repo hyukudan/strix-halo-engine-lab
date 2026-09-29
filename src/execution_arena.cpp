@@ -57,6 +57,8 @@ std::uint64_t bytes_for(
         return sizes.route_weight_bytes;
     case ExecutionBufferClass::logits:
         return sizes.logits_bytes;
+    case ExecutionBufferClass::mlp_intermediate:
+        return sizes.mlp_intermediate_bytes;
     }
     throw std::logic_error(
         "unknown execution buffer class");
@@ -146,6 +148,43 @@ ExecutionArenaPlan build_serial_execution_arena_plan(
                     found->last_step,
                     static_cast<std::uint32_t>(
                         step_index));
+        }
+
+        for (const auto use : io.temporaries) {
+            const auto found =
+                std::find_if(
+                    plan.allocations.begin(),
+                    plan.allocations.end(),
+                    [&](const ExecutionArenaAllocation& allocation) {
+                        return same_use(
+                            allocation.use, use);
+                    });
+            if (found != plan.allocations.end()) {
+                throw std::invalid_argument(
+                    "execution temporary generation is allocated more than once");
+            }
+
+            const auto bytes =
+                bytes_for(
+                    sizes,
+                    use.buffer.buffer_class);
+            if (bytes == 0) {
+                throw std::invalid_argument(
+                    "execution temporary size must be non-zero");
+            }
+
+            plan.allocations.push_back(
+                ExecutionArenaAllocation{
+                    use,
+                    static_cast<std::uint32_t>(step_index),
+                    static_cast<std::uint32_t>(step_index),
+                    0,
+                    bytes,
+                });
+            plan.naive_nonaliased_bytes =
+                checked_add(
+                    plan.naive_nonaliased_bytes,
+                    align_up(bytes, alignment));
         }
     }
 
