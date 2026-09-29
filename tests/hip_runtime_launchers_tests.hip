@@ -123,6 +123,87 @@ strix::ExecutionDispatchContext make_context(
 }
 
 
+
+void test_kernel_catalog() {
+    const auto model =
+        strix::ModelContract::qwen38_flash_next();
+
+    strix::ExecutionBindingRequest request;
+    request.logical_rows = 1;
+    request.request_concurrency = 1;
+    request.minimum_qualification =
+        strix::kernels::QualificationStatus::experimental;
+
+    strix::HipElementwiseLauncherConfig config;
+    config.hidden_size =
+        static_cast<std::uint32_t>(
+            model.hidden_size);
+    config.hc_count =
+        static_cast<std::uint32_t>(
+            model.hc_count);
+    config.activation =
+        strix::HipActivationStorage::bf16;
+
+    strix::kernels::KernelRegistry registry;
+    strix::register_hip_elementwise_kernel_variants(
+        model,
+        request,
+        config,
+        registry);
+
+    const auto execution =
+        strix::build_serial_decode_execution_plan(
+            model);
+    const auto bindings =
+        strix::bind_serial_execution_plan(
+            model,
+            execution,
+            registry,
+            request);
+
+    std::uint32_t expected_bound = 0;
+    for (std::size_t index = 0;
+         index < execution.steps.size();
+         ++index) {
+        const auto op =
+            execution.steps[index].op;
+        const bool elementwise =
+            op == strix::SerialOp::hyper_expand ||
+            op == strix::SerialOp::attn_inject ||
+            op == strix::SerialOp::mlp_inject ||
+            op == strix::SerialOp::moe_combine;
+        if (!elementwise) {
+            continue;
+        }
+        ++expected_bound;
+        expect(
+            bindings.bindings[index].kernel_id.has_value() &&
+                bindings.bindings[index].kernel_id->starts_with(
+                    "hip."),
+            "HIP elementwise kernel catalog binds the targeted serial operators");
+    }
+    expect(
+        bindings.bound_steps == expected_bound,
+        "HIP elementwise catalog binds only implemented families");
+
+    auto wrong = config;
+    ++wrong.hidden_size;
+    bool geometry_rejected = false;
+    try {
+        strix::kernels::KernelRegistry unused;
+        strix::register_hip_elementwise_kernel_variants(
+            model,
+            request,
+            wrong,
+            unused);
+    } catch (const std::invalid_argument&) {
+        geometry_rejected = true;
+    }
+    expect(
+        geometry_rejected,
+        "HIP elementwise kernel catalog rejects model-geometry mismatch");
+}
+
 void test_launcher_bundle() {
     strix::CompiledSerialExecution compiled;
     compiled.execution_identity = 0x445566ULL;
@@ -652,6 +733,7 @@ void run_fixture(
 }  // namespace
 
 int main() try {
+    test_kernel_catalog();
     test_launcher_bundle();
     run_fixture(
         strix::HipActivationStorage::bf16);
