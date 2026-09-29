@@ -6,6 +6,23 @@
 
 namespace strix {
 
+struct MoeExpertStorageRequest {
+    std::uint32_t gate_up_ggml_type = 0;
+    std::uint32_t down_ggml_type = 0;
+    std::uint64_t hidden_size = 0;
+    std::uint64_t intermediate_size = 0;
+    std::uint64_t expert_count = 0;
+};
+
+struct MoeExpertStoragePlan {
+    bool gate_up_compatible = false;
+    bool down_compatible = false;
+    std::uint64_t gate_up_bytes_per_expert = 0;
+    std::uint64_t down_bytes_per_expert = 0;
+    std::uint64_t total_bytes_per_expert = 0;
+    std::uint64_t total_bytes_all_experts = 0;
+};
+
 struct MoeRouteRequest {
     std::uint32_t rows = 0;
     std::uint32_t experts_per_row = 0;
@@ -63,6 +80,9 @@ struct MoeGroupingPlan {
     std::vector<std::uint32_t> assignment_rows;
     std::vector<std::uint32_t> assignment_slots;
 };
+
+[[nodiscard]] MoeExpertStoragePlan build_moe_expert_storage_plan(
+    const MoeExpertStorageRequest& request);
 
 [[nodiscard]] MoeRoutePlan build_moe_route_plan(
     const MoeRouteRequest& request);
