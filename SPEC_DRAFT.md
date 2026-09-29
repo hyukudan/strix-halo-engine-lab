@@ -22,7 +22,7 @@ fork de GUFO ni una reconstrucción de Halogen.
 - C++20 + HIP; Python solo para herramientas y oráculos.
 - GGUF como formato de entrada; caché interna opcional, lossless y versionada.
 - Primer slice: AR greedy/sampled + MTP solo greedy, Chat Completions en gateway
-  separado y contrato de replay explícito. MTP sampled espera algoritmo/RNG canónico.
+  separado y contrato de replay explícito. MTP sampled espera contrato RNG/replay canónico; el algoritmo probabilístico de aceptación ya está fijado.
 - C1 como fast path y C2/C4 como primeras rutas concurrentes.
 - Contexto inicial cualificado según el presupuesto UMA demostrado; 262.144,
   Responses API, prompt lookup y C6/C8 quedan como ampliaciones posteriores.
