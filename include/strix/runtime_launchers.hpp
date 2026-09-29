@@ -15,4 +15,7 @@ void launch_position_prepare(
 [[nodiscard]] ExecutionLauncher
 make_position_prepare_launcher();
 
+void register_default_runtime_launchers(
+    ExecutionLauncherRegistry& registry);
+
 }  // namespace strix
