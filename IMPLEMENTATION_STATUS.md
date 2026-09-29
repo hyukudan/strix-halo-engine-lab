@@ -398,13 +398,18 @@ Additional A1.5 runtime work now implemented:
 - allocated context capacity enforced independently from the model maximum;
 - common dispatch resolvers for scratch reads/writes, persistent state and model tensors;
 - complete runtime resource bundle;
+- canonical Qwen4Exp tensor-requirement generator for the full serial DAG;
+- execution-tensor audit CLI with missing/ambiguous/satisfied reporting;
+- explicit PLE parameter role separated from the giant file-backed n-gram table;
+- public Qwen4Exp GGUF naming support for hyper-connections, SSM, indexer, routed experts, shared experts and PLE;
+- tensor-access plan identity already incorporated into runtime compatibility identity;
 - compatibility identity binding compiled plan + manifest layout + model content + state layout;
 - separate physical binding identity adding addresses and allocation generations;
 - model-bound serial sessions reject a different checkpoint before dispatch and cannot bypass content checks through the structural/legacy path.
 
 Still pending:
 
-- exact canonical-checkpoint tensor-to-operator binding;
+- running the canonical tensor audit against the actual selected GGUF and closing any remaining selector deviations;
 - target-device allocation backend rather than externally supplied opaque addresses;
 - HIP dispatcher table for real bound kernels;
 - real token-embedding, GDN/attention, PLE, MoE and LM-head integration through that dispatcher;
