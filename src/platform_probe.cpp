@@ -48,6 +48,15 @@ std::optional<std::string> read_first_line(const std::filesystem::path& path) {
     return line;
 }
 
+std::optional<std::int64_t> parse_i64(std::string_view text) noexcept {
+    std::int64_t value = 0;
+    const auto result = std::from_chars(text.data(), text.data() + text.size(), value);
+    if (result.ec != std::errc{} || result.ptr != text.data() + text.size()) {
+        return std::nullopt;
+    }
+    return value;
+}
+
 std::optional<std::uint64_t> parse_u64(std::string_view text) noexcept {
     std::uint64_t value = 0;
     const auto result = std::from_chars(text.data(), text.data() + text.size(), value);
@@ -159,6 +168,63 @@ std::optional<std::string> rocm_version(const std::filesystem::path& root) {
     return std::nullopt;
 }
 
+
+std::vector<Usb4StreamInfo> configured_streams(const std::filesystem::path& root) {
+    std::vector<Usb4StreamInfo> streams;
+    const auto base = rooted(root, "sys/kernel/config/thunderbolt/stream");
+    std::error_code error;
+    for (std::filesystem::directory_iterator service_it(base, error), end;
+         service_it != end && !error; service_it.increment(error)) {
+        if (!service_it->is_directory(error)) {
+            if (error) {
+                error.clear();
+            }
+            continue;
+        }
+        const auto service = service_it->path().filename().string();
+        std::error_code child_error;
+        for (std::filesystem::directory_iterator stream_it(service_it->path(), child_error), child_end;
+             stream_it != child_end && !child_error; stream_it.increment(child_error)) {
+            if (!stream_it->is_directory(child_error)) {
+                if (child_error) {
+                    child_error.clear();
+                }
+                continue;
+            }
+
+            Usb4StreamInfo info;
+            info.service = service;
+            info.name = stream_it->path().filename().string();
+
+            if (const auto value = read_first_line(stream_it->path() / "index"); value.has_value()) {
+                info.index = parse_u64(*value);
+            }
+            if (const auto value = read_first_line(stream_it->path() / "busy_poll"); value.has_value()) {
+                if (*value == "0") info.busy_poll = false;
+                if (*value == "1") info.busy_poll = true;
+            }
+            if (const auto value = read_first_line(stream_it->path() / "ring_size"); value.has_value()) {
+                info.ring_size = parse_u64(*value);
+            }
+            if (const auto value = read_first_line(stream_it->path() / "throttling"); value.has_value()) {
+                info.throttling_ns = parse_u64(*value);
+            }
+            if (const auto value = read_first_line(stream_it->path() / "in_hopid"); value.has_value()) {
+                info.in_hopid = parse_i64(*value);
+            }
+            if (const auto value = read_first_line(stream_it->path() / "out_hopid"); value.has_value()) {
+                info.out_hopid = parse_i64(*value);
+            }
+            streams.push_back(std::move(info));
+        }
+    }
+    std::sort(streams.begin(), streams.end(), [](const auto& left, const auto& right) {
+        if (left.service != right.service) return left.service < right.service;
+        return left.name < right.name;
+    });
+    return streams;
+}
+
 std::vector<GpuNodeInfo> gpu_nodes(const std::filesystem::path& root) {
     std::vector<GpuNodeInfo> result;
     const auto nodes = rooted(root, "sys/class/kfd/kfd/topology/nodes");
@@ -219,6 +285,7 @@ PlatformInfo probe_platform(const std::filesystem::path& root) {
     info.usb4.domains = entries_matching(thunderbolt, is_domain);
     info.usb4.host_routers = entries_matching(thunderbolt, is_host_router);
     info.usb4.stream_devices = entries_matching(rooted(root, "dev"), is_tbstream);
+    info.usb4.configured_streams = configured_streams(root);
     info.usb4.stream_driver_present =
         std::filesystem::exists(rooted(root, "sys/module/thunderbolt_stream")) ||
         std::filesystem::exists(rooted(root, "sys/bus/thunderbolt/drivers/thunderbolt_stream"));
