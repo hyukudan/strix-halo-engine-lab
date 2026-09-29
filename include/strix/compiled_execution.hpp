@@ -28,6 +28,8 @@ struct CompiledSerialExecution {
 
     std::uint32_t logical_rows = 1;
     std::uint32_t request_concurrency = 1;
+    std::uint64_t vocab_size = 0;
+    std::uint64_t max_position_embeddings = 0;
 };
 
 [[nodiscard]] CompiledSerialExecution compile_serial_execution(
