@@ -19,6 +19,36 @@ void expect(bool condition, const char* message) {
 }  // namespace
 
 int main() {
+
+    strix::MoeExpertStorageRequest storage;
+    storage.hidden_size = 2560;
+    storage.intermediate_size = 640;
+    storage.expert_count = 512;
+
+    storage.gate_up_ggml_type = 23;
+    storage.down_ggml_type = 23;
+    const auto iq4_storage =
+        strix::build_moe_expert_storage_plan(storage);
+    expect(iq4_storage.gate_up_compatible,
+           "IQ4_XS is compatible with the 2560-wide real gate/up input");
+    expect(!iq4_storage.down_compatible,
+           "IQ4_XS is incompatible with the 640-wide real down projection");
+    expect(iq4_storage.total_bytes_per_expert == 0 &&
+               iq4_storage.total_bytes_all_experts == 0,
+           "mixed-incompatible expert format is not assigned a fake total size");
+
+    storage.gate_up_ggml_type = 8;
+    storage.down_ggml_type = 8;
+    const auto q8_storage =
+        strix::build_moe_expert_storage_plan(storage);
+    expect(q8_storage.gate_up_compatible &&
+               q8_storage.down_compatible,
+           "Q8_0 block geometry supports both real expert projection inputs");
+    expect(q8_storage.total_bytes_per_expert > 0 &&
+               q8_storage.total_bytes_all_experts ==
+                   q8_storage.total_bytes_per_expert * 512ULL,
+           "compatible expert storage computes exact aggregate bytes");
+
     const std::vector<std::uint32_t> routes{
         1, 2, 3,
         2, 3, 4,
