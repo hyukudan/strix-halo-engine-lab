@@ -93,6 +93,82 @@ ExecutionLauncherRegistry::find_runtime_launcher(
         : &found->launcher;
 }
 
+
+LauncherCoverage audit_launcher_coverage(
+    const CompiledSerialExecution& compiled,
+    const ExecutionLauncherRegistry& launchers) {
+    if (compiled.execution_identity == 0 ||
+        compiled.bindings.bindings.size() !=
+            compiled.execution.steps.size()) {
+        throw std::invalid_argument(
+            "launcher coverage requires a valid compiled execution");
+    }
+
+    LauncherCoverage coverage;
+    coverage.missing.reserve(
+        compiled.execution.steps.size());
+
+    for (std::size_t index = 0;
+         index < compiled.execution.steps.size();
+         ++index) {
+        const auto& step =
+            compiled.execution.steps[index];
+        const auto& binding =
+            compiled.bindings.bindings[index];
+
+        if (step.id != index ||
+            binding.step_id != step.id ||
+            binding.op != step.op) {
+            throw std::invalid_argument(
+                "compiled execution step/binding identity mismatch");
+        }
+
+        const ExecutionLauncher* launcher = nullptr;
+        std::string key;
+        if (binding.host_or_runtime_step) {
+            launcher =
+                launchers.find_runtime_launcher(
+                    step.op);
+            key =
+                "runtime:" +
+                std::string(
+                    to_string(step.op));
+        } else {
+            if (!binding.kernel_id.has_value() ||
+                binding.kernel_id->empty()) {
+                coverage.missing.push_back(
+                    MissingLauncher{
+                        step.id,
+                        step.op,
+                        false,
+                        "unbound-kernel",
+                    });
+                ++coverage.missing_steps;
+                continue;
+            }
+            key = *binding.kernel_id;
+            launcher =
+                launchers.find_kernel_launcher(
+                    key);
+        }
+
+        if (launcher == nullptr) {
+            coverage.missing.push_back(
+                MissingLauncher{
+                    step.id,
+                    step.op,
+                    binding.host_or_runtime_step,
+                    std::move(key),
+                });
+            ++coverage.missing_steps;
+        } else {
+            ++coverage.covered_steps;
+        }
+    }
+
+    return coverage;
+}
+
 CompiledLaunchPlan compile_launch_plan(
     const CompiledSerialExecution& compiled,
     const ExecutionLauncherRegistry& launchers) {
