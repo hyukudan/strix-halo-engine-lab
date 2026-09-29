@@ -576,52 +576,30 @@ int main(int argc, char** argv) try {
         break;
     }
 
-    std::cout << "{
-"
-              << "  \"device\": \"" << properties.name << "\",
-"
-              << "  \"gfx_arch\": \"" << properties.gcnArchName << "\",
-"
-              << "  \"warp_size\": " << properties.warpSize << ",
-"
-              << "  \"heads\": " << options.heads << ",
-"
-              << "  \"tokens\": " << options.tokens << ",
-"
-              << "  \"key_dim\": " << kKeyDim << ",
-"
-              << "  \"value_dim\": " << kValueDim << ",
-"
-              << "  \"value_tile\": " << kValueTile << ",
-"
-              << "  \"serial_ms\": " << serial_ms << ",
-"
-              << "  \"retained_window_ms\": " << window_ms << ",
-"
+    std::cout << '{' << '\n'
+              << "  \"device\": \"" << properties.name << "\"," << '\n'
+              << "  \"gfx_arch\": \"" << properties.gcnArchName << "\"," << '\n'
+              << "  \"warp_size\": " << properties.warpSize << ',' << '\n'
+              << "  \"heads\": " << options.heads << ',' << '\n'
+              << "  \"tokens\": " << options.tokens << ',' << '\n'
+              << "  \"key_dim\": " << kKeyDim << ',' << '\n'
+              << "  \"value_dim\": " << kValueDim << ',' << '\n'
+              << "  \"value_tile\": " << kValueTile << ',' << '\n'
+              << "  \"serial_ms\": " << serial_ms << ',' << '\n'
+              << "  \"retained_window_ms\": " << window_ms << ',' << '\n'
               << "  \"speedup\": "
-              << (window_ms > 0.0 ? serial_ms / window_ms : 0.0) << ",
-"
-              << "  \"serial_state_bytes\": " << serial_state_bytes << ",
-"
-              << "  \"retained_state_bytes\": " << retained_state_bytes << ",
-"
+              << (window_ms > 0.0 ? serial_ms / window_ms : 0.0) << ',' << '\n'
+              << "  \"serial_state_bytes\": " << serial_state_bytes << ',' << '\n'
+              << "  \"retained_state_bytes\": " << retained_state_bytes << ',' << '\n'
               << "  \"state_bytes_avoided\": "
-              << (serial_state_bytes - retained_state_bytes) << ",
-"
-              << "  \"max_state_error\": " << state_error << ",
-"
-              << "  \"max_output_error\": " << output_error << ",
-"
-              << "  \"kernel_local_bytes\": " << attributes.localSizeBytes << ",
-"
-              << "  \"kernel_shared_bytes\": " << attributes.sharedSizeBytes << ",
-"
-              << "  \"kernel_registers\": " << attributes.numRegs << ",
-"
-              << "  \"max_threads_per_block\": " << attributes.maxThreadsPerBlock
-              << "
-}
-";
+              << (serial_state_bytes - retained_state_bytes) << ',' << '\n'
+              << "  \"max_state_error\": " << state_error << ',' << '\n'
+              << "  \"max_output_error\": " << output_error << ',' << '\n'
+              << "  \"kernel_local_bytes\": " << attributes.localSizeBytes << ',' << '\n'
+              << "  \"kernel_shared_bytes\": " << attributes.sharedSizeBytes << ',' << '\n'
+              << "  \"kernel_registers\": " << attributes.numRegs << ',' << '\n'
+              << "  \"max_threads_per_block\": " << attributes.maxThreadsPerBlock << '\n'
+              << '}' << '\n';
 
     hipFree(d_output);
     hipFree(d_state);
