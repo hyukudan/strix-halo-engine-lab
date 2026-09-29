@@ -1,0 +1,152 @@
+#include "strix/mapped_model_file.hpp"
+
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <stdexcept>
+#include <vector>
+
+namespace {
+
+int failures = 0;
+
+void expect(bool condition, const char* message) {
+    if (!condition) {
+        std::cerr << "FAIL: " << message << '\n';
+        ++failures;
+    }
+}
+
+}  // namespace
+
+int main() {
+#if !defined(__linux__)
+    std::cout
+        << "mapped model file tests skipped on non-Linux\n";
+    return 0;
+#else
+    const auto path =
+        std::filesystem::temp_directory_path() /
+        "strix-mapped-model-test.gguf";
+
+    std::vector<std::uint8_t> bytes(
+        64U * 1024U);
+    for (std::size_t index = 0;
+         index < bytes.size();
+         ++index) {
+        bytes[index] =
+            static_cast<std::uint8_t>(
+                index & 0xffU);
+    }
+
+    {
+        std::ofstream output(
+            path,
+            std::ios::binary);
+        output.write(
+            reinterpret_cast<const char*>(
+                bytes.data()),
+            static_cast<std::streamsize>(
+                bytes.size()));
+    }
+
+    strix::ModelManifest manifest;
+    manifest.architecture = "fixture";
+
+    strix::ManifestTensor first;
+    first.name = "first.weight";
+    first.dimensions = {32, 32};
+    first.ggml_type = 1;
+    first.absolute_offset = 4096;
+    first.byte_size = 2048;
+    first.role =
+        strix::TensorRole::dense_projection;
+    manifest.tensors.push_back(first);
+
+    strix::ManifestTensor second;
+    second.name = "second.weight";
+    second.dimensions = {32, 32};
+    second.ggml_type = 1;
+    second.absolute_offset = 8192;
+    second.byte_size = 2048;
+    second.role =
+        strix::TensorRole::dense_projection;
+    manifest.tensors.push_back(second);
+
+    manifest.total_tensor_bytes =
+        first.byte_size +
+        second.byte_size;
+    manifest.layout_identity =
+        strix::model_manifest_layout_identity(
+            manifest);
+
+    strix::AllocationGenerationSource generations;
+    auto mapped =
+        strix::MappedModelFile::open_read_only(
+            path,
+            "model.gguf",
+            generations);
+
+    expect(mapped.valid() &&
+               mapped.bytes() ==
+                   bytes.size() &&
+               mapped.content_identity().valid() &&
+               mapped.allocation_generation() == 1,
+           "mapped model owns stable read-only file mapping and content identity");
+
+    const auto binding =
+        mapped.build_runtime_binding(
+            manifest);
+    expect(binding.tensors.size() == 2 &&
+               binding.tensors[0].storage ==
+                   strix::RuntimeTensorStorage::file_mapped &&
+               binding.tensors[0].address ==
+                   mapped.base_address() +
+                       first.absolute_offset,
+           "manifest tensor resolves directly into mapped file");
+
+    const auto* first_data =
+        reinterpret_cast<const std::uint8_t*>(
+            binding.tensors[0].address);
+    expect(first_data[0] ==
+               bytes[first.absolute_offset] &&
+               first_data[17] ==
+                   bytes[first.absolute_offset + 17],
+           "mapped tensor address reads original file bytes");
+
+    auto invalid_manifest = manifest;
+    invalid_manifest.tensors[1].absolute_offset =
+        mapped.bytes() - 1024;
+    invalid_manifest.tensors[1].byte_size =
+        2048;
+    invalid_manifest.layout_identity =
+        strix::model_manifest_layout_identity(
+            invalid_manifest);
+
+    bool range_rejected = false;
+    try {
+        static_cast<void>(
+            mapped.build_runtime_binding(
+                invalid_manifest));
+    } catch (const std::invalid_argument&) {
+        range_rejected = true;
+    }
+    expect(range_rejected,
+           "mapped model rejects tensor range outside file");
+
+    auto moved = std::move(mapped);
+    expect(!mapped.valid() &&
+               moved.valid(),
+           "mapped model ownership moves without duplicate unmap");
+
+    std::error_code error;
+    std::filesystem::remove(
+        path,
+        error);
+
+    if (failures == 0) {
+        std::cout << "mapped model file tests passed\n";
+    }
+    return failures == 0 ? 0 : 1;
+#endif
+}
