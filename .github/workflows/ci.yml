@@ -32,6 +32,9 @@ jobs:
       - name: Build transport lab
         run: cmake --build build/transport-lab
 
+      - name: Validate dual-link runner syntax
+        run: python3 -m py_compile lab/transport/dual_tbstream.py
+
       - name: TCP ping-pong smoke
         shell: bash
         run: |
