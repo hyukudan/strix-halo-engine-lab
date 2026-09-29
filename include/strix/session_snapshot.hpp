@@ -21,6 +21,7 @@ struct SessionSnapshotRange {
 };
 
 struct SerialSessionSnapshotRequest {
+    std::uint64_t compiled_execution_identity = 0;
     std::uint64_t runtime_compatibility_identity = 0;
     std::uint64_t next_position = 0;
     std::uint64_t committed_tokens = 0;
@@ -29,6 +30,7 @@ struct SerialSessionSnapshotRequest {
 };
 
 struct SerialSessionSnapshotPlan {
+    std::uint64_t compiled_execution_identity = 0;
     std::uint64_t runtime_compatibility_identity = 0;
     std::uint64_t state_layout_identity = 0;
     std::uint64_t next_position = 0;
