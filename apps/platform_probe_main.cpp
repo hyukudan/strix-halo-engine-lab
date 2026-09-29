@@ -95,6 +95,25 @@ int main() {
     print_string_array(info.usb4.host_routers);
     std::cout << ",\n    \"stream_devices\": ";
     print_string_array(info.usb4.stream_devices);
+    std::cout << ",\n    \"configured_streams\": [\n";
+    for (std::size_t index = 0; index < info.usb4.configured_streams.size(); ++index) {
+        const auto& stream = info.usb4.configured_streams[index];
+        std::cout << "      {\"service\":\"" << json_escape(stream.service)
+                  << "\",\"name\":\"" << json_escape(stream.name) << "\",\"index\":";
+        if (stream.index.has_value()) std::cout << *stream.index; else std::cout << "null";
+        std::cout << ",\"busy_poll\":";
+        if (stream.busy_poll.has_value()) std::cout << (*stream.busy_poll ? "true" : "false"); else std::cout << "null";
+        std::cout << ",\"ring_size\":";
+        if (stream.ring_size.has_value()) std::cout << *stream.ring_size; else std::cout << "null";
+        std::cout << ",\"throttling_ns\":";
+        if (stream.throttling_ns.has_value()) std::cout << *stream.throttling_ns; else std::cout << "null";
+        std::cout << ",\"in_hopid\":";
+        if (stream.in_hopid.has_value()) std::cout << *stream.in_hopid; else std::cout << "null";
+        std::cout << ",\"out_hopid\":";
+        if (stream.out_hopid.has_value()) std::cout << *stream.out_hopid; else std::cout << "null";
+        std::cout << '}' << (index + 1 == info.usb4.configured_streams.size() ? '\n' : ',') << '\n';
+    }
+    std::cout << "    ],";
     std::cout << ",\n    \"stream_driver_present\": "
               << (info.usb4.stream_driver_present ? "true" : "false")
               << "\n  }\n}\n";
