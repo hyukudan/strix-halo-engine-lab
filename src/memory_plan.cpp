@@ -55,23 +55,51 @@ std::uint64_t provisional_indexer_bytes_per_token(const ModelContract& model) {
     return uncompressed / model.indexer_compress_ratio;
 }
 
+std::uint64_t gdn_matrix_state_bytes_per_layer(
+    const ModelContract& model) {
+    return product({
+        model.gdn_value_heads,
+        model.gdn_key_head_dim,
+        model.gdn_value_head_dim,
+        model.bytes_fp32,
+    });
+}
+
 std::uint64_t gdn_matrix_state_bytes_per_session(
     const ModelContract& model) {
-    return product({model.gdn_layers, model.gdn_value_heads,
-                    model.gdn_key_head_dim, model.gdn_value_head_dim,
-                    model.bytes_fp32});
+    return checked_mul(
+        model.gdn_layers,
+        gdn_matrix_state_bytes_per_layer(model));
+}
+
+std::uint64_t gdn_conv_state_bytes_per_layer(
+    const ModelContract& model) {
+    const auto key_width =
+        product({
+            model.gdn_key_heads,
+            model.gdn_key_head_dim,
+        });
+    const auto value_width =
+        product({
+            model.gdn_value_heads,
+            model.gdn_value_head_dim,
+        });
+    const auto conv_width =
+        checked_add(
+            checked_mul(key_width, 2),
+            value_width);
+    return product({
+        conv_width,
+        model.gdn_conv_kernel,
+        model.bytes_bf16,
+    });
 }
 
 std::uint64_t gdn_conv_state_bytes_per_session(
     const ModelContract& model) {
-    const auto key_width =
-        product({model.gdn_key_heads, model.gdn_key_head_dim});
-    const auto value_width =
-        product({model.gdn_value_heads, model.gdn_value_head_dim});
-    const auto conv_width =
-        checked_add(checked_mul(key_width, 2), value_width);
-    return product({model.gdn_layers, conv_width,
-                    model.gdn_conv_kernel, model.bytes_bf16});
+    return checked_mul(
+        model.gdn_layers,
+        gdn_conv_state_bytes_per_layer(model));
 }
 
 std::uint64_t gdn_state_bytes_per_session(
