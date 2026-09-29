@@ -283,6 +283,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
 
     add_library(strix_hip_runtime STATIC
         src/hip_runtime_allocator.cpp
+        src/hip_launcher_catalog.cpp
         src/hip_runtime_launchers.hip
         src/hip_moe_route_launcher.hip
         src/hip_embedding_launcher.hip
@@ -401,6 +402,22 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         add_test(
             NAME strix-hip-hyper-mix-launcher-tests
             COMMAND strix-hip-hyper-mix-launcher-tests
+        )
+
+        add_executable(
+            strix-hip-launcher-catalog-tests
+            tests/hip_launcher_catalog_tests.cpp
+        )
+        target_link_libraries(
+            strix-hip-launcher-catalog-tests
+            PRIVATE strix_hip_runtime
+        )
+        strix_target_warnings(
+            strix-hip-launcher-catalog-tests
+        )
+        add_test(
+            NAME strix-hip-launcher-catalog-tests
+            COMMAND strix-hip-launcher-catalog-tests
         )
     endif()
 endif()
