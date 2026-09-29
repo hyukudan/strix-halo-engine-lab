@@ -39,6 +39,32 @@ struct Mapping {
 
     Mapping(const Mapping&) = delete;
     Mapping& operator=(const Mapping&) = delete;
+
+    Mapping(Mapping&& other) noexcept
+        : address(other.address), bytes(other.bytes), fd(other.fd) {
+        other.address = MAP_FAILED;
+        other.bytes = 0;
+        other.fd = -1;
+    }
+
+    Mapping& operator=(Mapping&& other) noexcept {
+        if (this != &other) {
+            if (address != MAP_FAILED) {
+                munmap(address, static_cast<std::size_t>(bytes));
+            }
+            if (fd >= 0) {
+                close(fd);
+            }
+            address = other.address;
+            bytes = other.bytes;
+            fd = other.fd;
+            other.address = MAP_FAILED;
+            other.bytes = 0;
+            other.fd = -1;
+        }
+        return *this;
+    }
+
     Mapping() = default;
 };
 
@@ -185,13 +211,14 @@ int advice_value(const std::string& advice) {
     throw std::invalid_argument("advice must be normal, random or sequential");
 }
 
-void page_touch(const Mapping& mapping, std::size_t page_size) {
-    volatile std::uint8_t sink = 0;
-    auto* bytes = static_cast<std::uint8_t*>(mapping.address);
+std::uint8_t page_touch(const Mapping& mapping, std::size_t page_size) {
+    std::uint8_t sink = 0;
+    const auto* bytes =
+        static_cast<volatile const std::uint8_t*>(mapping.address);
     for (std::uint64_t offset = 0; offset < mapping.bytes; offset += page_size) {
-        sink ^= bytes[offset];
+        sink = static_cast<std::uint8_t>(sink ^ bytes[offset]);
     }
-    (void)sink;
+    return sink;
 }
 
 struct Faults {
@@ -273,15 +300,16 @@ int main(int argc, char** argv) try {
         }
     }
 
+    std::uint64_t prefault_checksum = 0;
     if (options.prefault) {
-        page_touch(mapping, page_size);
+        prefault_checksum = page_touch(mapping, page_size);
     }
 
     std::vector<std::uint64_t> order;
     std::vector<std::uint8_t> destination;
     const auto before = faults();
     const auto start = std::chrono::steady_clock::now();
-    std::uint64_t checksum = 0;
+    std::uint64_t checksum = prefault_checksum;
 
     for (std::uint64_t iteration = 0; iteration < options.iterations; ++iteration) {
         if (options.pattern == "scan") {
