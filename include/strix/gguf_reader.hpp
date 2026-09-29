@@ -46,6 +46,14 @@ struct MetadataEntry {
     std::optional<std::uint64_t> array_length;
 };
 
+struct TensorTypeGeometry {
+    std::uint64_t block_elements = 0;
+    std::uint64_t block_bytes = 0;
+};
+
+[[nodiscard]] std::optional<TensorTypeGeometry> tensor_type_geometry(
+    std::uint32_t ggml_type) noexcept;
+
 struct TensorInfo {
     std::string name;
     std::vector<std::uint64_t> dimensions;
