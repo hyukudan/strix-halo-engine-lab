@@ -409,6 +409,128 @@ int main() {
     expect(context_rejected,
            "allocated session context capacity is enforced before dispatch");
 
+
+    strix::ModelManifest manifest;
+    manifest.architecture = "session-fixture";
+    strix::ManifestTensor model_tensor;
+    model_tensor.name = "token_embd.weight";
+    model_tensor.dimensions = {64, 64};
+    model_tensor.ggml_type = 1;
+    model_tensor.byte_size = 8192;
+    model_tensor.absolute_offset = 4096;
+    model_tensor.role = strix::TensorRole::embedding;
+    model_tensor.placement.kind =
+        strix::PlacementKind::local;
+    model_tensor.placement.node = 0;
+    manifest.tensors.push_back(model_tensor);
+    manifest.total_tensor_bytes =
+        model_tensor.byte_size;
+    manifest.layout_identity =
+        strix::model_manifest_layout_identity(
+            manifest);
+
+    strix::ModelRuntimeBinding model_weights;
+    model_weights.manifest_layout_identity =
+        manifest.layout_identity;
+    model_weights.model_content_identity =
+        0xfeedbeefULL;
+    model_weights.tensors.push_back(
+        {
+            0,
+            strix::RuntimeTensorStorage::resident,
+            static_cast<std::uintptr_t>(
+                0x33000000ULL),
+            model_tensor.byte_size,
+            11,
+            0,
+        });
+
+    strix::ExecutionRuntimeResources resources;
+    resources.scratch = &memory;
+    resources.model_manifest = &manifest;
+    resources.model_weights = &model_weights;
+    resources.session_state_layout =
+        &state_layout;
+    resources.session_state_memory =
+        &state_memory;
+
+    const auto runtime_ids =
+        strix::build_runtime_execution_identities(
+            compiled.execution_identity,
+            compiled.arena,
+            resources);
+
+    auto model_bound = before_failure;
+    model_bound.runtime_compatibility_identity =
+        runtime_ids.compatibility_identity;
+
+    SessionDispatcher model_bound_dispatcher;
+    model_bound_dispatcher.expected_token = 321;
+    model_bound_dispatcher.expected_position =
+        model_bound.next_position;
+    static_cast<void>(
+        strix::execute_serial_token(
+            compiled,
+            model_bound,
+            resources,
+            321,
+            model_bound_dispatcher));
+    expect(model_bound.committed_tokens ==
+               before_failure.committed_tokens + 1 &&
+               model_bound.next_position ==
+                   before_failure.next_position + 1,
+           "model-bound session executes with complete runtime resources");
+
+    auto changed_weights = model_weights;
+    ++changed_weights.model_content_identity;
+    auto changed_resources = resources;
+    changed_resources.model_weights =
+        &changed_weights;
+
+    auto incompatible_session = before_failure;
+    incompatible_session.runtime_compatibility_identity =
+        runtime_ids.compatibility_identity;
+    SessionDispatcher incompatible_dispatcher;
+    incompatible_dispatcher.expected_token = 322;
+    incompatible_dispatcher.expected_position =
+        incompatible_session.next_position;
+
+    bool model_content_rejected = false;
+    try {
+        static_cast<void>(
+            strix::execute_serial_token(
+                compiled,
+                incompatible_session,
+                changed_resources,
+                322,
+                incompatible_dispatcher));
+    } catch (const std::invalid_argument&) {
+        model_content_rejected = true;
+    }
+    expect(model_content_rejected &&
+               incompatible_dispatcher.calls == 0 &&
+               incompatible_session.health ==
+                   strix::SerialSessionHealth::ready,
+           "model-bound session rejects changed model content before dispatch");
+
+    bool legacy_model_bound_rejected = false;
+    try {
+        SessionDispatcher unused;
+        static_cast<void>(
+            strix::execute_serial_token(
+                compiled,
+                incompatible_session,
+                memory,
+                state_layout,
+                state_memory,
+                1,
+                unused));
+    } catch (const std::invalid_argument&) {
+        legacy_model_bound_rejected = true;
+    }
+    expect(legacy_model_bound_rejected,
+           "model-bound session cannot bypass content checks through legacy path");
+
     if (failures == 0) {
         std::cout << "serial session tests passed\n";
     }
