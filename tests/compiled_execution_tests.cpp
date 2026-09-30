@@ -265,6 +265,43 @@ int main() {
             compiled.execution_identity,
         "MLP temporary storage contract changes compiled execution identity");
 
+
+    auto different_gdn_norm_model =
+        model;
+    different_gdn_norm_model.gdn_qk_l2norm =
+        !model.gdn_qk_l2norm;
+    const auto different_gdn_norm =
+        strix::compile_serial_execution(
+            different_gdn_norm_model,
+            make_registry(
+                different_gdn_norm_model,
+                binding_request),
+            binding_request,
+            buffer_request,
+            256);
+    expect(
+        different_gdn_norm.execution_identity !=
+            compiled.execution_identity,
+        "GDN q/k normalization changes compiled execution identity");
+
+    auto different_gdn_conv_model =
+        model;
+    different_gdn_conv_model.gdn_conv_silu =
+        !model.gdn_conv_silu;
+    const auto different_gdn_conv =
+        strix::compile_serial_execution(
+            different_gdn_conv_model,
+            make_registry(
+                different_gdn_conv_model,
+                binding_request),
+            binding_request,
+            buffer_request,
+            256);
+    expect(
+        different_gdn_conv.execution_identity !=
+            compiled.execution_identity,
+        "GDN convolution activation changes compiled execution identity");
+
     strix::SerialSessionStateLayoutRequest state_request;
     state_request.context_tokens = 32;
     const auto state_layout =
