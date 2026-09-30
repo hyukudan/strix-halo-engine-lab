@@ -346,6 +346,18 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         strix-hip-runtime-allocator
         apps/hip_runtime_allocator_main.cpp
     )
+
+    add_executable(
+        strix-hip-model-residency
+        apps/hip_model_residency_main.cpp
+    )
+    target_link_libraries(
+        strix-hip-model-residency
+        PRIVATE strix_hip_runtime
+    )
+    strix_target_warnings(
+        strix-hip-model-residency
+    )
     target_link_libraries(
         strix-hip-runtime-allocator
         PRIVATE strix_hip_runtime
