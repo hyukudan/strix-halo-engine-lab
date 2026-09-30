@@ -23,6 +23,11 @@ namespace strix {
     const ExecutionDispatchContext& context,
     SessionStateComponent component);
 
+[[nodiscard]] SessionStateAddress resolve_dispatch_gdn_layer_state(
+    const ExecutionDispatchContext& context,
+    const ModelContract& model,
+    SessionStateComponent component);
+
 [[nodiscard]] const ExecutionTensorAccess& resolve_dispatch_tensor_access(
     const ExecutionDispatchContext& context,
     std::uint32_t binding_slot);
