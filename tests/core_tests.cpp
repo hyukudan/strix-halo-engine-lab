@@ -148,6 +148,15 @@ int main() {
     expect(model.hc_count == 4 &&
                model.hc_lowrank == 320,
            "official hyper-connection geometry is explicit");
+    expect(model.ple_head_count() == 16 &&
+               model.ple_head_dim() == 160 &&
+               model.ple_row_bytes_bf16() == 320 &&
+               model.ngram_vocab_size_base == 20'000'000 &&
+               model.ngram_vocab_divisor == 128 &&
+               model.ngram_hash_seed == 1234 &&
+               model.ple_eos_token_id == 248044,
+           "canonical PLE hash geometry is explicit");
+
     expect(model.rms_norm_epsilon == 1e-6F &&
                model.norm_topk_probability,
            "official RMS/router policy is explicit");
