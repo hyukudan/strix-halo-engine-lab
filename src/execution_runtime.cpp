@@ -172,11 +172,23 @@ void validate_eager_execution_preflight(
     const ExecutionArenaPlan& arena_plan,
     const EagerExecutionRequest& request,
     const SerialSessionStateLayout* session_state_layout,
-    const SessionStateMemoryBinding* session_state_memory) {
+    const SessionStateMemoryBinding* session_state_memory,
+    const ExecutionRuntimeResources* resources) {
     if (request.logical_rows == 0 ||
         request.request_concurrency == 0) {
         throw std::invalid_argument(
             "eager execution rows and concurrency must be non-zero");
+    }
+    if (!request.input_tokens.empty() &&
+        request.input_tokens.size() !=
+            request.logical_rows) {
+        throw std::invalid_argument(
+            "input token span must match logical row count");
+    }
+    if (request.logical_rows > 1 &&
+        request.input_tokens.empty()) {
+        throw std::invalid_argument(
+            "multi-row eager execution requires one input token per logical row");
     }
 
     if (bindings.bindings.size() != plan.steps.size()) {
@@ -217,6 +229,13 @@ void validate_eager_execution_preflight(
         (session_state_memory == nullptr)) {
         throw std::invalid_argument(
             "session state layout and memory must be supplied together");
+    }
+    if (resources != nullptr) {
+        if (resources->session_state_layout != session_state_layout ||
+            resources->session_state_memory != session_state_memory) {
+            throw std::invalid_argument(
+                "runtime resource state binding does not match eager arguments");
+        }
     }
     if (session_state_layout != nullptr) {
         validate_session_state_memory_binding(
@@ -315,7 +334,7 @@ EagerExecutionResult execute_serial_eager(
     const ExecutionRuntimeResources* resources) {
     validate_eager_execution_preflight(
         plan, bindings, io_plan, arena_plan, request,
-        session_state_layout, session_state_memory);
+        session_state_layout, session_state_memory, resources);
 
     EagerExecutionResult result;
     result.state = request.state;
@@ -362,6 +381,8 @@ EagerExecutionResult execute_serial_eager(
             request.request_concurrency;
         context.input_token_id =
             request.input_token_id;
+        context.input_tokens =
+            request.input_tokens;
         context.position =
             request.position;
 
