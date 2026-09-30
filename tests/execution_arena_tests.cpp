@@ -65,6 +65,37 @@ int main() {
            "aligned arena still reuses dead lifetimes");
 
 
+
+    const auto ple_it =
+        std::find_if(
+            io.steps.begin(),
+            io.steps.end(),
+            [](const auto& step) {
+                return step.op ==
+                    strix::SerialOp::ple;
+            });
+    expect(
+        ple_it != io.steps.end() &&
+            ple_it->temporaries.size() == 1,
+        "arena fixture exposes PLE temporary");
+    if (ple_it != io.steps.end() &&
+        !ple_it->temporaries.empty()) {
+        const auto* temporary =
+            strix::find_arena_allocation(
+                aligned,
+                ple_it->temporaries[0]);
+        expect(
+            temporary != nullptr &&
+                temporary->first_step ==
+                    temporary->last_step,
+            "PLE temporary has one-step lifetime");
+        expect(
+            temporary != nullptr &&
+                temporary->bytes ==
+                    sizes.ple_workspace_bytes,
+            "PLE temporary uses canonical workspace size");
+    }
+
     const auto shared_it =
         std::find_if(
             io.steps.begin(),
