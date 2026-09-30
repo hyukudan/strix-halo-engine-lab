@@ -41,6 +41,7 @@ struct ModelContract {
     std::uint64_t indexer_budget = 2048;
     std::uint64_t indexer_compress_ratio = 4;
     float partial_rotary_factor = 0.25F;
+    float rope_theta = 10'000'000.0F;
     std::uint64_t moe_intermediate_size = 640;
     std::uint64_t shared_expert_intermediate_size = 640;
     std::uint64_t num_experts = 512;
@@ -55,6 +56,12 @@ struct ModelContract {
     std::uint64_t bytes_fp32 = 4;
 
     [[nodiscard]] static ModelContract qwen38_flash_next();
+
+    [[nodiscard]] constexpr std::uint64_t rotary_dim() const noexcept {
+        return static_cast<std::uint64_t>(
+            static_cast<double>(head_dim) *
+            partial_rotary_factor);
+    }
 
     [[nodiscard]] constexpr std::uint64_t ple_head_count() const noexcept {
         return (ngram_size - 1ULL) * heads_per_ngram;
