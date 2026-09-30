@@ -1,6 +1,7 @@
 #include "strix/hip_gdn_launcher.hpp"
 
 #include "strix/dispatch_resources.hpp"
+#include "strix/execution_buffers.hpp"
 #include "strix/memory_plan.hpp"
 
 #include <hip/hip_fp16.h>
