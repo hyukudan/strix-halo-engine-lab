@@ -183,6 +183,29 @@ int main() {
     expect(overflow_rejected,
            "runtime binding rejects address-range overflow");
 
+
+    expect(
+        strix::runtime_tensor_gpu_visible(
+            strix::RuntimeTensorStorage::resident) &&
+        strix::runtime_tensor_gpu_visible(
+            strix::RuntimeTensorStorage::repacked_cache) &&
+        strix::runtime_tensor_gpu_visible(
+            strix::RuntimeTensorStorage::registered_file_mapped) &&
+        !strix::runtime_tensor_gpu_visible(
+            strix::RuntimeTensorStorage::file_mapped) &&
+        !strix::runtime_tensor_gpu_visible(
+            strix::RuntimeTensorStorage::remote),
+        "registered file mappings are GPU-visible while plain mappings are not");
+
+    expect(
+        strix::runtime_tensor_file_backed(
+            strix::RuntimeTensorStorage::file_mapped) &&
+        strix::runtime_tensor_file_backed(
+            strix::RuntimeTensorStorage::registered_file_mapped) &&
+        !strix::runtime_tensor_file_backed(
+            strix::RuntimeTensorStorage::resident),
+        "file-backed storage identity survives GPU registration");
+
     if (failures == 0) {
         std::cout << "model runtime binding tests passed\n";
     }
