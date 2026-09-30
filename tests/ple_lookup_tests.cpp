@@ -179,26 +179,24 @@ int main() {
 
         const auto handle =
             backend.start(lookup);
-        std::vector<std::byte> gathered(
+        std::vector<std::uint16_t> gathered(
             static_cast<std::size_t>(
-                row_bytes *
+                row_elements *
                 requested_rows.size()));
         backend.finish(
             handle,
-            gathered);
+            std::as_writable_bytes(
+                std::span<std::uint16_t>(
+                    gathered)));
 
-        const auto* gathered_values =
-            reinterpret_cast<
-                const std::uint16_t*>(
-                    gathered.data());
         expect(
-            gathered_values[0] == 2000 &&
-                gathered_values[
+            gathered[0] == 2000 &&
+                gathered[
                     row_elements - 1] ==
                     2159 &&
-                gathered_values[
+                gathered[
                     row_elements] == 0 &&
-                gathered_values[
+                gathered[
                     2 * row_elements - 1] ==
                     159,
             "file-mapped backend gathers requested rows in order");
