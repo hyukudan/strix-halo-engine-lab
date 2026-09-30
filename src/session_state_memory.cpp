@@ -137,6 +137,107 @@ SessionStateAddress resolve_session_state(
 
 namespace strix {
 
+
+std::uint32_t indexed_attention_layer_ordinal(
+    const ModelContract& model,
+    std::uint32_t zero_based_layer) {
+    if (const auto error =
+            model.validate();
+        !error.empty()) {
+        throw std::invalid_argument(error);
+    }
+    if (zero_based_layer >=
+        model.hidden_layers) {
+        throw std::out_of_range(
+            "indexed-attention layer index exceeds model layer count");
+    }
+
+    const auto one_based =
+        static_cast<std::uint64_t>(
+            zero_based_layer) +
+        1ULL;
+    if (one_based %
+            model.full_attention_interval !=
+        0) {
+        throw std::invalid_argument(
+            "linear-attention layer has no indexed-attention state");
+    }
+
+    const auto ordinal =
+        one_based /
+            model.full_attention_interval -
+        1ULL;
+    if (ordinal >=
+        model.full_attention_layers) {
+        throw std::logic_error(
+            "derived indexed-attention ordinal exceeds configured layers");
+    }
+    return static_cast<std::uint32_t>(
+        ordinal);
+}
+
+SessionStateAddress resolve_indexed_attention_layer_state(
+    const SerialSessionStateLayout& layout,
+    const SessionStateMemoryBinding& memory,
+    const ModelContract& model,
+    std::uint32_t zero_based_layer,
+    SessionStateComponent component) {
+    if (component !=
+            SessionStateComponent::attention_kv &&
+        component !=
+            SessionStateComponent::sparse_index) {
+        throw std::invalid_argument(
+            "indexed-attention layer resolver supports only KV and sparse-index state");
+    }
+
+    auto result =
+        resolve_session_state(
+            layout,
+            memory,
+            component);
+    const auto ordinal =
+        indexed_attention_layer_ordinal(
+            model,
+            zero_based_layer);
+
+    const auto per_token =
+        component ==
+                SessionStateComponent::attention_kv
+            ? base_kv_bytes_per_token(model) /
+                  model.full_attention_layers
+            : indexer_bytes_per_token(model) /
+                  model.full_attention_layers;
+    const auto per_layer =
+        per_token *
+        layout.context_tokens;
+    const auto offset =
+        static_cast<std::uint64_t>(
+            ordinal) *
+        per_layer;
+
+    if (offset > result.bytes ||
+        per_layer >
+            result.bytes - offset) {
+        throw std::invalid_argument(
+            "indexed-attention layer state slice exceeds component allocation");
+    }
+    if (offset >
+        static_cast<std::uint64_t>(
+            std::numeric_limits<
+                std::uintptr_t>::max() -
+            result.address)) {
+        throw std::overflow_error(
+            "indexed-attention layer state slice address overflows uintptr_t");
+    }
+
+    result.address +=
+        static_cast<std::uintptr_t>(
+            offset);
+    result.bytes =
+        per_layer;
+    return result;
+}
+
 std::uint32_t gdn_layer_ordinal(
     const ModelContract& model,
     std::uint32_t zero_based_layer) {
