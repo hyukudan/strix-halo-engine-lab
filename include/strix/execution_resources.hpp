@@ -5,6 +5,7 @@
 #include "strix/execution_tensor_access.hpp"
 #include "strix/model_manifest.hpp"
 #include "strix/model_runtime_binding.hpp"
+#include "strix/ple_lookup.hpp"
 #include "strix/session_state_layout.hpp"
 #include "strix/session_state_memory.hpp"
 
@@ -19,6 +20,7 @@ struct ExecutionRuntimeResources {
     const ExecutionTensorAccessPlan* tensor_access = nullptr;
     const SerialSessionStateLayout* session_state_layout = nullptr;
     const SessionStateMemoryBinding* session_state_memory = nullptr;
+    PleLookupBackend* ple_lookup = nullptr;
 };
 
 struct RuntimeExecutionIdentities {
