@@ -51,8 +51,21 @@ std::string ModelContract::validate() const {
     if (gdn_value_heads % gdn_key_heads != 0) {
         return "GDN value heads must be divisible by key heads";
     }
-    if (indexer_compress_ratio == 0) {
-        return "indexer compression ratio must be non-zero";
+    if (indexer_n_heads == 0 ||
+        indexer_kv_heads == 0 ||
+        indexer_head_dim == 0 ||
+        indexer_budget == 0 ||
+        indexer_compress_ratio == 0 ||
+        indexer_budget % indexer_compress_ratio != 0) {
+        return "indexer geometry and budget must be valid";
+    }
+    if (!std::isfinite(partial_rotary_factor) ||
+        partial_rotary_factor <= 0.0F ||
+        partial_rotary_factor > 1.0F ||
+        static_cast<std::uint64_t>(
+            static_cast<double>(head_dim) *
+            partial_rotary_factor) % 2ULL != 0) {
+        return "partial rotary factor must produce a positive even rotary width";
     }
     if (!std::isfinite(rms_norm_epsilon) ||
         rms_norm_epsilon <= 0.0F) {
