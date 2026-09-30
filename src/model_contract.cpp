@@ -42,6 +42,14 @@ std::string ModelContract::validate() const {
     if (indexer_compress_ratio == 0) {
         return "indexer compression ratio must be non-zero";
     }
+    if (!std::isfinite(rms_norm_epsilon) ||
+        rms_norm_epsilon <= 0.0F) {
+        return "RMS normalization epsilon must be finite and positive";
+    }
+    if (!std::isfinite(gdn_qk_l2_epsilon) ||
+        gdn_qk_l2_epsilon <= 0.0F) {
+        return "GDN q/k L2 epsilon must be finite and positive";
+    }
     if (hc_count <= 1 || hc_lowrank == 0) {
         return "hyper-connection count must exceed one and low-rank width must be non-zero";
     }
