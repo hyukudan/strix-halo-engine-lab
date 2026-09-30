@@ -66,6 +66,7 @@ add_library(strix_core STATIC
     src/speculation_cycle.cpp
     src/speculation_executor.cpp
     src/speculative_verify_plan.cpp
+    src/speculative_verify_runtime.cpp
     src/speculative_verify_binding.cpp
     src/platform_probe.cpp
     src/ple_lookup.cpp
@@ -336,6 +337,11 @@ if(BUILD_TESTING)
     target_link_libraries(strix-compiled-speculative-verify-tests PRIVATE strix_core)
     strix_target_warnings(strix-compiled-speculative-verify-tests)
     add_test(NAME strix-compiled-speculative-verify-tests COMMAND strix-compiled-speculative-verify-tests)
+
+    add_executable(strix-speculative-verify-runtime-tests tests/speculative_verify_runtime_tests.cpp)
+    target_link_libraries(strix-speculative-verify-runtime-tests PRIVATE strix_core)
+    strix_target_warnings(strix-speculative-verify-runtime-tests)
+    add_test(NAME strix-speculative-verify-runtime-tests COMMAND strix-speculative-verify-runtime-tests)
 
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
