@@ -560,10 +560,7 @@ void launch_lm_head(
         throw std::invalid_argument(
             "HIP LM-head tensor geometry does not match contract");
     }
-    if ((runtime_tensor.storage !=
-             RuntimeTensorStorage::resident &&
-         runtime_tensor.storage !=
-             RuntimeTensorStorage::repacked_cache) ||
+    if (!runtime_tensor_gpu_visible(runtime_tensor.storage) ||
         runtime_tensor.address == 0) {
         throw std::invalid_argument(
             "HIP LM-head requires resident or repacked GPU-visible weights");
