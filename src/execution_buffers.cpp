@@ -124,7 +124,7 @@ ExecutionBufferPlan build_serial_execution_buffer_plan(
         product(
             request.logical_rows,
             gdn_workspace_elements,
-            request.activation_element_bytes);
+            model.bytes_fp32);
 
     const auto attn_inject_peak =
         checked_add(
