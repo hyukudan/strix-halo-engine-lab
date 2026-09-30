@@ -42,6 +42,7 @@ struct ModelContract {
     bool norm_topk_probability = true;
     bool gdn_output_gate_sigmoid = true;
     bool gdn_qk_l2norm = true;
+    float gdn_qk_l2_epsilon = 1e-6F;
     bool gdn_conv_silu = true;
     std::uint64_t bytes_bf16 = 2;
     std::uint64_t bytes_fp32 = 4;
