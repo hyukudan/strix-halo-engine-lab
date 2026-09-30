@@ -19,8 +19,8 @@ std::uint64_t checked_add(
 
 }  // namespace
 
-GreedySpeculationCyclePlan
-build_greedy_speculation_cycle_plan(
+GreedySpeculationPreparation
+prepare_greedy_speculation_cycle(
     const ModelContract& model,
     const SerialSessionStateLayout& state_layout,
     const GreedySpeculationCycleRequest& request) {
@@ -34,19 +34,96 @@ build_greedy_speculation_cycle_plan(
             "speculation cycle requires compiled and runtime identities");
     }
     if (request.base_position >
-        state_layout.context_tokens) {
+        state_layout.context_tokens ||
+        request.base_position >
+            model.max_position_embeddings) {
         throw std::out_of_range(
-            "speculation base position exceeds allocated state capacity");
+            "speculation base position exceeds context capacity");
     }
-    if (request.base_position >
-        model.max_position_embeddings) {
+
+    if (request.candidate_tokens.size() >
+        static_cast<std::size_t>(
+            std::numeric_limits<std::uint32_t>::max())) {
+        throw std::overflow_error(
+            "speculation candidate depth exceeds uint32");
+    }
+
+    const auto verify_end =
+        checked_add(
+            request.base_position,
+            static_cast<std::uint64_t>(
+                request.candidate_tokens.size()),
+            "speculative verify position overflow");
+    if (verify_end >
+            state_layout.context_tokens ||
+        verify_end >
+            model.max_position_embeddings) {
         throw std::out_of_range(
-            "speculation base position exceeds model context limit");
+            "speculative verify window exceeds allocated/model context");
+    }
+
+    GreedySpeculationPreparation preparation;
+    preparation.compiled_execution_identity =
+        request.compiled_execution_identity;
+    preparation.runtime_compatibility_identity =
+        request.runtime_compatibility_identity;
+    preparation.base_position =
+        request.base_position;
+    preparation.committed_tokens =
+        request.committed_tokens;
+    preparation.state =
+        request.state;
+    preparation.candidate_tokens.assign(
+        request.candidate_tokens.begin(),
+        request.candidate_tokens.end());
+
+    if (!preparation.candidate_tokens.empty()) {
+        SerialSessionSnapshotRequest snapshot_request;
+        snapshot_request.compiled_execution_identity =
+            request.compiled_execution_identity;
+        snapshot_request.runtime_compatibility_identity =
+            request.runtime_compatibility_identity;
+        snapshot_request.next_position =
+            request.base_position;
+        snapshot_request.committed_tokens =
+            request.committed_tokens;
+        snapshot_request.state =
+            request.state;
+        snapshot_request.alignment =
+            request.snapshot_alignment;
+
+        preparation.pre_window_snapshot =
+            build_serial_session_snapshot_plan(
+                model,
+                state_layout,
+                snapshot_request);
+    }
+
+    return preparation;
+}
+
+GreedySpeculationCyclePlan
+finalize_greedy_speculation_cycle(
+    const ModelContract& model,
+    const SerialSessionStateLayout& state_layout,
+    const GreedySpeculationPreparation& preparation,
+    const GreedySpeculationFinalizeRequest& request) {
+    if (preparation.compiled_execution_identity == 0 ||
+        preparation.runtime_compatibility_identity == 0) {
+        throw std::invalid_argument(
+            "speculation preparation is not initialized");
+    }
+    if (preparation.base_position >
+            state_layout.context_tokens ||
+        preparation.base_position >
+            model.max_position_embeddings) {
+        throw std::out_of_range(
+            "speculation preparation position exceeds context capacity");
     }
 
     GreedyVerificationRequest verification_request;
     verification_request.candidate_tokens =
-        request.candidate_tokens;
+        preparation.candidate_tokens;
     verification_request.target_tokens =
         request.target_tokens;
     verification_request.token_budget =
@@ -59,9 +136,9 @@ build_greedy_speculation_cycle_plan(
         verify_greedy_candidates(
             verification_request);
     plan.base_position =
-        request.base_position;
+        preparation.base_position;
     plan.base_committed_tokens =
-        request.committed_tokens;
+        preparation.committed_tokens;
     plan.emitted_tokens =
         plan.verification.valid_tokens;
     plan.speculation_used =
@@ -71,55 +148,43 @@ build_greedy_speculation_cycle_plan(
     plan.committed_state_advance =
         plan.verification.accepted_matches;
 
-    const auto verify_end =
-        checked_add(
-            request.base_position,
-            plan.verify_state_advance,
-            "speculative verify position overflow");
-    if (verify_end >
-            state_layout.context_tokens ||
-        verify_end >
-            model.max_position_embeddings) {
-        throw std::out_of_range(
-            "speculative verify window exceeds allocated/model context");
-    }
-
     plan.post_cycle_state_position =
         checked_add(
-            request.base_position,
+            preparation.base_position,
             plan.committed_state_advance,
             "speculative committed-state position overflow");
-
-    // Output tokens include the target bonus token even though that token is
-    // not yet processed into target state.
     plan.post_cycle_output_position =
         checked_add(
-            request.base_position,
+            preparation.base_position,
             static_cast<std::uint64_t>(
                 plan.emitted_tokens.size()),
             "speculative output position overflow");
-
     if (plan.post_cycle_output_position >
         model.max_position_embeddings) {
         throw std::out_of_range(
             "speculative output exceeds model context");
     }
 
-    // SerialSessionContext::committed_tokens counts tokens represented in
-    // persistent target state, not merely emitted continuation tokens. The
-    // bonus token is emitted from target logits but is not processed into
-    // KV/GDN state until a later target step.
     plan.post_cycle_committed_tokens =
         checked_add(
-            request.committed_tokens,
+            preparation.committed_tokens,
             static_cast<std::uint64_t>(
                 plan.committed_state_advance),
             "speculative committed-token counter overflow");
 
     if (!plan.speculation_used) {
-        // Depth zero is a serial semantic baseline. No target state has been
-        // advanced by candidates, so no snapshot/restore/replay is required.
         return plan;
+    }
+
+    if (preparation.pre_window_snapshot.plan_identity == 0 ||
+        preparation.pre_window_snapshot.next_position !=
+            preparation.base_position ||
+        preparation.pre_window_snapshot.compiled_execution_identity !=
+            preparation.compiled_execution_identity ||
+        preparation.pre_window_snapshot.runtime_compatibility_identity !=
+            preparation.runtime_compatibility_identity) {
+        throw std::invalid_argument(
+            "positive-depth speculation requires matching pre-window snapshot plan");
     }
 
     plan.snapshot_required = true;
@@ -129,33 +194,41 @@ build_greedy_speculation_cycle_plan(
 
     if (plan.restore_required) {
         plan.replay_tokens.assign(
-            request.candidate_tokens.begin(),
-            request.candidate_tokens.begin() +
+            preparation.candidate_tokens.begin(),
+            preparation.candidate_tokens.begin() +
                 static_cast<std::ptrdiff_t>(
                     plan.verification.accepted_matches));
     }
 
-    SerialSessionSnapshotRequest snapshot_request;
-    snapshot_request.compiled_execution_identity =
-        request.compiled_execution_identity;
-    snapshot_request.runtime_compatibility_identity =
-        request.runtime_compatibility_identity;
-    snapshot_request.next_position =
-        request.base_position;
-    snapshot_request.committed_tokens =
-        request.committed_tokens;
-    snapshot_request.state =
-        request.state;
-    snapshot_request.alignment =
-        request.snapshot_alignment;
-
     plan.pre_window_snapshot =
-        build_serial_session_snapshot_plan(
+        preparation.pre_window_snapshot;
+    return plan;
+}
+
+GreedySpeculationCyclePlan
+build_greedy_speculation_cycle_plan(
+    const ModelContract& model,
+    const SerialSessionStateLayout& state_layout,
+    const GreedySpeculationCycleRequest& request) {
+    const auto preparation =
+        prepare_greedy_speculation_cycle(
             model,
             state_layout,
-            snapshot_request);
+            request);
 
-    return plan;
+    GreedySpeculationFinalizeRequest finalize;
+    finalize.target_tokens =
+        request.target_tokens;
+    finalize.token_budget =
+        request.token_budget;
+    finalize.eos_tokens =
+        request.eos_tokens;
+
+    return finalize_greedy_speculation_cycle(
+        model,
+        state_layout,
+        preparation,
+        finalize);
 }
 
 }  // namespace strix
