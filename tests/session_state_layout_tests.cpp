@@ -64,7 +64,7 @@ int main() {
     expect(sparse != nullptr &&
                !sparse->provisional &&
                sparse->bytes ==
-                   strix::indexer_bytes_per_token(model) *
+                   strix::provisional_indexer_bytes_per_token(model) *
                        request.context_tokens,
            "QSA raw-key cache is an exact context-sized device allocation");
 

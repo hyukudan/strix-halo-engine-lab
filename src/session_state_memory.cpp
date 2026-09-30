@@ -205,7 +205,7 @@ SessionStateAddress resolve_indexed_attention_layer_state(
                 SessionStateComponent::attention_kv
             ? base_kv_bytes_per_token(model) /
                   model.full_attention_layers
-            : indexer_bytes_per_token(model) /
+            : provisional_indexer_bytes_per_token(model) /
                   model.full_attention_layers;
     const auto per_layer =
         per_token *

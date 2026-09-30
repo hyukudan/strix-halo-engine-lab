@@ -56,10 +56,6 @@ bool role_matches_step(const ManifestTensor& tensor,
                (tensor.role == TensorRole::normalization ||
                 tensor.role == TensorRole::dense_projection);
 
-    case SerialOp::attn_inject:
-    case SerialOp::mlp_inject:
-        return false;
-
     case SerialOp::gated_delta_net:
         return layer_matches(tensor, step.layer) &&
                (tensor.role == TensorRole::recurrent_state ||

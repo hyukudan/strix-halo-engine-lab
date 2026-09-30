@@ -242,7 +242,7 @@ build_serial_session_state_layout(
             PersistentState::sparse_index,
             SessionStateStorage::device,
             checked_mul(
-                indexer_bytes_per_token(model),
+                provisional_indexer_bytes_per_token(model),
                 request.context_tokens),
             false);
     }
