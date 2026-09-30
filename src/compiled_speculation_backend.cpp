@@ -1,6 +1,7 @@
 #include "strix/compiled_speculation_backend.hpp"
 
 #include <stdexcept>
+#include <string>
 
 namespace strix {
 namespace {
