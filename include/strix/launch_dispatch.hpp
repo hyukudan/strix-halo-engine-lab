@@ -1,6 +1,7 @@
 #pragma once
 
 #include "strix/compiled_execution.hpp"
+#include "strix/compiled_speculative_verify.hpp"
 #include "strix/execution_runtime.hpp"
 
 #include <cstdint>
@@ -74,6 +75,10 @@ struct LauncherCoverage {
     const CompiledSerialExecution& compiled,
     const ExecutionLauncherRegistry& launchers);
 
+[[nodiscard]] LauncherCoverage audit_launcher_coverage(
+    const CompiledSpeculativeVerifyExecution& compiled,
+    const ExecutionLauncherRegistry& launchers);
+
 struct CompiledLaunchPlan {
     std::uint64_t execution_identity = 0;
     std::uint64_t plan_identity = 0;
@@ -82,6 +87,10 @@ struct CompiledLaunchPlan {
 
 [[nodiscard]] CompiledLaunchPlan compile_launch_plan(
     const CompiledSerialExecution& compiled,
+    const ExecutionLauncherRegistry& launchers);
+
+[[nodiscard]] CompiledLaunchPlan compile_launch_plan(
+    const CompiledSpeculativeVerifyExecution& compiled,
     const ExecutionLauncherRegistry& launchers);
 
 class DirectLaunchDispatcher final
