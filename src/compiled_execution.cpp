@@ -56,6 +56,10 @@ void hash_model(
     hash_u64(hash, model.ple_conv_kernel_size);
     hash_u64(hash, model.ngram_size);
     hash_u64(hash, model.heads_per_ngram);
+    hash_u64(hash, model.ngram_vocab_size_base);
+    hash_u64(hash, model.ngram_vocab_divisor);
+    hash_u64(hash, model.ngram_hash_seed);
+    hash_u64(hash, model.ple_eos_token_id);
     hash_u64(hash, model.hc_count);
     hash_u64(hash, model.hc_lowrank);
     hash_u64(hash, model.full_attention_layers);
