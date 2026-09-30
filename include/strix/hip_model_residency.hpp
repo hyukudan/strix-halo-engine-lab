@@ -76,13 +76,18 @@ private:
         std::uint64_t bytes = 0;
     };
 
+    struct CopiedRange {
+        std::uint64_t file_offset = 0;
+        std::uintptr_t device_base = 0;
+        std::uint64_t bytes = 0;
+    };
+
     void release() noexcept;
 
     HipModelResidencyMode mode_ =
         HipModelResidencyMode::registered_file_mapping;
     std::vector<RegisteredRange> registered_ranges_;
-    std::uintptr_t copied_device_base_ = 0;
-    std::uint64_t copied_device_bytes_ = 0;
+    std::vector<CopiedRange> copied_ranges_;
     std::uint64_t registered_bytes_ = 0;
     std::uint64_t copied_bytes_ = 0;
     ModelRuntimeBinding binding_;
