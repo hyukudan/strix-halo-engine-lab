@@ -284,6 +284,25 @@ int main() {
             compiled.execution_identity,
         "GDN q/k normalization changes compiled execution identity");
 
+
+    auto different_gdn_epsilon_model =
+        model;
+    different_gdn_epsilon_model.gdn_qk_l2_epsilon =
+        2e-6F;
+    const auto different_gdn_epsilon =
+        strix::compile_serial_execution(
+            different_gdn_epsilon_model,
+            make_registry(
+                different_gdn_epsilon_model,
+                binding_request),
+            binding_request,
+            buffer_request,
+            256);
+    expect(
+        different_gdn_epsilon.execution_identity !=
+            compiled.execution_identity,
+        "GDN q/k epsilon changes compiled execution identity");
+
     auto different_gdn_conv_model =
         model;
     different_gdn_conv_model.gdn_conv_silu =
