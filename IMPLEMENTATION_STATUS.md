@@ -407,11 +407,23 @@ Additional A1.5 runtime work now implemented:
 - separate physical binding identity adding addresses and allocation generations;
 - model-bound serial sessions reject a different checkpoint before dispatch and cannot bypass content checks through the structural/legacy path.
 
+Additional serial-runtime work now implemented:
+
+- complete experimental C1/BF16 HIP kernel catalog for every serial DAG operator;
+- zero-missing-step HIP launcher coverage audit;
+- runtime launchers for embedding, hyper expand/inject/combine, fused hyper-mix, PLE, GDN, indexed attention, MoE routing, routed experts, shared expert and LM head;
+- explicit indexed-attention KV/raw-index state layout and QSA workspace;
+- selective model-weight residency with registered file mappings or copied promoted ranges;
+- file-backed-candidate tensors remain ordinary host mappings by default, preserving the PLE lookup path;
+- fresh HIP scratch/device-state/host-state initialization;
+- `strix-hip-model-residency` hardware probe CLI;
+- `strix-hip-decode-token` runner that compiles the full C1 serial DAG from a GGUF, accepts explicit token IDs and materializes FP32 logits/top-5.
+
 Still pending:
 
 - running the canonical tensor audit against the actual selected GGUF and closing any remaining selector deviations;
-- target-device allocation backend rather than externally supplied opaque addresses;
-- HIP dispatcher table for real bound kernels;
-- real token-embedding, GDN/attention, PLE, MoE and LM-head integration through that dispatcher;
-- snapshot serialization/restoration and poisoned-session recovery;
-- first real token/logit replay against the canonical checkpoint.
+- native Strix Halo compilation and execution of the complete HIP runtime;
+- validating registered read-only GGUF mappings on the M5 ROCm stack and comparing against resident-copy fallback;
+- first real token/logit replay against the canonical checkpoint/reference implementation;
+- tokenizer/chat-template integration after raw token-id replay is correct;
+- snapshot recovery of a poisoned session after mid-dispatch failure.
