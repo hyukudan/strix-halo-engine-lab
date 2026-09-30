@@ -23,6 +23,18 @@ std::uint32_t checked_u32(
         value);
 }
 
+
+HipPleLauncherConfig
+ple_config(
+    const ModelContract& model,
+    HipActivationStorage activation) {
+    HipPleLauncherConfig config;
+    config.model = model;
+    config.activation =
+        activation;
+    return config;
+}
+
 HipElementwiseLauncherConfig
 elementwise_config(
     const ModelContract& model,
@@ -178,6 +190,10 @@ HipLauncherCatalog::HipLauncherCatalog(
           elementwise_config(
               model,
               config.activation)),
+      ple_(
+          ple_config(
+              model,
+              config.activation)),
       gdn_(
           HipGdnLauncherConfig{
               model,
@@ -222,6 +238,10 @@ register_for_compiled_execution(
     register_default_runtime_launchers(
         registry);
     elementwise_.
+        register_for_compiled_execution(
+            compiled,
+            registry);
+    ple_.
         register_for_compiled_execution(
             compiled,
             registry);
