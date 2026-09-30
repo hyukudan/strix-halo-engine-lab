@@ -2,6 +2,7 @@
 
 #include "strix/execution_binding.hpp"
 
+#include <algorithm>
 #include <set>
 #include <string>
 #include <utility>
