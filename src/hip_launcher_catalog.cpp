@@ -194,6 +194,147 @@ moe_route_config(
 
 }  // namespace
 
+
+void register_complete_hip_kernel_catalog(
+    const ModelContract& model,
+    const ExecutionBindingRequest& request,
+    HipLauncherCatalogConfig config,
+    kernels::KernelRegistry& registry) {
+    if (const auto error =
+            model.validate();
+        !error.empty()) {
+        throw std::invalid_argument(error);
+    }
+    if (request.logical_rows != 1 ||
+        request.request_concurrency != 1) {
+        throw std::invalid_argument(
+            "complete HIP kernel catalog currently targets C1 one-row decode");
+    }
+    if (config.activation !=
+        HipActivationStorage::bf16) {
+        throw std::invalid_argument(
+            "complete HIP kernel catalog currently targets canonical BF16 activation mode");
+    }
+    if (request.minimum_qualification !=
+        kernels::QualificationStatus::experimental) {
+        throw std::invalid_argument(
+            "complete HIP kernel catalog remains experimental until indexed-attention tie semantics and native target qualification are closed");
+    }
+
+    const auto qualification =
+        kernels::QualificationStatus::experimental;
+
+    const auto elementwise =
+        elementwise_config(
+            model,
+            config.activation);
+    register_hip_elementwise_kernel_variants(
+        model,
+        request,
+        elementwise,
+        registry,
+        qualification);
+
+    const auto ple =
+        ple_config(
+            model,
+            config.activation);
+    register_hip_ple_kernel_variant(
+        model,
+        request,
+        ple,
+        registry,
+        qualification);
+
+    const HipGdnLauncherConfig gdn{
+        model,
+        config.activation,
+    };
+    register_hip_gdn_kernel_variant(
+        model,
+        request,
+        gdn,
+        registry,
+        qualification);
+
+    const auto indexed =
+        indexed_attention_config(
+            model,
+            config.activation);
+    register_hip_indexed_attention_kernel_variant(
+        model,
+        request,
+        indexed,
+        registry,
+        qualification);
+
+    const auto embedding =
+        embedding_config(
+            model,
+            config.activation);
+    register_hip_embedding_kernel_variant(
+        model,
+        request,
+        embedding,
+        registry,
+        qualification);
+
+    const auto hyper_mix =
+        hyper_mix_config(
+            model,
+            config.activation);
+    register_hip_hyper_mix_kernel_variant(
+        model,
+        request,
+        hyper_mix,
+        registry,
+        qualification);
+
+    const auto moe_route =
+        moe_route_config(
+            model,
+            config.activation);
+    register_hip_moe_route_kernel_variant(
+        model,
+        request,
+        moe_route,
+        registry,
+        qualification);
+
+    const auto moe_experts =
+        moe_experts_config(
+            model,
+            config.activation);
+    register_hip_moe_experts_kernel_variant(
+        model,
+        request,
+        moe_experts,
+        registry,
+        qualification);
+
+    const auto lm_head =
+        lm_head_config(
+            model,
+            config.activation);
+    register_hip_lm_head_kernel_variant(
+        model,
+        request,
+        lm_head,
+        registry,
+        qualification);
+
+    const auto shared =
+        shared_expert_config(
+            model,
+            config.activation);
+    register_hip_shared_expert_kernel_variant(
+        model,
+        request,
+        shared,
+        registry,
+        qualification);
+}
+
 HipLauncherCatalog::HipLauncherCatalog(
     const ModelContract& model,
     HipLauncherCatalogConfig config)
