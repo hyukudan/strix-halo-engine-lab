@@ -305,6 +305,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         src/hip_runtime_launchers.hip
         src/hip_moe_route_launcher.hip
         src/hip_moe_experts_launcher.hip
+        src/hip_ple_launcher.hip
         src/hip_embedding_launcher.hip
         src/hip_gdn_launcher.hip
         src/hip_hyper_mix_launcher.hip
@@ -532,6 +533,29 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         add_test(
             NAME strix-hip-gdn-launcher-tests
             COMMAND strix-hip-gdn-launcher-tests
+        )
+
+        add_executable(
+            strix-hip-ple-launcher-tests
+            tests/hip_ple_launcher_tests.hip
+        )
+        set_target_properties(
+            strix-hip-ple-launcher-tests
+            PROPERTIES
+            HIP_STANDARD 20
+            HIP_STANDARD_REQUIRED ON
+            HIP_ARCHITECTURES gfx1151
+        )
+        target_link_libraries(
+            strix-hip-ple-launcher-tests
+            PRIVATE strix_hip_runtime
+        )
+        strix_target_warnings(
+            strix-hip-ple-launcher-tests
+        )
+        add_test(
+            NAME strix-hip-ple-launcher-tests
+            COMMAND strix-hip-ple-launcher-tests
         )
     endif()
 endif()
