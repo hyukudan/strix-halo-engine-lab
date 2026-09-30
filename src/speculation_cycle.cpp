@@ -105,11 +105,15 @@ build_greedy_speculation_cycle_plan(
             "speculative output exceeds model context");
     }
 
+    // SerialSessionContext::committed_tokens counts tokens represented in
+    // persistent target state, not merely emitted continuation tokens. The
+    // bonus token is emitted from target logits but is not processed into
+    // KV/GDN state until a later target step.
     plan.post_cycle_committed_tokens =
         checked_add(
             request.committed_tokens,
             static_cast<std::uint64_t>(
-                plan.emitted_tokens.size()),
+                plan.committed_state_advance),
             "speculative committed-token counter overflow");
 
     if (!plan.speculation_used) {
