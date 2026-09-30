@@ -66,6 +66,37 @@ int main() {
 
 
 
+
+    const auto indexed_it =
+        std::find_if(
+            io.steps.begin(),
+            io.steps.end(),
+            [](const auto& step) {
+                return step.op ==
+                    strix::SerialOp::indexed_attention;
+            });
+    expect(
+        indexed_it != io.steps.end() &&
+            indexed_it->temporaries.size() == 1,
+        "arena fixture exposes indexed-attention temporary");
+    if (indexed_it != io.steps.end() &&
+        !indexed_it->temporaries.empty()) {
+        const auto* temporary =
+            strix::find_arena_allocation(
+                aligned,
+                indexed_it->temporaries[0]);
+        expect(
+            temporary != nullptr &&
+                temporary->first_step ==
+                    temporary->last_step,
+            "indexed-attention temporary has one-step lifetime");
+        expect(
+            temporary != nullptr &&
+                temporary->bytes ==
+                    sizes.indexed_attention_workspace_bytes,
+            "indexed-attention temporary uses analytical workspace size");
+    }
+
     const auto ple_it =
         std::find_if(
             io.steps.begin(),
