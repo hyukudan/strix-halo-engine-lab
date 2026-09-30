@@ -249,6 +249,44 @@ int main() {
             compiled.execution_identity,
         "router normalization policy changes compiled execution identity");
 
+
+    auto different_qsa_model =
+        model;
+    different_qsa_model.indexer_budget =
+        model.indexer_budget -
+        model.indexer_compress_ratio;
+    const auto different_qsa =
+        strix::compile_serial_execution(
+            different_qsa_model,
+            make_registry(
+                different_qsa_model,
+                binding_request),
+            binding_request,
+            buffer_request,
+            256);
+    expect(
+        different_qsa.execution_identity !=
+            compiled.execution_identity,
+        "QSA budget changes compiled execution identity");
+
+    auto different_rope_model =
+        model;
+    different_rope_model.partial_rotary_factor =
+        0.5F;
+    const auto different_rope =
+        strix::compile_serial_execution(
+            different_rope_model,
+            make_registry(
+                different_rope_model,
+                binding_request),
+            binding_request,
+            buffer_request,
+            256);
+    expect(
+        different_rope.execution_identity !=
+            compiled.execution_identity,
+        "partial RoPE factor changes compiled execution identity");
+
     auto different_temporary_request =
         buffer_request;
     different_temporary_request.mlp_intermediate_element_bytes =
