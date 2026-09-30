@@ -19,14 +19,14 @@ struct MemoryPlanRequest {
     std::uint64_t resident_model_bytes = 0;
     std::uint64_t bounded_cache_bytes = 0;
     bool include_mtp_kv = true;
-    bool include_provisional_indexer = true;
+    bool include_indexer = true;
     RollbackPolicy rollback = RollbackPolicy::recompute;
 };
 
 struct MemoryBreakdown {
     std::uint64_t base_kv = 0;
     std::uint64_t mtp_kv = 0;
-    std::uint64_t provisional_indexer = 0;
+    std::uint64_t indexer = 0;
     std::uint64_t gdn_matrix_state = 0;
     std::uint64_t gdn_conv_state = 0;
     std::uint64_t gdn_state = 0;
