@@ -254,6 +254,11 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-launch-dispatch-tests)
     add_test(NAME strix-launch-dispatch-tests COMMAND strix-launch-dispatch-tests)
 
+    add_executable(strix-speculative-verify-launch-dispatch-tests tests/speculative_verify_launch_dispatch_tests.cpp)
+    target_link_libraries(strix-speculative-verify-launch-dispatch-tests PRIVATE strix_core)
+    strix_target_warnings(strix-speculative-verify-launch-dispatch-tests)
+    add_test(NAME strix-speculative-verify-launch-dispatch-tests COMMAND strix-speculative-verify-launch-dispatch-tests)
+
     add_executable(strix-runtime-launchers-tests tests/runtime_launchers_tests.cpp)
     target_link_libraries(strix-runtime-launchers-tests PRIVATE strix_core)
     strix_target_warnings(strix-runtime-launchers-tests)
