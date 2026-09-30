@@ -325,6 +325,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         src/hip_embedding_launcher.hip
         src/hip_gdn_launcher.hip
         src/hip_hyper_mix_launcher.hip
+        src/hip_indexed_attention_launcher.hip
         src/hip_lm_head_launcher.hip
         src/hip_shared_expert_launcher.hip
     )
