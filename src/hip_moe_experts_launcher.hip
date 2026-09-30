@@ -7,7 +7,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <limits>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -29,11 +28,6 @@ struct Q8Block {
     std::int8_t values[32];
 };
 
-struct IQ4NLBlock {
-    __half d;
-    std::uint8_t qs[16];
-};
-
 struct IQ4XSBlock {
     __half d;
     std::uint16_t scales_h;
@@ -42,7 +36,6 @@ struct IQ4XSBlock {
 };
 
 static_assert(sizeof(Q8Block) == 34);
-static_assert(sizeof(IQ4NLBlock) == 18);
 static_assert(sizeof(IQ4XSBlock) == 136);
 
 __device__ __constant__
@@ -58,7 +51,6 @@ enum class WeightKind {
     f16,
     bf16,
     q8_0,
-    iq4_nl,
     iq4_xs,
 };
 
@@ -67,10 +59,12 @@ struct TensorPair {
     const RuntimeTensorBinding* runtime = nullptr;
 };
 
-struct ExpertTensors {
+struct RoutedTensors {
+    TensorPair gate_up;
     TensorPair gate;
     TensorPair up;
     TensorPair down;
+    bool fused_gate_up = false;
 };
 
 void hash_u64(
@@ -79,9 +73,7 @@ void hash_u64(
     for (unsigned shift = 0;
          shift < 64;
          shift += 8) {
-        hash ^=
-            (value >> shift) &
-            0xffULL;
+        hash ^= (value >> shift) & 0xffULL;
         hash *= fnv_prime;
     }
 }
@@ -103,8 +95,7 @@ void validate_config(
         config.intermediate_size == 0 ||
         config.expert_count == 0 ||
         config.top_k == 0 ||
-        config.top_k >
-            config.expert_count) {
+        config.top_k > config.expert_count) {
         throw std::invalid_argument(
             "HIP routed-expert geometry is invalid");
     }
@@ -134,20 +125,18 @@ WeightKind weight_kind(
     case 0: return WeightKind::f32;
     case 1: return WeightKind::f16;
     case 8: return WeightKind::q8_0;
-    case 20: return WeightKind::iq4_nl;
     case 23: return WeightKind::iq4_xs;
     case 30: return WeightKind::bf16;
     default:
         throw std::invalid_argument(
-            "HIP routed experts support F32, F16, BF16, Q8_0, IQ4_NL and IQ4_XS");
+            "HIP routed experts support F32, F16, BF16, Q8_0 and IQ4_XS");
     }
 }
 
 __device__ float bf16_to_float(
     std::uint16_t bits) {
     return __uint_as_float(
-        static_cast<std::uint32_t>(
-            bits) << 16U);
+        static_cast<std::uint32_t>(bits) << 16U);
 }
 
 __device__ float load_activation(
@@ -184,24 +173,21 @@ __device__ std::uint8_t iq4_local_scale(
     const IQ4XSBlock& block,
     std::uint32_t subblock) {
     const auto low_byte =
-        block.scales_l[
-            subblock / 2U];
+        block.scales_l[subblock / 2U];
     const auto low =
         static_cast<std::uint8_t>(
             (low_byte >>
-             (4U *
-              (subblock % 2U))) &
+             (4U * (subblock % 2U))) &
             0x0fU);
     const auto high =
         static_cast<std::uint8_t>(
             (block.scales_h >>
              (2U * subblock)) &
             0x03U);
-    return
+    return static_cast<std::uint8_t>(
+        low |
         static_cast<std::uint8_t>(
-            low |
-            static_cast<std::uint8_t>(
-                high << 4U));
+            high << 4U));
 }
 
 template <WeightKind Kind>
@@ -212,128 +198,72 @@ __device__ float load_weight(
     std::uint32_t feature);
 
 template <>
-__device__ float load_weight<
-    WeightKind::f32>(
+__device__ float load_weight<WeightKind::f32>(
     const void* weights,
     std::uint32_t row_width,
     std::uint64_t row,
     std::uint32_t feature) {
-    return
-        static_cast<const float*>(
-            weights)[
-            row *
-                row_width +
-            feature];
+    return static_cast<const float*>(weights)[
+        row * row_width + feature];
 }
 
 template <>
-__device__ float load_weight<
-    WeightKind::f16>(
+__device__ float load_weight<WeightKind::f16>(
     const void* weights,
     std::uint32_t row_width,
     std::uint64_t row,
     std::uint32_t feature) {
     const auto* values =
-        static_cast<const __half*>(
-            weights);
+        static_cast<const __half*>(weights);
     return __half2float(
-        values[
-            row *
-                row_width +
-            feature]);
+        values[row * row_width + feature]);
 }
 
 template <>
-__device__ float load_weight<
-    WeightKind::bf16>(
+__device__ float load_weight<WeightKind::bf16>(
     const void* weights,
     std::uint32_t row_width,
     std::uint64_t row,
     std::uint32_t feature) {
     const auto* values =
-        static_cast<const std::uint16_t*>(
-            weights);
+        static_cast<const std::uint16_t*>(weights);
     return bf16_to_float(
-        values[
-            row *
-                row_width +
-            feature]);
+        values[row * row_width + feature]);
 }
 
 template <>
-__device__ float load_weight<
-    WeightKind::q8_0>(
+__device__ float load_weight<WeightKind::q8_0>(
     const void* weights,
     std::uint32_t row_width,
     std::uint64_t row,
     std::uint32_t feature) {
     const auto* blocks =
-        static_cast<const Q8Block*>(
-            weights);
+        static_cast<const Q8Block*>(weights);
     const auto blocks_per_row =
         row_width / 32U;
     const auto& block =
         blocks[
-            row *
-                blocks_per_row +
+            row * blocks_per_row +
             feature / 32U];
-    return __half2float(
-               block.scale) *
+    return __half2float(block.scale) *
            static_cast<float>(
                block.values[
                    feature % 32U]);
 }
 
 template <>
-__device__ float load_weight<
-    WeightKind::iq4_nl>(
+__device__ float load_weight<WeightKind::iq4_xs>(
     const void* weights,
     std::uint32_t row_width,
     std::uint64_t row,
     std::uint32_t feature) {
     const auto* blocks =
-        static_cast<const IQ4NLBlock*>(
-            weights);
-    const auto blocks_per_row =
-        row_width / 32U;
-    const auto& block =
-        blocks[
-            row *
-                blocks_per_row +
-            feature / 32U];
-    const auto within =
-        feature % 32U;
-    const auto packed =
-        block.qs[
-            within % 16U];
-    const auto code =
-        within < 16U
-            ? static_cast<std::uint8_t>(
-                  packed & 0x0fU)
-            : static_cast<std::uint8_t>(
-                  packed >> 4U);
-    return
-        __half2float(block.d) *
-        static_cast<float>(
-            iq4_codebook[code]);
-}
-
-template <>
-__device__ float load_weight<
-    WeightKind::iq4_xs>(
-    const void* weights,
-    std::uint32_t row_width,
-    std::uint64_t row,
-    std::uint32_t feature) {
-    const auto* blocks =
-        static_cast<const IQ4XSBlock*>(
-            weights);
+        static_cast<const IQ4XSBlock*>(weights);
     const auto blocks_per_row =
         row_width / 256U;
     const auto& block =
         blocks[
-            row *
-                blocks_per_row +
+            row * blocks_per_row +
             feature / 256U];
 
     const auto within =
@@ -358,70 +288,58 @@ __device__ float load_weight<
                 block,
                 subblock)) -
         32;
-    return
-        __half2float(block.d) *
-        static_cast<float>(local) *
-        static_cast<float>(
-            iq4_codebook[code]);
+    return __half2float(block.d) *
+           static_cast<float>(local) *
+           static_cast<float>(
+               iq4_codebook[code]);
 }
 
 std::uint64_t required_weight_bytes(
     WeightKind kind,
-    std::uint32_t input_width,
-    std::uint64_t output_rows) {
+    std::uint32_t input,
+    std::uint64_t output_rows,
+    std::uint32_t experts) {
+    std::uint64_t row_bytes = 0;
     switch (kind) {
     case WeightKind::f32:
-        return
-            static_cast<std::uint64_t>(
-                input_width) *
-            output_rows *
-            4ULL;
+        row_bytes =
+            static_cast<std::uint64_t>(input) * 4ULL;
+        break;
     case WeightKind::f16:
     case WeightKind::bf16:
-        return
-            static_cast<std::uint64_t>(
-                input_width) *
-            output_rows *
-            2ULL;
+        row_bytes =
+            static_cast<std::uint64_t>(input) * 2ULL;
+        break;
     case WeightKind::q8_0:
-        if (input_width % 32U != 0) {
+        if (input % 32U != 0) {
             throw std::invalid_argument(
                 "Q8_0 routed-expert input width must be divisible by 32");
         }
-        return
+        row_bytes =
             static_cast<std::uint64_t>(
-                input_width / 32U) *
-            output_rows *
+                input / 32U) *
             sizeof(Q8Block);
-    case WeightKind::iq4_nl:
-        if (input_width % 32U != 0) {
-            throw std::invalid_argument(
-                "IQ4_NL routed-expert input width must be divisible by 32");
-        }
-        return
-            static_cast<std::uint64_t>(
-                input_width / 32U) *
-            output_rows *
-            sizeof(IQ4NLBlock);
+        break;
     case WeightKind::iq4_xs:
-        if (input_width % 256U != 0) {
+        if (input % 256U != 0) {
             throw std::invalid_argument(
                 "IQ4_XS routed-expert input width must be divisible by 256");
         }
-        return
+        row_bytes =
             static_cast<std::uint64_t>(
-                input_width / 256U) *
-            output_rows *
+                input / 256U) *
             sizeof(IQ4XSBlock);
+        break;
     }
-    throw std::logic_error(
-        "unreachable routed-expert weight kind");
+    return row_bytes *
+           output_rows *
+           experts;
 }
 
 template <
     typename Input,
     WeightKind Kind>
-__global__ void expert_projection_kernel(
+__global__ void selected_projection_kernel(
     const Input* input,
     const std::uint32_t* route_indices,
     std::uint32_t slot,
@@ -436,20 +354,19 @@ __global__ void expert_projection_kernel(
     if (out >= output_width) {
         return;
     }
-
     const auto expert =
         route_indices[slot];
     if (expert >= expert_count) {
         return;
     }
-    const auto weight_row =
-        static_cast<std::uint64_t>(
-            expert) *
-            output_width +
-        out;
 
     __shared__ float scratch[kThreads];
     float sum = 0.0F;
+    const auto row =
+        static_cast<std::uint64_t>(expert) *
+            output_width +
+        out;
+
     for (std::uint32_t feature =
              static_cast<std::uint32_t>(
                  threadIdx.x);
@@ -461,7 +378,7 @@ __global__ void expert_projection_kernel(
             load_weight<Kind>(
                 weights,
                 input_width,
-                weight_row,
+                row,
                 feature);
     }
     scratch[threadIdx.x] = sum;
@@ -479,13 +396,14 @@ __global__ void expert_projection_kernel(
         }
         __syncthreads();
     }
+
     if (threadIdx.x == 0) {
         output[out] =
             scratch[0];
     }
 }
 
-__global__ void gated_activation_kernel(
+__global__ void routed_activation_kernel(
     float* workspace,
     std::uint32_t intermediate_size) {
     const auto index =
@@ -493,11 +411,9 @@ __global__ void gated_activation_kernel(
             blockIdx.x) *
             blockDim.x +
         threadIdx.x;
-    if (index >=
-        intermediate_size) {
+    if (index >= intermediate_size) {
         return;
     }
-
     const float gate =
         workspace[index];
     const float up =
@@ -506,15 +422,14 @@ __global__ void gated_activation_kernel(
             index];
     workspace[index] =
         (gate /
-         (1.0F +
-          expf(-gate))) *
+         (1.0F + expf(-gate))) *
         up;
 }
 
 template <
     typename Output,
     WeightKind Kind>
-__global__ void expert_down_accumulate_kernel(
+__global__ void selected_down_accumulate_kernel(
     const float* intermediate,
     const std::uint32_t* route_indices,
     const float* route_weights,
@@ -530,20 +445,19 @@ __global__ void expert_down_accumulate_kernel(
     if (out >= hidden_size) {
         return;
     }
-
     const auto expert =
         route_indices[slot];
     if (expert >= expert_count) {
         return;
     }
-    const auto weight_row =
-        static_cast<std::uint64_t>(
-            expert) *
-            hidden_size +
-        out;
 
     __shared__ float scratch[kThreads];
     float sum = 0.0F;
+    const auto row =
+        static_cast<std::uint64_t>(expert) *
+            hidden_size +
+        out;
+
     for (std::uint32_t feature =
              static_cast<std::uint32_t>(
                  threadIdx.x);
@@ -554,7 +468,7 @@ __global__ void expert_down_accumulate_kernel(
             load_weight<Kind>(
                 weights,
                 intermediate_size,
-                weight_row,
+                row,
                 feature);
     }
     scratch[threadIdx.x] = sum;
@@ -572,6 +486,7 @@ __global__ void expert_down_accumulate_kernel(
         }
         __syncthreads();
     }
+
     if (threadIdx.x == 0) {
         const float current =
             load_activation(
@@ -580,7 +495,7 @@ __global__ void expert_down_accumulate_kernel(
             &output[out],
             current +
                 scratch[0] *
-                route_weights[slot]);
+                    route_weights[slot]);
     }
 }
 
@@ -593,14 +508,14 @@ bool contains(
 
 TensorPair tensor_pair(
     const ExecutionDispatchContext& context,
-    std::uint32_t tensor_index) {
+    std::uint32_t index) {
     if (context.resources == nullptr ||
         context.resources->model_manifest ==
             nullptr) {
         throw std::invalid_argument(
             "HIP routed experts require model manifest");
     }
-    if (tensor_index >=
+    if (index >=
         context.resources->
             model_manifest->
             tensors.size()) {
@@ -610,21 +525,22 @@ TensorPair tensor_pair(
     return TensorPair{
         &context.resources->
             model_manifest->
-            tensors[tensor_index],
+            tensors[index],
         &resolve_dispatch_tensor(
             context,
-            tensor_index),
+            index),
     };
 }
 
-ExpertTensors identify_tensors(
+RoutedTensors identify_tensors(
     const ExecutionDispatchContext& context,
     const ExecutionTensorAccess& access,
     const HipMoeExpertsLauncherConfig& config) {
-    ExpertTensors result;
-    std::uint32_t gate_matches = 0;
-    std::uint32_t up_matches = 0;
-    std::uint32_t down_matches = 0;
+    RoutedTensors result;
+    std::uint32_t fused = 0;
+    std::uint32_t gate = 0;
+    std::uint32_t up = 0;
+    std::uint32_t down = 0;
 
     for (const auto index :
          access.tensor_indices) {
@@ -635,72 +551,87 @@ ExpertTensors identify_tensors(
         const auto& tensor =
             *pair.manifest;
         if (tensor.role !=
-                TensorRole::moe_expert ||
-            tensor.dimensions.size() < 3) {
+            TensorRole::moe_expert ||
+            tensor.dimensions.size() < 3 ||
+            tensor.dimensions[2] !=
+                config.expert_count) {
             continue;
         }
 
-        if (contains(
-                tensor.name,
-                "gate_up_exps")) {
-            throw std::invalid_argument(
-                "fused gate_up_exps is not supported by routed-expert v1");
-        }
-
-        const bool gate_up_geometry =
-            tensor.dimensions[0] ==
+        if (tensor.dimensions[0] ==
                 config.hidden_size &&
             tensor.dimensions[1] ==
-                config.intermediate_size &&
-            tensor.dimensions[2] ==
-                config.expert_count;
-        const bool down_geometry =
-            tensor.dimensions[0] ==
+                2ULL *
+                    config.intermediate_size &&
+            contains(
+                tensor.name,
+                "gate_up")) {
+            result.gate_up = pair;
+            ++fused;
+            continue;
+        }
+
+        if (tensor.dimensions[0] ==
+                config.hidden_size &&
+            tensor.dimensions[1] ==
+                config.intermediate_size) {
+            if (contains(
+                    tensor.name,
+                    "gate") &&
+                !contains(
+                    tensor.name,
+                    "gate_up")) {
+                result.gate = pair;
+                ++gate;
+                continue;
+            }
+            if (contains(
+                    tensor.name,
+                    "up")) {
+                result.up = pair;
+                ++up;
+                continue;
+            }
+        }
+
+        if (tensor.dimensions[0] ==
                 config.intermediate_size &&
             tensor.dimensions[1] ==
                 config.hidden_size &&
-            tensor.dimensions[2] ==
-                config.expert_count;
-
-        if (gate_up_geometry &&
             contains(
                 tensor.name,
-                "ffn_gate_exps")) {
-            result.gate = pair;
-            ++gate_matches;
-            continue;
-        }
-        if (gate_up_geometry &&
-            contains(
-                tensor.name,
-                "ffn_up_exps")) {
-            result.up = pair;
-            ++up_matches;
-            continue;
-        }
-        if (down_geometry &&
-            contains(
-                tensor.name,
-                "ffn_down_exps")) {
+                "down")) {
             result.down = pair;
-            ++down_matches;
-            continue;
+            ++down;
         }
     }
 
-    if (gate_matches != 1 ||
-        up_matches != 1 ||
-        down_matches != 1) {
+    if (down != 1) {
         throw std::invalid_argument(
-            "routed-expert tensor family is missing or ambiguous");
+            "routed expert down tensor is missing or ambiguous");
     }
-    return result;
+    if (fused == 1 &&
+        gate == 0 &&
+        up == 0) {
+        result.fused_gate_up = true;
+        return result;
+    }
+    if (fused == 0 &&
+        gate == 1 &&
+        up == 1) {
+        result.fused_gate_up = false;
+        return result;
+    }
+
+    throw std::invalid_argument(
+        "routed expert gate/up tensor family is missing or ambiguous");
 }
 
 void validate_tensor(
     const TensorPair& pair,
-    std::uint32_t input_width,
-    std::uint64_t output_rows,
+    std::uint32_t input,
+    std::uint64_t output,
+    std::uint32_t experts,
     const char* name) {
     if (pair.manifest == nullptr ||
         pair.runtime == nullptr) {
@@ -718,14 +649,13 @@ void validate_tensor(
             " tensor is not GPU-visible");
     }
 
-    const auto kind =
-        weight_kind(
-            pair.manifest->ggml_type);
     const auto required =
         required_weight_bytes(
-            kind,
-            input_width,
-            output_rows);
+            weight_kind(
+                pair.manifest->ggml_type),
+            input,
+            output,
+            experts);
     if (pair.runtime->bytes <
         required) {
         throw std::invalid_argument(
@@ -738,23 +668,22 @@ template <typename Input>
 void launch_projection_by_kind(
     WeightKind kind,
     const Input* input,
-    const std::uint32_t* route_indices,
+    const std::uint32_t* routes,
     std::uint32_t slot,
     const RuntimeTensorBinding& weights,
     std::uint32_t input_width,
     std::uint32_t output_width,
-    std::uint32_t expert_count,
+    std::uint32_t experts,
     float* output) {
-#define STRIX_EXPERT_PROJ(kind_name)     hipLaunchKernelGGL(         HIP_KERNEL_NAME(             expert_projection_kernel<                 Input, WeightKind::kind_name>),         dim3(output_width),         dim3(kThreads),         0, 0,         input, route_indices, slot,         reinterpret_cast<const void*>(weights.address),         input_width, output_width, expert_count, output)
+#define STRIX_PROJECT_CASE(kind_name)     hipLaunchKernelGGL(         HIP_KERNEL_NAME(             selected_projection_kernel<                 Input, WeightKind::kind_name>),         dim3(output_width), dim3(kThreads), 0, 0,         input, routes, slot,         reinterpret_cast<const void*>(weights.address),         input_width, output_width, experts, output)
     switch (kind) {
-    case WeightKind::f32: STRIX_EXPERT_PROJ(f32); break;
-    case WeightKind::f16: STRIX_EXPERT_PROJ(f16); break;
-    case WeightKind::bf16: STRIX_EXPERT_PROJ(bf16); break;
-    case WeightKind::q8_0: STRIX_EXPERT_PROJ(q8_0); break;
-    case WeightKind::iq4_nl: STRIX_EXPERT_PROJ(iq4_nl); break;
-    case WeightKind::iq4_xs: STRIX_EXPERT_PROJ(iq4_xs); break;
+    case WeightKind::f32: STRIX_PROJECT_CASE(f32); break;
+    case WeightKind::f16: STRIX_PROJECT_CASE(f16); break;
+    case WeightKind::bf16: STRIX_PROJECT_CASE(bf16); break;
+    case WeightKind::q8_0: STRIX_PROJECT_CASE(q8_0); break;
+    case WeightKind::iq4_xs: STRIX_PROJECT_CASE(iq4_xs); break;
     }
-#undef STRIX_EXPERT_PROJ
+#undef STRIX_PROJECT_CASE
     check_hip(
         hipGetLastError(),
         "HIP routed-expert projection launch");
@@ -764,22 +693,23 @@ template <typename Output>
 void launch_down_by_kind(
     WeightKind kind,
     const float* intermediate,
-    const std::uint32_t* route_indices,
+    const std::uint32_t* routes,
     const float* route_weights,
     std::uint32_t slot,
     const RuntimeTensorBinding& weights,
-    const HipMoeExpertsLauncherConfig& config,
+    std::uint32_t intermediate_size,
+    std::uint32_t hidden_size,
+    std::uint32_t experts,
     Output* output) {
-#define STRIX_EXPERT_DOWN(kind_name)     hipLaunchKernelGGL(         HIP_KERNEL_NAME(             expert_down_accumulate_kernel<                 Output, WeightKind::kind_name>),         dim3(config.hidden_size),         dim3(kThreads),         0, 0,         intermediate, route_indices, route_weights, slot,         reinterpret_cast<const void*>(weights.address),         config.intermediate_size, config.hidden_size,         config.expert_count, output)
+#define STRIX_DOWN_CASE(kind_name)     hipLaunchKernelGGL(         HIP_KERNEL_NAME(             selected_down_accumulate_kernel<                 Output, WeightKind::kind_name>),         dim3(hidden_size), dim3(kThreads), 0, 0,         intermediate, routes, route_weights, slot,         reinterpret_cast<const void*>(weights.address),         intermediate_size, hidden_size, experts, output)
     switch (kind) {
-    case WeightKind::f32: STRIX_EXPERT_DOWN(f32); break;
-    case WeightKind::f16: STRIX_EXPERT_DOWN(f16); break;
-    case WeightKind::bf16: STRIX_EXPERT_DOWN(bf16); break;
-    case WeightKind::q8_0: STRIX_EXPERT_DOWN(q8_0); break;
-    case WeightKind::iq4_nl: STRIX_EXPERT_DOWN(iq4_nl); break;
-    case WeightKind::iq4_xs: STRIX_EXPERT_DOWN(iq4_xs); break;
+    case WeightKind::f32: STRIX_DOWN_CASE(f32); break;
+    case WeightKind::f16: STRIX_DOWN_CASE(f16); break;
+    case WeightKind::bf16: STRIX_DOWN_CASE(bf16); break;
+    case WeightKind::q8_0: STRIX_DOWN_CASE(q8_0); break;
+    case WeightKind::iq4_xs: STRIX_DOWN_CASE(iq4_xs); break;
     }
-#undef STRIX_EXPERT_DOWN
+#undef STRIX_DOWN_CASE
     check_hip(
         hipGetLastError(),
         "HIP routed-expert down launch");
@@ -789,78 +719,84 @@ template <typename Storage>
 void launch_typed(
     const HipMoeExpertsLauncherConfig& config,
     const ExecutionBufferAddress& hidden,
-    const ExecutionBufferAddress& indices,
+    const ExecutionBufferAddress& route_indices,
     const ExecutionBufferAddress& route_weights,
     const ExecutionBufferAddress& output,
     const ExecutionBufferAddress& temporary,
-    const ExpertTensors& tensors) {
-    auto* workspace =
-        reinterpret_cast<float*>(
-            temporary.address);
-    auto* gate =
-        workspace;
-    auto* up =
-        workspace +
-        config.intermediate_size;
-
-    const auto* hidden_values =
+    const RoutedTensors& tensors) {
+    const auto* input =
         reinterpret_cast<const Storage*>(
             hidden.address);
-    const auto* route_indices =
+    const auto* routes =
         reinterpret_cast<const std::uint32_t*>(
-            indices.address);
+            route_indices.address);
     const auto* weights =
         reinterpret_cast<const float*>(
             route_weights.address);
-    auto* output_values =
-        reinterpret_cast<Storage*>(
-            output.address);
+    auto* workspace =
+        reinterpret_cast<float*>(
+            temporary.address);
 
     check_hip(
-        hipMemsetAsync(
-            output_values,
+        hipMemset(
+            reinterpret_cast<void*>(
+                output.address),
             0,
             static_cast<std::size_t>(
-                config.hidden_size) *
-                sizeof(Storage),
-            nullptr),
-        "HIP routed-expert output clear");
+                output.bytes)),
+        "clear routed-expert output");
 
     for (std::uint32_t slot = 0;
          slot < config.top_k;
          ++slot) {
-        launch_projection_by_kind(
-            weight_kind(
-                tensors.gate.manifest->
-                    ggml_type),
-            hidden_values,
-            route_indices,
-            slot,
-            *tensors.gate.runtime,
-            config.hidden_size,
-            config.intermediate_size,
-            config.expert_count,
-            gate);
-
-        launch_projection_by_kind(
-            weight_kind(
-                tensors.up.manifest->
-                    ggml_type),
-            hidden_values,
-            route_indices,
-            slot,
-            *tensors.up.runtime,
-            config.hidden_size,
-            config.intermediate_size,
-            config.expert_count,
-            up);
+        if (tensors.fused_gate_up) {
+            launch_projection_by_kind(
+                weight_kind(
+                    tensors.gate_up.
+                        manifest->ggml_type),
+                input,
+                routes,
+                slot,
+                *tensors.gate_up.runtime,
+                config.hidden_size,
+                2U *
+                    config.intermediate_size,
+                config.expert_count,
+                workspace);
+        } else {
+            launch_projection_by_kind(
+                weight_kind(
+                    tensors.gate.
+                        manifest->ggml_type),
+                input,
+                routes,
+                slot,
+                *tensors.gate.runtime,
+                config.hidden_size,
+                config.intermediate_size,
+                config.expert_count,
+                workspace);
+            launch_projection_by_kind(
+                weight_kind(
+                    tensors.up.
+                        manifest->ggml_type),
+                input,
+                routes,
+                slot,
+                *tensors.up.runtime,
+                config.hidden_size,
+                config.intermediate_size,
+                config.expert_count,
+                workspace +
+                    config.intermediate_size);
+        }
 
         const auto blocks =
             (config.intermediate_size +
              kThreads - 1U) /
             kThreads;
         hipLaunchKernelGGL(
-            gated_activation_kernel,
+            routed_activation_kernel,
             dim3(blocks),
             dim3(kThreads),
             0, 0,
@@ -874,13 +810,16 @@ void launch_typed(
             weight_kind(
                 tensors.down.manifest->
                     ggml_type),
-            gate,
-            route_indices,
+            workspace,
+            routes,
             weights,
             slot,
             *tensors.down.runtime,
-            config,
-            output_values);
+            config.intermediate_size,
+            config.hidden_size,
+            config.expert_count,
+            reinterpret_cast<Storage*>(
+                output.address));
     }
 }
 
@@ -896,7 +835,7 @@ void launch_moe_experts(
         context.writes.size() != 1 ||
         context.temporaries.size() != 1) {
         throw std::invalid_argument(
-            "HIP routed experts expect hidden/indices/weights reads, one write and one temporary");
+            "HIP routed experts expect hidden/routes/weights, one output and one temporary");
     }
     if (context.logical_rows != 1 ||
         context.request_concurrency != 1) {
@@ -917,7 +856,7 @@ void launch_moe_experts(
     const auto hidden =
         resolve_dispatch_read(
             context, 0);
-    const auto indices =
+    const auto route_indices =
         resolve_dispatch_read(
             context, 1);
     const auto route_weights =
@@ -937,11 +876,11 @@ void launch_moe_experts(
         static_cast<std::uint64_t>(
             config.hidden_size) *
         activation_bytes;
-    const auto index_required =
+    const auto route_index_required =
         static_cast<std::uint64_t>(
             config.top_k) *
         sizeof(std::uint32_t);
-    const auto route_required =
+    const auto route_weight_required =
         static_cast<std::uint64_t>(
             config.top_k) *
         sizeof(float);
@@ -955,10 +894,10 @@ void launch_moe_experts(
             hidden_required ||
         output.bytes <
             hidden_required ||
-        indices.bytes <
-            index_required ||
+        route_indices.bytes <
+            route_index_required ||
         route_weights.bytes <
-            route_required ||
+            route_weight_required ||
         temporary.bytes <
             temporary_required) {
         throw std::invalid_argument(
@@ -974,34 +913,41 @@ void launch_moe_experts(
             access,
             config);
 
-    validate_tensor(
-        tensors.gate,
-        config.hidden_size,
-        static_cast<std::uint64_t>(
-            config.intermediate_size) *
+    if (tensors.fused_gate_up) {
+        validate_tensor(
+            tensors.gate_up,
+            config.hidden_size,
+            2ULL *
+                config.intermediate_size,
             config.expert_count,
-        "routed gate experts");
-    validate_tensor(
-        tensors.up,
-        config.hidden_size,
-        static_cast<std::uint64_t>(
-            config.intermediate_size) *
+            "routed gate-up");
+    } else {
+        validate_tensor(
+            tensors.gate,
+            config.hidden_size,
+            config.intermediate_size,
             config.expert_count,
-        "routed up experts");
+            "routed gate");
+        validate_tensor(
+            tensors.up,
+            config.hidden_size,
+            config.intermediate_size,
+            config.expert_count,
+            "routed up");
+    }
     validate_tensor(
         tensors.down,
         config.intermediate_size,
-        static_cast<std::uint64_t>(
-            config.hidden_size) *
-            config.expert_count,
-        "routed down experts");
+        config.hidden_size,
+        config.expert_count,
+        "routed down");
 
     switch (config.activation) {
     case HipActivationStorage::bf16:
         launch_typed<std::uint16_t>(
             config,
             hidden,
-            indices,
+            route_indices,
             route_weights,
             output,
             temporary,
@@ -1011,7 +957,7 @@ void launch_moe_experts(
         launch_typed<float>(
             config,
             hidden,
-            indices,
+            route_indices,
             route_weights,
             output,
             temporary,
@@ -1143,12 +1089,9 @@ void register_hip_moe_experts_kernel_variant(
     variant.numerics.deterministic = true;
     variant.qualification =
         qualification;
-
-    // V1 launches one expert slot at a time and performs sequential accumulation.
-    // Keep it eager until the full route-dependent sequence is graph-qualified.
-    variant.graph_safe = false;
+    variant.graph_safe = true;
     variant.input_layout =
-        "row-major+device-route";
+        "row-major+device-topk";
     variant.output_layout =
         "row-major";
     variant.compiler_identity =
@@ -1197,7 +1140,6 @@ register_for_compiled_execution(
             SerialOp::moe_experts) {
             continue;
         }
-
         const auto& binding =
             compiled.bindings.bindings[index];
         if (binding.host_or_runtime_step ||
@@ -1206,7 +1148,6 @@ register_for_compiled_execution(
             throw std::invalid_argument(
                 "HIP routed-expert step has no kernel binding");
         }
-
         if (registered_id.empty()) {
             registered_id =
                 *binding.kernel_id;
