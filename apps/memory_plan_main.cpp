@@ -59,7 +59,7 @@ int main(int argc, char** argv) try {
         } else if (argument == "--rollback-full") {
             request.rollback = strix::RollbackPolicy::full_gdn_snapshots;
         } else if (argument == "--no-indexer") {
-            request.include_provisional_indexer = false;
+            request.include_indexer = false;
         } else if (argument == "--no-mtp-kv") {
             request.include_mtp_kv = false;
         } else {
@@ -74,7 +74,7 @@ int main(int argc, char** argv) try {
     std::cout << "{\n  \"breakdown\": {\n";
     print_field("base_kv", plan.base_kv);
     print_field("mtp_kv", plan.mtp_kv);
-    print_field("provisional_indexer", plan.provisional_indexer);
+    print_field("indexer_raw_keys", plan.indexer);
     print_field("gdn_matrix_state", plan.gdn_matrix_state);
     print_field("gdn_conv_state", plan.gdn_conv_state);
     print_field("gdn_state", plan.gdn_state);
