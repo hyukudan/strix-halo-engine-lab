@@ -197,6 +197,81 @@ int main() {
                "verify window cannot exceed allocated session capacity");
     }
 
+
+    {
+        const std::vector<std::uint32_t> candidates{
+            7, 8, 9};
+        const std::vector<std::uint32_t> target{
+            7, 88, 77, 66};
+        auto request =
+            base_request(
+                candidates,
+                target);
+
+        // Preparation deliberately does not need target verification tokens.
+        auto prepare_request = request;
+        prepare_request.target_tokens = {};
+        const auto preparation =
+            strix::prepare_greedy_speculation_cycle(
+                model,
+                layout,
+                prepare_request);
+
+        expect(preparation.candidate_tokens == candidates &&
+                   preparation.pre_window_snapshot.plan_identity != 0 &&
+                   preparation.pre_window_snapshot.next_position ==
+                       request.base_position,
+               "preparation captures snapshot before target tokens exist");
+
+        strix::GreedySpeculationFinalizeRequest finalize;
+        finalize.target_tokens = target;
+        finalize.token_budget = request.token_budget;
+        const auto plan =
+            strix::finalize_greedy_speculation_cycle(
+                model,
+                layout,
+                preparation,
+                finalize);
+
+        expect(plan.verification.accepted_matches == 1 &&
+                   plan.restore_required &&
+                   plan.replay_tokens ==
+                       std::vector<std::uint32_t>({7}),
+               "finalization applies verification result to prepared state");
+    }
+
+    {
+        const std::vector<std::uint32_t> candidates;
+        const std::vector<std::uint32_t> target{42};
+        auto request =
+            base_request(
+                candidates,
+                target);
+        request.target_tokens = {};
+
+        const auto preparation =
+            strix::prepare_greedy_speculation_cycle(
+                model,
+                layout,
+                request);
+        expect(preparation.pre_window_snapshot.plan_identity == 0,
+               "depth-zero preparation does not allocate a snapshot plan");
+
+        strix::GreedySpeculationFinalizeRequest finalize;
+        finalize.target_tokens = target;
+        finalize.token_budget = 1;
+        const auto plan =
+            strix::finalize_greedy_speculation_cycle(
+                model,
+                layout,
+                preparation,
+                finalize);
+        expect(!plan.snapshot_required &&
+                   plan.emitted_tokens ==
+                       std::vector<std::uint32_t>({42}),
+               "depth-zero finalization remains snapshot-free");
+    }
+
     if (failures == 0) {
         std::cout << "speculation cycle tests passed\n";
     }
