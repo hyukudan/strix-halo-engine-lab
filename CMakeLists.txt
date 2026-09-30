@@ -574,5 +574,28 @@ if(STRIX_ENABLE_HIP_RUNTIME)
             NAME strix-hip-ple-launcher-tests
             COMMAND strix-hip-ple-launcher-tests
         )
+
+        add_executable(
+            strix-hip-indexed-attention-launcher-tests
+            tests/hip_indexed_attention_launcher_tests.hip
+        )
+        set_target_properties(
+            strix-hip-indexed-attention-launcher-tests
+            PROPERTIES
+            HIP_STANDARD 20
+            HIP_STANDARD_REQUIRED ON
+            HIP_ARCHITECTURES gfx1151
+        )
+        target_link_libraries(
+            strix-hip-indexed-attention-launcher-tests
+            PRIVATE strix_hip_runtime
+        )
+        strix_target_warnings(
+            strix-hip-indexed-attention-launcher-tests
+        )
+        add_test(
+            NAME strix-hip-indexed-attention-launcher-tests
+            COMMAND strix-hip-indexed-attention-launcher-tests
+        )
     endif()
 endif()
