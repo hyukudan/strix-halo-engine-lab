@@ -1,7 +1,9 @@
 #include "strix/ple_lookup.hpp"
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
+#include <vector>
 #include <iostream>
 #include <stdexcept>
 
@@ -107,6 +109,146 @@ int main() {
     expect(
         bad_context,
         "PLE hashing rejects wrong history length");
+
+
+    {
+        constexpr std::uint64_t row_elements = 160;
+        constexpr std::uint64_t rows = 4;
+        constexpr std::uint64_t row_bytes =
+            row_elements * sizeof(std::uint16_t);
+
+        std::vector<std::uint16_t> table(
+            static_cast<std::size_t>(
+                row_elements * rows));
+        for (std::uint64_t row = 0;
+             row < rows;
+             ++row) {
+            for (std::uint64_t column = 0;
+                 column < row_elements;
+                 ++column) {
+                table[
+                    static_cast<std::size_t>(
+                        row * row_elements +
+                        column)] =
+                    static_cast<std::uint16_t>(
+                        row * 1000ULL +
+                        column);
+            }
+        }
+
+        strix::ManifestTensor table_manifest;
+        table_manifest.name =
+            "per_layer_token_embd.weight";
+        table_manifest.dimensions = {
+            row_elements,
+            rows,
+        };
+        table_manifest.ggml_type = 30;
+        table_manifest.byte_size =
+            table.size() *
+            sizeof(std::uint16_t);
+        table_manifest.role =
+            strix::TensorRole::ngram_table;
+
+        strix::RuntimeTensorBinding table_runtime;
+        table_runtime.storage =
+            strix::RuntimeTensorStorage::file_mapped;
+        table_runtime.address =
+            reinterpret_cast<std::uintptr_t>(
+                table.data());
+        table_runtime.bytes =
+            table_manifest.byte_size;
+        table_runtime.allocation_generation = 1;
+
+        const std::array<std::uint64_t, 2>
+            requested_rows{2, 0};
+        strix::PleLookupRequest lookup;
+        lookup.row_ids =
+            requested_rows;
+        lookup.row_bytes =
+            row_bytes;
+        lookup.table_manifest =
+            &table_manifest;
+        lookup.table_runtime =
+            &table_runtime;
+
+        strix::FileMappedPleLookupBackend backend;
+        expect(
+            backend.implementation_identity() != 0,
+            "file-mapped PLE backend has stable non-zero identity");
+
+        const auto handle =
+            backend.start(lookup);
+        std::vector<std::byte> gathered(
+            static_cast<std::size_t>(
+                row_bytes *
+                requested_rows.size()));
+        backend.finish(
+            handle,
+            gathered);
+
+        const auto* gathered_values =
+            reinterpret_cast<
+                const std::uint16_t*>(
+                    gathered.data());
+        expect(
+            gathered_values[0] == 2000 &&
+                gathered_values[
+                    row_elements - 1] ==
+                    2159 &&
+                gathered_values[
+                    row_elements] == 0 &&
+                gathered_values[
+                    2 * row_elements - 1] ==
+                    159,
+            "file-mapped backend gathers requested rows in order");
+
+        bool concurrent_rejected = false;
+        const auto active =
+            backend.start(lookup);
+        try {
+            static_cast<void>(
+                backend.start(lookup));
+        } catch (const std::logic_error&) {
+            concurrent_rejected = true;
+        }
+        expect(
+            concurrent_rejected,
+            "file-mapped backend rejects concurrent C1 lookup");
+        backend.cancel(active);
+
+        auto resident = table_runtime;
+        resident.storage =
+            strix::RuntimeTensorStorage::resident;
+        lookup.table_runtime =
+            &resident;
+        bool resident_rejected = false;
+        try {
+            static_cast<void>(
+                backend.start(lookup));
+        } catch (const std::invalid_argument&) {
+            resident_rejected = true;
+        }
+        expect(
+            resident_rejected,
+            "file-mapped backend does not assume resident GPU memory is host-readable");
+
+        lookup.table_runtime =
+            &table_runtime;
+        const std::array<std::uint64_t, 1>
+            bad_row{rows};
+        lookup.row_ids = bad_row;
+        bool row_rejected = false;
+        try {
+            static_cast<void>(
+                backend.start(lookup));
+        } catch (const std::out_of_range&) {
+            row_rejected = true;
+        }
+        expect(
+            row_rejected,
+            "file-mapped backend rejects row outside table geometry");
+    }
 
     if (failures == 0) {
         std::cout
