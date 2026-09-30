@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 
 namespace strix {
@@ -40,6 +41,64 @@ void launch_position_prepare(
         sizeof(position));
 }
 
+
+void launch_position_verify_window(
+    const ExecutionDispatchContext& context,
+    void*) {
+    if (context.op !=
+        SerialOp::position_prepare) {
+        throw std::invalid_argument(
+            "verify position launcher attached to wrong operator");
+    }
+    if (context.logical_rows == 0 ||
+        context.input_tokens.size() !=
+            context.logical_rows) {
+        throw std::invalid_argument(
+            "verify position launcher requires one token per logical row");
+    }
+
+    const auto state =
+        resolve_dispatch_state(
+            context,
+            SessionStateComponent::position_history);
+    if (state.storage !=
+            SessionStateStorage::host ||
+        state.bytes <
+            sizeof(std::uint64_t) ||
+        state.address == 0) {
+        throw std::invalid_argument(
+            "verify position launcher requires writable host position state");
+    }
+
+    const auto advance =
+        static_cast<std::uint64_t>(
+            context.logical_rows - 1U);
+    if (advance >
+        std::numeric_limits<std::uint64_t>::max() -
+            context.position) {
+        throw std::overflow_error(
+            "verify position window overflow");
+    }
+    const auto final_position =
+        context.position + advance;
+
+    std::memcpy(
+        reinterpret_cast<void*>(
+            state.address),
+        &final_position,
+        sizeof(final_position));
+}
+
+ExecutionLauncher
+make_position_verify_window_launcher() {
+    return ExecutionLauncher{
+        "runtime.position_verify_window",
+        position_verify_window_launcher_identity,
+        &launch_position_verify_window,
+        nullptr,
+    };
+}
+
 ExecutionLauncher
 make_position_prepare_launcher() {
     return ExecutionLauncher{
@@ -56,5 +115,13 @@ void register_default_runtime_launchers(
         SerialOp::position_prepare,
         make_position_prepare_launcher());
 }
+
+void register_verify_runtime_launchers(
+    ExecutionLauncherRegistry& registry) {
+    registry.add_runtime_launcher(
+        SerialOp::position_prepare,
+        make_position_verify_window_launcher());
+}
+
 
 }  // namespace strix
