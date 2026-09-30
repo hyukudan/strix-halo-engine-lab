@@ -107,7 +107,7 @@ jobs:
                 cmake --build build/uma-residency-hip-offline --target strix-uma-hip
 
                 cmake -S . -B build/root-hip-runtime-offline -G Ninja                   -DCMAKE_BUILD_TYPE=Release                   -DSTRIX_ENABLE_HIP_RUNTIME=ON                   -DBUILD_TESTING=ON
-                cmake --build build/root-hip-runtime-offline                   --target strix_hip_runtime strix-hip-runtime-launchers-tests strix-hip-moe-route-launcher-tests strix-hip-embedding-launcher-tests strix-hip-hyper-mix-launcher-tests strix-hip-launcher-catalog-tests strix-hip-lm-head-launcher-tests strix-hip-shared-expert-launcher-tests strix-hip-moe-experts-launcher-tests strix-hip-gdn-launcher-tests strix-hip-ple-launcher-tests strix-hip-indexed-attention-launcher-tests strix-hip-model-residency-tests
+                cmake --build build/root-hip-runtime-offline                   --target strix_hip_runtime strix-hip-decode-token strix-hip-model-residency strix-hip-runtime-launchers-tests strix-hip-moe-route-launcher-tests strix-hip-embedding-launcher-tests strix-hip-hyper-mix-launcher-tests strix-hip-launcher-catalog-tests strix-hip-lm-head-launcher-tests strix-hip-shared-expert-launcher-tests strix-hip-moe-experts-launcher-tests strix-hip-gdn-launcher-tests strix-hip-ple-launcher-tests strix-hip-indexed-attention-launcher-tests strix-hip-model-residency-tests
               '
           } 2>&1 | tee hip-offline-build.log
 
