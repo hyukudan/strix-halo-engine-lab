@@ -122,10 +122,11 @@ public:
         }
 
         if (!candidates.empty()) {
-            session.next_position +=
-                candidates.size();
-            session.committed_tokens +=
-                candidates.size();
+            const auto depth =
+                static_cast<std::uint64_t>(
+                    candidates.size());
+            session.next_position += depth;
+            session.committed_tokens += depth;
             for (auto& generation :
                  session.state.generations) {
                 ++generation;
