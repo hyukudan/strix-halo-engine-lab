@@ -247,6 +247,29 @@ int main() {
         bindings.missing_steps == 0,
         "fixture binds complete serial plan");
 
+
+    {
+        strix::kernels::KernelRegistry
+            complete_registry;
+        strix::register_complete_hip_kernel_catalog(
+            model,
+            request,
+            {},
+            complete_registry);
+        const auto complete_bindings =
+            strix::bind_serial_execution_plan(
+                model,
+                execution,
+                complete_registry,
+                request);
+        expect(
+            complete_bindings.missing_steps == 0 &&
+                complete_bindings.bound_steps +
+                    complete_bindings.host_or_runtime_steps ==
+                    execution.steps.size(),
+            "complete catalog helper binds the full serial DAG");
+    }
+
     strix::CompiledSerialExecution compiled;
     compiled.execution_identity =
         0x434154414c4f4701ULL;
