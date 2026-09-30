@@ -108,6 +108,15 @@ int main() {
                 "routed experts own one step-local MLP temporary");
         }
 
+
+        if (step.op == strix::SerialOp::indexed_attention) {
+            expect(
+                step.temporaries.size() == 1 &&
+                step.temporaries[0].buffer.buffer_class ==
+                    strix::ExecutionBufferClass::indexed_attention_workspace,
+                "indexed attention owns one step-local workspace");
+        }
+
         if (step.op == strix::SerialOp::moe_combine) {
             ++combine_count;
             expect(has_buffer(
