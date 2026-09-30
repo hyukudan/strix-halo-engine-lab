@@ -598,5 +598,21 @@ if(STRIX_ENABLE_HIP_RUNTIME)
             NAME strix-hip-indexed-attention-launcher-tests
             COMMAND strix-hip-indexed-attention-launcher-tests
         )
+
+        add_executable(
+            strix-hip-model-residency-tests
+            tests/hip_model_residency_tests.cpp
+        )
+        target_link_libraries(
+            strix-hip-model-residency-tests
+            PRIVATE strix_hip_runtime
+        )
+        strix_target_warnings(
+            strix-hip-model-residency-tests
+        )
+        add_test(
+            NAME strix-hip-model-residency-tests
+            COMMAND strix-hip-model-residency-tests
+        )
     endif()
 endif()
