@@ -69,6 +69,36 @@ public:
         PleLookupHandle handle) noexcept = 0;
 };
 
+class FileMappedPleLookupBackend final
+    : public PleLookupBackend {
+public:
+    [[nodiscard]] std::uint64_t implementation_identity() const noexcept override;
+
+    [[nodiscard]] PleLookupHandle start(
+        const PleLookupRequest& request) override;
+
+    void finish(
+        PleLookupHandle handle,
+        std::span<std::byte> destination) override;
+
+    void cancel(
+        PleLookupHandle handle) noexcept override;
+
+private:
+    struct Pending {
+        PleLookupHandle handle = 0;
+        std::uintptr_t table_address = 0;
+        std::uint64_t table_bytes = 0;
+        std::uint64_t row_bytes = 0;
+        std::array<std::uint64_t, PleHashContract::maximum_heads> row_ids{};
+        std::uint32_t row_count = 0;
+        bool active = false;
+    };
+
+    PleLookupHandle next_handle_ = 1;
+    Pending pending_;
+};
+
 struct PleLookupSessionState {
     PleLookupHandle handle = 0;
     bool active = false;
