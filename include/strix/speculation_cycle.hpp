@@ -53,6 +53,8 @@ struct GreedySpeculationCyclePlan {
     std::uint64_t post_cycle_state_position = 0;
     std::uint64_t post_cycle_output_position = 0;
 
+    // Serial-session target-state token count. This advances by accepted
+    // candidate inputs only; the emitted bonus token is not yet in target state.
     std::uint64_t base_committed_tokens = 0;
     std::uint64_t post_cycle_committed_tokens = 0;
 
