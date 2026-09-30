@@ -60,6 +60,7 @@ add_library(strix_core STATIC
     src/speculation.cpp
     src/speculation_controller.cpp
     src/platform_probe.cpp
+    src/ple_lookup.cpp
     src/transport.cpp
 )
 target_include_directories(strix_core PUBLIC include)
@@ -157,6 +158,11 @@ if(BUILD_TESTING)
     target_link_libraries(strix-sparse-lookup-tests PRIVATE strix_core)
     strix_target_warnings(strix-sparse-lookup-tests)
     add_test(NAME strix-sparse-lookup-tests COMMAND strix-sparse-lookup-tests)
+
+    add_executable(strix-ple-lookup-tests tests/ple_lookup_tests.cpp)
+    target_link_libraries(strix-ple-lookup-tests PRIVATE strix_core)
+    strix_target_warnings(strix-ple-lookup-tests)
+    add_test(NAME strix-ple-lookup-tests COMMAND strix-ple-lookup-tests)
 
     add_executable(strix-execution-plan-tests tests/execution_plan_tests.cpp)
     target_link_libraries(strix-execution-plan-tests PRIVATE strix_core)
