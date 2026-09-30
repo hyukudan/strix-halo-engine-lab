@@ -8,6 +8,17 @@
 namespace strix {
 namespace {
 
+std::uint64_t checked_session_add(
+    std::uint64_t left,
+    std::uint64_t right,
+    const char* message) {
+    if (right >
+        std::numeric_limits<std::uint64_t>::max() - left) {
+        throw std::overflow_error(message);
+    }
+    return left + right;
+}
+
 struct SessionMetadata {
     std::uint64_t execution_identity = 0;
     std::uint64_t state_layout_identity = 0;
@@ -247,9 +258,15 @@ execute_greedy_speculation_cycle(
         static_cast<std::uint64_t>(
             preparation.candidate_tokens.size());
     const auto expected_verify_position =
-        base.next_position + depth;
+        checked_session_add(
+            base.next_position,
+            depth,
+            "speculative verifier position overflow");
     const auto expected_verify_committed =
-        base.committed_tokens + depth;
+        checked_session_add(
+            base.committed_tokens,
+            depth,
+            "speculative verifier committed-token overflow");
 
     if (snapshot_captured) {
         if (session.next_position !=
