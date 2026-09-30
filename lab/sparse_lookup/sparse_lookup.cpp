@@ -61,7 +61,7 @@ struct Options {
     std::string mode = "pread";
     std::string pattern = "ple";
     std::uint64_t table_rows = 16'384;
-    std::uint64_t row_bytes = 5120;
+    std::uint64_t row_bytes = 320;
     std::uint64_t requests = 16'000;
     std::uint64_t window = 16;
     std::uint64_t cache_rows = 256;
