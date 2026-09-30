@@ -169,6 +169,82 @@ LauncherCoverage audit_launcher_coverage(
     return coverage;
 }
 
+
+LauncherCoverage audit_launcher_coverage(
+    const CompiledSpeculativeVerifyExecution& compiled,
+    const ExecutionLauncherRegistry& launchers) {
+    if (compiled.execution_identity == 0 ||
+        compiled.bindings.bindings.size() !=
+            compiled.topology.steps.size()) {
+        throw std::invalid_argument(
+            "verify launcher coverage requires a valid compiled execution");
+    }
+
+    LauncherCoverage coverage;
+    coverage.missing.reserve(
+        compiled.topology.steps.size());
+
+    for (std::size_t index = 0;
+         index < compiled.topology.steps.size();
+         ++index) {
+        const auto& step =
+            compiled.topology.steps[index];
+        const auto& binding =
+            compiled.bindings.bindings[index];
+
+        if (step.id != index ||
+            binding.step_id != step.id ||
+            binding.op != step.op) {
+            throw std::invalid_argument(
+                "compiled verify step/binding identity mismatch");
+        }
+
+        const ExecutionLauncher* launcher = nullptr;
+        std::string key;
+        if (binding.host_or_runtime_step) {
+            launcher =
+                launchers.find_runtime_launcher(
+                    step.op);
+            key =
+                "runtime:" +
+                std::string(
+                    to_string(step.op));
+        } else {
+            if (!binding.kernel_id.has_value() ||
+                binding.kernel_id->empty()) {
+                coverage.missing.push_back(
+                    MissingLauncher{
+                        step.id,
+                        step.op,
+                        false,
+                        "unbound-kernel",
+                    });
+                ++coverage.missing_steps;
+                continue;
+            }
+            key = *binding.kernel_id;
+            launcher =
+                launchers.find_kernel_launcher(
+                    key);
+        }
+
+        if (launcher == nullptr) {
+            coverage.missing.push_back(
+                MissingLauncher{
+                    step.id,
+                    step.op,
+                    binding.host_or_runtime_step,
+                    std::move(key),
+                });
+            ++coverage.missing_steps;
+        } else {
+            ++coverage.covered_steps;
+        }
+    }
+
+    return coverage;
+}
+
 CompiledLaunchPlan compile_launch_plan(
     const CompiledSerialExecution& compiled,
     const ExecutionLauncherRegistry& launchers) {
@@ -254,6 +330,96 @@ CompiledLaunchPlan compile_launch_plan(
     if (plan.plan_identity == 0) {
         throw std::logic_error(
             "compiled launch plan identity must be non-zero");
+    }
+    return plan;
+}
+
+
+CompiledLaunchPlan compile_launch_plan(
+    const CompiledSpeculativeVerifyExecution& compiled,
+    const ExecutionLauncherRegistry& launchers) {
+    if (compiled.execution_identity == 0 ||
+        compiled.bindings.bindings.size() !=
+            compiled.topology.steps.size()) {
+        throw std::invalid_argument(
+            "verify launch plan requires a valid compiled execution");
+    }
+
+    CompiledLaunchPlan plan;
+    plan.execution_identity =
+        compiled.execution_identity;
+    plan.steps.reserve(
+        compiled.topology.steps.size());
+
+    std::uint64_t hash = fnv_offset;
+    hash_u64(
+        hash,
+        compiled.execution_identity);
+
+    for (std::size_t index = 0;
+         index < compiled.topology.steps.size();
+         ++index) {
+        const auto& step =
+            compiled.topology.steps[index];
+        const auto& binding =
+            compiled.bindings.bindings[index];
+
+        if (step.id != index ||
+            binding.step_id != step.id ||
+            binding.op != step.op) {
+            throw std::invalid_argument(
+                "compiled verify step/binding identity mismatch");
+        }
+
+        const ExecutionLauncher* launcher = nullptr;
+        if (binding.host_or_runtime_step) {
+            launcher =
+                launchers.find_runtime_launcher(
+                    step.op);
+        } else {
+            if (!binding.kernel_id.has_value()) {
+                throw std::invalid_argument(
+                    "verify kernel step lacks bound kernel id");
+            }
+            launcher =
+                launchers.find_kernel_launcher(
+                    *binding.kernel_id);
+        }
+
+        if (launcher == nullptr) {
+            throw std::invalid_argument(
+                "compiled verify step has no registered launcher");
+        }
+
+        plan.steps.push_back(
+            CompiledStepLauncher{
+                step.id,
+                step.op,
+                binding.host_or_runtime_step,
+                launcher->implementation_identity,
+                launcher->function,
+                launcher->user_data,
+            });
+
+        hash_u64(hash, step.id);
+        hash_u64(
+            hash,
+            static_cast<std::uint64_t>(
+                step.op));
+        hash_u64(
+            hash,
+            binding.host_or_runtime_step
+                ? 1ULL
+                : 0ULL);
+        hash_u64(
+            hash,
+            launcher->implementation_identity);
+    }
+
+    plan.plan_identity = hash;
+    if (plan.plan_identity == 0) {
+        throw std::logic_error(
+            "compiled verify launch plan identity must be non-zero");
     }
     return plan;
 }
