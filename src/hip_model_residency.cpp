@@ -266,6 +266,7 @@ HipModelResidency::HipModelResidency(
     other.registered_bytes_ = 0;
     other.copied_bytes_ = 0;
     other.registered_ranges_.clear();
+    other.copied_ranges_.clear();
 }
 
 HipModelResidency&
@@ -561,6 +562,7 @@ HipModelResidency HipModelResidency::create(
             result.release();
             throw;
         }
+    }
 
     validate_model_runtime_binding(
         manifest,
