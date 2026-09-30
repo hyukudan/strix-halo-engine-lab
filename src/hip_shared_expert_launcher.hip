@@ -710,10 +710,7 @@ void validate_tensor(
             std::string(name) +
             " tensor is missing");
     }
-    if ((pair.runtime->storage !=
-             RuntimeTensorStorage::resident &&
-         pair.runtime->storage !=
-             RuntimeTensorStorage::repacked_cache) ||
+    if (!runtime_tensor_gpu_visible(pair.runtime->storage) ||
         pair.runtime->address == 0) {
         throw std::invalid_argument(
             std::string(name) +
