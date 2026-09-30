@@ -36,6 +36,7 @@ add_library(strix_core STATIC
     src/kernel_registry.cpp
     src/mapped_model_file.cpp
     src/iq4_xs.cpp
+    src/indexed_attention_workspace.cpp
     src/iq4_nl.cpp
     src/launch_dispatch.cpp
     src/memory_plan.cpp
@@ -144,6 +145,20 @@ if(BUILD_TESTING)
     target_link_libraries(strix-iq4-nl-tests PRIVATE strix_core)
     strix_target_warnings(strix-iq4-nl-tests)
     add_test(NAME strix-iq4-nl-tests COMMAND strix-iq4-nl-tests)
+
+    add_executable(
+        strix-indexed-attention-workspace-tests
+        tests/indexed_attention_workspace_tests.cpp
+    )
+    target_link_libraries(
+        strix-indexed-attention-workspace-tests
+        PRIVATE strix_core
+    )
+    strix_target_warnings(strix-indexed-attention-workspace-tests)
+    add_test(
+        NAME strix-indexed-attention-workspace-tests
+        COMMAND strix-indexed-attention-workspace-tests
+    )
 
     add_executable(strix-recurrent-plan-tests tests/recurrent_plan_tests.cpp)
     target_link_libraries(strix-recurrent-plan-tests PRIVATE strix_core)
