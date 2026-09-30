@@ -351,6 +351,18 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         strix-hip-model-residency
         apps/hip_model_residency_main.cpp
     )
+
+    add_executable(
+        strix-hip-decode-token
+        apps/hip_decode_token_main.cpp
+    )
+    target_link_libraries(
+        strix-hip-decode-token
+        PRIVATE strix_hip_runtime
+    )
+    strix_target_warnings(
+        strix-hip-decode-token
+    )
     target_link_libraries(
         strix-hip-model-residency
         PRIVATE strix_hip_runtime
