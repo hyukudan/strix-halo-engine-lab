@@ -178,6 +178,11 @@ HipLauncherCatalog::HipLauncherCatalog(
           elementwise_config(
               model,
               config.activation)),
+      gdn_(
+          HipGdnLauncherConfig{
+              model,
+              config.activation,
+          }),
       embedding_(
           embedding_config(
               model,
@@ -217,6 +222,10 @@ register_for_compiled_execution(
     register_default_runtime_launchers(
         registry);
     elementwise_.
+        register_for_compiled_execution(
+            compiled,
+            registry);
+    gdn_.
         register_for_compiled_execution(
             compiled,
             registry);
