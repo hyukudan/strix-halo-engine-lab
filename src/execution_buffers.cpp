@@ -1,5 +1,7 @@
 #include "strix/execution_buffers.hpp"
 
+#include "strix/ple_workspace.hpp"
+
 #include <algorithm>
 #include <limits>
 #include <stdexcept>
@@ -126,6 +128,14 @@ ExecutionBufferPlan build_serial_execution_buffer_plan(
             gdn_workspace_elements,
             model.bytes_fp32);
 
+    const auto ple_workspace =
+        build_ple_workspace_layout(
+            model);
+    plan.ple_workspace_bytes =
+        checked_mul(
+            request.logical_rows,
+            ple_workspace.total_bytes);
+
     const auto attn_inject_peak =
         checked_add(
             checked_add(
@@ -155,10 +165,19 @@ ExecutionBufferPlan build_serial_execution_buffer_plan(
             attn_inject_peak,
             plan.gdn_workspace_bytes);
 
+    const auto ple_peak =
+        checked_add(
+            checked_mul(
+                plan.expanded_hidden_bytes,
+                2ULL),
+            plan.ple_workspace_bytes);
+
     plan.peak_internal_bytes =
-        std::max(
+        std::max({
             gdn_core_peak,
-            moe_branch_peak);
+            moe_branch_peak,
+            ple_peak,
+        });
 
     const auto logits_stage_peak =
         checked_add(plan.hidden_bytes, plan.logits_bytes);
