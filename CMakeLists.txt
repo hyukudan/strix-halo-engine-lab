@@ -63,6 +63,7 @@ add_library(strix_core STATIC
     src/speculation.cpp
     src/speculation_controller.cpp
     src/speculation_cycle.cpp
+    src/speculation_executor.cpp
     src/platform_probe.cpp
     src/ple_lookup.cpp
     src/ple_workspace.cpp
@@ -312,6 +313,11 @@ if(BUILD_TESTING)
     target_link_libraries(strix-speculation-cycle-tests PRIVATE strix_core)
     strix_target_warnings(strix-speculation-cycle-tests)
     add_test(NAME strix-speculation-cycle-tests COMMAND strix-speculation-cycle-tests)
+
+    add_executable(strix-speculation-executor-tests tests/speculation_executor_tests.cpp)
+    target_link_libraries(strix-speculation-executor-tests PRIVATE strix_core)
+    strix_target_warnings(strix-speculation-executor-tests)
+    add_test(NAME strix-speculation-executor-tests COMMAND strix-speculation-executor-tests)
 
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
