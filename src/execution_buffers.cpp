@@ -1,5 +1,7 @@
 #include "strix/execution_buffers.hpp"
 
+#include "strix/indexed_attention_workspace.hpp"
+
 #include "strix/ple_workspace.hpp"
 
 #include <algorithm>
@@ -136,6 +138,14 @@ ExecutionBufferPlan build_serial_execution_buffer_plan(
             request.logical_rows,
             ple_workspace.total_bytes);
 
+    const auto indexed_workspace =
+        build_indexed_attention_workspace_layout(
+            model);
+    plan.indexed_attention_workspace_bytes =
+        checked_mul(
+            request.logical_rows,
+            indexed_workspace.total_bytes);
+
     const auto attn_inject_peak =
         checked_add(
             checked_add(
@@ -172,11 +182,23 @@ ExecutionBufferPlan build_serial_execution_buffer_plan(
                 2ULL),
             plan.ple_workspace_bytes);
 
+    const auto indexed_attention_peak =
+        checked_add(
+            checked_add(
+                checked_add(
+                    plan.expanded_hidden_bytes,
+                    checked_mul(
+                        plan.hidden_bytes,
+                        2ULL)),
+                plan.injection_weight_bytes),
+            plan.indexed_attention_workspace_bytes);
+
     plan.peak_internal_bytes =
         std::max({
             gdn_core_peak,
             moe_branch_peak,
             ple_peak,
+            indexed_attention_peak,
         });
 
     const auto logits_stage_peak =
