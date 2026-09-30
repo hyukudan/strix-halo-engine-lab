@@ -58,6 +58,12 @@ constexpr Buffer gdn_workspace() {
         0};
 }
 
+constexpr Buffer ple_workspace() {
+    return Buffer{
+        ExecutionBufferClass::ple_workspace,
+        0};
+}
+
 bool contains_buffer(
     std::span<const ExecutionBufferUse> values,
     Buffer needle) {
@@ -89,6 +95,8 @@ std::uint32_t slot_limit(
         return plan.mlp_intermediate_slots;
     case ExecutionBufferClass::gdn_workspace:
         return plan.gdn_workspace_slots;
+    case ExecutionBufferClass::ple_workspace:
+        return plan.ple_workspace_slots;
     }
     return 0;
 }
@@ -115,11 +123,12 @@ SerialExecutionIoPlan build_serial_execution_io_plan(
     output.logits_slots = 1;
     output.mlp_intermediate_slots = 1;
     output.gdn_workspace_slots = 1;
+    output.ple_workspace_slots = 1;
     output.steps.reserve(
         execution_plan.steps.size());
 
     constexpr std::size_t maximum_buffers =
-        8U * 8U;
+        9U * 8U;
     std::array<std::uint64_t, maximum_buffers> generations{};
 
     const auto read_use = [&](Buffer buffer) {
@@ -171,6 +180,10 @@ SerialExecutionIoPlan build_serial_execution_io_plan(
             const auto next = current_hyper ^ 1U;
             io.reads = {read_use(hyper(current_hyper))};
             io.writes = {write_use(hyper(next))};
+            io.temporaries = {
+                temporary_use(
+                    ple_workspace()),
+            };
             current_hyper = next;
             break;
         }
@@ -297,7 +310,7 @@ void validate_serial_execution_io_plan(
     }
 
     constexpr std::size_t maximum_buffers =
-        8U * 8U;
+        9U * 8U;
     std::array<bool, maximum_buffers> produced{};
     std::array<std::uint64_t, maximum_buffers> generation{};
 
