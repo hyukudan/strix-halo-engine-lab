@@ -332,6 +332,11 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-speculative-verify-binding-tests)
     add_test(NAME strix-speculative-verify-binding-tests COMMAND strix-speculative-verify-binding-tests)
 
+    add_executable(strix-compiled-speculative-verify-tests tests/compiled_speculative_verify_tests.cpp)
+    target_link_libraries(strix-compiled-speculative-verify-tests PRIVATE strix_core)
+    strix_target_warnings(strix-compiled-speculative-verify-tests)
+    add_test(NAME strix-compiled-speculative-verify-tests COMMAND strix-compiled-speculative-verify-tests)
+
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
         add_test(
