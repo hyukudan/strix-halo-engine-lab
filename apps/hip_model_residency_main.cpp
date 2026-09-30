@@ -120,52 +120,39 @@ int main(int argc, char** argv) try {
     }
 
     std::cout
-        << "{
-"
+        << '{' << '\n'
         << "  \"mode\": \""
         << (policy.mode ==
                     strix::HipModelResidencyMode::
                         registered_file_mapping
                 ? "registered_file_mapping"
                 : "resident_copy")
-        << "\",
-"
+        << "\"," << '\n'
         << "  \"manifest_tensors\": "
-        << manifest.tensors.size() << ",
-"
+        << manifest.tensors.size() << ',' << '\n'
         << "  \"mapped_file_bytes\": "
-        << mapped.bytes() << ",
-"
+        << mapped.bytes() << ',' << '\n'
         << "  \"registered_bytes\": "
-        << residency.registered_bytes() << ",
-"
+        << residency.registered_bytes() << ',' << '\n'
         << "  \"copied_bytes\": "
-        << residency.copied_bytes() << ",
-"
+        << residency.copied_bytes() << ',' << '\n'
         << "  \"gpu_visible_tensors\": "
-        << gpu_visible << ",
-"
+        << gpu_visible << ',' << '\n'
         << "  \"gpu_visible_tensor_bytes\": "
-        << bytes_gpu_visible << ",
-"
+        << bytes_gpu_visible << ',' << '\n'
         << "  \"file_backed_tensors\": "
-        << file_backed << ",
-"
+        << file_backed << ',' << '\n'
         << "  \"file_backed_tensor_bytes\": "
-        << bytes_file_backed << ",
-"
+        << bytes_file_backed << ',' << '\n'
         << "  \"remote_tensors\": "
-        << remote << ",
-"
+        << remote << ',' << '\n'
         << "  \"promote_file_backed_candidates\": "
         << (policy.promote_file_backed_candidates
                 ? "true"
                 : "false")
-        << ",
-"
+        << ',' << '\n'
         << "  \"coalesce_gap_bytes\": "
-        << policy.coalesce_gap_bytes << ",
-"
+        << policy.coalesce_gap_bytes << ',' << '\n'
         << "  \"storages\": {";
 
     bool first = true;
@@ -186,17 +173,14 @@ int main(int argc, char** argv) try {
             std::cout << ',';
         }
         first = false;
-        std::cout << "\n    \""
+        std::cout << '\n' << "    \""
                   << storage_name(storage)
                   << "\": "
                   << count;
     }
     std::cout
-        << "
-  }
-"
-        << "}
-";
+        << '\n' << "  }" << '\n'
+        << '}' << '\n';
 
     return 0;
 } catch (const std::exception& error) {
