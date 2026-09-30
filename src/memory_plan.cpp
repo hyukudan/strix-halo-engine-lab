@@ -44,15 +44,22 @@ std::uint64_t mtp_kv_bytes_per_token(const ModelContract& model) {
                     model.head_dim, 2, model.bytes_bf16});
 }
 
-std::uint64_t provisional_indexer_bytes_per_token(const ModelContract& model) {
-    const auto uncompressed = product({model.full_attention_layers,
-                                       model.indexer_kv_heads,
-                                       model.indexer_head_dim,
-                                       model.bytes_bf16});
-    if (uncompressed % model.indexer_compress_ratio != 0) {
-        throw std::invalid_argument("indexer estimate does not divide exactly");
-    }
-    return uncompressed / model.indexer_compress_ratio;
+std::uint64_t indexer_bytes_per_token(
+    const ModelContract& model) {
+    // QSA stores one raw BF16 index key per token for every full-attention
+    // layer. The 4:1 compression ratio applies only when complete blocks are
+    // pooled for scoring; it does not compress persistent raw-key storage.
+    return product({
+        model.full_attention_layers,
+        model.indexer_kv_heads,
+        model.indexer_head_dim,
+        model.bytes_bf16,
+    });
+}
+
+std::uint64_t provisional_indexer_bytes_per_token(
+    const ModelContract& model) {
+    return indexer_bytes_per_token(model);
 }
 
 std::uint64_t gdn_matrix_state_bytes_per_layer(
@@ -157,11 +164,11 @@ MemoryBreakdown build_memory_plan(const ModelContract& model,
     plan.mtp_kv = request.include_mtp_kv
                       ? checked_mul(mtp_kv_bytes_per_token(model), positions)
                       : 0;
-    plan.provisional_indexer = request.include_provisional_indexer
-                                   ? checked_mul(
-                                         provisional_indexer_bytes_per_token(model),
-                                         positions)
-                                   : 0;
+    plan.indexer = request.include_indexer
+                       ? checked_mul(
+                             indexer_bytes_per_token(model),
+                             positions)
+                       : 0;
     plan.gdn_matrix_state = checked_mul(
         gdn_matrix_state_bytes_per_session(model), request.sessions);
     plan.gdn_conv_state = checked_mul(
@@ -186,7 +193,7 @@ MemoryBreakdown build_memory_plan(const ModelContract& model,
 
     add_to_total(plan, plan.base_kv);
     add_to_total(plan, plan.mtp_kv);
-    add_to_total(plan, plan.provisional_indexer);
+    add_to_total(plan, plan.indexer);
     add_to_total(plan, plan.gdn_state);
     add_to_total(plan, plan.ple_conv_state);
     add_to_total(plan, plan.ngram_history);
