@@ -88,6 +88,17 @@ void hash_model(
         &model.partial_rotary_factor,
         sizeof(partial_rotary_bits));
     hash_u64(hash, partial_rotary_bits);
+
+    std::uint32_t rope_theta_bits = 0;
+    static_assert(
+        sizeof(rope_theta_bits) ==
+        sizeof(model.rope_theta));
+    std::memcpy(
+        &rope_theta_bits,
+        &model.rope_theta,
+        sizeof(rope_theta_bits));
+    hash_u64(hash, rope_theta_bits);
+
     hash_u64(hash, model.moe_intermediate_size);
     hash_u64(
         hash,
