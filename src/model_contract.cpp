@@ -62,10 +62,13 @@ std::string ModelContract::validate() const {
     if (!std::isfinite(partial_rotary_factor) ||
         partial_rotary_factor <= 0.0F ||
         partial_rotary_factor > 1.0F ||
-        static_cast<std::uint64_t>(
-            static_cast<double>(head_dim) *
-            partial_rotary_factor) % 2ULL != 0) {
-        return "partial rotary factor must produce a positive even rotary width";
+        rotary_dim() == 0 ||
+        rotary_dim() % 2ULL != 0 ||
+        rotary_dim() > head_dim ||
+        rotary_dim() > indexer_head_dim ||
+        !std::isfinite(rope_theta) ||
+        rope_theta <= 1.0F) {
+        return "partial rotary geometry and theta must be valid";
     }
     if (!std::isfinite(rms_norm_epsilon) ||
         rms_norm_epsilon <= 0.0F) {
