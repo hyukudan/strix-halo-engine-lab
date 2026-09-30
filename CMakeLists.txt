@@ -22,6 +22,7 @@ endfunction()
 add_library(strix_core STATIC
     src/compiled_execution.cpp
     src/compiled_speculative_verify.cpp
+    src/compiled_speculation_backend.cpp
     src/dispatch_resources.cpp
     src/execution_arena.cpp
     src/execution_binding.cpp
