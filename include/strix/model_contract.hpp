@@ -18,6 +18,10 @@ struct ModelContract {
     std::uint64_t ple_conv_kernel_size = 4;
     std::uint64_t ngram_size = 3;
     std::uint64_t heads_per_ngram = 8;
+    std::uint64_t ngram_vocab_size_base = 20'000'000;
+    std::uint64_t ngram_vocab_divisor = 128;
+    std::uint64_t ngram_hash_seed = 1234;
+    std::uint64_t ple_eos_token_id = 248044;
     std::uint64_t hc_count = 4;
     std::uint64_t hc_lowrank = 320;
     std::uint64_t full_attention_layers = 12;
@@ -48,6 +52,20 @@ struct ModelContract {
     std::uint64_t bytes_fp32 = 4;
 
     [[nodiscard]] static ModelContract qwen38_flash_next();
+
+    [[nodiscard]] constexpr std::uint64_t ple_head_count() const noexcept {
+        return (ngram_size - 1ULL) * heads_per_ngram;
+    }
+
+    [[nodiscard]] constexpr std::uint64_t ple_head_dim() const noexcept {
+        const auto heads = ple_head_count();
+        return heads == 0 ? 0 : ple_embed_dim / heads;
+    }
+
+    [[nodiscard]] constexpr std::uint64_t ple_row_bytes_bf16() const noexcept {
+        return ple_head_dim() * bytes_bf16;
+    }
+
     [[nodiscard]] std::string validate() const;
 };
 
