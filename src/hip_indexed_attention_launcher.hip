@@ -609,12 +609,13 @@ __global__ void norm_rope_kernel(
                     head_dim) +
             epsilon);
     source[feature] =
-        input *
-        inv_rms *
-        (1.0F +
-         load_small_weight<Kind>(
-             norm_weights,
-             feature));
+        round_bf16(
+            input *
+            inv_rms *
+            (1.0F +
+             load_small_weight<Kind>(
+                 norm_weights,
+                 feature)));
     __syncthreads();
 
     float result =
@@ -788,12 +789,13 @@ __global__ void block_score_kernel(
                     head_dim) +
             epsilon);
     pooled[feature] =
-        mean *
-        inv_rms *
-        (1.0F +
-         load_small_weight<Kind>(
-             key_norm,
-             feature));
+        round_bf16(
+            mean *
+            inv_rms *
+            (1.0F +
+             load_small_weight<Kind>(
+                 key_norm,
+                 feature)));
     __syncthreads();
 
     float rotated =
