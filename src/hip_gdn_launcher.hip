@@ -1999,7 +1999,13 @@ void register_hip_gdn_kernel_variant(
         config.model.rms_norm_epsilon !=
             model.rms_norm_epsilon ||
         config.model.gdn_qk_l2_epsilon !=
-            model.gdn_qk_l2_epsilon) {
+            model.gdn_qk_l2_epsilon ||
+        config.model.gdn_output_gate_sigmoid !=
+            model.gdn_output_gate_sigmoid ||
+        config.model.gdn_qk_l2norm !=
+            model.gdn_qk_l2norm ||
+        config.model.gdn_conv_silu !=
+            model.gdn_conv_silu) {
         throw std::invalid_argument(
             "HIP GDN config does not match model contract");
     }
