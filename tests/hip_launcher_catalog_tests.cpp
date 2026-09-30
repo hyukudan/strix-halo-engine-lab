@@ -2,6 +2,7 @@
 #include "strix/execution_binding.hpp"
 #include "strix/execution_plan.hpp"
 #include "strix/hip_embedding_launcher.hpp"
+#include "strix/hip_gdn_launcher.hpp"
 #include "strix/hip_hyper_mix_launcher.hpp"
 #include "strix/hip_launcher_catalog.hpp"
 #include "strix/hip_lm_head_launcher.hpp"
@@ -35,6 +36,7 @@ bool catalog_supported(strix::SerialOp op) {
     case SerialOp::token_embedding:
     case SerialOp::position_prepare:
     case SerialOp::hyper_expand:
+    case SerialOp::gated_delta_net:
     case SerialOp::attn_hyper_mix:
     case SerialOp::attn_inject:
     case SerialOp::mlp_hyper_mix:
@@ -131,6 +133,13 @@ int main() {
     strix::kernels::KernelRegistry kernels;
     strix::register_hip_elementwise_kernel_variants(
         model, request, elementwise, kernels);
+
+    strix::HipGdnLauncherConfig gdn;
+    gdn.model = model;
+    gdn.activation =
+        strix::HipActivationStorage::bf16;
+    strix::register_hip_gdn_kernel_variant(
+        model, request, gdn, kernels);
     strix::register_hip_embedding_kernel_variant(
         model, request, embedding, kernels);
     strix::register_hip_hyper_mix_kernel_variant(
@@ -247,14 +256,14 @@ int main() {
     }
 
     expect(
-        coverage.missing_steps == 49,
+        coverage.missing_steps == 13,
         "catalog exposes exact current launcher gap count");
     expect(
         missing_by_op[strix::SerialOp::ple] == 1,
         "PLE launcher gap is explicit");
     expect(
-        missing_by_op[strix::SerialOp::gated_delta_net] == 36,
-        "GDN launcher gaps are explicit");
+        missing_by_op[strix::SerialOp::gated_delta_net] == 0,
+        "GDN launcher is covered");
     expect(
         missing_by_op[strix::SerialOp::indexed_attention] == 12,
         "indexed-attention launcher gaps are explicit");
@@ -268,7 +277,7 @@ int main() {
         missing_by_op[strix::SerialOp::lm_head] == 0,
         "LM-head launcher is covered");
     expect(
-        missing_by_op.size() == 3,
+        missing_by_op.size() == 2,
         "no already-supported operator appears in missing coverage");
 
     expect(
