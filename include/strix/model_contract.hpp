@@ -35,9 +35,12 @@ struct ModelContract {
     std::uint64_t gdn_value_heads = 48;
     std::uint64_t gdn_value_head_dim = 128;
     std::uint64_t gdn_conv_kernel = 4;
+    std::uint64_t indexer_n_heads = 4;
     std::uint64_t indexer_kv_heads = 1;
     std::uint64_t indexer_head_dim = 128;
+    std::uint64_t indexer_budget = 2048;
     std::uint64_t indexer_compress_ratio = 4;
+    float partial_rotary_factor = 0.25F;
     std::uint64_t moe_intermediate_size = 640;
     std::uint64_t shared_expert_intermediate_size = 640;
     std::uint64_t num_experts = 512;
