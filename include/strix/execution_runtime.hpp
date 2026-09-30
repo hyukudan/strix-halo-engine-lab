@@ -36,6 +36,7 @@ struct ExecutionDispatchContext {
     std::uint32_t logical_rows = 1;
     std::uint32_t request_concurrency = 1;
     std::uint32_t input_token_id = 0;
+    std::span<const std::uint32_t> input_tokens;
     std::uint64_t position = 0;
 };
 
@@ -65,6 +66,7 @@ struct EagerExecutionRequest {
     std::uint32_t logical_rows = 1;
     std::uint32_t request_concurrency = 1;
     std::uint32_t input_token_id = 0;
+    std::span<const std::uint32_t> input_tokens;
     std::uint64_t position = 0;
 
     // Callers explicitly declare which persistent-state objects have been
@@ -99,6 +101,7 @@ void validate_eager_execution_preflight(
     EagerExecutionDispatcher& dispatcher,
     const ExecutionMemoryBinding* memory = nullptr,
     const SerialSessionStateLayout* session_state_layout = nullptr,
-    const SessionStateMemoryBinding* session_state_memory = nullptr);
+    const SessionStateMemoryBinding* session_state_memory = nullptr,
+    const ExecutionRuntimeResources* resources = nullptr);
 
 }  // namespace strix
