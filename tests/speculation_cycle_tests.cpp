@@ -87,8 +87,8 @@ int main() {
         expect(plan.post_cycle_state_position == 102 &&
                    plan.post_cycle_output_position == 103,
                "bonus output is not yet represented in target state");
-        expect(plan.post_cycle_committed_tokens == 103,
-               "output token count advances by emitted continuation size");
+        expect(plan.post_cycle_committed_tokens == 102,
+               "target-state token count advances only by accepted candidates");
         expect(plan.pre_window_snapshot.next_position == 100 &&
                    plan.pre_window_snapshot.compiled_execution_identity ==
                        request.compiled_execution_identity,
@@ -141,6 +141,8 @@ int main() {
                    plan.post_cycle_state_position == 100 &&
                    plan.post_cycle_output_position == 101,
                "depth zero reduces to one serial target bonus without snapshot");
+        expect(plan.post_cycle_committed_tokens == 100,
+               "depth-zero target state count does not advance for unprocessed bonus");
     }
 
     {
