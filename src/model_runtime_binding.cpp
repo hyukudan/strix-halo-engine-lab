@@ -5,6 +5,24 @@
 
 namespace strix {
 
+bool runtime_tensor_gpu_visible(
+    RuntimeTensorStorage storage) noexcept {
+    return storage ==
+               RuntimeTensorStorage::resident ||
+           storage ==
+               RuntimeTensorStorage::registered_file_mapped ||
+           storage ==
+               RuntimeTensorStorage::repacked_cache;
+}
+
+bool runtime_tensor_file_backed(
+    RuntimeTensorStorage storage) noexcept {
+    return storage ==
+               RuntimeTensorStorage::file_mapped ||
+           storage ==
+               RuntimeTensorStorage::registered_file_mapped;
+}
+
 bool ModelContentIdentity::valid() const noexcept {
     for (const auto byte : bytes) {
         if (byte != 0) {
