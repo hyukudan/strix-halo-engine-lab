@@ -62,8 +62,11 @@ int main() {
             layout,
             strix::SessionStateComponent::sparse_index);
     expect(sparse != nullptr &&
-               sparse->provisional,
-           "sparse index allocation is visibly provisional");
+               !sparse->provisional &&
+               sparse->bytes ==
+                   strix::indexer_bytes_per_token(model) *
+                       request.context_tokens,
+           "QSA raw-key cache is an exact context-sized device allocation");
 
     const auto* ngram =
         strix::find_session_state_allocation(
@@ -86,14 +89,14 @@ int main() {
         request.context_tokens;
     memory_request.sessions = 1;
     memory_request.include_mtp_kv = false;
-    memory_request.include_provisional_indexer = true;
+    memory_request.include_indexer = true;
     const auto memory =
         strix::build_memory_plan(
             model, memory_request);
 
     const auto exact_unaligned =
         memory.base_kv +
-        memory.provisional_indexer +
+        memory.indexer +
         memory.gdn_state +
         memory.ple_conv_state +
         memory.ngram_history +
@@ -121,7 +124,7 @@ int main() {
             without_sparse,
             strix::SessionStateComponent::sparse_index) ==
             nullptr,
-        "session layout can omit provisional sparse state");
+        "session layout can omit QSA raw-key state");
     expect(without_sparse.layout_identity !=
                layout.layout_identity,
            "sparse-state policy changes layout identity");
