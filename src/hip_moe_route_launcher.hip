@@ -633,10 +633,7 @@ void launch_moe_route(
         throw std::invalid_argument(
             "HIP MoE route tensor geometry does not match router contract");
     }
-    if ((runtime_tensor.storage !=
-             RuntimeTensorStorage::resident &&
-         runtime_tensor.storage !=
-             RuntimeTensorStorage::repacked_cache) ||
+    if (!runtime_tensor_gpu_visible(runtime_tensor.storage) ||
         runtime_tensor.address == 0) {
         throw std::invalid_argument(
             "HIP MoE route requires resident or repacked GPU-visible router weights");
