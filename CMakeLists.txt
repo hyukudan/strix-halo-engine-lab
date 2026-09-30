@@ -37,6 +37,7 @@ add_library(strix_core STATIC
     src/mapped_model_file.cpp
     src/iq4_xs.cpp
     src/indexed_attention_workspace.cpp
+    src/indexed_attention_state.cpp
     src/iq4_nl.cpp
     src/launch_dispatch.cpp
     src/memory_plan.cpp
