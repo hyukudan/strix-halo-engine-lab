@@ -74,6 +74,12 @@ void validate_execution_runtime_resources(
         *resources.session_state_layout,
         *resources.session_state_memory);
 
+    if (resources.ple_lookup != nullptr &&
+        resources.ple_lookup->implementation_identity() == 0) {
+        throw std::invalid_argument(
+            "PLE lookup backend identity must be non-zero");
+    }
+
     if (position >=
         resources.session_state_layout->context_tokens) {
         throw std::out_of_range(
@@ -110,6 +116,11 @@ build_runtime_execution_identities(
     hash_u64(
         compatibility,
         resources.session_state_layout->layout_identity);
+    hash_u64(
+        compatibility,
+        resources.ple_lookup != nullptr
+            ? resources.ple_lookup->implementation_identity()
+            : 0ULL);
 
     if (compatibility == 0) {
         throw std::logic_error(
