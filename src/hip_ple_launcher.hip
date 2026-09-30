@@ -579,9 +579,11 @@ __global__ void normalize_key_and_gate_kernel(
                     fabsf(score),
                     1e-6F));
         const float signed_root =
-            copysignf(
-                magnitude,
-                score);
+            score > 0.0F
+                ? magnitude
+                : score < 0.0F
+                    ? -magnitude
+                    : 0.0F;
         gates[stream] =
             1.0F /
             (1.0F +
