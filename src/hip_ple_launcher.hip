@@ -1013,10 +1013,7 @@ void validate_projection(
     std::uint64_t output,
     const char* name) {
     if (pair.runtime == nullptr ||
-        (pair.runtime->storage !=
-             RuntimeTensorStorage::resident &&
-         pair.runtime->storage !=
-             RuntimeTensorStorage::repacked_cache) ||
+        !runtime_tensor_gpu_visible(pair.runtime->storage) ||
         pair.runtime->address == 0) {
         throw std::invalid_argument(
             std::string(name) +
@@ -1041,10 +1038,7 @@ void validate_small(
     std::uint64_t elements,
     const char* name) {
     if (pair.runtime == nullptr ||
-        (pair.runtime->storage !=
-             RuntimeTensorStorage::resident &&
-         pair.runtime->storage !=
-             RuntimeTensorStorage::repacked_cache) ||
+        !runtime_tensor_gpu_visible(pair.runtime->storage) ||
         pair.runtime->address == 0) {
         throw std::invalid_argument(
             std::string(name) +
