@@ -13,6 +13,10 @@ enum class HipHostAllocationMode {
     pinned_mapped,
 };
 
+void initialize_hip_fresh_runtime_memory(
+    const ExecutionMemoryBinding& scratch,
+    const SessionStateMemoryBinding& state);
+
 class HipRuntimeAllocator final
     : public RuntimeMemoryAllocator {
 public:
