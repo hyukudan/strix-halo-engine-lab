@@ -5,10 +5,10 @@ tables.
 
 The initial target geometry uses:
 
-- 2560-value embedding rows;
-- BF16-sized rows as an initial byte model: 5120 bytes per row;
-- 16 row requests per token window, corresponding to two n-gram orders with
-  eight heads each.
+- 16 hashed embedding heads per token: two n-gram orders with eight heads each;
+- 160 BF16 values per table row;
+- 320 bytes per requested row;
+- 16 row requests per token, for 5120 useful lookup bytes before concatenation.
 
 The lab does not assume that the production path will use mmap, pread or a row
 cache. It measures them separately.
@@ -29,7 +29,7 @@ Do not benchmark a sparse hole-only file. Materialize deterministic bytes first:
 ./build/sparse-lookup/strix-sparse-lookup prepare \
   --file /fast/ple-table.bin \
   --table-rows 16384 \
-  --row-bytes 5120
+  --row-bytes 320
 ```
 
 ## Benchmark modes
@@ -40,7 +40,7 @@ Do not benchmark a sparse hole-only file. Materialize deterministic bytes first:
 ./build/sparse-lookup/strix-sparse-lookup bench \
   --file /fast/ple-table.bin \
   --mode mmap --pattern ple \
-  --table-rows 16384 --row-bytes 5120 \
+  --table-rows 16384 --row-bytes 320 \
   --requests 16000 --window 16
 ```
 
@@ -50,7 +50,7 @@ Do not benchmark a sparse hole-only file. Materialize deterministic bytes first:
 ./build/sparse-lookup/strix-sparse-lookup bench \
   --file /fast/ple-table.bin \
   --mode pread --pattern ple \
-  --table-rows 16384 --row-bytes 5120 \
+  --table-rows 16384 --row-bytes 320 \
   --requests 16000 --window 16
 ```
 
@@ -61,7 +61,7 @@ Do not benchmark a sparse hole-only file. Materialize deterministic bytes first:
   --file /fast/ple-table.bin \
   --mode pread-cache --pattern ple \
   --cache-rows 256 \
-  --table-rows 16384 --row-bytes 5120 \
+  --table-rows 16384 --row-bytes 320 \
   --requests 16000 --window 16
 ```
 
@@ -71,7 +71,7 @@ Do not benchmark a sparse hole-only file. Materialize deterministic bytes first:
 ./build/sparse-lookup/strix-sparse-lookup bench \
   --file /fast/ple-table.bin \
   --mode pread-coalesced --pattern ple \
-  --table-rows 16384 --row-bytes 5120 \
+  --table-rows 16384 --row-bytes 320 \
   --requests 16000 --window 16
 ```
 
