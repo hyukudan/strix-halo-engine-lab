@@ -26,6 +26,22 @@ struct GreedySpeculationCycleRequest {
     std::uint64_t snapshot_alignment = 64;
 };
 
+struct GreedySpeculationPreparation {
+    std::uint64_t compiled_execution_identity = 0;
+    std::uint64_t runtime_compatibility_identity = 0;
+    std::uint64_t base_position = 0;
+    std::uint64_t committed_tokens = 0;
+    PersistentStateGenerations state;
+    std::vector<std::uint32_t> candidate_tokens;
+    SerialSessionSnapshotPlan pre_window_snapshot;
+};
+
+struct GreedySpeculationFinalizeRequest {
+    std::span<const std::uint32_t> target_tokens;
+    std::uint32_t token_budget = 1;
+    std::span<const std::uint32_t> eos_tokens;
+};
+
 struct GreedySpeculationCyclePlan {
     GreedyVerificationPlan verification;
 
@@ -63,6 +79,19 @@ struct GreedySpeculationCyclePlan {
     // Present only for positive candidate depth.
     SerialSessionSnapshotPlan pre_window_snapshot;
 };
+
+[[nodiscard]] GreedySpeculationPreparation
+prepare_greedy_speculation_cycle(
+    const ModelContract& model,
+    const SerialSessionStateLayout& state_layout,
+    const GreedySpeculationCycleRequest& request);
+
+[[nodiscard]] GreedySpeculationCyclePlan
+finalize_greedy_speculation_cycle(
+    const ModelContract& model,
+    const SerialSessionStateLayout& state_layout,
+    const GreedySpeculationPreparation& preparation,
+    const GreedySpeculationFinalizeRequest& request);
 
 [[nodiscard]] GreedySpeculationCyclePlan
 build_greedy_speculation_cycle_plan(
