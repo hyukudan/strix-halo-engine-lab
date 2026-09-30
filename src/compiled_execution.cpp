@@ -91,6 +91,13 @@ void hash_model(
     hash_bool(hash, model.norm_topk_probability);
     hash_bool(hash, model.gdn_output_gate_sigmoid);
     hash_bool(hash, model.gdn_qk_l2norm);
+    std::uint32_t gdn_qk_epsilon_bits = 0;
+    static_assert(sizeof(gdn_qk_epsilon_bits) == sizeof(model.gdn_qk_l2_epsilon));
+    std::memcpy(
+        &gdn_qk_epsilon_bits,
+        &model.gdn_qk_l2_epsilon,
+        sizeof(gdn_qk_epsilon_bits));
+    hash_u64(hash, gdn_qk_epsilon_bits);
     hash_bool(hash, model.gdn_conv_silu);
 
     hash_u64(hash, model.bytes_bf16);
