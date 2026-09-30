@@ -156,6 +156,58 @@ int main() {
                ids.compatibility_identity,
            "model content change invalidates compatibility identity");
 
+
+    strix::FileMappedPleLookupBackend ple_backend;
+    auto ple_resources = resources;
+    ple_resources.ple_lookup =
+        &ple_backend;
+    const auto ple_ids =
+        strix::build_runtime_execution_identities(
+            scratch.execution_identity,
+            arena,
+            ple_resources);
+    expect(
+        ple_ids.compatibility_identity !=
+            ids.compatibility_identity,
+        "PLE backend implementation changes compatibility identity");
+
+    class ZeroPleBackend final
+        : public strix::PleLookupBackend {
+    public:
+        std::uint64_t implementation_identity()
+            const noexcept override {
+            return 0;
+        }
+        strix::PleLookupHandle start(
+            const strix::PleLookupRequest&) override {
+            return 1;
+        }
+        void finish(
+            strix::PleLookupHandle,
+            std::span<std::byte>) override {}
+        void cancel(
+            strix::PleLookupHandle) noexcept override {}
+    };
+
+    ZeroPleBackend zero_backend;
+    auto invalid_ple_resources =
+        resources;
+    invalid_ple_resources.ple_lookup =
+        &zero_backend;
+    bool zero_backend_rejected = false;
+    try {
+        strix::validate_execution_runtime_resources(
+            scratch.execution_identity,
+            arena,
+            invalid_ple_resources,
+            0);
+    } catch (const std::invalid_argument&) {
+        zero_backend_rejected = true;
+    }
+    expect(
+        zero_backend_rejected,
+        "runtime resources reject zero PLE backend identity");
+
     bool position_rejected = false;
     try {
         strix::validate_execution_runtime_resources(
