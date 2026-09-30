@@ -3,6 +3,7 @@
 #include "strix/hip_embedding_launcher.hpp"
 #include "strix/hip_gdn_launcher.hpp"
 #include "strix/hip_hyper_mix_launcher.hpp"
+#include "strix/hip_indexed_attention_launcher.hpp"
 #include "strix/hip_lm_head_launcher.hpp"
 #include "strix/hip_moe_route_launcher.hpp"
 #include "strix/hip_ple_launcher.hpp"
@@ -46,6 +47,7 @@ private:
     HipElementwiseLauncherBundle elementwise_;
     HipPleLauncherBundle ple_;
     HipGdnLauncherBundle gdn_;
+    HipIndexedAttentionLauncherBundle indexed_attention_;
     HipEmbeddingLauncherBundle embedding_;
     HipHyperMixLauncherBundle hyper_mix_;
     HipMoeRouteLauncherBundle moe_route_;
