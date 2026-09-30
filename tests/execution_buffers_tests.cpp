@@ -42,6 +42,10 @@ int main() {
            "C1 full logits materialization is explicit");
     expect(c1.ple_workspace_bytes == 138'496ULL,
            "C1 PLE workspace uses canonical aligned layout");
+    expect(c1.indexed_attention_workspace_bytes > 0 &&
+               c1.indexed_attention_workspace_bytes <
+                   600ULL * 1024ULL,
+           "C1 indexed-attention workspace is explicit and bounded");
     expect(c1.mlp_intermediate_bytes ==
                2ULL * 640ULL * 4ULL,
            "C1 MoE temporary stores FP32 gate/up intermediates");
