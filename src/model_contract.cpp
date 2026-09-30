@@ -28,6 +28,18 @@ std::string ModelContract::validate() const {
         hc_count <= 1) {
         return "layer pattern, PLE layer and hyper-connection geometry must be valid";
     }
+    const auto ple_heads =
+        (ngram_size - 1ULL) * heads_per_ngram;
+    if (ple_heads == 0 ||
+        ple_embed_dim % ple_heads != 0) {
+        return "PLE embedding dimension must divide the n-gram head count";
+    }
+    if (ngram_vocab_size_base == 0 ||
+        ngram_vocab_divisor == 0 ||
+        ngram_hash_seed == 0 ||
+        ple_eos_token_id >= vocab_size) {
+        return "PLE hash geometry and EOS token must be valid";
+    }
     if (kv_heads == 0 || head_dim == 0 || bytes_bf16 == 0 || bytes_fp32 == 0) {
         return "head and dtype dimensions must be non-zero";
     }
