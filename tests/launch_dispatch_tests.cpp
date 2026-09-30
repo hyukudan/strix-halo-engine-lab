@@ -105,6 +105,7 @@ int main() {
         plan);
 
     strix::ExecutionDispatchContext kernel_context;
+    kernel_context.execution_identity = compiled.execution_identity;
     kernel_context.step_id = 0;
     kernel_context.op =
         strix::SerialOp::token_embedding;
@@ -112,6 +113,7 @@ int main() {
         kernel_context);
 
     strix::ExecutionDispatchContext runtime_context;
+    runtime_context.execution_identity = compiled.execution_identity;
     runtime_context.step_id = 1;
     runtime_context.op =
         strix::SerialOp::position_prepare;
@@ -184,6 +186,47 @@ int main() {
            "launcher implementation identity changes compiled launch identity");
 
     strix::ExecutionLauncherRegistry missing;
+    auto other_execution = compiled;
+    ++other_execution.execution_identity;
+    const auto other_plan = strix::compile_launch_plan(
+        other_execution, registry);
+    strix::DirectLaunchDispatcher other_dispatcher(other_plan);
+    for (const auto identity : {std::uint64_t{0}, compiled.execution_identity}) {
+        auto foreign_kernel = kernel_context;
+        foreign_kernel.execution_identity = identity;
+        auto foreign_runtime = runtime_context;
+        foreign_runtime.execution_identity = identity;
+        bool kernel_rejected = false;
+        bool runtime_rejected = false;
+        try {
+            other_dispatcher.dispatch_kernel(foreign_kernel);
+        } catch (const std::invalid_argument&) {
+            kernel_rejected = true;
+        }
+        try {
+            other_dispatcher.dispatch_runtime_step(foreign_runtime);
+        } catch (const std::invalid_argument&) {
+            runtime_rejected = true;
+        }
+        expect(kernel_rejected && runtime_rejected,
+               "dispatcher rejects missing or foreign execution identity");
+    }
+    expect(kernel_counter.calls == 1 && runtime_counter.calls == 1,
+           "rejected contexts never invoke kernel or runtime launchers");
+    auto uninitialized_plan = plan;
+    uninitialized_plan.execution_identity = 0;
+    strix::DirectLaunchDispatcher uninitialized_dispatcher(uninitialized_plan);
+    auto uncompiled_context = kernel_context;
+    uncompiled_context.execution_identity = 0;
+    bool uninitialized_rejected = false;
+    try {
+        uninitialized_dispatcher.dispatch_kernel(uncompiled_context);
+    } catch (const std::invalid_argument&) {
+        uninitialized_rejected = true;
+    }
+    expect(uninitialized_rejected && kernel_counter.calls == 1,
+           "zero identities cannot bypass compiled dispatch validation");
+
     missing.add_kernel_launcher(
         {
             "kernel.embedding",

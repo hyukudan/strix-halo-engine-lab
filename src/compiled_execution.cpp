@@ -403,7 +403,8 @@ EagerExecutionResult execute_compiled_serial_eager(
         resources.scratch,
         resources.session_state_layout,
         resources.session_state_memory,
-        &resources);
+        &resources,
+        compiled.execution_identity);
 }
 
 EagerExecutionResult execute_compiled_serial_eager(
@@ -438,7 +439,9 @@ EagerExecutionResult execute_compiled_serial_eager(
         dispatcher,
         &memory,
         &session_state_layout,
-        &session_state_memory);
+        &session_state_memory,
+        nullptr,
+        compiled.execution_identity);
 }
 
 }  // namespace strix

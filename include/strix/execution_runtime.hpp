@@ -19,6 +19,8 @@
 namespace strix {
 
 struct ExecutionDispatchContext {
+    // Zero denotes an uncompiled execution and cannot use a compiled launcher.
+    std::uint64_t execution_identity = 0;
     std::uint32_t step_id = 0;
     SerialOp op = SerialOp::token_embedding;
     std::optional<std::uint32_t> layer;
@@ -102,6 +104,7 @@ void validate_eager_execution_preflight(
     const ExecutionMemoryBinding* memory = nullptr,
     const SerialSessionStateLayout* session_state_layout = nullptr,
     const SessionStateMemoryBinding* session_state_memory = nullptr,
-    const ExecutionRuntimeResources* resources = nullptr);
+    const ExecutionRuntimeResources* resources = nullptr,
+    std::uint64_t execution_identity = 0);
 
 }  // namespace strix

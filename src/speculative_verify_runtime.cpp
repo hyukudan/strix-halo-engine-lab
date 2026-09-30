@@ -124,7 +124,8 @@ execute_compiled_speculative_verify_eager(
                 resources.scratch,
                 resources.session_state_layout,
                 resources.session_state_memory,
-                &resources);
+                &resources,
+                compiled.execution_identity);
     } catch (...) {
         session.health =
             SerialSessionHealth::poisoned;

@@ -116,10 +116,13 @@ struct RecordingDispatcher final
     std::uint32_t calls = 0;
     std::optional<std::uint32_t> fail_step;
     std::uint64_t expected_position = 0;
+    std::uint64_t expected_identity = 0;
     std::vector<std::uint32_t> expected_tokens;
 
     void verify(
         const strix::ExecutionDispatchContext& context) {
+        expect(context.execution_identity == expected_identity && expected_identity != 0,
+               "verify dispatch carries compiled execution identity");
         expect(context.logical_rows ==
                    expected_tokens.size(),
                "verify dispatch carries compiled candidate row count");
@@ -284,6 +287,7 @@ int main() {
             10, 20, 30, 40};
 
         RecordingDispatcher dispatcher;
+        dispatcher.expected_identity = fixture.compiled.execution_identity;
         dispatcher.expected_position = 10;
         dispatcher.expected_tokens =
             candidates;
@@ -314,6 +318,7 @@ int main() {
         const std::vector<std::uint32_t> short_candidates{
             10, 20};
         RecordingDispatcher dispatcher;
+        dispatcher.expected_identity = fixture.compiled.execution_identity;
 
         bool rejected = false;
         try {
@@ -340,6 +345,7 @@ int main() {
             10, 20, 30, 40};
 
         RecordingDispatcher dispatcher;
+        dispatcher.expected_identity = fixture.compiled.execution_identity;
         dispatcher.expected_position = 10;
         dispatcher.expected_tokens =
             candidates;
@@ -386,6 +392,7 @@ int main() {
         const std::vector<std::uint32_t> candidates{
             10, 20, 30, 40};
         RecordingDispatcher dispatcher;
+        dispatcher.expected_identity = fixture.compiled.execution_identity;
 
         bool rejected = false;
         try {

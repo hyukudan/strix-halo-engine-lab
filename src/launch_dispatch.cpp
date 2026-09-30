@@ -428,6 +428,11 @@ const CompiledStepLauncher&
 DirectLaunchDispatcher::launcher_for(
     const ExecutionDispatchContext& context,
     bool runtime_step) const {
+    if (plan_.execution_identity == 0 ||
+        context.execution_identity != plan_.execution_identity) {
+        throw std::invalid_argument(
+            "dispatch execution identity does not match compiled launch plan");
+    }
     if (context.step_id >=
         plan_.steps.size()) {
         throw std::out_of_range(

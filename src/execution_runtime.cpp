@@ -331,7 +331,8 @@ EagerExecutionResult execute_serial_eager(
     const ExecutionMemoryBinding* memory,
     const SerialSessionStateLayout* session_state_layout,
     const SessionStateMemoryBinding* session_state_memory,
-    const ExecutionRuntimeResources* resources) {
+    const ExecutionRuntimeResources* resources,
+    std::uint64_t execution_identity) {
     validate_eager_execution_preflight(
         plan, bindings, io_plan, arena_plan, request,
         session_state_layout, session_state_memory, resources);
@@ -362,6 +363,7 @@ EagerExecutionResult execute_serial_eager(
             io_plan.steps[step.id];
 
         ExecutionDispatchContext context;
+        context.execution_identity = execution_identity;
         context.step_id = step.id;
         context.op = step.op;
         context.layer = step.layer;

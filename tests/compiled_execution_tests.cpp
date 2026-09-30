@@ -98,15 +98,20 @@ strix::kernels::KernelRegistry make_registry(
 struct NullDispatcher final
     : strix::EagerExecutionDispatcher {
     std::uint32_t kernels = 0;
+    std::uint64_t expected_identity = 0;
     std::uint32_t runtime = 0;
 
     void dispatch_kernel(
-        const strix::ExecutionDispatchContext&) override {
+        const strix::ExecutionDispatchContext& context) override {
+        expect(context.execution_identity == expected_identity && expected_identity != 0,
+               "serial kernel dispatch carries compiled execution identity");
         ++kernels;
     }
 
     void dispatch_runtime_step(
-        const strix::ExecutionDispatchContext&) override {
+        const strix::ExecutionDispatchContext& context) override {
+        expect(context.execution_identity == expected_identity && expected_identity != 0,
+               "serial runtime dispatch carries compiled execution identity");
         ++runtime;
     }
 };
@@ -394,6 +399,7 @@ int main() {
     run.state.valid = all_state();
 
     NullDispatcher dispatcher;
+    dispatcher.expected_identity = compiled.execution_identity;
     const auto result =
         strix::execute_compiled_serial_eager(
             compiled,
