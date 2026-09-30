@@ -231,7 +231,7 @@ int main() {
         bool rejected = false;
         try {
             strix::validate_serial_execution_io_plan(
-                plan,
+                execution,
                 stale_temporary);
         } catch (const std::invalid_argument&) {
             rejected = true;
