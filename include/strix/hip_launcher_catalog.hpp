@@ -20,6 +20,12 @@ struct HipLauncherCatalogConfig {
         HipActivationStorage::bf16;
 };
 
+void register_complete_hip_kernel_catalog(
+    const ModelContract& model,
+    const ExecutionBindingRequest& request,
+    HipLauncherCatalogConfig config,
+    kernels::KernelRegistry& registry);
+
 class HipLauncherCatalog {
 public:
     HipLauncherCatalog(
