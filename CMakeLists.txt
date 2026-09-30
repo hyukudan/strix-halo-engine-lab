@@ -56,6 +56,7 @@ add_library(strix_core STATIC
     src/session_state_layout.cpp
     src/session_state_memory.cpp
     src/session_snapshot.cpp
+    src/session_snapshot_memory.cpp
     src/session_snapshot_transfer.cpp
     src/session_restore.cpp
     src/sparse_lookup.cpp
@@ -276,6 +277,11 @@ if(BUILD_TESTING)
     target_link_libraries(strix-session-snapshot-tests PRIVATE strix_core)
     strix_target_warnings(strix-session-snapshot-tests)
     add_test(NAME strix-session-snapshot-tests COMMAND strix-session-snapshot-tests)
+
+    add_executable(strix-session-snapshot-memory-tests tests/session_snapshot_memory_tests.cpp)
+    target_link_libraries(strix-session-snapshot-memory-tests PRIVATE strix_core)
+    strix_target_warnings(strix-session-snapshot-memory-tests)
+    add_test(NAME strix-session-snapshot-memory-tests COMMAND strix-session-snapshot-memory-tests)
 
     add_executable(strix-session-restore-tests tests/session_restore_tests.cpp)
     target_link_libraries(strix-session-restore-tests PRIVATE strix_core)
