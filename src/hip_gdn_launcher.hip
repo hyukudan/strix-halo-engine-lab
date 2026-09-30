@@ -169,6 +169,10 @@ void validate_config(
             "HIP GDN v1 requires pinned Qwen4Exp GDN semantics");
     }
     if (config.model.gdn_key_head_dim !=
+            kRecurrentThreads ||
+        config.model.gdn_value_head_dim !=
+            kRecurrentThreads ||
+        config.model.gdn_key_head_dim !=
             config.model.gdn_value_head_dim ||
         config.model.gdn_value_heads %
                 config.model.gdn_key_heads !=
@@ -177,7 +181,7 @@ void validate_config(
                 kValueTile !=
             0) {
         throw std::invalid_argument(
-            "HIP GDN v1 requires equal/tileable key and value head dimensions");
+            "HIP GDN v1 requires 128-wide equal/tileable key and value heads");
     }
 }
 
