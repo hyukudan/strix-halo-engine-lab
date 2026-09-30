@@ -24,6 +24,17 @@ std::uint32_t checked_u32(
 }
 
 
+
+HipIndexedAttentionLauncherConfig
+indexed_attention_config(
+    const ModelContract& model,
+    HipActivationStorage activation) {
+    HipIndexedAttentionLauncherConfig config;
+    config.model = model;
+    config.activation = activation;
+    return config;
+}
+
 HipPleLauncherConfig
 ple_config(
     const ModelContract& model,
@@ -199,6 +210,10 @@ HipLauncherCatalog::HipLauncherCatalog(
               model,
               config.activation,
           }),
+      indexed_attention_(
+          indexed_attention_config(
+              model,
+              config.activation)),
       embedding_(
           embedding_config(
               model,
@@ -246,6 +261,10 @@ register_for_compiled_execution(
             compiled,
             registry);
     gdn_.
+        register_for_compiled_execution(
+            compiled,
+            registry);
+    indexed_attention_.
         register_for_compiled_execution(
             compiled,
             registry);
