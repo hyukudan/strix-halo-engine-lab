@@ -25,7 +25,7 @@ int main() {
 
     strix::SparseLookupRequest request;
     request.table_rows = 100;
-    request.row_bytes = 5120;
+    request.row_bytes = 320;
     request.cache_capacity_rows = 4;
     request.row_ids = rows;
 
@@ -37,8 +37,8 @@ int main() {
     expect(plan.unique_rows == 8 &&
                plan.duplicate_requests == 2,
            "lookup planner counts unique and duplicate rows");
-    expect(plan.requested_bytes == 51'200 &&
-               plan.unique_bytes == 40'960,
+    expect(plan.requested_bytes == 3'200 &&
+               plan.unique_bytes == 2'560,
            "lookup planner accounts row bytes");
     expect(plan.contiguous_runs == 3,
            "lookup planner coalesces adjacent unique rows");
@@ -54,7 +54,7 @@ int main() {
     expect(plan.cache_hits == 1 &&
                plan.cache_misses == 9,
            "bounded LRU simulation accounts eviction");
-    expect(plan.cache_read_bytes == 46'080,
+    expect(plan.cache_read_bytes == 2'880,
            "cache planner exposes physical row bytes read");
     expect(plan.cache_hit_rate == 0.1,
            "cache planner exposes hit rate");
