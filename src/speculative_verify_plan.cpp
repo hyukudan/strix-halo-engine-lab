@@ -2,6 +2,7 @@
 
 #include <limits>
 #include <stdexcept>
+#include <utility>
 
 namespace strix {
 namespace {
