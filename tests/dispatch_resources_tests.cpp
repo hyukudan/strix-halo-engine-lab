@@ -207,6 +207,77 @@ int main() {
                    weights.tensors[0].address,
            "dispatch tensor resolver uses model runtime binding");
 
+
+    const auto model =
+        strix::ModelContract::qwen38_flash_next();
+    strix::SerialSessionStateLayout gdn_layout;
+    gdn_layout.context_tokens = 8;
+    gdn_layout.device_alignment = 256;
+    gdn_layout.host_alignment = 64;
+    gdn_layout.device_total_bytes =
+        strix::gdn_matrix_state_bytes_per_session(model) +
+        strix::gdn_conv_state_bytes_per_session(model);
+    gdn_layout.host_total_bytes = 64;
+    gdn_layout.layout_identity = 0x7777ULL;
+    gdn_layout.allocations.push_back(
+        {
+            strix::SessionStateComponent::recurrent_matrix,
+            strix::PersistentState::recurrent_matrix,
+            strix::SessionStateStorage::device,
+            0,
+            strix::gdn_matrix_state_bytes_per_session(model),
+            false,
+        });
+    gdn_layout.allocations.push_back(
+        {
+            strix::SessionStateComponent::gdn_convolution,
+            strix::PersistentState::convolution_history,
+            strix::SessionStateStorage::device,
+            strix::gdn_matrix_state_bytes_per_session(model),
+            strix::gdn_conv_state_bytes_per_session(model),
+            false,
+        });
+    strix::SessionStateMemoryBinding gdn_memory;
+    gdn_memory.layout_identity =
+        gdn_layout.layout_identity;
+    gdn_memory.device_base =
+        static_cast<std::uintptr_t>(0x90000000ULL);
+    gdn_memory.device_bytes =
+        gdn_layout.device_total_bytes;
+    gdn_memory.device_allocation_generation = 8;
+    gdn_memory.host_base =
+        static_cast<std::uintptr_t>(0x91000000ULL);
+    gdn_memory.host_bytes = 64;
+    gdn_memory.host_allocation_generation = 1;
+
+    auto gdn_context = context;
+    gdn_context.layer = 4;
+    gdn_context.session_state_layout =
+        &gdn_layout;
+    gdn_context.session_state_memory =
+        &gdn_memory;
+    auto gdn_resources = resources;
+    gdn_resources.session_state_layout =
+        &gdn_layout;
+    gdn_resources.session_state_memory =
+        &gdn_memory;
+    gdn_context.resources =
+        &gdn_resources;
+
+    const auto gdn_matrix =
+        strix::resolve_dispatch_gdn_layer_state(
+            gdn_context,
+            model,
+            strix::SessionStateComponent::recurrent_matrix);
+    expect(
+        gdn_matrix.bytes ==
+            strix::gdn_matrix_state_bytes_per_layer(model) &&
+        gdn_matrix.address ==
+            gdn_memory.device_base +
+            3ULL *
+                strix::gdn_matrix_state_bytes_per_layer(model),
+        "dispatch GDN resolver slices one recurrent layer");
+
     bool read_rejected = false;
     try {
         static_cast<void>(
