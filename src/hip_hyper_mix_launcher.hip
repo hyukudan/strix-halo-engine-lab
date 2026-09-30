@@ -707,10 +707,7 @@ const RuntimeTensorBinding& runtime_tensor(
         resolve_dispatch_tensor(
             context,
             access.tensor_indices.front());
-    if ((tensor.storage !=
-             RuntimeTensorStorage::resident &&
-         tensor.storage !=
-             RuntimeTensorStorage::repacked_cache) ||
+    if (!runtime_tensor_gpu_visible(tensor.storage) ||
         tensor.address == 0) {
         throw std::invalid_argument(
             "HIP hyper-mix requires resident or repacked GPU-visible weights");
