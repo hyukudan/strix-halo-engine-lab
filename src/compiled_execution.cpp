@@ -73,9 +73,21 @@ void hash_model(
     hash_u64(hash, model.gdn_value_heads);
     hash_u64(hash, model.gdn_value_head_dim);
     hash_u64(hash, model.gdn_conv_kernel);
+    hash_u64(hash, model.indexer_n_heads);
     hash_u64(hash, model.indexer_kv_heads);
     hash_u64(hash, model.indexer_head_dim);
+    hash_u64(hash, model.indexer_budget);
     hash_u64(hash, model.indexer_compress_ratio);
+
+    std::uint32_t partial_rotary_bits = 0;
+    static_assert(
+        sizeof(partial_rotary_bits) ==
+        sizeof(model.partial_rotary_factor));
+    std::memcpy(
+        &partial_rotary_bits,
+        &model.partial_rotary_factor,
+        sizeof(partial_rotary_bits));
+    hash_u64(hash, partial_rotary_bits);
     hash_u64(hash, model.moe_intermediate_size);
     hash_u64(
         hash,
