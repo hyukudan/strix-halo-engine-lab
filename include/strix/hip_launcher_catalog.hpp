@@ -1,6 +1,7 @@
 #pragma once
 
 #include "strix/hip_embedding_launcher.hpp"
+#include "strix/hip_gdn_launcher.hpp"
 #include "strix/hip_hyper_mix_launcher.hpp"
 #include "strix/hip_lm_head_launcher.hpp"
 #include "strix/hip_moe_route_launcher.hpp"
@@ -42,6 +43,7 @@ public:
 
 private:
     HipElementwiseLauncherBundle elementwise_;
+    HipGdnLauncherBundle gdn_;
     HipEmbeddingLauncherBundle embedding_;
     HipHyperMixLauncherBundle hyper_mix_;
     HipMoeRouteLauncherBundle moe_route_;
