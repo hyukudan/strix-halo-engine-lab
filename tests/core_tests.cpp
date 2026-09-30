@@ -135,8 +135,11 @@ int main() {
            "base KV is 24 KiB/token/session");
     expect(strix::mtp_kv_bytes_per_token(model) == 2ULL * 1024ULL,
            "MTP KV is 2 KiB/token/session");
-    expect(strix::provisional_indexer_bytes_per_token(model) == 768ULL,
-           "provisional indexer estimate is 768 B/token/session");
+    expect(strix::indexer_bytes_per_token(model) == 3ULL * 1024ULL,
+           "exact QSA raw-key cache is 3 KiB/token/session");
+    expect(strix::provisional_indexer_bytes_per_token(model) ==
+               strix::indexer_bytes_per_token(model),
+           "legacy indexer sizing alias resolves to exact raw-key storage");
     expect(model.vocab_size == 248320,
            "official vocabulary size is explicit");
     expect(model.full_attention_interval == 4 &&
@@ -160,6 +163,13 @@ int main() {
     expect(model.rms_norm_epsilon == 1e-6F &&
                model.norm_topk_probability,
            "official RMS/router policy is explicit");
+    expect(model.indexer_n_heads == 4 &&
+               model.indexer_kv_heads == 1 &&
+               model.indexer_head_dim == 128 &&
+               model.indexer_budget == 2048 &&
+               model.indexer_compress_ratio == 4 &&
+               model.partial_rotary_factor == 0.25F,
+           "official QSA geometry is explicit");
     expect(model.gdn_output_gate_sigmoid,
            "official GDN output gate is sigmoid");
     expect(model.hidden_size == 2560 &&
@@ -200,7 +210,7 @@ int main() {
     strix::MemoryPlanRequest request;
     request.context_tokens = 262'144;
     request.sessions = 1;
-    request.include_provisional_indexer = false;
+    request.include_indexer = false;
     const auto one_session = strix::build_memory_plan(model, request);
     expect(one_session.ple_conv_state == 180ULL * 1024ULL,
            "memory plan includes PLE convolution state");
