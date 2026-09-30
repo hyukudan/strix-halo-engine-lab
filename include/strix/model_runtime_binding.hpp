@@ -23,6 +23,7 @@ struct ModelContentIdentity {
 enum class RuntimeTensorStorage {
     resident,
     file_mapped,
+    registered_file_mapped,
     repacked_cache,
     remote,
 };
@@ -47,6 +48,12 @@ struct ModelRuntimeBinding {
 
     std::vector<RuntimeTensorBinding> tensors;
 };
+
+[[nodiscard]] bool runtime_tensor_gpu_visible(
+    RuntimeTensorStorage storage) noexcept;
+
+[[nodiscard]] bool runtime_tensor_file_backed(
+    RuntimeTensorStorage storage) noexcept;
 
 void validate_model_runtime_binding(
     const ModelManifest& manifest,
