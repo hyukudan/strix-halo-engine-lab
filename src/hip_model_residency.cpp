@@ -186,29 +186,63 @@ std::vector<HostRange> build_registration_ranges(
     return merged;
 }
 
-const HipModelResidency::RegisteredRange*
-find_registered_range(
-    const std::vector<
-        HipModelResidency::RegisteredRange>& ranges,
-    std::uintptr_t host_address,
-    std::uint64_t bytes) {
-    for (const auto& range :
-         ranges) {
-        if (host_address <
-            range.host_base) {
+
+std::vector<HostRange> build_copy_ranges(
+    const MappedModelFile& mapped,
+    const ModelManifest& manifest,
+    const HipModelResidencyPolicy& policy) {
+    std::vector<HostRange> ranges;
+    for (const auto& tensor : manifest.tensors) {
+        if (!should_promote(tensor, policy)) {
             continue;
         }
-        const auto offset =
-            static_cast<std::uint64_t>(
-                host_address -
-                range.host_base);
-        if (offset <= range.bytes &&
-            bytes <=
-                range.bytes - offset) {
-            return &range;
+        if (tensor.absolute_offset > mapped.bytes() ||
+            tensor.byte_size >
+                mapped.bytes() - tensor.absolute_offset) {
+            throw std::invalid_argument(
+                "manifest tensor exceeds mapped model file");
+        }
+        ranges.push_back(
+            HostRange{
+                tensor.absolute_offset,
+                checked_add(
+                    tensor.absolute_offset,
+                    tensor.byte_size),
+            });
+    }
+
+    std::sort(
+        ranges.begin(),
+        ranges.end(),
+        [](const auto& left,
+           const auto& right) {
+            if (left.begin != right.begin) {
+                return left.begin < right.begin;
+            }
+            return left.end < right.end;
+        });
+
+    std::vector<HostRange> merged;
+    for (const auto range : ranges) {
+        if (merged.empty()) {
+            merged.push_back(range);
+            continue;
+        }
+        auto& last = merged.back();
+        const auto maximum_gap_end =
+            checked_add(
+                last.end,
+                policy.coalesce_gap_bytes);
+        if (range.begin <= maximum_gap_end) {
+            last.end =
+                std::max(
+                    last.end,
+                    range.end);
+        } else {
+            merged.push_back(range);
         }
     }
-    return nullptr;
+    return merged;
 }
 
 }  // namespace
@@ -219,10 +253,9 @@ HipModelResidency::HipModelResidency(
       registered_ranges_(
           std::move(
               other.registered_ranges_)),
-      copied_device_base_(
-          other.copied_device_base_),
-      copied_device_bytes_(
-          other.copied_device_bytes_),
+      copied_ranges_(
+          std::move(
+              other.copied_ranges_)),
       registered_bytes_(
           other.registered_bytes_),
       copied_bytes_(
@@ -230,8 +263,6 @@ HipModelResidency::HipModelResidency(
       binding_(
           std::move(
               other.binding_)) {
-    other.copied_device_base_ = 0;
-    other.copied_device_bytes_ = 0;
     other.registered_bytes_ = 0;
     other.copied_bytes_ = 0;
     other.registered_ranges_.clear();
@@ -246,10 +277,9 @@ HipModelResidency::operator=(
         registered_ranges_ =
             std::move(
                 other.registered_ranges_);
-        copied_device_base_ =
-            other.copied_device_base_;
-        copied_device_bytes_ =
-            other.copied_device_bytes_;
+        copied_ranges_ =
+            std::move(
+                other.copied_ranges_);
         registered_bytes_ =
             other.registered_bytes_;
         copied_bytes_ =
@@ -258,8 +288,6 @@ HipModelResidency::operator=(
             std::move(
                 other.binding_);
 
-        other.copied_device_base_ = 0;
-        other.copied_device_bytes_ = 0;
         other.registered_bytes_ = 0;
         other.copied_bytes_ = 0;
         other.registered_ranges_.clear();
@@ -393,12 +421,23 @@ HipModelResidency HipModelResidency::create(
                     static_cast<
                         std::uintptr_t>(
                             tensor.absolute_offset);
-                const auto* range =
-                    find_registered_range(
-                        result.registered_ranges_,
-                        host,
-                        tensor.byte_size);
-                if (range == nullptr) {
+                const auto found =
+                    std::find_if(
+                        result.registered_ranges_.begin(),
+                        result.registered_ranges_.end(),
+                        [&](const RegisteredRange& range) {
+                            if (host < range.host_base) {
+                                return false;
+                            }
+                            const auto offset =
+                                static_cast<std::uint64_t>(
+                                    host - range.host_base);
+                            return offset <= range.bytes &&
+                                   tensor.byte_size <=
+                                       range.bytes - offset;
+                        });
+                if (found ==
+                    result.registered_ranges_.end()) {
                     throw std::logic_error(
                         "promoted tensor is not covered by a registered range");
                 }
@@ -406,12 +445,12 @@ HipModelResidency HipModelResidency::create(
                 const auto offset =
                     static_cast<std::uintptr_t>(
                         host -
-                        range->host_base);
+                        found->host_base);
                 runtime.storage =
                     RuntimeTensorStorage::
                         registered_file_mapped;
                 runtime.address =
-                    range->device_base +
+                    found->device_base +
                     offset;
                 runtime.allocation_generation =
                     generation;
@@ -421,65 +460,100 @@ HipModelResidency HipModelResidency::create(
             throw;
         }
     } else {
-        void* device = nullptr;
-        check_hip(
-            hipMalloc(
-                &device,
-                static_cast<std::size_t>(
-                    mapped.bytes())),
-            "hipMalloc(model copy)");
-
-        result.copied_device_base_ =
-            reinterpret_cast<
-                std::uintptr_t>(
-                    device);
-        result.copied_device_bytes_ =
-            mapped.bytes();
+        const auto ranges =
+            build_copy_ranges(
+                mapped,
+                manifest,
+                policy);
 
         try {
-            check_hip(
-                hipMemcpy(
-                    device,
-                    reinterpret_cast<
-                        const void*>(
-                            mapped.base_address()),
-                    static_cast<std::size_t>(
-                        mapped.bytes()),
-                    hipMemcpyHostToDevice),
-                "hipMemcpy(model copy)");
-            result.copied_bytes_ =
-                mapped.bytes();
+            result.copied_ranges_.reserve(
+                ranges.size());
+
+            for (const auto range : ranges) {
+                const auto bytes =
+                    range.end - range.begin;
+                void* device = nullptr;
+                check_hip(
+                    hipMalloc(
+                        &device,
+                        static_cast<std::size_t>(
+                            bytes)),
+                    "hipMalloc(model range copy)");
+                try {
+                    check_hip(
+                        hipMemcpy(
+                            device,
+                            reinterpret_cast<const void*>(
+                                mapped.base_address() +
+                                static_cast<std::uintptr_t>(
+                                    range.begin)),
+                            static_cast<std::size_t>(
+                                bytes),
+                            hipMemcpyHostToDevice),
+                        "hipMemcpy(model range copy)");
+                } catch (...) {
+                    static_cast<void>(
+                        hipFree(device));
+                    throw;
+                }
+
+                result.copied_ranges_.push_back(
+                    CopiedRange{
+                        range.begin,
+                        reinterpret_cast<std::uintptr_t>(
+                            device),
+                        bytes,
+                    });
+                result.copied_bytes_ =
+                    checked_add(
+                        result.copied_bytes_,
+                        bytes);
+            }
 
             for (std::size_t index = 0;
-                 index <
-                    manifest.tensors.size();
+                 index < manifest.tensors.size();
                  ++index) {
                 const auto& tensor =
                     manifest.tensors[index];
                 auto& runtime =
-                    result.binding_.
-                        tensors[index];
+                    result.binding_.tensors[index];
 
-                if (tensor.placement.kind ==
-                    PlacementKind::remote) {
+                if (!should_promote(
+                        tensor,
+                        policy)) {
                     continue;
                 }
-                if (tensor.absolute_offset >
-                        mapped.bytes() ||
-                    tensor.byte_size >
-                        mapped.bytes() -
-                            tensor.absolute_offset) {
-                    throw std::invalid_argument(
-                        "manifest tensor exceeds copied model file");
+
+                const auto found =
+                    std::find_if(
+                        result.copied_ranges_.begin(),
+                        result.copied_ranges_.end(),
+                        [&](const CopiedRange& range) {
+                            if (tensor.absolute_offset <
+                                range.file_offset) {
+                                return false;
+                            }
+                            const auto offset =
+                                tensor.absolute_offset -
+                                range.file_offset;
+                            return offset <= range.bytes &&
+                                   tensor.byte_size <=
+                                       range.bytes - offset;
+                        });
+                if (found ==
+                    result.copied_ranges_.end()) {
+                    throw std::logic_error(
+                        "promoted tensor is not covered by a copied range");
                 }
 
                 runtime.storage =
                     RuntimeTensorStorage::resident;
                 runtime.address =
-                    result.copied_device_base_ +
-                    static_cast<
-                        std::uintptr_t>(
-                            tensor.absolute_offset);
+                    found->device_base +
+                    static_cast<std::uintptr_t>(
+                        tensor.absolute_offset -
+                        found->file_offset);
                 runtime.allocation_generation =
                     generation;
             }
@@ -487,7 +561,6 @@ HipModelResidency HipModelResidency::create(
             result.release();
             throw;
         }
-    }
 
     validate_model_runtime_binding(
         manifest,
@@ -505,14 +578,14 @@ void HipModelResidency::release() noexcept {
     }
     registered_ranges_.clear();
 
-    if (copied_device_base_ != 0) {
+    for (const auto& range :
+         copied_ranges_) {
         static_cast<void>(
             hipFree(
                 reinterpret_cast<void*>(
-                    copied_device_base_)));
+                    range.device_base)));
     }
-    copied_device_base_ = 0;
-    copied_device_bytes_ = 0;
+    copied_ranges_.clear();
     registered_bytes_ = 0;
     copied_bytes_ = 0;
     binding_ = {};
