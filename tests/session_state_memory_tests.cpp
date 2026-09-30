@@ -173,6 +173,74 @@ int main() {
             strix::gdn_conv_state_bytes_per_layer(model),
         "GDN convolution slice exposes one layer only");
 
+
+    expect(
+        strix::indexed_attention_layer_ordinal(
+            model, 3) == 0 &&
+        strix::indexed_attention_layer_ordinal(
+            model, 7) == 1 &&
+        strix::indexed_attention_layer_ordinal(
+            model, 47) == 11,
+        "indexed-attention ordinal follows every fourth layer");
+
+    bool linear_rejected = false;
+    try {
+        static_cast<void>(
+            strix::indexed_attention_layer_ordinal(
+                model, 2));
+    } catch (const std::invalid_argument&) {
+        linear_rejected = true;
+    }
+    expect(
+        linear_rejected,
+        "linear-attention layer has no indexed state ordinal");
+
+    const auto indexed_kv =
+        strix::resolve_indexed_attention_layer_state(
+            layout,
+            memory,
+            model,
+            7,
+            strix::SessionStateComponent::attention_kv);
+    const auto indexed_raw =
+        strix::resolve_indexed_attention_layer_state(
+            layout,
+            memory,
+            model,
+            7,
+            strix::SessionStateComponent::sparse_index);
+    const auto kv_per_layer =
+        strix::base_kv_bytes_per_token(model) /
+        model.full_attention_layers *
+        layout.context_tokens;
+    const auto raw_per_layer =
+        strix::indexer_bytes_per_token(model) /
+        model.full_attention_layers *
+        layout.context_tokens;
+    expect(
+        indexed_kv.bytes == kv_per_layer &&
+        indexed_raw.bytes == raw_per_layer,
+        "indexed layer resolver returns exact per-layer KV and raw-index sizes");
+
+    const auto kv_base =
+        strix::resolve_session_state(
+            layout,
+            memory,
+            strix::SessionStateComponent::attention_kv);
+    const auto raw_base =
+        strix::resolve_session_state(
+            layout,
+            memory,
+            strix::SessionStateComponent::sparse_index);
+    expect(
+        indexed_kv.address ==
+            kv_base.address +
+                kv_per_layer &&
+        indexed_raw.address ==
+            raw_base.address +
+                raw_per_layer,
+        "second indexed layer resolves one per-layer stride into both pools");
+
     if (failures == 0) {
         std::cout << "session state memory tests passed\n";
     }
