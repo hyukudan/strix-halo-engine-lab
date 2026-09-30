@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <new>
 #include <stdexcept>
@@ -32,6 +33,61 @@ bool valid_alignment(
 }
 
 }  // namespace
+
+
+void initialize_hip_fresh_runtime_memory(
+    const ExecutionMemoryBinding& scratch,
+    const SessionStateMemoryBinding& state) {
+    if (scratch.arena_base == 0 ||
+        scratch.arena_bytes == 0 ||
+        scratch.allocation_generation == 0) {
+        throw std::invalid_argument(
+            "fresh HIP runtime initialization requires bound scratch memory");
+    }
+
+    check_hip(
+        hipMemset(
+            reinterpret_cast<void*>(
+                scratch.arena_base),
+            0,
+            static_cast<std::size_t>(
+                scratch.arena_bytes)),
+        "hipMemset(fresh scratch)");
+
+    if (state.device_bytes != 0) {
+        if (state.device_base == 0 ||
+            state.device_allocation_generation == 0) {
+            throw std::invalid_argument(
+                "fresh HIP runtime initialization requires bound device state");
+        }
+        check_hip(
+            hipMemset(
+                reinterpret_cast<void*>(
+                    state.device_base),
+                0,
+                static_cast<std::size_t>(
+                    state.device_bytes)),
+            "hipMemset(fresh device state)");
+    }
+
+    if (state.host_bytes != 0) {
+        if (state.host_base == 0 ||
+            state.host_allocation_generation == 0) {
+            throw std::invalid_argument(
+                "fresh HIP runtime initialization requires bound host state");
+        }
+        std::memset(
+            reinterpret_cast<void*>(
+                state.host_base),
+            0,
+            static_cast<std::size_t>(
+                state.host_bytes));
+    }
+
+    check_hip(
+        hipDeviceSynchronize(),
+        "hipDeviceSynchronize(fresh runtime memory)");
+}
 
 HipRuntimeAllocator::HipRuntimeAllocator(
     HipHostAllocationMode host_mode)
