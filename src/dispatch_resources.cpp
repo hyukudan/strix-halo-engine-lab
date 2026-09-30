@@ -140,6 +140,23 @@ SessionStateAddress resolve_dispatch_state(
 }
 
 
+
+SessionStateAddress resolve_dispatch_gdn_layer_state(
+    const ExecutionDispatchContext& context,
+    const ModelContract& model,
+    SessionStateComponent component) {
+    if (!context.layer.has_value()) {
+        throw std::invalid_argument(
+            "GDN dispatch state resolution requires a layer id");
+    }
+    return resolve_gdn_layer_state(
+        state_layout(context),
+        state_memory(context),
+        model,
+        *context.layer,
+        component);
+}
+
 const ExecutionTensorAccess& resolve_dispatch_tensor_access(
     const ExecutionDispatchContext& context,
     std::uint32_t binding_slot) {
