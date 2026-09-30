@@ -324,6 +324,11 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-speculation-executor-tests)
     add_test(NAME strix-speculation-executor-tests COMMAND strix-speculation-executor-tests)
 
+    add_executable(strix-compiled-speculation-backend-tests tests/compiled_speculation_backend_tests.cpp)
+    target_link_libraries(strix-compiled-speculation-backend-tests PRIVATE strix_core)
+    strix_target_warnings(strix-compiled-speculation-backend-tests)
+    add_test(NAME strix-compiled-speculation-backend-tests COMMAND strix-compiled-speculation-backend-tests)
+
     add_executable(strix-speculative-verify-plan-tests tests/speculative_verify_plan_tests.cpp)
     target_link_libraries(strix-speculative-verify-plan-tests PRIVATE strix_core)
     strix_target_warnings(strix-speculative-verify-plan-tests)
