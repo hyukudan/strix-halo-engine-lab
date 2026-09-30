@@ -638,5 +638,21 @@ if(STRIX_ENABLE_HIP_RUNTIME)
             NAME strix-hip-model-residency-tests
             COMMAND strix-hip-model-residency-tests
         )
+
+        add_executable(
+            strix-hip-runtime-memory-init-tests
+            tests/hip_runtime_memory_init_tests.cpp
+        )
+        target_link_libraries(
+            strix-hip-runtime-memory-init-tests
+            PRIVATE strix_hip_runtime
+        )
+        strix_target_warnings(
+            strix-hip-runtime-memory-init-tests
+        )
+        add_test(
+            NAME strix-hip-runtime-memory-init-tests
+            COMMAND strix-hip-runtime-memory-init-tests
+        )
     endif()
 endif()
