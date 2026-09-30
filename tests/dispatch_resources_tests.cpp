@@ -1,4 +1,5 @@
 #include "strix/dispatch_resources.hpp"
+#include "strix/memory_plan.hpp"
 
 #include <array>
 #include <iostream>
