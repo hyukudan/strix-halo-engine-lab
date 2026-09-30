@@ -64,6 +64,12 @@ constexpr Buffer ple_workspace() {
         0};
 }
 
+constexpr Buffer indexed_attention_workspace() {
+    return Buffer{
+        ExecutionBufferClass::indexed_attention_workspace,
+        0};
+}
+
 bool contains_buffer(
     std::span<const ExecutionBufferUse> values,
     Buffer needle) {
@@ -97,6 +103,8 @@ std::uint32_t slot_limit(
         return plan.gdn_workspace_slots;
     case ExecutionBufferClass::ple_workspace:
         return plan.ple_workspace_slots;
+    case ExecutionBufferClass::indexed_attention_workspace:
+        return plan.indexed_attention_workspace_slots;
     }
     return 0;
 }
@@ -124,11 +132,12 @@ SerialExecutionIoPlan build_serial_execution_io_plan(
     output.mlp_intermediate_slots = 1;
     output.gdn_workspace_slots = 1;
     output.ple_workspace_slots = 1;
+    output.indexed_attention_workspace_slots = 1;
     output.steps.reserve(
         execution_plan.steps.size());
 
     constexpr std::size_t maximum_buffers =
-        9U * 8U;
+        10U * 8U;
     std::array<std::uint64_t, maximum_buffers> generations{};
 
     const auto read_use = [&](Buffer buffer) {
@@ -208,6 +217,10 @@ SerialExecutionIoPlan build_serial_execution_io_plan(
         case SerialOp::indexed_attention:
             io.reads = {read_use(hidden(0))};
             io.writes = {write_use(hidden(1))};
+            io.temporaries = {
+                temporary_use(
+                    indexed_attention_workspace()),
+            };
             break;
 
         case SerialOp::attn_inject: {
@@ -310,7 +323,7 @@ void validate_serial_execution_io_plan(
     }
 
     constexpr std::size_t maximum_buffers =
-        9U * 8U;
+        10U * 8U;
     std::array<bool, maximum_buffers> produced{};
     std::array<std::uint64_t, maximum_buffers> generation{};
 
