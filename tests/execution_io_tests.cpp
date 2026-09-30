@@ -72,6 +72,11 @@ int main() {
                            strix::ExecutionBufferClass::expanded_hidden &&
                        step.reads[0].buffer.slot != step.writes[0].buffer.slot,
                    "PLE ping-pongs expanded hidden state");
+            expect(
+                step.temporaries.size() == 1 &&
+                step.temporaries[0].buffer.buffer_class ==
+                    strix::ExecutionBufferClass::ple_workspace,
+                "PLE owns one step-local workspace");
         }
 
 
