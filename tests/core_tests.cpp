@@ -168,8 +168,10 @@ int main() {
                model.indexer_head_dim == 128 &&
                model.indexer_budget == 2048 &&
                model.indexer_compress_ratio == 4 &&
-               model.partial_rotary_factor == 0.25F,
-           "official QSA geometry is explicit");
+               model.partial_rotary_factor == 0.25F &&
+               model.rotary_dim() == 64 &&
+               model.rope_theta == 10'000'000.0F,
+           "official QSA geometry and partial RoPE are explicit");
     expect(model.gdn_output_gate_sigmoid,
            "official GDN output gate is sigmoid");
     expect(model.hidden_size == 2560 &&
