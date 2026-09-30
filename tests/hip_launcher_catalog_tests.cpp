@@ -4,6 +4,7 @@
 #include "strix/hip_embedding_launcher.hpp"
 #include "strix/hip_gdn_launcher.hpp"
 #include "strix/hip_hyper_mix_launcher.hpp"
+#include "strix/hip_indexed_attention_launcher.hpp"
 #include "strix/hip_launcher_catalog.hpp"
 #include "strix/hip_lm_head_launcher.hpp"
 #include "strix/hip_moe_route_launcher.hpp"
@@ -39,6 +40,7 @@ bool catalog_supported(strix::SerialOp op) {
     case SerialOp::hyper_expand:
     case SerialOp::ple:
     case SerialOp::gated_delta_net:
+    case SerialOp::indexed_attention:
     case SerialOp::attn_hyper_mix:
     case SerialOp::attn_inject:
     case SerialOp::mlp_hyper_mix:
@@ -149,6 +151,13 @@ int main() {
         strix::HipActivationStorage::bf16;
     strix::register_hip_gdn_kernel_variant(
         model, request, gdn, kernels);
+
+    strix::HipIndexedAttentionLauncherConfig indexed;
+    indexed.model = model;
+    indexed.activation =
+        strix::HipActivationStorage::bf16;
+    strix::register_hip_indexed_attention_kernel_variant(
+        model, request, indexed, kernels);
     strix::register_hip_embedding_kernel_variant(
         model, request, embedding, kernels);
     strix::register_hip_hyper_mix_kernel_variant(
@@ -265,8 +274,8 @@ int main() {
     }
 
     expect(
-        coverage.missing_steps == 12,
-        "catalog exposes exact current launcher gap count");
+        coverage.missing_steps == 0,
+        "catalog covers every serial execution step");
     expect(
         missing_by_op[strix::SerialOp::ple] == 0,
         "PLE launcher is covered");
@@ -274,8 +283,8 @@ int main() {
         missing_by_op[strix::SerialOp::gated_delta_net] == 0,
         "GDN launcher is covered");
     expect(
-        missing_by_op[strix::SerialOp::indexed_attention] == 12,
-        "indexed-attention launcher gaps are explicit");
+        missing_by_op[strix::SerialOp::indexed_attention] == 0,
+        "indexed-attention launcher is covered");
     expect(
         missing_by_op[strix::SerialOp::moe_experts] == 0,
         "routed-expert launcher is covered");
@@ -286,8 +295,8 @@ int main() {
         missing_by_op[strix::SerialOp::lm_head] == 0,
         "LM-head launcher is covered");
     expect(
-        missing_by_op.size() == 1,
-        "no already-supported operator appears in missing coverage");
+        missing_by_op.empty(),
+        "HIP launcher catalog has no missing serial operators");
 
     expect(
         coverage.covered_steps +
