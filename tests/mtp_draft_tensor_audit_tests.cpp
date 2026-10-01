@@ -70,6 +70,13 @@ struct Fixture {
 int main() {
     {
         Fixture fixture;
+        const auto manifest_audit =
+            strix::audit_mtp_draft_tensor_families(
+                fixture.manifest);
+        expect(manifest_audit.proposal_identity == 0 &&
+                   manifest_audit.structurally_complete(),
+               "manifest-only MTP audit works before runtime binding");
+
         const auto audit =
             strix::audit_mtp_draft_tensor_families(
                 fixture.manifest,

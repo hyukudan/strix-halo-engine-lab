@@ -75,22 +75,18 @@ bool classify(
 
 MtpDraftTensorAudit
 audit_mtp_draft_tensor_families(
-    const ModelManifest& manifest,
-    const MtpDraftRuntimeBinding& binding) {
+    const ModelManifest& manifest) {
     if (manifest.layout_identity == 0 ||
-        binding.manifest_layout_identity !=
-            manifest.layout_identity ||
-        binding.compatibility_identity == 0 ||
-        binding.tensor_indices.empty()) {
+        manifest.layout_identity !=
+            model_manifest_layout_identity(
+                manifest)) {
         throw std::invalid_argument(
-            "MTP tensor audit requires matching initialized manifest and binding");
+            "MTP tensor audit requires valid manifest identity");
     }
 
     MtpDraftTensorAudit audit;
     audit.manifest_layout_identity =
         manifest.layout_identity;
-    audit.proposal_identity =
-        binding.compatibility_identity;
     audit.families = {
         {MtpTensorFamily::embedding_combiner, true, {}},
         {MtpTensorFamily::hidden_combiner, true, {}},
@@ -99,20 +95,14 @@ audit_mtp_draft_tensor_families(
         {MtpTensorFamily::moe, true, {}},
     };
 
-    for (const auto index :
-         binding.tensor_indices) {
-        if (index >=
-            manifest.tensors.size()) {
-            throw std::invalid_argument(
-                "MTP tensor audit binding index exceeds manifest");
-        }
-
+    for (std::uint32_t index = 0;
+         index < manifest.tensors.size();
+         ++index) {
         const auto& tensor =
             manifest.tensors[index];
         if (tensor.role !=
             TensorRole::mtp) {
-            throw std::invalid_argument(
-                "MTP tensor audit binding contains non-MTP tensor");
+            continue;
         }
 
         MtpTensorFamily kind;
@@ -146,6 +136,42 @@ audit_mtp_draft_tensor_families(
     }
 
     return audit;
+}
+
+MtpDraftTensorAudit
+audit_mtp_draft_tensor_families(
+    const ModelManifest& manifest,
+    const MtpDraftRuntimeBinding& binding) {
+    if (binding.manifest_layout_identity !=
+            manifest.layout_identity ||
+        binding.compatibility_identity == 0 ||
+        binding.tensor_indices.empty()) {
+        throw std::invalid_argument(
+            "MTP tensor audit requires matching initialized binding");
+    }
+
+    const auto audit =
+        audit_mtp_draft_tensor_families(
+            manifest);
+
+    std::vector<std::uint32_t> expected;
+    for (std::uint32_t index = 0;
+         index < manifest.tensors.size();
+         ++index) {
+        if (manifest.tensors[index].role ==
+            TensorRole::mtp) {
+            expected.push_back(index);
+        }
+    }
+    if (binding.tensor_indices != expected) {
+        throw std::invalid_argument(
+            "MTP tensor audit binding does not cover manifest MTP tensors exactly");
+    }
+
+    auto bound = audit;
+    bound.proposal_identity =
+        binding.compatibility_identity;
+    return bound;
 }
 
 const char*

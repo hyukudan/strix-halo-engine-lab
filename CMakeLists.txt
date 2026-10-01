@@ -91,6 +91,10 @@ add_executable(strix-inspect-gguf apps/inspect_gguf_main.cpp)
 target_link_libraries(strix-inspect-gguf PRIVATE strix_core)
 strix_target_warnings(strix-inspect-gguf)
 
+add_executable(strix-mtp-manifest-audit apps/mtp_manifest_audit_main.cpp)
+target_link_libraries(strix-mtp-manifest-audit PRIVATE strix_core)
+strix_target_warnings(strix-mtp-manifest-audit)
+
 add_executable(strix-model-manifest apps/model_manifest_main.cpp)
 target_link_libraries(strix-model-manifest PRIVATE strix_core)
 strix_target_warnings(strix-model-manifest)

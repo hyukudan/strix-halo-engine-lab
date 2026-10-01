@@ -38,6 +38,10 @@ struct MtpDraftTensorAudit {
 
 [[nodiscard]] MtpDraftTensorAudit
 audit_mtp_draft_tensor_families(
+    const ModelManifest& manifest);
+
+[[nodiscard]] MtpDraftTensorAudit
+audit_mtp_draft_tensor_families(
     const ModelManifest& manifest,
     const MtpDraftRuntimeBinding& binding);
 
