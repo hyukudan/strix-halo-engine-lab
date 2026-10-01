@@ -18,13 +18,10 @@ strix_lab_warnings(strix-uma-host)
 
 if(STRIX_UMA_ENABLE_HIP)
     enable_language(HIP)
-    find_package(hip REQUIRED CONFIG)
-
     add_executable(strix-uma-hip hip_residency.hip)
     set_target_properties(strix-uma-hip PROPERTIES
         HIP_STANDARD 20
         HIP_STANDARD_REQUIRED ON
         HIP_ARCHITECTURES gfx1151
     )
-    target_link_libraries(strix-uma-hip PRIVATE hip::host)
 endif()
