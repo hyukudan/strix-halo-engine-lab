@@ -181,6 +181,71 @@ int main() {
            "direct link is unusable before receive ring is primed");
 
 
+    DirectLinkLifecycle peer_lifecycle =
+        lifecycle;
+    peer_lifecycle.physical_link_id =
+        "usb4-a-peer";
+    lifecycle.ring_frames = 4095;
+    peer_lifecycle.ring_frames = 4095;
+    lifecycle.interrupt_throttling_ns =
+        8192;
+    peer_lifecycle.interrupt_throttling_ns =
+        8192;
+    lifecycle.in_hopid = 9;
+    lifecycle.out_hopid = 10;
+    peer_lifecycle.in_hopid = 10;
+    peer_lifecycle.out_hopid = 9;
+    lifecycle.receive_ring_primed = false;
+    peer_lifecycle.receive_ring_primed = false;
+    lifecycle.state =
+        DirectLinkLifecycleState::arm_allowed;
+    peer_lifecycle.state =
+        DirectLinkLifecycleState::arm_allowed;
+
+    const auto arm_pair =
+        reconcile_direct_link_pair(
+            lifecycle,
+            peer_lifecycle);
+    expect(arm_pair.state ==
+               DirectPairState::arm_allowed &&
+               arm_pair.parameters_match &&
+               arm_pair.hopids_reciprocal,
+           "pair reconcile requires reciprocal HopIDs and matching parameters before arm");
+
+    lifecycle.state =
+        DirectLinkLifecycleState::direct_ready;
+    peer_lifecycle.state =
+        DirectLinkLifecycleState::direct_ready;
+    lifecycle.receive_ring_primed = true;
+    peer_lifecycle.receive_ring_primed = true;
+    lifecycle.completion_rearm_qualified = true;
+    peer_lifecycle.completion_rearm_qualified = true;
+    lifecycle.connection_epoch = 11;
+    peer_lifecycle.connection_epoch = 11;
+
+    const auto ready_pair =
+        reconcile_direct_link_pair(
+            lifecycle,
+            peer_lifecycle);
+    expect(ready_pair.state ==
+               DirectPairState::direct_ready &&
+               ready_pair.epochs_match &&
+               ready_pair.receive_rings_primed,
+           "pair reconcile requires matching epoch and primed receive rings");
+
+    peer_lifecycle.in_hopid = 12;
+    const auto partial_pair =
+        reconcile_direct_link_pair(
+            lifecycle,
+            peer_lifecycle);
+    expect(partial_pair.state ==
+               DirectPairState::partial &&
+               !partial_pair.hopids_reciprocal,
+           "pair reconcile rejects mismatched direct endpoint topology");
+
+
+
+
     std::vector<LinkProfile> completion_links(2);
     completion_links[0].id = "wire-fast-consumer-slow";
     completion_links[0].peer_node = 1;
