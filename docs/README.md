@@ -56,6 +56,7 @@ A wider kernel, larger speculative window, second node or second physical link i
 - [13 — Platform discovery and capability negotiation](architecture/13-platform-discovery.md)
 - [14 — Implementation roadmap](architecture/14-implementation-roadmap.md)
 - [15 — Optimization strategy](architecture/15-optimization-strategy.md)
+- [16 — Direct GPU transport over USB4](architecture/16-direct-gpu-transport.md)
 
 ## Change rule
 
