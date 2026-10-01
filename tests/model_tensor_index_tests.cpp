@@ -65,6 +65,11 @@ strix::ModelManifest fixture() {
         strix::TensorRole::attention_projection,
         1,
         strix::PlacementKind::remote);
+    add(
+        "blk.0.ffn_shexp_up.weight",
+        strix::TensorRole::dense_projection,
+        0,
+        strix::PlacementKind::local);
 
     manifest.layout_identity =
         strix::model_manifest_layout_identity(
