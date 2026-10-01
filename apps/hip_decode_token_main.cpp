@@ -8,6 +8,7 @@
 #include "strix/launch_dispatch.hpp"
 #include "strix/mapped_model_file.hpp"
 #include "strix/model_contract.hpp"
+#include "strix/model_content_hash.hpp"
 #include "strix/model_manifest.hpp"
 #include "strix/model_tensor_index.hpp"
 #include "strix/ple_lookup.hpp"
@@ -321,10 +322,31 @@ int main(
 
     std::optional<strix::SerialDecodeReference>
         reference;
+    std::uint64_t required_reference_logit_values = 0;
     if (!options.reference_path.empty()) {
         reference =
             strix::read_serial_decode_reference(
                 options.reference_path);
+        if (reference->steps.size() < 2) {
+            throw std::invalid_argument(
+                "serial replay qualification requires at least two reference steps");
+        }
+        for (const auto& step : reference->steps) {
+            const auto probes =
+                static_cast<std::uint64_t>(
+                    step.logits.size());
+            if (probes >
+                std::numeric_limits<std::uint64_t>::max() -
+                    required_reference_logit_values) {
+                throw std::overflow_error(
+                    "reference logit probe count overflow");
+            }
+            required_reference_logit_values += probes;
+        }
+        if (required_reference_logit_values == 0) {
+            throw std::invalid_argument(
+                "serial replay reference requires logit probes");
+        }
         if (options.tokens.empty()) {
             options.tokens.reserve(
                 reference->steps.size());
@@ -587,6 +609,10 @@ int main(
     }
 
     std::cout << '{' << '\n'
+              << "  \"model_content_identity\": \""
+              << strix::model_content_identity_hex(
+                     model_residency.binding().model_content_identity)
+              << "\"," << '\n'
               << "  \"execution_identity\": "
               << compiled.execution_identity
               << ',' << '\n'
@@ -736,9 +762,10 @@ int main(
         policy.max_logit_abs_error =
             options.max_logit_abs_error;
         policy.minimum_steps =
-            reference->steps.size();
+            static_cast<std::uint64_t>(
+                reference->steps.size());
         policy.minimum_logit_values_compared =
-            replay_observation.logit_values_compared;
+            required_reference_logit_values;
         policy.require_exact_argmax = true;
 
         replay_assessment =
