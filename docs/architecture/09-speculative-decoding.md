@@ -129,8 +129,16 @@ embedding to every stream. The next-step draft state is also pinned: preserve th
 hyper-connection residual, one row per request, before the final head mixer
 collapses it for logits. For the pinned model this state width is
 `4 * 2560 = 10240`. QSA block pooling/scoring and selection are independently oracled for fixtures
-without a cutoff tie. The canonical cutoff-tie rule remains unresolved, so the
-complete attention gate stays closed. Output semantics also remain unresolved. The complete contract therefore remains
+without a cutoff tie, including pooled-key RMSNorm and block-start RoPE. The
+canonical cutoff-tie rule remains unresolved, so the complete attention gate
+stays closed.
+
+The final MTP output mixer reuses the independently oracled gated-residual
+formula without injection. If the MTP manifest contains exactly one explicit
+`shared_head` tensor, that checkpoint binding is considered resolved; otherwise
+the target-output fallback remains unresolved. A structural compiled MTP plan
+may be created in either case, but it MUST remain non-executable while any
+readiness blocker remains. The complete contract therefore remains
 `forward_semantics_resolved=false`, and executable MTP plan construction MUST
 fail while that flag is false. A manifest-only audit may classify combiner,
 hyper-connection, attention and MoE tensor families without claiming that those
