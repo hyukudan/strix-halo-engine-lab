@@ -115,7 +115,7 @@ public:
     std::vector<std::uint32_t>
     propose_candidates(
         const strix::SerialSessionContext&,
-        strix::DraftProposalStateContext& proposal_state,
+        const strix::DraftProposalStateContext& proposal_state,
         std::uint32_t max_candidate_depth) override {
         ++calls;
         seen_max_depth = max_candidate_depth;
@@ -126,7 +126,7 @@ public:
     }
 
     void reconcile_after_target(
-        strix::DraftProposalStateContext& proposal_state,
+        const strix::DraftProposalStateContext& proposal_state,
         const strix::SerialSessionContext&,
         std::span<const std::uint32_t> emitted_tokens) override {
         ++reconcile_calls;

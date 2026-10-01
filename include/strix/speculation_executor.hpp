@@ -24,13 +24,13 @@ public:
     [[nodiscard]] virtual std::vector<std::uint32_t>
     propose_candidates(
         const SerialSessionContext& target_session,
-        DraftProposalStateContext& proposal_state,
+        const DraftProposalStateContext& proposal_state,
         std::uint32_t max_candidate_depth) = 0;
 
     // Reconcile concrete drafter caches/state to the committed target state
     // after target verification/replay has completed successfully.
     virtual void reconcile_after_target(
-        DraftProposalStateContext& proposal_state,
+        const DraftProposalStateContext& proposal_state,
         const SerialSessionContext& target_session,
         std::span<const std::uint32_t> emitted_tokens) = 0;
 };
