@@ -264,6 +264,7 @@ Routing foundation implemented:
 - grouped expert batches decomposed into realizable 8/4/2/1 row classes without padding;
 - packed IQ4_XS MoE reuse harness for compatible synthetic gate/up and down geometry;
 - deterministic CSR-style expert grouping plan;
+- route planning now emits a fused touched-expert bitmap plus CSR grouping offsets and assignment row/slot metadata in one validated pass;
 - grouped assignments retain original row and top-k slot identity for exact output restoration;
 - duplicate/out-of-range route validation;
 - dependency-free semantic oracle for FP32 softmax, no-tie top-k and selected-weight renormalization;
@@ -277,7 +278,6 @@ Still pending:
 
 - canonical top-k cutoff tie contract;
 - wave-parallel/hierarchical routing candidates;
-- fused touched-expert bitmap and route grouping metadata;
 - packed direct tiny-row expert path;
 - packed grouped expert execution with real weight reuse;
 - shared-expert integration;

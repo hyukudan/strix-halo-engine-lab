@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <limits>
 #include <stdexcept>
+#include <utility>
 
 namespace strix {
 namespace {
@@ -105,6 +106,9 @@ MoeRoutePlan build_moe_route_plan(const MoeRouteRequest& request) {
     plan.packed_weight_bytes_per_expert =
         request.packed_weight_bytes_per_expert;
     plan.expert_assignment_counts.assign(request.expert_count, 0);
+    plan.touched_expert_bitmap.assign(
+        (static_cast<std::size_t>(request.expert_count) + 63U) / 64U,
+        0);
 
     for (std::uint32_t row = 0; row < request.rows; ++row) {
         const auto begin =
@@ -133,6 +137,8 @@ MoeRoutePlan build_moe_route_plan(const MoeRouteRequest& request) {
             continue;
         }
         plan.touched_experts.push_back(expert);
+        plan.touched_expert_bitmap[expert / 64U] |=
+            std::uint64_t{1} << (expert % 64U);
         plan.maximum_rows_per_expert =
             std::max(plan.maximum_rows_per_expert, count);
         plan.minimum_rows_per_touched_expert =
@@ -147,6 +153,29 @@ MoeRoutePlan build_moe_route_plan(const MoeRouteRequest& request) {
     plan.mean_rows_per_touched_expert =
         static_cast<double>(touched_assignments) /
         static_cast<double>(plan.distinct_experts);
+
+    plan.expert_offsets.resize(
+        static_cast<std::size_t>(request.expert_count) + 1U, 0);
+    for (std::uint32_t expert = 0; expert < request.expert_count; ++expert) {
+        plan.expert_offsets[static_cast<std::size_t>(expert) + 1U] =
+            plan.expert_offsets[expert] +
+            plan.expert_assignment_counts[expert];
+    }
+
+    plan.assignment_rows.resize(static_cast<std::size_t>(plan.assignments));
+    plan.assignment_slots.resize(static_cast<std::size_t>(plan.assignments));
+    auto grouping_cursors = plan.expert_offsets;
+    for (std::uint32_t row = 0; row < request.rows; ++row) {
+        const auto begin =
+            static_cast<std::size_t>(row) * request.experts_per_row;
+        for (std::uint32_t slot = 0; slot < request.experts_per_row; ++slot) {
+            const auto expert = request.selected_experts[begin + slot];
+            auto& cursor = grouping_cursors[expert];
+            const auto output = static_cast<std::size_t>(cursor++);
+            plan.assignment_rows[output] = row;
+            plan.assignment_slots[output] = slot;
+        }
+    }
 
     if (request.rows > 1) {
         std::uint64_t overlap_sum = 0;
@@ -197,40 +226,17 @@ namespace strix {
 
 MoeGroupingPlan build_moe_grouping_plan(
     const MoeRouteRequest& request) {
-    // Reuse route validation and counts so grouping cannot accept a route that
-    // the cost planner would reject.
-    const auto route = build_moe_route_plan(request);
+    // Route planning owns the canonical fused grouping metadata so callers
+    // cannot observe a cost plan and grouping plan built from different
+    // validation or ordering rules.
+    auto route = build_moe_route_plan(request);
 
     MoeGroupingPlan plan;
     plan.expert_count = request.expert_count;
     plan.assignments = route.assignments;
-    plan.expert_offsets.resize(
-        static_cast<std::size_t>(request.expert_count) + 1U, 0);
-
-    for (std::uint32_t expert = 0; expert < request.expert_count; ++expert) {
-        plan.expert_offsets[static_cast<std::size_t>(expert) + 1U] =
-            plan.expert_offsets[expert] +
-            route.expert_assignment_counts[expert];
-    }
-
-    plan.assignment_rows.resize(
-        static_cast<std::size_t>(route.assignments));
-    plan.assignment_slots.resize(
-        static_cast<std::size_t>(route.assignments));
-
-    auto cursors = plan.expert_offsets;
-    for (std::uint32_t row = 0; row < request.rows; ++row) {
-        const auto begin =
-            static_cast<std::size_t>(row) * request.experts_per_row;
-        for (std::uint32_t slot = 0; slot < request.experts_per_row; ++slot) {
-            const auto expert = request.selected_experts[begin + slot];
-            auto& cursor = cursors[expert];
-            const auto output = static_cast<std::size_t>(cursor++);
-            plan.assignment_rows[output] = row;
-            plan.assignment_slots[output] = slot;
-        }
-    }
-
+    plan.expert_offsets = std::move(route.expert_offsets);
+    plan.assignment_rows = std::move(route.assignment_rows);
+    plan.assignment_slots = std::move(route.assignment_slots);
     return plan;
 }
 

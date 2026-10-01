@@ -49,6 +49,14 @@ struct MoeRoutePlan {
 
     std::vector<std::uint32_t> expert_assignment_counts;
     std::vector<std::uint32_t> touched_experts;
+
+    // Fused routing metadata. The bitmap uses one bit per expert and the
+    // CSR payload groups assignments by expert while preserving source row
+    // and top-k slot identity.
+    std::vector<std::uint64_t> touched_expert_bitmap;
+    std::vector<std::uint64_t> expert_offsets;
+    std::vector<std::uint32_t> assignment_rows;
+    std::vector<std::uint32_t> assignment_slots;
 };
 
 struct MoeExpertBatch {

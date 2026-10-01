@@ -82,6 +82,22 @@ int main() {
            "ideal grouped path models one traversal per touched expert");
     expect(plan.ideal_grouped_weight_bytes_saved == 6'000,
            "MoE plan exposes grouped weight-traffic upper bound");
+    expect(plan.touched_expert_bitmap.size() == 1 &&
+               plan.touched_expert_bitmap[0] == 0x7eULL,
+           "MoE plan fuses a deterministic touched-expert bitmap");
+    expect(plan.expert_offsets.size() == 9 &&
+               plan.expert_offsets[0] == 0 &&
+               plan.expert_offsets[1] == 0 &&
+               plan.expert_offsets[2] == 2 &&
+               plan.expert_offsets[3] == 6,
+           "MoE plan fuses CSR expert offsets");
+    const auto plan_expert_two_begin =
+        static_cast<std::size_t>(plan.expert_offsets[2]);
+    expect(plan.assignment_rows[plan_expert_two_begin] == 0 &&
+               plan.assignment_slots[plan_expert_two_begin] == 1 &&
+               plan.assignment_rows[plan_expert_two_begin + 3] == 3 &&
+               plan.assignment_slots[plan_expert_two_begin + 3] == 1,
+           "fused grouping metadata preserves row and top-k slot identity");
 
 
     request.rows = 4;
@@ -114,6 +130,24 @@ int main() {
                grouping.assignment_rows[expert_two_begin + 3] == 3 &&
                grouping.assignment_slots[expert_two_begin + 3] == 1,
            "grouped assignments preserve row and top-k slot identity");
+
+    const std::vector<std::uint32_t> bitmap_boundary_routes{
+        0, 63,
+        64, 69,
+    };
+    request.rows = 2;
+    request.experts_per_row = 2;
+    request.expert_count = 70;
+    request.selected_experts = bitmap_boundary_routes;
+    const auto bitmap_boundary = strix::build_moe_route_plan(request);
+    expect(bitmap_boundary.touched_expert_bitmap.size() == 2 &&
+               bitmap_boundary.touched_expert_bitmap[0] ==
+                   ((std::uint64_t{1} << 0U) |
+                    (std::uint64_t{1} << 63U)) &&
+               bitmap_boundary.touched_expert_bitmap[1] ==
+                   ((std::uint64_t{1} << 0U) |
+                    (std::uint64_t{1} << 5U)),
+           "touched-expert bitmap crosses 64-bit word boundaries exactly");
 
     const std::vector<std::uint32_t> unique_routes{
         0, 1,
