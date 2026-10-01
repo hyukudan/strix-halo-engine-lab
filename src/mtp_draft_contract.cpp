@@ -160,7 +160,7 @@ build_mtp_draft_structural_contract(
 
     contract.input_fusion_semantics_resolved = true;
     contract.attention_semantics_resolved = false;
-    contract.draft_state_semantics_resolved = false;
+    contract.draft_state_semantics_resolved = true;
     contract.output_semantics_resolved = false;
     contract.forward_semantics_resolved = false;
     contract.contract_identity =
@@ -207,7 +207,7 @@ void validate_mtp_draft_structural_contract(
             expected.provisional_kv_bytes_per_token ||
         !contract.input_fusion_semantics_resolved ||
         contract.attention_semantics_resolved ||
-        contract.draft_state_semantics_resolved ||
+        !contract.draft_state_semantics_resolved ||
         contract.output_semantics_resolved ||
         contract.forward_semantics_resolved ||
         contract.contract_identity !=

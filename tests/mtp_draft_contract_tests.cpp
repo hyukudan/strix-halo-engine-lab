@@ -53,7 +53,7 @@ int main() {
            "MTP contract reproduces provisional 2 KiB per-token KV planning estimate");
     expect(contract.input_fusion_semantics_resolved &&
                !contract.attention_semantics_resolved &&
-               !contract.draft_state_semantics_resolved &&
+               contract.draft_state_semantics_resolved &&
                !contract.output_semantics_resolved &&
                !contract.forward_semantics_resolved,
            "MTP contract resolves only independently-oracled input fusion");

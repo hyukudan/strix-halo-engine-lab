@@ -33,7 +33,7 @@ struct MtpDraftStructuralContract {
     // semantics are independently fixed and tested.
     bool input_fusion_semantics_resolved = true;
     bool attention_semantics_resolved = false;
-    bool draft_state_semantics_resolved = false;
+    bool draft_state_semantics_resolved = true;
     bool output_semantics_resolved = false;
     bool forward_semantics_resolved = false;
 
