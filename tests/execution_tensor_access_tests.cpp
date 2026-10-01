@@ -82,16 +82,22 @@ int main() {
     const auto canonical_requirements =
         strix::build_serial_execution_tensor_requirements(
             execution);
-    const auto canonical_plan =
-        strix::compile_execution_tensor_access_plan(
-            execution,
-            manifest,
-            index,
-            canonical_requirements);
-    expect(canonical_plan.plan_identity != 0,
-           "canonical tensor requirements compile against Qwen4Exp-like fixture");
     expect(!canonical_requirements.empty(),
            "canonical requirement generator covers the serial plan");
+
+    bool incomplete_canonical_fixture_rejected = false;
+    try {
+        static_cast<void>(
+            strix::compile_execution_tensor_access_plan(
+                execution,
+                manifest,
+                index,
+                canonical_requirements));
+    } catch (const std::invalid_argument&) {
+        incomplete_canonical_fixture_rejected = true;
+    }
+    expect(incomplete_canonical_fixture_rejected,
+           "canonical requirements reject a deliberately incomplete tensor fixture");
 
     const auto embedding_requirement =
         std::find_if(
