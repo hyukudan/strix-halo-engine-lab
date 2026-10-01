@@ -62,6 +62,7 @@ add_library(strix_core STATIC
     src/mtp_output_contract.cpp
     src/mtp_attention_contract.cpp
     src/qsa_selection_plan.cpp
+    src/qualified_mtp_draft_backend.cpp
     src/model_manifest.cpp
     src/model_runtime_binding.cpp
     src/model_tensor_index.cpp
@@ -400,6 +401,11 @@ if(BUILD_TESTING)
     target_link_libraries(strix-mtp-draft-qualification-tests PRIVATE strix_core)
     strix_target_warnings(strix-mtp-draft-qualification-tests)
     add_test(NAME strix-mtp-draft-qualification-tests COMMAND strix-mtp-draft-qualification-tests)
+
+    add_executable(strix-qualified-mtp-draft-backend-tests tests/qualified_mtp_draft_backend_tests.cpp)
+    target_link_libraries(strix-qualified-mtp-draft-backend-tests PRIVATE strix_core)
+    strix_target_warnings(strix-qualified-mtp-draft-backend-tests)
+    add_test(NAME strix-qualified-mtp-draft-backend-tests COMMAND strix-qualified-mtp-draft-backend-tests)
 
     add_executable(strix-mtp-attention-contract-tests tests/mtp_attention_contract_tests.cpp)
     target_link_libraries(strix-mtp-attention-contract-tests PRIVATE strix_core)
