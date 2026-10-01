@@ -512,6 +512,96 @@ int main() {
     expect(mismatch_rejected,
            "compiled speculation backend rejects serial/verify checkpoint mismatch");
 
+    {
+        Fixture invalid_fixture;
+        CountingDispatcher invalid_serial_dispatcher;
+        CountingDispatcher invalid_verify_dispatcher;
+        FixedCollector invalid_collector;
+        invalid_collector.base =
+            static_cast<std::uint32_t>(
+                invalid_fixture.serial.vocab_size);
+
+        strix::CompiledGreedySpeculationBackend invalid_backend(
+            invalid_fixture.serial,
+            invalid_fixture.serial_resources,
+            invalid_serial_dispatcher,
+            invalid_fixture.verify,
+            invalid_fixture.verify_resources,
+            invalid_verify_dispatcher,
+            invalid_collector);
+
+        const std::vector<std::uint32_t> invalid_candidates{
+            10, 20};
+        bool invalid_base_rejected = false;
+        try {
+            static_cast<void>(
+                invalid_backend.verify_target_candidates(
+                    invalid_fixture.session,
+                    invalid_fixture.serial_resources,
+                    invalid_candidates));
+        } catch (const std::runtime_error&) {
+            invalid_base_rejected = true;
+        }
+        expect(invalid_base_rejected &&
+                   invalid_verify_dispatcher.calls == 0 &&
+                   invalid_fixture.session.next_position == 10 &&
+                   invalid_fixture.session.committed_tokens == 10,
+               "out-of-vocabulary base target token fails before verify dispatch");
+    }
+
+    {
+        Fixture invalid_fixture;
+        CountingDispatcher invalid_serial_dispatcher;
+        CountingDispatcher invalid_verify_dispatcher;
+        FixedCollector invalid_collector;
+        invalid_collector.suffix.back() =
+            static_cast<std::uint32_t>(
+                invalid_fixture.serial.vocab_size);
+
+        strix::CompiledGreedySpeculationBackend invalid_backend(
+            invalid_fixture.serial,
+            invalid_fixture.serial_resources,
+            invalid_serial_dispatcher,
+            invalid_fixture.verify,
+            invalid_fixture.verify_resources,
+            invalid_verify_dispatcher,
+            invalid_collector);
+
+        FakeAllocator invalid_allocator;
+        strix::AllocationGenerationSource invalid_generations;
+        CountingTransfer invalid_transfer;
+        const std::vector<std::uint32_t> invalid_candidates{
+            10, 20};
+        strix::GreedySpeculationExecutionRequest invalid_request;
+        invalid_request.candidate_tokens =
+            invalid_candidates;
+        invalid_request.token_budget = 3;
+
+        bool invalid_suffix_rejected = false;
+        try {
+            static_cast<void>(
+                strix::execute_greedy_speculation_cycle(
+                    invalid_fixture.model,
+                    invalid_fixture.serial,
+                    invalid_fixture.serial_resources,
+                    invalid_fixture.session,
+                    invalid_request,
+                    invalid_allocator,
+                    invalid_generations,
+                    invalid_transfer,
+                    invalid_backend));
+        } catch (const std::runtime_error&) {
+            invalid_suffix_rejected = true;
+        }
+        expect(invalid_suffix_rejected &&
+                   invalid_fixture.session.health ==
+                       strix::SerialSessionHealth::ready &&
+                   invalid_fixture.session.next_position == 10 &&
+                   invalid_fixture.session.committed_tokens == 10 &&
+                   invalid_transfer.restores > 0,
+               "out-of-vocabulary verified token restores pre-window target state");
+    }
+
     if (failures == 0) {
         std::cout << "compiled speculation backend tests passed\n";
     }

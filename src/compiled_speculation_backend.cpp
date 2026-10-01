@@ -149,6 +149,12 @@ verify_target_candidates(
             serial_,
             serial_resources_,
             session);
+    if (serial_.vocab_size == 0 ||
+        static_cast<std::uint64_t>(base_token) >=
+            serial_.vocab_size) {
+        throw std::runtime_error(
+            "base target token is outside compiled vocabulary");
+    }
 
     static_cast<void>(
         execute_compiled_speculative_verify_eager(
@@ -168,6 +174,14 @@ verify_target_candidates(
         verify_.candidate_depth) {
         throw std::runtime_error(
             "verified target token collector returned wrong row count");
+    }
+    for (const auto token : suffix) {
+        if (serial_.vocab_size == 0 ||
+            static_cast<std::uint64_t>(token) >=
+                serial_.vocab_size) {
+            throw std::runtime_error(
+                "verified target token is outside compiled vocabulary");
+        }
     }
 
     std::vector<std::uint32_t> target_tokens;
