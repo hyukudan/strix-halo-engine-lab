@@ -10,8 +10,9 @@
 namespace strix {
 
 enum class MtpTensorFamily {
-    embedding_combiner,
-    hidden_combiner,
+    input_combiner,
+    embedding_norm,
+    hidden_norm,
     hyper_connection_mixer,
     attention,
     moe,

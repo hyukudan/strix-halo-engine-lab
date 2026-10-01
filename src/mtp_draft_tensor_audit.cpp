@@ -1,5 +1,6 @@
 #include "strix/mtp_draft_tensor_audit.hpp"
 
+#include <algorithm>
 #include <array>
 #include <stdexcept>
 #include <string_view>
@@ -29,16 +30,20 @@ bool classify(
     std::string_view name,
     MtpTensorFamily& result) noexcept {
     if (contains(name, "fc_embedding") ||
-        contains(name, "eh_proj") ||
-        contains(name, "nextn.enorm")) {
+        contains(name, "fc_hidden") ||
+        contains(name, "eh_proj")) {
         result =
-            MtpTensorFamily::embedding_combiner;
+            MtpTensorFamily::input_combiner;
         return true;
     }
-    if (contains(name, "fc_hidden") ||
-        contains(name, "nextn.hnorm")) {
+    if (contains(name, "enorm")) {
         result =
-            MtpTensorFamily::hidden_combiner;
+            MtpTensorFamily::embedding_norm;
+        return true;
+    }
+    if (contains(name, "hnorm")) {
+        result =
+            MtpTensorFamily::hidden_norm;
         return true;
     }
     if (contains(name, "hyper_connection") ||
@@ -88,8 +93,9 @@ audit_mtp_draft_tensor_families(
     audit.manifest_layout_identity =
         manifest.layout_identity;
     audit.families = {
-        {MtpTensorFamily::embedding_combiner, true, {}},
-        {MtpTensorFamily::hidden_combiner, true, {}},
+        {MtpTensorFamily::input_combiner, true, {}},
+        {MtpTensorFamily::embedding_norm, true, {}},
+        {MtpTensorFamily::hidden_norm, true, {}},
         {MtpTensorFamily::hyper_connection_mixer, true, {}},
         {MtpTensorFamily::attention, true, {}},
         {MtpTensorFamily::moe, true, {}},
@@ -135,6 +141,44 @@ audit_mtp_draft_tensor_families(
         }
     }
 
+    // The checkpoint may carry the combiner either as the original
+    // fc_embedding + fc_hidden pair or as one losslessly fused eh_proj tensor.
+    const auto* combiner =
+        family(
+            audit,
+            MtpTensorFamily::input_combiner);
+    if (combiner != nullptr &&
+        !combiner->tensor_indices.empty()) {
+        bool fused = false;
+        bool embedding = false;
+        bool hidden = false;
+        for (const auto index :
+             combiner->tensor_indices) {
+            const auto& name =
+                manifest.tensors[index].name;
+            fused =
+                fused ||
+                contains(name, "eh_proj");
+            embedding =
+                embedding ||
+                contains(name, "fc_embedding");
+            hidden =
+                hidden ||
+                contains(name, "fc_hidden");
+        }
+        if (!fused &&
+            !(embedding && hidden)) {
+            if (std::find(
+                    audit.missing_required_families.begin(),
+                    audit.missing_required_families.end(),
+                    MtpTensorFamily::input_combiner) ==
+                audit.missing_required_families.end()) {
+                audit.missing_required_families.push_back(
+                    MtpTensorFamily::input_combiner);
+            }
+        }
+    }
+
     return audit;
 }
 
@@ -177,10 +221,12 @@ audit_mtp_draft_tensor_families(
 const char*
 to_string(MtpTensorFamily family) noexcept {
     switch (family) {
-    case MtpTensorFamily::embedding_combiner:
-        return "embedding_combiner";
-    case MtpTensorFamily::hidden_combiner:
-        return "hidden_combiner";
+    case MtpTensorFamily::input_combiner:
+        return "input_combiner";
+    case MtpTensorFamily::embedding_norm:
+        return "embedding_norm";
+    case MtpTensorFamily::hidden_norm:
+        return "hidden_norm";
     case MtpTensorFamily::hyper_connection_mixer:
         return "hyper_connection_mixer";
     case MtpTensorFamily::attention:

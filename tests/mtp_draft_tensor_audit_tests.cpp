@@ -1,5 +1,6 @@
 #include "strix/mtp_draft_tensor_audit.hpp"
 
+#include <algorithm>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -44,6 +45,8 @@ struct Fixture {
         manifest.architecture = "fixture";
         add("mtp.fc_embedding.weight");
         add("mtp.fc_hidden.weight");
+        add("mtp.enorm.weight");
+        add("mtp.hnorm.weight");
         add("mtp.hyper_connection_mixer.down.weight");
         add("mtp.layers.0.self_attn.q_proj.weight");
         add("mtp.layers.0.mlp.experts.0.gate_proj.weight");
@@ -85,15 +88,38 @@ int main() {
         expect(audit.structurally_complete(),
                "MTP audit recognizes all required structural tensor families");
         expect(audit.unclassified_mtp_tensors ==
-                   std::vector<std::uint32_t>({5}),
+                   std::vector<std::uint32_t>({7}),
                "MTP audit preserves unresolved tensors instead of guessing their role");
-        expect(audit.families.size() == 5,
+        expect(audit.families.size() == 6,
                "MTP audit emits every required structural family");
     }
 
     {
         Fixture fixture;
-        fixture.manifest.tensors[4].name =
+        fixture.manifest.tensors[1].name =
+            "mtp.unresolved.fc_hidden_removed";
+        fixture.manifest.layout_identity =
+            strix::model_manifest_layout_identity(
+                fixture.manifest);
+        fixture.binding.manifest_layout_identity =
+            fixture.manifest.layout_identity;
+
+        const auto audit =
+            strix::audit_mtp_draft_tensor_families(
+                fixture.manifest,
+                fixture.binding);
+        expect(!audit.structurally_complete() &&
+                   std::find(
+                       audit.missing_required_families.begin(),
+                       audit.missing_required_families.end(),
+                       strix::MtpTensorFamily::input_combiner) !=
+                       audit.missing_required_families.end(),
+               "MTP audit rejects a half-present original combiner pair");
+    }
+
+    {
+        Fixture fixture;
+        fixture.manifest.tensors[6].name =
             "mtp.unresolved.moe_removed";
         fixture.manifest.layout_identity =
             strix::model_manifest_layout_identity(
