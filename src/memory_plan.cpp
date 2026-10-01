@@ -58,6 +58,16 @@ std::uint64_t mtp_draft_state_bytes_per_session(
     });
 }
 
+std::uint64_t mtp_indexer_bytes_per_token(
+    const ModelContract& model) {
+    return product({
+        model.mtp_full_attention_layers,
+        model.indexer_kv_heads,
+        model.indexer_head_dim,
+        model.bytes_bf16,
+    });
+}
+
 std::uint64_t indexer_bytes_per_token(
     const ModelContract& model) {
     // QSA stores one raw BF16 index key per token for every full-attention
@@ -185,6 +195,11 @@ MemoryBreakdown build_memory_plan(const ModelContract& model,
                                          request.mtp_draft_state_element_bytes),
                                      request.sessions)
                                : 0;
+    plan.mtp_indexer = request.include_mtp_indexer
+                           ? checked_mul(
+                                 mtp_indexer_bytes_per_token(model),
+                                 positions)
+                           : 0;
     plan.indexer = request.include_indexer
                        ? checked_mul(
                              indexer_bytes_per_token(model),
@@ -215,6 +230,7 @@ MemoryBreakdown build_memory_plan(const ModelContract& model,
     add_to_total(plan, plan.base_kv);
     add_to_total(plan, plan.mtp_kv);
     add_to_total(plan, plan.mtp_draft_state);
+    add_to_total(plan, plan.mtp_indexer);
     add_to_total(plan, plan.indexer);
     add_to_total(plan, plan.gdn_state);
     add_to_total(plan, plan.ple_conv_state);

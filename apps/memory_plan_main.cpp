@@ -63,6 +63,8 @@ int main(int argc, char** argv) try {
                 parse_u64(need_value(argument), argument);
         } else if (argument == "--no-mtp-draft-state") {
             request.include_mtp_draft_state = false;
+        } else if (argument == "--no-mtp-indexer") {
+            request.include_mtp_indexer = false;
         } else if (argument == "--no-indexer") {
             request.include_indexer = false;
         } else if (argument == "--no-mtp-kv") {
@@ -80,6 +82,7 @@ int main(int argc, char** argv) try {
     print_field("base_kv", plan.base_kv);
     print_field("mtp_kv", plan.mtp_kv);
     print_field("mtp_draft_state", plan.mtp_draft_state);
+    print_field("mtp_indexer_raw_keys", plan.mtp_indexer);
     print_field("indexer_raw_keys", plan.indexer);
     print_field("gdn_matrix_state", plan.gdn_matrix_state);
     print_field("gdn_conv_state", plan.gdn_conv_state);
