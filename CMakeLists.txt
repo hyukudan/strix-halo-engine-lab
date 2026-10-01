@@ -119,6 +119,10 @@ add_executable(strix-platform-probe apps/platform_probe_main.cpp)
 target_link_libraries(strix-platform-probe PRIVATE strix_core)
 strix_target_warnings(strix-platform-probe)
 
+add_executable(strix-validate-serial-reference apps/serial_decode_reference_main.cpp)
+target_link_libraries(strix-validate-serial-reference PRIVATE strix_core)
+strix_target_warnings(strix-validate-serial-reference)
+
 add_executable(strix-audit-execution-tensors apps/execution_tensor_audit_main.cpp)
 target_link_libraries(strix-audit-execution-tensors PRIVATE strix_core)
 strix_target_warnings(strix-audit-execution-tensors)
