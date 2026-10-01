@@ -167,6 +167,73 @@ bool validate_gpu_commit_record(
     return true;
 }
 
+
+StripedMessageTracker::StripedMessageTracker(
+    TransferDescriptor descriptor,
+    std::uint16_t stripe_count)
+    : descriptor_(descriptor),
+      stripe_count_(stripe_count),
+      stripe_bytes_(
+          stripe_count,
+          0) {
+    if (stripe_count_ == 0 ||
+        descriptor_.byte_length == 0) {
+        throw std::invalid_argument(
+            "striped message tracker requires non-zero payload and stripe count");
+    }
+}
+
+bool StripedMessageTracker::observe_commit(
+    const GpuCommitRecord& record) {
+    if (invalid_ || complete_) {
+        return false;
+    }
+    if (!validate_gpu_commit_record(
+            record,
+            descriptor_) ||
+        record.stripe_count !=
+            stripe_count_) {
+        invalid_ = true;
+        return false;
+    }
+
+    const auto stripe =
+        static_cast<std::size_t>(
+            record.stripe_index);
+    if (stripe >=
+            stripe_bytes_.size() ||
+        stripe_bytes_[stripe] != 0) {
+        invalid_ = true;
+        return false;
+    }
+
+    const auto bytes =
+        static_cast<std::uint64_t>(
+            record.payload_bytes);
+    if (bytes >
+        descriptor_.byte_length -
+            committed_bytes_) {
+        invalid_ = true;
+        return false;
+    }
+
+    stripe_bytes_[stripe] =
+        record.payload_bytes;
+    committed_bytes_ += bytes;
+    ++observed_stripes_;
+
+    if (observed_stripes_ ==
+        stripe_count_) {
+        if (committed_bytes_ !=
+            descriptor_.byte_length) {
+            invalid_ = true;
+            return false;
+        }
+        complete_ = true;
+    }
+    return true;
+}
+
 bool direct_link_armable(
     const DirectLinkLifecycle& link) noexcept {
     return link.state ==
