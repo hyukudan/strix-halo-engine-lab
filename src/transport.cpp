@@ -16,7 +16,10 @@ bool available(const LinkProfile& link) noexcept {
            link.one_way_latency_seconds >= 0.0;
 }
 
-TransferPlan single_plan(std::span<const LinkProfile> links, std::uint64_t bytes) {
+TransferPlan single_plan(
+    std::span<const LinkProfile> links,
+    std::uint64_t bytes,
+    LinkCompletionTarget target) {
     TransferPlan plan;
     double best = std::numeric_limits<double>::infinity();
     std::size_t best_index = 0;
@@ -26,7 +29,11 @@ TransferPlan single_plan(std::span<const LinkProfile> links, std::uint64_t bytes
         if (!available(links[index])) {
             continue;
         }
-        const auto estimate = estimate_single_link_seconds(links[index], bytes);
+        const auto estimate =
+            estimate_link_completion_seconds(
+                links[index],
+                bytes,
+                target);
         if (!found || estimate < best ||
             (estimate == best && links[index].id < links[best_index].id)) {
             found = true;
@@ -45,11 +52,13 @@ TransferPlan single_plan(std::span<const LinkProfile> links, std::uint64_t bytes
     return plan;
 }
 
-TransferPlan striped_pair(std::span<const LinkProfile> links,
-                          std::uint64_t bytes,
-                          std::size_t left,
-                          std::size_t right,
-                          double reassembly_seconds) {
+TransferPlan striped_pair(
+    std::span<const LinkProfile> links,
+    std::uint64_t bytes,
+    std::size_t left,
+    std::size_t right,
+    double reassembly_seconds,
+    LinkCompletionTarget target) {
     const auto& a = links[left];
     const auto& b = links[right];
     const auto bandwidth_sum = a.payload_bytes_per_second + b.payload_bytes_per_second;
@@ -84,8 +93,16 @@ TransferPlan striped_pair(std::span<const LinkProfile> links,
     }
     const auto second_bytes = bytes - first_bytes;
 
-    const auto first_seconds = estimate_single_link_seconds(a, first_bytes);
-    const auto second_seconds = estimate_single_link_seconds(b, second_bytes);
+    const auto first_seconds =
+        estimate_link_completion_seconds(
+            a,
+            first_bytes,
+            target);
+    const auto second_seconds =
+        estimate_link_completion_seconds(
+            b,
+            second_bytes,
+            target);
     if (!std::isfinite(first_seconds) || !std::isfinite(second_seconds)) {
         return {};
     }
@@ -261,23 +278,66 @@ bool direct_link_usable(
                 DirectLinkLifecycleState::leased);
 }
 
-double estimate_single_link_seconds(const LinkProfile& link,
-                                    std::uint64_t bytes) noexcept {
-    if (!available(link)) {
+double estimate_link_completion_seconds(
+    const LinkProfile& link,
+    std::uint64_t bytes,
+    LinkCompletionTarget target) noexcept {
+    if (!available(link) ||
+        !std::isfinite(
+            link.consumer_completion_seconds) ||
+        link.consumer_completion_seconds < 0.0 ||
+        !std::isfinite(
+            link.receive_repost_seconds) ||
+        link.receive_repost_seconds < 0.0) {
         return std::numeric_limits<double>::infinity();
     }
+
     const auto queued =
-        static_cast<long double>(link.in_flight_bytes) /
-        static_cast<long double>(link.payload_bytes_per_second);
+        static_cast<long double>(
+            link.in_flight_bytes) /
+        static_cast<long double>(
+            link.payload_bytes_per_second);
     const auto payload =
         static_cast<long double>(bytes) /
-        static_cast<long double>(link.payload_bytes_per_second);
-    const auto estimate =
-        static_cast<long double>(link.one_way_latency_seconds) + queued + payload;
-    if (!std::isfinite(static_cast<double>(estimate))) {
+        static_cast<long double>(
+            link.payload_bytes_per_second);
+
+    long double estimate =
+        static_cast<long double>(
+            link.one_way_latency_seconds) +
+        queued +
+        payload;
+
+    if (target ==
+            LinkCompletionTarget::remote_consumer_complete ||
+        target ==
+            LinkCompletionTarget::receiver_reusable) {
+        estimate +=
+            static_cast<long double>(
+                link.consumer_completion_seconds);
+    }
+    if (target ==
+        LinkCompletionTarget::receiver_reusable) {
+        estimate +=
+            static_cast<long double>(
+                link.receive_repost_seconds);
+    }
+
+    if (!std::isfinite(
+            static_cast<double>(
+                estimate))) {
         return std::numeric_limits<double>::infinity();
     }
     return static_cast<double>(estimate);
+}
+
+double estimate_single_link_seconds(
+    const LinkProfile& link,
+    std::uint64_t bytes) noexcept {
+    return estimate_link_completion_seconds(
+        link,
+        bytes,
+        LinkCompletionTarget::receive_ready);
 }
 
 TransferPlan plan_transfer(std::span<const LinkProfile> links,
@@ -288,7 +348,11 @@ TransferPlan plan_transfer(std::span<const LinkProfile> links,
         throw std::invalid_argument("transport plan requires a non-zero payload");
     }
 
-    const auto single = single_plan(links, bytes);
+    const auto single =
+        single_plan(
+            links,
+            bytes,
+            policy.completion_target);
     if (single.kind == PlanKind::unavailable ||
         priority == TransferPriority::latency_critical ||
         bytes < policy.minimum_stripe_bytes) {
@@ -307,8 +371,14 @@ TransferPlan plan_transfer(std::span<const LinkProfile> links,
                 links[left].peer_node != links[right].peer_node) {
                 continue;
             }
-            const auto candidate = striped_pair(
-                links, bytes, left, right, policy.stripe_reassembly_seconds);
+            const auto candidate =
+                striped_pair(
+                    links,
+                    bytes,
+                    left,
+                    right,
+                    policy.stripe_reassembly_seconds,
+                    policy.completion_target);
             if (candidate.kind == PlanKind::striped &&
                 candidate.estimated_seconds < best_striped.estimated_seconds) {
                 best_striped = candidate;
