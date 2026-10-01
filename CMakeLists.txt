@@ -72,6 +72,7 @@ add_library(strix_core STATIC
     src/recurrent_plan.cpp
     src/runtime_allocator.cpp
     src/runtime_launchers.cpp
+    src/serial_decode_reference.cpp
     src/serial_decode_replay.cpp
     src/serial_session.cpp
     src/session_state_layout.cpp
@@ -317,6 +318,11 @@ if(BUILD_TESTING)
     target_link_libraries(strix-serial-decode-replay-tests PRIVATE strix_core)
     strix_target_warnings(strix-serial-decode-replay-tests)
     add_test(NAME strix-serial-decode-replay-tests COMMAND strix-serial-decode-replay-tests)
+
+    add_executable(strix-serial-decode-reference-tests tests/serial_decode_reference_tests.cpp)
+    target_link_libraries(strix-serial-decode-reference-tests PRIVATE strix_core)
+    strix_target_warnings(strix-serial-decode-reference-tests)
+    add_test(NAME strix-serial-decode-reference-tests COMMAND strix-serial-decode-reference-tests)
 
     add_executable(strix-session-state-layout-tests tests/session_state_layout_tests.cpp)
     target_link_libraries(strix-session-state-layout-tests PRIVATE strix_core)
