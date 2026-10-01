@@ -123,6 +123,8 @@ bool requires_tensor_family(SerialOp op) noexcept {
 
     case SerialOp::position_prepare:
     case SerialOp::hyper_expand:
+    case SerialOp::attn_inject:
+    case SerialOp::mlp_inject:
     case SerialOp::moe_combine:
         return false;
     }
