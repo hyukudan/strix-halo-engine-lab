@@ -69,6 +69,14 @@ For every physical and logical link:
 - active transport mode;
 - mapped/copy/staging mode;
 - current scheduler role;
+- TX/RX transport-pool allocation generations;
+- frames posted, in flight, completed and awaiting repost;
+- remote consumer-complete credits;
+- RX repost backlog;
+- direct-link lease owner/state;
+- direct-stream epoch;
+- direct-DMA capability tier;
+- first-completion/re-arm failures;
 - physical-link identity distinct from logical stream identity;
 - progress mode such as interrupt-driven or dedicated polling.
 
@@ -96,6 +104,8 @@ For every physical and logical link the runtime SHOULD expose:
 - current scheduler role.
 
 When two physical links connect the same node pair, telemetry MUST keep them independently visible.
+
+A receive DMA completion MUST NOT be logged as reusable until consumer completion and required RX repost accounting have both completed.
 
 A failed secondary link SHOULD be isolated without terminating the node when the active placement can continue correctly over another qualified path.
 
