@@ -68,6 +68,37 @@ struct DescriptorLimits {
 
 using TransferHandle = std::uint64_t;
 
+enum class TransportMemoryDomain {
+    host_pageable,
+    host_registered,
+    gpu_device,
+    gpu_transport_pool,
+};
+
+enum class TransportBufferAccess {
+    read_only,
+    write_only,
+    read_write,
+};
+
+struct TransportBufferView {
+    std::uintptr_t address = 0;
+    std::uint64_t bytes = 0;
+    std::uint64_t allocation_generation = 0;
+    TransportMemoryDomain domain =
+        TransportMemoryDomain::host_pageable;
+    TransportBufferAccess access =
+        TransportBufferAccess::read_write;
+};
+
+[[nodiscard]] bool validate_transport_send_buffer(
+    const TransportBufferView& buffer,
+    std::uint64_t required_bytes) noexcept;
+
+[[nodiscard]] bool validate_transport_receive_buffer(
+    const TransportBufferView& buffer,
+    std::uint64_t required_bytes) noexcept;
+
 enum class CompletionKind {
     local_buffer_reusable,
     receive_complete,
@@ -105,6 +136,7 @@ struct BackendCapabilities {
     bool mapped_host_buffers = false;
     bool gpu_visible_buffers = false;
     bool external_dma = false;
+    bool supports_gpu_transport_pool = false;
     bool two_sided = true;
     bool requires_exclusive_lease = false;
     bool explicit_receive_repost = false;
@@ -123,11 +155,11 @@ public:
 
     [[nodiscard]] virtual TransferHandle prepare_send(
         const TransferDescriptor& descriptor,
-        std::span<const std::byte> payload) = 0;
+        const TransportBufferView& payload) = 0;
 
     [[nodiscard]] virtual TransferHandle prepare_receive(
         const TransferDescriptor& descriptor,
-        std::span<std::byte> destination) = 0;
+        const TransportBufferView& destination) = 0;
 
     virtual void submit(TransferHandle handle) = 0;
 
