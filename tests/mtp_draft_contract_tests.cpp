@@ -73,6 +73,16 @@ int main() {
     expect(overclaim_rejected,
            "MTP validator rejects claiming resolved forward semantics");
 
+    bool execution_blocked = false;
+    try {
+        strix::require_mtp_draft_execution_semantics(
+            contract);
+    } catch (const std::logic_error&) {
+        execution_blocked = true;
+    }
+    expect(execution_blocked,
+           "unresolved MTP forward semantics block executable plan construction");
+
     auto changed_binding =
         mtp_binding;
     ++changed_binding.compatibility_identity;

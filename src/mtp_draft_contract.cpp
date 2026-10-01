@@ -190,4 +190,16 @@ void validate_mtp_draft_structural_contract(
     }
 }
 
+void require_mtp_draft_execution_semantics(
+    const MtpDraftStructuralContract& contract) {
+    if (contract.contract_identity == 0) {
+        throw std::invalid_argument(
+            "MTP execution requires initialized structural contract");
+    }
+    if (!contract.forward_semantics_resolved) {
+        throw std::logic_error(
+            "MTP draft forward semantics are unresolved; execution is disabled");
+    }
+}
+
 }  // namespace strix

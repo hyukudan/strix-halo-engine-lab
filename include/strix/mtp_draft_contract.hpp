@@ -45,4 +45,7 @@ void validate_mtp_draft_structural_contract(
     const MtpDraftRuntimeBinding& binding,
     const MtpDraftStructuralContract& contract);
 
+void require_mtp_draft_execution_semantics(
+    const MtpDraftStructuralContract& contract);
+
 }  // namespace strix
