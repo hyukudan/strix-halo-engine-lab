@@ -7,6 +7,7 @@ assess_mtp_draft_readiness(
     const MtpDraftStructuralContract& structural,
     const MtpAttentionStructuralContract& attention,
     const MtpDraftStateContract& state,
+    const MtpOutputStructuralContract& output,
     const MtpDraftTensorAudit& tensors) {
     MtpDraftReadiness result;
 
@@ -20,8 +21,15 @@ assess_mtp_draft_readiness(
     result.draft_state_semantics_resolved =
         structural.draft_state_semantics_resolved &&
         state.state_width != 0;
+    result.output_mixer_semantics_resolved =
+        structural.output_mixer_semantics_resolved &&
+        output.mixer_semantics_resolved;
+    result.output_head_binding_resolved =
+        structural.output_head_binding_resolved &&
+        output.head_binding_resolved;
     result.output_semantics_resolved =
-        structural.output_semantics_resolved;
+        structural.output_semantics_resolved &&
+        output.output_semantics_resolved;
 
     if (!result.tensor_families_complete) {
         result.blockers.emplace_back(
@@ -39,9 +47,19 @@ assess_mtp_draft_readiness(
         result.blockers.emplace_back(
             "MTP next-step draft-state semantics are unresolved");
     }
-    if (!result.output_semantics_resolved) {
+    if (!result.output_mixer_semantics_resolved) {
         result.blockers.emplace_back(
-            "MTP output/head semantics are unresolved");
+            "MTP output mixer semantics are unresolved");
+    }
+    if (!result.output_head_binding_resolved) {
+        result.blockers.emplace_back(
+            "MTP LM-head checkpoint binding is unresolved");
+    }
+    if (!result.output_semantics_resolved &&
+        result.output_mixer_semantics_resolved &&
+        result.output_head_binding_resolved) {
+        result.blockers.emplace_back(
+            "MTP output semantics are unresolved");
     }
     if (!structural.forward_semantics_resolved) {
         result.blockers.emplace_back(

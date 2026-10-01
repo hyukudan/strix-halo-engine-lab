@@ -96,8 +96,10 @@ int main() {
     expect(!plan.executable &&
                !plan.readiness.executable &&
                plan.readiness.input_fusion_semantics_resolved &&
-               plan.readiness.draft_state_semantics_resolved,
-           "compiled MTP plan remains structural-only while semantic gates remain");
+               plan.readiness.draft_state_semantics_resolved &&
+               plan.readiness.output_mixer_semantics_resolved &&
+               !plan.readiness.output_head_binding_resolved,
+           "compiled MTP plan resolves output mixer but remains blocked on head binding and QSA");
 
     bool blocked = false;
     try {

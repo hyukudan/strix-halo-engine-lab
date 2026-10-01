@@ -36,6 +36,9 @@ int main() {
     const auto state =
         strix::build_mtp_draft_state_contract(
             model);
+    const auto output =
+        strix::build_mtp_output_structural_contract(
+            model);
 
     strix::MtpDraftTensorAudit tensors;
     tensors.manifest_layout_identity = 1;
@@ -56,6 +59,7 @@ int main() {
             structural,
             attention,
             state,
+            output,
             tensors);
 
     expect(readiness.tensor_families_complete &&
@@ -63,11 +67,13 @@ int main() {
                readiness.draft_state_semantics_resolved,
            "readiness reports independently resolved MTP subcontracts");
     expect(!readiness.attention_semantics_resolved &&
+               readiness.output_mixer_semantics_resolved &&
+               !readiness.output_head_binding_resolved &&
                !readiness.output_semantics_resolved &&
                !readiness.executable,
-           "readiness keeps unresolved QSA/output from enabling MTP");
+           "readiness keeps unresolved QSA/head binding from enabling MTP");
     expect(readiness.blockers.size() == 3,
-           "readiness exposes QSA, output and complete-forward blockers");
+           "readiness exposes QSA, LM-head binding and complete-forward blockers");
 
     auto incomplete = tensors;
     incomplete.missing_required_families.push_back(

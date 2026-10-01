@@ -93,6 +93,15 @@ std::uint64_t build_plan_identity(
     hash_u64(
         hash,
         plan.state.state_width);
+    hash_u64(
+        hash,
+        plan.output.wide_input_size);
+    hash_u64(
+        hash,
+        plan.output.mixed_hidden_size);
+    hash_u64(
+        hash,
+        plan.output.vocab_size);
     hash_u64(hash, plan.steps.size());
     for (const auto step : plan.steps) {
         hash_u64(
@@ -129,6 +138,9 @@ compile_mtp_draft_plan(
     plan.state =
         build_mtp_draft_state_contract(
             model);
+    plan.output =
+        build_mtp_output_structural_contract(
+            model);
     plan.tensor_audit =
         audit_mtp_draft_tensor_families(
             manifest,
@@ -153,6 +165,7 @@ compile_mtp_draft_plan(
             plan.structural,
             plan.attention,
             plan.state,
+            plan.output,
             plan.tensor_audit);
     plan.executable =
         plan.readiness.executable;
