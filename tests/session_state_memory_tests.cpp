@@ -76,8 +76,8 @@ int main() {
             layout,
             memory,
             strix::SessionStateComponent::sparse_index);
-    expect(sparse.provisional,
-           "resolved sparse state preserves provisional marker");
+    expect(!sparse.provisional,
+           "resolved sparse state reflects exact persistent raw-index geometry");
 
     auto wrong = memory;
     ++wrong.layout_identity;
