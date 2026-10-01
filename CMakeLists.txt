@@ -21,6 +21,7 @@ endfunction()
 
 add_library(strix_core STATIC
     src/compiled_execution.cpp
+    src/compiled_mtp_draft_plan.cpp
     src/compiled_speculative_verify.cpp
     src/compiled_speculation_backend.cpp
     src/dispatch_resources.cpp
@@ -352,6 +353,11 @@ if(BUILD_TESTING)
     target_link_libraries(strix-qsa-selection-plan-tests PRIVATE strix_core)
     strix_target_warnings(strix-qsa-selection-plan-tests)
     add_test(NAME strix-qsa-selection-plan-tests COMMAND strix-qsa-selection-plan-tests)
+
+    add_executable(strix-compiled-mtp-draft-plan-tests tests/compiled_mtp_draft_plan_tests.cpp)
+    target_link_libraries(strix-compiled-mtp-draft-plan-tests PRIVATE strix_core)
+    strix_target_warnings(strix-compiled-mtp-draft-plan-tests)
+    add_test(NAME strix-compiled-mtp-draft-plan-tests COMMAND strix-compiled-mtp-draft-plan-tests)
 
     add_executable(strix-mtp-draft-readiness-tests tests/mtp_draft_readiness_tests.cpp)
     target_link_libraries(strix-mtp-draft-readiness-tests PRIVATE strix_core)
