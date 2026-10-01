@@ -487,6 +487,53 @@ int main() {
                fixture.serial.execution.steps.size(),
            "accepted replay executes one complete serial target token");
 
+    {
+        Fixture zero_fixture;
+        CountingDispatcher zero_serial_dispatcher;
+        CountingDispatcher zero_verify_dispatcher;
+        FixedCollector zero_collector;
+        zero_collector.base = 42;
+
+        strix::CompiledGreedySpeculationBackend zero_backend(
+            zero_fixture.serial,
+            zero_fixture.serial_resources,
+            zero_serial_dispatcher,
+            zero_fixture.verify,
+            zero_fixture.verify_resources,
+            zero_verify_dispatcher,
+            zero_collector);
+
+        FakeAllocator zero_allocator;
+        strix::AllocationGenerationSource zero_generations;
+        CountingTransfer zero_transfer;
+        strix::GreedySpeculationExecutionRequest zero_request;
+        zero_request.token_budget = 1;
+
+        const auto zero_result =
+            strix::execute_greedy_speculation_cycle(
+                zero_fixture.model,
+                zero_fixture.serial,
+                zero_fixture.serial_resources,
+                zero_fixture.session,
+                zero_request,
+                zero_allocator,
+                zero_generations,
+                zero_transfer,
+                zero_backend);
+
+        expect(zero_result.plan.emitted_tokens ==
+                   std::vector<std::uint32_t>({42}) &&
+                   !zero_result.snapshot_captured &&
+                   zero_verify_dispatcher.calls == 0 &&
+                   zero_serial_dispatcher.calls == 0,
+               "compiled backend depth zero emits base target token without verify or replay");
+        expect(zero_fixture.session.next_position == 10 &&
+                   zero_fixture.session.committed_tokens == 10 &&
+                   zero_fixture.session.health ==
+                       strix::SerialSessionHealth::ready,
+               "compiled backend depth zero leaves target state unchanged");
+    }
+
     auto changed_verify_resources =
         fixture.verify_resources;
     auto changed_weights =

@@ -138,12 +138,6 @@ verify_target_candidates(
     validate_shared_target_resources(
         resources);
 
-    if (candidate_tokens.size() !=
-        verify_.candidate_depth) {
-        throw std::invalid_argument(
-            "candidate depth does not match compiled verify backend");
-    }
-
     const auto base_token =
         collector_.collect_base_target_token(
             serial_,
@@ -154,6 +148,15 @@ verify_target_candidates(
             serial_.vocab_size) {
         throw std::runtime_error(
             "base target token is outside compiled vocabulary");
+    }
+
+    if (candidate_tokens.empty()) {
+        return {base_token};
+    }
+    if (candidate_tokens.size() !=
+        verify_.candidate_depth) {
+        throw std::invalid_argument(
+            "candidate depth does not match compiled verify backend");
     }
 
     static_cast<void>(
