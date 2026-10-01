@@ -224,6 +224,33 @@ struct DirectLinkLifecycle {
 [[nodiscard]] bool direct_link_usable(
     const DirectLinkLifecycle& link) noexcept;
 
+enum class DirectPairState {
+    portable_only,
+    arm_allowed,
+    direct_ready,
+    in_use,
+    partial,
+    failed,
+};
+
+struct DirectPairDecision {
+    DirectPairState state =
+        DirectPairState::portable_only;
+    bool control_ready = false;
+    bool parameters_match = false;
+    bool hopids_reciprocal = false;
+    bool epochs_match = false;
+    bool receive_rings_primed = false;
+    bool completion_rearm_qualified = false;
+    bool lease_available = false;
+    bool dma_buf_import_common = false;
+};
+
+[[nodiscard]] DirectPairDecision
+reconcile_direct_link_pair(
+    const DirectLinkLifecycle& local,
+    const DirectLinkLifecycle& peer) noexcept;
+
 enum class LinkCompletionTarget {
     receive_ready,
     remote_consumer_complete,
