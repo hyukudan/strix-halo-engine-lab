@@ -17,6 +17,8 @@
 | D-011 | Exponer GTT casi máximo, pero admitir cargas con una reserva efectiva independiente de 16–20 GiB. | GTT amplía el mapping; no crea RAM ni protege al host de OOM. | E-022, E-023, `MEMORY_BUDGET.md`. | Ajustar reserva solo con telemetría del hardware real. |
 | D-012 | Mantener inicialmente el perfil mononodo de 128 GiB dentro de un envelope aproximado de 100 GiB de pesos residentes, hasta que A0.6 justifique otro límite. | Preserva la reserva efectiva y deja capacidad para KV, recurrencia, scratch, runtime y recuperación; evita convertir el GTT máximo en presupuesto de carga. | E-011, E-028, E-032, E-033. | Reabrir tras medidas UMA reales y calidad de las cuantizaciones candidatas. |
 
+| D-013 | Fijar el desempate QSA por menor índice de bloque cuando los scores sean idénticos. | El forward canónico usa `torch.topk`, cuyos índices empatados no tienen estabilidad garantizada; el motor necesita replay reproducible y la misma regla debe usarse en serial y MTP. | E-041, E-043 y fixture `qsa_tie`. | Reabrir solo si Qwen publica un desempate canónico explícito incompatible. |
+
 ## Pendientes
 
 | ID | Decisión pendiente | Datos necesarios |

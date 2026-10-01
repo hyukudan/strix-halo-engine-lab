@@ -382,7 +382,7 @@ Additional A1.6 runtime work now implemented:
 - MTP compatibility identity excludes physical relocation, while a separate physical binding identity includes storage, addresses and allocation generations;
 - MTP draft state cannot cross checkpoint-content identity;
 - pinned MTP structural contract from the official config: one full-attention predictor layer, shared embeddings, null explicit hidden-source layer, base-model attention geometry and a planning-only 2 KiB/token KV estimate;
-- MTP semantic gates are tracked independently: input fusion and next-step draft-state propagation are resolved; QSA scoring/selection is resolved for no-tie fixtures (including pooled-key RoPE) but cutoff-tie behavior remains open; output mixer semantics are resolved and an explicit sidecar `shared_head` resolves the LM-head binding; the complete forward gate remains closed;
+- MTP semantic gates are tracked independently: input fusion and next-step draft-state propagation are resolved; QSA scoring/selection is resolved including pooled-key RoPE and an explicit deterministic lower-block-index tie rule; output mixer semantics are resolved and an explicit sidecar `shared_head` resolves the LM-head binding; the complete forward gate remains closed;
 - executable MTP construction is explicitly blocked while the complete `forward_semantics_resolved` gate remains false;
 - `CompiledMtpDraftPlan` now freezes the structural step order and stable relocation-independent plan identity while surfacing unresolved readiness blockers instead of launching;
 - offline `strix-mtp-manifest-audit MTP.gguf` reports required structural tensor families, unresolved MTP tensors and missing families without allocating GPU state;

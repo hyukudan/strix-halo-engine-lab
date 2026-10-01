@@ -128,10 +128,11 @@ streams, apply the shared hidden projection to each stream and add the projected
 embedding to every stream. The next-step draft state is also pinned: preserve the post-block wide
 hyper-connection residual, one row per request, before the final head mixer
 collapses it for logits. For the pinned model this state width is
-`4 * 2560 = 10240`. QSA block pooling/scoring and selection are independently oracled for fixtures
-without a cutoff tie, including pooled-key RMSNorm and block-start RoPE. The
-canonical cutoff-tie rule remains unresolved, so the complete attention gate
-stays closed.
+`4 * 2560 = 10240`. QSA block pooling/scoring and selection are independently oracled including
+pooled-key RMSNorm and block-start RoPE. The pinned upstream forward uses
+`torch.topk`, whose tied indices are not stable; the engine therefore defines
+one reproducible completion of that otherwise undefined case: descending score,
+then lower compressed-block index. Serial and MTP MUST use the same rule.
 
 The final MTP output mixer reuses the independently oracled gated-residual
 formula without injection. If the MTP manifest contains exactly one explicit
