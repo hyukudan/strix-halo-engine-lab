@@ -66,14 +66,14 @@ int main() {
                readiness.input_fusion_semantics_resolved &&
                readiness.draft_state_semantics_resolved,
            "readiness reports independently resolved MTP subcontracts");
-    expect(!readiness.attention_semantics_resolved &&
+    expect(readiness.attention_semantics_resolved &&
                readiness.output_mixer_semantics_resolved &&
                !readiness.output_head_binding_resolved &&
                !readiness.output_semantics_resolved &&
                !readiness.executable,
            "readiness keeps unresolved QSA/head binding from enabling MTP");
-    expect(readiness.blockers.size() == 3,
-           "readiness exposes QSA, LM-head binding and complete-forward blockers");
+    expect(readiness.blockers.size() == 2,
+           "readiness exposes LM-head binding and complete-forward blockers");
 
     auto incomplete = tensors;
     incomplete.missing_required_families.push_back(
@@ -83,9 +83,10 @@ int main() {
             structural,
             attention,
             state,
+            output,
             incomplete);
     expect(!blocked.tensor_families_complete &&
-               blocked.blockers.size() == 4,
+               blocked.blockers.size() == 3,
            "readiness reports structural tensor blockers separately");
 
     if (failures == 0) {
