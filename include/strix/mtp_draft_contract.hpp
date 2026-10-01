@@ -34,6 +34,8 @@ struct MtpDraftStructuralContract {
     bool input_fusion_semantics_resolved = true;
     bool attention_semantics_resolved = false;
     bool draft_state_semantics_resolved = true;
+    bool output_mixer_semantics_resolved = true;
+    bool output_head_binding_resolved = false;
     bool output_semantics_resolved = false;
     bool forward_semantics_resolved = false;
 

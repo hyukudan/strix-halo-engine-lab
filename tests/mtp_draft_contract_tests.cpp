@@ -54,6 +54,8 @@ int main() {
     expect(contract.input_fusion_semantics_resolved &&
                !contract.attention_semantics_resolved &&
                contract.draft_state_semantics_resolved &&
+               contract.output_mixer_semantics_resolved &&
+               !contract.output_head_binding_resolved &&
                !contract.output_semantics_resolved &&
                !contract.forward_semantics_resolved,
            "MTP contract resolves only independently-oracled input fusion");
