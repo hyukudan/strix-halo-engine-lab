@@ -19,6 +19,9 @@ struct MemoryPlanRequest {
     std::uint64_t resident_model_bytes = 0;
     std::uint64_t bounded_cache_bytes = 0;
     bool include_mtp_kv = true;
+    bool include_mtp_draft_state = true;
+    // Planning assumption only; this is not the unresolved MTP state dtype contract.
+    std::uint64_t mtp_draft_state_element_bytes = 2;
     bool include_indexer = true;
     RollbackPolicy rollback = RollbackPolicy::recompute;
 };
@@ -26,6 +29,7 @@ struct MemoryPlanRequest {
 struct MemoryBreakdown {
     std::uint64_t base_kv = 0;
     std::uint64_t mtp_kv = 0;
+    std::uint64_t mtp_draft_state = 0;
     std::uint64_t indexer = 0;
     std::uint64_t gdn_matrix_state = 0;
     std::uint64_t gdn_conv_state = 0;
@@ -55,6 +59,9 @@ struct AdmissionDecision {
 
 [[nodiscard]] std::uint64_t base_kv_bytes_per_token(const ModelContract& model);
 [[nodiscard]] std::uint64_t mtp_kv_bytes_per_token(const ModelContract& model);
+[[nodiscard]] std::uint64_t mtp_draft_state_bytes_per_session(
+    const ModelContract& model,
+    std::uint64_t element_bytes);
 [[nodiscard]] std::uint64_t provisional_indexer_bytes_per_token(const ModelContract& model);
 [[nodiscard]] std::uint64_t gdn_matrix_state_bytes_per_layer(
     const ModelContract& model);

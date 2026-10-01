@@ -240,6 +240,11 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-execution-arena-tests)
     add_test(NAME strix-execution-arena-tests COMMAND strix-execution-arena-tests)
 
+    add_executable(strix-memory-plan-tests tests/memory_plan_tests.cpp)
+    target_link_libraries(strix-memory-plan-tests PRIVATE strix_core)
+    strix_target_warnings(strix-memory-plan-tests)
+    add_test(NAME strix-memory-plan-tests COMMAND strix-memory-plan-tests)
+
     add_executable(strix-execution-memory-tests tests/execution_memory_tests.cpp)
     target_link_libraries(strix-execution-memory-tests PRIVATE strix_core)
     strix_target_warnings(strix-execution-memory-tests)

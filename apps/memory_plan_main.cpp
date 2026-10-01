@@ -58,6 +58,11 @@ int main(int argc, char** argv) try {
             host.recovery_reserve_bytes = strix::gib(parse_u64(need_value(argument), argument));
         } else if (argument == "--rollback-full") {
             request.rollback = strix::RollbackPolicy::full_gdn_snapshots;
+        } else if (argument == "--mtp-draft-state-bytes") {
+            request.mtp_draft_state_element_bytes =
+                parse_u64(need_value(argument), argument);
+        } else if (argument == "--no-mtp-draft-state") {
+            request.include_mtp_draft_state = false;
         } else if (argument == "--no-indexer") {
             request.include_indexer = false;
         } else if (argument == "--no-mtp-kv") {
@@ -74,6 +79,7 @@ int main(int argc, char** argv) try {
     std::cout << "{\n  \"breakdown\": {\n";
     print_field("base_kv", plan.base_kv);
     print_field("mtp_kv", plan.mtp_kv);
+    print_field("mtp_draft_state", plan.mtp_draft_state);
     print_field("indexer_raw_keys", plan.indexer);
     print_field("gdn_matrix_state", plan.gdn_matrix_state);
     print_field("gdn_conv_state", plan.gdn_conv_state);
