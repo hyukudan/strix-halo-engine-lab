@@ -457,6 +457,9 @@ Additional serial-runtime work now implemented:
 - fresh HIP scratch/device-state/host-state initialization;
 - `strix-hip-model-residency` hardware probe CLI;
 - `strix-hip-decode-token` runner that compiles the full C1 serial DAG from a GGUF, accepts explicit token IDs and materializes FP32 logits/top-5.
+- versioned independent serial replay fixtures with checkpoint-content identity, expected argmax tokens and selected logit probes;
+- host-side `strix-validate-serial-reference` preflight with target-vocabulary checks and optional `MODEL.gguf` content-identity verification;
+- `strix-hip-decode-token --reference` qualification gate requiring multi-step replay, exact argmax agreement and bounded selected-logit error before replay evidence passes.
 
 Still pending:
 
