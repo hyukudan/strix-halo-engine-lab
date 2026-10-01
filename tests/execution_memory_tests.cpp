@@ -125,7 +125,8 @@ int main() {
             lm_io.reads[0]);
     const auto output =
         strix::resolve_execution_buffer(
-            compiled,
+            compiled.execution_identity,
+            compiled.arena,
             memory,
             lm_io.writes[0]);
 
