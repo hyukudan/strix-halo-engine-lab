@@ -251,6 +251,8 @@ The distributed scheduler SHOULD know:
 
 It MAY choose the link policy per tensor.
 
+The scheduler MUST declare which completion boundary it is optimizing: receive-ready, remote-consumer-complete, or receiver-reusable. Link selection for latency-critical inference SHOULD use the boundary that actually gates the next useful model operation rather than raw DMA arrival by default.
+
 Static round-robin SHOULD be only a baseline.
 
 Striping thresholds SHOULD be derived from an end-to-end transfer cost model equivalent to:
