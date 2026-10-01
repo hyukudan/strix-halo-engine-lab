@@ -361,9 +361,23 @@ Initial semantic foundation implemented:
 - expected committed-token normalization;
 - hysteresis before switching between serial and speculative depths.
 
+Additional A1.6 runtime work now implemented:
+
+- compiled multi-row target verify plans and eager execution;
+- pre-window persistent-state snapshots for positive candidate depth;
+- exact restore plus serial replay of the accepted prefix on partial matches;
+- all-match cycles retain the already-verified target state without replay;
+- verify/replay failures recover from the pre-window snapshot when recovery succeeds;
+- snapshot restore can recover a poisoned serial session and republishes only after all state ranges restore successfully;
+- compiled greedy backend binds serial and verify executions to the same model content and persistent target-state allocation;
+- direct launch dispatch rejects foreign execution identities;
+- draft candidates and collected target tokens are rejected when outside the compiled/model vocabulary before they can become visible output.
+
 Sampled speculative mathematics is source-identified (acceptance ratio and
 residual fallback), but sampled execution remains disabled until RNG stream
-identity and rejected-draft consumption are fixed.
+identity and rejected-draft consumption are fixed. Draft proposal-state
+generation is not yet integrated; candidate tokens are currently supplied to
+the greedy cycle by its caller.
 
 
 ## Slice A1.5b — compiled eager serial runtime
@@ -425,5 +439,4 @@ Still pending:
 - native Strix Halo compilation and execution of the complete HIP runtime;
 - validating registered read-only GGUF mappings on the M5 ROCm stack and comparing against resident-copy fallback;
 - first real token/logit replay against the canonical checkpoint/reference implementation;
-- tokenizer/chat-template integration after raw token-id replay is correct;
-- snapshot recovery of a poisoned session after mid-dispatch failure.
+- tokenizer/chat-template integration after raw token-id replay is correct.
