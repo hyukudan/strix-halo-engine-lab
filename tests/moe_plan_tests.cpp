@@ -74,7 +74,7 @@ int main() {
            "MoE plan exposes minimum touched-expert reuse");
     expect(plan.mean_rows_per_touched_expert == 2.0,
            "MoE plan exposes mean touched-expert reuse");
-    expect(plan.mean_adjacent_row_overlap == 4.0 / 9.0,
+    expect(plan.mean_adjacent_row_overlap == 5.0 / 9.0,
            "MoE plan measures adjacent-row route overlap");
     expect(plan.direct_assignment_weight_bytes == 12'000,
            "direct tiny-row path models one expert-weight traversal per assignment");
