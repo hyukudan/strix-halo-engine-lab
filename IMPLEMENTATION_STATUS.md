@@ -380,13 +380,17 @@ Additional A1.6 runtime work now implemented:
 - proposal/reconciliation failures poison only the drafter state while depth zero remains available;
 - MTP draft binding selects only manifest tensors classified as `mtp`, accounts their exact bytes and binds both model layout and content identity;
 - MTP compatibility identity excludes physical relocation, while a separate physical binding identity includes storage, addresses and allocation generations;
-- MTP draft state cannot cross checkpoint-content identity.
+- MTP draft state cannot cross checkpoint-content identity;
+- deterministic bounded prompt-lookup drafter using the most recent non-overlapping suffix n-gram match;
+- prompt-lookup history has an explicit token-capacity bound and proposal identity;
+- draft wrapper preflights target runtime/session before proposal and clamps effective proposal depth by remaining context and `token_budget - 1`.
 
 Sampled speculative mathematics is source-identified (acceptance ratio and
 residual fallback), but sampled execution remains disabled until RNG stream
 identity and rejected-draft consumption are fixed. The draft proposal seam is integrated, but concrete proposal-state
-storage beyond lifecycle metadata, MTP compute semantics/kernels, prompt-lookup
-implementation and proposal qualification remain open.
+storage beyond lifecycle metadata for model-backed drafters, MTP compute
+semantics/kernels, measured drafter selection and proposal qualification remain
+open.
 
 
 ## Slice A1.5b — compiled eager serial runtime

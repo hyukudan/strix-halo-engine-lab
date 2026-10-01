@@ -113,6 +113,17 @@ identity excludes physical relocation; pointer/storage/allocation changes are
 tracked by a separate physical binding identity. This binding is structural and
 does not imply semantic or hardware qualification.
 
+The host runtime also provides a bounded prompt-lookup proposal path. It matches
+the current suffix n-gram against the most recent non-overlapping prior
+occurrence and proposes only tokens already present in retained history. Its
+history capacity is explicit and bounded. Prompt lookup changes proposal cost
+and acceptance only; every emitted token remains target-verified.
+
+Before invoking any positive-depth drafter, the wrapper MUST preflight the target
+runtime/session. Effective proposal depth is bounded by the requested depth,
+remaining allocated/model context and `token_budget - 1`, preserving room for
+the mandatory target-produced bonus token.
+
 ## Verification
 
 Verify kernels SHOULD evaluate candidate rows in parallel while preserving each row's serial arithmetic.
