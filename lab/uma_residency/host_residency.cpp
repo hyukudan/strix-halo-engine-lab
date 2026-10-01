@@ -330,34 +330,20 @@ int main(int argc, char** argv) try {
         ? static_cast<double>(total_bytes / (1024.0L * 1024.0L * 1024.0L) / seconds)
         : 0.0;
 
-    std::cout << "{
-"
-              << "  \"mode\": \"" << options.mode << "\",
-"
-              << "  \"pattern\": \"" << options.pattern << "\",
-"
-              << "  \"advice\": \"" << options.advice << "\",
-"
-              << "  \"bytes\": " << options.bytes << ",
-"
-              << "  \"iterations\": " << options.iterations << ",
-"
-              << "  \"prefault\": " << (options.prefault ? "true" : "false") << ",
-"
-              << "  \"drop_pages\": " << (options.drop_pages ? "true" : "false") << ",
-"
-              << "  \"seconds\": " << seconds << ",
-"
-              << "  \"effective_gib_s\": " << gib_s << ",
-"
-              << "  \"minor_faults\": " << (after.minor - before.minor) << ",
-"
-              << "  \"major_faults\": " << (after.major - before.major) << ",
-"
-              << "  \"checksum\": " << checksum << "
-"
-              << "}
-";
+    std::cout << '{' << '\n'
+              << "  \"mode\": \"" << options.mode << "\"," << '\n'
+              << "  \"pattern\": \"" << options.pattern << "\"," << '\n'
+              << "  \"advice\": \"" << options.advice << "\"," << '\n'
+              << "  \"bytes\": " << options.bytes << ',' << '\n'
+              << "  \"iterations\": " << options.iterations << ',' << '\n'
+              << "  \"prefault\": " << (options.prefault ? "true" : "false") << ',' << '\n'
+              << "  \"drop_pages\": " << (options.drop_pages ? "true" : "false") << ',' << '\n'
+              << "  \"seconds\": " << seconds << ',' << '\n'
+              << "  \"effective_gib_s\": " << gib_s << ',' << '\n'
+              << "  \"minor_faults\": " << (after.minor - before.minor) << ',' << '\n'
+              << "  \"major_faults\": " << (after.major - before.major) << ',' << '\n'
+              << "  \"checksum\": " << checksum << '\n'
+              << '}' << '\n';
     return 0;
 } catch (const std::exception& error) {
     std::cerr << "strix-uma-host: " << error.what() << '\n';
