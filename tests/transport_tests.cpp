@@ -28,6 +28,18 @@ int main() {
     expect(!can_transition(BufferOwnership::producer_owned,
                            BufferOwnership::transport_owned),
            "transport cannot steal producer-owned buffer");
+    expect(can_transition(BufferOwnership::consumer_owned,
+                          BufferOwnership::consumer_released),
+           "consumer release precedes repost");
+    expect(can_transition(BufferOwnership::consumer_released,
+                          BufferOwnership::repost_pending),
+           "released receive buffer enters repost pending");
+    expect(can_transition(BufferOwnership::repost_pending,
+                          BufferOwnership::reusable),
+           "only reposted receive buffer becomes reusable");
+    expect(!can_transition(BufferOwnership::consumer_owned,
+                           BufferOwnership::reusable),
+           "consumer-owned receive buffer cannot skip repost lifecycle");
     expect(can_transition(BufferOwnership::reusable,
                           BufferOwnership::producer_owned),
            "reusable buffer can return to producer");
@@ -67,6 +79,51 @@ int main() {
     auto oversized = good;
     oversized.byte_length = 2048;
     expect(!validate_descriptor(oversized, limits), "oversized payload is rejected");
+
+
+    GpuCommitRecord commit;
+    commit.protocol_version = good.protocol_version;
+    commit.commit_word = gpu_commit_word;
+    commit.connection_epoch =
+        good.connection_epoch;
+    commit.sequence = good.sequence;
+    commit.payload_bytes = 256;
+    commit.stripe_index = 1;
+    commit.stripe_count = 2;
+    expect(validate_gpu_commit_record(commit, good),
+           "GPU commit record validates epoch sequence and stripe metadata");
+
+    auto stale_commit = commit;
+    --stale_commit.connection_epoch;
+    expect(!validate_gpu_commit_record(stale_commit, good),
+           "GPU commit record rejects stale epoch");
+
+    auto bad_stripe = commit;
+    bad_stripe.stripe_index = 2;
+    expect(!validate_gpu_commit_record(bad_stripe, good),
+           "GPU commit record rejects invalid stripe index");
+
+    DirectLinkLifecycle lifecycle;
+    lifecycle.physical_link_id = "usb4-a";
+    lifecycle.state =
+        DirectLinkLifecycleState::arm_allowed;
+    lifecycle.connection_epoch = 9;
+    lifecycle.control_link_ready = true;
+    lifecycle.peer_reconciled = true;
+    lifecycle.exclusive_lease_available = true;
+    expect(direct_link_armable(lifecycle),
+           "direct link is armable only after control reconciliation and lease");
+
+    lifecycle.state =
+        DirectLinkLifecycleState::direct_ready;
+    lifecycle.receive_ring_primed = true;
+    lifecycle.completion_rearm_qualified = true;
+    expect(direct_link_usable(lifecycle),
+           "qualified direct link becomes usable after RX priming and completion rearm");
+
+    lifecycle.receive_ring_primed = false;
+    expect(!direct_link_usable(lifecycle),
+           "direct link is unusable before receive ring is primed");
 
     std::vector<LinkProfile> links(2);
     links[0].id = "a";
