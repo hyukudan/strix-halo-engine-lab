@@ -37,6 +37,7 @@ int main() {
     policy.policy_identity = 0x2001ULL;
     policy.max_logit_abs_error = 1e-3;
     policy.minimum_steps = 2;
+    policy.minimum_logit_values_compared = 3;
     policy.require_exact_argmax = true;
 
     const auto observation =
@@ -74,7 +75,7 @@ int main() {
            "logit error above policy fails replay");
 
     auto no_logits = observation;
-    no_logits.logit_values_compared = 0;
+    no_logits.logit_values_compared = 2;
     no_logits.maximum_logit_abs_error = 0.0;
     const auto unchecked =
         strix::assess_serial_decode_replay(
@@ -82,7 +83,7 @@ int main() {
             no_logits);
     expect(!unchecked.logits_checked &&
                !unchecked.passes_declared_policy,
-           "zero compared logits cannot qualify serial replay");
+           "insufficient compared logits cannot qualify serial replay");
 
     auto wrong_identity = observation;
     wrong_identity.model_content_identity = {};
