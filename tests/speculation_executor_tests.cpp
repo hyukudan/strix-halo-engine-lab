@@ -108,13 +108,38 @@ public:
     int calls = 0;
     std::uint32_t seen_max_depth = 0;
 
+    int reconcile_calls = 0;
+    bool fail_reconcile = false;
+    std::vector<std::uint32_t> reconciled_tokens;
+
     std::vector<std::uint32_t>
     propose_candidates(
         const strix::SerialSessionContext&,
+        strix::DraftProposalStateContext& proposal_state,
         std::uint32_t max_candidate_depth) override {
         ++calls;
         seen_max_depth = max_candidate_depth;
+        expect(proposal_state.phase ==
+                   strix::DraftProposalStatePhase::proposal_active,
+               "draft backend sees active proposal state");
         return proposed_tokens;
+    }
+
+    void reconcile_after_target(
+        strix::DraftProposalStateContext& proposal_state,
+        const strix::SerialSessionContext&,
+        std::span<const std::uint32_t> emitted_tokens) override {
+        ++reconcile_calls;
+        expect(proposal_state.phase ==
+                   strix::DraftProposalStatePhase::reconciliation_required,
+               "draft backend reconciles only dirty proposal state");
+        if (fail_reconcile) {
+            throw std::runtime_error(
+                "injected draft reconciliation failure");
+        }
+        reconciled_tokens.assign(
+            emitted_tokens.begin(),
+            emitted_tokens.end());
     }
 };
 
@@ -482,6 +507,10 @@ int main() {
     {
         Fixture fixture;
         FakeDraftBackend draft;
+        auto draft_state =
+            strix::make_draft_proposal_state(
+                0x5555ULL,
+                fixture.session);
         draft.proposed_tokens = {10, 99};
         FakeSpeculationBackend backend;
         backend.target_tokens = {10, 20, 30};
@@ -500,11 +529,15 @@ int main() {
                 allocator,
                 generations,
                 transfer,
+                draft_state,
                 draft,
                 backend);
 
         expect(draft.calls == 1 &&
+                   draft.reconcile_calls == 1 &&
                    draft.seen_max_depth == 2 &&
+                   draft_state.phase ==
+                       strix::DraftProposalStatePhase::synchronized &&
                    result.proposed_tokens ==
                        std::vector<std::uint32_t>({10, 99}),
                "draft wrapper obtains bounded candidate tokens before target verification");
@@ -518,6 +551,10 @@ int main() {
     {
         Fixture fixture;
         FakeDraftBackend draft;
+        auto draft_state =
+            strix::make_draft_proposal_state(
+                0x5555ULL,
+                fixture.session);
         draft.proposed_tokens = {1, 2};
         FakeSpeculationBackend backend;
         backend.target_tokens = {42};
@@ -536,10 +573,14 @@ int main() {
                 allocator,
                 generations,
                 transfer,
+                draft_state,
                 draft,
                 backend);
 
         expect(draft.calls == 0 &&
+                   draft.reconcile_calls == 0 &&
+                   draft_state.phase ==
+                       strix::DraftProposalStatePhase::synchronized &&
                    result.proposed_tokens.empty() &&
                    result.target_cycle.plan.emitted_tokens ==
                        std::vector<std::uint32_t>({42}),
@@ -552,6 +593,10 @@ int main() {
     {
         Fixture fixture;
         FakeDraftBackend draft;
+        auto draft_state =
+            strix::make_draft_proposal_state(
+                0x5555ULL,
+                fixture.session);
         draft.proposed_tokens = {1, 2, 3};
         FakeSpeculationBackend backend;
         backend.target_tokens = {1, 2, 3};
@@ -579,9 +624,89 @@ int main() {
         }
         expect(rejected &&
                    backend.verify_calls == 0 &&
+                   draft_state.phase ==
+                       strix::DraftProposalStatePhase::poisoned &&
                    fixture.session.next_position == 10 &&
                    fixture.session.committed_tokens == 10,
                "over-depth draft result fails before target verification");
+    }
+
+    {
+        Fixture fixture;
+        FakeDraftBackend draft;
+        auto draft_state =
+            strix::make_draft_proposal_state(
+                0x5555ULL,
+                fixture.session);
+        draft.proposed_tokens = {10, 99};
+        draft.fail_reconcile = true;
+        FakeSpeculationBackend backend;
+        backend.target_tokens = {10, 20, 30};
+
+        strix::GreedyDraftExecutionRequest request;
+        request.max_candidate_depth = 2;
+        request.token_budget = 3;
+
+        bool rejected = false;
+        try {
+            static_cast<void>(
+                strix::execute_greedy_speculation_with_draft(
+                    fixture.model,
+                    fixture.compiled,
+                    fixture.resources,
+                    fixture.session,
+                    request,
+                    allocator,
+                    generations,
+                    transfer,
+                    draft_state,
+                    draft,
+                    backend));
+        } catch (const std::runtime_error&) {
+            rejected = true;
+        }
+        expect(rejected &&
+                   draft_state.phase ==
+                       strix::DraftProposalStatePhase::poisoned,
+               "draft reconciliation failure poisons proposal state");
+    }
+
+    {
+        Fixture fixture;
+        FakeDraftBackend draft;
+        auto draft_state =
+            strix::make_draft_proposal_state(
+                0x5555ULL,
+                fixture.session);
+        ++draft_state.synchronized_target_position;
+        FakeSpeculationBackend backend;
+
+        strix::GreedyDraftExecutionRequest request;
+        request.max_candidate_depth = 1;
+        request.token_budget = 2;
+
+        bool rejected = false;
+        try {
+            static_cast<void>(
+                strix::execute_greedy_speculation_with_draft(
+                    fixture.model,
+                    fixture.compiled,
+                    fixture.resources,
+                    fixture.session,
+                    request,
+                    allocator,
+                    generations,
+                    transfer,
+                    draft_state,
+                    draft,
+                    backend));
+        } catch (const std::logic_error&) {
+            rejected = true;
+        }
+        expect(rejected &&
+                   draft.calls == 0 &&
+                   backend.verify_calls == 0,
+               "stale draft state fails before proposal or target verification");
     }
 
     if (failures == 0) {

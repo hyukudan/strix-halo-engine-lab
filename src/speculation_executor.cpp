@@ -419,20 +419,39 @@ execute_greedy_speculation_with_draft(
     RuntimeMemoryAllocator& snapshot_allocator,
     AllocationGenerationSource& allocation_generations,
     SessionSnapshotTransferBackend& snapshot_transfer,
+    DraftProposalStateContext& draft_state,
     GreedyDraftProposalBackend& draft_backend,
     GreedySpeculationExecutionBackend& target_backend) {
     GreedyDraftExecutionResult result;
 
+    validate_draft_proposal_state(
+        draft_state,
+        session);
+
+    bool proposal_started = false;
     if (request.max_candidate_depth != 0) {
-        result.proposed_tokens =
-            draft_backend.propose_candidates(
-                session,
-                request.max_candidate_depth);
-        if (result.proposed_tokens.size() >
-            static_cast<std::size_t>(
-                request.max_candidate_depth)) {
-            throw std::invalid_argument(
-                "draft backend returned more candidates than requested");
+        begin_draft_proposal(
+            draft_state,
+            session);
+        proposal_started = true;
+        try {
+            result.proposed_tokens =
+                draft_backend.propose_candidates(
+                    session,
+                    draft_state,
+                    request.max_candidate_depth);
+            if (result.proposed_tokens.size() >
+                static_cast<std::size_t>(
+                    request.max_candidate_depth)) {
+                throw std::invalid_argument(
+                    "draft backend returned more candidates than requested");
+            }
+            finish_draft_proposal(
+                draft_state);
+        } catch (...) {
+            poison_draft_proposal_state(
+                draft_state);
+            throw;
         }
     }
 
@@ -446,17 +465,42 @@ execute_greedy_speculation_with_draft(
     target_request.snapshot_alignment =
         request.snapshot_alignment;
 
-    result.target_cycle =
-        execute_greedy_speculation_cycle(
-            model,
-            compiled,
-            resources,
-            session,
-            target_request,
-            snapshot_allocator,
-            allocation_generations,
-            snapshot_transfer,
-            target_backend);
+    try {
+        result.target_cycle =
+            execute_greedy_speculation_cycle(
+                model,
+                compiled,
+                resources,
+                session,
+                target_request,
+                snapshot_allocator,
+                allocation_generations,
+                snapshot_transfer,
+                target_backend);
+    } catch (...) {
+        if (proposal_started) {
+            poison_draft_proposal_state(
+                draft_state);
+        }
+        throw;
+    }
+
+    if (proposal_started) {
+        try {
+            draft_backend.reconcile_after_target(
+                draft_state,
+                session,
+                result.target_cycle.plan.emitted_tokens);
+            reconcile_draft_proposal_state(
+                draft_state,
+                session);
+        } catch (...) {
+            poison_draft_proposal_state(
+                draft_state);
+            throw;
+        }
+    }
+
     return result;
 }
 

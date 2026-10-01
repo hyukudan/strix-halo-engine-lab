@@ -1,6 +1,7 @@
 #pragma once
 
 #include "strix/compiled_execution.hpp"
+#include "strix/draft_proposal_state.hpp"
 #include "strix/execution_resources.hpp"
 #include "strix/runtime_allocator.hpp"
 #include "strix/serial_session.hpp"
@@ -23,7 +24,15 @@ public:
     [[nodiscard]] virtual std::vector<std::uint32_t>
     propose_candidates(
         const SerialSessionContext& target_session,
+        DraftProposalStateContext& proposal_state,
         std::uint32_t max_candidate_depth) = 0;
+
+    // Reconcile concrete drafter caches/state to the committed target state
+    // after target verification/replay has completed successfully.
+    virtual void reconcile_after_target(
+        DraftProposalStateContext& proposal_state,
+        const SerialSessionContext& target_session,
+        std::span<const std::uint32_t> emitted_tokens) = 0;
 };
 
 class GreedySpeculationExecutionBackend {
@@ -96,6 +105,7 @@ execute_greedy_speculation_with_draft(
     RuntimeMemoryAllocator& snapshot_allocator,
     AllocationGenerationSource& allocation_generations,
     SessionSnapshotTransferBackend& snapshot_transfer,
+    DraftProposalStateContext& draft_state,
     GreedyDraftProposalBackend& draft_backend,
     GreedySpeculationExecutionBackend& target_backend);
 
