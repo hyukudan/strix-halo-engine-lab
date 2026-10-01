@@ -12,7 +12,7 @@ from qwen4_exp_oracle import (
     gated_residual,
     moe_route_no_ties,
     ngram_ids,
-    qsa_select_tokens_no_ties,
+    qsa_select_tokens_deterministic,
     recurrent_gated_delta_rule,
     rms_norm,
     stable_top_k,
@@ -127,9 +127,9 @@ class OracleTests(unittest.TestCase):
         assert_nested_close(self, mixed, fixture["expected_mixed"])
         assert_nested_close(self, injection, fixture["expected_injection"])
 
-    def test_qsa_no_tie_fixture(self) -> None:
+    def test_qsa_deterministic_fixture(self) -> None:
         fixture = FIXTURE["qsa_no_ties"]
-        selected = qsa_select_tokens_no_ties(
+        selected = qsa_select_tokens_deterministic(
             fixture["query_heads"],
             fixture["raw_keys"],
             fixture["visible_indices"],
@@ -142,6 +142,21 @@ class OracleTests(unittest.TestCase):
         )
         self.assertEqual(selected, fixture["expected"])
 
+
+    def test_qsa_cutoff_tie_uses_lower_block_index(self) -> None:
+        fixture = FIXTURE["qsa_tie"]
+        selected = qsa_select_tokens_deterministic(
+            fixture["query_heads"],
+            fixture["raw_keys"],
+            fixture["visible_indices"],
+            compress_ratio=fixture["compress_ratio"],
+            token_budget=fixture["token_budget"],
+            key_norm_weight=fixture["key_norm_weight"],
+            block_rope_cos=fixture["block_rope_cos"],
+            block_rope_sin=fixture["block_rope_sin"],
+            eps=fixture["eps"],
+        )
+        self.assertEqual(selected, fixture["expected"])
 
     def test_moe_route_no_ties_fixture(self) -> None:
         fixture = FIXTURE["moe_route_no_ties"]

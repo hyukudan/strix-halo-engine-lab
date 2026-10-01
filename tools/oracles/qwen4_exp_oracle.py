@@ -169,7 +169,7 @@ def gated_residual(
     return mixed, injection
 
 
-def qsa_select_tokens_no_ties(
+def qsa_select_tokens_deterministic(
     query_heads: list[list[float]],
     raw_keys: list[list[float]],
     visible_indices: list[int],
@@ -181,14 +181,12 @@ def qsa_select_tokens_no_ties(
     block_rope_sin: list[list[float]],
     eps: float = 1e-6,
 ) -> list[int]:
-    """Reference QSA block pooling/scoring for a no-tie fixture.
+    """Deterministic QSA block pooling/scoring reference.
 
-    query_heads are the already-normalized/rotated query heads. raw_keys are the
-    cached unpooled key rows before block pooling. Each complete compressed block
-    is averaged, RMS-normalized, then RoPE is applied at that block's first-token
-    position before scoring. The function intentionally refuses a score tie that
-    could affect top-k membership because upstream tie semantics are not yet a
-    canonical contract.
+    The numerical path follows the pinned canonical forward. Upstream uses
+    torch.topk, whose tied indices are not stable; the engine resolves equal
+    scores by lower compressed-block index so serial and MTP replay share one
+    explicit contract.
     """
 
     if compress_ratio <= 0 or token_budget <= 0:
@@ -239,12 +237,10 @@ def qsa_select_tokens_no_ties(
             scores.append(score / math.sqrt(float(head_dim)))
 
         block_topk = min(token_budget // compress_ratio, complete)
-        ordered = sorted(range(complete), key=lambda index: -scores[index])
-        if block_topk < complete and block_topk > 0:
-            cutoff = scores[ordered[block_topk - 1]]
-            next_score = scores[ordered[block_topk]]
-            if cutoff == next_score:
-                raise ValueError("QSA top-k cutoff has unresolved score tie")
+        ordered = sorted(
+            range(complete),
+            key=lambda index: (-scores[index], index),
+        )
         for block_index in ordered[:block_topk]:
             selected.extend(blocks[block_index])
 
