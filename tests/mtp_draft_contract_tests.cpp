@@ -71,8 +71,9 @@ int main() {
 
     expect(contract.input_fusion_semantics_resolved &&
                contract.draft_state_semantics_resolved &&
-               !contract.attention_semantics_resolved,
-           "complete MTP attention remains gated despite no-tie QSA oracle");
+               contract.attention_semantics_resolved &&
+               !contract.forward_semantics_resolved,
+           "MTP attention is independently resolved while complete forward execution remains gated");
 
     auto overclaimed = contract;
     overclaimed.forward_semantics_resolved = true;
