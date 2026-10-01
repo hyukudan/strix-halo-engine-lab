@@ -579,8 +579,6 @@ int main() {
 
         expect(draft.calls == 0 &&
                    draft.reconcile_calls == 0 &&
-                   draft_state.phase ==
-                       strix::DraftProposalStatePhase::synchronized &&
                    result.proposed_tokens.empty() &&
                    result.target_cycle.plan.emitted_tokens ==
                        std::vector<std::uint32_t>({42}),
@@ -669,6 +667,44 @@ int main() {
                    draft_state.phase ==
                        strix::DraftProposalStatePhase::poisoned,
                "draft reconciliation failure poisons proposal state");
+    }
+
+    {
+        Fixture fixture;
+        FakeDraftBackend draft;
+        auto draft_state =
+            strix::make_draft_proposal_state(
+                0x5555ULL,
+                fixture.session);
+        strix::poison_draft_proposal_state(
+            draft_state);
+        FakeSpeculationBackend backend;
+        backend.target_tokens = {42};
+
+        strix::GreedyDraftExecutionRequest request;
+        request.max_candidate_depth = 0;
+        request.token_budget = 1;
+
+        const auto result =
+            strix::execute_greedy_speculation_with_draft(
+                fixture.model,
+                fixture.compiled,
+                fixture.resources,
+                fixture.session,
+                request,
+                allocator,
+                generations,
+                transfer,
+                draft_state,
+                draft,
+                backend);
+
+        expect(result.target_cycle.plan.emitted_tokens ==
+                   std::vector<std::uint32_t>({42}) &&
+                   draft.calls == 0 &&
+                   draft_state.phase ==
+                       strix::DraftProposalStatePhase::poisoned,
+               "depth-zero fallback remains available with poisoned drafter");
     }
 
     {

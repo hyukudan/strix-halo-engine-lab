@@ -424,12 +424,11 @@ execute_greedy_speculation_with_draft(
     GreedySpeculationExecutionBackend& target_backend) {
     GreedyDraftExecutionResult result;
 
-    validate_draft_proposal_state(
-        draft_state,
-        session);
-
     bool proposal_started = false;
     if (request.max_candidate_depth != 0) {
+        validate_draft_proposal_state(
+            draft_state,
+            session);
         begin_draft_proposal(
             draft_state,
             session);
