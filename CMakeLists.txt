@@ -47,6 +47,7 @@ add_library(strix_core STATIC
     src/model_contract.cpp
     src/model_content_hash.cpp
     src/mtp_draft_binding.cpp
+    src/mtp_draft_contract.cpp
     src/model_manifest.cpp
     src/model_runtime_binding.cpp
     src/model_tensor_index.cpp
@@ -331,6 +332,11 @@ if(BUILD_TESTING)
     target_link_libraries(strix-prompt-lookup-draft-tests PRIVATE strix_core)
     strix_target_warnings(strix-prompt-lookup-draft-tests)
     add_test(NAME strix-prompt-lookup-draft-tests COMMAND strix-prompt-lookup-draft-tests)
+
+    add_executable(strix-mtp-draft-contract-tests tests/mtp_draft_contract_tests.cpp)
+    target_link_libraries(strix-mtp-draft-contract-tests PRIVATE strix_core)
+    strix_target_warnings(strix-mtp-draft-contract-tests)
+    add_test(NAME strix-mtp-draft-contract-tests COMMAND strix-mtp-draft-contract-tests)
 
     add_executable(strix-mtp-draft-binding-tests tests/mtp_draft_binding_tests.cpp)
     target_link_libraries(strix-mtp-draft-binding-tests PRIVATE strix_core)
