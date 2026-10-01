@@ -14,6 +14,18 @@
 
 namespace strix {
 
+class GreedyDraftProposalBackend {
+public:
+    virtual ~GreedyDraftProposalBackend() = default;
+
+    // Proposal state is owned by the drafter. The target session is read-only
+    // here so proposal generation cannot mutate committed target state.
+    [[nodiscard]] virtual std::vector<std::uint32_t>
+    propose_candidates(
+        const SerialSessionContext& target_session,
+        std::uint32_t max_candidate_depth) = 0;
+};
+
 class GreedySpeculationExecutionBackend {
 public:
     virtual ~GreedySpeculationExecutionBackend() = default;
@@ -50,6 +62,18 @@ struct GreedySpeculationExecutionResult {
     bool restored_pre_window = false;
 };
 
+struct GreedyDraftExecutionRequest {
+    std::uint32_t max_candidate_depth = 0;
+    std::uint32_t token_budget = 1;
+    std::span<const std::uint32_t> eos_tokens;
+    std::uint64_t snapshot_alignment = 64;
+};
+
+struct GreedyDraftExecutionResult {
+    std::vector<std::uint32_t> proposed_tokens;
+    GreedySpeculationExecutionResult target_cycle;
+};
+
 [[nodiscard]] GreedySpeculationExecutionResult
 execute_greedy_speculation_cycle(
     const ModelContract& model,
@@ -61,5 +85,18 @@ execute_greedy_speculation_cycle(
     AllocationGenerationSource& allocation_generations,
     SessionSnapshotTransferBackend& snapshot_transfer,
     GreedySpeculationExecutionBackend& backend);
+
+[[nodiscard]] GreedyDraftExecutionResult
+execute_greedy_speculation_with_draft(
+    const ModelContract& model,
+    const CompiledSerialExecution& compiled,
+    const ExecutionRuntimeResources& resources,
+    SerialSessionContext& session,
+    const GreedyDraftExecutionRequest& request,
+    RuntimeMemoryAllocator& snapshot_allocator,
+    AllocationGenerationSource& allocation_generations,
+    SessionSnapshotTransferBackend& snapshot_transfer,
+    GreedyDraftProposalBackend& draft_backend,
+    GreedySpeculationExecutionBackend& target_backend);
 
 }  // namespace strix

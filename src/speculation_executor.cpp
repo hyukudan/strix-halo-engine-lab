@@ -409,4 +409,55 @@ execute_greedy_speculation_cycle(
     return result;
 }
 
+GreedyDraftExecutionResult
+execute_greedy_speculation_with_draft(
+    const ModelContract& model,
+    const CompiledSerialExecution& compiled,
+    const ExecutionRuntimeResources& resources,
+    SerialSessionContext& session,
+    const GreedyDraftExecutionRequest& request,
+    RuntimeMemoryAllocator& snapshot_allocator,
+    AllocationGenerationSource& allocation_generations,
+    SessionSnapshotTransferBackend& snapshot_transfer,
+    GreedyDraftProposalBackend& draft_backend,
+    GreedySpeculationExecutionBackend& target_backend) {
+    GreedyDraftExecutionResult result;
+
+    if (request.max_candidate_depth != 0) {
+        result.proposed_tokens =
+            draft_backend.propose_candidates(
+                session,
+                request.max_candidate_depth);
+        if (result.proposed_tokens.size() >
+            static_cast<std::size_t>(
+                request.max_candidate_depth)) {
+            throw std::invalid_argument(
+                "draft backend returned more candidates than requested");
+        }
+    }
+
+    GreedySpeculationExecutionRequest target_request;
+    target_request.candidate_tokens =
+        result.proposed_tokens;
+    target_request.token_budget =
+        request.token_budget;
+    target_request.eos_tokens =
+        request.eos_tokens;
+    target_request.snapshot_alignment =
+        request.snapshot_alignment;
+
+    result.target_cycle =
+        execute_greedy_speculation_cycle(
+            model,
+            compiled,
+            resources,
+            session,
+            target_request,
+            snapshot_allocator,
+            allocation_generations,
+            snapshot_transfer,
+            target_backend);
+    return result;
+}
+
 }  // namespace strix

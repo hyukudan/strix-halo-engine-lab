@@ -101,6 +101,23 @@ public:
     }
 };
 
+class FakeDraftBackend final
+    : public strix::GreedyDraftProposalBackend {
+public:
+    std::vector<std::uint32_t> proposed_tokens;
+    int calls = 0;
+    std::uint32_t seen_max_depth = 0;
+
+    std::vector<std::uint32_t>
+    propose_candidates(
+        const strix::SerialSessionContext&,
+        std::uint32_t max_candidate_depth) override {
+        ++calls;
+        seen_max_depth = max_candidate_depth;
+        return proposed_tokens;
+    }
+};
+
 class FakeSpeculationBackend final
     : public strix::GreedySpeculationExecutionBackend {
 public:
@@ -460,6 +477,111 @@ int main() {
                    fixture.session.health ==
                        strix::SerialSessionHealth::ready,
                "replay failure rolls session back to pre-window snapshot");
+    }
+
+    {
+        Fixture fixture;
+        FakeDraftBackend draft;
+        draft.proposed_tokens = {10, 99};
+        FakeSpeculationBackend backend;
+        backend.target_tokens = {10, 20, 30};
+
+        strix::GreedyDraftExecutionRequest request;
+        request.max_candidate_depth = 2;
+        request.token_budget = 3;
+
+        const auto result =
+            strix::execute_greedy_speculation_with_draft(
+                fixture.model,
+                fixture.compiled,
+                fixture.resources,
+                fixture.session,
+                request,
+                allocator,
+                generations,
+                transfer,
+                draft,
+                backend);
+
+        expect(draft.calls == 1 &&
+                   draft.seen_max_depth == 2 &&
+                   result.proposed_tokens ==
+                       std::vector<std::uint32_t>({10, 99}),
+               "draft wrapper obtains bounded candidate tokens before target verification");
+        expect(result.target_cycle.plan.emitted_tokens ==
+                   std::vector<std::uint32_t>({10, 20}) &&
+                   result.target_cycle.replayed_tokens == 1 &&
+                   fixture.session.next_position == 11,
+               "draft wrapper preserves target-owned greedy acceptance and replay");
+    }
+
+    {
+        Fixture fixture;
+        FakeDraftBackend draft;
+        draft.proposed_tokens = {1, 2};
+        FakeSpeculationBackend backend;
+        backend.target_tokens = {42};
+
+        strix::GreedyDraftExecutionRequest request;
+        request.max_candidate_depth = 0;
+        request.token_budget = 1;
+
+        const auto result =
+            strix::execute_greedy_speculation_with_draft(
+                fixture.model,
+                fixture.compiled,
+                fixture.resources,
+                fixture.session,
+                request,
+                allocator,
+                generations,
+                transfer,
+                draft,
+                backend);
+
+        expect(draft.calls == 0 &&
+                   result.proposed_tokens.empty() &&
+                   result.target_cycle.plan.emitted_tokens ==
+                       std::vector<std::uint32_t>({42}),
+               "depth-zero wrapper bypasses drafter and uses target baseline");
+        expect(fixture.session.next_position == 10 &&
+                   fixture.session.committed_tokens == 10,
+               "depth-zero draft wrapper leaves target state unchanged");
+    }
+
+    {
+        Fixture fixture;
+        FakeDraftBackend draft;
+        draft.proposed_tokens = {1, 2, 3};
+        FakeSpeculationBackend backend;
+        backend.target_tokens = {1, 2, 3};
+
+        strix::GreedyDraftExecutionRequest request;
+        request.max_candidate_depth = 2;
+        request.token_budget = 3;
+
+        bool rejected = false;
+        try {
+            static_cast<void>(
+                strix::execute_greedy_speculation_with_draft(
+                    fixture.model,
+                    fixture.compiled,
+                    fixture.resources,
+                    fixture.session,
+                    request,
+                    allocator,
+                    generations,
+                    transfer,
+                    draft,
+                    backend));
+        } catch (const std::invalid_argument&) {
+            rejected = true;
+        }
+        expect(rejected &&
+                   backend.verify_calls == 0 &&
+                   fixture.session.next_position == 10 &&
+                   fixture.session.committed_tokens == 10,
+               "over-depth draft result fails before target verification");
     }
 
     if (failures == 0) {
