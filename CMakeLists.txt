@@ -52,6 +52,7 @@ add_library(strix_core STATIC
     src/mtp_draft_state_contract.cpp
     src/mtp_input_fusion.cpp
     src/mtp_attention_contract.cpp
+    src/qsa_selection_plan.cpp
     src/model_manifest.cpp
     src/model_runtime_binding.cpp
     src/model_tensor_index.cpp
@@ -345,6 +346,11 @@ if(BUILD_TESTING)
     target_link_libraries(strix-prompt-lookup-draft-tests PRIVATE strix_core)
     strix_target_warnings(strix-prompt-lookup-draft-tests)
     add_test(NAME strix-prompt-lookup-draft-tests COMMAND strix-prompt-lookup-draft-tests)
+
+    add_executable(strix-qsa-selection-plan-tests tests/qsa_selection_plan_tests.cpp)
+    target_link_libraries(strix-qsa-selection-plan-tests PRIVATE strix_core)
+    strix_target_warnings(strix-qsa-selection-plan-tests)
+    add_test(NAME strix-qsa-selection-plan-tests COMMAND strix-qsa-selection-plan-tests)
 
     add_executable(strix-mtp-attention-contract-tests tests/mtp_attention_contract_tests.cpp)
     target_link_libraries(strix-mtp-attention-contract-tests PRIVATE strix_core)

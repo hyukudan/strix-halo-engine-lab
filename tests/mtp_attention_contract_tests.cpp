@@ -33,8 +33,14 @@ int main() {
                contract.indexer_kv_heads == 1 &&
                contract.indexer_head_dim == 128 &&
                contract.indexer_budget == 2048 &&
-               contract.indexer_compress_ratio == 4,
-           "MTP attention structural contract includes its own QSA indexer geometry");
+               contract.indexer_compress_ratio == 4 &&
+               contract.compressed_block_topk == 512,
+           "MTP attention structural contract includes its own QSA indexer geometry and compressed top-k width");
+    expect(contract.indexer_uses_attention_rope &&
+               contract.indexer_qk_rmsnorm_required &&
+               contract.compressed_keys_use_average_pool,
+           "MTP QSA planning pins shared RoPE, Q/K RMSNorm and average-pooled compressed keys");
+
     expect(contract.kv_row_bytes == 2048 &&
                contract.raw_index_row_bytes == 256,
            "MTP attention state accounts KV and raw index rows per token");

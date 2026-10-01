@@ -19,6 +19,11 @@ struct MtpAttentionStructuralContract {
     std::uint64_t indexer_head_dim = 0;
     std::uint64_t indexer_budget = 0;
     std::uint64_t indexer_compress_ratio = 0;
+    std::uint64_t compressed_block_topk = 0;
+
+    bool indexer_uses_attention_rope = false;
+    bool indexer_qk_rmsnorm_required = false;
+    bool compressed_keys_use_average_pool = false;
 
     std::uint64_t kv_row_bytes = 0;
     std::uint64_t raw_index_row_bytes = 0;

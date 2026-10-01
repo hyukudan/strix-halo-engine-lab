@@ -51,6 +51,18 @@ build_mtp_attention_structural_contract(
         model.indexer_budget;
     contract.indexer_compress_ratio =
         model.indexer_compress_ratio;
+    if (contract.indexer_budget %
+        contract.indexer_compress_ratio != 0) {
+        throw std::invalid_argument(
+            "MTP QSA budget must divide compression ratio exactly");
+    }
+    contract.compressed_block_topk =
+        contract.indexer_budget /
+        contract.indexer_compress_ratio;
+
+    contract.indexer_uses_attention_rope = true;
+    contract.indexer_qk_rmsnorm_required = true;
+    contract.compressed_keys_use_average_pool = true;
 
     contract.kv_row_bytes =
         checked_mul(
@@ -100,6 +112,11 @@ void validate_mtp_attention_structural_contract(
             expected.indexer_budget ||
         contract.indexer_compress_ratio !=
             expected.indexer_compress_ratio ||
+        contract.compressed_block_topk !=
+            expected.compressed_block_topk ||
+        !contract.indexer_uses_attention_rope ||
+        !contract.indexer_qk_rmsnorm_required ||
+        !contract.compressed_keys_use_average_pool ||
         contract.kv_row_bytes !=
             expected.kv_row_bytes ||
         contract.raw_index_row_bytes !=
