@@ -3,7 +3,9 @@
 #include "strix/model_content_hash.hpp"
 
 #include <charconv>
+#include <cerrno>
 #include <cmath>
+#include <cstdlib>
 #include <fstream>
 #include <limits>
 #include <set>
@@ -11,6 +13,8 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 namespace strix {
 namespace {
