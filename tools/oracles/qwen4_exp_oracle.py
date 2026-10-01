@@ -177,14 +177,18 @@ def qsa_select_tokens_no_ties(
     compress_ratio: int,
     token_budget: int,
     key_norm_weight: list[float],
+    block_rope_cos: list[list[float]],
+    block_rope_sin: list[list[float]],
     eps: float = 1e-6,
 ) -> list[int]:
     """Reference QSA block pooling/scoring for a no-tie fixture.
 
     query_heads are the already-normalized/rotated query heads. raw_keys are the
-    cached unpooled key rows before block pooling. The function intentionally
-    refuses a score tie that could affect top-k membership because upstream tie
-    semantics are not yet a canonical contract.
+    cached unpooled key rows before block pooling. Each complete compressed block
+    is averaged, RMS-normalized, then RoPE is applied at that block's first-token
+    position before scoring. The function intentionally refuses a score tie that
+    could affect top-k membership because upstream tie semantics are not yet a
+    canonical contract.
     """
 
     if compress_ratio <= 0 or token_budget <= 0:
@@ -204,6 +208,9 @@ def qsa_select_tokens_no_ties(
         raise ValueError("visible key index is out of range")
 
     complete = len(visible_indices) // compress_ratio
+    if len(block_rope_cos) != complete or len(block_rope_sin) != complete:
+        raise ValueError("QSA block RoPE rows must match complete compressed blocks")
+
     selected: list[int] = []
     if complete:
         blocks = [
@@ -220,6 +227,11 @@ def qsa_select_tokens_no_ties(
                 for feature in range(head_dim)
             ]
             pooled = rms_norm(pooled, key_norm_weight, eps=eps)
+            pooled = apply_partial_rope(
+                pooled,
+                block_rope_cos[len(scores)],
+                block_rope_sin[len(scores)],
+            )
             score = 0.0
             for query in query_heads:
                 dot = sum(float(q) * float(k) for q, k in zip(query, pooled))

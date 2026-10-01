@@ -136,6 +136,8 @@ class OracleTests(unittest.TestCase):
             compress_ratio=fixture["compress_ratio"],
             token_budget=fixture["token_budget"],
             key_norm_weight=fixture["key_norm_weight"],
+            block_rope_cos=fixture["block_rope_cos"],
+            block_rope_sin=fixture["block_rope_sin"],
             eps=fixture["eps"],
         )
         self.assertEqual(selected, fixture["expected"])
