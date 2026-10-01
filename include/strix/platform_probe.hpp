@@ -39,7 +39,7 @@ struct Usb4Topology {
 };
 
 struct PlatformInfo {
-    bool linux = false;
+    bool is_linux = false;
     std::string kernel_release;
     std::uint64_t mem_total_bytes = 0;
     std::optional<std::string> rocm_version;
