@@ -114,6 +114,10 @@ bool can_transition(BufferOwnership from, BufferOwnership to) noexcept {
     case BufferOwnership::consumer_acquired:
         return to == BufferOwnership::consumer_owned;
     case BufferOwnership::consumer_owned:
+        return to == BufferOwnership::consumer_released;
+    case BufferOwnership::consumer_released:
+        return to == BufferOwnership::repost_pending;
+    case BufferOwnership::repost_pending:
         return to == BufferOwnership::reusable;
     case BufferOwnership::reusable:
         return to == BufferOwnership::producer_owned;
@@ -137,6 +141,57 @@ bool validate_descriptor(const TransferDescriptor& descriptor,
         return false;
     }
     return true;
+}
+
+
+bool validate_gpu_commit_record(
+    const GpuCommitRecord& record,
+    const TransferDescriptor& descriptor) noexcept {
+    if (record.protocol_version !=
+            descriptor.protocol_version ||
+        record.commit_word !=
+            gpu_commit_word ||
+        record.connection_epoch !=
+            descriptor.connection_epoch ||
+        record.sequence !=
+            descriptor.sequence ||
+        record.payload_bytes == 0 ||
+        static_cast<std::uint64_t>(
+            record.payload_bytes) >
+            descriptor.byte_length ||
+        record.stripe_count == 0 ||
+        record.stripe_index >=
+            record.stripe_count) {
+        return false;
+    }
+    return true;
+}
+
+bool direct_link_armable(
+    const DirectLinkLifecycle& link) noexcept {
+    return link.state ==
+               DirectLinkLifecycleState::arm_allowed &&
+           link.connection_epoch != 0 &&
+           link.control_link_ready &&
+           link.peer_reconciled &&
+           link.exclusive_lease_available;
+}
+
+bool direct_link_usable(
+    const DirectLinkLifecycle& link) noexcept {
+    return (link.state ==
+                DirectLinkLifecycleState::direct_ready ||
+            link.state ==
+                DirectLinkLifecycleState::leased) &&
+           link.connection_epoch != 0 &&
+           link.control_link_ready &&
+           link.peer_reconciled &&
+           link.receive_ring_primed &&
+           link.completion_rearm_qualified &&
+           (!link.dma_buf_import_supported ||
+            link.exclusive_lease_available ||
+            link.state ==
+                DirectLinkLifecycleState::leased);
 }
 
 double estimate_single_link_seconds(const LinkProfile& link,
