@@ -316,6 +316,8 @@ Add:
 - cost accounting for proposal, verification, commit/replay and exposed communication;
 - bounded exploration and hysteresis;
 - optional cheaper proposal paths that never alter target verification semantics.
+- independent forward-replay qualification for any MTP plan before it can become executable;
+- qualification evidence MUST match proposal/plan identity and compare multi-step tokens plus hidden/logit error against a declared policy;
 
 Exit gate:
 
