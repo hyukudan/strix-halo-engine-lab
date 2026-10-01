@@ -383,7 +383,9 @@ Additional A1.6 runtime work now implemented:
 - MTP draft state cannot cross checkpoint-content identity;
 - deterministic bounded prompt-lookup drafter using the most recent non-overlapping suffix n-gram match;
 - prompt-lookup history has an explicit token-capacity bound and proposal identity;
-- draft wrapper preflights target runtime/session before proposal and clamps effective proposal depth by remaining context and `token_budget - 1`.
+- draft wrapper preflights target runtime/session before proposal and clamps effective proposal depth by remaining context and `token_budget - 1`;
+- speculation controller keys qualified measurements by `(proposal_identity, depth)`, so distinct drafters can compete at the same verify depth;
+- hysteresis can preserve or switch a concrete proposal strategy as well as a depth while the depth-zero serial baseline remains proposal-free.
 
 Sampled speculative mathematics is source-identified (acceptance ratio and
 residual fallback), but sampled execution remains disabled until RNG stream

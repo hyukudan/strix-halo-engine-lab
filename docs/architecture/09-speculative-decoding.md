@@ -48,6 +48,11 @@ Controller state SHOULD be conditioned on factors that materially change cost or
 
 The controller SHOULD use bounded exploration and hysteresis so noisy measurements do not cause rapid oscillation between depths.
 
+When multiple proposal mechanisms are available, measurements are identified by
+the pair `(proposal_identity, depth)`. Different drafters MAY therefore compete
+at the same verify depth, and hysteresis applies to the concrete drafter/depth
+choice. Depth zero remains the unique proposal-free serial target baseline.
+
 ## Greedy mode
 
 Greedy speculative decoding SHOULD be qualified first because it provides the simplest exact-replay contract.
