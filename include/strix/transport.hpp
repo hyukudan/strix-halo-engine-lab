@@ -155,6 +155,41 @@ static_assert(sizeof(GpuCommitRecord) == 32);
     const GpuCommitRecord& record,
     const TransferDescriptor& descriptor) noexcept;
 
+class StripedMessageTracker {
+public:
+    explicit StripedMessageTracker(
+        TransferDescriptor descriptor,
+        std::uint16_t stripe_count);
+
+    [[nodiscard]] bool observe_commit(
+        const GpuCommitRecord& record);
+
+    [[nodiscard]] bool complete() const noexcept {
+        return complete_;
+    }
+
+    [[nodiscard]] bool invalid() const noexcept {
+        return invalid_;
+    }
+
+    [[nodiscard]] std::uint64_t committed_bytes() const noexcept {
+        return committed_bytes_;
+    }
+
+    [[nodiscard]] std::uint16_t observed_stripes() const noexcept {
+        return observed_stripes_;
+    }
+
+private:
+    TransferDescriptor descriptor_;
+    std::uint16_t stripe_count_ = 0;
+    std::uint16_t observed_stripes_ = 0;
+    std::uint64_t committed_bytes_ = 0;
+    bool complete_ = false;
+    bool invalid_ = false;
+    std::vector<std::uint32_t> stripe_bytes_;
+};
+
 enum class DirectLinkLifecycleState {
     portable_only,
     arm_allowed,
