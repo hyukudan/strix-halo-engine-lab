@@ -371,13 +371,16 @@ Additional A1.6 runtime work now implemented:
 - snapshot restore can recover a poisoned serial session and republishes only after all state ranges restore successfully;
 - compiled greedy backend binds serial and verify executions to the same model content and persistent target-state allocation;
 - direct launch dispatch rejects foreign execution identities;
-- draft candidates and collected target tokens are rejected when outside the compiled/model vocabulary before they can become visible output.
+- draft candidates and collected target tokens are rejected when outside the compiled/model vocabulary before they can become visible output;
+- bounded draft-proposal backend seam with target-session read-only access;
+- depth-zero execution bypasses the drafter and compiled verify DAG entirely;
+- over-depth draft results fail before target verification or target-state mutation.
 
 Sampled speculative mathematics is source-identified (acceptance ratio and
 residual fallback), but sampled execution remains disabled until RNG stream
-identity and rejected-draft consumption are fixed. Draft proposal-state
-generation is not yet integrated; candidate tokens are currently supplied to
-the greedy cycle by its caller.
+identity and rejected-draft consumption are fixed. The draft proposal seam is integrated, but concrete proposal-state
+storage, checkpoint binding, MTP/prompt-lookup implementations and proposal
+qualification remain open.
 
 
 ## Slice A1.5b — compiled eager serial runtime
