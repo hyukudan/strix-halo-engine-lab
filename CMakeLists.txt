@@ -470,7 +470,25 @@ endif()
 
 if(STRIX_ENABLE_HIP_RUNTIME)
     enable_language(HIP)
-    find_package(hip REQUIRED CONFIG)
+
+    # CMake's HIP language drives device compilation directly. ROCm 7.x
+    # development images do not necessarily ship the legacy hipConfig.cmake /
+    # hip::host package target, so locate the runtime header/library from the
+    # toolkit instead of requiring that package surface.
+    find_path(
+        STRIX_HIP_INCLUDE_DIR
+        NAMES hip/hip_runtime.h
+        HINTS "$ENV{ROCM_PATH}" /opt/rocm
+        PATH_SUFFIXES include
+        REQUIRED
+    )
+    find_library(
+        STRIX_HIP_RUNTIME_LIBRARY
+        NAMES amdhip64
+        HINTS "$ENV{ROCM_PATH}" /opt/rocm
+        PATH_SUFFIXES lib lib64
+        REQUIRED
+    )
 
     add_library(strix_hip_runtime STATIC
         src/hip_runtime_allocator.cpp
@@ -487,8 +505,18 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         src/hip_lm_head_launcher.hip
         src/hip_shared_expert_launcher.hip
     )
-    target_include_directories(strix_hip_runtime PUBLIC include)
+    target_include_directories(
+        strix_hip_runtime
+        PUBLIC
+        include
+        "${STRIX_HIP_INCLUDE_DIR}"
+    )
     target_compile_features(strix_hip_runtime PUBLIC cxx_std_20)
+    target_compile_definitions(
+        strix_hip_runtime
+        PUBLIC
+        $<$<COMPILE_LANGUAGE:CXX>:__HIP_PLATFORM_AMD__=1>
+    )
     set_target_properties(
         strix_hip_runtime
         PROPERTIES
@@ -496,7 +524,12 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         HIP_STANDARD_REQUIRED ON
         HIP_ARCHITECTURES gfx1151
     )
-    target_link_libraries(strix_hip_runtime PUBLIC strix_core hip::host)
+    target_link_libraries(
+        strix_hip_runtime
+        PUBLIC
+        strix_core
+        "${STRIX_HIP_RUNTIME_LIBRARY}"
+    )
     strix_target_warnings(strix_hip_runtime)
 
     add_executable(
