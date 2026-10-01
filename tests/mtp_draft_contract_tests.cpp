@@ -51,8 +51,12 @@ int main() {
     expect(contract.provisional_kv_bytes_per_token ==
                2048,
            "MTP contract reproduces provisional 2 KiB per-token KV planning estimate");
-    expect(!contract.forward_semantics_resolved,
-           "MTP structural contract does not claim unresolved forward semantics");
+    expect(contract.input_fusion_semantics_resolved &&
+               !contract.attention_semantics_resolved &&
+               !contract.draft_state_semantics_resolved &&
+               !contract.output_semantics_resolved &&
+               !contract.forward_semantics_resolved,
+           "MTP contract resolves only independently-oracled input fusion");
     expect(contract.proposal_identity ==
                mtp_binding.compatibility_identity &&
                contract.contract_identity != 0,

@@ -69,6 +69,26 @@ std::uint64_t build_identity(
         contract.provisional_kv_bytes_per_token);
     hash_u64(
         hash,
+        contract.input_fusion_semantics_resolved
+            ? 1ULL
+            : 0ULL);
+    hash_u64(
+        hash,
+        contract.attention_semantics_resolved
+            ? 1ULL
+            : 0ULL);
+    hash_u64(
+        hash,
+        contract.draft_state_semantics_resolved
+            ? 1ULL
+            : 0ULL);
+    hash_u64(
+        hash,
+        contract.output_semantics_resolved
+            ? 1ULL
+            : 0ULL);
+    hash_u64(
+        hash,
         contract.forward_semantics_resolved
             ? 1ULL
             : 0ULL);
@@ -138,6 +158,10 @@ build_mtp_draft_structural_contract(
             kv_elements,
             model.bytes_bf16);
 
+    contract.input_fusion_semantics_resolved = true;
+    contract.attention_semantics_resolved = false;
+    contract.draft_state_semantics_resolved = false;
+    contract.output_semantics_resolved = false;
     contract.forward_semantics_resolved = false;
     contract.contract_identity =
         build_identity(contract);
@@ -181,6 +205,10 @@ void validate_mtp_draft_structural_contract(
             expected.hidden_state_source_layer_explicit ||
         contract.provisional_kv_bytes_per_token !=
             expected.provisional_kv_bytes_per_token ||
+        !contract.input_fusion_semantics_resolved ||
+        contract.attention_semantics_resolved ||
+        contract.draft_state_semantics_resolved ||
+        contract.output_semantics_resolved ||
         contract.forward_semantics_resolved ||
         contract.contract_identity !=
             expected.contract_identity) {

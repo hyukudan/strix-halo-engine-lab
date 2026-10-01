@@ -28,8 +28,13 @@ struct MtpDraftStructuralContract {
     // This is not a claim about the unresolved predictor forward semantics.
     std::uint64_t provisional_kv_bytes_per_token = 0;
 
-    // MUST remain false until an independent canonical MTP forward/replay
-    // contract is fixed and tested.
+    // Input fusion has an independent host-side oracle. The complete forward
+    // remains blocked until attention/QSA, block-state propagation and output
+    // semantics are independently fixed and tested.
+    bool input_fusion_semantics_resolved = true;
+    bool attention_semantics_resolved = false;
+    bool draft_state_semantics_resolved = false;
+    bool output_semantics_resolved = false;
     bool forward_semantics_resolved = false;
 
     std::uint64_t contract_identity = 0;

@@ -121,7 +121,12 @@ does not imply semantic or hardware qualification.
 The pinned official configuration fixes a structural MTP envelope: one
 full-attention predictor layer, shared token embeddings, no explicit
 hidden-state source layer and the base attention geometry. This is represented
-separately from forward semantics. The structural contract remains marked
+separately from forward semantics. The semantic contract is split into independent gates. Input fusion is now
+resolved by an independent host oracle: normalize embedding and wide hidden,
+project the embedding once, reshape the wide hidden into `hc_count` independent
+streams, apply the shared hidden projection to each stream and add the projected
+embedding to every stream. Attention/QSA, draft-state propagation and output
+semantics remain unresolved. The complete contract therefore remains
 `forward_semantics_resolved=false`, and executable MTP plan construction MUST
 fail while that flag is false. A manifest-only audit may classify combiner,
 hyper-connection, attention and MoE tensor families without claiming that those
