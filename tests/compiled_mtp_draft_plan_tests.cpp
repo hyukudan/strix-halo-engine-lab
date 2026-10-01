@@ -50,6 +50,7 @@ struct Fixture {
         add("mtp.layers.0.self_attn.q_proj.weight");
         add("mtp.layers.0.self_attn.indexer.index_qk_proj.weight");
         add("mtp.layers.0.mlp.experts.gate_up_proj.weight");
+        add("mtp.model.shared_head.head.weight");
         manifest.layout_identity =
             strix::model_manifest_layout_identity(
                 manifest);
@@ -98,8 +99,9 @@ int main() {
                plan.readiness.input_fusion_semantics_resolved &&
                plan.readiness.draft_state_semantics_resolved &&
                plan.readiness.output_mixer_semantics_resolved &&
-               !plan.readiness.output_head_binding_resolved,
-           "compiled MTP plan resolves output mixer but remains blocked on head binding and QSA");
+               plan.readiness.output_head_binding_resolved &&
+               plan.readiness.output_semantics_resolved,
+           "compiled MTP plan resolves sidecar output head while remaining blocked on QSA/global forward");
 
     bool blocked = false;
     try {

@@ -68,6 +68,12 @@ bool classify(
             MtpTensorFamily::attention;
         return true;
     }
+    if (contains(name, "shared_head") ||
+        contains(name, "lm_head")) {
+        result =
+            MtpTensorFamily::output_head;
+        return true;
+    }
     if (contains(name, "expert") ||
         contains(name, "router") ||
         contains(name, "ffn") ||
@@ -106,6 +112,7 @@ audit_mtp_draft_tensor_families(
         {MtpTensorFamily::attention, true, {}},
         {MtpTensorFamily::indexer, true, {}},
         {MtpTensorFamily::moe, true, {}},
+        {MtpTensorFamily::output_head, false, {}},
     };
 
     for (std::uint32_t index = 0;
@@ -242,6 +249,8 @@ to_string(MtpTensorFamily family) noexcept {
         return "indexer";
     case MtpTensorFamily::moe:
         return "moe";
+    case MtpTensorFamily::output_head:
+        return "output_head";
     }
     return "unknown";
 }

@@ -51,6 +51,7 @@ struct Fixture {
         add("mtp.layers.0.self_attn.q_proj.weight");
         add("mtp.layers.0.self_attn.indexer.index_qk_proj.weight");
         add("mtp.layers.0.mlp.experts.gate_up_proj.weight");
+        add("mtp.model.shared_head.head.weight");
         add("mtp.unresolved.extra.weight");
         manifest.layout_identity =
             strix::model_manifest_layout_identity(
@@ -89,9 +90,9 @@ int main() {
         expect(audit.structurally_complete(),
                "MTP audit recognizes all required structural tensor families");
         expect(audit.unclassified_mtp_tensors ==
-                   std::vector<std::uint32_t>({8}),
+                   std::vector<std::uint32_t>({9}),
                "MTP audit preserves unresolved tensors instead of guessing their role");
-        expect(audit.families.size() == 7,
+        expect(audit.families.size() == 8,
                "MTP audit emits every required structural family");
     }
 

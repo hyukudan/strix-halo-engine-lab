@@ -33,12 +33,50 @@ int main() {
            "MTP output requires non-injecting gated residual head mix followed by LM head");
     expect(contract.mixer_semantics_resolved &&
                !contract.head_binding_resolved &&
-               !contract.output_semantics_resolved,
+               !contract.output_semantics_resolved &&
+               contract.lm_head_source ==
+                   strix::MtpLmHeadSource::unresolved,
            "MTP output separates resolved mixer formula from unresolved checkpoint head binding");
 
     strix::validate_mtp_output_structural_contract(
         model,
         contract);
+
+    strix::ModelManifest manifest;
+    manifest.architecture = "fixture";
+    strix::ManifestTensor head;
+    head.name = "mtp.model.shared_head.head.weight";
+    head.dimensions = {2560, 248320};
+    head.ggml_type = 1;
+    head.byte_size = 4096;
+    head.absolute_offset = 4096;
+    head.role = strix::TensorRole::mtp;
+    manifest.total_tensor_bytes =
+        head.byte_size;
+    manifest.tensors.push_back(head);
+    manifest.layout_identity =
+        strix::model_manifest_layout_identity(
+            manifest);
+
+    strix::MtpDraftTensorAudit audit;
+    audit.manifest_layout_identity =
+        manifest.layout_identity;
+    audit.families = {
+        {strix::MtpTensorFamily::output_head, false, {0}},
+    };
+
+    const auto bound =
+        strix::bind_mtp_output_head(
+            model,
+            manifest,
+            audit);
+    expect(bound.head_binding_resolved &&
+               bound.output_semantics_resolved &&
+               bound.lm_head_source ==
+                   strix::MtpLmHeadSource::
+                       mtp_sidecar_shared_head &&
+               bound.lm_head_tensor_index == 0,
+           "explicit MTP shared head resolves output binding without target fallback");
 
     auto overclaimed = contract;
     overclaimed.head_binding_resolved = true;

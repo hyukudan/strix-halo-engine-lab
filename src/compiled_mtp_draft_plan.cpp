@@ -138,13 +138,15 @@ compile_mtp_draft_plan(
     plan.state =
         build_mtp_draft_state_contract(
             model);
-    plan.output =
-        build_mtp_output_structural_contract(
-            model);
     plan.tensor_audit =
         audit_mtp_draft_tensor_families(
             manifest,
             binding);
+    plan.output =
+        bind_mtp_output_head(
+            model,
+            manifest,
+            plan.tensor_audit);
 
     plan.steps = {
         MtpDraftPlanStep::input_fusion,

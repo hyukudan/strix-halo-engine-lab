@@ -17,6 +17,7 @@ enum class MtpTensorFamily {
     attention,
     indexer,
     moe,
+    output_head,
 };
 
 struct MtpTensorFamilyAudit {

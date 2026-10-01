@@ -76,4 +76,52 @@ void validate_mtp_output_structural_contract(
     }
 }
 
+MtpOutputStructuralContract
+bind_mtp_output_head(
+    const ModelContract& model,
+    const ModelManifest& manifest,
+    const MtpDraftTensorAudit& audit) {
+    auto contract =
+        build_mtp_output_structural_contract(
+            model);
+
+    if (audit.manifest_layout_identity !=
+            manifest.layout_identity) {
+        throw std::invalid_argument(
+            "MTP output head audit/manifest identity mismatch");
+    }
+
+    for (const auto& family :
+         audit.families) {
+        if (family.family !=
+            MtpTensorFamily::output_head) {
+            continue;
+        }
+        if (family.tensor_indices.size() > 1) {
+            throw std::invalid_argument(
+                "MTP sidecar contains ambiguous output-head tensors");
+        }
+        if (family.tensor_indices.size() == 1) {
+            const auto index =
+                family.tensor_indices.front();
+            if (index >=
+                manifest.tensors.size()) {
+                throw std::invalid_argument(
+                    "MTP output-head tensor index exceeds manifest");
+            }
+            contract.lm_head_source =
+                MtpLmHeadSource::
+                    mtp_sidecar_shared_head;
+            contract.lm_head_tensor_index =
+                index;
+            contract.head_binding_resolved =
+                true;
+            contract.output_semantics_resolved =
+                contract.mixer_semantics_resolved;
+        }
+    }
+
+    return contract;
+}
+
 }  // namespace strix
