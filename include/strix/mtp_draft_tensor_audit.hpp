@@ -22,7 +22,7 @@ enum class MtpTensorFamily {
 
 struct MtpTensorFamilyAudit {
     MtpTensorFamily family =
-        MtpTensorFamily::embedding_combiner;
+        MtpTensorFamily::input_combiner;
     bool required = true;
     std::vector<std::uint32_t> tensor_indices;
 };
