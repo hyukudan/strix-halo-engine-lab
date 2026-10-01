@@ -103,6 +103,61 @@ int main() {
     expect(!validate_gpu_commit_record(bad_stripe, good),
            "GPU commit record rejects invalid stripe index");
 
+
+    TransferDescriptor striped_descriptor = good;
+    striped_descriptor.byte_length = 600;
+
+    StripedMessageTracker tracker(
+        striped_descriptor,
+        2);
+
+    GpuCommitRecord stripe0;
+    stripe0.protocol_version =
+        striped_descriptor.protocol_version;
+    stripe0.commit_word = gpu_commit_word;
+    stripe0.connection_epoch =
+        striped_descriptor.connection_epoch;
+    stripe0.sequence =
+        striped_descriptor.sequence;
+    stripe0.payload_bytes = 256;
+    stripe0.stripe_index = 0;
+    stripe0.stripe_count = 2;
+
+    GpuCommitRecord stripe1 = stripe0;
+    stripe1.payload_bytes = 344;
+    stripe1.stripe_index = 1;
+
+    expect(tracker.observe_commit(stripe0) &&
+               !tracker.complete() &&
+               tracker.committed_bytes() == 256,
+           "striped tracker keeps partial logical message unpublished");
+    expect(tracker.observe_commit(stripe1) &&
+               tracker.complete() &&
+               !tracker.invalid() &&
+               tracker.committed_bytes() == 600,
+           "striped tracker publishes only complete logical message");
+
+    StripedMessageTracker duplicate_tracker(
+        striped_descriptor,
+        2);
+    expect(duplicate_tracker.observe_commit(stripe0),
+           "first stripe is accepted");
+    expect(!duplicate_tracker.observe_commit(stripe0) &&
+               duplicate_tracker.invalid(),
+           "duplicate stripe invalidates logical message");
+
+    StripedMessageTracker short_tracker(
+        striped_descriptor,
+        2);
+    auto short1 = stripe1;
+    short1.payload_bytes = 300;
+    expect(short_tracker.observe_commit(stripe0),
+           "short fixture first stripe accepted");
+    expect(!short_tracker.observe_commit(short1) &&
+               short_tracker.invalid() &&
+               !short_tracker.complete(),
+           "stripe byte sum mismatch never publishes partial tensor");
+
     DirectLinkLifecycle lifecycle;
     lifecycle.physical_link_id = "usb4-a";
     lifecycle.state =
