@@ -50,7 +50,12 @@ de planificación, no una promesa de implementación; el primer contexto se
 elegirá a partir de medidas C1/C2/C4.
 
 La capa MTP de atención completa añade provisionalmente 2 KiB/token, dejando
-26 KiB/token: 6,5 GiB a 262.144. El indexer podría añadir ~768 B/token si la
+26 KiB/token: 6,5 GiB a 262.144. Además, el estado next-step del drafter ya
+tiene geometría fijada de `hc_count × hidden_size = 10.240` elementos por
+sesión. El planner lo contabiliza como categoría separada: el escenario por
+defecto usa 2 bytes/elemento (20.480 bytes/sesión), pero
+`--mtp-draft-state-bytes` permite cambiar la hipótesis. Ese tamaño de elemento
+es una **suposición de planificación**, no el dtype canónico del forward MTP. El indexer podría añadir ~768 B/token si la
 compresión del config se traduce directamente a cache; debe confirmarse contra
 el forward oficial. El estado GDN FP32 mínimo estimado es
 `36 × 48 × 128 × 128 × 4 = 108 MiB/sesión`, más conv/history. Siete snapshots

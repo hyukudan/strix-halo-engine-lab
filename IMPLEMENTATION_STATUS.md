@@ -387,6 +387,7 @@ Additional A1.6 runtime work now implemented:
 - offline `strix-mtp-manifest-audit MTP.gguf` reports required structural tensor families, unresolved MTP tensors and missing families without allocating GPU state;
 - host-side MTP input-fusion oracle pins per-stream semantics: normalized embedding is projected once and broadcast, normalized wide hidden is reshaped into `hc_count` streams and projected independently before summation;
 - next-step MTP draft state is pinned as the post-block wide residual before final head collapse, with width `hc_count * hidden_size = 10240` for the target model;
+- memory admission accounts that draft state separately per session; the element size is an explicit planning input (2 bytes by default), not a resolved MTP dtype claim;
 - deterministic bounded prompt-lookup drafter using the most recent non-overlapping suffix n-gram match;
 - prompt-lookup history has an explicit token-capacity bound and proposal identity;
 - draft wrapper preflights target runtime/session before proposal and clamps effective proposal depth by remaining context and `token_budget - 1`;
