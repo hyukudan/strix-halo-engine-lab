@@ -8,6 +8,8 @@ The first multi-node target is a small cluster of directly connected Strix Halo 
 
 Multi-node support is an extension of the engine, not a dependency of the single-node fast path.
 
+The direct GPU ownership, terminal-commit, RX-repost and dual-pool contract is specified separately in [16 — Direct GPU Transport over USB4](16-direct-gpu-transport.md).
+
 ## Goals
 
 The distributed design SHOULD support:
@@ -185,6 +187,8 @@ The engine SHOULD expose each physical link separately to the transport schedule
 
 Two links MUST NOT be treated as twice the bandwidth until topology and simultaneous-transfer measurements prove it.
 
+For direct GPU-DMA operation, each physical link SHOULD own separate TX/RX pools, connection epoch, completion accounting and exclusive lease. The initial dual-link design MUST NOT share one imported pool across two external DMA engines.
+
 The platform probe MUST attempt to identify:
 
 - physical USB4 host routers;
@@ -269,14 +273,18 @@ A buffer SHOULD move through states similar to:
 1. producer owns;
 2. producer release complete;
 3. transport owns;
-4. receive completion;
+4. receive DMA complete;
 5. consumer acquire complete;
 6. consumer owns;
-7. reusable.
+7. consumer release complete;
+8. receive repost pending;
+9. reusable.
+
+Receive-DMA completion alone MUST NOT make an RX slot reusable.
 
 GPU and external-DMA synchronization MUST be proven for the exact buffer type in use.
 
-Transport completion MUST distinguish local submission, local buffer-reuse permission, remote receive completion and semantic commit. These events MUST NOT be collapsed into one completion flag unless the backend contract proves they are equivalent.
+Transport completion MUST distinguish local submission, local buffer-reuse permission, remote receive completion, remote consumer-complete credit, RX repost completion and semantic commit. These events MUST NOT be collapsed into one completion flag unless the backend contract proves they are equivalent.
 
 A device synchronization primitive that only orders GPU queues MUST NOT be assumed to establish visibility for writes performed by an external DMA engine.
 
