@@ -66,7 +66,10 @@ struct AdmissionDecision {
     std::uint64_t element_bytes);
 [[nodiscard]] std::uint64_t mtp_indexer_bytes_per_token(
     const ModelContract& model);
-[[nodiscard]] std::uint64_t provisional_indexer_bytes_per_token(const ModelContract& model);
+[[nodiscard]] std::uint64_t indexer_bytes_per_token(
+    const ModelContract& model);
+[[nodiscard]] std::uint64_t provisional_indexer_bytes_per_token(
+    const ModelContract& model);
 [[nodiscard]] std::uint64_t gdn_matrix_state_bytes_per_layer(
     const ModelContract& model);
 [[nodiscard]] std::uint64_t gdn_matrix_state_bytes_per_session(
