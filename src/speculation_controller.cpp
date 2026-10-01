@@ -3,8 +3,9 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <set>
 #include <stdexcept>
-#include <unordered_set>
+#include <utility>
 
 namespace strix {
 namespace {
@@ -42,6 +43,7 @@ SpeculationDepthCost cost(const SpeculationDepthSample& sample) {
         cycle,
         sample.expected_committed_tokens,
         cycle / sample.expected_committed_tokens,
+        sample.proposal_identity,
     };
 }
 
@@ -57,16 +59,23 @@ SpeculationDecision choose_speculation_depth(
             "switch hysteresis must be finite and within [0, 1)");
     }
 
-    std::unordered_set<std::uint32_t> depths;
-    depths.reserve(samples.size());
+    std::set<std::pair<std::uint64_t, std::uint32_t>>
+        proposal_depths;
 
     SpeculationDecision decision;
     bool qualified_depth_zero = false;
 
     for (const auto& sample : samples) {
-        if (!depths.insert(sample.depth).second) {
+        if (!proposal_depths.insert(
+                {sample.proposal_identity,
+                 sample.depth}).second) {
             throw std::invalid_argument(
-                "speculation depth samples must have unique depths");
+                "speculation samples must have unique proposal/depth pairs");
+        }
+        if (sample.depth == 0 &&
+            sample.proposal_identity != 0) {
+            throw std::invalid_argument(
+                "depth-zero serial baseline cannot have proposal identity");
         }
         if (!sample.qualified) {
             continue;
@@ -92,7 +101,11 @@ SpeculationDecision choose_speculation_depth(
         decision.qualified_costs.begin(),
         decision.qualified_costs.end(),
         [](const auto& left, const auto& right) {
-            return left.depth < right.depth;
+            if (left.depth != right.depth) {
+                return left.depth < right.depth;
+            }
+            return left.proposal_identity <
+                   right.proposal_identity;
         });
 
     const auto best_it = std::min_element(
@@ -104,39 +117,102 @@ SpeculationDecision choose_speculation_depth(
                 return left.seconds_per_committed_token <
                        right.seconds_per_committed_token;
             }
-            return left.depth < right.depth;
+            if (left.depth != right.depth) {
+                return left.depth < right.depth;
+            }
+            return left.proposal_identity <
+                   right.proposal_identity;
         });
 
-    std::uint32_t selected = best_it->depth;
+    std::uint32_t selected_depth =
+        best_it->depth;
+    std::uint64_t selected_proposal =
+        best_it->proposal_identity;
     bool switched = false;
 
-    if (policy.current_depth.has_value()) {
-        const auto current_it = std::find_if(
-            decision.qualified_costs.begin(),
-            decision.qualified_costs.end(),
-            [&](const auto& item) {
-                return item.depth == *policy.current_depth;
-            });
+    if (policy.current_proposal_identity.has_value() &&
+        !policy.current_depth.has_value()) {
+        throw std::invalid_argument(
+            "current proposal identity requires current depth");
+    }
 
-        if (current_it != decision.qualified_costs.end() &&
-            current_it->depth != best_it->depth) {
+    if (policy.current_depth.has_value()) {
+        auto current_it =
+            decision.qualified_costs.end();
+
+        if (policy.current_proposal_identity.has_value()) {
+            current_it = std::find_if(
+                decision.qualified_costs.begin(),
+                decision.qualified_costs.end(),
+                [&](const auto& item) {
+                    return item.depth ==
+                               *policy.current_depth &&
+                           item.proposal_identity ==
+                               *policy.current_proposal_identity;
+                });
+        } else {
+            const auto first =
+                std::find_if(
+                    decision.qualified_costs.begin(),
+                    decision.qualified_costs.end(),
+                    [&](const auto& item) {
+                        return item.depth ==
+                            *policy.current_depth;
+                    });
+            if (first !=
+                decision.qualified_costs.end()) {
+                const auto another =
+                    std::find_if(
+                        first + 1,
+                        decision.qualified_costs.end(),
+                        [&](const auto& item) {
+                            return item.depth ==
+                                *policy.current_depth;
+                        });
+                if (another ==
+                    decision.qualified_costs.end()) {
+                    current_it = first;
+                }
+            }
+        }
+
+        const bool same_choice =
+            current_it !=
+                decision.qualified_costs.end() &&
+            current_it->depth ==
+                best_it->depth &&
+            current_it->proposal_identity ==
+                best_it->proposal_identity;
+
+        if (current_it !=
+                decision.qualified_costs.end() &&
+            !same_choice) {
             const double required =
                 current_it->seconds_per_committed_token *
                 (1.0 - policy.switch_hysteresis_fraction);
-            if (best_it->seconds_per_committed_token >= required) {
-                selected = current_it->depth;
+            if (best_it->seconds_per_committed_token >=
+                required) {
+                selected_depth =
+                    current_it->depth;
+                selected_proposal =
+                    current_it->proposal_identity;
             } else {
                 switched = true;
             }
-        } else if (current_it == decision.qualified_costs.end()) {
+        } else if (current_it ==
+                   decision.qualified_costs.end()) {
             switched = true;
         }
     } else {
-        switched = selected != 0;
+        switched = selected_depth != 0;
     }
 
-    decision.selected_depth = selected;
-    decision.speculation_enabled = selected != 0;
+    decision.selected_depth =
+        selected_depth;
+    decision.selected_proposal_identity =
+        selected_proposal;
+    decision.speculation_enabled =
+        selected_depth != 0;
     decision.switched = switched;
     return decision;
 }

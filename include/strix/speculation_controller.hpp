@@ -20,10 +20,16 @@ struct SpeculationDepthSample {
     // Expected number of tokens committed by one completed cycle.
     // Depth zero should use exactly 1.
     double expected_committed_tokens = 0.0;
+
+    // Zero denotes the serial/no-drafter baseline or a legacy generic
+    // proposal. Distinct positive identities allow multiple drafters at the
+    // same candidate depth to compete on measured complete-cycle cost.
+    std::uint64_t proposal_identity = 0;
 };
 
 struct SpeculationControllerPolicy {
     std::optional<std::uint32_t> current_depth;
+    std::optional<std::uint64_t> current_proposal_identity;
 
     // A new depth must improve cost/token by at least this fraction before
     // replacing the current qualified choice.
@@ -35,10 +41,12 @@ struct SpeculationDepthCost {
     double cycle_seconds = 0.0;
     double expected_committed_tokens = 0.0;
     double seconds_per_committed_token = 0.0;
+    std::uint64_t proposal_identity = 0;
 };
 
 struct SpeculationDecision {
     std::uint32_t selected_depth = 0;
+    std::uint64_t selected_proposal_identity = 0;
     bool speculation_enabled = false;
     bool switched = false;
     std::vector<SpeculationDepthCost> qualified_costs;

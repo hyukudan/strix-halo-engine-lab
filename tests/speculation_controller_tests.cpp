@@ -88,6 +88,44 @@ int main() {
     expect(missing_serial,
            "controller requires a qualified serial baseline");
 
+    {
+        auto fast_prompt = samples[1];
+        fast_prompt.depth = 4;
+        fast_prompt.qualified = true;
+        fast_prompt.proposal_seconds = 0.002;
+        fast_prompt.verification_seconds = 0.008;
+        fast_prompt.commit_replay_seconds = 0.001;
+        fast_prompt.control_seconds = 0.001;
+        fast_prompt.expected_committed_tokens = 2.0;
+        fast_prompt.proposal_identity = 101;
+
+        auto slower_mtp = fast_prompt;
+        slower_mtp.proposal_seconds = 0.005;
+        slower_mtp.proposal_identity = 202;
+
+        const std::vector<strix::SpeculationDepthSample>
+            multi_proposal{
+                samples.front(),
+                fast_prompt,
+                slower_mtp,
+            };
+
+        strix::SpeculationControllerPolicy
+            multi_policy;
+        multi_policy.current_depth = 4;
+        multi_policy.current_proposal_identity = 202;
+        multi_policy.switch_hysteresis_fraction = 0.10;
+
+        const auto multi_decision =
+            strix::choose_speculation_depth(
+                multi_proposal,
+                multi_policy);
+        expect(multi_decision.selected_depth == 4 &&
+                   multi_decision.selected_proposal_identity == 101 &&
+                   multi_decision.switched,
+               "controller compares distinct drafters at the same depth");
+    }
+
     bool duplicate = false;
     try {
         auto invalid = samples;
@@ -98,7 +136,7 @@ int main() {
         duplicate = true;
     }
     expect(duplicate,
-           "controller rejects duplicate depth observations");
+           "controller rejects duplicate proposal/depth observations");
 
     if (failures == 0) {
         std::cout << "speculation controller tests passed\n";
