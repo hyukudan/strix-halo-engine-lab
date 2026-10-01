@@ -25,10 +25,8 @@ assess_mtp_draft_readiness(
         structural.output_mixer_semantics_resolved &&
         output.mixer_semantics_resolved;
     result.output_head_binding_resolved =
-        structural.output_head_binding_resolved &&
         output.head_binding_resolved;
     result.output_semantics_resolved =
-        structural.output_semantics_resolved &&
         output.output_semantics_resolved;
 
     if (!result.tensor_families_complete) {
