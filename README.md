@@ -7,6 +7,32 @@ contiene código derivado de Halogen ni modifica GUFO.
 
 The normative, source-independent technical decisions for the Strix Halo runtime live in [`docs/`](docs/README.md). Research notes and evidence remain separate from the architecture guide.
 
+## Current implementation state
+
+The project has moved beyond the initial host-only bootstrap.
+
+Current experimental pieces include:
+
+- defensive GGUF v3 parsing and model manifests;
+- pinned Qwen3.8-Flash-Next geometry and semantic oracles;
+- packed projection, GDN, MoE and QSA/PLE planning plus HIP harnesses;
+- a compiled C1 serial execution DAG with versioned IO, physical scratch arena and persistent session-state layouts;
+- experimental HIP launchers covering the serial DAG;
+- raw-token decode tooling that can materialize logits from a GGUF once native target qualification is available;
+- greedy speculative target verification and snapshot/replay infrastructure;
+- USB4 transport abstractions, TCP/direct-stream baselines and dual-link scheduling;
+- an experimental architecture for GPU-owned DMA-BUF USB4 transport with explicit commit/consumer-credit/RX-repost semantics.
+
+Native `gfx1151` qualification remains mandatory before any HIP or direct-transport path is promoted.
+
+### USB4 multi-node direction
+
+The distributed design treats every physical USB4 connection as an independent resource.
+
+For two links between the same pair of hosts, each link keeps its own epoch, lease, TX/RX pools, completion accounting and health state. The scheduler may later choose independent flows, directional specialization, role specialization or large-message striping, but only after simultaneous measurements prove the links are genuinely independent.
+
+The normative synchronization and ownership contract is in [`docs/architecture/16-direct-gpu-transport.md`](docs/architecture/16-direct-gpu-transport.md). The broader placement/scheduler design remains in [`docs/architecture/12-multi-node-and-usb4.md`](docs/architecture/12-multi-node-and-usb4.md).
+
 ## Documentos
 
 - [`RESEARCH.md`](RESEARCH.md): hechos observados, comparación y límites de licencia.
@@ -62,4 +88,4 @@ WSL y obtener un desglose JSON consumible por la futura WebUI.
 - `strix-model-manifest`: logical tensor roles, bytes, residency candidates and node placement.
 - `strix-platform-probe`: read-only Linux discovery for RAM, KFD GPU identity, ROCm and USB4/USB4STREAM topology.
 
-These tools remain usable before the HIP execution layer is implemented.
+These tools remain useful independently of the experimental HIP execution layer and can be used to qualify a host before enabling GPU runtime or direct USB4 transport tiers.
