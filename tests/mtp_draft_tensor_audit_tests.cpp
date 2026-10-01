@@ -122,7 +122,7 @@ int main() {
     {
         Fixture fixture;
         fixture.manifest.tensors[6].name =
-            "mtp.unresolved.indexer_removed";
+            "mtp.unresolved.qk_removed";
         fixture.manifest.layout_identity =
             strix::model_manifest_layout_identity(
                 fixture.manifest);
