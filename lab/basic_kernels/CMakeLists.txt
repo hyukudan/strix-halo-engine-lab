@@ -2,7 +2,6 @@ cmake_minimum_required(VERSION 3.24)
 
 project(strix_basic_kernel_lab LANGUAGES CXX HIP)
 
-find_package(hip REQUIRED CONFIG)
 
 function(configure_strix_basic_kernel_target target wave_size)
     add_executable(${target} basic_kernels.hip)
@@ -17,7 +16,6 @@ function(configure_strix_basic_kernel_target target wave_size)
         $<$<COMPILE_LANGUAGE:HIP>:-Wall>
         $<$<COMPILE_LANGUAGE:HIP>:-Wextra>
     )
-    target_link_libraries(${target} PRIVATE hip::host)
 endfunction()
 
 configure_strix_basic_kernel_target(strix-basic-kernels-w32 32)
