@@ -224,12 +224,20 @@ struct DirectLinkLifecycle {
 [[nodiscard]] bool direct_link_usable(
     const DirectLinkLifecycle& link) noexcept;
 
+enum class LinkCompletionTarget {
+    receive_ready,
+    remote_consumer_complete,
+    receiver_reusable,
+};
+
 struct LinkProfile {
     std::string id;
     std::uint32_t peer_node = 0;
     LinkHealth health = LinkHealth::absent;
     double payload_bytes_per_second = 0.0;
     double one_way_latency_seconds = 0.0;
+    double consumer_completion_seconds = 0.0;
+    double receive_repost_seconds = 0.0;
     std::uint64_t in_flight_bytes = 0;
     bool independent_for_striping = false;
 };
@@ -237,6 +245,8 @@ struct LinkProfile {
 struct SchedulerPolicy {
     std::uint64_t minimum_stripe_bytes = 1ULL << 20U;
     double stripe_reassembly_seconds = 0.0;
+    LinkCompletionTarget completion_target =
+        LinkCompletionTarget::receive_ready;
 };
 
 struct LinkSlice {
@@ -251,8 +261,14 @@ struct TransferPlan {
     double estimated_seconds = 0.0;
 };
 
-[[nodiscard]] double estimate_single_link_seconds(const LinkProfile& link,
-                                                  std::uint64_t bytes) noexcept;
+[[nodiscard]] double estimate_link_completion_seconds(
+    const LinkProfile& link,
+    std::uint64_t bytes,
+    LinkCompletionTarget target) noexcept;
+
+[[nodiscard]] double estimate_single_link_seconds(
+    const LinkProfile& link,
+    std::uint64_t bytes) noexcept;
 
 [[nodiscard]] TransferPlan plan_transfer(std::span<const LinkProfile> links,
                                          std::uint64_t bytes,
