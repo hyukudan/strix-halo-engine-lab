@@ -118,6 +118,41 @@ TransferPlan striped_pair(
 
 }  // namespace
 
+
+bool validate_transport_send_buffer(
+    const TransportBufferView& buffer,
+    std::uint64_t required_bytes) noexcept {
+    if (buffer.address == 0 ||
+        buffer.bytes == 0 ||
+        required_bytes == 0 ||
+        buffer.bytes < required_bytes ||
+        buffer.allocation_generation == 0) {
+        return false;
+    }
+
+    return buffer.access ==
+               TransportBufferAccess::read_only ||
+           buffer.access ==
+               TransportBufferAccess::read_write;
+}
+
+bool validate_transport_receive_buffer(
+    const TransportBufferView& buffer,
+    std::uint64_t required_bytes) noexcept {
+    if (buffer.address == 0 ||
+        buffer.bytes == 0 ||
+        required_bytes == 0 ||
+        buffer.bytes < required_bytes ||
+        buffer.allocation_generation == 0) {
+        return false;
+    }
+
+    return buffer.access ==
+               TransportBufferAccess::write_only ||
+           buffer.access ==
+               TransportBufferAccess::read_write;
+}
+
 bool can_transition(BufferOwnership from, BufferOwnership to) noexcept {
     switch (from) {
     case BufferOwnership::producer_owned:
