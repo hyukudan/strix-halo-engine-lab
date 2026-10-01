@@ -490,18 +490,6 @@ std::uint64_t small_weight_bytes(
         "unreachable GDN small weight kind");
 }
 
-__global__ void clear_bf16_kernel(
-    std::uint16_t* output,
-    std::uint32_t elements) {
-    const auto index =
-        static_cast<std::uint32_t>(
-            blockIdx.x) *
-            blockDim.x +
-        threadIdx.x;
-    if (index < elements) {
-        output[index] = 0;
-    }
-}
 
 template <WeightKind Kind>
 __global__ void project_bf16_to_fp32_kernel(
