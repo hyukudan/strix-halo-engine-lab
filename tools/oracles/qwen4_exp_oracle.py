@@ -248,13 +248,13 @@ def qsa_select_tokens_deterministic(
     return selected
 
 
-def moe_route_no_ties(
+def moe_route_deterministic(
     logits: list[float],
     *,
     top_k: int,
     normalize_selected: bool = True,
 ) -> tuple[list[int], list[float]]:
-    """Reference MoE routing for one row with an explicit no-tie contract."""
+    """Reference MoE routing with deterministic lower-index cutoff ties."""
 
     if top_k <= 0 or top_k > len(logits):
         raise ValueError("top_k is out of range")
@@ -270,13 +270,8 @@ def moe_route_no_ties(
 
     ordered = sorted(
         range(len(probabilities)),
-        key=lambda index: -probabilities[index],
+        key=lambda index: (-probabilities[index], index),
     )
-    if top_k < len(ordered):
-        cutoff = probabilities[ordered[top_k - 1]]
-        next_value = probabilities[ordered[top_k]]
-        if cutoff == next_value:
-            raise ValueError("MoE top-k cutoff has unresolved score tie")
 
     indices = ordered[:top_k]
     selected = [probabilities[index] for index in indices]

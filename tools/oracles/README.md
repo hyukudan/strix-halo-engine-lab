@@ -15,7 +15,7 @@ Implemented:
 - hashed PLE/n-gram row IDs;
 - Gated Residual/Hyper-Connection mixing with synthetic matrix fixtures;
 - QSA block pooling/selection for fixtures whose cutoff has no score tie;
-- MoE softmax/top-k routing for fixtures without cutoff ties;
+- MoE softmax/top-k routing with deterministic lower-expert-index cutoff ties;
 - greedy MTP/assisted verification acceptance, bonus-token and cache-crop semantics;
 - fresh-versus-resumed equivalence tests for recurrent and n-gram state.
 
