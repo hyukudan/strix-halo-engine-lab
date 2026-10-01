@@ -34,6 +34,8 @@ struct Usb4Topology {
     std::vector<std::string> stream_devices;
     std::vector<Usb4StreamInfo> configured_streams;
     bool stream_driver_present = false;
+    bool dma_buf_import_gate_present = false;
+    std::optional<bool> dma_buf_import_gate_enabled;
 };
 
 struct PlatformInfo {
