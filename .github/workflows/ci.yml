@@ -98,7 +98,7 @@ jobs:
               bash -lc '
                 set -euo pipefail
                 apt-get update
-                DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends cmake ninja-build
+                DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends cmake ninja-build hip-dev
                 cmake -S lab/basic_kernels -B build/basic-kernels-offline -G Ninja -DCMAKE_BUILD_TYPE=Release
                 cmake --build build/basic-kernels-offline
                 cmake -S lab/packed_projection -B build/packed-projection-offline -G Ninja -DCMAKE_BUILD_TYPE=Release
