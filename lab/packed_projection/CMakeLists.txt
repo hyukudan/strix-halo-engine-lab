@@ -2,7 +2,6 @@ cmake_minimum_required(VERSION 3.24)
 
 project(strix_packed_projection_lab LANGUAGES CXX HIP)
 
-find_package(hip REQUIRED CONFIG)
 
 function(configure_projection_target target source wave_size)
     add_executable(${target} ${source})
@@ -17,7 +16,6 @@ function(configure_projection_target target source wave_size)
         $<$<COMPILE_LANGUAGE:HIP>:-Wall>
         $<$<COMPILE_LANGUAGE:HIP>:-Wextra>
     )
-    target_link_libraries(${target} PRIVATE hip::host)
 endfunction()
 
 configure_projection_target(
