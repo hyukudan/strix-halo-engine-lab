@@ -281,7 +281,7 @@ std::vector<GpuNodeInfo> gpu_nodes(const std::filesystem::path& root) {
 PlatformInfo probe_platform(const std::filesystem::path& root) {
     PlatformInfo info;
 #if defined(__linux__)
-    info.linux = true;
+    info.is_linux = true;
     if (root == std::filesystem::path{"/"}) {
         utsname name{};
         if (uname(&name) == 0) {
