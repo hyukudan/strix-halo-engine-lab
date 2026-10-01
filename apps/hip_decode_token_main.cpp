@@ -12,15 +12,21 @@
 #include "strix/model_tensor_index.hpp"
 #include "strix/ple_lookup.hpp"
 #include "strix/runtime_allocator.hpp"
+#include "strix/serial_decode_reference.hpp"
+#include "strix/serial_decode_replay.hpp"
 #include "strix/serial_session.hpp"
 #include "strix/session_state_layout.hpp"
 
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <cerrno>
+#include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <iostream>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -74,6 +80,32 @@ std::uint64_t parse_u64(
     return value;
 }
 
+double parse_double(
+    std::string_view text,
+    const char* name) {
+    if (text.empty()) {
+        throw std::invalid_argument(
+            std::string(name) +
+            " must not be empty");
+    }
+    std::string copy(text);
+    char* end = nullptr;
+    errno = 0;
+    const auto value =
+        std::strtod(
+            copy.c_str(),
+            &end);
+    if (errno != 0 ||
+        end == copy.c_str() ||
+        *end != '\0' ||
+        !std::isfinite(value)) {
+        throw std::invalid_argument(
+            std::string(name) +
+            " must be a finite number");
+    }
+    return value;
+}
+
 strix::PersistentState all_persistent_state() {
     using strix::PersistentState;
     return
@@ -93,14 +125,17 @@ struct Options {
         strix::HipModelResidencyMode::
             registered_file_mapping;
     std::uint64_t coalesce_gap_bytes = 4096;
+    std::string reference_path;
+    double max_logit_abs_error = 1e-3;
 };
 
 Options parse_options(
     int argc,
     char** argv) {
-    if (argc < 3) {
+    if (argc < 2) {
         throw std::invalid_argument(
-            "usage: strix-hip-decode-token MODEL.gguf TOKEN_ID [TOKEN_ID ...] "
+            "usage: strix-hip-decode-token MODEL.gguf [TOKEN_ID ...] "
+            "[--reference FILE] [--max-logit-error X] "
             "[--context N] [--residency register|copy] [--coalesce-gap BYTES]");
     }
 
@@ -113,6 +148,32 @@ Options parse_options(
          ++index) {
         const std::string_view argument =
             argv[index];
+
+        if (argument == "--reference") {
+            if (index + 1 >= argc) {
+                throw std::invalid_argument(
+                    "--reference requires a fixture path");
+            }
+            options.reference_path =
+                argv[++index];
+            continue;
+        }
+
+        if (argument == "--max-logit-error") {
+            if (index + 1 >= argc) {
+                throw std::invalid_argument(
+                    "--max-logit-error requires a value");
+            }
+            options.max_logit_abs_error =
+                parse_double(
+                    argv[++index],
+                    "max-logit-error");
+            if (options.max_logit_abs_error < 0.0) {
+                throw std::invalid_argument(
+                    "--max-logit-error must be non-negative");
+            }
+            continue;
+        }
 
         if (argument == "--context") {
             if (index + 1 >= argc) {
@@ -181,9 +242,10 @@ Options parse_options(
                 token));
     }
 
-    if (options.tokens.empty()) {
+    if (options.tokens.empty() &&
+        options.reference_path.empty()) {
         throw std::invalid_argument(
-            "at least one token id is required");
+            "at least one token id or --reference is required");
     }
     if (options.context_tokens == 0) {
         throw std::invalid_argument(
@@ -252,10 +314,42 @@ std::vector<RankedLogit> top_logits(
 int main(
     int argc,
     char** argv) try {
-    const auto options =
+    auto options =
         parse_options(
             argc,
             argv);
+
+    std::optional<strix::SerialDecodeReference>
+        reference;
+    if (!options.reference_path.empty()) {
+        reference =
+            strix::read_serial_decode_reference(
+                options.reference_path);
+        if (options.tokens.empty()) {
+            options.tokens.reserve(
+                reference->steps.size());
+            for (const auto& step :
+                 reference->steps) {
+                options.tokens.push_back(
+                    step.input_token);
+            }
+        } else {
+            if (options.tokens.size() !=
+                reference->steps.size()) {
+                throw std::invalid_argument(
+                    "CLI token sequence length does not match replay reference");
+            }
+            for (std::size_t index = 0;
+                 index < options.tokens.size();
+                 ++index) {
+                if (options.tokens[index] !=
+                    reference->steps[index].input_token) {
+                    throw std::invalid_argument(
+                        "CLI token sequence does not match replay reference");
+                }
+            }
+        }
+    }
 
     const auto model =
         strix::ModelContract::
@@ -398,6 +492,14 @@ int main(
             generations,
             residency_policy);
 
+    if (reference.has_value() &&
+        reference->model_content_identity !=
+            model_residency.binding().
+                model_content_identity) {
+        throw std::invalid_argument(
+            "reference checkpoint SHA-256 does not match loaded model");
+    }
+
     strix::HipRuntimeAllocator
         allocator(
             strix::HipHostAllocationMode::
@@ -463,6 +565,26 @@ int main(
     std::vector<float> logits(
         static_cast<std::size_t>(
             model.vocab_size));
+
+    strix::SerialDecodeReplayObservation
+        replay_observation;
+    if (reference.has_value()) {
+        replay_observation.model_content_identity =
+            model_residency.binding().
+                model_content_identity;
+        replay_observation.compiled_execution_identity =
+            compiled.execution_identity;
+        replay_observation.runtime_compatibility_identity =
+            identities.compatibility_identity;
+        replay_observation.independent_reference_identity =
+            reference->independent_reference_identity;
+        replay_observation.input_tokens =
+            options.tokens;
+        replay_observation.reference_argmax_tokens.reserve(
+            reference->steps.size());
+        replay_observation.engine_argmax_tokens.reserve(
+            reference->steps.size());
+    }
 
     std::cout << '{' << '\n'
               << "  \"execution_identity\": "
@@ -544,6 +666,35 @@ int main(
                 "LM head produced no logits");
         }
 
+        if (reference.has_value()) {
+            const auto& expected =
+                reference->steps[input_index];
+            replay_observation.reference_argmax_tokens.push_back(
+                expected.expected_argmax_token);
+            replay_observation.engine_argmax_tokens.push_back(
+                ranked.front().token);
+
+            for (const auto& probe :
+                 expected.logits) {
+                if (probe.index >=
+                    logits.size()) {
+                    throw std::out_of_range(
+                        "reference logit probe index exceeds model vocabulary");
+                }
+                const auto error =
+                    std::abs(
+                        static_cast<double>(
+                            logits[probe.index]) -
+                        static_cast<double>(
+                            probe.value));
+                replay_observation.maximum_logit_abs_error =
+                    std::max(
+                        replay_observation.maximum_logit_abs_error,
+                        error);
+                ++replay_observation.logit_values_compared;
+            }
+        }
+
         std::cout
             << "    {\"input_token\":"
             << token
@@ -576,17 +727,68 @@ int main(
         std::cout << '\n';
     }
 
+    std::optional<strix::SerialDecodeReplayAssessment>
+        replay_assessment;
+    if (reference.has_value()) {
+        strix::SerialDecodeReplayPolicy policy;
+        policy.policy_identity =
+            reference->independent_reference_identity;
+        policy.max_logit_abs_error =
+            options.max_logit_abs_error;
+        policy.minimum_steps =
+            reference->steps.size();
+        policy.minimum_logit_values_compared =
+            replay_observation.logit_values_compared;
+        policy.require_exact_argmax = true;
+
+        replay_assessment =
+            strix::assess_serial_decode_replay(
+                policy,
+                replay_observation);
+    }
+
     std::cout
         << "  ]," << '\n'
         << "  \"committed_tokens\": "
         << session.committed_tokens
         << ',' << '\n'
         << "  \"next_position\": "
-        << session.next_position
+        << session.next_position;
+
+    if (replay_assessment.has_value()) {
+        std::cout
+            << ',' << '\n'
+            << "  \"replay\": {" << '\n'
+            << "    \"reference_id\": "
+            << reference->independent_reference_identity
+            << ',' << '\n'
+            << "    \"logit_values_compared\": "
+            << replay_observation.logit_values_compared
+            << ',' << '\n'
+            << "    \"max_logit_abs_error\": "
+            << replay_observation.maximum_logit_abs_error
+            << ',' << '\n'
+            << "    \"argmax_match\": "
+            << (replay_assessment->argmax_match
+                    ? "true"
+                    : "false")
+            << ',' << '\n'
+            << "    \"passed\": "
+            << (replay_assessment->passes_declared_policy
+                    ? "true"
+                    : "false")
+            << '\n'
+            << "  }";
+    }
+
+    std::cout
         << '\n'
         << '}' << '\n';
 
-    return 0;
+    return replay_assessment.has_value() &&
+                   !replay_assessment->passes_declared_policy
+               ? 2
+               : 0;
 } catch (const std::exception& error) {
     std::cerr
         << "strix-hip-decode-token: "
