@@ -387,6 +387,8 @@ Additional A1.6 runtime work now implemented:
 - `CompiledMtpDraftPlan` now freezes the structural step order and stable relocation-independent plan identity while surfacing unresolved readiness blockers instead of launching;
 - offline `strix-mtp-manifest-audit MTP.gguf` reports required structural tensor families, unresolved MTP tensors and missing families without allocating GPU state;
 - host-side MTP input-fusion oracle pins per-stream semantics: normalized embedding is projected once and broadcast, normalized wide hidden is reshaped into `hc_count` streams and projected independently before summation;
+- evidence-gated MTP plan qualification separates structural readiness from executable qualification: all structural blockers except the forward gate must be closed, then an independent multi-step replay must satisfy the declared token/hidden/logit policy before the plan is executable;
+- replay evidence is bound to proposal identity, compiled plan identity, policy identity and independent-reference identity; evidence from another plan cannot qualify the current plan;
 - next-step MTP draft state is pinned as the post-block wide residual before final head collapse, with width `hc_count * hidden_size = 10240` for the target model;
 - memory admission accounts that draft state separately per session; the element size is an explicit planning input (2 bytes by default), not a resolved MTP dtype claim;
 - deterministic bounded prompt-lookup drafter using the most recent non-overlapping suffix n-gram match;
