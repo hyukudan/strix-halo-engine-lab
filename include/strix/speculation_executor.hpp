@@ -80,6 +80,7 @@ struct GreedyDraftExecutionRequest {
 };
 
 struct GreedyDraftExecutionResult {
+    std::uint32_t proposal_depth_limit = 0;
     std::vector<std::uint32_t> proposed_tokens;
     GreedySpeculationExecutionResult target_cycle;
 };

@@ -533,7 +533,8 @@ int main() {
                 draft,
                 backend);
 
-        expect(draft.calls == 1 &&
+        expect(result.proposal_depth_limit == 2 &&
+                   draft.calls == 1 &&
                    draft.reconcile_calls == 1 &&
                    draft.seen_max_depth == 2 &&
                    draft_state.phase ==
@@ -577,7 +578,8 @@ int main() {
                 draft,
                 backend);
 
-        expect(draft.calls == 0 &&
+        expect(result.proposal_depth_limit == 0 &&
+                   draft.calls == 0 &&
                    draft.reconcile_calls == 0 &&
                    result.proposed_tokens.empty() &&
                    result.target_cycle.plan.emitted_tokens ==
@@ -743,6 +745,116 @@ int main() {
                    draft.calls == 0 &&
                    backend.verify_calls == 0,
                "stale draft state fails before proposal or target verification");
+    }
+
+    {
+        Fixture fixture;
+        FakeDraftBackend draft;
+        auto draft_state =
+            strix::make_draft_proposal_state(
+                0x5555ULL,
+                fixture.session);
+        draft.proposed_tokens = {10};
+        FakeSpeculationBackend backend;
+        backend.target_tokens = {10, 20};
+
+        strix::GreedyDraftExecutionRequest request;
+        request.max_candidate_depth = 4;
+        request.token_budget = 2;
+
+        const auto result =
+            strix::execute_greedy_speculation_with_draft(
+                fixture.model,
+                fixture.compiled,
+                fixture.resources,
+                fixture.session,
+                request,
+                allocator,
+                generations,
+                transfer,
+                draft_state,
+                draft,
+                backend);
+
+        expect(result.proposal_depth_limit == 1 &&
+                   draft.seen_max_depth == 1,
+               "draft depth is clamped to token budget minus target bonus");
+    }
+
+    {
+        Fixture fixture;
+        FakeDraftBackend draft;
+        auto draft_state =
+            strix::make_draft_proposal_state(
+                0x5555ULL,
+                fixture.session);
+        FakeSpeculationBackend backend;
+
+        strix::GreedyDraftExecutionRequest request;
+        request.max_candidate_depth = 2;
+        request.token_budget = 0;
+
+        bool rejected = false;
+        try {
+            static_cast<void>(
+                strix::execute_greedy_speculation_with_draft(
+                    fixture.model,
+                    fixture.compiled,
+                    fixture.resources,
+                    fixture.session,
+                    request,
+                    allocator,
+                    generations,
+                    transfer,
+                    draft_state,
+                    draft,
+                    backend));
+        } catch (const std::invalid_argument&) {
+            rejected = true;
+        }
+        expect(rejected &&
+                   draft.calls == 0 &&
+                   draft_state.phase ==
+                       strix::DraftProposalStatePhase::synchronized,
+               "invalid token budget fails before draft proposal state changes");
+    }
+
+    {
+        Fixture fixture;
+        fixture.session.next_position =
+            fixture.state_layout.context_tokens - 1;
+        fixture.session.committed_tokens =
+            fixture.session.next_position;
+        FakeDraftBackend draft;
+        auto draft_state =
+            strix::make_draft_proposal_state(
+                0x5555ULL,
+                fixture.session);
+        draft.proposed_tokens = {10};
+        FakeSpeculationBackend backend;
+        backend.target_tokens = {10, 20};
+
+        strix::GreedyDraftExecutionRequest request;
+        request.max_candidate_depth = 4;
+        request.token_budget = 5;
+
+        const auto result =
+            strix::execute_greedy_speculation_with_draft(
+                fixture.model,
+                fixture.compiled,
+                fixture.resources,
+                fixture.session,
+                request,
+                allocator,
+                generations,
+                transfer,
+                draft_state,
+                draft,
+                backend);
+
+        expect(result.proposal_depth_limit == 1 &&
+                   draft.seen_max_depth == 1,
+               "draft depth is clamped to remaining allocated target context");
     }
 
     if (failures == 0) {

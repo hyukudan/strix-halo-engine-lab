@@ -1,5 +1,6 @@
 #include "strix/speculation_executor.hpp"
 
+#include <algorithm>
 #include <exception>
 #include <limits>
 #include <stdexcept>
@@ -424,8 +425,40 @@ execute_greedy_speculation_with_draft(
     GreedySpeculationExecutionBackend& target_backend) {
     GreedyDraftExecutionResult result;
 
+    validate_session_binding(
+        compiled,
+        resources,
+        session);
+    if (request.token_budget == 0) {
+        throw std::invalid_argument(
+            "draft speculation token budget must be non-zero");
+    }
+
+    const auto remaining_state_tokens =
+        resources.session_state_layout->context_tokens -
+        session.next_position;
+    const auto remaining_model_tokens =
+        model.max_position_embeddings -
+        session.next_position;
+    const auto remaining_tokens =
+        std::min(
+            remaining_state_tokens,
+            remaining_model_tokens);
+    const auto budget_candidate_limit =
+        static_cast<std::uint64_t>(
+            request.token_budget - 1U);
+    const auto effective_depth =
+        std::min<std::uint64_t>(
+            request.max_candidate_depth,
+            std::min(
+                remaining_tokens,
+                budget_candidate_limit));
+    result.proposal_depth_limit =
+        static_cast<std::uint32_t>(
+            effective_depth);
+
     bool proposal_started = false;
-    if (request.max_candidate_depth != 0) {
+    if (result.proposal_depth_limit != 0) {
         validate_draft_proposal_state(
             draft_state,
             session);
@@ -438,12 +471,12 @@ execute_greedy_speculation_with_draft(
                 draft_backend.propose_candidates(
                     session,
                     draft_state,
-                    request.max_candidate_depth);
+                    result.proposal_depth_limit);
             if (result.proposed_tokens.size() >
                 static_cast<std::size_t>(
-                    request.max_candidate_depth)) {
+                    result.proposal_depth_limit)) {
                 throw std::invalid_argument(
-                    "draft backend returned more candidates than requested");
+                    "draft backend returned more candidates than effective depth limit");
             }
             finish_draft_proposal(
                 draft_state);
