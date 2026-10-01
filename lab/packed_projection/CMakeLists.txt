@@ -15,6 +15,7 @@ function(configure_projection_target target source wave_size)
         ${target} PRIVATE
         $<$<COMPILE_LANGUAGE:HIP>:-Wall>
         $<$<COMPILE_LANGUAGE:HIP>:-Wextra>
+        $<$<COMPILE_LANGUAGE:HIP>:-Werror>
     )
 endfunction()
 

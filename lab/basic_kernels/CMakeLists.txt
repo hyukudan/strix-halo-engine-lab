@@ -15,6 +15,7 @@ function(configure_strix_basic_kernel_target target wave_size)
         ${target} PRIVATE
         $<$<COMPILE_LANGUAGE:HIP>:-Wall>
         $<$<COMPILE_LANGUAGE:HIP>:-Wextra>
+        $<$<COMPILE_LANGUAGE:HIP>:-Werror>
     )
 endfunction()
 
