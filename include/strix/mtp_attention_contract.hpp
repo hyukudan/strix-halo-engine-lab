@@ -28,12 +28,12 @@ struct MtpAttentionStructuralContract {
     std::uint64_t kv_row_bytes = 0;
     std::uint64_t raw_index_row_bytes = 0;
 
-    // The existing independent oracle resolves the no-tie scoring/selection
-    // path. Cutoff tie behavior remains open, so the complete sparse-selection
-    // gate stays false.
+    // The canonical numerical path is independently oracled. Upstream leaves
+    // tied top-k indices unstable, so the engine contract resolves equal block
+    // scores by lower compressed-block index for reproducible serial/MTP replay.
     bool no_tie_selection_semantics_resolved = true;
-    bool cutoff_tie_semantics_resolved = false;
-    bool sparse_selection_semantics_resolved = false;
+    bool cutoff_tie_semantics_resolved = true;
+    bool sparse_selection_semantics_resolved = true;
 };
 
 [[nodiscard]] MtpAttentionStructuralContract

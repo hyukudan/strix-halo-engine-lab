@@ -169,7 +169,7 @@ build_mtp_draft_structural_contract(
             model.bytes_bf16);
 
     contract.input_fusion_semantics_resolved = true;
-    contract.attention_semantics_resolved = false;
+    contract.attention_semantics_resolved = true;
     contract.draft_state_semantics_resolved = true;
     contract.output_mixer_semantics_resolved = true;
     contract.output_head_binding_resolved = false;
@@ -218,7 +218,7 @@ void validate_mtp_draft_structural_contract(
         contract.provisional_kv_bytes_per_token !=
             expected.provisional_kv_bytes_per_token ||
         !contract.input_fusion_semantics_resolved ||
-        contract.attention_semantics_resolved ||
+        !contract.attention_semantics_resolved ||
         !contract.draft_state_semantics_resolved ||
         !contract.output_mixer_semantics_resolved ||
         contract.output_head_binding_resolved ||

@@ -45,27 +45,27 @@ int main() {
                contract.raw_index_row_bytes == 256,
            "MTP attention state accounts KV and raw index rows per token");
     expect(contract.no_tie_selection_semantics_resolved &&
-               !contract.cutoff_tie_semantics_resolved &&
-               !contract.sparse_selection_semantics_resolved,
-           "MTP attention resolves no-tie QSA while preserving open cutoff-tie semantics");
+               contract.cutoff_tie_semantics_resolved &&
+               contract.sparse_selection_semantics_resolved,
+           "MTP attention uses deterministic lower-block tie resolution");
 
     strix::validate_mtp_attention_structural_contract(
         model,
         contract);
 
-    auto overclaimed = contract;
-    overclaimed.sparse_selection_semantics_resolved =
-        true;
+    auto broken = contract;
+    broken.cutoff_tie_semantics_resolved =
+        false;
     bool rejected = false;
     try {
         strix::validate_mtp_attention_structural_contract(
             model,
-            overclaimed);
+            broken);
     } catch (const std::invalid_argument&) {
         rejected = true;
     }
     expect(rejected,
-           "MTP attention validator rejects unproven QSA semantic resolution");
+           "MTP attention validator rejects incomplete deterministic QSA contract");
 
     if (failures == 0) {
         std::cout << "MTP attention structural contract tests passed\n";

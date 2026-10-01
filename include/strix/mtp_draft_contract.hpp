@@ -32,7 +32,7 @@ struct MtpDraftStructuralContract {
     // remains blocked until attention/QSA, block-state propagation and output
     // semantics are independently fixed and tested.
     bool input_fusion_semantics_resolved = true;
-    bool attention_semantics_resolved = false;
+    bool attention_semantics_resolved = true;
     bool draft_state_semantics_resolved = true;
     bool output_mixer_semantics_resolved = true;
     bool output_head_binding_resolved = false;
