@@ -278,6 +278,121 @@ bool direct_link_usable(
                 DirectLinkLifecycleState::leased);
 }
 
+
+DirectPairDecision
+reconcile_direct_link_pair(
+    const DirectLinkLifecycle& local,
+    const DirectLinkLifecycle& peer) noexcept {
+    DirectPairDecision decision;
+
+    decision.control_ready =
+        local.control_link_ready &&
+        peer.control_link_ready;
+
+    decision.parameters_match =
+        local.ring_frames != 0 &&
+        local.ring_frames ==
+            peer.ring_frames &&
+        local.interrupt_throttling_ns ==
+            peer.interrupt_throttling_ns;
+
+    decision.hopids_reciprocal =
+        local.in_hopid >= 0 &&
+        local.out_hopid >= 0 &&
+        peer.in_hopid >= 0 &&
+        peer.out_hopid >= 0 &&
+        local.in_hopid ==
+            peer.out_hopid &&
+        local.out_hopid ==
+            peer.in_hopid;
+
+    decision.epochs_match =
+        local.connection_epoch != 0 &&
+        local.connection_epoch ==
+            peer.connection_epoch;
+
+    decision.receive_rings_primed =
+        local.receive_ring_primed &&
+        peer.receive_ring_primed;
+
+    decision.completion_rearm_qualified =
+        local.completion_rearm_qualified &&
+        peer.completion_rearm_qualified;
+
+    decision.lease_available =
+        local.exclusive_lease_available &&
+        peer.exclusive_lease_available;
+
+    decision.dma_buf_import_common =
+        local.dma_buf_import_supported &&
+        peer.dma_buf_import_supported;
+
+    if (local.state ==
+            DirectLinkLifecycleState::failed ||
+        peer.state ==
+            DirectLinkLifecycleState::failed) {
+        decision.state =
+            DirectPairState::failed;
+        return decision;
+    }
+
+    if (!decision.control_ready) {
+        decision.state =
+            DirectPairState::portable_only;
+        return decision;
+    }
+
+    if (!decision.parameters_match ||
+        !decision.hopids_reciprocal) {
+        decision.state =
+            DirectPairState::partial;
+        return decision;
+    }
+
+    const bool both_direct_state =
+        (local.state ==
+             DirectLinkLifecycleState::direct_ready ||
+         local.state ==
+             DirectLinkLifecycleState::leased) &&
+        (peer.state ==
+             DirectLinkLifecycleState::direct_ready ||
+         peer.state ==
+             DirectLinkLifecycleState::leased);
+
+    if (both_direct_state) {
+        if (!decision.epochs_match ||
+            !decision.receive_rings_primed ||
+            !decision.completion_rearm_qualified) {
+            decision.state =
+                DirectPairState::partial;
+            return decision;
+        }
+
+        if (!decision.lease_available ||
+            local.state ==
+                DirectLinkLifecycleState::leased ||
+            peer.state ==
+                DirectLinkLifecycleState::leased) {
+            decision.state =
+                DirectPairState::in_use;
+            return decision;
+        }
+
+        decision.state =
+            DirectPairState::direct_ready;
+        return decision;
+    }
+
+    if (decision.lease_available) {
+        decision.state =
+            DirectPairState::arm_allowed;
+    } else {
+        decision.state =
+            DirectPairState::in_use;
+    }
+    return decision;
+}
+
 double estimate_link_completion_seconds(
     const LinkProfile& link,
     std::uint64_t bytes,
