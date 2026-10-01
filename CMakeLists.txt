@@ -72,6 +72,7 @@ add_library(strix_core STATIC
     src/speculative_verify_runtime.cpp
     src/speculative_verify_binding.cpp
     src/platform_probe.cpp
+    src/prompt_lookup_draft.cpp
     src/ple_lookup.cpp
     src/ple_workspace.cpp
     src/transport.cpp
@@ -325,6 +326,11 @@ if(BUILD_TESTING)
     target_link_libraries(strix-speculation-cycle-tests PRIVATE strix_core)
     strix_target_warnings(strix-speculation-cycle-tests)
     add_test(NAME strix-speculation-cycle-tests COMMAND strix-speculation-cycle-tests)
+
+    add_executable(strix-prompt-lookup-draft-tests tests/prompt_lookup_draft_tests.cpp)
+    target_link_libraries(strix-prompt-lookup-draft-tests PRIVATE strix_core)
+    strix_target_warnings(strix-prompt-lookup-draft-tests)
+    add_test(NAME strix-prompt-lookup-draft-tests COMMAND strix-prompt-lookup-draft-tests)
 
     add_executable(strix-mtp-draft-binding-tests tests/mtp_draft_binding_tests.cpp)
     target_link_libraries(strix-mtp-draft-binding-tests PRIVATE strix_core)
