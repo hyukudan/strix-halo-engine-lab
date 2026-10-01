@@ -361,7 +361,8 @@ struct DeviceBuffer {
 
     ~DeviceBuffer() {
         if (pointer != nullptr) {
-            hipFree(pointer);
+            static_cast<void>(
+                hipFree(pointer));
         }
     }
 };
