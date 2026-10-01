@@ -19,6 +19,8 @@
 
 | D-013 | Fijar el desempate QSA por menor índice de bloque cuando los scores sean idénticos. | El forward canónico usa `torch.topk`, cuyos índices empatados no tienen estabilidad garantizada; el motor necesita replay reproducible y la misma regla debe usarse en serial y MTP. | E-041, E-043 y fixture `qsa_tie`. | Reabrir solo si Qwen publica un desempate canónico explícito incompatible. |
 
+| D-014 | Modelar cada USB4 físico como transporte autónomo con epoch, lease, TX/RX pools y contabilidad propios; el modo dual-link es una política por encima de dos enlaces cualificados. | Evita asumir suma de ancho de banda, aísla fallos y permite flow distribution/directional split/striping solo con evidencia de independencia. | E-044 a E-048; docs 12 y 16. | Reabrir solo si el hardware demuestra un recurso agregado con ownership/sincronización comunes y beneficio end-to-end. |
+
 ## Pendientes
 
 | ID | Decisión pendiente | Datos necesarios |
@@ -37,6 +39,7 @@
 | P-012 (P0) | Política compatible con Qwen Community License 1.0. | Caso de uso, distribución, servicio comercial y revisión legal si aplica. |
 | P-013 | Valores finales de GTT, reserva y recuperación tras dirty kill. | RAM física, BIOS, kernel/ROCm final y pruebas de presión/reinicio. |
 | P-014 (P0) | Semántica canónica QSA: selección top-k, desempate, indexer y relación con atención densa. | Paper/código oficial, oráculo CPU y pruebas KL/NIAH; no asumir que denso es equivalente. |
+| P-015 | Backend directo GPU-owned DMA-BUF y política dual-link preferida. | Kernel/ROCm exactos en M5, soporte export/import DMA-BUF, consumer-credit/repost, re-arm fiable, medidas 1×USB4/2×USB4 y efecto real sobre decode/prefill. |
 | H-001 | GDN tiled/DPP como primer candidato de optimización tras perfil. | Contrato/oráculo GDN y perfil propio de tráfico/tiempo. |
 | H-002 | Lector directo PLE antes que mmap demand-paged. | Contrato n-gram/PLE, latencia p99, page cache y A/B en hardware. |
 
