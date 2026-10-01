@@ -181,25 +181,6 @@ void rms_norm_heads(
     }
 }
 
-void* upload(
-    const void* source,
-    std::size_t bytes) {
-    void* device = nullptr;
-    check(
-        hipMalloc(
-            &device,
-            bytes),
-        "hipMalloc indexed fixture weight");
-    check(
-        hipMemcpy(
-            device,
-            source,
-            bytes,
-            hipMemcpyHostToDevice),
-        "copy indexed fixture weight");
-    return device;
-}
-
 }  // namespace
 
 int main() try {
