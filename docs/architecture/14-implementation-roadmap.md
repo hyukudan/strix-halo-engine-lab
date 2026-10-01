@@ -133,6 +133,35 @@ Exit gate:
 
 The runtime has measured transport capabilities and can schedule independent transfers across one or two links.
 
+
+### A0.7b — Direct GPU DMA transport tier
+
+Status: **architecture/core synchronization contract implemented; kernel/runtime ABI qualification pending**.
+
+Implement as an optional tier above the existing copy/direct-stream baselines:
+
+- dedicated GPU-owned TX/RX pools;
+- GPU-exported DMA-buffer capability probe;
+- stream-side imported-pool backend;
+- terminal commit record with epoch/sequence/stripe validation;
+- system-scope producer-release / consumer-acquire qualification;
+- explicit consumer-complete credit;
+- RX repost lifecycle and bounded deferred retirement;
+- exclusive per-link lease;
+- repeated cleanup/re-arm reliability gate;
+- operation-specific adapters with portable fallback.
+
+For two physical links:
+
+- separate pools/epochs/leases per link;
+- independent-flow qualification first;
+- direction/role specialization second;
+- single-message striping only after simultaneous independence is proven.
+
+Exit gate:
+
+A direct GPU path improves completed useful GPU-operation latency and the real distributed model workload while preserving deterministic cleanup, recovery and fallback.
+
 ## A1 — Single-node execution
 
 ### A1.0 — Kernel registry and basic exact kernels
