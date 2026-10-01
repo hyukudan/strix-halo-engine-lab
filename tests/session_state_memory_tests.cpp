@@ -1,6 +1,7 @@
 #include "strix/session_state_memory.hpp"
 
 #include "strix/model_contract.hpp"
+#include "strix/memory_plan.hpp"
 
 #include <iostream>
 #include <limits>
