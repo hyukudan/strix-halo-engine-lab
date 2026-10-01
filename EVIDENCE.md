@@ -54,6 +54,8 @@ permitidos son: **observado**, **publicado**, **inferido**, **hipótesis** y
 
 | E-039 | publicado + observado | SGLang y la PR de contraste de llama.cpp coinciden en que el estado que alimenta el siguiente paso MTP es el residual ancho de hyper-connections después del bloque MTP y antes del mixer final de salida. Para el config fijado son 4 streams × 2560 = 10240 valores por fila/request. Se añadió un contrato host-side que rechaza usar el hidden ya colapsado como estado next-step. | `sgl-project/sglang@41cbe65de05b209f3263942389267f79bd749d6a`; `ggml-org/llama.cpp#27836@1d8de7c1b0c7d2febf8f983174d8e6a711e2b1af`; `include/strix/mtp_draft_state_contract.hpp`; `tests/mtp_draft_state_contract_tests.cpp`. | Marcar draft-state propagation como subcontrato resuelto; mantener QSA/output y forward completo bloqueados. |
 
+| E-040 | observado + fixture propio | El oráculo QSA ya presente en `tools/oracles/qwen4_exp_oracle.py` fija para casos sin empate: promedio de keys por bloque comprimido, RMSNorm de la key pooled, score como suma sobre heads de `max(0, q·k)` escalada por `1/sqrt(head_dim)`, top-k de bloques y conservación del tail parcial. El propio oráculo rechaza un empate que pueda afectar al cutoff. | `tools/oracles/qwen4_exp_oracle.py`; `include/strix/qsa_selection_plan.hpp`; `tests/qsa_selection_plan_tests.cpp`. | Marcar selección QSA sin empates como resuelta; mantener abierto el contrato de desempate y, por ello, el gate completo de atención MTP. |
+
 ## Regla para nuevas entradas
 
 Cada evidencia nueva debe incluir identidad del artefacto, comando o prueba,

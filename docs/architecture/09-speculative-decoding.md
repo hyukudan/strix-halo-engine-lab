@@ -128,7 +128,9 @@ streams, apply the shared hidden projection to each stream and add the projected
 embedding to every stream. The next-step draft state is also pinned: preserve the post-block wide
 hyper-connection residual, one row per request, before the final head mixer
 collapses it for logits. For the pinned model this state width is
-`4 * 2560 = 10240`. Attention/QSA and output semantics remain unresolved. The complete contract therefore remains
+`4 * 2560 = 10240`. QSA block pooling/scoring and selection are independently oracled for fixtures
+without a cutoff tie. The canonical cutoff-tie rule remains unresolved, so the
+complete attention gate stays closed. Output semantics also remain unresolved. The complete contract therefore remains
 `forward_semantics_resolved=false`, and executable MTP plan construction MUST
 fail while that flag is false. A manifest-only audit may classify combiner,
 hyper-connection, attention and MoE tensor families without claiming that those

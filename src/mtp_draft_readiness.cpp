@@ -33,7 +33,7 @@ assess_mtp_draft_readiness(
     }
     if (!result.attention_semantics_resolved) {
         result.blockers.emplace_back(
-            "MTP attention/QSA semantics are unresolved");
+            "MTP attention/QSA cutoff-tie semantics are unresolved");
     }
     if (!result.draft_state_semantics_resolved) {
         result.blockers.emplace_back(
