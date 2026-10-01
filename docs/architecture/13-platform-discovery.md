@@ -95,6 +95,32 @@ Multiple logical streams attached to one physical path MUST NOT create multiple 
 
 Finding two host routers does not prove that two links provide independent bandwidth. Independence requires an active simultaneous-transfer test.
 
+
+## Direct-DMA capability discovery
+
+When a direct stream device exists, the platform probe SHOULD separately report whether the host appears capable of higher transport tiers.
+
+Relevant fields include:
+
+- direct-stream ABI/capability revision;
+- GPU DMA-buffer export support;
+- stream-side DMA-buffer import support;
+- exclusive-open/lease state;
+- current device holders;
+- configured ring-frame count;
+- RX-priming state when observable;
+- progress/interrupt mode;
+- interrupt vector and affinity;
+- endpoint/ring generation where exposed;
+- completion re-arm qualification result;
+- imported TX/RX pool state.
+
+Presence of an import capability MUST NOT imply that the direct-DMA path is qualified.
+
+A physical link with an unqualified re-arm path MUST remain below preferred status even if a single transfer succeeds.
+
+For two physical links, these capabilities MUST be reported independently for each link.
+
 ## Dual-link qualification
 
 For a pair of hosts with two candidate USB4 links, active qualification SHOULD measure:
