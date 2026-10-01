@@ -95,6 +95,8 @@ Multiple logical streams attached to one physical path MUST NOT create multiple 
 
 Finding two host routers does not prove that two links provide independent bandwidth. Independence requires an active simultaneous-transfer test.
 
+A processor exposing two native USB4 ports is not sufficient evidence that both links can sustain their nominal rates simultaneously. The platform profile MUST treat independence as a qualified property of the concrete host/port/router topology, not a static CPU-SKU capability.
+
 
 ## Direct-DMA capability discovery
 
