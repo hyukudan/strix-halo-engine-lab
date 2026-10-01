@@ -114,7 +114,7 @@ int main() {
     std::filesystem::create_directories(root / "sys/class/kfd/kfd/topology/nodes/1");
     std::filesystem::create_directories(root / "sys/bus/thunderbolt/devices/domain0");
     std::filesystem::create_directories(root / "sys/bus/thunderbolt/devices/0-0");
-    std::filesystem::create_directories(root / "sys/module/thunderbolt_stream");
+    std::filesystem::create_directories(root / "sys/module/thunderbolt_stream/parameters");
     std::filesystem::create_directories(root / "sys/kernel/config/thunderbolt/stream/0-1.0/data");
     std::filesystem::create_directories(root / "dev");
 
@@ -139,6 +139,12 @@ int main() {
     {
         std::ofstream out(root / "dev/tbstream0");
         out << '\n';
+    }
+    {
+        std::ofstream out(
+            root /
+            "sys/module/thunderbolt_stream/parameters/zc_diagnostic_dmabuf");
+        out << "Y\n";
     }
 
     {
@@ -170,6 +176,10 @@ int main() {
            "platform probe discovers USB4 stream device");
     expect(platform.usb4.stream_driver_present,
            "platform probe detects USB4 stream driver");
+    expect(platform.usb4.dma_buf_import_gate_present &&
+               platform.usb4.dma_buf_import_gate_enabled.has_value() &&
+               *platform.usb4.dma_buf_import_gate_enabled,
+           "platform probe reports direct-DMA import gate as present/enabled without treating it as qualified");
     expect(platform.usb4.configured_streams.size() == 1,
            "platform probe discovers configured USB4 stream");
     if (platform.usb4.configured_streams.size() == 1) {
