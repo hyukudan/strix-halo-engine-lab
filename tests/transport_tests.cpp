@@ -180,6 +180,56 @@ int main() {
     expect(!direct_link_usable(lifecycle),
            "direct link is unusable before receive ring is primed");
 
+
+    std::vector<LinkProfile> completion_links(2);
+    completion_links[0].id = "wire-fast-consumer-slow";
+    completion_links[0].peer_node = 1;
+    completion_links[0].health =
+        LinkHealth::qualified;
+    completion_links[0].payload_bytes_per_second =
+        2'000'000'000.0;
+    completion_links[0].one_way_latency_seconds =
+        10e-6;
+    completion_links[0].consumer_completion_seconds =
+        80e-6;
+
+    completion_links[1].id = "wire-slower-consumer-fast";
+    completion_links[1].peer_node = 1;
+    completion_links[1].health =
+        LinkHealth::qualified;
+    completion_links[1].payload_bytes_per_second =
+        1'500'000'000.0;
+    completion_links[1].one_way_latency_seconds =
+        15e-6;
+    completion_links[1].consumer_completion_seconds =
+        10e-6;
+
+    SchedulerPolicy receive_policy;
+    receive_policy.minimum_stripe_bytes =
+        1ULL << 30U;
+    receive_policy.completion_target =
+        LinkCompletionTarget::receive_ready;
+    const auto receive_choice =
+        plan_transfer(
+            completion_links,
+            4096,
+            TransferPriority::normal,
+            receive_policy);
+    expect(receive_choice.slices[0].link_index == 0,
+           "receive-ready scheduling prefers faster wire");
+
+    auto consumer_policy = receive_policy;
+    consumer_policy.completion_target =
+        LinkCompletionTarget::remote_consumer_complete;
+    const auto consumer_choice =
+        plan_transfer(
+            completion_links,
+            4096,
+            TransferPriority::normal,
+            consumer_policy);
+    expect(consumer_choice.slices[0].link_index == 1,
+           "consumer-complete scheduling can prefer lower end-to-end cost");
+
     std::vector<LinkProfile> links(2);
     links[0].id = "a";
     links[0].peer_node = 1;
