@@ -48,6 +48,19 @@ std::optional<std::string> read_first_line(const std::filesystem::path& path) {
     return line;
 }
 
+
+std::optional<bool> parse_bool_switch(std::string_view text) noexcept {
+    if (text == "1" || text == "Y" || text == "y" ||
+        text == "yes" || text == "true") {
+        return true;
+    }
+    if (text == "0" || text == "N" || text == "n" ||
+        text == "no" || text == "false") {
+        return false;
+    }
+    return std::nullopt;
+}
+
 std::optional<std::int64_t> parse_i64(std::string_view text) noexcept {
     std::int64_t value = 0;
     const auto result = std::from_chars(text.data(), text.data() + text.size(), value);
@@ -289,6 +302,20 @@ PlatformInfo probe_platform(const std::filesystem::path& root) {
     info.usb4.stream_driver_present =
         std::filesystem::exists(rooted(root, "sys/module/thunderbolt_stream")) ||
         std::filesystem::exists(rooted(root, "sys/bus/thunderbolt/drivers/thunderbolt_stream"));
+
+    const auto dma_buf_gate =
+        rooted(
+            root,
+            "sys/module/thunderbolt_stream/parameters/zc_diagnostic_dmabuf");
+    info.usb4.dma_buf_import_gate_present =
+        std::filesystem::exists(dma_buf_gate);
+    if (info.usb4.dma_buf_import_gate_present) {
+        if (const auto value = read_first_line(dma_buf_gate);
+            value.has_value()) {
+            info.usb4.dma_buf_import_gate_enabled =
+                parse_bool_switch(*value);
+        }
+    }
 
     return info;
 }
