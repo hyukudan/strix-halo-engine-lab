@@ -72,7 +72,12 @@ For a multi-node-qualified build, also:
 20. distributed long prefill;
 21. distributed failure and fallback;
 22. peer restart and reconnect;
-23. sustained multi-node soak.
+23. sustained multi-node soak;
+24. direct-link stop/re-arm/first-completion loop;
+25. consumer-credit and RX-repost pressure;
+26. dual-link one-link-failure during independent flows;
+27. dual-link one-link-failure during a striped message;
+28. degrade-to-one-link and later requalification.
 
 ## Transport message matrix
 
@@ -191,6 +196,39 @@ Qualification SHOULD include:
 - one-link versus dual-link equivalence;
 - reconnect and fallback without stale tensor reuse.
 
+
+## Completed GPU-operation boundary
+
+For direct GPU transport, the primary latency metric is the completed useful GPU operation rather than bare wire transfer.
+
+Where applicable, measure from producer readiness through:
+
+- GPU pack or production;
+- producer release to the external DMA domain;
+- transfer;
+- receive validation;
+- GPU consumer work;
+- consumer-complete credit or equivalent completion required before producer-side reuse.
+
+Raw transfer latency and payload bandwidth remain supporting metrics.
+
+A path that reduces DMA time but increases pack, validation, retirement or repost cost MUST NOT be reported as an end-to-end win.
+
+## Direct-link lifecycle qualification
+
+A direct transport profile MUST include repeated:
+
+- prepare;
+- first transfer;
+- steady-state transfers;
+- drain;
+- cleanup;
+- re-arm;
+- first transfer after re-arm.
+
+First-completion loss, stale interrupt state, orphaned holders or partial pair setup are release blockers.
+
+For direct-DMA pools, report consumer completion and RX repost backlog separately from receive-DMA completion.
 
 ## Multi-node qualification
 
