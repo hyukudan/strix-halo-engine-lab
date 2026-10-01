@@ -53,7 +53,8 @@ assess_serial_decode_replay(
             observation.engine_argmax_tokens;
 
     result.logits_checked =
-        observation.logit_values_compared != 0;
+        observation.logit_values_compared >=
+            policy.minimum_logit_values_compared;
 
     result.logits_within_policy =
         result.logits_checked &&
