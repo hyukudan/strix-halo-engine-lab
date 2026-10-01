@@ -382,10 +382,11 @@ Additional A1.6 runtime work now implemented:
 - MTP compatibility identity excludes physical relocation, while a separate physical binding identity includes storage, addresses and allocation generations;
 - MTP draft state cannot cross checkpoint-content identity;
 - pinned MTP structural contract from the official config: one full-attention predictor layer, shared embeddings, null explicit hidden-source layer, base-model attention geometry and a planning-only 2 KiB/token KV estimate;
-- MTP semantic gates are tracked independently: input fusion is resolved by a host oracle, while attention/QSA, draft-state propagation, output semantics and the complete forward remain unresolved;
+- MTP semantic gates are tracked independently: input fusion and next-step draft-state propagation are resolved by independent host-side contracts, while attention/QSA, output semantics and the complete forward remain unresolved;
 - executable MTP construction is explicitly blocked while the complete `forward_semantics_resolved` gate remains false;
 - offline `strix-mtp-manifest-audit MTP.gguf` reports required structural tensor families, unresolved MTP tensors and missing families without allocating GPU state;
 - host-side MTP input-fusion oracle pins per-stream semantics: normalized embedding is projected once and broadcast, normalized wide hidden is reshaped into `hc_count` streams and projected independently before summation;
+- next-step MTP draft state is pinned as the post-block wide residual before final head collapse, with width `hc_count * hidden_size = 10240` for the target model;
 - deterministic bounded prompt-lookup drafter using the most recent non-overlapping suffix n-gram match;
 - prompt-lookup history has an explicit token-capacity bound and proposal identity;
 - draft wrapper preflights target runtime/session before proposal and clamps effective proposal depth by remaining context and `token_budget - 1`;

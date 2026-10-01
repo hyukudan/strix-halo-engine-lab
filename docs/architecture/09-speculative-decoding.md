@@ -125,8 +125,10 @@ separately from forward semantics. The semantic contract is split into independe
 resolved by an independent host oracle: normalize embedding and wide hidden,
 project the embedding once, reshape the wide hidden into `hc_count` independent
 streams, apply the shared hidden projection to each stream and add the projected
-embedding to every stream. Attention/QSA, draft-state propagation and output
-semantics remain unresolved. The complete contract therefore remains
+embedding to every stream. The next-step draft state is also pinned: preserve the post-block wide
+hyper-connection residual, one row per request, before the final head mixer
+collapses it for logits. For the pinned model this state width is
+`4 * 2560 = 10240`. Attention/QSA and output semantics remain unresolved. The complete contract therefore remains
 `forward_semantics_resolved=false`, and executable MTP plan construction MUST
 fail while that flag is false. A manifest-only audit may classify combiner,
 hyper-connection, attention and MoE tensor families without claiming that those
