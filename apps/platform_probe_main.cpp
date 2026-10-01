@@ -43,7 +43,7 @@ int main() {
     const auto info = strix::probe_platform();
 
     std::cout << "{\n"
-              << "  \"linux\": " << (info.linux ? "true" : "false") << ",\n"
+              << "  \"linux\": " << (info.is_linux ? "true" : "false") << ",\n"
               << "  \"kernel_release\": \"" << json_escape(info.kernel_release) << "\",\n"
               << "  \"mem_total_bytes\": " << info.mem_total_bytes << ",\n"
               << "  \"rocm_version\": ";
