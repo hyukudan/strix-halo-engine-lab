@@ -23,6 +23,7 @@ struct CompiledSpeculativeVerifyExecution {
     std::uint64_t kernel_plan_identity = 0;
     std::uint64_t execution_identity = 0;
 
+    std::uint64_t vocab_size = 0;
     std::uint32_t candidate_depth = 0;
     std::uint32_t request_concurrency = 1;
     std::uint32_t sequential_window_steps = 0;

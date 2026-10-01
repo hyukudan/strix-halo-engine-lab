@@ -47,6 +47,13 @@ prepare_greedy_speculation_cycle(
         throw std::overflow_error(
             "speculation candidate depth exceeds uint32");
     }
+    for (const auto token : request.candidate_tokens) {
+        if (static_cast<std::uint64_t>(token) >=
+            model.vocab_size) {
+            throw std::invalid_argument(
+                "speculation candidate token is outside model vocabulary");
+        }
+    }
 
     const auto verify_end =
         checked_add(

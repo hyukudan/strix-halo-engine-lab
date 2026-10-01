@@ -387,6 +387,38 @@ int main() {
 
     {
         Fixture fixture;
+        const std::vector<std::uint32_t> candidates{
+            10,
+            static_cast<std::uint32_t>(
+                fixture.compiled.vocab_size),
+            30,
+            40};
+        RecordingDispatcher dispatcher;
+        dispatcher.expected_identity = fixture.compiled.execution_identity;
+
+        bool rejected = false;
+        try {
+            static_cast<void>(
+                strix::execute_compiled_speculative_verify_eager(
+                    fixture.compiled,
+                    fixture.resources,
+                    fixture.session,
+                    candidates,
+                    dispatcher));
+        } catch (const std::invalid_argument&) {
+            rejected = true;
+        }
+        expect(rejected &&
+                   dispatcher.calls == 0 &&
+                   fixture.session.health ==
+                       strix::SerialSessionHealth::ready &&
+                   fixture.session.next_position == 10 &&
+                   fixture.session.committed_tokens == 10,
+               "out-of-vocabulary verify candidate fails before dispatch");
+    }
+
+    {
+        Fixture fixture;
         fixture.session.next_position = 62;
         fixture.session.committed_tokens = 62;
         const std::vector<std::uint32_t> candidates{

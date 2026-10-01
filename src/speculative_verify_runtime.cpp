@@ -37,6 +37,17 @@ execute_compiled_speculative_verify_eager(
         throw std::invalid_argument(
             "candidate token count does not match compiled verify depth");
     }
+    if (compiled.vocab_size == 0) {
+        throw std::invalid_argument(
+            "speculative verify vocabulary is not initialized");
+    }
+    for (const auto token : candidate_tokens) {
+        if (static_cast<std::uint64_t>(token) >=
+            compiled.vocab_size) {
+            throw std::invalid_argument(
+                "speculative verify candidate token is outside compiled vocabulary");
+        }
+    }
     if (session.health !=
         SerialSessionHealth::ready) {
         throw std::logic_error(

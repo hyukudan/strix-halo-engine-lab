@@ -121,6 +121,30 @@ int main() {
     }
 
     {
+        const std::vector<std::uint32_t> candidates{
+            static_cast<std::uint32_t>(
+                model.vocab_size)};
+        const std::vector<std::uint32_t> target{42};
+        auto request =
+            base_request(
+                candidates,
+                target);
+
+        bool rejected = false;
+        try {
+            static_cast<void>(
+                strix::prepare_greedy_speculation_cycle(
+                    model,
+                    layout,
+                    request));
+        } catch (const std::invalid_argument&) {
+            rejected = true;
+        }
+        expect(rejected,
+               "out-of-vocabulary draft candidate is rejected during cycle preparation");
+    }
+
+    {
         const std::vector<std::uint32_t> candidates;
         const std::vector<std::uint32_t> target{42};
         auto request =

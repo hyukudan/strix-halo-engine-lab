@@ -149,6 +149,8 @@ compile_speculative_verify_execution(
     }
 
     CompiledSpeculativeVerifyExecution compiled;
+    compiled.vocab_size =
+        model.vocab_size;
     compiled.candidate_depth =
         candidate_depth;
     compiled.request_concurrency =
