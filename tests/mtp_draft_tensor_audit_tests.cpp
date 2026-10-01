@@ -49,7 +49,8 @@ struct Fixture {
         add("mtp.hnorm.weight");
         add("mtp.hyper_connection_mixer.down.weight");
         add("mtp.layers.0.self_attn.q_proj.weight");
-        add("mtp.layers.0.mlp.experts.0.gate_proj.weight");
+        add("mtp.layers.0.self_attn.indexer.index_qk_proj.weight");
+        add("mtp.layers.0.mlp.experts.gate_up_proj.weight");
         add("mtp.unresolved.extra.weight");
         manifest.layout_identity =
             strix::model_manifest_layout_identity(
@@ -88,9 +89,9 @@ int main() {
         expect(audit.structurally_complete(),
                "MTP audit recognizes all required structural tensor families");
         expect(audit.unclassified_mtp_tensors ==
-                   std::vector<std::uint32_t>({7}),
+                   std::vector<std::uint32_t>({8}),
                "MTP audit preserves unresolved tensors instead of guessing their role");
-        expect(audit.families.size() == 6,
+        expect(audit.families.size() == 7,
                "MTP audit emits every required structural family");
     }
 
@@ -120,6 +121,29 @@ int main() {
     {
         Fixture fixture;
         fixture.manifest.tensors[6].name =
+            "mtp.unresolved.indexer_removed";
+        fixture.manifest.layout_identity =
+            strix::model_manifest_layout_identity(
+                fixture.manifest);
+        fixture.binding.manifest_layout_identity =
+            fixture.manifest.layout_identity;
+
+        const auto audit =
+            strix::audit_mtp_draft_tensor_families(
+                fixture.manifest,
+                fixture.binding);
+        expect(!audit.structurally_complete() &&
+                   std::find(
+                       audit.missing_required_families.begin(),
+                       audit.missing_required_families.end(),
+                       strix::MtpTensorFamily::indexer) !=
+                       audit.missing_required_families.end(),
+               "MTP audit reports missing predictor indexer family");
+    }
+
+    {
+        Fixture fixture;
+        fixture.manifest.tensors[7].name =
             "mtp.unresolved.moe_removed";
         fixture.manifest.layout_identity =
             strix::model_manifest_layout_identity(

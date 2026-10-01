@@ -15,6 +15,7 @@ enum class MtpTensorFamily {
     hidden_norm,
     hyper_connection_mixer,
     attention,
+    indexer,
     moe,
 };
 

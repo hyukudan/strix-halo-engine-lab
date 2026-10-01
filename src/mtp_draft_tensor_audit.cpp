@@ -53,6 +53,12 @@ bool classify(
             MtpTensorFamily::hyper_connection_mixer;
         return true;
     }
+    if (contains(name, "indexer") ||
+        contains(name, "index_qk")) {
+        result =
+            MtpTensorFamily::indexer;
+        return true;
+    }
     if (contains(name, "attn") ||
         contains(name, "q_proj") ||
         contains(name, "k_proj") ||
@@ -98,6 +104,7 @@ audit_mtp_draft_tensor_families(
         {MtpTensorFamily::hidden_norm, true, {}},
         {MtpTensorFamily::hyper_connection_mixer, true, {}},
         {MtpTensorFamily::attention, true, {}},
+        {MtpTensorFamily::indexer, true, {}},
         {MtpTensorFamily::moe, true, {}},
     };
 
@@ -231,6 +238,8 @@ to_string(MtpTensorFamily family) noexcept {
         return "hyper_connection_mixer";
     case MtpTensorFamily::attention:
         return "attention";
+    case MtpTensorFamily::indexer:
+        return "indexer";
     case MtpTensorFamily::moe:
         return "moe";
     }
