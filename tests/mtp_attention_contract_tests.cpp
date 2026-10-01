@@ -44,8 +44,10 @@ int main() {
     expect(contract.kv_row_bytes == 2048 &&
                contract.raw_index_row_bytes == 256,
            "MTP attention state accounts KV and raw index rows per token");
-    expect(!contract.sparse_selection_semantics_resolved,
-           "MTP attention structure does not overclaim unresolved sparse selection semantics");
+    expect(contract.no_tie_selection_semantics_resolved &&
+               !contract.cutoff_tie_semantics_resolved &&
+               !contract.sparse_selection_semantics_resolved,
+           "MTP attention resolves no-tie QSA while preserving open cutoff-tie semantics");
 
     strix::validate_mtp_attention_structural_contract(
         model,

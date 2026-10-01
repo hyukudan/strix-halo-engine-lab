@@ -28,8 +28,11 @@ struct MtpAttentionStructuralContract {
     std::uint64_t kv_row_bytes = 0;
     std::uint64_t raw_index_row_bytes = 0;
 
-    // Structure/state geometry is known; sparse-selection semantics and tie
-    // behavior remain independently unresolved.
+    // The existing independent oracle resolves the no-tie scoring/selection
+    // path. Cutoff tie behavior remains open, so the complete sparse-selection
+    // gate stays false.
+    bool no_tie_selection_semantics_resolved = true;
+    bool cutoff_tie_semantics_resolved = false;
     bool sparse_selection_semantics_resolved = false;
 };
 

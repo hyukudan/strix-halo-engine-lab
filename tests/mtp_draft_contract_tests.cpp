@@ -67,6 +67,11 @@ int main() {
         mtp_binding,
         contract);
 
+    expect(contract.input_fusion_semantics_resolved &&
+               contract.draft_state_semantics_resolved &&
+               !contract.attention_semantics_resolved,
+           "complete MTP attention remains gated despite no-tie QSA oracle");
+
     auto overclaimed = contract;
     overclaimed.forward_semantics_resolved = true;
     bool overclaim_rejected = false;

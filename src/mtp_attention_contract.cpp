@@ -79,6 +79,10 @@ build_mtp_attention_structural_contract(
                 model.indexer_head_dim),
             model.bytes_bf16);
 
+    contract.no_tie_selection_semantics_resolved =
+        true;
+    contract.cutoff_tie_semantics_resolved =
+        false;
     contract.sparse_selection_semantics_resolved =
         false;
     return contract;
@@ -121,6 +125,8 @@ void validate_mtp_attention_structural_contract(
             expected.kv_row_bytes ||
         contract.raw_index_row_bytes !=
             expected.raw_index_row_bytes ||
+        !contract.no_tie_selection_semantics_resolved ||
+        contract.cutoff_tie_semantics_resolved ||
         contract.sparse_selection_semantics_resolved) {
         throw std::invalid_argument(
             "MTP attention structural contract is stale, incompatible or overclaims QSA semantics");
