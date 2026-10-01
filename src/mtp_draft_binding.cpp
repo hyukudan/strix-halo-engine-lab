@@ -176,4 +176,32 @@ void validate_mtp_draft_runtime_binding(
     }
 }
 
+DraftProposalStateContext
+make_mtp_draft_proposal_state(
+    const MtpDraftRuntimeBinding& draft,
+    const SerialSessionContext& target_session) {
+    if (draft.compatibility_identity == 0) {
+        throw std::invalid_argument(
+            "MTP draft binding requires non-zero compatibility identity");
+    }
+    return make_draft_proposal_state(
+        draft.compatibility_identity,
+        target_session);
+}
+
+void validate_mtp_draft_proposal_state(
+    const MtpDraftRuntimeBinding& draft,
+    const DraftProposalStateContext& state,
+    const SerialSessionContext& target_session) {
+    if (draft.compatibility_identity == 0 ||
+        state.proposal_identity !=
+            draft.compatibility_identity) {
+        throw std::invalid_argument(
+            "MTP draft proposal state identity mismatch");
+    }
+    validate_draft_proposal_state(
+        state,
+        target_session);
+}
+
 }  // namespace strix

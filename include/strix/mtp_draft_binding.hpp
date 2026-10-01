@@ -1,5 +1,6 @@
 #pragma once
 
+#include "strix/draft_proposal_state.hpp"
 #include "strix/model_manifest.hpp"
 #include "strix/model_runtime_binding.hpp"
 
@@ -32,5 +33,15 @@ void validate_mtp_draft_runtime_binding(
     const ModelManifest& manifest,
     const ModelRuntimeBinding& runtime,
     const MtpDraftRuntimeBinding& draft);
+
+[[nodiscard]] DraftProposalStateContext
+make_mtp_draft_proposal_state(
+    const MtpDraftRuntimeBinding& draft,
+    const SerialSessionContext& target_session);
+
+void validate_mtp_draft_proposal_state(
+    const MtpDraftRuntimeBinding& draft,
+    const DraftProposalStateContext& state,
+    const SerialSessionContext& target_session);
 
 }  // namespace strix

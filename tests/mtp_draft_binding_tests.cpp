@@ -110,6 +110,24 @@ int main() {
             fixture.runtime,
             draft);
 
+        strix::SerialSessionContext target_session;
+        target_session.execution_identity = 0x100ULL;
+        target_session.state_layout_identity = 0x200ULL;
+        target_session.runtime_compatibility_identity = 0x300ULL;
+        target_session.next_position = 12;
+        target_session.committed_tokens = 12;
+        const auto proposal_state =
+            strix::make_mtp_draft_proposal_state(
+                draft,
+                target_session);
+        strix::validate_mtp_draft_proposal_state(
+            draft,
+            proposal_state,
+            target_session);
+        expect(proposal_state.proposal_identity ==
+                   draft.compatibility_identity,
+               "MTP draft state binds compatibility identity");
+
         auto relocated_runtime =
             fixture.runtime;
         relocated_runtime.tensors[1].address +=
@@ -125,6 +143,10 @@ int main() {
                    relocated.physical_binding_identity !=
                        draft.physical_binding_identity,
                "MTP compatibility survives relocation while physical identity changes");
+        strix::validate_mtp_draft_proposal_state(
+            relocated,
+            proposal_state,
+            target_session);
 
         auto changed_content =
             fixture.runtime;
@@ -136,6 +158,18 @@ int main() {
         expect(changed.compatibility_identity !=
                    draft.compatibility_identity,
                "MTP compatibility binds model content identity");
+
+        bool changed_state_rejected = false;
+        try {
+            strix::validate_mtp_draft_proposal_state(
+                changed,
+                proposal_state,
+                target_session);
+        } catch (const std::invalid_argument&) {
+            changed_state_rejected = true;
+        }
+        expect(changed_state_rejected,
+               "MTP draft state cannot cross checkpoint content identity");
     }
 
     {
