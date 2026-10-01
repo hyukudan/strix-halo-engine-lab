@@ -369,13 +369,14 @@ int main() {
     expect(state_layout_identity_rejected,
            "state-layout identity mismatch is rejected");
 
+    auto invalid_token_session = before_failure;
     bool token_rejected = false;
     try {
         SessionDispatcher unused;
         static_cast<void>(
             strix::execute_serial_token(
                 compiled,
-                before_failure,
+                invalid_token_session,
                 memory,
                 state_layout,
                 state_memory,
