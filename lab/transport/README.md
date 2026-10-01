@@ -228,3 +228,71 @@ It is intentionally called **parallel flows**, not single-tensor striping:
 
 A later single-tensor striping harness must add reassembly cost to the measured
 critical path.
+
+## GPU-owned direct-DMA qualification plan
+
+The copy/read-write USB4STREAM harness is the baseline for a later GPU-owned transport tier.
+
+The direct-DMA experiment must keep separate TX and RX pools per physical link and must not reuse the inference scratch arena or persistent model/session state as transport storage.
+
+Before a direct-DMA result can be compared with the copy baseline, record:
+
+- physical link identity;
+- connection epoch;
+- direct-stream ABI/capability identity;
+- TX/RX pool bytes and allocation generations;
+- exclusive lease state;
+- ring/frame count;
+- progress mode;
+- interrupt throttling;
+- RX posted/in-flight/repost counts;
+- local TX reuse completion;
+- RX DMA completion;
+- remote GPU consumer-complete credit;
+- completed useful GPU-operation latency.
+
+The first direct-DMA operation should be a fixed-shape activation transfer or exact two-peer reduction with an ordinary portable fallback.
+
+### Synchronization gate
+
+A received payload is not reusable storage merely because DMA completed.
+
+The experiment must prove:
+
+1. producer GPU writes payload;
+2. producer publishes a terminal commit record with release semantics;
+3. external DMA transfers payload plus terminal record;
+4. consumer observes the commit with acquire semantics;
+5. consumer validates epoch/sequence/length/stripe metadata;
+6. consumer GPU finishes using the RX slot;
+7. transport completion accounting retires the message;
+8. RX frames are reposted;
+9. only then is the RX slot reusable.
+
+### Dual-link gate
+
+For two physical USB4 links, create one independent direct endpoint per link.
+
+Each endpoint owns its own:
+
+- TX/RX pools;
+- epoch;
+- lease;
+- frame counters;
+- completion/repost queue;
+- performance profile.
+
+Qualify in this order:
+
+1. link A alone;
+2. link B alone;
+3. two independent same-direction flows;
+4. two independent opposite-direction flows;
+5. latency-critical traffic on one link plus bulk traffic on the other;
+6. large logical message striped across both links;
+7. failure of one link during independent flows;
+8. failure of one link during a striped message;
+9. clean degradation to one link;
+10. cleanup/re-arm/requalification of the failed link.
+
+Single-message striping is not valid until every stripe commits and the total stripe byte count exactly matches the logical transfer descriptor. A partial tensor must never be published.
