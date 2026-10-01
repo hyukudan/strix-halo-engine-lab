@@ -617,6 +617,7 @@ int main() {
                     allocator,
                     generations,
                     transfer,
+                    draft_state,
                     draft,
                     backend));
         } catch (const std::invalid_argument&) {
