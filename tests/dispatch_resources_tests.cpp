@@ -188,11 +188,11 @@ int main() {
                recurrent.allocation_generation == 3,
            "dispatch state resolver uses persistent device pool");
 
-    const auto& tensor_access =
+    const auto& resolved_tensor_access =
         strix::resolve_dispatch_tensor_access(
             context, 0);
-    expect(tensor_access.tensor_indices.size() == 1 &&
-               tensor_access.tensor_indices[0] == 0,
+    expect(resolved_tensor_access.tensor_indices.size() == 1 &&
+               resolved_tensor_access.tensor_indices[0] == 0,
            "dispatch tensor slot resolves precompiled tensor indices");
 
     const auto& tensor_by_index =
