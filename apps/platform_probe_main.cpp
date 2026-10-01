@@ -116,6 +116,14 @@ int main() {
     std::cout << "    ]";
     std::cout << ",\n    \"stream_driver_present\": "
               << (info.usb4.stream_driver_present ? "true" : "false")
-              << "\n  }\n}\n";
+              << ",\n    \"dma_buf_import_gate_present\": "
+              << (info.usb4.dma_buf_import_gate_present ? "true" : "false")
+              << ",\n    \"dma_buf_import_gate_enabled\": ";
+    if (info.usb4.dma_buf_import_gate_enabled.has_value()) {
+        std::cout << (*info.usb4.dma_buf_import_gate_enabled ? "true" : "false");
+    } else {
+        std::cout << "null";
+    }
+    std::cout << "\n  }\n}\n";
     return 0;
 }
