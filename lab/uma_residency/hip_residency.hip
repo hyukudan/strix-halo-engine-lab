@@ -117,7 +117,7 @@ struct Region {
 
     ~Region() {
         if (registered) {
-            hipHostUnregister(address);
+            static_cast<void>(hipHostUnregister(address));
         }
         if (address != MAP_FAILED) {
             munmap(address, static_cast<std::size_t>(bytes));
@@ -264,31 +264,26 @@ int main(int argc, char** argv) try {
     unsigned long long checksum = 0;
     for (const auto value : host_sums) checksum += value;
 
-    std::cout << "{
-"
-              << "  \"mode\": \"" << options.mode << "\",
-"
-              << "  \"bytes\": " << options.bytes << ",
-"
-              << "  \"direct_read_gib_s\": " << gib_s(options.bytes, direct_read_s) << ",
-"
-              << "  \"direct_write_gib_s\": " << gib_s(options.bytes, direct_write_s) << ",
-"
-              << "  \"h2d_gib_s\": " << gib_s(options.bytes, h2d_s) << ",
-"
-              << "  \"d2h_gib_s\": " << gib_s(options.bytes, d2h_s) << ",
-"
-              << "  \"direct_read_checksum\": " << checksum << ",
-"
-              << "  \"mapped_write_visible\": " << (write_visible ? "true" : "false") << "
-"
-              << "}
-";
+    std::cout << '{' << '\n'
+              << "  \"mode\": \"" << options.mode << "\"," << '\n'
+              << "  \"bytes\": " << options.bytes << ',' << '\n'
+              << "  \"direct_read_gib_s\": "
+              << gib_s(options.bytes, direct_read_s) << ',' << '\n'
+              << "  \"direct_write_gib_s\": "
+              << gib_s(options.bytes, direct_write_s) << ',' << '\n'
+              << "  \"h2d_gib_s\": "
+              << gib_s(options.bytes, h2d_s) << ',' << '\n'
+              << "  \"d2h_gib_s\": "
+              << gib_s(options.bytes, d2h_s) << ',' << '\n'
+              << "  \"direct_read_checksum\": " << checksum << ',' << '\n'
+              << "  \"mapped_write_visible\": "
+              << (mapped_write_visible ? "true" : "false") << '\n'
+              << '}' << '\n';
 
-    hipEventDestroy(begin);
-    hipEventDestroy(end);
-    hipFree(staging);
-    hipFree(sums);
+    static_cast<void>(hipEventDestroy(begin));
+    static_cast<void>(hipEventDestroy(end));
+    static_cast<void>(hipFree(staging));
+    static_cast<void>(hipFree(sums));
     return 0;
 } catch (const std::exception& error) {
     std::cerr << "strix-uma-hip: " << error.what() << '\n';
