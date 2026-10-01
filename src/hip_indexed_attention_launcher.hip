@@ -226,12 +226,6 @@ __device__ float load_activation(
     return bf16_to_float(*value);
 }
 
-__device__ void store_activation(
-    std::uint16_t* destination,
-    float value) {
-    *destination =
-        float_to_bf16(value);
-}
 
 __device__ std::uint8_t iq4_local_scale(
     const IQ4XSBlock& block,
