@@ -48,6 +48,8 @@ permitidos son: **observado**, **publicado**, **inferido**, **hipótesis** y
 
 | E-036 | publicado + observado | La revisión fijada de Transformers define assisted greedy verification como aceptación del prefijo candidato contiguo igual al `argmax` del target, seguido de un token bonus del target; tras EOS/longitud recompone `n_matches = valid_tokens - 1` y recorta `candidate_length - n_matches` posiciones de cache. La misma revisión define sampled speculative con ratio `p/q` y fallback `[p-q]+`, pero su replay exacto depende del RNG. | `huggingface/transformers@ebd5de00b43e94cae2da6d7aeb5a76ecdda51dae`, `generation/utils.py`, `generation/candidate_generator.py`; `include/strix/speculation.hpp`; `tests/speculation_tests.cpp`. | Cerrar aceptación MTP greedy; mantener sampled bloqueado hasta fijar stream/consumo RNG. |
 
+| E-037 | publicado + observado | La PR abierta de contraste para qwen4exp MTP describe un head de una capa con combiner embedding+hidden, bloque de atención+MoE envuelto en hyper-connections y estado hidden recurrente entre pasos draft; la propia implementación contiene un TODO de QSA para el camino MTP y existen reportes posteriores de aislamiento multi-slot, por lo que no se adopta como oráculo semántico. El motor propio solo extrae de aquí familias estructurales para auditoría y mantiene la ejecución MTP bloqueada. | `ggml-org/llama.cpp#27836@1d8de7c1b0c7d2febf8f983174d8e6a711e2b1af`; `include/strix/mtp_draft_contract.hpp`; `include/strix/mtp_draft_tensor_audit.hpp`. | Mantener separación estructura/semántica; exigir contrato independiente antes de implementar el forward MTP. |
+
 ## Regla para nuevas entradas
 
 Cada evidencia nueva debe incluir identidad del artefacto, comando o prueba,

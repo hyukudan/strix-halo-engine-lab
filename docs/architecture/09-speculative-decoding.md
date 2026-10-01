@@ -118,6 +118,15 @@ identity excludes physical relocation; pointer/storage/allocation changes are
 tracked by a separate physical binding identity. This binding is structural and
 does not imply semantic or hardware qualification.
 
+The pinned official configuration fixes a structural MTP envelope: one
+full-attention predictor layer, shared token embeddings, no explicit
+hidden-state source layer and the base attention geometry. This is represented
+separately from forward semantics. The structural contract remains marked
+`forward_semantics_resolved=false`, and executable MTP plan construction MUST
+fail while that flag is false. A manifest-only audit may classify combiner,
+hyper-connection, attention and MoE tensor families without claiming that those
+families determine the canonical forward.
+
 The host runtime also provides a bounded prompt-lookup proposal path. It matches
 the current suffix n-gram against the most recent non-overlapping prior
 occurrence and proposes only tokens already present in retained history. Its

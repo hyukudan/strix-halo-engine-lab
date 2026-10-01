@@ -381,6 +381,9 @@ Additional A1.6 runtime work now implemented:
 - MTP draft binding selects only manifest tensors classified as `mtp`, accounts their exact bytes and binds both model layout and content identity;
 - MTP compatibility identity excludes physical relocation, while a separate physical binding identity includes storage, addresses and allocation generations;
 - MTP draft state cannot cross checkpoint-content identity;
+- pinned MTP structural contract from the official config: one full-attention predictor layer, shared embeddings, null explicit hidden-source layer, base-model attention geometry and a planning-only 2 KiB/token KV estimate;
+- MTP structural contract carries `forward_semantics_resolved=false` and executable MTP construction is explicitly blocked while that remains false;
+- offline `strix-mtp-manifest-audit MTP.gguf` reports required structural tensor families, unresolved MTP tensors and missing families without allocating GPU state;
 - deterministic bounded prompt-lookup drafter using the most recent non-overlapping suffix n-gram match;
 - prompt-lookup history has an explicit token-capacity bound and proposal identity;
 - draft wrapper preflights target runtime/session before proposal and clamps effective proposal depth by remaining context and `token_budget - 1`;
