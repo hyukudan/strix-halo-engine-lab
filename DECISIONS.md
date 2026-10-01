@@ -21,7 +21,7 @@
 
 | D-014 | Modelar cada USB4 físico como transporte autónomo con epoch, lease, TX/RX pools y contabilidad propios; el modo dual-link es una política por encima de dos enlaces cualificados. | Evita asumir suma de ancho de banda, aísla fallos y permite flow distribution/directional split/striping solo con evidencia de independencia. | E-044 a E-048; docs 12 y 16. | Reabrir solo si el hardware demuestra un recurso agregado con ownership/sincronización comunes y beneficio end-to-end. |
 
-| D-015 | Fijar el desempate MoE top-k por menor índice de experto cuando las probabilidades sean exactamente iguales. | El runtime HIP ya aplica esa comparación y el replay necesita un orden reproducible independiente de la estabilidad del top-k del backend. | E-050; `src/hip_moe_route_launcher.hip`; oráculo MoE. | Reabrir solo si la fuente canónica de Qwen publica una regla de desempate incompatible. |
+| D-015 | Fijar el desempate MoE top-k por menor índice de experto cuando las probabilidades sean exactamente iguales. | El runtime HIP ya aplica esa comparación y el replay necesita un orden reproducible independiente de la estabilidad del top-k del backend. | `src/hip_moe_route_launcher.hip`; `tools/oracles/qwen4_exp_oracle.py`; `tools/oracles/test_qwen4_exp_oracle.py`. | Reabrir solo si la fuente canónica de Qwen publica una regla de desempate incompatible. |
 
 ## Pendientes
 
