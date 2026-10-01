@@ -16,6 +16,8 @@ enum class BufferOwnership {
     receive_complete,
     consumer_acquired,
     consumer_owned,
+    consumer_released,
+    repost_pending,
     reusable,
 };
 
@@ -70,6 +72,8 @@ enum class CompletionKind {
     local_buffer_reusable,
     receive_complete,
     remote_transport_ack,
+    remote_consumer_complete,
+    receive_reposted,
     failed,
 };
 
@@ -77,6 +81,20 @@ struct Completion {
     TransferHandle handle = 0;
     CompletionKind kind = CompletionKind::failed;
     std::uint64_t bytes = 0;
+};
+
+enum class TransportProgressMode {
+    blocking,
+    interrupt_driven,
+    busy_poll,
+    dedicated_poll,
+};
+
+enum class TransportBufferMode {
+    copy_stream,
+    mapped_host,
+    gpu_visible_staging,
+    imported_gpu_dma_buf,
 };
 
 struct BackendCapabilities {
@@ -87,6 +105,14 @@ struct BackendCapabilities {
     bool mapped_host_buffers = false;
     bool gpu_visible_buffers = false;
     bool external_dma = false;
+    bool two_sided = true;
+    bool requires_exclusive_lease = false;
+    bool explicit_receive_repost = false;
+    bool gpu_commit_record = false;
+    TransportProgressMode progress_mode =
+        TransportProgressMode::blocking;
+    TransportBufferMode buffer_mode =
+        TransportBufferMode::copy_stream;
 };
 
 class TransportBackend {
@@ -109,6 +135,59 @@ public:
 
     virtual void cancel(TransferHandle handle) = 0;
 };
+
+inline constexpr std::uint32_t gpu_commit_word =
+    0x53545843U;
+
+struct GpuCommitRecord {
+    std::uint32_t protocol_version = 1;
+    std::uint32_t commit_word = 0;
+    std::uint64_t connection_epoch = 0;
+    std::uint64_t sequence = 0;
+    std::uint32_t payload_bytes = 0;
+    std::uint16_t stripe_index = 0;
+    std::uint16_t stripe_count = 1;
+};
+
+static_assert(sizeof(GpuCommitRecord) == 32);
+
+[[nodiscard]] bool validate_gpu_commit_record(
+    const GpuCommitRecord& record,
+    const TransferDescriptor& descriptor) noexcept;
+
+enum class DirectLinkLifecycleState {
+    portable_only,
+    arm_allowed,
+    preparing,
+    direct_ready,
+    leased,
+    draining,
+    partial,
+    failed,
+};
+
+struct DirectLinkLifecycle {
+    std::string physical_link_id;
+    DirectLinkLifecycleState state =
+        DirectLinkLifecycleState::portable_only;
+    std::uint64_t connection_epoch = 0;
+    std::uint32_t ring_frames = 0;
+    std::uint64_t interrupt_throttling_ns = 0;
+    std::int32_t in_hopid = -1;
+    std::int32_t out_hopid = -1;
+    bool control_link_ready = false;
+    bool peer_reconciled = false;
+    bool receive_ring_primed = false;
+    bool exclusive_lease_available = false;
+    bool dma_buf_import_supported = false;
+    bool completion_rearm_qualified = false;
+};
+
+[[nodiscard]] bool direct_link_armable(
+    const DirectLinkLifecycle& link) noexcept;
+
+[[nodiscard]] bool direct_link_usable(
+    const DirectLinkLifecycle& link) noexcept;
 
 struct LinkProfile {
     std::string id;
