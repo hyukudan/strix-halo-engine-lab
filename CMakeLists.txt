@@ -24,6 +24,7 @@ add_library(strix_core STATIC
     src/compiled_speculative_verify.cpp
     src/compiled_speculation_backend.cpp
     src/dispatch_resources.cpp
+    src/draft_proposal_state.cpp
     src/execution_arena.cpp
     src/execution_binding.cpp
     src/execution_buffers.cpp
@@ -323,6 +324,11 @@ if(BUILD_TESTING)
     target_link_libraries(strix-speculation-cycle-tests PRIVATE strix_core)
     strix_target_warnings(strix-speculation-cycle-tests)
     add_test(NAME strix-speculation-cycle-tests COMMAND strix-speculation-cycle-tests)
+
+    add_executable(strix-draft-proposal-state-tests tests/draft_proposal_state_tests.cpp)
+    target_link_libraries(strix-draft-proposal-state-tests PRIVATE strix_core)
+    strix_target_warnings(strix-draft-proposal-state-tests)
+    add_test(NAME strix-draft-proposal-state-tests COMMAND strix-draft-proposal-state-tests)
 
     add_executable(strix-speculation-executor-tests tests/speculation_executor_tests.cpp)
     target_link_libraries(strix-speculation-executor-tests PRIVATE strix_core)
