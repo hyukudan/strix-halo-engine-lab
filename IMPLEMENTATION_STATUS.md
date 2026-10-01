@@ -463,3 +463,29 @@ Still pending:
 - validating registered read-only GGUF mappings on the M5 ROCm stack and comparing against resident-copy fallback;
 - first real token/logit replay against the canonical checkpoint/reference implementation;
 - tokenizer/chat-template integration after raw token-id replay is correct.
+
+## Slice A0.7b — direct GPU DMA transport contract
+
+Architecture/core contract implemented from independent public transport evidence:
+
+- transport ownership now distinguishes consumer release, repost pending and reusable;
+- receive-DMA completion can no longer skip directly to buffer reuse;
+- completion taxonomy includes remote GPU consumer-complete credit and RX repost completion;
+- backend capabilities identify progress mode, buffer mode, exclusive lease, explicit repost and GPU commit support;
+- 32-byte engine-owned GPU commit record binds protocol version, epoch, sequence, payload bytes and stripe geometry;
+- commit validation rejects stale epoch/sequence and invalid stripe metadata;
+- direct-link lifecycle records control readiness, peer reconciliation, RX priming, exclusive lease, DMA-BUF capability and completion-rearm qualification;
+- direct link is unusable until control/reconciliation plus RX priming and re-arm gates pass;
+- normative direct-GPU transport design is in `docs/architecture/16-direct-gpu-transport.md`;
+- dual-link direct DMA is defined as two independent physical transports with separate TX/RX pools, epochs and leases.
+
+Still pending on native hosts:
+
+- exact kernel/UAPI capability probe for GPU DMA-BUF export/import;
+- dedicated uncached GPU transport-pool allocator;
+- imported-pool backend and completion/event bridge;
+- target-qualified system-scope release/acquire commit primitive;
+- consumer-credit and RX-repost implementation;
+- repeated ring stop/re-arm/first-completion gate;
+- 1×USB4 versus 2×USB4 completed-GPU-operation measurements;
+- independent-flow, directional, role-specialized and striped dual-link qualification.
