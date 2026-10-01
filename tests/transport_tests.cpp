@@ -44,6 +44,44 @@ int main() {
                           BufferOwnership::producer_owned),
            "reusable buffer can return to producer");
 
+
+    TransportBufferView gpu_pool;
+    gpu_pool.address =
+        static_cast<std::uintptr_t>(
+            0x100000000ULL);
+    gpu_pool.bytes = 64ULL * 1024ULL;
+    gpu_pool.allocation_generation = 7;
+    gpu_pool.domain =
+        TransportMemoryDomain::gpu_transport_pool;
+    gpu_pool.access =
+        TransportBufferAccess::read_write;
+
+    expect(validate_transport_send_buffer(
+               gpu_pool,
+               32ULL * 1024ULL) &&
+               validate_transport_receive_buffer(
+                   gpu_pool,
+                   32ULL * 1024ULL),
+           "GPU transport buffer is validated without CPU span semantics");
+
+    auto read_only_gpu = gpu_pool;
+    read_only_gpu.access =
+        TransportBufferAccess::read_only;
+    expect(validate_transport_send_buffer(
+               read_only_gpu,
+               4096) &&
+               !validate_transport_receive_buffer(
+                   read_only_gpu,
+                   4096),
+           "transport buffer access mode distinguishes producer and receiver use");
+
+    auto stale_gpu = gpu_pool;
+    stale_gpu.allocation_generation = 0;
+    expect(!validate_transport_send_buffer(
+               stale_gpu,
+               4096),
+           "transport buffer requires stable allocation generation");
+
     DescriptorLimits limits;
     limits.protocol_version = 3;
     limits.connection_epoch = 9;
