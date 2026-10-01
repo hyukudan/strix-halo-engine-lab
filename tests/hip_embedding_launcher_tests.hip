@@ -72,18 +72,6 @@ std::uint16_t float_to_bf16(float value) {
         bits >> 16U);
 }
 
-float bf16_to_float(std::uint16_t value) {
-    const std::uint32_t bits =
-        static_cast<std::uint32_t>(
-            value) << 16U;
-    float output = 0.0F;
-    std::memcpy(
-        &output,
-        &bits,
-        sizeof(output));
-    return output;
-}
-
 void set_iq4_local_scale(
     IQ4XSBlock& block,
     std::uint32_t subblock,
