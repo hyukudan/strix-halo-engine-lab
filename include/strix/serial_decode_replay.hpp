@@ -11,6 +11,7 @@ struct SerialDecodeReplayPolicy {
     std::uint64_t policy_identity = 0;
     double max_logit_abs_error = 0.0;
     std::uint64_t minimum_steps = 2;
+    std::uint64_t minimum_logit_values_compared = 1;
     bool require_exact_argmax = true;
 };
 
