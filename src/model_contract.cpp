@@ -40,6 +40,9 @@ std::string ModelContract::validate() const {
         ple_eos_token_id >= vocab_size) {
         return "PLE hash geometry and EOS token must be valid";
     }
+    if (mtp_full_attention_layers == 0) {
+        return "MTP layer count must be non-zero";
+    }
     if (kv_heads == 0 || head_dim == 0 || bytes_bf16 == 0 || bytes_fp32 == 0) {
         return "head and dtype dimensions must be non-zero";
     }

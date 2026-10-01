@@ -33,6 +33,10 @@ int main() {
     const auto mtp_binding =
         binding();
 
+    expect(!model.mtp_use_dedicated_embeddings &&
+               !model.mtp_hidden_state_source_layer_explicit,
+           "model contract pins official shared-embedding/null-hidden-source MTP config");
+
     const auto contract =
         strix::build_mtp_draft_structural_contract(
             model,

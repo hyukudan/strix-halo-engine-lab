@@ -30,6 +30,8 @@ struct ModelContract {
     std::uint64_t kv_heads = 2;
     std::uint64_t head_dim = 256;
     std::uint64_t mtp_full_attention_layers = 1;
+    bool mtp_use_dedicated_embeddings = false;
+    bool mtp_hidden_state_source_layer_explicit = false;
     std::uint64_t gdn_key_heads = 16;
     std::uint64_t gdn_key_head_dim = 128;
     std::uint64_t gdn_value_heads = 48;

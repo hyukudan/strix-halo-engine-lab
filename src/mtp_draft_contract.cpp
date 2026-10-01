@@ -120,11 +120,10 @@ build_mtp_draft_structural_contract(
     contract.rope_theta =
         model.rope_theta;
 
-    // Pinned official config:
-    // mtp_use_dedicated_embeddings=false
-    // mtp.mtp_use_hidden_state_from_layer=null
-    contract.uses_dedicated_embeddings = false;
-    contract.hidden_state_source_layer_explicit = false;
+    contract.uses_dedicated_embeddings =
+        model.mtp_use_dedicated_embeddings;
+    contract.hidden_state_source_layer_explicit =
+        model.mtp_hidden_state_source_layer_explicit;
 
     const auto kv_elements =
         checked_mul(
