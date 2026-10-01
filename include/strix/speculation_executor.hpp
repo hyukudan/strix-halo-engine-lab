@@ -19,8 +19,9 @@ class GreedyDraftProposalBackend {
 public:
     virtual ~GreedyDraftProposalBackend() = default;
 
-    // Proposal state is owned by the drafter. The target session is read-only
-    // here so proposal generation cannot mutate committed target state.
+    // Lifecycle metadata is runtime-owned and read-only to the drafter.
+    // Concrete proposal caches/state remain backend-owned. The target session
+    // is read-only here so proposal generation cannot mutate committed state.
     [[nodiscard]] virtual std::vector<std::uint32_t>
     propose_candidates(
         const SerialSessionContext& target_session,

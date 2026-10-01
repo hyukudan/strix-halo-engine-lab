@@ -98,6 +98,21 @@ A proposal optimization MUST NOT restrict the target model's own vocabulary, log
 
 Proposal-specific caches and weights MUST be included in memory admission and in the speculation cost model.
 
+Draft lifecycle metadata is runtime-owned. A stateful drafter MUST bind its
+proposal state to an explicit proposal/checkpoint identity and to the target
+runtime compatibility identity. The runtime tracks whether that state is
+synchronized, actively proposing, awaiting reconciliation, or poisoned.
+Backend code may inspect this metadata but MUST NOT mutate it.
+
+A positive-depth proposal failure or failed post-target reconciliation poisons
+the drafter state. This MUST NOT disable the depth-zero target baseline.
+
+For MTP-backed proposal, the binding reuses the model manifest/content identity
+and selects only tensors explicitly classified as MTP. Proposal compatibility
+identity excludes physical relocation; pointer/storage/allocation changes are
+tracked by a separate physical binding identity. This binding is structural and
+does not imply semantic or hardware qualification.
+
 ## Verification
 
 Verify kernels SHOULD evaluate candidate rows in parallel while preserving each row's serial arithmetic.
