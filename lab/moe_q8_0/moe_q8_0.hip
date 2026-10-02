@@ -2,6 +2,7 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <iostream>
@@ -266,9 +267,10 @@ __global__ void expert_down_scatter_kernel(
     for (std::uint32_t input_index = threadIdx.x;
          input_index < kIntermediate;
          input_index += blockDim.x) {
+        const auto block_index = input_index / kBlockElements;
         const auto within_block = input_index % kBlockElements;
         const float weight =
-            dequantized_weight(weight_row[0], within_block);
+            dequantized_weight(weight_row[block_index], within_block);
 #pragma unroll
         for (unsigned row = 0; row < Rows; ++row) {
             accumulators[row] +=
