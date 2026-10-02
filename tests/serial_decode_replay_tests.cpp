@@ -36,7 +36,7 @@ strix::SerialDecodeReplayObservation passing_observation() {
 
 int main() {
     strix::SerialDecodeReplayPolicy policy;
-    policy.policy_identity = 0x2001ULL;
+    policy.policy_identity = 0x1003ULL;
     policy.max_logit_abs_error = 1e-3;
     policy.minimum_steps = 2;
     policy.minimum_logit_values_compared = 3;
@@ -149,6 +149,17 @@ int main() {
                !unidentified.passes_declared_policy,
            "replay without checkpoint content identity cannot qualify");
 
+    auto wrong_reference = observation;
+    wrong_reference.independent_reference_identity =
+        policy.policy_identity + 1ULL;
+    const auto foreign_reference =
+        strix::assess_serial_decode_replay(
+            policy,
+            wrong_reference);
+    expect(!foreign_reference.identity_valid &&
+               !foreign_reference.passes_declared_policy,
+           "replay from a different independent reference cannot qualify");
+
     bool invalid_policy = false;
     try {
         auto broken = policy;
@@ -162,6 +173,34 @@ int main() {
     }
     expect(invalid_policy,
            "serial replay rejects uninitialized policy");
+
+    bool single_step_policy_rejected = false;
+    try {
+        auto broken = policy;
+        broken.minimum_steps = 1;
+        static_cast<void>(
+            strix::assess_serial_decode_replay(
+                broken,
+                observation));
+    } catch (const std::invalid_argument&) {
+        single_step_policy_rejected = true;
+    }
+    expect(single_step_policy_rejected,
+           "serial replay policy cannot downgrade qualification to one step");
+
+    bool zero_probe_policy_rejected = false;
+    try {
+        auto broken = policy;
+        broken.minimum_logit_values_compared = 0;
+        static_cast<void>(
+            strix::assess_serial_decode_replay(
+                broken,
+                observation));
+    } catch (const std::invalid_argument&) {
+        zero_probe_policy_rejected = true;
+    }
+    expect(zero_probe_policy_rejected,
+           "serial replay policy requires at least one compared logit");
 
     if (failures == 0) {
         std::cout << "serial decode replay tests passed\n";
