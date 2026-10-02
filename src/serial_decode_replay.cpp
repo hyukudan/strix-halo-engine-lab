@@ -36,7 +36,8 @@ assess_serial_decode_replay(
     const SerialDecodeReplayPolicy& policy,
     const SerialDecodeReplayObservation& observation) {
     if (policy.policy_identity == 0 ||
-        policy.minimum_steps == 0 ||
+        policy.minimum_steps < 2 ||
+        policy.minimum_logit_values_compared == 0 ||
         !std::isfinite(policy.max_logit_abs_error) ||
         policy.max_logit_abs_error < 0.0) {
         throw std::invalid_argument(
@@ -55,7 +56,9 @@ assess_serial_decode_replay(
         observation.model_content_identity.valid() &&
         observation.compiled_execution_identity != 0 &&
         observation.runtime_compatibility_identity != 0 &&
-        observation.independent_reference_identity != 0;
+        observation.independent_reference_identity != 0 &&
+        observation.independent_reference_identity ==
+            policy.policy_identity;
 
     result.input_sequence_present =
         !observation.input_tokens.empty();
