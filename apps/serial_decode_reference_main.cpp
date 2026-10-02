@@ -21,26 +21,20 @@ int main(int argc, char** argv) try {
 
     const auto model =
         strix::ModelContract::qwen38_flash_next();
+    strix::validate_serial_decode_reference_vocabulary(
+        reference,
+        model.vocab_size);
 
     std::uint64_t probes = 0;
     for (const auto& step : reference.steps) {
-        if (step.input_token >= model.vocab_size ||
-            step.expected_argmax_token >= model.vocab_size) {
-            throw std::invalid_argument(
-                "serial reference token exceeds target model vocabulary");
-        }
         const auto count =
-            static_cast<std::uint64_t>(step.logits.size());
+            static_cast<std::uint64_t>(
+                step.logits.size());
         if (count >
-            std::numeric_limits<std::uint64_t>::max() - probes) {
+            std::numeric_limits<std::uint64_t>::max() -
+                probes) {
             throw std::overflow_error(
                 "serial reference probe count overflow");
-        }
-        for (const auto& probe : step.logits) {
-            if (probe.index >= model.vocab_size) {
-                throw std::invalid_argument(
-                    "serial reference logit probe exceeds target model vocabulary");
-            }
         }
         probes += count;
     }

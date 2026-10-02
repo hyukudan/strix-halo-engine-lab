@@ -284,4 +284,33 @@ read_serial_decode_reference(
     return reference;
 }
 
+void validate_serial_decode_reference_vocabulary(
+    const SerialDecodeReference& reference,
+    std::uint64_t vocab_size) {
+    if (vocab_size == 0) {
+        throw std::invalid_argument(
+            "serial reference vocabulary must be non-zero");
+    }
+
+    for (const auto& step : reference.steps) {
+        if (static_cast<std::uint64_t>(
+                step.input_token) >= vocab_size) {
+            throw std::invalid_argument(
+                "serial reference input token exceeds target model vocabulary");
+        }
+        if (static_cast<std::uint64_t>(
+                step.expected_argmax_token) >= vocab_size) {
+            throw std::invalid_argument(
+                "serial reference argmax token exceeds target model vocabulary");
+        }
+        for (const auto& probe : step.logits) {
+            if (static_cast<std::uint64_t>(
+                    probe.index) >= vocab_size) {
+                throw std::invalid_argument(
+                    "serial reference logit probe exceeds target model vocabulary");
+            }
+        }
+    }
+}
+
 }  // namespace strix

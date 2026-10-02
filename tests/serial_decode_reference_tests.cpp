@@ -72,6 +72,67 @@ int main() {
             "b00361a396177a9cb410ff61f20015ad",
         "serial reference preserves checkpoint SHA-256");
 
+    bool vocabulary_valid = true;
+    try {
+        strix::validate_serial_decode_reference_vocabulary(
+            reference,
+            56);
+    } catch (const std::invalid_argument&) {
+        vocabulary_valid = false;
+    }
+    expect(vocabulary_valid,
+           "serial reference accepts token and probe ids below vocabulary size");
+
+    auto token_out_of_range = reference;
+    token_out_of_range.steps[0].input_token = 56;
+    bool token_rejected = false;
+    try {
+        strix::validate_serial_decode_reference_vocabulary(
+            token_out_of_range,
+            56);
+    } catch (const std::invalid_argument&) {
+        token_rejected = true;
+    }
+    expect(token_rejected,
+           "serial reference rejects input token at vocabulary boundary");
+
+    auto argmax_out_of_range = reference;
+    argmax_out_of_range.steps[0].expected_argmax_token = 56;
+    bool argmax_rejected = false;
+    try {
+        strix::validate_serial_decode_reference_vocabulary(
+            argmax_out_of_range,
+            56);
+    } catch (const std::invalid_argument&) {
+        argmax_rejected = true;
+    }
+    expect(argmax_rejected,
+           "serial reference rejects expected argmax at vocabulary boundary");
+
+    auto probe_out_of_range = reference;
+    probe_out_of_range.steps[0].logits[0].index = 56;
+    bool probe_rejected = false;
+    try {
+        strix::validate_serial_decode_reference_vocabulary(
+            probe_out_of_range,
+            56);
+    } catch (const std::invalid_argument&) {
+        probe_rejected = true;
+    }
+    expect(probe_rejected,
+           "serial reference rejects logit probe at vocabulary boundary");
+
+    bool zero_vocab_rejected = false;
+    try {
+        strix::validate_serial_decode_reference_vocabulary(
+            reference,
+            0);
+    } catch (const std::invalid_argument&) {
+        zero_vocab_rejected = true;
+    }
+    expect(zero_vocab_rejected,
+           "serial reference rejects zero-sized vocabulary");
+
     const auto duplicate =
         root / "duplicate.txt";
     write_text(

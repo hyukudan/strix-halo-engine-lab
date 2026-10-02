@@ -29,4 +29,8 @@ struct SerialDecodeReference {
 read_serial_decode_reference(
     const std::filesystem::path& path);
 
+void validate_serial_decode_reference_vocabulary(
+    const SerialDecodeReference& reference,
+    std::uint64_t vocab_size);
+
 }  // namespace strix
