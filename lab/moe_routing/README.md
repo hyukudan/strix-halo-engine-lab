@@ -1,18 +1,18 @@
 # Strix Halo MoE Routing Lab
 
-This lab isolates MoE routing from expert execution.
-
-The first candidate follows the pinned routing semantics:
+This lab isolates MoE routing from expert execution and keeps the routing
+contract identical across host and device candidates:
 
 1. FP32 softmax over all expert logits;
 2. top-k expert selection per logical row;
 3. optional renormalization of selected probabilities;
-4. output selected expert indices and weights.
+4. deterministic cutoff ties: equal probabilities prefer the lower expert index;
+5. output selected expert indices and weights.
 
-The fixture includes a cutoff tie when the requested geometry permits it. Equal
-probabilities must select the lower expert index, matching the canonical host contract.
+The deterministic fixture injects a cutoff tie when the requested geometry
+permits it, so both correctness paths exercise the canonical tie rule.
 
-## Initial geometry
+## Target geometry
 
 Defaults:
 
@@ -21,12 +21,32 @@ Defaults:
 - logical row classes 1/2/4/8;
 - one workgroup per row.
 
-This is a correctness/performance baseline, not the intended final selection
-algorithm. The first kernel uses cooperative max/sum reductions and a simple
-single-lane top-k scan after softmax.
+Two HIP candidates are built for `gfx1151`.
 
-Later candidates may replace only the selection mechanism while preserving the
-same output contract.
+### Serial-selection baseline
+
+`strix-moe-routing` keeps the original correctness/performance baseline:
+cooperative softmax max/sum reductions followed by a single-lane top-k scan.
+
+### Wave32 hierarchical candidate
+
+`strix-moe-routing-hierarchical` maps one thread to each of the 512 target
+experts and uses sixteen 32-lane groups. For every top-k slot, each group
+reduces to its best remaining expert, then the first Wave32 reduces those group
+winners to the global winner. The selected expert is removed and the process
+repeats.
+
+At the pinned 512-expert/top-10 geometry this mirrors the host hierarchical
+contract exactly:
+
+- group width: 32;
+- groups: 16;
+- local candidate scans: 5,120;
+- group-reduction candidates: 160.
+
+The device candidate requires Wave32 and validates exact selected indices plus
+selected-weight error against the independent CPU reference before reporting
+timing.
 
 ## Build
 
@@ -36,10 +56,17 @@ cmake -S lab/moe_routing -B build/moe-routing -G Ninja \
 cmake --build build/moe-routing
 ```
 
-Run:
+Run the baseline:
 
 ```bash
 ./build/moe-routing/strix-moe-routing \
+  --rows 4 --experts 512 --top-k 10 --iterations 500
+```
+
+Run the hierarchical candidate with the same geometry:
+
+```bash
+./build/moe-routing/strix-moe-routing-hierarchical \
   --rows 4 --experts 512 --top-k 10 --iterations 500
 ```
 
@@ -47,26 +74,29 @@ Supported explicit row classes are 1, 2, 4 and 8.
 
 ## Output
 
-The executable reports:
+The baseline reports routing latency, exact selected-index agreement, weight
+error, route-union/overlap metrics and kernel resource metadata.
 
-- device and architecture;
-- rows / experts / top-k;
-- average routing time;
-- max weight error;
-- exact selected-index agreement;
-- distinct expert count across the round;
-- mean adjacent-row route overlap;
-- kernel resource metadata.
+The hierarchical candidate additionally reports group width, group count,
+local candidate scans and group-reduction candidate count so native
+measurements can be checked directly against the host plan.
 
-## Next candidates
+## Qualification still required
 
-After this baseline is qualified on real `gfx1151`:
+The code now has both the serial-selection baseline and the Wave32
+hierarchical device candidate. The remaining gate is native Strix Halo
+qualification:
 
-- Wave32 and Wave64 top-k reduction candidates;
-- hierarchical top-k without materializing all probabilities;
-- direct production of expert-group metadata;
-- fused route histogram / touched-expert bitmap;
-- route sorting/grouping only when expert reuse justifies it.
+- build and run both on the same ROCm/toolchain revision;
+- compare latency for row classes 1/2/4/8;
+- inspect VGPR/LDS/spill occupancy;
+- confirm the hierarchical candidate remains exact under the cutoff-tie fixture;
+- decide whether removing full probability materialization is worthwhile;
+- only then promote a routing path into the production kernel registry.
 
-Expert GEMMs are a separate lab because route selection and grouped expert
+After routing selection is qualified, the next MoE work is direct/grouped
+packed expert execution, device-side grouping metadata and route-distribution
+qualification on the canonical checkpoint.
+
+Expert GEMMs remain a separate lab because route selection and grouped expert
 execution have different shape and memory bottlenecks.

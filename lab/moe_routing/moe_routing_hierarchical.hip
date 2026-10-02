@@ -402,6 +402,11 @@ int main(int argc, char** argv) try {
               << "  \"group_width\": " << kWaveWidth << ",\n"
               << "  \"groups\": "
               << ((options.experts + kWaveWidth - 1) / kWaveWidth) << ",\n"
+              << "  \"local_candidate_scans\": "
+              << (options.experts * options.top_k) << ",\n"
+              << "  \"group_reduction_candidates\": "
+              << (((options.experts + kWaveWidth - 1) / kWaveWidth) *
+                  options.top_k) << ",\n"
               << "  \"average_us\": "
               << (static_cast<double>(total_ms) * 1000.0 /
                   static_cast<double>(options.iterations)) << ",\n"
