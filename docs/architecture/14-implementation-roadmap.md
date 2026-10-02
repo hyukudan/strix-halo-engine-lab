@@ -239,12 +239,15 @@ Full snapshots, pre-window snapshot plus replay, and sparse-checkpoint replay ha
 
 ### A1.3 — MoE routing and expert execution
 
-Status: **route planner, routing baseline and expert-execution correctness harness implemented; packed grouped reuse pending**.
+Status: **route planner, routing baseline, correctness harness and host-side complete-cost selector implemented; packed grouped runtime reuse pending**.
 
 The host planner now measures touched-expert union, assignments per expert, adjacent-row route overlap, per-projection storage compatibility, realizable 8/4/2/1 expert batches, and packed expert-weight traffic saved by grouping. It also emits a deterministic CSR-style expert grouping plan with expert offsets plus original row/top-k-slot identity for every assignment. The semantic oracle and portable C++ selector cover FP32 softmax, deterministic top-k, selected-weight renormalization and an explicit cutoff-tie contract: equal FP32 softmax probabilities prefer the lower expert index. A separate FP32 expert-execution harness compares direct assignment order with deterministic expert-major grouping and validates both against a CPU reference. The packed IQ4_XS MoE harness then exercises real shared decode of gate/up and down weights across 1/2/4/8-row expert chunks on synthetic compatible geometry; it is a reuse experiment, not yet the canonical expert-format decision. A standalone HIP baseline routes explicit 1/2/4/8-row classes and reports route latency, index agreement, weight error, expert union and resource metadata.
 
+A target-independent execution-policy selector now consumes an explicitly qualified cost model and the actual route distribution. It compares complete direct and grouped costs using assignment count, realizable expert-batch count, packed-weight bytes traversed and row-restoration cost; equal costs deterministically retain the direct path. This closes the host-side policy contract without inventing target measurements: the coefficients still have to be calibrated on native Strix Halo before production selection can be enabled.
+
 Implement and compare:
 
+- target-calibrated direct/grouped complete-cost coefficients for the host-side selector;
 - device-resident deterministic routing;
 - a direct tiny-row expert path;
 - grouped expert execution for reusable routes;

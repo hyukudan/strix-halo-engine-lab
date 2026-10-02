@@ -321,13 +321,9 @@ std::uint32_t largest_supported_chunk(std::uint64_t remaining) {
     return 0;
 }
 
-}  // namespace
-
-MoeExpertExecutionPlan build_moe_expert_execution_plan(
-    const MoeRouteRequest& request) {
-    const auto route = build_moe_route_plan(request);
-    const auto grouping = build_moe_grouping_plan(request);
-
+MoeExpertExecutionPlan build_moe_expert_execution_plan_from_route(
+    const MoeRouteRequest& request,
+    const MoeRoutePlan& route) {
     MoeExpertExecutionPlan plan;
     plan.assignments = route.assignments;
     plan.direct_weight_traversals = route.assignments;
@@ -335,9 +331,9 @@ MoeExpertExecutionPlan build_moe_expert_execution_plan(
         route.assignments, request.packed_weight_bytes_per_expert);
 
     for (std::uint32_t expert = 0; expert < request.expert_count; ++expert) {
-        auto offset = grouping.expert_offsets[expert];
+        auto offset = route.expert_offsets[expert];
         auto remaining =
-            grouping.expert_offsets[static_cast<std::size_t>(expert) + 1U] -
+            route.expert_offsets[static_cast<std::size_t>(expert) + 1U] -
             offset;
 
         while (remaining != 0) {
@@ -345,8 +341,7 @@ MoeExpertExecutionPlan build_moe_expert_execution_plan(
             if (rows == 0) {
                 throw std::logic_error("MoE expert batch decomposition failed");
             }
-            plan.batches.push_back(
-                MoeExpertBatch{expert, offset, rows});
+            plan.batches.push_back(MoeExpertBatch{expert, offset, rows});
             offset += rows;
             remaining -= rows;
         }
@@ -364,6 +359,99 @@ MoeExpertExecutionPlan build_moe_expert_execution_plan(
             : 0;
 
     return plan;
+}
+
+bool valid_cost_term(double value) {
+    return std::isfinite(value) && value >= 0.0;
+}
+
+double checked_execution_cost(
+    double fixed_us,
+    std::uint64_t work_items,
+    double per_item_us,
+    std::uint64_t weight_bytes,
+    double per_weight_byte_us,
+    std::uint64_t restore_items,
+    double restore_per_item_us) {
+    const auto cost =
+        fixed_us +
+        static_cast<double>(work_items) * per_item_us +
+        static_cast<double>(weight_bytes) * per_weight_byte_us +
+        static_cast<double>(restore_items) * restore_per_item_us;
+    if (!std::isfinite(cost)) {
+        throw std::overflow_error("MoE execution cost calculation overflow");
+    }
+    return cost;
+}
+
+}  // namespace
+
+MoeExpertExecutionPlan build_moe_expert_execution_plan(
+    const MoeRouteRequest& request) {
+    const auto route = build_moe_route_plan(request);
+    return build_moe_expert_execution_plan_from_route(request, route);
+}
+
+MoeExpertExecutionDecision select_moe_expert_execution_strategy(
+    const MoeRouteRequest& request,
+    const MoeExpertExecutionCostModel& cost_model) {
+    if (!cost_model.qualified) {
+        throw std::invalid_argument(
+            "MoE execution cost model is not qualified");
+    }
+    if (!valid_cost_term(cost_model.direct_fixed_us) ||
+        !valid_cost_term(cost_model.direct_per_assignment_us) ||
+        !valid_cost_term(cost_model.direct_weight_byte_us) ||
+        !valid_cost_term(cost_model.grouped_fixed_us) ||
+        !valid_cost_term(cost_model.grouped_per_batch_us) ||
+        !valid_cost_term(cost_model.grouped_weight_byte_us) ||
+        !valid_cost_term(cost_model.grouped_restore_per_assignment_us)) {
+        throw std::invalid_argument(
+            "MoE execution cost terms must be finite and non-negative");
+    }
+
+    const auto route = build_moe_route_plan(request);
+    const auto execution =
+        build_moe_expert_execution_plan_from_route(request, route);
+
+    MoeExpertExecutionDecision decision;
+    decision.direct_estimated_us = checked_execution_cost(
+        cost_model.direct_fixed_us,
+        execution.assignments,
+        cost_model.direct_per_assignment_us,
+        execution.direct_weight_bytes,
+        cost_model.direct_weight_byte_us,
+        0,
+        0.0);
+    decision.grouped_estimated_us = checked_execution_cost(
+        cost_model.grouped_fixed_us,
+        execution.expert_batches,
+        cost_model.grouped_per_batch_us,
+        execution.grouped_weight_bytes,
+        cost_model.grouped_weight_byte_us,
+        execution.assignments,
+        cost_model.grouped_restore_per_assignment_us);
+
+    // Grouping must strictly beat the direct path. Exact ties keep the
+    // simpler direct schedule and avoid backend-dependent policy drift.
+    if (decision.grouped_estimated_us < decision.direct_estimated_us) {
+        decision.strategy = MoeExpertExecutionStrategy::GroupedExpertMajor;
+    }
+
+    decision.assignments = execution.assignments;
+    decision.expert_batches = execution.expert_batches;
+    decision.direct_weight_bytes = execution.direct_weight_bytes;
+    decision.grouped_weight_bytes = execution.grouped_weight_bytes;
+    decision.grouped_weight_bytes_saved =
+        execution.grouped_weight_bytes_saved;
+    decision.distinct_experts = route.distinct_experts;
+    decision.maximum_rows_per_expert = route.maximum_rows_per_expert;
+    decision.mean_rows_per_touched_expert =
+        route.mean_rows_per_touched_expert;
+    decision.mean_adjacent_row_overlap =
+        route.mean_adjacent_row_overlap;
+
+    return decision;
 }
 
 }  // namespace strix

@@ -237,6 +237,74 @@ int main() {
                execution.grouped_weight_bytes_saved == 8'000,
            "execution plan models realizable grouped weight traffic without padding");
 
+    strix::MoeExpertExecutionCostModel cost_model;
+    cost_model.qualified = true;
+    cost_model.direct_per_assignment_us = 0.6;
+    cost_model.direct_weight_byte_us = 0.0004;
+    cost_model.grouped_per_batch_us = 0.6;
+    cost_model.grouped_weight_byte_us = 0.0004;
+    cost_model.grouped_restore_per_assignment_us = 0.05;
+
+    const auto reuse_decision =
+        strix::select_moe_expert_execution_strategy(request, cost_model);
+    expect(reuse_decision.strategy ==
+               strix::MoeExpertExecutionStrategy::GroupedExpertMajor,
+           "qualified complete-cost model selects grouped execution when reuse pays");
+    expect(reuse_decision.grouped_estimated_us <
+               reuse_decision.direct_estimated_us &&
+               reuse_decision.expert_batches == 12 &&
+               reuse_decision.grouped_weight_bytes_saved == 8'000,
+           "MoE strategy decision exposes complete grouped cost and route-derived reuse");
+
+    request.rows = 3;
+    request.experts_per_row = 2;
+    request.expert_count = 6;
+    request.packed_weight_bytes_per_expert = 1000;
+    request.selected_experts = unique_routes;
+    const auto unique_decision =
+        strix::select_moe_expert_execution_strategy(request, cost_model);
+    expect(unique_decision.strategy ==
+               strix::MoeExpertExecutionStrategy::DirectAssignment,
+           "same measured cost model keeps direct execution when route distribution has no reuse");
+    expect(unique_decision.distinct_experts == 6 &&
+               unique_decision.expert_batches == 6 &&
+               unique_decision.grouped_weight_bytes_saved == 0,
+           "strategy decision is driven by actual expert union and batch decomposition");
+
+    strix::MoeExpertExecutionCostModel tie_cost_model;
+    tie_cost_model.qualified = true;
+    const auto tie_decision =
+        strix::select_moe_expert_execution_strategy(request, tie_cost_model);
+    expect(tie_decision.direct_estimated_us == 0.0 &&
+               tie_decision.grouped_estimated_us == 0.0 &&
+               tie_decision.strategy ==
+                   strix::MoeExpertExecutionStrategy::DirectAssignment,
+           "exact complete-cost ties deterministically prefer the direct path");
+
+    bool unqualified_cost_rejected = false;
+    try {
+        const strix::MoeExpertExecutionCostModel unqualified;
+        static_cast<void>(
+            strix::select_moe_expert_execution_strategy(request, unqualified));
+    } catch (const std::invalid_argument&) {
+        unqualified_cost_rejected = true;
+    }
+    expect(unqualified_cost_rejected,
+           "MoE strategy selection rejects unqualified target cost data");
+
+    bool nonfinite_cost_rejected = false;
+    try {
+        auto invalid_cost = cost_model;
+        invalid_cost.grouped_per_batch_us =
+            std::numeric_limits<double>::quiet_NaN();
+        static_cast<void>(
+            strix::select_moe_expert_execution_strategy(request, invalid_cost));
+    } catch (const std::invalid_argument&) {
+        nonfinite_cost_rejected = true;
+    }
+    expect(nonfinite_cost_rejected,
+           "MoE strategy selection rejects non-finite cost coefficients");
+
     bool duplicate_rejected = false;
     try {
         const std::vector<std::uint32_t> duplicate{1, 1};

@@ -266,6 +266,8 @@ Routing foundation implemented:
 - deterministic CSR-style expert grouping plan;
 - route planning now emits a fused touched-expert bitmap plus CSR grouping offsets and assignment row/slot metadata in one validated pass;
 - grouped assignments retain original row and top-k slot identity for exact output restoration;
+- target-independent direct-versus-grouped execution selector driven by a qualified complete-cost model;
+- complete cost includes fixed overhead, per-assignment/per-batch work, actual route-derived packed-weight traffic and grouped row-restoration cost; exact ties stay on the direct path;
 - duplicate/out-of-range route validation;
 - dependency-free semantic oracle plus portable C++ row selector for FP32 softmax, deterministic lower-expert-index cutoff ties, top-k and selected-weight renormalization;
 - standalone `gfx1151` HIP routing baseline for 1/2/4/8 logical rows;
@@ -280,6 +282,7 @@ Still pending:
 - packed direct tiny-row expert path;
 - packed grouped expert execution with real weight reuse;
 - shared-expert integration;
+- target-native calibration of direct/grouped cost coefficients;
 - route-distribution qualification on the canonical checkpoint.
 
 
