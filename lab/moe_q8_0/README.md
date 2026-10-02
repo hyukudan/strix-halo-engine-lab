@@ -57,3 +57,33 @@ This experiment does **not** make Q8_0 the canonical expert checkpoint format.
 It establishes a target-compatible baseline that can be compared with mixed
 per-projection formats or a future explicitly defined repack once quality and
 memory trade-offs are measured.
+
+
+## Native qualification
+
+After building the lab on the target host, run the machine-readable qualification
+gate across the low-row classes:
+
+```bash
+python3 lab/moe_q8_0/qualify.py \
+  --build-dir build/moe-q8-0 \
+  --rows 1,2,4,8 \
+  --experts 16 \
+  --top-k 10 \
+  --iterations 20 \
+  --output build/moe-q8-0/qualification.json
+```
+
+The runner rejects a result before comparing performance if the binary reports a
+different fixture, model geometry, row class, expert/top-k configuration,
+Wave32/target architecture identity, inconsistent modeled weight-byte accounting,
+or numerical error above the declared thresholds. It then reports direct and
+grouped latency medians and the modeled packed-weight bytes saved for every row
+class.
+
+The default fixture keeps 16 expert tensors materialized so the independent CPU
+packed-weight reference remains practical. A 512-expert storage-footprint run is
+available with `--experts 512`, but route-distribution qualification against the
+canonical checkpoint remains a separate gate. Repetitions default to one because
+each process run recomputes the CPU reference; increase `--repetitions` only
+when the target host has enough time for repeated correctness work.
