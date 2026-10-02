@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import statistics
 import subprocess
 import sys
@@ -135,11 +136,18 @@ def validate_result(
             f"{candidate} omitted or malformed timing/correctness metadata"
         ) from exc
 
-    if average_us <= 0.0:
-        raise QualificationError(f"{candidate} reported non-positive average_us")
-    if weight_error < 0.0 or weight_error > max_weight_error:
+    if not math.isfinite(average_us) or average_us <= 0.0:
         raise QualificationError(
-            f"{candidate} max_weight_error={weight_error} exceeds {max_weight_error}"
+            f"{candidate} reported invalid average_us={average_us!r}"
+        )
+    if (
+        not math.isfinite(weight_error)
+        or weight_error < 0.0
+        or weight_error > max_weight_error
+    ):
+        raise QualificationError(
+            f"{candidate} max_weight_error={weight_error!r} exceeds "
+            f"finite range [0, {max_weight_error}]"
         )
     if warp_size != 32:
         raise QualificationError(f"{candidate} reported warp_size={warp_size}; Wave32 required")
@@ -153,9 +161,21 @@ def validate_result(
     for key in RESOURCE_KEYS:
         if key not in result:
             raise QualificationError(f"{candidate} omitted resource field {key}")
+        value = result[key]
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise QualificationError(
+                f"{candidate} reported non-integer resource field {key}={value!r}"
+            )
+        minimum = 1 if key == "max_threads_per_block" else 0
+        if value < minimum:
+            raise QualificationError(
+                f"{candidate} reported invalid resource field {key}={value!r}"
+            )
 
 
 def stable_metadata(samples: list[dict[str, Any]], candidate: str) -> dict[str, Any]:
+    if not samples:
+        raise QualificationError(f"{candidate} produced no samples")
     first = samples[0]
     stable_keys = ("device", "gfx_arch", "fixture", "warp_size", *RESOURCE_KEYS)
     for sample in samples[1:]:
@@ -170,7 +190,16 @@ def stable_metadata(samples: list[dict[str, Any]], candidate: str) -> dict[str, 
 
 def summarize_samples(samples: list[dict[str, Any]], candidate: str) -> dict[str, Any]:
     metadata = stable_metadata(samples, candidate)
-    timings = [float(sample["average_us"]) for sample in samples]
+    try:
+        timings = [float(sample["average_us"]) for sample in samples]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise QualificationError(
+            f"{candidate} omitted or malformed average_us in repeated samples"
+        ) from exc
+    if any(not math.isfinite(value) or value <= 0.0 for value in timings):
+        raise QualificationError(
+            f"{candidate} produced non-finite or non-positive timing samples"
+        )
     return {
         "median_us": statistics.median(timings),
         "samples_us": timings,
@@ -189,6 +218,70 @@ def compare_pair(
                 f"C{rows}: candidates disagree on {key}: "
                 f"{serial.get(key)!r} != {hierarchical.get(key)!r}"
             )
+
+
+def validate_report(report: dict[str, Any]) -> None:
+    rows = report.get("rows")
+    if not isinstance(rows, list) or not rows:
+        raise QualificationError("qualification report contains no row classes")
+
+    seen_rows: set[int] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            raise QualificationError("qualification report row must be an object")
+        try:
+            row_count = int(row["rows"])
+            row_class = str(row["row_class"])
+            serial_us = float(row["serial"]["median_us"])
+            hierarchical_us = float(row["hierarchical"]["median_us"])
+            speedup = float(row["speedup_serial_over_hierarchical"])
+            winner = str(row["winner"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise QualificationError(
+                "qualification report contains malformed row summary"
+            ) from exc
+
+        if row_count in seen_rows:
+            raise QualificationError(
+                f"qualification report contains duplicate C{row_count}"
+            )
+        seen_rows.add(row_count)
+        if row_class != f"C{row_count}":
+            raise QualificationError(
+                f"qualification report row label {row_class!r} does not match C{row_count}"
+            )
+        if (
+            not math.isfinite(serial_us)
+            or not math.isfinite(hierarchical_us)
+            or serial_us <= 0.0
+            or hierarchical_us <= 0.0
+        ):
+            raise QualificationError(
+                f"C{row_count}: qualification report contains invalid median timing"
+            )
+
+        expected_speedup = serial_us / hierarchical_us
+        if not math.isfinite(speedup) or not math.isclose(
+            speedup, expected_speedup, rel_tol=1e-12, abs_tol=0.0
+        ):
+            raise QualificationError(
+                f"C{row_count}: reported speedup is inconsistent with medians"
+            )
+
+        if hierarchical_us < serial_us:
+            expected_winner = "hierarchical"
+        elif serial_us < hierarchical_us:
+            expected_winner = "serial"
+        else:
+            expected_winner = "tie"
+        if winner != expected_winner:
+            raise QualificationError(
+                f"C{row_count}: reported winner {winner!r} should be "
+                f"{expected_winner!r}"
+            )
+
+    if report.get("all_exact") is not True:
+        raise QualificationError("qualification report must preserve all_exact=true")
 
 
 def main() -> int:
@@ -321,6 +414,7 @@ def main() -> int:
         "rows": row_results,
         "all_exact": True,
     }
+    validate_report(report)
     payload = json.dumps(report, indent=2, sort_keys=True)
     print(payload)
     if args.output is not None:
