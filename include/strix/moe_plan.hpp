@@ -90,6 +90,45 @@ struct MoeExpertExecutionPlan {
     std::vector<MoeExpertBatch> batches;
 };
 
+enum class MoeExpertExecutionStrategy : std::uint8_t {
+    DirectAssignment = 0,
+    GroupedExpertMajor = 1,
+};
+
+struct MoeExpertExecutionCostModel {
+    // Selection is disabled until coefficients come from a qualified
+    // measurement set for the active target/runtime identity.
+    bool qualified = false;
+
+    double direct_fixed_us = 0.0;
+    double direct_per_assignment_us = 0.0;
+    double direct_weight_byte_us = 0.0;
+
+    double grouped_fixed_us = 0.0;
+    double grouped_per_batch_us = 0.0;
+    double grouped_weight_byte_us = 0.0;
+    double grouped_restore_per_assignment_us = 0.0;
+};
+
+struct MoeExpertExecutionDecision {
+    MoeExpertExecutionStrategy strategy =
+        MoeExpertExecutionStrategy::DirectAssignment;
+
+    double direct_estimated_us = 0.0;
+    double grouped_estimated_us = 0.0;
+
+    std::uint64_t assignments = 0;
+    std::uint64_t expert_batches = 0;
+    std::uint64_t direct_weight_bytes = 0;
+    std::uint64_t grouped_weight_bytes = 0;
+    std::uint64_t grouped_weight_bytes_saved = 0;
+
+    std::uint32_t distinct_experts = 0;
+    std::uint32_t maximum_rows_per_expert = 0;
+    double mean_rows_per_touched_expert = 0.0;
+    double mean_adjacent_row_overlap = 0.0;
+};
+
 struct MoeGroupingPlan {
     std::uint32_t expert_count = 0;
     std::uint64_t assignments = 0;
@@ -130,5 +169,9 @@ struct MoeGroupingPlan {
 
 [[nodiscard]] MoeExpertExecutionPlan build_moe_expert_execution_plan(
     const MoeRouteRequest& request);
+
+[[nodiscard]] MoeExpertExecutionDecision select_moe_expert_execution_strategy(
+    const MoeRouteRequest& request,
+    const MoeExpertExecutionCostModel& cost_model);
 
 }  // namespace strix
