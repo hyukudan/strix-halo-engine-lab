@@ -262,7 +262,7 @@ The engine selects expert execution from measured route distributions and comple
 
 Status: **lookup planner and host benchmark harness implemented; native qualification pending**.
 
-The host planner now models requested rows, unique rows, contiguous I/O runs, duplicate elimination and bounded LRU cache behavior. A standalone Linux benchmark compares mmap, one-pread-per-row, bounded row cache and per-window coalesced pread on identical deterministic access traces. The primary synthetic PLE pattern uses 16 row requests per token window and a 5120-byte initial row model derived from the pinned 2560-wide embedding geometry.
+The host planner now models requested rows, unique rows, contiguous I/O runs, duplicate elimination, bounded I/O chunking/inflight waves and bounded LRU cache behavior. A standalone Linux benchmark compares mmap, one-pread-per-row, bounded row cache and per-window coalesced pread on identical deterministic access traces. The primary synthetic PLE pattern uses 16 row requests per token window and a 5120-byte initial row model derived from the pinned 2560-wide embedding geometry.
 
 Implement large lookup-table access as a separate subsystem.
 
@@ -270,7 +270,8 @@ Compare:
 
 - direct mapped access;
 - CPU gather;
-- asynchronous read/staging;
+- deterministic bounded/coalesced I/O planning;
+- asynchronous read/staging that executes the bounded plan;
 - bounded row cache;
 - access-hint policies.
 

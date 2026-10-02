@@ -11,6 +11,13 @@
 namespace strix {
 namespace {
 
+std::uint64_t checked_add(std::uint64_t left, std::uint64_t right) {
+    if (right > std::numeric_limits<std::uint64_t>::max() - left) {
+        throw std::overflow_error("sparse lookup addition overflow");
+    }
+    return left + right;
+}
+
 std::uint64_t checked_mul(std::uint64_t left, std::uint64_t right) {
     if (left != 0 &&
         right > std::numeric_limits<std::uint64_t>::max() / left) {
@@ -26,6 +33,10 @@ SparseLookupPlan build_sparse_lookup_plan(
     if (request.table_rows == 0 || request.row_bytes == 0) {
         throw std::invalid_argument(
             "sparse lookup table rows and row bytes must be non-zero");
+    }
+    if (request.max_inflight_ios == 0) {
+        throw std::invalid_argument(
+            "sparse lookup max inflight I/O must be non-zero");
     }
 
     SparseLookupPlan plan;
@@ -88,6 +99,49 @@ SparseLookupPlan build_sparse_lookup_plan(
 
     plan.contiguous_runs =
         static_cast<std::uint64_t>(plan.runs.size());
+
+    plan.max_inflight_ios =
+        request.max_inflight_ios;
+    for (const auto& run : plan.runs) {
+        const auto chunk_rows =
+            request.max_rows_per_io == 0
+                ? run.row_count
+                : request.max_rows_per_io;
+        std::uint64_t consumed = 0;
+        while (consumed < run.row_count) {
+            const auto remaining =
+                run.row_count - consumed;
+            const auto rows =
+                std::min(chunk_rows, remaining);
+            const auto first_row =
+                checked_add(run.first_row, consumed);
+            const auto byte_offset =
+                checked_mul(first_row, request.row_bytes);
+            const auto byte_count =
+                checked_mul(rows, request.row_bytes);
+            plan.io_plan.push_back(
+                SparseLookupIoOperation{
+                    first_row,
+                    rows,
+                    byte_offset,
+                    byte_count,
+                });
+            plan.largest_io_rows =
+                std::max(plan.largest_io_rows, rows);
+            plan.largest_io_bytes =
+                std::max(plan.largest_io_bytes, byte_count);
+            consumed =
+                checked_add(consumed, rows);
+        }
+    }
+    plan.io_operations =
+        static_cast<std::uint64_t>(plan.io_plan.size());
+    plan.io_waves =
+        plan.io_operations == 0
+            ? 0
+            : (plan.io_operations +
+               plan.max_inflight_ios - 1ULL) /
+                  plan.max_inflight_ios;
 
     if (request.cache_capacity_rows != 0) {
         using Lru = std::list<std::uint64_t>;
