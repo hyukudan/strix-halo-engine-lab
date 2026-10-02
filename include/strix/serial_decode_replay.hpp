@@ -3,6 +3,7 @@
 #include "strix/model_runtime_binding.hpp"
 
 #include <cstdint>
+#include <span>
 #include <vector>
 
 namespace strix {
@@ -39,6 +40,10 @@ struct SerialDecodeReplayAssessment {
     bool logits_within_policy = false;
     bool passes_declared_policy = false;
 };
+
+void validate_serial_decode_engine_logits(
+    std::span<const float> logits,
+    std::uint64_t expected_vocab_size);
 
 [[nodiscard]] SerialDecodeReplayAssessment
 assess_serial_decode_replay(

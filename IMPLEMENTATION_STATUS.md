@@ -464,7 +464,8 @@ Additional serial-runtime work now implemented:
 - file-backed-candidate tensors remain ordinary host mappings by default, preserving the PLE lookup path;
 - fresh HIP scratch/device-state/host-state initialization;
 - `strix-hip-model-residency` hardware probe CLI;
-- `strix-hip-decode-token` runner that compiles the full C1 serial DAG from a GGUF, accepts explicit token IDs and materializes FP32 logits/top-5.
+- `strix-hip-decode-token` runner that compiles the full C1 serial DAG from a GGUF, accepts explicit token IDs and materializes FP32 logits/top-5;
+- versioned independent serial-replay fixtures can be preflighted against the target vocabulary and checkpoint content identity, and the HIP runner rejects non-finite/mis-sized engine logits before exact-argmax and logit-probe qualification.
 
 Still pending:
 

@@ -1,6 +1,8 @@
 #include "strix/serial_decode_replay.hpp"
 
+#include <array>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 
 namespace {
@@ -39,6 +41,58 @@ int main() {
     policy.minimum_steps = 2;
     policy.minimum_logit_values_compared = 3;
     policy.require_exact_argmax = true;
+
+    const std::array<float, 3> finite_logits{
+        1.0F,
+        -2.0F,
+        3.5F,
+    };
+    bool finite_logits_valid = true;
+    try {
+        strix::validate_serial_decode_engine_logits(
+            finite_logits,
+            finite_logits.size());
+    } catch (const std::invalid_argument&) {
+        finite_logits_valid = false;
+    }
+    expect(finite_logits_valid,
+           "finite engine logits with exact vocabulary size pass preflight");
+
+    auto non_finite_logits = finite_logits;
+    non_finite_logits[1] =
+        std::numeric_limits<float>::quiet_NaN();
+    bool non_finite_rejected = false;
+    try {
+        strix::validate_serial_decode_engine_logits(
+            non_finite_logits,
+            non_finite_logits.size());
+    } catch (const std::invalid_argument&) {
+        non_finite_rejected = true;
+    }
+    expect(non_finite_rejected,
+           "non-finite engine logits fail replay preflight");
+
+    bool wrong_vocab_rejected = false;
+    try {
+        strix::validate_serial_decode_engine_logits(
+            finite_logits,
+            finite_logits.size() + 1U);
+    } catch (const std::invalid_argument&) {
+        wrong_vocab_rejected = true;
+    }
+    expect(wrong_vocab_rejected,
+           "engine logit count must match the target vocabulary exactly");
+
+    bool zero_vocab_rejected = false;
+    try {
+        strix::validate_serial_decode_engine_logits(
+            finite_logits,
+            0);
+    } catch (const std::invalid_argument&) {
+        zero_vocab_rejected = true;
+    }
+    expect(zero_vocab_rejected,
+           "zero expected vocabulary is rejected before replay assessment");
 
     const auto observation =
         passing_observation();

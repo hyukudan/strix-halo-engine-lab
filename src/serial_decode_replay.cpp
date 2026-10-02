@@ -1,9 +1,35 @@
 #include "strix/serial_decode_replay.hpp"
 
 #include <cmath>
+#include <cstddef>
+#include <limits>
 #include <stdexcept>
 
 namespace strix {
+
+void validate_serial_decode_engine_logits(
+    std::span<const float> logits,
+    std::uint64_t expected_vocab_size) {
+    if (expected_vocab_size == 0 ||
+        expected_vocab_size >
+            static_cast<std::uint64_t>(
+                std::numeric_limits<std::size_t>::max())) {
+        throw std::invalid_argument(
+            "serial replay expected vocabulary size is invalid");
+    }
+    if (logits.size() !=
+        static_cast<std::size_t>(
+            expected_vocab_size)) {
+        throw std::invalid_argument(
+            "serial replay engine logits do not match expected vocabulary size");
+    }
+    for (const float value : logits) {
+        if (!std::isfinite(value)) {
+            throw std::invalid_argument(
+                "serial replay engine logits contain a non-finite value");
+        }
+    }
+}
 
 SerialDecodeReplayAssessment
 assess_serial_decode_replay(

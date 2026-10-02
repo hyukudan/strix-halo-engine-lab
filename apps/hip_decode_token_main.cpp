@@ -320,6 +320,10 @@ int main(
             argc,
             argv);
 
+    const auto model =
+        strix::ModelContract::
+            qwen38_flash_next();
+
     std::optional<strix::SerialDecodeReference>
         reference;
     std::uint64_t required_reference_logit_values = 0;
@@ -327,6 +331,9 @@ int main(
         reference =
             strix::read_serial_decode_reference(
                 options.reference_path);
+        strix::validate_serial_decode_reference_vocabulary(
+            *reference,
+            model.vocab_size);
         if (reference->steps.size() < 2) {
             throw std::invalid_argument(
                 "serial replay qualification requires at least two reference steps");
@@ -373,9 +380,14 @@ int main(
         }
     }
 
-    const auto model =
-        strix::ModelContract::
-            qwen38_flash_next();
+    for (const auto token : options.tokens) {
+        if (static_cast<std::uint64_t>(token) >=
+            model.vocab_size) {
+            throw std::invalid_argument(
+                "input token is outside target model vocabulary");
+        }
+    }
+
     if (options.context_tokens >
         model.max_position_embeddings) {
         throw std::invalid_argument(
@@ -682,6 +694,10 @@ int main(
                     sizeof(float),
                 hipMemcpyDeviceToHost),
             "hipMemcpy(logits D2H)");
+
+        strix::validate_serial_decode_engine_logits(
+            logits,
+            model.vocab_size);
 
         const auto ranked =
             top_logits(
