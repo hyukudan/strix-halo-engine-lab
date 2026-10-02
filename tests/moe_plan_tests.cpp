@@ -1,7 +1,9 @@
 #include "strix/moe_plan.hpp"
 
+#include <cmath>
 #include <cstdint>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <vector>
 
@@ -48,6 +50,43 @@ int main() {
                q8_storage.total_bytes_all_experts ==
                    q8_storage.total_bytes_per_expert * 512ULL,
            "compatible expert storage computes exact aggregate bytes");
+
+    const std::vector<float> cutoff_tie_logits{2.0F, 2.0F, 2.0F, 1.0F};
+    const auto cutoff_tie = strix::select_moe_experts_deterministic(
+        cutoff_tie_logits, 2, true);
+    expect(cutoff_tie.experts.size() == 2 &&
+               cutoff_tie.experts[0] == 0 &&
+               cutoff_tie.experts[1] == 1,
+           "equal MoE cutoff scores prefer lower expert indices");
+    expect(cutoff_tie.weights.size() == 2 &&
+               std::abs(cutoff_tie.weights[0] - 0.5F) < 1e-6F &&
+               std::abs(cutoff_tie.weights[1] - 0.5F) < 1e-6F,
+           "selected MoE weights renormalize after deterministic tie resolution");
+
+    const auto raw_cutoff_tie = strix::select_moe_experts_deterministic(
+        cutoff_tie_logits, 2, false);
+    expect(raw_cutoff_tie.weights.size() == 2 &&
+               raw_cutoff_tie.weights[0] == raw_cutoff_tie.weights[1] &&
+               raw_cutoff_tie.weights[0] < 0.5F,
+           "unnormalized MoE selection preserves full-softmax probabilities");
+
+    const std::vector<float> ordered_tie_logits{0.0F, 3.0F, 3.0F, 2.0F};
+    const auto ordered_tie = strix::select_moe_experts_deterministic(
+        ordered_tie_logits, 2, true);
+    expect(ordered_tie.experts[0] == 1 && ordered_tie.experts[1] == 2,
+           "MoE tie policy is score descending then lower expert index");
+
+    bool nonfinite_router_rejected = false;
+    try {
+        const std::vector<float> invalid_router{
+            0.0F, std::numeric_limits<float>::quiet_NaN()};
+        static_cast<void>(
+            strix::select_moe_experts_deterministic(invalid_router, 1, true));
+    } catch (const std::invalid_argument&) {
+        nonfinite_router_rejected = true;
+    }
+    expect(nonfinite_router_rejected,
+           "non-finite MoE router logits are rejected before softmax");
 
     const std::vector<std::uint32_t> routes{
         1, 2, 3,

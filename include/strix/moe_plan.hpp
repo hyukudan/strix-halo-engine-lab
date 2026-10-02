@@ -31,6 +31,11 @@ struct MoeRouteRequest {
     std::span<const std::uint32_t> selected_experts;
 };
 
+struct MoeRoutingSelection {
+    std::vector<std::uint32_t> experts;
+    std::vector<float> weights;
+};
+
 struct MoeRoutePlan {
     std::uint32_t rows = 0;
     std::uint32_t experts_per_row = 0;
@@ -91,6 +96,11 @@ struct MoeGroupingPlan {
 
 [[nodiscard]] MoeExpertStoragePlan build_moe_expert_storage_plan(
     const MoeExpertStorageRequest& request);
+
+[[nodiscard]] MoeRoutingSelection select_moe_experts_deterministic(
+    std::span<const float> logits,
+    std::uint32_t top_k,
+    bool normalize_selected = true);
 
 [[nodiscard]] MoeRoutePlan build_moe_route_plan(
     const MoeRouteRequest& request);

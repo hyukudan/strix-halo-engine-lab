@@ -248,13 +248,18 @@ def qsa_select_tokens_deterministic(
     return selected
 
 
-def moe_route_no_ties(
+def moe_route_deterministic(
     logits: list[float],
     *,
     top_k: int,
     normalize_selected: bool = True,
 ) -> tuple[list[int], list[float]]:
-    """Reference MoE routing for one row with an explicit no-tie contract."""
+    """Reference MoE routing with an explicit deterministic cutoff-tie contract.
+
+    The softmax is evaluated before ranking. Equal resulting probabilities are
+    ordered by lower expert index so replay and target-independent tests never
+    inherit backend-specific top-k tie behavior.
+    """
 
     if top_k <= 0 or top_k > len(logits):
         raise ValueError("top_k is out of range")
@@ -270,20 +275,30 @@ def moe_route_no_ties(
 
     ordered = sorted(
         range(len(probabilities)),
-        key=lambda index: -probabilities[index],
+        key=lambda index: (-probabilities[index], index),
     )
-    if top_k < len(ordered):
-        cutoff = probabilities[ordered[top_k - 1]]
-        next_value = probabilities[ordered[top_k]]
-        if cutoff == next_value:
-            raise ValueError("MoE top-k cutoff has unresolved score tie")
-
     indices = ordered[:top_k]
     selected = [probabilities[index] for index in indices]
     if normalize_selected:
         selected_sum = sum(selected)
         selected = [value / selected_sum for value in selected]
     return indices, selected
+
+
+def moe_route_no_ties(
+    logits: list[float],
+    *,
+    top_k: int,
+    normalize_selected: bool = True,
+) -> tuple[list[int], list[float]]:
+    """Backward-compatible alias for the now fully deterministic route oracle."""
+
+    return moe_route_deterministic(
+        logits,
+        top_k=top_k,
+        normalize_selected=normalize_selected,
+    )
+
 
 def stable_top_k(values: list[float], k: int) -> list[int]:
     """Candidate deterministic top-k policy: larger value, then lower index."""

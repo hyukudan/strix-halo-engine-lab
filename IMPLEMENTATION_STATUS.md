@@ -267,7 +267,7 @@ Routing foundation implemented:
 - route planning now emits a fused touched-expert bitmap plus CSR grouping offsets and assignment row/slot metadata in one validated pass;
 - grouped assignments retain original row and top-k slot identity for exact output restoration;
 - duplicate/out-of-range route validation;
-- dependency-free semantic oracle for FP32 softmax, no-tie top-k and selected-weight renormalization;
+- dependency-free semantic oracle plus portable C++ row selector for FP32 softmax, deterministic lower-expert-index cutoff ties, top-k and selected-weight renormalization;
 - standalone `gfx1151` HIP routing baseline for 1/2/4/8 logical rows;
 - standalone FP32 expert-execution correctness harness;
 - direct assignment and expert-major grouped GPU schedules compared against the same CPU reference;
@@ -276,7 +276,6 @@ Routing foundation implemented:
 
 Still pending:
 
-- canonical top-k cutoff tie contract;
 - wave-parallel/hierarchical routing candidates;
 - packed direct tiny-row expert path;
 - packed grouped expert execution with real weight reuse;

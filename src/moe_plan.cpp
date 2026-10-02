@@ -3,7 +3,9 @@
 #include "strix/gguf_reader.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
+#include <numeric>
 #include <stdexcept>
 #include <utility>
 
@@ -82,6 +84,71 @@ MoeExpertStoragePlan build_moe_expert_storage_plan(
     }
 
     return plan;
+}
+
+MoeRoutingSelection select_moe_experts_deterministic(
+    std::span<const float> logits,
+    std::uint32_t top_k,
+    bool normalize_selected) {
+    if (logits.empty() || top_k == 0 || top_k > logits.size()) {
+        throw std::invalid_argument("invalid MoE top-k geometry");
+    }
+
+    float maximum = -std::numeric_limits<float>::infinity();
+    for (const auto logit : logits) {
+        if (!std::isfinite(logit)) {
+            throw std::invalid_argument("MoE router logits must be finite");
+        }
+        maximum = std::max(maximum, logit);
+    }
+
+    std::vector<float> probabilities(logits.size(), 0.0F);
+    float denominator = 0.0F;
+    for (std::size_t index = 0; index < logits.size(); ++index) {
+        const auto probability = std::exp(logits[index] - maximum);
+        probabilities[index] = probability;
+        denominator += probability;
+    }
+    if (!(denominator > 0.0F) || !std::isfinite(denominator)) {
+        throw std::runtime_error("MoE softmax normalization is invalid");
+    }
+    for (auto& probability : probabilities) {
+        probability /= denominator;
+    }
+
+    std::vector<std::uint32_t> order(logits.size());
+    std::iota(order.begin(), order.end(), 0U);
+    std::sort(
+        order.begin(),
+        order.end(),
+        [&probabilities](std::uint32_t left, std::uint32_t right) {
+            if (probabilities[left] != probabilities[right]) {
+                return probabilities[left] > probabilities[right];
+            }
+            return left < right;
+        });
+    order.resize(top_k);
+
+    MoeRoutingSelection selection;
+    selection.experts = order;
+    selection.weights.reserve(top_k);
+    float selected_sum = 0.0F;
+    for (const auto expert : selection.experts) {
+        const auto weight = probabilities[expert];
+        selection.weights.push_back(weight);
+        selected_sum += weight;
+    }
+
+    if (normalize_selected) {
+        if (!(selected_sum > 0.0F) || !std::isfinite(selected_sum)) {
+            throw std::runtime_error("MoE selected-weight normalization is invalid");
+        }
+        for (auto& weight : selection.weights) {
+            weight /= selected_sum;
+        }
+    }
+
+    return selection;
 }
 
 MoeRoutePlan build_moe_route_plan(const MoeRouteRequest& request) {
