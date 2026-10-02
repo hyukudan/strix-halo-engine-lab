@@ -307,6 +307,7 @@ Initial host-side implementation:
 - sparse lookup planner with requested/unique row accounting;
 - deterministic contiguous-run construction;
 - bounded coalesced-I/O plan with configurable maximum rows per operation, exact byte offsets/sizes and deterministic inflight-wave accounting;
+- portable bounded asynchronous I/O executor that consumes the plan, caps concurrent reads, preserves deterministic result ordering and propagates source failures;
 - bounded LRU hit/miss simulation and physical row-read byte model;
 - standalone Linux benchmark for mmap, pread, pread+LRU and per-window coalesced pread;
 - deterministic PLE-like access pattern with 16 logical head partitions;
@@ -321,7 +322,7 @@ Still pending:
 - NVMe and page-cache qualification on the Strix Halo hosts;
 - CPU gather into registered/staging buffers under simultaneous GPU load;
 - direct GPU-visible sparse access experiment;
-- asynchronous execution of the bounded/coalesced I/O plan integrated with the executor.
+- production file/NVMe asynchronous source and staging integration with the serial executor/PLE launcher.
 
 
 ## Slice A1.5 — correct serial executor

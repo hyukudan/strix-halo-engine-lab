@@ -82,6 +82,7 @@ add_library(strix_core STATIC
     src/session_snapshot_transfer.cpp
     src/session_restore.cpp
     src/sparse_lookup.cpp
+    src/sparse_lookup_executor.cpp
     src/speculation.cpp
     src/speculation_controller.cpp
     src/speculation_cycle.cpp
@@ -222,6 +223,11 @@ if(BUILD_TESTING)
     target_link_libraries(strix-sparse-lookup-tests PRIVATE strix_core)
     strix_target_warnings(strix-sparse-lookup-tests)
     add_test(NAME strix-sparse-lookup-tests COMMAND strix-sparse-lookup-tests)
+
+    add_executable(strix-sparse-lookup-executor-tests tests/sparse_lookup_executor_tests.cpp)
+    target_link_libraries(strix-sparse-lookup-executor-tests PRIVATE strix_core)
+    strix_target_warnings(strix-sparse-lookup-executor-tests)
+    add_test(NAME strix-sparse-lookup-executor-tests COMMAND strix-sparse-lookup-executor-tests)
 
     add_executable(strix-ple-lookup-tests tests/ple_lookup_tests.cpp)
     target_link_libraries(strix-ple-lookup-tests PRIVATE strix_core)
