@@ -36,6 +36,15 @@ struct MoeRoutingSelection {
     std::vector<float> weights;
 };
 
+struct MoeHierarchicalRoutingPlan {
+    std::uint32_t expert_count = 0;
+    std::uint32_t top_k = 0;
+    std::uint32_t group_width = 0;
+    std::uint32_t groups = 0;
+    std::uint64_t local_candidate_scans = 0;
+    std::uint64_t group_reduction_candidates = 0;
+};
+
 struct MoeRoutePlan {
     std::uint32_t rows = 0;
     std::uint32_t experts_per_row = 0;
@@ -100,6 +109,17 @@ struct MoeGroupingPlan {
 [[nodiscard]] MoeRoutingSelection select_moe_experts_deterministic(
     std::span<const float> logits,
     std::uint32_t top_k,
+    bool normalize_selected = true);
+
+[[nodiscard]] MoeHierarchicalRoutingPlan build_moe_hierarchical_routing_plan(
+    std::uint32_t expert_count,
+    std::uint32_t top_k,
+    std::uint32_t group_width = 32);
+
+[[nodiscard]] MoeRoutingSelection select_moe_experts_hierarchical(
+    std::span<const float> logits,
+    std::uint32_t top_k,
+    std::uint32_t group_width = 32,
     bool normalize_selected = true);
 
 [[nodiscard]] MoeRoutePlan build_moe_route_plan(

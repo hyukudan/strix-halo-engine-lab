@@ -151,6 +151,192 @@ MoeRoutingSelection select_moe_experts_deterministic(
     return selection;
 }
 
+MoeHierarchicalRoutingPlan build_moe_hierarchical_routing_plan(
+    std::uint32_t expert_count,
+    std::uint32_t top_k,
+    std::uint32_t group_width) {
+    if (expert_count == 0 || top_k == 0 ||
+        top_k > expert_count || group_width == 0) {
+        throw std::invalid_argument(
+            "invalid hierarchical MoE routing geometry");
+    }
+
+    MoeHierarchicalRoutingPlan plan;
+    plan.expert_count = expert_count;
+    plan.top_k = top_k;
+    plan.group_width = group_width;
+    plan.groups =
+        static_cast<std::uint32_t>(
+            (static_cast<std::uint64_t>(expert_count) +
+             group_width - 1ULL) /
+            group_width);
+    plan.local_candidate_scans =
+        checked_mul(expert_count, top_k);
+    plan.group_reduction_candidates =
+        checked_mul(plan.groups, top_k);
+    return plan;
+}
+
+MoeRoutingSelection select_moe_experts_hierarchical(
+    std::span<const float> logits,
+    std::uint32_t top_k,
+    std::uint32_t group_width,
+    bool normalize_selected) {
+    if (logits.empty() ||
+        logits.size() >
+            std::numeric_limits<std::uint32_t>::max()) {
+        throw std::invalid_argument(
+            "hierarchical MoE router expert count is invalid");
+    }
+
+    const auto plan =
+        build_moe_hierarchical_routing_plan(
+            static_cast<std::uint32_t>(
+                logits.size()),
+            top_k,
+            group_width);
+
+    float maximum =
+        -std::numeric_limits<float>::infinity();
+    for (const auto logit : logits) {
+        if (!std::isfinite(logit)) {
+            throw std::invalid_argument(
+                "MoE router logits must be finite");
+        }
+        maximum =
+            std::max(
+                maximum,
+                logit);
+    }
+
+    std::vector<float> probabilities(
+        logits.size(),
+        0.0F);
+    float denominator = 0.0F;
+    for (std::size_t index = 0;
+         index < logits.size();
+         ++index) {
+        const auto probability =
+            std::exp(
+                logits[index] -
+                maximum);
+        probabilities[index] =
+            probability;
+        denominator +=
+            probability;
+    }
+    if (!(denominator > 0.0F) ||
+        !std::isfinite(denominator)) {
+        throw std::runtime_error(
+            "MoE softmax normalization is invalid");
+    }
+    for (auto& probability :
+         probabilities) {
+        probability /=
+            denominator;
+    }
+
+    std::vector<std::uint8_t> selected(
+        logits.size(),
+        0U);
+    MoeRoutingSelection selection;
+    selection.experts.reserve(top_k);
+    selection.weights.reserve(top_k);
+
+    for (std::uint32_t slot = 0;
+         slot < top_k;
+         ++slot) {
+        float winner_value =
+            -std::numeric_limits<float>::infinity();
+        std::uint32_t winner_index =
+            plan.expert_count;
+
+        for (std::uint32_t group = 0;
+             group < plan.groups;
+             ++group) {
+            const auto begin =
+                static_cast<std::uint64_t>(
+                    group) *
+                plan.group_width;
+            const auto end =
+                std::min<std::uint64_t>(
+                    begin +
+                        plan.group_width,
+                    plan.expert_count);
+
+            float group_value =
+                -std::numeric_limits<float>::infinity();
+            std::uint32_t group_index =
+                plan.expert_count;
+            for (std::uint64_t raw_index =
+                     begin;
+                 raw_index < end;
+                 ++raw_index) {
+                const auto index =
+                    static_cast<std::uint32_t>(
+                        raw_index);
+                if (selected[index] != 0U) {
+                    continue;
+                }
+
+                const auto value =
+                    probabilities[index];
+                if (value > group_value ||
+                    (value == group_value &&
+                     index < group_index)) {
+                    group_value = value;
+                    group_index = index;
+                }
+            }
+
+            if (group_index ==
+                plan.expert_count) {
+                continue;
+            }
+            if (group_value > winner_value ||
+                (group_value == winner_value &&
+                 group_index < winner_index)) {
+                winner_value =
+                    group_value;
+                winner_index =
+                    group_index;
+            }
+        }
+
+        if (winner_index ==
+            plan.expert_count) {
+            throw std::logic_error(
+                "hierarchical MoE selection exhausted candidates");
+        }
+        selected[winner_index] = 1U;
+        selection.experts.push_back(
+            winner_index);
+        selection.weights.push_back(
+            winner_value);
+    }
+
+    if (normalize_selected) {
+        float selected_sum = 0.0F;
+        for (const auto weight :
+             selection.weights) {
+            selected_sum +=
+                weight;
+        }
+        if (!(selected_sum > 0.0F) ||
+            !std::isfinite(selected_sum)) {
+            throw std::runtime_error(
+                "MoE selected-weight normalization is invalid");
+        }
+        for (auto& weight :
+             selection.weights) {
+            weight /=
+                selected_sum;
+        }
+    }
+
+    return selection;
+}
+
 MoeRoutePlan build_moe_route_plan(const MoeRouteRequest& request) {
     if (request.rows == 0 || request.experts_per_row == 0 ||
         request.expert_count == 0 ||

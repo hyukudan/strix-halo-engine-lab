@@ -268,6 +268,7 @@ Routing foundation implemented:
 - grouped assignments retain original row and top-k slot identity for exact output restoration;
 - duplicate/out-of-range route validation;
 - dependency-free semantic oracle plus portable C++ row selector for FP32 softmax, deterministic lower-expert-index cutoff ties, top-k and selected-weight renormalization;
+- Wave32-shaped hierarchical host routing candidate with explicit 32-wide groups, deterministic local/global reduction and exact target-geometry work accounting;
 - standalone `gfx1151` HIP routing baseline for 1/2/4/8 logical rows;
 - standalone FP32 expert-execution correctness harness;
 - direct assignment and expert-major grouped GPU schedules compared against the same CPU reference;
@@ -276,7 +277,7 @@ Routing foundation implemented:
 
 Still pending:
 
-- wave-parallel/hierarchical routing candidates;
+- native HIP wave-parallel/hierarchical routing candidate and Strix Halo comparison against the host hierarchical contract;
 - packed direct tiny-row expert path;
 - packed grouped expert execution with real weight reuse;
 - shared-expert integration;

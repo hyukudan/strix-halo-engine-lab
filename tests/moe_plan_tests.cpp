@@ -76,6 +76,74 @@ int main() {
     expect(ordered_tie.experts[0] == 1 && ordered_tie.experts[1] == 2,
            "MoE tie policy is score descending then lower expert index");
 
+    const auto hierarchical_plan =
+        strix::build_moe_hierarchical_routing_plan(512, 10, 32);
+    expect(hierarchical_plan.groups == 16 &&
+               hierarchical_plan.local_candidate_scans == 5120 &&
+               hierarchical_plan.group_reduction_candidates == 160,
+           "Wave32-shaped hierarchical routing plan exposes exact candidate work");
+
+    const auto hierarchical_tie =
+        strix::select_moe_experts_hierarchical(
+            cutoff_tie_logits,
+            2,
+            2,
+            true);
+    expect(hierarchical_tie.experts == cutoff_tie.experts,
+           "hierarchical MoE selection preserves deterministic cutoff ties");
+
+    std::vector<float> representative_router_logits(512);
+    for (std::uint32_t expert = 0;
+         expert < representative_router_logits.size();
+         ++expert) {
+        representative_router_logits[expert] =
+            static_cast<float>(
+                (expert * 37U) % 101U) /
+            7.0F;
+    }
+    const auto serial_representative =
+        strix::select_moe_experts_deterministic(
+            representative_router_logits,
+            10,
+            true);
+    const auto hierarchical_representative =
+        strix::select_moe_experts_hierarchical(
+            representative_router_logits,
+            10,
+            32,
+            true);
+    expect(hierarchical_representative.experts ==
+               serial_representative.experts,
+           "hierarchical routing matches canonical expert order at target geometry");
+    bool hierarchical_weights_match =
+        hierarchical_representative.weights.size() ==
+        serial_representative.weights.size();
+    for (std::size_t index = 0;
+         hierarchical_weights_match &&
+         index < serial_representative.weights.size();
+         ++index) {
+        hierarchical_weights_match =
+            std::abs(
+                hierarchical_representative.weights[index] -
+                serial_representative.weights[index]) <
+            1e-6F;
+    }
+    expect(hierarchical_weights_match,
+           "hierarchical routing matches canonical normalized weights");
+
+    bool invalid_hierarchical_width_rejected = false;
+    try {
+        static_cast<void>(
+            strix::build_moe_hierarchical_routing_plan(
+                512,
+                10,
+                0));
+    } catch (const std::invalid_argument&) {
+        invalid_hierarchical_width_rejected = true;
+    }
+    expect(invalid_hierarchical_width_rejected,
+           "hierarchical routing rejects zero-width candidate groups");
+
     bool nonfinite_router_rejected = false;
     try {
         const std::vector<float> invalid_router{
