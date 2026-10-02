@@ -325,30 +325,27 @@ Still pending:
 
 ## Slice A1.5 — correct serial executor
 
-Static execution planning implemented:
+Implemented through an experimental C1/BF16 HIP path:
 
-- pinned serial-decode dependency DAG;
-- serial decode buffer-lifetime planner;
-- two hyper-expanded ping-pong buffers and three hidden-width MoE branch buffers modeled explicitly;
-- route metadata, injection controls and full-logit materialization accounted separately;
-- internal scratch peak separated from final hidden + logits peak;
-- exact 36 recurrent / 12 indexed-attention layer pattern;
-- exact single PLE placement at the pinned one-based layer;
-- explicit attention and MLP gated-residual boundaries;
-- MoE router and shared-expert branches can begin from the same MLP input;
-- routed experts depend on routing; combine depends on routed and shared outputs;
-- persistent-state read/write masks for KV, recurrent matrix, convolution history, sparse index, n-gram history and position history;
-- conservative graph-safety and dynamic-shape flags per logical operation;
-- tests ensure stable IDs and backward-only DAG dependencies.
+- pinned serial-decode dependency DAG and liveness-derived scratch arena;
+- exact recurrent/indexed-attention layer pattern, PLE placement and gated-residual boundaries;
+- deterministic tensor-requirement/access plan bound into runtime compatibility identity;
+- kernel-registry binding plus a complete HIP launcher catalog structural audit;
+- independently versioned scratch, persistent session state and model-tensor bindings;
+- concrete KV/recurrent/convolution/history state layout and fresh-state initialization;
+- file-backed PLE lookup seam;
+- eager one-token serial session execution with fail-closed poisoning on partial dispatch failure;
+- raw-token HIP runner that assembles GGUF manifest, selective residency, runtime memory, tensor access, dispatch and FP32 LM-head logits;
+- versioned independent multi-step replay fixture with checkpoint/vocabulary preflight;
+- replay qualification rejects non-finite or mis-sized logits, requires exact argmax when declared, enforces the requested logit-error policy and now binds evidence to the exact checkpoint, compiled execution and runtime compatibility identities being qualified;
+- dedicated host tests cover replay policy and identity failures.
 
 Still pending:
 
-- binding each logical operation to qualified kernel-registry variants;
-- buffer/lifetime planning for side values such as hyper inputs and injection weights;
-- concrete KV and indexed-attention state objects;
-- real PLE asynchronous lookup integration;
-- executable eager decode loop;
-- logits/sampling/token replay against the canonical checkpoint.
+- native Strix Halo build/run of the complete HIP path;
+- canonical multi-token checkpoint replay with matching argmax/logit probes;
+- asynchronous production PLE lookup/staging rather than the current file-backed seam;
+- promotion from experimental bindings only after native correctness and resource qualification.
 
 
 ## Slice A1.6 — greedy speculative execution

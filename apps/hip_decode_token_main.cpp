@@ -773,6 +773,13 @@ int main(
         replay_assessment;
     if (reference.has_value()) {
         strix::SerialDecodeReplayPolicy policy;
+        policy.expected_model_content_identity =
+            model_residency.binding().
+                model_content_identity;
+        policy.expected_compiled_execution_identity =
+            compiled.execution_identity;
+        policy.expected_runtime_compatibility_identity =
+            identities.compatibility_identity;
         policy.policy_identity =
             reference->independent_reference_identity;
         policy.max_logit_abs_error =

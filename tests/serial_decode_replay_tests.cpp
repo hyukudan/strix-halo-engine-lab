@@ -35,7 +35,16 @@ strix::SerialDecodeReplayObservation passing_observation() {
 }  // namespace
 
 int main() {
+    const auto observation =
+        passing_observation();
+
     strix::SerialDecodeReplayPolicy policy;
+    policy.expected_model_content_identity =
+        observation.model_content_identity;
+    policy.expected_compiled_execution_identity =
+        observation.compiled_execution_identity;
+    policy.expected_runtime_compatibility_identity =
+        observation.runtime_compatibility_identity;
     policy.policy_identity = 0x1003ULL;
     policy.max_logit_abs_error = 1e-3;
     policy.minimum_steps = 2;
@@ -94,8 +103,6 @@ int main() {
     expect(zero_vocab_rejected,
            "zero expected vocabulary is rejected before replay assessment");
 
-    const auto observation =
-        passing_observation();
     const auto passing =
         strix::assess_serial_decode_replay(
             policy,
@@ -148,6 +155,36 @@ int main() {
     expect(!unidentified.identity_valid &&
                !unidentified.passes_declared_policy,
            "replay without checkpoint content identity cannot qualify");
+
+    auto foreign_model = observation;
+    foreign_model.model_content_identity.bytes[0] ^= 0x01U;
+    const auto wrong_model =
+        strix::assess_serial_decode_replay(
+            policy,
+            foreign_model);
+    expect(!wrong_model.identity_valid &&
+               !wrong_model.passes_declared_policy,
+           "replay from a different checkpoint identity cannot qualify");
+
+    auto foreign_execution = observation;
+    ++foreign_execution.compiled_execution_identity;
+    const auto wrong_execution =
+        strix::assess_serial_decode_replay(
+            policy,
+            foreign_execution);
+    expect(!wrong_execution.identity_valid &&
+               !wrong_execution.passes_declared_policy,
+           "replay from a different compiled execution cannot qualify");
+
+    auto foreign_runtime = observation;
+    ++foreign_runtime.runtime_compatibility_identity;
+    const auto wrong_runtime =
+        strix::assess_serial_decode_replay(
+            policy,
+            foreign_runtime);
+    expect(!wrong_runtime.identity_valid &&
+               !wrong_runtime.passes_declared_policy,
+           "replay from a different runtime compatibility identity cannot qualify");
 
     auto wrong_reference = observation;
     wrong_reference.independent_reference_identity =

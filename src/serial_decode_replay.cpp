@@ -35,7 +35,10 @@ SerialDecodeReplayAssessment
 assess_serial_decode_replay(
     const SerialDecodeReplayPolicy& policy,
     const SerialDecodeReplayObservation& observation) {
-    if (policy.policy_identity == 0 ||
+    if (!policy.expected_model_content_identity.valid() ||
+        policy.expected_compiled_execution_identity == 0 ||
+        policy.expected_runtime_compatibility_identity == 0 ||
+        policy.policy_identity == 0 ||
         policy.minimum_steps < 2 ||
         policy.minimum_logit_values_compared == 0 ||
         !std::isfinite(policy.max_logit_abs_error) ||
@@ -53,9 +56,12 @@ assess_serial_decode_replay(
     SerialDecodeReplayAssessment result;
 
     result.identity_valid =
-        observation.model_content_identity.valid() &&
-        observation.compiled_execution_identity != 0 &&
-        observation.runtime_compatibility_identity != 0 &&
+        observation.model_content_identity ==
+            policy.expected_model_content_identity &&
+        observation.compiled_execution_identity ==
+            policy.expected_compiled_execution_identity &&
+        observation.runtime_compatibility_identity ==
+            policy.expected_runtime_compatibility_identity &&
         observation.independent_reference_identity != 0 &&
         observation.independent_reference_identity ==
             policy.policy_identity;

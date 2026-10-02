@@ -9,6 +9,9 @@
 namespace strix {
 
 struct SerialDecodeReplayPolicy {
+    ModelContentIdentity expected_model_content_identity;
+    std::uint64_t expected_compiled_execution_identity = 0;
+    std::uint64_t expected_runtime_compatibility_identity = 0;
     std::uint64_t policy_identity = 0;
     double max_logit_abs_error = 0.0;
     std::uint64_t minimum_steps = 2;
