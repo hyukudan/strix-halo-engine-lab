@@ -14,6 +14,7 @@ from typing import Any
 
 FIXTURE_ID = "q8-target-dims-overlap-v1"
 SCHEMA_ID = "strix.moe-q8-reuse.v1"
+REPORT_SCHEMA_ID = "strix.moe-q8-qualification.v1"
 DEFAULT_ROWS = (1, 2, 4, 8)
 EXPECTED_HIDDEN = 2560
 EXPECTED_INTERMEDIATE = 640
@@ -197,8 +198,11 @@ def validate_result(
 
 
 def summarize(samples: list[dict[str, Any]], rows: int) -> dict[str, Any]:
+    if not samples:
+        raise QualificationError(f"C{rows} produced no samples")
     first = samples[0]
     stable_keys = (
+        "schema",
         "device",
         "gfx_arch",
         "warp_size",
@@ -214,6 +218,7 @@ def summarize(samples: list[dict[str, Any]], rows: int) -> dict[str, Any]:
         "direct_modeled_weight_bytes",
         "grouped_modeled_weight_bytes",
         "modeled_weight_bytes_saved",
+        "iterations",
     )
     for sample in samples[1:]:
         for key in stable_keys:
@@ -223,8 +228,20 @@ def summarize(samples: list[dict[str, Any]], rows: int) -> dict[str, Any]:
                     f"{first.get(key)!r} -> {sample.get(key)!r}"
                 )
 
-    direct = [float(sample["direct_ms"]) for sample in samples]
-    grouped = [float(sample["grouped_ms"]) for sample in samples]
+    try:
+        direct = [float(sample["direct_ms"]) for sample in samples]
+        grouped = [float(sample["grouped_ms"]) for sample in samples]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise QualificationError(
+            f"C{rows} omitted or malformed repeated timing samples"
+        ) from exc
+    if any(
+        not math.isfinite(value) or value <= 0.0
+        for value in (*direct, *grouped)
+    ):
+        raise QualificationError(
+            f"C{rows} produced non-finite or non-positive timing samples"
+        )
     direct_median = statistics.median(direct)
     grouped_median = statistics.median(grouped)
     speedup = direct_median / grouped_median
@@ -260,6 +277,94 @@ def summarize(samples: list[dict[str, Any]], rows: int) -> dict[str, Any]:
             float(sample["max_direct_grouped_error"]) for sample in samples
         ),
     }
+
+
+def validate_report(report: dict[str, Any]) -> None:
+    if report.get("schema") != REPORT_SCHEMA_ID:
+        raise QualificationError("qualification report schema mismatch")
+    if report.get("fixture") != FIXTURE_ID:
+        raise QualificationError("qualification report fixture mismatch")
+    if report.get("hidden") != EXPECTED_HIDDEN or report.get("intermediate") != EXPECTED_INTERMEDIATE:
+        raise QualificationError("qualification report geometry mismatch")
+
+    rows = report.get("rows")
+    if not isinstance(rows, list) or not rows:
+        raise QualificationError("qualification report contains no row classes")
+
+    seen_rows: set[int] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            raise QualificationError("qualification report row must be an object")
+        try:
+            row_count = int(row["rows"])
+            row_class = str(row["row_class"])
+            direct_ms = float(row["direct_ms_median"])
+            grouped_ms = float(row["grouped_ms_median"])
+            speedup = float(row["speedup_direct_over_grouped"])
+            winner = str(row["winner"])
+            direct_bytes = int(row["direct_modeled_weight_bytes"])
+            grouped_bytes = int(row["grouped_modeled_weight_bytes"])
+            saved_bytes = int(row["modeled_weight_bytes_saved"])
+            errors = (
+                float(row["max_direct_reference_error"]),
+                float(row["max_grouped_reference_error"]),
+                float(row["max_direct_grouped_error"]),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise QualificationError(
+                "qualification report contains malformed row summary"
+            ) from exc
+
+        if row_count in seen_rows:
+            raise QualificationError(
+                f"qualification report contains duplicate C{row_count}"
+            )
+        seen_rows.add(row_count)
+        if row_count not in DEFAULT_ROWS or row_class != f"C{row_count}":
+            raise QualificationError(
+                f"qualification report row label {row_class!r} is invalid for C{row_count}"
+            )
+        if (
+            not math.isfinite(direct_ms)
+            or not math.isfinite(grouped_ms)
+            or direct_ms <= 0.0
+            or grouped_ms <= 0.0
+        ):
+            raise QualificationError(
+                f"C{row_count}: qualification report contains invalid median timing"
+            )
+        expected_speedup = direct_ms / grouped_ms
+        if not math.isfinite(speedup) or not math.isclose(
+            speedup, expected_speedup, rel_tol=1e-12, abs_tol=0.0
+        ):
+            raise QualificationError(
+                f"C{row_count}: reported speedup is inconsistent with medians"
+            )
+        if grouped_ms < direct_ms:
+            expected_winner = "grouped"
+        elif direct_ms < grouped_ms:
+            expected_winner = "direct"
+        else:
+            expected_winner = "tie"
+        if winner != expected_winner:
+            raise QualificationError(
+                f"C{row_count}: reported winner {winner!r} should be {expected_winner!r}"
+            )
+        if direct_bytes <= 0 or grouped_bytes <= 0 or grouped_bytes > direct_bytes:
+            raise QualificationError(
+                f"C{row_count}: qualification report contains invalid modeled weight traffic"
+            )
+        if saved_bytes != direct_bytes - grouped_bytes:
+            raise QualificationError(
+                f"C{row_count}: qualification report weight-byte accounting is inconsistent"
+            )
+        if any(not math.isfinite(value) or value < 0.0 for value in errors):
+            raise QualificationError(
+                f"C{row_count}: qualification report contains invalid correctness error"
+            )
+
+    if report.get("all_correct") is not True:
+        raise QualificationError("qualification report must preserve all_correct=true")
 
 
 def main() -> int:
@@ -350,7 +455,7 @@ def main() -> int:
         row_results.append(summarize(samples, rows))
 
     report = {
-        "schema": "strix.moe-q8-qualification.v1",
+        "schema": REPORT_SCHEMA_ID,
         "device": device,
         "gfx_arch": gfx_arch,
         "fixture": FIXTURE_ID,
@@ -363,6 +468,7 @@ def main() -> int:
         "rows": row_results,
         "all_correct": True,
     }
+    validate_report(report)
     payload = json.dumps(report, indent=2, sort_keys=True)
     print(payload)
     if args.output is not None:
