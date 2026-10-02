@@ -9,8 +9,8 @@ The first candidate follows the pinned routing semantics:
 3. optional renormalization of selected probabilities;
 4. output selected expert indices and weights.
 
-The fixture generator avoids cutoff ties because upstream top-k tie order is not
-yet a canonical semantic contract.
+The fixture includes a cutoff tie when the requested geometry permits it. Equal
+probabilities must select the lower expert index, matching the canonical host contract.
 
 ## Initial geometry
 
