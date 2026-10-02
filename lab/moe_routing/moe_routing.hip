@@ -15,6 +15,7 @@ namespace {
 constexpr int kMaxExperts = 512;
 constexpr int kThreads = 256;
 constexpr int kMaxTopK = 16;
+constexpr std::string_view kFixtureId = "deterministic-cutoff-tie-v1";
 
 void check(hipError_t error, const char* operation) {
     if (error != hipSuccess) {
@@ -321,13 +322,23 @@ int main(int argc, char** argv) try {
     std::vector<float> logits(logit_count);
     for (int row = 0; row < options.rows; ++row) {
         for (int expert = 0; expert < options.experts; ++expert) {
-            // Deterministic and intentionally tie-free near the top-k boundary.
             const float wave =
                 std::sin(static_cast<float>((row + 1) * (expert + 3)) * 0.017F);
             logits[static_cast<std::size_t>(row) * options.experts + expert] =
                 wave + static_cast<float>(expert) * 1e-5F +
                 static_cast<float>(row) * 1e-4F;
         }
+    }
+
+    // Pin an exact cutoff tie on row zero so both device candidates are
+    // qualified against the same deterministic lower-expert-index rule.
+    if (options.experts > options.top_k) {
+        for (int expert = 0; expert < options.experts; ++expert) {
+            logits[static_cast<std::size_t>(expert)] =
+                -static_cast<float>(expert);
+        }
+        logits[static_cast<std::size_t>(options.top_k)] =
+            logits[static_cast<std::size_t>(options.top_k - 1)];
     }
 
     std::vector<int> reference_indices(selected_count);
@@ -390,47 +401,31 @@ int main(int argc, char** argv) try {
     const auto overlap =
         adjacent_overlap(options.rows, options.top_k, reference_indices);
 
-    std::cout << "{
-"
-              << "  \"device\": \"" << properties.name << "\",
-"
-              << "  \"gfx_arch\": \"" << properties.gcnArchName << "\",
-"
-              << "  \"warp_size\": " << properties.warpSize << ",
-"
-              << "  \"rows\": " << options.rows << ",
-"
-              << "  \"experts\": " << options.experts << ",
-"
-              << "  \"top_k\": " << options.top_k << ",
-"
+    std::cout << "{\n"
+              << "  \"device\": \"" << properties.name << "\",\n"
+              << "  \"gfx_arch\": \"" << properties.gcnArchName << "\",\n"
+              << "  \"fixture\": \"" << kFixtureId << "\",\n"
+              << "  \"warp_size\": " << properties.warpSize << ",\n"
+              << "  \"rows\": " << options.rows << ",\n"
+              << "  \"experts\": " << options.experts << ",\n"
+              << "  \"top_k\": " << options.top_k << ",\n"
+              << "  \"iterations\": " << options.iterations << ",\n"
               << "  \"normalize_selected\": "
-              << (options.normalize_selected ? "true" : "false") << ",
-"
+              << (options.normalize_selected ? "true" : "false") << ",\n"
               << "  \"average_us\": "
               << (static_cast<double>(total_ms) * 1000.0 /
-                  static_cast<double>(options.iterations)) << ",
-"
+                  static_cast<double>(options.iterations)) << ",\n"
               << "  \"exact_indices\": "
-              << (exact_indices ? "true" : "false") << ",
-"
-              << "  \"max_weight_error\": " << weight_error << ",
-"
-              << "  \"distinct_experts\": " << distinct << ",
-"
-              << "  \"mean_adjacent_row_overlap\": " << overlap << ",
-"
-              << "  \"kernel_local_bytes\": " << attributes.localSizeBytes << ",
-"
-              << "  \"kernel_shared_bytes\": " << attributes.sharedSizeBytes << ",
-"
-              << "  \"kernel_registers\": " << attributes.numRegs << ",
-"
+              << (exact_indices ? "true" : "false") << ",\n"
+              << "  \"max_weight_error\": " << weight_error << ",\n"
+              << "  \"distinct_experts\": " << distinct << ",\n"
+              << "  \"mean_adjacent_row_overlap\": " << overlap << ",\n"
+              << "  \"kernel_local_bytes\": " << attributes.localSizeBytes << ",\n"
+              << "  \"kernel_shared_bytes\": " << attributes.sharedSizeBytes << ",\n"
+              << "  \"kernel_registers\": " << attributes.numRegs << ",\n"
               << "  \"max_threads_per_block\": "
-              << attributes.maxThreadsPerBlock << "
-"
-              << "}
-";
+              << attributes.maxThreadsPerBlock << "\n"
+              << "}\n";
 
     hipEventDestroy(begin);
     hipEventDestroy(end);

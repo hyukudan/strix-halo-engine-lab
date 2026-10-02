@@ -273,6 +273,8 @@ Routing foundation implemented:
 - Wave32-shaped hierarchical host routing candidate with explicit 32-wide groups, deterministic local/global reduction and exact target-geometry work accounting;
 - standalone `gfx1151` HIP routing baseline for 1/2/4/8 logical rows;
 - standalone `gfx1151` Wave32 hierarchical HIP candidate with one 512-thread row block, sixteen 32-lane group reductions, deterministic global reduction per top-k slot, cutoff-tie validation and explicit host-plan work counters;
+- serial and hierarchical routing binaries share an explicit deterministic cutoff-tie fixture identity and emit comparable iteration/normalization metadata;
+- dependency-free native qualification runner interleaves serial/hierarchical C1/C2/C4/C8 repetitions, rejects mismatched device/fixture/`gfx1151` metadata, gates correctness before timing and emits per-row median latency, resource metadata and speedup;
 - standalone FP32 expert-execution correctness harness;
 - direct assignment and expert-major grouped GPU schedules compared against the same CPU reference;
 - grouped schedule preserves original row restoration through explicit assignment metadata;

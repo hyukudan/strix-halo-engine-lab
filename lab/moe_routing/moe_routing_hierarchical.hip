@@ -18,6 +18,7 @@ constexpr int kThreads = 512;
 constexpr int kWaveWidth = 32;
 constexpr int kMaxGroups = kMaxExperts / kWaveWidth;
 constexpr int kMaxTopK = 16;
+constexpr std::string_view kFixtureId = "deterministic-cutoff-tie-v1";
 
 void check(hipError_t error, const char* operation) {
     if (error != hipSuccess) {
@@ -395,10 +396,14 @@ int main(int argc, char** argv) try {
     std::cout << "{\n"
               << "  \"device\": \"" << properties.name << "\",\n"
               << "  \"gfx_arch\": \"" << properties.gcnArchName << "\",\n"
+              << "  \"fixture\": \"" << kFixtureId << "\",\n"
               << "  \"warp_size\": " << properties.warpSize << ",\n"
               << "  \"rows\": " << options.rows << ",\n"
               << "  \"experts\": " << options.experts << ",\n"
               << "  \"top_k\": " << options.top_k << ",\n"
+              << "  \"iterations\": " << options.iterations << ",\n"
+              << "  \"normalize_selected\": "
+              << (options.normalize_selected ? "true" : "false") << ",\n"
               << "  \"group_width\": " << kWaveWidth << ",\n"
               << "  \"groups\": "
               << ((options.experts + kWaveWidth - 1) / kWaveWidth) << ",\n"
