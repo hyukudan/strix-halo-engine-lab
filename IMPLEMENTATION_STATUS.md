@@ -309,7 +309,7 @@ Initial host-side implementation:
 - bounded coalesced-I/O plan with configurable maximum rows per operation, exact byte offsets/sizes and deterministic inflight-wave accounting;
 - portable bounded asynchronous I/O executor that consumes the plan, caps concurrent reads, preserves deterministic result ordering and propagates source failures;
 - bounded LRU hit/miss simulation and physical row-read byte model;
-- standalone Linux benchmark for mmap, pread, pread+LRU and per-window coalesced pread;
+- standalone Linux benchmark for mmap, pread, pread+LRU, per-window coalesced pread and bounded asynchronous pread using the production planner/executor contract;
 - deterministic PLE-like access pattern with 16 logical head partitions;
 - additional random, hot-set and contiguous-run controls;
 - materialized-file preparation mode so sparse holes are not mistaken for real storage performance;
@@ -322,7 +322,7 @@ Still pending:
 - NVMe and page-cache qualification on the Strix Halo hosts;
 - CPU gather into registered/staging buffers under simultaneous GPU load;
 - direct GPU-visible sparse access experiment;
-- production file/NVMe asynchronous source and staging integration with the serial executor/PLE launcher.
+- direct staging integration of the bounded asynchronous file source with the serial executor/PLE launcher;
 
 
 ## Slice A1.5 — correct serial executor

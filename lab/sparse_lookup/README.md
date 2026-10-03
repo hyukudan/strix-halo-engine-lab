@@ -75,6 +75,24 @@ Do not benchmark a sparse hole-only file. Materialize deterministic bytes first:
   --requests 16000 --window 16
 ```
 
+### Bounded asynchronous pread
+
+This mode uses the same bounded/coalesced planner and portable executor as the
+runtime core, backed by real Linux `pread` calls. It therefore measures the
+actual scheduling contract rather than a lab-only approximation.
+
+```bash
+./build/sparse-lookup/strix-sparse-lookup bench \
+  --file /fast/ple-table.bin \
+  --mode pread-bounded-async --pattern ple \
+  --table-rows 16384 --row-bytes 320 \
+  --requests 16000 --window 16 \
+  --max-rows-per-io 4 --max-inflight-ios 4
+```
+
+Compare several inflight depths and chunk sizes; do not assume more concurrency
+is better under page-cache or NVMe pressure.
+
 ## Access patterns
 
 - `ple`: 16 logical head partitions with deterministic random row selection.
@@ -100,6 +118,7 @@ The JSON result reports:
 - requested bytes;
 - actual bytes issued through pread paths;
 - read syscall count;
+- bounded-I/O chunk and inflight configuration;
 - cache hits and misses;
 - major and minor page-fault deltas;
 - requested-byte throughput;

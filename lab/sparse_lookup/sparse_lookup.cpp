@@ -2,6 +2,9 @@
 #error "The sparse lookup lab currently requires Linux."
 #endif
 
+#include "strix/sparse_lookup.hpp"
+#include "strix/sparse_lookup_executor.hpp"
+
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
@@ -65,6 +68,8 @@ struct Options {
     std::uint64_t requests = 16'000;
     std::uint64_t window = 16;
     std::uint64_t cache_rows = 256;
+    std::uint64_t max_rows_per_io = 4;
+    std::uint64_t max_inflight_ios = 4;
     std::uint64_t seed = 1234;
     bool drop_cache = false;
 };
@@ -106,6 +111,16 @@ Options parse_args(int argc, char** argv) {
         } else if (arg == "--cache-rows") {
             options.cache_rows =
                 parse_u64(next_value(argc, argv, index, "--cache-rows"), "--cache-rows");
+        } else if (arg == "--max-rows-per-io") {
+            options.max_rows_per_io =
+                parse_u64(
+                    next_value(argc, argv, index, "--max-rows-per-io"),
+                    "--max-rows-per-io");
+        } else if (arg == "--max-inflight-ios") {
+            options.max_inflight_ios =
+                parse_u64(
+                    next_value(argc, argv, index, "--max-inflight-ios"),
+                    "--max-inflight-ios");
         } else if (arg == "--seed") {
             options.seed =
                 parse_u64(next_value(argc, argv, index, "--seed"), "--seed");
@@ -125,6 +140,9 @@ Options parse_args(int argc, char** argv) {
     if (options.command == "bench" &&
         (options.requests == 0 || options.window == 0)) {
         throw std::invalid_argument("requests and window must be non-zero");
+    }
+    if (options.max_inflight_ios == 0) {
+        throw std::invalid_argument("--max-inflight-ios must be non-zero");
     }
     return options;
 }
@@ -353,6 +371,39 @@ off_t row_offset(std::uint64_t row, std::uint64_t row_bytes) {
     return static_cast<off_t>(offset);
 }
 
+off_t byte_offset(std::uint64_t offset) {
+    if (offset >
+        static_cast<std::uint64_t>(std::numeric_limits<off_t>::max())) {
+        throw std::overflow_error("byte offset does not fit off_t");
+    }
+    return static_cast<off_t>(offset);
+}
+
+class PreadIoSource final
+    : public strix::SparseLookupIoSource {
+public:
+    explicit PreadIoSource(int fd)
+        : fd_(fd) {
+        if (fd_ < 0) {
+            throw std::invalid_argument(
+                "pread I/O source requires a valid file descriptor");
+        }
+    }
+
+    void read(
+        std::uint64_t offset,
+        std::span<std::byte> destination) override {
+        pread_all(
+            fd_,
+            destination.data(),
+            destination.size(),
+            byte_offset(offset));
+    }
+
+private:
+    int fd_ = -1;
+};
+
 Result bench_pread(
     int fd,
     const Options& options,
@@ -550,6 +601,110 @@ Result bench_coalesced(
     return result;
 }
 
+
+Result bench_bounded_async(
+    int fd,
+    const Options& options,
+    const std::vector<std::uint64_t>& rows) {
+    Result result;
+    PreadIoSource source(fd);
+
+    for (std::size_t begin = 0;
+         begin < rows.size();
+         begin += static_cast<std::size_t>(options.window)) {
+        const auto end =
+            std::min(
+                rows.size(),
+                begin +
+                    static_cast<std::size_t>(
+                        options.window));
+        const std::span<const std::uint64_t> window_rows(
+            rows.data() + begin,
+            end - begin);
+
+        strix::SparseLookupRequest request;
+        request.table_rows =
+            options.table_rows;
+        request.row_bytes =
+            options.row_bytes;
+        request.cache_capacity_rows = 0;
+        request.max_rows_per_io =
+            options.max_rows_per_io;
+        request.max_inflight_ios =
+            options.max_inflight_ios;
+        request.row_ids =
+            window_rows;
+
+        const auto plan =
+            strix::build_sparse_lookup_plan(
+                request);
+        const auto execution =
+            strix::execute_sparse_lookup_io_plan(
+                plan,
+                source);
+
+        result.read_syscalls +=
+            execution.operations_completed;
+        result.physical_read_bytes +=
+            execution.bytes_read;
+
+        for (const auto row : window_rows) {
+            const std::byte* row_data = nullptr;
+            for (std::size_t operation_index = 0;
+                 operation_index < plan.io_plan.size();
+                 ++operation_index) {
+                const auto& operation =
+                    plan.io_plan[operation_index];
+                if (row < operation.first_row ||
+                    row >=
+                        operation.first_row +
+                            operation.row_count) {
+                    continue;
+                }
+
+                const auto within_rows =
+                    row - operation.first_row;
+                const auto within_bytes =
+                    checked_mul(
+                        within_rows,
+                        options.row_bytes);
+                const auto& payload =
+                    execution.operation_payloads[
+                        operation_index];
+                if (within_bytes >
+                        payload.size() ||
+                    options.row_bytes >
+                        payload.size() -
+                            static_cast<std::size_t>(
+                                within_bytes)) {
+                    throw std::logic_error(
+                        "bounded async payload does not contain requested row");
+                }
+                row_data =
+                    payload.data() +
+                    static_cast<std::size_t>(
+                        within_bytes);
+                break;
+            }
+
+            if (row_data == nullptr) {
+                throw std::logic_error(
+                    "bounded async row has no owning I/O operation");
+            }
+
+            result.checksum ^=
+                consume_row(
+                    reinterpret_cast<
+                        const std::uint8_t*>(
+                            row_data),
+                    static_cast<std::size_t>(
+                        options.row_bytes));
+        }
+    }
+
+    return result;
+}
+
 void verify_file_size(int fd, const Options& options) {
     struct stat info {};
     if (fstat(fd, &info) != 0) {
@@ -586,9 +741,11 @@ void run_benchmark(const Options& options) {
         result = bench_cache(file.fd, options, rows);
     } else if (options.mode == "pread-coalesced") {
         result = bench_coalesced(file.fd, options, rows);
+    } else if (options.mode == "pread-bounded-async") {
+        result = bench_bounded_async(file.fd, options, rows);
     } else {
         throw std::invalid_argument(
-            "mode must be pread, mmap, pread-cache or pread-coalesced");
+            "mode must be pread, mmap, pread-cache, pread-coalesced or pread-bounded-async");
     }
 
     const auto stop = std::chrono::steady_clock::now();
@@ -607,6 +764,8 @@ void run_benchmark(const Options& options) {
               << "  \"requests\": " << options.requests << ",\n"
               << "  \"window\": " << options.window << ",\n"
               << "  \"cache_rows\": " << options.cache_rows << ",\n"
+              << "  \"max_rows_per_io\": " << options.max_rows_per_io << ",\n"
+              << "  \"max_inflight_ios\": " << options.max_inflight_ios << ",\n"
               << "  \"seconds\": " << seconds << ",\n"
               << "  \"requested_bytes\": " << requested_bytes << ",\n"
               << "  \"physical_read_bytes\": "
