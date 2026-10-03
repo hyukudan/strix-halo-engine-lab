@@ -1,8 +1,10 @@
 #include "strix/ple_lookup.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <vector>
 #include <iostream>
 #include <stdexcept>
@@ -17,6 +19,37 @@ void expect(bool condition, const char* message) {
         ++failures;
     }
 }
+
+class MemoryIoSource final
+    : public strix::SparseLookupIoSource {
+public:
+    explicit MemoryIoSource(
+        std::vector<std::byte> bytes)
+        : bytes_(std::move(bytes)) {}
+
+    void read(
+        std::uint64_t byte_offset,
+        std::span<std::byte> destination) override {
+        if (byte_offset >
+                bytes_.size() ||
+            destination.size() >
+                bytes_.size() -
+                    static_cast<std::size_t>(
+                        byte_offset)) {
+            throw std::out_of_range(
+                "memory I/O source read exceeds bytes");
+        }
+        std::copy_n(
+            bytes_.data() +
+                static_cast<std::size_t>(
+                    byte_offset),
+            destination.size(),
+            destination.data());
+    }
+
+private:
+    std::vector<std::byte> bytes_;
+};
 
 }  // namespace
 
@@ -246,6 +279,149 @@ int main() {
         expect(
             row_rejected,
             "file-mapped backend rejects row outside table geometry");
+    }
+
+    {
+        constexpr std::uint64_t row_elements = 160;
+        constexpr std::uint64_t rows = 4;
+        constexpr std::uint64_t row_bytes =
+            row_elements * sizeof(std::uint16_t);
+        constexpr std::uint64_t table_offset = 64;
+
+        std::vector<std::byte> file_bytes(
+            static_cast<std::size_t>(
+                table_offset +
+                rows * row_bytes));
+        for (std::uint64_t row = 0;
+             row < rows;
+             ++row) {
+            for (std::uint64_t column = 0;
+                 column < row_elements;
+                 ++column) {
+                const auto value =
+                    static_cast<std::uint16_t>(
+                        row * 1000ULL +
+                        column);
+                std::memcpy(
+                    file_bytes.data() +
+                        static_cast<std::size_t>(
+                            table_offset +
+                            row * row_bytes +
+                            column *
+                                sizeof(std::uint16_t)),
+                    &value,
+                    sizeof(value));
+            }
+        }
+
+        strix::ManifestTensor table_manifest;
+        table_manifest.name =
+            "per_layer_token_embd.weight";
+        table_manifest.dimensions = {
+            row_elements,
+            rows,
+        };
+        table_manifest.ggml_type = 30;
+        table_manifest.byte_size =
+            rows * row_bytes;
+        table_manifest.absolute_offset =
+            table_offset;
+        table_manifest.role =
+            strix::TensorRole::ngram_table;
+
+        strix::RuntimeTensorBinding table_runtime;
+        table_runtime.storage =
+            strix::RuntimeTensorStorage::
+                file_mapped;
+        table_runtime.address = 1;
+        table_runtime.bytes =
+            table_manifest.byte_size;
+        table_runtime.allocation_generation = 1;
+
+        const std::array<std::uint64_t, 3>
+            requested_rows{2, 0, 2};
+        strix::PleLookupRequest lookup;
+        lookup.row_ids =
+            requested_rows;
+        lookup.row_bytes =
+            row_bytes;
+        lookup.table_manifest =
+            &table_manifest;
+        lookup.table_runtime =
+            &table_runtime;
+
+        MemoryIoSource source(
+            std::move(file_bytes));
+        strix::PlannedPleLookupPolicy policy;
+        policy.max_rows_per_io = 2;
+        policy.max_inflight_ios = 2;
+        strix::PlannedPleLookupBackend backend(
+            source,
+            policy);
+
+        expect(
+            backend.implementation_identity() != 0,
+            "planned PLE backend has stable non-zero identity");
+
+        const auto handle =
+            backend.start(lookup);
+        std::vector<std::uint16_t> gathered(
+            static_cast<std::size_t>(
+                row_elements *
+                requested_rows.size()));
+        backend.finish(
+            handle,
+            std::as_writable_bytes(
+                std::span<std::uint16_t>(
+                    gathered)));
+
+        expect(
+            gathered[0] == 2000 &&
+                gathered[
+                    row_elements - 1] ==
+                    2159 &&
+                gathered[
+                    row_elements] == 0 &&
+                gathered[
+                    2 * row_elements - 1] ==
+                    159 &&
+                gathered[
+                    2 * row_elements] ==
+                    2000,
+            "planned PLE backend reads tensor-relative rows and restores request order");
+
+        auto resident = table_runtime;
+        resident.storage =
+            strix::RuntimeTensorStorage::
+                resident;
+        lookup.table_runtime =
+            &resident;
+        bool resident_rejected = false;
+        try {
+            static_cast<void>(
+                backend.start(lookup));
+        } catch (const std::invalid_argument&) {
+            resident_rejected = true;
+        }
+        expect(
+            resident_rejected,
+            "planned PLE backend requires a file-backed tensor");
+
+        lookup.table_runtime =
+            &table_runtime;
+        const auto active =
+            backend.start(lookup);
+        bool concurrent_rejected = false;
+        try {
+            static_cast<void>(
+                backend.start(lookup));
+        } catch (const std::logic_error&) {
+            concurrent_rejected = true;
+        }
+        expect(
+            concurrent_rejected,
+            "planned PLE backend rejects overlapping lookup handles");
+        backend.cancel(active);
     }
 
     if (failures == 0) {

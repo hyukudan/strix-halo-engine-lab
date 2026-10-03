@@ -5,6 +5,7 @@
 #include <cstring>
 #include <limits>
 #include <stdexcept>
+#include <utility>
 
 namespace strix {
 namespace {
@@ -261,6 +262,18 @@ namespace {
 constexpr std::uint64_t file_mapped_ple_backend_identity =
     0x504c45464d415001ULL;
 
+std::uint64_t checked_add_lookup(
+    std::uint64_t left,
+    std::uint64_t right) {
+    if (right >
+        std::numeric_limits<std::uint64_t>::max() -
+            left) {
+        throw std::overflow_error(
+            "PLE lookup addition overflow");
+    }
+    return left + right;
+}
+
 std::uint64_t checked_mul_lookup(
     std::uint64_t left,
     std::uint64_t right) {
@@ -436,6 +449,279 @@ void FileMappedPleLookupBackend::cancel(
         handle == pending_.handle) {
         pending_ = {};
     }
+}
+
+PlannedPleLookupBackend::PlannedPleLookupBackend(
+    SparseLookupIoSource& source,
+    PlannedPleLookupPolicy policy)
+    : source_(&source),
+      policy_(policy) {
+    if (policy_.max_inflight_ios == 0) {
+        throw std::invalid_argument(
+            "planned PLE lookup requires non-zero inflight depth");
+    }
+}
+
+std::uint64_t
+PlannedPleLookupBackend::implementation_identity() const noexcept {
+    constexpr std::uint64_t base =
+        0x504c45504c414e31ULL;
+    return base ^
+           (policy_.max_rows_per_io << 17U) ^
+           (policy_.max_inflight_ios << 33U);
+}
+
+PleLookupHandle
+PlannedPleLookupBackend::start(
+    const PleLookupRequest& request) {
+    if (pending_.active) {
+        throw std::logic_error(
+            "planned PLE backend already has an active lookup");
+    }
+    if (source_ == nullptr ||
+        request.row_ids.empty() ||
+        request.row_ids.size() >
+            PleHashContract::maximum_heads ||
+        request.row_bytes == 0 ||
+        request.table_manifest == nullptr ||
+        request.table_runtime == nullptr) {
+        throw std::invalid_argument(
+            "planned PLE lookup request is incomplete");
+    }
+
+    const auto& manifest =
+        *request.table_manifest;
+    const auto& runtime =
+        *request.table_runtime;
+
+    if (manifest.role !=
+            TensorRole::ngram_table ||
+        manifest.dimensions.size() < 2 ||
+        manifest.dimensions[0] == 0 ||
+        manifest.dimensions[1] == 0 ||
+        manifest.ggml_type != 30) {
+        throw std::invalid_argument(
+            "planned PLE lookup requires a BF16 n-gram table");
+    }
+
+    const auto expected_row_bytes =
+        checked_mul_lookup(
+            manifest.dimensions[0],
+            2ULL);
+    if (request.row_bytes !=
+        expected_row_bytes) {
+        throw std::invalid_argument(
+            "planned PLE row size does not match table geometry");
+    }
+    if (!runtime_tensor_file_backed(
+            runtime.storage) ||
+        runtime.bytes <
+            manifest.byte_size) {
+        throw std::invalid_argument(
+            "planned PLE lookup requires a file-backed tensor binding");
+    }
+
+    const auto minimum_bytes =
+        checked_mul_lookup(
+            manifest.dimensions[1],
+            request.row_bytes);
+    if (manifest.byte_size <
+        minimum_bytes) {
+        throw std::invalid_argument(
+            "planned PLE tensor is smaller than declared rows");
+    }
+
+    for (const auto row :
+         request.row_ids) {
+        if (row >=
+            manifest.dimensions[1]) {
+            throw std::out_of_range(
+                "planned PLE row id exceeds table row count");
+        }
+    }
+
+    SparseLookupRequest sparse_request;
+    sparse_request.table_rows =
+        manifest.dimensions[1];
+    sparse_request.row_bytes =
+        request.row_bytes;
+    sparse_request.cache_capacity_rows = 0;
+    sparse_request.max_rows_per_io =
+        policy_.max_rows_per_io;
+    sparse_request.max_inflight_ios =
+        policy_.max_inflight_ios;
+    sparse_request.row_ids =
+        request.row_ids;
+
+    auto plan =
+        build_sparse_lookup_plan(
+            sparse_request);
+    for (auto& operation :
+         plan.io_plan) {
+        if (operation.byte_offset >
+                manifest.byte_size ||
+            operation.byte_count >
+                manifest.byte_size -
+                    operation.byte_offset) {
+            throw std::out_of_range(
+                "planned PLE I/O exceeds tensor range");
+        }
+        operation.byte_offset =
+            checked_add_lookup(
+                manifest.absolute_offset,
+                operation.byte_offset);
+    }
+
+    if (next_handle_ == 0) {
+        throw std::overflow_error(
+            "planned PLE lookup handle space exhausted");
+    }
+
+    const auto handle =
+        next_handle_++;
+    auto* source =
+        source_;
+    auto future =
+        std::async(
+            std::launch::async,
+            [plan, source]() mutable {
+                return execute_sparse_lookup_io_plan(
+                    plan,
+                    *source);
+            });
+
+    pending_.handle =
+        handle;
+    pending_.row_bytes =
+        request.row_bytes;
+    pending_.row_count =
+        static_cast<std::uint32_t>(
+            request.row_ids.size());
+    std::copy(
+        request.row_ids.begin(),
+        request.row_ids.end(),
+        pending_.row_ids.begin());
+    pending_.io_plan =
+        std::move(plan.io_plan);
+    pending_.future =
+        std::move(future);
+    pending_.active = true;
+    return handle;
+}
+
+void PlannedPleLookupBackend::finish(
+    PleLookupHandle handle,
+    std::span<std::byte> destination) {
+    if (!pending_.active ||
+        handle == 0 ||
+        handle != pending_.handle) {
+        throw std::invalid_argument(
+            "planned PLE lookup handle is not active");
+    }
+
+    const auto required =
+        checked_mul_lookup(
+            pending_.row_count,
+            pending_.row_bytes);
+    if (destination.size() <
+        required) {
+        throw std::invalid_argument(
+            "planned PLE lookup destination is undersized");
+    }
+
+    auto current =
+        std::move(pending_);
+    pending_ = {};
+
+    const auto execution =
+        current.future.get();
+    if (execution.operation_payloads.size() !=
+        current.io_plan.size()) {
+        throw std::logic_error(
+            "planned PLE execution payload count mismatch");
+    }
+
+    for (std::uint32_t output_row = 0;
+         output_row < current.row_count;
+         ++output_row) {
+        const auto row =
+            current.row_ids[output_row];
+        const std::byte* source_row = nullptr;
+
+        for (std::size_t operation_index = 0;
+             operation_index <
+                current.io_plan.size();
+             ++operation_index) {
+            const auto& operation =
+                current.io_plan[
+                    operation_index];
+            if (row <
+                    operation.first_row ||
+                row >=
+                    operation.first_row +
+                        operation.row_count) {
+                continue;
+            }
+
+            const auto within_rows =
+                row -
+                operation.first_row;
+            const auto within_bytes =
+                checked_mul_lookup(
+                    within_rows,
+                    current.row_bytes);
+            const auto& payload =
+                execution.operation_payloads[
+                    operation_index];
+            if (within_bytes >
+                    payload.size() ||
+                current.row_bytes >
+                    payload.size() -
+                        static_cast<std::size_t>(
+                            within_bytes)) {
+                throw std::logic_error(
+                    "planned PLE payload is missing requested row bytes");
+            }
+
+            source_row =
+                payload.data() +
+                static_cast<std::size_t>(
+                    within_bytes);
+            break;
+        }
+
+        if (source_row == nullptr) {
+            throw std::logic_error(
+                "planned PLE requested row has no owning I/O operation");
+        }
+
+        std::memcpy(
+            destination.data() +
+                static_cast<std::size_t>(
+                    checked_mul_lookup(
+                        output_row,
+                        current.row_bytes)),
+            source_row,
+            static_cast<std::size_t>(
+                current.row_bytes));
+    }
+}
+
+void PlannedPleLookupBackend::cancel(
+    PleLookupHandle handle) noexcept {
+    if (!pending_.active ||
+        handle == 0 ||
+        handle != pending_.handle) {
+        return;
+    }
+
+    auto cancelled =
+        std::move(pending_);
+    pending_ = {};
+    // std::future from std::launch::async joins on destruction. The source
+    // contract has no cancellation primitive yet, so cancel is fail-closed:
+    // results are discarded and no exception escapes this noexcept boundary.
+    static_cast<void>(cancelled);
 }
 
 }  // namespace strix

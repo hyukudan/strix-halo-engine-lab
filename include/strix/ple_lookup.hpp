@@ -3,10 +3,12 @@
 #include "strix/model_contract.hpp"
 #include "strix/model_manifest.hpp"
 #include "strix/model_runtime_binding.hpp"
+#include "strix/sparse_lookup_executor.hpp"
 
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <future>
 #include <span>
 #include <vector>
 
@@ -95,6 +97,47 @@ private:
         bool active = false;
     };
 
+    PleLookupHandle next_handle_ = 1;
+    Pending pending_;
+};
+
+struct PlannedPleLookupPolicy {
+    std::uint64_t max_rows_per_io = 4;
+    std::uint64_t max_inflight_ios = 4;
+};
+
+class PlannedPleLookupBackend final
+    : public PleLookupBackend {
+public:
+    explicit PlannedPleLookupBackend(
+        SparseLookupIoSource& source,
+        PlannedPleLookupPolicy policy = {});
+
+    [[nodiscard]] std::uint64_t implementation_identity() const noexcept override;
+
+    [[nodiscard]] PleLookupHandle start(
+        const PleLookupRequest& request) override;
+
+    void finish(
+        PleLookupHandle handle,
+        std::span<std::byte> destination) override;
+
+    void cancel(
+        PleLookupHandle handle) noexcept override;
+
+private:
+    struct Pending {
+        PleLookupHandle handle = 0;
+        std::uint64_t row_bytes = 0;
+        std::array<std::uint64_t, PleHashContract::maximum_heads> row_ids{};
+        std::uint32_t row_count = 0;
+        std::vector<SparseLookupIoOperation> io_plan;
+        std::future<SparseLookupIoExecution> future;
+        bool active = false;
+    };
+
+    SparseLookupIoSource* source_ = nullptr;
+    PlannedPleLookupPolicy policy_{};
     PleLookupHandle next_handle_ = 1;
     Pending pending_;
 };
