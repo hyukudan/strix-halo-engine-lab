@@ -340,6 +340,7 @@ Implemented through an experimental C1/BF16 HIP path:
 - the serial runner emits per-token/total decode latency plus PLE backend identity, enabling reproducible mapped-vs-planned qualification;
 - a portable policy-sweep harness evaluates a grid of chunk/inflight settings against one mapped baseline, rejects incomparable evidence and ranks valid planned policies by complete-token latency;
 - eager one-token serial session execution with fail-closed poisoning on partial dispatch failure;
+- portable complete-request greedy orchestration with prefix prefill, deterministic lower-token-index argmax ties, EOS termination, new-token budget and context-capacity enforcement;
 - raw-token HIP runner that assembles GGUF manifest, selective residency, runtime memory, tensor access, dispatch and FP32 LM-head logits;
 - versioned independent multi-step replay fixture with checkpoint/vocabulary preflight;
 - replay qualification rejects non-finite or mis-sized logits, requires exact argmax when declared, enforces the requested logit-error policy and now binds evidence to the exact checkpoint, compiled execution and runtime compatibility identities being qualified;
@@ -348,7 +349,7 @@ Implemented through an experimental C1/BF16 HIP path:
 Still pending:
 
 - native Strix Halo build/run of the complete HIP path;
-- canonical multi-token checkpoint replay with matching argmax/logit probes;
+- bind the native HIP runner to the complete-request greedy orchestration and qualify canonical multi-token generation;
 - asynchronous production PLE lookup/staging rather than the current file-backed seam;
 - promotion from experimental bindings only after native correctness and resource qualification.
 
