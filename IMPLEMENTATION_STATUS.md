@@ -322,7 +322,7 @@ Still pending:
 - NVMe and page-cache qualification on the Strix Halo hosts;
 - CPU gather into registered/staging buffers under simultaneous GPU load;
 - direct GPU-visible sparse access experiment;
-- native Strix Halo qualification of planned-PLE overlap/staging behavior and comparison against mapped lookup;
+- execute the mapped-vs-planned qualification gate on native Strix Halo and select chunk/inflight policy from measured complete-token latency;
 
 
 ## Slice A1.5 — correct serial executor
@@ -337,6 +337,7 @@ Implemented through an experimental C1/BF16 HIP path:
 - concrete KV/recurrent/convolution/history state layout and fresh-state initialization;
 - file-backed PLE lookup seam plus a planned backend that asynchronously executes bounded/coalesced tensor-relative I/O and restores requested row order into staging;
 - mapped model files expose bounded direct reads on their owned descriptor, and the native serial runner can select the planned PLE backend with configurable chunk/inflight limits without changing tensor bindings;
+- the serial runner emits per-token/total decode latency plus PLE backend identity, enabling reproducible mapped-vs-planned qualification;
 - eager one-token serial session execution with fail-closed poisoning on partial dispatch failure;
 - raw-token HIP runner that assembles GGUF manifest, selective residency, runtime memory, tensor access, dispatch and FP32 LM-head logits;
 - versioned independent multi-step replay fixture with checkpoint/vocabulary preflight;

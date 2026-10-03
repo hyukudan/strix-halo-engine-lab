@@ -510,6 +510,10 @@ if(BUILD_TESTING)
             NAME strix-python-oracle-tests
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/oracles/test_qwen4_exp_oracle.py
         )
+        add_test(
+            NAME strix-ple-qualification-tests
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/lab/sparse_lookup/test_qualify_serial_ple.py
+        )
     endif()
 endif()
 

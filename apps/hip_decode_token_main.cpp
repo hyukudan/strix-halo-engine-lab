@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -674,6 +675,10 @@ int main(
     std::vector<float> logits(
         static_cast<std::size_t>(
             model.vocab_size));
+    std::vector<double> token_elapsed_ms;
+    token_elapsed_ms.reserve(
+        options.tokens.size());
+    double decode_elapsed_ms_total = 0.0;
 
     strix::SerialDecodeReplayObservation
         replay_observation;
@@ -736,6 +741,9 @@ int main(
               << "  \"ple_max_inflight_ios\": "
               << options.ple_max_inflight_ios
               << ',' << '\n'
+              << "  \"ple_lookup_identity\": "
+              << ple_lookup->implementation_identity()
+              << ',' << '\n'
               << "  \"tokens\": [" << '\n';
 
     for (std::size_t input_index = 0;
@@ -744,6 +752,9 @@ int main(
          ++input_index) {
         const auto token =
             options.tokens[input_index];
+
+        const auto token_start =
+            std::chrono::steady_clock::now();
 
         static_cast<void>(
             strix::execute_serial_token(
@@ -756,6 +767,16 @@ int main(
         check_hip(
             hipDeviceSynchronize(),
             "hipDeviceSynchronize(serial token)");
+
+        const auto token_stop =
+            std::chrono::steady_clock::now();
+        const auto elapsed_ms =
+            std::chrono::duration<double, std::milli>(
+                token_stop - token_start).count();
+        token_elapsed_ms.push_back(
+            elapsed_ms);
+        decode_elapsed_ms_total +=
+            elapsed_ms;
 
         const auto logits_address =
             strix::resolve_execution_buffer(
@@ -832,6 +853,8 @@ int main(
             << ranked.front().token
             << ",\"argmax_logit\":"
             << ranked.front().logit
+            << ",\"elapsed_ms\":"
+            << elapsed_ms
             << ",\"top5\":[";
 
         for (std::size_t rank = 0;
@@ -885,6 +908,16 @@ int main(
 
     std::cout
         << "  ]," << '\n'
+        << "  \"decode_elapsed_ms_total\": "
+        << decode_elapsed_ms_total
+        << ',' << '\n'
+        << "  \"decode_elapsed_ms_per_token\": "
+        << (token_elapsed_ms.empty()
+                ? 0.0
+                : decode_elapsed_ms_total /
+                      static_cast<double>(
+                          token_elapsed_ms.size()))
+        << ',' << '\n'
         << "  \"committed_tokens\": "
         << session.committed_tokens
         << ',' << '\n'
