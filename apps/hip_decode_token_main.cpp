@@ -118,6 +118,25 @@ strix::PersistentState all_persistent_state() {
         PersistentState::position_history;
 }
 
+class MappedModelIoSource final
+    : public strix::SparseLookupIoSource {
+public:
+    explicit MappedModelIoSource(
+        const strix::MappedModelFile& mapped)
+        : mapped_(&mapped) {}
+
+    void read(
+        std::uint64_t byte_offset,
+        std::span<std::byte> destination) override {
+        mapped_->read_at(
+            byte_offset,
+            destination);
+    }
+
+private:
+    const strix::MappedModelFile* mapped_ = nullptr;
+};
+
 struct Options {
     std::string model_path;
     std::vector<std::uint32_t> tokens;
@@ -126,6 +145,9 @@ struct Options {
         strix::HipModelResidencyMode::
             registered_file_mapping;
     std::uint64_t coalesce_gap_bytes = 4096;
+    bool planned_ple_io = false;
+    std::uint64_t ple_max_rows_per_io = 4;
+    std::uint64_t ple_max_inflight_ios = 4;
     std::string reference_path;
     double max_logit_abs_error = 1e-3;
 };
@@ -137,7 +159,8 @@ Options parse_options(
         throw std::invalid_argument(
             "usage: strix-hip-decode-token MODEL.gguf [TOKEN_ID ...] "
             "[--reference FILE] [--max-logit-error X] "
-            "[--context N] [--residency register|copy] [--coalesce-gap BYTES]");
+            "[--context N] [--residency register|copy] [--coalesce-gap BYTES] "
+            "[--planned-ple-io] [--ple-max-rows-per-io N] [--ple-max-inflight-ios N]");
     }
 
     Options options;
@@ -222,6 +245,35 @@ Options parse_options(
             continue;
         }
 
+        if (argument == "--planned-ple-io") {
+            options.planned_ple_io = true;
+            continue;
+        }
+
+        if (argument == "--ple-max-rows-per-io") {
+            if (index + 1 >= argc) {
+                throw std::invalid_argument(
+                    "--ple-max-rows-per-io requires a value");
+            }
+            options.ple_max_rows_per_io =
+                parse_u64(
+                    argv[++index],
+                    "ple-max-rows-per-io");
+            continue;
+        }
+
+        if (argument == "--ple-max-inflight-ios") {
+            if (index + 1 >= argc) {
+                throw std::invalid_argument(
+                    "--ple-max-inflight-ios requires a value");
+            }
+            options.ple_max_inflight_ios =
+                parse_u64(
+                    argv[++index],
+                    "ple-max-inflight-ios");
+            continue;
+        }
+
         if (argument.starts_with("--")) {
             throw std::invalid_argument(
                 "unknown option: " +
@@ -251,6 +303,10 @@ Options parse_options(
     if (options.context_tokens == 0) {
         throw std::invalid_argument(
             "context must be non-zero");
+    }
+    if (options.ple_max_inflight_ios == 0) {
+        throw std::invalid_argument(
+            "ple-max-inflight-ios must be non-zero");
     }
     return options;
 }
@@ -551,7 +607,26 @@ int main(
         memory.state());
 
     strix::FileMappedPleLookupBackend
-        ple_lookup;
+        mapped_ple_lookup;
+    MappedModelIoSource
+        mapped_model_io(
+            mapped);
+    strix::PlannedPleLookupPolicy
+        planned_ple_policy;
+    planned_ple_policy.max_rows_per_io =
+        options.ple_max_rows_per_io;
+    planned_ple_policy.max_inflight_ios =
+        options.ple_max_inflight_ios;
+    strix::PlannedPleLookupBackend
+        planned_ple_lookup(
+            mapped_model_io,
+            planned_ple_policy);
+    strix::PleLookupBackend* ple_lookup =
+        options.planned_ple_io
+            ? static_cast<strix::PleLookupBackend*>(
+                  &planned_ple_lookup)
+            : static_cast<strix::PleLookupBackend*>(
+                  &mapped_ple_lookup);
 
     strix::ExecutionRuntimeResources
         resources;
@@ -568,7 +643,7 @@ int main(
     resources.session_state_memory =
         &memory.state();
     resources.ple_lookup =
-        &ple_lookup;
+        ple_lookup;
 
     const auto identities =
         strix::build_runtime_execution_identities(
@@ -649,6 +724,17 @@ int main(
               << ',' << '\n'
               << "  \"copied_bytes\": "
               << model_residency.copied_bytes()
+              << ',' << '\n'
+              << "  \"ple_lookup\": \""
+              << (options.planned_ple_io
+                      ? "planned-pread"
+                      : "mapped")
+              << "\"," << '\n'
+              << "  \"ple_max_rows_per_io\": "
+              << options.ple_max_rows_per_io
+              << ',' << '\n'
+              << "  \"ple_max_inflight_ios\": "
+              << options.ple_max_inflight_ios
               << ',' << '\n'
               << "  \"tokens\": [" << '\n';
 

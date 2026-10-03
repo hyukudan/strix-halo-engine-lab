@@ -1,5 +1,7 @@
 #include "strix/mapped_model_file.hpp"
 
+#include <array>
+#include <cstddef>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -93,6 +95,36 @@ int main() {
                mapped.content_identity().valid() &&
                mapped.allocation_generation() == 1,
            "mapped model owns stable read-only file mapping and content identity");
+
+    std::array<std::byte, 16> direct_read{};
+    mapped.read_at(
+        123,
+        direct_read);
+    bool direct_read_matches = true;
+    for (std::size_t index = 0;
+         index < direct_read.size();
+         ++index) {
+        direct_read_matches =
+            direct_read_matches &&
+            std::to_integer<std::uint8_t>(
+                direct_read[index]) ==
+                bytes[123 + index];
+    }
+    expect(
+        direct_read_matches,
+        "mapped model direct read uses the same opened file bytes");
+
+    bool direct_read_range_rejected = false;
+    try {
+        mapped.read_at(
+            mapped.bytes() - 4,
+            direct_read);
+    } catch (const std::out_of_range&) {
+        direct_read_range_rejected = true;
+    }
+    expect(
+        direct_read_range_rejected,
+        "mapped model direct read rejects ranges beyond EOF");
 
     const auto binding =
         mapped.build_runtime_binding(

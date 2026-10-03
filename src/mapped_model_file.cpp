@@ -2,6 +2,7 @@
 
 #include "strix/model_content_hash.hpp"
 
+#include <cerrno>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -192,6 +193,74 @@ MappedModelFile MappedModelFile::open_read_only(
     }
 
     return mapped;
+#endif
+}
+
+void MappedModelFile::read_at(
+    std::uint64_t byte_offset,
+    std::span<std::byte> destination) const {
+#if !defined(__linux__)
+    static_cast<void>(byte_offset);
+    static_cast<void>(destination);
+    throw std::runtime_error(
+        "mapped model direct reads require native Linux");
+#else
+    if (!valid() ||
+        fd_ < 0) {
+        throw std::logic_error(
+            "mapped model file is not initialized");
+    }
+    if (byte_offset > bytes_ ||
+        destination.size() >
+            bytes_ - byte_offset) {
+        throw std::out_of_range(
+            "mapped model read exceeds file range");
+    }
+    if (byte_offset >
+        static_cast<std::uint64_t>(
+            std::numeric_limits<off_t>::max())) {
+        throw std::overflow_error(
+            "mapped model read offset does not fit off_t");
+    }
+
+    std::size_t completed = 0;
+    while (completed < destination.size()) {
+        const auto remaining =
+            destination.size() -
+            completed;
+        const auto offset =
+            byte_offset +
+            static_cast<std::uint64_t>(
+                completed);
+        if (offset >
+            static_cast<std::uint64_t>(
+                std::numeric_limits<off_t>::max())) {
+            throw std::overflow_error(
+                "mapped model read range does not fit off_t");
+        }
+
+        const auto result =
+            ::pread(
+                fd_,
+                destination.data() + completed,
+                remaining,
+                static_cast<off_t>(
+                    offset));
+        if (result < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            throw std::runtime_error(
+                "mapped model pread failed");
+        }
+        if (result == 0) {
+            throw std::runtime_error(
+                "mapped model pread reached unexpected EOF");
+        }
+        completed +=
+            static_cast<std::size_t>(
+                result);
+    }
 #endif
 }
 

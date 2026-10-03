@@ -4,8 +4,10 @@
 #include "strix/model_runtime_binding.hpp"
 #include "strix/runtime_allocator.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <span>
 #include <string>
 
 namespace strix {
@@ -59,6 +61,10 @@ public:
     [[nodiscard]] ModelRuntimeBinding
     build_runtime_binding(
         const ModelManifest& manifest) const;
+
+    void read_at(
+        std::uint64_t byte_offset,
+        std::span<std::byte> destination) const;
 
 private:
     void release() noexcept;
