@@ -514,6 +514,10 @@ if(BUILD_TESTING)
             NAME strix-ple-qualification-tests
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/lab/sparse_lookup/test_qualify_serial_ple.py
         )
+        add_test(
+            NAME strix-ple-policy-sweep-tests
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/lab/sparse_lookup/test_sweep_serial_ple.py
+        )
     endif()
 endif()
 
