@@ -15,6 +15,7 @@
 #include "strix/runtime_allocator.hpp"
 #include "strix/serial_decode_reference.hpp"
 #include "strix/serial_decode_replay.hpp"
+#include "strix/serial_request.hpp"
 #include "strix/serial_session.hpp"
 #include "strix/session_state_layout.hpp"
 
@@ -151,6 +152,8 @@ struct Options {
     std::uint64_t ple_max_inflight_ios = 4;
     std::string reference_path;
     double max_logit_abs_error = 1e-3;
+    std::uint64_t generate_tokens = 0;
+    std::optional<std::uint32_t> eos_token;
 };
 
 Options parse_options(
@@ -161,7 +164,8 @@ Options parse_options(
             "usage: strix-hip-decode-token MODEL.gguf [TOKEN_ID ...] "
             "[--reference FILE] [--max-logit-error X] "
             "[--context N] [--residency register|copy] [--coalesce-gap BYTES] "
-            "[--planned-ple-io] [--ple-max-rows-per-io N] [--ple-max-inflight-ios N]");
+            "[--planned-ple-io] [--ple-max-rows-per-io N] [--ple-max-inflight-ios N] "
+            "[--generate N] [--eos-token TOKEN_ID]");
     }
 
     Options options;
@@ -275,6 +279,38 @@ Options parse_options(
             continue;
         }
 
+        if (argument == "--generate") {
+            if (index + 1 >= argc) {
+                throw std::invalid_argument(
+                    "--generate requires a token count");
+            }
+            options.generate_tokens =
+                parse_u64(
+                    argv[++index],
+                    "generate");
+            continue;
+        }
+
+        if (argument == "--eos-token") {
+            if (index + 1 >= argc) {
+                throw std::invalid_argument(
+                    "--eos-token requires a token id");
+            }
+            const auto value =
+                parse_u64(
+                    argv[++index],
+                    "eos-token");
+            if (value >
+                std::numeric_limits<std::uint32_t>::max()) {
+                throw std::out_of_range(
+                    "eos-token exceeds uint32");
+            }
+            options.eos_token =
+                static_cast<std::uint32_t>(
+                    value);
+            continue;
+        }
+
         if (argument.starts_with("--")) {
             throw std::invalid_argument(
                 "unknown option: " +
@@ -300,6 +336,16 @@ Options parse_options(
         options.reference_path.empty()) {
         throw std::invalid_argument(
             "at least one token id or --reference is required");
+    }
+    if (options.generate_tokens != 0 &&
+        !options.reference_path.empty()) {
+        throw std::invalid_argument(
+            "--generate and --reference are separate execution modes");
+    }
+    if (options.generate_tokens != 0 &&
+        options.tokens.empty()) {
+        throw std::invalid_argument(
+            "--generate requires at least one prefix token id");
     }
     if (options.context_tokens == 0) {
         throw std::invalid_argument(
@@ -367,6 +413,120 @@ std::vector<RankedLogit> top_logits(
     return result;
 }
 
+class HipSerialGreedyStepBackend final
+    : public strix::SerialGreedyStepBackend {
+public:
+    HipSerialGreedyStepBackend(
+        const strix::CompiledSerialExecution& compiled,
+        strix::SerialSessionContext& session,
+        const strix::ExecutionRuntimeResources& resources,
+        strix::EagerExecutionDispatcher& dispatcher,
+        const strix::ExecutionMemoryBinding& scratch,
+        const strix::ExecutionStepIo& lm_io,
+        std::uint64_t vocab_size)
+        : compiled_(&compiled),
+          session_(&session),
+          resources_(&resources),
+          dispatcher_(&dispatcher),
+          scratch_(&scratch),
+          lm_io_(&lm_io),
+          vocab_size_(vocab_size) {}
+
+    std::vector<float> execute(
+        std::uint32_t input_token,
+        std::uint64_t position) override {
+        if (position != session_->next_position) {
+            throw std::invalid_argument(
+                "greedy request position does not match serial session");
+        }
+
+        const auto start =
+            std::chrono::steady_clock::now();
+
+        static_cast<void>(
+            strix::execute_serial_token(
+                *compiled_,
+                *session_,
+                *resources_,
+                input_token,
+                *dispatcher_));
+
+        check_hip(
+            hipDeviceSynchronize(),
+            "hipDeviceSynchronize(greedy serial token)");
+
+        const auto stop =
+            std::chrono::steady_clock::now();
+        elapsed_ms_.push_back(
+            std::chrono::duration<double, std::milli>(
+                stop - start).count());
+
+        const auto logits_address =
+            strix::resolve_execution_buffer(
+                compiled_->execution_identity,
+                compiled_->arena,
+                *scratch_,
+                lm_io_->writes[0]);
+
+        if (vocab_size_ >
+            static_cast<std::uint64_t>(
+                std::numeric_limits<std::size_t>::max())) {
+            throw std::overflow_error(
+                "greedy vocabulary size does not fit size_t");
+        }
+        std::vector<float> logits(
+            static_cast<std::size_t>(
+                vocab_size_));
+        if (logits_address.bytes <
+            logits.size() * sizeof(float)) {
+            throw std::logic_error(
+                "compiled logits allocation is undersized");
+        }
+
+        check_hip(
+            hipMemcpy(
+                logits.data(),
+                reinterpret_cast<const void*>(
+                    logits_address.address),
+                logits.size() * sizeof(float),
+                hipMemcpyDeviceToHost),
+            "hipMemcpy(greedy logits D2H)");
+
+        strix::validate_serial_decode_engine_logits(
+            logits,
+            vocab_size_);
+        return logits;
+    }
+
+    [[nodiscard]] const std::vector<double>&
+    elapsed_ms() const noexcept {
+        return elapsed_ms_;
+    }
+
+private:
+    const strix::CompiledSerialExecution* compiled_ = nullptr;
+    strix::SerialSessionContext* session_ = nullptr;
+    const strix::ExecutionRuntimeResources* resources_ = nullptr;
+    strix::EagerExecutionDispatcher* dispatcher_ = nullptr;
+    const strix::ExecutionMemoryBinding* scratch_ = nullptr;
+    const strix::ExecutionStepIo* lm_io_ = nullptr;
+    std::uint64_t vocab_size_ = 0;
+    std::vector<double> elapsed_ms_;
+};
+
+std::string_view stop_reason_name(
+    strix::SerialRequestStopReason reason) noexcept {
+    switch (reason) {
+    case strix::SerialRequestStopReason::eos:
+        return "eos";
+    case strix::SerialRequestStopReason::max_new_tokens:
+        return "max_new_tokens";
+    case strix::SerialRequestStopReason::context_capacity:
+        return "context_capacity";
+    }
+    return "unknown";
+}
+
 }  // namespace
 
 int main(
@@ -380,6 +540,17 @@ int main(
     const auto model =
         strix::ModelContract::
             qwen38_flash_next();
+
+    const auto generation_eos =
+        options.eos_token.value_or(
+            static_cast<std::uint32_t>(
+                model.ple_eos_token_id));
+    if (static_cast<std::uint64_t>(
+            generation_eos) >=
+        model.vocab_size) {
+        throw std::invalid_argument(
+            "generation EOS token is outside target model vocabulary");
+    }
 
     std::optional<strix::SerialDecodeReference>
         reference;
@@ -670,6 +841,109 @@ int main(
         lm_io.writes.size() != 1) {
         throw std::logic_error(
             "compiled execution does not end in one logits write");
+    }
+
+    if (options.generate_tokens != 0) {
+        HipSerialGreedyStepBackend backend(
+            compiled,
+            session,
+            resources,
+            dispatcher,
+            memory.scratch(),
+            lm_io,
+            model.vocab_size);
+
+        strix::SerialGreedyRequest request;
+        request.prefix_tokens =
+            options.tokens;
+        request.vocab_size =
+            model.vocab_size;
+        request.context_capacity =
+            options.context_tokens;
+        request.max_new_tokens =
+            options.generate_tokens;
+        request.eos_token_id =
+            generation_eos;
+
+        const auto result =
+            strix::execute_serial_greedy_request(
+                request,
+                backend);
+
+        double elapsed_total = 0.0;
+        for (const auto value :
+             backend.elapsed_ms()) {
+            elapsed_total += value;
+        }
+
+        std::cout
+            << "{\n"
+            << "  \"model_content_identity\": \""
+            << strix::model_content_identity_hex(
+                   model_residency.binding().
+                       model_content_identity)
+            << "\",\n"
+            << "  \"execution_identity\": "
+            << compiled.execution_identity
+            << ",\n"
+            << "  \"runtime_compatibility_identity\": "
+            << identities.compatibility_identity
+            << ",\n"
+            << "  \"ple_lookup\": \""
+            << (options.planned_ple_io
+                    ? "planned-pread"
+                    : "mapped")
+            << "\",\n"
+            << "  \"prefix_tokens\": [";
+
+        for (std::size_t index = 0;
+             index < options.tokens.size();
+             ++index) {
+            if (index != 0) {
+                std::cout << ',';
+            }
+            std::cout << options.tokens[index];
+        }
+
+        std::cout
+            << "],\n"
+            << "  \"generated_tokens\": [";
+
+        for (std::size_t index = 0;
+             index <
+                result.generated_tokens.size();
+             ++index) {
+            if (index != 0) {
+                std::cout << ',';
+            }
+            std::cout
+                << result.generated_tokens[index];
+        }
+
+        std::cout
+            << "],\n"
+            << "  \"stop_reason\": \""
+            << stop_reason_name(
+                   result.stop_reason)
+            << "\",\n"
+            << "  \"steps_executed\": "
+            << result.steps_executed
+            << ",\n"
+            << "  \"final_position\": "
+            << result.final_position
+            << ",\n"
+            << "  \"decode_elapsed_ms_total\": "
+            << elapsed_total
+            << ",\n"
+            << "  \"decode_elapsed_ms_per_step\": "
+            << (backend.elapsed_ms().empty()
+                    ? 0.0
+                    : elapsed_total /
+                          static_cast<double>(
+                              backend.elapsed_ms().size()))
+            << "\n"
+            << "}\n";
+        return 0;
     }
 
     std::vector<float> logits(
