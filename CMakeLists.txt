@@ -564,6 +564,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
 
     add_library(strix_hip_runtime STATIC
         src/hip_runtime_allocator.cpp
+        src/hip_session_snapshot_transfer.cpp
         src/hip_model_residency.cpp
         src/hip_launcher_catalog.cpp
         src/hip_runtime_launchers.hip
@@ -899,6 +900,22 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         add_test(
             NAME strix-hip-model-residency-tests
             COMMAND strix-hip-model-residency-tests
+        )
+
+        add_executable(
+            strix-hip-session-snapshot-transfer-tests
+            tests/hip_session_snapshot_transfer_tests.cpp
+        )
+        target_link_libraries(
+            strix-hip-session-snapshot-transfer-tests
+            PRIVATE strix_hip_runtime
+        )
+        strix_target_warnings(
+            strix-hip-session-snapshot-transfer-tests
+        )
+        add_test(
+            NAME strix-hip-session-snapshot-transfer-tests
+            COMMAND strix-hip-session-snapshot-transfer-tests
         )
 
         add_executable(

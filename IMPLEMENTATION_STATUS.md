@@ -345,6 +345,7 @@ Implemented through an experimental C1/BF16 HIP path:
 - explicit serial prefix lifecycle metadata binds an exact prefix token sequence to one validated snapshot/runtime identity and only produces a restore plan when prefix, execution, runtime and state-layout identities all still match;
 - high-level prefix capture/restore operations now enforce that lifecycle before physical state transfer, preventing foreign or stale prefix metadata from reaching snapshot copy/restore;
 - a move-only serial prefix cache entry owns exact prefix metadata plus compact snapshot memory, captures directly from a ready prefilled session and restores only into identity-compatible sessions;
+- a HIP snapshot-transfer backend provides the physical device-to-device and host-to-host copy path needed by prefix cache capture/restore on native GPU sessions;
 - raw-token HIP runner that assembles GGUF manifest, selective residency, runtime memory, tensor access, dispatch and FP32 LM-head logits;
 - versioned independent multi-step replay fixture with checkpoint/vocabulary preflight;
 - replay qualification rejects non-finite or mis-sized logits, requires exact argmax when declared, enforces the requested logit-error policy and now binds evidence to the exact checkpoint, compiled execution and runtime compatibility identities being qualified;
