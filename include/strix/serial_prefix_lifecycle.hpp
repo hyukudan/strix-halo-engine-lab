@@ -3,6 +3,7 @@
 #include "strix/model_contract.hpp"
 #include "strix/session_restore.hpp"
 #include "strix/session_snapshot.hpp"
+#include "strix/session_snapshot_transfer.hpp"
 #include "strix/session_state_layout.hpp"
 
 #include <cstdint>
@@ -34,6 +35,24 @@ build_serial_prefix_restore_plan(
     const SerialSessionStateLayout& destination_layout,
     std::uint64_t compiled_execution_identity,
     std::uint64_t runtime_compatibility_identity,
+    std::span<const std::uint32_t> requested_prefix,
+    const SerialPrefixSnapshot& prefix);
+
+void capture_serial_prefix_snapshot(
+    const SerialPrefixSnapshot& prefix,
+    const SerialSessionContext& session,
+    const SerialSessionStateLayout& state_layout,
+    const SessionStateMemoryBinding& state_memory,
+    const SessionSnapshotMemoryBinding& snapshot_memory,
+    SessionSnapshotTransferBackend& backend);
+
+void restore_serial_prefix_snapshot(
+    SerialSessionContext& session,
+    const ModelContract& model,
+    const SerialSessionStateLayout& state_layout,
+    const SessionStateMemoryBinding& state_memory,
+    const SessionSnapshotMemoryBinding& snapshot_memory,
+    SessionSnapshotTransferBackend& backend,
     std::span<const std::uint32_t> requested_prefix,
     const SerialPrefixSnapshot& prefix);
 

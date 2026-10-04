@@ -165,4 +165,75 @@ build_serial_prefix_restore_plan(
         prefix.snapshot);
 }
 
+
+void capture_serial_prefix_snapshot(
+    const SerialPrefixSnapshot& prefix,
+    const SerialSessionContext& session,
+    const SerialSessionStateLayout& state_layout,
+    const SessionStateMemoryBinding& state_memory,
+    const SessionSnapshotMemoryBinding& snapshot_memory,
+    SessionSnapshotTransferBackend& backend) {
+    if (!serial_prefix_snapshot_matches(
+            prefix,
+            prefix.prefix_tokens,
+            session.execution_identity,
+            session.runtime_compatibility_identity,
+            session.state_layout_identity)) {
+        throw std::invalid_argument(
+            "serial prefix capture session does not match prefix snapshot");
+    }
+    if (session.health !=
+            SerialSessionHealth::ready ||
+        session.next_position !=
+            prefix.snapshot.next_position ||
+        session.committed_tokens !=
+            prefix.snapshot.committed_tokens ||
+        session.state.valid !=
+            prefix.snapshot.state.valid ||
+        session.state.generations !=
+            prefix.snapshot.state.generations) {
+        throw std::invalid_argument(
+            "serial prefix capture session metadata does not match snapshot");
+    }
+    if (state_layout.layout_identity !=
+        prefix.snapshot.state_layout_identity) {
+        throw std::invalid_argument(
+            "serial prefix capture layout does not match snapshot");
+    }
+
+    capture_serial_session_snapshot(
+        prefix.snapshot,
+        state_layout,
+        state_memory,
+        snapshot_memory,
+        backend);
+}
+
+void restore_serial_prefix_snapshot(
+    SerialSessionContext& session,
+    const ModelContract& model,
+    const SerialSessionStateLayout& state_layout,
+    const SessionStateMemoryBinding& state_memory,
+    const SessionSnapshotMemoryBinding& snapshot_memory,
+    SessionSnapshotTransferBackend& backend,
+    std::span<const std::uint32_t> requested_prefix,
+    const SerialPrefixSnapshot& prefix) {
+    const auto restore =
+        build_serial_prefix_restore_plan(
+            model,
+            state_layout,
+            session.execution_identity,
+            session.runtime_compatibility_identity,
+            requested_prefix,
+            prefix);
+
+    restore_serial_session_snapshot(
+        session,
+        restore,
+        state_layout,
+        state_memory,
+        snapshot_memory,
+        backend);
+}
+
 }  // namespace strix
