@@ -74,6 +74,7 @@ add_library(strix_core STATIC
     src/runtime_launchers.cpp
     src/serial_decode_reference.cpp
     src/serial_decode_replay.cpp
+    src/serial_prefix_cache.cpp
     src/serial_prefix_lifecycle.cpp
     src/serial_request.cpp
     src/serial_session.cpp
@@ -335,6 +336,11 @@ if(BUILD_TESTING)
     target_link_libraries(strix-serial-prefix-lifecycle-tests PRIVATE strix_core)
     strix_target_warnings(strix-serial-prefix-lifecycle-tests)
     add_test(NAME strix-serial-prefix-lifecycle-tests COMMAND strix-serial-prefix-lifecycle-tests)
+
+    add_executable(strix-serial-prefix-cache-tests tests/serial_prefix_cache_tests.cpp)
+    target_link_libraries(strix-serial-prefix-cache-tests PRIVATE strix_core)
+    strix_target_warnings(strix-serial-prefix-cache-tests)
+    add_test(NAME strix-serial-prefix-cache-tests COMMAND strix-serial-prefix-cache-tests)
 
     add_executable(strix-serial-decode-replay-tests tests/serial_decode_replay_tests.cpp)
     target_link_libraries(strix-serial-decode-replay-tests PRIVATE strix_core)
