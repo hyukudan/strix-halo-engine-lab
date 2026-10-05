@@ -79,6 +79,7 @@ add_library(strix_core STATIC
     src/model_tensor_index.cpp
     src/moe_plan.cpp
     src/moe_layer_schedule.cpp
+    src/moe_layer_runtime.cpp
     src/partition_search.cpp
     src/oracles.cpp
     src/packed_projection.cpp
@@ -269,6 +270,11 @@ if(BUILD_TESTING)
     target_link_libraries(strix-moe-layer-schedule-tests PRIVATE strix_core)
     strix_target_warnings(strix-moe-layer-schedule-tests)
     add_test(NAME strix-moe-layer-schedule-tests COMMAND strix-moe-layer-schedule-tests)
+
+    add_executable(strix-moe-layer-runtime-tests tests/moe_layer_runtime_tests.cpp)
+    target_link_libraries(strix-moe-layer-runtime-tests PRIVATE strix_core)
+    strix_target_warnings(strix-moe-layer-runtime-tests)
+    add_test(NAME strix-moe-layer-runtime-tests COMMAND strix-moe-layer-runtime-tests)
 
     add_executable(strix-partition-search-tests tests/partition_search_tests.cpp)
     target_link_libraries(strix-partition-search-tests PRIVATE strix_core)

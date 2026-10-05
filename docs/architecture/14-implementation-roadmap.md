@@ -260,7 +260,7 @@ Exit gate:
 
 The engine selects expert execution from measured route distributions and complete operator cost rather than row count alone.
 
-The MoE execution policy now has a complete-layer cost surface: routed direct/grouped estimates are combined with qualified shared-expert and combine costs, including the DAG's routed/shared parallel branch. This prevents selecting grouped routed execution when it does not improve end-to-end MoE layer latency. A qualified layer-schedule builder turns that decision into explicit routed/shared/combine dependencies with a stable runtime-bound schedule identity.
+The MoE execution policy now has a complete-layer cost surface: routed direct/grouped estimates are combined with qualified shared-expert and combine costs, including the DAG's routed/shared parallel branch. This prevents selecting grouped routed execution when it does not improve end-to-end MoE layer latency. A qualified layer-schedule builder turns that decision into explicit routed/shared/combine dependencies with a stable runtime-bound schedule identity. A portable schedule executor now materializes those dependencies through an async-capable backend seam, so qualified routed/shared parallelism can be implemented by native HIP streams without changing the policy contract.
 
 ### A1.4 — Sparse lookup path
 
