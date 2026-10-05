@@ -28,6 +28,7 @@ add_library(strix_core STATIC
     src/distributed_flow.cpp
     src/distributed_placement.cpp
     src/distributed_data_plane.cpp
+    src/distributed_native_backend.cpp
     src/distributed_runtime.cpp
     src/distributed_session.cpp
     src/direct_transport_completion.cpp
@@ -386,6 +387,11 @@ if(BUILD_TESTING)
     target_link_libraries(strix-distributed-runtime-tests PRIVATE strix_core)
     strix_target_warnings(strix-distributed-runtime-tests)
     add_test(NAME strix-distributed-runtime-tests COMMAND strix-distributed-runtime-tests)
+
+    add_executable(strix-distributed-native-backend-tests tests/distributed_native_backend_tests.cpp)
+    target_link_libraries(strix-distributed-native-backend-tests PRIVATE strix_core)
+    strix_target_warnings(strix-distributed-native-backend-tests)
+    add_test(NAME strix-distributed-native-backend-tests COMMAND strix-distributed-native-backend-tests)
 
     add_executable(strix-distributed-session-tests tests/distributed_session_tests.cpp)
     target_link_libraries(strix-distributed-session-tests PRIVATE strix_core)

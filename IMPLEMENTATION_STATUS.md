@@ -525,12 +525,13 @@ Initial host-side implementation:
 - boundary transfer descriptors bind placement-plan identity, request/generation/sequence, boundary identity, dtype and exact payload bytes;
 - control-plane reconciliation requires matching protocol, expected node identity, placement plan, runtime compatibility and exact model content;
 - receive-side request state enforces exact generation and monotonically increasing sequence, poisoning the request on stale/foreign boundary delivery;
-- host data-plane packaging now binds each boundary to its stable flow classification, request descriptor and live dual-link transfer plan, while receive-side validation rechecks the same flow/request identities before sequence advancement.
+- host data-plane packaging now binds each boundary to its stable flow classification, request descriptor and live dual-link transfer plan, while receive-side validation rechecks the same flow/request identities before sequence advancement;
+- a single-link native distributed backend now consumes that package through an explicit staging/control-plane seam, prepares only leased TX/RX pool buffers, publishes the validated one-stripe GPU commit, polls bounded completion lifecycles, emits consumer credit/repost, and fails closed on striped plans until multi-link reassembly is implemented.
 
 Still pending:
 
-- remote execution backend that consumes these boundary descriptors;
-- native submit/receive integration for the host-side boundary data-plane package;
+- concrete remote-step control implementation behind the native distributed backend seam;
+- striped multi-link native boundary reassembly/submission;
 - native two-node numerical replay and failure/fallback qualification.
 
 
