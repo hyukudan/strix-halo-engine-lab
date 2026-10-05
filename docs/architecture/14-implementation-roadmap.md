@@ -138,6 +138,8 @@ The runtime has measured transport capabilities and can schedule independent tra
 
 Status: **architecture/core synchronization contract implemented; kernel/runtime ABI qualification pending**.
 
+The pool planner now has a concrete move-only ownership layer: every physical link receives separate TX/RX GPU-domain allocations with independent allocation generations and a physical binding identity. This layer is allocator-agnostic and deliberately does not claim uncached/DMA-BUF semantics; the native allocator must satisfy those properties before direct-DMA qualification.
+
 Implement as an optional tier above the existing copy/direct-stream baselines:
 
 - dedicated GPU-owned TX/RX pools;

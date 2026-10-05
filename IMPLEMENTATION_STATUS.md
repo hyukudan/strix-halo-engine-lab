@@ -498,12 +498,13 @@ Architecture/core contract implemented from independent public transport evidenc
 - direct-link lifecycle records control readiness, peer reconciliation, RX priming, exclusive lease, DMA-BUF capability and completion-rearm qualification;
 - direct link is unusable until control/reconciliation plus RX priming and re-arm gates pass;
 - normative direct-GPU transport design is in `docs/architecture/16-direct-gpu-transport.md`;
-- dual-link direct DMA is defined as two independent physical transports with separate TX/RX pools, epochs and leases.
+- dual-link direct DMA is defined as two independent physical transports with separate TX/RX pools, epochs and leases;
+- move-only direct-pool ownership now materializes each planned TX/RX GPU pool as an independently generated `gpu_transport_pool` binding, validates per-link alignment/size/domain and exposes a physical binding identity for pointer-stability/lease checks.
 
 Still pending on native hosts:
 
 - exact kernel/UAPI capability probe for GPU DMA-BUF export/import;
-- dedicated uncached GPU transport-pool allocator;
+- dedicated uncached/native GPU transport-pool allocator satisfying the new ownership binding contract;
 - imported-pool backend and completion/event bridge;
 - target-qualified system-scope release/acquire commit primitive;
 - consumer-credit and RX-repost implementation;
