@@ -153,6 +153,27 @@ strix::transport::DirectTransportPoolMemoryBinding pools() {
     return value;
 }
 
+strix::transport::DualLinkRuntimeScheduler telemetry_scheduler() {
+    strix::transport::DirectionalLinkProfile profile;
+    profile.outbound.id = "usb4-a";
+    profile.inbound.id = "usb4-a";
+    profile.outbound.peer_node = 1;
+    profile.inbound.peer_node = 1;
+    profile.outbound.health =
+        strix::transport::LinkHealth::qualified;
+    profile.inbound.health =
+        strix::transport::LinkHealth::qualified;
+    profile.outbound.payload_bytes_per_second = 1.0e9;
+    profile.inbound.payload_bytes_per_second = 1.0e9;
+    profile.outbound.one_way_latency_seconds = 10e-6;
+    profile.inbound.one_way_latency_seconds = 10e-6;
+    return {
+        std::vector<strix::transport::DirectionalLinkProfile>{
+            profile,
+        },
+    };
+}
+
 strix::transport::TransferDescriptor descriptor() {
     strix::transport::TransferDescriptor value;
     value.connection_epoch = 17;
@@ -214,6 +235,52 @@ int main() {
                 backend.prepared_receives == 1 &&
                 backend.submits == 2,
             "native session prepares/submits only leased TX/RX pool buffers");
+
+        DualLinkCompletionTelemetry telemetry;
+        auto scheduler =
+            telemetry_scheduler();
+        session.bind_telemetry(
+            telemetry,
+            scheduler);
+
+        const auto tracked_send =
+            session.prepare_send(
+                desc,
+                tx);
+        session.submit_tracked(
+            tracked_send,
+            LinkDirection::outbound,
+            1.0,
+            20e-6,
+            4096);
+        backend.events.push_back({
+            Completion{
+                tracked_send,
+                CompletionKind::remote_transport_ack,
+                128},
+            false,
+            1.001,
+            2048,
+        });
+        backend.events.push_back({
+            Completion{
+                tracked_send,
+                CompletionKind::remote_consumer_complete,
+                128},
+            false,
+            1.002,
+            0,
+        });
+        static_cast<void>(
+            session.poll_event());
+        static_cast<void>(
+            session.poll_event());
+        expect(
+            !telemetry.tracked(
+                tracked_send) &&
+                scheduler.links()[0].
+                    outbound.in_flight_bytes == 0,
+            "native session feeds completion timestamps into bound dual-link scheduler");
 
         bool foreign_buffer_rejected = false;
         try {

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "strix/direct_transport_native_backend.hpp"
+#include "strix/dual_link_telemetry.hpp"
 
 #include <cstdint>
 
@@ -47,6 +48,17 @@ public:
 
     void submit(
         TransferHandle handle);
+
+    void bind_telemetry(
+        DualLinkCompletionTelemetry& telemetry,
+        DualLinkRuntimeScheduler& scheduler);
+
+    void submit_tracked(
+        TransferHandle handle,
+        LinkDirection direction,
+        double submit_seconds,
+        double one_way_latency_seconds,
+        std::uint64_t in_flight_bytes);
 
     void cancel(
         TransferHandle handle);
@@ -100,6 +112,8 @@ private:
     DirectTransportLease lease_;
     DirectReceiveCompletionBridge receives_;
     DirectSendCompletionBridge sends_;
+    DualLinkCompletionTelemetry* telemetry_ = nullptr;
+    DualLinkRuntimeScheduler* scheduler_ = nullptr;
 };
 
 }  // namespace strix::transport

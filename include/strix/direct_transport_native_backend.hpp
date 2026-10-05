@@ -29,6 +29,8 @@ struct DirectNativeReadiness {
 struct DirectNativeEvent {
     Completion completion;
     bool receive_path = false;
+    double monotonic_seconds = 0.0;
+    std::uint64_t in_flight_bytes = 0;
 };
 
 class DirectTransportNativeBackend {

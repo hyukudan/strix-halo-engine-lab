@@ -14,12 +14,16 @@ DirectTransportNativeLinkSession(
       pools_(other.pools_),
       lease_(std::move(other.lease_)),
       receives_(std::move(other.receives_)),
-      sends_(std::move(other.sends_)) {
+      sends_(std::move(other.sends_)),
+      telemetry_(other.telemetry_),
+      scheduler_(other.scheduler_) {
     other.backend_ = nullptr;
     other.leases_ = nullptr;
     other.link_ = nullptr;
     other.pools_ = nullptr;
     other.lease_ = {};
+    other.telemetry_ = nullptr;
+    other.scheduler_ = nullptr;
 }
 
 DirectTransportNativeLinkSession&
@@ -34,12 +38,16 @@ DirectTransportNativeLinkSession::operator=(
         lease_ = std::move(other.lease_);
         receives_ = std::move(other.receives_);
         sends_ = std::move(other.sends_);
+        telemetry_ = other.telemetry_;
+        scheduler_ = other.scheduler_;
 
         other.backend_ = nullptr;
         other.leases_ = nullptr;
         other.link_ = nullptr;
         other.pools_ = nullptr;
         other.lease_ = {};
+        other.telemetry_ = nullptr;
+        other.scheduler_ = nullptr;
     }
     return *this;
 }
@@ -216,6 +224,52 @@ void DirectTransportNativeLinkSession::submit(
     backend_->submit(handle);
 }
 
+void DirectTransportNativeLinkSession::bind_telemetry(
+    DualLinkCompletionTelemetry& telemetry,
+    DualLinkRuntimeScheduler& scheduler) {
+    require_current_lease();
+    telemetry_ = &telemetry;
+    scheduler_ = &scheduler;
+}
+
+void DirectTransportNativeLinkSession::submit_tracked(
+    TransferHandle handle,
+    LinkDirection direction,
+    double submit_seconds,
+    double one_way_latency_seconds,
+    std::uint64_t in_flight_bytes) {
+    require_current_lease();
+    if (telemetry_ == nullptr ||
+        scheduler_ == nullptr) {
+        throw std::logic_error(
+            "native tracked submit requires bound telemetry");
+    }
+
+    std::uint64_t bytes = 0;
+    if (direction ==
+        LinkDirection::outbound) {
+        bytes =
+            sends_.state(handle).
+                expected_bytes;
+    } else {
+        bytes =
+            receives_.state(handle).
+                descriptor.byte_length;
+    }
+
+    telemetry_->register_transfer(
+        DirectTelemetryStart{
+            handle,
+            lease_.link_index,
+            direction,
+            bytes,
+            submit_seconds,
+            one_way_latency_seconds,
+            in_flight_bytes,
+        });
+    submit(handle);
+}
+
 void DirectTransportNativeLinkSession::cancel(
     TransferHandle handle) {
     require_current_lease();
@@ -304,10 +358,40 @@ void DirectTransportNativeLinkSession::publish_commit(
 
 bool DirectTransportNativeLinkSession::poll_event() {
     require_current_lease();
-    return observe_direct_native_event(
-        *backend_,
-        receives_,
-        sends_);
+
+    const auto event =
+        backend_->poll_direct_event();
+    if (!event.has_value()) {
+        return false;
+    }
+    if (event->completion.handle == 0) {
+        throw std::invalid_argument(
+            "native direct transport event has zero handle");
+    }
+
+    if (event->receive_path) {
+        receives_.observe(
+            event->completion);
+    } else {
+        sends_.observe(
+            event->completion);
+    }
+
+    if (telemetry_ != nullptr &&
+        scheduler_ != nullptr &&
+        telemetry_->tracked(
+            event->completion.handle)) {
+        if (event->monotonic_seconds <= 0.0) {
+            throw std::invalid_argument(
+                "native telemetry event requires monotonic timestamp");
+        }
+        telemetry_->observe_completion(
+            event->completion,
+            event->monotonic_seconds,
+            event->in_flight_bytes,
+            *scheduler_);
+    }
+    return true;
 }
 
 const DirectReceiveCompletionState&
@@ -337,6 +421,8 @@ void DirectTransportNativeLinkSession::close() {
     link_ = nullptr;
     pools_ = nullptr;
     lease_ = {};
+    telemetry_ = nullptr;
+    scheduler_ = nullptr;
 }
 
 void DirectTransportNativeLinkSession::release_noexcept() noexcept {
@@ -359,6 +445,8 @@ void DirectTransportNativeLinkSession::release_noexcept() noexcept {
     link_ = nullptr;
     pools_ = nullptr;
     lease_ = {};
+    telemetry_ = nullptr;
+    scheduler_ = nullptr;
 }
 
 }  // namespace strix::transport
