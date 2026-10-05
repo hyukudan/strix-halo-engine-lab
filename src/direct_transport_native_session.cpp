@@ -155,6 +155,15 @@ void DirectTransportNativeLinkSession::release_receive(
     receives_.release_consumer(handle);
 }
 
+void DirectTransportNativeLinkSession::publish_receive_credit(
+    TransferHandle handle) {
+    require_current_lease();
+    publish_direct_native_consumer_credit(
+        *backend_,
+        receives_,
+        handle);
+}
+
 void DirectTransportNativeLinkSession::repost_receive(
     TransferHandle handle) {
     require_current_lease();

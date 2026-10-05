@@ -88,6 +88,27 @@ void publish_direct_native_commit(
     backend.publish_gpu_commit(handle, record);
 }
 
+void publish_direct_native_consumer_credit(
+    DirectTransportNativeBackend& backend,
+    DirectReceiveCompletionBridge& receives,
+    TransferHandle handle) {
+    const auto& state =
+        receives.state(handle);
+    if (state.failed ||
+        state.ownership !=
+            BufferOwnership::consumer_released ||
+        state.consumer_credit_published) {
+        throw std::logic_error(
+            "native consumer credit requires one unrecredited consumer-released receive");
+    }
+
+    backend.publish_consumer_credit(
+        handle,
+        state.descriptor.byte_length);
+    receives.publish_consumer_credit(
+        handle);
+}
+
 void repost_direct_native_receive(
     DirectTransportNativeBackend& backend,
     DirectReceiveCompletionBridge& receives,

@@ -146,6 +146,31 @@ void DirectReceiveCompletionBridge::release_consumer(
         BufferOwnership::consumer_released);
 }
 
+void DirectReceiveCompletionBridge::publish_consumer_credit(
+    TransferHandle handle) {
+    auto& current =
+        mutable_state(handle);
+    if (current.failed) {
+        throw std::logic_error(
+            "failed direct receive cannot publish consumer credit");
+    }
+    if (current.ownership !=
+            BufferOwnership::consumer_released &&
+        current.ownership !=
+            BufferOwnership::repost_pending &&
+        current.ownership !=
+            BufferOwnership::reusable) {
+        throw std::logic_error(
+            "direct receive consumer credit requires consumer-released ownership");
+    }
+    if (current.consumer_credit_published) {
+        throw std::logic_error(
+            "direct receive consumer credit was already published");
+    }
+    current.consumer_credit_published =
+        true;
+}
+
 void DirectReceiveCompletionBridge::submit_repost(
     TransferHandle handle) {
     auto& current =

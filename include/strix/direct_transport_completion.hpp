@@ -13,6 +13,7 @@ struct DirectReceiveCompletionState {
     BufferOwnership ownership =
         BufferOwnership::transport_owned;
     std::uint64_t completed_bytes = 0;
+    bool consumer_credit_published = false;
     bool failed = false;
 };
 
@@ -29,6 +30,9 @@ public:
         TransferHandle handle);
 
     void release_consumer(
+        TransferHandle handle);
+
+    void publish_consumer_credit(
         TransferHandle handle);
 
     void submit_repost(

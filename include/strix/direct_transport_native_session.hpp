@@ -51,6 +51,9 @@ public:
     void release_receive(
         TransferHandle handle);
 
+    void publish_receive_credit(
+        TransferHandle handle);
+
     void repost_receive(
         TransferHandle handle);
 

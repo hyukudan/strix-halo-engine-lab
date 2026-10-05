@@ -49,6 +49,10 @@ public:
         TransferHandle handle,
         const GpuCommitRecord& record) = 0;
 
+    virtual void publish_consumer_credit(
+        TransferHandle handle,
+        std::uint64_t bytes) = 0;
+
     virtual void repost_receive(
         TransferHandle handle) = 0;
 
@@ -72,6 +76,11 @@ void publish_direct_native_commit(
     TransferHandle handle,
     const TransferDescriptor& descriptor,
     const GpuCommitRecord& record);
+
+void publish_direct_native_consumer_credit(
+    DirectTransportNativeBackend& backend,
+    DirectReceiveCompletionBridge& receives,
+    TransferHandle handle);
 
 void repost_direct_native_receive(
     DirectTransportNativeBackend& backend,
