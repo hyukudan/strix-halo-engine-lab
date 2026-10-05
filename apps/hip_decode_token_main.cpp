@@ -813,6 +813,12 @@ int main(
             : static_cast<strix::PleLookupBackend*>(
                   &mapped_ple_lookup);
 
+    const auto ple_hash_contract =
+        strix::build_ple_hash_contract(
+            model);
+    strix::PleLookupPrefetchState
+        ple_prefetch;
+
     strix::ExecutionRuntimeResources
         resources;
     resources.scratch =
@@ -829,6 +835,10 @@ int main(
         &memory.state();
     resources.ple_lookup =
         ple_lookup;
+    resources.ple_hash_contract =
+        &ple_hash_contract;
+    resources.ple_prefetch =
+        &ple_prefetch;
 
     const auto identities =
         strix::build_runtime_execution_identities(

@@ -1187,51 +1187,6 @@ void launch_ple(
     const auto hash_contract =
         build_ple_hash_contract(
             config.model);
-    std::array<
-        std::uint32_t,
-        PleHashContract::maximum_ngram - 1>
-        previous{};
-    const auto context_count =
-        static_cast<std::size_t>(
-            config.model.ngram_size - 1ULL);
-
-    if (context.position == 0) {
-        std::fill_n(
-            previous.begin(),
-            context_count,
-            static_cast<std::uint32_t>(
-                config.model.ple_eos_token_id));
-    } else {
-        std::memcpy(
-            previous.data(),
-            reinterpret_cast<
-                const void*>(
-                    ngram_state.address),
-            context_count *
-                sizeof(std::uint32_t));
-    }
-
-    const auto hash =
-        hash_ple_token(
-            hash_contract,
-            context.input_token_id,
-            std::span<
-                const std::uint32_t>(
-                    previous.data(),
-                    context_count));
-
-    PleLookupRequest lookup;
-    lookup.row_ids =
-        std::span<
-            const std::uint64_t>(
-                hash.row_ids.data(),
-                hash.row_count);
-    lookup.row_bytes =
-        hash_contract.row_bytes;
-    lookup.table_manifest =
-        tensors.table.manifest;
-    lookup.table_runtime =
-        tensors.table.runtime;
 
     alignas(64)
     std::array<
@@ -1239,37 +1194,108 @@ void launch_ple(
         PleHashContract::maximum_heads * 512>
         host_staging{};
 
+    auto& backend =
+        *context.resources->ple_lookup;
+    PleHashResult hash;
+
+    if (context.resources->ple_prefetch != nullptr &&
+        context.resources->ple_prefetch->active) {
+        const auto prefetched_bytes =
+            context.resources->ple_prefetch->
+                lookup_bytes;
+        if (prefetched_bytes >
+            host_staging.size()) {
+            throw std::overflow_error(
+                "PLE prefetched lookup exceeds fixed host staging");
+        }
+        hash =
+            finish_ple_lookup_prefetch(
+                context.input_token_id,
+                context.position,
+                backend,
+                *context.resources->ple_prefetch,
+                std::span<std::byte>(
+                    host_staging.data(),
+                    static_cast<std::size_t>(
+                        prefetched_bytes)));
+    } else {
+        std::array<
+            std::uint32_t,
+            PleHashContract::maximum_ngram - 1>
+            previous{};
+        const auto context_count =
+            static_cast<std::size_t>(
+                config.model.ngram_size - 1ULL);
+
+        if (context.position == 0) {
+            std::fill_n(
+                previous.begin(),
+                context_count,
+                static_cast<std::uint32_t>(
+                    config.model.ple_eos_token_id));
+        } else {
+            std::memcpy(
+                previous.data(),
+                reinterpret_cast<const void*>(
+                    ngram_state.address),
+                context_count *
+                    sizeof(std::uint32_t));
+        }
+
+        hash =
+            hash_ple_token(
+                hash_contract,
+                context.input_token_id,
+                std::span<const std::uint32_t>(
+                    previous.data(),
+                    context_count));
+
+        PleLookupRequest lookup;
+        lookup.row_ids =
+            std::span<const std::uint64_t>(
+                hash.row_ids.data(),
+                hash.row_count);
+        lookup.row_bytes =
+            hash_contract.row_bytes;
+        lookup.table_manifest =
+            tensors.table.manifest;
+        lookup.table_runtime =
+            tensors.table.runtime;
+
+        const auto sync_lookup_bytes =
+            static_cast<std::uint64_t>(
+                hash.row_count) *
+            hash_contract.row_bytes;
+        if (sync_lookup_bytes >
+            host_staging.size()) {
+            throw std::overflow_error(
+                "PLE lookup exceeds fixed host staging");
+        }
+
+        PleLookupHandle handle = 0;
+        try {
+            handle =
+                backend.start(
+                    lookup);
+            backend.finish(
+                handle,
+                std::span<std::byte>(
+                    host_staging.data(),
+                    static_cast<std::size_t>(
+                        sync_lookup_bytes)));
+            handle = 0;
+        } catch (...) {
+            if (handle != 0) {
+                backend.cancel(handle);
+            }
+            throw;
+        }
+    }
+
     const auto lookup_bytes =
         static_cast<std::uint64_t>(
             hash.row_count) *
         hash_contract.row_bytes;
-    if (lookup_bytes >
-        host_staging.size()) {
-        throw std::overflow_error(
-            "PLE lookup exceeds fixed host staging");
-    }
-
-    auto& backend =
-        *context.resources->ple_lookup;
-    PleLookupHandle handle = 0;
-    try {
-        handle =
-            backend.start(
-                lookup);
-        backend.finish(
-            handle,
-            std::span<std::byte>(
-                host_staging.data(),
-                static_cast<std::size_t>(
-                    lookup_bytes)));
-        handle = 0;
-    } catch (...) {
-        if (handle != 0) {
-            backend.cancel(
-                handle);
-        }
-        throw;
-    }
 
     auto* workspace =
         reinterpret_cast<std::byte*>(

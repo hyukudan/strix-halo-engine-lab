@@ -311,6 +311,7 @@ Initial host-side implementation:
 - deterministic contiguous-run construction;
 - bounded coalesced-I/O plan with configurable maximum rows per operation, exact byte offsets/sizes and deterministic inflight-wave accounting;
 - portable bounded asynchronous I/O executor that consumes the plan, caps concurrent reads, preserves deterministic result ordering and propagates source failures;
+- serial-token PLE prefetch now starts the lookup after deterministic preflight but before the DAG, binds the handle to token/position/backend identity, overlaps I/O with preceding token work, and cancels outstanding lookup on execution failure;
 - bounded LRU hit/miss simulation and physical row-read byte model;
 - standalone Linux benchmark for mmap, pread, pread+LRU, per-window coalesced pread and bounded asynchronous pread using the production planner/executor contract;
 - deterministic PLE-like access pattern with 16 logical head partitions;
@@ -323,7 +324,7 @@ Still pending:
 - exact production table file/shard layout from the canonical checkpoint;
 - real PLE row traces from model execution;
 - NVMe and page-cache qualification on the Strix Halo hosts;
-- CPU gather into registered/staging buffers under simultaneous GPU load;
+- native measurement of the new pre-DAG PLE lookup overlap and CPU gather into registered/staging buffers under simultaneous GPU load;
 - direct GPU-visible sparse access experiment;
 - execute the mapped-vs-planned qualification/sweep gate on native Strix Halo and select chunk/inflight policy from measured complete-token latency;
 
