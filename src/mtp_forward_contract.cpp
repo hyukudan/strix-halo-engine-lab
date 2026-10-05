@@ -87,9 +87,22 @@ build_mtp_forward_composition_contract(
     contract.tensor_families_complete =
         tensors.structurally_complete();
     contract.attention_geometry_matches_hidden =
-        contract.attention_query_width == model.hidden_size &&
-        attention.kv_heads != 0 &&
-        attention.head_dim != 0 &&
+        attention.attention_heads ==
+            model.attention_heads &&
+        attention.kv_heads ==
+            model.kv_heads &&
+        attention.head_dim ==
+            model.head_dim &&
+        attention.rotary_dim ==
+            model.rotary_dim() &&
+        contract.attention_query_width ==
+            checked_mul(
+                model.attention_heads,
+                model.head_dim) &&
+        contract.attention_kv_width ==
+            checked_mul(
+                model.kv_heads,
+                model.head_dim) &&
         attention.sparse_selection_semantics_resolved;
     contract.state_matches_wide_hidden =
         state.one_state_row_per_request &&
