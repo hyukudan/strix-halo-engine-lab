@@ -341,6 +341,7 @@ The placement planner consumes the compiled serial DAG, exact tensor-access plan
 
 Control-plane reconciliation additionally requires matching protocol, expected peer node, placement plan, runtime compatibility and model content. Receive-side request state enforces the exact request generation and monotonically increasing sequence, poisoning a request on stale or foreign boundary delivery.
 A host data-plane package now binds each planned boundary to its stable distributed flow, request descriptor and live dual-link transfer plan; receive-side validation requires the matching inbound flow package before request sequence state advances.
+Remote-step execution now has a concrete sequenced controller above an abstract control-wire backend; command/ACK identity is bound to placement/request/generation and any stale, foreign or negative acknowledgement poisons the controller before later remote work can proceed.
 
 Implement next:
 
