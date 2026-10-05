@@ -26,6 +26,7 @@ add_library(strix_core STATIC
     src/compiled_speculation_backend.cpp
     src/dispatch_resources.cpp
     src/direct_transport_frames.cpp
+    src/direct_transport_lease.cpp
     src/direct_transport_pool.cpp
     src/direct_transport_pool_memory.cpp
     src/draft_proposal_state.cpp
@@ -184,6 +185,11 @@ if(BUILD_TESTING)
     target_link_libraries(strix-direct-transport-pool-memory-tests PRIVATE strix_core)
     strix_target_warnings(strix-direct-transport-pool-memory-tests)
     add_test(NAME strix-direct-transport-pool-memory-tests COMMAND strix-direct-transport-pool-memory-tests)
+
+    add_executable(strix-direct-transport-lease-tests tests/direct_transport_lease_tests.cpp)
+    target_link_libraries(strix-direct-transport-lease-tests PRIVATE strix_core)
+    strix_target_warnings(strix-direct-transport-lease-tests)
+    add_test(NAME strix-direct-transport-lease-tests COMMAND strix-direct-transport-lease-tests)
 
     add_executable(strix-kernel-registry-tests tests/kernel_registry_tests.cpp)
     target_link_libraries(strix-kernel-registry-tests PRIVATE strix_core)
