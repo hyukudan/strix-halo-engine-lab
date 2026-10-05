@@ -498,7 +498,9 @@ Initial host-side implementation:
 - cross-node dependency edges produce stable boundary identities and exact activation payload bytes from arena allocations;
 - plans fail closed on mixed-node tensor requirements inside one execution step;
 - deterministic execution-mode selection requires all remote nodes or an explicit local-model-copy fallback;
-- boundary transfer descriptors bind placement-plan identity, request/generation/sequence, boundary identity, dtype and exact payload bytes.
+- boundary transfer descriptors bind placement-plan identity, request/generation/sequence, boundary identity, dtype and exact payload bytes;
+- control-plane reconciliation requires matching protocol, expected node identity, placement plan, runtime compatibility and exact model content;
+- receive-side request state enforces exact generation and monotonically increasing sequence, poisoning the request on stale/foreign boundary delivery.
 
 Still pending:
 
