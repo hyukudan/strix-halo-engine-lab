@@ -528,11 +528,12 @@ Initial host-side implementation:
 - receive-side request state enforces exact generation and monotonically increasing sequence, poisoning the request on stale/foreign boundary delivery;
 - host data-plane packaging now binds each boundary to its stable flow classification, request descriptor and live dual-link transfer plan, while receive-side validation rechecks the same flow/request identities before sequence advancement;
 - the native distributed backend consumes boundary packages through an explicit staging/control-plane seam, supports both single-link and exact-cover striped plans across distinct leased sessions, publishes indexed GPU commits per slice, validates all received commits with the logical-message tracker before reassembly, and withholds consumer credit/repost until every stripe has been consumed successfully;
-- sequenced remote-step control now binds command/ACK to protocol, placement plan, request/generation, control sequence, step id/op and target node; stale, foreign or unsuccessful ACKs poison the controller, and boundary metadata is revalidated against the same request/epoch before forwarding.
+- sequenced remote-step control now binds command/ACK to protocol, placement plan, request/generation, control sequence, step id/op and target node; stale, foreign or unsuccessful ACKs poison the controller, and boundary metadata is revalidated against the same request/epoch before forwarding;
+- a bounded little-endian control-wire codec now serializes/deserializes remote-step commands, ACKs and boundary metadata (including striped link slices) behind an abstract byte-stream, with explicit magic/version/type/length checks and configurable frame/slice limits.
 
 Still pending:
 
-- production control-wire implementation behind the sequenced remote-step controller;
+- concrete stream transport (TCP/control-link/native channel) implementing the framed control byte-stream;
 - native two-host qualification of single-link versus striped multi-link boundary submission/reassembly;
 - native two-node numerical replay and failure/fallback qualification.
 
