@@ -105,6 +105,9 @@ std::uint64_t build_plan_identity_internal(
     hash_u64(
         hash,
         plan.forward.contract_identity);
+    hash_u64(
+        hash,
+        plan.forward_semantics.contract_identity);
     hash_u64(hash, plan.steps.size());
     for (const auto step : plan.steps) {
         hash_u64(
@@ -165,6 +168,9 @@ compile_mtp_draft_plan(
             plan.state,
             plan.output,
             plan.tensor_audit);
+    plan.forward_semantics =
+        build_mtp_forward_semantic_contract(
+            model);
 
     plan.steps = {
         MtpDraftPlanStep::input_fusion,

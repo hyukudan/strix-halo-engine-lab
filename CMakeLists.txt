@@ -79,6 +79,7 @@ add_library(strix_core STATIC
     src/mtp_draft_cycle_input.cpp
     src/mtp_forward_replay.cpp
     src/mtp_forward_contract.cpp
+    src/mtp_forward_semantics.cpp
     src/mtp_forward_runtime.cpp
     src/mtp_input_fusion.cpp
     src/mtp_output_contract.cpp
@@ -573,6 +574,11 @@ if(BUILD_TESTING)
     target_link_libraries(strix-mtp-forward-replay-tests PRIVATE strix_core)
     strix_target_warnings(strix-mtp-forward-replay-tests)
     add_test(NAME strix-mtp-forward-replay-tests COMMAND strix-mtp-forward-replay-tests)
+
+    add_executable(strix-mtp-forward-semantics-tests tests/mtp_forward_semantics_tests.cpp)
+    target_link_libraries(strix-mtp-forward-semantics-tests PRIVATE strix_core)
+    strix_target_warnings(strix-mtp-forward-semantics-tests)
+    add_test(NAME strix-mtp-forward-semantics-tests COMMAND strix-mtp-forward-semantics-tests)
 
     add_executable(strix-mtp-forward-contract-tests tests/mtp_forward_contract_tests.cpp)
     target_link_libraries(strix-mtp-forward-contract-tests PRIVATE strix_core)
