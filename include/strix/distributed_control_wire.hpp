@@ -30,6 +30,11 @@ public:
     receive() = 0;
 };
 
+[[nodiscard]] DistributedControlFrameKind
+inspect_distributed_control_frame_kind(
+    std::span<const std::byte> frame,
+    DistributedControlWireLimits limits = {});
+
 [[nodiscard]] std::vector<std::byte>
 encode_distributed_remote_step_command(
     const DistributedRemoteStepCommand& command,

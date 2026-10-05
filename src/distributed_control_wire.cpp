@@ -265,6 +265,57 @@ decode_descriptor(
 
 }  // namespace
 
+DistributedControlFrameKind
+inspect_distributed_control_frame_kind(
+    std::span<const std::byte> bytes,
+    DistributedControlWireLimits limits) {
+    validate_limits(limits);
+    if (bytes.size() <
+            header_bytes ||
+        bytes.size() >
+            limits.maximum_frame_bytes) {
+        throw std::invalid_argument(
+            "distributed control frame size is invalid");
+    }
+
+    Reader reader(bytes);
+    if (reader.u32() != magic ||
+        reader.u32() !=
+            limits.protocol_version) {
+        throw std::invalid_argument(
+            "distributed control frame header mismatch");
+    }
+    const auto raw_kind =
+        reader.u16();
+    static_cast<void>(
+        reader.u16());
+    const auto payload_bytes =
+        reader.u32();
+    if (payload_bytes !=
+        bytes.size() -
+            header_bytes) {
+        throw std::invalid_argument(
+            "distributed control frame payload length mismatch");
+    }
+
+    switch (
+        static_cast<
+            DistributedControlFrameKind>(
+                raw_kind)) {
+    case DistributedControlFrameKind::
+            remote_step_command:
+    case DistributedControlFrameKind::
+            remote_step_ack:
+    case DistributedControlFrameKind::
+            boundary_transfer:
+        return static_cast<
+            DistributedControlFrameKind>(
+                raw_kind);
+    }
+    throw std::invalid_argument(
+        "distributed control frame kind is unknown");
+}
+
 std::vector<std::byte>
 encode_distributed_remote_step_command(
     const DistributedRemoteStepCommand& command,
