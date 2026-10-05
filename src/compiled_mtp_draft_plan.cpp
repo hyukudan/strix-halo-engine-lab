@@ -102,6 +102,9 @@ std::uint64_t build_plan_identity(
     hash_u64(
         hash,
         plan.output.vocab_size);
+    hash_u64(
+        hash,
+        plan.forward.contract_identity);
     hash_u64(hash, plan.steps.size());
     for (const auto step : plan.steps) {
         hash_u64(
@@ -146,6 +149,14 @@ compile_mtp_draft_plan(
         bind_mtp_output_head(
             model,
             manifest,
+            plan.tensor_audit);
+    plan.forward =
+        build_mtp_forward_composition_contract(
+            model,
+            plan.structural,
+            plan.attention,
+            plan.state,
+            plan.output,
             plan.tensor_audit);
 
     plan.steps = {
