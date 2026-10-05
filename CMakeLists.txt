@@ -25,6 +25,8 @@ add_library(strix_core STATIC
     src/compiled_speculative_verify.cpp
     src/compiled_speculation_backend.cpp
     src/dispatch_resources.cpp
+    src/distributed_placement.cpp
+    src/distributed_session.cpp
     src/direct_transport_completion.cpp
     src/direct_transport_native_backend.cpp
     src/direct_transport_frames.cpp
@@ -75,6 +77,7 @@ add_library(strix_core STATIC
     src/model_tensor_index.cpp
     src/moe_plan.cpp
     src/moe_layer_schedule.cpp
+    src/partition_search.cpp
     src/oracles.cpp
     src/packed_projection.cpp
     src/recurrent_plan.cpp
@@ -260,6 +263,11 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-moe-layer-schedule-tests)
     add_test(NAME strix-moe-layer-schedule-tests COMMAND strix-moe-layer-schedule-tests)
 
+    add_executable(strix-partition-search-tests tests/partition_search_tests.cpp)
+    target_link_libraries(strix-partition-search-tests PRIVATE strix_core)
+    strix_target_warnings(strix-partition-search-tests)
+    add_test(NAME strix-partition-search-tests COMMAND strix-partition-search-tests)
+
     add_executable(strix-sparse-lookup-tests tests/sparse_lookup_tests.cpp)
     target_link_libraries(strix-sparse-lookup-tests PRIVATE strix_core)
     strix_target_warnings(strix-sparse-lookup-tests)
@@ -329,6 +337,16 @@ if(BUILD_TESTING)
     target_link_libraries(strix-execution-resources-tests PRIVATE strix_core)
     strix_target_warnings(strix-execution-resources-tests)
     add_test(NAME strix-execution-resources-tests COMMAND strix-execution-resources-tests)
+
+    add_executable(strix-distributed-placement-tests tests/distributed_placement_tests.cpp)
+    target_link_libraries(strix-distributed-placement-tests PRIVATE strix_core)
+    strix_target_warnings(strix-distributed-placement-tests)
+    add_test(NAME strix-distributed-placement-tests COMMAND strix-distributed-placement-tests)
+
+    add_executable(strix-distributed-session-tests tests/distributed_session_tests.cpp)
+    target_link_libraries(strix-distributed-session-tests PRIVATE strix_core)
+    strix_target_warnings(strix-distributed-session-tests)
+    add_test(NAME strix-distributed-session-tests COMMAND strix-distributed-session-tests)
 
     add_executable(strix-execution-tensor-access-tests tests/execution_tensor_access_tests.cpp)
     target_link_libraries(strix-execution-tensor-access-tests PRIVATE strix_core)
