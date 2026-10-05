@@ -167,11 +167,10 @@ strix::transport::DualLinkRuntimeScheduler telemetry_scheduler() {
     profile.inbound.payload_bytes_per_second = 1.0e9;
     profile.outbound.one_way_latency_seconds = 10e-6;
     profile.inbound.one_way_latency_seconds = 10e-6;
-    return {
+    return strix::transport::DualLinkRuntimeScheduler(
         std::vector<strix::transport::DirectionalLinkProfile>{
             profile,
-        },
-    };
+        });
 }
 
 strix::transport::TransferDescriptor descriptor() {
