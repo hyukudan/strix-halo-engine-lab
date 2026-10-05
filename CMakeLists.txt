@@ -26,6 +26,7 @@ add_library(strix_core STATIC
     src/compiled_speculation_backend.cpp
     src/dispatch_resources.cpp
     src/distributed_placement.cpp
+    src/distributed_session.cpp
     src/direct_transport_completion.cpp
     src/direct_transport_frames.cpp
     src/direct_transport_lease.cpp
@@ -322,6 +323,11 @@ if(BUILD_TESTING)
     target_link_libraries(strix-distributed-placement-tests PRIVATE strix_core)
     strix_target_warnings(strix-distributed-placement-tests)
     add_test(NAME strix-distributed-placement-tests COMMAND strix-distributed-placement-tests)
+
+    add_executable(strix-distributed-session-tests tests/distributed_session_tests.cpp)
+    target_link_libraries(strix-distributed-session-tests PRIVATE strix_core)
+    strix_target_warnings(strix-distributed-session-tests)
+    add_test(NAME strix-distributed-session-tests COMMAND strix-distributed-session-tests)
 
     add_executable(strix-execution-tensor-access-tests tests/execution_tensor_access_tests.cpp)
     target_link_libraries(strix-execution-tensor-access-tests PRIVATE strix_core)
