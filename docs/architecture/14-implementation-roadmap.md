@@ -138,7 +138,7 @@ The runtime has measured transport capabilities and can schedule independent tra
 
 Status: **architecture/core synchronization contract implemented; kernel/runtime ABI qualification pending**.
 
-The pool planner now has a concrete move-only ownership layer: every physical link receives separate TX/RX GPU-domain allocations with independent allocation generations and a physical binding identity. A portable exclusive-lease registry binds that physical pool identity to one link/epoch at a time and rejects duplicate/stale lease use. These layers are allocator/backend-agnostic and deliberately do not claim uncached/DMA-BUF semantics; the native allocator/backend must satisfy those properties before direct-DMA qualification.
+The pool planner now has a concrete move-only ownership layer: every physical link receives separate TX/RX GPU-domain allocations with independent allocation generations and a physical binding identity. A portable exclusive-lease registry binds that physical pool identity to one link/epoch at a time and rejects duplicate/stale lease use. Portable RX/TX completion bridges now keep DMA receive completion, consumer ownership, repost completion, local send reuse, transport ACK and remote consumer-complete credit as distinct milestones. These layers are allocator/backend-agnostic and deliberately do not claim uncached/DMA-BUF semantics; the native allocator/backend must satisfy those properties before direct-DMA qualification.
 
 Implement as an optional tier above the existing copy/direct-stream baselines:
 
