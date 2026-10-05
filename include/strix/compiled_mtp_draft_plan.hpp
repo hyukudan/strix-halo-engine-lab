@@ -6,6 +6,7 @@
 #include "strix/mtp_draft_contract.hpp"
 #include "strix/mtp_draft_readiness.hpp"
 #include "strix/mtp_draft_state_contract.hpp"
+#include "strix/mtp_forward_contract.hpp"
 #include "strix/mtp_output_contract.hpp"
 #include "strix/mtp_draft_tensor_audit.hpp"
 
@@ -37,6 +38,7 @@ struct CompiledMtpDraftPlan {
     MtpAttentionStructuralContract attention;
     MtpDraftStateContract state;
     MtpOutputStructuralContract output;
+    MtpForwardCompositionContract forward;
     MtpDraftTensorAudit tensor_audit;
     MtpDraftReadiness readiness;
 
