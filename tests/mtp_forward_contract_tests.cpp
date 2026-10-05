@@ -79,7 +79,10 @@ int main() {
     expect(contract.contract_identity != 0 &&
                contract.composition_resolved,
            "MTP forward composition closes cross-stage structural interfaces");
-    expect(contract.attention_query_width == model.hidden_size &&
+    expect(contract.attention_query_width ==
+                   model.attention_heads * model.head_dim &&
+               contract.attention_kv_width ==
+                   model.kv_heads * model.head_dim &&
                contract.draft_state_width ==
                    model.hidden_size * model.hc_count &&
                contract.output_wide_input_size ==
