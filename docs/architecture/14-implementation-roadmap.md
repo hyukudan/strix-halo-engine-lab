@@ -356,7 +356,7 @@ A two-node execution crosses a planned tensor boundary and preserves the qualifi
 
 Status: **host candidate evaluator implemented; measured candidate generation pending**.
 
-The search treats capacity and latency as separate objectives. Per-node memory budgets gate feasibility, while token latency is estimated from critical-path compute plus uncovered communication and control cost. Synchronization count is retained as evidence rather than used as an automatic veto. Every comparison requires at least one whole-layer/block baseline, but operator-level candidates may win the latency objective. Capacity selection minimizes the largest node footprint (then imbalance and token cost); latency selection requires an explicit improvement threshold over the measured local serial baseline.
+Candidate construction can now be driven directly from an executable placement plan, manifest residency/placement and complete measured step/boundary evidence, eliminating manual cost transcription. The search treats capacity and latency as separate objectives. Per-node memory budgets gate feasibility, while token latency is estimated from critical-path compute plus uncovered communication and control cost. Synchronization count is retained as evidence rather than used as an automatic veto. Every comparison requires at least one whole-layer/block baseline, but operator-level candidates may win the latency objective. Capacity selection minimizes the largest node footprint (then imbalance and token cost); latency selection requires an explicit improvement threshold over the measured local serial baseline.
 
 Next:
 

@@ -547,9 +547,13 @@ Initial host-side implementation:
 - capacity selection minimizes maximum per-node weight footprint with imbalance/token-time tie breakers;
 - latency selection requires an explicit minimum improvement over the measured local serial baseline.
 
+Additional A2.1 implementation:
+
+- placement-derived candidate generation now consumes exact manifest placement, measured per-step timings for both nodes and measured per-boundary uncovered communication/control costs; resident-only versus all-manifest weight accounting is explicit and missing/duplicate evidence fails closed.
+
 Still pending:
 
-- generate candidate costs from measured per-operator/native timing and planned A2.0 boundaries;
+- populate candidate evidence with native per-operator and boundary measurements from the two Strix hosts;
 - canonical two-Strix memory budgets and transport measurements;
 - native validation of the selected capacity and latency candidates.
 

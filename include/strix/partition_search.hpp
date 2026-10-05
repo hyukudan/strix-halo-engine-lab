@@ -1,5 +1,8 @@
 #pragma once
 
+#include "strix/distributed_placement.hpp"
+#include "strix/model_manifest.hpp"
+
 #include <cstdint>
 #include <optional>
 #include <span>
@@ -29,6 +32,28 @@ struct PartitionCandidate {
     double control_us = 0.0;
 };
 
+struct PartitionStepTiming {
+    std::uint32_t step_id = 0;
+    double node0_us = 0.0;
+    double node1_us = 0.0;
+};
+
+struct PartitionBoundaryTiming {
+    std::uint64_t boundary_id = 0;
+    double uncovered_communication_us = 0.0;
+    double control_us = 0.0;
+};
+
+enum class PartitionWeightAccounting : std::uint8_t {
+    resident_only,
+    all_manifest_tensors,
+};
+
+struct PartitionCandidateBuildPolicy {
+    PartitionWeightAccounting weight_accounting =
+        PartitionWeightAccounting::resident_only;
+};
+
 struct PartitionSearchPolicy {
     std::uint64_t node0_weight_budget_bytes = 0;
     std::uint64_t node1_weight_budget_bytes = 0;
@@ -56,6 +81,16 @@ struct PartitionSearchResult {
     std::optional<std::size_t> latency_choice;
     bool whole_layer_baseline_present = false;
 };
+
+[[nodiscard]] PartitionCandidate
+build_partition_candidate_from_placement(
+    const DistributedPlacementPlan& placement,
+    const ModelManifest& manifest,
+    std::span<const PartitionStepTiming> step_timings,
+    std::span<const PartitionBoundaryTiming> boundary_timings,
+    std::string name,
+    PartitionGranularity granularity,
+    PartitionCandidateBuildPolicy policy = {});
 
 [[nodiscard]] PartitionCandidateEvaluation
 evaluate_partition_candidate(
