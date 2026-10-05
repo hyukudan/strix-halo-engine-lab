@@ -343,6 +343,7 @@ Control-plane reconciliation additionally requires matching protocol, expected p
 A host data-plane package now binds each planned boundary to its stable distributed flow, request descriptor and live dual-link transfer plan; receive-side validation requires the matching inbound flow package before request sequence state advances.
 Remote-step execution now has a concrete sequenced controller above an abstract control-wire backend; command/ACK identity is bound to placement/request/generation and any stale, foreign or negative acknowledgement poisons the controller before later remote work can proceed.
 The control-wire format is now explicit and bounded: little-endian framed messages carry remote-step command/ACK and boundary-transfer metadata, including link-plan slices, over an abstract byte stream so TCP or native control channels can be substituted without changing control semantics.
+A concrete POSIX TCP stream now implements that byte-stream with bounded length-prefix framing and RAII socket ownership, providing an immediately usable two-host control path while leaving future native/direct control channels interchangeable.
 
 Implement next:
 
