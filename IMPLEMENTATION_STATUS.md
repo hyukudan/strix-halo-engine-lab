@@ -523,12 +523,13 @@ Initial host-side implementation:
 - deterministic execution-mode selection requires all remote nodes or an explicit local-model-copy fallback;
 - boundary transfer descriptors bind placement-plan identity, request/generation/sequence, boundary identity, dtype and exact payload bytes;
 - control-plane reconciliation requires matching protocol, expected node identity, placement plan, runtime compatibility and exact model content;
-- receive-side request state enforces exact generation and monotonically increasing sequence, poisoning the request on stale/foreign boundary delivery.
+- receive-side request state enforces exact generation and monotonically increasing sequence, poisoning the request on stale/foreign boundary delivery;
+- host data-plane packaging now binds each boundary to its stable flow classification, request descriptor and live dual-link transfer plan, while receive-side validation rechecks the same flow/request identities before sequence advancement.
 
 Still pending:
 
 - remote execution backend that consumes these boundary descriptors;
-- one-link data-plane integration with the direct/native transport backend;
+- native submit/receive integration for the host-side boundary data-plane package;
 - native two-node numerical replay and failure/fallback qualification.
 
 

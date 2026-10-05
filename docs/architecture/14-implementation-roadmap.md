@@ -340,6 +340,7 @@ Status: **host placement/boundary and control/session guards implemented; remote
 The placement planner consumes the compiled serial DAG, exact tensor-access plan and manifest placement. Each step receives a deterministic owner node; tensor-free continuation inherits a single dependency owner where possible, mixed-node tensor requirements fail closed, and each cross-node dependency edge becomes a stable boundary with exact activation bytes derived from the compiled arena. Boundary descriptors bind placement-plan identity, request/generation/sequence and dtype. Runtime selection uses distributed execution only when every required remote node is available; local fallback requires an explicit local model copy.
 
 Control-plane reconciliation additionally requires matching protocol, expected peer node, placement plan, runtime compatibility and model content. Receive-side request state enforces the exact request generation and monotonically increasing sequence, poisoning a request on stale or foreign boundary delivery.
+A host data-plane package now binds each planned boundary to its stable distributed flow, request descriptor and live dual-link transfer plan; receive-side validation requires the matching inbound flow package before request sequence state advances.
 
 Implement next:
 
