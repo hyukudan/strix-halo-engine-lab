@@ -94,8 +94,10 @@ public:
 
     void publish_gpu_commit(
         strix::transport::TransferHandle,
-        const strix::transport::GpuCommitRecord&) override {
+        const strix::transport::GpuCommitRecord& record) override {
         ++commits;
+        published_commits.push_back(
+            record);
     }
 
     strix::transport::GpuCommitRecord read_gpu_commit(
@@ -116,8 +118,10 @@ public:
             record.payload_bytes =
                 static_cast<std::uint32_t>(
                     item.second.byte_length);
-            record.stripe_index = 0;
-            record.stripe_count = 1;
+            record.stripe_index =
+                receive_stripe_index;
+            record.stripe_count =
+                receive_stripe_count;
             return record;
         }
         throw std::invalid_argument(
@@ -153,6 +157,10 @@ public:
     std::uint64_t next_handle = 100;
     int commits = 0;
     int credits = 0;
+    std::uint16_t receive_stripe_index = 0;
+    std::uint16_t receive_stripe_count = 1;
+    std::vector<strix::transport::GpuCommitRecord>
+        published_commits;
     std::vector<std::pair<std::uint64_t,std::uint64_t>> sends;
     std::vector<std::pair<std::uint64_t,std::uint64_t>> receives;
     std::vector<std::pair<
@@ -228,6 +236,86 @@ public:
     int consumed = 0;
 };
 
+class StripedStaging final
+    : public strix::DistributedBoundaryStagingProvider {
+public:
+    strix::transport::TransportBufferView stage_outbound(
+        const strix::DistributedExecutionBoundary&,
+        const strix::DistributedBoundaryTransfer&) override {
+        throw std::logic_error("striped staging requires slice API");
+    }
+
+    strix::transport::TransportBufferView stage_inbound(
+        const strix::DistributedExecutionBoundary&,
+        const strix::DistributedBoundaryTransfer&) override {
+        throw std::logic_error("striped staging requires slice API");
+    }
+
+    void consume_inbound(
+        const strix::DistributedExecutionBoundary&,
+        const strix::transport::TransportBufferView&) override {
+        throw std::logic_error("striped staging requires slice API");
+    }
+
+    strix::transport::TransportBufferView stage_outbound_slice(
+        const strix::DistributedExecutionBoundary&,
+        const strix::DistributedBoundaryTransfer&,
+        const strix::transport::LinkSlice& slice,
+        std::uint16_t,
+        std::uint16_t) override {
+        ++outbound_slices;
+        auto view = tx[slice.link_index];
+        view.bytes = slice.byte_length;
+        return view;
+    }
+
+    strix::transport::TransportBufferView stage_inbound_slice(
+        const strix::DistributedExecutionBoundary&,
+        const strix::DistributedBoundaryTransfer&,
+        const strix::transport::LinkSlice& slice,
+        std::uint16_t,
+        std::uint16_t) override {
+        ++inbound_slices;
+        auto view = rx[slice.link_index];
+        view.bytes = slice.byte_length;
+        return view;
+    }
+
+    void consume_inbound_slice(
+        const strix::DistributedExecutionBoundary&,
+        const strix::DistributedBoundaryTransfer&,
+        const strix::transport::LinkSlice& slice,
+        std::uint16_t stripe_index,
+        std::uint16_t stripe_count,
+        const strix::transport::TransportBufferView&) override {
+        consumed_offsets.push_back(
+            slice.byte_offset);
+        consumed_indices.push_back(
+            stripe_index);
+        observed_stripe_count =
+            stripe_count;
+    }
+
+    void finish_inbound(
+        const strix::DistributedExecutionBoundary&,
+        const strix::DistributedBoundaryTransfer&) override {
+        ++finished;
+    }
+
+    std::array<
+        strix::transport::TransportBufferView,
+        2> tx;
+    std::array<
+        strix::transport::TransportBufferView,
+        2> rx;
+    int outbound_slices = 0;
+    int inbound_slices = 0;
+    int finished = 0;
+    std::uint16_t observed_stripe_count = 0;
+    std::vector<std::uint64_t> consumed_offsets;
+    std::vector<std::uint16_t> consumed_indices;
+};
+
 strix::transport::DirectLinkLifecycle link() {
     strix::transport::DirectLinkLifecycle value;
     value.physical_link_id = "usb4-a";
@@ -258,6 +346,20 @@ strix::transport::DirectTransportPoolMemoryBinding pools() {
     value.links[0].rx = value.links[0].tx;
     value.links[0].rx.address = 0x10001000;
     value.links[0].rx.allocation_generation = 2;
+    return value;
+}
+
+strix::transport::DirectTransportPoolMemoryBinding pools_two() {
+    auto value = pools();
+    value.binding_identity = 0x200;
+    value.total_gpu_bytes = 16384;
+    value.links.resize(2);
+    value.links[1] =
+        value.links[0];
+    value.links[1].tx.address = 0x20000000;
+    value.links[1].tx.allocation_generation = 3;
+    value.links[1].rx.address = 0x20001000;
+    value.links[1].rx.allocation_generation = 4;
     return value;
 }
 
@@ -342,18 +444,125 @@ int main() {
                    strix::transport::BufferOwnership::reusable,
            "single-link native receive completes consume-credit-repost lifecycle");
 
-    auto striped = outbound;
-    striped.link_plan.kind =
-        strix::transport::PlanKind::striped;
-    striped.link_plan.slices = {{0,0,64},{0,64,64}};
-    bool striped_rejected = false;
-    try {
-        backend.send_boundary(boundary,striped);
-    } catch (const std::logic_error&) {
-        striped_rejected = true;
+    {
+        NativeBackend native0;
+        NativeBackend native1;
+        native0.receive_stripe_index = 0;
+        native0.receive_stripe_count = 2;
+        native1.receive_stripe_index = 1;
+        native1.receive_stripe_count = 2;
+
+        auto lifecycle0 = link();
+        auto lifecycle1 = link();
+        lifecycle0.physical_link_id = "usb4-a";
+        lifecycle1.physical_link_id = "usb4-b";
+        auto memory2 = pools_two();
+
+        strix::transport::DirectTransportLeaseRegistry
+            leases2;
+        auto session0 =
+            strix::transport::DirectTransportNativeLinkSession::open(
+                native0,
+                leases2,
+                lifecycle0,
+                memory2,
+                0);
+        auto session1 =
+            strix::transport::DirectTransportNativeLinkSession::open(
+                native1,
+                leases2,
+                lifecycle1,
+                memory2,
+                1);
+
+        Control striped_control;
+        Local striped_local;
+        StripedStaging striped_staging;
+        striped_staging.tx = {
+            memory2.links[0].tx,
+            memory2.links[1].tx,
+        };
+        striped_staging.rx = {
+            memory2.links[0].rx,
+            memory2.links[1].rx,
+        };
+
+        auto striped =
+            transfer(
+                strix::transport::LinkDirection::outbound);
+        striped.link_plan.kind =
+            strix::transport::PlanKind::striped;
+        striped.link_plan.slices = {
+            {0,0,64},
+            {1,64,64},
+        };
+
+        auto inbound_striped =
+            striped;
+        inbound_striped.flow.direction =
+            strix::transport::LinkDirection::inbound;
+        striped_control.inbound =
+            inbound_striped;
+
+        std::array<
+            strix::transport::DirectTransportNativeLinkSession*,
+            2> striped_sessions{
+                &session0,
+                &session1,
+            };
+        strix::NativeDistributedBackend striped_backend(
+            striped_sessions,
+            striped_control,
+            striped_local,
+            striped_staging);
+
+        striped_backend.send_boundary(
+            boundary,
+            striped);
+        expect(
+            native0.published_commits.size() == 1 &&
+                native1.published_commits.size() == 1 &&
+                native0.published_commits[0].stripe_index == 0 &&
+                native1.published_commits[0].stripe_index == 1 &&
+                native0.published_commits[0].stripe_count == 2 &&
+                native1.published_commits[0].stripe_count == 2,
+            "striped native send publishes one indexed commit per physical link");
+
+        const auto striped_observed =
+            striped_backend.receive_boundary(
+                boundary);
+        expect(
+            striped_observed.link_plan.kind ==
+                    strix::transport::PlanKind::striped &&
+                striped_staging.inbound_slices == 2 &&
+                striped_staging.consumed_offsets ==
+                    std::vector<std::uint64_t>({0,64}) &&
+                striped_staging.consumed_indices ==
+                    std::vector<std::uint16_t>({0,1}) &&
+                striped_staging.observed_stripe_count == 2 &&
+                striped_staging.finished == 1 &&
+                native0.credits == 1 &&
+                native1.credits == 1,
+            "striped native receive validates all commits before reassembly/credit");
+
+        auto overlapping =
+            striped;
+        overlapping.link_plan.slices = {
+            {0,0,80},
+            {1,64,64},
+        };
+        bool overlap_rejected = false;
+        try {
+            striped_backend.send_boundary(
+                boundary,
+                overlapping);
+        } catch (const std::invalid_argument&) {
+            overlap_rejected = true;
+        }
+        expect(
+            overlap_rejected,
+            "striped native backend rejects overlapping/non-contiguous slices");
     }
-    expect(striped_rejected,
-           "native distributed backend fails closed on striped plan before reassembly support");
 
     if (failures == 0) {
         std::cout << "distributed native backend tests passed\n";

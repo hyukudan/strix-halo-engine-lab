@@ -526,12 +526,12 @@ Initial host-side implementation:
 - control-plane reconciliation requires matching protocol, expected node identity, placement plan, runtime compatibility and exact model content;
 - receive-side request state enforces exact generation and monotonically increasing sequence, poisoning the request on stale/foreign boundary delivery;
 - host data-plane packaging now binds each boundary to its stable flow classification, request descriptor and live dual-link transfer plan, while receive-side validation rechecks the same flow/request identities before sequence advancement;
-- a single-link native distributed backend now consumes that package through an explicit staging/control-plane seam, prepares only leased TX/RX pool buffers, publishes the validated one-stripe GPU commit, polls bounded completion lifecycles, emits consumer credit/repost, and fails closed on striped plans until multi-link reassembly is implemented.
+- the native distributed backend consumes boundary packages through an explicit staging/control-plane seam, supports both single-link and exact-cover striped plans across distinct leased sessions, publishes indexed GPU commits per slice, validates all received commits with the logical-message tracker before reassembly, and withholds consumer credit/repost until every stripe has been consumed successfully.
 
 Still pending:
 
 - concrete remote-step control implementation behind the native distributed backend seam;
-- striped multi-link native boundary reassembly/submission;
+- native two-host qualification of single-link versus striped multi-link boundary submission/reassembly;
 - native two-node numerical replay and failure/fallback qualification.
 
 

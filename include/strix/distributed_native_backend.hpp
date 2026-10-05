@@ -49,16 +49,44 @@ public:
     virtual void consume_inbound(
         const DistributedExecutionBoundary& boundary,
         const transport::TransportBufferView& staged) = 0;
+
+    [[nodiscard]] virtual transport::TransportBufferView
+    stage_outbound_slice(
+        const DistributedExecutionBoundary& boundary,
+        const DistributedBoundaryTransfer& transfer,
+        const transport::LinkSlice& slice,
+        std::uint16_t stripe_index,
+        std::uint16_t stripe_count);
+
+    [[nodiscard]] virtual transport::TransportBufferView
+    stage_inbound_slice(
+        const DistributedExecutionBoundary& boundary,
+        const DistributedBoundaryTransfer& transfer,
+        const transport::LinkSlice& slice,
+        std::uint16_t stripe_index,
+        std::uint16_t stripe_count);
+
+    virtual void consume_inbound_slice(
+        const DistributedExecutionBoundary& boundary,
+        const DistributedBoundaryTransfer& transfer,
+        const transport::LinkSlice& slice,
+        std::uint16_t stripe_index,
+        std::uint16_t stripe_count,
+        const transport::TransportBufferView& staged);
+
+    virtual void finish_inbound(
+        const DistributedExecutionBoundary& boundary,
+        const DistributedBoundaryTransfer& transfer);
 };
 
 struct DistributedNativeBackendPolicy {
     std::uint64_t maximum_event_polls = 4096;
 };
 
-class SingleLinkNativeDistributedBackend final
+class NativeDistributedBackend final
     : public DistributedExecutionBackend {
 public:
-    SingleLinkNativeDistributedBackend(
+    NativeDistributedBackend(
         std::span<transport::DirectTransportNativeLinkSession*> sessions,
         DistributedNativeControlPlane& control,
         DistributedNativeLocalExecutor& local,
@@ -81,8 +109,8 @@ public:
 
 private:
     [[nodiscard]] transport::DirectTransportNativeLinkSession&
-    session_for(
-        const DistributedBoundaryTransfer& transfer) const;
+    session_for_link(
+        std::size_t link_index) const;
 
     void wait_send_reusable(
         transport::DirectTransportNativeLinkSession& session,
@@ -102,5 +130,8 @@ private:
     DistributedBoundaryStagingProvider* staging_ = nullptr;
     DistributedNativeBackendPolicy policy_{};
 };
+
+using SingleLinkNativeDistributedBackend =
+    NativeDistributedBackend;
 
 }  // namespace strix
