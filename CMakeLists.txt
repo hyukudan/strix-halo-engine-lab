@@ -30,6 +30,7 @@ add_library(strix_core STATIC
     src/distributed_session.cpp
     src/direct_transport_completion.cpp
     src/direct_transport_native_backend.cpp
+    src/direct_transport_native_session.cpp
     src/direct_transport_frames.cpp
     src/direct_transport_lease.cpp
     src/direct_transport_pool.cpp
@@ -212,6 +213,11 @@ if(BUILD_TESTING)
     target_link_libraries(strix-direct-transport-native-backend-tests PRIVATE strix_core)
     strix_target_warnings(strix-direct-transport-native-backend-tests)
     add_test(NAME strix-direct-transport-native-backend-tests COMMAND strix-direct-transport-native-backend-tests)
+
+    add_executable(strix-direct-transport-native-session-tests tests/direct_transport_native_session_tests.cpp)
+    target_link_libraries(strix-direct-transport-native-session-tests PRIVATE strix_core)
+    strix_target_warnings(strix-direct-transport-native-session-tests)
+    add_test(NAME strix-direct-transport-native-session-tests COMMAND strix-direct-transport-native-session-tests)
 
     add_executable(strix-direct-transport-rearm-tests tests/direct_transport_rearm_tests.cpp)
     target_link_libraries(strix-direct-transport-rearm-tests PRIVATE strix_core)

@@ -568,14 +568,15 @@ Architecture/core contract implemented from independent public transport evidenc
 - a portable exclusive-lease registry now binds one physical link to one pool-binding identity, connection epoch and link index at a time, rejecting duplicate acquisition, stale epochs and mutated lease tokens;
 - portable completion bridges now enforce the RX ownership chain (DMA complete → consumer acquire/own/release → repost pending → reusable) and separately track TX local reuse, transport ack and remote consumer-complete credit without conflating those milestones;
 - a repeated ring re-arm qualification gate now requires a fresh epoch plus the exact expected first descriptor/completion for every cycle before publishing `completion_rearm_qualified`;
-- a native-direct backend contract separates capability proof from implementation and wires pool import, GPU commit publication, receive repost and typed native completion events into the existing lease/completion lifecycle with fail-closed validation.
+- a native-direct backend contract separates capability proof from implementation and wires pool import, GPU commit publication, receive repost and typed native completion events into the existing lease/completion lifecycle with fail-closed validation;
+- a move-only native-link session now owns the exclusive lease/import lifetime and the send/receive completion bridges as one unit, revalidating lease/pool/link identity before commits, event polling and repost, and releasing the imported pool before dropping the lease.
 
 Still pending on native hosts:
 
 - exact kernel/UAPI capability probe for GPU DMA-BUF export/import;
 - dedicated uncached/native GPU transport-pool allocator satisfying the new ownership binding contract;
-- imported-pool backend and integration of the portable exclusive-lease token with the native lifecycle/completion path;
-- native backend/event-source integration with the portable completion bridges;
+- concrete imported-pool backend implementation against the native kernel/UAPI;
+- native event-source implementation feeding the already-integrated session completion bridges;
 - target-qualified system-scope release/acquire commit primitive;
 - consumer-credit and RX-repost implementation;
 - native execution of the repeated ring stop/re-arm/first-completion gate against the real imported-ring backend;

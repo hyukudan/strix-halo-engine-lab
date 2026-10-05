@@ -367,6 +367,8 @@ Exit gate:
 
 At least one useful two-node placement is identified or the evidence shows that the tested partition is not worthwhile.
 
+The direct-native control path now has a lifetime-bound link session that acquires the exclusive lease, imports exactly the leased pool, owns send/receive completion bridges and guarantees pool release before lease release.
+
 ### A2.2 — Dual-link USB4 scheduler
 
 Status: **directional live-metric scheduler with failover/recovery implemented; native telemetry qualification pending**.
