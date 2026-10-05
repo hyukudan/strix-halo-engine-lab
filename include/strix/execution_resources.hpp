@@ -21,6 +21,8 @@ struct ExecutionRuntimeResources {
     const SerialSessionStateLayout* session_state_layout = nullptr;
     const SessionStateMemoryBinding* session_state_memory = nullptr;
     PleLookupBackend* ple_lookup = nullptr;
+    const PleHashContract* ple_hash_contract = nullptr;
+    PleLookupPrefetchState* ple_prefetch = nullptr;
 };
 
 struct RuntimeExecutionIdentities {

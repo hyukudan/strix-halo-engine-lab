@@ -1,5 +1,6 @@
 #include "strix/serial_session.hpp"
 
+#include <algorithm>
 #include <limits>
 #include <stdexcept>
 
@@ -86,6 +87,34 @@ EagerExecutionResult execute_serial_token(
         resources.session_state_layout,
         resources.session_state_memory);
 
+    if (resources.ple_lookup != nullptr &&
+        resources.ple_hash_contract != nullptr &&
+        resources.ple_prefetch != nullptr) {
+        const auto found =
+            std::find_if(
+                compiled.execution.steps.begin(),
+                compiled.execution.steps.end(),
+                [](const ExecutionStep& step) {
+                    return step.op == SerialOp::ple;
+                });
+        if (found == compiled.execution.steps.end()) {
+            throw std::logic_error(
+                "PLE prefetch resources supplied to plan without PLE step");
+        }
+        start_ple_lookup_prefetch(
+            *resources.ple_hash_contract,
+            found->id,
+            input_token_id,
+            session.next_position,
+            *resources.model_manifest,
+            *resources.model_weights,
+            *resources.tensor_access,
+            *resources.session_state_layout,
+            *resources.session_state_memory,
+            *resources.ple_lookup,
+            *resources.ple_prefetch);
+    }
+
     EagerExecutionResult result;
     try {
         result =
@@ -94,7 +123,21 @@ EagerExecutionResult execute_serial_token(
                 resources,
                 request,
                 dispatcher);
+        if (resources.ple_prefetch != nullptr &&
+            resources.ple_prefetch->active) {
+            cancel_ple_lookup_prefetch(
+                *resources.ple_lookup,
+                *resources.ple_prefetch);
+            throw std::logic_error(
+                "serial execution completed without consuming PLE prefetch");
+        }
     } catch (...) {
+        if (resources.ple_lookup != nullptr &&
+            resources.ple_prefetch != nullptr) {
+            cancel_ple_lookup_prefetch(
+                *resources.ple_lookup,
+                *resources.ple_prefetch);
+        }
         session.health =
             SerialSessionHealth::poisoned;
         throw;

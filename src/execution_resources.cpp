@@ -79,6 +79,18 @@ void validate_execution_runtime_resources(
         throw std::invalid_argument(
             "PLE lookup backend identity must be non-zero");
     }
+    if ((resources.ple_hash_contract != nullptr ||
+         resources.ple_prefetch != nullptr) &&
+        resources.ple_lookup == nullptr) {
+        throw std::invalid_argument(
+            "PLE prefetch resources require lookup backend");
+    }
+    if (resources.ple_hash_contract != nullptr &&
+        ple_hash_contract_identity(
+            *resources.ple_hash_contract) == 0) {
+        throw std::invalid_argument(
+            "PLE hash contract identity must be non-zero");
+    }
 
     if (position >=
         resources.session_state_layout->context_tokens) {
@@ -120,6 +132,12 @@ build_runtime_execution_identities(
         compatibility,
         resources.ple_lookup != nullptr
             ? resources.ple_lookup->implementation_identity()
+            : 0ULL);
+    hash_u64(
+        compatibility,
+        resources.ple_hash_contract != nullptr
+            ? ple_hash_contract_identity(
+                  *resources.ple_hash_contract)
             : 0ULL);
 
     if (compatibility == 0) {
