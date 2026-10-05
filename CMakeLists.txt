@@ -72,6 +72,7 @@ add_library(strix_core STATIC
     src/model_runtime_binding.cpp
     src/model_tensor_index.cpp
     src/moe_plan.cpp
+    src/partition_search.cpp
     src/oracles.cpp
     src/packed_projection.cpp
     src/recurrent_plan.cpp
@@ -246,6 +247,11 @@ if(BUILD_TESTING)
     target_link_libraries(strix-moe-plan-tests PRIVATE strix_core)
     strix_target_warnings(strix-moe-plan-tests)
     add_test(NAME strix-moe-plan-tests COMMAND strix-moe-plan-tests)
+
+    add_executable(strix-partition-search-tests tests/partition_search_tests.cpp)
+    target_link_libraries(strix-partition-search-tests PRIVATE strix_core)
+    strix_target_warnings(strix-partition-search-tests)
+    add_test(NAME strix-partition-search-tests COMMAND strix-partition-search-tests)
 
     add_executable(strix-sparse-lookup-tests tests/sparse_lookup_tests.cpp)
     target_link_libraries(strix-sparse-lookup-tests PRIVATE strix_core)
