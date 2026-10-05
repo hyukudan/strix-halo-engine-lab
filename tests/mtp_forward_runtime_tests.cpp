@@ -1,6 +1,7 @@
 #include "strix/mtp_forward_runtime.hpp"
 
 #include <iostream>
+#include <optional>
 #include <stdexcept>
 #include <vector>
 
@@ -62,10 +63,12 @@ strix::QualifiedMtpDraftPlan qualified_fixture() {
     };
     plan.replay_policy.policy_identity = 1;
     plan.replay_assessment.identity_valid = true;
-    plan.replay_assessment.step_count_valid = true;
-    plan.replay_assessment.token_match = true;
-    plan.replay_assessment.hidden_error_valid = true;
-    plan.replay_assessment.logit_error_valid = true;
+    plan.replay_assessment.multi_step = true;
+    plan.replay_assessment.tokens_match = true;
+    plan.replay_assessment.hidden_checked = true;
+    plan.replay_assessment.hidden_within_policy = true;
+    plan.replay_assessment.logits_checked = true;
+    plan.replay_assessment.logits_within_policy = true;
     plan.replay_assessment.passes_declared_policy = true;
     plan.independent_reference_identity = 2;
     plan.qualification_identity = 3;
