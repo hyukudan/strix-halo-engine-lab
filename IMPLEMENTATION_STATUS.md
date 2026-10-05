@@ -491,6 +491,45 @@ Still pending:
 - first real token/logit replay against the canonical checkpoint/reference implementation;
 - tokenizer/chat-template integration after raw token-id replay is correct.
 
+## Slice A2.0 — distributed placement executor
+
+Initial host-side implementation:
+
+- compiled serial steps are assigned to a node from the exact tensor-access plan and manifest placement;
+- tensor-free steps inherit a single dependency node when unambiguous, avoiding artificial boundaries;
+- cross-node dependency edges produce stable boundary identities and exact activation payload bytes from arena allocations;
+- plans fail closed on mixed-node tensor requirements inside one execution step;
+- deterministic execution-mode selection requires all remote nodes or an explicit local-model-copy fallback;
+- boundary transfer descriptors bind placement-plan identity, request/generation/sequence, boundary identity, dtype and exact payload bytes;
+- control-plane reconciliation requires matching protocol, expected node identity, placement plan, runtime compatibility and exact model content;
+- receive-side request state enforces exact generation and monotonically increasing sequence, poisoning the request on stale/foreign boundary delivery.
+
+Still pending:
+
+- remote execution backend that consumes these boundary descriptors;
+- one-link data-plane integration with the direct/native transport backend;
+- native two-node numerical replay and failure/fallback qualification.
+
+
+## Slice A2.1 — two-node partition search
+
+Initial host-side implementation:
+
+- candidate evaluation separates capacity and latency objectives;
+- capacity feasibility is checked per-node rather than by total parameter balance;
+- latency estimates use critical-path compute plus uncovered communication and control cost;
+- synchronization count is retained but is not an automatic rejection criterion;
+- search requires at least one whole-layer baseline while allowing finer operator-level latency candidates;
+- capacity selection minimizes maximum per-node weight footprint with imbalance/token-time tie breakers;
+- latency selection requires an explicit minimum improvement over the measured local serial baseline.
+
+Still pending:
+
+- generate candidate costs from measured per-operator/native timing and planned A2.0 boundaries;
+- canonical two-Strix memory budgets and transport measurements;
+- native validation of the selected capacity and latency candidates.
+
+
 ## Slice A0.7b — direct GPU DMA transport contract
 
 Architecture/core contract implemented from independent public transport evidence:

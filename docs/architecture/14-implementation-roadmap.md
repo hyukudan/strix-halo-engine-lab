@@ -335,16 +335,17 @@ Speculative greedy output matches the serial contract and improves completed-tok
 
 ### A2.0 — Distributed placement executor
 
-Activate the placement fields already present in `ModelManifest`.
+Status: **host placement/boundary and control/session guards implemented; remote execution backend pending**.
 
-Implement:
+The placement planner consumes the compiled serial DAG, exact tensor-access plan and manifest placement. Each step receives a deterministic owner node; tensor-free continuation inherits a single dependency owner where possible, mixed-node tensor requirements fail closed, and each cross-node dependency edge becomes a stable boundary with exact activation bytes derived from the compiled arena. Boundary descriptors bind placement-plan identity, request/generation/sequence and dtype. Runtime selection uses distributed execution only when every required remote node is available; local fallback requires an explicit local model copy.
 
-- remote tensor boundary;
-- node identity;
-- generation/sequence safety;
-- control/data-plane separation;
-- one-link transport backend;
-- deterministic fallback.
+Control-plane reconciliation additionally requires matching protocol, expected peer node, placement plan, runtime compatibility and model content. Receive-side request state enforces the exact request generation and monotonically increasing sequence, poisoning a request on stale or foreign boundary delivery.
+
+Implement next:
+
+- remote execution backend for planned boundaries;
+- one-link data-plane integration with the native direct-transport backend;
+- native two-node replay and deterministic fallback qualification.
 
 Exit gate:
 
@@ -352,29 +353,19 @@ A two-node execution crosses a planned tensor boundary and preserves the qualifi
 
 ### A2.1 — Two-node partition search
 
-Evaluate partition candidates by:
+Status: **host candidate evaluator implemented; measured candidate generation pending**.
 
-- memory saved per node;
-- bytes transferred per token;
-- synchronization count;
-- compute balance;
-- transport overlap.
+The search treats capacity and latency as separate objectives. Per-node memory budgets gate feasibility, while token latency is estimated from critical-path compute plus uncovered communication and control cost. Synchronization count is retained as evidence rather than used as an automatic veto. Every comparison requires at least one whole-layer/block baseline, but operator-level candidates may win the latency objective. Capacity selection minimizes the largest node footprint (then imbalance and token cost); latency selection requires an explicit improvement threshold over the measured local serial baseline.
 
-Do not select by parameter balance alone.
+Next:
+
+- derive candidate costs from A2.0 boundaries and native per-operator timing;
+- feed measured one-link/dual-link communication exposure rather than ideal bandwidth;
+- evaluate canonical whole-layer and finer operator splits on the two Strix hosts.
 
 Exit gate:
 
 At least one useful two-node placement is identified or the evidence shows that the tested partition is not worthwhile.
-
-The evaluation MUST distinguish:
-
-- a capacity-oriented whole-layer/block baseline;
-- latency candidates that may use finer tensor/operator partitioning;
-- critical-path compute saved;
-- uncovered communication;
-- synchronization/control cost.
-
-Synchronization count alone MUST NOT reject a candidate.
 
 ### A2.2 — Dual-link USB4 scheduler
 
