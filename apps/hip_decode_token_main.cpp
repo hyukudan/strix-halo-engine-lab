@@ -5,6 +5,7 @@
 #include "strix/hip_launcher_catalog.hpp"
 #include "strix/hip_model_residency.hpp"
 #include "strix/hip_runtime_allocator.hpp"
+#include "strix/hip_session_snapshot_transfer.hpp"
 #include "strix/launch_dispatch.hpp"
 #include "strix/mapped_model_file.hpp"
 #include "strix/model_contract.hpp"
@@ -15,6 +16,7 @@
 #include "strix/runtime_allocator.hpp"
 #include "strix/serial_decode_reference.hpp"
 #include "strix/serial_decode_replay.hpp"
+#include "strix/serial_prefix_cache.hpp"
 #include "strix/serial_request.hpp"
 #include "strix/serial_session.hpp"
 #include "strix/session_state_layout.hpp"
@@ -154,6 +156,7 @@ struct Options {
     double max_logit_abs_error = 1e-3;
     std::uint64_t generate_tokens = 0;
     std::optional<std::uint32_t> eos_token;
+    bool prefix_cache_roundtrip = false;
 };
 
 Options parse_options(
@@ -165,7 +168,7 @@ Options parse_options(
             "[--reference FILE] [--max-logit-error X] "
             "[--context N] [--residency register|copy] [--coalesce-gap BYTES] "
             "[--planned-ple-io] [--ple-max-rows-per-io N] [--ple-max-inflight-ios N] "
-            "[--generate N] [--eos-token TOKEN_ID]");
+            "[--generate N] [--eos-token TOKEN_ID] [--prefix-cache-roundtrip]");
     }
 
     Options options;
@@ -311,6 +314,11 @@ Options parse_options(
             continue;
         }
 
+        if (argument == "--prefix-cache-roundtrip") {
+            options.prefix_cache_roundtrip = true;
+            continue;
+        }
+
         if (argument.starts_with("--")) {
             throw std::invalid_argument(
                 "unknown option: " +
@@ -346,6 +354,11 @@ Options parse_options(
         options.tokens.empty()) {
         throw std::invalid_argument(
             "--generate requires at least one prefix token id");
+    }
+    if (options.prefix_cache_roundtrip &&
+        options.generate_tokens == 0) {
+        throw std::invalid_argument(
+            "--prefix-cache-roundtrip requires --generate");
     }
     if (options.context_tokens == 0) {
         throw std::invalid_argument(
@@ -844,6 +857,228 @@ int main(
     }
 
     if (options.generate_tokens != 0) {
+        if (options.prefix_cache_roundtrip) {
+            HipSerialGreedyStepBackend
+                prefill_backend(
+                    compiled,
+                    session,
+                    resources,
+                    dispatcher,
+                    memory.scratch(),
+                    lm_io,
+                    model.vocab_size);
+
+            std::vector<float> prefix_logits;
+            for (std::size_t index = 0;
+                 index < options.tokens.size();
+                 ++index) {
+                prefix_logits =
+                    prefill_backend.execute(
+                        options.tokens[index],
+                        index);
+            }
+
+            strix::HipSessionSnapshotTransferBackend
+                snapshot_transfer;
+            auto prefix_cache =
+                strix::SerialPrefixCacheEntry::capture(
+                    model,
+                    options.tokens,
+                    session,
+                    state_layout,
+                    memory.state(),
+                    allocator,
+                    generations,
+                    snapshot_transfer);
+
+            strix::SerialGreedyContinuationRequest
+                continuation;
+            continuation.initial_logits =
+                prefix_logits;
+            continuation.start_position =
+                session.next_position;
+            continuation.vocab_size =
+                model.vocab_size;
+            continuation.context_capacity =
+                options.context_tokens;
+            continuation.max_new_tokens =
+                options.generate_tokens;
+            continuation.eos_token_id =
+                generation_eos;
+
+            HipSerialGreedyStepBackend
+                baseline_backend(
+                    compiled,
+                    session,
+                    resources,
+                    dispatcher,
+                    memory.scratch(),
+                    lm_io,
+                    model.vocab_size);
+            const auto baseline =
+                strix::execute_serial_greedy_continuation(
+                    continuation,
+                    baseline_backend);
+
+            const auto mutated_position =
+                session.next_position;
+            const auto restore_start =
+                std::chrono::steady_clock::now();
+            prefix_cache.restore(
+                session,
+                model,
+                state_layout,
+                memory.state(),
+                snapshot_transfer,
+                options.tokens);
+            check_hip(
+                hipDeviceSynchronize(),
+                "hipDeviceSynchronize(prefix restore)");
+            const auto restore_stop =
+                std::chrono::steady_clock::now();
+
+            if (session.next_position !=
+                    options.tokens.size() ||
+                session.committed_tokens !=
+                    options.tokens.size() ||
+                session.health !=
+                    strix::SerialSessionHealth::ready) {
+                throw std::logic_error(
+                    "prefix cache restore did not recover exact session metadata");
+            }
+
+            HipSerialGreedyStepBackend
+                restored_backend(
+                    compiled,
+                    session,
+                    resources,
+                    dispatcher,
+                    memory.scratch(),
+                    lm_io,
+                    model.vocab_size);
+            const auto restored =
+                strix::execute_serial_greedy_continuation(
+                    continuation,
+                    restored_backend);
+
+            const bool equivalent =
+                baseline.generated_tokens ==
+                    restored.generated_tokens &&
+                baseline.stop_reason ==
+                    restored.stop_reason &&
+                baseline.final_position ==
+                    restored.final_position;
+
+            if (!equivalent) {
+                throw std::runtime_error(
+                    "prefix cache round-trip changed greedy continuation");
+            }
+
+            double prefill_ms = 0.0;
+            for (const auto value :
+                 prefill_backend.elapsed_ms()) {
+                prefill_ms += value;
+            }
+            double baseline_ms = 0.0;
+            for (const auto value :
+                 baseline_backend.elapsed_ms()) {
+                baseline_ms += value;
+            }
+            double restored_ms = 0.0;
+            for (const auto value :
+                 restored_backend.elapsed_ms()) {
+                restored_ms += value;
+            }
+            const auto restore_ms =
+                std::chrono::duration<double, std::milli>(
+                    restore_stop -
+                    restore_start).count();
+
+            std::cout
+                << "{\n"
+                << "  \"model_content_identity\": \""
+                << strix::model_content_identity_hex(
+                       model_residency.binding().
+                           model_content_identity)
+                << "\",\n"
+                << "  \"execution_identity\": "
+                << compiled.execution_identity
+                << ",\n"
+                << "  \"runtime_compatibility_identity\": "
+                << identities.compatibility_identity
+                << ",\n"
+                << "  \"prefix_identity\": "
+                << prefix_cache.prefix().
+                       prefix_identity
+                << ",\n"
+                << "  \"prefix_tokens\": [";
+
+            for (std::size_t index = 0;
+                 index < options.tokens.size();
+                 ++index) {
+                if (index != 0) {
+                    std::cout << ',';
+                }
+                std::cout
+                    << options.tokens[index];
+            }
+
+            std::cout
+                << "],\n"
+                << "  \"baseline_generated_tokens\": [";
+            for (std::size_t index = 0;
+                 index <
+                    baseline.generated_tokens.size();
+                 ++index) {
+                if (index != 0) {
+                    std::cout << ',';
+                }
+                std::cout
+                    << baseline.generated_tokens[index];
+            }
+            std::cout
+                << "],\n"
+                << "  \"restored_generated_tokens\": [";
+            for (std::size_t index = 0;
+                 index <
+                    restored.generated_tokens.size();
+                 ++index) {
+                if (index != 0) {
+                    std::cout << ',';
+                }
+                std::cout
+                    << restored.generated_tokens[index];
+            }
+
+            std::cout
+                << "],\n"
+                << "  \"continuation_equivalent\": true,\n"
+                << "  \"mutated_position_before_restore\": "
+                << mutated_position
+                << ",\n"
+                << "  \"restored_prefix_position\": "
+                << options.tokens.size()
+                << ",\n"
+                << "  \"stop_reason\": \""
+                << stop_reason_name(
+                       restored.stop_reason)
+                << "\",\n"
+                << "  \"prefill_elapsed_ms\": "
+                << prefill_ms
+                << ",\n"
+                << "  \"baseline_continuation_elapsed_ms\": "
+                << baseline_ms
+                << ",\n"
+                << "  \"restore_elapsed_ms\": "
+                << restore_ms
+                << ",\n"
+                << "  \"restored_continuation_elapsed_ms\": "
+                << restored_ms
+                << "\n"
+                << "}\n";
+            return 0;
+        }
+
         HipSerialGreedyStepBackend backend(
             compiled,
             session,

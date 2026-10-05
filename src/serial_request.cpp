@@ -52,6 +52,98 @@ std::uint32_t select_greedy_token(
     return best;
 }
 
+SerialGreedyRequestResult execute_serial_greedy_continuation(
+    const SerialGreedyContinuationRequest& request,
+    SerialGreedyStepBackend& backend) {
+    if (request.vocab_size == 0 ||
+        request.vocab_size >
+            static_cast<std::uint64_t>(
+                std::numeric_limits<std::uint32_t>::max()) +
+                1ULL) {
+        throw std::invalid_argument(
+            "serial greedy continuation vocabulary size is invalid");
+    }
+    if (request.initial_logits.size() !=
+        static_cast<std::size_t>(
+            request.vocab_size)) {
+        throw std::invalid_argument(
+            "serial greedy continuation logits do not match vocabulary size");
+    }
+    if (request.context_capacity == 0 ||
+        request.start_position >
+            request.context_capacity) {
+        throw std::invalid_argument(
+            "serial greedy continuation position/capacity is invalid");
+    }
+    if (static_cast<std::uint64_t>(
+            request.eos_token_id) >=
+        request.vocab_size) {
+        throw std::invalid_argument(
+            "serial greedy continuation EOS token is outside vocabulary");
+    }
+
+    SerialGreedyRequestResult result;
+    result.final_position =
+        request.start_position;
+    std::vector<float> logits(
+        request.initial_logits.begin(),
+        request.initial_logits.end());
+
+    if (request.max_new_tokens == 0) {
+        return result;
+    }
+
+    std::uint64_t position =
+        request.start_position;
+    while (result.generated_tokens.size() <
+           request.max_new_tokens) {
+        const auto next =
+            select_greedy_token(
+                logits,
+                request.vocab_size);
+        result.generated_tokens.push_back(
+            next);
+
+        if (next ==
+            request.eos_token_id) {
+            result.stop_reason =
+                SerialRequestStopReason::eos;
+            result.final_position =
+                position;
+            return result;
+        }
+
+        if (position >=
+            request.context_capacity) {
+            result.stop_reason =
+                SerialRequestStopReason::context_capacity;
+            result.final_position =
+                position;
+            return result;
+        }
+
+        if (result.generated_tokens.size() >=
+            request.max_new_tokens) {
+            result.stop_reason =
+                SerialRequestStopReason::max_new_tokens;
+            result.final_position =
+                position;
+            return result;
+        }
+
+        logits =
+            backend.execute(
+                next,
+                position);
+        ++result.steps_executed;
+        ++position;
+        result.final_position =
+            position;
+    }
+
+    return result;
+}
+
 SerialGreedyRequestResult execute_serial_greedy_request(
     const SerialGreedyRequest& request,
     SerialGreedyStepBackend& backend) {
@@ -106,68 +198,27 @@ SerialGreedyRequestResult execute_serial_greedy_request(
         ++position;
     }
 
-    result.final_position =
+    SerialGreedyContinuationRequest continuation;
+    continuation.initial_logits =
+        logits;
+    continuation.start_position =
         position;
+    continuation.vocab_size =
+        request.vocab_size;
+    continuation.context_capacity =
+        request.context_capacity;
+    continuation.max_new_tokens =
+        request.max_new_tokens;
+    continuation.eos_token_id =
+        request.eos_token_id;
 
-    if (request.max_new_tokens == 0) {
-        result.stop_reason =
-            SerialRequestStopReason::
-                max_new_tokens;
-        return result;
-    }
-
-    while (result.generated_tokens.size() <
-           request.max_new_tokens) {
-        const auto next =
-            select_greedy_token(
-                logits,
-                request.vocab_size);
-        result.generated_tokens.push_back(
-            next);
-
-        if (next ==
-            request.eos_token_id) {
-            result.stop_reason =
-                SerialRequestStopReason::eos;
-            result.final_position =
-                position;
-            return result;
-        }
-
-        if (position >=
-            request.context_capacity) {
-            result.stop_reason =
-                SerialRequestStopReason::
-                    context_capacity;
-            result.final_position =
-                position;
-            return result;
-        }
-
-        if (result.generated_tokens.size() >=
-            request.max_new_tokens) {
-            result.stop_reason =
-                SerialRequestStopReason::
-                    max_new_tokens;
-            result.final_position =
-                position;
-            return result;
-        }
-
-        logits =
-            backend.execute(
-                next,
-                position);
-        ++result.steps_executed;
-        ++position;
-        result.final_position =
-            position;
-    }
-
-    result.stop_reason =
-        SerialRequestStopReason::
-            max_new_tokens;
-    return result;
+    auto generated =
+        execute_serial_greedy_continuation(
+            continuation,
+            backend);
+    generated.steps_executed +=
+        result.steps_executed;
+    return generated;
 }
 
 }  // namespace strix

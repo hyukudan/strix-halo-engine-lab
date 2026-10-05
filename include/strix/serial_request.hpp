@@ -28,6 +28,15 @@ struct SerialGreedyRequestResult {
         SerialRequestStopReason::max_new_tokens;
 };
 
+struct SerialGreedyContinuationRequest {
+    std::span<const float> initial_logits;
+    std::uint64_t start_position = 0;
+    std::uint64_t vocab_size = 0;
+    std::uint64_t context_capacity = 0;
+    std::uint64_t max_new_tokens = 0;
+    std::uint32_t eos_token_id = 0;
+};
+
 class SerialGreedyStepBackend {
 public:
     virtual ~SerialGreedyStepBackend() = default;
@@ -40,6 +49,10 @@ public:
 [[nodiscard]] std::uint32_t select_greedy_token(
     std::span<const float> logits,
     std::uint64_t vocab_size);
+
+[[nodiscard]] SerialGreedyRequestResult execute_serial_greedy_continuation(
+    const SerialGreedyContinuationRequest& request,
+    SerialGreedyStepBackend& backend);
 
 [[nodiscard]] SerialGreedyRequestResult execute_serial_greedy_request(
     const SerialGreedyRequest& request,

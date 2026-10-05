@@ -346,6 +346,7 @@ Implemented through an experimental C1/BF16 HIP path:
 - high-level prefix capture/restore operations now enforce that lifecycle before physical state transfer, preventing foreign or stale prefix metadata from reaching snapshot copy/restore;
 - a move-only serial prefix cache entry owns exact prefix metadata plus compact snapshot memory, captures directly from a ready prefilled session and restores only into identity-compatible sessions;
 - a HIP snapshot-transfer backend provides the physical device-to-device and host-to-host copy path needed by prefix cache capture/restore on native GPU sessions;
+- the HIP runner exposes a prefix-cache round-trip qualification mode that captures a prefilled prefix, mutates the live session through a full greedy continuation, restores the compact snapshot and requires the restored continuation to reproduce the same token sequence/stop result;
 - raw-token HIP runner that assembles GGUF manifest, selective residency, runtime memory, tensor access, dispatch and FP32 LM-head logits;
 - versioned independent multi-step replay fixture with checkpoint/vocabulary preflight;
 - replay qualification rejects non-finite or mis-sized logits, requires exact argmax when declared, enforces the requested logit-error policy and now binds evidence to the exact checkpoint, compiled execution and runtime compatibility identities being qualified;
@@ -354,7 +355,7 @@ Implemented through an experimental C1/BF16 HIP path:
 Still pending:
 
 - native Strix Halo build/run of the complete HIP path;
-- native Strix Halo qualification of complete-request greedy generation and prefix reuse against the canonical checkpoint/tokenizer contract;
+- execute the complete-request and prefix-cache round-trip gates on native Strix Halo against the canonical checkpoint/tokenizer contract;
 - asynchronous production PLE lookup/staging rather than the current file-backed seam;
 - promotion from experimental bindings only after native correctness and resource qualification.
 

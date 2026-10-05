@@ -189,6 +189,45 @@ int main() {
             "greedy request rejects non-finite logits before sampling");
     }
 
+    {
+        ScriptedBackend backend;
+        backend.outputs = {
+            logits(7, 6),
+        };
+
+        const auto initial =
+            logits(7, 4);
+        strix::SerialGreedyContinuationRequest continuation;
+        continuation.initial_logits =
+            initial;
+        continuation.start_position = 3;
+        continuation.vocab_size = 7;
+        continuation.context_capacity = 8;
+        continuation.max_new_tokens = 2;
+        continuation.eos_token_id = 6;
+
+        const auto result =
+            strix::execute_serial_greedy_continuation(
+                continuation,
+                backend);
+        expect(
+            result.generated_tokens ==
+                std::vector<std::uint32_t>({4, 6}),
+            "continuation samples directly from cached prefix logits");
+        expect(
+            backend.calls ==
+                std::vector<std::pair<std::uint32_t, std::uint64_t>>({
+                    {4, 3},
+                }),
+            "continuation skips prefix prefill and starts at restored position");
+        expect(
+            result.steps_executed == 1 &&
+                result.final_position == 4 &&
+                result.stop_reason ==
+                    strix::SerialRequestStopReason::eos,
+            "continuation tracks only post-prefix execution steps");
+    }
+
     if (failures == 0) {
         std::cout
             << "serial request tests passed\n";
