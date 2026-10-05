@@ -45,6 +45,20 @@ public:
     virtual void release_link_pool(
         const DirectTransportLease& lease) noexcept = 0;
 
+    [[nodiscard]] virtual TransferHandle prepare_send(
+        const TransferDescriptor& descriptor,
+        const TransportBufferView& payload);
+
+    [[nodiscard]] virtual TransferHandle prepare_receive(
+        const TransferDescriptor& descriptor,
+        const TransportBufferView& destination);
+
+    virtual void submit(
+        TransferHandle handle);
+
+    virtual void cancel(
+        TransferHandle handle);
+
     virtual void publish_gpu_commit(
         TransferHandle handle,
         const GpuCommitRecord& record) = 0;

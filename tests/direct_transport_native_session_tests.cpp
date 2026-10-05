@@ -51,6 +51,30 @@ public:
         ++releases;
     }
 
+    strix::transport::TransferHandle prepare_send(
+        const strix::transport::TransferDescriptor&,
+        const strix::transport::TransportBufferView&) override {
+        ++prepared_sends;
+        return next_handle++;
+    }
+
+    strix::transport::TransferHandle prepare_receive(
+        const strix::transport::TransferDescriptor&,
+        const strix::transport::TransportBufferView&) override {
+        ++prepared_receives;
+        return next_handle++;
+    }
+
+    void submit(
+        strix::transport::TransferHandle) override {
+        ++submits;
+    }
+
+    void cancel(
+        strix::transport::TransferHandle) override {
+        ++cancels;
+    }
+
     void publish_gpu_commit(
         strix::transport::TransferHandle,
         const strix::transport::GpuCommitRecord&) override {
@@ -80,11 +104,16 @@ public:
 
     int imports = 0;
     int releases = 0;
+    int prepared_sends = 0;
+    int prepared_receives = 0;
+    int submits = 0;
+    int cancels = 0;
     int commits = 0;
     int credits = 0;
     int reposts = 0;
     std::uint64_t imported_generation = 0;
     std::uint64_t released_generation = 0;
+    strix::transport::TransferHandle next_handle = 100;
     std::deque<strix::transport::DirectNativeEvent> events;
 };
 
@@ -160,6 +189,55 @@ int main() {
             "native link session acquires lease and imports exact pool generation");
 
         const auto desc = descriptor();
+
+        auto tx =
+            memory.links[0].tx;
+        tx.bytes = 512;
+        auto rx =
+            memory.links[0].rx;
+        rx.bytes = 512;
+
+        const auto prepared_send =
+            session.prepare_send(
+                desc,
+                tx);
+        const auto prepared_receive =
+            session.prepare_receive(
+                desc,
+                rx);
+        session.submit(
+            prepared_send);
+        session.submit(
+            prepared_receive);
+        expect(
+            backend.prepared_sends == 1 &&
+                backend.prepared_receives == 1 &&
+                backend.submits == 2,
+            "native session prepares/submits only leased TX/RX pool buffers");
+
+        bool foreign_buffer_rejected = false;
+        try {
+            auto foreign =
+                tx;
+            foreign.allocation_generation +=
+                99;
+            static_cast<void>(
+                session.prepare_send(
+                    desc,
+                    foreign));
+        } catch (const std::invalid_argument&) {
+            foreign_buffer_rejected = true;
+        }
+        expect(
+            foreign_buffer_rejected,
+            "native session rejects buffer from foreign pool generation");
+
+        session.cancel(
+            prepared_send);
+        expect(
+            backend.cancels == 1,
+            "native session exposes cancellation on current lease");
+
         session.register_receive(10, desc);
         session.register_send(20, desc);
 

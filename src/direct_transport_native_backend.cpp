@@ -4,6 +4,32 @@
 
 namespace strix::transport {
 
+TransferHandle DirectTransportNativeBackend::prepare_send(
+    const TransferDescriptor&,
+    const TransportBufferView&) {
+    throw std::logic_error(
+        "native direct backend does not implement send preparation");
+}
+
+TransferHandle DirectTransportNativeBackend::prepare_receive(
+    const TransferDescriptor&,
+    const TransportBufferView&) {
+    throw std::logic_error(
+        "native direct backend does not implement receive preparation");
+}
+
+void DirectTransportNativeBackend::submit(
+    TransferHandle) {
+    throw std::logic_error(
+        "native direct backend does not implement submission");
+}
+
+void DirectTransportNativeBackend::cancel(
+    TransferHandle) {
+    throw std::logic_error(
+        "native direct backend does not implement cancellation");
+}
+
 DirectNativeReadiness assess_direct_native_readiness(
     const BackendCapabilities& backend,
     const DirectNativeCapabilities& native) {

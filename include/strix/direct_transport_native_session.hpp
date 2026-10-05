@@ -37,6 +37,20 @@ public:
         return lease_;
     }
 
+    [[nodiscard]] TransferHandle prepare_receive(
+        const TransferDescriptor& descriptor,
+        const TransportBufferView& destination);
+
+    [[nodiscard]] TransferHandle prepare_send(
+        const TransferDescriptor& descriptor,
+        const TransportBufferView& payload);
+
+    void submit(
+        TransferHandle handle);
+
+    void cancel(
+        TransferHandle handle);
+
     void register_receive(
         TransferHandle handle,
         const TransferDescriptor& descriptor);

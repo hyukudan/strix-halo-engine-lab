@@ -114,6 +114,118 @@ void DirectTransportNativeLinkSession::require_current_lease() const {
     }
 }
 
+namespace {
+
+bool within_pool(
+    const TransportBufferView& buffer,
+    const TransportBufferView& pool,
+    std::uint64_t required_bytes,
+    bool receive) noexcept {
+    if (pool.address == 0 ||
+        pool.bytes == 0 ||
+        buffer.address < pool.address ||
+        buffer.allocation_generation == 0 ||
+        buffer.allocation_generation !=
+            pool.allocation_generation ||
+        buffer.domain !=
+            TransportMemoryDomain::gpu_transport_pool) {
+        return false;
+    }
+
+    const auto offset =
+        static_cast<std::uint64_t>(
+            buffer.address - pool.address);
+    if (offset > pool.bytes ||
+        buffer.bytes > pool.bytes - offset ||
+        required_bytes > buffer.bytes) {
+        return false;
+    }
+
+    return receive
+        ? validate_transport_receive_buffer(
+              buffer,
+              required_bytes)
+        : validate_transport_send_buffer(
+              buffer,
+              required_bytes);
+}
+
+}  // namespace
+
+TransferHandle DirectTransportNativeLinkSession::prepare_receive(
+    const TransferDescriptor& descriptor,
+    const TransportBufferView& destination) {
+    require_current_lease();
+    if (descriptor.connection_epoch !=
+            lease_.connection_epoch ||
+        lease_.link_index >=
+            pools_->links.size() ||
+        !within_pool(
+            destination,
+            pools_->links[lease_.link_index].rx,
+            descriptor.byte_length,
+            true)) {
+        throw std::invalid_argument(
+            "native receive buffer/descriptor is outside leased RX pool");
+    }
+
+    const auto handle =
+        backend_->prepare_receive(
+            descriptor,
+            destination);
+    register_receive(
+        handle,
+        descriptor);
+    return handle;
+}
+
+TransferHandle DirectTransportNativeLinkSession::prepare_send(
+    const TransferDescriptor& descriptor,
+    const TransportBufferView& payload) {
+    require_current_lease();
+    if (descriptor.connection_epoch !=
+            lease_.connection_epoch ||
+        lease_.link_index >=
+            pools_->links.size() ||
+        !within_pool(
+            payload,
+            pools_->links[lease_.link_index].tx,
+            descriptor.byte_length,
+            false)) {
+        throw std::invalid_argument(
+            "native send buffer/descriptor is outside leased TX pool");
+    }
+
+    const auto handle =
+        backend_->prepare_send(
+            descriptor,
+            payload);
+    register_send(
+        handle,
+        descriptor);
+    return handle;
+}
+
+void DirectTransportNativeLinkSession::submit(
+    TransferHandle handle) {
+    require_current_lease();
+    if (handle == 0) {
+        throw std::invalid_argument(
+            "native submit requires non-zero handle");
+    }
+    backend_->submit(handle);
+}
+
+void DirectTransportNativeLinkSession::cancel(
+    TransferHandle handle) {
+    require_current_lease();
+    if (handle == 0) {
+        throw std::invalid_argument(
+            "native cancel requires non-zero handle");
+    }
+    backend_->cancel(handle);
+}
+
 void DirectTransportNativeLinkSession::register_receive(
     TransferHandle handle,
     const TransferDescriptor& descriptor) {
