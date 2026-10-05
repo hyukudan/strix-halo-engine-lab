@@ -150,6 +150,24 @@ Still pending on the target hosts:
 - real single-link and dual-link topology qualification.
 
 
+## Slice A2.2 — dual-link USB4 runtime scheduler
+
+Initial host-side implementation:
+
+- directional link profiles allow different outbound/inbound performance on the same physical USB4 link;
+- live samples update payload rate, one-way latency and in-flight bytes with bounded EWMA;
+- flow-level affinity avoids unnecessary link flapping with explicit switch hysteresis;
+- new flows can move between links as directional telemetry changes;
+- large non-latency-critical messages reuse the existing complete-cost striping planner and stripe only when two qualified independent links beat the best single-link estimate;
+- physical-link health updates invalidate stale affinities, immediately downgrade striped traffic to the surviving link and allow explicit re-qualification/recovery for new flows.
+
+Still pending:
+
+- feed native USB4 completion/repost telemetry into the scheduler;
+- bind flow ids to distributed A2 request/boundary classes;
+- qualify 1× versus 2× USB4 on real dual-Strix hosts.
+
+
 ## Slice A1.0 — kernel registry and basic gfx1151 kernels
 
 Host-side registry implemented:
