@@ -258,6 +258,8 @@ Exit gate:
 
 The engine selects expert execution from measured route distributions and complete operator cost rather than row count alone.
 
+The MoE execution policy now has a complete-layer cost surface: routed direct/grouped estimates are combined with qualified shared-expert and combine costs, including the DAG's routed/shared parallel branch. This prevents selecting grouped routed execution when it does not improve end-to-end MoE layer latency.
+
 ### A1.4 — Sparse lookup path
 
 Status: **lookup planner and host benchmark harness implemented; native qualification pending**.

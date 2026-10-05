@@ -373,6 +373,73 @@ int main() {
     expect(nonfinite_cost_rejected,
            "MoE strategy selection rejects non-finite cost coefficients");
 
+    strix::MoeLayerExecutionCostModel layer_cost;
+    layer_cost.qualified = true;
+    layer_cost.routed = cost_model;
+    layer_cost.shared_expert_us = 20.0;
+    layer_cost.combine_us = 1.5;
+    layer_cost.routed_shared_parallel = true;
+
+    request.rows = 10;
+    request.experts_per_row = 2;
+    request.expert_count = 11;
+    request.packed_weight_bytes_per_expert = 1000;
+    request.selected_experts = reuse_routes;
+
+    const auto hidden_routed =
+        strix::select_moe_layer_execution_strategy(
+            request,
+            layer_cost);
+    expect(
+        hidden_routed.strategy ==
+                strix::MoeExpertExecutionStrategy::
+                    DirectAssignment &&
+            hidden_routed.direct_layer_estimated_us ==
+                21.5 &&
+            hidden_routed.grouped_layer_estimated_us ==
+                21.5,
+        "parallel shared expert can hide routed optimization and complete-layer tie stays direct");
+
+    layer_cost.shared_expert_us = 1.0;
+    const auto routed_dominant =
+        strix::select_moe_layer_execution_strategy(
+            request,
+            layer_cost);
+    expect(
+        routed_dominant.strategy ==
+                strix::MoeExpertExecutionStrategy::
+                    GroupedExpertMajor &&
+            routed_dominant.grouped_layer_estimated_us <
+                routed_dominant.direct_layer_estimated_us,
+        "complete-layer policy selects grouped routed experts only when end-to-end layer cost improves");
+
+    layer_cost.routed_shared_parallel = false;
+    const auto serial_branches =
+        strix::select_moe_layer_execution_strategy(
+            request,
+            layer_cost);
+    expect(
+        serial_branches.direct_layer_estimated_us >
+                serial_branches.routed.direct_estimated_us &&
+            serial_branches.grouped_layer_estimated_us >
+                serial_branches.routed.grouped_estimated_us,
+        "non-overlapped shared expert contributes explicitly to complete-layer cost");
+
+    bool unqualified_layer_rejected = false;
+    try {
+        auto invalid_layer = layer_cost;
+        invalid_layer.qualified = false;
+        static_cast<void>(
+            strix::select_moe_layer_execution_strategy(
+                request,
+                invalid_layer));
+    } catch (const std::invalid_argument&) {
+        unqualified_layer_rejected = true;
+    }
+    expect(
+        unqualified_layer_rejected,
+        "complete MoE layer selection rejects unqualified shared/combine evidence");
+
     bool duplicate_rejected = false;
     try {
         const std::vector<std::uint32_t> duplicate{1, 1};

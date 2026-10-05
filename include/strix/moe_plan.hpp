@@ -129,6 +129,28 @@ struct MoeExpertExecutionDecision {
     double mean_adjacent_row_overlap = 0.0;
 };
 
+struct MoeLayerExecutionCostModel {
+    // Complete-layer policy is disabled until routed, shared and combine
+    // measurements belong to one qualified target/runtime evidence set.
+    bool qualified = false;
+    MoeExpertExecutionCostModel routed;
+    double shared_expert_us = 0.0;
+    double combine_us = 0.0;
+    bool routed_shared_parallel = true;
+};
+
+struct MoeLayerExecutionDecision {
+    MoeExpertExecutionStrategy strategy =
+        MoeExpertExecutionStrategy::DirectAssignment;
+
+    MoeExpertExecutionDecision routed;
+    double shared_expert_us = 0.0;
+    double combine_us = 0.0;
+    double direct_layer_estimated_us = 0.0;
+    double grouped_layer_estimated_us = 0.0;
+    bool routed_shared_parallel = true;
+};
+
 struct MoeGroupingPlan {
     std::uint32_t expert_count = 0;
     std::uint64_t assignments = 0;
@@ -173,5 +195,9 @@ struct MoeGroupingPlan {
 [[nodiscard]] MoeExpertExecutionDecision select_moe_expert_execution_strategy(
     const MoeRouteRequest& request,
     const MoeExpertExecutionCostModel& cost_model);
+
+[[nodiscard]] MoeLayerExecutionDecision select_moe_layer_execution_strategy(
+    const MoeRouteRequest& request,
+    const MoeLayerExecutionCostModel& cost_model);
 
 }  // namespace strix

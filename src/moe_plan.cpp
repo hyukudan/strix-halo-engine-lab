@@ -640,4 +640,70 @@ MoeExpertExecutionDecision select_moe_expert_execution_strategy(
     return decision;
 }
 
+MoeLayerExecutionDecision select_moe_layer_execution_strategy(
+    const MoeRouteRequest& request,
+    const MoeLayerExecutionCostModel& cost_model) {
+    if (!cost_model.qualified ||
+        !cost_model.routed.qualified) {
+        throw std::invalid_argument(
+            "MoE layer cost model is not qualified");
+    }
+    if (!valid_cost_term(
+            cost_model.shared_expert_us) ||
+        !valid_cost_term(
+            cost_model.combine_us)) {
+        throw std::invalid_argument(
+            "MoE shared/combine costs must be finite and non-negative");
+    }
+
+    const auto routed =
+        select_moe_expert_execution_strategy(
+            request,
+            cost_model.routed);
+
+    const auto complete_cost =
+        [&](double routed_us) {
+            const double branches =
+                cost_model.routed_shared_parallel
+                    ? std::max(
+                          routed_us,
+                          cost_model.shared_expert_us)
+                    : routed_us +
+                          cost_model.shared_expert_us;
+            const double total =
+                branches +
+                cost_model.combine_us;
+            if (!std::isfinite(total)) {
+                throw std::overflow_error(
+                    "MoE complete-layer cost calculation overflow");
+            }
+            return total;
+        };
+
+    MoeLayerExecutionDecision decision;
+    decision.routed = routed;
+    decision.shared_expert_us =
+        cost_model.shared_expert_us;
+    decision.combine_us =
+        cost_model.combine_us;
+    decision.routed_shared_parallel =
+        cost_model.routed_shared_parallel;
+    decision.direct_layer_estimated_us =
+        complete_cost(
+            routed.direct_estimated_us);
+    decision.grouped_layer_estimated_us =
+        complete_cost(
+            routed.grouped_estimated_us);
+
+    // A complete-layer tie stays direct even if the routed branch alone
+    // would prefer grouping: no end-to-end gain means no extra complexity.
+    if (decision.grouped_layer_estimated_us <
+        decision.direct_layer_estimated_us) {
+        decision.strategy =
+            MoeExpertExecutionStrategy::
+                GroupedExpertMajor;
+    }
+    return decision;
+}
+
 }  // namespace strix
