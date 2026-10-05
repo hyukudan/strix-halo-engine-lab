@@ -32,6 +32,7 @@ add_library(strix_core STATIC
     src/distributed_remote_control.cpp
     src/distributed_control_wire.cpp
     src/distributed_control_server.cpp
+    src/distributed_control_receiver.cpp
     src/distributed_tcp_control_stream.cpp
     src/distributed_runtime.cpp
     src/distributed_session.cpp
@@ -412,6 +413,11 @@ if(BUILD_TESTING)
     target_link_libraries(strix-distributed-control-server-tests PRIVATE strix_core)
     strix_target_warnings(strix-distributed-control-server-tests)
     add_test(NAME strix-distributed-control-server-tests COMMAND strix-distributed-control-server-tests)
+
+    add_executable(strix-distributed-control-receiver-tests tests/distributed_control_receiver_tests.cpp)
+    target_link_libraries(strix-distributed-control-receiver-tests PRIVATE strix_core)
+    strix_target_warnings(strix-distributed-control-receiver-tests)
+    add_test(NAME strix-distributed-control-receiver-tests COMMAND strix-distributed-control-receiver-tests)
 
     add_executable(strix-distributed-tcp-control-stream-tests tests/distributed_tcp_control_stream_tests.cpp)
     target_link_libraries(strix-distributed-tcp-control-stream-tests PRIVATE strix_core)

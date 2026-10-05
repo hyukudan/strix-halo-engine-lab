@@ -531,7 +531,8 @@ Initial host-side implementation:
 - sequenced remote-step control now binds command/ACK to protocol, placement plan, request/generation, control sequence, step id/op and target node; stale, foreign or unsuccessful ACKs poison the controller, and boundary metadata is revalidated against the same request/epoch before forwarding;
 - a bounded little-endian control-wire codec now serializes/deserializes remote-step commands, ACKs and boundary metadata (including striped link slices) behind an abstract byte-stream, with explicit magic/version/type/length checks and configurable frame/slice limits;
 - a concrete POSIX TCP control byte-stream now owns connected sockets, supports connect/listen-once/adopt flows, disables Nagle on TCP peers, length-prefixes every framed message, retries interrupted I/O and rejects oversized lengths before allocation;
-- a bounded control server pump now inspects validated frame kinds, executes remote-step commands through a receiver handler and emits identity-mirroring success/failure ACKs, while boundary-transfer frames are delivered to the receiver-side metadata handler without ad-hoc decoding.
+- a bounded control server pump now inspects validated frame kinds, executes remote-step commands through a receiver handler and emits identity-mirroring success/failure ACKs, while boundary-transfer frames are delivered to the receiver-side metadata handler without ad-hoc decoding;
+- the receiver-side control handler now binds one global placement/request identity to an explicit physical receiver node, enforces monotonic remote-command sequence, validates target step ownership/op, queues only plan-owned boundaries addressed to that node, rejects duplicate pending boundary metadata and poisons itself on stale/foreign control input or local execution failure.
 
 Still pending:
 
