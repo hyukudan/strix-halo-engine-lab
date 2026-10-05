@@ -277,6 +277,7 @@ Routing foundation implemented:
 - dependency-free native qualification runner interleaves serial/hierarchical C1/C2/C4/C8 repetitions, rejects mismatched device/fixture/`gfx1151` metadata, gates correctness before timing and emits per-row median latency, resource metadata and speedup;
 - target-dimension Q8_0 routed-expert candidate using the real 2560-wide hidden input and 640-wide intermediate down input, with direct C1 assignment batches versus deterministic expert-major 8/4/2/1 grouped batches;
 - complete-layer MoE policy now incorporates measured shared-expert and combine cost, modeling routed/shared overlap and refusing grouped execution when a routed-only win is hidden by the shared branch;
+- a qualified whole-layer schedule materializes routed-expert, shared-expert and combine dependencies from that policy, including explicit parallel or serialized shared-branch execution and a stable runtime-bound schedule identity;
 - qualified complete-layer cost policies are sealed to the runtime-compatibility identity and a measurement-campaign identity; foreign runtimes or post-qualification coefficient mutation are rejected before schedule selection;
 - fixed-window route-trace aggregation now summarizes real selected-expert traces into distinct-expert histograms, overlap/reuse metrics and realizable direct/grouped packed-weight traffic for C1/C2/C4/C8 qualification;
 - packed Q8_0 scalars are decoded once per grouped kernel traversal and reused across active logical rows for gate/up and down projections, with CPU packed-weight reference, exact row restoration, modeled weight traffic and HIP-event timing;
@@ -412,6 +413,7 @@ Additional A1.6 runtime work now implemented:
 - replay evidence is bound to proposal identity, compiled plan identity, policy identity and independent-reference identity; evidence from another plan cannot qualify the current plan;
 - next-step MTP draft state is pinned as the post-block wide residual before final head collapse, with width `hc_count * hidden_size = 10240` for the target model;
 - concrete move-only MTP draft-state memory ownership now allocates and validates a proposal-identity-bound device buffer with explicit row count, element size, alignment and allocation generation;
+- a composed MTP forward contract validates cross-stage geometry and checkpoint/tensor/output bindings across input fusion, attention, wide draft state and final output, producing a relocation-stable composition identity while leaving numerical execution gated on replay/kernels;
 - the qualified MTP draft wrapper now requires that physical state binding and passes it to the forward/reconciliation backend, preventing model-backed proposal compute from running against absent or foreign draft-state storage;
 - memory admission accounts that draft state separately per session; the element size is an explicit planning input (2 bytes by default), not a resolved MTP dtype claim;
 - deterministic bounded prompt-lookup drafter using the most recent non-overlapping suffix n-gram match;
@@ -506,7 +508,8 @@ Architecture/core contract implemented from independent public transport evidenc
 - move-only direct-pool ownership now materializes each planned TX/RX GPU pool as an independently generated `gpu_transport_pool` binding, validates per-link alignment/size/domain and exposes a physical binding identity for pointer-stability/lease checks;
 - a portable exclusive-lease registry now binds one physical link to one pool-binding identity, connection epoch and link index at a time, rejecting duplicate acquisition, stale epochs and mutated lease tokens;
 - portable completion bridges now enforce the RX ownership chain (DMA complete → consumer acquire/own/release → repost pending → reusable) and separately track TX local reuse, transport ack and remote consumer-complete credit without conflating those milestones;
-- a repeated ring re-arm qualification gate now requires a fresh epoch plus the exact expected first descriptor/completion for every cycle before publishing `completion_rearm_qualified`.
+- a repeated ring re-arm qualification gate now requires a fresh epoch plus the exact expected first descriptor/completion for every cycle before publishing `completion_rearm_qualified`;
+- a native-direct backend contract separates capability proof from implementation and wires pool import, GPU commit publication, receive repost and typed native completion events into the existing lease/completion lifecycle with fail-closed validation.
 
 Still pending on native hosts:
 

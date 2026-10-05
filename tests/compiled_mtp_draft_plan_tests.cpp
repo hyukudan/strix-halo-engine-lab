@@ -100,8 +100,10 @@ int main() {
                plan.readiness.draft_state_semantics_resolved &&
                plan.readiness.output_mixer_semantics_resolved &&
                plan.readiness.output_head_binding_resolved &&
-               plan.readiness.output_semantics_resolved,
-           "compiled MTP plan resolves sidecar output head while remaining blocked on QSA/global forward");
+               plan.readiness.output_semantics_resolved &&
+               plan.forward.composition_resolved &&
+               plan.forward.contract_identity != 0,
+           "compiled MTP plan closes structural forward composition while remaining execution-gated");
 
     bool blocked = false;
     try {

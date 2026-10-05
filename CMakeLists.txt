@@ -26,6 +26,7 @@ add_library(strix_core STATIC
     src/compiled_speculation_backend.cpp
     src/dispatch_resources.cpp
     src/direct_transport_completion.cpp
+    src/direct_transport_native_backend.cpp
     src/direct_transport_frames.cpp
     src/direct_transport_lease.cpp
     src/direct_transport_pool.cpp
@@ -63,6 +64,7 @@ add_library(strix_core STATIC
     src/mtp_draft_activation.cpp
     src/mtp_draft_cycle_input.cpp
     src/mtp_forward_replay.cpp
+    src/mtp_forward_contract.cpp
     src/mtp_input_fusion.cpp
     src/mtp_output_contract.cpp
     src/mtp_attention_contract.cpp
@@ -72,6 +74,7 @@ add_library(strix_core STATIC
     src/model_runtime_binding.cpp
     src/model_tensor_index.cpp
     src/moe_plan.cpp
+    src/moe_layer_schedule.cpp
     src/oracles.cpp
     src/packed_projection.cpp
     src/recurrent_plan.cpp
@@ -198,6 +201,11 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-direct-transport-completion-tests)
     add_test(NAME strix-direct-transport-completion-tests COMMAND strix-direct-transport-completion-tests)
 
+    add_executable(strix-direct-transport-native-backend-tests tests/direct_transport_native_backend_tests.cpp)
+    target_link_libraries(strix-direct-transport-native-backend-tests PRIVATE strix_core)
+    strix_target_warnings(strix-direct-transport-native-backend-tests)
+    add_test(NAME strix-direct-transport-native-backend-tests COMMAND strix-direct-transport-native-backend-tests)
+
     add_executable(strix-direct-transport-rearm-tests tests/direct_transport_rearm_tests.cpp)
     target_link_libraries(strix-direct-transport-rearm-tests PRIVATE strix_core)
     strix_target_warnings(strix-direct-transport-rearm-tests)
@@ -246,6 +254,11 @@ if(BUILD_TESTING)
     target_link_libraries(strix-moe-plan-tests PRIVATE strix_core)
     strix_target_warnings(strix-moe-plan-tests)
     add_test(NAME strix-moe-plan-tests COMMAND strix-moe-plan-tests)
+
+    add_executable(strix-moe-layer-schedule-tests tests/moe_layer_schedule_tests.cpp)
+    target_link_libraries(strix-moe-layer-schedule-tests PRIVATE strix_core)
+    strix_target_warnings(strix-moe-layer-schedule-tests)
+    add_test(NAME strix-moe-layer-schedule-tests COMMAND strix-moe-layer-schedule-tests)
 
     add_executable(strix-sparse-lookup-tests tests/sparse_lookup_tests.cpp)
     target_link_libraries(strix-sparse-lookup-tests PRIVATE strix_core)
@@ -456,6 +469,11 @@ if(BUILD_TESTING)
     target_link_libraries(strix-mtp-forward-replay-tests PRIVATE strix_core)
     strix_target_warnings(strix-mtp-forward-replay-tests)
     add_test(NAME strix-mtp-forward-replay-tests COMMAND strix-mtp-forward-replay-tests)
+
+    add_executable(strix-mtp-forward-contract-tests tests/mtp_forward_contract_tests.cpp)
+    target_link_libraries(strix-mtp-forward-contract-tests PRIVATE strix_core)
+    strix_target_warnings(strix-mtp-forward-contract-tests)
+    add_test(NAME strix-mtp-forward-contract-tests COMMAND strix-mtp-forward-contract-tests)
 
     add_executable(strix-mtp-draft-readiness-tests tests/mtp_draft_readiness_tests.cpp)
     target_link_libraries(strix-mtp-draft-readiness-tests PRIVATE strix_core)
