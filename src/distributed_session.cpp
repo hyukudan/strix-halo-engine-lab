@@ -1,5 +1,6 @@
 #include "strix/distributed_session.hpp"
 
+#include <limits>
 #include <stdexcept>
 
 namespace strix {
