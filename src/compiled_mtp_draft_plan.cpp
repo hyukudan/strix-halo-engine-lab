@@ -76,7 +76,7 @@ void validate_structural_binding(
     }
 }
 
-std::uint64_t build_plan_identity(
+std::uint64_t build_plan_identity_internal(
     const CompiledMtpDraftPlan& plan) noexcept {
     std::uint64_t hash = fnv_offset;
     hash_u64(hash, plan.proposal_identity);
@@ -116,6 +116,13 @@ std::uint64_t build_plan_identity(
 }
 
 }  // namespace
+
+std::uint64_t
+recompute_compiled_mtp_draft_plan_identity(
+    const CompiledMtpDraftPlan& plan) noexcept {
+    return build_plan_identity_internal(
+        plan);
+}
 
 CompiledMtpDraftPlan
 compile_mtp_draft_plan(
@@ -183,7 +190,8 @@ compile_mtp_draft_plan(
     plan.executable =
         plan.readiness.executable;
     plan.plan_identity =
-        build_plan_identity(plan);
+        recompute_compiled_mtp_draft_plan_identity(
+            plan);
 
     if (plan.plan_identity == 0) {
         throw std::logic_error(
@@ -196,7 +204,10 @@ void require_executable_mtp_draft_plan(
     const CompiledMtpDraftPlan& plan) {
     if (plan.plan_identity == 0 ||
         plan.proposal_identity == 0 ||
-        plan.contract_identity == 0) {
+        plan.contract_identity == 0 ||
+        plan.plan_identity !=
+            recompute_compiled_mtp_draft_plan_identity(
+                plan)) {
         throw std::invalid_argument(
             "MTP draft plan is not initialized");
     }

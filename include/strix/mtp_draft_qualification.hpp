@@ -14,6 +14,7 @@ struct QualifiedMtpDraftPlan {
     MtpForwardReplayAssessment replay_assessment;
 
     std::uint64_t independent_reference_identity = 0;
+    std::uint64_t qualified_plan_identity = 0;
     std::uint64_t qualification_identity = 0;
     bool executable = false;
 };

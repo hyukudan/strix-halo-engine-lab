@@ -73,7 +73,10 @@ qualify_mtp_draft_plan(
     const MtpForwardReplayObservation& observation) {
     if (plan.plan_identity == 0 ||
         plan.proposal_identity == 0 ||
-        plan.contract_identity == 0) {
+        plan.contract_identity == 0 ||
+        plan.plan_identity !=
+            recompute_compiled_mtp_draft_plan_identity(
+                plan)) {
         throw std::invalid_argument(
             "MTP qualification requires an initialized compiled plan");
     }
@@ -98,6 +101,8 @@ qualify_mtp_draft_plan(
             observation);
     qualified.independent_reference_identity =
         observation.independent_reference_identity;
+    qualified.qualified_plan_identity =
+        plan.plan_identity;
 
     qualified.executable =
         qualified.replay_assessment.passes_declared_policy;
@@ -118,9 +123,18 @@ qualify_mtp_draft_plan(
 void require_qualified_mtp_draft_plan(
     const QualifiedMtpDraftPlan& plan) {
     if (plan.qualification_identity == 0 ||
-        plan.independent_reference_identity == 0) {
+        plan.independent_reference_identity == 0 ||
+        plan.qualified_plan_identity == 0) {
         throw std::invalid_argument(
             "MTP qualified plan is not initialized");
+    }
+    if (plan.base.plan_identity !=
+            plan.qualified_plan_identity ||
+        plan.base.plan_identity !=
+            recompute_compiled_mtp_draft_plan_identity(
+                plan.base)) {
+        throw std::logic_error(
+            "MTP qualified plan changed after replay qualification");
     }
     if (!plan.executable ||
         !plan.replay_assessment.passes_declared_policy) {

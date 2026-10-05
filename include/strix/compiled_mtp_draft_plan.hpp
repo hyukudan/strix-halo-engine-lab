@@ -46,6 +46,10 @@ struct CompiledMtpDraftPlan {
     bool executable = false;
 };
 
+[[nodiscard]] std::uint64_t
+recompute_compiled_mtp_draft_plan_identity(
+    const CompiledMtpDraftPlan& plan) noexcept;
+
 [[nodiscard]] CompiledMtpDraftPlan
 compile_mtp_draft_plan(
     const ModelContract& model,
