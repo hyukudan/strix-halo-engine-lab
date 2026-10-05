@@ -3,6 +3,8 @@
 #include "strix/model_contract.hpp"
 #include "strix/model_manifest.hpp"
 #include "strix/model_runtime_binding.hpp"
+#include "strix/execution_tensor_access.hpp"
+#include "strix/session_state_memory.hpp"
 #include "strix/sparse_lookup_executor.hpp"
 
 #include <array>
@@ -149,5 +151,42 @@ struct PleLookupSessionState {
     std::array<std::uint64_t, PleHashContract::maximum_heads> row_ids{};
     std::uint32_t row_count = 0;
 };
+
+struct PleLookupPrefetchState {
+    PleLookupHandle handle = 0;
+    std::uint64_t backend_identity = 0;
+    std::uint32_t input_token_id = 0;
+    std::uint64_t position = 0;
+    std::uint64_t lookup_bytes = 0;
+    PleHashResult hash;
+    bool active = false;
+};
+
+[[nodiscard]] std::uint64_t ple_hash_contract_identity(
+    const PleHashContract& contract) noexcept;
+
+void start_ple_lookup_prefetch(
+    const PleHashContract& contract,
+    std::uint32_t ple_step_id,
+    std::uint32_t input_token_id,
+    std::uint64_t position,
+    const ModelManifest& manifest,
+    const ModelRuntimeBinding& weights,
+    const ExecutionTensorAccessPlan& tensor_access,
+    const SerialSessionStateLayout& state_layout,
+    const SessionStateMemoryBinding& state_memory,
+    PleLookupBackend& backend,
+    PleLookupPrefetchState& prefetch);
+
+[[nodiscard]] PleHashResult finish_ple_lookup_prefetch(
+    std::uint32_t input_token_id,
+    std::uint64_t position,
+    PleLookupBackend& backend,
+    PleLookupPrefetchState& prefetch,
+    std::span<std::byte> destination);
+
+void cancel_ple_lookup_prefetch(
+    PleLookupBackend& backend,
+    PleLookupPrefetchState& prefetch) noexcept;
 
 }  // namespace strix

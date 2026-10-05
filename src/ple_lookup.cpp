@@ -253,6 +253,179 @@ PleHashResult hash_ple_token(
     return result;
 }
 
+std::uint64_t ple_hash_contract_identity(
+    const PleHashContract& contract) noexcept {
+    std::uint64_t hash = 14695981039346656037ULL;
+    const auto mix = [&](std::uint64_t value) {
+        for (unsigned shift = 0; shift < 64; shift += 8) {
+            hash ^= (value >> shift) & 0xffULL;
+            hash *= 1099511628211ULL;
+        }
+    };
+    mix(contract.ngram_size);
+    mix(contract.heads_per_ngram);
+    mix(contract.head_count);
+    mix(contract.head_dim);
+    mix(contract.eos_token_id);
+    mix(contract.row_bytes);
+    mix(contract.minimum_table_rows);
+    for (const auto value : contract.multipliers) mix(value);
+    for (const auto value : contract.head_offsets) mix(value);
+    for (const auto value : contract.head_vocab_sizes) mix(value);
+    return hash;
+}
+
+void start_ple_lookup_prefetch(
+    const PleHashContract& contract,
+    std::uint32_t ple_step_id,
+    std::uint32_t input_token_id,
+    std::uint64_t position,
+    const ModelManifest& manifest,
+    const ModelRuntimeBinding& weights,
+    const ExecutionTensorAccessPlan& tensor_access,
+    const SerialSessionStateLayout& state_layout,
+    const SessionStateMemoryBinding& state_memory,
+    PleLookupBackend& backend,
+    PleLookupPrefetchState& prefetch) {
+    if (prefetch.active) {
+        throw std::logic_error("PLE prefetch already active");
+    }
+    if (backend.implementation_identity() == 0 ||
+        ple_hash_contract_identity(contract) == 0) {
+        throw std::invalid_argument(
+            "PLE prefetch requires initialized backend/hash contract");
+    }
+
+    const auto* access =
+        find_execution_tensor_access(tensor_access, ple_step_id, 0);
+    if (access == nullptr ||
+        access->op != SerialOp::ple ||
+        access->tensor_indices.size() != 1) {
+        throw std::invalid_argument(
+            "PLE prefetch cannot resolve unique n-gram table");
+    }
+    const auto tensor_index = access->tensor_indices.front();
+    if (tensor_index >= manifest.tensors.size()) {
+        throw std::out_of_range(
+            "PLE prefetch table index exceeds manifest");
+    }
+    const auto* runtime =
+        find_runtime_tensor_binding(weights, tensor_index);
+    if (runtime == nullptr) {
+        throw std::invalid_argument(
+            "PLE prefetch table runtime binding is missing");
+    }
+
+    const auto ngram =
+        resolve_session_state(
+            state_layout,
+            state_memory,
+            SessionStateComponent::ngram_history);
+    const auto context_count =
+        static_cast<std::size_t>(contract.ngram_size - 1U);
+    if (ngram.storage != SessionStateStorage::host ||
+        ngram.address == 0 ||
+        ngram.bytes < context_count * sizeof(std::uint32_t)) {
+        throw std::invalid_argument(
+            "PLE prefetch requires host n-gram history");
+    }
+
+    std::array<
+        std::uint32_t,
+        PleHashContract::maximum_ngram - 1> previous{};
+    if (position == 0) {
+        std::fill_n(
+            previous.begin(),
+            context_count,
+            contract.eos_token_id);
+    } else {
+        std::memcpy(
+            previous.data(),
+            reinterpret_cast<const void*>(ngram.address),
+            context_count * sizeof(std::uint32_t));
+    }
+
+    const auto hashed =
+        hash_ple_token(
+            contract,
+            input_token_id,
+            std::span<const std::uint32_t>(
+                previous.data(), context_count));
+
+    PleLookupRequest request;
+    request.row_ids =
+        std::span<const std::uint64_t>(
+            hashed.row_ids.data(), hashed.row_count);
+    request.row_bytes = contract.row_bytes;
+    request.table_manifest = &manifest.tensors[tensor_index];
+    request.table_runtime = runtime;
+
+    const auto handle = backend.start(request);
+    if (handle == 0) {
+        throw std::runtime_error(
+            "PLE prefetch backend returned zero handle");
+    }
+    if (hashed.row_count != 0 &&
+        contract.row_bytes >
+            std::numeric_limits<std::uint64_t>::max() /
+                hashed.row_count) {
+        backend.cancel(handle);
+        throw std::overflow_error(
+            "PLE prefetch byte count overflow");
+    }
+
+    prefetch.handle = handle;
+    prefetch.backend_identity = backend.implementation_identity();
+    prefetch.input_token_id = input_token_id;
+    prefetch.position = position;
+    prefetch.lookup_bytes =
+        static_cast<std::uint64_t>(hashed.row_count) *
+        contract.row_bytes;
+    prefetch.hash = hashed;
+    prefetch.active = true;
+}
+
+PleHashResult finish_ple_lookup_prefetch(
+    std::uint32_t input_token_id,
+    std::uint64_t position,
+    PleLookupBackend& backend,
+    PleLookupPrefetchState& prefetch,
+    std::span<std::byte> destination) {
+    if (!prefetch.active ||
+        prefetch.handle == 0 ||
+        prefetch.backend_identity != backend.implementation_identity() ||
+        prefetch.input_token_id != input_token_id ||
+        prefetch.position != position ||
+        prefetch.lookup_bytes > destination.size()) {
+        throw std::invalid_argument(
+            "PLE prefetch does not match active token/backend");
+    }
+
+    const auto handle = prefetch.handle;
+    const auto hash = prefetch.hash;
+    try {
+        backend.finish(
+            handle,
+            destination.first(
+                static_cast<std::size_t>(prefetch.lookup_bytes)));
+    } catch (...) {
+        backend.cancel(handle);
+        prefetch = {};
+        throw;
+    }
+    prefetch = {};
+    return hash;
+}
+
+void cancel_ple_lookup_prefetch(
+    PleLookupBackend& backend,
+    PleLookupPrefetchState& prefetch) noexcept {
+    if (prefetch.active && prefetch.handle != 0) {
+        backend.cancel(prefetch.handle);
+    }
+    prefetch = {};
+}
+
 }  // namespace strix
 
 

@@ -20,6 +20,54 @@ void expect(bool condition, const char* message) {
     }
 }
 
+class PrefetchFixtureBackend final
+    : public strix::PleLookupBackend {
+public:
+    std::uint64_t implementation_identity()
+        const noexcept override {
+        return 0x5052464554434801ULL;
+    }
+
+    strix::PleLookupHandle start(
+        const strix::PleLookupRequest& request) override {
+        if (active_ ||
+            request.row_ids.empty() ||
+            request.row_bytes == 0) {
+            throw std::logic_error(
+                "invalid fixture prefetch start");
+        }
+        active_ = true;
+        bytes_ =
+            static_cast<std::uint64_t>(request.row_ids.size()) *
+            request.row_bytes;
+        return 9;
+    }
+
+    void finish(
+        strix::PleLookupHandle handle,
+        std::span<std::byte> destination) override {
+        if (!active_ || handle != 9 ||
+            destination.size() < bytes_) {
+            throw std::invalid_argument(
+                "fixture prefetch finish mismatch");
+        }
+        std::fill_n(
+            destination.begin(),
+            static_cast<std::size_t>(bytes_),
+            std::byte{0x2a});
+        active_ = false;
+    }
+
+    void cancel(
+        strix::PleLookupHandle handle) noexcept override {
+        if (handle == 9) active_ = false;
+    }
+
+private:
+    std::uint64_t bytes_ = 0;
+    bool active_ = false;
+};
+
 class MemoryIoSource final
     : public strix::SparseLookupIoSource {
 public:
@@ -422,6 +470,103 @@ int main() {
             concurrent_rejected,
             "planned PLE backend rejects overlapping lookup handles");
         backend.cancel(active);
+    }
+
+    {
+        strix::ModelManifest manifest;
+        manifest.architecture = "prefetch-fixture";
+        strix::ManifestTensor table;
+        table.name = "per_layer_token_embd.weight";
+        table.dimensions = {
+            contract.head_dim,
+            contract.minimum_table_rows,
+        };
+        table.ggml_type = 30;
+        table.byte_size =
+            contract.minimum_table_rows * contract.row_bytes;
+        table.role = strix::TensorRole::ngram_table;
+        manifest.tensors.push_back(table);
+        manifest.total_tensor_bytes = table.byte_size;
+        manifest.layout_identity =
+            strix::model_manifest_layout_identity(manifest);
+
+        strix::ModelRuntimeBinding weights;
+        weights.manifest_layout_identity =
+            manifest.layout_identity;
+        weights.model_content_identity.bytes[0] = 1;
+        strix::RuntimeTensorBinding runtime;
+        runtime.tensor_index = 0;
+        runtime.storage =
+            strix::RuntimeTensorStorage::file_mapped;
+        runtime.address = 1;
+        runtime.bytes = table.byte_size;
+        runtime.allocation_generation = 1;
+        weights.tensors.push_back(runtime);
+
+        strix::ExecutionTensorAccessPlan access;
+        access.manifest_layout_identity =
+            manifest.layout_identity;
+        access.plan_identity = 1;
+        strix::ExecutionTensorAccess table_access;
+        table_access.step_id = 3;
+        table_access.op = strix::SerialOp::ple;
+        table_access.binding_slot = 0;
+        table_access.tensor_indices = {0};
+        access.accesses.push_back(table_access);
+
+        strix::SerialSessionStateLayoutRequest layout_request;
+        layout_request.context_tokens = 8;
+        const auto layout =
+            strix::build_serial_session_state_layout(
+                model, layout_request);
+
+        std::vector<std::byte> host_state(
+            static_cast<std::size_t>(layout.host_total_bytes));
+        strix::SessionStateMemoryBinding memory;
+        memory.layout_identity = layout.layout_identity;
+        memory.host_base =
+            reinterpret_cast<std::uintptr_t>(host_state.data());
+        memory.host_bytes = layout.host_total_bytes;
+        memory.host_allocation_generation = 1;
+        memory.device_base =
+            static_cast<std::uintptr_t>(0x10000000ULL);
+        memory.device_bytes = layout.device_total_bytes;
+        memory.device_allocation_generation = 2;
+
+        PrefetchFixtureBackend backend;
+        strix::PleLookupPrefetchState prefetch;
+        strix::start_ple_lookup_prefetch(
+            contract, 3, 42, 0,
+            manifest, weights, access,
+            layout, memory, backend, prefetch);
+        expect(
+            prefetch.active &&
+                prefetch.input_token_id == 42 &&
+                prefetch.position == 0 &&
+                prefetch.lookup_bytes ==
+                    contract.head_count * contract.row_bytes,
+            "PLE prefetch starts lookup before PLE dispatch");
+
+        std::vector<std::byte> staging(
+            static_cast<std::size_t>(prefetch.lookup_bytes));
+        const auto prefetched_hash =
+            strix::finish_ple_lookup_prefetch(
+                42, 0, backend, prefetch, staging);
+        expect(
+            !prefetch.active &&
+                prefetched_hash.row_count == contract.head_count &&
+                staging.front() == std::byte{0x2a},
+            "PLE prefetch finish consumes exact token lookup handle");
+
+        strix::start_ple_lookup_prefetch(
+            contract, 3, 43, 0,
+            manifest, weights, access,
+            layout, memory, backend, prefetch);
+        strix::cancel_ple_lookup_prefetch(
+            backend, prefetch);
+        expect(
+            !prefetch.active,
+            "PLE prefetch cancellation clears backend lifecycle");
     }
 
     if (failures == 0) {
