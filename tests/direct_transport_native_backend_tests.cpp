@@ -55,6 +55,12 @@ public:
         ++commits;
     }
 
+    void publish_consumer_credit(
+        strix::transport::TransferHandle,
+        std::uint64_t) override {
+        ++credits;
+    }
+
     void repost_receive(
         strix::transport::TransferHandle) override {
         ++reposts;
@@ -73,6 +79,7 @@ public:
     int imports = 0;
     int releases = 0;
     int commits = 0;
+    int credits = 0;
     int reposts = 0;
     std::deque<strix::transport::DirectNativeEvent> events;
 };
@@ -142,6 +149,25 @@ int main() {
 
     receives.acquire_consumer(10);
     receives.release_consumer(10);
+    publish_direct_native_consumer_credit(
+        backend, receives, 10);
+    expect(
+        backend.credits == 1 &&
+            receives.state(10).consumer_credit_published,
+        "native consumer credit is emitted exactly after consumer release");
+
+    bool duplicate_credit_rejected = false;
+    try {
+        publish_direct_native_consumer_credit(
+            backend, receives, 10);
+    } catch (const std::logic_error&) {
+        duplicate_credit_rejected = true;
+    }
+    expect(
+        duplicate_credit_rejected &&
+            backend.credits == 1,
+        "duplicate remote consumer credit is rejected before backend call");
+
     repost_direct_native_receive(
         backend, receives, 10);
     expect(backend.reposts == 1 &&

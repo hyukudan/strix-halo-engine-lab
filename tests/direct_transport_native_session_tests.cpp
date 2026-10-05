@@ -57,6 +57,12 @@ public:
         ++commits;
     }
 
+    void publish_consumer_credit(
+        strix::transport::TransferHandle,
+        std::uint64_t) override {
+        ++credits;
+    }
+
     void repost_receive(
         strix::transport::TransferHandle) override {
         ++reposts;
@@ -75,6 +81,7 @@ public:
     int imports = 0;
     int releases = 0;
     int commits = 0;
+    int credits = 0;
     int reposts = 0;
     std::uint64_t imported_generation = 0;
     std::uint64_t released_generation = 0;
@@ -168,6 +175,12 @@ int main() {
 
         session.acquire_receive(10);
         session.release_receive(10);
+        session.publish_receive_credit(10);
+        expect(
+            backend.credits == 1 &&
+                session.receive_state(10).
+                    consumer_credit_published,
+            "session publishes remote consumer credit on current lease");
         session.repost_receive(10);
         expect(
             backend.reposts == 1 &&

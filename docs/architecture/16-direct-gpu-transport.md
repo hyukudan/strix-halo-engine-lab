@@ -416,3 +416,13 @@ A direct GPU transport tier becomes preferred only if:
 6. fallback remains available.
 
 A direct DMA path that wins only a transport microbenchmark MUST remain experimental.
+
+
+### Consumer credit publication
+
+Remote consumer credit publication is explicit and one-shot. A receive must
+reach `consumer_released` before the native session may emit the peer credit.
+The portable receive bridge records that publication and rejects duplicates.
+Receive repost remains a separate ownership transition and may proceed only
+after consumer release, keeping remote completion credit distinct from local
+RX buffer reuse.

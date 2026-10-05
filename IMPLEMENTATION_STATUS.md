@@ -572,6 +572,7 @@ Architecture/core contract implemented from independent public transport evidenc
 - a repeated ring re-arm qualification gate now requires a fresh epoch plus the exact expected first descriptor/completion for every cycle before publishing `completion_rearm_qualified`;
 - a native-direct backend contract separates capability proof from implementation and wires pool import, GPU commit publication, receive repost and typed native completion events into the existing lease/completion lifecycle with fail-closed validation;
 - a move-only native-link session now owns the exclusive lease/import lifetime and the send/receive completion bridges as one unit, revalidating lease/pool/link identity before commits, event polling and repost, and releasing the imported pool before dropping the lease.
+- remote consumer-complete credit is now an explicit one-shot receive-side operation: only consumer-released buffers may publish it, duplicate publication is rejected before the backend call, and the native-link session binds credit publication to the current lease before RX repost.
 
 Still pending on native hosts:
 
@@ -580,7 +581,6 @@ Still pending on native hosts:
 - concrete imported-pool backend implementation against the native kernel/UAPI;
 - native event-source implementation feeding the already-integrated session completion bridges;
 - target-qualified system-scope release/acquire commit primitive;
-- consumer-credit and RX-repost implementation;
 - native execution of the repeated ring stop/re-arm/first-completion gate against the real imported-ring backend;
 - 1×USB4 versus 2×USB4 completed-GPU-operation measurements;
 - independent-flow, directional, role-specialized and striped dual-link qualification.
