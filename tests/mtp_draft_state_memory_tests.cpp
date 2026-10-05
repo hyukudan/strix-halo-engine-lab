@@ -106,6 +106,8 @@ int main() {
                     proposal_identity ==
                     0x1234ULL &&
                 owner.binding().
+                    alignment == 256 &&
+                owner.binding().
                     device_base % 256ULL == 0 &&
                 owner.binding().
                     allocation_generation == 1,

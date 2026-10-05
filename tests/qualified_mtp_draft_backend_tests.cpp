@@ -25,6 +25,7 @@ struct FakeForward final
     propose_mtp_candidates(
         const strix::QualifiedMtpDraftPlan&,
         const strix::MtpDraftRuntimeBinding&,
+        const strix::MtpDraftStateMemoryBinding&,
         const strix::SerialSessionContext&,
         const strix::DraftProposalStateContext&,
         std::uint32_t) override {
@@ -35,6 +36,7 @@ struct FakeForward final
     void reconcile_mtp_after_target(
         const strix::QualifiedMtpDraftPlan&,
         const strix::MtpDraftRuntimeBinding&,
+        const strix::MtpDraftStateMemoryBinding&,
         const strix::DraftProposalStateContext&,
         const strix::SerialSessionContext&,
         std::span<const std::uint32_t>) override {
@@ -48,6 +50,10 @@ strix::QualifiedMtpDraftPlan qualified_plan() {
     plan.base.plan_identity = 0x2222ULL;
     plan.base.contract_identity = 0x3333ULL;
     plan.base.structural.vocab_size = 100;
+    plan.base.state.hidden_size = 2560;
+    plan.base.state.hc_count = 4;
+    plan.base.state.state_width = 10240;
+    plan.base.state.one_state_row_per_request = true;
     plan.replay_policy.policy_identity = 0x4444ULL;
     plan.replay_assessment.passes_declared_policy = true;
     plan.independent_reference_identity = 0x5555ULL;
@@ -66,6 +72,36 @@ strix::MtpDraftRuntimeBinding binding() {
     return value;
 }
 
+strix::MtpDraftStateMemoryBinding state_memory() {
+    strix::MtpDraftStateMemoryBinding value;
+    value.proposal_identity = 0x1111ULL;
+    value.state_width = 10240;
+    value.rows = 1;
+    value.element_bytes = 2;
+    value.alignment = 256;
+    value.device_base =
+        static_cast<std::uintptr_t>(
+            0x60000000ULL);
+    value.bytes = 10240ULL * 2ULL;
+    value.allocation_generation = 1;
+
+    strix::MtpDraftStateContract contract;
+    contract.hidden_size = 2560;
+    contract.hc_count = 4;
+    contract.state_width = 10240;
+    contract.one_state_row_per_request = true;
+    const auto plan =
+        strix::plan_mtp_draft_state_memory(
+            value.proposal_identity,
+            contract,
+            value.rows,
+            value.element_bytes,
+            value.alignment);
+    value.plan_identity =
+        plan.plan_identity;
+    return value;
+}
+
 strix::SerialSessionContext target_session() {
     strix::SerialSessionContext session;
     session.runtime_compatibility_identity = 0xaaaaULL;
@@ -80,6 +116,7 @@ strix::SerialSessionContext target_session() {
 int main() {
     auto plan = qualified_plan();
     auto draft_binding = binding();
+    auto draft_state_memory = state_memory();
     auto target = target_session();
 
     auto proposal_state =
@@ -91,6 +128,7 @@ int main() {
     strix::QualifiedMtpDraftBackend backend(
         plan,
         draft_binding,
+        draft_state_memory,
         forward);
 
     const auto tokens =
@@ -136,6 +174,24 @@ int main() {
                forward.proposal_calls == 1,
            "MTP wrapper rejects proposal state from another plan");
 
+    auto wrong_memory =
+        draft_state_memory;
+    ++wrong_memory.proposal_identity;
+    bool memory_rejected = false;
+    try {
+        strix::QualifiedMtpDraftBackend invalid_memory(
+            plan,
+            draft_binding,
+            wrong_memory,
+            forward);
+        static_cast<void>(invalid_memory);
+    } catch (const std::invalid_argument&) {
+        memory_rejected = true;
+    }
+    expect(
+        memory_rejected,
+        "qualified MTP wrapper rejects draft-state storage from another proposal");
+
     auto unqualified = plan;
     unqualified.executable = false;
     unqualified.replay_assessment.passes_declared_policy = false;
@@ -144,6 +200,7 @@ int main() {
         strix::QualifiedMtpDraftBackend invalid(
             unqualified,
             draft_binding,
+            draft_state_memory,
             forward);
         static_cast<void>(invalid);
     } catch (const std::logic_error&) {
@@ -157,6 +214,7 @@ int main() {
     strix::QualifiedMtpDraftBackend bad_backend(
         plan,
         draft_binding,
+        draft_state_memory,
         bad_forward);
     bool vocab_rejected = false;
     try {

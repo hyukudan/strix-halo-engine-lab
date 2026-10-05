@@ -7,9 +7,11 @@ namespace strix {
 QualifiedMtpDraftBackend::QualifiedMtpDraftBackend(
     const QualifiedMtpDraftPlan& qualified_plan,
     const MtpDraftRuntimeBinding& binding,
+    const MtpDraftStateMemoryBinding& state_memory,
     QualifiedMtpForwardBackend& backend)
     : qualified_plan_(qualified_plan),
       binding_(binding),
+      state_memory_(state_memory),
       backend_(backend) {
     require_qualified_mtp_draft_plan(
         qualified_plan_);
@@ -20,6 +22,17 @@ QualifiedMtpDraftBackend::QualifiedMtpDraftBackend(
         throw std::invalid_argument(
             "qualified MTP plan does not match draft runtime binding");
     }
+
+    const auto memory_plan =
+        plan_mtp_draft_state_memory(
+            binding_.compatibility_identity,
+            qualified_plan_.base.state,
+            state_memory_.rows,
+            state_memory_.element_bytes,
+            state_memory_.alignment);
+    validate_mtp_draft_state_memory_binding(
+        memory_plan,
+        state_memory_);
 }
 
 void QualifiedMtpDraftBackend::validate_request(
@@ -57,6 +70,7 @@ QualifiedMtpDraftBackend::propose_candidates(
         backend_.propose_mtp_candidates(
             qualified_plan_,
             binding_,
+            state_memory_,
             target_session,
             proposal_state,
             max_candidate_depth);
@@ -89,6 +103,7 @@ void QualifiedMtpDraftBackend::reconcile_after_target(
     backend_.reconcile_mtp_after_target(
         qualified_plan_,
         binding_,
+        state_memory_,
         proposal_state,
         target_session,
         emitted_tokens);

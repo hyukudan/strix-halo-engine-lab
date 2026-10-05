@@ -2,6 +2,7 @@
 
 #include "strix/mtp_draft_binding.hpp"
 #include "strix/mtp_draft_qualification.hpp"
+#include "strix/mtp_draft_state_memory.hpp"
 #include "strix/speculation_executor.hpp"
 
 #include <cstdint>
@@ -18,6 +19,7 @@ public:
     propose_mtp_candidates(
         const QualifiedMtpDraftPlan& qualified_plan,
         const MtpDraftRuntimeBinding& binding,
+        const MtpDraftStateMemoryBinding& state_memory,
         const SerialSessionContext& target_session,
         const DraftProposalStateContext& proposal_state,
         std::uint32_t max_candidate_depth) = 0;
@@ -25,6 +27,7 @@ public:
     virtual void reconcile_mtp_after_target(
         const QualifiedMtpDraftPlan& qualified_plan,
         const MtpDraftRuntimeBinding& binding,
+        const MtpDraftStateMemoryBinding& state_memory,
         const DraftProposalStateContext& proposal_state,
         const SerialSessionContext& target_session,
         std::span<const std::uint32_t> emitted_tokens) = 0;
@@ -36,6 +39,7 @@ public:
     QualifiedMtpDraftBackend(
         const QualifiedMtpDraftPlan& qualified_plan,
         const MtpDraftRuntimeBinding& binding,
+        const MtpDraftStateMemoryBinding& state_memory,
         QualifiedMtpForwardBackend& backend);
 
     [[nodiscard]] std::vector<std::uint32_t>
@@ -56,6 +60,7 @@ private:
 
     const QualifiedMtpDraftPlan& qualified_plan_;
     const MtpDraftRuntimeBinding& binding_;
+    const MtpDraftStateMemoryBinding& state_memory_;
     QualifiedMtpForwardBackend& backend_;
 };
 

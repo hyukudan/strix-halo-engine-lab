@@ -103,6 +103,8 @@ void validate_mtp_draft_state_memory_binding(
         binding.rows != plan.rows ||
         binding.element_bytes !=
             plan.element_bytes ||
+        binding.alignment !=
+            plan.alignment ||
         binding.device_base == 0 ||
         binding.bytes !=
             plan.total_bytes ||
@@ -164,6 +166,8 @@ MtpDraftStateMemoryOwner::allocate(
         plan.rows;
     owner.binding_.element_bytes =
         plan.element_bytes;
+    owner.binding_.alignment =
+        plan.alignment;
     owner.binding_.bytes =
         plan.total_bytes;
     owner.binding_.allocation_generation =

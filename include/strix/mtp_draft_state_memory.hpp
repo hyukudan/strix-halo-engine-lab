@@ -23,6 +23,7 @@ struct MtpDraftStateMemoryBinding {
     std::uint64_t state_width = 0;
     std::uint64_t rows = 0;
     std::uint64_t element_bytes = 0;
+    std::uint64_t alignment = 0;
     std::uintptr_t device_base = 0;
     std::uint64_t bytes = 0;
     std::uint64_t allocation_generation = 0;

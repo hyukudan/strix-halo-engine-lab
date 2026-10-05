@@ -409,6 +409,7 @@ Additional A1.6 runtime work now implemented:
 - replay evidence is bound to proposal identity, compiled plan identity, policy identity and independent-reference identity; evidence from another plan cannot qualify the current plan;
 - next-step MTP draft state is pinned as the post-block wide residual before final head collapse, with width `hc_count * hidden_size = 10240` for the target model;
 - concrete move-only MTP draft-state memory ownership now allocates and validates a proposal-identity-bound device buffer with explicit row count, element size, alignment and allocation generation;
+- the qualified MTP draft wrapper now requires that physical state binding and passes it to the forward/reconciliation backend, preventing model-backed proposal compute from running against absent or foreign draft-state storage;
 - memory admission accounts that draft state separately per session; the element size is an explicit planning input (2 bytes by default), not a resolved MTP dtype claim;
 - deterministic bounded prompt-lookup drafter using the most recent non-overlapping suffix n-gram match;
 - prompt-lookup history has an explicit token-capacity bound and proposal identity;
