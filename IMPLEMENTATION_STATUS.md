@@ -489,6 +489,25 @@ Still pending:
 - first real token/logit replay against the canonical checkpoint/reference implementation;
 - tokenizer/chat-template integration after raw token-id replay is correct.
 
+## Slice A2.1 — two-node partition search
+
+Initial host-side implementation:
+
+- candidate evaluation separates capacity and latency objectives;
+- capacity feasibility is checked per-node rather than by total parameter balance;
+- latency estimates use critical-path compute plus uncovered communication and control cost;
+- synchronization count is reported but is not an automatic rejection criterion;
+- search requires at least one whole-layer baseline while allowing finer operator-level latency candidates;
+- capacity selection minimizes maximum per-node weight footprint with imbalance/token-time tie breakers;
+- latency selection requires an explicit minimum improvement over the measured local serial baseline.
+
+Still pending:
+
+- generate candidate costs from measured per-operator/native timing and planned A2.0 boundaries;
+- canonical two-Strix memory budgets and transport measurements;
+- native validation of the selected capacity and latency candidates.
+
+
 ## Slice A0.7b — direct GPU DMA transport contract
 
 Architecture/core contract implemented from independent public transport evidence:
