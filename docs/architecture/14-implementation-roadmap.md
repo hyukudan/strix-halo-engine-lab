@@ -378,13 +378,16 @@ Synchronization count alone MUST NOT reject a candidate.
 
 ### A2.2 — Dual-link USB4 scheduler
 
-Enable:
+Status: **directional live-metric scheduler implemented; native telemetry qualification pending**.
 
-- independent physical links;
-- directional assignment;
-- flow-level assignment;
-- large-message striping;
-- live link metrics.
+The runtime scheduler maintains separate outbound/inbound profiles for each physical link, updates rate/latency/queue pressure from live samples, preserves flow affinity with switch hysteresis, and reuses the existing complete-cost transfer planner for large-message striping. Small or latency-critical traffic remains on one link, while bulk messages stripe only when two explicitly independent qualified links beat the best single-link estimate.
+
+Next:
+
+- feed native completion/repost measurements into live profiles;
+- map distributed A2 boundary classes to stable flow ids and priorities;
+- validate link failure downgrade/recovery;
+- qualify 1× versus 2× USB4 on the real two-Strix topology.
 
 Exit gate:
 
