@@ -335,16 +335,17 @@ Speculative greedy output matches the serial contract and improves completed-tok
 
 ### A2.0 — Distributed placement executor
 
-Activate the placement fields already present in `ModelManifest`.
+Status: **host placement/boundary planner implemented; remote execution backend pending**.
 
-Implement:
+The placement planner now consumes the compiled serial DAG, exact tensor-access plan and manifest placement. Each step receives a deterministic owner node; tensor-free continuation inherits a single dependency owner where possible, mixed-node tensor requirements fail closed, and every cross-node dependency edge becomes a stable boundary with exact activation bytes derived from the compiled arena. Boundary descriptors bind placement-plan identity, request/generation/sequence and dtype. Runtime selection uses the distributed path only when every required remote node is available; local fallback requires an explicit local model copy rather than silently ignoring remote placement.
 
-- remote tensor boundary;
-- node identity;
-- generation/sequence safety;
-- control/data-plane separation;
-- one-link transport backend;
-- deterministic fallback.
+Implement next:
+
+- remote execution backend for planned boundaries;
+- node/session control-plane reconciliation;
+- one-link data-plane integration;
+- per-request generation/sequence validation at receive;
+- native two-node replay and deterministic fallback qualification.
 
 Exit gate:
 
