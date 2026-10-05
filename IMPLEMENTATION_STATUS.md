@@ -503,7 +503,8 @@ Architecture/core contract implemented from independent public transport evidenc
 - dual-link direct DMA is defined as two independent physical transports with separate TX/RX pools, epochs and leases;
 - move-only direct-pool ownership now materializes each planned TX/RX GPU pool as an independently generated `gpu_transport_pool` binding, validates per-link alignment/size/domain and exposes a physical binding identity for pointer-stability/lease checks;
 - a portable exclusive-lease registry now binds one physical link to one pool-binding identity, connection epoch and link index at a time, rejecting duplicate acquisition, stale epochs and mutated lease tokens;
-- portable completion bridges now enforce the RX ownership chain (DMA complete → consumer acquire/own/release → repost pending → reusable) and separately track TX local reuse, transport ack and remote consumer-complete credit without conflating those milestones.
+- portable completion bridges now enforce the RX ownership chain (DMA complete → consumer acquire/own/release → repost pending → reusable) and separately track TX local reuse, transport ack and remote consumer-complete credit without conflating those milestones;
+- a repeated ring re-arm qualification gate now requires a fresh epoch plus the exact expected first descriptor/completion for every cycle before publishing `completion_rearm_qualified`.
 
 Still pending on native hosts:
 
@@ -513,6 +514,6 @@ Still pending on native hosts:
 - native backend/event-source integration with the portable completion bridges;
 - target-qualified system-scope release/acquire commit primitive;
 - consumer-credit and RX-repost implementation;
-- repeated ring stop/re-arm/first-completion gate;
+- native execution of the repeated ring stop/re-arm/first-completion gate against the real imported-ring backend;
 - 1×USB4 versus 2×USB4 completed-GPU-operation measurements;
 - independent-flow, directional, role-specialized and striped dual-link qualification.
