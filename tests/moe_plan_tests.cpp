@@ -490,6 +490,64 @@ int main() {
         mutated_policy_rejected,
         "MoE qualification identity rejects post-qualification cost mutation");
 
+    const std::vector<std::uint32_t> trace_routes{
+        // Window 0: strong reuse on expert 0.
+        0, 1,
+        0, 2,
+        0, 3,
+        0, 4,
+        // Window 1: all assignments unique.
+        0, 1,
+        2, 3,
+        4, 5,
+        6, 7,
+    };
+    strix::MoeRouteTraceRequest trace_request;
+    trace_request.window_rows = 4;
+    trace_request.experts_per_row = 2;
+    trace_request.expert_count = 8;
+    trace_request.packed_weight_bytes_per_expert = 1000;
+    trace_request.selected_experts =
+        trace_routes;
+
+    const auto trace =
+        strix::summarize_moe_route_trace(
+            trace_request);
+    expect(
+        trace.windows == 2 &&
+            trace.logical_rows == 8 &&
+            trace.assignments == 16 &&
+            trace.windows_with_grouped_savings == 1,
+        "MoE route trace summarizes fixed C4 windows");
+    expect(
+        trace.direct_weight_bytes == 16'000 &&
+            trace.grouped_weight_bytes == 13'000 &&
+            trace.grouped_weight_bytes_saved == 3'000,
+        "MoE route trace accumulates realizable grouped weight savings");
+    expect(
+        trace.maximum_distinct_experts == 8 &&
+            trace.mean_distinct_experts == 6.5 &&
+            trace.distinct_expert_histogram[5] == 1 &&
+            trace.distinct_expert_histogram[8] == 1,
+        "MoE route trace exposes distinct-expert distribution across windows");
+
+    bool partial_trace_rejected = false;
+    try {
+        auto partial_trace = trace_request;
+        partial_trace.selected_experts =
+            std::span<const std::uint32_t>(
+                trace_routes.data(),
+                trace_routes.size() - 1U);
+        static_cast<void>(
+            strix::summarize_moe_route_trace(
+                partial_trace));
+    } catch (const std::invalid_argument&) {
+        partial_trace_rejected = true;
+    }
+    expect(
+        partial_trace_rejected,
+        "MoE route trace rejects partial row-class windows");
+
     bool duplicate_rejected = false;
     try {
         const std::vector<std::uint32_t> duplicate{1, 1};

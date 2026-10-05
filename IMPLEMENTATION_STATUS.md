@@ -278,6 +278,7 @@ Routing foundation implemented:
 - target-dimension Q8_0 routed-expert candidate using the real 2560-wide hidden input and 640-wide intermediate down input, with direct C1 assignment batches versus deterministic expert-major 8/4/2/1 grouped batches;
 - complete-layer MoE policy now incorporates measured shared-expert and combine cost, modeling routed/shared overlap and refusing grouped execution when a routed-only win is hidden by the shared branch;
 - qualified complete-layer cost policies are sealed to the runtime-compatibility identity and a measurement-campaign identity; foreign runtimes or post-qualification coefficient mutation are rejected before schedule selection;
+- fixed-window route-trace aggregation now summarizes real selected-expert traces into distinct-expert histograms, overlap/reuse metrics and realizable direct/grouped packed-weight traffic for C1/C2/C4/C8 qualification;
 - packed Q8_0 scalars are decoded once per grouped kernel traversal and reused across active logical rows for gate/up and down projections, with CPU packed-weight reference, exact row restoration, modeled weight traffic and HIP-event timing;
 - dependency-free `lab/moe_q8_0/qualify.py` gate for C1/C2/C4/C8 validates fixture/device/geometry parity, modeled byte accounting and numerical error before summarizing direct-versus-grouped medians;
 - standalone FP32 expert-execution correctness harness;
@@ -291,7 +292,7 @@ Still pending:
 - native Strix Halo build/profile and C1/C2/C4/C8 qualification of the target-dimension Q8_0 direct/grouped expert candidate;
 - shared-expert integration;
 - target-native calibration of routed/shared/combine cost coefficients;
-- route-distribution qualification on the canonical checkpoint.
+- run the new fixed-window route-trace summary on canonical checkpoint traces for C1/C2/C4/C8 and feed the measured distributions into qualification.
 
 
 MoE format constraint discovered:

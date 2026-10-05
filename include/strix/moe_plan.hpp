@@ -158,6 +158,33 @@ struct MoeQualifiedLayerPolicy {
     MoeLayerExecutionCostModel cost_model;
 };
 
+struct MoeRouteTraceRequest {
+    std::uint32_t window_rows = 0;
+    std::uint32_t experts_per_row = 0;
+    std::uint32_t expert_count = 0;
+    std::uint64_t packed_weight_bytes_per_expert = 0;
+    std::span<const std::uint32_t> selected_experts;
+};
+
+struct MoeRouteTraceSummary {
+    std::uint64_t windows = 0;
+    std::uint64_t logical_rows = 0;
+    std::uint64_t assignments = 0;
+    std::uint64_t windows_with_grouped_savings = 0;
+
+    std::uint64_t direct_weight_bytes = 0;
+    std::uint64_t grouped_weight_bytes = 0;
+    std::uint64_t grouped_weight_bytes_saved = 0;
+
+    std::uint32_t maximum_distinct_experts = 0;
+    double mean_distinct_experts = 0.0;
+    double mean_maximum_rows_per_expert = 0.0;
+    double mean_adjacent_row_overlap = 0.0;
+
+    // Index is the number of distinct experts observed in one window.
+    std::vector<std::uint64_t> distinct_expert_histogram;
+};
+
 struct MoeGroupingPlan {
     std::uint32_t expert_count = 0;
     std::uint64_t assignments = 0;
@@ -195,6 +222,9 @@ struct MoeGroupingPlan {
 
 [[nodiscard]] MoeGroupingPlan build_moe_grouping_plan(
     const MoeRouteRequest& request);
+
+[[nodiscard]] MoeRouteTraceSummary summarize_moe_route_trace(
+    const MoeRouteTraceRequest& request);
 
 [[nodiscard]] MoeExpertExecutionPlan build_moe_expert_execution_plan(
     const MoeRouteRequest& request);

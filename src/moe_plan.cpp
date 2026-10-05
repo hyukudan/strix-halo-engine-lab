@@ -13,6 +13,17 @@
 namespace strix {
 namespace {
 
+std::uint64_t checked_add(
+    std::uint64_t left,
+    std::uint64_t right) {
+    if (right >
+        std::numeric_limits<std::uint64_t>::max() - left) {
+        throw std::overflow_error(
+            "MoE route addition overflow");
+    }
+    return left + right;
+}
+
 std::uint64_t checked_mul(std::uint64_t left, std::uint64_t right) {
     if (left != 0 &&
         right > std::numeric_limits<std::uint64_t>::max() / left) {
@@ -637,6 +648,134 @@ double checked_execution_cost(
 }
 
 }  // namespace
+
+MoeRouteTraceSummary summarize_moe_route_trace(
+    const MoeRouteTraceRequest& request) {
+    if (request.window_rows == 0 ||
+        request.experts_per_row == 0 ||
+        request.expert_count == 0 ||
+        request.packed_weight_bytes_per_expert == 0) {
+        throw std::invalid_argument(
+            "MoE route trace dimensions/weight bytes must be non-zero");
+    }
+
+    const auto assignments_per_window =
+        checked_mul(
+            request.window_rows,
+            request.experts_per_row);
+    if (assignments_per_window == 0 ||
+        request.selected_experts.empty() ||
+        request.selected_experts.size() %
+                assignments_per_window !=
+            0) {
+        throw std::invalid_argument(
+            "MoE route trace must contain complete fixed-size windows");
+    }
+
+    MoeRouteTraceSummary summary;
+    summary.windows =
+        static_cast<std::uint64_t>(
+            request.selected_experts.size()) /
+        assignments_per_window;
+    summary.logical_rows =
+        checked_mul(
+            summary.windows,
+            request.window_rows);
+    summary.assignments =
+        static_cast<std::uint64_t>(
+            request.selected_experts.size());
+    summary.distinct_expert_histogram.assign(
+        static_cast<std::size_t>(
+            request.expert_count) +
+            1U,
+        0);
+
+    long double distinct_sum = 0.0L;
+    long double maximum_rows_sum = 0.0L;
+    long double overlap_sum = 0.0L;
+
+    for (std::uint64_t window = 0;
+         window < summary.windows;
+         ++window) {
+        const auto offset =
+            checked_mul(
+                window,
+                assignments_per_window);
+        const auto count =
+            static_cast<std::size_t>(
+                assignments_per_window);
+
+        MoeRouteRequest current;
+        current.rows =
+            request.window_rows;
+        current.experts_per_row =
+            request.experts_per_row;
+        current.expert_count =
+            request.expert_count;
+        current.packed_weight_bytes_per_expert =
+            request.packed_weight_bytes_per_expert;
+        current.selected_experts =
+            request.selected_experts.subspan(
+                static_cast<std::size_t>(
+                    offset),
+                count);
+
+        const auto route =
+            build_moe_route_plan(
+                current);
+        const auto execution =
+            build_moe_expert_execution_plan_from_route(
+                current,
+                route);
+
+        summary.direct_weight_bytes =
+            checked_add(
+                summary.direct_weight_bytes,
+                execution.direct_weight_bytes);
+        summary.grouped_weight_bytes =
+            checked_add(
+                summary.grouped_weight_bytes,
+                execution.grouped_weight_bytes);
+        summary.grouped_weight_bytes_saved =
+            checked_add(
+                summary.grouped_weight_bytes_saved,
+                execution.grouped_weight_bytes_saved);
+        if (execution.grouped_weight_bytes_saved != 0) {
+            ++summary.windows_with_grouped_savings;
+        }
+
+        summary.maximum_distinct_experts =
+            std::max(
+                summary.maximum_distinct_experts,
+                route.distinct_experts);
+        ++summary.distinct_expert_histogram[
+            route.distinct_experts];
+
+        distinct_sum +=
+            route.distinct_experts;
+        maximum_rows_sum +=
+            route.maximum_rows_per_expert;
+        overlap_sum +=
+            route.mean_adjacent_row_overlap;
+    }
+
+    const auto denominator =
+        static_cast<long double>(
+            summary.windows);
+    summary.mean_distinct_experts =
+        static_cast<double>(
+            distinct_sum /
+            denominator);
+    summary.mean_maximum_rows_per_expert =
+        static_cast<double>(
+            maximum_rows_sum /
+            denominator);
+    summary.mean_adjacent_row_overlap =
+        static_cast<double>(
+            overlap_sum /
+            denominator);
+    return summary;
+}
 
 MoeExpertExecutionPlan build_moe_expert_execution_plan(
     const MoeRouteRequest& request) {
