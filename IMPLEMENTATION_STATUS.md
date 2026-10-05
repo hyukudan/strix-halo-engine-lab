@@ -489,6 +489,25 @@ Still pending:
 - first real token/logit replay against the canonical checkpoint/reference implementation;
 - tokenizer/chat-template integration after raw token-id replay is correct.
 
+## Slice A2.0 — distributed placement executor
+
+Initial host-side implementation:
+
+- compiled serial steps are assigned to a node from the exact tensor-access plan and manifest placement;
+- tensor-free steps inherit a single dependency node when unambiguous, avoiding artificial boundaries;
+- cross-node dependency edges produce stable boundary identities and exact activation payload bytes from arena allocations;
+- plans fail closed on mixed-node tensor requirements inside one execution step;
+- deterministic execution-mode selection requires all remote nodes or an explicit local-model-copy fallback;
+- boundary transfer descriptors bind placement-plan identity, request/generation/sequence, boundary identity, dtype and exact payload bytes.
+
+Still pending:
+
+- remote execution backend that consumes these boundary descriptors;
+- control-plane node/session reconciliation and per-request generation ownership;
+- one-link data-plane integration with the direct/native transport backend;
+- native two-node numerical replay and failure/fallback qualification.
+
+
 ## Slice A0.7b — direct GPU DMA transport contract
 
 Architecture/core contract implemented from independent public transport evidence:
