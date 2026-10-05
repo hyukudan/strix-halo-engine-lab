@@ -352,29 +352,19 @@ A two-node execution crosses a planned tensor boundary and preserves the qualifi
 
 ### A2.1 — Two-node partition search
 
-Evaluate partition candidates by:
+Status: **host candidate evaluator implemented; measured candidate generation pending**.
 
-- memory saved per node;
-- bytes transferred per token;
-- synchronization count;
-- compute balance;
-- transport overlap.
+The search now treats capacity and latency as separate objectives. Per-node memory budgets gate feasibility, while token latency is estimated from critical-path compute plus uncovered communication and control cost. Synchronization count is retained as evidence rather than used as an automatic veto. Every comparison requires at least one whole-layer/block baseline, but operator-level candidates may win the latency objective. Capacity selection minimizes the largest node footprint (then imbalance and token cost); latency selection requires an explicit improvement threshold over the measured local serial baseline.
 
-Do not select by parameter balance alone.
+Next:
+
+- derive candidate costs from A2.0 boundaries and native per-operator timing;
+- feed measured one-link/dual-link communication exposure rather than ideal bandwidth;
+- evaluate canonical whole-layer and finer operator splits on the two Strix hosts.
 
 Exit gate:
 
 At least one useful two-node placement is identified or the evidence shows that the tested partition is not worthwhile.
-
-The evaluation MUST distinguish:
-
-- a capacity-oriented whole-layer/block baseline;
-- latency candidates that may use finer tensor/operator partitioning;
-- critical-path compute saved;
-- uncovered communication;
-- synchronization/control cost.
-
-Synchronization count alone MUST NOT reject a candidate.
 
 ### A2.2 — Dual-link USB4 scheduler
 
