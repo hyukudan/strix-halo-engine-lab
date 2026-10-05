@@ -159,12 +159,13 @@ Initial host-side implementation:
 - flow-level affinity avoids unnecessary link flapping with explicit switch hysteresis;
 - new flows can move between links as directional telemetry changes;
 - large non-latency-critical messages reuse the existing complete-cost striping planner and stripe only when two qualified independent links beat the best single-link estimate;
-- physical-link health updates invalidate stale affinities, immediately downgrade striped traffic to the surviving link and allow explicit re-qualification/recovery for new flows.
+- physical-link health updates invalidate stale affinities, immediately downgrade striped traffic to the surviving link and allow explicit re-qualification/recovery for new flows;
+- a completion telemetry bridge now tracks per-handle submit time/link/direction and converts receive-ready, remote-consumer-complete and receive-reposted milestones into directional scheduler observations without inventing native timestamps.
 - distributed placement boundaries now map to stable plan-bound flow ids, direction and size-class priority, so A2 traffic can feed the dual-link scheduler without ad-hoc caller identities.
 
 Still pending:
 
-- feed native USB4 completion/repost telemetry into the scheduler;
+- feed real native USB4 timestamps into the new completion-to-scheduler telemetry bridge;
 - qualify 1× versus 2× USB4 on real dual-Strix hosts.
 
 

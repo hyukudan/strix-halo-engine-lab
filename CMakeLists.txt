@@ -39,6 +39,7 @@ add_library(strix_core STATIC
     src/direct_transport_pool_memory.cpp
     src/direct_transport_rearm.cpp
     src/dual_link_runtime.cpp
+    src/dual_link_telemetry.cpp
     src/draft_proposal_state.cpp
     src/execution_arena.cpp
     src/execution_binding.cpp
@@ -231,6 +232,11 @@ if(BUILD_TESTING)
     target_link_libraries(strix-dual-link-runtime-tests PRIVATE strix_core)
     strix_target_warnings(strix-dual-link-runtime-tests)
     add_test(NAME strix-dual-link-runtime-tests COMMAND strix-dual-link-runtime-tests)
+
+    add_executable(strix-dual-link-telemetry-tests tests/dual_link_telemetry_tests.cpp)
+    target_link_libraries(strix-dual-link-telemetry-tests PRIVATE strix_core)
+    strix_target_warnings(strix-dual-link-telemetry-tests)
+    add_test(NAME strix-dual-link-telemetry-tests COMMAND strix-dual-link-telemetry-tests)
 
     add_executable(strix-kernel-registry-tests tests/kernel_registry_tests.cpp)
     target_link_libraries(strix-kernel-registry-tests PRIVATE strix_core)
