@@ -151,6 +151,13 @@ struct MoeLayerExecutionDecision {
     bool routed_shared_parallel = true;
 };
 
+struct MoeQualifiedLayerPolicy {
+    std::uint64_t runtime_compatibility_identity = 0;
+    std::uint64_t measurement_identity = 0;
+    std::uint64_t qualification_identity = 0;
+    MoeLayerExecutionCostModel cost_model;
+};
+
 struct MoeGroupingPlan {
     std::uint32_t expert_count = 0;
     std::uint64_t assignments = 0;
@@ -199,5 +206,16 @@ struct MoeGroupingPlan {
 [[nodiscard]] MoeLayerExecutionDecision select_moe_layer_execution_strategy(
     const MoeRouteRequest& request,
     const MoeLayerExecutionCostModel& cost_model);
+
+[[nodiscard]] MoeQualifiedLayerPolicy bind_moe_layer_cost_model(
+    std::uint64_t runtime_compatibility_identity,
+    std::uint64_t measurement_identity,
+    const MoeLayerExecutionCostModel& cost_model);
+
+[[nodiscard]] MoeLayerExecutionDecision
+select_qualified_moe_layer_execution_strategy(
+    const MoeRouteRequest& request,
+    std::uint64_t active_runtime_compatibility_identity,
+    const MoeQualifiedLayerPolicy& policy);
 
 }  // namespace strix

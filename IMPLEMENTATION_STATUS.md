@@ -277,6 +277,7 @@ Routing foundation implemented:
 - dependency-free native qualification runner interleaves serial/hierarchical C1/C2/C4/C8 repetitions, rejects mismatched device/fixture/`gfx1151` metadata, gates correctness before timing and emits per-row median latency, resource metadata and speedup;
 - target-dimension Q8_0 routed-expert candidate using the real 2560-wide hidden input and 640-wide intermediate down input, with direct C1 assignment batches versus deterministic expert-major 8/4/2/1 grouped batches;
 - complete-layer MoE policy now incorporates measured shared-expert and combine cost, modeling routed/shared overlap and refusing grouped execution when a routed-only win is hidden by the shared branch;
+- qualified complete-layer cost policies are sealed to the runtime-compatibility identity and a measurement-campaign identity; foreign runtimes or post-qualification coefficient mutation are rejected before schedule selection;
 - packed Q8_0 scalars are decoded once per grouped kernel traversal and reused across active logical rows for gate/up and down projections, with CPU packed-weight reference, exact row restoration, modeled weight traffic and HIP-event timing;
 - dependency-free `lab/moe_q8_0/qualify.py` gate for C1/C2/C4/C8 validates fixture/device/geometry parity, modeled byte accounting and numerical error before summarizing direct-versus-grouped medians;
 - standalone FP32 expert-execution correctness harness;

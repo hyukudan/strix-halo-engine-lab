@@ -3,6 +3,7 @@
 #include "strix/gguf_reader.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <limits>
 #include <numeric>
@@ -551,6 +552,71 @@ bool valid_cost_term(double value) {
     return std::isfinite(value) && value >= 0.0;
 }
 
+void validate_layer_cost_model(
+    const MoeLayerExecutionCostModel& cost_model) {
+    if (!cost_model.qualified ||
+        !cost_model.routed.qualified) {
+        throw std::invalid_argument(
+            "MoE layer cost model is not qualified");
+    }
+    if (!valid_cost_term(cost_model.routed.direct_fixed_us) ||
+        !valid_cost_term(cost_model.routed.direct_per_assignment_us) ||
+        !valid_cost_term(cost_model.routed.direct_weight_byte_us) ||
+        !valid_cost_term(cost_model.routed.grouped_fixed_us) ||
+        !valid_cost_term(cost_model.routed.grouped_per_batch_us) ||
+        !valid_cost_term(cost_model.routed.grouped_weight_byte_us) ||
+        !valid_cost_term(cost_model.routed.grouped_restore_per_assignment_us) ||
+        !valid_cost_term(cost_model.shared_expert_us) ||
+        !valid_cost_term(cost_model.combine_us)) {
+        throw std::invalid_argument(
+            "MoE layer cost terms must be finite and non-negative");
+    }
+}
+
+constexpr std::uint64_t moe_policy_fnv_offset =
+    14695981039346656037ULL;
+constexpr std::uint64_t moe_policy_fnv_prime =
+    1099511628211ULL;
+
+void hash_policy_u64(
+    std::uint64_t& hash,
+    std::uint64_t value) noexcept {
+    for (unsigned shift = 0; shift < 64; shift += 8) {
+        hash ^= (value >> shift) & 0xffULL;
+        hash *= moe_policy_fnv_prime;
+    }
+}
+
+void hash_policy_double(
+    std::uint64_t& hash,
+    double value) noexcept {
+    hash_policy_u64(
+        hash,
+        std::bit_cast<std::uint64_t>(value));
+}
+
+std::uint64_t build_moe_policy_identity(
+    std::uint64_t runtime_identity,
+    std::uint64_t measurement_identity,
+    const MoeLayerExecutionCostModel& model) noexcept {
+    std::uint64_t hash = moe_policy_fnv_offset;
+    hash_policy_u64(hash, runtime_identity);
+    hash_policy_u64(hash, measurement_identity);
+    hash_policy_double(hash, model.routed.direct_fixed_us);
+    hash_policy_double(hash, model.routed.direct_per_assignment_us);
+    hash_policy_double(hash, model.routed.direct_weight_byte_us);
+    hash_policy_double(hash, model.routed.grouped_fixed_us);
+    hash_policy_double(hash, model.routed.grouped_per_batch_us);
+    hash_policy_double(hash, model.routed.grouped_weight_byte_us);
+    hash_policy_double(hash, model.routed.grouped_restore_per_assignment_us);
+    hash_policy_double(hash, model.shared_expert_us);
+    hash_policy_double(hash, model.combine_us);
+    hash_policy_u64(
+        hash,
+        model.routed_shared_parallel ? 1ULL : 0ULL);
+    return hash;
+}
+
 double checked_execution_cost(
     double fixed_us,
     std::uint64_t work_items,
@@ -643,18 +709,8 @@ MoeExpertExecutionDecision select_moe_expert_execution_strategy(
 MoeLayerExecutionDecision select_moe_layer_execution_strategy(
     const MoeRouteRequest& request,
     const MoeLayerExecutionCostModel& cost_model) {
-    if (!cost_model.qualified ||
-        !cost_model.routed.qualified) {
-        throw std::invalid_argument(
-            "MoE layer cost model is not qualified");
-    }
-    if (!valid_cost_term(
-            cost_model.shared_expert_us) ||
-        !valid_cost_term(
-            cost_model.combine_us)) {
-        throw std::invalid_argument(
-            "MoE shared/combine costs must be finite and non-negative");
-    }
+    validate_layer_cost_model(
+        cost_model);
 
     const auto routed =
         select_moe_expert_execution_strategy(
@@ -704,6 +760,69 @@ MoeLayerExecutionDecision select_moe_layer_execution_strategy(
                 GroupedExpertMajor;
     }
     return decision;
+}
+
+MoeQualifiedLayerPolicy bind_moe_layer_cost_model(
+    std::uint64_t runtime_compatibility_identity,
+    std::uint64_t measurement_identity,
+    const MoeLayerExecutionCostModel& cost_model) {
+    if (runtime_compatibility_identity == 0 ||
+        measurement_identity == 0) {
+        throw std::invalid_argument(
+            "MoE qualified layer policy requires runtime and measurement identities");
+    }
+    validate_layer_cost_model(
+        cost_model);
+
+    MoeQualifiedLayerPolicy policy;
+    policy.runtime_compatibility_identity =
+        runtime_compatibility_identity;
+    policy.measurement_identity =
+        measurement_identity;
+    policy.cost_model =
+        cost_model;
+    policy.qualification_identity =
+        build_moe_policy_identity(
+            runtime_compatibility_identity,
+            measurement_identity,
+            cost_model);
+    if (policy.qualification_identity == 0) {
+        throw std::logic_error(
+            "MoE layer qualification identity must be non-zero");
+    }
+    return policy;
+}
+
+MoeLayerExecutionDecision
+select_qualified_moe_layer_execution_strategy(
+    const MoeRouteRequest& request,
+    std::uint64_t active_runtime_compatibility_identity,
+    const MoeQualifiedLayerPolicy& policy) {
+    if (active_runtime_compatibility_identity == 0 ||
+        policy.runtime_compatibility_identity !=
+            active_runtime_compatibility_identity ||
+        policy.measurement_identity == 0 ||
+        policy.qualification_identity == 0) {
+        throw std::invalid_argument(
+            "MoE qualified layer policy does not match active runtime");
+    }
+
+    validate_layer_cost_model(
+        policy.cost_model);
+    const auto expected_identity =
+        build_moe_policy_identity(
+            policy.runtime_compatibility_identity,
+            policy.measurement_identity,
+            policy.cost_model);
+    if (expected_identity !=
+        policy.qualification_identity) {
+        throw std::invalid_argument(
+            "MoE qualified layer policy identity is stale or mutated");
+    }
+
+    return select_moe_layer_execution_strategy(
+        request,
+        policy.cost_model);
 }
 
 }  // namespace strix

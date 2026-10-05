@@ -440,6 +440,56 @@ int main() {
         unqualified_layer_rejected,
         "complete MoE layer selection rejects unqualified shared/combine evidence");
 
+    layer_cost.routed_shared_parallel = true;
+    layer_cost.shared_expert_us = 1.0;
+    const auto qualified_policy =
+        strix::bind_moe_layer_cost_model(
+            0xabcULL,
+            0xdefULL,
+            layer_cost);
+    const auto qualified_decision =
+        strix::select_qualified_moe_layer_execution_strategy(
+            request,
+            0xabcULL,
+            qualified_policy);
+    expect(
+        qualified_policy.qualification_identity != 0 &&
+            qualified_decision.strategy ==
+                strix::MoeExpertExecutionStrategy::
+                    GroupedExpertMajor,
+        "MoE measured layer policy is bound to active runtime identity");
+
+    bool foreign_runtime_rejected = false;
+    try {
+        static_cast<void>(
+            strix::select_qualified_moe_layer_execution_strategy(
+                request,
+                0xabdULL,
+                qualified_policy));
+    } catch (const std::invalid_argument&) {
+        foreign_runtime_rejected = true;
+    }
+    expect(
+        foreign_runtime_rejected,
+        "MoE layer policy cannot be reused by a different runtime identity");
+
+    auto mutated_policy =
+        qualified_policy;
+    mutated_policy.cost_model.combine_us += 0.25;
+    bool mutated_policy_rejected = false;
+    try {
+        static_cast<void>(
+            strix::select_qualified_moe_layer_execution_strategy(
+                request,
+                0xabcULL,
+                mutated_policy));
+    } catch (const std::invalid_argument&) {
+        mutated_policy_rejected = true;
+    }
+    expect(
+        mutated_policy_rejected,
+        "MoE qualification identity rejects post-qualification cost mutation");
+
     bool duplicate_rejected = false;
     try {
         const std::vector<std::uint32_t> duplicate{1, 1};
