@@ -223,6 +223,19 @@ SingleLinkNativeDistributedBackend::receive_boundary(
         session,
         handle);
 
+    const auto commit =
+        session.read_commit(
+            handle,
+            transfer.descriptor);
+    if (commit.stripe_count != 1 ||
+        commit.stripe_index != 0 ||
+        static_cast<std::uint64_t>(
+            commit.payload_bytes) !=
+            transfer.descriptor.byte_length) {
+        throw std::runtime_error(
+            "single-link native receive commit is not a complete one-stripe payload");
+    }
+
     session.acquire_receive(handle);
     staging_->consume_inbound(
         boundary,

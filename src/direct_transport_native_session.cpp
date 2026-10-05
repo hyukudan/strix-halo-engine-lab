@@ -356,6 +356,29 @@ void DirectTransportNativeLinkSession::publish_commit(
         record);
 }
 
+GpuCommitRecord DirectTransportNativeLinkSession::read_commit(
+    TransferHandle handle,
+    const TransferDescriptor& descriptor) {
+    require_current_lease();
+    if (handle == 0 ||
+        descriptor.connection_epoch !=
+            lease_.connection_epoch) {
+        throw std::invalid_argument(
+            "native commit readback requires current handle/epoch");
+    }
+
+    const auto record =
+        backend_->read_gpu_commit(
+            handle);
+    if (!validate_gpu_commit_record(
+            record,
+            descriptor)) {
+        throw std::runtime_error(
+            "native GPU commit readback does not match transfer descriptor");
+    }
+    return record;
+}
+
 bool DirectTransportNativeLinkSession::poll_event() {
     require_current_lease();
 

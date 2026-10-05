@@ -88,6 +88,10 @@ public:
         const TransferDescriptor& descriptor,
         const GpuCommitRecord& record);
 
+    [[nodiscard]] GpuCommitRecord read_commit(
+        TransferHandle handle,
+        const TransferDescriptor& descriptor);
+
     [[nodiscard]] bool poll_event();
 
     [[nodiscard]] const DirectReceiveCompletionState&

@@ -30,6 +30,12 @@ void DirectTransportNativeBackend::cancel(
         "native direct backend does not implement cancellation");
 }
 
+GpuCommitRecord DirectTransportNativeBackend::read_gpu_commit(
+    TransferHandle) {
+    throw std::logic_error(
+        "native direct backend does not implement GPU commit readback");
+}
+
 DirectNativeReadiness assess_direct_native_readiness(
     const BackendCapabilities& backend,
     const DirectNativeCapabilities& native) {

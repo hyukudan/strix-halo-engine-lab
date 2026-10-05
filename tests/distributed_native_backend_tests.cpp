@@ -61,6 +61,10 @@ public:
         const strix::transport::TransportBufferView&) override {
         const auto handle = next_handle++;
         receives.push_back({handle,descriptor.byte_length});
+        receive_descriptors.push_back({
+            handle,
+            descriptor,
+        });
         return handle;
     }
 
@@ -94,6 +98,32 @@ public:
         ++commits;
     }
 
+    strix::transport::GpuCommitRecord read_gpu_commit(
+        strix::transport::TransferHandle handle) override {
+        for (const auto& item : receive_descriptors) {
+            if (item.first != handle) {
+                continue;
+            }
+            strix::transport::GpuCommitRecord record;
+            record.protocol_version =
+                item.second.protocol_version;
+            record.commit_word =
+                strix::transport::gpu_commit_word;
+            record.connection_epoch =
+                item.second.connection_epoch;
+            record.sequence =
+                item.second.sequence;
+            record.payload_bytes =
+                static_cast<std::uint32_t>(
+                    item.second.byte_length);
+            record.stripe_index = 0;
+            record.stripe_count = 1;
+            return record;
+        }
+        throw std::invalid_argument(
+            "unknown receive handle commit");
+    }
+
     void publish_consumer_credit(
         strix::transport::TransferHandle,
         std::uint64_t) override {
@@ -125,6 +155,10 @@ public:
     int credits = 0;
     std::vector<std::pair<std::uint64_t,std::uint64_t>> sends;
     std::vector<std::pair<std::uint64_t,std::uint64_t>> receives;
+    std::vector<std::pair<
+        std::uint64_t,
+        strix::transport::TransferDescriptor>>
+        receive_descriptors;
     std::deque<strix::transport::DirectNativeEvent> events;
 };
 

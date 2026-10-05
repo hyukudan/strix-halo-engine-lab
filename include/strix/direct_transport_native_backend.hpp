@@ -65,6 +65,9 @@ public:
         TransferHandle handle,
         const GpuCommitRecord& record) = 0;
 
+    [[nodiscard]] virtual GpuCommitRecord read_gpu_commit(
+        TransferHandle handle);
+
     virtual void publish_consumer_credit(
         TransferHandle handle,
         std::uint64_t bytes) = 0;
