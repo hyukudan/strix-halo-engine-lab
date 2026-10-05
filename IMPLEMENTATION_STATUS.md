@@ -160,11 +160,11 @@ Initial host-side implementation:
 - new flows can move between links as directional telemetry changes;
 - large non-latency-critical messages reuse the existing complete-cost striping planner and stripe only when two qualified independent links beat the best single-link estimate;
 - physical-link health updates invalidate stale affinities, immediately downgrade striped traffic to the surviving link and allow explicit re-qualification/recovery for new flows.
+- distributed placement boundaries now map to stable plan-bound flow ids, direction and size-class priority, so A2 traffic can feed the dual-link scheduler without ad-hoc caller identities.
 
 Still pending:
 
 - feed native USB4 completion/repost telemetry into the scheduler;
-- bind flow ids to distributed A2 request/boundary classes;
 - qualify 1× versus 2× USB4 on real dual-Strix hosts.
 
 

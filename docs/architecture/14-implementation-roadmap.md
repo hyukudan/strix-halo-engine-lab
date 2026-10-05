@@ -371,12 +371,11 @@ At least one useful two-node placement is identified or the evidence shows that 
 
 Status: **directional live-metric scheduler with failover/recovery implemented; native telemetry qualification pending**.
 
-The runtime scheduler maintains separate outbound/inbound profiles for each physical link, updates rate/latency/queue pressure from live samples, preserves flow affinity with switch hysteresis, and reuses the existing complete-cost transfer planner for large-message striping. Small or latency-critical traffic remains on one link, while bulk messages stripe only when two explicitly independent qualified links beat the best single-link estimate. Physical-link failure invalidates stale affinity and collapses striped traffic to the surviving link; explicit re-qualification plus fresh telemetry returns the recovered link to selection for new flows.
+The runtime scheduler maintains separate outbound/inbound profiles for each physical link, updates rate/latency/queue pressure from live samples, preserves flow affinity with switch hysteresis, and reuses the existing complete-cost transfer planner for large-message striping. Small or latency-critical traffic remains on one link, while bulk messages stripe only when two explicitly independent qualified links beat the best single-link estimate. Physical-link failure invalidates stale affinity and collapses striped traffic to the surviving link; explicit re-qualification plus fresh telemetry returns the recovered link to selection for new flows. Distributed placement boundaries now derive a stable flow id, local direction and deterministic size-class priority directly from the placement-plan/boundary identities, closing the A2-to-scheduler handoff.
 
 Next:
 
 - feed native completion/repost measurements into live profiles;
-- map distributed A2 boundary classes to stable flow ids and priorities;
 - qualify 1× versus 2× USB4 on the real two-Strix topology.
 
 Exit gate:

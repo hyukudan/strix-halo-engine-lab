@@ -25,6 +25,7 @@ add_library(strix_core STATIC
     src/compiled_speculative_verify.cpp
     src/compiled_speculation_backend.cpp
     src/dispatch_resources.cpp
+    src/distributed_flow.cpp
     src/distributed_placement.cpp
     src/distributed_session.cpp
     src/direct_transport_completion.cpp
@@ -355,6 +356,11 @@ if(BUILD_TESTING)
     target_link_libraries(strix-distributed-placement-tests PRIVATE strix_core)
     strix_target_warnings(strix-distributed-placement-tests)
     add_test(NAME strix-distributed-placement-tests COMMAND strix-distributed-placement-tests)
+
+    add_executable(strix-distributed-flow-tests tests/distributed_flow_tests.cpp)
+    target_link_libraries(strix-distributed-flow-tests PRIVATE strix_core)
+    strix_target_warnings(strix-distributed-flow-tests)
+    add_test(NAME strix-distributed-flow-tests COMMAND strix-distributed-flow-tests)
 
     add_executable(strix-distributed-session-tests tests/distributed_session_tests.cpp)
     target_link_libraries(strix-distributed-session-tests PRIVATE strix_core)
