@@ -22,6 +22,12 @@ struct MtpOutputStructuralContract {
     bool uses_gated_residual_head_mix = false;
     bool head_mix_has_injection = false;
     bool lm_head_required = false;
+
+    bool head_mix_binding_resolved = false;
+    std::uint32_t head_norm_tensor_index = 0;
+    std::uint32_t head_down_tensor_index = 0;
+    std::uint32_t head_up_tensor_index = 0;
+
     MtpLmHeadSource lm_head_source =
         MtpLmHeadSource::unresolved;
     std::uint32_t lm_head_tensor_index = 0;
