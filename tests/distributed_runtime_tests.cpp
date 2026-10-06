@@ -17,7 +17,8 @@ strix::transport::DualLinkRuntimeScheduler scheduler(){
     links[0].inbound.payload_bytes_per_second=1e9;
     links[0].outbound.one_way_latency_seconds=10e-6;
     links[0].inbound.one_way_latency_seconds=10e-6;
-    return {std::move(links)};
+    return strix::transport::DualLinkRuntimeScheduler(
+        std::move(links));
 }
 strix::DistributedPlacementPlan plan(){
     strix::DistributedPlacementPlan p; p.local_node=0; p.plan_identity=0xabc; p.executable=true; p.has_remote_work=true; p.remote_nodes={1};

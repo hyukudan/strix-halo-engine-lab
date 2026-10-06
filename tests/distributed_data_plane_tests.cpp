@@ -50,10 +50,9 @@ scheduler() {
     strix::transport::DualLinkRuntimePolicy policy;
     policy.transfer.minimum_stripe_bytes =
         1ULL << 20U;
-    return {
+    return strix::transport::DualLinkRuntimeScheduler(
         std::move(links),
-        policy,
-    };
+        policy);
 }
 
 strix::DistributedPlacementPlan
