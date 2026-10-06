@@ -60,14 +60,16 @@ RuntimeFixture make_runtime_fixture() {
 }
 
 strix::QualifiedMtpDraftPlan make_plan(
-    std::uint64_t proposal_identity) {
+    const strix::MtpDraftRuntimeBinding& binding) {
     strix::QualifiedMtpDraftPlan plan;
-    plan.base.proposal_identity = proposal_identity;
+    plan.base.proposal_identity =
+        binding.compatibility_identity;
     plan.base.contract_identity = 0x3333ULL;
     plan.base.structural =
         strix::build_mtp_draft_structural_contract(
             strix::ModelContract::
-                qwen38_flash_next());
+                qwen38_flash_next(),
+            binding);
     plan.base.state =
         strix::build_mtp_draft_state_contract(
             strix::ModelContract::
@@ -252,7 +254,7 @@ int main() {
         physical.binding;
     auto plan =
         make_plan(
-            binding.compatibility_identity);
+            binding);
     const auto activation =
         make_activation(plan);
     const auto memory =
