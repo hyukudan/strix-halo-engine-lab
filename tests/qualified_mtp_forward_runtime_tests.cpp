@@ -159,10 +159,13 @@ strix::SerialSessionContext make_target() {
 struct StepBackend final
     : strix::MtpForwardExecutionBackend {
     std::uint32_t calls = 0;
+    std::vector<std::uint64_t> positions;
 
     void dispatch_mtp_step(
-        const strix::MtpForwardStepContext&) override {
+        const strix::MtpForwardStepContext& context) override {
         ++calls;
+        positions.push_back(
+            context.target_position);
     }
 };
 
@@ -296,6 +299,13 @@ int main() {
             tokens.calls == 2 &&
             steps.calls == 6,
         "runtime adapter executes qualified forward once per candidate and reads each token");
+    expect(
+        steps.positions ==
+            std::vector<std::uint64_t>({
+                10, 10, 10,
+                11, 11, 11,
+            }),
+        "successive MTP candidates dispatch at successive absolute seed positions");
 
     adapter.reconcile_mtp_after_target(
         plan,

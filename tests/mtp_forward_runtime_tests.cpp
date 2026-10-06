@@ -24,11 +24,14 @@ public:
         expect(context.binding != nullptr &&
                    context.state_memory != nullptr &&
                    context.manifest != nullptr &&
-                   context.runtime != nullptr,
-               "MTP forward step receives binding, state memory and physical resources");
+                   context.runtime != nullptr &&
+                   context.cycle_input != nullptr,
+               "MTP forward step receives binding, state memory, physical resources and cycle input");
         expect(context.step_index == steps.size(),
                "MTP forward step index is contiguous");
         steps.push_back(context.step);
+        positions.push_back(
+            context.target_position);
         if (fail_at.has_value() &&
             context.step_index ==
                 *fail_at) {
@@ -38,6 +41,7 @@ public:
     }
 
     std::vector<strix::MtpDraftPlanStep> steps;
+    std::vector<std::uint64_t> positions;
     std::optional<std::uint32_t> fail_at;
 };
 
@@ -185,15 +189,34 @@ int main() {
             binding.compatibility_identity,
             target);
 
+    strix::MtpDraftCycleInput cycle;
+    cycle.proposal_identity =
+        binding.compatibility_identity;
+    cycle.target_runtime_compatibility_identity =
+        target.runtime_compatibility_identity;
+    cycle.seed_token_id = 7;
+    cycle.seed_position =
+        target.next_position + 2;
+    cycle.hidden_source_position =
+        cycle.seed_position - 1;
+    cycle.hidden_address =
+        static_cast<std::uintptr_t>(
+            0x70000000ULL);
+    cycle.hidden_elements =
+        plan.base.state.state_width;
+    cycle.hidden_element_bytes = 2;
+    cycle.hidden_allocation_generation = 1;
+
     RecordingBackend backend;
     const auto result =
         strix::execute_qualified_mtp_forward(
             plan,
             binding,
             memory,
+            resources,
             target,
             proposal,
-            7,
+            cycle,
             backend);
 
     expect(result.completed_steps ==
@@ -204,6 +227,13 @@ int main() {
     expect(backend.steps ==
                plan.base.steps,
            "qualified MTP runtime preserves compiled step order exactly");
+    expect(
+        !backend.positions.empty() &&
+            backend.positions.front() ==
+                cycle.seed_position &&
+            backend.positions.back() ==
+                cycle.seed_position,
+        "qualified MTP runtime dispatches every step at the cycle seed position");
 
     RecordingBackend failing;
     failing.fail_at = 3;
@@ -217,7 +247,7 @@ int main() {
                 resources,
                 target,
                 proposal,
-                7,
+                cycle,
                 failing));
     } catch (const std::runtime_error&) {
         failure_observed = true;
@@ -235,9 +265,10 @@ int main() {
                 plan,
                 foreign,
                 memory,
+                resources,
                 target,
                 proposal,
-                7,
+                cycle,
                 backend));
     } catch (const std::invalid_argument&) {
         foreign_rejected = true;

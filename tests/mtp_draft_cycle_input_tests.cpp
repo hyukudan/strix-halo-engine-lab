@@ -107,6 +107,42 @@ int main() {
     expect(foreign_rejected,
            "MTP cycle input cannot cross semantic activation identity");
 
+    auto later_draft = input;
+    later_draft.seed_position =
+        session.next_position + 3;
+    later_draft.hidden_source_position =
+        later_draft.seed_position - 1;
+    strix::validate_mtp_draft_cycle_input(
+        model,
+        activation,
+        state,
+        session,
+        later_draft);
+    expect(
+        later_draft.seed_position >
+            session.next_position,
+        "MTP cycle allows later speculative positions without advancing target session");
+
+    auto past = input;
+    past.seed_position =
+        session.next_position - 1;
+    past.hidden_source_position =
+        past.seed_position;
+    bool past_rejected = false;
+    try {
+        strix::validate_mtp_draft_cycle_input(
+            model,
+            activation,
+            state,
+            session,
+            past);
+    } catch (const std::out_of_range&) {
+        past_rejected = true;
+    }
+    expect(
+        past_rejected,
+        "MTP cycle rejects seed positions before target-session base");
+
     auto future_hidden = input;
     future_hidden.hidden_source_position =
         input.seed_position + 1;
