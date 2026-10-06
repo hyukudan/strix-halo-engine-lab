@@ -117,6 +117,7 @@ add_library(strix_core STATIC
     src/speculation_controller.cpp
     src/speculation_measurement.cpp
     src/speculation_rng.cpp
+    src/speculation_sampling.cpp
     src/speculation_cycle.cpp
     src/speculation_executor.cpp
     src/speculative_verify_plan.cpp
@@ -535,6 +536,11 @@ if(BUILD_TESTING)
     target_link_libraries(strix-speculation-tests PRIVATE strix_core)
     strix_target_warnings(strix-speculation-tests)
     add_test(NAME strix-speculation-tests COMMAND strix-speculation-tests)
+
+    add_executable(strix-speculation-sampling-tests tests/speculation_sampling_tests.cpp)
+    target_link_libraries(strix-speculation-sampling-tests PRIVATE strix_core)
+    strix_target_warnings(strix-speculation-sampling-tests)
+    add_test(NAME strix-speculation-sampling-tests COMMAND strix-speculation-sampling-tests)
 
     add_executable(strix-speculation-rng-tests tests/speculation_rng_tests.cpp)
     target_link_libraries(strix-speculation-rng-tests PRIVATE strix_core)

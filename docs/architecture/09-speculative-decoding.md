@@ -103,6 +103,15 @@ cannot consume or shift the serial target draw at that or any later position.
 
 Rejected speculative work MUST NOT consume randomness that changes the serial result.
 
+The lossless sampled verifier uses the classical per-token rule. For target
+probability `p(y)` and draft probability `q(y)` of proposed token `y`,
+accept with probability `min(1, p(y) / q(y))`. At the first rejection, sample
+the replacement from the normalized residual distribution `max(0, p - q)`.
+Acceptance uses the `draft_acceptance` draw class, residual replacement uses
+`residual_fallback`, and ordinary target sampling uses `serial_target`.
+Because each draw is counter-addressed, these streams never advance one
+another.
+
 ## Proposal semantics
 
 A proposal mechanism MAY be cheaper or more restrictive than the target model, including a reduced proposal vocabulary or approximate predictor, provided the unchanged target verifies every emitted token under the declared sampling contract.
