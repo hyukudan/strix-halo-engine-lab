@@ -50,6 +50,55 @@ struct Fixture {
         add("mtp.layers.0.self_attn.q_proj.weight");
         add("mtp.layers.0.self_attn.indexer.index_qk_proj.weight");
         add("mtp.layers.0.mlp.experts.gate_up_proj.weight");
+
+        strix::ManifestTensor head_norm;
+        head_norm.name =
+            "mtp.blk.48.nextn.hc_head_norm.weight";
+        head_norm.dimensions = {2560, 4};
+        head_norm.ggml_type = 30;
+        head_norm.byte_size = 20480;
+        head_norm.absolute_offset =
+            4096 +
+            manifest.total_tensor_bytes;
+        head_norm.role =
+            strix::TensorRole::mtp;
+        manifest.total_tensor_bytes +=
+            head_norm.byte_size;
+        manifest.tensors.push_back(
+            head_norm);
+
+        strix::ManifestTensor head_down;
+        head_down.name =
+            "mtp.blk.48.nextn.hc_head_down.weight";
+        head_down.dimensions = {10240, 320};
+        head_down.ggml_type = 8;
+        head_down.byte_size = 1024;
+        head_down.absolute_offset =
+            4096 +
+            manifest.total_tensor_bytes;
+        head_down.role =
+            strix::TensorRole::mtp;
+        manifest.total_tensor_bytes +=
+            head_down.byte_size;
+        manifest.tensors.push_back(
+            head_down);
+
+        strix::ManifestTensor head_up;
+        head_up.name =
+            "mtp.blk.48.nextn.hc_head_up.weight";
+        head_up.dimensions = {320, 10240};
+        head_up.ggml_type = 8;
+        head_up.byte_size = 1024;
+        head_up.absolute_offset =
+            4096 +
+            manifest.total_tensor_bytes;
+        head_up.role =
+            strix::TensorRole::mtp;
+        manifest.total_tensor_bytes +=
+            head_up.byte_size;
+        manifest.tensors.push_back(
+            head_up);
+
         add("mtp.model.shared_head.head.weight");
         manifest.layout_identity =
             strix::model_manifest_layout_identity(

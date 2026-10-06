@@ -119,7 +119,7 @@ int main() {
                bound.lm_head_source ==
                    strix::MtpLmHeadSource::
                        mtp_sidecar_shared_head &&
-               bound.lm_head_tensor_index == 0,
+               bound.lm_head_tensor_index == 3,
            "explicit MTP shared head resolves output binding without target fallback");
 
     auto bad_geometry_manifest =

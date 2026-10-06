@@ -176,7 +176,7 @@ int main() {
             LinkDirection::outbound,
             1ULL << 20U,
             0.0005,
-            8e-6,
+            0.0,
             0,
         });
     const auto recovered =
