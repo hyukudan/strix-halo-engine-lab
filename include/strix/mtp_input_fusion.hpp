@@ -14,11 +14,20 @@ struct MtpInputFusionPlan {
     std::uint64_t wide_hidden_size = 0;
     std::uint64_t fc_embedding_elements = 0;
     std::uint64_t fc_hidden_elements = 0;
+    std::uint64_t eh_proj_input_size = 0;
+    std::uint64_t eh_proj_elements = 0;
 };
 
 [[nodiscard]] MtpInputFusionPlan
 build_mtp_input_fusion_plan(
     const ModelContract& model);
+
+[[nodiscard]] std::vector<double>
+mtp_eh_projection_reference(
+    const MtpInputFusionPlan& plan,
+    std::span<const double> normalized_embedding,
+    std::span<const double> normalized_wide_hidden,
+    std::span<const double> eh_proj_row_major);
 
 [[nodiscard]] std::vector<double>
 mtp_input_fusion_reference(

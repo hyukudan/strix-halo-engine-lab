@@ -47,7 +47,91 @@ build_mtp_input_fusion_plan(
             plan.hidden_size);
     plan.fc_hidden_elements =
         plan.fc_embedding_elements;
+    plan.eh_proj_input_size =
+        checked_mul(
+            plan.hidden_size,
+            2ULL);
+    plan.eh_proj_elements =
+        checked_mul(
+            plan.hidden_size,
+            plan.eh_proj_input_size);
     return plan;
+}
+
+std::vector<double>
+mtp_eh_projection_reference(
+    const MtpInputFusionPlan& plan,
+    std::span<const double> normalized_embedding,
+    std::span<const double> normalized_wide_hidden,
+    std::span<const double> eh_proj_row_major) {
+    if (plan.hidden_size == 0 ||
+        plan.hc_count <= 1 ||
+        plan.wide_hidden_size !=
+            plan.hidden_size * plan.hc_count ||
+        plan.eh_proj_input_size !=
+            plan.hidden_size * 2ULL ||
+        normalized_embedding.size() !=
+            plan.hidden_size ||
+        normalized_wide_hidden.size() !=
+            plan.wide_hidden_size ||
+        eh_proj_row_major.size() !=
+            plan.eh_proj_elements) {
+        throw std::invalid_argument(
+            "MTP eh_proj buffers do not match canonical geometry");
+    }
+
+    const auto hidden =
+        static_cast<std::size_t>(
+            plan.hidden_size);
+    const auto streams =
+        static_cast<std::size_t>(
+            plan.hc_count);
+    const auto input_width =
+        static_cast<std::size_t>(
+            plan.eh_proj_input_size);
+
+    std::vector<double> output(
+        normalized_wide_hidden.size(),
+        0.0);
+
+    for (std::size_t stream = 0;
+         stream < streams;
+         ++stream) {
+        const auto hidden_base =
+            stream * hidden;
+        for (std::size_t row = 0;
+             row < hidden;
+             ++row) {
+            double sum = 0.0;
+
+            // Canonical Qwen4Exp NextN order is [enorm(token), hnorm(stream)].
+            for (std::size_t column = 0;
+                 column < hidden;
+                 ++column) {
+                sum +=
+                    eh_proj_row_major[
+                        row * input_width +
+                        column] *
+                    normalized_embedding[column];
+            }
+            for (std::size_t column = 0;
+                 column < hidden;
+                 ++column) {
+                sum +=
+                    eh_proj_row_major[
+                        row * input_width +
+                        hidden +
+                        column] *
+                    normalized_wide_hidden[
+                        hidden_base + column];
+            }
+
+            output[
+                hidden_base + row] =
+                sum;
+        }
+    }
+    return output;
 }
 
 std::vector<double>

@@ -71,6 +71,74 @@ int main() {
     {
         auto model =
             strix::ModelContract::qwen38_flash_next();
+        model.hidden_size = 2;
+        model.hc_count = 3;
+
+        const auto plan =
+            strix::build_mtp_input_fusion_plan(
+                model);
+
+        const std::vector<double> embedding{
+            2.0, -1.0};
+        const std::vector<double> hidden{
+            1.0, 2.0,
+            -2.0, 3.0,
+            4.0, -1.0};
+
+        const std::vector<double> we{
+            1.0, 2.0,
+            3.0, 4.0};
+        const std::vector<double> wh{
+            2.0, 0.0,
+            0.0, -1.0};
+
+        // Row-major [H, 2H], with canonical concat order [embedding, hidden].
+        const std::vector<double> eh_proj{
+            1.0, 2.0, 2.0, 0.0,
+            3.0, 4.0, 0.0, -1.0,
+        };
+
+        const auto split =
+            strix::mtp_input_fusion_reference(
+                plan,
+                embedding,
+                hidden,
+                we,
+                wh);
+        const auto packed =
+            strix::mtp_eh_projection_reference(
+                plan,
+                embedding,
+                hidden,
+                eh_proj);
+
+        expect(
+            packed == split &&
+                plan.eh_proj_input_size == 4 &&
+                plan.eh_proj_elements == 8,
+            "canonical packed eh_proj exactly matches split fusion oracle");
+
+        auto reversed =
+            eh_proj;
+        // Swap the embedding/hidden halves to prove concat ordering is semantic.
+        reversed = {
+            2.0, 0.0, 1.0, 2.0,
+            0.0, -1.0, 3.0, 4.0,
+        };
+        const auto wrong_order =
+            strix::mtp_eh_projection_reference(
+                plan,
+                embedding,
+                hidden,
+                reversed);
+        expect(
+            wrong_order != split,
+            "eh_proj oracle is sensitive to embedding-before-hidden concat order");
+    }
+
+    {
+        auto model =
+            strix::ModelContract::qwen38_flash_next();
         model.hidden_size = 1;
         model.hc_count = 2;
         const auto plan =
