@@ -31,7 +31,8 @@ scheduler() {
     links[0].inbound.payload_bytes_per_second = 1.0e9;
     links[0].outbound.one_way_latency_seconds = 10e-6;
     links[0].inbound.one_way_latency_seconds = 10e-6;
-    return {std::move(links)};
+    return strix::transport::DualLinkRuntimeScheduler(
+        std::move(links));
 }
 
 }  // namespace
