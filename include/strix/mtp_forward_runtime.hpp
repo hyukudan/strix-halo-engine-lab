@@ -2,6 +2,7 @@
 
 #include "strix/draft_proposal_state.hpp"
 #include "strix/mtp_draft_binding.hpp"
+#include "strix/mtp_draft_cycle_input.hpp"
 #include "strix/mtp_draft_qualification.hpp"
 #include "strix/mtp_draft_state_memory.hpp"
 #include "strix/serial_session.hpp"
@@ -13,6 +14,7 @@ namespace strix {
 struct MtpForwardPhysicalResources {
     const ModelManifest* manifest = nullptr;
     const ModelRuntimeBinding* runtime = nullptr;
+    const MtpDraftCycleInput* cycle_input = nullptr;
 };
 
 struct MtpForwardStepContext {
@@ -51,7 +53,7 @@ execute_qualified_mtp_forward(
     const MtpForwardPhysicalResources& resources,
     const SerialSessionContext& target_session,
     const DraftProposalStateContext& proposal_state,
-    std::uint32_t input_token,
+    const MtpDraftCycleInput& cycle_input,
     MtpForwardExecutionBackend& backend);
 
 }  // namespace strix

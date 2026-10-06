@@ -49,10 +49,10 @@ void validate_mtp_draft_cycle_input(
     }
     if (input.seed_position >=
             model.max_position_embeddings ||
-        input.seed_position >
+        input.seed_position <
             target_session.next_position) {
         throw std::out_of_range(
-            "MTP seed position is outside target session/model range");
+            "MTP seed position cannot precede target base position or exceed model range");
     }
     if (input.hidden_source_position >
             input.seed_position) {

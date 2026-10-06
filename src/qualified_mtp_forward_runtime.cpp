@@ -99,7 +99,7 @@ propose_mtp_candidates(
                 resources_,
                 target_session,
                 proposal_state,
-                cycle_input.seed_token_id,
+                cycle_input,
                 *step_backend_);
 
         if (!forward.next_state_published ||

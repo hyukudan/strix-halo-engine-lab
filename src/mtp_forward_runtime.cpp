@@ -12,7 +12,7 @@ execute_qualified_mtp_forward(
     const MtpForwardPhysicalResources& resources,
     const SerialSessionContext& target_session,
     const DraftProposalStateContext& proposal_state,
-    std::uint32_t input_token,
+    const MtpDraftCycleInput& cycle_input,
     MtpForwardExecutionBackend& backend) {
     require_qualified_mtp_draft_plan(
         plan);
@@ -40,10 +40,23 @@ execute_qualified_mtp_forward(
         binding);
     if (plan.base.structural.vocab_size == 0 ||
         static_cast<std::uint64_t>(
-            input_token) >=
-            plan.base.structural.vocab_size) {
+            cycle_input.seed_token_id) >=
+            plan.base.structural.vocab_size ||
+        cycle_input.proposal_identity !=
+            plan.base.proposal_identity ||
+        cycle_input.target_runtime_compatibility_identity !=
+            target_session.runtime_compatibility_identity ||
+        cycle_input.seed_position <
+            target_session.next_position ||
+        cycle_input.hidden_source_position >
+            cycle_input.seed_position ||
+        cycle_input.hidden_address == 0 ||
+        cycle_input.hidden_elements !=
+            plan.base.state.state_width ||
+        cycle_input.hidden_element_bytes == 0 ||
+        cycle_input.hidden_allocation_generation == 0) {
         throw std::invalid_argument(
-            "qualified MTP forward input token is outside vocabulary");
+            "qualified MTP forward cycle input is incompatible with plan/session");
     }
 
     validate_mtp_draft_proposal_state(
@@ -83,9 +96,9 @@ execute_qualified_mtp_forward(
             static_cast<std::uint32_t>(
                 index);
         context.input_token =
-            input_token;
+            cycle_input.seed_token_id;
         context.target_position =
-            target_session.next_position;
+            cycle_input.seed_position;
         context.proposal_identity =
             plan.base.proposal_identity;
         context.plan_identity =
@@ -98,6 +111,8 @@ execute_qualified_mtp_forward(
             resources.manifest;
         context.runtime =
             resources.runtime;
+        context.cycle_input =
+            &cycle_input;
 
         backend.dispatch_mtp_step(
             context);
