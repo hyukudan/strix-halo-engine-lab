@@ -47,16 +47,20 @@ struct FakeForward final
 strix::QualifiedMtpDraftPlan qualified_plan() {
     strix::QualifiedMtpDraftPlan plan;
     plan.base.proposal_identity = 0x1111ULL;
-    plan.base.plan_identity = 0x2222ULL;
     plan.base.contract_identity = 0x3333ULL;
     plan.base.structural.vocab_size = 100;
     plan.base.state.hidden_size = 2560;
     plan.base.state.hc_count = 4;
     plan.base.state.state_width = 10240;
     plan.base.state.one_state_row_per_request = true;
+    plan.base.plan_identity =
+        strix::recompute_compiled_mtp_draft_plan_identity(
+            plan.base);
     plan.replay_policy.policy_identity = 0x4444ULL;
     plan.replay_assessment.passes_declared_policy = true;
     plan.independent_reference_identity = 0x5555ULL;
+    plan.qualified_plan_identity =
+        plan.base.plan_identity;
     plan.qualification_identity = 0x6666ULL;
     plan.executable = true;
     return plan;

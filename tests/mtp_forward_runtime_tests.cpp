@@ -42,7 +42,6 @@ public:
 strix::QualifiedMtpDraftPlan qualified_fixture() {
     strix::QualifiedMtpDraftPlan plan;
     plan.base.proposal_identity = 0x1234ULL;
-    plan.base.plan_identity = 0x5678ULL;
     plan.base.structural.vocab_size = 100;
     plan.base.state.state_width = 16;
     plan.base.state.one_state_row_per_request = true;
@@ -61,6 +60,9 @@ strix::QualifiedMtpDraftPlan qualified_fixture() {
         strix::MtpDraftPlanStep::output_head_mix,
         strix::MtpDraftPlanStep::lm_head,
     };
+    plan.base.plan_identity =
+        strix::recompute_compiled_mtp_draft_plan_identity(
+            plan.base);
     plan.replay_policy.policy_identity = 1;
     plan.replay_assessment.identity_valid = true;
     plan.replay_assessment.multi_step = true;
@@ -71,6 +73,8 @@ strix::QualifiedMtpDraftPlan qualified_fixture() {
     plan.replay_assessment.logits_within_policy = true;
     plan.replay_assessment.passes_declared_policy = true;
     plan.independent_reference_identity = 2;
+    plan.qualified_plan_identity =
+        plan.base.plan_identity;
     plan.qualification_identity = 3;
     plan.executable = true;
     return plan;

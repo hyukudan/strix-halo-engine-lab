@@ -18,7 +18,6 @@ void expect(bool condition, const char* message) {
 strix::QualifiedMtpDraftPlan make_plan() {
     strix::QualifiedMtpDraftPlan plan;
     plan.base.proposal_identity = 0x1111ULL;
-    plan.base.plan_identity = 0x2222ULL;
     plan.base.contract_identity = 0x3333ULL;
     plan.base.structural =
         strix::build_mtp_draft_structural_contract(
@@ -37,22 +36,28 @@ strix::QualifiedMtpDraftPlan make_plan() {
         strix::MtpDraftPlanStep::publish_next_state,
         strix::MtpDraftPlanStep::lm_head,
     };
+    plan.base.plan_identity =
+        strix::recompute_compiled_mtp_draft_plan_identity(
+            plan.base);
     plan.replay_policy.policy_identity =
         0x4444ULL;
     plan.replay_assessment.passes_declared_policy =
         true;
     plan.independent_reference_identity =
         0x5555ULL;
+    plan.qualified_plan_identity =
+        plan.base.plan_identity;
     plan.qualification_identity =
         0x6666ULL;
     plan.executable = true;
     return plan;
 }
 
-strix::ActivatedMtpDraftPlan make_activation() {
+strix::ActivatedMtpDraftPlan make_activation(
+    const strix::QualifiedMtpDraftPlan& plan) {
     strix::ActivatedMtpDraftPlan value;
     value.structural_plan_identity =
-        0x2222ULL;
+        plan.base.plan_identity;
     value.proposal_identity =
         0x1111ULL;
     value.replay_policy_identity =
@@ -206,7 +211,7 @@ int main() {
             qwen38_flash_next();
     auto plan = make_plan();
     const auto activation =
-        make_activation();
+        make_activation(plan);
     const auto binding =
         make_binding();
     const auto memory =
