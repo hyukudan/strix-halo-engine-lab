@@ -14,7 +14,6 @@ namespace strix {
 struct MtpForwardPhysicalResources {
     const ModelManifest* manifest = nullptr;
     const ModelRuntimeBinding* runtime = nullptr;
-    const MtpDraftCycleInput* cycle_input = nullptr;
 };
 
 struct MtpForwardStepContext {
@@ -29,6 +28,7 @@ struct MtpForwardStepContext {
     const MtpDraftStateMemoryBinding* state_memory = nullptr;
     const ModelManifest* manifest = nullptr;
     const ModelRuntimeBinding* runtime = nullptr;
+    const MtpDraftCycleInput* cycle_input = nullptr;
 };
 
 class MtpForwardExecutionBackend {
