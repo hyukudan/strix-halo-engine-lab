@@ -53,6 +53,7 @@ public:
     QualifiedMtpForwardRuntimeAdapter(
         const ModelContract& model,
         const ActivatedMtpDraftPlan& activated_plan,
+        MtpForwardPhysicalResources resources,
         MtpForwardExecutionBackend& step_backend,
         MtpRuntimeCycleInputProvider& input_provider,
         MtpRuntimeTokenReader& token_reader);
@@ -81,6 +82,7 @@ private:
 
     ModelContract model_;
     ActivatedMtpDraftPlan activated_plan_;
+    MtpForwardPhysicalResources resources_;
     MtpForwardExecutionBackend* step_backend_ = nullptr;
     MtpRuntimeCycleInputProvider* input_provider_ = nullptr;
     MtpRuntimeTokenReader* token_reader_ = nullptr;

@@ -9,6 +9,7 @@ execute_qualified_mtp_forward(
     const QualifiedMtpDraftPlan& plan,
     const MtpDraftRuntimeBinding& binding,
     const MtpDraftStateMemoryBinding& state_memory,
+    const MtpForwardPhysicalResources& resources,
     const SerialSessionContext& target_session,
     const DraftProposalStateContext& proposal_state,
     std::uint32_t input_token,
@@ -22,11 +23,21 @@ execute_qualified_mtp_forward(
             "qualified MTP forward requires resolved composition contract");
     }
     if (binding.compatibility_identity == 0 ||
+        binding.physical_binding_identity == 0 ||
         plan.base.proposal_identity !=
             binding.compatibility_identity) {
         throw std::invalid_argument(
             "qualified MTP forward binding does not match plan");
     }
+    if (resources.manifest == nullptr ||
+        resources.runtime == nullptr) {
+        throw std::invalid_argument(
+            "qualified MTP forward requires physical model resources");
+    }
+    validate_mtp_draft_runtime_binding(
+        *resources.manifest,
+        *resources.runtime,
+        binding);
     if (plan.base.structural.vocab_size == 0 ||
         static_cast<std::uint64_t>(
             input_token) >=
@@ -83,6 +94,10 @@ execute_qualified_mtp_forward(
             &binding;
         context.state_memory =
             &state_memory;
+        context.manifest =
+            resources.manifest;
+        context.runtime =
+            resources.runtime;
 
         backend.dispatch_mtp_step(
             context);

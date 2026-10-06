@@ -22,8 +22,10 @@ public:
     void dispatch_mtp_step(
         const strix::MtpForwardStepContext& context) override {
         expect(context.binding != nullptr &&
-                   context.state_memory != nullptr,
-               "MTP forward step receives binding and state memory");
+                   context.state_memory != nullptr &&
+                   context.manifest != nullptr &&
+                   context.runtime != nullptr,
+               "MTP forward step receives binding, state memory and physical resources");
         expect(context.step_index == steps.size(),
                "MTP forward step index is contiguous");
         steps.push_back(context.step);
@@ -39,9 +41,55 @@ public:
     std::optional<std::uint32_t> fail_at;
 };
 
-strix::QualifiedMtpDraftPlan qualified_fixture() {
+struct RuntimeFixture {
+    strix::ModelManifest manifest;
+    strix::ModelRuntimeBinding runtime;
+    strix::MtpDraftRuntimeBinding binding;
+};
+
+RuntimeFixture runtime_fixture() {
+    RuntimeFixture value;
+    value.manifest.architecture = "fixture";
+    strix::ManifestTensor tensor;
+    tensor.name = "mtp.fixture.weight";
+    tensor.dimensions = {1};
+    tensor.ggml_type = 30;
+    tensor.byte_size = 4096;
+    tensor.absolute_offset = 4096;
+    tensor.role = strix::TensorRole::mtp;
+    value.manifest.tensors.push_back(tensor);
+    value.manifest.total_tensor_bytes = tensor.byte_size;
+    value.manifest.layout_identity =
+        strix::model_manifest_layout_identity(
+            value.manifest);
+
+    value.runtime.manifest_layout_identity =
+        value.manifest.layout_identity;
+    value.runtime.model_content_identity.bytes[0] =
+        0x42;
+    strix::RuntimeTensorBinding runtime_tensor;
+    runtime_tensor.tensor_index = 0;
+    runtime_tensor.storage =
+        strix::RuntimeTensorStorage::resident;
+    runtime_tensor.address =
+        static_cast<std::uintptr_t>(
+            0x50000000ULL);
+    runtime_tensor.bytes = 4096;
+    runtime_tensor.allocation_generation = 1;
+    value.runtime.tensors.push_back(
+        runtime_tensor);
+
+    value.binding =
+        strix::build_mtp_draft_runtime_binding(
+            value.manifest,
+            value.runtime);
+    return value;
+}
+
+strix::QualifiedMtpDraftPlan qualified_fixture(
+    std::uint64_t proposal_identity) {
     strix::QualifiedMtpDraftPlan plan;
-    plan.base.proposal_identity = 0x1234ULL;
+    plan.base.proposal_identity = proposal_identity;
     plan.base.structural.vocab_size = 100;
     plan.base.state.state_width = 16;
     plan.base.state.one_state_row_per_request = true;
@@ -83,14 +131,19 @@ strix::QualifiedMtpDraftPlan qualified_fixture() {
 }  // namespace
 
 int main() {
+    auto physical =
+        runtime_fixture();
     auto plan =
-        qualified_fixture();
-
-    strix::MtpDraftRuntimeBinding binding;
-    binding.compatibility_identity =
-        plan.base.proposal_identity;
-    binding.model_content_identity.bytes[0] =
-        0x42;
+        qualified_fixture(
+            physical.binding.
+                compatibility_identity);
+    const auto& binding =
+        physical.binding;
+    const strix::MtpForwardPhysicalResources
+        resources{
+            &physical.manifest,
+            &physical.runtime,
+        };
 
     const auto memory_plan =
         strix::plan_mtp_draft_state_memory(
@@ -161,6 +214,7 @@ int main() {
                 plan,
                 binding,
                 memory,
+                resources,
                 target,
                 proposal,
                 7,

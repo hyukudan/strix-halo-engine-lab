@@ -15,9 +15,54 @@ void expect(bool condition, const char* message) {
     }
 }
 
-strix::QualifiedMtpDraftPlan make_plan() {
+struct RuntimeFixture {
+    strix::ModelManifest manifest;
+    strix::ModelRuntimeBinding runtime;
+    strix::MtpDraftRuntimeBinding binding;
+};
+
+RuntimeFixture make_runtime_fixture() {
+    RuntimeFixture value;
+    value.manifest.architecture = "fixture";
+    strix::ManifestTensor tensor;
+    tensor.name = "mtp.fixture.weight";
+    tensor.dimensions = {1};
+    tensor.ggml_type = 30;
+    tensor.byte_size = 4096;
+    tensor.absolute_offset = 4096;
+    tensor.role = strix::TensorRole::mtp;
+    value.manifest.tensors.push_back(tensor);
+    value.manifest.total_tensor_bytes = tensor.byte_size;
+    value.manifest.layout_identity =
+        strix::model_manifest_layout_identity(
+            value.manifest);
+
+    value.runtime.manifest_layout_identity =
+        value.manifest.layout_identity;
+    value.runtime.model_content_identity.bytes[0] = 1;
+    strix::RuntimeTensorBinding runtime_tensor;
+    runtime_tensor.tensor_index = 0;
+    runtime_tensor.storage =
+        strix::RuntimeTensorStorage::resident;
+    runtime_tensor.address =
+        static_cast<std::uintptr_t>(
+            0x50000000ULL);
+    runtime_tensor.bytes = 4096;
+    runtime_tensor.allocation_generation = 1;
+    value.runtime.tensors.push_back(
+        runtime_tensor);
+
+    value.binding =
+        strix::build_mtp_draft_runtime_binding(
+            value.manifest,
+            value.runtime);
+    return value;
+}
+
+strix::QualifiedMtpDraftPlan make_plan(
+    std::uint64_t proposal_identity) {
     strix::QualifiedMtpDraftPlan plan;
-    plan.base.proposal_identity = 0x1111ULL;
+    plan.base.proposal_identity = proposal_identity;
     plan.base.contract_identity = 0x3333ULL;
     plan.base.structural =
         strix::build_mtp_draft_structural_contract(
@@ -59,7 +104,7 @@ strix::ActivatedMtpDraftPlan make_activation(
     value.structural_plan_identity =
         plan.base.plan_identity;
     value.proposal_identity =
-        0x1111ULL;
+        plan.base.proposal_identity;
     value.replay_policy_identity =
         0x4444ULL;
     value.independent_reference_identity =
@@ -70,23 +115,12 @@ strix::ActivatedMtpDraftPlan make_activation(
     return value;
 }
 
-strix::MtpDraftRuntimeBinding make_binding() {
-    strix::MtpDraftRuntimeBinding value;
-    value.compatibility_identity =
-        0x1111ULL;
-    value.physical_binding_identity =
-        0x9999ULL;
-    value.model_content_identity.bytes[0] = 1;
-    value.tensor_indices = {0};
-    value.total_tensor_bytes = 4096;
-    return value;
-}
-
 strix::MtpDraftStateMemoryBinding make_memory(
-    const strix::MtpDraftStateContract& state) {
+    const strix::MtpDraftStateContract& state,
+    std::uint64_t proposal_identity) {
     strix::MtpDraftStateMemoryBinding value;
     value.proposal_identity =
-        0x1111ULL;
+        proposal_identity;
     value.state_width =
         state.state_width;
     value.rows = 1;
@@ -209,14 +243,24 @@ int main() {
     const auto model =
         strix::ModelContract::
             qwen38_flash_next();
-    auto plan = make_plan();
+    auto physical =
+        make_runtime_fixture();
+    const auto& binding =
+        physical.binding;
+    auto plan =
+        make_plan(
+            binding.compatibility_identity);
     const auto activation =
         make_activation(plan);
-    const auto binding =
-        make_binding();
     const auto memory =
         make_memory(
-            plan.base.state);
+            plan.base.state,
+            binding.compatibility_identity);
+    const strix::MtpForwardPhysicalResources
+        resources{
+            &physical.manifest,
+            &physical.runtime,
+        };
     const auto target =
         make_target();
     const auto proposal_state =
@@ -231,6 +275,7 @@ int main() {
         adapter(
             model,
             activation,
+            resources,
             steps,
             inputs,
             tokens);
@@ -275,6 +320,7 @@ int main() {
             invalid(
                 model,
                 foreign_activation,
+                resources,
                 other_steps,
                 other_inputs,
                 other_tokens);

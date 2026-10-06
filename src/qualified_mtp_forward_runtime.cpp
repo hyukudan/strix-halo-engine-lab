@@ -8,17 +8,24 @@ QualifiedMtpForwardRuntimeAdapter::
 QualifiedMtpForwardRuntimeAdapter(
     const ModelContract& model,
     const ActivatedMtpDraftPlan& activated_plan,
+    MtpForwardPhysicalResources resources,
     MtpForwardExecutionBackend& step_backend,
     MtpRuntimeCycleInputProvider& input_provider,
     MtpRuntimeTokenReader& token_reader)
     : model_(model),
       activated_plan_(activated_plan),
+      resources_(resources),
       step_backend_(&step_backend),
       input_provider_(&input_provider),
       token_reader_(&token_reader) {
     if (const auto error = model_.validate();
         !error.empty()) {
         throw std::invalid_argument(error);
+    }
+    if (resources_.manifest == nullptr ||
+        resources_.runtime == nullptr) {
+        throw std::invalid_argument(
+            "qualified MTP runtime adapter requires physical model resources");
     }
     if (!activated_plan_.semantics_qualified ||
         activated_plan_.activation_identity == 0 ||
@@ -89,6 +96,7 @@ propose_mtp_candidates(
                 qualified_plan,
                 binding,
                 state_memory,
+                resources_,
                 target_session,
                 proposal_state,
                 cycle_input.seed_token_id,

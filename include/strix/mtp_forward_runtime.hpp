@@ -10,6 +10,11 @@
 
 namespace strix {
 
+struct MtpForwardPhysicalResources {
+    const ModelManifest* manifest = nullptr;
+    const ModelRuntimeBinding* runtime = nullptr;
+};
+
 struct MtpForwardStepContext {
     MtpDraftPlanStep step =
         MtpDraftPlanStep::input_fusion;
@@ -20,6 +25,8 @@ struct MtpForwardStepContext {
     std::uint64_t plan_identity = 0;
     const MtpDraftRuntimeBinding* binding = nullptr;
     const MtpDraftStateMemoryBinding* state_memory = nullptr;
+    const ModelManifest* manifest = nullptr;
+    const ModelRuntimeBinding* runtime = nullptr;
 };
 
 class MtpForwardExecutionBackend {
@@ -41,6 +48,7 @@ execute_qualified_mtp_forward(
     const QualifiedMtpDraftPlan& plan,
     const MtpDraftRuntimeBinding& binding,
     const MtpDraftStateMemoryBinding& state_memory,
+    const MtpForwardPhysicalResources& resources,
     const SerialSessionContext& target_session,
     const DraftProposalStateContext& proposal_state,
     std::uint32_t input_token,
