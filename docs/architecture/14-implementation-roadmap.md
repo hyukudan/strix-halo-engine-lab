@@ -345,7 +345,7 @@ Remote-step execution now has a concrete sequenced controller above an abstract 
 The control-wire format is now explicit and bounded: little-endian framed messages carry remote-step command/ACK and boundary-transfer metadata, including link-plan slices, over an abstract byte stream so TCP or native control channels can be substituted without changing control semantics.
 A concrete POSIX TCP stream now implements that byte-stream with bounded length-prefix framing and RAII socket ownership, providing an immediately usable two-host control path while leaving future native/direct control channels interchangeable.
 A server-side frame pump completes the portable control path: it dispatches validated command and boundary frames, mirrors command identity into ACKs and preserves explicit failure status rather than letting receiver-side execution errors masquerade as success.
-The default receiver handler keeps the placement identity global while taking an explicit physical receiver-node id; it validates command ownership/sequence and queues only boundaries addressed to that node, avoiding per-peer re-planning that would create divergent plan identities.
+The default receiver handler keeps the placement identity global while taking an explicit physical receiver-node id; it validates command ownership/sequence and queues only boundaries addressed to that node, avoiding per-peer re-planning that would create divergent plan identities. A portable end-to-end control test now runs the sequenced client through the actual framed socket stream, server pump and receiver executor, including boundary metadata on the same session.
 
 Implement next:
 

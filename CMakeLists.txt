@@ -415,6 +415,11 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-distributed-control-server-tests)
     add_test(NAME strix-distributed-control-server-tests COMMAND strix-distributed-control-server-tests)
 
+    add_executable(strix-distributed-control-end-to-end-tests tests/distributed_control_end_to_end_tests.cpp)
+    target_link_libraries(strix-distributed-control-end-to-end-tests PRIVATE strix_core)
+    strix_target_warnings(strix-distributed-control-end-to-end-tests)
+    add_test(NAME strix-distributed-control-end-to-end-tests COMMAND strix-distributed-control-end-to-end-tests)
+
     add_executable(strix-distributed-control-receiver-tests tests/distributed_control_receiver_tests.cpp)
     target_link_libraries(strix-distributed-control-receiver-tests PRIVATE strix_core)
     strix_target_warnings(strix-distributed-control-receiver-tests)

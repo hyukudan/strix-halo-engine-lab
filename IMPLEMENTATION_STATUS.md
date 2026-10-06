@@ -536,7 +536,8 @@ Initial host-side implementation:
 - a bounded little-endian control-wire codec now serializes/deserializes remote-step commands, ACKs and boundary metadata (including striped link slices) behind an abstract byte-stream, with explicit magic/version/type/length checks and configurable frame/slice limits;
 - a concrete POSIX TCP control byte-stream now owns connected sockets, supports connect/listen-once/adopt flows, disables Nagle on TCP peers, length-prefixes every framed message, retries interrupted I/O and rejects oversized lengths before allocation;
 - a bounded control server pump now inspects validated frame kinds, executes remote-step commands through a receiver handler and emits identity-mirroring success/failure ACKs, while boundary-transfer frames are delivered to the receiver-side metadata handler without ad-hoc decoding;
-- the receiver-side control handler now binds one global placement/request identity to an explicit physical receiver node, enforces monotonic remote-command sequence, validates target step ownership/op, queues only plan-owned boundaries addressed to that node, rejects duplicate pending boundary metadata and poisons itself on stale/foreign control input or local execution failure.
+- the receiver-side control handler now binds one global placement/request identity to an explicit physical receiver node, enforces monotonic remote-command sequence, validates target step ownership/op, queues only plan-owned boundaries addressed to that node, rejects duplicate pending boundary metadata and poisons itself on stale/foreign control input or local execution failure;
+- an end-to-end portable control-plane test now drives a sequenced client through the real framed socket stream/server/receiver path, proving remote-step ACK and boundary-metadata delivery compose correctly on one connection.
 
 Still pending:
 
