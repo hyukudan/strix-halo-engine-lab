@@ -66,15 +66,18 @@ public:
 
     [[nodiscard]] std::uint16_t u16() {
         require(2);
+        const auto low =
+            static_cast<std::uint32_t>(
+                std::to_integer<std::uint8_t>(
+                    bytes_[offset_]));
+        const auto high =
+            static_cast<std::uint32_t>(
+                std::to_integer<std::uint8_t>(
+                    bytes_[offset_ + 1U]));
         const auto value =
             static_cast<std::uint16_t>(
-                std::to_integer<std::uint8_t>(
-                    bytes_[offset_])) |
-            static_cast<std::uint16_t>(
-                static_cast<std::uint16_t>(
-                    std::to_integer<std::uint8_t>(
-                        bytes_[offset_ + 1U])) <<
-                8U);
+                low |
+                (high << 8U));
         offset_ += 2;
         return value;
     }
