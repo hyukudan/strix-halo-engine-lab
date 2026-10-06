@@ -90,8 +90,16 @@ The random stream MUST be stable with respect to:
 - seed;
 - absolute token position;
 - request identity;
+- sampling-policy identity;
 - rejected drafts;
 - batching.
+
+The engine uses a stateless counter-based RNG key rather than a mutable cursor.
+Every random value is addressed by
+`(seed, request_identity, sampling_policy_identity, absolute_position, draw_class, draw_index)`.
+The draw classes are distinct for the serial target sample, draft acceptance,
+and residual fallback. As a result, acceptance/rejection work at one position
+cannot consume or shift the serial target draw at that or any later position.
 
 Rejected speculative work MUST NOT consume randomness that changes the serial result.
 

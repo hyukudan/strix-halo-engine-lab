@@ -447,11 +447,11 @@ Additional A1.6 runtime work now implemented:
 - draft wrapper preflights target runtime/session before proposal and clamps effective proposal depth by remaining context and `token_budget - 1`;
 - speculation controller keys qualified measurements by `(proposal_identity, depth)`, so distinct drafters can compete at the same verify depth;
 - measured-cycle aggregation now groups repeated observations by campaign + proposal/depth, requires a minimum repetition count and correctness-clean cycles before marking a sample qualified, summarizes component costs by median and expected committed tokens by arithmetic mean, and feeds those samples directly into the existing controller;
-- hysteresis can preserve or switch a concrete proposal strategy as well as a depth while the depth-zero serial baseline remains proposal-free.
+- hysteresis can preserve or switch a concrete proposal strategy as well as a depth while the depth-zero serial baseline remains proposal-free;
+- sampled speculation now has a stateless counter-based RNG identity contract keyed by seed, request identity, sampling-policy identity, absolute token position, draw class and draw index; draft-acceptance/residual draws therefore cannot advance or perturb the serial target draw assigned to any token position.
 
 Sampled speculative mathematics is source-identified (acceptance ratio and
-residual fallback), but sampled execution remains disabled until RNG stream
-identity and rejected-draft consumption are fixed. The draft proposal seam is integrated, but concrete proposal-state
+residual fallback), and RNG stream identity/consumption is now fixed. Sampled execution remains disabled until the acceptance/residual sampler itself is implemented and independently distribution-qualified. The draft proposal seam is integrated, but concrete proposal-state
 MTP compute semantics/kernels and native proposal qualification remain
 open; host-side measured drafter selection is now wired through repeatable campaign aggregation.
 
