@@ -203,3 +203,8 @@ The runtime SHOULD expose:
 - exposed communication time in distributed mode.
 
 Speculation MUST be disabled automatically or by policy when it loses against serial decode.
+
+
+### Distribution qualification
+
+Before sampled speculation can enter the stateful executor, the portable verifier is qualified over many independently keyed requests. The gate checks two invariants for a fixed target/draft pair: the emitted token marginal converges to the target distribution `p`, and the draft-token acceptance rate converges to `Σ_i min(p_i, q_i)`. The sample population is deterministic because request identities define independent counters; tolerances are qualification gates, not runtime heuristics.

@@ -450,8 +450,9 @@ Additional A1.6 runtime work now implemented:
 - hysteresis can preserve or switch a concrete proposal strategy as well as a depth while the depth-zero serial baseline remains proposal-free;
 - sampled speculation now has a stateless counter-based RNG identity contract keyed by seed, request identity, sampling-policy identity, absolute token position, draw class and draw index; draft-acceptance/residual draws therefore cannot advance or perturb the serial target draw assigned to any token position;
 - a portable lossless speculative-sampling verifier now implements per-token acceptance `min(1,p/q)`, rejection fallback from normalized `max(0,p-q)`, and ordinary target categorical sampling on the separately addressed serial-target RNG stream, with strict distribution validation.
+- deterministic distribution qualification now sweeps many independently keyed requests and checks that the speculative output marginal matches target `p` while observed draft acceptance matches `sum(min(p,q))` within declared statistical tolerances;
 
-Sampled speculative mathematics, RNG stream identity/consumption and the portable acceptance/residual sampler are now fixed. Sampled execution remains disabled until the sampler is independently distribution-qualified and integrated with rollback/commit semantics. The draft proposal seam is integrated, but concrete proposal-state
+Sampled speculative mathematics, RNG stream identity/consumption and the portable acceptance/residual sampler are now fixed, with an independent deterministic distribution-qualification test for output marginal and acceptance rate. Sampled execution remains disabled until the sampler is integrated with rollback/commit semantics. The draft proposal seam is integrated, but concrete proposal-state
 MTP compute semantics/kernels and native proposal qualification remain
 open; host-side measured drafter selection is now wired through repeatable campaign aggregation.
 
