@@ -452,8 +452,9 @@ Additional A1.6 runtime work now implemented:
 - a portable lossless speculative-sampling verifier now implements per-token acceptance `min(1,p/q)`, rejection fallback from normalized `max(0,p-q)`, and ordinary target categorical sampling on the separately addressed serial-target RNG stream, with strict distribution validation.
 - deterministic distribution qualification now sweeps many independently keyed requests and checks that the speculative output marginal matches target `p` while observed draft acceptance matches `sum(min(p,q))` within declared statistical tolerances;
 - a stateful sampled-cycle planner now maps accepted draft prefixes, first-rejection residuals, all-accepted target bonuses, EOS cropping and token budgets onto the same pre-window snapshot/restore/replay state semantics used by greedy speculation;
+- a sampled target executor now performs identity preflight, captures the pre-window snapshot, consumes target distributions, restores/replays only committed accepted candidates after rejection/EOS, and rolls back on verify/finalize/replay failures;
 
-Sampled speculative mathematics, RNG stream identity/consumption and the portable acceptance/residual sampler are fixed and distribution-qualified. Host-side sampled rollback/commit planning is now explicit; physical target-distribution execution plus snapshot/restore/replay integration remains pending. The draft proposal seam is integrated, but concrete proposal-state
+Sampled speculative mathematics, RNG stream identity/consumption and the portable acceptance/residual sampler are fixed and distribution-qualified. Host-side rollback/commit execution is now explicit; a concrete native backend that produces target distributions remains pending. The draft proposal seam is integrated, but concrete proposal-state
 MTP compute semantics/kernels and native proposal qualification remain
 open; host-side measured drafter selection is now wired through repeatable campaign aggregation.
 
