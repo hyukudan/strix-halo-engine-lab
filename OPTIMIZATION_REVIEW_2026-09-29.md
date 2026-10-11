@@ -6,7 +6,7 @@
 
 ## 1. Scope and evidence boundary
 
-The lab was inspected at `94d4333b7607343eabf64124ad0a1fbfd15b1861`. TensorFold was inspected at `191188075bca56a7c71074a79375eb4c1cb22e1c`, release 0.3.6.3 dated 2026-09-29. Selected implementation files, the relevant model recipes, and the lab architecture documents were read. This is not an exhaustive audit of either repository.
+The lab was inspected at `94d4333b7607343eabf64124ad0a1fbfd15b1861`. external execution study was inspected at `191188075bca56a7c71074a79375eb4c1cb22e1c`, release 0.3.6.3 dated 2026-09-29. Selected implementation files, the relevant model recipes, and the lab architecture documents were read. This is not an exhaustive audit of either repository.
 
 The Linux streaming implementation was inspected at `72d3fcf802c45d00b300f25b848a93c3a2bd7c7e`, `drivers/thunderbolt/stream.c`, blob `25c259dd07602dfadab4a0f1449411d08a65ee3d`.
 
@@ -333,7 +333,7 @@ The sequence is: semantic and platform truth; packed/recurrent/MoE operator qual
 
 ## 9. Explicit non-goals and claims not made
 
-This review does not claim a particular speedup, sustainable memory bandwidth, USB4 payload rate, optimal draft depth, optimal CPU thread count, or optimal power profile. It does not claim that all TensorFold paths use the same rollback strategy or that a selected controller method describes every outer disable policy.
+This review does not claim a particular speedup, sustainable memory bandwidth, USB4 payload rate, optimal draft depth, optimal CPU thread count, or optimal power profile. It does not claim that all external execution study paths use the same rollback strategy or that a selected controller method describes every outer disable policy.
 
 No Apple/NVIDIA backend, native vendor-specific low-precision execution path, generic multi-vendor abstraction, or accelerator-to-accelerator coherent memory model is proposed. A storage format bearing a vendor name is not itself proof of an instruction requirement, but adding more formats is separate from optimizing the first supported native path.
 
@@ -361,12 +361,12 @@ All lab references below use commit `94d4333b7607343eabf64124ad0a1fbfd15b1861`.
 
 ### Inspected comparative implementation
 
-- [T0] [TensorFold inspected release commit](https://github.com/ashhart/TensorFold/commit/191188075bca56a7c71074a79375eb4c1cb22e1c).
-- [T1] [Exact sampling](https://github.com/ashhart/TensorFold/blob/191188075bca56a7c71074a79375eb4c1cb22e1c/src/tensorfold/engine/exact_sampling.py).
-- [T2] [Flash Next decode](https://github.com/ashhart/TensorFold/blob/191188075bca56a7c71074a79375eb4c1cb22e1c/src/tensorfold/families/qwen4_exp/decode.py).
-- [T3] [Flash Next recurrent kernels](https://github.com/ashhart/TensorFold/blob/191188075bca56a7c71074a79375eb4c1cb22e1c/src/tensorfold/kernels/qwen/flash_next/v1/gdn.py).
-- [T4] [Draft-depth and row-allocation controller](https://github.com/ashhart/TensorFold/blob/191188075bca56a7c71074a79375eb4c1cb22e1c/src/tensorfold/engine/family_depth.py).
-- [T5] [Flash Next runtime](https://github.com/ashhart/TensorFold/blob/191188075bca56a7c71074a79375eb4c1cb22e1c/src/tensorfold/families/qwen4_exp/runtime.py).
+- [T0] private source record.
+- [T1] private source record.
+- [T2] private source record.
+- [T3] private source record.
+- [T4] private source record.
+- [T5] private source record.
 
 ### Platform and transport primary references
 

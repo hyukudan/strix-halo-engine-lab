@@ -60,8 +60,8 @@ std::uint16_t validate_slices(
         throw std::invalid_argument(
             "striped transfer plan requires at least two slices");
     }
-    if (transfer.link_plan.kind ==
-        transport::PlanKind::unavailable) {
+    if (transfer.link_plan.kind != transport::PlanKind::single_link &&
+        transfer.link_plan.kind != transport::PlanKind::striped) {
         throw std::invalid_argument(
             "unavailable transfer plan cannot reach native backend");
     }
@@ -75,6 +75,7 @@ std::uint16_t validate_slices(
         if (slice.link_index >=
                 session_count ||
             slice.byte_length == 0 ||
+            slice.byte_length > std::numeric_limits<std::uint32_t>::max() ||
             slice.byte_offset !=
                 expected_offset ||
             slice.byte_length >
@@ -106,16 +107,19 @@ std::uint16_t validate_slices(
 
 transport::TransferDescriptor slice_descriptor(
     const transport::TransferDescriptor& logical,
-    const transport::LinkSlice& slice) {
+    const transport::LinkSlice& slice,
+    const DistributedNativeSliceIdentity& identity) {
     auto descriptor =
         logical;
     descriptor.byte_length =
         slice.byte_length;
+    descriptor.connection_epoch = identity.connection_epoch;
+    descriptor.sequence = identity.sequence;
     return descriptor;
 }
 
 transport::GpuCommitRecord make_commit(
-    const transport::TransferDescriptor& logical,
+    const transport::TransferDescriptor& physical,
     const transport::LinkSlice& slice,
     std::uint16_t stripe_index,
     std::uint16_t stripe_count) {
@@ -127,13 +131,13 @@ transport::GpuCommitRecord make_commit(
 
     transport::GpuCommitRecord record;
     record.protocol_version =
-        logical.protocol_version;
+        physical.protocol_version;
     record.commit_word =
         transport::gpu_commit_word;
     record.connection_epoch =
-        logical.connection_epoch;
+        physical.connection_epoch;
     record.sequence =
-        logical.sequence;
+        physical.sequence;
     record.payload_bytes =
         static_cast<std::uint32_t>(
             slice.byte_length);
@@ -197,10 +201,6 @@ void DistributedBoundaryStagingProvider::consume_inbound_slice(
         staged);
 }
 
-void DistributedBoundaryStagingProvider::finish_inbound(
-    const DistributedExecutionBoundary&,
-    const DistributedBoundaryTransfer&) {}
-
 NativeDistributedBackend::NativeDistributedBackend(
     std::span<transport::DirectTransportNativeLinkSession*> sessions,
     DistributedNativeControlPlane& control,
@@ -213,9 +213,16 @@ NativeDistributedBackend::NativeDistributedBackend(
       staging_(&staging),
       policy_(policy) {
     if (sessions_.empty() ||
-        policy_.maximum_event_polls == 0) {
+        policy_.maximum_event_polls == 0 ||
+        policy_.maximum_consumer_polls == 0) {
         throw std::invalid_argument(
             "native distributed backend requires sessions and non-zero poll budget");
+    }
+}
+
+void NativeDistributedBackend::require_healthy() const {
+    if (failed_) {
+        throw std::logic_error("native distributed backend is poisoned");
     }
 }
 
@@ -225,7 +232,8 @@ NativeDistributedBackend::session_for_link(
     if (link_index >=
             sessions_.size() ||
         sessions_[link_index] == nullptr ||
-        !sessions_[link_index]->active()) {
+        !sessions_[link_index]->active() ||
+        sessions_[link_index]->lease().link_index != link_index) {
         throw std::invalid_argument(
             "distributed transfer references unavailable native link session");
     }
@@ -234,11 +242,13 @@ NativeDistributedBackend::session_for_link(
 
 void NativeDistributedBackend::execute_local_step(
     const DistributedStepPlacement& step) {
+    require_healthy();
     local_->execute_local_step(step);
 }
 
 void NativeDistributedBackend::execute_remote_step(
     const DistributedStepPlacement& step) {
+    require_healthy();
     control_->execute_remote_step(step);
 }
 
@@ -260,7 +270,10 @@ void NativeDistributedBackend::wait_send_reusable(
         static_cast<void>(
             session.poll_event());
     }
-    session.cancel(handle);
+    const auto& final = session.send_state(handle);
+    if (!final.failed && final.local_buffer_reusable) {
+        return;
+    }
     throw std::runtime_error(
         "native distributed send completion poll budget exhausted");
 }
@@ -284,7 +297,10 @@ void NativeDistributedBackend::wait_receive_complete(
         static_cast<void>(
             session.poll_event());
     }
-    session.cancel(handle);
+    const auto& final = session.receive_state(handle);
+    if (!final.failed && final.ownership == transport::BufferOwnership::receive_complete) {
+        return;
+    }
     throw std::runtime_error(
         "native distributed receive completion poll budget exhausted");
 }
@@ -308,6 +324,10 @@ void NativeDistributedBackend::wait_receive_reusable(
         static_cast<void>(
             session.poll_event());
     }
+    const auto& final = session.receive_state(handle);
+    if (!final.failed && final.ownership == transport::BufferOwnership::reusable) {
+        return;
+    }
     throw std::runtime_error(
         "native distributed receive repost poll budget exhausted");
 }
@@ -315,10 +335,25 @@ void NativeDistributedBackend::wait_receive_reusable(
 void NativeDistributedBackend::send_boundary(
     const DistributedExecutionBoundary& boundary,
     const DistributedBoundaryTransfer& transfer) {
+    require_healthy();
     const auto stripe_count =
         validate_slices(
             transfer,
             sessions_.size());
+    if (!transfer.native_slices.empty()) {
+        throw std::invalid_argument("native send requires an unbound logical transfer");
+    }
+    if (transfer.descriptor.boundary_id != boundary.boundary_id ||
+        transfer.descriptor.byte_length != boundary.payload_bytes ||
+        transfer.flow.direction != transport::LinkDirection::outbound ||
+        transfer.descriptor.sequence == 0 || transfer.descriptor.generation == 0 ||
+        !transport::validate_descriptor(transfer.descriptor,
+            {1, transfer.descriptor.connection_epoch, boundary.payload_bytes})) {
+        throw std::invalid_argument("native send metadata does not match boundary");
+    }
+
+    auto physical_transfer = transfer;
+    physical_transfer.native_slices.reserve(stripe_count);
 
     std::vector<NativePreparedTransfer>
         prepared;
@@ -326,6 +361,12 @@ void NativeDistributedBackend::send_boundary(
         transfer.link_plan.slices.size());
 
     try {
+        for (const auto& slice : transfer.link_plan.slices) {
+            auto& session = session_for_link(slice.link_index);
+            physical_transfer.native_slices.push_back({
+                session.lease().connection_epoch, session.reserve_send_sequence(),
+            });
+        }
         for (std::size_t index = 0;
              index <
                 transfer.link_plan.slices.size();
@@ -338,17 +379,19 @@ void NativeDistributedBackend::send_boundary(
             const auto stripe_index =
                 static_cast<std::uint16_t>(
                     index);
+            const auto& identity = physical_transfer.native_slices[index];
             const auto staged =
                 staging_->stage_outbound_slice(
                     boundary,
-                    transfer,
+                    physical_transfer,
                     slice,
                     stripe_index,
                     stripe_count);
             const auto descriptor =
                 slice_descriptor(
                     transfer.descriptor,
-                    slice);
+                    slice,
+                    identity);
             const auto handle =
                 session.prepare_send(
                     descriptor,
@@ -365,13 +408,13 @@ void NativeDistributedBackend::send_boundary(
 
         control_->publish_boundary_transfer(
             boundary,
-            transfer);
+            physical_transfer);
 
         for (auto& item :
              prepared) {
             const auto commit =
                 make_commit(
-                    transfer.descriptor,
+                    item.descriptor,
                     item.slice,
                     item.stripe_index,
                     stripe_count);
@@ -390,6 +433,7 @@ void NativeDistributedBackend::send_boundary(
                 item.handle);
         }
     } catch (...) {
+        failed_ = true;
         for (auto& item :
              prepared) {
             try {
@@ -410,6 +454,7 @@ void NativeDistributedBackend::send_boundary(
 DistributedBoundaryTransfer
 NativeDistributedBackend::receive_boundary(
     const DistributedExecutionBoundary& boundary) {
+    require_healthy();
     auto transfer =
         control_->await_boundary_transfer(
             boundary);
@@ -417,60 +462,67 @@ NativeDistributedBackend::receive_boundary(
         validate_slices(
             transfer,
             sessions_.size());
+    if (transfer.native_slices.size() != stripe_count ||
+        transfer.descriptor.boundary_id != boundary.boundary_id ||
+        transfer.descriptor.byte_length != boundary.payload_bytes ||
+        transfer.flow.direction != transport::LinkDirection::inbound ||
+        transfer.descriptor.sequence == 0 || transfer.descriptor.generation == 0 ||
+        !transport::validate_descriptor(transfer.descriptor,
+            {1, transfer.descriptor.connection_epoch, boundary.payload_bytes})) {
+        throw std::invalid_argument("native receive lacks exact physical/logical boundary identities");
+    }
+
+    // Validate every current epoch before reserving sequences or staging any
+    // payload. Logical request/plan reconciliation belongs to the control
+    // plane; physical descriptors retain those identities unchanged.
+    for (std::size_t index = 0; index < stripe_count; ++index) {
+        auto& session = session_for_link(transfer.link_plan.slices[index].link_index);
+        const auto& identity = transfer.native_slices[index];
+        if (identity.connection_epoch != session.lease().connection_epoch ||
+            identity.sequence == 0) {
+            throw std::invalid_argument("native receive slice epoch does not match leased link");
+        }
+    }
 
     std::vector<NativePreparedTransfer>
         prepared;
     prepared.reserve(
         transfer.link_plan.slices.size());
 
-    for (std::size_t index = 0;
-         index <
-            transfer.link_plan.slices.size();
-         ++index) {
-        const auto& slice =
-            transfer.link_plan.slices[index];
-        auto& session =
-            session_for_link(
-                slice.link_index);
-        const auto stripe_index =
-            static_cast<std::uint16_t>(
-                index);
-        const auto staged =
-            staging_->stage_inbound_slice(
-                boundary,
-                transfer,
-                slice,
-                stripe_index,
-                stripe_count);
-        const auto descriptor =
-            slice_descriptor(
-                transfer.descriptor,
-                slice);
-        const auto handle =
-            session.prepare_receive(
-                descriptor,
-                staged);
-        prepared.push_back({
-            &session,
-            handle,
-            descriptor,
-            staged,
-            slice,
-            stripe_index,
-        });
-    }
-
     try {
+        for (std::size_t index = 0;
+             index < transfer.link_plan.slices.size();
+             ++index) {
+            const auto& slice = transfer.link_plan.slices[index];
+            auto& session = session_for_link(slice.link_index);
+            const auto stripe_index = static_cast<std::uint16_t>(index);
+            const auto& identity = transfer.native_slices[index];
+            session.reserve_receive_sequence(identity.sequence);
+            const auto staged = staging_->stage_inbound_slice(
+                boundary, transfer, slice, stripe_index, stripe_count);
+            const auto descriptor = slice_descriptor(
+                transfer.descriptor, slice, identity);
+            const auto handle = session.prepare_receive(descriptor, staged);
+            prepared.push_back({
+                &session, handle, descriptor, staged, slice, stripe_index,
+            });
+        }
+
         for (auto& item :
              prepared) {
             item.session->submit(
                 item.handle);
         }
 
+        std::vector<transport::TransferDescriptor> physical_descriptors;
+        physical_descriptors.reserve(prepared.size());
+        for (const auto& item : prepared) {
+            physical_descriptors.push_back(item.descriptor);
+        }
         transport::StripedMessageTracker
             tracker(
                 transfer.descriptor,
-                stripe_count);
+                physical_descriptors);
 
         for (auto& item :
              prepared) {
@@ -481,6 +533,9 @@ NativeDistributedBackend::receive_boundary(
                 item.session->read_commit(
                     item.handle,
                     item.descriptor);
+            if (commit.stripe_index != item.stripe_index) {
+                throw std::runtime_error("native receive commit belongs to a different physical stripe");
+            }
             if (!tracker.observe_commit(
                     commit)) {
                 throw std::runtime_error(
@@ -508,9 +563,26 @@ NativeDistributedBackend::receive_boundary(
                 stripe_count,
                 item.staged);
         }
-        staging_->finish_inbound(
+        inbound_completion_ = staging_->finish_inbound(
             boundary,
             transfer);
+        if (!inbound_completion_) {
+            throw std::runtime_error("native receive consumer supplied no completion proof");
+        }
+        bool consumer_complete = false;
+        for (std::uint64_t poll = 0; poll < policy_.maximum_consumer_polls; ++poll) {
+            const auto status = inbound_completion_->poll();
+            if (status == DistributedInboundCompletionStatus::complete) {
+                consumer_complete = true;
+                break;
+            }
+            if (status == DistributedInboundCompletionStatus::failed) {
+                throw std::runtime_error("native receive consumer completion failed");
+            }
+        }
+        if (!consumer_complete) {
+            throw std::runtime_error("native receive consumer completion poll budget exhausted");
+        }
 
         for (auto& item :
              prepared) {
@@ -528,7 +600,9 @@ NativeDistributedBackend::receive_boundary(
                 *item.session,
                 item.handle);
         }
+        inbound_completion_.reset();
     } catch (...) {
+        failed_ = true;
         for (auto& item :
              prepared) {
             try {
@@ -538,8 +612,10 @@ NativeDistributedBackend::receive_boundary(
                             item.handle);
                 if (state.ownership ==
                         transport::BufferOwnership::transport_owned) {
-                    item.session->cancel(
-                        item.handle);
+                    try { item.session->cancel(item.handle); } catch (...) {}
+                }
+                if (state.ownership != transport::BufferOwnership::reusable) {
+                    item.session->quarantine_receive(item.handle);
                 }
             } catch (...) {
             }

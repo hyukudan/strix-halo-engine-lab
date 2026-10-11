@@ -74,7 +74,42 @@ DirectNativeReadiness assess_direct_native_readiness(
             "remote consumer-complete credit is unavailable");
     require(native.receive_repost,
             "native receive repost is unavailable");
+    require(native.query_status == DirectNativeQueryStatus::verified,
+            "native ABI capability query is unavailable, unsupported or unverified");
+    require(native.observed_interface.has_value(),
+            "native ABI proof identity is missing");
+    if (native.observed_interface) {
+        const auto& identity = *native.observed_interface;
+        require(identity.proof_contract_version == 1 &&
+                    !identity.kernel_release.empty() && !identity.driver_identity.empty() &&
+                    !identity.abi_identity.empty() && !identity.local_endpoint_identity.empty() &&
+                    !identity.peer_endpoint_identity.empty() &&
+                    identity.local_endpoint_identity != identity.peer_endpoint_identity &&
+                    !identity.physical_link_id.empty() && identity.connection_epoch != 0,
+                "native ABI proof identity is incomplete or incompatible");
+    }
+    require(native.imported_tx_rx_ownership_verified,
+            "imported TX/RX pool ownership semantics are unproven");
+    require(native.completion_ownership_verified,
+            "native event/repost/consumer-credit ownership semantics are unproven");
+    require(native.external_dma_visibility_qualified,
+            "GPU/external-DMA release/acquire visibility is unqualified");
 
+    result.ready = result.blockers.empty();
+    return result;
+}
+
+DirectNativeReadiness assess_direct_native_readiness(
+    const BackendCapabilities& backend,
+    const DirectNativeCapabilities& native,
+    const DirectLinkLifecycle& expected_link) {
+    auto result = assess_direct_native_readiness(backend, native);
+    if (!expected_link.expected_native_interface || !native.observed_interface ||
+        *expected_link.expected_native_interface != *native.observed_interface ||
+        native.observed_interface->physical_link_id != expected_link.physical_link_id ||
+        native.observed_interface->connection_epoch != expected_link.connection_epoch) {
+        result.blockers.emplace_back("native ABI/driver/peer/link/epoch proof does not match expected connection");
+    }
     result.ready = result.blockers.empty();
     return result;
 }
@@ -88,7 +123,8 @@ void prepare_direct_native_link(
     const auto readiness =
         assess_direct_native_readiness(
             backend.capabilities(),
-            backend.direct_capabilities());
+            backend.direct_capabilities(),
+            link);
     if (!readiness.ready) {
         throw std::logic_error(
             "native direct transport backend is not capability-complete");

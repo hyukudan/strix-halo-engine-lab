@@ -1,7 +1,7 @@
 # Especificación técnica v0.4 — motor propio para Strix Halo
 
-Estado: borrador de investigación revisado por Opus 5.5 y ampliado con fuentes
-oficiales Qwen, política GTT y revisión pwilkin. Persisten puertas P0 y la
+Estado: borrador de investigación revisado para aceptación técnica y ampliado con fuentes
+oficiales Qwen, política GTT y revisión external platform study. Persisten puertas P0 y la
 medición en hardware. Nombre del proyecto aún no decidido.
 
 Trazabilidad: los datos que sustentan esta especificación están indexados en
@@ -14,7 +14,7 @@ interpretarse como requisito cerrado.
 Construir un motor de inferencia local, reproducible y auditable para AMD Strix
 Halo `gfx1151`, optimizado primero para Qwen3.8-Flash-Next. Debe combinar alto
 prefill, decode competitivo, concurrencia real y calidad verificable. No será un
-fork de GUFO ni una reconstrucción de Halogen.
+fork de external runtime B ni una reconstrucción de external runtime A.
 
 ### Metas iniciales
 
@@ -38,7 +38,7 @@ fork de GUFO ni una reconstrucción de Halogen.
 ## 2. Principios
 
 1. **Código propio y procedencia auditable.** Contratos desde papers, fuentes
-   públicas canónicas y oráculos independientes. Halogen solo aporta
+   públicas canónicas y oráculos independientes. external runtime A solo aporta
    observaciones agregadas anonimizadas; no se copian cuerpos, firmas ni
    estructuras de kernels.
 2. **Especialización finita y justificada.** Cada variante debe corresponder a
@@ -50,7 +50,7 @@ fork de GUFO ni una reconstrucción de Halogen.
 5. **Una implementación ganadora.** Experimentos perdedores se documentan y se
    eliminan; no se acumulan flags permanentes.
 6. **Fuente primaria antes que referencia.** QSA, GDN, Gated Residual, MoE y
-   n-gram se especifican desde Qwen oficial; Halogen, GUFO y pwilkin sirven para
+   n-gram se especifican desde Qwen oficial; external runtime A, external runtime B y external platform study sirven para
    formular y contrastar hipótesis, nunca como único oráculo.
 
 ## 3. Arquitectura
@@ -153,7 +153,7 @@ producción de forma no determinista.
 6. Sampling/argmax y verificación MTP.
 
 Para cada familia se probarán wave32 y wave64 donde tengan sentido; el dato de
-Halogen no se convertirá en una regla universal.
+external runtime A no se convertirá en una regla universal.
 
 ## 4. Scheduling y especulación
 
@@ -218,7 +218,7 @@ microbenchmark no cuenta hasta sobrevivir al request completo sin profiler.
 - inventario de hardware/software;
 - confirmación de ejecución de los objetos producidos en A0;
 - medidor de ancho de banda y techo WMMA;
-- harness común para Halogen, GUFO y nuestro binario;
+- harness común para external runtime A, external runtime B y nuestro binario;
 - corpus y pesos fijados por hash.
 
 ### Fase B — referencia correcta
@@ -257,12 +257,12 @@ potencia/TDP, clocks y temperatura junto al entorno software.
 
 1. Elegir checkpoint público y cuantización canónica tras demostrar un
    presupuesto completo dentro de 128 GB UMA.
-2. Medir Halogen y GUFO con el mismo prompt, contexto, potencia y criterio de
+2. Medir external runtime A y external runtime B con el mismo prompt, contexto, potencia y criterio de
    tokens completados.
 3. Confirmar Linux/ROCm/kernel de la máquina objetivo.
 4. Decidir si el caché interno de pesos compensa tiempo de arranque y espacio.
 5. Fijar licencia y política de reutilización MIT.
-6. Resolver los P0 de `OPUS_REVIEW.md` y someter la spec consolidada a una
+6. Resolver los P0 de `DESIGN_ACCEPTANCE.md` y someter la spec consolidada a una
    segunda revisión.
 7. Fijar repo, commit y licencia canónicos para QSA, DeltaNet, routing MoE,
    MTP, tokenizer y chat template.
@@ -317,7 +317,7 @@ con salida del modelo estrictamente sanitizada.
 
 | Versión | Fecha | Cambio |
 | --- | --- | --- |
-| 0.4 | 2026-09-28 | Fuentes Qwen oficiales, política UMA/GTT y aprendizajes de pwilkin: GDN tiled, PLE directo, UMA ring y controles negativos de QSA/PM4. |
-| 0.3 | 2026-09-28 | Incorpora revisión Opus: P0, alcance reducido, contratos numéricos, A0 y separación de privilegios. |
+| 0.4 | 2026-09-28 | Fuentes Qwen oficiales, política UMA/GTT y aprendizajes de external platform study: GDN tiled, PLE directo, UMA ring y controles negativos de QSA/PM4. |
+| 0.3 | 2026-09-28 | Incorpora revisión de diseño: P0, alcance reducido, contratos numéricos, A0 y separación de privilegios. |
 | 0.2 | 2026-09-28 | Cross-compilación previa al hardware y plano administrativo remoto. |
 | 0.1 | 2026-09-28 | Alcance inicial, arquitectura, calidad, benchmark y fases. |

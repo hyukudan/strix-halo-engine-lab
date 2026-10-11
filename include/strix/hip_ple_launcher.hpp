@@ -2,10 +2,13 @@
 
 #include "strix/execution_binding.hpp"
 #include "strix/hip_runtime_launchers.hpp"
+#include "strix/hip_host_upload_backend.hpp"
 #include "strix/launch_dispatch.hpp"
 #include "strix/model_contract.hpp"
+#include "strix/ple_lookup.hpp"
 
 #include <cstdint>
+#include <memory>
 #include <string>
 
 namespace strix {
@@ -15,6 +18,13 @@ struct HipPleLauncherConfig {
         ModelContract::qwen38_flash_next();
     HipActivationStorage activation =
         HipActivationStorage::bf16;
+    // Default keeps the existing synchronous copy and creates no upload pool.
+    // Opt-in bundles require this fixed additional pinned-host admission budget.
+    static constexpr std::uint64_t owned_event_upload_maximum_bytes =
+        PleHashContract::maximum_heads * 512;
+    bool enable_owned_event_upload = false;
+    // An injected pool is an explicit alternative and outlives the launcher.
+    HostUploadPool* upload_pool = nullptr;
 };
 
 void register_hip_ple_kernel_variant(
@@ -33,8 +43,8 @@ make_hip_ple_launcher(
 class HipPleLauncherBundle {
 public:
     explicit HipPleLauncherBundle(
-        HipPleLauncherConfig config)
-        : config_(config) {}
+        HipPleLauncherConfig config);
+    ~HipPleLauncherBundle();
 
     HipPleLauncherBundle(
         const HipPleLauncherBundle&) = delete;
@@ -49,7 +59,13 @@ public:
         const CompiledSerialExecution& compiled,
         ExecutionLauncherRegistry& registry);
 
+    [[nodiscard]] std::uint64_t owned_upload_admission_bytes() const noexcept {
+        return uploads_ ? HipPleLauncherConfig::owned_event_upload_maximum_bytes : 0;
+    }
+
 private:
+    struct OwnedUploads;
+    std::unique_ptr<OwnedUploads> uploads_;
     HipPleLauncherConfig config_;
 };
 

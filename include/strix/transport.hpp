@@ -193,6 +193,12 @@ public:
         TransferDescriptor descriptor,
         std::uint16_t stripe_count);
 
+    // Physical descriptors preserve logical execution identity but bind each
+    // stripe to its own leased epoch, sequence and exact payload length.
+    StripedMessageTracker(
+        TransferDescriptor logical_descriptor,
+        std::span<const TransferDescriptor> physical_descriptors);
+
     [[nodiscard]] bool observe_commit(
         const GpuCommitRecord& record);
 
@@ -220,6 +226,7 @@ private:
     bool complete_ = false;
     bool invalid_ = false;
     std::vector<std::uint32_t> stripe_bytes_;
+    std::vector<TransferDescriptor> physical_descriptors_;
 };
 
 enum class DirectLinkLifecycleState {
@@ -231,6 +238,22 @@ enum class DirectLinkLifecycleState {
     draining,
     partial,
     failed,
+};
+
+// An engine proof identity, not a guessed kernel ioctl layout. A concrete
+// backend must query a supported ABI and qualify its ownership/visibility
+// semantics before publishing matching evidence for this exact connection.
+struct DirectNativeInterfaceIdentity {
+    std::uint32_t proof_contract_version = 1;
+    std::string kernel_release;
+    std::string driver_identity;
+    std::string abi_identity;
+    std::string local_endpoint_identity;
+    std::string peer_endpoint_identity;
+    std::string physical_link_id;
+    std::uint64_t connection_epoch = 0;
+
+    bool operator==(const DirectNativeInterfaceIdentity&) const = default;
 };
 
 struct DirectLinkLifecycle {
@@ -248,6 +271,9 @@ struct DirectLinkLifecycle {
     bool exclusive_lease_available = false;
     bool dma_buf_import_supported = false;
     bool completion_rearm_qualified = false;
+    // Expected identity from explicit local inspection + peer reconciliation.
+    // Static module/device discovery must not populate a positive proof.
+    std::optional<DirectNativeInterfaceIdentity> expected_native_interface;
 };
 
 [[nodiscard]] bool direct_link_armable(

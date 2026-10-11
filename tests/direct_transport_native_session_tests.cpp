@@ -1,4 +1,5 @@
 #include "strix/direct_transport_native_session.hpp"
+#include "direct_native_fixture.hpp"
 
 #include <deque>
 #include <iostream>
@@ -33,9 +34,7 @@ public:
 
     strix::transport::DirectNativeCapabilities
     direct_capabilities() const override {
-        return {
-            true, true, true, true, true, true, true,
-        };
+        return synthetic_native_capabilities(native_identity);
     }
 
     void import_link_pool(
@@ -103,6 +102,7 @@ public:
     }
 
     int imports = 0;
+    strix::transport::DirectNativeInterfaceIdentity native_identity;
     int releases = 0;
     int prepared_sends = 0;
     int prepared_receives = 0;
@@ -129,6 +129,7 @@ strix::transport::DirectLinkLifecycle link() {
     value.exclusive_lease_available = true;
     value.completion_rearm_qualified = true;
     value.dma_buf_import_supported = true;
+    value.expected_native_interface = synthetic_native_identity(value);
     return value;
 }
 
@@ -195,6 +196,7 @@ int main() {
     auto memory = pools();
     DirectTransportLeaseRegistry leases;
     FakeBackend backend;
+    backend.native_identity = *lifecycle.expected_native_interface;
 
     {
         auto session =
@@ -207,6 +209,25 @@ int main() {
                 session.lease().lease_generation ==
                     backend.imported_generation,
             "native link session acquires lease and imports exact pool generation");
+
+        expect(session.reserve_send_sequence() == 1 &&
+                   session.reserve_send_sequence() == 2,
+               "physical sequence reservations advance independently of logical descriptors");
+        session.reserve_receive_sequence(5);
+
+        const auto expected_identity = lifecycle.expected_native_interface;
+        for (int drift = 0; drift < 3; ++drift) {
+            lifecycle.expected_native_interface = expected_identity;
+            if (drift == 0) lifecycle.expected_native_interface->abi_identity = "changed-abi";
+            if (drift == 1) lifecycle.expected_native_interface->peer_endpoint_identity = "changed-peer";
+            if (drift == 2) lifecycle.expected_native_interface->driver_identity = "changed-driver";
+            bool drift_rejected = false;
+            try { static_cast<void>(session.prepare_send(descriptor(), memory.links[0].tx)); }
+            catch (const std::logic_error&) { drift_rejected = true; }
+            expect(drift_rejected && backend.prepared_sends == 0,
+                   "post-open ABI/peer/driver drift fails before any native preparation call");
+        }
+        lifecycle.expected_native_interface = expected_identity;
 
         const auto desc = descriptor();
 
@@ -386,6 +407,14 @@ int main() {
         expect(
             leases.leased("usb4-a"),
             "second session reacquires released physical link");
+        expect(session.reserve_send_sequence() == 3,
+               "same-epoch lease reopen retains physical send sequence history");
+        bool replay_rejected = false;
+        try { session.reserve_receive_sequence(5); }
+        catch (const std::invalid_argument&) { replay_rejected = true; }
+        expect(replay_rejected,
+               "same-epoch lease reopen retains receive replay protection");
+        session.reserve_receive_sequence(6);
     }
     expect(
         !leases.leased("usb4-a") &&
@@ -406,6 +435,25 @@ int main() {
         expect(
             stale_rejected,
             "session rejects operations after leased link epoch changes");
+    }
+
+    {
+        lifecycle.expected_native_interface = synthetic_native_identity(lifecycle);
+        backend.native_identity = *lifecycle.expected_native_interface;
+        auto session = DirectTransportNativeLinkSession::open(
+            backend, leases, lifecycle, memory, 0);
+        auto desc = descriptor();
+        desc.connection_epoch = lifecycle.connection_epoch;
+        const auto handle = session.prepare_receive(desc, memory.links[0].rx);
+        session.quarantine_receive(handle);
+        session.close();
+        auto reopened = DirectTransportNativeLinkSession::open(
+            backend, leases, lifecycle, memory, 0);
+        bool quarantined_rejected = false;
+        try { static_cast<void>(reopened.prepare_receive(desc, memory.links[0].rx)); }
+        catch (const std::logic_error&) { quarantined_rejected = true; }
+        expect(reopened.receive_quarantined() && quarantined_rejected,
+               "same-epoch reopen cannot discard quarantined RX state");
     }
 
     if (failures == 0) {

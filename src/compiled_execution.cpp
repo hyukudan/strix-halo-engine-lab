@@ -7,6 +7,40 @@
 #include <vector>
 
 namespace strix {
+
+namespace {
+GraphExecutionContract serial_graph_contract(const CompiledSerialExecution& compiled) {
+    bool safe = compiled.whole_plan_graph_safe && compiled.dynamic_steps == 0 &&
+        compiled.non_graph_safe_steps == 0 && !compiled.execution.steps.empty() &&
+        compiled.bindings.missing_steps == 0 &&
+        compiled.bindings.bindings.size() == compiled.execution.steps.size();
+    for (const auto& step : compiled.execution.steps) {
+        safe = safe && !step.dynamic_shape && step.graph_safe_candidate;
+    }
+    for (const auto& binding : compiled.bindings.bindings) {
+        safe = safe && !binding.host_or_runtime_step && binding.kernel_id.has_value();
+    }
+    return {compiled.execution_identity, compiled.kernel_plan_identity, compiled.logical_rows, safe};
+}
+} // namespace
+
+GraphCapturePlan prepare_compiled_serial_graph_capture(
+    const CompiledSerialExecution& compiled, const ExecutionRuntimeResources& resources,
+    const GraphDynamicArguments& arguments, const GraphMemoryRequest& memory) {
+    return prepare_graph_capture_plan(
+        serial_graph_contract(compiled),
+        compiled.arena, resources, arguments, memory);
+}
+
+GraphEligibility assess_compiled_serial_graph_replay(
+    const CompiledSerialExecution& compiled, const GraphCapturePlan& capture,
+    const ExecutionRuntimeResources& resources, const GraphDynamicArguments& arguments,
+    std::uint64_t position) {
+    return assess_graph_replay_eligibility(capture,
+        serial_graph_contract(compiled),
+        compiled.arena, resources, arguments, position);
+}
+
 namespace {
 
 constexpr std::uint64_t fnv_offset =

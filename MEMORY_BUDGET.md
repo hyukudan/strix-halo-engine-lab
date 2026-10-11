@@ -12,7 +12,7 @@ kernel, servicios, page cache, recuperación y picos temporales.
 - BIOS: carve-out gráfico mínimo que permita el firmware (objetivo 0,5–2 GiB,
   nunca `Auto` sin comprobar el resultado).
 - GTT: calcular desde la RAM real y ofrecer un perfil máximo cercano a 124 GiB.
-  La cifra publicada por Halogen para un equipo nominal de 128 GB es
+  La cifra publicada por external runtime A para un equipo nominal de 128 GB es
   `amdgpu.gttsize=126976` MiB y `ttm.pages_limit=32505856` páginas de 4 KiB.
 - Admisión: conservar 16–20 GiB de margen efectivo para host, page cache,
   recuperación y picos, aunque el mapping limit sea mayor. El máximo mapeable
@@ -21,7 +21,7 @@ kernel, servicios, page cache, recuperación y picos temporales.
   RSS/PSS, page cache y categorías internas del motor.
 - Si un proceso muere sucio y quedan 35–45 GiB aparentes en GTT, impedir el
   reinicio automático del modelo, drenar el servicio y recomendar reinicio del
-  host. La cifra es una observación publicada por Halogen y deberá reproducirse.
+  host. La cifra es una observación publicada por external runtime A y deberá reproducirse.
 
 `amd_iommu=off` no será predeterminado: puede mejorar prefill en un host dedicado,
 pero reduce aislamiento DMA y desactiva el NPU. Solo podrá existir como perfil
@@ -68,8 +68,8 @@ contabilidad propia; se compararán `O_DIRECT` y/o `posix_fadvise(DONTNEED)` par
 evitar que `pread` convierta la reserva del host en page cache invisible.
 
 El tamaño en disco no equivale al working set. Como referencia externa,
-Halogen publica unos 118 GiB de ficheros para base+overlay pero unos 68 GiB
-residentes más una tabla n-gram mapeada; pwilkin mantiene fuera del resident set
+external runtime A publica unos 118 GiB de ficheros para base+overlay pero unos 68 GiB
+residentes más una tabla n-gram mapeada; external platform study mantiene fuera del resident set
 una PLE de 27,5 GB mediante lectura directa. Ambos resultados requieren
 reproducción en nuestro hardware y modelo elegido.
 

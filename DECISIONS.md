@@ -4,8 +4,8 @@
 
 | ID | Decisión | Motivo | Evidencia | Revisión |
 | --- | --- | --- | --- | --- |
-| D-001 | Construir un motor propio; Halogen y GUFO son referencias. | Evita depender de una base cerrada o convertir GUFO en destino de cambios. | Alcance confirmado por el usuario. | Reabrir solo por decisión explícita. |
-| D-002 | Mantener observación no derivativa respecto a Halogen. | Obtener ideas generales sin copiar, reconstruir ni redistribuir implementaciones. | Licencia Halogen y alcance confirmado. | Auditar artefactos y procedencia antes de publicar código. |
+| D-001 | Construir un motor propio; external runtime A y external runtime B son referencias. | Evita depender de una base cerrada o convertir external runtime B en destino de cambios. | Alcance confirmado por el usuario. | Reabrir solo por decisión explícita. |
+| D-002 | Mantener observación no derivativa respecto a external runtime A. | Obtener ideas generales sin copiar, reconstruir ni redistribuir implementaciones. | Licencia external runtime A y alcance confirmado. | Auditar artefactos y procedencia antes de publicar código. |
 | D-003 | Empezar por Linux nativo, ROCm y `gfx1151`. | Es el entorno real de los dos motores y permite optimización específica. | E-001, documentación de ambos proyectos. | Revisar después de una primera versión estable. |
 | D-004 | Usar GGUF como entrada inicial. | Formato público, pesos disponibles y menor dependencia de formatos privados. | E-009. | Medir después un caché interno lossless. |
 | D-005 | Calidad y reproducibilidad son puertas, no tareas posteriores. | MTP, recurrencia y cuantización pueden producir ganancias engañosas. | E-008, E-010. | Permanente. |
@@ -47,12 +47,12 @@
 
 | ID | Alternativa | Motivo |
 | --- | --- | --- |
-| X-001 | Modificar GUFO como producto final. | No coincide con la meta de una solución propia. |
-| X-002 | Copiar o reconstruir kernels de Halogen. | Fuera del alcance clean-room y contrario al objetivo de código propio. |
+| X-001 | Modificar external runtime B como producto final. | No coincide con la meta de una solución propia. |
+| X-002 | Copiar o reconstruir kernels de external runtime A. | Fuera del alcance clean-room y contrario al objetivo de código propio. |
 | X-003 | Diseñar desde el inicio para múltiples GPU/modelos. | Añadiría abstracción antes de validar el fast path `gfx1151`. |
 
 ## Formato de revisión
 
 Toda decisión nueva indicará: alternativas, evidencia, riesgo, consecuencia en
-la spec y condición de reapertura. Las objeciones de Opus se enlazarán aquí y
-en `OPUS_REVIEW.md`.
+la spec y condición de reapertura. Las acciones de aceptación se enlazarán aquí y
+en `DESIGN_ACCEPTANCE.md`.

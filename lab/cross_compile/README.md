@@ -17,7 +17,7 @@ compila no demuestra que sea rápido ni siquiera que ejecute correctamente.
 
 ## Toolchain provisional verificado
 
-La imagen runtime de Halogen no contiene los headers C++ necesarios y no sirve
+La imagen runtime de external runtime A no contiene los headers C++ necesarios y no sirve
 como entorno de desarrollo completo. La prueba correcta usa la imagen pública
 `rocm/dev-ubuntu-24.04:7.2.4`, fijada por digest:
 

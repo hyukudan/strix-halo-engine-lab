@@ -5,6 +5,41 @@
 #include <vector>
 
 namespace strix {
+
+namespace {
+GraphExecutionContract verify_graph_contract(const CompiledSpeculativeVerifyExecution& compiled) {
+    bool safe = compiled.whole_plan_graph_safe && compiled.dynamic_steps == 0 &&
+        !compiled.verify.steps.empty() && compiled.bindings.missing_steps == 0 &&
+        compiled.bindings.bindings.size() == compiled.verify.steps.size();
+    for (const auto& step : compiled.verify.steps) {
+        safe = safe && !step.dynamic_shape && step.graph_safe_candidate &&
+            step.mode != SpeculativeVerifyMode::dynamic_row_parallel &&
+            step.mode != SpeculativeVerifyMode::runtime_position_window;
+    }
+    for (const auto& binding : compiled.bindings.bindings) {
+        safe = safe && !binding.host_or_runtime_step && binding.kernel_id.has_value();
+    }
+    return {compiled.execution_identity, compiled.kernel_plan_identity, compiled.candidate_depth, safe};
+}
+} // namespace
+
+GraphCapturePlan prepare_compiled_verify_graph_capture(
+    const CompiledSpeculativeVerifyExecution& compiled, const ExecutionRuntimeResources& resources,
+    const GraphDynamicArguments& arguments, const GraphMemoryRequest& memory) {
+    return prepare_graph_capture_plan(
+        verify_graph_contract(compiled),
+        compiled.arena, resources, arguments, memory);
+}
+
+GraphEligibility assess_compiled_verify_graph_replay(
+    const CompiledSpeculativeVerifyExecution& compiled, const GraphCapturePlan& capture,
+    const ExecutionRuntimeResources& resources, const GraphDynamicArguments& arguments,
+    std::uint64_t position) {
+    return assess_graph_replay_eligibility(capture,
+        verify_graph_contract(compiled),
+        compiled.arena, resources, arguments, position);
+}
+
 namespace {
 
 constexpr std::uint64_t fnv_offset =

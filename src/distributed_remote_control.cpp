@@ -64,14 +64,19 @@ void SequencedDistributedNativeControlPlane::publish_boundary_transfer(
     require_healthy();
     const bool ok=boundary_in_plan(b) && b.source_node==placement_->local_node &&
         t.flow.direction==transport::LinkDirection::outbound &&
+        t.descriptor.protocol_version==protocol_version_ &&
         t.descriptor.connection_epoch==request_.connection_epoch &&
         t.descriptor.model_plan_id==placement_->plan_identity &&
         t.descriptor.request_id==request_.request_id &&
         t.descriptor.generation==request_.generation &&
         t.descriptor.boundary_id==b.boundary_id &&
+        t.descriptor.dtype_id==request_.dtype_id &&
+        t.descriptor.sequence==next_boundary_send_sequence_ &&
+        next_boundary_send_sequence_!=std::numeric_limits<std::uint64_t>::max() &&
         t.descriptor.byte_length==b.payload_bytes;
     if(!ok){failed_=true; throw std::invalid_argument("outbound boundary metadata does not match control request");}
     wire_->publish_boundary_transfer(b,t);
+    ++next_boundary_send_sequence_;
 }
 DistributedBoundaryTransfer SequencedDistributedNativeControlPlane::await_boundary_transfer(
     const DistributedExecutionBoundary& b) {
@@ -81,13 +86,18 @@ DistributedBoundaryTransfer SequencedDistributedNativeControlPlane::await_bounda
     }
     auto t=wire_->await_boundary_transfer(b);
     const bool ok=t.flow.direction==transport::LinkDirection::inbound &&
+        t.descriptor.protocol_version==protocol_version_ &&
         t.descriptor.connection_epoch==request_.connection_epoch &&
         t.descriptor.model_plan_id==placement_->plan_identity &&
         t.descriptor.request_id==request_.request_id &&
         t.descriptor.generation==request_.generation &&
         t.descriptor.boundary_id==b.boundary_id &&
+        t.descriptor.dtype_id==request_.dtype_id &&
+        t.descriptor.sequence==next_boundary_receive_sequence_ &&
+        next_boundary_receive_sequence_!=std::numeric_limits<std::uint64_t>::max() &&
         t.descriptor.byte_length==b.payload_bytes;
     if(!ok){failed_=true; throw std::runtime_error("inbound boundary metadata is stale or foreign");}
+    ++next_boundary_receive_sequence_;
     return t;
 }
 }  // namespace strix

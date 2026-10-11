@@ -1,7 +1,9 @@
 #include "strix/distributed_native_backend.hpp"
+#include "direct_native_fixture.hpp"
 
 #include <array>
 #include <deque>
+#include <functional>
 #include <iostream>
 #include <optional>
 #include <string>
@@ -38,7 +40,7 @@ public:
 
     strix::transport::DirectNativeCapabilities
     direct_capabilities() const override {
-        return {true,true,true,true,true,true,true};
+        return synthetic_native_capabilities(native_identity);
     }
 
     void import_link_pool(
@@ -53,12 +55,16 @@ public:
         const strix::transport::TransportBufferView&) override {
         const auto handle = next_handle++;
         sends.push_back({handle,descriptor.byte_length});
+        send_descriptors.push_back(descriptor);
         return handle;
     }
 
     strix::transport::TransferHandle prepare_receive(
         const strix::transport::TransferDescriptor& descriptor,
         const strix::transport::TransportBufferView&) override {
+        if (fail_receive_prepare) {
+            throw std::runtime_error("injected receive prepare failure");
+        }
         const auto handle = next_handle++;
         receives.push_back({handle,descriptor.byte_length});
         receive_descriptors.push_back({
@@ -70,6 +76,7 @@ public:
 
     void submit(
         strix::transport::TransferHandle handle) override {
+        if (suppress_events) return;
         for (const auto& item : sends) {
             if (item.first == handle) {
                 events.push_back({
@@ -90,7 +97,9 @@ public:
     }
 
     void cancel(
-        strix::transport::TransferHandle) override {}
+        strix::transport::TransferHandle handle) override {
+        canceled.push_back(handle);
+    }
 
     void publish_gpu_commit(
         strix::transport::TransferHandle,
@@ -102,6 +111,7 @@ public:
 
     strix::transport::GpuCommitRecord read_gpu_commit(
         strix::transport::TransferHandle handle) override {
+        if (commit_override) return *commit_override;
         for (const auto& item : receive_descriptors) {
             if (item.first != handle) {
                 continue;
@@ -136,6 +146,7 @@ public:
 
     void repost_receive(
         strix::transport::TransferHandle handle) override {
+        ++reposts;
         for (const auto& item : receives) {
             if (item.first == handle) {
                 events.push_back({
@@ -155,8 +166,17 @@ public:
     }
 
     std::uint64_t next_handle = 100;
+    strix::transport::DirectNativeInterfaceIdentity native_identity =
+        {1, "synthetic-kernel", "synthetic-driver-build", "synthetic-abi-v1",
+         "synthetic-local-node", "synthetic-peer-node", "usb4-a", 9};
     int commits = 0;
     int credits = 0;
+    int reposts = 0;
+    bool fail_receive_prepare = false;
+    bool suppress_events = false;
+    std::optional<strix::transport::GpuCommitRecord> commit_override;
+    std::vector<strix::transport::TransferHandle> canceled;
+    std::vector<strix::transport::TransferDescriptor> send_descriptors;
     std::uint16_t receive_stripe_index = 0;
     std::uint16_t receive_stripe_count = 1;
     std::vector<strix::transport::GpuCommitRecord>
@@ -168,6 +188,40 @@ public:
         strix::transport::TransferDescriptor>>
         receive_descriptors;
     std::deque<strix::transport::DirectNativeEvent> events;
+};
+
+struct ConsumerProofState {
+    int pending_polls = 0;
+    int polls = 0;
+    int destroyed = 0;
+    bool fail = false;
+    bool throw_on_poll = false;
+    std::function<void()> check_ownership;
+};
+
+class ConsumerProof final : public strix::DistributedInboundCompletion {
+public:
+    explicit ConsumerProof(std::shared_ptr<ConsumerProofState> state)
+        : state_(std::move(state)) {}
+
+    ~ConsumerProof() override { ++state_->destroyed; }
+
+    strix::DistributedInboundCompletionStatus poll() override {
+        ++state_->polls;
+        if (state_->check_ownership) state_->check_ownership();
+        if (state_->throw_on_poll) {
+            throw std::runtime_error("injected completion query failure");
+        }
+        if (state_->polls <= state_->pending_polls) {
+            return strix::DistributedInboundCompletionStatus::pending;
+        }
+        return state_->fail
+            ? strix::DistributedInboundCompletionStatus::failed
+            : strix::DistributedInboundCompletionStatus::complete;
+    }
+
+private:
+    std::shared_ptr<ConsumerProofState> state_;
 };
 
 class Control final
@@ -227,6 +281,16 @@ public:
         const strix::DistributedExecutionBoundary&,
         const strix::transport::TransportBufferView&) override {
         ++consumed;
+        if (throw_on_consume) throw std::runtime_error("injected consumer launch failure");
+    }
+
+    std::unique_ptr<strix::DistributedInboundCompletion> finish_inbound(
+        const strix::DistributedExecutionBoundary&,
+        const strix::DistributedBoundaryTransfer&) override {
+        ++finished;
+        if (throw_on_finish) throw std::runtime_error("injected finish failure");
+        if (omit_proof) return nullptr;
+        return std::make_unique<ConsumerProof>(proof);
     }
 
     strix::transport::TransportBufferView tx;
@@ -234,6 +298,12 @@ public:
     int outbound = 0;
     int inbound = 0;
     int consumed = 0;
+    int finished = 0;
+    bool omit_proof = false;
+    bool throw_on_consume = false;
+    bool throw_on_finish = false;
+    std::shared_ptr<ConsumerProofState> proof =
+        std::make_shared<ConsumerProofState>();
 };
 
 class StripedStaging final
@@ -296,10 +366,11 @@ public:
             stripe_count;
     }
 
-    void finish_inbound(
+    std::unique_ptr<strix::DistributedInboundCompletion> finish_inbound(
         const strix::DistributedExecutionBoundary&,
         const strix::DistributedBoundaryTransfer&) override {
         ++finished;
+        return std::make_unique<ConsumerProof>(proof);
     }
 
     std::array<
@@ -311,6 +382,8 @@ public:
     int outbound_slices = 0;
     int inbound_slices = 0;
     int finished = 0;
+    std::shared_ptr<ConsumerProofState> proof =
+        std::make_shared<ConsumerProofState>();
     std::uint16_t observed_stripe_count = 0;
     std::vector<std::uint64_t> consumed_offsets;
     std::vector<std::uint16_t> consumed_indices;
@@ -328,6 +401,7 @@ strix::transport::DirectLinkLifecycle link() {
     value.exclusive_lease_available = true;
     value.dma_buf_import_supported = true;
     value.completion_rearm_qualified = true;
+    value.expected_native_interface = synthetic_native_identity(value);
     return value;
 }
 
@@ -370,7 +444,7 @@ strix::DistributedBoundaryTransfer transfer(
     value.flow.direction = direction;
     value.flow.priority =
         strix::transport::TransferPriority::normal;
-    value.descriptor.connection_epoch = 9;
+    value.descriptor.connection_epoch = 77;
     value.descriptor.model_plan_id = 1;
     value.descriptor.request_id = 2;
     value.descriptor.generation = 3;
@@ -383,6 +457,43 @@ strix::DistributedBoundaryTransfer transfer(
         strix::transport::PlanKind::single_link;
     value.link_plan.slices.push_back({0,0,128});
     return value;
+}
+
+class SingleFixture {
+public:
+    explicit SingleFixture(strix::DistributedNativeBackendPolicy policy = {})
+        : lifecycle(link()), memory(pools()),
+          session(strix::transport::DirectTransportNativeLinkSession::open(
+              native, leases, lifecycle, memory, 0)),
+          sessions{&session}, backend(sessions, control, local, staging, policy) {
+        staging.tx = memory.links[0].tx;
+        staging.rx = memory.links[0].rx;
+        boundary.boundary_id = 4;
+        boundary.payload_bytes = 128;
+        control.inbound = transfer(strix::transport::LinkDirection::inbound);
+        control.inbound.native_slices = {{lifecycle.connection_epoch, 1}};
+    }
+
+    NativeBackend native;
+    strix::transport::DirectLinkLifecycle lifecycle;
+    strix::transport::DirectTransportPoolMemoryBinding memory;
+    strix::transport::DirectTransportLeaseRegistry leases;
+    strix::transport::DirectTransportNativeLinkSession session;
+    Control control;
+    Local local;
+    Staging staging;
+    std::array<strix::transport::DirectTransportNativeLinkSession*, 1> sessions;
+    strix::NativeDistributedBackend backend;
+    strix::DistributedExecutionBoundary boundary;
+};
+
+bool receive_rejected(SingleFixture& fixture) {
+    try {
+        static_cast<void>(fixture.backend.receive_boundary(fixture.boundary));
+    } catch (const std::exception&) {
+        return true;
+    }
+    return false;
 }
 
 }  // namespace
@@ -430,9 +541,16 @@ int main() {
     backend.send_boundary(boundary,outbound);
     expect(staging.outbound == 1 &&
                native.commits == 1 &&
-               control.published.descriptor.sequence == 5,
+               control.published.descriptor.sequence == 5 &&
+               control.published.descriptor.connection_epoch == 77 &&
+               control.published.native_slices[0].connection_epoch == 9 &&
+               control.published.native_slices[0].sequence == 1 &&
+               native.published_commits[0].connection_epoch == 9 &&
+               native.published_commits[0].sequence == 1,
            "single-link native send stages, publishes control metadata and commit");
 
+    control.inbound = control.published;
+    control.inbound.flow.direction = strix::transport::LinkDirection::inbound;
     const auto observed =
         backend.receive_boundary(boundary);
     expect(observed.flow.direction ==
@@ -456,6 +574,9 @@ int main() {
         auto lifecycle1 = link();
         lifecycle0.physical_link_id = "usb4-a";
         lifecycle1.physical_link_id = "usb4-b";
+        lifecycle1.connection_epoch = 23;
+        lifecycle1.expected_native_interface = synthetic_native_identity(lifecycle1);
+        native1.native_identity = *lifecycle1.expected_native_interface;
         auto memory2 = pools_two();
 
         strix::transport::DirectTransportLeaseRegistry
@@ -497,13 +618,6 @@ int main() {
             {1,64,64},
         };
 
-        auto inbound_striped =
-            striped;
-        inbound_striped.flow.direction =
-            strix::transport::LinkDirection::inbound;
-        striped_control.inbound =
-            inbound_striped;
-
         std::array<
             strix::transport::DirectTransportNativeLinkSession*,
             2> striped_sessions{
@@ -525,9 +639,28 @@ int main() {
                 native0.published_commits[0].stripe_index == 0 &&
                 native1.published_commits[0].stripe_index == 1 &&
                 native0.published_commits[0].stripe_count == 2 &&
-                native1.published_commits[0].stripe_count == 2,
+                native1.published_commits[0].stripe_count == 2 &&
+                native0.published_commits[0].connection_epoch == 9 &&
+                native1.published_commits[0].connection_epoch == 23 &&
+                striped_control.published.descriptor.connection_epoch == 77 &&
+                striped_control.published.native_slices[1].connection_epoch == 23,
             "striped native send publishes one indexed commit per physical link");
 
+        striped_control.inbound = striped_control.published;
+        striped_control.inbound.flow.direction =
+            strix::transport::LinkDirection::inbound;
+        striped_staging.proof->pending_polls = 3;
+        striped_staging.proof->check_ownership = [&] {
+            expect(striped_staging.finished == 1 &&
+                       striped_staging.consumed_indices.size() == 2 &&
+                       native0.credits == 0 && native1.credits == 0 &&
+                       native0.reposts == 0 && native1.reposts == 0 &&
+                       session0.receive_state(native0.receives.back().first).ownership ==
+                           strix::transport::BufferOwnership::consumer_owned &&
+                       session1.receive_state(native1.receives.back().first).ownership ==
+                           strix::transport::BufferOwnership::consumer_owned,
+                   "both stripes remain consumer-owned after CPU callbacks until proof completes");
+        };
         const auto striped_observed =
             striped_backend.receive_boundary(
                 boundary);
@@ -541,6 +674,7 @@ int main() {
                     std::vector<std::uint16_t>({0,1}) &&
                 striped_staging.observed_stripe_count == 2 &&
                 striped_staging.finished == 1 &&
+                striped_staging.proof->polls == 4 &&
                 native0.credits == 1 &&
                 native1.credits == 1,
             "striped native receive validates all commits before reassembly/credit");
@@ -562,6 +696,159 @@ int main() {
         expect(
             overlap_rejected,
             "striped native backend rejects overlapping/non-contiguous slices");
+    }
+
+    {
+        SingleFixture fixture;
+        fixture.staging.proof->pending_polls = 2;
+        fixture.staging.proof->check_ownership = [&] {
+            expect(fixture.staging.consumed == 1 && fixture.staging.finished == 1 &&
+                       fixture.native.credits == 0 && fixture.native.reposts == 0 &&
+                       fixture.session.receive_state(fixture.native.receives.back().first).ownership ==
+                           strix::transport::BufferOwnership::consumer_owned,
+                   "delayed consumer proof withholds RX release, credit and repost");
+        };
+        static_cast<void>(fixture.backend.receive_boundary(fixture.boundary));
+        expect(fixture.staging.proof->polls == 3 && fixture.native.credits == 1 &&
+                   fixture.native.reposts == 1,
+               "consumer completion proof explicitly authorizes retirement");
+        const auto received_count = fixture.native.receives.size();
+        expect(receive_rejected(fixture) &&
+                   fixture.native.receives.size() == received_count &&
+                   fixture.staging.consumed == 1 && fixture.native.credits == 1,
+               "duplicate physical message is rejected before staging or consumption");
+    }
+
+    for (int mode = 0; mode < 6; ++mode) {
+        SingleFixture fixture({16, 3});
+        fixture.staging.proof->pending_polls = mode == 0 ? 10 : 0;
+        fixture.staging.proof->fail = mode == 1;
+        fixture.staging.proof->throw_on_poll = mode == 2;
+        fixture.staging.omit_proof = mode == 3;
+        fixture.staging.throw_on_consume = mode == 4;
+        fixture.staging.throw_on_finish = mode == 5;
+        expect(receive_rejected(fixture) && fixture.native.credits == 0 &&
+                   fixture.native.reposts == 0 &&
+                   fixture.session.receive_state(fixture.native.receives.back().first).ownership ==
+                       strix::transport::BufferOwnership::consumer_owned,
+               "pending/failed/throwing/missing proof and callback errors quarantine consumer-owned RX");
+        expect(fixture.session.receive_quarantined(),
+               "failed consumer completion quarantines physical RX lease");
+        if (mode < 3) {
+            expect(fixture.staging.proof->destroyed == 0,
+                   "failed completion proof remains retained after receive failure");
+        }
+        const auto received_count = fixture.native.receives.size();
+        ++fixture.control.inbound.native_slices[0].sequence;
+        expect(receive_rejected(fixture) && fixture.native.receives.size() == received_count,
+               "quarantined consumer prevents further native backend work");
+        strix::NativeDistributedBackend another_backend(
+            fixture.sessions, fixture.control, fixture.local, fixture.staging);
+        bool pool_reuse_rejected = false;
+        try { static_cast<void>(another_backend.receive_boundary(fixture.boundary)); }
+        catch (const std::logic_error&) { pool_reuse_rejected = true; }
+        expect(pool_reuse_rejected && fixture.native.receives.size() == received_count,
+               "new adapter cannot bypass quarantined physical RX pool");
+    }
+
+    {
+        SingleFixture fixture;
+        fixture.control.inbound.native_slices[0].connection_epoch = 8;
+        expect(receive_rejected(fixture) && fixture.native.receives.empty() &&
+                   fixture.staging.inbound == 0 && fixture.staging.consumed == 0,
+               "stale physical lease epoch fails before RX preparation");
+    }
+
+    {
+        SingleFixture fixture;
+        auto first = transfer(strix::transport::LinkDirection::outbound);
+        auto second = first;
+        second.descriptor.request_id = 99;
+        fixture.backend.send_boundary(fixture.boundary, first);
+        const auto first_published = fixture.control.published;
+        Control second_control;
+        strix::NativeDistributedBackend second_backend(
+            fixture.sessions, second_control, fixture.local, fixture.staging);
+        second_backend.send_boundary(fixture.boundary, second);
+        const auto second_published = second_control.published;
+        expect(first_published.descriptor.sequence == second_published.descriptor.sequence &&
+                   first_published.descriptor.request_id != second_published.descriptor.request_id &&
+                   first_published.native_slices[0].sequence == 1 &&
+                   second_published.native_slices[0].sequence == 2 &&
+                   fixture.native.send_descriptors[0].request_id == first.descriptor.request_id &&
+                   fixture.native.send_descriptors[1].request_id == second.descriptor.request_id,
+               "serialized request adapters with equal logical sequence reserve distinct physical sequence");
+        fixture.control.inbound = first_published;
+        fixture.control.inbound.flow.direction = strix::transport::LinkDirection::inbound;
+        fixture.native.commit_override = fixture.native.published_commits[1];
+        expect(receive_rejected(fixture) && fixture.staging.consumed == 0 &&
+                   fixture.native.credits == 0,
+               "commit from a foreign pending request fails before any payload consumption");
+    }
+
+    {
+        SingleFixture fixture({1, 1});
+        fixture.backend.send_boundary(fixture.boundary,
+            transfer(strix::transport::LinkDirection::outbound));
+        static_cast<void>(fixture.backend.receive_boundary(fixture.boundary));
+        expect(fixture.native.credits == 1 && fixture.native.reposts == 1,
+               "completion on final permitted poll is accepted without cancellation");
+    }
+
+    {
+        SingleFixture fixture({1, 1});
+        fixture.native.suppress_events = true;
+        expect(receive_rejected(fixture) && fixture.native.canceled.size() == 1 &&
+                   fixture.session.receive_quarantined() && fixture.staging.consumed == 0,
+               "RX timeout cancels once and quarantines without unproven cancellation reuse");
+    }
+
+    for (int mode = 0; mode < 3; ++mode) {
+        SingleFixture fixture;
+        strix::transport::GpuCommitRecord record;
+        record.commit_word = strix::transport::gpu_commit_word;
+        record.connection_epoch = mode == 0 ? 8 : 9;
+        record.sequence = mode == 1 ? 2 : 1;
+        record.payload_bytes = mode == 2 ? 127 : 128;
+        fixture.native.commit_override = record;
+        expect(receive_rejected(fixture) && fixture.staging.consumed == 0 &&
+                   fixture.native.credits == 0 && fixture.native.reposts == 0,
+               "stale epoch, foreign sequence and short stripe commits fail closed");
+    }
+
+    {
+        NativeBackend native0;
+        NativeBackend native1;
+        native1.fail_receive_prepare = true;
+        auto lifecycle0 = link();
+        auto lifecycle1 = link();
+        lifecycle1.physical_link_id = "usb4-b";
+        lifecycle1.connection_epoch = 23;
+        lifecycle1.expected_native_interface = synthetic_native_identity(lifecycle1);
+        native1.native_identity = *lifecycle1.expected_native_interface;
+        auto memory2 = pools_two();
+        strix::transport::DirectTransportLeaseRegistry leases2;
+        auto session0 = strix::transport::DirectTransportNativeLinkSession::open(
+            native0, leases2, lifecycle0, memory2, 0);
+        auto session1 = strix::transport::DirectTransportNativeLinkSession::open(
+            native1, leases2, lifecycle1, memory2, 1);
+        Control control2;
+        Local local2;
+        StripedStaging staging2;
+        staging2.rx = {memory2.links[0].rx, memory2.links[1].rx};
+        control2.inbound = transfer(strix::transport::LinkDirection::inbound);
+        control2.inbound.link_plan.kind = strix::transport::PlanKind::striped;
+        control2.inbound.link_plan.slices = {{0,0,64},{1,64,64}};
+        control2.inbound.native_slices = {{9,1},{23,1}};
+        std::array<strix::transport::DirectTransportNativeLinkSession*, 2> sessions2{
+            &session0, &session1};
+        strix::NativeDistributedBackend backend2(sessions2, control2, local2, staging2);
+        bool rejected = false;
+        try { static_cast<void>(backend2.receive_boundary(boundary)); }
+        catch (const std::runtime_error&) { rejected = true; }
+        expect(rejected && native0.canceled.size() == 1 && native1.canceled.empty() &&
+                   staging2.consumed_indices.empty() && native0.credits == 0,
+               "partial RX preparation cancels the earlier prepared slice");
     }
 
     if (failures == 0) {

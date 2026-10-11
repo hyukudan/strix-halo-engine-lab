@@ -271,6 +271,8 @@ void restore_serial_session_snapshot(
     } catch (...) {
         session.health =
             SerialSessionHealth::poisoned;
+        session.arithmetic_lineage = {};
+        session.arithmetic_lineage.tainted = true;
         throw;
     }
 
@@ -280,6 +282,9 @@ void restore_serial_session_snapshot(
         restore.committed_tokens;
     session.state =
         restore.state;
+    // A raw snapshot carries no producer history. Only the checked prefix
+    // lifecycle may republish a separately validated recorded lineage.
+    session.arithmetic_lineage = {};
     session.health =
         SerialSessionHealth::ready;
 }

@@ -275,6 +275,10 @@ struct Fixture {
         session.committed_tokens = 10;
         session.state.valid = all_state();
         session.state.generations.fill(5);
+        for (std::uint64_t position = 0; position < session.next_position; ++position) {
+            session.arithmetic_lineage = strix::prepare_serial_row_lineage(session.arithmetic_lineage,
+                position, session.execution_identity, compiled.kernel_plan_identity);
+        }
     }
 };
 
@@ -311,6 +315,9 @@ int main() {
         expect(dispatcher.calls ==
                    fixture.compiled.topology.steps.size(),
                "verify dispatcher sees every kernel/runtime step");
+        expect(fixture.session.arithmetic_lineage.history_identity == 0 &&
+                   fixture.session.arithmetic_lineage.intervals.empty(),
+               "verify window does not fabricate or retain serial arithmetic history");
     }
 
     {
@@ -337,6 +344,8 @@ int main() {
                    fixture.session.health ==
                        strix::SerialSessionHealth::ready,
                "candidate-depth mismatch fails before dispatch");
+        expect(strix::arithmetic_lineage_valid(fixture.session.arithmetic_lineage, 10),
+               "verify preflight failure retains the earlier independently recorded history");
     }
 
     {
@@ -383,6 +392,9 @@ int main() {
                    fixture.session.health ==
                        strix::SerialSessionHealth::poisoned,
                "mid-verify failure poisons target session without publishing metadata advance");
+        expect(fixture.session.arithmetic_lineage.tainted &&
+                   fixture.session.arithmetic_lineage.history_identity == 0,
+               "failed verify mutation invalidates arithmetic history");
     }
 
     {

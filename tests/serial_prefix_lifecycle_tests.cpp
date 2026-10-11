@@ -29,6 +29,14 @@ strix::PersistentState all_state() {
         PersistentState::position_history;
 }
 
+strix::ArithmeticLineage recorded_serial_history(std::uint64_t execution, std::uint64_t rows) {
+    strix::ArithmeticLineage result;
+    for (std::uint64_t position = 0; position < rows; ++position) {
+        result = strix::prepare_serial_row_lineage(result, position, execution, 0x3333ULL);
+    }
+    return result;
+}
+
 class MemcpyTransferBackend final
     : public strix::SessionSnapshotTransferBackend {
 public:
@@ -116,7 +124,8 @@ int main() {
     const auto prefix =
         strix::make_serial_prefix_snapshot(
             tokens,
-            snapshot);
+            snapshot,
+            recorded_serial_history(request.compiled_execution_identity, tokens.size()));
 
     expect(
         prefix.prefix_identity != 0 &&
@@ -204,7 +213,8 @@ int main() {
         static_cast<void>(
             strix::make_serial_prefix_snapshot(
                 tokens,
-                malformed));
+                malformed,
+                prefix.arithmetic_lineage));
     } catch (const std::invalid_argument&) {
         malformed_rejected = true;
     }
@@ -289,7 +299,8 @@ int main() {
         const auto physical_prefix =
             strix::make_serial_prefix_snapshot(
                 physical_tokens,
-                physical_plan);
+                physical_plan,
+                recorded_serial_history(physical_request.compiled_execution_identity, physical_tokens.size()));
 
         std::vector<std::uint8_t> snapshot_device(
             static_cast<std::size_t>(
@@ -328,6 +339,7 @@ int main() {
             physical_tokens.size();
         physical_session.state =
             physical_request.state;
+        physical_session.arithmetic_lineage = physical_prefix.arithmetic_lineage;
 
         MemcpyTransferBackend transfer;
         strix::capture_serial_prefix_snapshot(
@@ -399,6 +411,9 @@ int main() {
         expect(
             restored_bytes_match,
             "physical prefix restore copies every cached snapshot range");
+        expect(strix::arithmetic_lineage_matches(physical_session.arithmetic_lineage,
+            physical_prefix.arithmetic_lineage, physical_tokens.size()),
+            "successful prefix transfer republishes independently validated full producer history");
 
         auto wrong_session =
             physical_session;
@@ -418,6 +433,62 @@ int main() {
         expect(
             wrong_runtime_capture_rejected,
             "physical prefix capture rejects a foreign runtime identity");
+    }
+
+    {
+        const auto& history = prefix.arithmetic_lineage;
+        expect(history.intervals.size() == 1 && history.intervals[0].begin == 0 && history.intervals[0].end == tokens.size(),
+            "consecutive canonical one-row updates compress without inventing prefill chunks");
+        auto tampered = prefix;
+        ++tampered.arithmetic_lineage.intervals[0].reduction_plan_identity;
+        expect(!strix::serial_prefix_snapshot_matches(tampered, tokens,
+            request.compiled_execution_identity, request.runtime_compatibility_identity, layout.layout_identity),
+            "history metadata tampering without re-identification is a prefix miss");
+
+        strix::ArithmeticLineage chunks;
+        chunks.intervals = {
+            {0, 2, strix::ArithmeticProducer::prefill_chunk, request.compiled_execution_identity, 0x4444, 0x5555},
+            {2, 3, strix::ArithmeticProducer::serial_row, request.compiled_execution_identity, 0x3333, request.compiled_execution_identity},
+        };
+        chunks.history_identity = strix::arithmetic_history_identity(chunks.intervals);
+        const auto chunk_prefix = strix::make_serial_prefix_snapshot(tokens, snapshot, chunks);
+        expect(strix::serial_prefix_snapshot_matches(chunk_prefix, tokens,
+            request.compiled_execution_identity, request.runtime_compatibility_identity, layout.layout_identity, &chunks),
+            "explicit complete canonical chunk history matches its recorded fixture");
+        expect(!strix::serial_prefix_snapshot_matches(chunk_prefix, tokens,
+            request.compiled_execution_identity, request.runtime_compatibility_identity, layout.layout_identity),
+            "serial-only caller cannot implicitly relabel chunk-produced state");
+        auto different = chunks;
+        different.intervals.insert(different.intervals.begin(),
+            {0, 1, strix::ArithmeticProducer::prefill_chunk, request.compiled_execution_identity, 0x4444, 0x5555});
+        different.intervals[1].begin = 1;
+        different.history_identity = strix::arithmetic_history_identity(different.intervals);
+        expect(!strix::serial_prefix_snapshot_matches(chunk_prefix, tokens,
+            request.compiled_execution_identity, request.runtime_compatibility_identity, layout.layout_identity, &different),
+            "matching final row is insufficient when earlier complete chunk cuts differ");
+        different = chunks;
+        ++different.intervals[0].state_update_identity;
+        different.history_identity = strix::arithmetic_history_identity(different.intervals);
+        expect(!strix::arithmetic_lineage_matches(chunks, different, tokens.size()),
+            "earlier state-update identity mismatch is detected despite identical endpoint");
+        different = chunks;
+        ++different.intervals[0].reduction_plan_identity;
+        different.history_identity = strix::arithmetic_history_identity(different.intervals);
+        expect(!strix::arithmetic_lineage_matches(chunks, different, tokens.size()),
+            "earlier reduction identity cannot reuse retained history");
+        different = chunks;
+        different.intervals[0].end = 1;
+        different.history_identity = strix::arithmetic_history_identity(different.intervals);
+        expect(!strix::arithmetic_lineage_valid(different, tokens.size()), "history gap cannot be repaired by a valid endpoint");
+        different = chunks;
+        different.tainted = true;
+        expect(!strix::arithmetic_lineage_matches(chunks, different, tokens.size()), "tainted lineage is never reusable");
+        expect(strix::prepare_serial_row_lineage({}, 2, request.compiled_execution_identity, 0x3333).history_identity == 0,
+            "unknown earlier serial state stays unknown instead of fabricating previous rows");
+        bool unknown_rejected = false;
+        try { static_cast<void>(strix::make_serial_prefix_snapshot(tokens, snapshot, {})); }
+        catch (const std::invalid_argument&) { unknown_rejected = true; }
+        expect(unknown_rejected, "prefix creation requires actual recorded history");
     }
 
     if (failures == 0) {

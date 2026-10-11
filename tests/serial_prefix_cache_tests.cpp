@@ -70,6 +70,7 @@ private:
 class MemcpyTransferBackend final
     : public strix::SessionSnapshotTransferBackend {
 public:
+    bool fail_restore = false;
     void capture_device(
         std::uintptr_t source,
         std::uintptr_t destination,
@@ -88,6 +89,7 @@ public:
         std::uintptr_t source,
         std::uintptr_t destination,
         std::uint64_t bytes) override {
+        if (fail_restore) { throw std::runtime_error("injected restore failure"); }
         copy(source, destination, bytes);
     }
 
@@ -197,6 +199,10 @@ int main() {
          session.state.generations) {
         generation = 7;
     }
+    for (std::uint64_t position = 0; position < prefix_tokens.size(); ++position) {
+        session.arithmetic_lineage = strix::prepare_serial_row_lineage(
+            session.arithmetic_lineage, position, session.execution_identity, 0x1234ULL);
+    }
 
     VectorAllocator allocator;
     strix::AllocationGenerationSource
@@ -285,6 +291,41 @@ int main() {
     expect(
         restored_bytes_match,
         "prefix cache retains compact bytes needed for later restore");
+    expect(strix::arithmetic_lineage_matches(session.arithmetic_lineage,
+        cache.prefix().arithmetic_lineage, prefix_tokens.size()), "owned cache restores the recorded full arithmetic lineage");
+    auto wrong_history = session.arithmetic_lineage;
+    ++wrong_history.intervals.front().reduction_plan_identity;
+    wrong_history.history_identity = strix::arithmetic_history_identity(wrong_history.intervals);
+    expect(!cache.matches(prefix_tokens, session.execution_identity, session.runtime_compatibility_identity,
+        session.state_layout_identity, &wrong_history), "full requested history mismatch is an owned-cache miss");
+    const auto before_miss = session;
+    expect(!cache.try_restore(session, model, layout, state_memory, transfer, prefix_tokens, &wrong_history) &&
+        session.health == before_miss.health && session.next_position == before_miss.next_position,
+        "try-restore turns an arithmetic-history mismatch into an ordinary cache miss without state transfer");
+    bool wrong_history_rejected = false;
+    try { cache.restore(session, model, layout, state_memory, transfer, prefix_tokens, &wrong_history); }
+    catch (const std::invalid_argument&) { wrong_history_rejected = true; }
+    expect(wrong_history_rejected && session.next_position == before_miss.next_position &&
+        session.arithmetic_lineage.history_identity == before_miss.arithmetic_lineage.history_identity,
+        "history miss fails before transfer or mutation of the destination session");
+    auto unknown = session;
+    unknown.arithmetic_lineage = {};
+    bool unknown_capture_rejected = false;
+    try { static_cast<void>(strix::SerialPrefixCacheEntry::capture(model, prefix_tokens, unknown,
+        layout, state_memory, allocator, generations, transfer)); }
+    catch (const std::invalid_argument&) { unknown_capture_rejected = true; }
+    expect(unknown_capture_rejected, "position counters alone cannot create a reusable owned prefix cache");
+    transfer.fail_restore = true;
+    bool restore_failed = false;
+    try { cache.restore(session, model, layout, state_memory, transfer, prefix_tokens); }
+    catch (const std::runtime_error&) { restore_failed = true; }
+    expect(restore_failed && session.health == strix::SerialSessionHealth::poisoned &&
+        session.arithmetic_lineage.tainted && session.arithmetic_lineage.history_identity == 0,
+        "failed prefix transfer poisons session and deletes reusable producer history");
+    transfer.fail_restore = false;
+    cache.restore(session, model, layout, state_memory, transfer, prefix_tokens);
+    expect(strix::arithmetic_lineage_matches(session.arithmetic_lineage, cache.prefix().arithmetic_lineage,
+        prefix_tokens.size()), "independently valid prefix restore recovers full producer history after failed transfer");
 
     auto wrong_prefix =
         prefix_tokens;

@@ -79,6 +79,33 @@ how much repeated weight traffic separate single-row kernels would have needed.
 
 ## Promotion rule
 
+The IQ4_XS lab now compares the LDS reduction with an experimental register-shuffle
+tail. Both use the fixed 256-thread tree (128/64/32/16/8/4/2/1) and explicit FP32
+FMA in each ascending lane K chain. The candidate retains the first three LDS
+reductions and moves the final five into 32-lane shuffles, avoiding five group
+barriers while preserving the arithmetic tree. Packed weights are already reused
+across C1/2/4/8 rows in both variants.
+
+Before timing, native fixtures compare both variants bit-for-bit against the
+independent host lane/tree reference at K=256/512/2560/4096 for all row classes;
+guarded output allocations detect inactive writes. The portable reference tests
+include mixed-magnitude, signed-zero/subnormal and explicit FMA/reduction negative
+controls. Arithmetic identity: `iq4_xs-f32-fma256-tree-v1`. This explicitly defined
+lab identity replaces the earlier implicit contraction choice for this experiment.
+
+The latest local check compiled both Wave32 and Wave64 binaries offline with
+ROCm 7.2.4 and ran only the host reference tests. No GPU execution, bitwise native
+fixture result or throughput gain has been measured. The JSON result retains
+`qualified=false`; passing a synthetic kernel fixture is not full-model promotion.
+
+The harness also captures this fixed-shape projection in an owned HIP stream and
+replays it after changing input values in the same device allocation. Reference bits
+and guarded writes are checked again. Timings distinguish eager from graph replay
+and report host capture/instantiation time separately. Graph executable memory remains
+unknown (`graph_memory_bytes=null`), so this experiment cannot establish graph memory
+admission or enable whole-model replay. Captured scalar K/N are fixed for the graph's
+lifetime; varying token/position arguments in other launchers still require device data.
+
 Q8_0 remains an infrastructure/reference packed path until a real workload
 justifies it.
 

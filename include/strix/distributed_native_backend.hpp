@@ -4,6 +4,7 @@
 #include "strix/distributed_runtime.hpp"
 
 #include <cstdint>
+#include <memory>
 #include <span>
 
 namespace strix {
@@ -19,6 +20,8 @@ public:
         const DistributedExecutionBoundary& boundary,
         const DistributedBoundaryTransfer& transfer) = 0;
 
+    // Implementations must reconcile the logical request/plan, epoch, dtype,
+    // boundary and message sequence before exposing native receive metadata.
     [[nodiscard]] virtual DistributedBoundaryTransfer
     await_boundary_transfer(
         const DistributedExecutionBoundary& boundary) = 0;
@@ -30,6 +33,23 @@ public:
 
     virtual void execute_local_step(
         const DistributedStepPlacement& step) = 0;
+};
+
+enum class DistributedInboundCompletionStatus {
+    pending,
+    complete,
+    failed,
+};
+
+class DistributedInboundCompletion {
+public:
+    virtual ~DistributedInboundCompletion() = default;
+    // Complete proves every consumer/reassembly operation has stopped
+    // accessing every staged RX slice. A CPU callback return is insufficient.
+    // An implementation must drain or retain outstanding consumer resources
+    // safely on destruction; native GPU event/visibility proof is separate
+    // qualification work.
+    [[nodiscard]] virtual DistributedInboundCompletionStatus poll() = 0;
 };
 
 class DistributedBoundaryStagingProvider {
@@ -49,6 +69,9 @@ public:
     virtual void consume_inbound(
         const DistributedExecutionBoundary& boundary,
         const transport::TransportBufferView& staged) = 0;
+
+    // Providers retain any launched consumers safely across callback errors.
+    // All sessions and pool allocations must outlive their completion proof.
 
     [[nodiscard]] virtual transport::TransportBufferView
     stage_outbound_slice(
@@ -74,15 +97,20 @@ public:
         std::uint16_t stripe_count,
         const transport::TransportBufferView& staged);
 
-    virtual void finish_inbound(
+    [[nodiscard]] virtual std::unique_ptr<DistributedInboundCompletion>
+    finish_inbound(
         const DistributedExecutionBoundary& boundary,
-        const DistributedBoundaryTransfer& transfer);
+        const DistributedBoundaryTransfer& transfer) = 0;
 };
 
 struct DistributedNativeBackendPolicy {
     std::uint64_t maximum_event_polls = 4096;
+    std::uint64_t maximum_consumer_polls = 4096;
 };
 
+// A backend and all adapters sharing its sessions require a single serialized
+// progress owner. Different requests can remain pending remotely, but calling
+// these APIs concurrently from multiple threads is unsupported.
 class NativeDistributedBackend final
     : public DistributedExecutionBackend {
 public:
@@ -124,11 +152,17 @@ private:
         transport::DirectTransportNativeLinkSession& session,
         transport::TransferHandle handle) const;
 
+    void require_healthy() const;
+
     std::span<transport::DirectTransportNativeLinkSession*> sessions_;
     DistributedNativeControlPlane* control_ = nullptr;
     DistributedNativeLocalExecutor* local_ = nullptr;
     DistributedBoundaryStagingProvider* staging_ = nullptr;
     DistributedNativeBackendPolicy policy_{};
+    bool failed_ = false;
+    // Retain failed/pending proofs on error, together with consumer-owned
+    // session slots. No credit/repost or further work is permitted afterward.
+    std::unique_ptr<DistributedInboundCompletion> inbound_completion_;
 };
 
 using SingleLinkNativeDistributedBackend =

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <limits>
 #include <stdexcept>
+#include <utility>
 
 namespace strix {
 
@@ -70,6 +71,9 @@ EagerExecutionResult execute_serial_token(
         throw std::overflow_error(
             "serial committed-token counter overflow");
     }
+
+    auto next_lineage = prepare_serial_row_lineage(session.arithmetic_lineage,
+        session.next_position, compiled.execution_identity, compiled.kernel_plan_identity);
 
     EagerExecutionRequest request;
     request.logical_rows = 1;
@@ -140,10 +144,12 @@ EagerExecutionResult execute_serial_token(
         }
         session.health =
             SerialSessionHealth::poisoned;
+        session.arithmetic_lineage.tainted = true;
         throw;
     }
 
     session.state = result.state;
+    session.arithmetic_lineage = std::move(next_lineage);
     ++session.next_position;
     ++session.committed_tokens;
     return result;
@@ -212,6 +218,9 @@ EagerExecutionResult execute_serial_token(
             "serial committed-token counter overflow");
     }
 
+    auto next_lineage = prepare_serial_row_lineage(session.arithmetic_lineage,
+        session.next_position, compiled.execution_identity, compiled.kernel_plan_identity);
+
     EagerExecutionRequest request;
     request.logical_rows = 1;
     request.request_concurrency = 1;
@@ -251,10 +260,12 @@ EagerExecutionResult execute_serial_token(
         // cannot safely reuse the session after an execution failure.
         session.health =
             SerialSessionHealth::poisoned;
+        session.arithmetic_lineage.tainted = true;
         throw;
     }
 
     session.state = result.state;
+    session.arithmetic_lineage = std::move(next_lineage);
     ++session.next_position;
     ++session.committed_tokens;
 

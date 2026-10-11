@@ -140,6 +140,8 @@ execute_compiled_speculative_verify_eager(
     } catch (...) {
         session.health =
             SerialSessionHealth::poisoned;
+        session.arithmetic_lineage = {};
+        session.arithmetic_lineage.tainted = true;
         throw;
     }
 
@@ -149,6 +151,9 @@ execute_compiled_speculative_verify_eager(
         post_position;
     session.committed_tokens =
         post_committed;
+    // This window producer has no qualified canonical lineage recorder yet.
+    // Do not retain or relabel the earlier serial history after window mutation.
+    session.arithmetic_lineage = {};
 
     return result;
 }

@@ -1,6 +1,7 @@
 #include "strix/serial_prefix_lifecycle.hpp"
 
 #include <stdexcept>
+#include <utility>
 
 namespace strix {
 namespace {
@@ -26,7 +27,8 @@ void hash_u64(
 
 std::uint64_t build_prefix_identity(
     std::span<const std::uint32_t> tokens,
-    const SerialSessionSnapshotPlan& snapshot) noexcept {
+    const SerialSessionSnapshotPlan& snapshot,
+    const ArithmeticLineage& lineage) noexcept {
     std::uint64_t hash =
         fnv_offset;
     hash_u64(
@@ -47,6 +49,7 @@ std::uint64_t build_prefix_identity(
     hash_u64(
         hash,
         snapshot.committed_tokens);
+    hash_u64(hash, lineage.history_identity);
     hash_u64(
         hash,
         static_cast<std::uint64_t>(
@@ -64,7 +67,8 @@ std::uint64_t build_prefix_identity(
 
 SerialPrefixSnapshot make_serial_prefix_snapshot(
     std::span<const std::uint32_t> prefix_tokens,
-    const SerialSessionSnapshotPlan& snapshot) {
+    const SerialSessionSnapshotPlan& snapshot,
+    const ArithmeticLineage& arithmetic_lineage) {
     if (prefix_tokens.empty()) {
         throw std::invalid_argument(
             "serial prefix snapshot requires a non-empty prefix");
@@ -83,6 +87,9 @@ SerialPrefixSnapshot make_serial_prefix_snapshot(
         throw std::invalid_argument(
             "serial prefix snapshot position/token metadata must match prefix length");
     }
+    if (!arithmetic_lineage_valid(arithmetic_lineage, snapshot.next_position)) {
+        throw std::invalid_argument("prefix snapshot requires complete independently recorded arithmetic history");
+    }
 
     SerialPrefixSnapshot result;
     result.prefix_tokens.assign(
@@ -90,10 +97,12 @@ SerialPrefixSnapshot make_serial_prefix_snapshot(
         prefix_tokens.end());
     result.snapshot =
         snapshot;
+    result.arithmetic_lineage = arithmetic_lineage;
     result.prefix_identity =
         build_prefix_identity(
             result.prefix_tokens,
-            result.snapshot);
+            result.snapshot,
+            result.arithmetic_lineage);
 
     if (result.prefix_identity == 0) {
         throw std::logic_error(
@@ -107,7 +116,8 @@ bool serial_prefix_snapshot_matches(
     std::span<const std::uint32_t> requested_prefix,
     std::uint64_t compiled_execution_identity,
     std::uint64_t runtime_compatibility_identity,
-    std::uint64_t state_layout_identity) noexcept {
+    std::uint64_t state_layout_identity,
+    const ArithmeticLineage* requested_history) noexcept {
     if (prefix.prefix_identity == 0 ||
         prefix.snapshot.plan_identity == 0 ||
         requested_prefix.size() !=
@@ -125,6 +135,16 @@ bool serial_prefix_snapshot_matches(
             prefix.snapshot.state_layout_identity) {
         return false;
     }
+    if (prefix.snapshot.next_position != requested_prefix.size() ||
+        prefix.snapshot.committed_tokens != requested_prefix.size()) { return false; }
+    if (requested_history != nullptr) {
+        if (!arithmetic_lineage_matches(prefix.arithmetic_lineage, *requested_history,
+                                        prefix.snapshot.next_position)) { return false; }
+    } else if (!arithmetic_lineage_serial_only(prefix.arithmetic_lineage,
+                compiled_execution_identity, prefix.snapshot.next_position)) {
+        // The existing caller is serial-only, not an implicit chunked-prefill plan.
+        return false;
+    }
     for (std::size_t index = 0;
          index < requested_prefix.size();
          ++index) {
@@ -137,7 +157,8 @@ bool serial_prefix_snapshot_matches(
     return prefix.prefix_identity ==
         build_prefix_identity(
             prefix.prefix_tokens,
-            prefix.snapshot);
+            prefix.snapshot,
+            prefix.arithmetic_lineage);
 }
 
 SerialSessionRestorePlan
@@ -147,13 +168,15 @@ build_serial_prefix_restore_plan(
     std::uint64_t compiled_execution_identity,
     std::uint64_t runtime_compatibility_identity,
     std::span<const std::uint32_t> requested_prefix,
-    const SerialPrefixSnapshot& prefix) {
+    const SerialPrefixSnapshot& prefix,
+    const ArithmeticLineage* requested_history) {
     if (!serial_prefix_snapshot_matches(
             prefix,
             requested_prefix,
             compiled_execution_identity,
             runtime_compatibility_identity,
-            destination_layout.layout_identity)) {
+            destination_layout.layout_identity,
+            requested_history)) {
         throw std::invalid_argument(
             "serial prefix snapshot does not match requested prefix/runtime");
     }
@@ -178,7 +201,8 @@ void capture_serial_prefix_snapshot(
             prefix.prefix_tokens,
             session.execution_identity,
             session.runtime_compatibility_identity,
-            session.state_layout_identity)) {
+            session.state_layout_identity,
+            &session.arithmetic_lineage)) {
         throw std::invalid_argument(
             "serial prefix capture session does not match prefix snapshot");
     }
@@ -217,7 +241,8 @@ void restore_serial_prefix_snapshot(
     const SessionSnapshotMemoryBinding& snapshot_memory,
     SessionSnapshotTransferBackend& backend,
     std::span<const std::uint32_t> requested_prefix,
-    const SerialPrefixSnapshot& prefix) {
+    const SerialPrefixSnapshot& prefix,
+    const ArithmeticLineage* requested_history) {
     const auto restore =
         build_serial_prefix_restore_plan(
             model,
@@ -225,7 +250,11 @@ void restore_serial_prefix_snapshot(
             session.execution_identity,
             session.runtime_compatibility_identity,
             requested_prefix,
-            prefix);
+            prefix,
+            requested_history);
+
+    // Stage the copy before transfers; publication after completion cannot allocate.
+    auto restored_lineage = prefix.arithmetic_lineage;
 
     restore_serial_session_snapshot(
         session,
@@ -234,6 +263,7 @@ void restore_serial_prefix_snapshot(
         state_memory,
         snapshot_memory,
         backend);
+    session.arithmetic_lineage = std::move(restored_lineage);
 }
 
 }  // namespace strix

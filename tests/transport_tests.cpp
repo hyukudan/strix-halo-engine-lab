@@ -1,5 +1,6 @@
 #include "strix/transport.hpp"
 
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <iostream>
@@ -183,6 +184,39 @@ int main() {
     expect(!duplicate_tracker.observe_commit(stripe0) &&
                duplicate_tracker.invalid(),
            "duplicate stripe invalidates logical message");
+
+    std::array<TransferDescriptor, 2> physical_descriptors{
+        striped_descriptor, striped_descriptor};
+    physical_descriptors[0].connection_epoch = 21;
+    physical_descriptors[0].sequence = 101;
+    physical_descriptors[0].byte_length = 256;
+    physical_descriptors[1].connection_epoch = 39;
+    physical_descriptors[1].sequence = 203;
+    physical_descriptors[1].byte_length = 344;
+    auto physical0 = stripe0;
+    physical0.connection_epoch = 21;
+    physical0.sequence = 101;
+    auto physical1 = stripe1;
+    physical1.connection_epoch = 39;
+    physical1.sequence = 203;
+    StripedMessageTracker physical_tracker(striped_descriptor, physical_descriptors);
+    expect(physical_tracker.observe_commit(physical1) &&
+               physical_tracker.observe_commit(physical0) && physical_tracker.complete(),
+           "logical tracker validates independent physical epochs and sequences per stripe");
+    expect(!physical_tracker.observe_commit(physical0) && physical_tracker.invalid(),
+           "duplicate stripe after completion invalidates tracker");
+
+    StripedMessageTracker stale_physical_tracker(striped_descriptor, physical_descriptors);
+    auto stale_physical = physical1;
+    stale_physical.connection_epoch = 21;
+    expect(!stale_physical_tracker.observe_commit(stale_physical) && stale_physical_tracker.invalid(),
+           "stripe cannot inherit another physical link epoch");
+
+    StripedMessageTracker short_physical_tracker(striped_descriptor, physical_descriptors);
+    auto short_physical = physical0;
+    --short_physical.payload_bytes;
+    expect(!short_physical_tracker.observe_commit(short_physical) && short_physical_tracker.invalid(),
+           "physical tracker requires each slice exact length before reassembly");
 
     StripedMessageTracker short_tracker(
         striped_descriptor,

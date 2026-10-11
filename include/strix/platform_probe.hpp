@@ -26,6 +26,10 @@ struct Usb4StreamInfo {
     std::optional<std::uint64_t> throttling_ns;
     std::optional<std::int64_t> in_hopid;
     std::optional<std::int64_t> out_hopid;
+    std::optional<std::string> device_path;
+    std::optional<bool> device_is_character;
+    std::optional<std::string> device_sysfs_route;
+    bool read_write_candidate = false;
 };
 
 struct Usb4Topology {
@@ -36,6 +40,11 @@ struct Usb4Topology {
     bool stream_driver_present = false;
     bool dma_buf_import_gate_present = false;
     std::optional<bool> dma_buf_import_gate_enabled;
+    std::optional<std::string> stream_driver_version;
+    std::optional<std::string> stream_driver_srcversion;
+    // No supported native capability-query implementation exists yet. Static
+    // module/gate/device observations never establish an ABI or GPU proof.
+    bool native_capability_query_available = false;
 };
 
 struct PlatformInfo {

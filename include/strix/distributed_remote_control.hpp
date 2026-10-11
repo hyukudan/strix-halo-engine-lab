@@ -58,6 +58,8 @@ private:
     DistributedControlWireBackend* wire_ = nullptr;
     std::uint32_t protocol_version_ = 1;
     std::uint64_t next_sequence_ = 1;
+    std::uint64_t next_boundary_send_sequence_ = 1;
+    std::uint64_t next_boundary_receive_sequence_ = 1;
     bool failed_ = false;
 };
 }  // namespace strix

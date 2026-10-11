@@ -8,6 +8,7 @@
 #include "strix/execution_plan.hpp"
 #include "strix/execution_runtime.hpp"
 #include "strix/kernel_registry.hpp"
+#include "strix/graph_eligibility.hpp"
 #include "strix/model_contract.hpp"
 #include "strix/session_state_layout.hpp"
 #include "strix/session_state_memory.hpp"
@@ -41,6 +42,15 @@ struct CompiledSerialExecution {
     const ExecutionBindingRequest& binding_request,
     const ExecutionBufferRequest& buffer_request,
     std::uint64_t arena_alignment = 256);
+
+[[nodiscard]] GraphCapturePlan prepare_compiled_serial_graph_capture(
+    const CompiledSerialExecution& compiled, const ExecutionRuntimeResources& resources,
+    const GraphDynamicArguments& arguments, const GraphMemoryRequest& memory);
+
+[[nodiscard]] GraphEligibility assess_compiled_serial_graph_replay(
+    const CompiledSerialExecution& compiled, const GraphCapturePlan& capture,
+    const ExecutionRuntimeResources& resources, const GraphDynamicArguments& arguments,
+    std::uint64_t position);
 
 [[nodiscard]] EagerExecutionResult execute_compiled_serial_eager(
     const CompiledSerialExecution& compiled,

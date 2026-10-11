@@ -1,5 +1,8 @@
 # Estado de implementación
 
+Current cross-cutting summary: [qualification ledger](docs/qualification-ledger.md).
+The slices below are retained implementation history, not native qualification.
+
 ## Slice A0.1 — núcleo portable
 
 Implementado:

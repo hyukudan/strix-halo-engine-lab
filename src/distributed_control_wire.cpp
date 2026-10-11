@@ -144,7 +144,7 @@ private:
 
 void validate_limits(
     const DistributedControlWireLimits& limits) {
-    if (limits.protocol_version == 0 ||
+    if (limits.protocol_version != 2 ||
         limits.maximum_frame_bytes <
             header_bytes ||
         limits.maximum_slices == 0) {
@@ -417,6 +417,8 @@ encode_distributed_boundary_transfer(
     if (transfer.flow.flow_id == 0 ||
         transfer.descriptor.byte_length == 0 ||
         transfer.link_plan.slices.empty() ||
+        (!transfer.native_slices.empty() &&
+         transfer.native_slices.size() != transfer.link_plan.slices.size()) ||
         transfer.link_plan.slices.size() >
             limits.maximum_slices) {
         throw std::invalid_argument(
@@ -452,6 +454,14 @@ encode_distributed_boundary_transfer(
                 slice.link_index));
         payload.u64(slice.byte_offset);
         payload.u64(slice.byte_length);
+    }
+    payload.u32(static_cast<std::uint32_t>(transfer.native_slices.size()));
+    for (const auto& identity : transfer.native_slices) {
+        if (identity.connection_epoch == 0 || identity.sequence == 0) {
+            throw std::invalid_argument("native slice identity is uninitialized");
+        }
+        payload.u64(identity.connection_epoch);
+        payload.u64(identity.sequence);
     }
     return frame(
         DistributedControlFrameKind::
@@ -505,6 +515,20 @@ decode_distributed_boundary_transfer(
             reader.u64();
         transfer.link_plan.slices.push_back(
             slice);
+    }
+    const auto native_count = reader.u32();
+    if (native_count != 0 && native_count != slices) {
+        throw std::invalid_argument("native slice identity count does not match slices");
+    }
+    transfer.native_slices.reserve(native_count);
+    for (std::uint32_t index = 0; index < native_count; ++index) {
+        DistributedNativeSliceIdentity identity;
+        identity.connection_epoch = reader.u64();
+        identity.sequence = reader.u64();
+        if (identity.connection_epoch == 0 || identity.sequence == 0) {
+            throw std::invalid_argument("native slice identity is uninitialized");
+        }
+        transfer.native_slices.push_back(identity);
     }
     require_consumed(reader);
     return transfer;

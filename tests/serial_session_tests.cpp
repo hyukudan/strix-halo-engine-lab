@@ -234,6 +234,9 @@ int main() {
     expect(session.next_position == 1 &&
                session.committed_tokens == 1,
            "successful serial token commits position and token count");
+    expect(strix::arithmetic_lineage_serial_only(session.arithmetic_lineage,
+               compiled.execution_identity, 1),
+           "real serial producer publishes its one-row arithmetic lineage after state completion");
 
     SessionDispatcher second;
     second.expected_token = 456;
@@ -250,6 +253,10 @@ int main() {
     expect(session.next_position == 2 &&
                session.committed_tokens == 2,
            "second serial token advances from committed session state");
+    expect(strix::arithmetic_lineage_valid(session.arithmetic_lineage, 2) &&
+               session.arithmetic_lineage.intervals.size() == 1 &&
+               session.arithmetic_lineage.intervals[0].reduction_plan_identity == compiled.kernel_plan_identity,
+           "real consecutive serial rows bind the compiled reduction plan without synthetic chunks");
 
     const auto before_failure = session;
     SessionDispatcher failing;
@@ -285,6 +292,9 @@ int main() {
     expect(session.health ==
                strix::SerialSessionHealth::poisoned,
            "mid-execution failure poisons the session until recovery");
+    expect(session.arithmetic_lineage.tainted &&
+               session.arithmetic_lineage.history_identity == before_failure.arithmetic_lineage.history_identity,
+           "failed state mutation taints previous history without publishing a failed row");
 
     bool poisoned_rejected = false;
     try {

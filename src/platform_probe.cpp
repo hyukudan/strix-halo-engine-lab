@@ -11,6 +11,8 @@
 #include <utility>
 
 #if defined(__linux__)
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <sys/utsname.h>
 #endif
 
@@ -228,6 +230,27 @@ std::vector<Usb4StreamInfo> configured_streams(const std::filesystem::path& root
             if (const auto value = read_first_line(stream_it->path() / "out_hopid"); value.has_value()) {
                 info.out_hopid = parse_i64(*value);
             }
+            if (info.index) {
+                info.device_path = "/dev/tbstream" + std::to_string(*info.index);
+                const auto device = root / info.device_path->substr(1);
+                std::error_code device_error;
+                const auto status = std::filesystem::status(device, device_error);
+                if (!device_error && std::filesystem::exists(status)) {
+                    info.device_is_character = std::filesystem::is_character_file(status);
+                    info.read_write_candidate = *info.device_is_character;
+                }
+#if defined(__linux__)
+                struct stat device_stat {};
+                if (info.device_is_character.value_or(false) &&
+                    ::stat(device.c_str(), &device_stat) == 0) {
+                    const auto node = std::to_string(major(device_stat.st_rdev)) + ":" +
+                        std::to_string(minor(device_stat.st_rdev));
+                    const auto route = std::filesystem::canonical(
+                        rooted(root, "sys/dev/char") / node / "device", device_error);
+                    if (!device_error) info.device_sysfs_route = route.string();
+                }
+#endif
+            }
             streams.push_back(std::move(info));
         }
     }
@@ -289,6 +312,9 @@ PlatformInfo probe_platform(const std::filesystem::path& root) {
         }
     }
 #endif
+    if (info.kernel_release.empty()) {
+        info.kernel_release = read_first_line(rooted(root, "proc/sys/kernel/osrelease")).value_or("");
+    }
     info.mem_total_bytes = mem_total(root);
     info.rocm_version = rocm_version(root);
     info.hipcc_present = std::filesystem::exists(rooted(root, "opt/rocm/bin/hipcc"));
@@ -302,6 +328,8 @@ PlatformInfo probe_platform(const std::filesystem::path& root) {
     info.usb4.stream_driver_present =
         std::filesystem::exists(rooted(root, "sys/module/thunderbolt_stream")) ||
         std::filesystem::exists(rooted(root, "sys/bus/thunderbolt/drivers/thunderbolt_stream"));
+    info.usb4.stream_driver_version = read_first_line(rooted(root, "sys/module/thunderbolt_stream/version"));
+    info.usb4.stream_driver_srcversion = read_first_line(rooted(root, "sys/module/thunderbolt_stream/srcversion"));
 
     const auto dma_buf_gate =
         rooted(

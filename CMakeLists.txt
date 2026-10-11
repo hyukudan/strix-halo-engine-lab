@@ -20,6 +20,9 @@ function(strix_target_warnings target)
 endfunction()
 
 add_library(strix_core STATIC
+    src/arithmetic_lineage.cpp
+    src/graph_eligibility.cpp
+    src/host_upload.cpp
     src/compiled_execution.cpp
     src/compiled_mtp_draft_plan.cpp
     src/compiled_speculative_verify.cpp
@@ -66,6 +69,7 @@ add_library(strix_core STATIC
     src/indexed_attention_state.cpp
     src/iq4_nl.cpp
     src/launch_dispatch.cpp
+    src/low_precision.cpp
     src/memory_plan.cpp
     src/model_contract.cpp
     src/model_content_hash.cpp
@@ -128,6 +132,7 @@ add_library(strix_core STATIC
     src/speculative_verify_binding.cpp
     src/platform_probe.cpp
     src/prompt_lookup_draft.cpp
+    src/projection_reduction.cpp
     src/ple_lookup.cpp
     src/ple_workspace.cpp
     src/transport.cpp
@@ -135,6 +140,15 @@ add_library(strix_core STATIC
 target_include_directories(strix_core PUBLIC include)
 target_compile_features(strix_core PUBLIC cxx_std_20)
 strix_target_warnings(strix_core)
+if(NOT MSVC)
+    set_source_files_properties(src/low_precision.cpp src/projection_reduction.cpp PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+else()
+    set_source_files_properties(src/low_precision.cpp src/projection_reduction.cpp PROPERTIES COMPILE_OPTIONS "/fp:strict")
+endif()
+
+add_executable(strix-low-precision-reference lab/low_precision/reference_main.cpp)
+target_link_libraries(strix-low-precision-reference PRIVATE strix_core)
+strix_target_warnings(strix-low-precision-reference)
 
 add_executable(strix-memory-plan apps/memory_plan_main.cpp)
 target_link_libraries(strix-memory-plan PRIVATE strix_core)
@@ -166,6 +180,29 @@ strix_target_warnings(strix-audit-execution-tensors)
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(strix-host-upload-tests tests/host_upload_tests.cpp)
+    target_link_libraries(strix-host-upload-tests PRIVATE strix_core)
+    strix_target_warnings(strix-host-upload-tests)
+    add_test(NAME strix-host-upload-tests COMMAND strix-host-upload-tests)
+    add_executable(strix-graph-eligibility-tests tests/graph_eligibility_tests.cpp)
+    target_link_libraries(strix-graph-eligibility-tests PRIVATE strix_core)
+    strix_target_warnings(strix-graph-eligibility-tests)
+    add_test(NAME strix-graph-eligibility-tests COMMAND strix-graph-eligibility-tests)
+    add_executable(strix-projection-reduction-tests tests/projection_reduction_tests.cpp)
+    target_link_libraries(strix-projection-reduction-tests PRIVATE strix_core)
+    strix_target_warnings(strix-projection-reduction-tests)
+    if(NOT MSVC)
+        target_compile_options(strix-projection-reduction-tests PRIVATE -ffp-contract=off)
+    endif()
+    add_test(NAME strix-projection-reduction-tests COMMAND strix-projection-reduction-tests)
+    add_executable(strix-low-precision-tests tests/low_precision_tests.cpp)
+    target_link_libraries(strix-low-precision-tests PRIVATE strix_core)
+    strix_target_warnings(strix-low-precision-tests)
+    if(NOT MSVC)
+        target_compile_options(strix-low-precision-tests PRIVATE -ffp-contract=off)
+    endif()
+    add_test(NAME strix-low-precision-tests COMMAND strix-low-precision-tests)
+    add_test(NAME strix-low-precision-vectors COMMAND strix-low-precision-reference vectors)
     add_executable(strix-core-tests tests/core_tests.cpp)
     target_link_libraries(strix-core-tests PRIVATE strix_core)
     strix_target_warnings(strix-core-tests)
@@ -771,6 +808,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
     )
 
     add_library(strix_hip_runtime STATIC
+        src/hip_host_upload_backend.cpp
         src/hip_runtime_allocator.cpp
         src/hip_sampled_target_logits_reader.cpp
         src/hip_session_snapshot_transfer.cpp

@@ -16,7 +16,10 @@ enum class DistributedControlFrameKind : std::uint16_t {
 };
 
 struct DistributedControlWireLimits {
-    std::uint32_t protocol_version = 1;
+    // Wire v2 adds explicit physical-link slice identities. Descriptor and
+    // command protocol versions remain independent. Wire v1 is unsupported;
+    // peers must reconnect/reconcile using v2 rather than silently downgrade.
+    std::uint32_t protocol_version = 2;
     std::uint64_t maximum_frame_bytes = 64ULL * 1024ULL;
     std::uint32_t maximum_slices = 64;
 };

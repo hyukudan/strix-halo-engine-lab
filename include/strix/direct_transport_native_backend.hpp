@@ -11,7 +11,18 @@
 
 namespace strix::transport {
 
+enum class DirectNativeQueryStatus {
+    unavailable,
+    inaccessible,
+    unsupported,
+    incompatible,
+    verified,
+};
+
 struct DirectNativeCapabilities {
+    // Trusted backend declarations, not cryptographically verified evidence.
+    // The backend must invalidate the lifecycle/cached proof on driver, ABI,
+    // endpoint or synchronization changes; static discovery cannot set these.
     bool dma_buf_export = false;
     bool dma_buf_import = false;
     bool uncached_gpu_pool = false;
@@ -19,6 +30,11 @@ struct DirectNativeCapabilities {
     bool system_scope_gpu_commit = false;
     bool remote_consumer_credit = false;
     bool receive_repost = false;
+    DirectNativeQueryStatus query_status = DirectNativeQueryStatus::unavailable;
+    std::optional<DirectNativeInterfaceIdentity> observed_interface;
+    bool imported_tx_rx_ownership_verified = false;
+    bool completion_ownership_verified = false;
+    bool external_dma_visibility_qualified = false;
 };
 
 struct DirectNativeReadiness {
@@ -82,6 +98,11 @@ public:
 [[nodiscard]] DirectNativeReadiness assess_direct_native_readiness(
     const BackendCapabilities& backend,
     const DirectNativeCapabilities& native);
+
+[[nodiscard]] DirectNativeReadiness assess_direct_native_readiness(
+    const BackendCapabilities& backend,
+    const DirectNativeCapabilities& native,
+    const DirectLinkLifecycle& expected_link);
 
 void prepare_direct_native_link(
     DirectTransportNativeBackend& backend,

@@ -57,6 +57,7 @@ private:
     DistributedNativeLocalExecutor* executor_ = nullptr;
     std::uint32_t protocol_version_ = 1;
     std::uint64_t next_command_sequence_ = 1;
+    std::uint64_t next_boundary_sequence_ = 1;
     bool failed_ = false;
 
     std::unordered_map<

@@ -238,20 +238,27 @@ StripedMessageTracker::StripedMessageTracker(
 bool StripedMessageTracker::observe_commit(
     const GpuCommitRecord& record) {
     if (invalid_ || complete_) {
+        invalid_ = true;
         return false;
     }
+    const auto stripe = static_cast<std::size_t>(record.stripe_index);
+    if (stripe >= stripe_bytes_.size()) {
+        invalid_ = true;
+        return false;
+    }
+    const auto& expected = physical_descriptors_.empty()
+        ? descriptor_ : physical_descriptors_[stripe];
     if (!validate_gpu_commit_record(
             record,
-            descriptor_) ||
+            expected) ||
         record.stripe_count !=
-            stripe_count_) {
+            stripe_count_ ||
+        (!physical_descriptors_.empty() &&
+         record.payload_bytes != expected.byte_length)) {
         invalid_ = true;
         return false;
     }
 
-    const auto stripe =
-        static_cast<std::size_t>(
-            record.stripe_index);
     if (stripe >=
             stripe_bytes_.size() ||
         stripe_bytes_[stripe] != 0) {
@@ -284,6 +291,39 @@ bool StripedMessageTracker::observe_commit(
         complete_ = true;
     }
     return true;
+}
+
+StripedMessageTracker::StripedMessageTracker(
+    TransferDescriptor logical_descriptor,
+    std::span<const TransferDescriptor> physical_descriptors)
+    : descriptor_(logical_descriptor) {
+    if (physical_descriptors.empty() ||
+        physical_descriptors.size() > std::numeric_limits<std::uint16_t>::max() ||
+        descriptor_.byte_length == 0) {
+        throw std::invalid_argument("striped tracker requires bounded physical descriptors");
+    }
+    std::uint64_t total = 0;
+    for (const auto& physical : physical_descriptors) {
+        if (physical.protocol_version != descriptor_.protocol_version ||
+            physical.model_plan_id != descriptor_.model_plan_id ||
+            physical.request_id != descriptor_.request_id ||
+            physical.generation != descriptor_.generation ||
+            physical.boundary_id != descriptor_.boundary_id ||
+            physical.shape_fingerprint != descriptor_.shape_fingerprint ||
+            physical.dtype_id != descriptor_.dtype_id ||
+            physical.connection_epoch == 0 || physical.sequence == 0 ||
+            physical.byte_length == 0 ||
+            physical.byte_length > descriptor_.byte_length - total) {
+            throw std::invalid_argument("physical stripe does not match logical message");
+        }
+        total += physical.byte_length;
+    }
+    if (total != descriptor_.byte_length) {
+        throw std::invalid_argument("physical stripe bytes do not cover logical message");
+    }
+    stripe_count_ = static_cast<std::uint16_t>(physical_descriptors.size());
+    stripe_bytes_.resize(stripe_count_, 0);
+    physical_descriptors_.assign(physical_descriptors.begin(), physical_descriptors.end());
 }
 
 bool direct_link_armable(

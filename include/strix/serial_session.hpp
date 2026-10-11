@@ -1,5 +1,7 @@
 #pragma once
 
+#include "strix/arithmetic_lineage.hpp"
+
 #include "strix/compiled_execution.hpp"
 #include "strix/execution_runtime.hpp"
 #include "strix/session_state_layout.hpp"
@@ -22,6 +24,7 @@ struct SerialSessionContext {
     std::uint64_t committed_tokens = 0;
     SerialSessionHealth health = SerialSessionHealth::ready;
     PersistentStateGenerations state;
+    ArithmeticLineage arithmetic_lineage;
 };
 
 [[nodiscard]] EagerExecutionResult execute_serial_token(

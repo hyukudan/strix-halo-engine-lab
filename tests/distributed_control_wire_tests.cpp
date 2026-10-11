@@ -93,6 +93,7 @@ strix::DistributedBoundaryTransfer striped_transfer() {
         {0,0,64},
         {1,64,64},
     };
+    value.native_slices = {{21, 101}, {39, 203}};
     return value;
 }
 
@@ -159,8 +160,39 @@ int main() {
             decoded_transfer.link_plan.kind ==
                 strix::transport::PlanKind::striped &&
             decoded_transfer.link_plan.slices.size() == 2 &&
-            decoded_transfer.link_plan.slices[1].byte_offset == 64,
+            decoded_transfer.link_plan.slices[1].byte_offset == 64 &&
+            decoded_transfer.descriptor.connection_epoch == 9 &&
+            decoded_transfer.descriptor.sequence == 14 &&
+            decoded_transfer.native_slices.size() == 2 &&
+            decoded_transfer.native_slices[0].connection_epoch == 21 &&
+            decoded_transfer.native_slices[0].sequence == 101 &&
+            decoded_transfer.native_slices[1].connection_epoch == 39 &&
+            decoded_transfer.native_slices[1].sequence == 203,
         "striped boundary metadata round-trips with exact slices");
+
+    auto legacy_frame = strix::encode_distributed_boundary_transfer(transfer);
+    legacy_frame[4] = static_cast<std::byte>(1);
+    bool legacy_rejected = false;
+    try {
+        static_cast<void>(strix::decode_distributed_boundary_transfer(legacy_frame));
+    } catch (const std::invalid_argument&) { legacy_rejected = true; }
+    expect(legacy_rejected, "wire v2 rejects v1 peers without interpreting old slice framing");
+
+    bool downgrade_rejected = false;
+    auto legacy_limits = strix::DistributedControlWireLimits{};
+    legacy_limits.protocol_version = 1;
+    try {
+        static_cast<void>(strix::encode_distributed_boundary_transfer(transfer, legacy_limits));
+    } catch (const std::invalid_argument&) { downgrade_rejected = true; }
+    expect(downgrade_rejected, "wire v2 does not silently downgrade physical identity metadata");
+
+    auto bad_native_count = transfer;
+    bad_native_count.native_slices.pop_back();
+    bool count_rejected = false;
+    try {
+        static_cast<void>(strix::encode_distributed_boundary_transfer(bad_native_count));
+    } catch (const std::invalid_argument&) { count_rejected = true; }
+    expect(count_rejected, "wire rejects incomplete physical slice identity coverage");
 
     Loopback stream;
     strix::FramedDistributedControlWire wire(

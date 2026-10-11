@@ -63,7 +63,8 @@ SerialPrefixCacheEntry::capture(
     auto prefix =
         make_serial_prefix_snapshot(
             prefix_tokens,
-            snapshot);
+            snapshot,
+            session.arithmetic_lineage);
     auto memory =
         SessionSnapshotMemoryOwner::allocate(
             snapshot,
@@ -92,21 +93,38 @@ void SerialPrefixCacheEntry::restore(
     const SerialSessionStateLayout& state_layout,
     const SessionStateMemoryBinding& state_memory,
     SessionSnapshotTransferBackend& backend,
-    std::span<const std::uint32_t> requested_prefix) const {
+    std::span<const std::uint32_t> requested_prefix,
+    const ArithmeticLineage* requested_history) const {
     if (!valid()) {
         throw std::logic_error(
             "serial prefix cache entry is not initialized");
     }
 
-    restore_serial_prefix_snapshot(
-        session,
-        model,
-        state_layout,
-        state_memory,
-        memory_.binding(),
-        backend,
-        requested_prefix,
-        prefix_);
+    if (!try_restore(session, model, state_layout, state_memory, backend, requested_prefix, requested_history)) {
+        throw std::invalid_argument("serial prefix cache miss for requested tokens/runtime/arithmetic history");
+    }
+}
+
+bool SerialPrefixCacheEntry::matches(
+    std::span<const std::uint32_t> requested_prefix,
+    std::uint64_t execution_identity,
+    std::uint64_t runtime_compatibility_identity,
+    std::uint64_t state_layout_identity,
+    const ArithmeticLineage* requested_history) const noexcept {
+    return valid() && serial_prefix_snapshot_matches(prefix_, requested_prefix,
+        execution_identity, runtime_compatibility_identity, state_layout_identity, requested_history);
+}
+
+bool SerialPrefixCacheEntry::try_restore(
+    SerialSessionContext& session, const ModelContract& model,
+    const SerialSessionStateLayout& state_layout, const SessionStateMemoryBinding& state_memory,
+    SessionSnapshotTransferBackend& backend, std::span<const std::uint32_t> requested_prefix,
+    const ArithmeticLineage* requested_history) const {
+    if (!matches(requested_prefix, session.execution_identity, session.runtime_compatibility_identity,
+                 session.state_layout_identity, requested_history)) { return false; }
+    restore_serial_prefix_snapshot(session, model, state_layout, state_memory, memory_.binding(),
+                                  backend, requested_prefix, prefix_, requested_history);
+    return true;
 }
 
 }  // namespace strix

@@ -116,4 +116,54 @@ bool DirectTransportLeaseRegistry::leased(
            active_.end();
 }
 
+void DirectTransportLeaseRegistry::require_current_token(
+    const DirectTransportLease& lease) const {
+    const auto found = active_.find(lease.physical_link_id);
+    if (found == active_.end() ||
+        found->second.connection_epoch != lease.connection_epoch ||
+        found->second.pool_binding_identity != lease.pool_binding_identity ||
+        found->second.link_index != lease.link_index ||
+        found->second.lease_generation != lease.lease_generation) {
+        throw std::invalid_argument("physical sequence reservation requires current lease token");
+    }
+}
+
+std::uint64_t DirectTransportLeaseRegistry::reserve_send_sequence(
+    const DirectTransportLease& lease) {
+    require_current_token(lease);
+    auto& state = sequence_history_[lease.physical_link_id][lease.connection_epoch];
+    if (state.next_send == std::numeric_limits<std::uint64_t>::max()) {
+        throw std::overflow_error("native physical send sequence exhausted");
+    }
+    return state.next_send++;
+}
+
+void DirectTransportLeaseRegistry::reserve_receive_sequence(
+    const DirectTransportLease& lease, std::uint64_t sequence) {
+    require_current_token(lease);
+    auto& state = sequence_history_[lease.physical_link_id][lease.connection_epoch];
+    if (state.receive_quarantined) {
+        throw std::logic_error("native RX epoch is quarantined");
+    }
+    if (sequence == 0 || sequence <= state.last_receive) {
+        throw std::invalid_argument("native physical receive sequence is stale or duplicate");
+    }
+    state.last_receive = sequence;
+}
+
+void DirectTransportLeaseRegistry::quarantine_receive(
+    const DirectTransportLease& lease) {
+    require_current_token(lease);
+    sequence_history_[lease.physical_link_id][lease.connection_epoch].receive_quarantined = true;
+}
+
+bool DirectTransportLeaseRegistry::receive_quarantined(
+    const DirectTransportLease& lease) const {
+    require_current_token(lease);
+    const auto physical = sequence_history_.find(lease.physical_link_id);
+    if (physical == sequence_history_.end()) return false;
+    const auto epoch = physical->second.find(lease.connection_epoch);
+    return epoch != physical->second.end() && epoch->second.receive_quarantined;
+}
+
 }  // namespace strix::transport

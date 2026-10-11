@@ -7,6 +7,9 @@
 
 namespace strix::transport {
 
+// One serialized progress owner per physical session. These stateful APIs
+// are not thread-safe; adapters sharing a session must serialize reservations,
+// preparation, control publication and completion progress in link order.
 class DirectTransportNativeLinkSession {
 public:
     DirectTransportNativeLinkSession() = default;
@@ -36,6 +39,19 @@ public:
     [[nodiscard]] const DirectTransportLease&
     lease() const noexcept {
         return lease_;
+    }
+
+    // Sequences are unique within this physical epoch and direction, across
+    // logical requests and same-epoch lease reopen. Failed preparation burns
+    // a reservation deliberately; the lease registry retains the history.
+    [[nodiscard]] std::uint64_t reserve_send_sequence();
+    void reserve_receive_sequence(std::uint64_t sequence);
+
+    // Fail closed after an unretired receive. This lease's RX pool cannot be
+    // prepared, released or reposted again by another distributed adapter.
+    void quarantine_receive(TransferHandle handle);
+    [[nodiscard]] bool receive_quarantined() const noexcept {
+        return receive_quarantined_;
     }
 
     [[nodiscard]] TransferHandle prepare_receive(
@@ -114,10 +130,12 @@ private:
     const DirectLinkLifecycle* link_ = nullptr;
     const DirectTransportPoolMemoryBinding* pools_ = nullptr;
     DirectTransportLease lease_;
+    DirectNativeInterfaceIdentity native_interface_;
     DirectReceiveCompletionBridge receives_;
     DirectSendCompletionBridge sends_;
     DualLinkCompletionTelemetry* telemetry_ = nullptr;
     DualLinkRuntimeScheduler* scheduler_ = nullptr;
+    bool receive_quarantined_ = false;
 };
 
 }  // namespace strix::transport

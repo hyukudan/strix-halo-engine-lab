@@ -1,11 +1,15 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
+#include "strix/projection_reduction.hpp"
 
 #include <algorithm>
 #include <array>
+#include <bit>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <iostream>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -112,7 +116,7 @@ float dequantized_weight_host(
            static_cast<float>(kCodebookHost[code]);
 }
 
-template <unsigned Rows>
+template <unsigned Rows, bool ShuffleTail = false>
 __global__ void iq4_xs_projection_kernel(
     const float* activations,
     const IQ4XSBlock* weights,
@@ -149,12 +153,11 @@ __global__ void iq4_xs_projection_kernel(
 
 #pragma unroll
         for (unsigned row = 0; row < Rows; ++row) {
-            accumulators[row] +=
+            accumulators[row] = fmaf(
                 activations[
                     static_cast<std::uint64_t>(row) *
                         input_features +
-                    input_index] *
-                weight;
+                    input_index], weight, accumulators[row]);
         }
     }
 
@@ -169,7 +172,7 @@ __global__ void iq4_xs_projection_kernel(
     __syncthreads();
 
     for (unsigned offset = blockDim.x / 2U;
-         offset > 0;
+         offset >= (ShuffleTail ? 32U : 1U);
          offset /= 2U) {
         if (threadIdx.x < offset) {
 #pragma unroll
@@ -184,7 +187,19 @@ __global__ void iq4_xs_projection_kernel(
         __syncthreads();
     }
 
-    if (threadIdx.x == 0) {
+    if constexpr (ShuffleTail) {
+        if (threadIdx.x < 32U) {
+#pragma unroll
+            for (unsigned row = 0; row < Rows; ++row) {
+                float value = shared[static_cast<std::size_t>(row) * blockDim.x + threadIdx.x];
+                for (unsigned offset = 16; offset != 0; offset /= 2) {
+                    const float next = __shfl_down(value, offset, 32);
+                    if (threadIdx.x < offset) value = value + next;
+                }
+                if (threadIdx.x == 0) output[static_cast<std::uint64_t>(row) * output_features + output_index] = value;
+            }
+        }
+    } else if (threadIdx.x == 0) {
 #pragma unroll
         for (unsigned row = 0; row < Rows; ++row) {
             output[
@@ -408,6 +423,9 @@ void expect_close(
     for (std::size_t index = 0;
          index < actual.size();
          ++index) {
+        if (!std::isfinite(actual[index]) || !std::isfinite(expected[index])) {
+            throw std::runtime_error(std::string(name) + ": nonfinite output");
+        }
         const float difference =
             std::fabs(actual[index] - expected[index]);
         const float scale =
@@ -423,26 +441,69 @@ void expect_close(
     }
 }
 
-template <unsigned Rows>
+template <unsigned Rows, bool ShuffleTail = false>
 void launch_projection(
     const DeviceBuffer<float>& activations,
     const DeviceBuffer<IQ4XSBlock>& weights,
     DeviceBuffer<float>& output,
     std::uint32_t input_features,
-    std::uint32_t output_features) {
+    std::uint32_t output_features,
+    hipStream_t stream = nullptr) {
     hipLaunchKernelGGL(
         HIP_KERNEL_NAME(
-            iq4_xs_projection_kernel<Rows>),
+            iq4_xs_projection_kernel<Rows, ShuffleTail>),
         dim3(output_features),
         dim3(kThreads),
         Rows * kThreads * sizeof(float),
-        0,
+        stream,
         activations.pointer,
         weights.pointer,
         output.pointer,
         input_features,
         output_features);
 }
+
+template <unsigned Rows, bool ShuffleTail>
+class ProjectionGraph {
+public:
+    ProjectionGraph(const DeviceBuffer<float>& input, const DeviceBuffer<IQ4XSBlock>& weights,
+                    DeviceBuffer<float>& output, std::uint32_t k, std::uint32_t n) {
+        try {
+            check(hipStreamCreateWithFlags(&stream_, hipStreamNonBlocking), "graph stream create");
+            check(hipStreamBeginCapture(stream_, hipStreamCaptureModeThreadLocal), "graph capture begin");
+            capturing_ = true;
+            launch_projection<Rows, ShuffleTail>(input, weights, output, k, n, stream_);
+            check(hipGetLastError(), "graph projection capture launch");
+            const auto end = hipStreamEndCapture(stream_, &graph_);
+            capturing_ = false;
+            check(end, "graph capture end");
+            check(hipGraphInstantiate(&exec_, graph_, nullptr, nullptr, 0), "graph instantiate");
+        } catch (...) { cleanup(); throw; }
+    }
+    ProjectionGraph(const ProjectionGraph&) = delete;
+    ProjectionGraph& operator=(const ProjectionGraph&) = delete;
+    ~ProjectionGraph() { cleanup(); }
+    void launch() { check(hipGraphLaunch(exec_, stream_), "projection graph replay"); }
+    void synchronize() { check(hipStreamSynchronize(stream_), "projection graph completion"); }
+    hipStream_t stream() const { return stream_; }
+private:
+    void cleanup() noexcept {
+        if (capturing_) {
+            hipGraph_t discarded{};
+            static_cast<void>(hipStreamEndCapture(stream_, &discarded));
+            if (discarded) static_cast<void>(hipGraphDestroy(discarded));
+        }
+        if (stream_) static_cast<void>(hipStreamSynchronize(stream_));
+        if (exec_) static_cast<void>(hipGraphExecDestroy(exec_));
+        if (graph_) static_cast<void>(hipGraphDestroy(graph_));
+        if (stream_) static_cast<void>(hipStreamDestroy(stream_));
+        exec_ = nullptr; graph_ = nullptr; stream_ = nullptr; capturing_ = false;
+    }
+    hipStream_t stream_{};
+    hipGraph_t graph_{};
+    hipGraphExec_t exec_{};
+    bool capturing_ = false;
+};
 
 template <unsigned Rows>
 void correctness_fixture() {
@@ -588,11 +649,86 @@ void row_invariance_fixture() {
         "IQ4_XS row invariance");
 }
 
+template <unsigned Rows>
+void exact_tree_fixture(std::uint32_t input_features) {
+    constexpr std::uint32_t outputs = 7;
+    constexpr unsigned guard = 5;
+    const auto weights = make_weights(input_features, outputs);
+    std::vector<float> input(static_cast<std::size_t>(Rows) * input_features);
+    for (std::size_t i = 0; i < input.size(); ++i) {
+        const int code = static_cast<int>((i * 17U + i / input_features) % 61U) - 30;
+        input[i] = std::ldexp(static_cast<float>(code), static_cast<int>(i % 13U) - 6);
+    }
+    DeviceBuffer<float> d_input(input.size());
+    DeviceBuffer<IQ4XSBlock> d_weights(weights.size());
+    DeviceBuffer<float> d_baseline(static_cast<std::size_t>(Rows) * outputs + guard);
+    DeviceBuffer<float> d_candidate(static_cast<std::size_t>(Rows) * outputs + guard);
+    std::vector<float> poison(static_cast<std::size_t>(Rows) * outputs + guard,
+                              std::bit_cast<float>(0x7fc12345U));
+    copy_to_device(d_input, input);
+    copy_to_device(d_weights, weights);
+    copy_to_device(d_baseline, poison);
+    copy_to_device(d_candidate, poison);
+    launch_projection<Rows, false>(d_input, d_weights, d_baseline, input_features, outputs);
+    launch_projection<Rows, true>(d_input, d_weights, d_candidate, input_features, outputs);
+    check(hipGetLastError(), "exact reduction fixture launch");
+    check(hipDeviceSynchronize(), "exact reduction fixture sync");
+    const auto baseline = copy_from_device(d_baseline, poison.size());
+    const auto candidate = copy_from_device(d_candidate, poison.size());
+    // Capture only this fixed-shape projection. Input values remain device data;
+    // whole-model token/position scalar launchers are not made graph-safe here.
+    const auto original_input = input;
+    ProjectionGraph<Rows, true> graph(d_input, d_weights, d_candidate, input_features, outputs);
+    for (float& value : input) value = -value;
+    copy_to_device(d_input, input);
+    graph.launch();
+    graph.synchronize();
+    const auto replay = copy_from_device(d_candidate, poison.size());
+    const auto blocks = input_features / kBlockElements;
+    std::vector<float> decoded(input_features);
+    bool changed_output = false;
+    for (std::uint32_t out = 0; out < outputs; ++out) {
+        for (std::uint32_t k = 0; k < input_features; ++k) {
+            decoded[k] = dequantized_weight_host(weights[out * blocks + k / kBlockElements], k % kBlockElements);
+        }
+        for (unsigned row = 0; row < Rows; ++row) {
+            const float expected = strix::projection_dot_reference(decoded,
+                std::span<const float>(original_input).subspan(static_cast<std::size_t>(row) * input_features, input_features));
+            const float expected_replay = strix::projection_dot_reference(decoded,
+                std::span<const float>(input).subspan(static_cast<std::size_t>(row) * input_features, input_features));
+            const auto index = row * outputs + out;
+            changed_output = changed_output || expected != expected_replay;
+            if (std::bit_cast<std::uint32_t>(baseline[index]) != std::bit_cast<std::uint32_t>(expected) ||
+                std::bit_cast<std::uint32_t>(candidate[index]) != std::bit_cast<std::uint32_t>(expected) ||
+                std::bit_cast<std::uint32_t>(replay[index]) != std::bit_cast<std::uint32_t>(expected_replay)) {
+                throw std::runtime_error("projection exact arithmetic gate failed");
+            }
+        }
+    }
+    if (!changed_output) throw std::runtime_error("graph input-change fixture lacks a sensitive output");
+    for (std::size_t i = static_cast<std::size_t>(Rows) * outputs; i < poison.size(); ++i) {
+        if (std::bit_cast<std::uint32_t>(baseline[i]) != 0x7fc12345U ||
+            std::bit_cast<std::uint32_t>(candidate[i]) != 0x7fc12345U ||
+            std::bit_cast<std::uint32_t>(replay[i]) != 0x7fc12345U) {
+            throw std::runtime_error("projection wrote outside active output rows");
+        }
+    }
+}
+
+struct ScopedHipEvent {
+    hipEvent_t value{};
+    ScopedHipEvent() { check(hipEventCreate(&value), "benchmark event create"); }
+    ScopedHipEvent(const ScopedHipEvent&) = delete;
+    ScopedHipEvent& operator=(const ScopedHipEvent&) = delete;
+    ~ScopedHipEvent() { if (value) static_cast<void>(hipEventDestroy(value)); }
+};
+
 template <typename Launch>
 double benchmark_us(
     Launch&& launch,
     unsigned warmup = 10,
-    unsigned iterations = 100) {
+    unsigned iterations = 100,
+    hipStream_t stream = nullptr) {
     for (unsigned index = 0;
          index < warmup;
          ++index) {
@@ -605,16 +741,10 @@ double benchmark_us(
         hipDeviceSynchronize(),
         "IQ4_XS benchmark warmup sync");
 
-    hipEvent_t start{};
-    hipEvent_t stop{};
+    ScopedHipEvent start;
+    ScopedHipEvent stop;
     check(
-        hipEventCreate(&start),
-        "hipEventCreate start");
-    check(
-        hipEventCreate(&stop),
-        "hipEventCreate stop");
-    check(
-        hipEventRecord(start),
+        hipEventRecord(start.value, stream),
         "hipEventRecord start");
 
     for (unsigned index = 0;
@@ -627,25 +757,22 @@ double benchmark_us(
         hipGetLastError(),
         "IQ4_XS benchmark measured launch");
     check(
-        hipEventRecord(stop),
+        hipEventRecord(stop.value, stream),
         "hipEventRecord stop");
     check(
-        hipEventSynchronize(stop),
+        hipEventSynchronize(stop.value),
         "hipEventSynchronize stop");
 
     float milliseconds = 0.0F;
     check(
         hipEventElapsedTime(
             &milliseconds,
-            start,
-            stop),
+            start.value,
+            stop.value),
         "hipEventElapsedTime");
-    check(
-        hipEventDestroy(start),
-        "hipEventDestroy start");
-    check(
-        hipEventDestroy(stop),
-        "hipEventDestroy stop");
+    if (!std::isfinite(milliseconds) || milliseconds <= 0.0F) {
+        throw std::runtime_error("invalid measured projection event interval");
+    }
 
     return
         static_cast<double>(milliseconds) *
@@ -659,14 +786,14 @@ struct KernelAttributes {
     std::size_t local_bytes = 0;
 };
 
-template <unsigned Rows>
+template <unsigned Rows, bool ShuffleTail = false>
 KernelAttributes attributes() {
     hipFuncAttributes value{};
     check(
         hipFuncGetAttributes(
             &value,
             reinterpret_cast<const void*>(
-                iq4_xs_projection_kernel<Rows>)),
+                iq4_xs_projection_kernel<Rows, ShuffleTail>)),
         "hipFuncGetAttributes IQ4_XS");
     return KernelAttributes{
         value.numRegs,
@@ -676,6 +803,9 @@ KernelAttributes attributes() {
 }
 
 struct Measurement {
+    bool shuffle_tail = false;
+    bool graph_replay = false;
+    double capture_us = 0.0;
     unsigned rows = 0;
     double microseconds = 0.0;
     std::uint64_t weight_bytes = 0;
@@ -684,7 +814,7 @@ struct Measurement {
     KernelAttributes resources;
 };
 
-template <unsigned Rows>
+template <unsigned Rows, bool ShuffleTail = false, bool GraphReplay = false>
 Measurement benchmark_row_class() {
     constexpr std::uint32_t input_features = 2560;
     constexpr std::uint32_t output_features = 2560;
@@ -718,15 +848,24 @@ Measurement benchmark_row_class() {
     copy_to_device(
         d_weights, weights);
 
+    std::unique_ptr<ProjectionGraph<Rows, ShuffleTail>> graph;
+    const auto capture_start = std::chrono::steady_clock::now();
+    if constexpr (GraphReplay) {
+        graph = std::make_unique<ProjectionGraph<Rows, ShuffleTail>>(
+            d_activations, d_weights, d_output, input_features, output_features);
+    }
+    const double capture_us = GraphReplay ? std::chrono::duration<double, std::micro>(
+        std::chrono::steady_clock::now() - capture_start).count() : 0.0;
     const auto microseconds =
         benchmark_us([&] {
-            launch_projection<Rows>(
+            if constexpr (GraphReplay) { graph->launch(); }
+            else launch_projection<Rows, ShuffleTail>(
                 d_activations,
                 d_weights,
                 d_output,
                 input_features,
                 output_features);
-        });
+        }, 10, 100, GraphReplay ? graph->stream() : nullptr);
 
     const double seconds =
         microseconds * 1e-6;
@@ -735,6 +874,9 @@ Measurement benchmark_row_class() {
         (1024.0 * 1024.0 * 1024.0);
 
     Measurement result;
+    result.shuffle_tail = ShuffleTail;
+    result.graph_replay = GraphReplay;
+    result.capture_us = capture_us;
     result.rows = Rows;
     result.microseconds = microseconds;
     result.weight_bytes = weight_bytes;
@@ -748,7 +890,7 @@ Measurement benchmark_row_class() {
                   static_cast<double>(Rows) /
                   seconds
             : 0.0;
-    result.resources = attributes<Rows>();
+    result.resources = attributes<Rows, ShuffleTail>();
     return result;
 }
 
@@ -757,6 +899,10 @@ void print_measurement(
     bool last) {
     std::cout
         << "    {\"rows\":" << value.rows
+        << ",\"reduction\":\"" << (value.shuffle_tail ? "shuffle_tail" : "lds_tree") << '"'
+        << ",\"graph_replay\":" << (value.graph_replay ? "true" : "false")
+        << ",\"capture_us\":" << value.capture_us
+        << ",\"graph_memory_bytes\":null"
         << ",\"microseconds\":"
         << value.microseconds
         << ",\"weight_bytes\":"
@@ -829,6 +975,12 @@ int main() try {
     correctness_fixture<4>();
     correctness_fixture<8>();
     row_invariance_fixture();
+    for (std::uint32_t k : {256U, 512U, 2560U, 4096U}) {
+        exact_tree_fixture<1>(k);
+        exact_tree_fixture<2>(k);
+        exact_tree_fixture<4>(k);
+        exact_tree_fixture<8>(k);
+    }
 
     const auto c1 =
         benchmark_row_class<1>();
@@ -850,12 +1002,23 @@ int main() try {
         << STRIX_WAVE_SIZE
         << ",\n"
         << "  \"row_invariance_fixture\":true,\n"
+        << "  \"exact_tree_fixture\":true,\n"
+        << "  \"arithmetic\":\"iq4_xs-f32-fma256-tree-v1\",\n"
+        << "  \"qualified\":false,\n"
         << "  \"measurements\":[\n";
 
     print_measurement(c1, false);
     print_measurement(r2, false);
     print_measurement(r4, false);
-    print_measurement(r8, true);
+    print_measurement(r8, false);
+    print_measurement(benchmark_row_class<1, true>(), false);
+    print_measurement(benchmark_row_class<2, true>(), false);
+    print_measurement(benchmark_row_class<4, true>(), false);
+    print_measurement(benchmark_row_class<8, true>(), false);
+    print_measurement(benchmark_row_class<1, true, true>(), false);
+    print_measurement(benchmark_row_class<2, true, true>(), false);
+    print_measurement(benchmark_row_class<4, true, true>(), false);
+    print_measurement(benchmark_row_class<8, true, true>(), true);
 
     std::cout
         << "  ]\n"

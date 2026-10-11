@@ -1,4 +1,5 @@
 #include "strix/direct_transport_native_backend.hpp"
+#include "direct_native_fixture.hpp"
 
 #include <deque>
 #include <iostream>
@@ -33,9 +34,7 @@ public:
 
     strix::transport::DirectNativeCapabilities
     direct_capabilities() const override {
-        return {
-            true, true, true, true, true, true, true,
-        };
+        return synthetic_native_capabilities(native_identity);
     }
 
     void import_link_pool(
@@ -77,6 +76,7 @@ public:
     }
 
     int imports = 0;
+    strix::transport::DirectNativeInterfaceIdentity native_identity;
     int releases = 0;
     int commits = 0;
     int credits = 0;
@@ -99,6 +99,7 @@ int main() {
     link.exclusive_lease_available = true;
     link.completion_rearm_qualified = true;
     link.dma_buf_import_supported = true;
+    link.expected_native_interface = synthetic_native_identity(link);
 
     DirectTransportPoolMemoryBinding pools;
     pools.binding_identity = 0x1234ULL;
@@ -110,6 +111,7 @@ int main() {
         leases.acquire(link, pools, 0);
 
     FakeBackend backend;
+    backend.native_identity = *link.expected_native_interface;
     const auto readiness =
         assess_direct_native_readiness(
             backend.capabilities(),
@@ -225,6 +227,43 @@ int main() {
             incomplete);
     expect(!blocked.ready && !blocked.blockers.empty(),
            "missing native commit primitive blocks direct readiness");
+
+    auto booleans_only = backend.direct_capabilities();
+    booleans_only.query_status = DirectNativeQueryStatus::unavailable;
+    booleans_only.observed_interface.reset();
+    expect(!assess_direct_native_readiness(backend.capabilities(), booleans_only, link).ready,
+           "generic capability booleans cannot authorize native import without ABI proof");
+    for (const auto status : {DirectNativeQueryStatus::unavailable,
+                             DirectNativeQueryStatus::inaccessible,
+                             DirectNativeQueryStatus::unsupported,
+                             DirectNativeQueryStatus::incompatible}) {
+        auto unavailable = backend.direct_capabilities();
+        unavailable.query_status = status;
+        expect(!assess_direct_native_readiness(backend.capabilities(), unavailable, link).ready,
+               "unavailable/inaccessible/unsupported/incompatible query cannot enable import");
+    }
+    for (int mode = 0; mode < 10; ++mode) {
+        auto incompatible = backend.direct_capabilities();
+        if (mode == 0) incompatible.query_status = DirectNativeQueryStatus::unavailable;
+        if (mode == 1) incompatible.observed_interface->abi_identity = "unsupported-abi";
+        if (mode == 2) incompatible.observed_interface->peer_endpoint_identity = "foreign-peer";
+        if (mode == 3) incompatible.observed_interface->physical_link_id = "other-link";
+        if (mode == 4) ++incompatible.observed_interface->connection_epoch;
+        if (mode == 5) incompatible.imported_tx_rx_ownership_verified = false;
+        if (mode == 6) incompatible.completion_ownership_verified = false;
+        if (mode == 7) incompatible.external_dma_visibility_qualified = false;
+        if (mode == 8) incompatible.observed_interface->driver_identity = "changed-driver";
+        if (mode == 9) incompatible.observed_interface->kernel_release = "changed-kernel";
+        expect(!assess_direct_native_readiness(backend.capabilities(), incompatible, link).ready,
+               "stale ABI/peer/link/epoch or unproven import/event semantics reject readiness");
+    }
+    auto stale_expected = link;
+    stale_expected.expected_native_interface->abi_identity = "unsupported-expected-abi";
+    bool import_rejected = false;
+    try { prepare_direct_native_link(backend, leases, stale_expected, pools, lease); }
+    catch (const std::logic_error&) { import_rejected = true; }
+    expect(import_rejected && backend.imports == 1,
+           "incompatible proof is rejected before imported-pool backend call");
 
     if (failures == 0) {
         std::cout << "direct native backend tests passed\n";

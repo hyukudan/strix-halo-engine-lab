@@ -53,6 +53,22 @@ int main(){
     c.publish_boundary_transfer(p.boundaries[0],out); expect(w.published.size()==1,"outbound metadata forwarded");
     w.inbound=transfer(p,p.boundaries[1],strix::transport::LinkDirection::inbound);
     const auto in=c.await_boundary_transfer(p.boundaries[1]); expect(in.descriptor.boundary_id==p.boundaries[1].boundary_id,"inbound metadata accepted");
+    bool duplicate_rejected=false;
+    try {static_cast<void>(c.await_boundary_transfer(p.boundaries[1]));}
+    catch(const std::runtime_error&){duplicate_rejected=true;}
+    expect(duplicate_rejected&&c.failed(),"duplicate logical message fails before native payload exposure");
+    for(int mode=0;mode<3;++mode){
+        Wire foreign_wire;
+        strix::SequencedDistributedNativeControlPlane foreign(p,req,foreign_wire);
+        foreign_wire.inbound=transfer(p,p.boundaries[1],strix::transport::LinkDirection::inbound);
+        if(mode==0)++foreign_wire.inbound.descriptor.dtype_id;
+        if(mode==1)++foreign_wire.inbound.descriptor.protocol_version;
+        if(mode==2)++foreign_wire.inbound.descriptor.sequence;
+        bool foreign_rejected=false;
+        try{static_cast<void>(foreign.await_boundary_transfer(p.boundaries[1]));}
+        catch(const std::runtime_error&){foreign_rejected=true;}
+        expect(foreign_rejected&&foreign.failed(),"foreign dtype/protocol/logical sequence fails at control preflight");
+    }
     Wire badw; badw.auto_ack=false; badw.next_ack.success=true;
     strix::SequencedDistributedNativeControlPlane bad(p,req,badw);
     bool rejected=false; try{bad.execute_remote_step(p.steps[1]);}catch(const std::runtime_error&){rejected=true;}

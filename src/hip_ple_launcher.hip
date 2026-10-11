@@ -1325,14 +1325,23 @@ void launch_ple(
             workspace +
             workspace_layout.gate_offset);
 
-    check_hip(
-        hipMemcpy(
-            gathered,
-            host_staging.data(),
-            static_cast<std::size_t>(
-                lookup_bytes),
-            hipMemcpyHostToDevice),
-        "copy PLE gathered embedding");
+    if (lookup_bytes != workspace_layout.gathered_bytes || lookup_bytes > host_staging.size()) {
+        throw std::invalid_argument("PLE gathered upload does not match its exact workspace region");
+    }
+    if (config.upload_pool != nullptr) {
+        auto destination = temporary;
+        destination.address = reinterpret_cast<std::uintptr_t>(gathered);
+        destination.bytes = workspace_layout.gathered_bytes;
+        const auto ticket = config.upload_pool->start(
+            std::span<const std::byte>(host_staging.data(), static_cast<std::size_t>(lookup_bytes)),
+            destination);
+        // Preserve the eager synchronous boundary: dependent projections only
+        // start after the copy's event proves the retained host input released.
+        config.upload_pool->wait(ticket, destination);
+    } else {
+        check_hip(hipMemcpy(gathered, host_staging.data(), static_cast<std::size_t>(lookup_bytes),
+                            hipMemcpyHostToDevice), "copy PLE gathered embedding");
+    }
 
     launch_projection_by_kind(
         weight_kind(
@@ -1548,10 +1557,34 @@ std::uint64_t implementation_identity(
         hash,
         static_cast<std::uint64_t>(
             config.activation));
+    if (config.upload_pool != nullptr || config.enable_owned_event_upload) {
+        hash_u64(hash, 0x484f535455504c31ULL);
+    }
     return hash;
 }
 
 }  // namespace
+
+struct HipPleLauncherBundle::OwnedUploads {
+    AllocationGenerationSource generations;
+    HipHostUploadBackend backend{1};
+    HostUploadPool pool{backend, generations,
+        HostUploadPolicy{1, HipPleLauncherConfig::owned_event_upload_maximum_bytes,
+                        HipPleLauncherConfig::owned_event_upload_maximum_bytes, 4096}};
+};
+
+HipPleLauncherBundle::HipPleLauncherBundle(HipPleLauncherConfig config)
+    : config_(std::move(config)) {
+    if (config_.enable_owned_event_upload) {
+        if (config_.upload_pool != nullptr) {
+            throw std::invalid_argument("PLE must select either an owned or injected upload pool");
+        }
+        uploads_ = std::make_unique<OwnedUploads>();
+        config_.upload_pool = &uploads_->pool;
+    }
+}
+
+HipPleLauncherBundle::~HipPleLauncherBundle() = default;
 
 void register_hip_ple_kernel_variant(
     const ModelContract& model,
@@ -1651,6 +1684,9 @@ make_hip_ple_launcher(
             "HIP PLE launcher requires id and config");
     }
     validate_config(*config);
+    if (config->enable_owned_event_upload && config->upload_pool == nullptr) {
+        throw std::invalid_argument("PLE owned event upload requires a launcher bundle");
+    }
     return ExecutionLauncher{
         std::move(kernel_id_value),
         implementation_identity(

@@ -13,10 +13,12 @@ DirectTransportNativeLinkSession(
       link_(other.link_),
       pools_(other.pools_),
       lease_(std::move(other.lease_)),
+      native_interface_(std::move(other.native_interface_)),
       receives_(std::move(other.receives_)),
       sends_(std::move(other.sends_)),
       telemetry_(other.telemetry_),
-      scheduler_(other.scheduler_) {
+      scheduler_(other.scheduler_),
+      receive_quarantined_(other.receive_quarantined_) {
     other.backend_ = nullptr;
     other.leases_ = nullptr;
     other.link_ = nullptr;
@@ -36,10 +38,12 @@ DirectTransportNativeLinkSession::operator=(
         link_ = other.link_;
         pools_ = other.pools_;
         lease_ = std::move(other.lease_);
+        native_interface_ = std::move(other.native_interface_);
         receives_ = std::move(other.receives_);
         sends_ = std::move(other.sends_);
         telemetry_ = other.telemetry_;
         scheduler_ = other.scheduler_;
+        receive_quarantined_ = other.receive_quarantined_;
 
         other.backend_ = nullptr;
         other.leases_ = nullptr;
@@ -67,7 +71,8 @@ DirectTransportNativeLinkSession::open(
     const auto readiness =
         assess_direct_native_readiness(
             backend.capabilities(),
-            backend.direct_capabilities());
+            backend.direct_capabilities(),
+            link);
     if (!readiness.ready) {
         throw std::logic_error(
             "native direct link session requires capability-complete backend");
@@ -98,6 +103,8 @@ DirectTransportNativeLinkSession::open(
     session.pools_ = &pools;
     session.lease_ =
         std::move(lease);
+    session.receive_quarantined_ = leases.receive_quarantined(session.lease_);
+    session.native_interface_ = *link.expected_native_interface;
     return session;
 }
 
@@ -113,6 +120,10 @@ void DirectTransportNativeLinkSession::require_active() const {
 
 void DirectTransportNativeLinkSession::require_current_lease() const {
     require_active();
+    if (!link_->expected_native_interface ||
+        *link_->expected_native_interface != native_interface_) {
+        throw std::logic_error("native direct session ABI/peer proof changed during active lease");
+    }
     if (!leases_->validate(
             lease_,
             *link_,
@@ -120,6 +131,29 @@ void DirectTransportNativeLinkSession::require_current_lease() const {
         throw std::logic_error(
             "native direct link session lease is stale");
     }
+}
+
+std::uint64_t DirectTransportNativeLinkSession::reserve_send_sequence() {
+    require_current_lease();
+    return leases_->reserve_send_sequence(lease_);
+}
+
+void DirectTransportNativeLinkSession::reserve_receive_sequence(
+    std::uint64_t sequence) {
+    require_current_lease();
+    if (receive_quarantined_) {
+        throw std::logic_error("native RX pool is quarantined");
+    }
+    // Gaps are allowed because failed peer preparation burns its sequence.
+    // Control metadata must arrive in physical submission order.
+    leases_->reserve_receive_sequence(lease_, sequence);
+}
+
+void DirectTransportNativeLinkSession::quarantine_receive(TransferHandle handle) {
+    require_current_lease();
+    static_cast<void>(receives_.state(handle));
+    leases_->quarantine_receive(lease_);
+    receive_quarantined_ = true;
 }
 
 namespace {
@@ -164,6 +198,9 @@ TransferHandle DirectTransportNativeLinkSession::prepare_receive(
     const TransferDescriptor& descriptor,
     const TransportBufferView& destination) {
     require_current_lease();
+    if (receive_quarantined_) {
+        throw std::logic_error("native RX pool is quarantined");
+    }
     if (descriptor.connection_epoch !=
             lease_.connection_epoch ||
         lease_.link_index >=
@@ -181,9 +218,12 @@ TransferHandle DirectTransportNativeLinkSession::prepare_receive(
         backend_->prepare_receive(
             descriptor,
             destination);
-    register_receive(
-        handle,
-        descriptor);
+    try {
+        register_receive(handle, descriptor);
+    } catch (...) {
+        try { backend_->cancel(handle); } catch (...) {}
+        throw;
+    }
     return handle;
 }
 
@@ -208,9 +248,12 @@ TransferHandle DirectTransportNativeLinkSession::prepare_send(
         backend_->prepare_send(
             descriptor,
             payload);
-    register_send(
-        handle,
-        descriptor);
+    try {
+        register_send(handle, descriptor);
+    } catch (...) {
+        try { backend_->cancel(handle); } catch (...) {}
+        throw;
+    }
     return handle;
 }
 
@@ -284,6 +327,9 @@ void DirectTransportNativeLinkSession::register_receive(
     TransferHandle handle,
     const TransferDescriptor& descriptor) {
     require_current_lease();
+    if (receive_quarantined_) {
+        throw std::logic_error("native RX pool is quarantined");
+    }
     if (descriptor.connection_epoch !=
         lease_.connection_epoch) {
         throw std::invalid_argument(
@@ -312,18 +358,27 @@ void DirectTransportNativeLinkSession::register_send(
 void DirectTransportNativeLinkSession::acquire_receive(
     TransferHandle handle) {
     require_current_lease();
+    if (receive_quarantined_) {
+        throw std::logic_error("native RX pool is quarantined");
+    }
     receives_.acquire_consumer(handle);
 }
 
 void DirectTransportNativeLinkSession::release_receive(
     TransferHandle handle) {
     require_current_lease();
+    if (receive_quarantined_) {
+        throw std::logic_error("native RX pool is quarantined");
+    }
     receives_.release_consumer(handle);
 }
 
 void DirectTransportNativeLinkSession::publish_receive_credit(
     TransferHandle handle) {
     require_current_lease();
+    if (receive_quarantined_) {
+        throw std::logic_error("native RX pool is quarantined");
+    }
     publish_direct_native_consumer_credit(
         *backend_,
         receives_,
@@ -333,6 +388,9 @@ void DirectTransportNativeLinkSession::publish_receive_credit(
 void DirectTransportNativeLinkSession::repost_receive(
     TransferHandle handle) {
     require_current_lease();
+    if (receive_quarantined_) {
+        throw std::logic_error("native RX pool is quarantined");
+    }
     repost_direct_native_receive(
         *backend_,
         receives_,

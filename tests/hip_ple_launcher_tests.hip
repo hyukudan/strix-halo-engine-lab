@@ -641,6 +641,21 @@ int main() try {
     config.model = model;
     config.activation =
         strix::HipActivationStorage::bf16;
+    strix::HipPleLauncherBundle synchronous_bundle(config);
+    expect(synchronous_bundle.owned_upload_admission_bytes() == 0,
+           "default PLE bundle creates no extra pinned-host upload pool");
+    auto owned_config = config;
+    owned_config.enable_owned_event_upload = true;
+    strix::HipPleLauncherBundle owned_bundle(owned_config);
+    expect(owned_bundle.owned_upload_admission_bytes() ==
+               strix::HipPleLauncherConfig::owned_event_upload_maximum_bytes,
+           "opt-in PLE pool exposes its fixed additional admission maximum");
+    strix::AllocationGenerationSource upload_generations;
+    strix::HipHostUploadBackend upload_backend(1);
+    strix::HostUploadPool uploads(upload_backend, upload_generations,
+        {1, strix::PleHashContract::maximum_heads * 512,
+         strix::PleHashContract::maximum_heads * 512, 4096});
+    config.upload_pool = &uploads;
 
     auto launcher =
         strix::make_hip_ple_launcher(
@@ -649,6 +664,9 @@ int main() try {
     launcher.function(
         context,
         launcher.user_data);
+    expect(uploads.active_uploads() == 0 &&
+               uploads.allocated_bytes() == strix::PleHashContract::maximum_heads * 512,
+           "PLE event upload retires its exact-generation host source before projections");
 
     std::vector<std::uint16_t> actual(
         expanded);

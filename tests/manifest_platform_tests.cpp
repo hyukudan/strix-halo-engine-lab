@@ -109,6 +109,7 @@ int main() {
     std::error_code error;
     std::filesystem::remove_all(root, error);
     std::filesystem::create_directories(root / "proc");
+    std::filesystem::create_directories(root / "proc/sys/kernel");
     std::filesystem::create_directories(root / "opt/rocm/.info");
     std::filesystem::create_directories(root / "opt/rocm/bin");
     std::filesystem::create_directories(root / "sys/class/kfd/kfd/topology/nodes/1");
@@ -119,6 +120,9 @@ int main() {
     std::filesystem::create_directories(root / "dev");
 
     {
+        std::ofstream(root / "proc/sys/kernel/osrelease") << "synthetic-kernel\n";
+        std::ofstream(root / "sys/module/thunderbolt_stream/version") << "synthetic-version\n";
+        std::ofstream(root / "sys/module/thunderbolt_stream/srcversion") << "synthetic-module-build\n";
         std::ofstream out(root / "proc/meminfo");
         out << "MemTotal: 131072 kB\n";
     }
@@ -176,6 +180,11 @@ int main() {
            "platform probe discovers USB4 stream device");
     expect(platform.usb4.stream_driver_present,
            "platform probe detects USB4 stream driver");
+    expect(platform.kernel_release == "synthetic-kernel" &&
+               platform.usb4.stream_driver_version == "synthetic-version" &&
+               platform.usb4.stream_driver_srcversion == "synthetic-module-build" &&
+               !platform.usb4.native_capability_query_available,
+           "module build observations remain distinct from unavailable native ABI query");
     expect(platform.usb4.dma_buf_import_gate_present &&
                platform.usb4.dma_buf_import_gate_enabled.has_value() &&
                *platform.usb4.dma_buf_import_gate_enabled,
@@ -192,7 +201,35 @@ int main() {
                    stream.in_hopid.has_value() && *stream.in_hopid == 8 &&
                    stream.out_hopid.has_value() && *stream.out_hopid == 9,
                "configured USB4 stream attributes are parsed");
+        expect(stream.device_path == "/dev/tbstream0" &&
+                   stream.device_is_character == false &&
+                   !stream.read_write_candidate && !stream.device_sysfs_route,
+               "regular file named like a stream cannot establish a character-device transport");
     }
+
+    std::filesystem::remove(root / "dev/tbstream0", error);
+    const auto missing_device = strix::probe_platform(root);
+    expect(!missing_device.usb4.configured_streams[0].device_is_character &&
+               !missing_device.usb4.configured_streams[0].read_write_candidate &&
+               !missing_device.usb4.native_capability_query_available,
+           "configured stream without device remains unavailable for transport proof");
+#if defined(__linux__)
+    // /dev/null supplies a harmless real character inode; every route and
+    // module value below remains synthetic and proves no stream operation.
+    std::filesystem::create_symlink("/dev/null", root / "dev/tbstream0");
+    std::filesystem::create_directories(root / "sys/dev/char/1:3");
+    std::filesystem::create_directories(root / "sys/devices/synthetic-controller/synthetic-route");
+    std::filesystem::create_directory_symlink(
+        root / "sys/devices/synthetic-controller/synthetic-route",
+        root / "sys/dev/char/1:3/device");
+    const auto character_device = strix::probe_platform(root);
+    const auto& stream = character_device.usb4.configured_streams[0];
+    expect(stream.device_is_character == true && stream.read_write_candidate &&
+               stream.device_sysfs_route ==
+                   std::filesystem::canonical(root / "sys/devices/synthetic-controller/synthetic-route").string() &&
+               !character_device.usb4.native_capability_query_available,
+           "observed character device and sysfs route permit only a CPU read/write candidate");
+#endif
 
     std::filesystem::remove_all(root, error);
 

@@ -43,6 +43,7 @@ int main() {
     const auto info = strix::probe_platform();
 
     std::cout << "{\n"
+              << "  \"schema_version\": 2,\n"
               << "  \"linux\": " << (info.is_linux ? "true" : "false") << ",\n"
               << "  \"kernel_release\": \"" << json_escape(info.kernel_release) << "\",\n"
               << "  \"mem_total_bytes\": " << info.mem_total_bytes << ",\n"
@@ -111,6 +112,13 @@ int main() {
         if (stream.in_hopid.has_value()) std::cout << *stream.in_hopid; else std::cout << "null";
         std::cout << ",\"out_hopid\":";
         if (stream.out_hopid.has_value()) std::cout << *stream.out_hopid; else std::cout << "null";
+        std::cout << ",\"device_path\":";
+        if (stream.device_path) std::cout << '"' << json_escape(*stream.device_path) << '"'; else std::cout << "null";
+        std::cout << ",\"device_is_character\":";
+        if (stream.device_is_character) std::cout << (*stream.device_is_character ? "true" : "false"); else std::cout << "null";
+        std::cout << ",\"device_sysfs_route\":";
+        if (stream.device_sysfs_route) std::cout << '"' << json_escape(*stream.device_sysfs_route) << '"'; else std::cout << "null";
+        std::cout << ",\"read_write_candidate\":" << (stream.read_write_candidate ? "true" : "false");
         std::cout << '}' << (index + 1 == info.usb4.configured_streams.size() ? '\n' : ',') << '\n';
     }
     std::cout << "    ]";
@@ -124,6 +132,12 @@ int main() {
     } else {
         std::cout << "null";
     }
+    std::cout << ",\n    \"stream_driver_version\":";
+    if (info.usb4.stream_driver_version) std::cout << '"' << json_escape(*info.usb4.stream_driver_version) << '"'; else std::cout << "null";
+    std::cout << ",\n    \"stream_driver_srcversion\":";
+    if (info.usb4.stream_driver_srcversion) std::cout << '"' << json_escape(*info.usb4.stream_driver_srcversion) << '"'; else std::cout << "null";
+    std::cout << ",\n    \"native_capability_query_available\":"
+              << (info.usb4.native_capability_query_available ? "true" : "false");
     std::cout << "\n  }\n}\n";
     return 0;
 }

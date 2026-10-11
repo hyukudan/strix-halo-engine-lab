@@ -44,10 +44,29 @@ public:
         const SerialSessionStateLayout& state_layout,
         const SessionStateMemoryBinding& state_memory,
         SessionSnapshotTransferBackend& backend,
-        std::span<const std::uint32_t> requested_prefix) const;
+        std::span<const std::uint32_t> requested_prefix,
+        const ArithmeticLineage* requested_history = nullptr) const;
+
+    [[nodiscard]] bool matches(
+        std::span<const std::uint32_t> requested_prefix,
+        std::uint64_t execution_identity,
+        std::uint64_t runtime_compatibility_identity,
+        std::uint64_t state_layout_identity,
+        const ArithmeticLineage* requested_history = nullptr) const noexcept;
+
+    // Expected history/token/compatibility mismatches are ordinary cache misses;
+    // transfer failures still propagate and poison the destination session.
+    [[nodiscard]] bool try_restore(
+        SerialSessionContext& session, const ModelContract& model,
+        const SerialSessionStateLayout& state_layout,
+        const SessionStateMemoryBinding& state_memory,
+        SessionSnapshotTransferBackend& backend,
+        std::span<const std::uint32_t> requested_prefix,
+        const ArithmeticLineage* requested_history = nullptr) const;
 
     [[nodiscard]] bool valid() const noexcept {
         return prefix_.prefix_identity != 0 &&
+               arithmetic_lineage_valid(prefix_.arithmetic_lineage, prefix_.snapshot.next_position) &&
                memory_.valid();
     }
 

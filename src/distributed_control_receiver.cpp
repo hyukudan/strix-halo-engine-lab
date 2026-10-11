@@ -135,6 +135,9 @@ void DistributedControlReceiver::receive_boundary_transfer(
             request_.request_id &&
         transfer.descriptor.generation ==
             request_.generation &&
+        transfer.descriptor.dtype_id == request_.dtype_id &&
+        transfer.descriptor.sequence == next_boundary_sequence_ &&
+        next_boundary_sequence_ != std::numeric_limits<std::uint64_t>::max() &&
         transfer.descriptor.byte_length ==
             boundary->payload_bytes &&
         transfer.flow.flow_id != 0 &&
@@ -157,6 +160,7 @@ void DistributedControlReceiver::receive_boundary_transfer(
         throw std::logic_error(
             "duplicate pending boundary metadata for receiver");
     }
+    ++next_boundary_sequence_;
 }
 
 bool DistributedControlReceiver::has_boundary(

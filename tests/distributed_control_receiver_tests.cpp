@@ -150,6 +150,11 @@ int main() {
                 !receiver.has_boundary(
                     0x1001ULL),
             "receiver consumes pending boundary metadata exactly once");
+        bool replay_rejected = false;
+        try { receiver.receive_boundary_transfer(transfer); }
+        catch (const std::invalid_argument&) { replay_rejected = true; }
+        expect(replay_rejected && receiver.failed() && !receiver.has_boundary(0x1001ULL),
+               "replayed logical boundary is rejected even after its metadata was taken");
     }
 
     {
