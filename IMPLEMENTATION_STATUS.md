@@ -454,7 +454,7 @@ Additional A1.6 runtime work now implemented:
 - a stateful sampled-cycle planner now maps accepted draft prefixes, first-rejection residuals, all-accepted target bonuses, EOS cropping and token budgets onto the same pre-window snapshot/restore/replay state semantics used by greedy speculation;
 - a sampled target executor now performs identity preflight, captures the pre-window snapshot, consumes target distributions, restores/replays only committed accepted candidates after rejection/EOS, and rolls back on verify/finalize/replay failures;
 
-Sampled speculative mathematics, RNG stream identity/consumption and the portable acceptance/residual sampler are fixed and distribution-qualified. Host-side rollback/commit execution is now explicit; a concrete native backend that produces target distributions remains pending. The draft proposal seam is integrated, but concrete proposal-state
+Sampled speculative mathematics, RNG stream identity/consumption and the portable acceptance/residual sampler are fixed and distribution-qualified. Host-side rollback/commit execution is explicit. A compiled sampled backend now joins the already-materialized serial base distribution with D verify-row distributions through a stable FP32 softmax collector, while a HIP logits reader provides the device-to-host materialization seam without leaking HIP into the speculation core; native end-to-end sampled qualification remains pending. The draft proposal seam is integrated, but concrete proposal-state
 MTP compute semantics/kernels and native proposal qualification remain
 open; host-side measured drafter selection is now wired through repeatable campaign aggregation.
 

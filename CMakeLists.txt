@@ -24,6 +24,7 @@ add_library(strix_core STATIC
     src/compiled_mtp_draft_plan.cpp
     src/compiled_speculative_verify.cpp
     src/compiled_speculation_backend.cpp
+    src/compiled_sampled_speculation_backend.cpp
     src/dispatch_resources.cpp
     src/distributed_flow.cpp
     src/distributed_placement.cpp
@@ -704,6 +705,11 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-compiled-speculation-backend-tests)
     add_test(NAME strix-compiled-speculation-backend-tests COMMAND strix-compiled-speculation-backend-tests)
 
+    add_executable(strix-compiled-sampled-speculation-backend-tests tests/compiled_sampled_speculation_backend_tests.cpp)
+    target_link_libraries(strix-compiled-sampled-speculation-backend-tests PRIVATE strix_core)
+    strix_target_warnings(strix-compiled-sampled-speculation-backend-tests)
+    add_test(NAME strix-compiled-sampled-speculation-backend-tests COMMAND strix-compiled-sampled-speculation-backend-tests)
+
     add_executable(strix-speculative-verify-plan-tests tests/speculative_verify_plan_tests.cpp)
     target_link_libraries(strix-speculative-verify-plan-tests PRIVATE strix_core)
     strix_target_warnings(strix-speculative-verify-plan-tests)
@@ -766,6 +772,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
 
     add_library(strix_hip_runtime STATIC
         src/hip_runtime_allocator.cpp
+        src/hip_sampled_target_logits_reader.cpp
         src/hip_session_snapshot_transfer.cpp
         src/hip_model_residency.cpp
         src/hip_launcher_catalog.cpp
