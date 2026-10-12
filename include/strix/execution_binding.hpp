@@ -17,6 +17,8 @@ struct ExecutionBindingRequest {
     bool require_graph_safe = false;
     kernels::QualificationStatus minimum_qualification =
         kernels::QualificationStatus::oracle_matched;
+    // Explicit C1 device-input graph topology; requires graph-safe selections.
+    bool device_graph_inputs = false;
 };
 
 struct ExecutionKernelBinding {

@@ -1,0 +1,31 @@
+--- a/drivers/thunderbolt/Kconfig
++++ b/drivers/thunderbolt/Kconfig
+@@ -63,16 +63,28 @@
+ 
+ 	  To compile this driver a module, choose M here. The module will be
+ 	  called thunderbolt_dma_test.
+ 
+ config USB4_STREAM
+ 	tristate "Stream data over Thunderbolt/USB4 cable"
+ 	depends on USB4_CONFIGFS
+ 	help
+ 	  This adds support for USB4STREAM protocol that allows two
+ 	  hosts to stream data directly over Thunderbolt/USB4 cable
+ 	  through /dev/tbstreamX devices.
+ 
+ 	  To compile this driver a module, choose M here. The module will be
+ 	  called thunderbolt_stream.
+ 
++config USB4_GPU_STREAM
++	bool "Experimental GPU DMA-BUF stream mode"
++	depends on USB4_STREAM
++	select DMA_SHARED_BUFFER
++	default n
++	help
++	  Adds a project experimental, explicitly selected DMA-BUF mode to
++	  USB4STREAM. Dedicated TX/RX windows are imported into the local
++	  controller; controller completion does not establish GPU visibility,
++	  remote acknowledgement or hardware qualification. Software connection
++	  manager and interrupt mode only. Normal users should say N.
++
+ endif # USB4

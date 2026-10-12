@@ -3,6 +3,8 @@
 #include "strix/dispatch_resources.hpp"
 #include "strix/execution_buffers.hpp"
 #include "strix/memory_plan.hpp"
+#include "strix/hip_launch_context.hpp"
+#include "strix/graph_operator_control.hpp"
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -99,6 +101,27 @@ struct Workspace {
     float* core = nullptr;
     std::uint64_t elements = 0;
 };
+
+__global__ void validate_gdn_graph_position(const std::uint64_t* position,
+    std::uint64_t context_tokens, std::uint32_t* status) {
+    if (*position >= context_tokens) atomicOr(status, 2U);
+}
+__global__ void validate_gdn_graph_input(const std::uint16_t* input, std::uint32_t hidden,
+    std::uint32_t* status, std::uint32_t failure) {
+    if (atomicAdd(status, 0U) != 0) return;
+    for (std::uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+         index < hidden; index += gridDim.x * blockDim.x) {
+        const auto bits = static_cast<std::uint32_t>(input[index]) << 16U;
+        if ((bits & 0x7f800000U) == 0x7f800000U) atomicOr(status, failure);
+    }
+}
+__global__ void validate_gdn_graph_values(const float* values, std::uint64_t count, std::uint32_t* status) {
+    if (atomicAdd(status, 0U) != 0) return;
+    for (std::uint64_t i = blockIdx.x * blockDim.x + threadIdx.x;
+         i < count; i += gridDim.x * blockDim.x) {
+        if (!isfinite(values[i])) atomicOr(status, 8U);
+    }
+}
 
 void hash_u64(
     std::uint64_t& hash,
@@ -602,7 +625,8 @@ __global__ void conv_update_kernel(
     const void* conv_weights,
     SmallWeightKind weight_kind_value,
     std::uint32_t channels,
-    std::uint32_t kernel_size) {
+    std::uint32_t kernel_size, std::uint32_t* graph_status) {
+    if (graph_status != nullptr && *graph_status != 0) return;
     const auto channel =
         static_cast<std::uint32_t>(
             blockIdx.x) *
@@ -706,7 +730,13 @@ __global__ void normalize_qk_kernel(
     float* qkv,
     std::uint32_t key_heads,
     std::uint32_t head_dim,
-    float epsilon) {
+    float epsilon, std::uint32_t* graph_status) {
+    __shared__ unsigned graph_reject;
+    if (graph_status != nullptr) {
+        if (threadIdx.x == 0) graph_reject = atomicAdd(graph_status, 0U) != 0;
+        __syncthreads();
+        if (graph_reject) return;
+    }
     const auto block =
         static_cast<std::uint32_t>(
             blockIdx.x);
@@ -758,6 +788,10 @@ __global__ void normalize_qk_kernel(
         rsqrtf(
             scratch[0] +
             epsilon);
+    if (graph_status != nullptr && (!isfinite(scratch[0]) || !isfinite(inverse))) {
+        if (threadIdx.x == 0) atomicOr(graph_status, 8U);
+        return;
+    }
     const float q_scale =
         is_key
             ? 1.0F
@@ -781,7 +815,13 @@ void recurrent_step_kernel(
     float* core,
     std::uint32_t key_heads,
     std::uint32_t value_heads,
-    std::uint32_t head_dim) {
+    std::uint32_t head_dim, std::uint32_t* graph_status) {
+    __shared__ unsigned graph_reject;
+    if (graph_status != nullptr) {
+        if (threadIdx.x == 0) graph_reject = atomicAdd(graph_status, 0U) != 0;
+        __syncthreads();
+        if (graph_reject) return;
+    }
     const auto tile_count =
         head_dim /
         kValueTile;
@@ -993,7 +1033,13 @@ __global__ void gated_rms_norm_kernel(
     SmallWeightKind norm_kind,
     std::uint32_t heads,
     std::uint32_t head_dim,
-    float epsilon) {
+    float epsilon, std::uint32_t* graph_status) {
+    __shared__ unsigned graph_reject;
+    if (graph_status != nullptr) {
+        if (threadIdx.x == 0) graph_reject = atomicAdd(graph_status, 0U) != 0;
+        __syncthreads();
+        if (graph_reject) return;
+    }
     const auto head =
         static_cast<std::uint32_t>(
             blockIdx.x);
@@ -1033,6 +1079,10 @@ __global__ void gated_rms_norm_kernel(
                 static_cast<float>(
                     head_dim) +
             epsilon);
+    if (graph_status != nullptr && (!isfinite(scratch[0]) || !isfinite(inv))) {
+        if (threadIdx.x == 0) atomicOr(graph_status, 8U);
+        return;
+    }
     const float gate_value =
         1.0F /
         (1.0F +
@@ -1061,7 +1111,7 @@ void launch_projection(
         dim3(output_width),
         dim3(kProjectionThreads),
         0,
-        0,
+        hip_execution_stream(),
         input,
         reinterpret_cast<const void*>(
             weights.address),
@@ -1122,7 +1172,7 @@ void launch_output_projection(
         dim3(output_width),
         dim3(kProjectionThreads),
         0,
-        0,
+        hip_execution_stream(),
         input,
         reinterpret_cast<const void*>(
             weights.address),
@@ -1716,6 +1766,41 @@ void launch_gdn(
             const std::uint16_t*>(
                 input.address);
 
+    if (const auto* graph = current_hip_launch_context(); graph && graph->graph_capture) {
+        if (!config.enable_device_graph_inputs) {
+            throw std::invalid_argument("GDN device graph inputs are not explicitly enabled");
+        }
+        const auto* layout = context.resources && context.resources->session_state_layout
+            ? context.resources->session_state_layout : context.session_state_layout;
+        if (!layout || graph->context_tokens != layout->context_tokens ||
+            graph->context_tokens > config.model.max_position_embeddings) {
+            throw std::invalid_argument("GDN graph context exceeds the model position limit");
+        }
+        GraphOperatorControlRequest request;
+        request.execution_identity = context.execution_identity;
+        request.context_tokens = graph->context_tokens;
+        request.arguments = graph->arguments;
+        request.status = graph->status;
+        for (const auto* view : {&input, &output}) {
+            request.resources.push_back({view->address, view->bytes, view->allocation_generation, 2});
+        }
+        request.resources.push_back({temporary.address, temporary.bytes, temporary.allocation_generation, 4});
+        request.resources.push_back({matrix_state.address, matrix_state.bytes, matrix_state.allocation_generation, 4});
+        request.resources.push_back({conv_state.address, conv_state.bytes, conv_state.allocation_generation, 2});
+        for (const auto* tensor : {&tensors.qkv, &tensors.z, &tensors.beta, &tensors.alpha,
+                                  &tensors.conv, &tensors.dt, &tensors.a, &tensors.norm, &tensors.out}) {
+            request.resources.push_back({tensor->runtime->address, tensor->runtime->bytes,
+                tensor->runtime->allocation_generation, tensor->manifest->ggml_type == 0 ? 4U : 2U});
+        }
+        (void)prepare_graph_operator_control(request);
+        hipLaunchKernelGGL(validate_gdn_graph_position, dim3(1), dim3(1), 0, hip_execution_stream(),
+            hip_graph_position(), graph->context_tokens, hip_graph_status());
+        check_hip(hipGetLastError(), "HIP GDN device position validation");
+        hipLaunchKernelGGL(validate_gdn_graph_input, dim3(32), dim3(kProjectionThreads), 0, hip_execution_stream(),
+            hidden_input, hidden, hip_graph_status(), 4U);
+        check_hip(hipGetLastError(), "HIP GDN finite input validation");
+    }
+
     launch_projection_by_kind(
         weight_kind(
             tensors.qkv.manifest->
@@ -1753,6 +1838,12 @@ void launch_gdn(
         value_heads,
         workspace.gate);
 
+    if (hip_graph_status() != nullptr) {
+        hipLaunchKernelGGL(validate_gdn_graph_values, dim3(32), dim3(kProjectionThreads), 0,
+            hip_execution_stream(), workspace.qkv,
+            static_cast<std::uint64_t>(conv_width) + value_width + value_heads * 2ULL, hip_graph_status());
+        check_hip(hipGetLastError(), "HIP GDN finite projection validation");
+    }
     const auto conv_blocks =
         (conv_width +
          kProjectionThreads - 1U) /
@@ -1762,7 +1853,7 @@ void launch_gdn(
         dim3(conv_blocks),
         dim3(kProjectionThreads),
         0,
-        0,
+        hip_execution_stream(),
         workspace.qkv,
         reinterpret_cast<
             std::uint16_t*>(
@@ -1774,7 +1865,7 @@ void launch_gdn(
             tensors.conv.manifest->
                 ggml_type),
         conv_width,
-        kernel);
+        kernel, hip_graph_status());
     check_hip(
         hipGetLastError(),
         "HIP GDN causal convolution launch");
@@ -1788,7 +1879,7 @@ void launch_gdn(
         dim3(parameter_blocks),
         dim3(kProjectionThreads),
         0,
-        0,
+        hip_execution_stream(),
         workspace.beta,
         workspace.gate,
         reinterpret_cast<const void*>(
@@ -1813,16 +1904,22 @@ void launch_gdn(
         dim3(key_heads * 2U),
         dim3(kRecurrentThreads),
         0,
-        0,
+        hip_execution_stream(),
         workspace.qkv,
         key_heads,
         head_dim,
         config.model.
-            gdn_qk_l2_epsilon);
+            gdn_qk_l2_epsilon, hip_graph_status());
     check_hip(
         hipGetLastError(),
         "HIP GDN q/k normalization launch");
 
+    if (hip_graph_status() != nullptr) {
+        hipLaunchKernelGGL(validate_gdn_graph_values, dim3(32), dim3(kProjectionThreads), 0,
+            hip_execution_stream(), workspace.qkv,
+            static_cast<std::uint64_t>(conv_width) + value_width + value_heads * 2ULL, hip_graph_status());
+        check_hip(hipGetLastError(), "HIP GDN finite recurrent input validation");
+    }
     const auto tiles =
         head_dim /
         kValueTile;
@@ -1831,7 +1928,7 @@ void launch_gdn(
         dim3(value_heads * tiles),
         dim3(kRecurrentThreads),
         0,
-        0,
+        hip_execution_stream(),
         workspace.qkv,
         workspace.beta,
         workspace.gate,
@@ -1840,17 +1937,22 @@ void launch_gdn(
         workspace.core,
         key_heads,
         value_heads,
-        head_dim);
+        head_dim, hip_graph_status());
     check_hip(
         hipGetLastError(),
         "HIP GDN recurrent update launch");
+    if (hip_graph_status() != nullptr) {
+        hipLaunchKernelGGL(validate_gdn_graph_values, dim3(32), dim3(kProjectionThreads), 0,
+            hip_execution_stream(), workspace.core, value_width, hip_graph_status());
+        check_hip(hipGetLastError(), "HIP GDN finite recurrent output validation");
+    }
 
     hipLaunchKernelGGL(
         gated_rms_norm_kernel,
         dim3(value_heads),
         dim3(kRecurrentThreads),
         0,
-        0,
+        hip_execution_stream(),
         workspace.core,
         workspace.z,
         reinterpret_cast<const void*>(
@@ -1862,7 +1964,7 @@ void launch_gdn(
         value_heads,
         head_dim,
         config.model.
-            rms_norm_epsilon);
+            rms_norm_epsilon, hip_graph_status());
     check_hip(
         hipGetLastError(),
         "HIP GDN gated RMSNorm launch");
@@ -1878,6 +1980,12 @@ void launch_gdn(
         reinterpret_cast<
             std::uint16_t*>(
                 output.address));
+    if (hip_graph_status() != nullptr) {
+        hipLaunchKernelGGL(validate_gdn_graph_input, dim3(32), dim3(kProjectionThreads), 0,
+            hip_execution_stream(), reinterpret_cast<const std::uint16_t*>(output.address), hidden,
+            hip_graph_status(), 8U);
+        check_hip(hipGetLastError(), "HIP GDN finite final output validation");
+    }
 }
 
 std::string kernel_id(
@@ -1901,7 +2009,7 @@ std::string kernel_id(
             request.logical_rows) +
         ".c" +
         std::to_string(
-            request.request_concurrency);
+            request.request_concurrency) + (request.device_graph_inputs ? ".device" : ".scalar");
 }
 
 std::uint64_t implementation_identity(
@@ -1909,6 +2017,8 @@ std::uint64_t implementation_identity(
     std::uint64_t hash =
         fnv_offset;
     hash_u64(hash, kLauncherTag);
+    hash_u64(hash, config.enable_device_graph_inputs);
+    hash_u64(hash, config.model.max_position_embeddings);
     hash_u64(
         hash,
         config.model.hidden_size);
@@ -1996,6 +2106,9 @@ void register_hip_gdn_kernel_variant(
         throw std::invalid_argument(
             "HIP GDN v1 registers only C1 one-row variants");
     }
+    if (request.device_graph_inputs && (!request.require_graph_safe || !config.enable_device_graph_inputs)) {
+        throw std::invalid_argument("GDN device graph variant requires explicit graph input and graph-safe mode");
+    }
     if (qualification ==
             kernels::QualificationStatus::
                 target_qualified ||
@@ -2054,7 +2167,7 @@ void register_hip_gdn_kernel_variant(
     variant.numerics.deterministic = true;
     variant.qualification =
         qualification;
-    variant.graph_safe = false;
+    variant.graph_safe = request.device_graph_inputs && config.enable_device_graph_inputs;
     variant.input_layout =
         "row-major";
     variant.output_layout =

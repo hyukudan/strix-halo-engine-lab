@@ -18,7 +18,9 @@ GraphExecutionContract serial_graph_contract(const CompiledSerialExecution& comp
         safe = safe && !step.dynamic_shape && step.graph_safe_candidate;
     }
     for (const auto& binding : compiled.bindings.bindings) {
-        safe = safe && !binding.host_or_runtime_step && binding.kernel_id.has_value();
+        safe = safe && ((compiled.device_graph_inputs && binding.host_or_runtime_step &&
+            binding.op == SerialOp::position_prepare) ||
+            (!binding.host_or_runtime_step && binding.kernel_id.has_value()));
     }
     return {compiled.execution_identity, compiled.kernel_plan_identity, compiled.logical_rows, safe};
 }
@@ -183,6 +185,7 @@ std::uint64_t build_execution_identity(
     hash_bool(
         hash,
         binding_request.require_graph_safe);
+    hash_bool(hash, binding_request.device_graph_inputs);
     hash_u64(
         hash,
         static_cast<std::uint64_t>(
@@ -298,6 +301,11 @@ CompiledSerialExecution compile_serial_execution(
     }
 
     CompiledSerialExecution compiled;
+    if (binding_request.device_graph_inputs && (!binding_request.require_graph_safe ||
+        binding_request.logical_rows != 1 || binding_request.request_concurrency != 1)) {
+        throw std::invalid_argument("device graph topology requires explicit graph-safe C1 selection");
+    }
+    compiled.device_graph_inputs = binding_request.device_graph_inputs;
     compiled.logical_rows =
         binding_request.logical_rows;
     compiled.request_concurrency =
@@ -308,6 +316,14 @@ CompiledSerialExecution compile_serial_execution(
 
     compiled.execution =
         build_serial_decode_execution_plan(model);
+    if (compiled.device_graph_inputs) {
+        // Selected variants must implement fixed maximum launch geometry and
+        // device-driven live counts. The eager dynamic topology stays unchanged.
+        for (auto& step : compiled.execution.steps) {
+            step.dynamic_shape = false;
+            step.graph_safe_candidate = true;
+        }
+    }
     compiled.bindings =
         bind_serial_execution_plan(
             model,
@@ -356,7 +372,7 @@ CompiledSerialExecution compile_serial_execution(
         }
 
         if (binding.host_or_runtime_step) {
-            graph_safe = false;
+            graph_safe = graph_safe && compiled.device_graph_inputs && step.op == SerialOp::position_prepare;
             continue;
         }
 

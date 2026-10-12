@@ -23,6 +23,9 @@ struct HipPleLauncherConfig {
     static constexpr std::uint64_t owned_event_upload_maximum_bytes =
         PleHashContract::maximum_heads * 512;
     bool enable_owned_event_upload = false;
+    // Captured path uses a resident BF16 table and stable device n-gram IO.
+    // File-backed lookup and event-upload paths remain eager only.
+    bool enable_resident_graph = false;
     // An injected pool is an explicit alternative and outlives the launcher.
     HostUploadPool* upload_pool = nullptr;
 };

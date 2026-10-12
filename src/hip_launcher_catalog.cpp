@@ -1,11 +1,13 @@
 #include "strix/hip_launcher_catalog.hpp"
 
 #include "strix/runtime_launchers.hpp"
+#include "strix/hip_integer_projection_runtime.hpp"
 
 #include <limits>
 #include <stdexcept>
 
 namespace strix {
+void register_hip_graph_position_launcher(ExecutionLauncherRegistry&);
 namespace {
 
 std::uint32_t checked_u32(
@@ -28,21 +30,23 @@ std::uint32_t checked_u32(
 HipIndexedAttentionLauncherConfig
 indexed_attention_config(
     const ModelContract& model,
-    HipActivationStorage activation) {
+    HipActivationStorage activation, bool graph = false) {
     HipIndexedAttentionLauncherConfig config;
     config.model = model;
     config.activation = activation;
+    config.enable_device_graph_inputs = graph;
     return config;
 }
 
 HipPleLauncherConfig
 ple_config(
     const ModelContract& model,
-    HipActivationStorage activation) {
+    HipActivationStorage activation, bool graph = false) {
     HipPleLauncherConfig config;
     config.model = model;
     config.activation =
         activation;
+    config.enable_resident_graph = graph;
     return config;
 }
 
@@ -67,7 +71,7 @@ elementwise_config(
 HipEmbeddingLauncherConfig
 embedding_config(
     const ModelContract& model,
-    HipActivationStorage activation) {
+    HipActivationStorage activation, bool graph = false) {
     HipEmbeddingLauncherConfig config;
     config.hidden_size =
         checked_u32(
@@ -75,6 +79,7 @@ embedding_config(
             "hidden_size");
     config.output =
         activation;
+    config.enable_device_graph_inputs = graph;
     return config;
 }
 
@@ -199,12 +204,17 @@ void register_complete_hip_kernel_catalog(
     const ModelContract& model,
     const ExecutionBindingRequest& request,
     HipLauncherCatalogConfig config,
-    kernels::KernelRegistry& registry) {
+    kernels::KernelRegistry& registry,
+    const integer_projection::RuntimeConfig* alternate_lm_head) {
+    if (alternate_lm_head && config.enable_device_graph_inputs)
+        throw std::invalid_argument("blocking integer LM-head cannot enter a captured graph");
     if (const auto error =
             model.validate();
         !error.empty()) {
         throw std::invalid_argument(error);
     }
+    if (config.enable_device_graph_inputs != request.device_graph_inputs)
+        throw std::invalid_argument("HIP catalog and graph topology modes differ");
     if (request.logical_rows != 1 ||
         request.request_concurrency != 1) {
         throw std::invalid_argument(
@@ -238,7 +248,7 @@ void register_complete_hip_kernel_catalog(
     const auto ple =
         ple_config(
             model,
-            config.activation);
+            config.activation, config.enable_device_graph_inputs);
     register_hip_ple_kernel_variant(
         model,
         request,
@@ -248,7 +258,7 @@ void register_complete_hip_kernel_catalog(
 
     const HipGdnLauncherConfig gdn{
         model,
-        config.activation,
+        config.activation, config.enable_device_graph_inputs,
     };
     register_hip_gdn_kernel_variant(
         model,
@@ -260,7 +270,7 @@ void register_complete_hip_kernel_catalog(
     const auto indexed =
         indexed_attention_config(
             model,
-            config.activation);
+            config.activation, config.enable_device_graph_inputs);
     register_hip_indexed_attention_kernel_variant(
         model,
         request,
@@ -271,7 +281,7 @@ void register_complete_hip_kernel_catalog(
     const auto embedding =
         embedding_config(
             model,
-            config.activation);
+            config.activation, config.enable_device_graph_inputs);
     register_hip_embedding_kernel_variant(
         model,
         request,
@@ -312,6 +322,9 @@ void register_complete_hip_kernel_catalog(
         registry,
         qualification);
 
+    if (alternate_lm_head) {
+        integer_projection::register_integer_projection_runtime_variant(model, request, *alternate_lm_head, registry);
+    } else {
     const auto lm_head =
         lm_head_config(
             model,
@@ -322,7 +335,7 @@ void register_complete_hip_kernel_catalog(
         lm_head,
         registry,
         qualification);
-
+    }
     const auto shared =
         shared_expert_config(
             model,
@@ -337,28 +350,29 @@ void register_complete_hip_kernel_catalog(
 
 HipLauncherCatalog::HipLauncherCatalog(
     const ModelContract& model,
-    HipLauncherCatalogConfig config)
-    : elementwise_(
+    HipLauncherCatalogConfig config,
+    std::shared_ptr<integer_projection::HipIntegerProjectionRuntimeBundle> alternate_lm_head)
+    : device_graph_inputs_(config.enable_device_graph_inputs), alternate_lm_head_(std::move(alternate_lm_head)), elementwise_(
           elementwise_config(
               model,
               config.activation)),
       ple_(
           ple_config(
               model,
-              config.activation)),
+              config.activation, config.enable_device_graph_inputs)),
       gdn_(
           HipGdnLauncherConfig{
               model,
-              config.activation,
+              config.activation, config.enable_device_graph_inputs,
           }),
       indexed_attention_(
           indexed_attention_config(
               model,
-              config.activation)),
+              config.activation, config.enable_device_graph_inputs)),
       embedding_(
           embedding_config(
               model,
-              config.activation)),
+              config.activation, config.enable_device_graph_inputs)),
       hyper_mix_(
           hyper_mix_config(
               model,
@@ -379,6 +393,8 @@ HipLauncherCatalog::HipLauncherCatalog(
           shared_expert_config(
               model,
               config.activation)) {
+    if (device_graph_inputs_ && alternate_lm_head_)
+        throw std::invalid_argument("integer LM-head catalog is eager only");
     if (const auto error =
             model.validate();
         !error.empty()) {
@@ -391,8 +407,10 @@ void HipLauncherCatalog::
 register_for_compiled_execution(
     const CompiledSerialExecution& compiled,
     ExecutionLauncherRegistry& registry) {
-    register_default_runtime_launchers(
-        registry);
+    if (compiled.device_graph_inputs != device_graph_inputs_)
+        throw std::invalid_argument("launcher catalog graph mode differs from compiled plan");
+    if (device_graph_inputs_) register_hip_graph_position_launcher(registry);
+    else register_default_runtime_launchers(registry);
     elementwise_.
         register_for_compiled_execution(
             compiled,
@@ -425,10 +443,8 @@ register_for_compiled_execution(
         register_for_compiled_execution(
             compiled,
             registry);
-    lm_head_.
-        register_for_compiled_execution(
-            compiled,
-            registry);
+    if (alternate_lm_head_) alternate_lm_head_->register_for_compiled_execution(compiled, registry);
+    else lm_head_.register_for_compiled_execution(compiled, registry);
     shared_expert_.
         register_for_compiled_execution(
             compiled,

@@ -1,3 +1,4 @@
+#include "strix/hip_launch_context.hpp"
 #include "strix/hip_runtime_launchers.hpp"
 
 #include "strix/dispatch_resources.hpp"
@@ -307,7 +308,7 @@ void launch_hyper_expand_typed(
                 dim3(blocks),
                 dim3(threads),
                 0,
-                0,
+                hip_execution_stream(),
                 reinterpret_cast<const Storage*>(
                     input.address),
                 reinterpret_cast<Storage*>(
@@ -411,7 +412,7 @@ void launch_inject_typed(
                 dim3(blocks),
                 dim3(threads),
                 0,
-                0,
+                hip_execution_stream(),
                 reinterpret_cast<const Storage*>(
                     hyper.address),
                 reinterpret_cast<const Storage*>(
@@ -543,7 +544,7 @@ void launch_moe_combine_typed(
                 dim3(blocks),
                 dim3(threads),
                 0,
-                0,
+                hip_execution_stream(),
                 reinterpret_cast<const Storage*>(
                     shared.address),
                 reinterpret_cast<const Storage*>(

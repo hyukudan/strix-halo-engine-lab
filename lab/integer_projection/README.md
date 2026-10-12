@@ -134,3 +134,12 @@ VGPR/scratch/memory traffic and device preparation costs; representative tensor
 and row histograms; integration with producer/buffer identities; model/state/
 speculative fidelity; complete-workload timing against the packed floating
 control. No latency/throughput measurement or qualification is claimed here.
+
+The separate [experimental runtime consumer](../../docs/implementation-2026-10-12-integer-runtime.md)
+now binds actual compiled LM-head resources and original model blocks, and uses
+bounded column tiles before a whole-logits commit. It keeps its own exact approval
+identity; the default floating launcher rejects that alternate binding.
+`bash lab/integer_projection/compile_runtime_offline.sh NEW_PRIVATE_OUTPUT_DIRECTORY PINNED_CORE_ARCHIVE`
+compiles its native dispatcher fixture and both shared device components, retains
+disassembly/source hashes and pins the separately built core archive before and
+after linking. This does not run a GPU test or establish native/model qualification.

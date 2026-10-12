@@ -1,4 +1,5 @@
 #include "strix/hip_embedding_launcher.hpp"
+#include "strix/hip_launch_context.hpp"
 
 #include "strix/dispatch_resources.hpp"
 
@@ -453,7 +454,7 @@ void launch_typed(
         dim3(blocks),
         dim3(kThreads),
         0,
-        0,
+        hip_execution_stream(),
         reinterpret_cast<const void*>(
             weight.address),
         config.hidden_size,
@@ -630,6 +631,16 @@ void launch_embedding(
             "HIP embedding output buffer is undersized");
     }
 
+    if (const auto* scope = current_hip_launch_context(); scope && scope->graph_capture) {
+        if (!config.enable_device_graph_inputs || manifest_tensor.dimensions[1] != scope->vocabulary_size) {
+            throw std::invalid_argument("embedding graph mode requires an exact opt-in vocabulary");
+        }
+        launch_hip_graph_embedding(config, manifest_tensor.ggml_type, runtime_tensor,
+            scope->vocabulary_size, scope->context_tokens, scope->arguments, output,
+            scope->status, scope->stream);
+        return;
+    }
+
     switch (config.output) {
     case HipActivationStorage::bf16:
         launch_by_weight<
@@ -669,7 +680,7 @@ std::string kernel_id(
             request.logical_rows) +
         ".c" +
         std::to_string(
-            request.request_concurrency);
+            request.request_concurrency) + (config.enable_device_graph_inputs ? ".device-graph" : "");
 }
 
 std::uint64_t implementation_identity(
@@ -681,6 +692,7 @@ std::uint64_t implementation_identity(
         hash,
         static_cast<std::uint64_t>(
             config.output));
+    hash_u64(hash, config.enable_device_graph_inputs ? 1 : 0);
     return hash;
 }
 
@@ -753,7 +765,7 @@ void register_hip_embedding_kernel_variant(
     // token_id is currently a by-value launch parameter. Do not mark this
     // launcher graph-safe until graph parameter update/stable token storage is
     // part of the runtime contract.
-    variant.graph_safe = false;
+    variant.graph_safe = config.enable_device_graph_inputs;
     variant.input_layout =
         "ggml-row";
     variant.output_layout =

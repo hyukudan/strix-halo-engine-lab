@@ -6,6 +6,7 @@
 #include "strix/execution_resources.hpp"
 #include "strix/execution_tensor_access.hpp"
 #include "strix/hip_gdn_launcher.hpp"
+#include "strix/hip_launch_context.hpp"
 #include "strix/memory_plan.hpp"
 #include "strix/model_contract.hpp"
 #include "strix/model_manifest.hpp"
@@ -17,11 +18,13 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -1198,6 +1201,134 @@ int main() try {
         actual_conv ==
             expected.conv_state,
         "HIP GDN convolution state matches BF16 CPU reference");
+
+    // Capture the complete existing GDN operator: projections, convolution,
+    // recurrence, gated normalization and final projection. No host position
+    // scalar controls the captured state stage.
+    {
+        auto graph_config = config;
+        graph_config.enable_device_graph_inputs = true;
+        auto graph_launcher = strix::make_hip_gdn_launcher("test.gdn.device", &graph_config);
+        expect(graph_launcher.implementation_identity != launcher.implementation_identity,
+            "GDN device-input capability is bound to launcher identity");
+        struct GraphHandles {
+            hipStream_t stream = nullptr;
+            hipGraph_t graph = nullptr;
+            hipGraphExec_t executable = nullptr;
+            void* arguments = nullptr;
+            void* status = nullptr;
+            ~GraphHandles() {
+                if (stream && hipStreamQuery(stream) != hipSuccess) return;
+                if (executable) static_cast<void>(hipGraphExecDestroy(executable));
+                if (graph) static_cast<void>(hipGraphDestroy(graph));
+                if (arguments) static_cast<void>(hipFree(arguments));
+                if (status) static_cast<void>(hipFree(status));
+                if (stream) static_cast<void>(hipStreamDestroy(stream));
+            }
+        } graph;
+        check(hipStreamCreateWithFlags(&graph.stream, hipStreamNonBlocking), "create GDN graph stream");
+        check(hipMalloc(&graph.arguments, 16), "allocate GDN device arguments");
+        check(hipMalloc(&graph.status, 4), "allocate GDN graph status");
+        context.execution_identity = memory.execution_identity;
+        context.position = std::numeric_limits<std::uint64_t>::max();
+        strix::HipLaunchContext scope;
+        scope.stream = graph.stream; scope.graph_capture = true;
+        scope.arguments = strix::bind_graph_inputs(strix::graph_input_layout(1),
+            {memory.execution_identity, reinterpret_cast<std::uintptr_t>(graph.arguments), 16, 1});
+        scope.status = {memory.execution_identity, reinterpret_cast<std::uintptr_t>(graph.status), 4, 1};
+        scope.context_tokens = state_layout.context_tokens;
+        scope.vocabulary_size = static_cast<std::uint32_t>(model.vocab_size);
+        check(hipStreamBeginCapture(graph.stream, hipStreamCaptureModeThreadLocal), "capture complete GDN");
+        try {
+            const strix::HipLaunchScope owned(scope);
+            graph_launcher.function(context, graph_launcher.user_data);
+        } catch (...) { static_cast<void>(hipStreamEndCapture(graph.stream, &graph.graph)); throw; }
+        check(hipStreamEndCapture(graph.stream, &graph.graph), "finish GDN capture");
+        check(hipGraphInstantiate(&graph.executable, graph.graph, nullptr, nullptr, 0), "instantiate GDN graph");
+        auto copy_state = [&](const std::vector<float>& matrix, const std::vector<std::uint16_t>& convolution) {
+            check(hipMemcpy(reinterpret_cast<void*>(matrix_address.address), matrix.data(), matrix.size() * sizeof(float), hipMemcpyHostToDevice), "set GDN graph matrix");
+            check(hipMemcpy(reinterpret_cast<void*>(conv_address.address), convolution.data(), convolution.size() * sizeof(std::uint16_t), hipMemcpyHostToDevice), "set GDN graph convolution");
+        };
+        auto read_state = [&]() {
+            Reference r;
+            r.matrix_state.resize(matrix_state.size()); r.conv_state.resize(conv_state.size());
+            check(hipMemcpy(r.matrix_state.data(), reinterpret_cast<void*>(matrix_address.address), matrix_address.bytes, hipMemcpyDeviceToHost), "read GDN graph matrix");
+            check(hipMemcpy(r.conv_state.data(), reinterpret_cast<void*>(conv_address.address), conv_address.bytes, hipMemcpyDeviceToHost), "read GDN graph convolution");
+            return r;
+        };
+        auto control = [&](std::uint64_t position, std::uint32_t status) {
+            std::array<std::byte, 16> packet{};
+            std::memcpy(packet.data() + 8, &position, 8);
+            check(hipMemcpy(graph.arguments, packet.data(), packet.size(), hipMemcpyHostToDevice), "set dynamic GDN position");
+            check(hipMemcpy(graph.status, &status, 4, hipMemcpyHostToDevice), "set sticky GDN status");
+        };
+        auto replay = [&]() {
+            check(hipGraphLaunch(graph.executable, graph.stream), "replay complete GDN");
+            check(hipStreamSynchronize(graph.stream), "complete GDN graph");
+        };
+        auto read_status = [&]() {
+            std::uint32_t result = 0;
+            check(hipMemcpy(&result, graph.status, 4, hipMemcpyDeviceToHost), "read GDN graph status");
+            return result;
+        };
+        auto previous = Reference{{}, matrix_state, conv_state};
+        auto cpu = previous;
+        copy_state(previous.matrix_state, previous.conv_state);
+        for (unsigned iteration = 0; iteration < 3; ++iteration) {
+            for (unsigned i = 0; i < hidden; ++i) hidden_values[i] = float_to_bf16(
+                static_cast<float>(static_cast<int>((i + iteration * 3U) % 19U) - 9) / 23.0F);
+            check(hipMemcpy(reinterpret_cast<void*>(input.address), hidden_values.data(), hidden_values.size() * 2, hipMemcpyHostToDevice), "change GDN graph input");
+            control(iteration, 0); replay();
+            expect(read_status() == 0, "valid GDN graph status");
+            auto current = read_state();
+            std::vector<std::uint16_t> graph_output(hidden), eager_output(hidden);
+            check(hipMemcpy(graph_output.data(), reinterpret_cast<void*>(output.address), hidden * 2, hipMemcpyDeviceToHost), "read GDN graph output");
+            copy_state(previous.matrix_state, previous.conv_state);
+            auto eager_scope = scope; eager_scope.graph_capture = false;
+            { const strix::HipLaunchScope owned(eager_scope); graph_launcher.function(context, graph_launcher.user_data); }
+            check(hipStreamSynchronize(graph.stream), "complete GDN eager control");
+            const auto eager = read_state();
+            check(hipMemcpy(eager_output.data(), reinterpret_cast<void*>(output.address), hidden * 2, hipMemcpyDeviceToHost), "read GDN eager control output");
+            expect(graph_output == eager_output && current.conv_state == eager.conv_state &&
+                std::memcmp(current.matrix_state.data(), eager.matrix_state.data(), matrix_address.bytes) == 0,
+                "complete GDN graph replay exactly matches eager state/output bits");
+            cpu = cpu_reference(model, hidden_values, qkv, z, beta, alpha, conv, dt, a, norm, out_weight, cpu.matrix_state, cpu.conv_state);
+            for (unsigned i = 0; i < hidden; ++i) expect(std::isfinite(bf16_to_float(graph_output[i])) &&
+                std::fabs(bf16_to_float(graph_output[i]) - cpu.output[i]) <= 3e-3F, "repeated GDN graph independent CPU output");
+            for (std::size_t i = 0; i < current.matrix_state.size(); ++i) expect(std::isfinite(current.matrix_state[i]) &&
+                std::fabs(current.matrix_state[i] - cpu.matrix_state[i]) <= 5e-4F, "repeated GDN graph independent CPU matrix");
+            expect(current.conv_state == cpu.conv_state, "repeated GDN graph independent CPU convolution");
+            previous = current; copy_state(previous.matrix_state, previous.conv_state);
+        }
+        for (const auto position : {state_layout.context_tokens, std::uint64_t{1} << 32U, std::numeric_limits<std::uint64_t>::max()}) {
+            control(position, 0); replay();
+            const auto rejected = read_state();
+            expect(read_status() == 2 && rejected.conv_state == previous.conv_state &&
+                std::memcmp(rejected.matrix_state.data(), previous.matrix_state.data(), matrix_address.bytes) == 0,
+                "invalid device GDN position cannot mutate recurrence/convolution");
+        }
+        control(0, 1); replay();
+        auto rejected = read_state();
+        expect(read_status() == 1 && rejected.conv_state == previous.conv_state &&
+            std::memcmp(rejected.matrix_state.data(), previous.matrix_state.data(), matrix_address.bytes) == 0,
+            "upstream GDN status stays sticky and preserves persistent state");
+        std::fill(hidden_values.begin(), hidden_values.end(), float_to_bf16(0.5F));
+        check(hipMemcpy(reinterpret_cast<void*>(input.address), hidden_values.data(), hidden_values.size() * 2, hipMemcpyHostToDevice), "set finite overflow GDN input");
+        auto overflow_qkv = qkv;
+        std::fill_n(overflow_qkv.begin(), hidden, std::numeric_limits<float>::max());
+        check(hipMemcpy(device_weights[0], overflow_qkv.data(), overflow_qkv.size() * sizeof(float), hipMemcpyHostToDevice), "set GDN overflowing projection weights");
+        control(0, 0); replay(); rejected = read_state();
+        expect(read_status() == 8 && rejected.conv_state == previous.conv_state &&
+            std::memcmp(rejected.matrix_state.data(), previous.matrix_state.data(), matrix_address.bytes) == 0,
+            "nonfinite GDN projection rejects before persistent mutation");
+        check(hipMemcpy(device_weights[0], qkv.data(), qkv.size() * sizeof(float), hipMemcpyHostToDevice), "restore GDN projection weights");
+        hidden_values[0] = 0x7f80;
+        check(hipMemcpy(reinterpret_cast<void*>(input.address), hidden_values.data(), hidden_values.size() * 2, hipMemcpyHostToDevice), "set nonfinite GDN graph input");
+        control(0, 0); replay(); rejected = read_state();
+        expect(read_status() == 4 && rejected.conv_state == previous.conv_state &&
+            std::memcmp(rejected.matrix_state.data(), previous.matrix_state.data(), matrix_address.bytes) == 0,
+            "nonfinite GDN input rejected before persistent mutation");
+    }
 
     for (auto* pointer :
          device_weights) {

@@ -15,6 +15,7 @@ void expect(bool condition, const char* message) {
         ++failures;
     }
 }
+template<class F> bool rejected(F function) { try { function(); } catch (const std::invalid_argument&) { return true; } return false; }
 
 class Loopback final
     : public strix::DistributedControlByteStream {
@@ -140,6 +141,12 @@ int main() {
     const auto decoded_ack =
         strix::decode_distributed_remote_step_ack(
             encoded_ack);
+    std::vector<std::byte> golden_ack(64);
+    golden_ack[0] = std::byte{0x57}; golden_ack[1] = std::byte{0x43}; golden_ack[2] = std::byte{0x54}; golden_ack[3] = std::byte{0x53};
+    golden_ack[4] = std::byte{2}; golden_ack[8] = std::byte{2}; golden_ack[12] = std::byte{48}; golden_ack[16] = std::byte{1};
+    golden_ack[20] = std::byte{2}; golden_ack[28] = std::byte{3}; golden_ack[36] = std::byte{4}; golden_ack[44] = std::byte{5};
+    golden_ack[52] = std::byte{6}; golden_ack[56] = std::byte{1}; golden_ack[60] = std::byte{1};
+    expect(encoded_ack == golden_ack, "native extension preserves exact historical v2 ACK bytes");
     expect(
         decoded_ack.success &&
             decoded_ack.sequence == 5 &&
@@ -255,6 +262,36 @@ int main() {
     expect(
         trailing_rejected,
         "control wire rejects frame length/trailing-byte mismatch");
+
+    strix::DistributedDirectGpuControlFrame native;
+    native.physical_link_id = "synthetic-physical-link"; native.local_endpoint_identity = "synthetic-a"; native.peer_endpoint_identity = "synthetic-b";
+    native.descriptor = transfer.descriptor;
+    native.commit = {1, strix::transport::gpu_commit_word, 9, 14, 128, 1, 2};
+    const auto native_bytes = strix::encode_distributed_direct_gpu_control(native);
+    const auto native_decoded = strix::decode_distributed_direct_gpu_control(native_bytes);
+    expect(strix::inspect_distributed_control_frame_kind(native_bytes) == strix::DistributedControlFrameKind::direct_gpu_stream &&
+           native_decoded.descriptor.request_id == 11 && native_decoded.descriptor.model_plan_id == 10 && native_decoded.descriptor.generation == 12 &&
+           native_decoded.descriptor.sequence == 14 && native_decoded.descriptor.byte_length == 128 && native_decoded.commit.stripe_index == 1,
+           "explicit native kind4/v1 payload preserves full execution descriptor and terminal stripe record");
+    expect(rejected([&] { static_cast<void>(strix::decode_distributed_boundary_transfer(native_bytes)); }), "legacy boundary decoder rejects unsupported native extension without downgrade");
+    for (const auto kind : {strix::DistributedDirectGpuControlKind::receive_ready, strix::DistributedDirectGpuControlKind::received, strix::DistributedDirectGpuControlKind::consumed}) {
+        auto message = native; message.kind = kind; message.commit = {};
+        expect(strix::decode_distributed_direct_gpu_control(strix::encode_distributed_direct_gpu_control(message)).kind == kind, "native ready/received/consumer credit remain distinct canonical kinds");
+        message.commit = native.commit;
+        expect(rejected([&] { static_cast<void>(strix::encode_distributed_direct_gpu_control(message)); }), "native ACK cannot carry forged producer commit");
+    }
+    for (const auto index : {4U, 10U, 16U, 20U, 28U}) {
+        auto message = native_bytes; message[index] = index == 28 ? std::byte{0} : std::byte{99};
+        expect(rejected([&] { static_cast<void>(strix::decode_distributed_direct_gpu_control(message)); }), "native control rejects outer/inner version, reserved, unsupported kind or noncanonical identity");
+    }
+    auto invalid_native = native; invalid_native.contract_version = 2;
+    expect(rejected([&] { static_cast<void>(strix::encode_distributed_direct_gpu_control(invalid_native)); }), "unsupported native payload version cannot be emitted");
+    invalid_native = native; invalid_native.physical_link_id.assign(257, 'x');
+    expect(rejected([&] { static_cast<void>(strix::encode_distributed_direct_gpu_control(invalid_native)); }), "native identity length is bounded independently of total frame cap");
+    invalid_native = native; ++invalid_native.commit.sequence;
+    expect(rejected([&] { static_cast<void>(strix::encode_distributed_direct_gpu_control(invalid_native)); }), "stale terminal record sequence cannot be published as native producer release");
+    expect(rejected([&] { static_cast<void>(strix::encode_distributed_direct_gpu_control(native, {1, 2048, 1})); }) &&
+           rejected([&] { static_cast<void>(strix::encode_distributed_direct_gpu_control(native, {2, 16, 1})); }), "native extension rejects wire downgrade and insufficient bounded frame admission");
 
     if (failures == 0) {
         std::cout

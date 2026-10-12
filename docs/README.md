@@ -65,6 +65,9 @@ A wider kernel, larger speculative window, second node or second physical link i
 - [Optimization lifetime implementation](implementation-2026-10-12-optimization-lifetimes.md).
 - [Pre-hardware experiments](implementation-2026-10-12-prehardware-experiments.md).
 - [Reusable execution components](implementation-2026-10-12-execution-components.md).
+- [Complete C1 graph and GPU export prerequisites](implementation-2026-10-12-complete-graph-and-export.md).
+- [Device-dynamic GDN and indexed attention](implementation-2026-10-12-dynamic-state-operators.md).
+- [Experimental tiled integer LM-head consumer](implementation-2026-10-12-integer-runtime.md).
 - [Phase specific packed weights and integer execution](proposals/2026-10-11-phase-specific-low-precision.md).
 - [Execution optimization gates](proposals/2026-10-12-execution-optimization-gates.md).
 

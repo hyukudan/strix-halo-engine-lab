@@ -1,3 +1,4 @@
+#include "strix/hip_launch_context.hpp"
 #include "strix/hip_lm_head_launcher.hpp"
 
 #include "strix/dispatch_resources.hpp"
@@ -431,7 +432,7 @@ void launch_typed(
         dim3(config.vocab_size),
         dim3(kThreads),
         0,
-        0,
+        hip_execution_stream(),
         reinterpret_cast<const Input*>(
             hidden.address),
         reinterpret_cast<const void*>(
@@ -777,6 +778,13 @@ register_for_compiled_execution(
             binding.kernel_id->empty()) {
             throw std::invalid_argument(
                 "HIP LM-head step has no kernel binding");
+        }
+        ExecutionBindingRequest request;
+        request.logical_rows = compiled.logical_rows;
+        request.request_concurrency = compiled.request_concurrency;
+        if (*binding.kernel_id != kernel_id(request, config_)) {
+            throw std::invalid_argument(
+                "default HIP LM-head cannot execute another numerical kernel/profile");
         }
         registry.add_kernel_launcher(
             make_hip_lm_head_launcher(

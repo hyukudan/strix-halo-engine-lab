@@ -14,6 +14,7 @@ struct HipEmbeddingLauncherConfig {
     std::uint32_t hidden_size = 0;
     HipActivationStorage output =
         HipActivationStorage::bf16;
+    bool enable_device_graph_inputs = false;
 };
 
 // Experimental C1 device-input gather. All allocations must remain owned and

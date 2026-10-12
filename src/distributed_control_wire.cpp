@@ -48,6 +48,14 @@ public:
     void boolean(bool value) {
         u32(value ? 1U : 0U);
     }
+    void text(const std::string& value) {
+        if (value.empty() || value.size() > 256) throw std::invalid_argument("direct GPU control identity is empty or excessive");
+        u32(static_cast<std::uint32_t>(value.size()));
+        for (unsigned char character : value) {
+            if (character < 32 || character > 126) throw std::invalid_argument("direct GPU control identity is not canonical ASCII");
+            bytes_.push_back(static_cast<std::byte>(character));
+        }
+    }
 
     [[nodiscard]] std::vector<std::byte>
     take() {
@@ -120,6 +128,17 @@ public:
                 "control wire boolean is not canonical");
         }
         return value != 0;
+    }
+    [[nodiscard]] std::string text() {
+        const auto count = u32();
+        if (!count || count > 256) throw std::invalid_argument("direct GPU control identity is empty or excessive");
+        require(count); std::string value; value.reserve(count);
+        for (std::uint32_t i = 0; i < count; ++i) {
+            const auto character = std::to_integer<unsigned char>(bytes_[offset_++]);
+            if (character < 32 || character > 126) throw std::invalid_argument("direct GPU control identity is not canonical ASCII");
+            value.push_back(static_cast<char>(character));
+        }
+        return value;
     }
 
     [[nodiscard]] bool empty() const noexcept {
@@ -265,6 +284,26 @@ decode_descriptor(
     d.byte_length = reader.u64();
     return d;
 }
+void validate_direct_gpu_control(const DistributedDirectGpuControlFrame& value) {
+    const auto& descriptor = value.descriptor;
+    if (value.contract_version != 1 || value.local_endpoint_identity == value.peer_endpoint_identity ||
+        !transport::validate_descriptor(descriptor, {1, descriptor.connection_epoch, std::numeric_limits<std::uint32_t>::max()}) ||
+        !descriptor.sequence || !descriptor.generation) throw std::invalid_argument("direct GPU control contract/descriptor is incompatible");
+    switch (value.kind) {
+    case DistributedDirectGpuControlKind::producer_released:
+        if (!transport::validate_gpu_commit_record(value.commit, descriptor) || value.commit.payload_bytes != descriptor.byte_length) {
+            throw std::invalid_argument("direct GPU control producer record is foreign");
+        }
+        break;
+    case DistributedDirectGpuControlKind::receive_ready:
+    case DistributedDirectGpuControlKind::received:
+    case DistributedDirectGpuControlKind::consumed:
+        if (value.commit.protocol_version != 1 || value.commit.commit_word || value.commit.connection_epoch || value.commit.sequence ||
+            value.commit.payload_bytes || value.commit.stripe_index || value.commit.stripe_count != 1) throw std::invalid_argument("direct GPU control ACK cannot forge a commit record");
+        break;
+    default: throw std::invalid_argument("direct GPU control kind is unsupported");
+    }
+}
 
 }  // namespace
 
@@ -290,8 +329,7 @@ inspect_distributed_control_frame_kind(
     }
     const auto raw_kind =
         reader.u16();
-    static_cast<void>(
-        reader.u16());
+    if (reader.u16() != 0) throw std::invalid_argument("distributed control frame reserved bits are non-zero");
     const auto payload_bytes =
         reader.u32();
     if (payload_bytes !=
@@ -311,12 +349,32 @@ inspect_distributed_control_frame_kind(
             remote_step_ack:
     case DistributedControlFrameKind::
             boundary_transfer:
+    case DistributedControlFrameKind::direct_gpu_stream:
         return static_cast<
             DistributedControlFrameKind>(
                 raw_kind);
     }
     throw std::invalid_argument(
         "distributed control frame kind is unknown");
+}
+
+std::vector<std::byte> encode_distributed_direct_gpu_control(const DistributedDirectGpuControlFrame& value, DistributedControlWireLimits limits) {
+    validate_direct_gpu_control(value); Writer payload;
+    payload.u32(value.contract_version); payload.u32(static_cast<std::uint32_t>(value.kind));
+    payload.text(value.physical_link_id); payload.text(value.local_endpoint_identity); payload.text(value.peer_endpoint_identity);
+    encode_descriptor(payload, value.descriptor);
+    payload.u32(value.commit.protocol_version); payload.u32(value.commit.commit_word); payload.u64(value.commit.connection_epoch);
+    payload.u64(value.commit.sequence); payload.u32(value.commit.payload_bytes); payload.u16(value.commit.stripe_index); payload.u16(value.commit.stripe_count);
+    return frame(DistributedControlFrameKind::direct_gpu_stream, payload.take(), limits);
+}
+DistributedDirectGpuControlFrame decode_distributed_direct_gpu_control(std::span<const std::byte> bytes, DistributedControlWireLimits limits) {
+    Reader reader(payload_of(bytes, DistributedControlFrameKind::direct_gpu_stream, limits)); DistributedDirectGpuControlFrame value;
+    value.contract_version = reader.u32(); value.kind = static_cast<DistributedDirectGpuControlKind>(reader.u32());
+    value.physical_link_id = reader.text(); value.local_endpoint_identity = reader.text(); value.peer_endpoint_identity = reader.text();
+    value.descriptor = decode_descriptor(reader);
+    value.commit.protocol_version = reader.u32(); value.commit.commit_word = reader.u32(); value.commit.connection_epoch = reader.u64();
+    value.commit.sequence = reader.u64(); value.commit.payload_bytes = reader.u32(); value.commit.stripe_index = reader.u16(); value.commit.stripe_count = reader.u16();
+    require_consumed(reader); validate_direct_gpu_control(value); return value;
 }
 
 std::vector<std::byte>

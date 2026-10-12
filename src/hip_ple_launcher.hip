@@ -1,8 +1,10 @@
+#include "strix/hip_launch_context.hpp"
 #include "strix/hip_ple_launcher.hpp"
 
 #include "strix/dispatch_resources.hpp"
 #include "strix/ple_lookup.hpp"
 #include "strix/ple_workspace.hpp"
+#include "strix/graph_ple.hpp"
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -707,7 +709,8 @@ __global__ void conv_residual_kernel(
     std::uint32_t channels,
     std::uint32_t history,
     std::uint32_t kernel_size,
-    std::uint32_t dilation) {
+    std::uint32_t dilation, std::uint32_t* graph_status = nullptr) {
+    if (graph_status && atomicAdd(graph_status, 0U) != 0U) return;
     const auto channel =
         static_cast<std::uint32_t>(
             blockIdx.x) *
@@ -783,7 +786,7 @@ void launch_projection(
                 Kind>),
         dim3(output_width),
         dim3(kThreads),
-        0, 0,
+        0, hip_execution_stream(),
         input,
         reinterpret_cast<
             const void*>(
@@ -1057,6 +1060,40 @@ void validate_small(
     }
 }
 
+struct DevicePleHash {
+    std::uint32_t ngram, heads_per_ngram, heads, width, eos;
+    std::uint64_t multipliers[8], offsets[32], vocabularies[32];
+};
+__global__ void graph_ple_gather_kernel(DevicePleHash h, const std::uint16_t* table,
+    const std::uint32_t* token, const std::uint64_t* position, const std::uint32_t* previous,
+    std::uint16_t* gathered, std::uint32_t vocabulary, std::uint64_t context,
+    std::uint32_t* status) {
+    if (atomicAdd(status, 0U)) return;
+    if (*token >= vocabulary || *position >= context) { atomicOr(status, 16U); return; }
+    std::uint64_t values[8]; values[0] = *token;
+    bool cut = false;
+    for (std::uint32_t shift = 1; shift < h.ngram; ++shift) {
+        const auto value = *position == 0 ? h.eos : previous[h.ngram - 1U - shift];
+        if (value >= vocabulary) { atomicOr(status, 16U); return; }
+        cut = cut || value == h.eos; values[shift] = cut ? h.eos : value;
+    }
+    const auto element = static_cast<std::uint32_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (element >= h.heads * h.width) return;
+    const auto head = element / h.width;
+    const auto ngram = head / h.heads_per_ngram + 2U;
+    auto mixed = values[0] * h.multipliers[0];
+    for (std::uint32_t shift = 1; shift < ngram; ++shift) mixed ^= values[shift] * h.multipliers[shift];
+    const auto row = mixed % h.vocabularies[head] + h.offsets[head];
+    gathered[element] = table[row * h.width + element % h.width];
+}
+__global__ void graph_ple_history_kernel(const std::uint32_t* token, const std::uint64_t* position,
+    const std::uint32_t* previous, std::uint32_t* next, std::uint32_t count,
+    std::uint32_t eos, std::uint32_t* status) {
+    if (threadIdx.x || atomicAdd(status, 0U)) return;
+    for (std::uint32_t i = 0; i + 1U < count; ++i) next[i] = *position == 0 ? eos : previous[i + 1U];
+    next[count - 1U] = *token;
+}
+
 void launch_ple(
     const ExecutionDispatchContext& context,
     void* user_data) {
@@ -1078,8 +1115,8 @@ void launch_ple(
     }
     if (user_data == nullptr ||
         context.resources == nullptr ||
-        context.resources->ple_lookup ==
-            nullptr) {
+        ((!current_hip_launch_context() || !current_hip_launch_context()->graph_capture) &&
+        context.resources->ple_lookup == nullptr)) {
         throw std::invalid_argument(
             "HIP PLE requires config and lookup backend");
     }
@@ -1194,9 +1231,16 @@ void launch_ple(
         PleHashContract::maximum_heads * 512>
         host_staging{};
 
+    PleHashResult hash;
+    const auto* graph = current_hip_launch_context();
+    if (graph && graph->graph_capture) {
+        if (!config.enable_resident_graph || config.upload_pool || config.enable_owned_event_upload ||
+            tensors.table.manifest->ggml_type != 30)
+            throw std::invalid_argument("captured PLE requires opt-in resident BF16 table without host upload");
+        hash.row_count = hash_contract.head_count;
+    } else {
     auto& backend =
         *context.resources->ple_lookup;
-    PleHashResult hash;
 
     if (context.resources->ple_prefetch != nullptr &&
         context.resources->ple_prefetch->active) {
@@ -1292,6 +1336,8 @@ void launch_ple(
         }
     }
 
+    }
+
     const auto lookup_bytes =
         static_cast<std::uint64_t>(
             hash.row_count) *
@@ -1328,6 +1374,30 @@ void launch_ple(
     if (lookup_bytes != workspace_layout.gathered_bytes || lookup_bytes > host_staging.size()) {
         throw std::invalid_argument("PLE gathered upload does not match its exact workspace region");
     }
+    if (graph && graph->graph_capture) {
+        auto gathered_view = temporary;
+        gathered_view.address = reinterpret_cast<std::uintptr_t>(gathered);
+        gathered_view.bytes = workspace_layout.gathered_bytes;
+        validate_graph_ple_bindings(hash_contract, graph->vocabulary_size, graph->context_tokens,
+            *tensors.table.runtime, graph->arguments, graph->status, gathered_view,
+            graph->ngram_input, graph->ngram_output);
+        DevicePleHash h{};
+        h.ngram = hash_contract.ngram_size; h.heads_per_ngram = hash_contract.heads_per_ngram;
+        h.heads = hash_contract.head_count; h.width = hash_contract.head_dim; h.eos = hash_contract.eos_token_id;
+        std::copy_n(hash_contract.multipliers.begin(), 8, h.multipliers);
+        std::copy_n(hash_contract.head_offsets.begin(), 32, h.offsets);
+        std::copy_n(hash_contract.head_vocab_sizes.begin(), 32, h.vocabularies);
+        hipLaunchKernelGGL(graph_ple_gather_kernel, dim3((h.heads * h.width + 255U) / 256U), dim3(256),
+            0, graph->stream, h, reinterpret_cast<const std::uint16_t*>(tensors.table.runtime->address),
+            reinterpret_cast<const std::uint32_t*>(graph->arguments.memory.arena_base + graph->arguments.token_offset),
+            hip_graph_position(), reinterpret_cast<const std::uint32_t*>(graph->ngram_input.arena_base),
+            gathered, graph->vocabulary_size, graph->context_tokens, hip_graph_status());
+        check_hip(hipGetLastError(), "resident PLE graph hash/gather");
+    } else {
+    // The synchronous host upload uses the backend/default copy stream. An
+    // explicit nonblocking eager stream must first release reused arena views.
+    // This also keeps stack staging lifetime independent of async copy errors.
+    if (graph) check_hip(hipStreamSynchronize(graph->stream), "PLE eager upload arena fence");
     if (config.upload_pool != nullptr) {
         auto destination = temporary;
         destination.address = reinterpret_cast<std::uintptr_t>(gathered);
@@ -1341,6 +1411,7 @@ void launch_ple(
     } else {
         check_hip(hipMemcpy(gathered, host_staging.data(), static_cast<std::size_t>(lookup_bytes),
                             hipMemcpyHostToDevice), "copy PLE gathered embedding");
+    }
     }
 
     launch_projection_by_kind(
@@ -1373,7 +1444,7 @@ void launch_ple(
             static_cast<std::uint32_t>(
                 config.model.hc_count)),
         dim3(kThreads),
-        0, 0,
+        0, hip_execution_stream(),
         key,
         reinterpret_cast<
             const std::uint16_t*>(
@@ -1412,7 +1483,7 @@ void launch_ple(
             static_cast<std::uint32_t>(
                 value_blocks)),
         dim3(kThreads),
-        0, 0,
+        0, hip_execution_stream(),
         value,
         gates,
         gated,
@@ -1430,7 +1501,7 @@ void launch_ple(
             static_cast<std::uint32_t>(
                 config.model.hc_count)),
         dim3(kThreads),
-        0, 0,
+        0, hip_execution_stream(),
         gated,
         reinterpret_cast<
             const void*>(
@@ -1465,7 +1536,7 @@ void launch_ple(
             static_cast<std::uint32_t>(
                 conv_blocks)),
         dim3(kThreads),
-        0, 0,
+        0, hip_execution_stream(),
         reinterpret_cast<
             const std::uint16_t*>(
                 input.address),
@@ -1490,15 +1561,25 @@ void launch_ple(
         static_cast<std::uint32_t>(
             config.model.ple_conv_kernel_size),
         static_cast<std::uint32_t>(
-            config.model.ngram_size));
+            config.model.ngram_size), hip_graph_status());
     check_hip(
         hipGetLastError(),
         "HIP PLE convolution launch");
 
+    if (graph && graph->graph_capture) {
+        hipLaunchKernelGGL(graph_ple_history_kernel, dim3(1), dim3(1), 0, graph->stream,
+            reinterpret_cast<const std::uint32_t*>(graph->arguments.memory.arena_base + graph->arguments.token_offset),
+            hip_graph_position(), reinterpret_cast<const std::uint32_t*>(graph->ngram_input.arena_base),
+            reinterpret_cast<std::uint32_t*>(graph->ngram_output.arena_base), hash_contract.ngram_size - 1U,
+            hash_contract.eos_token_id, hip_graph_status());
+        check_hip(hipGetLastError(), "resident PLE graph next history");
+        return; // Host history publishes only after whole-graph completion/status.
+    }
+
     // PLE v1 deliberately synchronizes here: host n-gram history must not
     // advance until the device convolution/state update has succeeded.
     check_hip(
-        hipDeviceSynchronize(),
+        hipStreamSynchronize(hip_execution_stream()),
         "HIP PLE synchronize");
 
     std::memcpy(
@@ -1531,7 +1612,7 @@ std::string kernel_id(
             request.logical_rows) +
         ".c" +
         std::to_string(
-            request.request_concurrency);
+            request.request_concurrency) + (config.enable_resident_graph ? ".resident-graph" : "");
 }
 
 std::uint64_t implementation_identity(
@@ -1557,6 +1638,7 @@ std::uint64_t implementation_identity(
         hash,
         static_cast<std::uint64_t>(
             config.activation));
+    hash_u64(hash, config.enable_resident_graph ? 1 : 0);
     if (config.upload_pool != nullptr || config.enable_owned_event_upload) {
         hash_u64(hash, 0x484f535455504c31ULL);
     }
@@ -1661,7 +1743,7 @@ void register_hip_ple_kernel_variant(
         qualification;
     // Host hash/lookup and explicit state-commit synchronization make v1
     // unsuitable for graph capture.
-    variant.graph_safe = false;
+    variant.graph_safe = config.enable_resident_graph;
     variant.input_layout =
         "hc-stream-major+file-backed-ngram";
     variant.output_layout =

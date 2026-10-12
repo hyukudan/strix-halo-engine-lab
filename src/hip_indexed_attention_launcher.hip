@@ -4,6 +4,8 @@
 #include "strix/indexed_attention_state.hpp"
 #include "strix/indexed_attention_workspace.hpp"
 #include "strix/session_state_memory.hpp"
+#include "strix/hip_launch_context.hpp"
+#include "strix/graph_operator_control.hpp"
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -73,6 +75,66 @@ struct GraphPositionKernelArguments {
     std::uint64_t context_tokens = 0;
     std::uint32_t* status = nullptr;
 };
+
+struct GraphSelectionArguments {
+    GraphPositionKernelArguments position;
+    std::uint32_t ratio = 0;
+    std::uint32_t block_topk = 0;
+};
+
+void check_hip(hipError_t status, const char* operation);
+
+GraphPositionKernelArguments graph_position_arguments() {
+    const auto* scope = current_hip_launch_context();
+    if (scope == nullptr || !scope->graph_capture) return {};
+    return {hip_graph_position(), scope->context_tokens, hip_graph_status()};
+}
+
+__device__ bool graph_visible(GraphSelectionArguments dynamic, std::uint32_t& visible) {
+    if (dynamic.position.position == nullptr) return true;
+    const auto position = *dynamic.position.position;
+    // Other blocks can publish arithmetic failure concurrently. Broadcast once
+    // per block so a status transition cannot split threads around barriers.
+    __shared__ std::uint32_t reject;
+    if (threadIdx.x == 0) reject = atomicAdd(dynamic.position.status, 0U) != 0 || position >= dynamic.position.context_tokens;
+    __syncthreads();
+    if (reject) return false;
+    visible = static_cast<std::uint32_t>(position + 1ULL);
+    return true;
+}
+
+__device__ bool graph_selected_count(GraphSelectionArguments dynamic, std::uint32_t& count) {
+    if (dynamic.position.position == nullptr) return true;
+    std::uint32_t visible = 0;
+    if (!graph_visible(dynamic, visible)) return false;
+    const auto blocks = visible / dynamic.ratio;
+    count = min(blocks, dynamic.block_topk) * dynamic.ratio + visible % dynamic.ratio;
+    return true;
+}
+
+__global__ void validate_indexed_graph_control(GraphPositionKernelArguments dynamic,
+    const std::uint16_t* input, std::uint32_t hidden) {
+    if (atomicAdd(dynamic.status, 0U) != 0) return;
+    if (*dynamic.position >= dynamic.context_tokens) atomicOr(dynamic.status, 2U);
+    for (std::uint32_t i = threadIdx.x; i < hidden; i += blockDim.x) {
+        if ((input[i] & 0x7f80U) == 0x7f80U) atomicOr(dynamic.status, 4U);
+    }
+}
+
+__global__ void validate_indexed_graph_values(const float* values, std::uint32_t count,
+    std::uint32_t* status) {
+    if (atomicAdd(status, 0U) != 0) return;
+    for (std::uint32_t i = threadIdx.x; i < count; i += blockDim.x) {
+        if (!isfinite(values[i])) atomicOr(status, 8U);
+    }
+}
+
+void validate_graph_values(const float* values, std::uint32_t count) {
+    if (hip_graph_status() == nullptr) return;
+    hipLaunchKernelGGL(validate_indexed_graph_values, dim3(1), dim3(kThreads), 0,
+        hip_execution_stream(), values, count, hip_graph_status());
+    check_hip(hipGetLastError(), "HIP indexed-attention finite intermediate validation");
+}
 
 struct TensorPair {
     const ManifestTensor* manifest = nullptr;
@@ -710,7 +772,9 @@ __global__ void store_raw_index_key_kernel(
     const float* current,
     std::uint16_t* state,
     std::uint32_t width,
-    std::uint64_t position) {
+    std::uint64_t position, GraphPositionKernelArguments dynamic) {
+    if (dynamic.position != nullptr) position = *dynamic.position;
+    if (dynamic.status != nullptr && (*dynamic.status != 0 || position >= dynamic.context_tokens)) return;
     const auto feature =
         static_cast<std::uint32_t>(
             blockIdx.x) *
@@ -771,10 +835,15 @@ __global__ void block_score_kernel(
     float epsilon,
     std::uint32_t rotary_dim,
     float theta,
-    float* block_scores) {
+    float* block_scores, GraphSelectionArguments dynamic) {
     const auto block =
         static_cast<std::uint32_t>(
             blockIdx.x);
+    if (dynamic.position.position != nullptr) {
+        std::uint32_t visible = 0;
+        if (!graph_visible(dynamic, visible) || visible / compress_ratio <= dynamic.block_topk ||
+            block >= visible / compress_ratio) return;
+    }
     const auto feature =
         static_cast<std::uint32_t>(
             threadIdx.x);
@@ -834,6 +903,10 @@ __global__ void block_score_kernel(
                 static_cast<float>(
                     head_dim) +
             epsilon);
+    if (dynamic.position.status != nullptr && (!isfinite(scratch[0]) || !isfinite(inv_rms))) {
+        if (feature == 0) atomicOr(dynamic.position.status, 8U);
+        return;
+    }
     pooled[feature] =
         round_bf16(
             mean *
@@ -884,8 +957,12 @@ __global__ void block_score_kernel(
                     sine;
         }
     }
+    // Every lane must finish reading its RoPE partner before any lane writes
+    // the rotated value back into the shared pooled vector.
+    __syncthreads();
     pooled[feature] =
         round_bf16(rotated);
+    if (dynamic.position.status != nullptr && !isfinite(pooled[feature])) atomicOr(dynamic.position.status, 8U);
     __syncthreads();
 
     __shared__ float total;
@@ -919,6 +996,7 @@ __global__ void block_score_kernel(
             __syncthreads();
         }
         if (feature == 0) {
+            if (dynamic.position.status != nullptr && !isfinite(scratch[0])) atomicOr(dynamic.position.status, 8U);
             total +=
                 fmaxf(
                     scratch[0],
@@ -928,6 +1006,7 @@ __global__ void block_score_kernel(
     }
 
     if (feature == 0) {
+        if (dynamic.position.status != nullptr && !isfinite(total)) atomicOr(dynamic.position.status, 8U);
         block_scores[block] =
             total /
             sqrtf(
@@ -956,10 +1035,20 @@ __global__ void select_blocks_kernel(
     std::uint32_t select_blocks,
     std::uint32_t compress_ratio,
     std::uint32_t visible_tokens,
-    std::uint32_t* selected) {
+    std::uint32_t* selected, GraphSelectionArguments dynamic) {
     if (blockIdx.x != 0 ||
         threadIdx.x != 0) {
         return;
+    }
+
+    if (dynamic.position.position != nullptr) {
+        if (!graph_visible(dynamic, visible_tokens)) return;
+        num_blocks = visible_tokens / compress_ratio;
+        if (num_blocks <= dynamic.block_topk) {
+            for (std::uint32_t token = 0; token < visible_tokens; ++token) selected[token] = token;
+            return;
+        }
+        select_blocks = dynamic.block_topk;
     }
 
     for (std::uint32_t slot = 0;
@@ -1054,17 +1143,18 @@ __global__ void attention_score_kernel(
     std::uint32_t attention_heads,
     std::uint32_t kv_heads,
     std::uint32_t head_dim,
-    float* scores) {
+    float* scores, GraphSelectionArguments dynamic) {
+    if (!graph_selected_count(dynamic, selected_count)) return;
     const auto flat =
         static_cast<std::uint32_t>(
             blockIdx.x);
     const auto head =
         flat /
-        selected_count;
+        (dynamic.position.position == nullptr ? selected_count : maximum_selected);
     const auto selected_slot =
         flat %
-        selected_count;
-    if (head >= attention_heads) {
+        (dynamic.position.position == nullptr ? selected_count : maximum_selected);
+    if (head >= attention_heads || selected_slot >= selected_count) {
         return;
     }
 
@@ -1125,6 +1215,7 @@ __global__ void attention_score_kernel(
     }
 
     if (feature == 0) {
+        if (dynamic.position.status != nullptr && !isfinite(scratch[0])) atomicOr(dynamic.position.status, 8U);
         scores[
             static_cast<std::uint64_t>(
                 head) *
@@ -1140,7 +1231,8 @@ __global__ void attention_score_kernel(
 __global__ void attention_softmax_kernel(
     float* scores,
     std::uint32_t selected_count,
-    std::uint32_t maximum_selected) {
+    std::uint32_t maximum_selected, GraphSelectionArguments dynamic) {
+    if (!graph_selected_count(dynamic, selected_count)) return;
     const auto head =
         static_cast<std::uint32_t>(
             blockIdx.x);
@@ -1183,6 +1275,13 @@ __global__ void attention_softmax_kernel(
     }
     const float maximum =
         scratch[0];
+    if (dynamic.position.status != nullptr && !isfinite(maximum)) {
+        if (lane == 0) atomicOr(dynamic.position.status, 8U);
+        return;
+    }
+    // Preserve the reduced maximum in each lane before reusing scratch for
+    // the sum reduction (including waves with no active selected element).
+    __syncthreads();
 
     float local_sum = 0.0F;
     for (std::uint32_t index = lane;
@@ -1215,6 +1314,10 @@ __global__ void attention_softmax_kernel(
     }
     const float denominator =
         scratch[0];
+    if (dynamic.position.status != nullptr && (!isfinite(denominator) || denominator <= 0.0F)) {
+        if (lane == 0) atomicOr(dynamic.position.status, 8U);
+        return;
+    }
 
     for (std::uint32_t index = lane;
          index < selected_count;
@@ -1244,7 +1347,8 @@ __global__ void attention_output_kernel(
     std::uint32_t attention_heads,
     std::uint32_t kv_heads,
     std::uint32_t head_dim,
-    float* output) {
+    float* output, GraphSelectionArguments dynamic) {
+    if (!graph_selected_count(dynamic, selected_count)) return;
     const auto head =
         static_cast<std::uint32_t>(
             blockIdx.x);
@@ -1318,6 +1422,7 @@ __global__ void attention_output_kernel(
         feature] =
         round_bf16(
             attn * gate);
+    if (dynamic.position.status != nullptr && !isfinite(round_bf16(attn * gate))) atomicOr(dynamic.position.status, 8U);
 }
 
 bool contains(
@@ -1604,7 +1709,7 @@ void launch_linear_to_float_typed(
         dim3(output_width),
         dim3(kThreads),
         0,
-        0,
+        hip_execution_stream(),
         reinterpret_cast<
             const std::uint16_t*>(
                 input.address),
@@ -1681,7 +1786,7 @@ void launch_linear_float_to_bf16_typed(
         dim3(output_width),
         dim3(kThreads),
         0,
-        0,
+        hip_execution_stream(),
         input,
         reinterpret_cast<
             const void*>(
@@ -1798,21 +1903,21 @@ void launch_norm_rope(
             SmallWeightKind::f32>(
                 values, heads, head_dim,
                 head_stride, *norm.runtime,
-                model, position);
+                model, position, graph_position_arguments(), hip_execution_stream());
         return;
     case SmallWeightKind::f16:
         launch_norm_rope_typed<
             SmallWeightKind::f16>(
                 values, heads, head_dim,
                 head_stride, *norm.runtime,
-                model, position);
+                model, position, graph_position_arguments(), hip_execution_stream());
         return;
     case SmallWeightKind::bf16:
         launch_norm_rope_typed<
             SmallWeightKind::bf16>(
                 values, heads, head_dim,
                 head_stride, *norm.runtime,
-                model, position);
+                model, position, graph_position_arguments(), hip_execution_stream());
         return;
     }
     throw std::logic_error(
@@ -1825,7 +1930,7 @@ void launch_block_scores_typed(
     const SessionStateAddress& raw_state,
     const TensorPair& k_norm,
     const ModelContract& model,
-    std::uint32_t complete_blocks) {
+    std::uint32_t complete_blocks, GraphSelectionArguments dynamic) {
     hipLaunchKernelGGL(
         HIP_KERNEL_NAME(
             block_score_kernel<Kind>),
@@ -1837,7 +1942,7 @@ void launch_block_scores_typed(
         2ULL *
             model.indexer_head_dim *
             sizeof(float),
-        0,
+        hip_execution_stream(),
         workspace.index_query,
         reinterpret_cast<
             const std::uint16_t*>(
@@ -1859,7 +1964,7 @@ void launch_block_scores_typed(
             model.rotary_dim(),
             "rotary_dim"),
         model.rope_theta,
-        workspace.block_scores);
+        workspace.block_scores, dynamic);
     check_hip(
         hipGetLastError(),
         "HIP indexed-attention block-score launch");
@@ -1870,7 +1975,7 @@ void launch_block_scores(
     const SessionStateAddress& raw_state,
     const TensorPair& k_norm,
     const ModelContract& model,
-    std::uint32_t complete_blocks) {
+    std::uint32_t complete_blocks, GraphSelectionArguments dynamic = {}) {
     switch (small_weight_kind(
                 k_norm.manifest->
                     ggml_type)) {
@@ -1879,21 +1984,21 @@ void launch_block_scores(
             SmallWeightKind::f32>(
                 workspace, raw_state,
                 k_norm, model,
-                complete_blocks);
+                complete_blocks, dynamic);
         return;
     case SmallWeightKind::f16:
         launch_block_scores_typed<
             SmallWeightKind::f16>(
                 workspace, raw_state,
                 k_norm, model,
-                complete_blocks);
+                complete_blocks, dynamic);
         return;
     case SmallWeightKind::bf16:
         launch_block_scores_typed<
             SmallWeightKind::bf16>(
                 workspace, raw_state,
                 k_norm, model,
-                complete_blocks);
+                complete_blocks, dynamic);
         return;
     }
     throw std::logic_error(
@@ -2030,7 +2135,9 @@ void launch_indexed_attention(
 
     const auto& session_layout =
         state_layout(context);
-    if (context.position >=
+    const auto dynamic_position = graph_position_arguments();
+    const bool device_graph = dynamic_position.position != nullptr;
+    if (!device_graph && context.position >=
         session_layout.context_tokens) {
         throw std::out_of_range(
             "indexed-attention position exceeds session capacity");
@@ -2178,6 +2285,35 @@ void launch_indexed_attention(
             "indexed-attention hidden buffers are undersized");
     }
 
+    if (device_graph) {
+        const auto& scope = *current_hip_launch_context();
+        if (!config.enable_device_graph_inputs || scope.context_tokens != session_layout.context_tokens ||
+            scope.context_tokens > model.max_position_embeddings ||
+            scope.context_tokens > std::numeric_limits<std::uint32_t>::max()) {
+            throw std::invalid_argument("indexed-attention device graph context/configuration is invalid");
+        }
+        GraphOperatorControlRequest request;
+        request.execution_identity = context.execution_identity;
+        request.context_tokens = scope.context_tokens;
+        request.arguments = scope.arguments;
+        request.status = scope.status;
+        for (const auto* view : {&input, &output}) request.resources.push_back(
+            {view->address, view->bytes, view->allocation_generation, 2});
+        request.resources.push_back({temporary.address, temporary.bytes, temporary.allocation_generation, 4});
+        for (const auto* state : {&kv_state, &raw_state}) request.resources.push_back(
+            {state->address, state->bytes, state->allocation_generation, 2});
+        for (const auto* tensor : {&tensors.q, &tensors.k, &tensors.v, &tensors.out,
+            &tensors.q_norm, &tensors.k_norm, &tensors.index_q, &tensors.index_k,
+            &tensors.index_q_norm, &tensors.index_k_norm}) request.resources.push_back(
+            {tensor->runtime->address, tensor->runtime->bytes, tensor->runtime->allocation_generation,
+             tensor->manifest->ggml_type == 0 ? 4U : 2U});
+        (void)prepare_graph_operator_control(request);
+        hipLaunchKernelGGL(validate_indexed_graph_control, dim3(1), dim3(kThreads), 0,
+            hip_execution_stream(), dynamic_position,
+            reinterpret_cast<const std::uint16_t*>(input.address), hidden);
+        check_hip(hipGetLastError(), "HIP indexed-attention device control validation");
+    }
+
     // Indexer projections. Outputs are rounded to BF16 values represented in
     // FP32 workspace so subsequent FP32 normalization starts from model dtype.
     launch_linear_to_float(
@@ -2208,23 +2344,24 @@ void launch_indexed_attention(
         (index_dim +
          kThreads - 1U) /
         kThreads;
+    validate_graph_values(workspace.current_index_key, index_dim);
     hipLaunchKernelGGL(
         store_raw_index_key_kernel,
         dim3(raw_blocks),
         dim3(kThreads),
-        0, 0,
+        0, hip_execution_stream(),
         workspace.current_index_key,
         reinterpret_cast<
             std::uint16_t*>(
                 raw_state.address),
         index_dim,
-        context.position);
+        context.position, dynamic_position);
     check_hip(
         hipGetLastError(),
         "HIP indexed-attention raw-index state update");
 
     const auto visible64 =
-        context.position + 1ULL;
+        device_graph ? session_layout.context_tokens : context.position + 1ULL;
     if (visible64 >
         std::numeric_limits<
             std::uint32_t>::max()) {
@@ -2254,7 +2391,7 @@ void launch_indexed_attention(
         visible -
         complete_blocks *
             ratio;
-    const auto selected_count =
+    const auto selected_count = device_graph ? checked_u32(workspace_layout.maximum_selected_tokens, "maximum_selected_tokens") :
         selected_blocks *
             ratio +
         tail;
@@ -2267,7 +2404,8 @@ void launch_indexed_attention(
             "indexed-attention selected-token count exceeds workspace");
     }
 
-    if (complete_blocks <=
+    const GraphSelectionArguments dynamic_selection{dynamic_position, ratio, block_topk};
+    if (!device_graph && complete_blocks <=
         block_topk) {
         const auto blocks =
             (visible +
@@ -2277,7 +2415,7 @@ void launch_indexed_attention(
             fill_visible_indices_kernel,
             dim3(blocks),
             dim3(kThreads),
-            0, 0,
+            0, hip_execution_stream(),
             workspace.selected_indices,
             visible);
         check_hip(
@@ -2289,18 +2427,18 @@ void launch_indexed_attention(
             raw_state,
             tensors.index_k_norm,
             model,
-            complete_blocks);
+            std::max(complete_blocks, 1U), dynamic_selection);
         hipLaunchKernelGGL(
             select_blocks_kernel,
             dim3(1),
             dim3(1),
-            0, 0,
+            0, hip_execution_stream(),
             workspace.block_scores,
             complete_blocks,
             block_topk,
             ratio,
             visible,
-            workspace.selected_indices);
+            workspace.selected_indices, dynamic_selection);
         check_hip(
             hipGetLastError(),
             "HIP indexed-attention top-k block selection");
@@ -2347,18 +2485,19 @@ void launch_indexed_attention(
         (kv_width +
          kThreads - 1U) /
         kThreads;
+    validate_graph_values(workspace.current_v, kv_width);
     hipLaunchKernelGGL(
         store_kv_kernel,
         dim3(kv_blocks),
         dim3(kThreads),
-        0, 0,
+        0, hip_execution_stream(),
         workspace.current_k,
         workspace.current_v,
         reinterpret_cast<
             std::uint16_t*>(
                 kv_state.address),
         kv_width,
-        context.position, GraphPositionKernelArguments{});
+        context.position, dynamic_position);
     check_hip(
         hipGetLastError(),
         "HIP indexed-attention KV state update");
@@ -2379,7 +2518,7 @@ void launch_indexed_attention(
             static_cast<std::uint32_t>(
                 score_blocks64)),
         dim3(kThreads),
-        0, 0,
+        0, hip_execution_stream(),
         workspace.q_gate,
         reinterpret_cast<
             const std::uint16_t*>(
@@ -2393,7 +2532,7 @@ void launch_indexed_attention(
         attention_heads,
         kv_heads,
         head_dim,
-        workspace.attention_scores);
+        workspace.attention_scores, dynamic_selection);
     check_hip(
         hipGetLastError(),
         "HIP indexed-attention score launch");
@@ -2402,13 +2541,13 @@ void launch_indexed_attention(
         attention_softmax_kernel,
         dim3(attention_heads),
         dim3(kThreads),
-        0, 0,
+        0, hip_execution_stream(),
         workspace.attention_scores,
         selected_count,
         checked_u32(
             workspace_layout.
                 maximum_selected_tokens,
-            "maximum_selected_tokens"));
+            "maximum_selected_tokens"), dynamic_selection);
     check_hip(
         hipGetLastError(),
         "HIP indexed-attention softmax launch");
@@ -2417,7 +2556,7 @@ void launch_indexed_attention(
         attention_output_kernel,
         dim3(attention_heads),
         dim3(head_dim),
-        0, 0,
+        0, hip_execution_stream(),
         workspace.q_gate,
         reinterpret_cast<
             const std::uint16_t*>(
@@ -2432,7 +2571,7 @@ void launch_indexed_attention(
         attention_heads,
         kv_heads,
         head_dim,
-        workspace.attention_output);
+        workspace.attention_output, dynamic_selection);
     check_hip(
         hipGetLastError(),
         "HIP indexed-attention value/gate launch");
@@ -2443,6 +2582,12 @@ void launch_indexed_attention(
         attention_width,
         hidden,
         output);
+    if (device_graph) {
+        hipLaunchKernelGGL(validate_indexed_graph_control, dim3(1), dim3(kThreads), 0,
+            hip_execution_stream(), dynamic_position,
+            reinterpret_cast<const std::uint16_t*>(output.address), hidden);
+        check_hip(hipGetLastError(), "HIP indexed-attention finite output validation");
+    }
 }
 
 std::string kernel_id(
@@ -2475,7 +2620,7 @@ std::string kernel_id(
             request.logical_rows) +
         ".c" +
         std::to_string(
-            request.request_concurrency);
+            request.request_concurrency) + (request.device_graph_inputs ? ".device" : ".scalar");
 }
 
 std::uint64_t implementation_identity(
@@ -2519,6 +2664,8 @@ std::uint64_t implementation_identity(
     hash_float(
         hash,
         config.model.rms_norm_epsilon);
+    hash_u64(hash, config.enable_device_graph_inputs);
+    hash_u64(hash, config.model.max_position_embeddings);
     return hash;
 }
 
@@ -2560,6 +2707,10 @@ void register_hip_indexed_attention_kernel_variant(
         request.request_concurrency != 1) {
         throw std::invalid_argument(
             "HIP indexed-attention v1 registers only C1 one-row variants");
+    }
+
+    if (request.device_graph_inputs && (!request.require_graph_safe || !config.enable_device_graph_inputs)) {
+        throw std::invalid_argument("indexed device graph inputs require explicit graph configuration");
     }
 
     // QSA top-k ties remain source-undefined. Keep v1 experimental until a
@@ -2607,7 +2758,7 @@ void register_hip_indexed_attention_kernel_variant(
     variant.numerics.deterministic = true;
     variant.qualification =
         qualification;
-    variant.graph_safe = false;
+    variant.graph_safe = request.device_graph_inputs && config.enable_device_graph_inputs;
     variant.input_layout =
         "row-major+layer-kv+raw-index";
     variant.output_layout =

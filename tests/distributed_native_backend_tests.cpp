@@ -84,6 +84,10 @@ public:
                 events.push_back({
                     {handle,strix::transport::CompletionKind::local_buffer_reusable,item.second},
                     false});
+                if (full_send_events) {
+                    events.push_back({{handle, strix::transport::CompletionKind::remote_transport_ack, item.second}, false});
+                    if (!omit_consumer_event) events.push_back({{handle, strix::transport::CompletionKind::remote_consumer_complete, item.second}, false});
+                }
                 return;
             }
         }
@@ -176,6 +180,8 @@ public:
     int reposts = 0;
     bool fail_receive_prepare = false;
     bool suppress_events = false;
+    bool full_send_events = false;
+    bool omit_consumer_event = false;
     std::optional<strix::transport::GpuCommitRecord> commit_override;
     std::vector<strix::transport::TransferHandle> canceled;
     std::vector<strix::transport::TransferDescriptor> send_descriptors;
@@ -265,6 +271,8 @@ public:
 class Staging final
     : public strix::DistributedBoundaryStagingProvider {
 public:
+    bool full_retirement = false;
+    bool requires_full_send_retirement() const noexcept override { return full_retirement; }
     strix::transport::TransportBufferView stage_outbound(
         const strix::DistributedExecutionBoundary&,
         const strix::DistributedBoundaryTransfer&) override {
@@ -851,6 +859,32 @@ int main() {
         expect(rejected && native0.canceled.size() == 1 && native1.canceled.empty() &&
                    staging2.consumed_indices.empty() && native0.credits == 0,
                "partial RX preparation cancels the earlier prepared slice");
+    }
+
+    {
+        SingleFixture fixture({3, 1});
+        fixture.staging.full_retirement = true;
+        fixture.native.full_send_events = true;
+        fixture.backend.send_boundary(fixture.boundary, transfer(strix::transport::LinkDirection::outbound));
+        const auto& state = fixture.session.send_state(fixture.native.sends.back().first);
+        expect(state.local_buffer_reusable && state.remote_transport_acked && state.remote_consumer_complete && fixture.native.events.empty(),
+               "fixed C1 staging waits through peer ACK and consumer credit on final permitted poll");
+    }
+    {
+        SingleFixture fixture({4, 1});
+        fixture.staging.full_retirement = true;
+        fixture.native.full_send_events = true;
+        fixture.native.omit_consumer_event = true;
+        bool rejected = false;
+        try { fixture.backend.send_boundary(fixture.boundary, transfer(strix::transport::LinkDirection::outbound)); }
+        catch (const std::runtime_error&) { rejected = true; }
+        bool sticky = false;
+        try { fixture.backend.send_boundary(fixture.boundary, transfer(strix::transport::LinkDirection::outbound)); }
+        catch (const std::logic_error&) { sticky = true; }
+        const auto& state = fixture.session.send_state(fixture.native.sends.back().first);
+        expect(rejected && sticky && fixture.native.sends.size() == 1 && state.local_buffer_reusable &&
+                   state.remote_transport_acked && !state.remote_consumer_complete,
+               "local DMA and transport ACK cannot retire a fixed C1 slot without consumer credit");
     }
 
     if (failures == 0) {

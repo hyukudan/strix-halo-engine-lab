@@ -8,19 +8,23 @@ portable fixtures, declarations or offline compilation to native qualification.
 | --- | --- | --- |
 | Memory/model contracts | Checked physical-pool accounting, GGUF metadata, tensor/runtime bindings and admission | Complete canonical checkpoint ownership and observed physical peak |
 | Model execution | Portable semantic oracles, compiled serial runtime seams and experimental HIP implementation | Full-model tensor coverage, logits/tokens/state fidelity on gfx1151 |
-| Low precision | Integer/affine/codebook references, bounded packed staging, row/group activation preparation and shared opt-in Wave32 IU8/IU4 launcher with owned resources and epoch-bound completion | Correct native fragment layout, preparation-inclusive projection costs, full-model integration and model-quality gates |
+| Low precision | Integer/affine/codebook references, bounded packed staging, opt-in Wave32 IU8/IU4 launcher and actual tiled LM-head runtime adapter with exact IEEE widening and atomic full-output publication | Native fragment correctness, preparation-inclusive projection costs and full-model quality; integer LM-head is eager C1 only |
 | Instruction emission | Local ROCm 7.2.4 emitted Wave32 IU8/IU4 for gfx1151; artifacts retained privately | Native execution correctness, achieved throughput and complete-workload benefit |
-| Distributed boundary transport | Logical/physical identity separation, epoch-bound replay history, explicit consumer completion, RX quarantine and v2 control envelope | Concrete importer/event backend, GPU visibility, consumer drain and fresh-epoch recovery |
+| Distributed boundary transport | Exact identity/replay contracts, concrete Linux importer/event provider, GPU packing/full-payload acquire/unpacking, typed consumer completion and dedicated v2 control | Actual exporter/controller compatibility, external-DMA visibility, peer lifecycle and model continuity; first provider is serialized C1 |
 | Platform/link discovery | Linux/sysfs discovery and bounded CPU baseline tooling | Two-peer ABI, port/router mapping, negotiated links and physical independence |
-| Character-device control/payload | Owned POSIX nonblocking FD, bounded framing, v2 control and dedicated C1 host-copy tensor payload with typed completion, replay and fault regressions | Actual configured two-peer stream/control behavior, throughput and model continuity; GPU DMA remains unavailable |
-| Native interface preflight | Exact identities plus bounded driver adapter with import/quiescence ownership, operation-bound visibility/event proofs and same-epoch sequence history | Real driver syscall/GPU provider, native capability query and trusted target evidence; default provider is unavailable |
+| Character-device control/payload | Owned POSIX FD, bounded framing, v2 control and C1 host-copy payload; separate actual opt-in DMA-BUF kernel extension with strict enabled-object compilation | Configured two-peer behavior, throughput and model continuity; no module load or physical DMA execution yet |
+| Native interface preflight | Explicit experimental UAPI, concrete syscall/HIP providers, uncached allocator, guarded imports, operation-bound event proofs and same-epoch sequence history | Independent exact-binding target evidence and real driver/GPU visibility/drain observations; default provider remains unavailable |
 | Real two-node model | Portable placement and control contracts | State continuity, numerical replay, failure containment and single/two-link measurements |
 | Prefix lineage | Actual serial completion history, complete chunk/row provenance, mismatch cache misses and failure taint | Qualified chunked-prefill/verify histories and native fresh/resumed state correspondence |
-| Graph eligibility | Current bindings/generations/residency, bounded token/position ABI, experimental embedding gather and device-position norm/RoPE/KV stage with checked memory and failure status | Existing whole-model eager plans remain ineligible; remaining dynamic operators, whole-model capture/replay and actual graph-memory measurement |
+| Graph eligibility | Separate fixed C1 graph topology, complete device-input embedding/PLE/GDN/indexed attention, owned capture/replay lifecycle and whole-DAG native fixtures compiled offline | Full-model native logits/state fidelity, actual graph memory and preparation-inclusive latency; eager plans remain distinct |
 | Host staging | Event-owned source pool and opt-in HIP PLE consumer, bounded bytes/progress, stale ticket/binding rejection and retained failure ownership | Native event/visibility/lifetime proof and preparation-inclusive benefit; destination lifetime is caller-owned |
 | Projection reduction | Fixed-tree shuffle-tail candidate, host sensitivity controls and experimental operator HIP graph replay | Native exact fixtures and end-to-end quality/performance; no measured gain yet |
 
-The latest completed strict Release integration passed 126 portable CTest entries.
+The latest completed strict Release integration passed 134 portable CTest entries.
+The final source also passed 17 selected ASan/UBSan checks with leak detection and
+five HIP host-contract tests. The complete gfx1151 HIP build and the enabled Linux
+driver object compiled offline; the serial graph fixture validated its host
+contracts without GPU work. Compiler artifacts and detailed receipts remain private.
 This does not establish native GPU execution or DMA. The transport interfaces require
 one serialized progress owner. Completion budgets count polls, not elapsed time.
 Retained lease-registry history has no reclamation mechanism; replacement requires

@@ -5,6 +5,7 @@
 #include "strix/execution_resources.hpp"
 #include "strix/execution_tensor_access.hpp"
 #include "strix/hip_indexed_attention_launcher.hpp"
+#include "strix/hip_launch_context.hpp"
 #include "strix/indexed_attention_state.hpp"
 #include "strix/model_contract.hpp"
 #include "strix/model_manifest.hpp"
@@ -15,6 +16,8 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <array>
+#include <limits>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -190,6 +193,9 @@ int main() try {
     model.attention_heads = 2;
     model.kv_heads = 1;
     model.indexer_n_heads = 2;
+    model.indexer_budget = 2;
+    model.indexer_compress_ratio = 2;
+    model.max_position_embeddings = 8;
 
     expect(
         model.validate().empty(),
@@ -615,7 +621,7 @@ int main() try {
     const auto state_contract =
         strix::build_indexed_attention_state_layout(
             model);
-    constexpr std::uint64_t context_tokens = 4;
+    constexpr std::uint64_t context_tokens = 8;
     const auto kv_bytes =
         context_tokens *
         state_contract.kv_row_bytes;
@@ -824,6 +830,113 @@ int main() try {
     expect(
         raw_error <= 2e-3F,
         "indexed attention persists raw index key before norm/RoPE");
+
+
+    // Capture every indexed-attention kernel, then replay across partial-tail,
+    // full-visible and top-k boundaries without changing the graph topology.
+    {
+        auto graph_config = config;
+        graph_config.enable_device_graph_inputs = true;
+        auto graph_launcher = strix::make_hip_indexed_attention_launcher("test.indexed.device", &graph_config);
+        expect(graph_launcher.implementation_identity != launcher.implementation_identity,
+            "indexed device-input capability is bound to launcher identity");
+        struct GraphHandles {
+            hipStream_t stream = nullptr;
+            hipGraph_t graph = nullptr;
+            hipGraphExec_t executable = nullptr;
+            void* arguments = nullptr;
+            void* status = nullptr;
+            ~GraphHandles() {
+                if (stream && hipStreamQuery(stream) != hipSuccess) return;
+                if (executable) static_cast<void>(hipGraphExecDestroy(executable));
+                if (graph) static_cast<void>(hipGraphDestroy(graph));
+                if (arguments) static_cast<void>(hipFree(arguments));
+                if (status) static_cast<void>(hipFree(status));
+                if (stream) static_cast<void>(hipStreamDestroy(stream));
+            }
+        } graph;
+        check(hipStreamCreateWithFlags(&graph.stream, hipStreamNonBlocking), "create indexed graph stream");
+        check(hipMalloc(&graph.arguments, 16), "allocate indexed arguments");
+        check(hipMalloc(&graph.status, 4), "allocate indexed status");
+        context.execution_identity = scratch.execution_identity;
+        context.position = std::numeric_limits<std::uint64_t>::max();
+        strix::HipLaunchContext scope;
+        scope.stream = graph.stream; scope.graph_capture = true;
+        scope.arguments = strix::bind_graph_inputs(strix::graph_input_layout(1),
+            {scratch.execution_identity, reinterpret_cast<std::uintptr_t>(graph.arguments), 16, 1});
+        scope.status = {scratch.execution_identity, reinterpret_cast<std::uintptr_t>(graph.status), 4, 1};
+        scope.context_tokens = context_tokens;
+        scope.vocabulary_size = static_cast<std::uint32_t>(model.vocab_size);
+        check(hipStreamBeginCapture(graph.stream, hipStreamCaptureModeThreadLocal), "capture complete indexed attention");
+        try {
+            const strix::HipLaunchScope owned(scope);
+            graph_launcher.function(context, graph_launcher.user_data);
+        } catch (...) { static_cast<void>(hipStreamEndCapture(graph.stream, &graph.graph)); throw; }
+        check(hipStreamEndCapture(graph.stream, &graph.graph), "finish indexed capture");
+        check(hipGraphInstantiate(&graph.executable, graph.graph, nullptr, nullptr, 0), "instantiate indexed graph");
+        auto set_state = [&](const std::vector<std::uint16_t>& state) {
+            check(hipMemcpy(device_state, state.data(), state_layout.device_total_bytes, hipMemcpyHostToDevice), "set indexed graph state");
+        };
+        auto read_state = [&]() {
+            std::vector<std::uint16_t> state(state_layout.device_total_bytes / 2);
+            check(hipMemcpy(state.data(), device_state, state_layout.device_total_bytes, hipMemcpyDeviceToHost), "read indexed graph state");
+            return state;
+        };
+        auto control = [&](std::uint64_t position, std::uint32_t status) {
+            std::array<std::byte, 16> packet{};
+            std::memcpy(packet.data() + 8, &position, 8);
+            check(hipMemcpy(graph.arguments, packet.data(), 16, hipMemcpyHostToDevice), "set indexed device position");
+            check(hipMemcpy(graph.status, &status, 4, hipMemcpyHostToDevice), "set indexed sticky status");
+        };
+        auto replay = [&]() {
+            check(hipGraphLaunch(graph.executable, graph.stream), "replay complete indexed attention");
+            check(hipStreamSynchronize(graph.stream), "complete indexed graph");
+        };
+        auto read_status = [&]() {
+            std::uint32_t result = 0;
+            check(hipMemcpy(&result, graph.status, 4, hipMemcpyDeviceToHost), "read indexed status");
+            return result;
+        };
+        std::vector<std::uint16_t> previous(state_layout.device_total_bytes / 2, 0), prior_output;
+        set_state(previous);
+        bool changed_output = false;
+        for (std::uint64_t position = 0; position < context_tokens; ++position) {
+            for (unsigned i = 0; i < hidden.size(); ++i) hidden[i] = float_to_bf16(
+                static_cast<float>(static_cast<int>((i + position * 3U) % 19U) - 9) / 23.0F);
+            check(hipMemcpy(reinterpret_cast<void*>(input.address), hidden.data(), hidden.size() * 2, hipMemcpyHostToDevice), "change indexed graph input");
+            context.position = std::numeric_limits<std::uint64_t>::max();
+            control(position, 0); replay();
+            expect(read_status() == 0, "valid complete indexed graph status");
+            const auto current = read_state();
+            std::vector<std::uint16_t> graph_output(hidden_width), eager_output(hidden_width);
+            check(hipMemcpy(graph_output.data(), reinterpret_cast<void*>(output.address), hidden_width * 2, hipMemcpyDeviceToHost), "read indexed graph output");
+            set_state(previous);
+            context.position = position;
+            auto eager_scope = scope; eager_scope.graph_capture = false;
+            { const strix::HipLaunchScope owned(eager_scope); graph_launcher.function(context, graph_launcher.user_data); }
+            check(hipStreamSynchronize(graph.stream), "complete indexed eager control");
+            check(hipMemcpy(eager_output.data(), reinterpret_cast<void*>(output.address), hidden_width * 2, hipMemcpyDeviceToHost), "read indexed eager output");
+            expect(current == read_state() && graph_output == eager_output,
+                "indexed graph exactly matches eager output/KV/raw-index across selection boundaries");
+            for (const auto value : graph_output) expect(std::isfinite(bf16_to_float(value)), "finite indexed replay output");
+            if (!prior_output.empty() && graph_output != prior_output) changed_output = true;
+            prior_output = graph_output;
+            previous = current; set_state(previous);
+        }
+        expect(changed_output, "indexed replay fixture is sensitive to changing input/state");
+        context.position = std::numeric_limits<std::uint64_t>::max();
+        for (const auto position : {context_tokens, std::uint64_t{1} << 32U, std::numeric_limits<std::uint64_t>::max()}) {
+            control(position, 0); replay();
+            expect(read_status() == 2 && read_state() == previous,
+                "invalid indexed device position preserves entire KV/raw-index state");
+        }
+        control(0, 1); replay();
+        expect(read_status() == 1 && read_state() == previous, "indexed upstream status stays sticky without state mutation");
+        hidden[0] = 0x7f80;
+        check(hipMemcpy(reinterpret_cast<void*>(input.address), hidden.data(), hidden.size() * 2, hipMemcpyHostToDevice), "set nonfinite indexed input");
+        control(0, 0); replay();
+        expect(read_status() == 4 && read_state() == previous, "nonfinite indexed input fails before state writes");
+    }
 
     for (auto* pointer :
          device_weights) {

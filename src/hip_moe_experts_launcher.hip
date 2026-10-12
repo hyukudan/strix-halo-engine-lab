@@ -1,3 +1,4 @@
+#include "strix/hip_launch_context.hpp"
 #include "strix/hip_moe_experts_launcher.hpp"
 
 #include "strix/dispatch_resources.hpp"
@@ -672,7 +673,7 @@ void launch_projection_by_kind(
     std::uint32_t output_width,
     std::uint32_t experts,
     float* output) {
-#define STRIX_PROJECT_CASE(kind_name)     hipLaunchKernelGGL(         HIP_KERNEL_NAME(             selected_projection_kernel<                 Input, WeightKind::kind_name>),         dim3(output_width), dim3(kThreads), 0, 0,         input, routes, slot,         reinterpret_cast<const void*>(weights.address),         input_width, output_width, experts, output)
+#define STRIX_PROJECT_CASE(kind_name)     hipLaunchKernelGGL(         HIP_KERNEL_NAME(             selected_projection_kernel<                 Input, WeightKind::kind_name>),         dim3(output_width), dim3(kThreads), 0, hip_execution_stream(),         input, routes, slot,         reinterpret_cast<const void*>(weights.address),         input_width, output_width, experts, output)
     switch (kind) {
     case WeightKind::f32: STRIX_PROJECT_CASE(f32); break;
     case WeightKind::f16: STRIX_PROJECT_CASE(f16); break;
@@ -698,7 +699,7 @@ void launch_down_by_kind(
     std::uint32_t hidden_size,
     std::uint32_t experts,
     Output* output) {
-#define STRIX_DOWN_CASE(kind_name)     hipLaunchKernelGGL(         HIP_KERNEL_NAME(             selected_down_accumulate_kernel<                 Output, WeightKind::kind_name>),         dim3(hidden_size), dim3(kThreads), 0, 0,         intermediate, routes, route_weights, slot,         reinterpret_cast<const void*>(weights.address),         intermediate_size, hidden_size, experts, output)
+#define STRIX_DOWN_CASE(kind_name)     hipLaunchKernelGGL(         HIP_KERNEL_NAME(             selected_down_accumulate_kernel<                 Output, WeightKind::kind_name>),         dim3(hidden_size), dim3(kThreads), 0, hip_execution_stream(),         intermediate, routes, route_weights, slot,         reinterpret_cast<const void*>(weights.address),         intermediate_size, hidden_size, experts, output)
     switch (kind) {
     case WeightKind::f32: STRIX_DOWN_CASE(f32); break;
     case WeightKind::f16: STRIX_DOWN_CASE(f16); break;
@@ -735,12 +736,12 @@ void launch_typed(
             temporary.address);
 
     check_hip(
-        hipMemset(
+        hipMemsetAsync(
             reinterpret_cast<void*>(
                 output.address),
             0,
             static_cast<std::size_t>(
-                output.bytes)),
+                output.bytes), hip_execution_stream()),
         "clear routed-expert output");
 
     for (std::uint32_t slot = 0;
@@ -796,7 +797,7 @@ void launch_typed(
             routed_activation_kernel,
             dim3(blocks),
             dim3(kThreads),
-            0, 0,
+            0, hip_execution_stream(),
             workspace,
             config.intermediate_size);
         check_hip(

@@ -467,6 +467,22 @@ int main() {
     expect(sparse_rejected,
            "missing sparse state is rejected before compiled dispatch");
 
+    auto graph_request = binding_request;
+    graph_request.require_graph_safe = true;
+    graph_request.device_graph_inputs = true;
+    const auto graph_registry = make_registry(model, graph_request);
+    const auto graph_compiled = strix::compile_serial_execution(model, graph_registry, graph_request, buffer_request);
+    expect(graph_compiled.whole_plan_graph_safe && graph_compiled.device_graph_inputs &&
+               graph_compiled.dynamic_steps == 0 && graph_compiled.non_graph_safe_steps == 0,
+           "explicit device-input topology requires graph-safe kernels and fixes maximum launch shapes");
+    expect(graph_compiled.execution_identity != compiled.execution_identity,
+           "device-input graph cannot reuse eager execution identity");
+    graph_request.require_graph_safe = false;
+    bool graph_policy_rejected = false;
+    try { static_cast<void>(strix::compile_serial_execution(model, graph_registry, graph_request, buffer_request)); }
+    catch (const std::invalid_argument&) { graph_policy_rejected = true; }
+    expect(graph_policy_rejected, "device-input topology cannot bypass graph-safe kernel selection");
+
     if (failures == 0) {
         std::cout << "compiled execution tests passed\n";
     }

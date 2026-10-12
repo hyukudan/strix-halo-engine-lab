@@ -15,6 +15,7 @@ struct HipIndexedAttentionLauncherConfig {
         ModelContract::qwen38_flash_next();
     HipActivationStorage activation =
         HipActivationStorage::bf16;
+    bool enable_device_graph_inputs = false;
 };
 
 // Experimental post-projection C1 norm/RoPE/KV stage. Async on caller's

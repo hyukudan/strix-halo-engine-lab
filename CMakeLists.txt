@@ -24,11 +24,17 @@ add_library(strix_core STATIC
     src/graph_eligibility.cpp
     src/graph_inputs.cpp
     src/graph_attention_state.cpp
+    src/graph_ple.cpp
+    src/graph_operator_control.cpp
     src/integer_projection.cpp
     src/integer_projection_execution.cpp
+    src/integer_projection_runtime.cpp
     src/host_upload.cpp
     src/compiled_execution.cpp
     src/copied_stream_transport.cpp
+    src/direct_transport_gpu_export.cpp
+    src/direct_gpu_boundary_staging.cpp
+    src/linux_direct_transport_driver.cpp
     src/compiled_mtp_draft_plan.cpp
     src/compiled_speculative_verify.cpp
     src/compiled_speculation_backend.cpp
@@ -187,6 +193,43 @@ strix_target_warnings(strix-audit-execution-tensors)
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(strix-direct-transport-gpu-export-tests tests/direct_transport_gpu_export_tests.cpp)
+    target_link_libraries(strix-direct-transport-gpu-export-tests PRIVATE strix_core)
+    strix_target_warnings(strix-direct-transport-gpu-export-tests)
+    add_test(NAME strix-direct-transport-gpu-export-tests COMMAND strix-direct-transport-gpu-export-tests)
+    add_executable(strix-graph-ple-tests tests/graph_ple_tests.cpp)
+    add_executable(strix-direct-gpu-boundary-staging-tests tests/direct_gpu_boundary_staging_tests.cpp)
+    target_link_libraries(strix-direct-gpu-boundary-staging-tests PRIVATE strix_core)
+    strix_target_warnings(strix-direct-gpu-boundary-staging-tests)
+    add_test(NAME strix-direct-gpu-boundary-staging-tests COMMAND strix-direct-gpu-boundary-staging-tests)
+    target_link_libraries(strix-graph-ple-tests PRIVATE strix_core)
+    strix_target_warnings(strix-graph-ple-tests)
+    add_test(NAME strix-graph-ple-tests COMMAND strix-graph-ple-tests)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        enable_language(C)
+        add_executable(strix-linux-direct-transport-driver-tests tests/linux_direct_transport_driver_tests.cpp)
+        target_link_libraries(strix-linux-direct-transport-driver-tests PRIVATE strix_core)
+        strix_target_warnings(strix-linux-direct-transport-driver-tests)
+        add_test(NAME strix-linux-direct-transport-driver-tests COMMAND strix-linux-direct-transport-driver-tests)
+        add_executable(strix-linux-direct-gpu-stream-logic-tests lab/direct_gpu_stream/kernel/logic_tests.c)
+        target_include_directories(strix-linux-direct-gpu-stream-logic-tests PRIVATE include lab/direct_gpu_stream/kernel)
+        target_compile_features(strix-linux-direct-gpu-stream-logic-tests PRIVATE c_std_11)
+        strix_target_warnings(strix-linux-direct-gpu-stream-logic-tests)
+        add_test(NAME strix-linux-direct-gpu-stream-logic-tests COMMAND strix-linux-direct-gpu-stream-logic-tests)
+        add_executable(strix-linux-direct-gpu-stream-uapi-tests tests/linux_direct_gpu_stream_uapi_tests.cpp)
+        target_include_directories(strix-linux-direct-gpu-stream-uapi-tests PRIVATE include)
+        target_compile_features(strix-linux-direct-gpu-stream-uapi-tests PRIVATE cxx_std_20)
+        strix_target_warnings(strix-linux-direct-gpu-stream-uapi-tests)
+        add_test(NAME strix-linux-direct-gpu-stream-uapi-tests COMMAND strix-linux-direct-gpu-stream-uapi-tests)
+    endif()
+    add_executable(strix-integer-projection-runtime-tests tests/integer_projection_runtime_tests.cpp)
+    target_link_libraries(strix-integer-projection-runtime-tests PRIVATE strix_core)
+    strix_target_warnings(strix-integer-projection-runtime-tests)
+    add_test(NAME strix-integer-projection-runtime-tests COMMAND strix-integer-projection-runtime-tests)
+    add_executable(strix-graph-operator-control-tests tests/graph_operator_control_tests.cpp)
+    target_link_libraries(strix-graph-operator-control-tests PRIVATE strix_core)
+    strix_target_warnings(strix-graph-operator-control-tests)
+    add_test(NAME strix-graph-operator-control-tests COMMAND strix-graph-operator-control-tests)
     add_executable(strix-copied-stream-transport-tests tests/copied_stream_transport_tests.cpp)
     target_link_libraries(strix-copied-stream-transport-tests PRIVATE strix_core)
     strix_target_warnings(strix-copied-stream-transport-tests)
@@ -862,6 +905,12 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         src/hip_gdn_launcher.hip
         src/hip_hyper_mix_launcher.hip
         src/hip_indexed_attention_launcher.hip
+        src/hip_serial_graph.hip
+        src/hip_direct_transport_gpu_export.cpp
+        src/hip_direct_gpu_pool_allocator.cpp
+        src/hip_direct_gpu_stream_gpu.cpp
+        src/hip_integer_projection.hip
+        src/hip_integer_projection_runtime.hip
         src/hip_lm_head_launcher.hip
         src/hip_shared_expert_launcher.hip
     )
@@ -891,6 +940,8 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         "${STRIX_HIP_RUNTIME_LIBRARY}"
     )
     strix_target_warnings(strix_hip_runtime)
+    set_source_files_properties(src/hip_integer_projection.hip src/hip_integer_projection_runtime.hip
+        PROPERTIES COMPILE_OPTIONS "-mno-wavefrontsize64;-ffp-contract=off")
 
     add_executable(
         strix-hip-runtime-allocator
@@ -978,6 +1029,37 @@ if(STRIX_ENABLE_HIP_RUNTIME)
             tests/hip_embedding_launcher_tests.hip
         )
         add_executable(strix-hip-graph-inputs-tests tests/hip_graph_inputs_tests.hip)
+        add_executable(strix-hip-integer-projection-runtime-tests tests/hip_integer_projection_runtime_tests.hip)
+        add_executable(strix-hip-serial-graph-tests tests/hip_serial_graph_tests.hip)
+        set_target_properties(strix-hip-serial-graph-tests PROPERTIES
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+        target_link_libraries(strix-hip-serial-graph-tests PRIVATE strix_hip_runtime)
+        strix_target_warnings(strix-hip-serial-graph-tests)
+        add_test(NAME strix-hip-serial-graph-tests COMMAND strix-hip-serial-graph-tests)
+        set_tests_properties(strix-hip-serial-graph-tests PROPERTIES SKIP_RETURN_CODE 77)
+        set_target_properties(strix-hip-integer-projection-runtime-tests PROPERTIES
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+        target_link_libraries(strix-hip-integer-projection-runtime-tests PRIVATE strix_hip_runtime)
+        target_compile_options(strix-hip-integer-projection-runtime-tests PRIVATE -ffp-contract=off)
+        strix_target_warnings(strix-hip-integer-projection-runtime-tests)
+        add_test(NAME strix-hip-integer-projection-runtime-tests COMMAND strix-hip-integer-projection-runtime-tests)
+        set_tests_properties(strix-hip-integer-projection-runtime-tests PROPERTIES SKIP_RETURN_CODE 77)
+        add_executable(strix-hip-direct-transport-gpu-export-tests tests/hip_direct_transport_gpu_export_tests.cpp)
+        add_executable(strix-hip-direct-gpu-pool-allocator-tests tests/hip_direct_gpu_pool_allocator_tests.cpp)
+        add_executable(strix-hip-direct-gpu-stream-gpu-tests tests/hip_direct_gpu_stream_gpu_tests.cpp)
+        target_link_libraries(strix-hip-direct-gpu-stream-gpu-tests PRIVATE strix_hip_runtime)
+        strix_target_warnings(strix-hip-direct-gpu-stream-gpu-tests)
+        add_test(NAME strix-hip-direct-gpu-stream-gpu-tests COMMAND strix-hip-direct-gpu-stream-gpu-tests)
+        target_link_libraries(strix-hip-direct-gpu-pool-allocator-tests PRIVATE strix_hip_runtime)
+        strix_target_warnings(strix-hip-direct-gpu-pool-allocator-tests)
+        add_test(NAME strix-hip-direct-gpu-pool-allocator-tests COMMAND strix-hip-direct-gpu-pool-allocator-tests)
+        add_executable(strix-hip-launch-context-tests tests/hip_launch_context_tests.cpp)
+        target_link_libraries(strix-hip-launch-context-tests PRIVATE strix_hip_runtime)
+        strix_target_warnings(strix-hip-launch-context-tests)
+        add_test(NAME strix-hip-launch-context-tests COMMAND strix-hip-launch-context-tests)
+        target_link_libraries(strix-hip-direct-transport-gpu-export-tests PRIVATE strix_hip_runtime)
+        strix_target_warnings(strix-hip-direct-transport-gpu-export-tests)
+        add_test(NAME strix-hip-direct-transport-gpu-export-tests COMMAND strix-hip-direct-transport-gpu-export-tests)
         add_executable(strix-hip-graph-attention-state-tests tests/hip_graph_attention_state_tests.hip)
         set_target_properties(strix-hip-graph-attention-state-tests PROPERTIES
             HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)

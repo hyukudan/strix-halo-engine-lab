@@ -8,6 +8,8 @@
 
 namespace strix {
 
+namespace transport { class HipDirectGpuPoolAllocator; }
+
 enum class HipHostAllocationMode {
     pageable_aligned,
     pinned_mapped,
@@ -53,6 +55,9 @@ public:
     }
 
 private:
+    // Dedicated transport allocator reuses geometry, not general allocation
+    // policy or cleanup semantics. Existing runtime defaults stay unchanged.
+    friend class transport::HipDirectGpuPoolAllocator;
     struct BackingAllocation {
         std::uintptr_t raw_address = 0;
         std::uint64_t raw_bytes = 0;

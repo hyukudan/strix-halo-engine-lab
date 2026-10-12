@@ -264,14 +264,18 @@ void NativeDistributedBackend::wait_send_reusable(
             throw std::runtime_error(
                 "native distributed send failed");
         }
-        if (state.local_buffer_reusable) {
+        if (state.local_buffer_reusable &&
+            (!staging_->requires_full_send_retirement() ||
+             (state.remote_transport_acked && state.remote_consumer_complete))) {
             return;
         }
         static_cast<void>(
             session.poll_event());
     }
     const auto& final = session.send_state(handle);
-    if (!final.failed && final.local_buffer_reusable) {
+    if (!final.failed && final.local_buffer_reusable &&
+        (!staging_->requires_full_send_retirement() ||
+         (final.remote_transport_acked && final.remote_consumer_complete))) {
         return;
     }
     throw std::runtime_error(

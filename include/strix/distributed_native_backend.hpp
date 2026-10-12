@@ -56,6 +56,10 @@ class DistributedBoundaryStagingProvider {
 public:
     virtual ~DistributedBoundaryStagingProvider() = default;
 
+    // Fixed C1 staging slots may remain owned until peer ACK and consumer
+    // credit retire the transport operation, even after local DMA completion.
+    [[nodiscard]] virtual bool requires_full_send_retirement() const noexcept { return false; }
+
     [[nodiscard]] virtual transport::TransportBufferView
     stage_outbound(
         const DistributedExecutionBoundary& boundary,

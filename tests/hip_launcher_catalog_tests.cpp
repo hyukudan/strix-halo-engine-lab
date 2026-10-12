@@ -20,6 +20,7 @@
 #include <map>
 #include <set>
 #include <string>
+#include <stdexcept>
 
 namespace {
 
@@ -296,26 +297,31 @@ int main() {
         ++missing_by_op[missing.op];
     }
 
+    const auto missing_count = [&](strix::SerialOp op) {
+        const auto found = missing_by_op.find(op);
+        return found == missing_by_op.end() ? 0U : found->second;
+    };
+
     expect(
         coverage.missing_steps == 0,
         "catalog covers every serial execution step");
     expect(
-        missing_by_op[strix::SerialOp::ple] == 0,
+        missing_count(strix::SerialOp::ple) == 0,
         "PLE launcher is covered");
     expect(
-        missing_by_op[strix::SerialOp::gated_delta_net] == 0,
+        missing_count(strix::SerialOp::gated_delta_net) == 0,
         "GDN launcher is covered");
     expect(
-        missing_by_op[strix::SerialOp::indexed_attention] == 0,
+        missing_count(strix::SerialOp::indexed_attention) == 0,
         "indexed-attention launcher is covered");
     expect(
-        missing_by_op[strix::SerialOp::moe_experts] == 0,
+        missing_count(strix::SerialOp::moe_experts) == 0,
         "routed-expert launcher is covered");
     expect(
-        missing_by_op[strix::SerialOp::shared_expert] == 0,
+        missing_count(strix::SerialOp::shared_expert) == 0,
         "shared-expert launcher is covered");
     expect(
-        missing_by_op[strix::SerialOp::lm_head] == 0,
+        missing_count(strix::SerialOp::lm_head) == 0,
         "LM-head launcher is covered");
     expect(
         missing_by_op.empty(),
@@ -326,6 +332,29 @@ int main() {
                 coverage.missing_steps ==
             execution.steps.size(),
         "launcher coverage partitions the full serial DAG");
+
+    {
+        auto graph_request = request;
+        graph_request.require_graph_safe = true;
+        graph_request.device_graph_inputs = true;
+        strix::HipLauncherCatalogConfig graph_config;
+        graph_config.enable_device_graph_inputs = true;
+        strix::kernels::KernelRegistry graph_kernels;
+        strix::register_complete_hip_kernel_catalog(model, graph_request, graph_config, graph_kernels);
+        strix::ExecutionBufferRequest buffers;
+        const auto graph_compiled = strix::compile_serial_execution(model, graph_kernels, graph_request, buffers);
+        expect(graph_compiled.whole_plan_graph_safe && graph_compiled.dynamic_steps == 0,
+               "actual device-input catalog binds a complete fixed-shape graph DAG");
+        strix::HipLauncherCatalog graph_catalog(model, graph_config);
+        strix::ExecutionLauncherRegistry graph_launchers;
+        graph_catalog.register_for_compiled_execution(graph_compiled, graph_launchers);
+        expect(graph_catalog.audit(graph_compiled, graph_launchers).missing_steps == 0,
+               "graph catalog contains every actual operator and device-position bookkeeping consumer");
+        bool mismatch_rejected = false;
+        try { strix::ExecutionLauncherRegistry bad; catalog.register_for_compiled_execution(graph_compiled, bad); }
+        catch (const std::invalid_argument&) { mismatch_rejected = true; }
+        expect(mismatch_rejected, "eager catalog cannot label its launchers as a device-input graph");
+    }
 
     if (failures == 0) {
         std::cout

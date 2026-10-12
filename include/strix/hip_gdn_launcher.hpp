@@ -15,6 +15,7 @@ struct HipGdnLauncherConfig {
         ModelContract::qwen38_flash_next();
     HipActivationStorage activation =
         HipActivationStorage::bf16;
+    bool enable_device_graph_inputs = false;
 };
 
 void register_hip_gdn_kernel_variant(

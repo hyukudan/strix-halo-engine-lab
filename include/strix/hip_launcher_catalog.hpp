@@ -12,25 +12,30 @@
 #include "strix/hip_runtime_launchers.hpp"
 #include "strix/launch_dispatch.hpp"
 #include "strix/model_contract.hpp"
+#include <memory>
 
 namespace strix {
+namespace integer_projection { struct RuntimeConfig; class HipIntegerProjectionRuntimeBundle; }
 
 struct HipLauncherCatalogConfig {
     HipActivationStorage activation =
         HipActivationStorage::bf16;
+    bool enable_device_graph_inputs = false;
 };
 
 void register_complete_hip_kernel_catalog(
     const ModelContract& model,
     const ExecutionBindingRequest& request,
     HipLauncherCatalogConfig config,
-    kernels::KernelRegistry& registry);
+    kernels::KernelRegistry& registry,
+    const integer_projection::RuntimeConfig* alternate_lm_head = nullptr);
 
 class HipLauncherCatalog {
 public:
     HipLauncherCatalog(
         const ModelContract& model,
-        HipLauncherCatalogConfig config = {});
+        HipLauncherCatalogConfig config = {},
+        std::shared_ptr<integer_projection::HipIntegerProjectionRuntimeBundle> alternate_lm_head = {});
 
     HipLauncherCatalog(
         const HipLauncherCatalog&) = delete;
@@ -50,6 +55,8 @@ public:
         const ExecutionLauncherRegistry& registry) const;
 
 private:
+    bool device_graph_inputs_ = false;
+    std::shared_ptr<integer_projection::HipIntegerProjectionRuntimeBundle> alternate_lm_head_;
     HipElementwiseLauncherBundle elementwise_;
     HipPleLauncherBundle ple_;
     HipGdnLauncherBundle gdn_;

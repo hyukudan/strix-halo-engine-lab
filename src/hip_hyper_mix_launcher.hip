@@ -1,3 +1,4 @@
+#include "strix/hip_launch_context.hpp"
 #include "strix/hip_hyper_mix_launcher.hpp"
 
 #include "strix/dispatch_resources.hpp"
@@ -736,7 +737,7 @@ void launch_typed(
         dim3(context.logical_rows),
         dim3(kThreads),
         0,
-        0,
+        hip_execution_stream(),
         reinterpret_cast<
             const Storage*>(
                 input.address),

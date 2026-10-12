@@ -1,3 +1,4 @@
+#include "strix/hip_launch_context.hpp"
 #include "strix/hip_shared_expert_launcher.hpp"
 
 #include "strix/dispatch_resources.hpp"
@@ -740,7 +741,7 @@ void launch_projection_by_kind(
     std::uint32_t input_width,
     std::uint32_t output_width,
     float* output) {
-#define STRIX_LAUNCH_CASE(kind_name)     hipLaunchKernelGGL(         HIP_KERNEL_NAME(             projection_to_fp32_kernel<                 Input, WeightKind::kind_name>),         dim3(output_width),         dim3(kThreads),         0, 0,         input,         reinterpret_cast<const void*>(weights.address),         input_width,         output_width,         output)
+#define STRIX_LAUNCH_CASE(kind_name)     hipLaunchKernelGGL(         HIP_KERNEL_NAME(             projection_to_fp32_kernel<                 Input, WeightKind::kind_name>),         dim3(output_width),         dim3(kThreads),         0, hip_execution_stream(),         input,         reinterpret_cast<const void*>(weights.address),         input_width,         output_width,         output)
     switch (kind) {
     case WeightKind::f32: STRIX_LAUNCH_CASE(f32); break;
     case WeightKind::f16: STRIX_LAUNCH_CASE(f16); break;
@@ -762,7 +763,7 @@ void launch_scalar_by_kind(
     const RuntimeTensorBinding& weights,
     std::uint32_t input_width,
     float* output) {
-#define STRIX_SCALAR_CASE(kind_name)     hipLaunchKernelGGL(         HIP_KERNEL_NAME(             scalar_projection_kernel<                 Input, WeightKind::kind_name>),         dim3(1), dim3(kThreads), 0, 0,         input,         reinterpret_cast<const void*>(weights.address),         input_width, output)
+#define STRIX_SCALAR_CASE(kind_name)     hipLaunchKernelGGL(         HIP_KERNEL_NAME(             scalar_projection_kernel<                 Input, WeightKind::kind_name>),         dim3(1), dim3(kThreads), 0, hip_execution_stream(),         input,         reinterpret_cast<const void*>(weights.address),         input_width, output)
     switch (kind) {
     case WeightKind::f32: STRIX_SCALAR_CASE(f32); break;
     case WeightKind::f16: STRIX_SCALAR_CASE(f16); break;
@@ -786,7 +787,7 @@ void launch_down_by_kind(
     std::uint32_t intermediate_size,
     std::uint32_t hidden_size,
     Output* output) {
-#define STRIX_DOWN_CASE(kind_name)     hipLaunchKernelGGL(         HIP_KERNEL_NAME(             down_projection_kernel<                 Output, WeightKind::kind_name>),         dim3(hidden_size),         dim3(kThreads),         0, 0,         intermediate,         shared_gate,         reinterpret_cast<const void*>(weights.address),         intermediate_size,         hidden_size,         output)
+#define STRIX_DOWN_CASE(kind_name)     hipLaunchKernelGGL(         HIP_KERNEL_NAME(             down_projection_kernel<                 Output, WeightKind::kind_name>),         dim3(hidden_size),         dim3(kThreads),         0, hip_execution_stream(),         intermediate,         shared_gate,         reinterpret_cast<const void*>(weights.address),         intermediate_size,         hidden_size,         output)
     switch (kind) {
     case WeightKind::f32: STRIX_DOWN_CASE(f32); break;
     case WeightKind::f16: STRIX_DOWN_CASE(f16); break;
@@ -851,7 +852,7 @@ void launch_typed(
         gated_activation_kernel,
         dim3(blocks),
         dim3(kThreads),
-        0, 0,
+        0, hip_execution_stream(),
         workspace,
         config.intermediate_size);
     check_hip(

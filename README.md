@@ -20,11 +20,15 @@ Current experimental pieces include:
 - experimental HIP launchers covering the serial DAG;
 - shared opt-in integer projection launcher with owned allocations and epoch-bound completion;
 - experimental device-position norm/RoPE/KV stage for graph replay;
+- opt-in complete C1 device-input graph capture/replay with session commit and failure containment;
+- tiled experimental integer LM-head connected to the compiled eager dispatcher;
 - raw-token decode tooling that can materialize logits from a GGUF once native target qualification is available;
 - greedy speculative target verification and snapshot/replay infrastructure;
 - USB4 transport abstractions, TCP/direct-stream baselines and dual-link scheduling;
 - bounded C1 host-copy tensor payload and distributed boundary adapter, tested with socketpairs;
 - an experimental architecture for GPU-owned DMA-BUF USB4 transport with explicit commit/consumer-credit/RX-repost semantics.
+- concrete HIP DMA-BUF export and uncached pool ownership;
+- an opt-in Linux DMA-BUF driver extension, userspace provider and GPU boundary packing with separate commit/consumer/repost proofs, compiled and software-tested.
 
 Native `gfx1151` qualification remains mandatory before any HIP or direct-transport path is promoted.
 

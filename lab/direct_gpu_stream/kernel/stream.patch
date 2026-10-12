@@ -1,0 +1,798 @@
+--- a/drivers/thunderbolt/stream.c
++++ b/drivers/thunderbolt/stream.c
+@@ -1,42 +1,47 @@
+ // SPDX-License-Identifier: GPL-2.0
+ /*
+  * Stream data over Thunderbolt/USB4 cable
+  *
+  * Copyright (C) 2026, Intel Corporation
+  * Authors: Alan Borzeszkowski <alan.borzeszkowski@linux.intel.com>
+  *	    Mika Westerberg <mika.westerberg@linux.intel.com>
+  */
+ 
+ #define pr_fmt(fmt) "tbstream: " fmt
+ 
+ #include <linux/delay.h>
+ #include <linux/configfs.h>
++#include <linux/compat.h>
+ #include <linux/file.h>
+ #include <linux/fs.h>
+ #include <linux/idr.h>
+ #include <linux/ktime.h>
+ #include <linux/miscdevice.h>
+ #include <linux/module.h>
+ #include <linux/mutex.h>
+ #include <linux/poll.h>
+ #include <linux/sizes.h>
+ #include <linux/thunderbolt.h>
+ #include <linux/uaccess.h>
+ #include <linux/uio.h>
+ #include <linux/uuid.h>
+ #include <linux/wait.h>
++
++#if IS_ENABLED(CONFIG_USB4_GPU_STREAM)
++#include "gpu_stream.h"
++#endif
+ 
+ /*
+  * USB4STREAM - Stream data directly over Thunderbolt/USB4 cable
+  *
+  * HopIDs are configured by the user. In Linux this is done through
+  * ConfigFS. Once that is done paths are be established the first time
+  * the stream is opened. Typically the read side is opened first to make
+  * sure all the data will be received.
+  *
+  * End-to-end flow control is mandatory on both sides.
+  *
+  * Data is sent to the other side as tunneled DATA packets. All the data
+  * is owned by the user and passed as-is from the writer to the reader.
+  *
+  * Once the stream device is closed, a CLOSE packet is sent to the peer
+@@ -127,50 +132,58 @@
+  * @kref: Reference count
+  * @index: Unique identifier for the character device
+  * @in_hopid: In HopID
+  * @out_hopid: Out HopID
+  * @ring_size: Size of the rings
+  * @throttling: Interrupt throttling rate in ns
+  * @busy_poll: Instead of interrupts, busy poll the rings
+  * @users: Number of times @cdev has been opened
+  * @closed: CLOSE packet was received
+  * @removed: Userspace removed the ConfigFS group underneath.
+  * @wait: Waitqueue for open, read and write
+  * @lock: Lock protecting this structure
+  * @tx_ring: Transmit ring
+  * @rx_ring: Receive ring
+  * @list: Stream devices are linked through this
++ * @gpu_direct: Explicit exclusive DMA-BUF mode (when enabled)
++ * @gpu_last_epoch: Last accepted peer-agreed DMA epoch (when enabled)
++ * @gpu_context: Open or quarantined DMA context (when enabled)
+  */
+ struct tbstream_dev {
+ 	struct config_group group;
+ 	struct tbstream *stream;
+ 	struct miscdevice misc;
+ 	struct kref kref;
+ 	int index;
+ 	int in_hopid;
+ 	int out_hopid;
+ 	unsigned int ring_size;
+ 	unsigned int throttling;
+ 	bool busy_poll;
+ 	int users;
+ 	bool closed;
+ 	bool removed;
+ 	wait_queue_head_t wait;
+ 	struct mutex lock;
+ 	struct tbstream_ring tx_ring;
+ 	struct tbstream_ring rx_ring;
+ 	struct list_head list;
++#if IS_ENABLED(CONFIG_USB4_GPU_STREAM)
++	bool gpu_direct;
++	u64 gpu_last_epoch;
++	struct tbstream_gpu_context *gpu_context;
++#endif
+ };
+ 
+ /**
+  * struct tbstream_group - Config group for stream
+  * @group: ConfigFS group for @stream
+  * @stream: Stream the ConfigFS group is attached to. %NULL if there is
+  *	    no stream attached.
+  * @lock: Lock protecting this structure
+  * @dev_list: List of stream devices
+  *
+  * This is the ConfigFS directory for one connection to another host.
+  * There can be several &struct stream_dev linked through @dev_list of
+  * this structure. Reference count managed through @group.
+  */
+ struct tbstream_group {
+@@ -643,30 +656,37 @@
+ static bool tbstream_dev_tx_drained(const struct tbstream_dev *sdev)
+ {
+ 	const struct tbstream_ring *ring = &sdev->tx_ring;
+ 
+ 	/*
+ 	 * Everything is completed when number of free TX slots is back
+ 	 * to the maximum.
+ 	 */
+ 	return ring->prod - ring->cons == tb_ring_size(ring->ring) - 1;
+ }
+ 
+ static void tbstream_dev_stop(struct tbstream_dev *sdev)
+ {
+ 	struct tb_xdomain *xd;
+ 
++#if IS_ENABLED(CONFIG_USB4_GPU_STREAM)
++	if (sdev->gpu_context) {
++		tbstream_gpu_stop(sdev);
++		return;
++	}
++#endif
++
+ 	if (sdev->busy_poll) {
+ 		/*
+ 		 * When busy polling we must advance the ring ourselves
+ 		 * to push all outstanding frames on the wire.
+ 		 */
+ 		ktime_t timeout = ktime_add_ms(ktime_get(), 500);
+ 
+ 		do {
+ 			if (tbstream_dev_tx_drained(sdev))
+ 				break;
+ 			tbstream_dev_poll_ring(sdev, &sdev->tx_ring);
+ 			fsleep(15);
+ 		} while (ktime_before(ktime_get(), timeout));
+ 
+ 		tb_ring_stop(sdev->tx_ring.ring);
+@@ -704,30 +724,34 @@
+ 		if (mutex_lock_interruptible(&sdev->lock))
+ 			return -ERESTARTSYS;
+ 	}
+ 	return 0;
+ }
+ 
+ static ssize_t
+ tbstream_dev_fops_read_iter(struct kiocb *kiocb, struct iov_iter *to)
+ {
+ 	struct file *file = kiocb->ki_filp;
+ 	bool nowait = file->f_flags & O_NONBLOCK || kiocb->ki_flags & IOCB_NOWAIT;
+ 	struct tbstream_dev *sdev = to_tbstream_dev(file->private_data);
+ 	size_t nbytes;
+ 	int ret;
+ 
++#if IS_ENABLED(CONFIG_USB4_GPU_STREAM)
++	if (READ_ONCE(sdev->gpu_direct))
++		return -EOPNOTSUPP;
++#endif
+ 	ret = tbstream_dev_valid(sdev);
+ 	if (ret)
+ 		return ret;
+ 
+ 	ret = tbstream_dev_lock(sdev, nowait);
+ 	if (ret)
+ 		return ret;
+ 
+ 	for (;;) {
+ 		/* When busy polling, advance any completions manually */
+ 		tbstream_dev_poll_ring(sdev, &sdev->rx_ring);
+ 
+ 		ret = tbstream_dev_valid(sdev);
+ 		if (ret) {
+ 			mutex_unlock(&sdev->lock);
+@@ -816,30 +840,34 @@
+ 	mutex_unlock(&sdev->lock);
+ 	if (ret)
+ 		return ret;
+ 	return nbytes;
+ }
+ 
+ static ssize_t
+ tbstream_dev_fops_write_iter(struct kiocb *kiocb, struct iov_iter *from)
+ {
+ 	struct file *file = kiocb->ki_filp;
+ 	bool nowait = file->f_flags & O_NONBLOCK || kiocb->ki_flags & IOCB_NOWAIT;
+ 	struct tbstream_dev *sdev = to_tbstream_dev(file->private_data);
+ 	size_t nbytes;
+ 	int ret;
+ 
++#if IS_ENABLED(CONFIG_USB4_GPU_STREAM)
++	if (READ_ONCE(sdev->gpu_direct))
++		return -EOPNOTSUPP;
++#endif
+ 	ret = tbstream_dev_valid(sdev);
+ 	if (ret)
+ 		return ret;
+ 
+ 	ret = tbstream_dev_lock(sdev, nowait);
+ 	if (ret)
+ 		return ret;
+ 
+ 	for (;;) {
+ 		tbstream_dev_poll_ring(sdev, &sdev->tx_ring);
+ 
+ 		ret = tbstream_dev_valid(sdev);
+ 		if (ret) {
+ 			mutex_unlock(&sdev->lock);
+ 			return ret;
+@@ -896,30 +924,34 @@
+ 		nbytes += size;
+ 	}
+ 
+ 	mutex_unlock(&sdev->lock);
+ 	if (ret)
+ 		return ret;
+ 	return nbytes;
+ }
+ 
+ static __poll_t
+ tbstream_dev_fops_poll(struct file *file, struct poll_table_struct *wait)
+ {
+ 	struct tbstream_dev *sdev = to_tbstream_dev(file->private_data);
+ 	__poll_t mask = 0;
+ 
++#if IS_ENABLED(CONFIG_USB4_GPU_STREAM)
++	if (READ_ONCE(sdev->gpu_direct))
++		return tbstream_gpu_poll(file, wait);
++#endif
+ 	/*
+ 	 * Without interrupts there is nothing that can wake us up so
+ 	 * return failure instead.
+ 	 */
+ 	if (sdev->busy_poll)
+ 		return EPOLLERR;
+ 
+ 	poll_wait(file, &sdev->wait, wait);
+ 	guard(mutex)(&sdev->lock);
+ 	if (tbstream_dev_valid(sdev) != 0) {
+ 		mask |= EPOLLHUP | EPOLLERR;
+ 	} else {
+ 		if (tbstream_ring_available(&sdev->tx_ring))
+ 			mask |= EPOLLOUT | EPOLLWRNORM;
+ 		if (tbstream_ring_available(&sdev->rx_ring))
+@@ -928,138 +960,219 @@
+ 	return mask;
+ }
+ 
+ static int tbstream_dev_fops_open(struct inode *inode, struct file *file)
+ {
+ 	struct tbstream_dev *sdev = to_tbstream_dev(file->private_data);
+ 	int ret;
+ 
+ 	tbstream_dev_get(sdev);
+ 
+ 	if (mutex_lock_interruptible(&sdev->lock)) {
+ 		tbstream_dev_put(sdev);
+ 		return -ERESTARTSYS;
+ 	}
+ 
++#if IS_ENABLED(CONFIG_USB4_GPU_STREAM)
++	if (sdev->gpu_context || (sdev->gpu_direct && sdev->users)) {
++		ret = -EBUSY;
++		goto err_unlock;
++	}
++#endif
+ 	/*
+ 	 * If there is no stream attached yet, block until it appears
+ 	 * unless this is opened in non-blocking mode.
+ 	 */
+ 	while ((ret = tbstream_dev_valid(sdev))) {
+ 		mutex_unlock(&sdev->lock);
+ 
+ 		if (ret != -ENXIO || (file->f_flags & O_NONBLOCK))
+ 			goto err_put;
+ 
+ 		ret = wait_event_interruptible(sdev->wait,
+ 				tbstream_dev_valid(sdev) == 0 ||
+ 				tbstream_dev_removed(sdev));
+ 		if (ret)
+ 			goto err_put;
+ 
+ 		if (tbstream_dev_removed(sdev)) {
+ 			ret = -ENXIO;
+ 			goto err_put;
+ 		}
+ 
+ 		if (mutex_lock_interruptible(&sdev->lock)) {
+ 			ret = -ERESTARTSYS;
+ 			goto err_put;
+ 		}
+ 	}
+ 
++#if IS_ENABLED(CONFIG_USB4_GPU_STREAM)
++	if (sdev->gpu_context || (sdev->gpu_direct && sdev->users)) {
++		ret = -EBUSY;
++		goto err_unlock;
++	}
++#endif
+ 	/* Only on first open we allocate rings and enable paths */
+ 	if (!sdev->users++) {
+-		ret = tbstream_dev_start(sdev);
++#if IS_ENABLED(CONFIG_USB4_GPU_STREAM)
++		if (sdev->gpu_direct)
++			ret = tbstream_gpu_open(sdev);
++		else
++#endif
++			ret = tbstream_dev_start(sdev);
+ 		if (ret) {
+ 			sdev->users--;
+ 			goto err_unlock;
+ 		}
+ 		sdev->closed = false;
+ 	}
+ 
+ 	mutex_unlock(&sdev->lock);
+ 	return 0;
+ 
+ err_unlock:
+ 	mutex_unlock(&sdev->lock);
+ err_put:
+ 	tbstream_dev_put(sdev);
+ 
+ 	return ret;
+ }
+ 
+ static int tbstream_dev_fops_release(struct inode *inode, struct file *file)
+ {
+ 	struct tbstream_dev *sdev = to_tbstream_dev(file->private_data);
+ 
+ 	mutex_lock(&sdev->lock);
+ 	if (--sdev->users == 0) {
++#if IS_ENABLED(CONFIG_USB4_GPU_STREAM)
++		if (sdev->gpu_context) {
++			tbstream_gpu_close(sdev);
++			goto unlocked;
++		}
++#endif
+ 		/*
+ 		 * Send CLOSE tunneled packet to notify the other end
+ 		 * that we are closing the file. We do this twice if the
+ 		 * first one fails.
+ 		 */
+ 		tbstream_dev_send_close(sdev);
+ 		tbstream_dev_stop(sdev);
+ 	}
++#if IS_ENABLED(CONFIG_USB4_GPU_STREAM)
++unlocked:
++#endif
+ 	mutex_unlock(&sdev->lock);
+ 
+ 	tbstream_dev_put(sdev);
+ 	return 0;
+ }
++
++#if IS_ENABLED(CONFIG_USB4_GPU_STREAM)
++static long tbstream_dev_fops_ioctl(struct file *file, unsigned int command, unsigned long argument)
++{
++	struct tbstream_dev *sdev = to_tbstream_dev(file->private_data);
++
++	if (!READ_ONCE(sdev->gpu_direct))
++		return -ENOTTY;
++	return tbstream_gpu_ioctl(file, command, argument);
++}
++#endif
+ 
+ static const struct file_operations tbstream_dev_fops = {
+ 	.owner = THIS_MODULE,
+ 	.llseek = noop_llseek,
+ 	.read_iter = tbstream_dev_fops_read_iter,
+ 	.write_iter = tbstream_dev_fops_write_iter,
+ 	.poll = tbstream_dev_fops_poll,
+ 	.open = tbstream_dev_fops_open,
+ 	.release = tbstream_dev_fops_release,
++#if IS_ENABLED(CONFIG_USB4_GPU_STREAM)
++	.unlocked_ioctl = tbstream_dev_fops_ioctl,
++#ifdef CONFIG_COMPAT
++	.compat_ioctl = compat_ptr_ioctl,
++#endif
++#endif
+ };
+ 
+ static inline struct tbstream_dev *
+ tbstream_dev_from_group(struct config_group *group)
+ {
+ 	return container_of(group, struct tbstream_dev, group);
+ }
++
++static bool tbstream_dev_config_busy(struct tbstream_dev *sdev)
++{
++#if IS_ENABLED(CONFIG_USB4_GPU_STREAM)
++	if (sdev->gpu_context)
++		return true;
++#endif
++	return sdev->users != 0;
++}
++
++#if IS_ENABLED(CONFIG_USB4_GPU_STREAM)
++static ssize_t tbstream_dev_gpu_direct_show(struct config_item *item, char *buf)
++{
++	struct tbstream_dev *sdev = tbstream_dev_from_group(to_config_group(item));
++	return sysfs_emit(buf, "%u\n", sdev->gpu_direct);
++}
++static ssize_t tbstream_dev_gpu_direct_store(struct config_item *item, const char *buf, size_t count)
++{
++	struct tbstream_dev *sdev = tbstream_dev_from_group(to_config_group(item));
++	bool enabled;
++	int ret = kstrtobool(buf, &enabled);
++
++	if (ret)
++		return ret;
++	guard(mutex)(&sdev->lock);
++	if (tbstream_dev_config_busy(sdev))
++		return -EBUSY;
++	if (enabled && sdev->busy_poll)
++		return -EOPNOTSUPP;
++	sdev->gpu_direct = enabled;
++	return count;
++}
++CONFIGFS_ATTR(tbstream_dev_, gpu_direct);
++#endif
+ 
+ static ssize_t tbstream_dev_busy_poll_show(struct config_item *item, char *buf)
+ {
+ 	struct config_group *group = to_config_group(item);
+ 	struct tbstream_dev *sdev = tbstream_dev_from_group(group);
+ 
+ 	return sysfs_emit(buf, "%u\n", sdev->busy_poll);
+ }
+ 
+ static ssize_t
+ tbstream_dev_busy_poll_store(struct config_item *item, const char *buf,
+ 			     size_t count)
+ {
+ 	struct config_group *group = to_config_group(item);
+ 	struct tbstream_dev *sdev = tbstream_dev_from_group(group);
+ 	bool busy_poll;
+ 	int ret;
+ 
+ 	ret = kstrtobool(buf, &busy_poll);
+ 	if (ret)
+ 		return ret;
+ 
+ 	guard(mutex)(&sdev->lock);
+-	if (sdev->users)
++	if (tbstream_dev_config_busy(sdev))
+ 		return -EBUSY;
++#if IS_ENABLED(CONFIG_USB4_GPU_STREAM)
++	if (busy_poll && sdev->gpu_direct)
++		return -EOPNOTSUPP;
++#endif
+ 	sdev->busy_poll = busy_poll;
+ 	return count;
+ }
+ CONFIGFS_ATTR(tbstream_dev_, busy_poll);
+ 
+ static ssize_t tbstream_dev_index_show(struct config_item *item, char *buf)
+ {
+ 	struct config_group *group = to_config_group(item);
+ 	struct tbstream_dev *sdev = tbstream_dev_from_group(group);
+ 
+ 	return sysfs_emit(buf, "%d\n", sdev->index);
+ }
+ CONFIGFS_ATTR_RO(tbstream_dev_, index);
+ 
+ static ssize_t tbstream_dev_in_hopid_show(struct config_item *item, char *buf)
+@@ -1232,31 +1345,31 @@
+ }
+ 
+ static ssize_t
+ tbstream_dev_in_hopid_store(struct config_item *item, const char *buf,
+ 			    size_t count)
+ {
+ 	struct config_group *group = to_config_group(item);
+ 	struct tbstream_dev *sdev = tbstream_dev_from_group(group);
+ 	int ret, in_hopid;
+ 
+ 	ret = kstrtoint(buf, 0, &in_hopid);
+ 	if (ret)
+ 		return ret;
+ 
+ 	guard(mutex)(&sdev->lock);
+-	if (sdev->users)
++	if (tbstream_dev_config_busy(sdev))
+ 		return -EBUSY;
+ 	if (sdev->stream) {
+ 		ret = tbstream_dev_alloc_in_hopid(sdev, in_hopid);
+ 		if (ret)
+ 			return ret;
+ 		ret = tbstream_dev_update_properties(sdev);
+ 	} else {
+ 		sdev->in_hopid = in_hopid;
+ 	}
+ 	return ret ? ret : count;
+ }
+ CONFIGFS_ATTR(tbstream_dev_, in_hopid);
+ 
+ static ssize_t tbstream_dev_out_hopid_show(struct config_item *item, char *buf)
+ {
+@@ -1267,31 +1380,31 @@
+ }
+ 
+ static ssize_t
+ tbstream_dev_out_hopid_store(struct config_item *item, const char *buf,
+ 			     size_t count)
+ {
+ 	struct config_group *group = to_config_group(item);
+ 	struct tbstream_dev *sdev = tbstream_dev_from_group(group);
+ 	int ret, out_hopid;
+ 
+ 	ret = kstrtoint(buf, 0, &out_hopid);
+ 	if (ret)
+ 		return ret;
+ 
+ 	guard(mutex)(&sdev->lock);
+-	if (sdev->users)
++	if (tbstream_dev_config_busy(sdev))
+ 		return -EBUSY;
+ 	if (sdev->stream) {
+ 		ret = tbstream_dev_alloc_out_hopid(sdev, out_hopid);
+ 		if (ret)
+ 			return ret;
+ 		ret = tbstream_dev_update_properties(sdev);
+ 	} else {
+ 		sdev->out_hopid = out_hopid;
+ 	}
+ 	return ret ? ret : count;
+ }
+ CONFIGFS_ATTR(tbstream_dev_, out_hopid);
+ 
+ static ssize_t tbstream_dev_ring_size_show(struct config_item *item, char *buf)
+ {
+@@ -1307,31 +1420,31 @@
+ {
+ 	struct config_group *group = to_config_group(item);
+ 	struct tbstream_dev *sdev = tbstream_dev_from_group(group);
+ 	unsigned int ring_size;
+ 	int ret;
+ 
+ 	ret = kstrtouint(buf, 0, &ring_size);
+ 	if (ret)
+ 		return ret;
+ 
+ 	if (ring_size < TBSTREAM_DEV_MIN_RING_SIZE ||
+ 	    ring_size > TBSTREAM_DEV_MAX_RING_SIZE)
+ 		return -EINVAL;
+ 
+ 	guard(mutex)(&sdev->lock);
+-	if (sdev->users)
++	if (tbstream_dev_config_busy(sdev))
+ 		return -EBUSY;
+ 	sdev->ring_size = ring_size;
+ 	return count;
+ }
+ CONFIGFS_ATTR(tbstream_dev_, ring_size);
+ 
+ static ssize_t tbstream_dev_throttling_show(struct config_item *item, char *buf)
+ {
+ 	struct config_group *group = to_config_group(item);
+ 	struct tbstream_dev *sdev = tbstream_dev_from_group(group);
+ 
+ 	return sysfs_emit(buf, "%u\n", sdev->throttling);
+ }
+ 
+ static ssize_t
+@@ -1339,39 +1452,42 @@
+ 			      size_t count)
+ {
+ 	struct config_group *group = to_config_group(item);
+ 	struct tbstream_dev *sdev = tbstream_dev_from_group(group);
+ 	unsigned int throttling;
+ 	int ret;
+ 
+ 	ret = kstrtouint(buf, 0, &throttling);
+ 	if (ret)
+ 		return ret;
+ 
+ 	if (throttling > TBSTREAM_DEV_MAX_THROTTLING)
+ 		return -EINVAL;
+ 
+ 	guard(mutex)(&sdev->lock);
+-	if (sdev->users)
++	if (tbstream_dev_config_busy(sdev))
+ 		return -EBUSY;
+ 	sdev->throttling = throttling;
+ 	return count;
+ }
+ CONFIGFS_ATTR(tbstream_dev_, throttling);
+ 
+ static struct configfs_attribute *tbstream_dev_attrs[] = {
+ 	&tbstream_dev_attr_busy_poll,
++#if IS_ENABLED(CONFIG_USB4_GPU_STREAM)
++	&tbstream_dev_attr_gpu_direct,
++#endif
+ 	&tbstream_dev_attr_index,
+ 	&tbstream_dev_attr_in_hopid,
+ 	&tbstream_dev_attr_out_hopid,
+ 	&tbstream_dev_attr_ring_size,
+ 	&tbstream_dev_attr_throttling,
+ 	NULL,
+ };
+ 
+ static void tbstream_dev_item_release(struct config_item *item)
+ {
+ 	struct config_group *group = to_config_group(item);
+ 	struct tbstream_dev *sdev = tbstream_dev_from_group(group);
+ 
+ 	misc_deregister(&sdev->misc);
+ 	tbstream_dev_put(sdev);
+@@ -1414,30 +1530,36 @@
+ 	if (p && p->value.immediate >= 8)
+ 		*in_hopid = p->value.immediate;
+ }
+ 
+ static void
+ tbstream_dev_attach_stream(struct tbstream_dev *sdev, struct tbstream_group *sg)
+ {
+ 	const char *name = config_item_name(&sdev->group.cg_item);
+ 	struct tbstream *stream;
+ 
+ 	stream = tbstream_get(sg->stream);
+ 	if (!stream)
+ 		return;
+ 
+ 	scoped_guard(mutex, &sdev->lock) {
++#if IS_ENABLED(CONFIG_USB4_GPU_STREAM)
++		if (sdev->gpu_context) {
++			tbstream_put(stream);
++			return; /* never rebind an open/retained DMA endpoint */
++		}
++#endif
+ 		sdev->stream = stream;
+ 		/*
+ 		 * If there is no existing configuration (or automatic
+ 		 * configuration is being used) check if the other side
+ 		 * has configuration for this and use it.
+ 		 */
+ 		if (sdev->in_hopid <= 0 && sdev->out_hopid <= 0)
+ 			service_get_hopids(stream->svc, name, &sdev->in_hopid,
+ 					   &sdev->out_hopid);
+ 		if (sdev->in_hopid)
+ 			tbstream_dev_alloc_in_hopid(sdev, sdev->in_hopid);
+ 		if (sdev->out_hopid)
+ 			tbstream_dev_alloc_out_hopid(sdev, sdev->out_hopid);
+ 	}
+ 
+@@ -1447,36 +1569,45 @@
+ 
+ 	/* Notify any openerers that the stream is now attached */
+ 	wake_up_interruptible(&sdev->wait);
+ }
+ 
+ static void tbstream_dev_detach_stream(struct tbstream_dev *sdev)
+ {
+ 	const char *name = config_item_name(&sdev->group.cg_item);
+ 	struct tbstream *stream;
+ 	struct tb_xdomain *xd;
+ 
+ 	scoped_guard(mutex, &sdev->lock) {
+ 		stream = sdev->stream;
+ 		if (!stream)
+ 			return;
++#if IS_ENABLED(CONFIG_USB4_GPU_STREAM)
++		tbstream_gpu_disconnect(sdev);
++#endif
+ 		sdev->stream = NULL;
+ 		xd = tb_service_parent(stream->svc);
+-		if (sdev->out_hopid > 0)
+-			tb_xdomain_release_out_hopid(xd, sdev->out_hopid);
+-		if (sdev->in_hopid > 0)
+-			tb_xdomain_release_in_hopid(xd, sdev->in_hopid);
++#if IS_ENABLED(CONFIG_USB4_GPU_STREAM)
++		if (!tbstream_gpu_paths_pending(sdev)) {
++#endif
++			if (sdev->out_hopid > 0)
++				tb_xdomain_release_out_hopid(xd, sdev->out_hopid);
++			if (sdev->in_hopid > 0)
++				tb_xdomain_release_in_hopid(xd, sdev->in_hopid);
++#if IS_ENABLED(CONFIG_USB4_GPU_STREAM)
++		}
++#endif
+ 	}
+ 
+ 	service_update_properties(stream->svc, name, 0, 0);
+ 	tb_service_properties_changed(stream->svc);
+ 
+ 	tbstream_put(stream);
+ 
+ 	/* Notify any task that the stream is not valid anymore */
+ 	wake_up_interruptible_poll(&sdev->wait, EPOLLHUP | EPOLLERR);
+ }
+ 
+ static inline struct tbstream_group *
+ to_tbstream_group(struct config_group *group)
+ {
+ 	return container_of(group, struct tbstream_group, group);
+@@ -1724,53 +1855,66 @@
+ }
+ 
+ static int __maybe_unused tbstream_suspend(struct device *dev)
+ {
+ 	struct tb_service *svc = tb_to_service(dev);
+ 	struct tbstream *stream = tb_service_get_drvdata(svc);
+ 	struct tbstream_group *sg;
+ 	struct tbstream_dev *sdev;
+ 
+ 	sg = tbstream_group_find(stream);
+ 	if (!sg)
+ 		return 0;
+ 
+ 	list_for_each_entry_reverse(sdev, &sg->dev_list, list) {
+ 		tbstream_dev_get(sdev);
+-		/* Stop the stream (if it was open) */
+-		if (sdev->users)
+-			tbstream_dev_stop(sdev);
++		/* Stop the stream (if it was open); DMA mode never resumes implicitly. */
++		scoped_guard(mutex, &sdev->lock) {
++#if IS_ENABLED(CONFIG_USB4_GPU_STREAM)
++			if (sdev->gpu_context)
++				tbstream_gpu_disconnect(sdev);
++			else
++#endif
++			if (sdev->users)
++				tbstream_dev_stop(sdev);
++		}
+ 		tbstream_dev_put(sdev);
+ 	}
+ 
+ 	config_group_put(&sg->group);
+ 	return 0;
+ }
+ 
+ static int __maybe_unused tbstream_resume(struct device *dev)
+ {
+ 	struct tb_service *svc = tb_to_service(dev);
+ 	struct tbstream *stream = tb_service_get_drvdata(svc);
+ 	struct tbstream_group *sg;
+ 	struct tbstream_dev *sdev;
+ 
+ 	sg = tbstream_group_find(stream);
+ 	if (!sg)
+ 		return 0;
+ 
+ 	list_for_each_entry(sdev, &sg->dev_list, list) {
+ 		tbstream_dev_get(sdev);
++#if IS_ENABLED(CONFIG_USB4_GPU_STREAM)
++		if (sdev->gpu_direct || sdev->gpu_context) {
++			tbstream_dev_put(sdev);
++			continue;
++		}
++#endif
+ 		if (sdev->users) {
+ 			int ret;
+ 
+ 			ret = tbstream_dev_start(sdev);
+ 			if (ret) {
+ 				tbstream_dev_put(sdev);
+ 				config_group_put(&sg->group);
+ 				return ret;
+ 			}
+ 		}
+ 		tbstream_dev_put(sdev);
+ 	}
+ 
+ 	config_group_put(&sg->group);
+ 	return 0;
+@@ -1832,19 +1976,23 @@
+ 	tb_property_free_dir(tbstream_dir);
+ 	return ret;
+ }
+ module_init(tbstream_init);
+ 
+ static void __exit tbstream_exit(void)
+ {
+ 	tb_unregister_service_driver(&tbstream_driver);
+ 	tb_configfs_unregister_group(&tbstream_group);
+ 	tb_unregister_property_dir("stream", tbstream_dir);
+ 	tb_property_free_dir(tbstream_dir);
+ 	ida_destroy(&tbstream_indices);
+ }
+ module_exit(tbstream_exit);
+ 
++#if IS_ENABLED(CONFIG_USB4_GPU_STREAM)
++#include "gpu_stream.c"
++#endif
++
+ MODULE_AUTHOR("Alan Borzeszkowski <alan.borzeszkowski@linux.intel.com>");
+ MODULE_AUTHOR("Mika Westerberg <mika.westerberg@linux.intel.com>");
+ MODULE_DESCRIPTION("Stream data over Thunderbolt/USB4 cable");
+ MODULE_LICENSE("GPL");

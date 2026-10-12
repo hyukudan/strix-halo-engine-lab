@@ -29,6 +29,7 @@ struct CompiledSerialExecution {
     std::uint32_t dynamic_steps = 0;
     std::uint32_t non_graph_safe_steps = 0;
     bool whole_plan_graph_safe = false;
+    bool device_graph_inputs = false;
 
     std::uint32_t logical_rows = 1;
     std::uint32_t request_concurrency = 1;
