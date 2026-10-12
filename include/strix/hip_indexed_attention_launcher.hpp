@@ -4,6 +4,7 @@
 #include "strix/hip_runtime_launchers.hpp"
 #include "strix/launch_dispatch.hpp"
 #include "strix/model_contract.hpp"
+#include "strix/graph_attention_state.hpp"
 
 #include <string>
 
@@ -15,6 +16,15 @@ struct HipIndexedAttentionLauncherConfig {
     HipActivationStorage activation =
         HipActivationStorage::bf16;
 };
+
+// Experimental post-projection C1 norm/RoPE/KV stage. Async on caller's
+// explicitly owned stream; retain all resource owners through completion.
+// Read status only after completion: 0=stage valid, 2=position out of bounds,
+// 4=nonfinite source/norm, 8=nonfinite arithmetic. A nonzero status invalidates
+// the stage. This does not publish a serial token/state commit.
+void launch_hip_graph_attention_state(
+    const GraphAttentionStatePlan& plan, std::uint64_t scalar_control_position,
+    void* stream);
 
 void register_hip_indexed_attention_kernel_variant(
     const ModelContract& model,

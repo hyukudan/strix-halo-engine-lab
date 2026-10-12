@@ -18,17 +18,20 @@ compiler=${HIPCC:-/opt/rocm/bin/hipcc}
 llvm=${ROCM_LLVM:-/opt/rocm/llvm/bin}
 "$compiler" --version > "$output/compiler.txt"
 sha256sum "$source_dir/integer_projection.hip" "$repo/include/strix/integer_projection.hpp" \
+    "$repo/include/strix/integer_projection_execution.hpp" "$repo/include/strix/hip_integer_projection.hpp" \
     "$repo/include/strix/low_precision.hpp" "$repo/include/strix/iq4_xs.hpp" \
-    "$repo/src/integer_projection.cpp" "$repo/src/low_precision.cpp" "$repo/src/iq4_xs.cpp" \
-    "$repo/tests/integer_projection_tests.cpp" \
+    "$repo/src/integer_projection.cpp" "$repo/src/integer_projection_execution.cpp" "$repo/src/hip_integer_projection.hip" \
+    "$repo/src/low_precision.cpp" "$repo/src/iq4_xs.cpp" \
+    "$repo/tests/integer_projection_tests.cpp" "$repo/tests/integer_projection_execution_tests.cpp" \
     "$source_dir/compile_offline.sh" > "$output/source.sha256"
 args=(--offload-arch=gfx1151 -mno-wavefrontsize64 -std=c++20 -O2
     -Wall -Wextra -Werror -ffp-contract=off "-I$repo/include")
 printf '%q ' "$compiler" "${args[@]}" > "$output/command.txt"
 printf '\n' >> "$output/command.txt"
-"$compiler" "${args[@]}" --genco "$source_dir/integer_projection.hip" \
+"$compiler" "${args[@]}" --genco "$repo/src/hip_integer_projection.hip" \
     -o "$output/integer_projection.hsaco" > "$output/device.stdout" 2> "$output/device.stderr"
-"$compiler" "${args[@]}" "$source_dir/integer_projection.hip" "$repo/src/integer_projection.cpp" \
+"$compiler" "${args[@]}" "$source_dir/integer_projection.hip" "$repo/src/hip_integer_projection.hip" \
+    "$repo/src/integer_projection.cpp" "$repo/src/integer_projection_execution.cpp" \
     "$repo/src/low_precision.cpp" "$repo/src/iq4_xs.cpp" -o "$output/integer-projection-native" \
     > "$output/link.stdout" 2> "$output/link.stderr"
 "$llvm/clang-offload-bundler" --list --type=o --input="$output/integer_projection.hsaco" > "$output/bundles.txt"

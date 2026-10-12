@@ -98,6 +98,7 @@ public:
     [[nodiscard]] std::vector<std::byte> receive() override;
     [[nodiscard]] bool failed() const noexcept { return failed_; }
     [[nodiscard]] bool valid() const noexcept { return io_ != nullptr && fd_.descriptor >= 0; }
+    [[nodiscard]] std::uint64_t maximum_frame_bytes() const noexcept { return policy_.maximum_frame_bytes; }
 
 private:
     DirectStreamControlByteStream(DirectStreamControlIo&, DirectStreamDeviceIdentity, DirectStreamControlPolicy);

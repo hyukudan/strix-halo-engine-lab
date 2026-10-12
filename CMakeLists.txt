@@ -23,9 +23,12 @@ add_library(strix_core STATIC
     src/arithmetic_lineage.cpp
     src/graph_eligibility.cpp
     src/graph_inputs.cpp
+    src/graph_attention_state.cpp
     src/integer_projection.cpp
+    src/integer_projection_execution.cpp
     src/host_upload.cpp
     src/compiled_execution.cpp
+    src/copied_stream_transport.cpp
     src/compiled_mtp_draft_plan.cpp
     src/compiled_speculative_verify.cpp
     src/compiled_speculation_backend.cpp
@@ -184,6 +187,18 @@ strix_target_warnings(strix-audit-execution-tensors)
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(strix-copied-stream-transport-tests tests/copied_stream_transport_tests.cpp)
+    target_link_libraries(strix-copied-stream-transport-tests PRIVATE strix_core)
+    strix_target_warnings(strix-copied-stream-transport-tests)
+    add_test(NAME strix-copied-stream-transport-tests COMMAND strix-copied-stream-transport-tests)
+    add_executable(strix-integer-projection-execution-tests tests/integer_projection_execution_tests.cpp)
+    target_link_libraries(strix-integer-projection-execution-tests PRIVATE strix_core)
+    strix_target_warnings(strix-integer-projection-execution-tests)
+    add_test(NAME strix-integer-projection-execution-tests COMMAND strix-integer-projection-execution-tests)
+    add_executable(strix-graph-attention-state-tests tests/graph_attention_state_tests.cpp)
+    target_link_libraries(strix-graph-attention-state-tests PRIVATE strix_core)
+    strix_target_warnings(strix-graph-attention-state-tests)
+    add_test(NAME strix-graph-attention-state-tests COMMAND strix-graph-attention-state-tests)
     add_executable(strix-direct-stream-control-tests tests/direct_stream_control_tests.cpp)
     target_link_libraries(strix-direct-stream-control-tests PRIVATE strix_core)
     strix_target_warnings(strix-direct-stream-control-tests)
@@ -963,6 +978,12 @@ if(STRIX_ENABLE_HIP_RUNTIME)
             tests/hip_embedding_launcher_tests.hip
         )
         add_executable(strix-hip-graph-inputs-tests tests/hip_graph_inputs_tests.hip)
+        add_executable(strix-hip-graph-attention-state-tests tests/hip_graph_attention_state_tests.hip)
+        set_target_properties(strix-hip-graph-attention-state-tests PROPERTIES
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+        target_link_libraries(strix-hip-graph-attention-state-tests PRIVATE strix_hip_runtime)
+        strix_target_warnings(strix-hip-graph-attention-state-tests)
+        add_test(NAME strix-hip-graph-attention-state-tests COMMAND strix-hip-graph-attention-state-tests)
         set_target_properties(strix-hip-graph-inputs-tests PROPERTIES
             HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
         target_link_libraries(strix-hip-graph-inputs-tests PRIVATE strix_hip_runtime)

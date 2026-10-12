@@ -5,6 +5,45 @@ projection and row/group activation preparation. It is not registered for
 production selection. Offline compilation is distinct from native arithmetic,
 model fidelity and performance qualification; those gates remain open.
 
+The fixture now calls the reusable `HipIntegerProjectionLauncher` in
+`src/hip_integer_projection.hip`; kernels have one shared implementation.
+`ExecutionPlan` requires explicit opt-in, phase, increasing operation generation,
+exact approved arithmetic identity, fixed geometry, device instance and an
+admission ceiling. Default requests cannot execute. Ten device-buffer roles
+cover input, packed weights/scales, prepared activations/scales/sums, staged
+output, destination, integer groups and status. Accounting counts preparation,
+matrix tile waste, source checkpoint bytes, all required device bytes and
+distinct retained allocation capacities (including unused guards/arena gaps).
+Runtime HIP pointer attributes and allocation ranges check actual device-local
+memory and enforce the actual retained allocation ceiling too. Driver/runtime
+internal allocations and any compiler spill storage are separate profiler gates.
+
+Each view must fit its whole allocation, satisfy role alignment, have nonzero
+allocation identity/generation/access epoch, and match the selected device.
+Used ranges cannot alias. A trusted owner pins allocations and serializes
+conflicting access; writable epochs must equal the operation generation.
+Generations/epochs are owner-supplied lifecycle facts, not inferred native
+hardware evidence. Completed output retains its destination owner; reusing
+that allocation advances its access epoch, invalidating prior completions.
+Caller operation/epoch generators must outlive launcher recreation.
+
+An owned input-ready event is recorded by a sealed factory on a verified device
+and explicit stream. It pins the exact same allocation owners as the submitted
+operation, including through rejected consumer requests while its producer is
+still pending. The producer's scheduler owns data through successful event
+construction and serializes further writes. The launcher checks finite weight scales and activation
+preparation, synchronizes and checks status, executes projection into scratch,
+checks status/current bindings again, then copies into the destination and
+proves completion. Numerical/status failures perform no destination copy.
+A partial/error commit marks the destination poisoned; no failed result
+authorizes output consumption. Submission failure poisons the launcher;
+unproved stream quiescence retains all allocation pins, ready event and stream
+owner through explicit drain or process teardown. Recreating failed launchers
+with unproved retained work is unsupported. Successful completion may retire
+input/scratch pins, while the returned destination owner survives consumption.
+This blocking control path deliberately reads status between stages; it does
+not claim production latency or integration with model/state ownership.
+
 Q4_0 retains its unsigned nibble codes, FP16-derived group scales and offset 8.
 IQ4_XS retains its nibbles and exact signed INT8 codebook lookup, with the
 FP16 global scale times signed six-bit local scale per 32 elements. IQ4_XS
@@ -44,6 +83,7 @@ Build the portable checks without HIP:
 cmake -S lab/integer_projection -B /tmp/strix-integer-host
 cmake --build /tmp/strix-integer-host
 /tmp/strix-integer-host/integer-projection-host-tests
+/tmp/strix-integer-host/integer-projection-contract-tests
 ```
 
 Build and explicitly run the native checks only on gfx1151:
@@ -59,7 +99,7 @@ The program rejects a nonempty `HSA_OVERRIDE_GFX_VERSION`, selects device 0
 and checks exact gfx1151 plus actual Wave32.
 It executes Q4_0 A8/IU8, A4/IU4 and A4/IU8, IQ4_XS A8/A4/IU8;
 M=1/3/17, N=19/640/2560 and K=32/256/640/2560 where storage permits.
-It compares all corrected integer groups against independent direct integer
+It selects explicit prefill/decode/verify phases and compares all corrected integer groups against independent direct integer
 mathematics and binary64 scale/output bits against the CPU reference. It
 re-executes each native row alone after the batched run, compares preparation
 codes/scales/sums and outputs, and checks guards including logical solo bounds.
@@ -72,6 +112,13 @@ nonfinite scales, changed floating environment and nonlinear raw-IU4 requests.
 The laboratory limits staging/reference working storage to 256 MiB and rejects
 larger operations before allocation. Host checks require nearest-even and
 gradual subnormals even for previously staged operands.
+Contract checks additionally reject numerical/phase substitution, aliasing,
+misalignment, whole-allocation overflow, insufficient preparation/full resource
+admission, stale live generations/access epochs, unowned destination lifetime
+and failed/partial completion evidence. Native failure controls assert the
+destination remains untouched and the failed launcher cannot be replayed.
+Completed operation identities cannot be replayed, and the native fixture
+checks that writing a new destination epoch invalidates its prior completion.
 
 `bash lab/integer_projection/compile_offline.sh PRIVATE_OUTPUT_DIRECTORY` uses an existing ROCm installation
 to compile/link the whole harness and save source hashes, compiler identity,

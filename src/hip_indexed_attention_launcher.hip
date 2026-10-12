@@ -68,6 +68,12 @@ enum class SmallWeightKind {
     bf16,
 };
 
+struct GraphPositionKernelArguments {
+    const std::uint64_t* position = nullptr;
+    std::uint64_t context_tokens = 0;
+    std::uint32_t* status = nullptr;
+};
+
 struct TensorPair {
     const ManifestTensor* manifest = nullptr;
     const RuntimeTensorBinding* runtime = nullptr;
@@ -554,7 +560,19 @@ __global__ void norm_rope_kernel(
     float epsilon,
     std::uint32_t rotary_dim,
     float theta,
-    std::uint64_t position) {
+    std::uint64_t position,
+    GraphPositionKernelArguments dynamic) {
+    if (dynamic.position != nullptr) position = *dynamic.position;
+    // Another head can report arithmetic failure while this block starts.
+    // Broadcast a single atomic observation before any block-wide barriers;
+    // per-thread early exits could otherwise diverge around __syncthreads.
+    __shared__ unsigned graph_reject;
+    if (dynamic.status != nullptr) {
+        if (threadIdx.x == 0) graph_reject =
+            atomicAdd(dynamic.status, 0U) != 0 || position >= dynamic.context_tokens ? 1U : 0U;
+        __syncthreads();
+        if (graph_reject != 0) return;
+    }
     const auto head =
         static_cast<std::uint32_t>(
             blockIdx.x);
@@ -596,12 +614,15 @@ __global__ void norm_rope_kernel(
         __syncthreads();
     }
 
-    const float inv_rms =
-        rsqrtf(
-            reduction[0] /
-                static_cast<float>(
-                    head_dim) +
-            epsilon);
+    const float mean = reduction[0] / static_cast<float>(head_dim) + epsilon;
+    const float inv_rms = rsqrtf(mean);
+    if (dynamic.status != nullptr && (!isfinite(reduction[0]) || !isfinite(mean) ||
+        mean <= 0 || !isfinite(inv_rms))) {
+        // The shared reduction and scalar are identical for every thread in
+        // this head, so this return is uniform before the remaining barrier.
+        if (feature == 0) atomicOr(dynamic.status, 8U);
+        return;
+    }
     source[feature] =
         round_bf16(
             input *
@@ -610,6 +631,7 @@ __global__ void norm_rope_kernel(
              load_small_weight<Kind>(
                  norm_weights,
                  feature)));
+    if (dynamic.status != nullptr && !isfinite(source[feature])) atomicOr(dynamic.status, 8U);
     __syncthreads();
 
     float result =
@@ -653,8 +675,35 @@ __global__ void norm_rope_kernel(
                     sine;
         }
     }
-    values[index] =
-        round_bf16(result);
+    const float rounded = round_bf16(result);
+    if (dynamic.status != nullptr && (!isfinite(result) || !isfinite(rounded))) {
+        atomicOr(dynamic.status, 8U);
+        return;
+    }
+    values[index] = rounded;
+}
+
+__global__ void initialize_graph_attention_status(
+    std::uint32_t* status, std::uint64_t scalar_position, GraphPositionKernelArguments dynamic) {
+    const auto position = dynamic.position == nullptr ? scalar_position : *dynamic.position;
+    *status = position >= dynamic.context_tokens ? 2U : 0U;
+}
+
+template <SmallWeightKind Kind>
+__global__ void validate_graph_attention_sources(
+    const float* query, const float* key, const float* value,
+    const void* query_norm, const void* key_norm, std::uint64_t query_elements,
+    std::uint64_t kv_elements, std::uint32_t norm_elements, std::uint32_t query_stride, std::uint32_t* status) {
+    const auto maximum = query_elements > kv_elements ? query_elements : kv_elements;
+    for (std::uint64_t i = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         i < maximum || i < norm_elements; i += static_cast<std::uint64_t>(gridDim.x) * blockDim.x) {
+        bool invalid = false;
+        if (i < query_elements && i % query_stride < norm_elements) invalid = !isfinite(query[i]);
+        if (i < kv_elements) invalid = invalid || !isfinite(key[i]) || !isfinite(value[i]) || !isfinite(round_bf16(value[i]));
+        if (i < norm_elements) invalid = invalid || !isfinite(load_small_weight<Kind>(query_norm, static_cast<std::uint32_t>(i))) ||
+            !isfinite(load_small_weight<Kind>(key_norm, static_cast<std::uint32_t>(i)));
+        if (invalid) atomicOr(status, 4U);
+    }
 }
 
 __global__ void store_raw_index_key_kernel(
@@ -683,7 +732,10 @@ __global__ void store_kv_kernel(
     const float* current_v,
     std::uint16_t* state,
     std::uint32_t kv_width,
-    std::uint64_t position) {
+    std::uint64_t position,
+    GraphPositionKernelArguments dynamic) {
+    if (dynamic.position != nullptr) position = *dynamic.position;
+    if (dynamic.status != nullptr && (*dynamic.status != 0 || position >= dynamic.context_tokens)) return;
     const auto feature =
         static_cast<std::uint32_t>(
             blockIdx.x) *
@@ -1701,7 +1753,8 @@ void launch_norm_rope_typed(
     std::uint32_t head_stride,
     const RuntimeTensorBinding& norm,
     const ModelContract& model,
-    std::uint64_t position) {
+    std::uint64_t position,
+    GraphPositionKernelArguments dynamic = {}, hipStream_t stream = hipStreamLegacy) {
     hipLaunchKernelGGL(
         HIP_KERNEL_NAME(
             norm_rope_kernel<Kind>),
@@ -1710,7 +1763,7 @@ void launch_norm_rope_typed(
         2ULL *
             head_dim *
             sizeof(float),
-        0,
+        stream,
         values,
         heads,
         head_dim,
@@ -1723,7 +1776,7 @@ void launch_norm_rope_typed(
             model.rotary_dim(),
             "rotary_dim"),
         model.rope_theta,
-        position);
+        position, dynamic);
     check_hip(
         hipGetLastError(),
         "HIP indexed-attention norm/rope launch");
@@ -2305,7 +2358,7 @@ void launch_indexed_attention(
             std::uint16_t*>(
                 kv_state.address),
         kv_width,
-        context.position);
+        context.position, GraphPositionKernelArguments{});
     check_hip(
         hipGetLastError(),
         "HIP indexed-attention KV state update");
@@ -2633,6 +2686,65 @@ register_for_compiled_execution(
         throw std::invalid_argument(
             "compiled execution has no indexed-attention step");
     }
+}
+
+namespace {
+template <SmallWeightKind Kind>
+void launch_graph_attention_state_typed(const GraphAttentionStatePlan& p,
+    std::uint64_t scalar_position, hipStream_t stream) {
+    const auto& r = p.request;
+    GraphPositionKernelArguments dynamic;
+    dynamic.context_tokens = r.context_tokens;
+    dynamic.status = reinterpret_cast<std::uint32_t*>(r.status.arena_base);
+    if (r.position_mode == AttentionPositionMode::device_input) {
+        dynamic.position = reinterpret_cast<const std::uint64_t*>(
+            r.arguments.memory.arena_base + r.arguments.position_offset);
+    }
+    hipLaunchKernelGGL(initialize_graph_attention_status, dim3(1), dim3(1), 0, stream,
+        dynamic.status, scalar_position, dynamic);
+    check_hip(hipGetLastError(), "HIP attention state status initialization");
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(validate_graph_attention_sources<Kind>), dim3(32),
+        dim3(kThreads), 0, stream, reinterpret_cast<const float*>(r.query.address),
+        reinterpret_cast<const float*>(r.key.address), reinterpret_cast<const float*>(r.value.address),
+        reinterpret_cast<const void*>(r.query_norm.address), reinterpret_cast<const void*>(r.key_norm.address),
+        p.query_elements, p.kv_elements, r.head_dim, r.query_head_stride, dynamic.status);
+    check_hip(hipGetLastError(), "HIP attention state finite-source validation");
+    ModelContract model;
+    model.head_dim = r.head_dim;
+    model.partial_rotary_factor = static_cast<float>(r.rotary_dim) / static_cast<float>(r.head_dim);
+    model.rms_norm_epsilon = r.epsilon;
+    model.rope_theta = r.theta;
+    launch_norm_rope_typed<Kind>(reinterpret_cast<float*>(r.query.address), r.query_heads,
+        r.head_dim, r.query_head_stride, r.query_norm, model, scalar_position, dynamic, stream);
+    launch_norm_rope_typed<Kind>(reinterpret_cast<float*>(r.key.address), r.kv_heads,
+        r.head_dim, r.head_dim, r.key_norm, model, scalar_position, dynamic, stream);
+    const auto width = static_cast<std::uint32_t>(p.kv_elements);
+    hipLaunchKernelGGL(store_kv_kernel, dim3((width - 1U) / kThreads + 1U), dim3(kThreads),
+        0, stream, reinterpret_cast<const float*>(r.key.address), reinterpret_cast<const float*>(r.value.address),
+        reinterpret_cast<std::uint16_t*>(r.kv_state.address), width, scalar_position, dynamic);
+    check_hip(hipGetLastError(), "HIP attention state dynamic KV write");
+}
+} // namespace
+
+void launch_hip_graph_attention_state(const GraphAttentionStatePlan& plan,
+    std::uint64_t scalar_control_position, void* stream_pointer) {
+    validate_graph_attention_state_plan(plan);
+    if (stream_pointer == nullptr) throw std::invalid_argument("attention state requires an explicitly owned stream");
+    const auto stream = static_cast<hipStream_t>(stream_pointer);
+    if (plan.request.position_mode == AttentionPositionMode::scalar_control) {
+        if (scalar_control_position >= plan.request.context_tokens) throw std::out_of_range("scalar attention position exceeds context");
+        hipStreamCaptureStatus capturing;
+        check_hip(hipStreamIsCapturing(stream, &capturing), "HIP attention control capture query");
+        if (capturing != hipStreamCaptureStatusNone) throw std::invalid_argument("scalar attention control cannot be captured as a dynamic plan");
+    } else if (scalar_control_position != 0) {
+        throw std::invalid_argument("device-input attention mode does not accept a scalar position override");
+    }
+    switch (small_weight_kind(plan.request.norm_ggml_type)) {
+    case SmallWeightKind::f32: launch_graph_attention_state_typed<SmallWeightKind::f32>(plan, scalar_control_position, stream); return;
+    case SmallWeightKind::f16: launch_graph_attention_state_typed<SmallWeightKind::f16>(plan, scalar_control_position, stream); return;
+    case SmallWeightKind::bf16: launch_graph_attention_state_typed<SmallWeightKind::bf16>(plan, scalar_control_position, stream); return;
+    }
+    throw std::logic_error("unreachable attention norm encoding");
 }
 
 }  // namespace strix
