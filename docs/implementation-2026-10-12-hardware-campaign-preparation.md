@@ -73,6 +73,15 @@ copies and file IO are not end-to-end performance evidence. Tokenization, chat
 rendering and text decoding must be independently bound to the exact GGUF and
 workload; raw token traces cannot attest those semantic transformations.
 
+The [complete-model decode routes](implementation-2026-10-12-decode-execution-modes.md)
+now connect eager floating, floating graph and eager alternate integer LM-head
+execution to the RAW recorder. Each route can record an actual same-plan prefix
+snapshot, intervening continuation, restore and continued generation. The
+independent importer checks the full state, arithmetic lineage and exact
+execution/profile/runtime tuple; a no-op restoration is insufficient. Graph
+and integer execution require explicit native memory ceilings. This implements
+the recording adapters, not their physical quality or speed acceptance.
+
 ## Target order and remaining execution gates
 
 1. Observe each target runtime/GPU and confirm the reviewed boot kernel/module.

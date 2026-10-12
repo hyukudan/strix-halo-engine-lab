@@ -2,8 +2,10 @@
 
 #include "strix/model_contract.hpp"
 
+#include <algorithm>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <vector>
 
@@ -123,6 +125,9 @@ int main() {
                 0xffU);
     }
 
+    const auto original_device_state = device_state;
+    const auto original_host_state = host_state;
+
     strix::SessionStateMemoryBinding state_memory;
     state_memory.layout_identity =
         layout.layout_identity;
@@ -194,6 +199,33 @@ int main() {
         snapshot_memory,
         backend);
 
+    // The first range is valid in every fixture. Reject a malformed later
+    // range before even the first backend call, including asynchronous backends.
+    expect(snapshot.ranges.size() > 1 && restore.ranges.size() > 1,
+           "preflight fixture has a valid first range and malformed later range");
+    const auto captured_device = snapshot_device;
+    const auto captured_host = snapshot_host;
+    for (unsigned mutation = 0; mutation != 5; ++mutation) {
+        auto malformed = snapshot;
+        auto& later = malformed.ranges.back();
+        if (mutation == 0) ++later.source_offset;
+        if (mutation == 1) later.bytes = std::numeric_limits<std::uint64_t>::max();
+        if (mutation == 2) later.destination_offset = std::numeric_limits<std::uint64_t>::max();
+        if (mutation == 3) later.storage = static_cast<strix::SessionStateStorage>(99);
+        if (mutation == 4) later.component = static_cast<strix::SessionStateComponent>(99);
+        MemcpyBackend preflight_backend;
+        bool rejected = false;
+        try {
+            strix::capture_serial_session_snapshot(malformed, layout, state_memory,
+                                                   snapshot_memory, preflight_backend);
+        } catch (const std::exception&) { rejected = true; }
+        expect(rejected && preflight_backend.calls == 0,
+               "malformed later capture range is rejected before any copy submission");
+        expect(snapshot_device == captured_device && snapshot_host == captured_host &&
+                   device_state == original_device_state && host_state == original_host_state,
+               "capture preflight rejection changes neither payload nor source allocations");
+    }
+
     std::fill(
         device_state.begin(),
         device_state.end(),
@@ -210,6 +242,40 @@ int main() {
         request.runtime_compatibility_identity;
     session.state_layout_identity =
         layout.layout_identity;
+
+    session.next_position = 3;
+    session.committed_tokens = 3;
+    session.state = request.state;
+    session.arithmetic_lineage.history_identity = 42;
+    session.arithmetic_lineage.tainted = false;
+    const auto prior_session = session;
+    for (unsigned mutation = 0; mutation != 5; ++mutation) {
+        auto malformed = restore;
+        auto& later = malformed.ranges.back();
+        if (mutation == 0) ++later.destination_offset;
+        if (mutation == 1) later.bytes = std::numeric_limits<std::uint64_t>::max();
+        if (mutation == 2) later.snapshot_offset = std::numeric_limits<std::uint64_t>::max();
+        if (mutation == 3) later.storage = static_cast<strix::SessionStateStorage>(99);
+        if (mutation == 4) later.component = static_cast<strix::SessionStateComponent>(99);
+        MemcpyBackend preflight_backend;
+        bool rejected = false;
+        try {
+            strix::restore_serial_session_snapshot(session, malformed, layout, state_memory,
+                                                   snapshot_memory, preflight_backend);
+        } catch (const std::exception&) { rejected = true; }
+        expect(rejected && preflight_backend.calls == 0,
+               "malformed later restore range is rejected before any copy submission");
+        expect(std::all_of(device_state.begin(), device_state.end(), [](auto byte) { return byte == 0; }) &&
+                   std::all_of(host_state.begin(), host_state.end(), [](auto byte) { return byte == 0; }) &&
+                   snapshot_device == captured_device && snapshot_host == captured_host,
+               "restore preflight rejection changes neither destination nor captured payload");
+        expect(session.health == prior_session.health && session.next_position == prior_session.next_position &&
+                   session.committed_tokens == prior_session.committed_tokens && session.state.generations == prior_session.state.generations &&
+                   session.state.valid == prior_session.state.valid &&
+                   session.arithmetic_lineage.history_identity == prior_session.arithmetic_lineage.history_identity &&
+                   session.arithmetic_lineage.tainted == prior_session.arithmetic_lineage.tainted,
+               "restore preflight rejection preserves existing session health, metadata and lineage");
+    }
 
     auto wrong_snapshot_memory =
         snapshot_memory;
@@ -274,8 +340,21 @@ int main() {
     expect(prefix_restored,
            "restore copies every compact snapshot range to state layout");
 
+    // Independent component comparison catches the former contiguous-prefix
+    // bug: next_position=2 with context=4 must still restore later layers and
+    // all previously captured inactive capacity, not just layer zero's prefix.
+    for (const auto& allocation : layout.allocations) {
+        const auto* actual = allocation.storage == strix::SessionStateStorage::device
+            ? device_state.data() : host_state.data();
+        const auto* original = allocation.storage == strix::SessionStateStorage::device
+            ? original_device_state.data() : original_host_state.data();
+        expect(std::memcmp(actual + allocation.offset, original + allocation.offset,
+                   static_cast<std::size_t>(allocation.bytes)) == 0,
+               "partial-prefix snapshot restores every byte of every state component");
+    }
+
     session.health =
-        strix::SerialSessionHealth::poisoned;
+        strix::SerialSessionHealth::ready;
     MemcpyBackend failing;
     failing.fail_after = 1;
     bool failure_seen = false;
@@ -292,7 +371,8 @@ int main() {
     }
     expect(failure_seen &&
                session.health ==
-                   strix::SerialSessionHealth::poisoned,
+                   strix::SerialSessionHealth::poisoned && session.arithmetic_lineage.tainted &&
+                   failing.calls == 2,
            "partial restore failure leaves session poisoned");
 
     if (failures == 0) {

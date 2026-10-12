@@ -71,6 +71,7 @@ A wider kernel, larger speculative window, second node or second physical link i
 - [Hardware campaign preparation](implementation-2026-10-12-hardware-campaign-preparation.md).
 - [Native numerical campaign preparation](implementation-2026-10-12-native-numerical-campaign.md).
 - [Eager RAW baseline recording](implementation-2026-10-12-raw-baseline-recording.md).
+- [Complete-model experimental decode recording](implementation-2026-10-12-decode-execution-modes.md).
 - [Phase specific packed weights and integer execution](proposals/2026-10-11-phase-specific-low-precision.md).
 - [Execution optimization gates](proposals/2026-10-12-execution-optimization-gates.md).
 

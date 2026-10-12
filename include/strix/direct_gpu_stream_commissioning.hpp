@@ -47,6 +47,13 @@ struct DirectGpuCommissioningReport {
     std::uint64_t pool_binding_identity = 0, import_generation = 0;
     std::string error;
 };
+struct DirectGpuCommissioningSessionReport {
+    std::vector<DirectGpuCommissioningReport> transfers;
+    std::uint32_t requested_transfers = 0;
+    std::uint64_t completed_count = 0, pool_binding_identity = 0, import_generation = 0;
+    DirectPoolReleaseStatus cleanup = DirectPoolReleaseStatus::failed_retained;
+    std::string error;
+};
 struct DirectGpuCommissioningPayload {
     std::vector<TransportBufferView> send_segments, receive_segments;
     // Trusted native GPU producer on the helper-owned stream. Its complete
@@ -77,8 +84,22 @@ public:
     void bind_exact_observed(const DirectDriverBinding&);
     [[nodiscard]] DirectGpuCommissioningReport run_once(const DirectGpuCommissioningConfig&,
         const DirectGpuCommissioningPayload&, DirectGpuCommissioningProgress = DirectGpuCommissioningProgress::native());
+    // One import/ARM, bounded 2..128 sequential complete transfers. Directions
+    // may alternate; every operation retires before the next producer can
+    // overwrite a source or RX PREPARE can replace standby geometry. This is
+    // serialized C1 reuse, not simultaneous duplex or thread-safe ownership.
+    [[nodiscard]] DirectGpuCommissioningSessionReport run_session(std::span<const DirectGpuCommissioningConfig>,
+        std::span<const DirectGpuCommissioningPayload>, DirectGpuCommissioningProgress = DirectGpuCommissioningProgress::native());
+    // Explicit paired C2 commissioning: one TX plus one RX, exact opposite
+    // descriptors at the peer, bounded event demultiplexing by owned handle,
+    // RX progress before blocking TX ACK, both retired before the next pair.
+    // No production full-duplex capability or thread-safe caller is created.
+    [[nodiscard]] DirectGpuCommissioningSessionReport run_duplex_session(std::span<const DirectGpuCommissioningConfig>,
+        std::span<const DirectGpuCommissioningPayload>, DirectGpuCommissioningProgress = DirectGpuCommissioningProgress::native());
     [[nodiscard]] DirectPoolReleaseStatus close() noexcept;
 private:
+    [[nodiscard]] DirectGpuCommissioningSessionReport run_batch(std::span<const DirectGpuCommissioningConfig>,
+        std::span<const DirectGpuCommissioningPayload>, DirectGpuCommissioningProgress, bool duplex = false);
     template<class Function> decltype(auto) dispatch(Function&& function) {
         provider_->begin_commissioning_operation();
         struct Guard { LinuxDirectTransportDriverIo* io; ~Guard() { io->end_commissioning_operation(); } } guard{provider_.get()};

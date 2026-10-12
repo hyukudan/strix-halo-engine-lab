@@ -1,7 +1,5 @@
 #include "strix/session_snapshot.hpp"
 
-#include "strix/memory_plan.hpp"
-
 #include <limits>
 #include <stdexcept>
 
@@ -22,18 +20,6 @@ std::uint64_t checked_add(
             "session snapshot byte overflow");
     }
     return left + right;
-}
-
-std::uint64_t checked_mul(
-    std::uint64_t left,
-    std::uint64_t right) {
-    if (left != 0 &&
-        right >
-            std::numeric_limits<std::uint64_t>::max() / left) {
-        throw std::overflow_error(
-            "session snapshot multiplication overflow");
-    }
-    return left * right;
 }
 
 std::uint64_t align_up(
@@ -60,33 +46,6 @@ void hash_u64(
     }
 }
 
-std::uint64_t bytes_for_component(
-    const ModelContract& model,
-    const SessionStateAllocation& allocation,
-    std::uint64_t next_position) {
-    switch (allocation.component) {
-    case SessionStateComponent::attention_kv:
-        return checked_mul(
-            base_kv_bytes_per_token(model),
-            next_position);
-
-    case SessionStateComponent::sparse_index:
-        return checked_mul(
-            provisional_indexer_bytes_per_token(model),
-            next_position);
-
-    case SessionStateComponent::recurrent_matrix:
-    case SessionStateComponent::gdn_convolution:
-    case SessionStateComponent::ple_convolution:
-    case SessionStateComponent::ngram_history:
-    case SessionStateComponent::position_history:
-        return allocation.bytes;
-    }
-
-    throw std::logic_error(
-        "unknown session-state component");
-}
-
 bool flag_valid(
     const PersistentStateGenerations& state,
     PersistentState flag) noexcept {
@@ -96,6 +55,10 @@ bool flag_valid(
 std::uint64_t build_identity(
     const SerialSessionSnapshotPlan& plan) noexcept {
     std::uint64_t hash = fnv_offset;
+    // Versioned whole-component format: distinguish it from the former
+    // contiguous-prefix format and from any future compact per-layer layout.
+    hash_u64(hash, 0x53534e415046554cULL);
+    hash_u64(hash, 2);
     hash_u64(
         hash,
         plan.compiled_execution_identity);
@@ -196,11 +159,11 @@ build_serial_session_snapshot_plan(
             continue;
         }
 
-        const auto bytes =
-            bytes_for_component(
-                model,
-                allocation,
-                request.next_position);
+        // KV and sparse state use per-layer context-capacity strides. A
+        // component-wide prefix length would omit later layers. Preserve the
+        // whole allocation, including inactive capacity, until a versioned
+        // per-layer snapshot format is implemented and independently tested.
+        const auto bytes = allocation.bytes;
         if (bytes == 0) {
             continue;
         }

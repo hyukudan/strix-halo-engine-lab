@@ -139,7 +139,7 @@ struct LinuxDirectTransportDriverIo::Impl {
     std::uint64_t last_send = 0, last_receive = 0;
     bool failed = false, closing = false, queried = false, ready = false, armed = false, controller_stopped = false, kernel_released = false;
     bool discovery_placeholder = false, observed_bound = false;
-    bool commissioning = false, commissioning_operation = false;
+    bool commissioning = false, commissioning_operation = false, commissioning_duplex = false;
     std::string observed_driver_build;
 #if defined(__linux__)
     sgu_query observed{};
@@ -319,6 +319,11 @@ void LinuxDirectTransportDriverIo::begin_commissioning_operation() {
 #endif
 }
 void LinuxDirectTransportDriverIo::end_commissioning_operation() noexcept { impl_->commissioning_operation = false; }
+void LinuxDirectTransportDriverIo::enable_commissioning_duplex() {
+    auto& i = *impl_;
+    if (!i.commissioning || i.commissioning_operation || i.imported || i.armed || i.failed || i.closing || i.commissioning_duplex) throw std::logic_error("paired duplex requires one isolated pre-import commissioning owner");
+    i.commissioning_duplex = true;
+}
 std::optional<DirectDriverBinding> LinuxDirectTransportDriverIo::current_binding() const {
 #if defined(__linux__)
     try {
@@ -393,7 +398,8 @@ void LinuxDirectTransportDriverIo::activate_import(const std::shared_ptr<DirectD
 void LinuxDirectTransportDriverIo::prepare(const DirectDriverOperation& operation) {
 #if defined(__linux__)
     auto& i = *impl_; i.current();
-    if (!i.armed || i.operations[0] || i.operations[1] || !same_import(operation.imported, i.import_binding) || !operation.handle ||
+    const bool occupied = i.commissioning && i.commissioning_duplex ? i.operations[operation.receive_path ? 1U : 0U].has_value() : i.operations[0].has_value() || i.operations[1].has_value();
+    if (!i.armed || occupied || !same_import(operation.imported, i.import_binding) || !operation.handle ||
         !validate_descriptor(operation.descriptor, {1, i.fence.connection_epoch, i.cached.backend.maximum_payload_bytes}) || !operation.descriptor.sequence || !operation.descriptor.generation) throw std::invalid_argument("direct GPU stream requires one exact bounded C1 operation");
     const auto& pool = operation.receive_path ? operation.imported.pool.rx : operation.imported.pool.tx;
     if (operation.buffer.address < pool.address || operation.buffer.address - pool.address > pool.bytes - SGU_FRAME_BYTES ||
@@ -511,7 +517,11 @@ std::optional<DirectDriverEvent> LinuxDirectTransportDriverIo::poll_event() {
     try {
         auto& i = *impl_; i.current();
         if (!i.events.empty()) { auto event = i.events.front(); i.events.pop_front(); i.current(); return event; }
-        if (i.operations[0] && i.operations[0]->hardware_done) {
+        // The isolated paired commissioning runner processes RX acquire,
+        // consumer and repost before allowing a blocking TX ACK read. Otherwise
+        // TX-first completion at both peers would prevent RX/controller progress.
+        const bool receive_needs_progress = i.commissioning && i.commissioning_duplex && i.operations[1] && !i.operations[1]->reposted;
+        if (i.operations[0] && i.operations[0]->hardware_done && !receive_needs_progress) {
             auto& entry = *i.operations[0];
             if (!entry.transport_ack) { static_cast<void>(i.receive_control(entry, DistributedDirectGpuControlKind::received)); entry.transport_ack = true; i.enqueue(entry, CompletionKind::remote_transport_ack); }
             else if (!entry.remote_consumer) { static_cast<void>(i.receive_control(entry, DistributedDirectGpuControlKind::consumed)); entry.remote_consumer = true; i.enqueue(entry, CompletionKind::remote_consumer_complete); }

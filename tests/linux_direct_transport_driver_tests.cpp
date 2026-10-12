@@ -6,13 +6,17 @@
 #include <deque>
 #include <functional>
 #include <iostream>
+#include <atomic>
+#include <condition_variable>
+#include <future>
+#include <mutex>
 
 #if defined(__linux__)
 #include "strix/linux_direct_gpu_stream_uapi.h"
 #endif
 
 namespace {
-int failures = 0;
+std::atomic<int> failures{0};
 void expect(bool condition, const char* message) { if (!condition) { std::cerr << message << '\n'; ++failures; } }
 template<class F> bool rejected(F function) { try { function(); } catch (const std::exception&) { return true; } return false; }
 #if defined(__linux__)
@@ -72,6 +76,8 @@ struct Kernel {
     bool import_error = false, bad_import_ack = false, bad_stop_proof = false;
     std::function<void(sgu_event&)> event_mutation;
     std::function<void()> after_import;
+    std::function<void(const sgu_prepare&)> after_prepare;
+    std::vector<sgu_prepare> preparations;
     Kernel() {
         query.fence.abi_major = 1; query.fence.abi_cookie = SGU_ABI_COOKIE; query.fence.device_instance[0] = 8;
         query.fence.local_uuid[0] = 1; query.fence.peer_uuid[0] = 2; query.fence.route = 99; query.fence.in_hopid = 3; query.fence.out_hopid = 4;
@@ -99,7 +105,7 @@ struct Kernel {
             if (after_import) after_import();
             return import_error ? LinuxDirectGpuStreamSyscallResult{-1, EFAULT} : LinuxDirectGpuStreamSyscallResult{0, 0};
         }
-        if (command == SGU_IOC_PREPARE) { prepared = *static_cast<sgu_prepare*>(argument); return {0, 0}; }
+        if (command == SGU_IOC_PREPARE) { prepared = *static_cast<sgu_prepare*>(argument); preparations.push_back(prepared); if (after_prepare) after_prepare(prepared); return {0, 0}; }
         if (command == SGU_IOC_EVENT) {
             if (events.empty()) return {-1, EAGAIN};
             auto event = events.front(); events.pop_front(); if (event_mutation) event_mutation(event); *static_cast<sgu_event*>(argument) = event; return {0, 0};
@@ -147,10 +153,35 @@ struct Fixture {
     void incoming(DistributedDirectGpuControlKind kind, TransferDescriptor descriptor_value) {
         DistributedDirectGpuControlFrame frame; frame.kind = kind; frame.physical_link_id = expected().interface.physical_link_id;
         frame.local_endpoint_identity = expected().interface.peer_endpoint_identity; frame.peer_endpoint_identity = expected().interface.local_endpoint_identity;
-        frame.descriptor = descriptor_value; if (kind == DistributedDirectGpuControlKind::producer_released) frame.commit = commit(descriptor_value.sequence);
+        frame.descriptor = descriptor_value; if (kind == DistributedDirectGpuControlKind::producer_released) { frame.commit = commit(descriptor_value.sequence); frame.commit.payload_bytes = static_cast<std::uint32_t>(descriptor_value.byte_length); }
         control_fd->frame(frame);
     }
     void send_ready() { incoming(DistributedDirectGpuControlKind::receive_ready, descriptor()); }
+};
+// Two entirely synthetic peers exchange actual bounded kind4 byte frames and
+// CPU byte-vector payloads. No socket, GPU or controller is used by this fixture.
+struct PeerControlQueues {
+    std::mutex mutex; std::condition_variable changed;
+    std::array<std::deque<std::vector<std::byte>>, 2> incoming;
+};
+class PeerControl final : public DistributedControlByteStream {
+public:
+    PeerControl(std::shared_ptr<PeerControlQueues> queues, std::size_t side) : queues_(std::move(queues)), side_(side) {}
+    void send(std::span<const std::byte> value) override {
+        if (value.empty() || value.size() > 2048) throw std::runtime_error("synthetic peer frame budget");
+        { std::lock_guard lock(queues_->mutex); auto& target = queues_->incoming[1 - side_]; if (target.size() >= 4) throw std::runtime_error("synthetic peer queue budget"); target.emplace_back(value.begin(), value.end()); }
+        queues_->changed.notify_all();
+    }
+    std::vector<std::byte> receive() override {
+        std::unique_lock lock(queues_->mutex);
+        if (!queues_->changed.wait_for(lock, std::chrono::milliseconds{1000}, [&] { return !queues_->incoming[side_].empty(); })) throw std::runtime_error("synthetic peer bounded control timeout");
+        auto value = std::move(queues_->incoming[side_].front()); queues_->incoming[side_].pop_front(); lock.unlock();
+        if (received) received(decode_distributed_direct_gpu_control(value, {2, 2048, 1}).kind);
+        return value;
+    }
+    std::function<void(DistributedDirectGpuControlKind)> received;
+private:
+    std::shared_ptr<PeerControlQueues> queues_; std::size_t side_;
 };
 #endif
 }
@@ -169,6 +200,135 @@ int main() {
     const auto config = [](const DirectDriverBinding& binding, bool receiver) {
         return DirectGpuCommissioningConfig{"synthetic-campaign", "synthetic-run", binding, {1, 77, 2, 3, 4, 5, 1, 6, 1, 5120}, 123, receiver, std::chrono::milliseconds{1000}, 16};
     };
+    for (const int mode : {0, 1, 2}) {
+        Fixture fixture(false, true, false); auto harness = commission(fixture); const auto observed = harness->observe(); harness->bind_exact_observed(observed.binding);
+        std::vector<DirectGpuCommissioningConfig> configs; std::vector<DirectGpuCommissioningPayload> payloads;
+        int produced = 0, verified = 0;
+        fixture.kernel->after_prepare = [&](const sgu_prepare& value) { fixture.gpu->terminal = {1, gpu_commit_word, 77, value.sequence, static_cast<std::uint32_t>(value.payload_bytes), 0, 1}; };
+        for (std::size_t index = 0; index < 3; ++index) {
+            auto step = config(observed.binding, mode == 1 || (mode == 2 && index == 1));
+            step.run_id += "-" + std::to_string(index); step.descriptor.sequence = index + 1; step.descriptor.byte_length = std::array<std::uint64_t, 3>{1, 4097, 5120}[index];
+            configs.push_back(step); auto view = fixture.pool.external(step.descriptor.byte_length);
+            if (step.receiver) {
+                fixture.incoming(DistributedDirectGpuControlKind::producer_released, step.descriptor);
+                payloads.push_back({{}, {view}, {}, [&, index] { expect(fixture.kernel->retires == static_cast<int>(index), "RX verification occurs before next retirement"); ++verified; return true; }});
+            } else {
+                fixture.incoming(DistributedDirectGpuControlKind::receive_ready, step.descriptor); fixture.incoming(DistributedDirectGpuControlKind::received, step.descriptor); fixture.incoming(DistributedDirectGpuControlKind::consumed, step.descriptor);
+                payloads.push_back({{view}, {}, [&, index] { expect(fixture.kernel->retires == static_cast<int>(index), "next producer cannot run before preceding ACK/credit retirement"); ++produced; }, {}});
+            }
+        }
+        const auto report = harness->run_session(configs, payloads);
+        expect(report.completed_count == 3 && report.transfers.size() == 3 && report.cleanup == DirectPoolReleaseStatus::released && report.error.empty(), "one bounded session completes repeated TX/RX and alternating directions");
+        expect(fixture.kernel->imports == 1 && fixture.kernel->arms == 1 && fixture.kernel->releases == 1 && fixture.kernel->retires == 3 && produced + verified == 3, "sequential reuse has exactly one import/ARM/release and full per-step retirement");
+        for (std::size_t index = 0; index < report.transfers.size(); ++index) expect(report.transfers[index].import_generation == report.import_generation && report.transfers[index].pool_binding_identity == report.pool_binding_identity && report.transfers[index].cleanup == DirectPoolReleaseStatus::pending && fixture.kernel->preparations[index].handle == index + 1 && fixture.kernel->preparations[index].sequence == index + 1, "session binds same physical import, increasing handles/sequences and truthful held-import stage");
+    }
+    for (const bool fail_receive : {false, true}) {
+        std::array<std::unique_ptr<Fixture>, 2> peers{std::make_unique<Fixture>(false, true, false), std::make_unique<Fixture>(false, true, false)};
+        peers[1]->kernel->query.fence.local_uuid[0] = 2; peers[1]->kernel->query.fence.peer_uuid[0] = 1;
+        auto queues = std::make_shared<PeerControlQueues>();
+        std::array<std::shared_ptr<PeerControl>, 2> controls{std::make_shared<PeerControl>(queues, 0), std::make_shared<PeerControl>(queues, 1)};
+        std::array<std::unique_ptr<LinuxDirectGpuStreamCommissioning>, 2> harnesses;
+        std::array<std::array<sgu_prepare, 2>, 2> prepared{};
+        std::array<GpuCommitRecord, 2> tx_commits{};
+        std::array<std::atomic<unsigned>, 2> delivered{};
+        std::array<unsigned, 2> delivery_consumed{}, rx_delays{}, tx_first{}, producer_calls{}, verify_calls{};
+        std::array<std::vector<DirectGpuCommissioningConfig>, 2> configs;
+        std::array<std::vector<DirectGpuCommissioningPayload>, 2> payloads;
+        for (std::size_t side = 0; side < 2; ++side) {
+            auto& peer = *peers[side]; auto discovery = expected(); discovery.device_identity.clear(); discovery.device_instance_generation = 0;
+            LinuxDirectGpuStreamCalls calls; calls.fd_owner = peer.native_fd; calls.kernel_release = [] { return "synthetic-kernel"; }; calls.driver_build_identity = [] { return std::optional<std::string>{"01020304"}; };
+            calls.ioctl_call = [&, side](DirectStreamFd, unsigned long command, void* argument) {
+                auto& local = *peers[side]; auto& kernel = *local.kernel;
+                if (command == SGU_IOC_PREPARE) { const auto& request = *static_cast<sgu_prepare*>(argument); prepared[side][request.direction] = request; }
+                if (command == SGU_IOC_SUBMIT || command == SGU_IOC_RX_REPOST || command == SGU_IOC_RETIRE) kernel.prepared = prepared[side][static_cast<sgu_action*>(argument)->direction];
+                if (command == SGU_IOC_SUBMIT && static_cast<sgu_action*>(argument)->direction == SGU_DIRECTION_RX) tx_commits[side] = local.gpu->terminal;
+                if (command == SGU_IOC_EVENT) {
+                    const auto tx = std::find_if(kernel.events.begin(), kernel.events.end(), [](const auto& event) { return event.direction == SGU_DIRECTION_TX; });
+                    if (tx != kernel.events.end()) { std::rotate(kernel.events.begin(), tx, tx + 1); ++tx_first[side]; }
+                    else if (!kernel.events.empty() && kernel.events.front().direction == SGU_DIRECTION_RX) {
+                        if (delivered[side].load(std::memory_order_acquire) <= delivery_consumed[side] || rx_delays[side]++ % 4 != 3) return LinuxDirectGpuStreamSyscallResult{-1, EAGAIN};
+                        ++delivery_consumed[side];
+                    }
+                }
+                const auto result = kernel.call(command, argument);
+                if (command == SGU_IOC_SUBMIT && static_cast<sgu_action*>(argument)->direction == SGU_DIRECTION_TX) {
+                    auto& remote = *peers[1 - side]; const auto bytes = kernel.prepared.payload_bytes;
+                    std::memcpy(remote.pool.state->pointer(remote.pool.exported->binding().pool.rx.address, static_cast<std::size_t>(bytes)), local.pool.state->pointer(local.pool.exported->binding().pool.tx.address, static_cast<std::size_t>(bytes)), static_cast<std::size_t>(bytes));
+                    remote.gpu->terminal = tx_commits[side]; delivered[1 - side].fetch_add(1, std::memory_order_release);
+                }
+                return result;
+            };
+            controls[side]->received = [&, side](DistributedDirectGpuControlKind kind) {
+                if (kind == DistributedDirectGpuControlKind::received || kind == DistributedDirectGpuControlKind::consumed) expect(peers[side]->kernel->reposts > 0, "paired TX ACK consumption cannot block local RX acquire/consumer/repost");
+            };
+            harnesses[side] = std::make_unique<LinuxDirectGpuStreamCommissioning>(route(), discovery, peer.gpu, controls[side], LinuxDirectGpuStreamPolicy{true, 65536, 1048576, 64}, calls);
+            const auto observed = harnesses[side]->observe(); harnesses[side]->bind_exact_observed(observed.binding);
+            for (std::size_t index = 0; index < 4; ++index) {
+                auto step = config(observed.binding, (index + side) % 2 != 0); step.run_id += ".s" + std::to_string(index); step.descriptor.sequence = index + 1;
+                step.descriptor.byte_length = index % 2 ? 4097 : 5120; step.maximum_progress_polls = 10000; step.timeout = std::chrono::milliseconds{5000}; configs[side].push_back(step);
+                auto external = peer.pool.external(step.descriptor.byte_length);
+                payloads[side].push_back({{external}, {external}, [&, side, step] {
+                    ++producer_calls[side]; auto& local = *peers[side]; auto* data = local.pool.state->pointer(local.pool.exported->binding().pool.tx.address, static_cast<std::size_t>(step.descriptor.byte_length));
+                    for (std::uint64_t offset = 0; offset < step.descriptor.byte_length; ++offset) data[offset] = static_cast<std::byte>(direct_gpu_commissioning_pattern_byte(offset, step.pattern_seed, step.descriptor.sequence));
+                }, [&, side, step, external] {
+                    ++verify_calls[side]; auto& local = *peers[side];
+                    if (fail_receive && side == 0) { local.gpu->gpu_idle = false; throw std::runtime_error("synthetic delayed duplex GPU/readback error"); }
+                    const auto bytes = static_cast<std::size_t>(step.descriptor.byte_length); auto* destination = local.pool.state->pointer(external.address, bytes);
+                    std::memcpy(destination, local.pool.state->pointer(local.pool.exported->binding().pool.rx.address, bytes), bytes);
+                    return verify_direct_gpu_commissioning_pattern({destination, bytes}, step.pattern_seed, step.descriptor.sequence);
+                }});
+            }
+        }
+        auto first = std::async(std::launch::async, [&] { return harnesses[0]->run_duplex_session(configs[0], payloads[0]); });
+        auto second = std::async(std::launch::async, [&] { return harnesses[1]->run_duplex_session(configs[1], payloads[1]); });
+        const std::array reports{first.get(), second.get()};
+        for (std::size_t side = 0; side < 2; ++side) {
+            if (!fail_receive && !reports[side].error.empty()) std::cerr << "synthetic duplex side " << side << ": " << reports[side].error << '\n';
+            expect(tx_first[side] > 0 && rx_delays[side] > 0 && peers[side]->kernel->imports == 1 && peers[side]->kernel->arms == 1, "two-peer bounded duplex exercises TX-first delayed RX with one stable import");
+            if (!fail_receive) expect(reports[side].completed_count == 4 && reports[side].cleanup == DirectPoolReleaseStatus::released && reports[side].error.empty() && producer_calls[side] == 2 && verify_calls[side] == 2 && peers[side]->kernel->retires == 4, "two actual synthetic control peers complete two overlapping TX/RX pairs and full byte verification");
+            else expect(reports[side].completed_count == 0 && reports[side].transfers.size() == 2 && producer_calls[side] == 1 && !reports[side].error.empty(), "duplex failure aborts later pairs on both exact control peers");
+        }
+        if (fail_receive) { expect(reports[0].cleanup == DirectPoolReleaseStatus::failed_retained && peers[0]->kernel->reposts == 0 && peers[0]->kernel->releases == 0, "unknown duplex GPU completion cannot credit/repost/free pending import"); peers[0]->gpu->gpu_idle = true; expect(harnesses[0]->close() == DirectPoolReleaseStatus::released, "late typed duplex quiescence cleans retained old import"); }
+    }
+    for (const int invalid : {0, 1, 2, 3}) {
+        Fixture fixture(false, true, false); auto harness = commission(fixture); const auto observed = harness->observe(); harness->bind_exact_observed(observed.binding);
+        std::array configs{config(observed.binding, false), config(observed.binding, false)}; configs[1].run_id += "-2"; configs[1].descriptor.sequence = 2;
+        auto view = fixture.pool.external(5120); std::array<DirectGpuCommissioningPayload, 2> payloads{{{{view}, {}, [] {}, {}}, {{view}, {}, [] {}, {}}}};
+        if (invalid == 0) configs[1].descriptor.sequence = 1;
+        if (invalid == 1) ++configs[1].expected.device_instance_generation;
+        if (invalid == 2) configs[1].run_id = configs[0].run_id;
+        if (invalid == 3) payloads[1].send_segments[0].bytes = 5119;
+        expect(rejected([&] { static_cast<void>(harness->run_session(configs, payloads)); }) && fixture.kernel->imports == 0, "all schedule identities/coverage are checked before import or any producer exposure");
+    }
+    {
+        Fixture fixture(false, true, false); auto harness = commission(fixture); const auto observed = harness->observe(); harness->bind_exact_observed(observed.binding);
+        auto step = config(observed.binding, false); step.descriptor.sequence = 2; auto view = fixture.pool.external(5120);
+        expect(rejected([&] { static_cast<void>(harness->run_once(step, {{view}, {}, [] {}, {}})); }) && fixture.kernel->imports == 0, "fresh standalone import rejects non-one first sequence before controller exposure");
+    }
+    {
+        Fixture fixture(false, true, false); auto harness = commission(fixture); const auto observed = harness->observe(); harness->bind_exact_observed(observed.binding);
+        std::array configs{config(observed.binding, false), config(observed.binding, false)}; configs[1].run_id += "-2"; configs[1].descriptor.sequence = 2;
+        auto view = fixture.pool.external(5120); std::array<DirectGpuCommissioningPayload, 2> payloads{{{{view}, {}, [] {}, {}}, {{view}, {}, [] {}, {}}}};
+        expect(rejected([&] { static_cast<void>(harness->run_duplex_session(configs, payloads)); }) && fixture.kernel->imports == 0, "duplex requires opposite directions before importing or exposing any producer");
+    }
+    {
+        Fixture fixture(false, true, false); auto harness = commission(fixture); const auto observed = harness->observe(); harness->bind_exact_observed(observed.binding);
+        auto step = config(observed.binding, false); step.timeout = std::chrono::milliseconds{2}; auto view = fixture.pool.external(5120);
+        std::chrono::steady_clock::time_point time{}; int produced = 0; fixture.kernel->after_import = [&] { time += std::chrono::milliseconds{3}; };
+        const auto report = harness->run_once(step, {{view}, {}, [&] { ++produced; }, {}}, {[&] { return time; }, [] {}});
+        expect(!report.executed && report.completed_count == 0 && !report.error.empty() && produced == 0 && fixture.kernel->arms == 0 && report.cleanup == DirectPoolReleaseStatus::released, "initial import delay is charged to first total deadline before ARM or GPU producer exposure");
+    }
+    {
+        Fixture fixture(false, true, false); auto harness = commission(fixture); const auto observed = harness->observe(); harness->bind_exact_observed(observed.binding);
+        std::array configs{config(observed.binding, false), config(observed.binding, false), config(observed.binding, false)};
+        for (std::size_t index = 0; index < configs.size(); ++index) { configs[index].run_id += std::to_string(index); configs[index].descriptor.sequence = index + 1; }
+        fixture.incoming(DistributedDirectGpuControlKind::receive_ready, configs[0].descriptor); fixture.incoming(DistributedDirectGpuControlKind::received, configs[0].descriptor); fixture.incoming(DistributedDirectGpuControlKind::consumed, configs[0].descriptor);
+        auto view = fixture.pool.external(5120); int later = 0;
+        std::array<DirectGpuCommissioningPayload, 3> payloads{{{{view}, {}, [] {}, {}}, {{view}, {}, [&] { fixture.gpu->gpu_idle = false; throw std::runtime_error("delayed second producer failed"); }, {}}, {{view}, {}, [&] { ++later; }, {}}}};
+        const auto report = harness->run_session(configs, payloads);
+        expect(report.completed_count == 1 && report.transfers.size() == 2 && report.transfers.back().executed && later == 0 && fixture.kernel->imports == 1 && fixture.kernel->releases == 0 && report.cleanup == DirectPoolReleaseStatus::failed_retained, "second-transfer unknown callback completion retains same import and aborts whole remaining schedule");
+        fixture.gpu->gpu_idle = true; expect(harness->close() == DirectPoolReleaseStatus::released, "late exact GPU/controller quiescence permits failed session cleanup only");
+    }
     {
         Fixture fixture(false, true, false); auto harness = commission(fixture, 3); const auto observed = harness->observe();
         expect(observed.native.query_status != DirectNativeQueryStatus::verified && !assess_direct_native_readiness(observed.backend, observed.native).ready, "commissioning observation cannot grant native production readiness");

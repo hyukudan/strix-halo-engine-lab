@@ -1,4 +1,5 @@
 #include "strix/hip_runtime_allocator.hpp"
+#include "strix/hip_setup_quiescence.hpp"
 
 #include <hip/hip_runtime.h>
 
@@ -45,48 +46,46 @@ void initialize_hip_fresh_runtime_memory(
             "fresh HIP runtime initialization requires bound scratch memory");
     }
 
-    check_hip(
-        hipMemset(
-            reinterpret_cast<void*>(
-                scratch.arena_base),
-            0,
-            static_cast<std::size_t>(
-                scratch.arena_bytes)),
-        "hipMemset(fresh scratch)");
-
-    if (state.device_bytes != 0) {
-        if (state.device_base == 0 ||
-            state.device_allocation_generation == 0) {
-            throw std::invalid_argument(
-                "fresh HIP runtime initialization requires bound device state");
-        }
+    // Validate every host/device binding before the first potentially queued
+    // operation, so a later schema error cannot unwind pending initialization.
+    if ((state.device_bytes != 0 &&
+         (state.device_base == 0 || state.device_allocation_generation == 0)) ||
+        (state.host_bytes != 0 &&
+         (state.host_base == 0 || state.host_allocation_generation == 0))) {
+        throw std::invalid_argument("fresh HIP runtime initialization requires bound state");
+    }
+    if (scratch.arena_bytes > std::numeric_limits<std::size_t>::max() ||
+        state.device_bytes > std::numeric_limits<std::size_t>::max() ||
+        state.host_bytes > std::numeric_limits<std::size_t>::max() ||
+        scratch.arena_bytes > std::numeric_limits<std::uintptr_t>::max() - scratch.arena_base ||
+        state.device_bytes > std::numeric_limits<std::uintptr_t>::max() - state.device_base ||
+        state.host_bytes > std::numeric_limits<std::uintptr_t>::max() - state.host_base) {
+        throw std::overflow_error("fresh HIP runtime initialization size does not fit size_t");
+    }
+    const HipSetupQuiescenceGuard setup_guard;
+    setup_guard.run([&] {
         check_hip(
             hipMemset(
-                reinterpret_cast<void*>(
-                    state.device_base),
+                reinterpret_cast<void*>(scratch.arena_base),
                 0,
-                static_cast<std::size_t>(
-                    state.device_bytes)),
-            "hipMemset(fresh device state)");
-    }
+                static_cast<std::size_t>(scratch.arena_bytes)),
+            "hipMemset(fresh scratch)");
 
-    if (state.host_bytes != 0) {
-        if (state.host_base == 0 ||
-            state.host_allocation_generation == 0) {
-            throw std::invalid_argument(
-                "fresh HIP runtime initialization requires bound host state");
+        if (state.device_bytes != 0) {
+            check_hip(
+                hipMemset(
+                    reinterpret_cast<void*>(state.device_base),
+                    0,
+                    static_cast<std::size_t>(state.device_bytes)),
+                "hipMemset(fresh device state)");
         }
-        std::memset(
-            reinterpret_cast<void*>(
-                state.host_base),
-            0,
-            static_cast<std::size_t>(
-                state.host_bytes));
-    }
-
-    check_hip(
-        hipDeviceSynchronize(),
-        "hipDeviceSynchronize(fresh runtime memory)");
+        if (state.host_bytes != 0) {
+            std::memset(
+                reinterpret_cast<void*>(state.host_base),
+                0,
+                static_cast<std::size_t>(state.host_bytes));
+        }
+    });
 }
 
 HipRuntimeAllocator::HipRuntimeAllocator(

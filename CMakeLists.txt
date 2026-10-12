@@ -283,6 +283,14 @@ if(BUILD_TESTING)
         target_compile_options(strix-integer-projection-tests PRIVATE /fp:strict)
     endif()
     add_test(NAME strix-integer-projection-tests COMMAND strix-integer-projection-tests)
+    add_executable(strix-decode-execution-options-tests tests/decode_execution_options_tests.cpp)
+    target_link_libraries(strix-decode-execution-options-tests PRIVATE strix_core)
+    strix_target_warnings(strix-decode-execution-options-tests)
+    add_test(NAME strix-decode-execution-options-tests COMMAND strix-decode-execution-options-tests)
+    add_executable(strix-native-setup-quiescence-tests tests/native_setup_quiescence_tests.cpp)
+    target_link_libraries(strix-native-setup-quiescence-tests PRIVATE strix_core)
+    strix_target_warnings(strix-native-setup-quiescence-tests)
+    add_test(NAME strix-native-setup-quiescence-tests COMMAND strix-native-setup-quiescence-tests)
     add_executable(strix-graph-inputs-tests tests/graph_inputs_tests.cpp)
     target_link_libraries(strix-graph-inputs-tests PRIVATE strix_core)
     strix_target_warnings(strix-graph-inputs-tests)
@@ -876,6 +884,8 @@ if(BUILD_TESTING)
 
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
+        add_test(NAME strix-dual-transport-runner-tests
+            COMMAND ${Python3_EXECUTABLE} -B -W error::ResourceWarning ${CMAKE_SOURCE_DIR}/lab/transport/test_dual_tbstream.py)
         add_test(NAME strix-private-kernel-preparation-tests
             COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/lab/direct_gpu_stream/kernel/test_build_private_kernel.py)
         add_test(NAME strix-native-numerical-campaign-tests

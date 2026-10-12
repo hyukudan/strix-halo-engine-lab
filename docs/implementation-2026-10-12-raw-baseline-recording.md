@@ -1,7 +1,7 @@
-# Eager RAW baseline recording
+# RAW token and restored-prefix recording
 
 The existing `strix-hip-decode-token` executable has an opt-in actual recording
-path for its current native eager computation. The ordinary CLI behavior is
+path for native token execution. The ordinary CLI behavior is
 unchanged. This supplies data for a later independently bound model-correctness
 campaign; recording, hashes and offline compilation do not authorize a numerical
 mode or qualify hardware.
@@ -14,11 +14,17 @@ strix-hip-decode-token MODEL.gguf TOKEN_ID ... \
 
 Adding the existing `--generate N` records the actual greedy run from the exact
 supplied prefix IDs. Omitting it records the supplied IDs as teacher-forced raw
-inputs. The adapter uses the existing BF16 activation storage and eager kernel
-catalog, with complete FP32 logits; FP32 output storage is not a declaration of
-FP32 activation arithmetic. It does not tokenize, decode text, optimize prefill,
-capture graphs, select integer variants or perform prefix-cache roundtrips.
-Recording with `--prefix-cache-roundtrip` is rejected.
+inputs. The adapter uses the existing BF16 activation storage, with complete
+FP32 logits; FP32 output storage is not a declaration of FP32 activation
+arithmetic. It does not tokenize, decode text, optimize prefill or infer
+numerical compatibility from storage. The selected actual execution mode
+is explicit: `eager_float`, `graph_float`, or `eager_integer_lm_head`. Graph
+execution uses the actual complete C1 capture/replay consumer. The integer
+option changes the LM head through the existing bounded tiled consumer; the
+rest of the model remains floating. Its numerical identity describes that
+LM-head-only path rather than whole-model low precision. These experimental
+modes have explicit runtime budgets and do not become defaults or gain
+qualification by producing a recording.
 
 ## Artifacts and identity
 
@@ -40,6 +46,25 @@ separate files. Allocation offsets, storage, byte lengths, state flags,
 generations and position are recorded. Raw state bytes are opaque native storage,
 not a portable semantic restore format; their native byte order is explicit.
 
+The existing `--prefix-cache-roundtrip` can record a restored greedy run in any
+supported execution mode. It records the fresh prefix, captures the actual
+prefix-cache source, runs an unrecorded continuation that must advance the
+position, restores that exact cache, then records the restored continuation.
+The unrecorded mutation creates no invented token rows. `checkpoint` and
+`restored` snapshots hash all seven complete physical allocations, including
+inactive KV and sparse capacity. Their bytes, state generations and canonical
+serial arithmetic lineage must match. The snapshot implementation deliberately
+copies complete KV and sparse allocations so layer-strided inactive tails are
+restored too. This requires additional GPU cache capacity and two additional
+full-state recording snapshots, both included in admission budgets.
+
+The hash-bound `restore.json` records schema `strix-raw-prefix-restore-v1`, exact
+prefix/snapshot identities, prefix token count and little-endian token hash,
+strictly advanced mutation position, restored position, execution/runtime/layout
+tuple, numerical identity, source/restored generations and complete lineages.
+It cannot establish resumed equivalence from a no-op mutation, foreign cache,
+partial state copy or supplied noncanonical prefix hash.
+
 Each executed token produces the full vocabulary of finite FP32 logits in
 little-endian order. `steps.jsonl` records its input ID, role, position, resulting
 position, complete-logits count/artifact and first-index-on-tie argmax. An explicit
@@ -58,6 +83,10 @@ binary artifact through its manifest. It records exact GGUF file SHA256 and
 executable SHA256, the loader's separate model-content identity, execution/kernel
 plan/layout/runtime compatibility IDs, GPU UUID/architecture and HIP runtime/
 driver versions. Native UUID/version metadata must be present and nonzero.
+The receipt also records `execution_mode`, the actual `numerical_identity`,
+`capture_origin` (`fresh_initialized` or `fresh_then_prefix_restored`) and a
+null or hash-bound `restore` artifact. Its history contract distinguishes eager
+and graph execution and requires the explicit restore event for restored runs.
 The receipt's `activation_storage` is an explicit validated `bf16` or `fp32`
 value; this native CLI binds `bf16` to its actual BF16 catalog and two-byte
 activation configuration. An importer must match that observed value to its
@@ -65,7 +94,7 @@ declared numerical input storage, independently of the FP32 logits dtype.
 Native device/runtime/allocation owners are rechecked around copies and before
 publication; model and executable bytes are rehashed before publication.
 
-The native app completes each eager token before reading logits and state.
+The native app completes each token before reading logits and state.
 Recording IO and hashing run outside the existing token timers, but they can
 alter cache behavior and the execution environment. The recording explicitly
 sets `performance_evidence=false`; neither its timers nor recorded CLI timing
@@ -92,6 +121,16 @@ cannot be proved, the diagnostic process flushes a bounded error message
 and fail-stops without normal resource destructors or a success receipt. This is
 not automatic recovery or a claim that failed GPU work was released normally.
 
+The shared native model-copy and fresh-runtime initialization paths also capture
+the selected UUID/architecture/runtime/driver identity before queuing setup work.
+All initialization bindings and extents are validated before the first memset.
+Successful setup work is synchronized and rechecked. If copying or initializing
+fails, cleanup requires an original-binding check, successful device drain and
+second original-binding check. An unproved drain fail-stops instead of freeing
+resident allocations, runtime state or the borrowed mapped source. This protects
+setup regardless of whether RAW recording is enabled; it does not recover a
+removed/replaced device or establish hardware qualification.
+
 The identity boundary assumes trusted, quiescent local artifacts, toolchain,
 reader callbacks and serialized session ownership. Lasting changes are checked;
 the recorder does not assert immutable execute-by-handle or adversarial runtime
@@ -103,7 +142,9 @@ The portable writer tests use explicitly injected fixture readers. They cover
 complete little-endian logits/history, all state components, bounds/overflow,
 enum/native identity guards, stale histories/targets, nonfinite logits, exact
 greedy EOS/context boundaries, unknown-copy retention, artifact drift and failed
-publication. Strict portable compilation and ASan/UBSan with leak detection
+publication, exact mode/profile metadata and actual checkpoint/restored component
+hashes, lineage and positive mutation guards. Strict portable compilation and
+ASan/UBSan with leak detection
 passed. The modified actual CLI compiled offline with ROCm 7.2.4 for `gfx1151`.
 No GPU/model execution or recording from physical hardware was performed.
 
@@ -111,6 +152,7 @@ An external campaign adapter still needs the exact source/compile receipt and
 numerical/kernel/prefill/history contracts, explicit prompt-case and tokenizer
 binding, teacher-forced evaluation span, and independently supplied decoded text
 where semantic evaluation requires it. The receipt identifies these as external
-bindings. It preserves `evidence_kind` as native-eager-raw or injected-fixture and
+bindings. It preserves `evidence_kind` as `native-eager-raw`, `native-graph-raw`,
+`native-integer-eager-raw` or `injected-fixture`, matched to the actual mode, and
 always keeps `qualified=false`. A fixture, artifact hash, raw argmax match or
 successful recorder invocation cannot promote itself to native qualification.

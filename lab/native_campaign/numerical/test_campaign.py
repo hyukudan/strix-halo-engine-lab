@@ -81,6 +81,7 @@ class Fixture:
             evidence = {"schema":"strix-declared-state-restoration-v1","origin":"restored","model_sha256":data["model_sha256"],
                         "executable_sha256":data["executable"]["sha256"],"source_manifest_sha256":data["source_manifest"]["sha256"],
                         "history_sha256":data["history_sha256"],"state_history_identity":data["state_history_identity"],
+                        **{name:data[name] for name in ("numerical_identity","kernel_plan_identity","prefill_identity")},
                         "history_contract":history,"restore_log":self.raw(b"synthetic restore event, never native proof")}
             data["capture_contract"] = {"origin":"restored","history_contract":history,"restoration_record":self.json(evidence)}
         return self.json(data)
@@ -117,6 +118,19 @@ class Tests(unittest.TestCase):
         with self.assertRaises(c.Invalid): c.evaluate(self.f.plan,self.f.observations)
         self.f.observations["cases"]["recurrent-resume"]["replay"] = None
         self.assertEqual(c.evaluate(self.f.plan,self.f.observations)["status"],"unknown")
+
+    def test_restoration_record_profile_and_nested_log_are_identity_bound(self):
+        replay = c.load(self.f.observations["cases"]["recurrent-resume"]["replay"]["path"])
+        evidence = c.load(replay["capture_contract"]["restoration_record"]["path"])
+        evidence["numerical_identity"] = "foreign profile"
+        replay["capture_contract"]["restoration_record"] = self.f.json(evidence)
+        self.f.observations["cases"]["recurrent-resume"]["replay"] = self.f.json(replay)
+        with self.assertRaises(c.Invalid): c.evaluate(self.f.plan,self.f.observations)
+        evidence["numerical_identity"] = self.f.plan["runtime"]["numerical_identity"]
+        replay["capture_contract"]["restoration_record"] = self.f.json(evidence)
+        self.f.observations["cases"]["recurrent-resume"]["replay"] = self.f.json(replay)
+        Path(evidence["restore_log"]["path"]).write_bytes(b"changed restoration log")
+        with self.assertRaises(c.Invalid): c.evaluate(self.f.plan,self.f.observations)
         self.f.plan["runtime"] = {"status":"unknown"}; self.f.rebind()
         self.assertEqual(c.evaluate(self.f.plan,self.f.observations)["status"],"unknown")
 
@@ -154,6 +168,12 @@ class Tests(unittest.TestCase):
 
     def test_exact_replay_rejects_signed_zero_logit_change(self):
         self.f.change("recurrent-resume", lambda data:data.update(logits=self.f.logits([[-0.0,2,1],[3,0,1]])), "replay")
+        result = c.evaluate(self.f.plan,self.f.observations)
+        self.assertEqual(result["status"],"fail")
+        self.assertFalse(result["cases"]["recurrent-resume"]["within_plan_state_match"])
+
+    def test_exact_replay_checks_actual_generation_logits_not_only_teacherforced_rows(self):
+        self.f.change("recurrent-resume", lambda data:data.update(generation_logits=self.f.logits([[0.25,2,1],[3,0,1]])), "replay")
         result = c.evaluate(self.f.plan,self.f.observations)
         self.assertEqual(result["status"],"fail")
         self.assertFalse(result["cases"]["recurrent-resume"]["within_plan_state_match"])
@@ -308,9 +328,9 @@ class Tests(unittest.TestCase):
         manifest["tensors"][0]["ggml_type"] = 20
         receipt = copy.deepcopy(self.f.receipt); receipt["manifest"] = self.f.json(manifest)
         plan["audit_receipt"] = self.f.json(receipt); plan["candidates"] = c.candidate_matrix(manifest)
-        plan["runtime"].update(mode="graph_float",candidate_id="t0:decode:M1:FP32_activation_control",numerical_identity="bound-floating-control")
+        plan["runtime"].update(mode="graph_float",candidate_id="t0:decode:M1:FP32_activation_control",numerical_identity=c.floating_profile("fp32"))
         c.validate_plan(plan)
-        plan["runtime"].update(input_storage="bf16",candidate_id="t0:decode:M1:BF16_activation_control")
+        plan["runtime"].update(input_storage="bf16",candidate_id="t0:decode:M1:BF16_activation_control",numerical_identity=c.floating_profile("bf16"))
         c.validate_plan(plan)
         plan["runtime"]["input_storage"] = "fp32"
         with self.assertRaises(c.Invalid): c.validate_plan(plan)
@@ -341,6 +361,46 @@ class Tests(unittest.TestCase):
         tensor.update(dimensions=[32,3,1],ggml_type=2,byte_size=54)
         integer = next(x for x in c.candidate_matrix({"tensors":[tensor]}) if x["id"]=="t0:decode:M1:W4A8")
         self.assertEqual(integer["integration"],"projection_diagnostic_only")
+        alternate = next(x for x in c.candidate_matrix({"tensors":[tensor]}) if x["id"]=="t0:decode:M1:W4A4:iu8")
+        default = next(x for x in c.candidate_matrix({"tensors":[tensor]}) if x["id"]=="t0:decode:M1:W4A4")
+        self.assertEqual(alternate["operand"],"iu8"); self.assertEqual(default["operand"],"iu4")
+        self.assertEqual(alternate["costs"],default["costs"])
+        self.assertIn(":symmetric_a4:iu8:",c.integer_profile(alternate,"bf16"))
+
+    def test_floating_profile_exact_storage_and_scoped_arithmetic_descriptor(self):
+        expected = ("strix-experimental-float-lm-head-v1:decode:C1:M1:bf16-source-widen-f32:"
+                    "original-ggml-weight-decode-f32:256-thread-feature-stride:fp32-sum-binary-tree:"
+                    "fp32-logits:compiler-bound-arithmetic:no-whole-model-precision-claim")
+        self.assertEqual(c.floating_profile("bf16"),expected)
+        self.assertNotEqual(c.floating_profile("fp32"),expected)
+        with self.assertRaises(c.Invalid): c.floating_profile("float16")
+
+    def test_unknown_plan_byte_admission_is_checked_before_creating_output(self):
+        plan = c.prepare_plan(self.f.receipt_pin["path"],self.f.prompts["path"])
+        self.assertEqual(plan["runtime"],{"status":"unknown"})
+        self.assertTrue(all(x["status"]=="unknown" for x in plan["references"].values()))
+        encoded_size = len(c.canonical(plan))+1
+        rejected = self.f.root/"never-created"/"plan.json"
+        with self.assertRaises(c.Invalid): c.write_new(plan,rejected,maximum=encoded_size-1)
+        self.assertFalse(rejected.parent.exists())
+        accepted = self.f.root/"admitted-plan.json"
+        c.write_new(plan,accepted,maximum=encoded_size)
+        self.assertEqual(accepted.stat().st_size,encoded_size)
+        self.assertEqual(c.load_plan(accepted),plan)
+        c.validate_plan(c.load_plan(accepted))
+        with self.assertRaises(c.Invalid): c.load(accepted,maximum=encoded_size-1)
+        self.assertEqual(c.MAX_PLAN_JSON,256*1024*1024)
+        self.assertEqual(c.MAX_JSON,16*1024*1024)
+
+    def test_long_context_text_has_explicit_utf8_byte_bound_without_token_inference(self):
+        prompts = c.load(self.f.prompts["path"])
+        case = next(x for x in prompts["cases"] if x["kind"]=="context")
+        case["text"] = "Neutral text. "*6000 + "界"*20000
+        case["context_min_tokens"] = 16384
+        self.assertGreater(len(case["text"].encode("utf-8")),65536)
+        self.assertEqual(c.validate_prompts(prompts)["cases"][-1]["context_min_tokens"],16384)
+        case["text"] = "界"*((1024*1024)//3+1)
+        with self.assertRaises(c.Invalid): c.validate_prompts(prompts)
 
     def test_exact_current_cpp_profile_identity_and_unknown_code_rejection(self):
         candidate = next(x for x in self.f.plan["candidates"] if x["id"] == "t0:decode:M1:W4A8")

@@ -1,4 +1,5 @@
 #include "strix/hip_model_residency.hpp"
+#include "strix/hip_setup_quiescence.hpp"
 
 #include <hip/hip_runtime.h>
 
@@ -468,6 +469,8 @@ HipModelResidency HipModelResidency::create(
                 manifest,
                 policy);
 
+        const HipSetupQuiescenceGuard setup_guard;
+
         try {
             result.copied_ranges_.reserve(
                 ranges.size());
@@ -483,17 +486,17 @@ HipModelResidency HipModelResidency::create(
                             bytes)),
                     "hipMalloc(model range copy)");
                 try {
-                    check_hip(
-                        hipMemcpy(
-                            device,
-                            reinterpret_cast<const void*>(
-                                mapped.base_address() +
-                                static_cast<std::uintptr_t>(
-                                    range.begin)),
-                            static_cast<std::size_t>(
-                                bytes),
-                            hipMemcpyHostToDevice),
-                        "hipMemcpy(model range copy)");
+                    setup_guard.run([&] {
+                        check_hip(
+                            hipMemcpy(
+                                device,
+                                reinterpret_cast<const void*>(
+                                    mapped.base_address() +
+                                    static_cast<std::uintptr_t>(range.begin)),
+                                static_cast<std::size_t>(bytes),
+                                hipMemcpyHostToDevice),
+                            "hipMemcpy(model range copy)");
+                    });
                 } catch (...) {
                     static_cast<void>(
                         hipFree(device));

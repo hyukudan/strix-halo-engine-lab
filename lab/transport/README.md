@@ -218,6 +218,29 @@ python3 lab/transport/dual_tbstream.py client \
 This runner launches one benchmark process per physical stream concurrently and
 reports both lane results plus aggregate useful payload throughput.
 
+The native runner requires POSIX process groups, as do these baseline binaries.
+`--timeout-seconds` (default 60, maximum 3600) bounds launch, waiting and result
+collection across both lanes. On failure or timeout it terminates both owned
+groups, escalates to kill and waits for the child leaders within bounded cleanup
+grace periods. Ordinary leader exit also triggers group cleanup. Output is
+spooled privately outside Git and rejected if it exceeds 1 MiB per stream;
+there are no abandoned pipe-reader wait threads. Failed cleanup is an error,
+not a successful benchmark. No configuration or physical link is modified.
+
+There is no common measured-start barrier. `measured_overlap` is `UNKNOWN` and
+`aggregate_performance_qualified` is false. Aggregate throughput uses the maximum
+reported lane duration as an estimate; it does not establish simultaneous
+measured windows or a qualified dual-link rate. Actual lane results remain
+available separately. A future synchronized harness must record aligned
+measurement windows before making overlap or simultaneous-throughput claims.
+
+Portable injected lifecycle tests (and local POSIX child processes without any
+network/GPU operations) run with:
+
+```sh
+python3 -W error::ResourceWarning -m unittest discover -s lab/transport -p test_dual_tbstream.py
+```
+
 It is intentionally called **parallel flows**, not single-tensor striping:
 
 - it tests whether the two physical paths interfere;

@@ -61,24 +61,130 @@ void LinuxDirectGpuStreamCommissioning::bind_exact_observed(const DirectDriverBi
 }
 DirectGpuCommissioningReport LinuxDirectGpuStreamCommissioning::run_once(const DirectGpuCommissioningConfig& config,
     const DirectGpuCommissioningPayload& payload, DirectGpuCommissioningProgress progress) {
-    validate_direct_gpu_commissioning_config(config);
-    if (!bound_ || ran_ || config.expected != binding_ || !progress.now || !progress.pause ||
-        (config.receiver ? payload.receive_segments.empty() || !payload.verify_full_payload : payload.send_segments.empty() || !payload.produce)) throw std::invalid_argument("commissioning run requires one exact bound role and retained payload callbacks");
-    ran_ = true; DirectGpuCommissioningReport report; report.pool_binding_identity = gpu_->exported_binding().pool_binding_identity;
+    auto session = run_batch(std::span{&config, 1}, std::span{&payload, 1}, std::move(progress));
+    DirectGpuCommissioningReport report;
+    if (!session.transfers.empty()) report = std::move(session.transfers.front());
+    report.pool_binding_identity = session.pool_binding_identity; report.import_generation = session.import_generation;
+    report.cleanup = session.cleanup; if (report.error.empty()) report.error = std::move(session.error);
+    return report;
+}
+DirectGpuCommissioningSessionReport LinuxDirectGpuStreamCommissioning::run_session(std::span<const DirectGpuCommissioningConfig> configs,
+    std::span<const DirectGpuCommissioningPayload> payloads, DirectGpuCommissioningProgress progress) {
+    if (configs.size() < 2) throw std::invalid_argument("commissioning session reuse requires at least two planned transfers");
+    return run_batch(configs, payloads, std::move(progress));
+}
+DirectGpuCommissioningSessionReport LinuxDirectGpuStreamCommissioning::run_batch(std::span<const DirectGpuCommissioningConfig> configs,
+    std::span<const DirectGpuCommissioningPayload> payloads, DirectGpuCommissioningProgress progress, bool duplex) {
+    if (!bound_ || ran_ || configs.empty() || configs.size() > 128 || payloads.size() != configs.size() || configs.front().descriptor.sequence != 1 || !progress.now || !progress.pause) throw std::invalid_argument("commissioning requires one bounded serialized exact transfer schedule beginning at sequence one");
+    if (duplex && (configs.size() % 2 || configs.size() < 2)) throw std::invalid_argument("paired duplex requires an even bounded transfer schedule");
+    std::uint64_t total_bytes = 0;
+    for (std::size_t index = 0; index < configs.size(); ++index) {
+        const auto& config = configs[index]; const auto& payload = payloads[index]; validate_direct_gpu_commissioning_config(config);
+        if (config.expected != binding_ || config.campaign_id != configs.front().campaign_id ||
+            (duplex && config.receiver != (index % 2 ? !configs.front().receiver : configs.front().receiver)) ||
+            (index && (configs[index - 1].descriptor.sequence == UINT64_MAX || config.descriptor.sequence != configs[index - 1].descriptor.sequence + 1)) ||
+            (config.receiver ? payload.receive_segments.empty() || !payload.verify_full_payload : payload.send_segments.empty() || !payload.produce)) throw std::invalid_argument("commissioning schedule contains foreign binding, nonmonotonic sequence or missing payload callback");
+        for (std::size_t prior = 0; prior < index; ++prior) if (configs[prior].run_id == config.run_id) throw std::invalid_argument("commissioning transfer identity is duplicated");
+        const auto& segments = config.receiver ? payload.receive_segments : payload.send_segments;
+        if (segments.size() > 64) throw std::invalid_argument("commissioning payload segment count exceeds bound");
+        std::uint64_t bytes = 0;
+        for (const auto& view : segments) {
+            if (view.domain != TransportMemoryDomain::gpu_device || view.bytes > config.descriptor.byte_length - bytes ||
+                !(config.receiver ? validate_transport_receive_buffer(view, view.bytes) : validate_transport_send_buffer(view, view.bytes))) throw std::invalid_argument("commissioning segment extent/domain/ownership is invalid");
+            bytes += view.bytes;
+        }
+        if (bytes != config.descriptor.byte_length) throw std::invalid_argument("commissioning segments do not cover the exact payload");
+        if (config.descriptor.byte_length > 128ULL * 1024ULL * 1024ULL - total_bytes) throw std::invalid_argument("commissioning session aggregate payload exceeds 128 MiB");
+        total_bytes += config.descriptor.byte_length;
+    }
+    ran_ = true; DirectGpuCommissioningSessionReport result; result.requested_transfers = static_cast<std::uint32_t>(configs.size());
+    result.pool_binding_identity = gpu_->exported_binding().pool_binding_identity; result.transfers.reserve(configs.size());
     try {
+        if (duplex) provider_->enable_commissioning_duplex();
         auto last = progress.now();
-        const auto duration = std::chrono::duration_cast<std::chrono::steady_clock::duration>(config.timeout);
-        if (last > std::chrono::steady_clock::time_point::max() - duration) throw std::overflow_error("commissioning deadline overflow");
-        const auto deadline = last + duration;
+        const auto first_duration = std::chrono::duration_cast<std::chrono::steady_clock::duration>(duplex ? std::min(configs.front().timeout, configs[1].timeout) : configs.front().timeout);
+        if (last > std::chrono::steady_clock::time_point::max() - first_duration) throw std::overflow_error("commissioning deadline overflow");
+        auto deadline = last + first_duration;
         const auto check = [&] {
             const auto now = progress.now(); if (now < last || now >= deadline) throw std::runtime_error("commissioning total deadline expired or clock changed"); last = now;
         };
         const auto& pool = gpu_->exported_binding().pool;
-        const auto imported = dispatch([&] { return provider_->prepare_import(binding_, {binding_.interface.physical_link_id, binding_.interface.connection_epoch, report.pool_binding_identity, 0, 1}, pool); });
-        report.import_generation = imported->binding().import_generation; check();
-        dispatch([&] { provider_->activate_import(imported); }); check();
+        const auto imported = dispatch([&] { return provider_->prepare_import(binding_, {binding_.interface.physical_link_id, binding_.interface.connection_epoch, result.pool_binding_identity, 0, 1}, pool); });
+        result.import_generation = imported->binding().import_generation;
+        check(); dispatch([&] { provider_->activate_import(imported); }); check();
+        for (std::size_t index = 0; index < configs.size(); index += duplex ? 2U : 1U) {
+        const auto& config = configs[index]; const auto& payload = payloads[index];
+        if (duplex) {
+            result.transfers.emplace_back(); result.transfers.emplace_back();
+            std::array<DirectDriverOperation, 2> operations;
+            for (std::size_t member = 0; member < 2; ++member) {
+                const auto& step = configs[index + member]; auto& report = result.transfers[index + member];
+                report.pool_binding_identity = result.pool_binding_identity; report.import_generation = result.import_generation; report.cleanup = DirectPoolReleaseStatus::pending;
+                auto view = step.receiver ? pool.rx : pool.tx; view.bytes = step.descriptor.byte_length;
+                operations[member] = {imported->binding(), index + member + 1, step.descriptor, view, step.receiver};
+            }
+            if (index) {
+                check(); const auto duration = std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::min(config.timeout, configs[index + 1].timeout));
+                if (last > std::chrono::steady_clock::time_point::max() - duration) throw std::overflow_error("commissioning duplex deadline overflow");
+                deadline = last + duration;
+            }
+            const std::size_t tx = config.receiver ? 1U : 0U, rx = 1U - tx;
+            auto& sent = result.transfers[index + tx]; auto& received = result.transfers[index + rx];
+            sent.executed = true; payloads[index + tx].produce(); check();
+            dispatch([&] { gpu_->stage_outbound_segments(operations[tx].descriptor, payloads[index + tx].send_segments, operations[tx].buffer); }); check();
+            for (const auto& operation : operations) { dispatch([&] { provider_->prepare(operation); }); check(); }
+            const auto& descriptor = operations[tx].descriptor;
+            dispatch([&] { static_cast<void>(provider_->publish_gpu_commit(operations[tx], {1, gpu_commit_word, descriptor.connection_epoch, descriptor.sequence, static_cast<std::uint32_t>(descriptor.byte_length), 0, 1})); }); check();
+            received.executed = true; dispatch([&] { provider_->submit(operations[rx]); }); check();
+            dispatch([&] { provider_->submit(operations[tx]); }); check();
+            const auto budget = static_cast<std::uint64_t>(config.maximum_progress_polls) + configs[index + 1].maximum_progress_polls;
+            for (std::uint64_t polls = 0; polls < budget; ++polls) {
+                check(); const auto event = dispatch([&] { return provider_->poll_event(); }); check();
+                if (!event) { progress.pause(); continue; }
+                const auto member = event->operation.receive_path ? rx : tx;
+                const auto& operation = operations[member]; auto& report = result.transfers[index + member];
+                if (event->operation.handle != operation.handle || !same_descriptor(event->operation.descriptor, operation.descriptor) || event->event.completion.handle != operation.handle || event->event.completion.bytes != operation.descriptor.byte_length) throw std::runtime_error("duplex completion is foreign to the bounded owned pair");
+                switch (event->event.completion.kind) {
+                case CompletionKind::receive_complete:
+                    if (member != rx || report.controller_frames_complete) throw std::runtime_error("duplex RX completion is duplicate or out of order");
+                    report.controller_frames_complete = true;
+                    dispatch([&] { static_cast<void>(provider_->read_gpu_commit(operation)); }); check(); report.gpu_acquire_complete = true;
+                    dispatch([&] { provider_->consume_received_segments(operation.descriptor, payloads[index + rx].receive_segments); }); check();
+                    dispatch([&] { static_cast<void>(provider_->consumer_completion(operation)); }); check(); report.consumer_complete = true;
+                    if (!payloads[index + rx].verify_full_payload()) throw std::runtime_error("duplex complete acquired/unpacked payload mismatch");
+                    check(); report.full_payload_verified = true;
+                    dispatch([&] { provider_->publish_consumer_credit(operation, operation.descriptor.byte_length); }); check(); report.consumer_credit = true;
+                    dispatch([&] { provider_->repost_receive(operation); }); check(); break;
+                case CompletionKind::receive_reposted:
+                    if (member != rx || !report.consumer_credit || report.receive_reposted) throw std::runtime_error("duplex repost lacks one completed verified consumer");
+                    report.receive_reposted = true; break;
+                case CompletionKind::local_buffer_reusable:
+                    if (member != tx || report.local_tx_complete) throw std::runtime_error("duplex TX completion is duplicate or foreign");
+                    report.controller_frames_complete = report.local_tx_complete = true; break;
+                case CompletionKind::remote_transport_ack:
+                    if (member != tx || !report.local_tx_complete || report.transport_ack) throw std::runtime_error("duplex ACK is duplicate or out of order");
+                    report.transport_ack = true; break;
+                case CompletionKind::remote_consumer_complete:
+                    if (member != tx || !report.transport_ack || report.consumer_credit) throw std::runtime_error("duplex credit is duplicate or out of order");
+                    report.consumer_credit = true; break;
+                default: throw std::runtime_error("duplex completion is failed or unsupported");
+                }
+                if (received.receive_reposted && sent.consumer_credit) break;
+            }
+            if (!received.receive_reposted || !sent.consumer_credit) throw std::runtime_error("duplex bounded pair progress exhausted");
+            for (std::size_t member = 0; member < 2; ++member) { dispatch([&] { provider_->retire(operations[member]); }); check(); result.transfers[index + member].completed_count = 1; ++result.completed_count; }
+            continue;
+        }
+        result.transfers.emplace_back(); auto& report = result.transfers.back(); report.pool_binding_identity = result.pool_binding_identity; report.import_generation = result.import_generation;
+        report.cleanup = DirectPoolReleaseStatus::pending; // The session deliberately retains the same import between transfers.
+        if (index) {
+            check();
+            const auto duration = std::chrono::duration_cast<std::chrono::steady_clock::duration>(config.timeout);
+            if (last > std::chrono::steady_clock::time_point::max() - duration) throw std::overflow_error("commissioning deadline overflow");
+            deadline = last + duration;
+        }
         auto view = config.receiver ? pool.rx : pool.tx; view.bytes = config.descriptor.byte_length;
-        DirectDriverOperation operation{imported->binding(), 1, config.descriptor, view, config.receiver};
+        DirectDriverOperation operation{imported->binding(), index + 1, config.descriptor, view, config.receiver};
         if (!config.receiver) {
             report.executed = true;
             payload.produce(); check();
@@ -111,12 +217,18 @@ DirectGpuCommissioningReport LinuxDirectGpuStreamCommissioning::run_once(const D
             wait(CompletionKind::remote_transport_ack); report.transport_ack = true;
             wait(CompletionKind::remote_consumer_complete); report.consumer_credit = true;
         }
-        dispatch([&] { provider_->retire(operation); }); check(); report.completed_count = 1;
-    } catch (const std::exception& error) { report.error = error.what(); provider_->invalidate(); }
-    catch (...) { report.error = "commissioning unknown callback failure"; provider_->invalidate(); }
-    report.cleanup = provider_->close();
-    if (report.cleanup != DirectPoolReleaseStatus::released && report.error.empty()) report.error = "commissioning cleanup retained pending controller/GPU resources";
-    return report;
+        dispatch([&] { provider_->retire(operation); }); check(); report.completed_count = 1; ++result.completed_count;
+        }
+    } catch (const std::exception& error) { result.error = error.what(); provider_->invalidate(); }
+    catch (...) { result.error = "commissioning unknown callback failure"; provider_->invalidate(); }
+    if (!result.error.empty()) for (auto& transfer : result.transfers) if (!transfer.completed_count) transfer.error = result.error;
+    result.cleanup = provider_->close();
+    if (result.cleanup != DirectPoolReleaseStatus::released && result.error.empty()) result.error = "commissioning cleanup retained pending controller/GPU resources";
+    return result;
+}
+DirectGpuCommissioningSessionReport LinuxDirectGpuStreamCommissioning::run_duplex_session(std::span<const DirectGpuCommissioningConfig> configs,
+    std::span<const DirectGpuCommissioningPayload> payloads, DirectGpuCommissioningProgress progress) {
+    return run_batch(configs, payloads, std::move(progress), true);
 }
 DirectPoolReleaseStatus LinuxDirectGpuStreamCommissioning::close() noexcept { return provider_->close(); }
 } // namespace strix::transport

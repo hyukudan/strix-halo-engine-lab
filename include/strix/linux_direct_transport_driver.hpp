@@ -37,13 +37,15 @@ struct LinuxDirectGpuStreamPolicy {
 };
 
 // Concrete experimental extension provider, never a stock-driver ioctl guess.
-// Exact QUERY/FD/ABI/peer/link/epoch/import fencing, C1 per direction, contiguous
+// Exact QUERY/FD/ABI/peer/link/epoch/import fencing, production global C1, contiguous
 // payload frames (partial final frame permitted) + one dedicated terminal frame.
 // Dedicated bounded v2 kind4 control stream supplies peer-ready/ACK/credit;
 // caller supplies a trusted bounded byte stream (FD copy or portable network),
 // retained for the entire provider lifetime; it must not block indefinitely.
 // hardware frame completion and GPU completion remain separate. Stock ENOTTY,
 // unsupported platforms and absent independent qualification stay unavailable.
+// A private commissioning facade can exercise one TX+RX pair; it cannot promote
+// query/current_binding authority or the production full_duplex capability.
 // Single serialized owner. Import/export/GPU/FD/control lifetimes survive errors;
 // no cancel/reset recovery, ring wrap or automatic retry of exposed identities.
 class LinuxDirectTransportDriverIo final : public DirectTransportDriverIo, public DirectGpuBoundaryReceiveIo {
@@ -85,6 +87,7 @@ public:
 private:
     friend class LinuxDirectGpuStreamCommissioning;
     void bind_commissioning_observed(const DirectDriverBinding&);
+    void enable_commissioning_duplex();
     void begin_commissioning_operation();
     void end_commissioning_operation() noexcept;
     struct Impl;

@@ -1,6 +1,8 @@
 #include "strix/hip_serial_graph.hpp"
 #include "strix/hip_runtime_allocator.hpp"
 #include "strix/model_tensor_index.hpp"
+#include "strix/serial_prefix_cache.hpp"
+#include "strix/hip_session_snapshot_transfer.hpp"
 #include <hip/hip_runtime.h>
 #include <algorithm>
 #include <array>
@@ -220,11 +222,19 @@ void run(){
     expect(eager->device_state()==captured->device_state()&&eager->host_state()==captured->host_state(),"capture must not execute or mutate persistent state");
     const auto hash=strix::build_ple_hash_contract(m);std::vector<std::uint32_t> history(2,1);
     const std::array<std::uint32_t,12> tokens{2,3,2,5,1,4,6,6,7,2,3,5};
+    std::optional<strix::SerialPrefixCacheEntry> graph_prefix;
+    strix::HipSessionSnapshotTransferBackend snapshot_transfer;
     std::vector<float> first_logits;bool varied=false;std::vector<std::byte> initial=eager->device_state();
     for(std::size_t position=0;position<tokens.size();++position){
         const auto er=strix::execute_serial_token(eager->compiled,es,eager->resources,tokens[position],eager_dispatch);
         check(hipDeviceSynchronize(),"actual complete eager token completion");
         const auto gr=graph.execute(gs,tokens[position]);
+        if (position == 3) {
+            graph_prefix = strix::SerialPrefixCacheEntry::capture(m,
+                std::span<const std::uint32_t>(tokens).first(4), gs, captured->layout,
+                captured->state, captured->allocator, captured->generations, snapshot_transfer);
+            check(hipDeviceSynchronize(), "graph prefix snapshot completion");
+        }
         expect(er.completed_steps==eager->compiled.execution.steps.size()&&gr.completed_steps==captured->compiled.execution.steps.size(),"both real DAGs complete all steps");
         const auto a=eager->logits(),b=captured->logits();expect(a.size()==b.size(),"whole logits dimensions");
         for(std::size_t i=0;i<a.size();++i){expect(std::isfinite(a[i])&&std::bit_cast<std::uint32_t>(a[i])==std::bit_cast<std::uint32_t>(b[i]),"graph/eager whole logits must match bits");}
@@ -240,6 +250,29 @@ void run(){
         std::memcpy(&recorded,reinterpret_cast<const void*>(where.address),8);expect(recorded==position,"host position is current committed absolute position");
     }
     expect(varied&&eager->device_state()!=initial,"fixture executes nonzero token/state work, not constant outputs");
+    const auto full_device = captured->device_state(), full_host = captured->host_state();
+    const auto full_logits = captured->logits();
+    const auto full_metadata = gs;
+    expect(graph_prefix && graph_prefix->valid(), "native graph prefix cache must retain recorded lineage");
+    graph_prefix->restore(gs, m, captured->layout, captured->state, snapshot_transfer,
+        std::span<const std::uint32_t>(tokens).first(4));
+    check(hipDeviceSynchronize(), "graph prefix restore completion");
+    expect(gs.next_position == 4 && gs.committed_tokens == 4 &&
+        gs.health == strix::SerialSessionHealth::ready, "native graph restore publishes exact prefix metadata");
+    for (std::size_t position = 4; position < tokens.size(); ++position) {
+        (void)graph.execute(gs, tokens[position]);
+    }
+    const auto replay_logits = captured->logits();
+    expect(replay_logits.size() == full_logits.size(), "restored graph logits shape");
+    for (std::size_t i = 0; i < full_logits.size(); ++i)
+        expect(std::bit_cast<std::uint32_t>(replay_logits[i]) == std::bit_cast<std::uint32_t>(full_logits[i]),
+            "restored same-plan graph final logits must match every bit");
+    expect(captured->device_state() == full_device && captured->host_state() == full_host,
+        "restored graph continuation preserves every KV/recurrent/convolution/index/history byte");
+    expect(gs.next_position == full_metadata.next_position && gs.committed_tokens == full_metadata.committed_tokens &&
+        gs.state.valid == full_metadata.state.valid && gs.state.generations == full_metadata.state.generations &&
+        strix::arithmetic_lineage_matches(gs.arithmetic_lineage, full_metadata.arithmetic_lineage, gs.next_position),
+        "restored graph continuation preserves state generations and actual arithmetic history");
     const auto prior=captured->device_state(),host=captured->host_state();const auto next=gs.next_position;
     ++captured->scratch.allocation_generation;rejects([&]{(void)graph.execute(gs,2);},"stale scratch generation rejected before replay");--captured->scratch.allocation_generation;
     ++weights->binding.tensors[0].allocation_generation;rejects([&]{(void)graph.execute(gs,2);},"stale model generation rejected before replay");--weights->binding.tensors[0].allocation_generation;

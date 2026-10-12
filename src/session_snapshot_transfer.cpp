@@ -3,9 +3,27 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace strix {
 namespace {
+
+struct ResolvedSnapshotTransfer {
+    SessionStateStorage storage;
+    std::uintptr_t source;
+    std::uintptr_t destination;
+    std::uint64_t bytes;
+};
+
+void validate_transfer_extent(std::uintptr_t address, std::uint64_t bytes) {
+    if (bytes && (!address || bytes > std::numeric_limits<std::uintptr_t>::max() - address))
+        throw std::invalid_argument("snapshot transfer address extent is null or overflows");
+}
+
+void validate_storage(SessionStateStorage storage) {
+    if (storage != SessionStateStorage::device && storage != SessionStateStorage::host)
+        throw std::invalid_argument("snapshot transfer storage is unsupported");
+}
 
 void validate_section(
     std::uintptr_t base,
@@ -41,6 +59,7 @@ std::uintptr_t section_address(
     SessionStateStorage storage,
     std::uint64_t offset,
     std::uint64_t bytes) {
+    validate_storage(storage);
     const auto base =
         storage ==
                 SessionStateStorage::device
@@ -65,9 +84,11 @@ std::uintptr_t section_address(
         throw std::overflow_error(
             "snapshot payload address overflows uintptr_t");
     }
-    return base +
+    const auto address = base +
            static_cast<std::uintptr_t>(
                offset);
+    validate_transfer_extent(address, bytes);
+    return address;
 }
 
 }  // namespace
@@ -117,8 +138,14 @@ void capture_serial_session_snapshot(
             "snapshot plan state layout does not match source state");
     }
 
+    // Resolve and validate every range before exposing either owner to a
+    // potentially asynchronous backend. Allocation/validation exceptions here
+    // cannot leave an earlier copy pending.
+    std::vector<ResolvedSnapshotTransfer> transfers;
+    transfers.reserve(snapshot.ranges.size());
     for (const auto& range :
          snapshot.ranges) {
+        validate_storage(range.storage);
         const auto source =
             resolve_session_state(
                 state_layout,
@@ -161,18 +188,22 @@ void capture_serial_session_snapshot(
                 range.storage,
                 range.destination_offset,
                 range.bytes);
+        validate_transfer_extent(source.address, range.bytes);
+        transfers.push_back({range.storage, source.address, destination, range.bytes});
+    }
 
-        if (range.storage ==
+    for (const auto& transfer : transfers) {
+        if (transfer.storage ==
             SessionStateStorage::device) {
             backend.capture_device(
-                source.address,
-                destination,
-                range.bytes);
+                transfer.source,
+                transfer.destination,
+                transfer.bytes);
         } else {
             backend.capture_host(
-                source.address,
-                destination,
-                range.bytes);
+                transfer.source,
+                transfer.destination,
+                transfer.bytes);
         }
     }
 }
@@ -212,60 +243,51 @@ void restore_serial_session_snapshot(
         state_layout,
         state_memory);
 
-    if (snapshot_memory.device_section_bytes <
-            restore.snapshot_device_bytes ||
-        snapshot_memory.host_section_bytes <
-            restore.snapshot_host_bytes) {
-        throw std::invalid_argument(
-            "snapshot memory is smaller than restore payload");
+    validate_section(snapshot_memory.device_section_base,
+        snapshot_memory.device_section_bytes, restore.snapshot_device_bytes, "device");
+    validate_section(snapshot_memory.host_section_base,
+        snapshot_memory.host_section_bytes, restore.snapshot_host_bytes, "host");
+
+    std::vector<ResolvedSnapshotTransfer> transfers;
+    transfers.reserve(restore.ranges.size());
+    for (const auto& range : restore.ranges) {
+        validate_storage(range.storage);
+        const auto destination = resolve_session_state(
+            state_layout, state_memory, range.component);
+        if (destination.storage != range.storage || range.bytes > destination.bytes) {
+            throw std::invalid_argument(
+                "restore destination range does not match state component");
+        }
+        const auto source = section_address(
+            snapshot_memory, range.storage, range.snapshot_offset, range.bytes);
+        const auto* allocation = find_session_state_allocation(state_layout, range.component);
+        if (!allocation || range.destination_offset != allocation->offset)
+            throw std::invalid_argument("restore destination offset does not match state allocation");
+        const auto expected_destination =
+            (range.storage == SessionStateStorage::device
+                 ? state_memory.device_base : state_memory.host_base) +
+            static_cast<std::uintptr_t>(range.destination_offset);
+        if (destination.address != expected_destination) {
+            throw std::invalid_argument(
+                "restore destination offset does not match bound state layout");
+        }
+        validate_transfer_extent(destination.address, range.bytes);
+        transfers.push_back({range.storage, source, destination.address, range.bytes});
     }
 
     try {
-        for (const auto& range :
-             restore.ranges) {
-            const auto destination =
-                resolve_session_state(
-                    state_layout,
-                    state_memory,
-                    range.component);
-            if (destination.storage !=
-                    range.storage ||
-                range.bytes >
-                    destination.bytes) {
-                throw std::invalid_argument(
-                    "restore destination range does not match state component");
-            }
-
-            const auto source =
-                section_address(
-                    snapshot_memory,
-                    range.storage,
-                    range.snapshot_offset,
-                    range.bytes);
-            const auto expected_destination =
-                (range.storage ==
-                         SessionStateStorage::device
-                     ? state_memory.device_base
-                     : state_memory.host_base) +
-                static_cast<std::uintptr_t>(
-                    range.destination_offset);
-            if (destination.address !=
-                expected_destination) {
-                throw std::invalid_argument(
-                    "restore destination offset does not match bound state layout");
-            }
-
-            if (range.storage ==
+        for (const auto& transfer : transfers) {
+            if (transfer.storage ==
                 SessionStateStorage::device) {
                 backend.restore_device(
-                    source,
-                    destination.address,
-                    range.bytes);
+                    transfer.source,
+                    transfer.destination,
+                    transfer.bytes);
             } else {
                 backend.restore_host(
-                    source,
-                    destination.address,
-                    range.bytes);
+                    transfer.source,
+                    transfer.destination,
+                    transfer.bytes);
             }
         }
     } catch (...) {

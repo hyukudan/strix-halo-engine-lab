@@ -60,6 +60,7 @@ struct HipDirectGpuStreamGpu::Impl {
     std::array<std::optional<Operation>, 2> operations;
     std::optional<DirectDriverImportBinding> imported;
     std::optional<std::pair<TransferDescriptor, TransportBufferView>> staged;
+    std::optional<std::chrono::steady_clock::time_point> last_progress_time;
     bool failed = false, stopping = false, closed = false, stream_destroy_unknown = false;
     Impl(std::shared_ptr<DirectGpuExportImportLease> lease, HipDirectGpuStreamExecutionOwner e, HipDirectGpuStreamGpuPolicy p, HipDirectGpuStreamGpuCalls c)
         : import_lease(std::move(lease)), binding(import_lease ? import_lease->binding() : DirectGpuExportBinding{}), execution(std::move(e)), policy(p), calls(std::move(c)), probe(calls.observations) {}
@@ -127,18 +128,31 @@ struct HipDirectGpuStreamGpu::Impl {
             throw std::invalid_argument("GPU terminal region does not match final owned pool frame");
         }
     }
-    void wait(Event& event) {
+    std::chrono::steady_clock::time_point monotonic_now() {
+        const auto value = calls.now();
+        if (last_progress_time && value < *last_progress_time) throw std::runtime_error("HIP transport completion clock regressed; ownership retained");
+        last_progress_time = value; return value;
+    }
+    void wait(Event& event, std::chrono::steady_clock::time_point start) {
         if (!event.recorded) throw std::logic_error("unrecorded HIP event cannot prove queued work complete");
+        const auto duration = std::chrono::duration_cast<std::chrono::steady_clock::duration>(policy.completion_timeout);
+        if (start > std::chrono::steady_clock::time_point::max() - duration) throw std::overflow_error("HIP transport completion deadline overflow; ownership retained");
+        const auto deadline = start + duration;
+        const auto require_before_deadline = [&] {
+            if (monotonic_now() >= deadline) throw std::runtime_error("HIP transport completion deadline expired; ownership retained");
+        };
         for (std::uint64_t count = 0; count < policy.maximum_completion_polls; ++count) {
-            current(); const auto result = calls.query_event(event.handle); current();
+            require_before_deadline(); current(); const auto result = calls.query_event(event.handle); current(); require_before_deadline();
             if (result == hipSuccess) { event.complete = true; return; }
             if (result != hipErrorNotReady) check(result, "HIP transport event completion");
+            if (count + 1 < policy.maximum_completion_polls) { calls.pause(policy.completion_pause); require_before_deadline(); }
         }
         throw std::runtime_error("HIP transport completion budget exhausted; ownership retained");
     }
     void record(Event& event) {
+        const auto start = monotonic_now();
         check(calls.record_event(event.handle, stream), "HIP transport system-fence event record"); event.recorded = true;
-        current(); wait(event);
+        current(); wait(event, start);
     }
     void destroy(Event& event) {
         if (!event.handle) return;
@@ -153,10 +167,11 @@ HipDirectGpuStreamGpu::HipDirectGpuStreamGpu(std::shared_ptr<DirectGpuExportImpo
     : impl_(std::make_unique<Impl>(std::move(lease), std::move(execution), policy, std::move(calls))) {
     auto& i = *impl_;
     try {
-        if (!i.import_lease || !policy.experimental_opt_in || !policy.maximum_completion_polls || !policy.maximum_execution_retained_bytes ||
+        if (!i.import_lease || !policy.experimental_opt_in || !policy.maximum_completion_polls || policy.maximum_completion_polls > 1000000 || !policy.maximum_execution_retained_bytes ||
+            policy.completion_timeout.count() <= 0 || policy.completion_timeout > std::chrono::minutes{1} || policy.completion_pause.count() <= 0 || policy.completion_pause > std::chrono::seconds{1} || policy.completion_pause > policy.completion_timeout ||
             !i.execution.lifetime || i.execution.buffers.empty() || i.execution.buffers.size() > 64 || !i.execution.current_buffers ||
             !i.calls.create_stream || !i.calls.query_stream || !i.calls.destroy_stream || !i.calls.stream_device || !i.calls.stream_id || !i.calls.stream_capture ||
-            !i.calls.allocate_host || !i.calls.free_host || !i.calls.create_event || !i.calls.record_event || !i.calls.query_event || !i.calls.destroy_event || !i.calls.copy) {
+            !i.calls.allocate_host || !i.calls.free_host || !i.calls.create_event || !i.calls.record_event || !i.calls.query_event || !i.calls.destroy_event || !i.calls.copy || !i.calls.now || !i.calls.pause) {
             throw std::invalid_argument("HIP transport requires explicit opt-in, complete retained execution owner and bounded native calls");
         }
         i.import_lease->require_current(); i.current();

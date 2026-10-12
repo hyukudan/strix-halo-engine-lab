@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import math
@@ -18,6 +19,7 @@ import time
 SCHEMA = "strix-native-numerical-campaign-v1"
 ROOT = Path(__file__).resolve().parents[3]
 MAX_JSON = 16 * 1024 * 1024
+MAX_PLAN_JSON = 256 * 1024 * 1024
 MAX_LINE = 8 * 1024 * 1024
 MAX_LOGITS_FILE = 8 * 1024**3
 MAX_MODEL = 512 * 1024**3
@@ -25,6 +27,7 @@ MAX_POSITIONS = 4096
 MAX_VOCAB = 262144
 STATE_CLASSES = ("kv", "recurrent", "convolution", "host_ngram", "sparse_index", "position")
 FRESH_RAW_HISTORY = "single_row_eager_from_fresh_initialized_state"
+FRESH_GRAPH_HISTORY = "single_row_graph_from_fresh_initialized_state"
 KINDS = {"logits", "greedy", "json", "tool", "state", "context"}
 THRESHOLDS = {"max_abs_logit_error": 0.05, "max_mean_kl": 0.001,
               "max_nll_increase": 0.02, "max_teacher_forced_argmax_mismatch_rate": 0.01,
@@ -32,6 +35,13 @@ THRESHOLDS = {"max_abs_logit_error": 0.05, "max_mean_kl": 0.001,
               "semantic_failures": 0, "state_byte_mismatches": 0}
 ROW_CONTRACT = ("strix-row-quant-v1:f64:nearest-even:divide:no-ftz:finite-only:"
                 "symmetric-127-or-7:zero-scale-one:exact-groups:ordered-groups")
+
+
+def floating_profile(input_storage):
+    require(input_storage in {"bf16", "fp32"}, "unknown floating activation storage")
+    return (f"strix-experimental-float-lm-head-v1:decode:C1:M1:{input_storage}-source-widen-f32:"
+            "original-ggml-weight-decode-f32:256-thread-feature-stride:fp32-sum-binary-tree:"
+            "fp32-logits:compiler-bound-arithmetic:no-whole-model-precision-claim")
 
 
 def integer_profile(candidate, input_storage):
@@ -162,11 +172,17 @@ def load(path, maximum=MAX_JSON):
     return parse_json(raw)
 
 
-def write_new(value, path):
+def load_plan(path):
+    return load(path, MAX_PLAN_JSON)
+
+
+def write_new(value, path, maximum=MAX_JSON):
     path = private_path(path)
+    encoded = canonical(value) + b"\n"
+    require(len(encoded) <= maximum, "JSON artifact exceeds explicit byte admission")
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("xb") as stream:
-        stream.write(canonical(value) + b"\n")
+        stream.write(encoded)
 
 
 def source_manifest(value):
@@ -294,7 +310,7 @@ def validate_prompts(data):
     for case in data["cases"]:
         keys(case, ("id", "kind", "text", "context_min_tokens", "max_new_tokens", "expected"))
         name = text(case["id"], 128); require(name not in names and case["kind"] in KINDS, "duplicate/unknown prompt case")
-        names.add(name); text(case["text"])
+        names.add(name); text(case["text"],1024*1024)
         integer(case["context_min_tokens"], 1, 32768); integer(case["max_new_tokens"], 1, 256)
         require(case["expected"] is None if case["kind"] not in {"json", "tool", "context"}
                 else isinstance(case["expected"], dict), "JSON/tool/context cases need semantic expected object")
@@ -365,6 +381,11 @@ def candidate_matrix(manifest):
                                                    "floating_control_needs_exact_profile") if integrated else "projection_diagnostic_only",
                                    "reason": "exact audited storage blocks" if valid else "unsupported encoding or partial storage block",
                                    "costs": costs})
+                    if encoding == "q4_0" and activations == "W4A4":
+                        alternate = copy.deepcopy(result[-1])
+                        alternate.update(id=alternate["id"]+":iu8",operand="iu8")
+                        result.append(alternate)
+                    require(len(result) <= 100000, "projection candidate inventory exceeds bound")
     require(0 < len(result) <= 100000, "no bounded projection candidate inventory")
     return result
 
@@ -427,7 +448,7 @@ def validate_plan(plan):
                                               "floating_control_needs_exact_profile"), "runtime arithmetic/path mismatch")
         require(runtime["numerical_identity"] == integer_profile(candidate, runtime["input_storage"]) if integer_mode else
                 candidate["activation_class"] == ("BF16_activation_control" if runtime["input_storage"] == "bf16" else "FP32_activation_control")
-                and not runtime["numerical_identity"].startswith("strix-experimental-lm-head-v1:"),
+                and runtime["numerical_identity"] == floating_profile(runtime["input_storage"]),
                 "runtime numerical profile disagrees with candidate storage/activation/operand contract")
     return plan
 
@@ -511,11 +532,29 @@ def token_edit_rate(a, b):
     return previous[-1] / max(len(a), len(b))
 
 
+def validate_input_token_evidence(artifact, model_sha256, case, input_tokens, vocab):
+    data = load(verify_pin(artifact))
+    try:
+        from tensormeld.llamacpp_tokenization import validate_tokenization_receipt
+        spec = validate_tokenization_receipt(data,require_observed=True).config
+    except ImportError as error:
+        raise Invalid("observed input-token evidence requires the pinned TensorMeld tokenizer adapter") from error
+    except (ValueError,OSError) as error:
+        raise Invalid("invalid observed input-token evidence") from error
+    require(spec["model"]["sha256"] == model_sha256 and spec["prompt_contract_sha256"] == identity(case)
+            and spec["prompt"]["sha256"] == hashlib.sha256(case["text"].encode("utf-8")).hexdigest()
+            and spec["controls"]["vocabulary_size"] == vocab and data["tokens"] == input_tokens,
+            "observed tokenizer belongs to another GGUF/rendered text/prefix/vocabulary")
+    verify_pin(artifact)
+    return data["result_sha256"]
+
+
 def record(artifact, plan, case, vocab, candidate=False):
     data = load(verify_pin(artifact))
     keys(data, ("schema", "model_sha256", "prompt_sha256", "executable", "source_manifest", "numerical_identity",
                 "kernel_plan_identity", "prefill_identity", "state_history_identity", "history_sha256", "input_tokens", "logits",
-                "teacher_forced_target_tokens", "generation_logits", "output_tokens", "output_text", "state", "timings_ms", "capture_contract"))
+                "teacher_forced_target_tokens", "generation_logits", "output_tokens", "output_text", "state", "timings_ms", "capture_contract"),
+         optional=("input_token_evidence",))
     require(data["schema"] == "strix-numerical-record-v1" and data["model_sha256"] == plan["model_sha256"]
             and data["prompt_sha256"] == identity(case), "record belongs to another model/prompt contract")
     verify_pin(data["executable"], MAX_LOGITS_FILE); source_manifest(data["source_manifest"])
@@ -529,16 +568,18 @@ def record(artifact, plan, case, vocab, candidate=False):
     if capture["origin"] == "fresh":
         require(capture["restoration_record"] is None, "fresh capture cannot claim restoration evidence")
     else:
-        require(capture["history_contract"] != FRESH_RAW_HISTORY, "fresh RAW history cannot become restored lineage")
+        require(capture["history_contract"] not in {FRESH_RAW_HISTORY,FRESH_GRAPH_HISTORY}, "fresh RAW history cannot become restored lineage")
         restored = load(verify_pin(capture["restoration_record"]))
         keys(restored, ("schema", "origin", "model_sha256", "executable_sha256", "source_manifest_sha256",
-                       "history_sha256", "state_history_identity", "history_contract", "restore_log"))
+                       "history_sha256", "state_history_identity", "history_contract", "restore_log", "numerical_identity",
+                       "kernel_plan_identity", "prefill_identity"))
         require(restored["schema"] == "strix-declared-state-restoration-v1" and restored["origin"] == "restored"
                 and restored["model_sha256"] == data["model_sha256"]
                 and restored["executable_sha256"] == data["executable"]["sha256"]
                 and restored["source_manifest_sha256"] == data["source_manifest"]["sha256"]
                 and restored["history_sha256"] == data["history_sha256"]
                 and restored["state_history_identity"] == data["state_history_identity"]
+                and all(restored[name] == data[name] for name in ("numerical_identity", "kernel_plan_identity", "prefill_identity"))
                 and restored["history_contract"] == capture["history_contract"], "restoration declaration belongs to another producer/history")
         verify_pin(restored["restore_log"])
     require(isinstance(data["input_tokens"], list) and case["context_min_tokens"] <= len(data["input_tokens"]) <= 32768
@@ -546,6 +587,8 @@ def record(artifact, plan, case, vocab, candidate=False):
             "empty/truncated or unrealistic context/token observations")
     for token in data["input_tokens"] + data["output_tokens"]:
         integer(token, 0, vocab - 1)
+    if "input_token_evidence" in data:
+        validate_input_token_evidence(data["input_token_evidence"],data["model_sha256"],case,data["input_tokens"],vocab)
     require(isinstance(data["teacher_forced_target_tokens"], list)
             and 1 <= len(data["teacher_forced_target_tokens"]) <= MAX_POSITIONS, "missing teacher-forced targets")
     for token in data["teacher_forced_target_tokens"]:
@@ -631,11 +674,15 @@ def evaluate(plan, observations):
                 and replay["state"][name]["bytes"] == result["state"][name]["bytes"] for name in STATE_CLASSES)
                 replay_metrics = compare_logits(result["logits"], replay["logits"], vocab)
                 state &= replay_metrics["binary32_logit_bits_mismatched"] == 0 and replay_metrics["max_teacher_forced_argmax_mismatch_rate"] == 0
+                if replay["output_tokens"] == result["output_tokens"]:
+                    generation_metrics = compare_logits(result["generation_logits"], replay["generation_logits"], vocab)
+                    state &= generation_metrics["binary32_logit_bits_mismatched"] == 0
                 passed &= state
         elif observation["replay"] is not None:
             raise Invalid("undeclared replay record")
         results[case["id"]] = {"status": "fail" if not passed else "unknown" if missing_restore else "pass", "metrics": metrics,
-                                "semantic_match": semantic, "within_plan_state_match": state, "timings_ms": result["timings_ms"]}
+                                "semantic_match": semantic, "within_plan_state_match": state, "timings_ms": result["timings_ms"],
+                                "input_token_binding":"observed-upstream-tool" if "input_token_evidence" in result else "external-operator-assertion"}
         if missing_restore:
             results[case["id"]]["reason"] = "restored-state capture producer/evidence unavailable"
     # Input identity is rechecked after evaluation; observations are trusted
@@ -669,13 +716,13 @@ def main(argv=None):
             audit_model(args.model, args.model_sha256, args.manifest_tool, args.manifest_tool_sha256,
                         args.tensor_audit_tool, args.tensor_audit_tool_sha256, args.out)
         elif args.command == "prepare":
-            plan = prepare_plan(args.audit, args.prompts); validate_plan(plan); write_new(plan, args.out)
+            plan = prepare_plan(args.audit, args.prompts); validate_plan(plan); write_new(plan, args.out, MAX_PLAN_JSON)
             print(json.dumps({"plan_sha256": identity(plan), "native_execution": "not_done"}))
         elif args.command == "validate":
-            plan = validate_plan(load(private_path(args.plan))); print(json.dumps({"plan_sha256": identity(plan), "structurally_valid": True, "qualified": False}))
+            plan = validate_plan(load_plan(private_path(args.plan))); print(json.dumps({"plan_sha256": identity(plan), "structurally_valid": True, "qualified": False}))
         else:
             observed_pin = pin(args.observations)
-            report = evaluate(load(private_path(args.plan)), load(verify_pin(observed_pin))); verify_pin(observed_pin); write_new(report, args.out)
+            report = evaluate(load_plan(private_path(args.plan)), load(verify_pin(observed_pin))); verify_pin(observed_pin); write_new(report, args.out)
             print(json.dumps({"status": report["status"], "qualified": False}))
             return {"pass": 0, "unknown": 3, "fail": 4}[report["status"]]
         return 0

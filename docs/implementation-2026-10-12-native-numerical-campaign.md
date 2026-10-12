@@ -25,18 +25,27 @@ launcher. W4A16 remains diagnostic/unbound. No integer graph
 composition, speculative target substitution or runtime qualification follows.
 
 The opt-in native token decoder RAW recorder and host `raw_import.py` now form a
-concrete eager floating baseline/result collection path. Paired teacher-forced
+concrete eager floating, floating graph and experimental integer-head
+baseline/result collection path. Actual mode, source activation storage and
+emitted numerical descriptor must match the exact selected compiled plan.
+Integer selection changes the head only; it does not claim whole-model A4/A8.
+Paired teacher-forced
 and actual greedy histories remain distinct; final state comes from the greedy
 capture, including both convolution allocations. Model/executable/runtime/layout
 observations and every nested artifact are checked. Source/compile associations
 and external tokenization/decoded text remain explicit pinned operator declarations,
 not attestation. Diagnostic costs are unknown rather than invented measurements.
 
-RAW recording is fresh-state only. Imported records preserve that history contract
-and cannot satisfy a restored replay gate. Missing restored captures stay unknown;
+Actual prefix-cache roundtrip recording emits its source checkpoint, restored
+checkpoint, full canonical arithmetic lineage and observed mutation position.
+The importer checks every component byte, generation, token hash and canonical
+identity without fabricating token/chunk rows. Restored graph and eager captures
+use distinct explicit history contracts and cannot cross compiled plans. Exact
+replay compares actual generation logits as well as teacher-forced logits,
+tokens and complete persistent state. Missing restored captures stay unknown;
 two fresh duplicates are rejected. The full real-model campaign still requires
-all actual prompt/reference recordings, native prefix-restoration recording,
-integer/graph model capture adapters, independent fidelity and target execution.
+all actual prompt/reference recordings, trusted external tokenization/text,
+independent fidelity and target execution.
 No model, GPU or network campaign was executed. Native operator fixtures and the
 independent transport commissioning runbook remain their own first-hardware gates.
 

@@ -92,7 +92,7 @@ and does not create a qualification/admission record.
 
 ## One-way run
 
-The initial profile performs one transfer, sequence 1, with opaque bytes. Both
+The default profile performs one transfer, sequence 1, with opaque bytes. Both
 processes use the same campaign/run IDs, seed, byte length and descriptor IDs.
 The SHA-256-derived shape fingerprint binds those pattern/run fields; existing
 v2 kind4 control messages also check every descriptor field, endpoint UUID,
@@ -118,9 +118,59 @@ Only a complete matching payload permits consumed credit and physical RX repost.
 The sender waits for controller completion, transport ACK and consumer credit
 before retirement. ACK alone does not report successful payload verification.
 
-Swap roles only in separate processes using a new increasing epoch/run/request.
-Do not reuse an exposed epoch after a failed attempt. Native C1 capacity is one
-global bulk operation, contiguous payload frames without wrap, with a dedicated
+## Reuse and bounded duplex sessions
+
+`--iterations N` selects 2–128 complete transfers on the same owned FD, exported
+pool, import generation and ARM. The epoch is fresh for the whole invocation;
+physical sequences and operation handles increase through the session. Run IDs
+are `RUN.s0`, `RUN.s1`, and so on. `--payload-sizes 1,4097,5120` supplies exactly
+one size per transfer, with the first equal to `--payload-bytes`. Without this
+option each transfer uses the initial size. Total scheduled payload is bounded
+to 128 MiB; native source/acquire/unpack/readback allocations use the largest
+size, and actual allocation extents remain independently admitted.
+
+The default session is sequential. `--alternate-directions` reverses roles for
+every successive transfer; both peers keep reciprocal local roles. Every TX
+waits for controller completion, ACK and consumer credit, and every RX completes
+acquire/unpack/full verification/credit/repost. Retirement finishes before the
+next producer or RX geometry replacement. The driver's next RX PREPARE safely
+drains/rearms old standby frames; unsolicited standby traffic remains an error.
+
+`--duplex-pairs` instead requires an even count and permits one TX and one RX
+operation at a time. It is mutually exclusive with `--alternate-directions`.
+Adjacent transfers have opposite roles; both peers publish their TX producer
+record, post RX, exchange exact ready messages and only then submit TX. Owned
+controller completions are demultiplexed by the two exact handles/descriptors.
+RX acquire, consumer verification and repost progress before a blocking TX
+ACK/credit read, including TX-first completion. Both operations retire before
+the next pair. No third operation, unbounded queue, concurrent caller, larger
+pipeline, automatic recovery or production full-duplex capability is enabled.
+The two-operation capacity and successful paired completion do not prove
+simultaneous physical DMA. The current receipt has no matched controller DMA
+start/end intervals. The independent checker explicitly reports physical
+overlap as `UNKNOWN`; host submission order or the order of polling completions
+cannot replace target timing/traces or qualify overlap.
+
+Session config schema `strix-direct-gpu-commissioning-session-config-v2` contains
+`campaign_id`, `session_id`, `schedule` (`sequential`, `alternating` or
+`duplex_pairs`), `concurrency` (1 or 2 respectively), `executed:false`,
+`production_qualified:false` and ordered `transfers`. Transfer configs retain
+the exact config-v1 fields. Session receipts use
+`strix-direct-gpu-commissioning-session-v2` with the same session identity,
+`requested_transfers`, `completed_count`, stable `pool_binding_identity` and
+`import_generation`, final `cleanup`, `error`, `production_qualified:false`, and
+ordered `transfers`. Each emitted transfer has the complete legacy receipt
+fields but explicit schema `strix-direct-gpu-commissioning-transfer-v2` and
+`cleanup:"import_held"`; only the outer cleanup describes final release. A
+failed step/pair aborts the suffix, whose unattempted records are absent. Missing
+coverage or any retained resource cannot pass paired review. Legacy v1 schemas
+remain unchanged and reject session-v2 records.
+
+The one-way v1 profile reverses roles in separate processes using a new increasing
+epoch/run/request. Session-v2 changes direction only through its declared schedule.
+Do not reuse an exposed epoch after a failed attempt. Production C1 capacity is
+one global bulk operation; the isolated duplex profile is one TX+RX pair.
+Payload frames are contiguous without wrap, with a dedicated
 terminal frame; the final payload frame may be partial. Maximum payload is
 `(ring_frames - 1) * 4096`, at most 16 MiB minus one frame. Imported extents are
 bounded to 128 MiB; three complete native execution allocations are admitted by
@@ -142,7 +192,15 @@ error schema and are not valid run receipts.
 
 TCP connect/listen and each frame have wall-clock deadlines and syscall budgets.
 Controller progress, GPU event polling and full readback are bounded too. The
-total runner deadline is checked around trusted callbacks and ioctls; it cannot
+GPU helper waits cooperatively using an independent monotonic event deadline
+and pause, checking before and after queries and after pauses. Native CLI
+`--gpu-timeout-ms` (default 10000), `--gpu-maximum-polls` (default 100001) and
+`--gpu-pause-ms` (default 1) apply to producer, acquire, consumer and full readback
+events. They are separate from controller `--maximum-polls`; both GPU time and
+call-count bounds must permit completion. Clock regression, unavailable clocks,
+late success or a pause/callback error fail closed with queued owners retained.
+These are configured limits, not observed performance or cache-coherence proof.
+The total runner deadline is checked around trusted callbacks and ioctls; it cannot
 preempt a stuck kernel ioctl or arbitrary callback. An operator watchdog may
 bound process supervision, but killing a process is not a completion proof.
 

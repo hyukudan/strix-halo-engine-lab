@@ -21,8 +21,12 @@ struct Fixture {
     std::uintptr_t next_event = 0x5000;
     unsigned long long stream_id = 9;
     bool fail_copy_after_queue = false, fail_record = false, mutate_generation = false;
+    std::chrono::steady_clock::time_point clock{};
+    int pauses = 0;
     HipDirectGpuStreamGpuCalls calls = HipDirectGpuStreamGpuCalls::native();
     Fixture() {
+        calls.now = [&] { return clock; };
+        calls.pause = [&](std::chrono::milliseconds duration) { ++pauses; clock += duration; };
         execution = {pool.external(16384), pool.external(16384), pool.external(16384)};
         auto& observation = calls.observations;
         observation.get_device = [&](int* value) { *value = pool.state->device.index; return hipSuccess; };
@@ -83,9 +87,9 @@ struct Fixture {
     }
     TransportBufferView terminal(bool receive) const { auto view = receive ? imported().pool.rx : imported().pool.tx; view.address += view.bytes - 4096; view.bytes = 32; return view; }
     GpuCommitRecord commit(std::uint64_t sequence = 1) const { return {1, gpu_commit_word, 77, sequence, 5120, 0, 1}; }
-    std::unique_ptr<HipDirectGpuStreamGpu> prepare(std::uint64_t polls = 8) {
+    std::unique_ptr<HipDirectGpuStreamGpu> prepare(std::uint64_t polls = 8, std::chrono::milliseconds timeout = std::chrono::milliseconds{10000}, std::chrono::milliseconds pause = std::chrono::milliseconds{1}) {
         HipDirectGpuStreamExecutionOwner owner; owner.lifetime = pool.state; owner.buffers = execution; owner.receive_destination = execution[1]; owner.current_buffers = [&] { return execution; };
-        auto gpu = std::make_unique<HipDirectGpuStreamGpu>(pool.lease, owner, HipDirectGpuStreamGpuPolicy{true, polls, 3 * 16384}, calls); gpu->bind_import(imported()); return gpu;
+        auto gpu = std::make_unique<HipDirectGpuStreamGpu>(pool.lease, owner, HipDirectGpuStreamGpuPolicy{true, polls, 3 * 16384, timeout, pause}, calls); gpu->bind_import(imported()); return gpu;
     }
     void stage(HipDirectGpuStreamGpu& gpu) {
         auto first = execution[0]; first.bytes = 1280; auto second = execution[0]; second.address += 1280; second.bytes = 3840;
@@ -94,6 +98,48 @@ struct Fixture {
 };
 }
 int main() {
+    for (const int invalid : {0, 1, 2, 3, 4, 5}) {
+        Fixture fixture; int exposed = 0; const auto create = fixture.calls.create_stream;
+        fixture.calls.create_stream = [&, create](hipStream_t* stream, unsigned flags) { ++exposed; return create(stream, flags); };
+        if (invalid == 4) fixture.calls.now = {};
+        if (invalid == 5) fixture.calls.pause = {};
+        expect(rejected([&] { static_cast<void>(fixture.prepare(invalid == 0 ? 0 : 8, invalid == 1 ? std::chrono::milliseconds{0} : invalid == 2 ? std::chrono::milliseconds{60001} : std::chrono::milliseconds{10}, invalid == 3 ? std::chrono::milliseconds{0} : std::chrono::milliseconds{1})); }) && exposed == 0, "invalid GPU poll/time/pause/callback bounds are rejected before stream exposure");
+    }
+    {
+        Fixture fixture; auto gpu = fixture.prepare(100, std::chrono::milliseconds{100}); fixture.stage(*gpu); gpu->prepare(fixture.operation(false)); fixture.delay = 50;
+        const auto proof = gpu->publish_terminal(fixture.operation(false), fixture.terminal(false), fixture.commit());
+        expect(proof.visibility == DirectDriverVisibility::producer_release_to_external_dma && fixture.queries == 51 && fixture.pauses == 50 && fixture.clock.time_since_epoch() == std::chrono::milliseconds{50} && fixture.pending.empty(), "pending GPU work receives cooperative time before completion instead of exhausting a tight spin budget");
+        gpu->retire(fixture.operation(false)); expect(gpu->close() == DirectPoolReleaseStatus::released, "completed timed event retains normal typed cleanup");
+    }
+    for (const int failure : {0, 1, 2, 3, 4}) {
+        Fixture fixture; fixture.delay = 100;
+        if (failure == 1) { const auto query = fixture.calls.query_event; fixture.calls.query_event = [&, query](hipEvent_t event) { fixture.clock -= std::chrono::nanoseconds{1}; return query(event); }; }
+        if (failure == 2) fixture.calls.pause = [&](std::chrono::milliseconds) { ++fixture.pauses; throw std::runtime_error("synthetic cooperative pause failure"); };
+        if (failure == 3) fixture.calls.now = [&]() -> std::chrono::steady_clock::time_point { if (fixture.records) throw std::runtime_error("synthetic clock unavailable after record"); return fixture.clock; };
+        if (failure == 4) fixture.clock = std::chrono::steady_clock::time_point::max() - std::chrono::milliseconds{1};
+        auto gpu = fixture.prepare(100, std::chrono::milliseconds{3}); fixture.stage(*gpu); gpu->prepare(fixture.operation(false));
+        expect(rejected([&] { static_cast<void>(gpu->publish_terminal(fixture.operation(false), fixture.terminal(false), fixture.commit())); }) && gpu->failed(), "deadline/clock regression/pause/clock callback/overflow cannot publish GPU completion proof");
+        expect(!fixture.pending.empty() && gpu->poll_quiescence() == DirectDriverQuiescenceStatus::pending && gpu->close() == DirectPoolReleaseStatus::failed_retained && fixture.host_freed == 0 && fixture.events_freed == 0 && fixture.stream_freed == 0, "all time/progress failures retain queued copy sources, destinations, events, stream and import lease");
+        if (failure == 0) expect(fixture.queries == 3 && fixture.pauses == 3, "deadline independently bounds progress even with ample poll count");
+        fixture.flush(); expect(gpu->close() == DirectPoolReleaseStatus::released && gpu->failed(), "late actual quiescence cleans failed timed wait without healing readiness");
+    }
+    {
+        Fixture fixture; fixture.delay = 0; const auto query = fixture.calls.query_event;
+        fixture.calls.query_event = [&, query](hipEvent_t event) { const auto result = query(event); fixture.clock += std::chrono::milliseconds{3}; return result; };
+        auto gpu = fixture.prepare(100, std::chrono::milliseconds{3}); fixture.stage(*gpu); gpu->prepare(fixture.operation(false));
+        expect(rejected([&] { static_cast<void>(gpu->publish_terminal(fixture.operation(false), fixture.terminal(false), fixture.commit())); }) && fixture.queries == 1 && gpu->failed(), "hipSuccess arriving exactly at the deadline is not timely producer proof");
+        expect(gpu->close() == DirectPoolReleaseStatus::released, "a distinct actual quiescent stream can clean late-success failure only");
+    }
+    for (const bool consumer_wait : {false, true}) {
+        Fixture fixture; auto gpu = fixture.prepare(100, std::chrono::milliseconds{3}); fixture.stage(*gpu); gpu->prepare(fixture.operation(false));
+        static_cast<void>(gpu->publish_terminal(fixture.operation(false), fixture.terminal(false), fixture.commit()));
+        const auto rx = fixture.operation(true); gpu->prepare(rx); std::memcpy(fixture.pool.state->pointer(fixture.terminal(true).address, 32), fixture.pool.state->pointer(fixture.terminal(false).address, 32), 32);
+        if (consumer_wait) { fixture.delay = 0; static_cast<void>(gpu->read_terminal(rx, fixture.terminal(true))); auto destination = fixture.execution[2]; destination.bytes = 5120; gpu->consume_received_segments(rx, std::array{destination}); }
+        fixture.delay = 100;
+        expect(rejected([&] { if (consumer_wait) static_cast<void>(gpu->consumer_completion(rx)); else static_cast<void>(gpu->read_terminal(rx, fixture.terminal(true))); }) && gpu->failed() && !fixture.pending.empty(), "acquire and consumer events both obey the separate cooperative GPU deadline");
+        expect(gpu->close() == DirectPoolReleaseStatus::failed_retained && fixture.host_freed == 0, "failed acquire/consumer waits retain complete RX and destination ownership");
+        fixture.flush(); expect(gpu->close() == DirectPoolReleaseStatus::released, "late receiver stream quiescence permits cleanup only");
+    }
     {
         Fixture fixture; auto gpu = fixture.prepare(); fixture.stage(*gpu); gpu->prepare(fixture.operation(false));
         const auto release = gpu->publish_terminal(fixture.operation(false), fixture.terminal(false), fixture.commit());

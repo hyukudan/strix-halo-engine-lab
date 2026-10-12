@@ -15,6 +15,11 @@
 #include "strix/ple_lookup.hpp"
 #include "strix/runtime_allocator.hpp"
 #include "strix/raw_baseline_recording.hpp"
+#include "strix/decode_execution_options.hpp"
+#include "strix/decode_integer_head.hpp"
+#include "strix/hip_integer_projection_runtime.hpp"
+#include "strix/hip_setup_quiescence.hpp"
+#include "hip_decode_experiment.hpp"
 #include "strix/serial_decode_reference.hpp"
 #include "strix/serial_decode_replay.hpp"
 #include "strix/serial_prefix_cache.hpp"
@@ -36,6 +41,8 @@
 #include <iostream>
 #include <limits>
 #include <optional>
+#include <set>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -170,6 +177,7 @@ struct Options {
     std::uint64_t raw_maximum_bytes = 8ULL * 1024 * 1024 * 1024;
     strix::RawBaselineStatePolicy raw_state_policy = strix::RawBaselineStatePolicy::final;
     bool raw_policy_supplied = false;
+    strix::DecodeExecutionOptions execution;
 };
 
 Options parse_options(
@@ -187,12 +195,35 @@ Options parse_options(
     Options options;
     options.model_path =
         argv[1];
+    std::set<std::string_view> execution_option_names;
 
     for (int index = 2;
          index < argc;
          ++index) {
         const std::string_view argument =
             argv[index];
+
+        if (argument == "--execution-mode" || argument == "--integer-lm-head" ||
+            argument == "--graph-workspace-bytes" || argument == "--graph-executable-bytes" ||
+            argument == "--graph-capture-peak-bytes" || argument == "--graph-budget-bytes" ||
+            argument == "--integer-internal-bytes" || argument == "--integer-retained-bytes") {
+            if (!execution_option_names.insert(argument).second)
+                throw std::invalid_argument("duplicate decode execution option");
+            if (index + 1 >= argc) throw std::invalid_argument("decode execution option requires a value");
+            const std::string_view value = argv[++index];
+            if (argument == "--execution-mode") options.execution.mode = strix::parse_decode_execution_mode(value);
+            else if (argument == "--integer-lm-head") options.execution.integer_head = strix::parse_decode_integer_head(value);
+            else {
+                const auto bytes = parse_u64(value, "decode experiment memory ceiling");
+                if (argument == "--graph-workspace-bytes") options.execution.graph_workspace_bytes = bytes;
+                else if (argument == "--graph-executable-bytes") options.execution.graph_executable_bytes = bytes;
+                else if (argument == "--graph-capture-peak-bytes") options.execution.graph_capture_peak_bytes = bytes;
+                else if (argument == "--graph-budget-bytes") options.execution.graph_budget_bytes = bytes;
+                else if (argument == "--integer-internal-bytes") options.execution.integer_internal_bytes = bytes;
+                else options.execution.integer_retained_bytes = bytes;
+            }
+            continue;
+        }
 
         if (argument == "--record-raw") {
             if (index + 1 >= argc || !options.raw_recording_path.empty()) throw std::invalid_argument("--record-raw requires one fresh private directory");
@@ -389,20 +420,20 @@ Options parse_options(
         throw std::invalid_argument(
             "--generate requires at least one prefix token id");
     }
-    if (options.prefix_cache_roundtrip &&
-        options.generate_tokens == 0) {
-        throw std::invalid_argument(
-            "--prefix-cache-roundtrip requires --generate");
-    }
+    if (options.prefix_cache_roundtrip)
+        strix::validate_decode_prefix_roundtrip(options.tokens.size(), options.context_tokens, options.generate_tokens);
     if (options.context_tokens == 0) {
         throw std::invalid_argument(
             "context must be non-zero");
     }
     if (!options.raw_recording_path.empty()) {
         strix::validate_raw_baseline_output_directory(options.raw_recording_path);
-        if (options.prefix_cache_roundtrip) throw std::invalid_argument("RAW recording supports fresh eager execution, not prefix-cache roundtrip");
     }
     else if (options.raw_policy_supplied) throw std::invalid_argument("recording policy requires --record-raw");
+    options.execution.validate(options.residency == strix::HipModelResidencyMode::resident_copy,
+                               options.prefix_cache_roundtrip);
+    if (options.execution.mode == strix::DecodeExecutionMode::graph && options.planned_ple_io)
+        throw std::invalid_argument("graph mode uses resident device PLE gather, not planned host IO");
     if (options.ple_max_inflight_ios == 0) {
         throw std::invalid_argument(
             "ple-max-inflight-ios must be non-zero");
@@ -477,14 +508,15 @@ public:
         const strix::ExecutionStepIo& lm_io,
         std::uint64_t vocab_size,
         std::function<void(std::uint32_t, std::uint64_t, std::span<const float>)> recording = {},
-        std::function<void()> recording_binding = {}, std::function<void()> recording_drain = {})
+        std::function<void()> recording_binding = {}, std::function<void()> recording_drain = {},
+        std::function<void(std::uint32_t)> execute_override = {}, bool track_logit_hashes = false)
         : compiled_(&compiled),
           session_(&session),
           resources_(&resources),
           dispatcher_(&dispatcher),
           scratch_(&scratch),
           lm_io_(&lm_io),
-          vocab_size_(vocab_size), recording_(std::move(recording)), recording_binding_(std::move(recording_binding)), recording_drain_(std::move(recording_drain)) {}
+          vocab_size_(vocab_size), recording_(std::move(recording)), recording_binding_(std::move(recording_binding)), recording_drain_(std::move(recording_drain)), execute_override_(std::move(execute_override)), track_logit_hashes_(track_logit_hashes) {}
 
     std::vector<float> execute(
         std::uint32_t input_token,
@@ -499,6 +531,8 @@ public:
             std::chrono::steady_clock::now();
 
         try {
+        if (execute_override_) execute_override_(input_token);
+        else
         static_cast<void>(
             strix::execute_serial_token(
                 *compiled_,
@@ -554,6 +588,8 @@ public:
         strix::validate_serial_decode_engine_logits(
             logits,
             vocab_size_);
+        if (track_logit_hashes_) logit_hashes_.push_back(strix::model_content_identity_hex(
+            strix::sha256_bytes(std::as_bytes(std::span<const float>(logits)))));
         if (recording_) recording_(input_token, position, logits);
         return logits;
     }
@@ -561,6 +597,9 @@ public:
     [[nodiscard]] const std::vector<double>&
     elapsed_ms() const noexcept {
         return elapsed_ms_;
+    }
+    [[nodiscard]] const std::vector<std::string>& logit_hashes() const noexcept {
+        return logit_hashes_;
     }
 
 private:
@@ -572,9 +611,30 @@ private:
     const strix::ExecutionStepIo* lm_io_ = nullptr;
     std::uint64_t vocab_size_ = 0;
     std::vector<double> elapsed_ms_;
+    std::vector<std::string> logit_hashes_;
     std::function<void(std::uint32_t, std::uint64_t, std::span<const float>)> recording_;
     std::function<void()> recording_binding_;
     std::function<void()> recording_drain_;
+    std::function<void(std::uint32_t)> execute_override_;
+    bool track_logit_hashes_ = false;
+};
+
+// Drain inside the transfer call before the caller's snapshot owner can unwind.
+class GuardedHipSnapshotTransfer final : public strix::SessionSnapshotTransferBackend {
+public:
+    GuardedHipSnapshotTransfer(std::function<void()> current, std::function<void()> drain)
+        : current_(std::move(current)), drain_(std::move(drain)) {}
+    void capture_device(std::uintptr_t source, std::uintptr_t destination, std::uint64_t bytes) override { call([&] { backend_.capture_device(source, destination, bytes); }); }
+    void capture_host(std::uintptr_t source, std::uintptr_t destination, std::uint64_t bytes) override { call([&] { backend_.capture_host(source, destination, bytes); }); }
+    void restore_device(std::uintptr_t source, std::uintptr_t destination, std::uint64_t bytes) override { call([&] { backend_.restore_device(source, destination, bytes); }); }
+    void restore_host(std::uintptr_t source, std::uintptr_t destination, std::uint64_t bytes) override { call([&] { backend_.restore_host(source, destination, bytes); }); }
+private:
+    template<class Function> void call(Function&& function) {
+        try { if (current_) current_(); function(); if (current_) current_(); }
+        catch (...) { if (drain_) drain_(); throw; }
+    }
+    strix::HipSessionSnapshotTransferBackend backend_;
+    std::function<void()> current_, drain_;
 };
 
 std::string_view stop_reason_name(
@@ -590,11 +650,36 @@ std::string_view stop_reason_name(
     return "unknown";
 }
 
+void write_logit_hashes(std::span<const std::string> hashes) {
+    std::cout << '[';
+    for (std::size_t index = 0; index < hashes.size(); ++index) {
+        if (index) std::cout << ',';
+        std::cout << '"' << hashes[index] << '"';
+    }
+    std::cout << ']';
+}
+
 }  // namespace
 
 int main(
     int argc,
     char** argv) try {
+    if (argc == 2 && std::string_view(argv[1]) == "--help") {
+        std::cout << "Usage: strix-hip-decode-token MODEL.gguf TOKEN_ID ... [options]\n"
+            "  --context N --generate N --eos-token ID --residency register|copy\n"
+            "  --record-raw ABS_NEW_PRIVATE_DIRECTORY --record-max-bytes BYTES\n"
+            "  --record-state-policy final|each --prefix-cache-roundtrip\n"
+            "  --execution-mode eager|graph (default eager)\n"
+            "  --graph-workspace-bytes BYTES --graph-executable-bytes BYTES\n"
+            "  --graph-capture-peak-bytes BYTES --graph-budget-bytes BYTES\n"
+            "  --integer-lm-head a8-iu8|a4-iu8|a4-iu4\n"
+            "  --integer-internal-bytes BYTES --integer-retained-bytes BYTES\n"
+            "Graph requires --residency copy, including the complete PLE table.\n"
+            "Integer mode changes only the eager LM head; IQ4_XS requires IU8.\n"
+            "Graph and integer modes require explicit memory ceilings.\n"
+            "All paths remain experimental; RAW recording is not performance evidence.\n";
+        return 0;
+    }
     auto options =
         parse_options(
             argc,
@@ -699,19 +784,12 @@ int main(
     const auto tensor_index =
         strix::build_model_tensor_index(
             manifest);
-
-    const auto execution =
-        strix::build_serial_decode_execution_plan(
-            model);
-    const auto requirements =
-        strix::build_serial_execution_tensor_requirements(
-            execution);
-    const auto tensor_access =
-        strix::compile_execution_tensor_access_plan(
-            execution,
-            manifest,
-            tensor_index,
-            requirements);
+    const auto original_work_device = std::make_shared<strix::HipSetupQuiescenceGuard>();
+    auto target_architecture = original_work_device->architecture();
+    if (const auto suffix = target_architecture.find(':'); suffix != std::string::npos)
+        target_architecture.resize(suffix);
+    if (target_architecture != "gfx1151")
+        throw std::invalid_argument("native decoder requires observed gfx1151 without architecture override");
 
     strix::ExecutionBindingRequest
         binding_request;
@@ -722,13 +800,25 @@ int main(
             QualificationStatus::
                 experimental;
 
+    const bool graph_mode = options.execution.mode == strix::DecodeExecutionMode::graph;
+    binding_request.require_graph_safe = graph_mode;
+    binding_request.device_graph_inputs = graph_mode;
+    strix::HipLauncherCatalogConfig catalog_config;
+    catalog_config.activation = strix::HipActivationStorage::bf16;
+    catalog_config.enable_device_graph_inputs = graph_mode;
+    std::optional<strix::integer_projection::RuntimeConfig> integer_config;
+    if (options.execution.integer_head != strix::DecodeIntegerHead::none) {
+        integer_config = strix::make_decode_integer_head_config(model, manifest, options.execution,
+            {original_work_device->device_index(), original_work_device->observed_binding_identity(), target_architecture});
+    }
+
     strix::kernels::KernelRegistry
         kernel_registry;
     strix::register_complete_hip_kernel_catalog(
         model,
         binding_request,
-        {},
-        kernel_registry);
+        catalog_config,
+        kernel_registry, integer_config ? &*integer_config : nullptr);
 
     strix::ExecutionBufferRequest
         buffer_request;
@@ -752,35 +842,9 @@ int main(
             buffer_request,
             256);
 
-    strix::HipLauncherCatalog
-        launcher_catalog(
-            model,
-            {
-                strix::HipActivationStorage::
-                    bf16,
-            });
-    strix::ExecutionLauncherRegistry
-        launchers;
-    launcher_catalog.
-        register_for_compiled_execution(
-            compiled,
-            launchers);
-    const auto coverage =
-        launcher_catalog.audit(
-            compiled,
-            launchers);
-    if (coverage.missing_steps != 0) {
-        throw std::logic_error(
-            "HIP launcher catalog is incomplete for compiled execution");
-    }
-
-    const auto launch_plan =
-        strix::compile_launch_plan(
-            compiled,
-            launchers);
-    strix::DirectLaunchDispatcher
-        dispatcher(
-            launch_plan);
+    const auto tensor_access = strix::compile_execution_tensor_access_plan(
+        compiled.execution, manifest, tensor_index,
+        strix::build_serial_execution_tensor_requirements(compiled.execution));
 
     strix::SerialSessionStateLayoutRequest
         state_request;
@@ -793,12 +857,9 @@ int main(
 
     strix::AllocationGenerationSource
         generations;
-    auto mapped =
-        strix::MappedModelFile::
-            open_read_only(
-                options.model_path,
-                "model",
-                generations);
+    auto mapped_owner = std::make_shared<strix::MappedModelFile>(
+        strix::MappedModelFile::open_read_only(options.model_path, "model", generations));
+    auto& mapped = *mapped_owner;
 
     strix::HipModelResidencyPolicy
         residency_policy;
@@ -806,16 +867,13 @@ int main(
         options.residency;
     residency_policy.coalesce_gap_bytes =
         options.coalesce_gap_bytes;
-    residency_policy.
-        promote_file_backed_candidates =
-            false;
+    // Graph mode explicitly opts into a completely resident model, including
+    // its PLE table; registered/file-backed views cannot enter capture.
+    residency_policy.promote_file_backed_candidates = graph_mode;
 
-    auto model_residency =
-        strix::HipModelResidency::create(
-            mapped,
-            manifest,
-            generations,
-            residency_policy);
+    auto model_owner = std::make_shared<strix::HipModelResidency>(
+        strix::HipModelResidency::create(mapped, manifest, generations, residency_policy));
+    auto& model_residency = *model_owner;
 
     if (reference.has_value() &&
         reference->model_content_identity !=
@@ -825,17 +883,12 @@ int main(
             "reference checkpoint SHA-256 does not match loaded model");
     }
 
-    strix::HipRuntimeAllocator
-        allocator(
-            strix::HipHostAllocationMode::
-                pageable_aligned);
-    auto memory =
-        strix::RuntimeExecutionMemoryOwner::
-            allocate(
-                compiled,
-                state_layout,
-                allocator,
-                generations);
+    auto allocator_owner = std::make_shared<strix::HipRuntimeAllocator>(
+        strix::HipHostAllocationMode::pageable_aligned);
+    auto& allocator = *allocator_owner;
+    auto memory_owner = std::make_shared<strix::RuntimeExecutionMemoryOwner>(
+        strix::RuntimeExecutionMemoryOwner::allocate(compiled, state_layout, allocator, generations));
+    auto& memory = *memory_owner;
 
     strix::initialize_hip_fresh_runtime_memory(
         memory.scratch(),
@@ -890,6 +943,45 @@ int main(
     resources.ple_prefetch =
         &ple_prefetch;
 
+    auto experiment_owner = std::make_shared<HipDecodeExperimentResources>(
+        mapped_owner, model_owner, allocator_owner, memory_owner, manifest, tensor_access, state_layout);
+    if (graph_mode) resources = experiment_owner->resources;
+    std::shared_ptr<strix::integer_projection::HipIntegerRuntimeAllocationOwner> arena_pin, weight_pin;
+    std::shared_ptr<strix::integer_projection::HipIntegerProjectionRuntimeBundle> integer_bundle;
+    if (integer_config) {
+        const auto head = std::find_if(manifest.tensors.begin(), manifest.tensors.end(),
+            [](const auto& tensor) { return tensor.role == strix::TensorRole::output_head; });
+        if (head == manifest.tensors.end()) throw std::logic_error("integer output head disappeared");
+        const auto index = static_cast<std::uint32_t>(head - manifest.tensors.begin());
+        const auto* binding = strix::find_runtime_tensor_binding(model_residency.binding(), index);
+        if (!binding) throw std::logic_error("integer output head has no actual allocation binding");
+        arena_pin = strix::integer_projection::HipIntegerRuntimeAllocationOwner::pin(
+            integer_config->device, memory.scratch().arena_base,
+            memory.scratch().allocation_generation, experiment_owner);
+        weight_pin = strix::integer_projection::HipIntegerRuntimeAllocationOwner::pin(
+            integer_config->device, binding->address, binding->allocation_generation, experiment_owner);
+        const strix::integer_projection::RuntimeOwners pins{arena_pin, weight_pin};
+        const auto plan = strix::integer_projection::RuntimePlan::bind(compiled, resources, *integer_config, pins);
+        integer_bundle = std::make_shared<strix::integer_projection::HipIntegerProjectionRuntimeBundle>(
+            plan, pins, hipStreamLegacy);
+    }
+    auto launcher_catalog = std::make_shared<strix::HipLauncherCatalog>(model, catalog_config, integer_bundle);
+    strix::ExecutionLauncherRegistry launchers;
+    launcher_catalog->register_for_compiled_execution(compiled, launchers);
+    if (launcher_catalog->audit(compiled, launchers).missing_steps)
+        throw std::logic_error("HIP launcher catalog is incomplete for actual compiled execution");
+    const auto launch_plan = strix::compile_launch_plan(compiled, launchers);
+    strix::DirectLaunchDispatcher dispatcher(launch_plan);
+    std::unique_ptr<strix::HipSerialGraph> graph;
+    if (graph_mode) {
+        strix::GraphMemoryRequest graph_memory;
+        graph_memory.workspace_bytes_per_instance = options.execution.graph_workspace_bytes;
+        graph_memory.executable_bytes_per_instance = options.execution.graph_executable_bytes;
+        graph_memory.capture_peak_bytes = options.execution.graph_capture_peak_bytes;
+        graph_memory.budget_bytes = options.execution.graph_budget_bytes;
+        graph = std::make_unique<strix::HipSerialGraph>(compiled, launcher_catalog, experiment_owner, graph_memory);
+    }
+
     const auto identities =
         strix::build_runtime_execution_identities(
             compiled.execution_identity,
@@ -916,14 +1008,30 @@ int main(
             "compiled execution does not end in one logits write");
     }
 
+    std::uint64_t input_access_epoch = 1;
+    const std::function<void(std::uint32_t)> execute_native_token = [&](std::uint32_t token) {
+        original_work_device->require_original();
+        if (arena_pin) {
+            if (input_access_epoch == UINT64_MAX) throw std::overflow_error("integer input epochs exhausted");
+            arena_pin->advance_access(++input_access_epoch);
+        }
+        if (graph) static_cast<void>(graph->execute(session, token));
+        else static_cast<void>(strix::execute_serial_token(compiled, session, resources, token, dispatcher));
+        check_hip(hipDeviceSynchronize(), "native token original-device completion");
+        original_work_device->require_original();
+    };
+
     std::unique_ptr<strix::RawBaselineRecording> raw_recording;
     strix::RawBaselineStateReader raw_state_reader;
-    std::function<void()> raw_require_identity;
-    std::function<void()> raw_drain_or_fail;
+    std::function<void()> raw_require_identity = [original_work_device] {
+        original_work_device->require_original();
+    };
+    std::function<void()> raw_drain_or_fail = [original_work_device] {
+        original_work_device->recover_or_fail_stop();
+    };
     std::string raw_model_sha, raw_executable_sha;
     std::filesystem::path raw_executable;
     if (!options.raw_recording_path.empty()) {
-        if (compiled.device_graph_inputs) throw std::logic_error("RAW adapter supports native eager scalar inputs only");
         if (const char* override_arch = std::getenv("HSA_OVERRIDE_GFX_VERSION"); override_arch && *override_arch) throw std::invalid_argument("RAW native target recording rejects architecture override");
 #if defined(__linux__)
         raw_executable = "/proc/self/exe";
@@ -984,15 +1092,21 @@ int main(
         metadata.supplied_tokens = options.tokens; metadata.maximum_generated_tokens = options.generate_tokens;
         metadata.mode = options.generate_tokens ? strix::RawBaselineMode::greedy : strix::RawBaselineMode::teacher_forced;
         if (options.generate_tokens) metadata.eos_token = generation_eos;
-        metadata.evidence = strix::RawBaselineEvidence::native_eager;
+        metadata.evidence = graph_mode ? strix::RawBaselineEvidence::native_graph : integer_config
+            ? strix::RawBaselineEvidence::native_integer_eager : strix::RawBaselineEvidence::native_eager;
         if (buffer_request.activation_element_bytes != 2) throw std::logic_error("RAW BF16 catalog/storage binding changed");
         metadata.activation_storage = strix::RawBaselineActivationStorage::bf16;
+        metadata.execution_mode = graph_mode ? strix::RawBaselineExecutionMode::graph_float : integer_config
+            ? strix::RawBaselineExecutionMode::eager_integer_lm_head : strix::RawBaselineExecutionMode::eager_float;
+        metadata.numerical_identity = integer_config ? integer_config->approved_numerical_identity
+            : strix::raw_floating_lm_head_numerical_identity(metadata.activation_storage);
         strix::RawBaselinePolicy policy;
         policy.maximum_bytes = options.raw_maximum_bytes;
         policy.maximum_steps = options.tokens.size();
         if (options.generate_tokens) policy.maximum_steps = options.generate_tokens - 1 >= options.context_tokens - options.tokens.size()
             ? options.context_tokens : options.tokens.size() + options.generate_tokens - 1;
         policy.state_policy = options.raw_state_policy;
+        policy.allow_prefix_restore = options.prefix_cache_roundtrip;
         raw_state_reader = [&](const strix::SessionStateAllocation& allocation, std::uint64_t offset, std::span<std::byte> destination) {
             raw_require_identity();
             const auto address = strix::resolve_session_state(state_layout, memory.state(), allocation.component);
@@ -1028,7 +1142,10 @@ int main(
                     dispatcher,
                     memory.scratch(),
                     lm_io,
-                    model.vocab_size);
+                    model.vocab_size,
+                    [&](std::uint32_t token, std::uint64_t position, std::span<const float> values) {
+                        if (raw_recording) raw_recording->record_token(token, position, values, session, raw_state_reader);
+                    }, raw_require_identity, raw_drain_or_fail, execute_native_token);
 
             std::vector<float> prefix_logits;
             for (std::size_t index = 0;
@@ -1040,8 +1157,7 @@ int main(
                         index);
             }
 
-            strix::HipSessionSnapshotTransferBackend
-                snapshot_transfer;
+            GuardedHipSnapshotTransfer snapshot_transfer(raw_require_identity, raw_drain_or_fail);
             auto prefix_cache =
                 strix::SerialPrefixCacheEntry::capture(
                     model,
@@ -1052,6 +1168,11 @@ int main(
                     allocator,
                     generations,
                     snapshot_transfer);
+            check_raw_copy(hipDeviceSynchronize(), "hipDeviceSynchronize(prefix capture)", raw_drain_or_fail);
+            raw_require_identity();
+            if (raw_recording) {
+                raw_recording->capture_prefix_restore_source(prefix_cache.prefix(), session, raw_state_reader);
+            }
 
             strix::SerialGreedyContinuationRequest
                 continuation;
@@ -1076,7 +1197,7 @@ int main(
                     dispatcher,
                     memory.scratch(),
                     lm_io,
-                    model.vocab_size);
+                    model.vocab_size, {}, raw_require_identity, raw_drain_or_fail, execute_native_token, true);
             const auto baseline =
                 strix::execute_serial_greedy_continuation(
                     continuation,
@@ -1084,6 +1205,8 @@ int main(
 
             const auto mutated_position =
                 session.next_position;
+            if (mutated_position <= options.tokens.size())
+                throw std::runtime_error("prefix-cache roundtrip exercised no mutation before restore");
             const auto restore_start =
                 std::chrono::steady_clock::now();
             prefix_cache.restore(
@@ -1093,9 +1216,9 @@ int main(
                 memory.state(),
                 snapshot_transfer,
                 options.tokens);
-            check_hip(
+            check_raw_copy(
                 hipDeviceSynchronize(),
-                "hipDeviceSynchronize(prefix restore)");
+                "hipDeviceSynchronize(prefix restore)", raw_drain_or_fail);
             const auto restore_stop =
                 std::chrono::steady_clock::now();
 
@@ -1108,6 +1231,7 @@ int main(
                 throw std::logic_error(
                     "prefix cache restore did not recover exact session metadata");
             }
+            if (raw_recording) raw_recording->record_prefix_restoration(prefix_cache.prefix(), session, raw_state_reader, mutated_position);
 
             HipSerialGreedyStepBackend
                 restored_backend(
@@ -1117,7 +1241,10 @@ int main(
                     dispatcher,
                     memory.scratch(),
                     lm_io,
-                    model.vocab_size);
+                    model.vocab_size,
+                    [&](std::uint32_t token, std::uint64_t position, std::span<const float> values) {
+                        if (raw_recording) raw_recording->record_token(token, position, values, session, raw_state_reader);
+                    }, raw_require_identity, raw_drain_or_fail, execute_native_token, true);
             const auto restored =
                 strix::execute_serial_greedy_continuation(
                     continuation,
@@ -1129,12 +1256,14 @@ int main(
                 baseline.stop_reason ==
                     restored.stop_reason &&
                 baseline.final_position ==
-                    restored.final_position;
+                    restored.final_position &&
+                baseline_backend.logit_hashes() == restored_backend.logit_hashes();
 
             if (!equivalent) {
                 throw std::runtime_error(
-                    "prefix cache round-trip changed greedy continuation");
+                    "prefix cache round-trip changed complete logits or greedy continuation");
             }
+            finalize_raw(restored.generated_tokens, std::string(stop_reason_name(restored.stop_reason)));
 
             double prefill_ms = 0.0;
             for (const auto value :
@@ -1215,6 +1344,12 @@ int main(
             std::cout
                 << "],\n"
                 << "  \"continuation_equivalent\": true,\n"
+                << "  \"equivalence_scope\": \"tokens_stop_position_and_complete_continuation_logits\",\n"
+                << "  \"baseline_continuation_logits_sha256\": ";
+            write_logit_hashes(baseline_backend.logit_hashes());
+            std::cout << ",\n  \"restored_continuation_logits_sha256\": ";
+            write_logit_hashes(restored_backend.logit_hashes());
+            std::cout << ",\n"
                 << "  \"mutated_position_before_restore\": "
                 << mutated_position
                 << ",\n"
@@ -1251,7 +1386,7 @@ int main(
             model.vocab_size,
             [&](std::uint32_t token, std::uint64_t position, std::span<const float> values) {
                 if (raw_recording) raw_recording->record_token(token, position, values, session, raw_state_reader);
-            }, raw_require_identity, raw_drain_or_fail);
+            }, raw_require_identity, raw_drain_or_fail, execute_native_token);
 
         strix::SerialGreedyRequest request;
         request.prefix_tokens =
@@ -1432,13 +1567,7 @@ int main(
             std::chrono::steady_clock::now();
 
         try {
-        static_cast<void>(
-            strix::execute_serial_token(
-                compiled,
-                session,
-                resources,
-                token,
-                dispatcher));
+        execute_native_token(token);
 
         check_hip(
             hipDeviceSynchronize(),

@@ -38,6 +38,7 @@ RawBaselineMetadata metadata(bool greedy = false) {
     result.gpu_identity = "injected-gpu"; result.gpu_architecture = "fixture-only";
     result.execution_identity = 11; result.kernel_plan_identity = 12; result.runtime_compatibility_identity = 13; result.vocabulary_size = 3;
     result.supplied_tokens = greedy ? std::vector<std::uint32_t>{1} : std::vector<std::uint32_t>{1, 2};
+    result.numerical_identity = raw_floating_lm_head_numerical_identity(result.activation_storage);
     if (greedy) { result.mode = RawBaselineMode::greedy; result.maximum_generated_tokens = 2; result.eos_token = 2; }
     return result;
 }
@@ -46,11 +47,11 @@ SerialSessionContext session(std::uint64_t next = 0) {
     SerialSessionContext result; result.execution_identity = 11; result.state_layout_identity = 55; result.runtime_compatibility_identity = 13;
     result.next_position = result.committed_tokens = next; result.state.valid = static_cast<PersistentState>(63); result.state.generations.fill(next); return result;
 }
-struct CopyState { unsigned calls = 0; std::size_t max_chunk = 0; std::byte* exposed = nullptr; bool fail = false; };
+struct CopyState { unsigned calls = 0, bias = 0; std::size_t max_chunk = 0; std::byte* exposed = nullptr; bool fail = false; };
 RawBaselineStateReader reader(const std::shared_ptr<CopyState>& source) {
     return [source](const SessionStateAllocation& allocation, std::uint64_t offset, std::span<std::byte> destination) {
         ++source->calls; source->max_chunk = std::max(source->max_chunk, destination.size());
-        for (std::size_t n = 0; n < destination.size(); ++n) destination[n] = static_cast<std::byte>((static_cast<unsigned>(allocation.component) * 17 + offset + n) & 255U);
+        for (std::size_t n = 0; n < destination.size(); ++n) destination[n] = static_cast<std::byte>((static_cast<unsigned>(allocation.component) * 17 + offset + n + source->bias) & 255U);
         if (source->fail) { source->exposed = destination.data(); throw std::runtime_error("injected unknown copy outcome"); }
     };
 }
@@ -84,7 +85,7 @@ void complete_raw_and_greedy() {
     expect(read(generated.output() / "receipt.json").find("\"generated_output_tokens\":[1,1]") != std::string::npos && read(generated.output() / "steps.jsonl").find("generation_fed") != std::string::npos, "actual emitted greedy outputs are independently distinguished from fed history");
 }
 void rejects_before_creation() {
-    for (unsigned mutation = 0; mutation < 11; ++mutation) {
+    for (unsigned mutation = 0; mutation < 16; ++mutation) {
         Private p; auto m = metadata(); auto bounds = policy(); auto state_layout = layout();
         switch (mutation) {
         case 0: bounds.state_policy = static_cast<RawBaselineStatePolicy>(99); break;
@@ -98,12 +99,75 @@ void rejects_before_creation() {
         case 8: bounds.chunk_bytes = 3; break;
         case 9: state_layout.allocations[1].bytes = std::numeric_limits<std::uint64_t>::max(); break;
         case 10: m.activation_storage = static_cast<RawBaselineActivationStorage>(99); break;
+        case 11: m.execution_mode = static_cast<RawBaselineExecutionMode>(99); break;
+        case 12: m.numerical_identity.clear(); break;
+        case 13: m.evidence = RawBaselineEvidence::native_graph; break;
+        case 14: m.evidence = RawBaselineEvidence::native_integer_eager; break;
+        case 15: bounds.allow_prefix_restore = true; break;
         }
         expect(rejects([&] { RawBaselineRecording rejected(p.output(), m, bounds, state_layout); }) && !std::filesystem::exists(p.output()), "invalid enum/native metadata/geometry/budget rejected before any artifact creation");
     }
     Private p; std::filesystem::create_directory(p.parent / ".git"); expect(rejects([&] { validate_raw_baseline_output_directory(p.output()); }), "Git ancestor rejected");
     expect(rejects([&] { validate_raw_baseline_output_directory("relative-recording"); }), "relative output rejected");
     Private existing; std::filesystem::create_directory(existing.output()); expect(rejects([&] { RawBaselineRecording rejected(existing.output(), metadata(), policy(), layout()); }), "existing recording never overwritten");
+}
+SerialSessionContext prefix_session() {
+    auto value = session(1); value.arithmetic_lineage = prepare_serial_row_lineage({}, 0, 11, 12); return value;
+}
+SerialPrefixSnapshot prefix_snapshot() {
+    SerialPrefixSnapshot prefix; prefix.prefix_tokens = {1}; prefix.prefix_identity = 77;
+    auto& snapshot = prefix.snapshot; snapshot.compiled_execution_identity = 11; snapshot.runtime_compatibility_identity = 13; snapshot.state_layout_identity = 55;
+    snapshot.next_position = snapshot.committed_tokens = 1; snapshot.plan_identity = 99; snapshot.state = prefix_session().state; snapshot.device_bytes = 40; snapshot.host_bytes = 16; snapshot.alignment = 4;
+    for (const auto& allocation : layout().allocations) snapshot.ranges.push_back({allocation.component, allocation.storage, allocation.offset, allocation.offset, allocation.bytes, allocation.provisional});
+    prefix.arithmetic_lineage = prefix_session().arithmetic_lineage;
+    return make_serial_prefix_snapshot(prefix.prefix_tokens, prefix.snapshot, prefix.arithmetic_lineage);
+}
+void write_restored(const std::filesystem::path& output, RawBaselineExecutionMode mode = RawBaselineExecutionMode::eager_float) {
+    auto copy = std::make_shared<CopyState>(); auto transfer = reader(copy); auto bounds = policy(); bounds.allow_prefix_restore = true;
+    auto m = metadata(true); m.execution_mode = mode; if (mode == RawBaselineExecutionMode::eager_integer_lm_head) m.numerical_identity = "injected-integer-LM-head-only";
+    RawBaselineRecording recording(output, m, bounds, layout()); recording.capture_initial(session(), transfer);
+    const std::array logits{-1.0F, 5.0F, 2.0F}; auto restored = prefix_session(); const auto prefix = prefix_snapshot();
+    recording.record_token(1, 0, logits, restored, transfer); recording.capture_prefix_restore_source(prefix, restored, transfer);
+    // Inject a real changed source fixture, then put back the captured bytes;
+    // this fixture does not claim the native transfer implementation was run.
+    copy->bias = 91; copy->bias = 0;
+    recording.record_prefix_restoration(prefix, restored, transfer, 2);
+    auto next = session(2); next.arithmetic_lineage = prepare_serial_row_lineage(restored.arithmetic_lineage, 1, 11, 12);
+    recording.record_token(1, 1, logits, next, transfer); const std::array<std::uint32_t, 2> outputs{1, 1}; recording.finalize(next, transfer, outputs, "max_new_tokens");
+    const auto receipt = read(output / "receipt.json"), log = read(output / "restore.json"), states = read(output / "states.jsonl");
+    expect(receipt.find("fresh_then_prefix_restored") != std::string::npos && receipt.find(mode == RawBaselineExecutionMode::graph_float ? "single_row_graph_with_explicit_prefix_restore" : "single_row_eager_with_explicit_prefix_restore") != std::string::npos && log.find("\"mutation_position\":2") != std::string::npos, "explicit restored trace preserves unrecorded mutation and exact restored position");
+    expect(log.find("\"source_lineage\":") != std::string::npos && log.find("\"complete_component_restore\":true") != std::string::npos && states.find("checkpoint") != std::string::npos && states.find("restored") != std::string::npos, "restore artifact binds actual source/restored all-component hashes and arithmetic lineage");
+    expect(read(output / "history.u32le") == std::string("\x01\x00\x00\x00\x01\x00\x00\x00", 8), "unrecorded mutation creates no invented RAW token rows");
+}
+void restoration_guards_and_modes() {
+    Private correct; write_restored(correct.output());
+    Private graph; write_restored(graph.output(), RawBaselineExecutionMode::graph_float);
+    Private integer; write_restored(integer.output(), RawBaselineExecutionMode::eager_integer_lm_head);
+    for (unsigned mutation = 0; mutation < 8; ++mutation) {
+        Private p; auto copy = std::make_shared<CopyState>(); auto transfer = reader(copy); auto bounds = policy(); bounds.allow_prefix_restore = true;
+        RawBaselineRecording recording(p.output(), metadata(true), bounds, layout()); recording.capture_initial(session(), transfer);
+        const std::array logits{-1.0F, 5.0F, 2.0F}; auto state = prefix_session(); auto prefix = prefix_snapshot(); recording.record_token(1, 0, logits, state, transfer);
+        if (mutation == 0) { prefix.snapshot.ranges[0].bytes = 4; expect(rejects([&] { recording.capture_prefix_restore_source(prefix, state, transfer); }), "old compact global-prefix snapshot cannot claim full physical component restore"); }
+        else if (mutation == 1) expect(rejects([&] { recording.record_prefix_restoration(prefix, state, transfer, 2); }), "restore event without captured source cannot authorize continuation");
+        else if (mutation == 6) { ++prefix.prefix_identity; expect(rejects([&] { recording.capture_prefix_restore_source(prefix, state, transfer); }), "noncanonical prefix hash cannot be substituted for exact snapshot/token lineage"); }
+        else {
+            recording.capture_prefix_restore_source(prefix, state, transfer);
+            if (mutation == 2) copy->bias = 1;
+            if (mutation == 3) state.arithmetic_lineage.tainted = true;
+            if (mutation == 4) ++prefix.snapshot.plan_identity;
+            if (mutation == 5) prefix.prefix_tokens = {2};
+            expect(rejects([&] { recording.record_prefix_restoration(prefix, state, transfer, mutation == 7 ? state.next_position : 2); }), "corrupt bytes, tainted lineage, foreign snapshot/tokens and no-op mutations fail restored capture");
+        }
+        expect(rejects([&] { recording.finalize(state, transfer, std::array<std::uint32_t, 1>{1}, "max_new_tokens"); }) && !std::filesystem::exists(p.output() / "receipt.json"), "failed restored origin never publishes complete native/fixture receipt");
+    }
+    for (auto mode : {RawBaselineExecutionMode::graph_float, RawBaselineExecutionMode::eager_integer_lm_head}) {
+        Private p; auto m = metadata(); m.execution_mode = mode; if (mode == RawBaselineExecutionMode::eager_integer_lm_head) m.numerical_identity = "injected-integer-LM-head-only";
+        auto copy = std::make_shared<CopyState>(); auto transfer = reader(copy); RawBaselineRecording recording(p.output(), m, policy(), layout()); recording.capture_initial(session(), transfer);
+        const std::array logits{1.0F, 2.0F, 3.0F}; recording.record_token(1, 0, logits, session(1), transfer, 2); recording.record_token(2, 1, logits, session(2), transfer); recording.finalize(session(2), transfer);
+        const auto receipt = read(p.output() / "receipt.json");
+        expect(receipt.find(mode == RawBaselineExecutionMode::graph_float ? "single_row_graph_from_fresh_initialized_state" : "eager_integer_lm_head") != std::string::npos && receipt.find("injected-fixture") != std::string::npos, "graph/integer mode metadata remains explicit fixture evidence, not a native dispatch proof");
+    }
+    expect(rejects([] { static_cast<void>(raw_floating_lm_head_numerical_identity(static_cast<RawBaselineActivationStorage>(99))); }), "common floating descriptor cannot hide unknown source storage");
 }
 void failed_tokens_never_finalize() {
     for (unsigned mutation = 0; mutation < 6; ++mutation) {
@@ -154,7 +218,8 @@ void exact_greedy_stop_boundaries() {
 int main(int argc, char** argv) {
     try {
         if (argc == 3 && std::string(argv[1]) == "--write-example") { write_teacher(std::filesystem::path(argv[2])); return failures ? 1 : 0; }
-        complete_raw_and_greedy(); rejects_before_creation(); failed_tokens_never_finalize(); uncertain_copy_and_publication(); exact_greedy_stop_boundaries();
+        if (argc == 3 && std::string(argv[1]) == "--write-restored-example") { write_restored(std::filesystem::path(argv[2])); return failures ? 1 : 0; }
+        complete_raw_and_greedy(); rejects_before_creation(); failed_tokens_never_finalize(); uncertain_copy_and_publication(); exact_greedy_stop_boundaries(); restoration_guards_and_modes();
     } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
     std::cout << "RAW recording injected stream/state/token/publication tests; no GPU execution\n";
     return failures ? 1 : 0;

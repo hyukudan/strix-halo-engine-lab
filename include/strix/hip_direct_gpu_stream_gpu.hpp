@@ -2,12 +2,19 @@
 
 #include "strix/direct_gpu_stream_gpu.hpp"
 #include "strix/hip_direct_transport_gpu_export.hpp"
+#include <chrono>
+#include <thread>
 
 namespace strix::transport {
 struct HipDirectGpuStreamGpuPolicy {
     bool experimental_opt_in = false;
     std::uint64_t maximum_completion_polls = 4096;
     std::uint64_t maximum_execution_retained_bytes = 0;
+    // Separate GPU-event budget, independent of controller poll counts. Every
+    // not-ready result cooperatively pauses; both elapsed time and call count
+    // are bounded. A timeout is failure/retention, never completion evidence.
+    std::chrono::milliseconds completion_timeout{10000};
+    std::chrono::milliseconds completion_pause{1};
 };
 struct HipDirectGpuStreamExecutionOwner {
     // Trusted complete owner for every input read and destination written by
@@ -33,6 +40,8 @@ struct HipDirectGpuStreamGpuCalls {
     std::function<hipError_t(hipEvent_t, hipStream_t)> record_event;
     std::function<hipError_t(hipEvent_t)> query_event, destroy_event;
     std::function<hipError_t(void*, const void*, std::size_t, hipMemcpyKind, hipStream_t)> copy;
+    std::function<std::chrono::steady_clock::time_point()> now = [] { return std::chrono::steady_clock::now(); };
+    std::function<void(std::chrono::milliseconds)> pause = [](auto duration) { std::this_thread::sleep_for(duration); };
     [[nodiscard]] static HipDirectGpuStreamGpuCalls native();
 };
 

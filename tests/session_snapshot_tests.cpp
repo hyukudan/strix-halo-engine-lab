@@ -86,20 +86,19 @@ int main() {
         }
     }
 
-    expect(snapshotted_kv ==
-               strix::base_kv_bytes_per_token(model) *
-                   request.next_position,
-           "snapshot truncates KV to valid prefix");
-    expect(kv != nullptr &&
-               snapshotted_kv < kv->bytes,
-           "snapshot does not copy unused KV capacity");
-    expect(snapshotted_sparse ==
-               strix::provisional_indexer_bytes_per_token(model) *
-                   request.next_position,
-           "snapshot truncates provisional sparse state to valid prefix");
-    expect(snapshot.device_bytes <
-               layout.device_total_bytes,
-           "compact snapshot is smaller than full allocated device state");
+    expect(kv != nullptr && snapshotted_kv == kv->bytes,
+           "snapshot preserves all context-strided KV layers and inactive capacity");
+    const auto* sparse = strix::find_session_state_allocation(
+        layout, strix::SessionStateComponent::sparse_index);
+    expect(sparse != nullptr && snapshotted_sparse == sparse->bytes,
+           "snapshot preserves all context-strided sparse layers and inactive capacity");
+    auto shorter = request;
+    shorter.next_position = 1;
+    shorter.committed_tokens = 1;
+    const auto short_snapshot = strix::build_serial_session_snapshot_plan(model, layout, shorter);
+    expect(short_snapshot.device_bytes == snapshot.device_bytes &&
+               short_snapshot.plan_identity != snapshot.plan_identity,
+           "short prefixes preserve full capacity but retain distinct session identities");
 
     auto no_sparse_layout_request =
         layout_request;
