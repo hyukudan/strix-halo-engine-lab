@@ -1,0 +1,11 @@
+{
+  "schema": "strix-numerical-prompts-v1",
+  "cases": [
+    {"id":"teacher-forced","kind":"logits","text":"Explain why adding two even integers gives an even integer. Use one short sentence.","context_min_tokens":1,"max_new_tokens":64,"expected":null},
+    {"id":"greedy-ties","kind":"greedy","text":"Continue the sequence of integers: 2, 4, 6, 8. Answer with the next integer only.","context_min_tokens":1,"max_new_tokens":16,"expected":null},
+    {"id":"json-object","kind":"json","text":"Return exactly this JSON object without markdown or extra keys: {\"answer\":42,\"valid\":true}","context_min_tokens":1,"max_new_tokens":32,"expected":{"answer":42,"valid":true}},
+    {"id":"tool-arguments","kind":"tool","text":"Represent the tool call to add 2 and 3 as one JSON object with name add and arguments a=2,b=3. No extra text or keys.","context_min_tokens":1,"max_new_tokens":32,"expected":{"name":"add","arguments":{"a":2,"b":3}}},
+    {"id":"recurrent-resume","kind":"state","text":"Remember that the fictional archive key is cedar-17. State that key in a short answer.","context_min_tokens":1,"max_new_tokens":32,"expected":null},
+    {"id":"long-context","kind":"context","text":"PRIVATE TEMPLATE: construct a deterministic neutral document with first_key=cedar near its beginning and last_key=birch near its end. Fill the middle with numbered neutral paragraphs until the selected GGUF tokenizer records at least 16384 actual input tokens. Ask for exactly {\"first_key\":\"cedar\",\"last_key\":\"birch\"} without markdown. Replace this template text in the private prompt file with the complete actual document; never infer token count from characters.","context_min_tokens":16384,"max_new_tokens":64,"expected":{"first_key":"cedar","last_key":"birch"}}
+  ]
+}

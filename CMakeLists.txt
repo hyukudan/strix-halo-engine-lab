@@ -35,6 +35,8 @@ add_library(strix_core STATIC
     src/direct_transport_gpu_export.cpp
     src/direct_gpu_boundary_staging.cpp
     src/linux_direct_transport_driver.cpp
+    src/direct_gpu_stream_commissioning.cpp
+    src/raw_baseline_recording.cpp
     src/compiled_mtp_draft_plan.cpp
     src/compiled_speculative_verify.cpp
     src/compiled_speculation_backend.cpp
@@ -191,8 +193,25 @@ add_executable(strix-audit-execution-tensors apps/execution_tensor_audit_main.cp
 target_link_libraries(strix-audit-execution-tensors PRIVATE strix_core)
 strix_target_warnings(strix-audit-execution-tensors)
 
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(strix-direct-gpu-observe-driver
+        lab/direct_gpu_stream/observe_main.cpp lab/direct_gpu_stream/observe_driver.cpp)
+    target_link_libraries(strix-direct-gpu-observe-driver PRIVATE strix_core)
+    strix_target_warnings(strix-direct-gpu-observe-driver)
+endif()
+
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(strix-direct-gpu-stream-commissioning-tests
+        tests/direct_gpu_stream_commissioning_tests.cpp
+        lab/direct_gpu_stream/bounded_tcp_control.cpp)
+    target_link_libraries(strix-direct-gpu-stream-commissioning-tests PRIVATE strix_core)
+    strix_target_warnings(strix-direct-gpu-stream-commissioning-tests)
+    add_test(NAME strix-direct-gpu-stream-commissioning-tests COMMAND strix-direct-gpu-stream-commissioning-tests)
+    add_executable(strix-raw-baseline-recording-tests tests/raw_baseline_recording_tests.cpp)
+    target_link_libraries(strix-raw-baseline-recording-tests PRIVATE strix_core)
+    strix_target_warnings(strix-raw-baseline-recording-tests)
+    add_test(NAME strix-raw-baseline-recording-tests COMMAND strix-raw-baseline-recording-tests)
     add_executable(strix-direct-transport-gpu-export-tests tests/direct_transport_gpu_export_tests.cpp)
     target_link_libraries(strix-direct-transport-gpu-export-tests PRIVATE strix_core)
     strix_target_warnings(strix-direct-transport-gpu-export-tests)
@@ -206,6 +225,11 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-graph-ple-tests)
     add_test(NAME strix-graph-ple-tests COMMAND strix-graph-ple-tests)
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_executable(strix-direct-gpu-stream-driver-observation-tests
+            tests/direct_gpu_stream_driver_observation_tests.cpp lab/direct_gpu_stream/observe_driver.cpp)
+        target_link_libraries(strix-direct-gpu-stream-driver-observation-tests PRIVATE strix_core)
+        strix_target_warnings(strix-direct-gpu-stream-driver-observation-tests)
+        add_test(NAME strix-direct-gpu-stream-driver-observation-tests COMMAND strix-direct-gpu-stream-driver-observation-tests)
         enable_language(C)
         add_executable(strix-linux-direct-transport-driver-tests tests/linux_direct_transport_driver_tests.cpp)
         target_link_libraries(strix-linux-direct-transport-driver-tests PRIVATE strix_core)
@@ -852,6 +876,12 @@ if(BUILD_TESTING)
 
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
+        add_test(NAME strix-private-kernel-preparation-tests
+            COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/lab/direct_gpu_stream/kernel/test_build_private_kernel.py)
+        add_test(NAME strix-native-numerical-campaign-tests
+            COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/lab/native_campaign/numerical/test_campaign.py)
+        add_test(NAME strix-native-raw-import-tests
+            COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/lab/native_campaign/numerical/test_raw_import.py)
         add_test(
             NAME strix-python-oracle-tests
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/oracles/test_qwen4_exp_oracle.py
@@ -976,6 +1006,16 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         PRIVATE strix_hip_runtime
     )
     strix_target_warnings(strix-hip-runtime-allocator)
+
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_executable(strix-direct-gpu-commission
+            lab/direct_gpu_stream/commission_main.hip
+            lab/direct_gpu_stream/bounded_tcp_control.cpp)
+        set_target_properties(strix-direct-gpu-commission PROPERTIES
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+        target_link_libraries(strix-direct-gpu-commission PRIVATE strix_hip_runtime)
+        strix_target_warnings(strix-direct-gpu-commission)
+    endif()
 
     if(BUILD_TESTING)
         add_executable(

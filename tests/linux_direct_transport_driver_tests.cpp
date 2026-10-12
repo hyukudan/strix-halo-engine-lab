@@ -1,4 +1,5 @@
 #include "strix/linux_direct_transport_driver.hpp"
+#include "strix/direct_gpu_stream_commissioning.hpp"
 #include "direct_gpu_stream_fixture.hpp"
 #include "direct_native_fixture.hpp"
 
@@ -125,12 +126,12 @@ struct Fixture {
     std::shared_ptr<DirectStreamControlByteStream> control = std::make_shared<DirectStreamControlByteStream>(DirectStreamControlByteStream::open_with_io(*control_fd, route()));
     std::unique_ptr<LinuxDirectTransportDriverIo> provider;
     std::shared_ptr<DirectDriverImport> imported;
-    Fixture(bool qualified = true, bool discover = false) {
+    Fixture(bool qualified = true, bool discover = false, bool create_provider = true) {
         LinuxDirectGpuStreamCalls calls; calls.fd_owner = native_fd; calls.kernel_release = [] { return "synthetic-kernel"; };
         const auto observed_build = build_id; calls.driver_build_identity = [observed_build] { return *observed_build; };
         const auto retained_kernel = kernel; calls.ioctl_call = [retained_kernel](DirectStreamFd, unsigned long command, void* argument) { return retained_kernel->call(command, argument); };
         auto requested = expected(); if (discover) { requested.device_identity.clear(); requested.device_instance_generation = 0; }
-        provider = std::make_unique<LinuxDirectTransportDriverIo>(route(), requested, gpu, control, LinuxDirectGpuStreamPolicy{true, 65536, 1048576, 64}, qualified ? qualification : nullptr, calls);
+        if (create_provider) provider = std::make_unique<LinuxDirectTransportDriverIo>(route(), requested, gpu, control, LinuxDirectGpuStreamPolicy{true, 65536, 1048576, 64}, qualified ? qualification : nullptr, calls);
     }
     void open() {
         expect(provider->query().native.query_status == DirectNativeQueryStatus::verified, "synthetic qualification explicitly gates test provider");
@@ -155,6 +156,74 @@ struct Fixture {
 }
 int main() {
 #if defined(__linux__)
+    const auto commission = [](Fixture& fixture, int delay = 0) {
+        LinuxDirectGpuStreamCalls calls; calls.fd_owner = fixture.native_fd; calls.kernel_release = [] { return "synthetic-kernel"; };
+        const auto build = fixture.build_id; calls.driver_build_identity = [build] { return *build; };
+        const auto kernel = fixture.kernel; calls.ioctl_call = [kernel, delay](DirectStreamFd, unsigned long command, void* argument) mutable {
+            if (command == SGU_IOC_EVENT && delay-- > 0) return LinuxDirectGpuStreamSyscallResult{-1, EAGAIN};
+            return kernel->call(command, argument);
+        };
+        auto discovery = expected(); discovery.device_identity.clear(); discovery.device_instance_generation = 0;
+        return std::make_unique<LinuxDirectGpuStreamCommissioning>(route(), discovery, fixture.gpu, fixture.control, LinuxDirectGpuStreamPolicy{true, 65536, 1048576, 64}, calls);
+    };
+    const auto config = [](const DirectDriverBinding& binding, bool receiver) {
+        return DirectGpuCommissioningConfig{"synthetic-campaign", "synthetic-run", binding, {1, 77, 2, 3, 4, 5, 1, 6, 1, 5120}, 123, receiver, std::chrono::milliseconds{1000}, 16};
+    };
+    {
+        Fixture fixture(false, true, false); auto harness = commission(fixture, 3); const auto observed = harness->observe();
+        expect(observed.native.query_status != DirectNativeQueryStatus::verified && !assess_direct_native_readiness(observed.backend, observed.native).ready, "commissioning observation cannot grant native production readiness");
+        auto foreign = observed.binding; ++foreign.interface.connection_epoch;
+        expect(rejected([&] { harness->bind_exact_observed(foreign); }), "commissioning rejects operator binding foreign to same FD");
+        harness->bind_exact_observed(observed.binding);
+        expect(harness->observe().native.query_status == DirectNativeQueryStatus::unavailable, "bound experimental facade remains unavailable to production");
+        fixture.incoming(DistributedDirectGpuControlKind::receive_ready, fixture.descriptor());
+        fixture.incoming(DistributedDirectGpuControlKind::received, fixture.descriptor()); fixture.incoming(DistributedDirectGpuControlKind::consumed, fixture.descriptor());
+        auto source = fixture.pool.external(5120); int produced = 0, pauses = 0;
+        const auto result = harness->run_once(config(observed.binding, false), {{source}, {}, [&] { ++produced; }, {}}, {[] { return std::chrono::steady_clock::now(); }, [&] { ++pauses; }});
+        expect(result.executed && result.completed_count == 1 && produced == 1 && pauses == 3 && result.local_tx_complete && result.transport_ack && result.consumer_credit && result.cleanup == DirectPoolReleaseStatus::released,
+               "synthetic commissioning sender waits delayed controller plus independent ACK/credit before retire/cleanup");
+        expect(!result.full_payload_verified && !result.gpu_acquire_complete && !result.consumer_complete && !result.receive_reposted, "sender never self-attests receiver payload or consumer stages");
+        expect(rejected([&] { static_cast<void>(harness->run_once(config(observed.binding, false), {{source}, {}, [] {}, {}})); }), "commissioning cannot silently repeat same epoch/sequence");
+    }
+    for (const bool matching : {true, false}) {
+        Fixture fixture(false, true, false); auto harness = commission(fixture); const auto observed = harness->observe(); harness->bind_exact_observed(observed.binding);
+        fixture.incoming(DistributedDirectGpuControlKind::producer_released, fixture.descriptor()); fixture.gpu->terminal = fixture.commit();
+        auto destination = fixture.pool.external(5120); bool verified_after_gpu = false;
+        const auto result = harness->run_once(config(observed.binding, true), {{}, {destination}, {}, [&] { verified_after_gpu = fixture.gpu->acquired == 1 && fixture.gpu->unpacked == 1 && fixture.gpu->consumers == 1; return matching; }});
+        expect(verified_after_gpu && result.gpu_acquire_complete && result.consumer_complete && result.full_payload_verified == matching && result.completed_count == static_cast<std::uint64_t>(matching), "full-byte verification follows actual acquire/unpack/GPU completion stage");
+        expect(fixture.kernel->reposts == static_cast<int>(matching) && result.consumer_credit == matching && result.receive_reposted == matching, "payload mismatch cannot authorize consumed credit or RX repost");
+        expect(result.cleanup == DirectPoolReleaseStatus::released && (matching || !result.error.empty()), "mismatch stops/drains exact old import rather than promotes production");
+    }
+    {
+        Fixture fixture(false, true, false); auto harness = commission(fixture); const auto observed = harness->observe(); harness->bind_exact_observed(observed.binding);
+        auto source = fixture.pool.external(5120); fixture.gpu->gpu_idle = false;
+        const auto result = harness->run_once(config(observed.binding, false), {{source}, {}, [] { throw std::runtime_error("synthetic asynchronous producer callback failure"); }, {}});
+        expect(result.executed && result.cleanup == DirectPoolReleaseStatus::failed_retained && fixture.kernel->stops == 1 && fixture.kernel->releases == 0 && fixture.native_fd->closed == 0,
+               "commissioning producer callback error retains controller/GPU/import owners without credit");
+        fixture.gpu->gpu_idle = true; expect(harness->close() == DirectPoolReleaseStatus::released, "late typed quiescence permits exact experimental cleanup only");
+    }
+    {
+        Fixture fixture(false, true, false); auto harness = commission(fixture, 100); const auto observed = harness->observe(); harness->bind_exact_observed(observed.binding);
+        fixture.incoming(DistributedDirectGpuControlKind::producer_released, fixture.descriptor()); fixture.gpu->terminal = fixture.commit(); auto destination = fixture.pool.external(5120);
+        auto bounded = config(observed.binding, true); bounded.maximum_progress_polls = 2;
+        const auto result = harness->run_once(bounded, {{}, {destination}, {}, [] { return true; }});
+        expect(result.executed && result.completed_count == 0 && !result.gpu_acquire_complete && !result.consumer_credit && fixture.kernel->reposts == 0 && result.cleanup == DirectPoolReleaseStatus::released, "exhausted progress cannot verify/acquire/repost unseen payload");
+    }
+    {
+        Fixture fixture(false, true, false); auto harness = commission(fixture, 1); const auto observed = harness->observe(); harness->bind_exact_observed(observed.binding);
+        fixture.incoming(DistributedDirectGpuControlKind::producer_released, fixture.descriptor()); fixture.gpu->terminal = fixture.commit(); auto destination = fixture.pool.external(5120);
+        auto bounded = config(observed.binding, true); bounded.timeout = std::chrono::milliseconds{2}; std::chrono::steady_clock::time_point time{};
+        const auto result = harness->run_once(bounded, {{}, {destination}, {}, [] { return true; }}, {[&] { time += std::chrono::microseconds{1}; return time; }, [&] { time += std::chrono::milliseconds{3}; }});
+        expect(result.executed && result.completed_count == 0 && !result.gpu_acquire_complete && !result.consumer_credit && !result.error.empty() && fixture.kernel->reposts == 0, "total deadline after delayed controller readiness fails before acquire or credit");
+    }
+    {
+        Fixture fixture(false, true, false); auto harness = commission(fixture); const auto observed = harness->observe(); harness->bind_exact_observed(observed.binding);
+        fixture.incoming(DistributedDirectGpuControlKind::producer_released, fixture.descriptor()); fixture.gpu->terminal = fixture.commit(); auto destination = fixture.pool.external(5120);
+        const auto result = harness->run_once(config(observed.binding, true), {{}, {destination}, {}, [&]() -> bool { fixture.gpu->gpu_idle = false; throw std::runtime_error("synthetic D2H event error after enqueue"); }});
+        expect(result.executed && result.consumer_complete && !result.full_payload_verified && !result.consumer_credit && fixture.kernel->reposts == 0 && fixture.kernel->releases == 0 && result.cleanup == DirectPoolReleaseStatus::failed_retained,
+               "verification D2H callback failure retains owner/import after prior consumer event without credit/repost");
+        fixture.gpu->gpu_idle = true; expect(harness->close() == DirectPoolReleaseStatus::released, "late full-stream quiescence cleans failed verification without qualifying data");
+    }
     {
         std::vector<std::byte> note(24); note[0] = std::byte{4}; note[4] = std::byte{8}; note[8] = std::byte{3};
         note[12] = std::byte{'G'}; note[13] = std::byte{'N'}; note[14] = std::byte{'U'};

@@ -29,6 +29,8 @@ Current experimental pieces include:
 - an experimental architecture for GPU-owned DMA-BUF USB4 transport with explicit commit/consumer-credit/RX-repost semantics.
 - concrete HIP DMA-BUF export and uncached pool ownership;
 - an opt-in Linux DMA-BUF driver extension, userspace provider and GPU boundary packing with separate commit/consumer/repost proofs, compiled and software-tested.
+- a separate experimental two-host commissioning executable and private full-kernel/module staging workflow;
+- host-only numerical campaign preparation with exact model/artifact bindings and independent recorded-evidence checks.
 
 Native `gfx1151` qualification remains mandatory before any HIP or direct-transport path is promoted.
 

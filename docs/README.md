@@ -68,6 +68,9 @@ A wider kernel, larger speculative window, second node or second physical link i
 - [Complete C1 graph and GPU export prerequisites](implementation-2026-10-12-complete-graph-and-export.md).
 - [Device-dynamic GDN and indexed attention](implementation-2026-10-12-dynamic-state-operators.md).
 - [Experimental tiled integer LM-head consumer](implementation-2026-10-12-integer-runtime.md).
+- [Hardware campaign preparation](implementation-2026-10-12-hardware-campaign-preparation.md).
+- [Native numerical campaign preparation](implementation-2026-10-12-native-numerical-campaign.md).
+- [Eager RAW baseline recording](implementation-2026-10-12-raw-baseline-recording.md).
 - [Phase specific packed weights and integer execution](proposals/2026-10-11-phase-specific-low-precision.md).
 - [Execution optimization gates](proposals/2026-10-12-execution-optimization-gates.md).
 

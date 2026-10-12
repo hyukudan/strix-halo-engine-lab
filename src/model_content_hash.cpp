@@ -359,6 +359,12 @@ ModelContentIdentity sha256_file_content(
     return hash_file_stable(path).digest;
 }
 
+ModelContentIdentity sha256_bytes(std::span<const std::byte> bytes) {
+    Sha256 digest;
+    digest.update(reinterpret_cast<const std::uint8_t*>(bytes.data()), bytes.size());
+    return digest.finalize();
+}
+
 ModelContentIdentity build_model_content_identity(
     std::span<const ModelContentFile> files) {
     if (files.empty()) {

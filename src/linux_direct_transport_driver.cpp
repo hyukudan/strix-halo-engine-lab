@@ -126,7 +126,7 @@ struct LinuxDirectTransportDriverIo::Impl {
     DirectStreamDeviceIdentity route;
     DirectDriverBinding expected;
     std::shared_ptr<DirectGpuStreamGpu> gpu;
-    std::shared_ptr<DirectStreamControlByteStream> control;
+    std::shared_ptr<DistributedControlByteStream> control;
     LinuxDirectGpuStreamPolicy policy;
     std::shared_ptr<DirectGpuStreamQualification> qualification;
     LinuxDirectGpuStreamCalls calls;
@@ -139,6 +139,7 @@ struct LinuxDirectTransportDriverIo::Impl {
     std::uint64_t last_send = 0, last_receive = 0;
     bool failed = false, closing = false, queried = false, ready = false, armed = false, controller_stopped = false, kernel_released = false;
     bool discovery_placeholder = false, observed_bound = false;
+    bool commissioning = false, commissioning_operation = false;
     std::string observed_driver_build;
 #if defined(__linux__)
     sgu_query observed{};
@@ -184,11 +185,12 @@ struct LinuxDirectTransportDriverIo::Impl {
         return value;
     }
     void current() {
-        if (failed || closing || !ready || !imported) throw std::logic_error("direct GPU stream is unavailable, failed, closing or unimported");
+        const bool authorized = commissioning ? commissioning_operation : ready;
+        if (failed || closing || !authorized || !imported) throw std::logic_error("direct GPU stream is unavailable, failed, closing or unimported");
         identity();
         if (!same_import(imported->value, import_binding)) throw std::runtime_error("direct GPU stream import token binding changed");
         imported->lease->require_current(); gpu->require_current();
-        if (!qualification || !qualification->current(expected, gpu->exported_binding())) throw std::runtime_error("direct GPU stream qualification invalidated");
+        if (!commissioning && (!qualification || !qualification->current(expected, gpu->exported_binding()))) throw std::runtime_error("direct GPU stream qualification invalidated");
         imported->lease->require_current(); gpu->require_current(); identity();
     }
     Operation& require(const DirectDriverOperation& operation) {
@@ -228,16 +230,17 @@ struct LinuxDirectTransportDriverIo::Impl {
 };
 
 LinuxDirectTransportDriverIo::LinuxDirectTransportDriverIo(DirectStreamDeviceIdentity route, DirectDriverBinding expected,
-    std::shared_ptr<DirectGpuStreamGpu> gpu, std::shared_ptr<DirectStreamControlByteStream> control, LinuxDirectGpuStreamPolicy policy,
+    std::shared_ptr<DirectGpuStreamGpu> gpu, std::shared_ptr<DistributedControlByteStream> control, LinuxDirectGpuStreamPolicy policy,
     std::shared_ptr<DirectGpuStreamQualification> qualification, LinuxDirectGpuStreamCalls calls) : impl_(std::make_unique<Impl>()) {
     auto& i = *impl_; i.route = std::move(route); i.expected = std::move(expected); i.gpu = std::move(gpu); i.control = std::move(control);
     i.policy = policy; i.qualification = std::move(qualification); i.calls = std::move(calls);
     i.discovery_placeholder = i.expected.device_identity.empty() && i.expected.device_instance_generation == 0;
     if (!policy.experimental_opt_in || !policy.maximum_payload_bytes || policy.maximum_payload_bytes > 16ULL * 1024ULL * 1024ULL ||
         !policy.maximum_imported_bytes || policy.maximum_imported_bytes > 128ULL * 1024ULL * 1024ULL || !policy.maximum_event_calls ||
-        !i.gpu || !i.gpu->import_lease() || !i.control || !i.control->valid() || i.control->maximum_frame_bytes() < 2048 ||
+        !i.gpu || !i.gpu->import_lease() || !i.control ||
         !i.calls.fd_owner || !i.calls.ioctl_call || !i.calls.kernel_release || !i.calls.driver_build_identity || !i.expected.interface.connection_epoch || i.expected.interface.physical_link_id.empty() ||
         (!i.discovery_placeholder && (i.expected.device_identity.empty() || !i.expected.device_instance_generation))) throw std::invalid_argument("direct GPU stream requires explicit bounded experimental route, guarded GPU owner and dedicated control stream");
+    if (const auto* stream = dynamic_cast<const DirectStreamControlByteStream*>(i.control.get()); stream && (!stream->valid() || stream->maximum_frame_bytes() < 2048)) throw std::invalid_argument("direct GPU copied control stream is invalid or undersized");
 #if defined(__linux__)
     i.fd = i.calls.fd_owner->open(i.route);
     try { i.identity(); } catch (...) { i.calls.fd_owner->close(i.fd); i.fd = {}; throw; }
@@ -268,7 +271,8 @@ DirectDriverQuery LinuxDirectTransportDriverIo::query() {
         result.backend.requires_exclusive_lease = result.backend.explicit_receive_repost = result.backend.gpu_commit_record = true;
         result.backend.buffer_mode = TransportBufferMode::imported_gpu_dma_buf; result.backend.progress_mode = TransportProgressMode::interrupt_driven;
         result.native.observed_interface = result.binding.interface;
-        if (result.binding != i.expected) { result.native.query_status = i.discovery_placeholder ? DirectNativeQueryStatus::unavailable : DirectNativeQueryStatus::incompatible; i.ready = false; }
+        if (i.commissioning) { result.native.query_status = DirectNativeQueryStatus::unavailable; i.ready = false; }
+        else if (result.binding != i.expected) { result.native.query_status = i.discovery_placeholder ? DirectNativeQueryStatus::unavailable : DirectNativeQueryStatus::incompatible; i.ready = false; }
         else if (i.qualification) {
             result.native = i.qualification->proof(result.binding, i.gpu->exported_binding());
             i.ready = !i.failed && result.native.observed_interface == std::optional<DirectNativeInterfaceIdentity>(result.binding.interface) &&
@@ -299,10 +303,26 @@ void LinuxDirectTransportDriverIo::bind_observed(const DirectDriverBinding& bind
     static_cast<void>(binding); static_cast<void>(qualification); throw std::logic_error("Linux direct GPU stream unsupported");
 #endif
 }
+void LinuxDirectTransportDriverIo::bind_commissioning_observed(const DirectDriverBinding& binding) {
+    bind_observed(binding, {});
+    const auto observed = query();
+    if (observed.binding != binding || observed.native.query_status != DirectNativeQueryStatus::unavailable || !observed.backend.maximum_payload_bytes) throw std::runtime_error("commissioning exact observed binding is unavailable");
+    impl_->commissioning = true;
+}
+void LinuxDirectTransportDriverIo::begin_commissioning_operation() {
+#if defined(__linux__)
+    auto& i = *impl_;
+    if (!i.commissioning || !i.observed_bound || i.failed || i.closing || i.commissioning_operation) throw std::logic_error("commissioning requires one isolated current serialized dispatch");
+    i.identity(); i.gpu->require_current(); i.identity(); i.commissioning_operation = true;
+#else
+    throw std::logic_error("Linux direct GPU commissioning unsupported");
+#endif
+}
+void LinuxDirectTransportDriverIo::end_commissioning_operation() noexcept { impl_->commissioning_operation = false; }
 std::optional<DirectDriverBinding> LinuxDirectTransportDriverIo::current_binding() const {
 #if defined(__linux__)
     try {
-        auto& i = *impl_; if (i.failed || i.closing || !i.ready) return std::nullopt;
+        auto& i = *impl_; if (i.commissioning || i.failed || i.closing || !i.ready) return std::nullopt;
         i.identity(); i.gpu->require_current();
         if (!i.qualification || !i.qualification->current(i.expected, i.gpu->exported_binding())) { i.failed = true; i.ready = false; return std::nullopt; }
         i.gpu->require_current(); i.identity();
@@ -313,6 +333,7 @@ std::optional<DirectDriverBinding> LinuxDirectTransportDriverIo::current_binding
 }
 void LinuxDirectTransportDriverIo::require_current() {
 #if defined(__linux__)
+    if (impl_->commissioning) throw std::logic_error("commissioning cannot supply production current/readiness authority");
     try { impl_->current(); } catch (...) { invalidate(); throw; }
 #else
     throw std::logic_error("Linux direct GPU stream unsupported");
@@ -321,7 +342,8 @@ void LinuxDirectTransportDriverIo::require_current() {
 std::shared_ptr<DirectDriverImport> LinuxDirectTransportDriverIo::prepare_import(const DirectDriverBinding& expected, const DirectTransportLease& lease, const DirectTransportLinkPoolBinding& pool) {
 #if defined(__linux__)
     auto& i = *impl_;
-    if (current_binding() != std::optional<DirectDriverBinding>(expected) || i.imported || expected != i.expected || lease.connection_epoch != expected.interface.connection_epoch ||
+    const bool authorized = i.commissioning ? i.commissioning_operation && !i.failed && !i.closing : current_binding() == std::optional<DirectDriverBinding>(expected);
+    if (!authorized || i.imported || expected != i.expected || lease.connection_epoch != expected.interface.connection_epoch ||
         lease.physical_link_id != expected.interface.physical_link_id || !lease.lease_generation || lease.link_index != 0) throw std::invalid_argument("direct GPU stream import is unavailable or foreign");
     const auto export_lease = i.gpu->import_lease(); const auto& exported = export_lease->binding(); export_lease->require_current();
     if (lease.pool_binding_identity != exported.pool_binding_identity || !same_view(pool.tx, exported.pool.tx) || !same_view(pool.rx, exported.pool.rx) ||

@@ -158,3 +158,140 @@ completion/rearm fidelity and complete-workload performance remain target
 qualification gates. The userspace provider must use actual GPU events and
 separate transport ACK/consumer-credit control; no provided hash or QUERY value
 can turn those missing observations into native readiness.
+
+## Full kernel and module staging
+
+`build_private_kernel.py` is a Linux-only, closed build workflow. It verifies the
+official archive SHA256, validates tar paths/internal links, extracts a fresh
+private tree, applies the pinned extension, and consumes an explicitly SHA-bound
+base configuration. It runs `olddefconfig`, builds `bzImage` and all configured
+modules with actual modpost, and runs `modules_install` with an explicit private
+`INSTALL_MOD_PATH`. It never writes to the host `/boot` or `/lib/modules`, invokes
+modprobe, loads a module, creates an initramfs, changes a bootloader or resets a
+device. An existing workspace is rejected rather than reused.
+
+The supported build is x86-64. Its base and resolved configuration must contain
+`CONFIG_MODULES=y`, `CONFIG_USB4=m`, `CONFIG_USB4_CONFIGFS=m`,
+`CONFIG_USB4_STREAM=m`, `CONFIG_USB4_GPU_STREAM=y`,
+`CONFIG_DMA_SHARED_BUFFER=y`, and `CONFIG_MODULE_COMPRESS=n`. The local version
+must have a unique `-strix-gpu-...` suffix and automatic local versions/signing
+are disabled. These checks deliberately distinguish a complete custom kernel
+from a module built against arbitrary host headers. The base configuration is a
+trusted local input: review the PCI, storage, root filesystem, GPU/exporter,
+initramfs and security features required by the intended target before pinning
+it. An allnoconfig-derived development configuration does not establish that a
+machine can boot or provide its normal GPU drivers.
+
+For example, prepare a private copy of a reviewed configuration with the pinned
+`scripts/config`, resolve it using the patched kernel's `olddefconfig`, and hash
+that resolved file. Then invoke:
+
+```sh
+python3 lab/direct_gpu_stream/kernel/build_private_kernel.py \
+  --archive "$private_archive" \
+  --base-config "$private_base_config" \
+  --base-config-sha256 "$base_config_sha256" \
+  --workspace "$new_private_workspace" --jobs 4
+```
+
+The build needs the usual kernel tools, libelf headers/library, and Linux
+`depmod`, `modinfo` and `readelf`. `--private-host-deps "$private_dependencies"`
+optionally supplies private `include/` and `lib/` directories for libelf, as used
+for the cached development-image dependencies in the object build. It does not
+download or install packages. Source, build, stage and logs stay under the new
+workspace; all input/artifact paths are outside Git. Stage timeouts are bounded,
+and interruption/timeout kills the active build process group before exiting.
+
+The private stage contains the kernel image, vmlinux, System.map, resolved
+configuration, Module.symvers, `thunderbolt_stream.ko`, `thunderbolt.ko`, every
+other configured dependency module and depmod metadata. It rejects unresolved
+symbol diagnostics, missing dependencies, wrong vermagic release and missing or
+ambiguous GNU build IDs. `receipt.json` binds the source tree, recipe, base/final
+config, compiler tools, private host dependencies, commands/logs, module hashes,
+vermagic, build IDs and kernel artifacts. Input drift is checked after the build.
+This is a trusted, quiescent local source/toolchain boundary, not immutable
+execute-by-handle provenance or a proof of every compiler/runtime dependency.
+The receipt explicitly keeps installed, loaded, hardware-executed,
+boot-compatibility-verified and qualified flags false.
+
+The staged module tree's conventional `build` symlink points back to this
+private build directory. It is not a portable header package; do not transfer
+that link as evidence of a matching build environment on another machine.
+Distribution packaging must supply matching headers/build metadata separately
+if later external-module compilation is required. Metadata capture has a fixed
+60-second timeout and a 64 KiB retained-read limit per invocation; build logs
+remain private files rather than a claim of bounded compiler memory or log size.
+
+The preparation tests run without building a kernel or touching devices:
+
+A complete private development build finished with release
+`7.3.0-rc5-strix-gpu-devel-20261012`: bzImage, vmlinux, actual modpost, all three
+configured modules (`thunderbolt_stream`, `thunderbolt`, `libcryptoutils`), private
+staging and dependency/vermagic/build-ID gates passed. The stream module's GNU
+build ID is `8741a6693d685fffabfd69b8de870bcc53a61475`; this is an artifact
+observation, not an observation of a loaded module. The development configuration
+was not booted. Twelve preparation tests passed on Linux and on Windows with
+the Linux process-group test skipped there.
+
+```sh
+python3 -W error::ResourceWarning \
+  lab/direct_gpu_stream/kernel/test_build_private_kernel.py
+```
+
+They exercise private containment, tar traversal/symlink rejection, exact config
+and hash checks, repeated-workspace rejection, source drift, receipt parsing and
+actual Linux process-group timeout cleanup. They are host fixtures, not module
+load or physical DMA evidence.
+
+## Future target installation and removal runbook
+
+The following is an operator runbook for a later target session. None of its
+installation, boot, load or removal steps were executed for this source work.
+
+1. Select the target boot kernel first. A module must come from that exact
+   patched kernel source, configuration, toolchain, kernel release and exported
+   symbols, including CONFIG_MODVERSIONS CRCs where enabled. Matching a release
+   string or header directory alone is insufficient. `modules_prepare` does not
+   create the required full Module.symvers. Stock distribution headers also do
+   not supply this project extension or its internal Thunderbolt changes. The
+   supported fallback is the complete custom-kernel build above with a reviewed
+   target configuration, followed by booting that kernel.
+2. Retain a known-good boot entry, remote/local console and recovery path. Review
+   the private receipt and kernel/module signatures before installation. This
+   script stages unsigned artifacts and does not implement signing/enrollment.
+   If Secure Boot or CONFIG_MODULE_SIG_FORCE enforces signatures, use the target
+   distribution's trusted signed-kernel/module workflow from these pinned
+   sources; unsigned staging is not an installable result for that policy.
+   Do not disable signature enforcement as a compatibility shortcut.
+3. Use the target distribution's kernel packaging/install and initramfs/bootloader
+   procedures to install the reviewed custom kernel and its complete module
+   tree. Do not overwrite the running stock `thunderbolt` module or copy this
+   module alone into an unrelated release directory. Signing, stripping or
+   recompression changes artifact identity and requires a new final receipt and
+   qualification binding.
+4. Boot the selected custom kernel. Confirm `uname -r`, its configuration and
+   module vermagic against the receipt. Confirm `modinfo` dependency/signature
+   metadata and load `thunderbolt_stream` through the target's normal module
+   loader, which resolves `thunderbolt` and configured dependencies. Record the
+   actual loaded `/sys/module/thunderbolt_stream/notes/.note.gnu.build-id`; a
+   missing/malformed/inaccessible note fails the provider's build-identity gate.
+   A build ID or successful module load does not qualify GPU/controller DMA.
+5. Keep ConfigFS `gpu_direct` disabled until the target qualification/control
+   workflow selects an exact endpoint, driver build, GPU/exporter and peer epoch.
+   Run the independent visibility, stop/rearm, disconnect and reciprocal-credit
+   probes before serving a workload. Preserve the original copied stream mode
+   as its separate default interface.
+6. Before removal, stop admissions and peer sends, close logical operations,
+   drain actual GPU producer/consumer events, and obtain confirmed controller
+   STOP/path teardown before releasing imports and closing the endpoint FD.
+   Remove the unused ConfigFS endpoint through the stream driver's documented
+   interface. Then unload `thunderbolt_stream` through the normal module loader
+   only after all owners are gone. Other Thunderbolt clients may still need the
+   controller module; removing the extension does not require forcing that
+   module out. Return to the retained stock-kernel boot entry using the target's
+   normal package/boot procedure when removing the custom kernel.
+7. If close/STOP cannot prove path/controller quiescence, the extension deliberately
+   quarantines references. An unload or device-removal operation can remain
+   blocked. Preserve logs and the ownership incident; do not force module unload,
+   reuse hop IDs, or release DMA-BUF owners. Recovery/reset policy requires a
+   separate target session with its actual controller/GPU containment evidence.

@@ -6,6 +6,7 @@
 #include <functional>
 
 namespace strix::transport {
+class LinuxDirectGpuStreamCommissioning;
 struct LinuxDirectGpuStreamSyscallResult { int result = -1; int error = 0; };
 struct LinuxDirectGpuStreamCalls {
     std::shared_ptr<DirectStreamControlIo> fd_owner;
@@ -39,6 +40,8 @@ struct LinuxDirectGpuStreamPolicy {
 // Exact QUERY/FD/ABI/peer/link/epoch/import fencing, C1 per direction, contiguous
 // payload frames (partial final frame permitted) + one dedicated terminal frame.
 // Dedicated bounded v2 kind4 control stream supplies peer-ready/ACK/credit;
+// caller supplies a trusted bounded byte stream (FD copy or portable network),
+// retained for the entire provider lifetime; it must not block indefinitely.
 // hardware frame completion and GPU completion remain separate. Stock ENOTTY,
 // unsupported platforms and absent independent qualification stay unavailable.
 // Single serialized owner. Import/export/GPU/FD/control lifetimes survive errors;
@@ -46,7 +49,7 @@ struct LinuxDirectGpuStreamPolicy {
 class LinuxDirectTransportDriverIo final : public DirectTransportDriverIo, public DirectGpuBoundaryReceiveIo {
 public:
     LinuxDirectTransportDriverIo(DirectStreamDeviceIdentity route, DirectDriverBinding expected,
-        std::shared_ptr<DirectGpuStreamGpu>, std::shared_ptr<DirectStreamControlByteStream> dedicated_control,
+        std::shared_ptr<DirectGpuStreamGpu>, std::shared_ptr<DistributedControlByteStream> dedicated_control,
         LinuxDirectGpuStreamPolicy, std::shared_ptr<DirectGpuStreamQualification> qualification = {},
         LinuxDirectGpuStreamCalls = LinuxDirectGpuStreamCalls::native());
     ~LinuxDirectTransportDriverIo() override;
@@ -80,6 +83,10 @@ public:
     void invalidate() noexcept;
     [[nodiscard]] bool failed() const noexcept;
 private:
+    friend class LinuxDirectGpuStreamCommissioning;
+    void bind_commissioning_observed(const DirectDriverBinding&);
+    void begin_commissioning_operation();
+    void end_commissioning_operation() noexcept;
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

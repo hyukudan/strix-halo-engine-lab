@@ -18,6 +18,9 @@ struct ModelContentFile {
 [[nodiscard]] ModelContentIdentity sha256_file_content(
     const std::filesystem::path& path);
 
+[[nodiscard]] ModelContentIdentity sha256_bytes(
+    std::span<const std::byte> bytes);
+
 [[nodiscard]] ModelContentIdentity build_model_content_identity(
     std::span<const ModelContentFile> files);
 

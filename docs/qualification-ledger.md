@@ -19,11 +19,14 @@ portable fixtures, declarations or offline compilation to native qualification.
 | Graph eligibility | Separate fixed C1 graph topology, complete device-input embedding/PLE/GDN/indexed attention, owned capture/replay lifecycle and whole-DAG native fixtures compiled offline | Full-model native logits/state fidelity, actual graph memory and preparation-inclusive latency; eager plans remain distinct |
 | Host staging | Event-owned source pool and opt-in HIP PLE consumer, bounded bytes/progress, stale ticket/binding rejection and retained failure ownership | Native event/visibility/lifetime proof and preparation-inclusive benefit; destination lifetime is caller-owned |
 | Projection reduction | Fixed-tree shuffle-tail candidate, host sensitivity controls and experimental operator HIP graph replay | Native exact fixtures and end-to-end quality/performance; no measured gain yet |
+| Campaign preparation and capture | Private full-kernel/module build and staging, guarded driver/GPU observation tools, separate commissioning executable, full eager RAW logits/state writer and typed numerical import | Reviewed target boot/configuration, actual paired transfers, tokenizer/source bindings and independent model references; restored/integer/graph full-model recording remains separate |
 
-The latest completed strict Release integration passed 134 portable CTest entries.
-The final source also passed 17 selected ASan/UBSan checks with leak detection and
+The latest completed strict Release integration passed 140 portable CTest entries.
+The final source also passed 21 selected ASan/UBSan checks with leak detection and
 five HIP host-contract tests. The complete gfx1151 HIP build and the enabled Linux
-driver object compiled offline; the serial graph fixture validated its host
+driver object compiled offline. The complete pinned kernel, modules and private
+staging passed modpost, dependency, vermagic and GNU build-ID checks without
+installation or boot. The serial graph fixture validated its host
 contracts without GPU work. Compiler artifacts and detailed receipts remain private.
 This does not establish native GPU execution or DMA. The transport interfaces require
 one serialized progress owner. Completion budgets count polls, not elapsed time.

@@ -37,6 +37,14 @@ void write_file(
 }  // namespace
 
 int main() {
+    expect(strix::model_content_identity_hex(strix::sha256_bytes({})) ==
+               "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+           "SHA-256 empty buffer matches known vector");
+    constexpr std::string_view memory_vector = "abc";
+    expect(strix::model_content_identity_hex(strix::sha256_bytes(
+               std::as_bytes(std::span(memory_vector.data(), memory_vector.size())))) ==
+               "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+           "SHA-256 memory buffer matches known vector");
     const auto root =
         std::filesystem::temp_directory_path() /
         "strix-model-content-hash-test";
