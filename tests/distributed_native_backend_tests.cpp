@@ -47,8 +47,10 @@ public:
         const strix::transport::DirectTransportLease&,
         const strix::transport::DirectTransportLinkPoolBinding&) override {}
 
-    void release_link_pool(
-        const strix::transport::DirectTransportLease&) noexcept override {}
+    strix::transport::DirectPoolReleaseStatus release_link_pool(
+        const strix::transport::DirectTransportLease&) noexcept override {
+        return strix::transport::DirectPoolReleaseStatus::released;
+    }
 
     strix::transport::TransferHandle prepare_send(
         const strix::transport::TransferDescriptor& descriptor,

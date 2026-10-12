@@ -44,10 +44,11 @@ public:
         ++imports;
     }
 
-    void release_link_pool(
+    strix::transport::DirectPoolReleaseStatus release_link_pool(
         const strix::transport::DirectTransportLease& lease) noexcept override {
         released_generation = lease.lease_generation;
         ++releases;
+        return strix::transport::DirectPoolReleaseStatus::released;
     }
 
     strix::transport::TransferHandle prepare_send(

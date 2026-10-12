@@ -43,9 +43,10 @@ public:
         ++imports;
     }
 
-    void release_link_pool(
+    strix::transport::DirectPoolReleaseStatus release_link_pool(
         const strix::transport::DirectTransportLease&) noexcept override {
         ++releases;
+        return strix::transport::DirectPoolReleaseStatus::released;
     }
 
     void publish_gpu_commit(

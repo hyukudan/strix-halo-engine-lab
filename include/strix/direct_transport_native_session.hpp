@@ -118,6 +118,8 @@ public:
     send_state(
         TransferHandle handle) const;
 
+    // On unproved backend release, throws while retaining the active host lease
+    // and fencing new work. Retry close only to obtain actual release proof.
     void close();
 
 private:
@@ -136,6 +138,7 @@ private:
     DualLinkCompletionTelemetry* telemetry_ = nullptr;
     DualLinkRuntimeScheduler* scheduler_ = nullptr;
     bool receive_quarantined_ = false;
+    bool closing_ = false;
 };
 
 }  // namespace strix::transport

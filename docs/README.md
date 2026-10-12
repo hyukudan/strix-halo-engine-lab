@@ -63,6 +63,7 @@ A wider kernel, larger speculative window, second node or second physical link i
 - [Current qualification ledger](qualification-ledger.md).
 - [Portable correctness and precision foundations](implementation-2026-10-11.md).
 - [Optimization lifetime implementation](implementation-2026-10-12-optimization-lifetimes.md).
+- [Pre-hardware experiments](implementation-2026-10-12-prehardware-experiments.md).
 - [Phase specific packed weights and integer execution](proposals/2026-10-11-phase-specific-low-precision.md).
 - [Execution optimization gates](proposals/2026-10-12-execution-optimization-gates.md).
 

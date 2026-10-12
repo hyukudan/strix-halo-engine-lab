@@ -49,6 +49,8 @@ struct DirectNativeEvent {
     std::uint64_t in_flight_bytes = 0;
 };
 
+enum class DirectPoolReleaseStatus { released, pending, failed_retained };
+
 class DirectTransportNativeBackend {
 public:
     virtual ~DirectTransportNativeBackend() = default;
@@ -60,7 +62,9 @@ public:
         const DirectTransportLease& lease,
         const DirectTransportLinkPoolBinding& pool) = 0;
 
-    virtual void release_link_pool(
+    // released proves this exact lease's imported DMA/resources are quiescent
+    // and released. Pending/error retains the host lease as well as native pins.
+    virtual DirectPoolReleaseStatus release_link_pool(
         const DirectTransportLease& lease) noexcept = 0;
 
     [[nodiscard]] virtual TransferHandle prepare_send(

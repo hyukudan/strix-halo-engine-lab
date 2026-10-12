@@ -3,6 +3,7 @@
 #include "strix/execution_binding.hpp"
 #include "strix/hip_runtime_launchers.hpp"
 #include "strix/launch_dispatch.hpp"
+#include "strix/graph_inputs.hpp"
 
 #include <cstdint>
 #include <string>
@@ -14,6 +15,17 @@ struct HipEmbeddingLauncherConfig {
     HipActivationStorage output =
         HipActivationStorage::bf16;
 };
+
+// Experimental C1 device-input gather. All allocations must remain owned and
+// unchanged through stream completion. status is overwritten on every launch:
+// 0=valid, 1=token out of range, 2=position out of range (flags may combine).
+// This separate API does not promote the existing eager whole-model launcher.
+void launch_hip_graph_embedding(
+    const HipEmbeddingLauncherConfig& config, std::uint32_t ggml_type,
+    const RuntimeTensorBinding& weights, std::uint32_t vocabulary_size,
+    std::uint64_t context_tokens, const GraphDynamicArguments& arguments,
+    const ExecutionBufferAddress& output, const ExecutionMemoryBinding& status,
+    void* stream);
 
 void register_hip_embedding_kernel_variant(
     const ModelContract& model,

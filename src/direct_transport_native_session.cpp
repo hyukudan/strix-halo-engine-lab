@@ -18,7 +18,7 @@ DirectTransportNativeLinkSession(
       sends_(std::move(other.sends_)),
       telemetry_(other.telemetry_),
       scheduler_(other.scheduler_),
-      receive_quarantined_(other.receive_quarantined_) {
+      receive_quarantined_(other.receive_quarantined_), closing_(other.closing_) {
     other.backend_ = nullptr;
     other.leases_ = nullptr;
     other.link_ = nullptr;
@@ -44,6 +44,7 @@ DirectTransportNativeLinkSession::operator=(
         telemetry_ = other.telemetry_;
         scheduler_ = other.scheduler_;
         receive_quarantined_ = other.receive_quarantined_;
+        closing_ = other.closing_;
 
         other.backend_ = nullptr;
         other.leases_ = nullptr;
@@ -92,7 +93,9 @@ DirectTransportNativeLinkSession::open(
             pools,
             lease);
     } catch (...) {
-        leases.release(lease);
+        if (backend.release_link_pool(lease) == DirectPoolReleaseStatus::released) {
+            leases.release(lease);
+        }
         throw;
     }
 
@@ -120,6 +123,7 @@ void DirectTransportNativeLinkSession::require_active() const {
 
 void DirectTransportNativeLinkSession::require_current_lease() const {
     require_active();
+    if (closing_) throw std::logic_error("native direct session is closing and retains ownership");
     if (!link_->expected_native_interface ||
         *link_->expected_native_interface != native_interface_) {
         throw std::logic_error("native direct session ABI/peer proof changed during active lease");
@@ -491,9 +495,10 @@ DirectTransportNativeLinkSession::send_state(
 
 void DirectTransportNativeLinkSession::close() {
     require_active();
-
-    backend_->release_link_pool(
-        lease_);
+    closing_ = true;
+    if (backend_->release_link_pool(lease_) != DirectPoolReleaseStatus::released) {
+        throw std::runtime_error("native direct pool release lacks quiescence proof; host lease retained");
+    }
     leases_->release(
         lease_);
 
@@ -511,9 +516,9 @@ void DirectTransportNativeLinkSession::release_noexcept() noexcept {
         return;
     }
 
-    backend_->release_link_pool(
-        lease_);
-    if (leases_ != nullptr) {
+    closing_ = true;
+    const auto released = backend_->release_link_pool(lease_);
+    if (leases_ != nullptr && released == DirectPoolReleaseStatus::released) {
         try {
             leases_->release(
                 lease_);

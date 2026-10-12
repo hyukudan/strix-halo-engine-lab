@@ -317,14 +317,14 @@ __global__ void embedding_kernel(
     std::uint32_t row_width,
     std::uint32_t token_id,
     Output* output) {
-    for (std::uint32_t feature =
-             static_cast<std::uint32_t>(
+    for (std::uint64_t feature =
+             static_cast<std::uint64_t>(
                  blockIdx.x) *
                  blockDim.x +
              threadIdx.x;
          feature < row_width;
          feature +=
-             static_cast<std::uint32_t>(
+             static_cast<std::uint64_t>(
                  gridDim.x) *
              blockDim.x) {
         store_output(
@@ -333,7 +333,60 @@ __global__ void embedding_kernel(
                 weights,
                 row_width,
                 token_id,
-                feature));
+                static_cast<std::uint32_t>(feature)));
+    }
+}
+
+template <typename Output, EmbeddingWeightKind Kind>
+__global__ void graph_embedding_kernel(
+    const void* weights, std::uint32_t width, std::uint32_t vocabulary_size,
+    std::uint64_t context_tokens, const std::uint32_t* token,
+    const std::uint64_t* position, Output* output, std::uint32_t* status) {
+    const auto token_id = *token;
+    const auto absolute_position = *position;
+    const std::uint32_t flags = (token_id >= vocabulary_size ? 1U : 0U) |
+        (absolute_position >= context_tokens ? 2U : 0U);
+    if (blockIdx.x == 0 && threadIdx.x == 0) *status = flags;
+    for (std::uint64_t feature = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         feature < width; feature += static_cast<std::uint64_t>(gridDim.x) * blockDim.x) {
+        store_output(&output[feature], flags == 0 ? load_weight<Kind>(weights, width, token_id,
+            static_cast<std::uint32_t>(feature)) : 0.0F);
+    }
+}
+
+template <typename Output, EmbeddingWeightKind Kind>
+void launch_graph_typed(
+    const HipEmbeddingLauncherConfig& config, const RuntimeTensorBinding& weights,
+    std::uint32_t vocabulary_size, std::uint64_t context_tokens,
+    const GraphDynamicArguments& arguments, const ExecutionBufferAddress& output,
+    const ExecutionMemoryBinding& status, hipStream_t stream) {
+    const auto blocks = std::min<std::uint32_t>(32U, (config.hidden_size - 1U) / kThreads + 1U);
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(graph_embedding_kernel<Output, Kind>), dim3(blocks),
+        dim3(kThreads), 0, stream, reinterpret_cast<const void*>(weights.address), config.hidden_size,
+        vocabulary_size, context_tokens,
+        reinterpret_cast<const std::uint32_t*>(arguments.memory.arena_base + arguments.token_offset),
+        reinterpret_cast<const std::uint64_t*>(arguments.memory.arena_base + arguments.position_offset),
+        reinterpret_cast<Output*>(output.address), reinterpret_cast<std::uint32_t*>(status.arena_base));
+    check_hip(hipGetLastError(), "HIP device-input graph embedding launch");
+}
+
+template <typename Output>
+void launch_graph_by_kind(
+    EmbeddingWeightKind kind, const HipEmbeddingLauncherConfig& config,
+    const RuntimeTensorBinding& weights, std::uint32_t vocabulary_size,
+    std::uint64_t context_tokens, const GraphDynamicArguments& arguments,
+    const ExecutionBufferAddress& output, const ExecutionMemoryBinding& status, hipStream_t stream) {
+    switch (kind) {
+    case EmbeddingWeightKind::f32:
+        launch_graph_typed<Output, EmbeddingWeightKind::f32>(config, weights, vocabulary_size, context_tokens, arguments, output, status, stream); break;
+    case EmbeddingWeightKind::f16:
+        launch_graph_typed<Output, EmbeddingWeightKind::f16>(config, weights, vocabulary_size, context_tokens, arguments, output, status, stream); break;
+    case EmbeddingWeightKind::bf16:
+        launch_graph_typed<Output, EmbeddingWeightKind::bf16>(config, weights, vocabulary_size, context_tokens, arguments, output, status, stream); break;
+    case EmbeddingWeightKind::q8_0:
+        launch_graph_typed<Output, EmbeddingWeightKind::q8_0>(config, weights, vocabulary_size, context_tokens, arguments, output, status, stream); break;
+    case EmbeddingWeightKind::iq4_xs:
+        launch_graph_typed<Output, EmbeddingWeightKind::iq4_xs>(config, weights, vocabulary_size, context_tokens, arguments, output, status, stream); break;
     }
 }
 
@@ -391,9 +444,7 @@ void launch_typed(
     const auto blocks =
         std::min<std::uint32_t>(
             32U,
-            (config.hidden_size +
-             kThreads - 1U) /
-                kThreads);
+            (config.hidden_size - 1U) / kThreads + 1U);
     hipLaunchKernelGGL(
         HIP_KERNEL_NAME(
             embedding_kernel<
@@ -772,6 +823,24 @@ register_for_compiled_execution(
 
     throw std::invalid_argument(
         "compiled execution has no token embedding step");
+}
+
+void launch_hip_graph_embedding(
+    const HipEmbeddingLauncherConfig& config, std::uint32_t ggml_type,
+    const RuntimeTensorBinding& weights, std::uint32_t vocabulary_size,
+    std::uint64_t context_tokens, const GraphDynamicArguments& arguments,
+    const ExecutionBufferAddress& output, const ExecutionMemoryBinding& status, void* stream) {
+    validate_config(config);
+    if (stream == nullptr) throw std::invalid_argument("graph embedding requires an explicitly owned stream");
+    validate_graph_embedding_bindings(config.hidden_size, ggml_type, vocabulary_size, context_tokens,
+        config.output == HipActivationStorage::fp32 ? 4U : 2U, weights, arguments, output, status);
+    const auto kind = weight_kind(ggml_type);
+    const auto native_stream = static_cast<hipStream_t>(stream);
+    if (config.output == HipActivationStorage::fp32) {
+        launch_graph_by_kind<float>(kind, config, weights, vocabulary_size, context_tokens, arguments, output, status, native_stream);
+    } else {
+        launch_graph_by_kind<std::uint16_t>(kind, config, weights, vocabulary_size, context_tokens, arguments, output, status, native_stream);
+    }
 }
 
 }  // namespace strix

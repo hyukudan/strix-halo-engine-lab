@@ -22,6 +22,8 @@ endfunction()
 add_library(strix_core STATIC
     src/arithmetic_lineage.cpp
     src/graph_eligibility.cpp
+    src/graph_inputs.cpp
+    src/integer_projection.cpp
     src/host_upload.cpp
     src/compiled_execution.cpp
     src/compiled_mtp_draft_plan.cpp
@@ -41,6 +43,8 @@ add_library(strix_core STATIC
     src/distributed_runtime.cpp
     src/distributed_session.cpp
     src/direct_transport_completion.cpp
+    src/direct_transport_driver.cpp
+    src/direct_stream_control.cpp
     src/direct_transport_native_backend.cpp
     src/direct_transport_native_session.cpp
     src/direct_transport_frames.cpp
@@ -141,9 +145,9 @@ target_include_directories(strix_core PUBLIC include)
 target_compile_features(strix_core PUBLIC cxx_std_20)
 strix_target_warnings(strix_core)
 if(NOT MSVC)
-    set_source_files_properties(src/low_precision.cpp src/projection_reduction.cpp PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+    set_source_files_properties(src/low_precision.cpp src/projection_reduction.cpp src/integer_projection.cpp PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
 else()
-    set_source_files_properties(src/low_precision.cpp src/projection_reduction.cpp PROPERTIES COMPILE_OPTIONS "/fp:strict")
+    set_source_files_properties(src/low_precision.cpp src/projection_reduction.cpp src/integer_projection.cpp PROPERTIES COMPILE_OPTIONS "/fp:strict")
 endif()
 
 add_executable(strix-low-precision-reference lab/low_precision/reference_main.cpp)
@@ -180,6 +184,27 @@ strix_target_warnings(strix-audit-execution-tensors)
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(strix-direct-stream-control-tests tests/direct_stream_control_tests.cpp)
+    target_link_libraries(strix-direct-stream-control-tests PRIVATE strix_core)
+    strix_target_warnings(strix-direct-stream-control-tests)
+    add_test(NAME strix-direct-stream-control-tests COMMAND strix-direct-stream-control-tests)
+    add_executable(strix-direct-transport-driver-tests tests/direct_transport_driver_tests.cpp)
+    target_link_libraries(strix-direct-transport-driver-tests PRIVATE strix_core)
+    strix_target_warnings(strix-direct-transport-driver-tests)
+    add_test(NAME strix-direct-transport-driver-tests COMMAND strix-direct-transport-driver-tests)
+    add_executable(strix-integer-projection-tests tests/integer_projection_tests.cpp)
+    target_link_libraries(strix-integer-projection-tests PRIVATE strix_core)
+    strix_target_warnings(strix-integer-projection-tests)
+    if(NOT MSVC)
+        target_compile_options(strix-integer-projection-tests PRIVATE -ffp-contract=off)
+    else()
+        target_compile_options(strix-integer-projection-tests PRIVATE /fp:strict)
+    endif()
+    add_test(NAME strix-integer-projection-tests COMMAND strix-integer-projection-tests)
+    add_executable(strix-graph-inputs-tests tests/graph_inputs_tests.cpp)
+    target_link_libraries(strix-graph-inputs-tests PRIVATE strix_core)
+    strix_target_warnings(strix-graph-inputs-tests)
+    add_test(NAME strix-graph-inputs-tests COMMAND strix-graph-inputs-tests)
     add_executable(strix-host-upload-tests tests/host_upload_tests.cpp)
     target_link_libraries(strix-host-upload-tests PRIVATE strix_core)
     strix_target_warnings(strix-host-upload-tests)
@@ -937,6 +962,12 @@ if(STRIX_ENABLE_HIP_RUNTIME)
             strix-hip-embedding-launcher-tests
             tests/hip_embedding_launcher_tests.hip
         )
+        add_executable(strix-hip-graph-inputs-tests tests/hip_graph_inputs_tests.hip)
+        set_target_properties(strix-hip-graph-inputs-tests PROPERTIES
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+        target_link_libraries(strix-hip-graph-inputs-tests PRIVATE strix_hip_runtime)
+        strix_target_warnings(strix-hip-graph-inputs-tests)
+        add_test(NAME strix-hip-graph-inputs-tests COMMAND strix-hip-graph-inputs-tests)
         set_target_properties(
             strix-hip-embedding-launcher-tests
             PROPERTIES
