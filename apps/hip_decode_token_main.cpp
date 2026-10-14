@@ -168,6 +168,7 @@ struct Options {
     bool planned_ple_io = false;
     bool parallel_hyper_mix = false;
     bool staged_hyper_projections = false;
+    bool fused_staged_hyper_mix = false;
     std::uint64_t ple_max_rows_per_io = 4;
     std::uint64_t ple_max_inflight_ios = 4;
     std::string reference_path;
@@ -192,7 +193,7 @@ Options parse_options(
             "[--context N] [--residency register|copy] [--coalesce-gap BYTES] "
             "[--planned-ple-io] [--ple-max-rows-per-io N] [--ple-max-inflight-ios N] "
             "[--generate N] [--eos-token TOKEN_ID] [--prefix-cache-roundtrip] "
-            "[--parallel-hyper-mix [--staged-hyper-projections]]");
+            "[--parallel-hyper-mix [--staged-hyper-projections [--fused-staged-hyper-mix]]]");
     }
 
     Options options;
@@ -213,6 +214,11 @@ Options parse_options(
         if (argument == "--staged-hyper-projections") {
             if (options.staged_hyper_projections) throw std::invalid_argument("duplicate staged hyper projections option");
             options.staged_hyper_projections = true;
+            continue;
+        }
+        if (argument == "--fused-staged-hyper-mix") {
+            if (options.fused_staged_hyper_mix) throw std::invalid_argument("duplicate fused staged hyper-mix option");
+            options.fused_staged_hyper_mix = true;
             continue;
         }
 
@@ -453,6 +459,8 @@ Options parse_options(
     }
     if (options.staged_hyper_projections && !options.parallel_hyper_mix)
         throw std::invalid_argument("--staged-hyper-projections requires --parallel-hyper-mix");
+    if (options.fused_staged_hyper_mix && !options.staged_hyper_projections)
+        throw std::invalid_argument("--fused-staged-hyper-mix requires --staged-hyper-projections");
     return options;
 }
 
@@ -823,6 +831,7 @@ int main(
     catalog_config.enable_device_graph_inputs = graph_mode;
     catalog_config.parallel_hyper_mix = options.parallel_hyper_mix;
     catalog_config.staged_hyper_projections = options.staged_hyper_projections;
+    catalog_config.fused_staged_hyper_mix = options.fused_staged_hyper_mix;
     std::optional<strix::integer_projection::RuntimeConfig> integer_config;
     if (options.execution.integer_head != strix::DecodeIntegerHead::none) {
         integer_config = strix::make_decode_integer_head_config(model, manifest, options.execution,

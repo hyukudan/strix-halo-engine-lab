@@ -97,6 +97,8 @@ void validate_config(
     const HipHyperMixLauncherConfig& config) {
     if (config.staged_projections && !config.parallel)
         throw std::invalid_argument("staged hyper projections require parallel hyper-mix");
+    if (config.fused_injection && !config.staged_projections)
+        throw std::invalid_argument("fused injection requires staged hyper projections");
     if (config.hidden_size == 0 ||
         config.hc_count <= 1 ||
         config.hc_count > kMaxHc ||
@@ -727,6 +729,51 @@ __global__ void staged_hyper_projection_kernel(
     }
 }
 
+// The injection role is uniform for an entire workgroup. Its tile and chain
+// arithmetic match v4; the extra workgroups share the lowrank launch/stream.
+__global__ void fused_staged_hyper_projection_kernel(
+    const float* normalized, const void* down, std::uint32_t down_kind,
+    std::uint32_t width, std::uint32_t streams, std::uint32_t lowrank, float* low,
+    const void* inject, std::uint32_t inject_kind, float* injection_output,
+    std::uint32_t lowrank_blocks) {
+    __shared__ float values[kStagedThreads];
+    __shared__ float coefficients[kStagedOutputs][kStagedPitch];
+    const auto lane = threadIdx.x;
+    const bool injection = blockIdx.x >= lowrank_blocks;
+    const auto role_block = injection ? blockIdx.x - lowrank_blocks : blockIdx.x;
+    const auto first_output = role_block * kStagedOutputs;
+    const auto row = blockIdx.y;
+    const auto chain = first_output + lane;
+    const auto outputs = injection ? streams : lowrank;
+    const auto* weights = injection ? inject : down;
+    const auto kind = injection ? inject_kind : down_kind;
+    auto* output = injection ? injection_output : low;
+    const bool active = lane < kStagedOutputs && chain < outputs;
+    float sum = 0.0F;
+    for (std::uint32_t tile = 0; tile < width; tile += kStagedThreads) {
+        const auto remaining = width - tile;
+        const auto count = remaining < kStagedThreads ? remaining : kStagedThreads;
+        if (lane < count) {
+            values[lane] = normalized[static_cast<std::uint64_t>(row) * width + tile + lane];
+            for (std::uint32_t local = 0; local < kStagedOutputs; ++local) {
+                if (first_output + local < outputs)
+                    coefficients[local][lane] = load_linear_weight(
+                        weights, kind, width, first_output + local, tile + lane);
+            }
+        }
+        __syncthreads();
+        if (active)
+            for (std::uint32_t inner = 0; inner < count; ++inner)
+                sum += values[inner] * coefficients[lane][inner];
+        __syncthreads();
+    }
+    if (active) {
+        const float scaled = sum / static_cast<float>(streams);
+        output[static_cast<std::uint64_t>(row) * outputs + chain] =
+            injection ? 2.0F * sigmoid(scaled) : scaled * sigmoid(scaled);
+    }
+}
+
 template <typename Storage>
 __global__ void staged_hyper_output_kernel(
     const float* normalized, const float* low, const void* up, std::uint32_t kind,
@@ -917,6 +964,26 @@ void launch_typed(
             norm_manifest.ggml_type, config.hidden_size, config.hc_count, config.rms_epsilon, normalized);
         check_hip(hipGetLastError(), "parallel hyper-mix normalization launch");
         if (config.staged_projections) {
+            if (config.fused_injection) {
+                const auto lowrank_blocks = (config.lowrank + kStagedOutputs - 1U) / kStagedOutputs;
+                const auto injection_blocks = injection_output ? (config.hc_count + kStagedOutputs - 1U) / kStagedOutputs : 0U;
+                hipLaunchKernelGGL(fused_staged_hyper_projection_kernel,
+                    dim3(lowrank_blocks + injection_blocks, context.logical_rows), dim3(kStagedThreads),
+                    0, hip_execution_stream(), normalized,
+                    reinterpret_cast<const void*>(down_runtime.address), down_manifest.ggml_type,
+                    static_cast<std::uint32_t>(width), config.hc_count, config.lowrank, low,
+                    inject_runtime ? reinterpret_cast<const void*>(inject_runtime->address) : nullptr,
+                    inject_manifest ? inject_manifest->ggml_type : 0U,
+                    injection_output ? reinterpret_cast<float*>(injection_output->address) : nullptr, lowrank_blocks);
+                check_hip(hipGetLastError(), "fused staged hyper-mix projection launch");
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(staged_hyper_output_kernel<Storage>),
+                    dim3((config.hidden_size + kStagedOutputs - 1U) / kStagedOutputs, context.logical_rows),
+                    dim3(kStagedThreads), 0, hip_execution_stream(), normalized, low,
+                    reinterpret_cast<const void*>(up_runtime.address), up_manifest.ggml_type,
+                    config.hidden_size, config.hc_count, config.lowrank, reinterpret_cast<Storage*>(output.address));
+                check_hip(hipGetLastError(), "fused staged hyper-mix output launch");
+                return;
+            }
             hipLaunchKernelGGL(HIP_KERNEL_NAME(staged_hyper_projection_kernel<false>),
                 dim3((config.lowrank + kStagedOutputs - 1U) / kStagedOutputs, context.logical_rows),
                 dim3(kStagedThreads), 0, hip_execution_stream(), normalized,
@@ -1284,7 +1351,7 @@ std::string kernel_id(
         ".c" +
         std::to_string(
             request.request_concurrency) + (config.parallel ? ".parallel" : "") +
-        (config.staged_projections ? ".staged" : "");
+        (config.staged_projections ? ".staged" : "") + (config.fused_injection ? ".fused-injection-v5" : "");
 }
 
 std::uint64_t implementation_identity(
@@ -1309,6 +1376,7 @@ std::uint64_t implementation_identity(
     hash_u64(hash, epsilon_bits);
     hash_u64(hash, config.parallel ? 1U : 0U);
     if (config.staged_projections) hash_u64(hash, 0x535441474544ULL);
+    if (config.fused_injection) hash_u64(hash, 0x4655534544484305ULL);
     return hash;
 }
 
@@ -1402,6 +1470,7 @@ void register_hip_hyper_mix_kernel_variant(
     variant.output_layout =
         "row-major+fp32-injection";
     variant.compiler_identity =
+        config.fused_injection ? "hip-gfx1151-hyper-mix-v5-fused-injection" :
         config.staged_projections ? "hip-gfx1151-hyper-mix-v4-staged" :
         config.parallel ? "hip-gfx1151-hyper-mix-v3-parallel" : "hip-gfx1151-hyper-mix-v2";
     variant.measured_seconds = 0.0;
