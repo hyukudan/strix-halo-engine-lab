@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -381,7 +382,7 @@ struct Fixture {
 
 void run_numeric_fixture(
     strix::SerialOp op,
-    bool with_injection) {
+    bool with_injection, bool bf16 = false) {
     const auto model =
         strix::ModelContract::
             qwen38_flash_next();
@@ -398,7 +399,7 @@ void run_numeric_fixture(
 
     strix::ExecutionBufferRequest request;
     request.logical_rows = 1;
-    request.activation_element_bytes = 4;
+    request.activation_element_bytes = bf16 ? 2U : 4U;
     request.control_element_bytes = 4;
     const auto arena =
         strix::build_serial_execution_arena_plan(
@@ -455,13 +456,25 @@ void run_numeric_fixture(
     }
 
     Fixture fixture;
+    std::vector<std::uint16_t> input_bf16(fixture.input.size());
+    if (bf16) {
+        for (std::size_t index = 0; index < fixture.input.size(); ++index) {
+            int exponent = 0;
+            const double value = fixture.input[index];
+            const double scaled = std::frexp(std::fabs(value), &exponent) * 256.0;
+            auto integer = static_cast<unsigned int>(std::floor(scaled));
+            const double fraction = scaled - integer;
+            if (fraction > 0.5 || (fraction == 0.5 && (integer & 1U))) ++integer;
+            fixture.input[index] = static_cast<float>(std::copysign(std::ldexp(static_cast<double>(integer), exponent - 8), value));
+            input_bf16[index] = static_cast<std::uint16_t>(std::bit_cast<std::uint32_t>(fixture.input[index]) >> 16U);
+        }
+    }
     check(
         hipMemcpy(
             reinterpret_cast<void*>(
                 input_address.address),
-            fixture.input.data(),
-            fixture.input.size() *
-                sizeof(float),
+            bf16 ? static_cast<const void*>(input_bf16.data()) : fixture.input.data(),
+            fixture.input.size() * (bf16 ? sizeof(std::uint16_t) : sizeof(float)),
             hipMemcpyHostToDevice),
         "copy hyper-mix input");
 
@@ -635,6 +648,7 @@ void run_numeric_fixture(
         step_io.reads;
     context.writes =
         step_io.writes;
+    context.temporaries = step_io.temporaries;
     context.arena =
         &arena;
     context.memory =
@@ -653,8 +667,7 @@ void run_numeric_fixture(
         Fixture::lowrank;
     config.rms_epsilon =
         1e-6F;
-    config.activation =
-        strix::HipActivationStorage::fp32;
+    config.activation = bf16 ? strix::HipActivationStorage::bf16 : strix::HipActivationStorage::fp32;
 
     auto launcher =
         strix::make_hip_hyper_mix_launcher(
@@ -669,16 +682,18 @@ void run_numeric_fixture(
 
     std::vector<float> actual_mixed(
         Fixture::hidden);
+    std::vector<std::uint16_t> actual_bf16(Fixture::hidden);
     check(
         hipMemcpy(
-            actual_mixed.data(),
+            bf16 ? static_cast<void*>(actual_bf16.data()) : actual_mixed.data(),
             reinterpret_cast<
                 const void*>(
                 mixed_address.address),
-            actual_mixed.size() *
-                sizeof(float),
+            actual_mixed.size() * (bf16 ? sizeof(std::uint16_t) : sizeof(float)),
             hipMemcpyDeviceToHost),
         "copy hyper-mix output");
+    if (bf16) for (std::size_t index = 0; index < actual_mixed.size(); ++index)
+        actual_mixed[index] = std::bit_cast<float>(static_cast<std::uint32_t>(actual_bf16[index]) << 16U);
 
     std::vector<float> actual_injection;
     if (with_injection) {
@@ -743,6 +758,32 @@ void run_numeric_fixture(
             injection_error <= 2e-3F,
             "fused hyper-mix injection weights match CPU reference");
     }
+
+    auto parallel_config = config;
+    parallel_config.parallel = true;
+    auto parallel_launcher = strix::make_hip_hyper_mix_launcher("test.hyper_mix.parallel", &parallel_config);
+    expect(parallel_launcher.implementation_identity != launcher.implementation_identity,
+           "parallel hyper-mix has a distinct numerical implementation identity");
+    parallel_launcher.function(context, parallel_launcher.user_data);
+    check(hipDeviceSynchronize(), "parallel hyper-mix synchronize");
+    std::vector<float> parallel_mixed(actual_mixed.size());
+    check(hipMemcpy(bf16 ? static_cast<void*>(actual_bf16.data()) : parallel_mixed.data(), reinterpret_cast<void*>(mixed_address.address),
+                    parallel_mixed.size() * (bf16 ? sizeof(std::uint16_t) : sizeof(float)), hipMemcpyDeviceToHost), "read parallel hyper-mix output");
+    if (bf16) for (std::size_t index = 0; index < parallel_mixed.size(); ++index)
+        parallel_mixed[index] = std::bit_cast<float>(static_cast<std::uint32_t>(actual_bf16[index]) << 16U);
+    expect(parallel_mixed == actual_mixed, "parallel projections preserve legacy FP32 accumulation results");
+    if (with_injection) {
+        std::vector<float> parallel_injection(actual_injection.size());
+        check(hipMemcpy(parallel_injection.data(), reinterpret_cast<void*>(injection_address->address),
+                        parallel_injection.size() * sizeof(float), hipMemcpyDeviceToHost), "read parallel injection");
+        expect(parallel_injection == actual_injection, "parallel injection preserves legacy accumulation results");
+    }
+    auto missing_workspace = context;
+    missing_workspace.temporaries = {};
+    bool rejected = false;
+    try { parallel_launcher.function(missing_workspace, parallel_launcher.user_data); }
+    catch (const std::invalid_argument&) { rejected = true; }
+    expect(rejected, "parallel hyper-mix rejects missing admitted scratch");
 
     for (auto* pointer :
          device_weights) {
@@ -854,6 +895,9 @@ int main() try {
     run_numeric_fixture(
         strix::SerialOp::final_hyper_mix,
         false);
+    run_numeric_fixture(strix::SerialOp::attn_hyper_mix, true, true);
+    run_numeric_fixture(strix::SerialOp::mlp_hyper_mix, true, true);
+    run_numeric_fixture(strix::SerialOp::final_hyper_mix, false, true);
 
     if (failures == 0) {
         std::cout

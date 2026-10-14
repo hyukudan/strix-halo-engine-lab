@@ -70,6 +70,10 @@ constexpr Buffer indexed_attention_workspace() {
         0};
 }
 
+constexpr Buffer hyper_workspace() {
+    return Buffer{ExecutionBufferClass::hyper_workspace, 0};
+}
+
 bool contains_buffer(
     std::span<const ExecutionBufferUse> values,
     Buffer needle) {
@@ -105,6 +109,8 @@ std::uint32_t slot_limit(
         return plan.ple_workspace_slots;
     case ExecutionBufferClass::indexed_attention_workspace:
         return plan.indexed_attention_workspace_slots;
+    case ExecutionBufferClass::hyper_workspace:
+        return plan.hyper_workspace_slots;
     }
     return 0;
 }
@@ -133,11 +139,12 @@ SerialExecutionIoPlan build_serial_execution_io_plan(
     output.gdn_workspace_slots = 1;
     output.ple_workspace_slots = 1;
     output.indexed_attention_workspace_slots = 1;
+    output.hyper_workspace_slots = 1;
     output.steps.reserve(
         execution_plan.steps.size());
 
     constexpr std::size_t maximum_buffers =
-        10U * 8U;
+        (static_cast<std::size_t>(ExecutionBufferClass::hyper_workspace) + 1U) * 8U;
     std::array<std::uint64_t, maximum_buffers> generations{};
 
     const auto read_use = [&](Buffer buffer) {
@@ -203,6 +210,7 @@ SerialExecutionIoPlan build_serial_execution_io_plan(
                 write_use(hidden(0)),
                 write_use(injection()),
             };
+            io.temporaries = {temporary_use(hyper_workspace())};
             break;
 
         case SerialOp::gated_delta_net:
@@ -241,6 +249,7 @@ SerialExecutionIoPlan build_serial_execution_io_plan(
                 write_use(hidden(0)),
                 write_use(injection()),
             };
+            io.temporaries = {temporary_use(hyper_workspace())};
             break;
 
         case SerialOp::moe_route:
@@ -296,6 +305,7 @@ SerialExecutionIoPlan build_serial_execution_io_plan(
         case SerialOp::final_hyper_mix:
             io.reads = {read_use(hyper(current_hyper))};
             io.writes = {write_use(hidden(0))};
+            io.temporaries = {temporary_use(hyper_workspace())};
             break;
 
         case SerialOp::lm_head:
@@ -323,7 +333,7 @@ void validate_serial_execution_io_plan(
     }
 
     constexpr std::size_t maximum_buffers =
-        10U * 8U;
+        (static_cast<std::size_t>(ExecutionBufferClass::hyper_workspace) + 1U) * 8U;
     std::array<bool, maximum_buffers> produced{};
     std::array<std::uint64_t, maximum_buffers> generation{};
 

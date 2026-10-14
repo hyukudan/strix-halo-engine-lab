@@ -151,6 +151,8 @@ ExecutionBufferPlan build_serial_execution_buffer_plan(
         checked_mul(
             request.logical_rows,
             indexed_workspace.total_bytes);
+    plan.hyper_workspace_bytes = product(request.logical_rows,
+        checked_add(checked_mul(model.hidden_size, model.hc_count), model.hc_lowrank), model.bytes_fp32);
 
     const auto attn_inject_peak =
         checked_add(
@@ -205,6 +207,7 @@ ExecutionBufferPlan build_serial_execution_buffer_plan(
             moe_branch_peak,
             ple_peak,
             indexed_attention_peak,
+            checked_add(attn_inject_peak, plan.hyper_workspace_bytes),
         });
 
     const auto logits_stage_peak =

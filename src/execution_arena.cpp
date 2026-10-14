@@ -65,6 +65,8 @@ std::uint64_t bytes_for(
         return sizes.ple_workspace_bytes;
     case ExecutionBufferClass::indexed_attention_workspace:
         return sizes.indexed_attention_workspace_bytes;
+    case ExecutionBufferClass::hyper_workspace:
+        return sizes.hyper_workspace_bytes;
     }
     throw std::logic_error(
         "unknown execution buffer class");

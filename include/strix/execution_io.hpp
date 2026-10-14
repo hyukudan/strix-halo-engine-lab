@@ -19,6 +19,7 @@ enum class ExecutionBufferClass {
     gdn_workspace,
     ple_workspace,
     indexed_attention_workspace,
+    hyper_workspace,
 };
 
 struct ExecutionBufferRef {
@@ -60,6 +61,7 @@ struct SerialExecutionIoPlan {
     std::uint32_t gdn_workspace_slots = 0;
     std::uint32_t ple_workspace_slots = 0;
     std::uint32_t indexed_attention_workspace_slots = 0;
+    std::uint32_t hyper_workspace_slots = 0;
 };
 
 [[nodiscard]] SerialExecutionIoPlan build_serial_execution_io_plan(
