@@ -477,6 +477,11 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-ple-lookup-tests)
     add_test(NAME strix-ple-lookup-tests COMMAND strix-ple-lookup-tests)
 
+    add_executable(strix-ple-iq4-nl-tests tests/ple_iq4_nl_tests.cpp)
+    target_link_libraries(strix-ple-iq4-nl-tests PRIVATE strix_core)
+    strix_target_warnings(strix-ple-iq4-nl-tests)
+    add_test(NAME strix-ple-iq4-nl-tests COMMAND strix-ple-iq4-nl-tests)
+
     add_executable(strix-ple-workspace-tests tests/ple_workspace_tests.cpp)
     target_link_libraries(strix-ple-workspace-tests PRIVATE strix_core)
     strix_target_warnings(strix-ple-workspace-tests)

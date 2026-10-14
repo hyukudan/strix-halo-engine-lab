@@ -1,6 +1,8 @@
 #include "strix/ple_lookup.hpp"
+#include "strix/iq4_nl.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -433,7 +435,7 @@ namespace strix {
 namespace {
 
 constexpr std::uint64_t file_mapped_ple_backend_identity =
-    0x504c45464d415001ULL;
+    0x504c45464d415002ULL;
 
 std::uint64_t checked_add_lookup(
     std::uint64_t left,
@@ -491,15 +493,15 @@ FileMappedPleLookupBackend::start(
 
     if (manifest.role !=
             TensorRole::ngram_table ||
-        manifest.dimensions.size() < 2 ||
+        manifest.dimensions.size() != 2 ||
         manifest.dimensions[0] == 0 ||
         manifest.dimensions[1] == 0) {
         throw std::invalid_argument(
             "PLE lookup table manifest has invalid geometry");
     }
-    if (manifest.ggml_type != 30) {
+    if (manifest.ggml_type != 30 && manifest.ggml_type != 20) {
         throw std::invalid_argument(
-            "file-mapped PLE baseline requires BF16 table rows");
+            "file-mapped PLE lookup supports BF16 or IQ4_NL table rows");
     }
     const auto expected_row_bytes =
         checked_mul_lookup(
@@ -508,7 +510,17 @@ FileMappedPleLookupBackend::start(
     if (request.row_bytes !=
         expected_row_bytes) {
         throw std::invalid_argument(
-            "PLE lookup row size does not match BF16 table geometry");
+            "PLE lookup output row size does not match BF16 activation geometry");
+    }
+    std::uint64_t stored_row_bytes = expected_row_bytes;
+    if (manifest.ggml_type == 20) {
+        if (manifest.dimensions[0] % iq4_nl::block_elements != 0) {
+            throw std::invalid_argument(
+                "IQ4_NL PLE rows require complete 32-element blocks");
+        }
+        stored_row_bytes = checked_mul_lookup(
+            manifest.dimensions[0] / iq4_nl::block_elements,
+            iq4_nl::block_bytes);
     }
     if (runtime.storage !=
             RuntimeTensorStorage::file_mapped ||
@@ -517,12 +529,15 @@ FileMappedPleLookupBackend::start(
         throw std::invalid_argument(
             "file-mapped PLE backend requires a host-readable file mapping");
     }
+    if (runtime.bytes > std::numeric_limits<std::uintptr_t>::max() - runtime.address) {
+        throw std::overflow_error("PLE mapping address range overflows the host address space");
+    }
 
     const auto minimum_bytes =
         checked_mul_lookup(
             manifest.dimensions[1],
-            request.row_bytes);
-    if (runtime.bytes < minimum_bytes) {
+            stored_row_bytes);
+    if (runtime.bytes < minimum_bytes || manifest.byte_size < minimum_bytes) {
         throw std::invalid_argument(
             "PLE file mapping is smaller than declared table rows");
     }
@@ -549,6 +564,8 @@ FileMappedPleLookupBackend::start(
         runtime.bytes;
     pending_.row_bytes =
         request.row_bytes;
+    pending_.stored_row_bytes = stored_row_bytes;
+    pending_.ggml_type = manifest.ggml_type;
     pending_.row_count =
         static_cast<std::uint32_t>(
             request.row_ids.size());
@@ -590,26 +607,41 @@ void FileMappedPleLookupBackend::finish(
         const auto offset =
             checked_mul_lookup(
                 pending_.row_ids[index],
-                pending_.row_bytes);
+                pending_.stored_row_bytes);
         if (offset >
                 pending_.table_bytes ||
-            pending_.row_bytes >
+            pending_.stored_row_bytes >
                 pending_.table_bytes -
                     offset) {
             throw std::out_of_range(
                 "PLE lookup row range exceeds mapped table");
         }
-        std::memcpy(
-            destination.data() +
-                static_cast<std::size_t>(
-                    checked_mul_lookup(
-                        index,
-                        pending_.row_bytes)),
-            table +
-                static_cast<std::size_t>(
-                    offset),
-            static_cast<std::size_t>(
-                pending_.row_bytes));
+        auto* output = destination.data() + static_cast<std::size_t>(
+            checked_mul_lookup(index, pending_.row_bytes));
+        const auto* input = table + static_cast<std::size_t>(offset);
+        if (pending_.ggml_type == 30) {
+            std::memcpy(output, input, static_cast<std::size_t>(pending_.row_bytes));
+            continue;
+        }
+        // Only selected IQ4_NL rows are decoded. Storage remains quantized;
+        // the existing activation contract is BF16, rounded to nearest-even.
+        const auto blocks = pending_.stored_row_bytes / iq4_nl::block_bytes;
+        for (std::uint64_t block = 0; block < blocks; ++block) {
+            const std::span<const std::byte, iq4_nl::block_bytes> packed(
+                input + static_cast<std::size_t>(block * iq4_nl::block_bytes),
+                iq4_nl::block_bytes);
+            if (!std::isfinite(iq4_nl::fp16_bits_to_float(iq4_nl::scale_bits(packed)))) {
+                throw std::invalid_argument("IQ4_NL PLE scale must be finite");
+            }
+            for (std::size_t element = 0; element < iq4_nl::block_elements; ++element) {
+                const auto value = iq4_nl::dequantized_value(packed, element);
+                const auto bits = std::bit_cast<std::uint32_t>(value);
+                const auto bf16 = static_cast<std::uint16_t>(
+                    (bits + 0x7fffU + ((bits >> 16U) & 1U)) >> 16U);
+                const auto column = block * iq4_nl::block_elements + element;
+                std::memcpy(output + static_cast<std::size_t>(column * 2U), &bf16, sizeof(bf16));
+            }
+        }
     }
 
     pending_ = {};
