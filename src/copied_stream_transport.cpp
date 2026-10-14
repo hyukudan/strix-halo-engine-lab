@@ -167,14 +167,18 @@ struct CopiedStreamTransportBackend::Impl {
         std::uint64_t physical_sequence = 0;
         bool receive = false, submitted = false, exposed = false, received_ack = false;
     };
-    DirectStreamControlByteStream* stream;
+    DistributedControlByteStream* stream;
+    std::unique_ptr<TcpCopiedPayloadByteStream> tcp_stream_owner;
     CopiedStreamConnectionState* state;
     CopiedStreamTransportPolicy policy;
     std::unique_ptr<Active> active;
     std::deque<Completion> completions;
     bool failed = false;
 
-    void fail() noexcept { failed = true; state->failed_ = true; }
+    void fail() noexcept {
+        failed = true; state->failed_ = true;
+        if (tcp_stream_owner) tcp_stream_owner->poison();
+    }
     void healthy() const { if (failed || state->failed_) throw std::logic_error("copied stream connection is failed"); }
     Active& require(TransferHandle handle, bool check_health = true) {
         if (check_health) healthy();
@@ -242,10 +246,23 @@ struct CopiedStreamTransportBackend::Impl {
 };
 
 CopiedStreamTransportBackend::CopiedStreamTransportBackend(DirectStreamControlByteStream& stream,
-    CopiedStreamConnectionState& state, CopiedStreamTransportPolicy policy) : impl_(std::make_unique<Impl>()) {
+    CopiedStreamConnectionState& state, CopiedStreamTransportPolicy policy)
+    : CopiedStreamTransportBackend(stream, stream.maximum_frame_bytes(), state, policy) {}
+CopiedStreamTransportBackend::CopiedStreamTransportBackend(TcpCopiedPayloadByteStream&& stream,
+    CopiedStreamConnectionState& state, CopiedStreamTransportPolicy policy)
+    : CopiedStreamTransportBackend(stream, stream.maximum_frame_bytes(), state, policy) {
+    if (!stream.valid()) throw std::invalid_argument("copied TCP payload requires an owned healthy stream");
+    if (policy.maximum_frame_bytes != stream.maximum_frame_bytes())
+        throw std::invalid_argument("copied TCP payload requires matching frame ceilings");
+    impl_->tcp_stream_owner = std::make_unique<TcpCopiedPayloadByteStream>(std::move(stream));
+    impl_->stream = impl_->tcp_stream_owner.get();
+}
+CopiedStreamTransportBackend::CopiedStreamTransportBackend(DistributedControlByteStream& stream,
+    std::uint64_t stream_frame_limit, CopiedStreamConnectionState& state, CopiedStreamTransportPolicy policy)
+    : impl_(std::make_unique<Impl>()) {
     if (policy.maximum_payload_bytes == 0 || policy.maximum_frame_bytes > std::numeric_limits<std::uint32_t>::max() ||
         policy.maximum_frame_bytes < 512 || policy.maximum_payload_bytes > policy.maximum_frame_bytes - 512 ||
-        policy.maximum_frame_bytes > stream.maximum_frame_bytes() ||
+        policy.maximum_frame_bytes > stream_frame_limit ||
         policy.maximum_completion_polls == 0) throw std::invalid_argument("copied stream requires bounded payload/frame/progress budgets");
     impl_->stream = &stream; impl_->state = &state; impl_->policy = policy; impl_->healthy();
     if (state.attached_) throw std::logic_error("copied physical connection already has an owner");
