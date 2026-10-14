@@ -52,6 +52,7 @@ add_library(strix_core STATIC
     src/distributed_control_server.cpp
     src/distributed_control_receiver.cpp
     src/distributed_tcp_control_stream.cpp
+    src/tcp_copied_payload_stream.cpp
     src/distributed_runtime.cpp
     src/distributed_session.cpp
     src/direct_transport_completion.cpp
@@ -597,6 +598,12 @@ if(BUILD_TESTING)
     target_link_libraries(strix-distributed-tcp-control-stream-tests PRIVATE strix_core)
     strix_target_warnings(strix-distributed-tcp-control-stream-tests)
     add_test(NAME strix-distributed-tcp-control-stream-tests COMMAND strix-distributed-tcp-control-stream-tests)
+
+    add_executable(strix-tcp-copied-payload-stream-tests tests/tcp_copied_payload_stream_tests.cpp)
+    target_link_libraries(strix-tcp-copied-payload-stream-tests PRIVATE strix_core)
+    strix_target_warnings(strix-tcp-copied-payload-stream-tests)
+    add_test(NAME strix-tcp-copied-payload-stream-tests COMMAND strix-tcp-copied-payload-stream-tests)
+    set_tests_properties(strix-tcp-copied-payload-stream-tests PROPERTIES TIMEOUT 15)
 
     add_executable(strix-distributed-session-tests tests/distributed_session_tests.cpp)
     target_link_libraries(strix-distributed-session-tests PRIVATE strix_core)

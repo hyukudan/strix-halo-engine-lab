@@ -3,6 +3,7 @@
 #include "strix/direct_stream_control.hpp"
 #include "strix/distributed_control_receiver.hpp"
 #include "strix/host_upload.hpp"
+#include "strix/tcp_copied_payload_stream.hpp"
 
 #include <memory>
 
@@ -95,6 +96,10 @@ class CopiedStreamTransportBackend final : public TransportBackend {
 public:
     CopiedStreamTransportBackend(DirectStreamControlByteStream&, CopiedStreamConnectionState&,
                                 CopiedStreamTransportPolicy policy = {});
+    // The TCP backend owns its stream and requires matching explicit ceilings.
+    // Construction failure leaves the caller's stream unconsumed.
+    CopiedStreamTransportBackend(TcpCopiedPayloadByteStream&&, CopiedStreamConnectionState&,
+                                CopiedStreamTransportPolicy);
     ~CopiedStreamTransportBackend() override;
     CopiedStreamTransportBackend(const CopiedStreamTransportBackend&) = delete;
     CopiedStreamTransportBackend& operator=(const CopiedStreamTransportBackend&) = delete;
@@ -120,6 +125,8 @@ public:
     [[nodiscard]] std::optional<TransferHandle> retained_handle() const noexcept;
     [[nodiscard]] const CopiedStreamConnection& connection() const noexcept;
 private:
+    CopiedStreamTransportBackend(DistributedControlByteStream&, std::uint64_t stream_frame_limit,
+                                CopiedStreamConnectionState&, CopiedStreamTransportPolicy);
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
