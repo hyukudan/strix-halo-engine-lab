@@ -373,8 +373,8 @@ __device__ void k_group_factors(
         scale = packed[group] & 63U;
         minimum = packed[group + 4U] & 63U;
     } else {
-        scale = (packed[group + 4U] & 15U) | ((packed[group - 4U] >> 6U) << 4U);
-        minimum = (packed[group + 4U] >> 4U) | ((packed[group] >> 6U) << 4U);
+        scale = (packed[group + 4U] & 15U) | ((static_cast<std::uint32_t>(packed[group - 4U]) >> 6U) << 4U);
+        minimum = (static_cast<std::uint32_t>(packed[group + 4U]) >> 4U) | ((static_cast<std::uint32_t>(packed[group]) >> 6U) << 4U);
     }
 }
 
