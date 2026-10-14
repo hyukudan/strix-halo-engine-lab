@@ -26,7 +26,7 @@ constexpr std::uint32_t kThreads = 256;
 constexpr std::uint32_t kMaxHc = 8;
 constexpr std::uint32_t kMaxLowrank = 512;
 constexpr std::uint64_t kLauncherTag =
-    0x48595045524d4958ULL;
+    0x48595045524d4959ULL;
 constexpr std::uint64_t fnv_offset =
     14695981039346656037ULL;
 constexpr std::uint64_t fnv_prime =
@@ -338,7 +338,7 @@ __device__ float normalized_input_value(
     return
         source *
         inverse_rms[stream] *
-        (1.0F + weight);
+        weight;
 }
 
 __device__ float sigmoid(
@@ -1160,7 +1160,7 @@ void register_hip_hyper_mix_kernel_variant(
     variant.output_layout =
         "row-major+fp32-injection";
     variant.compiler_identity =
-        "hip-gfx1151-hyper-mix-v1";
+        "hip-gfx1151-hyper-mix-v2";
     variant.measured_seconds = 0.0;
 
     registry.add(

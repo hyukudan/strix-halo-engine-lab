@@ -25,6 +25,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -451,15 +452,11 @@ int main() try {
     upload(
         value_weights,
         &device_weights[2]);
-    upload(
-        norm_key,
-        &device_weights[3]);
-    upload(
-        norm_query,
-        &device_weights[4]);
-    upload(
-        norm_conv,
-        &device_weights[5]);
+    // Fold source zero-centered gammas only for serialized GGUF bindings.
+    const std::vector<float> gguf_norm(expanded, 1.0F);
+    upload(gguf_norm, &device_weights[3]);
+    upload(gguf_norm, &device_weights[4]);
+    upload(gguf_norm, &device_weights[5]);
     upload(
         conv,
         &device_weights[6]);
@@ -761,6 +758,72 @@ int main() try {
         conv_state[
             history_len - 1U] != 0,
         "PLE convolution state commits normalized current token");
+
+    // A nonzero-key case exercises distinct serialized key/query/conv scales,
+    // including zero and negative scales. The oracle uses generated source
+    // gammas and FP64 reductions, independently of the device norm kernels.
+    const auto nonzero_key = make_q8(static_cast<std::uint32_t>(expanded),
+        static_cast<std::uint32_t>(model.ple_embed_dim), false);
+    check(hipMemcpy(device_weights[1], nonzero_key.data(), nonzero_key.size() * sizeof(Q8Block),
+                    hipMemcpyHostToDevice), "upload nonzero PLE key");
+    std::vector<float> key_scale(expanded), query_scale(expanded), conv_scale(expanded);
+    for (std::size_t index = 0; index < expanded; ++index) {
+        norm_key[index] = static_cast<float>(static_cast<int>((index * 19U + index / 13U) % 23U) - 11) / 8.0F;
+        norm_query[index] = static_cast<float>(static_cast<int>((index * 29U + index / 17U + 5U) % 19U) - 9) / 8.0F;
+        norm_conv[index] = static_cast<float>(static_cast<int>((index * 31U + index / 11U + 7U) % 21U) - 10) / 8.0F;
+        key_scale[index] = 1.0F + norm_key[index];
+        query_scale[index] = 1.0F + norm_query[index];
+        conv_scale[index] = 1.0F + norm_conv[index];
+    }
+    for (const auto& pair : {std::pair{3U, &key_scale}, std::pair{4U, &query_scale}, std::pair{5U, &conv_scale}})
+        check(hipMemcpy(device_weights[pair.first], pair.second->data(), expanded * sizeof(float),
+                        hipMemcpyHostToDevice), "upload distinct folded PLE scale");
+    context.position = 1;
+    context.input_token_id = 6;
+    launcher.function(context, launcher.user_data);
+    check(hipMemcpy(actual.data(), reinterpret_cast<void*>(output.address), expanded * sizeof(std::uint16_t),
+                    hipMemcpyDeviceToHost), "read nonzero-norm PLE output");
+    check(hipMemcpy(conv_state.data(), conv_state_pointer, static_cast<std::size_t>(conv_bytes),
+                    hipMemcpyDeviceToHost), "read nonzero-norm PLE convolution state");
+    bool output_equal = true, state_equal = true;
+    const auto width = static_cast<std::size_t>(model.hidden_size);
+    for (std::size_t stream = 0; stream < model.hc_count; ++stream) {
+        std::vector<double> projected_key(width), gated_value(width);
+        double key_square = 0.0, query_square = 0.0;
+        for (std::size_t feature = 0; feature < width; ++feature) {
+            const auto index = stream * width + feature;
+            projected_key[feature] = gathered_sum * __half2float(nonzero_key[index * (model.ple_embed_dim / 32U)].scale);
+            key_square += projected_key[feature] * projected_key[feature];
+            const double query = bf16_to_float(input_values[index]);
+            query_square += query * query;
+        }
+        const double inv_key = 1.0 / std::sqrt(key_square / static_cast<double>(width) + model.rms_norm_epsilon);
+        const double inv_query = 1.0 / std::sqrt(query_square / static_cast<double>(width) + model.rms_norm_epsilon);
+        double dot = 0.0;
+        for (std::size_t feature = 0; feature < width; ++feature) {
+            const auto index = stream * width + feature;
+            dot += projected_key[feature] * inv_key * (1.0 + norm_key[index]) *
+                   bf16_to_float(input_values[index]) * inv_query * (1.0 + norm_query[index]);
+        }
+        const double score = dot / std::sqrt(static_cast<double>(width));
+        const double signed_root = score == 0.0 ? 0.0 : std::copysign(std::sqrt(std::max(std::fabs(score), 1e-6)), score);
+        const double gate = 1.0 / (1.0 + std::exp(-signed_root));
+        double value_square = 0.0;
+        for (std::size_t feature = 0; feature < width; ++feature) {
+            gated_value[feature] = gathered_sum * __half2float(value_weights[feature * (model.ple_embed_dim / 32U)].scale) * gate;
+            value_square += gated_value[feature] * gated_value[feature];
+        }
+        const double inv_value = 1.0 / std::sqrt(value_square / static_cast<double>(width) + model.rms_norm_epsilon);
+        for (std::size_t feature = 0; feature < width; ++feature) {
+            const auto index = stream * width + feature;
+            const double expected_output = bf16_to_float(input_values[index]) + gated_value[feature];
+            const double expected_state = gated_value[feature] * inv_value * (1.0 + norm_conv[index]);
+            output_equal = output_equal && std::fabs(bf16_to_float(actual[index]) - expected_output) <= 0.02;
+            state_equal = state_equal && std::fabs(bf16_to_float(conv_state[index * history_len + history_len - 1U]) - expected_state) <= 0.02;
+        }
+    }
+    expect(output_equal, "PLE distinct folded key/query scales match FP64 gate oracle");
+    expect(state_equal, "PLE folded convolution scales match independently normalized current value");
 
     for (std::size_t index = 1;
          index < device_weights.size();

@@ -27,7 +27,7 @@ namespace {
 
 constexpr std::uint32_t kThreads = 256;
 constexpr std::uint64_t kLauncherTag =
-    0x5141534154544e31ULL;
+    0x5141534154544e32ULL;
 constexpr std::uint64_t fnv_offset =
     14695981039346656037ULL;
 constexpr std::uint64_t fnv_prime =
@@ -689,10 +689,9 @@ __global__ void norm_rope_kernel(
         round_bf16(
             input *
             inv_rms *
-            (1.0F +
-             load_small_weight<Kind>(
+            load_small_weight<Kind>(
                  norm_weights,
-                 feature)));
+                 feature));
     if (dynamic.status != nullptr && !isfinite(source[feature])) atomicOr(dynamic.status, 8U);
     __syncthreads();
 
@@ -911,10 +910,9 @@ __global__ void block_score_kernel(
         round_bf16(
             mean *
             inv_rms *
-            (1.0F +
-             load_small_weight<Kind>(
+            load_small_weight<Kind>(
                  key_norm,
-                 feature)));
+                 feature));
     __syncthreads();
 
     float rotated =
@@ -2764,7 +2762,7 @@ void register_hip_indexed_attention_kernel_variant(
     variant.output_layout =
         "row-major";
     variant.compiler_identity =
-        "hip-gfx1151-indexed-attention-v1";
+        "hip-gfx1151-indexed-attention-v2";
     variant.measured_seconds = 0.0;
 
     registry.add(

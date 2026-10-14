@@ -75,7 +75,7 @@ struct Fixture {
         r.value.allocation_generation = 4; r.value.use.generation = 1;
         r.query_norm = {0, strix::RuntimeTensorStorage::resident, allocate(dim * sizeof(float)), dim * sizeof(float), 5, 0};
         r.key_norm = r.query_norm;
-        put(r.query_norm.address, std::vector<float>(dim, 0));
+        put(r.query_norm.address, std::vector<float>(dim, 1));
         r.kv_state.address = allocate((context * kv_width * 2 + 2) * sizeof(std::uint16_t)) + sizeof(std::uint16_t);
         r.kv_state.bytes = context * kv_width * 4; r.kv_state.allocation_generation = 6;
         r.kv_state.state_flag = strix::PersistentState::attention_kv;
@@ -167,14 +167,14 @@ struct Fixture {
         require((get<std::uint32_t>(dynamic.request.status.arena_base, 1)[0] & 8U) != 0,
             "finite FP32 RoPE with nonfinite BF16 result rejected");
         require(state(dynamic) == preserved, "BF16 rounding failure cannot commit persistent KV");
-        put(dynamic.request.query_norm.address, std::vector<float>(dim, 0)); inputs(dynamic, 0); position(0);
+        put(dynamic.request.query_norm.address, std::vector<float>(dim, 1)); inputs(dynamic, 0); position(0);
         auto overflow_key = get<float>(dynamic.request.key.address, kv_width);
         overflow_key[0] = std::numeric_limits<float>::max();
         put(dynamic.request.key.address, overflow_key); replay();
         require((get<std::uint32_t>(dynamic.request.status.arena_base, 1)[0] & 8U) != 0,
             "finite input with overflowing RMS reduction cannot silently normalize to zeros");
         require(state(dynamic) == preserved, "RMS reduction overflow preserves KV");
-        put(dynamic.request.query_norm.address, std::vector<float>(dim, 0)); inputs(dynamic, 1); position(2); replay();
+        put(dynamic.request.query_norm.address, std::vector<float>(dim, 1)); inputs(dynamic, 1); position(2); replay();
         require(get<std::uint32_t>(dynamic.request.status.arena_base, 1)[0] == 0, "later valid stage resets status");
         inputs(dynamic, 1); inputs(control, 1);
         auto padded = get<float>(dynamic.request.query.address, heads * stride);

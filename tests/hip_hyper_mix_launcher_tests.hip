@@ -373,6 +373,9 @@ struct Fixture {
                     2) *
                 0.01F;
         }
+        norm[0] = -1.0F;
+        norm[1] = -1.25F;
+        norm[2] = 0.375F;
     }
 };
 
@@ -548,9 +551,11 @@ void run_numeric_fixture(
     std::vector<void*> device_weights(
         manifest.tensors.size(),
         nullptr);
-    upload(
-        fixture.norm,
-        &device_weights[0]);
+    // The independent oracle consumes source zero-centered parameters;
+    // GGUF serializes their already-folded multiplicative scales.
+    auto gguf_norm = fixture.norm;
+    for (auto& value : gguf_norm) value += 1.0F;
+    upload(gguf_norm, &device_weights[0]);
     upload(
         fixture.down,
         &device_weights[1]);

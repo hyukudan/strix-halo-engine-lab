@@ -28,7 +28,7 @@ namespace {
 
 constexpr std::uint32_t kThreads = 256;
 constexpr std::uint64_t kLauncherTag =
-    0x504c454c41554e31ULL;
+    0x504c454c41554e32ULL;
 constexpr std::uint64_t fnv_offset =
     14695981039346656037ULL;
 constexpr std::uint64_t fnv_prime =
@@ -533,11 +533,10 @@ __global__ void normalize_key_and_gate_kernel(
         const float normalized_key =
             key[index] *
             inverse_key *
-            (1.0F +
-             load_small(
+            load_small(
                  key_norm,
                  key_norm_kind,
-                 index));
+                 index);
         key[index] =
             normalized_key;
 
@@ -545,11 +544,10 @@ __global__ void normalize_key_and_gate_kernel(
             bf16_to_float(
                 query[index]) *
             inverse_query *
-            (1.0F +
-             load_small(
+            load_small(
                  query_norm,
                  query_norm_kind,
-                 index));
+                 index);
         dot +=
             normalized_key *
             normalized_query;
@@ -690,11 +688,10 @@ __global__ void grouped_norm_kernel(
         output[index] =
             input[index] *
             inverse_rms *
-            (1.0F +
-             load_small(
+            load_small(
                  norm_weight,
                  norm_kind,
-                 index));
+                 index);
     }
 }
 
@@ -1749,7 +1746,7 @@ void register_hip_ple_kernel_variant(
     variant.output_layout =
         "hc-stream-major";
     variant.compiler_identity =
-        "hip-gfx1151-ple-v1";
+        "hip-gfx1151-ple-v2";
     variant.measured_seconds = 0.0;
 
     registry.add(
