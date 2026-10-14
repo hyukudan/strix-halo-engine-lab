@@ -67,3 +67,9 @@ Promotion requires both:
 
 1. model-fidelity comparison against an independent oracle/fixture;
 2. within-plan equivalence checks such as serial versus batched, fresh versus resumed and speculative versus serial.
+
+## Related implementation
+
+Use the [lab index](../../lab/README.md) to choose an operator or runtime experiment.
+The [qualification ledger](../../docs/qualification-ledger.md) separates fixture
+coverage from native execution and full-model promotion.

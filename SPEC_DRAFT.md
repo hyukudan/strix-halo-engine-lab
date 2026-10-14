@@ -1,323 +1,328 @@
-# Especificación técnica v0.4 — motor propio para Strix Halo
+# Technical specification v0.4 — independent Strix Halo engine
 
-Estado: borrador de investigación revisado para aceptación técnica y ampliado con fuentes
-oficiales Qwen, política GTT y revisión external platform study. Persisten puertas P0 y la
-medición en hardware. Nombre del proyecto aún no decidido.
+Status: research draft revised for technical acceptance and expanded with
+Qwen official sources, GTT policy and the external platform study review.
+P0 gates and hardware measurement remain outstanding in this draft. The
+project name is still undecided.
 
-Trazabilidad: los datos que sustentan esta especificación están indexados en
-[`EVIDENCE.md`](EVIDENCE.md); los cambios de dirección se registran en
-[`DECISIONS.md`](DECISIONS.md). Una afirmación marcada como hipótesis no debe
-interpretarse como requisito cerrado.
+This document retains the original design history. Consult the
+[qualification ledger](docs/qualification-ledger.md) for current implementation
+and promotion status and the [architecture guide](docs/README.md) for organized
+contracts. The supporting evidence is indexed in [EVIDENCE.md](EVIDENCE.md);
+changes of direction are recorded in [DECISIONS.md](DECISIONS.md). A hypothesis
+must not be read as a finalized requirement.
 
-## 1. Objetivo
+## 1. Objective
 
-Construir un motor de inferencia local, reproducible y auditable para AMD Strix
-Halo `gfx1151`, optimizado primero para Qwen3.8-Flash-Next. Debe combinar alto
-prefill, decode competitivo, concurrencia real y calidad verificable. No será un
-fork de external runtime B ni una reconstrucción de external runtime A.
+Build a local, reproducible and auditable inference engine for AMD Strix Halo
+`gfx1151`, optimized first for Qwen3.8-Flash-Next. It must combine high prefill
+throughput, competitive decode, real concurrency and verifiable quality. It
+will not be an external runtime B fork or a reconstruction of external runtime A.
 
-### Metas iniciales
+### Initial goals
 
-- Linux x86-64 nativo, ROCm/HIP, `gfx1151`.
-- C++20 + HIP; Python solo para herramientas y oráculos.
-- GGUF como formato de entrada; caché interna opcional, lossless y versionada.
-- Primer slice: AR greedy/sampled + MTP solo greedy, Chat Completions en gateway
-  separado y contrato de replay explícito. MTP sampled espera contrato RNG/replay canónico; el algoritmo probabilístico de aceptación ya está fijado.
-- C1 como fast path y C2/C4 como primeras rutas concurrentes.
-- Contexto inicial cualificado según el presupuesto UMA demostrado; 262.144,
-  Responses API, prompt lookup y C6/C8 quedan como ampliaciones posteriores.
+- Native Linux x86-64, ROCm/HIP, `gfx1151`.
+- C++20 + HIP; Python only for tools and oracles.
+- GGUF input; optional lossless, versioned internal cache.
+- First slice: greedy/sampled AR + greedy-only MTP, Chat Completions through a
+  separate gateway and an explicit replay contract. Sampled MTP awaits a
+  canonical RNG/replay contract; the probabilistic acceptance algorithm is
+  already fixed.
+- C1 fast path and C2/C4 as the first concurrent paths.
+- Initial qualified context based on the demonstrated UMA budget; 262,144,
+  Responses API, prompt lookup and C6/C8 are later extensions.
 
-### No objetivos de la primera versión
+### Outside the first version's goals
 
-- portabilidad a otras GPU;
-- múltiples familias de modelo;
-- visión antes de que texto/MTP esté cualificado;
-- aproximaciones numéricas sin una puerta de calidad explícita;
-- compatibilidad con cada cuantización existente.
+- portability to other GPUs;
+- multiple model families;
+- vision before text/MTP qualification;
+- numerical approximations without an explicit quality gate;
+- compatibility with every existing quantization.
 
-## 2. Principios
+## 2. Principles
 
-1. **Código propio y procedencia auditable.** Contratos desde papers, fuentes
-   públicas canónicas y oráculos independientes. external runtime A solo aporta
-   observaciones agregadas anonimizadas; no se copian cuerpos, firmas ni
-   estructuras de kernels.
-2. **Especialización finita y justificada.** Cada variante debe corresponder a
-   formas observadas y superar un control end-to-end.
-3. **Corrección antes de velocidad.** Ningún cambio entra por renovar goldens o
-   relajar tolerancias.
-4. **Reproducibilidad.** Compilador, ROCm, kernel Linux, BIOS/IOMMU, potencia,
-   commit, pesos, prompt y caché forman parte del resultado.
-5. **Una implementación ganadora.** Experimentos perdedores se documentan y se
-   eliminan; no se acumulan flags permanentes.
-6. **Fuente primaria antes que referencia.** QSA, GDN, Gated Residual, MoE y
-   n-gram se especifican desde Qwen oficial; external runtime A, external runtime B y external platform study sirven para
-   formular y contrastar hipótesis, nunca como único oráculo.
+1. **Independent code and auditable provenance.** Contracts from papers,
+   canonical public sources and independent oracles. External runtime A
+   contributes only anonymized aggregate observations; no kernel bodies,
+   signatures or structures are copied.
+2. **Finite, justified specialization.** Every variant must correspond to
+   observed shapes and pass an end-to-end control.
+3. **Correctness before speed.** Changes are not accepted by refreshing
+   goldens or relaxing tolerances.
+4. **Reproducibility.** Compiler, ROCm, Linux kernel, BIOS/IOMMU, power,
+   commit, weights, prompt and cache are part of each result.
+5. **One winning implementation.** Document and remove losing experiments;
+   do not accumulate permanent flags.
+6. **Primary sources before references.** Specify QSA, GDN, Gated Residual,
+   MoE and n-gram from official Qwen sources; external runtime A, external
+   runtime B and external platform study formulate and test hypotheses,
+   never serving as the sole oracle.
 
-## 3. Arquitectura
+## 3. Architecture
 
 ```text
-Red/VPN
+Network/VPN
   -> TLS reverse proxy
-    -> inference gateway (Chat API + playground opcional)
-      -> UDS/loopback -> motor
+    -> inference gateway (Chat API + optional playground)
+      -> UDS/loopback -> engine
         -> admission + scheduler
           -> session state (KV, recurrence, RNG, snapshots, rollback)
             -> model executor -> kernel registry -> HIP/hipBLASLt/HIP graphs
-    -> admin API (credencial más fuerte, sin shell)
-      -> operaciones tipadas -> supervisor/model manager/benchmark runner
+    -> admin API (stronger credential, no shell)
+      -> typed operations -> supervisor/model manager/benchmark runner
 
-Motor y supervisor -> métricas/logs de solo lectura -> panel administrativo
+Engine and supervisor -> read-only metrics/logs -> administrative panel
 ```
 
-### 3.1 Loader y pesos
+### 3.1 Loader and weights
 
-- lector GGUF propio y mínimo;
-- validación estricta de arquitectura, dimensiones, dtype y hash;
-- vista mmap read-only de los shards para carga CPU; antes de lanzar GPU, todo
-  rango usado por el hot path debe estar registrado y residente conforme al
-  contrato confirmado de la plataforma;
-- planner lossless que decide por tensor: lectura directa, repack temporal o
-  caché interna persistente;
-- subsistema PLE/n-gram con lectura directa asíncrona candidata (`pread` o
-  equivalente), pool acotado, coalescing, caché de filas y telemetría; `mmap`
-  demand-paged será un control, no la opción asumida;
-- caché identificada por hash de pesos + versión de layout + compilador;
-- ninguna requantización implícita;
-- comando `inspect` que publique bytes, bpw, familias, layouts y hashes.
+- minimal, independently authored GGUF reader;
+- strict architecture, dimension, dtype and hash validation;
+- read-only mmap shard views for CPU loading; before GPU launch, every hot-path
+  range must be registered and resident under the confirmed platform contract;
+- lossless per-tensor planner: direct read, temporary repack or persistent
+  internal cache;
+- candidate PLE/n-gram subsystem with asynchronous direct reads (`pread` or
+  equivalent), bounded pool, coalescing, row cache and telemetry; demand-paged
+  `mmap` is a control rather than the assumed choice;
+- cache identity includes weight hash + layout version + compiler;
+- no implicit requantization;
+- `inspect` command reports bytes, bpw, families, layouts and hashes.
 
-### 3.2 Memoria UMA
+### 3.2 UMA memory
 
-- allocator con categorías visibles: pesos mapeados, pesos copiados, KV,
-  recurrencia, rollback, scratch, librerías y caché;
-- prefault CPU paralelo y acotado para rangos activos, fuera del kernel GPU;
-- pruebas A/B de mmap registrado frente a copia anónima con páginas grandes;
-- pool de sesiones dimensionado en posiciones, no solo en slots;
-- snapshots solo de filas válidas;
-- backpressure antes de comprometer memoria que no cabe; el tope parte de
-  `MemTotal` medido menos baseline sin motor y reserva, y la contabilidad interna
-  manda sobre una `MemAvailable` que puede sobreestimar páginas fijadas;
-- métricas de GTT, MemAvailable corregida y page faults durante preparación;
-- presupuesto previo a cargar: pesos y mappings, tablas, KV, recurrencia,
-  rollback, scratch, librerías, SO y margen de recuperación. Un checkpoint que
-  nominalmente quepa no se admite si incumple el margen.
-- configurar GTT como límite de mapeo cercano al máximo útil (objetivo inicial
-  124 GiB en una máquina nominal de 128 GB), calculado desde la RAM real;
-- mantener separada una reserva efectiva inicial de 16–20 GiB en el admission
-  controller: ampliar GTT no autoriza a consumir esa RAM;
-- BIOS con carve-out mínimo verificado; `amd_iommu=off` y otros parámetros
-  experimentales nunca son defaults y requieren perfil dedicado, aviso y
+- allocator with visible categories: mapped weights, copied weights, KV,
+  recurrence, rollback, scratch, libraries and cache;
+- bounded parallel CPU prefault of active ranges outside GPU kernels;
+- A/B tests of registered mmap versus anonymous copy with huge pages;
+- session pool dimensioned in positions, not only slots;
+- snapshots only of valid rows;
+- backpressure before committing memory that does not fit; the cap starts from
+  measured `MemTotal` minus the engine-free baseline and reserve, and internal
+  accounting takes precedence over `MemAvailable`, which can overestimate
+  pinned pages;
+- GTT, corrected MemAvailable and preparation-time page-fault metrics;
+- pre-load budget covering weights and mappings, tables, KV, recurrence,
+  rollback, scratch, libraries, OS and recovery headroom. A nominally fitting
+  checkpoint is not admitted if it violates the margin;
+- GTT as a mapping limit near the useful maximum (initial target 124 GiB on a
+  nominal 128 GB host), calculated from actual RAM;
+- separate initial effective admission-controller reserve of 16–20 GiB:
+  increasing GTT does not authorize consuming this RAM;
+- verified minimum BIOS carve-out; `amd_iommu=off` and other experimental
+  parameters are never defaults and require a dedicated profile, warning and
   rollback;
-- shutdown limpio y watchdog de GTT residual: ante terminación sucia o uso
-  incoherente se bloquea la recarga y se escala a reinicio controlado.
+- clean shutdown and residual-GTT watchdog: an unclean termination or
+  inconsistent usage blocks reload and escalates to a controlled restart.
 
-### 3.3 Ejecutor
+### 3.3 Executor
 
-- caminos separados para prefill, AR decode, verificación MTP y catch-up;
-- grafo de operadores estático por modelo, sin runtime general en el hot path;
-- HIP graph por forma estable de decode;
-- invariante: ningún replay observa un input reutilizado; ring versionado por
-  slot/generación es un mecanismo candidato, no el contrato;
-- PM4 retenido solo como experimento opt-in para decode repetitivo, negociado
-  por capabilities y con fallback al runtime estándar; no condiciona prefill;
-- modo eager para warm-up, tuning y formas ragged;
-- solapamiento únicamente con streams y ownership demostrablemente seguros;
-- cada request conserva KV, estado recurrente, RNG y rollback independientes.
+- separate prefill, AR decode, MTP verification and catch-up paths;
+- static per-model operator graph without a general runtime in the hot path;
+- HIP graphs for stable decode shapes;
+- invariant: no replay observes a reused input; a versioned slot/generation
+  ring is a candidate mechanism, not the contract;
+- retained PM4 only as an opt-in repeated-decode experiment, capability
+  negotiated with standard-runtime fallback; it does not constrain prefill;
+- eager mode for warm-up, tuning and ragged shapes;
+- overlap only with demonstrably safe streams and ownership;
+- independent KV, recurrent state, RNG and rollback for every request.
 
 ### 3.4 Kernel registry
 
-Cada entrada declarará:
+Each entry declares:
 
-- operador, forma/rango y fase;
-- dtype/layout de entrada y salida;
-- wave32/wave64, workgroup, VGPR, SGPR, LDS y scratch;
-- orden de reducción y fronteras de redondeo que debe conservar;
-- flags de compilador, contracción FMA, modo de denormales y versión ABI;
-- evidencia de corrección;
-- coste medido por batch, profundidad y estado de caché;
-- identidad del toolchain que produjo el código.
+- operator, shape/range and phase;
+- input/output dtype and layout;
+- wave32/wave64, workgroup, VGPR, SGPR, LDS and scratch;
+- required reduction order and rounding boundaries;
+- compiler flags, FMA contraction, denormal mode and ABI version;
+- correctness evidence;
+- measured cost by batch, depth and cache state;
+- identity of the toolchain that produced the code.
 
-El selector lee un plan generado fuera de línea. Si la identidad no coincide,
-usa una ruta conservadora y solicita retuning; nunca cronometra algoritmos en
-producción de forma no determinista.
+The selector reads an offline-generated plan. On identity mismatch it uses a
+conservative path and requests retuning; it never times algorithms
+nondeterministically in production.
 
-### 3.5 Familias de kernel prioritarias
+### 3.5 Priority kernel families
 
-1. RMSNorm/residual/RoPE y conversiones.
-2. Proyecciones Q4/Q5/Q8 para C1 y batches 2–8.
-3. MoE: routing, agrupación de expertos, gate/up fusionado y down.
-4. Gated DeltaNet: fijar primero FP32/estado/orden/rollback; tiled, estado en
-   registros y DPP/LDS son candidatos posteriores al perfil propio.
-5. QSA: oráculo sparse canónico pendiente de confirmar desde Qwen; denso será
-   baseline de rendimiento y calidad, no se llamará exacto ni equivalente.
-   Indexer, top-k con empates, metadata y atención se evalúan como pipeline.
-6. Sampling/argmax y verificación MTP.
+1. RMSNorm/residual/RoPE and conversions.
+2. Q4/Q5/Q8 projections for C1 and batches 2–8.
+3. MoE: routing, expert grouping, fused gate/up and down.
+4. Gated DeltaNet: fix FP32/state/order/rollback first; tiling, register state
+   and DPP/LDS are candidates after our own profiling.
+5. QSA: canonical sparse oracle awaiting confirmation from Qwen; dense is a
+   performance/quality baseline, not labelled exact or equivalent. Evaluate
+   indexer, tied top-k, metadata and attention as a pipeline.
+6. Sampling/argmax and MTP verification.
 
-Para cada familia se probarán wave32 y wave64 donde tengan sentido; el dato de
-external runtime A no se convertirá en una regla universal.
+Test wave32 and wave64 where appropriate for each family; external runtime A's
+observations do not become a universal rule.
 
-## 4. Scheduling y especulación
+## 4. Scheduling and speculation
 
-- cola FIFO con límites explícitos de memoria y tokens;
-- C1 no paga estructuras de batching que no usa;
-- C2/C4 agrupa filas compatibles en el primer slice, manteniendo estado privado;
-- batching del transformer completo, incluyendo predictor y verificación;
-- MTP de 1–7 borradores con control basado en coste de ciclo completo;
-- control temporal solo en greedy; sampled usa política fija para replay;
-- rollback exacto para cada prefijo aceptado;
-- prompt lookup se incorporará después del primer slice y se medirá separado;
-- cancelación antes de tocar estado compartido y snapshots consistentes.
+- FIFO queue with explicit memory and token limits;
+- C1 does not pay for unused batching structures;
+- C2/C4 groups compatible rows in the first slice while keeping state private;
+- batching of the complete transformer, including predictor and verification;
+- MTP with 1–7 drafts, controlled by complete-cycle cost;
+- timing control only for greedy; sampled mode uses fixed policy for replay;
+- exact rollback for every accepted prefix;
+- prompt lookup after the first slice, measured separately;
+- cancellation before touching shared state, and consistent snapshots.
 
-## 5. Calidad
+## 5. Quality
 
-Tres niveles obligatorios:
+Three mandatory levels:
 
-1. **Oráculo de operador:** fórmula CPU FP64/FP32 independiente, incluidos tails
-   1/8/9/32/33 y valores pequeños no saturados.
-2. **Replay de modelo:** primer layer/logit divergente con historial de tokens
-   idéntico; AR, MTP, sampling, EOS, continuación y restauración.
-3. **Calidad de tarea:** PPL/KL/top-1, NIAH y corpus de agentes/código.
+1. **Operator oracle:** independent CPU FP64/FP32 formula, including tails
+   1/8/9/32/33 and small nonsaturated values.
+2. **Model replay:** first divergent layer/logit with identical token history;
+   AR, MTP, sampling, EOS, continuation and restoration.
+3. **Task quality:** PPL/KL/top-1, NIAH and an agent/code corpus.
 
-Una optimización debe preservar el contrato declarado. Si el contrato permite
-tolerancia, la tolerancia se fija antes de medir rendimiento.
+An optimization must preserve its declared contract. Where the contract allows
+tolerance, fix the tolerance before measuring performance.
 
-El contrato distingue replay C1 y concurrente. “Determinista” nunca será una
-etiqueta global: cada modo declara si exige identidad bitwise, identidad de
-tokens o tolerancia numérica, incluyendo el orden de reducción.
+Distinguish C1 and concurrent replay. Determinism is never a global label:
+each mode declares whether it requires bitwise identity, token identity or
+numerical tolerance, including reduction order.
 
 ## 6. Benchmark
 
-Matriz mínima:
+Minimum matrix:
 
 - prefill: 2K, 8K, 32K, 128K;
-- decode: profundidad 0/4K/16K/32K/64K/128K;
-- tg128, C1/C2/C4 inicialmente; C6/C8 después de cualificar C4;
-- AR, MTP en texto mixto y repetitivo, prompt lookup;
-- arranque frío/caliente, memoria pico y tiempo a readiness;
-- baseline, candidato y control no afectado en el mismo entorno.
-- mínimo tres repeticiones, dispersión publicada, lock exclusivo de GPU y
-  guardia de memoria; un cambio conceptual por experimento siempre que sea
-  posible.
+- decode: depth 0/4K/16K/32K/64K/128K;
+- tg128, initially C1/C2/C4; C6/C8 after C4 qualification;
+- AR, MTP on mixed and repetitive text, prompt lookup;
+- cold/warm startup, peak memory and readiness time;
+- baseline, candidate and unaffected control in the same environment;
+- at least three repetitions, reported dispersion, exclusive GPU lock and
+  memory guard; one conceptual change per experiment where possible.
 
-Guardar latencias individuales, throughput agregado, aceptación, tokens
-completados, launches, GPU busy, page faults y bytes de memoria. Un gain de
-microbenchmark no cuenta hasta sobrevivir al request completo sin profiler.
+Store individual latencies, aggregate throughput, acceptance, completed tokens,
+launches, GPU busy, page faults and memory bytes. A microbenchmark gain counts
+only after surviving the complete request without a profiler. Benchmark records
+and private host inventories stay outside Git under [AGENTS.md](AGENTS.md).
 
-## 7. Fases
+## 7. Phases
 
-### Fase A0 — laboratorio completamente offline
+### Phase A0 — fully offline lab
 
-- imagen de desarrollo pública fijada por digest y segundo toolchain de control;
-- compilación `gfx1151`, separación del HSACO y auditoría de ELF/metadata/ISA;
-- inventario de code objects `gfx1151` en rocBLAS, hipBLASLt y dependencias;
-- doble compilación con hashes y diff normalizado;
-- gates CI de VGPR, SGPR, LDS, spills y tamaño de código;
-- oráculos CPU y modelos/tensores diminutos sin dependencia del hardware final.
+- public development image pinned by digest and a second control toolchain;
+- `gfx1151` compilation, HSACO extraction and ELF/metadata/ISA audit;
+- `gfx1151` code-object inventory in rocBLAS, hipBLASLt and dependencies;
+- two builds with hashes and normalized diff;
+- CI gates for VGPR, SGPR, LDS, spills and code size;
+- CPU oracles and tiny models/tensors independent of final hardware.
 
-### Fase A — laboratorio en Strix Halo
+### Phase A — Strix Halo lab
 
-- inventario de hardware/software;
-- confirmación de ejecución de los objetos producidos en A0;
-- medidor de ancho de banda y techo WMMA;
-- harness común para external runtime A, external runtime B y nuestro binario;
-- corpus y pesos fijados por hash.
+- hardware/software inventory;
+- confirm execution of A0-produced objects;
+- bandwidth and WMMA-ceiling measurements;
+- common harness for external runtime A, external runtime B and our binary;
+- corpus and weights pinned by hash.
 
-### Fase B — referencia correcta
+### Phase B — correct reference
 
-- GGUF, tokenizer y CPU/oráculo mínimo;
-- ejecución AR correcta aunque sea lenta;
-- pruebas de estado, snapshot y sampling.
+- GGUF, tokenizer and minimal CPU/oracle;
+- correct AR execution even if slow;
+- state, snapshot and sampling tests.
 
-### Fase C — texto C1
+### Phase C — C1 text
 
-- kernels nativos de proyección, MoE, DeltaNet y QSA;
-- contratos/oráculos CPU de GDN, QSA sparse, n-gram/PLE, hyper-connections y routing;
-- tras AR correcto y perfil propio: prototipos GDN tiled y lector directo PLE;
-- ablation QSA denso frente a sparse completo, incluida calidad; no se acepta
-  integración parcial;
-- prefill y decode separados;
-- HIP graphs y tuning offline.
+- native projection, MoE, DeltaNet and QSA kernels;
+- CPU contracts/oracles for GDN, sparse QSA, n-gram/PLE, hyper-connections and routing;
+- after correct AR and our own profiling: tiled GDN and direct PLE-reader prototypes;
+- dense versus complete sparse QSA ablation including quality; partial
+  integration is not accepted;
+- separate prefill and decode;
+- HIP graphs and offline tuning.
 
-### Fase D — MTP y concurrencia inicial
+### Phase D — MTP and initial concurrency
 
-- predictor, aceptación, rollback y catch-up;
-- batching C2/C4 y admission por memoria;
-- expansión posterior a C6/C8 y prompt cache solo tras cualificar C4.
+- predictor, acceptance, rollback and catch-up;
+- C2/C4 batching and memory-based admission;
+- later expansion to C6/C8 and prompt cache only after C4 qualification.
 
-### Fase E — servidor y producto
+### Phase E — server and product
 
 - APIs, health/metrics, inspect/verify/ppl/niah;
-- empaquetado reproducible y documentación;
-- hardening de cancelación, fallos de driver y presión de memoria.
+- reproducible packaging and documentation;
+- harden cancellation, driver faults and memory-pressure handling.
 
-El servidor incluye watchdog, drenaje de requests, política explícita ante
-cuelgue/reset del driver y estado degradado visible. Cada benchmark registra
-potencia/TDP, clocks y temperatura junto al entorno software.
+The server includes a watchdog, request draining, explicit driver hang/reset
+policy and visible degraded state. Every benchmark records power/TDP, clocks
+and temperature alongside its software environment.
 
-## 8. Puertas de decisión antes de escribir el motor completo
+## 8. Decision gates before building the complete engine
 
-1. Elegir checkpoint público y cuantización canónica tras demostrar un
-   presupuesto completo dentro de 128 GB UMA.
-2. Medir external runtime A y external runtime B con el mismo prompt, contexto, potencia y criterio de
-   tokens completados.
-3. Confirmar Linux/ROCm/kernel de la máquina objetivo.
-4. Decidir si el caché interno de pesos compensa tiempo de arranque y espacio.
-5. Fijar licencia y política de reutilización MIT.
-6. Resolver los P0 de `DESIGN_ACCEPTANCE.md` y someter la spec consolidada a una
-   segunda revisión.
-7. Fijar repo, commit y licencia canónicos para QSA, DeltaNet, routing MoE,
-   MTP, tokenizer y chat template.
-8. Demostrar que las librerías ROCm elegidas contienen rutas `gfx1151` o definir
-   fallbacks propios.
-9. Aprobar el caso de uso y distribución frente a Qwen Community License 1.0.
-10. Confirmar la semántica QSA y su oráculo; no sustituirla por denso por una
-    observación de rendimiento externa.
+1. Select a public checkpoint and canonical quantization after demonstrating a
+   complete budget within 128 GB UMA.
+2. Measure external runtime A and external runtime B with the same prompt,
+   context, power and completed-token criterion.
+3. Confirm the target machine's Linux/ROCm/kernel.
+4. Decide whether the internal weight cache justifies startup time and storage.
+5. Fix license and MIT reuse policy.
+6. Resolve P0 items in `DESIGN_ACCEPTANCE.md` and submit the consolidated
+   specification to a second review.
+7. Pin canonical repository, commit and license for QSA, DeltaNet, MoE routing,
+   MTP, tokenizer and chat template.
+8. Demonstrate `gfx1151` paths in chosen ROCm libraries or define independent
+   fallbacks.
+9. Approve use case and distribution under Qwen Community License 1.0.
+10. Confirm QSA semantics and oracle; do not replace it with dense attention on
+    the strength of an external performance observation.
 
-## 8.1 Trabajo permitido antes de recibir el hardware
+## 8.1 Work permitted before hardware arrives
 
-- compilar HIP offline para `gfx1151` con toolchain fijado;
-- inspeccionar ISA, VGPR/SGPR/LDS, spills y tamaño de código;
-- implementar cargador GGUF, hashes y planner de layouts;
-- crear oráculos CPU y tests de operadores/estado;
-- simular admission, batching, cancelación, snapshots y rollback;
-- definir API, métricas, formatos de artefacto y plano administrativo;
-- construir microkernels candidatos sin declarar ganadores.
+- offline HIP compilation for `gfx1151` with a pinned toolchain;
+- ISA, VGPR/SGPR/LDS, spill and code-size inspection;
+- GGUF loader, hashes and layout planner implementation;
+- CPU oracles and operator/state tests;
+- admission, batching, cancellation, snapshot and rollback simulation;
+- API, metric, artifact-format and administrative-plane definition;
+- candidate microkernels without declaring winners.
 
-Queda prohibido convertir una compilación correcta o un recuento estático en
-una afirmación de rendimiento. Selección de kernels, tuning, UMA, page faults,
-potencia, temperatura y estabilidad requieren el Strix Halo real.
+Successful compilation or static counts must not become performance claims.
+Kernel selection, tuning, UMA, page faults, power, temperature and stability
+require actual Strix Halo hardware.
 
-## 8.2 Plano administrativo remoto
+## 8.2 Remote administrative plane
 
-El producto tendrá tres dominios separados: motor local sin exposición de red,
-gateway de inferencia/chat y plano administrativo. Sus funciones prioritarias
-serán salud/versiones, configuración
-validada, ciclo de vida de servicios, logs, memoria/GTT, temperatura/potencia,
-modelos, caché/sesiones y ejecución/comparación de benchmarks. Un playground de
-chat podrá vivir como pestaña opcional dentro del panel, únicamente para smoke
-tests y reproducción de peticiones.
+The product has three separate domains: a local engine with no network
+exposure, an inference/chat gateway and an administrative plane. Priority
+functions are health/versions, validated configuration, service lifecycle,
+logs, memory/GTT, temperature/power, models, cache/sessions and benchmark
+execution/comparison. An optional chat playground tab may support smoke tests
+and request reproduction.
 
-El puerto interno del motor nunca se publica: se usa UDS o loopback restringido.
-El gateway usa API keys u OIDC, cuotas y auditoría. El panel usa un agente local
-con operaciones tipadas permitidas explícitamente, WebAuthn o mTLS, TLS,
-auditoría, CSP y protección CSRF. La entrada remota se limita preferentemente a
-VPN. Las acciones destructivas o reinicios muestran el objetivo y requieren
-confirmación. La pestaña de chat no hereda privilegios administrativos y la UI
-no ejecuta shell arbitrario.
+The engine's internal port is never published: use a UDS or restricted
+loopback. The gateway uses API keys or OIDC, quotas and auditing. The panel
+uses a local agent with explicitly allowed typed operations, WebAuthn or mTLS,
+TLS, auditing, CSP and CSRF protection. Prefer VPN for remote ingress.
+Destructive actions or restarts show the target and require confirmation.
+The chat tab does not inherit administrative privileges and the UI does not
+execute arbitrary shell commands.
 
-La sección GTT mostrará límite configurado frente a consumo y reserva efectiva,
-carve-out detectado, `MemAvailable` y estado residual. Podrá preparar/aplicar un
-perfil allowlisted de GTT/TTM mediante arranque one-shot, preflight,
-reautenticación y confirmación. Un health check confirma driver/GTT/agente; si
-falla, el siguiente arranque vuelve a la entrada anterior. `amd_iommu=off` y
-parámetros experimentales quedan fuera de la WebUI y requieren consola o SSH.
-El playground se sirve desde origen y cookies distintos al panel administrativo,
-con salida del modelo estrictamente sanitizada.
+The GTT section shows configured limit versus consumption and effective
+reserve, detected carve-out, `MemAvailable` and residual state. It may prepare
+and apply an allowlisted GTT/TTM profile through one-shot boot, preflight,
+reauthentication and confirmation. A health check confirms driver/GTT/agent;
+on failure, the next boot returns to the previous entry. `amd_iommu=off` and
+experimental parameters remain outside the WebUI and require console or SSH.
+The playground uses separate origin and cookies from the administrative panel,
+with strictly sanitized model output.
 
-## 9. Historial de la especificación
+## 9. Specification history
 
-| Versión | Fecha | Cambio |
+| Version | Date | Change |
 | --- | --- | --- |
-| 0.4 | 2026-09-28 | Fuentes Qwen oficiales, política UMA/GTT y aprendizajes de external platform study: GDN tiled, PLE directo, UMA ring y controles negativos de QSA/PM4. |
-| 0.3 | 2026-09-28 | Incorpora revisión de diseño: P0, alcance reducido, contratos numéricos, A0 y separación de privilegios. |
-| 0.2 | 2026-09-28 | Cross-compilación previa al hardware y plano administrativo remoto. |
-| 0.1 | 2026-09-28 | Alcance inicial, arquitectura, calidad, benchmark y fases. |
+| 0.4 | 2026-09-28 | Official Qwen sources, UMA/GTT policy and external platform study findings: tiled GDN, direct PLE, UMA ring and QSA/PM4 negative controls. |
+| 0.3 | 2026-09-28 | Design review: P0, reduced scope, numerical contracts, A0 and privilege separation. |
+| 0.2 | 2026-09-28 | Pre-hardware cross-compilation and remote administrative plane. |
+| 0.1 | 2026-09-28 | Initial scope, architecture, quality, benchmarks and phases. |

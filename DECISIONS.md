@@ -1,58 +1,61 @@
-# Registro de decisiones
+# Decision log
 
-## Aceptadas
+These decisions retain the evidence and scope recorded when they were made.
+Consult the [qualification ledger](docs/qualification-ledger.md) for current
+implementation gates and [design acceptance](DESIGN_ACCEPTANCE.md) for the
+review requirements.
 
-| ID | Decisión | Motivo | Evidencia | Revisión |
+## Accepted
+
+| ID | Decision | Reason | Evidence | Review |
 | --- | --- | --- | --- | --- |
-| D-001 | Construir un motor propio; external runtime A y external runtime B son referencias. | Evita depender de una base cerrada o convertir external runtime B en destino de cambios. | Alcance confirmado por el usuario. | Reabrir solo por decisión explícita. |
-| D-002 | Mantener observación no derivativa respecto a external runtime A. | Obtener ideas generales sin copiar, reconstruir ni redistribuir implementaciones. | Licencia external runtime A y alcance confirmado. | Auditar artefactos y procedencia antes de publicar código. |
-| D-003 | Empezar por Linux nativo, ROCm y `gfx1151`. | Es el entorno real de los dos motores y permite optimización específica. | E-001, documentación de ambos proyectos. | Revisar después de una primera versión estable. |
-| D-004 | Usar GGUF como entrada inicial. | Formato público, pesos disponibles y menor dependencia de formatos privados. | E-009. | Medir después un caché interno lossless. |
-| D-005 | Calidad y reproducibilidad son puertas, no tareas posteriores. | MTP, recurrencia y cuantización pueden producir ganancias engañosas. | E-008, E-010. | Permanente. |
-| D-006 | La UI prioritaria será un plano administrativo remoto. | Operación, observabilidad y benchmarks aportan más valor que duplicar clientes de chat existentes. | E-016 y alcance confirmado por el usuario. | Chat queda como playground opcional integrado. |
-| D-007 | Avanzar con compilación offline antes del hardware. | Permite validar toolchain, objetos y contratos sin fingir resultados dinámicos. | E-015. | Revalidar todo en el equipo real. |
-| D-008 | El primer slice será AR + MTP, C1/C2/C4 y un contexto cualificado menor que 262K. | Reduce simultáneamente riesgo numérico, memoria y scheduling. | E-019, O-11. | Ampliar solo al superar corrección, memoria y estabilidad. |
-| D-009 | Separar motor, gateway/chat y administración como dominios de privilegio. | Una UI cómoda no debe ganar control directo del proceso GPU ni shell. | E-016, O-14, O-15. | Permanente salvo modelo de amenazas revisado. |
-| D-010 | Tratar repositorio, paper y checkpoint oficiales de Qwen como fuente primaria de arquitectura. | Permite especificar contratos sin inferirlos de motores ajenos. | E-020, E-021. | Reabrir si Qwen publica revisión incompatible; fijar siempre SHA. |
-| D-011 | Exponer GTT casi máximo, pero admitir cargas con una reserva efectiva independiente de 16–20 GiB. | GTT amplía el mapping; no crea RAM ni protege al host de OOM. | E-022, E-023, `MEMORY_BUDGET.md`. | Ajustar reserva solo con telemetría del hardware real. |
-| D-012 | Mantener inicialmente el perfil mononodo de 128 GiB dentro de un envelope aproximado de 100 GiB de pesos residentes, hasta que A0.6 justifique otro límite. | Preserva la reserva efectiva y deja capacidad para KV, recurrencia, scratch, runtime y recuperación; evita convertir el GTT máximo en presupuesto de carga. | E-011, E-028, E-032, E-033. | Reabrir tras medidas UMA reales y calidad de las cuantizaciones candidatas. |
+| D-001 | Build an independent engine; external runtime A and external runtime B are references. | Avoid dependence on a closed foundation or treating external runtime B as the destination for changes. | Scope confirmed by the user. | Reopen only by explicit decision. |
+| D-002 | Maintain non-derivative observation of external runtime A. | Obtain general ideas without copying, reconstructing or redistributing implementations. | External runtime A license and confirmed scope. | Audit artifacts and provenance before publishing code. |
+| D-003 | Start with native Linux, ROCm and `gfx1151`. | This is the actual environment of both engines and permits target-specific optimization. | E-001, documentation of both projects. | Review after the first stable version. |
+| D-004 | Use GGUF as the initial input. | Public format, available weights and less dependence on private formats. | E-009. | Later measure a lossless internal cache. |
+| D-005 | Quality and reproducibility are gates, not later tasks. | MTP, recurrence and quantization can produce misleading gains. | E-008, E-010. | Permanent. |
+| D-006 | Prioritize a remote administrative control plane for the UI. | Operations, observability and benchmarks offer more value than duplicating existing chat clients. | E-016 and scope confirmed by the user. | Chat remains an optional integrated playground. |
+| D-007 | Advance through offline compilation before hardware arrives. | Validate the toolchain, objects and contracts without claiming dynamic results. | E-015. | Revalidate everything on the actual machine. |
+| D-008 | The first slice is AR + MTP, C1/C2/C4 and a qualified context below 262K. | Reduce numerical, memory and scheduling risk together. | E-019, O-11. | Expand only after correctness, memory and stability gates pass. |
+| D-009 | Separate engine, gateway/chat and administration into privilege domains. | A convenient UI must not gain direct control over the GPU process or shell. | E-016, O-14, O-15. | Permanent unless the threat model is revised. |
+| D-010 | Treat official Qwen repository, paper and checkpoint as primary architecture sources. | Specify contracts without inferring them from other engines. | E-020, E-021. | Reopen if Qwen publishes an incompatible revision; always pin the SHA. |
+| D-011 | Expose near-maximum GTT, but admit loads with an independent effective reserve of 16–20 GiB. | GTT expands mapping; it does not create RAM or protect the host from OOM. | E-022, E-023, `MEMORY_BUDGET.md`. | Adjust the reserve only using telemetry from actual hardware. |
+| D-012 | Initially keep the single-host 128 GiB profile within an approximate 100 GiB resident-weight envelope until A0.6 justifies another limit. | Preserve the effective reserve and capacity for KV, recurrence, scratch, runtime and recovery; maximum GTT is not the load budget. | E-011, E-028, E-032, E-033. | Reopen after actual UMA measurements and quality assessment of candidate quantizations. |
+| D-013 | Break equal QSA scores by lower block index. | The canonical forward uses `torch.topk`, whose tied indices are not guaranteed stable; reproducible replay requires the same rule in serial and MTP. | E-041, E-043 and the `qsa_tie` fixture. | Reopen only if Qwen publishes an incompatible explicit canonical tie rule. |
+| D-014 | Model each physical USB4 link as an autonomous transport with its own epoch, lease, TX/RX pools and accounting; dual-link mode is a policy over two qualified links. | Avoid assuming additive bandwidth, isolate failures and permit flow distribution/directional split/striping only with evidence of independence. | E-044 through E-048; docs 12 and 16. | Reopen only if hardware demonstrates an aggregate resource with shared ownership/synchronization and an end-to-end benefit. |
 
-| D-013 | Fijar el desempate QSA por menor índice de bloque cuando los scores sean idénticos. | El forward canónico usa `torch.topk`, cuyos índices empatados no tienen estabilidad garantizada; el motor necesita replay reproducible y la misma regla debe usarse en serial y MTP. | E-041, E-043 y fixture `qsa_tie`. | Reabrir solo si Qwen publica un desempate canónico explícito incompatible. |
+## Pending
 
-| D-014 | Modelar cada USB4 físico como transporte autónomo con epoch, lease, TX/RX pools y contabilidad propios; el modo dual-link es una política por encima de dos enlaces cualificados. | Evita asumir suma de ancho de banda, aísla fallos y permite flow distribution/directional split/striping solo con evidencia de independencia. | E-044 a E-048; docs 12 y 16. | Reabrir solo si el hardware demuestra un recurso agregado con ownership/sincronización comunes y beneficio end-to-end. |
-
-## Pendientes
-
-| ID | Decisión pendiente | Datos necesarios |
+| ID | Pending decision | Required data |
 | --- | --- | --- |
-| P-001 | Nombre y licencia del proyecto. | Preferencias del propietario y política de contribuciones. |
-| P-002 | Checkpoint/quantización canónica de desarrollo. | Tamaño, calidad, MTP disponible y licencia de pesos. |
-| P-003 | mmap registrado frente a copia anónima/huge pages. | Medidas de carga, decode, memoria y presión de página. |
-| P-004 | Política exacta de continuous batching. | Resultados C1/C2/C4/C6/C8 y coste de admisión. |
-| P-005 | Wave32/wave64 por familia. | Experimentos emparejados por forma y end-to-end. |
-| P-006 | Caché interna de pesos. | Prototipo lossless, tamaño y tiempo de arranque. |
-| P-007 | Stack del plano administrativo. | Prototipo, modelo de amenazas y preferencias de despliegue. |
-| P-008 (P0) | Checkpoint canónico y presupuesto completo dentro de 128 GB UMA. | Tamaño real por tensor más SO, KV, recurrencia, rollback, scratch, librerías y margen. |
-| P-009 (P0) | Modelo de residencia/registro de memoria en `gfx1151`. | Documentación y prueba con kernel Linux/ROCm exactos; confirmar XNACK/HMM. |
-| P-010 (P0) | Ledger de fuentes canónicas de la arquitectura. | Repo, commit, licencia y contrato de QSA, DeltaNet, MoE, MTP, tokenizer y template. |
-| P-011 (P0) | Cobertura `gfx1151` de las librerías ROCm elegidas. | Inventario offline de code objects de rocBLAS/hipBLASLt y fallbacks. |
-| P-012 (P0) | Política compatible con Qwen Community License 1.0. | Caso de uso, distribución, servicio comercial y revisión legal si aplica. |
-| P-013 | Valores finales de GTT, reserva y recuperación tras dirty kill. | RAM física, BIOS, kernel/ROCm final y pruebas de presión/reinicio. |
-| P-014 (P0) | Semántica canónica QSA: selección top-k, desempate, indexer y relación con atención densa. | Paper/código oficial, oráculo CPU y pruebas KL/NIAH; no asumir que denso es equivalente. |
-| P-015 | Backend directo GPU-owned DMA-BUF y política dual-link preferida. | Kernel/ROCm exactos en M5, soporte export/import DMA-BUF, consumer-credit/repost, re-arm fiable, medidas 1×USB4/2×USB4 y efecto real sobre decode/prefill. |
-| H-001 | GDN tiled/DPP como primer candidato de optimización tras perfil. | Contrato/oráculo GDN y perfil propio de tráfico/tiempo. |
-| H-002 | Lector directo PLE antes que mmap demand-paged. | Contrato n-gram/PLE, latencia p99, page cache y A/B en hardware. |
+| P-001 | Project name and license. | Owner preferences and contribution policy. |
+| P-002 | Canonical development checkpoint/quantization. | Size, quality, available MTP and weight license. |
+| P-003 | Registered mmap versus anonymous copy/huge pages. | Load, decode, memory and page-pressure measurements. |
+| P-004 | Exact continuous-batching policy. | C1/C2/C4/C6/C8 results and admission cost. |
+| P-005 | Wave32/wave64 by family. | Paired experiments by shape and end-to-end. |
+| P-006 | Internal weight cache. | Lossless prototype, size and startup time. |
+| P-007 | Administrative control-plane stack. | Prototype, threat model and deployment preferences. |
+| P-008 (P0) | Canonical checkpoint and complete budget within 128 GB UMA. | Actual per-tensor size plus OS, KV, recurrence, rollback, scratch, libraries and headroom. |
+| P-009 (P0) | Memory residency/registration model on `gfx1151`. | Documentation and a test with exact Linux/ROCm versions; confirm XNACK/HMM. |
+| P-010 (P0) | Canonical architecture source ledger. | Repository, commit, license and QSA, DeltaNet, MoE, MTP, tokenizer and template contracts. |
+| P-011 (P0) | `gfx1151` coverage of selected ROCm libraries. | Offline rocBLAS/hipBLASLt code-object inventory and fallbacks. |
+| P-012 (P0) | Policy compatible with Qwen Community License 1.0. | Use case, distribution, commercial service and legal review where applicable. |
+| P-013 | Final GTT, reserve and recovery values after an unclean kill. | Physical RAM, BIOS, final kernel/ROCm and pressure/restart tests. |
+| P-014 (P0) | Canonical QSA semantics: top-k selection, ties, indexer and relation to dense attention. | Official paper/code, CPU oracle and KL/NIAH tests; do not assume dense equivalence. |
+| P-015 | Direct GPU-owned DMA-BUF backend and preferred dual-link policy. | Exact kernel/ROCm in M5, DMA-BUF export/import support, consumer-credit/repost, reliable re-arm, 1×USB4/2×USB4 measurements and actual decode/prefill effect. |
+| H-001 | Tiled/DPP GDN as the first optimization candidate after profiling. | GDN contract/oracle and our own traffic/time profile. |
+| H-002 | Direct PLE reader before demand-paged mmap. | N-gram/PLE contract, p99 latency, page cache and hardware A/B. |
 
-## Descartadas por ahora
+## Rejected for now
 
-| ID | Alternativa | Motivo |
+| ID | Alternative | Reason |
 | --- | --- | --- |
-| X-001 | Modificar external runtime B como producto final. | No coincide con la meta de una solución propia. |
-| X-002 | Copiar o reconstruir kernels de external runtime A. | Fuera del alcance clean-room y contrario al objetivo de código propio. |
-| X-003 | Diseñar desde el inicio para múltiples GPU/modelos. | Añadiría abstracción antes de validar el fast path `gfx1151`. |
+| X-001 | Modify external runtime B as the final product. | Does not match the goal of an independent solution. |
+| X-002 | Copy or reconstruct external runtime A kernels. | Outside clean-room scope and contrary to the goal of independently authored code. |
+| X-003 | Design for multiple GPUs/models from the start. | Would add abstraction before validating the `gfx1151` fast path. |
 
-## Formato de revisión
+## Review format
 
-Toda decisión nueva indicará: alternativas, evidencia, riesgo, consecuencia en
-la spec y condición de reapertura. Las acciones de aceptación se enlazarán aquí y
-en `DESIGN_ACCEPTANCE.md`.
+Every new decision records alternatives, evidence, risk, consequences for the
+specification and conditions for reopening. Link acceptance actions here and in
+`DESIGN_ACCEPTANCE.md`.

@@ -319,3 +319,9 @@ Qualify in this order:
 10. cleanup/re-arm/requalification of the failed link.
 
 Single-message striping is not valid until every stripe commits and the total stripe byte count exactly matches the logical transfer descriptor. A partial tensor must never be published.
+
+## Further reading
+
+See the [lab index](../README.md) for prerequisites and related experiments,
+the [qualification ledger](../../docs/qualification-ledger.md) for current gates,
+and [independent oracles](../../tools/oracles/README.md) for semantic checks.

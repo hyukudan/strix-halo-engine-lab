@@ -1,49 +1,60 @@
-# Laboratorio de compilación offline gfx1151
+# Offline gfx1151 compilation lab
 
-Objetivo: demostrar que podemos generar objetos AMDGPU para Strix Halo sin
-tener la GPU presente, inspeccionar su metadata/ISA y fijar el toolchain.
+Goal: demonstrate AMDGPU object generation for Strix Halo without the GPU
+present, inspect metadata/ISA and pin the toolchain.
 
-`probe.hip` no es un benchmark. Solo comprueba el pipeline:
+`probe.hip` is not a benchmark. It checks only the pipeline:
 
-1. frontend HIP;
-2. target `--offload-arch=gfx1151`;
-3. emisión de objeto AMDGPU;
-4. lectura de target, símbolos y recursos;
-5. desensamblado agregado mediante las herramientas de `../../tools`.
+1. HIP frontend;
+2. `--offload-arch=gfx1151` target;
+3. AMDGPU object emission;
+4. target, symbol and resource inspection;
+5. aggregate disassembly through the tools in `../../tools`.
 
-La ausencia de hardware impide validar ejecución, corrección del driver,
-rendimiento, ocupación dinámica, memoria UMA y estabilidad. Un objeto que
-compila no demuestra que sea rápido ni siquiera que ejecute correctamente.
+Without target hardware this does not validate execution, driver correctness,
+performance, dynamic occupancy, UMA memory or stability. Successful compilation
+establishes neither speed nor correct execution.
 
-## Toolchain provisional verificado
+## Provisionally verified toolchain
 
-La imagen runtime de external runtime A no contiene los headers C++ necesarios y no sirve
-como entorno de desarrollo completo. La prueba correcta usa la imagen pública
-`rocm/dev-ubuntu-24.04:7.2.4`, fijada por digest:
+The runtime image from external runtime A lacks the necessary C++ headers and
+is not a complete development environment. The successful test uses the public
+`rocm/dev-ubuntu-24.04:7.2.4` image, pinned by digest:
 
 `sha256:bdc8e61026cbb844ede93d44d2c50055f51ebb2041906b60182bf3bee3139054`
 
-Comando ejecutado dentro del contenedor:
+Command executed inside the container, from `lab/cross_compile`:
 
 ```sh
+mkdir -p out
 hipcc -std=c++20 -O3 --offload-arch=gfx1151 --cuda-device-only \
   -c probe.hip -o out/probe.gfx1151.o
 ```
 
-El bundle contiene un target `hipv4-amdgcn-amd-amdhsa--gfx1151`. Tras separar
-el device object, el ELF declara AMDGPU-HSA ABI v4, flag `gfx1151`; el kernel
-`saxpy_probe` declara wave32, 14 SGPR, 6 VGPR, 0 LDS y 0 spills.
+The bundle contains target `hipv4-amdgcn-amd-amdhsa--gfx1151`. After device-object
+extraction, the ELF declares AMDGPU-HSA ABI v4 and the `gfx1151` flag;
+`saxpy_probe` declares wave32, 14 SGPR, 6 VGPR, 0 LDS and 0 spills.
 
-## Salidas verificadas
+## Verified outputs
 
 - `out/probe.gfx1151.o`, SHA-256
   `3CE334B698C6BCA3D824637ECC7E712350308B47C3AC672CF71824A6072FC562`;
-- `out/probe.gfx1151.hsaco`, 4.976 bytes, SHA-256
+- `out/probe.gfx1151.hsaco`, 4,976 bytes, SHA-256
   `70C2BCDBAD899D22786ED065F8F4F546F676D7924F1D9E5F166426AA3CC19E2F`;
-- cabecera ELF con target AMDGPU;
-- metadata que declare `amdgcn-amd-amdhsa--gfx1151`;
-- resumen de recursos e ISA.
+- ELF header with AMDGPU target;
+- metadata declaring `amdgcn-amd-amdhsa--gfx1151`;
+- resource and ISA summary.
 
-Los binarios generados en `out/` son artefactos fijados por hash y no se
-consideran resultados de rendimiento. La reproducibilidad bit a bit requiere
-todavía una segunda compilación limpia y comparación normalizada.
+Generated binaries in `out/` are hash-pinned artifacts, not performance results.
+Bitwise reproducibility still requires a second clean build and normalized
+comparison.
+
+See [implementation history](../../IMPLEMENTATION_STATUS.md) and the
+[qualification ledger](../../docs/qualification-ledger.md) for the distinction
+between offline compilation, native execution and full-workload qualification.
+
+## Further reading
+
+See the [lab index](../README.md) for prerequisites and related experiments,
+the [qualification ledger](../../docs/qualification-ledger.md) for current gates,
+and [independent oracles](../../tools/oracles/README.md) for semantic checks.

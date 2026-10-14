@@ -44,6 +44,26 @@ cmake -S lab/basic_kernels -B build/basic-kernels -G Ninja \
 cmake --build build/basic-kernels
 ```
 
+Run these commands from the repository root with CMake 3.24 or newer, Ninja,
+a C++20 compiler and the HIP development toolchain installed. HIP compilation
+and target execution are separate gates; run the fixtures on `gfx1151` hardware.
+
+If the installed HIP compiler is outside CMake's default ROCm layout, select
+the actual compiler and root explicitly in a new build directory. For a
+distribution toolchain installed under `/usr`, an example is:
+
+```bash
+cmake -S lab/basic_kernels -B build/basic-kernels-distro -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_HIP_COMPILER=/usr/bin/clang++-21 \
+  -DCMAKE_HIP_COMPILER_ROCM_ROOT=/usr
+cmake --build build/basic-kernels-distro
+```
+
+These paths illustrate compiler discovery, not a universal version
+requirement or a qualification claim. Use paths matching the installed
+toolchain, and record compiler/runtime identity with private run artifacts.
+
 Run both variants:
 
 ```bash
@@ -80,3 +100,9 @@ The first kernel variants use FP32 input, accumulation and output.
 
 Later BF16 or mixed-precision variants MUST receive separate kernel IDs and
 numerical contracts. They do not replace the FP32 reference path implicitly.
+
+## Further reading
+
+See the [lab index](../README.md) for prerequisites and related experiments,
+the [qualification ledger](../../docs/qualification-ledger.md) for current gates,
+and [independent oracles](../../tools/oracles/README.md) for semantic checks.

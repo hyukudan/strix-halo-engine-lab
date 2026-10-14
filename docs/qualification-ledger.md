@@ -1,8 +1,15 @@
 # Current qualification ledger
 
-Updated: 2026-10-12. Earlier slices in `IMPLEMENTATION_STATUS.md` record historical
+Updated: 2026-10-12. Earlier slices in
+[IMPLEMENTATION_STATUS.md](../IMPLEMENTATION_STATUS.md) record historical
 implementation steps. This table summarizes current gates without promoting
 portable fixtures, declarations or offline compilation to native qualification.
+
+Read each row across: the middle column describes available implementation and
+checks, while the final column identifies the evidence still required on the
+target. An implementation being available does not imply that its final-column
+gate has passed. The date above belongs to the recorded qualification evidence;
+editorial changes to this page do not represent a new hardware campaign.
 
 | Area | Available implementation and checks | Required target evidence |
 | --- | --- | --- |
@@ -44,6 +51,22 @@ commit visibility, consumer completion, repost/rearm and complete model benefit.
 Each stage has its own rejection criteria. No native direct path is enabled by
 device-node presence, theoretical precision throughput or an external result.
 
-See [the portable implementation slice](implementation-2026-10-11.md),
-[reusable execution components](implementation-2026-10-12-execution-components.md),
-[low-precision lab](../lab/low_precision/README.md) and the architecture guides.
+## Evidence collection entry points
+
+| Evidence you need | Where to begin |
+| --- | --- |
+| Portable contracts and their implementation boundaries | [Portable foundations](implementation-2026-10-11.md) and [reusable execution components](implementation-2026-10-12-execution-components.md) |
+| Native arithmetic, model fidelity and state replay | [Numerical campaign preparation](implementation-2026-10-12-native-numerical-campaign.md) and [numerical lab runbook](../lab/native_campaign/numerical/README.md) |
+| Eager, graph or integer-head recording contracts | [RAW baseline recording](implementation-2026-10-12-raw-baseline-recording.md) and [complete-model decode modes](implementation-2026-10-12-decode-execution-modes.md) |
+| Precision emission and operator correctness | [Low-precision lab](../lab/low_precision/README.md) and [integer runtime slice](implementation-2026-10-12-integer-runtime.md) |
+| Target commissioning and direct transport lifecycle | [Hardware campaign preparation](implementation-2026-10-12-hardware-campaign-preparation.md) and [commissioning runbook](../lab/direct_gpu_stream/COMMISSIONING.md) |
+| Complete-workload acceptance and reproducibility | [Benchmarking and qualification](architecture/10-benchmarking-and-qualification.md) |
+
+Retain failures, unknowns and cleanup outcomes as evidence alongside successful
+checks. Each result must stay bound to the exact artifacts, configuration and
+runtime under assessment; a passing host evaluator cannot supply an unobserved
+native execution or an independent model reference. Follow the relevant runbook
+for the exact schema, required observations and rejection criteria.
+
+Return to the [documentation guide](README.md) for architecture decisions and
+the full implementation-report index.

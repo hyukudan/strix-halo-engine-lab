@@ -1,29 +1,36 @@
-# Ledger de fuentes y procedencia
+# Source and provenance ledger
 
-Estado: P0 parcialmente resuelto. Una referencia usada por external runtime A, external runtime B o external platform study no se convierte
-automáticamente en fuente canónica de nuestro motor.
+Status: P0 partially resolved. A reference used by external runtime A, external
+runtime B or external platform study does not automatically become a canonical
+source for our engine. Historical row status is retained below; consult the
+[qualification ledger](docs/qualification-ledger.md) for current implementation
+and promotion gates.
 
-| Componente | Fuente candidata fijada | Licencia verificada | Contrato independiente | Estado |
+| Component | Pinned candidate source | Verified license | Independent contract | Status |
 | --- | --- | --- | --- | --- |
-| Arquitectura Flash-Next | `QwenLM/Qwen3.8-Flash-Next@69885871a64393807d988b27b1b5e380e8f28526`, paper `arXiv:2608.30320` y checkpoint oficial `Qwen/Qwen3.8-Flash-Next@de4b8e4d43b917e7706784d8bb445c9af86a3540` | Qwen Community License 1.0; revisar caso de uso/distribución | Contratos QSA/GDN/Gated Residual/n-gram por extraer | **Fuente primaria fijada** |
-| Configuración y pesos Flash-Next Q4 | `unsloth/Qwen3.8-Flash-Next-GGUF@38bb39ee97821de2c9009abb7e93950eec396e66` | Derivada; pendiente mapear condiciones del modelo oficial | Hash/tensor map frente al checkpoint oficial | Candidato; no aprobado |
-| Predictor MTP Q8_0 | mismo snapshot, `MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf` | Pendiente | Pendiente | Candidato; no aprobado |
-| Implementación MTP de contraste | `ggml-org/llama.cpp#27836@1d8de7c1b0c7d2febf8f983174d8e6a711e2b1af` | MIT del proyecto; PR abierta/no canónica | Contraste estructural y del input combiner; atención contiene TODO QSA, por lo que NO es oráculo del forward completo | **Secundaria; input fusion corroborado, forward completo bloqueado** |
-| Routing y expertos MoE | Paper y checkpoint/config oficiales Qwen fijados arriba | Sí, sujeta a política de uso | Tie-breaking, orden y layout pendientes | Parcial |
-| Algoritmo de aceptación MTP | `huggingface/transformers@ebd5de00b43e94cae2da6d7aeb5a76ecdda51dae`, `src/transformers/generation/utils.py` y `candidate_generator.py` | Apache-2.0 | Greedy acceptance/crop fixture propio; sampled mantiene RNG pendiente | **Greedy fijado; sampled RNG abierto** |
-| Tokenizer | Debe extraerse del snapshot canónico y fijarse por hash | Pendiente | IDs exactos en fixtures | Abierto |
-| Chat template/reasoning controls | Debe extraerse del snapshot canónico y fijarse por hash | Pendiente | prompts y tokens golden | Abierto |
-| N-gram/PLE | Config oficial fijado (`ngram_size=3`, base 20M, 128 particiones, PLE capa 2) y paper/código Qwen | Qwen Community License 1.0 | hashing, filas, conv y timing de lookup pendientes | **P0 abierto** |
-| Hyper-connections/output gate | Config oficial (`hc_count=4`, `hc_lowrank=320`, sigmoid) y paper/código Qwen | Qwen Community License 1.0 | mezcla residual, scratch y orden numérico pendientes | **P0 abierto** |
-| mRoPE parcial/interleaved | Config oficial fijado (`partial_rotary_factor=0.25`) y código Qwen | Qwen Community License 1.0 | posiciones multimodales y oráculo texto pendientes | Abierto |
+| Flash-Next architecture | `QwenLM/Qwen3.8-Flash-Next@69885871a64393807d988b27b1b5e380e8f28526`, paper `arXiv:2608.30320` and official checkpoint `Qwen/Qwen3.8-Flash-Next@de4b8e4d43b917e7706784d8bb445c9af86a3540` | Qwen Community License 1.0; review use case/distribution | QSA/GDN/Gated Residual/n-gram contracts to extract | **Primary source pinned** |
+| Flash-Next Q4 configuration and weights | `unsloth/Qwen3.8-Flash-Next-GGUF@38bb39ee97821de2c9009abb7e93950eec396e66` | Derivative; mapping of official model terms pending | Hash/tensor map against official checkpoint | Candidate; not approved |
+| MTP Q8_0 predictor | Same snapshot, `MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf` | Pending | Pending | Candidate; not approved |
+| MTP cross-check implementation | `ggml-org/llama.cpp#27836@1d8de7c1b0c7d2febf8f983174d8e6a711e2b1af` | Project MIT; open/noncanonical PR | Structural and input-combiner cross-check; attention contains a QSA TODO and is NOT an oracle for the complete forward | **Secondary; input fusion corroborated, complete forward blocked** |
+| MoE routing and experts | Official Qwen paper and checkpoint/config pinned above | Yes, subject to use policy | Tie-breaking, order and layout pending | Partial |
+| MTP acceptance algorithm | `huggingface/transformers@ebd5de00b43e94cae2da6d7aeb5a76ecdda51dae`, `src/transformers/generation/utils.py` and `candidate_generator.py` | Apache-2.0 | Independent greedy acceptance/crop fixture; sampled RNG remains pending | **Greedy pinned; sampled RNG open** |
+| Tokenizer | Extract from canonical snapshot and pin by hash | Pending | Exact IDs in fixtures | Open |
+| Chat template/reasoning controls | Extract from canonical snapshot and pin by hash | Pending | Golden prompts and tokens | Open |
+| N-gram/PLE | Pinned official config (`ngram_size=3`, 20M base, 128 partitions, PLE layer 2) and Qwen paper/code | Qwen Community License 1.0 | Hashing, rows, conv and lookup timing pending | **P0 open** |
+| Hyper-connections/output gate | Official config (`hc_count=4`, `hc_lowrank=320`, sigmoid) and Qwen paper/code | Qwen Community License 1.0 | Residual mixing, scratch and numerical order pending | **P0 open** |
+| Partial/interleaved mRoPE | Pinned official config (`partial_rotary_factor=0.25`) and Qwen code | Qwen Community License 1.0 | Multimodal positions and text oracle pending | Open |
 | Transformers `qwen4_exp` semantics | `huggingface/transformers@ebd5de00b43e94cae2da6d7aeb5a76ecdda51dae`, `src/transformers/models/qwen4_exp/modeling_qwen4_exp.py` | Apache-2.0 | Independent tiny fixtures for RMSNorm, partial RoPE, recurrent GDN and PLE n-gram hashing | **Pinned for A0.5b; greedy MTP acceptance fixed, sampled RNG/QSA ties remain open** |
 | IQ4_XS storage/dequant contract | `ggml-org/llama.cpp@8019dc563b1ecbae6b161a70c3a1359f1b206c1e`, `ggml/src/ggml-common.h` and `ggml/src/ggml-quants.c` | MIT | Independent byte-layout parser, FP16 conversion and full 256-value dequant fixture | **Pinned for A1.1 compact-format experiments; not a canonical checkpoint decision** |
-| Estructura GGUF v3 | `ggml-org/ggml@353b63b439f27ab2cc19dac97ab1681ba6d2d084`, `docs/gguf.md`; geometrías en `ggml-org/llama.cpp@6c7a87f7e5e5cd75b8a641c3471f2dee84a6ed17` | MIT de ambos proyectos; especificación/catálogo públicos | Fixtures propios de parseo, límites, bloques y rangos | Fuente primaria fijada para A0.2/A0.3 |
+| GGUF v3 structure | `ggml-org/ggml@353b63b439f27ab2cc19dac97ab1681ba6d2d084`, `docs/gguf.md`; geometry in `ggml-org/llama.cpp@6c7a87f7e5e5cd75b8a641c3471f2dee84a6ed17` | Both projects MIT; public specification/catalog | Independent parsing, limit, block and range fixtures | Primary source pinned for A0.2/A0.3 |
 | Experimental USB4 DMA-BUF extension | [Linux USB4STREAM source](https://github.com/torvalds/linux/blob/72d3fcf802c45d00b300f25b848a93c3a2bd7c7e/drivers/thunderbolt/stream.c), pinned commit `72d3fcf802c45d00b300f25b848a93c3a2bd7c7e` | GPL-2.0; upstream Intel notices preserved in the integration patch. Project kernel code GPL-2.0-only; public UAPI GPL-2.0 WITH Linux-syscall-note. Exact upstream license/exception texts retained in `lab/direct_gpu_stream/kernel/` | Project-owned experimental ABI, attachment/SG/controller-drain contracts and shared property tests | Enabled real kernel driver object compiled with strict warnings; no module load, DMA execution or GPU/cache qualification |
 
-## Regla de aprobación
+## Approval rule
 
-Cada fila necesita URL/repo, SHA o revisión inmutable, licencia aplicable,
-hashes de artefactos y un contrato verificable sin depender de external runtime A. El
-código de external runtime B puede orientar pruebas y arquitectura, pero no será el oráculo
-único de una implementación propia.
+Each row needs a URL/repository, SHA or immutable revision, applicable license,
+artifact hashes and a verifiable contract independent of external runtime A.
+External runtime B code may inform tests and architecture, but will not be the
+sole oracle for an independently authored implementation.
+
+Record actual adopted components and their notices accurately. Comparative
+inspection artifacts and private source records remain outside Git under the
+[publication policy](AGENTS.md).

@@ -12,3 +12,9 @@ qualifies this engine. Do not copy or reconstruct external kernels from observat
 Use the official model semantics, independent oracles and real native replay. Record
 adopted dependency provenance and notices accurately. Published ISA/toolchain references
 are hardware documentation, not substitutes for native compiler and execution evidence.
+
+Start with the [source ledger](SOURCES_LEDGER.md) for pinned contracts and
+licenses, the [architecture guide](docs/README.md) for subsystem requirements,
+and the [lab index](lab/README.md) for reproducible experiments. The
+[qualification ledger](docs/qualification-ledger.md) records which gates are
+implemented, tested or still open.

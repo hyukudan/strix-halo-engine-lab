@@ -143,3 +143,9 @@ identity; the default floating launcher rejects that alternate binding.
 compiles its native dispatcher fixture and both shared device components, retains
 disassembly/source hashes and pins the separately built core archive before and
 after linking. This does not run a GPU test or establish native/model qualification.
+
+## Further reading
+
+See the [lab index](../README.md) for prerequisites and related experiments,
+the [qualification ledger](../../docs/qualification-ledger.md) for current gates,
+and [independent oracles](../../tools/oracles/README.md) for semantic checks.

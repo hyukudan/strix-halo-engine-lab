@@ -212,3 +212,9 @@ or D2H/event error publishes no consumed credit and issues no RX_REPOST. The
 program does not recover/rearm a failed endpoint or select production fallback.
 Native qualification, performance characterization, repeated workload fidelity
 and reset/recovery campaigns remain separate work.
+
+## Further reading
+
+See the [lab index](../README.md) for prerequisites and related experiments,
+the [qualification ledger](../../docs/qualification-ledger.md) for current gates,
+and [independent oracles](../../tools/oracles/README.md) for semantic checks.

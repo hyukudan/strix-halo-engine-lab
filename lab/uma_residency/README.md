@@ -105,3 +105,9 @@ Start with modest sizes.
 Pinned or registered memory reduces reclaimability. Do not register most of physical RAM until small and medium tests have demonstrated correct cleanup.
 
 A failed or interrupted HIP registration test should be followed by a platform/memory health check before running a large model.
+
+## Further reading
+
+See the [lab index](../README.md) for prerequisites and related experiments,
+the [qualification ledger](../../docs/qualification-ledger.md) for current gates,
+and [independent oracles](../../tools/oracles/README.md) for semantic checks.

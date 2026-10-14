@@ -47,3 +47,9 @@ Qualification must report modeled weight bytes, direct/grouped timing and
 reference error. A grouped result only becomes preferred after real gfx1151
 measurement shows that reduced packed-weight traffic survives launch,
 accumulation and routing overhead.
+
+## Further reading
+
+See the [lab index](../README.md) for prerequisites and related experiments,
+the [qualification ledger](../../docs/qualification-ledger.md) for current gates,
+and [independent oracles](../../tools/oracles/README.md) for semantic checks.

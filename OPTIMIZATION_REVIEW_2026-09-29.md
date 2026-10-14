@@ -2,6 +2,13 @@
 
 **Status:** Research and proposed decision amendments. This document does not change the normative architecture guide or qualify an implementation.
 
+This dated review retains its original evidence boundary and proposed actions.
+For current implementation and promotion gates, consult the
+[qualification ledger](docs/qualification-ledger.md); use the
+[lab index](lab/README.md) to locate reproducible experiments. New comparative
+records and private host inventories remain outside Git under the
+[publication policy](AGENTS.md).
+
 **Target:** Native Linux, AMD Strix Halo / `gfx1151`, first one host and then two directly connected hosts. No additional vendor backend is proposed.
 
 ## 1. Scope and evidence boundary

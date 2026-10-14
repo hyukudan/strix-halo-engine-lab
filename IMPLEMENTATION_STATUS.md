@@ -1,30 +1,34 @@
-# Estado de implementación
+# Implementation status
 
 Current cross-cutting summary: [qualification ledger](docs/qualification-ledger.md).
 The slices below are retained implementation history, not native qualification.
 
-## Slice A0.1 — núcleo portable
+## Slice A0.1 — portable core
 
-Implementado:
+Implemented:
 
-- proyecto CMake C++20 sin dependencias externas;
-- contrato de shapes Qwen3.8-Flash-Next fijado desde el config oficial;
-- planificador de memoria con aritmética comprobada contra overflow;
-- desglose KV base, MTP, indexer provisional, GDN FP32, rollback, modelo y cachés;
-- decisión de admisión desde MemTotal, baseline y reserva explícita;
-- CLI JSON `strix-memory-plan`, preparada para alimentar la futura WebUI;
-- oráculo top-k candidato con empates deterministas y rechazo de NaN;
-- pruebas CTest en Linux/WSL con warnings-as-errors.
+- CMake C++20 project without external dependencies;
+- Qwen3.8-Flash-Next shape contract pinned to the official config;
+- memory planner with overflow-checked arithmetic;
+- breakdown of base KV, MTP, provisional indexer, FP32 GDN, rollback, model and caches;
+- admission decision based on MemTotal, baseline and an explicit reserve;
+- JSON CLI `strix-memory-plan`, ready to supply the future WebUI;
+- candidate top-k oracle with deterministic ties and NaN rejection;
+- Linux/WSL CTest tests with warnings treated as errors.
 
-No implementado o deliberadamente bloqueado:
+Unimplemented or deliberately blocked at this slice:
 
-- semántica QSA canónica, n-gram/PLE, hyper-connections y GDN: esperan contratos
-  oficiales/oráculos antes de crear kernels;
-- allocator/residency HIP y kernels `gfx1151`;
-- MTP sampled;
-- servidor y panel administrativo.
+- canonical QSA, n-gram/PLE, hyper-connection and GDN semantics: official
+  contracts/oracles are required before creating kernels;
+- HIP allocator/residency and `gfx1151` kernels;
+- sampled MTP;
+- server and administrative panel.
 
-## Reproducción
+## Reproduction
+
+Run from the repository root with CMake, Ninja and a C++20 compiler installed.
+These commands build the portable core; individual HIP labs have separate build
+instructions. The `MODEL.gguf` argument is a local model path.
 
 ```bash
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
@@ -36,25 +40,33 @@ ctest --test-dir build --output-on-failure
 ./build/strix-model-manifest MODEL.gguf
 ```
 
-El indexer es una estimación provisional derivada del config. Se puede excluir
-con `--no-indexer`. `--rollback-full` permite cuantificar por qué copiar el
-estado GDN completo por borrador no escala; el camino objetivo será snapshot
-mínimo más recompute si el contrato lo permite.
+The indexer is a provisional estimate derived from the config. Exclude it with
+`--no-indexer`. `--rollback-full` quantifies why copying the entire GDN state
+for each draft does not scale; the intended path uses minimal snapshots plus
+recomputation where the contract permits it.
 
-## Slice A0.2 — inspección GGUF
+Warnings are errors by default. If a newer compiler stops the portable build
+on a diagnostic, retain the full diagnostic and compiler identity for review.
+For investigation, configure a separate directory with
+`-DSTRIX_WARNINGS_AS_ERRORS=OFF`; warnings remain enabled. This option allows
+diagnostic review and does not establish that a warning is harmless or that
+the resulting build is qualified.
 
-Implementado en `include/strix/gguf_reader.hpp` y `src/gguf_reader.cpp`: lector
-GGUF v3 little-endian defensivo y CLI `strix-inspect-gguf`. Valida metadata,
-arrays, directorio tensorial, geometría de bloques, tamaños, alineación, rangos
-y solapamientos sin cargar los datos de pesos.
-Las limitaciones y la revisión canónica se documentan en `GGUF_READER.md`.
+## Slice A0.2 — GGUF inspection
 
-Validación actual:
+Implemented in `include/strix/gguf_reader.hpp` and `src/gguf_reader.cpp`: a
+defensive little-endian GGUF v3 reader and the `strix-inspect-gguf` CLI. It
+validates metadata, arrays, tensor directories, block geometry, sizes,
+alignment, ranges and overlaps without loading weight data.
+Limitations and the canonical revision are documented in
+[the reader contract](GGUF_READER.md).
 
-- build `RelWithDebInfo` con `-Werror`;
-- fixtures válidos y corruptos en CTest;
-- build Debug con AddressSanitizer y UndefinedBehaviorSanitizer;
-- 100 % de las pruebas actuales superadas en ambos builds.
+Validation recorded for this slice:
+
+- `RelWithDebInfo` build with `-Werror`;
+- valid and corrupt fixtures in CTest;
+- Debug build with AddressSanitizer and UndefinedBehaviorSanitizer;
+- 100% of the tests at that time passed in both builds.
 
 
 ## Slice A0.4 — model manifest

@@ -108,3 +108,9 @@ Promotion requires:
 - repeated long-window stability;
 - no register spilling that defeats the state-traffic reduction;
 - end-to-end benefit once surrounding projections are integrated.
+
+## Further reading
+
+See the [lab index](../README.md) for prerequisites and related experiments,
+the [qualification ledger](../../docs/qualification-ledger.md) for current gates,
+and [independent oracles](../../tools/oracles/README.md) for semantic checks.
