@@ -208,6 +208,10 @@ endif()
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(strix-virtual-q8-oracle-tests tests/virtual_q8_oracle_tests.cpp)
+    target_compile_features(strix-virtual-q8-oracle-tests PRIVATE cxx_std_20)
+    strix_target_warnings(strix-virtual-q8-oracle-tests)
+    add_test(NAME strix-virtual-q8-oracle-tests COMMAND strix-virtual-q8-oracle-tests)
     add_executable(strix-direct-gpu-stream-commissioning-tests
         tests/direct_gpu_stream_commissioning_tests.cpp
         lab/direct_gpu_stream/bounded_tcp_control.cpp)
@@ -1015,6 +1019,11 @@ if(STRIX_ENABLE_HIP_RUNTIME)
     strix_target_warnings(
         strix-hip-decode-token
     )
+    if(BUILD_TESTING)
+        add_test(NAME strix-virtual-q8-cli-duplicate-tests
+            COMMAND ${CMAKE_COMMAND} -DBINARY=$<TARGET_FILE:strix-hip-decode-token>
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_virtual_q8_cli.cmake)
+    endif()
     target_link_libraries(
         strix-hip-model-residency
         PRIVATE strix_hip_runtime

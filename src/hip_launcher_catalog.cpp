@@ -114,7 +114,7 @@ hyper_mix_config(
 HipLmHeadLauncherConfig
 lm_head_config(
     const ModelContract& model,
-    HipActivationStorage activation) {
+    HipActivationStorage activation, bool virtual_wave) {
     HipLmHeadLauncherConfig config;
     config.hidden_size =
         checked_u32(
@@ -126,6 +126,7 @@ lm_head_config(
             "vocab_size");
     config.input =
         activation;
+    config.virtual_q8_wave = virtual_wave;
     return config;
 }
 
@@ -208,6 +209,8 @@ void register_complete_hip_kernel_catalog(
     HipLauncherCatalogConfig config,
     kernels::KernelRegistry& registry,
     const integer_projection::RuntimeConfig* alternate_lm_head) {
+    if (alternate_lm_head && config.virtual_q8_lm_head)
+        throw std::invalid_argument("integer and virtual Q8 LM heads are mutually exclusive");
     if (alternate_lm_head && config.enable_device_graph_inputs)
         throw std::invalid_argument("blocking integer LM-head cannot enter a captured graph");
     if (const auto error =
@@ -330,7 +333,7 @@ void register_complete_hip_kernel_catalog(
     const auto lm_head =
         lm_head_config(
             model,
-            config.activation);
+            config.activation, config.virtual_q8_lm_head);
     register_hip_lm_head_kernel_variant(
         model,
         request,
@@ -390,11 +393,13 @@ HipLauncherCatalog::HipLauncherCatalog(
       lm_head_(
           lm_head_config(
               model,
-              config.activation)),
+              config.activation, config.virtual_q8_lm_head)),
       shared_expert_(
           shared_expert_config(
               model,
               config.activation)) {
+    if (alternate_lm_head_ && config.virtual_q8_lm_head)
+        throw std::invalid_argument("integer and virtual Q8 LM heads are mutually exclusive");
     if (device_graph_inputs_ && alternate_lm_head_)
         throw std::invalid_argument("integer LM-head catalog is eager only");
     if (const auto error =
