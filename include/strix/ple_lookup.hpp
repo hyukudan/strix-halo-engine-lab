@@ -94,6 +94,8 @@ private:
         std::uintptr_t table_address = 0;
         std::uint64_t table_bytes = 0;
         std::uint64_t row_bytes = 0;
+        std::uint64_t stored_row_bytes = 0;
+        std::uint32_t ggml_type = 0;
         std::array<std::uint64_t, PleHashContract::maximum_heads> row_ids{};
         std::uint32_t row_count = 0;
         bool active = false;
