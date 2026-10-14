@@ -111,6 +111,8 @@ std::uint32_t slot_limit(
         return plan.indexed_attention_workspace_slots;
     case ExecutionBufferClass::hyper_workspace:
         return plan.hyper_workspace_slots;
+    case ExecutionBufferClass::router_workspace:
+        return plan.router_workspace_slots;
     }
     return 0;
 }
@@ -127,7 +129,7 @@ std::size_t flat_index(
 }  // namespace
 
 SerialExecutionIoPlan build_serial_execution_io_plan(
-    const SerialExecutionPlan& execution_plan) {
+    const SerialExecutionPlan& execution_plan, bool parallel_moe_router) {
     SerialExecutionIoPlan output;
     output.expanded_hidden_slots = 2;
     output.hidden_slots = 3;
@@ -140,11 +142,12 @@ SerialExecutionIoPlan build_serial_execution_io_plan(
     output.ple_workspace_slots = 1;
     output.indexed_attention_workspace_slots = 1;
     output.hyper_workspace_slots = 1;
+    output.router_workspace_slots = parallel_moe_router ? 1U : 0U;
     output.steps.reserve(
         execution_plan.steps.size());
 
     constexpr std::size_t maximum_buffers =
-        (static_cast<std::size_t>(ExecutionBufferClass::hyper_workspace) + 1U) * 8U;
+        (static_cast<std::size_t>(ExecutionBufferClass::router_workspace) + 1U) * 8U;
     std::array<std::uint64_t, maximum_buffers> generations{};
 
     const auto read_use = [&](Buffer buffer) {
@@ -258,6 +261,8 @@ SerialExecutionIoPlan build_serial_execution_io_plan(
                 write_use(route_indices()),
                 write_use(route_weights()),
             };
+            if (parallel_moe_router)
+                io.temporaries = {temporary_use(Buffer{ExecutionBufferClass::router_workspace, 0})};
             break;
 
         case SerialOp::shared_expert:
@@ -333,7 +338,7 @@ void validate_serial_execution_io_plan(
     }
 
     constexpr std::size_t maximum_buffers =
-        (static_cast<std::size_t>(ExecutionBufferClass::hyper_workspace) + 1U) * 8U;
+        (static_cast<std::size_t>(ExecutionBufferClass::router_workspace) + 1U) * 8U;
     std::array<bool, maximum_buffers> produced{};
     std::array<std::uint64_t, maximum_buffers> generation{};
 
@@ -350,6 +355,15 @@ void validate_serial_execution_io_plan(
             throw std::invalid_argument(
                 "execution IO identity does not match execution step");
         }
+
+        const auto router_temporaries = std::count_if(io.temporaries.begin(), io.temporaries.end(),
+            [](const ExecutionBufferUse& use) { return use.buffer.buffer_class == ExecutionBufferClass::router_workspace; });
+        if (io_plan.router_workspace_slots > 1U ||
+            (step.op == SerialOp::moe_route && io.temporaries.size() != io_plan.router_workspace_slots) ||
+            (step.op == SerialOp::moe_route &&
+             router_temporaries != static_cast<std::ptrdiff_t>(io_plan.router_workspace_slots)) ||
+            (step.op != SerialOp::moe_route && router_temporaries != 0))
+            throw std::invalid_argument("router workspace IO does not match admitted topology");
 
         for (const auto& use : io.reads) {
             const auto buffer = use.buffer;

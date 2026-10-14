@@ -85,6 +85,8 @@ std::uint64_t build_identity(
     hash_u64(hash, buffer_request.logit_element_bytes);
     hash_u64(hash, buffer_request.mlp_intermediate_element_bytes);
 
+    if (buffer_request.parallel_moe_router) hash_u64(hash, 0x524f555445525057ULL);
+
     for (const auto& step :
          compiled.verify.steps) {
         hash_u64(hash, step.id);
@@ -183,6 +185,9 @@ compile_speculative_verify_execution(
             "verify buffer logical rows must equal candidate depth");
     }
 
+    if (binding_request.parallel_moe_router != buffer_request.parallel_moe_router)
+        throw std::invalid_argument("router kernel request differs from buffer admission");
+
     CompiledSpeculativeVerifyExecution compiled;
     compiled.vocab_size =
         model.vocab_size;
@@ -212,9 +217,15 @@ compile_speculative_verify_execution(
             "compiled speculative verify requires all kernel steps bound");
     }
 
+    for (const auto& binding : compiled.bindings.bindings) {
+        if (binding.op == SerialOp::moe_route && binding.kernel_id.has_value() &&
+            binding.kernel_id->ends_with(".parallel") != buffer_request.parallel_moe_router)
+            throw std::invalid_argument("bound router kernel differs from admitted topology");
+    }
+
     compiled.io =
         build_serial_execution_io_plan(
-            compiled.topology);
+            compiled.topology, buffer_request.parallel_moe_router);
     compiled.arena =
         build_serial_execution_arena_plan(
             model,
