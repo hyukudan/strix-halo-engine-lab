@@ -104,6 +104,7 @@ strix::ModelContract fixture_model() {
         strix::ModelContract::qwen38_flash_next();
 
     model.vocab_size = 128;
+    model.ple_eos_token_id = 127;
     model.hidden_size = 128;
     model.max_position_embeddings = 64;
     model.hidden_layers = 2;
