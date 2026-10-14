@@ -2147,9 +2147,10 @@ void register_hip_gdn_kernel_variant(
     variant.resources.workgroup_threads =
         kProjectionThreads;
     variant.resources.lds_bytes =
-        kRecurrentThreads *
-        kValueTile *
-        sizeof(float);
+        // Conservative 256-byte-aligned bound for both FP32 arrays and the
+        // graph rejection broadcast, including possible compiler padding.
+        ((kRecurrentThreads * kValueTile * sizeof(float) +
+          kValueTile * sizeof(float) + sizeof(std::uint32_t) + 255U) / 256U) * 256U;
     variant.resources.scratch_bytes =
         build_serial_execution_buffer_plan(
             model,

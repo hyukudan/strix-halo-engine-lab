@@ -22,7 +22,7 @@ constexpr std::uint32_t kThreads = 256;
 constexpr std::uint32_t kMaxExperts = 512;
 constexpr std::uint32_t kMaxTopK = 16;
 constexpr std::uint64_t kLauncherTag =
-    0x4d4f45524f555445ULL;
+    0x4d4f45524f555432ULL;
 constexpr std::uint64_t fnv_offset =
     14695981039346656037ULL;
 constexpr std::uint64_t fnv_prime =
@@ -312,6 +312,9 @@ __global__ void moe_route_kernel(
     }
     const float maximum =
         scratch[0];
+    // Every wave must retain the maximum before lane zero reuses scratch[0]
+    // for its contribution to the denominator reduction.
+    __syncthreads();
 
     float local_sum = 0.0F;
     for (std::uint32_t expert = lane;
@@ -832,7 +835,7 @@ void register_hip_moe_route_kernel_variant(
     variant.output_layout =
         "topk-indices+fp32-weights";
     variant.compiler_identity =
-        "hip-gfx1151-moe-route-v1";
+        "hip-gfx1151-moe-route-v2";
     variant.measured_seconds = 0.0;
 
     registry.add(
