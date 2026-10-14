@@ -47,8 +47,8 @@ int main() {
                    600ULL * 1024ULL,
            "C1 indexed-attention workspace is explicit and bounded");
     expect(c1.mlp_intermediate_bytes ==
-               2ULL * 640ULL * 4ULL,
-           "C1 MoE temporary stores FP32 gate/up intermediates");
+               (2ULL * 640ULL + 2560ULL) * 4ULL + 4ULL,
+           "C1 MoE temporary stores gate/up, FP32 output accumulation and validation");
     expect(c1.gdn_workspace_bytes ==
                22'624ULL * 4ULL,
            "C1 FP32 analytical GDN workspace covers qkv z a b and core");

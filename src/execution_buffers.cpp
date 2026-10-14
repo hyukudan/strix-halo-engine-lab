@@ -99,6 +99,12 @@ ExecutionBufferPlan build_serial_execution_buffer_plan(
                     model.shared_expert_intermediate_size),
                 2ULL),
             request.mlp_intermediate_element_bytes);
+    // Routed expert outputs accumulate across all selected experts in FP32,
+    // with a device validation word, before conversion to activation storage.
+    const auto routed_workspace_bytes = checked_mul(request.logical_rows,
+        checked_add(checked_mul(checked_add(checked_mul(model.moe_intermediate_size, 2ULL),
+                                           model.hidden_size), model.bytes_fp32), 4ULL));
+    plan.mlp_intermediate_bytes = std::max(plan.mlp_intermediate_bytes, routed_workspace_bytes);
 
     const auto gdn_key_width =
         checked_mul(
