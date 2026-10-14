@@ -1,95 +1,120 @@
-# Motor Strix Halo propio — espacio de investigación
+# Strix Halo Engine Lab
 
-Este repositorio desarrolla un motor propio con contratos matemáticos,
-oráculos independientes y cualificación explícita sobre el hardware objetivo.
+An experimental inference-engine research repository targeting Linux, ROCm/HIP and AMD Strix Halo-class unified-memory systems, initially **gfx1151**. It develops its own mathematical contracts, independent numerical oracles and explicit hardware qualification gates.
 
-## Architecture documentation
+**This is an engineering lab, not a production inference server.** Portable tools and contract tests are available; HIP kernels, graph execution and multi-node transport remain experimental. Compilation, host tests and device discovery do not prove full-model correctness, GPU execution or performance. Consult the [qualification ledger](docs/qualification-ledger.md) for current evidence and blockers.
 
-The normative, source-independent technical decisions for the Strix Halo runtime live in [`docs/`](docs/README.md). Research notes and evidence remain separate from the architecture guide.
+## Goals and architecture
 
-## Current implementation state
+The engine aims to optimize end-to-end cost per committed token while preserving model semantics, predictable physical-memory use and recoverable state. Priorities are correctness, sustainable unified-memory residency, concurrency-one decode latency, small-concurrency throughput and long-context capacity. Multi-node work must preserve the single-node path.
 
-The project has moved beyond the initial host-only bootstrap.
+The architecture separates:
 
-Current experimental pieces include:
+- **Model and memory contracts:** defensive GGUF parsing, exact tensor/layout identities, conservative residency and explicit admission budgets.
+- **Execution:** packed operators, a compiled serial DAG, versioned inputs/outputs, physical scratch arenas and persistent session state.
+- **State and optimization:** recurrent/KV state, snapshots, prefix lineage, speculative verification and opt-in graph/low-precision paths.
+- **Transport:** bounded buffers, epochs, leases, explicit commit, consumer completion and receive reposting across independent links.
+- **Qualification:** independent numerical references, exact artifact/runtime bindings and complete-workload gates.
 
-- defensive GGUF v3 parsing and model manifests;
-- pinned Qwen3.8-Flash-Next geometry and semantic oracles;
-- packed projection, GDN, MoE and QSA/PLE planning plus HIP harnesses;
-- a compiled C1 serial execution DAG with versioned IO, physical scratch arena and persistent session-state layouts;
-- experimental HIP launchers covering the serial DAG;
-- shared opt-in integer projection launcher with owned allocations and epoch-bound completion;
-- experimental device-position norm/RoPE/KV stage for graph replay;
-- opt-in complete C1 device-input graph capture/replay with session commit and failure containment;
-- tiled experimental integer LM-head connected to the compiled eager dispatcher;
-- raw-token decode tooling that can materialize logits from a GGUF once native target qualification is available;
-- greedy speculative target verification and snapshot/replay infrastructure;
-- USB4 transport abstractions, TCP/direct-stream baselines and dual-link scheduling;
-- bounded C1 host-copy tensor payload and distributed boundary adapter, tested with socketpairs;
-- an experimental architecture for GPU-owned DMA-BUF USB4 transport with explicit commit/consumer-credit/RX-repost semantics.
-- concrete HIP DMA-BUF export and uncached pool ownership;
-- an opt-in Linux DMA-BUF driver extension, userspace provider and GPU boundary packing with separate commit/consumer/repost proofs, compiled and software-tested.
-- a separate experimental two-host commissioning executable and private full-kernel/module staging workflow;
-- host-only numerical campaign preparation with exact model/artifact bindings and independent recorded-evidence checks.
+The current model-specific geometry and semantic work focuses on Qwen3.8-Flash-Next; this is not a claim of general GGUF architecture support. C1 means concurrency one. Eager dispatch, graph replay and integer projection are distinct experimental modes with separate acceptance requirements.
 
-Native `gfx1151` qualification remains mandatory before any HIP or direct-transport path is promoted.
+See the [architecture guide](docs/README.md), [memory/residency contract](docs/architecture/02-memory-and-residency.md), [execution model](docs/architecture/04-execution-and-graphs.md) and [numerical rules](docs/architecture/06-quantization-and-numerics.md).
 
-### USB4 multi-node direction
+## Current implementation
 
-The distributed design treats every physical USB4 connection as an independent resource.
+| Area | Available pieces | Remaining qualification boundary |
+| --- | --- | --- |
+| Host tools | UMA budget planner, defensive little-endian GGUF v3 inspection, tensor manifests and read-only Linux probe | Actual limits, complete checkpoint coverage and observed physical peaks |
+| Portable correctness | Semantic oracles, checked accounting, state/ownership tests and serial runtime contracts | Native complete-model logits, tokens and state fidelity |
+| HIP execution | Experimental packed projection, GDN, MoE, QSA/PLE, norm/RoPE/KV and serial DAG launchers | Genuine gfx1151 execution, numerical fidelity and resource behavior |
+| Graph and low precision | Opt-in C1 device-input capture/replay, integer projection and tiled integer LM-head eager adapter | Preparation-inclusive costs and full-model quality; integer LM-head remains eager C1 only |
+| Speculation and state | Greedy/sampled verification contracts, snapshot/replay and prefix lifecycle infrastructure | Qualified proposal/target semantics and native fresh/resumed correspondence |
+| Multi-node transport | TCP/direct-stream diagnostics, dual-link scheduling, C1 host-copy boundaries and software-tested DMA-BUF provider/driver contracts | Real two-peer GPU visibility, continuity, recovery and measured independence |
+| Campaign tooling | Private commissioning preparation and host-side numerical evidence checks | Independently bound target execution and complete-workload evidence |
 
-For two links between the same pair of hosts, each link keeps its own epoch, lease, TX/RX pools, completion accounting and health state. The scheduler may later choose independent flows, directional specialization, role specialization or large-message striping, but only after simultaneous measurements prove the links are genuinely independent.
+The [implementation history](IMPLEMENTATION_STATUS.md) records earlier slices; the [current ledger](docs/qualification-ledger.md) is the cross-cutting summary. An earlier slice's missing-feature list may have been superseded by later experimental code. Neither history nor a successful offline HIP build is native qualification.
 
-The normative synchronization and ownership contract is in [`docs/architecture/16-direct-gpu-transport.md`](docs/architecture/16-direct-gpu-transport.md). The broader placement/scheduler design remains in [`docs/architecture/12-multi-node-and-usb4.md`](docs/architecture/12-multi-node-and-usb4.md).
+## Build and test the host tools
 
-## Documentos
+Requirements: **CMake 3.24+**, a **C++20 compiler**, and Ninja for the commands below. The base core has no external library dependencies. Python 3 enables additional oracle/campaign tests when discovered. Linux is the native target; WSL can exercise host-side work but does not establish target GPU support.
 
-- [`RESEARCH.md`](RESEARCH.md): alcance de investigación y criterios de evidencia propios.
-- [`SPEC_DRAFT.md`](SPEC_DRAFT.md): especificación técnica inicial del motor propio.
-- [`EVIDENCE.md`](EVIDENCE.md): índice de afirmaciones, evidencia y nivel de confianza.
-- [`DECISIONS.md`](DECISIONS.md): decisiones aceptadas, pendientes y descartadas.
-- [`DESIGN_ACCEPTANCE.md`](DESIGN_ACCEPTANCE.md): acciones de aceptación del diseño y trazabilidad.
-- [`SOURCES_LEDGER.md`](SOURCES_LEDGER.md): fuentes canónicas, licencias y bloqueos de procedencia.
-- [`MEMORY_BUDGET.md`](MEMORY_BUDGET.md): política propuesta de UMA/GTT y guardas de admisión.
-- [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md): código disponible, reproducción y bloqueos.
-- [`GGUF_READER.md`](GGUF_READER.md): contrato, defensas y límites del lector GGUF propio.
-- [`tools/`](tools): analizadores que conservan solo metadatos y recuentos agregados.
+From the repository root:
 
-## Public documentation policy
+```bash
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBUILD_TESTING=ON
+cmake --build build
+ctest --test-dir build --output-on-failure
+```
 
-Private comparative inputs remain outside Git. Public contracts and qualification
-records describe this engine. Actual adopted components keep required notices.
+Warnings are errors by default (`STRIX_WARNINGS_AS_ERRORS=ON`). HIP is disabled by default (`STRIX_ENABLE_HIP_RUNTIME=OFF`), so this workflow does not require a GPU or model download. Optional Python tests depend on interpreter discovery; inspect the CTest inventory when comparing runs.
 
-## Regla de observación no derivativa
+### Host-side examples
 
-La observación de external runtime A se limita a comportamiento, metadatos de kernel,
-mezcla agregada de instrucciones y medidas. No se copiará, reconstruirá ni
-redistribuirá código fuente o kernels derivados. Las implementaciones nuevas se
-escribirán desde contratos matemáticos públicos y se verificarán contra oráculos
-independientes. En este alcance no se reutilizará código de external runtime B: se estudia
-como referencia y el diseño presupone implementación propia. Cualquier cambio
-futuro de esa política exigiría una decisión explícita y conservación de avisos.
+```bash
+./build/strix-memory-plan --tokens 32768 --sessions 1 --host-gib 128 --resident-gib 68 --baseline-gib 2 --reserve-gib 18
+./build/strix-platform-probe
+./build/strix-inspect-gguf /path/to/model.gguf
+./build/strix-model-manifest /path/to/model.gguf
+```
 
-## Método de actualización
+| Tool | Output and limits |
+| --- | --- |
+| `strix-memory-plan` | JSON memory breakdown and admission decision for the pinned model contract; uses explicit budget inputs, not live GPU allocation |
+| `strix-platform-probe` | Read-only Linux RAM, KFD, ROCm and USB4/USB4STREAM discovery; presence does not prove runtime readiness |
+| `strix-inspect-gguf` | Metadata, tensor geometry, alignment/range checks and storage inspection without loading weight payloads |
+| `strix-model-manifest` | Tensor roles, physical bytes, offsets and conservative residency candidates; unknown tensors remain visible |
 
-Cada nueva observación se guarda primero en `EVIDENCE.md`. Si cambia el diseño,
-se refleja en `SPEC_DRAFT.md` y se registra el motivo en `DECISIONS.md`. Las
-hipótesis nunca se convierten en requisitos hasta que exista una medición o una
-decisión explícita. Este orden permitirá mantener una spec trazable y
-contrastar cada objeción contra evidencia concreta.
+The memory values above are illustrative. Supply budgets appropriate to your approved workload; a planner admission result is not a reservation or an observed memory peak. `strix-memory-plan` returns 0 for admitted, 2 for rejected and 1 for invalid input. Its `--no-indexer` and `--rollback-full` options support explicit budget exploration; provisional model terms remain subject to their contracts.
 
-## Primer build offline
+See [GGUF_READER.md](GGUF_READER.md) for supported storage formats and defensive limits. Model files and private probe/experiment outputs remain outside Git.
 
-El slice A0.1 ya contiene un núcleo C++20 portable y el ejecutable
-`strix-memory-plan`. Véase `IMPLEMENTATION_STATUS.md` para compilarlo en Linux o
-WSL y obtener un desglose JSON consumible por la futura WebUI.
+## Optional HIP development build
 
+Use a separately configured Linux environment with the ROCm development toolkit, HIP headers, compiler and `amdhip64` library. The optional target is fixed to gfx1151 in CMake.
 
-## Current host-side tools
+```bash
+cmake -S . -B build-hip -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DSTRIX_ENABLE_HIP_RUNTIME=ON -DBUILD_TESTING=ON
+cmake --build build-hip
+```
 
-- `strix-memory-plan`: conservative UMA admission planning.
-- `strix-inspect-gguf`: defensive GGUF structure and storage inspection.
-- `strix-model-manifest`: logical tensor roles, bytes, residency candidates and node placement.
-- `strix-platform-probe`: read-only Linux discovery for RAM, KFD GPU identity, ROCm and USB4/USB4STREAM topology.
+`ROCM_PATH` can help CMake locate a non-default toolkit installation. The host build and HIP build have separate prerequisites. A successful build establishes compilation only; review the relevant native campaign requirements before running GPU, model or driver experiments. See the [hardware campaign preparation](docs/implementation-2026-10-12-hardware-campaign-preparation.md) and [native numerical campaign](docs/implementation-2026-10-12-native-numerical-campaign.md).
 
-These tools remain useful independently of the experimental HIP execution layer and can be used to qualify a host before enabling GPU runtime or direct USB4 transport tiers.
+Raw-token decode tooling and full C1 graph code are experimental execution infrastructure, not a qualified chat interface. Tokenizer/source bindings, complete tensor coverage, numerical replay, memory behavior and lifecycle checks remain independent gates. No stable public serving API or administrative panel is promised.
+
+## USB4 and multi-node work
+
+Every physical link is a separate resource with its own epoch, leases, pools, completion accounting and health. Two cables do not imply twice the usable bandwidth. Directional affinity, independent flows and optional large-message striping depend on qualified paths and complete transfer cost.
+
+The repository contains CPU TCP/direct-stream diagnostics and experimental GPU-owned DMA-BUF transport infrastructure. A working network link or character device does not establish GPU zero-copy transport, external-DMA visibility or distributed model inference. Transport completion, semantic commit, consumer completion and receive reposting must be demonstrated separately.
+
+Read the [multi-node design](docs/architecture/12-multi-node-and-usb4.md) and [direct GPU transport contract](docs/architecture/16-direct-gpu-transport.md). Driver/module staging is an explicit experimental operator workflow; ordinary builds do not install or load a driver. Published benchmark claims require project-owned, reproducible qualification evidence, not negotiated link rates or theoretical kernel throughput.
+
+## Repository and reading guide
+
+| Path | Purpose |
+| --- | --- |
+| `include/strix/`, `src/` | C++ contracts, host core and optional HIP implementations |
+| `apps/` | Inspection, planning, execution-validation and experimental native tools |
+| `tests/` | Portable and optional native tests |
+| `tools/oracles/` | Independent Python semantic/numerical references |
+| `lab/` | Operator, transport and qualification experiments |
+| `docs/architecture/` | Normative runtime decisions |
+| `docs/qualification-ledger.md` | Current claim/evidence boundaries |
+
+Additional project documents:
+
+- [RESEARCH.md](RESEARCH.md): research scope and evidence criteria.
+- [SPEC_DRAFT.md](SPEC_DRAFT.md): initial technical specification draft.
+- [EVIDENCE.md](EVIDENCE.md): project claims, evidence and confidence.
+- [DECISIONS.md](DECISIONS.md): accepted, pending and rejected decisions.
+- [DESIGN_ACCEPTANCE.md](DESIGN_ACCEPTANCE.md): design acceptance and traceability.
+- [MEMORY_BUDGET.md](MEMORY_BUDGET.md): proposed UMA/GTT budgeting and admission guards.
+- [SOURCES_LEDGER.md](SOURCES_LEDGER.md): canonical sources, licenses and provenance gates.
+
+## Contribution and publication rules
+
+Read [AGENTS.md](AGENTS.md), the architecture guide and the current ledger before changing behavior. New implementations follow public mathematical contracts and independent oracles. Maintain accurate attribution and notices for any actually adopted components; do not copy or reconstruct unrelated runtime code through observational research.
+
+Keep comparative evaluations, external benchmark records, private review correspondence and source-identified inspection artifacts outside Git. Public documentation describes this engine's own contracts and evidence. Numerical proposals remain drafts until compiler, native execution, model fidelity and complete-workload gates pass.
+
+Record project-owned observations with their evidence level; update the specification and decision record when an accepted design changes. Hypotheses, portable fixtures, compilation and native measurements must remain distinguishable. Hardware or model tests need explicitly configured artifacts and target environments.
