@@ -86,7 +86,7 @@ embedding_config(
 HipHyperMixLauncherConfig
 hyper_mix_config(
     const ModelContract& model,
-    HipActivationStorage activation) {
+    HipActivationStorage activation, bool parallel) {
     HipHyperMixLauncherConfig config;
     config.hidden_size =
         checked_u32(
@@ -105,6 +105,7 @@ hyper_mix_config(
             model.rms_norm_epsilon);
     config.activation =
         activation;
+    config.parallel = parallel;
     return config;
 }
 
@@ -292,7 +293,7 @@ void register_complete_hip_kernel_catalog(
     const auto hyper_mix =
         hyper_mix_config(
             model,
-            config.activation);
+            config.activation, config.parallel_hyper_mix);
     register_hip_hyper_mix_kernel_variant(
         model,
         request,
@@ -376,7 +377,7 @@ HipLauncherCatalog::HipLauncherCatalog(
       hyper_mix_(
           hyper_mix_config(
               model,
-              config.activation)),
+              config.activation, config.parallel_hyper_mix)),
       moe_route_(
           moe_route_config(
               model,

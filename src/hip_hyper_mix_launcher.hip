@@ -600,6 +600,87 @@ bool supported_linear_type(
            ggml_type == 30;
 }
 
+// Preserve the legacy per-output accumulation order while distributing the
+// independent projection outputs across workgroups. Normalized input is
+// materialized once in the admitted, generation-owned execution scratch.
+template <typename Storage>
+__global__ void prepare_hyper_norm_kernel(
+    const Storage* input, const void* norm, std::uint32_t norm_type,
+    std::uint32_t hidden, std::uint32_t streams, float epsilon, float* normalized) {
+    const auto stream = blockIdx.x;
+    const auto row = blockIdx.y;
+    const auto lane = threadIdx.x;
+    const auto width = hidden * streams;
+    const auto base = static_cast<std::uint64_t>(row) * width + stream * hidden;
+    __shared__ float reduction[kThreads];
+    __shared__ float inverse;
+    float sum = 0.0F;
+    for (std::uint32_t feature = lane; feature < hidden; feature += kThreads) {
+        const float value = load_activation(input, base + feature);
+        sum += value * value;
+    }
+    reduction[lane] = sum;
+    __syncthreads();
+    for (std::uint32_t stride = kThreads / 2U; stride > 0; stride >>= 1U) {
+        if (lane < stride) reduction[lane] += reduction[lane + stride];
+        __syncthreads();
+    }
+    if (lane == 0) inverse = rsqrtf(reduction[0] / static_cast<float>(hidden) + epsilon);
+    __syncthreads();
+    for (std::uint32_t feature = lane; feature < hidden; feature += kThreads)
+        normalized[base + feature] = load_activation(input, base + feature) * inverse *
+            load_norm_weight(norm, norm_type, stream * hidden + feature);
+}
+
+__global__ void parallel_hyper_lowrank_kernel(
+    const float* normalized, const void* down, std::uint32_t kind,
+    std::uint32_t width, std::uint32_t streams, std::uint32_t lowrank, float* low) {
+    const auto output = blockIdx.x * blockDim.x + threadIdx.x;
+    if (output >= lowrank) return;
+    const auto row = blockIdx.y;
+    float sum = 0.0F;
+    for (std::uint32_t feature = 0; feature < width; ++feature)
+        sum += normalized[static_cast<std::uint64_t>(row) * width + feature] *
+            load_linear_weight(down, kind, width, output, feature);
+    const float scaled = sum / static_cast<float>(streams);
+    low[static_cast<std::uint64_t>(row) * lowrank + output] = scaled * sigmoid(scaled);
+}
+
+__global__ void parallel_hyper_injection_kernel(
+    const float* normalized, const void* inject, std::uint32_t kind,
+    std::uint32_t width, std::uint32_t streams, float* output) {
+    const auto stream = threadIdx.x;
+    if (stream >= streams) return;
+    const auto row = blockIdx.x;
+    float sum = 0.0F;
+    for (std::uint32_t feature = 0; feature < width; ++feature)
+        sum += normalized[static_cast<std::uint64_t>(row) * width + feature] *
+            load_linear_weight(inject, kind, width, stream, feature);
+    output[static_cast<std::uint64_t>(row) * streams + stream] =
+        2.0F * sigmoid(sum / static_cast<float>(streams));
+}
+
+template <typename Storage>
+__global__ void parallel_hyper_output_kernel(
+    const float* normalized, const float* low, const void* up, std::uint32_t kind,
+    std::uint32_t hidden, std::uint32_t streams, std::uint32_t lowrank, Storage* output) {
+    const auto feature = blockIdx.x * blockDim.x + threadIdx.x;
+    if (feature >= hidden) return;
+    const auto row = blockIdx.y;
+    const auto width = hidden * streams;
+    float mixed = 0.0F;
+    for (std::uint32_t stream = 0; stream < streams; ++stream) {
+        const auto index = stream * hidden + feature;
+        float gate = 0.0F;
+        for (std::uint32_t inner = 0; inner < lowrank; ++inner)
+            gate += low[static_cast<std::uint64_t>(row) * lowrank + inner] *
+                load_linear_weight(up, kind, lowrank, index, inner);
+        mixed += normalized[static_cast<std::uint64_t>(row) * width + index] * sigmoid(gate);
+    }
+    store_activation(&output[static_cast<std::uint64_t>(row) * hidden + feature],
+                     mixed / static_cast<float>(streams));
+}
+
 bool supported_norm_type(
     std::uint32_t ggml_type) noexcept {
     return ggml_type == 0 ||
@@ -731,6 +812,45 @@ void launch_typed(
     const RuntimeTensorBinding& up_runtime,
     const ManifestTensor* inject_manifest,
     const RuntimeTensorBinding* inject_runtime) {
+    if (config.parallel) {
+        if (context.temporaries.size() != 1)
+            throw std::invalid_argument("parallel hyper-mix requires one admitted workspace");
+        const auto temporary = resolve_dispatch_temporary(context, 0);
+        if (temporary.use.buffer.buffer_class != ExecutionBufferClass::hyper_workspace)
+            throw std::invalid_argument("parallel hyper-mix requires its typed workspace binding");
+        const auto width = static_cast<std::uint64_t>(config.hidden_size) * config.hc_count;
+        const auto required = static_cast<std::uint64_t>(context.logical_rows) * (width + config.lowrank) * sizeof(float);
+        if (temporary.bytes < required || temporary.address % alignof(float) != 0)
+            throw std::invalid_argument("parallel hyper-mix workspace is undersized or unaligned");
+        auto* normalized = reinterpret_cast<float*>(temporary.address);
+        auto* low = normalized + static_cast<std::uint64_t>(context.logical_rows) * width;
+        constexpr std::uint32_t projection_threads = 32;
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(prepare_hyper_norm_kernel<Storage>),
+            dim3(config.hc_count, context.logical_rows), dim3(kThreads), 0, hip_execution_stream(),
+            reinterpret_cast<const Storage*>(input.address), reinterpret_cast<const void*>(norm_runtime.address),
+            norm_manifest.ggml_type, config.hidden_size, config.hc_count, config.rms_epsilon, normalized);
+        check_hip(hipGetLastError(), "parallel hyper-mix normalization launch");
+        hipLaunchKernelGGL(parallel_hyper_lowrank_kernel,
+            dim3((config.lowrank + projection_threads - 1U) / projection_threads, context.logical_rows),
+            dim3(projection_threads), 0, hip_execution_stream(), normalized,
+            reinterpret_cast<const void*>(down_runtime.address), down_manifest.ggml_type,
+            static_cast<std::uint32_t>(width), config.hc_count, config.lowrank, low);
+        check_hip(hipGetLastError(), "parallel hyper-mix lowrank launch");
+        if (injection_output) {
+            hipLaunchKernelGGL(parallel_hyper_injection_kernel, dim3(context.logical_rows),
+                dim3(projection_threads), 0, hip_execution_stream(), normalized,
+                reinterpret_cast<const void*>(inject_runtime->address), inject_manifest->ggml_type,
+                static_cast<std::uint32_t>(width), config.hc_count, reinterpret_cast<float*>(injection_output->address));
+            check_hip(hipGetLastError(), "parallel hyper-mix injection launch");
+        }
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(parallel_hyper_output_kernel<Storage>),
+            dim3((config.hidden_size + projection_threads - 1U) / projection_threads, context.logical_rows),
+            dim3(projection_threads), 0, hip_execution_stream(), normalized, low,
+            reinterpret_cast<const void*>(up_runtime.address), up_manifest.ggml_type,
+            config.hidden_size, config.hc_count, config.lowrank, reinterpret_cast<Storage*>(output.address));
+        check_hip(hipGetLastError(), "parallel hyper-mix output launch");
+        return;
+    }
     hipLaunchKernelGGL(
         HIP_KERNEL_NAME(
             hyper_mix_kernel<Storage>),
@@ -1053,7 +1173,7 @@ std::string kernel_id(
             request.logical_rows) +
         ".c" +
         std::to_string(
-            request.request_concurrency);
+            request.request_concurrency) + (config.parallel ? ".parallel" : "");
 }
 
 std::uint64_t implementation_identity(
@@ -1076,6 +1196,7 @@ std::uint64_t implementation_identity(
         &config.rms_epsilon,
         sizeof(epsilon_bits));
     hash_u64(hash, epsilon_bits);
+    hash_u64(hash, config.parallel ? 1U : 0U);
     return hash;
 }
 
@@ -1142,6 +1263,11 @@ void register_hip_hyper_mix_kernel_variant(
          kMaxHc +
          kMaxLowrank) *
         sizeof(float);
+    if (config.parallel) {
+        variant.resources.lds_bytes = kThreads * sizeof(float);
+        variant.resources.scratch_bytes = static_cast<std::uint64_t>(request.logical_rows) *
+            (static_cast<std::uint64_t>(config.hidden_size) * config.hc_count + config.lowrank) * sizeof(float);
+    }
     variant.numerics.input_precision =
         storage_name(
             config.activation);
@@ -1160,7 +1286,7 @@ void register_hip_hyper_mix_kernel_variant(
     variant.output_layout =
         "row-major+fp32-injection";
     variant.compiler_identity =
-        "hip-gfx1151-hyper-mix-v2";
+        config.parallel ? "hip-gfx1151-hyper-mix-v3-parallel" : "hip-gfx1151-hyper-mix-v2";
     variant.measured_seconds = 0.0;
 
     registry.add(

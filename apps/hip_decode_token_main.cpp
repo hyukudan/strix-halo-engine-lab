@@ -166,6 +166,7 @@ struct Options {
             registered_file_mapping;
     std::uint64_t coalesce_gap_bytes = 4096;
     bool planned_ple_io = false;
+    bool parallel_hyper_mix = false;
     std::uint64_t ple_max_rows_per_io = 4;
     std::uint64_t ple_max_inflight_ios = 4;
     std::string reference_path;
@@ -202,6 +203,11 @@ Options parse_options(
          ++index) {
         const std::string_view argument =
             argv[index];
+        if (argument == "--parallel-hyper-mix") {
+            if (options.parallel_hyper_mix) throw std::invalid_argument("duplicate parallel hyper-mix option");
+            options.parallel_hyper_mix = true;
+            continue;
+        }
 
         if (argument == "--execution-mode" || argument == "--integer-lm-head" ||
             argument == "--graph-workspace-bytes" || argument == "--graph-executable-bytes" ||
@@ -806,6 +812,7 @@ int main(
     strix::HipLauncherCatalogConfig catalog_config;
     catalog_config.activation = strix::HipActivationStorage::bf16;
     catalog_config.enable_device_graph_inputs = graph_mode;
+    catalog_config.parallel_hyper_mix = options.parallel_hyper_mix;
     std::optional<strix::integer_projection::RuntimeConfig> integer_config;
     if (options.execution.integer_head != strix::DecodeIntegerHead::none) {
         integer_config = strix::make_decode_integer_head_config(model, manifest, options.execution,
