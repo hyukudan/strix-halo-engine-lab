@@ -569,10 +569,13 @@ int main() try {
                 &device_weights[index],
                 bytes),
             "hipMalloc indexed weight");
+        auto serialized = *host_weights[index];
+        if (manifest.tensors[index].name.find("norm.weight") != std::string::npos)
+            for (auto& value : serialized) value += 1.0F;
         check(
             hipMemcpy(
                 device_weights[index],
-                host_weights[index]->data(),
+                serialized.data(),
                 bytes,
                 hipMemcpyHostToDevice),
             "copy indexed weight");
