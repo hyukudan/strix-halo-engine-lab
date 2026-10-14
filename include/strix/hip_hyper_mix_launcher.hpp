@@ -16,6 +16,7 @@ struct HipHyperMixLauncherConfig {
     float rms_epsilon = 1e-6F;
     bool parallel = false;
     bool staged_projections = false;
+    bool fused_injection = false;
     HipActivationStorage activation =
         HipActivationStorage::bf16;
 };

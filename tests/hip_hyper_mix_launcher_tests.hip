@@ -1,4 +1,5 @@
 #include "strix/execution_arena.hpp"
+#include "strix/dispatch_resources.hpp"
 #include "strix/execution_io.hpp"
 #include "strix/execution_memory.hpp"
 #include "strix/execution_plan.hpp"
@@ -19,6 +20,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -861,10 +863,38 @@ void run_numeric_fixture(
     auto staged_launcher = strix::make_hip_hyper_mix_launcher("test.hyper_mix.staged", &staged_config);
     expect(staged_launcher.implementation_identity != parallel_launcher.implementation_identity,
            "staged projections have a distinct implementation identity");
-    // The existing IQ4_XS/Q8_0 fixture exercises a partial injection-output
-    // tile and a 32-element inner projection tail under both activation types.
-    // Replay a captured launch as well as eager dispatch against the same
-    // independent CPU oracle and the exact parallel-path outputs.
+    // Preserve immutable baseline bits independently of all later device writes.
+    const auto expected_bf16_bits = actual_bf16;
+    const auto workspace_address = strix::resolve_dispatch_temporary(context, 0);
+    const auto poison_outputs = [&](hipStream_t stream) {
+        check(hipMemsetAsync(reinterpret_cast<void*>(workspace_address.address), 0xff,
+                             static_cast<std::size_t>(workspace_address.bytes), stream),
+              "poison complete admitted hyper workspace");
+        check(hipMemsetAsync(reinterpret_cast<void*>(mixed_address.address), 0xff,
+                             parallel_mixed.size() * (bf16 ? sizeof(std::uint16_t) : sizeof(float)), stream),
+              "poison hyper-mix output");
+        if (with_injection)
+            check(hipMemsetAsync(reinterpret_cast<void*>(injection_address->address), 0xff,
+                                 actual_injection.size() * sizeof(float), stream), "poison hyper injection");
+    };
+    const auto outputs_match_expected_bits = [&] {
+        const auto mixed_bytes = parallel_mixed.size() * (bf16 ? sizeof(std::uint16_t) : sizeof(float));
+        std::vector<std::uint8_t> observed(mixed_bytes);
+        check(hipMemcpy(observed.data(), reinterpret_cast<void*>(mixed_address.address),
+                        mixed_bytes, hipMemcpyDeviceToHost), "read hyper-mix output bits");
+        const void* expected = bf16 ? static_cast<const void*>(expected_bf16_bits.data()) : parallel_mixed.data();
+        bool matches = std::memcmp(observed.data(), expected, mixed_bytes) == 0;
+        if (with_injection) {
+            const auto injection_bytes = actual_injection.size() * sizeof(float);
+            std::vector<std::uint8_t> injection(injection_bytes);
+            check(hipMemcpy(injection.data(), reinterpret_cast<void*>(injection_address->address),
+                            injection_bytes, hipMemcpyDeviceToHost), "read hyper injection bits");
+            matches &= std::memcmp(injection.data(), actual_injection.data(), injection_bytes) == 0;
+        }
+        return matches;
+    };
+    // Every candidate starts from NaN poison in its entire admitted scratch and
+    // outputs. No-op or partial writes cannot inherit prior correct values.
     hipStream_t staged_stream = nullptr;
     hipGraph_t staged_graph = nullptr;
     hipGraphExec_t staged_executable = nullptr;
@@ -873,34 +903,65 @@ void run_numeric_fixture(
     staged_scope.stream = staged_stream;
     {
         strix::HipLaunchScope scope(staged_scope);
+        poison_outputs(staged_stream);
+        check(hipStreamSynchronize(staged_stream), "synchronize staged no-op control");
+        expect(!outputs_match_expected_bits(), "poisoned no-op fails staged bit comparison");
         staged_launcher.function(context, staged_launcher.user_data);
         check(hipStreamSynchronize(staged_stream), "synchronize eager staged projection");
+        expect(outputs_match_expected_bits(), "eager staged output and injection preserve baseline bits");
         check(hipStreamBeginCapture(staged_stream, hipStreamCaptureModeThreadLocal), "capture staged projection");
         staged_launcher.function(context, staged_launcher.user_data);
         check(hipStreamEndCapture(staged_stream, &staged_graph), "finish staged capture");
     }
     check(hipGraphInstantiate(&staged_executable, staged_graph, nullptr, nullptr, 0), "instantiate staged graph");
     for (unsigned replay = 0; replay < 3; ++replay) {
+        poison_outputs(staged_stream);
         check(hipGraphLaunch(staged_executable, staged_stream), "replay staged graph");
         check(hipStreamSynchronize(staged_stream), "synchronize staged graph");
-        std::vector<float> staged_mixed(actual_mixed.size());
-        check(hipMemcpy(bf16 ? static_cast<void*>(actual_bf16.data()) : staged_mixed.data(),
-                        reinterpret_cast<void*>(mixed_address.address),
-                        staged_mixed.size() * (bf16 ? sizeof(std::uint16_t) : sizeof(float)), hipMemcpyDeviceToHost),
-              "read staged output");
-        if (bf16) for (std::size_t index = 0; index < staged_mixed.size(); ++index)
-            staged_mixed[index] = std::bit_cast<float>(static_cast<std::uint32_t>(actual_bf16[index]) << 16U);
-        expect(staged_mixed == parallel_mixed, "staged output preserves parallel accumulation exactly");
-        if (with_injection) {
-            std::vector<float> staged_injection(actual_injection.size());
-            check(hipMemcpy(staged_injection.data(), reinterpret_cast<void*>(injection_address->address),
-                            staged_injection.size() * sizeof(float), hipMemcpyDeviceToHost), "read staged injection");
-            expect(staged_injection == actual_injection, "staged injection preserves parallel accumulation exactly");
-        }
+        expect(outputs_match_expected_bits(), "staged replay output and injection preserve baseline bits");
     }
     check(hipGraphExecDestroy(staged_executable), "destroy staged executable");
     check(hipGraphDestroy(staged_graph), "destroy staged graph");
     check(hipStreamDestroy(staged_stream), "destroy staged stream");
+    auto fused_config = staged_config;
+    fused_config.fused_injection = true;
+    auto fused_launcher = strix::make_hip_hyper_mix_launcher("test.hyper_mix.fused.v5", &fused_config);
+    expect(fused_launcher.implementation_identity != staged_launcher.implementation_identity,
+           "fused injection v5 has a distinct implementation revision");
+    hipStream_t fused_stream = nullptr;
+    hipGraph_t fused_graph = nullptr;
+    hipGraphExec_t fused_executable = nullptr;
+    check(hipStreamCreateWithFlags(&fused_stream, hipStreamNonBlocking), "create fused stream");
+    strix::HipLaunchContext fused_scope;
+    fused_scope.stream = fused_stream;
+    {
+        strix::HipLaunchScope scope(fused_scope);
+        poison_outputs(fused_stream);
+        check(hipStreamSynchronize(fused_stream), "synchronize fused no-op control");
+        expect(!outputs_match_expected_bits(), "poisoned no-op fails fused bit comparison");
+        fused_launcher.function(context, fused_launcher.user_data);
+        check(hipStreamSynchronize(fused_stream), "synchronize eager fused injection");
+        expect(outputs_match_expected_bits(), "eager fused output and injection preserve baseline bits");
+        check(hipStreamBeginCapture(fused_stream, hipStreamCaptureModeThreadLocal), "capture fused injection");
+        fused_launcher.function(context, fused_launcher.user_data);
+        check(hipStreamEndCapture(fused_stream, &fused_graph), "finish fused capture");
+    }
+    check(hipGraphInstantiate(&fused_executable, fused_graph, nullptr, nullptr, 0), "instantiate fused graph");
+    for (unsigned replay = 0; replay < 3; ++replay) {
+        poison_outputs(fused_stream);
+        check(hipGraphLaunch(fused_executable, fused_stream), "replay fused graph");
+        check(hipStreamSynchronize(fused_stream), "synchronize fused replay");
+        expect(outputs_match_expected_bits(), "fused replay output and injection preserve baseline bits");
+    }
+    check(hipGraphExecDestroy(fused_executable), "destroy fused executable");
+    check(hipGraphDestroy(fused_graph), "destroy fused graph");
+    check(hipStreamDestroy(fused_stream), "destroy fused stream");
+    auto invalid_fused_config = fused_config;
+    invalid_fused_config.staged_projections = false;
+    bool invalid_fused_rejected = false;
+    try { (void)strix::make_hip_hyper_mix_launcher("test.invalid.fused", &invalid_fused_config); }
+    catch (const std::invalid_argument&) { invalid_fused_rejected = true; }
+    expect(invalid_fused_rejected, "fused injection rejects a nonstaged configuration");
     auto invalid_staged_config = staged_config;
     invalid_staged_config.parallel = false;
     bool invalid_staged_rejected = false;
@@ -917,6 +978,10 @@ void run_numeric_fixture(
     try { staged_launcher.function(missing_workspace, staged_launcher.user_data); }
     catch (const std::invalid_argument&) { rejected = true; }
     expect(rejected, "staged projections reject missing admitted scratch");
+    rejected = false;
+    try { fused_launcher.function(missing_workspace, fused_launcher.user_data); }
+    catch (const std::invalid_argument&) { rejected = true; }
+    expect(rejected, "fused injection rejects missing admitted scratch");
     for (unsigned malformed = 0; malformed < 3; ++malformed) {
         auto invalid_arena = arena;
         auto invalid_context = context;
@@ -937,6 +1002,10 @@ void run_numeric_fixture(
         try { staged_launcher.function(invalid_context, staged_launcher.user_data); }
         catch (const std::invalid_argument&) { rejected = true; }
         expect(rejected, "staged projections reject wrong-class, short or unaligned scratch");
+        rejected = false;
+        try { fused_launcher.function(invalid_context, fused_launcher.user_data); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        expect(rejected, "fused injection rejects wrong-class, short or unaligned scratch");
     }
 
     for (auto* pointer :
@@ -1003,6 +1072,16 @@ void test_catalog_and_bundle() {
     expect(staged_variant.id != parallel_registry.variants().front().id &&
            staged_variant.compiler_identity != parallel_registry.variants().front().compiler_identity,
            "staged kernel and compiler identities distinguish the numerical path");
+    auto fused_config = staged_config;
+    fused_config.fused_injection = true;
+    strix::kernels::KernelRegistry fused_registry;
+    strix::register_hip_hyper_mix_kernel_variant(model, request, fused_config, fused_registry);
+    const auto& fused_variant = fused_registry.variants().front();
+    expect(fused_variant.id != staged_variant.id && fused_variant.compiler_identity != staged_variant.compiler_identity,
+           "fused injection changes kernel and compiler revision identities");
+    expect(fused_variant.resources.lds_bytes == staged_variant.resources.lds_bytes &&
+           fused_variant.resources.scratch_bytes == staged_variant.resources.scratch_bytes,
+           "fused injection retains staged LDS and admitted global workspace bounds");
 
     const auto execution =
         strix::build_serial_decode_execution_plan(

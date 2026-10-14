@@ -23,6 +23,7 @@ struct HipLauncherCatalogConfig {
     bool enable_device_graph_inputs = false;
     bool parallel_hyper_mix = false;
     bool staged_hyper_projections = false;
+    bool fused_staged_hyper_mix = false;
 };
 
 void register_complete_hip_kernel_catalog(
