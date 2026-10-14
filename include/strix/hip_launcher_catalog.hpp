@@ -24,6 +24,7 @@ struct HipLauncherCatalogConfig {
     bool parallel_hyper_mix = false;
     bool staged_hyper_projections = false;
     bool fused_staged_hyper_mix = false;
+    bool virtual_q8_lm_head = false;
 };
 
 void register_complete_hip_kernel_catalog(
