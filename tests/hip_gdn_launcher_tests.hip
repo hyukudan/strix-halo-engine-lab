@@ -122,9 +122,9 @@ strix::ModelContract fixture_model() {
     model.kv_heads = 1;
     model.head_dim = 128;
     model.mtp_full_attention_layers = 1;
-    model.gdn_key_heads = 1;
+    model.gdn_key_heads = 16;
     model.gdn_key_head_dim = 128;
-    model.gdn_value_heads = 2;
+    model.gdn_value_heads = 48;
     model.gdn_value_head_dim = 128;
     model.gdn_conv_kernel = 4;
     model.indexer_kv_heads = 1;
@@ -692,7 +692,9 @@ int main() try {
         sparse_matrix(
             hidden,
             conv_width,
-            0.0020F,
+            // Keep recurrence updates large enough that a missed broadcast
+            // is visible in state, even after the final BF16 projection.
+            0.2500F,
             5U);
     const auto z =
         sparse_matrix(
@@ -1196,12 +1198,37 @@ int main() try {
         output_error <= 3e-3F,
         "HIP GDN output matches CPU reference");
     expect(
-        matrix_error <= 5e-4F,
+        matrix_error <= 1e-7F,
         "HIP GDN recurrent matrix matches CPU reference");
     expect(
         actual_conv ==
             expected.conv_state,
         "HIP GDN convolution state matches BF16 CPU reference");
+
+    // Four waves consume each delta broadcast. Check the complete recurrence
+    // against the independent scalar equations, then repeat from identical
+    // asymmetric state: a shared-memory race must not hide behind BF16 output
+    // rounding or an absolute tolerance larger than the state update.
+    const auto first_matrix = actual_matrix;
+    const auto first_output = actual_output;
+    for (unsigned iteration = 0; iteration < 16; ++iteration) {
+        check(hipMemcpy(reinterpret_cast<void*>(matrix_address.address), matrix_state.data(),
+            matrix_address.bytes, hipMemcpyHostToDevice), "restore recurrence broadcast fixture state");
+        check(hipMemcpy(reinterpret_cast<void*>(conv_address.address), conv_state.data(),
+            conv_address.bytes, hipMemcpyHostToDevice), "restore recurrence broadcast fixture convolution");
+        launcher.function(context, launcher.user_data);
+        check(hipDeviceSynchronize(), "drain repeated recurrence broadcast fixture");
+        check(hipMemcpy(actual_matrix.data(), reinterpret_cast<const void*>(matrix_address.address),
+            matrix_address.bytes, hipMemcpyDeviceToHost), "read repeated recurrence broadcast state");
+        check(hipMemcpy(actual_output.data(), reinterpret_cast<const void*>(output.address),
+            actual_output.size() * sizeof(std::uint16_t), hipMemcpyDeviceToHost), "read repeated recurrence broadcast output");
+        expect(std::memcmp(actual_matrix.data(), first_matrix.data(), matrix_address.bytes) == 0 &&
+            actual_output == first_output, "repeated identical GDN input/state is bit deterministic");
+        float recurrence_error = 0.0F;
+        for (std::size_t i = 0; i < actual_matrix.size(); ++i)
+            recurrence_error = std::max(recurrence_error, std::fabs(actual_matrix[i] - expected.matrix_state[i]));
+        expect(recurrence_error <= 1e-7F, "all waves consume the independently computed GDN delta");
+    }
 
     // Capture the complete existing GDN operator: projections, convolution,
     // recurrence, gated normalization and final projection. No host position
@@ -1296,8 +1323,14 @@ int main() try {
             cpu = cpu_reference(model, hidden_values, qkv, z, beta, alpha, conv, dt, a, norm, out_weight, cpu.matrix_state, cpu.conv_state);
             for (unsigned i = 0; i < hidden; ++i) expect(std::isfinite(bf16_to_float(graph_output[i])) &&
                 std::fabs(bf16_to_float(graph_output[i]) - cpu.output[i]) <= 3e-3F, "repeated GDN graph independent CPU output");
-            for (std::size_t i = 0; i < current.matrix_state.size(); ++i) expect(std::isfinite(current.matrix_state[i]) &&
-                std::fabs(current.matrix_state[i] - cpu.matrix_state[i]) <= 5e-4F, "repeated GDN graph independent CPU matrix");
+            float graph_matrix_error = 0.0F;
+            bool graph_matrix_finite = true;
+            for (std::size_t i = 0; i < current.matrix_state.size(); ++i) {
+                graph_matrix_finite = graph_matrix_finite && std::isfinite(current.matrix_state[i]);
+                graph_matrix_error = std::max(graph_matrix_error, std::fabs(current.matrix_state[i] - cpu.matrix_state[i]));
+            }
+            expect(graph_matrix_finite && graph_matrix_error <= 1e-7F,
+                "repeated GDN graph independent CPU matrix");
             expect(current.conv_state == cpu.conv_state, "repeated GDN graph independent CPU convolution");
             previous = current; copy_state(previous.matrix_state, previous.conv_state);
         }

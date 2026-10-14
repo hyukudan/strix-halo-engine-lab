@@ -26,7 +26,7 @@ constexpr std::uint32_t kProjectionThreads = 256;
 constexpr std::uint32_t kRecurrentThreads = 128;
 constexpr std::uint32_t kValueTile = 32;
 constexpr std::uint64_t kLauncherTag =
-    0x47444e4c41554e31ULL;
+    0x47444e4c41554e32ULL;
 constexpr std::uint64_t fnv_offset =
     14695981039346656037ULL;
 constexpr std::uint64_t fnv_prime =
@@ -871,6 +871,10 @@ void recurrent_step_kernel(
     __shared__ float reduction[
         kRecurrentThreads *
         kValueTile];
+    // The first reduction's broadcast must remain immutable while every wave
+    // reads it. Reusing reduction[column] for the next tree lets lane zero
+    // overwrite a delta before another wave has consumed it.
+    __shared__ float deltas[kValueTile];
 
     float retained[kValueTile];
 #pragma unroll
@@ -935,7 +939,7 @@ void recurrent_step_kernel(
             const auto value_index =
                 value_base +
                 column;
-            reduction[column] =
+            deltas[column] =
                 (qkv[
                      v_base +
                      value_index] -
@@ -950,7 +954,7 @@ void recurrent_step_kernel(
          column < kValueTile;
          ++column) {
         const auto delta =
-            reduction[column];
+            deltas[column];
         retained[column] +=
             qkv[
                 k_base +
@@ -2173,7 +2177,7 @@ void register_hip_gdn_kernel_variant(
     variant.output_layout =
         "row-major";
     variant.compiler_identity =
-        "hip-gfx1151-gdn-v1";
+        "hip-gfx1151-gdn-v2";
     variant.measured_seconds = 0.0;
 
     registry.add(
