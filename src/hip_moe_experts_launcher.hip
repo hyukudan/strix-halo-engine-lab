@@ -41,9 +41,34 @@ struct IQ4NLBlock {
     std::uint8_t qs[16];
 };
 
+struct Q51Block {
+    __half d;
+    __half m;
+    std::uint8_t qh[4];
+    std::uint8_t qs[16];
+};
+
+struct Q4KBlock {
+    __half d;
+    __half dmin;
+    std::uint8_t scales[12];
+    std::uint8_t qs[128];
+};
+
+struct Q5KBlock {
+    __half d;
+    __half dmin;
+    std::uint8_t scales[12];
+    std::uint8_t qh[32];
+    std::uint8_t qs[128];
+};
+
 static_assert(sizeof(Q8Block) == 34);
 static_assert(sizeof(IQ4XSBlock) == 136);
 static_assert(sizeof(IQ4NLBlock) == 18);
+static_assert(sizeof(Q51Block) == 24);
+static_assert(sizeof(Q4KBlock) == 144);
+static_assert(sizeof(Q5KBlock) == 176);
 
 __device__ __constant__
 std::int8_t iq4_codebook[16] = {
@@ -60,6 +85,9 @@ enum class WeightKind {
     q8_0,
     iq4_nl,
     iq4_xs,
+    q5_1,
+    q4_k,
+    q5_k,
 };
 
 struct TensorPair {
@@ -133,12 +161,15 @@ WeightKind weight_kind(
     case 0: return WeightKind::f32;
     case 1: return WeightKind::f16;
     case 8: return WeightKind::q8_0;
+    case 7: return WeightKind::q5_1;
+    case 12: return WeightKind::q4_k;
+    case 13: return WeightKind::q5_k;
     case 20: return WeightKind::iq4_nl;
     case 23: return WeightKind::iq4_xs;
     case 30: return WeightKind::bf16;
     default:
         throw std::invalid_argument(
-            "HIP routed experts support F32, F16, BF16, Q8_0, IQ4_NL and IQ4_XS");
+            "HIP routed experts support F32, F16, BF16, Q8_0, IQ4_NL, IQ4_XS, Q5_1, Q4_K and Q5_K");
     }
 }
 
@@ -319,6 +350,66 @@ __device__ float load_weight<WeightKind::iq4_xs>(
                iq4_codebook[code]);
 }
 
+template <>
+__device__ float load_weight<WeightKind::q5_1>(
+    const void* weights, std::uint32_t row_width,
+    std::uint64_t row, std::uint32_t feature) {
+    const auto* blocks = static_cast<const Q51Block*>(weights);
+    const auto& block = blocks[row * (row_width / 32U) + feature / 32U];
+    const auto lane = feature % 32U;
+    const auto byte = block.qs[lane % 16U];
+    const auto low = lane < 16U ? byte & 15U : byte >> 4U;
+    const auto high = (block.qh[lane / 8U] >> (lane % 8U)) & 1U;
+    return __half2float(block.d) * static_cast<float>(low | (high << 4U)) +
+           __half2float(block.m);
+}
+
+// K-block groups carry unsigned six-bit scale and minimum factors in twelve
+// bytes. The last four groups use the high bits of the first eight bytes.
+__device__ void k_group_factors(
+    const std::uint8_t* packed, std::uint32_t group,
+    std::uint32_t& scale, std::uint32_t& minimum) {
+    if (group < 4U) {
+        scale = packed[group] & 63U;
+        minimum = packed[group + 4U] & 63U;
+    } else {
+        scale = (packed[group + 4U] & 15U) | ((packed[group - 4U] >> 6U) << 4U);
+        minimum = (packed[group + 4U] >> 4U) | ((packed[group] >> 6U) << 4U);
+    }
+}
+
+template <typename Block>
+__device__ float load_k_weight(
+    const Block* blocks, std::uint32_t row_width,
+    std::uint64_t row, std::uint32_t feature) {
+    const auto& block = blocks[row * (row_width / 256U) + feature / 256U];
+    const auto lane = feature % 256U;
+    const auto group = lane / 32U;
+    const auto byte = block.qs[(group / 2U) * 32U + lane % 32U];
+    auto code = group % 2U == 0U ? byte & 15U : byte >> 4U;
+    if constexpr (sizeof(Block) == sizeof(Q5KBlock)) {
+        code |= ((block.qh[lane % 32U] >> group) & 1U) << 4U;
+    }
+    std::uint32_t scale = 0, minimum = 0;
+    k_group_factors(block.scales, group, scale, minimum);
+    return (__half2float(block.d) * static_cast<float>(scale)) * static_cast<float>(code) -
+           __half2float(block.dmin) * static_cast<float>(minimum);
+}
+
+template <>
+__device__ float load_weight<WeightKind::q4_k>(
+    const void* weights, std::uint32_t row_width,
+    std::uint64_t row, std::uint32_t feature) {
+    return load_k_weight(static_cast<const Q4KBlock*>(weights), row_width, row, feature);
+}
+
+template <>
+__device__ float load_weight<WeightKind::q5_k>(
+    const void* weights, std::uint32_t row_width,
+    std::uint64_t row, std::uint32_t feature) {
+    return load_k_weight(static_cast<const Q5KBlock*>(weights), row_width, row, feature);
+}
+
 std::uint64_t required_weight_bytes(
     WeightKind kind,
     std::uint32_t input,
@@ -361,6 +452,20 @@ std::uint64_t required_weight_bytes(
                 "IQ4_NL routed-expert input width must be divisible by 32");
         }
         row_bytes = static_cast<std::uint64_t>(input / 32U) * sizeof(IQ4NLBlock);
+        break;
+    case WeightKind::q5_1:
+        if (input % 32U != 0) {
+            throw std::invalid_argument("Q5_1 routed-expert input width must be divisible by 32");
+        }
+        row_bytes = static_cast<std::uint64_t>(input / 32U) * sizeof(Q51Block);
+        break;
+    case WeightKind::q4_k:
+    case WeightKind::q5_k:
+        if (input % 256U != 0) {
+            throw std::invalid_argument("K-quant routed-expert input width must be divisible by 256");
+        }
+        row_bytes = static_cast<std::uint64_t>(input / 256U) *
+            (kind == WeightKind::q4_k ? sizeof(Q4KBlock) : sizeof(Q5KBlock));
         break;
     }
     return row_bytes *
@@ -712,6 +817,9 @@ void launch_projection_by_kind(
     case WeightKind::q8_0: STRIX_PROJECT_CASE(q8_0); break;
     case WeightKind::iq4_nl: STRIX_PROJECT_CASE(iq4_nl); break;
     case WeightKind::iq4_xs: STRIX_PROJECT_CASE(iq4_xs); break;
+    case WeightKind::q5_1: STRIX_PROJECT_CASE(q5_1); break;
+    case WeightKind::q4_k: STRIX_PROJECT_CASE(q4_k); break;
+    case WeightKind::q5_k: STRIX_PROJECT_CASE(q5_k); break;
     }
 #undef STRIX_PROJECT_CASE
     check_hip(
@@ -739,6 +847,9 @@ void launch_down_by_kind(
     case WeightKind::q8_0: STRIX_DOWN_CASE(q8_0); break;
     case WeightKind::iq4_nl: STRIX_DOWN_CASE(iq4_nl); break;
     case WeightKind::iq4_xs: STRIX_DOWN_CASE(iq4_xs); break;
+    case WeightKind::q5_1: STRIX_DOWN_CASE(q5_1); break;
+    case WeightKind::q4_k: STRIX_DOWN_CASE(q4_k); break;
+    case WeightKind::q5_k: STRIX_DOWN_CASE(q5_k); break;
     }
 #undef STRIX_DOWN_CASE
     check_hip(
