@@ -5,6 +5,7 @@
 #include "strix/execution_resources.hpp"
 #include "strix/execution_tensor_access.hpp"
 #include "strix/hip_hyper_mix_launcher.hpp"
+#include "strix/hip_launch_context.hpp"
 #include "strix/model_contract.hpp"
 #include "strix/model_manifest.hpp"
 #include "strix/model_runtime_binding.hpp"
@@ -334,6 +335,9 @@ ReferenceResult reference(
 }
 
 struct Fixture {
+    static constexpr std::uint32_t down_type = 23;
+    static constexpr std::uint32_t up_type = 8;
+    static constexpr std::uint32_t inject_type = 23;
     static constexpr std::uint32_t hidden = 64;
     static constexpr std::uint32_t hc = 4;
     static constexpr std::uint32_t lowrank = 32;
@@ -380,9 +384,83 @@ struct Fixture {
     }
 };
 
+// Dense geometry deliberately crosses both feature-tile and output-tile
+// boundaries without quantized block alignment masking the tail conditions.
+struct DenseTailFixture {
+    static constexpr std::uint32_t hidden = 67;
+    static constexpr std::uint32_t hc = 3;
+    static constexpr std::uint32_t lowrank = 139;
+    static constexpr std::uint32_t expanded = hidden * hc;
+    static constexpr std::uint32_t down_type = 0;
+    static constexpr std::uint32_t up_type = 0;
+    static constexpr std::uint32_t inject_type = 0;
+    std::vector<float> input, norm, down, up, inject;
+    DenseTailFixture() : input(expanded), norm(expanded), down(expanded * lowrank),
+        up(lowrank * expanded), inject(expanded * hc) {
+        for (std::size_t index = 0; index < input.size(); ++index) {
+            input[index] = static_cast<float>(static_cast<int>(index % 29U) - 14) / 19.0F;
+            norm[index] = static_cast<float>(static_cast<int>(index % 13U) - 6) / 23.0F;
+        }
+        for (auto* weights : {&down, &up, &inject})
+            for (std::size_t index = 0; index < weights->size(); ++index)
+                (*weights)[index] = static_cast<float>(static_cast<int>((index * 7U + index / 11U) % 31U) - 15) / 997.0F;
+    }
+};
+
+ReferenceResult reference(const std::vector<float>& input, const std::vector<float>& norm,
+    const std::vector<float>& down, const std::vector<float>& up, const std::vector<float>& inject,
+    std::uint32_t hidden, std::uint32_t hc, std::uint32_t lowrank, float epsilon, bool with_injection) {
+    const auto width = hidden * hc;
+    std::vector<float> normalized(width), low(lowrank);
+    for (std::uint32_t stream = 0; stream < hc; ++stream) {
+        double square_sum = 0.0;
+        for (std::uint32_t feature = 0; feature < hidden; ++feature) {
+            const double value = input[stream * hidden + feature];
+            square_sum += value * value;
+        }
+        const double inverse = 1.0 / std::sqrt(square_sum / hidden + epsilon);
+        for (std::uint32_t feature = 0; feature < hidden; ++feature) {
+            const auto index = stream * hidden + feature;
+            normalized[index] = static_cast<float>(input[index] * inverse * (1.0 + norm[index]));
+        }
+    }
+    for (std::uint32_t out = 0; out < lowrank; ++out) {
+        double sum = 0.0;
+        for (std::uint32_t feature = 0; feature < width; ++feature)
+            sum += static_cast<double>(normalized[feature]) * down[out * width + feature];
+        const float scaled = static_cast<float>(sum / hc);
+        low[out] = scaled * sigmoid(scaled);
+    }
+    ReferenceResult result;
+    result.mixed.resize(hidden);
+    for (std::uint32_t feature = 0; feature < hidden; ++feature) {
+        double mixed = 0.0;
+        for (std::uint32_t stream = 0; stream < hc; ++stream) {
+            const auto index = stream * hidden + feature;
+            double gate = 0.0;
+            for (std::uint32_t inner = 0; inner < lowrank; ++inner)
+                gate += static_cast<double>(low[inner]) * up[index * lowrank + inner];
+            mixed += normalized[index] * sigmoid(static_cast<float>(gate));
+        }
+        result.mixed[feature] = static_cast<float>(mixed / hc);
+    }
+    if (with_injection) {
+        result.injection.resize(hc);
+        for (std::uint32_t stream = 0; stream < hc; ++stream) {
+            double sum = 0.0;
+            for (std::uint32_t feature = 0; feature < width; ++feature)
+                sum += static_cast<double>(normalized[feature]) * inject[stream * width + feature];
+            result.injection[stream] = 2.0F * sigmoid(static_cast<float>(sum / hc));
+        }
+    }
+    return result;
+}
+
+template <typename FixtureType = Fixture>
 void run_numeric_fixture(
     strix::SerialOp op,
     bool with_injection, bool bf16 = false) {
+    using Fixture = FixtureType;
     const auto model =
         strix::ModelContract::
             qwen38_flash_next();
@@ -524,37 +602,37 @@ void run_numeric_fixture(
         with_injection
             ? "blk.0.hc_attn_down.weight"
             : "output_hc_down.weight",
-        23,
+        Fixture::down_type,
         {
             Fixture::expanded,
             Fixture::lowrank,
         },
         strix::TensorRole::dense_projection,
         fixture.down.size() *
-            sizeof(IQ4XSBlock));
+            sizeof(typename decltype(fixture.down)::value_type));
     add_manifest(
         with_injection
             ? "blk.0.hc_attn_up.weight"
             : "output_hc_up.weight",
-        8,
+        Fixture::up_type,
         {
             Fixture::lowrank,
             Fixture::expanded,
         },
         strix::TensorRole::dense_projection,
         fixture.up.size() *
-            sizeof(Q8Block));
+            sizeof(typename decltype(fixture.up)::value_type));
     if (with_injection) {
         add_manifest(
             "blk.0.hc_attn_inject.weight",
-            23,
+            Fixture::inject_type,
             {
                 Fixture::expanded,
                 Fixture::hc,
             },
             strix::TensorRole::dense_projection,
             fixture.inject.size() *
-                sizeof(IQ4XSBlock));
+                sizeof(typename decltype(fixture.inject)::value_type));
     }
 
     manifest.layout_identity =
@@ -778,12 +856,88 @@ void run_numeric_fixture(
                         parallel_injection.size() * sizeof(float), hipMemcpyDeviceToHost), "read parallel injection");
         expect(parallel_injection == actual_injection, "parallel injection preserves legacy accumulation results");
     }
+    auto staged_config = parallel_config;
+    staged_config.staged_projections = true;
+    auto staged_launcher = strix::make_hip_hyper_mix_launcher("test.hyper_mix.staged", &staged_config);
+    expect(staged_launcher.implementation_identity != parallel_launcher.implementation_identity,
+           "staged projections have a distinct implementation identity");
+    // The existing IQ4_XS/Q8_0 fixture exercises a partial injection-output
+    // tile and a 32-element inner projection tail under both activation types.
+    // Replay a captured launch as well as eager dispatch against the same
+    // independent CPU oracle and the exact parallel-path outputs.
+    hipStream_t staged_stream = nullptr;
+    hipGraph_t staged_graph = nullptr;
+    hipGraphExec_t staged_executable = nullptr;
+    check(hipStreamCreateWithFlags(&staged_stream, hipStreamNonBlocking), "create staged stream");
+    strix::HipLaunchContext staged_scope;
+    staged_scope.stream = staged_stream;
+    {
+        strix::HipLaunchScope scope(staged_scope);
+        staged_launcher.function(context, staged_launcher.user_data);
+        check(hipStreamSynchronize(staged_stream), "synchronize eager staged projection");
+        check(hipStreamBeginCapture(staged_stream, hipStreamCaptureModeThreadLocal), "capture staged projection");
+        staged_launcher.function(context, staged_launcher.user_data);
+        check(hipStreamEndCapture(staged_stream, &staged_graph), "finish staged capture");
+    }
+    check(hipGraphInstantiate(&staged_executable, staged_graph, nullptr, nullptr, 0), "instantiate staged graph");
+    for (unsigned replay = 0; replay < 3; ++replay) {
+        check(hipGraphLaunch(staged_executable, staged_stream), "replay staged graph");
+        check(hipStreamSynchronize(staged_stream), "synchronize staged graph");
+        std::vector<float> staged_mixed(actual_mixed.size());
+        check(hipMemcpy(bf16 ? static_cast<void*>(actual_bf16.data()) : staged_mixed.data(),
+                        reinterpret_cast<void*>(mixed_address.address),
+                        staged_mixed.size() * (bf16 ? sizeof(std::uint16_t) : sizeof(float)), hipMemcpyDeviceToHost),
+              "read staged output");
+        if (bf16) for (std::size_t index = 0; index < staged_mixed.size(); ++index)
+            staged_mixed[index] = std::bit_cast<float>(static_cast<std::uint32_t>(actual_bf16[index]) << 16U);
+        expect(staged_mixed == parallel_mixed, "staged output preserves parallel accumulation exactly");
+        if (with_injection) {
+            std::vector<float> staged_injection(actual_injection.size());
+            check(hipMemcpy(staged_injection.data(), reinterpret_cast<void*>(injection_address->address),
+                            staged_injection.size() * sizeof(float), hipMemcpyDeviceToHost), "read staged injection");
+            expect(staged_injection == actual_injection, "staged injection preserves parallel accumulation exactly");
+        }
+    }
+    check(hipGraphExecDestroy(staged_executable), "destroy staged executable");
+    check(hipGraphDestroy(staged_graph), "destroy staged graph");
+    check(hipStreamDestroy(staged_stream), "destroy staged stream");
+    auto invalid_staged_config = staged_config;
+    invalid_staged_config.parallel = false;
+    bool invalid_staged_rejected = false;
+    try { (void)strix::make_hip_hyper_mix_launcher("test.invalid.staged", &invalid_staged_config); }
+    catch (const std::invalid_argument&) { invalid_staged_rejected = true; }
+    expect(invalid_staged_rejected, "staged projections reject a nonparallel configuration");
     auto missing_workspace = context;
     missing_workspace.temporaries = {};
     bool rejected = false;
     try { parallel_launcher.function(missing_workspace, parallel_launcher.user_data); }
     catch (const std::invalid_argument&) { rejected = true; }
     expect(rejected, "parallel hyper-mix rejects missing admitted scratch");
+    rejected = false;
+    try { staged_launcher.function(missing_workspace, staged_launcher.user_data); }
+    catch (const std::invalid_argument&) { rejected = true; }
+    expect(rejected, "staged projections reject missing admitted scratch");
+    for (unsigned malformed = 0; malformed < 3; ++malformed) {
+        auto invalid_arena = arena;
+        auto invalid_context = context;
+        auto invalid_temporaries = step_io.temporaries;
+        const auto original_use = invalid_temporaries.front();
+        if (malformed == 0)
+            invalid_temporaries.front().buffer.buffer_class = strix::ExecutionBufferClass::hidden;
+        for (auto& allocation : invalid_arena.allocations) {
+            if (allocation.use != original_use) continue;
+            allocation.use = invalid_temporaries.front();
+            if (malformed == 1) allocation.bytes =
+                (static_cast<std::uint64_t>(Fixture::expanded) + Fixture::lowrank) * sizeof(float) - 1U;
+            if (malformed == 2) ++allocation.offset;
+        }
+        invalid_context.arena = &invalid_arena;
+        invalid_context.temporaries = invalid_temporaries;
+        rejected = false;
+        try { staged_launcher.function(invalid_context, staged_launcher.user_data); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        expect(rejected, "staged projections reject wrong-class, short or unaligned scratch");
+    }
 
     for (auto* pointer :
          device_weights) {
@@ -830,6 +984,25 @@ void test_catalog_and_bundle() {
         request,
         config,
         registry);
+    auto staged_config = config;
+    staged_config.parallel = true;
+    strix::kernels::KernelRegistry parallel_registry;
+    strix::register_hip_hyper_mix_kernel_variant(model, request, staged_config, parallel_registry);
+    expect(parallel_registry.variants().front().resources.lds_bytes >= (256U + 1U) * sizeof(float),
+           "parallel LDS declaration includes reduction and shared inverse");
+    staged_config.staged_projections = true;
+    strix::kernels::KernelRegistry staged_registry;
+    strix::register_hip_hyper_mix_kernel_variant(model, request, staged_config, staged_registry);
+    const auto& staged_variant = staged_registry.variants().front();
+    expect(staged_variant.resources.lds_bytes >= (128U + 8U * 129U) * sizeof(float) &&
+           staged_variant.resources.lds_bytes >= (256U + 1U) * sizeof(float),
+           "staged LDS declaration covers projection tiles and normalization");
+    expect(staged_variant.resources.scratch_bytes ==
+           (model.hidden_size * model.hc_count + model.hc_lowrank) * sizeof(float),
+           "staged projections preserve admitted workspace size");
+    expect(staged_variant.id != parallel_registry.variants().front().id &&
+           staged_variant.compiler_identity != parallel_registry.variants().front().compiler_identity,
+           "staged kernel and compiler identities distinguish the numerical path");
 
     const auto execution =
         strix::build_serial_decode_execution_plan(
@@ -898,6 +1071,10 @@ int main() try {
     run_numeric_fixture(strix::SerialOp::attn_hyper_mix, true, true);
     run_numeric_fixture(strix::SerialOp::mlp_hyper_mix, true, true);
     run_numeric_fixture(strix::SerialOp::final_hyper_mix, false, true);
+    run_numeric_fixture<DenseTailFixture>(strix::SerialOp::attn_hyper_mix, true);
+    run_numeric_fixture<DenseTailFixture>(strix::SerialOp::final_hyper_mix, false);
+    run_numeric_fixture<DenseTailFixture>(strix::SerialOp::attn_hyper_mix, true, true);
+    run_numeric_fixture<DenseTailFixture>(strix::SerialOp::final_hyper_mix, false, true);
 
     if (failures == 0) {
         std::cout

@@ -86,7 +86,7 @@ embedding_config(
 HipHyperMixLauncherConfig
 hyper_mix_config(
     const ModelContract& model,
-    HipActivationStorage activation, bool parallel) {
+    HipActivationStorage activation, bool parallel, bool staged) {
     HipHyperMixLauncherConfig config;
     config.hidden_size =
         checked_u32(
@@ -106,6 +106,7 @@ hyper_mix_config(
     config.activation =
         activation;
     config.parallel = parallel;
+    config.staged_projections = staged;
     return config;
 }
 
@@ -293,7 +294,7 @@ void register_complete_hip_kernel_catalog(
     const auto hyper_mix =
         hyper_mix_config(
             model,
-            config.activation, config.parallel_hyper_mix);
+            config.activation, config.parallel_hyper_mix, config.staged_hyper_projections);
     register_hip_hyper_mix_kernel_variant(
         model,
         request,
@@ -377,7 +378,7 @@ HipLauncherCatalog::HipLauncherCatalog(
       hyper_mix_(
           hyper_mix_config(
               model,
-              config.activation, config.parallel_hyper_mix)),
+              config.activation, config.parallel_hyper_mix, config.staged_hyper_projections)),
       moe_route_(
           moe_route_config(
               model,

@@ -25,6 +25,9 @@ namespace {
 constexpr std::uint32_t kThreads = 256;
 constexpr std::uint32_t kMaxHc = 8;
 constexpr std::uint32_t kMaxLowrank = 512;
+constexpr std::uint32_t kStagedThreads = 128;
+constexpr std::uint32_t kStagedOutputs = 8;
+constexpr std::uint32_t kStagedPitch = kStagedThreads + 1;
 constexpr std::uint64_t kLauncherTag =
     0x48595045524d4959ULL;
 constexpr std::uint64_t fnv_offset =
@@ -92,6 +95,8 @@ const char* storage_name(
 
 void validate_config(
     const HipHyperMixLauncherConfig& config) {
+    if (config.staged_projections && !config.parallel)
+        throw std::invalid_argument("staged hyper projections require parallel hyper-mix");
     if (config.hidden_size == 0 ||
         config.hc_count <= 1 ||
         config.hc_count > kMaxHc ||
@@ -681,6 +686,87 @@ __global__ void parallel_hyper_output_kernel(
                      mixed / static_cast<float>(streams));
 }
 
+// Loader lanes fetch contiguous features of each coefficient row. Only the
+// first eight lanes own accumulation chains; neither the feature order nor
+// contraction expression changes. Padding avoids adjacent row bank aliasing.
+// Every lane participates in both barriers, including partial output tiles.
+template <bool Injection>
+__global__ void staged_hyper_projection_kernel(
+    const float* normalized, const void* weights, std::uint32_t kind,
+    std::uint32_t width, std::uint32_t streams, std::uint32_t outputs, float* output) {
+    __shared__ float values[kStagedThreads];
+    __shared__ float coefficients[kStagedOutputs][kStagedPitch];
+    const auto lane = threadIdx.x;
+    const auto first_output = blockIdx.x * kStagedOutputs;
+    const auto row = blockIdx.y;
+    const auto chain = first_output + lane;
+    const bool active = lane < kStagedOutputs && chain < outputs;
+    float sum = 0.0F;
+    for (std::uint32_t tile = 0; tile < width; tile += kStagedThreads) {
+        const auto remaining = width - tile;
+        const auto count = remaining < kStagedThreads ? remaining : kStagedThreads;
+        if (lane < count) {
+            values[lane] = normalized[static_cast<std::uint64_t>(row) * width + tile + lane];
+            for (std::uint32_t local = 0; local < kStagedOutputs; ++local) {
+                if (first_output + local < outputs)
+                    coefficients[local][lane] = load_linear_weight(
+                        weights, kind, width, first_output + local, tile + lane);
+            }
+        }
+        __syncthreads();
+        if (active)
+            for (std::uint32_t inner = 0; inner < count; ++inner)
+                sum += values[inner] * coefficients[lane][inner];
+        // Consumers in other waves must finish before any loader refills LDS.
+        __syncthreads();
+    }
+    if (active) {
+        const float scaled = sum / static_cast<float>(streams);
+        output[static_cast<std::uint64_t>(row) * outputs + chain] =
+            Injection ? 2.0F * sigmoid(scaled) : scaled * sigmoid(scaled);
+    }
+}
+
+template <typename Storage>
+__global__ void staged_hyper_output_kernel(
+    const float* normalized, const float* low, const void* up, std::uint32_t kind,
+    std::uint32_t hidden, std::uint32_t streams, std::uint32_t lowrank, Storage* output) {
+    __shared__ float values[kStagedThreads];
+    __shared__ float coefficients[kStagedOutputs][kStagedPitch];
+    const auto lane = threadIdx.x;
+    const auto first_feature = blockIdx.x * kStagedOutputs;
+    const auto feature = first_feature + lane;
+    const auto row = blockIdx.y;
+    const bool active = lane < kStagedOutputs && feature < hidden;
+    const auto width = hidden * streams;
+    float mixed = 0.0F;
+    for (std::uint32_t stream = 0; stream < streams; ++stream) {
+        float gate = 0.0F;
+        for (std::uint32_t tile = 0; tile < lowrank; tile += kStagedThreads) {
+            const auto remaining = lowrank - tile;
+            const auto count = remaining < kStagedThreads ? remaining : kStagedThreads;
+            if (lane < count) {
+                values[lane] = low[static_cast<std::uint64_t>(row) * lowrank + tile + lane];
+                for (std::uint32_t local = 0; local < kStagedOutputs; ++local) {
+                    if (first_feature + local < hidden)
+                        coefficients[local][lane] = load_linear_weight(
+                            up, kind, lowrank, stream * hidden + first_feature + local, tile + lane);
+                }
+            }
+            __syncthreads();
+            if (active)
+                for (std::uint32_t inner = 0; inner < count; ++inner)
+                    gate += values[inner] * coefficients[lane][inner];
+            __syncthreads();
+        }
+        if (active)
+            mixed += normalized[static_cast<std::uint64_t>(row) * width + stream * hidden + feature] * sigmoid(gate);
+    }
+    if (active)
+        store_activation(&output[static_cast<std::uint64_t>(row) * hidden + feature],
+                         mixed / static_cast<float>(streams));
+}
+
 bool supported_norm_type(
     std::uint32_t ggml_type) noexcept {
     return ggml_type == 0 ||
@@ -830,6 +916,30 @@ void launch_typed(
             reinterpret_cast<const Storage*>(input.address), reinterpret_cast<const void*>(norm_runtime.address),
             norm_manifest.ggml_type, config.hidden_size, config.hc_count, config.rms_epsilon, normalized);
         check_hip(hipGetLastError(), "parallel hyper-mix normalization launch");
+        if (config.staged_projections) {
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(staged_hyper_projection_kernel<false>),
+                dim3((config.lowrank + kStagedOutputs - 1U) / kStagedOutputs, context.logical_rows),
+                dim3(kStagedThreads), 0, hip_execution_stream(), normalized,
+                reinterpret_cast<const void*>(down_runtime.address), down_manifest.ggml_type,
+                static_cast<std::uint32_t>(width), config.hc_count, config.lowrank, low);
+            check_hip(hipGetLastError(), "staged hyper-mix lowrank launch");
+            if (injection_output) {
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(staged_hyper_projection_kernel<true>),
+                    dim3((config.hc_count + kStagedOutputs - 1U) / kStagedOutputs, context.logical_rows),
+                    dim3(kStagedThreads), 0, hip_execution_stream(), normalized,
+                    reinterpret_cast<const void*>(inject_runtime->address), inject_manifest->ggml_type,
+                    static_cast<std::uint32_t>(width), config.hc_count, config.hc_count,
+                    reinterpret_cast<float*>(injection_output->address));
+                check_hip(hipGetLastError(), "staged hyper-mix injection launch");
+            }
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(staged_hyper_output_kernel<Storage>),
+                dim3((config.hidden_size + kStagedOutputs - 1U) / kStagedOutputs, context.logical_rows),
+                dim3(kStagedThreads), 0, hip_execution_stream(), normalized, low,
+                reinterpret_cast<const void*>(up_runtime.address), up_manifest.ggml_type,
+                config.hidden_size, config.hc_count, config.lowrank, reinterpret_cast<Storage*>(output.address));
+            check_hip(hipGetLastError(), "staged hyper-mix output launch");
+            return;
+        }
         hipLaunchKernelGGL(parallel_hyper_lowrank_kernel,
             dim3((config.lowrank + projection_threads - 1U) / projection_threads, context.logical_rows),
             dim3(projection_threads), 0, hip_execution_stream(), normalized,
@@ -1173,7 +1283,8 @@ std::string kernel_id(
             request.logical_rows) +
         ".c" +
         std::to_string(
-            request.request_concurrency) + (config.parallel ? ".parallel" : "");
+            request.request_concurrency) + (config.parallel ? ".parallel" : "") +
+        (config.staged_projections ? ".staged" : "");
 }
 
 std::uint64_t implementation_identity(
@@ -1197,6 +1308,7 @@ std::uint64_t implementation_identity(
         sizeof(epsilon_bits));
     hash_u64(hash, epsilon_bits);
     hash_u64(hash, config.parallel ? 1U : 0U);
+    if (config.staged_projections) hash_u64(hash, 0x535441474544ULL);
     return hash;
 }
 
@@ -1264,7 +1376,11 @@ void register_hip_hyper_mix_kernel_variant(
          kMaxLowrank) *
         sizeof(float);
     if (config.parallel) {
-        variant.resources.lds_bytes = kThreads * sizeof(float);
+        // Conservative 256-byte-rounded declarations include the shared
+        // normalization inverse as well as the reduction array.
+        variant.resources.lds_bytes = ((kThreads + 1U) * sizeof(float) + 255U) & ~255ULL;
+        if (config.staged_projections)
+            variant.resources.lds_bytes = ((kStagedThreads + kStagedOutputs * kStagedPitch) * sizeof(float) + 255U) & ~255ULL;
         variant.resources.scratch_bytes = static_cast<std::uint64_t>(request.logical_rows) *
             (static_cast<std::uint64_t>(config.hidden_size) * config.hc_count + config.lowrank) * sizeof(float);
     }
@@ -1286,6 +1402,7 @@ void register_hip_hyper_mix_kernel_variant(
     variant.output_layout =
         "row-major+fp32-injection";
     variant.compiler_identity =
+        config.staged_projections ? "hip-gfx1151-hyper-mix-v4-staged" :
         config.parallel ? "hip-gfx1151-hyper-mix-v3-parallel" : "hip-gfx1151-hyper-mix-v2";
     variant.measured_seconds = 0.0;
 

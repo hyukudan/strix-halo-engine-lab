@@ -22,6 +22,7 @@ struct HipLauncherCatalogConfig {
         HipActivationStorage::bf16;
     bool enable_device_graph_inputs = false;
     bool parallel_hyper_mix = false;
+    bool staged_hyper_projections = false;
 };
 
 void register_complete_hip_kernel_catalog(
