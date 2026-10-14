@@ -18,7 +18,7 @@ namespace {
 
 constexpr std::uint32_t kThreads = 256;
 constexpr std::uint64_t kLauncherTag =
-    0x4d4f454558505254ULL;
+    0x4d4f454558505255ULL;
 constexpr std::uint64_t fnv_offset =
     14695981039346656037ULL;
 constexpr std::uint64_t fnv_prime =
@@ -373,8 +373,8 @@ __device__ void k_group_factors(
         scale = packed[group] & 63U;
         minimum = packed[group + 4U] & 63U;
     } else {
-        scale = (packed[group + 4U] & 15U) | ((packed[group - 4U] >> 6U) << 4U);
-        minimum = (packed[group + 4U] >> 4U) | ((packed[group] >> 6U) << 4U);
+        scale = (packed[group + 4U] & 15U) | ((static_cast<std::uint32_t>(packed[group - 4U]) >> 6U) << 4U);
+        minimum = (static_cast<std::uint32_t>(packed[group + 4U]) >> 4U) | ((static_cast<std::uint32_t>(packed[group]) >> 6U) << 4U);
     }
 }
 
@@ -484,7 +484,8 @@ __global__ void selected_projection_kernel(
     std::uint32_t input_width,
     std::uint32_t output_width,
     std::uint32_t expert_count,
-    float* output) {
+    float* output, const std::uint32_t* status) {
+    if (*status != 0U) return;
     const auto out =
         static_cast<std::uint32_t>(
             blockIdx.x);
@@ -542,7 +543,8 @@ __global__ void selected_projection_kernel(
 
 __global__ void routed_activation_kernel(
     float* workspace,
-    std::uint32_t intermediate_size) {
+    std::uint32_t intermediate_size, const std::uint32_t* status) {
+    if (*status != 0U) return;
     const auto index =
         static_cast<std::uint32_t>(
             blockIdx.x) *
@@ -563,6 +565,27 @@ __global__ void routed_activation_kernel(
         up;
 }
 
+__global__ void validate_routes_kernel(
+    const std::uint32_t* routes, const float* weights,
+    std::uint32_t count, std::uint32_t experts,
+    std::uint32_t* status, std::uint32_t* graph_status) {
+    for (std::uint32_t slot = threadIdx.x; slot < count; slot += blockDim.x) {
+        if (routes[slot] >= experts || !isfinite(weights[slot])) {
+            atomicOr(status, 1U);
+            if (graph_status) atomicOr(graph_status, 16U);
+        }
+    }
+}
+
+template <typename Storage>
+__global__ void commit_experts_kernel(
+    const float* accumulation, Storage* output,
+    std::uint32_t count, const std::uint32_t* status) {
+    if (*status != 0U) return;
+    const auto index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < count) store_activation(&output[index], accumulation[index]);
+}
+
 template <
     typename Output,
     WeightKind Kind>
@@ -575,7 +598,8 @@ __global__ void selected_down_accumulate_kernel(
     std::uint32_t intermediate_size,
     std::uint32_t hidden_size,
     std::uint32_t expert_count,
-    Output* output) {
+    Output* output, const std::uint32_t* status) {
+    if (*status != 0U) return;
     const auto out =
         static_cast<std::uint32_t>(
             blockIdx.x);
@@ -808,8 +832,8 @@ void launch_projection_by_kind(
     std::uint32_t input_width,
     std::uint32_t output_width,
     std::uint32_t experts,
-    float* output) {
-#define STRIX_PROJECT_CASE(kind_name)     hipLaunchKernelGGL(         HIP_KERNEL_NAME(             selected_projection_kernel<                 Input, WeightKind::kind_name>),         dim3(output_width), dim3(kThreads), 0, hip_execution_stream(),         input, routes, slot,         reinterpret_cast<const void*>(weights.address),         input_width, output_width, experts, output)
+    float* output, const std::uint32_t* status) {
+#define STRIX_PROJECT_CASE(kind_name)     hipLaunchKernelGGL(         HIP_KERNEL_NAME(             selected_projection_kernel<                 Input, WeightKind::kind_name>),         dim3(output_width), dim3(kThreads), 0, hip_execution_stream(),         input, routes, slot,         reinterpret_cast<const void*>(weights.address),         input_width, output_width, experts, output, status)
     switch (kind) {
     case WeightKind::f32: STRIX_PROJECT_CASE(f32); break;
     case WeightKind::f16: STRIX_PROJECT_CASE(f16); break;
@@ -838,8 +862,8 @@ void launch_down_by_kind(
     std::uint32_t intermediate_size,
     std::uint32_t hidden_size,
     std::uint32_t experts,
-    Output* output) {
-#define STRIX_DOWN_CASE(kind_name)     hipLaunchKernelGGL(         HIP_KERNEL_NAME(             selected_down_accumulate_kernel<                 Output, WeightKind::kind_name>),         dim3(hidden_size), dim3(kThreads), 0, hip_execution_stream(),         intermediate, routes, route_weights, slot,         reinterpret_cast<const void*>(weights.address),         intermediate_size, hidden_size, experts, output)
+    Output* output, const std::uint32_t* status) {
+#define STRIX_DOWN_CASE(kind_name)     hipLaunchKernelGGL(         HIP_KERNEL_NAME(             selected_down_accumulate_kernel<                 Output, WeightKind::kind_name>),         dim3(hidden_size), dim3(kThreads), 0, hip_execution_stream(),         intermediate, routes, route_weights, slot,         reinterpret_cast<const void*>(weights.address),         intermediate_size, hidden_size, experts, output, status)
     switch (kind) {
     case WeightKind::f32: STRIX_DOWN_CASE(f32); break;
     case WeightKind::f16: STRIX_DOWN_CASE(f16); break;
@@ -878,15 +902,20 @@ void launch_typed(
     auto* workspace =
         reinterpret_cast<float*>(
             temporary.address);
+    auto* accumulation = workspace + 2ULL * config.intermediate_size;
+    auto* status = reinterpret_cast<std::uint32_t*>(accumulation + config.hidden_size);
 
     check_hip(
         hipMemsetAsync(
-            reinterpret_cast<void*>(
-                output.address),
+            accumulation,
             0,
-            static_cast<std::size_t>(
-                output.bytes), hip_execution_stream()),
-        "clear routed-expert output");
+            static_cast<std::size_t>(config.hidden_size) * sizeof(float) + sizeof(std::uint32_t),
+            hip_execution_stream()),
+        "clear routed-expert FP32 accumulation and status");
+    hipLaunchKernelGGL(validate_routes_kernel, dim3(1), dim3(kThreads), 0,
+        hip_execution_stream(), routes, weights, config.top_k,
+        config.expert_count, status, hip_graph_status());
+    check_hip(hipGetLastError(), "validate routed-expert routes");
 
     for (std::uint32_t slot = 0;
          slot < config.top_k;
@@ -904,7 +933,7 @@ void launch_typed(
                 2U *
                     config.intermediate_size,
                 config.expert_count,
-                workspace);
+                workspace, status);
         } else {
             launch_projection_by_kind(
                 weight_kind(
@@ -917,7 +946,7 @@ void launch_typed(
                 config.hidden_size,
                 config.intermediate_size,
                 config.expert_count,
-                workspace);
+                workspace, status);
             launch_projection_by_kind(
                 weight_kind(
                     tensors.up.
@@ -930,7 +959,7 @@ void launch_typed(
                 config.intermediate_size,
                 config.expert_count,
                 workspace +
-                    config.intermediate_size);
+                    config.intermediate_size, status);
         }
 
         const auto blocks =
@@ -943,7 +972,7 @@ void launch_typed(
             dim3(kThreads),
             0, hip_execution_stream(),
             workspace,
-            config.intermediate_size);
+            config.intermediate_size, status);
         check_hip(
             hipGetLastError(),
             "HIP routed-expert activation launch");
@@ -960,8 +989,21 @@ void launch_typed(
             config.intermediate_size,
             config.hidden_size,
             config.expert_count,
-            reinterpret_cast<Storage*>(
-                output.address));
+            accumulation, status);
+    }
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(commit_experts_kernel<Storage>),
+        dim3((config.hidden_size + kThreads - 1U) / kThreads), dim3(kThreads),
+        0, hip_execution_stream(), accumulation,
+        reinterpret_cast<Storage*>(output.address), config.hidden_size, status);
+    check_hip(hipGetLastError(), "commit routed-expert output");
+    // Graph replay consumes the existing aggregate status at its completion
+    // boundary. Eager C1 retains scratch until this stream has drained.
+    if (hip_graph_status() == nullptr) {
+        std::uint32_t host_status = 0;
+        check_hip(hipMemcpyAsync(&host_status, status, sizeof(host_status),
+            hipMemcpyDeviceToHost, hip_execution_stream()), "read routed-expert status");
+        check_hip(hipStreamSynchronize(hip_execution_stream()), "drain routed-expert validation");
+        if (host_status != 0U) throw std::invalid_argument("HIP routed experts rejected invalid routes or nonfinite weights");
     }
 }
 
@@ -1027,10 +1069,7 @@ void launch_moe_experts(
             config.top_k) *
         sizeof(float);
     const auto temporary_required =
-        static_cast<std::uint64_t>(
-            config.intermediate_size) *
-        2ULL *
-        sizeof(float);
+        (2ULL * config.intermediate_size + config.hidden_size) * sizeof(float) + sizeof(std::uint32_t);
 
     if (hidden.bytes <
             hidden_required ||
@@ -1215,10 +1254,7 @@ void register_hip_moe_experts_kernel_variant(
     variant.resources.lds_bytes =
         kThreads * sizeof(float);
     variant.resources.scratch_bytes =
-        static_cast<std::uint64_t>(
-            config.intermediate_size) *
-        2ULL *
-        sizeof(float);
+        (2ULL * config.intermediate_size + config.hidden_size) * sizeof(float) + sizeof(std::uint32_t);
     variant.numerics.input_precision =
         storage_name(
             config.activation);
@@ -1237,7 +1273,7 @@ void register_hip_moe_experts_kernel_variant(
     variant.output_layout =
         "row-major";
     variant.compiler_identity =
-        "hip-gfx1151-moe-experts-v1";
+        "hip-gfx1151-moe-experts-v2";
     variant.measured_seconds = 0.0;
 
     registry.add(

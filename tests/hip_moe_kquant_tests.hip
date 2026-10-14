@@ -5,6 +5,7 @@
 #include "strix/execution_resources.hpp"
 #include "strix/execution_tensor_access.hpp"
 #include "strix/hip_moe_experts_launcher.hpp"
+#include "strix/hip_launch_context.hpp"
 #include "strix/model_contract.hpp"
 #include "strix/model_manifest.hpp"
 #include "strix/model_runtime_binding.hpp"
@@ -19,6 +20,7 @@
 #include <cstring>
 #include <array>
 #include <bit>
+#include <limits>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -162,7 +164,7 @@ int main(int argc, char** argv) try {
     const auto gate_type = mode < 3U ? types[mode] : 12U;
     const auto up_type = mode < 3U ? types[mode] : 13U;
     const auto down_type = mode < 3U ? types[mode] : 7U;
-    constexpr std::uint32_t hidden = 512;
+    constexpr std::uint32_t hidden = 768;
     constexpr std::uint32_t intermediate = 512;
     constexpr std::uint32_t experts = 4;
     constexpr std::uint32_t top_k = 2;
@@ -380,9 +382,10 @@ int main(int argc, char** argv) try {
                 static_cast<float>(
                     value) *
                 selected_weights[slot];
-            if (bf16) expected[feature] = round_bf16(expected[feature]);
         }
     }
+
+    if (bf16) for (auto& value : expected) value = round_bf16(value);
 
     strix::ModelManifest manifest;
     manifest.architecture =
@@ -583,6 +586,81 @@ int main(int argc, char** argv) try {
     expect(
         bf16 || maximum_error <= 1e-5F,
         "K-quant routed experts match independently generated values");
+
+    const auto output_bytes = hidden * (bf16 ? sizeof(std::uint16_t) : sizeof(float));
+    std::vector<std::byte> before(output_bytes), after(output_bytes);
+    check(hipMemcpy(before.data(), reinterpret_cast<void*>(output.address), output_bytes,
+                    hipMemcpyDeviceToHost), "snapshot committed routed output");
+    auto bad_routes = selected;
+    bad_routes[1] = experts;
+    check(hipMemcpy(reinterpret_cast<void*>(route_indices.address), bad_routes.data(),
+                    bad_routes.size() * sizeof(std::uint32_t), hipMemcpyHostToDevice), "upload invalid expert ID");
+    bool rejected = false;
+    try { launcher.function(context, launcher.user_data); }
+    catch (const std::invalid_argument&) { rejected = true; }
+    expect(rejected, "invalid expert ID rejects eager execution");
+    check(hipMemcpy(after.data(), reinterpret_cast<void*>(output.address), output_bytes,
+                    hipMemcpyDeviceToHost), "read output after invalid route");
+    expect(before == after, "invalid route cannot publish partial expert output");
+    check(hipMemcpy(reinterpret_cast<void*>(route_indices.address), selected.data(),
+                    selected.size() * sizeof(std::uint32_t), hipMemcpyHostToDevice), "restore valid routes");
+    auto bad_weights = selected_weights;
+    bad_weights[0] = std::numeric_limits<float>::quiet_NaN();
+    check(hipMemcpy(reinterpret_cast<void*>(route_weights.address), bad_weights.data(),
+                    bad_weights.size() * sizeof(float), hipMemcpyHostToDevice), "upload nonfinite route weight");
+    rejected = false;
+    try { launcher.function(context, launcher.user_data); }
+    catch (const std::invalid_argument&) { rejected = true; }
+    expect(rejected, "nonfinite route weight rejects eager execution");
+    check(hipMemcpy(after.data(), reinterpret_cast<void*>(output.address), output_bytes,
+                    hipMemcpyDeviceToHost), "read output after nonfinite weight");
+    expect(before == after, "nonfinite weight cannot publish partial expert output");
+
+    // Captured execution must report the same failure through the existing
+    // device graph status, without host reads or synchronization during capture.
+    const auto graph_layout = strix::graph_input_layout(1);
+    void* graph_arguments = nullptr;
+    void* graph_status = nullptr;
+    hipStream_t graph_stream = nullptr;
+    hipGraph_t graph = nullptr;
+    hipGraphExec_t graph_exec = nullptr;
+    check(hipMalloc(&graph_arguments, static_cast<std::size_t>(graph_layout.bytes)), "allocate graph arguments");
+    check(hipMalloc(&graph_status, sizeof(std::uint32_t)), "allocate graph status");
+    check(hipStreamCreateWithFlags(&graph_stream, hipStreamNonBlocking), "create graph stream");
+    strix::HipLaunchContext graph_context;
+    graph_context.stream = graph_stream;
+    graph_context.graph_capture = true;
+    graph_context.arguments = strix::bind_graph_inputs(graph_layout,
+        {memory.execution_identity, reinterpret_cast<std::uintptr_t>(graph_arguments), graph_layout.bytes, 1});
+    graph_context.status = {memory.execution_identity, reinterpret_cast<std::uintptr_t>(graph_status), sizeof(std::uint32_t), 1};
+    graph_context.context_tokens = 64;
+    graph_context.vocabulary_size = static_cast<std::uint32_t>(model.vocab_size);
+    check(hipStreamBeginCapture(graph_stream, hipStreamCaptureModeThreadLocal), "begin routed graph capture");
+    { strix::HipLaunchScope scope(graph_context); launcher.function(context, launcher.user_data); }
+    check(hipStreamEndCapture(graph_stream, &graph), "end routed graph capture");
+    check(hipGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0), "instantiate routed graph");
+    for (unsigned int invalid = 0; invalid < 2U; ++invalid) {
+        check(hipMemcpy(reinterpret_cast<void*>(route_indices.address),
+            invalid == 0U ? selected.data() : bad_routes.data(), selected.size() * sizeof(std::uint32_t),
+            hipMemcpyHostToDevice), "set graph routes");
+        check(hipMemcpy(reinterpret_cast<void*>(route_weights.address),
+            invalid == 0U ? bad_weights.data() : selected_weights.data(), selected_weights.size() * sizeof(float),
+            hipMemcpyHostToDevice), "set graph route weights");
+        check(hipMemsetAsync(graph_status, 0, sizeof(std::uint32_t), graph_stream), "reset aggregate graph status");
+        check(hipGraphLaunch(graph_exec, graph_stream), "launch invalid routed graph");
+        std::uint32_t failure = 0;
+        check(hipMemcpyAsync(&failure, graph_status, sizeof(failure), hipMemcpyDeviceToHost, graph_stream), "read graph validation status");
+        check(hipStreamSynchronize(graph_stream), "drain invalid routed graph");
+        expect((failure & 16U) != 0U, "graph reports invalid route or weight at completion");
+        check(hipMemcpy(after.data(), reinterpret_cast<void*>(output.address), output_bytes,
+                        hipMemcpyDeviceToHost), "read output after invalid graph replay");
+        expect(before == after, "invalid graph routes cannot publish expert output");
+    }
+    check(hipGraphExecDestroy(graph_exec), "destroy routed graph executable");
+    check(hipGraphDestroy(graph), "destroy routed graph");
+    check(hipStreamDestroy(graph_stream), "destroy routed graph stream");
+    check(hipFree(graph_status), "free graph status");
+    check(hipFree(graph_arguments), "free graph arguments");
 
     for (auto* pointer :
          device_weights) {
