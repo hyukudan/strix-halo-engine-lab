@@ -1121,6 +1121,14 @@ int main() try {
     config.activation =
         strix::HipActivationStorage::bf16;
 
+    strix::kernels::KernelRegistry gdn_variants;
+    strix::ExecutionBindingRequest gdn_request;
+    strix::register_hip_gdn_kernel_variant(model, gdn_request, config, gdn_variants);
+    expect(gdn_variants.variants().size() == 1 &&
+        gdn_variants.variants().front().resources.lds_bytes >=
+            (128U * 32U + 32U) * sizeof(float) + sizeof(std::uint32_t),
+        "GDN LDS declaration covers both reductions, immutable delta and graph control");
+
     auto launcher =
         strix::make_hip_gdn_launcher(
             "test.gdn",

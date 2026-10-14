@@ -295,10 +295,12 @@ void cpu_route_reference(
 
 void run_case(
     std::uint32_t ggml_type,
-    strix::HipActivationStorage activation) {
-    const auto model =
+    strix::HipActivationStorage activation,
+    std::uint32_t expert_count = 512) {
+    auto model =
         strix::ModelContract::
             qwen38_flash_next();
+    model.num_experts = expert_count;
 
     const std::uint32_t rows = 1;
     const auto hidden_size =
@@ -799,6 +801,12 @@ int main() try {
     run_case(
         8,
         strix::HipActivationStorage::bf16);
+    // Exercise partially occupied waves and workgroups as well as a second
+    // expert iteration. Inactive lanes still participate in both reductions.
+    for (const auto experts : {31U, 32U, 33U, 255U, 256U, 257U, 511U}) {
+        run_case(0, strix::HipActivationStorage::fp32, experts);
+        run_case(8, strix::HipActivationStorage::bf16, experts);
+    }
 
     if (failures == 0) {
         std::cout
