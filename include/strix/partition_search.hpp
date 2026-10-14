@@ -54,11 +54,19 @@ struct PartitionCandidateBuildPolicy {
         PartitionWeightAccounting::resident_only;
 };
 
+enum class PartitionComputeModel : std::uint8_t {
+    serial_chain,
+    // Reserved and rejected: aggregate node totals cannot establish a
+    // concurrent per-stage schedule or its critical path.
+    stage_overlap,
+};
+
 struct PartitionSearchPolicy {
     std::uint64_t node0_weight_budget_bytes = 0;
     std::uint64_t node1_weight_budget_bytes = 0;
     double local_serial_token_us = 0.0;
     double minimum_latency_improvement_fraction = 0.0;
+    PartitionComputeModel compute_model = PartitionComputeModel::serial_chain;
 };
 
 struct PartitionCandidateEvaluation {
@@ -70,6 +78,7 @@ struct PartitionCandidateEvaluation {
     std::uint64_t minimum_node_weight_bytes = 0;
     std::uint64_t memory_imbalance_bytes = 0;
 
+    // For the supported serial model, this is the sum of both node totals.
     double critical_compute_us = 0.0;
     double estimated_token_us = 0.0;
     double latency_improvement_fraction = 0.0;

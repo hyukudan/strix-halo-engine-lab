@@ -12,6 +12,10 @@ namespace {
 
 void validate_policy(
     const PartitionSearchPolicy& policy) {
+    if (policy.compute_model != PartitionComputeModel::serial_chain) {
+        throw std::invalid_argument(
+            "partition overlap cost requires unsupported per-stage scheduling evidence");
+    }
     if (policy.node0_weight_budget_bytes == 0 ||
         policy.node1_weight_budget_bytes == 0 ||
         !std::isfinite(policy.local_serial_token_us) ||
@@ -279,22 +283,27 @@ evaluate_partition_candidate(
         result.minimum_node_weight_bytes;
 
     result.critical_compute_us =
-        std::max(
+        checked_add_double(
             candidate.node0_compute_us,
-            candidate.node1_compute_us);
+            candidate.node1_compute_us,
+            "partition serial compute timing overflow");
     result.estimated_token_us =
-        result.critical_compute_us +
-        candidate.uncovered_communication_us +
-        candidate.control_us;
-    if (!std::isfinite(result.estimated_token_us)) {
-        throw std::overflow_error(
-            "partition candidate token cost is not finite");
-    }
+        checked_add_double(
+            checked_add_double(
+                result.critical_compute_us,
+                candidate.uncovered_communication_us,
+                "partition communication token cost overflow"),
+            candidate.control_us,
+            "partition control token cost overflow");
 
     result.latency_improvement_fraction =
         (policy.local_serial_token_us -
          result.estimated_token_us) /
         policy.local_serial_token_us;
+    if (!std::isfinite(result.latency_improvement_fraction)) {
+        throw std::overflow_error(
+            "partition latency improvement fraction is not finite");
+    }
     result.latency_useful =
         result.capacity_feasible &&
         result.latency_improvement_fraction >=
