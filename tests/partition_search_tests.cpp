@@ -88,6 +88,22 @@ int main() {
            "over-budget candidate is never selected despite low latency");
 
     {
+        auto threshold_policy = policy;
+        threshold_policy.minimum_latency_improvement_fraction = 0.25;
+        auto threshold_candidate = candidates[0];
+        threshold_candidate.node0_compute_us = 35.0;
+        threshold_candidate.node1_compute_us = 30.0;
+        threshold_candidate.uncovered_communication_us = 7.0;
+        threshold_candidate.control_us = 3.0;
+        const auto exact = strix::evaluate_partition_candidate(threshold_candidate, threshold_policy);
+        expect(exact.estimated_token_us == 75.0 && exact.latency_improvement_fraction == 0.25 && exact.latency_useful,
+               "serial estimate includes a candidate exactly at the improvement threshold");
+        threshold_candidate.control_us = 3.5;
+        expect(!strix::evaluate_partition_candidate(threshold_candidate, threshold_policy).latency_useful,
+               "additional serial control cost rejects a candidate above the threshold");
+    }
+
+    {
         auto balanced = candidates[0];
         balanced.node0_compute_us = 50.0;
         balanced.node1_compute_us = 50.0;

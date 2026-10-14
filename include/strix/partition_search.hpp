@@ -34,12 +34,16 @@ struct PartitionCandidate {
 
 struct PartitionStepTiming {
     std::uint32_t step_id = 0;
+    // Coordinator-observed serial step duration through completion. Remote
+    // durations include the blocking command/ACK exchange, not only GPU time.
     double node0_us = 0.0;
     double node1_us = 0.0;
 };
 
 struct PartitionBoundaryTiming {
     std::uint64_t boundary_id = 0;
+    // Full serial boundary cost; no overlap is assumed. Exclude exchanges
+    // already included in PartitionStepTiming to avoid double counting.
     double uncovered_communication_us = 0.0;
     double control_us = 0.0;
 };
