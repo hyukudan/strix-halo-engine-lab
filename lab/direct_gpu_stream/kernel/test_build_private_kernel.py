@@ -187,7 +187,12 @@ class PrivateKernelPreparationTests(unittest.TestCase):
             deadline = time.monotonic() + 5
             while time.monotonic() < deadline:
                 status = Path(f"/proc/{pid}/stat")
-                if not status.exists() or status.read_text().split()[2] == "Z":
+                try:
+                    state = status.read_text().split()[2]
+                except (FileNotFoundError, ProcessLookupError):
+                    # Exit can remove the procfs entry between lookup and read.
+                    break
+                if state == "Z":
                     break
                 time.sleep(0.01)
             else:
