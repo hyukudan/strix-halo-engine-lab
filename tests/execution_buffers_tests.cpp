@@ -1,4 +1,5 @@
 #include "strix/execution_buffers.hpp"
+#include "strix/execution_io.hpp"
 
 #include <cstdint>
 #include <iostream>
@@ -18,6 +19,8 @@ void expect(bool condition, const char* message) {
 }  // namespace
 
 int main() {
+    static_assert(static_cast<unsigned>(strix::ExecutionBufferClass::hyper_workspace) == 10U);
+    static_assert(static_cast<unsigned>(strix::ExecutionBufferClass::router_workspace) == 11U);
     const auto model =
         strix::ModelContract::qwen38_flash_next();
 
@@ -85,6 +88,19 @@ int main() {
     }
     expect(invalid,
            "zero-row execution buffer plan is rejected");
+
+    strix::ExecutionBufferRequest router_request;
+    expect(strix::build_serial_execution_buffer_plan(model, router_request).router_workspace_bytes == 0,
+           "default request admits no router workspace");
+    router_request.parallel_moe_router = true;
+    router_request.logical_rows = 2;
+    const auto router_buffers = strix::build_serial_execution_buffer_plan(model, router_request);
+    expect(router_buffers.router_workspace_bytes == 2ULL * model.num_experts * sizeof(float),
+           "two-row router workspace admits every FP32 logit");
+    auto tail_model = model;
+    tail_model.num_experts = 33;
+    expect(strix::build_serial_execution_buffer_plan(tail_model, router_request).router_workspace_bytes == 512ULL,
+           "router workspace admission rounds the whole row span to 256 bytes");
 
     if (failures == 0) {
         std::cout << "execution buffer tests passed\n";

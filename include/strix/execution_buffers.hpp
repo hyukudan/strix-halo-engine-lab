@@ -13,6 +13,7 @@ struct ExecutionBufferRequest {
     std::uint32_t index_element_bytes = 4;
     std::uint32_t logit_element_bytes = 4;
     std::uint32_t mlp_intermediate_element_bytes = 4;
+    bool parallel_moe_router = false;
 };
 
 struct ExecutionBufferPlan {
@@ -35,6 +36,7 @@ struct ExecutionBufferPlan {
 
     std::uint64_t peak_internal_bytes = 0;
     std::uint64_t peak_with_materialized_logits_bytes = 0;
+    std::uint64_t router_workspace_bytes = 0;
 };
 
 [[nodiscard]] ExecutionBufferPlan build_serial_execution_buffer_plan(

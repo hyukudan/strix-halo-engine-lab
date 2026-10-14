@@ -19,6 +19,7 @@ struct ExecutionBindingRequest {
         kernels::QualificationStatus::oracle_matched;
     // Explicit C1 device-input graph topology; requires graph-safe selections.
     bool device_graph_inputs = false;
+    bool parallel_moe_router = false;
 };
 
 struct ExecutionKernelBinding {

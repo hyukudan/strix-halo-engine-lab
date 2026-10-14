@@ -170,6 +170,7 @@ struct Options {
     bool staged_hyper_projections = false;
     bool fused_staged_hyper_mix = false;
     bool virtual_q8_lm_head = false;
+    bool parallel_moe_router = false;
     std::uint64_t ple_max_rows_per_io = 4;
     std::uint64_t ple_max_inflight_ios = 4;
     std::string reference_path;
@@ -194,11 +195,8 @@ Options parse_options(
             "[--context N] [--residency register|copy] [--coalesce-gap BYTES] "
             "[--planned-ple-io] [--ple-max-rows-per-io N] [--ple-max-inflight-ios N] "
             "[--generate N] [--eos-token TOKEN_ID] [--prefix-cache-roundtrip] "
-<<<<<<< HEAD
+            "[--parallel-moe-router] [--virtual-q8-lm-head] "
             "[--parallel-hyper-mix [--staged-hyper-projections [--fused-staged-hyper-mix]]]");
-=======
-            "[--parallel-hyper-mix [--staged-hyper-projections]] [--virtual-q8-lm-head]");
->>>>>>> 37d00b7 (perf: add experimental ordered virtual-leaf Q8 head)
     }
 
     Options options;
@@ -211,6 +209,11 @@ Options parse_options(
          ++index) {
         const std::string_view argument =
             argv[index];
+        if (argument == "--parallel-moe-router") {
+            if (options.parallel_moe_router) throw std::invalid_argument("duplicate parallel MoE router option");
+            options.parallel_moe_router = true;
+            continue;
+        }
         if (argument == "--parallel-hyper-mix") {
             if (options.parallel_hyper_mix) throw std::invalid_argument("duplicate parallel hyper-mix option");
             options.parallel_hyper_mix = true;
@@ -856,6 +859,8 @@ int main(
     catalog_config.staged_hyper_projections = options.staged_hyper_projections;
     catalog_config.fused_staged_hyper_mix = options.fused_staged_hyper_mix;
     catalog_config.virtual_q8_lm_head = options.virtual_q8_lm_head;
+    catalog_config.parallel_moe_router = options.parallel_moe_router;
+    binding_request.parallel_moe_router = options.parallel_moe_router;
     std::optional<strix::integer_projection::RuntimeConfig> integer_config;
     if (options.execution.integer_head != strix::DecodeIntegerHead::none) {
         integer_config = strix::make_decode_integer_head_config(model, manifest, options.execution,
@@ -873,6 +878,7 @@ int main(
     strix::ExecutionBufferRequest
         buffer_request;
     buffer_request.logical_rows = 1;
+    buffer_request.parallel_moe_router = options.parallel_moe_router;
     buffer_request.activation_element_bytes =
         2;
     buffer_request.control_element_bytes =
@@ -1568,6 +1574,7 @@ int main(
               << "  \"execution_identity\": "
               << compiled.execution_identity
               << ',' << '\n'
+              << "  \"parallel_moe_router\": " << (options.parallel_moe_router ? "true" : "false") << ",\n"
               << "  \"launch_plan_identity\": "
               << launch_plan.plan_identity
               << ',' << '\n'

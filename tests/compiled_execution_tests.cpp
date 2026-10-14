@@ -86,7 +86,8 @@ strix::kernels::KernelRegistry make_registry(
 
         registry.add(
             make_variant(
-                "test." + key + suffix,
+                "test." + key + suffix +
+                    (step.op == strix::SerialOp::moe_route && request.parallel_moe_router ? ".parallel" : ""),
                 *family,
                 shape,
                 measured_seconds));
@@ -157,6 +158,11 @@ int main() {
     expect(compiled.kernel_plan_identity != 0 &&
                compiled.execution_identity != 0,
            "compiled execution has stable non-zero identities");
+    // Captured from the pinned, pre-router implementation with this fixture.
+    expect(compiled.execution_identity == 5195923158154663034ULL &&
+               compiled.kernel_plan_identity == 4048923307928001002ULL &&
+               compiled.arena.total_bytes == 998400ULL,
+           "default serial identities and arena retain the pre-router receipt");
     expect(compiled.arena.total_bytes > 0,
            "compiled execution contains a physical scratch arena");
     expect(!compiled.whole_plan_graph_safe,
@@ -482,6 +488,66 @@ int main() {
     try { static_cast<void>(strix::compile_serial_execution(model, graph_registry, graph_request, buffer_request)); }
     catch (const std::invalid_argument&) { graph_policy_rejected = true; }
     expect(graph_policy_rejected, "device-input topology cannot bypass graph-safe kernel selection");
+
+    auto router_binding = binding_request;
+    auto router_buffers = buffer_request;
+    router_binding.parallel_moe_router = true;
+    router_buffers.parallel_moe_router = true;
+    const auto router_registry = make_registry(model, router_binding);
+    const auto router_compiled = strix::compile_serial_execution(model, router_registry, router_binding, router_buffers);
+    expect(router_compiled.execution_identity != compiled.execution_identity &&
+               router_compiled.kernel_plan_identity != compiled.kernel_plan_identity,
+           "parallel router invalidates serial execution and kernel identities");
+    expect(router_compiled.io.router_workspace_slots == 1 && compiled.io.router_workspace_slots == 0,
+           "router temporary exists only in opted-in IO");
+    std::uint32_t router_uses = 0;
+    for (const auto& step : router_compiled.io.steps) {
+        if (step.op != strix::SerialOp::moe_route) continue;
+        ++router_uses;
+        expect(step.temporaries.size() == 1 &&
+                   step.temporaries.front().buffer.buffer_class == strix::ExecutionBufferClass::router_workspace &&
+                   strix::find_arena_allocation(router_compiled.arena, step.temporaries.front()) != nullptr,
+               "every parallel router workspace use has a generation-bound arena allocation");
+    }
+    expect(router_uses == model.hidden_layers, "all layer routers admit a workspace generation");
+    bool router_mismatch = false;
+    try { static_cast<void>(strix::compile_serial_execution(model, router_registry, router_binding, buffer_request)); }
+    catch (const std::invalid_argument&) { router_mismatch = true; }
+    expect(router_mismatch, "serial compilation rejects router request/admission mismatch");
+    router_mismatch = false;
+    try { static_cast<void>(strix::compile_serial_execution(model, registry, router_binding, router_buffers)); }
+    catch (const std::invalid_argument&) { router_mismatch = true; }
+    expect(router_mismatch, "serial compilation rejects legacy kernel under parallel admission");
+    router_mismatch = false;
+    try { static_cast<void>(strix::compile_serial_execution(model, router_registry, binding_request, buffer_request)); }
+    catch (const std::invalid_argument&) { router_mismatch = true; }
+    expect(router_mismatch, "serial compilation rejects parallel kernel under default admission");
+    router_mismatch = false;
+    try { static_cast<void>(strix::build_serial_execution_arena_plan(model, router_buffers,
+                                   router_compiled.execution, router_compiled.io, 8)); }
+    catch (const std::invalid_argument&) { router_mismatch = true; }
+    expect(router_mismatch, "arena preflight rejects insufficient parallel workspace alignment");
+    auto corrupt_router_io = router_compiled.io;
+    for (auto& io : corrupt_router_io.steps)
+        if (io.op == strix::SerialOp::moe_route) io.temporaries.push_back(io.temporaries.front());
+    router_mismatch = false;
+    try { strix::validate_serial_execution_io_plan(router_compiled.execution, corrupt_router_io); }
+    catch (const std::invalid_argument& error) {
+        router_mismatch = std::string(error.what()).find("router workspace IO") != std::string::npos;
+    }
+    expect(router_mismatch, "IO preflight rejects extra router temporaries with the topology reason");
+    router_mismatch = false;
+    try { static_cast<void>(strix::build_serial_execution_arena_plan(model, buffer_request,
+                                   router_compiled.execution, router_compiled.io)); }
+    catch (const std::invalid_argument&) { router_mismatch = true; }
+    expect(router_mismatch, "arena preflight rejects unrequested router IO");
+    router_binding.parallel_moe_router = false;
+    router_buffers.parallel_moe_router = false;
+    const auto explicit_default = strix::compile_serial_execution(model, registry, router_binding, router_buffers);
+    expect(explicit_default.execution_identity == compiled.execution_identity &&
+               explicit_default.kernel_plan_identity == compiled.kernel_plan_identity &&
+               explicit_default.arena.total_bytes == compiled.arena.total_bytes,
+           "explicit disabled router preserves default execution/kernel identities and arena");
 
     if (failures == 0) {
         std::cout << "compiled execution tests passed\n";

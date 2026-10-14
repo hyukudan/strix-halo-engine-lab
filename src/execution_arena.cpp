@@ -67,6 +67,8 @@ std::uint64_t bytes_for(
         return sizes.indexed_attention_workspace_bytes;
     case ExecutionBufferClass::hyper_workspace:
         return sizes.hyper_workspace_bytes;
+    case ExecutionBufferClass::router_workspace:
+        return sizes.router_workspace_bytes;
     }
     throw std::logic_error(
         "unknown execution buffer class");
@@ -88,6 +90,11 @@ ExecutionArenaPlan build_serial_execution_arena_plan(
 
     validate_serial_execution_io_plan(
         execution_plan, io_plan);
+
+    if ((io_plan.router_workspace_slots != 0U) != buffer_request.parallel_moe_router)
+        throw std::invalid_argument("router workspace admission differs from buffer request");
+    if (buffer_request.parallel_moe_router && alignment % 16U != 0)
+        throw std::invalid_argument("parallel router arena requires at least 16-byte alignment");
 
     const auto sizes =
         build_serial_execution_buffer_plan(

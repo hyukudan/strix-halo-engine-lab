@@ -294,6 +294,7 @@ int main() {
         execution;
     compiled.bindings =
         bindings;
+    compiled.io = strix::build_serial_execution_io_plan(execution);
 
     strix::ExecutionLauncherRegistry launchers;
     strix::HipLauncherCatalog catalog(
