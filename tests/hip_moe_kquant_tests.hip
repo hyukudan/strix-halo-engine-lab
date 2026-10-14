@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <cstring>
 #include <array>
+#include <bit>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -140,11 +141,23 @@ float silu(float value) {
             std::exp(-value));
 }
 
+float round_bf16(float value) {
+    if (value == 0.0F) return value;
+    int exponent = 0;
+    const double scaled = std::frexp(std::fabs(static_cast<double>(value)), &exponent) * 256.0;
+    auto integer = static_cast<unsigned int>(std::floor(scaled));
+    const auto fraction = scaled - integer;
+    if (fraction > 0.5 || (fraction == 0.5 && (integer & 1U))) ++integer;
+    return static_cast<float>(std::copysign(std::ldexp(static_cast<double>(integer), exponent - 8), value));
+}
+
 }  // namespace
 
 int main(int argc, char** argv) try {
-    const unsigned int mode = argc > 1 ? static_cast<unsigned int>(std::stoul(argv[1])) : 0U;
-    if (mode > 3U) throw std::invalid_argument("invalid K-quant test mode");
+    const unsigned int requested_mode = argc > 1 ? static_cast<unsigned int>(std::stoul(argv[1])) : 0U;
+    if (requested_mode > 7U) throw std::invalid_argument("invalid K-quant test mode");
+    const bool bf16 = requested_mode >= 4U;
+    const auto mode = requested_mode % 4U;
     constexpr std::array<std::uint32_t, 3> types{12U, 13U, 7U};
     const auto gate_type = mode < 3U ? types[mode] : 12U;
     const auto up_type = mode < 3U ? types[mode] : 13U;
@@ -169,7 +182,7 @@ int main(int argc, char** argv) try {
 
     strix::ExecutionBufferRequest buffer_request;
     buffer_request.logical_rows = 1;
-    buffer_request.activation_element_bytes = 4;
+    buffer_request.activation_element_bytes = bf16 ? 2U : 4U;
     buffer_request.mlp_intermediate_element_bytes = 4;
     const auto arena =
         strix::build_serial_execution_arena_plan(
@@ -240,13 +253,21 @@ int main(int argc, char** argv) try {
     const std::vector<float>
         selected_weights{0.7F, 0.3F};
 
+    std::vector<std::uint16_t> hidden_bf16(hidden);
+    if (bf16) {
+        for (std::size_t index = 0; index < hidden; ++index) {
+            hidden_values[index] = round_bf16(hidden_values[index]);
+            hidden_bf16[index] = static_cast<std::uint16_t>(
+                std::bit_cast<std::uint32_t>(hidden_values[index]) >> 16U);
+        }
+    }
+
     check(
         hipMemcpy(
             reinterpret_cast<void*>(
                 hidden_input.address),
-            hidden_values.data(),
-            hidden_values.size() *
-                sizeof(float),
+            bf16 ? static_cast<const void*>(hidden_bf16.data()) : hidden_values.data(),
+            hidden_values.size() * (bf16 ? sizeof(std::uint16_t) : sizeof(float)),
             hipMemcpyHostToDevice),
         "copy routed-expert hidden");
     check(
@@ -359,6 +380,7 @@ int main(int argc, char** argv) try {
                 static_cast<float>(
                     value) *
                 selected_weights[slot];
+            if (bf16) expected[feature] = round_bf16(expected[feature]);
         }
     }
 
@@ -515,8 +537,7 @@ int main(int argc, char** argv) try {
         experts;
     config.top_k =
         top_k;
-    config.activation =
-        strix::HipActivationStorage::fp32;
+    config.activation = bf16 ? strix::HipActivationStorage::bf16 : strix::HipActivationStorage::fp32;
 
     auto launcher =
         strix::make_hip_moe_experts_launcher(
@@ -531,15 +552,19 @@ int main(int argc, char** argv) try {
 
     std::vector<float> actual(
         hidden);
+    std::vector<std::uint16_t> actual_bf16(hidden);
     check(
         hipMemcpy(
-            actual.data(),
+            bf16 ? static_cast<void*>(actual_bf16.data()) : actual.data(),
             reinterpret_cast<const void*>(
                 output.address),
-            actual.size() *
-                sizeof(float),
+            actual.size() * (bf16 ? sizeof(std::uint16_t) : sizeof(float)),
             hipMemcpyDeviceToHost),
         "copy routed-expert output");
+    if (bf16) {
+        for (std::size_t index = 0; index < hidden; ++index)
+            actual[index] = std::bit_cast<float>(static_cast<std::uint32_t>(actual_bf16[index]) << 16U);
+    }
 
     float maximum_error = 0.0F;
     for (std::size_t index = 0;
@@ -551,9 +576,12 @@ int main(int argc, char** argv) try {
                 std::abs(
                     actual[index] -
                     expected[index]));
+        if (bf16) expect(std::abs(actual[index] - expected[index]) <=
+                         1e-6F + std::abs(expected[index]) / 128.0F,
+                         "BF16 routed output within one storage rounding step");
     }
     expect(
-        maximum_error <= 1e-5F,
+        bf16 || maximum_error <= 1e-5F,
         "K-quant routed experts match independently generated values");
 
     for (auto* pointer :

@@ -1258,7 +1258,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
             HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
         target_link_libraries(strix-hip-moe-kquant-tests PRIVATE strix_hip_runtime)
         strix_target_warnings(strix-hip-moe-kquant-tests)
-        foreach(mode RANGE 0 3)
+        foreach(mode RANGE 0 7)
             add_test(NAME strix-hip-moe-kquant-${mode}-tests
                      COMMAND strix-hip-moe-kquant-tests ${mode})
         endforeach()

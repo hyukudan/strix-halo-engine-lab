@@ -20,6 +20,7 @@ The native tests independently generate weights and their expected values
 before packing, then compare complete routed-expert outputs with CPU matrix
 products and SiLU. They cover every code and six-bit factor, multiple blocks
 per row, noncontiguous selected experts and all three encodings individually,
-plus a mixed Q4_K gate, Q5_K up and Q5_1 down configuration. These fixtures
-passed on gfx1151. They do not qualify full-checkpoint logits, model quality,
+plus a mixed Q4_K gate, Q5_K up and Q5_1 down configuration. Each runs with
+FP32 and BF16 activations; the latter checks independently rounded inputs and
+per-route output storage. These fixtures passed on gfx1151. They do not qualify full-checkpoint logits, model quality,
 throughput or distributed continuity.
