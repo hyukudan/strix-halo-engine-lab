@@ -15,6 +15,7 @@ struct HipHyperMixLauncherConfig {
     std::uint32_t lowrank = 0;
     float rms_epsilon = 1e-6F;
     bool parallel = false;
+    bool staged_projections = false;
     HipActivationStorage activation =
         HipActivationStorage::bf16;
 };
