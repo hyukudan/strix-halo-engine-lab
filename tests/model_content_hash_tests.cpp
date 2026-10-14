@@ -82,6 +82,23 @@ int main() {
             "b00361a396177a9cb410ff61f20015ad",
         "SHA-256 abc vector matches");
 
+    const std::string million_a(1'000'000, 'a');
+    const auto million_path = root / "million-a.bin";
+    write_file(million_path, million_a);
+    expect(strix::model_content_identity_hex(strix::sha256_file_content(million_path)) ==
+               "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0",
+           "SHA-256 million-a known vector matches");
+    for (const auto size : {55U, 56U, 63U, 64U, 65U, 1048575U, 1048576U, 1048577U, 2097189U}) {
+        std::string payload(size, '\0');
+        for (std::size_t index = 0; index < payload.size(); ++index)
+            payload[index] = static_cast<char>((index * 37U + index / 97U) % 256U);
+        const auto path = root / "chunk-boundary.bin";
+        write_file(path, payload);
+        expect(strix::sha256_file_content(path) == strix::sha256_bytes(
+                   std::as_bytes(std::span<const char>(payload.data(), payload.size()))),
+               "full-file backend matches portable byte oracle across SHA and I/O chunk boundaries");
+    }
+
     const auto shard_a =
         root / "a.gguf";
     const auto shard_b =

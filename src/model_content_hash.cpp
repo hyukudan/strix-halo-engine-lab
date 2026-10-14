@@ -8,6 +8,10 @@
 #include <stdexcept>
 #include <system_error>
 #include <vector>
+#if defined(STRIX_USE_OPENSSL_SHA256)
+#include <openssl/evp.h>
+#include <memory>
+#endif
 
 namespace strix {
 namespace {
@@ -286,6 +290,40 @@ struct FileDigest {
     std::uint64_t bytes = 0;
 };
 
+#if defined(STRIX_USE_OPENSSL_SHA256)
+// Only the bulk file digest uses the optional provider. Canonical aggregate
+// framing and the portable byte oracle retain the same implementation.
+class FileSha256 {
+public:
+    FileSha256() : context_(EVP_MD_CTX_new(), &EVP_MD_CTX_free) {
+        if (!context_ || EVP_DigestInit_ex(context_.get(), EVP_sha256(), nullptr) != 1)
+            throw std::runtime_error("cannot initialize full-file SHA-256 provider");
+    }
+    void update(const std::uint8_t* data, std::size_t size) {
+        if (size != 0 && data == nullptr)
+            throw std::invalid_argument("SHA-256 update received null data");
+        if (size > std::numeric_limits<std::uint64_t>::max() - total_bytes_)
+            throw std::overflow_error("SHA-256 input length overflow");
+        if (size != 0 && EVP_DigestUpdate(context_.get(), data, size) != 1)
+            throw std::runtime_error("full-file SHA-256 provider update failed");
+        total_bytes_ += static_cast<std::uint64_t>(size);
+    }
+    ModelContentIdentity finalize() {
+        ModelContentIdentity result;
+        unsigned int bytes = 0;
+        if (EVP_DigestFinal_ex(context_.get(), result.bytes.data(), &bytes) != 1 ||
+            bytes != result.bytes.size())
+            throw std::runtime_error("full-file SHA-256 provider finalization failed");
+        return result;
+    }
+private:
+    std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> context_;
+    std::uint64_t total_bytes_ = 0;
+};
+#else
+using FileSha256 = Sha256;
+#endif
+
 FileDigest hash_file_stable(
     const std::filesystem::path& path) {
     std::error_code error;
@@ -306,7 +344,7 @@ FileDigest hash_file_stable(
             "cannot open model content file");
     }
 
-    Sha256 hash;
+    FileSha256 hash;
     std::vector<char> buffer(
         1024U * 1024U);
     std::uint64_t bytes = 0;
