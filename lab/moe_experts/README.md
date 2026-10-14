@@ -29,3 +29,9 @@ Example:
     ./build/moe-experts/strix-moe-experts --rows 4 --experts 16 --top-k 4 --iterations 200
 
 The fixture dimensions are hidden=64 and intermediate=32. They are correctness dimensions, not production model dimensions.
+
+## Further reading
+
+See the [lab index](../README.md) for prerequisites and related experiments,
+the [qualification ledger](../../docs/qualification-ledger.md) for current gates,
+and [independent oracles](../../tools/oracles/README.md) for semantic checks.

@@ -87,3 +87,9 @@ available with `--experts 512`, but route-distribution qualification against the
 canonical checkpoint remains a separate gate. Repetitions default to one because
 each process run recomputes the CPU reference; increase `--repetitions` only
 when the target host has enough time for repeated correctness work.
+
+## Further reading
+
+See the [lab index](../README.md) for prerequisites and related experiments,
+the [qualification ledger](../../docs/qualification-ledger.md) for current gates,
+and [independent oracles](../../tools/oracles/README.md) for semantic checks.

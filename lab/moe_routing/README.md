@@ -124,3 +124,9 @@ qualification on the canonical checkpoint.
 
 Expert GEMMs remain a separate lab because route selection and grouped expert
 execution have different shape and memory bottlenecks.
+
+## Further reading
+
+See the [lab index](../README.md) for prerequisites and related experiments,
+the [qualification ledger](../../docs/qualification-ledger.md) for current gates,
+and [independent oracles](../../tools/oracles/README.md) for semantic checks.

@@ -143,3 +143,9 @@ IQ4_XS is a strong compact-format candidate because it satisfies the current
 single-node memory envelope substantially better than heavier K-quants, but it
 is not yet the canonical checkpoint decision. Quality, real Strix Halo
 throughput, resource pressure and full-model behavior still decide that.
+
+## Further reading
+
+See the [lab index](../README.md) for prerequisites and related experiments,
+the [qualification ledger](../../docs/qualification-ledger.md) for current gates,
+and [independent oracles](../../tools/oracles/README.md) for semantic checks.

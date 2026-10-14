@@ -295,3 +295,9 @@ installation, boot, load or removal steps were executed for this source work.
    blocked. Preserve logs and the ownership incident; do not force module unload,
    reuse hop IDs, or release DMA-BUF owners. Recovery/reset policy requires a
    separate target session with its actual controller/GPU containment evidence.
+
+## Further reading
+
+See the [lab index](../../README.md) for prerequisites and related experiments,
+the [qualification ledger](../../../docs/qualification-ledger.md) for current gates,
+and [independent oracles](../../../tools/oracles/README.md) for semantic checks.

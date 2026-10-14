@@ -119,3 +119,9 @@ high/unsigned low I4 mode, with saturation disabled. The compiler identity was
 AMD clang 22.0.0git, `roc-7.2.4`, revision
 `f58b06dce1f9c15707c5f808fd002e18c2accf7e`.
 No target GPU was used and no native result or speed estimate is reported.
+
+## Further reading
+
+See the [lab index](../README.md) for prerequisites and related experiments,
+the [qualification ledger](../../docs/qualification-ledger.md) for current gates,
+and [independent oracles](../../tools/oracles/README.md) for semantic checks.

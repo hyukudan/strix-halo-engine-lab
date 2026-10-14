@@ -21,7 +21,7 @@ same actual GGUF-tokenized input IDs and meet the declared minimum context.
 Personal prompts, GGUF files, baselines and compiler/result artifacts stay
 outside every Git checkout. Output files/directories must be new; resolved
 symlink ancestors are checked. Nothing writes a supplied model or reference.
-Each case admits at most1MiB actual UTF8 text within a16MiB private prompt
+Each case admits at most 1 MiB of actual UTF-8 text within a 16 MiB private prompt
 document. Byte length never substitutes for an observed token count.
 
 On Linux/WSL, audit a local GGUF v3 using the existing host-only project tools:
@@ -151,14 +151,14 @@ Record fields follow `record()` in `campaign.py`:
 Each JSONL row is `{"position":0,"target_token":7,"logits":[...]}`. Positions
 must be complete and ordered, every row has the exact audited vocabulary width,
 and all values are finite within binary32 range. The evaluator streams bounded
-8MiB rows (at most4096 positions, vocabulary262144, file8GiB), rather than loading
+8 MiB rows (at most 4096 positions, vocabulary 262144, file 8 GiB), rather than loading
 an entire vocabulary-by-context matrix. Generation rows must select the recorded
 token by deterministic first-index argmax; teacher-forced targets are independently
 bound and cannot masquerade as generated decisions. Sampling is not supported.
 
-Predetermined defaults are absolute logit error≤0.05, mean KL≤0.001 nats,
-mean NLL increase≤0.02 nats, teacher-forced argmax mismatch≤0.01, generated
-token Levenshtein/max-length rate≤0.01, zero semantic failures and zero state
+Predetermined defaults are absolute logit errorâ‰¤0.05, mean KLâ‰¤0.001 nats,
+mean NLL increaseâ‰¤0.02 nats, teacher-forced argmax mismatchâ‰¤0.01, generated
+token Levenshtein/max-length rateâ‰¤0.01, zero semantic failures and zero state
 byte mismatches. These are explicit exploratory rejection thresholds, not
 validated quality limits for a real checkpoint. Change them before inspecting
 candidate outcomes and regenerate the exact plan identity. KL/NLL use independent
@@ -250,7 +250,7 @@ the importer does not independently authenticate a compiled executable from it.
 `tokenization` pins a `strix-external-tokenization-v1` object containing exact
 `model_sha256`, `prompt_sha256` (the canonical case hash), `input_tokens`,
 `output_tokens`, `output_text_sha256`, `tokenizer_identity` and
-`asserted_by:"external_operator"`. The output text file must be UTF8≤1MiB. The
+`asserted_by:"external_operator"`. The output text file must be UTF8â‰¤1MiB. The
 importer checks these associations but does not decode GGUF tokens itself.
 Both recordings must share the complete observed tuple, evidence kind, allocation
 layout and initial state bytes. Native-shaped input declarations retain their
@@ -283,8 +283,8 @@ mutation creates no fictitious token rows. Default `final` policy includes
 initial/checkpoint/restored/final snapshots; `each` places the same boundary
 snapshots between actual prefix and continuation rows.
 
-Teacher-forced rows P−1 through P+T−2 are selected with their actual next-fed
-target tokens. Greedy rows P−1 through P+G−2 must agree with first-index argmax.
+Teacher-forced rows Pâˆ’1 through P+Tâˆ’2 are selected with their actual next-fed
+target tokens. Greedy rows Pâˆ’1 through P+Gâˆ’2 must agree with first-index argmax.
 The final generated token, including EOS, is emitted without being fed; only the
 greedy final snapshot supplies output state and actual fed-token history. Both
 GDN and PLE convolution allocations are included in the convolution artifact,
@@ -294,17 +294,17 @@ The importer rejects `INCOMPLETE`, missing receipts, altered hashes, escaping
 paths, missing components, changed layout/generations, nonfinite/partial logits,
 false stops and model/source/runtime substitutions before publishing a record.
 
-Import bounds are 32768 prompt tokens plus4096 targets, vocabulary262144,
-256MiB for the full derived plan and16MiB for individual records/receipts/source
+Import bounds are 32768 prompt tokens plus 4096 targets, vocabulary 262144,
+256 MiB for the full derived plan and 16 MiB for individual records/receipts/source
 manifests. Plan output is admitted before creating any file; larger inventories
 are rejected without truncation. Actual projection candidates are capped100000.
 RAW bounds additionally include
-64MiB metadata, 8MiB metadata/converted-logit rows, at most4097 state snapshots,
-and64GiB aggregate RAW artifacts per capture. Metadata and logit rows are bounded;
-state copying and hashing stream1MiB/4MiB chunks. Converted logit and individual
-evaluator state files remain bounded to8GiB. A context of16384 at vocabulary153600
-already requires about9.4GiB of RAW FP32 logits before state; the decoder's default
-8GiB budget therefore requires explicit increased admission, never a silent cap
+64 MiB metadata, 8 MiB metadata/converted-logit rows, at most 4097 state snapshots,
+and 64 GiB aggregate RAW artifacts per capture. Metadata and logit rows are bounded;
+state copying and hashing stream 1 MiB/4 MiB chunks. Converted logit and individual
+evaluator state files remain bounded to 8 GiB. A context of 16384 at vocabulary 153600
+already requires about 9.4 GiB of RAW FP32 logits before state; the decoder's default
+8 GiB budget therefore requires explicit increased admission, never a silent cap
 override. `final` state policy avoids quadratic full-state snapshots.
 Unknown timing categories stay null and `performance_evidence` remains false.
 Fresh output retains an `INCOMPLETE` marker on any failed import. Only a finished
@@ -332,3 +332,9 @@ remains an explicit external operator assertion, reported as such. This binds
 input tokenization only: generated output text still requires a separate actual
 detokenizer and is never inferred from these input IDs. Native inference/API
 qualification does not follow from an observed tokenizer invocation.
+
+## Further reading
+
+See the [lab index](../../README.md) for prerequisites and related experiments,
+the [qualification ledger](../../../docs/qualification-ledger.md) for current gates,
+and [independent oracles](../../../tools/oracles/README.md) for semantic checks.

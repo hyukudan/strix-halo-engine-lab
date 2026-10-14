@@ -139,3 +139,9 @@ and system telemetry must be used instead.
 The winning path is the one with the lowest complete lookup-to-consumer cost
 under real memory pressure, not the one with the highest isolated file-read
 bandwidth.
+
+## Further reading
+
+See the [lab index](../README.md) for prerequisites and related experiments,
+the [qualification ledger](../../docs/qualification-ledger.md) for current gates,
+and [independent oracles](../../tools/oracles/README.md) for semantic checks.
