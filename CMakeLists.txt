@@ -1253,6 +1253,16 @@ if(STRIX_ENABLE_HIP_RUNTIME)
             COMMAND strix-hip-moe-experts-launcher-tests
         )
 
+        add_executable(strix-hip-moe-kquant-tests tests/hip_moe_kquant_tests.hip)
+        set_target_properties(strix-hip-moe-kquant-tests PROPERTIES
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+        target_link_libraries(strix-hip-moe-kquant-tests PRIVATE strix_hip_runtime)
+        strix_target_warnings(strix-hip-moe-kquant-tests)
+        foreach(mode RANGE 0 7)
+            add_test(NAME strix-hip-moe-kquant-${mode}-tests
+                     COMMAND strix-hip-moe-kquant-tests ${mode})
+        endforeach()
+
         add_executable(
             strix-hip-gdn-launcher-tests
             tests/hip_gdn_launcher_tests.hip
