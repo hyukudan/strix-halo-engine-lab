@@ -207,6 +207,8 @@ std::uint64_t build_execution_identity(
         hash,
         buffer_request.mlp_intermediate_element_bytes);
 
+    if (buffer_request.parallel_moe_router) hash_u64(hash, 0x524f555445525057ULL);
+
     hash_u64(hash, compiled.arena.alignment);
     hash_u64(hash, compiled.arena.total_bytes);
     for (const auto& allocation : compiled.arena.allocations) {
@@ -300,6 +302,9 @@ CompiledSerialExecution compile_serial_execution(
             "compiled execution buffer rows must match binding rows");
     }
 
+    if (binding_request.parallel_moe_router != buffer_request.parallel_moe_router)
+        throw std::invalid_argument("router kernel request differs from buffer admission");
+
     CompiledSerialExecution compiled;
     if (binding_request.device_graph_inputs && (!binding_request.require_graph_safe ||
         binding_request.logical_rows != 1 || binding_request.request_concurrency != 1)) {
@@ -336,9 +341,15 @@ CompiledSerialExecution compile_serial_execution(
             "compiled serial execution requires every kernel step to bind");
     }
 
+    for (const auto& binding : compiled.bindings.bindings) {
+        if (binding.op == SerialOp::moe_route && binding.kernel_id.has_value() &&
+            binding.kernel_id->ends_with(".parallel") != buffer_request.parallel_moe_router)
+            throw std::invalid_argument("bound router kernel differs from admitted topology");
+    }
+
     compiled.io =
         build_serial_execution_io_plan(
-            compiled.execution);
+            compiled.execution, buffer_request.parallel_moe_router);
     compiled.arena =
         build_serial_execution_arena_plan(
             model,

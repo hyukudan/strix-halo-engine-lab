@@ -55,7 +55,7 @@ strix::kernels::KernelVariant make_variant(
 strix::kernels::KernelRegistry make_registry(
     const strix::ModelContract& model,
     std::uint32_t depth,
-    std::string suffix = "") {
+    std::string suffix = "", bool parallel_router = false) {
     strix::kernels::KernelRegistry registry;
     const auto verify =
         strix::build_speculative_verify_plan(
@@ -95,7 +95,8 @@ strix::kernels::KernelRegistry make_registry(
         }
         registry.add(
             make_variant(
-                "verify." + key + suffix,
+                "verify." + key + suffix +
+                    (step.op == strix::SerialOp::moe_route && parallel_router ? ".parallel" : ""),
                 *family,
                 shape));
     }
@@ -130,6 +131,11 @@ int main() {
                compiled.execution_identity != 0 &&
                compiled.kernel_plan_identity != 0,
            "compiled verify freezes depth, bindings and identities");
+    // Captured from the pinned, pre-router implementation with this fixture.
+    expect(compiled.execution_identity == 2522750290423016878ULL &&
+               compiled.kernel_plan_identity == 2260442504783589592ULL &&
+               compiled.arena.total_bytes == 3993600ULL,
+           "default speculative identities and arena retain the pre-router receipt");
     expect(compiled.arena.total_bytes > 0 &&
                compiled.sequential_window_steps == 37 &&
                compiled.causal_window_steps == 12,
@@ -201,6 +207,41 @@ int main() {
     }
     expect(concurrency_rejected,
            "initial verify compile keeps request concurrency at one");
+
+    auto router_binding = binding;
+    auto router_buffers = buffers;
+    router_binding.parallel_moe_router = true;
+    router_buffers.parallel_moe_router = true;
+    const auto router_registry = make_registry(model, 4, "", true);
+    const auto router_compiled = strix::compile_speculative_verify_execution(
+        model, 4, router_registry, router_binding, router_buffers);
+    expect(router_compiled.execution_identity != compiled.execution_identity &&
+               router_compiled.kernel_plan_identity != compiled.kernel_plan_identity &&
+               router_compiled.io.router_workspace_slots == 1,
+           "parallel router has admitted workspace and distinct speculative identities");
+    bool router_mismatch = false;
+    try { static_cast<void>(strix::compile_speculative_verify_execution(model, 4,
+                                      router_registry, router_binding, buffers)); }
+    catch (const std::invalid_argument&) { router_mismatch = true; }
+    expect(router_mismatch, "verify compilation rejects router request/admission mismatch");
+    router_mismatch = false;
+    try { static_cast<void>(strix::compile_speculative_verify_execution(model, 4,
+                                      registry, router_binding, router_buffers)); }
+    catch (const std::invalid_argument&) { router_mismatch = true; }
+    expect(router_mismatch, "verify compilation rejects legacy router under parallel admission");
+    router_mismatch = false;
+    try { static_cast<void>(strix::compile_speculative_verify_execution(model, 4,
+                                      router_registry, binding, buffers)); }
+    catch (const std::invalid_argument&) { router_mismatch = true; }
+    expect(router_mismatch, "verify compilation rejects parallel router under default admission");
+    router_binding.parallel_moe_router = false;
+    router_buffers.parallel_moe_router = false;
+    const auto explicit_default = strix::compile_speculative_verify_execution(model, 4,
+                                      registry, router_binding, router_buffers);
+    expect(explicit_default.execution_identity == compiled.execution_identity &&
+               explicit_default.kernel_plan_identity == compiled.kernel_plan_identity &&
+               explicit_default.arena.total_bytes == compiled.arena.total_bytes,
+           "explicit disabled router preserves speculative default identities and arena");
 
     if (failures == 0) {
         std::cout << "compiled speculative verify tests passed\n";

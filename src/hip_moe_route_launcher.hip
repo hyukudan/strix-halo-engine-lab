@@ -431,6 +431,218 @@ __global__ void moe_route_kernel(
     }
 }
 
+constexpr std::uint32_t kRouterExpertsPerBlock = 8;
+constexpr std::uint32_t kRouterFeaturesPerTile = 256;
+constexpr std::uint32_t kRouterProjectionThreads = 128;
+constexpr std::uint32_t kRouterCoefficientPitch = kRouterFeaturesPerTile + 4;
+constexpr std::uint32_t kRouterProjectionLdsBytes =
+    (kRouterExpertsPerBlock * kRouterCoefficientPitch + kRouterFeaturesPerTile) * sizeof(float);
+constexpr std::uint32_t kRouterDeclaredLdsBytes =
+    (kRouterProjectionLdsBytes + 255U) & ~255U;
+static_assert(kRouterDeclaredLdsBytes == 9472U);
+
+template <typename Activation, RouterWeightKind WeightKind>
+__global__ void parallel_moe_route_logits_kernel(
+    const Activation* hidden, const void* weights, std::uint32_t hidden_size,
+    std::uint32_t expert_count, float* workspace) {
+    const auto row = static_cast<std::uint32_t>(blockIdx.y);
+    const auto lane = static_cast<std::uint32_t>(threadIdx.x);
+    const auto expert_base = static_cast<std::uint32_t>(blockIdx.x) * kRouterExpertsPerBlock;
+    __shared__ float tile_input[kRouterFeaturesPerTile];
+    __shared__ float tile_weights[kRouterExpertsPerBlock][kRouterCoefficientPitch];
+    float sum = 0.0F;
+    const auto hidden_base = static_cast<std::uint64_t>(row) * hidden_size;
+    for (std::uint32_t tile = 0; tile < hidden_size; tile += kRouterFeaturesPerTile) {
+        const auto remaining = hidden_size - tile;
+        const auto count = remaining < kRouterFeaturesPerTile ? remaining : kRouterFeaturesPerTile;
+        // Separate global load and LDS publication lets independent coefficient
+        // loads stay in flight. The inactive expert/tail lanes still synchronize.
+        float coefficients[kRouterExpertsPerBlock * kRouterFeaturesPerTile / kRouterProjectionThreads];
+        #pragma unroll
+        for (std::uint32_t item = 0; item < kRouterExpertsPerBlock * kRouterFeaturesPerTile / kRouterProjectionThreads; ++item) {
+            const auto flat = lane + item * kRouterProjectionThreads;
+            const auto expert = expert_base + flat / kRouterFeaturesPerTile;
+            const auto feature = flat % kRouterFeaturesPerTile;
+            coefficients[item] = expert < expert_count && feature < count
+                ? load_weight<WeightKind>(weights, hidden_size, expert, tile + feature) : 0.0F;
+        }
+        for (std::uint32_t feature = lane; feature < count; feature += kRouterProjectionThreads)
+            tile_input[feature] = load_activation(hidden, hidden_base + tile + feature);
+        #pragma unroll
+        for (std::uint32_t item = 0; item < kRouterExpertsPerBlock * kRouterFeaturesPerTile / kRouterProjectionThreads; ++item) {
+            const auto flat = lane + item * kRouterProjectionThreads;
+            tile_weights[flat / kRouterFeaturesPerTile][flat % kRouterFeaturesPerTile] = coefficients[item];
+        }
+        __syncthreads();
+        if (lane < kRouterExpertsPerBlock && expert_base + lane < expert_count)
+            for (std::uint32_t feature = 0; feature < count; ++feature)
+                // Baseline gfx1151 code objects use fused FP32 accumulation
+                // in the ascending dot chain; pin that operation explicitly.
+                sum = __builtin_fmaf(tile_input[feature], tile_weights[lane][feature], sum);
+        __syncthreads();
+    }
+    if (lane < kRouterExpertsPerBlock && expert_base + lane < expert_count)
+        workspace[static_cast<std::uint64_t>(row) * expert_count + expert_base + lane] = sum;
+}
+
+__global__ void parallel_moe_route_select_kernel(
+    const float* workspace, std::uint32_t expert_count, std::uint32_t top_k,
+    bool normalize_selected, std::uint32_t* selected_indices, float* selected_weights) {
+    const auto row = static_cast<std::uint32_t>(blockIdx.x);
+    const auto lane = static_cast<std::uint32_t>(threadIdx.x);
+    __shared__ float logits[kMaxExperts];
+    __shared__ float scratch[kThreads];
+    for (std::uint32_t expert = lane; expert < expert_count; expert += blockDim.x)
+        logits[expert] = workspace[static_cast<std::uint64_t>(row) * expert_count + expert];
+    __syncthreads();
+
+    float local_max =
+        -INFINITY;
+    for (std::uint32_t expert = lane;
+         expert < expert_count;
+         expert += blockDim.x) {
+        local_max =
+            fmaxf(
+                local_max,
+                logits[expert]);
+    }
+    scratch[lane] = local_max;
+    __syncthreads();
+
+    for (std::uint32_t stride =
+             blockDim.x / 2U;
+         stride > 0;
+         stride >>= 1U) {
+        if (lane < stride) {
+            scratch[lane] =
+                fmaxf(
+                    scratch[lane],
+                    scratch[
+                        lane + stride]);
+        }
+        __syncthreads();
+    }
+    const float maximum =
+        scratch[0];
+    // Every wave must retain the maximum before lane zero reuses scratch[0]
+    // for its contribution to the denominator reduction.
+    __syncthreads();
+
+    float local_sum = 0.0F;
+    for (std::uint32_t expert = lane;
+         expert < expert_count;
+         expert += blockDim.x) {
+        const float probability =
+            expf(
+                logits[expert] -
+                maximum);
+        logits[expert] =
+            probability;
+        local_sum += probability;
+    }
+    scratch[lane] = local_sum;
+    __syncthreads();
+
+    for (std::uint32_t stride =
+             blockDim.x / 2U;
+         stride > 0;
+         stride >>= 1U) {
+        if (lane < stride) {
+            scratch[lane] +=
+                scratch[lane + stride];
+        }
+        __syncthreads();
+    }
+    const float denominator =
+        scratch[0];
+
+    for (std::uint32_t expert = lane;
+         expert < expert_count;
+         expert += blockDim.x) {
+        logits[expert] /=
+            denominator;
+    }
+    __syncthreads();
+
+    if (lane == 0) {
+        float best_values[kMaxTopK];
+        std::uint32_t best_indices[
+            kMaxTopK];
+
+        for (std::uint32_t slot = 0;
+             slot < top_k;
+             ++slot) {
+            best_values[slot] =
+                -INFINITY;
+            best_indices[slot] =
+                expert_count;
+        }
+
+        for (std::uint32_t expert = 0;
+             expert < expert_count;
+             ++expert) {
+            const float probability =
+                logits[expert];
+
+            for (std::uint32_t slot = 0;
+                 slot < top_k;
+                 ++slot) {
+                if (!better(
+                        probability,
+                        expert,
+                        best_values[slot],
+                        best_indices[slot])) {
+                    continue;
+                }
+
+                for (std::uint32_t move =
+                         top_k - 1U;
+                     move > slot;
+                     --move) {
+                    best_values[move] =
+                        best_values[
+                            move - 1U];
+                    best_indices[move] =
+                        best_indices[
+                            move - 1U];
+                }
+                best_values[slot] =
+                    probability;
+                best_indices[slot] =
+                    expert;
+                break;
+            }
+        }
+
+        float selected_sum = 0.0F;
+        for (std::uint32_t slot = 0;
+             slot < top_k;
+             ++slot) {
+            selected_sum +=
+                best_values[slot];
+        }
+        if (!normalize_selected) {
+            selected_sum = 1.0F;
+        }
+
+        const auto output_base =
+            static_cast<std::uint64_t>(
+                row) *
+            top_k;
+        for (std::uint32_t slot = 0;
+             slot < top_k;
+             ++slot) {
+            selected_indices[
+                output_base + slot] =
+                best_indices[slot];
+            selected_weights[
+                output_base + slot] =
+                best_values[slot] /
+                selected_sum;
+        }
+    }
+}
+
 std::uint64_t required_router_weight_bytes(
     RouterWeightKind kind,
     std::uint32_t hidden_size,
@@ -467,7 +679,7 @@ std::uint64_t required_router_weight_bytes(
 template <
     typename Activation,
     RouterWeightKind WeightKind>
-void launch_typed(
+void launch_default_typed(
     const ExecutionDispatchContext& context,
     const HipMoeRouteLauncherConfig& config,
     const ExecutionBufferAddress& hidden,
@@ -501,6 +713,39 @@ void launch_typed(
     check_hip(
         hipGetLastError(),
         "HIP MoE route kernel launch");
+}
+
+template <typename Activation, RouterWeightKind WeightKind>
+void launch_typed(
+    const ExecutionDispatchContext& context, const HipMoeRouteLauncherConfig& config,
+    const ExecutionBufferAddress& hidden, const RuntimeTensorBinding& weight,
+    const ExecutionBufferAddress& indices, const ExecutionBufferAddress& weights) {
+    if (!config.parallel_projection) {
+        launch_default_typed<Activation, WeightKind>(context, config, hidden, weight, indices, weights);
+        return;
+    }
+    if (context.logical_rows == 0 || context.logical_rows > 65535U)
+        throw std::invalid_argument("parallel router row grid exceeds HIP launch limits");
+    const auto workspace = resolve_dispatch_temporary(context, 0);
+    const auto* workspace_allocation = find_arena_allocation(*context.arena, workspace.use);
+    if (workspace_allocation == nullptr || workspace_allocation->first_step != context.step_id ||
+        workspace_allocation->last_step != context.step_id)
+        throw std::invalid_argument("parallel router workspace does not belong to this step");
+    const auto required = static_cast<std::uint64_t>(context.logical_rows) * config.expert_count * sizeof(float);
+    if (workspace.use.buffer.buffer_class != ExecutionBufferClass::router_workspace ||
+        workspace.address % 16U != 0 || workspace.bytes < required || workspace.allocation_generation == 0)
+        throw std::invalid_argument("parallel router requires admitted aligned FP32 logits workspace");
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(parallel_moe_route_logits_kernel<Activation, WeightKind>),
+        dim3((config.expert_count + kRouterExpertsPerBlock - 1U) / kRouterExpertsPerBlock, context.logical_rows),
+        dim3(kRouterProjectionThreads), 0, hip_execution_stream(),
+        reinterpret_cast<const Activation*>(hidden.address), reinterpret_cast<const void*>(weight.address),
+        config.hidden_size, config.expert_count, reinterpret_cast<float*>(workspace.address));
+    check_hip(hipGetLastError(), "HIP parallel MoE route logits launch");
+    hipLaunchKernelGGL(parallel_moe_route_select_kernel, dim3(context.logical_rows), dim3(kThreads),
+        0, hip_execution_stream(), reinterpret_cast<const float*>(workspace.address),
+        config.expert_count, config.top_k, config.normalize_selected,
+        reinterpret_cast<std::uint32_t*>(indices.address), reinterpret_cast<float*>(weights.address));
+    check_hip(hipGetLastError(), "HIP parallel MoE route selection launch");
 }
 
 template <typename Activation>
@@ -585,6 +830,11 @@ void launch_moe_route(
             HipMoeRouteLauncherConfig*>(
                 user_data);
     validate_config(config);
+    if (context.temporaries.size() != (config.parallel_projection ? 1U : 0U))
+        throw std::invalid_argument("router temporary IO differs from launcher topology");
+    if (config.parallel_projection &&
+        context.temporaries.front().buffer.buffer_class != ExecutionBufferClass::router_workspace)
+        throw std::invalid_argument("parallel router temporary must use router_workspace");
 
     const auto hidden =
         resolve_dispatch_read(
@@ -737,7 +987,7 @@ std::string route_kernel_id(
             request.logical_rows) +
         ".c" +
         std::to_string(
-            request.request_concurrency);
+            request.request_concurrency) + (config.parallel_projection ? ".parallel" : "");
 }
 
 std::uint64_t launcher_identity(
@@ -756,6 +1006,7 @@ std::uint64_t launcher_identity(
         config.normalize_selected
             ? 1ULL
             : 0ULL);
+    if (config.parallel_projection) hash_u64(hash, 0x524f555445525057ULL);
     return hash;
 }
 
@@ -773,6 +1024,8 @@ void register_hip_moe_route_kernel_variant(
             error);
     }
     validate_config(config);
+    if (config.parallel_projection != request.parallel_moe_router)
+        throw std::invalid_argument("router variant mode differs from binding request");
     if (config.hidden_size !=
             model.hidden_size ||
         config.expert_count !=
@@ -816,8 +1069,8 @@ void register_hip_moe_route_kernel_variant(
     variant.resources.workgroup_threads =
         kThreads;
     variant.resources.lds_bytes =
-        (kMaxExperts + kThreads) *
-        sizeof(float);
+        config.parallel_projection ? kRouterDeclaredLdsBytes :
+        (kMaxExperts + kThreads) * sizeof(float);
     variant.numerics.input_precision =
         activation_name(
             config.activation);
@@ -834,8 +1087,8 @@ void register_hip_moe_route_kernel_variant(
         "row-major+ggml-router";
     variant.output_layout =
         "topk-indices+fp32-weights";
-    variant.compiler_identity =
-        "hip-gfx1151-moe-route-v2";
+    variant.compiler_identity = config.parallel_projection
+        ? "hip-gfx1151-moe-route-v4-parallel" : "hip-gfx1151-moe-route-v2";
     variant.measured_seconds = 0.0;
 
     registry.add(
@@ -869,6 +1122,25 @@ register_for_compiled_execution(
             compiled.bindings.bindings.size()) {
         throw std::invalid_argument(
             "HIP MoE route bundle requires valid compiled execution");
+    }
+
+    // Check the entire router registration contract before publishing launchers.
+    if (compiled.io.steps.size() != compiled.execution.steps.size() ||
+        compiled.bindings.bindings.size() != compiled.execution.steps.size())
+        throw std::invalid_argument("router launcher preflight requires complete compiled IO and bindings");
+    if (compiled.io.router_workspace_slots != (config_.parallel_projection ? 1U : 0U))
+        throw std::invalid_argument("router launcher mode differs from compiled workspace slots");
+    for (std::size_t index = 0; index < compiled.execution.steps.size(); ++index) {
+        if (compiled.execution.steps[index].op != SerialOp::moe_route) continue;
+        const auto& binding = compiled.bindings.bindings[index];
+        const auto& io = compiled.io.steps[index];
+        if (!binding.kernel_id.has_value() ||
+            binding.kernel_id->ends_with(".parallel") != config_.parallel_projection)
+            throw std::invalid_argument("router launcher mode differs from compiled kernel binding");
+        if (io.step_id != compiled.execution.steps[index].id || io.op != SerialOp::moe_route ||
+            io.temporaries.size() != (config_.parallel_projection ? 1U : 0U) ||
+            (config_.parallel_projection && io.temporaries.front().buffer.buffer_class != ExecutionBufferClass::router_workspace))
+            throw std::invalid_argument("router launcher mode differs from compiled temporary IO");
     }
 
     std::string registered_id;

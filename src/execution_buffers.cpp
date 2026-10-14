@@ -154,6 +154,11 @@ ExecutionBufferPlan build_serial_execution_buffer_plan(
     plan.hyper_workspace_bytes = product(request.logical_rows,
         checked_add(checked_mul(model.hidden_size, model.hc_count), model.hc_lowrank), model.bytes_fp32);
 
+    if (request.parallel_moe_router) {
+        const auto raw = product(request.logical_rows, model.num_experts, sizeof(float));
+        plan.router_workspace_bytes = checked_add(raw, 255ULL) & ~255ULL;
+    }
+
     const auto attn_inject_peak =
         checked_add(
             checked_add(
@@ -208,6 +213,10 @@ ExecutionBufferPlan build_serial_execution_buffer_plan(
             ple_peak,
             indexed_attention_peak,
             checked_add(attn_inject_peak, plan.hyper_workspace_bytes),
+            checked_add(checked_add(checked_add(plan.expanded_hidden_bytes, plan.hidden_bytes),
+                                   plan.injection_weight_bytes),
+                        checked_add(checked_add(plan.route_index_bytes, plan.route_weight_bytes),
+                                    plan.router_workspace_bytes)),
         });
 
     const auto logits_stage_peak =
