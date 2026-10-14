@@ -558,7 +558,7 @@ Initial host-side implementation:
 
 - candidate evaluation separates capacity and latency objectives;
 - capacity feasibility is checked per-node rather than by total parameter balance;
-- latency estimates use critical-path compute plus uncovered communication and control cost;
+- latency estimates sum serial node step durations (including remote command/ACK completion) plus full serial boundary communication and remaining control costs;
 - synchronization count is retained but is not an automatic rejection criterion;
 - search requires at least one whole-layer baseline while allowing finer operator-level latency candidates;
 - capacity selection minimizes maximum per-node weight footprint with imbalance/token-time tie breakers;

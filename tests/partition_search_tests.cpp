@@ -1,6 +1,7 @@
 #include "strix/partition_search.hpp"
 
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <vector>
 
@@ -76,11 +77,82 @@ int main() {
     expect(result.latency_choice.has_value() &&
                *result.latency_choice == 1,
            "latency objective may select finer operator partition");
-    expect(result.evaluations[1].critical_compute_us == 42.0 &&
-               result.evaluations[1].estimated_token_us == 52.0,
-           "partition cost uses critical compute plus uncovered communication/control");
+    expect(result.evaluations[1].critical_compute_us == 82.0 &&
+               result.evaluations[1].estimated_token_us == 92.0,
+           "serial partition cost sums both node compute totals plus communication/control");
+    expect(result.evaluations[0].critical_compute_us == 117.0 &&
+               result.evaluations[0].estimated_token_us == 140.0 &&
+               !result.evaluations[0].latency_useful,
+           "balanced capacity split is not automatically latency useful");
     expect(!result.evaluations[2].capacity_feasible,
            "over-budget candidate is never selected despite low latency");
+
+    {
+        auto threshold_policy = policy;
+        threshold_policy.minimum_latency_improvement_fraction = 0.25;
+        auto threshold_candidate = candidates[0];
+        threshold_candidate.node0_compute_us = 35.0;
+        threshold_candidate.node1_compute_us = 30.0;
+        threshold_candidate.uncovered_communication_us = 7.0;
+        threshold_candidate.control_us = 3.0;
+        const auto exact = strix::evaluate_partition_candidate(threshold_candidate, threshold_policy);
+        expect(exact.estimated_token_us == 75.0 && exact.latency_improvement_fraction == 0.25 && exact.latency_useful,
+               "serial estimate includes a candidate exactly at the improvement threshold");
+        threshold_candidate.control_us = 3.5;
+        expect(!strix::evaluate_partition_candidate(threshold_candidate, threshold_policy).latency_useful,
+               "additional serial control cost rejects a candidate above the threshold");
+    }
+
+    {
+        auto balanced = candidates[0];
+        balanced.node0_compute_us = 50.0;
+        balanced.node1_compute_us = 50.0;
+        balanced.uncovered_communication_us = 7.0;
+        balanced.control_us = 3.0;
+        const auto evaluated = strix::evaluate_partition_candidate(balanced, policy);
+        expect(evaluated.capacity_feasible && evaluated.critical_compute_us == 100.0 &&
+                   evaluated.estimated_token_us == 110.0 && !evaluated.latency_useful,
+               "two serial half-workloads retain full compute cost and communication overhead");
+        const auto capacity_only = strix::search_partition_candidates({&balanced, 1}, policy);
+        expect(capacity_only.capacity_choice == 0 && !capacity_only.latency_choice.has_value(),
+               "capacity-only candidate remains selectable without a false latency choice");
+        auto no_capacity_policy = policy;
+        no_capacity_policy.node0_weight_budget_bytes = 1;
+        no_capacity_policy.node1_weight_budget_bytes = 1;
+        const auto none = strix::search_partition_candidates(candidates, no_capacity_policy);
+        expect(!none.capacity_choice.has_value() && !none.latency_choice.has_value(),
+               "no eligible candidate yields no capacity or latency choice");
+    }
+    for (const auto model : {strix::PartitionComputeModel::stage_overlap,
+                            static_cast<strix::PartitionComputeModel>(255)}) {
+        auto unsupported = policy;
+        unsupported.compute_model = model;
+        bool rejected_model = false;
+        try { (void)strix::search_partition_candidates(candidates, unsupported); }
+        catch (const std::invalid_argument&) { rejected_model = true; }
+        expect(rejected_model, "unsupported overlap or invalid compute model fails closed");
+    }
+    {
+        const auto maximum = std::numeric_limits<double>::max();
+        for (unsigned field = 0; field < 4; ++field) {
+            auto overflow = candidates[0];
+            auto overflow_policy = policy;
+            overflow.node0_compute_us = maximum / 2.0;
+            overflow.node1_compute_us = 0.0;
+            overflow.uncovered_communication_us = 0.0;
+            overflow.control_us = 0.0;
+            if (field == 0) {
+                overflow.node0_compute_us = maximum;
+                overflow.node1_compute_us = maximum;
+            } else if (field == 1) overflow.uncovered_communication_us = maximum;
+            else if (field == 2) overflow.control_us = maximum;
+            else overflow_policy.local_serial_token_us = std::numeric_limits<double>::min();
+            bool overflow_rejected = false;
+            try { (void)strix::evaluate_partition_candidate(overflow, overflow_policy); }
+            catch (const std::overflow_error&) { overflow_rejected = true; }
+            expect(overflow_rejected, "nonfinite serial sum, overhead or improvement is rejected");
+        }
+    }
 
     {
         strix::DistributedPlacementPlan placement;
@@ -163,6 +235,9 @@ int main() {
                 built.uncovered_communication_us == 3.0 &&
                 built.control_us == 1.0,
             "placement candidate builder derives resident memory and measured step/boundary cost");
+        const auto evaluated_built = strix::evaluate_partition_candidate(built, policy);
+        expect(evaluated_built.critical_compute_us == 22.0 && evaluated_built.estimated_token_us == 26.0,
+               "actual placement-derived node timings are summed in the serial model");
 
         strix::PartitionCandidateBuildPolicy
             all_policy;
