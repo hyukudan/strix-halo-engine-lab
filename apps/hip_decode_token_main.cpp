@@ -168,6 +168,7 @@ struct Options {
     bool planned_ple_io = false;
     bool parallel_hyper_mix = false;
     bool staged_hyper_projections = false;
+    bool virtual_q8_lm_head = false;
     std::uint64_t ple_max_rows_per_io = 4;
     std::uint64_t ple_max_inflight_ios = 4;
     std::string reference_path;
@@ -192,7 +193,7 @@ Options parse_options(
             "[--context N] [--residency register|copy] [--coalesce-gap BYTES] "
             "[--planned-ple-io] [--ple-max-rows-per-io N] [--ple-max-inflight-ios N] "
             "[--generate N] [--eos-token TOKEN_ID] [--prefix-cache-roundtrip] "
-            "[--parallel-hyper-mix [--staged-hyper-projections]]");
+            "[--parallel-hyper-mix [--staged-hyper-projections]] [--virtual-q8-lm-head]");
     }
 
     Options options;
@@ -208,6 +209,11 @@ Options parse_options(
         if (argument == "--parallel-hyper-mix") {
             if (options.parallel_hyper_mix) throw std::invalid_argument("duplicate parallel hyper-mix option");
             options.parallel_hyper_mix = true;
+            continue;
+        }
+        if (argument == "--virtual-q8-lm-head") {
+            if (options.virtual_q8_lm_head) throw std::invalid_argument("duplicate virtual Q8 LM-head option");
+            options.virtual_q8_lm_head = true;
             continue;
         }
         if (argument == "--staged-hyper-projections") {
@@ -453,6 +459,8 @@ Options parse_options(
     }
     if (options.staged_hyper_projections && !options.parallel_hyper_mix)
         throw std::invalid_argument("--staged-hyper-projections requires --parallel-hyper-mix");
+    if (options.virtual_q8_lm_head && options.execution.integer_head != strix::DecodeIntegerHead::none)
+        throw std::invalid_argument("integer and virtual Q8 LM heads are mutually exclusive");
     return options;
 }
 
@@ -799,6 +807,17 @@ int main(
     const auto tensor_index =
         strix::build_model_tensor_index(
             manifest);
+    if (options.virtual_q8_lm_head) {
+        std::size_t output_heads = 0;
+        for (const auto& tensor : manifest.tensors) {
+            if (tensor.role != strix::TensorRole::output_head) continue;
+            ++output_heads;
+            if (tensor.ggml_type != 8U || model.hidden_size % 32U != 0U)
+                throw std::invalid_argument("--virtual-q8-lm-head requires an aligned Q8_0 output head");
+        }
+        if (output_heads != 1U)
+            throw std::invalid_argument("--virtual-q8-lm-head requires exactly one output head");
+    }
     const auto original_work_device = std::make_shared<strix::HipSetupQuiescenceGuard>();
     auto target_architecture = original_work_device->architecture();
     if (const auto suffix = target_architecture.find(':'); suffix != std::string::npos)
@@ -823,6 +842,7 @@ int main(
     catalog_config.enable_device_graph_inputs = graph_mode;
     catalog_config.parallel_hyper_mix = options.parallel_hyper_mix;
     catalog_config.staged_hyper_projections = options.staged_hyper_projections;
+    catalog_config.virtual_q8_lm_head = options.virtual_q8_lm_head;
     std::optional<strix::integer_projection::RuntimeConfig> integer_config;
     if (options.execution.integer_head != strix::DecodeIntegerHead::none) {
         integer_config = strix::make_decode_integer_head_config(model, manifest, options.execution,

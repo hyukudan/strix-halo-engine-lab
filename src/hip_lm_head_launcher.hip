@@ -416,6 +416,45 @@ __global__ void lm_head_kernel(
     }
 }
 
+// Emulate all 256 original leaves and their tree inside one 32-lane wave.
+// Local register reduction MUST follow the five cross-lane stages.
+template <typename Input>
+__global__ __launch_bounds__(32) void virtual_q8_lm_head_kernel(
+    const Input* hidden, const void* weights, std::uint32_t hidden_size,
+    std::uint32_t vocab_size, float* logits) {
+    const auto row = static_cast<std::uint32_t>(blockIdx.x);
+    const auto lane = static_cast<std::uint32_t>(threadIdx.x);
+    if (row >= vocab_size) return;
+    float partial[8] = {};
+    for (std::uint64_t chunk = 0; chunk < hidden_size; chunk += kThreads) {
+#pragma unroll
+        for (std::uint32_t local = 0; local < 8; ++local) {
+            const auto feature = chunk + lane * 8ULL + local;
+            if (feature < hidden_size)
+                partial[local] += load_activation(&hidden[feature]) *
+                    load_weight<WeightKind::q8_0>(weights, hidden_size, row,
+                        static_cast<std::uint32_t>(feature));
+        }
+    }
+    for (std::uint32_t distance = 16; distance > 0; distance >>= 1U) {
+#pragma unroll
+        for (std::uint32_t local = 0; local < 8; ++local) {
+            const float partner = __shfl_down(partial[local], distance, 32);
+            if (lane < distance) partial[local] += partner;
+        }
+    }
+    if (lane == 0) {
+        partial[0] += partial[4];
+        partial[1] += partial[5];
+        partial[2] += partial[6];
+        partial[3] += partial[7];
+        partial[0] += partial[2];
+        partial[1] += partial[3];
+        partial[0] += partial[1];
+        logits[row] = partial[0];
+    }
+}
+
 template <
     typename Input,
     WeightKind Kind>
@@ -424,6 +463,19 @@ void launch_typed(
     const HipLmHeadLauncherConfig& config,
     const ExecutionBufferAddress& hidden,
     const ExecutionBufferAddress& logits) {
+    if (config.virtual_q8_wave) {
+        if constexpr (Kind != WeightKind::q8_0) {
+            throw std::invalid_argument("virtual-wave LM head supports Q8_0 weights only");
+        } else {
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(virtual_q8_lm_head_kernel<Input>),
+                dim3(config.vocab_size), dim3(32), 0, hip_execution_stream(),
+                reinterpret_cast<const Input*>(hidden.address),
+                reinterpret_cast<const void*>(weights.address), config.hidden_size,
+                config.vocab_size, reinterpret_cast<float*>(logits.address));
+            check_hip(hipGetLastError(), "HIP virtual-wave Q8 LM-head launch");
+            return;
+        }
+    }
     hipLaunchKernelGGL(
         HIP_KERNEL_NAME(
             lm_head_kernel<
@@ -637,7 +689,7 @@ std::string kernel_id(
             request.logical_rows) +
         ".c" +
         std::to_string(
-            request.request_concurrency);
+            request.request_concurrency) + (config.virtual_q8_wave ? ".virtual256.q8" : "");
 }
 
 std::uint64_t implementation_identity(
@@ -650,6 +702,7 @@ std::uint64_t implementation_identity(
         hash,
         static_cast<std::uint64_t>(
             config.input));
+    if (config.virtual_q8_wave) hash_u64(hash, 0x5649525451323536ULL);
     return hash;
 }
 
@@ -707,9 +760,9 @@ void register_hip_lm_head_kernel_variant(
     variant.wave =
         kernels::WaveSize::wave32;
     variant.resources.workgroup_threads =
-        kThreads;
+        config.virtual_q8_wave ? 32U : kThreads;
     variant.resources.lds_bytes =
-        kThreads * sizeof(float);
+        config.virtual_q8_wave ? 0U : kThreads * sizeof(float);
     variant.numerics.input_precision =
         storage_name(
             config.input);
@@ -727,7 +780,7 @@ void register_hip_lm_head_kernel_variant(
     variant.output_layout =
         "fp32-logits";
     variant.compiler_identity =
-        "hip-gfx1151-lm-head-v1";
+        config.virtual_q8_wave ? "hip-gfx1151-lm-head-v2-virtual256-q8" : "hip-gfx1151-lm-head-v1";
     variant.measured_seconds = 0.0;
 
     registry.add(

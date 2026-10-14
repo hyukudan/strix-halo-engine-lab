@@ -14,6 +14,7 @@ struct HipLmHeadLauncherConfig {
     std::uint32_t vocab_size = 0;
     HipActivationStorage input =
         HipActivationStorage::bf16;
+    bool virtual_q8_wave = false;
 };
 
 void register_hip_lm_head_kernel_variant(

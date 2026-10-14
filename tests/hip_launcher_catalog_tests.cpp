@@ -14,6 +14,7 @@
 #include "strix/hip_runtime_launchers.hpp"
 #include "strix/kernel_registry.hpp"
 #include "strix/model_contract.hpp"
+#include "strix/integer_projection_runtime.hpp"
 
 #include <cstdint>
 #include <iostream>
@@ -90,6 +91,21 @@ strix::kernels::KernelVariant placeholder_variant(
 int main() {
     const auto model =
         strix::ModelContract::qwen38_flash_next();
+    {
+        strix::HipLauncherCatalogConfig conflict;
+        conflict.virtual_q8_lm_head = true;
+        strix::integer_projection::RuntimeConfig integer_config;
+        strix::ExecutionBindingRequest conflict_request;
+        strix::kernels::KernelRegistry conflict_registry;
+        bool rejected = false;
+        try { strix::register_complete_hip_kernel_catalog(model, conflict_request,
+            conflict, conflict_registry, &integer_config); }
+        catch (const std::invalid_argument& error) {
+            rejected = std::string(error.what()).find("mutually exclusive") != std::string::npos;
+        }
+        expect(rejected && conflict_registry.variants().empty(),
+            "integer and virtual Q8 catalog reject before registering any variant");
+    }
 
     strix::ExecutionBindingRequest request;
     request.logical_rows = 1;
