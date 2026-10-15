@@ -25,6 +25,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
@@ -588,11 +589,13 @@ Reference cpu_reference(
 int main(int argc, char** argv) try {
     auto model = fixture_model();
     const bool candidate_enabled = argc >= 2;
-    if (argc == 2 || (argc == 3 && std::string(argv[2]) == "fallback")) {
-        dense_q8_fixture = argc == 2;
+    const std::string fixture_mode = argc == 3 ? argv[2] : "";
+    const bool prefetch_enabled = fixture_mode == "prefetch" || fixture_mode == "prefetch-fallback";
+    if (argc == 2 || (argc == 3 && (fixture_mode == "fallback" || prefetch_enabled))) {
+        dense_q8_fixture = fixture_mode != "fallback" && fixture_mode != "prefetch-fallback";
         dense_q8_width = static_cast<std::uint32_t>(std::stoul(argv[1]));
-        if (dense_q8_width != 128U && dense_q8_width != 288U && dense_q8_width != 640U && dense_q8_width != 2560U)
-            throw std::invalid_argument("GDN Q8 fixture supports widths128,288,640,2560");
+        if (dense_q8_width != 128U && dense_q8_width != 288U && dense_q8_width != 480U && dense_q8_width != 640U && dense_q8_width != 2560U)
+            throw std::invalid_argument("GDN Q8 fixture supports widths128,288,480,640,2560");
         model.hidden_size = dense_q8_width;
     } else if (argc != 1) throw std::invalid_argument("GDN fixture accepts width and optional fallback mode");
     const auto plan =
@@ -1222,11 +1225,42 @@ int main(int argc, char** argv) try {
             candidate.resources.lds_bytes == original.resources.lds_bytes && candidate.resources.scratch_bytes == original.resources.scratch_bytes &&
             candidate.resources.workgroup_threads == 256U && candidate.resources.lds_bytes == 16640U,
             "composite GDN conservative resource bounds remain unchanged");
+        expect(strix::make_hip_gdn_launcher(candidate.id, &candidate_config).implementation_identity == 0x6df298901ec0691aULL,
+            "current virtual input hash remains independently golden");
+        auto prefetch_config = candidate_config; prefetch_config.prefetch_q8_input_projections = true;
+        strix::kernels::KernelRegistry prefetch_registry;
+        strix::register_hip_gdn_kernel_variant(prefetch_config.model, gdn_request, prefetch_config, prefetch_registry);
+        const auto& prefetched = prefetch_registry.variants().front();
+        expect(prefetched.id == "hip.gdn.bf16.h128.kh16.vh48.d128.r1.c1.scalar.prefetch8.virtual256.q8-input" &&
+            prefetched.compiler_identity == "hip-gfx1151-gdn-v4-prefetch8-virtual256-q8-input" &&
+            prefetched.resources.workgroup_threads == original.resources.workgroup_threads &&
+            prefetched.resources.lds_bytes == original.resources.lds_bytes && prefetched.resources.scratch_bytes == original.resources.scratch_bytes,
+            "prefetch id/compiler are distinct and composite resources unchanged");
+        expect(strix::make_hip_gdn_launcher(prefetched.id, &prefetch_config).implementation_identity == 0x31229ee8b0186323ULL,
+            "prefetch implementation hash remains independently golden and distinct");
+        auto invalid_config = default_config; invalid_config.prefetch_q8_input_projections = true;
+        bool register_rejected = false, factory_rejected = false;
+        try { strix::kernels::KernelRegistry invalid; strix::register_hip_gdn_kernel_variant(invalid_config.model, gdn_request, invalid_config, invalid); }
+        catch (const std::invalid_argument&) { register_rejected = true; }
+        try { static_cast<void>(strix::make_hip_gdn_launcher("test.invalid.prefetch", &invalid_config)); }
+        catch (const std::invalid_argument&) { factory_rejected = true; }
+        expect(register_rejected && factory_rejected, "prefetch without virtual rejects at registry and factory");
         strix::CompiledSerialExecution minimal;
         minimal.execution_identity = 0x47444e5142494e44ULL;
         minimal.execution.steps.push_back(step);
         strix::ExecutionKernelBinding binding; binding.op = step.op; binding.step_id = step.id;
         binding.kernel_id = candidate.id; minimal.bindings.bindings.push_back(binding);
+        std::array<strix::HipGdnLauncherConfig, 3> modes{default_config, candidate_config, prefetch_config};
+        const std::array<std::string, 3> ids{original.id, candidate.id, prefetched.id};
+        for (std::size_t mode = 0; mode < modes.size(); ++mode)
+            for (std::size_t selected = 0; selected < ids.size(); ++selected) {
+                minimal.bindings.bindings.front().kernel_id = ids[selected];
+                strix::HipGdnLauncherBundle bundle(modes[mode]); strix::ExecutionLauncherRegistry registry;
+                bool accepted = true;
+                try { bundle.register_for_compiled_execution(minimal, registry); }
+                catch (const std::invalid_argument&) { accepted = false; }
+                expect(accepted == (mode == selected), "GDN3x3 config/selected-id matrix admits exactly matching modes");
+            }
         for (unsigned direction = 0; direction < 2; ++direction) {
             minimal.bindings.bindings.front().kernel_id = direction == 0 ? candidate.id : original.id;
             strix::HipGdnLauncherBundle mismatched(direction == 0 ? default_config : candidate_config);
@@ -1354,17 +1388,20 @@ int main(int argc, char** argv) try {
     const auto first_matrix = actual_matrix;
     const auto first_output = actual_output;
     config.virtual_q8_input_projections = candidate_enabled;
+    config.prefetch_q8_input_projections = prefetch_enabled;
     const auto original_identity = launcher.implementation_identity;
     launcher = strix::make_hip_gdn_launcher("test.gdn.virtual", &config);
     expect((launcher.implementation_identity != original_identity) == candidate_enabled,
         "virtual GDN implementation identity is opt-in");
     if (dense_q8_fixture) {
-        const auto reject_before_launch = [&](auto mutate, auto restore) {
+        const auto reject_before_launch = [&](auto mutate, auto restore, const char* expected_error = nullptr) {
             poison_arena(nullptr);
             check(hipDeviceSynchronize(), "drain GDN admission poison");
-            mutate(); bool rejected = false;
+            mutate(); bool rejected = false; std::string rejection;
             try { launcher.function(context, launcher.user_data); }
-            catch (const std::logic_error&) { rejected = true; }
+            catch (const std::logic_error& error) { rejected = true; rejection = error.what(); }
+            if (expected_error) expect(rejection.find(expected_error) != std::string::npos,
+                "GDN rejection reaches the intended admission gate");
             restore();
             check(hipDeviceSynchronize(), "drain GDN admission rejection");
             std::vector<std::uint16_t> untouched(hidden);
@@ -1381,6 +1418,20 @@ int main(int argc, char** argv) try {
             expect(std::memcmp(untouched_matrix.data(), first_matrix.data(), matrix_address.bytes) == 0 && untouched_conv == actual_conv,
                 "bad GDN admission preserves persistent state");
         };
+        if (prefetch_enabled) {
+            reject_before_launch([&] { config.virtual_q8_input_projections = false; },
+                [&] { config.virtual_q8_input_projections = true; }, "requires virtual");
+            const auto saved_hidden = config.model.hidden_size;
+            reject_before_launch([&] {
+                config.model.hidden_size = saved_hidden - 1U;
+                for (const auto index : {0U, 1U, 5U, 6U}) manifest.tensors[index].dimensions[0] = saved_hidden - 1U;
+                manifest.tensors[8].dimensions[1] = saved_hidden - 1U;
+            }, [&] {
+                config.model.hidden_size = saved_hidden;
+                for (const auto index : {0U, 1U, 5U, 6U}) manifest.tensors[index].dimensions[0] = saved_hidden;
+                manifest.tensors[8].dimensions[1] = saved_hidden;
+            }, "width must divide 32");
+        }
         const auto saved_bytes = runtime.tensors[0].bytes;
         reject_before_launch([&] { runtime.tensors[0].bytes = saved_bytes - 1U; },
             [&] { runtime.tensors[0].bytes = saved_bytes; });
@@ -1416,6 +1467,28 @@ int main(int argc, char** argv) try {
                 "candidate convolution preserves BF16-visible fused-leaf control");
         expect(std::memcmp(actual_matrix.data(), first_matrix.data(), matrix_address.bytes) == 0 &&
             actual_output == first_output, "repeated identical GDN input/state is bit deterministic");
+        if (prefetch_enabled) {
+            auto streaming_config = config; streaming_config.prefetch_q8_input_projections = false;
+            auto streaming_launcher = strix::make_hip_gdn_launcher("test.gdn.streaming", &streaming_config);
+            check(hipMemcpy(reinterpret_cast<void*>(matrix_address.address), matrix_state.data(), matrix_address.bytes,
+                hipMemcpyHostToDevice), "restore streaming reference matrix");
+            check(hipMemcpy(reinterpret_cast<void*>(conv_address.address), conv_state.data(), conv_address.bytes,
+                hipMemcpyHostToDevice), "restore streaming reference convolution");
+            poison_arena(nullptr);
+            streaming_launcher.function(context, streaming_launcher.user_data);
+            check(hipDeviceSynchronize(), "drain streaming reference");
+            std::vector<std::byte> streaming_arena(first_arena.size());
+            std::vector<float> streaming_matrix(first_matrix.size());
+            std::vector<std::uint16_t> streaming_conv(first_conv.size());
+            check(hipMemcpy(streaming_arena.data(), arena_pointer, streaming_arena.size(), hipMemcpyDeviceToHost), "read streaming arena");
+            check(hipMemcpy(streaming_matrix.data(), reinterpret_cast<void*>(matrix_address.address), matrix_address.bytes,
+                hipMemcpyDeviceToHost), "read streaming matrix");
+            check(hipMemcpy(streaming_conv.data(), reinterpret_cast<void*>(conv_address.address), conv_address.bytes,
+                hipMemcpyDeviceToHost), "read streaming convolution");
+            expect(streaming_arena == candidate_arena && streaming_conv == actual_conv &&
+                std::memcmp(streaming_matrix.data(), actual_matrix.data(), matrix_address.bytes) == 0,
+                "prefetch and current virtual streaming full arena/state bits are equal");
+        }
         float recurrence_error = 0.0F;
         for (std::size_t i = 0; i < actual_matrix.size(); ++i)
             recurrence_error = std::max(recurrence_error, std::fabs(actual_matrix[i] - expected.matrix_state[i]));
@@ -1517,6 +1590,7 @@ int main(int argc, char** argv) try {
             std::vector<float> activations(hidden);
             for (unsigned feature = 0; feature < hidden; ++feature) activations[feature] = bf16_to_float(hidden_values[feature]);
             std::size_t offset = 0;
+            std::vector<std::uint32_t> all_bits;
             for (std::size_t projection = 0; projection < widths.size(); ++projection) {
                 std::vector<float> raw(widths[projection]);
                 check(hipMemcpy(raw.data(), reinterpret_cast<const void*>(temporary.address + offset * sizeof(float)),
@@ -1524,6 +1598,7 @@ int main(int argc, char** argv) try {
                 std::size_t mismatch = 0; float maximum_error = 0;
                 for (unsigned row = 0; row < widths[projection]; ++row) {
                     const float expected_raw = round_bf16(project_row(activations, *matrices[projection], hidden, row));
+                    all_bits.push_back(std::bit_cast<std::uint32_t>(raw[row]));
                     if (std::bit_cast<std::uint32_t>(raw[row]) != std::bit_cast<std::uint32_t>(expected_raw)) {
                         if (mismatch < 8U) std::cerr << "GDN_INPUT_ORACLE_ROW " << label << ' ' << names[projection]
                             << " row=" << row << " actual=" << raw[row] << " expected=" << expected_raw
@@ -1556,10 +1631,47 @@ int main(int argc, char** argv) try {
             expect(guards_preserved, "isolated projections preserve input and every arena word outside their four output slices");
             check(hipGraphExecDestroy(projection_exec), "isolated projection exec destroy");
             check(hipGraphDestroy(projection_graph), "isolated projection graph destroy");
+            return all_bits;
         };
-        if (dense_q8_fixture) check_input_projections(graph.graph, "candidate");
+        std::vector<std::uint32_t> candidate_projection_bits;
+        if (dense_q8_fixture) candidate_projection_bits = check_input_projections(graph.graph, "candidate");
+        if (prefetch_enabled) {
+            auto streaming_config = graph_config; streaming_config.prefetch_q8_input_projections = false;
+            auto streaming_launcher = strix::make_hip_gdn_launcher("test.gdn.streaming.capture", &streaming_config);
+            hipGraph_t streaming_graph = nullptr;
+            check(hipStreamBeginCapture(graph.stream, hipStreamCaptureModeThreadLocal), "capture current streaming control");
+            { const strix::HipLaunchScope owned(scope); streaming_launcher.function(context, streaming_launcher.user_data); }
+            check(hipStreamEndCapture(graph.stream, &streaming_graph), "finish streaming control capture");
+            std::size_t count = 0; check(hipGraphGetNodes(streaming_graph, nullptr, &count), "count streaming control nodes");
+            expect(count == node_count, "prefetch retains streaming complete operator node count");
+            std::vector<hipGraphNode_t> streaming_nodes(count);
+            check(hipGraphGetNodes(streaming_graph, streaming_nodes.data(), &count), "get streaming control nodes");
+            std::vector<void*> streaming_other, candidate_other;
+            for (const auto node : streaming_nodes) {
+                hipGraphNodeType type{}; check(hipGraphNodeGetType(node, &type), "streaming control node type");
+                if (type != hipGraphNodeTypeKernel) continue;
+                hipKernelNodeParams params{}; check(hipGraphKernelNodeGetParams(node, &params), "streaming control kernel params");
+                if (params.blockDim.x == 32U)
+                    expect(std::find(virtual_functions.begin(), virtual_functions.end(), params.func) == virtual_functions.end(),
+                        "prefetch32 and streaming32 use distinct kernel functions");
+                else streaming_other.push_back(params.func);
+            }
+            for (const auto node : nodes) {
+                hipGraphNodeType type{}; check(hipGraphNodeGetType(node, &type), "candidate control node type");
+                if (type != hipGraphNodeTypeKernel) continue;
+                hipKernelNodeParams params{}; check(hipGraphKernelNodeGetParams(node, &params), "candidate control kernel params");
+                if (params.blockDim.x != 32U) candidate_other.push_back(params.func);
+            }
+            // std::less provides a total order for unrelated function pointers.
+            std::sort(streaming_other.begin(), streaming_other.end(), std::less<void*>{});
+            std::sort(candidate_other.begin(), candidate_other.end(), std::less<void*>{});
+            expect(streaming_other == candidate_other, "all non32 captured functions remain unchanged");
+            if (dense_q8_fixture) expect(check_input_projections(streaming_graph, "streaming") == candidate_projection_bits,
+                "prefetch and current streaming raw projection arrays match bitwise");
+            check(hipGraphDestroy(streaming_graph), "destroy streaming control graph");
+        }
         if (dense_q8_fixture) {
-            auto baseline_config = graph_config; baseline_config.virtual_q8_input_projections = false;
+            auto baseline_config = graph_config; baseline_config.virtual_q8_input_projections = false; baseline_config.prefetch_q8_input_projections = false;
             auto baseline_launcher = strix::make_hip_gdn_launcher("test.gdn.baseline.capture", &baseline_config);
             hipGraph_t baseline_graph = nullptr;
             check(hipStreamBeginCapture(graph.stream, hipStreamCaptureModeThreadLocal), "capture original GDN control");
@@ -1577,7 +1689,98 @@ int main(int argc, char** argv) try {
                 expect(params.blockDim.x != 32U && std::find(virtual_functions.begin(), virtual_functions.end(), params.func) == virtual_functions.end(),
                     "original capture uses different functions and no virtual32 input kernel");
             }
-            check_input_projections(baseline_graph, "original");
+            expect(check_input_projections(baseline_graph, "original") == candidate_projection_bits,
+                "prefetch or streaming raw projection arrays match legacy256 bitwise");
+            if (prefetch_enabled && hidden == 2560U) {
+                // Raw projection-only edge scope: mutate owned fixture payloads,
+                // never execute the recurrent/gate/output graph on these inputs.
+                auto edge_config = graph_config; edge_config.prefetch_q8_input_projections = false;
+                auto edge_launcher = strix::make_hip_gdn_launcher("test.gdn.edge.streaming", &edge_config);
+                hipGraph_t edge_streaming_graph = nullptr;
+                check(hipStreamBeginCapture(graph.stream, hipStreamCaptureModeThreadLocal), "capture edge streaming control");
+                { const strix::HipLaunchScope owned(scope); edge_launcher.function(context, edge_launcher.user_data); }
+                check(hipStreamEndCapture(graph.stream, &edge_streaming_graph), "finish edge streaming control");
+                const auto saved_hidden = hidden_values;
+                const auto saved_z = z;
+                const auto saved_packed_z = packed_q8[1];
+                constexpr std::array<std::uint16_t, 7> scales{0x0000U, 0x8000U, 0x0001U,
+                    0x03ffU, 0x0400U, 0x7bffU, 0xfbffU};
+                constexpr std::array<std::int8_t, 5> codes{-128, -1, 0, 1, 127};
+                constexpr std::array<std::uint16_t, 8> activation_bits{0x0000U, 0x8000U, 0x0001U,
+                    0x8001U, 0x0080U, 0x8080U, 0x3f80U, 0xbf80U};
+                const auto half_scale = [](std::uint16_t bits) {
+                    const auto exponent = (bits >> 10U) & 31U;
+                    const auto mantissa = bits & 1023U;
+                    const float magnitude = exponent == 0U ? std::ldexp(static_cast<float>(mantissa), -24) :
+                        std::ldexp(1.0F + static_cast<float>(mantissa) / 1024.0F,
+                            static_cast<int>(exponent) - 15);
+                    return (bits & 0x8000U) != 0U ? -magnitude : magnitude;
+                };
+                for (unsigned feature = 0; feature < hidden; ++feature)
+                    hidden_values[feature] = activation_bits[feature % activation_bits.size()];
+                for (unsigned row = 0; row < scales.size(); ++row)
+                    for (unsigned feature = 0; feature < hidden; ++feature) {
+                        const auto block = static_cast<std::size_t>(row) * (hidden / 32U) + feature / 32U;
+                        const auto bits = scales[row]; const auto code = codes[feature % codes.size()];
+                        packed_q8[1][block * 34U] = static_cast<std::byte>(bits & 255U);
+                        packed_q8[1][block * 34U + 1U] = static_cast<std::byte>(bits >> 8U);
+                        packed_q8[1][block * 34U + 2U + feature % 32U] =
+                            static_cast<std::byte>(static_cast<std::uint8_t>(code));
+                        z[static_cast<std::size_t>(row) * hidden + feature] = half_scale(bits) * static_cast<float>(code);
+                    }
+                check(hipMemcpy(device_weights[1], packed_q8[1].data(), packed_q8[1].size(), hipMemcpyHostToDevice),
+                    "upload finite edge Q8 scales and codes");
+                const auto edge_original = check_input_projections(baseline_graph, "finite-edge-original");
+                expect(check_input_projections(edge_streaming_graph, "finite-edge-streaming") == edge_original,
+                    "finite Q8 scale/code and BF16 zero/subnormal edge arrays match original/current streaming bits");
+                expect(check_input_projections(graph.graph, "finite-edge-prefetch") == edge_original,
+                    "finite Q8 scale/code and BF16 zero/subnormal edge arrays match original/prefetch bits");
+                // A decode-association mutant survives the actual BF16 epilogue:
+                // x=2^-126, scale=2^-24, code=127. Decoding first yields BF16
+                // bits2 at width2560; multiplying x*scale first underflows to0.
+                std::fill(hidden_values.begin(), hidden_values.end(), std::uint16_t{0x0080U});
+                for (unsigned feature = 0; feature < hidden; ++feature) {
+                    const auto block = feature / 32U;
+                    packed_q8[1][block * 34U] = std::byte{1};
+                    packed_q8[1][block * 34U + 1U] = std::byte{0};
+                    packed_q8[1][block * 34U + 2U + feature % 32U] = std::byte{127};
+                    z[feature] = std::ldexp(127.0F, -24);
+                }
+                check(hipMemcpy(device_weights[1], packed_q8[1].data(), packed_q8[1].size(), hipMemcpyHostToDevice),
+                    "upload decode-association underflow control");
+                const auto underflow_original = check_input_projections(baseline_graph, "underflow-original");
+                expect(underflow_original[conv_width] == 0x00020000U,
+                    "decode-first underflow control survives BF16 epilogue with bits2");
+                expect(check_input_projections(edge_streaming_graph, "underflow-streaming") == underflow_original,
+                    "underflow original/current streaming arrays match bits");
+                expect(check_input_projections(graph.graph, "underflow-prefetch") == underflow_original,
+                    "underflow original/prefetch arrays match bits");
+                // Seed every leaf with negative underflow, then accumulate -0
+                // coefficients. A coefficient decode using a +0 FMA addend
+                // changes later coefficients to +0 and the final sign to +0.
+                for (unsigned feature = 0; feature < hidden; ++feature) {
+                    hidden_values[feature] = feature < 256U ? 0x8001U : 0x3f80U;
+                    const auto block = feature / 32U;
+                    const std::uint16_t bits = feature < 256U ? 0x0001U : 0x8000U;
+                    packed_q8[1][block * 34U] = static_cast<std::byte>(bits & 255U);
+                    packed_q8[1][block * 34U + 1U] = static_cast<std::byte>(bits >> 8U);
+                    packed_q8[1][block * 34U + 2U + feature % 32U] = std::byte{1};
+                    z[feature] = half_scale(bits);
+                }
+                check(hipMemcpy(device_weights[1], packed_q8[1].data(), packed_q8[1].size(), hipMemcpyHostToDevice),
+                    "upload signed-zero decode control");
+                const auto signed_zero_original = check_input_projections(baseline_graph, "signed-zero-original");
+                expect(signed_zero_original[conv_width] == 0x80000000U,
+                    "coefficient negative zero survives ordered leaves and BF16 epilogue");
+                expect(check_input_projections(edge_streaming_graph, "signed-zero-streaming") == signed_zero_original,
+                    "signed-zero original/current streaming arrays match bits");
+                expect(check_input_projections(graph.graph, "signed-zero-prefetch") == signed_zero_original,
+                    "signed-zero original/prefetch arrays match bits");
+                hidden_values = saved_hidden; z = saved_z; packed_q8[1] = saved_packed_z;
+                check(hipMemcpy(device_weights[1], packed_q8[1].data(), packed_q8[1].size(), hipMemcpyHostToDevice),
+                    "restore ordinary Q8 z fixture");
+                check(hipGraphDestroy(edge_streaming_graph), "destroy edge streaming graph");
+            }
             check(hipGraphDestroy(baseline_graph), "destroy original GDN capture control");
         }
         if (dense_q8_fixture) {
@@ -1653,7 +1856,7 @@ int main(int argc, char** argv) try {
             copy_state(previous.matrix_state, previous.conv_state);
             auto eager_scope = scope; eager_scope.graph_capture = false;
             poison_arena(graph.stream);
-            auto baseline_config = graph_config; baseline_config.virtual_q8_input_projections = false;
+            auto baseline_config = graph_config; baseline_config.virtual_q8_input_projections = false; baseline_config.prefetch_q8_input_projections = false;
             auto baseline_launcher = strix::make_hip_gdn_launcher("test.gdn.original.device", &baseline_config);
             { const strix::HipLaunchScope owned(eager_scope); baseline_launcher.function(context, baseline_launcher.user_data); }
             check(hipStreamSynchronize(graph.stream), "complete GDN eager control");

@@ -1307,6 +1307,12 @@ if(STRIX_ENABLE_HIP_RUNTIME)
 
         add_test(NAME strix-hip-gdn-virtual-q8-f32-fallback-tests
             COMMAND strix-hip-gdn-launcher-tests 128 fallback)
+        add_test(NAME strix-hip-gdn-prefetch-q8-f32-fallback-tests
+            COMMAND strix-hip-gdn-launcher-tests 128 prefetch-fallback)
+        foreach(prefetch_width 128 288 480 640 2560)
+            add_test(NAME strix-hip-gdn-prefetch-q8-${prefetch_width}-tests
+                COMMAND strix-hip-gdn-launcher-tests ${prefetch_width} prefetch)
+        endforeach()
         foreach(q8_width 128 288 640 2560)
             add_test(NAME strix-hip-gdn-virtual-q8-${q8_width}-tests
                 COMMAND strix-hip-gdn-launcher-tests ${q8_width})
