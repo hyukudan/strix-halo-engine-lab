@@ -2,6 +2,8 @@
 #include "strix/qsa_input_prefetch.hpp"
 
 #include <limits>
+#include <algorithm>
+#include "strix/lane_chain_hyper_output.hpp"
 #include <stdexcept>
 #include <utility>
 
@@ -135,6 +137,15 @@ ExecutionBindingPlan bind_serial_execution_plan(
     }
 
     qsa_input_prefetch::validate_layers(model,request.prefetch_q8_qsa_input,request.qsa_input_prefetch_layers);
+    if(request.lane_chain_hyper_output && request.lane_chain_hyper_output_eligible_steps.empty())
+        throw std::invalid_argument("lane-chain HC output has no eligible steps");
+    if(!request.lane_chain_hyper_output && !request.lane_chain_hyper_output_eligible_steps.empty())
+        throw std::invalid_argument("lane-chain HC output step list requires opt-in");
+    for(const auto id:request.lane_chain_hyper_output_eligible_steps){
+        const auto count=std::count(request.lane_chain_hyper_output_eligible_steps.begin(),request.lane_chain_hyper_output_eligible_steps.end(),id);
+        if(count!=1 || std::none_of(plan.steps.begin(),plan.steps.end(),[&](const auto& step){return step.id==id && (step.op==SerialOp::attn_hyper_mix || step.op==SerialOp::mlp_hyper_mix || step.op==SerialOp::final_hyper_mix);}))
+            throw std::invalid_argument("lane-chain HC output invalid eligible step list");
+    }
     ExecutionBindingPlan output;
     output.bindings.reserve(plan.steps.size());
 
@@ -174,6 +185,14 @@ ExecutionBindingPlan bind_serial_execution_plan(
             const bool actual=selected->id.ends_with(qsa_input_prefetch::kernel_suffix);
             if(wanted!=actual){std::string id=selected->id;if(actual)id.resize(id.size()-qsa_input_prefetch::kernel_suffix.size());else id+=qsa_input_prefetch::kernel_suffix;
                 selected=registry.find(id);if(selected && !kernels::matches(*selected,query))selected=nullptr;}
+        }
+        if(*binding.family==kernels::OperatorFamily::hyper_mix){
+            const bool want=request.lane_chain_hyper_output && std::find(request.lane_chain_hyper_output_eligible_steps.begin(),request.lane_chain_hyper_output_eligible_steps.end(),step.id)!=request.lane_chain_hyper_output_eligible_steps.end();
+            if(selected && selected->id.ends_with(lane_chain_hyper_output_suffix)!=want){
+                const auto other=want?selected->id+lane_chain_hyper_output_suffix:selected->id.substr(0,selected->id.size()-std::string_view(lane_chain_hyper_output_suffix).size());
+                selected=registry.find(other);
+                if(selected && !kernels::matches(*selected,query))selected=nullptr;
+            }
         }
         if (selected == nullptr) {
             ++output.missing_steps;

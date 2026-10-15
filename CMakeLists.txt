@@ -27,6 +27,7 @@ endfunction()
 
 add_library(strix_core STATIC
     src/qsa_input_prefetch.cpp
+    src/lane_chain_hyper_output.cpp
     src/q51_grouped_down_contract.cpp
     src/moe_q4k_a8_runtime.cpp
     src/gdn_output_admission.cpp
@@ -241,6 +242,10 @@ if(BUILD_TESTING)
         target_compile_options(strix-moe-q4k-a8-contract-tests PRIVATE -fno-fast-math -ffp-contract=off)
     endif()
     add_test(NAME strix-moe-q4k-a8-contract-tests COMMAND strix-moe-q4k-a8-contract-tests)
+    add_executable(strix-lane-chain-hyper-output-tests tests/lane_chain_hyper_output_tests.cpp)
+    target_link_libraries(strix-lane-chain-hyper-output-tests PRIVATE strix_core)
+    strix_target_warnings(strix-lane-chain-hyper-output-tests)
+    add_test(NAME strix-lane-chain-hyper-output-tests COMMAND strix-lane-chain-hyper-output-tests)
     add_executable(strix-gdn-output-admission-tests tests/gdn_output_admission_tests.cpp)
     target_link_libraries(strix-gdn-output-admission-tests PRIVATE strix_core)
     strix_target_warnings(strix-gdn-output-admission-tests)
@@ -1258,6 +1263,13 @@ if(STRIX_ENABLE_HIP_RUNTIME)
             COMMAND strix-hip-embedding-launcher-tests
         )
 
+        add_test(NAME strix-lane-chain-cli-tests COMMAND ${CMAKE_COMMAND} -DAPP=$<TARGET_FILE:strix-hip-decode-token> -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_lane_chain_cli.cmake)
+        add_test(NAME strix-hip-lane-chain-hyper-integration-tests COMMAND strix-hip-hyper-mix-launcher-tests lane-chain)
+        add_executable(strix-hip-lane-chain-hyper-output-tests tests/hip_lane_chain_hyper_output_tests.hip)
+        set_target_properties(strix-hip-lane-chain-hyper-output-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+        target_link_libraries(strix-hip-lane-chain-hyper-output-tests PRIVATE strix_hip_runtime)
+        strix_target_warnings(strix-hip-lane-chain-hyper-output-tests)
+        add_test(NAME strix-hip-lane-chain-hyper-output-tests COMMAND strix-hip-lane-chain-hyper-output-tests)
         add_executable(
             strix-hip-hyper-mix-launcher-tests
             tests/hip_hyper_mix_launcher_tests.hip

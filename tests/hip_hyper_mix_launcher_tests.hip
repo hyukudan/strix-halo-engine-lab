@@ -1,3 +1,4 @@
+#include "strix/lane_chain_hyper_output.hpp"
 #include "strix/execution_arena.hpp"
 #include "strix/dispatch_resources.hpp"
 #include "strix/execution_io.hpp"
@@ -580,7 +581,7 @@ template <typename FixtureType = Fixture>
 void run_numeric_fixture(
     strix::SerialOp op,
     bool with_injection, bool bf16 = false, bool enable_prefetch = false,
-    bool enable_output_prefetch = false) {
+    bool enable_output_prefetch = false, bool enable_lane_chain = false) {
     using Fixture = FixtureType;
     auto model =
         strix::ModelContract::
@@ -969,6 +970,26 @@ void run_numeric_fixture(
             "fused hyper-mix injection weights match CPU reference");
     }
 
+    if(enable_lane_chain){
+        auto reference_config=config;reference_config.parallel=true;reference_config.staged_projections=true;reference_config.fused_injection=true;reference_config.typed_projection=true;reference_config.prefetch_rows=true;reference_config.prefetch_q8_output=true;
+        auto reference_launcher=strix::make_hip_hyper_mix_launcher("test.output.reference",&reference_config);
+        auto candidate_config=reference_config;candidate_config.lane_chain_output=true;
+        auto candidate=strix::make_hip_hyper_mix_launcher("test.output.lane-chain-v1",&candidate_config);
+        expect(candidate.implementation_identity!=reference_launcher.implementation_identity,"lane-chain output identity is distinct");
+        const auto temp=strix::resolve_dispatch_temporary(context,0);const auto out_bytes=Fixture::hidden*(bf16?2U:4U);
+        const auto bytes=[&](std::uintptr_t address,std::size_t count){std::vector<std::byte> result(count);check(hipMemcpy(result.data(),reinterpret_cast<const void*>(address),count,hipMemcpyDeviceToHost),"read lane-chain integration receipt");return result;};
+        const auto semantic=[&]{auto result=bytes(mixed_address.address,out_bytes);if(with_injection){const auto inj=bytes(injection_address->address,Fixture::hc*4U);result.insert(result.end(),inj.begin(),inj.end());}return result;};
+        const auto poison=[&](hipStream_t stream){check(hipMemsetAsync(reinterpret_cast<void*>(temp.address),0xff,temp.bytes,stream),"poison whole lane-chain workspace");check(hipMemsetAsync(reinterpret_cast<void*>(mixed_address.address),0xff,out_bytes,stream),"poison lane-chain output");if(with_injection)check(hipMemsetAsync(reinterpret_cast<void*>(injection_address->address),0xff,Fixture::hc*4U,stream),"poison lane-chain injection");};
+        poison(nullptr);reference_launcher.function(context,reference_launcher.user_data);check(hipDeviceSynchronize(),"drain original output pipeline");const auto expected=semantic();
+        poison(nullptr);candidate.function(context,candidate.user_data);check(hipDeviceSynchronize(),"drain lane-chain pipeline");expect(semantic()==expected,"lane-chain complete eager pipeline output/injection exact");
+        hipStream_t stream=nullptr;hipGraph_t graph=nullptr;hipGraphExec_t executable=nullptr;check(hipStreamCreateWithFlags(&stream,hipStreamNonBlocking),"create lane-chain integration stream");strix::HipLaunchContext scope;scope.stream=stream;
+        {strix::HipLaunchScope active(scope);check(hipStreamBeginCapture(stream,hipStreamCaptureModeThreadLocal),"capture lane-chain pipeline");try{candidate.function(context,candidate.user_data);}catch(...){static_cast<void>(hipStreamEndCapture(stream,&graph));if(graph)static_cast<void>(hipGraphDestroy(graph));static_cast<void>(hipStreamDestroy(stream));throw;}check(hipStreamEndCapture(stream,&graph),"end lane-chain pipeline capture");}
+        check(hipGraphInstantiate(&executable,graph,nullptr,nullptr,0),"instantiate lane-chain pipeline");for(unsigned replay=0;replay<3;++replay){poison(stream);check(hipGraphLaunch(executable,stream),"replay lane-chain pipeline");check(hipStreamSynchronize(stream),"drain lane-chain pipeline replay");expect(semantic()==expected,"lane-chain poisoned graph pipeline output/injection exact");}
+        check(hipGraphExecDestroy(executable),"destroy lane-chain integration executable");check(hipGraphDestroy(graph),"destroy lane-chain integration graph");check(hipStreamDestroy(stream),"destroy lane-chain integration stream");
+        poison(nullptr);check(hipDeviceSynchronize(),"drain lane-chain rejection poison");const auto before=semantic(),scratch_before=bytes(temp.address,temp.bytes);const auto address=runtime.tensors[2].address;runtime.tensors[2].address+=2U;bool rejected=false;try{candidate.function(context,candidate.user_data);}catch(const std::invalid_argument& e){rejected=std::string_view(e.what())=="lane-chain HC output up owner admission differs";}runtime.tensors[2].address=address;check(hipDeviceSynchronize(),"drain lane-chain rejected owner");expect(rejected && semantic()==before && bytes(temp.address,temp.bytes)==scratch_before,"malformed lane-chain owner rejects before any normalization/workspace/semantic write");
+        for(auto* pointer:device_weights){check(hipFree(pointer),"free lane-chain integration weight");}
+        check(hipFree(arena_pointer),"free lane-chain integration arena");return;
+    }
     auto parallel_config = config;
     parallel_config.parallel = true;
     auto parallel_launcher = strix::make_hip_hyper_mix_launcher("test.hyper_mix.parallel", &parallel_config);
@@ -1582,6 +1603,26 @@ void test_catalog_and_bundle() {
                output_registry.variants().front().resources.lds_bytes == fused_variant.resources.lds_bytes &&
                output_registry.variants().front().resources.scratch_bytes == fused_variant.resources.scratch_bytes,
            "output prefetch has distinct identity and unchanged admitted resources");
+    {
+        auto lane_config=output_config;lane_config.lane_chain_output=true;auto lane_request=request;lane_request.lane_chain_hyper_output=true;
+        strix::kernels::KernelRegistry lane_registry;strix::register_hip_hyper_mix_kernel_variant(model,lane_request,lane_config,lane_registry);
+        const auto lane_variant=lane_registry.variants().front();expect(lane_variant.id==output_registry.variants().front().id+strix::lane_chain_hyper_output_suffix && lane_variant.compiler_identity=="hip-gfx1151-hyper-mix-v10-lane-chain-output" && lane_variant.resources.lds_bytes==44032 && lane_variant.resources.workgroup_threads==256,"lane-chain identity and conservative full-mixer resources exact");
+        auto lane_launcher=strix::make_hip_hyper_mix_launcher("fixture.lane-chain-v1",&lane_config);expect(lane_launcher.implementation_identity!=output_launcher.implementation_identity,"lane-chain launcher hash distinct");
+        bool mismatch=false;try{strix::kernels::KernelRegistry invalid;strix::register_hip_hyper_mix_kernel_variant(model,request,lane_config,invalid);}catch(const std::invalid_argument&){mismatch=true;}expect(mismatch,"lane-chain catalog requires matching opt-in");
+        strix::register_hip_hyper_mix_kernel_variant(model,lane_request,output_config,lane_registry);
+        const auto lane_plan=strix::build_serial_decode_execution_plan(model);const auto width=model.hidden_size*model.hc_count;
+        strix::ModelManifest lane_manifest;
+        for(unsigned slot=0;slot<5;++slot){const auto role=slot==4?2U:slot;strix::ManifestTensor t;t.name="lane.fixture.slot"+std::to_string(slot);t.ggml_type=(role==0 || role==3)?0U:8U;t.dimensions=role==0?std::vector<std::uint64_t>{width}:role==1?std::vector<std::uint64_t>{width,model.hc_lowrank}:role==2?std::vector<std::uint64_t>{model.hc_lowrank,width}:std::vector<std::uint64_t>{width,model.hc_count};t.byte_size=role==0?width*4U:role==1?width/32U*34U*model.hc_lowrank:role==2?model.hc_lowrank/32U*34U*width:width*model.hc_count*4U;if(slot==4)t.absolute_offset=2;lane_manifest.tensors.push_back(t);}
+        lane_manifest.layout_identity=strix::model_manifest_layout_identity(lane_manifest);strix::ModelRuntimeBinding lane_weights;lane_weights.manifest_layout_identity=lane_manifest.layout_identity;lane_weights.model_content_identity.bytes[0]=1;
+        for(unsigned slot=0;slot<5;++slot)lane_weights.tensors.push_back({slot,slot==4?strix::RuntimeTensorStorage::registered_file_mapped:strix::RuntimeTensorStorage::resident,static_cast<std::uintptr_t>(0x10000000ULL*(slot+1U)+(slot==4?2U:0U)),lane_manifest.tensors[slot].byte_size,1,0});
+        strix::ExecutionTensorAccessPlan lane_access;lane_access.manifest_layout_identity=lane_manifest.layout_identity;lane_access.plan_identity=12345;
+        for(const auto& step:lane_plan.steps){if(step.op!=strix::SerialOp::attn_hyper_mix && step.op!=strix::SerialOp::mlp_hyper_mix && step.op!=strix::SerialOp::final_hyper_mix)continue;const bool final=step.op==strix::SerialOp::final_hyper_mix;if(!final)lane_request.lane_chain_hyper_output_eligible_steps.push_back(step.id);for(unsigned slot=0;slot<(final?3U:4U);++slot)lane_access.accesses.push_back({step.id,step.op,slot,{final && slot==2?4U:slot}});}
+        strix::CompiledSerialExecution lane_compiled;lane_compiled.execution_identity=0x1234;lane_compiled.execution=lane_plan;lane_compiled.bindings=strix::bind_serial_execution_plan(model,lane_plan,lane_registry,lane_request);
+        strix::ExecutionRuntimeResources lane_resources;lane_resources.model_manifest=&lane_manifest;lane_resources.model_weights=&lane_weights;lane_resources.tensor_access=&lane_access;
+        strix::HipHyperMixLauncherBundle lane_bundle(lane_config);strix::ExecutionLauncherRegistry selected;lane_bundle.register_for_compiled_execution(lane_compiled,selected,&lane_resources);expect(selected.find_kernel_launcher(lane_variant.id) && selected.find_kernel_launcher(output_registry.variants().front().id),"lane-chain bundle admits exact candidate/base pair with final fallback");
+        for(std::size_t i=lane_compiled.execution.steps.size();i-- >0;)if(lane_compiled.execution.steps[i].op==strix::SerialOp::final_hyper_mix){lane_compiled.bindings.bindings[i].kernel_id=lane_variant.id;break;}
+        strix::ExecutionLauncherRegistry untouched;bool rejected=false;try{lane_bundle.register_for_compiled_execution(lane_compiled,untouched,&lane_resources);}catch(const std::invalid_argument&){rejected=true;}expect(rejected && !untouched.find_kernel_launcher(lane_variant.id) && !untouched.find_kernel_launcher(output_registry.variants().front().id),"wrong final fallback identity rejects bundle atomically before registration");
+    }
     auto output_only_config = typed_config; output_only_config.prefetch_q8_output = true;
     strix::kernels::KernelRegistry output_only_registry;
     strix::register_hip_hyper_mix_kernel_variant(model, request, output_only_config, output_only_registry);
@@ -1790,6 +1831,13 @@ void run_prefetch_geometry() {
 }  // namespace
 
 int main(int argc, char** argv) try {
+    if(argc==2 && std::string_view(argv[1])=="lane-chain"){
+        for(const auto op:{strix::SerialOp::attn_hyper_mix,strix::SerialOp::mlp_hyper_mix,strix::SerialOp::final_hyper_mix})for(bool bf16:{false,true}){
+            run_numeric_fixture<OutputPrefetchFixture<256,4,32>>(op,op!=strix::SerialOp::final_hyper_mix,bf16,true,true,true);
+            run_numeric_fixture<OutputPrefetchFixture<10240,4,320>>(op,op!=strix::SerialOp::final_hyper_mix,bf16,true,true,true);
+        }
+        return failures?1:0;
+    }
     const bool prefetch = argc == 2 && std::string_view(argv[1]) == "prefetch";
     const bool output_prefetch = argc == 2 && std::string_view(argv[1]) == "output-prefetch";
     if (argc != 1 && !prefetch && !output_prefetch) throw std::invalid_argument("expected no arguments, prefetch or output-prefetch fixture mode");

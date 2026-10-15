@@ -101,7 +101,7 @@ embedding_config(
 HipHyperMixLauncherConfig
 hyper_mix_config(
     const ModelContract& model,
-    HipActivationStorage activation, bool parallel, bool staged, bool fused, bool typed, bool prefetch_rows, bool prefetch_output) {
+    HipActivationStorage activation, bool parallel, bool staged, bool fused, bool typed, bool prefetch_rows, bool prefetch_output, bool lane_chain) {
     HipHyperMixLauncherConfig config;
     config.hidden_size =
         checked_u32(
@@ -126,6 +126,7 @@ hyper_mix_config(
     config.typed_projection = typed;
     config.prefetch_rows = prefetch_rows;
     config.prefetch_q8_output = prefetch_output;
+    config.lane_chain_output = lane_chain;
     return config;
 }
 
@@ -254,6 +255,8 @@ void register_complete_hip_kernel_catalog(
     if (config.ranked_moe_router_topk != request.ranked_moe_router_topk ||
         (config.ranked_moe_router_topk && !config.parallel_moe_router))
         throw std::invalid_argument("HIP catalog ranked router mode differs from binding request");
+    if(config.lane_chain_hyper_output!=request.lane_chain_hyper_output)
+        throw std::invalid_argument("HIP catalog lane-chain HC output differs from binding request");
     if(config.grouped_exact_q51_down != request.grouped_exact_q51_down)
         throw std::invalid_argument("HIP catalog grouped exact Q5_1 mode differs from binding request");
     if (config.q4k_a8g32_gate_up != request.q4k_a8g32_gate_up)
@@ -335,16 +338,17 @@ void register_complete_hip_kernel_catalog(
         registry,
         qualification);
 
-    const auto hyper_mix =
+    auto hyper_mix =
         hyper_mix_config(
             model,
-            config.activation, config.parallel_hyper_mix, config.staged_hyper_projections, config.fused_staged_hyper_mix, config.typed_hyper_projection, config.prefetch_typed_hyper_rows, config.prefetch_q8_hyper_output);
+            config.activation, config.parallel_hyper_mix, config.staged_hyper_projections, config.fused_staged_hyper_mix, config.typed_hyper_projection, config.prefetch_typed_hyper_rows, config.prefetch_q8_hyper_output, config.lane_chain_hyper_output);
     register_hip_hyper_mix_kernel_variant(
         model,
         request,
         hyper_mix,
         registry,
         qualification);
+    if(config.lane_chain_hyper_output){hyper_mix.lane_chain_output=false;register_hip_hyper_mix_kernel_variant(model,request,hyper_mix,registry,qualification);}
 
     const auto moe_route =
         moe_route_config(
@@ -420,7 +424,7 @@ HipLauncherCatalog::HipLauncherCatalog(
       hyper_mix_(
           hyper_mix_config(
               model,
-              config.activation, config.parallel_hyper_mix, config.staged_hyper_projections, config.fused_staged_hyper_mix, config.typed_hyper_projection, config.prefetch_typed_hyper_rows, config.prefetch_q8_hyper_output)),
+              config.activation, config.parallel_hyper_mix, config.staged_hyper_projections, config.fused_staged_hyper_mix, config.typed_hyper_projection, config.prefetch_typed_hyper_rows, config.prefetch_q8_hyper_output, config.lane_chain_hyper_output)),
       moe_route_(
           moe_route_config(
               model,

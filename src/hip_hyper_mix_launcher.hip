@@ -1,5 +1,7 @@
 #include "strix/hip_launch_context.hpp"
 #include "strix/hip_hyper_mix_launcher.hpp"
+#include "strix/lane_chain_hyper_output.hpp"
+#include <set>
 
 #include "strix/dispatch_resources.hpp"
 
@@ -99,6 +101,8 @@ void validate_config(
         throw std::invalid_argument("staged hyper projections require parallel hyper-mix");
     if (config.fused_injection && !config.staged_projections)
         throw std::invalid_argument("fused injection requires staged hyper projections");
+    if(config.lane_chain_output && (!config.prefetch_q8_output || !lane_chain_hyper_output_lds(config.hc_count,config.lowrank) || config.hidden_size%32U))
+        throw std::invalid_argument("lane-chain HC output requires eligible geometry and Q8 output prefetch");
     if (config.prefetch_q8_output && !config.typed_projection)
         throw std::invalid_argument("Q8 hyper output prefetch requires typed projection mode");
     if (config.prefetch_q8_output && config.lowrank % 32U != 0U)
@@ -1026,6 +1030,41 @@ __global__ void q8_batched_hyper_output_kernel(
             hidden, streams, lowrank, output, values, coefficients);
 }
 
+// Exact output chains: one wave per stream and one lane per output feature.
+// Row tiles occupy 34*rank bytes; rank%32 makes every wave tile 16-aligned.
+template <typename Storage>
+__global__ void lane_chain_hyper_output_kernel(const float* normalized,const float* low,const void* up,
+    std::uint32_t hidden,std::uint32_t streams,std::uint32_t rank,Storage* output){
+    extern __shared__ __align__(16) unsigned char staging[];
+    const auto lane=threadIdx.x&31U,stream=threadIdx.x/32U;
+    const std::uint64_t row=blockIdx.y,first=static_cast<std::uint64_t>(blockIdx.x)*32U;
+    const std::uint64_t tile_bytes=34ULL*rank,row_bytes=static_cast<std::uint64_t>(rank/32U)*34U;
+    auto* stage=staging+stream*tile_bytes;
+    const auto* source=static_cast<const unsigned char*>(up)+(static_cast<std::uint64_t>(stream)*hidden+first)*row_bytes;
+    for(std::uint64_t offset=static_cast<std::uint64_t>(lane)*16U;offset<tile_bytes;offset+=512U)
+        *reinterpret_cast<uint4*>(stage+offset)=*reinterpret_cast<const uint4*>(source+offset);
+    __syncthreads();
+    float gate=0.0F;
+    for(std::uint32_t block=0;block<rank/32U;++block){
+        const auto* weight=stage+static_cast<std::uint64_t>(lane)*row_bytes+static_cast<std::uint64_t>(block)*34U;
+        const auto scale_bits=static_cast<unsigned short>(static_cast<unsigned>(weight[0])|(static_cast<unsigned>(weight[1])<<8U));
+        const float scale=__half2float(__ushort_as_half(scale_bits));
+        for(std::uint32_t k=0;k<32U;++k){
+            const float coefficient=scale*static_cast<float>(static_cast<signed char>(weight[2U+k]));
+            gate+=low[row*rank+static_cast<std::uint64_t>(block)*32U+k]*coefficient;
+        }
+    }
+    auto* sig=reinterpret_cast<float*>(staging+static_cast<std::uint64_t>(streams)*tile_bytes);
+    sig[stream*32U+lane]=sigmoid(gate);
+    __syncthreads();
+    if(stream==0U){
+        float mixed=0.0F;const auto feature=first+lane;
+        for(std::uint32_t t=0;t<streams;++t)
+            mixed+=normalized[row*static_cast<std::uint64_t>(hidden)*streams+static_cast<std::uint64_t>(t)*hidden+feature]*sig[t*32U+lane];
+        store_activation(&output[row*hidden+feature],mixed/static_cast<float>(streams));
+    }
+}
+
 bool supported_norm_type(
     std::uint32_t ggml_type) noexcept {
     return ggml_type == 0 ||
@@ -1206,7 +1245,12 @@ void launch_typed(
                     injection_output ? reinterpret_cast<float*>(injection_output->address) : nullptr, lowrank_blocks);
                 }
                 check_hip(hipGetLastError(), "fused staged hyper-mix projection launch");
-                if (config.prefetch_q8_output) {
+                if(config.lane_chain_output){
+                    hipLaunchKernelGGL(HIP_KERNEL_NAME(lane_chain_hyper_output_kernel<Storage>),
+                        dim3(config.hidden_size/32U,context.logical_rows),dim3(32U*config.hc_count),
+                        static_cast<std::size_t>(lane_chain_hyper_output_lds(config.hc_count,config.lowrank)),hip_execution_stream(),
+                        normalized,low,reinterpret_cast<const void*>(up_runtime.address),config.hidden_size,config.hc_count,config.lowrank,reinterpret_cast<Storage*>(output.address));
+                }else if (config.prefetch_q8_output) {
                     hipLaunchKernelGGL(HIP_KERNEL_NAME(q8_batched_hyper_output_kernel<Storage>),
                         dim3((config.hidden_size + kStagedOutputs - 1U) / kStagedOutputs, context.logical_rows),
                         dim3(kStagedThreads), 0, hip_execution_stream(), normalized, low,
@@ -1530,6 +1574,27 @@ void launch_hyper_mix(
         }
     }
 
+    if(config.lane_chain_output){
+        const bool registered=up_runtime.storage==RuntimeTensorStorage::registered_file_mapped;
+        if(!lane_chain_hyper_output_eligible(up_manifest,config.hidden_size,config.hc_count,config.lowrank,registered) || up_runtime.address%16U || up_runtime.bytes<up_manifest.byte_size ||
+           up_manifest.byte_size>std::numeric_limits<std::uintptr_t>::max()-up_runtime.address)
+            throw std::invalid_argument("lane-chain HC output up owner admission differs");
+        if(input.address%activation_bytes || output.address%activation_bytes || norm_runtime.address%(norm_manifest.ggml_type==0U?4U:2U) || down_runtime.address%2U ||
+           (inject_runtime && inject_runtime->address%4U) || (injection_output && injection_output->address%4U))
+            throw std::invalid_argument("lane-chain HC output typed owner alignment differs");
+        const auto temp=resolve_dispatch_temporary(context,0);
+        std::vector<std::pair<std::uintptr_t,std::uint64_t>> writes={{temp.address,temp.bytes},{output.address,output.bytes}};
+        if(injection_output)writes.emplace_back(injection_output->address,injection_output->bytes);
+        std::vector<std::pair<std::uintptr_t,std::uint64_t>> reads={{input.address,input.bytes},{norm_runtime.address,norm_runtime.bytes},{down_runtime.address,down_runtime.bytes},{up_runtime.address,up_runtime.bytes}};
+        if(inject_runtime)reads.emplace_back(inject_runtime->address,inject_runtime->bytes);
+        for(const auto& owners:{writes,reads})for(const auto& owner:owners)if(!owner.first || !owner.second || owner.second>std::numeric_limits<std::uintptr_t>::max()-owner.first)
+            throw std::invalid_argument("lane-chain HC output invalid owner range");
+        const auto overlap=[](const auto& x,const auto& y){return x.first<y.first+y.second && y.first<x.first+x.second;};
+        for(std::size_t i=0;i<writes.size();++i){
+            for(std::size_t j=i+1;j<writes.size();++j)if(overlap(writes[i],writes[j]))throw std::invalid_argument("lane-chain HC output mutable owners overlap");
+            for(const auto& read:reads)if(overlap(writes[i],read))throw std::invalid_argument("lane-chain HC output read/write owners overlap");
+        }
+    }
     switch (config.activation) {
     case HipActivationStorage::bf16:
         launch_typed<
@@ -1596,7 +1661,7 @@ std::string kernel_id(
         ".c" +
         std::to_string(
             request.request_concurrency) + (config.parallel ? ".parallel" : "") +
-        (config.staged_projections ? ".staged" : "") + (config.fused_injection ? ".fused-injection-v5" : "") + (config.typed_projection ? ".typed-q8-f32-v1" : "") + (config.prefetch_rows ? ".prefetch-rows8-v2" : "") + (config.prefetch_q8_output ? ".prefetch-q8-output-v1" : "");
+        (config.staged_projections ? ".staged" : "") + (config.fused_injection ? ".fused-injection-v5" : "") + (config.typed_projection ? ".typed-q8-f32-v1" : "") + (config.prefetch_rows ? ".prefetch-rows8-v2" : "") + (config.prefetch_q8_output ? ".prefetch-q8-output-v1" : "") + (config.lane_chain_output ? lane_chain_hyper_output_suffix : "");
 }
 
 std::uint64_t implementation_identity(
@@ -1625,10 +1690,22 @@ std::uint64_t implementation_identity(
     if (config.typed_projection) hash_u64(hash, 0x5459504544484301ULL);
     if (config.prefetch_rows) hash_u64(hash, 0x5052464852430802ULL);
     if (config.prefetch_q8_output) hash_u64(hash, 0x5052464855500801ULL);
+    if(config.lane_chain_output)hash_u64(hash,0x4c414e4548430001ULL);
     return hash;
 }
 
 }  // namespace
+
+void enqueue_lane_chain_hyper_output_test(const HipHyperMixLauncherConfig& config,const float* normalized,const float* low,const void* up,void* output,std::uint32_t rows,bool lane_chain,hipStream_t stream){
+    auto selected=config;selected.lane_chain_output=lane_chain;validate_config(selected);
+    if(!rows || rows>65535 || !normalized || !low || !up || !output || (lane_chain && reinterpret_cast<std::uintptr_t>(up)%16U))throw std::invalid_argument("lane-chain HC output test owner/rows invalid");
+    const auto launch=[&]<typename Storage>(){
+        if(lane_chain){hipLaunchKernelGGL(HIP_KERNEL_NAME(lane_chain_hyper_output_kernel<Storage>),dim3(config.hidden_size/32U,rows),dim3(32U*config.hc_count),static_cast<std::size_t>(lane_chain_hyper_output_lds(config.hc_count,config.lowrank)),stream,normalized,low,up,config.hidden_size,config.hc_count,config.lowrank,reinterpret_cast<Storage*>(output));}
+        else{hipLaunchKernelGGL(HIP_KERNEL_NAME(q8_batched_hyper_output_kernel<Storage>),dim3((config.hidden_size+kStagedOutputs-1U)/kStagedOutputs,rows),dim3(kStagedThreads),0,stream,normalized,low,up,config.hidden_size,config.hc_count,config.lowrank,reinterpret_cast<Storage*>(output));}
+    };
+    if(config.activation==HipActivationStorage::bf16)launch.template operator()<std::uint16_t>();else launch.template operator()<float>();
+    check_hip(hipGetLastError(),"lane-chain HC same-input test launch");
+}
 
 void register_hip_hyper_mix_kernel_variant(
     const ModelContract& model,
@@ -1667,6 +1744,8 @@ void register_hip_hyper_mix_kernel_variant(
             "unmeasured HIP hyper-mix may only be experimental or oracle-matched");
     }
 
+    if(config.lane_chain_output && !request.lane_chain_hyper_output)
+        throw std::invalid_argument("lane-chain HC output requires matching binding opt-in");
     kernels::KernelVariant variant;
     variant.id =
         kernel_id(
@@ -1700,6 +1779,7 @@ void register_hip_hyper_mix_kernel_variant(
         variant.resources.scratch_bytes = static_cast<std::uint64_t>(request.logical_rows) *
             (static_cast<std::uint64_t>(config.hidden_size) * config.hc_count + config.lowrank) * sizeof(float);
     }
+    if(config.lane_chain_output)variant.resources.lds_bytes=std::max(variant.resources.lds_bytes,lane_chain_hyper_output_lds(config.hc_count,config.lowrank));
     variant.numerics.input_precision =
         storage_name(
             config.activation);
@@ -1718,6 +1798,7 @@ void register_hip_hyper_mix_kernel_variant(
     variant.output_layout =
         "row-major+fp32-injection";
     variant.compiler_identity =
+        config.lane_chain_output ? "hip-gfx1151-hyper-mix-v10-lane-chain-output" :
         config.prefetch_q8_output && config.prefetch_rows ? "hip-gfx1151-hyper-mix-v9-q8-output-prefetch8-with-projection-prefetch" :
         config.prefetch_q8_output ? "hip-gfx1151-hyper-mix-v9-q8-output-prefetch8" :
         config.prefetch_rows ? "hip-gfx1151-hyper-mix-v8-typed-prefetch-rows8" :
@@ -1741,6 +1822,8 @@ make_hip_hyper_mix_launcher(
             "HIP hyper-mix launcher requires id and config");
     }
     validate_config(*config);
+    if(kernel_id_value.ends_with(lane_chain_hyper_output_suffix)!=config->lane_chain_output)
+        throw std::invalid_argument("lane-chain HC output launcher identity differs");
     return ExecutionLauncher{
         std::move(kernel_id_value),
         implementation_identity(
@@ -1799,6 +1882,38 @@ register_for_compiled_execution(
     const CompiledSerialExecution& compiled,
     ExecutionLauncherRegistry& registry,
     const ExecutionRuntimeResources* resources) {
+    if(config_.lane_chain_output){
+        validate_config(config_);
+        if(config_.typed_projection){if(!resources)throw std::invalid_argument("typed hyper bundle requires complete model preflight resources");preflight_typed_hyper_projection_model(compiled,*resources);}
+        if(config_.prefetch_q8_output){if(!resources)throw std::invalid_argument("Q8 hyper output bundle requires complete model preflight resources");preflight_q8_hyper_output_model(compiled,*resources,config_);}
+        if(!compiled.execution_identity || compiled.execution.steps.size()!=compiled.bindings.bindings.size())throw std::invalid_argument("HIP hyper-mix bundle requires valid compiled execution");
+        fallback_config_=config_;fallback_config_.lane_chain_output=false;
+        ExecutionBindingRequest expected;expected.logical_rows=compiled.logical_rows;expected.request_concurrency=compiled.request_concurrency;
+        const auto candidate_id=kernel_id(expected,config_),base_id=kernel_id(expected,fallback_config_);
+        std::set<std::string> selected_ids;
+        for(std::size_t index=0;index<compiled.execution.steps.size();++index){
+            const auto& step=compiled.execution.steps[index];
+            if(step.op!=SerialOp::attn_hyper_mix && step.op!=SerialOp::mlp_hyper_mix && step.op!=SerialOp::final_hyper_mix)continue;
+            const auto& binding=compiled.bindings.bindings[index];
+            if(binding.host_or_runtime_step || !binding.kernel_id)throw std::invalid_argument("HIP hyper-mix step has no kernel binding");
+            bool eligible=false;
+            if(config_.lane_chain_output){
+                ExecutionDispatchContext context;context.execution_identity=compiled.execution_identity;context.step_id=step.id;context.op=step.op;context.resources=resources;
+                const auto& access=resolve_dispatch_tensor_access(context,2);const auto& up=manifest_tensor(context,access);const auto& owner=runtime_tensor(context,access);
+                eligible=lane_chain_hyper_output_eligible(up,config_.hidden_size,config_.hc_count,config_.lowrank,owner.storage==RuntimeTensorStorage::registered_file_mapped);
+                if(owner.bytes<up.byte_size || up.byte_size>std::numeric_limits<std::uintptr_t>::max()-owner.address)throw std::invalid_argument("lane-chain HC output up owner extent differs");
+                if(eligible && (owner.address%16U || owner.bytes<up.byte_size || up.byte_size>std::numeric_limits<std::uintptr_t>::max()-owner.address))throw std::invalid_argument("lane-chain HC output up owner admission differs");
+            }
+            const auto& id=(config_.lane_chain_output && !eligible)?base_id:candidate_id;
+            if(*binding.kernel_id!=id)throw std::invalid_argument("typed hyper bundle differs from selected kernel identity");
+            selected_ids.insert(id);
+        }
+        if(config_.lane_chain_output && !selected_ids.contains(candidate_id))throw std::invalid_argument("lane-chain HC output has no eligible steps");
+        for(const auto& id:selected_ids)registry.add_kernel_launcher(make_hip_hyper_mix_launcher(id,id==base_id?&fallback_config_:&config_));
+
+        return;
+    }
+
     if (config_.typed_projection) {
         if (resources == nullptr) throw std::invalid_argument("typed hyper bundle requires complete model preflight resources");
         preflight_typed_hyper_projection_model(compiled, *resources);

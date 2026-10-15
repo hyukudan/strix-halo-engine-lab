@@ -20,6 +20,7 @@ struct HipHyperMixLauncherConfig {
     bool typed_projection = false;
     bool prefetch_rows = false;
     bool prefetch_q8_output = false;
+    bool lane_chain_output = false;
     HipActivationStorage activation =
         HipActivationStorage::bf16;
 };
@@ -62,6 +63,7 @@ public:
 
 private:
     HipHyperMixLauncherConfig config_;
+    HipHyperMixLauncherConfig fallback_config_;
 };
 
 }  // namespace strix

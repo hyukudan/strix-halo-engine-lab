@@ -1,3 +1,4 @@
+#include "strix/lane_chain_hyper_output.hpp"
 #include "strix/gdn_output_admission.hpp"
 #include "strix/compiled_execution.hpp"
 #include "strix/execution_resources.hpp"
@@ -175,6 +176,7 @@ struct Options {
     bool typed_hyper_projection = false;
     bool prefetch_typed_hyper_rows = false;
     bool prefetch_q8_hyper_output = false;
+    bool lane_chain_hyper_output = false;
     bool virtual_q8_lm_head = false;
     bool parallel_moe_router = false;
     bool virtual_q8_gdn_input = false;
@@ -211,7 +213,7 @@ Options parse_options(
             "[--generate N] [--eos-token TOKEN_ID] [--prefix-cache-roundtrip] "
             "[--parallel-moe-router] [--ranked-moe-router-topk | --wave-moe-router-topk] "
             "[--prefetch-q8-qsa-input] [--virtual-q8-lm-head] [--virtual-q8-gdn-input [--prefetch-q8-gdn-input]] [--q4k-a8g32-gate-up [--grouped-exact-q51-down]] "
-            "[--parallel-hyper-mix [--staged-hyper-projections [--fused-staged-hyper-mix [--typed-fused-hyper-projections [--prefetch-typed-hyper-rows] [--prefetch-q8-hyper-output]]]]]");
+            "[--parallel-hyper-mix [--staged-hyper-projections [--fused-staged-hyper-mix [--typed-fused-hyper-projections [--prefetch-typed-hyper-rows] [--prefetch-q8-hyper-output [--lane-chain-hyper-output]]]]]]");
     }
 
     Options options;
@@ -260,6 +262,10 @@ Options parse_options(
         if(argument=="--virtual-q8-gdn-output") {
             if(options.virtual_q8_gdn_output) throw std::invalid_argument("duplicate virtual Q8 GDN output option");
             options.virtual_q8_gdn_output=true;continue;
+        }
+        if(argument=="--lane-chain-hyper-output"){
+            if(options.lane_chain_hyper_output)throw std::invalid_argument("duplicate lane-chain HC output option");
+            options.lane_chain_hyper_output=true;continue;
         }
         if (argument == "--prefetch-q8-hyper-output") {
             if (options.prefetch_q8_hyper_output) throw std::invalid_argument("duplicate Q8 hyper output prefetch option");
@@ -551,6 +557,8 @@ Options parse_options(
         throw std::invalid_argument("--ranked-moe-router-topk requires --parallel-moe-router");
     if (options.prefetch_q8_gdn_input && !options.virtual_q8_gdn_input)
         throw std::invalid_argument("--prefetch-q8-gdn-input requires --virtual-q8-gdn-input");
+    if(options.lane_chain_hyper_output && !options.prefetch_q8_hyper_output)
+        throw std::invalid_argument("--lane-chain-hyper-output requires --prefetch-q8-hyper-output");
     if (options.prefetch_q8_hyper_output && !options.typed_hyper_projection)
         throw std::invalid_argument("Q8 hyper output prefetch requires typed projection mode");
     if (options.prefetch_typed_hyper_rows && !options.typed_hyper_projection)
@@ -793,6 +801,7 @@ int main(
         std::cout << "Usage: strix-hip-decode-token MODEL.gguf TOKEN_ID ... [options]\n"
             "  --context N --generate N --eos-token ID --residency register|copy\n"
             "  --virtual-q8-gdn-output (exact original256-tree Q8 output)\n"
+            "  --lane-chain-hyper-output (requires --prefetch-q8-hyper-output)\n"
             "  --record-raw ABS_NEW_PRIVATE_DIRECTORY --record-max-bytes BYTES\n"
             "  --record-state-policy final|each --prefix-cache-roundtrip\n"
             "  --prefetch-q8-qsa-input (opt-in exact-tree Q8 input projections)\n"
@@ -946,6 +955,7 @@ int main(
             << ",\n  \"grouped_q51_host_submissions\": "
             << (q4k_a8_stats ? q4k_a8_stats->grouped_q51_submissions.load(std::memory_order_relaxed) : 0) << ",\n";
     };
+    const auto lane_chain_steps=options.lane_chain_hyper_output?strix::lane_chain_hyper_output_steps(model,manifest,options.residency==strix::HipModelResidencyMode::registered_file_mapping):std::vector<std::uint32_t>{};
     const auto tensor_index =
         strix::build_model_tensor_index(
             manifest);
@@ -974,6 +984,10 @@ int main(
             throw std::invalid_argument("--virtual-q8-gdn-input requires an aligned Q8_0 GDN input projection");
     }
     if(options.virtual_q8_gdn_output) strix::validate_virtual_q8_gdn_output_manifest(model,manifest);
+    const std::string lane_chain_mode_receipt=
+        "  \"lane_chain_hyper_output\": " + (options.lane_chain_hyper_output ? "true" : "false") + ",\n" +
+        "  \"lane_chain_hyper_output_eligible_steps\": " + std::to_string(lane_chain_steps.size()) + ",\n" +
+        "  \"lane_chain_hyper_output_fallback_steps\": " + std::to_string(options.lane_chain_hyper_output ? model.hidden_layers*2U+1U-lane_chain_steps.size() : 0U) + ",\n";
     const auto qsa_prefetch_plan=options.prefetch_q8_qsa_input ? strix::qsa_input_prefetch::build_plan(model,manifest) : strix::qsa_input_prefetch::Plan{};
     std::string qsa_input_mode_receipt="  \"prefetch_q8_qsa_input\": "+std::string(options.prefetch_q8_qsa_input?"true":"false")+",\n";
     if(options.prefetch_q8_qsa_input) qsa_input_mode_receipt+="  \"prefetch_q8_qsa_input_eligible_steps\": "+std::to_string(qsa_prefetch_plan.eligible_steps)+",\n";
@@ -986,7 +1000,7 @@ int main(
     const auto qsa_prefetch_stats=options.prefetch_q8_qsa_input ?
         std::make_shared<strix::qsa_input_prefetch::RuntimeDispatchStats>() : nullptr;
     const auto gdn_output_mode_receipt=[&] {
-        std::string receipt=(options.virtual_q8_gdn_output ? "  \"virtual_q8_gdn_output\": true,\n" : "")+qsa_input_mode_receipt;
+        std::string receipt=(options.virtual_q8_gdn_output ? "  \"virtual_q8_gdn_output\": true,\n" : "")+qsa_input_mode_receipt+lane_chain_mode_receipt;
         if(qsa_prefetch_stats) receipt += "  \"prefetch_q8_qsa_input_dispatched_projections\": "+
             std::to_string(qsa_prefetch_stats->dispatched_projections.load(std::memory_order_relaxed))+",\n";
         return receipt;
@@ -1019,6 +1033,9 @@ int main(
     catalog_config.typed_hyper_projection = options.typed_hyper_projection;
     catalog_config.prefetch_typed_hyper_rows = options.prefetch_typed_hyper_rows;
     catalog_config.prefetch_q8_hyper_output = options.prefetch_q8_hyper_output;
+    catalog_config.lane_chain_hyper_output=options.lane_chain_hyper_output;
+    binding_request.lane_chain_hyper_output=options.lane_chain_hyper_output;
+    binding_request.lane_chain_hyper_output_eligible_steps=lane_chain_steps;
     catalog_config.virtual_q8_lm_head = options.virtual_q8_lm_head;
     catalog_config.q4k_a8g32_gate_up = options.q4k_a8g32_gate_up;
     catalog_config.grouped_exact_q51_down = options.grouped_exact_q51_down;

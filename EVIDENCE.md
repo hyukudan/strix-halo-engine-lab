@@ -97,3 +97,6 @@ checks. A host submission counter records only eager enqueue and graph capture;
 it does not count graph replay. The host plan test explicitly covers Q8 q/k/v
 with BF16 indexer inputs (36 eligible and 24 fallback projections at 12 steps).
 These are fixture contracts, not claims that new device tests have executed.
+## E-HC-LANE-CHAIN-20261015
+
+Experimental source and fixtures: `src/lane_chain_hyper_output.cpp`, `src/hip_hyper_mix_launcher.hip`, host `strix-lane-chain-hyper-output-tests` and HIP `strix-hip-lane-chain-hyper-output-tests` / `strix-hip-lane-chain-hyper-integration-tests`. Reproduce host checks with `cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON -DSTRIX_ENABLE_HIP_RUNTIME=OFF -DSTRIX_WARNINGS_AS_ERRORS=ON`, build and `ctest --test-dir build --output-on-failure`. Host execution cannot qualify device arithmetic. HIP gfx1151 compiler/ISA/device, full-model exactness and performance gates remain required; see the lane-chain implementation document. No measured gain is claimed.

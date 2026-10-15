@@ -222,6 +222,8 @@ compile_speculative_verify_execution(
             compiled.verify,
             registry,
             binding_request);
+    for(const auto& binding:compiled.bindings.bindings)if(binding.kernel_id && binding.kernel_id->ends_with(".lane-chain-v1"))
+        throw std::invalid_argument("lane-chain HC output requires serial decode binding");
     for (const auto& binding : compiled.bindings.bindings)
         if (binding.op == SerialOp::moe_experts && binding.kernel_id &&
             binding.kernel_id->ends_with(moe_q4k_a8::runtime_kernel_suffix))

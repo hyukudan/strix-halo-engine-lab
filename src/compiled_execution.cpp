@@ -1,5 +1,7 @@
 #include "strix/compiled_execution.hpp"
 #include "strix/qsa_input_prefetch.hpp"
+#include "strix/lane_chain_hyper_output.hpp"
+#include <algorithm>
 #include "strix/moe_q4k_a8_runtime.hpp"
 
 #include <cstring>
@@ -362,6 +364,11 @@ CompiledSerialExecution compile_serial_execution(
 
     for (const auto& binding : compiled.bindings.bindings) {
         if(binding.op==SerialOp::indexed_attention && binding.kernel_id){const auto& step=compiled.execution.steps[binding.step_id];if(binding.kernel_id->ends_with(qsa_input_prefetch::kernel_suffix)!=qsa_input_prefetch::selected(binding_request.prefetch_q8_qsa_input,binding_request.qsa_input_prefetch_layers,step.layer))throw std::invalid_argument("bound QSA input prefetch differs from admitted topology");}
+        if(binding.op==SerialOp::attn_hyper_mix || binding.op==SerialOp::mlp_hyper_mix || binding.op==SerialOp::final_hyper_mix){
+            const bool expected=binding_request.lane_chain_hyper_output && std::find(binding_request.lane_chain_hyper_output_eligible_steps.begin(),binding_request.lane_chain_hyper_output_eligible_steps.end(),binding.step_id)!=binding_request.lane_chain_hyper_output_eligible_steps.end();
+            if(binding.kernel_id && binding.kernel_id->ends_with(lane_chain_hyper_output_suffix)!=expected)
+                throw std::invalid_argument("bound lane-chain HC output differs from admitted topology");
+        }
         if(binding.op==SerialOp::moe_experts && binding.kernel_id &&
            binding.kernel_id->ends_with(moe_q4k_a8::grouped_q51_kernel_ending)!=buffer_request.grouped_exact_q51_down)
             throw std::invalid_argument("bound grouped exact Q5_1 down differs from admitted topology");

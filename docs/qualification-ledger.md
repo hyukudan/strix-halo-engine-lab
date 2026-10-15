@@ -49,3 +49,5 @@ device-node presence, theoretical precision throughput or an external result.
 See [the portable implementation slice](implementation-2026-10-11.md),
 [reusable execution components](implementation-2026-10-12-execution-components.md),
 [low-precision lab](../lab/low_precision/README.md) and the architecture guides.
+
+| Lane-chain HC output | Experimental opt-in, pure metadata admission and per-step base fallback, exact ordered-chain source and poison/graph fixtures; see [implementation](implementation-2026-10-15-lane-chain-hyper-output.md) | Source review, HIP/ISA, device fixtures, complete-logit identity and paired workload measurements remain open |
