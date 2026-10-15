@@ -77,3 +77,15 @@ Cada evidencia nueva debe incluir identidad del artefacto, comando o prueba,
 condiciones del entorno y el requisito de la spec al que afecta. Si una medida
 contradice una entrada anterior, ambas se conservan y se registra la resolución
 en `DECISIONS.md`.
+
+
+## 2026-10-15: Q8 indexed-attention input prefetch source increment
+
+State: experimental source and host/device fixture implementation; native gates
+pending. Artifact: `docs/implementation-2026-10-15-qsa-input-prefetch.md` and
+`tests/qsa_input_prefetch_tests.cpp`, `tests/hip_qsa_input_prefetch_tests.hip`.
+Commands: configure Release with `BUILD_TESTING=ON`; host target
+`strix-qsa-input-prefetch-tests`, optional gfx1151 HIP target
+`strix-hip-qsa-input-prefetch-tests`. The baseline project contains POSIX-only
+sources, so a full Windows build is not a portable qualification environment.
+Actual Linux HIP compiler/ISA/device/model/performance results are not claimed.

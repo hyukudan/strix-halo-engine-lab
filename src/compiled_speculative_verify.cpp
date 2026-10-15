@@ -1,4 +1,5 @@
 #include "strix/compiled_speculative_verify.hpp"
+#include "strix/qsa_input_prefetch.hpp"
 #include "strix/moe_q4k_a8_runtime.hpp"
 
 #include <span>
@@ -173,6 +174,7 @@ compile_speculative_verify_execution(
     const SpeculativeVerifyBindingRequest& binding_request,
     const ExecutionBufferRequest& buffer_request,
     std::uint64_t arena_alignment) {
+    if(binding_request.prefetch_q8_qsa_input)throw std::invalid_argument("QSA input prefetch runtime does not support speculative verify");
     if (buffer_request.q4k_a8g32_gate_up || buffer_request.grouped_exact_q51_down)
         throw std::invalid_argument("Q4K A8 runtime does not support speculative verify");
     if (candidate_depth == 0) {
@@ -230,6 +232,7 @@ compile_speculative_verify_execution(
     }
 
     for (const auto& binding : compiled.bindings.bindings) {
+        if(binding.op==SerialOp::indexed_attention && binding.kernel_id && binding.kernel_id->ends_with(qsa_input_prefetch::kernel_suffix))throw std::invalid_argument("QSA input prefetch runtime does not support speculative verify");
         if (binding.op == SerialOp::moe_route && binding.kernel_id.has_value() &&
             (binding.kernel_id->ends_with(".parallel") != buffer_request.parallel_moe_router ||
              binding.kernel_id->ends_with(".ranked.parallel") != binding_request.ranked_moe_router_topk ||

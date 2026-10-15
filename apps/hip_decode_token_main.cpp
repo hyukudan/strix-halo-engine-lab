@@ -17,6 +17,7 @@
 #include "strix/ple_lookup.hpp"
 #include "strix/runtime_allocator.hpp"
 #include "strix/raw_baseline_recording.hpp"
+#include "strix/qsa_input_prefetch.hpp"
 #include "strix/decode_execution_options.hpp"
 #include "strix/decode_integer_head.hpp"
 #include "strix/hip_integer_projection_runtime.hpp"
@@ -182,6 +183,7 @@ struct Options {
     bool q4k_a8g32_gate_up = false;
     bool grouped_exact_q51_down = false;
     bool prefetch_q8_gdn_input = false;
+    bool prefetch_q8_qsa_input = false;
     bool virtual_q8_gdn_output = false;
     std::uint64_t ple_max_rows_per_io = 4;
     std::uint64_t ple_max_inflight_ios = 4;
@@ -208,7 +210,7 @@ Options parse_options(
             "[--planned-ple-io] [--ple-max-rows-per-io N] [--ple-max-inflight-ios N] "
             "[--generate N] [--eos-token TOKEN_ID] [--prefix-cache-roundtrip] "
             "[--parallel-moe-router] [--ranked-moe-router-topk | --wave-moe-router-topk] "
-            "[--virtual-q8-lm-head] [--virtual-q8-gdn-input [--prefetch-q8-gdn-input]] [--q4k-a8g32-gate-up [--grouped-exact-q51-down]] "
+            "[--prefetch-q8-qsa-input] [--virtual-q8-lm-head] [--virtual-q8-gdn-input [--prefetch-q8-gdn-input]] [--q4k-a8g32-gate-up [--grouped-exact-q51-down]] "
             "[--parallel-hyper-mix [--staged-hyper-projections [--fused-staged-hyper-mix [--typed-fused-hyper-projections [--prefetch-typed-hyper-rows] [--prefetch-q8-hyper-output]]]]]");
     }
 
@@ -279,6 +281,7 @@ Options parse_options(
             options.parallel_hyper_mix = true;
             continue;
         }
+        if(argument=="--prefetch-q8-qsa-input"){if(options.prefetch_q8_qsa_input)throw std::invalid_argument("duplicate prefetch Q8 QSA input option");options.prefetch_q8_qsa_input=true;continue;}
         if (argument == "--prefetch-q8-gdn-input") {
             if (options.prefetch_q8_gdn_input) throw std::invalid_argument("duplicate prefetch Q8 GDN input option");
             options.prefetch_q8_gdn_input = true;
@@ -792,6 +795,7 @@ int main(
             "  --virtual-q8-gdn-output (exact original256-tree Q8 output)\n"
             "  --record-raw ABS_NEW_PRIVATE_DIRECTORY --record-max-bytes BYTES\n"
             "  --record-state-policy final|each --prefix-cache-roundtrip\n"
+            "  --prefetch-q8-qsa-input (opt-in exact-tree Q8 input projections)\n"
             "  --execution-mode eager|graph (default eager)\n"
             "  --graph-workspace-bytes BYTES --graph-executable-bytes BYTES\n"
             "  --graph-capture-peak-bytes BYTES --graph-budget-bytes BYTES\n"
@@ -970,7 +974,16 @@ int main(
             throw std::invalid_argument("--virtual-q8-gdn-input requires an aligned Q8_0 GDN input projection");
     }
     if(options.virtual_q8_gdn_output) strix::validate_virtual_q8_gdn_output_manifest(model,manifest);
-    const std::string gdn_output_mode_receipt=options.virtual_q8_gdn_output ? "  \"virtual_q8_gdn_output\": true,\n" : "";
+    const auto qsa_prefetch_plan=options.prefetch_q8_qsa_input ? strix::qsa_input_prefetch::build_plan(model,manifest) : strix::qsa_input_prefetch::Plan{};
+    std::string qsa_input_mode_receipt="  \"prefetch_q8_qsa_input\": "+std::string(options.prefetch_q8_qsa_input?"true":"false")+",\n";
+    qsa_input_mode_receipt+="  \"prefetch_q8_qsa_input_eligible_steps\": "+std::to_string(qsa_prefetch_plan.eligible_steps)+",\n";
+    qsa_input_mode_receipt+="  \"prefetch_q8_qsa_input_fallback_steps\": "+std::to_string(qsa_prefetch_plan.fallback_steps)+",\n";
+    qsa_input_mode_receipt+="  \"prefetch_q8_qsa_input_eligible_projections\": "+std::to_string(qsa_prefetch_plan.eligible_projections)+",\n";
+    qsa_input_mode_receipt+="  \"prefetch_q8_qsa_input_fallback_projections\": "+std::to_string(qsa_prefetch_plan.fallback_projections)+",\n";
+    qsa_input_mode_receipt+="  \"prefetch_q8_qsa_input_projection_choices\": [";
+    for(std::size_t i=0;i<qsa_prefetch_plan.projections.size();++i){const auto& choice=qsa_prefetch_plan.projections[i];if(i)qsa_input_mode_receipt+=",";qsa_input_mode_receipt+="{\"layer\":"+std::to_string(choice.layer)+",\"projection\":"+std::to_string(i%5U)+",\"kernel_id\":\""+std::string(choice.eligible?strix::qsa_input_prefetch::projection_prefetch_id:strix::qsa_input_prefetch::projection_base_id)+"\"}";}
+    qsa_input_mode_receipt+="],\n";
+    const std::string gdn_output_mode_receipt=(options.virtual_q8_gdn_output ? "  \"virtual_q8_gdn_output\": true,\n" : "")+qsa_input_mode_receipt;
     const auto original_work_device = std::make_shared<strix::HipSetupQuiescenceGuard>();
     auto target_architecture = original_work_device->architecture();
     if (const auto suffix = target_architecture.find(':'); suffix != std::string::npos)
@@ -1014,6 +1027,10 @@ int main(
     binding_request.parallel_moe_router = options.parallel_moe_router;
     catalog_config.virtual_q8_gdn_input = options.virtual_q8_gdn_input;
     catalog_config.prefetch_q8_gdn_input = options.prefetch_q8_gdn_input;
+    catalog_config.prefetch_q8_qsa_input=options.prefetch_q8_qsa_input;
+    catalog_config.qsa_input_prefetch_layers=qsa_prefetch_plan.layers;
+    binding_request.prefetch_q8_qsa_input=options.prefetch_q8_qsa_input;
+    binding_request.qsa_input_prefetch_layers=qsa_prefetch_plan.layers;
     catalog_config.virtual_q8_gdn_output = options.virtual_q8_gdn_output;
     std::optional<strix::integer_projection::RuntimeConfig> integer_config;
     if (options.execution.integer_head != strix::DecodeIntegerHead::none) {

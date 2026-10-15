@@ -5,6 +5,7 @@
 #include "strix/launch_dispatch.hpp"
 #include "strix/model_contract.hpp"
 #include "strix/graph_attention_state.hpp"
+#include "strix/qsa_input_prefetch.hpp"
 
 #include <string>
 
@@ -16,7 +17,18 @@ struct HipIndexedAttentionLauncherConfig {
     HipActivationStorage activation =
         HipActivationStorage::bf16;
     bool enable_device_graph_inputs = false;
+    bool prefetch_q8_input = false;
+    std::vector<std::uint32_t> prefetch_eligible_layers;
 };
+
+enum class HipQsaInputProjectionMode {legacy256,virtual256,prefetch8};
+struct HipQsaInputProjectionView {std::uintptr_t address=0;std::uint64_t bytes=0;};
+// Standalone diagnostic, no allocation/sync. Caller retains all owners through
+// stream drain (also on enqueue failure). Exact disjoint output views, BF16 input,
+// original Q8_0 weights and BF16-rounded values represented in FP32 output.
+void launch_hip_qsa_input_projection_probe(HipQsaInputProjectionMode,
+    HipQsaInputProjectionView input,HipQsaInputProjectionView weights,
+    HipQsaInputProjectionView output,std::uint32_t width,std::uint32_t outputs,void* stream);
 
 // Experimental post-projection C1 norm/RoPE/KV stage. Async on caller's
 // explicitly owned stream; retain all resource owners through completion.
@@ -44,7 +56,7 @@ class HipIndexedAttentionLauncherBundle {
 public:
     explicit HipIndexedAttentionLauncherBundle(
         HipIndexedAttentionLauncherConfig config)
-        : config_(config) {}
+        : config_(config), fallback_config_(config) {fallback_config_.prefetch_q8_input=false;fallback_config_.prefetch_eligible_layers.clear();}
 
     HipIndexedAttentionLauncherBundle(
         const HipIndexedAttentionLauncherBundle&) = delete;
@@ -61,6 +73,7 @@ public:
 
 private:
     HipIndexedAttentionLauncherConfig config_;
+    HipIndexedAttentionLauncherConfig fallback_config_;
 };
 
 }  // namespace strix

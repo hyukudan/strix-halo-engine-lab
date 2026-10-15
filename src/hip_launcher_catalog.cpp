@@ -42,11 +42,13 @@ HipGdnLauncherConfig gdn_config(const ModelContract& model,
 HipIndexedAttentionLauncherConfig
 indexed_attention_config(
     const ModelContract& model,
-    HipActivationStorage activation, bool graph = false) {
+    HipActivationStorage activation, bool graph = false, bool prefetch = false, std::vector<std::uint32_t> layers = {}) {
     HipIndexedAttentionLauncherConfig config;
     config.model = model;
     config.activation = activation;
     config.enable_device_graph_inputs = graph;
+    config.prefetch_q8_input = prefetch;
+    config.prefetch_eligible_layers=std::move(layers);
     return config;
 }
 
@@ -246,6 +248,8 @@ void register_complete_hip_kernel_catalog(
     if (config.wave_moe_router_topk != request.wave_moe_router_topk ||
         (config.wave_moe_router_topk && (!config.parallel_moe_router || config.ranked_moe_router_topk)))
         throw std::invalid_argument("HIP catalog wave router mode differs from binding request");
+    if(config.prefetch_q8_qsa_input!=request.prefetch_q8_qsa_input || config.qsa_input_prefetch_layers!=request.qsa_input_prefetch_layers)throw std::invalid_argument("HIP catalog QSA input prefetch differs from binding request");
+    qsa_input_prefetch::validate_layers(model,config.prefetch_q8_qsa_input,config.qsa_input_prefetch_layers);
     if (config.ranked_moe_router_topk != request.ranked_moe_router_topk ||
         (config.ranked_moe_router_topk && !config.parallel_moe_router))
         throw std::invalid_argument("HIP catalog ranked router mode differs from binding request");
@@ -310,7 +314,8 @@ void register_complete_hip_kernel_catalog(
     const auto indexed =
         indexed_attention_config(
             model,
-            config.activation, config.enable_device_graph_inputs);
+            config.activation, config.enable_device_graph_inputs, config.prefetch_q8_qsa_input, config.qsa_input_prefetch_layers);
+    if(config.prefetch_q8_qsa_input){auto base=indexed;base.prefetch_q8_input=false;base.prefetch_eligible_layers.clear();auto base_request=request;base_request.prefetch_q8_qsa_input=false;base_request.qsa_input_prefetch_layers.clear();register_hip_indexed_attention_kernel_variant(model,base_request,base,registry,qualification);}
     register_hip_indexed_attention_kernel_variant(
         model,
         request,
@@ -406,7 +411,7 @@ HipLauncherCatalog::HipLauncherCatalog(
       indexed_attention_(
           indexed_attention_config(
               model,
-              config.activation, config.enable_device_graph_inputs)),
+              config.activation, config.enable_device_graph_inputs, config.prefetch_q8_qsa_input, config.qsa_input_prefetch_layers)),
       embedding_(
           embedding_config(
               model,

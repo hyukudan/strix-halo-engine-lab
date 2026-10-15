@@ -38,6 +38,8 @@ struct HipLauncherCatalogConfig {
     bool grouped_exact_q51_down = false;
     std::shared_ptr<moe_q4k_a8::RuntimeDispatchStats> q4k_a8_stats;
     bool virtual_q8_gdn_output = false;
+    bool prefetch_q8_qsa_input = false;
+    std::vector<std::uint32_t> qsa_input_prefetch_layers;
 };
 
 void register_complete_hip_kernel_catalog(

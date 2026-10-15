@@ -58,3 +58,14 @@
 Toda decisión nueva indicará: alternativas, evidencia, riesgo, consecuencia en
 la spec y condición de reapertura. Las acciones de aceptación se enlazarán aquí y
 en `DESIGN_ACCEPTANCE.md`.
+
+
+## 2026-10-15: explicit indexed-attention Q8 input prefetch experiment
+
+Keep the prefetch schedule off by default and in the original HIP translation
+unit. Manifest eligibility is per matrix; operator bindings explicitly retain
+legacy IDs for wholly ineligible layers. Receipts distinguish operator-step and
+projection counts. Do not infer target qualification from an arithmetic argument
+or a host test. Reopen adoption after linked legacy/candidate ISA, device fixtures,
+full-array and token fidelity, and paired complete-workload measurements. The first
+increment rejects speculative verify because the actual indexed launcher is C1.

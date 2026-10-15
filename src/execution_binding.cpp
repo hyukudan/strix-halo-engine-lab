@@ -1,4 +1,5 @@
 #include "strix/execution_binding.hpp"
+#include "strix/qsa_input_prefetch.hpp"
 
 #include <limits>
 #include <stdexcept>
@@ -133,6 +134,7 @@ ExecutionBindingPlan bind_serial_execution_plan(
             "execution binding dimensions exceed registry shape fields");
     }
 
+    qsa_input_prefetch::validate_layers(model,request.prefetch_q8_qsa_input,request.qsa_input_prefetch_layers);
     ExecutionBindingPlan output;
     output.bindings.reserve(plan.steps.size());
 
@@ -167,6 +169,12 @@ ExecutionBindingPlan bind_serial_execution_plan(
             request.minimum_qualification;
 
         const auto* selected = registry.select(query);
+        if(selected && step.op==SerialOp::indexed_attention){
+            const bool wanted=qsa_input_prefetch::selected(request.prefetch_q8_qsa_input,request.qsa_input_prefetch_layers,step.layer);
+            const bool actual=selected->id.ends_with(qsa_input_prefetch::kernel_suffix);
+            if(wanted!=actual){std::string id=selected->id;if(actual)id.resize(id.size()-qsa_input_prefetch::kernel_suffix.size());else id+=qsa_input_prefetch::kernel_suffix;
+                selected=registry.find(id);if(selected && !kernels::matches(*selected,query))selected=nullptr;}
+        }
         if (selected == nullptr) {
             ++output.missing_steps;
         } else {

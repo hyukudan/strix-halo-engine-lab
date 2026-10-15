@@ -11,6 +11,7 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -217,6 +218,7 @@ void validate_config(
         !error.empty()) {
         throw std::invalid_argument(error);
     }
+    qsa_input_prefetch::validate_layers(config.model,config.prefetch_q8_input,config.prefetch_eligible_layers);
     if (config.activation !=
         HipActivationStorage::bf16) {
         throw std::invalid_argument(
@@ -557,6 +559,93 @@ __global__ void linear_to_float_kernel(
         output[out] =
             round_bf16(
                 scratch[0]);
+    }
+}
+
+// Eight ascending virtual leaves per physical lane preserve the original
+// 256-leaf tree, including its operand order and BF16-in-FP32 epilogue.
+__global__ __launch_bounds__(32)
+void linear_virtual256_q8_qsa_input_kernel(
+    const std::uint16_t* input, const void* weights,
+    std::uint32_t input_width, std::uint32_t output_width, float* output) {
+    const auto row = static_cast<std::uint32_t>(blockIdx.x);
+    if (row >= output_width) return;
+    const auto lane = static_cast<std::uint32_t>(threadIdx.x);
+    float partial[8]{};
+    for (std::uint64_t chunk = 0; chunk < input_width; chunk += 256U) {
+#pragma unroll
+        for (unsigned local = 0; local < 8; ++local) {
+            const auto feature = chunk + 8U * lane + local;
+            if (feature < input_width)
+                partial[local] += bf16_to_float(input[feature]) *
+                    load_weight<WeightKind::q8_0>(weights, input_width, row,
+                        static_cast<std::uint32_t>(feature));
+        }
+    }
+#pragma unroll
+    for (unsigned distance = 16; distance > 0; distance /= 2) {
+#pragma unroll
+        for (unsigned local = 0; local < 8; ++local) {
+            const auto partner = __shfl_down(partial[local], distance, 32);
+            if (lane < distance) partial[local] += partner;
+        }
+    }
+    if (lane == 0) {
+        partial[0] += partial[4]; partial[1] += partial[5];
+        partial[2] += partial[6]; partial[3] += partial[7];
+        partial[0] += partial[2]; partial[1] += partial[3];
+        partial[0] += partial[1];
+        output[row] = round_bf16(partial[0]);
+    }
+}
+
+// Distinct opt-in load organization; existing virtual and legacy kernels
+// remain unchanged. Actual ISA, not these arrays, qualifies load batching.
+__global__ __launch_bounds__(32)
+void linear_prefetch8_q8_qsa_input_kernel(
+    const std::uint16_t* input, const void* weights,
+    std::uint32_t input_width, std::uint32_t output_width, float* output) {
+    const auto row = static_cast<std::uint32_t>(blockIdx.x);
+    if (row >= output_width) return;
+    const auto lane = static_cast<std::uint32_t>(threadIdx.x);
+    float partial[8]{};
+    const auto* blocks = static_cast<const Q8Block*>(weights) +
+        static_cast<std::uint64_t>(row) * (input_width / 32U);
+    for (std::uint64_t chunk = 0; chunk < input_width; chunk += 256U) {
+        const auto base = chunk + 8U * lane;
+        // The prelaunch Q8 width%32 gate proves all eight leaves are valid
+        // together and remain inside one block. No tail load is speculative.
+        if (base < input_width) {
+            const auto feature = static_cast<std::uint32_t>(base);
+            const auto& block = blocks[feature / 32U];
+            std::uint16_t bits[8];
+            std::int8_t codes[8];
+#pragma unroll
+            for (unsigned local = 0; local < 8; ++local) {
+                bits[local] = input[feature + local];
+                codes[local] = block.values[feature % 32U + local];
+            }
+            const float scale = __half2float(block.scale);
+#pragma unroll
+            for (unsigned local = 0; local < 8; ++local)
+                partial[local] += bf16_to_float(bits[local]) *
+                    (scale * static_cast<float>(codes[local]));
+        }
+    }
+#pragma unroll
+    for (unsigned distance = 16; distance > 0; distance /= 2) {
+#pragma unroll
+        for (unsigned local = 0; local < 8; ++local) {
+            const auto partner = __shfl_down(partial[local], distance, 32);
+            if (lane < distance) partial[local] += partner;
+        }
+    }
+    if (lane == 0) {
+        partial[0] += partial[4]; partial[1] += partial[5];
+        partial[2] += partial[6]; partial[3] += partial[7];
+        partial[0] += partial[2]; partial[1] += partial[3];
+        partial[0] += partial[1];
+        output[row] = round_bf16(partial[0]);
     }
 }
 
@@ -1727,7 +1816,12 @@ void launch_linear_to_float(
     const ExecutionBufferAddress& input,
     std::uint32_t input_width,
     std::uint32_t output_width,
-    float* output) {
+    float* output, bool prefetch = false) {
+    if(prefetch && qsa_input_prefetch::eligible(*tensor.manifest)){
+        if(tensor.runtime->address%16U!=0 || tensor.manifest->absolute_offset%16U!=0 || tensor.runtime->bytes<qsa_input_prefetch::required_weight_bytes(input_width,output_width))throw std::invalid_argument("QSA prefetch launch weight alignment/extent invalid");
+        hipLaunchKernelGGL(linear_prefetch8_q8_qsa_input_kernel,dim3(output_width),dim3(32),0,hip_execution_stream(),reinterpret_cast<const std::uint16_t*>(input.address),reinterpret_cast<const void*>(tensor.runtime->address),input_width,output_width,output);
+        check_hip(hipGetLastError(),"HIP indexed-attention prefetch8 Q8 input projection launch");return;
+    }
     switch (weight_kind(
                 tensor.manifest->
                     ggml_type)) {
@@ -2283,6 +2377,25 @@ void launch_indexed_attention(
             "indexed-attention hidden buffers are undersized");
     }
 
+    if(config.prefetch_q8_input){
+        if(!qsa_input_prefetch::selected(true,config.prefetch_eligible_layers,context.layer))throw std::invalid_argument("QSA prefetch launch layer differs from admitted plan");
+        if(input.address%2U!=0 || output.address%2U!=0 || temporary.address%4U!=0 || kv_state.address%2U!=0 || raw_state.address%2U!=0)throw std::invalid_argument("QSA prefetch owner alignment invalid");
+        unsigned eligible=0;
+        for(const auto* tensor:{&tensors.q,&tensors.k,&tensors.v,&tensors.index_q,&tensors.index_k})if(qsa_input_prefetch::eligible(*tensor->manifest)){
+            ++eligible;const auto bytes=qsa_input_prefetch::required_weight_bytes(tensor->manifest->dimensions[0],tensor->manifest->dimensions[1]);
+            if(tensor->manifest->absolute_offset%16U!=0 || tensor->runtime->address%16U!=0 || tensor->manifest->byte_size<bytes || tensor->runtime->bytes<bytes)throw std::invalid_argument("QSA prefetch weight alignment/extent invalid");
+        }
+        if(eligible==0)throw std::invalid_argument("QSA prefetch step has no eligible projection");
+        struct Range{std::uintptr_t address;std::uint64_t bytes;};
+        std::array<Range,11> reads{};reads[0]={input.address,input.bytes};unsigned read_index=1;
+        for(const auto* tensor:{&tensors.q,&tensors.k,&tensors.v,&tensors.out,&tensors.q_norm,&tensors.k_norm,&tensors.index_q,&tensors.index_k,&tensors.index_q_norm,&tensors.index_k_norm})reads[read_index++]={tensor->runtime->address,tensor->runtime->bytes};
+        const std::array<Range,4> writes{{{temporary.address,temporary.bytes},{output.address,output.bytes},{kv_state.address,kv_state.bytes},{raw_state.address,raw_state.bytes}}};
+        auto valid=[](Range view){return view.address!=0 && view.bytes!=0 && view.bytes<=UINTPTR_MAX-view.address;};
+        auto overlap=[](Range x,Range y){return x.address<y.address+y.bytes && y.address<x.address+x.bytes;};
+        for(auto view:reads)if(!valid(view))throw std::invalid_argument("QSA prefetch invalid read owner");
+        for(unsigned i=0;i<writes.size();++i){if(!valid(writes[i]))throw std::invalid_argument("QSA prefetch invalid writable owner");for(auto view:reads)if(overlap(writes[i],view))throw std::invalid_argument("QSA prefetch writable/read owner overlap");for(unsigned j=0;j<i;++j)if(overlap(writes[i],writes[j]))throw std::invalid_argument("QSA prefetch writable owner overlap");}
+    }
+
     if (device_graph) {
         const auto& scope = *current_hip_launch_context();
         if (!config.enable_device_graph_inputs || scope.context_tokens != session_layout.context_tokens ||
@@ -2319,13 +2432,13 @@ void launch_indexed_attention(
         input,
         hidden,
         index_q_width,
-        workspace.index_query);
+        workspace.index_query, config.prefetch_q8_input);
     launch_linear_to_float(
         tensors.index_k,
         input,
         hidden,
         index_dim,
-        workspace.current_index_key);
+        workspace.current_index_key, config.prefetch_q8_input);
 
     launch_norm_rope(
         workspace.index_query,
@@ -2448,19 +2561,19 @@ void launch_indexed_attention(
         input,
         hidden,
         q_gate_width,
-        workspace.q_gate);
+        workspace.q_gate, config.prefetch_q8_input);
     launch_linear_to_float(
         tensors.k,
         input,
         hidden,
         kv_width,
-        workspace.current_k);
+        workspace.current_k, config.prefetch_q8_input);
     launch_linear_to_float(
         tensors.v,
         input,
         hidden,
         kv_width,
-        workspace.current_v);
+        workspace.current_v, config.prefetch_q8_input);
 
     launch_norm_rope(
         workspace.q_gate,
@@ -2618,7 +2731,7 @@ std::string kernel_id(
             request.logical_rows) +
         ".c" +
         std::to_string(
-            request.request_concurrency) + (request.device_graph_inputs ? ".device" : ".scalar");
+            request.request_concurrency) + (request.device_graph_inputs ? ".device" : ".scalar") + (config.prefetch_q8_input ? std::string(qsa_input_prefetch::kernel_suffix) : "");
 }
 
 std::uint64_t implementation_identity(
@@ -2664,10 +2777,25 @@ std::uint64_t implementation_identity(
         config.model.rms_norm_epsilon);
     hash_u64(hash, config.enable_device_graph_inputs);
     hash_u64(hash, config.model.max_position_embeddings);
+    if(config.prefetch_q8_input){hash_u64(hash,0x5153415052465631ULL);for(auto layer:config.prefetch_eligible_layers)hash_u64(hash,layer);}
     return hash;
 }
 
 }  // namespace
+
+void launch_hip_qsa_input_projection_probe(HipQsaInputProjectionMode mode,HipQsaInputProjectionView input,HipQsaInputProjectionView weights,HipQsaInputProjectionView output,std::uint32_t width,std::uint32_t outputs,void* stream){
+    const auto required=qsa_input_prefetch::required_weight_bytes(width,outputs);
+    const auto valid=[](HipQsaInputProjectionView v,std::uint64_t n,unsigned align){return v.address!=0 && v.address%align==0 && v.bytes==n && v.bytes<=UINTPTR_MAX-v.address;};
+    if((mode!=HipQsaInputProjectionMode::legacy256 && mode!=HipQsaInputProjectionMode::virtual256 && mode!=HipQsaInputProjectionMode::prefetch8) || !valid(input,static_cast<std::uint64_t>(width)*2U,16) || !valid(weights,required,16) || !valid(output,static_cast<std::uint64_t>(outputs)*4U,16))throw std::invalid_argument("QSA input projection probe exact views invalid");
+    const auto overlap=[](HipQsaInputProjectionView x,HipQsaInputProjectionView y){return x.address<y.address+y.bytes && y.address<x.address+x.bytes;};
+    if(overlap(output,input)||overlap(output,weights))throw std::invalid_argument("QSA input projection probe writable alias");
+    check_hip(hipPeekAtLastError(),"QSA projection probe stale error");
+    auto hip_stream=static_cast<hipStream_t>(stream);auto* in=reinterpret_cast<const std::uint16_t*>(input.address);auto* w=reinterpret_cast<const void*>(weights.address);auto* out=reinterpret_cast<float*>(output.address);
+    if(mode==HipQsaInputProjectionMode::legacy256)hipLaunchKernelGGL(HIP_KERNEL_NAME(linear_to_float_kernel<WeightKind::q8_0>),dim3(outputs),dim3(256),0,hip_stream,in,w,width,outputs,out);
+    else if(mode==HipQsaInputProjectionMode::virtual256)hipLaunchKernelGGL(linear_virtual256_q8_qsa_input_kernel,dim3(outputs),dim3(32),0,hip_stream,in,w,width,outputs,out);
+    else hipLaunchKernelGGL(linear_prefetch8_q8_qsa_input_kernel,dim3(outputs),dim3(32),0,hip_stream,in,w,width,outputs,out);
+    check_hip(hipGetLastError(),"QSA input projection probe launch");
+}
 
 void register_hip_indexed_attention_kernel_variant(
     const ModelContract& model,
@@ -2681,6 +2809,8 @@ void register_hip_indexed_attention_kernel_variant(
         throw std::invalid_argument(error);
     }
     validate_config(config);
+    if(config.prefetch_q8_input!=request.prefetch_q8_qsa_input || config.prefetch_eligible_layers!=request.qsa_input_prefetch_layers)throw std::invalid_argument("indexed QSA prefetch config differs from binding request");
+    qsa_input_prefetch::validate_layers(model,request.prefetch_q8_qsa_input,request.qsa_input_prefetch_layers);
 
     if (config.model.hidden_size !=
             model.hidden_size ||
@@ -2762,7 +2892,7 @@ void register_hip_indexed_attention_kernel_variant(
     variant.output_layout =
         "row-major";
     variant.compiler_identity =
-        "hip-gfx1151-indexed-attention-v2";
+        config.prefetch_q8_input ? "hip-gfx1151-indexed-attention-v3-prefetch8-virtual256-q8-qsa-input" : "hip-gfx1151-indexed-attention-v2";
     variant.measured_seconds = 0.0;
 
     registry.add(
@@ -2799,42 +2929,21 @@ register_for_compiled_execution(
             "HIP indexed-attention bundle requires valid compiled execution");
     }
 
-    std::string registered_id;
-    for (std::size_t index = 0;
-         index < compiled.execution.steps.size();
-         ++index) {
-        if (compiled.execution.steps[index].op !=
-            SerialOp::indexed_attention) {
-            continue;
-        }
-
-        const auto& binding =
-            compiled.bindings.bindings[index];
-        if (binding.host_or_runtime_step ||
-            !binding.kernel_id.has_value() ||
-            binding.kernel_id->empty()) {
-            throw std::invalid_argument(
-                "HIP indexed-attention step has no kernel binding");
-        }
-
-        if (registered_id.empty()) {
-            registered_id =
-                *binding.kernel_id;
-            registry.add_kernel_launcher(
-                make_hip_indexed_attention_launcher(
-                    registered_id,
-                    &config_));
-        } else if (registered_id !=
-                   *binding.kernel_id) {
-            throw std::invalid_argument(
-                "HIP indexed-attention bundle requires one selected kernel id");
-        }
+    ExecutionBindingRequest shape;shape.logical_rows=compiled.logical_rows;shape.request_concurrency=compiled.request_concurrency;shape.device_graph_inputs=compiled.device_graph_inputs;
+    std::vector<std::string> registered;bool saw_prefetch=false;
+    for(std::size_t i=0;i<compiled.execution.steps.size();++i){
+        if(compiled.execution.steps[i].op!=SerialOp::indexed_attention)continue;
+        const auto& binding=compiled.bindings.bindings[i];
+        if(binding.host_or_runtime_step || !binding.kernel_id || binding.kernel_id->empty())throw std::invalid_argument("HIP indexed-attention step has no kernel binding");
+        const bool prefetch=binding.kernel_id->ends_with(qsa_input_prefetch::kernel_suffix);
+        if(prefetch!=qsa_input_prefetch::selected(config_.prefetch_q8_input,config_.prefetch_eligible_layers,compiled.execution.steps[i].layer))throw std::invalid_argument("HIP indexed QSA prefetch binding/config mismatch");
+        auto* selected=prefetch?&config_:&fallback_config_;
+        if(*binding.kernel_id!=kernel_id(shape,*selected))throw std::invalid_argument("HIP indexed-attention bundle permits only its base/prefetch pair");
+        if(std::find(registered.begin(),registered.end(),*binding.kernel_id)==registered.end()){registry.add_kernel_launcher(make_hip_indexed_attention_launcher(*binding.kernel_id,selected));registered.push_back(*binding.kernel_id);}
+        saw_prefetch|=prefetch;
     }
-
-    if (registered_id.empty()) {
-        throw std::invalid_argument(
-            "compiled execution has no indexed-attention step");
-    }
+    if(registered.empty())throw std::invalid_argument("compiled execution has no indexed-attention step");
+    if(config_.prefetch_q8_input && !saw_prefetch)throw std::invalid_argument("QSA prefetch bundle requires eligible bound step");
 }
 
 namespace {

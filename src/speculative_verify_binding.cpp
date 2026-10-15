@@ -25,6 +25,7 @@ bind_speculative_verify_plan(
             "invalid speculative verify binding geometry");
     }
 
+    if(request.prefetch_q8_qsa_input)throw std::invalid_argument("QSA input prefetch runtime does not support speculative verify");
     ExecutionBindingRequest shape_request;
     shape_request.logical_rows =
         plan.candidate_depth;
