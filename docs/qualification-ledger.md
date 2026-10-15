@@ -1,12 +1,12 @@
 # Current qualification ledger
 
-Updated: 2026-10-12. Earlier slices in `IMPLEMENTATION_STATUS.md` record historical
+Updated: 2026-10-15. Earlier slices in `IMPLEMENTATION_STATUS.md` record historical
 implementation steps. This table summarizes current gates without promoting
 portable fixtures, declarations or offline compilation to native qualification.
 
 | Area | Available implementation and checks | Required target evidence |
 | --- | --- | --- |
-| Wave router top-k | Low-level OFF in manual selection; content-bound auto profile selects wave/HC output; historical host evidence: distinct parallel wave selection and identities; WSL GNU13.3 Release HIP-OFF152/152 tests,6864 independent host insertion/wave cases; typed poisoned eager/captured device fixtures supplied | Actual Core10 HIP compile, softmax/epilogue ISA and FP modes, old-kernel preservation, native device fixtures, full554 arrays/512 IDs and preparation-inclusive paired measurements remain pending |
+| Wave router top-k | Low-level OFF in manual selection; content-bound auto profile selects wave/HC output; historical host evidence: distinct parallel wave selection and identities; WSL GNU13.3 Release HIP-OFF152/152 tests,6864 independent host insertion/wave cases; typed poisoned eager/captured device fixtures supplied | Individual canonical source/native/ISA, full554 equality, generated512 identity and descriptive paired measurements are observed; wider workloads, stronger timing evidence and the automatic wave/HC combination remain separate gates |
 | Deferred eager MoE status | Opt-in C1 first-error domain/full bits, owned completion stream, prepublication session hook and transactional host histories; shared host/device first-error helper, exact admission and portable middle-layer/fence/host-precedence tests | HIP compilation, native invalid-route/status fixtures, complete-model array equality and preparation-inclusive token latency |
 | Memory/model contracts | Checked physical-pool accounting, GGUF metadata, tensor/runtime bindings and admission | Complete canonical checkpoint ownership and observed physical peak |
 | Model execution | Portable semantic oracles, compiled serial runtime seams and experimental HIP implementation | Full-model tensor coverage, logits/tokens/state fidelity on gfx1151 |
@@ -27,7 +27,7 @@ portable fixtures, declarations or offline compilation to native qualification.
 | Q8 shared-expert gate/up/down prefetch | Default-off per-tensor/layer selection, distinct IDs, original device definitions preserved, limited host planning tests, standalone and full-operator poison/graph fixtures, actual host submission count | Native HIP compilation, linked legacy ISA and candidate FP/arithmetic/resource descriptors, new device fixture execution, full-model exactness, paired complete-workload benefit |
 | Exact HC projection prototype | Diagnostic-only OPW8/16/32 with P1/P2, original payloads, ordered chains and same-input poison/event fixtures | Source review, actual HIP/ISA no-spill/scalar-load checks, device exactness and real captured-input microbench; no decoder integration yet |
 
-The latest completed strict Release integration passed 143 portable CTest entries.
+A historical strict Release integration passed 143 portable CTest entries.
 The final source also passed 29 selected ASan/UBSan checks with leak detection and
 five HIP host-contract tests. The complete gfx1151 HIP build and the enabled Linux
 driver object compiled offline. The complete pinned kernel, modules and private
@@ -54,7 +54,7 @@ See [the portable implementation slice](implementation-2026-10-11.md),
 [reusable execution components](implementation-2026-10-12-execution-components.md),
 [low-precision lab](../lab/low_precision/README.md) and the architecture guides.
 
-Draft integration check (2026-10-15): the combined default-off source passed a
+Historical initial integration check (2026-10-15): the low-level default-off source passed a
 fresh GNU 13.3/WSL Release HIP-OFF build with warnings as errors and 157/157 portable
 CTest entries. This includes combined mixed-mode selection, base identity and
 deferred graph rejection. Host syntax checks with private HIP declarations passed;
@@ -70,3 +70,16 @@ explicit overrides and reasoned fallback. This policy source still requires revi
 and fresh integrated native qualification; see
 [the policy contract](decode-optimization-profile.md). The earlier default-off
 integration result records its original revision and scope.
+
+Current automatic-policy checkpoint: the preceding integrated source completed
+225/225 actual native regression tests with no failures/skips, and preserved 225
+legacy kernels under the linked restricted ISA comparison. A1 wave and C1 HC output
+also have separate full554 array equality, generated512 identity and descriptive
+paired workload observations. None of these statements establishes joint automatic
+profile fidelity or speed, and the individual gains must not be added.
+
+The host compatibility follow-up retains automatic selection with no optimization
+flags, preserves old explicit options unless auto is explicitly requested, validates
+roundtrip capacity after profile resolution, and escapes QSA tensor names in JSON.
+Its changed host source requires fresh review/native checks. Joint full554,
+automatic generated512 and paired combination measurements remain pending.

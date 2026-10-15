@@ -30,9 +30,24 @@ supports wider contexts, but the automatic profile does not claim those timings
 or numerical gates. Without automatic selection the previous implicit context128
 is retained.
 
+With no low-level optimization flags, `auto` remains the application default.
+If any kernel/PLE/coalescing optimization option is supplied without an explicit
+`--optimization-profile auto`, the resolver preserves those options and uses
+`explicit-low-level-options`. This keeps legacy commands and A/B arms from gaining
+wave, HC output or A8 implicitly. Context, token count and prefix-roundtrip options
+alone do not count as low-level optimization selection. An explicit `auto` permits
+composition; explicit ranked routing then keeps ranked and can add HC output.
+
+Roundtrip capacity is checked after profile resolution and before HIP setup or
+enqueue. Thus an implicit context can first resolve to8192. The complete requested
+trajectory must fit:43 prompt tokens and511 generated IDs fit the automatic8192
+context, while an unchanged manual128 context is rejected. An explicit context or
+an automatic fallback is validated using the context actually retained.
+
 `--optimization-profile manual` disables all automatic additions and preserves
 explicit options. Use it for controlled A/B comparisons and for selecting the
-legacy configuration. Explicit ranked routing is respected in automatic mode.
+legacy configuration. Ranked plus implicit auto stays explicit; ranked plus an
+explicit auto request retains ranked routing in the automatic bundle.
 Explicit graph, integer-head, copied residency, replay-reference and planned PLE
 IO modes fall back to the explicit configuration; their existing admission guards
 still apply. Missing build capability, another checkpoint or incompatible metadata
@@ -46,7 +61,7 @@ policy change prepares the combined wave/HC configuration for review and validat
 Separate measurements do not establish a combined speedup or justify adding their
 individual gains.
 The HC projection prototype adds no decoder option. Explicit experiment flags can
-compose with the selected profile, but this does not qualify their combined cost
+compose with an explicitly requested automatic profile, but this does not qualify their combined cost
 or numerical behavior.
 
 All three decoder receipt paths add:

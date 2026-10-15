@@ -464,6 +464,7 @@ int main(
     const auto optimization_profile = strix::decode_cli::resolve_optimization_profile(
         options, model, info, manifest,
         strix::model_content_identity_hex(mapped.content_identity()), has_auto_a8_runtime);
+    strix::decode_cli::validate_resolved_prefix_roundtrip(options);
     const std::string optimization_profile_receipt =
         "  \"optimization_profile_requested\": \"" + optimization_profile.requested + "\",\n" +
         "  \"optimization_profile_selected\": \"" + optimization_profile.selected + "\",\n" +
@@ -561,7 +562,7 @@ int main(
     if(options.prefetch_q8_qsa_input) qsa_input_mode_receipt+="  \"prefetch_q8_qsa_input_eligible_projections\": "+std::to_string(qsa_prefetch_plan.eligible_projections)+",\n";
     if(options.prefetch_q8_qsa_input) qsa_input_mode_receipt+="  \"prefetch_q8_qsa_input_fallback_projections\": "+std::to_string(qsa_prefetch_plan.fallback_projections)+",\n";
     if(options.prefetch_q8_qsa_input) qsa_input_mode_receipt+="  \"prefetch_q8_qsa_input_projection_choices\": [";
-    for(std::size_t i=0;i<qsa_prefetch_plan.projections.size();++i){const auto& choice=qsa_prefetch_plan.projections[i];if(i)qsa_input_mode_receipt+=",";qsa_input_mode_receipt+="{\"layer\":"+std::to_string(choice.layer)+",\"projection\":"+std::to_string(i%5U)+",\"tensor_name\":\""+choice.tensor_name+"\",\"projection_kernel\":\""+std::string(choice.eligible?strix::qsa_input_prefetch::projection_prefetch_id:strix::qsa_input_prefetch::projection_base_id)+"\"}";}
+    for(std::size_t i=0;i<qsa_prefetch_plan.projections.size();++i){const auto& choice=qsa_prefetch_plan.projections[i];if(i)qsa_input_mode_receipt+=",";qsa_input_mode_receipt+="{\"layer\":"+std::to_string(choice.layer)+",\"projection\":"+std::to_string(i%5U)+",\"tensor_name\":\""+strix::decode_receipt::escape_json_string(choice.tensor_name)+"\",\"projection_kernel\":\""+std::string(choice.eligible?strix::qsa_input_prefetch::projection_prefetch_id:strix::qsa_input_prefetch::projection_base_id)+"\"}";}
     if(options.prefetch_q8_qsa_input) qsa_input_mode_receipt+="],\n";
     const auto qsa_prefetch_stats=options.prefetch_q8_qsa_input ?
         std::make_shared<strix::qsa_input_prefetch::RuntimeDispatchStats>() : nullptr;

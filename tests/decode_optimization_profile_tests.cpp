@@ -29,7 +29,8 @@ int main() {
     manifest.layout_identity = model_manifest_layout_identity(manifest);
     auto defaults = parse({"decoder", "fixture.gguf", "1"});
     expect(defaults.optimization_profile == OptimizationProfile::automatic &&
-           defaults.context_tokens == 128 && !defaults.q4k_a8g32_gate_up,
+           defaults.context_tokens == 128 && !defaults.q4k_a8g32_gate_up &&
+           !defaults.profile_explicit && !defaults.any_low_level_flag,
            "parser defers auto until content identification");
     auto on = defaults;
     const auto selected = resolve_optimization_profile(on, model, info, manifest,
@@ -66,7 +67,18 @@ int main() {
     fallback(parse({"decoder","m","1","--context","4096"}), "context-not-qualified");
     fallback(parse({"decoder","m","1","--residency","copy"}), "residency-not-qualified");
     fallback(parse({"decoder","m","1","--reference","reference.json"}), "explicit-replay-reference");
-    fallback(parse({"decoder","m","1","--planned-ple-io"}), "planned-ple-io-explicit");
+    fallback(parse({"decoder","m","1","--planned-ple-io"}), "explicit-low-level-options");
+    fallback(parse({"decoder","m","1","--optimization-profile","auto","--planned-ple-io"}),
+             "planned-ple-io-explicit");
+    fallback(parse({"decoder","m","1","--parallel-hyper-mix"}), "explicit-low-level-options");
+    fallback(parse({"decoder","m","1","--coalesce-gap","64"}), "explicit-low-level-options");
+    for (const auto* flag : {"--parallel-hyper-mix","--prefetch-q8-qsa-input",
+        "--prefetch-q8-shared-expert","--deferred-moe-status","--lane-chain-hyper-output",
+        "--wave-moe-router-topk","--q4k-a8g32-gate-up","--grouped-exact-q51-down"})
+        expect(is_low_level_optimization_option(flag), "all experimental optimization flags tracked");
+    expect(!is_low_level_optimization_option("--context") &&
+           !is_low_level_optimization_option("--optimization-profile"),
+           "ordinary context and explicit profile are distinct from low-level choices");
     auto graph = parse({"decoder","m","1","--execution-mode","graph","--residency","copy",
         "--graph-workspace-bytes","1","--graph-executable-bytes","1",
         "--graph-capture-peak-bytes","1","--graph-budget-bytes","3"});
@@ -77,12 +89,52 @@ int main() {
     auto ranked = parse({"decoder","m","1","--parallel-moe-router","--ranked-moe-router-topk"});
     const auto ranked_result = resolve_optimization_profile(ranked, model, info, manifest,
         validated_model_content_identity, true);
-    expect(ranked.ranked_moe_router_topk && !ranked.wave_moe_router_topk &&
-           ranked.lane_chain_hyper_output && ranked_result.selected == "canonical-a8-ranked-hc-output-v2" &&
-           ranked_result.reason == "explicit-ranked-router", "explicit ranked selection preserved");
+    expect(ranked.profile_explicit == false && ranked.any_low_level_flag &&
+           ranked.ranked_moe_router_topk && !ranked.wave_moe_router_topk &&
+           !ranked.lane_chain_hyper_output && !ranked.q4k_a8g32_gate_up &&
+           ranked_result.selected == "manual" && !ranked_result.automatic_applied &&
+           ranked_result.reason == "explicit-low-level-options" && ranked.context_tokens == 128,
+           "legacy explicit ranked command is never expanded by implicit auto");
+    auto ranked_auto = parse({"decoder","m","1","--parallel-moe-router",
+        "--ranked-moe-router-topk","--optimization-profile","auto"});
+    const auto ranked_auto_result = resolve_optimization_profile(ranked_auto, model, info, manifest,
+        validated_model_content_identity, true);
+    expect(ranked_auto.profile_explicit && ranked_auto.ranked_moe_router_topk &&
+           !ranked_auto.wave_moe_router_topk && ranked_auto.lane_chain_hyper_output &&
+           ranked_auto_result.selected == "canonical-a8-ranked-hc-output-v2" &&
+           ranked_auto_result.reason == "explicit-ranked-router",
+           "explicit auto permits requested ranked routing plus HC output");
     auto explicit_context = parse({"decoder","m","1","--context","8192","--optimization-profile","auto"});
     expect(resolve_optimization_profile(explicit_context, model, info, manifest,
         validated_model_content_identity, true).automatic_applied, "explicit qualified context eligible");
+    auto roundtrip = parse({"decoder","m","1","--generate","511","--prefix-cache-roundtrip"});
+    roundtrip.tokens.assign(43,1);
+    expect(resolve_optimization_profile(roundtrip, model, info, manifest,
+        validated_model_content_identity, true).automatic_applied && roundtrip.context_tokens == 8192,
+        "implicit auto resolves roundtrip context before capacity validation");
+    validate_resolved_prefix_roundtrip(roundtrip);
+    auto manual_roundtrip = parse({"decoder","m","1","--generate","511",
+        "--prefix-cache-roundtrip","--optimization-profile","manual"});
+    manual_roundtrip.tokens.assign(43,1);
+    (void)resolve_optimization_profile(manual_roundtrip, model, info, manifest,
+                                     validated_model_content_identity, true);
+    rejects([&] { validate_resolved_prefix_roundtrip(manual_roundtrip); },
+        "prefix-cache roundtrip generation exceeds resolved context");
+    auto explicit_small = parse({"decoder","m","1","--generate","511",
+        "--prefix-cache-roundtrip","--context","128"});
+    explicit_small.tokens.assign(43,1);
+    expect(resolve_optimization_profile(explicit_small, model, info, manifest,
+        validated_model_content_identity, true).reason == "context-not-qualified",
+        "explicit small context is never expanded");
+    rejects([&] { validate_resolved_prefix_roundtrip(explicit_small); },
+        "prefix-cache roundtrip generation exceeds resolved context");
+    auto unknown_roundtrip = parse({"decoder","m","1","--generate","511","--prefix-cache-roundtrip"});
+    unknown_roundtrip.tokens.assign(43,1);
+    (void)resolve_optimization_profile(unknown_roundtrip, model, info, manifest,"unknown",true);
+    rejects([&] { validate_resolved_prefix_roundtrip(unknown_roundtrip); },
+        "prefix-cache roundtrip generation exceeds resolved context");
+    manual_roundtrip.generate_tokens = 86; //43prompt+85generated-inputs exactly128steps.
+    validate_resolved_prefix_roundtrip(manual_roundtrip);
     auto altered_model = model;
     altered_model.hidden_size /= 2;
     auto bad_contract = defaults;
@@ -109,6 +161,21 @@ int main() {
     rejects([] { (void)parse({"decoder","m","1","--optimization-profile","auto",
         "--optimization-profile","manual"}); }, "duplicate optimization profile option");
 #ifdef STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME
+    auto legacy_full = parse({"decoder","m","1","--parallel-hyper-mix",
+        "--staged-hyper-projections","--fused-staged-hyper-mix","--virtual-q8-lm-head",
+        "--parallel-moe-router","--ranked-moe-router-topk","--virtual-q8-gdn-input",
+        "--prefetch-q8-gdn-input","--typed-fused-hyper-projections","--prefetch-typed-hyper-rows",
+        "--q4k-a8g32-gate-up","--grouped-exact-q51-down","--prefetch-q8-hyper-output",
+        "--virtual-q8-gdn-output"});
+    const auto legacy_result = resolve_optimization_profile(legacy_full, model, info, manifest,
+        validated_model_content_identity, true);
+    expect(legacy_result.reason == "explicit-low-level-options" &&
+           !legacy_result.automatic_applied && legacy_full.q4k_a8g32_gate_up &&
+           legacy_full.grouped_exact_q51_down && legacy_full.virtual_q8_gdn_output &&
+           legacy_full.prefetch_q8_hyper_output && legacy_full.ranked_moe_router_topk &&
+           !legacy_full.wave_moe_router_topk && !legacy_full.lane_chain_hyper_output &&
+           legacy_full.context_tokens == 128,
+           "full fourteen-option legacy baseline remains its explicitly requested configuration");
     auto a8_manual = parse({"decoder","m","1","--optimization-profile","manual",
         "--q4k-a8g32-gate-up","--grouped-exact-q51-down"});
     expect(a8_manual.q4k_a8g32_gate_up && a8_manual.grouped_exact_q51_down,

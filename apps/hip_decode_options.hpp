@@ -91,6 +91,8 @@ struct OptimizationProfileResolution {
 };
 struct Options {
     OptimizationProfile optimization_profile = OptimizationProfile::automatic;
+    bool profile_explicit = false;
+    bool any_low_level_flag = false;
     bool context_explicit = false;
     std::string model_path;
     std::vector<std::uint32_t> tokens;
@@ -133,6 +135,31 @@ struct Options {
     strix::DecodeExecutionOptions execution;
 };
 
+inline bool is_low_level_optimization_option(std::string_view argument) {
+    for (const std::string_view option : {
+        "--parallel-hyper-mix", "--staged-hyper-projections", "--fused-staged-hyper-mix",
+        "--typed-fused-hyper-projections", "--prefetch-typed-hyper-rows",
+        "--prefetch-q8-hyper-output", "--lane-chain-hyper-output", "--virtual-q8-lm-head",
+        "--parallel-moe-router", "--ranked-moe-router-topk", "--wave-moe-router-topk",
+        "--virtual-q8-gdn-input", "--prefetch-q8-gdn-input", "--virtual-q8-gdn-output",
+        "--q4k-a8g32-gate-up", "--grouped-exact-q51-down", "--deferred-moe-status",
+        "--prefetch-q8-qsa-input", "--prefetch-q8-shared-expert", "--planned-ple-io",
+        "--ple-max-rows-per-io", "--ple-max-inflight-ios", "--coalesce-gap"})
+        if (argument == option) return true;
+    return false;
+}
+
+// Context can change only after immutable model/profile admission. Roundtrip
+// must fit the complete requested trajectory, including the final emitted ID
+// that does not itself consume another model step.
+inline void validate_resolved_prefix_roundtrip(const Options& options) {
+    if (!options.prefix_cache_roundtrip) return;
+    validate_decode_prefix_roundtrip(options.tokens.size(), options.context_tokens,
+                                    options.generate_tokens);
+    if (options.generate_tokens - 1U > options.context_tokens - options.tokens.size())
+        throw std::invalid_argument("prefix-cache roundtrip generation exceeds resolved context");
+}
+
 inline Options parse_options(
     int argc,
     char** argv) {
@@ -158,12 +185,15 @@ inline Options parse_options(
          ++index) {
         const std::string_view argument =
             argv[index];
+        options.any_low_level_flag = options.any_low_level_flag ||
+            is_low_level_optimization_option(argument);
         if (argument == "--optimization-profile") {
             if (!execution_option_names.insert(argument).second)
                 throw std::invalid_argument("duplicate optimization profile option");
             if (index + 1 >= argc)
                 throw std::invalid_argument("--optimization-profile requires auto or manual");
             options.optimization_profile = parse_optimization_profile(argv[++index]);
+            options.profile_explicit = true;
             continue;
         }
         if (argument == "--grouped-exact-q51-down") {
@@ -477,8 +507,6 @@ inline Options parse_options(
         throw std::invalid_argument(
             "--generate requires at least one prefix token id");
     }
-    if (options.prefix_cache_roundtrip)
-        strix::validate_decode_prefix_roundtrip(options.tokens.size(), options.context_tokens, options.generate_tokens);
     if (options.context_tokens == 0) {
         throw std::invalid_argument(
             "context must be non-zero");
@@ -539,6 +567,8 @@ inline OptimizationProfileResolution resolve_optimization_profile(
         result.requested = "manual";
         return fallback("explicit-manual");
     }
+    if (options.any_low_level_flag && !options.profile_explicit)
+        return fallback("explicit-low-level-options");
     if (options.execution.mode != DecodeExecutionMode::eager)
         return fallback("execution-mode-not-qualified");
     if (options.execution.integer_head != DecodeIntegerHead::none)

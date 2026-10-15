@@ -169,3 +169,31 @@ nonfinite case also tests a distinct NaN scalar gate during graph replays.
 ## E-055
 
 Diagnostic source: `src/hip_hyper_mix_launcher.hip`, `tests/hip_lane_chain_hyper_projection_tests.hip`, and its implementation document. HIP target `strix-hip-lane-chain-hyper-projection-tests` runs synthetic exactness checks; `--bench` records real-payload event pairs using an externally bound normalized capture. Required environment is actual gfx1151 with the original TU compiler settings; compiler/ISA and device results are pending. Source staging sizes are not measured occupancy or throughput.
+
+## Automatic decoder policy evidence (2026-10-15)
+
+The actual application parser and resolver are exercised by
+`tests/decode_optimization_profile_tests.cpp` with A8 capability present and absent.
+The preceding host-policy checkpoint passed 159/159 strict Release portable CTest
+entries. The preceding integrated source also passed 225/225 actual native tests
+with no failures/skips; its linked audit preserved 225 legacy kernels. These are
+native regression and preservation results, not a joint model/performance gate.
+
+E-050 wave routing and E-053 lane-chain HC output each have separate canonical
+full554 array equality,512 generated-ID identity and descriptive paired workload
+observations. This limited prompt/context/host evidence does not add together or
+qualify the combined automatic profile. No universal checkpoint-quality claim is
+made. Detailed receipts remain in the private evidence store.
+
+The current host-only follow-up preserves explicit legacy options unless auto is
+explicitly requested, checks full roundtrip capacity after resolving context, and
+uses the existing JSON escaping helper for QSA tensor names. Its tests cover
+no-flag automatic selection, implicit explicit-option fallback, explicit auto plus
+ranked, manual JSON identity, and43-prefix/511-generation auto8192 acceptance versus
+manual128 rejection. Changed host source needs review and fresh native validation;
+joint automatic full554/512 fidelity and paired timing remain independent gates.
+
+Observed for this host follow-up: GNU 13.3/WSL Release with HIP OFF and warnings
+as errors passed the full 159/159 portable CTest entries. Decoder/catalog/catalog
+fixture C++20 syntax checks with private HIP declarations passed with the A8
+capability both present and absent; this is not a fresh HIP/native result.
