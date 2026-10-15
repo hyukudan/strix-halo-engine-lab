@@ -1,5 +1,5 @@
 #include "strix/serial_request.hpp"
-#include "strix/serial_decode_reference.hpp"
+#include "strix/serial_decode_replay.hpp"
 
 #include <cmath>
 #include <limits>

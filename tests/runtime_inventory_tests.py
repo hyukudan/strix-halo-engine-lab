@@ -370,6 +370,20 @@ class InventoryTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, 2)
 
 
+    def test_hex_identity_normalizes_case(self):
+        self.assertEqual(INVENTORY.hex_identity("AB" * 32, "digest"), "ab" * 32)
+        path = self.text("model.bin", "payload")
+        digest = hashlib.sha256(b"payload").hexdigest()
+        result = self.collect(model_path=path,
+            receipt_path=self.evidence("uppercase-receipt.json", {"model_sha256": digest.upper()}))
+        self.assertTrue(result["consistent"])
+
+    def test_external_audit_status_must_be_string(self):
+        for status in (None, [], {}, 1, True):
+            with self.subTest(status=status), self.assertRaises(ValueError):
+                INVENTORY.operator_records({"requirements": [{"op": "lm_head", "status": status}]}, {})
+
+
 
 if __name__ == "__main__":
     unittest.main()

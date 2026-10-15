@@ -26,6 +26,8 @@ function(strix_target_warnings target)
 endfunction()
 
 add_library(strix_core STATIC
+    src/prepared_execution.cpp
+    src/prepared_serial_session.cpp
     src/execution_telemetry.cpp
     src/qsa_input_prefetch.cpp
     src/model_copy_residency_layout.cpp
@@ -232,6 +234,10 @@ if(BUILD_TESTING OR STRIX_BUILD_EXPERIMENTAL_Q4K_A8_PROBE OR STRIX_ENABLE_EXPERI
     endif()
 endif()
 if(BUILD_TESTING)
+    add_executable(strix-prepared-execution-tests tests/prepared_execution_tests.cpp)
+    target_link_libraries(strix-prepared-execution-tests PRIVATE strix_core)
+    strix_target_warnings(strix-prepared-execution-tests)
+    add_test(NAME strix-prepared-execution-tests COMMAND strix-prepared-execution-tests)
     add_executable(strix-generation-output-dispatch-tests tests/generation_output_dispatch_tests.cpp)
     target_link_libraries(strix-generation-output-dispatch-tests PRIVATE strix_core)
     strix_target_warnings(strix-generation-output-dispatch-tests)

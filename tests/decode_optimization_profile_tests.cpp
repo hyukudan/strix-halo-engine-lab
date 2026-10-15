@@ -32,7 +32,7 @@ int main() {
            defaults.context_tokens == 128 && !defaults.q4k_a8g32_gate_up &&
            !defaults.profile_explicit && !defaults.any_low_level_flag &&
            !defaults.prefetch_q8_qsa_input && !defaults.prefetch_q8_shared_expert &&
-           !defaults.deferred_moe_status,
+           !defaults.deferred_moe_status && !defaults.gpu_greedy_token && !defaults.prepared_eager,
            "parser defers auto until content identification");
     auto on = defaults;
     auto inventory_only = parse({"decoder", "fixture.gguf", "1", "--execution-inventory"});
@@ -48,6 +48,25 @@ int main() {
     rejects([] { static_cast<void>(parse({"decoder", "m", "1", "--generate", "2", "--prefix-cache-roundtrip",
         "--gpu-greedy-token"})); },
         "GPU greedy token output requires eager generation without RAW, reference, roundtrip or integer head");
+    auto prepared = parse({"decoder", "fixture.gguf", "1", "--prepared-eager"});
+    const auto prepared_profile = resolve_optimization_profile(prepared, model, info, manifest,
+        validated_model_content_identity, true);
+    expect(prepared.prepared_eager && !prepared.any_low_level_flag && prepared_profile.automatic_applied,
+           "prepared host submission preserves automatic kernel selection");
+    auto composed = parse({"decoder", "fixture.gguf", "1", "--generate", "2",
+        "--prepared-eager", "--gpu-greedy-token"});
+    expect(composed.prepared_eager && composed.gpu_greedy_token,
+           "prepared submission and scalar output compose explicitly");
+    expect(parse({"decoder", "m", "1", "--reference", "reference.json", "--prepared-eager"}).prepared_eager,
+           "prepared diagnostic replay retains full arrays");
+    rejects([] { static_cast<void>(parse({"decoder", "m", "1", "--prepared-eager", "--prepared-eager"})); },
+        "duplicate prepared eager option");
+    rejects([] { static_cast<void>(parse({"decoder", "m", "1", "--prepared-eager", "--prefix-cache-roundtrip", "--generate", "2"})); },
+        "prepared eager execution excludes graph, integer head and prefix roundtrip");
+    rejects([] { static_cast<void>(parse({"decoder", "m", "1", "--generate", "2", "--gpu-greedy-token", "--reference", "r"})); },
+        "--generate and --reference are separate execution modes");
+    rejects([] { static_cast<void>(parse({"decoder", "m", "1", "--generate", "2", "--gpu-greedy-token", "--gpu-greedy-token"})); },
+        "duplicate GPU greedy token option");
     auto instrumented = parse({"decoder", "fixture.gguf", "1", "--host-dispatch-telemetry"});
     const auto instrumented_profile = resolve_optimization_profile(instrumented, model, info, manifest,
         validated_model_content_identity, true);

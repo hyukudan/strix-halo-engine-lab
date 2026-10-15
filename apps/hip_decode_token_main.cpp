@@ -29,6 +29,7 @@
 #include "strix/hip_setup_quiescence.hpp"
 #include "strix/hip_generation_output.hpp"
 #include "strix/generation_output_dispatch.hpp"
+#include "strix/prepared_serial_session.hpp"
 #include "hip_decode_experiment.hpp"
 #include "hip_decode_options.hpp"
 #include "hip_deferred_moe_status.hpp"
@@ -442,6 +443,7 @@ int main(
             "  --host-dispatch-telemetry (eager host launcher counters on stderr; profiling only)\n"
             "  --execution-inventory (include selected host launcher and declared variant metadata)\n"
             "  --gpu-greedy-token (experimental eager generation with small GPU selection result)\n"
+            "  --prepared-eager (experimental immutable static submission plan)\n"
             "  --virtual-q8-gdn-output (exact original256-tree Q8 output)\n"
             "  --lane-chain-hyper-output (requires --prefetch-q8-hyper-output)\n"
             "  --record-raw ABS_NEW_PRIVATE_DIRECTORY --record-max-bytes BYTES\n"
@@ -572,6 +574,9 @@ int main(
         "  \"optimization_profile_reason\": \"" + optimization_profile.reason + "\",\n" +
         "  \"optimization_profile_automatic_applied\": " +
         (optimization_profile.automatic_applied ? "true" : "false") + ",\n";
+    const std::string eager_submission_receipt = options.prepared_eager
+        ? "  \"eager_submission_mode\":\"prepared-static-plan-experimental-v1\",\n"
+        : std::string{};
     if (options.context_tokens >
         model.max_position_embeddings) {
         throw std::invalid_argument(
@@ -1001,12 +1006,24 @@ int main(
             "compiled execution does not end in one logits write");
     }
 
-    std::unique_ptr<HipDeferredMoeStatus> deferred_moe;
+    std::shared_ptr<HipDeferredMoeStatus> deferred_moe;
     if(options.deferred_moe_status) {
         const auto deferred_status_generation=generations.next();
         const auto deferred_shadow_generation=generations.next();
-        deferred_moe=std::make_unique<HipDeferredMoeStatus>(resources,compiled.execution_identity,
+        deferred_moe=std::make_shared<HipDeferredMoeStatus>(resources,compiled.execution_identity,
             deferred_status_generation,deferred_shadow_generation,experiment_owner,original_work_device);
+    }
+    std::unique_ptr<strix::PreparedEagerExecution> prepared_eager;
+    if (options.prepared_eager) {
+        strix::EagerExecutionRequest prototype;
+        prototype.input_token_id = options.tokens.empty() ? 0U : options.tokens.front();
+        prototype.position = session.next_position;
+        prototype.state = session.state;
+        const auto& current_resources = deferred_moe ? deferred_moe->resources() : resources;
+        const auto owner = deferred_moe ? std::static_pointer_cast<const void>(deferred_moe)
+                                        : std::static_pointer_cast<const void>(experiment_owner);
+        prepared_eager = std::make_unique<strix::PreparedEagerExecution>(
+            compiled, current_resources, prototype, owner);
     }
     std::uint64_t input_access_epoch = 1;
     const std::function<void(std::uint32_t)> execute_native_token = [&](std::uint32_t token) {
@@ -1019,10 +1036,15 @@ int main(
             deferred_moe->begin();
             try {
                 strix::HipLaunchScope scope(deferred_moe->scope());
-                static_cast<void>(strix::execute_serial_token(compiled,session,deferred_moe->resources(),token,dispatcher,
+                if (prepared_eager) static_cast<void>(strix::execute_prepared_serial_token(
+                    *prepared_eager, session, deferred_moe->resources(), token, dispatcher,
+                    [&] { deferred_moe->complete_before_commit(); }));
+                else static_cast<void>(strix::execute_serial_token(compiled,session,deferred_moe->resources(),token,dispatcher,
                     [&] { deferred_moe->complete_before_commit(); }));
             } catch (...) { deferred_moe->abort();throw; }
         } else if (graph) static_cast<void>(graph->execute(session, token));
+        else if (prepared_eager) static_cast<void>(strix::execute_prepared_serial_token(
+            *prepared_eager, session, resources, token, dispatcher));
         else static_cast<void>(strix::execute_serial_token(compiled, session, resources, token, dispatcher));
         // Deferred mode completed its owned stream inside the session's
         // prepublication boundary. Keep the legacy completion path unchanged.
@@ -1304,7 +1326,7 @@ int main(
                     restore_start).count();
 
             std::cout
-                << "{\n" << optimization_profile_receipt << execution_inventory_receipt << gdn_output_mode_receipt() << wave_router_mode_receipt << deferred_moe_mode_receipt
+                << "{\n" << optimization_profile_receipt << eager_submission_receipt << execution_inventory_receipt << gdn_output_mode_receipt() << wave_router_mode_receipt << deferred_moe_mode_receipt
                 << strix::decode_detail::qsa_input_dispatch_receipt(qsa_prefetch_stats.get())
                 << shared_dispatch_receipt.completed_counts()
                 << strix::decode_detail::deferred_moe_completed_tokens_receipt(deferred_moe.get())
@@ -1445,7 +1467,7 @@ int main(
             elapsed_total += value;
         }
 
-        std::cout << "{\n" << optimization_profile_receipt << execution_inventory_receipt << gdn_output_mode_receipt() << wave_router_mode_receipt << deferred_moe_mode_receipt;
+        std::cout << "{\n" << optimization_profile_receipt << eager_submission_receipt << execution_inventory_receipt << gdn_output_mode_receipt() << wave_router_mode_receipt << deferred_moe_mode_receipt;
         if (greedy_output) {
             const auto stats = greedy_output->stats();
             double prefix_state_total = 0.0;
@@ -1571,7 +1593,7 @@ int main(
             reference->steps.size());
     }
 
-    std::cout << '{' << '\n' << optimization_profile_receipt << execution_inventory_receipt << gdn_output_mode_receipt() << wave_router_mode_receipt << deferred_moe_mode_receipt;
+    std::cout << '{' << '\n' << optimization_profile_receipt << eager_submission_receipt << execution_inventory_receipt << gdn_output_mode_receipt() << wave_router_mode_receipt << deferred_moe_mode_receipt;
     emit_q4k_a8_receipt();
     std::cout << "  \"model_content_identity\": \""
               << strix::model_content_identity_hex(

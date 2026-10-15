@@ -129,7 +129,7 @@ def hex_identity(value, label, lengths=(64,)):
     if (not isinstance(value, str) or len(value) not in lengths
             or re.fullmatch(r"[0-9a-fA-F]+", value) is None):
         raise ValueError(f"{label} must be a hexadecimal identity of length {lengths}")
-    return value
+    return value.lower()
 
 
 def closed_keys(value, required, optional, label):
@@ -178,6 +178,8 @@ def operator_records(audit, manifest):
     for requirement in requirements:
         if not isinstance(requirement, dict) or not isinstance(requirement.get("op"), str):
             raise ValueError("invalid tensor audit operator requirement")
+        if not isinstance(requirement.get("status", "unknown"), str):
+            raise ValueError("tensor audit requirement status must be a string")
         operators.setdefault(requirement["op"], []).append(requirement)
     records = []
     for op, uses in sorted(operators.items()):
@@ -368,12 +370,12 @@ def collect(repo, cache_path=None, receipt_path=None, audit_path=None, manifest_
     model["content_identity"] = (model_identity(model["sha256"], model["bytes"])
                                  if model_path else None)
     model["content_logical_name"] = "model" if model_path else None
-    agree("model_sha256", model["sha256"], receipt.get("model_sha256"))
-    agree("model_content_identity", model["content_identity"], receipt.get("model_content_identity"))
-    agree("source_revision", source["revision"], receipt.get("source_revision"))
+    agree("model_sha256", model["sha256"], hex_identity(receipt["model_sha256"], "model_sha256") if receipt.get("model_sha256") is not None else None)
+    agree("model_content_identity", model["content_identity"], hex_identity(receipt["model_content_identity"], "model_content_identity") if receipt.get("model_content_identity") is not None else None)
+    agree("source_revision", source["revision"], hex_identity(receipt["source_revision"], "source_revision", (40, 64)) if receipt.get("source_revision") is not None else None)
     binary = fingerprint(binary_path) if binary_path else None
     if binary:
-        agree("binary_sha256", binary["sha256"], receipt.get("binary_sha256"))
+        agree("binary_sha256", binary["sha256"], hex_identity(receipt["binary_sha256"], "binary_sha256") if receipt.get("binary_sha256") is not None else None)
     for evidence, key in ((manifest, "layout_identity"), (audit, "manifest_layout_identity")):
         if evidence.get(key) is not None:
             integer(evidence[key], key)

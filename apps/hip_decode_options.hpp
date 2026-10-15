@@ -90,6 +90,7 @@ struct OptimizationProfileResolution {
     bool automatic_applied = false;
 };
 struct Options {
+    bool prepared_eager = false;
     bool gpu_greedy_token = false;
     bool execution_inventory = false;
     bool host_dispatch_telemetry = false;
@@ -168,7 +169,7 @@ inline Options parse_options(
         throw std::invalid_argument(
             "usage: strix-hip-decode-token MODEL.gguf [TOKEN_ID ...] "
             "[--optimization-profile auto|manual] [--execution-inventory] [--host-dispatch-telemetry] "
-            "[--gpu-greedy-token] [--reference FILE] [--max-logit-error X] "
+            "[--gpu-greedy-token] [--prepared-eager] [--reference FILE] [--max-logit-error X] "
             "[--context N] [--residency register|copy] [--coalesce-gap BYTES] "
             "[--planned-ple-io] [--ple-max-rows-per-io N] [--ple-max-inflight-ios N] "
             "[--generate N] [--eos-token TOKEN_ID] [--prefix-cache-roundtrip] "
@@ -189,6 +190,12 @@ inline Options parse_options(
             argv[index];
         options.any_low_level_flag = options.any_low_level_flag ||
             is_low_level_optimization_option(argument);
+        if (argument == "--prepared-eager") {
+            if (options.prepared_eager)
+                throw std::invalid_argument("duplicate prepared eager option");
+            options.prepared_eager = true;
+            continue;
+        }
         if (argument == "--gpu-greedy-token") {
             if (options.gpu_greedy_token)
                 throw std::invalid_argument("duplicate GPU greedy token option");
@@ -527,6 +534,10 @@ inline Options parse_options(
         throw std::invalid_argument(
             "--generate requires at least one prefix token id");
     }
+    if (options.prepared_eager && (options.prefix_cache_roundtrip ||
+        options.execution.mode != strix::DecodeExecutionMode::eager ||
+        options.execution.integer_head != strix::DecodeIntegerHead::none))
+        throw std::invalid_argument("prepared eager execution excludes graph, integer head and prefix roundtrip");
     if (options.gpu_greedy_token && (!options.generate_tokens ||
         !options.reference_path.empty() || !options.raw_recording_path.empty() ||
         options.prefix_cache_roundtrip || options.execution.mode != strix::DecodeExecutionMode::eager ||
