@@ -208,6 +208,10 @@ endif()
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(strix-virtual-q8-gdn-oracle-tests tests/virtual_q8_gdn_oracle_tests.cpp)
+    target_compile_features(strix-virtual-q8-gdn-oracle-tests PRIVATE cxx_std_20)
+    strix_target_warnings(strix-virtual-q8-gdn-oracle-tests)
+    add_test(NAME strix-virtual-q8-gdn-oracle-tests COMMAND strix-virtual-q8-gdn-oracle-tests)
     add_executable(strix-virtual-q8-oracle-tests tests/virtual_q8_oracle_tests.cpp)
     target_compile_features(strix-virtual-q8-oracle-tests PRIVATE cxx_std_20)
     strix_target_warnings(strix-virtual-q8-oracle-tests)
@@ -1300,6 +1304,13 @@ if(STRIX_ENABLE_HIP_RUNTIME)
             NAME strix-hip-gdn-launcher-tests
             COMMAND strix-hip-gdn-launcher-tests
         )
+
+        add_test(NAME strix-hip-gdn-virtual-q8-f32-fallback-tests
+            COMMAND strix-hip-gdn-launcher-tests 128 fallback)
+        foreach(q8_width 128 288 640 2560)
+            add_test(NAME strix-hip-gdn-virtual-q8-${q8_width}-tests
+                COMMAND strix-hip-gdn-launcher-tests ${q8_width})
+        endforeach()
 
         add_executable(
             strix-hip-ple-launcher-tests

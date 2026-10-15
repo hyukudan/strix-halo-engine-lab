@@ -27,6 +27,16 @@ std::uint32_t checked_u32(
 
 
 
+HipGdnLauncherConfig gdn_config(const ModelContract& model,
+    HipActivationStorage activation, bool graph, bool virtual_q8) {
+    HipGdnLauncherConfig config;
+    config.model = model;
+    config.activation = activation;
+    config.enable_device_graph_inputs = graph;
+    config.virtual_q8_input_projections = virtual_q8;
+    return config;
+}
+
 HipIndexedAttentionLauncherConfig
 indexed_attention_config(
     const ModelContract& model,
@@ -265,10 +275,8 @@ void register_complete_hip_kernel_catalog(
         registry,
         qualification);
 
-    const HipGdnLauncherConfig gdn{
-        model,
-        config.activation, config.enable_device_graph_inputs,
-    };
+    const auto gdn = gdn_config(model, config.activation,
+        config.enable_device_graph_inputs, config.virtual_q8_gdn_input);
     register_hip_gdn_kernel_variant(
         model,
         request,
@@ -370,10 +378,8 @@ HipLauncherCatalog::HipLauncherCatalog(
               model,
               config.activation, config.enable_device_graph_inputs)),
       gdn_(
-          HipGdnLauncherConfig{
-              model,
-              config.activation, config.enable_device_graph_inputs,
-          }),
+          gdn_config(model, config.activation,
+              config.enable_device_graph_inputs, config.virtual_q8_gdn_input)),
       indexed_attention_(
           indexed_attention_config(
               model,

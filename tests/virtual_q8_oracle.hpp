@@ -8,7 +8,7 @@
 
 namespace virtual_q8_test {
 enum class Mutation { none, local_first, cross_reverse, local_reverse,
-    wrong_mapping, descending_leaves, negative_zero, first_product, unfused };
+    wrong_mapping, descending_leaves, negative_zero, first_product, unfused, correct_mapping };
 
 // Independent CPU statement of the measured legacy contract: 256 leaves,
 // ascending feature order, fused updates, then the 128..1 binary tree.

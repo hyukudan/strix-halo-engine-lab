@@ -171,6 +171,7 @@ struct Options {
     bool fused_staged_hyper_mix = false;
     bool virtual_q8_lm_head = false;
     bool parallel_moe_router = false;
+    bool virtual_q8_gdn_input = false;
     std::uint64_t ple_max_rows_per_io = 4;
     std::uint64_t ple_max_inflight_ios = 4;
     std::string reference_path;
@@ -195,7 +196,7 @@ Options parse_options(
             "[--context N] [--residency register|copy] [--coalesce-gap BYTES] "
             "[--planned-ple-io] [--ple-max-rows-per-io N] [--ple-max-inflight-ios N] "
             "[--generate N] [--eos-token TOKEN_ID] [--prefix-cache-roundtrip] "
-            "[--parallel-moe-router] [--virtual-q8-lm-head] "
+            "[--parallel-moe-router] [--virtual-q8-lm-head] [--virtual-q8-gdn-input] "
             "[--parallel-hyper-mix [--staged-hyper-projections [--fused-staged-hyper-mix]]]");
     }
 
@@ -217,6 +218,11 @@ Options parse_options(
         if (argument == "--parallel-hyper-mix") {
             if (options.parallel_hyper_mix) throw std::invalid_argument("duplicate parallel hyper-mix option");
             options.parallel_hyper_mix = true;
+            continue;
+        }
+        if (argument == "--virtual-q8-gdn-input") {
+            if (options.virtual_q8_gdn_input) throw std::invalid_argument("duplicate virtual Q8 GDN input option");
+            options.virtual_q8_gdn_input = true;
             continue;
         }
         if (argument == "--virtual-q8-lm-head") {
@@ -833,6 +839,19 @@ int main(
         if (output_heads != 1U)
             throw std::invalid_argument("--virtual-q8-lm-head requires exactly one output head");
     }
+    if (options.virtual_q8_gdn_input) {
+        if (model.full_attention_interval == 0U) throw std::invalid_argument("invalid GDN layer interval");
+        bool meaningful_q8 = false;
+        for (const auto& tensor : manifest.tensors) {
+            if (tensor.role != strix::TensorRole::attention_projection || !tensor.layer.has_value() ||
+                ((*tensor.layer + 1U) % model.full_attention_interval) == 0U) continue;
+            if (tensor.ggml_type == 8U &&
+                (tensor.name.ends_with(".attn_qkv.weight") || tensor.name.ends_with(".attn_gate.weight")))
+                meaningful_q8 = true;
+        }
+        if (!meaningful_q8 || model.hidden_size % 32U != 0U)
+            throw std::invalid_argument("--virtual-q8-gdn-input requires an aligned Q8_0 GDN input projection");
+    }
     const auto original_work_device = std::make_shared<strix::HipSetupQuiescenceGuard>();
     auto target_architecture = original_work_device->architecture();
     if (const auto suffix = target_architecture.find(':'); suffix != std::string::npos)
@@ -861,6 +880,7 @@ int main(
     catalog_config.virtual_q8_lm_head = options.virtual_q8_lm_head;
     catalog_config.parallel_moe_router = options.parallel_moe_router;
     binding_request.parallel_moe_router = options.parallel_moe_router;
+    catalog_config.virtual_q8_gdn_input = options.virtual_q8_gdn_input;
     std::optional<strix::integer_projection::RuntimeConfig> integer_config;
     if (options.execution.integer_head != strix::DecodeIntegerHead::none) {
         integer_config = strix::make_decode_integer_head_config(model, manifest, options.execution,
