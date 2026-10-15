@@ -424,12 +424,18 @@ int main() {
         strix::HipLauncherCatalogConfig on_config;
         on_config.prefetch_q8_qsa_input = true;
         on_config.qsa_input_prefetch_layers = on_request.qsa_input_prefetch_layers;
+        on_config.qsa_input_prefetch_stats =
+            std::make_shared<strix::qsa_input_prefetch::RuntimeDispatchStats>();
+        const std::weak_ptr<strix::qsa_input_prefetch::RuntimeDispatchStats> owner =
+            on_config.qsa_input_prefetch_stats;
         strix::kernels::KernelRegistry mixed_registry;
         strix::register_complete_hip_kernel_catalog(model, on_request, on_config, mixed_registry);
         strix::ExecutionBufferRequest buffers;
         const auto mixed = strix::compile_serial_execution(model, mixed_registry, on_request, buffers);
         const auto off = strix::compile_serial_execution(model, mixed_registry, request, buffers);
         strix::HipLauncherCatalog on_catalog(model, on_config), off_catalog(model);
+        on_config.qsa_input_prefetch_stats.reset();
+        expect(!owner.expired(), "catalog retains submission owner after caller reset");
         strix::ExecutionLauncherRegistry mixed_launchers, off_launchers;
         on_catalog.register_for_compiled_execution(mixed, mixed_launchers);
         off_catalog.register_for_compiled_execution(off, off_launchers);
@@ -449,6 +455,14 @@ int main() {
                 "hip-gfx1151-indexed-attention-v2"), "mixed registry compiler identities");
             const auto* selected_launcher = mixed_launchers.find_kernel_launcher(id);
             expect(selected_launcher != nullptr, "mixed bundle registers each indexed id");
+            if (selected_launcher) {
+                const auto* actual = static_cast<const strix::HipIndexedAttentionLauncherConfig*>(
+                    selected_launcher->user_data);
+                expect(actual && actual->prefetch_stats == owner.lock(),
+                       "registered indexed launcher retains exact supplied stats owner");
+                expect(actual && actual->prefetch_q8_input == use,
+                       "registered indexed launcher has exact bound dispatch mode");
+            }
             if(!use) {
                 const auto* legacy = off_launchers.find_kernel_launcher(id);
                 expect(legacy && selected_launcher && legacy->implementation_identity ==

@@ -1,3 +1,4 @@
+#include "../apps/qsa_input_receipt.hpp"
 #include "strix/compiled_execution.hpp"
 #include "strix/compiled_speculative_verify.hpp"
 #include "strix/qsa_input_prefetch.hpp"
@@ -83,6 +84,21 @@ kernels::KernelRegistry registry(const ModelContract &m, const ExecutionBindingR
 }
 } // namespace
 int main() {
+    {
+        // A result must read the live submission owner after the token loop.
+        // Prefix text prepared before execution must not freeze its count.
+        qsa_input_prefetch::RuntimeDispatchStats stats;
+        const auto prefix_snapshot = decode_detail::qsa_input_dispatch_receipt(&stats);
+        for (unsigned token = 0; token < 554; ++token)
+            stats.dispatched_projections.fetch_add(36, std::memory_order_relaxed);
+        const auto completed = decode_detail::qsa_input_dispatch_receipt(&stats);
+        expect(prefix_snapshot == "  \"prefetch_q8_qsa_input_dispatched_projections\": 0,\n",
+               "pre-execution receipt demonstrates stale zero count");
+        expect(completed == "  \"prefetch_q8_qsa_input_dispatched_projections\": 19944,\n",
+               "completion receipt reads all554 submissions from actual owner");
+        expect(decode_detail::qsa_input_dispatch_receipt(nullptr).empty(),
+               "disabled QSA mode emits no dynamic counter");
+    }
     const auto m = ModelContract::qwen38_flash_next();
     auto tensors = manifest(m);
     auto p = qsa_input_prefetch::build_plan(m, tensors);

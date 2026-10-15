@@ -98,6 +98,24 @@ checks. A host submission counter records only eager enqueue and graph capture;
 it does not count graph replay. The host plan test explicitly covers Q8 q/k/v
 with BF16 indexer inputs (36 eligible and 24 fallback projections at 12 steps).
 These are fixture contracts, not claims that new device tests have executed.
+
+
+The result-publication follow-up separates the live QSA dispatch count from the
+static mode prefix. The raw-token JSON prefix is written before its token loop;
+its dynamic count is now read only after that loop. Restore and greedy results
+also read the same live owner when publishing their completed results. The
+host regression demonstrates a pre-execution zero snapshot and a fresh19944
+snapshot after554 synthetic submissions of36 eligible projections; these are
+host fixture inputs, not a device execution result. Disabled mode emits no count.
+Catalog fixtures additionally inspect each selected launcher's actual user-data
+configuration and require retention of the supplied shared stats owner after the
+caller's configuration releases it, for both selected and fallback bindings.
+
+Local verification: `strix-qsa-input-prefetch-tests` passes in the existing
+Windows portability harness; the catalog test compiles with MSVC C++20/W4/WX.
+That catalog check is compilation only. Native execution and full-trajectory
+qualification of this publication change remain pending. No kernel arithmetic,
+manifest eligibility or expected submission-count policy changes.
 ## E-053
 
 Experimental source and fixtures: `src/lane_chain_hyper_output.cpp`, `src/hip_hyper_mix_launcher.hip`, host `strix-lane-chain-hyper-output-tests` and HIP `strix-hip-lane-chain-hyper-output-tests` / `strix-hip-lane-chain-hyper-integration-tests`. Reproduce host checks with `cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON -DSTRIX_ENABLE_HIP_RUNTIME=OFF -DSTRIX_WARNINGS_AS_ERRORS=ON`, build and `ctest --test-dir build --output-on-failure`. Host execution cannot qualify device arithmetic. HIP gfx1151 compiler/ISA/device, full-model exactness and performance gates remain required; see the lane-chain implementation document. No measured gain is claimed.

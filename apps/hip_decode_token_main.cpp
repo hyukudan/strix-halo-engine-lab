@@ -1,4 +1,5 @@
 #include "strix/lane_chain_hyper_output.hpp"
+#include "qsa_input_receipt.hpp"
 #include "strix/gdn_output_admission.hpp"
 #include "strix/compiled_execution.hpp"
 #include "strix/execution_resources.hpp"
@@ -577,8 +578,6 @@ int main(
         std::string receipt=(options.virtual_q8_gdn_output ? "  \"virtual_q8_gdn_output\": true,\n" : "")+shared_mode_receipt+qsa_input_mode_receipt+lane_chain_mode_receipt;
         if(shared_prefetch_stats) receipt += "  \"prefetch_q8_shared_expert_dispatched_projections\": "+
             std::to_string(shared_prefetch_stats->dispatched_projections.load(std::memory_order_relaxed))+",\n";
-        if(qsa_prefetch_stats) receipt += "  \"prefetch_q8_qsa_input_dispatched_projections\": "+
-            std::to_string(qsa_prefetch_stats->dispatched_projections.load(std::memory_order_relaxed))+",\n";
         return receipt;
     };
     const std::string deferred_moe_mode_receipt = "  \"deferred_moe_status\": " +
@@ -1190,6 +1189,7 @@ int main(
 
             std::cout
                 << "{\n" << optimization_profile_receipt << gdn_output_mode_receipt() << wave_router_mode_receipt << deferred_moe_receipt()
+                << strix::decode_detail::qsa_input_dispatch_receipt(qsa_prefetch_stats.get())
                 << "  \"model_content_identity\": \""
                 << strix::model_content_identity_hex(
                        model_residency.binding().
@@ -1318,6 +1318,7 @@ int main(
         std::cout << "{\n" << optimization_profile_receipt << gdn_output_mode_receipt() << wave_router_mode_receipt << deferred_moe_receipt();
         emit_q4k_a8_receipt();
         emit_q4k_a8_counts();
+        std::cout << strix::decode_detail::qsa_input_dispatch_receipt(qsa_prefetch_stats.get());
         std::cout
             << "  \"model_content_identity\": \""
             << strix::model_content_identity_hex(
@@ -1627,6 +1628,8 @@ int main(
 
     std::cout << "  ]," << '\n';
     emit_q4k_a8_counts();
+    // Dynamic counters belong after the raw token loop, not the JSON prefix.
+    std::cout << strix::decode_detail::qsa_input_dispatch_receipt(qsa_prefetch_stats.get());
     std::cout
         << "  \"decode_elapsed_ms_total\": "
         << decode_elapsed_ms_total
