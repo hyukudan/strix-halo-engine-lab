@@ -1,7 +1,7 @@
 # Automatic decoder optimization profile
 
 The decoder defaults to `--optimization-profile auto`. The low-level launcher
-configuration defaults remain conservative; the application resolves a qualified
+configuration defaults remain conservative; the application resolves a content-admitted candidate
 profile after reading GGUF metadata and identifying the immutable mapped file's
 content, before choosing kernels or allocating device execution storage.
 
@@ -25,7 +25,7 @@ execution, registered residency and context 8192, the automatic profile selects:
 - parallel wave router selection, replacing ranked routing unless ranked was
   explicitly requested.
 
-When `--context` is omitted, a successfully selected profile uses its qualified
+When `--context` is omitted, a successfully selected profile uses its admitted
 context 8192. An explicit context is never changed. Other explicit contexts retain
 the caller's configuration and emit `context-not-qualified`. The current source
 supports wider contexts, but the automatic profile does not claim those timings
