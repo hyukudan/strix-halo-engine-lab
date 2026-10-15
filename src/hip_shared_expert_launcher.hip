@@ -614,7 +614,13 @@ __global__ void shared_q8_virtual_projection_kernel(const Input* input,const voi
 template<typename Output,bool Prefetch,unsigned RowsPerBlock>
 __global__ void shared_q8_virtual_down_kernel(const float* input,const float* shared_gate,const void* weights,std::uint32_t width,std::uint32_t outputs,Output* output){
     const auto row=static_cast<std::uint32_t>(blockIdx.x)*RowsPerBlock+threadIdx.x/32U;if(row>=outputs)return;
-    const float sum=shared_q8_virtual256_dot<float,Prefetch>(input,weights,width,row);if((threadIdx.x&31U)==0)store_activation(&output[row],sum * *shared_gate);
+    const float sum=shared_q8_virtual256_dot<float,Prefetch>(input,weights,width,row);if((threadIdx.x&31U)==0){
+        // Match the legacy emitted multiply: gate src0, reduction src1.
+        // Both operands may be NaNs, so commuting them can change payload bits.
+        float gated;
+        asm volatile("v_mul_f32 %0, %1, %2" : "=v"(gated) : "v"(*shared_gate), "v"(sum));
+        store_activation(&output[row],gated);
+    }
 }
 
 bool contains(
