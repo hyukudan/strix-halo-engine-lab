@@ -6,8 +6,14 @@
 
 #include <cstdint>
 #include <string>
+#include <string_view>
 
 namespace strix {
+
+inline constexpr std::string_view splitk_hc_fp32_numerical_identity =
+    "hc-down-splitk16x640-r40-fp32-v1";
+inline constexpr std::string_view splitk_hc_fp64_numerical_identity =
+    "hc-down-splitk16x640-r40-fp64-oracle-v1";
 
 struct HipHyperMixLauncherConfig {
     std::uint32_t hidden_size = 0;
@@ -21,6 +27,9 @@ struct HipHyperMixLauncherConfig {
     bool prefetch_rows = false;
     bool prefetch_q8_output = false;
     bool lane_chain_output = false;
+    // Experimental integration, selected only by a diagnostic host driver.
+    bool splitk_projection = false;
+    bool splitk_projection_fp64 = false;
     HipActivationStorage activation =
         HipActivationStorage::bf16;
 };
@@ -43,6 +52,9 @@ void preflight_typed_hyper_projection_model(const CompiledSerialExecution& compi
     const ExecutionRuntimeResources& resources);
 
 void preflight_q8_hyper_output_model(const CompiledSerialExecution& compiled,
+    const ExecutionRuntimeResources& resources, const HipHyperMixLauncherConfig& config);
+
+void preflight_splitk_hyper_projection_model(const CompiledSerialExecution& compiled,
     const ExecutionRuntimeResources& resources, const HipHyperMixLauncherConfig& config);
 
 class HipHyperMixLauncherBundle {

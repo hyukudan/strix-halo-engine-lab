@@ -60,3 +60,24 @@ mode falls below 1.5; otherwise the two permitted alternatives are considered.
 If no variant reaches 2, the best of all three may qualify as marginal when its
 graph ratio and every other mode reach 1.5. This gate permits subsequent
 experimental model integration; it does not establish model quality or adoption.
+
+Experimental integration is controlled by two catalog/launcher configuration
+fields, both false by default. `splitk_projection` selects the four-output FP32
+mapping. `splitk_projection_fp64` additionally selects the diagnostic double
+accumulation arm and is invalid without the first field. There is no decoder CLI
+option for either field. The diagnostic host driver must set the catalog fields
+before both registry construction and launcher construction.
+
+Each mode has a distinct kernel ID, implementation fingerprint and RAW numerical
+identity. The existing output-mapping suffix remains last because binding selection
+uses that suffix. With both fields false, existing IDs and implementation hashes
+remain unchanged. The double arm labels its FP64 projection and FP32 epilogue.
+
+Before registering the first experimental HC launcher, whole-model preflight
+checks every compiled HC workspace, tensor shape/type/extent, alignment and output
+alias relationship. Device architecture/wave queries occur once after those host
+checks. Runtime dispatch adds the alignment/row checks before normalization and
+launches the existing qualified diagnostic kernel directly, without per-projection
+device-property queries. Normalization, output mixing, injection storage and the
+workspace layout are unchanged. This integration remains unqualified for complete
+model use until baseline-off, calibration, held-out regression and timing gates pass.

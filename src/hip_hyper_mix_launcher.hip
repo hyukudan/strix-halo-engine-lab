@@ -11,6 +11,7 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -99,6 +100,12 @@ const char* storage_name(
 
 void validate_config(
     const HipHyperMixLauncherConfig& config) {
+    if (config.splitk_projection_fp64 && !config.splitk_projection)
+        throw std::invalid_argument("FP64 HC diagnostic requires split-K projection");
+    if (config.splitk_projection && (!config.parallel || !config.staged_projections ||
+        !config.fused_injection || !config.typed_projection || !config.prefetch_rows ||
+        static_cast<std::uint64_t>(config.hidden_size) * config.hc_count != 10240U))
+        throw std::invalid_argument("split-K HC projection requires the admitted typed width10240 path");
     if (config.staged_projections && !config.parallel)
         throw std::invalid_argument("staged hyper projections require parallel hyper-mix");
     if (config.fused_injection && !config.staged_projections)
@@ -1424,6 +1431,9 @@ void launch_typed(
         const auto required = static_cast<std::uint64_t>(context.logical_rows) * (width + config.lowrank) * sizeof(float);
         if (temporary.bytes < required || temporary.address % alignof(float) != 0)
             throw std::invalid_argument("parallel hyper-mix workspace is undersized or unaligned");
+        if (config.splitk_projection && (context.logical_rows > 65535U || temporary.address % 16U ||
+            down_runtime.address % 16U || (inject_runtime && inject_runtime->address % 16U)))
+            throw std::invalid_argument("split-K HC launch owner alignment or row count differs");
         auto* normalized = reinterpret_cast<float*>(temporary.address);
         auto* low = normalized + static_cast<std::uint64_t>(context.logical_rows) * width;
         constexpr std::uint32_t projection_threads = 32;
@@ -1437,7 +1447,21 @@ void launch_typed(
                 const auto lowrank_blocks = (config.lowrank + kStagedOutputs - 1U) / kStagedOutputs;
                 const auto injection_blocks = injection_output ? (config.hc_count + kStagedOutputs - 1U) / kStagedOutputs : 0U;
                 if (config.typed_projection) {
-                    if (config.prefetch_rows) {
+                    if (config.splitk_projection) {
+                        constexpr unsigned outputs = 4U;
+                        const auto blocks = (config.lowrank + outputs - 1U) / outputs;
+                        const dim3 grid(blocks + (injection_output ? (config.hc_count + outputs - 1U) / outputs : 0U), context.logical_rows);
+                        const auto launch = [&]<typename Acc>() {
+                            hipLaunchKernelGGL(HIP_KERNEL_NAME(splitk_hyper_projection_kernel<outputs,Acc>),
+                                grid, dim3(512U), 0, hip_execution_stream(), normalized,
+                                reinterpret_cast<const void*>(down_runtime.address), static_cast<std::uint32_t>(width),
+                                config.hc_count, config.lowrank, low,
+                                inject_runtime ? reinterpret_cast<const void*>(inject_runtime->address) : nullptr,
+                                injection_output ? reinterpret_cast<float*>(injection_output->address) : nullptr, blocks);
+                        };
+                        if (config.splitk_projection_fp64) launch.template operator()<double>();
+                        else launch.template operator()<float>();
+                    } else if (config.prefetch_rows) {
                         hipLaunchKernelGGL(batched_typed_hyper_projection_kernel,
                             dim3(lowrank_blocks + injection_blocks, context.logical_rows), dim3(kStagedThreads),
                             0, hip_execution_stream(), normalized, reinterpret_cast<const void*>(down_runtime.address),
@@ -1878,7 +1902,9 @@ std::string kernel_id(
         ".c" +
         std::to_string(
             request.request_concurrency) + (config.parallel ? ".parallel" : "") +
-        (config.staged_projections ? ".staged" : "") + (config.fused_injection ? ".fused-injection-v5" : "") + (config.typed_projection ? ".typed-q8-f32-v1" : "") + (config.prefetch_rows ? ".prefetch-rows8-v2" : "") + (config.prefetch_q8_output ? ".prefetch-q8-output-v1" : "") + (config.lane_chain_output ? lane_chain_hyper_output_suffix : "");
+        (config.staged_projections ? ".staged" : "") + (config.fused_injection ? ".fused-injection-v5" : "") + (config.typed_projection ? ".typed-q8-f32-v1" : "") + (config.prefetch_rows ? ".prefetch-rows8-v2" : "") + (config.prefetch_q8_output ? ".prefetch-q8-output-v1" : "") +
+        (config.splitk_projection ? (config.splitk_projection_fp64 ? ".splitk-hc-proj-fp64-oracle-v1" : ".splitk-hc-proj-fp32-v1") : "") +
+        (config.lane_chain_output ? lane_chain_hyper_output_suffix : "");
 }
 
 std::uint64_t implementation_identity(
@@ -1907,6 +1933,7 @@ std::uint64_t implementation_identity(
     if (config.typed_projection) hash_u64(hash, 0x5459504544484301ULL);
     if (config.prefetch_rows) hash_u64(hash, 0x5052464852430802ULL);
     if (config.prefetch_q8_output) hash_u64(hash, 0x5052464855500801ULL);
+    if (config.splitk_projection) hash_u64(hash, config.splitk_projection_fp64 ? 0x534b484346363401ULL : 0x534b484346333201ULL);
     if(config.lane_chain_output)hash_u64(hash,0x4c414e4548430001ULL);
     return hash;
 }
@@ -2056,6 +2083,8 @@ void register_hip_hyper_mix_kernel_variant(
         throw std::invalid_argument(
             "HIP hyper-mix variant requires non-zero rows and concurrency");
     }
+    if (config.splitk_projection && (request.logical_rows > 65535U || request.request_concurrency != 1U))
+        throw std::invalid_argument("split-K HC variant requires bounded rows and serial concurrency");
     if (qualification ==
             kernels::QualificationStatus::target_qualified ||
         qualification ==
@@ -2086,7 +2115,7 @@ void register_hip_hyper_mix_kernel_variant(
     variant.wave =
         kernels::WaveSize::wave32;
     variant.resources.workgroup_threads =
-        kThreads;
+        config.splitk_projection ? 512U : kThreads;
     variant.resources.lds_bytes =
         (kMaxHc * kThreads +
          kMaxHc +
@@ -2107,7 +2136,7 @@ void register_hip_hyper_mix_kernel_variant(
         storage_name(
             config.activation);
     variant.numerics.accumulator_precision =
-        "fp32";
+        config.splitk_projection_fp64 ? "fp64-projection/fp32-epilogue" : "fp32";
     variant.numerics.output_precision =
         storage_name(
             config.activation);
@@ -2121,6 +2150,7 @@ void register_hip_hyper_mix_kernel_variant(
     variant.output_layout =
         "row-major+fp32-injection";
     variant.compiler_identity =
+        config.splitk_projection ? (config.splitk_projection_fp64 ? "hip-gfx1151-hyper-mix-splitk-fp64-oracle-v1" : "hip-gfx1151-hyper-mix-splitk-fp32-v1") :
         config.lane_chain_output ? "hip-gfx1151-hyper-mix-v10-lane-chain-output" :
         config.prefetch_q8_output && config.prefetch_rows ? "hip-gfx1151-hyper-mix-v9-q8-output-prefetch8-with-projection-prefetch" :
         config.prefetch_q8_output ? "hip-gfx1151-hyper-mix-v9-q8-output-prefetch8" :
@@ -2200,11 +2230,91 @@ void preflight_q8_hyper_output_model(const CompiledSerialExecution& compiled,
     if (count == 0U) throw std::invalid_argument("Q8 hyper output preflight found no mixer bindings");
 }
 
+void preflight_splitk_hyper_projection_model(const CompiledSerialExecution& compiled,
+    const ExecutionRuntimeResources& resources, const HipHyperMixLauncherConfig& config) {
+    validate_config(config);
+    if (!config.splitk_projection || !compiled.logical_rows || compiled.logical_rows > 65535U ||
+        compiled.request_concurrency != 1U || compiled.io.steps.size() != compiled.execution.steps.size())
+        throw std::invalid_argument("split-K HC preflight requires an admitted serial compiled plan");
+    validate_execution_runtime_resources(compiled.execution_identity, compiled.arena, resources, 0);
+    using hc_projection_diagnostic::Span;
+    const auto checked = [](Span span, std::uint64_t required, std::uint64_t alignment) {
+        if (!span.address || span.address % alignment || span.bytes < required ||
+            span.bytes > std::numeric_limits<std::uintptr_t>::max() - span.address)
+            throw std::invalid_argument("split-K HC preflight owner extent/alignment differs");
+    };
+    const auto overlaps = [](Span a, Span b) {
+        return a.address && b.address && a.address < b.address + b.bytes && b.address < a.address + a.bytes;
+    };
+    const std::uint64_t normalized_bytes = static_cast<std::uint64_t>(compiled.logical_rows) * 10240U * sizeof(float);
+    const std::uint64_t low_bytes = static_cast<std::uint64_t>(compiled.logical_rows) * config.lowrank * sizeof(float);
+    const std::uint64_t down_bytes = static_cast<std::uint64_t>(config.lowrank) * 320U * 34U;
+    const std::uint64_t inject_bytes = static_cast<std::uint64_t>(config.hc_count) * 10240U * sizeof(float);
+    std::uint32_t count = 0;
+    for (const auto& step : compiled.execution.steps) {
+        if (step.op != SerialOp::attn_hyper_mix && step.op != SerialOp::mlp_hyper_mix && step.op != SerialOp::final_hyper_mix) continue;
+        if (step.id >= compiled.io.steps.size()) throw std::invalid_argument("split-K HC step has no IO binding");
+        const auto& io = compiled.io.steps[step.id];
+        const bool final = step.op == SerialOp::final_hyper_mix;
+        if (io.step_id != step.id || io.op != step.op || io.reads.size() != 1U ||
+            io.temporaries.size() != 1U || io.writes.size() != (final ? 1U : 2U))
+            throw std::invalid_argument("split-K HC preflight IO topology differs");
+        ExecutionDispatchContext context;
+        context.execution_identity = compiled.execution_identity;context.step_id = step.id;context.op = step.op;context.layer = step.layer;
+        context.logical_rows = compiled.logical_rows;context.request_concurrency = compiled.request_concurrency;
+        context.reads = io.reads;context.writes = io.writes;context.temporaries = io.temporaries;
+        context.arena = &compiled.arena;context.memory = resources.scratch;context.resources = &resources;
+        const auto temporary = resolve_dispatch_temporary(context, 0);
+        if (temporary.use.buffer.buffer_class != ExecutionBufferClass::hyper_workspace)
+            throw std::invalid_argument("split-K HC preflight requires its hyper workspace");
+        checked({temporary.address,temporary.bytes}, normalized_bytes + low_bytes, 16U);
+        const Span normalized{temporary.address,normalized_bytes},low{temporary.address + normalized_bytes,low_bytes};
+        const auto& down_access = resolve_dispatch_tensor_access(context, 1);
+        const auto& down_manifest = manifest_tensor(context, down_access);
+        const auto& down_owner = runtime_tensor(context, down_access);
+        if (down_manifest.ggml_type != 8U || down_manifest.dimensions != std::vector<std::uint64_t>{10240U,config.lowrank} || down_manifest.byte_size != down_bytes)
+            throw std::invalid_argument("split-K HC preflight down tensor differs");
+        checked({down_owner.address,down_owner.bytes},down_bytes,16U);
+        const Span down{down_owner.address,down_bytes};Span inject{},injection{};
+        if (!final) {
+            const auto& access = resolve_dispatch_tensor_access(context, 3);
+            const auto& manifest = manifest_tensor(context, access);const auto& owner = runtime_tensor(context, access);
+            if (manifest.ggml_type != 0U || manifest.dimensions != std::vector<std::uint64_t>{10240U,config.hc_count} || manifest.byte_size != inject_bytes)
+                throw std::invalid_argument("split-K HC preflight injection tensor differs");
+            checked({owner.address,owner.bytes},inject_bytes,16U);inject = {owner.address,inject_bytes};
+            const auto output = resolve_dispatch_write(context, 1);const auto bytes = static_cast<std::uint64_t>(compiled.logical_rows) * config.hc_count * sizeof(float);
+            checked({output.address,output.bytes},bytes,4U);injection = {output.address,bytes};
+        }
+        // Normalization writes the first slice before projection reads it.
+        if (overlaps(normalized,down) || overlaps(normalized,inject))
+            throw std::invalid_argument("split-K HC normalized workspace aliases weights");
+        const std::array<Span,3> inputs{normalized,down,inject};
+        for (const auto output : {low,injection}) {
+            for (const auto input : inputs) if (overlaps(output,input))
+                throw std::invalid_argument("split-K HC projection output aliases input");
+        }
+        if (overlaps(low,injection)) throw std::invalid_argument("split-K HC projection outputs overlap");
+        ++count;
+    }
+    if (!count) throw std::invalid_argument("split-K HC preflight found no mixer bindings");
+    // Device queries happen once, after every host owner has been admitted, and
+    // before the bundle registers its first launcher or captures any graph.
+    int device = 0;hipDeviceProp_t properties{};
+    check_hip(hipGetDevice(&device),"split-K HC preflight device");
+    check_hip(hipGetDeviceProperties(&properties,device),"split-K HC preflight properties");
+    if (properties.warpSize != 32 || std::string_view(properties.gcnArchName,7U) != "gfx1151")
+        throw std::invalid_argument("split-K HC integration requires gfx1151 wave32");
+}
+
 void HipHyperMixLauncherBundle::
 register_for_compiled_execution(
     const CompiledSerialExecution& compiled,
     ExecutionLauncherRegistry& registry,
     const ExecutionRuntimeResources* resources) {
+    if (config_.splitk_projection) {
+        if (!resources) throw std::invalid_argument("split-K HC bundle requires whole-model preflight resources");
+        preflight_splitk_hyper_projection_model(compiled,*resources,config_);
+    }
     if(config_.lane_chain_output){
         validate_config(config_);
         if(config_.typed_projection){if(!resources)throw std::invalid_argument("typed hyper bundle requires complete model preflight resources");preflight_typed_hyper_projection_model(compiled,*resources);}
