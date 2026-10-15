@@ -1,11 +1,17 @@
 #include "strix/hc_repacked_down_pack.hpp"
+#include "strix/gguf_reader.hpp"
+#include "strix/model_content_hash.hpp"
 
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <random>
+#include <set>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -233,10 +239,135 @@ static_assert(geometry(10240,320).scales_bytes == 204800);
 static_assert(geometry(10240,320).padding_bytes == 0);
 static_assert(code_unit_index(3,1,2,32) == 226);
 static_assert(scale_word_index(3,2,32) == 34);
+
+struct RealOptions {
+    std::filesystem::path model, output;
+    std::string model_sha;
+};
+
+RealOptions real_options(int argc, char** argv) {
+    RealOptions options;
+    std::set<std::string> seen;
+    for (int at = 2; at < argc; at += 2) {
+        require(at + 1 < argc, "missing real-down option value");
+        const std::string key = argv[at], value = argv[at + 1];
+        require(seen.insert(key).second, "duplicate real-down option");
+        if (key == "--model") options.model = value;
+        else if (key == "--model-sha256") options.model_sha = value;
+        else if (key == "--output") options.output = value;
+        else require(false, "unknown real-down option");
+    }
+    require(!options.model.empty() && !options.output.empty() && options.model_sha.size() == 64 &&
+        std::all_of(options.model_sha.begin(), options.model_sha.end(), [](char c) {
+            return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+        }), "need model, lowercase model SHA256 and fresh output");
+    require(std::filesystem::is_regular_file(options.model) && !std::filesystem::is_symlink(options.model),
+            "model must be a regular nonsymlink file");
+    require(!std::filesystem::exists(options.output) && !std::filesystem::is_symlink(options.output),
+            "real-down ledger output occupied");
+    return options;
+}
+
+std::string file_sha(const std::filesystem::path& path) {
+    return strix::model_content_identity_hex(strix::sha256_file_content(path));
+}
+
+// CPU-only admission gate. No HIP headers, runtime calls or device allocation.
+// The canonical 97-name set is independent of the later captured-input corpus.
+void qualify_real_downs(const RealOptions& options) {
+    const auto size_before = std::filesystem::file_size(options.model);
+    const auto time_before = std::filesystem::last_write_time(options.model);
+    require(file_sha(options.model) == options.model_sha, "whole-model SHA256 mismatch before CPU qualification");
+    const auto info = strix::gguf::read_file(options.model);
+    require(info.file_size == size_before, "GGUF parser file extent mismatch");
+    std::ifstream model(options.model, std::ios::binary);
+    require(model.good(), "open GGUF tensor windows");
+    const auto g = geometry(10240, 320);
+    std::ostringstream ledger;
+    ledger << "{\"schema\":\"strix-hc-real-down-pack-v1\",\"layout_id\":\"" << kLayoutId
+           << "\",\"model_sha256\":\"" << options.model_sha << "\",\"model_bytes\":" << size_before
+           << ",\"cpu_only\":true,\"tensor_count\":97,\"tensors\":[";
+    std::uint64_t total = 0;
+    std::set<std::pair<std::uint64_t,std::uint64_t>> windows;
+    for (unsigned index = 0; index < 97; ++index) {
+        const std::string name = index == 96 ? "output_hc_down.weight" :
+            "blk." + std::to_string(index / 2) + (index % 2 == 0 ? ".hc_attn_down.weight" : ".hc_ffn_down.weight");
+        const strix::gguf::TensorInfo* tensor = nullptr;
+        for (const auto& candidate : info.tensors) {
+            if (candidate.name == name) {
+                require(tensor == nullptr, "duplicate real-down GGUF name");
+                tensor = &candidate;
+            }
+        }
+        require(tensor != nullptr && tensor->ggml_type == 8 &&
+                tensor->dimensions == std::vector<std::uint64_t>{10240,320} &&
+                tensor->byte_size == g.original_bytes, "real-down tensor type/shape/size mismatch");
+        const auto offset = tensor->absolute_offset;
+        require(offset <= size_before && tensor->byte_size <= size_before - offset &&
+                offset <= static_cast<std::uint64_t>(std::numeric_limits<std::streamoff>::max()),
+                "real-down tensor window outside source");
+        const auto end = offset + tensor->byte_size;
+        for (const auto& prior : windows) {
+            require(end <= prior.first || offset >= prior.second, "overlapping real-down tensor windows");
+        }
+        windows.emplace(offset,end);
+        Bytes original(static_cast<std::size_t>(g.original_bytes));
+        model.seekg(static_cast<std::streamoff>(offset));
+        model.read(reinterpret_cast<char*>(original.data()), static_cast<std::streamsize>(original.size()));
+        require(model.good(), "truncated real-down window read");
+        Bytes plane(static_cast<std::size_t>(g.plane_bytes),0xa5), recovered(original.size(),0xcd);
+        const auto source_sha = sha256_hex(original);
+        pack(g,original,plane);
+        unpack(g,plane,recovered);
+        require(original == recovered && sha256_hex(recovered) == source_sha && padding_zero(g,plane),
+                "real-down pack roundtrip/padding failed");
+        for (std::uint32_t o = 0; o < g.rank; ++o) {
+            for (std::uint32_t f = 0; f < g.width; ++f) {
+                const auto at = (std::size_t{o} * g.blocks + f / 32) * 34;
+                require(decoded_code(g,plane,o,f) == original[at + 2 + f % 32], "real-down independent code decode");
+            }
+            for (std::uint32_t b = 0; b < g.blocks; ++b) {
+                const auto at = (std::size_t{o} * g.blocks + b) * 34;
+                const auto expected = std::uint16_t{original[at]} | (std::uint16_t{original[at+1]} << 8);
+                require(decoded_scale(g,plane,o,b) == expected, "real-down independent scale decode");
+            }
+        }
+        // Canonical real shape has no padded rows or tail. Synthetic shape
+        // tests separately extract/hash nonempty padding across the full grid.
+        require(g.padding_bytes == 0, "unexpected real-down padding geometry");
+        if (index != 0) ledger << ',';
+        ledger << "{\"name\":\"" << name << "\",\"index\":" << index
+               << ",\"file_offset\":" << offset << ",\"size\":" << original.size()
+               << ",\"width\":" << g.width << ",\"rank\":" << g.rank << ",\"rank_pad\":" << g.rank_pad
+               << ",\"source_sha256\":\"" << source_sha << "\",\"roundtrip_sha256\":\"" << sha256_hex(recovered)
+               << "\",\"packed_sha256\":\"" << sha256_hex(plane) << "\",\"padding_bytes\":0,\"padding_sha256\":\""
+               << sha256_hex(Bytes{}) << "\",\"independent_decode_exact\":true}";
+        total += g.original_bytes;
+    }
+    require(total == 337715200ULL && windows.size() == 97, "real-down total corpus byte/count mismatch");
+    require(std::filesystem::file_size(options.model) == size_before &&
+            std::filesystem::last_write_time(options.model) == time_before &&
+            file_sha(options.model) == options.model_sha, "model changed during CPU qualification");
+    ledger << "],\"original_bytes_total\":" << total
+           << ",\"model_before_after_exact\":true,\"passed\":true}\n";
+    require(!std::filesystem::exists(options.output) && !std::filesystem::is_symlink(options.output),
+            "real-down output became occupied");
+    std::ofstream output(options.output,std::ios::binary);
+    require(output.good(), "create real-down CPU ledger");
+    output << ledger.str();
+    output.close();
+    require(output.good(), "write/close real-down CPU ledger");
+    std::cout << "HC real-down CPU qualification: 97 tensors, 337715200 bytes passed\n";
+}
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
     try {
+        if (argc != 1) {
+            require(std::string(argv[1]) == "--qualify-real-downs", "unknown CPU test mode");
+            qualify_real_downs(real_options(argc,argv));
+            return 0;
+        }
         validation();
         std::mt19937 random(0x165);
         for (const auto width : {256U,512U,2048U,10240U}) {
