@@ -141,14 +141,15 @@ void family(unsigned width, unsigned outputs, HipSharedQ8ProjectionRole role,
         for (unsigned group = 0; group < width / 32U; ++group) {
             const auto offset = (static_cast<std::uint64_t>(row) * (width / 32U) + group) * 34U;
             seed = seed * 1664525U + 1013904223U;
-            const unsigned scale = flavor == 4 ? nonfinite_scales[(row + group) % nonfinite_scales.size()]
+            const unsigned scale = flavor == 5 ? 0x3c00U
+                                    : flavor == 4 ? nonfinite_scales[(row + group) % nonfinite_scales.size()]
                                     : flavor == 1 ? scales[row % scales.size()]
                                                : (flavor == 2 ? 1U : 0x3000U | (seed & 0x83ffU));
             packed[offset] = static_cast<unsigned char>(scale);
             packed[offset + 1] = static_cast<unsigned char>(scale >> 8U);
             for (unsigned j = 0; j < 32; ++j) {
                 seed = seed * 1664525U + 1013904223U;
-                packed[offset + 2U + j] = flavor == 2 ? 127U
+                packed[offset + 2U + j] = flavor == 5 ? 1U : flavor == 2 ? 127U
                                           : flavor == 1
                                               ? static_cast<unsigned char>(codes[j % codes.size()])
                                               : static_cast<unsigned char>(seed >> 24U);
@@ -166,6 +167,18 @@ void family(unsigned width, unsigned outputs, HipSharedQ8ProjectionRole role,
             0x7f800000U, 0xff800000U, 0x3f800000U, 0xbf800000U};
         for (unsigned i = 0; i < width; ++i)
             values[i] = std::bit_cast<float>(payloads[i % payloads.size()]);
+    }
+    if (flavor == 5) {
+        for (unsigned i = 0; i < width; ++i) {
+            const unsigned id = (5U * i + (i >> 7U)) & 127U;
+            values[i] = std::bit_cast<float>(((id & 64U) << 25U) |
+                0x7fc00000U | ((id & 63U) << 16U));
+        }
+        for (unsigned stride = 128; stride != 0; stride /= 2U)
+            for (unsigned leaf = 0; leaf < stride; ++leaf)
+                require(std::bit_cast<unsigned>(values[leaf]) !=
+                    std::bit_cast<unsigned>(values[leaf + stride]),
+                    "NaN fixture must distinguish every reduction-stride pair");
     }
     upload(weights, packed.data());
     const std::array modes{HipSharedQ8ProjectionMode::legacy256,
@@ -215,7 +228,8 @@ void family(unsigned width, unsigned outputs, HipSharedQ8ProjectionRole role,
             upload(input, hidden.data());
         } else
             upload(input, values.data());
-        const float shared_gate = flavor == 3 ? (replay == 0   ? 0.0F
+        const float shared_gate = flavor == 4 && replay >= 2U ? std::bit_cast<float>(0x7fc50000U)
+                                  : flavor == 3 ? (replay == 0   ? 0.0F
                                                  : replay == 1 ? -0.0F
                                                  : replay == 2 ? 0.5F
                                                                : -0.5F)
@@ -224,7 +238,7 @@ void family(unsigned width, unsigned outputs, HipSharedQ8ProjectionRole role,
             upload(gate, &shared_gate);
         // Nonfinite payload propagation is compared across device modes only:
         // the host FMA implementation is not an AMD NaN-payload oracle.
-        const auto expected = flavor == 4 ? std::vector<unsigned char>{}
+        const auto expected = flavor >= 4 ? std::vector<unsigned char>{}
             : oracle(values, packed, outputs, down, output_bf16, shared_gate);
         if (flavor == 2)
             require(expected !=
@@ -232,7 +246,8 @@ void family(unsigned width, unsigned outputs, HipSharedQ8ProjectionRole role,
                     "decode-association mutant not detected");
         std::vector<unsigned char> first;
         for (unsigned mode = 0; mode < 3; ++mode) {
-            check(hipMemsetAsync(reinterpret_cast<void *>(output.address), 0xff, output.bytes,
+            // Flavor 5 can legitimately produce BF16 0xffff, so use finite poison.
+            check(hipMemsetAsync(reinterpret_cast<void *>(output.address), flavor == 5 ? 0xa5 : 0xff, output.bytes,
                                  o.stream),
                   "poison shared output");
             if (replay == 0)
@@ -245,7 +260,7 @@ void family(unsigned width, unsigned outputs, HipSharedQ8ProjectionRole role,
             check(hipMemcpy(actual.data(), reinterpret_cast<void *>(output.address), output.bytes,
                             hipMemcpyDeviceToHost),
                   "read shared output bits");
-            require(flavor == 4 || actual == expected,
+            require(flavor >= 4 || actual == expected,
                     "shared projection differs from independent fixed256 FMA/store oracle");
             if (mode == 0)
                 first = actual;
@@ -320,6 +335,7 @@ int main() try {
             family(2560, 7, role, storage, 1);
             family(role == HipSharedQ8ProjectionRole::down ? 640U : 2560U, 7, role, storage, 2);
             family(640, 9, role, storage, 4);
+            family(640, 9, role, storage, 5);
         }
         family(640, 9, HipSharedQ8ProjectionRole::down, storage, 3);
     }

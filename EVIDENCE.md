@@ -142,3 +142,9 @@ control/quote/backslash/null fixtures. New device-only payload cases compare
 legacy, virtual and candidate outputs for distinct NaNs/infinities and half NaN/
 infinite scales, without treating host FMA as a payload oracle. These new native
 cases still require actual execution and linked-ISA qualification.
+
+E-054 payload follow-up (pending native execution): a separate finite-scale,
+nonzero-code fixture uses feature-dependent quiet NaNs whose distinct payloads
+survive BF16 truncation. Host checks distinguish every reduction-stride pair;
+finite output poison avoids legitimate NaN payload collisions. The mixed
+nonfinite case also tests a distinct NaN scalar gate during graph replays.
