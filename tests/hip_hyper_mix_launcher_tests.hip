@@ -581,7 +581,7 @@ template <typename FixtureType = Fixture>
 void run_numeric_fixture(
     strix::SerialOp op,
     bool with_injection, bool bf16 = false, bool enable_prefetch = false,
-    bool enable_output_prefetch = false, bool enable_lane_chain = false) {
+    bool enable_output_prefetch = false, bool enable_lane_chain = false, std::uint32_t logical_rows = 1) {
     using Fixture = FixtureType;
     auto model =
         strix::ModelContract::
@@ -605,7 +605,7 @@ void run_numeric_fixture(
         io.steps[step.id];
 
     strix::ExecutionBufferRequest request;
-    request.logical_rows = 1;
+    request.logical_rows = logical_rows;
     request.activation_element_bytes = bf16 ? 2U : 4U;
     request.control_element_bytes = 4;
     const auto arena =
@@ -684,6 +684,7 @@ void run_numeric_fixture(
             fixture.input.size() * (bf16 ? sizeof(std::uint16_t) : sizeof(float)),
             hipMemcpyHostToDevice),
         "copy hyper-mix input");
+    for(std::uint32_t row=1;row<logical_rows;++row)check(hipMemcpy(reinterpret_cast<void*>(input_address.address+row*fixture.input.size()*(bf16?2U:4U)),bf16?static_cast<const void*>(input_bf16.data()):fixture.input.data(),fixture.input.size()*(bf16?2U:4U),hipMemcpyHostToDevice),"copy independent lane-chain input row");
 
     strix::ModelManifest manifest;
     manifest.architecture =
@@ -862,7 +863,7 @@ void run_numeric_fixture(
         &memory;
     context.resources =
         &resources;
-    context.logical_rows = 1;
+    context.logical_rows = logical_rows;
     context.request_concurrency = 1;
 
     strix::HipHyperMixLauncherConfig config;
@@ -976,15 +977,15 @@ void run_numeric_fixture(
         auto candidate_config=reference_config;candidate_config.lane_chain_output=true;
         auto candidate=strix::make_hip_hyper_mix_launcher("test.output.lane-chain-v1",&candidate_config);
         expect(candidate.implementation_identity!=reference_launcher.implementation_identity,"lane-chain output identity is distinct");
-        const auto temp=strix::resolve_dispatch_temporary(context,0);const auto out_bytes=Fixture::hidden*(bf16?2U:4U);
+        const auto temp=strix::resolve_dispatch_temporary(context,0);const auto out_bytes=logical_rows*Fixture::hidden*(bf16?2U:4U);
         const auto bytes=[&](std::uintptr_t address,std::size_t count){std::vector<std::byte> result(count);check(hipMemcpy(result.data(),reinterpret_cast<const void*>(address),count,hipMemcpyDeviceToHost),"read lane-chain integration receipt");return result;};
-        const auto semantic=[&]{auto result=bytes(mixed_address.address,out_bytes);if(with_injection){const auto inj=bytes(injection_address->address,Fixture::hc*4U);result.insert(result.end(),inj.begin(),inj.end());}return result;};
-        const auto poison=[&](hipStream_t stream){check(hipMemsetAsync(reinterpret_cast<void*>(temp.address),0xff,temp.bytes,stream),"poison whole lane-chain workspace");check(hipMemsetAsync(reinterpret_cast<void*>(mixed_address.address),0xff,out_bytes,stream),"poison lane-chain output");if(with_injection)check(hipMemsetAsync(reinterpret_cast<void*>(injection_address->address),0xff,Fixture::hc*4U,stream),"poison lane-chain injection");};
-        poison(nullptr);reference_launcher.function(context,reference_launcher.user_data);check(hipDeviceSynchronize(),"drain original output pipeline");const auto expected=semantic();
-        poison(nullptr);candidate.function(context,candidate.user_data);check(hipDeviceSynchronize(),"drain lane-chain pipeline");expect(semantic()==expected,"lane-chain complete eager pipeline output/injection exact");
+        const auto semantic=[&]{auto result=bytes(mixed_address.address,out_bytes);if(with_injection){const auto inj=bytes(injection_address->address,logical_rows*Fixture::hc*4U);result.insert(result.end(),inj.begin(),inj.end());}return result;};
+        const auto poison=[&](hipStream_t stream){check(hipMemsetAsync(reinterpret_cast<void*>(temp.address),0xff,temp.bytes,stream),"poison whole lane-chain workspace");check(hipMemsetAsync(reinterpret_cast<void*>(mixed_address.address),0xff,out_bytes,stream),"poison lane-chain output");if(with_injection)check(hipMemsetAsync(reinterpret_cast<void*>(injection_address->address),0xff,logical_rows*Fixture::hc*4U,stream),"poison lane-chain injection");};
+        poison(nullptr);reference_launcher.function(context,reference_launcher.user_data);check(hipDeviceSynchronize(),"drain original output pipeline");const auto pipeline_expected=semantic();
+        poison(nullptr);candidate.function(context,candidate.user_data);check(hipDeviceSynchronize(),"drain lane-chain pipeline");expect(semantic()==pipeline_expected,"lane-chain complete eager pipeline output/injection exact");
         hipStream_t stream=nullptr;hipGraph_t graph=nullptr;hipGraphExec_t executable=nullptr;check(hipStreamCreateWithFlags(&stream,hipStreamNonBlocking),"create lane-chain integration stream");strix::HipLaunchContext scope;scope.stream=stream;
         {strix::HipLaunchScope active(scope);check(hipStreamBeginCapture(stream,hipStreamCaptureModeThreadLocal),"capture lane-chain pipeline");try{candidate.function(context,candidate.user_data);}catch(...){static_cast<void>(hipStreamEndCapture(stream,&graph));if(graph)static_cast<void>(hipGraphDestroy(graph));static_cast<void>(hipStreamDestroy(stream));throw;}check(hipStreamEndCapture(stream,&graph),"end lane-chain pipeline capture");}
-        check(hipGraphInstantiate(&executable,graph,nullptr,nullptr,0),"instantiate lane-chain pipeline");for(unsigned replay=0;replay<3;++replay){poison(stream);check(hipGraphLaunch(executable,stream),"replay lane-chain pipeline");check(hipStreamSynchronize(stream),"drain lane-chain pipeline replay");expect(semantic()==expected,"lane-chain poisoned graph pipeline output/injection exact");}
+        check(hipGraphInstantiate(&executable,graph,nullptr,nullptr,0),"instantiate lane-chain pipeline");for(unsigned replay=0;replay<3;++replay){poison(stream);check(hipGraphLaunch(executable,stream),"replay lane-chain pipeline");check(hipStreamSynchronize(stream),"drain lane-chain pipeline replay");expect(semantic()==pipeline_expected,"lane-chain poisoned graph pipeline output/injection exact");}
         check(hipGraphExecDestroy(executable),"destroy lane-chain integration executable");check(hipGraphDestroy(graph),"destroy lane-chain integration graph");check(hipStreamDestroy(stream),"destroy lane-chain integration stream");
         poison(nullptr);check(hipDeviceSynchronize(),"drain lane-chain rejection poison");const auto before=semantic(),scratch_before=bytes(temp.address,temp.bytes);const auto address=runtime.tensors[2].address;runtime.tensors[2].address+=2U;bool rejected=false;try{candidate.function(context,candidate.user_data);}catch(const std::invalid_argument& e){rejected=std::string_view(e.what())=="lane-chain HC output up owner admission differs";}runtime.tensors[2].address=address;check(hipDeviceSynchronize(),"drain lane-chain rejected owner");expect(rejected && semantic()==before && bytes(temp.address,temp.bytes)==scratch_before,"malformed lane-chain owner rejects before any normalization/workspace/semantic write");
         for(auto* pointer:device_weights){check(hipFree(pointer),"free lane-chain integration weight");}
@@ -1833,7 +1834,7 @@ void run_prefetch_geometry() {
 int main(int argc, char** argv) try {
     if(argc==2 && std::string_view(argv[1])=="lane-chain"){
         for(const auto op:{strix::SerialOp::attn_hyper_mix,strix::SerialOp::mlp_hyper_mix,strix::SerialOp::final_hyper_mix})for(bool bf16:{false,true}){
-            run_numeric_fixture<OutputPrefetchFixture<256,4,32>>(op,op!=strix::SerialOp::final_hyper_mix,bf16,true,true,true);
+            run_numeric_fixture<OutputPrefetchFixture<256,4,32>>(op,op!=strix::SerialOp::final_hyper_mix,bf16,true,true,true,2);
             run_numeric_fixture<OutputPrefetchFixture<10240,4,320>>(op,op!=strix::SerialOp::final_hyper_mix,bf16,true,true,true);
         }
         return failures?1:0;

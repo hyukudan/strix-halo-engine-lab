@@ -306,6 +306,9 @@ int main() {
     expect(q4_rejected,"speculative depth1 rejects quantized kernel even without mode admission");
 
 
+    auto hc_binding=binding;hc_binding.lane_chain_hyper_output=true;bool hc_rejected=false;
+    try{(void)strix::compile_speculative_verify_execution(model,4,registry,hc_binding,buffers);}catch(const std::invalid_argument&){hc_rejected=true;}
+    expect(hc_rejected,"lane-chain HC rejects compiled speculative execution");
     if (failures == 0) {
         std::cout << "compiled speculative verify tests passed\n";
     }

@@ -192,58 +192,13 @@ std::vector<HostRange> build_copy_ranges(
     const MappedModelFile& mapped,
     const ModelManifest& manifest,
     const HipModelResidencyPolicy& policy) {
+    const auto planned=build_copy_residency_ranges(manifest,policy);
     std::vector<HostRange> ranges;
-    for (const auto& tensor : manifest.tensors) {
-        if (!should_promote(tensor, policy)) {
-            continue;
-        }
-        if (tensor.absolute_offset > mapped.bytes() ||
-            tensor.byte_size >
-                mapped.bytes() - tensor.absolute_offset) {
-            throw std::invalid_argument(
-                "manifest tensor exceeds mapped model file");
-        }
-        ranges.push_back(
-            HostRange{
-                tensor.absolute_offset,
-                checked_add(
-                    tensor.absolute_offset,
-                    tensor.byte_size),
-            });
+    for(const auto range:planned){
+        if(range.begin>mapped.bytes() || range.end>mapped.bytes())throw std::invalid_argument("manifest tensor exceeds mapped model file");
+        ranges.push_back({range.begin,range.end});
     }
-
-    std::sort(
-        ranges.begin(),
-        ranges.end(),
-        [](const auto& left,
-           const auto& right) {
-            if (left.begin != right.begin) {
-                return left.begin < right.begin;
-            }
-            return left.end < right.end;
-        });
-
-    std::vector<HostRange> merged;
-    for (const auto range : ranges) {
-        if (merged.empty()) {
-            merged.push_back(range);
-            continue;
-        }
-        auto& last = merged.back();
-        const auto maximum_gap_end =
-            checked_add(
-                last.end,
-                policy.coalesce_gap_bytes);
-        if (range.begin <= maximum_gap_end) {
-            last.end =
-                std::max(
-                    last.end,
-                    range.end);
-        } else {
-            merged.push_back(range);
-        }
-    }
-    return merged;
+    return ranges;
 }
 
 }  // namespace

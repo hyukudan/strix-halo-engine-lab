@@ -1,3 +1,4 @@
+#include "strix/lane_chain_hyper_output.hpp"
 #include "strix/compiled_execution.hpp"
 #include "strix/execution_binding.hpp"
 #include "strix/execution_plan.hpp"
@@ -483,6 +484,27 @@ int main() {
             "QSA prefetch config differs from binding request");
     }
 
+    {
+        auto hc_request=request;hc_request.lane_chain_hyper_output=true;
+        for(const auto& step:execution.steps)if(step.op==strix::SerialOp::attn_hyper_mix || step.op==strix::SerialOp::mlp_hyper_mix)hc_request.lane_chain_hyper_output_eligible_steps.push_back(step.id);
+        strix::HipLauncherCatalogConfig hc_config;hc_config.parallel_hyper_mix=true;hc_config.staged_hyper_projections=true;hc_config.fused_staged_hyper_mix=true;hc_config.typed_hyper_projection=true;hc_config.prefetch_typed_hyper_rows=true;hc_config.prefetch_q8_hyper_output=true;hc_config.lane_chain_hyper_output=true;
+        strix::kernels::KernelRegistry hc_registry;strix::register_complete_hip_kernel_catalog(model,hc_request,hc_config,hc_registry);
+        bool has_base=false,has_candidate=false;
+        for(const auto& variant:hc_registry.variants())if(variant.family==strix::kernels::OperatorFamily::hyper_mix){if(variant.id.ends_with(strix::lane_chain_hyper_output_suffix))has_candidate=true;else has_base=true;}
+        expect(has_base && has_candidate,"complete HC catalog contains base and candidate pair");
+        auto bad_config=hc_config;bad_config.lane_chain_hyper_output=false;bool rejected=false;
+        try{strix::kernels::KernelRegistry bad;strix::register_complete_hip_kernel_catalog(model,hc_request,bad_config,bad);}catch(const std::invalid_argument&){rejected=true;}
+        expect(rejected,"HC catalog rejects config/request opt-in mismatch");
+        auto bad_request=hc_request;bad_request.lane_chain_hyper_output=false;rejected=false;
+        try{strix::kernels::KernelRegistry bad;strix::register_complete_hip_kernel_catalog(model,bad_request,hc_config,bad);}catch(const std::invalid_argument&){rejected=true;}
+        expect(rejected,"HC catalog rejects inverse config/request opt-in mismatch");
+        strix::ExecutionBufferRequest hc_buffers;const auto hc_compiled=strix::compile_serial_execution(model,hc_registry,hc_request,hc_buffers);
+        expect(hc_compiled.bindings.missing_steps==0,"mixed candidate/base catalog compiles complete plan");
+        strix::kernels::KernelRegistry candidate_only;
+        for(const auto& variant:hc_registry.variants())if(variant.family!=strix::kernels::OperatorFamily::hyper_mix || variant.id.ends_with(strix::lane_chain_hyper_output_suffix))candidate_only.add(variant);
+        rejected=false;try{(void)strix::compile_serial_execution(model,candidate_only,hc_request,hc_buffers);}catch(const std::invalid_argument&){rejected=true;}
+        expect(rejected,"compiled serial execution rejects unavailable base suffix admission");
+    }
     if (failures == 0) {
         std::cout
             << "HIP launcher catalog tests passed\n";

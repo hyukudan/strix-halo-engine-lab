@@ -1,3 +1,4 @@
+#include "strix/hip_lane_chain_hyper_output_tests.hpp"
 #include "strix/hip_launch_context.hpp"
 #include "strix/hip_hyper_mix_launcher.hpp"
 #include "strix/lane_chain_hyper_output.hpp"
@@ -1575,8 +1576,7 @@ void launch_hyper_mix(
     }
 
     if(config.lane_chain_output){
-        const bool registered=up_runtime.storage==RuntimeTensorStorage::registered_file_mapped;
-        if(!lane_chain_hyper_output_eligible(up_manifest,config.hidden_size,config.hc_count,config.lowrank,registered) || up_runtime.address%16U || up_runtime.bytes<up_manifest.byte_size ||
+        if(!lane_chain_hyper_output_eligible(up_manifest,config.hidden_size,config.hc_count,config.lowrank,up_runtime.address%16U) || up_runtime.bytes<up_manifest.byte_size ||
            up_manifest.byte_size>std::numeric_limits<std::uintptr_t>::max()-up_runtime.address)
             throw std::invalid_argument("lane-chain HC output up owner admission differs");
         if(input.address%activation_bytes || output.address%activation_bytes || norm_runtime.address%(norm_manifest.ggml_type==0U?4U:2U) || down_runtime.address%2U ||
@@ -1696,7 +1696,7 @@ std::uint64_t implementation_identity(
 
 }  // namespace
 
-void enqueue_lane_chain_hyper_output_test(const HipHyperMixLauncherConfig& config,const float* normalized,const float* low,const void* up,void* output,std::uint32_t rows,bool lane_chain,hipStream_t stream){
+void testing::enqueue_lane_chain_hyper_output_test(const HipHyperMixLauncherConfig& config,const float* normalized,const float* low,const void* up,void* output,std::uint32_t rows,bool lane_chain,hipStream_t stream){
     auto selected=config;selected.lane_chain_output=lane_chain;validate_config(selected);
     if(!rows || rows>65535 || !normalized || !low || !up || !output || (lane_chain && reinterpret_cast<std::uintptr_t>(up)%16U))throw std::invalid_argument("lane-chain HC output test owner/rows invalid");
     const auto launch=[&]<typename Storage>(){
@@ -1888,7 +1888,6 @@ register_for_compiled_execution(
         if(config_.typed_projection){if(!resources)throw std::invalid_argument("typed hyper bundle requires complete model preflight resources");preflight_typed_hyper_projection_model(compiled,*resources);}
         if(config_.prefetch_q8_output){if(!resources)throw std::invalid_argument("Q8 hyper output bundle requires complete model preflight resources");preflight_q8_hyper_output_model(compiled,*resources,config_);}
         if(!compiled.execution_identity || compiled.execution.steps.size()!=compiled.bindings.bindings.size())throw std::invalid_argument("HIP hyper-mix bundle requires valid compiled execution");
-        fallback_config_=config_;fallback_config_.lane_chain_output=false;
         ExecutionBindingRequest expected;expected.logical_rows=compiled.logical_rows;expected.request_concurrency=compiled.request_concurrency;
         const auto candidate_id=kernel_id(expected,config_),base_id=kernel_id(expected,fallback_config_);
         std::set<std::string> selected_ids;
@@ -1898,14 +1897,14 @@ register_for_compiled_execution(
             const auto& binding=compiled.bindings.bindings[index];
             if(binding.host_or_runtime_step || !binding.kernel_id)throw std::invalid_argument("HIP hyper-mix step has no kernel binding");
             bool eligible=false;
-            if(config_.lane_chain_output){
+            {
                 ExecutionDispatchContext context;context.execution_identity=compiled.execution_identity;context.step_id=step.id;context.op=step.op;context.resources=resources;
                 const auto& access=resolve_dispatch_tensor_access(context,2);const auto& up=manifest_tensor(context,access);const auto& owner=runtime_tensor(context,access);
-                eligible=lane_chain_hyper_output_eligible(up,config_.hidden_size,config_.hc_count,config_.lowrank,owner.storage==RuntimeTensorStorage::registered_file_mapped);
+                eligible=lane_chain_hyper_output_eligible(up,config_.hidden_size,config_.hc_count,config_.lowrank,owner.address%16U);
                 if(owner.bytes<up.byte_size || up.byte_size>std::numeric_limits<std::uintptr_t>::max()-owner.address)throw std::invalid_argument("lane-chain HC output up owner extent differs");
                 if(eligible && (owner.address%16U || owner.bytes<up.byte_size || up.byte_size>std::numeric_limits<std::uintptr_t>::max()-owner.address))throw std::invalid_argument("lane-chain HC output up owner admission differs");
             }
-            const auto& id=(config_.lane_chain_output && !eligible)?base_id:candidate_id;
+            const auto& id=!eligible?base_id:candidate_id;
             if(*binding.kernel_id!=id)throw std::invalid_argument("typed hyper bundle differs from selected kernel identity");
             selected_ids.insert(id);
         }

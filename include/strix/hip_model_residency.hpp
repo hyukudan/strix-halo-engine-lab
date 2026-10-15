@@ -28,6 +28,15 @@ struct HipModelResidencyPolicy {
     std::uint64_t coalesce_gap_bytes = 0;
 };
 
+struct CopyResidencyRange {
+    std::uint64_t begin = 0, end = 0;
+};
+// Pure layout shared by allocation and pre-allocation kernel eligibility.
+[[nodiscard]] std::vector<CopyResidencyRange> build_copy_residency_ranges(
+    const ModelManifest&, const HipModelResidencyPolicy&);
+[[nodiscard]] std::uint64_t copy_residency_tensor_offset(
+    const ManifestTensor&, const std::vector<CopyResidencyRange>&);
+
 class HipModelResidency {
 public:
     HipModelResidency() = default;

@@ -1,6 +1,7 @@
 #include "strix/speculative_verify_binding.hpp"
 
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <utility>
 
@@ -162,6 +163,9 @@ int main() {
                missing.bound_steps == 0,
            "decode-only registry cannot bind speculative verify plan");
 
+    strix::SpeculativeVerifyBindingRequest hc_request;hc_request.lane_chain_hyper_output=true;bool hc_rejected=false;
+    try{(void)strix::bind_speculative_verify_plan(model,verify,registry,hc_request);}catch(const std::invalid_argument&){hc_rejected=true;}
+    expect(hc_rejected,"lane-chain HC rejects speculative binding");
     if (failures == 0) {
         std::cout << "speculative verify binding tests passed\n";
     }

@@ -49,7 +49,7 @@ class HipHyperMixLauncherBundle {
 public:
     explicit HipHyperMixLauncherBundle(
         HipHyperMixLauncherConfig config)
-        : config_(config) {}
+        : config_(config), fallback_config_(config) { fallback_config_.lane_chain_output=false; }
 
     HipHyperMixLauncherBundle(
         const HipHyperMixLauncherBundle&) = delete;

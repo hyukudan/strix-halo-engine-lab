@@ -27,6 +27,7 @@ endfunction()
 
 add_library(strix_core STATIC
     src/qsa_input_prefetch.cpp
+    src/model_copy_residency_layout.cpp
     src/lane_chain_hyper_output.cpp
     src/q51_grouped_down_contract.cpp
     src/moe_q4k_a8_runtime.cpp

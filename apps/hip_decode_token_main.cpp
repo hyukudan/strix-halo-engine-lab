@@ -955,7 +955,9 @@ int main(
             << ",\n  \"grouped_q51_host_submissions\": "
             << (q4k_a8_stats ? q4k_a8_stats->grouped_q51_submissions.load(std::memory_order_relaxed) : 0) << ",\n";
     };
-    const auto lane_chain_steps=options.lane_chain_hyper_output?strix::lane_chain_hyper_output_steps(model,manifest,options.residency==strix::HipModelResidencyMode::registered_file_mapping):std::vector<std::uint32_t>{};
+    strix::HipModelResidencyPolicy lane_chain_policy;lane_chain_policy.mode=options.residency;lane_chain_policy.coalesce_gap_bytes=options.coalesce_gap_bytes;lane_chain_policy.promote_file_backed_candidates=options.execution.mode==strix::DecodeExecutionMode::graph;
+    std::uint32_t lane_chain_total=0;
+    const auto lane_chain_steps=options.lane_chain_hyper_output?strix::lane_chain_hyper_output_steps(model,manifest,lane_chain_policy,&lane_chain_total):std::vector<std::uint32_t>{};
     const auto tensor_index =
         strix::build_model_tensor_index(
             manifest);
@@ -987,7 +989,7 @@ int main(
     const std::string lane_chain_mode_receipt=
         "  \"lane_chain_hyper_output\": " + (options.lane_chain_hyper_output ? "true" : "false") + ",\n" +
         "  \"lane_chain_hyper_output_eligible_steps\": " + std::to_string(lane_chain_steps.size()) + ",\n" +
-        "  \"lane_chain_hyper_output_fallback_steps\": " + std::to_string(options.lane_chain_hyper_output ? model.hidden_layers*2U+1U-lane_chain_steps.size() : 0U) + ",\n";
+        "  \"lane_chain_hyper_output_fallback_steps\": " + std::to_string(options.lane_chain_hyper_output ? lane_chain_total-lane_chain_steps.size() : 0U) + ",\n";
     const auto qsa_prefetch_plan=options.prefetch_q8_qsa_input ? strix::qsa_input_prefetch::build_plan(model,manifest) : strix::qsa_input_prefetch::Plan{};
     std::string qsa_input_mode_receipt="  \"prefetch_q8_qsa_input\": "+std::string(options.prefetch_q8_qsa_input?"true":"false")+",\n";
     if(options.prefetch_q8_qsa_input) qsa_input_mode_receipt+="  \"prefetch_q8_qsa_input_eligible_steps\": "+std::to_string(qsa_prefetch_plan.eligible_steps)+",\n";
