@@ -5,6 +5,7 @@
 #include "strix/hip_setup_quiescence.hpp"
 #ifdef STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME
 #include "strix/hip_moe_q4k_a8_probe.hpp"
+#include "strix/hip_q51_grouped_down_probe.hpp"
 #endif
 #include <array>
 #include <limits>
@@ -1043,6 +1044,54 @@ __global__ void q4k_a8_validate_finite_kernel(const float* values, std::uint32_t
     }
 }
 
+// One complete wave owns an output. Eight register leaves represent the
+// ORIGINAL256 threads, not a32-leaf reduction. All shuffle participants stay
+// active; only complete output waves can return at the output-tail guard.
+__global__ void q51_grouped_virtual256_down_probe_kernel(const float* intermediates,
+    const std::uint32_t* routes,const float* route_weights,const void* weights,
+    std::uint32_t intermediate_size,std::uint32_t hidden_size,std::uint32_t experts,
+    std::uint32_t top_k,float* accumulation,const std::uint32_t* status) {
+    if(*status!=0U) return; // No writer changes local status during this kernel.
+    const auto lane=static_cast<std::uint32_t>(threadIdx.x)%32U;
+    const auto wave=static_cast<std::uint32_t>(threadIdx.x)/32U;
+    const auto out=static_cast<std::uint32_t>(blockIdx.x)*8U+wave;
+    if(out>=hidden_size) return;
+    float current=0.0F;
+    for(std::uint32_t slot=0;slot<top_k;++slot) {
+        const auto expert=routes[slot];
+        if(expert>=experts) return; // Same-stream validator already sets bit1.
+        const auto row=static_cast<std::uint64_t>(expert)*hidden_size+out;
+        const auto input_base=static_cast<std::uint64_t>(slot)*2U*intermediate_size;
+        float partial[8]={};
+        for(std::uint32_t chunk=0;chunk<intermediate_size;chunk+=256U) {
+#pragma unroll
+            for(unsigned j=0;j<8;++j) {
+                const auto feature=chunk+8U*lane+j;
+                if(feature<intermediate_size)
+                    partial[j]+=intermediates[input_base+feature]*
+                        load_weight<WeightKind::q5_1>(weights,intermediate_size,row,feature);
+            }
+        }
+#pragma unroll
+        for(unsigned distance=16;distance>0;distance>>=1U) {
+#pragma unroll
+            for(unsigned j=0;j<8;++j) {
+                const auto neighbor=__shfl_down(partial[j],distance,32);
+                if(lane<distance) partial[j]+=neighbor;
+            }
+        }
+        if(lane==0U) {
+#pragma unroll
+            for(unsigned j=0;j<4;++j) partial[j]+=partial[j+4];
+#pragma unroll
+            for(unsigned j=0;j<2;++j) partial[j]+=partial[j+2];
+            partial[0]+=partial[1];
+            current=current+partial[0]*route_weights[slot];
+        }
+    }
+    if(lane==0U) accumulation[out]=current;
+}
+
 struct Q4kA8Range { std::uintptr_t address; std::uint64_t bytes; };
 void validate_q4k_a8_ranges(Q4kA8Range temporary, Q4kA8Range output,
     const std::array<Q4kA8Range, 6>& readonly) {
@@ -1528,5 +1577,46 @@ register_for_compiled_execution(
         }
     }
 }
+
+
+#ifdef STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME
+namespace q51_grouped_down {
+namespace {
+void enqueue_preflight(const Request& request,const Bindings& b,hipStream_t stream) {
+    validate(request,b);
+    check_hip(hipPeekAtLastError(),"Q5_1 grouped-down pre-enqueue stale error");
+    hipLaunchKernelGGL(validate_routes_kernel,dim3(1),dim3(kThreads),0,stream,
+        reinterpret_cast<const std::uint32_t*>(b.routes.address),
+        reinterpret_cast<const float*>(b.route_weights.address),request.shape.top_k,
+        request.shape.experts,reinterpret_cast<std::uint32_t*>(b.status.address),nullptr);
+    check_hip(hipGetLastError(),"Q5_1 grouped-down route validation");
+}
+}
+void enqueue_grouped_probe(const Request& request,const Bindings& b,hipStream_t stream) {
+    enqueue_preflight(request,b,stream);
+    hipLaunchKernelGGL(q51_grouped_virtual256_down_probe_kernel,
+        dim3((request.shape.hidden+7U)/8U),dim3(kThreads),0,stream,
+        reinterpret_cast<const float*>(b.intermediates.address),
+        reinterpret_cast<const std::uint32_t*>(b.routes.address),
+        reinterpret_cast<const float*>(b.route_weights.address),reinterpret_cast<const void*>(b.weights.address),
+        request.shape.intermediate,request.shape.hidden,request.shape.experts,request.shape.top_k,
+        reinterpret_cast<float*>(b.accumulation.address),reinterpret_cast<const std::uint32_t*>(b.status.address));
+    check_hip(hipGetLastError(),"Q5_1 grouped virtual256 down probe");
+}
+void enqueue_original_receipt(const Request& request,const Bindings& b,hipStream_t stream) {
+    enqueue_preflight(request,b,stream);
+    for(std::uint32_t slot=0;slot<request.shape.top_k;++slot) {
+        const auto address=b.intermediates.address+static_cast<std::uintptr_t>(slot)*2U*request.shape.intermediate*sizeof(float);
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(selected_down_accumulate_kernel<float,WeightKind::q5_1>),
+            dim3(request.shape.hidden),dim3(kThreads),0,stream,reinterpret_cast<const float*>(address),
+            reinterpret_cast<const std::uint32_t*>(b.routes.address),
+            reinterpret_cast<const float*>(b.route_weights.address),slot,reinterpret_cast<const void*>(b.weights.address),
+            request.shape.intermediate,request.shape.hidden,request.shape.experts,
+            reinterpret_cast<float*>(b.accumulation.address),reinterpret_cast<const std::uint32_t*>(b.status.address));
+        check_hip(hipGetLastError(),"original Q5_1 down receipt");
+    }
+}
+} // namespace q51_grouped_down
+#endif
 
 }  // namespace strix

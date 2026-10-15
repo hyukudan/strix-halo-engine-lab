@@ -26,6 +26,7 @@ function(strix_target_warnings target)
 endfunction()
 
 add_library(strix_core STATIC
+    src/q51_grouped_down_contract.cpp
     src/moe_q4k_a8_runtime.cpp
     src/arithmetic_lineage.cpp
     src/graph_eligibility.cpp
@@ -535,6 +536,14 @@ if(BUILD_TESTING)
     target_link_libraries(strix-execution-plan-tests PRIVATE strix_core)
     strix_target_warnings(strix-execution-plan-tests)
     add_test(NAME strix-execution-plan-tests COMMAND strix-execution-plan-tests)
+
+    add_executable(strix-q51-grouped-down-contract-tests tests/q51_grouped_down_contract_tests.cpp)
+    target_link_libraries(strix-q51-grouped-down-contract-tests PRIVATE strix_core)
+    strix_target_warnings(strix-q51-grouped-down-contract-tests)
+    if(NOT MSVC)
+        target_compile_options(strix-q51-grouped-down-contract-tests PRIVATE -fno-fast-math -ffp-contract=off)
+    endif()
+    add_test(NAME strix-q51-grouped-down-contract-tests COMMAND strix-q51-grouped-down-contract-tests)
 
     add_executable(strix-moe-q4k-a8-runtime-tests tests/moe_q4k_a8_runtime_tests.cpp)
     target_link_libraries(strix-moe-q4k-a8-runtime-tests PRIVATE strix_core)
@@ -1341,6 +1350,11 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         )
 
         if(STRIX_ENABLE_EXPERIMENTAL_Q4K_A8_RUNTIME)
+            add_executable(strix-hip-q51-grouped-down-probe-tests tests/hip_q51_grouped_down_probe_tests.hip)
+            set_target_properties(strix-hip-q51-grouped-down-probe-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+            target_link_libraries(strix-hip-q51-grouped-down-probe-tests PRIVATE strix_hip_runtime)
+            strix_target_warnings(strix-hip-q51-grouped-down-probe-tests)
+            add_test(NAME strix-hip-q51-grouped-down-probe-tests COMMAND strix-hip-q51-grouped-down-probe-tests)
             foreach(mode 0 4)
                 add_test(NAME strix-hip-moe-q4k-a8-native-duplicate-${mode}-tests
                     COMMAND strix-hip-moe-kquant-tests ${mode} q4k-a8-duplicate)
