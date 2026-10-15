@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace strix::q8_projection_organization {
@@ -73,11 +74,13 @@ inline ManifestPlan build_manifest_plan(const ModelContract& model, const ModelM
                 if (tensor.layer != layer) continue;
                 std::size_t family = counts.size();
                 if (tensor.role == TensorRole::attention_projection) {
-                    if (tensor.name.ends_with(".attn_qkv.weight")) family = 0;
-                    else if (tensor.name.ends_with(".attn_gate.weight")) family = 1;
+                    if (tensor.name.find("attn_qkv") != std::string::npos) family = 0;
+                    else if (tensor.name.find("attn_gate") != std::string::npos) family = 1;
                 } else if (tensor.role == TensorRole::recurrent_state) {
-                    if (tensor.name.ends_with(".ssm_beta.weight")) family = 2;
-                    else if (tensor.name.ends_with(".ssm_alpha.weight")) family = 3;
+                    // The launcher classifies convolution before beta/alpha.
+                    if (tensor.name.find("ssm_conv1d") != std::string::npos) continue;
+                    if (tensor.name.find("ssm_beta") != std::string::npos) family = 2;
+                    else if (tensor.name.find("ssm_alpha") != std::string::npos) family = 3;
                 }
                 if (family == counts.size()) continue;
                 ++counts[family];

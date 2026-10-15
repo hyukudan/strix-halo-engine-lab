@@ -154,6 +154,18 @@ void test_whole_model_alignment_admission() {
     }
     auto duplicate = manifest; duplicate.tensors.push_back(manifest.tensors.front());
     rejects([&] { (void)q8::build_manifest_plan(model, duplicate, false, true); }, "duplicate selected GDN projection rejects");
+    // Launcher family matching uses substrings, including noncanonical suffixes.
+    // Ambiguity in the last executed GDN layer must fail before state setup.
+    for (std::size_t family = 0; family < 4; ++family) {
+        auto ambiguous = manifest;
+        auto extra = manifest.tensors[manifest.tensors.size() - 5U + family];
+        extra.name = family == 0U ? "last.attn_qkv.bias" :
+                     family == 1U ? "last.attn_gate_extra.weight" :
+                     family == 2U ? "last.ssm_beta_extra.weight" : "last.ssm_alpha_x.weight";
+        ambiguous.tensors.push_back(std::move(extra));
+        rejects([&] { (void)q8::build_manifest_plan(model, ambiguous, false, true); },
+                "late noncanonical duplicate matches launcher and rejects in preflight");
+    }
     auto missing = manifest; missing.tensors.erase(missing.tensors.begin());
     rejects([&] { (void)q8::build_manifest_plan(model, missing, false, true); }, "missing selected GDN projection rejects");
     auto invalid = manifest; invalid.tensors.back().ggml_type = 20;
