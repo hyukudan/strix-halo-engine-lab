@@ -147,6 +147,8 @@ void negative_scope_and_protocol() {
     reject([&] { streams.verify_before_commit(); });
     reject([&] { streams.begin_experts(0); });
     streams.fork_shared(0);
+    require(streams.stats().fork_records == 1 && streams.stats().join_waits == 0,
+            "fork counter must record the actual fork event before shared-done");
     reject([&] { streams.join_before_combine(0); });
     reject([&] { streams.mark_committed(1,1); });
     streams.abort();

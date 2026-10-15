@@ -2,6 +2,7 @@
 #include "strix/decode_execution_options.hpp"
 #include "strix/hip_model_residency.hpp"
 #include "strix/raw_baseline_recording.hpp"
+#include "strix/final_generation_state_export.hpp"
 #include "strix/model_contract.hpp"
 #include "strix/wave_router_contract.hpp"
 #include <cerrno>
@@ -137,6 +138,9 @@ struct Options {
     std::optional<std::uint32_t> eos_token;
     bool prefix_cache_roundtrip = false;
     std::string raw_recording_path;
+    std::string validation_final_state_path;
+    std::uint64_t validation_final_state_maximum_bytes = 8ULL * 1024ULL * 1024ULL * 1024ULL;
+    bool validation_final_state_budget_explicit = false;
     std::uint64_t raw_maximum_bytes = 8ULL * 1024 * 1024 * 1024;
     strix::RawBaselineStatePolicy raw_state_policy = strix::RawBaselineStatePolicy::final;
     bool raw_policy_supplied = false;
@@ -173,7 +177,7 @@ inline Options parse_options(
         throw std::invalid_argument(
             "usage: strix-hip-decode-token MODEL.gguf [TOKEN_ID ...] "
             "[--optimization-profile auto|manual] [--execution-inventory] [--host-dispatch-telemetry] "
-            "[--gpu-greedy-token] [--prepared-eager] [--moe-shared-overlap] [--batched-moe-activation] [--reference FILE] [--max-logit-error X] "
+            "[--gpu-greedy-token] [--prepared-eager] [--moe-shared-overlap] [--moe-overlap-arena-budget-bytes N] [--batched-moe-activation] [--validation-final-state DIR] [--validation-final-state-max-bytes N] [--reference FILE] [--max-logit-error X] "
             "[--context N] [--residency register|copy] [--coalesce-gap BYTES] "
             "[--planned-ple-io] [--ple-max-rows-per-io N] [--ple-max-inflight-ios N] "
             "[--generate N] [--eos-token TOKEN_ID] [--prefix-cache-roundtrip] "
@@ -365,6 +369,21 @@ inline Options parse_options(
             continue;
         }
 
+        if (argument == "--validation-final-state") {
+            if (index + 1 >= argc || !options.validation_final_state_path.empty())
+                throw std::invalid_argument("--validation-final-state requires one fresh private directory");
+            options.validation_final_state_path = argv[++index];
+            if (options.validation_final_state_path.empty())
+                throw std::invalid_argument("--validation-final-state directory is empty");
+            continue;
+        }
+        if (argument == "--validation-final-state-max-bytes") {
+            if (index + 1 >= argc || options.validation_final_state_budget_explicit)
+                throw std::invalid_argument("--validation-final-state-max-bytes requires one byte budget");
+            options.validation_final_state_budget_explicit = true;
+            options.validation_final_state_maximum_bytes = parse_u64(argv[++index], "validation-final-state-max-bytes");
+            continue;
+        }
         if (argument == "--record-raw") {
             if (index + 1 >= argc || !options.raw_recording_path.empty()) throw std::invalid_argument("--record-raw requires one fresh private directory");
             options.raw_recording_path = argv[++index];
@@ -560,6 +579,16 @@ inline Options parse_options(
         options.tokens.empty()) {
         throw std::invalid_argument(
             "--generate requires at least one prefix token id");
+    }
+    if (options.validation_final_state_budget_explicit && options.validation_final_state_path.empty())
+        throw std::invalid_argument("final state export budget requires --validation-final-state");
+    if (!options.validation_final_state_path.empty()) {
+        if (!options.validation_final_state_maximum_bytes || !options.generate_tokens ||
+            !options.raw_recording_path.empty() || !options.reference_path.empty() ||
+            options.prefix_cache_roundtrip || options.execution.mode != strix::DecodeExecutionMode::eager ||
+            options.execution.integer_head != strix::DecodeIntegerHead::none)
+            throw std::invalid_argument("final state validation requires eager generation without RAW, reference, roundtrip or integer head");
+        strix::validate_final_generation_state_destination(options.validation_final_state_path);
     }
     if (options.batched_moe_activation && options.execution.mode != strix::DecodeExecutionMode::eager)
         throw std::invalid_argument("batched MoE activation requires eager mode");

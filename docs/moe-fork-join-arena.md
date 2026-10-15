@@ -42,7 +42,7 @@ compiled copy with the expanded arena and layout identity as execution identity.
 The kernel plan identity stays unchanged because kernels and their numerical
 contract stay unchanged. Whole-plan graph safety is set false; preparation rejects
 device-graph-input topologies. `plan.validate_execution(rebound)` checks the
-complete expected transformed snapshot when constructing a future dispatcher.
+complete expected transformed snapshot when constructing the HIP dispatcher.
 
 Integration must perform this transformation before allocating resources,
 compiling the launch plan and creating sessions/prepared executions. Scratch,
@@ -59,10 +59,12 @@ enqueue, error or cancellation must prevent reuse until all submitted users have
 drained. Graph executables and callbacks holding addresses also retain that duty.
 No serial first/last-step number is a substitute for the required device joins.
 
-This is a memory-planning component. It adds no decoder option, stream, event,
-launcher, completion ticket, graph qualification or changed default. Ticket and
-owner retention, independent branch status, deterministic error arbitration and
-the HIP dispatcher remain separate work before enabling concurrent execution.
+This component itself provides memory planning. The opt-in eager HIP dispatcher
+and decoder integration are described in [shared-expert fork/join](moe-shared-overlap.md).
+They provide event ownership, strong resource retention and completion checks;
+independent branch status and deterministic cross-branch error arbitration remain
+separate work. Neither component establishes graph qualification or changes the
+default execution recipe.
 
 The accompanying test source uses real serial planning components and retained,
 aligned host allocations. It covers all six linear extensions of shared

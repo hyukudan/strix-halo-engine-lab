@@ -26,6 +26,7 @@ function(strix_target_warnings target)
 endfunction()
 
 add_library(strix_core STATIC
+    src/final_generation_state_export.cpp
     src/uma_owner_inventory.cpp
     src/moe_fork_join_arena.cpp
     src/prepared_execution.cpp
@@ -237,6 +238,10 @@ if(BUILD_TESTING OR STRIX_BUILD_EXPERIMENTAL_Q4K_A8_PROBE OR STRIX_ENABLE_EXPERI
     endif()
 endif()
 if(BUILD_TESTING)
+    add_executable(strix-final-generation-state-export-tests tests/final_generation_state_export_tests.cpp)
+    target_link_libraries(strix-final-generation-state-export-tests PRIVATE strix_core)
+    strix_target_warnings(strix-final-generation-state-export-tests)
+    add_test(NAME strix-final-generation-state-export-tests COMMAND strix-final-generation-state-export-tests)
     add_executable(strix-uma-owner-inventory-tests tests/uma_owner_inventory_tests.cpp)
     target_link_libraries(strix-uma-owner-inventory-tests PRIVATE strix_core)
     strix_target_warnings(strix-uma-owner-inventory-tests)
@@ -1194,6 +1199,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
     strix_target_warnings(strix_hip_runtime)
     if(BUILD_TESTING)
         target_compile_definitions(strix_hip_runtime PRIVATE STRIX_BUILD_GDN_LM_WAVE8_DIAGNOSTIC=1)
+        target_compile_definitions(strix_hip_runtime PRIVATE STRIX_BUILD_GREEDY_OUTPUT_DIAGNOSTIC=1)
         target_compile_definitions(strix_hip_runtime PRIVATE STRIX_BUILD_GDN_RECURRENT_LAYOUT_DIAGNOSTIC=1)
         target_compile_definitions(strix_hip_runtime PRIVATE STRIX_BUILD_SHARED_EXPERT_ROWS_DIAGNOSTIC=1)
         target_compile_definitions(strix_hip_runtime PRIVATE STRIX_BUILD_QSA_GQA_REUSE_DIAGNOSTIC=1)

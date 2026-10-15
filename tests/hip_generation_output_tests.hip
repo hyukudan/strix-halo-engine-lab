@@ -1,4 +1,5 @@
 #include "strix/hip_generation_output.hpp"
+#include "strix/hip_generation_output_diagnostic.hpp"
 #include "strix/hip_setup_quiescence.hpp"
 #include <hip/hip_runtime.h>
 #include <algorithm>
@@ -118,6 +119,9 @@ void finite_family(std::uint32_t n) {
     rejected([&] { static_cast<void>(output.select(bad, n, 42, epoch + 1)); });
     bad = fixture.view; ++bad.allocation_generation;
     rejected([&] { static_cast<void>(output.select(bad, n, 42, epoch + 1)); });
+    // Valid aligned same-arena span, but a different view after binding.
+    bad = fixture.view; bad.address += sizeof(float);
+    rejected([&] { static_cast<void>(output.select(bad, n, 42, epoch + 1)); });
     bad = fixture.view; bad.address = fixture.scratch.arena_base + fixture.scratch.arena_bytes;
     rejected([&] { static_cast<void>(output.select(bad, n, 42, epoch + 1)); });
     if (n != std::numeric_limits<std::uint32_t>::max())
@@ -163,6 +167,63 @@ void nonfinite() {
         }
     }
 }
+template<class Work> void boundary_failure(Work&& work) {
+    bool caught = false;
+    try { work(); } catch (const std::exception&) { caught = true; }
+    strix::clear_hip_greedy_output_diagnostic_fault();
+    require(caught, "diagnostic boundary did not reject");
+}
+void host_fault_boundaries() {
+    using Fault = strix::HipGreedyOutputDiagnosticFault;
+    for (const auto fault : {Fault::partial_allocation, Fault::reply_allocation, Fault::pinned_allocation}) {
+        Fixture fixture(513);
+        strix::arm_hip_greedy_output_diagnostic_fault(fault);
+        boundary_failure([&] {
+            strix::HipGreedyOutput output(513, fixture.scratch, fixture.allocation, fixture.guard);
+        });
+        fixture.guard->require_original();
+        fixture.upload(std::vector<float>(513, -7.0F));
+        strix::HipGreedyOutput replacement(513, fixture.scratch, fixture.allocation, fixture.guard);
+        require(replacement.select(fixture.view, 513, 0, 1) == 0, "partial setup cleanup left device unusable");
+        fixture.readonly_and_guards();
+    }
+    for (const auto fault : {Fault::after_poison, Fault::after_partials, Fault::after_finish,
+            Fault::after_readback, Fault::after_completion, Fault::corrupt_epoch,
+            Fault::corrupt_position, Fault::corrupt_identity, Fault::corrupt_status, Fault::corrupt_token}) {
+        Fixture fixture(513);
+        fixture.upload(std::vector<float>(513, -3.0F));
+        strix::HipGreedyOutput output(513, fixture.scratch, fixture.allocation, fixture.guard);
+        require(output.select(fixture.view, 513, 42, 1) == 0, "fault fixture warmup failed");
+        strix::arm_hip_greedy_output_diagnostic_fault(fault);
+        boundary_failure([&] { static_cast<void>(output.select(fixture.view, 513, 43, 2)); });
+        const auto stats = output.stats();
+        require(output.failed() && stats.calls == 2 && stats.completed == 1 && stats.failures == 1,
+                "fault boundary published a result or left owner reusable");
+        rejected([&] { static_cast<void>(output.select(fixture.view, 513, 44, 3)); });
+        require(output.stats().calls == stats.calls, "faulted owner submitted more work");
+        fixture.guard->require_original();
+        fixture.readonly_and_guards();
+    }
+}
+void all_nan_and_retained_owner() {
+    Fixture fixture(513);
+    fixture.upload(std::vector<float>(513, std::bit_cast<float>(0x7fc12345U)));
+    {
+        strix::HipGreedyOutput output(513, fixture.scratch, fixture.allocation, fixture.guard);
+        rejected([&] { static_cast<void>(output.select(fixture.view, 513, 0, 1)); });
+        require(output.failed() && output.stats().completed == 0, "all-NaN vocabulary published a token");
+        fixture.readonly_and_guards();
+    }
+    fixture.upload(std::vector<float>(513, -9.0F));
+    std::weak_ptr<Allocation> weak = fixture.allocation;
+    {
+        strix::HipGreedyOutput output(513, fixture.scratch, fixture.allocation, fixture.guard);
+        fixture.allocation.reset();
+        require(!weak.expired(), "greedy owner did not retain source allocation");
+        require(output.select(fixture.view, 513, 0, 1) == 0, "retained source selection failed");
+    }
+    require(weak.expired(), "greedy owner leaked source allocation");
+}
 } // namespace
 int main() try {
     int count = 0;
@@ -181,7 +242,7 @@ int main() try {
         rejected([&] { strix::HipGreedyOutput invalid(1, fixture.scratch, {}, fixture.guard); });
         rejected([&] { strix::HipGreedyOutput invalid(1, fixture.scratch, fixture.allocation, {}); });
     }
-    repeats(); nonfinite();
+    repeats(); nonfinite(); host_fault_boundaries(); all_nan_and_retained_owner();
     std::cout << "GPU greedy exact first-max/finite/owners/repeats fixtures passed\n";
     return 0;
 } catch (const std::exception& e) {

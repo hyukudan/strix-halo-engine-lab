@@ -21,6 +21,7 @@
 #include "strix/ple_lookup.hpp"
 #include "strix/runtime_allocator.hpp"
 #include "strix/raw_baseline_recording.hpp"
+#include "strix/final_generation_state_export.hpp"
 #include "strix/qsa_input_prefetch.hpp"
 #include "strix/shared_expert_prefetch.hpp"
 #include "strix/decode_execution_options.hpp"
@@ -840,6 +841,8 @@ int main(
             state_request);
 
 
+    if (!options.validation_final_state_path.empty())
+        strix::validate_final_generation_state_budget(state_layout, {options.validation_final_state_maximum_bytes});
     strix::HipModelResidencyPolicy
         residency_policy;
     residency_policy.mode =
@@ -1129,7 +1132,8 @@ int main(
     };
     std::string raw_model_sha, raw_executable_sha;
     std::filesystem::path raw_executable;
-    if (!options.raw_recording_path.empty()) {
+    std::optional<strix::FinalGenerationStateMetadata> final_state_metadata;
+    if (!options.raw_recording_path.empty() || !options.validation_final_state_path.empty()) {
         if (const char* override_arch = std::getenv("HSA_OVERRIDE_GFX_VERSION"); override_arch && *override_arch) throw std::invalid_argument("RAW native target recording rejects architecture override");
 #if defined(__linux__)
         raw_executable = "/proc/self/exe";
@@ -1223,8 +1227,29 @@ int main(
             else std::memcpy(destination.data(), source, destination.size());
             raw_require_identity();
         };
-        raw_recording = std::make_unique<strix::RawBaselineRecording>(options.raw_recording_path, std::move(metadata), policy, state_layout);
-        raw_recording->capture_initial(session, raw_state_reader);
+        if (!options.validation_final_state_path.empty()) {
+            final_state_metadata.emplace();
+            auto& final = *final_state_metadata;
+            final.model_sha256 = metadata.model_sha256;
+            final.model_content_identity = metadata.model_content_identity;
+            final.executable_sha256 = metadata.executable_sha256;
+            final.numerical_identity = metadata.numerical_identity;
+            final.output_mode = options.gpu_greedy_token ? std::string(strix::gpu_greedy_output_identity) : "full-logits-cpu-firstmax";
+            final.gpu_identity = metadata.gpu_identity;
+            final.gpu_architecture = metadata.gpu_architecture;
+            final.hip_runtime_version = metadata.hip_runtime_version;
+            final.hip_driver_version = metadata.hip_driver_version;
+            final.kernel_plan_identity = compiled.kernel_plan_identity;
+            final.launch_plan_identity = launch_plan.plan_identity;
+            final.runtime_binding_identity = identities.binding_identity;
+            final.prepared_eager = options.prepared_eager;
+            final.shared_overlap = options.moe_shared_overlap;
+            final.batched_moe_activation = options.batched_moe_activation;
+        }
+        if (!options.raw_recording_path.empty()) {
+            raw_recording = std::make_unique<strix::RawBaselineRecording>(options.raw_recording_path, std::move(metadata), policy, state_layout);
+            raw_recording->capture_initial(session, raw_state_reader);
+        }
     }
     const auto finalize_raw = [&](std::span<const std::uint32_t> generated = {}, std::string stop = "raw_input_exhausted") {
         if (!raw_recording) return;
@@ -1532,7 +1557,28 @@ int main(
             elapsed_total += value;
         }
 
+        // Validation-only export is after the request and its per-step timing
+        // collection. Never enable this for wall-clock throughput measurements.
+        if (final_state_metadata) {
+            strix::export_final_generation_state(options.validation_final_state_path,
+                {options.validation_final_state_maximum_bytes}, model, state_layout, memory.state(),
+                session, request, result, *final_state_metadata,
+                std::static_pointer_cast<const void>(memory_owner), raw_state_reader,
+                raw_require_identity, raw_drain_or_fail, [&] {
+                    raw_require_identity();
+                    if (strix::model_content_identity_hex(strix::sha256_file_content(options.model_path)) != raw_model_sha ||
+                        strix::model_content_identity_hex(strix::sha256_file_content(raw_executable)) != raw_executable_sha)
+                        throw std::runtime_error("final state model/executable identity changed during validation");
+                    raw_require_identity();
+                });
+        }
         std::cout << "{\n" << optimization_profile_receipt << eager_submission_receipt << overlap_receipt() << execution_inventory_receipt << gdn_output_mode_receipt() << wave_router_mode_receipt << deferred_moe_mode_receipt;
+        if (final_state_metadata)
+            std::cout << "  \"validation_final_state_timing_invalid\":true,\n"
+                      << "  \"validation_final_state_manifest\":\""
+                      << strix::decode_receipt::escape_json_string(
+                             (std::filesystem::path(options.validation_final_state_path) / "manifest.json").string())
+                      << "\",\n";
         if (greedy_output) {
             const auto stats = greedy_output->stats();
             double prefix_state_total = 0.0;

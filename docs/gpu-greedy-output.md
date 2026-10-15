@@ -54,7 +54,16 @@ model equivalence and performance campaigns are deferred until the implementatio
 stage is complete. Source fixtures cover controller boundaries and full-vocabulary
 GPU selection, including nonfinite rejection, tail sizes and owner generations.
 
-Injected corrupt replies, allocation/launch/copy/drain failures, a device change,
-and the application session's failure paths still need dedicated fault-injection
-fixtures. Same-arena rebinding and all-NaN cases also remain to be added before
-the final test stage. None of these are implied by the existing source fixtures.
+Test-only host fault boundaries simulate reported failures before each pool
+allocation and after real poison, partial reduction, final reduction, readback
+and completion operations. They exercise partial setup cleanup and draining of
+actually queued work. Reply metadata, status and token corruption must also
+reject publication and permanently fail the owner. These seams are compiled
+only with `BUILD_TESTING`; builds without it contain no fault checks.
+Additional source fixtures cover same-arena rebinding, all-NaN logits and retained
+source lifetime. All fixtures still await execution.
+
+Real driver allocation/launch/copy failures, failed-drain fail-stop behavior,
+device changes and the application session failure paths remain separate
+qualification gaps. Host boundary simulation does not establish recovery from
+hardware or driver faults.

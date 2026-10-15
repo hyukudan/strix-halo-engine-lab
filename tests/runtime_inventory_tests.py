@@ -63,6 +63,42 @@ class InventoryTests(unittest.TestCase):
                                "numerics": {"input_precision": "bf16", "accumulator_precision": "fp32",
                                             "output_precision": "fp32", "row_invariant": True, "deterministic": True}}}]}
 
+    def test_auto_base_profile_with_overlays_is_consistent_but_not_combination_qualified(self):
+        modes = {"eager_submission_mode": "prepared-static-plan-experimental-v1",
+                 "moe_shared_overlap_mode": "eager-sibling-streams-experimental-v1",
+                 "generation_output_mode": "finite-firstmax-token-v1", "batched_moe_activation": True}
+        for field, value in modes.items():
+            with self.subTest(field=field):
+                receipt = self.receipt(True, "qualified-checkpoint")
+                receipt[field] = value
+                result = self.collect(cache_path=self.cache(a8="ON"),
+                                      receipt_path=self.evidence("overlay.json", receipt))
+                self.assertTrue(result["consistent"])
+                self.assertEqual(result["conflicts"], [])
+                self.assertEqual(result["effective_profile"]["selected"], receipt["optimization_profile_selected"])
+                self.assertEqual(result["reported_opt_in_overlays"][field], value)
+                self.assertEqual(result["profile_overlay_qualification"], "not_assessed")
+                self.assertTrue(any("combined configuration" in text for text in result["limitations"]))
+        receipt = self.receipt(True, "qualified-checkpoint")
+        receipt.update(modes)
+        result = self.collect(cache_path=self.cache(a8="ON"), receipt_path=self.evidence("all-overlays.json", receipt))
+        self.assertEqual(result["reported_opt_in_overlays"], modes)
+
+    def test_overlay_absence_false_unknown_and_invalid_types(self):
+        result = self.collect(receipt_path=self.evidence("no-overlays.json", {"batched_moe_activation": False}))
+        self.assertIsNone(result["profile_overlay_qualification"])
+        self.assertIsNone(result["reported_opt_in_overlays"]["generation_output_mode"])
+        result = self.collect(receipt_path=self.evidence("future-overlay.json", {"eager_submission_mode": "future-v2"}))
+        self.assertEqual(result["reported_opt_in_overlays"]["eager_submission_mode"], "future-v2")
+        self.assertTrue(result["consistent"])
+        for field in ("eager_submission_mode", "moe_shared_overlap_mode", "generation_output_mode"):
+            for value in (True, 1, {}, [] , ""):
+                with self.subTest(field=field, value=value), self.assertRaises(ValueError):
+                    self.collect(receipt_path=self.evidence("invalid-overlay.json", {field: value}))
+        for value in (1, "true", [], {}):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                self.collect(receipt_path=self.evidence("invalid-batched.json", {"batched_moe_activation": value}))
+
     def test_auto_fallback_is_effective_manual_not_v3(self):
         receipt = self.receipt()
         receipt.update(context_tokens=8192, prefix_tokens=[3, 4, 5], next_position=19)

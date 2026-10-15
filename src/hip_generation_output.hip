@@ -1,5 +1,8 @@
 #include "strix/hip_generation_output.hpp"
 #include "strix/hip_setup_quiescence.hpp"
+#if defined(STRIX_BUILD_GREEDY_OUTPUT_DIAGNOSTIC)
+#include "strix/hip_generation_output_diagnostic.hpp"
+#endif
 #include <hip/hip_runtime.h>
 #include <cstddef>
 #include <cstdint>
@@ -10,6 +13,27 @@
 #include <utility>
 
 namespace strix {
+#if defined(STRIX_BUILD_GREEDY_OUTPUT_DIAGNOSTIC)
+namespace {
+thread_local HipGreedyOutputDiagnosticFault diagnostic_fault = HipGreedyOutputDiagnosticFault::none;
+bool consume_fault(HipGreedyOutputDiagnosticFault expected) noexcept {
+    if (diagnostic_fault != expected) return false;
+    diagnostic_fault = HipGreedyOutputDiagnosticFault::none;
+    return true;
+}
+void diagnostic_boundary(HipGreedyOutputDiagnosticFault expected) {
+    if (consume_fault(expected)) throw std::runtime_error("injected GPU greedy host boundary failure");
+}
+}
+void arm_hip_greedy_output_diagnostic_fault(HipGreedyOutputDiagnosticFault fault) {
+    if (diagnostic_fault != HipGreedyOutputDiagnosticFault::none)
+        throw std::logic_error("GPU greedy diagnostic fault already armed");
+    diagnostic_fault = fault;
+}
+void clear_hip_greedy_output_diagnostic_fault() noexcept {
+    diagnostic_fault = HipGreedyOutputDiagnosticFault::none;
+}
+#endif
 namespace {
 constexpr unsigned threads = 256;
 static_assert(sizeof(float) == 4);
@@ -120,10 +144,19 @@ struct HipGreedyOutput::Impl {
         guard->require_original();
         try {
             check(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), "create greedy output stream");
+#if defined(STRIX_BUILD_GREEDY_OUTPUT_DIAGNOSTIC)
+            diagnostic_boundary(HipGreedyOutputDiagnosticFault::partial_allocation);
+#endif
             check(hipMalloc(reinterpret_cast<void**>(&partials), static_cast<std::size_t>(partial_bytes)), "allocate greedy partials");
             ++counters.pool_allocations;
+#if defined(STRIX_BUILD_GREEDY_OUTPUT_DIAGNOSTIC)
+            diagnostic_boundary(HipGreedyOutputDiagnosticFault::reply_allocation);
+#endif
             check(hipMalloc(reinterpret_cast<void**>(&device_reply), sizeof(Reply)), "allocate greedy result");
             ++counters.pool_allocations;
+#if defined(STRIX_BUILD_GREEDY_OUTPUT_DIAGNOSTIC)
+            diagnostic_boundary(HipGreedyOutputDiagnosticFault::pinned_allocation);
+#endif
             check(hipHostMalloc(reinterpret_cast<void**>(&host_reply), sizeof(Reply)), "allocate greedy pinned result");
             ++counters.pool_allocations;
         } catch (...) { cleanup(); throw; }
@@ -173,16 +206,36 @@ struct HipGreedyOutput::Impl {
             *host_reply = Reply{~epoch, ~position, 0xffffffffU, 0xffffffffU, ~execution_identity};
             check(hipMemcpyAsync(device_reply, host_reply, sizeof(Reply), hipMemcpyHostToDevice, stream), "poison greedy result");
             counters.poison_h2d_bytes += sizeof(Reply);
+#if defined(STRIX_BUILD_GREEDY_OUTPUT_DIAGNOSTIC)
+            diagnostic_boundary(HipGreedyOutputDiagnosticFault::after_poison);
+#endif
             hipLaunchKernelGGL(greedy_output_partials, dim3(partial_count), dim3(threads), 0, stream,
                                reinterpret_cast<const float*>(input.address), vocabulary, partials);
             check(hipGetLastError(), "submit greedy partials"); ++counters.reduction_kernel_submissions;
+#if defined(STRIX_BUILD_GREEDY_OUTPUT_DIAGNOSTIC)
+            diagnostic_boundary(HipGreedyOutputDiagnosticFault::after_partials);
+#endif
             hipLaunchKernelGGL(greedy_output_finish, dim3(1), dim3(threads), 0, stream,
                                partials, partial_count, device_reply, epoch, position, execution_identity);
             check(hipGetLastError(), "submit greedy finish"); ++counters.reduction_kernel_submissions;
+#if defined(STRIX_BUILD_GREEDY_OUTPUT_DIAGNOSTIC)
+            diagnostic_boundary(HipGreedyOutputDiagnosticFault::after_finish);
+#endif
             check(hipMemcpyAsync(host_reply, device_reply, sizeof(Reply), hipMemcpyDeviceToHost, stream), "read greedy result");
             counters.result_d2h_bytes += sizeof(Reply);
+#if defined(STRIX_BUILD_GREEDY_OUTPUT_DIAGNOSTIC)
+            diagnostic_boundary(HipGreedyOutputDiagnosticFault::after_readback);
+#endif
             check(hipStreamSynchronize(stream), "complete greedy result");
             ++counters.stream_completions;
+#if defined(STRIX_BUILD_GREEDY_OUTPUT_DIAGNOSTIC)
+            diagnostic_boundary(HipGreedyOutputDiagnosticFault::after_completion);
+            if (consume_fault(HipGreedyOutputDiagnosticFault::corrupt_epoch)) host_reply->epoch ^= 1U;
+            if (consume_fault(HipGreedyOutputDiagnosticFault::corrupt_position)) host_reply->position ^= 1U;
+            if (consume_fault(HipGreedyOutputDiagnosticFault::corrupt_identity)) host_reply->execution_identity ^= 1U;
+            if (consume_fault(HipGreedyOutputDiagnosticFault::corrupt_status)) host_reply->status = 1U;
+            if (consume_fault(HipGreedyOutputDiagnosticFault::corrupt_token)) host_reply->token = vocabulary;
+#endif
             guard->require_original();
             pending = false;
             require(host_reply->epoch == epoch && host_reply->position == position &&

@@ -100,6 +100,7 @@ void HipMoeSiblingStreams::fork_shared(std::uint32_t layer) {
     s.layer = layer; s.phase = Impl::Phase::forking;
     try {
         check(hipEventRecord(s.fork, s.main), "record shared producer-ready");
+        ++s.counters.fork_records; // Actual successful fork-event recording, even if a later operation fails.
         check(hipStreamWaitEvent(s.side, s.fork, 0), "side waits for shared input producer");
     } catch (...) { s.abort(); throw; }
 }
@@ -107,7 +108,7 @@ void HipMoeSiblingStreams::record_shared_done(std::uint32_t layer) {
     auto& s = *impl_; s.expected_phase(Impl::Phase::forking, layer);
     try { check(hipEventRecord(s.join, s.side), "record shared branch done"); }
     catch (...) { s.abort(); throw; }
-    ++s.forks; ++s.counters.fork_records; s.phase = Impl::Phase::shared_recorded;
+    ++s.forks; s.phase = Impl::Phase::shared_recorded;
 }
 void HipMoeSiblingStreams::begin_experts(std::uint32_t layer) {
     auto& s = *impl_; s.expected_phase(Impl::Phase::shared_recorded, layer);
@@ -195,7 +196,8 @@ struct HipMoeOverlapDispatcher::Impl {
         }
         for (const auto& layer : plan.layers()) {
             require(layer.route_step + 1U == layer.shared_step && layer.shared_step + 1U == layer.experts_step &&
-                    layer.experts_step + 1U == layer.combine_step && !launches.steps[layer.shared_step].runtime_step &&
+                    layer.experts_step + 1U == layer.combine_step && !launches.steps[layer.route_step].runtime_step &&
+                    !launches.steps[layer.shared_step].runtime_step &&
                     !launches.steps[layer.experts_step].runtime_step && !launches.steps[layer.combine_step].runtime_step,
                     "MoE overlap requires unchanged route/shared/experts/combine host order");
         }

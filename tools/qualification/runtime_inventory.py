@@ -182,6 +182,22 @@ def profile(receipt):
     return values
 
 
+
+def reported_opt_in_overlays(receipt):
+    # Receipt declarations, not inferred qualification of the combined recipe.
+    values = {}
+    for key in ("eager_submission_mode", "moe_shared_overlap_mode", "generation_output_mode"):
+        value = receipt.get(key)
+        if value is not None and (not isinstance(value, str) or not value):
+            raise ValueError(f"{key} must be a nonempty string or null")
+        values[key] = value
+    batched = receipt.get("batched_moe_activation")
+    if batched is not None:
+        boolean(batched, "batched_moe_activation")
+    values["batched_moe_activation"] = batched
+    return values
+
+
 def operator_records(audit, manifest):
     requirements = audit.get("requirements", [])
     if not isinstance(requirements, list):
@@ -354,6 +370,10 @@ def collect(repo, cache_path=None, receipt_path=None, audit_path=None, manifest_
     source = source_identity(repo)
     validate_outer_receipt(receipt)
     effective = profile(receipt)
+    overlays = reported_opt_in_overlays(receipt)
+    overlay_present = any(value is not None and value is not False for value in overlays.values())
+    overlay_limitations = (["Receipt reports explicit opt-in overlays; the selected base profile label does not "
+                            "establish qualification of this combined configuration."] if overlay_present else [])
     conflicts = []
 
     def agree(label, observed, reported):
@@ -430,6 +450,8 @@ def collect(repo, cache_path=None, receipt_path=None, audit_path=None, manifest_
             "model": model, "reported_model_sha256": receipt.get("model_sha256"),
             "reported_model_content_identity": receipt.get("model_content_identity"),
             "binary": binary, "effective_profile": effective,
+            "reported_opt_in_overlays": overlays,
+            "profile_overlay_qualification": "not_assessed" if overlay_present else None,
             "profile_evidence": "decoder-receipt" if effective["requested"] is not None else None,
             "context_capacity_tokens": capacity, "occupied_prefix_tokens": occupied,
             "context_evidence": {
@@ -447,7 +469,7 @@ def collect(repo, cache_path=None, receipt_path=None, audit_path=None, manifest_
                             "CMakeCache records configuration; it does not attest a built binary or a receipt's build.",
                             "Tensor requirements and formats do not establish launcher support in any phase.",
                             "Absent effective catalog/native qualification evidence remains null.",
-                            "Receipts without source/binary identities are not bound to this checkout/build."]}
+                            "Receipts without source/binary identities are not bound to this checkout/build."] + overlay_limitations}
 
 
 def main(argv=None):

@@ -26,7 +26,12 @@ A CMake cache attests configuration only. Tensor requirements attest neither
 executable launcher support nor row/concurrency support. Missing effective
 catalog, binary bindings and native qualification stay null. Profile resolution
 comes from the actual decoder receipt, without duplicating the application
-resolver. Conflicting evidence produces a conflict list and exit code 3;
+resolver. The collector separately surfaces reported prepared-submission,
+shared-overlap, batched-activation and generation-output overlays. A selected
+qualified base label does not qualify a combined opt-in configuration; such
+receipts carry an explicit limitation, without fabricating a conflict with the
+base recipe. Missing overlay metadata remains unknown.
+Conflicting evidence produces a conflict list and exit code 3;
 malformed inputs use exit code 2.
 An inventory with unresolved fields is not a qualified baseline.
 
