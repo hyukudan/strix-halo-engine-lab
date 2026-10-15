@@ -18,6 +18,7 @@ struct Delegate final : strix::EagerExecutionDispatcher {
 }
 int main() try {
     strix::CompiledSerialExecution compiled;
+    compiled.execution_identity = 17;
     compiled.execution.steps.resize(2);
     compiled.execution.steps[0].id = 0;
     compiled.execution.steps[0].op = strix::SerialOp::gated_delta_net;
@@ -29,6 +30,7 @@ int main() try {
     state.op = strix::SerialOp::gated_delta_net;
     state.writes_state = strix::PersistentState::recurrent_matrix;
     head.op = strix::SerialOp::lm_head;
+    head.execution_identity = 17;
     head.step_id = 1;
     dispatcher.dispatch_kernel(head);
     {
@@ -48,6 +50,18 @@ int main() try {
     delegate.fail = false;
     dispatcher.dispatch_kernel(head);
     require(delegate.head_calls == 3, "intent is restored after a producer exception");
+    for (unsigned mode = 0; mode < 3; ++mode) {
+        auto invalid = head;
+        if (mode == 0) ++invalid.execution_identity;
+        if (mode == 1) ++invalid.logical_rows;
+        if (mode == 2) ++invalid.request_concurrency;
+        bool rejected_context = false;
+        try {
+            strix::GenerationOutputDispatcher::StateOnlyScope intent(dispatcher);
+            dispatcher.dispatch_kernel(invalid);
+        } catch (const std::invalid_argument&) { rejected_context = true; }
+        require(rejected_context, "head omission cannot bypass execution or shape admission");
+    }
     bool rejected = false;
     try {
         strix::GenerationOutputDispatcher::StateOnlyScope intent(dispatcher);

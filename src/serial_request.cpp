@@ -245,6 +245,9 @@ SerialGreedyRequestResult execute_serial_greedy_token_request(
     std::uint32_t next = 0;
     const auto consume = [&](std::uint32_t token) {
         const auto selected = backend.execute_greedy(token, position, request.vocab_size);
+        // A generic backend is responsible for containing its own post-submit
+        // failures. The CLI's resident selector rejects this before returning
+        // and poisons its session on any failure after state consumption.
         if (static_cast<std::uint64_t>(selected) >= request.vocab_size)
             throw std::invalid_argument("greedy backend selected token outside vocabulary");
         return selected;

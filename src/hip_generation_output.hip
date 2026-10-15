@@ -164,10 +164,10 @@ struct HipGreedyOutput::Impl {
         admit(input, vocab, epoch);
         require(counters.calls < std::numeric_limits<std::uint64_t>::max() / 64U,
                 "GPU greedy counters exhausted");
-        check(hipPeekAtLastError(), "GPU greedy preexisting HIP error");
         ++counters.calls;
         pending = true;
         try {
+            check(hipPeekAtLastError(), "GPU greedy preexisting HIP error");
             // Poison the complete device reply before EACH launch. If a stage is
             // accidentally omitted, stale metadata cannot pass current-call checks.
             *host_reply = Reply{~epoch, ~position, 0xffffffffU, 0xffffffffU, ~execution_identity};

@@ -68,7 +68,8 @@ int main() try {
     bool rejected = false;
     try { static_cast<void>(strix::execute_serial_greedy_token_request(request, invalid)); }
     catch (const std::invalid_argument&) { rejected = true; }
-    require(rejected && invalid.calls == 1, "invalid scalar result never reaches a subsequent token step");
+    require(rejected && invalid.calls == 2 && invalid.consumed == std::vector<std::uint32_t>({1, 2}),
+            "invalid scalar result never reaches a generated-token feedback step");
     Tokens unused;
     request.context_capacity = 1;
     rejected = false;

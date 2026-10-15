@@ -37,13 +37,21 @@ change model arithmetic. Automatic kernel-profile selection remains intact;
 the explicit output route has its own receipt identity and is not qualified by
 the historical automatic profile's evidence.
 
-For this mode, per-step elapsed time includes producer completion, GPU selection
-and reply readback. The receipt labels that timing scope and reports completed
-selections, submitted reply bytes and retained output-pool bytes. It is not the
-same timing scope as the old producer-only diagnostic field. No target performance
+For this mode, `generation_step_elapsed_ms_total` and `_per_step` include producer
+completion and selection/readback when requested. Historical producer-only
+`decode_elapsed_ms_*` fields are omitted in this mode. The receipt labels the
+scope and reports vocabulary, calls, failures, kernel submissions, transfer bytes,
+stream completions, omitted heads and requested pool allocation bytes. Host-dispatch telemetry
+does not count the two selection kernels; their submissions have dedicated fields.
+No target performance
 gain is established by the reduced logical D2H payload.
 
 Status: implemented source, not qualified. New compilation, portable/native tests,
 model equivalence and performance campaigns are deferred until the implementation
 stage is complete. Source fixtures cover controller boundaries and full-vocabulary
 GPU selection, including nonfinite rejection, tail sizes and owner generations.
+
+Injected corrupt replies, allocation/launch/copy/drain failures, a device change,
+and the application session's failure paths still need dedicated fault-injection
+fixtures. Same-arena rebinding and all-NaN cases also remain to be added before
+the final test stage. None of these are implied by the existing source fixtures.

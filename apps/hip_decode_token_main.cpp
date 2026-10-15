@@ -222,6 +222,7 @@ public:
             throw std::invalid_argument("state-only prefix differs from live session");
         const auto start = std::chrono::steady_clock::now();
         strix::GenerationOutputDispatcher::StateOnlyScope state_only(*output_dispatcher_);
+        const auto committed_before = session_->committed_tokens;
         try {
             if (execute_override_) execute_override_(input_token);
             else static_cast<void>(strix::execute_serial_token(
@@ -231,8 +232,10 @@ public:
             elapsed_ms_.push_back(std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - start).count());
         } catch (...) {
-            session_->health = strix::SerialSessionHealth::poisoned;
-            session_->arithmetic_lineage.tainted = true;
+            if (session_->committed_tokens != committed_before) {
+                session_->health = strix::SerialSessionHealth::poisoned;
+                session_->arithmetic_lineage.tainted = true;
+            }
             if (recording_drain_) recording_drain_();
             throw;
         }
@@ -247,6 +250,7 @@ public:
             throw std::invalid_argument("scalar greedy request differs from live session");
         if (recording_binding_) recording_binding_();
         const auto start = std::chrono::steady_clock::now();
+        const auto committed_before = session_->committed_tokens;
         try {
             if (execute_override_) execute_override_(input_token);
             else static_cast<void>(strix::execute_serial_token(
@@ -269,8 +273,10 @@ public:
             // allow another token after an output failure. The result owner
             // drains its own work before throwing; retain the original path's
             // producer drain as well.
-            session_->health = strix::SerialSessionHealth::poisoned;
-            session_->arithmetic_lineage.tainted = true;
+            if (session_->committed_tokens != committed_before) {
+                session_->health = strix::SerialSessionHealth::poisoned;
+                session_->arithmetic_lineage.tainted = true;
+            }
             if (recording_drain_) recording_drain_();
             throw;
         }
@@ -1392,7 +1398,7 @@ int main(
             greedy_output = std::make_unique<strix::HipGreedyOutput>(
                 static_cast<std::uint32_t>(model.vocab_size), memory.scratch(),
                 std::static_pointer_cast<const void>(memory_owner),
-                std::make_shared<strix::HipSetupQuiescenceGuard>());
+                original_work_device);
         }
         std::function<void(std::uint32_t, std::uint64_t, std::span<const float>)> greedy_recording;
         if (raw_recording) greedy_recording = [&](std::uint32_t token, std::uint64_t position,
@@ -1438,8 +1444,15 @@ int main(
             const auto stats = greedy_output->stats();
             std::cout << "  \"generation_output_mode\":\"" << strix::gpu_greedy_output_identity << "\",\n"
                 << "  \"generation_output_completed\":" << stats.completed << ",\n"
+                << "  \"generation_output_vocabulary_size\":" << model.vocab_size << ",\n"
+                << "  \"generation_output_calls\":" << stats.calls << ",\n"
+                << "  \"generation_output_failures\":" << stats.failures << ",\n"
+                << "  \"generation_output_kernel_submissions\":" << stats.reduction_kernel_submissions << ",\n"
+                << "  \"generation_output_poison_h2d_bytes\":" << stats.poison_h2d_bytes << ",\n"
+                << "  \"generation_output_stream_completions\":" << stats.stream_completions << ",\n"
+                << "  \"generation_output_full_logits_d2h_bytes\":0,\n"
                 << "  \"generation_output_result_d2h_bytes\":" << stats.result_d2h_bytes << ",\n"
-                << "  \"generation_output_pool_bytes\":" << greedy_output->scratch_bytes() << ",\n"
+                << "  \"generation_output_pool_requested_bytes\":" << greedy_output->scratch_bytes() << ",\n"
                 << "  \"prefill_lm_heads_omitted\":" << output_dispatcher.omitted_heads() << ",\n"
                 << "  \"generation_output_timing_scope\":\"producer-through-selection-and-readback\",\n";
         }
@@ -1503,10 +1516,10 @@ int main(
             << "  \"final_position\": "
             << result.final_position
             << ",\n"
-            << "  \"decode_elapsed_ms_total\": "
+            << (greedy_output ? "  \"generation_step_elapsed_ms_total\": " : "  \"decode_elapsed_ms_total\": ")
             << elapsed_total
             << ",\n"
-            << "  \"decode_elapsed_ms_per_step\": "
+            << (greedy_output ? "  \"generation_step_elapsed_ms_per_step\": " : "  \"decode_elapsed_ms_per_step\": ")
             << (backend.elapsed_ms().empty()
                     ? 0.0
                     : elapsed_total /

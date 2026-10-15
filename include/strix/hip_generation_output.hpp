@@ -50,6 +50,8 @@ public:
     [[nodiscard]] bool failed() const noexcept;
     // Total retained payload bytes: device partials + device reply + pinned host
     // reply. Excludes allocator/runtime overhead, which is not observed here.
+    // Requested allocation sizes, including the pinned reply; driver allocation
+    // granularity and stream bookkeeping are not a measured physical peak.
     [[nodiscard]] std::uint64_t scratch_bytes() const noexcept;
 private:
     struct Impl;
