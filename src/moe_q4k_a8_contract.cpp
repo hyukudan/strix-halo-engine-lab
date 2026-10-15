@@ -1,4 +1,7 @@
 #include "strix/moe_q4k_a8_contract.hpp"
+#if defined(__FAST_MATH__) || (defined(__FINITE_MATH_ONLY__) && __FINITE_MATH_ONLY__)
+#error "Q4K A8G32 requires nonfinite checks and strict floating-point semantics"
+#endif
 #include <algorithm>
 #include <array>
 #include <bit>

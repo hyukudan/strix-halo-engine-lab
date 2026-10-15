@@ -1,4 +1,7 @@
 #include "strix/hip_moe_q4k_a8_probe.hpp"
+#if defined(__FAST_MATH__) || (defined(__FINITE_MATH_ONLY__) && __FINITE_MATH_ONLY__)
+#error "Q4K A8G32 requires nonfinite checks and strict floating-point semantics"
+#endif
 #include <hip/hip_fp16.h>
 #include <cmath>
 #include <stdexcept>
@@ -14,11 +17,12 @@
 #endif
 namespace strix::moe_q4k_a8 {
 namespace {
-// Core10.1 __fdiv_rn falls back to plain / without OCML_BASIC_ROUNDED_OPERATIONS.
-// Use the actual declared rounded entry point; link/IR/ISA qualification is mandatory.
-__device__ float divide_rne(float a, float b) { return __ocml_div_rte_f32(a,b); }
+// Explicit target option -fhip-fp32-correctly-rounded-divide-sqrt is mandatory.
+// The available compiler lowers /; the declared OCML rte entry point did not link.
+// Actual IR/ISA, denormal modes and independent device RN oracles remain required.
+__device__ float divide_rne(float a, float b) { return a/b; }
 __device__ int dot(int a, unsigned b, int acc) {
-    return __builtin_amdgcn_sudot4(true,a,false,b,acc,false);
+    return __builtin_amdgcn_sudot4(true,a,false,static_cast<int>(b),acc,false);
 }
 __device__ unsigned factor(uint4 header, unsigned group, bool minimum) {
     const unsigned shift = 8U*(group&3U);
@@ -47,14 +51,14 @@ __global__ void quantize(const void* input, unsigned hidden, signed char* codes,
         else x=static_cast<const float*>(input)[i];
         if(!isfinite(x)) {atomicOr(&bad,nonfinite_activation);x=0.0F;}
         float a=fabsf(x);
-        for(unsigned stride=16;stride!=0;stride/=2U) a=fmaxf(a,__shfl_xor(a,stride,32));
+        for(int stride=16;stride!=0;stride/=2) a=fmaxf(a,__shfl_xor(a,stride,32));
         float delta=a==0.0F?1.0F:divide_rne(a,127.0F);
         if(!(delta>0.0F) || !isfinite(delta)) {atomicOr(&bad,invalid_delta);delta=1.0F;}
         const float rounded=rintf(divide_rne(x,delta));
         const int code=static_cast<int>(fminf(127.0F,fmaxf(-127.0F,rounded)));
         local_codes[i]=static_cast<signed char>(code);
         int sum=code;
-        for(unsigned stride=16;stride!=0;stride/=2U) sum+=__shfl_xor(sum,stride,32);
+        for(int stride=16;stride!=0;stride/=2) sum+=__shfl_xor(sum,stride,32);
         if(lane==0) {local_deltas[group]=delta;local_sums[group]=sum;}
     }
     __syncthreads();
@@ -120,6 +124,7 @@ void check(hipError_t error,const char* operation) {
 }
 void enqueue_probe(const Request& request,const Bindings& b,hipStream_t stream) {
     validate(request,b);
+    check(hipPeekAtLastError(),"Q4K A8 pre-enqueue stale error");
     auto* status=reinterpret_cast<unsigned*>(b.status.address);
     const auto* routes=reinterpret_cast<const unsigned*>(b.routes.address);
     validate_routes<<<1,32,0,stream>>>(routes,request.shape.top_k,request.shape.experts,status);

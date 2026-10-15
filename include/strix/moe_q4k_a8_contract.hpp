@@ -8,7 +8,7 @@
 namespace strix::moe_q4k_a8 {
 inline constexpr std::uint32_t max_hidden = 2560, max_rows = 640, max_experts = 512, max_top_k = 10;
 inline constexpr std::string_view numerical_identity =
-    "strix-moe-q4k-a8g32-probe-v1:f32-div-rne:g32-sym127-zero1-finite-noflush:"
+    "strix-moe-q4k-a8g32-probe-v2:f32-div-rne:g32-sym127-zero1-finite-noflush:"
     "dot-s8xu8-i32:combine-separate-f32:pair-ascending-sb-tree4:writer-c0:wave32:proj-nonfinite=propagate-unqualified";
 struct QuantizedRow {
     std::vector<std::int8_t> codes;

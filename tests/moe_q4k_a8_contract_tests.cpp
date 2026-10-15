@@ -37,12 +37,32 @@ void tests(bool exhaustive) {
     expect(std::fesetround(original_round)==0,"test restored rounding mode");
     expect(wrong_round_rejected,"non-nearest host environment rejected before arithmetic");
     std::mt19937 random(0x4a832U);
+    bool reciprocal_mutant_detected=false;
     for (unsigned trial = 0; trial < 100000; ++trial) {
         const auto a = static_cast<std::uint32_t>(random()&0x7fffffffU), b = static_cast<std::uint32_t>(random()&0x7fffffffU);
         if (a >= 0x7f800000U || b == 0 || b >= 0x7f800000U) continue;
         const float x = std::bit_cast<float>(a), y = std::bit_cast<float>(b);
         volatile float quotient = x/y;
+        volatile float reciprocal=1.0F/y;volatile float product=x*reciprocal;
+        if(std::isfinite(quotient) && std::isfinite(reciprocal) && std::isfinite(product) && quotient!=0 && product!=0 && reciprocal!=0)
+            reciprocal_mutant_detected|=bits(quotient)!=bits(product);
         expect(q4k_a8_oracle::divide(a,b) == bits(quotient),"exact rational division agrees with independently executed binary32 hardware");
+    }
+    expect(reciprocal_mutant_detected,"finite reciprocal-multiply division mutant actually detected");
+    // Wide-exponent activation/quantization boundary sweep; includes delta underflow.
+    for(unsigned trial=0;trial<1000U;++trial) {
+        const unsigned maximum=1U+static_cast<unsigned>(random()%0x7f7fffffU);
+        const float amax=std::bit_cast<float>(maximum);
+        const auto dbits=q4k_a8_oracle::divide(maximum,0x42fe0000U);
+        std::vector<float> sweep(32);sweep[0]=amax;
+        if(dbits==0) {reject_quant(sweep);continue;}
+        const float delta=std::bit_cast<float>(dbits);
+        for(unsigned lane=1;lane<32U;++lane) {
+            const float boundary=delta*(static_cast<float>(lane)+0.5F);
+            sweep[lane]=std::min(amax,std::nextafter(boundary,(lane&1U)?0.0F:amax));
+            if(lane&2U) sweep[lane]=-sweep[lane];
+        }
+        check_quant(sweep);
     }
     std::vector<float> values(32,0.0F); check_quant(values);
     std::fill(values.begin(),values.end(),-0.0F); check_quant(values);
@@ -104,7 +124,7 @@ void tests(bool exhaustive) {
                 expect(a.scale == static_cast<unsigned>(b.first) && a.minimum == static_cast<unsigned>(b.second),"exhaustive byte-triple decoder");
             }
         }
-    std::array<bool,7> detected{};
+    std::array<bool,13> detected{};
     for (const unsigned width : {256U,512U,2560U}) for (unsigned trial = 0; trial < 100; ++trial) {
         values.resize(width);
         for (auto& x : values) x = std::ldexp(static_cast<float>(static_cast<int>(random()%255U)-127),static_cast<int>(random()%15U)-8);
@@ -112,8 +132,8 @@ void tests(bool exhaustive) {
         std::vector<std::byte> weights(width/256U*144U);
         for (auto& x : weights) x = static_cast<std::byte>(random()&255U);
         for (unsigned block = 0; block < width/256U; ++block) {
-            const std::uint16_t d = static_cast<std::uint16_t>(0x2000U+(random()%0x2c00U));
-            const std::uint16_t dm = static_cast<std::uint16_t>(0x1800U+(random()%0x2800U));
+            const std::array<std::uint16_t,10> headers{0,0x8000,1,0x8001,0x03ff,0x83ff,0x3c00,0xbc00,0x7bff,0xfbff};
+            const auto d=headers[random()%headers.size()],dm=headers[random()%headers.size()];
             weights[block*144U] = static_cast<std::byte>(d&255U); weights[block*144U+1U] = static_cast<std::byte>(d>>8U);
             weights[block*144U+2U] = static_cast<std::byte>(dm&255U); weights[block*144U+3U] = static_cast<std::byte>(dm>>8U);
         }
@@ -127,7 +147,7 @@ void tests(bool exhaustive) {
             if (mutation == 3) { auto x = values; x[1] *= -1; a = quantize_f32(x); }
             detected[mutation] = detected[mutation] || bits(q4k_a8_oracle::row(w,a)) != expected;
         }
-        const std::array mutations{q4k_a8_oracle::Mutation::fused,q4k_a8_oracle::Mutation::reverse_blocks,q4k_a8_oracle::Mutation::wrong_tree};
+        const std::array mutations{q4k_a8_oracle::Mutation::fused,q4k_a8_oracle::Mutation::reverse_blocks,q4k_a8_oracle::Mutation::wrong_tree,q4k_a8_oracle::Mutation::nibble_swap,q4k_a8_oracle::Mutation::hp_swap,q4k_a8_oracle::Mutation::header_swap,q4k_a8_oracle::Mutation::factor_swap,q4k_a8_oracle::Mutation::unsigned_a,q4k_a8_oracle::Mutation::missing_xor4};
         for (unsigned m = 0; m < mutations.size(); ++m)
             detected[m+4U] = detected[m+4U] || bits(q4k_a8_oracle::row(weights,quantized,mutations[m])) != expected;
         std::array<std::uint8_t,32> q{},a_bytes{},biased{}; std::array<std::int8_t,32> a{};
@@ -145,13 +165,27 @@ void tests(bool exhaustive) {
         expect(strix::low_precision::correct_dot(raw_biased,sumq,suma,32,0,127) == integers.raw,"unsigned bias127 correction exact");
     }
     expect(std::all_of(detected.begin(),detected.end(),[](bool x){return x;}),"all packed/activation/FMA/order mutants detected");
+    std::vector<float> zero_values(256,0.0F);const auto zero_quant=quantize_f32(zero_values);
+    std::vector<std::byte> zero_weights(144,std::byte{0xff});
+    zero_weights[0]=std::byte{0};zero_weights[1]=std::byte{0xbc};zero_weights[2]=std::byte{0};zero_weights[3]=std::byte{0};
+    expect(bits(evaluate_row(zero_weights,zero_quant))==0 &&
+        bits(q4k_a8_oracle::row(zero_weights,zero_quant,q4k_a8_oracle::Mutation::negative_zero_seed))==0x80000000U,
+        "negative zero seed mutant detected through full qualified combine tree");
     // Pure admission: default disabled, wrong approval, dtype, C>1 and bad views reject before any HIP call.
     Request request; request.enabled = true; request.approved_numerical_identity = numerical_identity;
     Bindings b; std::array<DeviceBytes*,9> fields{&b.input,&b.gate,&b.up,&b.routes,&b.codes,&b.deltas,&b.sums,&b.status,&b.output};
     const std::array<std::uint64_t,9> lengths{512,4608,4608,4,256,32,32,4,256};
     for (unsigned i = 0; i < fields.size(); ++i) *fields[i] = {0x10000ULL+i*0x10000ULL,lengths[i]};
     validate(request,b);
-    for (unsigned change = 0; change < 8; ++change) {
+    auto f32=request;f32.input=InputKind::fp32;auto f32b=b;f32b.input.bytes=1024;validate(f32,f32b);
+    auto alias=b;alias.input.address=alias.routes.address;validate(request,alias);
+    alias=b;alias.routes.address=alias.gate.address;validate(request,alias);
+    Request maximum=request;maximum.input=InputKind::fp32;maximum.shape={2560,640,512,10,1};
+    Bindings large;std::array<DeviceBytes*,9> large_fields{&large.input,&large.gate,&large.up,&large.routes,&large.codes,&large.deltas,&large.sums,&large.status,&large.output};
+    const std::array<std::uint64_t,9> large_lengths{10240,471859200,471859200,40,2560,320,320,4,51200};
+    for(unsigned i=0;i<large_fields.size();++i) *large_fields[i]={0x100000000ULL*(i+1U),large_lengths[i]};
+    validate(maximum,large);
+    for (unsigned change = 0; change < 25; ++change) {
         auto q = request; auto v = b;
         if (change == 0) q.enabled = false;
         if (change == 1) q.approved_numerical_identity = "wrong";
@@ -161,7 +195,28 @@ void tests(bool exhaustive) {
         if (change == 5) v.gate.address += 1;
         if (change == 6) --v.output.bytes;
         if (change == 7) v.codes.address = v.output.address;
-        bool rejected = false; try { validate(q,v); } catch (const std::invalid_argument&) { rejected = true; }
+        if (change == 8) q.shape.hidden=0;
+        if (change == 9) q.shape.hidden=257;
+        if (change == 10) q.shape.hidden=2816;
+        if (change == 11) q.shape.rows=0;
+        if (change == 12) q.shape.rows=31;
+        if (change == 13) q.shape.rows=672;
+        if (change == 14) q.shape.experts=0;
+        if (change == 15) q.shape.experts=513;
+        if (change == 16) q.shape.top_k=0;
+        if (change == 17) q.shape.top_k=11;
+        if (change == 18) q.input=static_cast<InputKind>(99);
+        if (change == 19) ++v.gate.bytes;
+        if (change == 20) --v.routes.bytes;
+        if (change == 21) v.codes.address=std::numeric_limits<std::uintptr_t>::max()-15U;
+        if (change == 22) v.up=v.gate;
+        if (change == 23) v.input.address=v.codes.address;
+        if (change == 24) v.status.address+=4;
+        bool rejected = false; try { validate(q,v); } catch (const std::invalid_argument& error) {
+            rejected = true;
+            if(change>=8 && change<=17) expect(std::string_view(error.what()).find("bounded C1 dimensions")!=std::string_view::npos,
+                "invalid dimensions must reject at dimension gate before incidental byte mismatch");
+        }
         expect(rejected,"invalid probe admission fails before enqueue");
     }
 }

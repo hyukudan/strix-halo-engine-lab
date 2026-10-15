@@ -87,24 +87,32 @@ inline std::pair<int,int> factors(std::span<const std::byte> packed, unsigned gr
 inline float mul(float a,float b) { volatile float value = a*b; return value; }
 inline float add(float a,float b) { volatile float value = a+b; return value; }
 inline float sub(float a,float b) { volatile float value = a-b; return value; }
-enum class Mutation { none, fused, reverse_blocks, wrong_tree };
+enum class Mutation { none, fused, reverse_blocks, wrong_tree, nibble_swap, hp_swap, header_swap, factor_swap, unsigned_a, missing_xor4, negative_zero_seed };
 inline float row(std::span<const std::byte> weights, const strix::moe_q4k_a8::QuantizedRow& a, Mutation mutation = Mutation::none) {
     std::array<float,4> accum{};
+    if(mutation==Mutation::negative_zero_seed) accum.fill(-0.0F);
     for (std::size_t iteration = 0; iteration < a.codes.size()/256U; ++iteration) {
         const auto block = mutation == Mutation::reverse_blocks ? a.codes.size()/256U-1U-iteration : iteration;
         std::array<float,8> contributions{};
         const auto bytes = weights.subspan(block*144U,144U);
         const auto at = [&](unsigned i) { return std::to_integer<unsigned char>(bytes[i]); };
-        const float d = half(static_cast<std::uint16_t>(at(0)|(static_cast<unsigned>(at(1))<<8U)));
-        const float dm = half(static_cast<std::uint16_t>(at(2)|(static_cast<unsigned>(at(3))<<8U)));
+        float d = half(static_cast<std::uint16_t>(at(0)|(static_cast<unsigned>(at(1))<<8U)));
+        float dm = half(static_cast<std::uint16_t>(at(2)|(static_cast<unsigned>(at(3))<<8U)));
+        if(mutation==Mutation::header_swap) std::swap(d,dm);
         if (!std::isfinite(d) || !std::isfinite(dm)) throw std::invalid_argument("oracle nonfinite header");
         for (unsigned j = 0; j < 8; ++j) {
             std::int64_t dot = 0, sum = 0;
             for (unsigned l = 0; l < 32; ++l) {
-                const auto packed = at(16U+(j/2U)*32U+l); const int q = j&1U ? packed>>4U : packed&15U;
-                const int code = a.codes[block*256U+j*32U+l]; dot += q*code; sum += code;
+                const unsigned pair=j/2U,half=l/16U;
+                const unsigned index=mutation==Mutation::hp_swap ? ((pair&2U)|half)*32U+(pair&1U)*16U+(l&15U) : pair*32U+l;
+                const auto packed = at(16U+index);
+                const unsigned selector=mutation==Mutation::nibble_swap ? (j^1U) : j;
+                const int q = selector&1U ? packed>>4U : packed&15U;
+                const int code = a.codes[block*256U+j*32U+l];
+                dot += q*(mutation==Mutation::unsigned_a?static_cast<unsigned char>(code):code); sum += code;
             }
-            const auto [scale,minimum] = factors(bytes.subspan(4,12),j);
+            auto [scale,minimum] = factors(bytes.subspan(4,12),j);
+            if(mutation==Mutation::factor_swap) std::swap(scale,minimum);
             const float i = static_cast<float>(scale*dot), k = static_cast<float>(minimum*sum);
             const float t = mutation == Mutation::fused ? std::fma(d,i,-mul(dm,k)) : sub(mul(d,i),mul(dm,k));
             contributions[j] = mul(a.deltas[block*8U+j],t);
@@ -112,7 +120,7 @@ inline float row(std::span<const std::byte> weights, const strix::moe_q4k_a8::Qu
         for (unsigned pair = 0; pair < 4; ++pair)
             accum[pair] = add(accum[pair],add(contributions[pair*2U],contributions[pair*2U+1U]));
     }
-    const float value = mutation == Mutation::wrong_tree ? add(add(accum[0],accum[2]),add(accum[1],accum[3])) :
+    const float value = mutation==Mutation::missing_xor4 ? add(accum[0],accum[1]) : mutation == Mutation::wrong_tree ? add(add(accum[0],accum[2]),add(accum[1],accum[3])) :
         add(add(accum[0],accum[1]),add(accum[2],accum[3]));
     if (!std::isfinite(value)) throw std::invalid_argument("oracle combine overflow");
     return value;
