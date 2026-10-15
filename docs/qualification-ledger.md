@@ -6,8 +6,8 @@ portable fixtures, declarations or offline compilation to native qualification.
 
 | Area | Available implementation and checks | Required target evidence |
 | --- | --- | --- |
-| Wave router top-k | Low-level OFF in manual selection; content-bound auto v3 candidate selects wave with HC output, QSA, shared-expert prefetch and deferred status; historical host evidence: distinct parallel wave selection and identities; WSL GNU13.3 Release HIP-OFF152/152 tests,6864 independent host insertion/wave cases; typed poisoned eager/captured device fixtures supplied | Individual canonical source/native/ISA, full554 equality, generated512 identity and descriptive paired measurements are observed; wider workloads, stronger timing evidence and the automatic v3 combination remain separate gates |
-| Deferred eager MoE status | Low-level/manual OFF; included by the auto v3 candidate after admission; C1 first-error domain/full bits, owned completion stream, prepublication session hook and transactional host histories; shared host/device first-error helper, exact admission and portable middle-layer/fence/host-precedence tests | HIP compilation, native invalid-route/status fixtures, complete-model array equality and preparation-inclusive token latency, plus the automatic v3 combination gates |
+| Wave router top-k | Low-level OFF in manual selection; content-bound adopted auto v3 profile selects wave with HC output, QSA, shared-expert prefetch and deferred status; historical host evidence: distinct parallel wave selection and identities; WSL GNU13.3 Release HIP-OFF152/152 tests,6864 independent host insertion/wave cases; typed poisoned eager/captured device fixtures supplied | Individual canonical source/native/ISA, full554 equality, generated512 identity and descriptive paired measurements are observed; wider workloads, stronger timing evidence and other model/context combinations remain separate gates |
+| Deferred eager MoE status | Low-level/manual OFF; included by the adopted auto v3 profile after admission; C1 first-error domain/full bits, owned completion stream, prepublication session hook and transactional host histories; shared host/device first-error helper, exact admission and portable middle-layer/fence/host-precedence tests | HIP compilation, native invalid-route/status fixtures, complete-model array equality and preparation-inclusive token latency, outside the qualified v3 slice; see the adoption record below |
 | Memory/model contracts | Checked physical-pool accounting, GGUF metadata, tensor/runtime bindings and admission | Complete canonical checkpoint ownership and observed physical peak |
 | Model execution | Portable semantic oracles, compiled serial runtime seams and experimental HIP implementation | Full-model tensor coverage, logits/tokens/state fidelity on gfx1151 |
 | Low precision | Integer/affine/codebook references, bounded packed staging, opt-in Wave32 IU8/IU4 launcher and actual tiled LM-head runtime adapter with exact IEEE widening and atomic full-output publication | Native fragment correctness, preparation-inclusive projection costs and full-model quality; integer LM-head is eager C1 only |
@@ -20,11 +20,11 @@ portable fixtures, declarations or offline compilation to native qualification.
 | Prefix lineage | Actual serial completion history, complete chunk/row provenance, mismatch cache misses and failure taint | Qualified chunked-prefill/verify histories and native fresh/resumed state correspondence |
 | Graph eligibility | Separate fixed C1 graph topology, complete device-input embedding/PLE/GDN/indexed attention, owned capture/replay lifecycle and whole-DAG native fixtures compiled offline | Full-model native logits/state fidelity, actual graph memory and preparation-inclusive latency; eager plans remain distinct |
 | Host staging | Event-owned source pool and opt-in HIP PLE consumer, bounded bytes/progress, stale ticket/binding rejection and retained failure ownership | Native event/visibility/lifetime proof and preparation-inclusive benefit; destination lifetime is caller-owned |
-| Q8 indexed-attention input prefetch | Low-level/manual OFF; included by the auto v3 candidate after admission; per-matrix eligibility, mixed-layer IDs, host planning tests, actual-dispatch receipts, poisoned standalone/full-operator fixtures and zero-node failure checks | Linked legacy ISA stability, candidate ISA/descriptors, execution of the new native fixtures, full-model exactness and measured workload benefit, plus the automatic v3 combination gates |
+| Q8 indexed-attention input prefetch | Low-level/manual OFF; included by the adopted auto v3 profile after admission; per-matrix eligibility, mixed-layer IDs, host planning tests, actual-dispatch receipts, poisoned standalone/full-operator fixtures and zero-node failure checks | Linked legacy ISA stability, candidate ISA/descriptors, execution of the new native fixtures, full-model exactness and measured workload benefit, outside the qualified v3 slice; see the adoption record below |
 | Projection reduction | Fixed-tree shuffle-tail candidate, host sensitivity controls and experimental operator HIP graph replay | Native exact fixtures and end-to-end quality/performance; no measured gain yet |
 | Campaign preparation and capture | Private full-kernel/module staging, guarded observations, imported-pool reuse and paired commissioning, eager/graph/integer RAW recording and actual same-plan prefix restoration with full-state/lineage import checks | Reviewed target boot/configuration, actual paired transfers, observed tokenizer/source bindings and independent model references; schedule completion does not prove physical DMA overlap |
-| Lane-chain HC output | Explicit in manual mode; selected by the content-bound auto policy; historical source increment: pure metadata admission and per-step base fallback, exact ordered-chain source and poison/graph fixtures; see [implementation](implementation-2026-10-15-lane-chain-hyper-output.md) | Isolated canonical source/native/fidelity and paired workload gates passed; combined automatic v3 candidate (wave/QSA/HC/shared/deferred) review, native/model fidelity and paired timing remain open |
-| Q8 shared-expert gate/up/down prefetch | Low-level/manual OFF; included by the auto v3 candidate after admission; per-tensor/layer selection, distinct IDs, original device definitions preserved, limited host planning tests, standalone and full-operator poison/graph fixtures, actual host submission count | Native HIP compilation, linked legacy ISA and candidate FP/arithmetic/resource descriptors, new device fixture execution, full-model exactness, paired complete-workload benefit, plus the automatic v3 combination gates |
+| Lane-chain HC output | Explicit in manual mode; selected by the content-bound auto policy; historical source increment: pure metadata admission and per-step base fallback, exact ordered-chain source and poison/graph fixtures; see [implementation](implementation-2026-10-15-lane-chain-hyper-output.md) | Isolated canonical source/native/fidelity and paired workload gates passed; combined automatic v3 (wave/QSA/HC/shared/deferred) qualified on the canonical slice; wider workloads remain open |
+| Q8 shared-expert gate/up/down prefetch | Low-level/manual OFF; included by the adopted auto v3 profile after admission; per-tensor/layer selection, distinct IDs, original device definitions preserved, limited host planning tests, standalone and full-operator poison/graph fixtures, actual host submission count | Native HIP compilation, linked legacy ISA and candidate FP/arithmetic/resource descriptors, new device fixture execution, full-model exactness, paired complete-workload benefit, outside the qualified v3 slice; see the adoption record below |
 | Exact HC projection prototype | Diagnostic-only OPW8/16/32 with P1/P2, original payloads, ordered chains and same-input poison/event fixtures | Source review, actual HIP/ISA no-spill/scalar-load checks, device exactness and real captured-input microbench; no decoder integration yet |
 
 A historical strict Release integration passed 143 portable CTest entries.
@@ -60,26 +60,43 @@ CTest entries. This includes combined mixed-mode selection, base identity and
 deferred graph rejection. Host syntax checks with private HIP declarations passed;
 these do not establish native HIP compilation or execution. See
 [the draft integration record](implementation-2026-10-15-spec-v1-draft-integration.md).
-Combined review, actual native ISA/fixtures, model fidelity and paired timing remain
-pending; earlier historical checks above retain their original scope.
+At this historical checkpoint combined review, native ISA/fixtures, model fidelity
+and paired timing were pending. The qualified adoption below supersedes that status
+for its explicit slice; earlier checks retain their original scope.
 
 Automatic decoder policy follow-up: the application now proposes a content-bound
 qualified eager/register profile and a manual A/B override. The actual parser and
 resolver are portable-tested for model/content/mode/context/build capability,
-explicit overrides and reasoned fallback. This policy source still requires review
+explicit overrides and reasoned fallback. The initial policy checkpoint required review
 and fresh integrated native qualification; see
 [the policy contract](decode-optimization-profile.md). The earlier default-off
 integration result records its original revision and scope.
 
-Current automatic-policy checkpoint: the preceding integrated source completed
+Historical automatic-policy checkpoint: the preceding integrated source completed
 225/225 actual native regression tests with no failures/skips, and preserved 225
 legacy kernels under the linked restricted ISA comparison. A1 wave and C1 HC output
 also have separate full554 array equality, generated512 identity and descriptive
-paired workload observations. None of these statements establishes joint automatic
-profile fidelity or speed, and the individual gains must not be added.
+paired workload observations. These preceding observations did not establish joint
+automatic profile fidelity or speed; the later direct combination gates are recorded below. Individual gains
+are not added.
 
 The host compatibility follow-up retains automatic selection with no optimization
 flags, preserves old explicit options unless auto is explicitly requested, validates
 roundtrip capacity after profile resolution, and escapes QSA tensor names in JSON.
-Its changed host source requires fresh review/native checks. Joint full554,
-automatic generated512 and paired combination measurements remain pending.
+At that checkpoint changed host source required fresh review/native checks. Those
+joint full554, automatic generated512 and paired gates subsequently passed for
+the adopted revision below.
+
+## Adopted canonical automatic v3
+
+The exact source `265fd78762884d18eb32aa60294408f080088d52` is now primary.
+Its own checks passed: 225 native tests, 14 linked modules/245 preserved kernels,
+seven actual CLI cases, all 554 complete reference logit arrays and all 512 immutable
+generated IDs in each of eight clean automatic runs. The same-node three-pair
+descriptive result was +25.99% against the preserved baseline; an independent
+three-pair comparison was +15.55% against the preceding automatic wave+HC profile.
+No individual gains were added. See the [profile adoption record](decode-optimization-profile.md#qualified-adoption-2026-10-15)
+for exact source/archive, timings, counters and limits. Low-level manual defaults
+remain OFF; other models, contexts, graph/speculative modes and projection
+prototypes are not admitted by these observations. This records source adoption,
+not remote binary deployment.

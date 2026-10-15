@@ -610,3 +610,16 @@ Still pending on native hosts:
 - native execution of the repeated ring stop/re-arm/first-completion gate against the real imported-ring backend;
 - 1×USB4 versus 2×USB4 completed-GPU-operation measurements;
 - independent-flow, directional, role-specialized and striped dual-link qualification.
+
+## Canonical automatic v3 source adoption (2026-10-15)
+
+Primary source `265fd78762884d18eb32aa60294408f080088d52` now selects the
+content-admitted all-five automatic profile. Native225, 14-module/245-kernel
+preservation, seven actual CLI cases, full554 arrays and all 512 generated IDs
+passed. Separate descriptive three-pair campaigns measured +25.99% over the
+preserved baseline and +15.55% over the preceding automatic profile on the same
+execution host. These are limited workload observations, not additive gains or
+statistical significance. See E-056 and
+[the adoption record](docs/decode-optimization-profile.md#qualified-adoption-2026-10-15).
+Earlier status entries retain their historical revision and scope. Source
+adoption does not imply remote binary deployment.

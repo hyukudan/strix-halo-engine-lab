@@ -4,8 +4,8 @@ This branch combines the wave router, Q8 indexed-attention input prefetch,
 lane-chain HC output, deferred MoE status and Q8 shared-expert prefetch increments.
 This initial integration preserved all low-level modes OFF by default. The later
 [automatic profile policy](decode-optimization-profile.md) selects a content-bound
-v3 candidate with wave, QSA, HC output, shared-expert prefetch and deferred status
-after exact content/mode admission, pending its own qualification; manual mode preserves the
+v3 profile with wave, QSA, HC output, shared-expert prefetch and deferred status
+after exact content/mode admission; its later qualification is linked below. Manual mode preserves the
 original explicit configuration. The independent HC whole-projection
 prototype is diagnostic only and adds no decoder command-line selection.
 
@@ -33,9 +33,14 @@ Observed integration checks:
   plus the frozen increments' device/global bodies, remain literal matches after
   line-ending normalization. This is a source preservation check, not linked ISA.
 
-The integrated source remains a draft. It requires review of the combined changes,
+At this initial checkpoint the integrated source was a draft requiring review of the combined changes,
 actual HIP compilation and linked legacy/candidate ISA, execution of native fixtures,
 full-model array/token fidelity and paired preparation-inclusive workload timing.
 Portable success does not establish compiler equivalence, GPU exactness or benefit.
-No source-level result in this document qualifies a default change or performance
-claim. Private review and comparative evidence remain outside Git.
+These historical source-level checks alone did not qualify a default change or
+performance claim. The later source `265fd78762884d18eb32aa60294408f080088d52`
+passed its own native225, 14-module/245-kernel preservation, seven CLI cases,
+full554-array and clean generated512 gates and was adopted as primary. Its paired
+workload observations and limits are in the
+[automatic profile adoption record](decode-optimization-profile.md#qualified-adoption-2026-10-15).
+Detailed private evidence remains outside Git.

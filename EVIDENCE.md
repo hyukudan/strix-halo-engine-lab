@@ -170,7 +170,7 @@ nonfinite case also tests a distinct NaN scalar gate during graph replays.
 
 Diagnostic source: `src/hip_hyper_mix_launcher.hip`, `tests/hip_lane_chain_hyper_projection_tests.hip`, and its implementation document. HIP target `strix-hip-lane-chain-hyper-projection-tests` runs synthetic exactness checks; `--bench` records real-payload event pairs using an externally bound normalized capture. Required environment is actual gfx1151 with the original TU compiler settings; compiler/ISA and device results are pending. Source staging sizes are not measured occupancy or throughput.
 
-## Automatic decoder policy evidence (2026-10-15)
+## Historical automatic decoder policy preparation (2026-10-15)
 
 The actual application parser and resolver are exercised by
 `tests/decode_optimization_profile_tests.cpp` with A8 capability present and absent.
@@ -207,3 +207,36 @@ under GNU 13.3/WSL Release, HIP OFF, with warnings as errors. This observation
 covers host policy and compatibility only. Documentation-only follow-ups preserve
 that tested code; native, full-model fidelity and clean automatic workload gates
 remain separate. Manual bundle observations do not by themselves qualify v3 auto.
+
+## E-056 (2026-10-15): canonical automatic v3 qualified and adopted
+
+Exact source `265fd78762884d18eb32aa60294408f080088d52`, archive SHA-256
+`f0c87566c37fa5ca2e76caacd02c5af94a0080bb3b08911d377e7058a90db155`,
+passed native 225/225 with no failures/skips, 14-module diagnostic linkage,
+245-kernel compiled preservation and seven actual CLI cases. The complete 554
+FP32 logit arrays match the preserved canonical reference. All eight clean
+automatic runs match all 512 immutable generated IDs. These close the preceding
+automatic-policy pending gates only for the admitted canonical content, eager
+registered execution and context 8192. They do not assert universal checkpoint
+quality, all hidden-state equality or other execution-mode qualification.
+
+Two separate same-node campaigns each retained two warmups and three alternating
+pairs. Against the immutable baseline, the median paired ratio was 1.2599223
+(+25.99%), with wall-rate medians 12.1007 and 15.2520 tokens/s. Against the preceding
+automatic wave+HC bundle, both arms used clean automatic selection and the
+median ratio was 1.1555118 (+15.55%), with wall-rate medians 13.1692 and 15.2226.
+The latter used an explicitly foreign-compiled baseline revalidated on the actual
+execution host. Both comparisons matched every 512-token vector, metadata and
+actual HIP/HSA mappings; owners/processes were reaped, shared locks released and
+input/source/model pins unchanged. All outliers remain included. The prescribed
+3/6/10 descriptive screen stopped at 3; no significance, universal performance or
+additive-gain claim follows. Host timing instrumentation is explicit and retained
+the same14 device modules as each clean application.
+
+The actual full554 receipts report 19,944 QSA and 79,776 shared projection host
+submissions plus 554 deferred-owner completions. These are not invented layer or
+replay counters. The primary source now equals that exact qualified revision;
+this observation does not assert deployment of a remote user binary. Detailed
+receipts and original comparative inputs remain outside Git. See the
+[profile adoption record](docs/decode-optimization-profile.md#qualified-adoption-2026-10-15)
+for the model identity, fallback policy, measurement scope and remaining gates.

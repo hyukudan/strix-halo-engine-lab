@@ -1,9 +1,17 @@
 # Deferred eager MoE status
 
+Current status: this mode is included in the adopted canonical automatic v3
+profile at source `265fd78762884d18eb32aa60294408f080088d52`. Its combined
+native, complete554-array, generated512 and descriptive workload gates passed;
+see the [qualified adoption](decode-optimization-profile.md#qualified-adoption-2026-10-15)
+for scope and limits. The source-increment and fixture observations below retain
+their historical scope; their earlier pending gates are closed only for this
+qualified content/context/execution slice. Low-level manual selection stays explicit.
+
 `strix-hip-decode-token --deferred-moe-status` selects an experimental eager C1
 completion policy. Low-level and manual defaults are disabled. The
-[automatic profile candidate](decode-optimization-profile.md) includes this policy
-after content and execution admission, pending its own workload qualification.
+[automatic profile](decode-optimization-profile.md) includes this policy
+after content and execution admission, within its qualified workload slice.
 The completion policy rejects graph execution,
 speculative verification and the separate integer LM-head stream. Each affected
 MoE kernel ID includes `.deferred-status-v1`; implementation and compiled execution

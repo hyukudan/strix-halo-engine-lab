@@ -1,10 +1,18 @@
 # Experimental exact lane-chain HC output
 
+Current status: this mode is included in the adopted canonical automatic v3
+profile at source `265fd78762884d18eb32aa60294408f080088d52`. Its combined
+native, complete554-array, generated512 and descriptive workload gates passed;
+see the [qualified adoption](decode-optimization-profile.md#qualified-adoption-2026-10-15)
+for scope and limits. The source-increment and fixture observations below retain
+their historical scope; their earlier pending gates are closed only for this
+qualified content/context/execution slice. Low-level manual selection stays explicit.
+
 The low-level `--lane-chain-hyper-output` flag remains OFF in
 `--optimization-profile manual` unless explicitly requested, and requires `--prefetch-q8-hyper-output` and its typed fused staged parallel prerequisites. It replaces only eligible HC output steps. Original normalization, low projection and injection remain unchanged. The content-bound [automatic decoder policy](decode-optimization-profile.md) now
 selects it with no low-level flags for the admitted eager/register checkpoint
-and context as part of the complete v3 candidate bundle described in that policy.
-Automatic workload qualification remains separate. Other checkpoints and
+and context as part of the complete v3 bundle described in that policy.
+Automatic workload qualification is recorded in the adoption note above. Other checkpoints and
 incompatible modes retain their explicit selection.
 Supplying low-level optimization flags also preserves that explicit configuration
 unless `--optimization-profile auto` is requested.
@@ -20,7 +28,7 @@ For rank320 an output row spans340 bytes, or85 dwords. Scalar scale/code reads a
 
 Host tests cover checked metadata eligibility, exact LDS bounds, alignment policy, no-eligible rejection, bank-index algebra, and mixed eligible/base binding. Device fixtures are supplied for same-input bit comparisons, distinct output poison and guard bytes, extreme signed Q8 scales/codes and FP32 inputs, eager and three graph replays, complete mixer output/injection preservation, and rejection before scratch/semantic writes. These source fixtures are not evidence of GPU execution.
 
-Qualification requires independent source review, actual HIP/ISA and device fixtures, complete model arrays and generated IDs, and paired workload measurements. The isolated canonical HC-output increment has passed its source/native/fidelity and paired-workload checks. The automatic v3 candidate (wave, QSA, HC output, shared-expert prefetch and deferred status) is a new combination prepared for review and fresh native/model/workload validation; separate gains do not establish its combined performance. Manual selection remains explicit. No model-quality relaxation or approximate HC mode is included.
+Qualification requires independent source review, actual HIP/ISA and device fixtures, complete model arrays and generated IDs, and paired workload measurements. The isolated canonical HC-output increment has passed its source/native/fidelity and paired-workload checks. The automatic v3 combination (wave, QSA, HC output, shared-expert prefetch and deferred status) passed its own native/model/workload gates in the slice above; separate gains are not added to establish its performance. Manual selection remains explicit. No model-quality relaxation or approximate HC mode is included.
 
 Historical host qualification checkpoint: Ubuntu24.04 under WSL, GCC13.3, HIP-OFF with warnings as errors: build succeeded and152/152 host tests passed. This does not compile the HIP translation unit. At that historical host-only checkpoint the supplied32 same-input and12 complete-mixer cases had not yet been executed on target; later isolated native qualification is described above.
 

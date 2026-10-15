@@ -22,8 +22,8 @@
 | D-014 | Modelar cada USB4 físico como transporte autónomo con epoch, lease, TX/RX pools y contabilidad propios; el modo dual-link es una política por encima de dos enlaces cualificados. | Evita asumir suma de ancho de banda, aísla fallos y permite flow distribution/directional split/striping solo con evidencia de independencia. | E-044 a E-048; docs 12 y 16. | Reabrir solo si el hardware demuestra un recurso agregado con ownership/sincronización comunes y beneficio end-to-end. |
 | D-020 | Prototype exact whole HC projection chains with explicit 32-thread launch bounds and P1/P2 prefetch; do not integrate before measurement. | Alternative: retain rows8; reduction splitting is excluded. Bound registers using actual compiler evidence, then compare hot and rotating real-weight copies. | E-055; implementation document and diagnostic fixtures. | Risk: dependency latency, cache bias or register pressure can dominate. Reopen after fresh ISA, device exactness and real event measurements; reject if no benefit. |
 
-| D-015 | Keep low-level wave router selection OFF in manual mode; the content-bound automatic profile may select wave as part of the v3 candidate bundle after admission, with unchanged softmax/slot-order FP expressions, immutable preflight manifest admission and launcher-only K32; retain default/ranked alternatives. | Pointer identity to a validated owned deep copy avoids hot-path tensor scans and unsafe caches on mutable declared IDs. Raw GGUF rejects groups/bias before shape reduction; registration cannot inspect metadata absent from its API. | E-050; `docs/implementation-2026-10-15-wave-router-topk.md`; host oracle/admission checks. | Reopen for expressible grouped routing/bias, ISA changes, full-array mismatch or failure to improve measured latency. Target and model gates remain pending. |
-| D-016 | Mantener un modo eager C1 opt-in con primer error MoE persistente y finalización previa a publicar el token. | El dominio y los bits completos conservan el primer error; una copia temporal del historial host evita publicar posición o n-gramas al fallar. KV/GDN permanecen in-place y el fallo posterior al dispatch envenena la sesión. | E-051; `docs/deferred-moe-status.md`. | Pendientes revisión, compilación HIP, fixtures nativos y fidelidad completa; reabrir ante diferencias numéricas o ausencia de beneficio medido. |
+| D-015 | Keep low-level wave router selection OFF in manual mode; the content-bound automatic profile may select wave as part of the adopted v3 bundle after admission, with unchanged softmax/slot-order FP expressions, immutable preflight manifest admission and launcher-only K32; retain default/ranked alternatives. | Pointer identity to a validated owned deep copy avoids hot-path tensor scans and unsafe caches on mutable declared IDs. Raw GGUF rejects groups/bias before shape reduction; registration cannot inspect metadata absent from its API. | E-050; `docs/implementation-2026-10-15-wave-router-topk.md`; host oracle/admission checks. | Reopen for expressible grouped routing/bias, ISA changes, full-array mismatch or failure to improve measured latency. Canonical v3 target/model gates passed as recorded in E-056; other workloads remain separate. |
+| D-016 | Mantener un modo eager C1 opt-in con primer error MoE persistente y finalización previa a publicar el token. | El dominio y los bits completos conservan el primer error; una copia temporal del historial host evita publicar posición o n-gramas al fallar. KV/GDN permanecen in-place y el fallo posterior al dispatch envenena la sesión. | E-051; `docs/deferred-moe-status.md`. | Revisión, HIP, fixtures y fidelidad del slice canónico v3 cerrados en E-056; otros casos requieren cualificación. Reabrir ante diferencias numéricas o ausencia de beneficio medido. |
 
 ## Pendientes
 
@@ -109,8 +109,20 @@ fixtures, full-model equality and paired preparation-inclusive measurements.
 
 D-015 decoder policy follow-up: use a content-bound automatic profile for the
 admitted eager registered checkpoint, retaining manual selection and explicit
-ranked routing. Low-level flag defaults remain OFF. The current source candidate
+ranked routing. Low-level flag defaults remain OFF. The adopted source profile
 `canonical-a8-{wave,ranked}-qsa-hc-shared-deferred-v3` also selects QSA input
 prefetch, shared-expert prefetch and deferred MoE status after metadata/content
-admission; adoption requires its own review, native, full-model fidelity and
-automatic workload gates. See `docs/decode-optimization-profile.md`.
+admission. Its own native, full-model fidelity and automatic workload gates passed
+at source `265fd78762884d18eb32aa60294408f080088d52` (E-056); manual flags and
+all existing fallback contracts are retained. This does not adopt unrelated
+projection prototypes or other checkpoints/contexts. See `docs/decode-optimization-profile.md`.
+
+D-015 qualified adoption: fast-forward primary source to the exact qualified v3
+revision above, without another code change. Alternatives were retaining the
+preceding wave+HC automatic bundle or keeping all five modes manual. The direct
+same-node clean-auto comparison favored v3 by a descriptive median +15.55% across
+three retained pairs after all model/native gates; evidence E-056. Risk: limited
+prompt/context and early stopping do not establish population performance or
+quality. Reopen on fidelity failure, adverse workload behavior, changed compiler
+semantics or a newly measured alternative. Source adoption does not assert remote
+binary deployment.

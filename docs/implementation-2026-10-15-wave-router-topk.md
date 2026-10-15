@@ -1,5 +1,13 @@
 # Experimental wave router selection
 
+Current status: this mode is included in the adopted canonical automatic v3
+profile at source `265fd78762884d18eb32aa60294408f080088d52`. Its combined
+native, complete554-array, generated512 and descriptive workload gates passed;
+see the [qualified adoption](decode-optimization-profile.md#qualified-adoption-2026-10-15)
+for scope and limits. The source-increment and fixture observations below retain
+their historical scope; their earlier pending gates are closed only for this
+qualified content/context/execution slice. Low-level manual selection stays explicit.
+
 The low-level `--wave-moe-router-topk` defaults to OFF in manual selection,
 requires `--parallel-moe-router`, and
 excludes `--ranked-moe-router-topk`. It selects a distinct `.wave.parallel`
@@ -7,10 +15,10 @@ kernel ID, launcher tag and `hip-gfx1151-moe-route-v6-wave-parallel` compiler
 identity. Catalog, serial, speculative and bundle admission check this mode.
 Existing modes and their device function bodies remain unchanged.
 With no low-level flags, the content-bound [automatic profile](decode-optimization-profile.md) selects wave
-alongside the other modes listed in the v3 candidate policy for its admitted
+alongside the other modes listed in the v3 policy for its admitted
 checkpoint/mode/context. Explicit ranked
 routing is retained. Low-level flags without an explicit auto request retain their
-legacy configuration. The combined automatic profile still requires its own validation.
+legacy configuration. The combined automatic profile passed its own qualified-slice validation recorded above.
 
 The parallel projection is reused. The new selection kernel copies the current
 256-thread softmax expression sequence: per-lane ascending input scan, maximum
