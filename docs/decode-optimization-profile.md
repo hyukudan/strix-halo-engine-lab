@@ -38,11 +38,11 @@ wave, HC output or A8 implicitly. Context, token count and prefix-roundtrip opti
 alone do not count as low-level optimization selection. An explicit `auto` permits
 composition; explicit ranked routing then keeps ranked and can add HC output.
 
-Roundtrip capacity is checked after profile resolution and before HIP setup or
-enqueue. Thus an implicit context can first resolve to8192. The complete requested
-trajectory must fit:43 prompt tokens and511 generated IDs fit the automatic8192
-context, while an unchanged manual128 context is rejected. An explicit context or
-an automatic fallback is validated using the context actually retained.
+Roundtrip prefix capacity is checked after profile resolution and before HIP setup
+or enqueue. Thus an implicit context can first resolve to 8192, admitting a prefix
+longer than the legacy default of 128. Generation retains its existing behavior:
+it can stop at `context_capacity` before the requested token count. An explicit
+context or an automatic fallback is validated using the context actually retained.
 
 `--optimization-profile manual` disables all automatic additions and preserves
 explicit options. Use it for controlled A/B comparisons and for selecting the

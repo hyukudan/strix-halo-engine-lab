@@ -150,14 +150,12 @@ inline bool is_low_level_optimization_option(std::string_view argument) {
 }
 
 // Context can change only after immutable model/profile admission. Roundtrip
-// must fit the complete requested trajectory, including the final emitted ID
-// that does not itself consume another model step.
+// validates the resolved prefix capacity; generation may stop at the existing
+// context_capacity boundary before reaching the requested token count.
 inline void validate_resolved_prefix_roundtrip(const Options& options) {
     if (!options.prefix_cache_roundtrip) return;
     validate_decode_prefix_roundtrip(options.tokens.size(), options.context_tokens,
                                     options.generate_tokens);
-    if (options.generate_tokens - 1U > options.context_tokens - options.tokens.size())
-        throw std::invalid_argument("prefix-cache roundtrip generation exceeds resolved context");
 }
 
 inline Options parse_options(

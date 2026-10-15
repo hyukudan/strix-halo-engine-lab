@@ -118,21 +118,28 @@ int main() {
     manual_roundtrip.tokens.assign(43,1);
     (void)resolve_optimization_profile(manual_roundtrip, model, info, manifest,
                                      validated_model_content_identity, true);
-    rejects([&] { validate_resolved_prefix_roundtrip(manual_roundtrip); },
-        "prefix-cache roundtrip generation exceeds resolved context");
+    validate_resolved_prefix_roundtrip(manual_roundtrip);
     auto explicit_small = parse({"decoder","m","1","--generate","511",
         "--prefix-cache-roundtrip","--context","128"});
     explicit_small.tokens.assign(43,1);
     expect(resolve_optimization_profile(explicit_small, model, info, manifest,
         validated_model_content_identity, true).reason == "context-not-qualified",
         "explicit small context is never expanded");
-    rejects([&] { validate_resolved_prefix_roundtrip(explicit_small); },
-        "prefix-cache roundtrip generation exceeds resolved context");
+    validate_resolved_prefix_roundtrip(explicit_small);
     auto unknown_roundtrip = parse({"decoder","m","1","--generate","511","--prefix-cache-roundtrip"});
     unknown_roundtrip.tokens.assign(43,1);
     (void)resolve_optimization_profile(unknown_roundtrip, model, info, manifest,"unknown",true);
-    rejects([&] { validate_resolved_prefix_roundtrip(unknown_roundtrip); },
-        "prefix-cache roundtrip generation exceeds resolved context");
+    validate_resolved_prefix_roundtrip(unknown_roundtrip);
+    auto long_roundtrip = parse({"decoder","m","1","--generate","511","--prefix-cache-roundtrip"});
+    long_roundtrip.tokens.assign(200,1);
+    expect(resolve_optimization_profile(long_roundtrip, model, info, manifest,
+        validated_model_content_identity, true).automatic_applied && long_roundtrip.context_tokens == 8192,
+        "prefix beyond implicit legacy context accepted after automatic expansion");
+    validate_resolved_prefix_roundtrip(long_roundtrip);
+    manual_roundtrip.tokens.assign(200,1);
+    rejects([&] { validate_resolved_prefix_roundtrip(manual_roundtrip); },
+        "prefix-cache roundtrip requires at least two generated tokens and remaining context");
+    manual_roundtrip.tokens.assign(43,1);
     manual_roundtrip.generate_tokens = 86; //43prompt+85generated-inputs exactly128steps.
     validate_resolved_prefix_roundtrip(manual_roundtrip);
     auto altered_model = model;
