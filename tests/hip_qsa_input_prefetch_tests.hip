@@ -101,6 +101,21 @@ std::vector<unsigned> oracle(const std::vector<std::uint16_t> &input,
     }
     return result;
 }
+void mismatch(const std::vector<unsigned>& actual, const std::vector<unsigned>& expected,
+              unsigned width, unsigned outputs, unsigned flavor, unsigned replay,
+              unsigned mode, const char* reference) {
+    std::cerr << "QSA_BITS_MISMATCH width=" << width << " outputs=" << outputs
+              << " input=BF16 output=FP32-rounded-BF16 flavor=" << flavor
+              << " replay=" << replay << " path=" << (replay ? "graph" : "eager")
+              << " mode=" << mode << " reference=" << reference << '\n';
+    unsigned count=0;
+    for(unsigned row=0;row<outputs;++row)if(actual[row]!=expected[row]){
+        if(count<16U)std::cerr << " output=" << row << " old=0x" << std::hex
+                              << expected[row] << " new=0x" << actual[row] << std::dec << '\n';
+        ++count;
+    }
+    std::cerr << " differing_output_words=" << count << '\n';
+}
 void family(unsigned width, unsigned outputs, unsigned flavor) {
     Owner owner;
     const auto bytes = qsa_input_prefetch::required_weight_bytes(width, outputs);
@@ -115,6 +130,8 @@ void family(unsigned width, unsigned outputs, unsigned flavor) {
     }
     constexpr std::array<unsigned short, 7> scales{0x0000U, 0x8000U, 0x0001U, 0x03ffU,
                                                    0x0400U, 0x7bffU, 0xfbffU};
+    constexpr std::array<unsigned short, 8> nonfinite_scales{
+        0x7e11U,0xfe29U,0x7f31U,0xff47U,0x7c00U,0xfc00U,0x3c00U,0xbc00U};
     constexpr std::array<signed char, 5> codes{-128, -1, 0, 1, 127};
     constexpr std::array<unsigned short, 8> activations{0,       0x8000U, 1,       0x8001U,
                                                         0x0080U, 0x8080U, 0x3f80U, 0xbf80U};
@@ -122,13 +139,15 @@ void family(unsigned width, unsigned outputs, unsigned flavor) {
         for (unsigned group = 0; group < width / 32U; ++group) {
             const auto offset = (static_cast<std::uint64_t>(row) * (width / 32U) + group) * 34U;
             seed = 1664525U * seed + 1013904223U;
-            const unsigned scale = flavor == 1 ? scales[row % scales.size()]
+            const unsigned scale = flavor == 5 ? 0x3c00U
+                : flavor == 4 ? nonfinite_scales[(row+group)%nonfinite_scales.size()]
+                : flavor == 1 ? scales[row % scales.size()]
                                                : (flavor == 2 ? 1U : 0x3000U | (seed & 0x83ffU));
             packed[offset] = static_cast<unsigned char>(scale);
             packed[offset + 1U] = static_cast<unsigned char>(scale >> 8U);
             for (unsigned j = 0; j < 32; ++j) {
                 seed = 1664525U * seed + 1013904223U;
-                packed[offset + 2U + j] = flavor == 2 ? 127U
+                packed[offset + 2U + j] = flavor == 5 ? 1U : flavor == 2 ? 127U
                                           : flavor == 1
                                               ? static_cast<unsigned char>(codes[j % codes.size()])
                                               : static_cast<unsigned char>(seed >> 24U);
@@ -139,6 +158,21 @@ void family(unsigned width, unsigned outputs, unsigned flavor) {
             hidden[i] = activations[i % activations.size()];
     if (flavor == 2)
         hidden.assign(width, 0x0080U);
+    if(flavor==4){
+        constexpr std::array<std::uint16_t,8> payloads{
+            0x7fc1U,0xffc2U,0x7fc3U,0xffc4U,0x7f80U,0xff80U,0x3f80U,0xbf80U};
+        for(unsigned i=0;i<width;++i)hidden[i]=payloads[i%payloads.size()];
+    }
+    if(flavor==5){
+        for(unsigned i=0;i<width;++i){
+            const unsigned id=(5U*i+(i>>7U))&127U;
+            hidden[i]=static_cast<std::uint16_t>(((id&64U)<<9U)|0x7fc0U|(id&63U));
+        }
+        for(unsigned stride=128;stride;stride/=2U)
+            for(unsigned leaf=0;leaf<stride;++leaf)
+                require(hidden[leaf]!=hidden[leaf+stride],
+                        "NaN fixture must distinguish every reduction-stride pair");
+    }
     upload(weights, packed.data());
     const std::array modes{HipQsaInputProjectionMode::legacy256,
                            HipQsaInputProjectionMode::virtual256,
@@ -178,7 +212,9 @@ void family(unsigned width, unsigned outputs, unsigned flavor) {
             for (auto &value : hidden)
                 value ^= 0x8000U;
         upload(input, hidden.data());
-        const auto expected = oracle(hidden, packed, outputs);
+        // CPU NaN operand priority is not a device reference. Nonfinite cases
+        // compare every output word against the same device legacy kernel.
+        const auto expected = flavor>=4 ? std::vector<unsigned>{} : oracle(hidden, packed, outputs);
         if (flavor == 2) {
             require(expected[0] == (replay % 2U ? 0x80020000U : 0x00020000U),
                     "decode-first control bits must survive BF16");
@@ -200,12 +236,16 @@ void family(unsigned width, unsigned outputs, unsigned flavor) {
             check(hipMemcpy(actual.data(), reinterpret_cast<void *>(output.address), output.bytes,
                             hipMemcpyDeviceToHost),
                   "read projection bits");
-            require(actual == expected,
-                    "projection differs from independent fixed256 FMA/BF16 oracle");
+            if(flavor<4 && actual!=expected){
+                mismatch(actual,expected,width,outputs,flavor,replay,mode,"host-fixed256");
+                throw std::runtime_error("projection differs from independent fixed256 FMA/BF16 oracle");
+            }
             if (mode == 0)
                 first = actual;
-            else
-                require(actual == first, "legacy/virtual/prefetch bits differ");
+            else if(actual!=first){
+                mismatch(actual,first,width,outputs,flavor,replay,mode,"device-legacy256");
+                throw std::runtime_error("legacy/virtual/prefetch bits differ");
+            }
             guard(input);
             guard(weights);
             guard(output);
@@ -251,7 +291,13 @@ void family(unsigned width, unsigned outputs, unsigned flavor) {
               << " flavor=" << flavor << " PASS\n";
 }
 } // namespace
-int main() try {
+int main(int argc,char** argv) try {
+    if(argc>1){
+        require(argc==2 && std::string(argv[1])=="--nonfinite","expected no args or --nonfinite");
+        for(unsigned flavor:{4U,5U})family(640,9,flavor);
+        std::cout << "QSA input nonfinite exact diagnostic fixtures PASS\n";
+        return 0;
+    }
     for (auto shape : {std::pair{32U, 1U},
                        {64U, 7U},
                        {96U, 31U},
@@ -263,6 +309,7 @@ int main() try {
         family(shape.first, shape.second, 0);
     family(2560, 7, 1);
     family(2560, 7, 2);
+    for(unsigned flavor:{4U,5U})family(640,9,flavor);
     std::cout << "QSA input prefetch exact diagnostic fixtures PASS\n";
     return 0;
 } catch (const std::exception &error) {
