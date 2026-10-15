@@ -174,7 +174,7 @@ HipMoeExpertsLauncherConfig
 moe_experts_config(
     const ModelContract& model,
     HipActivationStorage activation, bool q4k_a8 = false,
-    std::shared_ptr<moe_q4k_a8::RuntimeDispatchStats> stats = {}, bool grouped_q51=false) {
+    std::shared_ptr<moe_q4k_a8::RuntimeDispatchStats> stats = {}, bool grouped_q51=false, bool deferred_status=false) {
     HipMoeExpertsLauncherConfig config;
     config.hidden_size =
         checked_u32(
@@ -196,6 +196,7 @@ moe_experts_config(
         activation;
     config.q4k_a8g32_gate_up = q4k_a8;
     config.grouped_exact_q51_down = grouped_q51;
+    config.deferred_moe_status = deferred_status;
     config.q4k_a8_stats = std::move(stats);
     return config;
 }
@@ -257,6 +258,9 @@ void register_complete_hip_kernel_catalog(
         throw std::invalid_argument("HIP catalog ranked router mode differs from binding request");
     if(config.lane_chain_hyper_output!=request.lane_chain_hyper_output)
         throw std::invalid_argument("HIP catalog lane-chain HC output differs from binding request");
+    if (config.deferred_moe_status != request.deferred_moe_status ||
+        (config.deferred_moe_status && (config.enable_device_graph_inputs || request.require_graph_safe)))
+        throw std::invalid_argument("HIP catalog deferred MoE mode differs from eager request");
     if(config.grouped_exact_q51_down != request.grouped_exact_q51_down)
         throw std::invalid_argument("HIP catalog grouped exact Q5_1 mode differs from binding request");
     if (config.q4k_a8g32_gate_up != request.q4k_a8g32_gate_up)
@@ -364,7 +368,7 @@ void register_complete_hip_kernel_catalog(
     const auto moe_experts =
         moe_experts_config(
             model,
-            config.activation, config.q4k_a8g32_gate_up, config.q4k_a8_stats, config.grouped_exact_q51_down);
+            config.activation, config.q4k_a8g32_gate_up, config.q4k_a8_stats, config.grouped_exact_q51_down, config.deferred_moe_status);
     register_hip_moe_experts_kernel_variant(
         model,
         request,
@@ -432,7 +436,7 @@ HipLauncherCatalog::HipLauncherCatalog(
       moe_experts_(
           moe_experts_config(
               model,
-              config.activation, config.q4k_a8g32_gate_up, config.q4k_a8_stats, config.grouped_exact_q51_down)),
+              config.activation, config.q4k_a8g32_gate_up, config.q4k_a8_stats, config.grouped_exact_q51_down, config.deferred_moe_status)),
       lm_head_(
           lm_head_config(
               model,

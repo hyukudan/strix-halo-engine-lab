@@ -18,6 +18,8 @@ struct HipLaunchContext {
     // Optional stable device history inputs/outputs for resident-table PLE.
     ExecutionMemoryBinding ngram_input;
     ExecutionMemoryBinding ngram_output;
+    // Separate eager first-error record; never selects graph-only kernel paths.
+    ExecutionMemoryBinding deferred_moe_status;
 };
 inline thread_local const HipLaunchContext* active_hip_launch_context = nullptr;
 [[nodiscard]] inline const HipLaunchContext* current_hip_launch_context() noexcept {
@@ -34,6 +36,10 @@ inline thread_local const HipLaunchContext* active_hip_launch_context = nullptr;
     return active_hip_launch_context && active_hip_launch_context->graph_capture
         ? reinterpret_cast<const std::uint64_t*>(active_hip_launch_context->arguments.memory.arena_base +
               active_hip_launch_context->arguments.position_offset) : nullptr;
+}
+[[nodiscard]] inline std::uint32_t* hip_deferred_moe_status() noexcept {
+    return active_hip_launch_context && !active_hip_launch_context->graph_capture
+        ? reinterpret_cast<std::uint32_t*>(active_hip_launch_context->deferred_moe_status.arena_base) : nullptr;
 }
 class HipLaunchScope {
 public:
@@ -56,6 +62,16 @@ public:
                 throw std::invalid_argument("HIP graph scope arguments and status alias");
             }
         }
+        const auto& deferred = context_.deferred_moe_status;
+        const bool has_deferred = deferred.arena_base || deferred.arena_bytes ||
+            deferred.execution_identity || deferred.allocation_generation;
+        if (has_deferred &&
+            (context_.graph_capture || !deferred.arena_base || context_.deferred_moe_status.execution_identity == 0 ||
+             context_.deferred_moe_status.allocation_generation == 0 ||
+             context_.deferred_moe_status.arena_base % alignof(std::uint32_t) != 0 ||
+             context_.deferred_moe_status.arena_bytes != 8 ||
+             context_.deferred_moe_status.arena_base > std::numeric_limits<std::uintptr_t>::max()-8U))
+            throw std::invalid_argument("deferred MoE scope requires a distinct bounded eager first-error record");
         active_hip_launch_context = &context_;
     }
     ~HipLaunchScope() { active_hip_launch_context = nullptr; }

@@ -19,6 +19,7 @@ struct SpeculativeVerifyBindingRequest {
     bool wave_moe_router_topk = false;
     bool prefetch_q8_qsa_input = false;
     bool lane_chain_hyper_output = false;
+    bool deferred_moe_status = false;
 };
 
 [[nodiscard]] ExecutionBindingPlan

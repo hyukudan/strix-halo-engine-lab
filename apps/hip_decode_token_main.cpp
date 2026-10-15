@@ -24,6 +24,7 @@
 #include "strix/hip_integer_projection_runtime.hpp"
 #include "strix/hip_setup_quiescence.hpp"
 #include "hip_decode_experiment.hpp"
+#include "hip_deferred_moe_status.hpp"
 #include "strix/serial_decode_reference.hpp"
 #include "strix/serial_decode_replay.hpp"
 #include "strix/serial_prefix_cache.hpp"
@@ -184,6 +185,7 @@ struct Options {
     bool wave_moe_router_topk = false;
     bool q4k_a8g32_gate_up = false;
     bool grouped_exact_q51_down = false;
+    bool deferred_moe_status = false;
     bool prefetch_q8_gdn_input = false;
     bool prefetch_q8_qsa_input = false;
     bool virtual_q8_gdn_output = false;
@@ -212,7 +214,7 @@ Options parse_options(
             "[--planned-ple-io] [--ple-max-rows-per-io N] [--ple-max-inflight-ios N] "
             "[--generate N] [--eos-token TOKEN_ID] [--prefix-cache-roundtrip] "
             "[--parallel-moe-router] [--ranked-moe-router-topk | --wave-moe-router-topk] "
-            "[--prefetch-q8-qsa-input] [--virtual-q8-lm-head] [--virtual-q8-gdn-input [--prefetch-q8-gdn-input]] [--q4k-a8g32-gate-up [--grouped-exact-q51-down]] "
+            "[--prefetch-q8-qsa-input] [--virtual-q8-lm-head] [--virtual-q8-gdn-input [--prefetch-q8-gdn-input]] [--q4k-a8g32-gate-up [--grouped-exact-q51-down]] [--deferred-moe-status] "
             "[--parallel-hyper-mix [--staged-hyper-projections [--fused-staged-hyper-mix [--typed-fused-hyper-projections [--prefetch-typed-hyper-rows] [--prefetch-q8-hyper-output [--lane-chain-hyper-output]]]]]]");
     }
 
@@ -248,6 +250,10 @@ Options parse_options(
             if (options.wave_moe_router_topk) throw std::invalid_argument("duplicate wave MoE router top-k option");
             options.wave_moe_router_topk = true;
             continue;
+        }
+        if (argument == "--deferred-moe-status") {
+            if (options.deferred_moe_status) throw std::invalid_argument("duplicate deferred MoE status option");
+            options.deferred_moe_status = true; continue;
         }
         if (argument == "--ranked-moe-router-topk") {
             if (options.ranked_moe_router_topk) throw std::invalid_argument("duplicate ranked MoE router top-k option");
@@ -541,6 +547,9 @@ Options parse_options(
         strix::validate_raw_baseline_output_directory(options.raw_recording_path);
     }
     else if (options.raw_policy_supplied) throw std::invalid_argument("recording policy requires --record-raw");
+    if (options.deferred_moe_status && (options.execution.mode != strix::DecodeExecutionMode::eager ||
+        options.execution.integer_head != strix::DecodeIntegerHead::none))
+        throw std::invalid_argument("--deferred-moe-status requires eager C1 without an integer-head stream");
     options.execution.validate(options.residency == strix::HipModelResidencyMode::resident_copy,
                                options.prefix_cache_roundtrip);
     if (options.execution.mode == strix::DecodeExecutionMode::graph && options.planned_ple_io)
@@ -642,14 +651,18 @@ public:
         std::uint64_t vocab_size,
         std::function<void(std::uint32_t, std::uint64_t, std::span<const float>)> recording = {},
         std::function<void()> recording_binding = {}, std::function<void()> recording_drain = {},
-        std::function<void(std::uint32_t)> execute_override = {}, bool track_logit_hashes = false)
+        std::function<void(std::uint32_t)> execute_override = {}, bool track_logit_hashes = false,
+        bool prepublication_completion = false)
         : compiled_(&compiled),
           session_(&session),
           resources_(&resources),
           dispatcher_(&dispatcher),
           scratch_(&scratch),
           lm_io_(&lm_io),
-          vocab_size_(vocab_size), recording_(std::move(recording)), recording_binding_(std::move(recording_binding)), recording_drain_(std::move(recording_drain)), execute_override_(std::move(execute_override)), track_logit_hashes_(track_logit_hashes) {}
+          vocab_size_(vocab_size), recording_(std::move(recording)), recording_binding_(std::move(recording_binding)), recording_drain_(std::move(recording_drain)), execute_override_(std::move(execute_override)), track_logit_hashes_(track_logit_hashes), prepublication_completion_(prepublication_completion) {
+        if(prepublication_completion_&&!execute_override_)
+            throw std::invalid_argument("checked completion requires the owned native token executor");
+    }
 
     std::vector<float> execute(
         std::uint32_t input_token,
@@ -674,7 +687,7 @@ public:
                 input_token,
                 *dispatcher_));
 
-        check_hip(
+        if (!prepublication_completion_) check_hip(
             hipDeviceSynchronize(),
             "hipDeviceSynchronize(greedy serial token)");
         } catch (...) { if (recording_drain_) recording_drain_(); throw; }
@@ -750,6 +763,7 @@ private:
     std::function<void()> recording_drain_;
     std::function<void(std::uint32_t)> execute_override_;
     bool track_logit_hashes_ = false;
+    bool prepublication_completion_ = false;
 };
 
 // Drain inside the transfer call before the caller's snapshot owner can unwind.
@@ -806,6 +820,7 @@ int main(
             "  --record-state-policy final|each --prefix-cache-roundtrip\n"
             "  --prefetch-q8-qsa-input (opt-in exact-tree Q8 input projections)\n"
             "  --execution-mode eager|graph (default eager)\n"
+            "  --deferred-moe-status (owned eager C1 completion before token publication)\n"
             "  --graph-workspace-bytes BYTES --graph-executable-bytes BYTES\n"
             "  --graph-capture-peak-bytes BYTES --graph-budget-bytes BYTES\n"
             "  --integer-lm-head a8-iu8|a4-iu8|a4-iu4\n"
@@ -1007,6 +1022,8 @@ int main(
             std::to_string(qsa_prefetch_stats->dispatched_projections.load(std::memory_order_relaxed))+",\n";
         return receipt;
     };
+    const std::string deferred_moe_mode_receipt = "  \"deferred_moe_status\": " +
+        std::string(options.deferred_moe_status ? "true" : "false") + ",\n";
     const auto original_work_device = std::make_shared<strix::HipSetupQuiescenceGuard>();
     auto target_architecture = original_work_device->architecture();
     if (const auto suffix = target_architecture.find(':'); suffix != std::string::npos)
@@ -1044,6 +1061,8 @@ int main(
     catalog_config.q4k_a8_stats = q4k_a8_stats;
     binding_request.q4k_a8g32_gate_up = options.q4k_a8g32_gate_up;
     binding_request.grouped_exact_q51_down = options.grouped_exact_q51_down;
+    catalog_config.deferred_moe_status = options.deferred_moe_status;
+    binding_request.deferred_moe_status = options.deferred_moe_status;
     catalog_config.ranked_moe_router_topk = options.ranked_moe_router_topk;
     binding_request.ranked_moe_router_topk = options.ranked_moe_router_topk;
     catalog_config.wave_moe_router_topk = options.wave_moe_router_topk;
@@ -1294,6 +1313,9 @@ int main(
             "compiled execution does not end in one logits write");
     }
 
+    std::unique_ptr<HipDeferredMoeStatus> deferred_moe;
+    if(options.deferred_moe_status) deferred_moe=std::make_unique<HipDeferredMoeStatus>(resources,
+        compiled.execution_identity,generations.next(),generations.next(),experiment_owner,original_work_device);
     std::uint64_t input_access_epoch = 1;
     const std::function<void(std::uint32_t)> execute_native_token = [&](std::uint32_t token) {
         original_work_device->require_original();
@@ -1301,10 +1323,21 @@ int main(
             if (input_access_epoch == UINT64_MAX) throw std::overflow_error("integer input epochs exhausted");
             arena_pin->advance_access(++input_access_epoch);
         }
-        if (graph) static_cast<void>(graph->execute(session, token));
+        if (deferred_moe) {
+            deferred_moe->begin();
+            try {
+                strix::HipLaunchScope scope(deferred_moe->scope());
+                static_cast<void>(strix::execute_serial_token(compiled,session,deferred_moe->resources(),token,dispatcher,
+                    [&] { deferred_moe->complete_before_commit(); }));
+            } catch (...) { deferred_moe->abort();throw; }
+        } else if (graph) static_cast<void>(graph->execute(session, token));
         else static_cast<void>(strix::execute_serial_token(compiled, session, resources, token, dispatcher));
-        check_hip(hipDeviceSynchronize(), "native token original-device completion");
-        original_work_device->require_original();
+        // Deferred mode completed its owned stream inside the session's
+        // prepublication boundary. Keep the legacy completion path unchanged.
+        if (!deferred_moe) {
+            check_hip(hipDeviceSynchronize(), "native token original-device completion");
+            original_work_device->require_original();
+        }
     };
 
     std::unique_ptr<strix::RawBaselineRecording> raw_recording;
@@ -1435,7 +1468,7 @@ int main(
                     model.vocab_size,
                     [&](std::uint32_t token, std::uint64_t position, std::span<const float> values) {
                         if (raw_recording) raw_recording->record_token(token, position, values, session, raw_state_reader);
-                    }, raw_require_identity, raw_drain_or_fail, execute_native_token);
+                    }, raw_require_identity, raw_drain_or_fail, execute_native_token, false, options.deferred_moe_status);
 
             std::vector<float> prefix_logits;
             for (std::size_t index = 0;
@@ -1487,7 +1520,7 @@ int main(
                     dispatcher,
                     memory.scratch(),
                     lm_io,
-                    model.vocab_size, {}, raw_require_identity, raw_drain_or_fail, execute_native_token, true);
+                    model.vocab_size, {}, raw_require_identity, raw_drain_or_fail, execute_native_token, true, options.deferred_moe_status);
             const auto baseline =
                 strix::execute_serial_greedy_continuation(
                     continuation,
@@ -1534,7 +1567,7 @@ int main(
                     model.vocab_size,
                     [&](std::uint32_t token, std::uint64_t position, std::span<const float> values) {
                         if (raw_recording) raw_recording->record_token(token, position, values, session, raw_state_reader);
-                    }, raw_require_identity, raw_drain_or_fail, execute_native_token, true);
+                    }, raw_require_identity, raw_drain_or_fail, execute_native_token, true, options.deferred_moe_status);
             const auto restored =
                 strix::execute_serial_greedy_continuation(
                     continuation,
@@ -1576,7 +1609,7 @@ int main(
                     restore_start).count();
 
             std::cout
-                << "{\n" << gdn_output_mode_receipt() << wave_router_mode_receipt
+                << "{\n" << gdn_output_mode_receipt() << wave_router_mode_receipt << deferred_moe_mode_receipt
                 << "  \"model_content_identity\": \""
                 << strix::model_content_identity_hex(
                        model_residency.binding().
@@ -1676,7 +1709,7 @@ int main(
             model.vocab_size,
             [&](std::uint32_t token, std::uint64_t position, std::span<const float> values) {
                 if (raw_recording) raw_recording->record_token(token, position, values, session, raw_state_reader);
-            }, raw_require_identity, raw_drain_or_fail, execute_native_token);
+            }, raw_require_identity, raw_drain_or_fail, execute_native_token, false, options.deferred_moe_status);
 
         strix::SerialGreedyRequest request;
         request.prefix_tokens =
@@ -1702,7 +1735,7 @@ int main(
             elapsed_total += value;
         }
 
-        std::cout << "{\n" << gdn_output_mode_receipt() << wave_router_mode_receipt;
+        std::cout << "{\n" << gdn_output_mode_receipt() << wave_router_mode_receipt << deferred_moe_mode_receipt;
         emit_q4k_a8_receipt();
         emit_q4k_a8_counts();
         std::cout
@@ -1802,7 +1835,7 @@ int main(
             reference->steps.size());
     }
 
-    std::cout << '{' << '\n' << gdn_output_mode_receipt() << wave_router_mode_receipt;
+    std::cout << '{' << '\n' << gdn_output_mode_receipt() << wave_router_mode_receipt << deferred_moe_mode_receipt;
     emit_q4k_a8_receipt();
     std::cout << "  \"model_content_identity\": \""
               << strix::model_content_identity_hex(
@@ -1864,7 +1897,7 @@ int main(
         try {
         execute_native_token(token);
 
-        check_hip(
+        if (!deferred_moe) check_hip(
             hipDeviceSynchronize(),
             "hipDeviceSynchronize(serial token)");
         } catch (...) { if (raw_drain_or_fail) raw_drain_or_fail(); throw; }

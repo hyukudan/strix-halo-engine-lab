@@ -311,6 +311,10 @@ CompiledSerialExecution compile_serial_execution(
     if (binding_request.wave_moe_router_topk &&
         (!binding_request.parallel_moe_router || binding_request.ranked_moe_router_topk))
         throw std::invalid_argument("wave router requires parallel topology and excludes ranked mode");
+    if (binding_request.deferred_moe_status &&
+        (binding_request.device_graph_inputs || binding_request.require_graph_safe ||
+         binding_request.logical_rows != 1 || binding_request.request_concurrency != 1))
+        throw std::invalid_argument("deferred MoE status supports eager C1 only");
     if (binding_request.ranked_moe_router_topk && !binding_request.parallel_moe_router)
         throw std::invalid_argument("ranked router requires parallel router topology");
     if (binding_request.parallel_moe_router != buffer_request.parallel_moe_router)
@@ -369,6 +373,9 @@ CompiledSerialExecution compile_serial_execution(
             if(binding.kernel_id && binding.kernel_id->ends_with(lane_chain_hyper_output_suffix)!=expected)
                 throw std::invalid_argument("bound lane-chain HC output differs from admitted topology");
         }
+        if (binding.op==SerialOp::moe_experts && binding.kernel_id &&
+            (binding.kernel_id->find(".deferred-status-v1")!=std::string::npos)!=binding_request.deferred_moe_status)
+            throw std::invalid_argument("bound deferred MoE status mode differs from request");
         if(binding.op==SerialOp::moe_experts && binding.kernel_id &&
            binding.kernel_id->ends_with(moe_q4k_a8::grouped_q51_kernel_ending)!=buffer_request.grouped_exact_q51_down)
             throw std::invalid_argument("bound grouped exact Q5_1 down differs from admitted topology");

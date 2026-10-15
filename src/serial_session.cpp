@@ -13,7 +13,8 @@ EagerExecutionResult execute_serial_token(
     SerialSessionContext& session,
     const ExecutionRuntimeResources& resources,
     std::uint32_t input_token_id,
-    EagerExecutionDispatcher& dispatcher) {
+    EagerExecutionDispatcher& dispatcher,
+    const std::function<void()>& before_commit) {
     validate_execution_runtime_resources(
         compiled.execution_identity,
         compiled.arena,
@@ -135,6 +136,9 @@ EagerExecutionResult execute_serial_token(
             throw std::logic_error(
                 "serial execution completed without consuming PLE prefetch");
         }
+        // Completion/status and transactional host history precede session
+        // generations, lineage, position and committed-token publication.
+        if (before_commit) before_commit();
     } catch (...) {
         if (resources.ple_lookup != nullptr &&
             resources.ple_prefetch != nullptr) {
@@ -162,7 +166,8 @@ EagerExecutionResult execute_serial_token(
     const SerialSessionStateLayout& session_state_layout,
     const SessionStateMemoryBinding& session_state_memory,
     std::uint32_t input_token_id,
-    EagerExecutionDispatcher& dispatcher) {
+    EagerExecutionDispatcher& dispatcher,
+    const std::function<void()>& before_commit) {
     if (session.runtime_compatibility_identity != 0) {
         throw std::invalid_argument(
             "model-bound serial session requires complete runtime resources");
@@ -253,6 +258,7 @@ EagerExecutionResult execute_serial_token(
                 session_state_memory,
                 request,
                 dispatcher);
+        if (before_commit) before_commit();
     } catch (...) {
         // Preflight inside execute_compiled_serial_eager runs before the first
         // dispatcher call, but once dispatch begins persistent device state may

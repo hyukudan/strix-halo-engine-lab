@@ -1,5 +1,6 @@
 #include "strix/hip_launch_context.hpp"
 #include "strix/hip_moe_experts_launcher.hpp"
+#include "strix/deferred_moe_status.hpp"
 
 #include "strix/dispatch_resources.hpp"
 #include "strix/hip_setup_quiescence.hpp"
@@ -898,6 +899,19 @@ void launch_down_by_kind(
         "HIP routed-expert down launch");
 }
 
+__global__ void publish_deferred_moe_first_error(const std::uint32_t* local,
+    std::uint32_t* record, std::uint32_t domain) {
+    // One thread, one stream: completion of this node precedes the next layer's
+    // workspace reset. Existing arithmetic kernels and status words are intact.
+    const auto bits = *local;
+    if (bits != 0U && record[0] == 0U) { record[1] = bits; record[0] = domain; }
+}
+void enqueue_deferred_moe_status(const std::uint32_t* local, DeferredMoeDomain domain) {
+    hipLaunchKernelGGL(publish_deferred_moe_first_error,dim3(1),dim3(1),0,hip_execution_stream(),
+        local,hip_deferred_moe_status(),static_cast<std::uint32_t>(domain));
+    check_hip(hipGetLastError(),"publish deferred MoE first-error record");
+}
+
 template <typename Storage>
 void launch_typed(
     const HipMoeExpertsLauncherConfig& config,
@@ -1015,7 +1029,9 @@ void launch_typed(
     check_hip(hipGetLastError(), "commit routed-expert output");
     // Graph replay consumes the existing aggregate status at its completion
     // boundary. Eager C1 retains scratch until this stream has drained.
-    if (hip_graph_status() == nullptr) {
+    if (config.deferred_moe_status) {
+        enqueue_deferred_moe_status(status,DeferredMoeDomain::legacy);
+    } else if (hip_graph_status() == nullptr) {
         std::uint32_t host_status = 0;
         check_hip(hipMemcpyAsync(&host_status, status, sizeof(host_status),
             hipMemcpyDeviceToHost, hip_execution_stream()), "read routed-expert status");
@@ -1212,7 +1228,9 @@ void launch_q4k_a8_typed(const HipMoeExpertsLauncherConfig& config,
         dim3((config.hidden_size+kThreads-1U)/kThreads),dim3(kThreads),0,hip_execution_stream(),
         accumulation,reinterpret_cast<Storage*>(output.address),config.hidden_size,status);
     check_hip(hipGetLastError(),"Q4K A8 semantic output commit");
-    if (aggregate == nullptr) {
+    if (config.deferred_moe_status) {
+        enqueue_deferred_moe_status(status,DeferredMoeDomain::q4k_a8);
+    } else if (aggregate == nullptr) {
         std::uint32_t host_status = 0;
         try {
             check_hip(hipMemcpyAsync(&host_status,status,sizeof(host_status),hipMemcpyDeviceToHost,
@@ -1262,6 +1280,8 @@ void launch_moe_experts(
             HipMoeExpertsLauncherConfig*>(
                 user_data);
     validate_config(config);
+    if (config.deferred_moe_status != (hip_deferred_moe_status()!=nullptr))
+        throw std::invalid_argument("deferred MoE launcher requires matching owned eager completion scope");
 
     const auto hidden =
         resolve_dispatch_read(
@@ -1351,6 +1371,25 @@ void launch_moe_experts(
         config.expert_count,
         "routed down");
 
+    if (config.deferred_moe_status) {
+        const auto& record=current_hip_launch_context()->deferred_moe_status;
+        if (!context.memory || record.execution_identity!=context.memory->execution_identity ||
+            (context.execution_identity && record.execution_identity!=context.execution_identity))
+            throw std::invalid_argument("deferred MoE record belongs to a different execution");
+        const auto disjoint=[&](std::uintptr_t address,std::uint64_t bytes) {
+            if (bytes>std::numeric_limits<std::uintptr_t>::max()-address ||
+                (record.arena_base<address+bytes && address<record.arena_base+record.arena_bytes))
+                throw std::invalid_argument("deferred MoE record aliases execution storage");
+        };
+        disjoint(context.memory->arena_base,context.memory->arena_bytes);
+        for (const auto* pair : {&tensors.gate,&tensors.up,&tensors.gate_up,&tensors.down})
+            if (pair->runtime) disjoint(pair->runtime->address,pair->runtime->bytes);
+        if (context.session_state_memory) {
+            disjoint(context.session_state_memory->device_base,context.session_state_memory->device_bytes);
+            disjoint(context.session_state_memory->host_base,context.session_state_memory->host_bytes);
+        }
+    }
+
     if (config.q4k_a8g32_gate_up) {
 #ifdef STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME
         if (tensors.fused_gate_up || tensors.gate.manifest->ggml_type != tensors.up.manifest->ggml_type ||
@@ -1417,6 +1456,7 @@ std::string kernel_id(
         ".c" +
         std::to_string(
             request.request_concurrency) +
+        (config.deferred_moe_status ? ".deferred-status-v1" : "") +
         (config.grouped_exact_q51_down ? ".grouped-exact-q51-down-v1" : "") +
         (config.q4k_a8g32_gate_up ? std::string(moe_q4k_a8::runtime_kernel_suffix) : "");
 }
@@ -1435,6 +1475,7 @@ std::uint64_t implementation_identity(
             config.activation));
     if (config.q4k_a8g32_gate_up) hash_u64(hash,0x51344b4138473332ULL);
     if (config.grouped_exact_q51_down) hash_u64(hash,0x5135314752505631ULL);
+    if (config.deferred_moe_status) hash_u64(hash,0x4445464d4f453031ULL);
     return hash;
 }
 
@@ -1455,6 +1496,9 @@ void register_hip_moe_experts_kernel_variant(
     validate_config(config);
     if(request.grouped_exact_q51_down != config.grouped_exact_q51_down)
         throw std::invalid_argument("grouped exact Q5_1 config differs from binding request");
+    if (request.deferred_moe_status != config.deferred_moe_status ||
+        (config.deferred_moe_status && (request.device_graph_inputs || request.require_graph_safe)))
+        throw std::invalid_argument("deferred MoE variant requires matching eager request");
     if (request.q4k_a8g32_gate_up != config.q4k_a8g32_gate_up)
         throw std::invalid_argument("Q4K A8 variant config differs from binding request");
     if (config.hidden_size !=
@@ -1517,7 +1561,7 @@ void register_hip_moe_experts_kernel_variant(
     variant.numerics.deterministic = true;
     variant.qualification =
         qualification;
-    variant.graph_safe = true;
+    variant.graph_safe = !config.deferred_moe_status;
     variant.input_layout =
         "row-major+device-topk";
     variant.output_layout =
@@ -1535,6 +1579,7 @@ void register_hip_moe_experts_kernel_variant(
         variant.numerics.accumulator_precision += ";" + std::string(moe_q4k_a8::grouped_q51_numerical_identity);
         variant.compiler_identity += ":grouped-exact-q51-down-v1";
     }
+    if(config.deferred_moe_status) variant.compiler_identity += ":deferred-first-error-v1";
     variant.measured_seconds = 0.0;
 
     registry.add(
@@ -1551,6 +1596,8 @@ make_hip_moe_experts_launcher(
             "HIP routed-expert launcher requires id and config");
     }
     validate_config(*config);
+    if ((kernel_id_value.find(".deferred-status-v1")!=std::string::npos)!=config->deferred_moe_status)
+        throw std::invalid_argument("deferred MoE launcher id differs from config");
     if(kernel_id_value.ends_with(moe_q4k_a8::grouped_q51_kernel_ending)!=config->grouped_exact_q51_down)
         throw std::invalid_argument("grouped exact Q5_1 launcher id differs from config");
     if (kernel_id_value.ends_with(moe_q4k_a8::runtime_kernel_suffix) != config->q4k_a8g32_gate_up)
@@ -1593,6 +1640,8 @@ register_for_compiled_execution(
             throw std::invalid_argument(
                 "HIP routed-expert step has no kernel binding");
         }
+        if ((binding.kernel_id->find(".deferred-status-v1")!=std::string::npos)!=config_.deferred_moe_status)
+            throw std::invalid_argument("deferred MoE bundle mode differs from compiled binding");
         if(binding.kernel_id->ends_with(moe_q4k_a8::grouped_q51_kernel_ending)!=config_.grouped_exact_q51_down)
             throw std::invalid_argument("grouped exact Q5_1 bundle differs from compiled selection");
         if (binding.kernel_id->ends_with(moe_q4k_a8::runtime_kernel_suffix) != config_.q4k_a8g32_gate_up)

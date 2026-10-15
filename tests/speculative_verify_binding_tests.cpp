@@ -6,6 +6,7 @@
 #include <utility>
 
 #include <iostream>
+#include <stdexcept>
 
 namespace {
 
@@ -166,6 +167,12 @@ int main() {
     strix::SpeculativeVerifyBindingRequest hc_request;hc_request.lane_chain_hyper_output=true;bool hc_rejected=false;
     try{(void)strix::bind_speculative_verify_plan(model,verify,registry,hc_request);}catch(const std::invalid_argument&){hc_rejected=true;}
     expect(hc_rejected,"lane-chain HC rejects speculative binding");
+    strix::SpeculativeVerifyBindingRequest deferred;deferred.deferred_moe_status=true;
+    bool deferred_rejected=false;
+    try{(void)strix::bind_speculative_verify_plan(model,verify,registry,deferred);}
+    catch(const std::invalid_argument&){deferred_rejected=true;}
+    expect(deferred_rejected,"verify binder rejects deferred MoE completion");
+
     if (failures == 0) {
         std::cout << "speculative verify binding tests passed\n";
     }

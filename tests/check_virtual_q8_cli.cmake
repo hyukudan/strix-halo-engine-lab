@@ -2,6 +2,17 @@ if(EXISTS "missing-model.gguf")
     message(FATAL_ERROR "CLI missing-model fixture must not exist")
 endif()
 
+execute_process(COMMAND "${BINARY}" missing-model.gguf 1 --deferred-moe-status --deferred-moe-status
+    RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE error)
+if(result EQUAL 0 OR NOT "${output}${error}" MATCHES "duplicate deferred MoE status option")
+    message(FATAL_ERROR "Duplicate deferred status must reject during parsing: ${result} ${output} ${error}")
+endif()
+execute_process(COMMAND "${BINARY}" missing-model.gguf 1 --deferred-moe-status --execution-mode graph
+    RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE error)
+if(result EQUAL 0 OR NOT "${output}${error}" MATCHES "deferred-moe-status requires eager C1")
+    message(FATAL_ERROR "Deferred status must reject graph mode before model IO: ${result} ${output} ${error}")
+endif()
+
 execute_process(COMMAND "${BINARY}" missing-model.gguf 1
     --virtual-q8-lm-head --virtual-q8-lm-head
     RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE error)

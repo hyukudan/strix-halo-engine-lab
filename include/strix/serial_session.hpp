@@ -8,6 +8,7 @@
 #include "strix/session_state_memory.hpp"
 
 #include <cstdint>
+#include <functional>
 
 namespace strix {
 
@@ -27,12 +28,17 @@ struct SerialSessionContext {
     ArithmeticLineage arithmetic_lineage;
 };
 
+// Optional native completion runs after dispatch and PLE consumption, inside
+// the poisoning boundary and before state generations/lineage/token commit.
+// Its owner must retain async resources and publish any shadow host history
+// only after successful completion. An empty hook preserves eager semantics.
 [[nodiscard]] EagerExecutionResult execute_serial_token(
     const CompiledSerialExecution& compiled,
     SerialSessionContext& session,
     const ExecutionRuntimeResources& resources,
     std::uint32_t input_token_id,
-    EagerExecutionDispatcher& dispatcher);
+    EagerExecutionDispatcher& dispatcher,
+    const std::function<void()>& before_commit = {});
 
 [[nodiscard]] EagerExecutionResult execute_serial_token(
     const CompiledSerialExecution& compiled,
@@ -41,6 +47,7 @@ struct SerialSessionContext {
     const SerialSessionStateLayout& session_state_layout,
     const SessionStateMemoryBinding& session_state_memory,
     std::uint32_t input_token_id,
-    EagerExecutionDispatcher& dispatcher);
+    EagerExecutionDispatcher& dispatcher,
+    const std::function<void()>& before_commit = {});
 
 }  // namespace strix

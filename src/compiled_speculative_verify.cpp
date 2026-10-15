@@ -194,6 +194,8 @@ compile_speculative_verify_execution(
     if (binding_request.wave_moe_router_topk &&
         (!binding_request.parallel_moe_router || binding_request.ranked_moe_router_topk))
         throw std::invalid_argument("wave router requires parallel topology and excludes ranked mode");
+    if (binding_request.deferred_moe_status)
+        throw std::invalid_argument("deferred MoE status is not a speculative verification contract");
     if (binding_request.ranked_moe_router_topk && !binding_request.parallel_moe_router)
         throw std::invalid_argument("ranked router requires parallel router topology");
     if (binding_request.parallel_moe_router != buffer_request.parallel_moe_router)

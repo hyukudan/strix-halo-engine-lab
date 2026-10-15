@@ -28,6 +28,7 @@ struct ExecutionBindingRequest {
     bool grouped_exact_q51_down = false;
     bool lane_chain_hyper_output = false;
     std::vector<std::uint32_t> lane_chain_hyper_output_eligible_steps;
+    bool deferred_moe_status = false;
 };
 
 struct ExecutionKernelBinding {

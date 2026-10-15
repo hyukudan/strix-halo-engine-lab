@@ -6,6 +6,8 @@
 #include "strix/execution_tensor_access.hpp"
 #include "strix/hip_moe_experts_launcher.hpp"
 #include "strix/hip_launch_context.hpp"
+#include "strix/hip_setup_quiescence.hpp"
+#include "strix/deferred_moe_status.hpp"
 #include "strix/model_contract.hpp"
 #include "strix/model_manifest.hpp"
 #include "strix/model_runtime_binding.hpp"
@@ -724,6 +726,54 @@ int main(int argc, char** argv) try {
                     hipMemcpyDeviceToHost), "read output after nonfinite weight");
     expect(before == after, "nonfinite weight cannot publish partial expert output");
 
+    // The separate eager record retains precise local bits until the token's
+    // explicit completion boundary. All D2H storage survives a checked drain.
+    const auto check_deferred_error = [&](unsigned expected_bits,bool later_valid=false) {
+        strix::HipSetupQuiescenceGuard completion_guard;
+        hipStream_t stream=nullptr;void* record=nullptr;
+        strix::DeferredMoeFirstError receipt;
+        try {
+            check(hipStreamCreateWithFlags(&stream,hipStreamNonBlocking),"create deferred fixture stream");
+            check(hipMalloc(&record,sizeof(receipt)),"allocate deferred fixture record");
+            strix::HipLaunchContext scope_context;scope_context.stream=stream;
+            scope_context.deferred_moe_status={memory.execution_identity,reinterpret_cast<std::uintptr_t>(record),sizeof(receipt),1};
+            auto deferred_config=config;deferred_config.deferred_moe_status=true;
+            auto deferred=strix::make_hip_moe_experts_launcher("test.deferred-status-v1"+
+                (grouped_q51 ? std::string(".grouped-exact-q51-down-v1") : "")+
+                (q4k_a8 ? std::string(strix::moe_q4k_a8::runtime_kernel_suffix) : ""),&deferred_config);
+            check(hipMemsetAsync(record,0,sizeof(receipt),stream),"clear deferred fixture record");
+            {strix::HipLaunchScope scope(scope_context);deferred.function(context,deferred.user_data);}
+            check(hipMemcpyAsync(&receipt,record,sizeof(receipt),hipMemcpyDeviceToHost,stream),"read deferred failure");
+            check(hipStreamSynchronize(stream),"drain deferred failure");
+            const unsigned domain=q4k_a8&&gate_type==12U ? 2U : 1U;
+            expect(receipt.domain==domain&&receipt.bits==expected_bits,"deferred failure preserves domain and complete local bits");
+            check(hipMemcpy(after.data(),reinterpret_cast<void*>(output.address),output_bytes,hipMemcpyDeviceToHost),"read deferred rejected destination");
+            expect(before==after,"deferred invalid layer preserves semantic output");
+            bool deferred_rejected=false;
+            try{strix::check_deferred_moe_status(receipt);}catch(const std::invalid_argument&){deferred_rejected=true;}
+            expect(deferred_rejected,"deferred completion reports original error class");
+            if(later_valid) {
+                check(hipMemcpyAsync(reinterpret_cast<void*>(route_indices.address),selected.data(),selected.size()*4,hipMemcpyHostToDevice,stream),"restore deferred valid route");
+                check(hipMemcpyAsync(reinterpret_cast<void*>(route_weights.address),selected_weights.data(),selected_weights.size()*4,hipMemcpyHostToDevice,stream),"restore deferred valid weights");
+                {strix::HipLaunchScope scope(scope_context);deferred.function(context,deferred.user_data);}
+                check(hipMemcpyAsync(&receipt,record,sizeof(receipt),hipMemcpyDeviceToHost,stream),"read retained first error");
+                check(hipStreamSynchronize(stream),"drain later valid layer");
+                expect(receipt.domain==domain&&receipt.bits==expected_bits,"later local reset and successful layer preserve first error");
+            }
+            check(hipFree(record),"free deferred fixture record");record=nullptr;
+            check(hipStreamDestroy(stream),"destroy deferred fixture stream");stream=nullptr;
+        } catch(...) {
+            completion_guard.recover_or_fail_stop();
+            if(record)(void)hipFree(record);
+            if(stream)(void)hipStreamDestroy(stream);
+            throw;
+        }
+    };
+    check_deferred_error(1U,true);
+    check(hipMemcpy(reinterpret_cast<void*>(route_indices.address),bad_routes.data(),bad_routes.size()*4,hipMemcpyHostToDevice),"set deferred invalid route");
+    check_deferred_error(1U,true);
+    check(hipMemcpy(reinterpret_cast<void*>(route_weights.address),bad_weights.data(),bad_weights.size()*4,hipMemcpyHostToDevice),"restore original invalid graph weights");
+
     // Captured execution must report the same failure through the existing
     // device graph status, without host reads or synchronization during capture.
     const auto graph_layout = strix::graph_input_layout(1);
@@ -819,6 +869,7 @@ int main(int argc, char** argv) try {
             check(hipMemcpy(&local,reinterpret_cast<void*>(temporary.address+layout.status_offset),4,hipMemcpyDeviceToHost),"read eager pipeline status");
             check(hipMemcpy(after.data(),reinterpret_cast<void*>(output.address),output_bytes,hipMemcpyDeviceToHost),"read rejected pipeline output");
             expect(error && local==bit && before==after,"eager failure has precise sticky bit and preserves semantic destination");
+            check_deferred_error(bit);
             if(down_phase) {
                 std::vector<float> activated(static_cast<std::size_t>(2U*intermediate*top_k));
                 check(hipMemcpy(activated.data(),reinterpret_cast<void*>(temporary.address),activated.size()*4,hipMemcpyDeviceToHost),"read pre-down finite activation");

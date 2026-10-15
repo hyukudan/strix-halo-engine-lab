@@ -90,6 +90,7 @@ strix::kernels::KernelRegistry make_registry(
                     (step.op == strix::SerialOp::moe_route && request.wave_moe_router_topk ? ".wave.parallel" :
                      step.op == strix::SerialOp::moe_route && request.ranked_moe_router_topk ? ".ranked.parallel" :
                      step.op == strix::SerialOp::moe_route && request.parallel_moe_router ? ".parallel" : "") +
+                    (step.op == strix::SerialOp::moe_experts && request.deferred_moe_status ? ".deferred-status-v1" : "") +
                     (step.op == strix::SerialOp::moe_experts && request.grouped_exact_q51_down ? ".grouped-exact-q51-down-v1" : "") +
                     (step.op == strix::SerialOp::moe_experts && request.q4k_a8g32_gate_up ? ".q4k-a8g32-gateup-v2" : ""),
                 *family,
@@ -622,6 +623,29 @@ int main() {
     q4_binding.q4k_a8g32_gate_up=false; q4_buffers.q4k_a8g32_gate_up=false;
     expect(strix::compile_serial_execution(model,registry,q4_binding,q4_buffers).execution_identity ==
         5195923158154663034ULL, "disabled Q4K A8 preserves pre-edit compiled golden");
+
+    auto deferred_binding=binding_request;
+    deferred_binding.deferred_moe_status=true;
+    const auto deferred_registry=make_registry(model,deferred_binding);
+    const auto deferred_compiled=strix::compile_serial_execution(model,deferred_registry,deferred_binding,buffer_request);
+    expect(deferred_compiled.execution_identity!=compiled.execution_identity &&
+        deferred_compiled.kernel_plan_identity!=compiled.kernel_plan_identity &&
+        deferred_compiled.arena.total_bytes==compiled.arena.total_bytes,
+        "deferred status changes execution/kernel identity without scratch growth");
+    expect(rejects_ranked(registry,deferred_binding,buffer_request),"deferred status rejects synchronous MoE bindings");
+    expect(rejects_ranked(deferred_registry,binding_request,buffer_request),"default status rejects deferred MoE bindings");
+    auto deferred_graph=deferred_binding;deferred_graph.require_graph_safe=true;
+    expect(rejects_ranked(deferred_registry,deferred_graph,buffer_request),"deferred status rejects graph-safe admission");
+    deferred_graph=deferred_binding;deferred_graph.device_graph_inputs=true;
+    expect(rejects_ranked(deferred_registry,deferred_graph,buffer_request),"deferred status rejects graph dynamic inputs");
+    auto deferred_rows=deferred_binding;deferred_rows.logical_rows=2;
+    expect(rejects_ranked(deferred_registry,deferred_rows,buffer_request),"deferred status rejects multirow execution");
+    auto deferred_q51=q51_binding;deferred_q51.q4k_a8g32_gate_up=true;deferred_q51.deferred_moe_status=true;
+    auto deferred_q51_buffers=q51_buffers;deferred_q51_buffers.q4k_a8g32_gate_up=true;
+    const auto deferred_q51_registry=make_registry(model,deferred_q51);
+    const auto deferred_q51_compiled=strix::compile_serial_execution(model,deferred_q51_registry,deferred_q51,deferred_q51_buffers);
+    expect(deferred_q51_compiled.execution_identity!=q51_compiled.execution_identity,
+        "deferred marker preserves existing grouped and A8 suffix validation");
 
     if (failures == 0) {
         std::cout << "compiled execution tests passed\n";
