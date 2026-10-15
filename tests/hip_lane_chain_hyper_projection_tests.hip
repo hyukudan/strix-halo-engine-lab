@@ -158,10 +158,14 @@ void bench(const Options& a){
         std::vector<Fixture*> pool;if(copies==1)pool.push_back(&f);else for(auto& copy:rotated)pool.push_back(copy.get());
         std::vector<std::unique_ptr<Graph>> base_graphs,candidate_graphs;
         if(captured)for(auto* fixture:pool){base_graphs.push_back(std::make_unique<Graph>());candidate_graphs.push_back(std::make_unique<Graph>());fixture->capture(*base_graphs.back(),false,0,1,stream.value);fixture->capture(*candidate_graphs.back(),true,opw,prefetch,stream.value);}
-        unsigned base_cursor=0,candidate_cursor=0;
+        // Prime the entire cyclic working set before either arm is sampled.
+        for(auto* fixture:pool)fixture->launch(false,0,1,true,stream.value);
+        check(hipStreamSynchronize(stream.value),"drain cyclic priming");
+        for(auto* fixture:pool)fixture->verify(false);
+        unsigned cursor=0;
         const auto sample=[&](bool candidate){
             for(auto* fixture:pool)fixture->poison(candidate,stream.value);
-            auto& cursor=candidate?candidate_cursor:base_cursor;std::vector<bool> touched(pool.size(),false);
+            std::vector<bool> touched(pool.size(),false);
             check(hipEventRecord(events.start,stream.value),"record start");
             for(unsigned call=0;call<a.iterations;++call){const auto index=cursor;cursor=(cursor+1U)%copies;touched[index]=true;auto* fixture=pool[index];if(captured)check(hipGraphLaunch(candidate?candidate_graphs[index]->executable:base_graphs[index]->executable,stream.value),"launch timed graph");else fixture->launch(candidate,candidate?opw:0U,candidate?prefetch:1U,true,stream.value);}
             check(hipEventRecord(events.stop,stream.value),"record stop");check(hipEventSynchronize(events.stop),"drain timed events");float ms=0;check(hipEventElapsedTime(&ms,events.start,events.stop),"read event timing");require(std::isfinite(ms)&&ms>0,"invalid event interval");
@@ -171,7 +175,7 @@ void bench(const Options& a){
         for(unsigned pair=0;pair<a.warmup;++pair){static_cast<void>(sample(pair%2U!=0));static_cast<void>(sample(pair%2U==0));}
         std::vector<double> base,candidate,ratios;
         for(unsigned pair=0;pair<a.pairs;++pair){double b=0,c=0;if(pair%2U==0){b=sample(false);c=sample(true);}else{c=sample(true);b=sample(false);}base.push_back(b);candidate.push_back(c);ratios.push_back(b/c);}
-        out<<(first?"":",")<<"{\"cache_mode\":"<<quoted(copies==1?"hot-single-copy":"rotating-private-copies")<<",\"copies\":"<<copies<<",\"down_working_set_bytes\":"<<static_cast<std::uint64_t>(down.data.size())*copies<<",\"opw\":"<<opw<<",\"prefetch\":"<<prefetch<<",\"graph\":"<<(captured?"true":"false")<<",\"base_us\":";array(out,base);out<<",\"candidate_us\":";array(out,candidate);out<<",\"paired_speedup\":";array(out,ratios);out<<",\"base_median_us\":"<<median(base)<<",\"candidate_median_us\":"<<median(candidate)<<",\"paired_speedup_median\":"<<median(ratios)<<",\"every_timed_output_exact\":true}";first=false;out.flush();require(out.good(),"microbench receipt write failed");
+        out<<(first?"":",")<<"{\"cache_mode\":"<<quoted(copies==1?"hot-single-copy":"rotating-private-copies")<<",\"copies\":"<<copies<<",\"reuse_distance_calls\":"<<copies<<",\"reuse_distance_down_bytes\":"<<static_cast<std::uint64_t>(down.data.size())*copies<<",\"down_working_set_bytes\":"<<static_cast<std::uint64_t>(down.data.size())*copies<<",\"opw\":"<<opw<<",\"prefetch\":"<<prefetch<<",\"graph\":"<<(captured?"true":"false")<<",\"base_us\":";array(out,base);out<<",\"candidate_us\":";array(out,candidate);out<<",\"paired_speedup\":";array(out,ratios);out<<",\"base_median_us\":"<<median(base)<<",\"candidate_median_us\":"<<median(candidate)<<",\"paired_speedup_median\":"<<median(ratios)<<",\"every_timed_output_exact\":true}";first=false;out.flush();require(out.good(),"microbench receipt write failed");
     }
     }
     require(libraries()==loaded,"loaded Core10 library identities changed during benchmark");
