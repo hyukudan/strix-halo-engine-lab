@@ -1617,6 +1617,23 @@ register_for_compiled_execution(
             "HIP hyper-mix bundle requires valid compiled execution");
     }
 
+    // Fail atomically for the typed selection before registering its first id.
+    if (config_.typed_projection) {
+        ExecutionBindingRequest expected;
+        expected.logical_rows = compiled.logical_rows;
+        expected.request_concurrency = compiled.request_concurrency;
+        const auto selected_id = kernel_id(expected, config_);
+        for (std::size_t index = 0; index < compiled.execution.steps.size(); ++index) {
+            const auto op = compiled.execution.steps[index].op;
+            if (op != SerialOp::attn_hyper_mix && op != SerialOp::mlp_hyper_mix &&
+                op != SerialOp::final_hyper_mix) continue;
+            const auto& binding = compiled.bindings.bindings[index];
+            if (binding.host_or_runtime_step || !binding.kernel_id.has_value() ||
+                *binding.kernel_id != selected_id)
+                throw std::invalid_argument("typed hyper bundle differs from selected kernel identity");
+        }
+    }
+
     std::string registered_id;
     for (std::size_t index = 0;
          index <
@@ -1640,14 +1657,6 @@ register_for_compiled_execution(
             binding.kernel_id->empty()) {
             throw std::invalid_argument(
                 "HIP hyper-mix step has no kernel binding");
-        }
-
-        if (config_.typed_projection) {
-            ExecutionBindingRequest expected;
-            expected.logical_rows = compiled.logical_rows;
-            expected.request_concurrency = compiled.request_concurrency;
-            if (*binding.kernel_id != kernel_id(expected, config_))
-                throw std::invalid_argument("typed hyper bundle differs from selected kernel identity");
         }
 
         if (registered_id.empty()) {

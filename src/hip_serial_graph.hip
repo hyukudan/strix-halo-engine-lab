@@ -143,7 +143,7 @@ HipSerialGraph::HipSerialGraph(CompiledSerialExecution compiled, std::shared_ptr
     if (!resources.session_state_layout || !resources.session_state_memory || resources.ple_lookup ||
         resources.ple_prefetch || resources.ple_hash_contract)
         throw std::invalid_argument("whole graph resources must omit eager host lookup/preprocessing");
-    p.catalog->register_for_compiled_execution(p.compiled, p.launchers);
+    p.catalog->register_for_compiled_execution(p.compiled, p.launchers, &resources);
     // Catalog must register the dedicated no-host-write position implementation.
     const auto* position = p.launchers.find_runtime_launcher(SerialOp::position_prepare);
     if (!position || position->implementation_identity != graph_position_identity || position->function != &graph_position_prepare)

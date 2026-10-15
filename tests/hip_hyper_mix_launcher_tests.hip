@@ -24,6 +24,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace {
@@ -1050,6 +1051,16 @@ void run_numeric_fixture(
             catch (const std::invalid_argument&) { wrong_model_rejected = true; }
             expect(wrong_model_rejected, "whole-model typed preflight fails closed on wrong down format");
             manifest.tensors[1].ggml_type = old_down_type;
+            const auto old_inject_type = manifest.tensors[3].ggml_type;
+            manifest.tensors[3].ggml_type = 8U;
+            bool wrong_inject_rejected = false;
+            try { strix::preflight_typed_hyper_projection_model(preflight_compiled, preflight_resources); }
+            catch (const std::invalid_argument& e) {
+                wrong_inject_rejected = std::string_view(e.what()) ==
+                    "typed hyper model contains a non-F32 injection projection";
+            }
+            expect(wrong_inject_rejected, "whole-model typed preflight independently rejects wrong injection format");
+            manifest.tensors[3].ggml_type = old_inject_type;
             auto late_manifest = manifest;
             auto bad_down = late_manifest.tensors[1]; bad_down.ggml_type = 0U;
             late_manifest.tensors.push_back(bad_down);
@@ -1081,7 +1092,10 @@ void run_numeric_fixture(
                       "snapshot typed rejection injection");
             bool rejected = false;
             try { typed_launcher.function(context, typed_launcher.user_data); }
-            catch (const std::invalid_argument&) { rejected = true; }
+            catch (const std::invalid_argument& e) {
+                rejected = std::string_view(e.what()) ==
+                    "typed hyper projection requires Q8_0 down and F32 injection";
+            }
             expect(rejected, "typed per-launch format defense rejects before enqueue");
             check(hipDeviceSynchronize(), "drain typed rejected launch");
             std::vector<std::byte> after(untouched.size());
@@ -1290,6 +1304,11 @@ void test_catalog_and_bundle() {
                typed_registry.variants().front().compiler_identity != fused_variant.compiler_identity &&
                typed_registry.variants().front().resources.lds_bytes == fused_variant.resources.lds_bytes,
            "typed projection changes identity while retaining v5 geometry and LDS bounds");
+    const auto typed_golden = strix::make_hip_hyper_mix_launcher("test.typed.golden", &typed_config);
+    expect(typed_golden.implementation_identity == 13117369992274356318ULL &&
+               typed_registry.variants().front().id == golden_base + ".parallel.staged.fused-injection-v5.typed-q8-f32-v1" &&
+               typed_registry.variants().front().compiler_identity == "hip-gfx1151-hyper-mix-v6-typed-projection",
+           "typed implementation, kernel and compiler goldens are stable");
     auto invalid_typed = typed_config; invalid_typed.fused_injection = false;
     bool invalid_typed_rejected = false;
     try { (void)strix::make_hip_hyper_mix_launcher("invalid.typed", &invalid_typed); }
@@ -1330,6 +1349,41 @@ void test_catalog_and_bundle() {
     catch (const std::invalid_argument&) { missing_typed_resources_rejected = true; }
     expect(missing_typed_resources_rejected,
            "typed bundle refuses registration without complete model preflight resources");
+
+    strix::ModelManifest typed_manifest;
+    typed_manifest.tensors.resize(2);
+    typed_manifest.tensors[0].ggml_type = 8U;
+    typed_manifest.tensors[1].ggml_type = 0U;
+    strix::ExecutionTensorAccessPlan typed_access;
+    for (const auto& mixer : execution.steps) {
+        if (mixer.op != strix::SerialOp::attn_hyper_mix && mixer.op != strix::SerialOp::mlp_hyper_mix &&
+            mixer.op != strix::SerialOp::final_hyper_mix) continue;
+        typed_access.accesses.push_back({mixer.id, mixer.op, 1U, {0U}});
+        if (mixer.op != strix::SerialOp::final_hyper_mix)
+            typed_access.accesses.push_back({mixer.id, mixer.op, 3U, {1U}});
+    }
+    strix::ExecutionRuntimeResources typed_resources;
+    typed_resources.model_manifest = &typed_manifest;
+    typed_resources.tensor_access = &typed_access;
+    auto typed_compiled = compiled;
+    typed_compiled.bindings = strix::bind_serial_execution_plan(model, execution, typed_registry, request);
+    strix::ExecutionLauncherRegistry valid_typed_registry;
+    typed_bundle.register_for_compiled_execution(typed_compiled, valid_typed_registry, &typed_resources);
+    expect(valid_typed_registry.find_kernel_launcher(typed_registry.variants().front().id) != nullptr,
+           "complete model resources permit typed bundle registration");
+    for (std::size_t index = typed_compiled.execution.steps.size(); index-- > 0;) {
+        const auto op = typed_compiled.execution.steps[index].op;
+        if (op != strix::SerialOp::attn_hyper_mix && op != strix::SerialOp::mlp_hyper_mix &&
+            op != strix::SerialOp::final_hyper_mix) continue;
+        typed_compiled.bindings.bindings[index].kernel_id = golden_base;
+        break;
+    }
+    strix::ExecutionLauncherRegistry atomic_typed_registry;
+    bool late_id_rejected = false;
+    try { typed_bundle.register_for_compiled_execution(typed_compiled, atomic_typed_registry, &typed_resources); }
+    catch (const std::invalid_argument&) { late_id_rejected = true; }
+    expect(late_id_rejected && atomic_typed_registry.find_kernel_launcher(typed_registry.variants().front().id) == nullptr,
+           "wrong final mixer id rejects before registering the first typed launcher");
 
     strix::ExecutionLauncherRegistry launchers;
     strix::HipHyperMixLauncherBundle bundle(
