@@ -86,7 +86,7 @@ embedding_config(
 HipHyperMixLauncherConfig
 hyper_mix_config(
     const ModelContract& model,
-    HipActivationStorage activation, bool parallel, bool staged, bool fused) {
+    HipActivationStorage activation, bool parallel, bool staged, bool fused, bool typed) {
     HipHyperMixLauncherConfig config;
     config.hidden_size =
         checked_u32(
@@ -108,6 +108,7 @@ hyper_mix_config(
     config.parallel = parallel;
     config.staged_projections = staged;
     config.fused_injection = fused;
+    config.typed_projection = typed;
     return config;
 }
 
@@ -301,7 +302,7 @@ void register_complete_hip_kernel_catalog(
     const auto hyper_mix =
         hyper_mix_config(
             model,
-            config.activation, config.parallel_hyper_mix, config.staged_hyper_projections, config.fused_staged_hyper_mix);
+            config.activation, config.parallel_hyper_mix, config.staged_hyper_projections, config.fused_staged_hyper_mix, config.typed_hyper_projection);
     register_hip_hyper_mix_kernel_variant(
         model,
         request,
@@ -385,7 +386,7 @@ HipLauncherCatalog::HipLauncherCatalog(
       hyper_mix_(
           hyper_mix_config(
               model,
-              config.activation, config.parallel_hyper_mix, config.staged_hyper_projections, config.fused_staged_hyper_mix)),
+              config.activation, config.parallel_hyper_mix, config.staged_hyper_projections, config.fused_staged_hyper_mix, config.typed_hyper_projection)),
       moe_route_(
           moe_route_config(
               model,
@@ -417,7 +418,8 @@ HipLauncherCatalog::HipLauncherCatalog(
 void HipLauncherCatalog::
 register_for_compiled_execution(
     const CompiledSerialExecution& compiled,
-    ExecutionLauncherRegistry& registry) {
+    ExecutionLauncherRegistry& registry,
+    const ExecutionRuntimeResources* resources) {
     if (compiled.device_graph_inputs != device_graph_inputs_)
         throw std::invalid_argument("launcher catalog graph mode differs from compiled plan");
     if (device_graph_inputs_) register_hip_graph_position_launcher(registry);
@@ -445,7 +447,7 @@ register_for_compiled_execution(
     hyper_mix_.
         register_for_compiled_execution(
             compiled,
-            registry);
+            registry, resources);
     moe_route_.
         register_for_compiled_execution(
             compiled,

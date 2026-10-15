@@ -169,6 +169,7 @@ struct Options {
     bool parallel_hyper_mix = false;
     bool staged_hyper_projections = false;
     bool fused_staged_hyper_mix = false;
+    bool typed_hyper_projection = false;
     bool virtual_q8_lm_head = false;
     bool parallel_moe_router = false;
     std::uint64_t ple_max_rows_per_io = 4;
@@ -196,7 +197,7 @@ Options parse_options(
             "[--planned-ple-io] [--ple-max-rows-per-io N] [--ple-max-inflight-ios N] "
             "[--generate N] [--eos-token TOKEN_ID] [--prefix-cache-roundtrip] "
             "[--parallel-moe-router] [--virtual-q8-lm-head] "
-            "[--parallel-hyper-mix [--staged-hyper-projections [--fused-staged-hyper-mix]]]");
+            "[--parallel-hyper-mix [--staged-hyper-projections [--fused-staged-hyper-mix [--typed-fused-hyper-projections]]]]");
     }
 
     Options options;
@@ -212,6 +213,11 @@ Options parse_options(
         if (argument == "--parallel-moe-router") {
             if (options.parallel_moe_router) throw std::invalid_argument("duplicate parallel MoE router option");
             options.parallel_moe_router = true;
+            continue;
+        }
+        if (argument == "--typed-fused-hyper-projections") {
+            if (options.typed_hyper_projection) throw std::invalid_argument("duplicate typed hyper projection option");
+            options.typed_hyper_projection = true;
             continue;
         }
         if (argument == "--parallel-hyper-mix") {
@@ -470,6 +476,8 @@ Options parse_options(
         throw std::invalid_argument(
             "ple-max-inflight-ios must be non-zero");
     }
+    if (options.typed_hyper_projection && !(options.parallel_hyper_mix && options.staged_hyper_projections && options.fused_staged_hyper_mix))
+        throw std::invalid_argument("typed hyper projections require parallel, staged and fused options");
     if (options.staged_hyper_projections && !options.parallel_hyper_mix)
         throw std::invalid_argument("--staged-hyper-projections requires --parallel-hyper-mix");
     if (options.fused_staged_hyper_mix && !options.staged_hyper_projections)
@@ -858,6 +866,7 @@ int main(
     catalog_config.parallel_hyper_mix = options.parallel_hyper_mix;
     catalog_config.staged_hyper_projections = options.staged_hyper_projections;
     catalog_config.fused_staged_hyper_mix = options.fused_staged_hyper_mix;
+    catalog_config.typed_hyper_projection = options.typed_hyper_projection;
     catalog_config.virtual_q8_lm_head = options.virtual_q8_lm_head;
     catalog_config.parallel_moe_router = options.parallel_moe_router;
     binding_request.parallel_moe_router = options.parallel_moe_router;
@@ -1023,7 +1032,7 @@ int main(
     }
     auto launcher_catalog = std::make_shared<strix::HipLauncherCatalog>(model, catalog_config, integer_bundle);
     strix::ExecutionLauncherRegistry launchers;
-    launcher_catalog->register_for_compiled_execution(compiled, launchers);
+    launcher_catalog->register_for_compiled_execution(compiled, launchers, &resources);
     if (launcher_catalog->audit(compiled, launchers).missing_steps)
         throw std::logic_error("HIP launcher catalog is incomplete for actual compiled execution");
     const auto launch_plan = strix::compile_launch_plan(compiled, launchers);

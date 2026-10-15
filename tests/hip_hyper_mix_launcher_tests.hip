@@ -458,6 +458,65 @@ ReferenceResult reference(const std::vector<float>& input, const std::vector<flo
     return result;
 }
 
+template <std::uint32_t Width>
+struct TypedProjectionFixture {
+    static constexpr std::uint32_t hidden = Width / 4U, hc = 4U, lowrank = 320U, expanded = Width;
+    static constexpr std::uint32_t down_type = 8U, up_type = 8U, inject_type = 0U;
+    std::vector<float> input, norm, inject;
+    std::vector<Q8Block> down, up;
+    TypedProjectionFixture() : input(Width), norm(Width), inject(Width * hc),
+        down(lowrank * (Width / 32U)), up(Width * (lowrank / 32U)) {
+        static_assert(Width % 32U == 0U && Width % hc == 0U);
+        constexpr std::array<std::uint16_t, 10> scales{0U, 0x8000U, 1U, 0x8001U, 0x1000U,
+            0x1400U, 0x2000U, 0x2400U, 0x3000U, 0x7bffU};
+        constexpr std::array<int, 8> codes{-128, -127, -17, -1, 0, 1, 63, 127};
+        for (std::size_t i = 0; i < Width; ++i) {
+            input[i] = static_cast<float>(static_cast<int>(i % 23U) - 11) / 17.0F;
+            norm[i] = static_cast<float>(static_cast<int>(i % 13U) - 6) / 29.0F;
+        }
+        for (std::size_t b = 0; b < down.size(); ++b) {
+            const auto bits = scales[b % scales.size()];
+            std::memcpy(&down[b].scale, &bits, sizeof(bits));
+            for (std::size_t j = 0; j < 32; ++j)
+                down[b].values[j] = static_cast<std::int8_t>(bits == 0x7bffU ? 0 : codes[(j + b * 3U) % codes.size()]);
+        }
+        for (std::size_t b = 0; b < up.size(); ++b) {
+            const auto bits = static_cast<std::uint16_t>(0x0800U + (b % 7U) * 0x0100U);
+            std::memcpy(&up[b].scale, &bits, sizeof(bits));
+            for (std::size_t j = 0; j < 32; ++j)
+                up[b].values[j] = static_cast<std::int8_t>(static_cast<int>((b + j * 3U) % 15U) - 7);
+        }
+        // A visible, isolated gate makes the last-block mutation meaningful
+        // even after final BF16 storage. Other rows retain varied coefficients.
+        for (std::size_t b = 0; b < Width / 32U; ++b)
+            std::fill(std::begin(down[b].values), std::end(down[b].values), static_cast<std::int8_t>(0));
+        const std::uint16_t unit_scale = 0x3c00U;
+        std::memcpy(&down[Width / 32U - 1U].scale, &unit_scale, sizeof(unit_scale));
+        down[Width / 32U - 1U].values[30] = 1;
+        for (std::size_t b = 0; b < lowrank / 32U; ++b)
+            std::fill(std::begin(up[b].values), std::end(up[b].values), static_cast<std::int8_t>(0));
+        std::memcpy(&up[0].scale, &unit_scale, sizeof(unit_scale));
+        up[0].values[0] = 16;
+        for (std::size_t i = 0; i < inject.size(); ++i) {
+            const float ordinary = static_cast<float>(static_cast<int>((i * 7U + i / 11U) % 31U) - 15) / 997.0F;
+            inject[i] = std::nextafter(ordinary, i % 2U ? -INFINITY : INFINITY);
+        }
+    }
+};
+
+ReferenceResult reference(const std::vector<float>& input, const std::vector<float>& norm,
+    const std::vector<Q8Block>& down, const std::vector<Q8Block>& up, const std::vector<float>& inject,
+    std::uint32_t hidden, std::uint32_t hc, std::uint32_t lowrank, float epsilon, bool with_injection) {
+    const auto unpack = [](const std::vector<Q8Block>& blocks) {
+        std::vector<float> values(blocks.size() * 32U);
+        for (std::size_t b = 0; b < blocks.size(); ++b)
+            for (std::size_t j = 0; j < 32; ++j)
+                values[b * 32U + j] = __half2float(blocks[b].scale) * static_cast<float>(blocks[b].values[j]);
+        return values;
+    };
+    return reference(input, norm, unpack(down), unpack(up), inject, hidden, hc, lowrank, epsilon, with_injection);
+}
+
 template <typename FixtureType = Fixture>
 void run_numeric_fixture(
     strix::SerialOp op,
@@ -956,6 +1015,128 @@ void run_numeric_fixture(
     check(hipGraphExecDestroy(fused_executable), "destroy fused executable");
     check(hipGraphDestroy(fused_graph), "destroy fused graph");
     check(hipStreamDestroy(fused_stream), "destroy fused stream");
+    if constexpr (Fixture::down_type == 8U && Fixture::inject_type == 0U) {
+        auto typed_config = fused_config;
+        typed_config.typed_projection = true;
+        auto typed_launcher = strix::make_hip_hyper_mix_launcher("test.hyper_mix.typed.q8.f32", &typed_config);
+        expect(typed_launcher.implementation_identity != fused_launcher.implementation_identity,
+               "typed projection has a unique implementation identity");
+        // Every compiled mixer is inspected, including the last binding.
+        strix::CompiledSerialExecution preflight_compiled;
+        preflight_compiled.execution = plan;
+        preflight_compiled.execution_identity = 1U;
+        strix::ExecutionTensorAccessPlan complete_access;
+        for (const auto& mixer : plan.steps) {
+            if (mixer.op != strix::SerialOp::attn_hyper_mix && mixer.op != strix::SerialOp::mlp_hyper_mix &&
+                mixer.op != strix::SerialOp::final_hyper_mix) continue;
+            complete_access.accesses.push_back({mixer.id, mixer.op, 1U, {1U}});
+            if (with_injection && mixer.op != strix::SerialOp::final_hyper_mix)
+                complete_access.accesses.push_back({mixer.id, mixer.op, 3U, {3U}});
+        }
+        auto preflight_resources = resources;
+        preflight_resources.tensor_access = &complete_access;
+        if (with_injection) strix::preflight_typed_hyper_projection_model(preflight_compiled, preflight_resources);
+        else {
+            bool incomplete_rejected = false;
+            try { strix::preflight_typed_hyper_projection_model(preflight_compiled, preflight_resources); }
+            catch (const std::invalid_argument&) { incomplete_rejected = true; }
+            expect(incomplete_rejected, "final-only resources cannot preflight a complete model");
+        }
+        if (with_injection) {
+            const auto old_down_type = manifest.tensors[1].ggml_type;
+            manifest.tensors[1].ggml_type = 0U;
+            bool wrong_model_rejected = false;
+            try { strix::preflight_typed_hyper_projection_model(preflight_compiled, preflight_resources); }
+            catch (const std::invalid_argument&) { wrong_model_rejected = true; }
+            expect(wrong_model_rejected, "whole-model typed preflight fails closed on wrong down format");
+            manifest.tensors[1].ggml_type = old_down_type;
+            auto late_manifest = manifest;
+            auto bad_down = late_manifest.tensors[1]; bad_down.ggml_type = 0U;
+            late_manifest.tensors.push_back(bad_down);
+            auto late_access = complete_access;
+            late_access.accesses.back().tensor_indices[0] = static_cast<std::uint32_t>(late_manifest.tensors.size() - 1U);
+            auto late_resources = preflight_resources;
+            late_resources.model_manifest = &late_manifest;
+            late_resources.tensor_access = &late_access;
+            bool late_rejected = false;
+            try { strix::preflight_typed_hyper_projection_model(preflight_compiled, late_resources); }
+            catch (const std::invalid_argument&) { late_rejected = true; }
+            expect(late_rejected, "typed preflight inspects the last of all mixer bindings");
+        }
+        for (unsigned invalid = 0; invalid < (with_injection ? 2U : 1U); ++invalid) {
+            const auto index = invalid == 0U ? 1U : 3U;
+            const auto previous = manifest.tensors[index].ggml_type;
+            manifest.tensors[index].ggml_type = invalid == 0U ? 0U : 8U;
+            poison_outputs(nullptr);
+            check(hipDeviceSynchronize(), "drain typed rejection poison");
+            std::vector<std::byte> untouched(static_cast<std::size_t>(workspace_address.bytes));
+            check(hipMemcpy(untouched.data(), reinterpret_cast<void*>(workspace_address.address), untouched.size(), hipMemcpyDeviceToHost),
+                  "snapshot typed rejection workspace");
+            std::vector<std::byte> output_before(Fixture::hidden * (bf16 ? sizeof(std::uint16_t) : sizeof(float)));
+            std::vector<std::byte> injection_before(with_injection ? Fixture::hc * sizeof(float) : 0U);
+            check(hipMemcpy(output_before.data(), reinterpret_cast<void*>(mixed_address.address), output_before.size(), hipMemcpyDeviceToHost),
+                  "snapshot typed rejection output");
+            if (with_injection)
+                check(hipMemcpy(injection_before.data(), reinterpret_cast<void*>(injection_address->address), injection_before.size(), hipMemcpyDeviceToHost),
+                      "snapshot typed rejection injection");
+            bool rejected = false;
+            try { typed_launcher.function(context, typed_launcher.user_data); }
+            catch (const std::invalid_argument&) { rejected = true; }
+            expect(rejected, "typed per-launch format defense rejects before enqueue");
+            check(hipDeviceSynchronize(), "drain typed rejected launch");
+            std::vector<std::byte> after(untouched.size());
+            check(hipMemcpy(after.data(), reinterpret_cast<void*>(workspace_address.address), after.size(), hipMemcpyDeviceToHost),
+                  "read typed rejected workspace");
+            std::vector<std::byte> output_after(output_before.size()), injection_after(injection_before.size());
+            check(hipMemcpy(output_after.data(), reinterpret_cast<void*>(mixed_address.address), output_after.size(), hipMemcpyDeviceToHost),
+                  "read typed rejection output");
+            if (with_injection)
+                check(hipMemcpy(injection_after.data(), reinterpret_cast<void*>(injection_address->address), injection_after.size(), hipMemcpyDeviceToHost),
+                      "read typed rejection injection");
+            expect(after == untouched && output_after == output_before && injection_after == injection_before,
+                   "wrong typed formats preserve all poisoned buffers byte for byte");
+            manifest.tensors[index].ggml_type = previous;
+        }
+        // A changed coefficient in the last block must affect the generic control.
+        auto changed_down = fixture.down;
+        changed_down[Fixture::expanded / 32U - 1U].values[30] = static_cast<std::int8_t>(
+            static_cast<std::uint8_t>(changed_down[Fixture::expanded / 32U - 1U].values[30]) ^ 0x3fU);
+        check(hipMemcpy(device_weights[1], changed_down.data(), changed_down.size() * sizeof(Q8Block), hipMemcpyHostToDevice),
+              "mutate last Q8 block as indexing sensitivity control");
+        poison_outputs(nullptr);
+        fused_launcher.function(context, fused_launcher.user_data);
+        check(hipDeviceSynchronize(), "drain generic mutation control");
+        expect(!outputs_match_expected_bits(), "last-block Q8 mutation changes generic output bits");
+        check(hipMemcpy(device_weights[1], fixture.down.data(), fixture.down.size() * sizeof(Q8Block), hipMemcpyHostToDevice),
+              "restore Q8 control weights");
+        hipStream_t typed_stream = nullptr;
+        hipGraph_t typed_graph = nullptr;
+        hipGraphExec_t typed_executable = nullptr;
+        check(hipStreamCreateWithFlags(&typed_stream, hipStreamNonBlocking), "create typed stream");
+        strix::HipLaunchContext typed_scope; typed_scope.stream = typed_stream;
+        {
+            strix::HipLaunchScope scope(typed_scope);
+            poison_outputs(typed_stream);
+            check(hipStreamSynchronize(typed_stream), "drain typed no-op poison");
+            expect(!outputs_match_expected_bits(), "typed no-op poison comparison cannot pass");
+            typed_launcher.function(context, typed_launcher.user_data);
+            check(hipStreamSynchronize(typed_stream), "drain typed eager run");
+            expect(outputs_match_expected_bits(), "typed eager output/injection preserve generic bits");
+            check(hipStreamBeginCapture(typed_stream, hipStreamCaptureModeThreadLocal), "capture typed projection");
+            typed_launcher.function(context, typed_launcher.user_data);
+            check(hipStreamEndCapture(typed_stream, &typed_graph), "finish typed capture");
+        }
+        check(hipGraphInstantiate(&typed_executable, typed_graph, nullptr, nullptr, 0), "instantiate typed graph");
+        for (unsigned replay = 0; replay < 3U; ++replay) {
+            poison_outputs(typed_stream);
+            check(hipGraphLaunch(typed_executable, typed_stream), "replay typed graph");
+            check(hipStreamSynchronize(typed_stream), "drain typed replay");
+            expect(outputs_match_expected_bits(), "poisoned typed replay preserves generic bits");
+        }
+        check(hipGraphExecDestroy(typed_executable), "destroy typed executable");
+        check(hipGraphDestroy(typed_graph), "destroy typed graph");
+        check(hipStreamDestroy(typed_stream), "destroy typed stream");
+    }
     auto invalid_fused_config = fused_config;
     invalid_fused_config.staged_projections = false;
     bool invalid_fused_rejected = false;
@@ -1083,6 +1264,37 @@ void test_catalog_and_bundle() {
            fused_variant.resources.scratch_bytes == staged_variant.resources.scratch_bytes,
            "fused injection retains staged LDS and admitted global workspace bounds");
 
+    const std::array<std::uint64_t, 4> golden_implementation{11360272515784746702ULL,13592587922752336111ULL,12691105065209337701ULL,744827713494104566ULL};
+    const std::array<std::string, 4> golden_compiler{"hip-gfx1151-hyper-mix-v2", "hip-gfx1151-hyper-mix-v3-parallel",
+        "hip-gfx1151-hyper-mix-v4-staged", "hip-gfx1151-hyper-mix-v5-fused-injection"};
+    const std::string golden_base = "hip.hyper_mix.bf16.h2560.hc4.lr320.r1.c1";
+    const std::array<std::string, 4> golden_suffix{"", ".parallel", ".parallel.staged", ".parallel.staged.fused-injection-v5"};
+    for (unsigned mode = 0; mode < 4U; ++mode) {
+        auto golden_config = config;
+        golden_config.parallel = mode >= 1U;
+        golden_config.staged_projections = mode >= 2U;
+        golden_config.fused_injection = mode >= 3U;
+        const auto golden_launcher = strix::make_hip_hyper_mix_launcher("test.golden", &golden_config);
+        strix::kernels::KernelRegistry golden_registry;
+        strix::register_hip_hyper_mix_kernel_variant(model, request, golden_config, golden_registry);
+        expect(golden_launcher.implementation_identity == golden_implementation[mode] &&
+                   golden_registry.variants().front().id == golden_base + golden_suffix[mode] &&
+                   golden_registry.variants().front().compiler_identity == golden_compiler[mode],
+               "v2 through v5 implementation, kernel and compiler goldens remain unchanged");
+    }
+    auto typed_config = fused_config;
+    typed_config.typed_projection = true;
+    strix::kernels::KernelRegistry typed_registry;
+    strix::register_hip_hyper_mix_kernel_variant(model, request, typed_config, typed_registry);
+    expect(typed_registry.variants().front().id != fused_variant.id &&
+               typed_registry.variants().front().compiler_identity != fused_variant.compiler_identity &&
+               typed_registry.variants().front().resources.lds_bytes == fused_variant.resources.lds_bytes,
+           "typed projection changes identity while retaining v5 geometry and LDS bounds");
+    auto invalid_typed = typed_config; invalid_typed.fused_injection = false;
+    bool invalid_typed_rejected = false;
+    try { (void)strix::make_hip_hyper_mix_launcher("invalid.typed", &invalid_typed); }
+    catch (const std::invalid_argument&) { invalid_typed_rejected = true; }
+    expect(invalid_typed_rejected, "typed projection requires fused staged parallel mode");
     const auto execution =
         strix::build_serial_decode_execution_plan(
             model);
@@ -1110,6 +1322,14 @@ void test_catalog_and_bundle() {
         execution;
     compiled.bindings =
         bindings;
+
+    strix::HipHyperMixLauncherBundle typed_bundle(typed_config);
+    strix::ExecutionLauncherRegistry rejected_typed_registry;
+    bool missing_typed_resources_rejected = false;
+    try { typed_bundle.register_for_compiled_execution(compiled, rejected_typed_registry); }
+    catch (const std::invalid_argument&) { missing_typed_resources_rejected = true; }
+    expect(missing_typed_resources_rejected,
+           "typed bundle refuses registration without complete model preflight resources");
 
     strix::ExecutionLauncherRegistry launchers;
     strix::HipHyperMixLauncherBundle bundle(
@@ -1155,6 +1375,14 @@ int main() try {
     run_numeric_fixture<DenseTailFixture>(strix::SerialOp::attn_hyper_mix, true, true);
     run_numeric_fixture<DenseTailFixture>(strix::SerialOp::final_hyper_mix, false, true);
 
+    for (const auto op : {strix::SerialOp::attn_hyper_mix, strix::SerialOp::mlp_hyper_mix, strix::SerialOp::final_hyper_mix}) {
+        const bool injection = op != strix::SerialOp::final_hyper_mix;
+        for (const bool bf16 : {false, true}) {
+            run_numeric_fixture<TypedProjectionFixture<288>>(op, injection, bf16);
+            run_numeric_fixture<TypedProjectionFixture<320>>(op, injection, bf16);
+            run_numeric_fixture<TypedProjectionFixture<384>>(op, injection, bf16);
+        }
+    }
     if (failures == 0) {
         std::cout
             << "HIP hyper-mix launcher tests passed\n";
