@@ -7,6 +7,9 @@ catalog/launcher evidence stays unknown, even when tensor admission succeeds.
 import argparse
 import hashlib
 import json
+import math
+import re
+from decimal import Decimal, InvalidOperation
 import os
 from pathlib import Path
 import struct
@@ -23,8 +26,14 @@ def load_json(path):
             result[key] = value
         return result
 
+    def finite_float(text):
+        value = float(text)
+        if not math.isfinite(value):
+            raise ValueError(f"nonfinite JSON number: {text}")
+        return value
+
     value = json.loads(Path(path).read_text(encoding="utf-8-sig"),
-                       object_pairs_hook=unique,
+                       object_pairs_hook=unique, parse_float=finite_float,
                        parse_constant=lambda value: (_ for _ in ()).throw(
                            ValueError(f"nonfinite JSON value: {value}")))
     if not isinstance(value, dict):
@@ -64,26 +73,37 @@ def cmake_cache(path):
         name, colon, kind = declaration.partition(":")
         if not separator or not colon:
             raise ValueError("malformed CMake cache entry")
+        # Unrelated cache settings cannot invalidate this selected configuration.
+        if not (name.startswith("STRIX_") or name == "BUILD_TESTING"
+                or name in ("CMAKE_BUILD_TYPE", "CMAKE_GENERATOR", "CMAKE_HOME_DIRECTORY")
+                or name.startswith(("CMAKE_CXX_", "CMAKE_HIP_", "CMAKE_EXE_LINKER_FLAGS"))):
+            continue
         if name in values:
             raise ValueError(f"duplicate CMake cache entry: {name}")
         if kind == "BOOL":
-            if value.upper() in ("ON", "TRUE", "YES", "1"):
+            upper = value.upper()
+            if upper in ("ON", "TRUE", "YES", "Y"):
                 value = True
-            elif value.upper() in ("OFF", "FALSE", "NO", "0", "", "NOTFOUND"):
+            elif upper in ("OFF", "FALSE", "NO", "N", "0", "", "IGNORE", "NOTFOUND") or upper.endswith("-NOTFOUND"):
                 value = False
+            elif re.fullmatch(r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?", value):
+                try:
+                    value = Decimal(value) != 0
+                except InvalidOperation as error:
+                    raise ValueError(f"invalid CMake numeric boolean: {name}") from error
             else:
                 raise ValueError(f"unrecognized CMake boolean: {name}")
-        if (name.startswith("STRIX_") or name == "BUILD_TESTING"
-                or name in ("CMAKE_BUILD_TYPE", "CMAKE_GENERATOR", "CMAKE_HOME_DIRECTORY")
-                or name.startswith(("CMAKE_CXX_", "CMAKE_HIP_", "CMAKE_EXE_LINKER_FLAGS"))):
-            values[name] = value
+        values[name] = value
     return values
 
 
 def source_identity(repo):
     def git(*arguments):
-        result = subprocess.run(["git", "-C", str(repo), *arguments],
-                                capture_output=True, text=True, check=False)
+        try:
+            result = subprocess.run(["git", "-C", str(repo), *arguments],
+                                    capture_output=True, text=True, check=False)
+        except OSError:
+            return None
         return result.stdout.strip() if result.returncode == 0 else None
 
     revision = git("rev-parse", "HEAD")
@@ -94,9 +114,45 @@ def source_identity(repo):
 
 
 def integer(value, label):
-    if type(value) is not int or value < 0:
-        raise ValueError(f"{label} must be a nonnegative integer")
+    if type(value) is not int or value < 0 or value > 0xffffffffffffffff:
+        raise ValueError(f"{label} must be a uint64 integer")
     return value
+
+
+def boolean(value, label):
+    if type(value) is not bool:
+        raise ValueError(f"{label} must be a boolean")
+    return value
+
+
+def hex_identity(value, label, lengths=(64,)):
+    if (not isinstance(value, str) or len(value) not in lengths
+            or re.fullmatch(r"[0-9a-fA-F]+", value) is None):
+        raise ValueError(f"{label} must be a hexadecimal identity of length {lengths}")
+    return value
+
+
+def closed_keys(value, required, optional, label):
+    if not isinstance(value, dict) or not set(required) <= value.keys() or value.keys() - (set(required) | set(optional)):
+        raise ValueError(f"{label} has missing or unknown keys")
+
+
+def validate_outer_receipt(receipt):
+    # Outer receipts and external audit/probe schemas remain open: only fields
+    # consumed here are checked. A missing or explicit null identity stays unknown.
+    for key in ("execution_identity", "kernel_plan_identity", "launch_plan_identity",
+                "runtime_compatibility_identity", "context_tokens", "final_position",
+                "next_position", "committed_tokens", "steps_executed"):
+        if receipt.get(key) is not None:
+            integer(receipt[key], key)
+    for key in ("model_sha256", "model_content_identity", "binary_sha256"):
+        if receipt.get(key) is not None:
+            hex_identity(receipt[key], key)
+    if receipt.get("source_revision") is not None:
+        hex_identity(receipt["source_revision"], "source_revision", (40, 64))
+    for key in ("q4k_a8g32_gate_up", "grouped_exact_q51_down"):
+        if key in receipt:
+            boolean(receipt[key], key)
 
 
 def profile(receipt):
@@ -160,6 +216,16 @@ def selected_operator_records(inventory, receipt, tensor_records, conflicts):
             or inventory.get("native_execution_observed") is not None
             or inventory.get("qualification") is not None):
         raise ValueError("unsupported execution_inventory receipt or scope")
+    # Closed keys apply only to our versioned exporter, never to the enclosing
+    # decoder receipt or external model/tensor/platform evidence.
+    closed_keys(inventory,
+        {"schema_version", "evidence_kind", "phase", "selected_logical_rows",
+         "selected_request_concurrency", "verify_admitted_by_this_receipt",
+         "prefill_admitted_by_this_receipt", "execution_identity", "kernel_plan_identity",
+         "launch_plan_identity", "native_execution_observed", "qualification", "steps"},
+        {"whole_plan_graph_safe_declared"}, "execution inventory")
+    if "whole_plan_graph_safe_declared" in inventory:
+        boolean(inventory["whole_plan_graph_safe_declared"], "whole-plan graph declaration")
     rows = integer(inventory.get("selected_logical_rows"), "selected logical rows")
     concurrency = integer(inventory.get("selected_request_concurrency"), "selected request concurrency")
     if not rows or not concurrency:
@@ -175,12 +241,17 @@ def selected_operator_records(inventory, receipt, tensor_records, conflicts):
     formats = {record["operator"]: record for record in tensor_records if record["phase"] == "decode"}
     result = []
     for index, step in enumerate(steps):
+        closed_keys(step,
+            {"step_id", "operator", "layer", "runtime_step", "launcher_bound",
+             "launcher_implementation_identity", "kernel_id", "declared_variant"},
+            set(), "execution step")
         if (not isinstance(step, dict) or type(step.get("step_id")) is not int
                 or step["step_id"] != index or not isinstance(step.get("operator"), str)
                 or not step["operator"] or type(step.get("runtime_step")) is not bool
                 or step.get("launcher_bound") is not True
                 or not integer(step.get("launcher_implementation_identity"), "launcher identity")):
             raise ValueError("invalid selected launcher step")
+        integer(step["step_id"], "step id")
         if step.get("layer") is not None:
             integer(step["layer"], "layer")
         variant = step.get("declared_variant")
@@ -196,13 +267,26 @@ def selected_operator_records(inventory, receipt, tensor_records, conflicts):
                     or variant["request_concurrency"] != concurrency
                     or type(variant.get("graph_safe")) is not bool
                     or variant.get("qualification") not in (
-                        "experimental", "oracle_matched", "target_qualified", "production")):
+                        "experimental", "oracle_matched", "target_qualified", "production", "rejected")):
                 raise ValueError("variant declaration differs from selected decode binding")
+            closed_keys(variant,
+                {"id", "phase", "logical_rows", "request_concurrency", "graph_safe",
+                 "qualification", "input_layout", "output_layout", "compiler_identity", "numerics"},
+                {"family", "hidden_size", "auxiliary_size", "wave_size"}, "declared variant")
+            for key in ("logical_rows", "request_concurrency", "family", "hidden_size", "auxiliary_size", "wave_size"):
+                if key in variant:
+                    integer(variant[key], "variant " + key)
             numerics = variant.get("numerics")
             if (not isinstance(numerics, dict) or any(
                     not isinstance(numerics.get(key), str) or not numerics[key]
                     for key in ("input_precision", "accumulator_precision", "output_precision"))):
                 raise ValueError("invalid declared variant numerics")
+            closed_keys(numerics,
+                {"input_precision", "accumulator_precision", "output_precision"},
+                {"row_invariant", "deterministic"}, "declared numerics")
+            for key in ("row_invariant", "deterministic"):
+                if key in numerics:
+                    boolean(numerics[key], "numerics " + key)
             for key in ("input_layout", "output_layout", "compiler_identity"):
                 if not isinstance(variant.get(key), str) or not variant[key]:
                     raise ValueError("invalid variant layout/compiler declaration")
@@ -251,6 +335,7 @@ def collect(repo, cache_path=None, receipt_path=None, audit_path=None, manifest_
         if inputs["cmake_cache"] != fingerprint(cache_path):
             raise ValueError("CMake cache changed while reading")
     source = source_identity(repo)
+    validate_outer_receipt(receipt)
     effective = profile(receipt)
     conflicts = []
 
@@ -260,8 +345,14 @@ def collect(repo, cache_path=None, receipt_path=None, audit_path=None, manifest_
 
     hip = cache.get("STRIX_ENABLE_HIP_RUNTIME")
     a8 = cache.get("STRIX_ENABLE_EXPERIMENTAL_Q4K_A8_RUNTIME")
+    for name, value in (("STRIX_ENABLE_HIP_RUNTIME", hip), ("STRIX_ENABLE_EXPERIMENTAL_Q4K_A8_RUNTIME", a8)):
+        if value is not None:
+            boolean(value, name)
     if hip is False and a8 is True:
         conflicts.append({"field": "build", "reason": "A8 configured without HIP runtime"})
+    for flag in ("q4k_a8g32_gate_up", "grouped_exact_q51_down"):
+        if a8 is False and flag in receipt:
+            agree("build/" + flag, False, receipt[flag])
     applied = effective["automatic_applied"]
     if applied is not None:
         agree("profile/manual", effective["selected"] == "manual", not applied)
@@ -283,6 +374,9 @@ def collect(repo, cache_path=None, receipt_path=None, audit_path=None, manifest_
     binary = fingerprint(binary_path) if binary_path else None
     if binary:
         agree("binary_sha256", binary["sha256"], receipt.get("binary_sha256"))
+    for evidence, key in ((manifest, "layout_identity"), (audit, "manifest_layout_identity")):
+        if evidence.get(key) is not None:
+            integer(evidence[key], key)
     if audit and manifest:
         agree("manifest_layout_identity", manifest.get("layout_identity"), audit.get("manifest_layout_identity"))
     capacity_declared, occupied_declared = capacity is not None, occupied is not None
@@ -360,7 +454,7 @@ def main(argv=None):
             args.output.write_text(text, encoding="utf-8")
         else:
             sys.stdout.write(text)
-        return 0 if result["consistent"] else 2
+        return 0 if result["consistent"] else 3
     except (OSError, ValueError) as error:
         parser.error(str(error))
 

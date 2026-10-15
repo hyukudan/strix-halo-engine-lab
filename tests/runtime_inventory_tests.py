@@ -50,16 +50,18 @@ class InventoryTests(unittest.TestCase):
                 "verify_admitted_by_this_receipt": False, "prefill_admitted_by_this_receipt": False,
                 "execution_identity": 101, "kernel_plan_identity": 102, "launch_plan_identity": 103,
                 "native_execution_observed": None, "qualification": None,
+                "whole_plan_graph_safe_declared": True,
                 "steps": [{"step_id": 0, "operator": "lm_head", "layer": None,
                            "runtime_step": False, "launcher_bound": True,
                            "launcher_implementation_identity": 104, "kernel_id": "selected.head",
                            "declared_variant": {
-                               "id": "selected.head", "phase": "decode", "logical_rows": 1,
+                               "id": "selected.head", "phase": "decode", "family": 17,
+                               "hidden_size": 2560, "auxiliary_size": 248320, "wave_size": 32, "logical_rows": 1,
                                "request_concurrency": 1, "graph_safe": True,
                                "qualification": "oracle_matched", "input_layout": "rows",
                                "output_layout": "logits", "compiler_identity": "host-fixture",
                                "numerics": {"input_precision": "bf16", "accumulator_precision": "fp32",
-                                            "output_precision": "fp32"}}}]}
+                                            "output_precision": "fp32", "row_invariant": True, "deterministic": True}}}]}
 
     def test_auto_fallback_is_effective_manual_not_v3(self):
         receipt = self.receipt()
@@ -179,12 +181,20 @@ class InventoryTests(unittest.TestCase):
         self.assertIsNone(self.collect(capacity=8192)["occupied_prefix_tokens"])
         self.assertEqual(result["context_evidence"]["capacity"], "caller-declaration")
 
+    def test_external_layout_identities_cannot_exploit_boolean_integer_equality(self):
+        with self.assertRaises(ValueError):
+            self.collect(audit_path=self.evidence("bool-layout-audit.json", {"manifest_layout_identity": True}),
+                         manifest_path=self.evidence("numeric-layout.json", {"layout_identity": 1}))
+        result = self.collect(audit_path=self.evidence("null-layout-audit.json", {"manifest_layout_identity": None}),
+                              manifest_path=self.evidence("null-layout.json", {"layout_identity": None}))
+        self.assertTrue(result["consistent"])
+
     def test_cli_writes_conflict_json_and_nonzero_exit_without_execution(self):
         receipt = self.evidence("receipt.json", self.receipt(True, "qualified-checkpoint"))
         output = self.root / "inventory.json"
         code = INVENTORY.main(["--repo", str(self.root), "--cmake-cache", str(self.cache()),
                                "--receipt", str(receipt), "--output", str(output)])
-        self.assertEqual(code, 2)
+        self.assertEqual(code, 3)
         self.assertFalse(json.loads(output.read_text(encoding="utf-8"))["consistent"])
         before = receipt.read_bytes()
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
@@ -243,6 +253,122 @@ class InventoryTests(unittest.TestCase):
 
         with mock.patch.object(INVENTORY, "cmake_cache", side_effect=mutate), self.assertRaises(ValueError):
             self.collect(cache_path=path)
+
+    def test_missing_git_reports_unknown_without_fabricating_clean_source(self):
+        with mock.patch.object(INVENTORY.subprocess, "run", side_effect=FileNotFoundError("git absent")):
+            result = self.collect()
+        self.assertIsNone(result["source"]["revision"])
+        self.assertIsNone(result["source"]["dirty"])
+        self.assertIsNone(result["source"]["status_porcelain"])
+        self.assertTrue(result["consistent"])
+
+    def test_explicit_A8_flags_are_strict_and_checked_without_auto_profile(self):
+        for flag in ("q4k_a8g32_gate_up", "grouped_exact_q51_down"):
+            with self.subTest(flag=flag):
+                result = self.collect(cache_path=self.cache(a8="OFF"),
+                    receipt_path=self.evidence("explicit.json", {flag: True}))
+                self.assertFalse(result["consistent"])
+                self.assertIn("build/" + flag, {x["field"] for x in result["conflicts"]})
+                self.assertTrue(self.collect(cache_path=self.cache(a8="ON"),
+                    receipt_path=self.evidence("enabled.json", {flag: True}))["consistent"])
+                self.assertTrue(self.collect(receipt_path=self.evidence("unknown.json", {flag: True}))["consistent"])
+                for value in (0, 1, "false", None, [], {}):
+                    with self.subTest(value=value), self.assertRaises(ValueError):
+                        self.collect(receipt_path=self.evidence("badflag.json", {flag: value}))
+
+    def test_overflowing_JSON_floats_rejected_even_in_unconsumed_nested_metadata(self):
+        for text in ('{"extra":{"value":1e999}}', '{"extra":[-1e999]}', '{"value":NaN}'):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                self.collect(receipt_path=self.text("nonfinite.json", text))
+        self.assertTrue(self.collect(receipt_path=self.text("finite.json", '{"extra":{"value":1e300}}'))["consistent"])
+
+    def test_outer_u64_identities_and_positions_reject_boolean_and_overflow(self):
+        fields = ("execution_identity", "kernel_plan_identity", "launch_plan_identity",
+                  "runtime_compatibility_identity", "final_position", "next_position",
+                  "committed_tokens", "steps_executed")
+        for key in fields:
+            for value in (True, False, -1, 1 << 64, 1.0, "1"):
+                with self.subTest(key=key, value=value), self.assertRaises(ValueError):
+                    self.collect(receipt_path=self.evidence("bad-u64.json", {key: value}))
+            self.assertTrue(self.collect(receipt_path=self.evidence("null-u64.json", {key: None}))["consistent"])
+            self.assertTrue(self.collect(receipt_path=self.evidence("max-u64.json", {key: (1 << 64) - 1}))["consistent"])
+        receipt = {"execution_identity": True, "execution_inventory": self.selected_inventory()}
+        receipt["execution_inventory"]["execution_identity"] = 1
+        with self.assertRaises(ValueError):
+            self.collect(receipt_path=self.evidence("bool-one.json", receipt))
+
+    def test_outer_digest_and_git_identity_fields_are_validated(self):
+        for key in ("model_sha256", "model_content_identity", "binary_sha256"):
+            for value in (True, 1, "f" * 63, "g" * 64, " f" * 32, ""):
+                with self.subTest(key=key, value=value), self.assertRaises(ValueError):
+                    self.collect(receipt_path=self.evidence("bad-hex.json", {key: value}))
+            self.assertTrue(self.collect(receipt_path=self.evidence("valid-hex.json", {key: "a" * 64}))["consistent"])
+        with self.assertRaises(ValueError):
+            self.collect(receipt_path=self.evidence("bad-git.json", {"source_revision": "not-git"}))
+        for width in (40, 64):
+            with mock.patch.object(INVENTORY.subprocess, "run", side_effect=OSError("git unavailable")):
+                result = self.collect(receipt_path=self.evidence("git.json", {"source_revision": "a" * width}))
+            self.assertTrue(result["consistent"])
+            self.assertIsNone(result["source"]["revision"])
+
+    def test_own_exporter_schemas_are_closed_but_external_receipt_extras_are_open(self):
+        base = self.selected_inventory()
+        for target in ("inventory", "step", "variant", "numerics"):
+            value = copy.deepcopy(base)
+            obj = value if target == "inventory" else value["steps"][0]
+            if target in ("variant", "numerics"):
+                obj = obj["declared_variant"]
+            if target == "numerics":
+                obj = obj["numerics"]
+            obj["unrecognized_native_pass"] = True
+            with self.subTest(target=target), self.assertRaises(ValueError):
+                self.collect(receipt_path=self.evidence("unknown-owned.json", {"execution_inventory": value}))
+        receipt = {"execution_inventory": base, "future_receipt_metadata": {"nested": [1, 2, "valid"]}}
+        result = self.collect(receipt_path=self.evidence("real-shaped.json", receipt),
+            audit_path=self.evidence("audit-extra.json", {"extra": {"metadata": True}}),
+            manifest_path=self.evidence("manifest-extra.json", {"extra": [3]}),
+            platform_path=self.evidence("platform-extra.json", {"nested": {"new": "field"}}))
+        self.assertTrue(result["consistent"])
+        self.assertIsNone(result["native_tests_executed"])
+        self.assertEqual(result["operators"][0]["declared_variant"]["numerics"]["row_invariant"], True)
+
+    def test_exporter_optional_declarations_validated_without_rejecting_zero_shapes(self):
+        for field in ("whole_plan_graph_safe_declared", "family", "hidden_size", "auxiliary_size", "wave_size",
+                      "row_invariant", "deterministic"):
+            value = self.selected_inventory()
+            if field == "whole_plan_graph_safe_declared":
+                value[field] = "true"
+            elif field in ("row_invariant", "deterministic"):
+                value["steps"][0]["declared_variant"]["numerics"][field] = 1
+            else:
+                value["steps"][0]["declared_variant"][field] = True
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                self.collect(receipt_path=self.evidence("bad-declaration.json", {"execution_inventory": value}))
+        value = self.selected_inventory()
+        value["steps"][0]["declared_variant"]["auxiliary_size"] = 0
+        value["steps"][0]["declared_variant"]["qualification"] = "rejected"
+        result = self.collect(receipt_path=self.evidence("declared-rejected.json", {"execution_inventory": value}))
+        self.assertTrue(result["consistent"])
+        self.assertIsNone(result["operators"][0]["qualification"])
+
+    def test_CMake_filters_unrelated_entries_before_parsing_full_boolean_table(self):
+        for text in ("ON", "TRUE", "YES", "Y", "1", "2", "-1", "0.25", "1e3"):
+            with self.subTest(value=text):
+                cache = INVENTORY.cmake_cache(self.text("truth-cache", f"STRIX_ENABLE_HIP_RUNTIME:BOOL={text}\nUNRELATED:BOOL=arbitrary\n"))
+                self.assertIs(cache["STRIX_ENABLE_HIP_RUNTIME"], True)
+                self.assertNotIn("UNRELATED", cache)
+        for text in ("OFF", "FALSE", "NO", "N", "0", "", "IGNORE", "NOTFOUND", "unused-NOTFOUND", "0.0", "-0", "0e99"):
+            with self.subTest(value=text):
+                self.assertIs(INVENTORY.cmake_cache(self.text("false-cache", f"BUILD_TESTING:BOOL={text}\n"))["BUILD_TESTING"], False)
+        with self.assertRaises(ValueError):
+            self.collect(cache_path=self.text("not-BOOL-cache", "STRIX_ENABLE_HIP_RUNTIME:STRING=OFF\n"))
+
+    def test_CLI_invalid_evidence_exit_2_distinct_from_consistent_conflict_exit_3(self):
+        path = self.text("invalid-CLI.json", '{"unexpected":1e999}')
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as caught:
+            INVENTORY.main(["--repo", str(self.root), "--receipt", str(path)])
+        self.assertEqual(caught.exception.code, 2)
+
 
 
 if __name__ == "__main__":
