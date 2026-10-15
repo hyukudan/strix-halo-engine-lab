@@ -42,3 +42,21 @@ that private memory is absent.
 Only after those gates pass should expanded full/partial-row operator fixtures,
 poison/no-op/mutation controls, model logit/token fidelity and matched timing
 be run. Current typed-projection qualification does not qualify this probe.
+
+The separate `prefetch` mode of the hyper-mix operator test now prepares
+144 finite geometry/storage/operation cases. It covers every partial-row count,
+hc2 through8, lowrank1 through the512 bound, widths below128 and with tile
+tails, and canonical width10240/lowrank320. Partial lowrank fixtures use F32
+up projections where Q8 up would require a multiple-of32 input width.
+The oracle compares normalized and low FP32 workspace as well as mixed and
+injection outputs against the current typed implementation. Row7/last-row
+down mutations and last-row/tail injection mutations must change that oracle,
+and the prefetch path must follow the changed values bitwise. Eager and three
+captured replays repeat full admitted-workspace/output poisoning with no-op
+controls. Wrong formats require the exact typed rejection and preserve the
+entire workspace and destinations.
+
+These new assertions have not run on the device at this source snapshot.
+The fixtures include nonzero maximum finite half coefficients and F32
+subnormal inputs, but do not establish arbitrary NaN/Inf payload behavior or
+complete-model graph, multirow or distributed qualification.

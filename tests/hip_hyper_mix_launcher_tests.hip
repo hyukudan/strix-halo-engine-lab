@@ -25,6 +25,8 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <type_traits>
+#include <limits>
 #include <vector>
 
 namespace {
@@ -459,15 +461,18 @@ ReferenceResult reference(const std::vector<float>& input, const std::vector<flo
     return result;
 }
 
-template <std::uint32_t Width>
+template <std::uint32_t Width, std::uint32_t Streams = 4U, std::uint32_t Lowrank = 320U,
+          bool DenseUp = false, bool PrefetchValues = false>
 struct TypedProjectionFixture {
-    static constexpr std::uint32_t hidden = Width / 4U, hc = 4U, lowrank = 320U, expanded = Width;
-    static constexpr std::uint32_t down_type = 8U, up_type = 8U, inject_type = 0U;
+    static constexpr std::uint32_t hidden = Width / Streams, hc = Streams, lowrank = Lowrank, expanded = Width;
+    static constexpr std::uint32_t down_type = 8U, up_type = DenseUp ? 0U : 8U, inject_type = 0U;
+    using UpElement = std::conditional_t<DenseUp, float, Q8Block>;
     std::vector<float> input, norm, inject;
-    std::vector<Q8Block> down, up;
+    std::vector<Q8Block> down;
+    std::vector<UpElement> up;
     TypedProjectionFixture() : input(Width), norm(Width), inject(Width * hc),
-        down(lowrank * (Width / 32U)), up(Width * (lowrank / 32U)) {
-        static_assert(Width % 32U == 0U && Width % hc == 0U);
+        down(lowrank * (Width / 32U)), up(Width * (DenseUp ? lowrank : lowrank / 32U)) {
+        static_assert(Width % 32U == 0U && Width % hc == 0U && (DenseUp || lowrank % 32U == 0U));
         constexpr std::array<std::uint16_t, 10> scales{0U, 0x8000U, 1U, 0x8001U, 0x1000U,
             0x1400U, 0x2000U, 0x2400U, 0x3000U, 0x7bffU};
         constexpr std::array<int, 8> codes{-128, -127, -17, -1, 0, 1, 63, 127};
@@ -481,11 +486,16 @@ struct TypedProjectionFixture {
             for (std::size_t j = 0; j < 32; ++j)
                 down[b].values[j] = static_cast<std::int8_t>(bits == 0x7bffU ? 0 : codes[(j + b * 3U) % codes.size()]);
         }
-        for (std::size_t b = 0; b < up.size(); ++b) {
-            const auto bits = static_cast<std::uint16_t>(0x0800U + (b % 7U) * 0x0100U);
-            std::memcpy(&up[b].scale, &bits, sizeof(bits));
-            for (std::size_t j = 0; j < 32; ++j)
-                up[b].values[j] = static_cast<std::int8_t>(static_cast<int>((b + j * 3U) % 15U) - 7);
+        if constexpr (DenseUp) {
+            for (std::size_t i = 0; i < up.size(); ++i)
+                up[i] = static_cast<float>(static_cast<int>((i * 5U + i / lowrank) % 17U) - 8) / 191.0F;
+        } else {
+            for (std::size_t b = 0; b < up.size(); ++b) {
+                const auto bits = static_cast<std::uint16_t>(0x0800U + (b % 7U) * 0x0100U);
+                std::memcpy(&up[b].scale, &bits, sizeof(bits));
+                for (std::size_t j = 0; j < 32; ++j)
+                    up[b].values[j] = static_cast<std::int8_t>(static_cast<int>((b + j * 3U) % 15U) - 7);
+            }
         }
         // A visible, isolated gate makes the last-block mutation meaningful
         // even after final BF16 storage. Other rows retain varied coefficients.
@@ -494,13 +504,33 @@ struct TypedProjectionFixture {
         const std::uint16_t unit_scale = 0x3c00U;
         std::memcpy(&down[Width / 32U - 1U].scale, &unit_scale, sizeof(unit_scale));
         down[Width / 32U - 1U].values[30] = 1;
-        for (std::size_t b = 0; b < lowrank / 32U; ++b)
-            std::fill(std::begin(up[b].values), std::end(up[b].values), static_cast<std::int8_t>(0));
-        std::memcpy(&up[0].scale, &unit_scale, sizeof(unit_scale));
-        up[0].values[0] = 16;
+        if constexpr (DenseUp) {
+            std::fill(up.begin(), up.begin() + lowrank, 0.0F);
+            up[0] = 16.0F;
+        } else {
+            for (std::size_t b = 0; b < lowrank / 32U; ++b)
+                std::fill(std::begin(up[b].values), std::end(up[b].values), static_cast<std::int8_t>(0));
+            std::memcpy(&up[0].scale, &unit_scale, sizeof(unit_scale));
+            up[0].values[0] = 16;
+        }
         for (std::size_t i = 0; i < inject.size(); ++i) {
             const float ordinary = static_cast<float>(static_cast<int>((i * 7U + i / 11U) % 31U) - 15) / 997.0F;
             inject[i] = std::nextafter(ordinary, i % 2U ? -INFINITY : INFINITY);
+        }
+        if constexpr (PrefetchValues) {
+            input.back() = 0.375F;  // The last-feature mutation must be observable.
+            inject[0] = 0.0F;
+            inject[1] = -0.0F;
+            inject[2] = std::numeric_limits<float>::denorm_min();
+            inject[3] = -std::numeric_limits<float>::denorm_min();
+            if constexpr (lowrank > 1U) {
+                auto& extreme = down[2U * (Width / 32U) - 1U];
+                const std::uint16_t max_scale = 0x7bffU;
+                std::memcpy(&extreme.scale, &max_scale, sizeof(max_scale));
+                std::fill(std::begin(extreme.values), std::end(extreme.values), static_cast<std::int8_t>(0));
+                extreme.values[0] = 1;
+                extreme.values[1] = -1;
+            }
         }
     }
 };
@@ -518,10 +548,20 @@ ReferenceResult reference(const std::vector<float>& input, const std::vector<flo
     return reference(input, norm, unpack(down), unpack(up), inject, hidden, hc, lowrank, epsilon, with_injection);
 }
 
+ReferenceResult reference(const std::vector<float>& input, const std::vector<float>& norm,
+    const std::vector<Q8Block>& down, const std::vector<float>& up, const std::vector<float>& inject,
+    std::uint32_t hidden, std::uint32_t hc, std::uint32_t lowrank, float epsilon, bool with_injection) {
+    std::vector<float> unpacked(down.size() * 32U);
+    for (std::size_t b = 0; b < down.size(); ++b)
+        for (std::size_t j = 0; j < 32U; ++j)
+            unpacked[b * 32U + j] = __half2float(down[b].scale) * static_cast<float>(down[b].values[j]);
+    return reference(input, norm, unpacked, up, inject, hidden, hc, lowrank, epsilon, with_injection);
+}
+
 template <typename FixtureType = Fixture>
 void run_numeric_fixture(
     strix::SerialOp op,
-    bool with_injection, bool bf16 = false) {
+    bool with_injection, bool bf16 = false, bool enable_prefetch = false) {
     using Fixture = FixtureType;
     const auto model =
         strix::ModelContract::
@@ -1150,6 +1190,130 @@ void run_numeric_fixture(
         check(hipGraphExecDestroy(typed_executable), "destroy typed executable");
         check(hipGraphDestroy(typed_graph), "destroy typed graph");
         check(hipStreamDestroy(typed_stream), "destroy typed stream");
+        if (enable_prefetch) {
+            auto prefetch_config = typed_config;
+            prefetch_config.prefetch_rows = true;
+            auto prefetch_launcher = strix::make_hip_hyper_mix_launcher("test.hyper_mix.prefetch.rows8.v2", &prefetch_config);
+            expect(prefetch_launcher.implementation_identity != typed_launcher.implementation_identity,
+                   "row-prefetch implementation differs from typed-v1");
+            // Include normalized and low FP32 workspace, so activation/storage
+            // rounding cannot hide a wrong down row or signed-zero result.
+            const auto used_workspace_bytes = static_cast<std::size_t>(Fixture::expanded + Fixture::lowrank) * sizeof(float);
+            const auto mixed_bytes = static_cast<std::size_t>(Fixture::hidden) * (bf16 ? sizeof(std::uint16_t) : sizeof(float));
+            const auto inject_bytes = with_injection ? Fixture::hc * sizeof(float) : 0U;
+            const auto read_state = [&] {
+                std::vector<std::byte> state(used_workspace_bytes + mixed_bytes + inject_bytes);
+                check(hipMemcpy(state.data(), reinterpret_cast<void*>(workspace_address.address), used_workspace_bytes,
+                                hipMemcpyDeviceToHost), "read exact normalized and low state");
+                check(hipMemcpy(state.data() + used_workspace_bytes, reinterpret_cast<void*>(mixed_address.address),
+                                mixed_bytes, hipMemcpyDeviceToHost), "read exact prefetch mixed state");
+                if (with_injection)
+                    check(hipMemcpy(state.data() + used_workspace_bytes + mixed_bytes,
+                                    reinterpret_cast<void*>(injection_address->address), inject_bytes,
+                                    hipMemcpyDeviceToHost), "read exact prefetch injection state");
+                return state;
+            };
+            const auto expected_state = read_state();
+            const auto paired_current_weights = [&] {
+                poison_outputs(nullptr);
+                typed_launcher.function(context, typed_launcher.user_data);
+                check(hipDeviceSynchronize(), "drain typed-v1 mutation oracle");
+                const auto wanted = read_state();
+                poison_outputs(nullptr);
+                expect(read_state() != wanted, "prefetch no-op state cannot satisfy current typed oracle");
+                prefetch_launcher.function(context, prefetch_launcher.user_data);
+                check(hipDeviceSynchronize(), "drain prefetch mutation pair");
+                expect(read_state() == wanted, "prefetch mutated weights preserve full typed-v1 state");
+                return wanted;
+            };
+            std::vector<std::uint32_t> changed_rows{std::min(7U, Fixture::lowrank - 1U), Fixture::lowrank - 1U};
+            if (changed_rows.front() == changed_rows.back()) changed_rows.pop_back();
+            for (const auto changed_row : changed_rows) {
+                auto changed = fixture.down;
+                const auto blocks = Fixture::expanded / 32U;
+                for (std::uint32_t b = 0; b < blocks; ++b)
+                    std::fill(std::begin(changed[changed_row * blocks + b].values),
+                              std::end(changed[changed_row * blocks + b].values), static_cast<std::int8_t>(0));
+                auto& last = changed[changed_row * blocks + blocks - 1U];
+                const std::uint16_t unit = 0x3c00U;
+                std::memcpy(&last.scale, &unit, sizeof(unit));
+                last.values[30] = 1;
+                check(hipMemcpy(device_weights[1], changed.data(), changed.size() * sizeof(Q8Block), hipMemcpyHostToDevice),
+                      "upload row-sensitive prefetch mutation A");
+                const auto first = paired_current_weights();
+                last.values[30] = 62;
+                check(hipMemcpy(device_weights[1], changed.data(), changed.size() * sizeof(Q8Block), hipMemcpyHostToDevice),
+                      "upload row-sensitive prefetch mutation B");
+                expect(paired_current_weights() != first, "last/full-row mutation changes typed low state");
+            }
+            check(hipMemcpy(device_weights[1], fixture.down.data(), fixture.down.size() * sizeof(Q8Block), hipMemcpyHostToDevice),
+                  "restore original prefetch down weights");
+            if (with_injection) {
+                auto changed = fixture.inject;
+                const auto first = static_cast<std::ptrdiff_t>((Fixture::hc - 1U) * Fixture::expanded);
+                std::fill(changed.begin() + first, changed.begin() + first + Fixture::expanded, 0.0F);
+                changed.back() = 1.0F;
+                check(hipMemcpy(device_weights[3], changed.data(), changed.size() * sizeof(float), hipMemcpyHostToDevice),
+                      "upload last injection row/tail mutation A");
+                const auto before = paired_current_weights();
+                changed.back() = 62.0F;
+                check(hipMemcpy(device_weights[3], changed.data(), changed.size() * sizeof(float), hipMemcpyHostToDevice),
+                      "upload last injection row/tail mutation B");
+                expect(paired_current_weights() != before, "last injection row/tail mutation changes typed state");
+                check(hipMemcpy(device_weights[3], fixture.inject.data(), fixture.inject.size() * sizeof(float), hipMemcpyHostToDevice),
+                      "restore original prefetch injection weights");
+            }
+            expect(paired_current_weights() == expected_state, "restored prefetch model state equals original typed state");
+            for (unsigned invalid = 0; invalid < (with_injection ? 2U : 1U); ++invalid) {
+                const auto index = invalid == 0U ? 1U : 3U;
+                const auto previous = manifest.tensors[index].ggml_type;
+                manifest.tensors[index].ggml_type = invalid == 0U ? 0U : 8U;
+                poison_outputs(nullptr);
+                const auto untouched = read_state();
+                std::vector<std::byte> entire_workspace(static_cast<std::size_t>(workspace_address.bytes));
+                check(hipMemcpy(entire_workspace.data(), reinterpret_cast<void*>(workspace_address.address),
+                                entire_workspace.size(), hipMemcpyDeviceToHost), "snapshot entire rejected prefetch workspace");
+                bool rejected = false;
+                try { prefetch_launcher.function(context, prefetch_launcher.user_data); }
+                catch (const std::invalid_argument& e) {
+                    rejected = std::string_view(e.what()) == "typed hyper projection requires Q8_0 down and F32 injection";
+                }
+                check(hipDeviceSynchronize(), "drain rejected prefetch launch");
+                std::vector<std::byte> entire_after(entire_workspace.size());
+                check(hipMemcpy(entire_after.data(), reinterpret_cast<void*>(workspace_address.address), entire_after.size(),
+                                hipMemcpyDeviceToHost), "read entire rejected prefetch workspace");
+                expect(rejected && read_state() == untouched && entire_after == entire_workspace,
+                       "prefetch wrong format preserves entire workspace/output/injection byte for byte");
+                manifest.tensors[index].ggml_type = previous;
+            }
+            hipStream_t stream = nullptr;
+            hipGraph_t graph = nullptr;
+            hipGraphExec_t executable = nullptr;
+            check(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), "create prefetch capture stream");
+            strix::HipLaunchContext launch_scope; launch_scope.stream = stream;
+            {
+                strix::HipLaunchScope scope(launch_scope);
+                poison_outputs(stream);
+                check(hipStreamSynchronize(stream), "drain prefetch no-op poison");
+                expect(read_state() != expected_state, "prefetch no-op full-state control fails equality");
+                prefetch_launcher.function(context, prefetch_launcher.user_data);
+                check(hipStreamSynchronize(stream), "drain prefetch eager");
+                expect(read_state() == expected_state, "prefetch eager preserves typed normalized/low/output/injection bytes");
+                check(hipStreamBeginCapture(stream, hipStreamCaptureModeThreadLocal), "capture row-prefetch projection");
+                prefetch_launcher.function(context, prefetch_launcher.user_data);
+                check(hipStreamEndCapture(stream, &graph), "finish row-prefetch capture");
+            }
+            check(hipGraphInstantiate(&executable, graph, nullptr, nullptr, 0), "instantiate row-prefetch graph");
+            for (unsigned replay = 0; replay < 3U; ++replay) {
+                poison_outputs(stream);
+                check(hipGraphLaunch(executable, stream), "launch poisoned row-prefetch replay");
+                check(hipStreamSynchronize(stream), "drain row-prefetch replay");
+                expect(read_state() == expected_state, "row-prefetch replay preserves complete typed state");
+            }
+            check(hipGraphExecDestroy(executable), "destroy row-prefetch executable");
+            check(hipGraphDestroy(graph), "destroy row-prefetch graph");
+            check(hipStreamDestroy(stream), "destroy row-prefetch stream");
+        }
     }
     auto invalid_fused_config = fused_config;
     invalid_fused_config.staged_projections = false;
@@ -1309,6 +1473,24 @@ void test_catalog_and_bundle() {
                typed_registry.variants().front().id == golden_base + ".parallel.staged.fused-injection-v5.typed-q8-f32-v1" &&
                typed_registry.variants().front().compiler_identity == "hip-gfx1151-hyper-mix-v6-typed-projection",
            "typed implementation, kernel and compiler goldens are stable");
+    auto prefetch_config = typed_config;
+    prefetch_config.prefetch_rows = true;
+    strix::kernels::KernelRegistry prefetch_registry;
+    strix::register_hip_hyper_mix_kernel_variant(model, request, prefetch_config, prefetch_registry);
+    const auto prefetch_golden = strix::make_hip_hyper_mix_launcher("test.prefetch.golden", &prefetch_config);
+    expect(prefetch_golden.implementation_identity == 7219967087554914409ULL &&
+               prefetch_registry.variants().front().id == golden_base + ".parallel.staged.fused-injection-v5.typed-q8-f32-v1.prefetch-rows8-v2" &&
+               prefetch_registry.variants().front().compiler_identity == "hip-gfx1151-hyper-mix-v8-typed-prefetch-rows8" &&
+               prefetch_registry.variants().front().resources.lds_bytes == fused_variant.resources.lds_bytes &&
+               prefetch_registry.variants().front().resources.scratch_bytes == fused_variant.resources.scratch_bytes,
+           "prefetch identity golden is unique and retains admitted resources");
+    auto invalid_prefetch = prefetch_config; invalid_prefetch.typed_projection = false;
+    bool invalid_prefetch_rejected = false;
+    try { (void)strix::make_hip_hyper_mix_launcher("invalid.prefetch", &invalid_prefetch); }
+    catch (const std::invalid_argument& e) {
+        invalid_prefetch_rejected = std::string_view(e.what()) == "hyper row prefetch requires typed projection mode";
+    }
+    expect(invalid_prefetch_rejected, "prefetch requires typed projection independently of other flags");
     auto invalid_typed = typed_config; invalid_typed.fused_injection = false;
     bool invalid_typed_rejected = false;
     try { (void)strix::make_hip_hyper_mix_launcher("invalid.typed", &invalid_typed); }
@@ -1371,6 +1553,13 @@ void test_catalog_and_bundle() {
     typed_bundle.register_for_compiled_execution(typed_compiled, valid_typed_registry, &typed_resources);
     expect(valid_typed_registry.find_kernel_launcher(typed_registry.variants().front().id) != nullptr,
            "complete model resources permit typed bundle registration");
+    strix::HipHyperMixLauncherBundle prefetch_bundle(prefetch_config);
+    strix::ExecutionLauncherRegistry wrong_prefetch_registry;
+    bool wrong_prefetch_id_rejected = false;
+    try { prefetch_bundle.register_for_compiled_execution(typed_compiled, wrong_prefetch_registry, &typed_resources); }
+    catch (const std::invalid_argument&) { wrong_prefetch_id_rejected = true; }
+    expect(wrong_prefetch_id_rejected && wrong_prefetch_registry.find_kernel_launcher(prefetch_registry.variants().front().id) == nullptr,
+           "typed-v1 binding cannot register under prefetch identity");
     for (std::size_t index = typed_compiled.execution.steps.size(); index-- > 0;) {
         const auto op = typed_compiled.execution.steps[index].op;
         if (op != strix::SerialOp::attn_hyper_mix && op != strix::SerialOp::mlp_hyper_mix &&
@@ -1411,10 +1600,46 @@ void test_catalog_and_bundle() {
         "hyper-mix launcher bundle materializes selected mixer id");
 }
 
+template <std::uint32_t Width, std::uint32_t Streams, std::uint32_t Lowrank, bool DenseUp>
+void run_prefetch_geometry() {
+    for (const auto op : {strix::SerialOp::attn_hyper_mix, strix::SerialOp::mlp_hyper_mix, strix::SerialOp::final_hyper_mix})
+        for (const bool bf16 : {false, true})
+            run_numeric_fixture<TypedProjectionFixture<Width, Streams, Lowrank, DenseUp, true>>(
+                op, op != strix::SerialOp::final_hyper_mix, bf16, true);
+}
+
 }  // namespace
 
-int main() try {
+int main(int argc, char** argv) try {
+    const bool prefetch = argc == 2 && std::string_view(argv[1]) == "prefetch";
+    if (argc != 1 && !prefetch) throw std::invalid_argument("expected no arguments or prefetch fixture mode");
     test_catalog_and_bundle();
+    if (prefetch) {
+        run_prefetch_geometry<288, 4, 320, false>();
+        run_prefetch_geometry<320, 4, 320, false>();
+        run_prefetch_geometry<384, 4, 320, false>();
+        run_prefetch_geometry<288, 8, 32, false>();
+        run_prefetch_geometry<320, 8, 32, false>();
+        run_prefetch_geometry<384, 8, 32, false>();
+        run_prefetch_geometry<288, 3, 32, false>();
+        run_prefetch_geometry<384, 3, 32, false>();
+        run_prefetch_geometry<160, 2, 1, true>();
+        run_prefetch_geometry<288, 3, 3, true>();
+        run_prefetch_geometry<320, 4, 7, true>();
+        run_prefetch_geometry<320, 4, 8, true>();
+        run_prefetch_geometry<384, 6, 9, true>();
+        run_prefetch_geometry<320, 4, 10, true>();
+        run_prefetch_geometry<288, 3, 11, true>();
+        run_prefetch_geometry<288, 4, 12, true>();
+        run_prefetch_geometry<320, 5, 13, true>();
+        run_prefetch_geometry<384, 6, 14, true>();
+        run_prefetch_geometry<448, 7, 15, true>();
+        run_prefetch_geometry<512, 8, 16, true>();
+        run_prefetch_geometry<96, 3, 505, true>();
+        run_prefetch_geometry<96, 3, 511, true>();
+        run_prefetch_geometry<96, 3, 512, false>();
+        run_prefetch_geometry<10240, 4, 320, false>();
+    } else {
     run_numeric_fixture(
         strix::SerialOp::attn_hyper_mix,
         true);
@@ -1436,6 +1661,7 @@ int main() try {
             run_numeric_fixture<TypedProjectionFixture<320>>(op, injection, bf16);
             run_numeric_fixture<TypedProjectionFixture<384>>(op, injection, bf16);
         }
+    }
     }
     if (failures == 0) {
         std::cout
