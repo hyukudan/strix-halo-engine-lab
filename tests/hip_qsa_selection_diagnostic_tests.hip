@@ -12,6 +12,7 @@
 #include <functional>
 #include <exception>
 #include <iostream>
+#include <limits>
 #include <numeric>
 #include <stdexcept>
 #include <string>
@@ -130,8 +131,31 @@ std::vector<float> pattern(std::uint32_t blocks, unsigned kind) {
         if (kind == 2) scores[i] = i % 2U ? -0.0F : 0.0F;
         if (kind == 3) scores[i] = -static_cast<float>(i % 17U) - 0.25F;
         if (kind == 4) scores[i] = std::bit_cast<float>(i % 2U ? 0x00000001U : 0x80000001U);
+        if (kind == 5) {
+            constexpr std::array<float,8> extremes{
+                std::numeric_limits<float>::max(), -std::numeric_limits<float>::max(),
+                std::numeric_limits<float>::min(), -std::numeric_limits<float>::min(),
+                std::numeric_limits<float>::denorm_min(), -std::numeric_limits<float>::denorm_min(),
+                0.0F, -0.0F};
+            scores[i] = extremes[(i * 7U) % extremes.size()];
+        }
     }
     return scores;
+}
+void graph_nodes(const Owner& owner, Shape shape) {
+    std::size_t expected = 0;
+    if (selected_count(shape)) {
+        if (shape.blocks <= block_topk) expected = 1;
+        else {
+            expected = 3; // validation, local top-512, chronological expansion
+            for (auto lists = (shape.blocks - 1U) / 1024U + 1U; lists > 1U; lists = (lists + 1U) / 2U)
+                ++expected;
+        }
+    }
+    std::size_t observed = 0;
+    require(!owner.graphs.empty(), "fixture graph owner missing");
+    check(hipGraphGetNodes(owner.graphs.back(), nullptr, &observed), "fixture graph node count");
+    require(observed == expected, "shape-specific selection graph node count differs");
 }
 void positive(Shape shape, bool graph_mode) {
     Owner owner;
@@ -145,8 +169,8 @@ void positive(Shape shape, bool graph_mode) {
     // Buffers/stream and any queued construction fills outlive the capture.
     owner.finish();
     hipGraphExec_t graph = nullptr;
-    if (graph_mode) graph = owner.capture(invoke);
-    for (unsigned replay = 0; replay < 5; ++replay) {
+    if (graph_mode) { graph = owner.capture(invoke); graph_nodes(owner, shape); }
+    for (unsigned replay = 0; replay < 6; ++replay) {
         auto input = pattern(shape.blocks, replay);
         scores.upload(input); status.upload({0});
         const auto expected = oracle(shape, input);
@@ -162,7 +186,8 @@ void positive(Shape shape, bool graph_mode) {
         scores.guards(); selected.guards(); ping.guards(); pong.guards(); status.guards();
     }
 }
-void blocked_output(Shape shape, bool graph_mode, bool invalid_scores) {
+enum class Rejection { sticky_finite, nonfinite_last, sticky_nonfinite, all_nonfinite, nonfinite_first };
+void blocked_output(Shape shape, bool graph_mode, Rejection rejection) {
     Owner owner;
     Buffer<float> scores(owner, shape.blocks);
     Buffer<std::uint32_t> selected(owner, selected_count(shape));
@@ -172,17 +197,27 @@ void blocked_output(Shape shape, bool graph_mode, bool invalid_scores) {
     const auto invoke = [&] { enqueue(shape, {scores.view.data, scores.view.count}, selected.view,
                                       ping.view, pong.view, status.view, owner.stream); };
     hipGraphExec_t graph = nullptr;
-    if (graph_mode) graph = owner.capture(invoke);
+    if (graph_mode) { graph = owner.capture(invoke); graph_nodes(owner, shape); }
     for (const auto bits : std::array<std::uint32_t,4>{0x7fc01234U,0xffc12345U,0x7f800000U,0xff800000U}) {
         auto input = pattern(shape.blocks, 0);
-        if (invalid_scores) input.back() = std::bit_cast<float>(bits);
-        scores.upload(input); status.upload({invalid_scores ? 0U : 8U}); owner.finish();
+        const bool invalid_scores = rejection != Rejection::sticky_finite;
+        if (invalid_scores) {
+            require(shape.blocks > block_topk, "nonfinite fixture must take sparse validation path");
+            if (rejection == Rejection::all_nonfinite)
+                std::fill(input.begin(), input.end(), std::bit_cast<float>(bits));
+            else if (rejection == Rejection::nonfinite_first) input.front() = std::bit_cast<float>(bits);
+            else input.back() = std::bit_cast<float>(bits);
+        }
+        const std::uint32_t initial_status =
+            rejection == Rejection::sticky_finite || rejection == Rejection::sticky_nonfinite ? 8U : 0U;
+        scores.upload(input); status.upload({initial_status}); owner.finish();
         const auto original = selected.read_all(), original_ping = ping.read_all(), original_pong = pong.read_all();
         const auto readonly = scores.read_all();
         if (graph_mode) check(hipGraphLaunch(graph, owner.stream), "blocked graph replay"); else invoke();
         owner.finish();
         const auto observed = status.read()[0];
-        require(invalid_scores ? (observed & nonfinite_score) != 0 : observed == 8U, "sticky/nonfinite status mismatch");
+        const auto expected_status = initial_status | (invalid_scores ? nonfinite_score : 0U);
+        require(observed == expected_status, "sticky/nonfinite exact status mismatch");
         require(selected.read_all() == original && ping.read_all() == original_ping && pong.read_all() == original_pong,
                 "rejected input wrote selected output or scratch");
         require(scores.read_all() == readonly, "rejected scores mutated");
@@ -241,18 +276,31 @@ void negative_admission() {
     reject([&] { run(shape,input,output.view,{reinterpret_cast<Item*>(reinterpret_cast<std::uintptr_t>(ping.view.data)+4U),ping.view.count},pong.view,status.view,owner.stream); });
     reject([&] { run(shape,input,output.view,ping.view,pong.view,{},owner.stream); });
     reject([&] { run(shape,input,output.view,ping.view,pong.view,status.view,nullptr); });
+    reject([&] { run(shape,input,output.view,ping.view,pong.view,status.view,hipStreamPerThread); });
+    reject([&] { run(shape,input,output.view,ping.view,pong.view,status.view,hipStreamLegacy); });
+    const Shape direct{511,0};
+    const View<std::uint32_t> direct_output{output.view.data,selected_count(direct)};
+    reject([&] { run(direct,{},direct_output,{ping.view.data,1},{},status.view,owner.stream); });
+    reject([&] { run(direct,{},direct_output,{ping.view.data,0},{},status.view,owner.stream); });
+    reject([&] { run(shape,{nullptr,input.count},output.view,ping.view,pong.view,status.view,owner.stream); });
+    reject([&] { run(shape,input,output.view,ping.view,
+        {reinterpret_cast<Item*>(reinterpret_cast<std::uintptr_t>(pong.view.data)+4U),pong.view.count},
+        status.view,owner.stream); });
 }
 } // namespace
 int main() try {
     int devices = 0;
     if (hipGetDeviceCount(&devices) != hipSuccess || !devices) return 77;
-    for (const auto blocks : std::array<std::uint32_t,12>{0,1,511,512,513,1023,1024,1025,2049,4097,8193,32768})
+    for (const auto blocks : std::array<std::uint32_t,14>{0,1,511,512,513,1023,1024,1025,2048,2049,4097,8193,32767,32768})
         for (std::uint32_t tail = 0; tail < (blocks == 32768 ? 1U : 4U); ++tail)
             for (const bool graph : {false,true}) positive({blocks,tail}, graph);
     for (const bool graph : {false,true}) {
-        blocked_output({2049,3}, graph, false);
-        blocked_output({32768,0}, graph, true);
-        blocked_output({511,3}, graph, false);
+        blocked_output({2049,3}, graph, Rejection::sticky_finite);
+        blocked_output({32768,0}, graph, Rejection::nonfinite_last);
+        blocked_output({511,3}, graph, Rejection::sticky_finite);
+        blocked_output({2049,3}, graph, Rejection::sticky_nonfinite);
+        blocked_output({2049,3}, graph, Rejection::all_nonfinite);
+        blocked_output({2049,3}, graph, Rejection::nonfinite_first);
     }
     direct_without_scores(); negative_admission();
     std::cout << "QSA diagnostic source fixtures completed\n";

@@ -26,6 +26,7 @@ function(strix_target_warnings target)
 endfunction()
 
 add_library(strix_core STATIC
+    src/uma_owner_inventory.cpp
     src/prepared_execution.cpp
     src/prepared_serial_session.cpp
     src/execution_telemetry.cpp
@@ -234,6 +235,11 @@ if(BUILD_TESTING OR STRIX_BUILD_EXPERIMENTAL_Q4K_A8_PROBE OR STRIX_ENABLE_EXPERI
     endif()
 endif()
 if(BUILD_TESTING)
+    add_executable(strix-uma-owner-inventory-tests tests/uma_owner_inventory_tests.cpp)
+    target_link_libraries(strix-uma-owner-inventory-tests PRIVATE strix_core)
+    strix_target_warnings(strix-uma-owner-inventory-tests)
+    add_test(NAME strix-uma-owner-inventory-tests COMMAND strix-uma-owner-inventory-tests)
+
     add_executable(strix-prepared-execution-tests tests/prepared_execution_tests.cpp)
     target_link_libraries(strix-prepared-execution-tests PRIVATE strix_core)
     strix_target_warnings(strix-prepared-execution-tests)
