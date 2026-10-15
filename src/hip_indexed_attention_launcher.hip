@@ -562,6 +562,15 @@ __global__ void linear_to_float_kernel(
     }
 }
 
+// Preserve the actual legacy LDS-tree operand priority: upper/partner src0,
+// lower/self src1. Ordinary commutative lowering can select another NaN payload.
+// Only the two new QSA input trees call this helper; old kernels remain literal.
+__device__ __forceinline__ float qsa_input_legacy_tree_add(float lower, float upper) {
+    float result;
+    asm volatile("v_add_f32 %0, %1, %2" : "=v"(result) : "v"(upper), "v"(lower));
+    return result;
+}
+
 // Eight ascending virtual leaves per physical lane preserve the original
 // 256-leaf tree, including its operand order and BF16-in-FP32 epilogue.
 __global__ __launch_bounds__(32)
@@ -587,14 +596,14 @@ void linear_virtual256_q8_qsa_input_kernel(
 #pragma unroll
         for (unsigned local = 0; local < 8; ++local) {
             const auto partner = __shfl_down(partial[local], distance, 32);
-            if (lane < distance) partial[local] += partner;
+            if (lane < distance) partial[local] = qsa_input_legacy_tree_add(partial[local], partner);
         }
     }
     if (lane == 0) {
-        partial[0] += partial[4]; partial[1] += partial[5];
-        partial[2] += partial[6]; partial[3] += partial[7];
-        partial[0] += partial[2]; partial[1] += partial[3];
-        partial[0] += partial[1];
+        partial[0] = qsa_input_legacy_tree_add(partial[0], partial[4]); partial[1] = qsa_input_legacy_tree_add(partial[1], partial[5]);
+        partial[2] = qsa_input_legacy_tree_add(partial[2], partial[6]); partial[3] = qsa_input_legacy_tree_add(partial[3], partial[7]);
+        partial[0] = qsa_input_legacy_tree_add(partial[0], partial[2]); partial[1] = qsa_input_legacy_tree_add(partial[1], partial[3]);
+        partial[0] = qsa_input_legacy_tree_add(partial[0], partial[1]);
         output[row] = round_bf16(partial[0]);
     }
 }
@@ -637,14 +646,14 @@ void linear_prefetch8_q8_qsa_input_kernel(
 #pragma unroll
         for (unsigned local = 0; local < 8; ++local) {
             const auto partner = __shfl_down(partial[local], distance, 32);
-            if (lane < distance) partial[local] += partner;
+            if (lane < distance) partial[local] = qsa_input_legacy_tree_add(partial[local], partner);
         }
     }
     if (lane == 0) {
-        partial[0] += partial[4]; partial[1] += partial[5];
-        partial[2] += partial[6]; partial[3] += partial[7];
-        partial[0] += partial[2]; partial[1] += partial[3];
-        partial[0] += partial[1];
+        partial[0] = qsa_input_legacy_tree_add(partial[0], partial[4]); partial[1] = qsa_input_legacy_tree_add(partial[1], partial[5]);
+        partial[2] = qsa_input_legacy_tree_add(partial[2], partial[6]); partial[3] = qsa_input_legacy_tree_add(partial[3], partial[7]);
+        partial[0] = qsa_input_legacy_tree_add(partial[0], partial[2]); partial[1] = qsa_input_legacy_tree_add(partial[1], partial[3]);
+        partial[0] = qsa_input_legacy_tree_add(partial[0], partial[1]);
         output[row] = round_bf16(partial[0]);
     }
 }
