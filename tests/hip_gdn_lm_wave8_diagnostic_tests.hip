@@ -11,6 +11,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -159,7 +160,7 @@ void family(Shape shape,Kind kind,unsigned flavor,bool host_oracle){
     const auto expected=download(output);
     if(host_oracle){
         same(expected,oracle(shape,hidden,packed,kind),shape,kind,Arm::reference,flavor,"finite CPU oracle");
-        auto changed=packed;changed[2]^=0x55U;
+        auto changed=packed;changed[1]^=0x40U; // finite block scale x65536 survives BF16 rounding
         require(oracle(shape,hidden,changed,kind)!=expected,"fixture does not detect corrupted coefficient");
         auto changed_input=hidden;changed_input[0]=0x4000U;
         require(oracle(shape,changed_input,packed,kind)!=expected,"fixture does not detect wrong input leaf");
