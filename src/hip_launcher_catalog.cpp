@@ -168,7 +168,7 @@ HipMoeExpertsLauncherConfig
 moe_experts_config(
     const ModelContract& model,
     HipActivationStorage activation, bool q4k_a8 = false,
-    std::shared_ptr<moe_q4k_a8::RuntimeDispatchStats> stats = {}) {
+    std::shared_ptr<moe_q4k_a8::RuntimeDispatchStats> stats = {}, bool grouped_q51=false) {
     HipMoeExpertsLauncherConfig config;
     config.hidden_size =
         checked_u32(
@@ -189,6 +189,7 @@ moe_experts_config(
     config.activation =
         activation;
     config.q4k_a8g32_gate_up = q4k_a8;
+    config.grouped_exact_q51_down = grouped_q51;
     config.q4k_a8_stats = std::move(stats);
     return config;
 }
@@ -240,6 +241,8 @@ void register_complete_hip_kernel_catalog(
     if (config.ranked_moe_router_topk != request.ranked_moe_router_topk ||
         (config.ranked_moe_router_topk && !config.parallel_moe_router))
         throw std::invalid_argument("HIP catalog ranked router mode differs from binding request");
+    if(config.grouped_exact_q51_down != request.grouped_exact_q51_down)
+        throw std::invalid_argument("HIP catalog grouped exact Q5_1 mode differs from binding request");
     if (config.q4k_a8g32_gate_up != request.q4k_a8g32_gate_up)
         throw std::invalid_argument("HIP catalog Q4K A8 mode differs from binding request");
     if (config.parallel_moe_router != request.parallel_moe_router)
@@ -343,7 +346,7 @@ void register_complete_hip_kernel_catalog(
     const auto moe_experts =
         moe_experts_config(
             model,
-            config.activation, config.q4k_a8g32_gate_up, config.q4k_a8_stats);
+            config.activation, config.q4k_a8g32_gate_up, config.q4k_a8_stats, config.grouped_exact_q51_down);
     register_hip_moe_experts_kernel_variant(
         model,
         request,
@@ -411,7 +414,7 @@ HipLauncherCatalog::HipLauncherCatalog(
       moe_experts_(
           moe_experts_config(
               model,
-              config.activation, config.q4k_a8g32_gate_up, config.q4k_a8_stats)),
+              config.activation, config.q4k_a8g32_gate_up, config.q4k_a8_stats, config.grouped_exact_q51_down)),
       lm_head_(
           lm_head_config(
               model,

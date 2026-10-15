@@ -211,6 +211,7 @@ std::uint64_t build_execution_identity(
 
     if (buffer_request.parallel_moe_router) hash_u64(hash, 0x524f555445525057ULL);
     if (buffer_request.q4k_a8g32_gate_up) hash_u64(hash, 0x51344b4138473332ULL);
+    if (buffer_request.grouped_exact_q51_down) hash_u64(hash, 0x5135314752505631ULL);
 
     hash_u64(hash, compiled.arena.alignment);
     hash_u64(hash, compiled.arena.total_bytes);
@@ -310,6 +311,10 @@ CompiledSerialExecution compile_serial_execution(
     if (binding_request.parallel_moe_router != buffer_request.parallel_moe_router)
         throw std::invalid_argument("router kernel request differs from buffer admission");
 
+    if(binding_request.grouped_exact_q51_down != buffer_request.grouped_exact_q51_down)
+        throw std::invalid_argument("grouped exact Q5_1 down request differs from buffer admission");
+    if(binding_request.grouped_exact_q51_down && !binding_request.q4k_a8g32_gate_up)
+        throw std::invalid_argument("grouped exact Q5_1 down requires Q4K A8 slot workspace");
     if (binding_request.q4k_a8g32_gate_up != buffer_request.q4k_a8g32_gate_up)
         throw std::invalid_argument("Q4K A8 kernel request differs from buffer admission");
     if (binding_request.q4k_a8g32_gate_up &&
@@ -353,6 +358,9 @@ CompiledSerialExecution compile_serial_execution(
     }
 
     for (const auto& binding : compiled.bindings.bindings) {
+        if(binding.op==SerialOp::moe_experts && binding.kernel_id &&
+           binding.kernel_id->ends_with(moe_q4k_a8::grouped_q51_kernel_ending)!=buffer_request.grouped_exact_q51_down)
+            throw std::invalid_argument("bound grouped exact Q5_1 down differs from admitted topology");
         if (binding.op == SerialOp::moe_experts && binding.kernel_id.has_value() &&
             binding.kernel_id->ends_with(moe_q4k_a8::runtime_kernel_suffix) != buffer_request.q4k_a8g32_gate_up)
             throw std::invalid_argument("bound Q4K A8 kernel differs from admitted topology");

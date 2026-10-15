@@ -134,6 +134,8 @@ void check_hip(
 
 void validate_config(
     const HipMoeExpertsLauncherConfig& config) {
+    if(config.grouped_exact_q51_down && !config.q4k_a8g32_gate_up)
+        throw std::invalid_argument("grouped exact Q5_1 down requires Q4K A8 slot workspace");
     if (config.q4k_a8g32_gate_up) {
 #ifndef STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME
         throw std::invalid_argument("Q4K A8 runtime capability is not built");
@@ -1152,6 +1154,16 @@ void launch_q4k_a8_typed(const HipMoeExpertsLauncherConfig& config,
         slice(layout.gate_up_offset,layout.gate_up_bytes)};
     // All admission is complete before even the initial clear is submitted.
     moe_q4k_a8::validate(request,bindings);
+    const bool grouped_q51=config.grouped_exact_q51_down && tensors.down.manifest->ggml_type==7U;
+    if(grouped_q51) {
+        const q51_grouped_down::Request q51_request{true,q51_grouped_down::numerical_identity,
+            {config.hidden_size,config.intermediate_size,config.expert_count,config.top_k}};
+        const auto n=q51_grouped_down::required_bytes(q51_request.shape);
+        q51_grouped_down::validate(q51_request,{
+            {bindings.output.address,n.intermediates},{tensors.down.runtime->address,n.weights},
+            {route_indices.address,n.routes},{route_weights.address,n.route_weights},
+            {bindings.status.address,n.status},{temporary.address+layout.accumulation_offset,n.accumulation}});
+    }
     auto* workspace = reinterpret_cast<float*>(bindings.output.address);
     auto* accumulation = reinterpret_cast<float*>(temporary.address + layout.accumulation_offset);
     auto* status = reinterpret_cast<std::uint32_t*>(bindings.status.address);
@@ -1183,10 +1195,18 @@ void launch_q4k_a8_typed(const HipMoeExpertsLauncherConfig& config,
         check_hip(hipGetLastError(),"Q4K A8 original SiLU enqueue");
     }
     scan(workspace,2U*config.intermediate_size*config.top_k);
-    for (std::uint32_t slot=0;slot<config.top_k;++slot)
-        launch_down_by_kind(weight_kind(tensors.down.manifest->ggml_type),
-            workspace+2ULL*slot*config.intermediate_size,routes,weights,slot,*tensors.down.runtime,
-            config.intermediate_size,config.hidden_size,config.expert_count,accumulation,status);
+    if(grouped_q51) {
+        hipLaunchKernelGGL(q51_grouped_virtual256_down_probe_kernel,
+            dim3((config.hidden_size+7U)/8U),dim3(kThreads),0,hip_execution_stream(),
+            workspace,routes,weights,reinterpret_cast<const void*>(tensors.down.runtime->address),
+            config.intermediate_size,config.hidden_size,config.expert_count,config.top_k,accumulation,status);
+        check_hip(hipGetLastError(),"native grouped exact Q5_1 down");
+    } else {
+        for (std::uint32_t slot=0;slot<config.top_k;++slot)
+            launch_down_by_kind(weight_kind(tensors.down.manifest->ggml_type),
+                workspace+2ULL*slot*config.intermediate_size,routes,weights,slot,*tensors.down.runtime,
+                config.intermediate_size,config.hidden_size,config.expert_count,accumulation,status);
+    }
     scan(accumulation,config.hidden_size,config.activation == HipActivationStorage::bf16);
     hipLaunchKernelGGL(HIP_KERNEL_NAME(commit_experts_kernel<Storage>),
         dim3((config.hidden_size+kThreads-1U)/kThreads),dim3(kThreads),0,hip_execution_stream(),
@@ -1208,6 +1228,8 @@ void launch_q4k_a8_typed(const HipMoeExpertsLauncherConfig& config,
                 std::to_string(host_status));
     }
     if (config.q4k_a8_stats) config.q4k_a8_stats->quantized_submissions.fetch_add(1,std::memory_order_relaxed);
+    if(grouped_q51 && config.q4k_a8_stats)
+        config.q4k_a8_stats->grouped_q51_submissions.fetch_add(1,std::memory_order_relaxed);
 }
 #endif
 
@@ -1395,6 +1417,7 @@ std::string kernel_id(
         ".c" +
         std::to_string(
             request.request_concurrency) +
+        (config.grouped_exact_q51_down ? ".grouped-exact-q51-down-v1" : "") +
         (config.q4k_a8g32_gate_up ? std::string(moe_q4k_a8::runtime_kernel_suffix) : "");
 }
 
@@ -1411,6 +1434,7 @@ std::uint64_t implementation_identity(
         static_cast<std::uint64_t>(
             config.activation));
     if (config.q4k_a8g32_gate_up) hash_u64(hash,0x51344b4138473332ULL);
+    if (config.grouped_exact_q51_down) hash_u64(hash,0x5135314752505631ULL);
     return hash;
 }
 
@@ -1429,6 +1453,8 @@ void register_hip_moe_experts_kernel_variant(
             error);
     }
     validate_config(config);
+    if(request.grouped_exact_q51_down != config.grouped_exact_q51_down)
+        throw std::invalid_argument("grouped exact Q5_1 config differs from binding request");
     if (request.q4k_a8g32_gate_up != config.q4k_a8g32_gate_up)
         throw std::invalid_argument("Q4K A8 variant config differs from binding request");
     if (config.hidden_size !=
@@ -1505,6 +1531,10 @@ void register_hip_moe_experts_kernel_variant(
         variant.numerics.accumulator_precision = std::string(moe_q4k_a8::runtime_numerical_identity);
         variant.compiler_identity = "hip-gfx1151-moe-q4k-a8g32-native-v2-probe-strict-rndiv-legacy-down";
     }
+    if(config.grouped_exact_q51_down) {
+        variant.numerics.accumulator_precision += ";" + std::string(moe_q4k_a8::grouped_q51_numerical_identity);
+        variant.compiler_identity += ":grouped-exact-q51-down-v1";
+    }
     variant.measured_seconds = 0.0;
 
     registry.add(
@@ -1521,6 +1551,8 @@ make_hip_moe_experts_launcher(
             "HIP routed-expert launcher requires id and config");
     }
     validate_config(*config);
+    if(kernel_id_value.ends_with(moe_q4k_a8::grouped_q51_kernel_ending)!=config->grouped_exact_q51_down)
+        throw std::invalid_argument("grouped exact Q5_1 launcher id differs from config");
     if (kernel_id_value.ends_with(moe_q4k_a8::runtime_kernel_suffix) != config->q4k_a8g32_gate_up)
         throw std::invalid_argument("Q4K A8 launcher id differs from config");
     if (config->q4k_a8g32_gate_up && !config->q4k_a8_quiescence)
@@ -1561,6 +1593,8 @@ register_for_compiled_execution(
             throw std::invalid_argument(
                 "HIP routed-expert step has no kernel binding");
         }
+        if(binding.kernel_id->ends_with(moe_q4k_a8::grouped_q51_kernel_ending)!=config_.grouped_exact_q51_down)
+            throw std::invalid_argument("grouped exact Q5_1 bundle differs from compiled selection");
         if (binding.kernel_id->ends_with(moe_q4k_a8::runtime_kernel_suffix) != config_.q4k_a8g32_gate_up)
             throw std::invalid_argument("Q4K A8 bundle mode differs from compiled selection");
         if (registered_id.empty()) {

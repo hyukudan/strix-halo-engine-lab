@@ -1,5 +1,7 @@
 #include "strix/moe_q4k_a8_runtime.hpp"
 #include "strix/execution_buffers.hpp"
+#include "strix/raw_baseline_recording.hpp"
+#include "strix/integer_projection_runtime.hpp"
 #include <iostream>
 #include <stdexcept>
 
@@ -57,6 +59,7 @@ int main() {
     const auto c = classify_runtime_manifest(model,m);
     check(c.quantized_layers.size() == 47 && c.legacy_q5k_layers == std::vector<std::uint32_t>{2},
         "synthetic canonical manifest classification 47 Q4K / layer2 Q5K");
+    check(c.q4k_with_q51_down_layers.size()==47,"synthetic manifest classifies Q4K/Q5_1 targets");
     auto bad = m;
     bad.tensors.pop_back(); rejects([&]{(void)classify_runtime_manifest(model,bad);}, "missing down");
     bad=m; bad.tensors.push_back(m.tensors[0]); rejects([&]{(void)classify_runtime_manifest(model,bad);}, "duplicate gate");
@@ -76,8 +79,31 @@ int main() {
     request.q4k_a8g32_gate_up=true;
     check(strix::build_serial_execution_buffer_plan(model,request).mlp_intermediate_bytes >= l.total_bytes,
         "admitted workspace covers all typed regions");
+    request.grouped_exact_q51_down=true;
+    check(strix::build_serial_execution_buffer_plan(model,request).mlp_intermediate_bytes==l.total_bytes,
+        "grouped exact Q5_1 down reuses existing typed workspace");
+    request.q4k_a8g32_gate_up=false;
+    rejects([&]{(void)strix::build_serial_execution_buffer_plan(model,request);},"grouped Q5_1 needs A8 layout");
+    request.q4k_a8g32_gate_up=true;
     request.logical_rows=2; rejects([&]{(void)strix::build_serial_execution_buffer_plan(model,request);}, "mode rejects rows2");
     request.logical_rows=1; request.control_element_bytes=2;
     rejects([&]{(void)strix::build_serial_execution_buffer_plan(model,request);}, "mode rejects FP16 controls");
+    const auto combined=[&](std::string prefix) {
+        prefix += ";" + std::string(runtime_numerical_identity) + ";" + std::string(grouped_q51_raw_identity);
+        check(prefix.size()<=512,"combined RAW numerical identity remains inside512 byte contract");
+    };
+    combined(strix::raw_floating_lm_head_numerical_identity(strix::RawBaselineActivationStorage::bf16));
+    combined(strix::raw_floating_lm_head_numerical_identity(strix::RawBaselineActivationStorage::fp32));
+    for(const auto weight:{strix::integer_projection::WeightEncoding::q4_0,strix::integer_projection::WeightEncoding::iq4_xs})
+        for(const auto activation:{strix::low_precision::ActivationEncoding::symmetric_a8,strix::low_precision::ActivationEncoding::symmetric_a4})
+            for(const auto instruction:{strix::integer_projection::Instruction::iu8,strix::integer_projection::Instruction::iu4}) {
+                if(instruction==strix::integer_projection::Instruction::iu4 &&
+                   (weight!=strix::integer_projection::WeightEncoding::q4_0 || activation!=strix::low_precision::ActivationEncoding::symmetric_a4)) continue;
+                for(const auto input:{strix::integer_projection::RuntimeInput::bf16,strix::integer_projection::RuntimeInput::fp32}) {
+                    strix::integer_projection::RuntimeConfig config;
+                    config.weights=weight; config.activations=activation; config.instruction=instruction; config.input=input;
+                    combined(strix::integer_projection::runtime_numerical_identity(config));
+                }
+            }
     return failures ? 1 : 0;
 }

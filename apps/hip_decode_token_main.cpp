@@ -176,6 +176,7 @@ struct Options {
     bool virtual_q8_gdn_input = false;
     bool ranked_moe_router_topk = false;
     bool q4k_a8g32_gate_up = false;
+    bool grouped_exact_q51_down = false;
     bool prefetch_q8_gdn_input = false;
     std::uint64_t ple_max_rows_per_io = 4;
     std::uint64_t ple_max_inflight_ios = 4;
@@ -202,7 +203,7 @@ Options parse_options(
             "[--planned-ple-io] [--ple-max-rows-per-io N] [--ple-max-inflight-ios N] "
             "[--generate N] [--eos-token TOKEN_ID] [--prefix-cache-roundtrip] "
             "[--parallel-moe-router] [--ranked-moe-router-topk] "
-            "[--virtual-q8-lm-head] [--virtual-q8-gdn-input [--prefetch-q8-gdn-input]] [--q4k-a8g32-gate-up] "
+            "[--virtual-q8-lm-head] [--virtual-q8-gdn-input [--prefetch-q8-gdn-input]] [--q4k-a8g32-gate-up [--grouped-exact-q51-down]] "
             "[--parallel-hyper-mix [--staged-hyper-projections [--fused-staged-hyper-mix [--typed-fused-hyper-projections [--prefetch-typed-hyper-rows]]]]]");
     }
 
@@ -216,6 +217,15 @@ Options parse_options(
          ++index) {
         const std::string_view argument =
             argv[index];
+        if (argument == "--grouped-exact-q51-down") {
+#ifndef STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME
+            throw std::invalid_argument("--grouped-exact-q51-down requires the experimental runtime build capability");
+#else
+            if(options.grouped_exact_q51_down) throw std::invalid_argument("duplicate grouped exact Q5_1 down option");
+            options.grouped_exact_q51_down=true;
+            continue;
+#endif
+        }
         if (argument == "--q4k-a8g32-gate-up") {
 #ifndef STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME
             throw std::invalid_argument("--q4k-a8g32-gate-up requires the experimental runtime build capability");
@@ -511,6 +521,8 @@ Options parse_options(
         throw std::invalid_argument(
             "ple-max-inflight-ios must be non-zero");
     }
+    if(options.grouped_exact_q51_down && !options.q4k_a8g32_gate_up)
+        throw std::invalid_argument("--grouped-exact-q51-down requires --q4k-a8g32-gate-up");
     if (options.ranked_moe_router_topk && !options.parallel_moe_router)
         throw std::invalid_argument("--ranked-moe-router-topk requires --parallel-moe-router");
     if (options.prefetch_q8_gdn_input && !options.virtual_q8_gdn_input)
@@ -871,10 +883,15 @@ int main(
     const auto q4k_a8_layers = options.q4k_a8g32_gate_up ?
         strix::moe_q4k_a8::classify_runtime_manifest(model,manifest) :
         strix::moe_q4k_a8::RuntimeLayerClassification{};
+    if(options.grouped_exact_q51_down && q4k_a8_layers.q4k_with_q51_down_layers.empty())
+        throw std::invalid_argument("--grouped-exact-q51-down requires a Q4_K gate/up layer with Q5_1 down");
     const auto q4k_a8_stats = options.q4k_a8g32_gate_up ?
         std::make_shared<strix::moe_q4k_a8::RuntimeDispatchStats>() : nullptr;
     const auto emit_q4k_a8_receipt = [&] {
-        std::cout << "  \"q4k_a8g32_gate_up\": " << (options.q4k_a8g32_gate_up ? "true" : "false") << ",\n"
+        std::cout << "  \"grouped_exact_q51_down\": " << (options.grouped_exact_q51_down ? "true" : "false") << ",\n"
+            << "  \"grouped_q51_numerical_identity\": \""
+            << (options.grouped_exact_q51_down ? strix::moe_q4k_a8::grouped_q51_numerical_identity : std::string_view{"legacy"}) << "\",\n"
+            << "  \"q4k_a8g32_gate_up\": " << (options.q4k_a8g32_gate_up ? "true" : "false") << ",\n"
             << "  \"q4k_a8g32_numerical_identity\": \""
             << (options.q4k_a8g32_gate_up ? strix::moe_q4k_a8::runtime_numerical_identity : std::string_view{"legacy"}) << "\",\n"
             << "  \"q4k_a8g32_quantized_layers\": [";
@@ -883,13 +900,18 @@ int main(
         std::cout << "],\n  \"q4k_a8g32_legacy_q5k_layers\": [";
         for (std::size_t i=0;i<q4k_a8_layers.legacy_q5k_layers.size();++i)
             std::cout << (i ? "," : "") << q4k_a8_layers.legacy_q5k_layers[i];
+        std::cout << "],\n  \"grouped_q51_eligible_layers\": [";
+        for(std::size_t i=0;i<q4k_a8_layers.q4k_with_q51_down_layers.size();++i)
+            std::cout << (i ? "," : "") << q4k_a8_layers.q4k_with_q51_down_layers[i];
         std::cout << "],\n";
     };
     const auto emit_q4k_a8_counts = [&] {
         std::cout << "  \"q4k_a8g32_host_quantized_submissions\": "
             << (q4k_a8_stats ? q4k_a8_stats->quantized_submissions.load(std::memory_order_relaxed) : 0)
             << ",\n  \"q4k_a8g32_host_legacy_q5k_submissions\": "
-            << (q4k_a8_stats ? q4k_a8_stats->legacy_q5k_submissions.load(std::memory_order_relaxed) : 0) << ",\n";
+            << (q4k_a8_stats ? q4k_a8_stats->legacy_q5k_submissions.load(std::memory_order_relaxed) : 0)
+            << ",\n  \"grouped_q51_host_submissions\": "
+            << (q4k_a8_stats ? q4k_a8_stats->grouped_q51_submissions.load(std::memory_order_relaxed) : 0) << ",\n";
     };
     const auto tensor_index =
         strix::build_model_tensor_index(
@@ -947,8 +969,10 @@ int main(
     catalog_config.prefetch_typed_hyper_rows = options.prefetch_typed_hyper_rows;
     catalog_config.virtual_q8_lm_head = options.virtual_q8_lm_head;
     catalog_config.q4k_a8g32_gate_up = options.q4k_a8g32_gate_up;
+    catalog_config.grouped_exact_q51_down = options.grouped_exact_q51_down;
     catalog_config.q4k_a8_stats = q4k_a8_stats;
     binding_request.q4k_a8g32_gate_up = options.q4k_a8g32_gate_up;
+    binding_request.grouped_exact_q51_down = options.grouped_exact_q51_down;
     catalog_config.ranked_moe_router_topk = options.ranked_moe_router_topk;
     binding_request.ranked_moe_router_topk = options.ranked_moe_router_topk;
     catalog_config.parallel_moe_router = options.parallel_moe_router;
@@ -974,6 +998,7 @@ int main(
     buffer_request.logical_rows = 1;
     buffer_request.parallel_moe_router = options.parallel_moe_router;
     buffer_request.q4k_a8g32_gate_up = options.q4k_a8g32_gate_up;
+    buffer_request.grouped_exact_q51_down = options.grouped_exact_q51_down;
     buffer_request.activation_element_bytes =
         2;
     buffer_request.control_element_bytes =
@@ -1253,6 +1278,8 @@ int main(
             : strix::raw_floating_lm_head_numerical_identity(metadata.activation_storage);
         if (options.q4k_a8g32_gate_up)
             metadata.numerical_identity += ";" + std::string(strix::moe_q4k_a8::runtime_numerical_identity);
+        if(options.grouped_exact_q51_down)
+            metadata.numerical_identity += ";" + std::string(strix::moe_q4k_a8::grouped_q51_raw_identity);
         strix::RawBaselinePolicy policy;
         policy.maximum_bytes = options.raw_maximum_bytes;
         policy.maximum_steps = options.tokens.size();

@@ -173,7 +173,7 @@ compile_speculative_verify_execution(
     const SpeculativeVerifyBindingRequest& binding_request,
     const ExecutionBufferRequest& buffer_request,
     std::uint64_t arena_alignment) {
-    if (buffer_request.q4k_a8g32_gate_up)
+    if (buffer_request.q4k_a8g32_gate_up || buffer_request.grouped_exact_q51_down)
         throw std::invalid_argument("Q4K A8 runtime does not support speculative verify");
     if (candidate_depth == 0) {
         throw std::invalid_argument(

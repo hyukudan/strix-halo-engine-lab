@@ -161,8 +161,9 @@ float round_bf16(float value) {
 int main(int argc, char** argv) try {
     const unsigned int requested_mode = argc > 1 ? static_cast<unsigned int>(std::stoul(argv[1])) : 0U;
     if (requested_mode > 7U) throw std::invalid_argument("invalid K-quant test mode");
-    const bool q4k_a8 = argc > 2 && (std::string(argv[2]) == "q4k-a8" || std::string(argv[2]) == "q4k-a8-duplicate");
-    const bool duplicate_routes = argc > 2 && std::string(argv[2]) == "q4k-a8-duplicate";
+    const bool grouped_q51=argc>2 && (std::string(argv[2])=="q4k-a8-q51-grouped" || std::string(argv[2])=="q4k-a8-q51-grouped-duplicate");
+    const bool q4k_a8 = grouped_q51 || (argc > 2 && (std::string(argv[2]) == "q4k-a8" || std::string(argv[2]) == "q4k-a8-duplicate"));
+    const bool duplicate_routes = argc > 2 && (std::string(argv[2]) == "q4k-a8-duplicate" || std::string(argv[2])=="q4k-a8-q51-grouped-duplicate");
 #ifndef STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME
     if(q4k_a8) throw std::invalid_argument("Q4K A8 test requires runtime capability");
 #endif
@@ -171,7 +172,7 @@ int main(int argc, char** argv) try {
     constexpr std::array<std::uint32_t, 3> types{12U, 13U, 7U};
     const auto gate_type = mode < 3U ? types[mode] : 12U;
     const auto up_type = mode < 3U ? types[mode] : 13U;
-    const auto down_type = mode < 3U ? types[mode] : 7U;
+    const auto down_type = grouped_q51 && mode==0U ? 7U : (mode < 3U ? types[mode] : 7U);
     if(q4k_a8 && mode>1U) throw std::invalid_argument("Q4K A8 fixture requires paired Q4K/Q5K");
     constexpr std::uint32_t hidden = 768;
     constexpr std::uint32_t intermediate = 512;
@@ -208,6 +209,7 @@ int main(int argc, char** argv) try {
     strix::ExecutionBufferRequest buffer_request;
     buffer_request.logical_rows = 1;
     buffer_request.q4k_a8g32_gate_up = q4k_a8;
+    buffer_request.grouped_exact_q51_down=grouped_q51;
     buffer_request.activation_element_bytes = bf16 ? 2U : 4U;
     buffer_request.mlp_intermediate_element_bytes = 4;
     const auto arena =
@@ -584,10 +586,13 @@ int main(int argc, char** argv) try {
         top_k;
     config.activation = bf16 ? strix::HipActivationStorage::bf16 : strix::HipActivationStorage::fp32;
     config.q4k_a8g32_gate_up = q4k_a8;
+    config.grouped_exact_q51_down=grouped_q51;
+    if(grouped_q51) config.q4k_a8_stats=std::make_shared<strix::moe_q4k_a8::RuntimeDispatchStats>();
 
     auto launcher =
         strix::make_hip_moe_experts_launcher(
-            "test.moe_experts" + (q4k_a8 ? std::string(strix::moe_q4k_a8::runtime_kernel_suffix) : ""),
+            "test.moe_experts" + (grouped_q51 ? std::string(".grouped-exact-q51-down-v1") : "") +
+                (q4k_a8 ? std::string(strix::moe_q4k_a8::runtime_kernel_suffix) : ""),
             &config);
     launcher.function(
         context,
@@ -634,6 +639,21 @@ int main(int argc, char** argv) try {
     std::vector<std::byte> before(output_bytes), after(output_bytes);
     check(hipMemcpy(before.data(), reinterpret_cast<void*>(output.address), output_bytes,
                     hipMemcpyDeviceToHost), "snapshot committed routed output");
+    if(grouped_q51 && gate_type==12U) {
+        expect(config.q4k_a8_stats->grouped_q51_submissions.load()==1U,"grouped Q5_1 native host branch actually submitted");
+        const auto grouped_temporary=strix::resolve_execution_buffer(memory.execution_identity,arena,memory,step_io.temporaries[0]);
+        const auto grouped_layout=strix::moe_q4k_a8::build_runtime_workspace(hidden,intermediate,experts,top_k);
+        std::vector<std::uint32_t> grouped_accumulator(hidden),reference_accumulator(hidden);
+        check(hipMemcpy(grouped_accumulator.data(),reinterpret_cast<void*>(grouped_temporary.address+grouped_layout.accumulation_offset),hidden*4,hipMemcpyDeviceToHost),"snapshot grouped FP32 accumulation");
+        auto reference_config=config; reference_config.grouped_exact_q51_down=false;
+        auto reference=strix::make_hip_moe_experts_launcher(
+            "test.q4-reference"+std::string(strix::moe_q4k_a8::runtime_kernel_suffix),&reference_config);
+        reference.function(context,reference.user_data);
+        check(hipMemcpy(after.data(),reinterpret_cast<void*>(output.address),output_bytes,hipMemcpyDeviceToHost),"read A8-only down reference");
+        expect(before==after,"grouped exact Q5_1 native output equals A8-only original down bits");
+        check(hipMemcpy(reference_accumulator.data(),reinterpret_cast<void*>(grouped_temporary.address+grouped_layout.accumulation_offset),hidden*4,hipMemcpyDeviceToHost),"read original FP32 accumulation");
+        expect(grouped_accumulator==reference_accumulator,"grouped exact Q5_1 native FP32 accumulation equals original down bits before BF16 rounding");
+    }
     if(q4k_a8 && gate_type==12U) {
         const auto temporary=strix::resolve_execution_buffer(memory.execution_identity,arena,memory,step_io.temporaries[0]);
         const auto layout=strix::moe_q4k_a8::build_runtime_workspace(hidden,intermediate,experts,top_k);
@@ -671,7 +691,8 @@ int main(int argc, char** argv) try {
         malformed_binding(0,runtime.tensors[0].address,runtime.tensors[0].bytes-1);
     }
     if(q4k_a8 && gate_type==13U) {
-        auto legacy_config=config; legacy_config.q4k_a8g32_gate_up=false;
+        if(grouped_q51) expect(config.q4k_a8_stats->grouped_q51_submissions.load()==0U,"Q5K gate fallback does not submit grouped Q5_1 down");
+        auto legacy_config=config; legacy_config.q4k_a8g32_gate_up=false; legacy_config.grouped_exact_q51_down=false;
         auto legacy=strix::make_hip_moe_experts_launcher("test.legacy.moe",&legacy_config);
         legacy.function(context,legacy.user_data);
         check(hipMemcpy(after.data(),reinterpret_cast<void*>(output.address),output_bytes,hipMemcpyDeviceToHost),
@@ -726,6 +747,20 @@ int main(int argc, char** argv) try {
     { strix::HipLaunchScope scope(graph_context); launcher.function(context, launcher.user_data); }
     check(hipStreamEndCapture(graph_stream, &graph), "end routed graph capture");
     check(hipGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0), "instantiate routed graph");
+    if(grouped_q51 && gate_type==12U) {
+        std::size_t count=0;check(hipGraphGetNodes(graph,nullptr,&count),"count native Q5_1 graph nodes");
+        std::vector<hipGraphNode_t> nodes(count);check(hipGraphGetNodes(graph,nodes.data(),&count),"read native Q5_1 graph nodes");
+        unsigned grouped_nodes=0,original_down_nodes=0;
+        for(const auto node:nodes) {
+            hipGraphNodeType type;check(hipGraphNodeGetType(node,&type),"inspect native Q5_1 node type");
+            if(type!=hipGraphNodeTypeKernel) continue;
+            hipKernelNodeParams params{};check(hipGraphKernelNodeGetParams(node,&params),"inspect native Q5_1 launch");
+            if(params.gridDim.x==(hidden+7U)/8U && params.gridDim.y==1U && params.blockDim.x==256U) ++grouped_nodes;
+            if(params.gridDim.x==hidden && params.gridDim.y==1U && params.blockDim.x==256U) ++original_down_nodes;
+        }
+        expect(grouped_nodes==1U && original_down_nodes==0U,"native capture uses one grouped Q5_1 down and no serial original down nodes");
+    }
+
     if(q4k_a8) {
         check(hipMemcpy(reinterpret_cast<void*>(route_indices.address),selected.data(),selected.size()*sizeof(unsigned),hipMemcpyHostToDevice),"restore graph valid routes");
         check(hipMemcpy(reinterpret_cast<void*>(route_weights.address),selected_weights.data(),selected_weights.size()*sizeof(float),hipMemcpyHostToDevice),"restore graph valid weights");
@@ -815,7 +850,7 @@ int main(int argc, char** argv) try {
         restore(); upload_input(std::vector<float>(hidden,1e25F)); error_case(8U,false);
         restore(); upload_input(std::vector<float>(hidden,1e18F));
         auto huge_down=down.packed;
-        for(std::size_t offset=0;offset<huge_down.size();offset+=144) {
+        for(std::size_t offset=0;offset<huge_down.size();offset+=(down_type==7U ? 24U : 144U)) {
             const std::uint16_t d=0x7bffU,m=0;
             std::memcpy(huge_down.data()+offset,&d,2); std::memcpy(huge_down.data()+offset+2,&m,2);
         }

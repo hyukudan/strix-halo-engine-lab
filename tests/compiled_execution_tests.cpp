@@ -89,6 +89,7 @@ strix::kernels::KernelRegistry make_registry(
                 "test." + key + suffix +
                     (step.op == strix::SerialOp::moe_route && request.ranked_moe_router_topk ? ".ranked.parallel" :
                      step.op == strix::SerialOp::moe_route && request.parallel_moe_router ? ".parallel" : "") +
+                    (step.op == strix::SerialOp::moe_experts && request.grouped_exact_q51_down ? ".grouped-exact-q51-down-v1" : "") +
                     (step.op == strix::SerialOp::moe_experts && request.q4k_a8g32_gate_up ? ".q4k-a8g32-gateup-v2" : ""),
                 *family,
                 shape,
@@ -589,6 +590,20 @@ int main() {
     try { (void)strix::compile_serial_execution(model,q4_registry,q4_binding,q4_buffers,128); }
     catch(const std::invalid_argument&) { q4_alignment_rejected=true; }
     expect(q4_alignment_rejected, "Q4K A8 rejects insufficient absolute arena alignment");
+    auto q51_binding=q4_binding; auto q51_buffers=q4_buffers;
+    q51_binding.grouped_exact_q51_down=true; q51_buffers.grouped_exact_q51_down=true;
+    const auto q51_registry=make_registry(model,q51_binding);
+    const auto q51_compiled=strix::compile_serial_execution(model,q51_registry,q51_binding,q51_buffers);
+    expect(q51_compiled.execution_identity!=q4_compiled.execution_identity &&
+        q51_compiled.kernel_plan_identity!=q4_compiled.kernel_plan_identity &&
+        q51_compiled.arena.total_bytes==q4_compiled.arena.total_bytes,
+        "grouped exact Q5_1 down changes identities without changing admitted scratch");
+    expect(rejects_ranked(q51_registry,q51_binding,q4_buffers),"Q5_1 request requires matching buffer mode");
+    expect(rejects_ranked(q51_registry,q4_binding,q51_buffers),"Q5_1 buffers require matching request mode");
+    expect(rejects_ranked(q4_registry,q51_binding,q51_buffers),"Q5_1 admitted mode rejects A8-only kernel suffix");
+    expect(rejects_ranked(q51_registry,q4_binding,q4_buffers),"A8-only mode rejects grouped Q5_1 kernel suffix");
+    q51_binding.q4k_a8g32_gate_up=false; q51_buffers.q4k_a8g32_gate_up=false;
+    expect(rejects_ranked(q51_registry,q51_binding,q51_buffers),"grouped Q5_1 rejects missing A8 slot workspace");
     q4_binding.q4k_a8g32_gate_up=false; q4_buffers.q4k_a8g32_gate_up=false;
     expect(strix::compile_serial_execution(model,registry,q4_binding,q4_buffers).execution_identity ==
         5195923158154663034ULL, "disabled Q4K A8 preserves pre-edit compiled golden");

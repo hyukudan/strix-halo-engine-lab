@@ -1355,6 +1355,14 @@ if(STRIX_ENABLE_HIP_RUNTIME)
             target_link_libraries(strix-hip-q51-grouped-down-probe-tests PRIVATE strix_hip_runtime)
             strix_target_warnings(strix-hip-q51-grouped-down-probe-tests)
             add_test(NAME strix-hip-q51-grouped-down-probe-tests COMMAND strix-hip-q51-grouped-down-probe-tests)
+            foreach(mode 0 1 4 5)
+                add_test(NAME strix-hip-moe-q51-grouped-native-${mode}-tests
+                    COMMAND strix-hip-moe-kquant-tests ${mode} q4k-a8-q51-grouped)
+            endforeach()
+            foreach(mode 0 4)
+                add_test(NAME strix-hip-moe-q51-grouped-native-duplicate-${mode}-tests
+                    COMMAND strix-hip-moe-kquant-tests ${mode} q4k-a8-q51-grouped-duplicate)
+            endforeach()
             foreach(mode 0 4)
                 add_test(NAME strix-hip-moe-q4k-a8-native-duplicate-${mode}-tests
                     COMMAND strix-hip-moe-kquant-tests ${mode} q4k-a8-duplicate)

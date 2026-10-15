@@ -52,6 +52,9 @@ ExecutionBufferPlan build_serial_execution_buffer_plan(
             "execution buffer row and element sizes must be non-zero");
     }
 
+    if(request.grouped_exact_q51_down && !request.q4k_a8g32_gate_up)
+        throw std::invalid_argument("grouped exact Q5_1 down requires Q4K A8 slot workspace");
+
     ExecutionBufferPlan plan;
     plan.logical_rows = request.logical_rows;
 

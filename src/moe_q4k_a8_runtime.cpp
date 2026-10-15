@@ -94,6 +94,8 @@ RuntimeLayerClassification classify_runtime_manifest(
         check_tensor(*ts[1], model.hidden_size, model.moe_intermediate_size, model.num_experts);
         check_tensor(*ts[2], model.moe_intermediate_size, model.hidden_size, model.num_experts);
         (ts[0]->ggml_type == 12 ? result.quantized_layers : result.legacy_q5k_layers).push_back(layer);
+        if(ts[0]->ggml_type==12 && ts[2]->ggml_type==7)
+            result.q4k_with_q51_down_layers.push_back(layer);
     }
     if (result.quantized_layers.empty()) throw std::invalid_argument("Q4K A8 requires a Q4K routed layer");
     return result;
