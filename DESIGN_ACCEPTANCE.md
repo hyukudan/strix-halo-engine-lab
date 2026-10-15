@@ -27,13 +27,14 @@ portable tests do not qualify native HIP execution, linked arithmetic identity,
 model arrays/token publication or complete-workload latency. Those gates must
 pass before adoption; first-error merge and host-exception precedence are explicit.
 
-## Default-off spec v1 draft integration
+## Spec v1 draft integration with conditional automatic profile
 
 D-015 through D-020 / E-050 through E-055 are combined in a reversible draft.
 The [integration record](docs/implementation-2026-10-15-spec-v1-draft-integration.md)
 records observed host checks and pending combined review, native compiler/ISA,
 GPU fixtures, model fidelity and paired timing. Low-level flags remain OFF; the
 [automatic decoder policy](docs/decode-optimization-profile.md) can select its
-qualified content-bound profile, and manual mode preserves explicit selection;
+content-bound wave/HC profile, whose combined review and validation remain
+pending, and manual mode preserves explicit selection;
 the HC projection prototype remains diagnostic only. Host evidence does not close
 these native or performance gates.

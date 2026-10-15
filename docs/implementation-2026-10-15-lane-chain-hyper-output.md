@@ -1,6 +1,10 @@
 # Experimental exact lane-chain HC output
 
-`--lane-chain-hyper-output` is off by default and requires `--prefetch-q8-hyper-output` and its typed fused staged parallel prerequisites. It replaces only eligible HC output steps. Original normalization, low projection and injection remain unchanged. This is an exact arithmetic optimization candidate; any complete-logit difference is a correctness failure, not an approximation allowance.
+The low-level `--lane-chain-hyper-output` flag remains OFF in
+`--optimization-profile manual` unless explicitly requested, and requires `--prefetch-q8-hyper-output` and its typed fused staged parallel prerequisites. It replaces only eligible HC output steps. Original normalization, low projection and injection remain unchanged. The content-bound [automatic decoder policy](decode-optimization-profile.md) now
+selects it for the qualified eager/register checkpoint and context alongside wave
+routing. Other checkpoints and incompatible modes retain their explicit selection.
+This is an exact arithmetic optimization candidate; any complete-logit difference is a correctness failure, not an approximation allowance.
 
 The output kernel remains in the original HC translation unit with its compiler settings. A wave owns one stream and each lane owns one feature. For each gate it decodes the original signed Q8 coefficient as a separate FP32 half-scale times signed-code multiplication, then accumulates features in ascending order from positive zero. After the original sigmoid, wave zero combines streams in ascending order and applies the original division and activation storage conversion. Compiler ISA must establish the same fusion, operand ordering and FP32 denormal behavior as the original output kernel before numerical qualification.
 
@@ -12,8 +16,8 @@ For rank320 an output row spans340 bytes, or85 dwords. Scalar scale/code reads a
 
 Host tests cover checked metadata eligibility, exact LDS bounds, alignment policy, no-eligible rejection, bank-index algebra, and mixed eligible/base binding. Device fixtures are supplied for same-input bit comparisons, distinct output poison and guard bytes, extreme signed Q8 scales/codes and FP32 inputs, eager and three graph replays, complete mixer output/injection preservation, and rejection before scratch/semantic writes. These source fixtures are not evidence of GPU execution.
 
-Remaining qualification gates: independent source review; actual HIP compilation with warnings as errors; preservation of every original kernel under a relocation-aware ISA comparison; new arithmetic and resource ISA checks; all device fixtures;554 complete FP32 arrays and512 generated IDs identical to the base; isolated event timings and paired full workloads. The optimization stays experimental and off by default until those gates pass. No model-quality relaxation or approximate HC mode is included.
+Qualification requires independent source review, actual HIP/ISA and device fixtures, complete model arrays and generated IDs, and paired workload measurements. The isolated canonical HC-output increment has passed its source/native/fidelity and paired-workload checks. The automatic wave/HC profile is a new combination prepared for review and fresh native/model/workload validation; separate gains do not establish its combined performance. Manual selection remains explicit. No model-quality relaxation or approximate HC mode is included.
 
-Local qualification checkpoint: Ubuntu24.04 under WSL, GCC13.3, HIP-OFF with warnings as errors: build succeeded and152/152 host tests passed. This does not compile the HIP translation unit. The supplied32 same-input cases and12 complete-mixer cases still require target execution and review.
+Historical host qualification checkpoint: Ubuntu24.04 under WSL, GCC13.3, HIP-OFF with warnings as errors: build succeeded and152/152 host tests passed. This does not compile the HIP translation unit. The supplied32 same-input cases and12 complete-mixer cases still require target execution and review.
 
 Copy residency eligibility uses the exact shared coalesced allocation range and the tensor offset within it; registered residency uses the file offset. Runtime admission checks the actual address with the same residue contract. Copy allocation layout is unchanged. Same-input device fixtures include non-finite FP16 scales and signed FP32 NaNs; complete-pipeline fixtures include two independent rows.

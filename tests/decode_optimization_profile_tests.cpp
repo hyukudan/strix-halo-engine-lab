@@ -34,17 +34,17 @@ int main() {
     auto on = defaults;
     const auto selected = resolve_optimization_profile(on, model, info, manifest,
         validated_model_content_identity, true);
-    expect(selected.automatic_applied && selected.selected == "canonical-a8-wave-v1" &&
+    expect(selected.automatic_applied && selected.selected == "canonical-a8-wave-hc-output-v2" &&
            selected.reason == "qualified-checkpoint", "qualified default selects fast profile");
     expect(on.parallel_hyper_mix && on.staged_hyper_projections && on.fused_staged_hyper_mix &&
            on.typed_hyper_projection && on.prefetch_typed_hyper_rows &&
            on.virtual_q8_lm_head && on.parallel_moe_router && on.wave_moe_router_topk &&
            !on.ranked_moe_router_topk && on.virtual_q8_gdn_input && on.prefetch_q8_gdn_input &&
            on.q4k_a8g32_gate_up && on.grouped_exact_q51_down && on.prefetch_q8_hyper_output &&
-           on.virtual_q8_gdn_output && on.context_tokens == 8192,
+           on.virtual_q8_gdn_output && on.lane_chain_hyper_output && on.context_tokens == 8192,
            "exact validated flag bundle and qualified implicit context");
     expect(!on.prefetch_q8_qsa_input && !on.prefetch_q8_shared_expert &&
-           !on.deferred_moe_status && !on.lane_chain_hyper_output,
+           !on.deferred_moe_status,
            "unqualified experiments stay explicit");
     const auto fallback = [&](Options input, const char* reason, bool capability = true,
                               std::string_view identity = validated_model_content_identity) {
@@ -55,6 +55,7 @@ int main() {
         expect(input.context_tokens == before.context_tokens &&
                input.virtual_q8_lm_head == before.virtual_q8_lm_head &&
                input.q4k_a8g32_gate_up == before.q4k_a8g32_gate_up &&
+               input.lane_chain_hyper_output == before.lane_chain_hyper_output &&
                input.wave_moe_router_topk == before.wave_moe_router_topk &&
                input.ranked_moe_router_topk == before.ranked_moe_router_topk,
                "fallback retains explicit and previous defaults");
@@ -77,6 +78,7 @@ int main() {
     const auto ranked_result = resolve_optimization_profile(ranked, model, info, manifest,
         validated_model_content_identity, true);
     expect(ranked.ranked_moe_router_topk && !ranked.wave_moe_router_topk &&
+           ranked.lane_chain_hyper_output && ranked_result.selected == "canonical-a8-ranked-hc-output-v2" &&
            ranked_result.reason == "explicit-ranked-router", "explicit ranked selection preserved");
     auto explicit_context = parse({"decoder","m","1","--context","8192","--optimization-profile","auto"});
     expect(resolve_optimization_profile(explicit_context, model, info, manifest,
@@ -121,9 +123,22 @@ int main() {
         "--ranked-moe-router-topk","--optimization-profile","manual"});
     const auto manual_result = resolve_optimization_profile(manual, model, info, manifest,
         validated_model_content_identity, true);
-    expect(manual_result.requested == "manual" && manual.ranked_moe_router_topk &&
-           !manual.virtual_q8_lm_head && !manual.q4k_a8g32_gate_up && manual.context_tokens == 128,
+    expect(manual_result.requested == "manual" && manual_result.selected == "manual" &&
+           manual_result.reason == "explicit-manual" && !manual_result.automatic_applied &&
+           manual.ranked_moe_router_topk &&
+           !manual.virtual_q8_lm_head && !manual.q4k_a8g32_gate_up &&
+           !manual.lane_chain_hyper_output && manual.context_tokens == 128,
            "actual application CLI preserves manual baseline without auto dependencies");
+    auto manual_hc = parse({"decoder","m","1","--optimization-profile","manual",
+        "--parallel-hyper-mix","--staged-hyper-projections","--fused-staged-hyper-mix",
+        "--typed-fused-hyper-projections","--prefetch-q8-hyper-output","--lane-chain-hyper-output"});
+    const auto explicit_hc = resolve_optimization_profile(manual_hc, model, info, manifest,
+        validated_model_content_identity, true);
+    expect(explicit_hc.requested == "manual" && explicit_hc.selected == "manual" &&
+           explicit_hc.reason == "explicit-manual" && !explicit_hc.automatic_applied &&
+           manual_hc.lane_chain_hyper_output &&
+           !manual_hc.wave_moe_router_topk && !manual_hc.q4k_a8g32_gate_up,
+           "manual HC selection retains its own dependencies without auto wave or A8");
     std::cout << "Decode optimization profile failures=" << failures << '\n';
     return failures ? 1 : 0;
 }

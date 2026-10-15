@@ -17,7 +17,7 @@ For that content, compatible model/router contracts, an A8-enabled build, eager
 execution, registered residency and context 8192, the automatic profile selects:
 
 - parallel/staged/fused HC with typed projection and typed-row prefetch;
-- exact Q8 HC output prefetch;
+- exact Q8 HC output prefetch and lane-chain HC output;
 - virtual Q8 LM head, GDN input/input prefetch and GDN output;
 - grouped A8 gate/up and exact grouped Q5_1 down;
 - parallel wave router selection, replacing ranked routing unless ranked was
@@ -39,8 +39,12 @@ still apply. Missing build capability, another checkpoint or incompatible metada
 also produce a reasoned fallback without automatically selecting A8. Speculative
 execution has separate APIs and is unaffected by this decoder policy.
 
-The QSA prefetch, lane-chain HC output, deferred-status and shared-expert prefetch
-increments remain explicit experiments pending their own performance qualification.
+The QSA prefetch, deferred-status and shared-expert prefetch increments remain
+explicit experiments pending their own performance qualification. Lane-chain HC
+output now joins the automatic profile after its separate qualification; this
+policy change prepares the combined wave/HC configuration for review and validation.
+Separate measurements do not establish a combined speedup or justify adding their
+individual gains.
 The HC projection prototype adds no decoder option. Explicit experiment flags can
 compose with the selected profile, but this does not qualify their combined cost
 or numerical behavior.
@@ -50,7 +54,7 @@ All three decoder receipt paths add:
 | JSON field | Meaning |
 | --- | --- |
 | `optimization_profile_requested` | `auto` or `manual` |
-| `optimization_profile_selected` | `manual`, `canonical-a8-wave-v1` or `canonical-a8-ranked-v1` |
+| `optimization_profile_selected` | `manual`, `canonical-a8-wave-hc-output-v2` or `canonical-a8-ranked-hc-output-v2` |
 | `optimization_profile_reason` | Qualified selection, explicit ranked override, or the specific fallback reason |
 | `optimization_profile_automatic_applied` | Whether the automatic bundle was added |
 

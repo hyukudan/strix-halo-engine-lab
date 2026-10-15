@@ -1,10 +1,14 @@
 # Experimental wave router selection
 
-`--wave-moe-router-topk` defaults to OFF, requires `--parallel-moe-router`, and
+The low-level `--wave-moe-router-topk` defaults to OFF in manual selection,
+requires `--parallel-moe-router`, and
 excludes `--ranked-moe-router-topk`. It selects a distinct `.wave.parallel`
 kernel ID, launcher tag and `hip-gfx1151-moe-route-v6-wave-parallel` compiler
 identity. Catalog, serial, speculative and bundle admission check this mode.
 Existing modes and their device function bodies remain unchanged.
+The content-bound [automatic profile](decode-optimization-profile.md) selects wave
+and lane-chain HC output for its qualified checkpoint/mode/context. Explicit ranked
+routing is retained. The combined automatic profile still requires its own validation.
 
 The parallel projection is reused. The new selection kernel copies the current
 256-thread softmax expression sequence: per-lane ascending input scan, maximum
