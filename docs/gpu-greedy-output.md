@@ -21,15 +21,19 @@ and arithmetic lineage are poisoned and no generated result is returned. The
 selection owner drains its own stream; aborting a completed deferred producer
 alone would not drain this subsequent work.
 
-The scalar request controller preserves prefix execution, EOS, capacity and
+The scalar request controller preserves prefix state execution, EOS, capacity and
 generated-versus-consumed token boundaries. The backend's default scalar method
 retains the existing full-logits CPU selection for other implementations. The
 previous full-logits request and continuation APIs remain available.
 
 The option requires eager generation and rejects RAW recording, reference replay,
 prefix roundtrip and integer-head modes. Those paths keep their complete-logits
-behavior. It does not skip prompt LM heads yet, implement sampling or logprobs,
-or change model arithmetic. Automatic kernel-profile selection remains intact;
+behavior. Nonfinal prefix positions use a state-only intent: every model-state
+step still runs, and only the terminal, state-free LM head is omitted. The final
+prefix position and generated-token steps compute the complete head and select
+from its full vocabulary. The receipt counts omitted heads. Final hidden values
+remain available; this slice does not implement MTP, sampling or logprobs, or
+change model arithmetic. Automatic kernel-profile selection remains intact;
 the explicit output route has its own receipt identity and is not qualified by
 the historical automatic profile's evidence.
 

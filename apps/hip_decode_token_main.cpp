@@ -28,6 +28,7 @@
 #include "strix/hip_integer_projection_runtime.hpp"
 #include "strix/hip_setup_quiescence.hpp"
 #include "strix/hip_generation_output.hpp"
+#include "strix/generation_output_dispatch.hpp"
 #include "hip_decode_experiment.hpp"
 #include "hip_decode_options.hpp"
 #include "hip_deferred_moe_status.hpp"
@@ -195,18 +196,46 @@ public:
         std::function<void(std::uint32_t, std::uint64_t, std::span<const float>)> recording = {},
         std::function<void()> recording_binding = {}, std::function<void()> recording_drain = {},
         std::function<void(std::uint32_t)> execute_override = {}, bool track_logit_hashes = false,
-        bool prepublication_completion = false, strix::HipGreedyOutput* greedy_output = nullptr)
+        bool prepublication_completion = false, strix::HipGreedyOutput* greedy_output = nullptr,
+        strix::GenerationOutputDispatcher* output_dispatcher = nullptr)
         : compiled_(&compiled),
           session_(&session),
           resources_(&resources),
           dispatcher_(&dispatcher),
           scratch_(&scratch),
           lm_io_(&lm_io),
-          vocab_size_(vocab_size), recording_(std::move(recording)), recording_binding_(std::move(recording_binding)), recording_drain_(std::move(recording_drain)), execute_override_(std::move(execute_override)), track_logit_hashes_(track_logit_hashes), prepublication_completion_(prepublication_completion), greedy_output_(greedy_output) {
+          vocab_size_(vocab_size), recording_(std::move(recording)), recording_binding_(std::move(recording_binding)), recording_drain_(std::move(recording_drain)), execute_override_(std::move(execute_override)), track_logit_hashes_(track_logit_hashes), prepublication_completion_(prepublication_completion), greedy_output_(greedy_output), output_dispatcher_(output_dispatcher) {
         if(prepublication_completion_&&!execute_override_)
             throw std::invalid_argument("checked completion requires the owned native token executor");
         if (greedy_output_ && (recording_ || track_logit_hashes_))
             throw std::invalid_argument("scalar greedy output cannot omit requested full-logit evidence");
+        if (greedy_output_ && !output_dispatcher_)
+            throw std::invalid_argument("scalar greedy output requires its prefix output dispatcher");
+    }
+
+    void execute_state(std::uint32_t input_token, std::uint64_t position) override {
+        if (!greedy_output_) {
+            strix::SerialGreedyStepBackend::execute_state(input_token, position);
+            return;
+        }
+        if (position != session_->next_position || session_->health != strix::SerialSessionHealth::ready)
+            throw std::invalid_argument("state-only prefix differs from live session");
+        const auto start = std::chrono::steady_clock::now();
+        strix::GenerationOutputDispatcher::StateOnlyScope state_only(*output_dispatcher_);
+        try {
+            if (execute_override_) execute_override_(input_token);
+            else static_cast<void>(strix::execute_serial_token(
+                *compiled_, *session_, *resources_, input_token, *dispatcher_));
+            if (!prepublication_completion_)
+                check_hip(hipDeviceSynchronize(), "state-only prefix producer completion");
+            elapsed_ms_.push_back(std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - start).count());
+        } catch (...) {
+            session_->health = strix::SerialSessionHealth::poisoned;
+            session_->arithmetic_lineage.tainted = true;
+            if (recording_drain_) recording_drain_();
+            throw;
+        }
     }
 
     std::uint32_t execute_greedy(std::uint32_t input_token, std::uint64_t position,
@@ -348,6 +377,7 @@ private:
     bool track_logit_hashes_ = false;
     bool prepublication_completion_ = false;
     strix::HipGreedyOutput* greedy_output_ = nullptr;
+    strix::GenerationOutputDispatcher* output_dispatcher_ = nullptr;
 };
 
 // Drain inside the transfer call before the caller's snapshot owner can unwind.
@@ -664,8 +694,6 @@ int main(
                 experimental;
 
     const bool graph_mode = options.execution.mode == strix::DecodeExecutionMode::graph;
-    if (graph_mode && options.host_dispatch_telemetry)
-        throw std::invalid_argument("host dispatch telemetry requires eager mode; graph replay is not host dispatch");
     binding_request.require_graph_safe = graph_mode;
     binding_request.device_graph_inputs = graph_mode;
     strix::HipLauncherCatalogConfig catalog_config;
@@ -919,8 +947,12 @@ int main(
         : std::string{};
     HostTelemetryReport host_telemetry;
     host_telemetry.enabled = options.host_dispatch_telemetry;
-    strix::DirectLaunchDispatcher dispatcher(launch_plan,
+    strix::DirectLaunchDispatcher direct_dispatcher(launch_plan,
         host_telemetry.enabled ? &host_telemetry.counters : nullptr);
+    strix::GenerationOutputDispatcher output_dispatcher(direct_dispatcher, compiled);
+    strix::EagerExecutionDispatcher& dispatcher = options.gpu_greedy_token
+        ? static_cast<strix::EagerExecutionDispatcher&>(output_dispatcher)
+        : static_cast<strix::EagerExecutionDispatcher&>(direct_dispatcher);
     std::unique_ptr<strix::HipSerialGraph> graph;
     if (graph_mode) {
         strix::GraphMemoryRequest graph_memory;
@@ -1376,7 +1408,7 @@ int main(
             lm_io,
             model.vocab_size,
             std::move(greedy_recording), raw_require_identity, raw_drain_or_fail,
-            execute_native_token, false, options.deferred_moe_status, greedy_output.get());
+            execute_native_token, false, options.deferred_moe_status, greedy_output.get(), &output_dispatcher);
 
         strix::SerialGreedyRequest request;
         request.prefix_tokens =
@@ -1408,6 +1440,7 @@ int main(
                 << "  \"generation_output_completed\":" << stats.completed << ",\n"
                 << "  \"generation_output_result_d2h_bytes\":" << stats.result_d2h_bytes << ",\n"
                 << "  \"generation_output_pool_bytes\":" << greedy_output->scratch_bytes() << ",\n"
+                << "  \"prefill_lm_heads_omitted\":" << output_dispatcher.omitted_heads() << ",\n"
                 << "  \"generation_output_timing_scope\":\"producer-through-selection-and-readback\",\n";
         }
         emit_q4k_a8_receipt();

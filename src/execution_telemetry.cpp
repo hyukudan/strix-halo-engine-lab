@@ -65,7 +65,7 @@ GpuTraceTime summarize_gpu_trace(std::span<const GpuTraceInterval> intervals) {
     std::vector<GpuTraceInterval> ordered(intervals.begin(), intervals.end());
     for (const auto& interval : ordered) {
         if (interval.end_ns < interval.begin_ns || interval.clock_domain != ordered.front().clock_domain)
-            throw std::invalid_argument("GPU trace requires ordered ranges in one clock domain");
+            throw std::invalid_argument("GPU trace requires nonnegative durations in one clock domain");
         const auto duration = interval.end_ns - interval.begin_ns;
         if (duration > std::numeric_limits<std::uint64_t>::max() - result.summed_ns)
             throw std::overflow_error("GPU trace duration sum overflow");

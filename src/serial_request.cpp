@@ -233,6 +233,10 @@ std::uint32_t SerialGreedyStepBackend::execute_greedy(
     return select_greedy_token(execute(input_token, position), vocab_size);
 }
 
+void SerialGreedyStepBackend::execute_state(std::uint32_t input_token, std::uint64_t position) {
+    static_cast<void>(execute(input_token, position));
+}
+
 SerialGreedyRequestResult execute_serial_greedy_token_request(
     const SerialGreedyRequest& request, SerialGreedyStepBackend& backend) {
     validate_greedy_request(request);
@@ -246,7 +250,8 @@ SerialGreedyRequestResult execute_serial_greedy_token_request(
         return selected;
     };
     for (const auto token : request.prefix_tokens) {
-        next = consume(token);
+        if (position + 1U == request.prefix_tokens.size()) next = consume(token);
+        else backend.execute_state(token, position);
         ++result.steps_executed;
         ++position;
     }

@@ -167,7 +167,8 @@ inline Options parse_options(
     if (argc < 2) {
         throw std::invalid_argument(
             "usage: strix-hip-decode-token MODEL.gguf [TOKEN_ID ...] "
-            "[--optimization-profile auto|manual] [--reference FILE] [--max-logit-error X] "
+            "[--optimization-profile auto|manual] [--execution-inventory] [--host-dispatch-telemetry] "
+            "[--gpu-greedy-token] [--reference FILE] [--max-logit-error X] "
             "[--context N] [--residency register|copy] [--coalesce-gap BYTES] "
             "[--planned-ple-io] [--ple-max-rows-per-io N] [--ple-max-inflight-ios N] "
             "[--generate N] [--eos-token TOKEN_ID] [--prefix-cache-roundtrip] "
@@ -531,6 +532,8 @@ inline Options parse_options(
         options.prefix_cache_roundtrip || options.execution.mode != strix::DecodeExecutionMode::eager ||
         options.execution.integer_head != strix::DecodeIntegerHead::none))
         throw std::invalid_argument("GPU greedy token output requires eager generation without RAW, reference, roundtrip or integer head");
+    if (options.host_dispatch_telemetry && options.execution.mode == strix::DecodeExecutionMode::graph)
+        throw std::invalid_argument("host dispatch telemetry requires eager mode; graph replay is not host dispatch");
     if (options.context_tokens == 0) {
         throw std::invalid_argument(
             "context must be non-zero");

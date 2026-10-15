@@ -27,6 +27,10 @@ struct Tokens final : strix::SerialGreedyStepBackend {
     std::vector<float> execute(std::uint32_t, std::uint64_t) override {
         throw std::logic_error("token-only controller requested full logits");
     }
+    void execute_state(std::uint32_t input, std::uint64_t) override {
+        ++calls;
+        consumed.push_back(input);
+    }
     std::uint32_t execute_greedy(std::uint32_t input, std::uint64_t position, std::uint64_t vocab) override {
         ++calls;
         consumed.push_back(input);

@@ -78,7 +78,7 @@ int main() try {
     context.op = SerialOp::position_prepare;
     measured.dispatch_runtime_step(context);
     require(observer.counters.totals().returned == 2 && observer.events[3].runtime_step,
-            "runtime-managed host work accounted separately");
+            "runtime-managed host work is observed and attributed to its operator");
     require(observer.counters.operators()[static_cast<std::size_t>(SerialOp::lm_head)].returned == 1,
             "operator attribution excludes runtime step");
 

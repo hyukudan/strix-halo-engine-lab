@@ -26,7 +26,8 @@ A CMake cache attests configuration only. Tensor requirements attest neither
 executable launcher support nor row/concurrency support. Missing effective
 catalog, binary bindings and native qualification stay null. Profile resolution
 comes from the actual decoder receipt, without duplicating the application
-resolver. Conflicting evidence produces a conflict list and a nonzero exit.
+resolver. Conflicting evidence produces a conflict list and exit code 3;
+malformed inputs use exit code 2.
 An inventory with unresolved fields is not a qualified baseline.
 
 The decoder's optional `--execution-inventory` adds the actual selected compiled

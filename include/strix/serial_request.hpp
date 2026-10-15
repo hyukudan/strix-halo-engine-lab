@@ -50,6 +50,10 @@ public:
     [[nodiscard]] virtual std::uint32_t execute_greedy(
         std::uint32_t input_token, std::uint64_t position,
         std::uint64_t vocab_size);
+
+    // Prefix positions with no requested output still consume all model state.
+    // The default preserves the complete existing execution.
+    virtual void execute_state(std::uint32_t input_token, std::uint64_t position);
 };
 
 [[nodiscard]] std::uint32_t select_greedy_token(
