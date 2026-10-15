@@ -77,7 +77,7 @@ int main() {
         environment.find("\"HSA_ENABLE_SDMA\":null") != std::string::npos &&
         environment.find("\"effective_hw_queues\":null,\"concurrent_execution_observed\":null") != std::string::npos,
         "requested runtime environment is distinct from effective queues and observed overlap");
-    expect(environment.find("device\\\\name\\n") != std::string::npos && environment.find('\n') == environment.size() - 1U,
+    expect(environment.find("device\\\\name\\u000a") != std::string::npos && environment.find('\n') == environment.size() - 1U,
         "runtime environment escapes controls without exposing unrelated variables");
     Fixture fixture;
     const auto text = fixture.render();
@@ -90,8 +90,8 @@ int main() {
            text.find("\"prefill_admitted_by_this_receipt\":false") != std::string::npos &&
            text.find("\"native_execution_observed\":null,\"qualification\":null") != std::string::npos,
            "declarations do not become cross-phase admission or native qualification");
-    expect(text.find("fixture.\\\"\\\\\\n") != std::string::npos &&
-           text.find("row\\tmajor") != std::string::npos && text.find('\t') == std::string::npos &&
+    expect(text.find("fixture.\\\"\\\\\\u000a") != std::string::npos &&
+           text.find("row\\u0009major") != std::string::npos && text.find('\t') == std::string::npos &&
            text.find('\n') == text.size() - 1U,
            "kernel ids and variant strings escape quotes, backslash and controls");
     expect(text.find("\"runtime_step\":true,\"launcher_bound\":true") != std::string::npos &&

@@ -1751,9 +1751,9 @@ void test_catalog_and_bundle() {
     auto output_compiled = compiled;
     output_compiled.bindings = strix::bind_serial_execution_plan(model, execution, output_registry, request);
     strix::HipHyperMixLauncherBundle output_bundle(output_config);
-    const auto& output_id = output_registry.variants().front().id;
-    const auto& typed_id = typed_registry.variants().front().id;
-    const auto& prefetch_id = prefetch_registry.variants().front().id;
+    const auto output_id = output_registry.variants().front().id;
+    const auto typed_id = typed_registry.variants().front().id;
+    const auto prefetch_id = prefetch_registry.variants().front().id;
     // A wrong final binding must reject before the first launcher is registered.
     auto late_output_manifest = output_manifest;
     late_output_manifest.tensors.push_back(output_up);

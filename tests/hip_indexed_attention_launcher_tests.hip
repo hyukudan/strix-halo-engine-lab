@@ -1035,7 +1035,7 @@ int main() try {
                 check(hipGraphInstantiate(&executables[mode],graphs[mode],nullptr,nullptr,0),"instantiate QSA comparison");
             }
             for(unsigned replay=0;replay<3;++replay){
-                std::vector<std::byte> expected_output,expected_state,expected_workspace;
+                std::vector<std::byte> expected_replay_output,expected_state,expected_workspace;
                 for(unsigned path=0;path<4;++path){
                     reset(replay);scope.graph_capture=false;context.position=0;
                     if(path<2){auto& candidate=path?on_launch:off_launch;
@@ -1059,8 +1059,8 @@ int main() try {
                     const auto actual_output=read_bytes(output.address,output.bytes);
                     const auto actual_state=read_bytes(state_memory.device_base,state_memory.device_bytes);
                     const auto actual_workspace=read_bytes(temporary.address,temporary.bytes);
-                    if(path==0){expected_output=actual_output;expected_state=actual_state;expected_workspace=actual_workspace;}
-                    else expect(actual_output==expected_output && actual_state==expected_state &&
+                    if(path==0){expected_replay_output=actual_output;expected_state=actual_state;expected_workspace=actual_workspace;}
+                    else expect(actual_output==expected_replay_output && actual_state==expected_state &&
                         actual_workspace==expected_workspace,"full QSA ON/OFF eager/graph output/KV/raw/workspace bit equality");
                 }
             }
