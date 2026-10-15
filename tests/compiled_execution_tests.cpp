@@ -90,6 +90,7 @@ strix::kernels::KernelRegistry make_registry(
                     (step.op == strix::SerialOp::moe_route && request.wave_moe_router_topk ? ".wave.parallel" :
                      step.op == strix::SerialOp::moe_route && request.ranked_moe_router_topk ? ".ranked.parallel" :
                      step.op == strix::SerialOp::moe_route && request.parallel_moe_router ? ".parallel" : "") +
+                    (step.op == strix::SerialOp::moe_experts && request.batched_moe_activation ? ".batched-slot-activation-v1" : "") +
                     (step.op == strix::SerialOp::moe_experts && request.deferred_moe_status ? ".deferred-status-v1" : "") +
                     (step.op == strix::SerialOp::moe_experts && request.grouped_exact_q51_down ? ".grouped-exact-q51-down-v1" : "") +
                     (step.op == strix::SerialOp::moe_experts && request.q4k_a8g32_gate_up ? ".q4k-a8g32-gateup-v2" : ""),
@@ -657,6 +658,24 @@ int main() {
     expect(deferred_q51_compiled.execution_identity!=q51_compiled.execution_identity,
         "deferred marker preserves existing grouped and A8 suffix validation");
 
+    auto batched_binding = deferred_q51;
+    batched_binding.batched_moe_activation = true;
+    const auto batched_registry = make_registry(model,batched_binding);
+    const auto batched_compiled = strix::compile_serial_execution(model,batched_registry,batched_binding,deferred_q51_buffers);
+    expect(batched_compiled.execution_identity != deferred_q51_compiled.execution_identity &&
+        batched_compiled.kernel_plan_identity != deferred_q51_compiled.kernel_plan_identity &&
+        batched_compiled.arena.total_bytes == deferred_q51_compiled.arena.total_bytes,
+        "activation batching changes selected execution identity without changing scratch");
+    expect(rejects_deferred(deferred_q51_registry,batched_binding,deferred_q51_buffers,
+        "bound batched MoE activation differs from request"), "batched mode rejects unbatched launchers");
+    expect(rejects_deferred(batched_registry,deferred_q51,deferred_q51_buffers,
+        "bound batched MoE activation differs from request"), "unbatched mode rejects batched launchers");
+    auto invalid_batch = binding_request; invalid_batch.batched_moe_activation = true;
+    expect(rejects_deferred(registry,invalid_batch,buffer_request,
+        "batched MoE activation requires eager C1 A8 execution"), "batching requires A8 before binding");
+    invalid_batch = batched_binding; invalid_batch.require_graph_safe = true;
+    expect(rejects_deferred(batched_registry,invalid_batch,deferred_q51_buffers,
+        "batched MoE activation requires eager C1 A8 execution"), "batched activation rejects graphs for its own cause");
     if (failures == 0) {
         std::cout << "compiled execution tests passed\n";
     }

@@ -93,6 +93,7 @@ struct Options {
     bool moe_shared_overlap = false;
     std::uint64_t moe_overlap_arena_budget_bytes = 64ULL * 1024ULL * 1024ULL;
     bool moe_overlap_budget_explicit = false;
+    bool batched_moe_activation = false;
     bool prepared_eager = false;
     bool gpu_greedy_token = false;
     bool execution_inventory = false;
@@ -172,7 +173,7 @@ inline Options parse_options(
         throw std::invalid_argument(
             "usage: strix-hip-decode-token MODEL.gguf [TOKEN_ID ...] "
             "[--optimization-profile auto|manual] [--execution-inventory] [--host-dispatch-telemetry] "
-            "[--gpu-greedy-token] [--prepared-eager] [--moe-shared-overlap] [--reference FILE] [--max-logit-error X] "
+            "[--gpu-greedy-token] [--prepared-eager] [--moe-shared-overlap] [--batched-moe-activation] [--reference FILE] [--max-logit-error X] "
             "[--context N] [--residency register|copy] [--coalesce-gap BYTES] "
             "[--planned-ple-io] [--ple-max-rows-per-io N] [--ple-max-inflight-ios N] "
             "[--generate N] [--eos-token TOKEN_ID] [--prefix-cache-roundtrip] "
@@ -193,6 +194,16 @@ inline Options parse_options(
             argv[index];
         options.any_low_level_flag = options.any_low_level_flag ||
             is_low_level_optimization_option(argument);
+        if (argument == "--batched-moe-activation") {
+#ifndef STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME
+            throw std::invalid_argument("--batched-moe-activation requires the experimental runtime build capability");
+#else
+            if (options.batched_moe_activation)
+                throw std::invalid_argument("duplicate batched MoE activation option");
+            options.batched_moe_activation = true;
+            continue;
+#endif
+        }
         if (argument == "--moe-shared-overlap") {
             if (options.moe_shared_overlap)
                 throw std::invalid_argument("duplicate MoE shared overlap option");
@@ -550,6 +561,8 @@ inline Options parse_options(
         throw std::invalid_argument(
             "--generate requires at least one prefix token id");
     }
+    if (options.batched_moe_activation && options.execution.mode != strix::DecodeExecutionMode::eager)
+        throw std::invalid_argument("batched MoE activation requires eager mode");
     if (options.moe_shared_overlap && (options.prefix_cache_roundtrip ||
         options.execution.mode != strix::DecodeExecutionMode::eager ||
         options.execution.integer_head != strix::DecodeIntegerHead::none))

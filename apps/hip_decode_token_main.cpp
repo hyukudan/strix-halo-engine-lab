@@ -445,6 +445,7 @@ int main(
             "  --host-dispatch-telemetry (eager host launcher counters on stderr; profiling only)\n"
             "  --execution-inventory (include selected host launcher and declared variant metadata)\n"
             "  --gpu-greedy-token (experimental eager generation with small GPU selection result)\n"
+            "  --batched-moe-activation (experimental eager A8 slot activation batching)\n"
             "  --prepared-eager (experimental immutable static submission plan)\n"
             "  --moe-shared-overlap [--moe-overlap-arena-budget-bytes N] (experimental eager D1)\n"
             "  --virtual-q8-gdn-output (exact original256-tree Q8 output)\n"
@@ -571,6 +572,8 @@ int main(
         options, model, info, manifest,
         strix::model_content_identity_hex(mapped.content_identity()), has_auto_a8_runtime);
     strix::decode_cli::validate_resolved_prefix_roundtrip(options);
+    if (options.batched_moe_activation && !options.q4k_a8g32_gate_up)
+        throw std::invalid_argument("batched MoE activation requires resolved Q4K A8 gate/up execution");
     if (options.moe_shared_overlap && !options.deferred_moe_status)
         throw std::invalid_argument("MoE shared overlap requires the resolved eager deferred-status owner");
     const std::string optimization_profile_receipt =
@@ -630,6 +633,12 @@ int main(
             << (q4k_a8_stats ? q4k_a8_stats->legacy_q5k_submissions.load(std::memory_order_relaxed) : 0)
             << ",\n  \"grouped_q51_host_submissions\": "
             << (q4k_a8_stats ? q4k_a8_stats->grouped_q51_submissions.load(std::memory_order_relaxed) : 0) << ",\n";
+        if (options.batched_moe_activation) std::cout << "  \"batched_moe_activation\":true,\n"
+            << "  \"batched_moe_activation_launches\":"
+            << (q4k_a8_stats ? q4k_a8_stats->batched_activation_launches.load(std::memory_order_relaxed) : 0) << ",\n"
+            << "  \"batched_moe_activation_slots\":"
+            << (q4k_a8_stats ? q4k_a8_stats->batched_activation_slots.load(std::memory_order_relaxed) : 0) << ",\n";
+
     };
     strix::HipModelResidencyPolicy lane_chain_policy;lane_chain_policy.mode=options.residency;lane_chain_policy.coalesce_gap_bytes=options.coalesce_gap_bytes;lane_chain_policy.promote_file_backed_candidates=options.execution.mode==strix::DecodeExecutionMode::graph;
     std::uint32_t lane_chain_total=0;
@@ -729,6 +738,8 @@ int main(
     binding_request.lane_chain_hyper_output=options.lane_chain_hyper_output;
     binding_request.lane_chain_hyper_output_eligible_steps=lane_chain_steps;
     catalog_config.virtual_q8_lm_head = options.virtual_q8_lm_head;
+    catalog_config.batched_moe_activation = options.batched_moe_activation;
+    binding_request.batched_moe_activation = options.batched_moe_activation;
     catalog_config.q4k_a8g32_gate_up = options.q4k_a8g32_gate_up;
     catalog_config.grouped_exact_q51_down = options.grouped_exact_q51_down;
     catalog_config.q4k_a8_stats = q4k_a8_stats;

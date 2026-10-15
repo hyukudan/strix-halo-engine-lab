@@ -32,7 +32,7 @@ int main() {
            defaults.context_tokens == 128 && !defaults.q4k_a8g32_gate_up &&
            !defaults.profile_explicit && !defaults.any_low_level_flag &&
            !defaults.prefetch_q8_qsa_input && !defaults.prefetch_q8_shared_expert &&
-           !defaults.deferred_moe_status && !defaults.gpu_greedy_token && !defaults.prepared_eager && !defaults.moe_shared_overlap,
+           !defaults.deferred_moe_status && !defaults.gpu_greedy_token && !defaults.prepared_eager && !defaults.moe_shared_overlap && !defaults.batched_moe_activation,
            "parser defers auto until content identification");
     auto on = defaults;
     auto inventory_only = parse({"decoder", "fixture.gguf", "1", "--execution-inventory"});
@@ -79,6 +79,19 @@ int main() {
         "MoE overlap arena budget requires enabled overlap and nonzero bytes");
     rejects([] { static_cast<void>(parse({"decoder", "m", "1", "--moe-shared-overlap", "--moe-shared-overlap"})); },
         "duplicate MoE shared overlap option");
+#ifdef STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME
+    auto batched = parse({"decoder", "fixture.gguf", "1", "--batched-moe-activation"});
+    const auto batched_profile = resolve_optimization_profile(batched, model, info, manifest,
+        validated_model_content_identity, true);
+    expect(batched.batched_moe_activation && !batched.any_low_level_flag && batched_profile.automatic_applied &&
+        batched.q4k_a8g32_gate_up && batched.deferred_moe_status,
+        "batched activation overlay preserves the existing automatic optimization bundle");
+    rejects([] { static_cast<void>(parse({"decoder", "m", "1", "--batched-moe-activation", "--batched-moe-activation"})); },
+        "duplicate batched MoE activation option");
+#else
+    rejects([] { static_cast<void>(parse({"decoder", "m", "1", "--batched-moe-activation"})); },
+        "--batched-moe-activation requires the experimental runtime build capability");
+#endif
     auto instrumented = parse({"decoder", "fixture.gguf", "1", "--host-dispatch-telemetry"});
     const auto instrumented_profile = resolve_optimization_profile(instrumented, model, info, manifest,
         validated_model_content_identity, true);

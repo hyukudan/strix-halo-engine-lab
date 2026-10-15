@@ -4,6 +4,9 @@
 
 #include "strix/dispatch_resources.hpp"
 #include "strix/hip_setup_quiescence.hpp"
+#ifdef STRIX_BUILD_MOE_BATCHED_ACTIVATION_DIAGNOSTIC
+#include "strix/moe_batched_activation_diagnostic.hpp"
+#endif
 #ifdef STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME
 #include "strix/hip_moe_q4k_a8_probe.hpp"
 #include "strix/hip_q51_grouped_down_probe.hpp"
@@ -135,6 +138,8 @@ void check_hip(
 
 void validate_config(
     const HipMoeExpertsLauncherConfig& config) {
+    if (config.batched_slot_activation && !config.q4k_a8g32_gate_up)
+        throw std::invalid_argument("batched routed activation requires Q4K A8 independent slot workspace");
     if(config.grouped_exact_q51_down && !config.q4k_a8g32_gate_up)
         throw std::invalid_argument("grouped exact Q5_1 down requires Q4K A8 slot workspace");
     if (config.q4k_a8g32_gate_up) {
@@ -582,6 +587,35 @@ __global__ void routed_activation_kernel(
          (1.0F + expf(-gate))) *
         up;
 }
+
+#if defined(STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME) || defined(STRIX_BUILD_MOE_BATCHED_ACTIVATION_DIAGNOSTIC)
+// Each y block owns one pre-existing [gate,up] slot. Arithmetic and x indexing
+// remain the original routed_activation_kernel's; status is immutable here.
+__global__ void batched_routed_activation_kernel(
+    float* slots,
+    std::uint32_t intermediate_size, const std::uint32_t* status) {
+    if (*status != 0U) return;
+    const auto index =
+        static_cast<std::uint32_t>(
+            blockIdx.x) *
+            blockDim.x +
+        threadIdx.x;
+    if (index >= intermediate_size) {
+        return;
+    }
+    auto* workspace = slots + 2ULL * blockIdx.y * intermediate_size;
+    const float gate =
+        workspace[index];
+    const float up =
+        workspace[
+            intermediate_size +
+            index];
+    workspace[index] =
+        (gate /
+         (1.0F + expf(-gate))) *
+        up;
+}
+#endif
 
 __global__ void validate_routes_kernel(
     const std::uint32_t* routes, const float* weights,
@@ -1203,12 +1237,23 @@ void launch_q4k_a8_typed(const HipMoeExpertsLauncherConfig& config,
     scan(workspace,2U*config.intermediate_size*config.top_k);
     // Slot buffers are independent. Finish all original SiLU kernels before
     // checking their FP32 values, then preserve ascending down accumulation.
-    for (std::uint32_t slot=0;slot<config.top_k;++slot) {
-        auto* slot_workspace=workspace+2ULL*slot*config.intermediate_size;
-        hipLaunchKernelGGL(routed_activation_kernel,
-            dim3((config.intermediate_size+kThreads-1U)/kThreads),dim3(kThreads),0,
-            hip_execution_stream(),slot_workspace,config.intermediate_size,status);
-        check_hip(hipGetLastError(),"Q4K A8 original SiLU enqueue");
+    if (config.batched_slot_activation) {
+        hipLaunchKernelGGL(batched_routed_activation_kernel,
+            dim3((config.intermediate_size+kThreads-1U)/kThreads,config.top_k),dim3(kThreads),0,
+            hip_execution_stream(),workspace,config.intermediate_size,status);
+        check_hip(hipGetLastError(),"Q4K A8 batched slot SiLU enqueue");
+        if (config.q4k_a8_stats) {
+            config.q4k_a8_stats->batched_activation_launches.fetch_add(1,std::memory_order_relaxed);
+            config.q4k_a8_stats->batched_activation_slots.fetch_add(config.top_k,std::memory_order_relaxed);
+        }
+    } else {
+        for (std::uint32_t slot=0;slot<config.top_k;++slot) {
+            auto* slot_workspace=workspace+2ULL*slot*config.intermediate_size;
+            hipLaunchKernelGGL(routed_activation_kernel,
+                dim3((config.intermediate_size+kThreads-1U)/kThreads),dim3(kThreads),0,
+                hip_execution_stream(),slot_workspace,config.intermediate_size,status);
+            check_hip(hipGetLastError(),"Q4K A8 original SiLU enqueue");
+        }
     }
     scan(workspace,2U*config.intermediate_size*config.top_k);
     if(grouped_q51) {
@@ -1456,6 +1501,7 @@ std::string kernel_id(
         ".c" +
         std::to_string(
             request.request_concurrency) +
+        (config.batched_slot_activation ? ".batched-slot-activation-v1" : "") +
         (config.deferred_moe_status ? ".deferred-status-v1" : "") +
         (config.grouped_exact_q51_down ? ".grouped-exact-q51-down-v1" : "") +
         (config.q4k_a8g32_gate_up ? std::string(moe_q4k_a8::runtime_kernel_suffix) : "");
@@ -1476,6 +1522,7 @@ std::uint64_t implementation_identity(
     if (config.q4k_a8g32_gate_up) hash_u64(hash,0x51344b4138473332ULL);
     if (config.grouped_exact_q51_down) hash_u64(hash,0x5135314752505631ULL);
     if (config.deferred_moe_status) hash_u64(hash,0x4445464d4f453031ULL);
+    if (config.batched_slot_activation) hash_u64(hash,0x42415453494c5531ULL);
     return hash;
 }
 
@@ -1494,6 +1541,10 @@ void register_hip_moe_experts_kernel_variant(
             error);
     }
     validate_config(config);
+    if (request.batched_moe_activation != config.batched_slot_activation)
+        throw std::invalid_argument("batched routed activation config differs from binding request");
+    if (request.batched_moe_activation && (request.device_graph_inputs || request.require_graph_safe))
+        throw std::invalid_argument("batched routed activation variant admits eager execution only");
     if(request.grouped_exact_q51_down != config.grouped_exact_q51_down)
         throw std::invalid_argument("grouped exact Q5_1 config differs from binding request");
     if (request.deferred_moe_status != config.deferred_moe_status ||
@@ -1580,6 +1631,7 @@ void register_hip_moe_experts_kernel_variant(
         variant.compiler_identity += ":grouped-exact-q51-down-v1";
     }
     if(config.deferred_moe_status) variant.compiler_identity += ":deferred-first-error-v1";
+    if(config.batched_slot_activation) variant.compiler_identity += ":batched-slot-activation-v1";
     variant.measured_seconds = 0.0;
 
     registry.add(
@@ -1596,6 +1648,8 @@ make_hip_moe_experts_launcher(
             "HIP routed-expert launcher requires id and config");
     }
     validate_config(*config);
+    if ((kernel_id_value.find(".batched-slot-activation-v1")!=std::string::npos)!=config->batched_slot_activation)
+        throw std::invalid_argument("batched routed activation launcher id differs from config");
     if ((kernel_id_value.find(".deferred-status-v1")!=std::string::npos)!=config->deferred_moe_status)
         throw std::invalid_argument("deferred MoE launcher id differs from config");
     if(kernel_id_value.ends_with(moe_q4k_a8::grouped_q51_kernel_ending)!=config->grouped_exact_q51_down)
@@ -1642,6 +1696,8 @@ register_for_compiled_execution(
         }
         if ((binding.kernel_id->find(".deferred-status-v1")!=std::string::npos)!=config_.deferred_moe_status)
             throw std::invalid_argument("deferred MoE bundle mode differs from compiled binding");
+        if ((binding.kernel_id->find(".batched-slot-activation-v1")!=std::string::npos)!=config_.batched_slot_activation)
+            throw std::invalid_argument("batched routed activation bundle differs from compiled selection");
         if(binding.kernel_id->ends_with(moe_q4k_a8::grouped_q51_kernel_ending)!=config_.grouped_exact_q51_down)
             throw std::invalid_argument("grouped exact Q5_1 bundle differs from compiled selection");
         if (binding.kernel_id->ends_with(moe_q4k_a8::runtime_kernel_suffix) != config_.q4k_a8g32_gate_up)
@@ -1700,6 +1756,39 @@ void enqueue_original_receipt(const Request& request,const Bindings& b,hipStream
     }
 }
 } // namespace q51_grouped_down
+#endif
+
+#ifdef STRIX_BUILD_MOE_BATCHED_ACTIVATION_DIAGNOSTIC
+namespace moe_batched_activation_diagnostic {
+const void* kernel_symbol(Mode mode) {
+    switch (mode) {
+    case Mode::reference: return reinterpret_cast<const void*>(routed_activation_kernel);
+    case Mode::batched: return reinterpret_cast<const void*>(batched_routed_activation_kernel);
+    }
+    throw std::invalid_argument("invalid routed activation diagnostic mode");
+}
+void enqueue(Shape shape, const Bindings& bindings, Mode mode, hipStream_t stream) {
+    const auto launch = validate(shape, bindings, mode);
+    if (!stream || stream == hipStreamPerThread || stream == hipStreamLegacy)
+        throw std::invalid_argument("routed activation diagnostic requires an explicitly owned stream");
+    check_hip(hipPeekAtLastError(), "routed activation diagnostic stale error");
+    auto* workspace = reinterpret_cast<float*>(bindings.workspace.address);
+    const auto* status = reinterpret_cast<const std::uint32_t*>(bindings.status.address);
+    if (mode == Mode::batched) {
+        hipLaunchKernelGGL(batched_routed_activation_kernel,
+            dim3(launch.grid_x,launch.grid_y),dim3(launch.block_x),0,stream,
+            workspace,shape.intermediate,status);
+        check_hip(hipGetLastError(), "routed activation diagnostic batched enqueue");
+    } else {
+        for (std::uint32_t slot = 0; slot < shape.slots; ++slot) {
+            hipLaunchKernelGGL(routed_activation_kernel,
+                dim3(launch.grid_x),dim3(launch.block_x),0,stream,
+                workspace+2ULL*slot*shape.intermediate,shape.intermediate,status);
+            check_hip(hipGetLastError(), "routed activation diagnostic original enqueue");
+        }
+    }
+}
+} // namespace moe_batched_activation_diagnostic
 #endif
 
 }  // namespace strix

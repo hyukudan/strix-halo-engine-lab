@@ -32,6 +32,8 @@ struct RuntimeWorkspace {
     std::uint64_t hidden, std::uint64_t rows, std::uint64_t experts, std::uint64_t top_k);
 // Host submissions include graph captures; replay counts are not inferred.
 struct RuntimeDispatchStats {
+    std::atomic<std::uint64_t> batched_activation_launches{0};
+    std::atomic<std::uint64_t> batched_activation_slots{0};
     std::atomic<std::uint64_t> quantized_submissions{0};
     std::atomic<std::uint64_t> legacy_q5k_submissions{0};
     std::atomic<std::uint64_t> grouped_q51_submissions{0};

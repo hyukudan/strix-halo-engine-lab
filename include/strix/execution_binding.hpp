@@ -25,6 +25,7 @@ struct ExecutionBindingRequest {
     bool prefetch_q8_qsa_input = false;
     std::vector<std::uint32_t> qsa_input_prefetch_layers;
     bool q4k_a8g32_gate_up = false;
+    bool batched_moe_activation = false;
     bool grouped_exact_q51_down = false;
     bool lane_chain_hyper_output = false;
     std::vector<std::uint32_t> lane_chain_hyper_output_eligible_steps;

@@ -20,6 +20,7 @@ struct HipMoeExpertsLauncherConfig {
     HipActivationStorage activation =
         HipActivationStorage::bf16;
     bool q4k_a8g32_gate_up = false;
+    bool batched_slot_activation = false;
     bool grouped_exact_q51_down = false;
     bool deferred_moe_status = false;
     std::shared_ptr<const HipSetupQuiescenceGuard> q4k_a8_quiescence;

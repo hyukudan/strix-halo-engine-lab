@@ -312,6 +312,10 @@ CompiledSerialExecution compile_serial_execution(
     if (binding_request.wave_moe_router_topk &&
         (!binding_request.parallel_moe_router || binding_request.ranked_moe_router_topk))
         throw std::invalid_argument("wave router requires parallel topology and excludes ranked mode");
+    if (binding_request.batched_moe_activation && (!binding_request.q4k_a8g32_gate_up ||
+        binding_request.device_graph_inputs || binding_request.require_graph_safe ||
+        binding_request.logical_rows != 1 || binding_request.request_concurrency != 1))
+        throw std::invalid_argument("batched MoE activation requires eager C1 A8 execution");
     if (binding_request.deferred_moe_status &&
         (binding_request.device_graph_inputs || binding_request.require_graph_safe ||
          binding_request.logical_rows != 1 || binding_request.request_concurrency != 1))
@@ -374,6 +378,9 @@ CompiledSerialExecution compile_serial_execution(
             if(binding.kernel_id && binding.kernel_id->ends_with(lane_chain_hyper_output_suffix)!=expected)
                 throw std::invalid_argument("bound lane-chain HC output differs from admitted topology");
         }
+        if (binding.op == SerialOp::moe_experts && binding.kernel_id &&
+            (binding.kernel_id->find(".batched-slot-activation-v1") != std::string::npos) != binding_request.batched_moe_activation)
+            throw std::invalid_argument("bound batched MoE activation differs from request");
         if (binding.op==SerialOp::moe_experts && binding.kernel_id &&
             (binding.kernel_id->find(".deferred-status-v1")!=std::string::npos)!=binding_request.deferred_moe_status)
             throw std::invalid_argument("bound deferred MoE status mode differs from request");
