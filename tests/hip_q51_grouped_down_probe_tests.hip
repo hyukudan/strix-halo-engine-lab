@@ -71,7 +71,7 @@ void code_at(std::span<std::byte> row,unsigned f,unsigned code){
     const auto shift=lane/16U*4U;bits=(bits&~(15U<<shift))|((code&15U)<<shift);row[base+8U+lane%16U]=std::byte(bits);
     if(code&16U)row[base+4U+lane/8U]|=std::byte(1U<<(lane%8U));
 }
-void run(Guard guard,Shape shape,bool signed_zero=false,bool duplicate=false){
+void run(Guard guard,Shape shape,bool signed_zero=false,bool duplicate=false,bool denormal=false){
     Request r{true,numerical_identity,shape};const auto n=required_bytes(shape);
     std::vector<float> input(static_cast<std::size_t>(n.intermediates/4),std::bit_cast<float>(0x7fffffffU));
     std::vector<std::byte> weights(static_cast<std::size_t>(n.weights));
@@ -82,7 +82,7 @@ void run(Guard guard,Shape shape,bool signed_zero=false,bool duplicate=false){
         for(unsigned f=0;f<shape.intermediate;++f){
             const auto hash=(f+slot*31U)*2654435761U;
             input[static_cast<std::size_t>(slot)*2U*shape.intermediate+f]=signed_zero ? -1.0F :
-                std::ldexp(static_cast<float>(static_cast<int>(hash%257U)-128)/127.0F,static_cast<int>(hash%25U)-12);
+                denormal ? std::bit_cast<float>((hash&0x80000000U)|(hash%127U+1U)) : std::ldexp(static_cast<float>(static_cast<int>(hash%257U)-128)/127.0F,static_cast<int>(hash%25U)-12);
         }
     }
     const auto row_bytes=static_cast<std::size_t>(shape.intermediate/32U)*24U;
@@ -133,6 +133,13 @@ void run(Guard guard,Shape shape,bool signed_zero=false,bool duplicate=false){
         if(!known){++new_down_count;expect(node.gridDim.x==(shape.hidden+7U)/8U && node.gridDim.y==1U &&
             node.blockDim.x==256U && node.blockDim.y==1U && node.sharedMemBytes==0U,"actual grouped function uses8-output256-thread geometry without dynamic LDS");}}
     expect(new_down_count==1U,"captured grouped function differs from original/validator");
+    guard->run([&]{
+        check(hipMemsetAsync(accum.pointer,0,static_cast<std::size_t>(n.accumulation),baseline.stream),"clear captured original seed");
+        check(hipMemsetAsync(status.pointer,0,4,baseline.stream),"clear captured original status");
+        check(hipGraphLaunch(baseline.exec,baseline.stream),"replay actual original Q5_1 receipt");
+        check(hipMemcpyAsync(candidate.data(),accum.pointer,static_cast<std::size_t>(n.accumulation),hipMemcpyDeviceToHost,baseline.stream),"read original graph receipt");
+    });
+    expect(candidate==original,"actual original explicit-stream graph reproduces eager bits");verify(candidate);
     for(unsigned replay=0;replay<3;++replay){
         guard->run([&]{check(hipMemsetAsync(accum.pointer,0xff,static_cast<std::size_t>(n.accumulation),grouped.stream),"stream poison before every grouped replay");
             check(hipMemsetAsync(status.pointer,0,4,grouped.stream),"stream reset grouped status");check(hipGraphLaunch(grouped.exec,grouped.stream),"replay grouped Q5_1");
@@ -141,12 +148,16 @@ void run(Guard guard,Shape shape,bool signed_zero=false,bool duplicate=false){
         expect(local==0 && candidate==original,"poisoned static replay equals original bits");verify(candidate);
     }
     const auto rejected=[&](unsigned preset,unsigned expected_status){
-        guard->run([&]{check(hipMemsetAsync(accum.pointer,0xa5,static_cast<std::size_t>(n.accumulation),grouped.stream),"poison rejected graph destination");
-            check(hipMemcpyAsync(status.pointer,&preset,4,hipMemcpyHostToDevice,grouped.stream),"preset sticky Q5_1 status");
-            check(hipGraphLaunch(grouped.exec,grouped.stream),"replay rejected Q5_1 graph");
-            check(hipMemcpyAsync(candidate.data(),accum.pointer,static_cast<std::size_t>(n.accumulation),hipMemcpyDeviceToHost,grouped.stream),"read rejected Q5_1 destination");
-            check(hipMemcpyAsync(&local,status.pointer,4,hipMemcpyDeviceToHost,grouped.stream),"read rejected Q5_1 status");});
-        expect(local==expected_status && std::all_of(candidate.begin(),candidate.end(),[](auto v){return v==0xa5a5a5a5U;}),"invalid/sticky Q5_1 graph leaves destination unchanged");
+        for(unsigned captured=0;captured<2;++captured){
+            const auto stream=captured ? grouped.stream : nullptr;
+            guard->run([&]{check(hipMemsetAsync(accum.pointer,0xa5,static_cast<std::size_t>(n.accumulation),stream),"poison rejected destination");
+                check(hipMemcpyAsync(status.pointer,&preset,4,hipMemcpyHostToDevice,stream),"preset sticky Q5_1 status");
+                if(captured) check(hipGraphLaunch(grouped.exec,stream),"replay rejected Q5_1 graph");
+                else enqueue_grouped_probe(r,b,stream);
+                check(hipMemcpyAsync(candidate.data(),accum.pointer,static_cast<std::size_t>(n.accumulation),hipMemcpyDeviceToHost,stream),"read rejected Q5_1 destination");
+                check(hipMemcpyAsync(&local,status.pointer,4,hipMemcpyDeviceToHost,stream),"read rejected Q5_1 status");});
+            expect(local==expected_status && std::all_of(candidate.begin(),candidate.end(),[](auto v){return v==0xa5a5a5a5U;}),"invalid/sticky eager or captured Q5_1 leaves destination unchanged");
+        }
     };
     rejected(0x40U,0x40U);
     for(const auto slot:std::set<unsigned>{0U,shape.top_k/2U,shape.top_k-1U}){
@@ -157,7 +168,7 @@ void run(Guard guard,Shape shape,bool signed_zero=false,bool duplicate=false){
     }
     for(const auto* owner:{&gu,&w,&ids,&mw,&status,&accum})owner->tail();
     std::cout<<"Q5_1 grouped probe H="<<shape.hidden<<" I="<<shape.intermediate<<" E="<<shape.experts<<" K="<<shape.top_k
-        <<" compared="<<shape.hidden*5U<<" signedzero="<<signed_zero<<" duplicate="<<duplicate<<'\n';
+        <<" compared="<<shape.hidden*6U<<" signedzero="<<signed_zero<<" duplicate="<<duplicate<<" denormal="<<denormal<<'\n';
 }
 }
 int main()try{
@@ -168,6 +179,7 @@ int main()try{
     const auto guard=std::make_shared<strix::HipSetupQuiescenceGuard>();
     for(const auto shape:std::array<strix::q51_grouped_down::Shape,7>{{{1,32,1,1},{7,64,3,2},{8,256,3,3},{9,288,4,3},{67,512,10,10},{67,640,10,10},{2560,640,512,10}}})run(guard,shape);
     run(guard,{9,288,3,3},true);run(guard,{67,640,10,10},false,true);
+    run(guard,{9,288,3,3},false,false,true);
     if(failures==0)std::cout<<"Q5_1 grouped standalone device probe PASS; no native integration/model/performance qualification\n";
     return failures?1:0;
 }catch(const std::exception& error){std::cerr<<error.what()<<'\n';return 2;}
