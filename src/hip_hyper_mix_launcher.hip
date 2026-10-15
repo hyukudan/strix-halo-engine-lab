@@ -1779,7 +1779,8 @@ void register_hip_hyper_mix_kernel_variant(
         variant.resources.scratch_bytes = static_cast<std::uint64_t>(request.logical_rows) *
             (static_cast<std::uint64_t>(config.hidden_size) * config.hc_count + config.lowrank) * sizeof(float);
     }
-    if(config.lane_chain_output)variant.resources.lds_bytes=std::max(variant.resources.lds_bytes,lane_chain_hyper_output_lds(config.hc_count,config.lowrank));
+    if(config.lane_chain_output)variant.resources.lds_bytes=std::max(variant.resources.lds_bytes,
+        static_cast<std::uint32_t>(lane_chain_hyper_output_lds(config.hc_count,config.lowrank)));
     variant.numerics.input_precision =
         storage_name(
             config.activation);
