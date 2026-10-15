@@ -35,14 +35,28 @@ std::vector<Schedule> parse_schedules(const std::string& text) {
     require(!text.empty(), "explicit admitted schedules required");
     std::vector<Schedule> result;
     unsigned previous = 0;
-    for (std::size_t at = 0; at < text.size(); at += 2) {
-        require(text[at] >= '1' && text[at] <= '3', "invalid admitted schedule");
-        const unsigned value = static_cast<unsigned>(text[at] - '0');
-        require(value > previous, "admitted schedules must be distinct ascending 1,2,3");
+    for (std::size_t at = 0; at < text.size(); at += 3) {
+        require(at + 1 < text.size() && text[at] == '1' &&
+                    text[at + 1] >= '1' && text[at + 1] <= '3', "invalid admitted schedule (need 11,12,13)");
+        const unsigned value = 10U + static_cast<unsigned>(text[at + 1] - '0');
+        require(value > previous, "admitted schedules must be distinct ascending 11,12,13");
         result.push_back(static_cast<Schedule>(value)); previous = value;
-        if (at + 1 < text.size()) require(text[at + 1] == ',' && at + 2 < text.size(), "invalid schedule separator");
+        if (at + 2 < text.size()) require(text[at + 2] == ',' && at + 3 < text.size(), "invalid schedule separator");
     }
     return result;
+}
+void schedule_parser_controls() {
+    require(parse_schedules("11") == std::vector<Schedule>{Schedule::n1_scalar_k8_d8}, "parse N1");
+    require(parse_schedules("12") == std::vector<Schedule>{Schedule::n2_lds_k8_d8}, "parse N2");
+    require(parse_schedules("13") == std::vector<Schedule>{Schedule::n3_scalar_k4_d4}, "parse N3");
+    require(parse_schedules("11,13") == std::vector<Schedule>{Schedule::n1_scalar_k8_d8,Schedule::n3_scalar_k4_d4}, "parse admitted subset");
+    require(parse_schedules("11,12,13").size() == 3U, "parse all new schedules");
+    for (const std::string bad : {"", "1", "2", "3", "1,2,3", "10", "14", "011", "+11", "11,", "11,,12", "11,11", "12,11", "11, 12", "11x12", "11,12,013", "11,12,13,"}) {
+        bool rejected = false;
+        try { static_cast<void>(parse_schedules(bad)); }
+        catch (const std::runtime_error&) { rejected = true; }
+        require(rejected, "schedule parser accepted old or noncanonical IDs");
+    }
 }
 std::size_t buffer_bytes(std::size_t payload) {
     require(payload <= std::numeric_limits<std::size_t>::max() - 2 * guard_bytes, "fixture allocation overflow");
@@ -370,7 +384,7 @@ void negative_cases(const std::vector<Schedule>& admitted) {
         for (unsigned rank : {0U, 513U}) { auto bad = shape; bad.rank = rank; reject(bad, n, c, s, 32, i, l, o, geometry); }
         for (unsigned rows : {0U, 65536U}) { auto bad = shape; bad.rows = rows; reject(bad, n, c, s, 32, i, l, o, geometry); }
         for (unsigned rp : {0U, 31U, 64U}) reject(shape, n, c, s, rp, i, l, o, geometry);
-        for (unsigned bad : {0U, 4U, std::numeric_limits<unsigned>::max()}) rejected(shape, n, c, s, 32, i, l, o, static_cast<Schedule>(bad), geometry);
+        for (unsigned bad : {0U, 1U, 2U, 3U, 4U, 10U, 14U, std::numeric_limits<unsigned>::max()}) rejected(shape, n, c, s, 32, i, l, o, static_cast<Schedule>(bad), geometry);
         reject(shape, n, c, s, 32, {}, l, o, pair); reject(shape, n, c, s, 32, i, l, {}, pair);
         reject(shape, n, c, s, 32, {0, 1}, l, {}, pair); reject(shape, n, c, s, 32, {}, l, {0, 1}, pair);
         // Exact required extents are used by every positive fixture. Here every
@@ -441,6 +455,7 @@ void synthetic(const std::vector<Schedule>& admitted) {
 #include "hip_repacked_hc_capture_qualification.hpp"
 
 int main(int argc, char** argv) try {
+    repacked_test::schedule_parser_controls(); // CPU-only, before any HIP owner.
     if (argc == 1) {
         const char* text = std::getenv("STRIX_HC_REPACKED_ADMITTED_SCHEDULES");
         repacked_test::require(text != nullptr, "STRIX_HC_REPACKED_ADMITTED_SCHEDULES required before HIP");

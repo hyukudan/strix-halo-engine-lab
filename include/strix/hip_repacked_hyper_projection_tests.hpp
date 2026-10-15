@@ -7,9 +7,9 @@ namespace strix::hc_repacked_projection_diagnostic {
 // Diagnostic only: no catalog, application flag, or production dispatch selects
 // these schedules. The caller retains every owner until the stream is drained.
 enum class Schedule : std::uint32_t {
-    s1_lds_k8_d8 = 1,
-    s2_lds_k11_d8 = 2,
-    s3_scalar_k8_d8 = 3,
+    n1_scalar_k8_d8 = 11,
+    n2_lds_k8_d8 = 12,
+    n3_scalar_k4_d4 = 13,
 };
 
 void enqueue(
