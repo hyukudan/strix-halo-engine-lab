@@ -18,6 +18,7 @@ struct HipGdnLauncherConfig {
     bool enable_device_graph_inputs = false;
     bool virtual_q8_input_projections = false;
     bool prefetch_q8_input_projections = false;
+    bool virtual_q8_output_projection = false;
 };
 
 void register_hip_gdn_kernel_variant(

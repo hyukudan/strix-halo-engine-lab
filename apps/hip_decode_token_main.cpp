@@ -1,3 +1,4 @@
+#include "strix/gdn_output_admission.hpp"
 #include "strix/compiled_execution.hpp"
 #include "strix/execution_resources.hpp"
 #include "strix/execution_tensor_access.hpp"
@@ -179,6 +180,7 @@ struct Options {
     bool q4k_a8g32_gate_up = false;
     bool grouped_exact_q51_down = false;
     bool prefetch_q8_gdn_input = false;
+    bool virtual_q8_gdn_output = false;
     std::uint64_t ple_max_rows_per_io = 4;
     std::uint64_t ple_max_inflight_ios = 4;
     std::string reference_path;
@@ -245,6 +247,10 @@ Options parse_options(
             if (options.parallel_moe_router) throw std::invalid_argument("duplicate parallel MoE router option");
             options.parallel_moe_router = true;
             continue;
+        }
+        if(argument=="--virtual-q8-gdn-output") {
+            if(options.virtual_q8_gdn_output) throw std::invalid_argument("duplicate virtual Q8 GDN output option");
+            options.virtual_q8_gdn_output=true;continue;
         }
         if (argument == "--prefetch-q8-hyper-output") {
             if (options.prefetch_q8_hyper_output) throw std::invalid_argument("duplicate Q8 hyper output prefetch option");
@@ -774,6 +780,7 @@ int main(
     if (argc == 2 && std::string_view(argv[1]) == "--help") {
         std::cout << "Usage: strix-hip-decode-token MODEL.gguf TOKEN_ID ... [options]\n"
             "  --context N --generate N --eos-token ID --residency register|copy\n"
+            "  --virtual-q8-gdn-output (exact original256-tree Q8 output)\n"
             "  --record-raw ABS_NEW_PRIVATE_DIRECTORY --record-max-bytes BYTES\n"
             "  --record-state-policy final|each --prefix-cache-roundtrip\n"
             "  --execution-mode eager|graph (default eager)\n"
@@ -948,6 +955,8 @@ int main(
         if (!meaningful_q8 || model.hidden_size % 32U != 0U)
             throw std::invalid_argument("--virtual-q8-gdn-input requires an aligned Q8_0 GDN input projection");
     }
+    if(options.virtual_q8_gdn_output) strix::validate_virtual_q8_gdn_output_manifest(model,manifest);
+    const std::string gdn_output_mode_receipt=options.virtual_q8_gdn_output ? "  \"virtual_q8_gdn_output\": true,\n" : "";
     const auto original_work_device = std::make_shared<strix::HipSetupQuiescenceGuard>();
     auto target_architecture = original_work_device->architecture();
     if (const auto suffix = target_architecture.find(':'); suffix != std::string::npos)
@@ -988,6 +997,7 @@ int main(
     binding_request.parallel_moe_router = options.parallel_moe_router;
     catalog_config.virtual_q8_gdn_input = options.virtual_q8_gdn_input;
     catalog_config.prefetch_q8_gdn_input = options.prefetch_q8_gdn_input;
+    catalog_config.virtual_q8_gdn_output = options.virtual_q8_gdn_output;
     std::optional<strix::integer_projection::RuntimeConfig> integer_config;
     if (options.execution.integer_head != strix::DecodeIntegerHead::none) {
         integer_config = strix::make_decode_integer_head_config(model, manifest, options.execution,
@@ -1475,7 +1485,7 @@ int main(
                     restore_start).count();
 
             std::cout
-                << "{\n"
+                << "{\n" << gdn_output_mode_receipt
                 << "  \"model_content_identity\": \""
                 << strix::model_content_identity_hex(
                        model_residency.binding().
@@ -1601,7 +1611,7 @@ int main(
             elapsed_total += value;
         }
 
-        std::cout << "{\n";
+        std::cout << "{\n" << gdn_output_mode_receipt;
         emit_q4k_a8_receipt();
         emit_q4k_a8_counts();
         std::cout
@@ -1701,7 +1711,7 @@ int main(
             reference->steps.size());
     }
 
-    std::cout << '{' << '\n';
+    std::cout << '{' << '\n' << gdn_output_mode_receipt;
     emit_q4k_a8_receipt();
     std::cout << "  \"model_content_identity\": \""
               << strix::model_content_identity_hex(

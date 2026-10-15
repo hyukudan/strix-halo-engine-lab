@@ -35,6 +35,7 @@ struct HipLauncherCatalogConfig {
     bool q4k_a8g32_gate_up = false;
     bool grouped_exact_q51_down = false;
     std::shared_ptr<moe_q4k_a8::RuntimeDispatchStats> q4k_a8_stats;
+    bool virtual_q8_gdn_output = false;
 };
 
 void register_complete_hip_kernel_catalog(

@@ -28,13 +28,14 @@ std::uint32_t checked_u32(
 
 
 HipGdnLauncherConfig gdn_config(const ModelContract& model,
-    HipActivationStorage activation, bool graph, bool virtual_q8, bool prefetch_q8) {
+    HipActivationStorage activation, bool graph, bool virtual_q8, bool prefetch_q8, bool virtual_output) {
     HipGdnLauncherConfig config;
     config.model = model;
     config.activation = activation;
     config.enable_device_graph_inputs = graph;
     config.virtual_q8_input_projections = virtual_q8;
     config.prefetch_q8_input_projections = prefetch_q8;
+    config.virtual_q8_output_projection = virtual_output;
     return config;
 }
 
@@ -292,7 +293,7 @@ void register_complete_hip_kernel_catalog(
         qualification);
 
     const auto gdn = gdn_config(model, config.activation,
-        config.enable_device_graph_inputs, config.virtual_q8_gdn_input, config.prefetch_q8_gdn_input);
+        config.enable_device_graph_inputs, config.virtual_q8_gdn_input, config.prefetch_q8_gdn_input, config.virtual_q8_gdn_output);
     register_hip_gdn_kernel_variant(
         model,
         request,
@@ -395,7 +396,7 @@ HipLauncherCatalog::HipLauncherCatalog(
               config.activation, config.enable_device_graph_inputs)),
       gdn_(
           gdn_config(model, config.activation,
-              config.enable_device_graph_inputs, config.virtual_q8_gdn_input, config.prefetch_q8_gdn_input)),
+              config.enable_device_graph_inputs, config.virtual_q8_gdn_input, config.prefetch_q8_gdn_input, config.virtual_q8_gdn_output)),
       indexed_attention_(
           indexed_attention_config(
               model,

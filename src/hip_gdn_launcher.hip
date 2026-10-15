@@ -710,6 +710,41 @@ __global__ void project_fp32_to_bf16_kernel(
     }
 }
 
+// One wave simulates the same256 original leaves: virtual t=8*lane+j.
+// Ascending per-leaf FMA chains and the128..1 tree are unchanged.
+__global__ __launch_bounds__(32)
+void project_virtual_q8_fp32_to_bf16_kernel(
+    const float* input, const void* weights, std::uint32_t input_width,
+    std::uint32_t output_width, std::uint16_t* output) {
+    const auto row=static_cast<std::uint32_t>(blockIdx.x);
+    if(row>=output_width) return;
+    const auto lane=static_cast<std::uint32_t>(threadIdx.x);
+    float partial[8]{};
+    for(std::uint64_t chunk=0;chunk<input_width;chunk+=256U) {
+#pragma unroll
+        for(unsigned local=0;local<8;++local) {
+            const auto feature=chunk+8U*lane+local;
+            if(feature<input_width)
+                partial[local]+=input[feature]*load_weight<WeightKind::q8_0>(
+                    weights,input_width,row,static_cast<std::uint32_t>(feature));
+        }
+    }
+#pragma unroll
+    for(unsigned distance=16;distance>0;distance/=2) {
+#pragma unroll
+        for(unsigned local=0;local<8;++local) {
+            const auto partner=__shfl_down(partial[local],distance,32);
+            if(lane<distance) partial[local]+=partner;
+        }
+    }
+    if(lane==0) {
+        partial[0]+=partial[4];partial[1]+=partial[5];
+        partial[2]+=partial[6];partial[3]+=partial[7];
+        partial[0]+=partial[2];partial[1]+=partial[3];partial[0]+=partial[1];
+        output[row]=float_to_bf16(partial[0]);
+    }
+}
+
 __global__ void conv_update_kernel(
     float* qkv,
     std::uint16_t* conv_state,
@@ -1301,7 +1336,14 @@ void launch_output_by_kind(
     const RuntimeTensorBinding& weights,
     std::uint32_t input_width,
     std::uint32_t output_width,
-    std::uint16_t* output) {
+    std::uint16_t* output, bool virtual_q8 = false) {
+    if(virtual_q8) {
+        if(kind!=WeightKind::q8_0 || input_width%32U!=0U)
+            throw std::invalid_argument("virtual Q8 GDN output requires aligned Q8_0 weights");
+        hipLaunchKernelGGL(project_virtual_q8_fp32_to_bf16_kernel,dim3(output_width),dim3(32),0,
+            hip_execution_stream(),input,reinterpret_cast<const void*>(weights.address),input_width,output_width,output);
+        check_hip(hipGetLastError(),"HIP GDN virtual Q8 output projection launch");return;
+    }
     switch (kind) {
     case WeightKind::f32:
         launch_output_projection<WeightKind::f32>(
@@ -1836,6 +1878,9 @@ void launch_gdn(
         value_width,
         hidden,
         "out");
+    if(config.virtual_q8_output_projection &&
+        (tensors.out.manifest->ggml_type!=8U || value_width%32U!=0U))
+        throw std::invalid_argument("virtual Q8 GDN output requires aligned Q8_0 weights");
     validate_small_tensor(
         tensors.conv,
         static_cast<std::uint64_t>(
@@ -2099,7 +2144,7 @@ void launch_gdn(
         hidden,
         reinterpret_cast<
             std::uint16_t*>(
-                output.address));
+                output.address),config.virtual_q8_output_projection);
     if (hip_graph_status() != nullptr) {
         hipLaunchKernelGGL(validate_gdn_graph_input, dim3(32), dim3(kProjectionThreads), 0,
             hip_execution_stream(), reinterpret_cast<const std::uint16_t*>(output.address), hidden,
@@ -2131,7 +2176,8 @@ std::string kernel_id(
         std::to_string(
             request.request_concurrency) + (request.device_graph_inputs ? ".device" : ".scalar") +
         (config.prefetch_q8_input_projections ? ".prefetch8" : "") +
-        (config.virtual_q8_input_projections ? ".virtual256.q8-input" : "");
+        (config.virtual_q8_input_projections ? ".virtual256.q8-input" : "") +
+        (config.virtual_q8_output_projection ? ".virtual256.q8-output" : "");
 }
 
 std::uint64_t implementation_identity(
@@ -2181,6 +2227,7 @@ std::uint64_t implementation_identity(
             ? 1ULL
             : 0ULL);
     if (config.virtual_q8_input_projections) hash_u64(hash, 0x47444e5138563235ULL);
+    if (config.virtual_q8_output_projection) hash_u64(hash, 0x47444e514f555431ULL);
     if (config.prefetch_q8_input_projections) hash_u64(hash, 0x47444e5138504631ULL);
     return hash;
 }
@@ -2299,6 +2346,7 @@ void register_hip_gdn_kernel_variant(
         "row-major";
     variant.compiler_identity = config.prefetch_q8_input_projections ? "hip-gfx1151-gdn-v4-prefetch8-virtual256-q8-input"
         : config.virtual_q8_input_projections ? "hip-gfx1151-gdn-v3-virtual256-q8-input" : "hip-gfx1151-gdn-v2";
+    if(config.virtual_q8_output_projection) variant.compiler_identity += "-virtual256-q8-output";
     variant.measured_seconds = 0.0;
 
     registry.add(
@@ -2354,10 +2402,15 @@ register_for_compiled_execution(
                 "HIP GDN step has no kernel binding");
         }
 
-        if (binding.kernel_id->ends_with(".virtual256.q8-input") !=
+        std::string_view selected_id=*binding.kernel_id;
+        constexpr std::string_view output_suffix=".virtual256.q8-output";
+        if(selected_id.ends_with(output_suffix)!=config_.virtual_q8_output_projection)
+            throw std::invalid_argument("HIP GDN selected kernel disagrees with virtual Q8 output configuration");
+        if(config_.virtual_q8_output_projection) selected_id.remove_suffix(output_suffix.size());
+        if (selected_id.ends_with(".virtual256.q8-input") !=
             config_.virtual_q8_input_projections)
             throw std::invalid_argument("HIP GDN selected kernel disagrees with virtual Q8 configuration");
-        if (binding.kernel_id->ends_with(".prefetch8.virtual256.q8-input") != config_.prefetch_q8_input_projections)
+        if (selected_id.ends_with(".prefetch8.virtual256.q8-input") != config_.prefetch_q8_input_projections)
             throw std::invalid_argument("HIP GDN selected kernel disagrees with prefetch Q8 configuration");
 
         if (registered_id.empty()) {

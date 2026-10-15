@@ -28,6 +28,7 @@ endfunction()
 add_library(strix_core STATIC
     src/q51_grouped_down_contract.cpp
     src/moe_q4k_a8_runtime.cpp
+    src/gdn_output_admission.cpp
     src/arithmetic_lineage.cpp
     src/graph_eligibility.cpp
     src/graph_inputs.cpp
@@ -235,6 +236,10 @@ if(BUILD_TESTING)
         target_compile_options(strix-moe-q4k-a8-contract-tests PRIVATE -fno-fast-math -ffp-contract=off)
     endif()
     add_test(NAME strix-moe-q4k-a8-contract-tests COMMAND strix-moe-q4k-a8-contract-tests)
+    add_executable(strix-gdn-output-admission-tests tests/gdn_output_admission_tests.cpp)
+    target_link_libraries(strix-gdn-output-admission-tests PRIVATE strix_core)
+    strix_target_warnings(strix-gdn-output-admission-tests)
+    add_test(NAME strix-gdn-output-admission-tests COMMAND strix-gdn-output-admission-tests)
     add_executable(strix-virtual-q8-gdn-oracle-tests tests/virtual_q8_gdn_oracle_tests.cpp)
     target_compile_features(strix-virtual-q8-gdn-oracle-tests PRIVATE cxx_std_20)
     strix_target_warnings(strix-virtual-q8-gdn-oracle-tests)
@@ -1099,6 +1104,9 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         strix-hip-decode-token
     )
     if(BUILD_TESTING)
+        add_test(NAME strix-virtual-q8-gdn-output-cli-tests
+            COMMAND ${CMAKE_COMMAND} -DBINARY=$<TARGET_FILE:strix-hip-decode-token>
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_virtual_q8_gdn_output_cli.cmake)
         add_test(NAME strix-virtual-q8-cli-duplicate-tests
             COMMAND ${CMAKE_COMMAND} -DBINARY=$<TARGET_FILE:strix-hip-decode-token>
             -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_virtual_q8_cli.cmake)
@@ -1387,6 +1395,12 @@ if(STRIX_ENABLE_HIP_RUNTIME)
             add_test(NAME strix-hip-moe-kquant-${mode}-tests
                      COMMAND strix-hip-moe-kquant-tests ${mode})
         endforeach()
+
+        add_executable(strix-hip-gdn-output-projection-tests tests/hip_gdn_output_projection_tests.hip)
+        target_link_libraries(strix-hip-gdn-output-projection-tests PRIVATE strix_hip_runtime)
+        set_target_properties(strix-hip-gdn-output-projection-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+        strix_target_warnings(strix-hip-gdn-output-projection-tests)
+        add_test(NAME strix-hip-gdn-output-projection-tests COMMAND strix-hip-gdn-output-projection-tests)
 
         add_executable(
             strix-hip-gdn-launcher-tests
