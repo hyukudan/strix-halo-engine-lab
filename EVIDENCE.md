@@ -71,6 +71,19 @@ permitidos son: **observado**, **publicado**, **inferido**, **hipótesis** y
 
 ## Regla para nuevas entradas
 
+### Experimental wave router selection, 2026-10-15
+
+Project-owned implementation and tests are recorded in
+`docs/implementation-2026-10-15-wave-router-topk.md`,
+`src/hip_moe_route_launcher.hip`, and `tests/router_wave_topk_tests.cpp`.
+Validation: WSL GNU13.3, Ninja, CMake Release, HIP runtime OFF;
+`cmake --build /mnt/d/tmp/build-spec-v1-router-host -j 8` and
+`ctest --test-dir /mnt/d/tmp/build-spec-v1-router-host --output-on-failure --no-tests=error -j 8`
+passed152/152 tests. The host wave/insertion oracle covers6864 bit comparisons
+plus duplicate/gap mutants and admission negatives. Device fixture source is
+supplied; no HIP build, target execution, ISA qualification, complete-model
+fidelity or timing result is implied. The option remains experimental and OFF.
+
 Cada evidencia nueva debe incluir identidad del artefacto, comando o prueba,
 condiciones del entorno y el requisito de la spec al que afecta. Si una medida
 contradice una entrada anterior, ambas se conservan y se registra la resolución

@@ -53,6 +53,27 @@
 
 ## Formato de revisión
 
+### Wave router selection contract, 2026-10-15
+
+Use repeated wave maxima over float value/expert-index pairs while retaining
+the existing softmax and slot-order epilogue. Integer-bit sorting or parallel
+division is outside this exact candidate. Existing default/ranked functions and
+their16-slot limits remain intact; wave K32 is launcher-only. The alternative
+is the existing ranked selector, which remains available and unchanged.
+
+The raw GGUF reader exposes group metadata, but `ModelContract` and the variant
+registration API contain no group/bias fields or manifest parameter. Therefore
+wave intake rejects `.expert_group_count`, `.expert_group_used_count` and
+`*.exp_probs_b*` before that information is reduced to a shape contract; direct
+callers must use the same raw-intake validator. The launcher independently
+rejects bias tensors retained in its manifest before enqueue. Registration must
+not be described as inspecting metadata it cannot receive. Reopen this contract
+if grouped routing or selection bias becomes expressible in the model API.
+
+Host oracle/admission checks pass; hardware, ISA, model and performance gates
+remain pending. A different compiled FP sequence, any full-array mismatch, or
+failure to improve measured latency blocks adoption and requires investigation.
+
 Toda decisión nueva indicará: alternativas, evidencia, riesgo, consecuencia en
 la spec y condición de reapertura. Las acciones de aceptación se enlazarán aquí y
 en `DESIGN_ACCEPTANCE.md`.

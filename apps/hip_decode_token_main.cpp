@@ -12,6 +12,7 @@
 #include "strix/model_contract.hpp"
 #include "strix/model_content_hash.hpp"
 #include "strix/model_manifest.hpp"
+#include "strix/wave_router_contract.hpp"
 #include "strix/model_tensor_index.hpp"
 #include "strix/ple_lookup.hpp"
 #include "strix/runtime_allocator.hpp"
@@ -177,6 +178,7 @@ struct Options {
     bool parallel_moe_router = false;
     bool virtual_q8_gdn_input = false;
     bool ranked_moe_router_topk = false;
+    bool wave_moe_router_topk = false;
     bool q4k_a8g32_gate_up = false;
     bool grouped_exact_q51_down = false;
     bool prefetch_q8_gdn_input = false;
@@ -205,7 +207,7 @@ Options parse_options(
             "[--context N] [--residency register|copy] [--coalesce-gap BYTES] "
             "[--planned-ple-io] [--ple-max-rows-per-io N] [--ple-max-inflight-ios N] "
             "[--generate N] [--eos-token TOKEN_ID] [--prefix-cache-roundtrip] "
-            "[--parallel-moe-router] [--ranked-moe-router-topk] "
+            "[--parallel-moe-router] [--ranked-moe-router-topk | --wave-moe-router-topk] "
             "[--virtual-q8-lm-head] [--virtual-q8-gdn-input [--prefetch-q8-gdn-input]] [--q4k-a8g32-gate-up [--grouped-exact-q51-down]] "
             "[--parallel-hyper-mix [--staged-hyper-projections [--fused-staged-hyper-mix [--typed-fused-hyper-projections [--prefetch-typed-hyper-rows] [--prefetch-q8-hyper-output]]]]]");
     }
@@ -237,6 +239,11 @@ Options parse_options(
             options.q4k_a8g32_gate_up = true;
             continue;
 #endif
+        }
+        if (argument == "--wave-moe-router-topk") {
+            if (options.wave_moe_router_topk) throw std::invalid_argument("duplicate wave MoE router top-k option");
+            options.wave_moe_router_topk = true;
+            continue;
         }
         if (argument == "--ranked-moe-router-topk") {
             if (options.ranked_moe_router_topk) throw std::invalid_argument("duplicate ranked MoE router top-k option");
@@ -535,6 +542,8 @@ Options parse_options(
     }
     if(options.grouped_exact_q51_down && !options.q4k_a8g32_gate_up)
         throw std::invalid_argument("--grouped-exact-q51-down requires --q4k-a8g32-gate-up");
+    if (options.wave_moe_router_topk && (!options.parallel_moe_router || options.ranked_moe_router_topk))
+        throw std::invalid_argument("--wave-moe-router-topk requires --parallel-moe-router and excludes --ranked-moe-router-topk");
     if (options.ranked_moe_router_topk && !options.parallel_moe_router)
         throw std::invalid_argument("--ranked-moe-router-topk requires --parallel-moe-router");
     if (options.prefetch_q8_gdn_input && !options.virtual_q8_gdn_input)
@@ -892,6 +901,7 @@ int main(
     const auto info =
         strix::gguf::read_file(
             options.model_path);
+    if (options.wave_moe_router_topk) strix::validate_wave_router_model_inputs(info);
     const auto manifest =
         strix::build_model_manifest(
             info);
@@ -956,6 +966,10 @@ int main(
             throw std::invalid_argument("--virtual-q8-gdn-input requires an aligned Q8_0 GDN input projection");
     }
     if(options.virtual_q8_gdn_output) strix::validate_virtual_q8_gdn_output_manifest(model,manifest);
+    const std::string wave_router_mode_receipt =
+        "  \"wave_moe_router_topk\": " + std::string(options.wave_moe_router_topk ? "true" : "false") + ",\n" +
+        "  \"wave_moe_router_topk_eligible_steps\": " + std::to_string(options.wave_moe_router_topk ? model.hidden_layers : 0ULL) + ",\n" +
+        "  \"wave_moe_router_topk_fallback_steps\": 0,\n";
     const std::string gdn_output_mode_receipt=options.virtual_q8_gdn_output ? "  \"virtual_q8_gdn_output\": true,\n" : "";
     const auto original_work_device = std::make_shared<strix::HipSetupQuiescenceGuard>();
     auto target_architecture = original_work_device->architecture();
@@ -993,6 +1007,8 @@ int main(
     binding_request.grouped_exact_q51_down = options.grouped_exact_q51_down;
     catalog_config.ranked_moe_router_topk = options.ranked_moe_router_topk;
     binding_request.ranked_moe_router_topk = options.ranked_moe_router_topk;
+    catalog_config.wave_moe_router_topk = options.wave_moe_router_topk;
+    binding_request.wave_moe_router_topk = options.wave_moe_router_topk;
     catalog_config.parallel_moe_router = options.parallel_moe_router;
     binding_request.parallel_moe_router = options.parallel_moe_router;
     catalog_config.virtual_q8_gdn_input = options.virtual_q8_gdn_input;
@@ -1485,7 +1501,7 @@ int main(
                     restore_start).count();
 
             std::cout
-                << "{\n" << gdn_output_mode_receipt
+                << "{\n" << gdn_output_mode_receipt << wave_router_mode_receipt
                 << "  \"model_content_identity\": \""
                 << strix::model_content_identity_hex(
                        model_residency.binding().
@@ -1611,7 +1627,7 @@ int main(
             elapsed_total += value;
         }
 
-        std::cout << "{\n" << gdn_output_mode_receipt;
+        std::cout << "{\n" << gdn_output_mode_receipt << wave_router_mode_receipt;
         emit_q4k_a8_receipt();
         emit_q4k_a8_counts();
         std::cout
@@ -1711,7 +1727,7 @@ int main(
             reference->steps.size());
     }
 
-    std::cout << '{' << '\n' << gdn_output_mode_receipt;
+    std::cout << '{' << '\n' << gdn_output_mode_receipt << wave_router_mode_receipt;
     emit_q4k_a8_receipt();
     std::cout << "  \"model_content_identity\": \""
               << strix::model_content_identity_hex(

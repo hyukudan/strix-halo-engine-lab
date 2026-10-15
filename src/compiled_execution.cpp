@@ -306,6 +306,9 @@ CompiledSerialExecution compile_serial_execution(
             "compiled execution buffer rows must match binding rows");
     }
 
+    if (binding_request.wave_moe_router_topk &&
+        (!binding_request.parallel_moe_router || binding_request.ranked_moe_router_topk))
+        throw std::invalid_argument("wave router requires parallel topology and excludes ranked mode");
     if (binding_request.ranked_moe_router_topk && !binding_request.parallel_moe_router)
         throw std::invalid_argument("ranked router requires parallel router topology");
     if (binding_request.parallel_moe_router != buffer_request.parallel_moe_router)
@@ -366,7 +369,8 @@ CompiledSerialExecution compile_serial_execution(
             throw std::invalid_argument("bound Q4K A8 kernel differs from admitted topology");
         if (binding.op == SerialOp::moe_route && binding.kernel_id.has_value() &&
             (binding.kernel_id->ends_with(".parallel") != buffer_request.parallel_moe_router ||
-             binding.kernel_id->ends_with(".ranked.parallel") != binding_request.ranked_moe_router_topk))
+             binding.kernel_id->ends_with(".ranked.parallel") != binding_request.ranked_moe_router_topk ||
+             binding.kernel_id->ends_with(".wave.parallel") != binding_request.wave_moe_router_topk))
             throw std::invalid_argument("bound router kernel differs from admitted topology");
     }
 

@@ -18,6 +18,7 @@ struct HipMoeRouteLauncherConfig {
     bool normalize_selected = true;
     bool parallel_projection = false;
     bool ranked_topk = false;
+    bool wave_topk = false;
 };
 
 void register_hip_moe_route_kernel_variant(

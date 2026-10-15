@@ -385,6 +385,168 @@ void cpu_route_reference(
     }
 }
 
+// Independent serial-insertion selection oracle; extends only fixture-local arrays to32.
+__device__ bool fixture_select_better(float a, std::uint32_t ai, float b, std::uint32_t bi) {
+    return a > b || (a == b && ai < bi);
+}
+__global__ void fixture_insertion32_select_kernel(
+    const float* workspace, std::uint32_t expert_count, std::uint32_t top_k,
+    bool normalize_selected, std::uint32_t* selected_indices, float* selected_weights) {
+    const auto row = static_cast<std::uint32_t>(blockIdx.x);
+    const auto lane = static_cast<std::uint32_t>(threadIdx.x);
+    __shared__ float logits[512];
+    __shared__ float scratch[256];
+    for (std::uint32_t expert = lane; expert < expert_count; expert += blockDim.x)
+        logits[expert] = workspace[static_cast<std::uint64_t>(row) * expert_count + expert];
+    __syncthreads();
+
+    float local_max =
+        -INFINITY;
+    for (std::uint32_t expert = lane;
+         expert < expert_count;
+         expert += blockDim.x) {
+        local_max =
+            fmaxf(
+                local_max,
+                logits[expert]);
+    }
+    scratch[lane] = local_max;
+    __syncthreads();
+
+    for (std::uint32_t stride =
+             blockDim.x / 2U;
+         stride > 0;
+         stride >>= 1U) {
+        if (lane < stride) {
+            scratch[lane] =
+                fmaxf(
+                    scratch[lane],
+                    scratch[
+                        lane + stride]);
+        }
+        __syncthreads();
+    }
+    const float maximum =
+        scratch[0];
+    // Every wave must retain the maximum before lane zero reuses scratch[0]
+    // for its contribution to the denominator reduction.
+    __syncthreads();
+
+    float local_sum = 0.0F;
+    for (std::uint32_t expert = lane;
+         expert < expert_count;
+         expert += blockDim.x) {
+        const float probability =
+            expf(
+                logits[expert] -
+                maximum);
+        logits[expert] =
+            probability;
+        local_sum += probability;
+    }
+    scratch[lane] = local_sum;
+    __syncthreads();
+
+    for (std::uint32_t stride =
+             blockDim.x / 2U;
+         stride > 0;
+         stride >>= 1U) {
+        if (lane < stride) {
+            scratch[lane] +=
+                scratch[lane + stride];
+        }
+        __syncthreads();
+    }
+    const float denominator =
+        scratch[0];
+
+    for (std::uint32_t expert = lane;
+         expert < expert_count;
+         expert += blockDim.x) {
+        logits[expert] /=
+            denominator;
+    }
+    __syncthreads();
+
+    if (lane == 0) {
+        float best_values[32];
+        std::uint32_t best_indices[
+            32];
+
+        for (std::uint32_t slot = 0;
+             slot < top_k;
+             ++slot) {
+            best_values[slot] =
+                -INFINITY;
+            best_indices[slot] =
+                expert_count;
+        }
+
+        for (std::uint32_t expert = 0;
+             expert < expert_count;
+             ++expert) {
+            const float probability =
+                logits[expert];
+
+            for (std::uint32_t slot = 0;
+                 slot < top_k;
+                 ++slot) {
+                if (!fixture_select_better(
+                        probability,
+                        expert,
+                        best_values[slot],
+                        best_indices[slot])) {
+                    continue;
+                }
+
+                for (std::uint32_t move =
+                         top_k - 1U;
+                     move > slot;
+                     --move) {
+                    best_values[move] =
+                        best_values[
+                            move - 1U];
+                    best_indices[move] =
+                        best_indices[
+                            move - 1U];
+                }
+                best_values[slot] =
+                    probability;
+                best_indices[slot] =
+                    expert;
+                break;
+            }
+        }
+
+        float selected_sum = 0.0F;
+        for (std::uint32_t slot = 0;
+             slot < top_k;
+             ++slot) {
+            selected_sum +=
+                best_values[slot];
+        }
+        if (!normalize_selected) {
+            selected_sum = 1.0F;
+        }
+
+        const auto output_base =
+            static_cast<std::uint64_t>(
+                row) *
+            top_k;
+        for (std::uint32_t slot = 0;
+             slot < top_k;
+             ++slot) {
+            selected_indices[
+                output_base + slot] =
+                best_indices[slot];
+            selected_weights[
+                output_base + slot] =
+                best_values[slot] /
+                selected_sum;
+        }
+    }
+}
+
 void run_case(
     std::uint32_t ggml_type,
     strix::HipActivationStorage activation,
@@ -397,7 +559,7 @@ void run_case(
     bool seeded = false,
     bool nan_logits = false,
     bool exceptional_weights = false,
-    bool require_distinct_rows = false, float logit_spread = 0.0F, std::uint32_t requested_top_k = 0) {
+    bool require_distinct_rows = false, float logit_spread = 0.0F, std::uint32_t requested_top_k = 0, bool wave_only = false, unsigned injected_logits = 0) {
     auto model =
         strix::ModelContract::
             qwen38_flash_next();
@@ -542,6 +704,10 @@ void run_case(
         std::fill(hidden_float.begin(), hidden_float.end(), 0.0F);
         for (std::uint32_t row = 0; row < rows; ++row) hidden_float[static_cast<std::size_t>(row) * hidden_size] = 1.0F;
     }
+    if (injected_logits != 0) {
+        std::fill(hidden_float.begin(), hidden_float.end(), 0.0F);
+        for (std::uint32_t row = 0; row < rows; ++row) hidden_float[static_cast<std::size_t>(row)*hidden_size] = 1.0F;
+    }
     if (activation ==
         strix::HipActivationStorage::fp32) {
         check(
@@ -614,6 +780,24 @@ void run_case(
             std::fill(f32_weights.begin(), f32_weights.end(), 0.0F);
             for (std::uint32_t expert = 1; expert < experts; ++expert)
                 f32_weights[static_cast<std::size_t>(expert) * hidden_size] = -logit_spread - static_cast<float>(expert % 3U);
+        }
+        if (injected_logits != 0) {
+            expect(ggml_type == 0, "exact arbitrary-logit injection uses F32 weights");
+            std::fill(f32_weights.begin(), f32_weights.end(), 0.0F);
+            for (std::uint32_t e = 0; e < experts; ++e) {
+                float value = 0.0F;
+                switch (injected_logits) {
+                case 1: value = 0.25F; break;
+                case 2: value = e < 64U ? 1.0F : 0.0F; break;
+                case 3: value = static_cast<float>((e / 2U) % 32U); break;
+                case 4: value = e == 0 ? 0.0F : -100.0F; break;
+                case 5: value = e == 0 ? INFINITY : 0.0F; break;
+                case 6: value = -INFINITY; break;
+                case 7: value = e < 3U ? static_cast<float>(e) : -INFINITY; break;
+                default: value = e == 0 ? std::numeric_limits<float>::quiet_NaN() : 0.0F; break;
+                }
+                f32_weights[static_cast<std::size_t>(e)*hidden_size] = value;
+            }
         }
         std::vector<std::uint16_t> packed_weights;
         if (ggml_type != 0) {
@@ -779,6 +963,14 @@ void run_case(
     config.activation =
         activation;
     config.normalize_selected = normalize_selected;
+    if (wave_only) {
+        config.parallel_projection = true; config.wave_topk = true;
+        context.temporaries = step_io.temporaries;
+        const auto work = strix::resolve_execution_buffer(memory.execution_identity, arena, memory, context.temporaries.front());
+        check(hipMemset(reinterpret_cast<void*>(work.address), 0xff, work.bytes), "poison wave32 eager workspace");
+        check(hipMemset(reinterpret_cast<void*>(indices_address.address), 0xff, indices_address.bytes), "poison wave32 eager indices");
+        check(hipMemset(reinterpret_cast<void*>(weights_address.address), 0xff, weights_address.bytes), "poison wave32 eager weights");
+    }
 
     auto launcher =
         strix::make_hip_moe_route_launcher(
@@ -832,6 +1024,46 @@ void run_case(
         }
     }
 
+    if (wave_only) {
+        const auto work = strix::resolve_execution_buffer(memory.execution_identity, arena, memory, context.temporaries.front());
+        // Fresh reference destinations, and actual projection logits from the production launcher.
+        check(hipMemset(reinterpret_cast<void*>(indices_address.address), 0xff, indices_address.bytes), "poison insertion32 indices");
+        check(hipMemset(reinterpret_cast<void*>(weights_address.address), 0xff, weights_address.bytes), "poison insertion32 weights");
+        hipLaunchKernelGGL(fixture_insertion32_select_kernel, dim3(rows), dim3(256), 0, hipStreamLegacy,
+            reinterpret_cast<const float*>(work.address), experts, top_k, normalize_selected,
+            reinterpret_cast<std::uint32_t*>(indices_address.address), reinterpret_cast<float*>(weights_address.address));
+        check(hipGetLastError(), "insertion32 reference launch");
+        check(hipDeviceSynchronize(), "insertion32 reference completion");
+        std::vector<std::uint32_t> reference_indices(actual_indices.size());
+        std::vector<float> reference_weights(actual_weights.size());
+        check(hipMemcpy(reference_indices.data(), reinterpret_cast<void*>(indices_address.address), reference_indices.size()*4, hipMemcpyDeviceToHost), "read insertion32 indices");
+        check(hipMemcpy(reference_weights.data(), reinterpret_cast<void*>(weights_address.address), reference_weights.size()*4, hipMemcpyDeviceToHost), "read insertion32 weights");
+        expect(reference_indices == actual_indices && std::memcmp(reference_weights.data(), actual_weights.data(), actual_weights.size()*4)==0,
+               "wave32 eager matches independent device insertion oracle bits including NaNs");
+        hipStream_t wave_stream = nullptr; hipGraph_t wave_graph = nullptr; hipGraphExec_t wave_exec = nullptr;
+        check(hipStreamCreateWithFlags(&wave_stream, hipStreamNonBlocking), "wave32 stream");
+        strix::HipLaunchContext scope_context; scope_context.stream = wave_stream;
+        { strix::HipLaunchScope scope(scope_context);
+          check(hipStreamBeginCapture(wave_stream, hipStreamCaptureModeThreadLocal), "capture wave32");
+          launcher.function(context,launcher.user_data);
+          check(hipStreamEndCapture(wave_stream,&wave_graph), "end wave32 capture"); }
+        std::size_t nodes=0; check(hipGraphGetNodes(wave_graph,nullptr,&nodes), "wave32 graph count");
+        expect(nodes==2, "wave32 graph contains projection and selection only");
+        check(hipGraphInstantiate(&wave_exec,wave_graph,nullptr,nullptr,0), "instantiate wave32");
+        for (unsigned replay=0; replay<3; ++replay) {
+            check(hipMemsetAsync(reinterpret_cast<void*>(work.address),0xff,work.bytes,wave_stream),"poison wave32 replay workspace");
+            check(hipMemsetAsync(reinterpret_cast<void*>(indices_address.address),0xff,indices_address.bytes,wave_stream),"poison wave32 replay indices");
+            check(hipMemsetAsync(reinterpret_cast<void*>(weights_address.address),0xff,weights_address.bytes,wave_stream),"poison wave32 replay weights");
+            check(hipGraphLaunch(wave_exec,wave_stream),"wave32 replay");check(hipStreamSynchronize(wave_stream),"wave32 replay completion");
+            check(hipMemcpy(actual_indices.data(),reinterpret_cast<void*>(indices_address.address),actual_indices.size()*4,hipMemcpyDeviceToHost),"read wave32 replay indices");
+            check(hipMemcpy(actual_weights.data(),reinterpret_cast<void*>(weights_address.address),actual_weights.size()*4,hipMemcpyDeviceToHost),"read wave32 replay weights");
+            expect(reference_indices==actual_indices && std::memcmp(reference_weights.data(),actual_weights.data(),actual_weights.size()*4)==0,
+                   "poisoned wave32 captured replay matches insertion oracle bits");
+        }
+        check(hipGraphExecDestroy(wave_exec),"destroy wave32 exec");check(hipGraphDestroy(wave_graph),"destroy wave32 graph");
+        check(hipStreamDestroy(wave_stream),"destroy wave32 stream");check(hipFree(device_weights),"free wave32 weights");
+        check(hipFree(arena_pointer),"free wave32 arena");return;
+    }
     std::vector<std::uint32_t> expected_indices;
     std::vector<float> expected_weights;
 
@@ -1168,10 +1400,32 @@ void run_case(
         check(hipGraphLaunch(ranked_executable, stream), "replay ranked router graph");
         check(hipStreamSynchronize(stream), "synchronize ranked router graph"); verify_parallel();
     }
+    auto wave_config = parallel_config; wave_config.wave_topk = true;
+    auto wave_launcher = strix::make_hip_moe_route_launcher("test.moe_route.wave.parallel", &wave_config);
+    expect(wave_launcher.implementation_identity != ranked_launcher.implementation_identity &&
+               wave_launcher.implementation_identity != parallel_launcher.implementation_identity,
+           "wave top-k has its own implementation identity");
+    { strix::HipLaunchScope scope(launch_context); poison_ranked(); wave_launcher.function(context,wave_launcher.user_data); }
+    check(hipStreamSynchronize(stream),"wave eager completion");verify_parallel();
+    hipGraph_t wave_graph = nullptr; hipGraphExec_t wave_executable = nullptr;
+    { strix::HipLaunchScope scope(launch_context);
+      check(hipStreamBeginCapture(stream,hipStreamCaptureModeThreadLocal),"capture wave router");
+      wave_launcher.function(context,wave_launcher.user_data);
+      check(hipStreamEndCapture(stream,&wave_graph),"finish wave router capture"); }
+    const auto wave_functions = captured_functions(wave_graph);
+    if (old_functions.size()==2 && new_functions.size()==2 && wave_functions.size()==2)
+        expect(old_functions[0]==wave_functions[0] && old_functions[1]!=wave_functions[1] && new_functions[1]!=wave_functions[1],
+               "wave retains original projection and captures a third selection function");
+    check(hipGraphInstantiate(&wave_executable,wave_graph,nullptr,nullptr,0),"instantiate wave router");
+    for (unsigned replay=0;replay<3;++replay) {
+        poison_ranked();check(hipGraphLaunch(wave_executable,stream),"replay wave router");
+        check(hipStreamSynchronize(stream),"wave router replay completion");verify_parallel();
+    }
+    check(hipGraphExecDestroy(wave_executable),"destroy wave executable");check(hipGraphDestroy(wave_graph),"destroy wave graph");
     check(hipGraphExecDestroy(ranked_executable), "destroy ranked router executable");
     check(hipGraphDestroy(ranked_graph), "destroy ranked router graph");
     const auto expect_rejected_workspace = [&](const char* reason, const char* message) {
-        for (const auto* candidate : {&parallel_launcher, &ranked_launcher}) {
+        for (const auto* candidate : {&parallel_launcher, &ranked_launcher, &wave_launcher}) {
             bool rejected = false;
             try { candidate->function(context, candidate->user_data); }
             catch (const std::invalid_argument& error) { rejected = std::string(error.what()).find(reason) != std::string::npos; }
@@ -1379,6 +1633,29 @@ void test_catalog_and_bundle() {
     ranked_bundle.register_for_compiled_execution(ranked_compiled, ranked_launchers);
     expect_preflight_rejected(ranked_bundle, parallel_compiled, "compiled kernel binding");
     expect_preflight_rejected(parallel_bundle, ranked_compiled, "compiled kernel binding");
+    auto wave_config = parallel_config; wave_config.wave_topk = true;
+    auto wave_request = parallel_request; wave_request.wave_moe_router_topk = true;
+    strix::kernels::KernelRegistry wave_kernels;
+    strix::register_hip_moe_route_kernel_variant(model,wave_request,wave_config,wave_kernels);
+    expect(wave_kernels.variants().front().id.ends_with(".wave.parallel") &&
+           wave_kernels.variants().front().compiler_identity=="hip-gfx1151-moe-route-v6-wave-parallel",
+           "wave catalog suffix and compiler identity distinct");
+    auto wave_compiled = parallel_compiled;
+    wave_compiled.bindings = strix::bind_serial_execution_plan(model,execution,wave_kernels,wave_request);
+    strix::HipMoeRouteLauncherBundle wave_bundle(wave_config);strix::ExecutionLauncherRegistry wave_launchers;
+    wave_bundle.register_for_compiled_execution(wave_compiled,wave_launchers);
+    expect_preflight_rejected(wave_bundle,ranked_compiled,"compiled kernel binding");
+    expect_preflight_rejected(ranked_bundle,wave_compiled,"compiled kernel binding");
+    expect_preflight_rejected(wave_bundle,parallel_compiled,"compiled kernel binding");
+    for (unsigned invalid=0;invalid<3;++invalid) {
+        auto bad=wave_config;
+        if(invalid==0)bad.parallel_projection=false;
+        if(invalid==1)bad.ranked_topk=true;
+        if(invalid==2)bad.top_k=33;
+        bool rejected=false;try{(void)strix::make_hip_moe_route_launcher("bad.wave.parallel",&bad);}
+        catch(const std::invalid_argument&){rejected=true;}
+        expect(rejected,"wave config rejects missing parallel, ranked collision and K33");
+    }
     bool invalid_ranked = false;
     auto bad_ranked_config = config; bad_ranked_config.ranked_topk = true;
     try { (void)strix::make_hip_moe_route_launcher("invalid.ranked.parallel", &bad_ranked_config); }
@@ -1403,6 +1680,21 @@ int main() try {
                     run_case(0, strix::HipActivationStorage::fp32, experts, 67, 1, normalize, false, false, false, false, false, false, spread, k);
             }
 
+    // K32 is launcher-only: its independent literal device insertion oracle
+    // has32 fixture slots while every existing production kernel stays16.
+    for (const auto experts : {33U,255U,257U,500U,511U,512U})
+        for (const auto activation : {strix::HipActivationStorage::bf16,strix::HipActivationStorage::fp32})
+            for (bool normalize : {false,true})
+                for (unsigned pattern=1;pattern<=8;++pattern)
+                    run_case(0,activation,experts,67,2,normalize,false,false,false,false,false,false,0.0F,32,true,pattern);
+    // Independent oracle also exercises K1/8/10/16 and arbitrary-logit states,
+    // including owner-stride ties, underflow, infinities and partial NaN.
+    for (auto k : {1U,8U,10U,16U}) for (unsigned pattern=1;pattern<=8;++pattern)
+        run_case(0,strix::HipActivationStorage::bf16,512,67,2,true,false,false,false,false,false,false,0.0F,k,true,pattern);
+    for (const auto activation : {strix::HipActivationStorage::bf16,strix::HipActivationStorage::fp32})
+        for (auto type : {0U,1U,30U,8U}) for (bool normalize : {false,true})
+            for (auto k : {10U,32U})
+                run_case(type,activation,512,96,4,normalize,false,false,false,false,false,false,0.0F,k,true);
     test_catalog_and_bundle();
     run_case(
         0,

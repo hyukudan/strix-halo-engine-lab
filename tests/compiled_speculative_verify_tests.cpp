@@ -55,7 +55,7 @@ strix::kernels::KernelVariant make_variant(
 strix::kernels::KernelRegistry make_registry(
     const strix::ModelContract& model,
     std::uint32_t depth,
-    std::string suffix = "", bool parallel_router = false, bool ranked_router = false) {
+    std::string suffix = "", bool parallel_router = false, bool ranked_router = false, bool wave_router = false) {
     strix::kernels::KernelRegistry registry;
     const auto verify =
         strix::build_speculative_verify_plan(
@@ -96,7 +96,8 @@ strix::kernels::KernelRegistry make_registry(
         registry.add(
             make_variant(
                 "verify." + key + suffix +
-                    (step.op == strix::SerialOp::moe_route && ranked_router ? ".ranked.parallel" :
+                    (step.op == strix::SerialOp::moe_route && wave_router ? ".wave.parallel" :
+                     step.op == strix::SerialOp::moe_route && ranked_router ? ".ranked.parallel" :
                      step.op == strix::SerialOp::moe_route && parallel_router ? ".parallel" : ""),
                 *family,
                 shape));
@@ -250,6 +251,31 @@ int main() {
     try { (void)strix::compile_speculative_verify_execution(model, 4, ranked_registry, router_binding, router_buffers); }
     catch (const std::invalid_argument&) { rejected_ranked = true; }
     expect(rejected_ranked, "parallel speculative admission rejects ranked kernel");
+    auto wave_binding = router_binding; wave_binding.wave_moe_router_topk = true;
+    const auto wave_registry = make_registry(model, 4, "", true, false, true);
+    const auto wave_compiled = strix::compile_speculative_verify_execution(model, 4, wave_registry, wave_binding, router_buffers);
+    expect(wave_compiled.execution_identity != ranked_compiled.execution_identity &&
+               wave_compiled.kernel_plan_identity != ranked_compiled.kernel_plan_identity &&
+               wave_compiled.arena.total_bytes == router_compiled.arena.total_bytes,
+           "wave speculative identities change without changing arena");
+    bool rejected_wave = false;
+    try { (void)strix::compile_speculative_verify_execution(model, 4, router_registry, wave_binding, router_buffers); }
+    catch (const std::invalid_argument&) { rejected_wave = true; }
+    expect(rejected_wave, "wave speculative admission rejects parallel-only binding");
+    rejected_wave = false;
+    try { (void)strix::compile_speculative_verify_execution(model, 4, wave_registry, router_binding, router_buffers); }
+    catch (const std::invalid_argument&) { rejected_wave = true; }
+    expect(rejected_wave, "parallel speculative admission rejects wave binding");
+    auto invalid_wave = wave_binding; invalid_wave.ranked_moe_router_topk = true;
+    rejected_wave = false;
+    try { (void)strix::compile_speculative_verify_execution(model, 4, wave_registry, invalid_wave, router_buffers); }
+    catch (const std::invalid_argument&) { rejected_wave = true; }
+    expect(rejected_wave, "wave and ranked speculative modes mutually exclude");
+    invalid_wave = wave_binding; invalid_wave.parallel_moe_router = false;
+    rejected_wave = false;
+    try { (void)strix::compile_speculative_verify_execution(model, 4, wave_registry, invalid_wave, router_buffers); }
+    catch (const std::invalid_argument&) { rejected_wave = true; }
+    expect(rejected_wave, "wave speculative mode requires parallel topology");
     auto invalid_ranked = binding; invalid_ranked.ranked_moe_router_topk = true;
     rejected_ranked = false;
     try { (void)strix::compile_speculative_verify_execution(model, 4, registry, invalid_ranked, buffers); }

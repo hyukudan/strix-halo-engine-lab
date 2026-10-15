@@ -199,7 +199,7 @@ moe_experts_config(
 HipMoeRouteLauncherConfig
 moe_route_config(
     const ModelContract& model,
-    HipActivationStorage activation, bool parallel = false, bool ranked = false) {
+    HipActivationStorage activation, bool parallel = false, bool ranked = false, bool wave = false) {
     HipMoeRouteLauncherConfig config;
     config.hidden_size =
         checked_u32(
@@ -219,6 +219,7 @@ moe_route_config(
         model.norm_topk_probability;
     config.parallel_projection = parallel;
     config.ranked_topk = ranked;
+    config.wave_topk = wave;
     return config;
 }
 
@@ -240,6 +241,9 @@ void register_complete_hip_kernel_catalog(
         !error.empty()) {
         throw std::invalid_argument(error);
     }
+    if (config.wave_moe_router_topk != request.wave_moe_router_topk ||
+        (config.wave_moe_router_topk && (!config.parallel_moe_router || config.ranked_moe_router_topk)))
+        throw std::invalid_argument("HIP catalog wave router mode differs from binding request");
     if (config.ranked_moe_router_topk != request.ranked_moe_router_topk ||
         (config.ranked_moe_router_topk && !config.parallel_moe_router))
         throw std::invalid_argument("HIP catalog ranked router mode differs from binding request");
@@ -337,7 +341,7 @@ void register_complete_hip_kernel_catalog(
     const auto moe_route =
         moe_route_config(
             model,
-            config.activation, config.parallel_moe_router, config.ranked_moe_router_topk);
+            config.activation, config.parallel_moe_router, config.ranked_moe_router_topk, config.wave_moe_router_topk);
     register_hip_moe_route_kernel_variant(
         model,
         request,
@@ -412,7 +416,7 @@ HipLauncherCatalog::HipLauncherCatalog(
       moe_route_(
           moe_route_config(
               model,
-              config.activation, config.parallel_moe_router, config.ranked_moe_router_topk)),
+              config.activation, config.parallel_moe_router, config.ranked_moe_router_topk, config.wave_moe_router_topk)),
       moe_experts_(
           moe_experts_config(
               model,

@@ -1,5 +1,6 @@
 #include "strix/hip_launch_context.hpp"
 #include "strix/hip_moe_route_launcher.hpp"
+#include "strix/wave_router_contract.hpp"
 
 #include "strix/dispatch_resources.hpp"
 
@@ -21,6 +22,10 @@ namespace {
 constexpr std::uint32_t kThreads = 256;
 constexpr std::uint32_t kMaxExperts = 512;
 constexpr std::uint32_t kMaxTopK = 16;
+constexpr std::uint32_t kWaveMaxTopK = 32;
+constexpr std::uint32_t kRouterWave = 32;
+constexpr std::uint32_t kWaveCandidates = kMaxExperts / kRouterWave;
+static_assert(kWaveCandidates <= 32);
 constexpr std::uint64_t kLauncherTag =
     0x4d4f45524f555432ULL;
 constexpr std::uint64_t fnv_offset =
@@ -77,6 +82,10 @@ const char* activation_name(
 
 void validate_config(
     const HipMoeRouteLauncherConfig& config) {
+    if (config.wave_topk)
+        validate_wave_router_selection_contract(config.expert_count, config.top_k, config.parallel_projection, config.ranked_topk);
+    if (config.wave_topk && (!config.parallel_projection || config.ranked_topk))
+        throw std::invalid_argument("wave router top-k requires parallel projection and excludes ranked mode");
     if (config.ranked_topk && !config.parallel_projection)
         throw std::invalid_argument("ranked router top-k requires parallel projection");
     if (config.hidden_size == 0 ||
@@ -84,7 +93,7 @@ void validate_config(
         config.expert_count > kMaxExperts ||
         config.top_k == 0 ||
         config.top_k > config.expert_count ||
-        config.top_k > kMaxTopK) {
+        config.top_k > (config.wave_topk ? kWaveMaxTopK : kMaxTopK)) {
         throw std::invalid_argument(
             "HIP MoE route geometry is invalid");
     }
@@ -778,6 +787,154 @@ __global__ void ranked_parallel_moe_route_select_kernel(
     }
 }
 
+__global__ void wave_parallel_moe_route_select_kernel(
+    const float* workspace, std::uint32_t expert_count, std::uint32_t top_k,
+    bool normalize_selected, std::uint32_t* selected_indices, float* selected_weights) {
+    const auto row = static_cast<std::uint32_t>(blockIdx.x);
+    const auto lane = static_cast<std::uint32_t>(threadIdx.x);
+    __shared__ float logits[kMaxExperts];
+    __shared__ float scratch[kThreads];
+    __shared__ float best_values[kWaveMaxTopK];
+    __shared__ std::uint32_t best_indices[kWaveMaxTopK];
+    for (std::uint32_t expert = lane; expert < expert_count; expert += blockDim.x)
+        logits[expert] = workspace[static_cast<std::uint64_t>(row) * expert_count + expert];
+    __syncthreads();
+
+    float local_max =
+        -INFINITY;
+    for (std::uint32_t expert = lane;
+         expert < expert_count;
+         expert += blockDim.x) {
+        local_max =
+            fmaxf(
+                local_max,
+                logits[expert]);
+    }
+    scratch[lane] = local_max;
+    __syncthreads();
+
+    for (std::uint32_t stride =
+             blockDim.x / 2U;
+         stride > 0;
+         stride >>= 1U) {
+        if (lane < stride) {
+            scratch[lane] =
+                fmaxf(
+                    scratch[lane],
+                    scratch[
+                        lane + stride]);
+        }
+        __syncthreads();
+    }
+    const float maximum =
+        scratch[0];
+    // Every wave must retain the maximum before lane zero reuses scratch[0]
+    // for its contribution to the denominator reduction.
+    __syncthreads();
+
+    float local_sum = 0.0F;
+    for (std::uint32_t expert = lane;
+         expert < expert_count;
+         expert += blockDim.x) {
+        const float probability =
+            expf(
+                logits[expert] -
+                maximum);
+        logits[expert] =
+            probability;
+        local_sum += probability;
+    }
+    scratch[lane] = local_sum;
+    __syncthreads();
+
+    for (std::uint32_t stride =
+             blockDim.x / 2U;
+         stride > 0;
+         stride >>= 1U) {
+        if (lane < stride) {
+            scratch[lane] +=
+                scratch[lane + stride];
+        }
+        __syncthreads();
+    }
+    const float denominator =
+        scratch[0];
+
+    for (std::uint32_t expert = lane;
+         expert < expert_count;
+         expert += blockDim.x) {
+        logits[expert] /=
+            denominator;
+    }
+    // Publish all divided probabilities before wave zero reads other waves' stores.
+    __syncthreads();
+    if (lane < kRouterWave) {
+        float values[kWaveCandidates];
+        std::uint32_t available = 0;
+#pragma unroll
+        for (std::uint32_t i = 0; i < kWaveCandidates; ++i) {
+            const auto expert = lane + kRouterWave * i;
+            values[i] = expert < expert_count ? logits[expert] : 0.0F;
+            if (expert < expert_count && values[i] == values[i]) available |= 1U << i;
+        }
+        for (std::uint32_t slot = 0; slot < top_k; ++slot) {
+            bool has = false;
+            float best = -INFINITY;
+            std::uint32_t index = expert_count;
+#pragma unroll
+            for (std::uint32_t i = 0; i < kWaveCandidates; ++i) {
+                if ((available & (1U << i)) != 0) {
+                    const auto expert = lane + kRouterWave * i;
+                    if (!has || better(values[i], expert, best, index)) {
+                        has = true; best = values[i]; index = expert;
+                    }
+                }
+            }
+#pragma unroll
+            for (std::uint32_t mask = kRouterWave / 2U; mask > 0; mask >>= 1U) {
+                const float other = __shfl_xor(best, static_cast<int>(mask), kRouterWave);
+                const auto other_index = __shfl_xor(index, static_cast<int>(mask), kRouterWave);
+                const int other_has = __shfl_xor(static_cast<int>(has), static_cast<int>(mask), kRouterWave);
+                if (other_has != 0 && (!has || better(other, other_index, best, index))) {
+                    has = true; best = other; index = other_index;
+                }
+            }
+            if (lane == 0) { best_values[slot] = has ? best : -INFINITY; best_indices[slot] = has ? index : expert_count; }
+            if (has && index % kRouterWave == lane) available &= ~(1U << (index / kRouterWave));
+        }
+    }
+    // All eight waves participate; no early return may bypass this barrier.
+    __syncthreads();
+    if (lane == 0) {
+        float selected_sum = 0.0F;
+        for (std::uint32_t slot = 0;
+             slot < top_k;
+             ++slot) {
+            selected_sum +=
+                best_values[slot];
+        }
+        if (!normalize_selected) {
+            selected_sum = 1.0F;
+        }
+
+        const auto output_base =
+            static_cast<std::uint64_t>(
+                row) *
+            top_k;
+        for (std::uint32_t slot = 0;
+             slot < top_k;
+             ++slot) {
+            selected_indices[
+                output_base + slot] =
+                best_indices[slot];
+            selected_weights[
+                output_base + slot] =
+                best_values[slot] /
+                selected_sum;
+        }
+    }
+}
+
 std::uint64_t required_router_weight_bytes(
     RouterWeightKind kind,
     std::uint32_t hidden_size,
@@ -876,7 +1033,12 @@ void launch_typed(
         reinterpret_cast<const Activation*>(hidden.address), reinterpret_cast<const void*>(weight.address),
         config.hidden_size, config.expert_count, reinterpret_cast<float*>(workspace.address));
     check_hip(hipGetLastError(), "HIP parallel MoE route logits launch");
-    if (config.ranked_topk) {
+    if (config.wave_topk) {
+        hipLaunchKernelGGL(wave_parallel_moe_route_select_kernel, dim3(context.logical_rows), dim3(kThreads),
+            0, hip_execution_stream(), reinterpret_cast<const float*>(workspace.address),
+            config.expert_count, config.top_k, config.normalize_selected,
+            reinterpret_cast<std::uint32_t*>(indices.address), reinterpret_cast<float*>(weights.address));
+    } else if (config.ranked_topk) {
         hipLaunchKernelGGL(ranked_parallel_moe_route_select_kernel, dim3(context.logical_rows), dim3(kThreads),
             0, hip_execution_stream(), reinterpret_cast<const float*>(workspace.address),
             config.expert_count, config.top_k, config.normalize_selected,
@@ -1001,6 +1163,7 @@ void launch_moe_route(
             "HIP MoE route requires model manifest resources");
     }
 
+    if (config.wave_topk) validate_wave_router_manifest(*context.resources->model_manifest);
     const auto tensor_index =
         access.tensor_indices.front();
     if (tensor_index >=
@@ -1035,6 +1198,11 @@ void launch_moe_route(
             "HIP MoE route requires resident or repacked GPU-visible router weights");
     }
 
+    if (config.wave_topk && (runtime_tensor.address % 16U != 0 ||
+        (runtime_tensor.storage == RuntimeTensorStorage::registered_file_mapped && manifest_tensor.absolute_offset % 16U != 0) ||
+        hidden.address % (config.activation == HipActivationStorage::bf16 ? 2U : 4U) != 0 ||
+        indices.address % 4U != 0 || route_weights.address % 4U != 0))
+        throw std::invalid_argument("wave router requires aligned runtime inputs and outputs");
     const auto kind =
         weight_kind(
             manifest_tensor.ggml_type);
@@ -1129,7 +1297,7 @@ std::string route_kernel_id(
             request.logical_rows) +
         ".c" +
         std::to_string(
-            request.request_concurrency) + (config.ranked_topk ? ".ranked.parallel" :
+            request.request_concurrency) + (config.wave_topk ? ".wave.parallel" : config.ranked_topk ? ".ranked.parallel" :
             config.parallel_projection ? ".parallel" : "");
 }
 
@@ -1151,6 +1319,7 @@ std::uint64_t launcher_identity(
             : 0ULL);
     if (config.parallel_projection) hash_u64(hash, 0x524f555445525057ULL);
     if (config.ranked_topk) hash_u64(hash, 0x52414e4b544f504bULL);
+    if (config.wave_topk) hash_u64(hash, 0x57415645544f504bULL);
     return hash;
 }
 
@@ -1168,6 +1337,8 @@ void register_hip_moe_route_kernel_variant(
             error);
     }
     validate_config(config);
+    if (config.wave_topk != request.wave_moe_router_topk)
+        throw std::invalid_argument("wave router variant mode differs from binding request");
     if (config.ranked_topk != request.ranked_moe_router_topk)
         throw std::invalid_argument("ranked router variant mode differs from binding request");
     if (config.parallel_projection != request.parallel_moe_router)
@@ -1233,7 +1404,7 @@ void register_hip_moe_route_kernel_variant(
         "row-major+ggml-router";
     variant.output_layout =
         "topk-indices+fp32-weights";
-    variant.compiler_identity = config.ranked_topk ? "hip-gfx1151-moe-route-v5-ranked-parallel" : config.parallel_projection
+    variant.compiler_identity = config.wave_topk ? "hip-gfx1151-moe-route-v6-wave-parallel" : config.ranked_topk ? "hip-gfx1151-moe-route-v5-ranked-parallel" : config.parallel_projection
         ? "hip-gfx1151-moe-route-v4-parallel" : "hip-gfx1151-moe-route-v2";
     variant.measured_seconds = 0.0;
 
@@ -1282,7 +1453,8 @@ register_for_compiled_execution(
         const auto& io = compiled.io.steps[index];
         if (!binding.kernel_id.has_value() ||
             (binding.kernel_id->ends_with(".parallel") != config_.parallel_projection ||
-             binding.kernel_id->ends_with(".ranked.parallel") != config_.ranked_topk))
+             binding.kernel_id->ends_with(".ranked.parallel") != config_.ranked_topk ||
+             binding.kernel_id->ends_with(".wave.parallel") != config_.wave_topk))
             throw std::invalid_argument("router launcher mode differs from compiled kernel binding");
         if (io.step_id != compiled.execution.steps[index].id || io.op != SerialOp::moe_route ||
             io.temporaries.size() != (config_.parallel_projection ? 1U : 0U) ||

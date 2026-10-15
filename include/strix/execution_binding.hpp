@@ -21,6 +21,7 @@ struct ExecutionBindingRequest {
     bool device_graph_inputs = false;
     bool parallel_moe_router = false;
     bool ranked_moe_router_topk = false;
+    bool wave_moe_router_topk = false;
     bool q4k_a8g32_gate_up = false;
     bool grouped_exact_q51_down = false;
 };

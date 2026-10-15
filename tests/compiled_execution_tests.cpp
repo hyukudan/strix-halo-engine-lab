@@ -87,7 +87,8 @@ strix::kernels::KernelRegistry make_registry(
         registry.add(
             make_variant(
                 "test." + key + suffix +
-                    (step.op == strix::SerialOp::moe_route && request.ranked_moe_router_topk ? ".ranked.parallel" :
+                    (step.op == strix::SerialOp::moe_route && request.wave_moe_router_topk ? ".wave.parallel" :
+                     step.op == strix::SerialOp::moe_route && request.ranked_moe_router_topk ? ".ranked.parallel" :
                      step.op == strix::SerialOp::moe_route && request.parallel_moe_router ? ".parallel" : "") +
                     (step.op == strix::SerialOp::moe_experts && request.grouped_exact_q51_down ? ".grouped-exact-q51-down-v1" : "") +
                     (step.op == strix::SerialOp::moe_experts && request.q4k_a8g32_gate_up ? ".q4k-a8g32-gateup-v2" : ""),
@@ -564,6 +565,20 @@ int main() {
     };
     expect(rejects_ranked(router_registry, ranked_binding, router_buffers), "ranked admission rejects parallel-only kernel");
     expect(rejects_ranked(ranked_registry, router_binding, router_buffers), "parallel-only admission rejects ranked kernel");
+    auto wave_binding = router_binding; wave_binding.wave_moe_router_topk = true;
+    const auto wave_registry = make_registry(model, wave_binding);
+    const auto wave_compiled = strix::compile_serial_execution(model, wave_registry, wave_binding, router_buffers);
+    expect(wave_compiled.execution_identity != ranked_compiled.execution_identity &&
+               wave_compiled.kernel_plan_identity != ranked_compiled.kernel_plan_identity &&
+               wave_compiled.arena.total_bytes == router_compiled.arena.total_bytes,
+           "wave router identities differ with unchanged arena");
+    expect(rejects_ranked(router_registry, wave_binding, router_buffers), "wave admission rejects parallel-only binding");
+    expect(rejects_ranked(wave_registry, router_binding, router_buffers), "parallel admission rejects wave binding");
+    expect(rejects_ranked(ranked_registry, wave_binding, router_buffers), "wave admission rejects ranked binding");
+    auto invalid_wave = wave_binding; invalid_wave.ranked_moe_router_topk = true;
+    expect(rejects_ranked(wave_registry, invalid_wave, router_buffers), "wave and ranked mutually exclude");
+    invalid_wave = wave_binding; invalid_wave.parallel_moe_router = false;
+    expect(rejects_ranked(wave_registry, invalid_wave, router_buffers), "wave requires parallel topology");
     auto invalid_ranked = binding_request; invalid_ranked.ranked_moe_router_topk = true;
     expect(rejects_ranked(registry, invalid_ranked, buffer_request), "ranked router rejects missing parallel topology");
     router_binding.parallel_moe_router = false;
