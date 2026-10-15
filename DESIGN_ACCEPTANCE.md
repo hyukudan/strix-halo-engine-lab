@@ -26,3 +26,12 @@ D-016 / E-051: deferred eager MoE status remains an opt-in experiment. See
 portable tests do not qualify native HIP execution, linked arithmetic identity,
 model arrays/token publication or complete-workload latency. Those gates must
 pass before adoption; first-error merge and host-exception precedence are explicit.
+
+## Default-off spec v1 draft integration
+
+D-015 through D-020 / E-050 through E-055 are combined in a reversible draft.
+The [integration record](docs/implementation-2026-10-15-spec-v1-draft-integration.md)
+records observed host checks and pending combined review, native compiler/ISA,
+GPU fixtures, model fidelity and paired timing. All decoder flags remain OFF;
+the HC projection prototype remains diagnostic only. Host evidence does not close
+these native or performance gates.

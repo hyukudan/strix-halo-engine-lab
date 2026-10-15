@@ -1,3 +1,4 @@
+#include "strix/lane_chain_hyper_output.hpp"
 #include "strix/compiled_execution.hpp"
 #include "strix/execution_binding.hpp"
 #include "strix/execution_plan.hpp"

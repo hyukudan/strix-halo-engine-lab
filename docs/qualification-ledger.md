@@ -23,6 +23,8 @@ portable fixtures, declarations or offline compilation to native qualification.
 | Q8 indexed-attention input prefetch | Default-off per-matrix eligibility, mixed-layer IDs, host planning tests, actual-dispatch receipts, poisoned standalone/full-operator fixtures and zero-node failure checks | Linked legacy ISA stability, candidate ISA/descriptors, execution of the new native fixtures, full-model exactness and measured workload benefit |
 | Projection reduction | Fixed-tree shuffle-tail candidate, host sensitivity controls and experimental operator HIP graph replay | Native exact fixtures and end-to-end quality/performance; no measured gain yet |
 | Campaign preparation and capture | Private full-kernel/module staging, guarded observations, imported-pool reuse and paired commissioning, eager/graph/integer RAW recording and actual same-plan prefix restoration with full-state/lineage import checks | Reviewed target boot/configuration, actual paired transfers, observed tokenizer/source bindings and independent model references; schedule completion does not prove physical DMA overlap |
+| Lane-chain HC output | Experimental opt-in, pure metadata admission and per-step base fallback, exact ordered-chain source and poison/graph fixtures; see [implementation](implementation-2026-10-15-lane-chain-hyper-output.md) | Source review, HIP/ISA, device fixtures, complete-logit identity and paired workload measurements remain open |
+| Q8 shared-expert gate/up/down prefetch | Default-off per-tensor/layer selection, distinct IDs, original device definitions preserved, limited host planning tests, standalone and full-operator poison/graph fixtures, actual host submission count | Native HIP compilation, linked legacy ISA and candidate FP/arithmetic/resource descriptors, new device fixture execution, full-model exactness, paired complete-workload benefit |
 | Exact HC projection prototype | Diagnostic-only OPW8/16/32 with P1/P2, original payloads, ordered chains and same-input poison/event fixtures | Source review, actual HIP/ISA no-spill/scalar-load checks, device exactness and real captured-input microbench; no decoder integration yet |
 
 The latest completed strict Release integration passed 143 portable CTest entries.
@@ -52,8 +54,11 @@ See [the portable implementation slice](implementation-2026-10-11.md),
 [reusable execution components](implementation-2026-10-12-execution-components.md),
 [low-precision lab](../lab/low_precision/README.md) and the architecture guides.
 
-| Lane-chain HC output | Experimental opt-in, pure metadata admission and per-step base fallback, exact ordered-chain source and poison/graph fixtures; see [implementation](implementation-2026-10-15-lane-chain-hyper-output.md) | Source review, HIP/ISA, device fixtures, complete-logit identity and paired workload measurements remain open |
-
-| Increment | Implemented evidence | Remaining gates |
-| --- | --- | --- |
-| Q8 shared-expert gate/up/down prefetch | Default-off per-tensor/layer selection, distinct IDs, original device definitions preserved, limited host planning tests, standalone and full-operator poison/graph fixtures, actual host submission count | Native HIP compilation, linked legacy ISA and candidate FP/arithmetic/resource descriptors, new device fixture execution, full-model exactness, paired complete-workload benefit |
+Draft integration check (2026-10-15): the combined default-off source passed a
+fresh GNU 13.3/WSL Release HIP-OFF build with warnings as errors and 157/157 portable
+CTest entries. This includes combined mixed-mode selection, base identity and
+deferred graph rejection. Host syntax checks with private HIP declarations passed;
+these do not establish native HIP compilation or execution. See
+[the draft integration record](implementation-2026-10-15-spec-v1-draft-integration.md).
+Combined review, actual native ISA/fixtures, model fidelity and paired timing remain
+pending; earlier historical checks above retain their original scope.

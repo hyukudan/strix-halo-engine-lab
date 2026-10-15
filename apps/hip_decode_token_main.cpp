@@ -1007,7 +1007,7 @@ int main(
     }
     if(options.virtual_q8_gdn_output) strix::validate_virtual_q8_gdn_output_manifest(model,manifest);
     const std::string lane_chain_mode_receipt=
-        "  \"lane_chain_hyper_output\": " + (options.lane_chain_hyper_output ? "true" : "false") + ",\n" +
+        std::string("  \"lane_chain_hyper_output\": ") + (options.lane_chain_hyper_output ? "true" : "false") + ",\n" +
         "  \"lane_chain_hyper_output_eligible_steps\": " + std::to_string(lane_chain_steps.size()) + ",\n" +
         "  \"lane_chain_hyper_output_fallback_steps\": " + std::to_string(options.lane_chain_hyper_output ? lane_chain_total-lane_chain_steps.size() : 0U) + ",\n";
     const auto qsa_prefetch_plan=options.prefetch_q8_qsa_input ? strix::qsa_input_prefetch::build_plan(model,manifest) : strix::qsa_input_prefetch::Plan{};

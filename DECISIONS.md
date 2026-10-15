@@ -78,9 +78,11 @@ qualification without replacing the existing path. Risk: source equivalence does
 not establish compiler behavior or complete-workload benefit. Spec consequence:
 require explicit per-tensor eligibility, topology/dispatch receipts and all native
 gates before adoption. Evidence: E-052. Reopening conditions are the gates above.
+
 ## D-018
 
 Preserve each original HC gate chain, coefficient rounding, sigmoid and stream order while assigning independent chains to lanes. Keep normalization/projection/injection kernels untouched. Stage original Q8 bytes without repacking, use explicit metadata-selected base fallback, and bound dynamic LDS to64KiB. Rank320 bank permutation is documented narrowly; other admitted ranks are not presumed conflict free. Reject speculative selection for this serial decode slice. Alternatives that split the reduction or alter rounding are outside this exact optimization. Reopen after actual ISA/resource checks and bitwise complete-model evidence, or reject the candidate if any arithmetic mismatch appears.
+
 D-016 follow-up: alternatives are the synchronous per-layer status boundary or
 an opt-in token completion boundary with transactional host histories. The latter
 keeps the complete first error through one shared host/device merge helper.
@@ -91,6 +93,7 @@ A zero-on-construction/dirty-state optimization needs owner recovery injection
 coverage before changing lifecycle semantics. Evidence: E-051. Reopen after
 native compiler/ISA, bounded async fixtures, model fidelity and paired workload
 measurements; see `DESIGN_ACCEPTANCE.md` and `docs/deferred-moe-status.md`.
+
 ## D-019 (2026-10-15): explicit Q8 shared-expert loading experiment
 
 Choose a default-off gate/up/down loading schedule with unchanged T256 leaves,
