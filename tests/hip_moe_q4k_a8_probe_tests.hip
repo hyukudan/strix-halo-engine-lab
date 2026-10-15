@@ -91,7 +91,7 @@ void conversion_receipts(const strix::HipSetupQuiescenceGuard& guard) {
     guard.run([&]{da.upload(a.data());db.upload(b.data());result.poison();enqueue_division_probe(
         static_cast<unsigned*>(da.data()),static_cast<unsigned*>(db.data()),static_cast<unsigned*>(result.data()),static_cast<unsigned>(a.size()));});
     const auto divided=result.read<unsigned>();
-    for(unsigned i=0;i<a.size();++i) expect(divided[i]==q4k_a8_oracle::divide(a[i],b[i]),"OCML RN division independent integer oracle");
+    for(unsigned i=0;i<a.size();++i) expect(divided[i]==q4k_a8_oracle::divide(a[i],b[i]),"compiler RN division independent integer oracle");
     result.guards();
 }
 void projection_case(unsigned hidden,unsigned rows,unsigned top_k,bool bf16,unsigned special,const strix::HipSetupQuiescenceGuard& guard) {
