@@ -31,6 +31,7 @@ bind_speculative_verify_plan(
     shape_request.request_concurrency =
         request.request_concurrency;
     shape_request.parallel_moe_router = request.parallel_moe_router;
+    shape_request.ranked_moe_router_topk = request.ranked_moe_router_topk;
     shape_request.require_graph_safe =
         request.require_graph_safe;
     shape_request.minimum_qualification =

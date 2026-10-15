@@ -185,6 +185,8 @@ compile_speculative_verify_execution(
             "verify buffer logical rows must equal candidate depth");
     }
 
+    if (binding_request.ranked_moe_router_topk && !binding_request.parallel_moe_router)
+        throw std::invalid_argument("ranked router requires parallel router topology");
     if (binding_request.parallel_moe_router != buffer_request.parallel_moe_router)
         throw std::invalid_argument("router kernel request differs from buffer admission");
 
@@ -219,7 +221,8 @@ compile_speculative_verify_execution(
 
     for (const auto& binding : compiled.bindings.bindings) {
         if (binding.op == SerialOp::moe_route && binding.kernel_id.has_value() &&
-            binding.kernel_id->ends_with(".parallel") != buffer_request.parallel_moe_router)
+            (binding.kernel_id->ends_with(".parallel") != buffer_request.parallel_moe_router ||
+             binding.kernel_id->ends_with(".ranked.parallel") != binding_request.ranked_moe_router_topk))
             throw std::invalid_argument("bound router kernel differs from admitted topology");
     }
 

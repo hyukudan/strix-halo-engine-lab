@@ -55,7 +55,7 @@ strix::kernels::KernelVariant make_variant(
 strix::kernels::KernelRegistry make_registry(
     const strix::ModelContract& model,
     std::uint32_t depth,
-    std::string suffix = "", bool parallel_router = false) {
+    std::string suffix = "", bool parallel_router = false, bool ranked_router = false) {
     strix::kernels::KernelRegistry registry;
     const auto verify =
         strix::build_speculative_verify_plan(
@@ -96,7 +96,8 @@ strix::kernels::KernelRegistry make_registry(
         registry.add(
             make_variant(
                 "verify." + key + suffix +
-                    (step.op == strix::SerialOp::moe_route && parallel_router ? ".parallel" : ""),
+                    (step.op == strix::SerialOp::moe_route && ranked_router ? ".ranked.parallel" :
+                     step.op == strix::SerialOp::moe_route && parallel_router ? ".parallel" : ""),
                 *family,
                 shape));
     }
@@ -234,6 +235,26 @@ int main() {
                                       router_registry, binding, buffers)); }
     catch (const std::invalid_argument&) { router_mismatch = true; }
     expect(router_mismatch, "verify compilation rejects parallel router under default admission");
+    auto ranked_binding = router_binding; ranked_binding.ranked_moe_router_topk = true;
+    const auto ranked_registry = make_registry(model, 4, "", true, true);
+    const auto ranked_compiled = strix::compile_speculative_verify_execution(model, 4, ranked_registry, ranked_binding, router_buffers);
+    expect(ranked_compiled.execution_identity != router_compiled.execution_identity &&
+               ranked_compiled.kernel_plan_identity != router_compiled.kernel_plan_identity &&
+               ranked_compiled.arena.total_bytes == router_compiled.arena.total_bytes,
+           "ranked speculative binding changes identities with unchanged arena");
+    bool rejected_ranked = false;
+    try { (void)strix::compile_speculative_verify_execution(model, 4, router_registry, ranked_binding, router_buffers); }
+    catch (const std::invalid_argument&) { rejected_ranked = true; }
+    expect(rejected_ranked, "ranked speculative admission rejects parallel-only kernel");
+    rejected_ranked = false;
+    try { (void)strix::compile_speculative_verify_execution(model, 4, ranked_registry, router_binding, router_buffers); }
+    catch (const std::invalid_argument&) { rejected_ranked = true; }
+    expect(rejected_ranked, "parallel speculative admission rejects ranked kernel");
+    auto invalid_ranked = binding; invalid_ranked.ranked_moe_router_topk = true;
+    rejected_ranked = false;
+    try { (void)strix::compile_speculative_verify_execution(model, 4, registry, invalid_ranked, buffers); }
+    catch (const std::invalid_argument&) { rejected_ranked = true; }
+    expect(rejected_ranked, "ranked speculative mode requires parallel topology");
     router_binding.parallel_moe_router = false;
     router_buffers.parallel_moe_router = false;
     const auto explicit_default = strix::compile_speculative_verify_execution(model, 4,

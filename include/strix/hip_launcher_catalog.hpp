@@ -27,6 +27,7 @@ struct HipLauncherCatalogConfig {
     bool virtual_q8_lm_head = false;
     bool parallel_moe_router = false;
     bool virtual_q8_gdn_input = false;
+    bool ranked_moe_router_topk = false;
 };
 
 void register_complete_hip_kernel_catalog(

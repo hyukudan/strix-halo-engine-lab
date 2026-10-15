@@ -15,6 +15,7 @@ struct SpeculativeVerifyBindingRequest {
     kernels::QualificationStatus minimum_qualification =
         kernels::QualificationStatus::oracle_matched;
     bool parallel_moe_router = false;
+    bool ranked_moe_router_topk = false;
 };
 
 [[nodiscard]] ExecutionBindingPlan

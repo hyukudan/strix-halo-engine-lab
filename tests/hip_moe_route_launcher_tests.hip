@@ -397,11 +397,12 @@ void run_case(
     bool seeded = false,
     bool nan_logits = false,
     bool exceptional_weights = false,
-    bool require_distinct_rows = false) {
+    bool require_distinct_rows = false, float logit_spread = 0.0F, std::uint32_t requested_top_k = 0) {
     auto model =
         strix::ModelContract::
             qwen38_flash_next();
     model.num_experts = expert_count;
+    if (requested_top_k != 0) model.num_experts_per_token = requested_top_k;
     model.hidden_size = width;
     const auto hidden_size =
         static_cast<std::uint32_t>(
@@ -537,6 +538,10 @@ void run_case(
         for (std::uint32_t row = 0; row < rows; ++row)
             hidden_float[static_cast<std::size_t>(row) * hidden_size] = std::numeric_limits<float>::quiet_NaN();
 
+    if (logit_spread != 0.0F) {
+        std::fill(hidden_float.begin(), hidden_float.end(), 0.0F);
+        for (std::uint32_t row = 0; row < rows; ++row) hidden_float[static_cast<std::size_t>(row) * hidden_size] = 1.0F;
+    }
     if (activation ==
         strix::HipActivationStorage::fp32) {
         check(
@@ -603,6 +608,12 @@ void run_case(
             expect(ggml_type == 0, "mixed-exponent fixture uses F32 router weights");
             for (std::size_t index = 0; index < f32_weights.size(); ++index)
                 f32_weights[index] = mixed_value(index, true);
+        }
+        if (logit_spread != 0.0F) {
+            expect(ggml_type == 0, "spread fixture uses F32 weights");
+            std::fill(f32_weights.begin(), f32_weights.end(), 0.0F);
+            for (std::uint32_t expert = 1; expert < experts; ++expert)
+                f32_weights[static_cast<std::size_t>(expert) * hidden_size] = -logit_spread - static_cast<float>(expert % 3U);
         }
         std::vector<std::uint16_t> packed_weights;
         if (ggml_type != 0) {
@@ -949,8 +960,10 @@ void run_case(
         }
     }
 
+    // FMA normal-chain qualification does not establish exp's subnormal policy.
+    // Spread fixtures use actual legacy-device outputs, including any FTZ ties.
     const bool route_cpu_qualified = nan_logits || exceptional_weights ||
-        std::all_of(cpu_oracle_normal_chain.begin(), cpu_oracle_normal_chain.end(), [](bool value) { return value; });
+        (logit_spread == 0.0F && std::all_of(cpu_oracle_normal_chain.begin(), cpu_oracle_normal_chain.end(), [](bool value) { return value; }));
     if (route_cpu_qualified) expect(
         actual_indices ==
             expected_indices,
@@ -959,6 +972,16 @@ void run_case(
     if (!nan_logits && !exceptional_weights)
         expect(std::all_of(actual_weights.begin(), actual_weights.end(), [](float value) { return std::isfinite(value); }),
                "finite route fixture produces finite selected weights");
+    if (logit_spread != 0.0F && top_k > 1U) {
+        for (std::uint32_t row = 0; row < rows; ++row) {
+            for (std::uint32_t slot = 1; slot < top_k; ++slot) {
+                const auto value = actual_weights[static_cast<std::size_t>(row) * top_k + slot];
+                expect(value == 0.0F || std::fpclassify(value) == FP_SUBNORMAL,
+                       "spread fixture reaches actual subnormal-or-zero selected tails");
+                if (logit_spread >= 120.0F) expect(value == 0.0F, "wide spread reaches underflow-zero index ties");
+            }
+        }
+    }
     if (nan_logits || exceptional_weights)
         expect(std::all_of(actual_weights.begin(), actual_weights.end(),
                            [=](float value) { return normalize_selected ? std::isnan(value) : value == -INFINITY; }),
@@ -1089,11 +1112,71 @@ void run_case(
         check(hipStreamSynchronize(stream), "synchronize parallel router graph");
         verify_parallel();
     }
+    auto ranked_config = parallel_config;
+    ranked_config.ranked_topk = true;
+    auto ranked_launcher = strix::make_hip_moe_route_launcher("test.moe_route.ranked.parallel", &ranked_config);
+    expect(ranked_launcher.implementation_identity != parallel_launcher.implementation_identity,
+           "ranked selection has a distinct implementation identity");
+    const auto poison_ranked = [&] {
+        check(hipMemsetAsync(reinterpret_cast<void*>(workspace_address.address), 0xff, workspace_address.bytes, stream), "poison ranked workspace");
+        check(hipMemsetAsync(reinterpret_cast<void*>(indices_address.address), 0xff, actual_indices.size() * sizeof(std::uint32_t), stream), "poison ranked indices");
+        check(hipMemsetAsync(reinterpret_cast<void*>(weights_address.address), 0xff, actual_weights.size() * sizeof(float), stream), "poison ranked weights");
+    };
+    {
+        strix::HipLaunchScope scope(launch_context);
+        poison_ranked();
+        ranked_launcher.function(context, ranked_launcher.user_data);
+    }
+    check(hipStreamSynchronize(stream), "synchronize ranked eager router"); verify_parallel();
+    hipGraph_t ranked_graph = nullptr; hipGraphExec_t ranked_executable = nullptr;
+    {
+        strix::HipLaunchScope scope(launch_context);
+        check(hipStreamBeginCapture(stream, hipStreamCaptureModeThreadLocal), "capture ranked router");
+        ranked_launcher.function(context, ranked_launcher.user_data);
+        check(hipStreamEndCapture(stream, &ranked_graph), "finish ranked router capture");
+    }
+    const auto captured_functions = [&](hipGraph_t captured) {
+        std::size_t count = 0; check(hipGraphGetNodes(captured, nullptr, &count), "count captured router nodes");
+        expect(count == 2U, "router capture contains exactly logits and selection nodes");
+        std::vector<hipGraphNode_t> nodes(count);
+        check(hipGraphGetNodes(captured, nodes.data(), &count), "read captured router nodes");
+        std::vector<void*> functions;
+        for (const auto node : nodes) {
+            std::size_t dependencies = 0;
+            check(hipGraphNodeGetDependencies(node, nullptr, &dependencies), "read router node dependencies");
+            hipGraphNodeType type; check(hipGraphNodeGetType(node, &type), "read router node type");
+            expect(type == hipGraphNodeTypeKernel, "each captured router node is a kernel");
+            if (type != hipGraphNodeTypeKernel) continue;
+            hipKernelNodeParams params{}; check(hipGraphKernelNodeGetParams(node, &params), "read captured router kernel function");
+            if (dependencies == 0U) functions.insert(functions.begin(), params.func);
+            else functions.push_back(params.func);
+        }
+        return functions;
+    };
+    const auto old_functions = captured_functions(graph), new_functions = captured_functions(ranked_graph);
+    unsigned shared_functions = 0;
+    for (const auto function : old_functions)
+        shared_functions += std::find(new_functions.begin(), new_functions.end(), function) != new_functions.end() ? 1U : 0U;
+    expect(old_functions.size() == 2U && new_functions.size() == 2U && shared_functions == 1U,
+           "captures retain the identical projection function and a distinct selection function");
+    if (old_functions.size() == 2U && new_functions.size() == 2U)
+        expect(old_functions[0] == new_functions[0] && old_functions[1] != new_functions[1],
+               "actual capture root projection is common and dependent selection function differs");
+    check(hipGraphInstantiate(&ranked_executable, ranked_graph, nullptr, nullptr, 0), "instantiate ranked router graph");
+    for (unsigned replay = 0; replay < 3; ++replay) {
+        poison_ranked();
+        check(hipGraphLaunch(ranked_executable, stream), "replay ranked router graph");
+        check(hipStreamSynchronize(stream), "synchronize ranked router graph"); verify_parallel();
+    }
+    check(hipGraphExecDestroy(ranked_executable), "destroy ranked router executable");
+    check(hipGraphDestroy(ranked_graph), "destroy ranked router graph");
     const auto expect_rejected_workspace = [&](const char* reason, const char* message) {
-        bool rejected = false;
-        try { parallel_launcher.function(context, parallel_launcher.user_data); }
-        catch (const std::invalid_argument& error) { rejected = std::string(error.what()).find(reason) != std::string::npos; }
-        expect(rejected, message);
+        for (const auto* candidate : {&parallel_launcher, &ranked_launcher}) {
+            bool rejected = false;
+            try { candidate->function(context, candidate->user_data); }
+            catch (const std::invalid_argument& error) { rejected = std::string(error.what()).find(reason) != std::string::npos; }
+            expect(rejected, message);
+        }
     };
     bool default_extra_rejected = false;
     try { launcher.function(context, launcher.user_data); }
@@ -1169,6 +1252,10 @@ void test_catalog_and_bundle() {
     config.activation =
         strix::HipActivationStorage::bf16;
 
+    const auto default_receipt = strix::make_hip_moe_route_launcher("receipt.default", &config);
+    expect(default_receipt.implementation_identity == 15352140532421398971ULL,
+           "default router retains the fixed implementation receipt");
+
     strix::kernels::KernelRegistry kernels;
     strix::register_hip_moe_route_kernel_variant(
         model,
@@ -1177,6 +1264,9 @@ void test_catalog_and_bundle() {
         kernels);
     auto parallel_config = config;
     parallel_config.parallel_projection = true;
+    const auto parallel_receipt = strix::make_hip_moe_route_launcher("receipt.parallel", &parallel_config);
+    expect(parallel_receipt.implementation_identity == 5065166250755998983ULL,
+           "parallel-only router retains the fixed implementation receipt");
     auto parallel_request = request;
     parallel_request.parallel_moe_router = true;
     strix::kernels::KernelRegistry parallel_kernels;
@@ -1273,6 +1363,27 @@ void test_catalog_and_bundle() {
     auto corrupt = parallel_compiled;
     corrupt.bindings = compiled.bindings;
     expect_preflight_rejected(parallel_bundle, corrupt, "compiled kernel binding");
+    auto ranked_config = parallel_config; ranked_config.ranked_topk = true;
+    auto ranked_request = parallel_request; ranked_request.ranked_moe_router_topk = true;
+    strix::kernels::KernelRegistry ranked_kernels;
+    strix::register_hip_moe_route_kernel_variant(model, ranked_request, ranked_config, ranked_kernels);
+    const auto& ranked_variant = ranked_kernels.variants().front();
+    expect(ranked_variant.id.ends_with(".ranked.parallel") &&
+               ranked_variant.compiler_identity == "hip-gfx1151-moe-route-v5-ranked-parallel" &&
+               ranked_variant.resources.lds_bytes == parallel_variant.resources.lds_bytes,
+           "ranked catalog distinguishes identity within the unchanged resource maximum");
+    auto ranked_compiled = parallel_compiled;
+    ranked_compiled.bindings = strix::bind_serial_execution_plan(model, execution, ranked_kernels, ranked_request);
+    strix::HipMoeRouteLauncherBundle ranked_bundle(ranked_config);
+    strix::ExecutionLauncherRegistry ranked_launchers;
+    ranked_bundle.register_for_compiled_execution(ranked_compiled, ranked_launchers);
+    expect_preflight_rejected(ranked_bundle, parallel_compiled, "compiled kernel binding");
+    expect_preflight_rejected(parallel_bundle, ranked_compiled, "compiled kernel binding");
+    bool invalid_ranked = false;
+    auto bad_ranked_config = config; bad_ranked_config.ranked_topk = true;
+    try { (void)strix::make_hip_moe_route_launcher("invalid.ranked.parallel", &bad_ranked_config); }
+    catch (const std::invalid_argument&) { invalid_ranked = true; }
+    expect(invalid_ranked, "ranked launcher requires parallel projection");
     corrupt = parallel_compiled;
     for (auto& io : corrupt.io.steps) if (io.op == strix::SerialOp::moe_route) io.temporaries.clear();
     expect_preflight_rejected(parallel_bundle, corrupt, "compiled temporary IO");
@@ -1283,6 +1394,15 @@ void test_catalog_and_bundle() {
 
 int main() try {
     qualify_fixture_denormal_scope();
+    for (const auto experts : {1U, 31U, 255U, 256U, 257U, 511U, 512U})
+        for (const auto k : {1U, std::min(experts, 16U)})
+            for (const bool normalize : {false, true}) {
+                run_case(0, strix::HipActivationStorage::fp32, experts, 67, 1, normalize, true, false, false, false, false, false, 0.0F, k);
+                run_case(0, strix::HipActivationStorage::fp32, experts, 67, 1, normalize, false, false, false, true, false, false, 0.0F, k);
+                for (const float spread : {90.0F, 100.0F, 120.0F})
+                    run_case(0, strix::HipActivationStorage::fp32, experts, 67, 1, normalize, false, false, false, false, false, false, spread, k);
+            }
+
     test_catalog_and_bundle();
     run_case(
         0,

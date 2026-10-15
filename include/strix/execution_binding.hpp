@@ -20,6 +20,7 @@ struct ExecutionBindingRequest {
     // Explicit C1 device-input graph topology; requires graph-safe selections.
     bool device_graph_inputs = false;
     bool parallel_moe_router = false;
+    bool ranked_moe_router_topk = false;
 };
 
 struct ExecutionKernelBinding {

@@ -87,7 +87,8 @@ strix::kernels::KernelRegistry make_registry(
         registry.add(
             make_variant(
                 "test." + key + suffix +
-                    (step.op == strix::SerialOp::moe_route && request.parallel_moe_router ? ".parallel" : ""),
+                    (step.op == strix::SerialOp::moe_route && request.ranked_moe_router_topk ? ".ranked.parallel" :
+                     step.op == strix::SerialOp::moe_route && request.parallel_moe_router ? ".parallel" : ""),
                 *family,
                 shape,
                 measured_seconds));
@@ -495,6 +496,10 @@ int main() {
     router_buffers.parallel_moe_router = true;
     const auto router_registry = make_registry(model, router_binding);
     const auto router_compiled = strix::compile_serial_execution(model, router_registry, router_binding, router_buffers);
+    expect(router_compiled.execution_identity == 2521722731646212663ULL &&
+               router_compiled.kernel_plan_identity == 12954012342789894402ULL &&
+               router_compiled.arena.total_bytes == 998400ULL,
+           "parallel-only execution preserves fixed identity and workspace receipts");
     expect(router_compiled.execution_identity != compiled.execution_identity &&
                router_compiled.kernel_plan_identity != compiled.kernel_plan_identity,
            "parallel router invalidates serial execution and kernel identities");
@@ -541,6 +546,24 @@ int main() {
                                    router_compiled.execution, router_compiled.io)); }
     catch (const std::invalid_argument&) { router_mismatch = true; }
     expect(router_mismatch, "arena preflight rejects unrequested router IO");
+    auto ranked_binding = router_binding;
+    ranked_binding.ranked_moe_router_topk = true;
+    const auto ranked_registry = make_registry(model, ranked_binding);
+    const auto ranked_compiled = strix::compile_serial_execution(model, ranked_registry, ranked_binding, router_buffers);
+    expect(ranked_compiled.execution_identity != router_compiled.execution_identity &&
+               ranked_compiled.kernel_plan_identity != router_compiled.kernel_plan_identity &&
+               ranked_compiled.arena.total_bytes == router_compiled.arena.total_bytes,
+           "ranked router changes identities without changing workspace");
+    const auto rejects_ranked = [&](const strix::kernels::KernelRegistry& candidate,
+                                    const strix::ExecutionBindingRequest& request,
+                                    const strix::ExecutionBufferRequest& buffers) {
+        try { (void)strix::compile_serial_execution(model, candidate, request, buffers); }
+        catch (const std::invalid_argument&) { return true; } return false;
+    };
+    expect(rejects_ranked(router_registry, ranked_binding, router_buffers), "ranked admission rejects parallel-only kernel");
+    expect(rejects_ranked(ranked_registry, router_binding, router_buffers), "parallel-only admission rejects ranked kernel");
+    auto invalid_ranked = binding_request; invalid_ranked.ranked_moe_router_topk = true;
+    expect(rejects_ranked(registry, invalid_ranked, buffer_request), "ranked router rejects missing parallel topology");
     router_binding.parallel_moe_router = false;
     router_buffers.parallel_moe_router = false;
     const auto explicit_default = strix::compile_serial_execution(model, registry, router_binding, router_buffers);

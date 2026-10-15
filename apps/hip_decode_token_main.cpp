@@ -172,6 +172,7 @@ struct Options {
     bool virtual_q8_lm_head = false;
     bool parallel_moe_router = false;
     bool virtual_q8_gdn_input = false;
+    bool ranked_moe_router_topk = false;
     std::uint64_t ple_max_rows_per_io = 4;
     std::uint64_t ple_max_inflight_ios = 4;
     std::string reference_path;
@@ -196,7 +197,8 @@ Options parse_options(
             "[--context N] [--residency register|copy] [--coalesce-gap BYTES] "
             "[--planned-ple-io] [--ple-max-rows-per-io N] [--ple-max-inflight-ios N] "
             "[--generate N] [--eos-token TOKEN_ID] [--prefix-cache-roundtrip] "
-            "[--parallel-moe-router] [--virtual-q8-lm-head] [--virtual-q8-gdn-input] "
+            "[--parallel-moe-router] [--ranked-moe-router-topk] "
+            "[--virtual-q8-lm-head] [--virtual-q8-gdn-input] "
             "[--parallel-hyper-mix [--staged-hyper-projections [--fused-staged-hyper-mix]]]");
     }
 
@@ -210,6 +212,11 @@ Options parse_options(
          ++index) {
         const std::string_view argument =
             argv[index];
+        if (argument == "--ranked-moe-router-topk") {
+            if (options.ranked_moe_router_topk) throw std::invalid_argument("duplicate ranked MoE router top-k option");
+            options.ranked_moe_router_topk = true;
+            continue;
+        }
         if (argument == "--parallel-moe-router") {
             if (options.parallel_moe_router) throw std::invalid_argument("duplicate parallel MoE router option");
             options.parallel_moe_router = true;
@@ -476,6 +483,8 @@ Options parse_options(
         throw std::invalid_argument(
             "ple-max-inflight-ios must be non-zero");
     }
+    if (options.ranked_moe_router_topk && !options.parallel_moe_router)
+        throw std::invalid_argument("--ranked-moe-router-topk requires --parallel-moe-router");
     if (options.staged_hyper_projections && !options.parallel_hyper_mix)
         throw std::invalid_argument("--staged-hyper-projections requires --parallel-hyper-mix");
     if (options.fused_staged_hyper_mix && !options.staged_hyper_projections)
@@ -878,6 +887,8 @@ int main(
     catalog_config.staged_hyper_projections = options.staged_hyper_projections;
     catalog_config.fused_staged_hyper_mix = options.fused_staged_hyper_mix;
     catalog_config.virtual_q8_lm_head = options.virtual_q8_lm_head;
+    catalog_config.ranked_moe_router_topk = options.ranked_moe_router_topk;
+    binding_request.ranked_moe_router_topk = options.ranked_moe_router_topk;
     catalog_config.parallel_moe_router = options.parallel_moe_router;
     binding_request.parallel_moe_router = options.parallel_moe_router;
     catalog_config.virtual_q8_gdn_input = options.virtual_q8_gdn_input;
@@ -1594,6 +1605,7 @@ int main(
               << "  \"execution_identity\": "
               << compiled.execution_identity
               << ',' << '\n'
+              << "  \"ranked_moe_router_topk\": " << (options.ranked_moe_router_topk ? "true" : "false") << ",\n"
               << "  \"parallel_moe_router\": " << (options.parallel_moe_router ? "true" : "false") << ",\n"
               << "  \"launch_plan_identity\": "
               << launch_plan.plan_identity

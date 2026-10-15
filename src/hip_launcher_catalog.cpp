@@ -190,7 +190,7 @@ moe_experts_config(
 HipMoeRouteLauncherConfig
 moe_route_config(
     const ModelContract& model,
-    HipActivationStorage activation, bool parallel = false) {
+    HipActivationStorage activation, bool parallel = false, bool ranked = false) {
     HipMoeRouteLauncherConfig config;
     config.hidden_size =
         checked_u32(
@@ -209,6 +209,7 @@ moe_route_config(
     config.normalize_selected =
         model.norm_topk_probability;
     config.parallel_projection = parallel;
+    config.ranked_topk = ranked;
     return config;
 }
 
@@ -230,6 +231,9 @@ void register_complete_hip_kernel_catalog(
         !error.empty()) {
         throw std::invalid_argument(error);
     }
+    if (config.ranked_moe_router_topk != request.ranked_moe_router_topk ||
+        (config.ranked_moe_router_topk && !config.parallel_moe_router))
+        throw std::invalid_argument("HIP catalog ranked router mode differs from binding request");
     if (config.parallel_moe_router != request.parallel_moe_router)
         throw std::invalid_argument("HIP catalog router mode differs from binding request");
     if (config.enable_device_graph_inputs != request.device_graph_inputs)
@@ -320,7 +324,7 @@ void register_complete_hip_kernel_catalog(
     const auto moe_route =
         moe_route_config(
             model,
-            config.activation, config.parallel_moe_router);
+            config.activation, config.parallel_moe_router, config.ranked_moe_router_topk);
     register_hip_moe_route_kernel_variant(
         model,
         request,
@@ -395,7 +399,7 @@ HipLauncherCatalog::HipLauncherCatalog(
       moe_route_(
           moe_route_config(
               model,
-              config.activation, config.parallel_moe_router)),
+              config.activation, config.parallel_moe_router, config.ranked_moe_router_topk)),
       moe_experts_(
           moe_experts_config(
               model,
