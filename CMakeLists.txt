@@ -5,6 +5,7 @@ project(strix_engine_lab VERSION 0.1.0 LANGUAGES CXX)
 option(STRIX_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" ON)
 option(STRIX_ENABLE_HIP_RUNTIME "Build optional HIP allocation/runtime support" OFF)
 option(STRIX_USE_OPENSSL_SHA256 "Use OpenSSL for full-file SHA-256 verification" OFF)
+option(STRIX_ENABLE_SSH_BOUND_BOOTSTRAP "Build experimental OpenSSL3 SSH-provisioned channel bootstrap" OFF)
 
 function(strix_target_warnings target)
     if(MSVC)
@@ -53,6 +54,7 @@ add_library(strix_core STATIC
     src/distributed_control_receiver.cpp
     src/distributed_tcp_control_stream.cpp
     src/tcp_copied_payload_stream.cpp
+    src/ssh_bound_copied_stream.cpp
     src/distributed_runtime.cpp
     src/distributed_session.cpp
     src/direct_transport_completion.cpp
@@ -160,6 +162,11 @@ if(STRIX_USE_OPENSSL_SHA256)
     find_package(OpenSSL REQUIRED COMPONENTS Crypto)
     target_link_libraries(strix_core PRIVATE OpenSSL::Crypto)
     target_compile_definitions(strix_core PRIVATE STRIX_USE_OPENSSL_SHA256=1)
+endif()
+if(STRIX_ENABLE_SSH_BOUND_BOOTSTRAP)
+    find_package(OpenSSL 3.0 REQUIRED COMPONENTS Crypto)
+    target_link_libraries(strix_core PRIVATE OpenSSL::Crypto)
+    target_compile_definitions(strix_core PUBLIC STRIX_ENABLE_SSH_BOUND_BOOTSTRAP=1)
 endif()
 strix_target_warnings(strix_core)
 if(NOT MSVC)
@@ -604,6 +611,15 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-tcp-copied-payload-stream-tests)
     add_test(NAME strix-tcp-copied-payload-stream-tests COMMAND strix-tcp-copied-payload-stream-tests)
     set_tests_properties(strix-tcp-copied-payload-stream-tests PROPERTIES TIMEOUT 15)
+
+    add_executable(strix-ssh-bound-copied-stream-tests tests/ssh_bound_copied_stream_tests.cpp)
+    target_link_libraries(strix-ssh-bound-copied-stream-tests PRIVATE strix_core)
+    if(STRIX_ENABLE_SSH_BOUND_BOOTSTRAP)
+        target_link_libraries(strix-ssh-bound-copied-stream-tests PRIVATE OpenSSL::Crypto)
+    endif()
+    strix_target_warnings(strix-ssh-bound-copied-stream-tests)
+    add_test(NAME strix-ssh-bound-copied-stream-tests COMMAND strix-ssh-bound-copied-stream-tests)
+    set_tests_properties(strix-ssh-bound-copied-stream-tests PROPERTIES TIMEOUT 30)
 
     add_executable(strix-distributed-session-tests tests/distributed_session_tests.cpp)
     target_link_libraries(strix-distributed-session-tests PRIVATE strix_core)
