@@ -27,7 +27,9 @@ endfunction()
 
 add_library(strix_core STATIC
     src/uma_owner_inventory.cpp
+    src/moe_fork_join_arena.cpp
     src/prepared_execution.cpp
+    src/prepared_tensor_views.cpp
     src/prepared_serial_session.cpp
     src/execution_telemetry.cpp
     src/qsa_input_prefetch.cpp
@@ -239,6 +241,21 @@ if(BUILD_TESTING)
     target_link_libraries(strix-uma-owner-inventory-tests PRIVATE strix_core)
     strix_target_warnings(strix-uma-owner-inventory-tests)
     add_test(NAME strix-uma-owner-inventory-tests COMMAND strix-uma-owner-inventory-tests)
+
+    add_executable(strix-shared-expert-rows-diagnostic-contract-tests tests/shared_expert_rows_diagnostic_contract_tests.cpp)
+    target_link_libraries(strix-shared-expert-rows-diagnostic-contract-tests PRIVATE strix_core)
+    strix_target_warnings(strix-shared-expert-rows-diagnostic-contract-tests)
+    add_test(NAME strix-shared-expert-rows-diagnostic-contract-tests COMMAND strix-shared-expert-rows-diagnostic-contract-tests)
+
+    add_executable(strix-moe-fork-join-arena-tests tests/moe_fork_join_arena_tests.cpp)
+    target_link_libraries(strix-moe-fork-join-arena-tests PRIVATE strix_core)
+    strix_target_warnings(strix-moe-fork-join-arena-tests)
+    add_test(NAME strix-moe-fork-join-arena-tests COMMAND strix-moe-fork-join-arena-tests)
+
+    add_executable(strix-prepared-tensor-views-tests tests/prepared_tensor_views_tests.cpp)
+    target_link_libraries(strix-prepared-tensor-views-tests PRIVATE strix_core)
+    strix_target_warnings(strix-prepared-tensor-views-tests)
+    add_test(NAME strix-prepared-tensor-views-tests COMMAND strix-prepared-tensor-views-tests)
 
     add_executable(strix-prepared-execution-tests tests/prepared_execution_tests.cpp)
     target_link_libraries(strix-prepared-execution-tests PRIVATE strix_core)
@@ -1142,6 +1159,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         src/hip_integer_projection_runtime.hip
         src/hip_lm_head_launcher.hip
         src/hip_generation_output.hip
+        src/hip_moe_overlap_dispatcher.hip
         src/hip_shared_expert_launcher.hip
     )
     target_include_directories(
@@ -1177,6 +1195,8 @@ if(STRIX_ENABLE_HIP_RUNTIME)
     if(BUILD_TESTING)
         target_compile_definitions(strix_hip_runtime PRIVATE STRIX_BUILD_GDN_LM_WAVE8_DIAGNOSTIC=1)
         target_compile_definitions(strix_hip_runtime PRIVATE STRIX_BUILD_GDN_RECURRENT_LAYOUT_DIAGNOSTIC=1)
+        target_compile_definitions(strix_hip_runtime PRIVATE STRIX_BUILD_SHARED_EXPERT_ROWS_DIAGNOSTIC=1)
+        target_compile_definitions(strix_hip_runtime PRIVATE STRIX_BUILD_QSA_GQA_REUSE_DIAGNOSTIC=1)
         add_library(strix_qsa_selection_diagnostic STATIC src/hip_qsa_selection_diagnostic.hip)
         target_include_directories(strix_qsa_selection_diagnostic PUBLIC include "${STRIX_HIP_INCLUDE_DIR}")
         target_link_libraries(strix_qsa_selection_diagnostic PUBLIC strix_core "${STRIX_HIP_RUNTIME_LIBRARY}")
@@ -1617,6 +1637,21 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         add_test(NAME strix-hip-shared-expert-prefetch-tests COMMAND strix-hip-shared-expert-prefetch-tests)
 
         add_executable(strix-hip-gdn-lm-wave8-diagnostic-tests tests/hip_gdn_lm_wave8_diagnostic_tests.hip)
+        add_executable(strix-hip-shared-expert-rows-diagnostic-tests tests/hip_shared_expert_rows_diagnostic_tests.hip)
+        set_target_properties(strix-hip-shared-expert-rows-diagnostic-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+        target_link_libraries(strix-hip-shared-expert-rows-diagnostic-tests PRIVATE strix_hip_runtime)
+        strix_target_warnings(strix-hip-shared-expert-rows-diagnostic-tests)
+        add_test(NAME strix-hip-shared-expert-rows-diagnostic-tests COMMAND strix-hip-shared-expert-rows-diagnostic-tests)
+        add_executable(strix-hip-qsa-gqa-reuse-diagnostic-tests tests/hip_qsa_gqa_reuse_diagnostic_tests.hip)
+        set_target_properties(strix-hip-qsa-gqa-reuse-diagnostic-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+        target_link_libraries(strix-hip-qsa-gqa-reuse-diagnostic-tests PRIVATE strix_hip_runtime)
+        strix_target_warnings(strix-hip-qsa-gqa-reuse-diagnostic-tests)
+        add_test(NAME strix-hip-qsa-gqa-reuse-diagnostic-tests COMMAND strix-hip-qsa-gqa-reuse-diagnostic-tests)
+        add_executable(strix-hip-moe-overlap-dispatcher-tests tests/hip_moe_overlap_dispatcher_tests.hip)
+        set_target_properties(strix-hip-moe-overlap-dispatcher-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+        target_link_libraries(strix-hip-moe-overlap-dispatcher-tests PRIVATE strix_hip_runtime)
+        strix_target_warnings(strix-hip-moe-overlap-dispatcher-tests)
+        add_test(NAME strix-hip-moe-overlap-dispatcher-tests COMMAND strix-hip-moe-overlap-dispatcher-tests)
         add_executable(strix-hip-generation-output-tests tests/hip_generation_output_tests.hip)
         add_executable(strix-hip-gdn-recurrent-layout-diagnostic-tests tests/hip_gdn_recurrent_layout_diagnostic_tests.hip)
         set_target_properties(strix-hip-gdn-recurrent-layout-diagnostic-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)

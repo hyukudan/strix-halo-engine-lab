@@ -32,9 +32,15 @@ int main() try {
     head.op = strix::SerialOp::lm_head;
     head.execution_identity = 17;
     head.step_id = 1;
+    require(!dispatcher.state_only_active(), "default output intent is full output");
     dispatcher.dispatch_kernel(head);
     {
         strix::GenerationOutputDispatcher::StateOnlyScope intent(dispatcher);
+        require(dispatcher.state_only_active(), "state-only intent is visible to the completion owner");
+        bool nested_rejected = false;
+        try { strix::GenerationOutputDispatcher::StateOnlyScope nested(dispatcher); }
+        catch (const std::logic_error&) { nested_rejected = true; }
+        require(nested_rejected && dispatcher.state_only_active(), "nested rejection preserves outer intent");
         dispatcher.dispatch_kernel(state);
         dispatcher.dispatch_runtime_step(state);
         dispatcher.dispatch_kernel(head);
@@ -48,13 +54,15 @@ int main() try {
         dispatcher.dispatch_kernel(state);
     } catch (const std::runtime_error&) {}
     delegate.fail = false;
+    require(!dispatcher.state_only_active(), "state-only intent resets after exception");
     dispatcher.dispatch_kernel(head);
     require(delegate.head_calls == 3, "intent is restored after a producer exception");
-    for (unsigned mode = 0; mode < 3; ++mode) {
+    for (unsigned mode = 0; mode < 4; ++mode) {
         auto invalid = head;
         if (mode == 0) ++invalid.execution_identity;
         if (mode == 1) ++invalid.logical_rows;
         if (mode == 2) ++invalid.request_concurrency;
+        if (mode == 3) invalid.reads_state = strix::PersistentState::recurrent_matrix;
         bool rejected_context = false;
         try {
             strix::GenerationOutputDispatcher::StateOnlyScope intent(dispatcher);
@@ -69,6 +77,18 @@ int main() try {
         dispatcher.dispatch_kernel(head);
     } catch (const std::invalid_argument&) { rejected = true; }
     require(rejected, "stateful head cannot be silently pruned");
+    for (unsigned mode = 0; mode < 5; ++mode) {
+        auto malformed = compiled;
+        if (mode == 0) malformed.execution_identity = 0;
+        if (mode == 1) malformed.execution.steps.back().id = 0;
+        if (mode == 2) malformed.execution.steps.back().op = strix::SerialOp::moe_experts;
+        if (mode == 3) malformed.execution.steps.back().writes_state = strix::PersistentState::recurrent_matrix;
+        if (mode == 4) malformed.execution.steps.back().reads_state = strix::PersistentState::recurrent_matrix;
+        bool bad_constructor = false;
+        try { strix::GenerationOutputDispatcher invalid(delegate, malformed); }
+        catch (const std::invalid_argument&) { bad_constructor = true; }
+        require(bad_constructor, "prefix intent requires an identified terminal state-free head");
+    }
     std::cout << "generation output dispatch source fixtures PASS\n";
     return 0;
 } catch (const std::exception& error) {

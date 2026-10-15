@@ -1,4 +1,5 @@
 #include "strix/dispatch_resources.hpp"
+#include "strix/prepared_tensor_views.hpp"
 
 #include <stdexcept>
 
@@ -42,6 +43,15 @@ const SessionStateMemoryBinding& state_memory(
     }
     throw std::invalid_argument(
         "dispatch context has no session-state memory binding");
+}
+
+const PreparedTensorViews* prepared_views(const ExecutionDispatchContext& context) {
+    if (!context.prepared_tensor_views) return nullptr;
+    if (!context.resources)
+        throw std::invalid_argument("prepared tensor lookup requires its source resources");
+    context.prepared_tensor_views->validate_source_handles(context.resources->model_manifest,
+        context.resources->model_weights, context.resources->tensor_access);
+    return context.prepared_tensor_views;
 }
 
 const ModelManifest& model_manifest(
@@ -160,6 +170,8 @@ SessionStateAddress resolve_dispatch_gdn_layer_state(
 const ExecutionTensorAccess& resolve_dispatch_tensor_access(
     const ExecutionDispatchContext& context,
     std::uint32_t binding_slot) {
+    if (const auto* prepared = prepared_views(context))
+        return prepared->access(context.execution_identity, context.step_id, binding_slot);
     if (context.resources == nullptr ||
         context.resources->tensor_access == nullptr) {
         throw std::invalid_argument(
@@ -180,6 +192,8 @@ const ExecutionTensorAccess& resolve_dispatch_tensor_access(
 const RuntimeTensorBinding& resolve_dispatch_tensor(
     const ExecutionDispatchContext& context,
     std::uint32_t tensor_index) {
+    if (const auto* prepared = prepared_views(context))
+        return prepared->tensor(context.execution_identity, tensor_index);
     const auto& manifest =
         model_manifest(context);
     const auto& weights =
@@ -200,6 +214,8 @@ const RuntimeTensorBinding& resolve_dispatch_tensor(
 const RuntimeTensorBinding& resolve_dispatch_tensor(
     const ExecutionDispatchContext& context,
     std::string_view tensor_name) {
+    if (const auto* prepared = prepared_views(context))
+        return prepared->tensor(context.execution_identity, tensor_name);
     const auto& manifest =
         model_manifest(context);
     const auto& weights =

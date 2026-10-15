@@ -1,4 +1,5 @@
 #include "strix/prepared_execution.hpp"
+#include "strix/prepared_tensor_views.hpp"
 
 #include <array>
 #include <limits>
@@ -30,6 +31,7 @@ bool same_layout(const SerialSessionStateLayout& left, const SerialSessionStateL
 struct PreparedEagerExecution::Impl {
     const CompiledSerialExecution compiled;
     const std::shared_ptr<const void> actual_owner;
+    std::unique_ptr<const PreparedTensorViews> tensor_views;
     RuntimeExecutionIdentities identities;
     SerialSessionStateLayout state_layout;
     std::array<std::uint64_t, 6> write_counts{};
@@ -50,6 +52,9 @@ struct PreparedEagerExecution::Impl {
         identities = build_runtime_execution_identities(compiled.execution_identity, compiled.arena, resources);
         validate_eager_execution_preflight(compiled.execution, compiled.bindings, compiled.io, compiled.arena,
             prototype, resources.session_state_layout, resources.session_state_memory, &resources);
+        tensor_views = std::make_unique<const PreparedTensorViews>(compiled.execution_identity,
+            compiled.execution, *resources.model_manifest, *resources.model_weights,
+            *resources.tensor_access, actual_owner);
         state_layout = *resources.session_state_layout;
         order.reserve(compiled.execution.steps.size());
         for (const auto& step : compiled.execution.steps) {
@@ -95,6 +100,8 @@ struct PreparedEagerExecution::Impl {
         if (current.compatibility_identity != identities.compatibility_identity || current.binding_identity != identities.binding_identity ||
             !same_layout(state_layout, *resources.session_state_layout))
             throw std::invalid_argument("prepared eager runtime bindings or state layout changed");
+        tensor_views->validate_source_metadata(*resources.model_manifest, *resources.model_weights,
+            *resources.tensor_access);
         validate_request(resources, request);
     }
 
@@ -120,6 +127,7 @@ struct PreparedEagerExecution::Impl {
             context.session_state_layout = resources.session_state_layout;
             context.session_state_memory = resources.session_state_memory;
             context.resources = &resources;
+            context.prepared_tensor_views = tensor_views.get();
             context.reads_state = step.reads_state;
             context.writes_state = step.writes_state;
             context.logical_rows = request.logical_rows;

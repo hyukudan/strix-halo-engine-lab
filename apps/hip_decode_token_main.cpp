@@ -30,6 +30,8 @@
 #include "strix/hip_generation_output.hpp"
 #include "strix/generation_output_dispatch.hpp"
 #include "strix/prepared_serial_session.hpp"
+#include "strix/moe_fork_join_arena.hpp"
+#include "strix/hip_moe_overlap_dispatcher.hpp"
 #include "hip_decode_experiment.hpp"
 #include "hip_decode_options.hpp"
 #include "hip_deferred_moe_status.hpp"
@@ -444,6 +446,7 @@ int main(
             "  --execution-inventory (include selected host launcher and declared variant metadata)\n"
             "  --gpu-greedy-token (experimental eager generation with small GPU selection result)\n"
             "  --prepared-eager (experimental immutable static submission plan)\n"
+            "  --moe-shared-overlap [--moe-overlap-arena-budget-bytes N] (experimental eager D1)\n"
             "  --virtual-q8-gdn-output (exact original256-tree Q8 output)\n"
             "  --lane-chain-hyper-output (requires --prefetch-q8-hyper-output)\n"
             "  --record-raw ABS_NEW_PRIVATE_DIRECTORY --record-max-bytes BYTES\n"
@@ -568,6 +571,8 @@ int main(
         options, model, info, manifest,
         strix::model_content_identity_hex(mapped.content_identity()), has_auto_a8_runtime);
     strix::decode_cli::validate_resolved_prefix_roundtrip(options);
+    if (options.moe_shared_overlap && !options.deferred_moe_status)
+        throw std::invalid_argument("MoE shared overlap requires the resolved eager deferred-status owner");
     const std::string optimization_profile_receipt =
         "  \"optimization_profile_requested\": \"" + optimization_profile.requested + "\",\n" +
         "  \"optimization_profile_selected\": \"" + optimization_profile.selected + "\",\n" +
@@ -782,13 +787,19 @@ int main(
     buffer_request.mlp_intermediate_element_bytes =
         4;
 
-    const auto compiled =
+    auto compiled =
         strix::compile_serial_execution(
             model,
             kernel_registry,
             binding_request,
             buffer_request,
             256);
+    std::optional<strix::MoeForkJoinArenaPlan> overlap_arena;
+    if (options.moe_shared_overlap) {
+        overlap_arena.emplace(strix::prepare_moe_fork_join_arena(
+            compiled, options.moe_overlap_arena_budget_bytes));
+        compiled = overlap_arena->rebind_execution(compiled);
+    }
 
     std::uint32_t wave_eligible_steps = 0;
     for (const auto& binding : compiled.bindings.bindings)
@@ -958,18 +969,38 @@ int main(
         throw std::logic_error("HIP launcher catalog is incomplete for actual compiled execution");
     const auto launch_plan = strix::compile_launch_plan(compiled, launchers);
     const auto execution_inventory_receipt = options.execution_inventory
-        ? strix::decode_receipt::execution_inventory_receipt(compiled, launch_plan, kernel_registry)
+        ? strix::decode_receipt::execution_inventory_receipt(compiled, launch_plan, kernel_registry) +
+            strix::decode_receipt::hip_runtime_environment_receipt()
         : std::string{};
+    std::shared_ptr<HipDeferredMoeStatus> deferred_moe;
+    if(options.deferred_moe_status) {
+        const auto deferred_status_generation=generations.next();
+        const auto deferred_shadow_generation=generations.next();
+        deferred_moe=std::make_shared<HipDeferredMoeStatus>(resources,compiled.execution_identity,
+            deferred_status_generation,deferred_shadow_generation,experiment_owner,original_work_device);
+    }
     HostTelemetryReport host_telemetry;
     host_telemetry.enabled = options.host_dispatch_telemetry;
     strix::DirectLaunchDispatcher direct_dispatcher(launch_plan,
         host_telemetry.enabled ? &host_telemetry.counters : nullptr);
+    std::unique_ptr<strix::HipMoeOverlapDispatcher> moe_overlap;
+    if (overlap_arena) {
+        if (!deferred_moe) throw std::logic_error("MoE overlap is missing its main stream owner");
+        moe_overlap = std::make_unique<strix::HipMoeOverlapDispatcher>(compiled, *overlap_arena,
+            launch_plan, deferred_moe->resources(), deferred_moe->scope().stream,
+            std::static_pointer_cast<const void>(deferred_moe),
+            std::static_pointer_cast<const void>(launcher_catalog), original_work_device,
+            host_telemetry.enabled ? &host_telemetry.counters : nullptr);
+    }
+    strix::EagerExecutionDispatcher& native_dispatcher = moe_overlap
+        ? static_cast<strix::EagerExecutionDispatcher&>(*moe_overlap)
+        : static_cast<strix::EagerExecutionDispatcher&>(direct_dispatcher);
     std::unique_ptr<strix::GenerationOutputDispatcher> output_dispatcher;
     if (options.gpu_greedy_token)
-        output_dispatcher = std::make_unique<strix::GenerationOutputDispatcher>(direct_dispatcher, compiled);
+        output_dispatcher = std::make_unique<strix::GenerationOutputDispatcher>(native_dispatcher, compiled);
     strix::EagerExecutionDispatcher& dispatcher = output_dispatcher
         ? static_cast<strix::EagerExecutionDispatcher&>(*output_dispatcher)
-        : static_cast<strix::EagerExecutionDispatcher&>(direct_dispatcher);
+        : native_dispatcher;
     std::unique_ptr<strix::HipSerialGraph> graph;
     if (graph_mode) {
         strix::GraphMemoryRequest graph_memory;
@@ -1006,13 +1037,6 @@ int main(
             "compiled execution does not end in one logits write");
     }
 
-    std::shared_ptr<HipDeferredMoeStatus> deferred_moe;
-    if(options.deferred_moe_status) {
-        const auto deferred_status_generation=generations.next();
-        const auto deferred_shadow_generation=generations.next();
-        deferred_moe=std::make_shared<HipDeferredMoeStatus>(resources,compiled.execution_identity,
-            deferred_status_generation,deferred_shadow_generation,experiment_owner,original_work_device);
-    }
     std::unique_ptr<strix::PreparedEagerExecution> prepared_eager;
     if (options.prepared_eager) {
         strix::EagerExecutionRequest prototype;
@@ -1025,6 +1049,21 @@ int main(
         prepared_eager = std::make_unique<strix::PreparedEagerExecution>(
             compiled, current_resources, prototype, owner);
     }
+    const auto overlap_receipt = [&]() -> std::string {
+        if (!moe_overlap) return {};
+        const auto stats = moe_overlap->stats();
+        return "  \"moe_shared_overlap_mode\":\"eager-sibling-streams-experimental-v1\",\n"
+            "  \"moe_shared_overlap_layout_identity\":" + std::to_string(overlap_arena->layout_identity()) + ",\n" +
+            "  \"moe_shared_overlap_source_execution_identity\":" + std::to_string(overlap_arena->source_execution_identity()) + ",\n" +
+            "  \"moe_shared_overlap_arena_bytes\":" + std::to_string(compiled.arena.total_bytes) + ",\n" +
+            "  \"moe_shared_overlap_additional_arena_bytes\":" + std::to_string(overlap_arena->additional_bytes()) + ",\n" +
+            "  \"moe_shared_overlap_fork_records\":" + std::to_string(stats.fork_records) + ",\n" +
+            "  \"moe_shared_overlap_join_waits\":" + std::to_string(stats.join_waits) + ",\n" +
+            "  \"moe_shared_overlap_verified_tokens\":" + std::to_string(stats.verified_tokens) + ",\n" +
+            "  \"moe_shared_overlap_committed_tokens\":" + std::to_string(stats.committed_tokens) + ",\n" +
+            "  \"moe_shared_overlap_committed_layers\":" + std::to_string(stats.committed_layers) + ",\n" +
+            "  \"moe_shared_overlap_aborted_tokens\":" + std::to_string(stats.aborted_tokens) + ",\n";
+    };
     std::uint64_t input_access_epoch = 1;
     const std::function<void(std::uint32_t)> execute_native_token = [&](std::uint32_t token) {
         original_work_device->require_original();
@@ -1033,15 +1072,30 @@ int main(
             arena_pin->advance_access(++input_access_epoch);
         }
         if (deferred_moe) {
+            const auto committed_before = session.committed_tokens;
             deferred_moe->begin();
             try {
                 strix::HipLaunchScope scope(deferred_moe->scope());
+                if (moe_overlap) moe_overlap->begin_token(session);
+                const auto complete_before_commit = [&] {
+                    if (moe_overlap) moe_overlap->verify_before_commit(
+                        output_dispatcher && output_dispatcher->state_only_active());
+                    deferred_moe->complete_before_commit();
+                };
                 if (prepared_eager) static_cast<void>(strix::execute_prepared_serial_token(
-                    *prepared_eager, session, deferred_moe->resources(), token, dispatcher,
-                    [&] { deferred_moe->complete_before_commit(); }));
-                else static_cast<void>(strix::execute_serial_token(compiled,session,deferred_moe->resources(),token,dispatcher,
-                    [&] { deferred_moe->complete_before_commit(); }));
-            } catch (...) { deferred_moe->abort();throw; }
+                    *prepared_eager, session, deferred_moe->resources(), token, dispatcher, complete_before_commit));
+                else static_cast<void>(strix::execute_serial_token(compiled, session, deferred_moe->resources(),
+                    token, dispatcher, complete_before_commit));
+                if (moe_overlap) moe_overlap->mark_committed(session);
+            } catch (...) {
+                if (moe_overlap) moe_overlap->abort();
+                deferred_moe->abort();
+                if (session.committed_tokens != committed_before) {
+                    session.health = strix::SerialSessionHealth::poisoned;
+                    session.arithmetic_lineage.tainted = true;
+                }
+                throw;
+            }
         } else if (graph) static_cast<void>(graph->execute(session, token));
         else if (prepared_eager) static_cast<void>(strix::execute_prepared_serial_token(
             *prepared_eager, session, resources, token, dispatcher));
@@ -1326,7 +1380,7 @@ int main(
                     restore_start).count();
 
             std::cout
-                << "{\n" << optimization_profile_receipt << eager_submission_receipt << execution_inventory_receipt << gdn_output_mode_receipt() << wave_router_mode_receipt << deferred_moe_mode_receipt
+                << "{\n" << optimization_profile_receipt << eager_submission_receipt << overlap_receipt() << execution_inventory_receipt << gdn_output_mode_receipt() << wave_router_mode_receipt << deferred_moe_mode_receipt
                 << strix::decode_detail::qsa_input_dispatch_receipt(qsa_prefetch_stats.get())
                 << shared_dispatch_receipt.completed_counts()
                 << strix::decode_detail::deferred_moe_completed_tokens_receipt(deferred_moe.get())
@@ -1467,7 +1521,7 @@ int main(
             elapsed_total += value;
         }
 
-        std::cout << "{\n" << optimization_profile_receipt << eager_submission_receipt << execution_inventory_receipt << gdn_output_mode_receipt() << wave_router_mode_receipt << deferred_moe_mode_receipt;
+        std::cout << "{\n" << optimization_profile_receipt << eager_submission_receipt << overlap_receipt() << execution_inventory_receipt << gdn_output_mode_receipt() << wave_router_mode_receipt << deferred_moe_mode_receipt;
         if (greedy_output) {
             const auto stats = greedy_output->stats();
             double prefix_state_total = 0.0;
@@ -1593,7 +1647,7 @@ int main(
             reference->steps.size());
     }
 
-    std::cout << '{' << '\n' << optimization_profile_receipt << eager_submission_receipt << execution_inventory_receipt << gdn_output_mode_receipt() << wave_router_mode_receipt << deferred_moe_mode_receipt;
+    std::cout << '{' << '\n' << optimization_profile_receipt << eager_submission_receipt << overlap_receipt() << execution_inventory_receipt << gdn_output_mode_receipt() << wave_router_mode_receipt << deferred_moe_mode_receipt;
     emit_q4k_a8_receipt();
     std::cout << "  \"model_content_identity\": \""
               << strix::model_content_identity_hex(

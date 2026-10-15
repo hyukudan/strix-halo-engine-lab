@@ -76,3 +76,14 @@ epochs and graph replays, or measure prepare, selection, commit and delivery.
 Those are remaining inventory/telemetry work, not implied by these interfaces.
 Target HIP compilation, native execution and complete-workload measurements
 remain separate gates from portable tests.
+
+## Requested HIP process settings
+
+With `--execution-inventory`, the decoder also emits the fixed allowlist
+`hip_runtime_environment`: requested hardware queues, SDMA/architecture override,
+kernel/copy serialization, launch blocking and device visibility. Values are
+read from the actual decoder process; unset is null and an empty value remains
+an empty string. The collector preserves this receipt instead of substituting
+its own process environment. Effective hardware queues and observed concurrency
+remain null: an environment request or two streams does not establish overlap.
+No setting is modified. These source changes have not been executed yet.

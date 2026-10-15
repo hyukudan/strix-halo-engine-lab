@@ -66,6 +66,19 @@ struct Fixture {
 } // namespace
 
 int main() {
+    const auto environment = strix::decode_receipt::hip_runtime_environment_receipt([](const char* name) -> const char* {
+        if (std::string_view(name) == "GPU_MAX_HW_QUEUES") return "1";
+        if (std::string_view(name) == "HIP_VISIBLE_DEVICES") return "\"device\\name\n";
+        if (std::string_view(name) == "HIP_LAUNCH_BLOCKING") return "";
+        return nullptr;
+    });
+    expect(environment.find("\"GPU_MAX_HW_QUEUES\":\"1\"") != std::string::npos &&
+        environment.find("\"HIP_LAUNCH_BLOCKING\":\"\"") != std::string::npos &&
+        environment.find("\"HSA_ENABLE_SDMA\":null") != std::string::npos &&
+        environment.find("\"effective_hw_queues\":null,\"concurrent_execution_observed\":null") != std::string::npos,
+        "requested runtime environment is distinct from effective queues and observed overlap");
+    expect(environment.find("device\\\\name\\n") != std::string::npos && environment.find('\n') == environment.size() - 1U,
+        "runtime environment escapes controls without exposing unrelated variables");
     Fixture fixture;
     const auto text = fixture.render();
     expect(text.starts_with("  \"execution_inventory\":{") && text.ends_with("},\n"),

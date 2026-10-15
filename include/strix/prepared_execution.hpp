@@ -18,8 +18,9 @@ struct PreparedEagerExecutionResult {
 };
 
 // Bounded eager preparation: privately owns an immutable deep copy of the
-// compiled DAG/IO/arena and its validated submission order. It caches neither
-// tensor addresses nor launcher functions. Request spans are never retained.
+// compiled DAG/IO/arena, its validated submission order and admitted immutable
+// tensor views with retained owners. Launcher functions remain in the existing
+// compiled launch plan. Request spans are never retained.
 //
 // actual_owner must retain the actual prepared allocations. The caller must
 // additionally retain every borrowed resource/dispatcher and exclude mutation

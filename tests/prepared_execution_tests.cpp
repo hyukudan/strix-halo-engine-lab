@@ -1,5 +1,7 @@
 #include "strix/prepared_execution.hpp"
 #include "strix/prepared_serial_session.hpp"
+#include "strix/dispatch_resources.hpp"
+#include "strix/model_tensor_index.hpp"
 
 #include <algorithm>
 #include <array>
@@ -79,16 +81,31 @@ struct Fixture {
         owner->scratch = {compiled.execution_identity, scratch_base,
                           compiled.arena.total_bytes, 3};
         owner->manifest.architecture = "host-fixture";
-        strix::ManifestTensor tensor;
-        tensor.name = "fixture.weight"; tensor.dimensions = {1, 1}; tensor.ggml_type = 0; tensor.byte_size = 4;
-        tensor.placement.kind = strix::PlacementKind::local;
-        owner->manifest.tensors.push_back(tensor); owner->manifest.total_tensor_bytes = 4;
+        const auto requirements = strix::build_serial_execution_tensor_requirements(compiled.execution);
+        std::set<std::string> tensor_names;
+        for (const auto& requirement : requirements) {
+            const auto& selector = requirement.selector;
+            std::string needle(selector.name_contains);
+            if (needle.empty() && !selector.name_contains_any.empty()) needle = selector.name_contains_any.front();
+            const auto name = "fixture." + std::to_string(static_cast<unsigned>(*selector.role)) + "." +
+                (selector.layer ? std::to_string(*selector.layer) : "global") + "." + needle;
+            if (!tensor_names.insert(name).second) continue;
+            strix::ManifestTensor tensor;
+            tensor.name = name; tensor.dimensions = {1, 1}; tensor.ggml_type = 0; tensor.byte_size = 4;
+            tensor.role = *selector.role; tensor.layer = selector.layer;
+            tensor.placement.kind = strix::PlacementKind::local;
+            owner->manifest.tensors.push_back(tensor);
+            owner->manifest.total_tensor_bytes += 4;
+        }
         owner->manifest.layout_identity = strix::model_manifest_layout_identity(owner->manifest);
         owner->weights.manifest_layout_identity = owner->manifest.layout_identity;
         owner->weights.model_content_identity.bytes[0] = 1;
-        owner->weights.tensors.push_back({0, strix::RuntimeTensorStorage::resident,
-            reinterpret_cast<std::uintptr_t>(owner->tensor_bytes.data()), 4, 7, 0});
-        owner->access.manifest_layout_identity = owner->manifest.layout_identity; owner->access.plan_identity = 0x4444;
+        for (std::size_t index = 0; index < owner->manifest.tensors.size(); ++index)
+            owner->weights.tensors.push_back({static_cast<std::uint32_t>(index), strix::RuntimeTensorStorage::resident,
+                reinterpret_cast<std::uintptr_t>(owner->tensor_bytes.data()), 4, 7, 0});
+        const auto tensor_index = strix::build_model_tensor_index(owner->manifest);
+        owner->access = strix::compile_execution_tensor_access_plan(
+            compiled.execution, owner->manifest, tensor_index, requirements);
         owner->layout.context_tokens = 16; owner->layout.layout_identity = 0x5678;
         owner->layout.device_total_bytes = 5U * owner->layout.device_alignment;
         owner->layout.host_total_bytes = 2U * owner->layout.host_alignment;
@@ -125,6 +142,24 @@ struct Trace final : strix::EagerExecutionDispatcher {
     std::vector<strix::ExecutionDispatchContext> calls;
     std::optional<std::uint32_t> fail_step;
     void record(const strix::ExecutionDispatchContext& context) {
+        if (context.prepared_tensor_views) {
+            require(context.resources != nullptr, "prepared lookup cache has no resources");
+            for (const auto& access : context.resources->tensor_access->accesses) {
+                if (access.step_id != context.step_id) continue;
+                const auto& cached = strix::resolve_dispatch_tensor_access(context, access.binding_slot);
+                require(cached.tensor_indices == access.tensor_indices && cached.op == context.op,
+                        "prepared dispatch access differs from its admitted source");
+                for (const auto index : cached.tensor_indices) {
+                    const auto& actual = context.resources->model_weights->tensors[index];
+                    const auto& indexed = strix::resolve_dispatch_tensor(context, index);
+                    const auto& named = strix::resolve_dispatch_tensor(context,
+                        context.resources->model_manifest->tensors[index].name);
+                    require(indexed.address == actual.address && indexed.bytes == actual.bytes &&
+                        indexed.allocation_generation == actual.allocation_generation && &indexed == &named,
+                        "prepared tensor index/name lookup changed the admitted physical view");
+                }
+            }
+        }
         calls.push_back(context);
         if (fail_step == context.step_id) throw std::runtime_error("injected dispatch failure");
     }
@@ -252,6 +287,23 @@ void dynamic_rejection() {
     auto layout = fixture.owner->layout; layout.allocations.pop_back();
     resources = fixture.owner->resources; resources.session_state_layout = &layout; rejected(resources, fixture.request);
     resources = fixture.owner->resources; resources.model_weights = nullptr; rejected(resources, fixture.request);
+    auto manifest = fixture.owner->manifest; manifest.tensors[0].name += ".changed";
+    resources = fixture.owner->resources; resources.model_manifest = &manifest; rejected(resources, fixture.request);
+    manifest = fixture.owner->manifest; manifest.tensors[0].dimensions[0] = 2; rejected(resources, fixture.request);
+    access = fixture.owner->access; access.accesses[0].tensor_indices[0] = 1;
+    resources = fixture.owner->resources; resources.tensor_access = &access; rejected(resources, fixture.request);
+
+    // Mutations under the SAME source handles and stale claimed identities must
+    // also be rejected: identity hashes do not cover these structural fields.
+    const auto saved_name = fixture.owner->manifest.tensors[0].name;
+    fixture.owner->manifest.tensors[0].name += ".mutated";
+    rejected(fixture.owner->resources, fixture.request);
+    fixture.owner->manifest.tensors[0].name = saved_name;
+    const auto saved_index = fixture.owner->access.accesses[0].tensor_indices[0];
+    fixture.owner->access.accesses[0].tensor_indices[0] = saved_index + 1U;
+    rejected(fixture.owner->resources, fixture.request);
+    fixture.owner->access.accesses[0].tensor_indices[0] = saved_index;
+
 }
 void preparation_rejection() {
     Fixture fixture;

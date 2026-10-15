@@ -6,6 +6,9 @@
 #include "strix/session_state_memory.hpp"
 #include "strix/hip_launch_context.hpp"
 #include "strix/graph_operator_control.hpp"
+#ifdef STRIX_BUILD_QSA_GQA_REUSE_DIAGNOSTIC
+#include "strix/hip_qsa_gqa_reuse_diagnostic.hpp"
+#endif
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -3019,5 +3022,223 @@ void launch_hip_graph_attention_state(const GraphAttentionStatePlan& plan,
     }
     throw std::logic_error("unreachable attention norm encoding");
 }
+
+#ifdef STRIX_BUILD_QSA_GQA_REUSE_DIAGNOSTIC
+namespace {
+// Test-only grouping of independent heads. Each head retains the incumbent
+// 256-feature product/store and 128->1 tree. Only the BF16 K load is shared.
+template <std::uint32_t Heads>
+__global__ void qsa_gqa_score_diagnostic_kernel(
+    const float* q_gate, const std::uint16_t* kv_state, const std::uint32_t* selected,
+    std::uint32_t selected_count, std::uint32_t maximum_selected,
+    std::uint32_t attention_heads, std::uint32_t kv_heads, std::uint32_t head_dim,
+    float* scores, GraphSelectionArguments dynamic) {
+    if (!graph_selected_count(dynamic, selected_count)) return;
+    const auto flat = static_cast<std::uint32_t>(blockIdx.x);
+    const auto selected_slot = flat % maximum_selected;
+    if (selected_slot >= selected_count) return;
+    const auto group = attention_heads / kv_heads;
+    const auto blocks_per_group = (group + Heads - 1U) / Heads;
+    const auto head_block = flat / maximum_selected;
+    const auto kv_head = head_block / blocks_per_group;
+    const auto first_head = kv_head * group + (head_block % blocks_per_group) * Heads;
+    const auto feature = static_cast<std::uint32_t>(threadIdx.x);
+    const auto kv_width = kv_heads * head_dim;
+    const auto row_base = static_cast<std::uint64_t>(selected[selected_slot]) * kv_width * 2ULL;
+    float key = 0.0F;
+    if (feature < head_dim)
+        key = bf16_to_float(kv_state[row_base + static_cast<std::uint64_t>(kv_head) * head_dim + feature]);
+    __shared__ float scratch[Heads][kThreads];
+#pragma unroll
+    for (std::uint32_t local = 0; local < Heads; ++local) {
+        const auto head = first_head + local;
+        float product = 0.0F;
+        if (head < (kv_head + 1U) * group && feature < head_dim)
+            product = q_gate[static_cast<std::uint64_t>(head) * head_dim * 2ULL + feature] * key;
+        scratch[local][feature] = product;
+    }
+    __syncthreads();
+    for (std::uint32_t stride = kThreads / 2U; stride > 0; stride >>= 1U) {
+        if (feature < stride) {
+#pragma unroll
+            for (std::uint32_t local = 0; local < Heads; ++local)
+                scratch[local][feature] += scratch[local][feature + stride];
+        }
+        __syncthreads();
+    }
+    if (feature == 0) {
+#pragma unroll
+        for (std::uint32_t local = 0; local < Heads; ++local) {
+            const auto head = first_head + local;
+            if (head < (kv_head + 1U) * group) {
+                if (dynamic.position.status != nullptr && !isfinite(scratch[local][0])) atomicOr(dynamic.position.status, 8U);
+                scores[static_cast<std::uint64_t>(head) * maximum_selected + selected_slot] =
+                    scratch[local][0] / sqrtf(static_cast<float>(head_dim));
+            }
+        }
+    }
+}
+
+// Each independent accumulator visits slots in the incumbent chronological
+// order and keeps the same score*value operand order and BF16/gate epilogue.
+template <std::uint32_t Heads>
+__global__ void qsa_gqa_value_diagnostic_kernel(
+    const float* q_gate, const std::uint16_t* kv_state, const std::uint32_t* selected,
+    const float* scores, std::uint32_t selected_count, std::uint32_t maximum_selected,
+    std::uint32_t attention_heads, std::uint32_t kv_heads, std::uint32_t head_dim,
+    float* output, GraphSelectionArguments dynamic) {
+    if (!graph_selected_count(dynamic, selected_count)) return;
+    const auto group = attention_heads / kv_heads;
+    const auto blocks_per_group = (group + Heads - 1U) / Heads;
+    const auto head_block = static_cast<std::uint32_t>(blockIdx.x);
+    const auto kv_head = head_block / blocks_per_group;
+    const auto first_head = kv_head * group + (head_block % blocks_per_group) * Heads;
+    const auto feature = static_cast<std::uint32_t>(threadIdx.x);
+    if (feature >= head_dim) return;
+    const auto kv_width = kv_heads * head_dim;
+    float sums[Heads]{};
+    for (std::uint32_t slot = 0; slot < selected_count; ++slot) {
+        const auto row_base = static_cast<std::uint64_t>(selected[slot]) * kv_width * 2ULL;
+        const auto value = bf16_to_float(kv_state[row_base + kv_width +
+            static_cast<std::uint64_t>(kv_head) * head_dim + feature]);
+#pragma unroll
+        for (std::uint32_t local = 0; local < Heads; ++local) {
+            const auto head = first_head + local;
+            if (head < (kv_head + 1U) * group)
+                sums[local] += scores[static_cast<std::uint64_t>(head) * maximum_selected + slot] * value;
+        }
+    }
+#pragma unroll
+    for (std::uint32_t local = 0; local < Heads; ++local) {
+        const auto head = first_head + local;
+        if (head < (kv_head + 1U) * group) {
+            const float attn = round_bf16(sums[local]);
+            const float gate = round_bf16(1.0F / (1.0F + expf(-q_gate[
+                static_cast<std::uint64_t>(head) * head_dim * 2ULL + head_dim + feature])));
+            output[static_cast<std::uint64_t>(head) * head_dim + feature] = round_bf16(attn * gate);
+        }
+    }
+}
+
+__global__ void qsa_gqa_validate_diagnostic_kernel(const float* q_gate, const std::uint16_t* kv_state,
+    const std::uint32_t* selected, std::uint32_t attention_heads, std::uint32_t kv_heads,
+    std::uint32_t head_dim, GraphSelectionArguments dynamic) {
+    __shared__ std::uint32_t admitted;
+    __shared__ std::uint32_t count;
+    __shared__ std::uint32_t visible;
+    if (threadIdx.x == 0) {
+        admitted = atomicAdd(dynamic.position.status, 0U) == 0U;
+        if (admitted) {
+            const auto position = *dynamic.position.position;
+            if (position >= dynamic.position.context_tokens) {
+                atomicOr(dynamic.position.status, qsa_gqa_reuse_diagnostic::invalid_position); admitted = 0U;
+            } else {
+                visible = static_cast<std::uint32_t>(position + 1ULL);
+                count = min(visible / dynamic.ratio, dynamic.block_topk) * dynamic.ratio + visible % dynamic.ratio;
+            }
+        }
+    }
+    __syncthreads();
+    if (!admitted) return;
+    for (std::uint32_t index = threadIdx.x; index < attention_heads * head_dim * 2U; index += kThreads)
+        if (!isfinite(q_gate[index])) atomicOr(dynamic.position.status, qsa_gqa_reuse_diagnostic::nonfinite_source);
+    for (std::uint32_t slot = threadIdx.x; slot < count; slot += kThreads) {
+        const auto token = selected[slot];
+        if (token >= visible || (slot && selected[slot - 1U] >= token))
+            atomicOr(dynamic.position.status, qsa_gqa_reuse_diagnostic::invalid_selection);
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) admitted = atomicAdd(dynamic.position.status, 0U) == 0U;
+    __syncthreads();
+    if (!admitted) return; // Never gather an unvalidated selected ID.
+    const auto row_elements = kv_heads * head_dim * 2U;
+    const auto elements = static_cast<std::uint64_t>(count) * row_elements;
+    for (std::uint64_t index = threadIdx.x; index < elements; index += kThreads) {
+        const auto token = selected[index / row_elements];
+        const auto bits = kv_state[static_cast<std::uint64_t>(token) * row_elements + index % row_elements];
+        if ((bits & 0x7f80U) == 0x7f80U)
+            atomicOr(dynamic.position.status, qsa_gqa_reuse_diagnostic::nonfinite_source);
+    }
+}
+__global__ void qsa_gqa_validate_output_diagnostic_kernel(const float* output, std::uint32_t count, std::uint32_t* status) {
+    if (atomicAdd(status, 0U) != 0U) return;
+    for (std::uint32_t index = threadIdx.x; index < count; index += kThreads)
+        if (!isfinite(output[index])) atomicOr(status, qsa_gqa_reuse_diagnostic::invalid_arithmetic);
+}
+} // namespace
+
+namespace qsa_gqa_reuse_diagnostic {
+const void* score_kernel_symbol(Mode mode) {
+    switch (mode) {
+    case Mode::reference: return reinterpret_cast<const void*>(attention_score_kernel);
+    case Mode::heads2: return reinterpret_cast<const void*>(qsa_gqa_score_diagnostic_kernel<2U>);
+    case Mode::heads4: return reinterpret_cast<const void*>(qsa_gqa_score_diagnostic_kernel<4U>);
+    }
+    throw std::invalid_argument("invalid QSA GQA diagnostic mode");
+}
+const void* value_kernel_symbol(Mode mode) {
+    switch (mode) {
+    case Mode::reference: return reinterpret_cast<const void*>(attention_output_kernel);
+    case Mode::heads2: return reinterpret_cast<const void*>(qsa_gqa_value_diagnostic_kernel<2U>);
+    case Mode::heads4: return reinterpret_cast<const void*>(qsa_gqa_value_diagnostic_kernel<4U>);
+    }
+    throw std::invalid_argument("invalid QSA GQA diagnostic mode");
+}
+namespace {
+void enqueue_impl(Shape shape, const Bindings& bindings, Mode mode, hipStream_t stream, bool scores_only) {
+    const auto launch = validate(shape, bindings, mode);
+    if (!stream || stream == hipStreamPerThread || stream == hipStreamLegacy)
+        throw std::invalid_argument("QSA GQA diagnostic requires an explicitly owned stream");
+    check_hip(hipPeekAtLastError(), "QSA GQA diagnostic stale error");
+    const auto* query = reinterpret_cast<const float*>(bindings.q_gate.address);
+    const auto* kv = reinterpret_cast<const std::uint16_t*>(bindings.kv_state.address);
+    const auto* selected = reinterpret_cast<const std::uint32_t*>(bindings.selected.address);
+    auto* scores = reinterpret_cast<float*>(bindings.scores.address);
+    auto* output = reinterpret_cast<float*>(bindings.output.address);
+    auto* status = reinterpret_cast<std::uint32_t*>(bindings.status.address);
+    const GraphSelectionArguments dynamic{{reinterpret_cast<const std::uint64_t*>(bindings.position.address),
+        shape.context_tokens, status}, compression, block_topk};
+    hipLaunchKernelGGL(qsa_gqa_validate_diagnostic_kernel, dim3(1), dim3(kThreads), 0, stream,
+        query, kv, selected, shape.query_heads, shape.kv_heads, shape.head_dim, dynamic);
+    check_hip(hipGetLastError(), "QSA GQA diagnostic source validation");
+#define STRIX_QSA_GQA_SCORE(kernel) \
+    hipLaunchKernelGGL(kernel, dim3(launch.score_blocks), dim3(kThreads), 0, stream, \
+        query, kv, selected, launch.maximum_selected, launch.maximum_selected, \
+        shape.query_heads, shape.kv_heads, shape.head_dim, scores, dynamic)
+    switch (mode) {
+    case Mode::reference: STRIX_QSA_GQA_SCORE(attention_score_kernel); break;
+    case Mode::heads2: STRIX_QSA_GQA_SCORE(HIP_KERNEL_NAME(qsa_gqa_score_diagnostic_kernel<2U>)); break;
+    case Mode::heads4: STRIX_QSA_GQA_SCORE(HIP_KERNEL_NAME(qsa_gqa_score_diagnostic_kernel<4U>)); break;
+    }
+#undef STRIX_QSA_GQA_SCORE
+    check_hip(hipGetLastError(), "QSA GQA diagnostic score");
+    if (scores_only) return;
+    hipLaunchKernelGGL(attention_softmax_kernel, dim3(shape.query_heads), dim3(kThreads), 0, stream,
+        scores, launch.maximum_selected, launch.maximum_selected, dynamic);
+    check_hip(hipGetLastError(), "QSA GQA diagnostic original softmax");
+#define STRIX_QSA_GQA_VALUE(kernel) \
+    hipLaunchKernelGGL(kernel, dim3(launch.value_blocks), dim3(shape.head_dim), 0, stream, \
+        query, kv, selected, scores, launch.maximum_selected, launch.maximum_selected, \
+        shape.query_heads, shape.kv_heads, shape.head_dim, output, dynamic)
+    switch (mode) {
+    case Mode::reference: STRIX_QSA_GQA_VALUE(attention_output_kernel); break;
+    case Mode::heads2: STRIX_QSA_GQA_VALUE(HIP_KERNEL_NAME(qsa_gqa_value_diagnostic_kernel<2U>)); break;
+    case Mode::heads4: STRIX_QSA_GQA_VALUE(HIP_KERNEL_NAME(qsa_gqa_value_diagnostic_kernel<4U>)); break;
+    }
+#undef STRIX_QSA_GQA_VALUE
+    check_hip(hipGetLastError(), "QSA GQA diagnostic value/gate");
+    hipLaunchKernelGGL(qsa_gqa_validate_output_diagnostic_kernel, dim3(1), dim3(kThreads), 0, stream,
+        output, shape.query_heads * shape.head_dim, status);
+    check_hip(hipGetLastError(), "QSA GQA diagnostic finite output");
+}
+} // namespace
+void enqueue(Shape shape, const Bindings& bindings, Mode mode, hipStream_t stream) {
+    enqueue_impl(shape, bindings, mode, stream, false);
+}
+void enqueue_scores(Shape shape, const Bindings& bindings, Mode mode, hipStream_t stream) {
+    enqueue_impl(shape, bindings, mode, stream, true);
+}
+} // namespace qsa_gqa_reuse_diagnostic
+#endif
 
 }  // namespace strix

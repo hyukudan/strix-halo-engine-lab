@@ -32,7 +32,7 @@ int main() {
            defaults.context_tokens == 128 && !defaults.q4k_a8g32_gate_up &&
            !defaults.profile_explicit && !defaults.any_low_level_flag &&
            !defaults.prefetch_q8_qsa_input && !defaults.prefetch_q8_shared_expert &&
-           !defaults.deferred_moe_status && !defaults.gpu_greedy_token && !defaults.prepared_eager,
+           !defaults.deferred_moe_status && !defaults.gpu_greedy_token && !defaults.prepared_eager && !defaults.moe_shared_overlap,
            "parser defers auto until content identification");
     auto on = defaults;
     auto inventory_only = parse({"decoder", "fixture.gguf", "1", "--execution-inventory"});
@@ -67,6 +67,18 @@ int main() {
         "--generate and --reference are separate execution modes");
     rejects([] { static_cast<void>(parse({"decoder", "m", "1", "--generate", "2", "--gpu-greedy-token", "--gpu-greedy-token"})); },
         "duplicate GPU greedy token option");
+    auto overlap = parse({"decoder", "fixture.gguf", "1", "--moe-shared-overlap"});
+    const auto overlap_profile = resolve_optimization_profile(overlap, model, info, manifest,
+        validated_model_content_identity, true);
+    expect(overlap.moe_shared_overlap && !overlap.any_low_level_flag && overlap_profile.automatic_applied &&
+        overlap.deferred_moe_status && overlap.moe_overlap_arena_budget_bytes == 64ULL * 1024ULL * 1024ULL,
+        "explicit overlap retains the automatic arithmetic bundle and a bounded arena budget");
+    rejects([] { static_cast<void>(parse({"decoder", "m", "1", "--moe-overlap-arena-budget-bytes", "64"})); },
+        "MoE overlap arena budget requires enabled overlap and nonzero bytes");
+    rejects([] { static_cast<void>(parse({"decoder", "m", "1", "--moe-shared-overlap", "--moe-overlap-arena-budget-bytes", "0"})); },
+        "MoE overlap arena budget requires enabled overlap and nonzero bytes");
+    rejects([] { static_cast<void>(parse({"decoder", "m", "1", "--moe-shared-overlap", "--moe-shared-overlap"})); },
+        "duplicate MoE shared overlap option");
     auto instrumented = parse({"decoder", "fixture.gguf", "1", "--host-dispatch-telemetry"});
     const auto instrumented_profile = resolve_optimization_profile(instrumented, model, info, manifest,
         validated_model_content_identity, true);

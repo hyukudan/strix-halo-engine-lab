@@ -384,6 +384,25 @@ class InventoryTests(unittest.TestCase):
                 INVENTORY.operator_records({"requirements": [{"op": "lm_head", "status": status}]}, {})
 
 
+    def test_reported_environment_never_proves_effective_queues_or_overlap(self):
+        value = {"source": "decoder-process", "requested": {key: None for key in INVENTORY.RUNTIME_ENVIRONMENT_KEYS},
+                 "effective_hw_queues": None, "concurrent_execution_observed": None}
+        value["requested"]["GPU_MAX_HW_QUEUES"] = "1"
+        result = self.collect(receipt_path=self.evidence("environment.json", {"hip_runtime_environment": value}))
+        self.assertEqual(result["reported_hip_runtime_environment"], value)
+        self.assertTrue(result["consistent"])
+        for field, setting in (("effective_hw_queues", 1), ("concurrent_execution_observed", True), ("source", "collector-process")):
+            bad = copy.deepcopy(value)
+            bad[field] = setting
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                INVENTORY.validate_runtime_environment(bad)
+        for setting in (False, 1, []):
+            bad = copy.deepcopy(value)
+            bad["requested"]["GPU_MAX_HW_QUEUES"] = setting
+            with self.subTest(setting=setting), self.assertRaises(ValueError):
+                INVENTORY.validate_runtime_environment(bad)
+
+
 
 if __name__ == "__main__":
     unittest.main()

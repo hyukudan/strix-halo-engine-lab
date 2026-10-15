@@ -18,6 +18,8 @@
 
 namespace strix {
 
+class PreparedTensorViews;
+
 struct ExecutionDispatchContext {
     // Zero denotes an uncompiled execution and cannot use a compiled launcher.
     std::uint64_t execution_identity = 0;
@@ -33,6 +35,9 @@ struct ExecutionDispatchContext {
     const SerialSessionStateLayout* session_state_layout = nullptr;
     const SessionStateMemoryBinding* session_state_memory = nullptr;
     const ExecutionRuntimeResources* resources = nullptr;
+    // Published only after the immutable prepared plan admits this run. The
+    // launcher borrows this snapshot; caller retains it through quiescence.
+    const PreparedTensorViews* prepared_tensor_views = nullptr;
     PersistentState reads_state = PersistentState::none;
     PersistentState writes_state = PersistentState::none;
     std::uint32_t logical_rows = 1;

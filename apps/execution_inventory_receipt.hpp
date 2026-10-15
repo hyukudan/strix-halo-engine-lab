@@ -3,6 +3,8 @@
 #include "hip_decode_receipt_json.hpp"
 #include "strix/launch_dispatch.hpp"
 
+#include <array>
+#include <cstdlib>
 #include <locale>
 #include <sstream>
 #include <stdexcept>
@@ -26,6 +28,33 @@ inline void string(std::ostream& out, std::string_view value) {
     out << '"' << escape_json_string(value) << '"';
 }
 } // namespace execution_inventory_detail
+
+// Explicit decoder-process settings only. Unset/empty strings are distinct;
+// environment values do not prove the runtime's effective queue topology or
+// observed kernel overlap. This never changes a process setting.
+template<class Getter>
+inline std::string hip_runtime_environment_receipt(Getter&& get) {
+    constexpr std::array names{"GPU_MAX_HW_QUEUES", "HSA_ENABLE_SDMA",
+        "HSA_OVERRIDE_GFX_VERSION", "AMD_SERIALIZE_KERNEL", "AMD_SERIALIZE_COPY",
+        "HIP_LAUNCH_BLOCKING", "HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES"};
+    std::ostringstream out;
+    out.imbue(std::locale::classic());
+    out << "  \"hip_runtime_environment\":{\"source\":\"decoder-process\",\"requested\":{";
+    bool first = true;
+    for (const auto* name : names) {
+        if (!first) out << ',';
+        first = false;
+        execution_inventory_detail::string(out, name);
+        out << ':';
+        if (const auto* value = get(name)) execution_inventory_detail::string(out, value);
+        else out << "null";
+    }
+    out << "},\"effective_hw_queues\":null,\"concurrent_execution_observed\":null},\n";
+    return out.str();
+}
+inline std::string hip_runtime_environment_receipt() {
+    return hip_runtime_environment_receipt([](const char* name) { return std::getenv(name); });
+}
 
 // Describes this compiled decode selection, not a general capability catalog or
 // native qualification. No launcher is called and no pointer address is emitted.

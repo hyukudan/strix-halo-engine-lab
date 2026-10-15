@@ -137,7 +137,22 @@ def closed_keys(value, required, optional, label):
         raise ValueError(f"{label} has missing or unknown keys")
 
 
+RUNTIME_ENVIRONMENT_KEYS = {"GPU_MAX_HW_QUEUES", "HSA_ENABLE_SDMA", "HSA_OVERRIDE_GFX_VERSION",
+    "AMD_SERIALIZE_KERNEL", "AMD_SERIALIZE_COPY", "HIP_LAUNCH_BLOCKING", "HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES"}
+
+
+def validate_runtime_environment(value):
+    closed_keys(value, {"source", "requested", "effective_hw_queues", "concurrent_execution_observed"}, set(), "runtime environment")
+    if value["source"] != "decoder-process" or value["effective_hw_queues"] is not None or value["concurrent_execution_observed"] is not None:
+        raise ValueError("requested environment is not effective queue or overlap evidence")
+    closed_keys(value["requested"], RUNTIME_ENVIRONMENT_KEYS, set(), "runtime environment requested settings")
+    if any(item is not None and not isinstance(item, str) for item in value["requested"].values()):
+        raise ValueError("runtime environment settings must be strings or null")
+
+
 def validate_outer_receipt(receipt):
+    if receipt.get("hip_runtime_environment") is not None:
+        validate_runtime_environment(receipt["hip_runtime_environment"])
     # Outer receipts and external audit/probe schemas remain open: only fields
     # consumed here are checked. A missing or explicit null identity stays unknown.
     for key in ("execution_identity", "kernel_plan_identity", "launch_plan_identity",
@@ -411,6 +426,7 @@ def collect(repo, cache_path=None, receipt_path=None, audit_path=None, manifest_
     return {"schema_version": 1, "kind": "offline-runtime-inventory",
             "source": source, "inputs": inputs,
             "configured_build": cache, "build_completed": None,
+            "reported_hip_runtime_environment": receipt.get("hip_runtime_environment"),
             "model": model, "reported_model_sha256": receipt.get("model_sha256"),
             "reported_model_content_identity": receipt.get("model_content_identity"),
             "binary": binary, "effective_profile": effective,

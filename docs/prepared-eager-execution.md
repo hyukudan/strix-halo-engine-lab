@@ -9,14 +9,21 @@ The prepared runner keeps dynamic token/shape/position checks, required state
 flags, generation-overflow checks, resource validation and compatibility/binding
 identities. A changed physical generation or binding requires new preparation.
 The state layout is compared with its prepared snapshot so mutation under a stale
-identity is rejected. No tensor pointers or request token spans are cached.
+identity is rejected. A deeply owned tensor-view index snapshots the validated manifest, physical
+bindings and canonical step/slot access plan. Actual allocation owners remain
+strongly retained. Request token spans are never retained.
 
 Each run creates only its lightweight result/state metadata. Its submission order
 is a view of immutable prepared storage, avoiding a newly allocated completed
 vector and result-order vector. The view remains valid while the prepared object
-lives. Launcher-specific validation is unchanged. This does not remove tensor
-searches inside launchers or all metadata work: those remain subsequent prepared
-operator increments. Dynamic resource validation is deliberately retained.
+lives. Tensor helpers use the immutable views: index lookup is constant time,
+name lookup uses a prebuilt transparent tree and step/slot access uses the existing
+binary search. This avoids rescanning and validating every model tensor for each
+individual lookup. Before publishing the cache in any dispatch context, admission
+still compares all source metadata and physical identities; source descriptor
+handles are also checked at lookup. Launcher-specific shape/numerical checks and
+remaining operator-local tensor selection are unchanged. Dynamic admission is
+still linear in model metadata and is not claimed to meet every hot-path goal.
 
 The prepared session adapter preserves the existing session's readiness, PLE
 prefetch, before-commit hook, poison/taint boundary, state generations, lineage

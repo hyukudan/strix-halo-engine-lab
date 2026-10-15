@@ -17,7 +17,8 @@ public:
         if (!execution_identity_ || !logical_rows_ || !concurrency_ || compiled.execution.steps.empty() ||
             compiled.execution.steps.back().id != compiled.execution.steps.size() - 1U ||
             compiled.execution.steps.back().op != SerialOp::lm_head ||
-            compiled.execution.steps.back().writes_state != PersistentState::none)
+            (compiled.execution.steps.back().reads_state != PersistentState::none ||
+             compiled.execution.steps.back().writes_state != PersistentState::none))
             throw std::invalid_argument("state-only prefix requires a terminal state-free LM head");
         terminal_head_ = compiled.execution.steps.back().id;
     }
@@ -37,7 +38,7 @@ public:
         if (state_only_ && context.op == SerialOp::lm_head) {
             if (context.execution_identity != execution_identity_ || context.logical_rows != logical_rows_ ||
                 context.request_concurrency != concurrency_ || context.step_id != terminal_head_ ||
-                context.writes_state != PersistentState::none)
+                context.reads_state != PersistentState::none || context.writes_state != PersistentState::none)
                 throw std::invalid_argument("prefix output intent cannot omit a nonterminal or stateful head");
             if (omitted_heads_ != std::numeric_limits<std::uint64_t>::max()) ++omitted_heads_;
             return;
@@ -47,6 +48,7 @@ public:
     void dispatch_runtime_step(const ExecutionDispatchContext& context) override {
         delegate_.dispatch_runtime_step(context);
     }
+    [[nodiscard]] bool state_only_active() const noexcept { return state_only_; }
     [[nodiscard]] std::uint64_t omitted_heads() const noexcept { return omitted_heads_; }
 private:
     EagerExecutionDispatcher& delegate_;

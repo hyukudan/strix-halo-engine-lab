@@ -90,6 +90,9 @@ struct OptimizationProfileResolution {
     bool automatic_applied = false;
 };
 struct Options {
+    bool moe_shared_overlap = false;
+    std::uint64_t moe_overlap_arena_budget_bytes = 64ULL * 1024ULL * 1024ULL;
+    bool moe_overlap_budget_explicit = false;
     bool prepared_eager = false;
     bool gpu_greedy_token = false;
     bool execution_inventory = false;
@@ -169,7 +172,7 @@ inline Options parse_options(
         throw std::invalid_argument(
             "usage: strix-hip-decode-token MODEL.gguf [TOKEN_ID ...] "
             "[--optimization-profile auto|manual] [--execution-inventory] [--host-dispatch-telemetry] "
-            "[--gpu-greedy-token] [--prepared-eager] [--reference FILE] [--max-logit-error X] "
+            "[--gpu-greedy-token] [--prepared-eager] [--moe-shared-overlap] [--reference FILE] [--max-logit-error X] "
             "[--context N] [--residency register|copy] [--coalesce-gap BYTES] "
             "[--planned-ple-io] [--ple-max-rows-per-io N] [--ple-max-inflight-ios N] "
             "[--generate N] [--eos-token TOKEN_ID] [--prefix-cache-roundtrip] "
@@ -190,6 +193,19 @@ inline Options parse_options(
             argv[index];
         options.any_low_level_flag = options.any_low_level_flag ||
             is_low_level_optimization_option(argument);
+        if (argument == "--moe-shared-overlap") {
+            if (options.moe_shared_overlap)
+                throw std::invalid_argument("duplicate MoE shared overlap option");
+            options.moe_shared_overlap = true;
+            continue;
+        }
+        if (argument == "--moe-overlap-arena-budget-bytes") {
+            if (options.moe_overlap_budget_explicit || index + 1 >= argc)
+                throw std::invalid_argument("MoE overlap arena budget requires one byte value");
+            options.moe_overlap_budget_explicit = true;
+            options.moe_overlap_arena_budget_bytes = parse_u64(argv[++index], "MoE overlap arena budget");
+            continue;
+        }
         if (argument == "--prepared-eager") {
             if (options.prepared_eager)
                 throw std::invalid_argument("duplicate prepared eager option");
@@ -534,6 +550,13 @@ inline Options parse_options(
         throw std::invalid_argument(
             "--generate requires at least one prefix token id");
     }
+    if (options.moe_shared_overlap && (options.prefix_cache_roundtrip ||
+        options.execution.mode != strix::DecodeExecutionMode::eager ||
+        options.execution.integer_head != strix::DecodeIntegerHead::none))
+        throw std::invalid_argument("MoE shared overlap requires eager mode without integer head or prefix roundtrip");
+    if ((options.moe_overlap_budget_explicit && !options.moe_shared_overlap) ||
+        (options.moe_shared_overlap && !options.moe_overlap_arena_budget_bytes))
+        throw std::invalid_argument("MoE overlap arena budget requires enabled overlap and nonzero bytes");
     if (options.prepared_eager && (options.prefix_cache_roundtrip ||
         options.execution.mode != strix::DecodeExecutionMode::eager ||
         options.execution.integer_head != strix::DecodeIntegerHead::none))
