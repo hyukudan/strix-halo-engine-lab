@@ -161,7 +161,8 @@ float round_bf16(float value) {
 int main(int argc, char** argv) try {
     const unsigned int requested_mode = argc > 1 ? static_cast<unsigned int>(std::stoul(argv[1])) : 0U;
     if (requested_mode > 7U) throw std::invalid_argument("invalid K-quant test mode");
-    const bool q4k_a8 = argc > 2 && std::string(argv[2]) == "q4k-a8";
+    const bool q4k_a8 = argc > 2 && (std::string(argv[2]) == "q4k-a8" || std::string(argv[2]) == "q4k-a8-duplicate");
+    const bool duplicate_routes = argc > 2 && std::string(argv[2]) == "q4k-a8-duplicate";
 #ifndef STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME
     if(q4k_a8) throw std::invalid_argument("Q4K A8 test requires runtime capability");
 #endif
@@ -274,7 +275,7 @@ int main(int argc, char** argv) try {
     }
 
     const std::vector<std::uint32_t>
-        selected{1U, q4k_a8 ? 1U : 3U};
+        selected{1U, duplicate_routes ? 1U : 3U};
     const std::vector<float>
         selected_weights{0.7F, 0.3F};
 
@@ -648,6 +649,27 @@ int main(int argc, char** argv) try {
                 "activated gate half matches independent slot composition");
         }
     }
+    if(q4k_a8 && gate_type==12U) {
+        const auto temporary=strix::resolve_execution_buffer(memory.execution_identity,arena,memory,step_io.temporaries[0]);
+        std::vector<std::byte> scratch_after(static_cast<std::size_t>(temporary.bytes));
+        const auto malformed_binding = [&](unsigned tensor, std::uintptr_t address, std::uint64_t bytes) {
+            check(hipMemset(reinterpret_cast<void*>(temporary.address),0x5a,static_cast<std::size_t>(temporary.bytes)),"poison pre-admission scratch");
+            const auto saved=runtime.tensors[tensor];
+            runtime.tensors[tensor].address=address; runtime.tensors[tensor].bytes=bytes;
+            bool reject=false;
+            try { launcher.function(context,launcher.user_data); }
+            catch(const std::invalid_argument&) { reject=true; }
+            runtime.tensors[tensor]=saved;
+            check(hipMemcpy(scratch_after.data(),reinterpret_cast<void*>(temporary.address),scratch_after.size(),hipMemcpyDeviceToHost),"read pre-admission scratch");
+            check(hipMemcpy(after.data(),reinterpret_cast<void*>(output.address),output_bytes,hipMemcpyDeviceToHost),"read pre-admission destination");
+            expect(reject && before==after && std::all_of(scratch_after.begin(),scratch_after.end(),
+                [](std::byte v){return v==std::byte{0x5a};}),"malformed binding rejects before clear, scratch mutation or semantic publication");
+        };
+        malformed_binding(0,temporary.address,runtime.tensors[0].bytes);
+        malformed_binding(1,runtime.tensors[0].address,runtime.tensors[1].bytes);
+        malformed_binding(2,output.address,runtime.tensors[2].bytes);
+        malformed_binding(0,runtime.tensors[0].address,runtime.tensors[0].bytes-1);
+    }
     if(q4k_a8 && gate_type==13U) {
         auto legacy_config=config; legacy_config.q4k_a8g32_gate_up=false;
         auto legacy=strix::make_hip_moe_experts_launcher("test.legacy.moe",&legacy_config);
@@ -799,7 +821,63 @@ int main(int argc, char** argv) try {
         }
         check(hipMemcpy(device_weights[2],huge_down.data(),huge_down.size(),hipMemcpyHostToDevice),"upload finite down-overflow payload");
         error_case(8U,true);
+        // Use identical exactly representable BF16/FP32 input and isolate slot0.
+        // Calibrate from actual finite FP32 accumulation, then scale only a finite
+        // route weight. The largest output targets the middle of the BF16-overflow
+        // band without overflowing FP32; no rounded BF16 output is used as a reference.
+        restore(); upload_input(std::vector<float>(hidden,67108864.0F));
+        std::array<float,2> calibration_weights{1.0F,0.0F};
+        check(hipMemcpy(reinterpret_cast<void*>(route_weights.address),calibration_weights.data(),sizeof(calibration_weights),hipMemcpyHostToDevice),"upload first-slot calibration weights");
+        launcher.function(context,launcher.user_data);
+        std::vector<float> accumulation(hidden);
+        check(hipMemcpy(accumulation.data(),reinterpret_cast<void*>(temporary.address+layout.accumulation_offset),hidden*4,hipMemcpyDeviceToHost),"read finite calibration accumulation");
+        float maximum=0.0F;
+        for(const auto value:accumulation) {
+            if(!std::isfinite(value)) throw std::runtime_error("nonfinite rounding-band calibration");
+            maximum=std::max(maximum,std::abs(value));
+        }
+        if(!(maximum>1.0F)) throw std::runtime_error("rounding-band calibration too small");
+        calibration_weights[0]=std::bit_cast<float>(0x7f7fc000U)/maximum;
+        if(!std::isfinite(calibration_weights[0])) throw std::runtime_error("rounding-band route scale is nonfinite");
+        check(hipMemcpy(reinterpret_cast<void*>(route_weights.address),calibration_weights.data(),sizeof(calibration_weights),hipMemcpyHostToDevice),"upload finite rounding-band route scale");
+        check(hipMemcpy(reinterpret_cast<void*>(output.address),before.data(),output_bytes,hipMemcpyHostToDevice),"restore semantic destination before rounding-band test");
+        if(bf16) error_case(8U,false);
+        else {
+            launcher.function(context,launcher.user_data);
+            std::vector<std::byte> scaled_before(output_bytes);
+            check(hipMemcpy(scaled_before.data(),reinterpret_cast<void*>(output.address),output_bytes,hipMemcpyDeviceToHost),"read finite FP32 band commit");
+            const unsigned preset=0x200U;
+            check(hipMemcpyAsync(graph_status,&preset,4,hipMemcpyHostToDevice,graph_stream),"preset finite FP32 band aggregate");
+            check(hipMemsetAsync(reinterpret_cast<void*>(output.address),0xa5,output_bytes,graph_stream),"poison FP32 rounding-band replay output");
+            check(hipGraphLaunch(graph_exec,graph_stream),"replay finite FP32 rounding band");
+            unsigned aggregate=0,local=0;
+            check(hipMemcpyAsync(&aggregate,graph_status,4,hipMemcpyDeviceToHost,graph_stream),"read FP32 band aggregate");
+            check(hipMemcpyAsync(&local,reinterpret_cast<void*>(temporary.address+layout.status_offset),4,hipMemcpyDeviceToHost,graph_stream),"read FP32 band local status");
+            check(hipMemcpyAsync(after.data(),reinterpret_cast<void*>(output.address),output_bytes,hipMemcpyDeviceToHost,graph_stream),"read FP32 band replay output");
+            check(hipStreamSynchronize(graph_stream),"drain FP32 rounding-band graph");
+            expect(aggregate==preset && local==0 && scaled_before==after,"FP32 threshold admits finite BF16-overflow band in eager and graph");
+        }
+        check(hipMemcpy(accumulation.data(),reinterpret_cast<void*>(temporary.address+layout.accumulation_offset),hidden*4,hipMemcpyDeviceToHost),"read actual rounding-band accumulation");
+        bool band=false; unsigned maximum_bits=0;
+        for(const auto value:accumulation) {
+            const auto bits=std::bit_cast<unsigned>(value)&0x7fffffffU;
+            expect(bits<0x7f800000U,"rounding-band accumulation remains finite FP32");
+            band=band || (bits>=0x7f7f8000U && bits<0x7f800000U);
+            maximum_bits=std::max(maximum_bits,bits);
+        }
+        expect(band,"actual finite accumulator reaches BF16 rounding-overflow band");
+        std::vector<float> finite_stages(2ULL*intermediate*top_k);
+        check(hipMemcpy(finite_stages.data(),reinterpret_cast<void*>(temporary.address),finite_stages.size()*4,hipMemcpyDeviceToHost),"read finite pre-down rounding-band stages");
+        expect(std::all_of(finite_stages.begin(),finite_stages.end(),[](float value){return std::isfinite(value);}),"rounding-band error originates after finite projection and SiLU");
+        if(!bf16) {
+            std::vector<float> committed(hidden);
+            check(hipMemcpy(committed.data(),reinterpret_cast<void*>(output.address),hidden*4,hipMemcpyDeviceToHost),"read FP32 admitted band values");
+            for(unsigned i=0;i<hidden;++i) expect(std::bit_cast<unsigned>(committed[i])==std::bit_cast<unsigned>(accumulation[i]),"FP32 band commit preserves every finite accumulator bit");
+        }
+        std::cout << "rounding-band maxabs-bits=" << maximum_bits << " finite-route-scale-bits="
+            << std::bit_cast<unsigned>(calibration_weights[0]) << " bf16-reject=" << bf16 << '\n';
         restore();
+        check(hipMemcpy(reinterpret_cast<void*>(output.address),before.data(),output_bytes,hipMemcpyHostToDevice),"restore output after rounding-band fixture");
         std::cout << "Q4K A8 native independent up comparisons=" << top_k*intermediate
             << " successful graph replays=3 input/header/activation/down failure gates passed\n";
     }

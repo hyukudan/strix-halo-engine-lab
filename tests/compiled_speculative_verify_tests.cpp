@@ -271,6 +271,14 @@ int main() {
         q4_rejected=std::string(error.what()).find("Q4K A8 runtime does not support speculative verify") != std::string::npos;
     }
     expect(q4_rejected,"Q4K A8 explicitly rejects speculative depth1 before alternate admission");
+    q4_buffers.q4k_a8g32_gate_up=false; q4_rejected=false;
+    try { (void)strix::compile_speculative_verify_execution(model,1,
+        make_registry(model,1,".q4k-a8g32-gateup-v2"),binding,q4_buffers); }
+    catch(const std::invalid_argument& error) {
+        q4_rejected=std::string(error.what()).find("Q4K A8 runtime does not support speculative verify") != std::string::npos;
+    }
+    expect(q4_rejected,"speculative depth1 rejects quantized kernel even without mode admission");
+
 
     if (failures == 0) {
         std::cout << "compiled speculative verify tests passed\n";

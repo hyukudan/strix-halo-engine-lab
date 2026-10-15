@@ -1341,6 +1341,10 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         )
 
         if(STRIX_ENABLE_EXPERIMENTAL_Q4K_A8_RUNTIME)
+            foreach(mode 0 4)
+                add_test(NAME strix-hip-moe-q4k-a8-native-duplicate-${mode}-tests
+                    COMMAND strix-hip-moe-kquant-tests ${mode} q4k-a8-duplicate)
+            endforeach()
             foreach(mode 0 1 4 5)
                 add_test(NAME strix-hip-moe-q4k-a8-native-${mode}-tests
                     COMMAND strix-hip-moe-kquant-tests ${mode} q4k-a8)
