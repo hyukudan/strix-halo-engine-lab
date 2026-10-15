@@ -188,7 +188,7 @@ void run_case(std::uint32_t requested_hidden, bool bf16, unsigned pattern = 0) {
 
     const auto hidden_size =
         requested_hidden;
-    constexpr std::uint32_t vocab = 16;
+    constexpr std::uint32_t vocab = 19; // Includes a partial final wave8 block.
 
     std::vector<float> hidden(
         hidden_size);
@@ -501,6 +501,55 @@ void run_case(std::uint32_t requested_hidden, bool bf16, unsigned pattern = 0) {
     }
     check(hipGraphExecDestroy(executable), "destroy virtual head executable");
     check(hipGraphDestroy(graph), "destroy virtual head graph");
+    if (bf16) for (const bool wave8 : {false, true}) {
+        auto organized = virtual_config;
+        organized.prefetch_q8_wave = true;
+        organized.wave8_q8_wave = wave8;
+        const std::string id = "hip.lm_head.bf16.h" + std::to_string(hidden_size) +
+            ".v" + std::to_string(vocab) + ".r1.c1" +
+            (wave8 ? ".prefetch8-wave8-v1" : ".prefetch8-load-v1") + ".virtual256.q8";
+        const auto grouped = strix::make_hip_lm_head_launcher(id, &organized);
+        expect(grouped.implementation_identity != candidate.implementation_identity,
+            "prefetch organization has a distinct implementation identity");
+        for (unsigned repeat = 0; repeat < 3; ++repeat) {
+            constexpr std::uint32_t canary = 0x55aabbccU;
+            check(hipMemcpy(reinterpret_cast<void*>(logits_address.address + vocab * sizeof(float)),
+                &canary, sizeof(canary), hipMemcpyHostToDevice), "set prefetch tail canary");
+            check(hipMemset(reinterpret_cast<void*>(logits_address.address), 0xff, vocab * sizeof(float)), "poison prefetch head output");
+            { strix::HipLaunchScope owned(scope); grouped.function(context, grouped.user_data); }
+            check(hipStreamSynchronize(stream), "drain prefetch head");
+            verify(); // Full-output bitwise comparison with unchanged original.
+            std::uint32_t observed_canary = 0;
+            check(hipMemcpy(&observed_canary, reinterpret_cast<void*>(logits_address.address + vocab * sizeof(float)),
+                sizeof(observed_canary), hipMemcpyDeviceToHost), "read prefetch tail canary");
+            expect(observed_canary == canary, "partial final wave8 block preserves destination tail");
+        }
+        hipGraph_t rejected_graph = nullptr;
+        bool capture_rejected = false;
+        {
+            strix::HipLaunchScope owned(scope);
+            check(hipStreamBeginCapture(stream, hipStreamCaptureModeThreadLocal), "begin rejected prefetch head capture");
+            try { grouped.function(context, grouped.user_data); }
+            catch (const std::invalid_argument&) { capture_rejected = true; }
+            check(hipStreamEndCapture(stream, &rejected_graph), "end rejected prefetch head capture");
+        }
+        std::size_t rejected_nodes = 0;
+        check(hipGraphGetNodes(rejected_graph, nullptr, &rejected_nodes), "count rejected head nodes");
+        expect(capture_rejected && rejected_nodes == 0, "prefetch head rejects real stream capture before any enqueue");
+        check(hipGraphDestroy(rejected_graph), "destroy rejected head graph");
+        const auto saved_type = manifest.tensors.front().ggml_type;
+        manifest.tensors.front().ggml_type = 30U;
+        bool rejected_format = false;
+        check(hipMemset(reinterpret_cast<void*>(logits_address.address), 0xff, vocab * sizeof(float)), "poison non-Q8 prefetch output");
+        try { grouped.function(context, grouped.user_data); }
+        catch (const std::invalid_argument&) { rejected_format = true; }
+        manifest.tensors.front().ggml_type = saved_type;
+        check(hipDeviceSynchronize(), "drain rejected prefetch head");
+        std::vector<std::uint32_t> untouched(vocab);
+        check(hipMemcpy(untouched.data(), reinterpret_cast<void*>(logits_address.address), vocab * sizeof(float), hipMemcpyDeviceToHost), "read rejected prefetch head output");
+        expect(rejected_format && std::all_of(untouched.begin(), untouched.end(), [](auto word) { return word == 0xffffffffU; }),
+            "non-Q8 prefetch call rejects and preserves all output poison");
+    }
     check(hipStreamDestroy(stream), "destroy virtual head stream");
     auto bad_config = virtual_config;
     bad_config.hidden_size = 0;

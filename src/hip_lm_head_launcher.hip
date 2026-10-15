@@ -3,6 +3,7 @@
 #endif
 #include "strix/hip_launch_context.hpp"
 #include "strix/hip_lm_head_launcher.hpp"
+#include "strix/q8_projection_organization.hpp"
 
 #include "strix/dispatch_resources.hpp"
 
@@ -15,6 +16,7 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <type_traits>
 
 namespace strix {
 namespace {
@@ -89,6 +91,9 @@ void check_hip(
 
 void validate_config(
     const HipLmHeadLauncherConfig& config) {
+    q8_projection_organization::validate_modes(config.virtual_q8_wave,
+        config.prefetch_q8_wave, config.wave8_q8_wave,
+        config.input == HipActivationStorage::bf16, config.hidden_size, config.vocab_size);
     if (config.hidden_size == 0 ||
         config.vocab_size == 0) {
         throw std::invalid_argument(
@@ -458,11 +463,10 @@ __global__ __launch_bounds__(32) void virtual_q8_lm_head_kernel(
     }
 }
 
-#ifdef STRIX_BUILD_GDN_LM_WAVE8_DIAGNOSTIC
 // Project-owned GDN prefetch8 load body, preserving the LM coefficient/leaf DAG.
 template <typename Input, unsigned Waves>
 __global__ __launch_bounds__(32U * Waves)
-void prefetch8_wave_q8_lm_head_diagnostic_kernel(
+void prefetch8_wave_q8_lm_head_kernel(
     const Input* input, const void* weights,
     std::uint32_t input_width, std::uint32_t output_width, float* output) {
     const auto row = static_cast<std::uint32_t>(blockIdx.x) * Waves + static_cast<std::uint32_t>(threadIdx.x) / 32U;
@@ -508,7 +512,6 @@ void prefetch8_wave_q8_lm_head_diagnostic_kernel(
         output[row] = partial[0];
     }
 }
-#endif
 
 template <
     typename Input,
@@ -518,6 +521,27 @@ void launch_typed(
     const HipLmHeadLauncherConfig& config,
     const ExecutionBufferAddress& hidden,
     const ExecutionBufferAddress& logits) {
+    if (config.prefetch_q8_wave) {
+        if constexpr (Kind == WeightKind::q8_0 && std::is_same_v<Input, std::uint16_t>) {
+            if (config.wave8_q8_wave) {
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(prefetch8_wave_q8_lm_head_kernel<Input, 8>),
+                    dim3((config.vocab_size + 7U) / 8U), dim3(256), 0, hip_execution_stream(),
+                    reinterpret_cast<const Input*>(hidden.address),
+                    reinterpret_cast<const void*>(weights.address), config.hidden_size,
+                    config.vocab_size, reinterpret_cast<float*>(logits.address));
+            } else {
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(prefetch8_wave_q8_lm_head_kernel<Input, 1>),
+                    dim3(config.vocab_size), dim3(32), 0, hip_execution_stream(),
+                    reinterpret_cast<const Input*>(hidden.address),
+                    reinterpret_cast<const void*>(weights.address), config.hidden_size,
+                    config.vocab_size, reinterpret_cast<float*>(logits.address));
+            }
+            check_hip(hipGetLastError(), "HIP prefetch Q8 LM-head launch");
+            return;
+        } else {
+            throw std::invalid_argument("prefetch LM head supports BF16/Q8_0 only");
+        }
+    }
     if (config.virtual_q8_wave) {
         if constexpr (Kind != WeightKind::q8_0) {
             throw std::invalid_argument("virtual-wave LM head supports Q8_0 weights only");
@@ -619,6 +643,15 @@ void launch_lm_head(
                 user_data);
     validate_config(config);
 
+    if (config.prefetch_q8_wave) {
+        if (const auto* scope = current_hip_launch_context(); scope && scope->graph_capture)
+            throw std::invalid_argument("prefetch LM head supports eager execution only");
+        hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
+        check_hip(hipStreamIsCapturing(hip_execution_stream(), &capture), "query prefetch LM-head capture");
+        if (capture != hipStreamCaptureStatusNone)
+            throw std::invalid_argument("prefetch LM head cannot be captured");
+    }
+
     const auto hidden =
         resolve_dispatch_read(
             context, 0);
@@ -702,6 +735,14 @@ void launch_lm_head(
             "HIP LM-head scratch buffers are undersized");
     }
 
+    if (config.prefetch_q8_wave) {
+        if (kind != WeightKind::q8_0)
+            throw std::invalid_argument("prefetch LM head supports BF16/Q8_0 only");
+        q8_projection_organization::validate_views(config.hidden_size, config.vocab_size,
+            {hidden.address, hidden.bytes}, {runtime_tensor.address, runtime_tensor.bytes},
+            {logits.address, logits.bytes});
+    }
+
     switch (config.input) {
     case HipActivationStorage::bf16:
         launch_by_weight<
@@ -744,7 +785,10 @@ std::string kernel_id(
             request.logical_rows) +
         ".c" +
         std::to_string(
-            request.request_concurrency) + (config.virtual_q8_wave ? ".virtual256.q8" : "");
+            request.request_concurrency) +
+        (config.wave8_q8_wave ? std::string(q8_projection_organization::lm_wave8_marker)
+            : config.prefetch_q8_wave ? std::string(q8_projection_organization::lm_prefetch_marker) : "") +
+        (config.virtual_q8_wave ? ".virtual256.q8" : "");
 }
 
 std::uint64_t implementation_identity(
@@ -758,6 +802,8 @@ std::uint64_t implementation_identity(
         static_cast<std::uint64_t>(
             config.input));
     if (config.virtual_q8_wave) hash_u64(hash, 0x5649525451323536ULL);
+    if (config.prefetch_q8_wave) hash_u64(hash, 0x4c4d513850524631ULL);
+    if (config.wave8_q8_wave) hash_u64(hash, 0x4c4d513857415638ULL);
     return hash;
 }
 
@@ -776,6 +822,11 @@ void register_hip_lm_head_kernel_variant(
             error);
     }
     validate_config(config);
+    if (request.prefetch_q8_lm_head != config.prefetch_q8_wave ||
+        request.wave8_q8_lm_head != config.wave8_q8_wave)
+        throw std::invalid_argument("LM-head organization request/config mismatch");
+    if (config.prefetch_q8_wave && (request.device_graph_inputs || request.require_graph_safe))
+        throw std::invalid_argument("prefetch LM head registers eager variants only");
     if (config.hidden_size !=
             model.hidden_size ||
         config.vocab_size !=
@@ -815,7 +866,7 @@ void register_hip_lm_head_kernel_variant(
     variant.wave =
         kernels::WaveSize::wave32;
     variant.resources.workgroup_threads =
-        config.virtual_q8_wave ? 32U : kThreads;
+        config.virtual_q8_wave && !config.wave8_q8_wave ? 32U : kThreads;
     variant.resources.lds_bytes =
         config.virtual_q8_wave ? 0U : kThreads * sizeof(float);
     variant.numerics.input_precision =
@@ -829,13 +880,15 @@ void register_hip_lm_head_kernel_variant(
     variant.numerics.deterministic = true;
     variant.qualification =
         qualification;
-    variant.graph_safe = true;
+    variant.graph_safe = !config.prefetch_q8_wave;
     variant.input_layout =
         "row-major";
     variant.output_layout =
         "fp32-logits";
     variant.compiler_identity =
         config.virtual_q8_wave ? "hip-gfx1151-lm-head-v2-virtual256-q8" : "hip-gfx1151-lm-head-v1";
+    if (config.prefetch_q8_wave) variant.compiler_identity += ":prefetch8-load-v1";
+    if (config.wave8_q8_wave) variant.compiler_identity += ":wave8-rows-v1";
     variant.measured_seconds = 0.0;
 
     registry.add(
@@ -852,6 +905,13 @@ make_hip_lm_head_launcher(
             "HIP LM-head launcher requires id and config");
     }
     validate_config(*config);
+    if (config->prefetch_q8_wave ||
+        kernel_id_value.find(q8_projection_organization::lm_prefetch_marker) != std::string::npos ||
+        kernel_id_value.find(q8_projection_organization::lm_wave8_marker) != std::string::npos) {
+        ExecutionBindingRequest request;
+        if (kernel_id_value != kernel_id(request, *config))
+            throw std::invalid_argument("prefetch LM-head launcher requires its exact eager C1 kernel id");
+    }
     return ExecutionLauncher{
         std::move(kernel_id_value),
         implementation_identity(
@@ -913,9 +973,9 @@ const void* lm_symbol(Kind kind, Arm arm) {
     case Arm::reference:
         return reinterpret_cast<const void*>(virtual_q8_lm_head_kernel<std::uint16_t>);
     case Arm::prefetch1:
-        return reinterpret_cast<const void*>(prefetch8_wave_q8_lm_head_diagnostic_kernel<std::uint16_t, 1>);
+        return reinterpret_cast<const void*>(prefetch8_wave_q8_lm_head_kernel<std::uint16_t, 1>);
     case Arm::wave8:
-        return reinterpret_cast<const void*>(prefetch8_wave_q8_lm_head_diagnostic_kernel<std::uint16_t, 8>);
+        return reinterpret_cast<const void*>(prefetch8_wave_q8_lm_head_kernel<std::uint16_t, 8>);
     }
     throw std::invalid_argument("invalid LM diagnostic arm");
 }
@@ -930,13 +990,13 @@ void enqueue_lm(Shape shape, Span input, Span weights, Span output, Kind kind, A
             reinterpret_cast<const void*>(weights.address), shape.width, shape.outputs,
             reinterpret_cast<float*>(output.address));
     } else if (arm == Arm::prefetch1) {
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(prefetch8_wave_q8_lm_head_diagnostic_kernel<std::uint16_t, 1>),
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(prefetch8_wave_q8_lm_head_kernel<std::uint16_t, 1>),
             dim3(launch.grid_x), dim3(launch.block_x), 0, stream,
             reinterpret_cast<const std::uint16_t*>(input.address),
             reinterpret_cast<const void*>(weights.address), shape.width, shape.outputs,
             reinterpret_cast<float*>(output.address));
     } else {
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(prefetch8_wave_q8_lm_head_diagnostic_kernel<std::uint16_t, 8>),
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(prefetch8_wave_q8_lm_head_kernel<std::uint16_t, 8>),
             dim3(launch.grid_x), dim3(launch.block_x), 0, stream,
             reinterpret_cast<const std::uint16_t*>(input.address),
             reinterpret_cast<const void*>(weights.address), shape.width, shape.outputs,

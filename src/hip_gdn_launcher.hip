@@ -5,6 +5,7 @@
 #include "strix/hip_gdn_lm_wave8_diagnostic.hpp"
 #endif
 #include "strix/hip_gdn_launcher.hpp"
+#include "strix/q8_projection_organization.hpp"
 
 #include "strix/dispatch_resources.hpp"
 #include "strix/execution_buffers.hpp"
@@ -76,7 +77,7 @@ enum class WeightKind {
     iq4_xs,
 };
 
-enum class ProjectionMode { legacy256, virtual_stream, prefetch8 };
+enum class ProjectionMode { legacy256, virtual_stream, prefetch8, prefetch8_wave8 };
 
 enum class SmallWeightKind : std::uint32_t {
     f32 = 0,
@@ -191,6 +192,14 @@ void validate_config(
     }
     if (config.prefetch_q8_input_projections && !config.virtual_q8_input_projections)
         throw std::invalid_argument("HIP GDN prefetch Q8 input requires virtual Q8 input");
+    if (config.wave8_q8_input_projections) {
+        q8_projection_organization::validate_modes(config.virtual_q8_input_projections,
+            config.prefetch_q8_input_projections, true,
+            config.activation == HipActivationStorage::bf16, config.model.hidden_size,
+            config.model.gdn_value_heads * config.model.gdn_value_head_dim);
+        if (config.enable_device_graph_inputs)
+            throw std::invalid_argument("wave8 GDN input supports eager execution only");
+    }
     if (config.activation !=
         HipActivationStorage::bf16) {
         throw std::invalid_argument(
@@ -663,8 +672,7 @@ void project_prefetch8_q8_bf16_to_fp32_kernel(
         output[row] = round_bf16(partial[0]);
     }
 }
-#ifdef STRIX_BUILD_GDN_LM_WAVE8_DIAGNOSTIC
-// Test-only geometry copy of the incumbent prefetch8 body above.
+// Explicit geometry overlay of the incumbent prefetch8 body above.
 __global__ __launch_bounds__(256)
 void project_prefetch8_wave8_q8_bf16_to_fp32_kernel(
     const std::uint16_t* input, const void* weights,
@@ -712,7 +720,6 @@ void project_prefetch8_wave8_q8_bf16_to_fp32_kernel(
         output[row] = round_bf16(partial[0]);
     }
 }
-#endif
 
 
 template <WeightKind Kind>
@@ -1547,6 +1554,14 @@ void launch_projection_by_kind(
             input, weights, input_width, output_width, output);
         return;
     case WeightKind::q8_0:
+        if (mode == ProjectionMode::prefetch8_wave8) {
+            hipLaunchKernelGGL(project_prefetch8_wave8_q8_bf16_to_fp32_kernel,
+                dim3((output_width + 7U) / 8U), dim3(256), 0, hip_execution_stream(),
+                input, reinterpret_cast<const void*>(weights.address),
+                input_width, output_width, output);
+            check_hip(hipGetLastError(), "HIP GDN prefetch8 wave8 Q8 input projection launch");
+            return;
+        }
         if (mode == ProjectionMode::prefetch8) {
             hipLaunchKernelGGL(project_prefetch8_q8_bf16_to_fp32_kernel,
                 dim3(output_width), dim3(32), 0, hip_execution_stream(),
@@ -2049,6 +2064,15 @@ void launch_gdn(
                 user_data);
     validate_config(config);
 
+    if (config.wave8_q8_input_projections) {
+        if (const auto* scope = current_hip_launch_context(); scope && scope->graph_capture)
+            throw std::invalid_argument("wave8 GDN input supports eager execution only");
+        hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
+        check_hip(hipStreamIsCapturing(hip_execution_stream(), &capture), "query wave8 GDN capture");
+        if (capture != hipStreamCaptureStatusNone)
+            throw std::invalid_argument("wave8 GDN input cannot be captured");
+    }
+
     const auto input =
         resolve_dispatch_read(
             context, 0);
@@ -2143,7 +2167,22 @@ void launch_gdn(
         (tensors.qkv.manifest->ggml_type == 8U || tensors.z.manifest->ggml_type == 8U ||
          tensors.beta.manifest->ggml_type == 8U || tensors.alpha.manifest->ggml_type == 8U))
         throw std::invalid_argument("HIP GDN prefetch8 Q8 input width must align to32");
-    const auto projection_mode = config.prefetch_q8_input_projections ? ProjectionMode::prefetch8
+    if (config.wave8_q8_input_projections) {
+        if (tensors.qkv.manifest->ggml_type != 8U || tensors.z.manifest->ggml_type != 8U)
+            throw std::invalid_argument("wave8 GDN input requires Q8_0 qkv and z weights");
+        const auto validate = [&](const TensorPair& tensor, std::uint32_t rows, float* target) {
+            if (tensor.manifest->ggml_type != 8U) return;
+            q8_projection_organization::validate_views(hidden, rows,
+                {input.address, input.bytes}, {tensor.runtime->address, tensor.runtime->bytes},
+                {reinterpret_cast<std::uintptr_t>(target), static_cast<std::uint64_t>(rows) * sizeof(float)});
+        };
+        validate(tensors.qkv, conv_width, workspace.qkv);
+        validate(tensors.z, value_width, workspace.z);
+        validate(tensors.beta, value_heads, workspace.beta);
+        validate(tensors.alpha, value_heads, workspace.gate);
+    }
+    const auto projection_mode = config.wave8_q8_input_projections ? ProjectionMode::prefetch8_wave8
+        : config.prefetch_q8_input_projections ? ProjectionMode::prefetch8
         : config.virtual_q8_input_projections ? ProjectionMode::virtual_stream : ProjectionMode::legacy256;
 
     validate_projection_tensor(
@@ -2448,6 +2487,7 @@ std::string kernel_id(
         ".c" +
         std::to_string(
             request.request_concurrency) + (request.device_graph_inputs ? ".device" : ".scalar") +
+        (config.wave8_q8_input_projections ? std::string(q8_projection_organization::gdn_wave8_marker) : "") +
         (config.prefetch_q8_input_projections ? ".prefetch8" : "") +
         (config.virtual_q8_input_projections ? ".virtual256.q8-input" : "") +
         (config.virtual_q8_output_projection ? ".virtual256.q8-output" : "");
@@ -2502,6 +2542,7 @@ std::uint64_t implementation_identity(
     if (config.virtual_q8_input_projections) hash_u64(hash, 0x47444e5138563235ULL);
     if (config.virtual_q8_output_projection) hash_u64(hash, 0x47444e514f555431ULL);
     if (config.prefetch_q8_input_projections) hash_u64(hash, 0x47444e5138504631ULL);
+    if (config.wave8_q8_input_projections) hash_u64(hash, 0x47444e5138574156ULL);
     return hash;
 }
 
@@ -2514,6 +2555,10 @@ void register_hip_gdn_kernel_variant(
     kernels::KernelRegistry& registry,
     kernels::QualificationStatus qualification) {
     validate_config(config);
+    if (request.wave8_q8_gdn_input != config.wave8_q8_input_projections)
+        throw std::invalid_argument("GDN wave8 request/config mismatch");
+    if (config.wave8_q8_input_projections && (request.device_graph_inputs || request.require_graph_safe))
+        throw std::invalid_argument("wave8 GDN input registers eager variants only");
     if (const auto error =
             model.validate();
         !error.empty()) {
@@ -2620,6 +2665,7 @@ void register_hip_gdn_kernel_variant(
     variant.compiler_identity = config.prefetch_q8_input_projections ? "hip-gfx1151-gdn-v4-prefetch8-virtual256-q8-input"
         : config.virtual_q8_input_projections ? "hip-gfx1151-gdn-v3-virtual256-q8-input" : "hip-gfx1151-gdn-v2";
     if(config.virtual_q8_output_projection) variant.compiler_identity += "-virtual256-q8-output";
+    if(config.wave8_q8_input_projections) variant.compiler_identity += ":wave8-input-v1";
     variant.measured_seconds = 0.0;
 
     registry.add(
@@ -2636,6 +2682,12 @@ make_hip_gdn_launcher(
             "HIP GDN launcher requires id and config");
     }
     validate_config(*config);
+    if (config->wave8_q8_input_projections ||
+        kernel_id_value.find(q8_projection_organization::gdn_wave8_marker) != std::string::npos) {
+        ExecutionBindingRequest request;
+        if (kernel_id_value != kernel_id(request, *config))
+            throw std::invalid_argument("wave8 GDN launcher requires its exact eager C1 kernel id");
+    }
     return ExecutionLauncher{
         std::move(kernel_id_value),
         implementation_identity(
@@ -2685,6 +2737,14 @@ register_for_compiled_execution(
             throw std::invalid_argument("HIP GDN selected kernel disagrees with virtual Q8 configuration");
         if (selected_id.ends_with(".prefetch8.virtual256.q8-input") != config_.prefetch_q8_input_projections)
             throw std::invalid_argument("HIP GDN selected kernel disagrees with prefetch Q8 configuration");
+        if (config_.wave8_q8_input_projections ||
+            selected_id.find(q8_projection_organization::gdn_wave8_marker) != std::string::npos) {
+            ExecutionBindingRequest request;
+            request.logical_rows = compiled.logical_rows;
+            request.request_concurrency = compiled.request_concurrency;
+            if (*binding.kernel_id != kernel_id(request, config_))
+                throw std::invalid_argument("HIP GDN wave8 selected kernel disagrees with exact configuration");
+        }
 
         if (registered_id.empty()) {
             registered_id =

@@ -15,6 +15,9 @@ struct HipLmHeadLauncherConfig {
     HipActivationStorage input =
         HipActivationStorage::bf16;
     bool virtual_q8_wave = false;
+    // Explicit eager BF16/Q8_0 candidates; wave8 also requires prefetch.
+    bool prefetch_q8_wave = false;
+    bool wave8_q8_wave = false;
 };
 
 void register_hip_lm_head_kernel_variant(

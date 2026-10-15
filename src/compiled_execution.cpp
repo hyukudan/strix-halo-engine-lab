@@ -1,4 +1,5 @@
 #include "strix/compiled_execution.hpp"
+#include "strix/q8_projection_organization.hpp"
 #include "strix/qsa_input_prefetch.hpp"
 #include "strix/lane_chain_hyper_output.hpp"
 #include <algorithm>
@@ -309,6 +310,12 @@ CompiledSerialExecution compile_serial_execution(
             "compiled execution buffer rows must match binding rows");
     }
 
+    if (binding_request.wave8_q8_lm_head && !binding_request.prefetch_q8_lm_head)
+        throw std::invalid_argument("wave8 Q8 LM head requires prefetch organization");
+    if ((binding_request.prefetch_q8_lm_head || binding_request.wave8_q8_lm_head || binding_request.wave8_q8_gdn_input) &&
+        (binding_request.device_graph_inputs || binding_request.require_graph_safe ||
+         binding_request.logical_rows != 1 || binding_request.request_concurrency != 1))
+        throw std::invalid_argument("Q8 projection organizations require eager C1 execution");
     if (binding_request.wave_moe_router_topk &&
         (!binding_request.parallel_moe_router || binding_request.ranked_moe_router_topk))
         throw std::invalid_argument("wave router requires parallel topology and excludes ranked mode");
@@ -372,6 +379,15 @@ CompiledSerialExecution compile_serial_execution(
     }
 
     for (const auto& binding : compiled.bindings.bindings) {
+        if (binding.op == SerialOp::gated_delta_net && binding.kernel_id &&
+            (binding.kernel_id->find(q8_projection_organization::gdn_wave8_marker) != std::string::npos) != binding_request.wave8_q8_gdn_input)
+            throw std::invalid_argument("bound GDN wave8 organization differs from request");
+        if (binding.op == SerialOp::lm_head && binding.kernel_id) {
+            const bool p1 = binding.kernel_id->find(q8_projection_organization::lm_prefetch_marker) != std::string::npos;
+            const bool p8 = binding.kernel_id->find(q8_projection_organization::lm_wave8_marker) != std::string::npos;
+            if ((p1 && p8) || (p1 || p8) != binding_request.prefetch_q8_lm_head || p8 != binding_request.wave8_q8_lm_head)
+                throw std::invalid_argument("bound LM prefetch organization differs from request");
+        }
         if(binding.op==SerialOp::indexed_attention && binding.kernel_id){const auto& step=compiled.execution.steps[binding.step_id];if(binding.kernel_id->ends_with(qsa_input_prefetch::kernel_suffix)!=qsa_input_prefetch::selected(binding_request.prefetch_q8_qsa_input,binding_request.qsa_input_prefetch_layers,step.layer))throw std::invalid_argument("bound QSA input prefetch differs from admitted topology");}
         if(binding.op==SerialOp::attn_hyper_mix || binding.op==SerialOp::mlp_hyper_mix || binding.op==SerialOp::final_hyper_mix){
             const bool expected=binding_request.lane_chain_hyper_output && std::find(binding_request.lane_chain_hyper_output_eligible_steps.begin(),binding_request.lane_chain_hyper_output_eligible_steps.end(),binding.step_id)!=binding_request.lane_chain_hyper_output_eligible_steps.end();

@@ -18,6 +18,8 @@ struct HipGdnLauncherConfig {
     bool enable_device_graph_inputs = false;
     bool virtual_q8_input_projections = false;
     bool prefetch_q8_input_projections = false;
+    // Explicit eager geometry overlay; requires the two input options above.
+    bool wave8_q8_input_projections = false;
     bool virtual_q8_output_projection = false;
 };
 

@@ -35,6 +35,7 @@
 #include "strix/hip_moe_overlap_dispatcher.hpp"
 #include "hip_decode_experiment.hpp"
 #include "hip_decode_options.hpp"
+#include "strix/q8_projection_organization.hpp"
 #include "hip_deferred_moe_status.hpp"
 #include "hip_decode_receipt_json.hpp"
 #include "execution_inventory_receipt.hpp"
@@ -573,6 +574,7 @@ int main(
         options, model, info, manifest,
         strix::model_content_identity_hex(mapped.content_identity()), has_auto_a8_runtime);
     strix::decode_cli::validate_resolved_prefix_roundtrip(options);
+    strix::decode_cli::validate_resolved_q8_projection_organization(options);
     if (options.batched_moe_activation && !options.q4k_a8g32_gate_up)
         throw std::invalid_argument("batched MoE activation requires resolved Q4K A8 gate/up execution");
     if (options.moe_shared_overlap && !options.deferred_moe_status)
@@ -647,6 +649,33 @@ int main(
     const auto tensor_index =
         strix::build_model_tensor_index(
             manifest);
+    if (options.prefetch_q8_lm_head)
+        strix::q8_projection_organization::validate_geometry(model.hidden_size, model.vocab_size);
+    if (options.wave8_q8_gdn_input) {
+        const auto key_width = model.gdn_key_heads * model.gdn_key_head_dim;
+        const auto value_width = model.gdn_value_heads * model.gdn_value_head_dim;
+        strix::q8_projection_organization::validate_geometry(model.hidden_size, key_width * 2U + value_width);
+        for (std::uint64_t layer = 0; layer < model.hidden_layers; ++layer) {
+            if ((layer + 1U) % model.full_attention_interval == 0U) continue;
+            std::size_t qkv = 0, z = 0;
+            for (const auto& tensor : manifest.tensors) {
+                if (tensor.layer != layer || tensor.role != strix::TensorRole::attention_projection) continue;
+                if (tensor.name.find("attn_qkv") != std::string::npos) {
+                    ++qkv;
+                    if (tensor.ggml_type != 8U || tensor.dimensions.size() < 2 ||
+                        tensor.dimensions[0] != model.hidden_size || tensor.dimensions[1] != key_width * 2U + value_width)
+                        throw std::invalid_argument("wave8 GDN requires aligned Q8_0 qkv in every GDN layer");
+                } else if (tensor.name.find("attn_gate") != std::string::npos) {
+                    ++z;
+                    if (tensor.ggml_type != 8U || tensor.dimensions.size() < 2 ||
+                        tensor.dimensions[0] != model.hidden_size || tensor.dimensions[1] != value_width)
+                        throw std::invalid_argument("wave8 GDN requires aligned Q8_0 z in every GDN layer");
+                }
+            }
+            if (qkv != 1U || z != 1U)
+                throw std::invalid_argument("wave8 GDN qkv/z family is missing or ambiguous");
+        }
+    }
     if (options.virtual_q8_lm_head) {
         std::size_t output_heads = 0;
         for (const auto& tensor : manifest.tensors) {
@@ -702,6 +731,12 @@ int main(
     // counts must be read separately after the selected workload completes.
     const auto gdn_output_mode_receipt=[&] {
         std::string receipt=(options.virtual_q8_gdn_output ? "  \"virtual_q8_gdn_output\": true,\n" : "")+shared_mode_receipt+qsa_input_mode_receipt+lane_chain_mode_receipt;
+        if (options.prefetch_q8_lm_head || options.wave8_q8_lm_head || options.wave8_q8_gdn_input) {
+            receipt += "  \"prefetch_q8_lm_head\": " + std::string(options.prefetch_q8_lm_head ? "true" : "false") + ",\n";
+            receipt += "  \"wave8_q8_lm_head\": " + std::string(options.wave8_q8_lm_head ? "true" : "false") + ",\n";
+            receipt += "  \"wave8_q8_gdn_input\": " + std::string(options.wave8_q8_gdn_input ? "true" : "false") + ",\n";
+            receipt += "  \"q8_projection_organization_qualification\": \"not_assessed\",\n";
+        }
         return receipt;
     };
     const std::string deferred_moe_mode_receipt = "  \"deferred_moe_status\": " +
@@ -739,6 +774,12 @@ int main(
     binding_request.lane_chain_hyper_output=options.lane_chain_hyper_output;
     binding_request.lane_chain_hyper_output_eligible_steps=lane_chain_steps;
     catalog_config.virtual_q8_lm_head = options.virtual_q8_lm_head;
+    catalog_config.prefetch_q8_lm_head = options.prefetch_q8_lm_head;
+    catalog_config.wave8_q8_lm_head = options.wave8_q8_lm_head;
+    catalog_config.wave8_q8_gdn_input = options.wave8_q8_gdn_input;
+    binding_request.prefetch_q8_lm_head = options.prefetch_q8_lm_head;
+    binding_request.wave8_q8_lm_head = options.wave8_q8_lm_head;
+    binding_request.wave8_q8_gdn_input = options.wave8_q8_gdn_input;
     catalog_config.batched_moe_activation = options.batched_moe_activation;
     binding_request.batched_moe_activation = options.batched_moe_activation;
     catalog_config.q4k_a8g32_gate_up = options.q4k_a8g32_gate_up;

@@ -19,6 +19,9 @@ struct ExecutionBindingRequest {
         kernels::QualificationStatus::oracle_matched;
     // Explicit C1 device-input graph topology; requires graph-safe selections.
     bool device_graph_inputs = false;
+    bool prefetch_q8_lm_head = false;
+    bool wave8_q8_lm_head = false;
+    bool wave8_q8_gdn_input = false;
     bool parallel_moe_router = false;
     bool ranked_moe_router_topk = false;
     bool wave_moe_router_topk = false;

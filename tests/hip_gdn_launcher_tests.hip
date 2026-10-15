@@ -590,7 +590,8 @@ int main(int argc, char** argv) try {
     auto model = fixture_model();
     const bool candidate_enabled = argc >= 2;
     const std::string fixture_mode = argc == 3 ? argv[2] : "";
-    const bool prefetch_enabled = fixture_mode == "prefetch" || fixture_mode == "prefetch-fallback";
+    const bool wave8_enabled = fixture_mode == "wave8";
+    const bool prefetch_enabled = fixture_mode == "prefetch" || fixture_mode == "prefetch-fallback" || wave8_enabled;
     if (argc == 2 || (argc == 3 && (fixture_mode == "fallback" || prefetch_enabled))) {
         dense_q8_fixture = fixture_mode != "fallback" && fixture_mode != "prefetch-fallback";
         dense_q8_width = static_cast<std::uint32_t>(std::stoul(argv[1]));
@@ -1389,8 +1390,16 @@ int main(int argc, char** argv) try {
     const auto first_output = actual_output;
     config.virtual_q8_input_projections = candidate_enabled;
     config.prefetch_q8_input_projections = prefetch_enabled;
+    config.wave8_q8_input_projections = wave8_enabled;
     const auto original_identity = launcher.implementation_identity;
-    launcher = strix::make_hip_gdn_launcher("test.gdn.virtual", &config);
+    std::string selected_id = "test.gdn.virtual";
+    if (wave8_enabled) {
+        auto request = gdn_request; request.wave8_q8_gdn_input = true;
+        strix::kernels::KernelRegistry registry;
+        strix::register_hip_gdn_kernel_variant(model, request, config, registry);
+        selected_id = registry.variants().front().id;
+    }
+    launcher = strix::make_hip_gdn_launcher(selected_id, &config);
     expect((launcher.implementation_identity != original_identity) == candidate_enabled,
         "virtual GDN implementation identity is opt-in");
     if (dense_q8_fixture) {
@@ -1435,7 +1444,15 @@ int main(int argc, char** argv) try {
                 config.model.hidden_size = saved_hidden;
                 for (const auto index : {0U, 1U, 5U, 6U}) manifest.tensors[index].dimensions[0] = saved_hidden;
                 manifest.tensors[8].dimensions[1] = saved_hidden;
-            }, "width must divide 32");
+            }, wave8_enabled ? "shape outside admitted bounds" : "width must divide 32");
+        }
+        if (wave8_enabled) {
+            const auto saved_kind = manifest.tensors[0].ggml_type;
+            reject_before_launch([&] { manifest.tensors[0].ggml_type = 1U; },
+                [&] { manifest.tensors[0].ggml_type = saved_kind; }, "requires Q8_0 qkv and z");
+            const auto saved_address = runtime.tensors[0].address;
+            reject_before_launch([&] { runtime.tensors[0].address += 2U; },
+                [&] { runtime.tensors[0].address = saved_address; }, "invalid alignment or extent");
         }
         const auto saved_bytes = runtime.tensors[0].bytes;
         reject_before_launch([&] { runtime.tensors[0].bytes = saved_bytes - 1U; },
@@ -1474,6 +1491,7 @@ int main(int argc, char** argv) try {
             actual_output == first_output, "repeated identical GDN input/state is bit deterministic");
         if (prefetch_enabled) {
             auto streaming_config = config; streaming_config.prefetch_q8_input_projections = false;
+            streaming_config.wave8_q8_input_projections = false;
             auto streaming_launcher = strix::make_hip_gdn_launcher("test.gdn.streaming", &streaming_config);
             check(hipMemcpy(reinterpret_cast<void*>(matrix_address.address), matrix_state.data(), matrix_address.bytes,
                 hipMemcpyHostToDevice), "restore streaming reference matrix");
@@ -1505,10 +1523,30 @@ int main(int argc, char** argv) try {
         } else expect(recurrence_error <= 1e-7F, "all waves consume the independently computed GDN delta");
     }
 
+    if (wave8_enabled) {
+        hipStream_t stream = nullptr;
+        hipGraph_t rejected_graph = nullptr;
+        check(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), "create rejected wave8 GDN stream");
+        strix::HipLaunchContext scope; scope.stream = stream;
+        bool rejected = false;
+        {
+            strix::HipLaunchScope owned(scope);
+            check(hipStreamBeginCapture(stream, hipStreamCaptureModeThreadLocal), "begin rejected wave8 GDN capture");
+            try { launcher.function(context, launcher.user_data); }
+            catch (const std::invalid_argument&) { rejected = true; }
+            check(hipStreamEndCapture(stream, &rejected_graph), "end rejected wave8 GDN capture");
+        }
+        std::size_t count = 0;
+        check(hipGraphGetNodes(rejected_graph, nullptr, &count), "count rejected wave8 GDN nodes");
+        expect(rejected && count == 0, "wave8 GDN capture rejects before any projection/state enqueue");
+        check(hipGraphDestroy(rejected_graph), "destroy rejected wave8 GDN graph");
+        check(hipStreamDestroy(stream), "destroy rejected wave8 GDN stream");
+    }
+
     // Capture the complete existing GDN operator: projections, convolution,
     // recurrence, gated normalization and final projection. No host position
     // scalar controls the captured state stage.
-    {
+    if (!wave8_enabled) {
         auto graph_config = config;
         graph_config.enable_device_graph_inputs = true;
         auto graph_launcher = strix::make_hip_gdn_launcher("test.gdn.device", &graph_config);

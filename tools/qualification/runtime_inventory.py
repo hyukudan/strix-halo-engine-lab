@@ -191,10 +191,11 @@ def reported_opt_in_overlays(receipt):
         if value is not None and (not isinstance(value, str) or not value):
             raise ValueError(f"{key} must be a nonempty string or null")
         values[key] = value
-    batched = receipt.get("batched_moe_activation")
-    if batched is not None:
-        boolean(batched, "batched_moe_activation")
-    values["batched_moe_activation"] = batched
+    for key in ("batched_moe_activation", "prefetch_q8_lm_head", "wave8_q8_lm_head", "wave8_q8_gdn_input"):
+        value = receipt.get(key)
+        if value is not None:
+            boolean(value, key)
+        values[key] = value
     return values
 
 
