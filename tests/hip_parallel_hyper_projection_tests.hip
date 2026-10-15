@@ -16,6 +16,7 @@
 #include <memory>
 #include <numeric>
 #include <sstream>
+#include <set>
 #include <vector>
 
 namespace {
@@ -220,6 +221,7 @@ void bench(const Options& options){
     }
     require(libraries()==initial_libraries&&digest(file_bytes(exe))==exe_sha&&digest(file_bytes(options.normalized))==digest(normalized),"runtime/executable/input changed during benchmark");for(auto* f:{owners.front().get()})f->readonly();out<<"],\"loaded_core10_libraries\":[";for(std::size_t j=0;j<initial_libraries.size();++j){const auto& lib=initial_libraries[j];out<<(j?",":"")<<"{\"path\":"<<quote(lib.path)<<",\"sha256\":"<<quote(lib.sha)<<",\"bytes\":"<<lib.size<<'}';}out<<"],\"readonly_inputs_exact\":true,\"owner_guards_intact\":true,\"finished\":true,\"M97_gate_passed\":false}\n";require(out.good(),"final benchmark receipt write failed");
 }
+#include "hip_hc_capture_qualification.hpp"
 } // namespace
 
-int main(int argc,char** argv){try{if(argc>1){require(std::string(argv[1])=="--bench","expected no arguments or --bench");bench(parse(argc,argv));}else native();return 0;}catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}
+int main(int argc,char** argv){try{if(argc>1){const std::string mode=argv[1];if(mode=="--bench")bench(parse(argc,argv));else if(mode=="--qualify-capture")qualify_capture(capture_options(argc,argv));else require(false,"expected --bench or --qualify-capture");}else native();return 0;}catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}

@@ -1,8 +1,9 @@
 # Parallel HC projection diagnostic
 
-Status: source prototype; native compilation, numerical execution and complete
-workload qualification are pending. No production launcher or decoder option
-selects these kernels. The existing ordered projection is unchanged.
+Status: diagnostic prototype. Source revision `db3740f` compiled successfully and
+passed 227 native tests. A single captured-input screening experiment completed;
+complete-workload qualification remains pending. No production launcher or decoder
+option selects these kernels. The existing ordered projection is unchanged.
 
 The diagnostic consumes already normalized FP32 activations, original Q8_0 down
 weights and optional FP32 injection weights. It supports width 10240, 2–8 streams,
@@ -44,3 +45,17 @@ eager/graph agreement. One captured-input microbenchmark is only a screening
 experiment. Production integration requires broader layer/position coverage,
 fixed teacher-forced and held-out quality gates, and complete-workload timing.
 No model quality, speedup or default-selection claim follows from this prototype.
+
+The capture qualifier accepts a fixed 165-case inventory: eight selected layers
+and the final projection at positions 0, 42, 43, 52 and 61, together with all 97
+projections at position 61. Every captured ordered low/injection output must be
+reproduced bitwise before the numerical candidate is qualified. The final projection
+has no injection weights. Its complete 97-call graph reads 353,443,840 logical
+weight bytes, with one actual binding and captured input per call.
+
+Timing uses eager hot, graph hot and the complete 97-call graph, with five warmup
+ABBA blocks and 100 measured ABBA blocks (200 matched pairs). The four-output
+single-kernel mapping has priority if its paired graph speedup reaches 2 and no
+mode falls below 1.5; otherwise the two permitted alternatives are considered.
+Results from 1.5 to 2 are explicitly marginal. This gate permits subsequent
+experimental model integration; it does not establish model quality or adoption.
