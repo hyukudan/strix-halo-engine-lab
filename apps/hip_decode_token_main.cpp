@@ -175,6 +175,7 @@ struct Options {
     bool parallel_moe_router = false;
     bool virtual_q8_gdn_input = false;
     bool ranked_moe_router_topk = false;
+    bool q4k_a8g32_gate_up = false;
     bool prefetch_q8_gdn_input = false;
     std::uint64_t ple_max_rows_per_io = 4;
     std::uint64_t ple_max_inflight_ios = 4;
@@ -201,7 +202,7 @@ Options parse_options(
             "[--planned-ple-io] [--ple-max-rows-per-io N] [--ple-max-inflight-ios N] "
             "[--generate N] [--eos-token TOKEN_ID] [--prefix-cache-roundtrip] "
             "[--parallel-moe-router] [--ranked-moe-router-topk] "
-            "[--virtual-q8-lm-head] [--virtual-q8-gdn-input [--prefetch-q8-gdn-input]] "
+            "[--virtual-q8-lm-head] [--virtual-q8-gdn-input [--prefetch-q8-gdn-input]] [--q4k-a8g32-gate-up] "
             "[--parallel-hyper-mix [--staged-hyper-projections [--fused-staged-hyper-mix [--typed-fused-hyper-projections [--prefetch-typed-hyper-rows]]]]]");
     }
 
@@ -215,6 +216,15 @@ Options parse_options(
          ++index) {
         const std::string_view argument =
             argv[index];
+        if (argument == "--q4k-a8g32-gate-up") {
+#ifndef STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME
+            throw std::invalid_argument("--q4k-a8g32-gate-up requires the experimental runtime build capability");
+#else
+            if (options.q4k_a8g32_gate_up) throw std::invalid_argument("duplicate Q4K A8G32 gate/up option");
+            options.q4k_a8g32_gate_up = true;
+            continue;
+#endif
+        }
         if (argument == "--ranked-moe-router-topk") {
             if (options.ranked_moe_router_topk) throw std::invalid_argument("duplicate ranked MoE router top-k option");
             options.ranked_moe_router_topk = true;
@@ -858,6 +868,29 @@ int main(
     const auto manifest =
         strix::build_model_manifest(
             info);
+    const auto q4k_a8_layers = options.q4k_a8g32_gate_up ?
+        strix::moe_q4k_a8::classify_runtime_manifest(model,manifest) :
+        strix::moe_q4k_a8::RuntimeLayerClassification{};
+    const auto q4k_a8_stats = options.q4k_a8g32_gate_up ?
+        std::make_shared<strix::moe_q4k_a8::RuntimeDispatchStats>() : nullptr;
+    const auto emit_q4k_a8_receipt = [&] {
+        std::cout << "  \"q4k_a8g32_gate_up\": " << (options.q4k_a8g32_gate_up ? "true" : "false") << ",\n"
+            << "  \"q4k_a8g32_numerical_identity\": \""
+            << (options.q4k_a8g32_gate_up ? strix::moe_q4k_a8::runtime_numerical_identity : std::string_view{"legacy"}) << "\",\n"
+            << "  \"q4k_a8g32_quantized_layers\": [";
+        for (std::size_t i=0;i<q4k_a8_layers.quantized_layers.size();++i)
+            std::cout << (i ? "," : "") << q4k_a8_layers.quantized_layers[i];
+        std::cout << "],\n  \"q4k_a8g32_legacy_q5k_layers\": [";
+        for (std::size_t i=0;i<q4k_a8_layers.legacy_q5k_layers.size();++i)
+            std::cout << (i ? "," : "") << q4k_a8_layers.legacy_q5k_layers[i];
+        std::cout << "],\n";
+    };
+    const auto emit_q4k_a8_counts = [&] {
+        std::cout << "  \"q4k_a8g32_host_quantized_submissions\": "
+            << (q4k_a8_stats ? q4k_a8_stats->quantized_submissions.load(std::memory_order_relaxed) : 0)
+            << ",\n  \"q4k_a8g32_host_legacy_q5k_submissions\": "
+            << (q4k_a8_stats ? q4k_a8_stats->legacy_q5k_submissions.load(std::memory_order_relaxed) : 0) << ",\n";
+    };
     const auto tensor_index =
         strix::build_model_tensor_index(
             manifest);
@@ -913,6 +946,9 @@ int main(
     catalog_config.typed_hyper_projection = options.typed_hyper_projection;
     catalog_config.prefetch_typed_hyper_rows = options.prefetch_typed_hyper_rows;
     catalog_config.virtual_q8_lm_head = options.virtual_q8_lm_head;
+    catalog_config.q4k_a8g32_gate_up = options.q4k_a8g32_gate_up;
+    catalog_config.q4k_a8_stats = q4k_a8_stats;
+    binding_request.q4k_a8g32_gate_up = options.q4k_a8g32_gate_up;
     catalog_config.ranked_moe_router_topk = options.ranked_moe_router_topk;
     binding_request.ranked_moe_router_topk = options.ranked_moe_router_topk;
     catalog_config.parallel_moe_router = options.parallel_moe_router;
@@ -937,6 +973,7 @@ int main(
         buffer_request;
     buffer_request.logical_rows = 1;
     buffer_request.parallel_moe_router = options.parallel_moe_router;
+    buffer_request.q4k_a8g32_gate_up = options.q4k_a8g32_gate_up;
     buffer_request.activation_element_bytes =
         2;
     buffer_request.control_element_bytes =
@@ -1214,6 +1251,8 @@ int main(
             ? strix::RawBaselineExecutionMode::eager_integer_lm_head : strix::RawBaselineExecutionMode::eager_float;
         metadata.numerical_identity = integer_config ? integer_config->approved_numerical_identity
             : strix::raw_floating_lm_head_numerical_identity(metadata.activation_storage);
+        if (options.q4k_a8g32_gate_up)
+            metadata.numerical_identity += ";" + std::string(strix::moe_q4k_a8::runtime_numerical_identity);
         strix::RawBaselinePolicy policy;
         policy.maximum_bytes = options.raw_maximum_bytes;
         policy.maximum_steps = options.tokens.size();
@@ -1526,8 +1565,10 @@ int main(
             elapsed_total += value;
         }
 
+        std::cout << "{\n";
+        emit_q4k_a8_receipt();
+        emit_q4k_a8_counts();
         std::cout
-            << "{\n"
             << "  \"model_content_identity\": \""
             << strix::model_content_identity_hex(
                    model_residency.binding().
@@ -1624,8 +1665,9 @@ int main(
             reference->steps.size());
     }
 
-    std::cout << '{' << '\n'
-              << "  \"model_content_identity\": \""
+    std::cout << '{' << '\n';
+    emit_q4k_a8_receipt();
+    std::cout << "  \"model_content_identity\": \""
               << strix::model_content_identity_hex(
                      model_residency.binding().model_content_identity)
               << "\"," << '\n'
@@ -1833,8 +1875,9 @@ int main(
                 replay_observation);
     }
 
+    std::cout << "  ]," << '\n';
+    emit_q4k_a8_counts();
     std::cout
-        << "  ]," << '\n'
         << "  \"decode_elapsed_ms_total\": "
         << decode_elapsed_ms_total
         << ',' << '\n'

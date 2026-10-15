@@ -1,0 +1,25 @@
+# Experimental Q4K A8G32 native gate/up path
+
+This opt-in C1 decode path quantizes each routed input activation in groups of 32 and evaluates the original separate Q4_K gate/up weights with signed-activation/unsigned-weight integer dot products. It changes numerical behavior. It does not convert model weights or quantize the down projection. The original path remains the default.
+
+Build with `STRIX_ENABLE_HIP_RUNTIME=ON` and `STRIX_ENABLE_EXPERIMENTAL_Q4K_A8_RUNTIME=ON`, then pass `--q4k-a8g32-gate-up`. The runtime capability defaults to OFF; an OFF build rejects the flag during option parsing. The independent standalone probe remains separately selectable with `STRIX_BUILD_EXPERIMENTAL_Q4K_A8_PROBE`.
+
+The supported geometry is one request and one row, H=256..2560 in multiples of 256, I=32..640 in multiples of 32, E=1..512, and K=1..min(E,10). BF16 and FP32 launcher inputs are supported; the complete decoder catalog uses BF16. A host manifest preflight requires unambiguous separate paired Q4_K or paired Q5_K gate/up tensors and a supported down tensor for every routed layer. Fused or mixed gate/up families are rejected. Paired Q5_K layers execute the original launcher without activation quantization. The private canonical manifest has 47 Q4_K layers and one Q5_K layer; this is validated from tensor metadata, not hard-coded in dispatch.
+
+## Arithmetic and ownership
+
+The arithmetic TU reuses the standalone group quantizer, integer affine dot and FP32 combination. Its flags explicitly require wave32, correctly rounded FP32 division, gradual underflow, no fast math and no contraction. The original MoE kernel bodies and their compiler flags are unchanged. The numerical identity is `q4k-a8g32-native-v2:g32-sym127-f32div-rne-noflush:dot-s8xu8-i32:separate-f32-pair4-c0:legacy-silu-down-slot-order:finite-pipeline-failclosed`.
+
+The candidate projects all selected gate/up rows together. Independent original SiLU kernels then operate on separate slot buffers. Down projections accumulate into FP32 in the original ascending expert-slot order, followed by the original storage conversion. Integer finite checks run after projection, after activation and before output commit. The final check also rejects a finite FP32 value that would round to BF16 infinity. This extra scheduling and validation belongs only to the experimental Q4_K path. The untouched Q5_K fallback retains its original semantics.
+
+One generation-bound existing MoE temporary owns every candidate region. At H=2560/I=640/K=10 the relative byte offsets are gate/up 0, accumulation 51200, status 61440, codes 61696, deltas 64256, sums 64768; total 65280. The arena base and all region starts except the immediately following status require 256-byte alignment. Dispatch independently checks bounds, complete-owner non-aliasing and exact nine-view probe admission before submitting any clear or kernel. Mutable output and scratch cannot alias any runtime input or weight owner.
+
+Status bits are route/weight=1, nonfinite input=2, underflowed activation scale=4 and nonfinite pipeline/storage overflow=8. Failure suppresses semantic output commit. Graph failures OR aggregate bit 16 without clearing any preset bits; the existing graph completion/session poison contract handles publication. A pre-existing aggregate failure does not imply later internal kernels stop writing scratch. Eager execution reads one status word after the layer and drains before returning. The candidate's error path retains its stack readback owner until an original-device drain succeeds or the process stops.
+
+## Qualification
+
+The source includes pure host workspace, manifest, binding, identity and speculative-rejection checks, independent integer/significand activation and Q4_K row oracles, FP32/BF16 native fixtures, duplicate routes, Q5_K fallback equality, poisoned graph replays and error-publication checks. Existing exact default identities have pinned regression constants. Host checks do not compile or qualify HIP code.
+
+Before GPU fixtures, inspect the actual linked gfx1151 code object for the strict division/denormal policy, signed dot4 lowering, separate FP32 combination, resource bounds and scan behavior. Native fixture success is separate from full-model qualification. A new binary with the flag OFF must reproduce the preserved complete-logit baseline; candidate activation quantization is assessed with fixed teacher-forced inputs and separately reported full-array divergence, finite checks and greedy behavior. Matching generated IDs alone does not establish logit equality or quality. Self-generated trajectory metrics are diagnostic and are not held-out perplexity. No quality envelope or performance gain is claimed by this source.
+
+Graph captures must re-derive their workspace budget from the candidate arena and graph requirements. Host submission counters include captures and are not device replay counters. Both raw and greedy receipts report the flag, numerical identity, manifest layer lists and host submission counts. Runtime and compiled identities change with the explicit mode.

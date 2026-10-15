@@ -1,4 +1,5 @@
 #include "strix/compiled_speculative_verify.hpp"
+#include "strix/moe_q4k_a8_runtime.hpp"
 
 #include <span>
 #include <stdexcept>
@@ -172,6 +173,8 @@ compile_speculative_verify_execution(
     const SpeculativeVerifyBindingRequest& binding_request,
     const ExecutionBufferRequest& buffer_request,
     std::uint64_t arena_alignment) {
+    if (buffer_request.q4k_a8g32_gate_up)
+        throw std::invalid_argument("Q4K A8 runtime does not support speculative verify");
     if (candidate_depth == 0) {
         throw std::invalid_argument(
             "compiled speculative verify requires positive depth");
@@ -214,6 +217,10 @@ compile_speculative_verify_execution(
             compiled.verify,
             registry,
             binding_request);
+    for (const auto& binding : compiled.bindings.bindings)
+        if (binding.op == SerialOp::moe_experts && binding.kernel_id &&
+            binding.kernel_id->ends_with(moe_q4k_a8::runtime_kernel_suffix))
+            throw std::invalid_argument("Q4K A8 runtime does not support speculative verify");
     if (compiled.bindings.missing_steps != 0) {
         throw std::invalid_argument(
             "compiled speculative verify requires all kernel steps bound");

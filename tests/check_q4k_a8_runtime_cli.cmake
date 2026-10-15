@@ -1,0 +1,20 @@
+if(EXISTS "missing-model.gguf")
+    message(FATAL_ERROR "missing-model.gguf fixture must not exist")
+endif()
+execute_process(COMMAND "${BINARY}" missing-model.gguf 1 --q4k-a8g32-gate-up --q4k-a8g32-gate-up
+    RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE error)
+if(CAPABILITY)
+    if(result STREQUAL "0" OR NOT "${output}${error}" MATCHES "duplicate Q4K A8G32 gate/up option")
+        message(FATAL_ERROR "Duplicate Q4K A8 flag must reject before model IO: ${result} ${output} ${error}")
+    endif()
+    execute_process(COMMAND "${BINARY}" missing-model.gguf 1 --q4k-a8g32-gate-up
+        RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE error)
+    if(result STREQUAL "0" OR NOT "${output}${error}" MATCHES "(cannot get file size|file_size)" OR
+       NOT "${output}${error}" MATCHES "missing-model[.]gguf")
+        message(FATAL_ERROR "Valid opt-in must reach missing model size query: ${result} ${output} ${error}")
+    endif()
+else()
+    if(result STREQUAL "0" OR NOT "${output}${error}" MATCHES "requires the experimental runtime build capability")
+        message(FATAL_ERROR "Disabled build must reject capability before model IO: ${result} ${output} ${error}")
+    endif()
+endif()

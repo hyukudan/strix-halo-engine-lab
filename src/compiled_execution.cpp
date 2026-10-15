@@ -1,4 +1,5 @@
 #include "strix/compiled_execution.hpp"
+#include "strix/moe_q4k_a8_runtime.hpp"
 
 #include <cstring>
 #include <span>
@@ -18,6 +19,7 @@ GraphExecutionContract serial_graph_contract(const CompiledSerialExecution& comp
         safe = safe && !step.dynamic_shape && step.graph_safe_candidate;
     }
     for (const auto& binding : compiled.bindings.bindings) {
+
         safe = safe && ((compiled.device_graph_inputs && binding.host_or_runtime_step &&
             binding.op == SerialOp::position_prepare) ||
             (!binding.host_or_runtime_step && binding.kernel_id.has_value()));
@@ -208,6 +210,7 @@ std::uint64_t build_execution_identity(
         buffer_request.mlp_intermediate_element_bytes);
 
     if (buffer_request.parallel_moe_router) hash_u64(hash, 0x524f555445525057ULL);
+    if (buffer_request.q4k_a8g32_gate_up) hash_u64(hash, 0x51344b4138473332ULL);
 
     hash_u64(hash, compiled.arena.alignment);
     hash_u64(hash, compiled.arena.total_bytes);
@@ -307,6 +310,12 @@ CompiledSerialExecution compile_serial_execution(
     if (binding_request.parallel_moe_router != buffer_request.parallel_moe_router)
         throw std::invalid_argument("router kernel request differs from buffer admission");
 
+    if (binding_request.q4k_a8g32_gate_up != buffer_request.q4k_a8g32_gate_up)
+        throw std::invalid_argument("Q4K A8 kernel request differs from buffer admission");
+    if (binding_request.q4k_a8g32_gate_up &&
+        (binding_request.logical_rows != 1 || binding_request.request_concurrency != 1))
+        throw std::invalid_argument("Q4K A8 runtime supports only C1 one-row execution");
+
     CompiledSerialExecution compiled;
     if (binding_request.device_graph_inputs && (!binding_request.require_graph_safe ||
         binding_request.logical_rows != 1 || binding_request.request_concurrency != 1)) {
@@ -344,6 +353,9 @@ CompiledSerialExecution compile_serial_execution(
     }
 
     for (const auto& binding : compiled.bindings.bindings) {
+        if (binding.op == SerialOp::moe_experts && binding.kernel_id.has_value() &&
+            binding.kernel_id->ends_with(moe_q4k_a8::runtime_kernel_suffix) != buffer_request.q4k_a8g32_gate_up)
+            throw std::invalid_argument("bound Q4K A8 kernel differs from admitted topology");
         if (binding.op == SerialOp::moe_route && binding.kernel_id.has_value() &&
             (binding.kernel_id->ends_with(".parallel") != buffer_request.parallel_moe_router ||
              binding.kernel_id->ends_with(".ranked.parallel") != binding_request.ranked_moe_router_topk))

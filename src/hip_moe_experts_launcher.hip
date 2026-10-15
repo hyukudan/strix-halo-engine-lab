@@ -2,6 +2,12 @@
 #include "strix/hip_moe_experts_launcher.hpp"
 
 #include "strix/dispatch_resources.hpp"
+#include "strix/hip_setup_quiescence.hpp"
+#ifdef STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME
+#include "strix/hip_moe_q4k_a8_probe.hpp"
+#endif
+#include <array>
+#include <limits>
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -127,6 +133,14 @@ void check_hip(
 
 void validate_config(
     const HipMoeExpertsLauncherConfig& config) {
+    if (config.q4k_a8g32_gate_up) {
+#ifndef STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME
+        throw std::invalid_argument("Q4K A8 runtime capability is not built");
+#else
+        (void)moe_q4k_a8::build_runtime_workspace(config.hidden_size,
+            config.intermediate_size, config.expert_count, config.top_k);
+#endif
+    }
     if (config.hidden_size == 0 ||
         config.intermediate_size == 0 ||
         config.expert_count == 0 ||
@@ -1007,6 +1021,147 @@ void launch_typed(
     }
 }
 
+
+#ifdef STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME
+// Integer classification avoids finite-math assumptions and never mutates the
+// graph aggregate except by OR. Each CTA snapshots the sticky status atomically
+// before its barrier; bad producers cannot expose indeterminate scratch values.
+__global__ void q4k_a8_validate_finite_kernel(const float* values, std::uint32_t count,
+    std::uint32_t* status, std::uint32_t* aggregate, bool bf16_commit) {
+    const auto index = blockIdx.x * blockDim.x + threadIdx.x;
+    __shared__ std::uint32_t initial_status;
+    if (threadIdx.x == 0U) initial_status = atomicOr(status,0U);
+    __syncthreads();
+    if (initial_status != 0U) {
+        if (index == 0U && aggregate != nullptr) atomicOr(aggregate, 16U);
+        return;
+    }
+    if (index < count && (__float_as_uint(values[index]) & 0x7fffffffU) >=
+        (bf16_commit ? 0x7f7f8000U : 0x7f800000U)) {
+        atomicOr(status, 8U);
+        if (aggregate != nullptr) atomicOr(aggregate, 16U);
+    }
+}
+
+struct Q4kA8Range { std::uintptr_t address; std::uint64_t bytes; };
+void validate_q4k_a8_ranges(Q4kA8Range temporary, Q4kA8Range output,
+    const std::array<Q4kA8Range, 6>& readonly) {
+    const auto end = [](Q4kA8Range r) {
+        if (r.address == 0 || r.bytes == 0 || r.bytes > std::numeric_limits<std::uintptr_t>::max() - r.address)
+            throw std::invalid_argument("Q4K A8 invalid runtime address range");
+        return r.address + static_cast<std::uintptr_t>(r.bytes);
+    };
+    const auto disjoint = [&](Q4kA8Range a, Q4kA8Range c) {
+        if (a.address < end(c) && c.address < end(a))
+            throw std::invalid_argument("Q4K A8 runtime writable range aliases another owner");
+    };
+    (void)end(temporary); (void)end(output);
+    if (temporary.address % 256 != 0)
+        throw std::invalid_argument("Q4K A8 runtime temporary requires absolute 256-byte alignment");
+    disjoint(temporary,output);
+    for (const auto r : readonly) { disjoint(temporary,r); disjoint(output,r); }
+}
+
+template <typename Storage>
+void launch_q4k_a8_typed(const HipMoeExpertsLauncherConfig& config,
+    const ExecutionBufferAddress& hidden, const ExecutionBufferAddress& route_indices,
+    const ExecutionBufferAddress& route_weights, const ExecutionBufferAddress& output,
+    const ExecutionBufferAddress& temporary, const RoutedTensors& tensors) {
+    if (!config.q4k_a8_quiescence)
+        throw std::invalid_argument("Q4K A8 runtime requires setup completion guard");
+    const auto layout = moe_q4k_a8::build_runtime_workspace(config.hidden_size,
+        config.intermediate_size, config.expert_count, config.top_k);
+    if (temporary.bytes < layout.total_bytes)
+        throw std::invalid_argument("Q4K A8 runtime temporary is undersized");
+    const auto gate_bytes = required_weight_bytes(WeightKind::q4_k, config.hidden_size,
+        config.intermediate_size, config.expert_count);
+    // Validate entire runtime owners, not just the exact probe slices. Read-only
+    // owners can alias each other; scratch and semantic output cannot alias any.
+    validate_q4k_a8_ranges({temporary.address, temporary.bytes},
+        {output.address, output.bytes}, {{{hidden.address,hidden.bytes},
+        {route_indices.address,route_indices.bytes}, {route_weights.address,route_weights.bytes},
+        {tensors.gate.runtime->address,tensors.gate.runtime->bytes}, {tensors.up.runtime->address,tensors.up.runtime->bytes},
+        {tensors.down.runtime->address,tensors.down.runtime->bytes}}});
+    moe_q4k_a8::Request request;
+    request.enabled = true;
+    request.approved_numerical_identity = moe_q4k_a8::numerical_identity;
+    request.input = config.activation == HipActivationStorage::bf16 ?
+        moe_q4k_a8::InputKind::bf16 : moe_q4k_a8::InputKind::fp32;
+    request.shape = {config.hidden_size, config.intermediate_size, config.expert_count, config.top_k, 1};
+    request.gate_type = tensors.gate.manifest->ggml_type;
+    request.up_type = tensors.up.manifest->ggml_type;
+    request.fused_gate_up = tensors.fused_gate_up;
+    const auto slice = [&](std::uint64_t offset, std::uint64_t bytes) {
+        return moe_q4k_a8::DeviceBytes{temporary.address + static_cast<std::uintptr_t>(offset), bytes};
+    };
+    const moe_q4k_a8::Bindings bindings{
+        {hidden.address, static_cast<std::uint64_t>(config.hidden_size) * sizeof(Storage)},
+        {tensors.gate.runtime->address,gate_bytes}, {tensors.up.runtime->address,gate_bytes},
+        {route_indices.address, static_cast<std::uint64_t>(config.top_k) * sizeof(std::uint32_t)},
+        slice(layout.codes_offset,layout.codes_bytes), slice(layout.deltas_offset,layout.deltas_bytes),
+        slice(layout.sums_offset,layout.sums_bytes), slice(layout.status_offset,4),
+        slice(layout.gate_up_offset,layout.gate_up_bytes)};
+    // All admission is complete before even the initial clear is submitted.
+    moe_q4k_a8::validate(request,bindings);
+    auto* workspace = reinterpret_cast<float*>(bindings.output.address);
+    auto* accumulation = reinterpret_cast<float*>(temporary.address + layout.accumulation_offset);
+    auto* status = reinterpret_cast<std::uint32_t*>(bindings.status.address);
+    const auto* routes = reinterpret_cast<const std::uint32_t*>(route_indices.address);
+    const auto* weights = reinterpret_cast<const float*>(route_weights.address);
+    auto* aggregate = hip_graph_status();
+    check_hip(hipPeekAtLastError(), "Q4K A8 runtime pre-enqueue stale error");
+    check_hip(hipMemsetAsync(accumulation,0,
+        static_cast<std::size_t>(layout.accumulation_bytes + 4),hip_execution_stream()),
+        "clear Q4K A8 runtime accumulation/status");
+    hipLaunchKernelGGL(validate_routes_kernel,dim3(1),dim3(kThreads),0,hip_execution_stream(),
+        routes,weights,config.top_k,config.expert_count,status,aggregate);
+    check_hip(hipGetLastError(),"Q4K A8 route/weight validation");
+    moe_q4k_a8::enqueue_probe(request,bindings,hip_execution_stream());
+    const auto scan = [&](const float* values,std::uint32_t count,bool bf16_commit=false) {
+        hipLaunchKernelGGL(q4k_a8_validate_finite_kernel,
+            dim3((count+kThreads-1U)/kThreads),dim3(kThreads),0,hip_execution_stream(),
+            values,count,status,aggregate,bf16_commit);
+        check_hip(hipGetLastError(),"Q4K A8 finite pipeline validation");
+    };
+    scan(workspace,2U*config.intermediate_size*config.top_k);
+    // Slot buffers are independent. Finish all original SiLU kernels before
+    // checking their FP32 values, then preserve ascending down accumulation.
+    for (std::uint32_t slot=0;slot<config.top_k;++slot) {
+        auto* slot_workspace=workspace+2ULL*slot*config.intermediate_size;
+        hipLaunchKernelGGL(routed_activation_kernel,
+            dim3((config.intermediate_size+kThreads-1U)/kThreads),dim3(kThreads),0,
+            hip_execution_stream(),slot_workspace,config.intermediate_size,status);
+        check_hip(hipGetLastError(),"Q4K A8 original SiLU enqueue");
+    }
+    scan(workspace,2U*config.intermediate_size*config.top_k);
+    for (std::uint32_t slot=0;slot<config.top_k;++slot)
+        launch_down_by_kind(weight_kind(tensors.down.manifest->ggml_type),
+            workspace+2ULL*slot*config.intermediate_size,routes,weights,slot,*tensors.down.runtime,
+            config.intermediate_size,config.hidden_size,config.expert_count,accumulation,status);
+    scan(accumulation,config.hidden_size,config.activation == HipActivationStorage::bf16);
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(commit_experts_kernel<Storage>),
+        dim3((config.hidden_size+kThreads-1U)/kThreads),dim3(kThreads),0,hip_execution_stream(),
+        accumulation,reinterpret_cast<Storage*>(output.address),config.hidden_size,status);
+    check_hip(hipGetLastError(),"Q4K A8 semantic output commit");
+    if (aggregate == nullptr) {
+        std::uint32_t host_status = 0;
+        try {
+            check_hip(hipMemcpyAsync(&host_status,status,sizeof(host_status),hipMemcpyDeviceToHost,
+                hip_execution_stream()),"Q4K A8 read status");
+            check_hip(hipStreamSynchronize(hip_execution_stream()),"Q4K A8 drain status");
+        } catch (...) {
+            // host_status is still alive until the original device is drained.
+            config.q4k_a8_quiescence->recover_or_fail_stop();
+            throw;
+        }
+        if (host_status != 0)
+            throw std::invalid_argument("Q4K A8 rejected status bits (route/weight=1,input=2,delta=4,pipeline=8): " +
+                std::to_string(host_status));
+    }
+    if (config.q4k_a8_stats) config.q4k_a8_stats->quantized_submissions.fetch_add(1,std::memory_order_relaxed);
+}
+#endif
+
 void launch_moe_experts(
     const ExecutionDispatchContext& context,
     void* user_data) {
@@ -1068,7 +1223,9 @@ void launch_moe_experts(
         static_cast<std::uint64_t>(
             config.top_k) *
         sizeof(float);
-    const auto temporary_required =
+    const auto temporary_required = config.q4k_a8g32_gate_up ?
+        moe_q4k_a8::build_runtime_workspace(config.hidden_size, config.intermediate_size,
+            config.expert_count, config.top_k).total_bytes :
         (2ULL * config.intermediate_size + config.hidden_size) * sizeof(float) + sizeof(std::uint32_t);
 
     if (hidden.bytes <
@@ -1123,6 +1280,20 @@ void launch_moe_experts(
         config.expert_count,
         "routed down");
 
+    if (config.q4k_a8g32_gate_up) {
+#ifdef STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME
+        if (tensors.fused_gate_up || tensors.gate.manifest->ggml_type != tensors.up.manifest->ggml_type ||
+            (tensors.gate.manifest->ggml_type != 12 && tensors.gate.manifest->ggml_type != 13))
+            throw std::invalid_argument("Q4K A8 runtime requires separate paired Q4K or Q5K gate/up");
+        if (tensors.gate.manifest->ggml_type == 12) {
+            if (config.activation == HipActivationStorage::bf16)
+                launch_q4k_a8_typed<std::uint16_t>(config,hidden,route_indices,route_weights,output,temporary,tensors);
+            else launch_q4k_a8_typed<float>(config,hidden,route_indices,route_weights,output,temporary,tensors);
+            return;
+        }
+        if (config.q4k_a8_stats) config.q4k_a8_stats->legacy_q5k_submissions.fetch_add(1,std::memory_order_relaxed);
+#endif
+    }
     switch (config.activation) {
     case HipActivationStorage::bf16:
         launch_typed<std::uint16_t>(
@@ -1174,7 +1345,8 @@ std::string kernel_id(
             request.logical_rows) +
         ".c" +
         std::to_string(
-            request.request_concurrency);
+            request.request_concurrency) +
+        (config.q4k_a8g32_gate_up ? std::string(moe_q4k_a8::runtime_kernel_suffix) : "");
 }
 
 std::uint64_t implementation_identity(
@@ -1189,6 +1361,7 @@ std::uint64_t implementation_identity(
         hash,
         static_cast<std::uint64_t>(
             config.activation));
+    if (config.q4k_a8g32_gate_up) hash_u64(hash,0x51344b4138473332ULL);
     return hash;
 }
 
@@ -1207,6 +1380,8 @@ void register_hip_moe_experts_kernel_variant(
             error);
     }
     validate_config(config);
+    if (request.q4k_a8g32_gate_up != config.q4k_a8g32_gate_up)
+        throw std::invalid_argument("Q4K A8 variant config differs from binding request");
     if (config.hidden_size !=
             model.hidden_size ||
         config.intermediate_size !=
@@ -1274,6 +1449,13 @@ void register_hip_moe_experts_kernel_variant(
         "row-major";
     variant.compiler_identity =
         "hip-gfx1151-moe-experts-v2";
+    if (config.q4k_a8g32_gate_up) {
+        variant.resources.lds_bytes = 3328;
+        variant.resources.scratch_bytes = moe_q4k_a8::build_runtime_workspace(config.hidden_size,
+            config.intermediate_size,config.expert_count,config.top_k).total_bytes;
+        variant.numerics.accumulator_precision = std::string(moe_q4k_a8::runtime_numerical_identity);
+        variant.compiler_identity = "hip-gfx1151-moe-q4k-a8g32-native-v2-probe-strict-rndiv-legacy-down";
+    }
     variant.measured_seconds = 0.0;
 
     registry.add(
@@ -1290,6 +1472,10 @@ make_hip_moe_experts_launcher(
             "HIP routed-expert launcher requires id and config");
     }
     validate_config(*config);
+    if (kernel_id_value.ends_with(moe_q4k_a8::runtime_kernel_suffix) != config->q4k_a8g32_gate_up)
+        throw std::invalid_argument("Q4K A8 launcher id differs from config");
+    if (config->q4k_a8g32_gate_up && !config->q4k_a8_quiescence)
+        config->q4k_a8_quiescence = std::make_shared<HipSetupQuiescenceGuard>();
     return ExecutionLauncher{
         std::move(kernel_id_value),
         implementation_identity(
@@ -1326,6 +1512,8 @@ register_for_compiled_execution(
             throw std::invalid_argument(
                 "HIP routed-expert step has no kernel binding");
         }
+        if (binding.kernel_id->ends_with(moe_q4k_a8::runtime_kernel_suffix) != config_.q4k_a8g32_gate_up)
+            throw std::invalid_argument("Q4K A8 bundle mode differs from compiled selection");
         if (registered_id.empty()) {
             registered_id =
                 *binding.kernel_id;

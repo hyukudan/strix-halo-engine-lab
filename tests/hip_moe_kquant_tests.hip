@@ -9,6 +9,9 @@
 #include "strix/model_contract.hpp"
 #include "strix/model_manifest.hpp"
 #include "strix/model_runtime_binding.hpp"
+#ifdef STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME
+#include "q4k_a8_oracle.hpp"
+#endif
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -158,12 +161,17 @@ float round_bf16(float value) {
 int main(int argc, char** argv) try {
     const unsigned int requested_mode = argc > 1 ? static_cast<unsigned int>(std::stoul(argv[1])) : 0U;
     if (requested_mode > 7U) throw std::invalid_argument("invalid K-quant test mode");
+    const bool q4k_a8 = argc > 2 && std::string(argv[2]) == "q4k-a8";
+#ifndef STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME
+    if(q4k_a8) throw std::invalid_argument("Q4K A8 test requires runtime capability");
+#endif
     const bool bf16 = requested_mode >= 4U;
     const auto mode = requested_mode % 4U;
     constexpr std::array<std::uint32_t, 3> types{12U, 13U, 7U};
     const auto gate_type = mode < 3U ? types[mode] : 12U;
     const auto up_type = mode < 3U ? types[mode] : 13U;
     const auto down_type = mode < 3U ? types[mode] : 7U;
+    if(q4k_a8 && mode>1U) throw std::invalid_argument("Q4K A8 fixture requires paired Q4K/Q5K");
     constexpr std::uint32_t hidden = 768;
     constexpr std::uint32_t intermediate = 512;
     constexpr std::uint32_t experts = 4;
@@ -171,6 +179,20 @@ int main(int argc, char** argv) try {
 
     const auto model =
         strix::ModelContract::qwen38_flash_next();
+    {
+        strix::HipMoeExpertsLauncherConfig golden;
+        golden.hidden_size=2560; golden.intermediate_size=640; golden.expert_count=512; golden.top_k=10;
+        strix::ExecutionBindingRequest request;
+        request.minimum_qualification=strix::kernels::QualificationStatus::experimental;
+        strix::kernels::KernelRegistry registry;
+        strix::register_hip_moe_experts_kernel_variant(model,request,golden,registry);
+        const std::string id="hip.moe_experts.bf16.h2560.m640.e512.k10.r1.c1";
+        expect(registry.find(id)!=nullptr,"default MoE kernel ID matches pre-edit golden");
+        const auto launcher_golden=strix::make_hip_moe_experts_launcher(id,&golden);
+        expect(launcher_golden.implementation_identity==5740034692284928882ULL,
+            "default MoE implementation identity matches pre-edit FNV golden");
+    }
+
     const auto plan =
         strix::build_serial_decode_execution_plan(
             model);
@@ -184,6 +206,7 @@ int main(int argc, char** argv) try {
 
     strix::ExecutionBufferRequest buffer_request;
     buffer_request.logical_rows = 1;
+    buffer_request.q4k_a8g32_gate_up = q4k_a8;
     buffer_request.activation_element_bytes = bf16 ? 2U : 4U;
     buffer_request.mlp_intermediate_element_bytes = 4;
     const auto arena =
@@ -251,7 +274,7 @@ int main(int argc, char** argv) try {
     }
 
     const std::vector<std::uint32_t>
-        selected{1U, 3U};
+        selected{1U, q4k_a8 ? 1U : 3U};
     const std::vector<float>
         selected_weights{0.7F, 0.3F};
 
@@ -310,6 +333,20 @@ int main(int argc, char** argv) try {
             intermediate,
             11U, down_type);
 
+    std::vector<float> expected_projections(2ULL*intermediate*top_k);
+#ifdef STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME
+    if(q4k_a8 && gate_type==12U) {
+        const auto activation=q4k_a8_oracle::quantize(hidden_values);
+        const auto row_bytes=static_cast<std::size_t>(hidden/256U)*144U;
+        for(unsigned slot=0;slot<top_k;++slot) for(unsigned which=0;which<2;++which)
+            for(unsigned row=0;row<intermediate;++row) {
+                const auto& packed=which ? up.packed : gate.packed;
+                const auto offset=(static_cast<std::size_t>(selected[slot])*intermediate+row)*row_bytes;
+                expected_projections[(slot*2U+which)*intermediate+row]=q4k_a8_oracle::row(
+                    std::span<const std::byte>(packed.data()+offset,row_bytes),activation);
+            }
+    }
+#endif
     std::vector<float> expected(
         hidden,
         0.0F);
@@ -351,6 +388,10 @@ int main(int argc, char** argv) try {
                         intermediate,
                         hidden,
                         feature);
+            }
+            if(q4k_a8 && gate_type==12U) {
+                gate_sum=expected_projections[slot*2U*intermediate+inner];
+                up_sum=expected_projections[(slot*2U+1U)*intermediate+inner];
             }
             temp[inner] =
                 silu(
@@ -541,10 +582,11 @@ int main(int argc, char** argv) try {
     config.top_k =
         top_k;
     config.activation = bf16 ? strix::HipActivationStorage::bf16 : strix::HipActivationStorage::fp32;
+    config.q4k_a8g32_gate_up = q4k_a8;
 
     auto launcher =
         strix::make_hip_moe_experts_launcher(
-            "test.moe_experts",
+            "test.moe_experts" + (q4k_a8 ? std::string(strix::moe_q4k_a8::runtime_kernel_suffix) : ""),
             &config);
     launcher.function(
         context,
@@ -591,6 +633,29 @@ int main(int argc, char** argv) try {
     std::vector<std::byte> before(output_bytes), after(output_bytes);
     check(hipMemcpy(before.data(), reinterpret_cast<void*>(output.address), output_bytes,
                     hipMemcpyDeviceToHost), "snapshot committed routed output");
+    if(q4k_a8 && gate_type==12U) {
+        const auto temporary=strix::resolve_execution_buffer(memory.execution_identity,arena,memory,step_io.temporaries[0]);
+        const auto layout=strix::moe_q4k_a8::build_runtime_workspace(hidden,intermediate,experts,top_k);
+        std::vector<float> staged(expected_projections.size());
+        check(hipMemcpy(staged.data(),reinterpret_cast<void*>(temporary.address+layout.gate_up_offset),
+            staged.size()*sizeof(float),hipMemcpyDeviceToHost),"read quantized gate/up slot workspace");
+        for(unsigned slot=0;slot<top_k;++slot) for(unsigned row=0;row<intermediate;++row) {
+            const auto gate_index=slot*2U*intermediate+row;
+            const auto up_index=gate_index+intermediate;
+            expect(std::bit_cast<unsigned>(staged[up_index])==std::bit_cast<unsigned>(expected_projections[up_index]),
+                "untouched up half exactly matches independent integer/FP32 oracle");
+            expect(std::abs(staged[gate_index]-silu(expected_projections[gate_index])*expected_projections[up_index])<=1e-6F,
+                "activated gate half matches independent slot composition");
+        }
+    }
+    if(q4k_a8 && gate_type==13U) {
+        auto legacy_config=config; legacy_config.q4k_a8g32_gate_up=false;
+        auto legacy=strix::make_hip_moe_experts_launcher("test.legacy.moe",&legacy_config);
+        legacy.function(context,legacy.user_data);
+        check(hipMemcpy(after.data(),reinterpret_cast<void*>(output.address),output_bytes,hipMemcpyDeviceToHost),
+            "read Q5K legacy fallback");
+        expect(before==after,"Q5K mode fallback output is bitwise identical to original launcher");
+    }
     auto bad_routes = selected;
     bad_routes[1] = experts;
     check(hipMemcpy(reinterpret_cast<void*>(route_indices.address), bad_routes.data(),
@@ -639,6 +704,21 @@ int main(int argc, char** argv) try {
     { strix::HipLaunchScope scope(graph_context); launcher.function(context, launcher.user_data); }
     check(hipStreamEndCapture(graph_stream, &graph), "end routed graph capture");
     check(hipGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0), "instantiate routed graph");
+    if(q4k_a8) {
+        check(hipMemcpy(reinterpret_cast<void*>(route_indices.address),selected.data(),selected.size()*sizeof(unsigned),hipMemcpyHostToDevice),"restore graph valid routes");
+        check(hipMemcpy(reinterpret_cast<void*>(route_weights.address),selected_weights.data(),selected_weights.size()*sizeof(float),hipMemcpyHostToDevice),"restore graph valid weights");
+        for(unsigned replay=0;replay<3;++replay) {
+            const unsigned preset=0x200U;
+            check(hipMemcpyAsync(graph_status,&preset,4,hipMemcpyHostToDevice,graph_stream),"preset graph aggregate");
+            check(hipMemsetAsync(reinterpret_cast<void*>(output.address),0xa5,output_bytes,graph_stream),"stream ordered poison before successful replay");
+            check(hipGraphLaunch(graph_exec,graph_stream),"launch valid quantized/fallback graph");
+            unsigned status=0;
+            check(hipMemcpyAsync(&status,graph_status,4,hipMemcpyDeviceToHost,graph_stream),"read preserved aggregate");
+            check(hipMemcpyAsync(after.data(),reinterpret_cast<void*>(output.address),output_bytes,hipMemcpyDeviceToHost,graph_stream),"read successful replay");
+            check(hipStreamSynchronize(graph_stream),"drain successful replay");
+            expect(status==preset && before==after,"graph replay preserves preset aggregate and reproduces eager bits");
+        }
+    }
     for (unsigned int invalid = 0; invalid < 2U; ++invalid) {
         check(hipMemcpy(reinterpret_cast<void*>(route_indices.address),
             invalid == 0U ? selected.data() : bad_routes.data(), selected.size() * sizeof(std::uint32_t),
@@ -646,15 +726,82 @@ int main(int argc, char** argv) try {
         check(hipMemcpy(reinterpret_cast<void*>(route_weights.address),
             invalid == 0U ? bad_weights.data() : selected_weights.data(), selected_weights.size() * sizeof(float),
             hipMemcpyHostToDevice), "set graph route weights");
-        check(hipMemsetAsync(graph_status, 0, sizeof(std::uint32_t), graph_stream), "reset aggregate graph status");
+        const unsigned preset=q4k_a8 ? 0x200U : 0U;
+        check(hipMemcpyAsync(graph_status,&preset,sizeof(preset),hipMemcpyHostToDevice,graph_stream), "preset aggregate graph status");
         check(hipGraphLaunch(graph_exec, graph_stream), "launch invalid routed graph");
         std::uint32_t failure = 0;
         check(hipMemcpyAsync(&failure, graph_status, sizeof(failure), hipMemcpyDeviceToHost, graph_stream), "read graph validation status");
         check(hipStreamSynchronize(graph_stream), "drain invalid routed graph");
         expect((failure & 16U) != 0U, "graph reports invalid route or weight at completion");
+        if(q4k_a8) expect(failure==0x210U,"invalid graph preserves unrelated aggregate bit");
         check(hipMemcpy(after.data(), reinterpret_cast<void*>(output.address), output_bytes,
                         hipMemcpyDeviceToHost), "read output after invalid graph replay");
         expect(before == after, "invalid graph routes cannot publish expert output");
+    }
+    if(q4k_a8 && gate_type==12U) {
+        const auto temporary=strix::resolve_execution_buffer(memory.execution_identity,arena,memory,step_io.temporaries[0]);
+        const auto layout=strix::moe_q4k_a8::build_runtime_workspace(hidden,intermediate,experts,top_k);
+        const auto restore = [&] {
+            check(hipMemcpy(reinterpret_cast<void*>(hidden_input.address),bf16 ? static_cast<const void*>(hidden_bf16.data()) : hidden_values.data(),hidden*(bf16?2U:4U),hipMemcpyHostToDevice),"restore quantized input");
+            check(hipMemcpy(reinterpret_cast<void*>(device_weights[0]),gate.data(),gate.size(),hipMemcpyHostToDevice),"restore gate payload");
+            check(hipMemcpy(reinterpret_cast<void*>(device_weights[2]),down.data(),down.size(),hipMemcpyHostToDevice),"restore down payload");
+            check(hipMemcpy(reinterpret_cast<void*>(route_indices.address),selected.data(),selected.size()*4,hipMemcpyHostToDevice),"restore route IDs");
+            check(hipMemcpy(reinterpret_cast<void*>(route_weights.address),selected_weights.data(),selected_weights.size()*4,hipMemcpyHostToDevice),"restore route weights");
+        };
+        const auto upload_input = [&](const std::vector<float>& input) {
+            std::vector<std::uint16_t> storage(hidden);
+            if(bf16) for(unsigned i=0;i<hidden;++i) storage[i]=static_cast<std::uint16_t>(
+                std::bit_cast<unsigned>(std::isfinite(input[i]) ? round_bf16(input[i]) : input[i])>>16U);
+            check(hipMemcpy(reinterpret_cast<void*>(hidden_input.address),bf16 ? static_cast<const void*>(storage.data()) : input.data(),hidden*(bf16?2U:4U),hipMemcpyHostToDevice),"upload adversarial input");
+        };
+        const auto error_case = [&](unsigned bit, bool down_phase) {
+            bool error=false;
+            try { launcher.function(context,launcher.user_data); }
+            catch(const std::invalid_argument&) { error=true; }
+            unsigned local=0;
+            check(hipMemcpy(&local,reinterpret_cast<void*>(temporary.address+layout.status_offset),4,hipMemcpyDeviceToHost),"read eager pipeline status");
+            check(hipMemcpy(after.data(),reinterpret_cast<void*>(output.address),output_bytes,hipMemcpyDeviceToHost),"read rejected pipeline output");
+            expect(error && local==bit && before==after,"eager failure has precise sticky bit and preserves semantic destination");
+            if(down_phase) {
+                std::vector<float> activated(static_cast<std::size_t>(2U*intermediate*top_k));
+                check(hipMemcpy(activated.data(),reinterpret_cast<void*>(temporary.address),activated.size()*4,hipMemcpyDeviceToHost),"read pre-down finite activation");
+                expect(std::all_of(activated.begin(),activated.end(),[](float value){return std::isfinite(value);}),
+                    "down-overflow adversary reached finite post-SiLU workspace");
+            }
+            const unsigned preset=0x200U;
+            check(hipMemcpyAsync(graph_status,&preset,4,hipMemcpyHostToDevice,graph_stream),"preset pipeline-error aggregate");
+            check(hipGraphLaunch(graph_exec,graph_stream),"replay pipeline error");
+            unsigned aggregate=0;
+            check(hipMemcpyAsync(&aggregate,graph_status,4,hipMemcpyDeviceToHost,graph_stream),"read pipeline error aggregate");
+            check(hipMemcpyAsync(&local,reinterpret_cast<void*>(temporary.address+layout.status_offset),4,hipMemcpyDeviceToHost,graph_stream),"read captured pipeline status");
+            check(hipMemcpyAsync(after.data(),reinterpret_cast<void*>(output.address),output_bytes,hipMemcpyDeviceToHost,graph_stream),"read captured rejected destination");
+            check(hipStreamSynchronize(graph_stream),"drain pipeline error graph");
+            expect(aggregate==0x210U && local==bit && before==after,
+                "captured failure preserves output, precise local bit and unrelated aggregate");
+        };
+        for(const auto bits : {0x7fc00000U,0x7f800000U,0xff800000U}) {
+            restore(); auto bad=hidden_values; bad[0]=std::bit_cast<float>(bits); upload_input(bad); error_case(2U,false);
+        }
+        if(!bf16) { restore(); upload_input(std::vector<float>(hidden,std::bit_cast<float>(63U))); error_case(4U,false); }
+        restore();
+        auto corrupt_gate=gate.packed;
+        const auto header=(static_cast<std::size_t>(selected[0])*intermediate)*(hidden/256U)*144U;
+        const std::uint16_t nan_half=0x7e00U;
+        std::memcpy(corrupt_gate.data()+header,&nan_half,2);
+        check(hipMemcpy(device_weights[0],corrupt_gate.data(),corrupt_gate.size(),hipMemcpyHostToDevice),"upload nonfinite gate header");
+        error_case(8U,false);
+        restore(); upload_input(std::vector<float>(hidden,1e25F)); error_case(8U,false);
+        restore(); upload_input(std::vector<float>(hidden,1e18F));
+        auto huge_down=down.packed;
+        for(std::size_t offset=0;offset<huge_down.size();offset+=144) {
+            const std::uint16_t d=0x7bffU,m=0;
+            std::memcpy(huge_down.data()+offset,&d,2); std::memcpy(huge_down.data()+offset+2,&m,2);
+        }
+        check(hipMemcpy(device_weights[2],huge_down.data(),huge_down.size(),hipMemcpyHostToDevice),"upload finite down-overflow payload");
+        error_case(8U,true);
+        restore();
+        std::cout << "Q4K A8 native independent up comparisons=" << top_k*intermediate
+            << " successful graph replays=3 input/header/activation/down failure gates passed\n";
     }
     check(hipGraphExecDestroy(graph_exec), "destroy routed graph executable");
     check(hipGraphDestroy(graph), "destroy routed graph");

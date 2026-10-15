@@ -14,6 +14,7 @@ struct ExecutionBufferRequest {
     std::uint32_t logit_element_bytes = 4;
     std::uint32_t mlp_intermediate_element_bytes = 4;
     bool parallel_moe_router = false;
+    bool q4k_a8g32_gate_up = false;
 };
 
 struct ExecutionBufferPlan {

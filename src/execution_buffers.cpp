@@ -1,6 +1,7 @@
 #include "strix/execution_buffers.hpp"
 
 #include "strix/indexed_attention_workspace.hpp"
+#include "strix/moe_q4k_a8_runtime.hpp"
 
 #include "strix/ple_workspace.hpp"
 
@@ -105,6 +106,16 @@ ExecutionBufferPlan build_serial_execution_buffer_plan(
         checked_add(checked_mul(checked_add(checked_mul(model.moe_intermediate_size, 2ULL),
                                            model.hidden_size), model.bytes_fp32), 4ULL));
     plan.mlp_intermediate_bytes = std::max(plan.mlp_intermediate_bytes, routed_workspace_bytes);
+    if (request.q4k_a8g32_gate_up) {
+        if (request.logical_rows != 1 || request.control_element_bytes != 4 ||
+            request.index_element_bytes != 4 || request.mlp_intermediate_element_bytes != 4 ||
+            (request.activation_element_bytes != 2 && request.activation_element_bytes != 4))
+            throw std::invalid_argument("Q4K A8 runtime requires C1 and typed FP32 workspace");
+        const auto layout = moe_q4k_a8::build_runtime_workspace(model.hidden_size,
+            model.moe_intermediate_size, model.num_experts, model.num_experts_per_token);
+        plan.mlp_intermediate_bytes = std::max(plan.mlp_intermediate_bytes, layout.total_bytes);
+    }
+
 
     const auto gdn_key_width =
         checked_mul(

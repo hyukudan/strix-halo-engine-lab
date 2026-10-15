@@ -88,7 +88,8 @@ strix::kernels::KernelRegistry make_registry(
             make_variant(
                 "test." + key + suffix +
                     (step.op == strix::SerialOp::moe_route && request.ranked_moe_router_topk ? ".ranked.parallel" :
-                     step.op == strix::SerialOp::moe_route && request.parallel_moe_router ? ".parallel" : ""),
+                     step.op == strix::SerialOp::moe_route && request.parallel_moe_router ? ".parallel" : "") +
+                    (step.op == strix::SerialOp::moe_experts && request.q4k_a8g32_gate_up ? ".q4k-a8g32-gateup-v2" : ""),
                 *family,
                 shape,
                 measured_seconds));
@@ -571,6 +572,26 @@ int main() {
                explicit_default.kernel_plan_identity == compiled.kernel_plan_identity &&
                explicit_default.arena.total_bytes == compiled.arena.total_bytes,
            "explicit disabled router preserves default execution/kernel identities and arena");
+
+    auto q4_binding=binding_request;
+    auto q4_buffers=buffer_request;
+    q4_binding.q4k_a8g32_gate_up=true; q4_buffers.q4k_a8g32_gate_up=true;
+    const auto q4_registry=make_registry(model,q4_binding);
+    const auto q4_compiled=strix::compile_serial_execution(model,q4_registry,q4_binding,q4_buffers);
+    expect(q4_compiled.execution_identity != compiled.execution_identity &&
+        q4_compiled.kernel_plan_identity != compiled.kernel_plan_identity,
+        "Q4K A8 opt-in gets distinct compiled and kernel identities");
+    expect(rejects_ranked(q4_registry,q4_binding,buffer_request), "Q4K A8 request requires matching buffer admission");
+    expect(rejects_ranked(q4_registry,binding_request,q4_buffers), "Q4K A8 buffers require matching request");
+    expect(rejects_ranked(registry,q4_binding,q4_buffers), "Q4K A8 admission rejects legacy kernel");
+    expect(rejects_ranked(q4_registry,binding_request,buffer_request), "legacy admission rejects Q4K A8 kernel");
+    bool q4_alignment_rejected=false;
+    try { (void)strix::compile_serial_execution(model,q4_registry,q4_binding,q4_buffers,128); }
+    catch(const std::invalid_argument&) { q4_alignment_rejected=true; }
+    expect(q4_alignment_rejected, "Q4K A8 rejects insufficient absolute arena alignment");
+    q4_binding.q4k_a8g32_gate_up=false; q4_buffers.q4k_a8g32_gate_up=false;
+    expect(strix::compile_serial_execution(model,registry,q4_binding,q4_buffers).execution_identity ==
+        5195923158154663034ULL, "disabled Q4K A8 preserves pre-edit compiled golden");
 
     if (failures == 0) {
         std::cout << "compiled execution tests passed\n";

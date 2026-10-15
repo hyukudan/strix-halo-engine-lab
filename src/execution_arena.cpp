@@ -96,6 +96,9 @@ ExecutionArenaPlan build_serial_execution_arena_plan(
     if (buffer_request.parallel_moe_router && alignment % 16U != 0)
         throw std::invalid_argument("parallel router arena requires at least 16-byte alignment");
 
+    if (buffer_request.q4k_a8g32_gate_up && alignment % 256U != 0)
+        throw std::invalid_argument("Q4K A8 runtime arena requires 256-byte alignment");
+
     const auto sizes =
         build_serial_execution_buffer_plan(
             model, buffer_request);

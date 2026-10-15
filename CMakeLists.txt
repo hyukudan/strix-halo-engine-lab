@@ -6,7 +6,8 @@ option(STRIX_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" ON)
 option(STRIX_ENABLE_HIP_RUNTIME "Build optional HIP allocation/runtime support" OFF)
 option(STRIX_USE_OPENSSL_SHA256 "Use OpenSSL for full-file SHA-256 verification" OFF)
 option(STRIX_BUILD_EXPERIMENTAL_Q4K_A8_PROBE "Build standalone experimental Q4K A8G32 HIP probe" OFF)
-if(STRIX_BUILD_EXPERIMENTAL_Q4K_A8_PROBE AND NOT STRIX_ENABLE_HIP_RUNTIME)
+option(STRIX_ENABLE_EXPERIMENTAL_Q4K_A8_RUNTIME "Build opt-in native Q4K A8G32 gate/up integration" OFF)
+if((STRIX_BUILD_EXPERIMENTAL_Q4K_A8_PROBE OR STRIX_ENABLE_EXPERIMENTAL_Q4K_A8_RUNTIME) AND NOT STRIX_ENABLE_HIP_RUNTIME)
     message(FATAL_ERROR "Experimental Q4K A8 probe requires HIP runtime support")
 endif()
 
@@ -25,6 +26,7 @@ function(strix_target_warnings target)
 endfunction()
 
 add_library(strix_core STATIC
+    src/moe_q4k_a8_runtime.cpp
     src/arithmetic_lineage.cpp
     src/graph_eligibility.cpp
     src/graph_inputs.cpp
@@ -211,7 +213,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 endif()
 
 include(CTest)
-if(BUILD_TESTING OR STRIX_BUILD_EXPERIMENTAL_Q4K_A8_PROBE)
+if(BUILD_TESTING OR STRIX_BUILD_EXPERIMENTAL_Q4K_A8_PROBE OR STRIX_ENABLE_EXPERIMENTAL_Q4K_A8_RUNTIME)
     add_library(strix_q4k_a8_contract STATIC src/moe_q4k_a8_contract.cpp)
     target_include_directories(strix_q4k_a8_contract PUBLIC include)
     target_compile_features(strix_q4k_a8_contract PUBLIC cxx_std_20)
@@ -533,6 +535,11 @@ if(BUILD_TESTING)
     target_link_libraries(strix-execution-plan-tests PRIVATE strix_core)
     strix_target_warnings(strix-execution-plan-tests)
     add_test(NAME strix-execution-plan-tests COMMAND strix-execution-plan-tests)
+
+    add_executable(strix-moe-q4k-a8-runtime-tests tests/moe_q4k_a8_runtime_tests.cpp)
+    target_link_libraries(strix-moe-q4k-a8-runtime-tests PRIVATE strix_core)
+    strix_target_warnings(strix-moe-q4k-a8-runtime-tests)
+    add_test(NAME strix-moe-q4k-a8-runtime-tests COMMAND strix-moe-q4k-a8-runtime-tests)
 
     add_executable(strix-execution-buffer-tests tests/execution_buffers_tests.cpp)
     target_link_libraries(strix-execution-buffer-tests PRIVATE strix_core)
@@ -977,18 +984,24 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         REQUIRED
     )
 
-    if(STRIX_BUILD_EXPERIMENTAL_Q4K_A8_PROBE)
-        # Isolated opt-in targets; no new TU or flag enters the default runtime.
-        add_library(strix_q4k_a8_dot4_compile_probe OBJECT lab/q4k_a8/dot4_compile_probe.hip)
+    if(STRIX_BUILD_EXPERIMENTAL_Q4K_A8_PROBE OR STRIX_ENABLE_EXPERIMENTAL_Q4K_A8_RUNTIME)
+        # Only this isolated arithmetic TU receives the strict experimental flags.
         add_library(strix_q4k_a8_hip_probe STATIC src/hip_moe_q4k_a8_probe.hip)
         target_link_libraries(strix_q4k_a8_hip_probe PUBLIC strix_q4k_a8_contract "${STRIX_HIP_RUNTIME_LIBRARY}")
-        foreach(target strix_q4k_a8_dot4_compile_probe strix_q4k_a8_hip_probe)
+        foreach(target strix_q4k_a8_hip_probe)
             target_include_directories(${target} PUBLIC include "${STRIX_HIP_INCLUDE_DIR}")
             set_target_properties(${target} PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
             target_compile_options(${target} PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
             strix_target_warnings(${target})
         endforeach()
-        if(BUILD_TESTING)
+        if(STRIX_BUILD_EXPERIMENTAL_Q4K_A8_PROBE)
+            add_library(strix_q4k_a8_dot4_compile_probe OBJECT lab/q4k_a8/dot4_compile_probe.hip)
+            target_include_directories(strix_q4k_a8_dot4_compile_probe PRIVATE include "${STRIX_HIP_INCLUDE_DIR}")
+            set_target_properties(strix_q4k_a8_dot4_compile_probe PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+            target_compile_options(strix_q4k_a8_dot4_compile_probe PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
+            strix_target_warnings(strix_q4k_a8_dot4_compile_probe)
+        endif()
+        if(BUILD_TESTING AND STRIX_BUILD_EXPERIMENTAL_Q4K_A8_PROBE)
             add_executable(strix-hip-q4k-a8-probe-tests tests/hip_moe_q4k_a8_probe_tests.hip $<TARGET_OBJECTS:strix_q4k_a8_dot4_compile_probe>)
             target_link_libraries(strix-hip-q4k-a8-probe-tests PRIVATE strix_q4k_a8_hip_probe strix_core)
             set_target_properties(strix-hip-q4k-a8-probe-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
@@ -1047,6 +1060,10 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         strix_core
         "${STRIX_HIP_RUNTIME_LIBRARY}"
     )
+    if(STRIX_ENABLE_EXPERIMENTAL_Q4K_A8_RUNTIME)
+        target_link_libraries(strix_hip_runtime PUBLIC strix_q4k_a8_hip_probe)
+        target_compile_definitions(strix_hip_runtime PUBLIC STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME=1)
+    endif()
     strix_target_warnings(strix_hip_runtime)
     set_source_files_properties(src/hip_integer_projection.hip src/hip_integer_projection_runtime.hip
         PROPERTIES COMPILE_OPTIONS "-mno-wavefrontsize64;-ffp-contract=off")
@@ -1323,6 +1340,16 @@ if(STRIX_ENABLE_HIP_RUNTIME)
             COMMAND strix-hip-moe-experts-launcher-tests
         )
 
+        if(STRIX_ENABLE_EXPERIMENTAL_Q4K_A8_RUNTIME)
+            foreach(mode 0 1 4 5)
+                add_test(NAME strix-hip-moe-q4k-a8-native-${mode}-tests
+                    COMMAND strix-hip-moe-kquant-tests ${mode} q4k-a8)
+            endforeach()
+        endif()
+        add_test(NAME strix-q4k-a8-native-cli-tests
+            COMMAND "${CMAKE_COMMAND}" "-DBINARY=$<TARGET_FILE:strix-hip-decode-token>"
+            "-DCAPABILITY=${STRIX_ENABLE_EXPERIMENTAL_Q4K_A8_RUNTIME}"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_q4k_a8_runtime_cli.cmake")
         add_executable(strix-hip-moe-kquant-tests tests/hip_moe_kquant_tests.hip)
         set_target_properties(strix-hip-moe-kquant-tests PROPERTIES
             HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)

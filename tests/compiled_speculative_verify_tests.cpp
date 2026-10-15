@@ -264,6 +264,14 @@ int main() {
                explicit_default.arena.total_bytes == compiled.arena.total_bytes,
            "explicit disabled router preserves speculative default identities and arena");
 
+    auto q4_buffers=buffers; q4_buffers.logical_rows=1; q4_buffers.q4k_a8g32_gate_up=true;
+    bool q4_rejected=false;
+    try { (void)strix::compile_speculative_verify_execution(model,1,make_registry(model,1),binding,q4_buffers); }
+    catch(const std::invalid_argument& error) {
+        q4_rejected=std::string(error.what()).find("Q4K A8 runtime does not support speculative verify") != std::string::npos;
+    }
+    expect(q4_rejected,"Q4K A8 explicitly rejects speculative depth1 before alternate admission");
+
     if (failures == 0) {
         std::cout << "compiled speculative verify tests passed\n";
     }

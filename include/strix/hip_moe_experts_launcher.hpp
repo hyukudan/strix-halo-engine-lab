@@ -6,8 +6,11 @@
 
 #include <cstdint>
 #include <string>
+#include <memory>
+#include "strix/moe_q4k_a8_runtime.hpp"
 
 namespace strix {
+class HipSetupQuiescenceGuard;
 
 struct HipMoeExpertsLauncherConfig {
     std::uint32_t hidden_size = 0;
@@ -16,6 +19,9 @@ struct HipMoeExpertsLauncherConfig {
     std::uint32_t top_k = 0;
     HipActivationStorage activation =
         HipActivationStorage::bf16;
+    bool q4k_a8g32_gate_up = false;
+    std::shared_ptr<const HipSetupQuiescenceGuard> q4k_a8_quiescence;
+    std::shared_ptr<moe_q4k_a8::RuntimeDispatchStats> q4k_a8_stats;
 };
 
 void register_hip_moe_experts_kernel_variant(
