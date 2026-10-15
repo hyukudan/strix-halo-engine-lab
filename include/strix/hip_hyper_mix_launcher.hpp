@@ -18,6 +18,7 @@ struct HipHyperMixLauncherConfig {
     bool staged_projections = false;
     bool fused_injection = false;
     bool typed_projection = false;
+    bool prefetch_rows = false;
     HipActivationStorage activation =
         HipActivationStorage::bf16;
 };

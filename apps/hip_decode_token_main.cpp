@@ -170,6 +170,7 @@ struct Options {
     bool staged_hyper_projections = false;
     bool fused_staged_hyper_mix = false;
     bool typed_hyper_projection = false;
+    bool prefetch_typed_hyper_rows = false;
     bool virtual_q8_lm_head = false;
     bool parallel_moe_router = false;
     std::uint64_t ple_max_rows_per_io = 4;
@@ -197,7 +198,7 @@ Options parse_options(
             "[--planned-ple-io] [--ple-max-rows-per-io N] [--ple-max-inflight-ios N] "
             "[--generate N] [--eos-token TOKEN_ID] [--prefix-cache-roundtrip] "
             "[--parallel-moe-router] [--virtual-q8-lm-head] "
-            "[--parallel-hyper-mix [--staged-hyper-projections [--fused-staged-hyper-mix [--typed-fused-hyper-projections]]]]");
+            "[--parallel-hyper-mix [--staged-hyper-projections [--fused-staged-hyper-mix [--typed-fused-hyper-projections [--prefetch-typed-hyper-rows]]]]]");
     }
 
     Options options;
@@ -213,6 +214,11 @@ Options parse_options(
         if (argument == "--parallel-moe-router") {
             if (options.parallel_moe_router) throw std::invalid_argument("duplicate parallel MoE router option");
             options.parallel_moe_router = true;
+            continue;
+        }
+        if (argument == "--prefetch-typed-hyper-rows") {
+            if (options.prefetch_typed_hyper_rows) throw std::invalid_argument("duplicate typed hyper row prefetch option");
+            options.prefetch_typed_hyper_rows = true;
             continue;
         }
         if (argument == "--typed-fused-hyper-projections") {
@@ -476,6 +482,8 @@ Options parse_options(
         throw std::invalid_argument(
             "ple-max-inflight-ios must be non-zero");
     }
+    if (options.prefetch_typed_hyper_rows && !options.typed_hyper_projection)
+        throw std::invalid_argument("typed hyper row prefetch requires typed projection mode");
     if (options.typed_hyper_projection && !(options.parallel_hyper_mix && options.staged_hyper_projections && options.fused_staged_hyper_mix))
         throw std::invalid_argument("typed hyper projections require parallel, staged and fused options");
     if (options.staged_hyper_projections && !options.parallel_hyper_mix)
@@ -867,6 +875,7 @@ int main(
     catalog_config.staged_hyper_projections = options.staged_hyper_projections;
     catalog_config.fused_staged_hyper_mix = options.fused_staged_hyper_mix;
     catalog_config.typed_hyper_projection = options.typed_hyper_projection;
+    catalog_config.prefetch_typed_hyper_rows = options.prefetch_typed_hyper_rows;
     catalog_config.virtual_q8_lm_head = options.virtual_q8_lm_head;
     catalog_config.parallel_moe_router = options.parallel_moe_router;
     binding_request.parallel_moe_router = options.parallel_moe_router;
