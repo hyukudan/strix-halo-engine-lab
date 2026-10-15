@@ -44,6 +44,12 @@ public:
     [[nodiscard]] virtual std::vector<float> execute(
         std::uint32_t input_token,
         std::uint64_t position) = 0;
+
+    // Scalar generation seam. The default retains the complete-logits backend;
+    // a device backend may validate/select without downloading the vocabulary.
+    [[nodiscard]] virtual std::uint32_t execute_greedy(
+        std::uint32_t input_token, std::uint64_t position,
+        std::uint64_t vocab_size);
 };
 
 [[nodiscard]] std::uint32_t select_greedy_token(
@@ -55,6 +61,12 @@ public:
     SerialGreedyStepBackend& backend);
 
 [[nodiscard]] SerialGreedyRequestResult execute_serial_greedy_request(
+    const SerialGreedyRequest& request,
+    SerialGreedyStepBackend& backend);
+
+// Explicit token-output route; existing full-logits request/continuation APIs
+// retain their behavior. Every scalar result must have passed finite validation.
+[[nodiscard]] SerialGreedyRequestResult execute_serial_greedy_token_request(
     const SerialGreedyRequest& request,
     SerialGreedyStepBackend& backend);
 

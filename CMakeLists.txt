@@ -232,6 +232,10 @@ if(BUILD_TESTING OR STRIX_BUILD_EXPERIMENTAL_Q4K_A8_PROBE OR STRIX_ENABLE_EXPERI
     endif()
 endif()
 if(BUILD_TESTING)
+    add_executable(strix-greedy-token-request-tests tests/greedy_token_request_tests.cpp)
+    target_link_libraries(strix-greedy-token-request-tests PRIVATE strix_core)
+    strix_target_warnings(strix-greedy-token-request-tests)
+    add_test(NAME strix-greedy-token-request-tests COMMAND strix-greedy-token-request-tests)
     add_executable(strix-execution-inventory-receipt-tests tests/execution_inventory_receipt_tests.cpp)
     target_link_libraries(strix-execution-inventory-receipt-tests PRIVATE strix_core)
     strix_target_warnings(strix-execution-inventory-receipt-tests)
@@ -1121,6 +1125,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         src/hip_integer_projection.hip
         src/hip_integer_projection_runtime.hip
         src/hip_lm_head_launcher.hip
+        src/hip_generation_output.hip
         src/hip_shared_expert_launcher.hip
     )
     target_include_directories(
@@ -1584,6 +1589,11 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         add_test(NAME strix-hip-shared-expert-prefetch-tests COMMAND strix-hip-shared-expert-prefetch-tests)
 
         add_executable(strix-hip-gdn-lm-wave8-diagnostic-tests tests/hip_gdn_lm_wave8_diagnostic_tests.hip)
+        add_executable(strix-hip-generation-output-tests tests/hip_generation_output_tests.hip)
+        set_target_properties(strix-hip-generation-output-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+        target_link_libraries(strix-hip-generation-output-tests PRIVATE strix_hip_runtime)
+        strix_target_warnings(strix-hip-generation-output-tests)
+        add_test(NAME strix-hip-generation-output-tests COMMAND strix-hip-generation-output-tests)
         set_target_properties(strix-hip-gdn-lm-wave8-diagnostic-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
         target_link_libraries(strix-hip-gdn-lm-wave8-diagnostic-tests PRIVATE strix_hip_runtime)
         strix_target_warnings(strix-hip-gdn-lm-wave8-diagnostic-tests)

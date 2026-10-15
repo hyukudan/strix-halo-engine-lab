@@ -90,6 +90,7 @@ struct OptimizationProfileResolution {
     bool automatic_applied = false;
 };
 struct Options {
+    bool gpu_greedy_token = false;
     bool execution_inventory = false;
     bool host_dispatch_telemetry = false;
     OptimizationProfile optimization_profile = OptimizationProfile::automatic;
@@ -187,6 +188,12 @@ inline Options parse_options(
             argv[index];
         options.any_low_level_flag = options.any_low_level_flag ||
             is_low_level_optimization_option(argument);
+        if (argument == "--gpu-greedy-token") {
+            if (options.gpu_greedy_token)
+                throw std::invalid_argument("duplicate GPU greedy token option");
+            options.gpu_greedy_token = true;
+            continue;
+        }
         if (argument == "--execution-inventory") {
             if (options.execution_inventory)
                 throw std::invalid_argument("duplicate execution inventory option");
@@ -519,6 +526,11 @@ inline Options parse_options(
         throw std::invalid_argument(
             "--generate requires at least one prefix token id");
     }
+    if (options.gpu_greedy_token && (!options.generate_tokens ||
+        !options.reference_path.empty() || !options.raw_recording_path.empty() ||
+        options.prefix_cache_roundtrip || options.execution.mode != strix::DecodeExecutionMode::eager ||
+        options.execution.integer_head != strix::DecodeIntegerHead::none))
+        throw std::invalid_argument("GPU greedy token output requires eager generation without RAW, reference, roundtrip or integer head");
     if (options.context_tokens == 0) {
         throw std::invalid_argument(
             "context must be non-zero");

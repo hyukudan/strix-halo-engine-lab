@@ -144,9 +144,8 @@ SerialGreedyRequestResult execute_serial_greedy_continuation(
     return result;
 }
 
-SerialGreedyRequestResult execute_serial_greedy_request(
-    const SerialGreedyRequest& request,
-    SerialGreedyStepBackend& backend) {
+namespace {
+void validate_greedy_request(const SerialGreedyRequest& request) {
     if (request.prefix_tokens.empty()) {
         throw std::invalid_argument(
             "serial greedy request requires a non-empty prefix");
@@ -184,6 +183,14 @@ SerialGreedyRequestResult execute_serial_greedy_request(
         }
     }
 
+}
+}  // namespace
+
+SerialGreedyRequestResult execute_serial_greedy_request(
+    const SerialGreedyRequest& request,
+    SerialGreedyStepBackend& backend) {
+    validate_greedy_request(request);
+
     SerialGreedyRequestResult result;
     std::vector<float> logits;
     std::uint64_t position = 0;
@@ -219,6 +226,48 @@ SerialGreedyRequestResult execute_serial_greedy_request(
     generated.steps_executed +=
         result.steps_executed;
     return generated;
+}
+
+std::uint32_t SerialGreedyStepBackend::execute_greedy(
+    std::uint32_t input_token, std::uint64_t position, std::uint64_t vocab_size) {
+    return select_greedy_token(execute(input_token, position), vocab_size);
+}
+
+SerialGreedyRequestResult execute_serial_greedy_token_request(
+    const SerialGreedyRequest& request, SerialGreedyStepBackend& backend) {
+    validate_greedy_request(request);
+    SerialGreedyRequestResult result;
+    std::uint64_t position = 0;
+    std::uint32_t next = 0;
+    const auto consume = [&](std::uint32_t token) {
+        const auto selected = backend.execute_greedy(token, position, request.vocab_size);
+        if (static_cast<std::uint64_t>(selected) >= request.vocab_size)
+            throw std::invalid_argument("greedy backend selected token outside vocabulary");
+        return selected;
+    };
+    for (const auto token : request.prefix_tokens) {
+        next = consume(token);
+        ++result.steps_executed;
+        ++position;
+    }
+    result.final_position = position;
+    while (result.generated_tokens.size() < request.max_new_tokens) {
+        result.generated_tokens.push_back(next);
+        if (next == request.eos_token_id) {
+            result.stop_reason = SerialRequestStopReason::eos;
+            break;
+        }
+        if (position >= request.context_capacity) {
+            result.stop_reason = SerialRequestStopReason::context_capacity;
+            break;
+        }
+        if (result.generated_tokens.size() >= request.max_new_tokens) break;
+        next = consume(next);
+        ++result.steps_executed;
+        ++position;
+        result.final_position = position;
+    }
+    return result;
 }
 
 }  // namespace strix

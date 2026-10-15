@@ -35,6 +35,19 @@ int main() {
            !defaults.deferred_moe_status,
            "parser defers auto until content identification");
     auto on = defaults;
+    auto inventory_only = parse({"decoder", "fixture.gguf", "1", "--execution-inventory"});
+    expect(inventory_only.execution_inventory && !inventory_only.any_low_level_flag,
+           "inventory export is independent of kernel selection");
+    auto scalar = parse({"decoder", "fixture.gguf", "1", "--generate", "2", "--gpu-greedy-token"});
+    const auto scalar_profile = resolve_optimization_profile(scalar, model, info, manifest,
+        validated_model_content_identity, true);
+    expect(scalar.gpu_greedy_token && scalar_profile.automatic_applied,
+           "explicit scalar output preserves the selected automatic kernel bundle");
+    rejects([] { static_cast<void>(parse({"decoder", "m", "1", "--gpu-greedy-token"})); },
+        "GPU greedy token output requires eager generation without RAW, reference, roundtrip or integer head");
+    rejects([] { static_cast<void>(parse({"decoder", "m", "1", "--generate", "2", "--prefix-cache-roundtrip",
+        "--gpu-greedy-token"})); },
+        "GPU greedy token output requires eager generation without RAW, reference, roundtrip or integer head");
     auto instrumented = parse({"decoder", "fixture.gguf", "1", "--host-dispatch-telemetry"});
     const auto instrumented_profile = resolve_optimization_profile(instrumented, model, info, manifest,
         validated_model_content_identity, true);

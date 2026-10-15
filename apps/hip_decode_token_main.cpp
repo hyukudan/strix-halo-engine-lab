@@ -27,6 +27,7 @@
 #include "strix/decode_integer_head.hpp"
 #include "strix/hip_integer_projection_runtime.hpp"
 #include "strix/hip_setup_quiescence.hpp"
+#include "strix/hip_generation_output.hpp"
 #include "hip_decode_experiment.hpp"
 #include "hip_decode_options.hpp"
 #include "hip_deferred_moe_status.hpp"
@@ -194,16 +195,56 @@ public:
         std::function<void(std::uint32_t, std::uint64_t, std::span<const float>)> recording = {},
         std::function<void()> recording_binding = {}, std::function<void()> recording_drain = {},
         std::function<void(std::uint32_t)> execute_override = {}, bool track_logit_hashes = false,
-        bool prepublication_completion = false)
+        bool prepublication_completion = false, strix::HipGreedyOutput* greedy_output = nullptr)
         : compiled_(&compiled),
           session_(&session),
           resources_(&resources),
           dispatcher_(&dispatcher),
           scratch_(&scratch),
           lm_io_(&lm_io),
-          vocab_size_(vocab_size), recording_(std::move(recording)), recording_binding_(std::move(recording_binding)), recording_drain_(std::move(recording_drain)), execute_override_(std::move(execute_override)), track_logit_hashes_(track_logit_hashes), prepublication_completion_(prepublication_completion) {
+          vocab_size_(vocab_size), recording_(std::move(recording)), recording_binding_(std::move(recording_binding)), recording_drain_(std::move(recording_drain)), execute_override_(std::move(execute_override)), track_logit_hashes_(track_logit_hashes), prepublication_completion_(prepublication_completion), greedy_output_(greedy_output) {
         if(prepublication_completion_&&!execute_override_)
             throw std::invalid_argument("checked completion requires the owned native token executor");
+        if (greedy_output_ && (recording_ || track_logit_hashes_))
+            throw std::invalid_argument("scalar greedy output cannot omit requested full-logit evidence");
+    }
+
+    std::uint32_t execute_greedy(std::uint32_t input_token, std::uint64_t position,
+                                 std::uint64_t vocab_size) override {
+        if (!greedy_output_)
+            return strix::SerialGreedyStepBackend::execute_greedy(input_token, position, vocab_size);
+        if (vocab_size != vocab_size_ || position != session_->next_position ||
+            session_->health != strix::SerialSessionHealth::ready)
+            throw std::invalid_argument("scalar greedy request differs from live session");
+        if (recording_binding_) recording_binding_();
+        const auto start = std::chrono::steady_clock::now();
+        try {
+            if (execute_override_) execute_override_(input_token);
+            else static_cast<void>(strix::execute_serial_token(
+                *compiled_, *session_, *resources_, input_token, *dispatcher_));
+            // The output owner uses its own stream. The producer must have
+            // completed, including deferred status, before it may read logits.
+            if (!prepublication_completion_)
+                check_hip(hipDeviceSynchronize(), "scalar greedy producer completion");
+            const auto logits = strix::resolve_execution_buffer(compiled_->execution_identity,
+                compiled_->arena, *scratch_, lm_io_->writes[0]);
+            if (recording_binding_) recording_binding_();
+            const auto token = greedy_output_->select(logits, static_cast<std::uint32_t>(vocab_size_),
+                position, session_->committed_tokens);
+            if (recording_binding_) recording_binding_();
+            elapsed_ms_.push_back(std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - start).count());
+            return token;
+        } catch (...) {
+            // State may already be consumed. Do not roll counters back or
+            // allow another token after an output failure. The result owner
+            // drains its own work before throwing; retain the original path's
+            // producer drain as well.
+            session_->health = strix::SerialSessionHealth::poisoned;
+            session_->arithmetic_lineage.tainted = true;
+            if (recording_drain_) recording_drain_();
+            throw;
+        }
     }
 
     std::vector<float> execute(
@@ -306,6 +347,7 @@ private:
     std::function<void(std::uint32_t)> execute_override_;
     bool track_logit_hashes_ = false;
     bool prepublication_completion_ = false;
+    strix::HipGreedyOutput* greedy_output_ = nullptr;
 };
 
 // Drain inside the transfer call before the caller's snapshot owner can unwind.
@@ -359,6 +401,7 @@ int main(
             "  --optimization-profile auto|manual (default auto, qualified checkpoint only)\n"
             "  --host-dispatch-telemetry (eager host launcher counters on stderr; profiling only)\n"
             "  --execution-inventory (include selected host launcher and declared variant metadata)\n"
+            "  --gpu-greedy-token (experimental eager generation with small GPU selection result)\n"
             "  --virtual-q8-gdn-output (exact original256-tree Q8 output)\n"
             "  --lane-chain-hyper-output (requires --prefetch-q8-hyper-output)\n"
             "  --record-raw ABS_NEW_PRIVATE_DIRECTORY --record-max-bytes BYTES\n"
@@ -1310,6 +1353,20 @@ int main(
             return 0;
         }
 
+        std::unique_ptr<strix::HipGreedyOutput> greedy_output;
+        if (options.gpu_greedy_token) {
+            if (model.vocab_size > std::numeric_limits<std::uint32_t>::max())
+                throw std::invalid_argument("GPU greedy vocabulary exceeds uint32");
+            greedy_output = std::make_unique<strix::HipGreedyOutput>(
+                static_cast<std::uint32_t>(model.vocab_size), memory.scratch(),
+                std::static_pointer_cast<const void>(memory_owner),
+                std::make_shared<strix::HipSetupQuiescenceGuard>());
+        }
+        std::function<void(std::uint32_t, std::uint64_t, std::span<const float>)> greedy_recording;
+        if (raw_recording) greedy_recording = [&](std::uint32_t token, std::uint64_t position,
+                                                   std::span<const float> values) {
+            raw_recording->record_token(token, position, values, session, raw_state_reader);
+        };
         HipSerialGreedyStepBackend backend(
             compiled,
             session,
@@ -1318,9 +1375,8 @@ int main(
             memory.scratch(),
             lm_io,
             model.vocab_size,
-            [&](std::uint32_t token, std::uint64_t position, std::span<const float> values) {
-                if (raw_recording) raw_recording->record_token(token, position, values, session, raw_state_reader);
-            }, raw_require_identity, raw_drain_or_fail, execute_native_token, false, options.deferred_moe_status);
+            std::move(greedy_recording), raw_require_identity, raw_drain_or_fail,
+            execute_native_token, false, options.deferred_moe_status, greedy_output.get());
 
         strix::SerialGreedyRequest request;
         request.prefix_tokens =
@@ -1334,10 +1390,9 @@ int main(
         request.eos_token_id =
             generation_eos;
 
-        const auto result =
-            strix::execute_serial_greedy_request(
-                request,
-                backend);
+        const auto result = options.gpu_greedy_token
+            ? strix::execute_serial_greedy_token_request(request, backend)
+            : strix::execute_serial_greedy_request(request, backend);
         finalize_raw(result.generated_tokens, std::string(stop_reason_name(result.stop_reason)));
 
         double elapsed_total = 0.0;
@@ -1347,6 +1402,14 @@ int main(
         }
 
         std::cout << "{\n" << optimization_profile_receipt << execution_inventory_receipt << gdn_output_mode_receipt() << wave_router_mode_receipt << deferred_moe_mode_receipt;
+        if (greedy_output) {
+            const auto stats = greedy_output->stats();
+            std::cout << "  \"generation_output_mode\":\"" << strix::gpu_greedy_output_identity << "\",\n"
+                << "  \"generation_output_completed\":" << stats.completed << ",\n"
+                << "  \"generation_output_result_d2h_bytes\":" << stats.result_d2h_bytes << ",\n"
+                << "  \"generation_output_pool_bytes\":" << greedy_output->scratch_bytes() << ",\n"
+                << "  \"generation_output_timing_scope\":\"producer-through-selection-and-readback\",\n";
+        }
         emit_q4k_a8_receipt();
         emit_q4k_a8_counts();
         std::cout << strix::decode_detail::qsa_input_dispatch_receipt(qsa_prefetch_stats.get());
