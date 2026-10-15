@@ -937,6 +937,162 @@ __global__ void batched_typed_hyper_projection_kernel(
     }
 }
 
+// Diagnostic parallel projection: independent fixed reduction identity. Each
+// wave owns a disjoint 640-feature tile, and registers reuse its input across R
+// output rows. Existing ordered kernels and their production dispatch stay intact.
+template <unsigned R, typename Acc, bool Injection>
+__device__ __forceinline__ void splitk_hyper_lane_dots(
+    const float* normalized, const void* weights, unsigned first, unsigned valid,
+    unsigned tile, unsigned lane, Acc (&sums)[R]) {
+    float4 x[5];
+#pragma unroll
+    for (unsigned s=0;s<5U;++s)
+        x[s]=*reinterpret_cast<const float4*>(normalized+tile*640U+s*128U+lane*4U);
+    if constexpr (Injection) {
+        float4 w[R][5];
+#pragma unroll
+        for (unsigned r=0;r<R;++r) if(r<valid) {
+#pragma unroll
+            for(unsigned s=0;s<5U;++s)
+                w[r][s]=*reinterpret_cast<const float4*>(
+                    static_cast<const float*>(weights)+
+                    static_cast<std::uint64_t>(first+r)*10240U+tile*640U+s*128U+lane*4U);
+        }
+#pragma unroll
+        for(unsigned r=0;r<R;++r) {
+            sums[r]=Acc{0};
+            if(r<valid) {
+#pragma unroll
+                for(unsigned s=0;s<5U;++s) {
+                    if constexpr(sizeof(Acc)==sizeof(float)) {
+                        sums[r]=fmaf(x[s].x,w[r][s].x,sums[r]);
+                        sums[r]=fmaf(x[s].y,w[r][s].y,sums[r]);
+                        sums[r]=fmaf(x[s].z,w[r][s].z,sums[r]);
+                        sums[r]=fmaf(x[s].w,w[r][s].w,sums[r]);
+                    } else {
+                        sums[r]=fma(static_cast<double>(x[s].x),static_cast<double>(w[r][s].x),sums[r]);
+                        sums[r]=fma(static_cast<double>(x[s].y),static_cast<double>(w[r][s].y),sums[r]);
+                        sums[r]=fma(static_cast<double>(x[s].z),static_cast<double>(w[r][s].z),sums[r]);
+                        sums[r]=fma(static_cast<double>(x[s].w),static_cast<double>(w[r][s].w),sums[r]);
+                    }
+                }
+            }
+        }
+    } else {
+        unsigned packed[R][5];
+        float scales[R][5];
+#pragma unroll
+        for(unsigned r=0;r<R;++r) if(r<valid) {
+#pragma unroll
+            for(unsigned s=0;s<5U;++s) {
+                const auto* block=static_cast<const unsigned char*>(weights)+
+                    static_cast<std::uint64_t>(first+r)*320U*34U+
+                    static_cast<std::uint64_t>(tile*20U+4U*s+lane/8U)*34U;
+                // Original 34-byte blocks are only 2-aligned. Never issue an
+                // incorrectly aligned 32-bit load for this packed code quartet.
+                const auto bits=*reinterpret_cast<const unsigned short*>(block);
+                const auto* codes=reinterpret_cast<const unsigned short*>(block+2U+4U*(lane%8U));
+                scales[r][s]=__half2float(__ushort_as_half(bits));
+                packed[r][s]=static_cast<unsigned>(codes[0])|
+                    (static_cast<unsigned>(codes[1])<<16U);
+            }
+        }
+#pragma unroll
+        for(unsigned r=0;r<R;++r) {
+            sums[r]=Acc{0};
+            if(r<valid) {
+#pragma unroll
+                for(unsigned s=0;s<5U;++s) {
+                    const float inputs[4]={x[s].x,x[s].y,x[s].z,x[s].w};
+#pragma unroll
+                    for(unsigned j=0;j<4U;++j) {
+                        const unsigned byte=(packed[r][s]>>(j*8U))&255U;
+                        const int code=byte<128U?static_cast<int>(byte):static_cast<int>(byte)-256;
+                        const float coefficient=scales[r][s]*static_cast<float>(code);
+                        if constexpr(sizeof(Acc)==sizeof(float))
+                            sums[r]=fmaf(inputs[j],coefficient,sums[r]);
+                        else
+                            sums[r]=fma(static_cast<double>(inputs[j]),static_cast<double>(coefficient),sums[r]);
+                    }
+                }
+            }
+        }
+    }
+#pragma unroll
+    for(unsigned r=0;r<R;++r) if(r<valid) {
+#pragma unroll
+        for(unsigned offset=16U;offset!=0U;offset/=2U)
+            sums[r]=sums[r]+__shfl_xor(sums[r],static_cast<int>(offset),32);
+    }
+}
+
+template <unsigned R, typename Acc>
+__global__ __launch_bounds__(512) void splitk_hyper_projection_kernel(
+    const float* __restrict__ normalized,const void* __restrict__ down,unsigned width,unsigned streams,
+    unsigned rank,float* __restrict__ low,const void* __restrict__ inject,float* __restrict__ injection,unsigned low_blocks) {
+    __shared__ Acc red[16][R];
+    const unsigned lane=threadIdx.x%32U,tile=threadIdx.x/32U;
+    const bool is_inject=blockIdx.x>=low_blocks;
+    const unsigned first=(is_inject?blockIdx.x-low_blocks:blockIdx.x)*R;
+    const unsigned remaining=(is_inject?streams:rank)-first;
+    const unsigned valid=remaining<R?remaining:R;
+    const auto* input=normalized+static_cast<std::uint64_t>(blockIdx.y)*width;
+    Acc sums[R];
+    if(is_inject)splitk_hyper_lane_dots<R,Acc,true>(input,inject,first,valid,tile,lane,sums);
+    else splitk_hyper_lane_dots<R,Acc,false>(input,down,first,valid,tile,lane,sums);
+    if(lane==0U) {
+#pragma unroll
+        for(unsigned r=0;r<R;++r)if(r<valid)red[tile][r]=sums[r];
+    }
+    __syncthreads();
+    if(threadIdx.x<valid) {
+        Acc total=Acc{0};
+#pragma unroll
+        for(unsigned k=0;k<16U;++k)total=total+red[k][threadIdx.x];
+        const float scaled=static_cast<float>(total)/static_cast<float>(streams);
+        if(is_inject)injection[static_cast<std::uint64_t>(blockIdx.y)*streams+first+threadIdx.x]=2.0F*sigmoid(scaled);
+        else low[static_cast<std::uint64_t>(blockIdx.y)*rank+first+threadIdx.x]=scaled*sigmoid(scaled);
+    }
+}
+
+// Same arithmetic as P1, with a separate global-partial/finalize comparator.
+__global__ __launch_bounds__(256) void splitk_hyper_partial_kernel(
+    const float* normalized,const void* down,const float* inject,unsigned streams,
+    unsigned rank,unsigned low_blocks,float* partial) {
+    const unsigned lane=threadIdx.x%32U,warp=threadIdx.x/32U,tile=blockIdx.y;
+    const bool is_inject=blockIdx.x>=low_blocks;
+    const unsigned first=is_inject?warp:(blockIdx.x*8U+warp)*4U;
+    const unsigned limit=is_inject?streams:rank;
+    if(first>=limit)return; // Whole wave; this kernel has no block barrier.
+    const unsigned valid=is_inject?1U:((limit-first)<4U?(limit-first):4U);
+    const auto* input=normalized+static_cast<std::uint64_t>(blockIdx.z)*10240U;
+    const unsigned pitch=rank+(inject?streams:0U);
+    const auto base=(static_cast<std::uint64_t>(blockIdx.z)*16U+tile)*pitch;
+    if(is_inject) {
+        float sums[1];splitk_hyper_lane_dots<1,float,true>(input,inject,first,1U,tile,lane,sums);
+        if(lane==0U)partial[base+rank+first]=sums[0];
+    } else {
+        float sums[4];splitk_hyper_lane_dots<4,float,false>(input,down,first,valid,tile,lane,sums);
+        if(lane==0U) {
+#pragma unroll
+            for(unsigned r=0;r<4U;++r)if(r<valid)partial[base+first+r]=sums[r];
+        }
+    }
+}
+
+__global__ void splitk_hyper_finalize_kernel(
+    const float* partial,unsigned streams,unsigned rank,unsigned pitch,float* low,float* injection) {
+    const unsigned output=blockIdx.x*128U+threadIdx.x;
+    if(output>=pitch)return;
+    float total=0.0F;
+#pragma unroll
+    for(unsigned tile=0;tile<16U;++tile)
+        total=total+partial[(static_cast<std::uint64_t>(blockIdx.y)*16U+tile)*pitch+output];
+    const float scaled=total/static_cast<float>(streams);
+    if(output<rank)low[static_cast<std::uint64_t>(blockIdx.y)*rank+output]=scaled*sigmoid(scaled);
+    else injection[static_cast<std::uint64_t>(blockIdx.y)*streams+output-rank]=2.0F*sigmoid(scaled);
+}
+
 // Diagnostic exact projection prototype. No production launcher selects it.
 // Each active lane owns one entire ascending dot chain; K is never partitioned.
 __device__ __forceinline__ unsigned lane_chain_q8_byte(const uint4* words,unsigned byte){
@@ -1797,6 +1953,80 @@ void hc_projection_diagnostic::enqueue(Shape shape,Span normalized,Span down,Spa
         else{if(prefetch==1U)launch.template operator()<32,1>();else launch.template operator()<32,2>();}
     }
     check_hip(hipGetLastError(),"HC projection diagnostic enqueue");
+}
+
+void hc_projection_diagnostic::enqueue_splitk(
+    Shape shape,Span normalized,Span down,Span inject,Span low,Span injection,
+    Span partial,SplitKVariant variant,hipStream_t stream) {
+    const bool is_p2=variant==SplitKVariant::p2_r4;
+    if(shape.width!=10240U || shape.streams<2U || shape.streams>8U ||
+       !shape.rank || shape.rank>512U || !shape.rows || shape.rows>65535U ||
+       (variant!=SplitKVariant::p1_r4 && variant!=SplitKVariant::p1_r2 &&
+        variant!=SplitKVariant::p2_r4 && variant!=SplitKVariant::p1_r4_fp64))
+        throw std::invalid_argument("HC split-K projection unsupported shape/variant");
+    const bool with_inject=inject.address!=0U;
+    if(with_inject!=(injection.address!=0U) ||
+       (!with_inject && (inject.bytes!=0U || injection.bytes!=0U)))
+        throw std::invalid_argument("HC split-K projection injection owner pair differs");
+    if(!is_p2 && (partial.address!=0U || partial.bytes!=0U))
+        throw std::invalid_argument("HC split-K projection unexpected partial owner");
+    const auto check_span=[](Span owner,std::uint64_t required,std::uint64_t alignment) {
+        if(!owner.address || owner.address%alignment || owner.bytes<required ||
+           owner.bytes>std::numeric_limits<std::uintptr_t>::max()-owner.address)
+            throw std::invalid_argument("HC split-K projection owner extent/alignment differs");
+    };
+    check_span(normalized,static_cast<std::uint64_t>(shape.rows)*10240U*4U,16U);
+    check_span(down,static_cast<std::uint64_t>(shape.rank)*320U*34U,16U);
+    check_span(low,static_cast<std::uint64_t>(shape.rows)*shape.rank*4U,4U);
+    if(with_inject) {
+        check_span(inject,static_cast<std::uint64_t>(shape.streams)*10240U*4U,16U);
+        check_span(injection,static_cast<std::uint64_t>(shape.rows)*shape.streams*4U,4U);
+    }
+    const unsigned pitch=shape.rank+(with_inject?shape.streams:0U);
+    if(is_p2)check_span(partial,static_cast<std::uint64_t>(shape.rows)*16U*pitch*4U,16U);
+    const auto overlaps=[](Span a,Span b) {
+        return a.address<b.address+b.bytes && b.address<a.address+a.bytes;
+    };
+    const Span inputs[3]={normalized,down,inject};
+    const Span outputs[3]={low,injection,partial};
+    for(unsigned i=0;i<3U;++i)if(outputs[i].address) {
+        for(const auto input:inputs)if(input.address && overlaps(outputs[i],input))
+            throw std::invalid_argument("HC split-K projection owners overlap");
+        for(unsigned j=i+1U;j<3U;++j)if(outputs[j].address && overlaps(outputs[i],outputs[j]))
+            throw std::invalid_argument("HC split-K projection owners overlap");
+    }
+    check_hip(hipPeekAtLastError(),"HC split-K projection stale error");
+    int device=0;hipDeviceProp_t properties{};
+    check_hip(hipGetDevice(&device),"HC split-K projection current device");
+    check_hip(hipGetDeviceProperties(&properties,device),"HC split-K projection device properties");
+    if(properties.warpSize!=32)throw std::invalid_argument("HC split-K projection requires wave32");
+    const auto* n=reinterpret_cast<const float*>(normalized.address);
+    const auto* d=reinterpret_cast<const void*>(down.address);
+    const auto* in=reinterpret_cast<const void*>(inject.address);
+    auto* l=reinterpret_cast<float*>(low.address);
+    auto* out=reinterpret_cast<float*>(injection.address);
+    if(is_p2) {
+        const unsigned low_blocks=(shape.rank+31U)/32U;
+        auto* p=reinterpret_cast<float*>(partial.address);
+        hipLaunchKernelGGL(splitk_hyper_partial_kernel,
+            dim3(low_blocks+(with_inject?1U:0U),16U,shape.rows),dim3(256U),0,stream,
+            n,d,reinterpret_cast<const float*>(in),shape.streams,shape.rank,low_blocks,p);
+        check_hip(hipGetLastError(),"HC split-K projection partial enqueue");
+        hipLaunchKernelGGL(splitk_hyper_finalize_kernel,
+            dim3((pitch+127U)/128U,shape.rows),dim3(128U),0,stream,
+            p,shape.streams,shape.rank,pitch,l,out);
+    } else {
+        const auto launch=[&]<unsigned R,typename Acc>() {
+            const unsigned low_blocks=(shape.rank+R-1U)/R;
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(splitk_hyper_projection_kernel<R,Acc>),
+                dim3(low_blocks+(with_inject?(shape.streams+R-1U)/R:0U),shape.rows),
+                dim3(512U),0,stream,n,d,shape.width,shape.streams,shape.rank,l,in,out,low_blocks);
+        };
+        if(variant==SplitKVariant::p1_r2)launch.template operator()<2U,float>();
+        else if(variant==SplitKVariant::p1_r4_fp64)launch.template operator()<4U,double>();
+        else launch.template operator()<4U,float>();
+    }
+    check_hip(hipGetLastError(),"HC split-K projection final enqueue");
 }
 
 void register_hip_hyper_mix_kernel_variant(
