@@ -23,7 +23,7 @@ mapping is the only alternative geometry. A two-kernel global-partial comparator
 uses the same arithmetic and must produce identical finite FP32 outputs. A double
 accumulation arm is diagnostic evidence, not a production precision mode.
 
-The two-kernel comparator requires caller-owned scratch of
+The two-kernel comparator requires 16-byte-aligned caller-owned scratch of
 `rows * 16 * (rank + (injection_present ? streams : 0)) * sizeof(float)` bytes.
 The single-kernel variants require an empty scratch span. All owners must remain
 valid through stream completion; the API performs no allocation or synchronization.

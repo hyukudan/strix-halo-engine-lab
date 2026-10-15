@@ -12,7 +12,8 @@ void enqueue(Shape,Span normalized,Span down,Span inject,Span low,Span injection
 // Diagnostic reassociated FP32 projection. This is not the ordered reference
 // numerical identity and is not selected by any production launcher.
 enum class SplitKVariant { p1_r4, p1_r2, p2_r4, p1_r4_fp64 };
-// Only p2_r4 uses partial: rows*16*(rank + (inject ? streams : 0))*4 bytes.
+// Only p2_r4 uses partial: rows*16*(rank + (inject ? streams : 0))*4 bytes,
+// with a 16-byte-aligned base disjoint from every other owner.
 // Every owner remains alive until stream completion. The other variants require
 // an empty partial span; no implicit allocation or device synchronization occurs.
 void enqueue_splitk(Shape,Span normalized,Span down,Span inject,Span low,
