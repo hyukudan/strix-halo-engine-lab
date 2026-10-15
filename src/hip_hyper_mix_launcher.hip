@@ -1,3 +1,5 @@
+#include "strix/hip_repacked_hyper_projection_tests.hpp"
+#include "strix/hc_repacked_down_layout.hpp"
 #include "strix/hip_lane_chain_hyper_output_tests.hpp"
 #include "strix/hip_lane_chain_hyper_projection_tests.hpp"
 #include "strix/hip_launch_context.hpp"
@@ -997,6 +999,108 @@ __global__ __launch_bounds__(32) void lane_chain_hyper_projection_kernel(const f
     }
 }
 
+// Exact repacked down projection (diagnostic only; no production launcher selects it).
+// One lane owns one whole ascending chain; K is never split. Code unit (2b+h)*rank_pad+o
+// holds bytes 16h..16h+15 of original block (o,b); scale word (b/2)*rank_pad+o holds the
+// original half bits of blocks b&~1 (low) and b|1 (high). Injection reads the original F32
+// rows and keeps the legacy chain and epilogue expressions.
+constexpr unsigned kRepackedStreams=4U,kRepackedTile=128U,kRepackedPitch=132U,kRepackedMaxWidth=10240U;
+__device__ __forceinline__ float repacked_code(unsigned word,unsigned byte){
+    return static_cast<float>(static_cast<std::int8_t>(static_cast<std::uint8_t>(word>>(8U*byte))));
+}
+template <unsigned Pairs,unsigned InjectDepth,bool LdsInput>
+__global__ __launch_bounds__(32) void repacked_hyper_projection_kernel(const float* __restrict__ normalized,
+    const uint4* __restrict__ codes,const std::uint32_t* __restrict__ scales,const float* __restrict__ inject,
+    unsigned width,unsigned streams,unsigned rank,unsigned rank_pad,float* __restrict__ low,
+    float* __restrict__ injection,unsigned low_blocks){
+    __shared__ __align__(16) float staged[LdsInput?kRepackedMaxWidth:4U];
+    __shared__ __align__(16) float tile[kRepackedStreams][kRepackedPitch];
+    const unsigned lane=threadIdx.x;const std::uint64_t row=blockIdx.y;
+    const float* input=normalized+row*width;
+    if constexpr(LdsInput){   // all loads of a chunk precede its LDS stores
+        for(unsigned chunk=0;chunk<width;chunk+=2048U){
+            float4 part[16];
+#pragma unroll
+            for(unsigned u=0;u<16U;++u)if(chunk+u*128U<width)part[u]=*reinterpret_cast<const float4*>(input+chunk+u*128U+lane*4U);
+#pragma unroll
+            for(unsigned u=0;u<16U;++u)if(chunk+u*128U<width)*reinterpret_cast<float4*>(staged+chunk+u*128U+lane*4U)=part[u];
+        }
+        __syncthreads();
+    }
+    const auto value=[&](unsigned feature)->float{if constexpr(LdsInput)return staged[feature];else return input[feature];};
+    float sum=0.0F;
+    if(blockIdx.x<low_blocks){
+        const unsigned output=blockIdx.x*32U+lane,pairs=width/64U;
+        uint4 code[Pairs][4];std::uint32_t scale_bits[Pairs];
+#pragma unroll
+        for(unsigned p=0;p<Pairs;++p)if(p<pairs){
+#pragma unroll
+            for(unsigned u=0;u<4U;++u)code[p][u]=codes[(static_cast<std::uint64_t>(p)*4U+u)*rank_pad+output];
+            scale_bits[p]=scales[static_cast<std::uint64_t>(p)*rank_pad+output];
+        }
+        for(unsigned first=0;first<pairs;first+=Pairs){
+#pragma unroll
+            for(unsigned p=0;p<Pairs;++p){
+                const unsigned pair=first+p;
+                if(pair<pairs){
+#pragma unroll
+                    for(unsigned e=0;e<2U;++e){
+                        const float scale=__half2float(__ushort_as_half(static_cast<unsigned short>(scale_bits[p]>>(16U*e))));
+                        const unsigned block=pair*2U+e;
+#pragma unroll
+                        for(unsigned h=0;h<2U;++h){
+                            const uint4 unit=code[p][2U*e+h];const unsigned words[4]={unit.x,unit.y,unit.z,unit.w};
+#pragma unroll
+                            for(unsigned j=0;j<16U;++j){
+                                const float coefficient=scale*repacked_code(words[j/4U],j%4U);
+                                sum+=value(block*32U+h*16U+j)*coefficient;
+                            }
+                        }
+                    }
+                    const unsigned next=pair+Pairs;   // refill the consumed slot
+                    if(next<pairs){
+#pragma unroll
+                        for(unsigned u=0;u<4U;++u)code[p][u]=codes[(static_cast<std::uint64_t>(next)*4U+u)*rank_pad+output];
+                        scale_bits[p]=scales[static_cast<std::uint64_t>(next)*rank_pad+output];
+                    }
+                }
+            }
+        }
+        if(output<rank){const float scaled=sum/static_cast<float>(streams);
+            low[row*rank+output]=scaled*sigmoid(scaled);}
+    }else{   // the single injection workgroup of this row
+        const unsigned tiles=width/kRepackedTile;
+        float4 ring[InjectDepth][kRepackedStreams];
+#pragma unroll
+        for(unsigned d=0;d<InjectDepth;++d)if(d<tiles)
+#pragma unroll
+            for(unsigned s=0;s<kRepackedStreams;++s)
+                ring[d][s]=*reinterpret_cast<const float4*>(inject+static_cast<std::uint64_t>(s)*width+d*kRepackedTile+lane*4U);
+        for(unsigned first=0;first<tiles;first+=InjectDepth){
+#pragma unroll
+            for(unsigned d=0;d<InjectDepth;++d){
+                const unsigned t=first+d;
+                if(t<tiles){
+                    __syncthreads();   // previous tile consumers finish before the refill
+#pragma unroll
+                    for(unsigned s=0;s<kRepackedStreams;++s)*reinterpret_cast<float4*>(&tile[s][lane*4U])=ring[d][s];
+                    __syncthreads();
+                    const unsigned next=t+InjectDepth;
+                    if(next<tiles)
+#pragma unroll
+                        for(unsigned s=0;s<kRepackedStreams;++s)
+                            ring[d][s]=*reinterpret_cast<const float4*>(inject+static_cast<std::uint64_t>(s)*width+next*kRepackedTile+lane*4U);
+                    if(lane<streams)
+#pragma unroll
+                        for(unsigned i=0;i<kRepackedTile;++i)sum+=value(t*kRepackedTile+i)*tile[lane][i];
+                }
+            }
+        }
+        if(lane<streams){const float scaled=sum/static_cast<float>(streams);
+            injection[row*streams+lane]=2.0F*sigmoid(scaled);}
+    }
+}
+
 template <typename Storage>
 __global__ void staged_hyper_output_kernel(
     const float* normalized, const float* low, const void* up, std::uint32_t kind,
@@ -1797,6 +1901,86 @@ void hc_projection_diagnostic::enqueue(Shape shape,Span normalized,Span down,Spa
         else{if(prefetch==1U)launch.template operator()<32,1>();else launch.template operator()<32,2>();}
     }
     check_hip(hipGetLastError(),"HC projection diagnostic enqueue");
+}
+
+void hc_repacked_projection_diagnostic::enqueue(
+    hc_projection_diagnostic::Shape shape,
+    hc_projection_diagnostic::Span normalized,
+    hc_projection_diagnostic::Span codes,
+    hc_projection_diagnostic::Span scales,
+    std::uint32_t rank_pad,
+    hc_projection_diagnostic::Span inject,
+    hc_projection_diagnostic::Span low,
+    hc_projection_diagnostic::Span injection,
+    Schedule schedule,
+    hipStream_t stream) {
+    using Span = hc_projection_diagnostic::Span;
+    if (shape.width < 256U || shape.width > 10240U ||
+        shape.width % 256U != 0U || shape.streams != 4U ||
+        shape.rank == 0U || shape.rank > 512U ||
+        shape.rows == 0U || shape.rows > 65535U ||
+        rank_pad != ((shape.rank + 31U) / 32U) * 32U ||
+        (schedule != Schedule::s1_lds_k8_d8 &&
+         schedule != Schedule::s2_lds_k11_d8 &&
+         schedule != Schedule::s3_scalar_k8_d8)) {
+        throw std::invalid_argument(
+            "HC repacked projection diagnostic unsupported shape/schedule");
+    }
+    const auto geometry = hc_repacked_down::geometry(shape.width, shape.rank);
+    const bool with_inject = inject.address != 0U;
+    if (with_inject != (injection.address != 0U) ||
+        (!with_inject && (inject.bytes != 0U || injection.bytes != 0U))) {
+        throw std::invalid_argument(
+            "HC repacked projection diagnostic injection owner pair differs");
+    }
+    const auto check_span = [](Span owner, std::uint64_t required,
+                               std::uint64_t alignment) {
+        if (owner.address == 0U || owner.address % alignment != 0U ||
+            owner.bytes < required ||
+            owner.bytes > std::numeric_limits<std::uintptr_t>::max() - owner.address) {
+            throw std::invalid_argument(
+                "HC repacked projection diagnostic owner extent/alignment differs");
+        }
+    };
+    check_span(normalized, static_cast<std::uint64_t>(shape.rows) * shape.width * 4U, 16U);
+    check_span(codes, geometry.codes_bytes, 256U);
+    check_span(scales, geometry.scales_bytes, 256U);
+    check_span(low, static_cast<std::uint64_t>(shape.rows) * shape.rank * 4U, 4U);
+    if (with_inject) {
+        check_span(inject, static_cast<std::uint64_t>(shape.width) * 4U * 4U, 16U);
+        check_span(injection, static_cast<std::uint64_t>(shape.rows) * 4U * 4U, 4U);
+    }
+    // Every addition below is safe after check_span. Use whole supplied spans,
+    // so a caller cannot hide an alias in unused owner bytes.
+    const auto overlap = [](Span a, Span b) {
+        return a.address < b.address + b.bytes && b.address < a.address + a.bytes;
+    };
+    if (overlap(codes, scales) || overlap(low, normalized) ||
+        overlap(low, codes) || overlap(low, scales) ||
+        (with_inject &&
+         (overlap(low, inject) || overlap(low, injection) ||
+          overlap(injection, normalized) || overlap(injection, codes) ||
+          overlap(injection, scales) || overlap(injection, inject)))) {
+        throw std::invalid_argument("HC repacked projection diagnostic owners overlap");
+    }
+    check_hip(hipPeekAtLastError(), "HC repacked projection diagnostic stale error");
+    const auto launch = [&]<unsigned Pairs, bool LdsInput>() {
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(repacked_hyper_projection_kernel<Pairs, 8U, LdsInput>),
+            dim3(rank_pad / 32U + (with_inject ? 1U : 0U), shape.rows),
+            dim3(32U), 0, stream,
+            reinterpret_cast<const float*>(normalized.address),
+            reinterpret_cast<const uint4*>(codes.address),
+            reinterpret_cast<const std::uint32_t*>(scales.address),
+            reinterpret_cast<const float*>(inject.address),
+            shape.width, shape.streams, shape.rank, rank_pad,
+            reinterpret_cast<float*>(low.address),
+            reinterpret_cast<float*>(injection.address), rank_pad / 32U);
+    };
+    if (schedule == Schedule::s1_lds_k8_d8) launch.template operator()<8U, true>();
+    else if (schedule == Schedule::s2_lds_k11_d8) launch.template operator()<11U, true>();
+    else launch.template operator()<8U, false>();
+    check_hip(hipGetLastError(), "HC repacked projection diagnostic enqueue");
 }
 
 void register_hip_hyper_mix_kernel_variant(
