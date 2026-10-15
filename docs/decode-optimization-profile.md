@@ -71,7 +71,7 @@ All three decoder receipt paths add:
 | --- | --- |
 | `optimization_profile_requested` | `auto` or `manual` |
 | `optimization_profile_selected` | `manual`, `canonical-a8-wave-qsa-hc-shared-deferred-v3` or `canonical-a8-ranked-qsa-hc-shared-deferred-v3` |
-| `optimization_profile_reason` | Qualified selection, explicit ranked override, or the specific fallback reason |
+| `optimization_profile_reason` | `qualified-checkpoint` denotes content admission, not bundle qualification; otherwise explicit ranked override or a specific fallback reason |
 | `optimization_profile_automatic_applied` | Whether the automatic bundle was added |
 
 `manual` in the selected field means the caller's explicit configuration is used,
@@ -81,8 +81,9 @@ review and fresh integration/native qualification before adoption. Portable test
 exercise the actual application parser and resolver with runtime capability present
 and absent; they do not execute HIP kernels or measure token latency.
 
-Observed host verification: GNU 13.3/WSL Release, HIP OFF, warnings as errors,
-full build and 159/159 CTest entries passed. The actual decoder, catalog and
-catalog fixtures also passed C++20 syntax checks with private HIP declarations,
-with the A8 runtime capability both defined and absent. This is not a native HIP
-compiler or GPU execution result.
+Observed for code revision `dee811a391485b894dbda5ea1d7fd29efc1bd1ec`:
+GNU 13.3/WSL Release, HIP OFF and warnings as errors, full build and 159/159 CTest
+entries passed. Later documentation-only changes do not change that tested code.
+Earlier decoder/catalog/catalog-fixture C++20 syntax checks with private HIP
+declarations covered capability present and absent; they do not establish fresh
+native compilation or GPU execution for v3.

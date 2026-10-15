@@ -3,8 +3,9 @@
 This branch combines the wave router, Q8 indexed-attention input prefetch,
 lane-chain HC output, deferred MoE status and Q8 shared-expert prefetch increments.
 This initial integration preserved all low-level modes OFF by default. The later
-[automatic profile policy](decode-optimization-profile.md) selects the qualified
-canonical profile after exact content/mode admission; manual mode preserves the
+[automatic profile policy](decode-optimization-profile.md) selects a content-bound
+v3 candidate with wave, QSA, HC output, shared-expert prefetch and deferred status
+after exact content/mode admission, pending its own qualification; manual mode preserves the
 original explicit configuration. The independent HC whole-projection
 prototype is diagnostic only and adds no decoder command-line selection.
 

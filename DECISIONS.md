@@ -108,7 +108,9 @@ native fidelity/latency gates precede adoption. Reopen after linked ISA, actual
 fixtures, full-model equality and paired preparation-inclusive measurements.
 
 D-015 decoder policy follow-up: use a content-bound automatic profile for the
-qualified eager registered checkpoint, retaining manual selection and explicit
-ranked routing. The low-level flag default remains OFF; the application can select
-wave after metadata/content admission. Other new source increments remain explicit
-until their performance gates pass. See `docs/decode-optimization-profile.md`.
+admitted eager registered checkpoint, retaining manual selection and explicit
+ranked routing. Low-level flag defaults remain OFF. The current source candidate
+`canonical-a8-{wave,ranked}-qsa-hc-shared-deferred-v3` also selects QSA input
+prefetch, shared-expert prefetch and deferred MoE status after metadata/content
+admission; adoption requires its own review, native, full-model fidelity and
+automatic workload gates. See `docs/decode-optimization-profile.md`.

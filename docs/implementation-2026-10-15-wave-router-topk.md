@@ -7,7 +7,8 @@ kernel ID, launcher tag and `hip-gfx1151-moe-route-v6-wave-parallel` compiler
 identity. Catalog, serial, speculative and bundle admission check this mode.
 Existing modes and their device function bodies remain unchanged.
 With no low-level flags, the content-bound [automatic profile](decode-optimization-profile.md) selects wave
-and lane-chain HC output for its qualified checkpoint/mode/context. Explicit ranked
+alongside the other modes listed in the v3 candidate policy for its admitted
+checkpoint/mode/context. Explicit ranked
 routing is retained. Low-level flags without an explicit auto request retain their
 legacy configuration. The combined automatic profile still requires its own validation.
 

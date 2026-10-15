@@ -2,9 +2,10 @@
 
 The low-level `--lane-chain-hyper-output` flag remains OFF in
 `--optimization-profile manual` unless explicitly requested, and requires `--prefetch-q8-hyper-output` and its typed fused staged parallel prerequisites. It replaces only eligible HC output steps. Original normalization, low projection and injection remain unchanged. The content-bound [automatic decoder policy](decode-optimization-profile.md) now
-selects it with no low-level flags for the qualified eager/register checkpoint
-and context alongside wave
-routing. Other checkpoints and incompatible modes retain their explicit selection.
+selects it with no low-level flags for the admitted eager/register checkpoint
+and context as part of the complete v3 candidate bundle described in that policy.
+Automatic workload qualification remains separate. Other checkpoints and
+incompatible modes retain their explicit selection.
 Supplying low-level optimization flags also preserves that explicit configuration
 unless `--optimization-profile auto` is requested.
 This is an exact arithmetic optimization candidate; any complete-logit difference is a correctness failure, not an approximation allowance.

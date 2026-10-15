@@ -34,7 +34,8 @@ The [integration record](docs/implementation-2026-10-15-spec-v1-draft-integratio
 records observed host checks and pending combined review, native compiler/ISA,
 GPU fixtures, model fidelity and paired timing. Low-level flags remain OFF; the
 [automatic decoder policy](docs/decode-optimization-profile.md) can select its
-content-bound wave/HC profile, whose combined review and validation remain
-pending, and manual mode preserves explicit selection;
+content-bound v3 candidate (wave, QSA, HC output, shared-expert prefetch and
+deferred status), whose review, native, fidelity and automatic workload
+qualification remain pending, and manual mode preserves explicit selection;
 the HC projection prototype remains diagnostic only. Host evidence does not close
 these native or performance gates.

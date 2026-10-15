@@ -200,3 +200,10 @@ Observed for this host follow-up: GNU 13.3/WSL Release with HIP OFF and warnings
 as errors passed the full 159/159 portable CTest entries. Decoder/catalog/catalog
 fixture C++20 syntax checks with private HIP declarations passed with the A8
 capability both present and absent; this is not a fresh HIP/native result.
+
+Auto-v3 policy preparation: code revision
+`dee811a391485b894dbda5ea1d7fd29efc1bd1ec` passed the full 159/159 portable tests
+under GNU 13.3/WSL Release, HIP OFF, with warnings as errors. This observation
+covers host policy and compatibility only. Documentation-only follow-ups preserve
+that tested code; native, full-model fidelity and clean automatic workload gates
+remain separate. Manual bundle observations do not by themselves qualify v3 auto.
