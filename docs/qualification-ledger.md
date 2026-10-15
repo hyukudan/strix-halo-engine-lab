@@ -101,3 +101,18 @@ for exact source/archive, timings, counters and limits. Low-level manual default
 remain OFF; other models, contexts, graph/speculative modes and projection
 prototypes are not admitted by these observations. This records source adoption,
 not remote binary deployment.
+
+## Consolidated development baseline
+
+The development branches were consolidated into `main` on 2026-10-15:
+qualified automatic v3 (`e40ba98`), exact HC repack diagnostics (`dcbffb0`),
+guarded split-K HC experiments (`e747cf1`) and GDN/LM load and eight-wave
+projection diagnostics (`0405647`). Subsequent integration work starts from
+this shared branch. Historical source pins retain their original scope.
+
+The consolidated source passed a fresh GNU 13.3 Release HIP-OFF build with
+warnings as errors and all 162 portable CTest entries. This is host integration
+evidence; it does not qualify new HIP binaries, experimental arithmetic,
+whole-model quality or performance. The qualified automatic profile is preserved;
+experimental split-K selection remains explicit and projection diagnostics remain
+outside default decoder selection.
