@@ -1,3 +1,7 @@
+if(EXISTS "missing-model.gguf")
+    message(FATAL_ERROR "CLI missing-model fixture must not exist")
+endif()
+
 execute_process(COMMAND "${BINARY}" missing-model.gguf 1
     --virtual-q8-lm-head --virtual-q8-lm-head
     RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE error)
@@ -31,7 +35,13 @@ foreach(first_prefetch ON OFF)
     endif()
     execute_process(COMMAND "${BINARY}" missing-model.gguf 1 ${options}
         RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE error)
-    if(result EQUAL 0 OR NOT "${output}${error}" MATCHES "cannot open GGUF file")
-        message(FATAL_ERROR "Both flag orders must reach missing GGUF after valid parsing: ${result} ${output} ${error}")
+    # read_file checks filesystem::file_size before opening the stream.
+    # Standard-library operation wording varies; OS error text is localized.
+    # Require both the size-query operation and its missing-file path, rather
+    # than accepting an arbitrary nonzero parse/setup error.
+    set(diagnostic "${output}${error}")
+    if(result STREQUAL "0" OR NOT diagnostic MATCHES "(cannot get file size|file_size)" OR
+       NOT diagnostic MATCHES "missing-model[.]gguf")
+        message(FATAL_ERROR "Both flag orders must reach missing GGUF size query after valid parsing: ${result} ${diagnostic}")
     endif()
 endforeach()
