@@ -1,3 +1,6 @@
+#ifdef STRIX_BUILD_GDN_LM_WAVE8_DIAGNOSTIC
+#include "strix/hip_gdn_lm_wave8_diagnostic.hpp"
+#endif
 #include "strix/hip_gdn_launcher.hpp"
 
 #include "strix/dispatch_resources.hpp"
@@ -657,6 +660,57 @@ void project_prefetch8_q8_bf16_to_fp32_kernel(
         output[row] = round_bf16(partial[0]);
     }
 }
+#ifdef STRIX_BUILD_GDN_LM_WAVE8_DIAGNOSTIC
+// Test-only geometry copy of the incumbent prefetch8 body above.
+__global__ __launch_bounds__(256)
+void project_prefetch8_wave8_q8_bf16_to_fp32_kernel(
+    const std::uint16_t* input, const void* weights,
+    std::uint32_t input_width, std::uint32_t output_width, float* output) {
+    const auto row = static_cast<std::uint32_t>(blockIdx.x) * 8U + static_cast<std::uint32_t>(threadIdx.x) / 32U;
+    if (row >= output_width) return;
+    const auto lane = static_cast<std::uint32_t>(threadIdx.x) % 32U;
+    float partial[8]{};
+    const auto* blocks = static_cast<const Q8Block*>(weights) +
+        static_cast<std::uint64_t>(row) * (input_width / 32U);
+    for (std::uint64_t chunk = 0; chunk < input_width; chunk += 256U) {
+        const auto base = chunk + 8U * lane;
+        // The prelaunch Q8 width%32 gate proves all eight leaves are valid
+        // together and remain inside one block. No tail load is speculative.
+        if (base < input_width) {
+            const auto feature = static_cast<std::uint32_t>(base);
+            const auto& block = blocks[feature / 32U];
+            std::uint16_t bits[8];
+            std::int8_t codes[8];
+#pragma unroll
+            for (unsigned local = 0; local < 8; ++local) {
+                bits[local] = input[feature + local];
+                codes[local] = block.values[feature % 32U + local];
+            }
+            const float scale = __half2float(block.scale);
+#pragma unroll
+            for (unsigned local = 0; local < 8; ++local)
+                partial[local] += bf16_to_float(bits[local]) *
+                    (scale * static_cast<float>(codes[local]));
+        }
+    }
+#pragma unroll
+    for (unsigned distance = 16; distance > 0; distance /= 2) {
+#pragma unroll
+        for (unsigned local = 0; local < 8; ++local) {
+            const auto partner = __shfl_down(partial[local], distance, 32);
+            if (lane < distance) partial[local] += partner;
+        }
+    }
+    if (lane == 0) {
+        partial[0] += partial[4]; partial[1] += partial[5];
+        partial[2] += partial[6]; partial[3] += partial[7];
+        partial[0] += partial[2]; partial[1] += partial[3];
+        partial[0] += partial[1];
+        output[row] = round_bf16(partial[0]);
+    }
+}
+#endif
+
 
 template <WeightKind Kind>
 __global__ void project_fp32_to_bf16_kernel(
@@ -2427,5 +2481,38 @@ register_for_compiled_execution(
         }
     }
 }
+
+
+#ifdef STRIX_BUILD_GDN_LM_WAVE8_DIAGNOSTIC
+namespace gdn_lm_wave8_diagnostic::detail {
+const void* gdn_symbol(Arm arm) {
+    switch (arm) {
+    case Arm::reference: case Arm::prefetch1:
+        return reinterpret_cast<const void*>(project_prefetch8_q8_bf16_to_fp32_kernel);
+    case Arm::wave8:
+        return reinterpret_cast<const void*>(project_prefetch8_wave8_q8_bf16_to_fp32_kernel);
+    }
+    throw std::invalid_argument("invalid GDN diagnostic arm");
+}
+void enqueue_gdn(Shape shape, Span input, Span weights, Span output, Arm arm, hipStream_t stream) {
+    const auto launch = validate(shape, input, weights, output, Kind::gdn_bf16, arm);
+    check_hip(hipPeekAtLastError(), "GDN wave8 diagnostic stale error");
+    if (arm == Arm::wave8) {
+        hipLaunchKernelGGL(project_prefetch8_wave8_q8_bf16_to_fp32_kernel,
+            dim3(launch.grid_x), dim3(launch.block_x), 0, stream,
+            reinterpret_cast<const std::uint16_t*>(input.address),
+            reinterpret_cast<const void*>(weights.address), shape.width, shape.outputs,
+            reinterpret_cast<float*>(output.address));
+    } else {
+        hipLaunchKernelGGL(project_prefetch8_q8_bf16_to_fp32_kernel,
+            dim3(launch.grid_x), dim3(launch.block_x), 0, stream,
+            reinterpret_cast<const std::uint16_t*>(input.address),
+            reinterpret_cast<const void*>(weights.address), shape.width, shape.outputs,
+            reinterpret_cast<float*>(output.address));
+    }
+    check_hip(hipGetLastError(), "GDN wave8 diagnostic launch");
+}
+} // namespace gdn_lm_wave8_diagnostic::detail
+#endif
 
 }  // namespace strix

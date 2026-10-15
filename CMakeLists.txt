@@ -242,6 +242,10 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-hc-repacked-down-pack-tests)
     add_test(NAME strix-hc-repacked-down-pack-tests COMMAND strix-hc-repacked-down-pack-tests)
 
+    add_executable(strix-gdn-lm-wave8-diagnostic-contract-tests tests/gdn_lm_wave8_diagnostic_contract_tests.cpp)
+    target_link_libraries(strix-gdn-lm-wave8-diagnostic-contract-tests PRIVATE strix_core)
+    strix_target_warnings(strix-gdn-lm-wave8-diagnostic-contract-tests)
+    add_test(NAME strix-gdn-lm-wave8-diagnostic-contract-tests COMMAND strix-gdn-lm-wave8-diagnostic-contract-tests)
     add_executable(strix-decode-optimization-profile-tests tests/decode_optimization_profile_tests.cpp)
     target_link_libraries(strix-decode-optimization-profile-tests PRIVATE strix_core)
     strix_target_warnings(strix-decode-optimization-profile-tests)
@@ -1136,6 +1140,9 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         target_compile_definitions(strix_hip_runtime PUBLIC STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME=1)
     endif()
     strix_target_warnings(strix_hip_runtime)
+    if(BUILD_TESTING)
+        target_compile_definitions(strix_hip_runtime PRIVATE STRIX_BUILD_GDN_LM_WAVE8_DIAGNOSTIC=1)
+    endif()
     set_source_files_properties(src/hip_integer_projection.hip src/hip_integer_projection_runtime.hip
         PROPERTIES COMPILE_OPTIONS "-mno-wavefrontsize64;-ffp-contract=off")
 
@@ -1562,6 +1569,12 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         target_link_libraries(strix-hip-shared-expert-prefetch-tests PRIVATE strix_hip_runtime)
         strix_target_warnings(strix-hip-shared-expert-prefetch-tests)
         add_test(NAME strix-hip-shared-expert-prefetch-tests COMMAND strix-hip-shared-expert-prefetch-tests)
+
+        add_executable(strix-hip-gdn-lm-wave8-diagnostic-tests tests/hip_gdn_lm_wave8_diagnostic_tests.hip)
+        set_target_properties(strix-hip-gdn-lm-wave8-diagnostic-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+        target_link_libraries(strix-hip-gdn-lm-wave8-diagnostic-tests PRIVATE strix_hip_runtime)
+        strix_target_warnings(strix-hip-gdn-lm-wave8-diagnostic-tests)
+        add_test(NAME strix-hip-gdn-lm-wave8-diagnostic-tests COMMAND strix-hip-gdn-lm-wave8-diagnostic-tests)
 
         add_executable(
             strix-hip-indexed-attention-launcher-tests

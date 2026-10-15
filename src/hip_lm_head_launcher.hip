@@ -1,3 +1,6 @@
+#ifdef STRIX_BUILD_GDN_LM_WAVE8_DIAGNOSTIC
+#include "strix/hip_gdn_lm_wave8_diagnostic.hpp"
+#endif
 #include "strix/hip_launch_context.hpp"
 #include "strix/hip_lm_head_launcher.hpp"
 
@@ -455,6 +458,58 @@ __global__ __launch_bounds__(32) void virtual_q8_lm_head_kernel(
     }
 }
 
+#ifdef STRIX_BUILD_GDN_LM_WAVE8_DIAGNOSTIC
+// Project-owned GDN prefetch8 load body, preserving the LM coefficient/leaf DAG.
+template <typename Input, unsigned Waves>
+__global__ __launch_bounds__(32U * Waves)
+void prefetch8_wave_q8_lm_head_diagnostic_kernel(
+    const Input* input, const void* weights,
+    std::uint32_t input_width, std::uint32_t output_width, float* output) {
+    const auto row = static_cast<std::uint32_t>(blockIdx.x) * Waves + static_cast<std::uint32_t>(threadIdx.x) / 32U;
+    if (row >= output_width) return;
+    const auto lane = static_cast<std::uint32_t>(threadIdx.x) % 32U;
+    float partial[8]{};
+    const auto* blocks = static_cast<const Q8Block*>(weights) +
+        static_cast<std::uint64_t>(row) * (input_width / 32U);
+    for (std::uint64_t chunk = 0; chunk < input_width; chunk += 256U) {
+        const auto base = chunk + 8U * lane;
+        // The prelaunch Q8 width%32 gate proves all eight leaves are valid
+        // together and remain inside one block. No tail load is speculative.
+        if (base < input_width) {
+            const auto feature = static_cast<std::uint32_t>(base);
+            const auto& block = blocks[feature / 32U];
+            Input bits[8];
+            std::int8_t codes[8];
+#pragma unroll
+            for (unsigned local = 0; local < 8; ++local) {
+                bits[local] = input[feature + local];
+                codes[local] = block.values[feature % 32U + local];
+            }
+            const float scale = __half2float(block.scale);
+#pragma unroll
+            for (unsigned local = 0; local < 8; ++local)
+                partial[local] += load_activation(&bits[local]) *
+                    (scale * static_cast<float>(codes[local]));
+        }
+    }
+#pragma unroll
+    for (unsigned distance = 16; distance > 0; distance /= 2) {
+#pragma unroll
+        for (unsigned local = 0; local < 8; ++local) {
+            const auto partner = __shfl_down(partial[local], distance, 32);
+            if (lane < distance) partial[local] += partner;
+        }
+    }
+    if (lane == 0) {
+        partial[0] += partial[4]; partial[1] += partial[5];
+        partial[2] += partial[6]; partial[3] += partial[7];
+        partial[0] += partial[2]; partial[1] += partial[3];
+        partial[0] += partial[1];
+        output[row] = partial[0];
+    }
+}
+#endif
+
 template <
     typename Input,
     WeightKind Kind>
@@ -848,5 +903,48 @@ register_for_compiled_execution(
     throw std::invalid_argument(
         "compiled execution has no LM-head step");
 }
+
+
+#ifdef STRIX_BUILD_GDN_LM_WAVE8_DIAGNOSTIC
+namespace gdn_lm_wave8_diagnostic::detail {
+const void* lm_symbol(Kind kind, Arm arm) {
+    if (kind != Kind::lm_bf16) throw std::invalid_argument("invalid LM diagnostic kind");
+    switch (arm) {
+    case Arm::reference:
+        return reinterpret_cast<const void*>(virtual_q8_lm_head_kernel<std::uint16_t>);
+    case Arm::prefetch1:
+        return reinterpret_cast<const void*>(prefetch8_wave_q8_lm_head_diagnostic_kernel<std::uint16_t, 1>);
+    case Arm::wave8:
+        return reinterpret_cast<const void*>(prefetch8_wave_q8_lm_head_diagnostic_kernel<std::uint16_t, 8>);
+    }
+    throw std::invalid_argument("invalid LM diagnostic arm");
+}
+void enqueue_lm(Shape shape, Span input, Span weights, Span output, Kind kind, Arm arm, hipStream_t stream) {
+    const auto launch = validate(shape, input, weights, output, kind, arm);
+    if (kind != Kind::lm_bf16) throw std::invalid_argument("invalid LM diagnostic kind");
+    check_hip(hipPeekAtLastError(), "LM wave8 diagnostic stale error");
+    if (arm == Arm::reference) {
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(virtual_q8_lm_head_kernel<std::uint16_t>),
+            dim3(launch.grid_x), dim3(launch.block_x), 0, stream,
+            reinterpret_cast<const std::uint16_t*>(input.address),
+            reinterpret_cast<const void*>(weights.address), shape.width, shape.outputs,
+            reinterpret_cast<float*>(output.address));
+    } else if (arm == Arm::prefetch1) {
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(prefetch8_wave_q8_lm_head_diagnostic_kernel<std::uint16_t, 1>),
+            dim3(launch.grid_x), dim3(launch.block_x), 0, stream,
+            reinterpret_cast<const std::uint16_t*>(input.address),
+            reinterpret_cast<const void*>(weights.address), shape.width, shape.outputs,
+            reinterpret_cast<float*>(output.address));
+    } else {
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(prefetch8_wave_q8_lm_head_diagnostic_kernel<std::uint16_t, 8>),
+            dim3(launch.grid_x), dim3(launch.block_x), 0, stream,
+            reinterpret_cast<const std::uint16_t*>(input.address),
+            reinterpret_cast<const void*>(weights.address), shape.width, shape.outputs,
+            reinterpret_cast<float*>(output.address));
+    }
+    check_hip(hipGetLastError(), "LM wave8 diagnostic launch");
+}
+} // namespace gdn_lm_wave8_diagnostic::detail
+#endif
 
 }  // namespace strix
