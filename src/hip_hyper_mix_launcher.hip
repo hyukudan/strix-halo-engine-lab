@@ -99,6 +99,10 @@ void validate_config(
         throw std::invalid_argument("staged hyper projections require parallel hyper-mix");
     if (config.fused_injection && !config.staged_projections)
         throw std::invalid_argument("fused injection requires staged hyper projections");
+    if (config.prefetch_q8_output && !config.typed_projection)
+        throw std::invalid_argument("Q8 hyper output prefetch requires typed projection mode");
+    if (config.prefetch_q8_output && config.lowrank % 32U != 0U)
+        throw std::invalid_argument("Q8 hyper output prefetch requires lowrank divisible by 32");
     if (config.prefetch_rows && !config.typed_projection)
         throw std::invalid_argument("hyper row prefetch requires typed projection mode");
     if (config.typed_projection && !config.fused_injection)
@@ -967,6 +971,61 @@ __global__ void staged_hyper_output_kernel(
                          mixed / static_cast<float>(streams));
 }
 
+
+// Experimental output producer: typed Q8 coefficients, independent rows loaded
+// before LDS stores. Arithmetic and stream order match the generic output path.
+template <typename Storage, bool Full>
+__device__ void q8_batched_hyper_output_role(
+    const float* normalized, const float* low, const void* up,
+    std::uint32_t hidden, std::uint32_t streams, std::uint32_t lowrank,
+    Storage* output, float* values, float (*coefficients)[kStagedPitch]) {
+    const auto lane = threadIdx.x;
+    const auto first_feature = blockIdx.x * kStagedOutputs;
+    const auto feature = first_feature + lane;
+    const auto row = blockIdx.y;
+    const bool active = lane < kStagedOutputs && feature < hidden;
+    const auto rows_left = hidden - first_feature;
+    const auto valid = rows_left < kStagedOutputs ? rows_left : kStagedOutputs;
+    const auto width = hidden * streams;
+    float mixed = 0.0F;
+    for (std::uint32_t stream = 0; stream < streams; ++stream) {
+        float gate = 0.0F;
+        for (std::uint32_t tile = 0; tile < lowrank; tile += kStagedThreads) {
+            const auto remaining = lowrank - tile;
+            const auto count = remaining < kStagedThreads ? remaining : kStagedThreads;
+            if (lane < count) {
+                typed_batched_produce<8U, Full>(low, up, lowrank,
+                    stream * hidden + first_feature, valid, tile, values, coefficients);
+            }
+            __syncthreads();
+            if (active)
+                for (std::uint32_t inner = 0; inner < count; ++inner)
+                    gate += values[inner] * coefficients[lane][inner];
+            __syncthreads();
+        }
+        if (active)
+            mixed += normalized[static_cast<std::uint64_t>(row) * width + stream * hidden + feature] * sigmoid(gate);
+    }
+    if (active)
+        store_activation(&output[static_cast<std::uint64_t>(row) * hidden + feature],
+                         mixed / static_cast<float>(streams));
+}
+
+template <typename Storage>
+__global__ void q8_batched_hyper_output_kernel(
+    const float* normalized, const float* low, const void* up,
+    std::uint32_t hidden, std::uint32_t streams, std::uint32_t lowrank, Storage* output) {
+    __shared__ float values[kStagedThreads];
+    __shared__ float coefficients[kStagedOutputs][kStagedPitch];
+    // The ceil(hidden/8) grid guarantees valid >= 1. This branch is uniform.
+    if (hidden - blockIdx.x * kStagedOutputs >= kStagedOutputs)
+        q8_batched_hyper_output_role<Storage, true>(normalized, low, up,
+            hidden, streams, lowrank, output, values, coefficients);
+    else
+        q8_batched_hyper_output_role<Storage, false>(normalized, low, up,
+            hidden, streams, lowrank, output, values, coefficients);
+}
+
 bool supported_norm_type(
     std::uint32_t ggml_type) noexcept {
     return ggml_type == 0 ||
@@ -1147,11 +1206,19 @@ void launch_typed(
                     injection_output ? reinterpret_cast<float*>(injection_output->address) : nullptr, lowrank_blocks);
                 }
                 check_hip(hipGetLastError(), "fused staged hyper-mix projection launch");
-                hipLaunchKernelGGL(HIP_KERNEL_NAME(staged_hyper_output_kernel<Storage>),
-                    dim3((config.hidden_size + kStagedOutputs - 1U) / kStagedOutputs, context.logical_rows),
-                    dim3(kStagedThreads), 0, hip_execution_stream(), normalized, low,
-                    reinterpret_cast<const void*>(up_runtime.address), up_manifest.ggml_type,
-                    config.hidden_size, config.hc_count, config.lowrank, reinterpret_cast<Storage*>(output.address));
+                if (config.prefetch_q8_output) {
+                    hipLaunchKernelGGL(HIP_KERNEL_NAME(q8_batched_hyper_output_kernel<Storage>),
+                        dim3((config.hidden_size + kStagedOutputs - 1U) / kStagedOutputs, context.logical_rows),
+                        dim3(kStagedThreads), 0, hip_execution_stream(), normalized, low,
+                        reinterpret_cast<const void*>(up_runtime.address),
+                        config.hidden_size, config.hc_count, config.lowrank, reinterpret_cast<Storage*>(output.address));
+                } else {
+                    hipLaunchKernelGGL(HIP_KERNEL_NAME(staged_hyper_output_kernel<Storage>),
+                        dim3((config.hidden_size + kStagedOutputs - 1U) / kStagedOutputs, context.logical_rows),
+                        dim3(kStagedThreads), 0, hip_execution_stream(), normalized, low,
+                        reinterpret_cast<const void*>(up_runtime.address), up_manifest.ggml_type,
+                        config.hidden_size, config.hc_count, config.lowrank, reinterpret_cast<Storage*>(output.address));
+                }
                 check_hip(hipGetLastError(), "fused staged hyper-mix output launch");
                 return;
             }
@@ -1346,6 +1413,9 @@ void launch_hyper_mix(
         (inject_manifest != nullptr && inject_manifest->ggml_type != 0U)))
         throw std::invalid_argument("typed hyper projection requires Q8_0 down and F32 injection");
 
+    if (config.prefetch_q8_output && up_manifest.ggml_type != 8U)
+        throw std::invalid_argument("Q8 hyper output prefetch requires Q8_0 up projection");
+
     const auto expanded_width =
         static_cast<std::uint64_t>(
             config.hidden_size) *
@@ -1526,7 +1596,7 @@ std::string kernel_id(
         ".c" +
         std::to_string(
             request.request_concurrency) + (config.parallel ? ".parallel" : "") +
-        (config.staged_projections ? ".staged" : "") + (config.fused_injection ? ".fused-injection-v5" : "") + (config.typed_projection ? ".typed-q8-f32-v1" : "") + (config.prefetch_rows ? ".prefetch-rows8-v2" : "");
+        (config.staged_projections ? ".staged" : "") + (config.fused_injection ? ".fused-injection-v5" : "") + (config.typed_projection ? ".typed-q8-f32-v1" : "") + (config.prefetch_rows ? ".prefetch-rows8-v2" : "") + (config.prefetch_q8_output ? ".prefetch-q8-output-v1" : "");
 }
 
 std::uint64_t implementation_identity(
@@ -1554,6 +1624,7 @@ std::uint64_t implementation_identity(
     if (config.fused_injection) hash_u64(hash, 0x4655534544484305ULL);
     if (config.typed_projection) hash_u64(hash, 0x5459504544484301ULL);
     if (config.prefetch_rows) hash_u64(hash, 0x5052464852430802ULL);
+    if (config.prefetch_q8_output) hash_u64(hash, 0x5052464855500801ULL);
     return hash;
 }
 
@@ -1647,6 +1718,8 @@ void register_hip_hyper_mix_kernel_variant(
     variant.output_layout =
         "row-major+fp32-injection";
     variant.compiler_identity =
+        config.prefetch_q8_output && config.prefetch_rows ? "hip-gfx1151-hyper-mix-v9-q8-output-prefetch8-with-projection-prefetch" :
+        config.prefetch_q8_output ? "hip-gfx1151-hyper-mix-v9-q8-output-prefetch8" :
         config.prefetch_rows ? "hip-gfx1151-hyper-mix-v8-typed-prefetch-rows8" :
         config.typed_projection ? "hip-gfx1151-hyper-mix-v6-typed-projection" :
         config.fused_injection ? "hip-gfx1151-hyper-mix-v5-fused-injection" :
@@ -1700,6 +1773,27 @@ void preflight_typed_hyper_projection_model(const CompiledSerialExecution& compi
     if (count == 0U) throw std::invalid_argument("typed hyper preflight found no mixer bindings");
 }
 
+void preflight_q8_hyper_output_model(const CompiledSerialExecution& compiled,
+    const ExecutionRuntimeResources& resources, const HipHyperMixLauncherConfig& config) {
+    if (compiled.execution_identity == 0 || resources.model_manifest == nullptr || resources.tensor_access == nullptr)
+        throw std::invalid_argument("Q8 hyper output preflight requires complete compiled model resources");
+    std::uint32_t count = 0;
+    for (const auto& step : compiled.execution.steps) {
+        if (step.op != SerialOp::attn_hyper_mix && step.op != SerialOp::mlp_hyper_mix && step.op != SerialOp::final_hyper_mix) continue;
+        ExecutionDispatchContext context;
+        context.execution_identity = compiled.execution_identity;
+        context.step_id = step.id;
+        context.op = step.op;
+        context.resources = &resources;
+        const auto& up = manifest_tensor(context, resolve_dispatch_tensor_access(context, 2));
+        if (up.ggml_type != 8U || up.dimensions.size() < 2U || up.dimensions[0] == 0U || up.dimensions[0] != config.lowrank || up.dimensions[0] % 32U != 0U ||
+            up.dimensions[1] != static_cast<std::uint64_t>(config.hidden_size) * config.hc_count)
+            throw std::invalid_argument("Q8 hyper output model contains a non-Q8_0 or invalid-width up projection");
+        ++count;
+    }
+    if (count == 0U) throw std::invalid_argument("Q8 hyper output preflight found no mixer bindings");
+}
+
 void HipHyperMixLauncherBundle::
 register_for_compiled_execution(
     const CompiledSerialExecution& compiled,
@@ -1708,6 +1802,10 @@ register_for_compiled_execution(
     if (config_.typed_projection) {
         if (resources == nullptr) throw std::invalid_argument("typed hyper bundle requires complete model preflight resources");
         preflight_typed_hyper_projection_model(compiled, *resources);
+    }
+    if (config_.prefetch_q8_output) {
+        if (resources == nullptr) throw std::invalid_argument("Q8 hyper output bundle requires complete model preflight resources");
+        preflight_q8_hyper_output_model(compiled, *resources, config_);
     }
     if (compiled.execution_identity == 0 ||
         compiled.execution.steps.size() !=

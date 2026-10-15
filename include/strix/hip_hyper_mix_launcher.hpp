@@ -19,6 +19,7 @@ struct HipHyperMixLauncherConfig {
     bool fused_injection = false;
     bool typed_projection = false;
     bool prefetch_rows = false;
+    bool prefetch_q8_output = false;
     HipActivationStorage activation =
         HipActivationStorage::bf16;
 };
@@ -39,6 +40,9 @@ make_hip_hyper_mix_launcher(
 // Validates every compiled mixer before the first typed launch or capture.
 void preflight_typed_hyper_projection_model(const CompiledSerialExecution& compiled,
     const ExecutionRuntimeResources& resources);
+
+void preflight_q8_hyper_output_model(const CompiledSerialExecution& compiled,
+    const ExecutionRuntimeResources& resources, const HipHyperMixLauncherConfig& config);
 
 class HipHyperMixLauncherBundle {
 public:

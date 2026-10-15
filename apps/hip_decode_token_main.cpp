@@ -171,6 +171,7 @@ struct Options {
     bool fused_staged_hyper_mix = false;
     bool typed_hyper_projection = false;
     bool prefetch_typed_hyper_rows = false;
+    bool prefetch_q8_hyper_output = false;
     bool virtual_q8_lm_head = false;
     bool parallel_moe_router = false;
     bool virtual_q8_gdn_input = false;
@@ -204,7 +205,7 @@ Options parse_options(
             "[--generate N] [--eos-token TOKEN_ID] [--prefix-cache-roundtrip] "
             "[--parallel-moe-router] [--ranked-moe-router-topk] "
             "[--virtual-q8-lm-head] [--virtual-q8-gdn-input [--prefetch-q8-gdn-input]] [--q4k-a8g32-gate-up [--grouped-exact-q51-down]] "
-            "[--parallel-hyper-mix [--staged-hyper-projections [--fused-staged-hyper-mix [--typed-fused-hyper-projections [--prefetch-typed-hyper-rows]]]]]");
+            "[--parallel-hyper-mix [--staged-hyper-projections [--fused-staged-hyper-mix [--typed-fused-hyper-projections [--prefetch-typed-hyper-rows] [--prefetch-q8-hyper-output]]]]]");
     }
 
     Options options;
@@ -243,6 +244,11 @@ Options parse_options(
         if (argument == "--parallel-moe-router") {
             if (options.parallel_moe_router) throw std::invalid_argument("duplicate parallel MoE router option");
             options.parallel_moe_router = true;
+            continue;
+        }
+        if (argument == "--prefetch-q8-hyper-output") {
+            if (options.prefetch_q8_hyper_output) throw std::invalid_argument("duplicate Q8 hyper output prefetch option");
+            options.prefetch_q8_hyper_output = true;
             continue;
         }
         if (argument == "--prefetch-typed-hyper-rows") {
@@ -527,6 +533,8 @@ Options parse_options(
         throw std::invalid_argument("--ranked-moe-router-topk requires --parallel-moe-router");
     if (options.prefetch_q8_gdn_input && !options.virtual_q8_gdn_input)
         throw std::invalid_argument("--prefetch-q8-gdn-input requires --virtual-q8-gdn-input");
+    if (options.prefetch_q8_hyper_output && !options.typed_hyper_projection)
+        throw std::invalid_argument("Q8 hyper output prefetch requires typed projection mode");
     if (options.prefetch_typed_hyper_rows && !options.typed_hyper_projection)
         throw std::invalid_argument("typed hyper row prefetch requires typed projection mode");
     if (options.typed_hyper_projection && !(options.parallel_hyper_mix && options.staged_hyper_projections && options.fused_staged_hyper_mix))
@@ -967,6 +975,7 @@ int main(
     catalog_config.fused_staged_hyper_mix = options.fused_staged_hyper_mix;
     catalog_config.typed_hyper_projection = options.typed_hyper_projection;
     catalog_config.prefetch_typed_hyper_rows = options.prefetch_typed_hyper_rows;
+    catalog_config.prefetch_q8_hyper_output = options.prefetch_q8_hyper_output;
     catalog_config.virtual_q8_lm_head = options.virtual_q8_lm_head;
     catalog_config.q4k_a8g32_gate_up = options.q4k_a8g32_gate_up;
     catalog_config.grouped_exact_q51_down = options.grouped_exact_q51_down;
