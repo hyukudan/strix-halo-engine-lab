@@ -31,6 +31,12 @@ __device__ __forceinline__ T& slot(RegisterRing<T, N>& ring) {
     if constexpr(I == 0) return ring.head;
     else return slot<I-1>(ring.tail);
 }
+template<unsigned I, class T, unsigned N>
+__device__ __forceinline__ const T& slot(const RegisterRing<T, N>& ring) {
+    static_assert(I < N);
+    if constexpr(I == 0) return ring.head;
+    else return slot<I-1>(ring.tail);
+}
 
 struct PairSlot { RegisterRing<unsigned, 16> words; unsigned scales; };
 struct TileSlot { F32x4 s0, s1, s2, s3; };
