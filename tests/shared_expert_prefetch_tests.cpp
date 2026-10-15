@@ -1,10 +1,12 @@
 #include "../apps/hip_decode_receipt_json.hpp"
+#include "../apps/shared_prefetch_receipt.hpp"
 #include "strix/compiled_execution.hpp"
 #include "strix/compiled_speculative_verify.hpp"
 #include "strix/shared_expert_prefetch.hpp"
 #include <algorithm>
 #include <array>
 #include <iostream>
+#include <memory>
 #include <set>
 #include <stdexcept>
 using namespace strix;
@@ -89,6 +91,31 @@ int main() {
            "receipt preserves name with escaped quotes, backslashes and controls");
     expect(strix::decode_receipt::escape_json_string(std::string("a\0b", 3)) == "a\\u0000b",
            "receipt escapes embedded null without truncating name");
+
+    // The receipt binds the exact runtime owner before work, without latching
+    // a zero at construction. Updates below test counter observation only;
+    // they do not claim that a GPU projection was launched by this host test.
+    auto stats_owner = std::make_shared<shared_expert_prefetch::RuntimeDispatchStats>();
+    std::weak_ptr<shared_expert_prefetch::RuntimeDispatchStats> live_owner = stats_owner;
+    const decode_detail::SharedPrefetchDispatchReceipt completed_receipt(stats_owner);
+    expect(completed_receipt.completed_counts() ==
+               "  \"prefetch_q8_shared_expert_dispatched_projections\": 0,\n",
+           "pre-execution reader observes actual owner zero");
+    stats_owner.reset();
+    expect(!live_owner.expired(), "deferred completion reader retains runtime owner");
+    auto producer_owner = live_owner.lock();
+    producer_owner->dispatched_projections.fetch_add(1, std::memory_order_relaxed);
+    expect(completed_receipt.completed_counts() ==
+               "  \"prefetch_q8_shared_expert_dispatched_projections\": 1,\n",
+           "completion reader observes enqueue update after its construction");
+    producer_owner->dispatched_projections.fetch_add(2, std::memory_order_relaxed);
+    shared_expert_prefetch::RuntimeDispatchStats unrelated_owner;
+    unrelated_owner.dispatched_projections.fetch_add(99, std::memory_order_relaxed);
+    expect(completed_receipt.completed_counts() ==
+               "  \"prefetch_q8_shared_expert_dispatched_projections\": 3,\n",
+           "completion reader follows its actual owner, not another owner or token-derived total");
+    const decode_detail::SharedPrefetchDispatchReceipt disabled_receipt(nullptr);
+    expect(disabled_receipt.completed_counts().empty(), "disabled mode omits dynamic feature counter");
 
     const auto m = ModelContract::qwen38_flash_next();
     auto tensors = manifest(m);

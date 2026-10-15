@@ -68,3 +68,12 @@ nulls and other controls. A nonfinite diagnostic flavor supplies distinct NaN
 payloads, infinities and nonfinite half scales; it compares the three actual device
 modes directly and deliberately does not use host FMA as an AMD payload oracle.
 Native execution of these additional cases remains pending.
+
+Static mode and projection-plan fields may be emitted before token execution.
+The dynamic dispatch receipt retains the same statistics owner as the launcher
+and reads its live host enqueue/capture count only at completed receipt emission.
+Teacher-forced output emits that count after the token array; greedy generation
+and prefix-restoration output emit it after their workloads complete. Graph replay
+does not manufacture host dispatch counts from committed tokens. Portable tests
+check zero before owner updates, later live values, owner lifetime and isolation,
+and disabled-field omission; they do not claim GPU dispatch execution.

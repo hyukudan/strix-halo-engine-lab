@@ -1,5 +1,6 @@
 #include "strix/lane_chain_hyper_output.hpp"
 #include "qsa_input_receipt.hpp"
+#include "shared_prefetch_receipt.hpp"
 #include "strix/gdn_output_admission.hpp"
 #include "strix/compiled_execution.hpp"
 #include "strix/execution_resources.hpp"
@@ -574,14 +575,15 @@ int main(
     if(options.prefetch_q8_shared_expert) shared_mode_receipt+="],\n";
     const auto shared_prefetch_stats=options.prefetch_q8_shared_expert ?
         std::make_shared<strix::shared_expert_prefetch::RuntimeDispatchStats>() : nullptr;
+    // Static mode/plan metadata may be emitted before execution. Dispatch
+    // counts must be read separately after the selected workload completes.
     const auto gdn_output_mode_receipt=[&] {
         std::string receipt=(options.virtual_q8_gdn_output ? "  \"virtual_q8_gdn_output\": true,\n" : "")+shared_mode_receipt+qsa_input_mode_receipt+lane_chain_mode_receipt;
-        if(shared_prefetch_stats) receipt += "  \"prefetch_q8_shared_expert_dispatched_projections\": "+
-            std::to_string(shared_prefetch_stats->dispatched_projections.load(std::memory_order_relaxed))+",\n";
         return receipt;
     };
     const std::string deferred_moe_mode_receipt = "  \"deferred_moe_status\": " +
         std::string(options.deferred_moe_status ? "true" : "false") + ",\n";
+    const strix::decode_detail::SharedPrefetchDispatchReceipt shared_dispatch_receipt(shared_prefetch_stats);
     const auto original_work_device = std::make_shared<strix::HipSetupQuiescenceGuard>();
     auto target_architecture = original_work_device->architecture();
     if (const auto suffix = target_architecture.find(':'); suffix != std::string::npos)
@@ -1190,6 +1192,7 @@ int main(
             std::cout
                 << "{\n" << optimization_profile_receipt << gdn_output_mode_receipt() << wave_router_mode_receipt << deferred_moe_receipt()
                 << strix::decode_detail::qsa_input_dispatch_receipt(qsa_prefetch_stats.get())
+                << shared_dispatch_receipt.completed_counts()
                 << "  \"model_content_identity\": \""
                 << strix::model_content_identity_hex(
                        model_residency.binding().
@@ -1319,6 +1322,7 @@ int main(
         emit_q4k_a8_receipt();
         emit_q4k_a8_counts();
         std::cout << strix::decode_detail::qsa_input_dispatch_receipt(qsa_prefetch_stats.get());
+        std::cout << shared_dispatch_receipt.completed_counts();
         std::cout
             << "  \"model_content_identity\": \""
             << strix::model_content_identity_hex(
@@ -1630,6 +1634,7 @@ int main(
     emit_q4k_a8_counts();
     // Dynamic counters belong after the raw token loop, not the JSON prefix.
     std::cout << strix::decode_detail::qsa_input_dispatch_receipt(qsa_prefetch_stats.get());
+    std::cout << shared_dispatch_receipt.completed_counts();
     std::cout
         << "  \"decode_elapsed_ms_total\": "
         << decode_elapsed_ms_total
