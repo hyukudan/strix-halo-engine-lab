@@ -106,3 +106,9 @@ cannot establish compiler behavior or useful workload speed. Spec consequence:
 explicit per-tensor eligibility, operator IDs, actual-dispatch receipts and all
 native fidelity/latency gates precede adoption. Reopen after linked ISA, actual
 fixtures, full-model equality and paired preparation-inclusive measurements.
+
+D-015 decoder policy follow-up: use a content-bound automatic profile for the
+qualified eager registered checkpoint, retaining manual selection and explicit
+ranked routing. The low-level flag default remains OFF; the application can select
+wave after metadata/content admission. Other new source increments remain explicit
+until their performance gates pass. See `docs/decode-optimization-profile.md`.

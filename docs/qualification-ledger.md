@@ -62,3 +62,11 @@ these do not establish native HIP compilation or execution. See
 [the draft integration record](implementation-2026-10-15-spec-v1-draft-integration.md).
 Combined review, actual native ISA/fixtures, model fidelity and paired timing remain
 pending; earlier historical checks above retain their original scope.
+
+Automatic decoder policy follow-up: the application now proposes a content-bound
+qualified eager/register profile and a manual A/B override. The actual parser and
+resolver are portable-tested for model/content/mode/context/build capability,
+explicit overrides and reasoned fallback. This policy source still requires review
+and fresh integrated native qualification; see
+[the policy contract](decode-optimization-profile.md). The earlier default-off
+integration result records its original revision and scope.

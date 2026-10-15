@@ -32,6 +32,8 @@ pass before adoption; first-error merge and host-exception precedence are explic
 D-015 through D-020 / E-050 through E-055 are combined in a reversible draft.
 The [integration record](docs/implementation-2026-10-15-spec-v1-draft-integration.md)
 records observed host checks and pending combined review, native compiler/ISA,
-GPU fixtures, model fidelity and paired timing. All decoder flags remain OFF;
+GPU fixtures, model fidelity and paired timing. Low-level flags remain OFF; the
+[automatic decoder policy](docs/decode-optimization-profile.md) can select its
+qualified content-bound profile, and manual mode preserves explicit selection;
 the HC projection prototype remains diagnostic only. Host evidence does not close
 these native or performance gates.

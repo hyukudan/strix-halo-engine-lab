@@ -2,7 +2,10 @@
 
 This branch combines the wave router, Q8 indexed-attention input prefetch,
 lane-chain HC output, deferred MoE status and Q8 shared-expert prefetch increments.
-Every decoder mode remains OFF by default. The independent HC whole-projection
+This initial integration preserved all low-level modes OFF by default. The later
+[automatic profile policy](decode-optimization-profile.md) selects the qualified
+canonical profile after exact content/mode admission; manual mode preserves the
+original explicit configuration. The independent HC whole-projection
 prototype is diagnostic only and adds no decoder command-line selection.
 
 The implementation preserves separate per-layer/per-step fallback IDs and separate
