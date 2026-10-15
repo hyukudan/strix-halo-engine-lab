@@ -148,3 +148,6 @@ nonzero-code fixture uses feature-dependent quiet NaNs whose distinct payloads
 survive BF16 truncation. Host checks distinguish every reduction-stride pair;
 finite output poison avoids legitimate NaN payload collisions. The mixed
 nonfinite case also tests a distinct NaN scalar gate during graph replays.
+## E-055
+
+Diagnostic source: `src/hip_hyper_mix_launcher.hip`, `tests/hip_lane_chain_hyper_projection_tests.hip`, and its implementation document. HIP target `strix-hip-lane-chain-hyper-projection-tests` runs synthetic exactness checks; `--bench` records real-payload event pairs using an externally bound normalized capture. Required environment is actual gfx1151 with the original TU compiler settings; compiler/ISA and device results are pending. Source staging sizes are not measured occupancy or throughput.

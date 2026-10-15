@@ -1281,6 +1281,11 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         target_link_libraries(strix-hip-lane-chain-hyper-output-tests PRIVATE strix_hip_runtime)
         strix_target_warnings(strix-hip-lane-chain-hyper-output-tests)
         add_test(NAME strix-hip-lane-chain-hyper-output-tests COMMAND strix-hip-lane-chain-hyper-output-tests)
+        add_executable(strix-hip-lane-chain-hyper-projection-tests tests/hip_lane_chain_hyper_projection_tests.hip)
+        set_target_properties(strix-hip-lane-chain-hyper-projection-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+        target_link_libraries(strix-hip-lane-chain-hyper-projection-tests PRIVATE strix_hip_runtime)
+        strix_target_warnings(strix-hip-lane-chain-hyper-projection-tests)
+        add_test(NAME strix-hip-lane-chain-hyper-projection-tests COMMAND strix-hip-lane-chain-hyper-projection-tests)
         add_executable(
             strix-hip-hyper-mix-launcher-tests
             tests/hip_hyper_mix_launcher_tests.hip

@@ -102,3 +102,6 @@ cannot establish compiler behavior or useful workload speed. Spec consequence:
 explicit per-tensor eligibility, operator IDs, actual-dispatch receipts and all
 native fidelity/latency gates precede adoption. Reopen after linked ISA, actual
 fixtures, full-model equality and paired preparation-inclusive measurements.
+## D-020
+
+Measure independent whole-output chains without changing arithmetic before introducing decoder plumbing. Keep all existing HC device bodies unchanged. Limit register prefetch toP1/P2; do not instantiateP4 because its packed payload alone is272 dwords. Reopen only after actual register/scratch, scalar-input-load and exact-FMA ISA plus real captured-input event measurements. If the dependent chain floor remains high, report it or consider another exact producer schedule; splitting K is outside this prototype.

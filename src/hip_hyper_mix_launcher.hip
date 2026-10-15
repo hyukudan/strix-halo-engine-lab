@@ -1,4 +1,5 @@
 #include "strix/hip_lane_chain_hyper_output_tests.hpp"
+#include "strix/hip_lane_chain_hyper_projection_tests.hpp"
 #include "strix/hip_launch_context.hpp"
 #include "strix/hip_hyper_mix_launcher.hpp"
 #include "strix/lane_chain_hyper_output.hpp"
@@ -936,6 +937,66 @@ __global__ void batched_typed_hyper_projection_kernel(
     }
 }
 
+// Diagnostic exact projection prototype. No production launcher selects it.
+// Each active lane owns one entire ascending dot chain; K is never partitioned.
+__device__ __forceinline__ unsigned lane_chain_q8_byte(const uint4* words,unsigned byte){
+    const auto v=words[byte/16U];const unsigned slot=(byte/4U)%4U;
+    const unsigned word=slot==0U?v.x:slot==1U?v.y:slot==2U?v.z:v.w;
+    return (word>>(8U*(byte%4U)))&255U;
+}
+template <unsigned OutputsPerWave,unsigned Prefetch>
+__global__ void lane_chain_hyper_projection_kernel(const float* normalized,const void* down,const float* inject,
+    unsigned width,unsigned streams,unsigned rank,float* low,float* injection,unsigned low_blocks){
+    static_assert(OutputsPerWave==8 || OutputsPerWave==16 || OutputsPerWave==32);
+    static_assert(Prefetch==1 || Prefetch==2); // P4 needs272 packed dwords alone.
+    const unsigned lane=threadIdx.x,row=blockIdx.y;
+    const bool is_inject=blockIdx.x>=low_blocks;
+    const unsigned chain=(is_inject?blockIdx.x-low_blocks:blockIdx.x)*OutputsPerWave+lane;
+    if(lane>=OutputsPerWave || chain>=(is_inject?streams:rank))return;
+    float sum=0.0F;
+    const auto input_row=static_cast<std::uint64_t>(row)*width;
+    if(is_inject){
+        const auto base=static_cast<std::uint64_t>(chain)*width;
+        for(unsigned tile=0;tile<width;tile+=4U){
+            const float4 w=*reinterpret_cast<const float4*>(inject+base+tile);
+            sum+=normalized[input_row+tile]*w.x;
+            sum+=normalized[input_row+tile+1U]*w.y;
+            sum+=normalized[input_row+tile+2U]*w.z;
+            sum+=normalized[input_row+tile+3U]*w.w;
+        }
+        const float scaled=sum/static_cast<float>(streams);
+        injection[static_cast<std::uint64_t>(row)*streams+chain]=2.0F*sigmoid(scaled);
+    }else{
+        const auto* weight_row=static_cast<const unsigned char*>(down)+static_cast<std::uint64_t>(chain)*(width/32U)*34U;
+        const unsigned groups=width/256U;
+        for(unsigned first=0;first<groups;first+=Prefetch){
+            uint4 packed[Prefetch][17];
+#pragma unroll
+            for(unsigned p=0;p<Prefetch;++p)if(first+p<groups){
+#pragma unroll
+                for(unsigned v=0;v<17U;++v)
+                    packed[p][v]=*reinterpret_cast<const uint4*>(weight_row+static_cast<std::uint64_t>(first+p)*272U+v*16U);
+            }
+#pragma unroll
+            for(unsigned p=0;p<Prefetch;++p)if(first+p<groups){
+#pragma unroll
+                for(unsigned b=0;b<8U;++b){
+                    const auto bits=static_cast<unsigned short>(lane_chain_q8_byte(packed[p],b*34U)|(lane_chain_q8_byte(packed[p],b*34U+1U)<<8U));
+                    const float scale=__half2float(__ushort_as_half(bits));
+#pragma unroll
+                    for(unsigned k=0;k<32U;++k){
+                        const auto code=static_cast<signed char>(lane_chain_q8_byte(packed[p],b*34U+2U+k));
+                        const float coefficient=scale*static_cast<float>(code);
+                        sum+=normalized[input_row+static_cast<std::uint64_t>(first+p)*256U+b*32U+k]*coefficient;
+                    }
+                }
+            }
+        }
+        const float scaled=sum/static_cast<float>(streams);
+        low[static_cast<std::uint64_t>(row)*rank+chain]=scaled*sigmoid(scaled);
+    }
+}
+
 template <typename Storage>
 __global__ void staged_hyper_output_kernel(
     const float* normalized, const float* low, const void* up, std::uint32_t kind,
@@ -1705,6 +1766,37 @@ void testing::enqueue_lane_chain_hyper_output_test(const HipHyperMixLauncherConf
     };
     if(config.activation==HipActivationStorage::bf16)launch.template operator()<std::uint16_t>();else launch.template operator()<float>();
     check_hip(hipGetLastError(),"lane-chain HC same-input test launch");
+}
+
+void hc_projection_diagnostic::enqueue(Shape shape,Span normalized,Span down,Span inject,Span low,Span injection,
+    std::uint32_t opw,std::uint32_t prefetch,bool reference_rows8,hipStream_t stream){
+    if(!shape.width || shape.width>10240U || shape.width%256U || shape.streams<2U || shape.streams>8U || shape.width%shape.streams || !shape.rank || shape.rank>512U || !shape.rows || shape.rows>65535U ||
+       (opw!=0U && opw!=8U && opw!=16U && opw!=32U) || (prefetch!=1U && prefetch!=2U))throw std::invalid_argument("HC projection diagnostic unsupported shape/variant");
+    const bool with_inject=injection.address!=0;
+    if(with_inject!=(inject.address!=0) || (!with_inject && (inject.bytes || injection.bytes)))throw std::invalid_argument("HC projection diagnostic injection owner pair differs");
+    const auto check_span=[](Span owner,std::uint64_t required,std::uint64_t alignment){if(!owner.address || owner.address%alignment || owner.bytes<required || owner.bytes>std::numeric_limits<std::uintptr_t>::max()-owner.address)throw std::invalid_argument("HC projection diagnostic owner extent/alignment differs");};
+    check_span(normalized,static_cast<std::uint64_t>(shape.rows)*shape.width*4U,4);
+    check_span(down,static_cast<std::uint64_t>(shape.rank)*(shape.width/32U)*34U,16);
+    check_span(low,static_cast<std::uint64_t>(shape.rows)*shape.rank*4U,4);
+    if(with_inject){check_span(inject,static_cast<std::uint64_t>(shape.streams)*shape.width*4U,16);check_span(injection,static_cast<std::uint64_t>(shape.rows)*shape.streams*4U,4);}
+    const auto overlap=[](Span x,Span y){return x.address<y.address+y.bytes && y.address<x.address+x.bytes;};
+    if(overlap(low,normalized)||overlap(low,down)||(with_inject&&(overlap(low,inject)||overlap(low,injection)||overlap(injection,normalized)||overlap(injection,down)||overlap(injection,inject))))throw std::invalid_argument("HC projection diagnostic owners overlap");
+    check_hip(hipPeekAtLastError(),"HC projection diagnostic stale error");
+    const auto base_blocks=(shape.rank+kStagedOutputs-1U)/kStagedOutputs;
+    if(!opw){
+        const dim3 grid(base_blocks+(with_inject?(shape.streams+kStagedOutputs-1U)/kStagedOutputs:0U),shape.rows);
+        if(reference_rows8){hipLaunchKernelGGL(batched_typed_hyper_projection_kernel,grid,dim3(kStagedThreads),0,stream,reinterpret_cast<const float*>(normalized.address),reinterpret_cast<const void*>(down.address),shape.width,shape.streams,shape.rank,reinterpret_cast<float*>(low.address),reinterpret_cast<const void*>(inject.address),reinterpret_cast<float*>(injection.address),base_blocks);}
+        else{hipLaunchKernelGGL(typed_fused_hyper_projection_kernel,grid,dim3(kStagedThreads),0,stream,reinterpret_cast<const float*>(normalized.address),reinterpret_cast<const void*>(down.address),shape.width,shape.streams,shape.rank,reinterpret_cast<float*>(low.address),reinterpret_cast<const void*>(inject.address),reinterpret_cast<float*>(injection.address),base_blocks);}
+    }else{
+        const auto launch=[&]<unsigned Outputs,unsigned P>(){
+            const unsigned blocks=(shape.rank+Outputs-1U)/Outputs;
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(lane_chain_hyper_projection_kernel<Outputs,P>),dim3(blocks+(with_inject?(shape.streams+Outputs-1U)/Outputs:0U),shape.rows),dim3(32),0,stream,reinterpret_cast<const float*>(normalized.address),reinterpret_cast<const void*>(down.address),reinterpret_cast<const float*>(inject.address),shape.width,shape.streams,shape.rank,reinterpret_cast<float*>(low.address),reinterpret_cast<float*>(injection.address),blocks);
+        };
+        if(opw==8U){if(prefetch==1U)launch.template operator()<8,1>();else launch.template operator()<8,2>();}
+        else if(opw==16U){if(prefetch==1U)launch.template operator()<16,1>();else launch.template operator()<16,2>();}
+        else{if(prefetch==1U)launch.template operator()<32,1>();else launch.template operator()<32,2>();}
+    }
+    check_hip(hipGetLastError(),"HC projection diagnostic enqueue");
 }
 
 void register_hip_hyper_mix_kernel_variant(

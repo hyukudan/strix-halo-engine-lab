@@ -56,3 +56,4 @@ See [the portable implementation slice](implementation-2026-10-11.md),
 | Increment | Implemented evidence | Remaining gates |
 | --- | --- | --- |
 | Q8 shared-expert gate/up/down prefetch | Default-off per-tensor/layer selection, distinct IDs, original device definitions preserved, limited host planning tests, standalone and full-operator poison/graph fixtures, actual host submission count | Native HIP compilation, linked legacy ISA and candidate FP/arithmetic/resource descriptors, new device fixture execution, full-model exactness, paired complete-workload benefit |
+| Exact HC projection prototype | Diagnostic-only OPW8/16/32 withP1/P2, original payloads, ordered chains and same-input poison/event fixtures | Source review, actual HIP/ISA no-spill/scalar-load checks, device exactness and real captured-input microbench; no decoder integration yet |
