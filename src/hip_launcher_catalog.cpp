@@ -199,7 +199,8 @@ moe_experts_config(
 HipMoeRouteLauncherConfig
 moe_route_config(
     const ModelContract& model,
-    HipActivationStorage activation, bool parallel = false, bool ranked = false, bool wave = false) {
+    HipActivationStorage activation, bool parallel = false, bool ranked = false, bool wave = false,
+    std::shared_ptr<const WaveRouterManifestAdmission> admission = {}) {
     HipMoeRouteLauncherConfig config;
     config.hidden_size =
         checked_u32(
@@ -220,6 +221,7 @@ moe_route_config(
     config.parallel_projection = parallel;
     config.ranked_topk = ranked;
     config.wave_topk = wave;
+    config.wave_manifest_admission = std::move(admission);
     return config;
 }
 
@@ -341,7 +343,7 @@ void register_complete_hip_kernel_catalog(
     const auto moe_route =
         moe_route_config(
             model,
-            config.activation, config.parallel_moe_router, config.ranked_moe_router_topk, config.wave_moe_router_topk);
+            config.activation, config.parallel_moe_router, config.ranked_moe_router_topk, config.wave_moe_router_topk, config.wave_router_manifest_admission);
     register_hip_moe_route_kernel_variant(
         model,
         request,
@@ -416,7 +418,7 @@ HipLauncherCatalog::HipLauncherCatalog(
       moe_route_(
           moe_route_config(
               model,
-              config.activation, config.parallel_moe_router, config.ranked_moe_router_topk, config.wave_moe_router_topk)),
+              config.activation, config.parallel_moe_router, config.ranked_moe_router_topk, config.wave_moe_router_topk, config.wave_router_manifest_admission)),
       moe_experts_(
           moe_experts_config(
               model,

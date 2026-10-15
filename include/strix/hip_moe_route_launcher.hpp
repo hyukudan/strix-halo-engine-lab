@@ -6,8 +6,10 @@
 
 #include <cstdint>
 #include <string>
+#include <memory>
 
 namespace strix {
+class WaveRouterManifestAdmission;
 
 struct HipMoeRouteLauncherConfig {
     std::uint32_t hidden_size = 0;
@@ -19,6 +21,7 @@ struct HipMoeRouteLauncherConfig {
     bool parallel_projection = false;
     bool ranked_topk = false;
     bool wave_topk = false;
+    std::shared_ptr<const WaveRouterManifestAdmission> wave_manifest_admission;
 };
 
 void register_hip_moe_route_kernel_variant(

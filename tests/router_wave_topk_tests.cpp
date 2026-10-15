@@ -145,6 +145,15 @@ int main() try {
     rejects([&]{strix::validate_wave_router_model_inputs(info);});
     strix::ModelManifest manifest;strix::ManifestTensor bias;bias.name=tensor.name;manifest.tensors.push_back(bias);
     rejects([&]{strix::validate_wave_router_manifest(manifest);});
+    rejects([&]{(void)strix::WaveRouterManifestAdmission::create(manifest);});
+    manifest.tensors.clear();manifest.layout_identity=strix::model_manifest_layout_identity(manifest);
+    const auto admission=strix::WaveRouterManifestAdmission::create(manifest);
+    if(admission->manifest().layout_identity!=manifest.layout_identity)throw std::runtime_error("admitted manifest changed");
+    manifest.tensors.push_back(bias); // Mutate caller's names while retaining its declared identity.
+    if(!admission->manifest().tensors.empty())throw std::runtime_error("admission aliases mutable caller state");
+    rejects([&]{(void)strix::WaveRouterManifestAdmission::create(manifest);});
+    manifest.tensors.front().name="blk.0.other.weight";
+    rejects([&]{(void)strix::WaveRouterManifestAdmission::create(manifest);});
     std::cout<<cases<<" wave/insertion bit-exact cases, slot mutants and admission negatives passed\n";
     return 0;
 }catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}

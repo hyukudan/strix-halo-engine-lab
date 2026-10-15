@@ -84,8 +84,6 @@ void validate_config(
     const HipMoeRouteLauncherConfig& config) {
     if (config.wave_topk)
         validate_wave_router_selection_contract(config.expert_count, config.top_k, config.parallel_projection, config.ranked_topk);
-    if (config.wave_topk && (!config.parallel_projection || config.ranked_topk))
-        throw std::invalid_argument("wave router top-k requires parallel projection and excludes ranked mode");
     if (config.ranked_topk && !config.parallel_projection)
         throw std::invalid_argument("ranked router top-k requires parallel projection");
     if (config.hidden_size == 0 ||
@@ -1163,7 +1161,9 @@ void launch_moe_route(
             "HIP MoE route requires model manifest resources");
     }
 
-    if (config.wave_topk) validate_wave_router_manifest(*context.resources->model_manifest);
+    if (config.wave_topk && (!config.wave_manifest_admission ||
+        context.resources->model_manifest != &config.wave_manifest_admission->manifest()))
+        throw std::invalid_argument("wave router requires the exact owned admitted manifest");
     const auto tensor_index =
         access.tensor_indices.front();
     if (tensor_index >=
@@ -1198,9 +1198,7 @@ void launch_moe_route(
             "HIP MoE route requires resident or repacked GPU-visible router weights");
     }
 
-    if (config.wave_topk && (runtime_tensor.address % 16U != 0 ||
-        (runtime_tensor.storage == RuntimeTensorStorage::registered_file_mapped && manifest_tensor.absolute_offset % 16U != 0) ||
-        hidden.address % (config.activation == HipActivationStorage::bf16 ? 2U : 4U) != 0 ||
+    if (config.wave_topk && (hidden.address % (config.activation == HipActivationStorage::bf16 ? 2U : 4U) != 0 ||
         indices.address % 4U != 0 || route_weights.address % 4U != 0))
         throw std::invalid_argument("wave router requires aligned runtime inputs and outputs");
     const auto kind =
@@ -1422,6 +1420,8 @@ make_hip_moe_route_launcher(
             "HIP MoE route launcher requires id and config");
     }
     validate_config(*config);
+    if(config->wave_topk && !config->wave_manifest_admission)
+        throw std::invalid_argument("wave router launcher requires owned manifest preflight admission");
     return ExecutionLauncher{
         std::move(kernel_id),
         launcher_identity(*config),

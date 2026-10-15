@@ -21,6 +21,8 @@
 
 | D-014 | Modelar cada USB4 físico como transporte autónomo con epoch, lease, TX/RX pools y contabilidad propios; el modo dual-link es una política por encima de dos enlaces cualificados. | Evita asumir suma de ancho de banda, aísla fallos y permite flow distribution/directional split/striping solo con evidencia de independencia. | E-044 a E-048; docs 12 y 16. | Reabrir solo si el hardware demuestra un recurso agregado con ownership/sincronización comunes y beneficio end-to-end. |
 
+| D-015 | Keep wave router selection OFF by default, with unchanged softmax/slot-order FP expressions, immutable preflight manifest admission and launcher-only K32; retain default/ranked alternatives. | Pointer identity to a validated owned deep copy avoids hot-path tensor scans and unsafe caches on mutable declared IDs. Raw GGUF rejects groups/bias before shape reduction; registration cannot inspect metadata absent from its API. | E-050; `docs/implementation-2026-10-15-wave-router-topk.md`; host oracle/admission checks. | Reopen for expressible grouped routing/bias, ISA changes, full-array mismatch or failure to improve measured latency. Target and model gates remain pending. |
+
 ## Pendientes
 
 | ID | Decisión pendiente | Datos necesarios |
@@ -52,27 +54,6 @@
 | X-003 | Diseñar desde el inicio para múltiples GPU/modelos. | Añadiría abstracción antes de validar el fast path `gfx1151`. |
 
 ## Formato de revisión
-
-### Wave router selection contract, 2026-10-15
-
-Use repeated wave maxima over float value/expert-index pairs while retaining
-the existing softmax and slot-order epilogue. Integer-bit sorting or parallel
-division is outside this exact candidate. Existing default/ranked functions and
-their16-slot limits remain intact; wave K32 is launcher-only. The alternative
-is the existing ranked selector, which remains available and unchanged.
-
-The raw GGUF reader exposes group metadata, but `ModelContract` and the variant
-registration API contain no group/bias fields or manifest parameter. Therefore
-wave intake rejects `.expert_group_count`, `.expert_group_used_count` and
-`*.exp_probs_b*` before that information is reduced to a shape contract; direct
-callers must use the same raw-intake validator. The launcher independently
-rejects bias tensors retained in its manifest before enqueue. Registration must
-not be described as inspecting metadata it cannot receive. Reopen this contract
-if grouped routing or selection bias becomes expressible in the model API.
-
-Host oracle/admission checks pass; hardware, ISA, model and performance gates
-remain pending. A different compiled FP sequence, any full-array mismatch, or
-failure to improve measured latency blocks adoption and requires investigation.
 
 Toda decisión nueva indicará: alternativas, evidencia, riesgo, consecuencia en
 la spec y condición de reapertura. Las acciones de aceptación se enlazarán aquí y

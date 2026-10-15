@@ -905,6 +905,10 @@ int main(
     const auto manifest =
         strix::build_model_manifest(
             info);
+    // Admission validates all names and the actual layout hash once, before
+    // any GPU setup or enqueue, then retains its immutable snapshot.
+    const auto wave_router_admission = options.wave_moe_router_topk ?
+        strix::WaveRouterManifestAdmission::create(manifest) : nullptr;
     const auto q4k_a8_layers = options.q4k_a8g32_gate_up ?
         strix::moe_q4k_a8::classify_runtime_manifest(model,manifest) :
         strix::moe_q4k_a8::RuntimeLayerClassification{};
@@ -966,10 +970,6 @@ int main(
             throw std::invalid_argument("--virtual-q8-gdn-input requires an aligned Q8_0 GDN input projection");
     }
     if(options.virtual_q8_gdn_output) strix::validate_virtual_q8_gdn_output_manifest(model,manifest);
-    const std::string wave_router_mode_receipt =
-        "  \"wave_moe_router_topk\": " + std::string(options.wave_moe_router_topk ? "true" : "false") + ",\n" +
-        "  \"wave_moe_router_topk_eligible_steps\": " + std::to_string(options.wave_moe_router_topk ? model.hidden_layers : 0ULL) + ",\n" +
-        "  \"wave_moe_router_topk_fallback_steps\": 0,\n";
     const std::string gdn_output_mode_receipt=options.virtual_q8_gdn_output ? "  \"virtual_q8_gdn_output\": true,\n" : "";
     const auto original_work_device = std::make_shared<strix::HipSetupQuiescenceGuard>();
     auto target_architecture = original_work_device->architecture();
@@ -1008,6 +1008,7 @@ int main(
     catalog_config.ranked_moe_router_topk = options.ranked_moe_router_topk;
     binding_request.ranked_moe_router_topk = options.ranked_moe_router_topk;
     catalog_config.wave_moe_router_topk = options.wave_moe_router_topk;
+    catalog_config.wave_router_manifest_admission = wave_router_admission;
     binding_request.wave_moe_router_topk = options.wave_moe_router_topk;
     catalog_config.parallel_moe_router = options.parallel_moe_router;
     binding_request.parallel_moe_router = options.parallel_moe_router;
@@ -1053,6 +1054,18 @@ int main(
             buffer_request,
             256);
 
+    std::uint32_t wave_eligible_steps = 0;
+    for (const auto& binding : compiled.bindings.bindings)
+        if(binding.op == strix::SerialOp::moe_route && binding.kernel_id && binding.kernel_id->ends_with(".wave.parallel"))
+            ++wave_eligible_steps;
+    if (wave_eligible_steps > compiled.execution.moe_route_steps ||
+        (options.wave_moe_router_topk && (!wave_eligible_steps || wave_eligible_steps != compiled.execution.moe_route_steps)))
+        throw std::invalid_argument("wave router compiled bindings do not cover every route step");
+    const auto wave_fallback_steps = compiled.execution.moe_route_steps - wave_eligible_steps;
+    const std::string wave_router_mode_receipt =
+        "  \"wave_moe_router_topk\": " + std::string(options.wave_moe_router_topk ? "true" : "false") + ",\n" +
+        "  \"wave_moe_router_topk_eligible_steps\": " + std::to_string(wave_eligible_steps) + ",\n" +
+        "  \"wave_moe_router_topk_fallback_steps\": " + std::to_string(wave_fallback_steps) + ",\n";
     const auto tensor_access = strix::compile_execution_tensor_access_plan(
         compiled.execution, manifest, tensor_index,
         strix::build_serial_execution_tensor_requirements(compiled.execution));
@@ -1157,6 +1170,10 @@ int main(
     auto experiment_owner = std::make_shared<HipDecodeExperimentResources>(
         mapped_owner, model_owner, allocator_owner, memory_owner, manifest, tensor_access, state_layout);
     if (graph_mode) resources = experiment_owner->resources;
+    if(wave_router_admission) {
+        resources.model_manifest = &wave_router_admission->manifest();
+        experiment_owner->resources.model_manifest = &wave_router_admission->manifest();
+    }
     std::shared_ptr<strix::integer_projection::HipIntegerRuntimeAllocationOwner> arena_pin, weight_pin;
     std::shared_ptr<strix::integer_projection::HipIntegerProjectionRuntimeBundle> integer_bundle;
     if (integer_config) {

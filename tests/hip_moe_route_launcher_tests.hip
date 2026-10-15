@@ -5,6 +5,7 @@
 #include "strix/execution_resources.hpp"
 #include "strix/execution_tensor_access.hpp"
 #include "strix/hip_moe_route_launcher.hpp"
+#include "strix/wave_router_contract.hpp"
 #include "strix/hip_launch_context.hpp"
 #include "strix/model_contract.hpp"
 #include "strix/model_manifest.hpp"
@@ -900,6 +901,7 @@ void run_case(
         strix::model_manifest_layout_identity(
             manifest);
 
+    const auto wave_admission = strix::WaveRouterManifestAdmission::create(manifest);
     strix::ModelRuntimeBinding runtime;
     runtime.manifest_layout_identity =
         manifest.layout_identity;
@@ -934,7 +936,7 @@ void run_case(
     resources.scratch =
         &memory;
     resources.model_manifest =
-        &manifest;
+        &wave_admission->manifest();
     resources.model_weights =
         &runtime;
     resources.tensor_access =
@@ -963,6 +965,7 @@ void run_case(
     config.activation =
         activation;
     config.normalize_selected = normalize_selected;
+    config.wave_manifest_admission = wave_admission;
     if (wave_only) {
         config.parallel_projection = true; config.wave_topk = true;
         context.temporaries = step_io.temporaries;
@@ -1025,6 +1028,22 @@ void run_case(
     }
 
     if (wave_only) {
+        if(experts==33 && injected_logits==1 && normalize_selected && activation==strix::HipActivationStorage::bf16) {
+            auto forged = manifest; // Same declared layout identity, changed names/content.
+            strix::ManifestTensor bias;bias.name="blk.0.exp_probs_b.bias";forged.tensors.push_back(bias);
+            resources.model_manifest=&forged;
+            check(hipMemset(reinterpret_cast<void*>(indices_address.address),0xa5,indices_address.bytes),"poison rejected wave bias indices");
+            check(hipMemset(reinterpret_cast<void*>(weights_address.address),0xa5,weights_address.bytes),"poison rejected wave bias weights");
+            bool rejected=false;try{launcher.function(context,launcher.user_data);}catch(const std::invalid_argument&){rejected=true;}
+            expect(rejected,"wave launcher rejects mutable bias manifest even with a reused layout identity");
+            std::vector<std::uint32_t> rejected_indices(actual_indices.size()),rejected_weights(actual_weights.size());
+            check(hipMemcpy(rejected_indices.data(),reinterpret_cast<void*>(indices_address.address),rejected_indices.size()*4,hipMemcpyDeviceToHost),"read rejected wave bias indices");
+            check(hipMemcpy(rejected_weights.data(),reinterpret_cast<void*>(weights_address.address),rejected_weights.size()*4,hipMemcpyDeviceToHost),"read rejected wave bias weights");
+            expect(std::all_of(rejected_indices.begin(),rejected_indices.end(),[](auto x){return x==0xa5a5a5a5U;}) &&
+                   std::all_of(rejected_weights.begin(),rejected_weights.end(),[](auto x){return x==0xa5a5a5a5U;}),
+                   "rejected wave bias leaves every poisoned destination untouched");
+            resources.model_manifest=&wave_admission->manifest();
+        }
         const auto work = strix::resolve_execution_buffer(memory.execution_identity, arena, memory, context.temporaries.front());
         // Fresh reference destinations, and actual projection logits from the production launcher.
         check(hipMemset(reinterpret_cast<void*>(indices_address.address), 0xff, indices_address.bytes), "poison insertion32 indices");
@@ -1040,6 +1059,45 @@ void run_case(
         check(hipMemcpy(reference_weights.data(), reinterpret_cast<void*>(weights_address.address), reference_weights.size()*4, hipMemcpyDeviceToHost), "read insertion32 weights");
         expect(reference_indices == actual_indices && std::memcmp(reference_weights.data(), actual_weights.data(), actual_weights.size()*4)==0,
                "wave32 eager matches independent device insertion oracle bits including NaNs");
+        if(top_k<=16U) {
+            // Actual production kernels remain the independent oracle for the
+            // injected adversarial states, not only the fixture-local extension.
+            for(unsigned mode=0;mode<3;++mode) {
+                auto production_config=config;production_config.wave_topk=false;
+                production_config.parallel_projection=mode!=0;production_config.ranked_topk=mode==2;
+                auto production_context=context;
+                if(mode==0)production_context.temporaries={};
+                auto production_launcher=strix::make_hip_moe_route_launcher("test.production.router",&production_config);
+                const auto poison=[&](hipStream_t stream) {
+                    check(hipMemsetAsync(reinterpret_cast<void*>(work.address),0xff,work.bytes,stream),"poison injected production workspace");
+                    check(hipMemsetAsync(reinterpret_cast<void*>(indices_address.address),0xff,indices_address.bytes,stream),"poison injected production indices");
+                    check(hipMemsetAsync(reinterpret_cast<void*>(weights_address.address),0xff,weights_address.bytes,stream),"poison injected production weights");
+                };
+                const auto compare=[&] {
+                    check(hipMemcpy(actual_indices.data(),reinterpret_cast<void*>(indices_address.address),actual_indices.size()*4,hipMemcpyDeviceToHost),"read injected production indices");
+                    check(hipMemcpy(actual_weights.data(),reinterpret_cast<void*>(weights_address.address),actual_weights.size()*4,hipMemcpyDeviceToHost),"read injected production weights");
+                    expect(actual_indices==reference_indices && std::memcmp(actual_weights.data(),reference_weights.data(),actual_weights.size()*4)==0,
+                           "injected wave result matches production default/parallel/ranked weight bits including NaNs");
+                };
+                poison(hipStreamLegacy);production_launcher.function(production_context,production_launcher.user_data);
+                check(hipDeviceSynchronize(),"complete injected production eager");compare();
+                hipStream_t oracle_stream=nullptr;hipGraph_t oracle_graph=nullptr;hipGraphExec_t oracle_exec=nullptr;
+                check(hipStreamCreateWithFlags(&oracle_stream,hipStreamNonBlocking),"create injected production stream");
+                strix::HipLaunchContext oracle_scope;oracle_scope.stream=oracle_stream;
+                { strix::HipLaunchScope scope(oracle_scope);
+                  check(hipStreamBeginCapture(oracle_stream,hipStreamCaptureModeThreadLocal),"capture injected production");
+                  production_launcher.function(production_context,production_launcher.user_data);
+                  check(hipStreamEndCapture(oracle_stream,&oracle_graph),"end injected production capture"); }
+                std::size_t oracle_nodes=0;check(hipGraphGetNodes(oracle_graph,nullptr,&oracle_nodes),"count injected production nodes");
+                expect(oracle_nodes==(mode==0?1U:2U),"injected production capture contains its exact kernel topology");
+                check(hipGraphInstantiate(&oracle_exec,oracle_graph,nullptr,nullptr,0),"instantiate injected production");
+                poison(oracle_stream);check(hipGraphLaunch(oracle_exec,oracle_stream),"replay injected production");
+                check(hipStreamSynchronize(oracle_stream),"complete injected production replay");compare();
+                check(hipGraphExecDestroy(oracle_exec),"destroy injected production exec");
+                check(hipGraphDestroy(oracle_graph),"destroy injected production graph");
+                check(hipStreamDestroy(oracle_stream),"destroy injected production stream");
+            }
+        }
         hipStream_t wave_stream = nullptr; hipGraph_t wave_graph = nullptr; hipGraphExec_t wave_exec = nullptr;
         check(hipStreamCreateWithFlags(&wave_stream, hipStreamNonBlocking), "wave32 stream");
         strix::HipLaunchContext scope_context; scope_context.stream = wave_stream;
@@ -1634,6 +1692,9 @@ void test_catalog_and_bundle() {
     expect_preflight_rejected(ranked_bundle, parallel_compiled, "compiled kernel binding");
     expect_preflight_rejected(parallel_bundle, ranked_compiled, "compiled kernel binding");
     auto wave_config = parallel_config; wave_config.wave_topk = true;
+    strix::ModelManifest fixture_manifest;
+    fixture_manifest.layout_identity = strix::model_manifest_layout_identity(fixture_manifest);
+    wave_config.wave_manifest_admission = strix::WaveRouterManifestAdmission::create(fixture_manifest);
     auto wave_request = parallel_request; wave_request.wave_moe_router_topk = true;
     strix::kernels::KernelRegistry wave_kernels;
     strix::register_hip_moe_route_kernel_variant(model,wave_request,wave_config,wave_kernels);

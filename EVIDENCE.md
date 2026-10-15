@@ -69,20 +69,9 @@ permitidos son: **observado**, **publicado**, **inferido**, **hipótesis** y
 
 | E-049 | publicado | AMD especifica 2 puertos USB4 nativos de 40 Gbps en Ryzen AI Max+ 395/Strix Halo. La especificación de producto no demuestra independencia de routers/upstream ni 80 Gbps agregados sostenidos. | AMD Ryzen AI Max+ 395 product specification, consultada 2026-10-01. | Diseñar dos enlaces físicos como recursos separados y exigir prueba simultánea antes de habilitar striping/agregación. |
 
+| E-050 | observado (host) | Experimental wave top-k: 6,864 independent insertion/wave bit cases plus slot/admission mutants; WSL GNU 13.3 Release HIP-OFF build and 152/152 CTest cases passed. | Project source `src/hip_moe_route_launcher.hip`, `tests/router_wave_topk_tests.cpp`, implementation document; `cmake --build /mnt/d/tmp/build-spec-v1-router-host -j 8`; `ctest --test-dir /mnt/d/tmp/build-spec-v1-router-host --output-on-failure --no-tests=error -j 8`. | Supports portable order/admission contracts only. Actual revised-source HIP compile, ISA/FP-mode and old-kernel preservation, device fixtures, 554 arrays/512 IDs and paired timing remain independent gates. OFF by default. |
+
 ## Regla para nuevas entradas
-
-### Experimental wave router selection, 2026-10-15
-
-Project-owned implementation and tests are recorded in
-`docs/implementation-2026-10-15-wave-router-topk.md`,
-`src/hip_moe_route_launcher.hip`, and `tests/router_wave_topk_tests.cpp`.
-Validation: WSL GNU13.3, Ninja, CMake Release, HIP runtime OFF;
-`cmake --build /mnt/d/tmp/build-spec-v1-router-host -j 8` and
-`ctest --test-dir /mnt/d/tmp/build-spec-v1-router-host --output-on-failure --no-tests=error -j 8`
-passed152/152 tests. The host wave/insertion oracle covers6864 bit comparisons
-plus duplicate/gap mutants and admission negatives. Device fixture source is
-supplied; no HIP build, target execution, ISA qualification, complete-model
-fidelity or timing result is implied. The option remains experimental and OFF.
 
 Cada evidencia nueva debe incluir identidad del artefacto, comando o prueba,
 condiciones del entorno y el requisito de la spec al que afecta. Si una medida
