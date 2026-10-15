@@ -101,7 +101,8 @@ embedding_config(
 HipHyperMixLauncherConfig
 hyper_mix_config(
     const ModelContract& model,
-    HipActivationStorage activation, bool parallel, bool staged, bool fused, bool typed, bool prefetch_rows, bool prefetch_output, bool lane_chain) {
+    HipActivationStorage activation, bool parallel, bool staged, bool fused, bool typed, bool prefetch_rows, bool prefetch_output, bool lane_chain,
+    bool splitk, bool splitk_fp64) {
     HipHyperMixLauncherConfig config;
     config.hidden_size =
         checked_u32(
@@ -127,6 +128,8 @@ hyper_mix_config(
     config.prefetch_rows = prefetch_rows;
     config.prefetch_q8_output = prefetch_output;
     config.lane_chain_output = lane_chain;
+    config.splitk_projection = splitk;
+    config.splitk_projection_fp64 = splitk_fp64;
     return config;
 }
 
@@ -348,7 +351,8 @@ void register_complete_hip_kernel_catalog(
     auto hyper_mix =
         hyper_mix_config(
             model,
-            config.activation, config.parallel_hyper_mix, config.staged_hyper_projections, config.fused_staged_hyper_mix, config.typed_hyper_projection, config.prefetch_typed_hyper_rows, config.prefetch_q8_hyper_output, config.lane_chain_hyper_output);
+            config.activation, config.parallel_hyper_mix, config.staged_hyper_projections, config.fused_staged_hyper_mix, config.typed_hyper_projection, config.prefetch_typed_hyper_rows, config.prefetch_q8_hyper_output, config.lane_chain_hyper_output,
+            config.splitk_hyper_projection, config.splitk_hyper_projection_fp64);
     register_hip_hyper_mix_kernel_variant(
         model,
         request,
@@ -432,7 +436,8 @@ HipLauncherCatalog::HipLauncherCatalog(
       hyper_mix_(
           hyper_mix_config(
               model,
-              config.activation, config.parallel_hyper_mix, config.staged_hyper_projections, config.fused_staged_hyper_mix, config.typed_hyper_projection, config.prefetch_typed_hyper_rows, config.prefetch_q8_hyper_output, config.lane_chain_hyper_output)),
+              config.activation, config.parallel_hyper_mix, config.staged_hyper_projections, config.fused_staged_hyper_mix, config.typed_hyper_projection, config.prefetch_typed_hyper_rows, config.prefetch_q8_hyper_output, config.lane_chain_hyper_output,
+              config.splitk_hyper_projection, config.splitk_hyper_projection_fp64)),
       moe_route_(
           moe_route_config(
               model,

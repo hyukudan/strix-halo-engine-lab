@@ -1002,6 +1002,9 @@ int main(
             metadata.numerical_identity += ";" + std::string(strix::moe_q4k_a8::runtime_numerical_identity);
         if(options.grouped_exact_q51_down)
             metadata.numerical_identity += ";" + std::string(strix::moe_q4k_a8::grouped_q51_raw_identity);
+        if (catalog_config.splitk_hyper_projection)
+            metadata.numerical_identity += ";" + std::string(catalog_config.splitk_hyper_projection_fp64
+                ? strix::splitk_hc_fp64_numerical_identity : strix::splitk_hc_fp32_numerical_identity);
         strix::RawBaselinePolicy policy;
         policy.maximum_bytes = options.raw_maximum_bytes;
         policy.maximum_steps = options.tokens.size();

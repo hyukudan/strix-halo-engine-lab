@@ -28,6 +28,8 @@ struct HipLauncherCatalogConfig {
     bool prefetch_typed_hyper_rows = false;
     bool prefetch_q8_hyper_output = false;
     bool lane_chain_hyper_output = false;
+    bool splitk_hyper_projection = false;
+    bool splitk_hyper_projection_fp64 = false;
     bool virtual_q8_lm_head = false;
     bool parallel_moe_router = false;
     bool virtual_q8_gdn_input = false;

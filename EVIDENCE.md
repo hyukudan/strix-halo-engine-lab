@@ -1,5 +1,11 @@
 # Registro de evidencias
 
+Parallel HC projection diagnostic: source prototype with a distinct reassociated
+FP32 numerical identity; see `docs/implementation-2026-10-15-parallel-hc-projection.md`.
+The portable FP64 oracle passes strict GNU C++20 tests, including all 65536 half
+bit patterns and independent indexing/cancellation controls. HIP compilation,
+native execution, model quality and workload performance remain pending.
+
 Este archivo es la fuente de trazabilidad de la especificación. Los estados
 permitidos son: **observado**, **publicado**, **inferido**, **hipótesis** y
 **pendiente**.

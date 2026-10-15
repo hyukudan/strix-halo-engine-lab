@@ -1,0 +1,79 @@
+// Included by the standalone HIP diagnostic, inside its anonymous namespace.
+// This path does not participate in application dispatch or model inference.
+
+struct CaptureOptions { std::filesystem::path model,index,output; };
+CaptureOptions capture_options(int argc,char** argv){
+    CaptureOptions o;std::set<std::string> seen;
+    for(int i=2;i<argc;i+=2){require(i+1<argc,"missing capture qualifier option value");const std::string k=argv[i];require(seen.insert(k).second,"duplicate capture qualifier option");
+        if(k=="--model")o.model=argv[i+1];else if(k=="--capture-index")o.index=argv[i+1];else if(k=="--output")o.output=argv[i+1];else require(false,"unknown capture qualifier option");}
+    require(!o.model.empty()&&!o.index.empty()&&!o.output.empty()&&!std::filesystem::exists(o.output)&&!std::filesystem::is_symlink(o.output),"need model, capture index and new output");return o;
+}
+struct CapturedProjection { unsigned position,layer;std::string op;std::unique_ptr<Fixture> fixture;double serial_max_abs,candidate_max_abs;std::uint64_t serial_max_ulp,candidate_max_ulp;std::vector<float> original_reference,original_candidate; };
+std::string capture_key(unsigned position,const std::string& op,unsigned layer){return std::to_string(position)+":"+op+":"+std::to_string(layer);}
+unsigned capture_uint(const std::string& s){require(!s.empty()&&std::all_of(s.begin(),s.end(),[](char c){return c>='0'&&c<='9';}),"invalid capture integer");auto v=std::stoul(s);require(v<=1000,"capture integer outside contract");return static_cast<unsigned>(v);}
+std::vector<std::byte> capture_payload(const std::filesystem::path& parent,const std::string& name,const std::string& sha,std::size_t size){
+    require(!name.empty()&&name!="."&&name!=".."&&std::all_of(name.begin(),name.end(),[](char c){return(c>='a'&&c<='z')||(c>='A'&&c<='Z')||(c>='0'&&c<='9')||c=='_'||c=='-'||c=='.';}),"unsafe capture basename");
+    require(sha.size()==64&&std::all_of(sha.begin(),sha.end(),[](char c){return(c>='0'&&c<='9')||(c>='a'&&c<='f');}),"invalid capture digest");
+    const auto path=parent/name;require(!std::filesystem::is_symlink(path),"capture payload symlink");auto data=file_bytes(path);require(data.size()==size&&digest(data)==sha,"capture payload extent/hash mismatch");return data;
+}
+std::vector<CapturedProjection> load_captures(const CaptureOptions& o,NumericalSummary& numerical){
+    const auto info=strix::gguf::read_file(o.model);std::ifstream index(o.index);require(index.good(),"open capture index");std::string line;require(static_cast<bool>(std::getline(index,line))&&line=="strix-hc-capture165-v1","capture index version");
+    std::set<std::string> expected;
+    constexpr std::array<unsigned,8> selected{0,1,2,3,23,24,46,47};
+    for(unsigned position:{0U,42U,43U,52U,61U}){for(auto layer:selected)for(const std::string op:{"attn","ffn"})expected.insert(capture_key(position,op,layer));expected.insert(capture_key(position,"output",48));}
+    for(unsigned layer=0;layer<48;++layer)for(const std::string op:{"attn","ffn"})expected.insert(capture_key(61,op,layer));
+    require(expected.size()==165,"internal capture selection count");std::vector<CapturedProjection> cases;std::set<std::string> seen;
+    while(std::getline(index,line)){
+        require(!line.empty()&&line.back()!='\r',"empty or noncanonical capture line");std::vector<std::string> columns;std::size_t start=0;
+        for(;;){auto end=line.find('\t',start);columns.push_back(line.substr(start,end==std::string::npos?end:end-start));if(end==std::string::npos)break;start=end+1;}
+        require(columns.size()==11,"capture index column count");const auto position=capture_uint(columns[0]),layer=capture_uint(columns[2]);const auto& op=columns[1];const auto key=capture_key(position,op,layer);require(expected.contains(key)&&seen.insert(key).second,"unexpected or duplicate capture case");
+        const bool output=op=="output";const auto prefix=output?std::string("output_hc"):"blk."+std::to_string(layer)+".hc_"+op;
+        require(columns[9]==prefix+"_down.weight"&&columns[10]==(output?"-":prefix+"_inject.weight"),"capture tensor names differ from binding");
+        auto normalized=capture_payload(o.index.parent_path(),columns[3],columns[6],40960);auto low=capture_payload(o.index.parent_path(),columns[4],columns[7],1280);std::vector<std::byte> injection_output;
+        if(output)require(columns[5]=="-"&&columns[8]=="-","output HC cannot have injection");else injection_output=capture_payload(o.index.parent_path(),columns[5],columns[8],16);
+        auto down=tensor(o.model,info,columns[9],8,{10240,320});std::vector<float> x(10240),iw;std::memcpy(x.data(),normalized.data(),normalized.size());require(std::all_of(x.begin(),x.end(),[](float v){return std::isfinite(v);}),"nonfinite captured normalized input");
+        if(!output){auto injection=tensor(o.model,info,columns[10],0,{10240,4});iw.resize(40960);std::memcpy(iw.data(),injection.data.data(),injection.data.size());}
+        auto f=std::make_unique<Fixture>(Shape{10240,4,320,1},std::move(x),std::move(down.data),std::move(iw));f->poison(false);f->reference();check(hipDeviceSynchronize(),"drain captured reference reproduction");auto reference=f->semantic(false);std::vector<std::byte> captured=std::move(low);captured.insert(captured.end(),injection_output.begin(),injection_output.end());require(digest(bytes(reference))==digest(captured),"native reference does not reproduce captured low/injection bits");f->guards(false);
+        const auto oracle_values=f->all_expected();require(std::all_of(oracle_values.begin(),oracle_values.end(),[](const auto& e){return std::isfinite(e.dot)&&std::isfinite(e.sum_abs)&&std::isfinite(e.postactivation);}),"real capture has nonfinite oracle arithmetic");
+        native_case(*f,numerical,false);
+        require(f->readonly_hashes[0]==columns[6],"restored captured input differs from capture index");f->readonly();
+        f->poison(true);f->launch(variants[0]);check(hipDeviceSynchronize(),"drain original-input diagnostic");
+        const auto restored=f->semantic(true);validate(*f,restored,reference,variants[0],numerical);f->guards(true);
+        const auto diagnostic=oracle::compare_pair(reference,restored,oracle_values);
+        cases.push_back({position,layer,op,std::move(f),diagnostic.serial.max_absolute,diagnostic.candidate.max_absolute,diagnostic.serial.max_ulp,diagnostic.candidate.max_ulp,std::move(reference),restored});
+    }
+    require(!index.bad()&&seen==expected&&cases.size()==165,"incomplete capture index");return cases;
+}
+struct CaptureTiming { std::vector<double> baseline,candidate,ratios; };
+double percentile(std::vector<double> values,double q){require(!values.empty(),"empty percentile");std::sort(values.begin(),values.end());const double at=q*static_cast<double>(values.size()-1);const auto i=static_cast<std::size_t>(at);return values[i]+(values[std::min(i+1,values.size()-1)]-values[i])*(at-static_cast<double>(i));}
+void qualify_capture(const CaptureOptions& o){
+    int device=0;check(hipGetDevice(&device),"capture qualifier device");hipDeviceProp_t properties{};check(hipGetDeviceProperties(&properties,device),"capture qualifier properties");require(properties.warpSize==32&&std::string(properties.gcnArchName).starts_with("gfx1151"),"capture qualifier requires gfx1151 wave32");
+    const auto runtime=libraries();const auto exe=std::filesystem::canonical("/proc/self/exe");const auto exe_sha=digest(file_bytes(exe)),index_sha=digest(file_bytes(o.index));NumericalSummary numerical;auto cases=load_captures(o,numerical);
+    std::vector<Fixture*> anchor;for(unsigned layer=0;layer<48;++layer)for(const std::string op:{"attn","ffn"}){auto it=std::find_if(cases.begin(),cases.end(),[&](const auto& c){return c.position==61&&c.layer==layer&&c.op==op;});require(it!=cases.end(),"missing graph anchor binding");anchor.push_back(it->fixture.get());}
+    auto last=std::find_if(cases.begin(),cases.end(),[](const auto& c){return c.position==61&&c.op=="output";});require(last!=cases.end(),"missing final HC anchor");anchor.push_back(last->fixture.get());require(anchor.size()==97,"graph anchor count");
+    constexpr std::uint64_t graph_bytes=353443840;std::uint64_t actual_bytes=0;for(auto* f:anchor)actual_bytes+=f->weights.size()+f->inject.size()*sizeof(float);require(actual_bytes==graph_bytes,"actual graph tensor-byte ledger differs");
+    require(!std::filesystem::exists(o.output)&&!std::filesystem::is_symlink(o.output),"qualifier output became occupied");std::ofstream out(o.output);require(out.good(),"open qualifier receipt");out<<std::setprecision(17)<<"{\"schema\":\"private-hc-capture165-m97-v1\",\"numerical_identity\":\"hc-down-splitk16x640-r40-fp32-v1\",\"capture_cases\":165,\"anchor_position\":61,\"graph_calls\":97,\"graph_logical_weight_bytes\":"<<graph_bytes<<",\"capture_index_sha256\":"<<quote(index_sha)<<",\"executable_sha256\":"<<quote(exe_sha)<<",\"N1_max_fraction\":"<<numerical.max_dot_bound_fraction<<",\"N2_max_fraction\":"<<numerical.max_candidate_bound_fraction<<",\"N3_max_fraction\":"<<numerical.max_epilogue_c_fraction<<",\"native_reproduction_all_exact\":true,\"N5_all_cases_passed\":true,\"host_query_asymmetry\":\"Eager candidate includes device/property queries; graph replay excludes capture-time queries\",\"schedule\":\"100 ABBA blocks; two matched A/B pairs per block; five warmup blocks\",\"samples\":[";
+    std::array<std::array<double,3>,3> speedups{};bool first=true;Stream stream;Events events;
+    for(unsigned variant=0;variant<3;++variant)for(unsigned mode=0;mode<3;++mode){
+        const bool graph_mode=mode!=0;std::vector<Fixture*> pool=mode==2?anchor:std::vector<Fixture*>{anchor.front()};const unsigned calls=mode==2?97U:16U;Graph base_graph,candidate_graph;std::vector<std::vector<float>> expected_base,expected_candidate;
+        for(auto* f:pool){f->poison(false,stream.value);f->reference(stream.value);f->poison(true,stream.value);f->launch(variants[variant],stream.value);}check(hipStreamSynchronize(stream.value),"drain qualifier preparation");
+        for(auto* f:pool){expected_base.push_back(f->semantic(false));expected_candidate.push_back(f->semantic(true));const auto original=std::find_if(cases.begin(),cases.end(),[&](const auto& c){return c.fixture.get()==f;});require(original!=cases.end()&&same(expected_base.back(),original->original_reference)&&same(expected_candidate.back(),original->original_candidate),"timed expectations differ from qualified captured-input outputs");}
+        if(graph_mode)for(bool candidate:{false,true}){auto& graph=candidate?candidate_graph:base_graph;check(hipStreamBeginCapture(stream.value,hipStreamCaptureModeThreadLocal),"begin M97 graph capture");try{for(unsigned i=0;i<calls;++i){auto* f=pool[i%pool.size()];if(candidate)f->launch(variants[variant],stream.value);else f->reference(stream.value);}}catch(...){static_cast<void>(hipStreamEndCapture(stream.value,&graph.graph));throw;}check(hipStreamEndCapture(stream.value,&graph.graph),"end M97 graph capture");check(hipGraphInstantiate(&graph.executable,graph.graph,nullptr,nullptr,0),"instantiate M97 graph");std::size_t nodes=0;check(hipGraphGetNodes(graph.graph,nullptr,&nodes),"count M97 graph nodes");require(nodes==calls*(candidate&&variant==2?2U:1U),"M97 graph call count differs");}
+        auto sample=[&](bool candidate){for(auto* f:pool)f->poison(candidate,stream.value);check(hipEventRecord(events.start,stream.value),"start M97 sample");if(graph_mode)check(hipGraphLaunch(candidate?candidate_graph.executable:base_graph.executable,stream.value),"launch M97 graph");else for(unsigned i=0;i<calls;++i){if(candidate)pool.front()->launch(variants[variant],stream.value);else pool.front()->reference(stream.value);}check(hipEventRecord(events.stop,stream.value),"stop M97 sample");check(hipEventSynchronize(events.stop),"drain M97 sample");float ms=0;check(hipEventElapsedTime(&ms,events.start,events.stop),"time M97 sample");require(std::isfinite(ms)&&ms>0,"invalid M97 duration");for(std::size_t i=0;i<pool.size();++i){require(same(pool[i]->semantic(candidate),candidate?expected_candidate[i]:expected_base[i]),"M97 sample final output differs");pool[i]->guards(candidate);}return static_cast<double>(ms)*1000.0/calls;};
+        for(unsigned warm=0;warm<5;++warm){for(bool candidate:{false,true,true,false})static_cast<void>(sample(candidate));}
+        CaptureTiming timing;
+        for(unsigned block=0;block<100;++block){const auto a0=sample(false),b0=sample(true),b1=sample(true),a1=sample(false);timing.baseline.insert(timing.baseline.end(),{a0,a1});timing.candidate.insert(timing.candidate.end(),{b0,b1});timing.ratios.insert(timing.ratios.end(),{a0/b0,a1/b1});}
+        speedups[variant][mode]=median(timing.ratios);for(auto* f:pool)f->readonly();out<<(first?"":",")<<"{\"variant\":"<<variant<<",\"mode\":"<<quote(mode==0?"eager-hot":mode==1?"graph-hot":"graph-rot97")<<",\"calls_per_sample\":"<<calls<<",\"pairs\":200,\"base_us\":";array(out,timing.baseline);out<<",\"candidate_us\":";array(out,timing.candidate);out<<",\"paired_speedup\":";array(out,timing.ratios);out<<",\"median_paired_speedup\":"<<speedups[variant][mode];
+        for(bool candidate:{false,true}){const auto& values=candidate?timing.candidate:timing.baseline;out<<",\""<<(candidate?"candidate":"base")<<"_median_us\":"<<median(values)<<",\""<<(candidate?"candidate":"base")<<"_p10_us\":"<<percentile(values,0.1)<<",\""<<(candidate?"candidate":"base")<<"_p90_us\":"<<percentile(values,0.9);}
+        const double per_call_bytes=mode==2?static_cast<double>(graph_bytes)/97.0:static_cast<double>(anchor.front()->weights.size()+anchor.front()->inject.size()*sizeof(float));out<<",\"candidate_logical_GBps\":"<<per_call_bytes/(median(timing.candidate)*1000.0)<<",\"sample_final_outputs_self_exact\":true}";first=false;out.flush();require(out.good(),"write M97 sample receipt");
+    }
+    // Primary gets first refusal; alternatives are considered only if it misses.
+    int selected=-1;bool marginal=false;const auto eligible=[&](unsigned v,double threshold){return speedups[v][2]>=threshold&&std::all_of(speedups[v].begin(),speedups[v].end(),[](double r){return r>=1.5;});};
+    if(eligible(0,2.0))selected=0;else{for(unsigned v=1;v<3;++v)if(eligible(v,2.0)&&(selected<0||speedups[v][2]>speedups[static_cast<unsigned>(selected)][2]))selected=static_cast<int>(v);}
+    if(selected<0){for(unsigned v=0;v<3;++v)if(eligible(v,1.5)&&(selected<0||speedups[v][2]>speedups[static_cast<unsigned>(selected)][2]))selected=static_cast<int>(v);marginal=selected>=0;}
+    for(auto& c:cases){c.fixture->readonly();}
+    require(libraries()==runtime&&digest(file_bytes(exe))==exe_sha&&digest(file_bytes(o.index))==index_sha,"qualifier runtime/executable/index changed");
+    out<<"],\"case_diagnostics\":[";bool first_case=true;for(const auto& c:cases){out<<(first_case?"":",")<<"{\"position\":"<<c.position<<",\"layer\":"<<c.layer<<",\"op\":"<<quote(c.op)<<",\"normalized_sha256\":"<<quote(digest(bytes(c.fixture->input)))<<",\"down_sha256\":"<<quote(digest(c.fixture->weights))<<",\"inject_sha256\":"<<quote(digest(bytes(c.fixture->inject)))<<",\"serial_max_abs\":"<<c.serial_max_abs<<",\"candidate_max_abs\":"<<c.candidate_max_abs<<",\"serial_max_ulp\":"<<c.serial_max_ulp<<",\"candidate_max_ulp\":"<<c.candidate_max_ulp<<'}';first_case=false;}
+    out<<"],\"loaded_core10_libraries\":[";for(std::size_t i=0;i<runtime.size();++i){const auto& lib=runtime[i];out<<(i?",":"")<<"{\"path\":"<<quote(lib.path)<<",\"sha256\":"<<quote(lib.sha)<<",\"bytes\":"<<lib.size<<'}';}
+    out<<"],\"selected_variant\":"<<selected<<",\"marginal\":"<<(marginal?"true":"false")<<",\"M97_gate_passed\":"<<(selected>=0?"true":"false")<<",\"readonly_inputs_exact\":true,\"owner_guards_intact\":true,\"finished\":true,\"model_quality_qualified\":false}\n";require(out.good(),"finish M97 receipt");
+}
