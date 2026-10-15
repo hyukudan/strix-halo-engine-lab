@@ -941,6 +941,168 @@ int main() try {
         expect(read_status() == 4 && read_state() == previous, "nonfinite indexed input fails before state writes");
     }
 
+
+    // Full operator: changing finite inputs, original projection versus prefetch,
+    // independent poisoned destinations, actual eager and captured dispatches.
+    {
+        struct Q8Block {std::uint16_t scale; std::int8_t values[32];};
+        static_assert(sizeof(Q8Block)==34);
+        const std::array<unsigned,5> projection_indices{0,1,2,6,7};
+        const auto temporary = strix::resolve_execution_buffer(scratch.execution_identity,
+            arena,scratch,step_io.temporaries[0]);
+        hipStream_t stream=nullptr;
+        check(hipStreamCreateWithFlags(&stream,hipStreamNonBlocking),"create QSA comparison stream");
+        void* arguments=nullptr; void* status=nullptr;
+        check(hipMalloc(&arguments,16),"QSA comparison arguments");
+        check(hipMalloc(&status,4),"QSA comparison status");
+        context.execution_identity=scratch.execution_identity;
+        strix::HipLaunchContext scope;
+        scope.stream=stream;
+        scope.arguments=strix::bind_graph_inputs(strix::graph_input_layout(1),
+            {scratch.execution_identity,reinterpret_cast<std::uintptr_t>(arguments),16,1});
+        scope.status={scratch.execution_identity,reinterpret_cast<std::uintptr_t>(status),4,1};
+        scope.context_tokens=context_tokens;
+        scope.vocabulary_size=static_cast<std::uint32_t>(model.vocab_size);
+        const auto read_bytes=[&](std::uintptr_t address,std::uint64_t bytes){
+            std::vector<std::byte> result(bytes);
+            check(hipMemcpy(result.data(),reinterpret_cast<void*>(address),bytes,hipMemcpyDeviceToHost),
+                  "read full QSA comparison bytes");return result;};
+        const auto reset=[&](unsigned replay){
+            check(hipMemset(reinterpret_cast<void*>(output.address),0xa5,output.bytes),"poison QSA output");
+            check(hipMemset(reinterpret_cast<void*>(temporary.address),0xff,temporary.bytes),"poison QSA workspace");
+            check(hipMemset(device_state,0xa5,state_layout.device_total_bytes),"poison QSA KV/raw");
+            for(unsigned f=0;f<hidden.size();++f)hidden[f]=float_to_bf16(
+                static_cast<float>(static_cast<int>((f+replay*7U)%23U)-11)/29.0F);
+            check(hipMemcpy(reinterpret_cast<void*>(input.address),hidden.data(),hidden.size()*2,
+                            hipMemcpyHostToDevice),"set QSA comparison input");
+            std::array<std::byte,16> packet{};std::uint32_t zero=0;
+            check(hipMemcpy(arguments,packet.data(),16,hipMemcpyHostToDevice),"set QSA comparison position");
+            check(hipMemcpy(status,&zero,4,hipMemcpyHostToDevice),"clear QSA comparison status");
+        };
+        for(unsigned mixed=0;mixed<2;++mixed){
+            for(const auto index:projection_indices){
+                auto& tensor=manifest.tensors[index];
+                const auto elements=tensor.dimensions[0]*tensor.dimensions[1];
+                tensor.ggml_type=8;
+                std::vector<Q8Block> blocks(elements/32);
+                for(std::size_t b=0;b<blocks.size();++b){blocks[b].scale=0x2400;
+                    for(unsigned f=0;f<32;++f)blocks[b].values[f]=static_cast<std::int8_t>(
+                        static_cast<int>((b*5+f*3+index)%31U)-15);}
+                tensor.byte_size=blocks.size()*sizeof(Q8Block);
+                check(hipMemcpy(device_weights[index],blocks.data(),tensor.byte_size,hipMemcpyHostToDevice),
+                      "set full QSA Q8 projection");
+                if(mixed && index==7){
+                    tensor.ggml_type=30;
+                    std::vector<std::uint16_t> bf16(elements);
+                    for(std::size_t f=0;f<bf16.size();++f)
+                        bf16[f]=float_to_bf16(static_cast<float>(blocks[f/32].values[f%32])/64.0F);
+                    tensor.byte_size=bf16.size()*2;
+                    check(hipMemcpy(device_weights[index],bf16.data(),tensor.byte_size,hipMemcpyHostToDevice),
+                          "set full QSA BF16 projection fallback");
+                }
+                runtime.tensors[index].bytes=tensor.byte_size;
+            }
+            manifest.layout_identity=strix::model_manifest_layout_identity(manifest);
+            runtime.manifest_layout_identity=manifest.layout_identity;
+            access.manifest_layout_identity=manifest.layout_identity;
+            auto off_config=config;off_config.enable_device_graph_inputs=true;
+            auto on_config=off_config;on_config.prefetch_q8_input=true;
+            on_config.prefetch_eligible_layers={layer};
+            on_config.prefetch_stats=std::make_shared<strix::qsa_input_prefetch::RuntimeDispatchStats>();
+            auto off_launch=strix::make_hip_indexed_attention_launcher("test.full.off",&off_config);
+            auto on_launch=strix::make_hip_indexed_attention_launcher("test.full.on",&on_config);
+            hipGraph_t graphs[2]{};hipGraphExec_t executables[2]{};
+            for(unsigned mode=0;mode<2;++mode){
+                auto& candidate=mode?on_launch:off_launch;
+                scope.graph_capture=true;context.position=std::numeric_limits<std::uint64_t>::max();
+                const auto before=on_config.prefetch_stats->dispatched_projections.load();
+                check(hipStreamBeginCapture(stream,hipStreamCaptureModeThreadLocal),"capture QSA ON/OFF");
+                try{const strix::HipLaunchScope owned(scope);candidate.function(context,candidate.user_data);}
+                catch(...){static_cast<void>(hipStreamEndCapture(stream,&graphs[mode]));throw;}
+                check(hipStreamEndCapture(stream,&graphs[mode]),"finish QSA ON/OFF capture");
+                std::size_t nodes_count=0;check(hipGraphGetNodes(graphs[mode],nullptr,&nodes_count),"QSA node count");
+                std::vector<hipGraphNode_t> nodes(nodes_count);
+                check(hipGraphGetNodes(graphs[mode],nodes.data(),&nodes_count),"QSA graph nodes");
+                unsigned wide_nodes=0;
+                for(auto node:nodes){hipGraphNodeType type;
+                    check(hipGraphNodeGetType(node,&type),"QSA node type");
+                    if(type==hipGraphNodeTypeKernel){hipKernelNodeParams params{};
+                        check(hipGraphKernelNodeGetParams(node,&params),"QSA kernel node params");
+                        if(params.blockDim.x==32)++wide_nodes;}}
+                expect(wide_nodes==(mode?5U-mixed:0U),"full QSA graph has exact candidate projection nodes");
+                expect(on_config.prefetch_stats->dispatched_projections.load()-before==(mode?5U-mixed:0U),
+                       "full QSA capture counter proves actual candidate submission");
+                check(hipGraphInstantiate(&executables[mode],graphs[mode],nullptr,nullptr,0),"instantiate QSA comparison");
+            }
+            for(unsigned replay=0;replay<3;++replay){
+                std::vector<std::byte> expected_output,expected_state,expected_workspace;
+                for(unsigned path=0;path<4;++path){
+                    reset(replay);scope.graph_capture=false;context.position=0;
+                    if(path<2){auto& candidate=path?on_launch:off_launch;
+                        const auto before=on_config.prefetch_stats->dispatched_projections.load();
+                        {const strix::HipLaunchScope owned(scope);candidate.function(context,candidate.user_data);}
+                        expect(on_config.prefetch_stats->dispatched_projections.load()-before==(path?5U-mixed:0U),
+                               "full QSA eager counter matches eligible projections");
+                    }else{const auto before=on_config.prefetch_stats->dispatched_projections.load();
+                        check(hipGraphLaunch(executables[path-2],stream),"replay QSA comparison");
+                        expect(on_config.prefetch_stats->dispatched_projections.load()==before,
+                               "QSA device replay does not inflate host capture count");}
+                    check(hipStreamSynchronize(stream),"complete QSA comparison");
+                    std::uint32_t actual_status=0;
+                    check(hipMemcpy(&actual_status,status,4,hipMemcpyDeviceToHost),"read QSA comparison status");
+                    expect(actual_status==0,"full QSA candidate completed with valid graph status");
+                    std::vector<std::uint16_t> finite_output(hidden_width);
+                    check(hipMemcpy(finite_output.data(),reinterpret_cast<void*>(output.address),
+                        hidden_width*2,hipMemcpyDeviceToHost),"read finite QSA comparison output");
+                    for(auto value:finite_output)expect(std::isfinite(bf16_to_float(value)),
+                        "full QSA comparison output is finite");
+                    const auto actual_output=read_bytes(output.address,output.bytes);
+                    const auto actual_state=read_bytes(state_memory.device_base,state_memory.device_bytes);
+                    const auto actual_workspace=read_bytes(temporary.address,temporary.bytes);
+                    if(path==0){expected_output=actual_output;expected_state=actual_state;expected_workspace=actual_workspace;}
+                    else expect(actual_output==expected_output && actual_state==expected_state &&
+                        actual_workspace==expected_workspace,"full QSA ON/OFF eager/graph output/KV/raw/workspace bit equality");
+                }
+            }
+            // Admission failures must enqueue nothing and leave every owner byte intact.
+            for(unsigned failure=0;failure<2;++failure){
+                reset(0);
+                const auto old_address=runtime.tensors[0].address;
+                auto bad_arena=arena;
+                if(failure==0){
+                    const auto* temp_allocation=strix::find_arena_allocation(arena,step_io.temporaries[0]);
+                    for(auto& allocation:bad_arena.allocations)
+                        if(allocation.use==step_io.writes[0])allocation.offset=temp_allocation->offset;
+                    context.arena=&bad_arena;
+                }else runtime.tensors[0].address+=2;
+                const auto before_arena=read_bytes(scratch.arena_base,scratch.arena_bytes);
+                const auto before_state=read_bytes(state_memory.device_base,state_memory.device_bytes);
+                const auto before_count=on_config.prefetch_stats->dispatched_projections.load();
+                hipGraph_t rejected_graph=nullptr;bool rejected=false;
+                scope.graph_capture=true;context.position=std::numeric_limits<std::uint64_t>::max();
+                check(hipStreamBeginCapture(stream,hipStreamCaptureModeThreadLocal),"capture rejected QSA preflight");
+                try{const strix::HipLaunchScope owned(scope);on_launch.function(context,on_launch.user_data);}
+                catch(const std::invalid_argument& error){rejected=std::string(error.what()).find(failure?
+                    "weight alignment/extent invalid":"owner overlap")!=std::string::npos;}
+                check(hipStreamEndCapture(stream,&rejected_graph),"end rejected QSA preflight");
+                std::size_t nodes=1;check(hipGraphGetNodes(rejected_graph,nullptr,&nodes),"rejected QSA nodes");
+                expect(rejected && nodes==0,"QSA preflight rejects precise cause with zero queued nodes");
+                expect(before_count==on_config.prefetch_stats->dispatched_projections.load() &&
+                    before_arena==read_bytes(scratch.arena_base,scratch.arena_bytes) &&
+                    before_state==read_bytes(state_memory.device_base,state_memory.device_bytes),
+                    "QSA preflight failure preserves all owners and dispatch count");
+                check(hipGraphDestroy(rejected_graph),"destroy rejected QSA graph");
+                runtime.tensors[0].address=old_address;context.arena=&arena;
+            }
+            for(unsigned mode=0;mode<2;++mode){
+                check(hipGraphExecDestroy(executables[mode]),"destroy QSA executable");
+                check(hipGraphDestroy(graphs[mode]),"destroy QSA graph");}
+        }
+        check(hipFree(arguments),"free QSA comparison arguments");
+        check(hipFree(status),"free QSA comparison status");
+        check(hipStreamDestroy(stream),"destroy QSA comparison stream");
+    }
+
     for (auto* pointer :
          device_weights) {
         check(

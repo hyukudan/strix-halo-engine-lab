@@ -1816,11 +1816,13 @@ void launch_linear_to_float(
     const ExecutionBufferAddress& input,
     std::uint32_t input_width,
     std::uint32_t output_width,
-    float* output, bool prefetch = false) {
+    float* output, bool prefetch = false, qsa_input_prefetch::RuntimeDispatchStats* stats = nullptr) {
     if(prefetch && qsa_input_prefetch::eligible(*tensor.manifest)){
         if(tensor.runtime->address%16U!=0 || tensor.manifest->absolute_offset%16U!=0 || tensor.runtime->bytes<qsa_input_prefetch::required_weight_bytes(input_width,output_width))throw std::invalid_argument("QSA prefetch launch weight alignment/extent invalid");
         hipLaunchKernelGGL(linear_prefetch8_q8_qsa_input_kernel,dim3(output_width),dim3(32),0,hip_execution_stream(),reinterpret_cast<const std::uint16_t*>(input.address),reinterpret_cast<const void*>(tensor.runtime->address),input_width,output_width,output);
-        check_hip(hipGetLastError(),"HIP indexed-attention prefetch8 Q8 input projection launch");return;
+        check_hip(hipGetLastError(),"HIP indexed-attention prefetch8 Q8 input projection launch");
+        if(stats)stats->dispatched_projections.fetch_add(1,std::memory_order_relaxed);
+        return;
     }
     switch (weight_kind(
                 tensor.manifest->
@@ -2432,13 +2434,13 @@ void launch_indexed_attention(
         input,
         hidden,
         index_q_width,
-        workspace.index_query, config.prefetch_q8_input);
+        workspace.index_query, config.prefetch_q8_input, config.prefetch_stats.get());
     launch_linear_to_float(
         tensors.index_k,
         input,
         hidden,
         index_dim,
-        workspace.current_index_key, config.prefetch_q8_input);
+        workspace.current_index_key, config.prefetch_q8_input, config.prefetch_stats.get());
 
     launch_norm_rope(
         workspace.index_query,
@@ -2561,19 +2563,19 @@ void launch_indexed_attention(
         input,
         hidden,
         q_gate_width,
-        workspace.q_gate, config.prefetch_q8_input);
+        workspace.q_gate, config.prefetch_q8_input, config.prefetch_stats.get());
     launch_linear_to_float(
         tensors.k,
         input,
         hidden,
         kv_width,
-        workspace.current_k, config.prefetch_q8_input);
+        workspace.current_k, config.prefetch_q8_input, config.prefetch_stats.get());
     launch_linear_to_float(
         tensors.v,
         input,
         hidden,
         kv_width,
-        workspace.current_v, config.prefetch_q8_input);
+        workspace.current_v, config.prefetch_q8_input, config.prefetch_stats.get());
 
     launch_norm_rope(
         workspace.q_gate,
@@ -2929,6 +2931,10 @@ register_for_compiled_execution(
             "HIP indexed-attention bundle requires valid compiled execution");
     }
 
+    if(config_.prefetch_q8_input && std::none_of(compiled.bindings.bindings.begin(),
+        compiled.bindings.bindings.end(),[](const auto& binding){return binding.op==SerialOp::indexed_attention &&
+            binding.kernel_id && binding.kernel_id->ends_with(qsa_input_prefetch::kernel_suffix);}))
+        throw std::invalid_argument("QSA prefetch bundle requires eligible bound step");
     ExecutionBindingRequest shape;shape.logical_rows=compiled.logical_rows;shape.request_concurrency=compiled.request_concurrency;shape.device_graph_inputs=compiled.device_graph_inputs;
     std::vector<std::string> registered;bool saw_prefetch=false;
     for(std::size_t i=0;i<compiled.execution.steps.size();++i){

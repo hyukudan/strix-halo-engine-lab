@@ -232,6 +232,7 @@ compile_speculative_verify_execution(
     }
 
     for (const auto& binding : compiled.bindings.bindings) {
+        // Defense for externally assembled bindings; current request admission rejects first.
         if(binding.op==SerialOp::indexed_attention && binding.kernel_id && binding.kernel_id->ends_with(qsa_input_prefetch::kernel_suffix))throw std::invalid_argument("QSA input prefetch runtime does not support speculative verify");
         if (binding.op == SerialOp::moe_route && binding.kernel_id.has_value() &&
             (binding.kernel_id->ends_with(".parallel") != buffer_request.parallel_moe_router ||

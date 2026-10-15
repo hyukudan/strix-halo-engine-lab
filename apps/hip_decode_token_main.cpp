@@ -976,14 +976,21 @@ int main(
     if(options.virtual_q8_gdn_output) strix::validate_virtual_q8_gdn_output_manifest(model,manifest);
     const auto qsa_prefetch_plan=options.prefetch_q8_qsa_input ? strix::qsa_input_prefetch::build_plan(model,manifest) : strix::qsa_input_prefetch::Plan{};
     std::string qsa_input_mode_receipt="  \"prefetch_q8_qsa_input\": "+std::string(options.prefetch_q8_qsa_input?"true":"false")+",\n";
-    qsa_input_mode_receipt+="  \"prefetch_q8_qsa_input_eligible_steps\": "+std::to_string(qsa_prefetch_plan.eligible_steps)+",\n";
-    qsa_input_mode_receipt+="  \"prefetch_q8_qsa_input_fallback_steps\": "+std::to_string(qsa_prefetch_plan.fallback_steps)+",\n";
-    qsa_input_mode_receipt+="  \"prefetch_q8_qsa_input_eligible_projections\": "+std::to_string(qsa_prefetch_plan.eligible_projections)+",\n";
-    qsa_input_mode_receipt+="  \"prefetch_q8_qsa_input_fallback_projections\": "+std::to_string(qsa_prefetch_plan.fallback_projections)+",\n";
-    qsa_input_mode_receipt+="  \"prefetch_q8_qsa_input_projection_choices\": [";
-    for(std::size_t i=0;i<qsa_prefetch_plan.projections.size();++i){const auto& choice=qsa_prefetch_plan.projections[i];if(i)qsa_input_mode_receipt+=",";qsa_input_mode_receipt+="{\"layer\":"+std::to_string(choice.layer)+",\"projection\":"+std::to_string(i%5U)+",\"kernel_id\":\""+std::string(choice.eligible?strix::qsa_input_prefetch::projection_prefetch_id:strix::qsa_input_prefetch::projection_base_id)+"\"}";}
-    qsa_input_mode_receipt+="],\n";
-    const std::string gdn_output_mode_receipt=(options.virtual_q8_gdn_output ? "  \"virtual_q8_gdn_output\": true,\n" : "")+qsa_input_mode_receipt;
+    if(options.prefetch_q8_qsa_input) qsa_input_mode_receipt+="  \"prefetch_q8_qsa_input_eligible_steps\": "+std::to_string(qsa_prefetch_plan.eligible_steps)+",\n";
+    if(options.prefetch_q8_qsa_input) qsa_input_mode_receipt+="  \"prefetch_q8_qsa_input_fallback_steps\": "+std::to_string(qsa_prefetch_plan.fallback_steps)+",\n";
+    if(options.prefetch_q8_qsa_input) qsa_input_mode_receipt+="  \"prefetch_q8_qsa_input_eligible_projections\": "+std::to_string(qsa_prefetch_plan.eligible_projections)+",\n";
+    if(options.prefetch_q8_qsa_input) qsa_input_mode_receipt+="  \"prefetch_q8_qsa_input_fallback_projections\": "+std::to_string(qsa_prefetch_plan.fallback_projections)+",\n";
+    if(options.prefetch_q8_qsa_input) qsa_input_mode_receipt+="  \"prefetch_q8_qsa_input_projection_choices\": [";
+    for(std::size_t i=0;i<qsa_prefetch_plan.projections.size();++i){const auto& choice=qsa_prefetch_plan.projections[i];if(i)qsa_input_mode_receipt+=",";qsa_input_mode_receipt+="{\"layer\":"+std::to_string(choice.layer)+",\"projection\":"+std::to_string(i%5U)+",\"tensor_name\":\""+choice.tensor_name+"\",\"projection_kernel\":\""+std::string(choice.eligible?strix::qsa_input_prefetch::projection_prefetch_id:strix::qsa_input_prefetch::projection_base_id)+"\"}";}
+    if(options.prefetch_q8_qsa_input) qsa_input_mode_receipt+="],\n";
+    const auto qsa_prefetch_stats=options.prefetch_q8_qsa_input ?
+        std::make_shared<strix::qsa_input_prefetch::RuntimeDispatchStats>() : nullptr;
+    const auto gdn_output_mode_receipt=[&] {
+        std::string receipt=(options.virtual_q8_gdn_output ? "  \"virtual_q8_gdn_output\": true,\n" : "")+qsa_input_mode_receipt;
+        if(qsa_prefetch_stats) receipt += "  \"prefetch_q8_qsa_input_dispatched_projections\": "+
+            std::to_string(qsa_prefetch_stats->dispatched_projections.load(std::memory_order_relaxed))+",\n";
+        return receipt;
+    };
     const auto original_work_device = std::make_shared<strix::HipSetupQuiescenceGuard>();
     auto target_architecture = original_work_device->architecture();
     if (const auto suffix = target_architecture.find(':'); suffix != std::string::npos)
@@ -1029,6 +1036,7 @@ int main(
     catalog_config.prefetch_q8_gdn_input = options.prefetch_q8_gdn_input;
     catalog_config.prefetch_q8_qsa_input=options.prefetch_q8_qsa_input;
     catalog_config.qsa_input_prefetch_layers=qsa_prefetch_plan.layers;
+    catalog_config.qsa_input_prefetch_stats=qsa_prefetch_stats;
     binding_request.prefetch_q8_qsa_input=options.prefetch_q8_qsa_input;
     binding_request.qsa_input_prefetch_layers=qsa_prefetch_plan.layers;
     catalog_config.virtual_q8_gdn_output = options.virtual_q8_gdn_output;
@@ -1086,6 +1094,7 @@ int main(
     const auto tensor_access = strix::compile_execution_tensor_access_plan(
         compiled.execution, manifest, tensor_index,
         strix::build_serial_execution_tensor_requirements(compiled.execution));
+    strix::qsa_input_prefetch::validate_tensor_access(qsa_prefetch_plan,manifest,compiled.execution,tensor_access);
 
     strix::SerialSessionStateLayoutRequest
         state_request;
@@ -1115,6 +1124,19 @@ int main(
     auto model_owner = std::make_shared<strix::HipModelResidency>(
         strix::HipModelResidency::create(mapped, manifest, generations, residency_policy));
     auto& model_residency = *model_owner;
+    // Admission of actual device views happens before any token can enqueue work.
+    for(const auto& projection:qsa_prefetch_plan.projections) {
+        if(!projection.eligible) continue;
+        const auto found=std::find_if(manifest.tensors.begin(),manifest.tensors.end(),
+            [&](const auto& tensor){return tensor.name==projection.tensor_name;});
+        if(found==manifest.tensors.end()) throw std::logic_error("QSA admitted tensor disappeared");
+        const auto index=static_cast<std::uint32_t>(found-manifest.tensors.begin());
+        const auto* runtime=strix::find_runtime_tensor_binding(model_residency.binding(),index);
+        const auto bytes=strix::qsa_input_prefetch::required_weight_bytes(found->dimensions[0],found->dimensions[1]);
+        if(!runtime || runtime->address==0 || runtime->address%16U!=0 || runtime->bytes<bytes)
+            throw std::invalid_argument("QSA prefetch resident weight alignment/extent invalid");
+    }
+
 
     if (reference.has_value() &&
         reference->model_content_identity !=
@@ -1535,7 +1557,7 @@ int main(
                     restore_start).count();
 
             std::cout
-                << "{\n" << gdn_output_mode_receipt << wave_router_mode_receipt
+                << "{\n" << gdn_output_mode_receipt() << wave_router_mode_receipt
                 << "  \"model_content_identity\": \""
                 << strix::model_content_identity_hex(
                        model_residency.binding().
@@ -1661,7 +1683,7 @@ int main(
             elapsed_total += value;
         }
 
-        std::cout << "{\n" << gdn_output_mode_receipt << wave_router_mode_receipt;
+        std::cout << "{\n" << gdn_output_mode_receipt() << wave_router_mode_receipt;
         emit_q4k_a8_receipt();
         emit_q4k_a8_counts();
         std::cout
@@ -1761,7 +1783,7 @@ int main(
             reference->steps.size());
     }
 
-    std::cout << '{' << '\n' << gdn_output_mode_receipt << wave_router_mode_receipt;
+    std::cout << '{' << '\n' << gdn_output_mode_receipt() << wave_router_mode_receipt;
     emit_q4k_a8_receipt();
     std::cout << "  \"model_content_identity\": \""
               << strix::model_content_identity_hex(

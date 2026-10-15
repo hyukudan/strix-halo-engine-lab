@@ -1,6 +1,7 @@
 #include "strix/compiled_execution.hpp"
 #include "strix/compiled_speculative_verify.hpp"
 #include "strix/qsa_input_prefetch.hpp"
+#include <algorithm>
 #include <array>
 #include <iostream>
 #include <set>
@@ -14,11 +15,12 @@ void expect(bool ok, const char *m) {
         std::cerr << m << '\n';
     }
 }
-template <class F> void rejects(F f) {
+template <class F> void rejects(F f, const char *message) {
     try {
         f();
         expect(false, "expected invalid_argument");
-    } catch (const std::invalid_argument &) {
+    } catch (const std::invalid_argument &e) {
+        expect(std::string(e.what()).find(message) != std::string::npos, e.what());
     }
 }
 ModelManifest manifest(const ModelContract &m, bool q8 = true) {
@@ -34,6 +36,7 @@ ModelManifest manifest(const ModelContract &m, bool q8 = true) {
                 ManifestTensor t;
                 t.name = "blk." + std::to_string(layer) + "." + names[i];
                 t.layer = layer;
+                t.role = i < 3 ? TensorRole::attention_projection : TensorRole::sparse_index;
                 t.dimensions = {m.hidden_size, outputs[i]};
                 t.ggml_type = q8 ? 8U : 0U;
                 t.absolute_offset = 0x1000;
@@ -84,7 +87,34 @@ int main() {
     auto tensors = manifest(m);
     auto p = qsa_input_prefetch::build_plan(m, tensors);
     expect(p.layers.size() == 12 && p.eligible_projections == 60 && p.fallback_projections == 0,
-           "canonical complete plan");
+           "synthetic all-Q8 complete plan");
+    auto mixed_types = manifest(m);
+    for (auto &t : mixed_types.tensors)
+        if (t.name.find("indexer.") != std::string::npos) {
+            t.ggml_type = 30U;
+            t.byte_size = t.dimensions[0] * t.dimensions[1] * 2U;
+        }
+    const auto real_types = qsa_input_prefetch::build_plan(m, mixed_types);
+    expect(real_types.eligible_projections == 36 && real_types.fallback_projections == 24 &&
+               real_types.eligible_steps == 12,
+           "Q8 q/k/v with BF16 indexer uses per-tensor fallback");
+    const auto execution = build_serial_decode_execution_plan(m);
+    auto requirements = build_serial_execution_tensor_requirements(execution);
+    std::erase_if(requirements, [](const auto &r) {
+        return r.op != SerialOp::indexed_attention || r.binding_slot > 1;
+    });
+    mixed_types.layout_identity = model_manifest_layout_identity(mixed_types);
+    const auto access = compile_execution_tensor_access_plan(
+        execution, mixed_types, build_model_tensor_index(mixed_types), requirements);
+    qsa_input_prefetch::validate_tensor_access(real_types, mixed_types, execution, access);
+    auto wrong_access = access;
+    wrong_access.accesses.front().tensor_indices.clear();
+    rejects(
+        [&] {
+            qsa_input_prefetch::validate_tensor_access(real_types, mixed_types, execution,
+                                                       wrong_access);
+        },
+        "QSA prefetch projection differs from tensor access");
     expect(!qsa_input_prefetch::eligible(ManifestTensor{}), "empty not eligible");
     ManifestTensor narrow;
     narrow.ggml_type = 8;
@@ -93,7 +123,7 @@ int main() {
     narrow.dimensions = {32, 1};
     expect(qsa_input_prefetch::eligible(narrow), "one Q8 group eligible");
     for (auto &t : tensors.tensors)
-        if (t.layer == 3 || t.name == "blk.7.attn_q.weight") {
+        if (t.layer == 3U || t.name == "blk.7.attn_q.weight") {
             t.ggml_type = 0;
             t.byte_size = t.dimensions[0] * t.dimensions[1] * 4U;
         }
@@ -128,37 +158,54 @@ int main() {
     const auto original_only = compile_serial_execution(m, base_reg, off, buffers);
     expect(original_only.execution_identity == original.execution_identity,
            "OFF identity unaffected by extra experimental registrations");
-    rejects([&] { (void)compile_serial_execution(m, base_reg, on, buffers); });
+    rejects([&] { (void)compile_serial_execution(m, base_reg, on, buffers); },
+            "compiled serial execution requires every kernel step to bind");
     auto bad = on;
     bad.qsa_input_prefetch_layers.clear();
-    rejects([&] { (void)compile_serial_execution(m, reg, bad, buffers); });
+    rejects([&] { (void)compile_serial_execution(m, reg, bad, buffers); },
+            "QSA prefetch requires at least one eligible step");
     bad = off;
     bad.qsa_input_prefetch_layers = {3};
-    rejects([&] { (void)compile_serial_execution(m, reg, bad, buffers); });
+    rejects([&] { (void)compile_serial_execution(m, reg, bad, buffers); },
+            "QSA prefetch layers require opt-in");
     bad = on;
     bad.qsa_input_prefetch_layers = {3, 3};
-    rejects([&] { (void)compile_serial_execution(m, reg, bad, buffers); });
+    rejects([&] { (void)compile_serial_execution(m, reg, bad, buffers); },
+            "QSA prefetch eligible layers invalid");
     bad = on;
     bad.qsa_input_prefetch_layers = {0};
-    rejects([&] { (void)compile_serial_execution(m, reg, bad, buffers); });
+    rejects([&] { (void)compile_serial_execution(m, reg, bad, buffers); },
+            "QSA prefetch eligible layers invalid");
     SpeculativeVerifyBindingRequest verify;
+    verify.minimum_qualification = kernels::QualificationStatus::experimental;
     verify.prefetch_q8_qsa_input = true;
-    rejects([&] { (void)compile_speculative_verify_execution(m, 1, reg, verify, buffers); });
-    rejects([&] { (void)qsa_input_prefetch::build_plan(m, manifest(m, false)); });
+    rejects([&] { (void)compile_speculative_verify_execution(m, 1, reg, verify, buffers); },
+            "QSA input prefetch runtime does not support speculative verify");
+    const auto verify_plan = build_speculative_verify_plan(m, 1);
+    rejects([&] { (void)bind_speculative_verify_plan(m, verify_plan, reg, verify); },
+            "QSA input prefetch runtime does not support speculative verify");
+    rejects([&] { (void)qsa_input_prefetch::build_plan(m, manifest(m, false)); },
+            "QSA prefetch requires at least one eligible step");
     auto malformed = manifest(m);
     malformed.tensors.pop_back();
-    rejects([&] { (void)qsa_input_prefetch::build_plan(m, malformed); });
+    rejects([&] { (void)qsa_input_prefetch::build_plan(m, malformed); },
+            "QSA prefetch projection geometry missing or invalid");
     malformed = manifest(m);
     malformed.tensors.push_back(malformed.tensors[0]);
-    rejects([&] { (void)qsa_input_prefetch::build_plan(m, malformed); });
+    rejects([&] { (void)qsa_input_prefetch::build_plan(m, malformed); },
+            "QSA prefetch ambiguous projection tensor");
     malformed = manifest(m);
     malformed.tensors[0].absolute_offset = 8;
-    rejects([&] { (void)qsa_input_prefetch::build_plan(m, malformed); });
+    rejects([&] { (void)qsa_input_prefetch::build_plan(m, malformed); },
+            "QSA prefetch weight alignment/extent invalid");
     malformed = manifest(m);
     --malformed.tensors[0].byte_size;
-    rejects([&] { (void)qsa_input_prefetch::build_plan(m, malformed); });
-    rejects([&] { (void)qsa_input_prefetch::required_weight_bytes(32, UINT64_MAX); });
-    rejects([&] { (void)qsa_input_prefetch::required_weight_bytes(33, 1); });
+    rejects([&] { (void)qsa_input_prefetch::build_plan(m, malformed); },
+            "QSA prefetch weight alignment/extent invalid");
+    rejects([&] { (void)qsa_input_prefetch::required_weight_bytes(32, UINT64_MAX); },
+            "QSA prefetch geometry overflow");
+    rejects([&] { (void)qsa_input_prefetch::required_weight_bytes(33, 1); },
+            "QSA prefetch Q8 geometry invalid");
     expect(qsa_input_prefetch::required_weight_bytes(2560, 12288) == 33423360ULL,
            "canonical checked extent");
     std::cout << "QSA input prefetch host tests failures=" << failures << '\n';

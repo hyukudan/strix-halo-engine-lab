@@ -20,8 +20,6 @@ GraphExecutionContract serial_graph_contract(const CompiledSerialExecution& comp
         safe = safe && !step.dynamic_shape && step.graph_safe_candidate;
     }
     for (const auto& binding : compiled.bindings.bindings) {
-
-
         safe = safe && ((compiled.device_graph_inputs && binding.host_or_runtime_step &&
             binding.op == SerialOp::position_prepare) ||
             (!binding.host_or_runtime_step && binding.kernel_id.has_value()));

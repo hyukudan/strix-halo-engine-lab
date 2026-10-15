@@ -79,7 +79,7 @@ contradice una entrada anterior, ambas se conservan y se registra la resolución
 en `DECISIONS.md`.
 
 
-## 2026-10-15: Q8 indexed-attention input prefetch source increment
+## E-052 (2026-10-15): Q8 indexed-attention input prefetch source increment
 
 State: experimental source and host/device fixture implementation; native gates
 pending. Artifact: `docs/implementation-2026-10-15-qsa-input-prefetch.md` and
@@ -89,3 +89,11 @@ Commands: configure Release with `BUILD_TESTING=ON`; host target
 `strix-hip-qsa-input-prefetch-tests`. The baseline project contains POSIX-only
 sources, so a full Windows build is not a portable qualification environment.
 Actual Linux HIP compiler/ISA/device/model/performance results are not claimed.
+
+The follow-up source adds exact-message negative assertions, actual mixed catalog
+and full-operator ON/OFF eager/graph fixtures, poisoned output/workspace/KV/raw
+owners, five-candidate and four-candidate node assertions, and zero-node failure
+checks. A host submission counter records only eager enqueue and graph capture;
+it does not count graph replay. The host plan test explicitly covers Q8 q/k/v
+with BF16 indexer inputs (36 eligible and 24 fallback projections at 12 steps).
+These are fixture contracts, not claims that new device tests have executed.

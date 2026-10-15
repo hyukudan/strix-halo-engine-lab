@@ -40,6 +40,7 @@ struct HipLauncherCatalogConfig {
     bool virtual_q8_gdn_output = false;
     bool prefetch_q8_qsa_input = false;
     std::vector<std::uint32_t> qsa_input_prefetch_layers;
+    std::shared_ptr<qsa_input_prefetch::RuntimeDispatchStats> qsa_input_prefetch_stats;
 };
 
 void register_complete_hip_kernel_catalog(

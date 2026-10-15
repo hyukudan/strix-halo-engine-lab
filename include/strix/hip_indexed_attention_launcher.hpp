@@ -8,6 +8,7 @@
 #include "strix/qsa_input_prefetch.hpp"
 
 #include <string>
+#include <memory>
 
 namespace strix {
 
@@ -19,6 +20,7 @@ struct HipIndexedAttentionLauncherConfig {
     bool enable_device_graph_inputs = false;
     bool prefetch_q8_input = false;
     std::vector<std::uint32_t> prefetch_eligible_layers;
+    std::shared_ptr<qsa_input_prefetch::RuntimeDispatchStats> prefetch_stats;
 };
 
 enum class HipQsaInputProjectionMode {legacy256,virtual256,prefetch8};

@@ -104,4 +104,26 @@ Plan build_plan(const ModelContract &m, const ModelManifest &manifest) {
     validate_layers(m, true, p.layers);
     return p;
 }
+void validate_tensor_access(const Plan &plan, const ModelManifest &manifest,
+                            const SerialExecutionPlan &execution,
+                            const ExecutionTensorAccessPlan &accesses) {
+    for (const auto &projection : plan.projections) {
+        const auto step =
+            std::find_if(execution.steps.begin(), execution.steps.end(), [&](const auto &s) {
+                return s.op == SerialOp::indexed_attention && s.layer == projection.layer;
+            });
+        const auto tensor =
+            std::find_if(manifest.tensors.begin(), manifest.tensors.end(), [&](const auto &t) {
+                return t.name == projection.tensor_name && t.layer == projection.layer;
+            });
+        if (step == execution.steps.end() || tensor == manifest.tensors.end())
+            throw std::invalid_argument("QSA prefetch projection access missing");
+        const auto which = slot(tensor->name);
+        const auto *access = find_execution_tensor_access(accesses, step->id, which < 3 ? 0U : 1U);
+        const auto index = static_cast<std::uint32_t>(tensor - manifest.tensors.begin());
+        if (which < 0 || !access || access->op != SerialOp::indexed_attention ||
+            std::count(access->tensor_indices.begin(), access->tensor_indices.end(), index) != 1)
+            throw std::invalid_argument("QSA prefetch projection differs from tensor access");
+    }
+}
 } // namespace strix::qsa_input_prefetch

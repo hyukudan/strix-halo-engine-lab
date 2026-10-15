@@ -42,13 +42,14 @@ HipGdnLauncherConfig gdn_config(const ModelContract& model,
 HipIndexedAttentionLauncherConfig
 indexed_attention_config(
     const ModelContract& model,
-    HipActivationStorage activation, bool graph = false, bool prefetch = false, std::vector<std::uint32_t> layers = {}) {
+    HipActivationStorage activation, bool graph = false, bool prefetch = false, std::vector<std::uint32_t> layers = {}, std::shared_ptr<qsa_input_prefetch::RuntimeDispatchStats> stats = {}) {
     HipIndexedAttentionLauncherConfig config;
     config.model = model;
     config.activation = activation;
     config.enable_device_graph_inputs = graph;
     config.prefetch_q8_input = prefetch;
     config.prefetch_eligible_layers=std::move(layers);
+    config.prefetch_stats=std::move(stats);
     return config;
 }
 
@@ -314,7 +315,7 @@ void register_complete_hip_kernel_catalog(
     const auto indexed =
         indexed_attention_config(
             model,
-            config.activation, config.enable_device_graph_inputs, config.prefetch_q8_qsa_input, config.qsa_input_prefetch_layers);
+            config.activation, config.enable_device_graph_inputs, config.prefetch_q8_qsa_input, config.qsa_input_prefetch_layers, config.qsa_input_prefetch_stats);
     if(config.prefetch_q8_qsa_input){auto base=indexed;base.prefetch_q8_input=false;base.prefetch_eligible_layers.clear();auto base_request=request;base_request.prefetch_q8_qsa_input=false;base_request.qsa_input_prefetch_layers.clear();register_hip_indexed_attention_kernel_variant(model,base_request,base,registry,qualification);}
     register_hip_indexed_attention_kernel_variant(
         model,
@@ -411,7 +412,7 @@ HipLauncherCatalog::HipLauncherCatalog(
       indexed_attention_(
           indexed_attention_config(
               model,
-              config.activation, config.enable_device_graph_inputs, config.prefetch_q8_qsa_input, config.qsa_input_prefetch_layers)),
+              config.activation, config.enable_device_graph_inputs, config.prefetch_q8_qsa_input, config.qsa_input_prefetch_layers, config.qsa_input_prefetch_stats)),
       embedding_(
           embedding_config(
               model,

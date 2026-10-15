@@ -60,7 +60,7 @@ la spec y condición de reapertura. Las acciones de aceptación se enlazarán aq
 en `DESIGN_ACCEPTANCE.md`.
 
 
-## 2026-10-15: explicit indexed-attention Q8 input prefetch experiment
+## D-017 (2026-10-15): explicit indexed-attention Q8 input prefetch experiment
 
 Keep the prefetch schedule off by default and in the original HIP translation
 unit. Manifest eligibility is per matrix; operator bindings explicitly retain
@@ -69,3 +69,10 @@ projection counts. Do not infer target qualification from an arithmetic argument
 or a host test. Reopen adoption after linked legacy/candidate ISA, device fixtures,
 full-array and token fidelity, and paired complete-workload measurements. The first
 increment rejects speculative verify because the actual indexed launcher is C1.
+
+Alternatives: retain only the original T256 schedule, or choose a distinct opt-in
+loading schedule with the same leaves and reduction. The latter permits isolated
+qualification without replacing the existing path. Risk: source equivalence does
+not establish compiler behavior or complete-workload benefit. Spec consequence:
+require explicit per-tensor eligibility, topology/dispatch receipts and all native
+gates before adoption. Evidence: E-052. Reopening conditions are the gates above.
