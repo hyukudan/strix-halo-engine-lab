@@ -1,4 +1,5 @@
 #include "strix/serial_request.hpp"
+#include "strix/serial_decode_reference.hpp"
 
 #include <cmath>
 #include <limits>
@@ -234,7 +235,10 @@ std::uint32_t SerialGreedyStepBackend::execute_greedy(
 }
 
 void SerialGreedyStepBackend::execute_state(std::uint32_t input_token, std::uint64_t position) {
-    static_cast<void>(execute(input_token, position));
+    const auto logits = execute(input_token, position);
+    // A generic full-output backend still produced these values. Validate its
+    // finite contract even when the caller does not request a token from them.
+    validate_serial_decode_engine_logits(logits, logits.size());
 }
 
 SerialGreedyRequestResult execute_serial_greedy_token_request(

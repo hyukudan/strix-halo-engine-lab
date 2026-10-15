@@ -106,6 +106,7 @@ std::vector<float> state_values(Shape shape, unsigned seed, unsigned flavor) {
             const auto index = (static_cast<std::size_t>(head) * 128U + key) * 128U + value;
             const auto mixed = (head * 131U + key * 17U + value * 11U + (key ^ value) * 7U + seed * 29U) % 521U;
             state[index] = static_cast<float>(static_cast<int>(mixed) - 260) / 65536.0F;
+            if (flavor == 4U) state[index] = 0.0F;
             if (flavor == 1U) {
                 constexpr std::uint32_t bits[]{0U, 0x80000000U, 1U, 0x80000001U, 0x00800000U, 0x80800000U};
                 state[index] = std::bit_cast<float>(bits[mixed % 6U]);
@@ -290,8 +291,8 @@ void invalid_preflight() {
 int main() try {
     invalid_preflight(); sticky_rejection();
     unsigned cases = 0;
-    for (const auto shape : {Shape{1U, 1U, 128U}, Shape{2U, 6U, 128U}, Shape{16U, 48U, 128U}})
-        for (unsigned flavor = 0; flavor < 4U; ++flavor) for (const bool status : {false, true}) {
+    for (const auto shape : {Shape{1U, 1U, 128U}, Shape{2U, 6U, 128U}, Shape{16U, 48U, 128U}, Shape{64U, 64U, 128U}})
+        for (unsigned flavor = 0; flavor < 5U; ++flavor) for (const bool status : {false, true}) {
             family(shape, flavor, status); ++cases;
         }
     std::cout << "GDN recurrent LDS layout diagnostic PASS cases=" << cases

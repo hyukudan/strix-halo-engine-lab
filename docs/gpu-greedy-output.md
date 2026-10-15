@@ -1,7 +1,8 @@
 # Experimental scalar greedy output
 
 `--gpu-greedy-token` selects an explicit eager generation path which retains the
-complete LM-head output in the execution arena, checks every logit for finiteness,
+complete LM-head output in the execution arena for each selected position,
+checks every logit of that position for finiteness,
 and selects the maximum on the GPU. Numeric ties, including signed zeros, select
 the lowest token ID. Integer IEEE keys preserve ordering for finite subnormals
 without depending on device floating-point denormal arithmetic.
@@ -38,7 +39,9 @@ the explicit output route has its own receipt identity and is not qualified by
 the historical automatic profile's evidence.
 
 For this mode, `generation_step_elapsed_ms_total` and `_per_step` include producer
-completion and selection/readback when requested. Historical producer-only
+completion and selection/readback for full-output steps only. Nonfinal prefix
+timings are separate `prefix_state_only_elapsed_ms_*` fields and are not averaged
+with full-output steps. Historical producer-only
 `decode_elapsed_ms_*` fields are omitted in this mode. The receipt labels the
 scope and reports vocabulary, calls, failures, kernel submissions, transfer bytes,
 stream completions, omitted heads and requested pool allocation bytes. Host-dispatch telemetry

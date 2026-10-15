@@ -23,17 +23,20 @@ struct Logits final : strix::SerialGreedyStepBackend {
 struct Tokens final : strix::SerialGreedyStepBackend {
     unsigned calls = 0;
     std::vector<std::uint32_t> consumed;
+    std::vector<std::uint64_t> state_positions, greedy_positions;
     bool invalid = false;
     std::vector<float> execute(std::uint32_t, std::uint64_t) override {
         throw std::logic_error("token-only controller requested full logits");
     }
-    void execute_state(std::uint32_t input, std::uint64_t) override {
+    void execute_state(std::uint32_t input, std::uint64_t position) override {
         ++calls;
         consumed.push_back(input);
+        state_positions.push_back(position);
     }
     std::uint32_t execute_greedy(std::uint32_t input, std::uint64_t position, std::uint64_t vocab) override {
         ++calls;
         consumed.push_back(input);
+        greedy_positions.push_back(position);
         return invalid ? static_cast<std::uint32_t>(vocab)
                        : static_cast<std::uint32_t>((position + 2U) % vocab);
     }
@@ -46,10 +49,14 @@ void same(const strix::SerialGreedyRequestResult& left, const strix::SerialGreed
 }
 int main() try {
     const std::array<std::uint32_t, 2> prefix{1, 2};
+    for (const auto& candidate_prefix : {std::vector<std::uint32_t>{1},
+                                       std::vector<std::uint32_t>{1, 2},
+                                       std::vector<std::uint32_t>{1, 2, 4}}) {
     for (std::uint64_t capacity : {2ULL, 3ULL, 8ULL, 16ULL}) {
+        if (capacity < candidate_prefix.size()) continue;
         for (std::uint64_t maximum : {0ULL, 1ULL, 2ULL, 7ULL, 20ULL}) {
             for (std::uint32_t eos : {0U, 3U, 7U}) {
-                strix::SerialGreedyRequest request{prefix, 8, capacity, maximum, eos};
+                strix::SerialGreedyRequest request{candidate_prefix, 8, capacity, maximum, eos};
                 Logits full, fallback;
                 Tokens token;
                 const auto reference = strix::execute_serial_greedy_request(request, full);
@@ -59,8 +66,13 @@ int main() try {
                         "scalar controller neither skips nor duplicates state-consuming steps");
                 require(full.consumed == token.consumed && full.consumed == fallback.consumed,
                         "scalar feedback consumes the same prefix and generated input tokens");
+                require(token.state_positions.size() + 1U == candidate_prefix.size() &&
+                        !token.greedy_positions.empty() &&
+                        token.greedy_positions.front() == candidate_prefix.size() - 1U,
+                        "only nonfinal prefix positions use the state-only backend method");
             }
         }
+    }
     }
     strix::SerialGreedyRequest request{prefix, 8, 8, 2, 7};
     Tokens invalid;

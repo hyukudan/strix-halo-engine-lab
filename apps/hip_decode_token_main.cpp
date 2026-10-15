@@ -229,7 +229,7 @@ public:
                 *compiled_, *session_, *resources_, input_token, *dispatcher_));
             if (!prepublication_completion_)
                 check_hip(hipDeviceSynchronize(), "state-only prefix producer completion");
-            elapsed_ms_.push_back(std::chrono::duration<double, std::milli>(
+            prefix_state_elapsed_ms_.push_back(std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - start).count());
         } catch (...) {
             if (session_->committed_tokens != committed_before) {
@@ -365,6 +365,9 @@ public:
     [[nodiscard]] const std::vector<std::string>& logit_hashes() const noexcept {
         return logit_hashes_;
     }
+    [[nodiscard]] const std::vector<double>& prefix_state_elapsed_ms() const noexcept {
+        return prefix_state_elapsed_ms_;
+    }
 
 private:
     const strix::CompiledSerialExecution* compiled_ = nullptr;
@@ -375,6 +378,7 @@ private:
     const strix::ExecutionStepIo* lm_io_ = nullptr;
     std::uint64_t vocab_size_ = 0;
     std::vector<double> elapsed_ms_;
+    std::vector<double> prefix_state_elapsed_ms_;
     std::vector<std::string> logit_hashes_;
     std::function<void(std::uint32_t, std::uint64_t, std::span<const float>)> recording_;
     std::function<void()> recording_binding_;
@@ -955,9 +959,11 @@ int main(
     host_telemetry.enabled = options.host_dispatch_telemetry;
     strix::DirectLaunchDispatcher direct_dispatcher(launch_plan,
         host_telemetry.enabled ? &host_telemetry.counters : nullptr);
-    strix::GenerationOutputDispatcher output_dispatcher(direct_dispatcher, compiled);
-    strix::EagerExecutionDispatcher& dispatcher = options.gpu_greedy_token
-        ? static_cast<strix::EagerExecutionDispatcher&>(output_dispatcher)
+    std::unique_ptr<strix::GenerationOutputDispatcher> output_dispatcher;
+    if (options.gpu_greedy_token)
+        output_dispatcher = std::make_unique<strix::GenerationOutputDispatcher>(direct_dispatcher, compiled);
+    strix::EagerExecutionDispatcher& dispatcher = output_dispatcher
+        ? static_cast<strix::EagerExecutionDispatcher&>(*output_dispatcher)
         : static_cast<strix::EagerExecutionDispatcher&>(direct_dispatcher);
     std::unique_ptr<strix::HipSerialGraph> graph;
     if (graph_mode) {
@@ -1414,7 +1420,7 @@ int main(
             lm_io,
             model.vocab_size,
             std::move(greedy_recording), raw_require_identity, raw_drain_or_fail,
-            execute_native_token, false, options.deferred_moe_status, greedy_output.get(), &output_dispatcher);
+            execute_native_token, false, options.deferred_moe_status, greedy_output.get(), output_dispatcher.get());
 
         strix::SerialGreedyRequest request;
         request.prefix_tokens =
@@ -1442,7 +1448,14 @@ int main(
         std::cout << "{\n" << optimization_profile_receipt << execution_inventory_receipt << gdn_output_mode_receipt() << wave_router_mode_receipt << deferred_moe_mode_receipt;
         if (greedy_output) {
             const auto stats = greedy_output->stats();
+            double prefix_state_total = 0.0;
+            for (const auto duration : backend.prefix_state_elapsed_ms()) prefix_state_total += duration;
             std::cout << "  \"generation_output_mode\":\"" << strix::gpu_greedy_output_identity << "\",\n"
+                << "  \"prefix_state_only_steps\":" << backend.prefix_state_elapsed_ms().size() << ",\n"
+                << "  \"prefix_state_only_elapsed_ms_total\":" << prefix_state_total << ",\n"
+                << "  \"prefix_state_only_elapsed_ms_per_step\":"
+                << (backend.prefix_state_elapsed_ms().empty() ? 0.0 : prefix_state_total /
+                    static_cast<double>(backend.prefix_state_elapsed_ms().size())) << ",\n"
                 << "  \"generation_output_completed\":" << stats.completed << ",\n"
                 << "  \"generation_output_vocabulary_size\":" << model.vocab_size << ",\n"
                 << "  \"generation_output_calls\":" << stats.calls << ",\n"
@@ -1453,8 +1466,8 @@ int main(
                 << "  \"generation_output_full_logits_d2h_bytes\":0,\n"
                 << "  \"generation_output_result_d2h_bytes\":" << stats.result_d2h_bytes << ",\n"
                 << "  \"generation_output_pool_requested_bytes\":" << greedy_output->scratch_bytes() << ",\n"
-                << "  \"prefill_lm_heads_omitted\":" << output_dispatcher.omitted_heads() << ",\n"
-                << "  \"generation_output_timing_scope\":\"producer-through-selection-and-readback\",\n";
+                << "  \"prefill_lm_heads_omitted\":" << output_dispatcher->omitted_heads() << ",\n"
+                << "  \"generation_output_timing_scope\":\"full-output-steps-producer-through-selection-and-readback\",\n";
         }
         emit_q4k_a8_receipt();
         emit_q4k_a8_counts();
