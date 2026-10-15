@@ -6,6 +6,7 @@
 #include "strix/execution_resources.hpp"
 #include "strix/execution_tensor_access.hpp"
 #include "strix/hip_shared_expert_launcher.hpp"
+#include "strix/hip_launch_context.hpp"
 #include "strix/model_contract.hpp"
 #include "strix/model_manifest.hpp"
 #include "strix/model_runtime_binding.hpp"
@@ -15,8 +16,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -528,6 +531,106 @@ int main() try {
     expect(
         maximum_error <= 2e-4F,
         "mixed-format shared expert matches CPU reference");
+
+
+    {
+        const auto temporary=strix::resolve_execution_buffer(memory.execution_identity,arena,memory,step_io.temporaries[0]);
+        hipStream_t stream=nullptr;check(hipStreamCreateWithFlags(&stream,hipStreamNonBlocking),"create shared comparison stream");
+        strix::HipLaunchContext scope;scope.stream=stream;
+        // This operator has no device-position/status consumer. The owned stream
+        // scope is sufficient for both eager enqueue and external HIP capture.
+        const auto read_bytes=[&](std::uintptr_t address,std::uint64_t bytes){std::vector<std::byte> result(bytes);
+            check(hipMemcpy(result.data(),reinterpret_cast<void*>(address),bytes,hipMemcpyDeviceToHost),"read shared comparison bytes");return result;};
+        const auto bf16=[](float value){auto bits=std::bit_cast<std::uint32_t>(value);
+            bits+=0x7fffU+((bits>>16U)&1U);return static_cast<std::uint16_t>(bits>>16U);};
+        for(unsigned mixed=0;mixed<2;++mixed){
+            auto& up_tensor=manifest.tensors[1];
+            if(mixed){up_tensor.ggml_type=0;up_tensor.byte_size=up.size()*4;
+                check(hipMemcpy(device_weights[1],up.data(),up_tensor.byte_size,hipMemcpyHostToDevice),"restore shared F32 up fallback");}
+            else{const auto up_q8=make_q8(intermediate,hidden,0.0009F);up_tensor.ggml_type=8;
+                up_tensor.byte_size=up_q8.size()*sizeof(Q8Block);
+                check(hipMemcpy(device_weights[1],up_q8.data(),up_tensor.byte_size,hipMemcpyHostToDevice),"set shared Q8 up");}
+            runtime.tensors[1].bytes=up_tensor.byte_size;
+            manifest.layout_identity=strix::model_manifest_layout_identity(manifest);
+            runtime.manifest_layout_identity=manifest.layout_identity;access.manifest_layout_identity=manifest.layout_identity;
+            for(auto dtype:{strix::HipActivationStorage::bf16,strix::HipActivationStorage::fp32}){
+                auto off_config=config;off_config.activation=dtype;
+                auto on_config=off_config;on_config.prefetch_q8=true;on_config.prefetch_eligible_layers={*step.layer};
+                on_config.prefetch_stats=std::make_shared<strix::shared_expert_prefetch::RuntimeDispatchStats>();
+                auto off_launch=strix::make_hip_shared_expert_launcher("test.shared.off",&off_config);
+                auto on_launch=strix::make_hip_shared_expert_launcher("test.shared.on",&on_config);
+                hipGraph_t graphs[2]{};hipGraphExec_t executables[2]{};
+                for(unsigned mode=0;mode<2;++mode){auto& candidate=mode?on_launch:off_launch;
+                    const auto before=on_config.prefetch_stats->dispatched_projections.load();
+                    check(hipStreamBeginCapture(stream,hipStreamCaptureModeThreadLocal),"capture shared ON/OFF");
+                    try{const strix::HipLaunchScope owned(scope);candidate.function(context,candidate.user_data);}
+                    catch(...){static_cast<void>(hipStreamEndCapture(stream,&graphs[mode]));throw;}
+                    check(hipStreamEndCapture(stream,&graphs[mode]),"end shared ON/OFF capture");
+                    std::size_t count=0;check(hipGraphGetNodes(graphs[mode],nullptr,&count),"shared graph node count");
+                    expect(count==5,"shared exact schedule retains all five kernels");
+                    std::vector<hipGraphNode_t> nodes(count);check(hipGraphGetNodes(graphs[mode],nodes.data(),&count),"shared graph nodes");
+                    unsigned candidate_nodes=0;for(auto node:nodes){hipGraphNodeType type;
+                        check(hipGraphNodeGetType(node,&type),"shared graph node type");
+                        if(type==hipGraphNodeTypeKernel){hipKernelNodeParams params{};
+                            check(hipGraphKernelNodeGetParams(node,&params),"shared node params");
+                            if(params.blockDim.x==256 && (params.gridDim.x==4 || params.gridDim.x==8))++candidate_nodes;}}
+                    expect(candidate_nodes==(mode?3U-mixed:0U),"shared graph contains exact row-group candidate nodes");
+                    expect(on_config.prefetch_stats->dispatched_projections.load()-before==(mode?3U-mixed:0U),
+                           "shared capture counter matches eligible projections");
+                    check(hipGraphInstantiate(&executables[mode],graphs[mode],nullptr,nullptr,0),"instantiate shared comparison");
+                }
+                const auto reset=[&](unsigned replay){
+                    check(hipMemset(reinterpret_cast<void*>(output.address),0xff,output.bytes),"poison shared output");
+                    check(hipMemset(reinterpret_cast<void*>(temporary.address),0xff,temporary.bytes),"poison shared workspace");
+                    for(unsigned f=0;f<hidden;++f)hidden_values[f]=static_cast<float>(static_cast<int>((f+7*replay)%19)-9)/23.0F;
+                    if(dtype==strix::HipActivationStorage::fp32)check(hipMemcpy(reinterpret_cast<void*>(input.address),hidden_values.data(),hidden*4,hipMemcpyHostToDevice),"set shared FP32 input");
+                    else{std::vector<std::uint16_t> encoded(hidden);for(unsigned f=0;f<hidden;++f)encoded[f]=bf16(hidden_values[f]);
+                        check(hipMemcpy(reinterpret_cast<void*>(input.address),encoded.data(),hidden*2,hipMemcpyHostToDevice),"set shared BF16 input");}
+                };
+                for(unsigned replay=0;replay<3;++replay){std::vector<std::byte> expected_output,expected_workspace;
+                    for(unsigned path=0;path<4;++path){reset(replay);const auto before=on_config.prefetch_stats->dispatched_projections.load();
+                        if(path<2){auto& candidate=path?on_launch:off_launch;
+                            {const strix::HipLaunchScope owned(scope);candidate.function(context,candidate.user_data);}
+                            expect(on_config.prefetch_stats->dispatched_projections.load()-before==(path?3U-mixed:0U),"shared eager counter exact");}
+                        else{check(hipGraphLaunch(executables[path-2],stream),"replay shared ON/OFF");
+                            expect(on_config.prefetch_stats->dispatched_projections.load()==before,"shared graph replay leaves host capture count unchanged");}
+                        check(hipStreamSynchronize(stream),"complete shared comparison");
+                        auto actual_output=read_bytes(output.address,output.bytes),actual_workspace=read_bytes(temporary.address,temporary.bytes);
+                        for(unsigned f=0;f<hidden;++f){float value;
+                            if(dtype==strix::HipActivationStorage::fp32)std::memcpy(&value,actual_output.data()+f*4,4);
+                            else{std::uint16_t bits;std::memcpy(&bits,actual_output.data()+f*2,2);value=std::bit_cast<float>(static_cast<std::uint32_t>(bits)<<16U);}
+                            expect(std::isfinite(value),"shared full operator output finite");}
+                        if(path==0){expected_output=std::move(actual_output);expected_workspace=std::move(actual_workspace);}
+                        else expect(actual_output==expected_output && actual_workspace==expected_workspace,
+                            "shared full operator ON/OFF eager/graph exact output and intermediate bytes");
+                    }
+                }
+                for(unsigned failure=0;failure<2;++failure){reset(0);auto bad_arena=arena;
+                    const auto old_address=runtime.tensors[0].address;
+                    if(failure==0){const auto* allocation=strix::find_arena_allocation(arena,step_io.temporaries[0]);
+                        for(auto& output_allocation:bad_arena.allocations)if(output_allocation.use==step_io.writes[0]){output_allocation.offset=allocation->offset;output_allocation.bytes=hidden*static_cast<std::uint32_t>(dtype);}
+                        context.arena=&bad_arena;
+                    }else runtime.tensors[0].address+=2;
+                    const auto before=read_bytes(memory.arena_base,memory.arena_bytes);
+                    const auto before_count=on_config.prefetch_stats->dispatched_projections.load();
+                    hipGraph_t rejected_graph=nullptr;bool rejected=false;
+                    check(hipStreamBeginCapture(stream,hipStreamCaptureModeThreadLocal),"capture shared rejected preflight");
+                    try{const strix::HipLaunchScope owned(scope);on_launch.function(context,on_launch.user_data);}
+                    catch(const std::invalid_argument& error){rejected=std::string(error.what()).find(failure?
+                        "weight alignment/extent invalid":"writable alias")!=std::string::npos;}
+                    check(hipStreamEndCapture(stream,&rejected_graph),"end shared rejected preflight");
+                    std::size_t count=1;check(hipGraphGetNodes(rejected_graph,nullptr,&count),"rejected shared nodes");
+                    expect(rejected && count==0 && before==read_bytes(memory.arena_base,memory.arena_bytes) &&
+                        before_count==on_config.prefetch_stats->dispatched_projections.load(),"shared preflight rejects precise cause before any node or mutation");
+                    check(hipGraphDestroy(rejected_graph),"destroy shared rejected graph");
+                    context.arena=&arena;runtime.tensors[0].address=old_address;
+                }
+                for(unsigned mode=0;mode<2;++mode){check(hipGraphExecDestroy(executables[mode]),"destroy shared executable");
+                    check(hipGraphDestroy(graphs[mode]),"destroy shared graph");}
+            }
+        }
+        check(hipStreamDestroy(stream),"destroy shared comparison stream");
+    }
 
     for (auto* pointer :
          device_weights) {

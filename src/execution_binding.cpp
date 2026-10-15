@@ -1,5 +1,6 @@
 #include "strix/execution_binding.hpp"
 #include "strix/qsa_input_prefetch.hpp"
+#include "strix/shared_expert_prefetch.hpp"
 
 #include <limits>
 #include <algorithm>
@@ -146,6 +147,7 @@ ExecutionBindingPlan bind_serial_execution_plan(
         if(count!=1 || std::none_of(plan.steps.begin(),plan.steps.end(),[&](const auto& step){return step.id==id && (step.op==SerialOp::attn_hyper_mix || step.op==SerialOp::mlp_hyper_mix || step.op==SerialOp::final_hyper_mix);}))
             throw std::invalid_argument("lane-chain HC output invalid eligible step list");
     }
+    shared_expert_prefetch::validate_layers(model.hidden_layers,request.prefetch_q8_shared_expert,request.shared_expert_prefetch_layers);
     ExecutionBindingPlan output;
     output.bindings.reserve(plan.steps.size());
 
@@ -193,6 +195,11 @@ ExecutionBindingPlan bind_serial_execution_plan(
                 selected=registry.find(other);
                 if(selected && !kernels::matches(*selected,query))selected=nullptr;
             }
+        }
+        if(selected && step.op==SerialOp::shared_expert){
+            const bool wanted=shared_expert_prefetch::selected(request.prefetch_q8_shared_expert,request.shared_expert_prefetch_layers,step.layer);
+            const bool actual=selected->id.ends_with(shared_expert_prefetch::kernel_suffix);
+            if(wanted!=actual){std::string id=selected->id;if(actual)id.resize(id.size()-shared_expert_prefetch::kernel_suffix.size());else id+=shared_expert_prefetch::kernel_suffix;selected=registry.find(id);if(selected && !kernels::matches(*selected,query))selected=nullptr;}
         }
         if (selected == nullptr) {
             ++output.missing_steps;

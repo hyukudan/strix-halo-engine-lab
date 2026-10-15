@@ -154,7 +154,7 @@ lm_head_config(
 HipSharedExpertLauncherConfig
 shared_expert_config(
     const ModelContract& model,
-    HipActivationStorage activation) {
+    HipActivationStorage activation, bool prefetch=false, std::vector<std::uint32_t> layers={}, std::shared_ptr<shared_expert_prefetch::RuntimeDispatchStats> stats={}) {
     HipSharedExpertLauncherConfig config;
     config.hidden_size =
         checked_u32(
@@ -166,6 +166,7 @@ shared_expert_config(
             "shared_expert_intermediate_size");
     config.activation =
         activation;
+    config.prefetch_q8=prefetch;config.prefetch_eligible_layers=std::move(layers);config.prefetch_stats=std::move(stats);
     return config;
 }
 
@@ -253,6 +254,8 @@ void register_complete_hip_kernel_catalog(
         throw std::invalid_argument("HIP catalog wave router mode differs from binding request");
     if(config.prefetch_q8_qsa_input!=request.prefetch_q8_qsa_input || config.qsa_input_prefetch_layers!=request.qsa_input_prefetch_layers)throw std::invalid_argument("HIP catalog QSA input prefetch differs from binding request");
     qsa_input_prefetch::validate_layers(model,config.prefetch_q8_qsa_input,config.qsa_input_prefetch_layers);
+    if(config.prefetch_q8_shared_expert!=request.prefetch_q8_shared_expert || config.shared_expert_prefetch_layers!=request.shared_expert_prefetch_layers)throw std::invalid_argument("HIP catalog shared prefetch request mismatch");
+    shared_expert_prefetch::validate_layers(model.hidden_layers,config.prefetch_q8_shared_expert,config.shared_expert_prefetch_layers);
     if (config.ranked_moe_router_topk != request.ranked_moe_router_topk ||
         (config.ranked_moe_router_topk && !config.parallel_moe_router))
         throw std::invalid_argument("HIP catalog ranked router mode differs from binding request");
@@ -393,7 +396,8 @@ void register_complete_hip_kernel_catalog(
     const auto shared =
         shared_expert_config(
             model,
-            config.activation);
+            config.activation,config.prefetch_q8_shared_expert,config.shared_expert_prefetch_layers);
+    if(config.prefetch_q8_shared_expert){auto base=shared;base.prefetch_q8=false;base.prefetch_eligible_layers.clear();auto base_request=request;base_request.prefetch_q8_shared_expert=false;base_request.shared_expert_prefetch_layers.clear();register_hip_shared_expert_kernel_variant(model,base_request,base,registry,qualification);}
     register_hip_shared_expert_kernel_variant(
         model,
         request,
@@ -444,7 +448,7 @@ HipLauncherCatalog::HipLauncherCatalog(
       shared_expert_(
           shared_expert_config(
               model,
-              config.activation)) {
+              config.activation,config.prefetch_q8_shared_expert,config.shared_expert_prefetch_layers)) {
     if (alternate_lm_head_ && config.virtual_q8_lm_head)
         throw std::invalid_argument("integer and virtual Q8 LM heads are mutually exclusive");
     if (device_graph_inputs_ && alternate_lm_head_)

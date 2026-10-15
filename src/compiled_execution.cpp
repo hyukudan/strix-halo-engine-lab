@@ -2,6 +2,7 @@
 #include "strix/qsa_input_prefetch.hpp"
 #include "strix/lane_chain_hyper_output.hpp"
 #include <algorithm>
+#include "strix/shared_expert_prefetch.hpp"
 #include "strix/moe_q4k_a8_runtime.hpp"
 
 #include <cstring>
@@ -376,6 +377,7 @@ CompiledSerialExecution compile_serial_execution(
         if (binding.op==SerialOp::moe_experts && binding.kernel_id &&
             (binding.kernel_id->find(".deferred-status-v1")!=std::string::npos)!=binding_request.deferred_moe_status)
             throw std::invalid_argument("bound deferred MoE status mode differs from request");
+        if(binding.op==SerialOp::shared_expert && binding.kernel_id){const auto& step=compiled.execution.steps[binding.step_id];if(binding.kernel_id->ends_with(shared_expert_prefetch::kernel_suffix)!=shared_expert_prefetch::selected(binding_request.prefetch_q8_shared_expert,binding_request.shared_expert_prefetch_layers,step.layer))throw std::invalid_argument("bound shared prefetch differs from admitted topology");}
         if(binding.op==SerialOp::moe_experts && binding.kernel_id &&
            binding.kernel_id->ends_with(moe_q4k_a8::grouped_q51_kernel_ending)!=buffer_request.grouped_exact_q51_down)
             throw std::invalid_argument("bound grouped exact Q5_1 down differs from admitted topology");

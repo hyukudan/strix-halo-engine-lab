@@ -52,3 +52,7 @@ See [the portable implementation slice](implementation-2026-10-11.md),
 [low-precision lab](../lab/low_precision/README.md) and the architecture guides.
 
 | Lane-chain HC output | Experimental opt-in, pure metadata admission and per-step base fallback, exact ordered-chain source and poison/graph fixtures; see [implementation](implementation-2026-10-15-lane-chain-hyper-output.md) | Source review, HIP/ISA, device fixtures, complete-logit identity and paired workload measurements remain open |
+
+| Increment | Implemented evidence | Remaining gates |
+| --- | --- | --- |
+| Q8 shared-expert gate/up/down prefetch | Default-off per-tensor/layer selection, distinct IDs, original device definitions preserved, limited host planning tests, standalone and full-operator poison/graph fixtures, actual host submission count | Native HIP compilation, linked legacy ISA and candidate FP/arithmetic/resource descriptors, new device fixture execution, full-model exactness, paired complete-workload benefit |

@@ -3,9 +3,11 @@
 #include "strix/execution_binding.hpp"
 #include "strix/hip_runtime_launchers.hpp"
 #include "strix/launch_dispatch.hpp"
+#include "strix/shared_expert_prefetch.hpp"
 
 #include <cstdint>
 #include <string>
+#include <memory>
 
 namespace strix {
 
@@ -14,7 +16,22 @@ struct HipSharedExpertLauncherConfig {
     std::uint32_t intermediate_size = 0;
     HipActivationStorage activation =
         HipActivationStorage::bf16;
+    bool prefetch_q8 = false;
+    std::vector<std::uint32_t> prefetch_eligible_layers;
+    std::shared_ptr<shared_expert_prefetch::RuntimeDispatchStats> prefetch_stats;
 };
+
+enum class HipSharedQ8ProjectionMode {legacy256,virtual256,prefetch8};
+enum class HipSharedQ8ProjectionRole {gate_up,down};
+struct HipSharedQ8ProjectionView {std::uintptr_t address=0;std::uint64_t bytes=0;};
+// Diagnostic uses the exact native kernels, no allocation/sync. Caller owns views
+// through stream drain, including enqueue failure. Gate/up: storage is input
+// dtype, FP32 output and empty gate view. Down: FP32 input, FP32 shared_gate,
+// storage selects the output dtype. Complete exact views, output disjoint.
+void launch_hip_shared_q8_projection_probe(HipSharedQ8ProjectionRole,HipSharedQ8ProjectionMode,
+    HipActivationStorage storage,HipSharedQ8ProjectionView input,HipSharedQ8ProjectionView weights,
+    HipSharedQ8ProjectionView shared_gate,HipSharedQ8ProjectionView output,
+    std::uint32_t width,std::uint32_t outputs,void* stream);
 
 void register_hip_shared_expert_kernel_variant(
     const ModelContract& model,
@@ -33,7 +50,7 @@ class HipSharedExpertLauncherBundle {
 public:
     explicit HipSharedExpertLauncherBundle(
         HipSharedExpertLauncherConfig config)
-        : config_(config) {}
+        : config_(config), fallback_config_(config) {fallback_config_.prefetch_q8=false;fallback_config_.prefetch_eligible_layers.clear();}
 
     HipSharedExpertLauncherBundle(
         const HipSharedExpertLauncherBundle&) = delete;
@@ -50,6 +67,7 @@ public:
 
 private:
     HipSharedExpertLauncherConfig config_;
+    HipSharedExpertLauncherConfig fallback_config_;
 };
 
 }  // namespace strix

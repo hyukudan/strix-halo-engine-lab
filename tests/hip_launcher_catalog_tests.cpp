@@ -1,4 +1,3 @@
-#include "strix/lane_chain_hyper_output.hpp"
 #include "strix/compiled_execution.hpp"
 #include "strix/execution_binding.hpp"
 #include "strix/execution_plan.hpp"
@@ -415,7 +414,6 @@ int main() {
         expect(mismatch_rejected, "eager catalog cannot label its launchers as a device-input graph");
     }
 
-
     {
         // Explicit mixed topology: layer 3 falls back, the other eleven use Q8.
         auto on_request = request;
@@ -484,6 +482,7 @@ int main() {
             "QSA prefetch config differs from binding request");
     }
 
+
     {
         auto hc_request=request;hc_request.lane_chain_hyper_output=true;
         for(const auto& step:execution.steps)if(step.op==strix::SerialOp::attn_hyper_mix || step.op==strix::SerialOp::mlp_hyper_mix)hc_request.lane_chain_hyper_output_eligible_steps.push_back(step.id);
@@ -505,6 +504,77 @@ int main() {
         rejected=false;try{(void)strix::compile_serial_execution(model,candidate_only,hc_request,hc_buffers);}catch(const std::invalid_argument&){rejected=true;}
         expect(rejected,"compiled serial execution rejects unavailable base suffix admission");
     }
+
+    {
+        // Explicit mixed topology: layer 0 falls back, the other forty-seven use Q8.
+        auto on_request = request;
+        on_request.prefetch_q8_shared_expert = true;
+        for (std::uint32_t layer = 1; layer < model.hidden_layers; ++layer)
+            on_request.shared_expert_prefetch_layers.push_back(layer);
+        strix::HipLauncherCatalogConfig on_config;
+        on_config.prefetch_q8_shared_expert = true;
+        on_config.shared_expert_prefetch_layers = on_request.shared_expert_prefetch_layers;
+        strix::kernels::KernelRegistry mixed_registry;
+        strix::register_complete_hip_kernel_catalog(model, on_request, on_config, mixed_registry);
+        strix::ExecutionBufferRequest buffers;
+        const auto mixed = strix::compile_serial_execution(model, mixed_registry, on_request, buffers);
+        const auto off = strix::compile_serial_execution(model, mixed_registry, request, buffers);
+        strix::HipLauncherCatalog on_catalog(model, on_config), off_catalog(model);
+        strix::ExecutionLauncherRegistry mixed_launchers, off_launchers;
+        on_catalog.register_for_compiled_execution(mixed, mixed_launchers);
+        off_catalog.register_for_compiled_execution(off, off_launchers);
+        unsigned pref = 0, base = 0;
+        std::set<std::string> shared_ids;
+        for(const auto& binding : mixed.bindings.bindings) {
+            if(binding.op != strix::SerialOp::shared_expert) continue;
+            const auto& id = *binding.kernel_id;
+            shared_ids.insert(id);
+            const bool use = id.ends_with(strix::shared_expert_prefetch::kernel_suffix);
+            use ? ++pref : ++base;
+            expect(use == (*mixed.execution.steps[binding.step_id].layer != 0U),
+                   "mixed catalog selects exact admitted layers");
+            const auto* variant = mixed_registry.find(id);
+            expect(variant && variant->compiler_identity == (use ?
+                "hip-gfx1151-shared-expert-v2-prefetch8-virtual256-q8" :
+                "hip-gfx1151-shared-expert-v1"), "mixed registry compiler identities");
+            const auto* selected_launcher = mixed_launchers.find_kernel_launcher(id);
+            expect(selected_launcher != nullptr, "mixed bundle registers each indexed id");
+            if(!use) {
+                const auto* legacy = off_launchers.find_kernel_launcher(id);
+                expect(legacy && selected_launcher && legacy->implementation_identity ==
+                    selected_launcher->implementation_identity, "fallback identity equals OFF");
+            }
+        }
+        expect(pref == 47 && base == 1 && shared_ids.size() == 2,
+               "mixed catalog has forty-seven prefetch and one base with two launchers");
+        expect(on_catalog.audit(mixed,mixed_launchers).missing_steps == 0,
+               "mixed catalog launcher coverage complete");
+        const auto rejects = [&](auto&& operation, const char* expected) {
+            bool rejected = false;
+            try { operation(); } catch(const std::invalid_argument& error) {
+                rejected = std::string(error.what()).find(expected) != std::string::npos;
+                if(!rejected) std::cerr << error.what() << '\n';
+            }
+            expect(rejected, expected);
+        };
+        rejects([&]{strix::ExecutionLauncherRegistry bad;
+            off_catalog.register_for_compiled_execution(mixed,bad);}, "layer/config mismatch");
+        rejects([&]{strix::ExecutionLauncherRegistry bad;
+            on_catalog.register_for_compiled_execution(off,bad);}, "has no eligible step");
+        auto wrong_config=on_config; wrong_config.shared_expert_prefetch_layers.erase(
+            wrong_config.shared_expert_prefetch_layers.begin());
+        rejects([&]{strix::kernels::KernelRegistry bad;
+            strix::register_complete_hip_kernel_catalog(model,on_request,wrong_config,bad);},
+            "shared prefetch request mismatch");
+        strix::HipSharedExpertLauncherConfig wrong_direct;
+        wrong_direct.hidden_size=static_cast<std::uint32_t>(model.hidden_size);
+        wrong_direct.intermediate_size=static_cast<std::uint32_t>(model.shared_expert_intermediate_size);
+        rejects([&]{strix::kernels::KernelRegistry bad;
+            strix::register_hip_shared_expert_kernel_variant(model,on_request,wrong_direct,bad);},
+            "shared prefetch config/request mismatch");
+    }
+
+
     if (failures == 0) {
         std::cout
             << "HIP launcher catalog tests passed\n";

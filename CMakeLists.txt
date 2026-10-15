@@ -29,6 +29,7 @@ add_library(strix_core STATIC
     src/qsa_input_prefetch.cpp
     src/model_copy_residency_layout.cpp
     src/lane_chain_hyper_output.cpp
+    src/shared_expert_prefetch.cpp
     src/q51_grouped_down_contract.cpp
     src/moe_q4k_a8_runtime.cpp
     src/gdn_output_admission.cpp
@@ -234,6 +235,10 @@ if(BUILD_TESTING)
     target_link_libraries(strix-qsa-input-prefetch-tests PRIVATE strix_core)
     strix_target_warnings(strix-qsa-input-prefetch-tests)
     add_test(NAME strix-qsa-input-prefetch-tests COMMAND strix-qsa-input-prefetch-tests)
+    add_executable(strix-shared-expert-prefetch-tests tests/shared_expert_prefetch_tests.cpp)
+    target_link_libraries(strix-shared-expert-prefetch-tests PRIVATE strix_core)
+    strix_target_warnings(strix-shared-expert-prefetch-tests)
+    add_test(NAME strix-shared-expert-prefetch-tests COMMAND strix-shared-expert-prefetch-tests)
     add_executable(strix-moe-q4k-a8-contract-tests tests/moe_q4k_a8_contract_tests.cpp)
     target_link_libraries(strix-moe-q4k-a8-contract-tests PRIVATE strix_q4k_a8_contract strix_core)
     strix_target_warnings(strix-moe-q4k-a8-contract-tests)
@@ -1495,6 +1500,11 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         target_link_libraries(strix-hip-qsa-input-prefetch-tests PRIVATE strix_hip_runtime)
         strix_target_warnings(strix-hip-qsa-input-prefetch-tests)
         add_test(NAME strix-hip-qsa-input-prefetch-tests COMMAND strix-hip-qsa-input-prefetch-tests)
+        add_executable(strix-hip-shared-expert-prefetch-tests tests/hip_shared_expert_prefetch_tests.hip)
+        set_target_properties(strix-hip-shared-expert-prefetch-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+        target_link_libraries(strix-hip-shared-expert-prefetch-tests PRIVATE strix_hip_runtime)
+        strix_target_warnings(strix-hip-shared-expert-prefetch-tests)
+        add_test(NAME strix-hip-shared-expert-prefetch-tests COMMAND strix-hip-shared-expert-prefetch-tests)
 
         add_executable(
             strix-hip-indexed-attention-launcher-tests

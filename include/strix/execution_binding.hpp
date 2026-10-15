@@ -29,6 +29,8 @@ struct ExecutionBindingRequest {
     bool lane_chain_hyper_output = false;
     std::vector<std::uint32_t> lane_chain_hyper_output_eligible_steps;
     bool deferred_moe_status = false;
+    bool prefetch_q8_shared_expert = false;
+    std::vector<std::uint32_t> shared_expert_prefetch_layers;
 };
 
 struct ExecutionKernelBinding {

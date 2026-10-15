@@ -7,6 +7,7 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -100,6 +101,7 @@ void validate_config(
         throw std::invalid_argument(
             "HIP shared-expert geometry must be non-zero");
     }
+    shared_expert_prefetch::validate_layers(static_cast<std::uint64_t>(UINT32_MAX)+1U,config.prefetch_q8,config.prefetch_eligible_layers);
     if (config.activation !=
             HipActivationStorage::bf16 &&
         config.activation !=
@@ -568,6 +570,44 @@ __global__ void down_projection_kernel(
     }
 }
 
+// Exact virtual T256 leaves. New kernels alone use this helper; all legacy
+// device functions remain literal. Compiler contraction and denormal modes are
+// inherited from this same translation unit and require linked ISA qualification.
+template<typename Input,bool Prefetch>
+__device__ __forceinline__ float shared_q8_virtual256_dot(const Input* input,const void* weights,std::uint32_t width,std::uint32_t row){
+    const unsigned lane=threadIdx.x&31U;float partial[8]{};
+    const auto* blocks=static_cast<const Q8Block*>(weights)+static_cast<std::uint64_t>(row)*(width/32U);
+    for(std::uint64_t chunk=0;chunk<width;chunk+=256U){
+        if constexpr(Prefetch){const auto base=chunk+8U*lane;if(base<width){const auto feature=static_cast<std::uint32_t>(base);const auto& block=blocks[feature/32U];Input values[8];std::int8_t codes[8];
+#pragma unroll
+            for(unsigned local=0;local<8;++local){values[local]=input[feature+local];codes[local]=block.values[feature%32U+local];}
+            const float scale=__half2float(block.scale);
+#pragma unroll
+            for(unsigned local=0;local<8;++local)partial[local]+=load_activation(&values[local])*(scale*static_cast<float>(codes[local]));
+        }}else{
+#pragma unroll
+            for(unsigned local=0;local<8;++local){const auto feature=chunk+8U*lane+local;if(feature<width)partial[local]+=load_activation(&input[feature])*load_weight<WeightKind::q8_0>(weights,width,row,static_cast<std::uint32_t>(feature));}
+        }
+    }
+#pragma unroll
+    for(unsigned distance=16;distance>0;distance/=2){
+#pragma unroll
+        for(unsigned local=0;local<8;++local){const float partner=__shfl_down(partial[local],distance,32);if(lane<distance)partial[local]+=partner;}
+    }
+    if(lane==0){partial[0]+=partial[4];partial[1]+=partial[5];partial[2]+=partial[6];partial[3]+=partial[7];partial[0]+=partial[2];partial[1]+=partial[3];partial[0]+=partial[1];}
+    return partial[0];
+}
+template<typename Input,bool Prefetch,unsigned RowsPerBlock>
+__global__ void shared_q8_virtual_projection_kernel(const Input* input,const void* weights,std::uint32_t width,std::uint32_t outputs,float* output){
+    const auto row=static_cast<std::uint32_t>(blockIdx.x)*RowsPerBlock+threadIdx.x/32U;if(row>=outputs)return;
+    const float sum=shared_q8_virtual256_dot<Input,Prefetch>(input,weights,width,row);if((threadIdx.x&31U)==0)output[row]=sum;
+}
+template<typename Output,bool Prefetch,unsigned RowsPerBlock>
+__global__ void shared_q8_virtual_down_kernel(const float* input,const float* shared_gate,const void* weights,std::uint32_t width,std::uint32_t outputs,Output* output){
+    const auto row=static_cast<std::uint32_t>(blockIdx.x)*RowsPerBlock+threadIdx.x/32U;if(row>=outputs)return;
+    const float sum=shared_q8_virtual256_dot<float,Prefetch>(input,weights,width,row);if((threadIdx.x&31U)==0)store_activation(&output[row],sum * *shared_gate);
+}
+
 bool contains(
     std::string_view text,
     std::string_view needle) {
@@ -740,7 +780,8 @@ void launch_projection_by_kind(
     const RuntimeTensorBinding& weights,
     std::uint32_t input_width,
     std::uint32_t output_width,
-    float* output) {
+    float* output,bool prefetch=false,shared_expert_prefetch::RuntimeDispatchStats* stats=nullptr) {
+    if(prefetch && kind==WeightKind::q8_0 && input_width%32U==0){hipLaunchKernelGGL(HIP_KERNEL_NAME(shared_q8_virtual_projection_kernel<Input,true,8>),dim3(output_width/8U+(output_width%8U!=0U)),dim3(256),0,hip_execution_stream(),input,reinterpret_cast<const void*>(weights.address),input_width,output_width,output);check_hip(hipGetLastError(),"HIP shared prefetch8 gate/up launch");if(stats)stats->dispatched_projections.fetch_add(1,std::memory_order_relaxed);return;}
 #define STRIX_LAUNCH_CASE(kind_name)     hipLaunchKernelGGL(         HIP_KERNEL_NAME(             projection_to_fp32_kernel<                 Input, WeightKind::kind_name>),         dim3(output_width),         dim3(kThreads),         0, hip_execution_stream(),         input,         reinterpret_cast<const void*>(weights.address),         input_width,         output_width,         output)
     switch (kind) {
     case WeightKind::f32: STRIX_LAUNCH_CASE(f32); break;
@@ -786,7 +827,8 @@ void launch_down_by_kind(
     const RuntimeTensorBinding& weights,
     std::uint32_t intermediate_size,
     std::uint32_t hidden_size,
-    Output* output) {
+    Output* output,bool prefetch=false,shared_expert_prefetch::RuntimeDispatchStats* stats=nullptr) {
+    if(prefetch && kind==WeightKind::q8_0 && intermediate_size%32U==0){hipLaunchKernelGGL(HIP_KERNEL_NAME(shared_q8_virtual_down_kernel<Output,true,8>),dim3(hidden_size/8U+(hidden_size%8U!=0U)),dim3(256),0,hip_execution_stream(),intermediate,shared_gate,reinterpret_cast<const void*>(weights.address),intermediate_size,hidden_size,output);check_hip(hipGetLastError(),"HIP shared prefetch8 down launch");if(stats)stats->dispatched_projections.fetch_add(1,std::memory_order_relaxed);return;}
 #define STRIX_DOWN_CASE(kind_name)     hipLaunchKernelGGL(         HIP_KERNEL_NAME(             down_projection_kernel<                 Output, WeightKind::kind_name>),         dim3(hidden_size),         dim3(kThreads),         0, hip_execution_stream(),         intermediate,         shared_gate,         reinterpret_cast<const void*>(weights.address),         intermediate_size,         hidden_size,         output)
     switch (kind) {
     case WeightKind::f32: STRIX_DOWN_CASE(f32); break;
@@ -832,7 +874,7 @@ void launch_typed(
         *tensors.gate.runtime,
         config.hidden_size,
         config.intermediate_size,
-        gate);
+        gate,config.prefetch_q8 && shared_expert_prefetch::eligible(*tensors.gate.manifest),config.prefetch_stats.get());
 
     launch_projection_by_kind(
         weight_kind(
@@ -842,7 +884,7 @@ void launch_typed(
         *tensors.up.runtime,
         config.hidden_size,
         config.intermediate_size,
-        up);
+        up,config.prefetch_q8 && shared_expert_prefetch::eligible(*tensors.up.manifest),config.prefetch_stats.get());
 
     const auto blocks =
         (config.intermediate_size +
@@ -878,7 +920,7 @@ void launch_typed(
         config.intermediate_size,
         config.hidden_size,
         reinterpret_cast<Storage*>(
-            output.address));
+            output.address),config.prefetch_q8 && shared_expert_prefetch::eligible(*tensors.down.manifest),config.prefetch_stats.get());
 }
 
 void launch_shared_expert(
@@ -974,6 +1016,19 @@ void launch_shared_expert(
         1,
         "shared expert gate");
 
+    if(config.prefetch_q8){
+        if(!shared_expert_prefetch::selected(true,config.prefetch_eligible_layers,context.layer))throw std::invalid_argument("shared prefetch layer differs from admitted plan");
+        unsigned eligible=0;for(const auto* tensor:{&tensors.gate,&tensors.up,&tensors.down})if(shared_expert_prefetch::eligible(*tensor->manifest)){++eligible;const auto required=shared_expert_prefetch::required_weight_bytes(tensor->manifest->dimensions[0],tensor->manifest->dimensions[1]);if(tensor->manifest->absolute_offset%16U!=0 || tensor->runtime->address%16U!=0 || tensor->manifest->byte_size<required || tensor->runtime->bytes<required)throw std::invalid_argument("shared prefetch weight alignment/extent invalid");}
+        if(eligible==0)throw std::invalid_argument("shared prefetch step has no eligible matrix");
+        struct Range{std::uintptr_t address;std::uint64_t bytes;};
+        std::array<Range,5> reads{};reads[0]={input.address,input.bytes};unsigned index=1;for(const auto* tensor:{&tensors.gate,&tensors.up,&tensors.down,&tensors.shared_gate})reads[index++]={tensor->runtime->address,tensor->runtime->bytes};
+        const std::array<Range,2> writes{{{temporary.address,temporary.bytes},{output.address,output.bytes}}};
+        const auto valid=[](Range v){return v.address!=0 && v.bytes!=0 && v.bytes<=UINTPTR_MAX-v.address;};const auto overlap=[](Range a,Range b){return a.address<b.address+b.bytes && b.address<a.address+a.bytes;};
+        if(input.address%activation_bytes || output.address%activation_bytes || temporary.address%4U)throw std::invalid_argument("shared prefetch activation owner alignment invalid");
+        for(auto v:reads)if(!valid(v))throw std::invalid_argument("shared prefetch read owner invalid");
+        for(unsigned i=0;i<writes.size();++i){if(!valid(writes[i]))throw std::invalid_argument("shared prefetch write owner invalid");for(auto v:reads)if(overlap(writes[i],v))throw std::invalid_argument("shared prefetch writable/read alias");for(unsigned j=0;j<i;++j)if(overlap(writes[i],writes[j]))throw std::invalid_argument("shared prefetch writable alias");}
+    }
+
     switch (config.activation) {
     case HipActivationStorage::bf16:
         launch_typed<std::uint16_t>(
@@ -1015,7 +1070,7 @@ std::string kernel_id(
             request.logical_rows) +
         ".c" +
         std::to_string(
-            request.request_concurrency);
+            request.request_concurrency) + (config.prefetch_q8?std::string(shared_expert_prefetch::kernel_suffix):"");
 }
 
 std::uint64_t implementation_identity(
@@ -1028,10 +1083,35 @@ std::uint64_t implementation_identity(
         hash,
         static_cast<std::uint64_t>(
             config.activation));
+    if(config.prefetch_q8){hash_u64(hash,0x5348505246563031ULL);for(auto layer:config.prefetch_eligible_layers)hash_u64(hash,layer);}
     return hash;
 }
 
 }  // namespace
+
+namespace {
+template<typename Storage>
+void shared_projection_probe_typed(HipSharedQ8ProjectionRole role,HipSharedQ8ProjectionMode mode,HipSharedQ8ProjectionView input,HipSharedQ8ProjectionView weights,HipSharedQ8ProjectionView gate,HipSharedQ8ProjectionView output,unsigned width,unsigned outputs,hipStream_t stream){
+    const auto* w=reinterpret_cast<const void*>(weights.address);const auto* g=reinterpret_cast<const float*>(gate.address);
+    if(role==HipSharedQ8ProjectionRole::gate_up){const auto* in=reinterpret_cast<const Storage*>(input.address);auto* out=reinterpret_cast<float*>(output.address);
+        if(mode==HipSharedQ8ProjectionMode::legacy256)hipLaunchKernelGGL(HIP_KERNEL_NAME(projection_to_fp32_kernel<Storage,WeightKind::q8_0>),dim3(outputs),dim3(256),0,stream,in,w,width,outputs,out);
+        else if(mode==HipSharedQ8ProjectionMode::virtual256)hipLaunchKernelGGL(HIP_KERNEL_NAME(shared_q8_virtual_projection_kernel<Storage,false,1>),dim3(outputs),dim3(32),0,stream,in,w,width,outputs,out);
+        else hipLaunchKernelGGL(HIP_KERNEL_NAME(shared_q8_virtual_projection_kernel<Storage,true,8>),dim3(outputs/8U+(outputs%8U!=0U)),dim3(256),0,stream,in,w,width,outputs,out);
+    }else{const auto* in=reinterpret_cast<const float*>(input.address);auto* out=reinterpret_cast<Storage*>(output.address);
+        if(mode==HipSharedQ8ProjectionMode::legacy256)hipLaunchKernelGGL(HIP_KERNEL_NAME(down_projection_kernel<Storage,WeightKind::q8_0>),dim3(outputs),dim3(256),0,stream,in,g,w,width,outputs,out);
+        else if(mode==HipSharedQ8ProjectionMode::virtual256)hipLaunchKernelGGL(HIP_KERNEL_NAME(shared_q8_virtual_down_kernel<Storage,false,1>),dim3(outputs),dim3(32),0,stream,in,g,w,width,outputs,out);
+        else hipLaunchKernelGGL(HIP_KERNEL_NAME(shared_q8_virtual_down_kernel<Storage,true,8>),dim3(outputs/8U+(outputs%8U!=0U)),dim3(256),0,stream,in,g,w,width,outputs,out);
+    }
+}
+}
+void launch_hip_shared_q8_projection_probe(HipSharedQ8ProjectionRole role,HipSharedQ8ProjectionMode mode,HipActivationStorage storage,HipSharedQ8ProjectionView input,HipSharedQ8ProjectionView weights,HipSharedQ8ProjectionView gate,HipSharedQ8ProjectionView output,std::uint32_t width,std::uint32_t outputs,void* stream){
+    const bool down=role==HipSharedQ8ProjectionRole::down;const auto weight_bytes=shared_expert_prefetch::required_weight_bytes(width,outputs);const auto element_bytes=static_cast<std::uint64_t>(storage);
+    const auto valid=[](HipSharedQ8ProjectionView v,std::uint64_t n){return v.address!=0 && v.address%16U==0 && v.bytes==n && v.bytes<=UINTPTR_MAX-v.address;};
+    if((role!=HipSharedQ8ProjectionRole::gate_up && !down) || (mode!=HipSharedQ8ProjectionMode::legacy256 && mode!=HipSharedQ8ProjectionMode::virtual256 && mode!=HipSharedQ8ProjectionMode::prefetch8) || (storage!=HipActivationStorage::bf16 && storage!=HipActivationStorage::fp32) || !valid(input,static_cast<std::uint64_t>(width)*(down?4U:element_bytes)) || !valid(weights,weight_bytes) || !valid(output,static_cast<std::uint64_t>(outputs)*(down?element_bytes:4U)) || (down?!valid(gate,4U):(gate.address!=0 || gate.bytes!=0)))throw std::invalid_argument("shared projection probe exact views/role invalid");
+    const auto overlap=[](HipSharedQ8ProjectionView x,HipSharedQ8ProjectionView y){return x.address<y.address+y.bytes && y.address<x.address+x.bytes;};if(overlap(output,input)||overlap(output,weights)||(down && overlap(output,gate)))throw std::invalid_argument("shared projection probe writable alias");
+    check_hip(hipPeekAtLastError(),"shared projection probe stale error");
+    if(storage==HipActivationStorage::bf16)shared_projection_probe_typed<std::uint16_t>(role,mode,input,weights,gate,output,width,outputs,static_cast<hipStream_t>(stream));else shared_projection_probe_typed<float>(role,mode,input,weights,gate,output,width,outputs,static_cast<hipStream_t>(stream));check_hip(hipGetLastError(),"shared projection probe launch");
+}
 
 void register_hip_shared_expert_kernel_variant(
     const ModelContract& model,
@@ -1046,6 +1126,9 @@ void register_hip_shared_expert_kernel_variant(
             error);
     }
     validate_config(config);
+    if(config.prefetch_q8!=request.prefetch_q8_shared_expert || config.prefetch_eligible_layers!=request.shared_expert_prefetch_layers)throw std::invalid_argument("shared prefetch config/request mismatch");
+    shared_expert_prefetch::validate_layers(model.hidden_layers,config.prefetch_q8,config.prefetch_eligible_layers);
+    if(config.prefetch_q8 && qualification!=kernels::QualificationStatus::experimental)throw std::invalid_argument("shared prefetch variant remains experimental");
     if (config.hidden_size !=
             model.hidden_size ||
         config.intermediate_size !=
@@ -1111,7 +1194,7 @@ void register_hip_shared_expert_kernel_variant(
     variant.output_layout =
         "row-major";
     variant.compiler_identity =
-        "hip-gfx1151-shared-expert-v1";
+        config.prefetch_q8?"hip-gfx1151-shared-expert-v2-prefetch8-virtual256-q8":"hip-gfx1151-shared-expert-v1";
     variant.measured_seconds = 0.0;
 
     registry.add(
@@ -1148,37 +1231,14 @@ register_for_compiled_execution(
             "HIP shared-expert bundle requires valid compiled execution");
     }
 
-    std::string registered_id;
-    for (std::size_t index = 0;
-         index < compiled.execution.steps.size();
-         ++index) {
-        if (compiled.execution.steps[index].op !=
-            SerialOp::shared_expert) {
-            continue;
-        }
-
-        const auto& binding =
-            compiled.bindings.bindings[index];
-        if (binding.host_or_runtime_step ||
-            !binding.kernel_id.has_value() ||
-            binding.kernel_id->empty()) {
-            throw std::invalid_argument(
-                "HIP shared-expert step has no kernel binding");
-        }
-
-        if (registered_id.empty()) {
-            registered_id =
-                *binding.kernel_id;
-            registry.add_kernel_launcher(
-                make_hip_shared_expert_launcher(
-                    registered_id,
-                    &config_));
-        } else if (registered_id !=
-                   *binding.kernel_id) {
-            throw std::invalid_argument(
-                "HIP shared-expert bundle requires one selected kernel id");
-        }
-    }
+    ExecutionBindingRequest shape;shape.logical_rows=compiled.logical_rows;shape.request_concurrency=compiled.request_concurrency;
+    if(config_.prefetch_q8 && std::none_of(compiled.bindings.bindings.begin(),compiled.bindings.bindings.end(),
+        [](const auto& binding){return binding.op==SerialOp::shared_expert && binding.kernel_id &&
+            binding.kernel_id->ends_with(shared_expert_prefetch::kernel_suffix);}))
+        throw std::invalid_argument("shared prefetch bundle has no eligible step");
+    std::vector<std::string> registered;bool saw_prefetch=false;
+    for(std::size_t i=0;i<compiled.execution.steps.size();++i){if(compiled.execution.steps[i].op!=SerialOp::shared_expert)continue;const auto& binding=compiled.bindings.bindings[i];if(binding.host_or_runtime_step || !binding.kernel_id || binding.kernel_id->empty())throw std::invalid_argument("HIP shared step has no kernel binding");const bool prefetch=binding.kernel_id->ends_with(shared_expert_prefetch::kernel_suffix);if(prefetch!=shared_expert_prefetch::selected(config_.prefetch_q8,config_.prefetch_eligible_layers,compiled.execution.steps[i].layer))throw std::invalid_argument("shared prefetch bundle layer/config mismatch");auto* selected=prefetch?&config_:&fallback_config_;if(*binding.kernel_id!=kernel_id(shape,*selected))throw std::invalid_argument("HIP shared bundle permits only its base/prefetch pair");if(std::find(registered.begin(),registered.end(),*binding.kernel_id)==registered.end()){registry.add_kernel_launcher(make_hip_shared_expert_launcher(*binding.kernel_id,selected));registered.push_back(*binding.kernel_id);}saw_prefetch|=prefetch;}
+    if(config_.prefetch_q8 && !saw_prefetch)throw std::invalid_argument("shared prefetch bundle has no eligible step");
 }
 
 }  // namespace strix

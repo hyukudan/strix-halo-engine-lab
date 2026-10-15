@@ -43,6 +43,9 @@ struct HipLauncherCatalogConfig {
     bool prefetch_q8_qsa_input = false;
     std::vector<std::uint32_t> qsa_input_prefetch_layers;
     std::shared_ptr<qsa_input_prefetch::RuntimeDispatchStats> qsa_input_prefetch_stats;
+    bool prefetch_q8_shared_expert = false;
+    std::vector<std::uint32_t> shared_expert_prefetch_layers;
+    std::shared_ptr<shared_expert_prefetch::RuntimeDispatchStats> shared_expert_prefetch_stats;
 };
 
 void register_complete_hip_kernel_catalog(

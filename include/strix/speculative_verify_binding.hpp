@@ -20,6 +20,7 @@ struct SpeculativeVerifyBindingRequest {
     bool prefetch_q8_qsa_input = false;
     bool lane_chain_hyper_output = false;
     bool deferred_moe_status = false;
+    bool prefetch_q8_shared_expert = false;
 };
 
 [[nodiscard]] ExecutionBindingPlan

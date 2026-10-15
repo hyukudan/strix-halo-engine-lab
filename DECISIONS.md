@@ -90,3 +90,15 @@ A zero-on-construction/dirty-state optimization needs owner recovery injection
 coverage before changing lifecycle semantics. Evidence: E-051. Reopen after
 native compiler/ISA, bounded async fixtures, model fidelity and paired workload
 measurements; see `DESIGN_ACCEPTANCE.md` and `docs/deferred-moe-status.md`.
+## D-019 (2026-10-15): explicit Q8 shared-expert loading experiment
+
+Choose a default-off gate/up/down loading schedule with unchanged T256 leaves,
+reduction and activation/store semantics. Alternatives: retain only the existing
+schedule, or change the arithmetic/activation fusion. The isolated loading change
+keeps exactness independently testable and preserves the scalar gate and SiLU.
+Evidence: E-054 and the project-owned implementation note. Risk: eight rows per
+workgroup and reduced waves can have shape-dependent cost; source equivalence
+cannot establish compiler behavior or useful workload speed. Spec consequence:
+explicit per-tensor eligibility, operator IDs, actual-dispatch receipts and all
+native fidelity/latency gates precede adoption. Reopen after linked ISA, actual
+fixtures, full-model equality and paired preparation-inclusive measurements.

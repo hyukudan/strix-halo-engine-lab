@@ -119,3 +119,17 @@ executable linked to the real core with private HIP type/constant declarations;
 it invokes no HIP API and provides no runtime qualification. Native fixture C++
 API parsing succeeds both with and without experimental A8 capability enabled.
 E-051 native/compiler/ISA/model/performance gates: **pendiente**.
+## E-054 (2026-10-15): shared-expert Q8 projection loading source increment
+
+Artifacts: `docs/implementation-2026-10-15-shared-expert-prefetch.md`,
+`tests/shared_expert_prefetch_tests.cpp`,
+`tests/hip_shared_expert_prefetch_tests.hip`, and full-operator/catalog fixtures.
+Commands: build and run `strix-shared-expert-prefetch-tests`; optional native
+`strix-hip-shared-expert-prefetch-tests`, existing shared launcher and catalog
+targets. Host planning tests pass in a private external MSVC portability harness
+excluding the baseline POSIX stream TU and disabling warnings-as-errors because
+of pre-existing unreachable-code warnings. This is a limited host gate. C++ API
+syntax checks are not HIP compilation. Actual linked legacy/new ISA, device tests,
+complete model arrays/tokens and workload performance remain pending. Requirements:
+exact gate/up raw FP32 and down scalar-gate/store behavior, explicit fallback and
+identity admission, poisoned eager/graph fixtures and host dispatch counters.

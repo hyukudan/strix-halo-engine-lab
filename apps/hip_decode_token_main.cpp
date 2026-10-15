@@ -19,6 +19,7 @@
 #include "strix/runtime_allocator.hpp"
 #include "strix/raw_baseline_recording.hpp"
 #include "strix/qsa_input_prefetch.hpp"
+#include "strix/shared_expert_prefetch.hpp"
 #include "strix/decode_execution_options.hpp"
 #include "strix/decode_integer_head.hpp"
 #include "strix/hip_integer_projection_runtime.hpp"
@@ -188,6 +189,7 @@ struct Options {
     bool deferred_moe_status = false;
     bool prefetch_q8_gdn_input = false;
     bool prefetch_q8_qsa_input = false;
+    bool prefetch_q8_shared_expert = false;
     bool virtual_q8_gdn_output = false;
     std::uint64_t ple_max_rows_per_io = 4;
     std::uint64_t ple_max_inflight_ios = 4;
@@ -214,7 +216,7 @@ Options parse_options(
             "[--planned-ple-io] [--ple-max-rows-per-io N] [--ple-max-inflight-ios N] "
             "[--generate N] [--eos-token TOKEN_ID] [--prefix-cache-roundtrip] "
             "[--parallel-moe-router] [--ranked-moe-router-topk | --wave-moe-router-topk] "
-            "[--prefetch-q8-qsa-input] [--virtual-q8-lm-head] [--virtual-q8-gdn-input [--prefetch-q8-gdn-input]] [--q4k-a8g32-gate-up [--grouped-exact-q51-down]] [--deferred-moe-status] "
+            "[--prefetch-q8-qsa-input] [--prefetch-q8-shared-expert] [--virtual-q8-lm-head] [--virtual-q8-gdn-input [--prefetch-q8-gdn-input]] [--q4k-a8g32-gate-up [--grouped-exact-q51-down]] [--deferred-moe-status] "
             "[--parallel-hyper-mix [--staged-hyper-projections [--fused-staged-hyper-mix [--typed-fused-hyper-projections [--prefetch-typed-hyper-rows] [--prefetch-q8-hyper-output [--lane-chain-hyper-output]]]]]]");
     }
 
@@ -294,6 +296,7 @@ Options parse_options(
             continue;
         }
         if(argument=="--prefetch-q8-qsa-input"){if(options.prefetch_q8_qsa_input)throw std::invalid_argument("duplicate prefetch Q8 QSA input option");options.prefetch_q8_qsa_input=true;continue;}
+        if(argument=="--prefetch-q8-shared-expert"){if(options.prefetch_q8_shared_expert)throw std::invalid_argument("duplicate prefetch Q8 shared expert option");options.prefetch_q8_shared_expert=true;continue;}
         if (argument == "--prefetch-q8-gdn-input") {
             if (options.prefetch_q8_gdn_input) throw std::invalid_argument("duplicate prefetch Q8 GDN input option");
             options.prefetch_q8_gdn_input = true;
@@ -819,6 +822,7 @@ int main(
             "  --record-raw ABS_NEW_PRIVATE_DIRECTORY --record-max-bytes BYTES\n"
             "  --record-state-policy final|each --prefix-cache-roundtrip\n"
             "  --prefetch-q8-qsa-input (opt-in exact-tree Q8 input projections)\n"
+            "  --prefetch-q8-shared-expert (opt-in exact-tree Q8 gate/up/down)\n"
             "  --execution-mode eager|graph (default eager)\n"
             "  --deferred-moe-status (owned eager C1 completion before token publication)\n"
             "  --graph-workspace-bytes BYTES --graph-executable-bytes BYTES\n"
@@ -1016,8 +1020,21 @@ int main(
     if(options.prefetch_q8_qsa_input) qsa_input_mode_receipt+="],\n";
     const auto qsa_prefetch_stats=options.prefetch_q8_qsa_input ?
         std::make_shared<strix::qsa_input_prefetch::RuntimeDispatchStats>() : nullptr;
+    const auto shared_prefetch_plan=options.prefetch_q8_shared_expert?strix::shared_expert_prefetch::build_plan(model,manifest):strix::shared_expert_prefetch::Plan{};
+    std::string shared_mode_receipt="  \"prefetch_q8_shared_expert\": "+std::string(options.prefetch_q8_shared_expert?"true":"false")+",\n";
+    if(options.prefetch_q8_shared_expert) shared_mode_receipt+="  \"prefetch_q8_shared_expert_eligible_steps\": "+std::to_string(shared_prefetch_plan.eligible_steps)+",\n";
+    if(options.prefetch_q8_shared_expert) shared_mode_receipt+="  \"prefetch_q8_shared_expert_fallback_steps\": "+std::to_string(shared_prefetch_plan.fallback_steps)+",\n";
+    if(options.prefetch_q8_shared_expert) shared_mode_receipt+="  \"prefetch_q8_shared_expert_eligible_projections\": "+std::to_string(shared_prefetch_plan.eligible_projections)+",\n";
+    if(options.prefetch_q8_shared_expert) shared_mode_receipt+="  \"prefetch_q8_shared_expert_fallback_projections\": "+std::to_string(shared_prefetch_plan.fallback_projections)+",\n";
+    if(options.prefetch_q8_shared_expert) shared_mode_receipt+="  \"prefetch_q8_shared_expert_projection_choices\": [";
+    for(std::size_t i=0;i<shared_prefetch_plan.projections.size();++i){const auto& c=shared_prefetch_plan.projections[i];if(i)shared_mode_receipt+=",";shared_mode_receipt+="{\"layer\":"+std::to_string(c.layer)+",\"projection\":"+std::to_string(i%3U)+",\"tensor_name\":\""+c.tensor_name+"\",\"projection_kernel\":\""+std::string(c.eligible?strix::shared_expert_prefetch::projection_prefetch_id:strix::shared_expert_prefetch::projection_base_id)+"\"}";}
+    if(options.prefetch_q8_shared_expert) shared_mode_receipt+="],\n";
+    const auto shared_prefetch_stats=options.prefetch_q8_shared_expert ?
+        std::make_shared<strix::shared_expert_prefetch::RuntimeDispatchStats>() : nullptr;
     const auto gdn_output_mode_receipt=[&] {
-        std::string receipt=(options.virtual_q8_gdn_output ? "  \"virtual_q8_gdn_output\": true,\n" : "")+qsa_input_mode_receipt+lane_chain_mode_receipt;
+        std::string receipt=(options.virtual_q8_gdn_output ? "  \"virtual_q8_gdn_output\": true,\n" : "")+shared_mode_receipt+qsa_input_mode_receipt+lane_chain_mode_receipt;
+        if(shared_prefetch_stats) receipt += "  \"prefetch_q8_shared_expert_dispatched_projections\": "+
+            std::to_string(shared_prefetch_stats->dispatched_projections.load(std::memory_order_relaxed))+",\n";
         if(qsa_prefetch_stats) receipt += "  \"prefetch_q8_qsa_input_dispatched_projections\": "+
             std::to_string(qsa_prefetch_stats->dispatched_projections.load(std::memory_order_relaxed))+",\n";
         return receipt;
@@ -1077,6 +1094,11 @@ int main(
     catalog_config.qsa_input_prefetch_stats=qsa_prefetch_stats;
     binding_request.prefetch_q8_qsa_input=options.prefetch_q8_qsa_input;
     binding_request.qsa_input_prefetch_layers=qsa_prefetch_plan.layers;
+    catalog_config.prefetch_q8_shared_expert=options.prefetch_q8_shared_expert;
+    catalog_config.shared_expert_prefetch_layers=shared_prefetch_plan.layers;
+    catalog_config.shared_expert_prefetch_stats=shared_prefetch_stats;
+    binding_request.prefetch_q8_shared_expert=options.prefetch_q8_shared_expert;
+    binding_request.shared_expert_prefetch_layers=shared_prefetch_plan.layers;
     catalog_config.virtual_q8_gdn_output = options.virtual_q8_gdn_output;
     std::optional<strix::integer_projection::RuntimeConfig> integer_config;
     if (options.execution.integer_head != strix::DecodeIntegerHead::none) {
@@ -1133,6 +1155,7 @@ int main(
         compiled.execution, manifest, tensor_index,
         strix::build_serial_execution_tensor_requirements(compiled.execution));
     strix::qsa_input_prefetch::validate_tensor_access(qsa_prefetch_plan,manifest,compiled.execution,tensor_access);
+    strix::shared_expert_prefetch::validate_tensor_access(shared_prefetch_plan,manifest,compiled.execution,tensor_access);
 
     strix::SerialSessionStateLayoutRequest
         state_request;
@@ -1173,6 +1196,18 @@ int main(
         const auto bytes=strix::qsa_input_prefetch::required_weight_bytes(found->dimensions[0],found->dimensions[1]);
         if(!runtime || runtime->address==0 || runtime->address%16U!=0 || runtime->bytes<bytes)
             throw std::invalid_argument("QSA prefetch resident weight alignment/extent invalid");
+    }
+    // Admit all actual eligible device views before the first token can enqueue.
+    for(const auto& projection:shared_prefetch_plan.projections) {
+        if(!projection.eligible) continue;
+        const auto tensor=std::find_if(manifest.tensors.begin(),manifest.tensors.end(),
+            [&](const auto& t){return t.name==projection.tensor_name;});
+        if(tensor==manifest.tensors.end())throw std::logic_error("shared admitted tensor disappeared");
+        const auto index=static_cast<std::uint32_t>(tensor-manifest.tensors.begin());
+        const auto* runtime=strix::find_runtime_tensor_binding(model_residency.binding(),index);
+        const auto bytes=strix::shared_expert_prefetch::required_weight_bytes(tensor->dimensions[0],tensor->dimensions[1]);
+        if(!runtime || runtime->address==0 || runtime->address%16U || runtime->bytes<bytes)
+            throw std::invalid_argument("shared prefetch resident weight alignment/extent invalid");
     }
 
 
