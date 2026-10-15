@@ -231,6 +231,17 @@ if(BUILD_TESTING OR STRIX_BUILD_EXPERIMENTAL_Q4K_A8_PROBE OR STRIX_ENABLE_EXPERI
     endif()
 endif()
 if(BUILD_TESTING)
+    # Diagnostic-only byte permutation. It is never linked into the decoder.
+    add_library(strix_hc_repacked_down_pack STATIC src/hc_repacked_down_pack.cpp)
+    target_include_directories(strix_hc_repacked_down_pack PUBLIC include)
+    target_compile_features(strix_hc_repacked_down_pack PUBLIC cxx_std_20)
+    target_link_libraries(strix_hc_repacked_down_pack PUBLIC strix_core)
+    strix_target_warnings(strix_hc_repacked_down_pack)
+    add_executable(strix-hc-repacked-down-pack-tests tests/hc_repacked_down_pack_tests.cpp)
+    target_link_libraries(strix-hc-repacked-down-pack-tests PRIVATE strix_hc_repacked_down_pack)
+    strix_target_warnings(strix-hc-repacked-down-pack-tests)
+    add_test(NAME strix-hc-repacked-down-pack-tests COMMAND strix-hc-repacked-down-pack-tests)
+
     add_executable(strix-decode-optimization-profile-tests tests/decode_optimization_profile_tests.cpp)
     target_link_libraries(strix-decode-optimization-profile-tests PRIVATE strix_core)
     strix_target_warnings(strix-decode-optimization-profile-tests)
@@ -1299,6 +1310,18 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         target_link_libraries(strix-hip-lane-chain-hyper-projection-tests PRIVATE strix_hip_runtime)
         strix_target_warnings(strix-hip-lane-chain-hyper-projection-tests)
         add_test(NAME strix-hip-lane-chain-hyper-projection-tests COMMAND strix-hip-lane-chain-hyper-projection-tests)
+        add_library(strix_hc_repacked_diagnostic STATIC src/hip_hc_repacked_diagnostic.hip)
+        target_include_directories(strix_hc_repacked_diagnostic PUBLIC include)
+        set_target_properties(strix_hc_repacked_diagnostic PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+        target_link_libraries(strix_hc_repacked_diagnostic PUBLIC strix_core "${STRIX_HIP_RUNTIME_LIBRARY}")
+        strix_target_warnings(strix_hc_repacked_diagnostic)
+        add_executable(strix-hip-repacked-hyper-projection-tests tests/hip_repacked_hyper_projection_tests.hip)
+        set_target_properties(strix-hip-repacked-hyper-projection-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+        target_link_libraries(strix-hip-repacked-hyper-projection-tests PRIVATE strix_hip_runtime strix_hc_repacked_down_pack strix_hc_repacked_diagnostic)
+        strix_target_warnings(strix-hip-repacked-hyper-projection-tests)
+        # No implicit GPU schedule: the admitted compiler receipt determines
+        # STRIX_HC_REPACKED_ADMITTED_SCHEDULES in the native test environment.
+        add_test(NAME strix-hip-repacked-hyper-projection-tests COMMAND strix-hip-repacked-hyper-projection-tests)
         add_executable(
             strix-hip-hyper-mix-launcher-tests
             tests/hip_hyper_mix_launcher_tests.hip
