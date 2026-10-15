@@ -1681,10 +1681,29 @@ void test_catalog_and_bundle() {
     output_up.dimensions = {model.hc_lowrank, model.hidden_size * model.hc_count};
     output_manifest.tensors.push_back(output_up);
     auto output_access = typed_access;
-    for (const auto& mixer : execution.steps)
-        if (mixer.op == strix::SerialOp::attn_hyper_mix || mixer.op == strix::SerialOp::mlp_hyper_mix ||
-            mixer.op == strix::SerialOp::final_hyper_mix)
-            output_access.accesses.push_back({mixer.id, mixer.op, 2U, {2U}});
+    output_access.accesses.clear();
+    // Lookup uses lower_bound(step_id, binding_slot). Build each mixer's full
+    // slot sequence together; appending all up slots later is not a valid plan.
+    for (const auto& mixer : execution.steps) {
+        if (mixer.op != strix::SerialOp::attn_hyper_mix && mixer.op != strix::SerialOp::mlp_hyper_mix &&
+            mixer.op != strix::SerialOp::final_hyper_mix) continue;
+        output_access.accesses.push_back({mixer.id, mixer.op, 1U, {0U}});
+        output_access.accesses.push_back({mixer.id, mixer.op, 2U, {2U}});
+        if (mixer.op != strix::SerialOp::final_hyper_mix)
+            output_access.accesses.push_back({mixer.id, mixer.op, 3U, {1U}});
+    }
+    for (const auto& mixer : execution.steps) {
+        if (mixer.op != strix::SerialOp::attn_hyper_mix && mixer.op != strix::SerialOp::mlp_hyper_mix &&
+            mixer.op != strix::SerialOp::final_hyper_mix) continue;
+        for (const auto slot : {1U, 2U, 3U}) {
+            if (slot == 3U && mixer.op == strix::SerialOp::final_hyper_mix) continue;
+            const auto* access = strix::find_execution_tensor_access(output_access, mixer.id, slot);
+            const auto expected_tensor = slot == 1U ? 0U : (slot == 2U ? 2U : 1U);
+            expect(access != nullptr && access->op == mixer.op &&
+                       access->tensor_indices == std::vector<std::uint32_t>{expected_tensor},
+                   "every mixer slot positively resolves before output admission controls");
+        }
+    }
     auto output_resources = typed_resources;
     output_resources.model_manifest = &output_manifest; output_resources.tensor_access = &output_access;
     auto output_compiled = compiled;
