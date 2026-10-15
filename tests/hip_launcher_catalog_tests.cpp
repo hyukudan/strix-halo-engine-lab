@@ -279,6 +279,11 @@ int main() {
                 execution,
                 complete_registry,
                 request);
+        for (std::size_t index = 0; index < execution.steps.size(); ++index)
+            if (execution.steps[index].op == strix::SerialOp::gated_delta_net)
+                expect(complete_bindings.bindings[index].kernel_id.has_value() &&
+                    !complete_bindings.bindings[index].kernel_id->ends_with(".virtual256.q8-input"),
+                    "default complete catalog selects original GDN id");
         expect(
             complete_bindings.missing_steps == 0 &&
                 complete_bindings.bound_steps +
@@ -355,10 +360,16 @@ int main() {
         graph_request.device_graph_inputs = true;
         strix::HipLauncherCatalogConfig graph_config;
         graph_config.enable_device_graph_inputs = true;
+        graph_config.virtual_q8_gdn_input = true;
         strix::kernels::KernelRegistry graph_kernels;
         strix::register_complete_hip_kernel_catalog(model, graph_request, graph_config, graph_kernels);
         strix::ExecutionBufferRequest buffers;
         const auto graph_compiled = strix::compile_serial_execution(model, graph_kernels, graph_request, buffers);
+        for (std::size_t index = 0; index < graph_compiled.execution.steps.size(); ++index)
+            if (graph_compiled.execution.steps[index].op == strix::SerialOp::gated_delta_net)
+                expect(graph_compiled.bindings.bindings[index].kernel_id.has_value() &&
+                    graph_compiled.bindings.bindings[index].kernel_id->ends_with(".virtual256.q8-input"),
+                    "flagged complete catalog selects virtual Q8 GDN id");
         expect(graph_compiled.whole_plan_graph_safe && graph_compiled.dynamic_steps == 0,
                "actual device-input catalog binds a complete fixed-shape graph DAG");
         strix::HipLauncherCatalog graph_catalog(model, graph_config);
@@ -366,6 +377,12 @@ int main() {
         graph_catalog.register_for_compiled_execution(graph_compiled, graph_launchers);
         expect(graph_catalog.audit(graph_compiled, graph_launchers).missing_steps == 0,
                "graph catalog contains every actual operator and device-position bookkeeping consumer");
+        auto no_virtual_config = graph_config; no_virtual_config.virtual_q8_gdn_input = false;
+        strix::HipLauncherCatalog no_virtual_catalog(model, no_virtual_config);
+        bool virtual_mismatch_rejected = false;
+        try { strix::ExecutionLauncherRegistry bad; no_virtual_catalog.register_for_compiled_execution(graph_compiled, bad); }
+        catch (const std::invalid_argument&) { virtual_mismatch_rejected = true; }
+        expect(virtual_mismatch_rejected, "catalog rejects virtual selected GDN id when configuration drops the flag");
         bool mismatch_rejected = false;
         try { strix::ExecutionLauncherRegistry bad; catalog.register_for_compiled_execution(graph_compiled, bad); }
         catch (const std::invalid_argument&) { mismatch_rejected = true; }
