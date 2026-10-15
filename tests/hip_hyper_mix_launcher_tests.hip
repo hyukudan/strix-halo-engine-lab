@@ -563,9 +563,16 @@ void run_numeric_fixture(
     strix::SerialOp op,
     bool with_injection, bool bf16 = false, bool enable_prefetch = false) {
     using Fixture = FixtureType;
-    const auto model =
+    auto model =
         strix::ModelContract::
             qwen38_flash_next();
+    if (enable_prefetch) {
+        // Allocate the exact fixture geometry before deriving any buffer or IO
+        // plan: the checkpoint default has only four injection output lanes.
+        model.hidden_size = Fixture::hidden;
+        model.hc_count = Fixture::hc;
+        model.hc_lowrank = Fixture::lowrank;
+    }
     const auto plan =
         strix::build_serial_decode_execution_plan(
             model);
