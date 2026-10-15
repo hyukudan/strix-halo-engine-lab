@@ -1,7 +1,10 @@
 # Opt-in Q8 indexed-attention input prefetch
 
 The `--prefetch-q8-qsa-input` experiment changes only the loading schedule of Q8_0
-query, key, value, index-query and index-key projections. It is off by default.
+query, key, value, index-query and index-key projections. The low-level and manual
+defaults are off. The [automatic profile candidate](decode-optimization-profile.md)
+selects this mode only after its content and execution admission; that policy
+still requires its own automatic-workload qualification before adoption.
 All new kernels live in the original indexed-attention translation unit, with its
 existing floating-point compiler options. The original kernels remain unchanged.
 

@@ -1,7 +1,10 @@
 # Deferred eager MoE status
 
 `strix-hip-decode-token --deferred-moe-status` selects an experimental eager C1
-completion policy. It is disabled by default and rejects graph execution,
+completion policy. Low-level and manual defaults are disabled. The
+[automatic profile candidate](decode-optimization-profile.md) includes this policy
+after content and execution admission, pending its own workload qualification.
+The completion policy rejects graph execution,
 speculative verification and the separate integer LM-head stream. Each affected
 MoE kernel ID includes `.deferred-status-v1`; implementation and compiled execution
 identities differ from synchronous eager execution. Scratch admission and existing

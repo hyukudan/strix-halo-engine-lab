@@ -620,15 +620,17 @@ inline OptimizationProfileResolution resolve_optimization_profile(
     options.prefetch_q8_hyper_output = true;
     options.lane_chain_hyper_output = true;
     options.virtual_q8_gdn_output = true;
-    // HC output and wave have separate qualification evidence. Their combined
-    // automatic profile still needs fresh integration and workload validation.
+    options.prefetch_q8_qsa_input = true;
+    options.prefetch_q8_shared_expert = true;
+    options.deferred_moe_status = true;
+    // This policy candidate requires fresh automatic-profile qualification.
     // Explicit ranked routing keeps its requested algorithm. Otherwise the
     // exact wave replacement is the qualified faster selection.
     if (!options.ranked_moe_router_topk) options.wave_moe_router_topk = true;
     options.context_tokens = 8192;
     result.automatic_applied = true;
-    result.selected = options.ranked_moe_router_topk ? "canonical-a8-ranked-hc-output-v2" :
-                                                    "canonical-a8-wave-hc-output-v2";
+    result.selected = options.ranked_moe_router_topk ? "canonical-a8-ranked-qsa-hc-shared-deferred-v3" :
+                                                    "canonical-a8-wave-qsa-hc-shared-deferred-v3";
     result.reason = options.ranked_moe_router_topk ? "explicit-ranked-router" : "qualified-checkpoint";
     return result;
 }

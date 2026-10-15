@@ -1,7 +1,10 @@
 # Opt-in Q8 shared-expert projection prefetch
 
-`--prefetch-q8-shared-expert` is an experimental, default-off loading schedule for
-eligible Q8_0 gate, up and down matrices. Every original device function remains
+`--prefetch-q8-shared-expert` is an experimental loading schedule for eligible
+Q8_0 gate, up and down matrices. Low-level and manual defaults are off. The
+[automatic profile candidate](decode-optimization-profile.md) includes it after
+content and execution admission, pending that policy's own workload qualification.
+Every original device function remains
 literal in the same HIP translation unit. The scalar sigmoid gate and the SiLU
 activation kernel are unchanged. Gate/up results retain raw FP32 precision; down
 retains the original FP32 intermediate input and multiplies the final sum by the
