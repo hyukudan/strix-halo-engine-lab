@@ -25,6 +25,18 @@ jobs:
             ctest --test-dir build --output-on-failure
           } 2>&1 | tee host-build.log
 
+      - name: Build and test optional authenticated channel contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libssl-dev
+          {
+            cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DSTRIX_ENABLE_SSH_BOUND_BOOTSTRAP=ON
+            cmake --build build --target strix-ssh-bound-copied-stream-tests
+            ctest --test-dir build -R '^strix-ssh-bound-copied-stream-tests$' --output-on-failure
+          } 2>&1 | tee ssh-bootstrap-host.log
+
       - name: Configure UMA host lab
         run: cmake -S lab/uma_residency -B build/uma-residency -G Ninja -DCMAKE_BUILD_TYPE=Release
 
@@ -79,7 +91,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: host-build-log
-          path: host-build.log
+          path: |
+            host-build.log
+            ssh-bootstrap-host.log
           if-no-files-found: ignore
 
 
