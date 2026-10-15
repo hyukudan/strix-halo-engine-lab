@@ -25,6 +25,7 @@ struct HipLauncherCatalogConfig {
     bool staged_hyper_projections = false;
     bool virtual_q8_lm_head = false;
     bool virtual_q8_gdn_input = false;
+    bool prefetch_q8_gdn_input = false;
 };
 
 void register_complete_hip_kernel_catalog(

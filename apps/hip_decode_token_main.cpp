@@ -170,6 +170,7 @@ struct Options {
     bool staged_hyper_projections = false;
     bool virtual_q8_lm_head = false;
     bool virtual_q8_gdn_input = false;
+    bool prefetch_q8_gdn_input = false;
     std::uint64_t ple_max_rows_per_io = 4;
     std::uint64_t ple_max_inflight_ios = 4;
     std::string reference_path;
@@ -194,7 +195,7 @@ Options parse_options(
             "[--context N] [--residency register|copy] [--coalesce-gap BYTES] "
             "[--planned-ple-io] [--ple-max-rows-per-io N] [--ple-max-inflight-ios N] "
             "[--generate N] [--eos-token TOKEN_ID] [--prefix-cache-roundtrip] "
-            "[--parallel-hyper-mix [--staged-hyper-projections]] [--virtual-q8-lm-head] [--virtual-q8-gdn-input]");
+            "[--parallel-hyper-mix [--staged-hyper-projections]] [--virtual-q8-lm-head] [--virtual-q8-gdn-input [--prefetch-q8-gdn-input]]");
     }
 
     Options options;
@@ -210,6 +211,11 @@ Options parse_options(
         if (argument == "--parallel-hyper-mix") {
             if (options.parallel_hyper_mix) throw std::invalid_argument("duplicate parallel hyper-mix option");
             options.parallel_hyper_mix = true;
+            continue;
+        }
+        if (argument == "--prefetch-q8-gdn-input") {
+            if (options.prefetch_q8_gdn_input) throw std::invalid_argument("duplicate prefetch Q8 GDN input option");
+            options.prefetch_q8_gdn_input = true;
             continue;
         }
         if (argument == "--virtual-q8-gdn-input") {
@@ -463,6 +469,8 @@ Options parse_options(
         throw std::invalid_argument(
             "ple-max-inflight-ios must be non-zero");
     }
+    if (options.prefetch_q8_gdn_input && !options.virtual_q8_gdn_input)
+        throw std::invalid_argument("--prefetch-q8-gdn-input requires --virtual-q8-gdn-input");
     if (options.staged_hyper_projections && !options.parallel_hyper_mix)
         throw std::invalid_argument("--staged-hyper-projections requires --parallel-hyper-mix");
     if (options.virtual_q8_lm_head && options.execution.integer_head != strix::DecodeIntegerHead::none)
@@ -863,6 +871,7 @@ int main(
     catalog_config.staged_hyper_projections = options.staged_hyper_projections;
     catalog_config.virtual_q8_lm_head = options.virtual_q8_lm_head;
     catalog_config.virtual_q8_gdn_input = options.virtual_q8_gdn_input;
+    catalog_config.prefetch_q8_gdn_input = options.prefetch_q8_gdn_input;
     std::optional<strix::integer_projection::RuntimeConfig> integer_config;
     if (options.execution.integer_head != strix::DecodeIntegerHead::none) {
         integer_config = strix::make_decode_integer_head_config(model, manifest, options.execution,
