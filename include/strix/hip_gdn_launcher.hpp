@@ -16,6 +16,7 @@ struct HipGdnLauncherConfig {
     HipActivationStorage activation =
         HipActivationStorage::bf16;
     bool enable_device_graph_inputs = false;
+    bool virtual_q8_input_projections = false;
 };
 
 void register_hip_gdn_kernel_variant(
