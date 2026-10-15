@@ -240,13 +240,16 @@ Data data(Shape s, bool injection, unsigned flavor) {
     }
     const std::array<unsigned, 3> witnesses{0U, s.width / 2U, s.width - 1U};
     if (flavor == 1) { // Signed zeros, negative-scale code zero, exact cancellation.
-        for (std::size_t j = 0; j < d.normalized.size(); ++j) d.normalized[j] = std::bit_cast<float>((j & 1U) ? 0x80000000U : 0U);
+        std::fill(d.normalized.begin(), d.normalized.end(), 0.0F);
         std::fill(d.inject.begin(), d.inject.end(), -0.0F);
         for (unsigned o = 0; o < s.rank; ++o) for (unsigned b = 0; b < s.width / 32U; ++b) {
             put_scale(d, s, o, b, 0xbc00U); for (unsigned j = 0; j < 32; ++j) put_code(d, s, o, b * 32U + j, 0);
         }
-        for (unsigned row = 0; row < s.rows; ++row) { d.normalized[static_cast<std::size_t>(row) * s.width] = 1; d.normalized[static_cast<std::size_t>(row) * s.width + 1U] = -1; }
-        for (unsigned o = 0; o < s.rank; ++o) { put_code(d, s, o, 0, 1); put_code(d, s, o, 1, 1); }
+        for (unsigned row = 0; row < s.rows; ++row) { d.normalized[static_cast<std::size_t>(row) * s.width] = 1; d.normalized[static_cast<std::size_t>(row) * s.width + 1U] = 1; }
+        // Even outputs contain only -0 products, distinguishing the required
+        // +0 accumulator from a -0 start or a folded first product. Odd outputs
+        // additionally retain the nonzero exact-cancellation witness.
+        for (unsigned o = 1; o < s.rank; o += 2U) { put_code(d, s, o, 0, 1); put_code(d, s, o, 1, -1); }
     }
     if (flavor == 2 || flavor == 3) { // Distinct qNaN/sNaN payloads at early/middle/last features.
         for (unsigned row = 0; row < s.rows; ++row) for (unsigned k = 0; k < witnesses.size(); ++k)
@@ -414,6 +417,12 @@ void synthetic(const std::vector<Schedule>& admitted) {
     for (const auto& c : cases) {
         for (unsigned flavor = 0; flavor < 12; ++flavor) {
             const auto input = data(c.shape, c.injection, flavor); Fixture f(c.shape, input.normalized, input.down, input.inject);
+            if (flavor == 1) for (unsigned row = 0; row < c.shape.rows; ++row) for (unsigned o = 0; o < c.shape.rank; o += 2U) {
+                std::uint32_t bits = 0;
+                const auto at = (static_cast<std::size_t>(row) * c.shape.rank + o) * sizeof(bits);
+                std::memcpy(&bits, f.expected.data() + at, sizeof(bits));
+                require(bits == 0x00000000U, "signed-zero fixture power: rows8 even output is not raw +0");
+            }
             exercise(f, admitted, flavor == 0 && c.shape.width == 10240 && c.shape.rank == 320 && c.shape.rows == 1);
             ++count;
         }

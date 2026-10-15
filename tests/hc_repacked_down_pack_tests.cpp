@@ -275,6 +275,11 @@ std::string file_sha(const std::filesystem::path& path) {
 // CPU-only admission gate. No HIP headers, runtime calls or device allocation.
 // The canonical 97-name set is independent of the later captured-input corpus.
 void qualify_real_downs(const RealOptions& options) {
+    // This diagnostic is admitted only where the running binary can be pinned.
+    // canonical throws if /proc/self/exe is unavailable; no ledger is emitted.
+    const auto executable = std::filesystem::canonical("/proc/self/exe");
+    require(std::filesystem::is_regular_file(executable), "running executable is not a regular file");
+    const auto executable_sha = file_sha(executable);
     const auto size_before = std::filesystem::file_size(options.model);
     const auto time_before = std::filesystem::last_write_time(options.model);
     require(file_sha(options.model) == options.model_sha, "whole-model SHA256 mismatch before CPU qualification");
@@ -285,6 +290,7 @@ void qualify_real_downs(const RealOptions& options) {
     const auto g = geometry(10240, 320);
     std::ostringstream ledger;
     ledger << "{\"schema\":\"strix-hc-real-down-pack-v1\",\"layout_id\":\"" << kLayoutId
+           << "\",\"executable_sha256\":\"" << executable_sha
            << "\",\"model_sha256\":\"" << options.model_sha << "\",\"model_bytes\":" << size_before
            << ",\"cpu_only\":true,\"tensor_count\":97,\"tensors\":[";
     std::uint64_t total = 0;
@@ -348,6 +354,8 @@ void qualify_real_downs(const RealOptions& options) {
     require(std::filesystem::file_size(options.model) == size_before &&
             std::filesystem::last_write_time(options.model) == time_before &&
             file_sha(options.model) == options.model_sha, "model changed during CPU qualification");
+    require(std::filesystem::canonical("/proc/self/exe") == executable &&
+            file_sha(executable) == executable_sha, "running executable changed during CPU qualification");
     ledger << "],\"original_bytes_total\":" << total
            << ",\"model_before_after_exact\":true,\"passed\":true}\n";
     require(!std::filesystem::exists(options.output) && !std::filesystem::is_symlink(options.output),
