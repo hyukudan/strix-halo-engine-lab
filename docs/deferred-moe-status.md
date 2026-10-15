@@ -71,3 +71,10 @@ stream still pending. The callback has a five-second escape and is released on
 exceptions before recovery, so a regression to a layer drain produces failure
 rather than an intentional infinite wait. This is a liveness gate, not a latency
 measurement. New native fixtures and their API behavior remain pending execution.
+
+Result-publication follow-up: the mode boolean is static prefix metadata, while
+`deferred_moe_status_completed_tokens` is read from the actual completion owner
+only when restore/greedy results are ready or after the raw token loop. The host
+regression compares a retained zero prefix snapshot with a fresh completed reader
+after the real serial-session commit path advances to one. It does not execute
+the native HIP owner; full-model post-loop counts remain a separate native gate.

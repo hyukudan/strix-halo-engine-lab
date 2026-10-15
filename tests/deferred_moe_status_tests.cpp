@@ -1,3 +1,4 @@
+#include "../apps/deferred_moe_receipt.hpp"
 #include "strix/deferred_moe_status.hpp"
 #include "strix/serial_host_state_shadow.hpp"
 #include "strix/serial_session.hpp"
@@ -113,9 +114,23 @@ int main()try{
         expect(rejected,"poisoned session rejects another token");
     }
     auto success=fresh;Dispatcher ok;shadow.begin();bool completion=false;
+    struct CompletionView {
+        const strix::SerialSessionContext* session;
+        std::uint64_t completed_tokens() const { return session->committed_tokens; }
+    } completed_view{&success};
+    const auto prefix_snapshot = strix::decode_detail::deferred_moe_completed_tokens_receipt(&completed_view);
+    expect(prefix_snapshot == "  \"deferred_moe_status_completed_tokens\": 0,\n",
+           "before execution completion receipt is zero");
     (void)strix::execute_serial_token(compiled,success,transactional,7734,ok,[&]{completion=true;ok.error={};strix::check_deferred_moe_status(ok.error);shadow.publish();});
     expect(completion&&success.next_position==1&&success.committed_tokens==1&&success.health==strix::SerialSessionHealth::ready,"successful fence publishes exactly one token");
     expect(published!=std::array<std::byte,128>{},"successful fence publishes staged host history");
+    expect(strix::decode_detail::deferred_moe_completed_tokens_receipt(&completed_view) ==
+           "  \"deferred_moe_status_completed_tokens\": 1,\n" &&
+           prefix_snapshot == "  \"deferred_moe_status_completed_tokens\": 0,\n",
+           "post-execution reader follows actual committed session, not stale prefix snapshot");
+    expect(strix::decode_detail::deferred_moe_completed_tokens_receipt<CompletionView>(nullptr) ==
+           "  \"deferred_moe_status_completed_tokens\": 0,\n",
+           "disabled deferred owner retains explicit zero completed tokens");
     auto preflight=fresh;Dispatcher untouched;bool ran=false;shadow.begin();
     try{(void)strix::execute_serial_token(compiled,preflight,transactional,static_cast<std::uint32_t>(model.vocab_size),untouched,[&]{ran=true;});}
     catch(const std::invalid_argument&){}shadow.cancel();

@@ -1,3 +1,4 @@
+#include "deferred_moe_receipt.hpp"
 #include "strix/lane_chain_hyper_output.hpp"
 #include "qsa_input_receipt.hpp"
 #include "shared_prefetch_receipt.hpp"
@@ -893,10 +894,6 @@ int main(
         deferred_moe=std::make_unique<HipDeferredMoeStatus>(resources,compiled.execution_identity,
             deferred_status_generation,deferred_shadow_generation,experiment_owner,original_work_device);
     }
-    const auto deferred_moe_receipt=[&] {
-        return deferred_moe_mode_receipt+"  \"deferred_moe_status_completed_tokens\": "+
-            std::to_string(deferred_moe?deferred_moe->completed_tokens():0)+",\n";
-    };
     std::uint64_t input_access_epoch = 1;
     const std::function<void(std::uint32_t)> execute_native_token = [&](std::uint32_t token) {
         original_work_device->require_original();
@@ -1190,9 +1187,10 @@ int main(
                     restore_start).count();
 
             std::cout
-                << "{\n" << optimization_profile_receipt << gdn_output_mode_receipt() << wave_router_mode_receipt << deferred_moe_receipt()
+                << "{\n" << optimization_profile_receipt << gdn_output_mode_receipt() << wave_router_mode_receipt << deferred_moe_mode_receipt
                 << strix::decode_detail::qsa_input_dispatch_receipt(qsa_prefetch_stats.get())
                 << shared_dispatch_receipt.completed_counts()
+                << strix::decode_detail::deferred_moe_completed_tokens_receipt(deferred_moe.get())
                 << "  \"model_content_identity\": \""
                 << strix::model_content_identity_hex(
                        model_residency.binding().
@@ -1318,11 +1316,12 @@ int main(
             elapsed_total += value;
         }
 
-        std::cout << "{\n" << optimization_profile_receipt << gdn_output_mode_receipt() << wave_router_mode_receipt << deferred_moe_receipt();
+        std::cout << "{\n" << optimization_profile_receipt << gdn_output_mode_receipt() << wave_router_mode_receipt << deferred_moe_mode_receipt;
         emit_q4k_a8_receipt();
         emit_q4k_a8_counts();
         std::cout << strix::decode_detail::qsa_input_dispatch_receipt(qsa_prefetch_stats.get());
         std::cout << shared_dispatch_receipt.completed_counts();
+        std::cout << strix::decode_detail::deferred_moe_completed_tokens_receipt(deferred_moe.get());
         std::cout
             << "  \"model_content_identity\": \""
             << strix::model_content_identity_hex(
@@ -1420,7 +1419,7 @@ int main(
             reference->steps.size());
     }
 
-    std::cout << '{' << '\n' << optimization_profile_receipt << gdn_output_mode_receipt() << wave_router_mode_receipt << deferred_moe_receipt();
+    std::cout << '{' << '\n' << optimization_profile_receipt << gdn_output_mode_receipt() << wave_router_mode_receipt << deferred_moe_mode_receipt;
     emit_q4k_a8_receipt();
     std::cout << "  \"model_content_identity\": \""
               << strix::model_content_identity_hex(
@@ -1635,6 +1634,7 @@ int main(
     // Dynamic counters belong after the raw token loop, not the JSON prefix.
     std::cout << strix::decode_detail::qsa_input_dispatch_receipt(qsa_prefetch_stats.get());
     std::cout << shared_dispatch_receipt.completed_counts();
+    std::cout << strix::decode_detail::deferred_moe_completed_tokens_receipt(deferred_moe.get());
     std::cout
         << "  \"decode_elapsed_ms_total\": "
         << decode_elapsed_ms_total
