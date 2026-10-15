@@ -26,6 +26,7 @@ function(strix_target_warnings target)
 endfunction()
 
 add_library(strix_core STATIC
+    src/execution_telemetry.cpp
     src/qsa_input_prefetch.cpp
     src/model_copy_residency_layout.cpp
     src/lane_chain_hyper_output.cpp
@@ -231,6 +232,14 @@ if(BUILD_TESTING OR STRIX_BUILD_EXPERIMENTAL_Q4K_A8_PROBE OR STRIX_ENABLE_EXPERI
     endif()
 endif()
 if(BUILD_TESTING)
+    add_executable(strix-execution-inventory-receipt-tests tests/execution_inventory_receipt_tests.cpp)
+    target_link_libraries(strix-execution-inventory-receipt-tests PRIVATE strix_core)
+    strix_target_warnings(strix-execution-inventory-receipt-tests)
+    add_test(NAME strix-execution-inventory-receipt-tests COMMAND strix-execution-inventory-receipt-tests)
+    add_executable(strix-execution-telemetry-tests tests/execution_telemetry_tests.cpp)
+    target_link_libraries(strix-execution-telemetry-tests PRIVATE strix_core)
+    strix_target_warnings(strix-execution-telemetry-tests)
+    add_test(NAME strix-execution-telemetry-tests COMMAND strix-execution-telemetry-tests)
     # Diagnostic-only byte permutation. It is never linked into the decoder.
     add_library(strix_hc_repacked_down_pack STATIC src/hc_repacked_down_pack.cpp)
     target_include_directories(strix_hc_repacked_down_pack PUBLIC include)
@@ -1012,6 +1021,10 @@ if(BUILD_TESTING)
     add_test(NAME strix-speculative-verify-runtime-tests COMMAND strix-speculative-verify-runtime-tests)
 
     find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME strix-runtime-inventory-tests
+            COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/tests/runtime_inventory_tests.py)
+    endif()
     if(Python3_Interpreter_FOUND)
         add_test(NAME strix-dual-transport-runner-tests
             COMMAND ${Python3_EXECUTABLE} -B -W error::ResourceWarning ${CMAKE_SOURCE_DIR}/lab/transport/test_dual_tbstream.py)

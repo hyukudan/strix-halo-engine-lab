@@ -90,6 +90,8 @@ struct OptimizationProfileResolution {
     bool automatic_applied = false;
 };
 struct Options {
+    bool execution_inventory = false;
+    bool host_dispatch_telemetry = false;
     OptimizationProfile optimization_profile = OptimizationProfile::automatic;
     bool profile_explicit = false;
     bool any_low_level_flag = false;
@@ -185,6 +187,18 @@ inline Options parse_options(
             argv[index];
         options.any_low_level_flag = options.any_low_level_flag ||
             is_low_level_optimization_option(argument);
+        if (argument == "--execution-inventory") {
+            if (options.execution_inventory)
+                throw std::invalid_argument("duplicate execution inventory option");
+            options.execution_inventory = true;
+            continue;
+        }
+        if (argument == "--host-dispatch-telemetry") {
+            if (options.host_dispatch_telemetry)
+                throw std::invalid_argument("duplicate host dispatch telemetry option");
+            options.host_dispatch_telemetry = true;
+            continue;
+        }
         if (argument == "--optimization-profile") {
             if (!execution_option_names.insert(argument).second)
                 throw std::invalid_argument("duplicate optimization profile option");

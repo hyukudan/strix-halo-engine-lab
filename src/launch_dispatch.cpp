@@ -1,6 +1,7 @@
 #include "strix/launch_dispatch.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <stdexcept>
 #include <utility>
 
@@ -456,24 +457,46 @@ DirectLaunchDispatcher::launcher_for(
 
 void DirectLaunchDispatcher::dispatch_kernel(
     const ExecutionDispatchContext& context) {
-    const auto& launcher =
-        launcher_for(
-            context,
-            false);
-    launcher.function(
-        context,
-        launcher.user_data);
+    dispatch(context, false);
 }
 
 void DirectLaunchDispatcher::dispatch_runtime_step(
     const ExecutionDispatchContext& context) {
-    const auto& launcher =
-        launcher_for(
-            context,
-            true);
-    launcher.function(
-        context,
-        launcher.user_data);
+    dispatch(context, true);
+}
+
+void DirectLaunchDispatcher::dispatch(const ExecutionDispatchContext& context, bool runtime_step) {
+    if (!telemetry_) {
+        const auto& launcher = launcher_for(context, runtime_step);
+        launcher.function(context, launcher.user_data);
+        return;
+    }
+    HostDispatchObservation event;
+    event.execution_identity = context.execution_identity;
+    event.position = context.position;
+    event.step_id = context.step_id;
+    event.op = context.op;
+    event.layer = context.layer;
+    event.logical_rows = context.logical_rows;
+    event.request_concurrency = context.request_concurrency;
+    event.runtime_step = runtime_step;
+    const auto start = std::chrono::steady_clock::now();
+    const auto report = [&] {
+        event.host_elapsed_ns = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - start).count());
+        telemetry_->observe(event);
+    };
+    try {
+        const auto& launcher = launcher_for(context, runtime_step);
+        event.outcome = DispatchOutcome::failed;
+        launcher.function(context, launcher.user_data);
+        event.outcome = DispatchOutcome::returned;
+    } catch (...) {
+        report();
+        throw;
+    }
+    report();
 }
 
 }  // namespace strix

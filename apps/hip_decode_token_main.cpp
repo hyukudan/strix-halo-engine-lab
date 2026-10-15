@@ -31,6 +31,7 @@
 #include "hip_decode_options.hpp"
 #include "hip_deferred_moe_status.hpp"
 #include "hip_decode_receipt_json.hpp"
+#include "execution_inventory_receipt.hpp"
 #include "strix/serial_decode_reference.hpp"
 #include "strix/serial_decode_replay.hpp"
 #include "strix/serial_prefix_cache.hpp"
@@ -61,6 +62,21 @@
 
 namespace {
 using strix::decode_cli::parse_options;
+
+// One optional stderr JSON record; stdout keeps its existing decoder receipt.
+// Runs during failure unwinding too. Observability must not mask an execution
+// error or change publication/cleanup ordering.
+struct HostTelemetryReport {
+    strix::HostDispatchCounters counters;
+    bool enabled = false;
+    ~HostTelemetryReport() noexcept {
+        if (!enabled) return;
+        try {
+            strix::write_host_dispatch_telemetry(std::cerr, counters);
+            std::cerr << '\n';
+        } catch (...) {}
+    }
+};
 
 void check_hip(
     hipError_t error,
@@ -341,6 +357,8 @@ int main(
         std::cout << "Usage: strix-hip-decode-token MODEL.gguf TOKEN_ID ... [options]\n"
             "  --context N --generate N --eos-token ID --residency register|copy\n"
             "  --optimization-profile auto|manual (default auto, qualified checkpoint only)\n"
+            "  --host-dispatch-telemetry (eager host launcher counters on stderr; profiling only)\n"
+            "  --execution-inventory (include selected host launcher and declared variant metadata)\n"
             "  --virtual-q8-gdn-output (exact original256-tree Q8 output)\n"
             "  --lane-chain-hyper-output (requires --prefetch-q8-hyper-output)\n"
             "  --record-raw ABS_NEW_PRIVATE_DIRECTORY --record-max-bytes BYTES\n"
@@ -603,6 +621,8 @@ int main(
                 experimental;
 
     const bool graph_mode = options.execution.mode == strix::DecodeExecutionMode::graph;
+    if (graph_mode && options.host_dispatch_telemetry)
+        throw std::invalid_argument("host dispatch telemetry requires eager mode; graph replay is not host dispatch");
     binding_request.require_graph_safe = graph_mode;
     binding_request.device_graph_inputs = graph_mode;
     strix::HipLauncherCatalogConfig catalog_config;
@@ -851,7 +871,13 @@ int main(
     if (launcher_catalog->audit(compiled, launchers).missing_steps)
         throw std::logic_error("HIP launcher catalog is incomplete for actual compiled execution");
     const auto launch_plan = strix::compile_launch_plan(compiled, launchers);
-    strix::DirectLaunchDispatcher dispatcher(launch_plan);
+    const auto execution_inventory_receipt = options.execution_inventory
+        ? strix::decode_receipt::execution_inventory_receipt(compiled, launch_plan, kernel_registry)
+        : std::string{};
+    HostTelemetryReport host_telemetry;
+    host_telemetry.enabled = options.host_dispatch_telemetry;
+    strix::DirectLaunchDispatcher dispatcher(launch_plan,
+        host_telemetry.enabled ? &host_telemetry.counters : nullptr);
     std::unique_ptr<strix::HipSerialGraph> graph;
     if (graph_mode) {
         strix::GraphMemoryRequest graph_memory;
@@ -1191,7 +1217,7 @@ int main(
                     restore_start).count();
 
             std::cout
-                << "{\n" << optimization_profile_receipt << gdn_output_mode_receipt() << wave_router_mode_receipt << deferred_moe_mode_receipt
+                << "{\n" << optimization_profile_receipt << execution_inventory_receipt << gdn_output_mode_receipt() << wave_router_mode_receipt << deferred_moe_mode_receipt
                 << strix::decode_detail::qsa_input_dispatch_receipt(qsa_prefetch_stats.get())
                 << shared_dispatch_receipt.completed_counts()
                 << strix::decode_detail::deferred_moe_completed_tokens_receipt(deferred_moe.get())
@@ -1320,7 +1346,7 @@ int main(
             elapsed_total += value;
         }
 
-        std::cout << "{\n" << optimization_profile_receipt << gdn_output_mode_receipt() << wave_router_mode_receipt << deferred_moe_mode_receipt;
+        std::cout << "{\n" << optimization_profile_receipt << execution_inventory_receipt << gdn_output_mode_receipt() << wave_router_mode_receipt << deferred_moe_mode_receipt;
         emit_q4k_a8_receipt();
         emit_q4k_a8_counts();
         std::cout << strix::decode_detail::qsa_input_dispatch_receipt(qsa_prefetch_stats.get());
@@ -1423,7 +1449,7 @@ int main(
             reference->steps.size());
     }
 
-    std::cout << '{' << '\n' << optimization_profile_receipt << gdn_output_mode_receipt() << wave_router_mode_receipt << deferred_moe_mode_receipt;
+    std::cout << '{' << '\n' << optimization_profile_receipt << execution_inventory_receipt << gdn_output_mode_receipt() << wave_router_mode_receipt << deferred_moe_mode_receipt;
     emit_q4k_a8_receipt();
     std::cout << "  \"model_content_identity\": \""
               << strix::model_content_identity_hex(

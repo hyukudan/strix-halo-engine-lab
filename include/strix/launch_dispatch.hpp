@@ -3,6 +3,7 @@
 #include "strix/compiled_execution.hpp"
 #include "strix/compiled_speculative_verify.hpp"
 #include "strix/execution_runtime.hpp"
+#include "strix/execution_telemetry.hpp"
 
 #include <cstdint>
 #include <string>
@@ -97,8 +98,9 @@ class DirectLaunchDispatcher final
     : public EagerExecutionDispatcher {
 public:
     explicit DirectLaunchDispatcher(
-        const CompiledLaunchPlan& plan)
-        : plan_(plan) {}
+        const CompiledLaunchPlan& plan,
+        ExecutionTelemetry* telemetry = nullptr)
+        : plan_(plan), telemetry_(telemetry) {}
 
     void dispatch_kernel(
         const ExecutionDispatchContext& context) override;
@@ -107,12 +109,14 @@ public:
         const ExecutionDispatchContext& context) override;
 
 private:
+    void dispatch(const ExecutionDispatchContext&, bool runtime_step);
     [[nodiscard]] const CompiledStepLauncher&
     launcher_for(
         const ExecutionDispatchContext& context,
         bool runtime_step) const;
 
     const CompiledLaunchPlan& plan_;
+    ExecutionTelemetry* telemetry_ = nullptr;
 };
 
 }  // namespace strix

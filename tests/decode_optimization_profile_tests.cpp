@@ -35,6 +35,14 @@ int main() {
            !defaults.deferred_moe_status,
            "parser defers auto until content identification");
     auto on = defaults;
+    auto instrumented = parse({"decoder", "fixture.gguf", "1", "--host-dispatch-telemetry"});
+    const auto instrumented_profile = resolve_optimization_profile(instrumented, model, info, manifest,
+        validated_model_content_identity, true);
+    expect(instrumented.host_dispatch_telemetry && !instrumented.any_low_level_flag &&
+           instrumented_profile.automatic_applied,
+           "host observation does not silently disable the qualified automatic profile");
+    rejects([] { static_cast<void>(parse({"decoder", "m", "1", "--host-dispatch-telemetry",
+        "--host-dispatch-telemetry"})); }, "duplicate host dispatch telemetry option");
     const auto selected = resolve_optimization_profile(on, model, info, manifest,
         validated_model_content_identity, true);
     expect(selected.automatic_applied && selected.selected == "canonical-a8-wave-qsa-hc-shared-deferred-v3" &&
