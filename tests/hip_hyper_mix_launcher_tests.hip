@@ -1531,7 +1531,7 @@ void test_catalog_and_bundle() {
     staged_config.staged_projections = true;
     strix::kernels::KernelRegistry staged_registry;
     strix::register_hip_hyper_mix_kernel_variant(model, request, staged_config, staged_registry);
-    const auto& staged_variant = staged_registry.variants().front();
+    const auto staged_variant = staged_registry.variants().front();
     expect(staged_variant.resources.lds_bytes >= (128U + 8U * 129U) * sizeof(float) &&
            staged_variant.resources.lds_bytes >= (256U + 1U) * sizeof(float),
            "staged LDS declaration covers projection tiles and normalization");
@@ -1545,7 +1545,7 @@ void test_catalog_and_bundle() {
     fused_config.fused_injection = true;
     strix::kernels::KernelRegistry fused_registry;
     strix::register_hip_hyper_mix_kernel_variant(model, request, fused_config, fused_registry);
-    const auto& fused_variant = fused_registry.variants().front();
+    const auto fused_variant = fused_registry.variants().front();
     expect(fused_variant.id != staged_variant.id && fused_variant.compiler_identity != staged_variant.compiler_identity,
            "fused injection changes kernel and compiler revision identities");
     expect(fused_variant.resources.lds_bytes == staged_variant.resources.lds_bytes &&

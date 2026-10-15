@@ -637,8 +637,8 @@ int main() try {
     strix::kernels::KernelRegistry baseline_registry, virtual_registry;
     strix::register_hip_lm_head_kernel_variant(model, request, default_config, baseline_registry);
     strix::register_hip_lm_head_kernel_variant(model, request, virtual_config, virtual_registry);
-    const auto& baseline = baseline_registry.variants().front();
-    const auto& candidate = virtual_registry.variants().front();
+    const auto baseline = baseline_registry.variants().front();
+    const auto candidate = virtual_registry.variants().front();
     expect(candidate.id != baseline.id && candidate.compiler_identity != baseline.compiler_identity,
         "virtual Q8 registry distinguishes kernel and compiler identity");
     expect(baseline.resources.workgroup_threads == 256U && baseline.resources.lds_bytes == 1024U &&

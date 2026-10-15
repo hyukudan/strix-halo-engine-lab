@@ -199,7 +199,7 @@ int main() try {
         strix::kernels::KernelRegistry old_registry,new_registry;strix::ExecutionBindingRequest request;
         strix::register_hip_gdn_kernel_variant(baseline.model,request,baseline,old_registry);
         strix::register_hip_gdn_kernel_variant(candidate.model,request,candidate,new_registry);
-        const auto& old=old_registry.variants()[0];const auto& changed=new_registry.variants()[0];
+        const auto old = old_registry.variants()[0];const auto changed = new_registry.variants()[0];
         require(old.id!=changed.id && old.compiler_identity!=changed.compiler_identity,"output compiler/kernel identities must be distinct");
         const auto old_launcher=strix::make_hip_gdn_launcher(old.id,&baseline),new_launcher=strix::make_hip_gdn_launcher(changed.id,&candidate);
         require(old_launcher.implementation_identity!=new_launcher.implementation_identity,"output launcher identity must differ");

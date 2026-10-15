@@ -1213,7 +1213,7 @@ int main(int argc, char** argv) try {
         strix::kernels::KernelRegistry defaults, candidates;
         strix::register_hip_gdn_kernel_variant(default_config.model, gdn_request, default_config, defaults);
         strix::register_hip_gdn_kernel_variant(default_config.model, gdn_request, candidate_config, candidates);
-        const auto& original = defaults.variants().front(); const auto& candidate = candidates.variants().front();
+        const auto original = defaults.variants().front(); const auto candidate = candidates.variants().front();
         expect(original.id == "hip.gdn.bf16.h128.kh16.vh48.d128.r1.c1.scalar" && original.compiler_identity == "hip-gfx1151-gdn-v2",
             "default GDN selected id and compiler identity remain golden");
         // Independently derived from unchanged37d00b7 FNV tag/hash fields for
@@ -1231,7 +1231,7 @@ int main(int argc, char** argv) try {
         auto prefetch_config = candidate_config; prefetch_config.prefetch_q8_input_projections = true;
         strix::kernels::KernelRegistry prefetch_registry;
         strix::register_hip_gdn_kernel_variant(prefetch_config.model, gdn_request, prefetch_config, prefetch_registry);
-        const auto& prefetched = prefetch_registry.variants().front();
+        const auto prefetched = prefetch_registry.variants().front();
         expect(prefetched.id == "hip.gdn.bf16.h128.kh16.vh48.d128.r1.c1.scalar.prefetch8.virtual256.q8-input" &&
             prefetched.compiler_identity == "hip-gfx1151-gdn-v4-prefetch8-virtual256-q8-input" &&
             prefetched.resources.workgroup_threads == original.resources.workgroup_threads &&

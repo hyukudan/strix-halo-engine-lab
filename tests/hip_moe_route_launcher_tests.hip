@@ -1583,7 +1583,7 @@ void test_catalog_and_bundle() {
     parallel_request.parallel_moe_router = true;
     strix::kernels::KernelRegistry parallel_kernels;
     strix::register_hip_moe_route_kernel_variant(model, parallel_request, parallel_config, parallel_kernels);
-    const auto& parallel_variant = parallel_kernels.variants().front();
+    const auto parallel_variant = parallel_kernels.variants().front();
     expect(parallel_variant.resources.lds_bytes >= (8U * 260U + 256U) * sizeof(float) &&
            parallel_variant.resources.lds_bytes < 65536U,
            "parallel router declares bounded shared coefficient and reduction storage");
@@ -1679,7 +1679,7 @@ void test_catalog_and_bundle() {
     auto ranked_request = parallel_request; ranked_request.ranked_moe_router_topk = true;
     strix::kernels::KernelRegistry ranked_kernels;
     strix::register_hip_moe_route_kernel_variant(model, ranked_request, ranked_config, ranked_kernels);
-    const auto& ranked_variant = ranked_kernels.variants().front();
+    const auto ranked_variant = ranked_kernels.variants().front();
     expect(ranked_variant.id.ends_with(".ranked.parallel") &&
                ranked_variant.compiler_identity == "hip-gfx1151-moe-route-v5-ranked-parallel" &&
                ranked_variant.resources.lds_bytes == parallel_variant.resources.lds_bytes,
