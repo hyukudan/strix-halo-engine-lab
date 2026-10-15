@@ -57,5 +57,6 @@ Timing uses eager hot, graph hot and the complete 97-call graph, with five warmu
 ABBA blocks and 100 measured ABBA blocks (200 matched pairs). The four-output
 single-kernel mapping has priority if its paired graph speedup reaches 2 and no
 mode falls below 1.5; otherwise the two permitted alternatives are considered.
-Results from 1.5 to 2 are explicitly marginal. This gate permits subsequent
+If no variant reaches 2, the best of all three may qualify as marginal when its
+graph ratio and every other mode reach 1.5. This gate permits subsequent
 experimental model integration; it does not establish model quality or adoption.
