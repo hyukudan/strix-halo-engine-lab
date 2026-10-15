@@ -844,7 +844,7 @@ __global__ void typed_fused_hyper_projection_kernel(
 // Compile/ISA probe: all producer loads precede this producer's LDS stores.
 // Full rows have no per-row control flow; partial rows reread an in-bounds row.
 template <std::uint32_t Kind, bool Full>
-__device__ void typed_prefetch_produce(const float* normalized, const void* weights,
+__device__ void typed_batched_produce(const float* normalized, const void* weights,
     std::uint32_t width, std::uint32_t first_output, std::uint32_t valid,
     std::uint32_t tile, float* values, float (*coefficients)[kStagedPitch]) {
     const auto lane = threadIdx.x;
@@ -858,12 +858,16 @@ __device__ void typed_prefetch_produce(const float* normalized, const void* weig
     }
     values[lane] = value;
 #pragma unroll
-    for (std::uint32_t local = 0; local < kStagedOutputs; ++local)
-        if (Full || local < valid) coefficients[local][lane] = prefetched[local];
+    for (std::uint32_t local = 0; local < kStagedOutputs; ++local) {
+        // Every destination is a valid row. Repeated last-row stores carry
+        // the identical clamped coefficient and finish before the barrier.
+        const auto destination = (Full || local < valid) ? local : valid - 1U;
+        coefficients[destination][lane] = prefetched[local];
+    }
 }
 
-template <std::uint32_t Kind, bool Injection>
-__device__ void typed_prefetch_projection_role(const float* normalized, const void* weights,
+template <std::uint32_t Kind, bool Injection, bool Full>
+__device__ void typed_batched_projection_role(const float* normalized, const void* weights,
     std::uint32_t width, std::uint32_t streams, std::uint32_t outputs,
     std::uint32_t role_block, float* output, float* values,
     float (*coefficients)[kStagedPitch]) {
@@ -880,12 +884,8 @@ __device__ void typed_prefetch_projection_role(const float* normalized, const vo
         const auto remaining = width - tile;
         const auto count = remaining < kStagedThreads ? remaining : kStagedThreads;
         if (lane < count) {
-            if (valid == kStagedOutputs)
-                typed_prefetch_produce<Kind, true>(normalized, weights, width, first_output, valid,
-                    tile, values, coefficients);
-            else
-                typed_prefetch_produce<Kind, false>(normalized, weights, width, first_output, valid,
-                    tile, values, coefficients);
+            typed_batched_produce<Kind, Full>(normalized, weights, width, first_output, valid,
+                tile, values, coefficients);
         }
         __syncthreads();
         if (active)
@@ -900,19 +900,31 @@ __device__ void typed_prefetch_projection_role(const float* normalized, const vo
     }
 }
 
-__global__ void prefetched_typed_hyper_projection_kernel(
+__global__ void batched_typed_hyper_projection_kernel(
     const float* normalized, const void* down, std::uint32_t width,
     std::uint32_t streams, std::uint32_t lowrank, float* low,
     const void* inject, float* injection_output, std::uint32_t lowrank_blocks) {
     __shared__ float values[kStagedThreads];
     __shared__ float coefficients[kStagedOutputs][kStagedPitch];
-    // Role is block-uniform: every lane enters one complete producer/consumer loop.
-    if (blockIdx.x < lowrank_blocks)
-        typed_prefetch_projection_role<8U, false>(normalized, down, width, streams, lowrank,
-            blockIdx.x, low, values, coefficients);
-    else
-        typed_prefetch_projection_role<0U, true>(normalized, inject, width, streams, streams,
-            blockIdx.x - lowrank_blocks, injection_output, values, coefficients);
+    // Both choices are block-uniform and precede each complete tile loop.
+    if (blockIdx.x < lowrank_blocks) {
+        const auto rows_left = lowrank - blockIdx.x * kStagedOutputs;
+        if (rows_left >= kStagedOutputs)
+            typed_batched_projection_role<8U, false, true>(normalized, down, width, streams, lowrank,
+                blockIdx.x, low, values, coefficients);
+        else
+            typed_batched_projection_role<8U, false, false>(normalized, down, width, streams, lowrank,
+                blockIdx.x, low, values, coefficients);
+    } else {
+        const auto role_block = blockIdx.x - lowrank_blocks;
+        const auto rows_left = streams - role_block * kStagedOutputs;
+        if (rows_left >= kStagedOutputs)
+            typed_batched_projection_role<0U, true, true>(normalized, inject, width, streams, streams,
+                role_block, injection_output, values, coefficients);
+        else
+            typed_batched_projection_role<0U, true, false>(normalized, inject, width, streams, streams,
+                role_block, injection_output, values, coefficients);
+    }
 }
 
 template <typename Storage>
@@ -1110,7 +1122,7 @@ void launch_typed(
                 const auto injection_blocks = injection_output ? (config.hc_count + kStagedOutputs - 1U) / kStagedOutputs : 0U;
                 if (config.typed_projection) {
                     if (config.prefetch_rows) {
-                        hipLaunchKernelGGL(prefetched_typed_hyper_projection_kernel,
+                        hipLaunchKernelGGL(batched_typed_hyper_projection_kernel,
                             dim3(lowrank_blocks + injection_blocks, context.logical_rows), dim3(kStagedThreads),
                             0, hip_execution_stream(), normalized, reinterpret_cast<const void*>(down_runtime.address),
                             static_cast<std::uint32_t>(width), config.hc_count, config.lowrank, low,
@@ -1514,7 +1526,7 @@ std::string kernel_id(
         ".c" +
         std::to_string(
             request.request_concurrency) + (config.parallel ? ".parallel" : "") +
-        (config.staged_projections ? ".staged" : "") + (config.fused_injection ? ".fused-injection-v5" : "") + (config.typed_projection ? ".typed-q8-f32-v1" : "") + (config.prefetch_rows ? ".prefetch-rows8-v1" : "");
+        (config.staged_projections ? ".staged" : "") + (config.fused_injection ? ".fused-injection-v5" : "") + (config.typed_projection ? ".typed-q8-f32-v1" : "") + (config.prefetch_rows ? ".prefetch-rows8-v2" : "");
 }
 
 std::uint64_t implementation_identity(
@@ -1541,7 +1553,7 @@ std::uint64_t implementation_identity(
     if (config.staged_projections) hash_u64(hash, 0x535441474544ULL);
     if (config.fused_injection) hash_u64(hash, 0x4655534544484305ULL);
     if (config.typed_projection) hash_u64(hash, 0x5459504544484301ULL);
-    if (config.prefetch_rows) hash_u64(hash, 0x5052464852430801ULL);
+    if (config.prefetch_rows) hash_u64(hash, 0x5052464852430802ULL);
     return hash;
 }
 
@@ -1635,7 +1647,7 @@ void register_hip_hyper_mix_kernel_variant(
     variant.output_layout =
         "row-major+fp32-injection";
     variant.compiler_identity =
-        config.prefetch_rows ? "hip-gfx1151-hyper-mix-v7-typed-prefetch-rows8" :
+        config.prefetch_rows ? "hip-gfx1151-hyper-mix-v8-typed-prefetch-rows8" :
         config.typed_projection ? "hip-gfx1151-hyper-mix-v6-typed-projection" :
         config.fused_injection ? "hip-gfx1151-hyper-mix-v5-fused-injection" :
         config.staged_projections ? "hip-gfx1151-hyper-mix-v4-staged" :
