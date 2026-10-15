@@ -473,8 +473,8 @@ void m97_qualify(const M97Options& options) {
     std::ofstream output(options.output);
     require(output.good(), "open fresh M97 result");
     output << std::setprecision(17)
-           << "{\"schema\":\"hc-exact-repacked-capture165-m97-v3\","
-              "\"schedule_family\":\"word-ring-wave-fence-w1-w2-w3-v3\","
+           << "{\"schema\":\"hc-exact-repacked-capture165-m97-v4\","
+              "\"schedule_family\":\"ordered-word-ring-o1-o2-o3-v4\","
               "\"layout\":\"hc-down-q8-j16s2-rpad32-v1\",\"base_old_kernels\":245,"
               "\"capture_cases\":165,\"anchor_position\":61,\"distinct_weight_owners\":97,"
               "\"original97_logical_weight_bytes\":353443840,\"device_byte_cap\":" << byte_cap

@@ -36,22 +36,22 @@ std::vector<Schedule> parse_schedules(const std::string& text) {
     std::vector<Schedule> result;
     unsigned previous = 0;
     for (std::size_t at = 0; at < text.size(); at += 3) {
-        require(at + 1 < text.size() && text[at] == '2' &&
-                    text[at + 1] >= '1' && text[at + 1] <= '3', "invalid admitted schedule (need 21,22,23)");
-        const unsigned value = 20U + static_cast<unsigned>(text[at + 1] - '0');
-        require(value > previous, "admitted schedules must be distinct ascending 21,22,23");
+        require(at + 1 < text.size() && text[at] == '3' &&
+                    text[at + 1] >= '1' && text[at + 1] <= '3', "invalid admitted schedule (need 31,32,33)");
+        const unsigned value = 30U + static_cast<unsigned>(text[at + 1] - '0');
+        require(value > previous, "admitted schedules must be distinct ascending 31,32,33");
         result.push_back(static_cast<Schedule>(value)); previous = value;
         if (at + 2 < text.size()) require(text[at + 2] == ',' && at + 3 < text.size(), "invalid schedule separator");
     }
     return result;
 }
 void schedule_parser_controls() {
-    require(parse_schedules("21") == std::vector<Schedule>{Schedule::w1_scalar_k8_d8}, "parse W1");
-    require(parse_schedules("22") == std::vector<Schedule>{Schedule::w2_lds_k8_d8}, "parse W2");
-    require(parse_schedules("23") == std::vector<Schedule>{Schedule::w3_scalar_k4_d4}, "parse W3");
-    require(parse_schedules("21,23") == std::vector<Schedule>{Schedule::w1_scalar_k8_d8,Schedule::w3_scalar_k4_d4}, "parse admitted subset");
-    require(parse_schedules("21,22,23").size() == 3U, "parse all word schedules");
-    for (const std::string bad : {"", "1", "2", "3", "1,2,3", "11", "12", "13", "11,12,13", "20", "24", "021", "+21", "21,", "21,,22", "21,21", "22,21", "21, 22", "21x22", "21,22,023", "21,22,23,"}) {
+    require(parse_schedules("31") == std::vector<Schedule>{Schedule::o1_scalar_k8_d8}, "parse O1");
+    require(parse_schedules("32") == std::vector<Schedule>{Schedule::o2_lds_k8_d8}, "parse O2");
+    require(parse_schedules("33") == std::vector<Schedule>{Schedule::o3_scalar_k4_d4}, "parse O3");
+    require(parse_schedules("31,33") == std::vector<Schedule>{Schedule::o1_scalar_k8_d8,Schedule::o3_scalar_k4_d4}, "parse admitted subset");
+    require(parse_schedules("31,32,33").size() == 3U, "parse all ordered schedules");
+    for (const std::string bad : {"", "0", "1", "2", "3", "1,2,3", "11", "12", "13", "11,12,13", "21", "22", "23", "21,22,23", "30", "34", "031", "+31", "31,", "31,,32", "31,31", "32,31", "31, 32", "31x32", "31,32,033", "31,32,33,"}) {
         bool rejected = false;
         try { static_cast<void>(parse_schedules(bad)); }
         catch (const std::runtime_error&) { rejected = true; }
@@ -384,7 +384,7 @@ void negative_cases(const std::vector<Schedule>& admitted) {
         for (unsigned rank : {0U, 513U}) { auto bad = shape; bad.rank = rank; reject(bad, n, c, s, 32, i, l, o, geometry); }
         for (unsigned rows : {0U, 65536U}) { auto bad = shape; bad.rows = rows; reject(bad, n, c, s, 32, i, l, o, geometry); }
         for (unsigned rp : {0U, 31U, 64U}) reject(shape, n, c, s, rp, i, l, o, geometry);
-        for (unsigned bad : {0U, 1U, 2U, 3U, 4U, 10U, 11U, 12U, 13U, 14U, 20U, 24U, std::numeric_limits<unsigned>::max()}) rejected(shape, n, c, s, 32, i, l, o, static_cast<Schedule>(bad), geometry);
+        for (unsigned bad : {0U, 1U, 2U, 3U, 4U, 10U, 11U, 12U, 13U, 14U, 20U, 21U, 22U, 23U, 24U, 30U, 34U, std::numeric_limits<unsigned>::max()}) rejected(shape, n, c, s, 32, i, l, o, static_cast<Schedule>(bad), geometry);
         reject(shape, n, c, s, 32, {}, l, o, pair); reject(shape, n, c, s, 32, i, l, {}, pair);
         reject(shape, n, c, s, 32, {0, 1}, l, {}, pair); reject(shape, n, c, s, 32, {}, l, {0, 1}, pair);
         // Exact required extents are used by every positive fixture. Here every

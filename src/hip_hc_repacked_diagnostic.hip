@@ -109,18 +109,27 @@ __device__ __forceinline__ void projection_roles(const float* input, const float
     float sum = 0.0F;
     if(blockIdx.x < low_blocks) {
         const unsigned output = blockIdx.x * 32U + lane, pairs = width / 64U;
-        RegisterRing<PairSlot, K> ring;
-        static_for<K>([&]<unsigned I>() {
-            if(I < pairs) load_pair(slot<I>(ring), codes, scales, I, rank_pad, output);
-        });
-        for(unsigned first = 0; first < pairs; first += K) {
+        if(pairs != 0U) {
+            const unsigned last = pairs - 1U;
+            RegisterRing<PairSlot, K> ring;
+            // Always issue K groups. Clamped tail groups stay in bounds and
+            // are never consumed; conditional loads would merge VMEM counters.
             static_for<K>([&]<unsigned I>() {
-                const unsigned pair = first + I;
-                if(pair < pairs) {
-                    consume_pair<LdsInput>(sum, slot<I>(ring), pair, input, staged);
-                    if(pair + K < pairs) load_pair(slot<I>(ring), codes, scales, pair + K, rank_pad, output);
-                }
+                load_pair(slot<I>(ring), codes, scales, I < pairs ? I : last, rank_pad, output);
             });
+            for(unsigned first = 0; first < pairs; first += K) {
+                static_for<K>([&]<unsigned I>() {
+                    const unsigned pair = first + I;
+                    if(pair < pairs)
+                        consume_pair<LdsInput>(sum, slot<I>(ring), pair, input, staged);
+                    unsigned next = pair + K < pairs ? pair + K : last;
+                    // Keep the refill after the old slot's last use. This
+                    // compiler dependency emits no instruction and leaves the
+                    // index unchanged; it prevents cross-block refill hoisting.
+                    asm volatile("" : "+s"(next) : "v"(sum));
+                    load_pair(slot<I>(ring), codes, scales, next, rank_pad, output);
+                });
+            }
         }
         if(output < rank) {
             const float scaled = sum / static_cast<float>(streams);
@@ -159,7 +168,7 @@ __device__ __forceinline__ void projection_roles(const float* input, const float
 }
 
 template<unsigned K, unsigned D, bool LdsInput>
-__global__ __launch_bounds__(32) void word_repacked_hyper_projection_kernel(
+__global__ __launch_bounds__(32) void ordered_repacked_hyper_projection_kernel(
     const float* __restrict__ normalized, const U32x4* __restrict__ codes,
     const unsigned* __restrict__ scales, const float* __restrict__ inject,
     unsigned width, unsigned streams, unsigned rank, unsigned rank_pad,
@@ -208,9 +217,9 @@ void hc_repacked_projection_diagnostic::enqueue(
         shape.rank == 0U || shape.rank > 512U ||
         shape.rows == 0U || shape.rows > 65535U ||
         rank_pad != ((shape.rank + 31U) / 32U) * 32U ||
-        (schedule != Schedule::w1_scalar_k8_d8 &&
-         schedule != Schedule::w2_lds_k8_d8 &&
-         schedule != Schedule::w3_scalar_k4_d4)) {
+        (schedule != Schedule::o1_scalar_k8_d8 &&
+         schedule != Schedule::o2_lds_k8_d8 &&
+         schedule != Schedule::o3_scalar_k4_d4)) {
         throw std::invalid_argument(
             "HC repacked projection diagnostic unsupported shape/schedule");
     }
@@ -254,7 +263,7 @@ void hc_repacked_projection_diagnostic::enqueue(
     check_hip(hipPeekAtLastError(), "HC repacked projection diagnostic stale error");
     const auto launch = [&]<unsigned Pairs, unsigned Depth, bool LdsInput>() {
         hipLaunchKernelGGL(
-            HIP_KERNEL_NAME(word_repacked_hyper_projection_kernel<Pairs, Depth, LdsInput>),
+            HIP_KERNEL_NAME(ordered_repacked_hyper_projection_kernel<Pairs, Depth, LdsInput>),
             dim3(rank_pad / 32U + (with_inject ? 1U : 0U), shape.rows),
             dim3(32U), 0, stream,
             reinterpret_cast<const float*>(normalized.address),
@@ -265,8 +274,8 @@ void hc_repacked_projection_diagnostic::enqueue(
             reinterpret_cast<float*>(low.address),
             reinterpret_cast<float*>(injection.address), rank_pad / 32U);
     };
-    if (schedule == Schedule::w1_scalar_k8_d8) launch.template operator()<8U, 8U, false>();
-    else if (schedule == Schedule::w2_lds_k8_d8) launch.template operator()<8U, 8U, true>();
+    if (schedule == Schedule::o1_scalar_k8_d8) launch.template operator()<8U, 8U, false>();
+    else if (schedule == Schedule::o2_lds_k8_d8) launch.template operator()<8U, 8U, true>();
     else launch.template operator()<4U, 4U, false>();
     check_hip(hipGetLastError(), "HC repacked projection diagnostic enqueue");
 }
