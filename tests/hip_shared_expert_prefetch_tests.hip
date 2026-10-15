@@ -8,8 +8,10 @@
 #include <cstring>
 #include <hip/hip_runtime.h>
 #include <iostream>
+#include <iomanip>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 namespace {
 using namespace strix;
@@ -20,6 +22,27 @@ void check(hipError_t e, const char *op) {
 void require(bool ok, const char *message) {
     if (!ok)
         throw std::runtime_error(message);
+}
+void mismatch(const std::vector<unsigned char>& actual,const std::vector<unsigned char>& reference,
+              unsigned word_bytes,unsigned width,unsigned outputs,bool down,unsigned storage,
+              unsigned flavor,unsigned replay,unsigned mode,const char* reference_name) {
+    std::cerr << "SHARED_BITS_MISMATCH width=" << width << " outputs=" << outputs
+              << " role=" << (down?"down":"gate_up") << " storage=" << storage
+              << " flavor=" << flavor << " replay=" << replay
+              << " path=" << (replay?"graph":"eager") << " mode=" << mode
+              << " reference=" << reference_name << " word_bytes=" << word_bytes << '\n';
+    unsigned differences=0;
+    for(std::size_t at=0;at<actual.size();at+=word_bytes) {
+        std::uint32_t before=0,after=0;
+        std::memcpy(&before,reference.data()+at,word_bytes);
+        std::memcpy(&after,actual.data()+at,word_bytes);
+        if(before==after)continue;
+        if(differences++<16U)std::cerr << " output=" << at/word_bytes << " old=0x"
+            << std::hex << std::setw(static_cast<int>(word_bytes*2U)) << std::setfill('0') << before
+            << " new=0x" << std::setw(static_cast<int>(word_bytes*2U)) << after
+            << std::dec << std::setfill(' ') << '\n';
+    }
+    std::cerr << " differing_output_words=" << differences << '\n';
 }
 struct Owner {
     hipStream_t stream{};
@@ -260,12 +283,16 @@ void family(unsigned width, unsigned outputs, HipSharedQ8ProjectionRole role,
             check(hipMemcpy(actual.data(), reinterpret_cast<void *>(output.address), output.bytes,
                             hipMemcpyDeviceToHost),
                   "read shared output bits");
-            require(flavor >= 4 || actual == expected,
-                    "shared projection differs from independent fixed256 FMA/store oracle");
+            if(flavor<4 && actual!=expected){
+                mismatch(actual,expected,output_bf16?2U:4U,width,outputs,down,element,flavor,replay,mode,"host-fixed256");
+                throw std::runtime_error("shared projection differs from independent fixed256 FMA/store oracle");
+            }
             if (mode == 0)
                 first = actual;
-            else
-                require(actual == first, "shared legacy/virtual/prefetch bits differ");
+            else if(actual!=first){
+                mismatch(actual,first,output_bf16?2U:4U,width,outputs,down,element,flavor,replay,mode,"device-legacy256");
+                throw std::runtime_error("shared legacy/virtual/prefetch bits differ");
+            }
             guard(input);
             guard(weights);
             if (down)
@@ -319,7 +346,14 @@ void family(unsigned width, unsigned outputs, HipSharedQ8ProjectionRole role,
               << " storage=" << element << " flavor=" << flavor << " PASS\n";
 }
 } // namespace
-int main() try {
+int main(int argc,char** argv) try {
+    if(argc==2 && std::string_view(argv[1])=="--nonfinite") {
+        for(auto storage:{HipActivationStorage::bf16,HipActivationStorage::fp32})
+            for(auto role:{HipSharedQ8ProjectionRole::gate_up,HipSharedQ8ProjectionRole::down})
+                for(unsigned flavor:{4U,5U})family(640,9,role,storage,flavor);
+        return 0;
+    }
+    require(argc==1,"expected no arguments or --nonfinite");
     for (auto storage : {HipActivationStorage::bf16, HipActivationStorage::fp32}) {
         for (auto role : {HipSharedQ8ProjectionRole::gate_up, HipSharedQ8ProjectionRole::down})
             for (auto shape : {std::pair{32U, 1U},
