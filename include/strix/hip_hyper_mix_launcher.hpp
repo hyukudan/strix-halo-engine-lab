@@ -17,6 +17,8 @@ struct HipHyperMixLauncherConfig {
     bool parallel = false;
     bool staged_projections = false;
     bool fused_injection = false;
+    bool typed_projection = false;
+    bool prefetch_rows = false;
     HipActivationStorage activation =
         HipActivationStorage::bf16;
 };
@@ -34,6 +36,10 @@ make_hip_hyper_mix_launcher(
     std::string kernel_id,
     HipHyperMixLauncherConfig* config);
 
+// Validates every compiled mixer before the first typed launch or capture.
+void preflight_typed_hyper_projection_model(const CompiledSerialExecution& compiled,
+    const ExecutionRuntimeResources& resources);
+
 class HipHyperMixLauncherBundle {
 public:
     explicit HipHyperMixLauncherBundle(
@@ -47,7 +53,8 @@ public:
 
     void register_for_compiled_execution(
         const CompiledSerialExecution& compiled,
-        ExecutionLauncherRegistry& registry);
+        ExecutionLauncherRegistry& registry,
+        const ExecutionRuntimeResources* resources = nullptr);
 
 private:
     HipHyperMixLauncherConfig config_;

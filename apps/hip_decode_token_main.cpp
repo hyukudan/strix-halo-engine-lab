@@ -169,6 +169,8 @@ struct Options {
     bool parallel_hyper_mix = false;
     bool staged_hyper_projections = false;
     bool fused_staged_hyper_mix = false;
+    bool typed_hyper_projection = false;
+    bool prefetch_typed_hyper_rows = false;
     bool virtual_q8_lm_head = false;
     bool parallel_moe_router = false;
     bool virtual_q8_gdn_input = false;
@@ -200,7 +202,7 @@ Options parse_options(
             "[--generate N] [--eos-token TOKEN_ID] [--prefix-cache-roundtrip] "
             "[--parallel-moe-router] [--ranked-moe-router-topk] "
             "[--virtual-q8-lm-head] [--virtual-q8-gdn-input [--prefetch-q8-gdn-input]] "
-            "[--parallel-hyper-mix [--staged-hyper-projections [--fused-staged-hyper-mix]]]");
+            "[--parallel-hyper-mix [--staged-hyper-projections [--fused-staged-hyper-mix [--typed-fused-hyper-projections [--prefetch-typed-hyper-rows]]]]]");
     }
 
     Options options;
@@ -221,6 +223,16 @@ Options parse_options(
         if (argument == "--parallel-moe-router") {
             if (options.parallel_moe_router) throw std::invalid_argument("duplicate parallel MoE router option");
             options.parallel_moe_router = true;
+            continue;
+        }
+        if (argument == "--prefetch-typed-hyper-rows") {
+            if (options.prefetch_typed_hyper_rows) throw std::invalid_argument("duplicate typed hyper row prefetch option");
+            options.prefetch_typed_hyper_rows = true;
+            continue;
+        }
+        if (argument == "--typed-fused-hyper-projections") {
+            if (options.typed_hyper_projection) throw std::invalid_argument("duplicate typed hyper projection option");
+            options.typed_hyper_projection = true;
             continue;
         }
         if (argument == "--parallel-hyper-mix") {
@@ -493,6 +505,10 @@ Options parse_options(
         throw std::invalid_argument("--ranked-moe-router-topk requires --parallel-moe-router");
     if (options.prefetch_q8_gdn_input && !options.virtual_q8_gdn_input)
         throw std::invalid_argument("--prefetch-q8-gdn-input requires --virtual-q8-gdn-input");
+    if (options.prefetch_typed_hyper_rows && !options.typed_hyper_projection)
+        throw std::invalid_argument("typed hyper row prefetch requires typed projection mode");
+    if (options.typed_hyper_projection && !(options.parallel_hyper_mix && options.staged_hyper_projections && options.fused_staged_hyper_mix))
+        throw std::invalid_argument("typed hyper projections require parallel, staged and fused options");
     if (options.staged_hyper_projections && !options.parallel_hyper_mix)
         throw std::invalid_argument("--staged-hyper-projections requires --parallel-hyper-mix");
     if (options.fused_staged_hyper_mix && !options.staged_hyper_projections)
@@ -894,6 +910,8 @@ int main(
     catalog_config.parallel_hyper_mix = options.parallel_hyper_mix;
     catalog_config.staged_hyper_projections = options.staged_hyper_projections;
     catalog_config.fused_staged_hyper_mix = options.fused_staged_hyper_mix;
+    catalog_config.typed_hyper_projection = options.typed_hyper_projection;
+    catalog_config.prefetch_typed_hyper_rows = options.prefetch_typed_hyper_rows;
     catalog_config.virtual_q8_lm_head = options.virtual_q8_lm_head;
     catalog_config.ranked_moe_router_topk = options.ranked_moe_router_topk;
     binding_request.ranked_moe_router_topk = options.ranked_moe_router_topk;
@@ -1063,7 +1081,7 @@ int main(
     }
     auto launcher_catalog = std::make_shared<strix::HipLauncherCatalog>(model, catalog_config, integer_bundle);
     strix::ExecutionLauncherRegistry launchers;
-    launcher_catalog->register_for_compiled_execution(compiled, launchers);
+    launcher_catalog->register_for_compiled_execution(compiled, launchers, &resources);
     if (launcher_catalog->audit(compiled, launchers).missing_steps)
         throw std::logic_error("HIP launcher catalog is incomplete for actual compiled execution");
     const auto launch_plan = strix::compile_launch_plan(compiled, launchers);

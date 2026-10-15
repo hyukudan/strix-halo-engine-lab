@@ -99,6 +99,10 @@ void validate_config(
         throw std::invalid_argument("staged hyper projections require parallel hyper-mix");
     if (config.fused_injection && !config.staged_projections)
         throw std::invalid_argument("fused injection requires staged hyper projections");
+    if (config.prefetch_rows && !config.typed_projection)
+        throw std::invalid_argument("hyper row prefetch requires typed projection mode");
+    if (config.typed_projection && !config.fused_injection)
+        throw std::invalid_argument("typed hyper projection requires fused staged execution");
     if (config.hidden_size == 0 ||
         config.hc_count <= 1 ||
         config.hc_count > kMaxHc ||
@@ -774,6 +778,155 @@ __global__ void fused_staged_hyper_projection_kernel(
     }
 }
 
+template <std::uint32_t Kind>
+__device__ float typed_projection_weight(const void* weights, std::uint32_t width,
+    std::uint32_t output, std::uint32_t feature) {
+    static_assert(Kind == 8U || Kind == 0U);
+    if constexpr (Kind == 8U) {
+        const auto& block = static_cast<const Q8Block*>(weights)[
+            static_cast<std::uint64_t>(output) * (width / 32U) + feature / 32U];
+        return __half2float(block.scale) * static_cast<float>(block.values[feature % 32U]);
+    } else {
+        return static_cast<const float*>(weights)[static_cast<std::uint64_t>(output) * width + feature];
+    }
+}
+
+template <std::uint32_t Kind, bool Injection>
+__device__ void typed_projection_role(const float* normalized, const void* weights,
+    std::uint32_t width, std::uint32_t streams, std::uint32_t outputs,
+    std::uint32_t role_block, float* output, float* values,
+    float (*coefficients)[kStagedPitch]) {
+    const auto lane = threadIdx.x;
+    const auto first_output = role_block * kStagedOutputs;
+    const auto row = blockIdx.y;
+    const auto chain = first_output + lane;
+    const bool active = lane < kStagedOutputs && chain < outputs;
+    float sum = 0.0F;
+    for (std::uint32_t tile = 0; tile < width; tile += kStagedThreads) {
+        const auto remaining = width - tile;
+        const auto count = remaining < kStagedThreads ? remaining : kStagedThreads;
+        if (lane < count) {
+            values[lane] = normalized[static_cast<std::uint64_t>(row) * width + tile + lane];
+            for (std::uint32_t local = 0; local < kStagedOutputs; ++local) {
+                if (first_output + local < outputs)
+                    coefficients[local][lane] = typed_projection_weight<Kind>(
+                        weights, width, first_output + local, tile + lane);
+            }
+        }
+        __syncthreads();
+        if (active)
+            for (std::uint32_t inner = 0; inner < count; ++inner)
+                sum += values[inner] * coefficients[lane][inner];
+        __syncthreads();
+    }
+    if (active) {
+        const float scaled = sum / static_cast<float>(streams);
+        output[static_cast<std::uint64_t>(row) * outputs + chain] =
+            Injection ? 2.0F * sigmoid(scaled) : scaled * sigmoid(scaled);
+    }
+}
+
+__global__ void typed_fused_hyper_projection_kernel(
+    const float* normalized, const void* down, std::uint32_t width,
+    std::uint32_t streams, std::uint32_t lowrank, float* low,
+    const void* inject, float* injection_output, std::uint32_t lowrank_blocks) {
+    __shared__ float values[kStagedThreads];
+    __shared__ float coefficients[kStagedOutputs][kStagedPitch];
+    // Role is block-uniform: every lane enters one complete producer/consumer loop.
+    if (blockIdx.x < lowrank_blocks)
+        typed_projection_role<8U, false>(normalized, down, width, streams, lowrank,
+            blockIdx.x, low, values, coefficients);
+    else
+        typed_projection_role<0U, true>(normalized, inject, width, streams, streams,
+            blockIdx.x - lowrank_blocks, injection_output, values, coefficients);
+}
+
+// Compile/ISA probe: all producer loads precede this producer's LDS stores.
+// Full rows have no per-row control flow; partial rows reread an in-bounds row.
+template <std::uint32_t Kind, bool Full>
+__device__ void typed_batched_produce(const float* normalized, const void* weights,
+    std::uint32_t width, std::uint32_t first_output, std::uint32_t valid,
+    std::uint32_t tile, float* values, float (*coefficients)[kStagedPitch]) {
+    const auto lane = threadIdx.x;
+    const float value = normalized[static_cast<std::uint64_t>(blockIdx.y) * width + tile + lane];
+    float prefetched[kStagedOutputs];
+#pragma unroll
+    for (std::uint32_t local = 0; local < kStagedOutputs; ++local) {
+        const auto source = (Full || local < valid) ? local : valid - 1U;
+        prefetched[local] = typed_projection_weight<Kind>(
+            weights, width, first_output + source, tile + lane);
+    }
+    values[lane] = value;
+#pragma unroll
+    for (std::uint32_t local = 0; local < kStagedOutputs; ++local) {
+        // Every destination is a valid row. Repeated last-row stores carry
+        // the identical clamped coefficient and finish before the barrier.
+        const auto destination = (Full || local < valid) ? local : valid - 1U;
+        coefficients[destination][lane] = prefetched[local];
+    }
+}
+
+template <std::uint32_t Kind, bool Injection, bool Full>
+__device__ void typed_batched_projection_role(const float* normalized, const void* weights,
+    std::uint32_t width, std::uint32_t streams, std::uint32_t outputs,
+    std::uint32_t role_block, float* output, float* values,
+    float (*coefficients)[kStagedPitch]) {
+    const auto lane = threadIdx.x;
+    const auto first_output = role_block * kStagedOutputs;
+    const auto row = blockIdx.y;
+    // The ceil(outputs/8) grid guarantees first_output < outputs and valid >= 1.
+    const auto rows_left = outputs - first_output;
+    const auto valid = rows_left < kStagedOutputs ? rows_left : kStagedOutputs;
+    const auto chain = first_output + lane;
+    const bool active = lane < kStagedOutputs && chain < outputs;
+    float sum = 0.0F;
+    for (std::uint32_t tile = 0; tile < width; tile += kStagedThreads) {
+        const auto remaining = width - tile;
+        const auto count = remaining < kStagedThreads ? remaining : kStagedThreads;
+        if (lane < count) {
+            typed_batched_produce<Kind, Full>(normalized, weights, width, first_output, valid,
+                tile, values, coefficients);
+        }
+        __syncthreads();
+        if (active)
+            for (std::uint32_t inner = 0; inner < count; ++inner)
+                sum += values[inner] * coefficients[lane][inner];
+        __syncthreads();
+    }
+    if (active) {
+        const float scaled = sum / static_cast<float>(streams);
+        output[static_cast<std::uint64_t>(row) * outputs + chain] =
+            Injection ? 2.0F * sigmoid(scaled) : scaled * sigmoid(scaled);
+    }
+}
+
+__global__ void batched_typed_hyper_projection_kernel(
+    const float* normalized, const void* down, std::uint32_t width,
+    std::uint32_t streams, std::uint32_t lowrank, float* low,
+    const void* inject, float* injection_output, std::uint32_t lowrank_blocks) {
+    __shared__ float values[kStagedThreads];
+    __shared__ float coefficients[kStagedOutputs][kStagedPitch];
+    // Both choices are block-uniform and precede each complete tile loop.
+    if (blockIdx.x < lowrank_blocks) {
+        const auto rows_left = lowrank - blockIdx.x * kStagedOutputs;
+        if (rows_left >= kStagedOutputs)
+            typed_batched_projection_role<8U, false, true>(normalized, down, width, streams, lowrank,
+                blockIdx.x, low, values, coefficients);
+        else
+            typed_batched_projection_role<8U, false, false>(normalized, down, width, streams, lowrank,
+                blockIdx.x, low, values, coefficients);
+    } else {
+        const auto role_block = blockIdx.x - lowrank_blocks;
+        const auto rows_left = streams - role_block * kStagedOutputs;
+        if (rows_left >= kStagedOutputs)
+            typed_batched_projection_role<0U, true, true>(normalized, inject, width, streams, streams,
+                role_block, injection_output, values, coefficients);
+        else
+            typed_batched_projection_role<0U, true, false>(normalized, inject, width, streams, streams,
+                role_block, injection_output, values, coefficients);
+    }
+}
+
 template <typename Storage>
 __global__ void staged_hyper_output_kernel(
     const float* normalized, const float* low, const void* up, std::uint32_t kind,
@@ -967,6 +1120,23 @@ void launch_typed(
             if (config.fused_injection) {
                 const auto lowrank_blocks = (config.lowrank + kStagedOutputs - 1U) / kStagedOutputs;
                 const auto injection_blocks = injection_output ? (config.hc_count + kStagedOutputs - 1U) / kStagedOutputs : 0U;
+                if (config.typed_projection) {
+                    if (config.prefetch_rows) {
+                        hipLaunchKernelGGL(batched_typed_hyper_projection_kernel,
+                            dim3(lowrank_blocks + injection_blocks, context.logical_rows), dim3(kStagedThreads),
+                            0, hip_execution_stream(), normalized, reinterpret_cast<const void*>(down_runtime.address),
+                            static_cast<std::uint32_t>(width), config.hc_count, config.lowrank, low,
+                            inject_runtime ? reinterpret_cast<const void*>(inject_runtime->address) : nullptr,
+                            injection_output ? reinterpret_cast<float*>(injection_output->address) : nullptr, lowrank_blocks);
+                    } else {
+                    hipLaunchKernelGGL(typed_fused_hyper_projection_kernel,
+                        dim3(lowrank_blocks + injection_blocks, context.logical_rows), dim3(kStagedThreads),
+                        0, hip_execution_stream(), normalized, reinterpret_cast<const void*>(down_runtime.address),
+                        static_cast<std::uint32_t>(width), config.hc_count, config.lowrank, low,
+                        inject_runtime ? reinterpret_cast<const void*>(inject_runtime->address) : nullptr,
+                        injection_output ? reinterpret_cast<float*>(injection_output->address) : nullptr, lowrank_blocks);
+                    }
+                } else {
                 hipLaunchKernelGGL(fused_staged_hyper_projection_kernel,
                     dim3(lowrank_blocks + injection_blocks, context.logical_rows), dim3(kStagedThreads),
                     0, hip_execution_stream(), normalized,
@@ -975,6 +1145,7 @@ void launch_typed(
                     inject_runtime ? reinterpret_cast<const void*>(inject_runtime->address) : nullptr,
                     inject_manifest ? inject_manifest->ggml_type : 0U,
                     injection_output ? reinterpret_cast<float*>(injection_output->address) : nullptr, lowrank_blocks);
+                }
                 check_hip(hipGetLastError(), "fused staged hyper-mix projection launch");
                 hipLaunchKernelGGL(HIP_KERNEL_NAME(staged_hyper_output_kernel<Storage>),
                     dim3((config.hidden_size + kStagedOutputs - 1U) / kStagedOutputs, context.logical_rows),
@@ -1171,6 +1342,10 @@ void launch_hyper_mix(
                 access);
     }
 
+    if (config.typed_projection && (down_manifest.ggml_type != 8U ||
+        (inject_manifest != nullptr && inject_manifest->ggml_type != 0U)))
+        throw std::invalid_argument("typed hyper projection requires Q8_0 down and F32 injection");
+
     const auto expanded_width =
         static_cast<std::uint64_t>(
             config.hidden_size) *
@@ -1351,7 +1526,7 @@ std::string kernel_id(
         ".c" +
         std::to_string(
             request.request_concurrency) + (config.parallel ? ".parallel" : "") +
-        (config.staged_projections ? ".staged" : "") + (config.fused_injection ? ".fused-injection-v5" : "");
+        (config.staged_projections ? ".staged" : "") + (config.fused_injection ? ".fused-injection-v5" : "") + (config.typed_projection ? ".typed-q8-f32-v1" : "") + (config.prefetch_rows ? ".prefetch-rows8-v2" : "");
 }
 
 std::uint64_t implementation_identity(
@@ -1377,6 +1552,8 @@ std::uint64_t implementation_identity(
     hash_u64(hash, config.parallel ? 1U : 0U);
     if (config.staged_projections) hash_u64(hash, 0x535441474544ULL);
     if (config.fused_injection) hash_u64(hash, 0x4655534544484305ULL);
+    if (config.typed_projection) hash_u64(hash, 0x5459504544484301ULL);
+    if (config.prefetch_rows) hash_u64(hash, 0x5052464852430802ULL);
     return hash;
 }
 
@@ -1470,6 +1647,8 @@ void register_hip_hyper_mix_kernel_variant(
     variant.output_layout =
         "row-major+fp32-injection";
     variant.compiler_identity =
+        config.prefetch_rows ? "hip-gfx1151-hyper-mix-v8-typed-prefetch-rows8" :
+        config.typed_projection ? "hip-gfx1151-hyper-mix-v6-typed-projection" :
         config.fused_injection ? "hip-gfx1151-hyper-mix-v5-fused-injection" :
         config.staged_projections ? "hip-gfx1151-hyper-mix-v4-staged" :
         config.parallel ? "hip-gfx1151-hyper-mix-v3-parallel" : "hip-gfx1151-hyper-mix-v2";
@@ -1498,15 +1677,60 @@ make_hip_hyper_mix_launcher(
     };
 }
 
+void preflight_typed_hyper_projection_model(const CompiledSerialExecution& compiled,
+    const ExecutionRuntimeResources& resources) {
+    if (compiled.execution_identity == 0 || resources.model_manifest == nullptr || resources.tensor_access == nullptr)
+        throw std::invalid_argument("typed hyper preflight requires a complete compiled model binding");
+    std::uint32_t count = 0;
+    for (const auto& step : compiled.execution.steps) {
+        if (step.op != SerialOp::attn_hyper_mix && step.op != SerialOp::mlp_hyper_mix && step.op != SerialOp::final_hyper_mix) continue;
+        ExecutionDispatchContext context;
+        context.execution_identity = compiled.execution_identity;
+        context.step_id = step.id;
+        context.op = step.op;
+        context.resources = &resources;
+        const auto& down = manifest_tensor(context, resolve_dispatch_tensor_access(context, 1));
+        if (down.ggml_type != 8U) throw std::invalid_argument("typed hyper model contains a non-Q8_0 down projection");
+        if (step.op != SerialOp::final_hyper_mix) {
+            const auto& inject = manifest_tensor(context, resolve_dispatch_tensor_access(context, 3));
+            if (inject.ggml_type != 0U) throw std::invalid_argument("typed hyper model contains a non-F32 injection projection");
+        }
+        ++count;
+    }
+    if (count == 0U) throw std::invalid_argument("typed hyper preflight found no mixer bindings");
+}
+
 void HipHyperMixLauncherBundle::
 register_for_compiled_execution(
     const CompiledSerialExecution& compiled,
-    ExecutionLauncherRegistry& registry) {
+    ExecutionLauncherRegistry& registry,
+    const ExecutionRuntimeResources* resources) {
+    if (config_.typed_projection) {
+        if (resources == nullptr) throw std::invalid_argument("typed hyper bundle requires complete model preflight resources");
+        preflight_typed_hyper_projection_model(compiled, *resources);
+    }
     if (compiled.execution_identity == 0 ||
         compiled.execution.steps.size() !=
             compiled.bindings.bindings.size()) {
         throw std::invalid_argument(
             "HIP hyper-mix bundle requires valid compiled execution");
+    }
+
+    // Fail atomically for the typed selection before registering its first id.
+    if (config_.typed_projection) {
+        ExecutionBindingRequest expected;
+        expected.logical_rows = compiled.logical_rows;
+        expected.request_concurrency = compiled.request_concurrency;
+        const auto selected_id = kernel_id(expected, config_);
+        for (std::size_t index = 0; index < compiled.execution.steps.size(); ++index) {
+            const auto op = compiled.execution.steps[index].op;
+            if (op != SerialOp::attn_hyper_mix && op != SerialOp::mlp_hyper_mix &&
+                op != SerialOp::final_hyper_mix) continue;
+            const auto& binding = compiled.bindings.bindings[index];
+            if (binding.host_or_runtime_step || !binding.kernel_id.has_value() ||
+                *binding.kernel_id != selected_id)
+                throw std::invalid_argument("typed hyper bundle differs from selected kernel identity");
+        }
     }
 
     std::string registered_id;
