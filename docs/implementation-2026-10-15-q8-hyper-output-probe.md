@@ -54,3 +54,23 @@ width divisible by32; with at most8 streams, legal partial output groups have
 4 valid rows. Other partial-group counts are not claimed as admitted fixture
 shapes. Non32 lowrank and F32 up projections remain supported by prior paths;
 this opt-in variant must reject them without mutating its destinations.
+
+The supplemental `strix-hip-hyper-output-prefetch-tests` target runs the
+`output-prefetch` fixture mode. Its 48 cases cover F32/BF16 storage, attention,
+MLP and final mixers, hidden widths with complete and admitted partial-four
+blocks, and lowrank widths 32, 96, 128, 160, 288, 320 and 512. Together these
+cover all four tile-tail classes and multiple tiles. One shape retains the
+checkpoint dimensions 2560 hidden features, four streams and lowrank 320.
+Signed finite Q8 scales include zeros, subnormals and maximum magnitude; codes
+include -128 and 127. The independent CPU oracle and unchanged generic/typed
+kernels provide separate reference controls. These fixtures use one logical
+row; they do not establish multi-row or nonfinite-payload qualification.
+
+Each candidate begins from poisoned complete scratch and destinations, checks
+full normalized/low/output/injection state, and replays captured work three
+times. Separate last-K changes in first/full/last up rows must change reference
+output bits. Wrong F32-up admission must report the exact format error and
+preserve every destination byte. Model preflight tests positive registration
+and malformed final up bindings before any specialized launcher is registered.
+Device fixture execution, checkpoint equality and timing remain pending for
+this supplemental source snapshot.

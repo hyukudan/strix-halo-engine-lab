@@ -1263,6 +1263,8 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         )
         add_test(NAME strix-hip-hyper-row-prefetch-tests
                  COMMAND strix-hip-hyper-mix-launcher-tests prefetch)
+        add_test(NAME strix-hip-hyper-output-prefetch-tests
+                 COMMAND strix-hip-hyper-mix-launcher-tests output-prefetch)
 
         add_executable(
             strix-hip-launcher-catalog-tests
