@@ -186,11 +186,14 @@ qualify the combined automatic profile. No universal checkpoint-quality claim is
 made. Detailed receipts remain in the private evidence store.
 
 The current host-only follow-up preserves explicit legacy options unless auto is
-explicitly requested, checks full roundtrip capacity after resolving context, and
+explicitly requested, checks prefix capacity after resolving context, and
 uses the existing JSON escaping helper for QSA tensor names. Its tests cover
 no-flag automatic selection, implicit explicit-option fallback, explicit auto plus
-ranked, manual JSON identity, and43-prefix/511-generation auto8192 acceptance versus
-manual128 rejection. Changed host source needs review and fresh native validation;
+ranked, manual JSON identity, a 200-token prefix accepted under automatic context
+8192 versus rejected under manual context 128, and 43-prefix/511-generation requests
+accepted under manual, explicit 128 and unknown-checkpoint configurations.
+Generation retains the existing `context_capacity` stop. Changed host source needs
+review and fresh native validation;
 joint automatic full554/512 fidelity and paired timing remain independent gates.
 
 Observed for this host follow-up: GNU 13.3/WSL Release with HIP OFF and warnings
