@@ -1418,6 +1418,11 @@ int main(int argc, char** argv) try {
             expect(std::memcmp(untouched_matrix.data(), first_matrix.data(), matrix_address.bytes) == 0 && untouched_conv == actual_conv,
                 "bad GDN admission preserves persistent state");
         };
+        // Full entrypoint must reject the existing F32 output BEFORE either
+        // input projection or persistent conv/recurrent update is enqueued.
+        reject_before_launch([&] { config.virtual_q8_output_projection = true; },
+            [&] { config.virtual_q8_output_projection = false; },
+            "virtual Q8 GDN output requires aligned Q8_0 weights");
         if (prefetch_enabled) {
             reject_before_launch([&] { config.virtual_q8_input_projections = false; },
                 [&] { config.virtual_q8_input_projections = true; }, "requires virtual");

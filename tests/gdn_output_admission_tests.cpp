@@ -31,8 +31,8 @@ int main() try {
         manifest.layout_identity=strix::model_manifest_layout_identity(manifest);
         bool rejected=false;try {strix::validate_virtual_q8_gdn_output_manifest(model,manifest);}
         catch(const std::invalid_argument& e) {
-            const std::string message=e.what();rejected=message=="virtual Q8 GDN output requires every original aligned Q8_0 output tensor" ||
-                message=="virtual Q8 GDN output tensor is duplicated";
+            const std::string message=e.what();rejected=message==(mode==6?"virtual Q8 GDN output tensor is duplicated":
+                "virtual Q8 GDN output requires every original aligned Q8_0 output tensor");
         }
         if(!rejected) throw std::runtime_error("wrong late tensor did not fail exact admission contract");
     }
