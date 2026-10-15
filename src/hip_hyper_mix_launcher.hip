@@ -945,10 +945,10 @@ __device__ __forceinline__ unsigned lane_chain_q8_byte(const uint4* words,unsign
     return (word>>(8U*(byte%4U)))&255U;
 }
 template <unsigned OutputsPerWave,unsigned Prefetch>
-__global__ void lane_chain_hyper_projection_kernel(const float* normalized,const void* down,const float* inject,
+__global__ __launch_bounds__(32) void lane_chain_hyper_projection_kernel(const float* normalized,const void* down,const float* inject,
     unsigned width,unsigned streams,unsigned rank,float* low,float* injection,unsigned low_blocks){
     static_assert(OutputsPerWave==8 || OutputsPerWave==16 || OutputsPerWave==32);
-    static_assert(Prefetch==1 || Prefetch==2); // P4 needs272 packed dwords alone.
+    static_assert(Prefetch==1 || Prefetch==2); // P4 needs 272 packed dwords alone.
     const unsigned lane=threadIdx.x,row=blockIdx.y;
     const bool is_inject=blockIdx.x>=low_blocks;
     const unsigned chain=(is_inject?blockIdx.x-low_blocks:blockIdx.x)*OutputsPerWave+lane;
