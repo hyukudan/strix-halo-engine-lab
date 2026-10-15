@@ -32,7 +32,7 @@ __device__ __forceinline__ T& slot(RegisterRing<T, N>& ring) {
     else return slot<I-1>(ring.tail);
 }
 
-struct PairSlot { U32x4 c0, c1, c2, c3; unsigned scales; };
+struct PairSlot { RegisterRing<unsigned, 16> words; unsigned scales; };
 struct TileSlot { F32x4 s0, s1, s2, s3; };
 
 __device__ float sigmoid(float value) {
@@ -42,10 +42,12 @@ __device__ float sigmoid(float value) {
 __device__ __forceinline__ void load_pair(PairSlot& part, const U32x4* codes,
     const unsigned* scales, unsigned pair, unsigned rank_pad, unsigned output) {
     const auto base = static_cast<std::uint64_t>(pair) * 4U * rank_pad + output;
-    part.c0 = codes[base];
-    part.c1 = codes[base + rank_pad];
-    part.c2 = codes[base + 2U * rank_pad];
-    part.c3 = codes[base + 3U * rank_pad];
+    static_for<4>([&]<unsigned H>() {
+        const U32x4 loaded = codes[base + H * rank_pad];
+        static_for<4>([&]<unsigned J>() {
+            slot<H * 4U + J>(part.words) = loaded[J];
+        });
+    });
     part.scales = scales[static_cast<std::uint64_t>(pair) * rank_pad + output];
 }
 
@@ -64,19 +66,25 @@ __device__ __forceinline__ float input_value(const float* input, const float* st
     else return input[feature];
 }
 
+// The host launches exactly one wave32 per block. Release/acquire fences make
+// the preceding LDS reads/stores visible across that wave's rendezvous, without
+// imposing workgroup scope on unrelated, read-only global prefetches. This
+// contract also requires wave32 in the compiled kernel descriptor.
+__device__ __forceinline__ void wave_exchange() {
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
+    __builtin_amdgcn_wave_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
+}
+
 template<bool LdsInput>
 __device__ __forceinline__ void consume_pair(float& sum, const PairSlot& part,
     unsigned pair, const float* input, const float* staged) {
     static_for<2>([&]<unsigned E>() {
         const float scale = __half2float(__ushort_as_half(static_cast<unsigned short>(part.scales >> (16U * E))));
         static_for<2>([&]<unsigned H>() {
-            U32x4 unit;
-            if constexpr(2U * E + H == 0) unit = part.c0;
-            else if constexpr(2U * E + H == 1) unit = part.c1;
-            else if constexpr(2U * E + H == 2) unit = part.c2;
-            else unit = part.c3;
             static_for<16>([&]<unsigned J>() {
-                const auto code = static_cast<std::int8_t>(static_cast<std::uint8_t>(unit[J / 4U] >> (8U * (J % 4U))));
+                const auto word = slot<(2U * E + H) * 4U + J / 4U>(part.words);
+                const auto code = static_cast<std::int8_t>(static_cast<std::uint8_t>(word >> (8U * (J % 4U))));
                 const float coefficient = scale * static_cast<float>(code);
                 sum += input_value<LdsInput>(input, staged, (pair * 2U + E) * 32U + H * 16U + J) * coefficient;
             });
@@ -122,12 +130,12 @@ __device__ __forceinline__ void projection_roles(const float* input, const float
             static_for<D>([&]<unsigned I>() {
                 const unsigned current = first + I;
                 if(current < tiles) {
-                    __syncthreads();
+                    wave_exchange();
                     *reinterpret_cast<F32x4*>(&tile[0][lane * 4U]) = slot<I>(ring).s0;
                     *reinterpret_cast<F32x4*>(&tile[1][lane * 4U]) = slot<I>(ring).s1;
                     *reinterpret_cast<F32x4*>(&tile[2][lane * 4U]) = slot<I>(ring).s2;
                     *reinterpret_cast<F32x4*>(&tile[3][lane * 4U]) = slot<I>(ring).s3;
-                    __syncthreads();
+                    wave_exchange();
                     if(current + D < tiles) load_tile(slot<I>(ring), inject, width, current + D, lane);
                     if(lane < streams) {
 #pragma unroll
@@ -145,7 +153,7 @@ __device__ __forceinline__ void projection_roles(const float* input, const float
 }
 
 template<unsigned K, unsigned D, bool LdsInput>
-__global__ __launch_bounds__(32) void register_repacked_hyper_projection_kernel(
+__global__ __launch_bounds__(32) void word_repacked_hyper_projection_kernel(
     const float* __restrict__ normalized, const U32x4* __restrict__ codes,
     const unsigned* __restrict__ scales, const float* __restrict__ inject,
     unsigned width, unsigned streams, unsigned rank, unsigned rank_pad,
@@ -194,9 +202,9 @@ void hc_repacked_projection_diagnostic::enqueue(
         shape.rank == 0U || shape.rank > 512U ||
         shape.rows == 0U || shape.rows > 65535U ||
         rank_pad != ((shape.rank + 31U) / 32U) * 32U ||
-        (schedule != Schedule::n1_scalar_k8_d8 &&
-         schedule != Schedule::n2_lds_k8_d8 &&
-         schedule != Schedule::n3_scalar_k4_d4)) {
+        (schedule != Schedule::w1_scalar_k8_d8 &&
+         schedule != Schedule::w2_lds_k8_d8 &&
+         schedule != Schedule::w3_scalar_k4_d4)) {
         throw std::invalid_argument(
             "HC repacked projection diagnostic unsupported shape/schedule");
     }
@@ -240,7 +248,7 @@ void hc_repacked_projection_diagnostic::enqueue(
     check_hip(hipPeekAtLastError(), "HC repacked projection diagnostic stale error");
     const auto launch = [&]<unsigned Pairs, unsigned Depth, bool LdsInput>() {
         hipLaunchKernelGGL(
-            HIP_KERNEL_NAME(register_repacked_hyper_projection_kernel<Pairs, Depth, LdsInput>),
+            HIP_KERNEL_NAME(word_repacked_hyper_projection_kernel<Pairs, Depth, LdsInput>),
             dim3(rank_pad / 32U + (with_inject ? 1U : 0U), shape.rows),
             dim3(32U), 0, stream,
             reinterpret_cast<const float*>(normalized.address),
@@ -251,8 +259,8 @@ void hc_repacked_projection_diagnostic::enqueue(
             reinterpret_cast<float*>(low.address),
             reinterpret_cast<float*>(injection.address), rank_pad / 32U);
     };
-    if (schedule == Schedule::n1_scalar_k8_d8) launch.template operator()<8U, 8U, false>();
-    else if (schedule == Schedule::n2_lds_k8_d8) launch.template operator()<8U, 8U, true>();
+    if (schedule == Schedule::w1_scalar_k8_d8) launch.template operator()<8U, 8U, false>();
+    else if (schedule == Schedule::w2_lds_k8_d8) launch.template operator()<8U, 8U, true>();
     else launch.template operator()<4U, 4U, false>();
     check_hip(hipGetLastError(), "HC repacked projection diagnostic enqueue");
 }
