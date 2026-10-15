@@ -589,15 +589,22 @@ Reference cpu_reference(
 int main(int argc, char** argv) try {
     auto model = fixture_model();
     const bool candidate_enabled = argc >= 2;
-    const std::string fixture_mode = argc == 3 ? argv[2] : "";
+    const std::string fixture_mode = argc >= 3 ? argv[2] : "";
     const bool wave8_enabled = fixture_mode == "wave8";
     const bool prefetch_enabled = fixture_mode == "prefetch" || fixture_mode == "prefetch-fallback" || wave8_enabled;
-    if (argc == 2 || (argc == 3 && (fixture_mode == "fallback" || prefetch_enabled))) {
+    if (argc == 2 || ((argc == 3 || argc == 4) && (fixture_mode == "fallback" || prefetch_enabled))) {
         dense_q8_fixture = fixture_mode != "fallback" && fixture_mode != "prefetch-fallback";
         dense_q8_width = static_cast<std::uint32_t>(std::stoul(argv[1]));
         if (dense_q8_width != 128U && dense_q8_width != 288U && dense_q8_width != 480U && dense_q8_width != 640U && dense_q8_width != 2560U)
             throw std::invalid_argument("GDN Q8 fixture supports widths128,288,480,640,2560");
         model.hidden_size = dense_q8_width;
+        if (argc == 4) {
+            const auto heads = static_cast<std::uint32_t>(std::stoul(argv[3]));
+            if (!wave8_enabled || (heads != 4U && heads != 12U))
+                throw std::invalid_argument("GDN wave8 tail fixture supports 4 or 12 value heads");
+            model.gdn_key_heads = 4;
+            model.gdn_value_heads = heads;
+        }
     } else if (argc != 1) throw std::invalid_argument("GDN fixture accepts width and optional fallback mode");
     const auto plan =
         strix::build_serial_decode_execution_plan(
@@ -1409,6 +1416,8 @@ int main(int argc, char** argv) try {
             mutate(); bool rejected = false; std::string rejection;
             try { launcher.function(context, launcher.user_data); }
             catch (const std::logic_error& error) { rejected = true; rejection = error.what(); }
+            if (expected_error && rejection.find(expected_error) == std::string::npos)
+                std::cerr << "GDN_ADMISSION_DIAGNOSTIC expected=" << expected_error << " actual=" << rejection << '\n';
             if (expected_error) expect(rejection.find(expected_error) != std::string::npos,
                 "GDN rejection reaches the intended admission gate");
             restore();
@@ -1447,9 +1456,14 @@ int main(int argc, char** argv) try {
             }, wave8_enabled ? "shape outside admitted bounds" : "width must divide 32");
         }
         if (wave8_enabled) {
-            const auto saved_kind = manifest.tensors[0].ggml_type;
-            reject_before_launch([&] { manifest.tensors[0].ggml_type = 1U; },
-                [&] { manifest.tensors[0].ggml_type = saved_kind; }, "requires Q8_0 qkv and z");
+            // IQ4_NL requires 18 bytes per 32 features, fitting the existing
+            // Q8_0 extent (34). F16 would fail the earlier size guard and never
+            // reach the intended wave8 format admission guard.
+            for (const auto index : {0U, 1U}) {
+                const auto saved_kind = manifest.tensors[index].ggml_type;
+                reject_before_launch([&] { manifest.tensors[index].ggml_type = 20U; },
+                    [&] { manifest.tensors[index].ggml_type = saved_kind; }, "requires Q8_0 qkv and z");
+            }
             const auto saved_address = runtime.tensors[0].address;
             reject_before_launch([&] { runtime.tensors[0].address += 2U; },
                 [&] { runtime.tensors[0].address = saved_address; }, "invalid alignment or extent");
@@ -1524,6 +1538,96 @@ int main(int argc, char** argv) try {
     }
 
     if (wave8_enabled) {
+        // Production entrypoints, including all post-projection state updates.
+        // Restore the same nonzero state before every arm and poison the whole
+        // arena so tail writes and unwritten workspace bytes remain observable.
+        const auto saved_hidden = hidden_values;
+        const auto saved_packed_z = packed_q8[1];
+        auto baseline_config = config;
+        baseline_config.virtual_q8_input_projections = false;
+        baseline_config.prefetch_q8_input_projections = false;
+        baseline_config.wave8_q8_input_projections = false;
+        const auto baseline_launcher = strix::make_hip_gdn_launcher("test.gdn.edge.legacy", &baseline_config);
+        auto p1_config = config; p1_config.wave8_q8_input_projections = false;
+        const auto p1_launcher = strix::make_hip_gdn_launcher("test.gdn.edge.prefetch1", &p1_config);
+        struct EdgeSnapshot {
+            std::vector<std::byte> arena_bytes;
+            std::vector<float> matrix_values;
+            std::vector<std::uint16_t> convolution_values;
+        };
+        const auto run_edge = [&](const strix::ExecutionLauncher& arm) {
+            check(hipMemcpy(reinterpret_cast<void*>(matrix_address.address), matrix_state.data(), matrix_address.bytes,
+                hipMemcpyHostToDevice), "restore edge recurrent state");
+            check(hipMemcpy(reinterpret_cast<void*>(conv_address.address), conv_state.data(), conv_address.bytes,
+                hipMemcpyHostToDevice), "restore edge convolution state");
+            poison_arena(nullptr);
+            arm.function(context, arm.user_data);
+            check(hipDeviceSynchronize(), "drain production GDN edge arm");
+            EdgeSnapshot result{std::vector<std::byte>(first_arena.size()),
+                std::vector<float>(matrix_state.size()), std::vector<std::uint16_t>(conv_state.size())};
+            check(hipMemcpy(result.arena_bytes.data(), arena_pointer, result.arena_bytes.size(), hipMemcpyDeviceToHost), "read complete edge arena");
+            check(hipMemcpy(result.matrix_values.data(), reinterpret_cast<void*>(matrix_address.address), matrix_address.bytes,
+                hipMemcpyDeviceToHost), "read complete edge matrix");
+            check(hipMemcpy(result.convolution_values.data(), reinterpret_cast<void*>(conv_address.address), conv_address.bytes,
+                hipMemcpyDeviceToHost), "read complete edge convolution");
+            return result;
+        };
+        const auto same = [&](const EdgeSnapshot& a, const EdgeSnapshot& b) {
+            return a.arena_bytes == b.arena_bytes && a.convolution_values == b.convolution_values &&
+                std::memcmp(a.matrix_values.data(), b.matrix_values.data(), matrix_address.bytes) == 0;
+        };
+        const auto set_z = [&](std::uint32_t row, std::uint32_t feature, std::uint16_t scale, std::int8_t code) {
+            const auto block = static_cast<std::size_t>(row) * (hidden / 32U) + feature / 32U;
+            auto* packed = packed_q8[1].data() + block * 34U;
+            packed[0] = static_cast<std::byte>(scale & 255U);
+            packed[1] = static_cast<std::byte>(scale >> 8U);
+            packed[2U + feature % 32U] = static_cast<std::byte>(static_cast<std::uint8_t>(code));
+        };
+        for (unsigned payload = 0; payload < 3; ++payload) {
+            packed_q8[1] = saved_packed_z;
+            if (payload == 0) {
+                constexpr std::array<std::uint16_t, 7> scales{0x0000U, 0x8000U, 0x0001U,
+                    0x03ffU, 0x0400U, 0x7bffU, 0xfbffU};
+                constexpr std::array<std::int8_t, 5> codes{-128, -1, 0, 1, 127};
+                constexpr std::array<std::uint16_t, 8> activations{0x0000U, 0x8000U, 0x0001U,
+                    0x8001U, 0x0080U, 0x8080U, 0x3f80U, 0xbf80U};
+                for (unsigned feature = 0; feature < hidden; ++feature)
+                    hidden_values[feature] = activations[feature % activations.size()];
+                for (unsigned row = 0; row < scales.size(); ++row)
+                    for (unsigned feature = 0; feature < hidden; ++feature)
+                        set_z(row, feature, scales[row], codes[feature % codes.size()]);
+            } else for (unsigned feature = 0; feature < hidden; ++feature) {
+                if (payload == 1) {
+                    hidden_values[feature] = 0x0080U;
+                    set_z(0, feature, 0x0001U, 127);
+                } else {
+                    hidden_values[feature] = feature < 256U ? 0x8001U : 0x3f80U;
+                    set_z(0, feature, feature < 256U ? 0x0001U : 0x8000U, 1);
+                }
+            }
+            check(hipMemcpy(device_weights[1], packed_q8[1].data(), packed_q8[1].size(), hipMemcpyHostToDevice),
+                "upload production GDN edge Q8 payload");
+            for (unsigned repeat = 0; repeat < 3; ++repeat) {
+                const auto original = run_edge(baseline_launcher);
+                const auto temporary = strix::resolve_dispatch_temporary(context, 0);
+                std::uint32_t z0 = 0;
+                check(hipMemcpy(&z0, reinterpret_cast<void*>(temporary.address + conv_width * sizeof(float)),
+                    sizeof(z0), hipMemcpyDeviceToHost), "read edge projection control");
+                if (payload == 1 && hidden == 2560U)
+                    expect(z0 == 0x00020000U, "production decode-first control retains BF16 subnormal bits2");
+                if (payload == 2 && hidden >= 256U)
+                    expect(z0 == 0x80000000U, "production signed-zero control retains negative zero");
+                const auto p1 = run_edge(p1_launcher);
+                const auto p8 = run_edge(launcher);
+                expect(same(original, p1) && same(original, p8),
+                    "production edge payloads preserve all arena, matrix and convolution bits in P1/P8");
+            }
+        }
+        hidden_values = saved_hidden;
+        packed_q8[1] = saved_packed_z;
+        check(hipMemcpy(device_weights[1], packed_q8[1].data(), packed_q8[1].size(), hipMemcpyHostToDevice),
+            "restore production GDN edge weights");
+
         hipStream_t stream = nullptr;
         hipGraph_t rejected_graph = nullptr;
         check(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), "create rejected wave8 GDN stream");

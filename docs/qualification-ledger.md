@@ -126,3 +126,28 @@ evidence; it does not qualify new HIP binaries, experimental arithmetic,
 whole-model quality or performance. The qualified automatic profile is preserved;
 experimental split-K selection remains explicit and projection diagnostics remain
 outside default decoder selection.
+
+## Externally admitted HC repack research tests
+
+The diagnostic `strix-hip-repacked-hyper-projection-tests` binary is built when
+HIP test support is enabled. Its native CTest is explicitly opt-in through the
+CMake cache STRING `STRIX_HC_REPACKED_ADMITTED_SCHEDULES`, which defaults to empty.
+Only a nonempty, exact ascending comma-separated subset of `31,32,33` registers
+the research test. Whitespace, duplicates, descending order, other IDs and list
+separators are rejected. CTest sets that exact environment value itself; an
+ambient shell variable does not configure or admit the test.
+
+The value must come from an external compiler/ISA qualification receipt bound to
+the actual source, executable and eligible schedule subset. CMake validates only
+syntax; it does not manufacture or verify that receipt. A successful build,
+resource bounds or source review alone do not close a failed pipeline gate. The
+existing experimental STOP decisions remain intact, and no schedule is inferred
+admitted by default. Direct diagnostic invocation retains its own explicit
+schedule checks; it is not a substitute for qualification.
+
+With the default empty value, configuration reports that this research test is
+not admitted and omits it from the registered/passed standard-suite count. That
+is an explicitly excluded research slice, not a native PASS, skip, numerical
+qualification or completion of the HC optimization. Portable HC pack-contract
+tests remain registered independently. Their success does not admit GPU
+schedules. No kernel, numerical comparison or admission threshold changes here.

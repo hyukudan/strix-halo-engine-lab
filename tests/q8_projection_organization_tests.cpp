@@ -1,9 +1,11 @@
 #include "strix/q8_projection_organization.hpp"
+#include "strix/q8_projection_manifest.hpp"
 #include "strix/compiled_execution.hpp"
 
 #include <cstdint>
 #include <iostream>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <set>
 #include <string>
@@ -100,9 +102,73 @@ void test_compiled_admission() {
     rejects([&] { (void)strix::compile_serial_execution(model, baseline_registry, missing_prefetch, buffers); },
         "LM wave8 cannot omit the prefetch dependency");
 }
+
+void test_whole_model_alignment_admission() {
+    const auto model = strix::ModelContract::qwen38_flash_next();
+    strix::ModelManifest manifest;
+    manifest.architecture = "qwen3next";
+    const auto append = [&](std::string name, std::uint64_t rows, strix::TensorRole role,
+                            std::optional<std::uint32_t> layer) {
+        strix::ManifestTensor tensor;
+        tensor.name = std::move(name); tensor.role = role; tensor.layer = layer;
+        tensor.ggml_type = 8; tensor.dimensions = {model.hidden_size, rows};
+        tensor.byte_size = (model.hidden_size / 32U) * 34U * rows;
+        tensor.absolute_offset = 4096U * (manifest.tensors.size() + 1U);
+        manifest.tensors.push_back(std::move(tensor));
+    };
+    const auto key_width = model.gdn_key_heads * model.gdn_key_head_dim;
+    const auto value_width = model.gdn_value_heads * model.gdn_value_head_dim;
+    for (std::uint32_t layer = 0; layer < model.hidden_layers; ++layer) {
+        if ((layer + 1U) % model.full_attention_interval == 0U) continue;
+        const auto prefix = "blk." + std::to_string(layer);
+        append(prefix + ".attn_qkv.weight", key_width * 2U + value_width, strix::TensorRole::attention_projection, layer);
+        append(prefix + ".attn_gate.weight", value_width, strix::TensorRole::attention_projection, layer);
+        append(prefix + ".ssm_beta.weight", model.gdn_value_heads, strix::TensorRole::recurrent_state, layer);
+        append(prefix + ".ssm_alpha.weight", model.gdn_value_heads, strix::TensorRole::recurrent_state, layer);
+    }
+    append("output.weight", model.vocab_size, strix::TensorRole::output_head, std::nullopt);
+    manifest.layout_identity = strix::model_manifest_layout_identity(manifest);
+    const auto plan = q8::build_manifest_plan(model, manifest, true, true);
+    expect(plan.weights.size() == manifest.tensors.size(), "whole-model plan covers every selected Q8 weight");
+    strix::ModelRuntimeBinding binding;
+    binding.manifest_layout_identity = manifest.layout_identity;
+    for (std::size_t i = 0; i < manifest.tensors.size(); ++i)
+        binding.tensors.push_back({static_cast<std::uint32_t>(i), strix::RuntimeTensorStorage::resident,
+            0x100000U + i * 4096U, manifest.tensors[i].byte_size, 7, 0});
+    q8::validate_resident_weights(plan, binding);
+    // A bad last-layer tensor must reject before any model dispatch can start.
+    for (std::size_t distance = 1; distance <= 5; ++distance) {
+        const auto index = manifest.tensors.size() - distance;
+        auto bad = manifest;
+        bad.tensors[index].absolute_offset += 8U;
+        rejects([&] { (void)q8::build_manifest_plan(model, bad, true, true); },
+                "late-layer qkv/z/beta/alpha or head file alignment rejects in whole preflight");
+        auto resident = binding;
+        resident.tensors[index].address += 8U;
+        rejects([&] { q8::validate_resident_weights(plan, resident); },
+                "actual late device address rejects before token execution");
+        resident = binding; --resident.tensors[index].bytes;
+        rejects([&] { q8::validate_resident_weights(plan, resident); }, "short late resident view rejects");
+        resident = binding; resident.tensors[index].allocation_generation = 0;
+        rejects([&] { q8::validate_resident_weights(plan, resident); }, "missing real owner generation rejects");
+    }
+    auto duplicate = manifest; duplicate.tensors.push_back(manifest.tensors.front());
+    rejects([&] { (void)q8::build_manifest_plan(model, duplicate, false, true); }, "duplicate selected GDN projection rejects");
+    auto missing = manifest; missing.tensors.erase(missing.tensors.begin());
+    rejects([&] { (void)q8::build_manifest_plan(model, missing, false, true); }, "missing selected GDN projection rejects");
+    auto invalid = manifest; invalid.tensors.back().ggml_type = 20;
+    rejects([&] { (void)q8::build_manifest_plan(model, invalid, true, false); }, "non-Q8 LM head rejects before dispatch");
+    auto unaligned_heads = model; unaligned_heads.gdn_key_heads = 1; unaligned_heads.gdn_value_heads = 3;
+    rejects([&] { (void)q8::build_manifest_plan(unaligned_heads, manifest, false, true); },
+            "unaligned beta/gate workspace slices reject at setup");
+    // Default paths do not acquire these extra restrictions or any residency work.
+    expect(q8::build_manifest_plan(model, invalid, false, false).weights.empty(), "inactive overlay leaves default admission unchanged");
+    q8::validate_resident_weights({}, {});
+}
 }
 int main() {
     test_compiled_admission();
+    test_whole_model_alignment_admission();
     // Incumbent modes remain outside the new bounded BF16-only overlay.
     q8::validate_modes(false, false, false, false, 0, 0);
     q8::validate_modes(true, true, false, true, 2560, 248320);

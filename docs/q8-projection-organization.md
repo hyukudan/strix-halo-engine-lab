@@ -25,6 +25,13 @@ checks. The supported projection width is a nonzero multiple of 32, at most
 every selected layer; other supported input tensors keep their original format
 handling. LM candidates require BF16 input and Q8_0 weights.
 
+Before residency, admission checks the file offsets, exact shapes and extents of
+every selected weight across all layers, including Q8 beta and alpha. Every
+actual device address is checked again after residency and before any token
+launch. Projection views retain 16-byte alignment; GDN workspace head counts
+must also keep its adjacent FP32 beta and gate arrays aligned. A late-layer
+alignment error therefore rejects setup before earlier layers can mutate state.
+
 Selected kernel IDs, implementation identities and compiler tags distinguish the
 overlays. The receipt declares all three options and marks their qualification
 as `not_assessed`. Inventory collection preserves that distinction when an

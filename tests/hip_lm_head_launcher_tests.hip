@@ -129,9 +129,14 @@ float q8_value(
 
 }  // namespace
 
-void run_case(std::uint32_t requested_hidden, bool bf16, unsigned pattern = 0) {
-    const auto model =
+void run_case(std::uint32_t requested_hidden, bool bf16, unsigned pattern = 0,
+              std::uint32_t vocab = 19) {
+    auto model =
         strix::ModelContract::qwen38_flash_next();
+    if (requested_hidden > model.hidden_size) {
+        model.hidden_size = requested_hidden;
+        model.ple_embed_dim = requested_hidden;
+    }
     const auto plan =
         strix::build_serial_decode_execution_plan(
             model);
@@ -188,7 +193,7 @@ void run_case(std::uint32_t requested_hidden, bool bf16, unsigned pattern = 0) {
 
     const auto hidden_size =
         requested_hidden;
-    constexpr std::uint32_t vocab = 19; // Includes a partial final wave8 block.
+    // Default 19 includes a partial final block; explicit 1/4/7 are below 8.
 
     std::vector<float> hidden(
         hidden_size);
@@ -538,16 +543,18 @@ void run_case(std::uint32_t requested_hidden, bool bf16, unsigned pattern = 0) {
         expect(capture_rejected && rejected_nodes == 0, "prefetch head rejects real stream capture before any enqueue");
         check(hipGraphDestroy(rejected_graph), "destroy rejected head graph");
         const auto saved_type = manifest.tensors.front().ggml_type;
-        manifest.tensors.front().ggml_type = 30U;
+        manifest.tensors.front().ggml_type = 20U; // Fits Q8 extent; reaches the kind gate.
         bool rejected_format = false;
+        std::string format_error;
         check(hipMemset(reinterpret_cast<void*>(logits_address.address), 0xff, vocab * sizeof(float)), "poison non-Q8 prefetch output");
         try { grouped.function(context, grouped.user_data); }
-        catch (const std::invalid_argument&) { rejected_format = true; }
+        catch (const std::invalid_argument& error) { rejected_format = true; format_error = error.what(); }
         manifest.tensors.front().ggml_type = saved_type;
         check(hipDeviceSynchronize(), "drain rejected prefetch head");
         std::vector<std::uint32_t> untouched(vocab);
         check(hipMemcpy(untouched.data(), reinterpret_cast<void*>(logits_address.address), vocab * sizeof(float), hipMemcpyDeviceToHost), "read rejected prefetch head output");
-        expect(rejected_format && std::all_of(untouched.begin(), untouched.end(), [](auto word) { return word == 0xffffffffU; }),
+        expect(rejected_format && format_error == "prefetch LM head supports BF16/Q8_0 only" &&
+            std::all_of(untouched.begin(), untouched.end(), [](auto word) { return word == 0xffffffffU; }),
             "non-Q8 prefetch call rejects and preserves all output poison");
     }
     check(hipStreamDestroy(stream), "destroy virtual head stream");
@@ -654,6 +661,10 @@ int main() try {
     for (const auto pattern : {2U, 3U, 4U}) {
         run_case(640U, false, pattern);
         run_case(640U, true, pattern);
+    }
+    for (const auto vocab : {1U, 4U, 7U}) {
+        run_case(32U, true, 3U, vocab);
+        run_case(10240U, true, 0U, vocab);
     }
     if (failures == 0) {
         std::cout

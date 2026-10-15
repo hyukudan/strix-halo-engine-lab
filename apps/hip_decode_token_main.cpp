@@ -36,6 +36,7 @@
 #include "hip_decode_experiment.hpp"
 #include "hip_decode_options.hpp"
 #include "strix/q8_projection_organization.hpp"
+#include "strix/q8_projection_manifest.hpp"
 #include "hip_deferred_moe_status.hpp"
 #include "hip_decode_receipt_json.hpp"
 #include "execution_inventory_receipt.hpp"
@@ -649,33 +650,8 @@ int main(
     const auto tensor_index =
         strix::build_model_tensor_index(
             manifest);
-    if (options.prefetch_q8_lm_head)
-        strix::q8_projection_organization::validate_geometry(model.hidden_size, model.vocab_size);
-    if (options.wave8_q8_gdn_input) {
-        const auto key_width = model.gdn_key_heads * model.gdn_key_head_dim;
-        const auto value_width = model.gdn_value_heads * model.gdn_value_head_dim;
-        strix::q8_projection_organization::validate_geometry(model.hidden_size, key_width * 2U + value_width);
-        for (std::uint64_t layer = 0; layer < model.hidden_layers; ++layer) {
-            if ((layer + 1U) % model.full_attention_interval == 0U) continue;
-            std::size_t qkv = 0, z = 0;
-            for (const auto& tensor : manifest.tensors) {
-                if (tensor.layer != layer || tensor.role != strix::TensorRole::attention_projection) continue;
-                if (tensor.name.find("attn_qkv") != std::string::npos) {
-                    ++qkv;
-                    if (tensor.ggml_type != 8U || tensor.dimensions.size() < 2 ||
-                        tensor.dimensions[0] != model.hidden_size || tensor.dimensions[1] != key_width * 2U + value_width)
-                        throw std::invalid_argument("wave8 GDN requires aligned Q8_0 qkv in every GDN layer");
-                } else if (tensor.name.find("attn_gate") != std::string::npos) {
-                    ++z;
-                    if (tensor.ggml_type != 8U || tensor.dimensions.size() < 2 ||
-                        tensor.dimensions[0] != model.hidden_size || tensor.dimensions[1] != value_width)
-                        throw std::invalid_argument("wave8 GDN requires aligned Q8_0 z in every GDN layer");
-                }
-            }
-            if (qkv != 1U || z != 1U)
-                throw std::invalid_argument("wave8 GDN qkv/z family is missing or ambiguous");
-        }
-    }
+    const auto q8_organization_plan = strix::q8_projection_organization::build_manifest_plan(
+        model, manifest, options.prefetch_q8_lm_head, options.wave8_q8_gdn_input);
     if (options.virtual_q8_lm_head) {
         std::size_t output_heads = 0;
         for (const auto& tensor : manifest.tensors) {
@@ -897,6 +873,7 @@ int main(
     auto model_owner = std::make_shared<strix::HipModelResidency>(
         strix::HipModelResidency::create(mapped, manifest, generations, residency_policy));
     auto& model_residency = *model_owner;
+    strix::q8_projection_organization::validate_resident_weights(q8_organization_plan, model_residency.binding());
     // Admission of actual device views happens before any token can enqueue work.
     for(const auto& projection:qsa_prefetch_plan.projections) {
         if(!projection.eligible) continue;

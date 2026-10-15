@@ -7,6 +7,19 @@ option(STRIX_ENABLE_HIP_RUNTIME "Build optional HIP allocation/runtime support" 
 option(STRIX_USE_OPENSSL_SHA256 "Use OpenSSL for full-file SHA-256 verification" OFF)
 option(STRIX_BUILD_EXPERIMENTAL_Q4K_A8_PROBE "Build standalone experimental Q4K A8G32 HIP probe" OFF)
 option(STRIX_ENABLE_EXPERIMENTAL_Q4K_A8_RUNTIME "Build opt-in native Q4K A8G32 gate/up integration" OFF)
+set(STRIX_HC_REPACKED_ADMITTED_SCHEDULES "" CACHE STRING
+    "Externally admitted HC research schedules (canonical ascending comma-separated subset of 31,32,33)")
+# This only validates syntax, never compiler/ISA or numerical admission. The
+# caller must bind the exact nonempty subset to an external qualification receipt.
+set(_strix_hc_repacked_canonical_lists "31" "32" "33" "31,32" "31,33" "32,33" "31,32,33")
+if(NOT "${STRIX_HC_REPACKED_ADMITTED_SCHEDULES}" STREQUAL "")
+    list(FIND _strix_hc_repacked_canonical_lists "${STRIX_HC_REPACKED_ADMITTED_SCHEDULES}" _strix_hc_repacked_list_index)
+    if(_strix_hc_repacked_list_index EQUAL -1)
+        message(FATAL_ERROR "STRIX_HC_REPACKED_ADMITTED_SCHEDULES must be an ascending comma-separated subset of 31,32,33")
+    endif()
+endif()
+unset(_strix_hc_repacked_canonical_lists)
+unset(_strix_hc_repacked_list_index)
 if((STRIX_BUILD_EXPERIMENTAL_Q4K_A8_PROBE OR STRIX_ENABLE_EXPERIMENTAL_Q4K_A8_RUNTIME) AND NOT STRIX_ENABLE_HIP_RUNTIME)
     message(FATAL_ERROR "Experimental Q4K A8 probe requires HIP runtime support")
 endif()
@@ -1423,9 +1436,18 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         set_target_properties(strix-hip-repacked-hyper-projection-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
         target_link_libraries(strix-hip-repacked-hyper-projection-tests PRIVATE strix_hip_runtime strix_hc_repacked_down_pack strix_hc_repacked_diagnostic)
         strix_target_warnings(strix-hip-repacked-hyper-projection-tests)
-        # No implicit GPU schedule: the admitted compiler receipt determines
-        # STRIX_HC_REPACKED_ADMITTED_SCHEDULES in the native test environment.
-        add_test(NAME strix-hip-repacked-hyper-projection-tests COMMAND strix-hip-repacked-hyper-projection-tests)
+        # Always build the diagnostic binary; only an externally admitted subset
+        # registers its research test. CTest receives the cache value explicitly,
+        # independent of the parent environment stripped by native workers.
+        if(NOT "${STRIX_HC_REPACKED_ADMITTED_SCHEDULES}" STREQUAL "")
+            add_test(NAME strix-hip-repacked-hyper-projection-tests COMMAND strix-hip-repacked-hyper-projection-tests)
+            set_tests_properties(strix-hip-repacked-hyper-projection-tests PROPERTIES
+                ENVIRONMENT "STRIX_HC_REPACKED_ADMITTED_SCHEDULES=${STRIX_HC_REPACKED_ADMITTED_SCHEDULES}"
+                LABELS "research;externally-admitted-hc")
+            message(STATUS "HC repacked research CTest registered for externally admitted schedules: ${STRIX_HC_REPACKED_ADMITTED_SCHEDULES}")
+        else()
+            message(STATUS "HC repacked research CTest NOT registered: no schedules externally admitted; binary and portable pack contracts remain built")
+        endif()
         add_executable(
             strix-hip-hyper-mix-launcher-tests
             tests/hip_hyper_mix_launcher_tests.hip
@@ -1659,6 +1681,10 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         foreach(wave8_width IN ITEMS 128 288 480 640 2560)
             add_test(NAME strix-hip-gdn-wave8-q8-${wave8_width}-tests
                 COMMAND strix-hip-gdn-launcher-tests ${wave8_width} wave8)
+        endforeach()
+        foreach(tail_heads IN ITEMS 4 12)
+            add_test(NAME strix-hip-gdn-wave8-q8-tail-${tail_heads}-tests
+                COMMAND strix-hip-gdn-launcher-tests 2560 wave8 ${tail_heads})
         endforeach()
         add_executable(strix-hip-gdn-lm-wave8-diagnostic-tests tests/hip_gdn_lm_wave8_diagnostic_tests.hip)
         add_executable(strix-hip-shared-expert-rows-diagnostic-tests tests/hip_shared_expert_rows_diagnostic_tests.hip)
