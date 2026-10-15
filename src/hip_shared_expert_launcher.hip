@@ -573,6 +573,15 @@ __global__ void down_projection_kernel(
 // Exact virtual T256 leaves. New kernels alone use this helper; all legacy
 // device functions remain literal. Compiler contraction and denormal modes are
 // inherited from this same translation unit and require linked ISA qualification.
+// The legacy LDS tree emits upper/partner as v_add_f32 src0 and lower/self as
+// src1. Commuting them preserves finite sums but can select a different NaN
+// payload. Keep that actual operand order in every new virtual-tree addition.
+__device__ __forceinline__ float shared_q8_legacy_tree_add(float lower, float upper) {
+    float result;
+    asm volatile("v_add_f32 %0, %1, %2" : "=v"(result) : "v"(upper), "v"(lower));
+    return result;
+}
+
 template<typename Input,bool Prefetch>
 __device__ __forceinline__ float shared_q8_virtual256_dot(const Input* input,const void* weights,std::uint32_t width,std::uint32_t row){
     const unsigned lane=threadIdx.x&31U;float partial[8]{};
@@ -592,9 +601,9 @@ __device__ __forceinline__ float shared_q8_virtual256_dot(const Input* input,con
 #pragma unroll
     for(unsigned distance=16;distance>0;distance/=2){
 #pragma unroll
-        for(unsigned local=0;local<8;++local){const float partner=__shfl_down(partial[local],distance,32);if(lane<distance)partial[local]+=partner;}
+        for(unsigned local=0;local<8;++local){const float partner=__shfl_down(partial[local],distance,32);if(lane<distance)partial[local]=shared_q8_legacy_tree_add(partial[local],partner);}
     }
-    if(lane==0){partial[0]+=partial[4];partial[1]+=partial[5];partial[2]+=partial[6];partial[3]+=partial[7];partial[0]+=partial[2];partial[1]+=partial[3];partial[0]+=partial[1];}
+    if(lane==0){partial[0]=shared_q8_legacy_tree_add(partial[0],partial[4]);partial[1]=shared_q8_legacy_tree_add(partial[1],partial[5]);partial[2]=shared_q8_legacy_tree_add(partial[2],partial[6]);partial[3]=shared_q8_legacy_tree_add(partial[3],partial[7]);partial[0]=shared_q8_legacy_tree_add(partial[0],partial[2]);partial[1]=shared_q8_legacy_tree_add(partial[1],partial[3]);partial[0]=shared_q8_legacy_tree_add(partial[0],partial[1]);}
     return partial[0];
 }
 template<typename Input,bool Prefetch,unsigned RowsPerBlock>

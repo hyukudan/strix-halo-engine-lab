@@ -77,3 +77,12 @@ and prefix-restoration output emit it after their workloads complete. Graph repl
 does not manufacture host dispatch counts from committed tokens. Portable tests
 check zero before owner updates, later live values, owner lifetime and isolation,
 and disabled-field omission; they do not claim GPU dispatch execution.
+
+The new virtual tree fixes each FP32 addition's operand order to the existing
+device tree: upper/partner is source zero, lower/self is source one. A deliberate
+device add prevents compiler commutation from changing NaN payload priority while
+retaining the same finite reduction association. This applies only to new virtual
+and prefetch kernels; the existing device bodies remain literal. The nonfinite
+fixture compares every output bit and reports the first differing words with
+mode, role and replay context. Fresh ISA and native execution are required to
+qualify this repair; no NaN canonicalization or tolerance is used.
