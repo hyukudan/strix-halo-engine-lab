@@ -139,6 +139,29 @@ int main() {
         expect(strix::hip_execution_stream() == eager.stream && strix::hip_graph_position() == nullptr &&
             strix::hip_graph_status() == nullptr, "eager owned stream does not expose graph controls");
     }
+    {
+        auto eager=fixture();eager.graph_capture=false;eager.arguments={};eager.status={};
+        eager.deferred_moe_status={9,0x5000,8,5};
+        {const strix::HipLaunchScope scope(eager);
+            expect(reinterpret_cast<std::uintptr_t>(strix::hip_deferred_moe_status())==0x5000,
+                "eager scope exposes its admitted deferred record");}
+        for(unsigned fault=0;fault<8;++fault){auto bad=eager;
+            switch(fault){
+            case 0:bad.deferred_moe_status.arena_bytes=4;break;
+            case 1:bad.deferred_moe_status.arena_bytes=16;break;
+            case 2:++bad.deferred_moe_status.arena_base;break;
+            case 3:bad.deferred_moe_status.execution_identity=0;break;
+            case 4:bad.deferred_moe_status.allocation_generation=0;break;
+            case 5:bad.deferred_moe_status.arena_base=std::numeric_limits<std::uintptr_t>::max()-7U;break;
+            case 6:bad=original;bad.deferred_moe_status=eager.deferred_moe_status;break;
+            case 7:bad.deferred_moe_status.arena_base=0;break;
+            }
+            rejects(bad,"deferred record must have exact bounded eager metadata");
+        }
+        {const strix::HipLaunchScope scope(original);
+            expect(strix::hip_deferred_moe_status()==nullptr,"capture scope cannot expose deferred record");}
+    }
+    expect(strix::hip_deferred_moe_status()==nullptr,"unscoped deferred helper is empty");
     expect(strix::current_hip_launch_context() == nullptr, "all scopes finish empty");
     if (!failures) std::cout << "HIP launch scope host-only tests passed\n";
     return failures ? 1 : 0;

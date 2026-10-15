@@ -19,6 +19,9 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -732,6 +735,12 @@ int main(int argc, char** argv) try {
         strix::HipSetupQuiescenceGuard completion_guard;
         hipStream_t stream=nullptr;void* record=nullptr;
         strix::DeferredMoeFirstError receipt;
+        // A bounded host callback blocks only the fixture stream. It never calls
+        // HIP. Even an accidental layer drain is released after five seconds.
+        struct StreamGate {std::mutex mutex;std::condition_variable changed;
+            bool entered=false,released=false,timed_out=false;} gate;
+        const auto release_gate=[&]{std::lock_guard lock(gate.mutex);
+            gate.released=true;gate.changed.notify_all();};
         try {
             check(hipStreamCreateWithFlags(&stream,hipStreamNonBlocking),"create deferred fixture stream");
             check(hipMalloc(&record,sizeof(receipt)),"allocate deferred fixture record");
@@ -741,6 +750,34 @@ int main(int argc, char** argv) try {
             auto deferred=strix::make_hip_moe_experts_launcher("test.deferred-status-v1"+
                 (grouped_q51 ? std::string(".grouped-exact-q51-down-v1") : "")+
                 (q4k_a8 ? std::string(strix::moe_q4k_a8::runtime_kernel_suffix) : ""),&deferred_config);
+            const auto temporary=strix::resolve_execution_buffer(memory.execution_identity,arena,memory,step_io.temporaries[0]);
+            for(unsigned fault=0;fault<3;++fault){
+                check(hipMemset(reinterpret_cast<void*>(temporary.address),0x5a,temporary.bytes),"poison deferred preflight scratch");
+                std::vector<std::byte> scratch_after(temporary.bytes);
+                auto bad_scope=scope_context;
+                if(fault==2)bad_scope.deferred_moe_status.arena_base=temporary.address;
+                hipGraph_t rejected_graph=nullptr;
+                if(fault)check(hipStreamBeginCapture(stream,hipStreamCaptureModeThreadLocal),"capture deferred preflight rejection");
+                bool rejected=false;
+                try{
+                    if(fault==0)deferred.function(context,deferred.user_data);
+                    else{strix::HipLaunchScope scope(bad_scope);
+                        auto& candidate=fault==1?launcher:deferred;
+                        candidate.function(context,candidate.user_data);}
+                }catch(const std::invalid_argument& error){rejected=std::string(error.what())==(fault==2?
+                    "deferred MoE record aliases execution storage":
+                    "deferred MoE launcher requires matching owned eager completion scope");}
+                catch(...){if(fault)(void)hipStreamEndCapture(stream,&rejected_graph);
+                    if(rejected_graph)(void)hipGraphDestroy(rejected_graph);throw;}
+                if(fault){check(hipStreamEndCapture(stream,&rejected_graph),"finish deferred rejected capture");
+                    std::size_t nodes=1;check(hipGraphGetNodes(rejected_graph,nullptr,&nodes),"inspect rejected deferred nodes");
+                    expect(nodes==0,"deferred mismatch/alias rejects with zero queued nodes");
+                    check(hipGraphDestroy(rejected_graph),"destroy rejected deferred graph");}
+                check(hipMemcpy(scratch_after.data(),reinterpret_cast<void*>(temporary.address),scratch_after.size(),hipMemcpyDeviceToHost),"read rejected deferred scratch");
+                check(hipMemcpy(after.data(),reinterpret_cast<void*>(output.address),output_bytes,hipMemcpyDeviceToHost),"read rejected deferred output");
+                expect(rejected && before==after && std::all_of(scratch_after.begin(),scratch_after.end(),
+                    [](std::byte value){return value==std::byte{0x5a};}),"deferred scope/alias admission preserves all scratch and semantic output");
+            }
             check(hipMemsetAsync(record,0,sizeof(receipt),stream),"clear deferred fixture record");
             {strix::HipLaunchScope scope(scope_context);deferred.function(context,deferred.user_data);}
             check(hipMemcpyAsync(&receipt,record,sizeof(receipt),hipMemcpyDeviceToHost,stream),"read deferred failure");
@@ -759,10 +796,26 @@ int main(int argc, char** argv) try {
                 check(hipMemcpyAsync(&receipt,record,sizeof(receipt),hipMemcpyDeviceToHost,stream),"read retained first error");
                 check(hipStreamSynchronize(stream),"drain later valid layer");
                 expect(receipt.domain==domain&&receipt.bits==expected_bits,"later local reset and successful layer preserve first error");
+                check(hipLaunchHostFunc(stream,[](void* pointer){auto& blocked=*static_cast<StreamGate*>(pointer);
+                    std::unique_lock lock(blocked.mutex);blocked.entered=true;blocked.changed.notify_all();
+                    if(!blocked.changed.wait_for(lock,std::chrono::seconds(5),[&]{return blocked.released;}))
+                        blocked.timed_out=true;
+                },&gate),"queue bounded deferred stream gate");
+                bool entered=false;
+                {std::unique_lock lock(gate.mutex);entered=gate.changed.wait_for(lock,std::chrono::seconds(5),[&]{return gate.entered;});}
+                {strix::HipLaunchScope scope(scope_context);deferred.function(context,deferred.user_data);}
+                const auto pending=hipStreamQuery(stream);
+                bool timed_out=false;{std::lock_guard lock(gate.mutex);timed_out=gate.timed_out;}
+                release_gate();
+                check(hipStreamSynchronize(stream),"drain released deferred stream gate");
+                expect(entered && !timed_out && pending==hipErrorNotReady,
+                    "deferred launcher returns while owned stream is blocked, without a layer drain");
+
             }
             check(hipFree(record),"free deferred fixture record");record=nullptr;
             check(hipStreamDestroy(stream),"destroy deferred fixture stream");stream=nullptr;
         } catch(...) {
+            release_gate();
             completion_guard.recover_or_fail_stop();
             if(record)(void)hipFree(record);
             if(stream)(void)hipStreamDestroy(stream);

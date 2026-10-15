@@ -624,6 +624,12 @@ int main() {
     expect(strix::compile_serial_execution(model,registry,q4_binding,q4_buffers).execution_identity ==
         5195923158154663034ULL, "disabled Q4K A8 preserves pre-edit compiled golden");
 
+    const auto rejects_deferred = [&](const auto& kernels,const auto& request,const auto& buffers,
+                                       const char* message) {
+        try {(void)strix::compile_serial_execution(model,kernels,request,buffers);}
+        catch(const std::invalid_argument& error) {return std::string(error.what())==message;}
+        return false;
+    };
     auto deferred_binding=binding_request;
     deferred_binding.deferred_moe_status=true;
     const auto deferred_registry=make_registry(model,deferred_binding);
@@ -632,14 +638,18 @@ int main() {
         deferred_compiled.kernel_plan_identity!=compiled.kernel_plan_identity &&
         deferred_compiled.arena.total_bytes==compiled.arena.total_bytes,
         "deferred status changes execution/kernel identity without scratch growth");
-    expect(rejects_ranked(registry,deferred_binding,buffer_request),"deferred status rejects synchronous MoE bindings");
-    expect(rejects_ranked(deferred_registry,binding_request,buffer_request),"default status rejects deferred MoE bindings");
+    expect(rejects_deferred(registry,deferred_binding,buffer_request,"bound deferred MoE status mode differs from request"),"deferred status rejects synchronous MoE bindings");
+    expect(rejects_deferred(deferred_registry,binding_request,buffer_request,"bound deferred MoE status mode differs from request"),"default status rejects deferred MoE bindings");
     auto deferred_graph=deferred_binding;deferred_graph.require_graph_safe=true;
-    expect(rejects_ranked(deferred_registry,deferred_graph,buffer_request),"deferred status rejects graph-safe admission");
+    expect(rejects_deferred(deferred_registry,deferred_graph,buffer_request,"deferred MoE status supports eager C1 only"),"deferred status rejects graph-safe admission");
     deferred_graph=deferred_binding;deferred_graph.device_graph_inputs=true;
-    expect(rejects_ranked(deferred_registry,deferred_graph,buffer_request),"deferred status rejects graph dynamic inputs");
+    expect(rejects_deferred(deferred_registry,deferred_graph,buffer_request,"deferred MoE status supports eager C1 only"),"deferred status rejects graph dynamic inputs");
     auto deferred_rows=deferred_binding;deferred_rows.logical_rows=2;
-    expect(rejects_ranked(deferred_registry,deferred_rows,buffer_request),"deferred status rejects multirow execution");
+    auto deferred_row_buffers=buffer_request;deferred_row_buffers.logical_rows=2;
+    expect(rejects_deferred(deferred_registry,deferred_rows,deferred_row_buffers,"deferred MoE status supports eager C1 only"),"deferred status rejects multirow execution");
+    auto deferred_concurrency=deferred_binding;deferred_concurrency.request_concurrency=2;
+    expect(rejects_deferred(deferred_registry,deferred_concurrency,buffer_request,
+        "deferred MoE status supports eager C1 only"),"deferred status rejects C2 execution for its own cause");
     auto deferred_q51=q51_binding;deferred_q51.q4k_a8g32_gate_up=true;deferred_q51.deferred_moe_status=true;
     auto deferred_q51_buffers=q51_buffers;deferred_q51_buffers.q4k_a8g32_gate_up=true;
     const auto deferred_q51_registry=make_registry(model,deferred_q51);

@@ -1314,8 +1314,16 @@ int main(
     }
 
     std::unique_ptr<HipDeferredMoeStatus> deferred_moe;
-    if(options.deferred_moe_status) deferred_moe=std::make_unique<HipDeferredMoeStatus>(resources,
-        compiled.execution_identity,generations.next(),generations.next(),experiment_owner,original_work_device);
+    if(options.deferred_moe_status) {
+        const auto deferred_status_generation=generations.next();
+        const auto deferred_shadow_generation=generations.next();
+        deferred_moe=std::make_unique<HipDeferredMoeStatus>(resources,compiled.execution_identity,
+            deferred_status_generation,deferred_shadow_generation,experiment_owner,original_work_device);
+    }
+    const auto deferred_moe_receipt=[&] {
+        return deferred_moe_mode_receipt+"  \"deferred_moe_status_completed_tokens\": "+
+            std::to_string(deferred_moe?deferred_moe->completed_tokens():0)+",\n";
+    };
     std::uint64_t input_access_epoch = 1;
     const std::function<void(std::uint32_t)> execute_native_token = [&](std::uint32_t token) {
         original_work_device->require_original();
@@ -1609,7 +1617,7 @@ int main(
                     restore_start).count();
 
             std::cout
-                << "{\n" << gdn_output_mode_receipt() << wave_router_mode_receipt << deferred_moe_mode_receipt
+                << "{\n" << gdn_output_mode_receipt() << wave_router_mode_receipt << deferred_moe_receipt()
                 << "  \"model_content_identity\": \""
                 << strix::model_content_identity_hex(
                        model_residency.binding().
@@ -1735,7 +1743,7 @@ int main(
             elapsed_total += value;
         }
 
-        std::cout << "{\n" << gdn_output_mode_receipt() << wave_router_mode_receipt << deferred_moe_mode_receipt;
+        std::cout << "{\n" << gdn_output_mode_receipt() << wave_router_mode_receipt << deferred_moe_receipt();
         emit_q4k_a8_receipt();
         emit_q4k_a8_counts();
         std::cout
@@ -1835,7 +1843,7 @@ int main(
             reference->steps.size());
     }
 
-    std::cout << '{' << '\n' << gdn_output_mode_receipt() << wave_router_mode_receipt << deferred_moe_mode_receipt;
+    std::cout << '{' << '\n' << gdn_output_mode_receipt() << wave_router_mode_receipt << deferred_moe_receipt();
     emit_q4k_a8_receipt();
     std::cout << "  \"model_content_identity\": \""
               << strix::model_content_identity_hex(

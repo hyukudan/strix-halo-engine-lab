@@ -46,6 +46,9 @@ public:
         if(pending_)throw std::logic_error("deferred MoE token already pending");
         guard_->require_original();
         shadow_.begin(); host_={};pending_=true;
+        // This conservative reset still precedes serial preflight. Moving it to
+        // construction plus a dirty-state protocol needs owner-level recovery
+        // injection coverage; do not infer zero queue work from a preflight error.
         try { check(hipMemsetAsync(device_,0,sizeof(host_),scope_.stream),"clear deferred MoE first-error record"); }
         catch (...) { abort();throw; }
     }

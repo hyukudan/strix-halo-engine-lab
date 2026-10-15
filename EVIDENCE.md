@@ -70,7 +70,7 @@ permitidos son: **observado**, **publicado**, **inferido**, **hipótesis** y
 | E-049 | publicado | AMD especifica 2 puertos USB4 nativos de 40 Gbps en Ryzen AI Max+ 395/Strix Halo. La especificación de producto no demuestra independencia de routers/upstream ni 80 Gbps agregados sostenidos. | AMD Ryzen AI Max+ 395 product specification, consultada 2026-10-01. | Diseñar dos enlaces físicos como recursos separados y exigir prueba simultánea antes de habilitar striping/agregación. |
 
 | E-050 | observado (host) | Experimental wave top-k: 6,864 independent insertion/wave bit cases plus slot/admission mutants; WSL GNU 13.3 Release HIP-OFF build and 152/152 CTest cases passed. | Project source `src/hip_moe_route_launcher.hip`, `tests/router_wave_topk_tests.cpp`, implementation document; `cmake --build /mnt/d/tmp/build-spec-v1-router-host -j 8`; `ctest --test-dir /mnt/d/tmp/build-spec-v1-router-host --output-on-failure --no-tests=error -j 8`. | Supports portable order/admission contracts only. Actual revised-source HIP compile, ISA/FP-mode and old-kernel preservation, device fixtures, 554 arrays/512 IDs and paired timing remain independent gates. OFF by default. |
-| E-051 | implementado + prueba portable | El modo `--deferred-moe-status` tiene identidad MoE distinta, conserva dominio/bits del primer error y finaliza dentro del límite de publicación de la sesión. Las pruebas host inyectan errores en la capa 17 y en el fence, comprueban historial host intacto, generaciones/posición/ID sin avanzar y sesión envenenada. | GNU 13.3, WSL, CMake Release, HIP OFF: 152/152 CTest; `tests/deferred_moe_status_tests.cpp`; `tests/compiled_execution_tests.cpp`; contrato en `docs/deferred-moe-status.md`. | No implica ejecución GPU, igualdad de arrays de modelo ni ganancia de rendimiento. Compilación HIP, revisión y cualificación nativa pendientes. |
+| E-051 | observado | El modo `--deferred-moe-status` tiene identidad MoE distinta, conserva dominio/bits del primer error y finaliza dentro del límite de publicación de la sesión. Las pruebas host inyectan errores en la capa 17 y en el fence, comprueban historial host intacto, generaciones/posición/ID sin avanzar y sesión envenenada. | GNU 13.3, WSL, CMake Release, HIP OFF: 152/152 CTest; `tests/deferred_moe_status_tests.cpp`; `tests/compiled_execution_tests.cpp`; contrato en `docs/deferred-moe-status.md`. | No implica ejecución GPU, igualdad de arrays de modelo ni ganancia de rendimiento. Compilación HIP, ISA, fixtures nativos y cualificación de modelo/rendimiento pendientes. |
 
 ## Regla para nuevas entradas
 
@@ -101,3 +101,21 @@ These are fixture contracts, not claims that new device tests have executed.
 ## E-053
 
 Experimental source and fixtures: `src/lane_chain_hyper_output.cpp`, `src/hip_hyper_mix_launcher.hip`, host `strix-lane-chain-hyper-output-tests` and HIP `strix-hip-lane-chain-hyper-output-tests` / `strix-hip-lane-chain-hyper-integration-tests`. Reproduce host checks with `cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON -DSTRIX_ENABLE_HIP_RUNTIME=OFF -DSTRIX_WARNINGS_AS_ERRORS=ON`, build and `ctest --test-dir build --output-on-failure`. Host execution cannot qualify device arithmetic. HIP gfx1151 compiler/ISA/device, full-model exactness and performance gates remain required; see the lane-chain implementation document. No measured gain is claimed.
+E-051 follow-up artifacts: `merge_deferred_moe_first_error` is now the same
+host/device helper called by the actual publisher and the portable dispatcher
+fixture. Host sequence zero -> A8 bits 5 -> legacy bits 1 -> zero must retain
+`{2,5}`. Exact-message compiled admission and host-only launch-scope metadata
+fixtures exercise their specific guards. Native scope/alias fixtures require
+untouched poison and zero captured nodes where an owned scope exists. A bounded
+host callback holds the fixture stream to test asynchronous launcher return;
+this fixture has not been executed as part of the portable evidence above.
+Actual owner receipts report completed tokens, without synthetic layer counters.
+
+
+E-051 follow-up observed checks: GNU 13.3/WSL, Release HIP OFF, rebuilt targeted
+`strix-deferred-moe-status-tests` and `strix-compiled-execution-tests`: 2/2 PASS.
+The actual `hip_launch_context_tests.cpp` metadata fixture also passes as a host
+executable linked to the real core with private HIP type/constant declarations;
+it invokes no HIP API and provides no runtime qualification. Native fixture C++
+API parsing succeeds both with and without experimental A8 capability enabled.
+E-051 native/compiler/ISA/model/performance gates: **pendiente**.

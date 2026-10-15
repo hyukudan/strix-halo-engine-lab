@@ -19,3 +19,10 @@ and qualification are recorded in [the ledger](docs/qualification-ledger.md).
 The original 2026-09-28 review actions must not be interpreted as a current list of
 unimplemented features or as experimental measurements. Acceptance is determined
 by the exact implementation tests and target evidence for each current path.
+
+
+D-016 / E-051: deferred eager MoE status remains an opt-in experiment. See
+[the completion and recovery contract](docs/deferred-moe-status.md). Source and
+portable tests do not qualify native HIP execution, linked arithmetic identity,
+model arrays/token publication or complete-workload latency. Those gates must
+pass before adoption; first-error merge and host-exception precedence are explicit.

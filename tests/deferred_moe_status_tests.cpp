@@ -29,7 +29,7 @@ strix::kernels::KernelRegistry registry(const strix::ModelContract& model,const 
 }
 struct Dispatcher final:strix::EagerExecutionDispatcher{
     strix::DeferredMoeFirstError error;
-    bool throw_during_dispatch=false;
+    bool throw_during_dispatch=false,throw_after_device_error=false;
     unsigned calls=0,moe_layers=0;
     void run(const strix::ExecutionDispatchContext& c){
         ++calls;
@@ -42,10 +42,12 @@ struct Dispatcher final:strix::EagerExecutionDispatcher{
             ++moe_layers;
             if(moe_layers==17){
                 if(throw_during_dispatch)throw std::runtime_error("injected middle-layer host failure");
-                if(error.domain==0)error={static_cast<unsigned>(strix::DeferredMoeDomain::q4k_a8),5};
+                strix::merge_deferred_moe_first_error(error,5,strix::DeferredMoeDomain::q4k_a8);
             }
+            if(moe_layers==30 && throw_after_device_error)throw std::runtime_error("injected later host failure");
             // A later failure must not replace the first domain or any status bits.
-            if(moe_layers==29&&error.domain==0)error={static_cast<unsigned>(strix::DeferredMoeDomain::legacy),1};
+            if(moe_layers==29)strix::merge_deferred_moe_first_error(error,1,strix::DeferredMoeDomain::legacy);
+            strix::merge_deferred_moe_first_error(error,0,strix::DeferredMoeDomain::none);
         }
     }
     void dispatch_kernel(const strix::ExecutionDispatchContext& c)override{run(c);}
@@ -53,6 +55,14 @@ struct Dispatcher final:strix::EagerExecutionDispatcher{
 };
 }
 int main()try{
+    strix::DeferredMoeFirstError first;
+    strix::merge_deferred_moe_first_error(first,0,strix::DeferredMoeDomain::legacy);
+    expect(first.domain==0 && first.bits==0,"successful layer leaves empty record unchanged");
+    strix::merge_deferred_moe_first_error(first,5,strix::DeferredMoeDomain::q4k_a8);
+    strix::merge_deferred_moe_first_error(first,1,strix::DeferredMoeDomain::legacy);
+    strix::merge_deferred_moe_first_error(first,0,strix::DeferredMoeDomain::none);
+    expect(first.domain==2 && first.bits==5,"product merge retains complete first A8 error over later legacy/zero status");
+
     const auto model=strix::ModelContract::qwen38_flash_next();strix::ExecutionBindingRequest binding;
     strix::ExecutionBufferRequest buffers;
     const auto compiled=strix::compile_serial_execution(model,registry(model,binding),binding,buffers,256);
@@ -76,9 +86,9 @@ int main()try{
     strix::SerialSessionContext fresh;fresh.execution_identity=compiled.execution_identity;fresh.state_layout_identity=layout.layout_identity;
     fresh.runtime_compatibility_identity=original.compatibility_identity;
     for(const auto& step:compiled.execution.steps)fresh.state.valid=fresh.state.valid|step.reads_state|step.writes_state;
-    for(unsigned failure:{0U,1U,2U}){
+    for(unsigned failure:{0U,1U,2U,3U}){
         const bool throw_dispatch=failure==1U;
-        auto session=fresh;Dispatcher d;d.throw_during_dispatch=throw_dispatch;bool completion=false;shadow.begin();
+        auto session=fresh;Dispatcher d;d.throw_during_dispatch=throw_dispatch;d.throw_after_device_error=failure==3U;bool completion=false;shadow.begin();
         std::string error;
         try{(void)strix::execute_serial_token(compiled,session,transactional,7734,d,[&]{
             completion=true;
@@ -94,6 +104,8 @@ int main()try{
                session.arithmetic_lineage.history_identity==fresh.arithmetic_lineage.history_identity,"failure publishes no metadata, row ID or state generations");
         expect(published==std::array<std::byte,128>{},"failed middle layer publishes no ngram or position bytes");
         if(throw_dispatch)expect(!completion&&error=="injected middle-layer host failure","dispatch failure bypasses completion");
+        else if(failure==3U)expect(!completion && error=="injected later host failure" && d.error.domain==2 && d.error.bits==5,
+            "later host exception takes precedence over earlier device status and bypasses completion");
         else if(failure==2U)expect(completion&&error=="injected token fence failure","completion failure preserves its original error");
         else expect(completion&&d.moe_layers==48&&error=="Q4K A8 rejected status bits (route/weight=1,input=2,delta=4,pipeline=8): 5",
                     "deferred error retains first complete A8 bits and original message after all layers");

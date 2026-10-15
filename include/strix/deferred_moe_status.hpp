@@ -13,6 +13,19 @@ struct DeferredMoeFirstError {
 };
 static_assert(sizeof(DeferredMoeFirstError) == 8);
 
+// The caller serializes publishers in one stream. Preserve the complete first
+// nonzero status; a successful layer or a later error cannot overwrite it.
+#if defined(__HIPCC__)
+__host__ __device__
+#endif
+inline void merge_deferred_moe_first_error(DeferredMoeFirstError& record,
+    std::uint32_t local_bits, DeferredMoeDomain domain) noexcept {
+    if(local_bits != 0U && record.domain == 0U) {
+        record.bits = local_bits;
+        record.domain = static_cast<std::uint32_t>(domain);
+    }
+}
+
 inline void check_deferred_moe_status(const DeferredMoeFirstError& error) {
     if (error.domain == 0 && error.bits == 0) return;
     if (error.domain == static_cast<std::uint32_t>(DeferredMoeDomain::legacy) && error.bits != 0)

@@ -903,8 +903,8 @@ __global__ void publish_deferred_moe_first_error(const std::uint32_t* local,
     std::uint32_t* record, std::uint32_t domain) {
     // One thread, one stream: completion of this node precedes the next layer's
     // workspace reset. Existing arithmetic kernels and status words are intact.
-    const auto bits = *local;
-    if (bits != 0U && record[0] == 0U) { record[1] = bits; record[0] = domain; }
+    merge_deferred_moe_first_error(*reinterpret_cast<DeferredMoeFirstError*>(record),
+        *local, static_cast<DeferredMoeDomain>(domain));
 }
 void enqueue_deferred_moe_status(const std::uint32_t* local, DeferredMoeDomain domain) {
     hipLaunchKernelGGL(publish_deferred_moe_first_error,dim3(1),dim3(1),0,hip_execution_stream(),
