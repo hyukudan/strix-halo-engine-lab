@@ -132,6 +132,8 @@ void family(unsigned width, unsigned outputs, HipSharedQ8ProjectionRole role,
     }
     constexpr std::array<unsigned short, 7> scales{0,       0x8000U, 1,      0x03ffU,
                                                    0x0400U, 0x7bffU, 0xfbffU};
+    constexpr std::array<unsigned short, 6> nonfinite_scales{
+        0x7c00U, 0xfc00U, 0x7e01U, 0xfe55U, 0x3c00U, 0xbc00U};
     constexpr std::array<signed char, 5> codes{-128, -1, 0, 1, 127};
     constexpr std::array<unsigned short, 8> activation_bits{0,       0x8000U, 1,       0x8001U,
                                                             0x0080U, 0x8080U, 0x3f80U, 0xbf80U};
@@ -139,7 +141,8 @@ void family(unsigned width, unsigned outputs, HipSharedQ8ProjectionRole role,
         for (unsigned group = 0; group < width / 32U; ++group) {
             const auto offset = (static_cast<std::uint64_t>(row) * (width / 32U) + group) * 34U;
             seed = seed * 1664525U + 1013904223U;
-            const unsigned scale = flavor == 1 ? scales[row % scales.size()]
+            const unsigned scale = flavor == 4 ? nonfinite_scales[(row + group) % nonfinite_scales.size()]
+                                    : flavor == 1 ? scales[row % scales.size()]
                                                : (flavor == 2 ? 1U : 0x3000U | (seed & 0x83ffU));
             packed[offset] = static_cast<unsigned char>(scale);
             packed[offset + 1] = static_cast<unsigned char>(scale >> 8U);
@@ -157,6 +160,13 @@ void family(unsigned width, unsigned outputs, HipSharedQ8ProjectionRole role,
                 static_cast<unsigned>(activation_bits[i % activation_bits.size()]) << 16U);
     if (flavor == 2)
         values.assign(width, std::ldexp(1.0F, -126));
+    if (flavor == 4) {
+        constexpr std::array<unsigned, 8> payloads{
+            0x7fc10000U, 0xffc20000U, 0x7fc30000U, 0xffc40000U,
+            0x7f800000U, 0xff800000U, 0x3f800000U, 0xbf800000U};
+        for (unsigned i = 0; i < width; ++i)
+            values[i] = std::bit_cast<float>(payloads[i % payloads.size()]);
+    }
     upload(weights, packed.data());
     const std::array modes{HipSharedQ8ProjectionMode::legacy256,
                            HipSharedQ8ProjectionMode::virtual256,
@@ -212,7 +222,10 @@ void family(unsigned width, unsigned outputs, HipSharedQ8ProjectionRole role,
                                               : 1.0F;
         if (down)
             upload(gate, &shared_gate);
-        const auto expected = oracle(values, packed, outputs, down, output_bf16, shared_gate);
+        // Nonfinite payload propagation is compared across device modes only:
+        // the host FMA implementation is not an AMD NaN-payload oracle.
+        const auto expected = flavor == 4 ? std::vector<unsigned char>{}
+            : oracle(values, packed, outputs, down, output_bf16, shared_gate);
         if (flavor == 2)
             require(expected !=
                         oracle(values, packed, outputs, down, output_bf16, shared_gate, true),
@@ -232,7 +245,7 @@ void family(unsigned width, unsigned outputs, HipSharedQ8ProjectionRole role,
             check(hipMemcpy(actual.data(), reinterpret_cast<void *>(output.address), output.bytes,
                             hipMemcpyDeviceToHost),
                   "read shared output bits");
-            require(actual == expected,
+            require(flavor == 4 || actual == expected,
                     "shared projection differs from independent fixed256 FMA/store oracle");
             if (mode == 0)
                 first = actual;
@@ -306,6 +319,7 @@ int main() try {
         for (auto role : {HipSharedQ8ProjectionRole::gate_up, HipSharedQ8ProjectionRole::down}) {
             family(2560, 7, role, storage, 1);
             family(role == HipSharedQ8ProjectionRole::down ? 640U : 2560U, 7, role, storage, 2);
+            family(640, 9, role, storage, 4);
         }
         family(640, 9, HipSharedQ8ProjectionRole::down, storage, 3);
     }

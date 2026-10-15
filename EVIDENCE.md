@@ -133,3 +133,12 @@ syntax checks are not HIP compilation. Actual linked legacy/new ISA, device test
 complete model arrays/tokens and workload performance remain pending. Requirements:
 exact gate/up raw FP32 and down scalar-gate/store behavior, explicit fallback and
 identity admission, poisoned eager/graph fixtures and host dispatch counters.
+
+
+E-054 follow-up source: catalog fixtures now provide a real statistics owner and
+check the final native launcher configuration retains the same owner; the catalog
+constructor forwards it explicitly. Tensor-name JSON escaping has portable
+control/quote/backslash/null fixtures. New device-only payload cases compare
+legacy, virtual and candidate outputs for distinct NaNs/infinities and half NaN/
+infinite scales, without treating host FMA as a payload oracle. These new native
+cases still require actual execution and linked-ISA qualification.

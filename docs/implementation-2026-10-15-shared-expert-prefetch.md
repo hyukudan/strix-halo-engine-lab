@@ -58,3 +58,13 @@ This does not qualify HIP compilation or execution. Linked original-function ISA
 new kernel arithmetic/FP descriptors, native adversarial fixtures, full-array/token
 fidelity and paired complete-workload measurements remain mandatory. No measured
 speedup or production qualification is claimed.
+
+
+The catalog retains and forwards the same statistics owner into its native
+launcher bundle. Its mixed catalog fixture checks this owner directly, in addition
+to checking that fallback launchers cannot select prefetch. Tensor-name receipts
+escape quotes, backslashes and JSON control bytes, with host fixtures for embedded
+nulls and other controls. A nonfinite diagnostic flavor supplies distinct NaN
+payloads, infinities and nonfinite half scales; it compares the three actual device
+modes directly and deliberately does not use host FMA as an AMD payload oracle.
+Native execution of these additional cases remains pending.

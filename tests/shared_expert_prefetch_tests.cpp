@@ -1,3 +1,4 @@
+#include "../apps/hip_decode_receipt_json.hpp"
 #include "strix/compiled_execution.hpp"
 #include "strix/compiled_speculative_verify.hpp"
 #include "strix/shared_expert_prefetch.hpp"
@@ -82,6 +83,13 @@ kernels::KernelRegistry registry(const ModelContract &m, const ExecutionBindingR
 }
 } // namespace
 int main() {
+    const std::string receipt_name = "blk.0.shared_expert.up_proj.\"\\\n\t";
+    expect(strix::decode_receipt::escape_json_string(receipt_name) ==
+               "blk.0.shared_expert.up_proj.\\\"\\\\\\u000a\\u0009",
+           "receipt preserves name with escaped quotes, backslashes and controls");
+    expect(strix::decode_receipt::escape_json_string(std::string("a\0b", 3)) == "a\\u0000b",
+           "receipt escapes embedded null without truncating name");
+
     const auto m = ModelContract::qwen38_flash_next();
     auto tensors = manifest(m);
     auto p = shared_expert_prefetch::build_plan(m, tensors);

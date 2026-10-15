@@ -514,6 +514,8 @@ int main() {
         strix::HipLauncherCatalogConfig on_config;
         on_config.prefetch_q8_shared_expert = true;
         on_config.shared_expert_prefetch_layers = on_request.shared_expert_prefetch_layers;
+        on_config.shared_expert_prefetch_stats =
+            std::make_shared<strix::shared_expert_prefetch::RuntimeDispatchStats>();
         strix::kernels::KernelRegistry mixed_registry;
         strix::register_complete_hip_kernel_catalog(model, on_request, on_config, mixed_registry);
         strix::ExecutionBufferRequest buffers;
@@ -539,6 +541,15 @@ int main() {
                 "hip-gfx1151-shared-expert-v1"), "mixed registry compiler identities");
             const auto* selected_launcher = mixed_launchers.find_kernel_launcher(id);
             expect(selected_launcher != nullptr, "mixed bundle registers each indexed id");
+            if (selected_launcher) {
+                const auto* launcher_config =
+                    static_cast<const strix::HipSharedExpertLauncherConfig*>(selected_launcher->user_data);
+                expect(launcher_config && launcher_config->prefetch_stats ==
+                    on_config.shared_expert_prefetch_stats,
+                    "catalog forwards the real shared dispatch statistics owner");
+                expect(launcher_config && launcher_config->prefetch_q8 == use,
+                    "fallback launcher cannot dispatch shared prefetch");
+            }
             if(!use) {
                 const auto* legacy = off_launchers.find_kernel_launcher(id);
                 expect(legacy && selected_launcher && legacy->implementation_identity ==

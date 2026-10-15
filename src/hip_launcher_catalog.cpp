@@ -448,7 +448,8 @@ HipLauncherCatalog::HipLauncherCatalog(
       shared_expert_(
           shared_expert_config(
               model,
-              config.activation,config.prefetch_q8_shared_expert,config.shared_expert_prefetch_layers)) {
+              config.activation,config.prefetch_q8_shared_expert,config.shared_expert_prefetch_layers,
+              config.shared_expert_prefetch_stats)) {
     if (alternate_lm_head_ && config.virtual_q8_lm_head)
         throw std::invalid_argument("integer and virtual Q8 LM heads are mutually exclusive");
     if (device_graph_inputs_ && alternate_lm_head_)
