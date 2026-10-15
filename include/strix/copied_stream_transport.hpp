@@ -4,6 +4,7 @@
 #include "strix/distributed_control_receiver.hpp"
 #include "strix/host_upload.hpp"
 #include "strix/tcp_copied_payload_stream.hpp"
+#include "strix/ssh_bound_copied_stream.hpp"
 
 #include <memory>
 
@@ -99,6 +100,8 @@ public:
     // The TCP backend owns its stream and requires matching explicit ceilings.
     // Construction failure leaves the caller's stream unconsumed.
     CopiedStreamTransportBackend(TcpCopiedPayloadByteStream&&, CopiedStreamConnectionState&,
+                                CopiedStreamTransportPolicy);
+    CopiedStreamTransportBackend(SshBoundCopiedByteStream&&, CopiedStreamConnectionState&,
                                 CopiedStreamTransportPolicy);
     ~CopiedStreamTransportBackend() override;
     CopiedStreamTransportBackend(const CopiedStreamTransportBackend&) = delete;

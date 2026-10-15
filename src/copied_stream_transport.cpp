@@ -169,6 +169,7 @@ struct CopiedStreamTransportBackend::Impl {
     };
     DistributedControlByteStream* stream;
     std::unique_ptr<TcpCopiedPayloadByteStream> tcp_stream_owner;
+    std::unique_ptr<SshBoundCopiedByteStream> authenticated_stream_owner;
     CopiedStreamConnectionState* state;
     CopiedStreamTransportPolicy policy;
     std::unique_ptr<Active> active;
@@ -178,6 +179,16 @@ struct CopiedStreamTransportBackend::Impl {
     void fail() noexcept {
         failed = true; state->failed_ = true;
         if (tcp_stream_owner) tcp_stream_owner->poison();
+        if (authenticated_stream_owner) authenticated_stream_owner->poison();
+    }
+    void validate_admitted_transfer(const DistributedBoundaryTransfer& transfer) const {
+        if (!authenticated_stream_owner) return;
+        const auto& binding = authenticated_stream_owner->binding();
+        const auto& descriptor = transfer.descriptor;
+        if (descriptor.model_plan_id != binding.placement_plan_identity || descriptor.request_id != binding.request_id ||
+            descriptor.generation != binding.generation || descriptor.connection_epoch != binding.connection_epoch ||
+            descriptor.dtype_id != binding.dtype_id || descriptor.byte_length > binding.maximum_payload_bytes)
+            throw std::invalid_argument("copied transfer does not match authenticated bootstrap binding");
     }
     void healthy() const { if (failed || state->failed_) throw std::logic_error("copied stream connection is failed"); }
     Active& require(TransferHandle handle, bool check_health = true) {
@@ -268,6 +279,20 @@ CopiedStreamTransportBackend::CopiedStreamTransportBackend(DistributedControlByt
     if (state.attached_) throw std::logic_error("copied physical connection already has an owner");
     state.attached_ = true;
 }
+CopiedStreamTransportBackend::CopiedStreamTransportBackend(SshBoundCopiedByteStream&& stream,
+    CopiedStreamConnectionState& state, CopiedStreamTransportPolicy policy)
+    : CopiedStreamTransportBackend(stream, stream.maximum_frame_bytes(), state, policy) {
+    if (!stream.valid() || stream.channel() != SshCopiedChannel::payload)
+        throw std::invalid_argument("copied payload requires a verified payload-channel capability");
+    const auto& binding = stream.binding();
+    const auto& connection = state.connection();
+    if (policy.maximum_frame_bytes != binding.maximum_application_frame_bytes || policy.maximum_payload_bytes > binding.maximum_payload_bytes ||
+        connection.physical_link_id != binding.physical_link_id || connection.physical_epoch != binding.physical_epoch ||
+        connection.link_index != binding.link_index || connection.local_node != stream.local_node() || connection.peer_node != 1U - stream.local_node())
+        throw std::invalid_argument("copied payload route does not match authenticated bootstrap binding");
+    impl_->authenticated_stream_owner = std::make_unique<SshBoundCopiedByteStream>(std::move(stream));
+    impl_->stream = impl_->authenticated_stream_owner.get();
+}
 CopiedStreamTransportBackend::~CopiedStreamTransportBackend() {
     if (impl_->active && drain_retained() != CopiedStreamCleanupStatus::released) {
         // One bounded host allocation and its proof remain owned until process
@@ -297,6 +322,7 @@ TransferHandle CopiedStreamTransportBackend::prepare_send(const DistributedBound
     impl_->active = std::move(operation);
     try {
         auto& active = *impl_->active;
+        impl_->validate_admitted_transfer(transfer);
         validate_owned(active.buffer, transfer.descriptor.byte_length, impl_->policy.maximum_payload_bytes, false);
         if (!active.proof || !same_binding(active.proof->binding(), completion_binding(transfer, active.buffer, false))) {
             throw std::invalid_argument("copied stream producer proof is missing or foreign");
@@ -313,6 +339,7 @@ TransferHandle CopiedStreamTransportBackend::prepare_receive(const DistributedBo
     auto operation = std::make_unique<Impl::Active>(); operation->handle = next_handle(); operation->transfer = transfer;
     operation->buffer = std::move(buffer); operation->receive = true; impl_->active = std::move(operation);
     try {
+        impl_->validate_admitted_transfer(transfer);
         validate_owned(impl_->active->buffer, transfer.descriptor.byte_length, impl_->policy.maximum_payload_bytes, true);
         impl_->active->metadata = metadata(transfer, impl_->state->connection_, impl_->policy);
         return impl_->active->handle;
