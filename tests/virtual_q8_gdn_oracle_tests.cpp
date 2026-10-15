@@ -14,6 +14,51 @@ std::uint32_t bf16_bits(float value) {
 }
 }
 int main() {
+    // The prefetch loader's group predicate is safe for every admitted tail.
+    for (std::uint64_t width = 32; width <= 8192; width += 32) {
+        for (std::uint64_t chunk = 0; chunk < width; chunk += 256) {
+            for (unsigned lane = 0; lane < 32; ++lane) {
+                const auto base = chunk + 8U * lane;
+                for (unsigned local = 0; local < 8; ++local)
+                    if ((base + local < width) != (base < width)) return 3;
+                if (base < width && (base / 32U != (base + 7U) / 32U || base + 7U >= width)) return 4;
+            }
+        }
+    }
+    constexpr std::uint64_t maximum_aligned_width = 0xffffffe0ULL;
+    const auto final_chunk = ((maximum_aligned_width - 1U) / 256U) * 256U;
+    for (unsigned lane = 0; lane < 32; ++lane) {
+        const auto base = final_chunk + 8U * lane;
+        for (unsigned local = 0; local < 8; ++local)
+            if ((base + local < maximum_aligned_width) != (base < maximum_aligned_width)) return 5;
+    }
+    // Host-executed coefficient reassociation mutant. The changed arithmetic
+    // differs even after the production BF16 rounding, rather than only FP32.
+    {
+        constexpr std::size_t width = 2560;
+        const float activation = std::ldexp(1.0F, -126);
+        const float scale = std::ldexp(1.0F, -24);
+        std::vector<float> inputs(width, activation), decoded(width, scale * 127.0F);
+        volatile float premature_product = activation * scale;
+        const float premature_rounded = premature_product;
+        std::vector<float> reassociated_inputs(width, premature_rounded), codes(width, 127.0F);
+        const auto correct = bf16_bits(virtual_q8_test::legacy_oracle(inputs, decoded));
+        const auto mutant = bf16_bits(virtual_q8_test::legacy_oracle(reassociated_inputs, codes));
+        if (correct != 0x00020000U || mutant != 0U) return 6;
+        std::cout << "Decode-first underflow mutant detected after BF16 rounding: "
+                  << correct << " vs " << mutant << '\n';
+    }
+    {
+        std::vector<float> inputs(2560, 1.0F), weights(2560, -0.0F), wrong_weights(2560, 0.0F);
+        for (unsigned feature = 0; feature < 256; ++feature) {
+            inputs[feature] = -std::ldexp(1.0F, -133);
+            weights[feature] = std::ldexp(1.0F, -24);
+            wrong_weights[feature] = weights[feature];
+        }
+        if (bf16_bits(virtual_q8_test::legacy_oracle(inputs, weights)) != 0x80000000U ||
+            bf16_bits(virtual_q8_test::legacy_oracle(inputs, wrong_weights)) != 0U) return 7;
+        std::cout << "Signed-zero coefficient mutant detected after BF16 rounding\n";
+    }
     using virtual_q8_test::Mutation;
     constexpr std::array mutants{Mutation::local_first, Mutation::cross_reverse,
         Mutation::local_reverse, Mutation::wrong_mapping, Mutation::descending_leaves,

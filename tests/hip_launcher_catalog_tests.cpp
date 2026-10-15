@@ -384,6 +384,30 @@ int main() {
         try { strix::ExecutionLauncherRegistry bad; no_virtual_catalog.register_for_compiled_execution(graph_compiled, bad); }
         catch (const std::invalid_argument&) { virtual_mismatch_rejected = true; }
         expect(virtual_mismatch_rejected, "catalog rejects virtual selected GDN id when configuration drops the flag");
+        auto prefetch_config = graph_config; prefetch_config.prefetch_q8_gdn_input = true;
+        strix::kernels::KernelRegistry prefetch_kernels;
+        strix::register_complete_hip_kernel_catalog(model, graph_request, prefetch_config, prefetch_kernels);
+        const auto prefetch_compiled = strix::compile_serial_execution(model, prefetch_kernels, graph_request, buffers);
+        for (std::size_t index = 0; index < prefetch_compiled.execution.steps.size(); ++index)
+            if (prefetch_compiled.execution.steps[index].op == strix::SerialOp::gated_delta_net)
+                expect(prefetch_compiled.bindings.bindings[index].kernel_id.has_value() &&
+                    prefetch_compiled.bindings.bindings[index].kernel_id->ends_with(".prefetch8.virtual256.q8-input"),
+                    "prefetch complete catalog selects explicit prefetch GDN id");
+        strix::HipLauncherCatalog prefetch_catalog(model, prefetch_config);
+        strix::ExecutionLauncherRegistry prefetch_launchers;
+        prefetch_catalog.register_for_compiled_execution(prefetch_compiled, prefetch_launchers);
+        expect(prefetch_catalog.audit(prefetch_compiled, prefetch_launchers).missing_steps == 0,
+            "prefetch catalog bundle propagates selected flags at its construction site");
+        bool prefetch_mismatch_rejected = false;
+        try { strix::ExecutionLauncherRegistry bad; graph_catalog.register_for_compiled_execution(prefetch_compiled, bad); }
+        catch (const std::invalid_argument&) { prefetch_mismatch_rejected = true; }
+        expect(prefetch_mismatch_rejected, "streaming catalog rejects prefetched selected GDN id");
+        auto invalid_prefetch_config = prefetch_config; invalid_prefetch_config.virtual_q8_gdn_input = false;
+        bool invalid_prefetch_rejected = false;
+        try { strix::kernels::KernelRegistry bad;
+            strix::register_complete_hip_kernel_catalog(model, graph_request, invalid_prefetch_config, bad); }
+        catch (const std::invalid_argument&) { invalid_prefetch_rejected = true; }
+        expect(invalid_prefetch_rejected, "catalog rejects prefetch without required virtual input flag");
         bool mismatch_rejected = false;
         try { strix::ExecutionLauncherRegistry bad; catalog.register_for_compiled_execution(graph_compiled, bad); }
         catch (const std::invalid_argument&) { mismatch_rejected = true; }

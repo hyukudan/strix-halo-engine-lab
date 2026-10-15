@@ -70,6 +70,8 @@ enum class WeightKind {
     iq4_xs,
 };
 
+enum class ProjectionMode { legacy256, virtual_stream, prefetch8 };
+
 enum class SmallWeightKind : std::uint32_t {
     f32 = 0,
     f16 = 1,
@@ -181,6 +183,8 @@ void validate_config(
         throw std::invalid_argument(
             error);
     }
+    if (config.prefetch_q8_input_projections && !config.virtual_q8_input_projections)
+        throw std::invalid_argument("HIP GDN prefetch Q8 input requires virtual Q8 input");
     if (config.activation !=
         HipActivationStorage::bf16) {
         throw std::invalid_argument(
@@ -585,6 +589,56 @@ void project_virtual_q8_bf16_to_fp32_kernel(
                 partial[local] += bf16_to_float(input[feature]) *
                     load_weight<WeightKind::q8_0>(weights, input_width, row,
                         static_cast<std::uint32_t>(feature));
+        }
+    }
+#pragma unroll
+    for (unsigned distance = 16; distance > 0; distance /= 2) {
+#pragma unroll
+        for (unsigned local = 0; local < 8; ++local) {
+            const auto partner = __shfl_down(partial[local], distance, 32);
+            if (lane < distance) partial[local] += partner;
+        }
+    }
+    if (lane == 0) {
+        partial[0] += partial[4]; partial[1] += partial[5];
+        partial[2] += partial[6]; partial[3] += partial[7];
+        partial[0] += partial[2]; partial[1] += partial[3];
+        partial[0] += partial[1];
+        output[row] = round_bf16(partial[0]);
+    }
+}
+
+// Distinct opt-in load organization; existing virtual and legacy kernels
+// remain unchanged. Actual ISA, not these arrays, qualifies load batching.
+__global__ __launch_bounds__(32)
+void project_prefetch8_q8_bf16_to_fp32_kernel(
+    const std::uint16_t* input, const void* weights,
+    std::uint32_t input_width, std::uint32_t output_width, float* output) {
+    const auto row = static_cast<std::uint32_t>(blockIdx.x);
+    if (row >= output_width) return;
+    const auto lane = static_cast<std::uint32_t>(threadIdx.x);
+    float partial[8]{};
+    const auto* blocks = static_cast<const Q8Block*>(weights) +
+        static_cast<std::uint64_t>(row) * (input_width / 32U);
+    for (std::uint64_t chunk = 0; chunk < input_width; chunk += 256U) {
+        const auto base = chunk + 8U * lane;
+        // The prelaunch Q8 width%32 gate proves all eight leaves are valid
+        // together and remain inside one block. No tail load is speculative.
+        if (base < input_width) {
+            const auto feature = static_cast<std::uint32_t>(base);
+            const auto& block = blocks[feature / 32U];
+            std::uint16_t bits[8];
+            std::int8_t codes[8];
+#pragma unroll
+            for (unsigned local = 0; local < 8; ++local) {
+                bits[local] = input[feature + local];
+                codes[local] = block.values[feature % 32U + local];
+            }
+            const float scale = __half2float(block.scale);
+#pragma unroll
+            for (unsigned local = 0; local < 8; ++local)
+                partial[local] += bf16_to_float(bits[local]) *
+                    (scale * static_cast<float>(codes[local]));
         }
     }
 #pragma unroll
@@ -1170,7 +1224,7 @@ void launch_projection_by_kind(
     const RuntimeTensorBinding& weights,
     std::uint32_t input_width,
     std::uint32_t output_width,
-    float* output, bool virtual_q8 = false) {
+    float* output, ProjectionMode mode = ProjectionMode::legacy256) {
     switch (kind) {
     case WeightKind::f32:
         launch_projection<WeightKind::f32>(
@@ -1185,7 +1239,15 @@ void launch_projection_by_kind(
             input, weights, input_width, output_width, output);
         return;
     case WeightKind::q8_0:
-        if (virtual_q8) {
+        if (mode == ProjectionMode::prefetch8) {
+            hipLaunchKernelGGL(project_prefetch8_q8_bf16_to_fp32_kernel,
+                dim3(output_width), dim3(32), 0, hip_execution_stream(),
+                input, reinterpret_cast<const void*>(weights.address),
+                input_width, output_width, output);
+            check_hip(hipGetLastError(), "HIP GDN prefetch8 Q8 input projection launch");
+            return;
+        }
+        if (mode == ProjectionMode::virtual_stream) {
             hipLaunchKernelGGL(project_virtual_q8_bf16_to_fp32_kernel,
                 dim3(output_width), dim3(32), 0, hip_execution_stream(),
                 input, reinterpret_cast<const void*>(weights.address),
@@ -1760,6 +1822,15 @@ void launch_gdn(
         hidden,
         value_heads,
         "alpha");
+    // Keep the eight-feature dereference proof local to the opt-in path,
+    // independently of required_weight_bytes' existing alignment check.
+    if (config.prefetch_q8_input_projections && hidden % 32U != 0U &&
+        (tensors.qkv.manifest->ggml_type == 8U || tensors.z.manifest->ggml_type == 8U ||
+         tensors.beta.manifest->ggml_type == 8U || tensors.alpha.manifest->ggml_type == 8U))
+        throw std::invalid_argument("HIP GDN prefetch8 Q8 input width must align to32");
+    const auto projection_mode = config.prefetch_q8_input_projections ? ProjectionMode::prefetch8
+        : config.virtual_q8_input_projections ? ProjectionMode::virtual_stream : ProjectionMode::legacy256;
+
     validate_projection_tensor(
         tensors.out,
         value_width,
@@ -1858,7 +1929,7 @@ void launch_gdn(
         *tensors.qkv.runtime,
         hidden,
         conv_width,
-        workspace.qkv, config.virtual_q8_input_projections);
+        workspace.qkv, projection_mode);
     launch_projection_by_kind(
         weight_kind(
             tensors.z.manifest->
@@ -1867,7 +1938,7 @@ void launch_gdn(
         *tensors.z.runtime,
         hidden,
         value_width,
-        workspace.z, config.virtual_q8_input_projections);
+        workspace.z, projection_mode);
     launch_projection_by_kind(
         weight_kind(
             tensors.beta.manifest->
@@ -1876,7 +1947,7 @@ void launch_gdn(
         *tensors.beta.runtime,
         hidden,
         value_heads,
-        workspace.beta, config.virtual_q8_input_projections);
+        workspace.beta, projection_mode);
     launch_projection_by_kind(
         weight_kind(
             tensors.alpha.manifest->
@@ -1885,7 +1956,7 @@ void launch_gdn(
         *tensors.alpha.runtime,
         hidden,
         value_heads,
-        workspace.gate, config.virtual_q8_input_projections);
+        workspace.gate, projection_mode);
 
     if (hip_graph_status() != nullptr) {
         hipLaunchKernelGGL(validate_gdn_graph_values, dim3(32), dim3(kProjectionThreads), 0,
@@ -2059,6 +2130,7 @@ std::string kernel_id(
         ".c" +
         std::to_string(
             request.request_concurrency) + (request.device_graph_inputs ? ".device" : ".scalar") +
+        (config.prefetch_q8_input_projections ? ".prefetch8" : "") +
         (config.virtual_q8_input_projections ? ".virtual256.q8-input" : "");
 }
 
@@ -2109,6 +2181,7 @@ std::uint64_t implementation_identity(
             ? 1ULL
             : 0ULL);
     if (config.virtual_q8_input_projections) hash_u64(hash, 0x47444e5138563235ULL);
+    if (config.prefetch_q8_input_projections) hash_u64(hash, 0x47444e5138504631ULL);
     return hash;
 }
 
@@ -2224,8 +2297,8 @@ void register_hip_gdn_kernel_variant(
         "row-major";
     variant.output_layout =
         "row-major";
-    variant.compiler_identity = config.virtual_q8_input_projections
-        ? "hip-gfx1151-gdn-v3-virtual256-q8-input" : "hip-gfx1151-gdn-v2";
+    variant.compiler_identity = config.prefetch_q8_input_projections ? "hip-gfx1151-gdn-v4-prefetch8-virtual256-q8-input"
+        : config.virtual_q8_input_projections ? "hip-gfx1151-gdn-v3-virtual256-q8-input" : "hip-gfx1151-gdn-v2";
     variant.measured_seconds = 0.0;
 
     registry.add(
@@ -2284,6 +2357,8 @@ register_for_compiled_execution(
         if (binding.kernel_id->ends_with(".virtual256.q8-input") !=
             config_.virtual_q8_input_projections)
             throw std::invalid_argument("HIP GDN selected kernel disagrees with virtual Q8 configuration");
+        if (binding.kernel_id->ends_with(".prefetch8.virtual256.q8-input") != config_.prefetch_q8_input_projections)
+            throw std::invalid_argument("HIP GDN selected kernel disagrees with prefetch Q8 configuration");
 
         if (registered_id.empty()) {
             registered_id =
