@@ -45,7 +45,7 @@ struct Fixture final : strix::SerialGreedyStepBackend {
         : root(base/std::to_string(index)) {
         require(std::filesystem::create_directory(root),"fixture directory collision");
         request.max_new_tokens=maximum; request.eos_token_id=eos; request.context_capacity=context;
-        layout.context_tokens=context; layout.layout_identity=17; layout.device_alignment=1; layout.host_alignment=1;
+        layout.context_tokens=context; layout.device_alignment=1; layout.host_alignment=1;
         constexpr std::array flags{strix::PersistentState::attention_kv,strix::PersistentState::recurrent_matrix,
             strix::PersistentState::convolution_history,strix::PersistentState::convolution_history,
             strix::PersistentState::sparse_index,strix::PersistentState::ngram_history,strix::PersistentState::position_history};
@@ -57,11 +57,12 @@ struct Fixture final : strix::SerialGreedyStepBackend {
                 host?strix::SessionStateStorage::host:strix::SessionStateStorage::device,total,count,false});
             total+=count;
         }
+        layout.layout_identity=strix::serial_session_state_layout_identity(strix::ModelContract::qwen38_flash_next(),layout);
         owner->device.resize(static_cast<std::size_t>(layout.device_total_bytes));
         owner->host.resize(static_cast<std::size_t>(layout.host_total_bytes));
-        binding={17,reinterpret_cast<std::uintptr_t>(owner->device.data()),layout.device_total_bytes,19,
+        binding={layout.layout_identity,reinterpret_cast<std::uintptr_t>(owner->device.data()),layout.device_total_bytes,19,
                     reinterpret_cast<std::uintptr_t>(owner->host.data()),layout.host_total_bytes,23};
-        session.execution_identity=29; session.runtime_compatibility_identity=31; session.state_layout_identity=17;
+        session.execution_identity=29; session.runtime_compatibility_identity=31; session.state_layout_identity=layout.layout_identity;
         session.state.valid=static_cast<strix::PersistentState>(63U);
         metadata.model_sha256=std::string(64,'1'); metadata.model_content_identity=std::string(64,'2');
         metadata.executable_sha256=std::string(64,'3'); metadata.numerical_identity="synthetic-portable-no-native-claim";

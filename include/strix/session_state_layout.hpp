@@ -90,4 +90,9 @@ void convert_gdn_recurrent_host_storage(
 void validate_serial_session_state_layout_identity(
     const ModelContract& model, const SerialSessionStateLayout& layout);
 
+// Deterministic metadata digest for explicitly authored layouts. This binds
+// physical storage and offsets; it does not admit a layout to a native kernel.
+[[nodiscard]] std::uint64_t serial_session_state_layout_identity(
+    const ModelContract& model, const SerialSessionStateLayout& layout);
+
 }  // namespace strix

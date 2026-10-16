@@ -312,6 +312,13 @@ void validate_serial_session_state_layout_identity(
         throw std::invalid_argument("session-state layout metadata identity mismatch");
 }
 
+std::uint64_t serial_session_state_layout_identity(
+    const ModelContract& model, const SerialSessionStateLayout& layout) {
+    if (const auto error = model.validate(); !error.empty()) throw std::invalid_argument(error);
+    validate_gdn_recurrent_storage(layout.recurrent_storage);
+    return build_identity(model, layout);
+}
+
 void convert_gdn_recurrent_host_storage(
     GdnRecurrentHostView source, GdnRecurrentStorage source_storage,
     GdnRecurrentHostView destination, GdnRecurrentStorage destination_storage,
