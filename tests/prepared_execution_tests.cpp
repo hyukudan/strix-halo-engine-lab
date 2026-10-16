@@ -1,4 +1,7 @@
 #include "strix/prepared_execution.hpp"
+#include "strix/prepared_arena_views.hpp"
+#include "strix/moe_fork_join_arena.hpp"
+#include "strix/generation_output_dispatch.hpp"
 #include "strix/prepared_serial_session.hpp"
 #include "strix/dispatch_resources.hpp"
 #include "strix/model_tensor_index.hpp"
@@ -806,6 +809,313 @@ void ple_single_admission_and_lifetime() {
     }
     require(lifetime.expired(), "prepared destruction leaked the PLE backend/resources owner");
 }
+
+// Arena-index fixtures are separate from T0-T5. All addresses below refer to
+// retained actual host allocations; these dispatchers never execute kernels.
+bool same_address(const strix::ExecutionBufferAddress& a, const strix::ExecutionBufferAddress& b) {
+    return a.use == b.use && a.address == b.address && a.bytes == b.bytes &&
+           a.allocation_generation == b.allocation_generation;
+}
+template<class Exception, class Function>
+void arena_rejects(Function&& function, const char* fragment) {
+    bool caught = false;
+    try { function(); }
+    catch (const Exception& error) {
+        caught = std::string(error.what()).find(fragment) != std::string::npos;
+    }
+    require(caught, "arena rejection did not reach the intended typed admission gate");
+}
+struct ArenaTrace final : strix::EagerExecutionDispatcher {
+    std::vector<strix::ExecutionDispatchContext> calls;
+    std::vector<strix::ExecutionBufferAddress> buffers;
+    const strix::MoeForkJoinArenaPlan* fork = nullptr;
+    std::optional<bool> prepared_path;
+    const strix::PreparedArenaViews* views = nullptr;
+    void record(const strix::ExecutionDispatchContext& context) {
+        if (!prepared_path) prepared_path = context.prepared_arena_views != nullptr;
+        require(*prepared_path == (context.prepared_arena_views != nullptr), "arena cache presence changed during dispatch");
+        if (context.prepared_arena_views) {
+            if (!views) views = context.prepared_arena_views;
+            require(views == context.prepared_arena_views, "forwarded dispatch changed arena cache owner");
+        }
+        const auto append = [&](const auto uses, auto resolver) {
+            for (std::size_t i = 0; i < uses.size(); ++i) {
+                const auto actual = resolver(context, i);
+                const auto reference = strix::resolve_execution_buffer(context.execution_identity,
+                    *context.arena, *context.resources->scratch, uses[i]);
+                require(same_address(actual, reference), "indexed arena address differs from legacy full-use lookup");
+                if (fork) require(same_address(actual, fork->resolve(*context.resources->scratch, uses[i])),
+                    "indexed fork arena address differs from fork plan");
+                buffers.push_back(actual);
+            }
+        };
+        append(context.reads, strix::resolve_dispatch_read);
+        append(context.writes, strix::resolve_dispatch_write);
+        append(context.temporaries, strix::resolve_dispatch_temporary);
+        calls.push_back(context);
+    }
+    void dispatch_kernel(const strix::ExecutionDispatchContext& context) override { record(context); }
+    void dispatch_runtime_step(const strix::ExecutionDispatchContext& context) override { record(context); }
+};
+void same_arena_trace(const ArenaTrace& a, const ArenaTrace& b) {
+    require(a.calls.size() == b.calls.size() && a.buffers.size() == b.buffers.size(), "arena sweep counts differ");
+    for (std::size_t i = 0; i < a.buffers.size(); ++i)
+        require(same_address(a.buffers[i], b.buffers[i]), "arena sweep changed full use/address/extent/generation");
+}
+void bind_fixture_arena(Fixture& fixture) {
+    const auto base = allocate_aligned(fixture.owner->scratch_bytes,
+        fixture.compiled.arena.total_bytes, fixture.compiled.arena.alignment);
+    fixture.owner->scratch = {fixture.compiled.execution_identity, base, fixture.compiled.arena.total_bytes, 3};
+}
+strix::CompiledSerialExecution parallel_arena_compiled() {
+    const auto model = strix::ModelContract::qwen38_flash_next();
+    strix::ExecutionBindingRequest request; request.parallel_moe_router = true;
+    strix::ExecutionBufferRequest buffers; buffers.parallel_moe_router = true;
+    strix::kernels::KernelRegistry registry;
+    std::set<std::string> added;
+    for (const auto& step : strix::build_serial_decode_execution_plan(model).steps) {
+        const auto family = strix::operator_family_for(step.op);
+        if (!family) continue;
+        const auto shape = strix::execution_shape_for(model, step.op, request);
+        auto id = "arena.fixture." + std::to_string(static_cast<unsigned>(*family)) + "." +
+            std::to_string(shape.hidden_size) + "." + std::to_string(shape.auxiliary_size);
+        if (step.op == strix::SerialOp::moe_route) id += ".parallel";
+        if (!added.insert(id).second) continue;
+        strix::kernels::KernelVariant variant;
+        variant.id = id; variant.family = *family; variant.phase = strix::kernels::ExecutionPhase::decode;
+        variant.shape = shape; variant.resources.workgroup_threads = 32;
+        variant.numerics = {"bf16", "fp32", "bf16", true, true};
+        variant.qualification = strix::kernels::QualificationStatus::oracle_matched;
+        variant.graph_safe = true; variant.input_layout = "rows"; variant.output_layout = "rows";
+        variant.compiler_identity = "synthetic-host"; registry.add(variant);
+    }
+    return strix::compile_serial_execution(model, registry, request, buffers);
+}
+void arena_parity_sweeps() {
+    for (const bool parallel : {false, true}) {
+        Fixture fixture;
+        if (parallel) { fixture.compiled = parallel_arena_compiled(); bind_fixture_arena(fixture); }
+        strix::PreparedEagerExecution prepared(fixture.compiled, fixture.owner->resources, fixture.request, fixture.owner);
+        ArenaTrace reference, candidate;
+        const auto a = strix::execute_compiled_serial_eager(fixture.compiled, fixture.owner->resources, fixture.request, reference);
+        const auto b = prepared.run(fixture.owner->resources, fixture.request, candidate);
+        require(reference.calls.size() == 438U && reference.buffers.size() == (parallel ? 1643U : 1595U),
+                "canonical arena sweep did not visit every declared IO entry");
+        require(reference.prepared_path == false && candidate.prepared_path == true,
+                "arena sweep did not exercise both legacy and indexed resolvers");
+        same_arena_trace(reference, candidate);
+        require(a.state.generations == b.state.generations && same_span(a.completion_order, b.completion_order),
+                "arena indexing changed state or completion order");
+        const auto stable_order = b.completion_order.data();
+        // Caller-owned arena metadata is independent of the immutable prepared snapshot.
+        ++fixture.compiled.arena.allocations.front().offset;
+        auto next = fixture.request; ++next.position; next.state = b.state;
+        ArenaTrace repeated;
+        const auto c = prepared.run(fixture.owner->resources, next, repeated);
+        same_arena_trace(candidate, repeated);
+        require(c.completion_order.data() == stable_order, "caller arena mutation invalidated prepared order span");
+    }
+}
+void arena_fork_join() {
+    Fixture fixture;
+    const auto fork = strix::prepare_moe_fork_join_arena(fixture.compiled, std::numeric_limits<std::uint64_t>::max());
+    fixture.compiled = fork.rebind_execution(fixture.compiled); bind_fixture_arena(fixture);
+    strix::PreparedEagerExecution prepared(fixture.compiled, fixture.owner->resources, fixture.request, fixture.owner);
+    ArenaTrace reference, candidate; reference.fork = &fork; candidate.fork = &fork;
+    static_cast<void>(strix::execute_compiled_serial_eager(fixture.compiled, fixture.owner->resources, fixture.request, reference));
+    static_cast<void>(prepared.run(fixture.owner->resources, fixture.request, candidate));
+    same_arena_trace(reference, candidate);
+    require(fork.layers().size() > 1U, "fork arena fixture lacks inter-layer reuse");
+    const auto first = fork.resolve(fixture.owner->scratch, fork.layers()[0].shared_output);
+    const auto second = fork.resolve(fixture.owner->scratch, fork.layers()[1].shared_output);
+    require(first.use != second.use && first.address == second.address &&
+            first.address == fixture.owner->scratch.arena_base + fork.serial_arena_bytes(),
+            "shared outputs did not preserve distinct logical generations at the reusable join region");
+}
+void arena_context_rejections() {
+    Fixture fixture;
+    strix::PreparedEagerExecution a(fixture.compiled, fixture.owner->resources, fixture.request, fixture.owner);
+    strix::PreparedEagerExecution b(fixture.compiled, fixture.owner->resources, fixture.request, fixture.owner);
+    ArenaTrace at, bt;
+    static_cast<void>(a.run(fixture.owner->resources, fixture.request, at));
+    static_cast<void>(b.run(fixture.owner->resources, fixture.request, bt));
+    const auto found = std::find_if(at.calls.begin(), at.calls.end(), [](const auto& c) { return !c.reads.empty(); });
+    require(found != at.calls.end(), "arena fixture has no read context");
+    const auto good = *found;
+    const auto resolve = [&](const auto& c) { return strix::resolve_dispatch_read(c, 0); };
+    const auto reject = [&](const auto& c, const char* message) {
+        arena_rejects<std::invalid_argument>([&] { static_cast<void>(resolve(c)); }, message);
+    };
+    auto bad = good; bad.execution_identity = 0; reject(bad, "execution identity");
+    bad = good; ++bad.execution_identity; reject(bad, "execution identity");
+    bad = good; bad.arena = &fixture.compiled.arena; reject(bad, "arena handle");
+    bad = good; bad.arena = bt.calls[good.step_id].arena; reject(bad, "arena handle");
+    bad = bt.calls[good.step_id]; bad.arena = good.arena; reject(bad, "arena handle");
+    bad = good; bad.step_id = static_cast<std::uint32_t>(at.calls.size());
+    arena_rejects<std::out_of_range>([&] { static_cast<void>(resolve(bad)); }, "step");
+    bad = good; bad.step_id = good.step_id == 0U ? 1U : 0U; reject(bad, "dispatch step");
+    bad = good; bad.op = good.op == strix::SerialOp::lm_head ? strix::SerialOp::position_prepare : strix::SerialOp::lm_head;
+    reject(bad, "dispatch step");
+    bad = good; bad.layer = good.layer.value_or(0U) + 1U; reject(bad, "dispatch step");
+    // Equal copied spans must remain legal; pointer equality is not the contract.
+    std::vector<strix::ExecutionBufferUse> reads(good.reads.begin(), good.reads.end());
+    bad = good; bad.reads = reads;
+    require(same_address(resolve(good), resolve(bad)), "equal copied IO span was rejected");
+    for (unsigned mutation = 0; mutation < 3U; ++mutation) {
+        reads.assign(good.reads.begin(), good.reads.end());
+        if (mutation == 0U) ++reads[0].generation;
+        if (mutation == 1U) ++reads[0].buffer.slot;
+        if (mutation == 2U) reads[0].buffer.buffer_class = reads[0].buffer.buffer_class == strix::ExecutionBufferClass::logits ?
+            strix::ExecutionBufferClass::hidden : strix::ExecutionBufferClass::logits;
+        bad = good; bad.reads = reads; reject(bad, "buffer generation");
+    }
+    reads.assign(good.reads.begin(), good.reads.end()); reads.push_back(reads.front());
+    bad = good; bad.reads = reads; reject(bad, "IO sizes");
+    bad = good; bad.writes = {}; // This read-bearing step also writes an output.
+    require(!good.writes.empty(), "read context selected for missing-span test has no write");
+    reject(bad, "IO sizes");
+    arena_rejects<std::out_of_range>([&] { static_cast<void>(strix::resolve_dispatch_read(good, good.reads.size())); }, "read index");
+    arena_rejects<std::out_of_range>([&] { static_cast<void>(good.prepared_arena_views->resolve(good,
+        strix::PreparedBufferKind::read, good.reads.size(), fixture.owner->scratch)); }, "buffer index");
+    arena_rejects<std::invalid_argument>([&] { static_cast<void>(good.prepared_arena_views->resolve(good,
+        static_cast<strix::PreparedBufferKind>(999), 0, fixture.owner->scratch)); }, "buffer kind");
+}
+void arena_current_memory_and_fault_order() {
+    Fixture fixture;
+    strix::PreparedEagerExecution prepared(fixture.compiled, fixture.owner->resources, fixture.request, fixture.owner);
+    ArenaTrace trace; static_cast<void>(prepared.run(fixture.owner->resources, fixture.request, trace));
+    const auto found = std::find_if(trace.calls.begin(), trace.calls.end(), [](const auto& c) { return !c.reads.empty(); });
+    require(found != trace.calls.end(), "current-binding fixture has no read");
+    const auto good = *found;
+    std::vector<std::byte> alternative_storage;
+    auto alternative = fixture.owner->scratch;
+    alternative.arena_base = allocate_aligned(alternative_storage, alternative.arena_bytes, fixture.compiled.arena.alignment);
+    ++alternative.allocation_generation;
+    auto context = good; context.memory = &alternative;
+    const auto expected = strix::resolve_dispatch_read(good, 0);
+    require(same_address(strix::resolve_dispatch_read(context, 0), expected), "context.memory displaced resources scratch priority");
+    auto resources = fixture.owner->resources; resources.scratch = &alternative; context.resources = &resources;
+    const auto relocated = strix::resolve_dispatch_read(context, 0);
+    require(relocated.address - alternative.arena_base == expected.address - fixture.owner->scratch.arena_base &&
+            relocated.allocation_generation == alternative.allocation_generation,
+            "standalone arena resolver cached a physical address or generation");
+    // These are standalone metadata resolver probes, not admission of rebound prepared runs.
+    for (unsigned fault = 0; fault < 5U; ++fault) {
+        auto broken = alternative;
+        if (fault == 0U) broken.arena_base = 0;
+        if (fault == 1U) --broken.arena_bytes;
+        if (fault == 2U) broken.allocation_generation = 0;
+        if (fault == 3U) broken.arena_base = std::numeric_limits<std::uintptr_t>::max();
+        if (fault == 4U) ++broken.execution_identity;
+        resources.scratch = &broken;
+        if (fault == 3U) arena_rejects<std::overflow_error>([&] {
+            static_cast<void>(strix::resolve_dispatch_read(context, 0)); }, "address range overflows");
+        else arena_rejects<std::invalid_argument>([&] {
+            static_cast<void>(strix::resolve_dispatch_read(context, 0)); }, fault == 0U ? "null arena base" :
+                fault == 1U ? "smaller than compiled" : fault == 2U ? "generation must be non-zero" : "binding identity");
+        // A valid span/arena enters the cache. Binding validation precedes its context checks.
+        auto wrong_context = context; wrong_context.execution_identity = 0;
+        if (fault == 3U) arena_rejects<std::overflow_error>([&] {
+            static_cast<void>(strix::resolve_dispatch_read(wrong_context, 0)); }, "address range overflows");
+        else arena_rejects<std::invalid_argument>([&] {
+            static_cast<void>(strix::resolve_dispatch_read(wrong_context, 0)); }, fault == 0U ? "null arena base" :
+                fault == 1U ? "smaller than compiled" : fault == 2U ? "generation must be non-zero" : "binding identity");
+    }
+}
+void arena_admission_before_ple() {
+    PleFixture fixture;
+    strix::PreparedEagerExecution prepared(fixture.compiled, fixture.owner->resources, fixture.request, fixture.owner);
+    std::vector<std::byte> other_storage;
+    const auto other_base = allocate_aligned(other_storage, fixture.owner->scratch.arena_bytes, fixture.compiled.arena.alignment);
+    auto accepted = initial_session(fixture, prepared);
+    PleTrace initial_dispatch(fixture.owner->ple_backend);
+    static_cast<void>(strix::execute_prepared_serial_token(prepared, accepted,
+        fixture.owner->resources, 3U, initial_dispatch));
+    for (unsigned fault = 0; fault < 3U; ++fault) {
+        auto session = accepted; const auto before = session;
+        auto memory = fixture.owner->scratch;
+        if (fault == 0U) --memory.arena_bytes;
+        if (fault == 1U) memory.arena_base = other_base;
+        if (fault == 2U) ++memory.allocation_generation;
+        auto resources = fixture.owner->resources; resources.scratch = &memory;
+        fixture.owner->ple_backend.clear_counts(); ArenaTrace unused;
+        require(rejects([&] { static_cast<void>(strix::execute_prepared_serial_token(prepared, session, resources, 3U, unused)); }) &&
+                unused.calls.empty() && fixture.owner->ple_backend.start_calls == 0U &&
+                !fixture.owner->ple_prefetch.active, "changed scratch reached PLE or dispatch before admission");
+        same_session(session, before);
+    }
+}
+void arena_preparation_rejections() {
+    Fixture fixture;
+    for (unsigned fault = 0; fault < 6U; ++fault) {
+        auto broken = fixture.compiled;
+        if (fault == 0U) broken.arena.allocations.push_back(broken.arena.allocations.front());
+        if (fault == 1U) broken.arena.allocations.front().offset = broken.arena.total_bytes + 1U;
+        if (fault == 2U) { broken.arena.allocations.front().offset = broken.arena.total_bytes;
+                          broken.arena.allocations.front().bytes = 1U; }
+        if (fault == 3U) ++broken.io.steps.front().step_id;
+        if (fault == 4U) broken.io.steps.front().op = strix::SerialOp::lm_head;
+        if (fault == 5U) {
+            // A7 validates even allocations not referenced by any dispatch IO.
+            auto unused = broken.arena.allocations.front();
+            unused.use.generation = std::numeric_limits<std::uint64_t>::max();
+            unused.offset = broken.arena.total_bytes + 1U;
+            broken.arena.allocations.push_back(unused);
+        }
+        const auto* gate = fault == 0U ? "duplicate allocation uses" :
+            (fault == 3U || fault == 4U) ? "execution IO identity" : "allocation exceeds compiled arena";
+        arena_rejects<std::invalid_argument>([&] { strix::PreparedEagerExecution rejected(broken,
+                    fixture.owner->resources, fixture.request, fixture.owner); }, gate);
+    }
+}
+void arena_state_only_and_lifetime() {
+    Fixture fixture;
+    std::weak_ptr<Storage> weak = fixture.owner;
+    auto* storage = fixture.owner.get();
+    {
+        strix::PreparedEagerExecution prepared(fixture.compiled, storage->resources, fixture.request, fixture.owner);
+        fixture.owner.reset();
+        require(!weak.expired(), "prepared arena did not retain actual allocation owner");
+        const std::uint32_t* order = nullptr;
+        for (std::uint32_t i = 0; i < 3U; ++i) {
+            auto request = fixture.request; request.position += i; request.input_token_id += i;
+            ArenaTrace baseline, candidate;
+            const auto reference = strix::execute_compiled_serial_eager(fixture.compiled, storage->resources, request, baseline);
+            const auto result = prepared.run(storage->resources, request, candidate);
+            same_arena_trace(baseline, candidate);
+            require(reference.state.generations == result.state.generations && reference.state.valid == result.state.valid,
+                    "repeated arena run changed published state");
+            if (!order) order = result.completion_order.data();
+            require(order == result.completion_order.data(), "arena owner retention changed immutable result span");
+        }
+        ArenaTrace forwarded;
+        strix::GenerationOutputDispatcher wrapper(forwarded, prepared.compiled());
+        {
+            strix::GenerationOutputDispatcher::StateOnlyScope scope(wrapper);
+            static_cast<void>(prepared.run(storage->resources, fixture.request, wrapper));
+        }
+        require(wrapper.omitted_heads() == 1U && forwarded.calls.size() + 1U == prepared.compiled().execution.steps.size() &&
+                forwarded.prepared_path == true && forwarded.calls.back().step_id + 2U == prepared.compiled().execution.steps.size(),
+                "state-only prefix lost the cache or omitted more than its terminal head");
+        auto session = strix::SerialSessionContext{};
+        session.execution_identity = prepared.compiled().execution_identity;
+        session.state_layout_identity = storage->layout.layout_identity;
+        session.runtime_compatibility_identity = prepared.compatibility_identity(); session.state = fixture.request.state;
+        auto baseline_session = session;
+        for (const auto token : {3U, 4U}) {
+            ArenaTrace dispatched, baseline_dispatch;
+            const auto reference = strix::execute_serial_token(fixture.compiled, baseline_session,
+                storage->resources, token, baseline_dispatch);
+            const auto result = strix::execute_prepared_serial_token(prepared, session, storage->resources, token, dispatched);
+            same_arena_trace(baseline_dispatch, dispatched); same_session(baseline_session, session);
+            require(result.state.generations == reference.state.generations &&
+                    dispatched.prepared_path == true && result.completion_order.data() == order &&
+                    dispatched.calls.size() == 438U, "session wrapper lost indexed arena or immutable order");
+        }
+    }
+    require(weak.expired(), "prepared arena view leaked its retained allocation owner");
+}
+
 } // namespace
 
 int main() try {
@@ -813,9 +1123,15 @@ int main() try {
                   !std::is_move_constructible_v<strix::PreparedEagerExecution>);
     static_assert(std::is_same_v<decltype(std::declval<const strix::PreparedEagerExecution&>().compiled()),
                                  const strix::CompiledSerialExecution&>);
+    static_assert(!std::is_copy_constructible_v<strix::PreparedArenaViews> &&
+                  !std::is_move_constructible_v<strix::PreparedArenaViews> &&
+                  !std::is_constructible_v<strix::PreparedArenaViews, const strix::CompiledSerialExecution&>);
     equivalence(); dispatch_failure(); dynamic_rejection(); preparation_rejection(); retained_owner(); session_adapter();
     public_run_admission(); ple_between_call_rejection(); ple_preflight_guards();
     ple_failure_boundaries(); ple_single_admission_and_lifetime();
+    arena_parity_sweeps(); arena_fork_join(); arena_context_rejections();
+    arena_current_memory_and_fault_order(); arena_admission_before_ple();
+    arena_preparation_rejections(); arena_state_only_and_lifetime();
     std::cout << "prepared eager host contract fixtures passed; no native work\n";
     return 0;
 } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }

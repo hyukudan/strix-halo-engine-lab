@@ -25,6 +25,14 @@ handles are also checked at lookup. Launcher-specific shape/numerical checks and
 remaining operator-local tensor selection are unchanged. Dynamic admission is
 still linear in model metadata and is not claimed to meet every hot-path goal.
 
+Prepared scratch lookups use a private per-step allocation-index table over
+that same owned compiled snapshot. The table stores logical allocation indices,
+with full buffer class, slot and generation checks; it stores no device addresses
+or physical generations. Each resolution still validates the current memory
+binding and address bounds. Another arena handle, a changed dispatch step or a
+mismatched use is rejected. Preparation rejects duplicate uses and invalid
+allocation extents. The ordinary eager resolver is unchanged.
+
 The prepared session adapter preserves the existing session's readiness, PLE
 prefetch, before-commit hook, poison/taint boundary, state generations, lineage
 and consumed-position publication. The decoder pins the real experiment owner,
@@ -38,8 +46,8 @@ slice. RAW/reference execution retains complete arrays. The kernel bundle and
 automatic profile admission are unchanged; the submission mode is separately
 identified and has no inherited native qualification.
 
-Status: source implementation, compilation/tests/measurements deferred. Source
-fixtures compare dispatch order and state generations with the original executor
-and exercise invalid requests, stale resource generations and failures. Native
-model/state equality, transactional failure injection, performance and full
-prepared-operator coverage are still required. No speedup is established.
+The allocation-index extension has source fixtures; its review, build, native
+and model checks are pending. Fixtures compare complete resolved views, dispatch
+order and state generations with the ordinary executor, including invalid
+contexts, current physical bindings and fork/join aliases. No speedup is
+established by the source change.

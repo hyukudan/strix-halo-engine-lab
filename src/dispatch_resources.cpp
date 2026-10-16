@@ -1,5 +1,6 @@
 #include "strix/dispatch_resources.hpp"
 #include "strix/prepared_tensor_views.hpp"
+#include "strix/prepared_arena_views.hpp"
 
 #include <stdexcept>
 
@@ -90,6 +91,8 @@ ExecutionBufferAddress resolve_dispatch_read(
 
     const auto& memory =
         scratch_memory(context);
+    if (context.prepared_arena_views)
+        return context.prepared_arena_views->resolve(context, PreparedBufferKind::read, index, memory);
     return resolve_execution_buffer(
         memory.execution_identity,
         *context.arena,
@@ -111,6 +114,8 @@ ExecutionBufferAddress resolve_dispatch_write(
 
     const auto& memory =
         scratch_memory(context);
+    if (context.prepared_arena_views)
+        return context.prepared_arena_views->resolve(context, PreparedBufferKind::write, index, memory);
     return resolve_execution_buffer(
         memory.execution_identity,
         *context.arena,
@@ -133,6 +138,8 @@ ExecutionBufferAddress resolve_dispatch_temporary(
 
     const auto& memory =
         scratch_memory(context);
+    if (context.prepared_arena_views)
+        return context.prepared_arena_views->resolve(context, PreparedBufferKind::temporary, index, memory);
     return resolve_execution_buffer(
         memory.execution_identity,
         *context.arena,

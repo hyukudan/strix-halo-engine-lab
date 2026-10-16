@@ -44,6 +44,7 @@ add_library(strix_core STATIC
     src/moe_fork_join_arena.cpp
     src/prepared_execution.cpp
     src/prepared_tensor_views.cpp
+    src/prepared_arena_views.cpp
     src/prepared_serial_session.cpp
     src/execution_telemetry.cpp
     src/qsa_input_prefetch.cpp

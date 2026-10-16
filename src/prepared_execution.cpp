@@ -1,5 +1,6 @@
 #include "strix/prepared_execution.hpp"
 #include "strix/prepared_tensor_views.hpp"
+#include "strix/prepared_arena_views.hpp"
 
 #include <array>
 #include <limits>
@@ -32,6 +33,7 @@ struct PreparedEagerExecution::Impl {
     const CompiledSerialExecution compiled;
     const std::shared_ptr<const void> actual_owner;
     std::unique_ptr<const PreparedTensorViews> tensor_views;
+    std::unique_ptr<const PreparedArenaViews> arena_views;
     RuntimeExecutionIdentities identities;
     SerialSessionStateLayout state_layout;
     std::array<std::uint64_t, 6> write_counts{};
@@ -65,6 +67,7 @@ struct PreparedEagerExecution::Impl {
                 if (has_state(step.writes_state, state_flags[index])) ++write_counts[index];
         }
         validate_request(resources, prototype);
+        arena_views = std::unique_ptr<const PreparedArenaViews>(new PreparedArenaViews(compiled));
     }
 
     void validate_request(const ExecutionRuntimeResources& resources, const EagerExecutionRequest& request) const {
@@ -127,6 +130,7 @@ struct PreparedEagerExecution::Impl {
             context.session_state_memory = resources.session_state_memory;
             context.resources = &resources;
             context.prepared_tensor_views = tensor_views.get();
+            context.prepared_arena_views = arena_views.get();
             context.reads_state = step.reads_state;
             context.writes_state = step.writes_state;
             context.logical_rows = request.logical_rows;

@@ -4,6 +4,7 @@
 #include <array>
 #include <iostream>
 #include <stdexcept>
+#include <string>
 
 namespace {
 
@@ -14,6 +15,47 @@ void expect(bool condition, const char* message) {
         std::cerr << "FAIL: " << message << '\n';
         ++failures;
     }
+}
+
+// Keep the unprepared resolver's historical self-identity and binding priority.
+// Synthetic addresses are inspected only; no memory is dereferenced.
+void unprepared_arena_fallback_contract() {
+    const strix::ExecutionBufferUse use{{strix::ExecutionBufferClass::hidden, 0}, 1};
+    const std::array reads{use};
+    strix::ExecutionArenaPlan arena;
+    arena.alignment = 256; arena.total_bytes = 256;
+    arena.allocations.push_back({use, 0, 0, 32, 64});
+    strix::ExecutionMemoryBinding primary{0x101U, 0x80000000U, 256, 2};
+    strix::ExecutionMemoryBinding alternate{0x202U, 0x81000000U, 256, 3};
+    strix::ExecutionRuntimeResources resources; resources.scratch = &primary;
+    strix::ExecutionDispatchContext context;
+    expect(context.execution_identity == 0U && context.prepared_arena_views == nullptr,
+           "unprepared dispatch defaults preserve zero identity and absent arena cache");
+    context.arena = &arena; context.reads = reads; context.memory = &alternate; context.resources = &resources;
+    const auto first = strix::resolve_dispatch_read(context, 0);
+    expect(first.address == primary.arena_base + 32U && first.allocation_generation == 2U,
+           "unprepared resources scratch retains priority over context memory");
+    resources.scratch = nullptr;
+    const auto fallback = strix::resolve_dispatch_read(context, 0);
+    expect(fallback.address == alternate.arena_base + 32U && fallback.allocation_generation == 3U,
+           "unprepared fallback accepts current memory self-identity despite zero context identity");
+    context.resources = nullptr;
+    expect(strix::resolve_dispatch_read(context, 0).address == fallback.address,
+           "unprepared memory fallback does not require runtime resources");
+    context.arena = nullptr;
+    bool null_first = false;
+    try { static_cast<void>(strix::resolve_dispatch_read(context, 99)); }
+    catch (const std::invalid_argument& error) {
+        null_first = std::string(error.what()).find("no arena plan") != std::string::npos;
+    }
+    expect(null_first, "null arena rejection precedes span bounds in unchanged fallback");
+    context.arena = &arena; context.memory = nullptr;
+    bool bounds_first = false;
+    try { static_cast<void>(strix::resolve_dispatch_read(context, 99)); }
+    catch (const std::out_of_range& error) {
+        bounds_first = std::string(error.what()).find("read index") != std::string::npos;
+    }
+    expect(bounds_first, "span bounds rejection precedes absent scratch in unchanged fallback");
 }
 
 }  // namespace
@@ -303,6 +345,8 @@ int main() {
     }
     expect(model_rejected,
            "dispatch tensor resolver requires model weights");
+
+    unprepared_arena_fallback_contract();
 
     if (failures == 0) {
         std::cout << "dispatch resource tests passed\n";

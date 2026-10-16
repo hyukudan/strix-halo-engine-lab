@@ -19,6 +19,7 @@
 namespace strix {
 
 class PreparedTensorViews;
+class PreparedArenaViews;
 
 struct ExecutionDispatchContext {
     // Zero denotes an uncompiled execution and cannot use a compiled launcher.
@@ -38,6 +39,8 @@ struct ExecutionDispatchContext {
     // Published only after the immutable prepared plan admits this run. The
     // launcher borrows this snapshot; caller retains it through quiescence.
     const PreparedTensorViews* prepared_tensor_views = nullptr;
+    // Same immutable snapshot and retain-through-quiescence rule as above.
+    const PreparedArenaViews* prepared_arena_views = nullptr;
     PersistentState reads_state = PersistentState::none;
     PersistentState writes_state = PersistentState::none;
     std::uint32_t logical_rows = 1;
