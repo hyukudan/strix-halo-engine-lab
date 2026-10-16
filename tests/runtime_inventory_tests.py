@@ -126,6 +126,53 @@ class InventoryTests(unittest.TestCase):
                           if value is not None}, modes)
         self.assertIsNone(result["reported_opt_in_overlays"]["qsa_hierarchical_selection"])
 
+    def test_new_runtime_consumers_are_reported_without_combination_qualification(self):
+        overlays = {"known_prefix_window": True, "known_prefix_expert_union_requested": True,
+                    "prompt_lookup": True, "serving_prefix_cache_requested": True,
+                    "known_prefix_output_policy": "state-only", "gdn_recurrent_storage": "value-key",
+                    "gdn_recurrent_layout": ".lds33-v1", "requested_logprobs_scope": "full-vocabulary",
+                    "ple_row_cache_requested_rows": 64, "ple_cpu_helper_budget_requested": 2,
+                    "offline_tuning_cache_sha256": "a" * 64,
+                    "prompt_lookup_adaptive": {"enabled": True, "completed_cycles": 9},
+                    "device_queue_trace": {"profiling_only": True, "kernel_busy_ns": None}}
+        for field, declaration in overlays.items():
+            receipt = self.receipt(True, "qualified-checkpoint")
+            receipt[field] = declaration
+            result = self.collect(cache_path=self.cache(a8="ON"), receipt_path=self.evidence("new-overlay.json", receipt))
+            with self.subTest(field=field):
+                self.assertTrue(result["consistent"])
+                self.assertEqual(result["profile_overlay_qualification"], "not_assessed")
+                expected = declaration if not isinstance(declaration, dict) else True
+                self.assertEqual(result["reported_opt_in_overlays"][field], expected)
+                self.assertIsNone(result["native_tests_executed"])
+
+    def test_new_overlay_neutral_null_and_malformed_declarations(self):
+        neutral = {"known_prefix_window": False, "known_prefix_expert_union_requested": False,
+                   "prompt_lookup": False, "serving_prefix_cache_requested": False,
+                   "gdn_recurrent_storage": "key-value", "ple_row_cache_requested_rows": 0,
+                   "ple_cpu_helper_budget_requested": 0, "prompt_lookup_adaptive": {"enabled": False},
+                   "device_queue_trace": {"profiling_only": False}}
+        result = self.collect(receipt_path=self.evidence("neutral-new.json", neutral))
+        self.assertIsNone(result["profile_overlay_qualification"])
+        for field in neutral:
+            self.assertIs(result["reported_opt_in_overlays"][field], False)
+        for field in ("known_prefix_window", "known_prefix_expert_union_requested", "prompt_lookup",
+                      "serving_prefix_cache_requested", "known_prefix_output_policy", "gdn_recurrent_storage",
+                      "ple_row_cache_requested_rows", "ple_cpu_helper_budget_requested", "offline_tuning_cache_sha256",
+                      "prompt_lookup_adaptive", "device_queue_trace"):
+            unknown = self.collect(receipt_path=self.evidence("unknown-new.json", {field: None}))
+            self.assertIsNone(unknown["reported_opt_in_overlays"][field])
+            self.assertIsNone(unknown["profile_overlay_qualification"])
+        bad = [{"known_prefix_window": 1}, {"known_prefix_expert_union_requested": "true"},
+               {"serving_prefix_cache_requested": {}}, {"known_prefix_output_policy": "partial"},
+               {"gdn_recurrent_storage": "transposed"}, {"ple_row_cache_requested_rows": True},
+               {"ple_cpu_helper_budget_requested": 9}, {"offline_tuning_cache_sha256": "short"},
+               {"prompt_lookup_adaptive": True}, {"prompt_lookup_adaptive": {"enabled": 1}},
+               {"device_queue_trace": {"profiling_only": "true"}}]
+        for declaration in bad:
+            with self.subTest(declaration=declaration), self.assertRaises(ValueError):
+                self.collect(receipt_path=self.evidence("invalid-new.json", declaration))
+
     def test_overlay_absence_false_unknown_and_invalid_types(self):
         inactive = {key: False for key in ("batched_moe_activation", "prefetch_q8_lm_head",
                                           "wave8_q8_lm_head", "wave8_q8_gdn_input",

@@ -225,16 +225,45 @@ def profile(receipt):
 def reported_opt_in_overlays(receipt):
     # Receipt declarations, not inferred qualification of the combined recipe.
     values = {}
-    for key in ("eager_submission_mode", "moe_shared_overlap_mode", "generation_output_mode"):
+    for key in ("eager_submission_mode", "moe_shared_overlap_mode", "generation_output_mode",
+                "gdn_recurrent_layout", "requested_logprobs_scope"):
         value = receipt.get(key)
         if value is not None and (not isinstance(value, str) or not value):
             raise ValueError(f"{key} must be a nonempty string or null")
         values[key] = value
     for key in ("batched_moe_activation", "prefetch_q8_lm_head", "wave8_q8_lm_head", "wave8_q8_gdn_input",
-                "wave8_q8_gdn_output", "wave8_q8_qsa_output", "prefetch_hc_projection_next_tile", "q51_slot_parallel_down", "qsa_hierarchical_selection"):
+                "wave8_q8_gdn_output", "wave8_q8_qsa_output", "prefetch_hc_projection_next_tile", "q51_slot_parallel_down", "qsa_hierarchical_selection",
+                "known_prefix_window", "known_prefix_expert_union_requested", "prompt_lookup", "serving_prefix_cache_requested"):
         value = receipt.get(key)
         if value is not None:
             boolean(value, key)
+        values[key] = value
+    policy = receipt.get("known_prefix_output_policy")
+    if policy is not None and policy not in ("all-rows", "terminal-row", "state-only"):
+        raise ValueError("unknown known-prefix output policy")
+    values["known_prefix_output_policy"] = policy
+    storage = receipt.get("gdn_recurrent_storage")
+    if storage is not None and storage not in ("key-value", "value-key"):
+        raise ValueError("unknown GDN recurrent storage")
+    # A serving receipt explicitly emits key-value even for the baseline.
+    # Preserve its absence as unknown; neutral declarations are not opt-ins.
+    values["gdn_recurrent_storage"] = False if storage == "key-value" else storage
+    for key in ("ple_row_cache_requested_rows", "ple_cpu_helper_budget_requested"):
+        value = receipt.get(key)
+        if value is not None:
+            integer(value, key)
+            if key == "ple_cpu_helper_budget_requested" and value > 8:
+                raise ValueError("PLE CPU helper budget exceeds the declared bound")
+        values[key] = (value if value else False) if value is not None else None
+    digest = receipt.get("offline_tuning_cache_sha256")
+    values["offline_tuning_cache_sha256"] = hex_identity(digest, "tuning payload") if digest is not None else None
+    for key, flag in (("prompt_lookup_adaptive", "enabled"), ("device_queue_trace", "profiling_only")):
+        value = receipt.get(key)
+        if value is not None:
+            if not isinstance(value, dict) or flag not in value:
+                raise ValueError(f"{key} must contain its typed {flag} declaration")
+            boolean(value[flag], key + "." + flag)
+            value = value[flag]
         values[key] = value
     return values
 
