@@ -31,7 +31,8 @@ struct PreparedEagerExecutionResult {
 // PLE backend internal state and PleLookupPrefetchState may evolve as prescribed
 // by their protocol; implementation_identity() must remain invariant. Other
 // mutation inside that window is outside this contract and need not be detected.
-// Changes between calls are checked by each entry's full dynamic admission.
+// Changes between calls are checked against deep metadata and binding
+// snapshots on each entry, without rebuilding the model's runtime hashes.
 // A returned dispatch is not a completion fence; the session owner remains
 // responsible for drain, commit and failure poisoning.
 class PreparedEagerExecution final {

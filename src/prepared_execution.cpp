@@ -36,6 +36,10 @@ struct PreparedEagerExecution::Impl {
     std::unique_ptr<const PreparedArenaViews> arena_views;
     RuntimeExecutionIdentities identities;
     SerialSessionStateLayout state_layout;
+    ExecutionMemoryBinding scratch_binding;
+    SessionStateMemoryBinding state_binding;
+    std::uint64_t ple_backend_identity = 0;
+    std::uint64_t ple_contract_identity = 0;
     std::array<std::uint64_t, 6> write_counts{};
     PersistentState required_state = PersistentState::none;
     std::vector<std::uint32_t> order;
@@ -58,6 +62,10 @@ struct PreparedEagerExecution::Impl {
             compiled.execution, *resources.model_manifest, *resources.model_weights,
             *resources.tensor_access, actual_owner);
         state_layout = *resources.session_state_layout;
+        scratch_binding = *resources.scratch;
+        state_binding = *resources.session_state_memory;
+        ple_backend_identity = resources.ple_lookup ? resources.ple_lookup->implementation_identity() : 0;
+        ple_contract_identity = resources.ple_hash_contract ? ple_hash_contract_identity(*resources.ple_hash_contract) : 0;
         order.reserve(compiled.execution.steps.size());
         for (const auto& step : compiled.execution.steps) {
             if (!ple_step && step.op == SerialOp::ple) ple_step = step.id;
@@ -96,11 +104,33 @@ struct PreparedEagerExecution::Impl {
     }
 
     void validate_dynamic(const ExecutionRuntimeResources& resources, const EagerExecutionRequest& request) const {
-        // The identity builder retains dynamic model/scratch/state/PLE checks,
-        // including every weight allocation generation. Relocation needs a new
-        // prepared object even if logical compatibility happens to be unchanged.
-        const auto current = build_runtime_execution_identities(compiled.execution_identity, compiled.arena, resources);
-        if (current.compatibility_identity != identities.compatibility_identity || current.binding_identity != identities.binding_identity ||
+        if (!resources.scratch || !resources.model_manifest || !resources.model_weights ||
+            !resources.tensor_access || !resources.session_state_layout || !resources.session_state_memory)
+            throw std::invalid_argument("compiled execution requires complete runtime resources");
+        // Preserve dynamic bounds diagnostics without revalidating and hashing
+        // every weight a second time. Full structural equality below includes
+        // every source field and allocation generation, even unhashed metadata.
+        validate_execution_memory_binding(compiled.execution_identity, compiled.arena, *resources.scratch);
+        validate_session_state_memory_binding(*resources.session_state_layout, *resources.session_state_memory);
+        if ((resources.ple_hash_contract || resources.ple_prefetch) && !resources.ple_lookup)
+            throw std::invalid_argument("PLE prefetch resources require lookup backend");
+        const auto backend = resources.ple_lookup ? resources.ple_lookup->implementation_identity() : 0;
+        const auto contract = resources.ple_hash_contract ? ple_hash_contract_identity(*resources.ple_hash_contract) : 0;
+        if (resources.ple_lookup && !backend)
+            throw std::invalid_argument("PLE lookup backend identity must be non-zero");
+        if (resources.ple_hash_contract && !contract)
+            throw std::invalid_argument("PLE hash contract identity must be non-zero");
+        const auto& scratch = *resources.scratch;
+        const auto& state = *resources.session_state_memory;
+        if (scratch.execution_identity != scratch_binding.execution_identity ||
+            scratch.arena_base != scratch_binding.arena_base || scratch.arena_bytes != scratch_binding.arena_bytes ||
+            scratch.allocation_generation != scratch_binding.allocation_generation ||
+            state.layout_identity != state_binding.layout_identity || state.device_base != state_binding.device_base ||
+            state.device_bytes != state_binding.device_bytes ||
+            state.device_allocation_generation != state_binding.device_allocation_generation ||
+            state.host_base != state_binding.host_base || state.host_bytes != state_binding.host_bytes ||
+            state.host_allocation_generation != state_binding.host_allocation_generation ||
+            backend != ple_backend_identity || contract != ple_contract_identity ||
             !same_layout(state_layout, *resources.session_state_layout))
             throw std::invalid_argument("prepared eager runtime bindings or state layout changed");
         tensor_views->validate_source_metadata(*resources.model_manifest, *resources.model_weights,

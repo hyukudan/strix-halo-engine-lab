@@ -609,6 +609,7 @@ void ple_between_call_rejection() {
     const auto layout = data.layout;
     const auto state = data.state;
     const auto resources = data.resources;
+    const auto contract = data.ple_contract;
     auto alternate_manifest = manifest;
     auto alternate_weights = weights;
     auto alternate_access = access;
@@ -624,12 +625,18 @@ void ple_between_call_rejection() {
         {"same-handle access tensor index", [&] { ++data.access.accesses.front().tensor_indices.front(); }},
         {"weight generation", [&] { ++data.weights.tensors.front().allocation_generation; }},
         {"weight relocation", [&] { ++data.weights.tensors.front().address; }},
+        {"weight extent", [&] { ++data.weights.tensors.front().bytes; }},
+        {"model content identity", [&] { data.weights.model_content_identity.bytes.front() ^= 1U; }},
         {"scratch generation", [&] { ++data.scratch.allocation_generation; }},
         {"scratch relocation", [&] { data.scratch.arena_base += fixture.compiled.arena.alignment; }},
+        {"scratch extent", [&] { ++data.scratch.arena_bytes; }},
         {"device state generation", [&] { ++data.state.device_allocation_generation; }},
         {"host state generation", [&] { ++data.state.host_allocation_generation; }},
         {"device state relocation", [&] { data.state.device_base += data.layout.device_alignment; }},
         {"host state relocation", [&] { data.state.host_base += data.layout.host_alignment; }},
+        {"device state extent", [&] { ++data.state.device_bytes; }},
+        {"host state extent", [&] { ++data.state.host_bytes; }},
+        {"PLE hash multiplier", [&] { ++data.ple_contract.multipliers.front(); }},
         {"state layout allocation offset", [&] { data.layout.allocations.front().offset += data.layout.device_alignment; }},
         {"equal manifest at another descriptor handle", [&] { data.resources.model_manifest = &alternate_manifest; }},
         {"equal weights at another descriptor handle", [&] { data.resources.model_weights = &alternate_weights; }},
@@ -651,7 +658,7 @@ void ple_between_call_rejection() {
                 public_rejected.trace.calls.empty() && data.ple_backend.start_calls == starts,
                 "public run admitted a between-call mutation");
         data.manifest = manifest; data.weights = weights; data.access = access; data.scratch = scratch;
-        data.layout = layout; data.state = state; data.resources = resources;
+        data.layout = layout; data.state = state; data.resources = resources; data.ple_contract = contract;
         PleTrace recovery(data.ple_backend);
         static_cast<void>(strix::execute_prepared_serial_token(prepared, session, data.resources, 3U, recovery));
         require(session.next_position == before.next_position + 1U &&
