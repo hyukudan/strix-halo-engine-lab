@@ -36,3 +36,27 @@ Optional closed R2/R4/R8 target verification requires `--mtp-target-window-rows 
 Reservations cover declared requested payloads, including target D1 capture/shadow requirements. Window total includes the window arena/completion record plus checkpoint/capture payloads. They exclude opaque driver bookkeeping and container capacity overhead, and do not assert physical RAM fit. Snapshot tails follow their declared logical policy. Receipt fields describe actual operations from a completed invocation, separate declared-policy replay activation from hardware/performance qualification, and label cycle-only host wall timing. Source implementation alone establishes no native or model validation result.
 
 The verification receipt follows actual window attempts. A configured owner with zero attempts reports `serial-target-fallback` and separately records its requested rows/configuration. Pair-entry dispatch counts explicitly exclude wide R4/R8 dispatches; the wide count is `null` because the current verifier result does not expose it. No total is inferred from requested geometry. The base backing inventory keeps its original pre-optional-request boundary. A distinct `mtp_target_d1_inventory` describes the later actual target D1 presence as unaccounted storage, without inventing backing keys or adding it to the base allocation census.
+
+
+Optional `--mtp-window-expert-union --mtp-window-expert-union-bytes N` connects
+closed target verification to the existing routed-expert union. It requires a
+configured target window, resolved A8 gate/up, grouped Q5_1 down, slot-parallel
+down and deferred status. It does not select these prerequisites implicitly.
+The requested union must contain admitted routed steps; otherwise setup rejects
+it. Ordinary generation and serial MTP retain their existing behavior.
+
+The native union workspace is allocated once with its own lease and retained
+owner. Its actual size must fit the separate explicit union ceiling and the
+existing window arena ceiling, together with the arena and eight-byte completion
+record. The same charge is subtracted from the existing total window ceiling
+before admitting both capture pools and the rollback checkpoint. Declared
+ceilings are never enlarged. No union allocation occurs per cycle.
+
+Receipts report the compiled eligible step count, actual workspace size and
+generation, and the GPU-produced CSR summary from the last eligible layer of the
+last completed target window. This includes provisionally completed windows that
+were subsequently restored. That summary is not an aggregate reuse, traffic or
+performance measurement. Checkpoint fixtures additionally expose actual union
+and variant dispatch counts and require a nonzero union witness when requested.
+Independent replay, complete state restoration and full-cycle cache comparisons
+remain mandatory; this integration does not qualify speed or arbitrary models.

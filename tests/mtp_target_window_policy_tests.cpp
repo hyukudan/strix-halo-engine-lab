@@ -1,4 +1,5 @@
 #include "strix/mtp_target_window_policy.hpp"
+#include "../apps/mtp_window_memory_reservation.hpp"
 
 #include <array>
 #include <iostream>
@@ -19,6 +20,27 @@ template<class Work> void invalid(Work&& work,const char* message) {
 } // namespace
 int main() {
     using namespace strix;
+    {
+        const auto plain = decode_cli::reserve_mtp_window_memory(1024, 1032, 4096);
+        expect(plain.retained_window_bytes == 1032 && plain.verifier_budget_bytes == 3064,
+            "ordinary MTP windows retain their exact arena and D1 charge");
+        const auto united = decode_cli::reserve_mtp_window_memory(1024, 1288, 4096, 256, 512);
+        expect(united.retained_window_bytes == 1288 && united.verifier_budget_bytes == 2808,
+            "actual union scratch, not its ceiling, reduces the remaining verifier budget");
+        invalid([] { (void)decode_cli::reserve_mtp_window_memory(1024, 1287, 4096, 256, 512); },
+            "union storage cannot escape the explicit arena budget");
+        invalid([] { (void)decode_cli::reserve_mtp_window_memory(1024, 1288, 1288, 256, 512); },
+            "capture/checkpoint must have a nonempty remaining total reservation");
+        invalid([] { (void)decode_cli::reserve_mtp_window_memory(1024, 4096, 8192, 256, 255); },
+            "actual union storage cannot escape its independent ceiling");
+        invalid([] { (void)decode_cli::reserve_mtp_window_memory(1, 100000, 200000, 65537, 100000); },
+            "known native owner maximum union allocation is checked before construction");
+        invalid([] { (void)decode_cli::reserve_mtp_window_memory(0, 4096, 8192); }, "empty arena rejected");
+        invalid([] { (void)decode_cli::reserve_mtp_window_memory(UINT64_MAX - 7U, UINT64_MAX, UINT64_MAX); },
+            "D1 addition cannot wrap");
+        invalid([] { (void)decode_cli::reserve_mtp_window_memory(UINT64_MAX - 8U, UINT64_MAX, UINT64_MAX, 1, 1); },
+            "union addition cannot wrap after D1 charge");
+    }
     constexpr auto none=std::numeric_limits<std::uint32_t>::max();
     const std::array<std::uint32_t,2> eos={62,63};
     for(const std::uint32_t rows:{2U,4U,8U}) {

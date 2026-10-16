@@ -2004,24 +2004,37 @@ int STRIX_DECODE_ENTRY(
             // It retains all serial parents and its separate D1/arena ownership.
             make_window = [&, parents](std::shared_ptr<strix::HipMtpTargetHidden> target) {
                 const auto plan = strix::compile_known_prefix_window(model, compiled, manifest, tensor_access,
-                    {true, true, true, options.mtp.window_rows, false, strix::KnownWindowOutputPolicy::all_rows});
-                if (!strix::known_window_has_promoted_steps(plan) || plan.arena.physical.total_bytes > options.mtp.window_arena_bytes ||
-                    plan.arena.physical.total_bytes > UINT64_MAX - 8U)
-                    throw std::invalid_argument("MTP actual closed target arena exceeds its explicit payload budget");
-                const auto requested_arena = plan.arena.physical.total_bytes + 8U;
-                if (requested_arena > options.mtp.window_arena_bytes || requested_arena >= options.mtp.window_total_bytes)
-                    throw std::invalid_argument("MTP target window arena/completion record exceeds total retained payload budget");
+                    {true, true, true, options.mtp.window_rows, options.mtp.window_expert_union, strix::KnownWindowOutputPolicy::all_rows});
+                if (!strix::known_window_has_promoted_steps(plan) ||
+                    (options.mtp.window_expert_union && !plan.routed_expert_union_steps))
+                    throw std::invalid_argument("MTP target window has no admitted requested operators");
+                std::uint64_t union_bytes = 0;
+                if (options.mtp.window_expert_union) {
+                    if (model.num_experts > UINT32_MAX || model.num_experts_per_token > UINT32_MAX)
+                        throw std::invalid_argument("MTP window expert union geometry exceeds uint32");
+                    union_bytes = strix::q51_known_rows::required_scratch_bytes(options.mtp.window_rows,
+                        static_cast<std::uint32_t>(model.num_experts), static_cast<std::uint32_t>(model.num_experts_per_token));
+                    if (!union_bytes) throw std::logic_error("MTP expert union has no required scratch");
+                }
+                const auto reservation = strix::decode_cli::reserve_mtp_window_memory(plan.arena.physical.total_bytes,
+                    options.mtp.window_arena_bytes, options.mtp.window_total_bytes, union_bytes, options.mtp.window_expert_union_bytes);
                 auto window_memory = std::make_shared<KnownPromptMemory>(plan, generations.next(), generations.next(),
-                    std::static_pointer_cast<const void>(parents), original_work_device);
+                    std::static_pointer_cast<const void>(parents), original_work_device, 0, 0,
+                    union_bytes, union_bytes ? generations.next() : 0);
                 auto window_owner = std::make_shared<strix::HipKnownPrefixWindow>(plan, compiled, model, catalog_config,
-                    parents->resources, window_memory->scratch, window_memory->scope, std::static_pointer_cast<const void>(window_memory));
+                    parents->resources, window_memory->scratch, window_memory->scope, std::static_pointer_cast<const void>(window_memory),
+                    union_bytes ? strix::q51_known_rows::Workspace{window_memory->union_scratch,
+                        std::static_pointer_cast<const void>(window_memory)} : strix::q51_known_rows::Workspace{});
                 strix::HipMtpWindowVerificationPolicy policy;
                 policy.bounded_window_rollback = true;
                 policy.capture = {options.mtp.window_capture_bytes, options.mtp.window_history_intervals};
                 policy.checkpoint_retained_byte_budget = options.mtp.window_checkpoint_bytes;
-                policy.total_retained_byte_budget = options.mtp.window_total_bytes - requested_arena;
-                return std::make_shared<strix::HipMtpWindowVerifier>(std::move(target), std::move(window_owner),
+                policy.total_retained_byte_budget = reservation.verifier_budget_bytes;
+                auto verifier = std::make_shared<strix::HipMtpWindowVerifier>(std::move(target), std::move(window_owner),
                     parents->resources, parents, policy, generations);
+                parents->window_setup = {plan.routed_expert_union_steps, union_bytes,
+                    window_memory->union_scratch.allocation_generation, reservation.retained_window_bytes};
+                return verifier;
             };
         }
         setup_phase.reset();

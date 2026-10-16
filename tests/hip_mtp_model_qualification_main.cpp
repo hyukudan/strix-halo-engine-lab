@@ -202,7 +202,7 @@ void run_mtp_model_qualification(decode_cli::MtpDecodeQualificationContext& c){
         auto window=c.window->window_owner();c.window.reset();
         const auto receipt=qualify_hip_mtp_target_window_checkpoint(c.target,window,c.session,c.parents->resources,c.parents,
             g.window.chunks.front().inputs,{c.options.mtp.window_capture_bytes,c.options.mtp.window_history_intervals},
-            c.options.mtp.window_checkpoint_bytes,request.host_bytes,c.generations);
+            c.options.mtp.window_checkpoint_bytes,request.host_bytes,c.generations,c.options.mtp.window_expert_union);
         require(receipt.full_device_bytes_restored && receipt.full_host_bytes_restored && receipt.deferred_status_restored && receipt.exact_session_metadata_restored,
             "checkpoint fixture did not confirm every restoration component");
         checkpoint_observation=receipt;break;
@@ -218,6 +218,14 @@ void run_mtp_model_qualification(decode_cli::MtpDecodeQualificationContext& c){
             <<",\"chunk_begin\":"<<observed.chunk_begin<<",\"chunk_end\":"<<observed.chunk_end
             <<",\"r2_dispatches\":"<<observed.r2_dispatches
             <<",\"projection_launches_saved\":"<<observed.projection_launches_saved
+            <<",\"routed_expert_union_required\":"<<(observed.routed_union_required?"true":"false")
+            <<",\"routed_expert_union_dispatches\":"<<observed.routed_expert_union_dispatches
+            <<",\"r2_variant_dispatches\":[";
+        for(std::size_t i=0;i<observed.r2_variant_dispatches.size();++i)
+            std::cout<<(i?",":"")<<observed.r2_variant_dispatches[i];
+        std::cout<<"],\"routed_expert_union_latest_observation\":";
+        decode_cli::write_mtp_union_observation(std::cout,observed.routed_union_observation);
+        std::cout
             <<",\"device_bytes_checked\":"<<observed.device_bytes_checked<<",\"host_bytes_checked\":"<<observed.host_bytes_checked
             <<",\"deferred_bytes_checked\":"<<observed.deferred_bytes_checked
             <<",\"checkpoint_reserved_bytes\":"<<observed.checkpoint_reserved_bytes

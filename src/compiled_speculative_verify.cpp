@@ -3,6 +3,7 @@
 #include "strix/qsa_input_prefetch.hpp"
 #include "strix/shared_expert_prefetch.hpp"
 #include "strix/moe_q4k_a8_runtime.hpp"
+#include "strix/gguf_reader.hpp"
 
 #include <algorithm>
 #include <array>
@@ -489,7 +490,10 @@ bool window_routed_union_types(const ModelManifest& manifest, const ExecutionTen
         window_require(tensor.dimensions==std::vector<std::uint64_t>{width,outputs,512ULL},
             "known window routed expert shape differs from canonical operands");
         if(tensor.ggml_type!=(down?7U:12U)) {eligible=false;continue;}
-        const auto bytes=down?(width/32ULL*22ULL*outputs*512ULL):(width/256ULL*144ULL*outputs*512ULL);
+        const auto geometry=gguf::tensor_type_geometry(tensor.ggml_type);
+        window_require(geometry && geometry->block_elements && width%geometry->block_elements==0,
+            "known window routed expert block geometry is invalid");
+        const auto bytes=width/geometry->block_elements*geometry->block_bytes*outputs*512ULL;
         window_require(tensor.byte_size==bytes && tensor.absolute_offset%16U==0 &&
             bytes<=std::numeric_limits<std::uint64_t>::max()-tensor.absolute_offset,
             "known window routed expert extent/alignment is invalid");

@@ -20,7 +20,8 @@ bool same(const SerialSessionContext& a,const SerialSessionContext& b) {
 HipMtpTargetCheckpointComponentReceipt qualify_hip_mtp_target_window_checkpoint(
     std::shared_ptr<HipMtpTargetHidden> target,std::shared_ptr<HipKnownPrefixWindow> window,SerialSessionContext& session,
     const ExecutionRuntimeResources& resources,std::shared_ptr<const void> actual_owner,std::span<const std::uint32_t> inputs,
-    HipMtpTargetWindowCapturePolicy capture_policy,std::uint64_t checkpoint_budget,std::uint64_t readback_budget,AllocationGenerationSource& generations) {
+    HipMtpTargetWindowCapturePolicy capture_policy,std::uint64_t checkpoint_budget,std::uint64_t readback_budget,AllocationGenerationSource& generations,
+    bool require_routed_union) {
     require(target && window && actual_owner && resources.session_state_layout &&
         resources.session_state_memory==&target->memory_owner()->state() && inputs.size()==window->logical_rows(),
         "MTP checkpoint component fixture needs actual target/window resources");
@@ -69,6 +70,41 @@ HipMtpTargetCheckpointComponentReceipt qualify_hip_mtp_target_window_checkpoint(
         receipt.window_execution_identity=execution.batch.window_execution_identity();
         receipt.window_kernel_plan_identity=execution.batch.window_kernel_plan_identity();
         receipt.chunk_begin=execution.batch.chunk_begin();receipt.chunk_end=execution.batch.chunk_end();
+        receipt.routed_expert_union_dispatches=execution.execution.routed_expert_union_dispatches;
+        receipt.r2_variant_dispatches=execution.execution.r2_variant_dispatches;
+        receipt.routed_union_required=require_routed_union;
+        const auto union_variant=receipt.logical_rows==2U?KnownWindowR2Variant::routed_q51_union_rows2_v1:
+            receipt.logical_rows==4U?KnownWindowR2Variant::routed_q51_union_rows4_v1:KnownWindowR2Variant::routed_q51_union_rows8_v1;
+        std::uint64_t all_union_variants=0;
+        for(const auto variant:{KnownWindowR2Variant::routed_q51_union_rows2_v1,
+            KnownWindowR2Variant::routed_q51_union_rows4_v1,KnownWindowR2Variant::routed_q51_union_rows8_v1})
+            all_union_variants+=receipt.r2_variant_dispatches[static_cast<std::uint32_t>(variant)];
+        require(all_union_variants==receipt.routed_expert_union_dispatches &&
+            receipt.r2_variant_dispatches[static_cast<std::uint32_t>(union_variant)]==all_union_variants &&
+            receipt.routed_expert_union_dispatches<=execution.execution.execution.completed_steps &&
+            (!require_routed_union||receipt.routed_expert_union_dispatches>0U),
+            "checkpoint fixture did not execute the requested actual routed union variant");
+        if(receipt.routed_expert_union_dispatches) {
+            receipt.routed_union_observation=window->latest_routed_union_observation();
+            require(receipt.routed_union_observation.has_value(),
+                "completed routed union has no actual last-group observation");
+            const auto& observed=*receipt.routed_union_observation;const auto& group=observed.group;
+            const auto& model=target->model();
+            require(receipt.logical_rows && model.num_experts_per_token &&
+                model.num_experts_per_token<=UINT32_MAX/receipt.logical_rows,
+                "checkpoint routed union assignment bound overflows");
+            const auto assignments=static_cast<std::uint64_t>(receipt.logical_rows)*model.num_experts_per_token;
+            require(observed.first_position==receipt.chunk_begin && observed.layer<model.hidden_layers &&
+                assignments<=UINT32_MAX && group.status==0U && group.version==1U &&
+                group.logical_rows==receipt.logical_rows && group.assignments==assignments &&
+                group.touched>0U && group.touched<=model.num_experts && group.touched<=assignments &&
+                group.batches>=group.touched && group.batches<=assignments &&
+                group.maximum_assignments>0U && group.maximum_assignments<=assignments &&
+                group.duplicate_assignments<=assignments,
+                "checkpoint routed union observation is not this completed bounded last group");
+            // HipKnownPrefixWindow::complete already validated every histogram
+            // and reserved word before publishing this host-owned summary.
+        }
         require(receipt.logical_rows==inputs.size() && receipt.chunk_begin==recorded.next_position &&
             receipt.chunk_end>=receipt.chunk_begin && receipt.chunk_end-receipt.chunk_begin==receipt.logical_rows,
             "checkpoint observation does not bind the actual completed input chunk");

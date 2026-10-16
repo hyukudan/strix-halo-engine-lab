@@ -2,6 +2,7 @@
 #include "hip_decode_experiment.hpp"
 #include "hip_decode_options.hpp"
 #include "hip_decode_receipt_json.hpp"
+#include "mtp_window_memory_reservation.hpp"
 #include "strix/hip_mtp_asset_loader.hpp"
 #include "strix/hip_launcher_catalog.hpp"
 #include "strix/hip_mtp_forward_replay.hpp"
@@ -17,6 +18,7 @@
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 #include <chrono>
@@ -38,6 +40,12 @@ struct MtpDecodeTargetParents final {
     PleHashContract hash;
     PleLookupPrefetchState prefetch;
     ExecutionRuntimeResources resources;
+    struct WindowSetupReceipt {
+        std::uint64_t union_source_steps = 0;
+        std::uint64_t union_reserved_bytes = 0;
+        std::uint64_t union_generation = 0;
+        std::uint64_t retained_window_bytes = 0;
+    } window_setup;
     MtpDecodeTargetParents(std::shared_ptr<HipDecodeExperimentResources> actual,
         std::shared_ptr<HipLauncherCatalog> launchers,std::shared_ptr<PleLookupBackend> lookup,const PleHashContract& contract)
         :experiment(std::move(actual)),catalog(std::move(launchers)),ple(std::move(lookup)),hash(contract) {
@@ -48,6 +56,22 @@ struct MtpDecodeTargetParents final {
     MtpDecodeTargetParents(const MtpDecodeTargetParents&)=delete;
     MtpDecodeTargetParents& operator=(const MtpDecodeTargetParents&)=delete;
 };
+inline void write_mtp_union_observation(std::ostream& output,
+    const std::optional<HipKnownPrefixUnionObservation>& observed) {
+    if (!observed) { output << "null"; return; }
+    const auto& group = observed->group;
+    output << "{\"scope\":\"last-completed-window-last-eligible-layer-including-restored-windows-not-aggregate-reuse-or-traffic\","
+        << "\"first_position\":" << observed->first_position << ",\"layer\":" << observed->layer
+        << ",\"logical_rows\":" << group.logical_rows << ",\"status\":" << group.status
+        << ",\"version\":" << group.version << ",\"assignments\":" << group.assignments
+        << ",\"touched\":" << group.touched << ",\"batches\":" << group.batches
+        << ",\"duplicate_assignments\":" << group.duplicate_assignments
+        << ",\"maximum_assignments\":" << group.maximum_assignments << ",\"rows_per_expert_histogram\":[";
+    for (unsigned i = 0; i < 8U; ++i) output << (i ? "," : "") << group.rows_per_expert_histogram[i];
+    output << "],\"batch_size_histogram\":[";
+    for (unsigned i = 0; i < 8U; ++i) output << (i ? "," : "") << group.batch_size_histogram[i];
+    output << "]}";
+}
 inline ModelContentIdentity mtp_cli_digest(std::string_view text) {
     if(!mtp_sha256_text(text))throw std::invalid_argument("MTP SHA256 pin is invalid");
     const auto digit=[](char ch)->unsigned {if(ch>='0'&&ch<='9')return static_cast<unsigned>(ch-'0');
@@ -246,13 +270,28 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
         if(generated.back()==eos.front())stop="eos";
         assets->validate_assets_unchanged();
         const auto native_stats=runtime->execution_stats();
+        std::optional<HipKnownPrefixUnionObservation> union_observation;
+        if(window)union_observation=window->window_owner()->latest_routed_union_observation();
+        if(m.window_expert_union && window_attempts &&
+            (!parents->window_setup.union_source_steps || !union_observation))
+            throw std::logic_error("MTP expert union completed no actual native group for an attempted window");
+        std::ostringstream union_receipt;
+        union_receipt << "  \"mtp_window_expert_union_requested\":" << (m.window_expert_union ? "true" : "false")
+            << ",\n  \"mtp_window_expert_union_source_steps\":" << parents->window_setup.union_source_steps
+            << ",\n  \"mtp_window_expert_union_workspace_budget_bytes\":" << m.window_expert_union_bytes
+            << ",\n  \"mtp_window_expert_union_workspace_reserved_bytes\":" << parents->window_setup.union_reserved_bytes
+            << ",\n  \"mtp_window_expert_union_workspace_generation\":" << parents->window_setup.union_generation
+            << ",\n  \"mtp_window_arena_completion_union_retained_bytes\":" << parents->window_setup.retained_window_bytes
+            << ",\n  \"mtp_window_expert_union_latest_observation\":";
+        write_mtp_union_observation(union_receipt, union_observation);
+        union_receipt << ",\n";
         const auto mtp_d1_inventory=options.execution_inventory
             ? std::string("  \"mtp_target_d1_inventory\":{\"boundary\":\"after-mtp-target-setup-and-request-completion\",\"present\":")+
                 (deferred_status?"true":"false")+",\"storage\":\""+(deferred_status?"unaccounted":"absent")+
                 "\",\"included_in_base_runtime_backing_inventory\":false,\"physical_fit\":null,"
                 "\"scope\":\"actual-target-private-D1-record-and-host-shadow-presence-not-allocation-census\"},\n"
             : std::string{};
-        output<<"{\n"<<(completion_receipt?completion_receipt():std::string{})<<mtp_d1_inventory<<"  \"mode\":\"native-mtp-independent-replay-then-target-verified-greedy\",\n"
+        output<<"{\n"<<(completion_receipt?completion_receipt():std::string{})<<mtp_d1_inventory<<union_receipt.str()<<"  \"mode\":\"native-mtp-independent-replay-then-target-verified-greedy\",\n"
             <<"  \"mtp_native_hardware_qualified\":false,\n  \"mtp_performance_qualified\":false,\n"
             <<"  \"optimization_profile_selected\":\""<<decode_receipt::escape_json_string(resolved_profile)<<"\",\n"
             <<"  \"mtp_target_verification\":\""<<mtp_target_verification_name(window_attempts)<<"\",\n"

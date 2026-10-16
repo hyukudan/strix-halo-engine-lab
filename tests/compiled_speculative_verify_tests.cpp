@@ -169,7 +169,7 @@ KnownFixture make_known_fixture(const strix::ModelContract& model, std::uint32_t
             std::uint64_t elements = 1;
             for (const auto extent : value.dimensions) elements *= extent;
             value.byte_size = type == 8 ? value.dimensions[0] / 32U * 34U * value.dimensions[1] :
-                type==12U ? elements/256U*144U : type==7U ? elements/32U*22U : elements * 4U;
+                type==12U ? elements/256U*144U : type==7U ? elements/32U*24U : elements * 4U;
             offset += (value.byte_size + 255U) / 256U * 256U;
             tensors.tensor_indices.push_back(static_cast<std::uint32_t>(fixture.manifest.tensors.size()));
             fixture.manifest.tensors.push_back(std::move(value));
@@ -1128,6 +1128,17 @@ void known_window_routed_union_compiler_tests(const strix::ModelContract& model)
         const auto reject=[&](auto&& operation,const char* message) {
             bool rejected=false;try{operation();}catch(const std::invalid_argument&){rejected=true;}expect(rejected,message);
         };
+        auto short_down=fixture;
+        auto down=std::find_if(short_down.manifest.tensors.begin(),short_down.manifest.tensors.end(),
+            [](const auto& t){return t.name=="blk.0.ffn_down_exps.weight";});
+        expect(down!=short_down.manifest.tensors.end() && down->ggml_type==7U && down->byte_size==629145600ULL,
+            "Q5_1 fixture has 24-byte blocks for the actual 640x2560x512 tensor geometry");
+        if(down!=short_down.manifest.tensors.end()) {
+            down->byte_size=576716800ULL; // Q5_0's 22-byte blocks must never admit a Q5_1 tensor.
+            reject([&]{(void)strix::compile_known_prefix_window(model,short_down.serial,short_down.manifest,
+                short_down.access,{false,false,false,rows,true});},
+                "Q5_1 union rejects the formerly accepted Q5_0-sized extent before dispatch");
+        }
         auto changed=on;++changed.routed_expert_union_steps;
         reject([&]{strix::validate_compiled_known_prefix_window(changed,fixture.serial);},"forged union counter rejects");
         changed=on;changed.r2_variant[first]=V::shared_q8_virtual256_r2_v1;

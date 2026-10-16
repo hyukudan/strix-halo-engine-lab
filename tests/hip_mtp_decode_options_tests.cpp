@@ -36,6 +36,10 @@ void set(std::vector<std::string>& values,const std::string& key,const std::stri
 void reject(const std::vector<std::string>& args,const char* message){
     bool failed=false;try{(void)parse(args);}catch(const std::exception&){failed=true;}require(failed,message);
 }
+void reject_as(const std::vector<std::string>& args,const char* expected,const char* message){
+    bool failed=false;try{(void)parse(args);}catch(const std::invalid_argument& error){failed=std::string(error.what())==expected;}
+    require(failed,message);
+}
 }
 int main(){try{
     const auto legacy=parse({"decoder","target.gguf","1"});
@@ -122,5 +126,76 @@ int main(){try{
     selected.deferred_moe_status=selected.virtual_q8_gdn_input=selected.prefetch_q8_gdn_input=selected.virtual_q8_gdn_output=
         selected.wave8_q8_gdn_input=selected.wave8_q8_gdn_output=true;
     strix::decode_cli::validate_resolved_mtp_cli(selected);
+    // The union is a separate opt-in target-window consumer, never an implicit
+    // prerequisite-completing optimization or a known-prefix alias.
+    require(!legacy.mtp.window_expert_union && !legacy.mtp.window_expert_union_bytes_explicit &&
+        legacy.mtp.window_expert_union_bytes==0 && !good.mtp.window_expert_union,
+        "legacy and ordinary MTP requests do not acquire union workspace");
+    auto union_request=wide;
+    union_request.insert(union_request.end(),{"--mtp-window-expert-union","--mtp-window-expert-union-bytes","512"});
+    for(const auto rows:{2U,4U,8U}) {
+        auto args=union_request;
+        set(args,"--mtp-target-window-rows",std::to_string(rows));
+        set(args,"--mtp-candidate-depth",std::to_string(rows-1U));
+        auto options=parse(args);
+        require(options.mtp.window_expert_union && options.mtp.window_expert_union_bytes_explicit &&
+            options.mtp.window_expert_union_bytes==512 && options.mtp.window_rows==rows &&
+            !options.any_low_level_flag && !options.known_prefix_expert_union &&
+            !options.q4k_a8g32_gate_up && !options.grouped_exact_q51_down && !options.q51_slot_parallel_down &&
+            !options.deferred_moe_status,
+            "real parser preserves explicit union budget and leaves all execution prerequisites unchanged");
+        options.context_tokens=8192;
+        options.deferred_moe_status=options.virtual_q8_gdn_input=options.prefetch_q8_gdn_input=
+            options.virtual_q8_gdn_output=options.wave8_q8_gdn_input=options.wave8_q8_gdn_output=true;
+        bool missing_prerequisites=false;
+        try{strix::decode_cli::validate_resolved_mtp_cli(options);}catch(const std::invalid_argument& e){
+            missing_prerequisites=std::string(e.what())==
+                "MTP window expert union requires resolved A8, grouped Q5_1, slot-parallel down and D1";
+        }
+        require(missing_prerequisites,"resolved union rejects absent A8/grouped/slot prerequisites specifically");
+        options.q4k_a8g32_gate_up=options.grouped_exact_q51_down=options.q51_slot_parallel_down=true;
+        strix::decode_cli::validate_resolved_mtp_cli(options);
+        for(unsigned fault=0;fault<4U;++fault) {
+            auto bad=options;
+            if(fault==0U)bad.q4k_a8g32_gate_up=false;
+            if(fault==1U)bad.grouped_exact_q51_down=false;
+            if(fault==2U)bad.q51_slot_parallel_down=false;
+            if(fault==3U)bad.deferred_moe_status=false;
+            bool rejected=false;
+            try{strix::decode_cli::validate_resolved_mtp_cli(bad);}catch(const std::invalid_argument&){rejected=true;}
+            require(rejected,"each missing execution prerequisite rejects without completing or disabling flags");
+        }
+    }
+    auto equals_budget=wide;
+    equals_budget.insert(equals_budget.end(),{"--mtp-window-expert-union","--mtp-window-expert-union-bytes=1024"});
+    require(parse(equals_budget).mtp.window_expert_union_bytes==1024,
+        "explicit union budget accepts equals syntax and inclusive existing arena ceiling");
+    auto no_budget=wide;no_budget.push_back("--mtp-window-expert-union");
+    reject_as(no_budget,"MTP window expert union requires an actual target window and a positive explicit budget within arena and total window budgets","union flag requires an explicit positive budget");
+    auto no_flag=wide;no_flag.push_back("--mtp-window-expert-union-bytes=512");
+    reject_as(no_flag,"MTP window expert union requires an actual target window and a positive explicit budget within arena and total window budgets","unused union budget cannot silently select a consumer");
+    auto no_window=request();no_window.insert(no_window.end(),{"--mtp-window-expert-union","--mtp-window-expert-union-bytes=512"});
+    reject_as(no_window,"MTP window expert union requires an actual target window and a positive explicit budget within arena and total window budgets","union requires an actual admitted target window");
+    auto no_mtp=union_request;
+    for(auto it=no_mtp.begin();it!=no_mtp.end();++it)if(*it=="--mtp"){no_mtp.erase(it);break;}
+    reject(no_mtp,"union parameters cannot silently enable MTP");
+    for(unsigned fault=0;fault<8U;++fault) {
+        auto bad=union_request;
+        if(fault==0U)set(bad,"--mtp-window-expert-union-bytes","0");
+        if(fault==1U)set(bad,"--mtp-window-expert-union-bytes","1025");
+        if(fault==2U)set(bad,"--mtp-window-total-bytes","256");
+        if(fault==3U)set(bad,"--mtp-window-expert-union-bytes","18446744073709551616");
+        if(fault==4U)bad.push_back("--mtp-window-expert-union");
+        if(fault==5U)bad.push_back("--mtp-window-expert-union-bytes=512");
+        if(fault==6U)bad.push_back("--mtp-window-expert-union=1");
+        if(fault==7U)bad.push_back("--mtp-window-expert-union-bytes");
+        reject(bad,"union zero/over-budget/overflow/duplicate/invalid flag/missing value rejects before setup");
+    }
+    auto metadata_union=metadata;
+    set(metadata_union,"--mtp-metadata-only","1");
+    metadata_union.insert(metadata_union.end(),{"--mtp-target-window-rows=2","--mtp-window-arena-bytes=1024",
+        "--mtp-window-capture-bytes=1024","--mtp-window-checkpoint-bytes=1024","--mtp-window-total-bytes=8192",
+        "--mtp-window-history-intervals=128","--mtp-window-expert-union","--mtp-window-expert-union-bytes=512"});
+    reject_as(metadata_union,"MTP window expert union requires an actual target window and a positive explicit budget within arena and total window budgets","metadata-only route cannot accept unused union workspace");
     return 0;
 }catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}

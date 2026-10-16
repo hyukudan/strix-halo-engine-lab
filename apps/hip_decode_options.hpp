@@ -107,6 +107,9 @@ struct MtpCliOptions {
     std::uint32_t candidate_depth=0,window_rows=0;
     std::uint64_t window_arena_bytes=0,window_capture_bytes=0,window_checkpoint_bytes=0,window_total_bytes=0,window_history_intervals=0;
     double max_hidden_error=0.0,max_logit_error=0.0;
+    bool window_expert_union=false;
+    std::uint64_t window_expert_union_bytes=0;
+    bool window_expert_union_bytes_explicit=false;
 };
 // This is execution evidence: a configured owner alone is not an attempted
 // native window (EOS, remaining budget/context and history can choose serial).
@@ -571,6 +574,11 @@ inline void validate_mtp_cli(const Options& o,bool resolved=false) {
     if(any_window && ((m.window_rows!=2U && m.window_rows!=4U && m.window_rows!=8U) || !m.window_arena_bytes ||
        !m.window_capture_bytes || !m.window_checkpoint_bytes || !m.window_total_bytes || !m.window_history_intervals))
         throw std::invalid_argument("MTP closed target windows require explicit rows2/4/8 and all five positive window budgets");
+    if((m.window_expert_union || m.window_expert_union_bytes_explicit || m.window_expert_union_bytes) &&
+       (!m.window_expert_union || !m.window_expert_union_bytes_explicit || !m.window_expert_union_bytes ||
+        !m.window_rows || m.metadata_only || m.window_expert_union_bytes>m.window_arena_bytes ||
+        m.window_expert_union_bytes>m.window_total_bytes))
+        throw std::invalid_argument("MTP window expert union requires an actual target window and a positive explicit budget within arena and total window budgets");
     if(m.window_rows && m.candidate_depth<m.window_rows-1U)
         throw std::invalid_argument("MTP target window requires candidate depth at least rows minus one");
     if(m.window_rows && (o.gdn_recurrent_layout!=HipGdnRecurrentLayout::baseline || o.gdn_recurrent_storage!=GdnRecurrentStorage::key_value ||
@@ -582,6 +590,9 @@ inline void validate_resolved_mtp_cli(const Options& o) {
     if(o.mtp.enabled && o.mtp.window_rows && (!o.deferred_moe_status || !o.virtual_q8_gdn_input || !o.prefetch_q8_gdn_input ||
        !o.virtual_q8_gdn_output || !o.wave8_q8_gdn_input || !o.wave8_q8_gdn_output))
         throw std::invalid_argument("MTP target windows require resolved D1 and explicit paired wave8 GDN configuration");
+    if(o.mtp.enabled && o.mtp.window_expert_union && (!o.q4k_a8g32_gate_up || !o.grouped_exact_q51_down ||
+       !o.q51_slot_parallel_down || !o.deferred_moe_status))
+        throw std::invalid_argument("MTP window expert union requires resolved A8, grouped Q5_1, slot-parallel down and D1");
 }
 
 inline Options parse_options(
@@ -590,7 +601,7 @@ inline Options parse_options(
     if (argc < 2) {
         throw std::invalid_argument(
             "usage: strix-hip-decode-token MODEL.gguf [TOKEN_ID ...] "
-            "[--mtp --mtp-sidecar FILE --mtp-sidecar-sha256 HEX --mtp-golden FILE --mtp-golden-sha256 HEX (explicit source/conversion/cast/budget options required)] "
+            "[--mtp --mtp-sidecar FILE --mtp-sidecar-sha256 HEX --mtp-golden FILE --mtp-golden-sha256 HEX [--mtp-window-expert-union --mtp-window-expert-union-bytes N] (explicit source/conversion/cast/budget options required)] "
             "[--optimization-profile auto|manual] [--execution-inventory] [--host-dispatch-telemetry] [--execution-telemetry-trace] [--device-queue-trace] "
             "[--gpu-greedy-token] [--logprob-token ID ...] [--offline-tuning-cache FILE [--offline-compile-provenance FILE]] [--gdn-recurrent-layout baseline|stride32|stride33|transposed] [--gdn-recurrent-storage key-value|value-key] [--known-prefix-window --known-prefix-rows 2|4|8 --known-prefix-expert-union] [--known-prefix-prefill-rows 16..2048 --known-prefix-workspace-budget-bytes N --known-prefix-host-metadata-budget-bytes N --known-prefix-uma-budget-bytes N --known-prefix-host-headroom-bytes N] [--prompt-lookup [--prompt-lookup-depth 0|1|2 | --prompt-lookup-adaptive] [--prompt-lookup-snapshot occupied-kv-v1 --prompt-lookup-snapshot-bytes N]] [--serve-prefix-u32le FILE ... --serve-concurrency 1|2|4 [--serve-tensor-cohort-rows 2|4 | --serve-prefill-rows 2|4|8|16..2048 --serve-prefill-workspace-budget-bytes N --serve-prefill-host-metadata-budget-bytes N] --serve-memory-budget-bytes N --serve-request-budget-bytes N --serve-headroom-bytes N] [--gdn-islands] [--qsa-hierarchical-selection] [--qsa-gqa-heads-per-block 1|2|4] [--prepared-eager] [--moe-shared-overlap [--moe-token-cost-policy]] [--moe-overlap-arena-budget-bytes N] [--batched-moe-activation] [--validation-final-state DIR] [--validation-final-state-max-bytes N] [--reference FILE] [--max-logit-error X] "
             "[--context N] [--residency register|copy] [--coalesce-gap BYTES] "
@@ -618,6 +629,12 @@ inline Options parse_options(
             if(options.mtp.enabled)throw std::invalid_argument("duplicate MTP route option");
             options.mtp.enabled=true;continue;
         }
+        if(argument=="--mtp-window-expert-union") {
+            if(!mtp_option_names.insert(std::string(argument)).second)throw std::invalid_argument("duplicate MTP option");
+            options.mtp.supplied=true;options.mtp.window_expert_union=true;continue;
+        }
+        if(argument.starts_with("--mtp-window-expert-union="))
+            throw std::invalid_argument("MTP window expert union is a flag without a value");
         if(argument.starts_with("--mtp-")) {
             const auto equal=argument.find('=');const auto key=argument.substr(0,equal);
             if(!mtp_option_names.insert(std::string(key)).second)throw std::invalid_argument("duplicate MTP option");
@@ -665,6 +682,7 @@ inline Options parse_options(
                 else if(key=="--mtp-window-checkpoint-bytes")m.window_checkpoint_bytes=n;
                 else if(key=="--mtp-window-total-bytes")m.window_total_bytes=n;
                 else if(key=="--mtp-window-history-intervals")m.window_history_intervals=n;
+                else if(key=="--mtp-window-expert-union-bytes"){m.window_expert_union_bytes=n;m.window_expert_union_bytes_explicit=true;}
                 else if(key=="--mtp-candidate-depth" || key=="--mtp-target-window-rows") {
                     if(n>UINT32_MAX)throw std::invalid_argument("MTP depth/rows exceeds uint32");
                     if(key=="--mtp-candidate-depth")m.candidate_depth=static_cast<std::uint32_t>(n);else m.window_rows=static_cast<std::uint32_t>(n);
