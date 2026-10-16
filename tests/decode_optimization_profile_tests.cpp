@@ -147,6 +147,15 @@ int main() {
     expect(!defaults.known_prefix_window, "known-prefix route stays opt-in");
     validate_resolved_known_prefix_window(defaults);
     expect(defaults.offline_tuning_cache_path.empty(), "offline persisted tuning stays opt-in");
+    const auto provenance = parse({"decoder", "m", "1", "--offline-tuning-cache", "cache.bin", "--offline-compile-provenance", "context.bin"});
+    expect(provenance.offline_compile_provenance_path == "context.bin" && !provenance.any_low_level_flag,
+        "explicit evaluated compile context is a prepare-only consumer input");
+    rejects([] { (void)parse({"decoder", "m", "1", "--offline-compile-provenance", "context.bin"}); },
+        "offline compile provenance requires --offline-tuning-cache");
+    rejects([] { (void)parse({"decoder", "m", "1", "--offline-compile-provenance"}); },
+        "offline compile provenance requires a file");
+    rejects([] { (void)parse({"decoder", "m", "1", "--offline-tuning-cache", "cache.bin", "--offline-compile-provenance", "a", "--offline-compile-provenance", "b"}); },
+        "duplicate offline compile provenance option");
     const auto persisted = parse({"decoder", "m", "1", "--offline-tuning-cache", "source-only-cache.bin"});
     expect(persisted.offline_tuning_cache_path == "source-only-cache.bin" && !persisted.any_low_level_flag,
         "persisted tuning does not silently alter base optimization profile");

@@ -180,6 +180,7 @@ struct Options {
     std::vector<std::uint32_t> logprob_token_ids;
     bool known_prefix_expert_union = false;
     std::string offline_tuning_cache_path;
+    std::string offline_compile_provenance_path;
     strix::KnownWindowOutputPolicy known_prefix_output_policy = strix::KnownWindowOutputPolicy::all_rows;
     bool known_prefix_output_policy_explicit = false;
     bool prompt_lookup_adaptive = false;
@@ -337,6 +338,8 @@ inline void validate_resolved_serving(const Options& options) {
     if ((options.ple_cache_rows_explicit || options.ple_cache_budget_explicit) &&
         (!options.ple_cache_rows_explicit || !options.ple_cache_budget_explicit))
         throw std::invalid_argument("PLE cache requires both positive explicit row and byte limits");
+    if (!options.offline_compile_provenance_path.empty() && options.offline_tuning_cache_path.empty())
+        throw std::invalid_argument("offline compile provenance requires --offline-tuning-cache");
     validate_serving_prefix_cache_limits(options);
     if (options.serving_prefix_files.empty()) return;
     if (!options.generate_tokens || !options.tokens.empty() || !options.deferred_moe_status ||
@@ -426,7 +429,7 @@ inline Options parse_options(
         throw std::invalid_argument(
             "usage: strix-hip-decode-token MODEL.gguf [TOKEN_ID ...] "
             "[--optimization-profile auto|manual] [--execution-inventory] [--host-dispatch-telemetry] [--execution-telemetry-trace] "
-            "[--gpu-greedy-token] [--logprob-token ID ...] [--offline-tuning-cache FILE] [--gdn-recurrent-layout baseline|stride32|stride33|transposed] [--gdn-recurrent-storage key-value|value-key] [--known-prefix-window --known-prefix-rows 2|4|8 --known-prefix-expert-union] [--prompt-lookup [--prompt-lookup-depth 0|1|2 | --prompt-lookup-adaptive]] [--serve-prefix-u32le FILE ... --serve-concurrency 1|2|4 --serve-memory-budget-bytes N --serve-request-budget-bytes N --serve-headroom-bytes N] [--gdn-islands] [--qsa-hierarchical-selection] [--qsa-gqa-heads-per-block 1|2|4] [--prepared-eager] [--moe-shared-overlap] [--moe-overlap-arena-budget-bytes N] [--batched-moe-activation] [--validation-final-state DIR] [--validation-final-state-max-bytes N] [--reference FILE] [--max-logit-error X] "
+            "[--gpu-greedy-token] [--logprob-token ID ...] [--offline-tuning-cache FILE [--offline-compile-provenance FILE]] [--gdn-recurrent-layout baseline|stride32|stride33|transposed] [--gdn-recurrent-storage key-value|value-key] [--known-prefix-window --known-prefix-rows 2|4|8 --known-prefix-expert-union] [--prompt-lookup [--prompt-lookup-depth 0|1|2 | --prompt-lookup-adaptive]] [--serve-prefix-u32le FILE ... --serve-concurrency 1|2|4 --serve-memory-budget-bytes N --serve-request-budget-bytes N --serve-headroom-bytes N] [--gdn-islands] [--qsa-hierarchical-selection] [--qsa-gqa-heads-per-block 1|2|4] [--prepared-eager] [--moe-shared-overlap] [--moe-overlap-arena-budget-bytes N] [--batched-moe-activation] [--validation-final-state DIR] [--validation-final-state-max-bytes N] [--reference FILE] [--max-logit-error X] "
             "[--context N] [--residency register|copy] [--coalesce-gap BYTES] "
             "[--planned-ple-io] [--ple-cpu-helper-threads 1..8] [--ple-cache-rows N --ple-cache-budget-bytes N] [--ple-max-rows-per-io N] [--ple-max-inflight-ios N] "
             "[--generate N] [--eos-token TOKEN_ID] [--prefix-cache-roundtrip] "
@@ -522,6 +525,12 @@ inline Options parse_options(
             if (value > 2) throw std::invalid_argument("prompt lookup depth must be zero, one or two");
             options.prompt_lookup_depth = static_cast<std::uint32_t>(value);
             options.prompt_lookup_depth_explicit = true;
+            continue;
+        }
+        if (argument == "--offline-compile-provenance") {
+            if (!options.offline_compile_provenance_path.empty()) throw std::invalid_argument("duplicate offline compile provenance option");
+            if (index + 1 >= argc || !*argv[index+1]) throw std::invalid_argument("offline compile provenance requires a file");
+            options.offline_compile_provenance_path = argv[++index];
             continue;
         }
         if (argument == "--offline-tuning-cache") {
@@ -1098,6 +1107,8 @@ inline Options parse_options(
     if ((options.ple_cache_rows_explicit || options.ple_cache_budget_explicit) &&
         (!options.ple_cache_rows_explicit || !options.ple_cache_budget_explicit))
         throw std::invalid_argument("PLE cache requires both positive explicit row and byte limits");
+    if (!options.offline_compile_provenance_path.empty() && options.offline_tuning_cache_path.empty())
+        throw std::invalid_argument("offline compile provenance requires --offline-tuning-cache");
     validate_serving_prefix_cache_limits(options);
     if (options.serving_prefix_files.empty() && (options.serving_concurrency_explicit || options.serving_memory_explicit ||
         options.serving_request_explicit || options.serving_headroom_explicit))

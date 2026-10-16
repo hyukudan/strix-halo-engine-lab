@@ -19,6 +19,7 @@
 #include "strix/generation_output.hpp"
 #include "strix/q51_known_rows.hpp"
 #include "strix/offline_tuning_preparation.hpp"
+#include "strix/offline_compile_provenance.hpp"
 #include "offline_tuning_build_context.hpp"
 #include "strix/hip_model_residency.hpp"
 #include "strix/hip_runtime_allocator.hpp"
@@ -938,6 +939,22 @@ int main(
     std::optional<strix::LoadedOfflineTuningCache> loaded_offline_tuning;
     if (!options.offline_tuning_cache_path.empty())
         loaded_offline_tuning.emplace(strix::load_offline_tuning_cache_file(options.offline_tuning_cache_path));
+    std::optional<strix::OfflineCompileProvenance> loaded_compile_provenance;
+    std::string provenance_executable_sha;
+    if (!options.offline_compile_provenance_path.empty()) {
+#if defined(__linux__)
+        std::error_code executable_error;
+        const auto executable = std::filesystem::canonical("/proc/self/exe", executable_error);
+        if (!executable_error && !executable.empty())
+            provenance_executable_sha = strix::model_content_identity_hex(strix::sha256_file_content("/proc/self/exe"));
+#endif
+        // All file/dependency reads are bounded setup work BEFORE GPU setup.
+        // A supplied but incomplete/stale description fails closed; absence
+        // leaves the previous unknown flags key and invalid_key fallback.
+        loaded_compile_provenance.emplace(strix::load_offline_compile_provenance(
+            options.offline_compile_provenance_path, provenance_executable_sha,
+            strix::decode_cli::offline_tuning_declared_build_context_hex));
+    }
     strix::PlannedPleLookupPolicy requested_ple_policy{options.ple_max_rows_per_io, options.ple_max_inflight_ios,
         options.ple_cpu_helper_threads, options.ple_cache_rows, options.ple_cache_budget_bytes, mapped.content_identity()};
     const auto requested_ple_cache_bytes = strix::PlannedPleLookupBackend::cache_reservation_bytes(requested_ple_policy);
@@ -1259,10 +1276,14 @@ int main(
         live.hip_identity = "runtime:" + std::to_string(runtime_version) + ";driver:" + std::to_string(driver_version) +
             ";declared-cmake-context:" + declared_sha;
         std::string binary_identity_source = "unavailable";
+        if (loaded_compile_provenance) {
+            live.binary_sha256 = provenance_executable_sha;
+            binary_identity_source = "canonical-proc-self-exe-inode-setup-once";
+        }
 #if defined(__linux__)
         std::error_code executable_error;
         const auto executable = std::filesystem::canonical("/proc/self/exe", executable_error);
-        if (!executable_error && !executable.empty()) {
+        if (!loaded_compile_provenance && !executable_error && !executable.empty()) {
             // Hash the process inode, not a pathname that could be replaced
             // after canonicalization. No model bytes are rehashed here.
             live.binary_sha256 = strix::model_content_identity_hex(strix::sha256_file_content("/proc/self/exe"));
@@ -1270,7 +1291,8 @@ int main(
         }
 #endif
         live.model_content_sha256 = strix::model_content_identity_hex(mapped.content_identity());
-        live.compiler_flags_sha256 = std::string(strix::decode_cli::offline_tuning_live_compiler_flags_sha256);
+        live.compiler_flags_sha256 = loaded_compile_provenance ? loaded_compile_provenance->compiler_flags_sha256 :
+            std::string(strix::decode_cli::offline_tuning_live_compiler_flags_sha256);
         live.context_tokens = options.context_tokens;
         strix::SerialSessionStateLayoutRequest tuning_state_request;
         tuning_state_request.context_tokens = options.context_tokens;
@@ -1310,13 +1332,22 @@ int main(
                 if (index >= reasons.size()) throw std::logic_error("unknown offline tuning selection reason");
                 ++reasons[index];
             }
+        if (loaded_compile_provenance)
+            optimization_profile_receipt += "  \"offline_compile_provenance_files_checked\":" +
+                std::to_string(loaded_compile_provenance->files_checked) + ",\n" +
+                "  \"offline_compile_provenance_units\":" + std::to_string(loaded_compile_provenance->units) + ",\n" +
+                "  \"offline_compile_provenance_targets\":" + std::to_string(loaded_compile_provenance->targets) + ",\n" +
+                "  \"offline_compile_provenance_referenced_bytes\":" + std::to_string(loaded_compile_provenance->referenced_bytes) + ",\n";
         optimization_profile_receipt += "  \"offline_tuning_cache_sha256\":\"" + offline_tuning_owner->payload_sha256() + "\",\n" +
             "  \"offline_tuning_cache_bytes\":" + std::to_string(offline_tuning_owner->payload_bytes()) + ",\n" +
             "  \"offline_tuning_cache_records\":" + std::to_string(offline_tuning_owner->record_count()) + ",\n" +
             "  \"offline_tuning_declared_cmake_context_sha256\":\"" + declared_sha + "\",\n" +
             "  \"offline_tuning_build_context_provenance\":\"DECLARED-CMake-not-observed-or-attested-argv\",\n" +
-            "  \"offline_tuning_compiler_flags_provenance\":\"" + std::string(strix::decode_cli::offline_tuning_flags_provenance) + "\",\n" +
-            "  \"offline_tuning_compiler_flags_sha256\":null,\n" +
+            "  \"offline_tuning_compiler_flags_provenance\":\"" +
+                (loaded_compile_provenance ? std::string("evaluated-per-TU-argv-and-declared-inputs-binary-bound-not-driver-runtime-closure-or-attestation") :
+                 std::string(strix::decode_cli::offline_tuning_flags_provenance)) + "\",\n" +
+            "  \"offline_tuning_compiler_flags_sha256\":" +
+                (loaded_compile_provenance ? "\"" + loaded_compile_provenance->compiler_flags_sha256 + "\"" : std::string("null")) + ",\n" +
             "  \"offline_tuning_runtime_reported_processor_count\":" + std::to_string(live.runtime_reported_processor_count) + ",\n" +
             "  \"offline_tuning_processor_count_scope\":\"HIP-multiprocessorCount-not-physical-CU-proof\",\n" +
             "  \"offline_tuning_binary_sha256\":" + (live.binary_sha256.empty() ? "null" : "\"" + live.binary_sha256 + "\"") + ",\n" +

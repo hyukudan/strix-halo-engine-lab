@@ -2,6 +2,19 @@ cmake_minimum_required(VERSION 3.24)
 
 project(strix_engine_lab VERSION 0.1.0 LANGUAGES CXX)
 
+# Optional evaluated-input export only. No manifest is self-generated or
+# admitted by configuration; explicit valid Ninja dependency export is required.
+option(STRIX_EXPORT_OFFLINE_TUNING_PROVENANCE "Export Ninja POSIX FileAPI inputs for offline compile provenance" OFF)
+if(STRIX_EXPORT_OFFLINE_TUNING_PROVENANCE)
+    if(NOT UNIX OR NOT CMAKE_GENERATOR STREQUAL "Ninja")
+        message(FATAL_ERROR "Offline compile provenance export supports single-config Ninja POSIX only")
+    endif()
+    set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+    file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/.cmake/api/v1/query")
+    file(WRITE "${CMAKE_BINARY_DIR}/.cmake/api/v1/query/codemodel-v2" "")
+    file(WRITE "${CMAKE_BINARY_DIR}/.cmake/api/v1/query/toolchains-v1" "")
+endif()
+
 option(STRIX_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" ON)
 option(STRIX_ENABLE_HIP_RUNTIME "Build optional HIP allocation/runtime support" OFF)
 option(STRIX_USE_OPENSSL_SHA256 "Use OpenSSL for full-file SHA-256 verification" OFF)
@@ -47,6 +60,7 @@ add_library(strix_core STATIC
     src/known_prompt_chunks.cpp
     src/offline_tuning_cache.cpp
     src/offline_tuning_preparation.cpp
+    src/offline_compile_provenance.cpp
     src/uma_owner_inventory.cpp
     src/moe_fork_join_arena.cpp
     src/prepared_execution.cpp
@@ -306,6 +320,10 @@ if(BUILD_TESTING)
     target_link_libraries(strix-known-prompt-chunks-tests PRIVATE strix_core)
     strix_target_warnings(strix-known-prompt-chunks-tests)
     add_test(NAME strix-known-prompt-chunks-tests COMMAND strix-known-prompt-chunks-tests)
+    add_executable(strix-offline-compile-provenance-tests tests/offline_compile_provenance_tests.cpp)
+    target_link_libraries(strix-offline-compile-provenance-tests PRIVATE strix_core)
+    strix_target_warnings(strix-offline-compile-provenance-tests)
+    add_test(NAME offline-compile-provenance COMMAND strix-offline-compile-provenance-tests)
     add_executable(strix-offline-tuning-preparation-tests tests/offline_tuning_preparation_tests.cpp)
     target_link_libraries(strix-offline-tuning-preparation-tests PRIVATE strix_core)
     strix_target_warnings(strix-offline-tuning-preparation-tests)
