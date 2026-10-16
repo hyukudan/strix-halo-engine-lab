@@ -48,11 +48,18 @@ std::uint64_t AllocationGenerationSource::next() {
 RuntimeExecutionMemoryOwner::RuntimeExecutionMemoryOwner(
     RuntimeExecutionMemoryOwner&& other) noexcept
     : allocator_(other.allocator_),
+      allocator_owner_(std::move(other.allocator_owner_)),
       scratch_(other.scratch_),
-      state_(other.state_) {
+      state_(other.state_),
+      original_scratch_(other.original_scratch_),
+      original_state_(other.original_state_),
+      allocation_leases_(other.allocation_leases_) {
     other.allocator_ = nullptr;
     other.scratch_ = {};
     other.state_ = {};
+    other.original_scratch_ = {};
+    other.original_state_ = {};
+    other.allocation_leases_ = {};
 }
 
 RuntimeExecutionMemoryOwner&
@@ -61,11 +68,18 @@ RuntimeExecutionMemoryOwner::operator=(
     if (this != &other) {
         release();
         allocator_ = other.allocator_;
+        allocator_owner_ = std::move(other.allocator_owner_);
         scratch_ = other.scratch_;
         state_ = other.state_;
+        original_scratch_ = other.original_scratch_;
+        original_state_ = other.original_state_;
+        allocation_leases_ = other.allocation_leases_;
         other.allocator_ = nullptr;
         other.scratch_ = {};
         other.state_ = {};
+        other.original_scratch_ = {};
+        other.original_state_ = {};
+        other.allocation_leases_ = {};
     }
     return *this;
 }
@@ -154,6 +168,46 @@ RuntimeExecutionMemoryOwner::allocate(
     return owner;
 }
 
+RuntimeExecutionMemoryOwner RuntimeExecutionMemoryOwner::allocate(
+    const CompiledSerialExecution& compiled,const SerialSessionStateLayout& state_layout,
+    std::shared_ptr<RuntimeMemoryAllocator> allocator,AllocationGenerationSource& generations) {
+    if(!allocator) throw std::invalid_argument("retained runtime allocation requires an actual shared allocator");
+    auto owner=allocate(compiled,state_layout,*allocator,generations);
+    owner.allocator_owner_=std::move(allocator);
+    owner.original_scratch_=owner.scratch_;
+    owner.original_state_=owner.state_;
+    owner.allocation_leases_[0]=owner.allocator_->allocation_lease_identity(
+        owner.scratch_.arena_base,owner.scratch_.arena_bytes,false);
+    if(owner.state_.device_bytes) owner.allocation_leases_[1]=owner.allocator_->allocation_lease_identity(
+        owner.state_.device_base,owner.state_.device_bytes,false);
+    if(owner.state_.host_bytes) owner.allocation_leases_[2]=owner.allocator_->allocation_lease_identity(
+        owner.state_.host_base,owner.state_.host_bytes,true);
+    return owner;
+}
+
+void RuntimeExecutionMemoryOwner::validate_inventory_ownership() const {
+    const auto& a=scratch_;const auto& b=original_scratch_;
+    const auto& x=state_;const auto& y=original_state_;
+    if(!allocator_ || !allocator_owner_ || allocator_owner_.get()!=allocator_ ||
+        a.execution_identity!=b.execution_identity || a.arena_base!=b.arena_base ||
+        a.arena_bytes!=b.arena_bytes || a.allocation_generation!=b.allocation_generation ||
+        x.layout_identity!=y.layout_identity || x.device_base!=y.device_base || x.device_bytes!=y.device_bytes ||
+        x.device_allocation_generation!=y.device_allocation_generation || x.host_base!=y.host_base ||
+        x.host_bytes!=y.host_bytes || x.host_allocation_generation!=y.host_allocation_generation ||
+        x.stage_mapping!=y.stage_mapping)
+        throw std::invalid_argument("runtime inventory requires unchanged actual retained allocator/bindings");
+    const std::array<std::uintptr_t,3> addresses{a.arena_base,x.device_base,x.host_base};
+    const std::array<std::uint64_t,3> bytes{a.arena_bytes,x.device_bytes,x.host_bytes};
+    for(std::size_t i=0;i<3U;++i) {
+        if(!bytes[i]) {
+            if(addresses[i] || allocation_leases_[i])
+                throw std::invalid_argument("runtime inventory absent pool carries an allocation lease");
+        } else if(!allocation_leases_[i] || allocator_->allocation_lease_identity(addresses[i],bytes[i],i==2U)!=allocation_leases_[i]) {
+            throw std::invalid_argument("runtime inventory allocation lease changed or is opaque");
+        }
+    }
+}
+
 void RuntimeExecutionMemoryOwner::release() noexcept {
     if (allocator_ == nullptr) {
         return;
@@ -178,6 +232,11 @@ void RuntimeExecutionMemoryOwner::release() noexcept {
     allocator_ = nullptr;
     scratch_ = {};
     state_ = {};
+    original_scratch_ = {};
+    original_state_ = {};
+    allocation_leases_ = {};
+    // Last: freeing pools above still needs the actual allocator alive.
+    allocator_owner_.reset();
 }
 
 }  // namespace strix

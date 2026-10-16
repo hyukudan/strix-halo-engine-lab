@@ -211,7 +211,65 @@ def validate_serving_prefill(value):
     return rows
 
 
+def reported_runtime_backing_inventory(receipt):
+    if "runtime_backing_inventory" not in receipt:
+        return None
+    value = receipt["runtime_backing_inventory"]
+    totals = {"covered_view_count", "covered_known_backing_count", "covered_unknown_backing_views",
+        "covered_logical_view_bytes", "covered_known_allocated_storage_bytes", "covered_known_file_mapping_bytes",
+        "covered_reservation_upper_bound_bytes", "covered_unique_backing_reserved_bytes"}
+    closed_keys(value, totals | {"scope", "boundary", "complete_resource_census", "physical_fit",
+        "physical_residency_independently_verified", "opaque_owners", "runtime_pools"}, set(), "runtime backing subset")
+    if (value["scope"] != "retained-model-and-base-scratch-state-virtual-backing-subset" or
+        value["boundary"] != "after-base-runtime-D1-catalog-before-optional-request-setup" or
+        boolean(value["complete_resource_census"], "complete resource census") or
+        value["physical_fit"] is not None or value["physical_residency_independently_verified"] is not None):
+        raise ValueError("runtime backing subset is not complete or physical memory evidence")
+    opaque = value["opaque_owners"]
+    closed_keys(opaque, {"D1", "PLE", "catalog", "other", "optional_request_workspaces"}, set(), "opaque owners")
+    if (opaque["D1"] not in ("unaccounted", "absent") or any(opaque[key] != "unaccounted" for key in ("PLE", "catalog", "other")) or
+        opaque["optional_request_workspaces"] != "outside-observation-boundary"):
+        raise ValueError("opaque runtime allocations cannot be inferred from covered pools")
+    for key in totals - {"covered_unique_backing_reserved_bytes"}:
+        integer(value[key], key)
+    known = value["covered_known_allocated_storage_bytes"] + value["covered_known_file_mapping_bytes"]
+    if known > 0xffffffffffffffff or known > value["covered_reservation_upper_bound_bytes"]:
+        raise ValueError("runtime reservation totals contradict the covered subset")
+    unknown = value["covered_unknown_backing_views"]
+    unique = value["covered_unique_backing_reserved_bytes"]
+    if (unknown > value["covered_view_count"] or
+        value["covered_known_backing_count"] > value["covered_view_count"] - unknown or
+        ((unique is None) != bool(unknown))):
+        raise ValueError("runtime unique reservation requires complete covered backing identities")
+    if unique is not None and (integer(unique, "unique reservation") != known or unique != value["covered_reservation_upper_bound_bytes"]):
+        raise ValueError("runtime unique reservation differs from deduplicated declared backing extents")
+    pools = value["runtime_pools"]
+    if not isinstance(pools, list) or len(pools) > 3 or len(pools) > value["covered_view_count"]:
+        raise ValueError("runtime base pool array is invalid")
+    identities = set()
+    for pool in pools:
+        closed_keys(pool, {"category", "view_identity", "address_space", "allocation_bytes", "view_offset", "view_bytes",
+            "outside_view_reservation_bytes", "backing"}, set(), "runtime base pool")
+        identity = integer(pool["view_identity"], "runtime pool view identity")
+        if (not identity or identity in identities or not isinstance(pool["category"], str) or not pool["category"] or
+            pool["address_space"] not in ("host", "device", "unspecified")):
+            raise ValueError("runtime base pool category/address space/view identity is invalid")
+        identities.add(identity)
+        extent = integer(pool["allocation_bytes"], "runtime allocation extent")
+        offset = integer(pool["view_offset"], "runtime view offset")
+        size = integer(pool["view_bytes"], "runtime view bytes")
+        padding = integer(pool["outside_view_reservation_bytes"], "runtime outside-view reservation")
+        if offset > extent or size > extent - offset or padding != extent - size:
+            raise ValueError("runtime view/padding exceeds its declared allocation")
+        if pool["backing"] is not None:
+            closed_keys(pool["backing"], {"issuer", "allocation", "generation"}, set(), "runtime backing lease")
+            if any(not integer(field, "runtime backing lease") for field in pool["backing"].values()):
+                raise ValueError("runtime backing lease must be complete")
+    return value
+
+
 def validate_outer_receipt(receipt):
+    reported_runtime_backing_inventory(receipt)
     reported_uma_setup_observation(receipt)
     if receipt.get("hip_runtime_environment") is not None:
         validate_runtime_environment(receipt["hip_runtime_environment"])
@@ -617,6 +675,7 @@ def collect(repo, cache_path=None, receipt_path=None, audit_path=None, manifest_
             "configured_build": cache, "build_completed": None,
             "reported_hip_runtime_environment": receipt.get("hip_runtime_environment"),
             "reported_uma_setup_observation": reported_uma_setup_observation(receipt),
+            "reported_runtime_backing_inventory": reported_runtime_backing_inventory(receipt),
             "model": model, "reported_model_sha256": receipt.get("model_sha256"),
             "reported_model_content_identity": receipt.get("model_content_identity"),
             "binary": binary, "effective_profile": effective,

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "strix/runtime_allocator.hpp"
+#include "strix/uma_owner_inventory.hpp"
 
 #include <cstdint>
 #include <mutex>
@@ -27,7 +28,7 @@ void initialize_hip_fresh_runtime_memory(
     const SessionStateMemoryBinding& state);
 
 class HipRuntimeAllocator final
-    : public RuntimeMemoryAllocator {
+    : public RuntimeMemoryAllocator, public std::enable_shared_from_this<HipRuntimeAllocator> {
 public:
     // Process-local allocation issuer; actual lease IDs are minted on allocate,
     // independently of returned/raw addresses and caller generation numbers.
@@ -68,6 +69,8 @@ public:
     // The actual owner must pin this allocator and allocation through use.
     [[nodiscard]] HipRuntimeAllocationDescription describe_allocation(
         std::uintptr_t,std::uint64_t,HipRuntimeAllocationSpace) const;
+    [[nodiscard]] std::uint64_t allocation_lease_identity(
+        std::uintptr_t,std::uint64_t,bool host) const override;
 
 private:
     // Dedicated transport allocator reuses geometry, not general allocation
@@ -101,5 +104,12 @@ private:
         std::uintptr_t,
         BackingAllocation> pageable_host_;
 };
+
+// Three actual retained pools only: scratch, device state and host state. The
+// exact memory owner and its retained actual shared HIP allocator are required;
+// borrowed/value allocators are rejected. D1/PLE/caches/transport stay outside
+// this declared scope. No allocation/copy/completion or physical-fit inference.
+[[nodiscard]] UmaOwnerInventory hip_runtime_memory_owner_inventory(
+    std::shared_ptr<const RuntimeExecutionMemoryOwner>,UmaMemoryObservation = {});
 
 }  // namespace strix

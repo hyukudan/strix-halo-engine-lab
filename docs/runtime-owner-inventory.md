@@ -1,0 +1,7 @@
+# Base runtime owner inventory
+
+With `--execution-inventory`, the normal decoder snapshots its actual retained model views and the three allocator-owned pools: scratch, device state and host state. The memory owner retains the real shared allocator; pool views carry allocation-time issuer/lease/generation evidence and the original raw alignment reservation. Equal backing keys alone deduplicate aliases. The inventory does not mint ownership from an address, token, content hash or future workspace estimate.
+
+The receipt is a live covered subset sampled after base runtime, D1 and catalog setup, before optional request workspace setup. D1, PLE, catalogs and other opaque owners remain explicitly unaccounted; later optional request workspaces are outside this boundary. Per-pool fields preserve the requested view, its offset and raw reservation outside the view. Addresses are not emitted. These virtual/backing reservations are not physical pages, measured resident bytes, complete process memory or proof of fit. Linux memory observations remain separate; RSS and GTT are never summed into backing accounting.
+
+Tiled prefill's subsequent growth admission reuses these same actual base pool views once, replacing the earlier conservative serial-pool estimates. Future prefill workspace/runtime payload estimates remain growth reservations, not observed allocations. Inventory construction and serialization are setup-only and remain disabled by default. This increment has not been compiled, tested or executed.

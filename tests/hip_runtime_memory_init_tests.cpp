@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -67,11 +68,75 @@ void allocation_descriptions() {
             "freed host allocation no longer supplies a live lease");
     }
 }
+void retained_runtime_inventory() {
+    using namespace strix;
+    CompiledSerialExecution compiled;compiled.execution_identity=17U;
+    compiled.arena.alignment=256U;compiled.arena.total_bytes=65U;
+    SerialSessionStateLayout layout;layout.layout_identity=29U;
+    layout.device_alignment=256U;layout.device_total_bytes=97U;
+    layout.host_alignment=64U;layout.host_total_bytes=37U;
+    AllocationGenerationSource generations;
+    auto allocator=std::make_shared<HipRuntimeAllocator>();
+    auto owner=std::make_shared<RuntimeExecutionMemoryOwner>(
+        RuntimeExecutionMemoryOwner::allocate(compiled,layout,allocator,generations));
+    const auto scratch=owner->scratch();const auto state=owner->state();
+    auto inventory=hip_runtime_memory_owner_inventory(owner);
+    expect(inventory.pinned_views.size()==3U && inventory.unique_backing_reserved_bytes==709U,
+        "actual runtime inventory includes scratch/state alignment backing and pageable host payload exactly once");
+    for(const auto& view:inventory.pinned_views) {
+        const bool host=view.address_space==UmaAddressSpace::host;
+        const auto actual=allocator->describe_allocation(view.address,view.view_bytes,
+            host?HipRuntimeAllocationSpace::host:HipRuntimeAllocationSpace::device);
+        const auto expected_generation=host?state.host_allocation_generation:
+            view.address==scratch.arena_base?scratch.allocation_generation:state.device_allocation_generation;
+        expect(view.backing.issuer==HipRuntimeAllocator::inventory_issuer &&
+            view.backing.allocation==actual.lease_identity && view.backing.generation==expected_generation &&
+            view.allocation_bytes==actual.raw_bytes && view.view_offset==actual.view_offset && view.allocation_pin,
+            "actual runtime views carry exact allocator leases, binding generations and real pins");
+    }
+    {
+        const auto repeated=hip_runtime_memory_owner_inventory(owner);
+        auto joined=inventory.pinned_views;
+        joined.insert(joined.end(),repeated.pinned_views.begin(),repeated.pinned_views.end());
+        expect(build_uma_owner_inventory(joined).unique_backing_reserved_bytes==inventory.unique_backing_reserved_bytes,
+            "repeated runtime inventory deduplicates actual backing leases without view-ID collisions");
+    }
+    expect(rejects_description([&] {(void)hip_runtime_memory_owner_inventory(
+        std::shared_ptr<const RuntimeExecutionMemoryOwner>(owner.get(),[](const RuntimeExecutionMemoryOwner*){}));}),
+        "a same-address false memory owner control block cannot pin real allocations");
+    {
+        auto false_allocator=std::shared_ptr<RuntimeMemoryAllocator>(allocator.get(),[](RuntimeMemoryAllocator*){});
+        auto false_owner=std::make_shared<RuntimeExecutionMemoryOwner>(
+            RuntimeExecutionMemoryOwner::allocate(compiled,layout,false_allocator,generations));
+        expect(rejects_description([&] {(void)hip_runtime_memory_owner_inventory(false_owner);}),
+            "a same-address false allocator control block cannot acquire actual allocator ownership");
+    }
+    {
+        auto borrowed=std::make_shared<RuntimeExecutionMemoryOwner>(
+            RuntimeExecutionMemoryOwner::allocate(compiled,layout,*allocator,generations));
+        expect(rejects_description([&] {(void)hip_runtime_memory_owner_inventory(borrowed);}),
+            "legacy borrowed memory does not fabricate a retained allocator pin");
+    }
+    auto& mutable_state=const_cast<SessionStateMemoryBinding&>(owner->state());
+    ++mutable_state.device_allocation_generation;
+    expect(rejects_description([&] {(void)hip_runtime_memory_owner_inventory(owner);}),
+        "forged current generation is rejected against the original private binding snapshot");
+    mutable_state=state;
+    std::weak_ptr<RuntimeExecutionMemoryOwner> weak_memory=owner;
+    std::weak_ptr<HipRuntimeAllocator> weak_allocator=allocator;
+    owner.reset();allocator.reset();
+    expect(!weak_memory.expired() && !weak_allocator.expired(),
+        "returned inventory retains actual memory and its allocator after caller pins are released");
+    inventory={};
+    expect(weak_memory.expired() && weak_allocator.expired(),
+        "dropping inventory releases owners with no self-cycle");
+}
 
 }  // namespace
 
 int main() try {
     allocation_descriptions();
+    retained_runtime_inventory();
     constexpr std::uint64_t scratch_bytes = 4096;
     constexpr std::uint64_t state_bytes = 8192;
     constexpr std::uint64_t host_bytes = 256;

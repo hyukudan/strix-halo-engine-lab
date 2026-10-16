@@ -59,6 +59,7 @@
 #include "hip_deferred_moe_status.hpp"
 #include "hip_decode_receipt_json.hpp"
 #include "execution_inventory_receipt.hpp"
+#include "runtime_owner_inventory_receipt.hpp"
 #include "strix/serial_decode_reference.hpp"
 #include "strix/serial_decode_replay.hpp"
 #include "strix/serial_prefix_cache.hpp"
@@ -1740,8 +1741,18 @@ int main(
         strix::HipHostAllocationMode::pageable_aligned);
     auto& allocator = *allocator_owner;
     auto memory_owner = std::make_shared<strix::RuntimeExecutionMemoryOwner>(
-        strix::RuntimeExecutionMemoryOwner::allocate(compiled, state_layout, allocator, generations));
+        strix::RuntimeExecutionMemoryOwner::allocate(compiled, state_layout, allocator_owner, generations));
     auto& memory = *memory_owner;
+    // These snapshots pin actual allocator-issued live pools, independently of
+    // optional future request workspace estimates. No per-token inventory work.
+    std::optional<strix::UmaOwnerInventory> runtime_memory_inventory,base_runtime_owner_inventory;
+    if(options.execution_inventory || options.known_prefix_prefill_rows) {
+        if(!model_owner_inventory) throw std::logic_error("base runtime inventory lacks its actual model owner");
+        runtime_memory_inventory.emplace(strix::hip_runtime_memory_owner_inventory(memory_owner));
+        auto views=model_owner_inventory->pinned_views;
+        views.insert(views.end(),runtime_memory_inventory->pinned_views.begin(),runtime_memory_inventory->pinned_views.end());
+        base_runtime_owner_inventory.emplace(strix::build_uma_owner_inventory(views));
+    }
     {
         auto correlation = strix::current_execution_correlation();
         correlation.execution_identity = compiled.execution_identity;
@@ -1859,7 +1870,7 @@ int main(
     if (launcher_catalog->audit(compiled, launchers).missing_steps)
         throw std::logic_error("HIP launcher catalog is incomplete for actual compiled execution");
     const auto launch_plan = strix::compile_launch_plan(compiled, launchers);
-    std::string uma_setup_observation_receipt;
+    std::string uma_setup_observation_receipt,base_runtime_owner_inventory_receipt;
     if (options.execution_inventory) {
         const auto observed = strix::observe_linux_uma_memory();
         uma_setup_observation_receipt = "  \"uma_setup_observation_boundary\":\"after-base-runtime-D1-catalog-before-optional-request-setup\",\n"
@@ -1867,10 +1878,15 @@ int main(
             strix::linux_uma_observation_json(observed) + ",\n";
         if (model_owner_inventory)
             model_owner_inventory = strix::build_uma_owner_inventory(model_owner_inventory->pinned_views, observed.memory);
+        if(!base_runtime_owner_inventory || !runtime_memory_inventory)
+            throw std::logic_error("runtime inventory snapshots are missing actual retained pools");
+        base_runtime_owner_inventory = strix::build_uma_owner_inventory(base_runtime_owner_inventory->pinned_views,observed.memory);
+        base_runtime_owner_inventory_receipt = strix::decode_receipt::runtime_owner_inventory_receipt(
+            *base_runtime_owner_inventory,*runtime_memory_inventory,static_cast<bool>(deferred_moe));
     }
     const auto execution_inventory_receipt = options.execution_inventory
         ? strix::decode_receipt::execution_inventory_receipt(compiled, launch_plan, kernel_registry) +
-            strix::decode_receipt::hip_runtime_environment_receipt() + model_owner_inventory_receipt + uma_setup_observation_receipt
+            strix::decode_receipt::hip_runtime_environment_receipt() + model_owner_inventory_receipt + base_runtime_owner_inventory_receipt + uma_setup_observation_receipt
         : std::string{};
     std::unique_ptr<strix::HipEventQueueTrace> device_queue_trace;
     std::optional<strix::ExecutionTelemetryBinding> device_queue_binding;
@@ -2598,9 +2614,9 @@ int main(
                     if (b > UINT64_MAX - a) throw std::overflow_error("known prefill reservation overflow");
                     return a + b;
                 };
-                if (!model_owner_inventory || !prefill_ple_owner || !retained_ple_source || !deferred_moe)
+                if (!base_runtime_owner_inventory || !prefill_ple_owner || !retained_ple_source || !deferred_moe)
                     throw std::logic_error("known prefill lacks actual retained setup owners");
-                auto views = model_owner_inventory->pinned_views;
+                auto views = base_runtime_owner_inventory->pinned_views;
                 std::uint64_t view_id = 0;
                 for (const auto& view : views) view_id = std::max(view_id, view.view_identity);
                 const auto reserve = [&](std::string category, std::uint64_t bytes, std::shared_ptr<const void> owner) {
@@ -2613,9 +2629,6 @@ int main(
                     view.allocation_bytes = bytes; view.view_bytes = bytes;
                     view.allocation_pin = std::move(owner); views.push_back(std::move(view));
                 };
-                reserve("serial-scratch", add(memory.scratch().arena_bytes, compiled.arena.alignment - 1U), memory_owner);
-                reserve("serial-device-state", add(state_layout.device_total_bytes, state_layout.device_alignment - 1U), memory_owner);
-                reserve("serial-host-state", add(state_layout.host_total_bytes, state_layout.host_alignment - 1U), memory_owner);
                 reserve("D1-shadow-host-state", add(state_layout.host_total_bytes, state_layout.host_alignment - 1U), deferred_moe);
                 reserve("serial-D1-record", 8U, deferred_moe);
                 reserve("PLE-row-cache", requested_ple_cache_bytes, prefill_ple_owner);

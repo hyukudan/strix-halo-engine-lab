@@ -96,6 +96,36 @@ class InventoryTests(unittest.TestCase):
                 INVENTORY.validate_serving_prefill(bad)
         self.assertIsNone(self.collect()["reported_opt_in_overlays"]["serving_prefill"])
 
+    def test_runtime_backing_subset_preserves_opaque_and_physical_unknowns(self):
+        pool = {"category": "runtime.scratch", "view_identity": 1, "address_space": "device",
+            "allocation_bytes": 128, "view_offset": 8, "view_bytes": 64, "outside_view_reservation_bytes": 64,
+            "backing": {"issuer": 1, "allocation": 1, "generation": 1}}
+        value = {"scope": "retained-model-and-base-scratch-state-virtual-backing-subset",
+            "boundary": "after-base-runtime-D1-catalog-before-optional-request-setup", "complete_resource_census": False,
+            "physical_fit": None, "physical_residency_independently_verified": None,
+            "opaque_owners": {"D1": "unaccounted", "PLE": "unaccounted", "catalog": "unaccounted",
+                "other": "unaccounted", "optional_request_workspaces": "outside-observation-boundary"},
+            "covered_view_count": 1, "covered_known_backing_count": 1, "covered_unknown_backing_views": 0,
+            "covered_logical_view_bytes": 64, "covered_known_allocated_storage_bytes": 128,
+            "covered_known_file_mapping_bytes": 0, "covered_reservation_upper_bound_bytes": 128,
+            "covered_unique_backing_reserved_bytes": 128, "runtime_pools": [pool]}
+        output = self.collect(receipt_path=self.evidence("backing.json", {"runtime_backing_inventory": value}))
+        self.assertEqual(output["reported_runtime_backing_inventory"], value)
+        self.assertIsNone(output["native_tests_executed"])
+        self.assertIsNone(self.collect()["reported_runtime_backing_inventory"])
+        for key, setting in (("physical_fit", True), ("complete_resource_census", True),
+            ("covered_unique_backing_reserved_bytes", 64), ("covered_unknown_backing_views", 1),
+            ("covered_view_count", 0), ("covered_reservation_upper_bound_bytes", 127)):
+            bad = copy.deepcopy(value);bad[key] = setting
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                INVENTORY.reported_runtime_backing_inventory({"runtime_backing_inventory": bad})
+        for key, setting in (("view_offset", 129), ("outside_view_reservation_bytes", 0), ("view_identity", 0)):
+            bad = copy.deepcopy(value);bad["runtime_pools"][0][key] = setting
+            with self.subTest(pool_key=key), self.assertRaises(ValueError):
+                INVENTORY.reported_runtime_backing_inventory({"runtime_backing_inventory": bad})
+        bad = copy.deepcopy(value);bad["runtime_pools"].append(copy.deepcopy(pool));bad["covered_view_count"] = 2
+        with self.assertRaises(ValueError): INVENTORY.reported_runtime_backing_inventory({"runtime_backing_inventory": bad})
+
     def selected_inventory(self):
         return {"schema_version": 1, "evidence_kind": "compiled-selected-launchers",
                 "phase": "decode", "selected_logical_rows": 1, "selected_request_concurrency": 1,

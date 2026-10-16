@@ -278,6 +278,41 @@ HipRuntimeAllocationDescription HipRuntimeAllocator::describe_allocation(
         static_cast<std::uint64_t>(address-actual.raw_address),bytes};
 }
 
+std::uint64_t HipRuntimeAllocator::allocation_lease_identity(
+    std::uintptr_t address,std::uint64_t bytes,bool host) const {
+    return describe_allocation(address,bytes,host?HipRuntimeAllocationSpace::host:HipRuntimeAllocationSpace::device).lease_identity;
+}
+
+UmaOwnerInventory hip_runtime_memory_owner_inventory(
+    std::shared_ptr<const RuntimeExecutionMemoryOwner> owner,UmaMemoryObservation observation) {
+    if(!owner) throw std::invalid_argument("runtime inventory requires an actual shared memory owner");
+    const auto self=owner->weak_from_this().lock();
+    if(!self || self.get()!=owner.get() || owner.owner_before(self) || self.owner_before(owner))
+        throw std::invalid_argument("runtime inventory requires its exact memory owner control block");
+    const auto& allocator_pin=owner->retained_allocator();
+    const auto* allocator=dynamic_cast<const HipRuntimeAllocator*>(allocator_pin.get());
+    if(!allocator) throw std::invalid_argument("runtime inventory requires a retained actual HIP allocator");
+    const auto allocator_self=allocator->weak_from_this().lock();
+    if(!allocator_self || allocator_self.get()!=allocator ||
+        allocator_pin.owner_before(allocator_self) || allocator_self.owner_before(allocator_pin))
+        throw std::invalid_argument("runtime inventory requires its exact allocator control block");
+    owner->validate_inventory_ownership();
+    const auto& scratch=owner->scratch();const auto& state=owner->state();
+    std::vector<UmaOwnerView> views;views.reserve(3U);
+    const auto append=[&](std::uintptr_t address,std::uint64_t bytes,std::uint64_t generation,bool host,const char* category) {
+        if(!bytes) return;
+        const auto actual=allocator->describe_allocation(address,bytes,
+            host?HipRuntimeAllocationSpace::host:HipRuntimeAllocationSpace::device);
+        views.push_back({next_uma_owner_view_identity(),{HipRuntimeAllocator::inventory_issuer,actual.lease_identity,generation},
+            UmaBackingKind::allocated_storage,category,actual.raw_bytes,actual.view_offset,actual.view_bytes,owner,
+            host?UmaAddressSpace::host:UmaAddressSpace::device,address});
+    };
+    append(scratch.arena_base,scratch.arena_bytes,scratch.allocation_generation,false,"runtime.scratch");
+    append(state.device_base,state.device_bytes,state.device_allocation_generation,false,"runtime.state.device");
+    append(state.host_base,state.host_bytes,state.host_allocation_generation,true,"runtime.state.host");
+    return build_uma_owner_inventory(views,std::move(observation));
+}
+
 void HipRuntimeAllocator::free_device(
     std::uintptr_t address,
     std::uint64_t) noexcept {

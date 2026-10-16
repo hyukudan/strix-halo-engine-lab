@@ -809,6 +809,11 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-execution-resources-tests)
     add_test(NAME strix-execution-resources-tests COMMAND strix-execution-resources-tests)
 
+    add_executable(strix-runtime-owner-inventory-receipt-tests tests/runtime_owner_inventory_receipt_tests.cpp)
+    target_link_libraries(strix-runtime-owner-inventory-receipt-tests PRIVATE strix_core)
+    strix_target_warnings(strix-runtime-owner-inventory-receipt-tests)
+    add_test(NAME strix-runtime-owner-inventory-receipt-tests COMMAND strix-runtime-owner-inventory-receipt-tests)
+
     add_executable(strix-linux-uma-observation-tests tests/linux_uma_observation_tests.cpp)
     target_link_libraries(strix-linux-uma-observation-tests PRIVATE strix_core)
     strix_target_warnings(strix-linux-uma-observation-tests)
