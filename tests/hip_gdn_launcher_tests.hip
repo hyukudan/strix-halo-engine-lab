@@ -8,7 +8,12 @@
 #include "strix/execution_resources.hpp"
 #include "strix/execution_tensor_access.hpp"
 #include "strix/hip_gdn_launcher.hpp"
+#include "strix/hip_gdn_islands.hpp"
+#include "strix/hip_embedding_launcher.hpp"
+#include "strix/prepared_execution.hpp"
+#include "strix/hip_model_residency.hpp"
 #include "strix/hip_launch_context.hpp"
+#include "../apps/hip_deferred_moe_status.hpp"
 #include "strix/memory_plan.hpp"
 #include "strix/model_contract.hpp"
 #include "strix/model_manifest.hpp"
@@ -22,14 +27,20 @@
 #include <array>
 #include <bit>
 #include <cmath>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <limits>
+#include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace {
@@ -584,9 +595,484 @@ Reference cpu_reference(
     return reference;
 }
 
+struct IslandTemporaryFile {
+    std::filesystem::path path = std::filesystem::temp_directory_path() /
+        ("strix-gdn-island-" + std::to_string(
+            std::chrono::steady_clock::now().time_since_epoch().count()) + ".bin");
+    ~IslandTemporaryFile() {
+        std::error_code ignored;
+        std::filesystem::remove(path, ignored);
+    }
+};
+
+struct IslandFixtureStorage {
+    std::shared_ptr<const strix::HipSetupQuiescenceGuard> guard =
+        std::make_shared<strix::HipSetupQuiescenceGuard>();
+    strix::ModelContract model = fixture_model();
+    strix::CompiledSerialExecution compiled;
+    strix::ModelManifest manifest;
+    strix::ExecutionTensorAccessPlan access;
+    strix::ExecutionMemoryBinding memory;
+    strix::SerialSessionStateLayout layout;
+    strix::SessionStateMemoryBinding state;
+    std::vector<std::byte> host_state;
+    std::shared_ptr<strix::MappedModelFile> mapped;
+    std::shared_ptr<strix::HipModelResidency> weights;
+    strix::ExecutionRuntimeResources resources;
+    void* scratch = nullptr;
+    void* device_state = nullptr;
+    ~IslandFixtureStorage() {
+        guard->recover_or_fail_stop();
+        if (device_state) static_cast<void>(hipFree(device_state));
+        if (scratch) static_cast<void>(hipFree(scratch));
+        // Registration is released before the source mmap owner.
+        weights.reset();
+        mapped.reset();
+    }
+};
+
+struct IslandSnapshot {
+    std::vector<std::byte> arena, state;
+    bool operator==(const IslandSnapshot&) const = default;
+};
+
+// Component qualification only: a real mapped/registered weight owner and the
+// real D1 owner, but one bounded GDN layer, not a full-model profile claim.
+void run_gdn_island_fixture() {
+    for (const unsigned profile : {0U, 1U, 2U}) {
+        const bool prefetched = profile != 0U;
+        const bool mixed_f32 = profile == 2U;
+        IslandTemporaryFile file;
+        auto owner = std::make_shared<IslandFixtureStorage>();
+        auto& model = owner->model;
+        auto& compiled = owner->compiled;
+        const auto full_plan = strix::build_serial_decode_execution_plan(model);
+        auto component_gdn = gdn_step(full_plan);
+        component_gdn.id = 1;
+        component_gdn.dependencies = {0};
+        strix::ExecutionStep embedding_step;
+        embedding_step.id = 0;
+        embedding_step.op = strix::SerialOp::token_embedding;
+        compiled.execution.steps = {embedding_step, component_gdn};
+        compiled.execution.linear_attention_steps = 1;
+        compiled.io = strix::build_serial_execution_io_plan(compiled.execution);
+        strix::ExecutionBufferRequest buffers;
+        buffers.activation_element_bytes = 2;
+        compiled.arena = strix::build_serial_execution_arena_plan(
+            model, buffers, compiled.execution, compiled.io, 256);
+        compiled.execution_identity = 0x47444e49534c5445ULL;
+        compiled.kernel_plan_identity = 0x47444e49534c4e55ULL;
+        compiled.vocab_size = model.vocab_size;
+        compiled.max_position_embeddings = model.max_position_embeddings;
+        const auto& step = gdn_step(compiled.execution);
+        const auto& io = compiled.io.steps[step.id];
+        const auto hidden = static_cast<std::uint32_t>(model.hidden_size);
+        const auto heads = static_cast<std::uint32_t>(model.gdn_value_heads);
+        const auto dim = static_cast<std::uint32_t>(model.gdn_value_head_dim);
+        const auto value = heads * dim;
+        const auto conv_width = 2U * static_cast<std::uint32_t>(model.gdn_key_heads) * dim + value;
+        const auto kernel = static_cast<std::uint32_t>(model.gdn_conv_kernel);
+        std::vector<std::byte> image(4096, std::byte{0});
+        auto& manifest = owner->manifest;
+        manifest.architecture = "qwen4_exp";
+        const auto add = [&](const char* name, strix::TensorRole role,
+            std::vector<std::uint64_t> dims, bool q8, float scalar) {
+            strix::ManifestTensor tensor;
+            tensor.name = name;
+            tensor.role = role;
+            tensor.layer = role == strix::TensorRole::embedding ? std::nullopt : step.layer;
+            tensor.dimensions = std::move(dims);
+            tensor.ggml_type = q8 ? 8U : 0U;
+            std::uint64_t elements = 1;
+            for (const auto extent : tensor.dimensions) elements *= extent;
+            tensor.byte_size = q8 ? elements / 32U * 34U : elements * sizeof(float);
+            tensor.residency = strix::ResidencyPolicy::resident;
+            image.resize((image.size() + 255U) / 256U * 256U, std::byte{0});
+            tensor.absolute_offset = image.size();
+            std::vector<std::byte> payload(static_cast<std::size_t>(tensor.byte_size));
+            if (q8) {
+                for (std::size_t block = 0; block < payload.size() / 34U; ++block) {
+                    payload[block * 34U] = std::byte{0};
+                    payload[block * 34U + 1U] = std::byte{0x18}; // exact half 2^-9
+                    for (std::size_t local = 0; local < 32U; ++local) {
+                        const auto code = static_cast<std::int8_t>(
+                            static_cast<int>((block * 3U + local * 5U) % 7U) - 3);
+                        payload[block * 34U + 2U + local] =
+                            static_cast<std::byte>(static_cast<std::uint8_t>(code));
+                    }
+                }
+            } else {
+                for (std::size_t element = 0; element < static_cast<std::size_t>(elements); ++element) {
+                    const auto sample = role == strix::TensorRole::embedding
+                        ? static_cast<float>(static_cast<int>(((element % hidden) * 7U +
+                            (element / hidden) * 3U) % 23U) - 11) / 32.0F : scalar;
+                    std::memcpy(payload.data() + element * sizeof(float), &sample, sizeof(float));
+                }
+            }
+            image.insert(image.end(), payload.begin(), payload.end());
+            manifest.total_tensor_bytes += tensor.byte_size;
+            manifest.tensors.push_back(std::move(tensor));
+        };
+        using Role = strix::TensorRole;
+        add("blk.0.attn_qkv.weight", Role::attention_projection, {hidden, conv_width}, true, 0);
+        add("blk.0.attn_gate.weight", Role::attention_projection, {hidden, value}, true, 0);
+        add("blk.0.ssm_conv1d.weight", Role::recurrent_state, {kernel, conv_width}, false, 0.125F);
+        add("blk.0.ssm_dt.bias", Role::recurrent_state, {heads}, false, 0.03F);
+        add("blk.0.ssm_a", Role::recurrent_state, {heads}, false, -0.12F);
+        add("blk.0.ssm_beta.weight", Role::recurrent_state, {hidden, heads}, !mixed_f32, 0.0625F);
+        add("blk.0.ssm_alpha.weight", Role::recurrent_state, {hidden, heads}, !mixed_f32, -0.03125F);
+        add("blk.0.ssm_norm.weight", Role::recurrent_state, {dim}, false, 1.0F);
+        add("blk.0.ssm_out.weight", Role::recurrent_state, {value, hidden}, true, 0);
+        add("token_embd.weight", Role::embedding, {hidden, model.vocab_size}, false, 0);
+        image.resize((image.size() + 4095U) / 4096U * 4096U, std::byte{0});
+        manifest.layout_identity = strix::model_manifest_layout_identity(manifest);
+        if (std::filesystem::exists(file.path)) throw std::runtime_error("island tempfile already exists");
+        {
+            std::ofstream output(file.path, std::ios::binary);
+            output.write(reinterpret_cast<const char*>(image.data()), static_cast<std::streamsize>(image.size()));
+            if (!output) throw std::runtime_error("cannot write bounded island weight fixture");
+        }
+        strix::AllocationGenerationSource generations;
+        owner->mapped = std::make_shared<strix::MappedModelFile>(
+            strix::MappedModelFile::open_read_only(file.path, "gdn-island-component", generations));
+        owner->weights = std::make_shared<strix::HipModelResidency>(
+            strix::HipModelResidency::create(*owner->mapped, manifest, generations));
+        expect(owner->weights->registered_bytes() > 0U && owner->weights->copied_bytes() == 0U,
+            "island fixture actually uses registered mmap weights rather than copied weights");
+        for (const auto& tensor : owner->weights->binding().tensors) {
+            expect(owner->weights->covers_device_range(tensor.address, tensor.bytes) &&
+                tensor.allocation_generation == owner->weights->generation(),
+                "residency owns the complete actual device alias and generation");
+        }
+        expect(!owner->weights->covers_device_range(0, 1) &&
+            !owner->weights->covers_device_range(owner->weights->binding().tensors.front().address, 0) &&
+            !owner->weights->covers_device_range(std::numeric_limits<std::uintptr_t>::max(), 2),
+            "range coverage rejects null, empty and overflowing addresses without HIP queries");
+        if (!prefetched) {
+            strix::HipModelResidencyPolicy copied_policy;
+            copied_policy.mode = strix::HipModelResidencyMode::resident_copy;
+            auto copied = strix::HipModelResidency::create(*owner->mapped, manifest, generations, copied_policy);
+            const auto first_copy = copied.binding().tensors.front();
+            expect(copied.copied_bytes() > 0U && copied.registered_bytes() == 0U &&
+                copied.covers_device_range(first_copy.address, first_copy.bytes),
+                "coverage also binds actual copied allocations, independent of mapped host addresses");
+            auto moved = std::move(copied);
+            expect(!copied.covers_device_range(first_copy.address, first_copy.bytes) && copied.generation() == 0U &&
+                moved.covers_device_range(first_copy.address, first_copy.bytes) &&
+                moved.generation() == first_copy.allocation_generation,
+                "residency move transfers range ownership and invalidates the old generation");
+            copied = std::move(moved);
+            expect(!moved.covers_device_range(first_copy.address, first_copy.bytes) && moved.generation() == 0U &&
+                copied.covers_device_range(first_copy.address, first_copy.bytes),
+                "residency move assignment transfers the owned coverage as well");
+        }
+        check(hipMalloc(&owner->scratch, static_cast<std::size_t>(compiled.arena.total_bytes)), "island scratch allocate");
+        owner->memory = {compiled.execution_identity, reinterpret_cast<std::uintptr_t>(owner->scratch),
+            compiled.arena.total_bytes, 11};
+        strix::SerialSessionStateLayoutRequest state_request;
+        state_request.context_tokens = 16;
+        owner->layout = strix::build_serial_session_state_layout(model, state_request);
+        check(hipMalloc(&owner->device_state, static_cast<std::size_t>(owner->layout.device_total_bytes)), "island state allocate");
+        owner->host_state.resize(static_cast<std::size_t>(
+            owner->layout.host_total_bytes + owner->layout.host_alignment - 1U));
+        const auto host_base = reinterpret_cast<std::uintptr_t>(owner->host_state.data());
+        const auto aligned_host = (host_base + owner->layout.host_alignment - 1U) /
+            owner->layout.host_alignment * owner->layout.host_alignment;
+        owner->state = {owner->layout.layout_identity, reinterpret_cast<std::uintptr_t>(owner->device_state),
+            owner->layout.device_total_bytes, 12, aligned_host,
+            owner->layout.host_total_bytes, 13};
+        const auto tensor_index = strix::build_model_tensor_index(manifest);
+        const auto requirements = strix::build_serial_execution_tensor_requirements(compiled.execution);
+        owner->access = strix::compile_execution_tensor_access_plan(
+            compiled.execution, manifest, tensor_index, requirements);
+        owner->resources = { };
+        owner->resources.scratch = &owner->memory;
+        owner->resources.model_manifest = &owner->manifest;
+        owner->resources.model_weights = &owner->weights->binding();
+        owner->resources.tensor_access = &owner->access;
+        owner->resources.session_state_layout = &owner->layout;
+        owner->resources.session_state_memory = &owner->state;
+        owner->guard->run([&] {
+            check(hipMemset(owner->scratch, 0, static_cast<std::size_t>(compiled.arena.total_bytes)), "island initial arena");
+            check(hipMemset(owner->device_state, 0, static_cast<std::size_t>(owner->layout.device_total_bytes)), "island initial state");
+        });
+        auto d1 = std::make_shared<HipDeferredMoeStatus>(owner->resources, compiled.execution_identity,
+            14, 15, owner, owner->guard);
+        strix::HipGdnLauncherConfig config;
+        config.model = model;
+        config.virtual_q8_input_projections = prefetched;
+        config.prefetch_q8_input_projections = prefetched;
+        config.virtual_q8_output_projection = prefetched;
+        strix::kernels::KernelRegistry variants;
+        strix::ExecutionBindingRequest request;
+        strix::register_hip_gdn_kernel_variant(model, request, config, variants);
+        const auto variant = variants.variants().front();
+        strix::HipEmbeddingLauncherConfig embedding_config;
+        embedding_config.hidden_size = hidden;
+        strix::kernels::KernelRegistry embedding_variants;
+        strix::register_hip_embedding_kernel_variant(model, request, embedding_config, embedding_variants);
+        const auto embedding_variant = embedding_variants.variants().front();
+        compiled.bindings.bound_steps = 2;
+        compiled.bindings.bindings.resize(compiled.execution.steps.size());
+        for (const auto& item : compiled.execution.steps) {
+            auto& binding = compiled.bindings.bindings[item.id];
+            binding.step_id = item.id;
+            binding.op = item.op;
+            binding.family = strix::operator_family_for(item.op);
+            binding.kernel_id = item.op == strix::SerialOp::gated_delta_net
+                ? variant.id : embedding_variant.id;
+        }
+        strix::ExecutionDispatchContext context;
+        context.execution_identity = compiled.execution_identity;
+        context.step_id = step.id; context.op = step.op; context.layer = step.layer;
+        context.reads = io.reads; context.writes = io.writes; context.temporaries = io.temporaries;
+        context.arena = &compiled.arena; context.memory = &owner->memory;
+        context.resources = &d1->resources();
+        context.session_state_layout = context.resources->session_state_layout;
+        context.session_state_memory = context.resources->session_state_memory;
+        context.reads_state = step.reads_state; context.writes_state = step.writes_state;
+        context.logical_rows = 1; context.request_concurrency = 1; context.kernel_id = variant.id;
+        const auto input = strix::resolve_dispatch_read(context, 0);
+        const auto snapshot = [&] {
+            IslandSnapshot result;
+            result.arena.resize(static_cast<std::size_t>(compiled.arena.total_bytes));
+            result.state.resize(static_cast<std::size_t>(owner->layout.device_total_bytes));
+            owner->guard->run([&] {
+                check(hipMemcpy(result.arena.data(), owner->scratch, result.arena.size(), hipMemcpyDeviceToHost), "island full arena read");
+                check(hipMemcpy(result.state.data(), owner->device_state, result.state.size(), hipMemcpyDeviceToHost), "island full state read");
+            });
+            return result;
+        };
+        const auto reset_state = [&] {
+            owner->guard->run([&] {
+                check(hipMemset(owner->device_state, 0, static_cast<std::size_t>(owner->layout.device_total_bytes)), "island in-place state restore");
+            });
+        };
+        const auto prepare_input = [&](std::uint64_t position) {
+            std::vector<std::uint16_t> values(hidden);
+            for (std::size_t feature = 0; feature < values.size(); ++feature)
+                values[feature] = float_to_bf16(static_cast<float>(
+                    static_cast<int>((feature * 7U + static_cast<std::size_t>(position) * 3U) % 23U) - 11) / 32.0F);
+            owner->guard->run([&] {
+                check(hipMemset(owner->scratch, 0xa5, static_cast<std::size_t>(compiled.arena.total_bytes)), "island poison arena");
+                check(hipMemcpy(reinterpret_cast<void*>(input.address), values.data(), values.size() * 2U,
+                    hipMemcpyHostToDevice), "island input upload");
+            });
+        };
+        const auto eager = strix::make_hip_gdn_launcher(variant.id, &config);
+        std::vector<IslandSnapshot> reference;
+        for (std::uint64_t position = 0; position < 8U; ++position) {
+            context.position = position; prepare_input(position); d1->begin();
+            { const strix::HipLaunchScope scope(d1->scope()); eager.function(context, eager.user_data); }
+            d1->complete_before_commit(); reference.push_back(snapshot());
+        }
+        expect(reference[0].state != reference[1].state,
+            "island replay oracle observes evolving recurrent/convolution bytes, not an all-zero state fixture");
+        reset_state();
+        const auto create = [&](const strix::HipGdnLauncherConfig& selected, const strix::HipLaunchContext& scope) {
+            return strix::HipGdnIslands::create(compiled, selected, d1->resources(), scope,
+                owner->weights, d1, owner->guard, strix::HipGdnIslandBudget{36, 360, 0});
+        };
+        auto islands = create(config, d1->scope());
+        const auto initial = islands->receipt();
+        expect(initial.islands == 1U && initial.kernel_nodes == 10U && initial.replays == 0U,
+            "one GDN island validates its exact ten-node emitter ledger without a warmup replay");
+        strix::HipGdnLauncherBundle bundle(config);
+        strix::ExecutionLauncherRegistry registry;
+        bundle.register_for_compiled_execution(compiled, registry, islands.get());
+        strix::HipEmbeddingLauncherBundle embedding_bundle(embedding_config);
+        embedding_bundle.register_for_compiled_execution(compiled, registry);
+        const auto launch_plan = strix::compile_launch_plan(compiled, registry);
+        strix::DirectLaunchDispatcher direct(launch_plan);
+        class PreparedWitness final : public strix::EagerExecutionDispatcher {
+        public:
+            PreparedWitness(strix::DirectLaunchDispatcher& dispatcher,
+                const strix::RuntimeTensorBinding* actual) : dispatcher_(dispatcher), actual_(actual) {}
+            void dispatch_kernel(const strix::ExecutionDispatchContext& current) override {
+                if (current.op == strix::SerialOp::gated_delta_net) {
+                    const auto& resolved = strix::resolve_dispatch_tensor(current, "blk.0.ssm_out.weight");
+                    expect(current.prepared_tensor_views != nullptr && &resolved != actual_,
+                        "actual prepared dispatcher publishes deep-copied tensor metadata, not canonical owner pointers");
+                    ++prepared_gdn_calls;
+                }
+                dispatcher_.dispatch_kernel(current);
+            }
+            void dispatch_runtime_step(const strix::ExecutionDispatchContext& current) override {
+                dispatcher_.dispatch_runtime_step(current);
+            }
+            unsigned prepared_gdn_calls = 0;
+        private:
+            strix::DirectLaunchDispatcher& dispatcher_;
+            const strix::RuntimeTensorBinding* actual_;
+        } prepared_dispatcher(direct, &owner->weights->binding().tensors[8]);
+        strix::EagerExecutionRequest prototype;
+        prototype.state.valid = step.reads_state | step.writes_state;
+        prototype.state.generations.fill(1);
+        strix::PreparedEagerExecution prepared(compiled, d1->resources(), prototype, d1);
+        const auto* installed = registry.find_kernel_launcher(variant.id);
+        if (!installed || !installed->preflight) throw std::runtime_error("island launcher missing real preflight");
+        const auto launch = *installed;
+        expect(launch.implementation_identity != eager.implementation_identity,
+            "island organization identity changes without changing numerical kernel ID");
+        for (unsigned repeat = 0; repeat < 2U; ++repeat) {
+            reset_state();
+            auto prepared_request = prototype;
+            for (std::uint64_t position = 0; position < 8U; ++position) {
+                context.position = position; prepare_input(position);
+                if (repeat != 0U) {
+                    // A skipped/broken embedding cannot inherit the manual input oracle.
+                    owner->guard->run([&] {
+                        check(hipMemset(reinterpret_cast<void*>(input.address), 0x5a,
+                            static_cast<std::size_t>(input.bytes)), "island prepared input poison");
+                    });
+                }
+                d1->begin();
+                { const strix::HipLaunchScope scope(d1->scope());
+                  if (repeat == 0U) {
+                      launch.preflight(context, launch.user_data); launch.function(context, launch.user_data);
+                  } else {
+                      prepared_request.input_token_id = static_cast<std::uint32_t>(position);
+                      prepared_request.position = position;
+                      const auto result = prepared.run(d1->resources(), prepared_request, prepared_dispatcher);
+                      prepared_request.state = result.state;
+                      expect(result.completed_steps == 2U && result.kernel_steps == 2U,
+                          "prepared component actually dispatches embedding and GDN with both full outputs");
+                  }
+                }
+                d1->complete_before_commit();
+                expect(snapshot() == reference[static_cast<std::size_t>(position)],
+                    "registered legacy/prefetch GDN island preserves whole output/workspace/matrix/convolution bits at successive positions");
+            }
+        }
+        expect(prepared_dispatcher.prepared_gdn_calls == 8U,
+            "eight actual PreparedEagerExecution component replays exercise retained canonical tensor slots");
+        expect(islands->receipt().replays == 16U, "receipt counts actual graph replays rather than captured kernels");
+        reset_state(); prepare_input(0); context.position = 0;
+        d1->begin();
+        { const strix::HipLaunchScope scope(d1->scope()); launch.function(context, launch.user_data); }
+        islands.reset(); // Graph work is deliberately still potentially in flight.
+        d1->complete_before_commit();
+        expect(snapshot() == reference[0], "island destructor drains in-flight graph work before releasing captured owners");
+
+        const auto reject_creation = [&](const strix::HipGdnLauncherConfig& bad_config,
+            const strix::HipLaunchContext& bad_scope, std::string_view expected_message = {}) {
+            const auto before = snapshot();
+            bool rejected = false;
+            std::string rejection;
+            try { static_cast<void>(create(bad_config, bad_scope)); }
+            catch (const std::invalid_argument& error) { rejected = true; rejection = error.what(); }
+            expect(rejected && (expected_message.empty() || rejection == expected_message) && snapshot() == before,
+                "unsupported island creation rejects through its intended guard with no state/output effects");
+        };
+        auto wave8 = config; wave8.virtual_q8_input_projections = true;
+        wave8.prefetch_q8_input_projections = true; wave8.wave8_q8_input_projections = true;
+        strix::kernels::KernelRegistry wave8_variants;
+        strix::register_hip_gdn_kernel_variant(model, request, wave8, wave8_variants);
+        const auto wave8_variant = wave8_variants.variants().front();
+        compiled.bindings.bindings[step.id].kernel_id = wave8_variant.id;
+        reject_creation(wave8, d1->scope());
+        wave8 = config; wave8.virtual_q8_output_projection = true;
+        wave8.wave8_q8_output_projection = true;
+        strix::kernels::KernelRegistry wave8_output_variants;
+        strix::register_hip_gdn_kernel_variant(model, request, wave8, wave8_output_variants);
+        const auto wave8_output_variant = wave8_output_variants.variants().front();
+        compiled.bindings.bindings[step.id].kernel_id = wave8_output_variant.id;
+        reject_creation(wave8, d1->scope());
+        compiled.bindings.bindings[step.id].kernel_id = variant.id;
+        auto no_stream = d1->scope(); no_stream.stream = nullptr; reject_creation(config, no_stream);
+        auto whole_graph = d1->scope(); whole_graph.graph_capture = true; reject_creation(config, whole_graph);
+        auto aliased_status = d1->scope();
+        aliased_status.deferred_moe_status.arena_base = owner->memory.arena_base;
+        reject_creation(config, aliased_status, "GDN island scratch, state and D1 record owners must be disjoint");
+        aliased_status.deferred_moe_status.arena_base = owner->state.device_base;
+        reject_creation(config, aliased_status, "GDN island scratch, state and D1 record owners must be disjoint");
+
+        // Every malformed replay uses a fresh owner because rejection is sticky.
+        for (unsigned fault = 0; fault < 12U; ++fault) {
+            auto subject = create(config, d1->scope());
+            strix::HipGdnLauncherBundle subject_bundle(config);
+            strix::ExecutionLauncherRegistry subject_registry;
+            subject_bundle.register_for_compiled_execution(compiled, subject_registry, subject.get());
+            const auto arm = *subject_registry.find_kernel_launcher(variant.id);
+            auto bad_context = context;
+            auto bad_scope = d1->scope();
+            auto bad_resources = d1->resources();
+            auto bad_memory = owner->memory;
+            auto bad_runtime = owner->weights->binding();
+            // The actual owners are mutable fixture objects. Mutate the original
+            // fields, preserving resources and binding pointers, so descriptor
+            // tests cannot pass merely by rejecting a substituted resources object.
+            auto& live_runtime = const_cast<strix::ModelRuntimeBinding&>(owner->weights->binding());
+            auto& live_state = const_cast<strix::SessionStateMemoryBinding&>(*context.session_state_memory);
+            const auto original_tensor = live_runtime.tensors[0];
+            const auto original_state = live_state;
+            const auto original_type = manifest.tensors[0].ggml_type;
+            const auto restore_metadata = [&] {
+                live_runtime.tensors[0] = original_tensor;
+                live_state = original_state;
+                manifest.tensors[0].ggml_type = original_type;
+            };
+            if (fault == 0U) { bad_scope.deferred_moe_status = {}; }
+            if (fault == 1U) { bad_scope.stream = hipStreamPerThread; }
+            if (fault == 2U) { ++live_runtime.tensors[0].allocation_generation; }
+            if (fault == 3U) { live_runtime.tensors[0].address += 16U; }
+            if (fault == 4U) { live_runtime.tensors[0].bytes += 16U; }
+            if (fault == 5U) { manifest.tensors[0].ggml_type = 0U; }
+            if (fault == 6U) { bad_context.writes = context.reads; }
+            if (fault == 7U) { ++bad_scope.deferred_moe_status.allocation_generation; }
+            if (fault == 8U) bad_context.resources = &bad_resources; // Equal values, wrong resource object.
+            if (fault == 9U) { bad_resources.model_weights = &bad_runtime; bad_context.resources = &bad_resources; }
+            if (fault == 10U) {
+                ++live_state.device_allocation_generation;
+            }
+            if (fault == 11U) {
+                bad_memory.arena_base = owner->weights->binding().tensors[0].address;
+                bad_resources.scratch = &bad_memory;
+                bad_context.memory = &bad_memory;
+                bad_context.resources = &bad_resources;
+            }
+            const auto before = snapshot();
+            bool rejected = false;
+            std::string rejection;
+            bool alternate_stream_created = false;
+            try {
+                if (fault == 1U) {
+                    // A real, different non-blocking stream reaches island admission,
+                    // unlike a prohibited per-thread scope rejected by HipLaunchScope.
+                    check(hipStreamCreateWithFlags(&bad_scope.stream, hipStreamNonBlocking), "island wrong-stream fixture");
+                    alternate_stream_created = true;
+                }
+                { const strix::HipLaunchScope scope(bad_scope); arm.preflight(bad_context, arm.user_data); }
+            } catch (const std::invalid_argument& error) { rejected = true; rejection = error.what(); }
+            catch (...) {
+                restore_metadata();
+                if (alternate_stream_created) static_cast<void>(hipStreamDestroy(bad_scope.stream));
+                throw;
+            }
+            restore_metadata();
+            if (alternate_stream_created) check(hipStreamDestroy(bad_scope.stream), "island wrong-stream teardown");
+            if (fault == 2U || fault == 3U || fault == 4U || fault == 10U)
+                expect(rejection == "GDN island replay scope, owner or complete descriptor changed",
+                    "in-place generation/address/extent/state mutation reaches fixed descriptor rejection");
+            expect(rejected && subject->receipt().replays == 0U && snapshot() == before,
+                "island scope/owner/generation/pointer/extent/type/alias/resource mutations reject before replay");
+            bool sticky = false;
+            try { const strix::HipLaunchScope scope(d1->scope()); arm.function(context, arm.user_data); }
+            catch (const std::exception&) { sticky = true; }
+            expect(sticky && subject->receipt().replays == 0U && snapshot() == before,
+                "failed island owner cannot silently fall back or be reused with restored metadata");
+        }
+        std::vector<std::byte> weights_after(image.size());
+        owner->mapped->read_at(0, weights_after);
+        expect(weights_after == image, "captured and eager kernels leave all registered weight-file bytes read-only");
+        d1.reset();
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) try {
+    if (argc == 1) run_gdn_island_fixture();
     auto model = fixture_model();
     const bool candidate_enabled = argc >= 2;
     const std::string fixture_mode = argc >= 3 ? argv[2] : "";

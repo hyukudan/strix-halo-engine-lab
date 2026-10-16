@@ -11,6 +11,8 @@
 
 namespace strix {
 
+class HipGdnIslands;
+
 struct HipGdnLauncherConfig {
     ModelContract model =
         ModelContract::qwen38_flash_next();
@@ -77,7 +79,7 @@ public:
 
     void register_for_compiled_execution(
         const CompiledSerialExecution& compiled,
-        ExecutionLauncherRegistry& registry);
+        ExecutionLauncherRegistry& registry, HipGdnIslands* islands = nullptr);
 
 private:
     HipGdnLauncherConfig config_;

@@ -78,6 +78,17 @@ public:
         return copied_bytes_;
     }
 
+    [[nodiscard]] std::uint64_t generation() const noexcept {
+        return generation_;
+    }
+
+    // Pure ownership query over the actual registered device aliases and
+    // copied device allocations, not host mapping addresses or tensor labels.
+    // The caller retains this object and the source mapping through quiescence.
+    // Empty, overflowing, or cross-allocation views are never covered.
+    [[nodiscard]] bool covers_device_range(
+        std::uintptr_t address, std::uint64_t bytes) const noexcept;
+
 private:
     struct RegisteredRange {
         std::uintptr_t host_base = 0;
@@ -99,6 +110,7 @@ private:
     std::vector<CopiedRange> copied_ranges_;
     std::uint64_t registered_bytes_ = 0;
     std::uint64_t copied_bytes_ = 0;
+    std::uint64_t generation_ = 0;
     ModelRuntimeBinding binding_;
 };
 

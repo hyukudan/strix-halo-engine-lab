@@ -216,11 +216,13 @@ HipModelResidency::HipModelResidency(
           other.registered_bytes_),
       copied_bytes_(
           other.copied_bytes_),
+      generation_(other.generation_),
       binding_(
           std::move(
               other.binding_)) {
     other.registered_bytes_ = 0;
     other.copied_bytes_ = 0;
+    other.generation_ = 0;
     other.registered_ranges_.clear();
     other.copied_ranges_.clear();
 }
@@ -241,12 +243,14 @@ HipModelResidency::operator=(
             other.registered_bytes_;
         copied_bytes_ =
             other.copied_bytes_;
+        generation_ = other.generation_;
         binding_ =
             std::move(
                 other.binding_);
 
         other.registered_bytes_ = 0;
         other.copied_bytes_ = 0;
+        other.generation_ = 0;
         other.registered_ranges_.clear();
         other.copied_ranges_.clear();
     }
@@ -255,6 +259,22 @@ HipModelResidency::operator=(
 
 HipModelResidency::~HipModelResidency() {
     release();
+}
+
+bool HipModelResidency::covers_device_range(
+    std::uintptr_t address, std::uint64_t bytes) const noexcept {
+    constexpr auto maximum = std::numeric_limits<std::uintptr_t>::max();
+    if (!generation_ || !address || !bytes || bytes > maximum - address) return false;
+    const auto contains = [&](std::uintptr_t base, std::uint64_t extent) noexcept {
+        if (!base || !extent || extent > maximum - base || address < base) return false;
+        const auto offset = static_cast<std::uint64_t>(address - base);
+        return offset < extent && bytes <= extent - offset;
+    };
+    for (const auto& range : registered_ranges_)
+        if (contains(range.device_base, range.bytes)) return true;
+    for (const auto& range : copied_ranges_)
+        if (contains(range.device_base, range.bytes)) return true;
+    return false;
 }
 
 HipModelResidency HipModelResidency::create(
@@ -287,6 +307,7 @@ HipModelResidency HipModelResidency::create(
         policy.mode;
     const auto generation =
         generations.next();
+    result.generation_ = generation;
 
     result.binding_ =
         mapped.build_runtime_binding(
@@ -549,6 +570,7 @@ void HipModelResidency::release() noexcept {
     copied_ranges_.clear();
     registered_bytes_ = 0;
     copied_bytes_ = 0;
+    generation_ = 0;
     binding_ = {};
 }
 

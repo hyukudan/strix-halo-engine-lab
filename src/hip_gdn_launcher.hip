@@ -5,6 +5,9 @@
 #include "strix/hip_gdn_lm_wave8_diagnostic.hpp"
 #endif
 #include "strix/hip_gdn_launcher.hpp"
+#include "strix/hip_gdn_islands.hpp"
+#include "strix/hip_model_residency.hpp"
+#include "strix/hip_setup_quiescence.hpp"
 #include "strix/q8_projection_organization.hpp"
 #include "strix/q8_projection_manifest.hpp"
 
@@ -17,7 +20,12 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
+#include <algorithm>
 #include <array>
+#include <bit>
+#include <memory>
+#include <tuple>
+#include <vector>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -1693,13 +1701,32 @@ __global__ void gated_rms_norm_kernel(
         gate_value;
 }
 
+struct GdnKernelNode {
+    const void* function;
+    dim3 grid, block;
+    std::size_t shared_bytes;
+};
+using GdnKernelLedger = std::vector<GdnKernelNode>;
+struct GdnEmitTarget {
+    hipStream_t stream;
+    std::uint32_t* graph_status;
+    const std::uint64_t* graph_position;
+    std::uint64_t context_tokens;
+    GdnKernelLedger* ledger;
+};
+void record_gdn_kernel(GdnKernelLedger* ledger, const void* function, dim3 grid, dim3 block) {
+    if (ledger) ledger->push_back({function, grid, block, 0});
+}
+
 template <WeightKind Kind>
 void launch_projection(
     const std::uint16_t* input,
     const RuntimeTensorBinding& weights,
     std::uint32_t input_width,
     std::uint32_t output_width,
-    float* output) {
+    float* output, hipStream_t stream, GdnKernelLedger* ledger) {
+    record_gdn_kernel(ledger, reinterpret_cast<const void*>(project_bf16_to_fp32_kernel<Kind>),
+        dim3(output_width), dim3(kProjectionThreads));
     hipLaunchKernelGGL(
         HIP_KERNEL_NAME(
             project_bf16_to_fp32_kernel<
@@ -1707,7 +1734,7 @@ void launch_projection(
         dim3(output_width),
         dim3(kProjectionThreads),
         0,
-        hip_execution_stream(),
+        stream,
         input,
         reinterpret_cast<const void*>(
             weights.address),
@@ -1725,55 +1752,58 @@ void launch_projection_by_kind(
     const RuntimeTensorBinding& weights,
     std::uint32_t input_width,
     std::uint32_t output_width,
-    float* output, ProjectionMode mode = ProjectionMode::legacy256) {
+    float* output, ProjectionMode mode, hipStream_t stream, GdnKernelLedger* ledger) {
     switch (kind) {
     case WeightKind::f32:
         launch_projection<WeightKind::f32>(
-            input, weights, input_width, output_width, output);
+            input, weights, input_width, output_width, output, stream, ledger);
         return;
     case WeightKind::f16:
         launch_projection<WeightKind::f16>(
-            input, weights, input_width, output_width, output);
+            input, weights, input_width, output_width, output, stream, ledger);
         return;
     case WeightKind::bf16:
         launch_projection<WeightKind::bf16>(
-            input, weights, input_width, output_width, output);
+            input, weights, input_width, output_width, output, stream, ledger);
         return;
     case WeightKind::q8_0:
         if (mode == ProjectionMode::prefetch8_wave8) {
+            record_gdn_kernel(ledger, reinterpret_cast<const void*>(project_prefetch8_wave8_q8_bf16_to_fp32_kernel), dim3((output_width + 7U) / 8U), dim3(256));
             hipLaunchKernelGGL(project_prefetch8_wave8_q8_bf16_to_fp32_kernel,
-                dim3((output_width + 7U) / 8U), dim3(256), 0, hip_execution_stream(),
+                dim3((output_width + 7U) / 8U), dim3(256), 0, stream,
                 input, reinterpret_cast<const void*>(weights.address),
                 input_width, output_width, output);
             check_hip(hipGetLastError(), "HIP GDN prefetch8 wave8 Q8 input projection launch");
             return;
         }
         if (mode == ProjectionMode::prefetch8) {
+            record_gdn_kernel(ledger, reinterpret_cast<const void*>(project_prefetch8_q8_bf16_to_fp32_kernel), dim3(output_width), dim3(32));
             hipLaunchKernelGGL(project_prefetch8_q8_bf16_to_fp32_kernel,
-                dim3(output_width), dim3(32), 0, hip_execution_stream(),
+                dim3(output_width), dim3(32), 0, stream,
                 input, reinterpret_cast<const void*>(weights.address),
                 input_width, output_width, output);
             check_hip(hipGetLastError(), "HIP GDN prefetch8 Q8 input projection launch");
             return;
         }
         if (mode == ProjectionMode::virtual_stream) {
+            record_gdn_kernel(ledger, reinterpret_cast<const void*>(project_virtual_q8_bf16_to_fp32_kernel), dim3(output_width), dim3(32));
             hipLaunchKernelGGL(project_virtual_q8_bf16_to_fp32_kernel,
-                dim3(output_width), dim3(32), 0, hip_execution_stream(),
+                dim3(output_width), dim3(32), 0, stream,
                 input, reinterpret_cast<const void*>(weights.address),
                 input_width, output_width, output);
             check_hip(hipGetLastError(), "HIP GDN virtual Q8 input projection launch");
             return;
         }
         launch_projection<WeightKind::q8_0>(
-            input, weights, input_width, output_width, output);
+            input, weights, input_width, output_width, output, stream, ledger);
         return;
     case WeightKind::iq4_nl:
         launch_projection<WeightKind::iq4_nl>(
-            input, weights, input_width, output_width, output);
+            input, weights, input_width, output_width, output, stream, ledger);
         return;
     case WeightKind::iq4_xs:
         launch_projection<WeightKind::iq4_xs>(
-            input, weights, input_width, output_width, output);
+            input, weights, input_width, output_width, output, stream, ledger);
         return;
     }
 }
@@ -1784,7 +1814,9 @@ void launch_output_projection(
     const RuntimeTensorBinding& weights,
     std::uint32_t input_width,
     std::uint32_t output_width,
-    std::uint16_t* output) {
+    std::uint16_t* output, hipStream_t stream, GdnKernelLedger* ledger) {
+    record_gdn_kernel(ledger, reinterpret_cast<const void*>(project_fp32_to_bf16_kernel<Kind>),
+        dim3(output_width), dim3(kProjectionThreads));
     hipLaunchKernelGGL(
         HIP_KERNEL_NAME(
             project_fp32_to_bf16_kernel<
@@ -1792,7 +1824,7 @@ void launch_output_projection(
         dim3(output_width),
         dim3(kProjectionThreads),
         0,
-        hip_execution_stream(),
+        stream,
         input,
         reinterpret_cast<const void*>(
             weights.address),
@@ -1810,7 +1842,7 @@ void launch_output_by_kind(
     const RuntimeTensorBinding& weights,
     std::uint32_t input_width,
     std::uint32_t output_width,
-    std::uint16_t* output, bool virtual_q8 = false, bool wave8 = false) {
+    std::uint16_t* output, bool virtual_q8, bool wave8, hipStream_t stream, GdnKernelLedger* ledger) {
     if (wave8) {
         if (!virtual_q8 || kind != WeightKind::q8_0)
             throw std::invalid_argument("wave8 GDN output requires virtual Q8_0 weights");
@@ -1818,42 +1850,44 @@ void launch_output_by_kind(
             {reinterpret_cast<std::uintptr_t>(input), static_cast<std::uint64_t>(input_width) * sizeof(float)},
             {weights.address, weights.bytes},
             {reinterpret_cast<std::uintptr_t>(output), static_cast<std::uint64_t>(output_width) * sizeof(std::uint16_t)});
+        record_gdn_kernel(ledger, reinterpret_cast<const void*>(project_prefetch8_wave8_q8_fp32_to_bf16_kernel), dim3((output_width + 7U) / 8U), dim3(256));
         hipLaunchKernelGGL(project_prefetch8_wave8_q8_fp32_to_bf16_kernel, dim3((output_width + 7U) / 8U), dim3(256), 0,
-            hip_execution_stream(), input, reinterpret_cast<const void*>(weights.address), input_width, output_width, output);
+            stream, input, reinterpret_cast<const void*>(weights.address), input_width, output_width, output);
         check_hip(hipGetLastError(), "HIP GDN prefetch8 wave8 Q8 output projection launch");
         return;
     }
     if(virtual_q8) {
         if(kind!=WeightKind::q8_0 || input_width%32U!=0U)
             throw std::invalid_argument("virtual Q8 GDN output requires aligned Q8_0 weights");
+        record_gdn_kernel(ledger, reinterpret_cast<const void*>(project_virtual_q8_fp32_to_bf16_kernel), dim3(output_width), dim3(32));
         hipLaunchKernelGGL(project_virtual_q8_fp32_to_bf16_kernel,dim3(output_width),dim3(32),0,
-            hip_execution_stream(),input,reinterpret_cast<const void*>(weights.address),input_width,output_width,output);
+            stream,input,reinterpret_cast<const void*>(weights.address),input_width,output_width,output);
         check_hip(hipGetLastError(),"HIP GDN virtual Q8 output projection launch");return;
     }
     switch (kind) {
     case WeightKind::f32:
         launch_output_projection<WeightKind::f32>(
-            input, weights, input_width, output_width, output);
+            input, weights, input_width, output_width, output, stream, ledger);
         return;
     case WeightKind::f16:
         launch_output_projection<WeightKind::f16>(
-            input, weights, input_width, output_width, output);
+            input, weights, input_width, output_width, output, stream, ledger);
         return;
     case WeightKind::bf16:
         launch_output_projection<WeightKind::bf16>(
-            input, weights, input_width, output_width, output);
+            input, weights, input_width, output_width, output, stream, ledger);
         return;
     case WeightKind::q8_0:
         launch_output_projection<WeightKind::q8_0>(
-            input, weights, input_width, output_width, output);
+            input, weights, input_width, output_width, output, stream, ledger);
         return;
     case WeightKind::iq4_nl:
         launch_output_projection<WeightKind::iq4_nl>(
-            input, weights, input_width, output_width, output);
+            input, weights, input_width, output_width, output, stream, ledger);
         return;
     case WeightKind::iq4_xs:
         launch_output_projection<WeightKind::iq4_xs>(
-            input, weights, input_width, output_width, output);
+            input, weights, input_width, output_width, output, stream, ledger);
         return;
     }
 }
@@ -2490,9 +2524,8 @@ void preflight_gdn(const ExecutionDispatchContext& context, void* user_data) {
     static_cast<void>(prepare_gdn_launch(context, static_cast<const HipGdnLauncherConfig*>(user_data)));
 }
 
-void launch_gdn(const ExecutionDispatchContext& context, void* user_data) {
-    const auto prepared = prepare_gdn_launch(context, static_cast<const HipGdnLauncherConfig*>(user_data));
-    const auto& config = *static_cast<const HipGdnLauncherConfig*>(user_data);
+void emit_gdn_sequence(const PreparedGdnLaunch& prepared, const HipGdnLauncherConfig& config,
+    const GdnEmitTarget& target) {
     const auto& input = prepared.input; const auto& output = prepared.output;
     const auto& workspace = prepared.workspace; const auto& tensors = prepared.tensors;
     const auto& matrix_state = prepared.matrix_state; const auto& conv_state = prepared.conv_state;
@@ -2502,12 +2535,11 @@ void launch_gdn(const ExecutionDispatchContext& context, void* user_data) {
     const auto projection_mode = prepared.projection_mode;
     const auto* hidden_input = reinterpret_cast<const std::uint16_t*>(input.address);
     if (prepared.graph_capture) {
-        const auto* graph = current_hip_launch_context();
-        hipLaunchKernelGGL(validate_gdn_graph_position, dim3(1), dim3(1), 0, hip_execution_stream(),
-            hip_graph_position(), graph->context_tokens, hip_graph_status());
+        hipLaunchKernelGGL(validate_gdn_graph_position, dim3(1), dim3(1), 0, target.stream,
+            target.graph_position, target.context_tokens, target.graph_status);
         check_hip(hipGetLastError(), "HIP GDN device position validation");
-        hipLaunchKernelGGL(validate_gdn_graph_input, dim3(32), dim3(kProjectionThreads), 0, hip_execution_stream(),
-            hidden_input, hidden, hip_graph_status(), 4U);
+        hipLaunchKernelGGL(validate_gdn_graph_input, dim3(32), dim3(kProjectionThreads), 0, target.stream,
+            hidden_input, hidden, target.graph_status, 4U);
         check_hip(hipGetLastError(), "HIP GDN finite input validation");
     }
 
@@ -2519,7 +2551,7 @@ void launch_gdn(const ExecutionDispatchContext& context, void* user_data) {
         *tensors.qkv.runtime,
         hidden,
         conv_width,
-        workspace.qkv, projection_mode);
+        workspace.qkv, projection_mode, target.stream, target.ledger);
     launch_projection_by_kind(
         weight_kind(
             tensors.z.manifest->
@@ -2528,7 +2560,7 @@ void launch_gdn(const ExecutionDispatchContext& context, void* user_data) {
         *tensors.z.runtime,
         hidden,
         value_width,
-        workspace.z, projection_mode);
+        workspace.z, projection_mode, target.stream, target.ledger);
     launch_projection_by_kind(
         weight_kind(
             tensors.beta.manifest->
@@ -2537,7 +2569,7 @@ void launch_gdn(const ExecutionDispatchContext& context, void* user_data) {
         *tensors.beta.runtime,
         hidden,
         value_heads,
-        workspace.beta, projection_mode);
+        workspace.beta, projection_mode, target.stream, target.ledger);
     launch_projection_by_kind(
         weight_kind(
             tensors.alpha.manifest->
@@ -2546,24 +2578,26 @@ void launch_gdn(const ExecutionDispatchContext& context, void* user_data) {
         *tensors.alpha.runtime,
         hidden,
         value_heads,
-        workspace.gate, projection_mode);
+        workspace.gate, projection_mode, target.stream, target.ledger);
 
-    if (hip_graph_status() != nullptr) {
+    if (target.graph_status != nullptr) {
         hipLaunchKernelGGL(validate_gdn_graph_values, dim3(32), dim3(kProjectionThreads), 0,
-            hip_execution_stream(), workspace.qkv,
-            static_cast<std::uint64_t>(conv_width) + value_width + value_heads * 2ULL, hip_graph_status());
+            target.stream, workspace.qkv,
+            static_cast<std::uint64_t>(conv_width) + value_width + value_heads * 2ULL, target.graph_status);
         check_hip(hipGetLastError(), "HIP GDN finite projection validation");
     }
     const auto conv_blocks =
         (conv_width +
          kProjectionThreads - 1U) /
         kProjectionThreads;
+    record_gdn_kernel(target.ledger, reinterpret_cast<const void*>(conv_update_kernel),
+        dim3(conv_blocks), dim3(kProjectionThreads));
     hipLaunchKernelGGL(
         conv_update_kernel,
         dim3(conv_blocks),
         dim3(kProjectionThreads),
         0,
-        hip_execution_stream(),
+        target.stream,
         workspace.qkv,
         reinterpret_cast<
             std::uint16_t*>(
@@ -2575,7 +2609,7 @@ void launch_gdn(const ExecutionDispatchContext& context, void* user_data) {
             tensors.conv.manifest->
                 ggml_type),
         conv_width,
-        kernel, hip_graph_status());
+        kernel, target.graph_status);
     check_hip(
         hipGetLastError(),
         "HIP GDN causal convolution launch");
@@ -2584,12 +2618,14 @@ void launch_gdn(const ExecutionDispatchContext& context, void* user_data) {
         (value_heads +
          kProjectionThreads - 1U) /
         kProjectionThreads;
+    record_gdn_kernel(target.ledger, reinterpret_cast<const void*>(transform_beta_gate_kernel),
+        dim3(parameter_blocks), dim3(kProjectionThreads));
     hipLaunchKernelGGL(
         transform_beta_gate_kernel,
         dim3(parameter_blocks),
         dim3(kProjectionThreads),
         0,
-        hip_execution_stream(),
+        target.stream,
         workspace.beta,
         workspace.gate,
         reinterpret_cast<const void*>(
@@ -2609,36 +2645,40 @@ void launch_gdn(const ExecutionDispatchContext& context, void* user_data) {
         hipGetLastError(),
         "HIP GDN beta/gate transform launch");
 
+    record_gdn_kernel(target.ledger, reinterpret_cast<const void*>(normalize_qk_kernel),
+        dim3(key_heads * 2U), dim3(kRecurrentThreads));
     hipLaunchKernelGGL(
         normalize_qk_kernel,
         dim3(key_heads * 2U),
         dim3(kRecurrentThreads),
         0,
-        hip_execution_stream(),
+        target.stream,
         workspace.qkv,
         key_heads,
         head_dim,
         config.model.
-            gdn_qk_l2_epsilon, hip_graph_status());
+            gdn_qk_l2_epsilon, target.graph_status);
     check_hip(
         hipGetLastError(),
         "HIP GDN q/k normalization launch");
 
-    if (hip_graph_status() != nullptr) {
+    if (target.graph_status != nullptr) {
         hipLaunchKernelGGL(validate_gdn_graph_values, dim3(32), dim3(kProjectionThreads), 0,
-            hip_execution_stream(), workspace.qkv,
-            static_cast<std::uint64_t>(conv_width) + value_width + value_heads * 2ULL, hip_graph_status());
+            target.stream, workspace.qkv,
+            static_cast<std::uint64_t>(conv_width) + value_width + value_heads * 2ULL, target.graph_status);
         check_hip(hipGetLastError(), "HIP GDN finite recurrent input validation");
     }
     const auto tiles =
         head_dim /
         kValueTile;
+    record_gdn_kernel(target.ledger, reinterpret_cast<const void*>(recurrent_step_kernel),
+        dim3(value_heads * tiles), dim3(kRecurrentThreads));
     hipLaunchKernelGGL(
         recurrent_step_kernel,
         dim3(value_heads * tiles),
         dim3(kRecurrentThreads),
         0,
-        hip_execution_stream(),
+        target.stream,
         workspace.qkv,
         workspace.beta,
         workspace.gate,
@@ -2647,22 +2687,24 @@ void launch_gdn(const ExecutionDispatchContext& context, void* user_data) {
         workspace.core,
         key_heads,
         value_heads,
-        head_dim, hip_graph_status());
+        head_dim, target.graph_status);
     check_hip(
         hipGetLastError(),
         "HIP GDN recurrent update launch");
-    if (hip_graph_status() != nullptr) {
+    if (target.graph_status != nullptr) {
         hipLaunchKernelGGL(validate_gdn_graph_values, dim3(32), dim3(kProjectionThreads), 0,
-            hip_execution_stream(), workspace.core, value_width, hip_graph_status());
+            target.stream, workspace.core, value_width, target.graph_status);
         check_hip(hipGetLastError(), "HIP GDN finite recurrent output validation");
     }
 
+    record_gdn_kernel(target.ledger, reinterpret_cast<const void*>(gated_rms_norm_kernel),
+        dim3(value_heads), dim3(kRecurrentThreads));
     hipLaunchKernelGGL(
         gated_rms_norm_kernel,
         dim3(value_heads),
         dim3(kRecurrentThreads),
         0,
-        hip_execution_stream(),
+        target.stream,
         workspace.core,
         workspace.z,
         reinterpret_cast<const void*>(
@@ -2674,7 +2716,7 @@ void launch_gdn(const ExecutionDispatchContext& context, void* user_data) {
         value_heads,
         head_dim,
         config.model.
-            rms_norm_epsilon, hip_graph_status());
+            rms_norm_epsilon, target.graph_status);
     check_hip(
         hipGetLastError(),
         "HIP GDN gated RMSNorm launch");
@@ -2689,13 +2731,21 @@ void launch_gdn(const ExecutionDispatchContext& context, void* user_data) {
         hidden,
         reinterpret_cast<
             std::uint16_t*>(
-                output.address),config.virtual_q8_output_projection,config.wave8_q8_output_projection);
-    if (hip_graph_status() != nullptr) {
+                output.address),config.virtual_q8_output_projection,config.wave8_q8_output_projection, target.stream, target.ledger);
+    if (target.graph_status != nullptr) {
         hipLaunchKernelGGL(validate_gdn_graph_input, dim3(32), dim3(kProjectionThreads), 0,
-            hip_execution_stream(), reinterpret_cast<const std::uint16_t*>(output.address), hidden,
-            hip_graph_status(), 8U);
+            target.stream, reinterpret_cast<const std::uint16_t*>(output.address), hidden,
+            target.graph_status, 8U);
         check_hip(hipGetLastError(), "HIP GDN finite final output validation");
     }
+}
+
+void launch_gdn(const ExecutionDispatchContext& context, void* user_data) {
+    const auto prepared = prepare_gdn_launch(context, static_cast<const HipGdnLauncherConfig*>(user_data));
+    const auto* graph = current_hip_launch_context();
+    emit_gdn_sequence(prepared, *static_cast<const HipGdnLauncherConfig*>(user_data),
+        {hip_execution_stream(), hip_graph_status(), hip_graph_position(),
+         graph ? graph->context_tokens : 0, nullptr});
 }
 
 std::string kernel_id(
@@ -3251,6 +3301,493 @@ void register_hip_gdn_kernel_variant(
         std::move(variant));
 }
 
+namespace {
+// The owner is immutable; these are full descriptor values, never hash keys.
+struct GdnIslandView {
+    std::uintptr_t address = 0;
+    std::uint64_t bytes = 0, generation = 0;
+    bool operator==(const GdnIslandView&) const = default;
+};
+struct GdnIslandTensor {
+    const RuntimeTensorBinding* binding = nullptr;
+    std::size_t slot = 0;
+    std::uintptr_t address = 0;
+    std::uint64_t bytes = 0, generation = 0;
+    RuntimeTensorStorage storage = RuntimeTensorStorage::resident;
+    std::uint32_t ggml_type = 0;
+    std::uint32_t tensor_index = 0, owner_node = 0;
+    bool operator==(const GdnIslandTensor&) const = default;
+};
+struct GdnIslandDescriptor {
+    std::uint32_t step = 0, layer = 0;
+    std::array<GdnIslandView, 3> buffers;
+    std::array<std::uintptr_t, 5> workspace;
+    std::array<GdnIslandTensor, 9> tensors;
+    std::array<GdnIslandView, 2> state;
+    std::array<SessionStateStorage, 2> state_storage;
+    std::array<std::uint32_t, 7> dimensions;
+    ProjectionMode projection_mode = ProjectionMode::legacy256;
+    bool graph_capture = false;
+    bool operator==(const GdnIslandDescriptor&) const = default;
+};
+std::array<TensorPair, 9> island_tensors(const GdnTensors& tensors) {
+    return {tensors.qkv, tensors.z, tensors.beta, tensors.alpha, tensors.conv,
+        tensors.dt, tensors.a, tensors.norm, tensors.out};
+}
+GdnIslandDescriptor island_descriptor(const ExecutionDispatchContext& context, const PreparedGdnLaunch& p,
+    const ModelRuntimeBinding& actual, const GdnIslandDescriptor* expected = nullptr) {
+    GdnIslandDescriptor d;
+    d.step = context.step_id; d.layer = context.layer.value();
+    d.buffers = {{{p.input.address, p.input.bytes, p.input.allocation_generation},
+        {p.output.address, p.output.bytes, p.output.allocation_generation},
+        {p.temporary.address, p.temporary.bytes, p.temporary.allocation_generation}}};
+    d.workspace = {reinterpret_cast<std::uintptr_t>(p.workspace.qkv), reinterpret_cast<std::uintptr_t>(p.workspace.z),
+        reinterpret_cast<std::uintptr_t>(p.workspace.beta), reinterpret_cast<std::uintptr_t>(p.workspace.gate),
+        reinterpret_cast<std::uintptr_t>(p.workspace.core)};
+    const auto tensors = island_tensors(p.tensors);
+    for (std::size_t i = 0; i < tensors.size(); ++i) {
+        const auto& t = tensors[i];
+        std::size_t slot = 0;
+        if (expected) {
+            slot = expected->tensors[i].slot;
+            // Check the current slot address without dereferencing the recorded
+            // pointer: vector replacement invalidates admission, not lifetime.
+            if (slot >= actual.tensors.size() || &actual.tensors[slot] != expected->tensors[i].binding)
+                throw std::invalid_argument("GDN island canonical weight owner slot changed");
+        } else {
+            // Setup only: the unprepared context must resolve the real owner.
+            const auto found = std::find_if(actual.tensors.begin(), actual.tensors.end(),
+                [&](const RuntimeTensorBinding& tensor) { return &tensor == t.runtime; });
+            if (found == actual.tensors.end())
+                throw std::invalid_argument("GDN island setup tensor lacks an actual owner slot");
+            slot = static_cast<std::size_t>(found - actual.tensors.begin());
+        }
+        const auto& canonical = actual.tensors[slot];
+        const auto& resolved = *t.runtime;
+        // PreparedTensorViews owns a deep metadata copy. Normalize that pointer
+        // only after every resolved runtime field matches the retained owner.
+        if (resolved.tensor_index != canonical.tensor_index || resolved.storage != canonical.storage ||
+            resolved.address != canonical.address || resolved.bytes != canonical.bytes ||
+            resolved.allocation_generation != canonical.allocation_generation || resolved.owner_node != canonical.owner_node)
+            throw std::invalid_argument("GDN island resolved weight differs from its actual canonical owner slot");
+        d.tensors[i] = {&canonical, slot, resolved.address, resolved.bytes,
+            resolved.allocation_generation, resolved.storage, t.manifest->ggml_type,
+            resolved.tensor_index, resolved.owner_node};
+    }
+    d.state = {{{p.matrix_state.address, p.matrix_state.bytes, p.matrix_state.allocation_generation},
+        {p.conv_state.address, p.conv_state.bytes, p.conv_state.allocation_generation}}};
+    d.state_storage = {p.matrix_state.storage, p.conv_state.storage};
+    d.dimensions = {p.hidden, p.key_heads, p.value_heads, p.head_dim, p.value_width, p.conv_width, p.kernel};
+    d.projection_mode = p.projection_mode; d.graph_capture = p.graph_capture;
+    return d;
+}
+
+bool same_island_config(const HipGdnLauncherConfig& a, const HipGdnLauncherConfig& b) noexcept {
+    return a.model.vocab_size == b.model.vocab_size &&
+        a.model.hidden_size == b.model.hidden_size &&
+        a.model.max_position_embeddings == b.model.max_position_embeddings &&
+        a.model.hidden_layers == b.model.hidden_layers &&
+        a.model.full_attention_interval == b.model.full_attention_interval &&
+        a.model.ple_layer_1based == b.model.ple_layer_1based &&
+        a.model.ple_embed_dim == b.model.ple_embed_dim &&
+        a.model.ple_conv_kernel_size == b.model.ple_conv_kernel_size &&
+        a.model.ngram_size == b.model.ngram_size &&
+        a.model.heads_per_ngram == b.model.heads_per_ngram &&
+        a.model.ngram_vocab_size_base == b.model.ngram_vocab_size_base &&
+        a.model.ngram_vocab_divisor == b.model.ngram_vocab_divisor &&
+        a.model.ngram_hash_seed == b.model.ngram_hash_seed &&
+        a.model.ple_eos_token_id == b.model.ple_eos_token_id &&
+        a.model.hc_count == b.model.hc_count &&
+        a.model.hc_lowrank == b.model.hc_lowrank &&
+        a.model.full_attention_layers == b.model.full_attention_layers &&
+        a.model.gdn_layers == b.model.gdn_layers &&
+        a.model.attention_heads == b.model.attention_heads &&
+        a.model.kv_heads == b.model.kv_heads &&
+        a.model.head_dim == b.model.head_dim &&
+        a.model.mtp_full_attention_layers == b.model.mtp_full_attention_layers &&
+        a.model.mtp_use_dedicated_embeddings == b.model.mtp_use_dedicated_embeddings &&
+        a.model.mtp_hidden_state_source_layer_explicit == b.model.mtp_hidden_state_source_layer_explicit &&
+        a.model.gdn_key_heads == b.model.gdn_key_heads &&
+        a.model.gdn_key_head_dim == b.model.gdn_key_head_dim &&
+        a.model.gdn_value_heads == b.model.gdn_value_heads &&
+        a.model.gdn_value_head_dim == b.model.gdn_value_head_dim &&
+        a.model.gdn_conv_kernel == b.model.gdn_conv_kernel &&
+        a.model.indexer_n_heads == b.model.indexer_n_heads &&
+        a.model.indexer_kv_heads == b.model.indexer_kv_heads &&
+        a.model.indexer_head_dim == b.model.indexer_head_dim &&
+        a.model.indexer_budget == b.model.indexer_budget &&
+        a.model.indexer_compress_ratio == b.model.indexer_compress_ratio &&
+        std::bit_cast<std::uint32_t>(a.model.partial_rotary_factor) == std::bit_cast<std::uint32_t>(b.model.partial_rotary_factor) &&
+        std::bit_cast<std::uint32_t>(a.model.rope_theta) == std::bit_cast<std::uint32_t>(b.model.rope_theta) &&
+        a.model.moe_intermediate_size == b.model.moe_intermediate_size &&
+        a.model.shared_expert_intermediate_size == b.model.shared_expert_intermediate_size &&
+        a.model.num_experts == b.model.num_experts &&
+        a.model.num_experts_per_token == b.model.num_experts_per_token &&
+        std::bit_cast<std::uint32_t>(a.model.rms_norm_epsilon) == std::bit_cast<std::uint32_t>(b.model.rms_norm_epsilon) &&
+        a.model.norm_topk_probability == b.model.norm_topk_probability &&
+        a.model.gdn_output_gate_sigmoid == b.model.gdn_output_gate_sigmoid &&
+        a.model.gdn_qk_l2norm == b.model.gdn_qk_l2norm &&
+        std::bit_cast<std::uint32_t>(a.model.gdn_qk_l2_epsilon) == std::bit_cast<std::uint32_t>(b.model.gdn_qk_l2_epsilon) &&
+        a.model.gdn_conv_silu == b.model.gdn_conv_silu &&
+        a.model.bytes_bf16 == b.model.bytes_bf16 &&
+        a.model.bytes_fp32 == b.model.bytes_fp32 &&
+        a.activation == b.activation &&
+        a.enable_device_graph_inputs == b.enable_device_graph_inputs &&
+        a.virtual_q8_input_projections == b.virtual_q8_input_projections &&
+        a.prefetch_q8_input_projections == b.prefetch_q8_input_projections &&
+        a.wave8_q8_input_projections == b.wave8_q8_input_projections &&
+        a.virtual_q8_output_projection == b.virtual_q8_output_projection &&
+        a.wave8_q8_output_projection == b.wave8_q8_output_projection;
+}
+
+std::uint64_t island_organization_identity(const HipGdnLauncherConfig& config) noexcept {
+    auto identity = implementation_identity(config);
+    hash_u64(identity, 0x47444e49534c3031ULL); // GDNISL01: organization only.
+    return identity;
+}
+bool same_island_memory(const ExecutionMemoryBinding& a, const ExecutionMemoryBinding& b) noexcept {
+    return a.execution_identity == b.execution_identity && a.arena_base == b.arena_base &&
+        a.arena_bytes == b.arena_bytes && a.allocation_generation == b.allocation_generation;
+}
+void require_island_d1_scope(const HipLaunchContext& scope, std::uint64_t identity) {
+    const auto& record = scope.deferred_moe_status;
+    if (scope.graph_capture || !scope.stream || scope.stream == hipStreamLegacy || scope.stream == hipStreamPerThread ||
+        record.execution_identity != identity || !record.allocation_generation || !record.arena_base ||
+        record.arena_base % alignof(std::uint32_t) || record.arena_bytes != 8 ||
+        record.arena_base > std::numeric_limits<std::uintptr_t>::max() - 8U)
+        throw std::invalid_argument("GDN islands require an owned eager D1 stream and bounded eight-byte record");
+}
+void validate_island_graph(hipGraph_t graph, const GdnKernelLedger& ledger) {
+    if (ledger.size() != 10) throw std::runtime_error("GDN island emitter must record ten kernel nodes");
+    std::size_t count = 0;
+    check_hip(hipGraphGetNodes(graph, nullptr, &count), "GDN island node count");
+    if (count != ledger.size()) throw std::runtime_error("GDN island must capture exactly ten nodes");
+    std::vector<hipGraphNode_t> nodes(count);
+    check_hip(hipGraphGetNodes(graph, nodes.data(), &count), "GDN island node inventory");
+    if (count != ledger.size()) throw std::runtime_error("GDN island node inventory changed");
+    std::vector<bool> used(count, false);
+    hipGraphNode_t previous = nullptr;
+    for (const auto& expected : ledger) {
+        std::size_t selected = count;
+        for (std::size_t i = 0; i < count; ++i) {
+            if (used[i]) continue;
+            std::size_t dependencies = 0;
+            check_hip(hipGraphNodeGetDependencies(nodes[i], nullptr, &dependencies), "GDN island dependencies");
+            if (dependencies != (previous ? 1U : 0U)) continue;
+            if (previous) {
+                hipGraphNode_t dependency = nullptr;
+                check_hip(hipGraphNodeGetDependencies(nodes[i], &dependency, &dependencies), "GDN island dependency edge");
+                if (dependencies != 1 || dependency != previous) continue;
+            }
+            if (selected != count) throw std::runtime_error("GDN island graph is not one linear chain");
+            selected = i;
+        }
+        if (selected == count) throw std::runtime_error("GDN island graph has a missing linear dependency");
+        hipGraphNodeType type{};
+        check_hip(hipGraphNodeGetType(nodes[selected], &type), "GDN island node type");
+        if (type != hipGraphNodeTypeKernel) throw std::runtime_error("GDN island captured a non-kernel node");
+        hipKernelNodeParams parameters{};
+        check_hip(hipGraphKernelNodeGetParams(nodes[selected], &parameters), "GDN island kernel parameters");
+        if (parameters.func != expected.function || parameters.gridDim.x != expected.grid.x ||
+            parameters.gridDim.y != expected.grid.y || parameters.gridDim.z != expected.grid.z ||
+            parameters.blockDim.x != expected.block.x || parameters.blockDim.y != expected.block.y ||
+            parameters.blockDim.z != expected.block.z || parameters.sharedMemBytes != expected.shared_bytes)
+            throw std::runtime_error("GDN island kernel node differs from the emitter ledger");
+        used[selected] = true; previous = nodes[selected];
+    }
+}
+} // namespace
+
+struct HipGdnIslands::Impl {
+    struct Island {
+        GdnIslandDescriptor descriptor;
+        hipGraph_t graph = nullptr;
+        hipGraphExec_t executable = nullptr;
+    };
+    // Retain actual owners until every graph is destroyed after quiescence.
+    std::shared_ptr<const void> resources_owner;
+    std::shared_ptr<const HipModelResidency> weights;
+    std::shared_ptr<const HipSetupQuiescenceGuard> guard;
+    const CompiledSerialExecution compiled;
+    const HipGdnLauncherConfig config;
+    const ExecutionRuntimeResources* resources;
+    const ExecutionRuntimeResources resource_bindings;
+    const HipLaunchContext scope;
+    const HipGdnIslandBudget budget;
+    std::vector<std::unique_ptr<Island>> steps;
+    HipGdnIslandReceipt observed;
+    hipStream_t setup_stream = nullptr;
+    bool capturing = false, failed = false;
+    hipGraph_t abandoned_graph = nullptr;
+    ModelContentIdentity model_content;
+    std::uint64_t manifest_identity = 0;
+    std::uint64_t weight_generation = 0;
+
+    Impl(const CompiledSerialExecution& c, const HipGdnLauncherConfig& cfg,
+        const ExecutionRuntimeResources& r, const HipLaunchContext& s,
+        std::shared_ptr<const HipModelResidency> w, std::shared_ptr<const void> owner,
+        std::shared_ptr<const HipSetupQuiescenceGuard> g, HipGdnIslandBudget b)
+        : resources_owner(std::move(owner)), weights(std::move(w)), guard(std::move(g)),
+          compiled(c), config(cfg), resources(&r), resource_bindings(r), scope(s), budget(b) {}
+
+    void finish_capture() noexcept {
+        if (!capturing) return;
+        hipGraph_t graph = nullptr;
+        const auto error = hipStreamEndCapture(setup_stream, &graph);
+        if (error == hipSuccess || error == hipErrorStreamCaptureInvalidated) capturing = false;
+        if (graph && hipGraphDestroy(graph) != hipSuccess) abandoned_graph = graph;
+    }
+    bool destroy() noexcept {
+        if (capturing) return false;
+        bool okay = true;
+        for (auto& island : steps) if (island) {
+            if (island->executable) {
+                if (hipGraphExecDestroy(island->executable) == hipSuccess) island->executable = nullptr;
+                else okay = false;
+            }
+            if (island->graph) {
+                if (hipGraphDestroy(island->graph) == hipSuccess) island->graph = nullptr;
+                else okay = false;
+            }
+        }
+        if (abandoned_graph) {
+            if (hipGraphDestroy(abandoned_graph) == hipSuccess) abandoned_graph = nullptr;
+            else okay = false;
+        }
+        if (setup_stream) {
+            if (hipStreamDestroy(setup_stream) == hipSuccess) setup_stream = nullptr;
+            else okay = false;
+        }
+        return okay;
+    }
+    void device_range(GdnIslandView range) const {
+        if (!range.address || !range.bytes || !range.generation ||
+            range.bytes > std::numeric_limits<std::uintptr_t>::max() - range.address)
+            throw std::invalid_argument("GDN island has an invalid native resource range");
+        hipPointerAttribute_t attributes{};
+        check_hip(hipPointerGetAttributes(&attributes, reinterpret_cast<const void*>(range.address)), "GDN island device identity");
+        if (attributes.type != hipMemoryTypeDevice || attributes.isManaged || attributes.device != guard->device_index())
+            throw std::invalid_argument("GDN island scratch/state requires original-device allocations");
+        hipDeviceptr_t allocation{}; std::size_t bytes = 0;
+        check_hip(hipMemGetAddressRange(&allocation, &bytes, reinterpret_cast<hipDeviceptr_t>(range.address)),
+            "GDN island native extent");
+        const auto base = reinterpret_cast<std::uintptr_t>(allocation);
+        if (range.address < base || range.address - base > bytes || range.bytes > bytes - (range.address - base))
+            throw std::invalid_argument("GDN island resource exceeds its native allocation");
+    }
+    void build() {
+        if (current_hip_launch_context()) throw std::invalid_argument("GDN island setup requires no active launch scope");
+        validate_config(config);
+        const bool legacy = !config.virtual_q8_input_projections && !config.prefetch_q8_input_projections &&
+            !config.virtual_q8_output_projection;
+        const bool profile = config.virtual_q8_input_projections && config.prefetch_q8_input_projections &&
+            config.virtual_q8_output_projection;
+        if (config.enable_device_graph_inputs || config.wave8_q8_input_projections || config.wave8_q8_output_projection ||
+            (!legacy && !profile) ||
+            compiled.device_graph_inputs || compiled.logical_rows != 1 || compiled.request_concurrency != 1 ||
+            !compiled.execution_identity || !compiled.kernel_plan_identity ||
+            compiled.execution.steps.size() != compiled.io.steps.size() ||
+            compiled.execution.steps.size() != compiled.bindings.bindings.size())
+            throw std::invalid_argument("GDN islands require a complete eager R1/C1 non-wave8 source");
+        if (!resources_owner || !weights || !guard || &weights->binding() != resources->model_weights || !weights->generation())
+            throw std::invalid_argument("GDN islands require the actual retained D1 and weight owners");
+        require_island_d1_scope(scope, compiled.execution_identity);
+        validate_execution_runtime_resources(compiled.execution_identity, compiled.arena, *resources, 0);
+        model_content = weights->binding().model_content_identity;
+        manifest_identity = weights->binding().manifest_layout_identity;
+        weight_generation = weights->generation();
+        std::uint32_t count = 0;
+        std::vector<std::uint32_t> layers;
+        ExecutionBindingRequest request;
+        for (std::size_t i = 0; i < compiled.execution.steps.size(); ++i) {
+            const auto& step = compiled.execution.steps[i];
+            const auto& binding = compiled.bindings.bindings[i];
+            const auto& io = compiled.io.steps[i];
+            if (step.id != i || binding.step_id != step.id || binding.op != step.op || io.step_id != step.id || io.op != step.op)
+                throw std::invalid_argument("GDN island source step/binding/IO must be dense and consistent");
+            if (step.op != SerialOp::gated_delta_net) continue;
+            if (!step.layer || binding.host_or_runtime_step || !binding.kernel_id ||
+                *binding.kernel_id != kernel_id(request, config) ||
+                std::find(layers.begin(), layers.end(), *step.layer) != layers.end())
+                throw std::invalid_argument("GDN island source requires one exact selected kernel per GDN layer");
+            layers.push_back(*step.layer);
+            if (count == std::numeric_limits<std::uint32_t>::max()) throw std::overflow_error("GDN island count overflow");
+            ++count;
+        }
+        if (!count || count > budget.max_islands || count > budget.max_kernel_nodes / 10U)
+            throw std::invalid_argument("GDN island count exceeds explicit setup admission");
+        steps.resize(compiled.execution.steps.size());
+        observed.organization_identity = island_organization_identity(config);
+        observed.islands = count; observed.kernel_nodes = count * 10U;
+        const auto& scratch = *resources->scratch;
+        const auto& state = *resources->session_state_memory;
+        device_range({scratch.arena_base, scratch.arena_bytes, scratch.allocation_generation});
+        device_range({state.device_base, state.device_bytes, state.device_allocation_generation});
+        device_range({scope.deferred_moe_status.arena_base, 8, scope.deferred_moe_status.allocation_generation});
+        const std::array<GdnIslandView, 3> writable_owners{{
+            {scratch.arena_base, scratch.arena_bytes, scratch.allocation_generation},
+            {state.device_base, state.device_bytes, state.device_allocation_generation},
+            {scope.deferred_moe_status.arena_base, 8, scope.deferred_moe_status.allocation_generation}}};
+        const auto overlaps = [](GdnIslandView a, GdnIslandView b) {
+            return a.address < b.address + b.bytes && b.address < a.address + a.bytes;
+        };
+        for (std::size_t i = 0; i < writable_owners.size(); ++i)
+            for (std::size_t j = i + 1; j < writable_owners.size(); ++j)
+                if (overlaps(writable_owners[i], writable_owners[j]))
+                    throw std::invalid_argument("GDN island scratch, state and D1 record owners must be disjoint");
+        for (const auto& tensor : weights->binding().tensors) {
+            if (!runtime_tensor_gpu_visible(tensor.storage)) continue;
+            if (!tensor.address || !tensor.bytes || tensor.bytes > std::numeric_limits<std::uintptr_t>::max() - tensor.address)
+                throw std::invalid_argument("GDN island weight extent is invalid");
+            for (const auto& owner : writable_owners)
+                if (overlaps(owner, {tensor.address, tensor.bytes, tensor.allocation_generation}))
+                    throw std::invalid_argument("GDN island writable owner aliases weights");
+        }
+        check_hip(hipStreamCreateWithFlags(&setup_stream, hipStreamNonBlocking), "GDN island setup stream create");
+        std::size_t before = 0, after = 0, total = 0;
+        const bool before_observed = hipMemGetInfo(&before, &total) == hipSuccess;
+        try {
+            for (std::size_t i = 0; i < compiled.execution.steps.size(); ++i) {
+                const auto& step = compiled.execution.steps[i];
+                if (step.op != SerialOp::gated_delta_net) continue;
+                const auto& io = compiled.io.steps[i];
+                ExecutionDispatchContext context;
+                context.execution_identity = compiled.execution_identity;
+                context.step_id = step.id; context.op = step.op; context.layer = step.layer;
+                context.logical_rows = 1; context.request_concurrency = 1;
+                context.reads = io.reads; context.writes = io.writes; context.temporaries = io.temporaries;
+                context.arena = &compiled.arena; context.memory = resources->scratch; context.resources = resources;
+                context.session_state_layout = resources->session_state_layout;
+                context.session_state_memory = resources->session_state_memory;
+                context.reads_state = step.reads_state; context.writes_state = step.writes_state;
+                context.kernel_id = *compiled.bindings.bindings[i].kernel_id;
+                const auto prepared = prepare_gdn_launch(context, &config);
+                auto island = std::make_unique<Island>();
+                island->descriptor = island_descriptor(context, prepared, weights->binding());
+                for (const auto& buffer : island->descriptor.buffers) device_range(buffer);
+                for (const auto& view : island->descriptor.state) device_range(view);
+                for (const auto& tensor : island->descriptor.tensors) {
+                    if ((tensor.storage != RuntimeTensorStorage::resident && tensor.storage != RuntimeTensorStorage::repacked_cache &&
+                         tensor.storage != RuntimeTensorStorage::registered_file_mapped) ||
+                        tensor.generation != weights->generation() || !weights->covers_device_range(tensor.address, tensor.bytes))
+                        throw std::invalid_argument("GDN island tensor is outside its actual retained residency");
+                }
+                steps[i] = std::move(island);
+                GdnKernelLedger ledger; ledger.reserve(10);
+                check_hip(hipStreamBeginCapture(setup_stream, hipStreamCaptureModeThreadLocal), "GDN island capture begin");
+                capturing = true;
+                hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
+                check_hip(hipStreamIsCapturing(setup_stream, &capture), "GDN island capture state");
+                if (capture != hipStreamCaptureStatusActive || current_hip_launch_context())
+                    throw std::runtime_error("GDN island capture requires the explicit setup target without a launch scope");
+                emit_gdn_sequence(prepared, config, {setup_stream, nullptr, nullptr, 0, &ledger});
+                const auto ended = hipStreamEndCapture(setup_stream, &steps[i]->graph);
+                if (ended == hipSuccess || ended == hipErrorStreamCaptureInvalidated) capturing = false;
+                check_hip(ended, "GDN island capture end");
+                validate_island_graph(steps[i]->graph, ledger);
+                check_hip(hipGraphInstantiate(&steps[i]->executable, steps[i]->graph, nullptr, nullptr, 0), "GDN island instantiate");
+            }
+        } catch (...) { finish_capture(); throw; }
+        check_hip(hipStreamDestroy(setup_stream), "GDN island setup stream destroy"); setup_stream = nullptr;
+        const bool after_observed = hipMemGetInfo(&after, &total) == hipSuccess;
+        if (before_observed && after_observed && before <= static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max()) &&
+            after <= static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max())) {
+            observed.memory_observed = true;
+            observed.observed_setup_free_delta_bytes = static_cast<std::int64_t>(before) - static_cast<std::int64_t>(after);
+            if (budget.observed_setup_delta_reject_bytes && observed.observed_setup_free_delta_bytes > 0 &&
+                static_cast<std::uint64_t>(observed.observed_setup_free_delta_bytes) > budget.observed_setup_delta_reject_bytes)
+                throw std::invalid_argument("GDN island observed setup memory delta exceeds explicit rejection threshold");
+        }
+    }
+    Island& admit(const ExecutionDispatchContext& context, const PreparedGdnLaunch& prepared) {
+        if (failed) throw std::logic_error("GDN island owner is failed and cannot be reused");
+        const auto* active = current_hip_launch_context();
+        if (!active || active->graph_capture || active->stream != scope.stream ||
+            !same_island_memory(active->deferred_moe_status, scope.deferred_moe_status) ||
+            context.execution_identity != compiled.execution_identity || context.resources != resources ||
+            resources->scratch != resource_bindings.scratch || resources->model_manifest != resource_bindings.model_manifest ||
+            resources->tensor_access != resource_bindings.tensor_access ||
+            resources->session_state_layout != resource_bindings.session_state_layout ||
+            resources->session_state_memory != resource_bindings.session_state_memory ||
+            resources->model_weights != &weights->binding() || weights->binding().model_content_identity != model_content ||
+            weights->binding().manifest_layout_identity != manifest_identity || weights->generation() != weight_generation ||
+            context.step_id >= steps.size() || !steps[context.step_id] ||
+            !(island_descriptor(context, prepared, weights->binding(), &steps[context.step_id]->descriptor) ==
+                steps[context.step_id]->descriptor))
+            throw std::invalid_argument("GDN island replay scope, owner or complete descriptor changed");
+        return *steps[context.step_id];
+    }
+    void registration(const CompiledSerialExecution& source, const HipGdnLauncherConfig& cfg) const {
+        if (failed || source.execution_identity != compiled.execution_identity ||
+            source.kernel_plan_identity != compiled.kernel_plan_identity || source.device_graph_inputs ||
+            source.logical_rows != 1 || source.request_concurrency != 1 || !same_island_config(config, cfg) ||
+            source.execution.steps.size() != compiled.execution.steps.size() ||
+            source.bindings.bindings.size() != compiled.bindings.bindings.size())
+            throw std::invalid_argument("GDN island registration source/config differs from its fixed owner");
+        std::size_t count = 0;
+        for (std::size_t i = 0; i < source.execution.steps.size(); ++i) {
+            const auto& step = source.execution.steps[i];
+            if (step.op != SerialOp::gated_delta_net) {
+                if (steps[i]) throw std::invalid_argument("GDN island registration lost a GDN step");
+                continue;
+            }
+            if (!steps[i] || step.id != i || !step.layer || *step.layer != steps[i]->descriptor.layer)
+                throw std::invalid_argument("GDN island registration step/layer coverage changed");
+            const auto& binding = source.bindings.bindings[i];
+            const auto& original = compiled.bindings.bindings[i];
+            if (binding.step_id != step.id || binding.op != step.op || binding.host_or_runtime_step ||
+                binding.kernel_id != original.kernel_id)
+                throw std::invalid_argument("GDN island registration selected numerical kernel changed");
+            ++count;
+        }
+        if (count != observed.islands) throw std::invalid_argument("GDN island registration has incomplete coverage");
+    }
+};
+
+HipGdnIslands::HipGdnIslands(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
+std::shared_ptr<HipGdnIslands> HipGdnIslands::create(const CompiledSerialExecution& compiled,
+    const HipGdnLauncherConfig& config, const ExecutionRuntimeResources& resources, const HipLaunchContext& scope,
+    std::shared_ptr<const HipModelResidency> weights, std::shared_ptr<const void> owner,
+    std::shared_ptr<const HipSetupQuiescenceGuard> guard, HipGdnIslandBudget budget) {
+    if (!weights || !owner || !guard) throw std::invalid_argument("GDN island setup requires strong actual owners");
+    auto impl = std::make_unique<Impl>(compiled, config, resources, scope, std::move(weights), std::move(owner), guard, budget);
+    try { guard->run([&] { impl->build(); }); }
+    catch (...) {
+        impl->finish_capture(); guard->recover_or_fail_stop();
+        if (!impl->destroy()) (void)impl.release();
+        throw;
+    }
+    return std::shared_ptr<HipGdnIslands>(new HipGdnIslands(std::move(impl)));
+}
+HipGdnIslands::~HipGdnIslands() {
+    if (impl_) {
+        impl_->guard->recover_or_fail_stop();
+        if (!impl_->destroy()) (void)impl_.release();
+    }
+}
+HipGdnIslandReceipt HipGdnIslands::receipt() const noexcept { return impl_->observed; }
+void HipGdnIslands::preflight_gdn_island(const ExecutionDispatchContext& context, void* opaque) {
+    if (!opaque) throw std::invalid_argument("GDN island launcher lacks its owner");
+    auto& owner = *static_cast<HipGdnIslands*>(opaque);
+    try {
+        const auto prepared = prepare_gdn_launch(context, &owner.impl_->config);
+        (void)owner.impl_->admit(context, prepared);
+    } catch (...) { owner.impl_->failed = true; throw; }
+}
+void HipGdnIslands::launch_gdn_island(const ExecutionDispatchContext& context, void* opaque) {
+    if (!opaque) throw std::invalid_argument("GDN island launcher lacks its owner");
+    auto& owner = *static_cast<HipGdnIslands*>(opaque);
+    try {
+        const auto prepared = prepare_gdn_launch(context, &owner.impl_->config);
+        auto& island = owner.impl_->admit(context, prepared);
+        if (owner.impl_->observed.replays == std::numeric_limits<std::uint64_t>::max())
+            throw std::overflow_error("GDN island replay counter overflow");
+        check_hip(hipGraphLaunch(island.executable, owner.impl_->scope.stream), "GDN island replay");
+        ++owner.impl_->observed.replays;
+    } catch (...) { owner.impl_->failed = true; throw; }
+}
+
+
 ExecutionLauncher
 make_hip_gdn_launcher(
     std::string kernel_id_value,
@@ -3281,7 +3818,7 @@ make_hip_gdn_launcher(
 void HipGdnLauncherBundle::
 register_for_compiled_execution(
     const CompiledSerialExecution& compiled,
-    ExecutionLauncherRegistry& registry) {
+    ExecutionLauncherRegistry& registry, HipGdnIslands* islands) {
     if (compiled.execution_identity == 0 ||
         compiled.execution.steps.size() !=
             compiled.bindings.bindings.size()) {
@@ -3289,6 +3826,7 @@ register_for_compiled_execution(
             "HIP GDN bundle requires valid compiled execution");
     }
 
+    if (islands) islands->impl_->registration(compiled, config_);
     std::string registered_id;
     for (std::size_t index = 0;
          index <
@@ -3331,10 +3869,13 @@ register_for_compiled_execution(
         if (registered_id.empty()) {
             registered_id =
                 *binding.kernel_id;
-            registry.add_kernel_launcher(
-                make_hip_gdn_launcher(
-                    registered_id,
-                    &config_));
+            if (islands) {
+                registry.add_kernel_launcher({registered_id, island_organization_identity(config_),
+                    &HipGdnIslands::launch_gdn_island, islands, &HipGdnIslands::preflight_gdn_island});
+            } else {
+                registry.add_kernel_launcher(
+                    make_hip_gdn_launcher(registered_id, &config_));
+            }
         } else if (registered_id !=
                    *binding.kernel_id) {
             throw std::invalid_argument(
