@@ -3678,6 +3678,20 @@ void enqueue_scores(Shape shape, const Bindings& bindings, Mode mode, hipStream_
 
 namespace strix {
 namespace {
+// Cache-only teacher rows must not publish a finite FP32 value that overflows
+// its durable BF16 cast. This validator has no reduction or payload mutation.
+__global__ void validate_mtp_cache_casts(const float* index,std::uint32_t index_dim,
+    const float* key,const float* value,std::uint32_t kv_width,std::uint32_t* status) {
+    if(atomicAdd(status,0U)!=0U)return;
+    const auto count=index_dim>kv_width?index_dim:kv_width;
+    for(std::uint32_t i=threadIdx.x;i<count;i+=blockDim.x) {
+        bool invalid=false;
+        if(i<index_dim)invalid=!isfinite(index[i]) || (float_to_bf16(index[i])&0x7f80U)==0x7f80U;
+        if(i<kv_width)invalid=invalid || !isfinite(key[i]) || !isfinite(value[i]) ||
+            (float_to_bf16(key[i])&0x7f80U)==0x7f80U || (float_to_bf16(value[i])&0x7f80U)==0x7f80U;
+        if(invalid)atomicOr(status,8U);
+    }
+}
 struct MtpAttentionPrepared {
     MtpDeviceView input,output,work,kv,index,status;
     WorkspacePointers workspace;
@@ -3763,6 +3777,28 @@ void mtp_attention_finite(const MtpAttentionPrepared& p,const float* values,std:
 }
 }
 void preflight_hip_mtp_attention(const MtpNativeContext& c) {(void)prepare_mtp_attention(c);}
+void preflight_hip_mtp_cache_rows(const MtpNativeContext& c) {(void)prepare_mtp_attention(c);}
+void launch_hip_mtp_cache_rows(const MtpNativeContext& c,void* raw_stream) {
+    const auto p=prepare_mtp_attention(c);require_mtp_attention_stream(c,raw_stream);
+    const auto stream=static_cast<hipStream_t>(raw_stream);const auto& m=*c.model;const auto& w=p.workspace;
+    // The original indexer stores the unnormalised BF16-rounded key. Pooled
+    // index-key norm/RoPE is applied later by block_score_kernel, never here.
+    mtp_project<WeightKind::bf16>(p.input,p.tensors.index_k,p.hidden,p.index_dim,w.current_index_key,stream);
+    mtp_project<WeightKind::q8_0>(p.input,p.tensors.k,p.hidden,p.kv_width,w.current_k,stream);
+    mtp_project<WeightKind::q8_0>(p.input,p.tensors.v,p.hidden,p.kv_width,w.current_v,stream);
+    launch_norm_rope_typed<SmallWeightKind::f32>(w.current_k,p.kv_heads,p.dim,p.dim,*p.tensors.k_norm.runtime,m,c.position,{},stream);
+    auto* status=reinterpret_cast<std::uint32_t*>(p.status.address);
+    hipLaunchKernelGGL(validate_mtp_cache_casts,dim3(1),dim3(kThreads),0,stream,
+        w.current_index_key,p.index_dim,w.current_k,w.current_v,p.kv_width,status);
+    check_hip(hipGetLastError(),"MTP teacher cache-cast validation enqueue");
+    const GraphPositionKernelArguments guarded{nullptr,c.resources->context_capacity(),status};
+    hipLaunchKernelGGL(store_raw_index_key_kernel,dim3((p.index_dim+kThreads-1U)/kThreads),dim3(kThreads),0,stream,
+        w.current_index_key,reinterpret_cast<std::uint16_t*>(p.index.address),p.index_dim,c.position,guarded);
+    check_hip(hipGetLastError(),"MTP teacher raw index store enqueue");
+    hipLaunchKernelGGL(store_kv_kernel,dim3((p.kv_width+kThreads-1U)/kThreads),dim3(kThreads),0,stream,w.current_k,w.current_v,
+        reinterpret_cast<std::uint16_t*>(p.kv.address),p.kv_width,c.position,guarded);
+    check_hip(hipGetLastError(),"MTP teacher KV store enqueue");
+}
 void launch_hip_mtp_indexer(const MtpNativeContext& c,void* raw_stream) {
     const auto p=prepare_mtp_attention(c);require_mtp_attention_stream(c,raw_stream);
     const auto stream=static_cast<hipStream_t>(raw_stream);const auto& m=*c.model;const auto& w=p.workspace;
@@ -3771,8 +3807,13 @@ void launch_hip_mtp_indexer(const MtpNativeContext& c,void* raw_stream) {
     launch_norm_rope_typed<SmallWeightKind::f32>(w.index_query,checked_u32(m.indexer_n_heads,"MTP index heads"),p.index_dim,p.index_dim,
         *p.tensors.index_q_norm.runtime,m,c.position,{},stream);
     mtp_attention_finite(p,w.index_query,p.index_width,stream);mtp_attention_finite(p,w.current_index_key,p.index_dim,stream);
+    auto* cache_status=reinterpret_cast<std::uint32_t*>(p.status.address);
+    hipLaunchKernelGGL(validate_mtp_cache_casts,dim3(1),dim3(kThreads),0,stream,
+        w.current_index_key,p.index_dim,static_cast<const float*>(nullptr),static_cast<const float*>(nullptr),0U,cache_status);
+    check_hip(hipGetLastError(),"MTP full raw-index cache-cast validation enqueue");
+    const GraphPositionKernelArguments guarded_cache{nullptr,c.resources->context_capacity(),cache_status};
     hipLaunchKernelGGL(store_raw_index_key_kernel,dim3((p.index_dim+kThreads-1U)/kThreads),dim3(kThreads),0,stream,
-        w.current_index_key,reinterpret_cast<std::uint16_t*>(p.index.address),p.index_dim,c.position,GraphPositionKernelArguments{});
+        w.current_index_key,reinterpret_cast<std::uint16_t*>(p.index.address),p.index_dim,c.position,guarded_cache);
     check_hip(hipGetLastError(),"MTP raw index store enqueue");
     const GraphSelectionArguments selection{{},p.ratio,p.topk};
     if(p.blocks<=p.topk) {
@@ -3798,8 +3839,13 @@ void launch_hip_mtp_sparse_attention(const MtpNativeContext& c,void* raw_stream)
     launch_norm_rope_typed<SmallWeightKind::f32>(w.q_gate,p.heads,p.dim,p.dim*2U,*p.tensors.q_norm.runtime,m,c.position,{},stream);
     launch_norm_rope_typed<SmallWeightKind::f32>(w.current_k,p.kv_heads,p.dim,p.dim,*p.tensors.k_norm.runtime,m,c.position,{},stream);
     mtp_attention_finite(p,w.q_gate,p.q_width,stream);mtp_attention_finite(p,w.current_k,p.kv_width,stream);mtp_attention_finite(p,w.current_v,p.kv_width,stream);
+    auto* cache_status=reinterpret_cast<std::uint32_t*>(p.status.address);
+    hipLaunchKernelGGL(validate_mtp_cache_casts,dim3(1),dim3(kThreads),0,stream,
+        static_cast<const float*>(nullptr),0U,w.current_k,w.current_v,p.kv_width,cache_status);
+    check_hip(hipGetLastError(),"MTP full KV cache-cast validation enqueue");
+    const GraphPositionKernelArguments guarded_cache{nullptr,c.resources->context_capacity(),cache_status};
     hipLaunchKernelGGL(store_kv_kernel,dim3((p.kv_width+kThreads-1U)/kThreads),dim3(kThreads),0,stream,w.current_k,w.current_v,
-        reinterpret_cast<std::uint16_t*>(p.kv.address),p.kv_width,c.position,GraphPositionKernelArguments{});
+        reinterpret_cast<std::uint16_t*>(p.kv.address),p.kv_width,c.position,guarded_cache);
     check_hip(hipGetLastError(),"MTP KV store enqueue");
     const GraphSelectionArguments selection{{},p.ratio,p.topk};
     hipLaunchKernelGGL(attention_score_kernel,dim3(checked_u32(static_cast<std::uint64_t>(p.heads)*p.selected,"MTP attention score grid")),

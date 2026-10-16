@@ -11,8 +11,9 @@ struct HipMtpGreedyCycleGoldenRow {
     std::uint32_t target_r2_dispatches=0,target_projection_launches_saved=0;
     std::vector<std::uint32_t> eos_tokens,emitted_tokens;
     bool eos=false,terminal_budget=false,attempted_window=false,accepted_window=false,restored_checkpoint=false;
-    std::vector<std::uint16_t> final_target_wide_bf16,reconciled_mtp_wide_bf16;
-    std::vector<float> reconciled_full_logits;
+    // Reconciliation publishes persistent cache prefixes, not a predictor
+    // hidden/logits output. Future cache rows and temporary outputs are scratch.
+    std::vector<std::uint16_t> final_target_wide_bf16,reconciled_kv_bf16,reconciled_raw_index_bf16;
 };
 struct HipMtpGreedyCycleGolden {
     ModelContentIdentity independent_source_content,target_content,sidecar_content;
@@ -29,7 +30,7 @@ struct HipMtpGreedyCycleComponentRequest {
 };
 struct HipMtpGreedyCycleComponentRowReceipt {
     std::uint64_t final_source_position=0,consumed_target_rows=0;
-    ModelContentIdentity emitted_tokens,target_wide,mtp_wide,mtp_logits;
+    ModelContentIdentity emitted_tokens,target_wide,mtp_kv,mtp_raw_index;
 };
 struct HipMtpGreedyCycleComponentReceipt {
     ModelContentIdentity reference_payload;

@@ -23,12 +23,12 @@ struct HipMtpWindowVerifier::Impl {
     std::array<std::shared_ptr<HipMtpTargetWindowCapture>,2> captures;
     std::unique_ptr<HipMtpTargetCheckpoint> checkpoint;
     std::uint64_t retained=0,maximum_history_intervals=0;
-    bool busy=false,failed=false;
+    bool busy=false,failed=false,bounded=false;
     Impl(std::shared_ptr<HipMtpTargetHidden> t,std::shared_ptr<HipKnownPrefixWindow> w,
          const ExecutionRuntimeResources& r,std::shared_ptr<const void> owner,
          HipMtpWindowVerificationPolicy policy,AllocationGenerationSource& generations)
         :target(std::move(t)),window(std::move(w)),resources(r),resource_owner(std::move(owner)),
-         maximum_history_intervals(policy.capture.maximum_history_intervals) {
+         maximum_history_intervals(policy.capture.maximum_history_intervals),bounded(policy.bounded_window_rollback) {
         require(target && window && resource_owner && resources.session_state_layout &&
             resources.session_state_memory==&target->memory_owner()->state() &&
             resources.scratch==&target->memory_owner()->scratch() &&
@@ -36,7 +36,8 @@ struct HipMtpWindowVerifier::Impl {
             window->output_policy()==KnownWindowOutputPolicy::all_rows &&
             (window->logical_rows()==2 || window->logical_rows()==4 || window->logical_rows()==8),
             "MTP window verifier requires actual closed all-row target owners");
-        const auto reservation=plan_hip_mtp_target_checkpoint(target->model(),*resources.session_state_layout,policy.snapshot_policy);
+        const auto reservation=bounded?plan_hip_mtp_target_window_rollback(target->model(),*resources.session_state_layout,0,window->logical_rows(),true).reservation:
+            plan_hip_mtp_target_checkpoint(target->model(),*resources.session_state_layout,policy.snapshot_policy);
         const auto upper=mtp_native::sum(reservation.retained_bytes,
             mtp_native::product(policy.capture.retained_byte_budget,2));
         require(policy.total_retained_byte_budget && reservation.retained_bytes<=policy.checkpoint_retained_byte_budget &&
@@ -48,7 +49,8 @@ struct HipMtpWindowVerifier::Impl {
         }
         checkpoint=std::make_unique<HipMtpTargetCheckpoint>(target->model(),target->compiled(),*resources.session_state_layout,
             target->memory_owner(),target->weights_owner(),target->allocator(),static_cast<hipStream_t>(target->stream()),
-            target,target->guard(),policy.snapshot_policy,policy.checkpoint_retained_byte_budget,generations);
+            target,target->guard(),policy.snapshot_policy,policy.checkpoint_retained_byte_budget,generations,
+            bounded?captures.front():std::shared_ptr<const HipMtpTargetWindowCapture>{});
         retained=mtp_native::sum(retained,checkpoint->reserved_bytes());
         require(retained<=policy.total_retained_byte_budget,"MTP actual verification pools exceed admitted reservation");
     }
@@ -59,6 +61,7 @@ HipMtpWindowVerifier::HipMtpWindowVerifier(std::shared_ptr<HipMtpTargetHidden> t
     :impl_(std::make_unique<Impl>(std::move(target),std::move(window),resources,std::move(owner),policy,generations)){}
 HipMtpWindowVerifier::~HipMtpWindowVerifier()=default;
 std::shared_ptr<HipMtpTargetHidden> HipMtpWindowVerifier::target_owner() const noexcept {return impl_->target;}
+std::shared_ptr<HipKnownPrefixWindow> HipMtpWindowVerifier::window_owner() const noexcept {return impl_->window;}
 std::uint32_t HipMtpWindowVerifier::logical_rows() const noexcept {return impl_->window->logical_rows();}
 bool HipMtpWindowVerifier::failed() const noexcept {return impl_->failed || impl_->checkpoint->failed();}
 std::uint64_t HipMtpWindowVerifier::retained_payload_bytes() const noexcept {return impl_->retained;}
@@ -95,7 +98,7 @@ HipMtpVerifiedTargetRows HipMtpWindowVerifier::verify(SerialSessionContext& sess
         if(use_window) {
             std::vector<std::uint32_t> inputs;inputs.reserve(rows);inputs.push_back(pending);
             inputs.insert(inputs.end(),candidates.begin(),candidates.begin()+static_cast<std::ptrdiff_t>(rows-1));
-            i.checkpoint->capture(session);
+            if(i.bounded)i.checkpoint->capture_window(session);else i.checkpoint->capture(session);
             auto native=i.window->execute_mtp_captured(session,inputs,capture);
             // Successful return proves actual target consumption. Rejected
             // admission leaves the original ready session untouched; dispatch
@@ -114,7 +117,8 @@ HipMtpVerifiedTargetRows HipMtpWindowVerifier::verify(SerialSessionContext& sess
             }
             // No provisional row has been promoted. Restore the exact actual
             // checkpoint, then select/reverify the serial greedy continuation.
-            provisional.reset();i.checkpoint->restore(session);out.restored_checkpoint=true;
+            if(i.bounded)i.checkpoint->restore_window(session,*provisional);else i.checkpoint->restore(session);
+            provisional.reset();out.restored_checkpoint=true;
             require(session_equal(initial.committed_session(),session),"MTP rejected window did not restore exact target frontier");
         }
         for(std::size_t index=0;out.emitted_tokens.size()<budget && session.next_position<capacity;++index) {

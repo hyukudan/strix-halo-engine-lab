@@ -70,6 +70,11 @@ const SessionStateMemoryBinding& HipMtpTargetWindowCapture::source_state_memory_
 const ExecutionMemoryBinding& HipMtpTargetWindowCapture::source_scratch_binding()const noexcept{return impl_->source_scratch;}
 const ModelRuntimeBinding& HipMtpTargetWindowCapture::source_weights_binding()const noexcept{return impl_->weights_snapshot;}
 std::uint64_t HipMtpTargetWindowCapture::source_serial_execution_identity()const noexcept{return impl_->serial_id;}
+std::uint32_t HipMtpTargetWindowCapture::logical_rows()const noexcept{return impl_->rows;}
+std::uint64_t HipMtpTargetWindowCapture::window_execution_identity()const noexcept{return impl_->window_id;}
+std::uint64_t HipMtpTargetWindowCapture::window_kernel_plan_identity()const noexcept{return impl_->kernel_id;}
+const ExecutionMemoryBinding& HipMtpTargetWindowCapture::deferred_status_binding()const noexcept{return impl_->scope.deferred_moe_status;}
+void* HipMtpTargetWindowCapture::source_stream()const noexcept{return impl_->scope.stream;}
 std::shared_ptr<HipMtpTargetWindowCapture> HipMtpTargetWindowCapture::create(const void* source_owner,const ModelContract& model,
     const CompiledSerialExecution& serial,const CompiledKnownPrefixWindow& window,const ExecutionRuntimeResources& resources,
     ExecutionMemoryBinding scratch,HipLaunchContext scope,std::shared_ptr<const void> actual_owner,HipMtpTargetWindowCapturePolicy policy){
@@ -197,4 +202,6 @@ std::uint64_t HipMtpTargetWindowBatch::epoch()const{require(valid(),"MTP target 
 const SessionStateMemoryBinding& HipMtpTargetWindowBatch::source_state_memory_binding()const{require(valid(),"MTP target batch is invalid");return lease_->capture->impl_->state_snapshot;}
 const ExecutionMemoryBinding& HipMtpTargetWindowBatch::source_scratch_binding()const{require(valid(),"MTP target batch is invalid");return lease_->capture->impl_->source_scratch;}
 const ModelRuntimeBinding& HipMtpTargetWindowBatch::source_weights_binding()const{require(valid(),"MTP target batch is invalid");return lease_->capture->impl_->weights_snapshot;}
+const ExecutionMemoryBinding& HipMtpTargetWindowBatch::deferred_status_binding()const{require(valid(),"MTP target batch is invalid");return lease_->capture->impl_->scope.deferred_moe_status;}
+void* HipMtpTargetWindowBatch::source_stream()const{require(valid(),"MTP target batch is invalid");return lease_->capture->impl_->scope.stream;}
 } // namespace strix

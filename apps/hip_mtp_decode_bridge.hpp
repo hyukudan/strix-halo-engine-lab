@@ -8,6 +8,7 @@
 #include "strix/mtp_forward_golden_file.hpp"
 #include "strix/hip_mtp_greedy_runtime.hpp"
 #include "strix/hip_mtp_window_verifier.hpp"
+#include "strix/hip_lm_head_launcher.hpp"
 #include "strix/mtp_draft_activation.hpp"
 #include "strix/mtp_draft_qualification.hpp"
 #include "strix/model_content_hash.hpp"
@@ -60,6 +61,20 @@ inline std::uint64_t mtp_cli_mul(std::uint64_t a,std::uint64_t b) {
     if(b && a>UINT64_MAX/b)throw std::overflow_error("MTP CLI payload budget overflow");return a*b;
 }
 using MtpDecodeWindowFactory=std::function<std::shared_ptr<HipMtpWindowVerifier>(std::shared_ptr<HipMtpTargetHidden>)>;
+struct MtpDecodeQualificationContext {
+    const Options& options;
+    std::shared_ptr<MtpDecodeTargetParents> parents;
+    std::shared_ptr<HipMtpResources> predictor;
+    std::shared_ptr<HipMtpTargetHidden> target;
+    std::shared_ptr<HipMtpWindowVerifier> window;
+    SerialSessionContext& session;
+    DirectLaunchDispatcher& dispatcher;
+    AllocationGenerationSource& generations;
+    HipMtpGreedyRuntime& greedy;
+    HipMtpRuntime& runtime;
+    HipMtpTargetHiddenTicket initial;
+};
+using MtpDecodeQualification=std::function<void(MtpDecodeQualificationContext&)>;
 
 // One synchronous CLI request with externally pinned evidence. Setup/loading,
 // independent replay, activation and generation have separate receipt scopes.
@@ -68,7 +83,8 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
     const CompiledSerialExecution& compiled,const std::shared_ptr<MtpDecodeTargetParents>& parents,
     SerialSessionContext& session,DirectLaunchDispatcher& dispatcher,AllocationGenerationSource& generations,
     bool deferred_status,std::string_view resolved_profile,std::ostream& output,
-    MtpDecodeWindowFactory make_window={},std::function<std::string()> completion_receipt={}) {
+    MtpDecodeWindowFactory make_window={},std::function<std::string()> completion_receipt={},
+    MtpDecodeQualification qualify={}) {
     validate_resolved_mtp_cli(options);
     if(!options.mtp.enabled || !parents || session.next_position || session.committed_tokens ||
        session.health!=SerialSessionHealth::ready || session.execution_identity!=compiled.execution_identity)
@@ -157,7 +173,13 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
             throw std::logic_error("MTP replay did not prime the actual final prompt frontier");
         replay_rows.clear(); // release prompt snapshots before bounded cycles
         HipMtpGreedyRuntime greedy(runtime,qualified,activated,target,session,r,dispatcher,parents);
-        if(window)greedy.use_window_verifier(window);
+        if(window && !qualify)greedy.use_window_verifier(window);
+        if(qualify){
+            MtpDecodeQualificationContext context{options,parents,native,target,window,session,dispatcher,generations,greedy,*runtime,std::move(pending)};
+            qualify(context);
+            assets->validate_assets_unchanged();
+            return;
+        }
         // The final prompt target already selected this unconsumed pending
         // token. Emit it once, then each cycle returns only subsequent outputs.
         generated.push_back(pending.predicted_token());
@@ -175,6 +197,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
         const auto elapsed=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count();
         if(generated.back()==eos.front())stop="eos";
         assets->validate_assets_unchanged();
+        const auto native_stats=runtime->execution_stats();
         const auto mtp_d1_inventory=options.execution_inventory
             ? std::string("  \"mtp_target_d1_inventory\":{\"boundary\":\"after-mtp-target-setup-and-request-completion\",\"present\":")+
                 (deferred_status?"true":"false")+",\"storage\":\""+(deferred_status?"unaccounted":"absent")+
@@ -217,6 +240,13 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
             <<"  \"mtp_requested_candidate_depth\":"<<m.candidate_depth<<",\n  \"mtp_target_capture_rows\":"<<retained_rows<<",\n"
             <<"  \"mtp_normalized_rounding\":\""<<m.normalized_rounding<<"\",\n  \"mtp_projection_rounding\":\""<<m.projection_rounding<<"\",\n"
             <<"  \"mtp_runtime_retained_payload_bytes\":"<<native->retained_payload_bytes()<<",\n"
+            <<"  \"mtp_head_recipe\":"<<static_cast<std::uint32_t>(select_hip_mtp_lm_head_recipe(model,native->tensors().lm_head))<<",\n"
+            <<"  \"mtp_head_profile_identity\":"<<hip_mtp_lm_head_profile_identity(model,native->tensors().lm_head)<<",\n"
+            <<"  \"mtp_native_full_forward_rows\":"<<native_stats.full_forward_rows<<",\n"
+            <<"  \"mtp_cache_only_rows\":"<<native_stats.cache_only_rows<<",\n"
+            <<"  \"mtp_reused_cache_rows\":"<<native_stats.cache_reused_rows<<",\n"
+            <<"  \"mtp_native_row_counter_scope\":\"completed-rows-including-prompt-independent-replay-and-generation\",\n"
+            <<"  \"mtp_window_retained_payload_bytes\":"<<(window?window->retained_payload_bytes():0U)<<",\n"
             <<"  \"mtp_target_capture_budget_bytes\":"<<m.target_capture_bytes<<",\n  \"mtp_target_d1\":"<<(deferred_status?"true":"false")<<",\n"
             <<"  \"mtp_cycles\":"<<cycles<<",\n  \"mtp_proposed_candidates\":"<<proposed<<",\n  \"mtp_accepted_candidates\":"<<accepted<<",\n"
             <<"  \"mtp_consumed_generation_input_rows\":"<<target_rows<<",\n  \"mtp_attempted_target_windows\":"<<window_attempts<<",\n"

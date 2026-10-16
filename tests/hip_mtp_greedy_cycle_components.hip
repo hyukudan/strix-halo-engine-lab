@@ -22,7 +22,6 @@ template<class T>ModelContentIdentity digest(const std::vector<T>& v){return sha
 template<class T>void payload(std::vector<std::byte>& frame,const std::vector<T>& v){append(frame,v.size());append(frame,digest(v));}
 float decode(std::uint16_t v){return std::bit_cast<float>(static_cast<std::uint32_t>(v)<<16U);}
 void finite_hidden(const std::vector<std::uint16_t>& v){for(auto b:v)require(std::isfinite(decode(b)),"MTP cycle fixture hidden reference/output is nonfinite");}
-void finite_logits(const std::vector<float>& v){for(auto b:v)require(std::isfinite(b),"MTP cycle fixture full logits are nonfinite");}
 bool is_eos(std::uint32_t token,const std::vector<std::uint32_t>& eos){return std::find(eos.begin(),eos.end(),token)!=eos.end();}
 void read(MtpDeviceView view,void* out,std::uint64_t bytes,hipStream_t stream){
     require(view.address && view.allocation_generation && view.bytes>=bytes &&
@@ -47,7 +46,7 @@ ModelContentIdentity hip_mtp_greedy_cycle_golden_identity(const HipMtpGreedyCycl
     static_assert(sizeof(float)==4U && std::numeric_limits<float>::is_iec559);
     require(std::endian::native==std::endian::little && g.cycles.size()<=cycle_limit,"MTP cycle fixture framing contract is invalid");
     std::vector<std::byte> frame;frame.reserve(static_cast<std::size_t>(mul(add(g.cycles.size(),1U),512U)));
-    append(frame,0x4d54504359434c31ULL);append(frame,g.independent_source_content);append(frame,g.target_content);append(frame,g.sidecar_content);
+    append(frame,0x4d54504359434c32ULL);append(frame,g.independent_source_content);append(frame,g.target_content);append(frame,g.sidecar_content);
     append(frame,g.independent_reference_identity);append(frame,g.structural_plan_identity);append(frame,g.semantic_identity);append(frame,g.numerical_profile_identity);append(frame,g.cycles.size());
     for(const auto& r:g.cycles){
         append(frame,r.initial_source_position);append(frame,r.final_source_position);append(frame,r.final_committed_tokens);append(frame,r.consumed_target_rows);
@@ -55,7 +54,7 @@ ModelContentIdentity hip_mtp_greedy_cycle_golden_identity(const HipMtpGreedyCycl
         append(frame,r.maximum_candidates);append(frame,r.token_budget);append(frame,r.proposed_candidates);append(frame,r.accepted_candidates);
         append(frame,r.target_r2_dispatches);append(frame,r.target_projection_launches_saved);
         append(frame,r.eos);append(frame,r.terminal_budget);append(frame,r.attempted_window);append(frame,r.accepted_window);append(frame,r.restored_checkpoint);
-        payload(frame,r.eos_tokens);payload(frame,r.emitted_tokens);payload(frame,r.final_target_wide_bf16);payload(frame,r.reconciled_mtp_wide_bf16);payload(frame,r.reconciled_full_logits);
+        payload(frame,r.eos_tokens);payload(frame,r.emitted_tokens);payload(frame,r.final_target_wide_bf16);payload(frame,r.reconciled_kv_bf16);payload(frame,r.reconciled_raw_index_bf16);
     }return sha256_bytes(frame);
 }
 HipMtpGreedyCycleComponentReceipt qualify_hip_mtp_greedy_cycles(HipMtpGreedyRuntime& greedy,HipMtpRuntime& native,
@@ -75,13 +74,16 @@ HipMtpGreedyCycleComponentReceipt qualify_hip_mtp_greedy_cycles(HipMtpGreedyRunt
         "MTP cycle fixture independent provenance/model/plan/profile differs");
     const auto width=mul(owner.model().hidden_size,owner.model().hc_count);const auto vocab=owner.model().vocab_size;
     require(width&&width<=SIZE_MAX/2U&&vocab&&vocab<=UINT32_MAX&&vocab<=SIZE_MAX/4U,"MTP cycle fixture geometry is invalid");
-    std::uint64_t bytes=add(mul(width,4U),mul(vocab,4U));
+    const auto geometry=native.cache_state();
+    std::uint64_t bytes=mul(width,2U),maximum_cache_bytes=0;
     bytes=add(bytes,mul(add(g.cycles.size(),1U),512U));
     bytes=add(bytes,mul(g.cycles.size(),add(sizeof(HipMtpGreedyCycleComponentRowReceipt),sizeof(HipMtpGreedyCycleGoldenRow))));
     for(const auto& r:g.cycles){
         bytes=add(bytes,add(mul(add(r.eos_tokens.size(),r.emitted_tokens.size()),4U),
-            add(mul(add(r.final_target_wide_bf16.size(),r.reconciled_mtp_wide_bf16.size()),2U),mul(r.reconciled_full_logits.size(),4U))));
+            mul(add(add(r.final_target_wide_bf16.size(),r.reconciled_kv_bf16.size()),r.reconciled_raw_index_bf16.size()),2U)));
+        maximum_cache_bytes=std::max(maximum_cache_bytes,mul(add(r.reconciled_kv_bf16.size(),r.reconciled_raw_index_bf16.size()),2U));
     }
+    bytes=add(bytes,maximum_cache_bytes);
     require(request.host_payload_budget_bytes&&bytes<=request.host_payload_budget_bytes,"MTP cycle fixture exceeds host payload budget");
     for(std::size_t i=0;i<g.cycles.size();++i){const auto& r=g.cycles[i];
         require(r.token_budget && r.maximum_candidates<=owner.budget().maximum_candidate_depth &&
@@ -91,8 +93,9 @@ HipMtpGreedyCycleComponentReceipt qualify_hip_mtp_greedy_cycles(HipMtpGreedyRunt
             r.consumed_target_rows==r.emitted_tokens.size()&&r.final_source_position==add(r.initial_source_position,r.consumed_target_rows)&&
             r.reconciled_next_source_position==r.final_source_position,
             "MTP cycle fixture trace counters/frontier/depth are inconsistent");
-        require(r.final_target_wide_bf16.size()==width&&r.reconciled_mtp_wide_bf16.size()==width&&r.reconciled_full_logits.size()==vocab,
-            "MTP cycle fixture reference requires full wide states and vocabulary");
+        require(r.final_target_wide_bf16.size()==width&&mul(r.reconciled_kv_bf16.size(),2U)==mul(r.reconciled_next_source_position,geometry.kv_row_bytes)&&
+            mul(r.reconciled_raw_index_bf16.size(),2U)==mul(r.reconciled_next_source_position,geometry.raw_index_row_bytes),
+            "MTP cycle fixture reference requires full target wide and logical persistent cache prefixes");
         for(auto token:r.eos_tokens)require(token<vocab,"MTP cycle fixture EOS is outside vocabulary");
         for(std::size_t j=0;j<r.emitted_tokens.size();++j)require(r.emitted_tokens[j]<vocab&&
             (j+1U==r.emitted_tokens.size()||!is_eos(r.emitted_tokens[j],r.eos_tokens)),"MTP cycle fixture output token/EOS ordering differs");
@@ -102,21 +105,27 @@ HipMtpGreedyCycleComponentReceipt qualify_hip_mtp_greedy_cycles(HipMtpGreedyRunt
             "MTP cycle fixture expected flags or pending selection differ");
         if(i){const auto& prior=g.cycles[i-1U];require(!prior.eos&&r.initial_source_position==prior.final_source_position&&
             r.initial_pending_token==prior.final_pending_token,"MTP cycle fixture continuation must consume prior pending without duplicate emission");}
-        finite_hidden(r.final_target_wide_bf16);finite_hidden(r.reconciled_mtp_wide_bf16);finite_logits(r.reconciled_full_logits);
+        finite_hidden(r.final_target_wide_bf16);finite_hidden(r.reconciled_kv_bf16);finite_hidden(r.reconciled_raw_index_bf16);
     }
     require_coverage(request.required_coverage,coverage(g));
     require(initial.source_position()==g.cycles.front().initial_source_position&&initial.predicted_token()==g.cycles.front().initial_pending_token&&
         native.next_source_position()==initial.source_position(),"MTP cycle fixture initial real frontier differs");
     const auto reference=hip_mtp_greedy_cycle_golden_identity(g);require(reference==request.expected_payload,"MTP cycle fixture full reference digest differs");
     HipMtpGreedyCycleComponentReceipt receipt;receipt.reference_payload=reference;receipt.cycles.reserve(g.cycles.size());
-    std::vector<std::uint16_t> target(static_cast<std::size_t>(width)),mtp(static_cast<std::size_t>(width));
-    std::vector<float> logits(static_cast<std::size_t>(vocab));auto current=std::move(initial);
+    std::vector<std::uint16_t> target(static_cast<std::size_t>(width)),kv,raw;auto current=std::move(initial);
     try{
         for(std::size_t i=0;i<g.cycles.size();++i){const auto& expected=g.cycles[i];
             require(current.source_position()==expected.initial_source_position&&current.predicted_token()==expected.initial_pending_token&&
                 expected.final_committed_tokens==add(current.committed_session().committed_tokens,expected.consumed_target_rows),
                 "MTP cycle fixture continuation did not retain actual prior ticket/counter frontier");
+            const auto before=native.execution_stats();
             const auto actual=greedy.cycle(current,expected.maximum_candidates,expected.token_budget,expected.eos_tokens);
+            const auto after=native.execution_stats();
+            require(after.full_forward_rows>=before.full_forward_rows && after.cache_only_rows>=before.cache_only_rows &&
+                after.cache_reused_rows>=before.cache_reused_rows &&
+                after.full_forward_rows-before.full_forward_rows==actual.proposed_candidates &&
+                add(after.cache_only_rows-before.cache_only_rows,after.cache_reused_rows-before.cache_reused_rows)==actual.consumed_target_rows,
+                "MTP reconciliation executed a full forward or omitted a durable cache row");
             require(actual.emitted_tokens==expected.emitted_tokens&&actual.proposed_candidates==expected.proposed_candidates&&
                 actual.accepted_candidates==expected.accepted_candidates&&actual.consumed_target_rows==expected.consumed_target_rows&&
                 actual.eos==expected.eos&&actual.terminal_budget==expected.terminal_budget&&
@@ -133,14 +142,16 @@ HipMtpGreedyCycleComponentReceipt qualify_hip_mtp_greedy_cycles(HipMtpGreedyRunt
                 native.next_source_position()==expected.reconciled_next_source_position&&!native.failed()&&!greedy.failed(),
                 "MTP cycle fixture final real target/predictor frontier differs");
             read(actual.final_target.view(),target.data(),mul(width,2U),stream);
-            read(owner.view(HipMtpBuffer::wide_current),mtp.data(),mul(width,2U),stream);
-            read(owner.view(HipMtpBuffer::logits),logits.data(),mul(vocab,4U),stream);check(hipStreamSynchronize(stream));
-            finite_hidden(target);finite_hidden(mtp);finite_logits(logits);
-            require(target==expected.final_target_wide_bf16&&mtp==expected.reconciled_mtp_wide_bf16&&
-                std::memcmp(logits.data(),expected.reconciled_full_logits.data(),static_cast<std::size_t>(mul(vocab,4U)))==0,
-                "MTP cycle fixture complete target/reconciled predictor payload differs bitwise");
+            const auto cache=native.cache_state();
+            kv.resize(expected.reconciled_kv_bf16.size());raw.resize(expected.reconciled_raw_index_bf16.size());
+            require(cache.logical_rows==expected.reconciled_next_source_position,"MTP cache frontier differs");
+            if(!kv.empty())read(cache.kv,kv.data(),mul(kv.size(),2U),stream);
+            if(!raw.empty())read(cache.raw_index,raw.data(),mul(raw.size(),2U),stream);
+            check(hipStreamSynchronize(stream));finite_hidden(target);finite_hidden(kv);finite_hidden(raw);
+            require(target==expected.final_target_wide_bf16&&kv==expected.reconciled_kv_bf16&&raw==expected.reconciled_raw_index_bf16,
+                "MTP cycle fixture complete target/cache prefix differs bitwise");
             receipt.cycles.push_back({actual.final_target.source_position(),actual.consumed_target_rows,
-                digest(actual.emitted_tokens),digest(target),digest(mtp),digest(logits)});
+                digest(actual.emitted_tokens),digest(target),digest(kv),digest(raw)});
             receipt.coverage.accepted_window|=actual.attempted_target_window&&actual.accepted_target_window&&!actual.target_checkpoint_restored;
             receipt.coverage.rejected_window_restored|=actual.attempted_target_window&&!actual.accepted_target_window&&actual.target_checkpoint_restored;
             receipt.coverage.eos|=actual.eos;receipt.coverage.budget|=actual.terminal_budget;receipt.coverage.continuation|=i!=0U;

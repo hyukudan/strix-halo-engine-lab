@@ -142,13 +142,16 @@ std::shared_ptr<HipMtpResources> HipMtpResources::create(const ModelContract& mo
     const auto state_layout=build_indexed_attention_state_layout(model);
     const auto wide=mul(mul(model.hidden_size,model.hc_count),2U);
     const auto input_scratch=hip_mtp_input_fusion_scratch_bytes(static_cast<std::uint32_t>(model.hidden_size),static_cast<std::uint32_t>(model.hc_count));
-    const std::array<std::uint64_t,buffer_count> sizes{wide,wide,wide,mul(model.hidden_size,2U),input_scratch,input_scratch,
+    const std::array<std::uint64_t,buffer_count> sizes{wide,wide,0U,mul(model.hidden_size,2U),input_scratch,input_scratch,
         wide,wide,buffers.hidden_bytes,buffers.hidden_bytes,buffers.hidden_bytes,buffers.injection_weight_bytes,buffers.route_index_bytes,buffers.route_weight_bytes,
         buffers.hyper_workspace_bytes,attention.total_bytes,buffers.mlp_intermediate_bytes,mul(model.num_experts,4U),buffers.logits_bytes,
         mul(budget.context_capacity,state_layout.kv_row_bytes),mul(budget.context_capacity,state_layout.raw_index_row_bytes),
-        mul(budget.context_capacity,state_layout.kv_row_bytes),mul(budget.context_capacity,state_layout.raw_index_row_bytes),8U};
+        0U,0U,8U};
     std::array<std::uint64_t,buffer_count> offsets{};std::uint64_t bytes=0;
-    for(std::size_t i=0;i<buffer_count;++i) {bytes=align256(bytes);offsets[i]=bytes;bytes=add(bytes,sizes[i]);}
+    for(std::size_t i=0;i<buffer_count;++i) {
+        if(!sizes[i])continue; // retired checkpoint roles consume no padding/storage
+        bytes=align256(bytes);offsets[i]=bytes;bytes=add(bytes,sizes[i]);
+    }
     const auto selector=HipGreedyOutput::required_scratch_bytes(static_cast<std::uint32_t>(model.vocab_size));
     const auto retained=add(add(bytes,255U),selector);
     require(retained<=budget.retained_bytes,"MTP actual pool plus finite-reader payload exceeds explicit budget");
@@ -164,7 +167,7 @@ std::shared_ptr<HipMtpResources> HipMtpResources::create(const ModelContract& mo
     p.pool=p.allocator->allocate_device(bytes,256U);
     p.pool_lease=p.allocator->describe_allocation(p.pool,bytes,HipRuntimeAllocationSpace::device);
     p.pool_generation=p.pool_lease.lease_identity;
-    for(std::size_t i=0;i<buffer_count;++i) p.views[i]={p.pool+offsets[i],sizes[i],p.pool_generation};
+    for(std::size_t i=0;i<buffer_count;++i) if(sizes[i])p.views[i]={p.pool+offsets[i],sizes[i],p.pool_generation};
     const auto state_plan=plan_mtp_draft_state_memory(plan.proposal_identity,plan.state,1U,2U,256U);
     p.state={state_plan.plan_identity,state_plan.proposal_identity,state_plan.state_width,1U,2U,256U,
         p.views[static_cast<std::size_t>(HipMtpBuffer::wide_current)].address,state_plan.total_bytes,p.pool_generation};
@@ -193,7 +196,10 @@ std::shared_ptr<HipMtpResources> HipMtpResources::create(const ModelContract& mo
     result->validate();return result;
 }
 MtpDeviceView HipMtpResources::view(HipMtpBuffer kind) const {
-    const auto i=static_cast<std::size_t>(kind);require(i<buffer_count,"MTP buffer role is invalid");return impl_->views[i];
+    const auto i=static_cast<std::size_t>(kind);require(i<buffer_count,"MTP buffer role is invalid");
+    require(kind!=HipMtpBuffer::wide_checkpoint && kind!=HipMtpBuffer::kv_checkpoint &&
+        kind!=HipMtpBuffer::raw_index_checkpoint,"MTP draft checkpoint buffer role is retired");
+    return impl_->views[i];
 }
 const ModelContract& HipMtpResources::model() const noexcept {return *impl_->model;}
 const CompiledMtpDraftPlan& HipMtpResources::plan() const noexcept {return *impl_->plan;}

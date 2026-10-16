@@ -1,6 +1,8 @@
 #include "strix/hip_mtp_target_checkpoint.hpp"
 #include "strix/hip_launch_context.hpp"
 #include "strix/hip_session_snapshot_transfer.hpp"
+#include "strix/hip_mtp_target_window.hpp"
+#include "strix/indexed_attention_state.hpp"
 #include <limits>
 #include <optional>
 #include <stdexcept>
@@ -73,6 +75,51 @@ HipMtpTargetCheckpointReservation plan_hip_mtp_target_checkpoint(
     return result;
 }
 
+HipMtpTargetRollbackPlan plan_hip_mtp_target_window_rollback(const ModelContract& model,
+    const SerialSessionStateLayout& layout,std::uint64_t position,std::uint32_t rows,bool status) {
+    validate_serial_session_state_layout_identity(model,layout);
+    const auto canonical=build_serial_session_state_layout(model,
+        {layout.context_tokens,layout.device_alignment,layout.host_alignment,true,layout.recurrent_storage});
+    if(canonical.layout_identity!=layout.layout_identity || layout.allocations.size()!=7 ||
+       (rows!=2 && rows!=4 && rows!=8) || position>layout.context_tokens || rows>layout.context_tokens-position ||
+       position>model.max_position_embeddings || rows>model.max_position_embeddings-position)
+        throw std::invalid_argument("MTP bounded rollback requires a canonical complete layout and closed in-capacity producer");
+    HipMtpTargetRollbackPlan plan;plan.first_position=position;plan.logical_rows=rows;
+    const auto attention=build_indexed_attention_state_layout(model);
+    const auto append=[&](const SessionStateAllocation& allocation,std::uint64_t offset,std::uint64_t bytes) {
+        if(offset<allocation.offset || offset-allocation.offset>allocation.bytes || bytes>allocation.bytes-(offset-allocation.offset))
+            throw std::invalid_argument("MTP rollback slice exceeds the actual component");
+        auto& total=allocation.storage==SessionStateStorage::device?plan.reservation.device_payload_bytes:plan.reservation.host_payload_bytes;
+        const auto destination=aligned(total);total=add(destination,bytes);
+        plan.ranges.push_back({allocation.component,allocation.storage,offset,destination,bytes,false});
+    };
+    for(const auto& allocation:layout.allocations) {
+        if(allocation.component==SessionStateComponent::attention_kv || allocation.component==SessionStateComponent::sparse_index) {
+            const auto row=allocation.component==SessionStateComponent::attention_kv?attention.kv_row_bytes:attention.raw_index_row_bytes;
+            if(!row || layout.context_tokens>UINT64_MAX/row || model.full_attention_layers>UINT64_MAX/(layout.context_tokens*row))
+                throw std::overflow_error("MTP rollback layer stride overflow");
+            const auto stride=layout.context_tokens*row;
+            if(allocation.storage!=SessionStateStorage::device || allocation.bytes!=stride*model.full_attention_layers)
+                throw std::invalid_argument("MTP rollback append-row geometry differs from actual canonical QSA storage");
+            for(std::uint64_t layer=0;layer<model.full_attention_layers;++layer)
+                append(allocation,add(allocation.offset,add(layer*stride,position*row)),rows*row);
+        } else {
+            // Mutable recurrent matrix, BOTH convolutions and BOTH host words
+            // are not append-only: preserve their complete declared extents.
+            append(allocation,allocation.offset,allocation.bytes);
+        }
+    }
+    if(status) {
+        auto& total=plan.reservation.device_payload_bytes;
+        const auto offset=aligned(total);total=add(offset,8);
+        plan.ranges.push_back({SessionStateComponent::position_history,SessionStateStorage::device,0,offset,8,true});
+    }
+    plan.reservation.retained_bytes=add(plan.reservation.device_payload_bytes,plan.reservation.host_payload_bytes);
+    if(plan.reservation.device_payload_bytes) plan.reservation.retained_bytes=add(plan.reservation.retained_bytes,alignment-1);
+    if(plan.reservation.host_payload_bytes) plan.reservation.retained_bytes=add(plan.reservation.retained_bytes,alignment-1);
+    return plan;
+}
+
 struct HipMtpTargetCheckpoint::Impl {
     ModelContract model;
     CompiledSerialExecution compiled;
@@ -95,6 +142,36 @@ struct HipMtpTargetCheckpoint::Impl {
     const SerialSessionContext* session_address=nullptr;
     std::uint64_t compatibility=0;
     bool broken=false;
+    std::shared_ptr<const HipMtpTargetWindowCapture> producer;
+    std::optional<HipMtpTargetRollbackPlan> rollback;
+    ExecutionMemoryBinding deferred;
+    void require_producer() const {
+        if(!producer || !producer->window_execution_identity() || !producer->window_kernel_plan_identity() ||
+           producer->source_serial_execution_identity()!=compiled.execution_identity ||
+           !same(producer->source_state_memory_binding(),original_state) ||
+           !same(producer->source_scratch_binding(),original_scratch) ||
+           !same(producer->source_weights_binding(),original_weights) ||
+           !same(producer->deferred_status_binding(),deferred) || producer->source_stream()!=stream)
+            throw std::invalid_argument("MTP bounded rollback actual producer/binding changed");
+    }
+    std::vector<SessionSnapshotTransfer> rollback_transfers(const HipMtpTargetRollbackPlan& plan,bool restoring) const {
+        std::vector<SessionSnapshotTransfer> result;result.reserve(plan.ranges.size());
+        for(const auto& range:plan.ranges) {
+            const auto source_base=range.deferred_status?deferred.arena_base:
+                range.storage==SessionStateStorage::device?original_state.device_base:original_state.host_base;
+            const auto source_bytes=range.deferred_status?deferred.arena_bytes:
+                range.storage==SessionStateStorage::device?original_state.device_bytes:original_state.host_bytes;
+            const auto destination_base=range.storage==SessionStateStorage::device?pools.device_section_base:pools.host_section_base;
+            const auto destination_bytes=range.storage==SessionStateStorage::device?reservation.device_payload_bytes:reservation.host_payload_bytes;
+            if(range.source_offset>source_bytes || range.bytes>source_bytes-range.source_offset ||
+               range.snapshot_offset>destination_bytes || range.bytes>destination_bytes-range.snapshot_offset ||
+               !source_base || !destination_base || source_bytes>UINTPTR_MAX-source_base || destination_bytes>UINTPTR_MAX-destination_base)
+                throw std::invalid_argument("MTP bounded rollback transfer escapes retained allocation");
+            const auto source=source_base+range.source_offset,destination=destination_base+range.snapshot_offset;
+            result.push_back({range.storage,restoring?destination:source,restoring?source:destination,range.bytes});
+        }
+        return result;
+    }
 
     ~Impl() {
         // Retain every owner through this stream only on normal teardown.
@@ -151,7 +228,8 @@ HipMtpTargetCheckpoint::HipMtpTargetCheckpoint(const ModelContract& model,
     std::shared_ptr<const HipModelResidency> weights,std::shared_ptr<HipRuntimeAllocator> allocator,
     hipStream_t stream,std::shared_ptr<const void> stream_owner,
     std::shared_ptr<const HipSetupQuiescenceGuard> guard,SessionSnapshotPolicy policy,
-    std::uint64_t budget,AllocationGenerationSource& generations):impl_(std::make_unique<Impl>()) {
+    std::uint64_t budget,AllocationGenerationSource& generations,
+    std::shared_ptr<const HipMtpTargetWindowCapture> producer):impl_(std::make_unique<Impl>()) {
     if(!memory || !weights || !allocator || !stream_owner || !guard || !stream ||
        stream==hipStreamLegacy || stream==hipStreamPerThread || !budget || !compiled.execution_identity ||
        compiled.logical_rows!=1 || compiled.request_concurrency!=1 || memory->state().stage_mapping ||
@@ -163,7 +241,15 @@ HipMtpTargetCheckpoint::HipMtpTargetCheckpoint(const ModelContract& model,
     p.model=model; p.compiled=compiled; p.layout=layout;
     p.memory=std::move(memory); p.weights=std::move(weights); p.allocator=std::move(allocator);
     p.stream=stream; p.stream_owner=std::move(stream_owner); p.guard=std::move(guard); p.policy=policy;
-    p.reservation=plan_hip_mtp_target_checkpoint(model,layout,policy);
+    validate_session_snapshot_policy(policy);
+    p.producer=std::move(producer);
+    if(p.producer) p.deferred=p.producer->deferred_status_binding();
+    const bool status=p.deferred.arena_base || p.deferred.arena_bytes || p.deferred.execution_identity || p.deferred.allocation_generation;
+    if(status && (!p.producer || p.deferred.execution_identity!=p.producer->window_execution_identity() ||
+       !p.deferred.arena_base || p.deferred.arena_base%4 || p.deferred.arena_bytes!=8 || !p.deferred.allocation_generation))
+        throw std::invalid_argument("MTP bounded rollback D1 record is not the exact producer record");
+    p.reservation=p.producer?plan_hip_mtp_target_window_rollback(model,layout,0,p.producer->logical_rows(),status).reservation:
+        plan_hip_mtp_target_checkpoint(model,layout,policy);
     if(p.reservation.retained_bytes>budget) throw std::length_error("MTP checkpoint retained byte budget exceeded");
     if(p.reservation.device_payload_bytes>std::numeric_limits<std::size_t>::max() ||
        p.reservation.host_payload_bytes>std::numeric_limits<std::size_t>::max())
@@ -174,6 +260,7 @@ HipMtpTargetCheckpoint::HipMtpTargetCheckpoint(const ModelContract& model,
     if(!p.original_weights.model_content_identity.valid() || !p.original_weights_generation)
         throw std::invalid_argument("MTP checkpoint requires actual model content and residency generation");
     p.require_bindings();
+    if(p.producer) p.require_producer();
     p.pools.allocation_generation=generations.next();
     p.guard->run([&] {
         if(p.reservation.device_payload_bytes) {
@@ -191,6 +278,7 @@ HipMtpTargetCheckpoint::HipMtpTargetCheckpoint(const ModelContract& model,
 HipMtpTargetCheckpoint::~HipMtpTargetCheckpoint()=default;
 void HipMtpTargetCheckpoint::capture(const SerialSessionContext& session) {
     auto& p=*impl_; p.require_bindings(); p.admit_session(session,true);
+    if(p.producer) throw std::logic_error("bounded target checkpoint requires capture_window");
     if(p.saved) throw std::logic_error("MTP checkpoint must be restored or explicitly discarded before recapture");
     // All metadata allocations and canonical range validation precede copying.
     auto recorded=session;
@@ -218,6 +306,7 @@ void HipMtpTargetCheckpoint::capture(const SerialSessionContext& session) {
 }
 void HipMtpTargetCheckpoint::restore(SerialSessionContext& session) {
     auto& p=*impl_; p.require_bindings(); p.admit_session(session,false);
+    if(p.producer) throw std::logic_error("bounded target checkpoint requires actual completed restore_window proof");
     if(!p.saved) throw std::logic_error("MTP checkpoint has no captured frontier");
     if(!valid_recorded_lineage(*p.saved) ||
        p.saved->health!=SerialSessionHealth::ready)
@@ -238,11 +327,55 @@ void HipMtpTargetCheckpoint::restore(SerialSessionContext& session) {
     session=std::move(recorded); // Only completed payload copies authorize this exact recorded metadata.
     p.saved.reset(); p.snapshot={};
 }
+void HipMtpTargetCheckpoint::capture_window(const SerialSessionContext& session) {
+    auto& p=*impl_;p.require_bindings();p.require_producer();p.admit_session(session,true);
+    if(p.saved) throw std::logic_error("MTP bounded checkpoint already has a captured frontier");
+    auto recorded=session;
+    auto plan=plan_hip_mtp_target_window_rollback(p.model,p.layout,session.next_position,p.producer->logical_rows(),p.deferred.arena_bytes!=0);
+    const auto transfers=p.rollback_transfers(plan,false);
+    HipSessionSnapshotTransferBackend transfer(p.stream,p.guard);
+    try {p.complete_owned_stream();transfer.capture_batch(transfers);p.guard->require_original();}
+    catch(...) {p.broken=true;p.guard->recover_or_fail_stop();throw;}
+    p.session_address=&session;p.compatibility=session.runtime_compatibility_identity;
+    p.rollback.emplace(std::move(plan));p.saved.emplace(std::move(recorded));
+}
+namespace {
+bool same_record(const SerialSessionContext& a,const SerialSessionContext& b) {
+    return a.execution_identity==b.execution_identity && a.runtime_compatibility_identity==b.runtime_compatibility_identity &&
+        a.state_layout_identity==b.state_layout_identity && a.next_position==b.next_position && a.committed_tokens==b.committed_tokens &&
+        a.health==b.health && a.state.valid==b.state.valid && a.state.generations==b.state.generations &&
+        a.arithmetic_lineage.history_identity==b.arithmetic_lineage.history_identity && a.arithmetic_lineage.tainted==b.arithmetic_lineage.tainted &&
+        a.arithmetic_lineage.intervals==b.arithmetic_lineage.intervals;
+}
+}
+void HipMtpTargetCheckpoint::restore_window(SerialSessionContext& session,const HipMtpTargetWindowBatch& batch) {
+    auto& p=*impl_;p.require_bindings();p.require_producer();p.admit_session(session,false);
+    if(!p.saved || !p.rollback || !batch.valid() || !valid_recorded_lineage(*p.saved) ||
+       batch.window_execution_identity()!=p.producer->window_execution_identity() ||
+       batch.window_kernel_plan_identity()!=p.producer->window_kernel_plan_identity() ||
+       batch.logical_rows()!=p.rollback->logical_rows || batch.chunk_begin()!=p.saved->next_position ||
+       batch.chunk_end()-batch.chunk_begin()!=p.rollback->logical_rows ||
+       !same_record(batch.base_session(),*p.saved) || !same_record(batch.committed_session(),session) ||
+       !same(batch.source_state_memory_binding(),p.original_state) || !same(batch.source_scratch_binding(),p.original_scratch) ||
+       !same(batch.source_weights_binding(),p.original_weights) ||
+       !same(batch.deferred_status_binding(),p.deferred) || batch.source_stream()!=p.stream)
+        throw std::invalid_argument("MTP bounded rollback lacks the exact actual completed producer footprint");
+    auto recorded=*p.saved;
+    const auto transfers=p.rollback_transfers(*p.rollback,true);
+    HipSessionSnapshotTransferBackend transfer(p.stream,p.guard);
+    try {p.complete_owned_stream();transfer.restore_batch(transfers);p.guard->require_original();}
+    catch(...) {
+        p.broken=true;session.health=SerialSessionHealth::poisoned;session.arithmetic_lineage={};session.arithmetic_lineage.tainted=true;
+        p.guard->recover_or_fail_stop();throw;
+    }
+    session=std::move(recorded);p.saved.reset();p.rollback.reset();
+}
+
 void HipMtpTargetCheckpoint::discard() {
     auto& p=*impl_; p.require_bindings();
     try { p.complete_owned_stream(); }
     catch(...) { p.broken=true; p.guard->recover_or_fail_stop(); throw; }
-    p.saved.reset(); p.snapshot={};
+    p.saved.reset(); p.snapshot={};p.rollback.reset();
 }
 bool HipMtpTargetCheckpoint::has_checkpoint() const noexcept { return impl_->saved.has_value(); }
 bool HipMtpTargetCheckpoint::failed() const noexcept { return impl_->broken; }

@@ -107,8 +107,8 @@ complete output is captured before reuse. The current replay producer covers a
 fresh sequential forward only, not resumed or rejection/reconciliation scenarios.
 Callable HC/routed/shared/window/cycle component fixtures also require independent
 goldens. Cycle traces can require accepted-window, restored rejection, EOS, budget
-and continuation coverage and compare complete final target and reconciled MTP
-states. They retain host receipts rather than keeping obsolete capture leases.
+and continuation coverage and compare complete final target values and occupied
+predictor KV/raw-index prefixes. They retain host receipts rather than keeping obsolete capture leases.
 The small payload fixture does not exercise a model forward.
 
 Window row selections submit all independent finite/first-max reductions before
@@ -126,3 +126,31 @@ and review of resulting code corrections. Closed-window capture, whole-chunk
 promotion and rejection/replay are implemented in source and still require their
 native independent fixtures. No current speed, acceptance rate, native correctness or readiness
 claim is made by the source receipt.
+
+## Cache reconciliation and bounded rollback
+
+Qualified priming and reconciliation rebuild only durable predictor cache rows:
+actual target wide input, embedding/fusion, attention HC and key/index/KV stores.
+The complete eleven-stage diagnostic still supplies full-forward qualification
+evidence. Reconciliation does not run MoE or LM-head selection and does not
+publish temporary hidden/logit outputs. The first following proposal supplies
+its authoritative target wide input again.
+
+Predictor cache writes are append-only by logical row. Reconciliation replaces
+the affected rows before subsequent reads; rows at or above the current frontier
+are excluded from the causal read set. Full-capacity draft checkpoint buffers
+and their per-cycle copy/restore operations are retired. The selected head recipe
+is part of the actual native numerical profile: admitted Q8 uses the retained
+prefetch/wave implementation; other supported cases use the generic recipe.
+
+The CLI's actual closed-window verifier enables bounded target rollback. It
+saves exactly the KV/raw-index rows that the minted producer will overwrite,
+including their previous future bytes, and the complete recurrent, convolution,
+host and D1 state. Restore requires the same actual producer/bindings and sealed
+batch. The generic full-component checkpoint remains available. These are source
+implementations and require native byte-restoration and continuation validation.
+
+The [model fixture runner](mtp-model-qualification.md) connects component,
+capture, rollback, recipe and cycle fixtures to the same actual asset loader and
+independent full-forward replay. Its binary references are externally supplied;
+the runner does not manufacture expected outputs from native results.

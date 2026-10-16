@@ -33,6 +33,8 @@ public:
     [[nodiscard]] const SessionStateMemoryBinding& source_state_memory_binding() const;
     [[nodiscard]] const ExecutionMemoryBinding& source_scratch_binding() const;
     [[nodiscard]] const ModelRuntimeBinding& source_weights_binding() const;
+    [[nodiscard]] const ExecutionMemoryBinding& deferred_status_binding() const;
+    [[nodiscard]] void* source_stream() const;
 private:
     friend class HipMtpTargetWindowCapture;
     struct Lease;
@@ -57,6 +59,11 @@ public:
     [[nodiscard]] const ExecutionMemoryBinding& source_scratch_binding() const noexcept;
     [[nodiscard]] const ModelRuntimeBinding& source_weights_binding() const noexcept;
     [[nodiscard]] std::uint64_t source_serial_execution_identity() const noexcept;
+    [[nodiscard]] std::uint32_t logical_rows() const noexcept;
+    [[nodiscard]] std::uint64_t window_execution_identity() const noexcept;
+    [[nodiscard]] std::uint64_t window_kernel_plan_identity() const noexcept;
+    [[nodiscard]] const ExecutionMemoryBinding& deferred_status_binding() const noexcept;
+    [[nodiscard]] void* source_stream() const noexcept;
 private:
     friend class HipKnownPrefixWindow;
     friend class HipMtpTargetWindowBatch;

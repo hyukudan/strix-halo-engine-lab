@@ -1400,6 +1400,10 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         # Callable fixture requires actual independently supplied component goldens.
         # Building this source library does not execute or qualify the components.
         add_library(strix_mtp_projection_component_fixtures STATIC tests/hip_mtp_projection_components.hip tests/hip_mtp_shared_expert_components.hip tests/hip_mtp_target_window_components.hip tests/hip_mtp_greedy_cycle_components.hip)
+        target_sources(strix_mtp_projection_component_fixtures PRIVATE
+            tests/hip_mtp_lm_head_components.hip
+            tests/hip_mtp_target_checkpoint_components.hip
+            tests/hip_mtp_qualification_reference.hip)
         target_link_libraries(strix_mtp_projection_component_fixtures PRIVATE strix_hip_runtime)
         set_target_properties(strix_mtp_projection_component_fixtures PROPERTIES
             HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
@@ -1446,6 +1450,27 @@ if(STRIX_ENABLE_HIP_RUNTIME)
     )
     target_compile_options(strix-hip-decode-token PRIVATE
         "SHELL:-include \"${CMAKE_CURRENT_SOURCE_DIR}/include/strix/hip_runtime_telemetry.hpp\"")
+    if(BUILD_TESTING)
+        # Same actual model/PLE/asset/replay setup as the decoder. The separate
+        # entry consumes external fixture references and never self-mints proof.
+        add_executable(strix-hip-mtp-model-qualification
+            apps/hip_decode_token_main.cpp tests/hip_mtp_model_qualification_main.cpp)
+        target_compile_definitions(strix-hip-mtp-model-qualification PRIVATE
+            STRIX_DECODE_ENTRY=strix_hip_decode_token_entry STRIX_MTP_MODEL_QUALIFICATION_RUNNER=1)
+        target_include_directories(strix-hip-mtp-model-qualification PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
+        target_link_libraries(strix-hip-mtp-model-qualification PRIVATE
+            strix_hip_runtime strix_mtp_projection_component_fixtures)
+        target_compile_options(strix-hip-mtp-model-qualification PRIVATE
+            "SHELL:-include \"${CMAKE_CURRENT_SOURCE_DIR}/include/strix/hip_runtime_telemetry.hpp\"")
+        strix_target_warnings(strix-hip-mtp-model-qualification)
+        add_executable(strix-hip-mtp-qualification-reference-tests tests/hip_mtp_qualification_reference_tests.hip)
+        target_link_libraries(strix-hip-mtp-qualification-reference-tests PRIVATE
+            strix_hip_runtime strix_mtp_projection_component_fixtures)
+        set_target_properties(strix-hip-mtp-qualification-reference-tests PROPERTIES
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+        strix_target_warnings(strix-hip-mtp-qualification-reference-tests)
+        add_test(NAME strix-hip-mtp-qualification-reference-tests COMMAND strix-hip-mtp-qualification-reference-tests)
+    endif()
     if(BUILD_TESTING)
         add_test(NAME strix-virtual-q8-gdn-output-cli-tests
             COMMAND ${CMAKE_COMMAND} -DBINARY=$<TARGET_FILE:strix-hip-decode-token>

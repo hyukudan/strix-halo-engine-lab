@@ -1038,6 +1038,30 @@ void enqueue_lm(Shape shape, Span input, Span weights, Span output, Kind kind, A
 } // namespace gdn_lm_wave8_diagnostic::detail
 #endif
 
+HipMtpLmHeadRecipe select_hip_mtp_lm_head_recipe(const ModelContract& model,const MtpTensorView& tensor) {
+    const auto h=model.hidden_size,v=model.vocab_size;
+    if(!h || h>std::numeric_limits<std::uint32_t>::max() ||
+       !v || v>std::numeric_limits<std::uint32_t>::max() || !tensor.manifest)
+        throw std::invalid_argument("MTP head geometry or tensor exceeds native launch ABI");
+    const auto kind=weight_kind(tensor.manifest->ggml_type);
+    mtp_native::tensor(tensor,{h,v},required_weight_bytes(kind,static_cast<std::uint32_t>(h),v));
+    // Match the incumbent target overlay's closed geometry and view contract.
+    // Other valid original formats/geometries retain their generic recipe.
+    if(kind==WeightKind::q8_0 && h<=10240U && h%32U==0U && v<=248320U &&
+       tensor.runtime->address%16U==0U)
+        return HipMtpLmHeadRecipe::prefetch8_wave8_q8;
+    return HipMtpLmHeadRecipe::generic256;
+}
+std::uint64_t hip_mtp_lm_head_profile_identity(const ModelContract& model,const MtpTensorView& tensor) {
+    const auto recipe=select_hip_mtp_lm_head_recipe(model,tensor);
+    // The v2 domain explicitly separates this auto-selected MTP-only recipe
+    // from the previous generic MTP profile. Never infer numeric equivalence.
+    std::uint64_t hash=fnv_offset;
+    for(const auto word:{std::uint64_t{0x4d54504c4d483032ULL},static_cast<std::uint64_t>(recipe),
+        static_cast<std::uint64_t>(tensor.manifest->ggml_type),model.hidden_size,model.vocab_size,
+        std::uint64_t{16U},std::uint64_t{32U},std::uint64_t{256U}})hash_u64(hash,word);
+    return hash?hash:1U;
+}
 void preflight_hip_mtp_lm_head(const MtpNativeContext& c) {
     mtp_native::context(c);
     const auto h=c.model->hidden_size,v=c.model->vocab_size;
@@ -1045,15 +1069,29 @@ void preflight_hip_mtp_lm_head(const MtpNativeContext& c) {
        !v || v>std::numeric_limits<std::uint32_t>::max())
         throw std::invalid_argument("MTP head geometry exceeds native launch ABI");
     const auto& t=c.tensors->lm_head;
-    if(!t.manifest) throw std::invalid_argument("MTP shared output head is missing");
-    mtp_native::tensor(t,{h,v},required_weight_bytes(weight_kind(t.manifest->ggml_type),static_cast<std::uint32_t>(h),v));
+    const auto recipe=select_hip_mtp_lm_head_recipe(*c.model,t);
     auto input=mtp_native::buffer(c,HipMtpBuffer::hidden0,mtp_native::product(h,2));
     auto out=mtp_native::buffer(c,HipMtpBuffer::logits,mtp_native::product(v,4));
     mtp_native::disjoint({input,out,{t.runtime->address,t.runtime->bytes,t.runtime->allocation_generation}});
+    if(recipe==HipMtpLmHeadRecipe::prefetch8_wave8_q8)
+        q8_projection_organization::validate_views(static_cast<std::uint32_t>(h),static_cast<std::uint32_t>(v),
+            {input.address,input.bytes},{t.runtime->address,t.runtime->bytes},{out.address,out.bytes});
 }
 void launch_hip_mtp_lm_head(const MtpNativeContext& c,void* stream) {
     preflight_hip_mtp_lm_head(c); mtp_native::stream(c,stream);
-    check_hip(hipGetLastError(),"MTP head pending HIP error");
+    check_hip(hipPeekAtLastError(),"MTP head pending HIP error");
+    if(select_hip_mtp_lm_head_recipe(*c.model,c.tensors->lm_head)==HipMtpLmHeadRecipe::prefetch8_wave8_q8) {
+        const auto outputs=static_cast<std::uint32_t>(c.model->vocab_size);
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(prefetch8_wave_q8_lm_head_kernel<std::uint16_t,8>),
+            dim3(outputs/8U+static_cast<std::uint32_t>(outputs%8U!=0U)),dim3(256U),0,
+            reinterpret_cast<hipStream_t>(stream),
+            reinterpret_cast<const std::uint16_t*>(c.resources->view(HipMtpBuffer::hidden0).address),
+            reinterpret_cast<const void*>(c.tensors->lm_head.runtime->address),
+            static_cast<std::uint32_t>(c.model->hidden_size),outputs,
+            reinterpret_cast<float*>(c.resources->view(HipMtpBuffer::logits).address));
+        check_hip(hipGetLastError(),"MTP prefetch8 wave8 LM head launch");
+        return;
+    }
     auto launch=[&]<WeightKind Kind>() {
         hipLaunchKernelGGL(HIP_KERNEL_NAME(lm_head_kernel<std::uint16_t,Kind>),
             dim3(static_cast<std::uint32_t>(c.model->vocab_size)),dim3(kThreads),0,

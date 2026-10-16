@@ -33,6 +33,8 @@ struct MtpNativeTensorViews {
     MtpTensorView shared_gate,shared_up,shared_down,shared_scalar_gate;
     MtpTensorView head_norm,head_down,head_up,lm_head;
 };
+// The three checkpoint enumerators retain their old numeric slots for source
+// compatibility only. They have no allocation; view() rejects retired roles.
 enum class HipMtpBuffer : std::uint32_t {
     wide_current,wide_next,wide_checkpoint,embedding,normalized_input,projected_input,
     fused_wide,wide_work,hidden0,hidden1,hidden2,injection,routes,route_weights,

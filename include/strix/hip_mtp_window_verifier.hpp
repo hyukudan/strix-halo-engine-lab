@@ -8,6 +8,7 @@ struct HipMtpWindowVerificationPolicy {
     HipMtpTargetWindowCapturePolicy capture;
     SessionSnapshotPolicy snapshot_policy=SessionSnapshotPolicy::occupied_kv_v1;
     std::uint64_t checkpoint_retained_byte_budget=0,total_retained_byte_budget=0;
+    bool bounded_window_rollback=false; // explicit candidate, full fallback remains default
 };
 struct HipMtpVerifiedTargetRows {
     std::vector<HipMtpTargetHiddenTicket> committed_rows;
@@ -29,6 +30,7 @@ public:
     HipMtpWindowVerifier(const HipMtpWindowVerifier&)=delete;
     HipMtpWindowVerifier& operator=(const HipMtpWindowVerifier&)=delete;
     [[nodiscard]] std::shared_ptr<HipMtpTargetHidden> target_owner() const noexcept;
+    [[nodiscard]] std::shared_ptr<HipKnownPrefixWindow> window_owner() const noexcept;
     [[nodiscard]] std::uint32_t logical_rows() const noexcept;
     [[nodiscard]] bool failed() const noexcept;
     [[nodiscard]] std::uint64_t retained_payload_bytes() const noexcept;

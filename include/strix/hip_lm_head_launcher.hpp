@@ -58,6 +58,16 @@ private:
 
 // Source-only native MTP entry points; qualification is separate.
 struct MtpNativeContext;
+struct MtpTensorView;
+enum class HipMtpLmHeadRecipe : std::uint32_t {
+    generic256=0,
+    prefetch8_wave8_q8=1,
+};
+// Pure host recipe admission: no HIP calls or qualification. Unsupported fast
+// geometry/format uses the original generic native MTP head. Actual launches
+// still require the full retained-owner context and dynamic buffer checks.
+[[nodiscard]] HipMtpLmHeadRecipe select_hip_mtp_lm_head_recipe(const ModelContract&,const MtpTensorView&);
+[[nodiscard]] std::uint64_t hip_mtp_lm_head_profile_identity(const ModelContract&,const MtpTensorView&);
 void preflight_hip_mtp_lm_head(const MtpNativeContext&);
 void launch_hip_mtp_lm_head(const MtpNativeContext&,void* stream);
 

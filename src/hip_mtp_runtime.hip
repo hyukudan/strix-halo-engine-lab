@@ -84,9 +84,10 @@ struct HipMtpRuntime::Impl {
     std::vector<HipMtpReplayRow> replay;
     std::vector<std::uint32_t> candidates;
     MtpDraftCycleInput current;
+    HipMtpExecutionStats stats;
     std::uint64_t next_source=0,base_source=0,epoch=0,profile=0;
     std::uint32_t step=0,pending_token=0;
-    bool active=false,cycle=false,have_replay=false,broken=false;
+    bool active=false,cycle=false,have_replay=false,broken=false,cache_only_active=false,first_cache_reusable=false;
     explicit Impl(std::shared_ptr<HipMtpResources> actual):owner(std::move(actual)) {
         require(owner && !owner.owner_before(owner->weak_from_this().lock()) &&
             !owner->weak_from_this().lock().owner_before(owner),"MTP runtime requires its actual retained native owner");
@@ -98,7 +99,10 @@ struct HipMtpRuntime::Impl {
         selector=std::make_unique<HipGreedyOutput>(static_cast<std::uint32_t>(owner->model().vocab_size),
             ExecutionMemoryBinding{owner->physical_identity(),pool.address,owner->reservation().device_pool_bytes,pool.allocation_generation},owner,owner->guard());
         const auto input=fusion();profile=hip_mtp_input_fusion_profile_identity(input);
-        for(const auto word:{owner->plan().forward_semantics.contract_identity,owner->plan().plan_identity,std::uint64_t{0x4d545052415731ULL}})
+        for(const auto word:{owner->plan().forward_semantics.contract_identity,owner->plan().plan_identity,
+            hip_mtp_lm_head_profile_identity(owner->model(),owner->tensors().lm_head),
+            std::uint64_t{0x4d54504341535431ULL}, // durable cache BF16-cast contract v1
+            std::uint64_t{0x4d545052415731ULL}})
             for(unsigned shift=0;shift<64;shift+=8) profile=(profile^((word>>shift)&255U))*1099511628211ULL;
         if(!profile) profile=1U;
     }
@@ -118,7 +122,7 @@ struct HipMtpRuntime::Impl {
         r.output=device(owner->view(HipMtpBuffer::fused_wide));return r;
     }
     MtpNativeContext context(std::uint64_t position) const {return {&owner->model(),&owner->plan(),&owner->tensors(),owner.get(),position};}
-    void preflight(std::uint64_t position,std::uint32_t token,bool already_admitted=false) const {
+    void preflight(std::uint64_t position,std::uint32_t token,bool already_admitted=false,bool cache_only=false) const {
         require(!broken && !active && !current_hip_launch_context(),"MTP native input requires one healthy idle host protocol");
         std::optional<HipMtpResources::NativeValidationScope> local_validation;
         if(!already_admitted && !validation) local_validation.emplace(owner->admit_native_entry());
@@ -127,7 +131,9 @@ struct HipMtpRuntime::Impl {
         check(hipStreamIsCapturing(static_cast<hipStream_t>(owner->stream()),&capture),"MTP capture query failed");
         require(capture==hipStreamCaptureStatusNone,"MTP native runtime is eager only");
         preflight_hip_mtp_embedding(c,token);preflight_hip_mtp_input_fusion(fusion());
-        preflight_hip_mtp_hyper_mix(c,MtpHyperRole::attention);preflight_hip_mtp_attention(c);
+        preflight_hip_mtp_hyper_mix(c,MtpHyperRole::attention);
+        if(cache_only){preflight_hip_mtp_cache_rows(c);return;}
+        preflight_hip_mtp_attention(c);
         preflight_hip_mtp_inject(c,MtpInjectRole::attention);preflight_hip_mtp_hyper_mix(c,MtpHyperRole::mlp);
         preflight_hip_mtp_route(c);preflight_hip_mtp_shared_expert(c);preflight_hip_mtp_routed_experts(c);
         preflight_hip_mtp_moe_combine(c);preflight_hip_mtp_inject(c,MtpInjectRole::mlp);
@@ -156,10 +162,10 @@ struct HipMtpRuntime::Impl {
         check(hipMemcpyAsync(reinterpret_cast<void*>(destination.address),reinterpret_cast<const void*>(source.address),
             static_cast<std::size_t>(source.bytes),hipMemcpyDeviceToDevice,static_cast<hipStream_t>(owner->stream())),"MTP owned copy enqueue failed");
     }
-    void failure() noexcept {broken=true;active=false;owner->fail();validation.reset();}
+    void failure() noexcept {broken=true;active=false;cache_only_active=false;first_cache_reusable=false;owner->fail();validation.reset();}
     void stage(const MtpForwardStepContext& call) {
         const auto& input=*call.cycle_input;
-        require(active && step<native_steps.size() && call.step_index==step && call.step==native_steps[step] &&
+        require(active && !cache_only_active && step<native_steps.size() && call.step_index==step && call.step==native_steps[step] &&
             call.input_token==current.seed_token_id && call.target_position==current.seed_position &&
             call.predictor_position==current.hidden_source_position && call.plan_identity==owner->plan().plan_identity &&
             call.proposal_identity==owner->plan().proposal_identity && same_input(input,current),"MTP native dispatch order/input changed");
@@ -181,28 +187,30 @@ struct HipMtpRuntime::Impl {
         }
         ++step;
     }
-    void start(MtpDraftCycleInput input,const HipMtpTargetHiddenTicket* source) {
+    void start(MtpDraftCycleInput input,const HipMtpTargetHiddenTicket* source,bool cache_only=false) {
         require(input.hidden_source_position==next_source && input.seed_position==next_source+1U &&
             input.seed_token_id<owner->model().vocab_size,"MTP source position/seed is not the next native row");
         require(!active && !validation,"MTP input cannot replace an active native admission");
         validation.emplace(owner->admit_native_entry());
         try {
-            preflight(next_source,input.seed_token_id);
+            preflight(next_source,input.seed_token_id,false,cache_only);
+            require(cache_only?stats.cache_only_rows!=UINT64_MAX:stats.full_forward_rows!=UINT64_MAX,
+                "MTP completed row counter exhausted");
             if(source) validate_ticket(*source);
             require(epoch!=UINT64_MAX,"MTP native epoch exhausted");
             owner->mark_submitted();
         } catch(...) {validation.reset();throw;}
         ++epoch;
-        active=true;step=0;current=input;
+        active=true;cache_only_active=cache_only;step=0;current=input;
         try {if(source) copy(owner->view(HipMtpBuffer::wide_current),source->view());} catch(...) {failure();throw;}
     }
     std::uint32_t finish() {
-        require(active && step==native_steps.size(),"MTP native output requested before all eleven steps");
+        require(active && !cache_only_active && step==native_steps.size(),"MTP native output requested before all eleven steps");
         try {
             owner->complete();const auto logits=owner->view(HipMtpBuffer::logits);
             const auto token=selector->select(ExecutionBufferAddress{{},logits.address,logits.bytes,logits.allocation_generation},
                 static_cast<std::uint32_t>(owner->model().vocab_size),current.hidden_source_position,epoch);
-            active=false;++next_source;validation.reset();return token;
+            active=false;++next_source;++stats.full_forward_rows;validation.reset();return token;
         } catch(...) {failure();throw;}
     }
     std::uint32_t run_current() {
@@ -229,6 +237,49 @@ struct HipMtpRuntime::Impl {
                 owner->view(HipMtpBuffer::wide_current),owner->view(HipMtpBuffer::logits),true};
         } catch(...) {failure();throw;}
     }
+    void teacher_cache(const HipMtpTargetHiddenTicket& ticket,std::uint32_t token) {
+        validate_ticket(ticket);require(ticket.source_position()==next_source,"MTP teacher cache row is not contiguous");
+        if(last_target) {
+            require_chain(*last_target,ticket);
+            require(last_teacher_next_input && *last_teacher_next_input==ticket.input_token(),
+                "MTP prior cache teacher pair differs from the actual next target input");
+        } else require(!next_source,"MTP initial cache history must start at source zero");
+        const auto v=owner->view(HipMtpBuffer::wide_current);
+        MtpDraftCycleInput input{owner->plan().proposal_identity,0U,ticket.committed_session().runtime_compatibility_identity,
+            token,next_source+1U,next_source,v.address,owner->plan().state.state_width,2U,v.allocation_generation};
+        // Copy the authoritative wide source on every teacher row. No previous
+        // predictor-wide result, logits or scratch payload is a cache input.
+        start(input,&ticket,true);
+        try {
+            const auto c=context(current.hidden_source_position);void* stream=owner->stream();
+            launch_hip_mtp_embedding(c,current.seed_token_id,stream);
+            launch_hip_mtp_input_fusion(fusion(),stream);
+            launch_hip_mtp_hyper_mix(c,MtpHyperRole::attention,stream);
+            launch_hip_mtp_cache_rows(c,stream);
+            owner->complete();
+            active=false;cache_only_active=false;++next_source;++stats.cache_only_rows;validation.reset();
+            last_target=ticket;last_teacher_next_input=token;
+        } catch(...) {failure();throw;}
+    }
+    void reuse_first_teacher_cache(const HipMtpReplayRow& row) {
+        // The only caller is reconciliation after its full metadata admission.
+        // The proof is private and minted after the first full proposal row's
+        // native completion and finite selector, never by predicted-token match.
+        require(first_cache_reusable && cycle_base && !broken && !active && !validation &&
+            row.hidden.same_commit(*cycle_base) && row.hidden.source_position()==base_source &&
+            row.hidden.view()==cycle_base->view() && row.next_input_token==pending_token && next_source==base_source,
+            "MTP first cache reuse lacks its actual completed proposal source proof");
+        validate_ticket(row.hidden);
+        if(last_target) {
+            require_chain(*last_target,row.hidden);
+            require(last_teacher_next_input && *last_teacher_next_input==row.hidden.input_token(),
+                "MTP reused cache teacher pair differs from the actual preceding input");
+        } else require(!next_source,"MTP reused initial cache history must start at source zero");
+        owner->require_idle();
+        require(stats.cache_reused_rows!=UINT64_MAX,"MTP reused cache row counter exhausted");
+        ++next_source;++stats.cache_reused_rows;
+        last_target=row.hidden;last_teacher_next_input=row.next_input_token;
+    }
     void qualification(const QualifiedMtpDraftPlan& plan,const ActivatedMtpDraftPlan& activated) const {
         require_qualified_mtp_draft_plan(plan);
         require(plan.base.plan_identity==owner->plan().plan_identity && plan.base.proposal_identity==owner->plan().proposal_identity &&
@@ -245,6 +296,21 @@ std::uint64_t HipMtpRuntime::next_source_position() const noexcept {return impl_
 bool HipMtpRuntime::failed() const noexcept {return impl_->broken || impl_->owner->failed();}
 void HipMtpRuntime::cancel() noexcept {impl_->failure();}
 std::uint64_t HipMtpRuntime::numerical_profile_identity() const noexcept {return impl_->profile;}
+HipMtpExecutionStats HipMtpRuntime::execution_stats() const noexcept {return impl_->stats;}
+HipMtpCacheStateView HipMtpRuntime::cache_state() const {
+    const auto& p=*impl_;
+    require(!p.broken && !p.active && !p.cycle && !p.validation,
+        "MTP durable cache view requires an idle completed producer outside any proposal");
+    p.owner->require_idle();
+    const auto kv_stride=mtp_native::product(mtp_native::product(p.owner->model().kv_heads,p.owner->model().head_dim),4U);
+    const auto index_stride=mtp_native::product(p.owner->model().indexer_head_dim,2U);
+    auto kv=p.owner->view(HipMtpBuffer::kv),index=p.owner->view(HipMtpBuffer::raw_index);
+    const auto kv_bytes=mtp_native::product(p.next_source,kv_stride),index_bytes=mtp_native::product(p.next_source,index_stride);
+    require(p.next_source<=p.owner->context_capacity() && kv_bytes<=kv.bytes && index_bytes<=index.bytes,
+        "MTP durable cache prefix exceeds actual retained backing");
+    kv.bytes=kv_bytes;index.bytes=index_bytes;
+    return {kv,index,p.next_source,kv_stride,index_stride};
+}
 HipMtpNativeRowResult HipMtpRuntime::execute_diagnostic(const HipMtpTargetHiddenTicket& ticket,std::uint32_t token) {
     require(!impl_->cycle,"MTP diagnostic cannot interleave a live production proposal");return impl_->teacher(ticket,token);
 }
@@ -256,10 +322,10 @@ void HipMtpRuntime::prime_committed_rows(const QualifiedMtpDraftPlan& plan,const
         p.validate_ticket(rows[i].hidden);require(rows[i].hidden.source_position()==p.next_source+i &&
             rows[i].next_input_token<p.owner->model().vocab_size,"MTP priming rows are invalid");
         if(i) {require_chain(rows[i-1U].hidden,rows[i].hidden);require(rows[i-1U].next_input_token==rows[i].hidden.input_token(),"MTP teacher priming token pair changed");}
-        p.preflight(rows[i].hidden.source_position(),rows[i].next_input_token,true);
+        p.preflight(rows[i].hidden.source_position(),rows[i].next_input_token,true,true);
     }
     }
-    for(const auto& row:rows) (void)p.teacher(row.hidden,row.next_input_token);
+    for(const auto& row:rows) p.teacher_cache(row.hidden,row.next_input_token);
 }
 void HipMtpRuntime::begin_cycle(std::uint32_t token,const HipMtpTargetHiddenTicket& ticket) {
     auto& p=*impl_;p.validate_ticket(ticket);require(!p.cycle && !p.active && ticket.source_position()==p.next_source &&
@@ -271,13 +337,12 @@ void HipMtpRuntime::begin_cycle(std::uint32_t token,const HipMtpTargetHiddenTick
     }
     const auto admission=p.owner->admit_native_entry();
     p.preflight(p.next_source,token,true);p.owner->require_idle();
-    try {
-        p.owner->mark_submitted();p.copy(p.owner->view(HipMtpBuffer::kv_checkpoint),p.owner->view(HipMtpBuffer::kv));
-        p.copy(p.owner->view(HipMtpBuffer::raw_index_checkpoint),p.owner->view(HipMtpBuffer::raw_index));
-        p.copy(p.owner->view(HipMtpBuffer::wide_checkpoint),p.owner->view(HipMtpBuffer::wide_current));p.owner->complete();
-    } catch(...) {p.failure();throw;}
+    // Metadata-only checkpoint: proposals overwrite rows starting at
+    // base_source. All earlier rows are immutable, and every later reader is
+    // bounded by its current source position after that row was overwritten.
+    // The first proposal input always copies the authoritative cycle ticket.
     p.base_previous_target=p.last_target;p.base_previous_input=p.last_teacher_next_input;
-    p.cycle_base=ticket;p.base_source=p.next_source;p.pending_token=token;p.candidates.clear();p.cycle=true;
+    p.cycle_base=ticket;p.base_source=p.next_source;p.pending_token=token;p.candidates.clear();p.cycle=true;p.first_cache_reusable=false;
     p.replay.clear();p.reconcile_final.reset();p.have_replay=false;
 }
 void HipMtpRuntime::dispatch_mtp_step(const MtpForwardStepContext& call) {
@@ -321,7 +386,10 @@ std::uint32_t HipMtpRuntime::read_greedy_token(const QualifiedMtpDraftPlan& plan
             plan.native_arithmetic_profile_identity==p.profile &&
             result.completed_steps==native_steps.size() && result.next_state_published && result.logits_published,
             "MTP token read does not match a complete pending native forward");
-        const auto token=p.finish();p.candidates.push_back(token);return token;
+        const auto token=p.finish();
+        if(index==0U) p.first_cache_reusable=p.cycle_base && p.current.hidden_source_position==p.base_source &&
+            p.current.seed_position==p.base_source+1U && p.current.seed_token_id==p.pending_token;
+        p.candidates.push_back(token);return token;
     } catch(...) {if(p.active) p.failure();throw;}
 }
 void HipMtpRuntime::set_reconciliation_rows(std::span<const HipMtpReplayRow> rows,const HipMtpTargetHiddenTicket& final_target) {
@@ -355,29 +423,27 @@ void HipMtpRuntime::reconcile_after_target(const QualifiedMtpDraftPlan& plan,con
     // tickets and complete teacher-pair coverage above are the authority.
     {
         const auto admission=p.owner->admit_native_entry();
-        for(const auto& row:p.replay) p.preflight(row.hidden.source_position(),row.next_input_token,true);
-        try {
-        p.owner->mark_submitted();p.copy(p.owner->view(HipMtpBuffer::kv),p.owner->view(HipMtpBuffer::kv_checkpoint));
-        p.copy(p.owner->view(HipMtpBuffer::raw_index),p.owner->view(HipMtpBuffer::raw_index_checkpoint));
-        p.copy(p.owner->view(HipMtpBuffer::wide_current),p.owner->view(HipMtpBuffer::wide_checkpoint));p.owner->complete();
-        } catch(...) {p.failure();throw;}
+        for(const auto& row:p.replay) p.preflight(row.hidden.source_position(),row.next_input_token,true,true);
     }
     try {
         p.next_source=p.base_source;
-        // First replay row is the checkpoint ticket, not a new committed row.
+        // Earlier occupied rows were never overwritten. The whole proposal
+        // suffix is now logically invalid until actual teacher pairs overwrite
+        // its committed prefix in order. Bytes beyond next_source stay unused;
+        // they are not restored, compared as committed data or read by a later
+        // attention row before that row has produced its own cache values.
         p.last_target=p.base_previous_target;p.last_teacher_next_input=p.base_previous_input;
-        for(const auto& row:p.replay) {
-            // Earlier known history remains in the restored cache. The first
-            // row is checked against cycle_base by the staged metadata above.
-            const auto v=p.owner->view(HipMtpBuffer::wide_current);
-            MtpDraftCycleInput input{plan.base.proposal_identity,activated.activation_identity,target.runtime_compatibility_identity,
-                row.next_input_token,p.next_source+1U,p.next_source,v.address,plan.base.state.state_width,2U,v.allocation_generation};
-            p.start(input,&row.hidden);
-            (void)p.run_current();p.last_target=row.hidden;p.last_teacher_next_input=row.next_input_token;
+        for(std::size_t i=0;i<p.replay.size();++i) {
+            const auto& row=p.replay[i];
+            const bool reuse=i==0U && p.first_cache_reusable && p.cycle_base &&
+                row.hidden.same_commit(*p.cycle_base) && row.hidden.source_position()==p.base_source &&
+                row.hidden.view()==p.cycle_base->view() && row.next_input_token==p.pending_token;
+            if(reuse)p.reuse_first_teacher_cache(row);
+            else p.teacher_cache(row.hidden,row.next_input_token);
         }
         require(p.next_source==p.reconcile_final->source_position(),"MTP replay did not reach the actual committed target frontier");
         p.cycle=false;p.cycle_base.reset();p.base_previous_target.reset();p.base_previous_input.reset();
-        p.replay.clear();p.reconcile_final.reset();p.have_replay=false;p.candidates.clear();
+        p.replay.clear();p.reconcile_final.reset();p.have_replay=false;p.candidates.clear();p.first_cache_reusable=false;
     } catch(...) {p.failure();throw;}
 }
 } // namespace strix

@@ -16,6 +16,22 @@ struct HipMtpNativeRowResult {
     MtpDeviceView wide_state,logits;
     bool device_completed=false;
 };
+// Only these durable occupied prefixes are meaningful after teacher replay.
+// KV rows are [K[kv_heads*head_dim],V[kv_heads*head_dim]] BF16; raw-index
+// rows are BF16[indexer_head_dim]. Unoccupied future bytes and work/logit/wide
+// outputs after a cache-only row are unspecified, never restoration evidence.
+struct HipMtpCacheStateView {
+    MtpDeviceView kv,raw_index;
+    std::uint64_t logical_rows=0,kv_row_bytes=0,raw_index_row_bytes=0;
+};
+struct HipMtpExecutionStats {
+    // Completed rows only. Full rows include the real finite token reader;
+    // cache rows have no head, selector or wide-next publication.
+    std::uint64_t full_forward_rows=0,cache_only_rows=0;
+    // Actual first proposal cache row retained under its private completion
+    // proof; not a new GPU cachewriter submission and never token equality.
+    std::uint64_t cache_reused_rows=0;
+};
 // Concrete eager C1 native proposal owner/protocol. The diagnostic entry is an
 // explicit candidate execution to acquire independent replay evidence; it does
 // not mint activation/qualification or claim checkpoint numerical equivalence.
@@ -34,12 +50,18 @@ public:
     [[nodiscard]] bool failed() const noexcept;
     void cancel() noexcept;
     [[nodiscard]] std::uint64_t numerical_profile_identity() const noexcept;
+    // Requires healthy idle ownership outside a live proposal. Views borrow
+    // this actual owner and are valid until the next runtime operation.
+    [[nodiscard]] HipMtpCacheStateView cache_state() const;
+    [[nodiscard]] HipMtpExecutionStats execution_stats() const noexcept;
     [[nodiscard]] HipMtpNativeRowResult execute_diagnostic(
         const HipMtpTargetHiddenTicket&,std::uint32_t next_input_token);
     void begin_cycle(std::uint32_t actual_pending_token,const HipMtpTargetHiddenTicket&);
+    // Qualified teacher rows rebuild only exact raw-index/K/V cache state;
+    // full diagnostic replay above always executes all eleven stages.
     void prime_committed_rows(const QualifiedMtpDraftPlan&,const ActivatedMtpDraftPlan&,
         std::span<const HipMtpReplayRow>);
-    // All source pairs after the checkpoint, plus the final committed target
+    // All source pairs after the logical cache frontier, plus the final committed target
     // ticket. Equality of predicted tokens is never cache authority.
     void set_reconciliation_rows(std::span<const HipMtpReplayRow>,const HipMtpTargetHiddenTicket& final_target);
     void dispatch_mtp_step(const MtpForwardStepContext&) override;

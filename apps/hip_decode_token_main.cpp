@@ -54,6 +54,9 @@
 #include "hip_decode_experiment.hpp"
 #include "hip_decode_options.hpp"
 #include "hip_mtp_decode_bridge.hpp"
+#if defined(STRIX_MTP_MODEL_QUALIFICATION_RUNNER)
+#include "../tests/hip_mtp_model_qualification.hpp"
+#endif
 #include "strix/q8_projection_organization.hpp"
 #include "strix/q8_projection_manifest.hpp"
 #include "strix/hc_projection_prefetch.hpp"
@@ -800,7 +803,10 @@ void write_logit_hashes(std::span<const std::string> hashes) {
 
 }  // namespace
 
-int main(
+#ifndef STRIX_DECODE_ENTRY
+#define STRIX_DECODE_ENTRY main
+#endif
+int STRIX_DECODE_ENTRY(
     int argc,
     char** argv) try {
     if (argc == 2 && std::string_view(argv[1]) == "--help") {
@@ -1993,6 +1999,7 @@ int main(
                 auto window_owner = std::make_shared<strix::HipKnownPrefixWindow>(plan, compiled, model, catalog_config,
                     parents->resources, window_memory->scratch, window_memory->scope, std::static_pointer_cast<const void>(window_memory));
                 strix::HipMtpWindowVerificationPolicy policy;
+                policy.bounded_window_rollback = true;
                 policy.capture = {options.mtp.window_capture_bytes, options.mtp.window_history_intervals};
                 policy.checkpoint_retained_byte_budget = options.mtp.window_checkpoint_bytes;
                 policy.total_retained_byte_budget = options.mtp.window_total_bytes - requested_arena;
@@ -2003,7 +2010,11 @@ int main(
         setup_phase.reset();
         strix::decode_cli::run_mtp_decode_bridge(options, model, compiled, parents, session, direct_dispatcher,
             generations, catalog_config.deferred_moe_status, optimization_profile.selected, std::cout, std::move(make_window),
-            [&] { return execution_inventory_receipt + ple_cache_completed_receipt(); });
+            [&] { return execution_inventory_receipt + ple_cache_completed_receipt(); }
+#if defined(STRIX_MTP_MODEL_QUALIFICATION_RUNNER)
+            , strix::tests::run_mtp_model_qualification
+#endif
+            );
         return 0;
     }
 
