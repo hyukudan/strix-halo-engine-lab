@@ -1,11 +1,15 @@
 #include "strix/serial_prefix_cache.hpp"
+#include "strix/known_prefix_prefill.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
 #include <memory>
 #include <stdexcept>
+#include <string>
+#include <utility>
 #include <unordered_map>
 #include <vector>
 
@@ -122,6 +126,124 @@ strix::PersistentState all_state() {
         PersistentState::sparse_index |
         PersistentState::ngram_history |
         PersistentState::position_history;
+}
+
+// Canonical-topology metadata fixture, not a native execution/oracle. Shared
+// tensors/accesses are real planner inputs; other operators remain explicit R1
+// fixture IDs. Window/prefill identities are derived by production compilers.
+struct ProducerPlans {
+    strix::CompiledSerialExecution serial;
+    strix::ModelManifest manifest;
+    strix::ExecutionTensorAccessPlan access;
+    explicit ProducerPlans(const strix::ModelContract& model) {
+        serial.execution=strix::build_serial_decode_execution_plan(model);
+        serial.io=strix::build_serial_execution_io_plan(serial.execution);
+        serial.arena=strix::build_serial_execution_arena_plan(model,{},serial.execution,serial.io);
+        serial.execution_identity=0x52504331U;serial.kernel_plan_identity=0x52504b31U;
+        serial.vocab_size=model.vocab_size;serial.max_position_embeddings=model.max_position_embeddings;
+        manifest.architecture="producer-recipe-planner-fixture";
+        for(const auto& step:serial.execution.steps) {
+            strix::ExecutionKernelBinding binding;binding.step_id=step.id;binding.op=step.op;
+            binding.family=strix::operator_family_for(step.op);
+            binding.host_or_runtime_step=step.op==strix::SerialOp::position_prepare;
+            if(binding.host_or_runtime_step) ++serial.bindings.host_or_runtime_steps;
+            else {binding.kernel_id="fixture.serial."+std::to_string(step.id);++serial.bindings.bound_steps;}
+            if(step.op==strix::SerialOp::shared_expert) {
+                binding.kernel_id="hip.shared_expert.bf16.h2560.m640.r1.c1";
+                for(unsigned i=0;i<4U;++i) {
+                    strix::ManifestTensor tensor;tensor.layer=step.layer;tensor.role=strix::TensorRole::dense_projection;
+                    tensor.name="blk."+std::to_string(*step.layer)+"."+
+                        std::array<const char*,4>{"ffn_gate_shexp.weight","ffn_up_shexp.weight","ffn_down_shexp.weight","ffn_gate_inp_shexp.weight"}[i];
+                    tensor.dimensions=i==3U?std::vector<std::uint64_t>{2560}:
+                        i==2U?std::vector<std::uint64_t>{640,2560}:std::vector<std::uint64_t>{2560,640};
+                    tensor.ggml_type=i==3U?0U:8U;tensor.byte_size=i==3U?2560U*4U:tensor.dimensions[0]/32U*34U*tensor.dimensions[1];
+                    tensor.absolute_offset=manifest.total_tensor_bytes;manifest.total_tensor_bytes+=tensor.byte_size;
+                    manifest.tensors.push_back(std::move(tensor));
+                }
+            }
+            serial.bindings.bindings.push_back(std::move(binding));
+        }
+        manifest.layout_identity=strix::model_manifest_layout_identity(manifest);
+        auto requirements=strix::build_serial_execution_tensor_requirements(serial.execution);
+        std::erase_if(requirements,[](const auto& r){return r.op!=strix::SerialOp::shared_expert;});
+        access=strix::compile_execution_tensor_access_plan(serial.execution,manifest,strix::build_model_tensor_index(manifest),requirements);
+    }
+};
+strix::ArithmeticLineage recipe_history(const ProducerPlans& source,const strix::CompiledKnownPrefixWindow& state,
+    const strix::CompiledKnownPrefixWindow& terminal,std::uint64_t length) {
+    strix::ArithmeticLineage history;std::uint64_t position=0;
+    while(length-position>=state.logical_rows) {
+        const auto& plan=length-position==state.logical_rows?terminal:state;
+        history=strix::prepare_prefill_chunk_lineage(history,position,position+state.logical_rows,
+            plan.window_execution_identity,plan.window_kernel_plan_identity,plan.window_execution_identity);
+        position+=state.logical_rows;
+    }
+    while(position<length) {
+        history=strix::prepare_serial_row_lineage(history,position,source.serial.execution_identity,source.serial.kernel_plan_identity);++position;
+    }
+    return history;
+}
+void producer_recipe_cases(const strix::ModelContract& model,const strix::SerialSessionStateLayout& layout,
+    const strix::SessionStateMemoryBinding& state_memory,const strix::SerialSessionContext& base,
+    strix::AllocationGenerationSource& generations,MemcpyTransferBackend& transfer) {
+    ProducerPlans source(model);
+    strix::KnownWindowRequest req;req.r2_shared_expert=true;req.output_policy=strix::KnownWindowOutputPolicy::state_only;
+    const auto state=strix::compile_known_prefix_window(model,source.serial,source.manifest,source.access,req);
+    req.output_policy=strix::KnownWindowOutputPolicy::terminal_row;
+    const auto terminal=strix::compile_known_prefix_window(model,source.serial,source.manifest,source.access,req);
+    const auto recipe=strix::SerialPrefixProducerRecipe::known_window(source.serial,state,terminal);
+    expect(recipe.maximum_history_intervals(7U)==4U,"producer recipe exposes bounded metadata reservation before allocation");
+    bool empty_bound=false;try {(void)recipe.maximum_history_intervals(0U);} catch(const std::invalid_argument&) {empty_bound=true;}
+    expect(empty_bound,"producer recipe accepted an empty metadata bound");
+    for(std::uint64_t n=1;n<=7U;++n) {
+        auto history=recipe_history(source,state,terminal,n);
+        expect(recipe.matches_history(history,n),"canonical chunk/terminal/R1 suffix history rejected");
+        history.intervals[0].numerical_plan_identity^=1U;history.history_identity=strix::arithmetic_history_identity(history.intervals);
+        expect(!recipe.matches_history(history,n),"producer recipe accepted another numerical producer with a fresh hash");
+    }
+    auto wrong=terminal;wrong.window_execution_identity^=1U;bool invalid=false;
+    try {(void)strix::SerialPrefixProducerRecipe::known_window(source.serial,state,wrong);} catch(const std::invalid_argument&) {invalid=true;}
+    expect(invalid,"recipe accepted a forged compiled window identity");
+    invalid=false;try {(void)strix::SerialPrefixProducerRecipe::known_window(source.serial,terminal,state);}
+    catch(const std::invalid_argument&) {invalid=true;}
+    expect(invalid,"recipe accepted swapped state/terminal policies");
+    strix::KnownPrefillRequest tiled;tiled.logical_rows=16;tiled.r2_shared_expert=true;
+    tiled.workspace_budget_bytes=UINT64_MAX;tiled.host_metadata_payload_budget_bytes=UINT64_MAX;
+    tiled.output_policy=strix::KnownWindowOutputPolicy::state_only;
+    const auto state_tiled=strix::compile_known_prefix_prefill(model,source.serial,source.manifest,source.access,tiled);
+    tiled.output_policy=strix::KnownWindowOutputPolicy::terminal_row;
+    const auto terminal_tiled=strix::compile_known_prefix_prefill(model,source.serial,source.manifest,source.access,tiled);
+    const auto tiled_recipe=strix::SerialPrefixProducerRecipe::known_prefill(source.serial,state_tiled,terminal_tiled);
+    auto history=strix::prepare_prefill_chunk_lineage({},0U,16U,terminal_tiled.prefill_execution_identity,
+        terminal_tiled.prefill_kernel_plan_identity,terminal_tiled.prefill_execution_identity);
+    expect(tiled_recipe.matches_history(history,16U) && !recipe.matches_history(history,16U),"tiled recipe lost actual geometry/IDs");
+    // A valid budget-constrained cursor history (R1 then a chunk) is not the
+    // canonical from-zero recipe. Pool capture must skip it without retagging.
+    history=strix::prepare_serial_row_lineage({},0U,source.serial.execution_identity,source.serial.kernel_plan_identity);
+    history=strix::prepare_prefill_chunk_lineage(history,1U,3U,terminal.window_execution_identity,
+        terminal.window_kernel_plan_identity,terminal.window_execution_identity);
+    expect(strix::arithmetic_lineage_valid(history,3U) && !recipe.matches_history(history,3U),"recipe silently canonicalized an offset chunk");
+    const std::vector<std::uint32_t> tokens{11U,12U,13U};
+    auto session=base;session.execution_identity=source.serial.execution_identity;session.next_position=3U;session.committed_tokens=3U;
+    session.arithmetic_lineage=recipe_history(source,state,terminal,3U);
+    auto allocator=std::make_shared<VectorAllocator>();strix::ModelContentIdentity content;content.bytes[0]=7;
+    auto entry=strix::SerialPrefixCacheEntry::capture(model,tokens,session,layout,state_memory,*allocator,generations,transfer,64U,
+        strix::SerialPrefixGreedyFrontier{content,model.vocab_size,21U});
+    const auto bytes=entry.memory().device_section_bytes+entry.memory().host_section_bytes;
+    strix::SerialPrefixCache cache(1,bytes);(void)cache.insert(std::move(entry),allocator);
+    auto hit=cache.find_exact_greedy(tokens,content,model.vocab_size,session.execution_identity,
+        session.runtime_compatibility_identity,session.state_layout_identity,recipe);
+    expect(hit && hit->greedy_frontier()->pending_token==21U,"canonical recipe exact-hit lost pending token");
+    auto longer=tokens;longer.push_back(14U);
+    expect(!cache.find_exact_greedy(longer,content,model.vocab_size,session.execution_identity,
+        session.runtime_compatibility_identity,session.state_layout_identity,recipe),"recipe mode reused a proper prefix");
+    expect(!cache.find_longest_greedy(tokens,content,model.vocab_size,session.execution_identity,
+        session.runtime_compatibility_identity,session.state_layout_identity),"serial-only mode promoted chunk history");
+    auto restored=base;restored.execution_identity=session.execution_identity;restored.next_position=0;restored.committed_tokens=0;
+    restored.arithmetic_lineage={};
+    hit->restore(restored,model,layout,state_memory,transfer,tokens,&hit->prefix().arithmetic_lineage);
+    expect(restored.arithmetic_lineage.intervals==session.arithmetic_lineage.intervals && restored.next_position==3U,
+        "recipe restore failed to publish complete original chunk history after payload");
 }
 
 }  // namespace
@@ -484,6 +606,8 @@ int main() {
         }
         session=original_session;
     }
+
+    producer_recipe_cases(model,layout,state_memory,session,generations,transfer);
 
     if (failures == 0) {
         std::cout

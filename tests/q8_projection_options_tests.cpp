@@ -244,6 +244,21 @@ int main() {
             if(fault==8U) bad.serving_cache_entries_explicit=true;
             rejects([&]{validate_resolved_serving(bad);},"serving prefill never ignores missing budgets/profile or conflicting cohort/layout");
         }
+        {
+            auto cached=prefill;
+            cached.serving_cache_entries_explicit=cached.serving_cache_snapshot_explicit=
+                cached.serving_cache_peak_explicit=cached.serving_cache_tokens_explicit=true;
+            cached.serving_cache_entries=2;cached.serving_cache_snapshot_bytes=1ULL<<30;
+            cached.serving_cache_capture_peak_bytes=1ULL<<30;
+            cached.serving_cache_max_prefix_tokens=cached.context_tokens;
+            validate_resolved_serving(cached);
+            expect(cached.serving_prefill_rows==2048U && cached.serving_cache_entries==2U,
+                "bounded prefix cache and native prefill coexist without disabling either request");
+            auto incomplete=cached;incomplete.serving_cache_snapshot_explicit=false;
+            rejects([&]{validate_resolved_serving(incomplete);},"prefill never bypasses explicit cache budget admission");
+            auto cohort_cached=cached;cohort_cached.serving_tensor_cohort_rows=2U;
+            rejects([&]{validate_resolved_serving(cohort_cached);},"cache support never silently routes prefill through a cohort");
+        }
         rejects([]{(void)parse({"decoder","m","--serve-prefill-rows","3"});},"unsupported native widths are rejected, not relabelled");
         rejects([]{(void)parse({"decoder","m","--serve-prefill-rows","2","--serve-prefill-rows=4"});},"serving prefill duplicate forms reject");
         expect(!defaults.serving_prefill_rows && !defaults.serving_prefill_explicit,"serving prefill is default off");

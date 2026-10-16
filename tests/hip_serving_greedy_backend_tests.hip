@@ -689,6 +689,76 @@ void qualify_native_prefill(const std::shared_ptr<ModelOwner>& model,std::span<c
             stats.terminal_chunks==(c.length%c.rows?0U:1U) && stats.state_only_chunks+stats.terminal_chunks==stats.chunks,
             "native prefill receipt counted planned rows rather than completed chunks");
     }
+    // Producer-aware cache composes with the REAL native chunk backend.
+    // Every hit is exact-length; ordinary serial cache lookup is unchanged.
+    for(const auto rows:{2U,16U}) for(const bool suffix:{false,true}) {
+        const auto length=rows*2U+(suffix?1U:0U);
+        std::vector<std::uint32_t> prompt(length);
+        for(std::size_t i=0;i<prompt.size();++i) prompt[i]=source[i%source.size()];
+        auto plan=std::make_shared<const strix::HipServingPrefillPlan>(strix::HipServingGreedyBackend::prepare_prefill(
+            model->model,model->compiled,model->manifest,model->access,rows,16ULL<<30,128ULL<<20));
+        const auto recipe=plan->state_tiled?strix::SerialPrefixProducerRecipe::known_prefill(model->compiled,*plan->state_tiled,*plan->terminal_tiled):
+            strix::SerialPrefixProducerRecipe::known_window(model->compiled,plan->state_window,plan->terminal_window);
+        require(model->layout.host_total_bytes<=UINT64_MAX-4096U &&
+            model->layout.device_total_bytes<=UINT64_MAX-model->layout.host_total_bytes-4096U,"prefill cache snapshot bound overflow");
+        const auto snapshot_bound=model->layout.device_total_bytes+model->layout.host_total_bytes+4096U;
+        require(snapshot_bound<=UINT64_MAX/3U,"prefill cache peak overflow");
+        strix::HipServingPrefixCachePolicy cache_policy{2U,snapshot_bound*2U,snapshot_bound*3U,context_capacity};
+        cache_policy.max_history_intervals=recipe.maximum_history_intervals(cache_policy.max_prefix_tokens);
+        const auto declared=strix::HipServingPrefixCache::requested_reservation_bytes(cache_policy);
+        require(declared>=cache_policy.capture_peak_bytes,"prefill cache reservation omitted retained metadata");
+        auto pool=std::make_shared<strix::HipServingPrefixCache>(cache_policy,model->mapped->content_identity(),
+            static_cast<std::uint32_t>(model->model.vocab_size));
+        auto producer=fresh_session(model);auto produce=backend(producer,false,pool,plan);
+        const strix::SerialGreedyRequest req{prompt,model->model.vocab_size,context_capacity,1U,
+            static_cast<std::uint32_t>(model->model.ple_eos_token_id)};
+        strix::SerialGreedyTokenCursor first(req);
+        while(!first.done()) first.advance(*produce,rows);
+        require(pool->stats().inserted==1U && recipe.matches_history(producer->session.arithmetic_lineage,length),
+            "native prefill cache producer failed canonical capture after terminal selection");
+        auto consumer=fresh_session(model);independent(*producer,*consumer);auto consume=backend(consumer,false,pool,plan);
+        strix::SerialGreedyTokenCursor second(req);
+        while(!second.done()) second.advance(*consume,rows);
+        require(second.result().generated_tokens==first.result().generated_tokens && second.result().steps_executed==0U &&
+            second.result().restored_prefix_tokens==length && second.result().final_position==length &&
+            consume->prefill_stats().chunks==0U,"prefill exact hit consumed a target call or the pending bonus twice");
+        same_metadata(producer->session,consumer->session);
+        const auto tag="prefill-cache-"+std::to_string(rows)+(suffix?"-suffix":"-terminal");
+        require(capture_state(producer,output/(tag+"-producer"))==capture_state(consumer,output/(tag+"-consumer")),
+            "producer-aware prefill cache changed one of seven complete state components");
+        auto longer=prompt;longer.push_back(source.front());
+        auto proper=fresh_session(model);auto miss=backend(proper,false,pool,plan);
+        const strix::SerialGreedyRequest more{longer,model->model.vocab_size,context_capacity,1U,
+            static_cast<std::uint32_t>(model->model.ple_eos_token_id)};
+        strix::SerialGreedyTokenCursor third(more);
+        while(!third.done()) third.advance(*miss,rows);
+        require(third.result().restored_prefix_tokens==0U && third.result().steps_executed==longer.size(),
+            "producer-aware cache incorrectly reused a terminal proper-prefix recipe");
+    }
+    {
+        // Public work budgets may deliberately create a noncanonical but valid
+        // mixed history. Cache must benignly skip, not poison/retag that session.
+        auto plan=std::make_shared<const strix::HipServingPrefillPlan>(strix::HipServingGreedyBackend::prepare_prefill(
+            model->model,model->compiled,model->manifest,model->access,2U,16ULL<<30,128ULL<<20));
+        const auto recipe=strix::SerialPrefixProducerRecipe::known_window(model->compiled,plan->state_window,plan->terminal_window);
+        require(model->layout.host_total_bytes<=UINT64_MAX-4096U &&
+            model->layout.device_total_bytes<=UINT64_MAX-model->layout.host_total_bytes-4096U,"noncanonical cache snapshot bound overflow");
+        const auto snapshot_bound=model->layout.device_total_bytes+model->layout.host_total_bytes+4096U;
+        require(snapshot_bound<=UINT64_MAX/2U,"noncanonical cache peak overflow");
+        strix::HipServingPrefixCachePolicy p{1U,snapshot_bound,snapshot_bound*2U,context_capacity};
+        p.max_history_intervals=recipe.maximum_history_intervals(p.max_prefix_tokens);
+        (void)strix::HipServingPrefixCache::requested_reservation_bytes(p);
+        auto pool=std::make_shared<strix::HipServingPrefixCache>(p,model->mapped->content_identity(),static_cast<std::uint32_t>(model->model.vocab_size));
+        std::vector<std::uint32_t> prompt(5U);for(std::size_t i=0;i<prompt.size();++i) prompt[i]=source[i%source.size()];
+        auto owner=fresh_session(model);auto native=backend(owner,false,pool,plan);
+        strix::SerialGreedyTokenCursor cursor({prompt,model->model.vocab_size,context_capacity,1U,
+            static_cast<std::uint32_t>(model->model.ple_eos_token_id)});
+        cursor.advance(*native,1U);while(!cursor.done()) cursor.advance(*native,2U);
+        require(owner->session.health==strix::SerialSessionHealth::ready && !native->failed() &&
+            strix::arithmetic_lineage_valid(owner->session.arithmetic_lineage,5U) &&
+            !recipe.matches_history(owner->session.arithmetic_lineage,5U) && pool->stats().entries==0U && pool->stats().skipped==1U,
+            "prefill cache rewrote or poisoned a valid noncanonical producer history");
+    }
     // Actual queued terminal selector failure must be contained BEFORE the
     // window can publish its chunk generations/position/lineage.
     auto owner=fresh_session(model);

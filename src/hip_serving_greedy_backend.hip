@@ -175,6 +175,7 @@ struct HipServingGreedyBackend::Impl {
     bool broken = false, cohort_pending = false;
     std::shared_ptr<HipServingPrefixCache> prefix_cache;
     std::unique_ptr<ServingPrefillRuntime> prefill;
+    std::optional<SerialPrefixProducerRecipe> prefix_recipe;
     std::vector<std::uint32_t> request_prefix;
     bool prefix_started=false,capture_enabled=false,capture_attempted=false,selected_valid=false;
     std::uint32_t selected_token=0;
@@ -193,7 +194,13 @@ struct HipServingGreedyBackend::Impl {
             model.vocab_size == serial.vocab_size && serial.logical_rows == 1 && serial.request_concurrency == 1,
             "serving backend requires retained owners and one canonical uint32-vocabulary C1 plan");
         serving_require(config.deferred_moe_status,"serving backend requires an explicit per-session D1 record");
-        serving_require(!prefill_plan || !prefix_cache,"serving native prefill and serial-only prefix cache are separate modes");
+        if(prefill_plan && prefix_cache) {
+            serving_require(prefill_plan->state_tiled.has_value()==prefill_plan->terminal_tiled.has_value(),
+                "serving prefix recipe requires the same compiled plan family for both intents");
+            prefix_recipe.emplace(prefill_plan->state_tiled ?
+                SerialPrefixProducerRecipe::known_prefill(serial,*prefill_plan->state_tiled,*prefill_plan->terminal_tiled) :
+                SerialPrefixProducerRecipe::known_window(serial,prefill_plan->state_window,prefill_plan->terminal_window));
+        }
         serving_require(!serial.device_graph_inputs && !config.enable_device_graph_inputs,
             "serving backend requires eager original-resource execution");
         enter_worker();
@@ -486,7 +493,7 @@ std::optional<GreedyPrefixRestore> HipServingGreedyBackend::try_restore_greedy_p
     try {
         s.complete();ServingPrefixTransfer transfer(s.scope.stream,s.guard);
         const auto result=s.prefix_cache->try_restore(s.model,request,s.session,*s.resources.session_state_layout,
-            *s.resources.session_state_memory,transfer);
+            *s.resources.session_state_memory,transfer,s.prefix_recipe?&*s.prefix_recipe:nullptr);
         s.complete();return result;
     } catch(...) {
         s.broken=true;s.guard->recover_or_fail_stop();s.session.health=SerialSessionHealth::poisoned;
@@ -508,7 +515,7 @@ void HipServingGreedyBackend::capture_greedy_prefix(std::span<const std::uint32_
             s.selected_position+1U==prefix.size(),"serving cache capture has no actual terminal finite-selection witness");
         serving_require(!s.resources.ple_prefetch || !s.resources.ple_prefetch->active,"serving capture requires retired PLE work");
         s.complete();ServingPrefixTransfer transfer(s.scope.stream,s.guard);
-        s.prefix_cache->capture(s.model,prefix,pending,s.session,*s.resources.session_state_layout,*s.resources.session_state_memory,transfer);
+        s.prefix_cache->capture(s.model,prefix,pending,s.session,*s.resources.session_state_layout,*s.resources.session_state_memory,transfer,s.prefix_recipe?&*s.prefix_recipe:nullptr);
         s.complete();s.capture_attempted=true;
     } catch(...) {
         // The prefix model calls already committed. Never leave that consumed

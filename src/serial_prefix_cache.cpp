@@ -1,4 +1,5 @@
 #include "strix/serial_prefix_cache.hpp"
+#include "strix/known_prefix_prefill.hpp"
 
 #include <algorithm>
 #include <limits>
@@ -6,6 +7,56 @@
 #include <utility>
 
 namespace strix {
+
+SerialPrefixProducerRecipe::SerialPrefixProducerRecipe(std::uint64_t serial,std::uint64_t kernel,
+    std::uint64_t state,std::uint64_t state_reduction,std::uint64_t terminal,std::uint64_t terminal_reduction,
+    std::uint32_t rows,std::uint64_t maximum_position)
+    :serial_(serial),kernel_(kernel),state_(state),state_reduction_(state_reduction),terminal_(terminal),
+     terminal_reduction_(terminal_reduction),maximum_position_(maximum_position),rows_(rows) {
+    if(!serial_ || !kernel_ || !state_ || !state_reduction_ || !terminal_ || !terminal_reduction_ || rows_<2U || !maximum_position_)
+        throw std::invalid_argument("prefix producer recipe requires validated nonzero plans and geometry");
+}
+SerialPrefixProducerRecipe SerialPrefixProducerRecipe::known_window(const CompiledSerialExecution& serial,
+    const CompiledKnownPrefixWindow& state,const CompiledKnownPrefixWindow& terminal) {
+    validate_compiled_known_prefix_window(state,serial);validate_compiled_known_prefix_window(terminal,serial);
+    if(state.logical_rows!=terminal.logical_rows || state.output_policy!=KnownWindowOutputPolicy::state_only ||
+        terminal.output_policy!=KnownWindowOutputPolicy::terminal_row)
+        throw std::invalid_argument("prefix producer recipe requires matching state-only and terminal window plans");
+    return {serial.execution_identity,serial.kernel_plan_identity,state.window_execution_identity,state.window_kernel_plan_identity,
+        terminal.window_execution_identity,terminal.window_kernel_plan_identity,state.logical_rows,serial.max_position_embeddings};
+}
+SerialPrefixProducerRecipe SerialPrefixProducerRecipe::known_prefill(const CompiledSerialExecution& serial,
+    const CompiledKnownPrefixPrefill& state,const CompiledKnownPrefixPrefill& terminal) {
+    validate_compiled_known_prefix_prefill(state,serial);validate_compiled_known_prefix_prefill(terminal,serial);
+    if(state.logical_rows!=terminal.logical_rows || state.output_policy!=KnownWindowOutputPolicy::state_only ||
+        terminal.output_policy!=KnownWindowOutputPolicy::terminal_row)
+        throw std::invalid_argument("prefix producer recipe requires matching state-only and terminal prefill plans");
+    return {serial.execution_identity,serial.kernel_plan_identity,state.prefill_execution_identity,state.prefill_kernel_plan_identity,
+        terminal.prefill_execution_identity,terminal.prefill_kernel_plan_identity,state.logical_rows,serial.max_position_embeddings};
+}
+std::uint64_t SerialPrefixProducerRecipe::maximum_history_intervals(std::uint64_t n) const {
+    if(!n || n>maximum_position_) throw std::invalid_argument("prefix recipe metadata bound exceeds admitted model positions");
+    return n/rows_+(n%rows_!=0U?1U:0U);
+}
+bool SerialPrefixProducerRecipe::matches_history(const ArithmeticLineage& history,std::uint64_t n) const noexcept {
+    if(!n || n>maximum_position_ || !arithmetic_lineage_valid(history,n)) return false;
+    const auto chunks=n/rows_,tail=n%rows_;
+    if(history.intervals.size()!=chunks+(tail?1U:0U)) return false;
+    for(std::uint64_t i=0;i<chunks;++i) {
+        const auto& r=history.intervals[static_cast<std::size_t>(i)];
+        const auto terminal=tail==0U && i+1U==chunks;
+        if(r.begin!=i*rows_ || r.end!=(i+1U)*rows_ || r.producer!=ArithmeticProducer::prefill_chunk ||
+            r.numerical_plan_identity!=(terminal?terminal_:state_) ||
+            r.reduction_plan_identity!=(terminal?terminal_reduction_:state_reduction_) ||
+            r.state_update_identity!=(terminal?terminal_:state_)) return false;
+    }
+    if(tail) {
+        const auto& r=history.intervals.back();
+        if(r.begin!=chunks*rows_ || r.end!=n || r.producer!=ArithmeticProducer::serial_row ||
+            r.numerical_plan_identity!=serial_ || r.reduction_plan_identity!=kernel_ || r.state_update_identity!=serial_) return false;
+    }
+    return true;
+}
 
 SerialPrefixCacheEntry
 SerialPrefixCacheEntry::capture(
@@ -172,6 +223,24 @@ std::shared_ptr<const SerialPrefixCacheEntry> SerialPrefixCache::find_longest_gr
     auto handle=slots_[best].entry;
     std::rotate(slots_.begin()+best,slots_.begin()+best+1U,slots_.end());
     return handle;
+}
+
+std::shared_ptr<const SerialPrefixCacheEntry> SerialPrefixCache::find_exact_greedy(
+    std::span<const std::uint32_t> tokens,const ModelContentIdentity& content,std::uint64_t vocabulary,
+    std::uint64_t execution,std::uint64_t compatibility,std::uint64_t layout,const SerialPrefixProducerRecipe& recipe) {
+    if(!content.valid() || !vocabulary || tokens.empty() || recipe.execution_identity()!=execution) return {};
+    for(std::size_t i=0;i<slots_.size();++i) {
+        const auto& entry=*slots_[i].entry;const auto& frontier=entry.greedy_frontier();
+        if(entry.prefix().prefix_tokens.size()!=tokens.size() || !frontier || frontier->model_content!=content ||
+            frontier->vocabulary_size!=vocabulary || frontier->pending_token>=vocabulary ||
+            !recipe.matches_history(entry.prefix().arithmetic_lineage,static_cast<std::uint64_t>(tokens.size()))) continue;
+        // Recorded history is admissible here ONLY after the independent,
+        // compiled-plan-derived recipe above proves every interval and cut.
+        if(!entry.matches(tokens,execution,compatibility,layout,&entry.prefix().arithmetic_lineage)) continue;
+        auto handle=slots_[i].entry;
+        std::rotate(slots_.begin()+i,slots_.begin()+i+1U,slots_.end());return handle;
+    }
+    return {};
 }
 
 SerialPrefixCacheAdmission SerialPrefixCache::insert(

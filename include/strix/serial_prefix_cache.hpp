@@ -18,6 +18,30 @@
 
 namespace strix {
 
+struct CompiledKnownPrefixWindow;
+struct CompiledKnownPrefixPrefill;
+// Immutable producer recipe from actually validated compiled plans. Fresh
+// prompts start at0: full chunks use state-only except a final full chunk,
+// which uses the terminal plan; an unpadded suffix uses original serial rows.
+// Lookup validates this independent recipe BEFORE using recorded history.
+class SerialPrefixProducerRecipe final {
+public:
+    [[nodiscard]] static SerialPrefixProducerRecipe known_window(const CompiledSerialExecution&,
+        const CompiledKnownPrefixWindow& state,const CompiledKnownPrefixWindow& terminal);
+    [[nodiscard]] static SerialPrefixProducerRecipe known_prefill(const CompiledSerialExecution&,
+        const CompiledKnownPrefixPrefill& state,const CompiledKnownPrefixPrefill& terminal);
+    [[nodiscard]] bool matches_history(const ArithmeticLineage&,std::uint64_t prefix_tokens) const noexcept;
+    [[nodiscard]] std::uint64_t maximum_history_intervals(std::uint64_t max_prefix_tokens) const;
+    [[nodiscard]] std::uint64_t execution_identity() const noexcept {return serial_;}
+    [[nodiscard]] std::uint32_t logical_rows() const noexcept {return rows_;}
+private:
+    SerialPrefixProducerRecipe(std::uint64_t serial,std::uint64_t kernel,std::uint64_t state,
+        std::uint64_t state_reduction,std::uint64_t terminal,std::uint64_t terminal_reduction,
+        std::uint32_t rows,std::uint64_t maximum_position);
+    std::uint64_t serial_,kernel_,state_,state_reduction_,terminal_,terminal_reduction_,maximum_position_;
+    std::uint32_t rows_;
+};
+
 struct SerialPrefixGreedyFrontier {
     ModelContentIdentity model_content;
     std::uint64_t vocabulary_size = 0;
@@ -135,6 +159,14 @@ public:
         std::span<const std::uint32_t> request_tokens, const ModelContentIdentity& model_content,
         std::uint64_t vocabulary_size, std::uint64_t execution_identity,
         std::uint64_t runtime_compatibility_identity, std::uint64_t state_layout_identity);
+    // Producer-aware mode is deliberately EXACT request length only. A cached
+    // terminal chunk is never reused as an interior state-only chunk. Model,
+    // runtime, layout, tokens and the complete canonical recipe must all match.
+    [[nodiscard]] std::shared_ptr<const SerialPrefixCacheEntry> find_exact_greedy(
+        std::span<const std::uint32_t> request_tokens,const ModelContentIdentity& model_content,
+        std::uint64_t vocabulary_size,std::uint64_t execution_identity,
+        std::uint64_t runtime_compatibility_identity,std::uint64_t state_layout_identity,
+        const SerialPrefixProducerRecipe&);
     // Evicts only unpinned snapshots; outstanding handles retain their owners.
     [[nodiscard]] std::size_t evict_unpinned() noexcept;
     [[nodiscard]] std::size_t size() const noexcept { return slots_.size(); }

@@ -12,6 +12,8 @@ namespace strix {
 struct HipServingPrefixCachePolicy {
     std::size_t max_entries=0;
     std::uint64_t snapshot_byte_budget=0,capture_peak_bytes=0,max_prefix_tokens=0;
+    // Explicit recipe.maximum_history_intervals(max_prefix_tokens) for chunks.
+    std::uint64_t max_history_intervals=1;
 };
 struct HipServingPrefixCacheStats {
     std::uint64_t lookups=0,hits=0,restored_prefix_tokens=0,capture_attempts=0;
@@ -27,7 +29,8 @@ struct HipServingPrefixCacheStats {
 // Reserve requested_reservation_bytes in the scheduler's shared budget BEFORE
 // constructing the pool/request factories. The bound covers snapshot capture
 // peaks and declared token/entry bookkeeping, not GPU driver/RSS overhead.
-// Current consumers use the exact serial arithmetic producer history only.
+// Default consumers use serial history/longest-prefix matching. A supplied
+// compiled producer recipe enables exact-length chunk-history matching only.
 class HipServingPrefixCache final {
 public:
     HipServingPrefixCache(HipServingPrefixCachePolicy,ModelContentIdentity,std::uint32_t vocabulary_size);
@@ -45,13 +48,13 @@ public:
     [[nodiscard]] std::optional<GreedyPrefixRestore> try_restore(
         const ModelContract&,const SerialGreedyRequest&,SerialSessionContext&,
         const SerialSessionStateLayout&,const SessionStateMemoryBinding&,
-        SessionSnapshotTransferBackend&);
+        SessionSnapshotTransferBackend&,const SerialPrefixProducerRecipe* recipe=nullptr);
     // Only a completed finite scalar frontier may be captured. The production
     // serving backend supplies its own successful terminal-selection witness.
     // No captures from state-only positions or max_new_tokens==0 requests.
     void capture(const ModelContract&,std::span<const std::uint32_t>,std::uint32_t pending,
         const SerialSessionContext&,const SerialSessionStateLayout&,const SessionStateMemoryBinding&,
-        SessionSnapshotTransferBackend&);
+        SessionSnapshotTransferBackend&,const SerialPrefixProducerRecipe* recipe=nullptr);
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

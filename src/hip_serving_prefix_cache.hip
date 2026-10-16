@@ -67,13 +67,16 @@ struct HipServingPrefixCache::Impl {
 };
 std::uint64_t HipServingPrefixCache::requested_reservation_bytes(const HipServingPrefixCachePolicy& p) {
     if(!p.max_entries || !p.snapshot_byte_budget || p.capture_peak_bytes<p.snapshot_byte_budget || !p.max_prefix_tokens ||
+        !p.max_history_intervals || p.max_history_intervals>p.max_prefix_tokens ||
         p.max_entries==std::numeric_limits<std::size_t>::max() || p.max_prefix_tokens>std::numeric_limits<std::size_t>::max()/sizeof(std::uint32_t))
         throw std::invalid_argument("serving prefix cache needs bounded entries, snapshot bytes, capture peak and prefix length");
     // One extra candidate during capture; 64-byte snapshot alignment adds at
     // most63 bytes to each device backing. Bookkeeping allowance includes the
-    // seven-range plan copies, one serial lineage interval and bounded entries.
+    // seven-range plan copies, the default serial interval and bounded entries.
+    // Additional declared producer intervals are charged explicitly below.
     // General allocator/driver overhead remains in caller's explicit headroom.
-    const auto entry=sum(product(p.max_prefix_tokens,sizeof(std::uint32_t)),4096U+63U);
+    const auto history=product(p.max_history_intervals-1U,sizeof(ArithmeticRowInterval));
+    const auto entry=sum(sum(product(p.max_prefix_tokens,sizeof(std::uint32_t)),4096U+63U),history);
     return sum(p.capture_peak_bytes,product(static_cast<std::uint64_t>(p.max_entries)+1U,entry));
 }
 HipServingPrefixCache::HipServingPrefixCache(HipServingPrefixCachePolicy policy,ModelContentIdentity content,std::uint32_t vocabulary)
@@ -88,7 +91,7 @@ HipServingPrefixCacheStats HipServingPrefixCache::stats() const {
 }
 std::optional<GreedyPrefixRestore> HipServingPrefixCache::try_restore(const ModelContract& model,const SerialGreedyRequest& request,
     SerialSessionContext& session,const SerialSessionStateLayout& layout,const SessionStateMemoryBinding& state,
-    SessionSnapshotTransferBackend& transfer) {
+    SessionSnapshotTransferBackend& transfer,const SerialPrefixProducerRecipe* recipe) {
     auto& s=*impl_;s.allocator->bind();
     if(request.vocab_size!=s.vocabulary || model.vocab_size!=s.vocabulary || request.prefix_tokens.empty() ||
         request.context_capacity!=layout.context_tokens || session.health!=SerialSessionHealth::ready ||
@@ -97,7 +100,14 @@ std::optional<GreedyPrefixRestore> HipServingPrefixCache::try_restore(const Mode
     std::shared_ptr<const SerialPrefixCacheEntry> handle;
     {
         std::lock_guard lock(s.mutex);count(s.counters.lookups,1U,s.counters.saturated);
-        handle=s.cache.find_longest_greedy(request.prefix_tokens,s.content,s.vocabulary,session.execution_identity,
+        if(recipe) {
+            if(recipe->execution_identity()!=session.execution_identity)
+                throw std::invalid_argument("serving prefix recipe belongs to another serial execution");
+            if(request.prefix_tokens.size()>s.policy.max_prefix_tokens ||
+                recipe->maximum_history_intervals(request.prefix_tokens.size())>s.policy.max_history_intervals) return std::nullopt;
+            handle=s.cache.find_exact_greedy(request.prefix_tokens,s.content,s.vocabulary,session.execution_identity,
+                session.runtime_compatibility_identity,session.state_layout_identity,*recipe);
+        } else handle=s.cache.find_longest_greedy(request.prefix_tokens,s.content,s.vocabulary,session.execution_identity,
             session.runtime_compatibility_identity,session.state_layout_identity);
         if(!handle) return std::nullopt;
         count(s.counters.hits,1U,s.counters.saturated);
@@ -106,7 +116,10 @@ std::optional<GreedyPrefixRestore> HipServingPrefixCache::try_restore(const Mode
     try {
         // The handle pins snapshot+allocator even while another worker inserts
         // or evicts. Its frontier and exact source lineage are immutable.
-        handle->restore(session,model,layout,state,transfer,request.prefix_tokens.first(n));
+        // In recipe mode find_exact_greedy already checked the independent
+        // canonical recipe; never treat arbitrary entry history as expected.
+        handle->restore(session,model,layout,state,transfer,request.prefix_tokens.first(n),
+            recipe?&handle->prefix().arithmetic_lineage:nullptr);
         std::lock_guard lock(s.mutex);count(s.counters.restored_prefix_tokens,static_cast<std::uint64_t>(n),s.counters.saturated);
         return GreedyPrefixRestore{static_cast<std::uint64_t>(n),n==request.prefix_tokens.size()?
             std::optional<std::uint32_t>(handle->greedy_frontier()->pending_token):std::nullopt};
@@ -116,17 +129,29 @@ std::optional<GreedyPrefixRestore> HipServingPrefixCache::try_restore(const Mode
 }
 void HipServingPrefixCache::capture(const ModelContract& model,std::span<const std::uint32_t> prefix,std::uint32_t pending,
     const SerialSessionContext& session,const SerialSessionStateLayout& layout,const SessionStateMemoryBinding& state,
-    SessionSnapshotTransferBackend& transfer) {
+    SessionSnapshotTransferBackend& transfer,const SerialPrefixProducerRecipe* recipe) {
     auto& s=*impl_;s.allocator->bind();
     if(model.vocab_size!=s.vocabulary || pending>=s.vocabulary || prefix.empty() ||
         std::any_of(prefix.begin(),prefix.end(),[&](auto token){return token>=s.vocabulary;}) || session.health!=SerialSessionHealth::ready ||
         session.arithmetic_lineage.tainted || session.next_position!=prefix.size() || session.committed_tokens!=prefix.size() ||
-        !arithmetic_lineage_serial_only(session.arithmetic_lineage,session.execution_identity,session.next_position))
-        throw std::invalid_argument("serving prefix capture requires a completed serial finite-scalar frontier");
+        (recipe?(recipe->execution_identity()!=session.execution_identity ||
+            !arithmetic_lineage_valid(session.arithmetic_lineage,session.next_position)):
+            !arithmetic_lineage_serial_only(session.arithmetic_lineage,session.execution_identity,session.next_position)))
+        throw std::invalid_argument("serving prefix capture requires a completed finite-scalar frontier with its exact producer history");
     std::lock_guard lock(s.mutex);count(s.counters.capture_attempts,1U,s.counters.saturated);
-    if(prefix.size()>s.policy.max_prefix_tokens) {count(s.counters.skipped,1U,s.counters.saturated);return;}
-    auto existing=s.cache.find_longest_greedy(prefix,s.content,s.vocabulary,session.execution_identity,
-        session.runtime_compatibility_identity,session.state_layout_identity);
+    // A legitimate public cursor may consume serial rows due to a small work
+    // budget before a later chunk. Valid but noncanonical history is a benign
+    // cache skip, never rewritten to the requested recipe or captured as one.
+    if(recipe && !recipe->matches_history(session.arithmetic_lineage,session.next_position)) {
+        count(s.counters.skipped,1U,s.counters.saturated);return;
+    }
+    if(prefix.size()>s.policy.max_prefix_tokens || session.arithmetic_lineage.intervals.size()>s.policy.max_history_intervals) {
+        count(s.counters.skipped,1U,s.counters.saturated);return;
+    }
+    auto existing=recipe?s.cache.find_exact_greedy(prefix,s.content,s.vocabulary,session.execution_identity,
+        session.runtime_compatibility_identity,session.state_layout_identity,*recipe):
+        s.cache.find_longest_greedy(prefix,s.content,s.vocabulary,session.execution_identity,
+            session.runtime_compatibility_identity,session.state_layout_identity);
     if(existing && existing->prefix().prefix_tokens.size()==prefix.size()) {
         if(existing->greedy_frontier()->pending_token!=pending) throw std::invalid_argument("serving prefix repeated frontier differs");
         count(s.counters.skipped,1U,s.counters.saturated);return;
@@ -146,7 +171,6 @@ void HipServingPrefixCache::capture(const ModelContract& model,std::span<const s
             throw std::invalid_argument("serving prefix snapshot omits or truncates a state component");
         components[index]=true;
     }
-    if(session.arithmetic_lineage.intervals.size()!=1U) {count(s.counters.skipped,1U,s.counters.saturated);return;}
     const auto bytes=sum(snapshot.device_bytes,snapshot.host_bytes);
     if(bytes>s.policy.snapshot_byte_budget || bytes>s.policy.capture_peak_bytes ||
         s.cache.snapshot_bytes()>s.policy.capture_peak_bytes-bytes) {count(s.counters.skipped,1U,s.counters.saturated);return;}

@@ -1537,6 +1537,12 @@ int main(
             prefix_cache_policy = strix::HipServingPrefixCachePolicy{
                 static_cast<std::size_t>(options.serving_cache_entries), options.serving_cache_snapshot_bytes,
                 options.serving_cache_capture_peak_bytes, options.serving_cache_max_prefix_tokens};
+            if(serving_prefill) {
+                const auto recipe=serving_prefill->state_tiled ?
+                    strix::SerialPrefixProducerRecipe::known_prefill(compiled,*serving_prefill->state_tiled,*serving_prefill->terminal_tiled) :
+                    strix::SerialPrefixProducerRecipe::known_window(compiled,serving_prefill->state_window,serving_prefill->terminal_window);
+                prefix_cache_policy->max_history_intervals=recipe.maximum_history_intervals(options.serving_cache_max_prefix_tokens);
+            }
             prefix_cache_reservation = strix::HipServingPrefixCache::requested_reservation_bytes(*prefix_cache_policy);
         }
         const auto cohort_reservation = options.serving_tensor_cohort_rows == 1 ? 0U :
@@ -1666,6 +1672,8 @@ int main(
                 << ",\"snapshot_budget_bytes\":" << options.serving_cache_snapshot_bytes
                 << ",\"capture_peak_bytes\":" << options.serving_cache_capture_peak_bytes
                 << ",\"max_prefix_tokens\":" << options.serving_cache_max_prefix_tokens
+                << ",\"max_history_intervals\":" << prefix_cache_policy->max_history_intervals
+                << ",\"matching\":\"" << (serving_prefill?"exact-prefix-and-compiled-producer-history":"longest-serial-prefix") << "\""
                 << ",\"lookups\":" << cache.lookups << ",\"hits\":" << cache.hits
                 << ",\"restored_prefix_tokens\":" << cache.restored_prefix_tokens
                 << ",\"capture_attempts\":" << cache.capture_attempts << ",\"inserted\":" << cache.inserted

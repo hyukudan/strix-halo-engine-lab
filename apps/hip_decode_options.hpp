@@ -393,8 +393,7 @@ inline void validate_resolved_serving(const Options& options) {
         !options.serving_prefill_workspace_explicit || !options.serving_prefill_metadata_explicit ||
         !options.serving_prefill_workspace_budget || !options.serving_prefill_metadata_budget ||
         (options.serving_prefill_rows!=2U && options.serving_prefill_rows!=4U && options.serving_prefill_rows!=8U &&
-            (options.serving_prefill_rows<16U || options.serving_prefill_rows>2048U)) || options.serving_tensor_cohort_rows!=1U ||
-        options.serving_cache_entries_explicit))
+            (options.serving_prefill_rows<16U || options.serving_prefill_rows>2048U)) || options.serving_tensor_cohort_rows!=1U))
         throw std::invalid_argument("serving prefill requires rows2/4/8 or16..2048, explicit workspace/metadata budgets and independent serving workers");
     if (any_prefill && (options.gdn_recurrent_layout != strix::HipGdnRecurrentLayout::baseline ||
         options.gdn_recurrent_storage != strix::GdnRecurrentStorage::key_value || options.qsa_hierarchical_selection ||
