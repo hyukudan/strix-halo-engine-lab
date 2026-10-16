@@ -1,15 +1,26 @@
 # Experimental Q8 projection organizations
 
 The decoder accepts explicit eager C1 overlays for existing BF16 activations and
-Q8_0 weights:
+Q8_0 weights. The input and LM overlays are:
 
 - `--prefetch-q8-lm-head` groups the existing eight loads while retaining one
   wave per output row.
 - `--prefetch-q8-lm-head --wave8-q8-lm-head` assigns eight output rows to a
   256-thread block.
 - `--wave8-q8-gdn-input` uses eight output rows per block for Q8 GDN input
-  projections. The GDN operator still runs its original recurrence and output
-  projection, with their existing shared-memory requirements.
+  projections.
+
+Two further independent output overlays use the existing internal FP32
+activation slices and store BF16 results:
+
+- `--wave8-q8-gdn-output` requires the resolved virtual GDN output path.
+- `--wave8-q8-qsa-output` replaces the output projection's 256-thread LDS
+  reduction with eight independent output waves per block.
+
+Both keep the original 256-leaf DAG. Their separate add helpers preserve each
+consumer's ordered operands, including NaN payload priority. No intermediate
+BF16 conversion is added to their FP32 input. The width comes from value heads
+or attention heads (6144 in the canonical model), rather than hidden size 2560.
 
 These options preserve automatic base-profile resolution. They do not enable
 themselves by default or inherit the base profile's qualification. A manual or
@@ -32,8 +43,17 @@ launch. Projection views retain 16-byte alignment; GDN workspace head counts
 must also keep its adjacent FP32 beta and gate arrays aligned. A late-layer
 alignment error therefore rejects setup before earlier layers can mutate state.
 
+Output admission checks every GDN and attention output weight, with no
+per-layer precision fallback. After scratch allocation and before persistent
+state initialization, it binds each output tensor to its unique compiled step,
+resolves the actual workspace source and destination, and checks dtype-specific
+extents, owners, alignment and aliasing. The existing BF16-input view contract
+is kept separate from the FP32-input/BF16-output contract. Launchers repeat the
+constant-time view check before enqueueing. The output overlays retain the
+compound operators' existing conservative workspace and shared-memory bounds.
+
 Selected kernel IDs, implementation identities and compiler tags distinguish the
-overlays. The receipt declares all three options and marks their qualification
+overlays. The receipt declares all five options and marks their qualification
 as `not_assessed`. Inventory collection preserves that distinction when an
 automatic base profile is also selected.
 

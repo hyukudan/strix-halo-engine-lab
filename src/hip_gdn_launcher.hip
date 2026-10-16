@@ -6,6 +6,7 @@
 #endif
 #include "strix/hip_gdn_launcher.hpp"
 #include "strix/q8_projection_organization.hpp"
+#include "strix/q8_projection_manifest.hpp"
 
 #include "strix/dispatch_resources.hpp"
 #include "strix/execution_buffers.hpp"
@@ -199,6 +200,16 @@ void validate_config(
             config.model.gdn_value_heads * config.model.gdn_value_head_dim);
         if (config.enable_device_graph_inputs)
             throw std::invalid_argument("wave8 GDN input supports eager execution only");
+    }
+    if (config.wave8_q8_output_projection) {
+        if (!config.virtual_q8_output_projection)
+            throw std::invalid_argument("wave8 GDN output requires virtual Q8 output");
+        if (config.enable_device_graph_inputs)
+            throw std::invalid_argument("wave8 GDN output supports eager execution only");
+        if (config.model.gdn_value_heads > 10240U / config.model.gdn_value_head_dim)
+            throw std::invalid_argument("wave8 GDN output width outside admitted bounds");
+        q8_projection_organization::validate_geometry(
+            config.model.gdn_value_heads * config.model.gdn_value_head_dim, config.model.hidden_size);
     }
     if (config.activation !=
         HipActivationStorage::bf16) {
@@ -806,6 +817,64 @@ void project_virtual_q8_fp32_to_bf16_kernel(
         partial[2]+=partial[6];partial[3]+=partial[7];
         partial[0]+=partial[2];partial[1]+=partial[3];partial[0]+=partial[1];
         output[row]=float_to_bf16(partial[0]);
+    }
+}
+
+// Actual incumbent virtual-output ISA uses lower/self as src0 at every tree
+// site. Keep this new-only helper distinct from the input projection trees.
+__device__ __forceinline__ float gdn_output_virtual_tree_add(float lower, float upper) {
+    float result;
+    asm volatile("v_add_f32 %0, %1, %2" : "=v"(result) : "v"(lower), "v"(upper));
+    return result;
+}
+
+// One complete wave owns one output. Eight ascending virtual leaves reproduce
+// the incumbent256-leaf DAG and BF16 epilogue; waves share no mutable storage.
+__global__ __launch_bounds__(256)
+void project_prefetch8_wave8_q8_fp32_to_bf16_kernel(
+    const float* input, const void* weights, std::uint32_t input_width,
+    std::uint32_t output_width, std::uint16_t* output) {
+    const auto row = static_cast<std::uint32_t>(blockIdx.x) * 8U + static_cast<std::uint32_t>(threadIdx.x) / 32U;
+    if (row >= output_width) return;
+    const auto lane = static_cast<std::uint32_t>(threadIdx.x) % 32U;
+    float partial[8]{};
+    const auto* blocks = static_cast<const Q8Block*>(weights) +
+        static_cast<std::uint64_t>(row) * (input_width / 32U);
+    for (std::uint64_t chunk = 0; chunk < input_width; chunk += 256U) {
+        const auto base = chunk + 8U * lane;
+        if (base < input_width) {
+            const auto feature = static_cast<std::uint32_t>(base);
+            const auto& block = blocks[feature / 32U];
+            float values[8];
+            std::int8_t codes[8];
+#pragma unroll
+            for (unsigned local = 0; local < 8; ++local) {
+                values[local] = input[feature + local];
+                codes[local] = block.values[feature % 32U + local];
+            }
+            const float scale = __half2float(block.scale);
+#pragma unroll
+            for (unsigned local = 0; local < 8; ++local)
+                partial[local] += values[local] * (scale * static_cast<float>(codes[local]));
+        }
+    }
+    // The shuffled value is read before this stage overwrites dead upper lanes.
+    // Lane0's lineage therefore preserves the original128..8 stages exactly.
+#pragma unroll
+    for (unsigned distance = 16; distance > 0; distance /= 2) {
+#pragma unroll
+        for (unsigned local = 0; local < 8; ++local)
+            partial[local] = gdn_output_virtual_tree_add(partial[local], __shfl_down(partial[local], distance, 32));
+    }
+    if (lane == 0) {
+        partial[0] = gdn_output_virtual_tree_add(partial[0], partial[4]);
+        partial[1] = gdn_output_virtual_tree_add(partial[1], partial[5]);
+        partial[2] = gdn_output_virtual_tree_add(partial[2], partial[6]);
+        partial[3] = gdn_output_virtual_tree_add(partial[3], partial[7]);
+        partial[0] = gdn_output_virtual_tree_add(partial[0], partial[2]);
+        partial[1] = gdn_output_virtual_tree_add(partial[1], partial[3]);
+        partial[0] = gdn_output_virtual_tree_add(partial[0], partial[1]);
+        output[row] = float_to_bf16(partial[0]);
     }
 }
 
@@ -1624,7 +1693,19 @@ void launch_output_by_kind(
     const RuntimeTensorBinding& weights,
     std::uint32_t input_width,
     std::uint32_t output_width,
-    std::uint16_t* output, bool virtual_q8 = false) {
+    std::uint16_t* output, bool virtual_q8 = false, bool wave8 = false) {
+    if (wave8) {
+        if (!virtual_q8 || kind != WeightKind::q8_0)
+            throw std::invalid_argument("wave8 GDN output requires virtual Q8_0 weights");
+        q8_projection_organization::validate_fp32_bf16_views(input_width, output_width,
+            {reinterpret_cast<std::uintptr_t>(input), static_cast<std::uint64_t>(input_width) * sizeof(float)},
+            {weights.address, weights.bytes},
+            {reinterpret_cast<std::uintptr_t>(output), static_cast<std::uint64_t>(output_width) * sizeof(std::uint16_t)});
+        hipLaunchKernelGGL(project_prefetch8_wave8_q8_fp32_to_bf16_kernel, dim3((output_width + 7U) / 8U), dim3(256), 0,
+            hip_execution_stream(), input, reinterpret_cast<const void*>(weights.address), input_width, output_width, output);
+        check_hip(hipGetLastError(), "HIP GDN prefetch8 wave8 Q8 output projection launch");
+        return;
+    }
     if(virtual_q8) {
         if(kind!=WeightKind::q8_0 || input_width%32U!=0U)
             throw std::invalid_argument("virtual Q8 GDN output requires aligned Q8_0 weights");
@@ -2064,13 +2145,13 @@ void launch_gdn(
                 user_data);
     validate_config(config);
 
-    if (config.wave8_q8_input_projections) {
+    if (config.wave8_q8_input_projections || config.wave8_q8_output_projection) {
         if (const auto* scope = current_hip_launch_context(); scope && scope->graph_capture)
-            throw std::invalid_argument("wave8 GDN input supports eager execution only");
+            throw std::invalid_argument("wave8 GDN projections support eager execution only");
         hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
         check_hip(hipStreamIsCapturing(hip_execution_stream(), &capture), "query wave8 GDN capture");
         if (capture != hipStreamCaptureStatusNone)
-            throw std::invalid_argument("wave8 GDN input cannot be captured");
+            throw std::invalid_argument("wave8 GDN projections cannot be captured");
     }
 
     const auto input =
@@ -2193,6 +2274,17 @@ void launch_gdn(
     if(config.virtual_q8_output_projection &&
         (tensors.out.manifest->ggml_type!=8U || value_width%32U!=0U))
         throw std::invalid_argument("virtual Q8 GDN output requires aligned Q8_0 weights");
+    if (config.wave8_q8_output_projection) {
+        const auto core_offset = q8_projection_organization::gdn_output_core_offset_bytes(config.model);
+        const auto core_address = reinterpret_cast<std::uintptr_t>(workspace.core);
+        const auto core_bytes = static_cast<std::uint64_t>(value_width) * sizeof(float);
+        if (core_address < temporary.address || core_address - temporary.address != core_offset ||
+            core_offset > temporary.bytes || core_bytes > temporary.bytes - core_offset)
+            throw std::invalid_argument("wave8 GDN output core workspace mapping differs");
+        q8_projection_organization::validate_fp32_bf16_views(value_width, hidden,
+            {core_address, core_bytes}, {tensors.out.runtime->address, tensors.out.runtime->bytes},
+            {output.address, output.bytes});
+    }
     validate_small_tensor(
         tensors.conv,
         static_cast<std::uint64_t>(
@@ -2456,7 +2548,7 @@ void launch_gdn(
         hidden,
         reinterpret_cast<
             std::uint16_t*>(
-                output.address),config.virtual_q8_output_projection);
+                output.address),config.virtual_q8_output_projection,config.wave8_q8_output_projection);
     if (hip_graph_status() != nullptr) {
         hipLaunchKernelGGL(validate_gdn_graph_input, dim3(32), dim3(kProjectionThreads), 0,
             hip_execution_stream(), reinterpret_cast<const std::uint16_t*>(output.address), hidden,
@@ -2488,6 +2580,7 @@ std::string kernel_id(
         std::to_string(
             request.request_concurrency) + (request.device_graph_inputs ? ".device" : ".scalar") +
         (config.wave8_q8_input_projections ? std::string(q8_projection_organization::gdn_wave8_marker) : "") +
+        (config.wave8_q8_output_projection ? std::string(q8_projection_organization::gdn_output_wave8_marker) : "") +
         (config.prefetch_q8_input_projections ? ".prefetch8" : "") +
         (config.virtual_q8_input_projections ? ".virtual256.q8-input" : "") +
         (config.virtual_q8_output_projection ? ".virtual256.q8-output" : "");
@@ -2543,6 +2636,7 @@ std::uint64_t implementation_identity(
     if (config.virtual_q8_output_projection) hash_u64(hash, 0x47444e514f555431ULL);
     if (config.prefetch_q8_input_projections) hash_u64(hash, 0x47444e5138504631ULL);
     if (config.wave8_q8_input_projections) hash_u64(hash, 0x47444e5138574156ULL);
+    if (config.wave8_q8_output_projection) hash_u64(hash, 0x47444e514f573831ULL);
     return hash;
 }
 
@@ -2557,7 +2651,9 @@ void register_hip_gdn_kernel_variant(
     validate_config(config);
     if (request.wave8_q8_gdn_input != config.wave8_q8_input_projections)
         throw std::invalid_argument("GDN wave8 request/config mismatch");
-    if (config.wave8_q8_input_projections && (request.device_graph_inputs || request.require_graph_safe))
+    if (request.wave8_q8_gdn_output != config.wave8_q8_output_projection)
+        throw std::invalid_argument("GDN wave8 output request/config mismatch");
+    if ((config.wave8_q8_input_projections || config.wave8_q8_output_projection) && (request.device_graph_inputs || request.require_graph_safe))
         throw std::invalid_argument("wave8 GDN input registers eager variants only");
     if (const auto error =
             model.validate();
@@ -2666,6 +2762,7 @@ void register_hip_gdn_kernel_variant(
         : config.virtual_q8_input_projections ? "hip-gfx1151-gdn-v3-virtual256-q8-input" : "hip-gfx1151-gdn-v2";
     if(config.virtual_q8_output_projection) variant.compiler_identity += "-virtual256-q8-output";
     if(config.wave8_q8_input_projections) variant.compiler_identity += ":wave8-input-v1";
+    if(config.wave8_q8_output_projection) variant.compiler_identity += ":wave8-q8-output-v1";
     variant.measured_seconds = 0.0;
 
     registry.add(
@@ -2682,8 +2779,9 @@ make_hip_gdn_launcher(
             "HIP GDN launcher requires id and config");
     }
     validate_config(*config);
-    if (config->wave8_q8_input_projections ||
-        kernel_id_value.find(q8_projection_organization::gdn_wave8_marker) != std::string::npos) {
+    if (config->wave8_q8_input_projections || config->wave8_q8_output_projection ||
+        kernel_id_value.find(q8_projection_organization::gdn_wave8_marker) != std::string::npos ||
+        kernel_id_value.find(q8_projection_organization::gdn_output_wave8_marker) != std::string::npos) {
         ExecutionBindingRequest request;
         if (kernel_id_value != kernel_id(request, *config))
             throw std::invalid_argument("wave8 GDN launcher requires its exact eager C1 kernel id");
@@ -2737,8 +2835,9 @@ register_for_compiled_execution(
             throw std::invalid_argument("HIP GDN selected kernel disagrees with virtual Q8 configuration");
         if (selected_id.ends_with(".prefetch8.virtual256.q8-input") != config_.prefetch_q8_input_projections)
             throw std::invalid_argument("HIP GDN selected kernel disagrees with prefetch Q8 configuration");
-        if (config_.wave8_q8_input_projections ||
-            selected_id.find(q8_projection_organization::gdn_wave8_marker) != std::string::npos) {
+        if (config_.wave8_q8_input_projections || config_.wave8_q8_output_projection ||
+            selected_id.find(q8_projection_organization::gdn_wave8_marker) != std::string::npos ||
+            selected_id.find(q8_projection_organization::gdn_output_wave8_marker) != std::string::npos) {
             ExecutionBindingRequest request;
             request.logical_rows = compiled.logical_rows;
             request.request_concurrency = compiled.request_concurrency;

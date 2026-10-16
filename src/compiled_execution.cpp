@@ -312,7 +312,8 @@ CompiledSerialExecution compile_serial_execution(
 
     if (binding_request.wave8_q8_lm_head && !binding_request.prefetch_q8_lm_head)
         throw std::invalid_argument("wave8 Q8 LM head requires prefetch organization");
-    if ((binding_request.prefetch_q8_lm_head || binding_request.wave8_q8_lm_head || binding_request.wave8_q8_gdn_input) &&
+    if ((binding_request.prefetch_q8_lm_head || binding_request.wave8_q8_lm_head || binding_request.wave8_q8_gdn_input ||
+         binding_request.wave8_q8_gdn_output || binding_request.wave8_q8_qsa_output) &&
         (binding_request.device_graph_inputs || binding_request.require_graph_safe ||
          binding_request.logical_rows != 1 || binding_request.request_concurrency != 1))
         throw std::invalid_argument("Q8 projection organizations require eager C1 execution");
@@ -382,6 +383,12 @@ CompiledSerialExecution compile_serial_execution(
         if (binding.op == SerialOp::gated_delta_net && binding.kernel_id &&
             (binding.kernel_id->find(q8_projection_organization::gdn_wave8_marker) != std::string::npos) != binding_request.wave8_q8_gdn_input)
             throw std::invalid_argument("bound GDN wave8 organization differs from request");
+        if (binding.op == SerialOp::gated_delta_net && binding.kernel_id &&
+            (binding.kernel_id->find(q8_projection_organization::gdn_output_wave8_marker) != std::string::npos) != binding_request.wave8_q8_gdn_output)
+            throw std::invalid_argument("bound GDN output wave8 organization differs from request");
+        if (binding.op == SerialOp::indexed_attention && binding.kernel_id &&
+            (binding.kernel_id->find(q8_projection_organization::qsa_output_wave8_marker) != std::string::npos) != binding_request.wave8_q8_qsa_output)
+            throw std::invalid_argument("bound QSA output wave8 organization differs from request");
         if (binding.op == SerialOp::lm_head && binding.kernel_id) {
             const bool p1 = binding.kernel_id->find(q8_projection_organization::lm_prefetch_marker) != std::string::npos;
             const bool p8 = binding.kernel_id->find(q8_projection_organization::lm_wave8_marker) != std::string::npos;

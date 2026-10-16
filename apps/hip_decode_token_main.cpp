@@ -452,6 +452,8 @@ int main(
             "  --prepared-eager (experimental immutable static submission plan)\n"
             "  --moe-shared-overlap [--moe-overlap-arena-budget-bytes N] (experimental eager D1)\n"
             "  --virtual-q8-gdn-output (exact original256-tree Q8 output)\n"
+            "  --wave8-q8-gdn-output (eager wave8 output; requires resolved virtual Q8 GDN output)\n"
+            "  --wave8-q8-qsa-output (eager all-layer Q8 output organization)\n"
             "  --lane-chain-hyper-output (requires --prefetch-q8-hyper-output)\n"
             "  --record-raw ABS_NEW_PRIVATE_DIRECTORY --record-max-bytes BYTES\n"
             "  --record-state-policy final|each --prefix-cache-roundtrip\n"
@@ -651,7 +653,8 @@ int main(
         strix::build_model_tensor_index(
             manifest);
     const auto q8_organization_plan = strix::q8_projection_organization::build_manifest_plan(
-        model, manifest, options.prefetch_q8_lm_head, options.wave8_q8_gdn_input);
+        model, manifest, options.prefetch_q8_lm_head, options.wave8_q8_gdn_input,
+        options.wave8_q8_gdn_output, options.wave8_q8_qsa_output);
     if (options.virtual_q8_lm_head) {
         std::size_t output_heads = 0;
         for (const auto& tensor : manifest.tensors) {
@@ -707,10 +710,13 @@ int main(
     // counts must be read separately after the selected workload completes.
     const auto gdn_output_mode_receipt=[&] {
         std::string receipt=(options.virtual_q8_gdn_output ? "  \"virtual_q8_gdn_output\": true,\n" : "")+shared_mode_receipt+qsa_input_mode_receipt+lane_chain_mode_receipt;
-        if (options.prefetch_q8_lm_head || options.wave8_q8_lm_head || options.wave8_q8_gdn_input) {
+        if (options.prefetch_q8_lm_head || options.wave8_q8_lm_head || options.wave8_q8_gdn_input ||
+            options.wave8_q8_gdn_output || options.wave8_q8_qsa_output) {
             receipt += "  \"prefetch_q8_lm_head\": " + std::string(options.prefetch_q8_lm_head ? "true" : "false") + ",\n";
             receipt += "  \"wave8_q8_lm_head\": " + std::string(options.wave8_q8_lm_head ? "true" : "false") + ",\n";
             receipt += "  \"wave8_q8_gdn_input\": " + std::string(options.wave8_q8_gdn_input ? "true" : "false") + ",\n";
+            receipt += "  \"wave8_q8_gdn_output\": " + std::string(options.wave8_q8_gdn_output ? "true" : "false") + ",\n";
+            receipt += "  \"wave8_q8_qsa_output\": " + std::string(options.wave8_q8_qsa_output ? "true" : "false") + ",\n";
             receipt += "  \"q8_projection_organization_qualification\": \"not_assessed\",\n";
         }
         return receipt;
@@ -753,9 +759,13 @@ int main(
     catalog_config.prefetch_q8_lm_head = options.prefetch_q8_lm_head;
     catalog_config.wave8_q8_lm_head = options.wave8_q8_lm_head;
     catalog_config.wave8_q8_gdn_input = options.wave8_q8_gdn_input;
+    catalog_config.wave8_q8_gdn_output = options.wave8_q8_gdn_output;
+    catalog_config.wave8_q8_qsa_output = options.wave8_q8_qsa_output;
     binding_request.prefetch_q8_lm_head = options.prefetch_q8_lm_head;
     binding_request.wave8_q8_lm_head = options.wave8_q8_lm_head;
     binding_request.wave8_q8_gdn_input = options.wave8_q8_gdn_input;
+    binding_request.wave8_q8_gdn_output = options.wave8_q8_gdn_output;
+    binding_request.wave8_q8_qsa_output = options.wave8_q8_qsa_output;
     catalog_config.batched_moe_activation = options.batched_moe_activation;
     binding_request.batched_moe_activation = options.batched_moe_activation;
     catalog_config.q4k_a8g32_gate_up = options.q4k_a8g32_gate_up;
@@ -914,6 +924,8 @@ int main(
     auto memory_owner = std::make_shared<strix::RuntimeExecutionMemoryOwner>(
         strix::RuntimeExecutionMemoryOwner::allocate(compiled, state_layout, allocator, generations));
     auto& memory = *memory_owner;
+    strix::q8_projection_organization::validate_output_steps(
+        q8_organization_plan, model, compiled, tensor_access, memory.scratch(), model_residency.binding());
 
     strix::initialize_hip_fresh_runtime_memory(
         memory.scratch(),

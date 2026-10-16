@@ -8,13 +8,30 @@
 
 namespace virtual_q8_test {
 enum class Mutation { none, local_first, cross_reverse, local_reverse,
-    wrong_mapping, descending_leaves, negative_zero, first_product, unfused, correct_mapping };
+    wrong_mapping, descending_leaves, negative_zero, first_product, unfused, correct_mapping,
+    lane_accumulator };
 
 // Independent CPU statement of the measured legacy contract: 256 leaves,
 // ascending feature order, fused updates, then the 128..1 binary tree.
 inline float legacy_oracle(std::span<const float> input, std::span<const float> weight,
     Mutation mutation = Mutation::none) {
     if (input.size() != weight.size()) throw std::invalid_argument("oracle extent mismatch");
+    if (mutation == Mutation::lane_accumulator) {
+        // Deliberately wrong: collapse the eight independent virtual leaves
+        // into one ascending accumulator per physical lane and a 32-leaf tree.
+        std::array<float, 32> lanes{};
+        for (std::size_t lane = 0; lane < lanes.size(); ++lane)
+            for (std::size_t chunk = 0; chunk < input.size(); chunk += 256U)
+                for (std::size_t local = 0; local < 8U; ++local) {
+                    const auto feature = chunk + 8U * lane + local;
+                    if (feature < input.size())
+                        lanes[lane] = std::fmaf(input[feature], weight[feature], lanes[lane]);
+                }
+        for (std::size_t distance = 16; distance; distance >>= 1U)
+            for (std::size_t lane = 0; lane < distance; ++lane)
+                lanes[lane] += lanes[lane + distance];
+        return lanes[0];
+    }
     std::array<float, 256> leaves{};
     for (std::size_t lane = 0; lane < leaves.size(); ++lane) {
         float sum = mutation == Mutation::negative_zero ? -0.0F : 0.0F;

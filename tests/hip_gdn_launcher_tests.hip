@@ -591,8 +591,9 @@ int main(int argc, char** argv) try {
     const bool candidate_enabled = argc >= 2;
     const std::string fixture_mode = argc >= 3 ? argv[2] : "";
     const bool wave8_enabled = fixture_mode == "wave8";
+    const bool wave8_output_enabled = fixture_mode == "wave8-output";
     const bool prefetch_enabled = fixture_mode == "prefetch" || fixture_mode == "prefetch-fallback" || wave8_enabled;
-    if (argc == 2 || ((argc == 3 || argc == 4) && (fixture_mode == "fallback" || prefetch_enabled))) {
+    if (argc == 2 || ((argc == 3 || argc == 4) && (fixture_mode == "fallback" || prefetch_enabled || wave8_output_enabled))) {
         dense_q8_fixture = fixture_mode != "fallback" && fixture_mode != "prefetch-fallback";
         dense_q8_width = static_cast<std::uint32_t>(std::stoul(argv[1]));
         if (dense_q8_width != 128U && dense_q8_width != 288U && dense_q8_width != 480U && dense_q8_width != 640U && dense_q8_width != 2560U)
@@ -600,7 +601,7 @@ int main(int argc, char** argv) try {
         model.hidden_size = dense_q8_width;
         if (argc == 4) {
             const auto heads = static_cast<std::uint32_t>(std::stoul(argv[3]));
-            if (!wave8_enabled || (heads != 4U && heads != 12U))
+            if ((!wave8_enabled && !wave8_output_enabled) || (heads != 4U && heads != 12U))
                 throw std::invalid_argument("GDN wave8 tail fixture supports 4 or 12 value heads");
             model.gdn_key_heads = 4;
             model.gdn_value_heads = heads;
@@ -837,12 +838,28 @@ int main(int argc, char** argv) try {
             0.01F;
     }
 
-    const auto out_weight =
+    auto out_weight =
         sparse_matrix(
             value_width,
             hidden,
             0.0035F,
             17U);
+
+    std::vector<std::byte> packed_output;
+    if (wave8_output_enabled) {
+        packed_output.resize(out_weight.size()/32U*34U);
+        for(std::size_t block=0;block<out_weight.size()/32U;++block) {
+            const std::uint16_t bits=static_cast<std::uint16_t>(0x0400U+(block*137U)%1024U);
+            packed_output[block*34U]=static_cast<std::byte>(bits&255U);
+            packed_output[block*34U+1U]=static_cast<std::byte>(bits>>8U);
+            const float scale=std::ldexp(1.0F+static_cast<float>(bits&1023U)/1024.0F,-14);
+            for(unsigned local=0;local<32;++local) {
+                const auto code=static_cast<std::int8_t>(static_cast<int>((block*29U+local*17U)%256U)-128);
+                packed_output[block*34U+2U+local]=static_cast<std::byte>(static_cast<std::uint8_t>(code));
+                out_weight[block*32U+local]=scale*static_cast<float>(code);
+            }
+        }
+    }
 
     strix::SerialSessionStateLayoutRequest
         state_request;
@@ -1063,6 +1080,10 @@ int main(int argc, char** argv) try {
             manifest.total_tensor_bytes += tensor.byte_size;
         }
     }
+    if(wave8_output_enabled) {
+        auto& tensor=manifest.tensors[8];manifest.total_tensor_bytes-=tensor.byte_size;
+        tensor.ggml_type=8U;tensor.byte_size=packed_output.size();manifest.total_tensor_bytes+=tensor.byte_size;
+    }
     manifest.layout_identity =
         strix::model_manifest_layout_identity(
             manifest);
@@ -1101,6 +1122,7 @@ int main(int argc, char** argv) try {
             const auto m = index == 0 ? 0U : index == 1 ? 1U : 2U;
             payload = packed_q8[m].data(); bytes = packed_q8[m].size();
         }
+        if(wave8_output_enabled && index==8U) {payload=packed_output.data();bytes=packed_output.size();}
         check(
             hipMalloc(
                 &device_weights[index],
@@ -1205,6 +1227,12 @@ int main(int argc, char** argv) try {
     config.activation =
         strix::HipActivationStorage::bf16;
 
+    // The output experiment changes only the output organization. Both arms
+    // use the same virtual input path, nonzero initial state and packed weights.
+    if(wave8_output_enabled) {
+        config.virtual_q8_input_projections=true;
+        config.virtual_q8_output_projection=true;
+    }
     strix::kernels::KernelRegistry gdn_variants;
     strix::ExecutionBindingRequest gdn_request;
     strix::register_hip_gdn_kernel_variant(model, gdn_request, config, gdn_variants);
@@ -1398,10 +1426,12 @@ int main(int argc, char** argv) try {
     config.virtual_q8_input_projections = candidate_enabled;
     config.prefetch_q8_input_projections = prefetch_enabled;
     config.wave8_q8_input_projections = wave8_enabled;
+    config.wave8_q8_output_projection = wave8_output_enabled;
     const auto original_identity = launcher.implementation_identity;
     std::string selected_id = "test.gdn.virtual";
-    if (wave8_enabled) {
-        auto request = gdn_request; request.wave8_q8_gdn_input = true;
+    if (wave8_enabled || wave8_output_enabled) {
+        auto request = gdn_request; request.wave8_q8_gdn_input = wave8_enabled;
+        request.wave8_q8_gdn_output = wave8_output_enabled;
         strix::kernels::KernelRegistry registry;
         strix::register_hip_gdn_kernel_variant(model, request, config, registry);
         selected_id = registry.variants().front().id;
@@ -1438,7 +1468,7 @@ int main(int argc, char** argv) try {
         };
         // Full entrypoint must reject the existing F32 output BEFORE either
         // input projection or persistent conv/recurrent update is enqueued.
-        reject_before_launch([&] { config.virtual_q8_output_projection = true; },
+        if(!wave8_output_enabled) reject_before_launch([&] { config.virtual_q8_output_projection = true; },
             [&] { config.virtual_q8_output_projection = false; },
             "virtual Q8 GDN output requires aligned Q8_0 weights");
         if (prefetch_enabled) {
@@ -1467,6 +1497,19 @@ int main(int argc, char** argv) try {
             const auto saved_address = runtime.tensors[0].address;
             reject_before_launch([&] { runtime.tensors[0].address += 2U; },
                 [&] { runtime.tensors[0].address = saved_address; }, "invalid alignment or extent");
+        }
+        if(wave8_output_enabled) {
+            reject_before_launch([&] {config.virtual_q8_output_projection=false;},
+                [&] {config.virtual_q8_output_projection=true;},"requires virtual Q8 output");
+            const auto saved_kind=manifest.tensors[8].ggml_type;
+            reject_before_launch([&] {manifest.tensors[8].ggml_type=20U;},
+                [&] {manifest.tensors[8].ggml_type=saved_kind;},"requires aligned Q8_0 weights");
+            const auto saved_address=runtime.tensors[8].address;
+            reject_before_launch([&] {runtime.tensors[8].address+=2U;},
+                [&] {runtime.tensors[8].address=saved_address;},"invalid alignment or extent");
+            const auto saved_extent=runtime.tensors[8].bytes;
+            reject_before_launch([&] {runtime.tensors[8].bytes=saved_extent-1U;},
+                [&] {runtime.tensors[8].bytes=saved_extent;});
         }
         const auto saved_bytes = runtime.tensors[0].bytes;
         reject_before_launch([&] { runtime.tensors[0].bytes = saved_bytes - 1U; },
@@ -1628,6 +1671,48 @@ int main(int argc, char** argv) try {
         check(hipMemcpy(device_weights[1], packed_q8[1].data(), packed_q8[1].size(), hipMemcpyHostToDevice),
             "restore production GDN edge weights");
 
+    }
+    if(wave8_output_enabled) {
+        auto baseline_config=config;baseline_config.wave8_q8_output_projection=false;
+        const auto baseline_launcher=strix::make_hip_gdn_launcher("test.gdn.output.virtual",&baseline_config);
+        const auto saved_packed_output=packed_output;
+        const auto observe_output_arm=[&](const strix::ExecutionLauncher& arm) {
+            check(hipMemcpy(reinterpret_cast<void*>(matrix_address.address),matrix_state.data(),matrix_address.bytes,hipMemcpyHostToDevice),"restore output edge matrix");
+            check(hipMemcpy(reinterpret_cast<void*>(conv_address.address),conv_state.data(),conv_address.bytes,hipMemcpyHostToDevice),"restore output edge convolution");
+            poison_arena(nullptr);arm.function(context,arm.user_data);
+            check(hipDeviceSynchronize(),"drain output edge arm");
+            std::vector<std::byte> arena_bits(first_arena.size());
+            std::vector<float> matrix_bits(first_matrix.size());std::vector<std::uint16_t> conv_bits(first_conv.size());
+            check(hipMemcpy(arena_bits.data(),arena_pointer,arena_bits.size(),hipMemcpyDeviceToHost),"read output edge arena");
+            check(hipMemcpy(matrix_bits.data(),reinterpret_cast<void*>(matrix_address.address),matrix_address.bytes,hipMemcpyDeviceToHost),"read output edge matrix");
+            check(hipMemcpy(conv_bits.data(),reinterpret_cast<void*>(conv_address.address),conv_address.bytes,hipMemcpyDeviceToHost),"read output edge convolution");
+            std::vector<std::byte> weights_after(packed_output.size());
+            check(hipMemcpy(weights_after.data(),device_weights[8],weights_after.size(),hipMemcpyDeviceToHost),"read output edge weights");
+            expect(weights_after==packed_output,"output weights remain read-only");
+            expect(std::memcmp(matrix_bits.data(),first_matrix.data(),matrix_address.bytes)==0 && conv_bits==first_conv,
+                "output-only organization cannot change recurrent or convolution state");
+            return arena_bits;
+        };
+        // These coefficients exercise the actual normalizer/core workspace and
+        // BF16 epilogue; standalone tests discriminate nonfinite payload roles.
+        constexpr std::array<std::uint16_t,5> edge_scales{0x8000U,0x0001U,0x03ffU,0x7bffU,0x7e01U};
+        for(const auto scale:edge_scales) {
+            packed_output=saved_packed_output;
+            for(std::size_t block=0;block<packed_output.size()/34U;++block) {
+                packed_output[block*34U]=static_cast<std::byte>(scale&255U);
+                packed_output[block*34U+1U]=static_cast<std::byte>(scale>>8U);
+                packed_output[block*34U+2U]=std::byte{0x80};
+                packed_output[block*34U+3U]=std::byte{0};
+            }
+            check(hipMemcpy(device_weights[8],packed_output.data(),packed_output.size(),hipMemcpyHostToDevice),"upload output edge weights");
+            const auto baseline_bits=observe_output_arm(baseline_launcher);
+            for(unsigned replay=0;replay<3;++replay)
+                expect(observe_output_arm(launcher)==baseline_bits,"wave8 output complete arena matches virtual baseline on edge replay");
+        }
+        packed_output=saved_packed_output;
+        check(hipMemcpy(device_weights[8],packed_output.data(),packed_output.size(),hipMemcpyHostToDevice),"restore output edge weights");
+    }
+    if(wave8_enabled || wave8_output_enabled) {
         hipStream_t stream = nullptr;
         hipGraph_t rejected_graph = nullptr;
         check(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), "create rejected wave8 GDN stream");
@@ -1650,7 +1735,7 @@ int main(int argc, char** argv) try {
     // Capture the complete existing GDN operator: projections, convolution,
     // recurrence, gated normalization and final projection. No host position
     // scalar controls the captured state stage.
-    if (!wave8_enabled) {
+    if (!wave8_enabled && !wave8_output_enabled) {
         auto graph_config = config;
         graph_config.enable_device_graph_inputs = true;
         auto graph_launcher = strix::make_hip_gdn_launcher("test.gdn.device", &graph_config);

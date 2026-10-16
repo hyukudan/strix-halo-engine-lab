@@ -191,7 +191,8 @@ def reported_opt_in_overlays(receipt):
         if value is not None and (not isinstance(value, str) or not value):
             raise ValueError(f"{key} must be a nonempty string or null")
         values[key] = value
-    for key in ("batched_moe_activation", "prefetch_q8_lm_head", "wave8_q8_lm_head", "wave8_q8_gdn_input"):
+    for key in ("batched_moe_activation", "prefetch_q8_lm_head", "wave8_q8_lm_head", "wave8_q8_gdn_input",
+                "wave8_q8_gdn_output", "wave8_q8_qsa_output"):
         value = receipt.get(key)
         if value is not None:
             boolean(value, key)

@@ -6,6 +6,7 @@
 #include "strix/session_state_memory.hpp"
 #include "strix/hip_launch_context.hpp"
 #include "strix/graph_operator_control.hpp"
+#include "strix/q8_projection_organization.hpp"
 #ifdef STRIX_BUILD_QSA_GQA_REUSE_DIAGNOSTIC
 #include "strix/hip_qsa_gqa_reuse_diagnostic.hpp"
 #endif
@@ -242,6 +243,14 @@ void validate_config(
             config.model.head_dim) {
         throw std::invalid_argument(
             "HIP indexed-attention v1 requires pinned/tileable head geometry");
+    }
+    if (config.wave8_q8_output) {
+        if (config.enable_device_graph_inputs)
+            throw std::invalid_argument("wave8 QSA output supports eager execution only");
+        if (config.model.attention_heads > 10240U / config.model.head_dim)
+            throw std::invalid_argument("wave8 QSA output width exceeds admitted bounds");
+        q8_projection_organization::validate_geometry(
+            config.model.attention_heads * config.model.head_dim, config.model.hidden_size);
     }
 }
 
@@ -710,6 +719,65 @@ __global__ void linear_float_to_bf16_kernel(
         output[out] =
             float_to_bf16(
                 scratch[0]);
+    }
+}
+
+// Actual original Q8 output LDS tree uses upper/partner src0 and lower/self
+// src1 at every 128..1 stage. Keep this output-specific evidence and helper
+// separate from the input projection tree and leave the old body unchanged.
+__device__ __forceinline__ float qsa_output_legacy_tree_add(float lower, float upper) {
+    float result;
+    asm volatile("v_add_f32 %0, %1, %2" : "=v"(result) : "v"(upper), "v"(lower));
+    return result;
+}
+
+__global__ __launch_bounds__(256)
+void linear_prefetch8_wave8_q8_float_to_bf16_kernel(
+    const float* input, const void* weights, std::uint32_t input_width,
+    std::uint32_t output_width, std::uint16_t* output) {
+    const auto row = static_cast<std::uint32_t>(blockIdx.x) * 8U +
+        static_cast<std::uint32_t>(threadIdx.x) / 32U;
+    if (row >= output_width) return; // Whole inactive wave; no block barriers.
+    const auto lane = static_cast<std::uint32_t>(threadIdx.x) % 32U;
+    float partial[8]{};
+    const auto* blocks = static_cast<const Q8Block*>(weights) +
+        static_cast<std::uint64_t>(row) * (input_width / 32U);
+    for (std::uint64_t chunk = 0; chunk < input_width; chunk += 256U) {
+        const auto base = chunk + 8U * lane;
+        if (base < input_width) {
+            const auto feature = static_cast<std::uint32_t>(base);
+            const auto& block = blocks[feature / 32U];
+            float values[8];
+            std::int8_t codes[8];
+#pragma unroll
+            for (unsigned local = 0; local < 8; ++local) {
+                values[local] = input[feature + local];
+                codes[local] = block.values[feature % 32U + local];
+            }
+            const float scale = __half2float(block.scale);
+#pragma unroll
+            for (unsigned local = 0; local < 8; ++local)
+                partial[local] += values[local] * (scale * static_cast<float>(codes[local]));
+        }
+    }
+    // The shuffle reads partners before upper lanes are overwritten. Lane0's
+    // 8 independent leaves preserve the old 128,64,32,16,8 stages exactly.
+#pragma unroll
+    for (unsigned distance = 16; distance > 0; distance /= 2) {
+#pragma unroll
+        for (unsigned local = 0; local < 8; ++local)
+            partial[local] = qsa_output_legacy_tree_add(
+                partial[local], __shfl_down(partial[local], distance, 32));
+    }
+    if (lane == 0) {
+        partial[0] = qsa_output_legacy_tree_add(partial[0], partial[4]);
+        partial[1] = qsa_output_legacy_tree_add(partial[1], partial[5]);
+        partial[2] = qsa_output_legacy_tree_add(partial[2], partial[6]);
+        partial[3] = qsa_output_legacy_tree_add(partial[3], partial[7]);
+        partial[0] = qsa_output_legacy_tree_add(partial[0], partial[2]);
+        partial[1] = qsa_output_legacy_tree_add(partial[1], partial[3]);
+        partial[0] = qsa_output_legacy_tree_add(partial[0], partial[1]);
+        output[row] = float_to_bf16(partial[0]);
     }
 }
 
@@ -1912,7 +1980,18 @@ void launch_linear_float_to_bf16(
     const float* input,
     std::uint32_t input_width,
     std::uint32_t output_width,
-    const ExecutionBufferAddress& output) {
+    const ExecutionBufferAddress& output, bool wave8 = false) {
+    if (wave8) {
+        if (tensor.manifest->ggml_type != 8U || input_width % 32U)
+            throw std::invalid_argument("wave8 QSA output requires aligned Q8_0 weights");
+        q8_projection_organization::validate_geometry(input_width, output_width);
+        hipLaunchKernelGGL(linear_prefetch8_wave8_q8_float_to_bf16_kernel,
+            dim3((output_width + 7U) / 8U), dim3(256), 0, hip_execution_stream(), input,
+            reinterpret_cast<const void*>(tensor.runtime->address), input_width, output_width,
+            reinterpret_cast<std::uint16_t*>(output.address));
+        check_hip(hipGetLastError(), "HIP indexed-attention wave8 Q8 output projection launch");
+        return;
+    }
     switch (weight_kind(
                 tensor.manifest->
                     ggml_type)) {
@@ -2213,6 +2292,16 @@ void launch_indexed_attention(
             HipIndexedAttentionLauncherConfig*>(
                 user_data);
     validate_config(config);
+    if (config.wave8_q8_output) {
+        const auto* scope = current_hip_launch_context();
+        if (scope && scope->graph_capture)
+            throw std::invalid_argument("wave8 QSA output supports eager execution only");
+        hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
+        check_hip(hipStreamIsCapturing(hip_execution_stream(), &capture),
+            "HIP wave8 QSA output capture query");
+        if (capture != hipStreamCaptureStatusNone)
+            throw std::invalid_argument("wave8 QSA output supports eager execution only");
+    }
     const auto& model =
         config.model;
 
@@ -2391,6 +2480,15 @@ void launch_indexed_attention(
             "indexed-attention hidden buffers are undersized");
     }
 
+    if (config.wave8_q8_output) {
+        if (tensors.out.manifest->ggml_type != 8U)
+            throw std::invalid_argument("wave8 QSA output requires aligned Q8_0 weights");
+        q8_projection_organization::validate_fp32_bf16_views(attention_width, hidden,
+            {reinterpret_cast<std::uintptr_t>(workspace.attention_output),
+             static_cast<std::uint64_t>(attention_width) * sizeof(float)},
+            {tensors.out.runtime->address, tensors.out.runtime->bytes},
+            {output.address, output.bytes});
+    }
     if(config.prefetch_q8_input){
         if(!qsa_input_prefetch::selected(true,config.prefetch_eligible_layers,context.layer))throw std::invalid_argument("QSA prefetch launch layer differs from admitted plan");
         if(input.address%2U!=0 || output.address%2U!=0 || temporary.address%4U!=0 || kv_state.address%2U!=0 || raw_state.address%2U!=0)throw std::invalid_argument("QSA prefetch owner alignment invalid");
@@ -2706,7 +2804,7 @@ void launch_indexed_attention(
         workspace.attention_output,
         attention_width,
         hidden,
-        output);
+        output, config.wave8_q8_output);
     if (device_graph) {
         hipLaunchKernelGGL(validate_indexed_graph_control, dim3(1), dim3(kThreads), 0,
             hip_execution_stream(), dynamic_position,
@@ -2745,7 +2843,9 @@ std::string kernel_id(
             request.logical_rows) +
         ".c" +
         std::to_string(
-            request.request_concurrency) + (request.device_graph_inputs ? ".device" : ".scalar") + (config.prefetch_q8_input ? std::string(qsa_input_prefetch::kernel_suffix) : "");
+            request.request_concurrency) + (request.device_graph_inputs ? ".device" : ".scalar") +
+        (config.wave8_q8_output ? std::string(q8_projection_organization::qsa_output_wave8_marker) : "") +
+        (config.prefetch_q8_input ? std::string(qsa_input_prefetch::kernel_suffix) : "");
 }
 
 std::uint64_t implementation_identity(
@@ -2792,6 +2892,7 @@ std::uint64_t implementation_identity(
     hash_u64(hash, config.enable_device_graph_inputs);
     hash_u64(hash, config.model.max_position_embeddings);
     if(config.prefetch_q8_input){hash_u64(hash,0x5153415052465631ULL);for(auto layer:config.prefetch_eligible_layers)hash_u64(hash,layer);}
+    if(config.wave8_q8_output) hash_u64(hash, 0x5153414f57385631ULL);
     return hash;
 }
 
@@ -2811,6 +2912,29 @@ void launch_hip_qsa_input_projection_probe(HipQsaInputProjectionMode mode,HipQsa
     check_hip(hipGetLastError(),"QSA input projection probe launch");
 }
 
+#ifdef STRIX_BUILD_QSA_OUTPUT_PROJECTION_DIAGNOSTIC
+void launch_hip_qsa_output_projection_probe(HipQsaOutputProjectionMode mode,
+    HipQsaInputProjectionView input, HipQsaInputProjectionView weights,
+    HipQsaInputProjectionView output, std::uint32_t width, std::uint32_t outputs, void* stream) {
+    if ((mode != HipQsaOutputProjectionMode::legacy256 && mode != HipQsaOutputProjectionMode::wave8) ||
+        !stream || stream == hipStreamPerThread || stream == hipStreamLegacy)
+        throw std::invalid_argument("QSA output projection diagnostic requires mode and owned stream");
+    q8_projection_organization::validate_fp32_bf16_views(width, outputs,
+        {input.address, input.bytes}, {weights.address, weights.bytes}, {output.address, output.bytes});
+    auto* in = reinterpret_cast<const float*>(input.address);
+    auto* out = reinterpret_cast<std::uint16_t*>(output.address);
+    const auto* weight = reinterpret_cast<const void*>(weights.address);
+    const auto owned_stream = static_cast<hipStream_t>(stream);
+    if (mode == HipQsaOutputProjectionMode::legacy256)
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(linear_float_to_bf16_kernel<WeightKind::q8_0>),
+            dim3(outputs), dim3(256), 0, owned_stream, in, weight, width, outputs, out);
+    else
+        hipLaunchKernelGGL(linear_prefetch8_wave8_q8_float_to_bf16_kernel,
+            dim3((outputs + 7U) / 8U), dim3(256), 0, owned_stream, in, weight, width, outputs, out);
+    check_hip(hipGetLastError(), "HIP QSA output projection diagnostic launch");
+}
+#endif
+
 void register_hip_indexed_attention_kernel_variant(
     const ModelContract& model,
     const ExecutionBindingRequest& request,
@@ -2823,6 +2947,10 @@ void register_hip_indexed_attention_kernel_variant(
         throw std::invalid_argument(error);
     }
     validate_config(config);
+    if (request.wave8_q8_qsa_output != config.wave8_q8_output)
+        throw std::invalid_argument("wave8 QSA output request/config mismatch");
+    if (config.wave8_q8_output && (request.device_graph_inputs || request.require_graph_safe))
+        throw std::invalid_argument("wave8 QSA output registers eager variants only");
     if(config.prefetch_q8_input!=request.prefetch_q8_qsa_input || config.prefetch_eligible_layers!=request.qsa_input_prefetch_layers)throw std::invalid_argument("indexed QSA prefetch config differs from binding request");
     qsa_input_prefetch::validate_layers(model,request.prefetch_q8_qsa_input,request.qsa_input_prefetch_layers);
 
@@ -2907,6 +3035,7 @@ void register_hip_indexed_attention_kernel_variant(
         "row-major";
     variant.compiler_identity =
         config.prefetch_q8_input ? "hip-gfx1151-indexed-attention-v3-prefetch8-virtual256-q8-qsa-input" : "hip-gfx1151-indexed-attention-v2";
+    if (config.wave8_q8_output) variant.compiler_identity += ":wave8-q8-qsa-output-v1";
     variant.measured_seconds = 0.0;
 
     registry.add(
@@ -2923,6 +3052,12 @@ make_hip_indexed_attention_launcher(
             "HIP indexed-attention launcher requires id and config");
     }
     validate_config(*config);
+    if (config->wave8_q8_output ||
+        kernel_id_value.find(q8_projection_organization::qsa_output_wave8_marker) != std::string::npos) {
+        ExecutionBindingRequest request;
+        if (kernel_id_value != kernel_id(request, *config))
+            throw std::invalid_argument("wave8 QSA output launcher requires its exact eager C1 kernel id");
+    }
     return ExecutionLauncher{
         std::move(kernel_id_value),
         implementation_identity(

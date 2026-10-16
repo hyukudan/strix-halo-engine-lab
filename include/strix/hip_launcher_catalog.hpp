@@ -34,6 +34,8 @@ struct HipLauncherCatalogConfig {
     bool prefetch_q8_lm_head = false;
     bool wave8_q8_lm_head = false;
     bool wave8_q8_gdn_input = false;
+    bool wave8_q8_gdn_output = false;
+    bool wave8_q8_qsa_output = false;
     bool parallel_moe_router = false;
     bool virtual_q8_gdn_input = false;
     bool ranked_moe_router_topk = false;

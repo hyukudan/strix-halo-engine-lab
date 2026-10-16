@@ -19,6 +19,7 @@ struct HipIndexedAttentionLauncherConfig {
         HipActivationStorage::bf16;
     bool enable_device_graph_inputs = false;
     bool prefetch_q8_input = false;
+    bool wave8_q8_output = false;
     std::vector<std::uint32_t> prefetch_eligible_layers;
     std::shared_ptr<qsa_input_prefetch::RuntimeDispatchStats> prefetch_stats;
 };
@@ -31,6 +32,17 @@ struct HipQsaInputProjectionView {std::uintptr_t address=0;std::uint64_t bytes=0
 void launch_hip_qsa_input_projection_probe(HipQsaInputProjectionMode,
     HipQsaInputProjectionView input,HipQsaInputProjectionView weights,
     HipQsaInputProjectionView output,std::uint32_t width,std::uint32_t outputs,void* stream);
+
+#ifdef STRIX_BUILD_QSA_OUTPUT_PROJECTION_DIAGNOSTIC
+enum class HipQsaOutputProjectionMode { legacy256, wave8 };
+// Test-only explicit-stream entry. FP32 input and original Q8_0 weights produce
+// BF16 output. No allocation/synchronization; retain owners through completion.
+// Diagnostic capture is supported to inspect geometry, independently of the
+// eager-only production launcher's pre-enqueue capture rejection.
+void launch_hip_qsa_output_projection_probe(HipQsaOutputProjectionMode,
+    HipQsaInputProjectionView input, HipQsaInputProjectionView weights,
+    HipQsaInputProjectionView output, std::uint32_t width, std::uint32_t outputs, void* stream);
+#endif
 
 // Experimental post-projection C1 norm/RoPE/KV stage. Async on caller's
 // explicitly owned stream; retain all resource owners through completion.

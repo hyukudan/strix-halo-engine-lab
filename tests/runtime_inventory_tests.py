@@ -67,7 +67,8 @@ class InventoryTests(unittest.TestCase):
         modes = {"eager_submission_mode": "prepared-static-plan-experimental-v1",
                  "moe_shared_overlap_mode": "eager-sibling-streams-experimental-v1",
                  "generation_output_mode": "finite-firstmax-token-v1", "batched_moe_activation": True,
-                 "prefetch_q8_lm_head": True, "wave8_q8_lm_head": True, "wave8_q8_gdn_input": True}
+                 "prefetch_q8_lm_head": True, "wave8_q8_lm_head": True, "wave8_q8_gdn_input": True,
+                 "wave8_q8_gdn_output": True, "wave8_q8_qsa_output": True}
         for field, value in modes.items():
             with self.subTest(field=field):
                 receipt = self.receipt(True, "qualified-checkpoint")
@@ -87,7 +88,8 @@ class InventoryTests(unittest.TestCase):
 
     def test_overlay_absence_false_unknown_and_invalid_types(self):
         inactive = {key: False for key in ("batched_moe_activation", "prefetch_q8_lm_head",
-                                          "wave8_q8_lm_head", "wave8_q8_gdn_input")}
+                                          "wave8_q8_lm_head", "wave8_q8_gdn_input",
+                                          "wave8_q8_gdn_output", "wave8_q8_qsa_output")}
         result = self.collect(receipt_path=self.evidence("no-overlays.json", inactive))
         for key in inactive:
             self.assertIs(result["reported_opt_in_overlays"][key], False)
@@ -100,7 +102,8 @@ class InventoryTests(unittest.TestCase):
             for value in (True, 1, {}, [] , ""):
                 with self.subTest(field=field, value=value), self.assertRaises(ValueError):
                     self.collect(receipt_path=self.evidence("invalid-overlay.json", {field: value}))
-        for field in ("batched_moe_activation", "prefetch_q8_lm_head", "wave8_q8_lm_head", "wave8_q8_gdn_input"):
+        for field in ("batched_moe_activation", "prefetch_q8_lm_head", "wave8_q8_lm_head", "wave8_q8_gdn_input",
+                      "wave8_q8_gdn_output", "wave8_q8_qsa_output"):
             for value in (1, 0, 0.0, "true", [], {}):
                 with self.subTest(field=field, value=value), self.assertRaises(ValueError):
                     self.collect(receipt_path=self.evidence("invalid-bool-overlay.json", {field: value}))

@@ -15,6 +15,7 @@
 #include "strix/hip_runtime_launchers.hpp"
 #include "strix/kernel_registry.hpp"
 #include "strix/model_contract.hpp"
+#include "strix/q8_projection_organization.hpp"
 #include "strix/integer_projection_runtime.hpp"
 
 #include <cstdint>
@@ -600,6 +601,94 @@ int main() {
             "shared prefetch config/request mismatch");
     }
 
+
+    // Output organization is independent of QSA's per-layer input fallback.
+    // Both the marked base and marked prefetch launcher must retain output mode.
+    for (const bool gdn_output : {false, true}) {
+        for (const bool qsa_output : {false, true}) {
+            auto output_request = request;
+            output_request.wave8_q8_gdn_output = gdn_output;
+            output_request.wave8_q8_qsa_output = qsa_output;
+            output_request.prefetch_q8_qsa_input = true;
+            for (std::uint32_t layer = 7; layer < model.hidden_layers; layer += 4)
+                output_request.qsa_input_prefetch_layers.push_back(layer);
+            strix::HipLauncherCatalogConfig output_config;
+            output_config.virtual_q8_gdn_output = true;
+            output_config.wave8_q8_gdn_output = gdn_output;
+            output_config.wave8_q8_qsa_output = qsa_output;
+            output_config.prefetch_q8_qsa_input = true;
+            output_config.qsa_input_prefetch_layers = output_request.qsa_input_prefetch_layers;
+            output_config.qsa_input_prefetch_stats =
+                std::make_shared<strix::qsa_input_prefetch::RuntimeDispatchStats>();
+            strix::kernels::KernelRegistry output_registry;
+            strix::register_complete_hip_kernel_catalog(model, output_request, output_config, output_registry);
+            strix::ExecutionBufferRequest output_buffers;
+            const auto output_compiled = strix::compile_serial_execution(
+                model, output_registry, output_request, output_buffers);
+            strix::HipLauncherCatalog output_catalog(model, output_config);
+            strix::ExecutionLauncherRegistry output_launchers;
+            output_catalog.register_for_compiled_execution(output_compiled, output_launchers);
+            unsigned gdns = 0, qsas = 0, prefetched = 0;
+            for (const auto& binding : output_compiled.bindings.bindings) {
+                if (binding.op != strix::SerialOp::gated_delta_net &&
+                    binding.op != strix::SerialOp::indexed_attention) continue;
+                const auto& id = *binding.kernel_id;
+                const auto* launcher = output_launchers.find_kernel_launcher(id);
+                expect(launcher != nullptr, "output organization has its exact bound launcher");
+                if (binding.op == strix::SerialOp::gated_delta_net) {
+                    ++gdns;
+                    expect((id.find(strix::q8_projection_organization::gdn_output_wave8_marker) !=
+                        std::string::npos) == gdn_output, "GDN output marker matches request");
+                    expect(id.ends_with(".virtual256.q8-output"), "GDN output marker preserves terminal suffix");
+                    if (launcher) {
+                        const auto* actual = static_cast<const strix::HipGdnLauncherConfig*>(launcher->user_data);
+                        expect(actual && actual->wave8_q8_output_projection == gdn_output,
+                               "GDN catalog forwards output config");
+                    }
+                } else {
+                    ++qsas;
+                    const bool input_prefetch = id.ends_with(strix::qsa_input_prefetch::kernel_suffix);
+                    if (input_prefetch) ++prefetched;
+                    expect((id.find(strix::q8_projection_organization::qsa_output_wave8_marker) !=
+                        std::string::npos) == qsa_output, "QSA output marker survives input fallback");
+                    if (launcher) {
+                        const auto* actual = static_cast<const strix::HipIndexedAttentionLauncherConfig*>(launcher->user_data);
+                        expect(actual && actual->wave8_q8_output == qsa_output &&
+                               actual->prefetch_q8_input == input_prefetch,
+                               "QSA base and prefetch launchers preserve output bit");
+                    }
+                }
+            }
+            expect(gdns == 36 && qsas == 12 && prefetched == 11, "output overlay covers all GDN/QSA and mixed input topology");
+            expect(output_catalog.audit(output_compiled, output_launchers).missing_steps == 0,
+                   "output organization launcher coverage complete");
+            for (const bool flip_gdn : {false, true}) {
+                auto mismatch = output_config;
+                if (flip_gdn) mismatch.wave8_q8_gdn_output = !gdn_output;
+                else mismatch.wave8_q8_qsa_output = !qsa_output;
+                strix::kernels::KernelRegistry rejected_registry;
+                bool rejected = false;
+                try { strix::register_complete_hip_kernel_catalog(
+                    model, output_request, mismatch, rejected_registry); }
+                catch (const std::invalid_argument& error) {
+                    rejected = std::string(error.what()).find("organization differs") != std::string::npos;
+                }
+                expect(rejected && rejected_registry.variants().empty(),
+                       "output config/request mismatch rejects before catalog publication");
+            }
+            if (gdn_output || qsa_output) {
+                auto graph_request = output_request;
+                graph_request.require_graph_safe = true;
+                bool rejected = false;
+                try { (void)strix::compile_serial_execution(
+                    model, output_registry, graph_request, output_buffers); }
+                catch (const std::invalid_argument& error) {
+                    rejected = std::string(error.what()).find("eager C1") != std::string::npos;
+                }
+                expect(rejected, "compiled output organization rejects graph request before binding");
+            }
+        }
+    }
 
     if (failures == 0) {
         std::cout

@@ -13,7 +13,7 @@ namespace {
 using virtual_q8_test::Mutation;
 constexpr std::array mutations{Mutation::local_first,Mutation::cross_reverse,Mutation::local_reverse,
     Mutation::wrong_mapping,Mutation::descending_leaves,Mutation::negative_zero,
-    Mutation::first_product,Mutation::unfused};
+    Mutation::first_product,Mutation::unfused,Mutation::lane_accumulator};
 std::array<bool,mutations.size()> detected{};
 void require(bool value,const char* message) {if(!value) throw std::runtime_error(message);}
 void check(hipError_t value) {if(value!=hipSuccess) throw std::runtime_error(hipGetErrorString(value));}
@@ -42,18 +42,18 @@ struct Graph {
     hipGraph_t graph=nullptr;hipGraphExec_t executable=nullptr;hipKernelNodeParams params{};
     ~Graph() {if(executable) static_cast<void>(hipGraphExecDestroy(executable));if(graph) static_cast<void>(hipGraphDestroy(graph));}
 };
-void capture(Graph& graph,Stream& stream,bool candidate,const float* input,
+void capture(Graph& graph,Stream& stream,unsigned arm,const float* input,
     const strix::RuntimeTensorBinding& weights,unsigned width,unsigned rows,std::uint16_t* output) {
     strix::HipLaunchContext context{};context.stream=stream.stream;
     const strix::HipLaunchScope scope(context);
     check(hipStreamBeginCapture(stream.stream,hipStreamCaptureModeThreadLocal));
-    try {strix::launch_output_by_kind(strix::WeightKind::q8_0,input,weights,width,rows,output,candidate);}
+    try {strix::launch_output_by_kind(strix::WeightKind::q8_0,input,weights,width,rows,output,arm!=0U,arm==2U);}
     catch(...) {static_cast<void>(hipStreamEndCapture(stream.stream,&graph.graph));throw;}
     check(hipStreamEndCapture(stream.stream,&graph.graph));
     std::size_t count=0;check(hipGraphGetNodes(graph.graph,nullptr,&count));require(count==1,"projection receipt must contain exactly one kernel");
     hipGraphNode_t node=nullptr;check(hipGraphGetNodes(graph.graph,&node,&count));
     check(hipGraphKernelNodeGetParams(node,&graph.params));
-    require(graph.params.blockDim.x==(candidate?32U:256U) && graph.params.gridDim.x==rows,
+    require(graph.params.blockDim.x==(arm==1U?32U:256U) && graph.params.gridDim.x==(arm==2U?(rows+7U)/8U:rows),
         "kernel geometry must prove original256/candidate32 selection");
     // Deliberately overlaunch rows to exercise both uniform output bounds guards.
     auto extra=graph.params;extra.gridDim.x+=3U;
@@ -127,14 +127,44 @@ void run(unsigned width,unsigned rows,unsigned kind,bool cpu_only=false) {
             q[0].values[0]=64;q[negative/32].values[negative%32]=-128;q[small/32].values[small%32]=1;
         }
     }
-    const bool finite_oracle=kind<4 || kind>=8;
+    if(kind==16) {
+        std::fill(input.begin(),input.end(),0.0F);
+        input[0]=std::ldexp(1.0F,26);input[1]=-std::ldexp(1.0F,26);input[8]=1.0F;
+        for(auto& q:weights) {set_scale(q,0x3c00);std::fill(std::begin(q.values),std::end(q.values),1);}
+    }
+    // Actual-device comparison covers NaN coefficient decode and operand priority;
+    // the finite CPU oracle is deliberately not used for these payload cases.
+    if(kind>=17) {
+        std::fill(input.begin(),input.end(),1.0F);
+        for(auto& q:weights) {set_scale(q,0x3c00);std::fill(std::begin(q.values),std::end(q.values),1);}
+        if(kind==17 || kind==18) for(auto& q:weights) set_scale(q,kind==17?0x7e01U:0x7c01U);
+        if(kind==19) for(auto& q:weights) {set_scale(q,0x7c00U);std::fill(std::begin(q.values),std::end(q.values),0);}
+        if(kind==20) {
+            std::fill(input.begin(),input.end(),std::numeric_limits<float>::max());
+            for(auto& q:weights) {set_scale(q,0x7bffU);std::fill(std::begin(q.values),std::end(q.values),-128);}
+        }
+        if(kind==21) {
+            input[0]=std::bit_cast<float>(0xffc12345U);
+            for(unsigned row=0;row<rows;++row) set_scale(weights[static_cast<std::size_t>(row)*(width/32)],0x7e02U);
+        }
+        if(kind==22) {input[0]=std::bit_cast<float>(0xffc12345U);input[256]=std::bit_cast<float>(0x7fc54321U);}
+        if(kind>=23) {
+            const unsigned pair=(kind-23U)/2U;require(pair<8U,"invalid NaN tree witness");
+            const unsigned stride=128U>>pair;const bool swap=(kind&1U)==0U;
+            input[0]=std::bit_cast<float>(swap?0x7fc54321U:0xffc12345U);
+            input[stride]=std::bit_cast<float>(swap?0xffc12345U:0x7fc54321U);
+        }
+    }
+    const bool finite_oracle=kind<4 || (kind>=8 && kind<=16);
     std::vector<std::uint16_t> expected(rows);
     if(finite_oracle) for(unsigned row=0;row<rows;++row) {
         std::vector<float> decoded(width);
         for(unsigned i=0;i<width;++i) {const auto& q=weights[static_cast<std::size_t>(row)*(width/32)+i/32];decoded[i]=half_value(scale_bits(q))*static_cast<float>(q.values[i%32]);}
         const float value=virtual_q8_test::legacy_oracle(input,decoded);expected[row]=bf16(value);
-        for(std::size_t m=0;m<mutations.size();++m)
+        for(std::size_t m=0;rows<64U && m<mutations.size();++m)
             detected[m]=detected[m] || expected[row]!=bf16(virtual_q8_test::legacy_oracle(input,decoded,mutations[m]));
+        if(kind==16) require(expected[row]==0 && bf16(virtual_q8_test::legacy_oracle(input,decoded,Mutation::lane_accumulator))==0x3f80U,
+            "contiguous-eight one-accumulator mutant must differ after BF16");
         if(kind==10) {
             std::vector<float> premature(width),codes(width,127.0F);
             for(unsigned i=0;i<width;++i) {volatile float product=input[i]*half_value(0x0001);premature[i]=product;}
@@ -157,9 +187,10 @@ void run(unsigned width,unsigned rows,unsigned kind,bool cpu_only=false) {
     d_input.guard.run([&]{check(hipMemcpy(d_input.p,input.data(),input.size()*4,hipMemcpyHostToDevice));check(hipMemcpy(d_weights.p,weights.data(),weights.size()*sizeof(strix::Q8Block),hipMemcpyHostToDevice));});
     strix::RuntimeTensorBinding binding;binding.address=reinterpret_cast<std::uintptr_t>(d_weights.p);binding.bytes=weights.size()*sizeof(strix::Q8Block);
     auto* output=static_cast<std::uint16_t*>(d_output.p)+8;
-    Graph old_graph,new_graph;capture(old_graph,stream,false,static_cast<float*>(d_input.p),binding,width,rows,output);
-    capture(new_graph,stream,true,static_cast<float*>(d_input.p),binding,width,rows,output);
-    require(old_graph.params.func!=new_graph.params.func,"original and candidate must be distinct actual functions");
+    Graph old_graph,new_graph,wave_graph;capture(old_graph,stream,0,static_cast<float*>(d_input.p),binding,width,rows,output);
+    capture(new_graph,stream,1,static_cast<float*>(d_input.p),binding,width,rows,output);
+    capture(wave_graph,stream,2,static_cast<float*>(d_input.p),binding,width,rows,output);
+    require(wave_graph.params.func!=new_graph.params.func && old_graph.params.func!=new_graph.params.func,"original and candidate must be distinct actual functions");
     const auto observe=[&](Graph& graph,int poison,bool execute) {
         std::vector<std::uint16_t> values(rows+16);
         d_output.guard.run([&]{check(hipMemsetAsync(d_output.p,poison,values.size()*2,stream.stream));
@@ -173,8 +204,30 @@ void run(unsigned width,unsigned rows,unsigned kind,bool cpu_only=false) {
     };
     (void)observe(old_graph,0xa5,false);
     const auto old=observe(old_graph,0xa5,true),candidate=observe(new_graph,0x5a,true);
-    require(old==candidate,"candidate differs from actual original-kernel BF16 receipt");
+    if(kind<17) require(old==candidate,"virtual candidate differs from actual original-kernel BF16 receipt");
+    const auto exact_wave=[&](const std::vector<std::uint16_t>& actual,const char* phase,unsigned replay) {
+        for(std::size_t row=0;row<actual.size();++row) if(actual[row]!=candidate[row]) {
+            std::cerr<<"GDN_OUTPUT_BIT_MISMATCH width="<<width<<" rows="<<rows<<" case="<<kind
+                <<" phase="<<phase<<" replay="<<replay<<" row="<<row<<" virtual=0x"<<std::hex<<candidate[row]
+                <<" wave8=0x"<<actual[row]<<std::dec<<'\n';
+            throw std::runtime_error("wave8 output differs from actual virtual-output BF16 payload receipt");
+        }
+    };
+    for(unsigned replay=0;replay<3;++replay) exact_wave(observe(wave_graph,replay%2U?0xa5:0x5a,true),"graph",replay);
     if(finite_oracle) require(old==expected,"actual original kernel differs from independent256-leaf FP32 FMA/tree oracle");
+    for(unsigned replay=0;replay<3;++replay) {
+        std::vector<std::uint16_t> eager(rows+16U);
+        d_output.guard.run([&] {
+            check(hipMemsetAsync(d_output.p,0xa5,eager.size()*2U,stream.stream));
+            strix::HipLaunchContext context{};context.stream=stream.stream;
+            const strix::HipLaunchScope scope(context);
+            strix::launch_output_by_kind(strix::WeightKind::q8_0,static_cast<float*>(d_input.p),binding,width,rows,output,true,true);
+            check(hipMemcpyAsync(eager.data(),d_output.p,eager.size()*2U,hipMemcpyDeviceToHost,stream.stream));
+        });
+        require(std::all_of(eager.begin(),eager.begin()+8,[](auto v){return v==0xa5a5U;}) &&
+            std::all_of(eager.end()-8,eager.end(),[](auto v){return v==0xa5a5U;}),"eager wave8 output guards");
+        exact_wave(std::vector<std::uint16_t>(eager.begin()+8,eager.end()-8),"eager",replay);
+    }
     std::vector<float> retained(input.size());std::vector<strix::Q8Block> retained_weights(weights.size());
     d_input.guard.run([&]{check(hipMemcpy(retained.data(),d_input.p,retained.size()*4,hipMemcpyDeviceToHost));check(hipMemcpy(retained_weights.data(),d_weights.p,retained_weights.size()*sizeof(strix::Q8Block),hipMemcpyDeviceToHost));});
     require(std::memcmp(retained.data(),input.data(),input.size()*4)==0 && std::memcmp(retained_weights.data(),weights.data(),weights.size()*sizeof(strix::Q8Block))==0,"borrowed input/weight bytes mutated");
@@ -186,7 +239,32 @@ void run(unsigned width,unsigned rows,unsigned kind,bool cpu_only=false) {
         std::vector<std::uint16_t> preserved(rows+16);check(hipMemcpy(preserved.data(),d_output.p,preserved.size()*2,hipMemcpyDeviceToHost));
         require(std::all_of(preserved.begin(),preserved.end(),[](auto v){return v==0xa5a5U;}),"wrong format/alignment mutated output");
     }
-    std::cout<<"GDN_OUTPUT_RECEIPT width="<<width<<" rows="<<rows<<" case="<<kind<<" original_threads=256 candidate_threads=32 exact_bf16=true cpu_finite_oracle="<<finite_oracle<<'\n';
+    for(unsigned fault=0;fault<8;++fault) {
+        auto bad_binding=binding;auto* bad_input=static_cast<float*>(d_input.p);auto* bad_output=output;
+        auto bad_width=width;auto bad_rows=rows;bool virtual_enabled=true;
+        if(fault==0) virtual_enabled=false;
+        if(fault==1) bad_width=0;
+        if(fault==2) bad_rows=0;
+        if(fault==3) bad_width=10272;
+        if(fault==4) bad_binding.bytes-=1;
+        if(fault==5) bad_binding.address+=2;
+        if(fault==6) bad_input=reinterpret_cast<float*>(reinterpret_cast<std::uintptr_t>(bad_input)+4U);
+        if(fault==7) bad_output+=1;
+        check(hipMemset(d_output.p,0xa5,(rows+16U)*2U));
+        strix::HipLaunchContext context{};context.stream=stream.stream;Graph rejected_graph;bool rejected=false;
+        {
+            const strix::HipLaunchScope scope(context);
+            check(hipStreamBeginCapture(stream.stream,hipStreamCaptureModeThreadLocal));
+            try {strix::launch_output_by_kind(strix::WeightKind::q8_0,bad_input,bad_binding,bad_width,bad_rows,bad_output,virtual_enabled,true);}
+            catch(const std::invalid_argument&) {rejected=true;}
+            check(hipStreamEndCapture(stream.stream,&rejected_graph.graph));
+        }
+        std::size_t nodes=0;check(hipGraphGetNodes(rejected_graph.graph,nullptr,&nodes));
+        require(rejected && nodes==0,"wave8 malformed view must reject before enqueue");
+        std::vector<std::uint16_t> preserved(rows+16);check(hipMemcpy(preserved.data(),d_output.p,preserved.size()*2,hipMemcpyDeviceToHost));
+        require(std::all_of(preserved.begin(),preserved.end(),[](auto v){return v==0xa5a5U;}),"wave8 malformed view mutated output");
+    }
+    std::cout<<"GDN_OUTPUT_RECEIPT width="<<width<<" rows="<<rows<<" case="<<kind<<" original_threads=256 virtual_threads=32 wave8_threads=256 outputs_per_cta=8 virtual_wave8_exact_bf16=true cpu_finite_oracle="<<finite_oracle<<'\n';
 }
 }
 int main() try {
@@ -219,12 +297,48 @@ int main() try {
         catch(const std::invalid_argument& error) {rejected=std::string(error.what())=="HIP GDN selected kernel disagrees with virtual Q8 output configuration";}
         require(rejected && reverse_registry.find_kernel_launcher(changed.id)==nullptr,"output-off config must reject suffixed identity before registration");
     }
-    for(const unsigned width:{32U,96U,256U,288U,640U,6144U}) run(width,17,0);
+    for(unsigned input_mode=0;input_mode<3;++input_mode) {
+        strix::HipGdnLauncherConfig base;base.virtual_q8_output_projection=true;
+        base.virtual_q8_input_projections=input_mode!=0;base.prefetch_q8_input_projections=input_mode==2;
+        auto wave=base;wave.wave8_q8_output_projection=true;
+        strix::ExecutionBindingRequest request;request.wave8_q8_gdn_output=true;
+        strix::kernels::KernelRegistry registry;
+        strix::register_hip_gdn_kernel_variant(wave.model,request,wave,registry);
+        const auto variant=registry.variants().front();
+        require(variant.id.find(".wave8-q8-output-v1")!=std::string::npos &&
+            variant.id.ends_with(".virtual256.q8-output"),"wave8 output marker preserves terminal selector");
+        require(strix::make_hip_gdn_launcher(variant.id,&wave).implementation_identity!=
+            strix::make_hip_gdn_launcher("test.base",&base).implementation_identity,"wave8 output hash distinct");
+        strix::CompiledSerialExecution compiled;compiled.execution_identity=1;
+        strix::ExecutionStep step;step.id=1;step.op=strix::SerialOp::gated_delta_net;compiled.execution.steps.push_back(step);
+        strix::ExecutionKernelBinding binding;binding.step_id=1;binding.op=step.op;binding.kernel_id=variant.id;compiled.bindings.bindings.push_back(binding);
+        strix::HipGdnLauncherBundle bundle(wave);strix::ExecutionLauncherRegistry launchers;
+        bundle.register_for_compiled_execution(compiled,launchers);
+        require(launchers.find_kernel_launcher(variant.id)!=nullptr,"wave8 selected identity registers");
+        strix::HipGdnLauncherBundle wrong_bundle(base);strix::ExecutionLauncherRegistry wrong_launchers;bool wrong_rejected=false;
+        try {wrong_bundle.register_for_compiled_execution(compiled,wrong_launchers);}
+        catch(const std::invalid_argument&) {wrong_rejected=true;}
+        require(wrong_rejected && wrong_launchers.find_kernel_launcher(variant.id)==nullptr,"output-off rejects selected wave8 id atomically");
+        for(unsigned fault=0;fault<3;++fault) {
+            auto bad=wave;auto bad_request=request;
+            if(fault==0) bad.virtual_q8_output_projection=false;
+            if(fault==1) bad_request.wave8_q8_gdn_output=false;
+            if(fault==2) bad_request.require_graph_safe=true;
+            bool rejected=false;strix::kernels::KernelRegistry invalid;
+            try {strix::register_hip_gdn_kernel_variant(bad.model,bad_request,bad,invalid);}
+            catch(const std::invalid_argument&) {rejected=true;}
+            require(rejected && invalid.variants().empty(),"wave8 output invalid configuration registers nothing");
+        }
+    }
+    for(const unsigned width:{32U,96U,256U,288U,640U,6144U,10240U}) run(width,17,0);
     run(512,3,1);run(256,3,2);run(256,3,3);run(640,7,8);
     run(640,3,9);run(2560,3,10);run(2560,3,11);run(768,3,12);run(640,3,13);run(640,3,14);run(640,3,15);
+    run(256,3,16);
+    for(const unsigned rows:{1U,4U,7U,8U,9U,2560U,2563U}) run(6144,rows,0);
+    for(unsigned kind=17;kind<=38;++kind) run(640,9,kind);
     for(std::size_t m=0;m<detected.size();++m) {
         if(!detected[m]) throw std::runtime_error("fixture BF16-invisible mutant "+std::to_string(m));
     }
     for(unsigned mode=4;mode<=7;++mode) run(288,7,mode);
-    std::cout<<"GDN original/virtual output projection fixtures passed\n";return 0;
+    std::cout<<"GDN original/virtual/wave8 output projection fixtures passed\n";return 0;
 } catch(const std::exception& e) {std::cerr<<e.what()<<'\n';return 1;}

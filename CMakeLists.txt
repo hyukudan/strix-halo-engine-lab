@@ -1603,6 +1603,13 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         strix_target_warnings(strix-hip-gdn-output-projection-tests)
         add_test(NAME strix-hip-gdn-output-projection-tests COMMAND strix-hip-gdn-output-projection-tests)
 
+        add_executable(strix-hip-qsa-output-projection-tests tests/hip_qsa_output_projection_tests.hip)
+        target_compile_definitions(strix-hip-qsa-output-projection-tests PRIVATE STRIX_BUILD_QSA_OUTPUT_PROJECTION_DIAGNOSTIC=1)
+        target_link_libraries(strix-hip-qsa-output-projection-tests PRIVATE strix_hip_runtime)
+        set_target_properties(strix-hip-qsa-output-projection-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+        strix_target_warnings(strix-hip-qsa-output-projection-tests)
+        add_test(NAME strix-hip-qsa-output-projection-tests COMMAND strix-hip-qsa-output-projection-tests)
+
         add_executable(
             strix-hip-gdn-launcher-tests
             tests/hip_gdn_launcher_tests.hip
@@ -1685,6 +1692,14 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         foreach(tail_heads IN ITEMS 4 12)
             add_test(NAME strix-hip-gdn-wave8-q8-tail-${tail_heads}-tests
                 COMMAND strix-hip-gdn-launcher-tests 2560 wave8 ${tail_heads})
+        endforeach()
+        foreach(wave8_output_width IN ITEMS 128 288 480 640 2560)
+            add_test(NAME strix-hip-gdn-wave8-q8-output-${wave8_output_width}-tests
+                COMMAND strix-hip-gdn-launcher-tests ${wave8_output_width} wave8-output)
+        endforeach()
+        foreach(output_tail_heads IN ITEMS 4 12)
+            add_test(NAME strix-hip-gdn-wave8-q8-output-tail-${output_tail_heads}-tests
+                COMMAND strix-hip-gdn-launcher-tests 640 wave8-output ${output_tail_heads})
         endforeach()
         add_executable(strix-hip-gdn-lm-wave8-diagnostic-tests tests/hip_gdn_lm_wave8_diagnostic_tests.hip)
         add_executable(strix-hip-shared-expert-rows-diagnostic-tests tests/hip_shared_expert_rows_diagnostic_tests.hip)

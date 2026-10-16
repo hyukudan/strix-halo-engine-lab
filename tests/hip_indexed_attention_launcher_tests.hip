@@ -1097,6 +1097,101 @@ int main() try {
             for(unsigned mode=0;mode<2;++mode){
                 check(hipGraphExecDestroy(executables[mode]),"destroy QSA executable");
                 check(hipGraphDestroy(graphs[mode]),"destroy QSA graph");}
+
+            // Production output opt-in: independent of input prefetch, with
+            // the same real post-attention FP32 source and original Q8 rows.
+            // Restore all arena/state bytes and replay positions0..2 per arm.
+            const auto original_out = manifest.tensors[3];
+            const auto original_out_bytes = runtime.tensors[3].bytes;
+            std::vector<Q8Block> out_blocks(static_cast<std::size_t>(attention_width) * hidden_width / 32U);
+            for (unsigned edge = 0; edge < 3; ++edge) {
+                constexpr std::array<std::uint16_t,8> ordinary{0x0001,0x03ff,0x0400,0x2401,0x3c01,0x8000,0x8400,0xb801};
+                constexpr std::array<std::uint16_t,8> nonfinite{0x7e01,0x7c01,0xfe23,0x7c00,0xfc00,0,0x8000,0x3c00};
+                for (std::size_t b = 0; b < out_blocks.size(); ++b) {
+                    out_blocks[b].scale = edge == 2 ? nonfinite[b % nonfinite.size()] :
+                        edge == 1 ? ordinary[b % ordinary.size()] : 0x2400U;
+                    for (unsigned f = 0; f < 32; ++f)
+                        out_blocks[b].values[f] = static_cast<std::int8_t>(
+                            static_cast<int>((b * 11U + f * 7U) % 256U) - 128);
+                }
+                manifest.tensors[3].ggml_type = 8;
+                manifest.tensors[3].byte_size = out_blocks.size() * sizeof(Q8Block);
+                runtime.tensors[3].bytes = manifest.tensors[3].byte_size;
+                check(hipMemcpy(device_weights[3],out_blocks.data(),manifest.tensors[3].byte_size,
+                    hipMemcpyHostToDevice),"set production QSA output Q8 edges");
+                manifest.layout_identity=strix::model_manifest_layout_identity(manifest);
+                runtime.manifest_layout_identity=manifest.layout_identity;
+                access.manifest_layout_identity=manifest.layout_identity;
+                for (unsigned input_prefetch = 0; input_prefetch < 2; ++input_prefetch) {
+                    auto old_output = config;
+                    old_output.prefetch_q8_input = input_prefetch != 0;
+                    if (input_prefetch) old_output.prefetch_eligible_layers = {layer};
+                    auto new_output = old_output; new_output.wave8_q8_output = true;
+                    strix::ExecutionBindingRequest selected;
+                    selected.minimum_qualification = strix::kernels::QualificationStatus::experimental;
+                    selected.prefetch_q8_qsa_input = old_output.prefetch_q8_input;
+                    selected.qsa_input_prefetch_layers = old_output.prefetch_eligible_layers;
+                    strix::kernels::KernelRegistry old_registry,new_registry;
+                    strix::register_hip_indexed_attention_kernel_variant(model,selected,old_output,old_registry);
+                    selected.wave8_q8_qsa_output = true;
+                    strix::register_hip_indexed_attention_kernel_variant(model,selected,new_output,new_registry);
+                    const auto old_variant = old_registry.variants().front();
+                    const auto new_variant = new_registry.variants().front();
+                    expect(old_variant.id != new_variant.id && old_variant.compiler_identity != new_variant.compiler_identity,
+                        "output opt-in changes selected kernel/compiler identities");
+                    auto old_production = strix::make_hip_indexed_attention_launcher(old_variant.id,&old_output);
+                    auto new_production = strix::make_hip_indexed_attention_launcher(new_variant.id,&new_output);
+                    expect(old_production.implementation_identity != new_production.implementation_identity,
+                        "output opt-in changes actual launcher identity");
+                    for (unsigned repeat = 0; repeat < 3; ++repeat) {
+                        std::array<std::vector<std::byte>,3> expected_arena, expected_persistent;
+                        for (unsigned arm = 0; arm < 2; ++arm) {
+                            check(hipMemset(arena_pointer,0xa5,arena.total_bytes),"reset complete QSA arena");
+                            reset(repeat);
+                            scope.graph_capture = false;
+                            for (unsigned position = 0; position < 3; ++position) {
+                                context.position = position;
+                                auto& production = arm ? new_production : old_production;
+                                { const strix::HipLaunchScope owned(scope); production.function(context,production.user_data); }
+                                check(hipStreamSynchronize(stream),"finish production QSA output comparison");
+                                auto actual_arena=read_bytes(scratch.arena_base,scratch.arena_bytes);
+                                auto actual_persistent=read_bytes(state_memory.device_base,state_memory.device_bytes);
+                                if (!arm) {
+                                    expected_arena[position]=std::move(actual_arena);
+                                    expected_persistent[position]=std::move(actual_persistent);
+                                } else expect(actual_arena == expected_arena[position] &&
+                                    actual_persistent == expected_persistent[position],
+                                    "production output wave8/input modes preserve full arena and KV/raw bits");
+                            }
+                        }
+                    }
+                    // Both a marked scope and an actual stream capture with an
+                    // eager scope must reject before any production kernel.
+                    for (const bool marked : {false,true}) {
+                        reset(0); context.position=0; scope.graph_capture=marked;
+                        const auto before_arena=read_bytes(scratch.arena_base,scratch.arena_bytes);
+                        const auto before_state=read_bytes(state_memory.device_base,state_memory.device_bytes);
+                        hipGraph_t rejected_graph=nullptr; bool rejected=false;
+                        check(hipStreamBeginCapture(stream,hipStreamCaptureModeThreadLocal),"capture output admission rejection");
+                        try { const strix::HipLaunchScope owned(scope); new_production.function(context,new_production.user_data); }
+                        catch (const std::invalid_argument& error) {
+                            rejected=std::string(error.what())=="wave8 QSA output supports eager execution only";
+                        }
+                        check(hipStreamEndCapture(stream,&rejected_graph),"end output admission rejection");
+                        std::size_t nodes=1;check(hipGraphGetNodes(rejected_graph,nullptr,&nodes),"output rejection graph nodes");
+                        expect(rejected && nodes==0 && before_arena==read_bytes(scratch.arena_base,scratch.arena_bytes) &&
+                            before_state==read_bytes(state_memory.device_base,state_memory.device_bytes),
+                            "output capture admission rejects without enqueue or owner mutation");
+                        check(hipGraphDestroy(rejected_graph),"destroy output rejection graph");
+                    }
+                    scope.graph_capture=false;
+                }
+            }
+            manifest.tensors[3]=original_out;runtime.tensors[3].bytes=original_out_bytes;
+            check(hipMemcpy(device_weights[3],o.data(),o.size()*sizeof(float),hipMemcpyHostToDevice),
+                "restore original QSA output weights");
+            manifest.layout_identity=strix::model_manifest_layout_identity(manifest);
+            runtime.manifest_layout_identity=manifest.layout_identity;access.manifest_layout_identity=manifest.layout_identity;
         }
         check(hipFree(arguments),"free QSA comparison arguments");
         check(hipFree(status),"free QSA comparison status");

@@ -28,7 +28,8 @@ std::uint32_t checked_u32(
 
 
 HipGdnLauncherConfig gdn_config(const ModelContract& model,
-    HipActivationStorage activation, bool graph, bool virtual_q8, bool prefetch_q8, bool virtual_output, bool wave8) {
+    HipActivationStorage activation, bool graph, bool virtual_q8, bool prefetch_q8, bool virtual_output,
+    bool wave8, bool wave8_output) {
     HipGdnLauncherConfig config;
     config.model = model;
     config.activation = activation;
@@ -37,13 +38,16 @@ HipGdnLauncherConfig gdn_config(const ModelContract& model,
     config.prefetch_q8_input_projections = prefetch_q8;
     config.wave8_q8_input_projections = wave8;
     config.virtual_q8_output_projection = virtual_output;
+    config.wave8_q8_output_projection = wave8_output;
     return config;
 }
 
 HipIndexedAttentionLauncherConfig
 indexed_attention_config(
     const ModelContract& model,
-    HipActivationStorage activation, bool graph = false, bool prefetch = false, std::vector<std::uint32_t> layers = {}, std::shared_ptr<qsa_input_prefetch::RuntimeDispatchStats> stats = {}) {
+    HipActivationStorage activation, bool graph = false, bool prefetch = false,
+    std::vector<std::uint32_t> layers = {}, std::shared_ptr<qsa_input_prefetch::RuntimeDispatchStats> stats = {},
+    bool wave8_output = false) {
     HipIndexedAttentionLauncherConfig config;
     config.model = model;
     config.activation = activation;
@@ -51,6 +55,7 @@ indexed_attention_config(
     config.prefetch_q8_input = prefetch;
     config.prefetch_eligible_layers=std::move(layers);
     config.prefetch_stats=std::move(stats);
+    config.wave8_q8_output = wave8_output;
     return config;
 }
 
@@ -258,9 +263,14 @@ void register_complete_hip_kernel_catalog(
     }
     if (config.prefetch_q8_lm_head != request.prefetch_q8_lm_head ||
         config.wave8_q8_lm_head != request.wave8_q8_lm_head ||
-        config.wave8_q8_gdn_input != request.wave8_q8_gdn_input)
+        config.wave8_q8_gdn_input != request.wave8_q8_gdn_input ||
+        config.wave8_q8_gdn_output != request.wave8_q8_gdn_output ||
+        config.wave8_q8_qsa_output != request.wave8_q8_qsa_output)
         throw std::invalid_argument("HIP catalog Q8 organization differs from binding request");
-    if ((config.prefetch_q8_lm_head || config.wave8_q8_lm_head || config.wave8_q8_gdn_input) &&
+    if (config.wave8_q8_gdn_output && !config.virtual_q8_gdn_output)
+        throw std::invalid_argument("HIP catalog wave8 GDN output requires virtual Q8 output");
+    if ((config.prefetch_q8_lm_head || config.wave8_q8_lm_head || config.wave8_q8_gdn_input ||
+         config.wave8_q8_gdn_output || config.wave8_q8_qsa_output) &&
         (config.enable_device_graph_inputs || request.device_graph_inputs || request.require_graph_safe || alternate_lm_head))
         throw std::invalid_argument("HIP catalog Q8 organizations support eager floating execution only");
     if (config.wave_moe_router_topk != request.wave_moe_router_topk ||
@@ -331,7 +341,7 @@ void register_complete_hip_kernel_catalog(
         qualification);
 
     const auto gdn = gdn_config(model, config.activation,
-        config.enable_device_graph_inputs, config.virtual_q8_gdn_input, config.prefetch_q8_gdn_input, config.virtual_q8_gdn_output, config.wave8_q8_gdn_input);
+        config.enable_device_graph_inputs, config.virtual_q8_gdn_input, config.prefetch_q8_gdn_input, config.virtual_q8_gdn_output, config.wave8_q8_gdn_input, config.wave8_q8_gdn_output);
     register_hip_gdn_kernel_variant(
         model,
         request,
@@ -342,7 +352,7 @@ void register_complete_hip_kernel_catalog(
     const auto indexed =
         indexed_attention_config(
             model,
-            config.activation, config.enable_device_graph_inputs, config.prefetch_q8_qsa_input, config.qsa_input_prefetch_layers, config.qsa_input_prefetch_stats);
+            config.activation, config.enable_device_graph_inputs, config.prefetch_q8_qsa_input, config.qsa_input_prefetch_layers, config.qsa_input_prefetch_stats, config.wave8_q8_qsa_output);
     if(config.prefetch_q8_qsa_input){auto base=indexed;base.prefetch_q8_input=false;base.prefetch_eligible_layers.clear();auto base_request=request;base_request.prefetch_q8_qsa_input=false;base_request.qsa_input_prefetch_layers.clear();register_hip_indexed_attention_kernel_variant(model,base_request,base,registry,qualification);}
     register_hip_indexed_attention_kernel_variant(
         model,
@@ -438,11 +448,11 @@ HipLauncherCatalog::HipLauncherCatalog(
               config.activation, config.enable_device_graph_inputs)),
       gdn_(
           gdn_config(model, config.activation,
-              config.enable_device_graph_inputs, config.virtual_q8_gdn_input, config.prefetch_q8_gdn_input, config.virtual_q8_gdn_output, config.wave8_q8_gdn_input)),
+              config.enable_device_graph_inputs, config.virtual_q8_gdn_input, config.prefetch_q8_gdn_input, config.virtual_q8_gdn_output, config.wave8_q8_gdn_input, config.wave8_q8_gdn_output)),
       indexed_attention_(
           indexed_attention_config(
               model,
-              config.activation, config.enable_device_graph_inputs, config.prefetch_q8_qsa_input, config.qsa_input_prefetch_layers, config.qsa_input_prefetch_stats)),
+              config.activation, config.enable_device_graph_inputs, config.prefetch_q8_qsa_input, config.qsa_input_prefetch_layers, config.qsa_input_prefetch_stats, config.wave8_q8_qsa_output)),
       embedding_(
           embedding_config(
               model,
@@ -469,7 +479,8 @@ HipLauncherCatalog::HipLauncherCatalog(
               model,
               config.activation,config.prefetch_q8_shared_expert,config.shared_expert_prefetch_layers,
               config.shared_expert_prefetch_stats)) {
-    if ((config.prefetch_q8_lm_head || config.wave8_q8_lm_head || config.wave8_q8_gdn_input) &&
+    if ((config.prefetch_q8_lm_head || config.wave8_q8_lm_head || config.wave8_q8_gdn_input ||
+         config.wave8_q8_gdn_output || config.wave8_q8_qsa_output) &&
         (config.enable_device_graph_inputs || alternate_lm_head_))
         throw std::invalid_argument("HIP catalog Q8 organizations support eager floating execution only");
     if (alternate_lm_head_ && config.virtual_q8_lm_head)

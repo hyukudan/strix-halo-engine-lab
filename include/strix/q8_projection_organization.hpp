@@ -10,6 +10,8 @@ namespace strix::q8_projection_organization {
 inline constexpr std::string_view gdn_wave8_marker = ".wave8-input-v1";
 inline constexpr std::string_view lm_prefetch_marker = ".prefetch8-load-v1";
 inline constexpr std::string_view lm_wave8_marker = ".prefetch8-wave8-v1";
+inline constexpr std::string_view gdn_output_wave8_marker = ".wave8-q8-output-v1";
+inline constexpr std::string_view qsa_output_wave8_marker = ".wave8-q8-qsa-output-v1";
 
 // Bounded BF16/Q8_0 overlays. These contracts do not establish native fidelity
 // or performance qualification. The incumbent paths do not call these guards.
@@ -48,6 +50,26 @@ inline void validate_views(std::uint32_t width, std::uint32_t outputs,
     };
     if (overlap(output, input) || overlap(output, weights))
         throw std::invalid_argument("Q8 projection organization output aliases a read-only view");
+}
+
+// Separate byte contract for internal FP32 activations and BF16 output.
+// The BF16-input/FP32-output contract above remains unchanged.
+inline void validate_fp32_bf16_views(std::uint32_t width, std::uint32_t outputs,
+                                     View input, View weights, View output) {
+    validate_geometry(width, outputs);
+    const auto check = [](View view, std::uint64_t required) {
+        if (!view.address || view.address % 16U || view.bytes < required ||
+            view.bytes > std::numeric_limits<std::uintptr_t>::max() - view.address)
+            throw std::invalid_argument("Q8 FP32 output projection view has invalid alignment or extent");
+    };
+    check(input, static_cast<std::uint64_t>(width) * 4U);
+    check(weights, static_cast<std::uint64_t>(width / 32U) * 34U * outputs);
+    check(output, static_cast<std::uint64_t>(outputs) * 2U);
+    const auto overlap = [](View a, View b) {
+        return a.address < b.address + b.bytes && b.address < a.address + a.bytes;
+    };
+    if (overlap(output, input) || overlap(output, weights))
+        throw std::invalid_argument("Q8 FP32 output projection aliases a read-only view");
 }
 
 } // namespace strix::q8_projection_organization

@@ -122,6 +122,8 @@ struct Options {
     bool prefetch_q8_lm_head = false;
     bool wave8_q8_lm_head = false;
     bool wave8_q8_gdn_input = false;
+    bool wave8_q8_gdn_output = false;
+    bool wave8_q8_qsa_output = false;
     bool parallel_moe_router = false;
     bool virtual_q8_gdn_input = false;
     bool ranked_moe_router_topk = false;
@@ -176,6 +178,8 @@ inline void validate_resolved_prefix_roundtrip(const Options& options) {
 // New organizations overlay the resolved base; the base's qualification does
 // not qualify the overlay. Manual/fallback modes must supply prerequisites.
 inline void validate_resolved_q8_projection_organization(const Options& options) {
+    if (options.wave8_q8_gdn_output && !options.virtual_q8_gdn_output)
+        throw std::invalid_argument("wave8 Q8 GDN output requires virtual Q8 GDN output");
     if (options.prefetch_q8_lm_head && !options.virtual_q8_lm_head)
         throw std::invalid_argument("prefetch Q8 LM head requires resolved virtual Q8 LM head");
     if (options.wave8_q8_lm_head && !options.prefetch_q8_lm_head)
@@ -212,9 +216,14 @@ inline Options parse_options(
             argv[index];
         options.any_low_level_flag = options.any_low_level_flag ||
             is_low_level_optimization_option(argument);
-        if (argument == "--prefetch-q8-lm-head" || argument == "--wave8-q8-lm-head" || argument == "--wave8-q8-gdn-input") {
+        if (argument == "--prefetch-q8-lm-head" || argument == "--wave8-q8-lm-head" ||
+            argument == "--wave8-q8-gdn-input" || argument == "--wave8-q8-gdn-output" ||
+            argument == "--wave8-q8-qsa-output") {
             auto& enabled = argument == "--prefetch-q8-lm-head" ? options.prefetch_q8_lm_head
-                : argument == "--wave8-q8-lm-head" ? options.wave8_q8_lm_head : options.wave8_q8_gdn_input;
+                : argument == "--wave8-q8-lm-head" ? options.wave8_q8_lm_head
+                : argument == "--wave8-q8-gdn-input" ? options.wave8_q8_gdn_input
+                : argument == "--wave8-q8-gdn-output" ? options.wave8_q8_gdn_output
+                : options.wave8_q8_qsa_output;
             if (enabled) throw std::invalid_argument("duplicate Q8 projection organization option");
             enabled = true;
             continue;
@@ -611,7 +620,8 @@ inline Options parse_options(
             throw std::invalid_argument("final state validation requires eager generation without RAW, reference, roundtrip or integer head");
         strix::validate_final_generation_state_destination(options.validation_final_state_path);
     }
-    if ((options.prefetch_q8_lm_head || options.wave8_q8_lm_head || options.wave8_q8_gdn_input) &&
+    if ((options.prefetch_q8_lm_head || options.wave8_q8_lm_head || options.wave8_q8_gdn_input ||
+         options.wave8_q8_gdn_output || options.wave8_q8_qsa_output) &&
         (options.execution.mode != strix::DecodeExecutionMode::eager ||
          options.execution.integer_head != strix::DecodeIntegerHead::none))
         throw std::invalid_argument("Q8 projection organizations require eager execution without integer head");

@@ -21,6 +21,8 @@ struct HipGdnLauncherConfig {
     // Explicit eager geometry overlay; requires the two input options above.
     bool wave8_q8_input_projections = false;
     bool virtual_q8_output_projection = false;
+    // Explicit eager FP32 output organization; requires virtual Q8 output.
+    bool wave8_q8_output_projection = false;
 };
 
 void register_hip_gdn_kernel_variant(

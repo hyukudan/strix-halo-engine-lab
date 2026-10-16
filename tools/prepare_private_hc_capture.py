@@ -54,7 +54,8 @@ def render(source,output,reference,golden,commit,archive_sha,model_sha):
         !options.parallel_moe_router||!options.virtual_q8_lm_head||!options.virtual_q8_gdn_input||
         !options.prefetch_q8_gdn_input||!options.virtual_q8_gdn_output||!options.q4k_a8g32_gate_up||
         !options.grouped_exact_q51_down||options.planned_ple_io||
-        options.prefetch_q8_lm_head||options.wave8_q8_lm_head||options.wave8_q8_gdn_input)
+        options.prefetch_q8_lm_head||options.wave8_q8_lm_head||options.wave8_q8_gdn_input||
+        options.wave8_q8_gdn_output||options.wave8_q8_qsa_output)
         throw std::invalid_argument("private HC capture requires qualified all5 eager registered43/20");
     strix::DirectLaunchDispatcher native_capture_delegate(launch_plan);
     strix::private_hc_capture::Dispatcher dispatcher(native_capture_delegate,CONFIG,
