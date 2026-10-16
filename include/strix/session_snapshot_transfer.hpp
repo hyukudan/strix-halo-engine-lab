@@ -7,6 +7,7 @@
 #include "strix/session_state_memory.hpp"
 
 #include <cstdint>
+#include <span>
 
 namespace strix {
 
@@ -22,9 +23,24 @@ struct SessionSnapshotMemoryBinding {
     std::uint64_t allocation_generation = 0;
 };
 
+struct SessionSnapshotTransfer {
+    SessionStateStorage storage;
+    std::uintptr_t source;
+    std::uintptr_t destination;
+    std::uint64_t bytes;
+};
+
 class SessionSnapshotTransferBackend {
 public:
     virtual ~SessionSnapshotTransferBackend() = default;
+
+    // Every range is resolved and admitted before either batch method is called.
+    // A batch override may enqueue copies together, but MUST complete/drain all
+    // submitted work before returning OR throwing: payload owners may unwind
+    // immediately afterward. Restore metadata is published only after return.
+    // Defaults preserve the individual synchronous backend contract.
+    virtual void capture_batch(std::span<const SessionSnapshotTransfer> transfers);
+    virtual void restore_batch(std::span<const SessionSnapshotTransfer> transfers);
 
     virtual void capture_device(
         std::uintptr_t source_device,

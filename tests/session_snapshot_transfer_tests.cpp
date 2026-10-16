@@ -20,7 +20,7 @@ void expect(bool condition, const char* message) {
     }
 }
 
-class MemcpyBackend final
+class MemcpyBackend
     : public strix::SessionSnapshotTransferBackend {
 public:
     int fail_after = -1;
@@ -73,6 +73,31 @@ private:
                 source),
             static_cast<std::size_t>(
                 bytes));
+    }
+};
+
+// A batch backend observes completion before the caller is allowed to
+// publish restore metadata; a completion error is as destructive as a copy error.
+class BatchBackend final : public MemcpyBackend {
+public:
+    strix::SerialSessionContext* session = nullptr;
+    std::uint64_t expected_position = 0;
+    bool completion_failure = false;
+    unsigned captures = 0, restores = 0;
+    std::size_t ranges = 0;
+    void capture_batch(std::span<const strix::SessionSnapshotTransfer> transfers) override {
+        ++captures; ranges=transfers.size();
+        strix::SessionSnapshotTransferBackend::capture_batch(transfers);
+        if(completion_failure) throw std::runtime_error("injected capture completion failure");
+    }
+    void restore_batch(std::span<const strix::SessionSnapshotTransfer> transfers) override {
+        ++restores; ranges=transfers.size();
+        expect(session && session->next_position==expected_position,
+            "restore metadata remains at original frontier before batch completion");
+        strix::SessionSnapshotTransferBackend::restore_batch(transfers);
+        expect(session && session->next_position==expected_position,
+            "restore metadata is not published after individual copies");
+        if(completion_failure) throw std::runtime_error("injected restore completion failure");
     }
 };
 
@@ -395,6 +420,37 @@ int main() {
                    strix::SerialSessionHealth::poisoned && session.arithmetic_lineage.tainted &&
                    failing.calls == 2,
            "partial restore failure leaves session poisoned");
+
+    {
+        BatchBackend batched;
+        batched.session=&session; batched.expected_position=3;
+        strix::capture_serial_session_snapshot(snapshot,layout,state_memory,snapshot_memory,batched);
+        expect(batched.captures==1 && batched.ranges==snapshot.ranges.size(),
+            "snapshot invokes one complete admitted capture batch");
+        session.next_position=3; session.committed_tokens=3;
+        session.health=strix::SerialSessionHealth::ready;
+        strix::restore_serial_session_snapshot(session,restore,layout,state_memory,snapshot_memory,batched);
+        expect(batched.restores==1 && batched.ranges==restore.ranges.size() &&
+            session.next_position==restore.next_position && session.committed_tokens==restore.committed_tokens &&
+            session.health==strix::SerialSessionHealth::ready,
+            "all ranges complete in one batch before restore frontier publication");
+        // The backend may fail its single final fence after ALL copies submitted.
+        session.next_position=3; session.committed_tokens=3;
+        batched.completion_failure=true;
+        bool rejected=false;
+        try {strix::restore_serial_session_snapshot(session,restore,layout,state_memory,snapshot_memory,batched);}
+        catch(const std::runtime_error&) {rejected=true;}
+        expect(rejected && session.health==strix::SerialSessionHealth::poisoned &&
+            session.arithmetic_lineage.tainted && session.next_position==3 && session.committed_tokens==3,
+            "batch completion failure poisons without publishing saved metadata");
+        auto malformed=restore; ++malformed.ranges.back().destination_offset;
+        const auto submitted=batched.restores;
+        rejected=false;
+        try {strix::restore_serial_session_snapshot(session,malformed,layout,state_memory,snapshot_memory,batched);}
+        catch(const std::invalid_argument&) {rejected=true;}
+        expect(rejected && batched.restores==submitted,
+            "invalid last range is rejected before entering a batched backend");
+    }
 
     if (failures == 0) {
         std::cout << "session snapshot transfer tests passed\n";

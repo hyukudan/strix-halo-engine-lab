@@ -8,13 +8,6 @@
 namespace strix {
 namespace {
 
-struct ResolvedSnapshotTransfer {
-    SessionStateStorage storage;
-    std::uintptr_t source;
-    std::uintptr_t destination;
-    std::uint64_t bytes;
-};
-
 void validate_transfer_extent(std::uintptr_t address, std::uint64_t bytes) {
     if (bytes && (!address || bytes > std::numeric_limits<std::uintptr_t>::max() - address))
         throw std::invalid_argument("snapshot transfer address extent is null or overflows");
@@ -93,6 +86,24 @@ std::uintptr_t section_address(
 
 }  // namespace
 
+void SessionSnapshotTransferBackend::capture_batch(std::span<const SessionSnapshotTransfer> transfers) {
+    for (const auto& transfer : transfers) {
+        validate_storage(transfer.storage);
+        if (transfer.storage == SessionStateStorage::device)
+            capture_device(transfer.source, transfer.destination, transfer.bytes);
+        else capture_host(transfer.source, transfer.destination, transfer.bytes);
+    }
+}
+
+void SessionSnapshotTransferBackend::restore_batch(std::span<const SessionSnapshotTransfer> transfers) {
+    for (const auto& transfer : transfers) {
+        validate_storage(transfer.storage);
+        if (transfer.storage == SessionStateStorage::device)
+            restore_device(transfer.source, transfer.destination, transfer.bytes);
+        else restore_host(transfer.source, transfer.destination, transfer.bytes);
+    }
+}
+
 void validate_snapshot_memory_binding(
     const SerialSessionSnapshotPlan& snapshot,
     const SessionSnapshotMemoryBinding& memory) {
@@ -141,7 +152,7 @@ void capture_serial_session_snapshot(
     // Resolve and validate every range before exposing either owner to a
     // potentially asynchronous backend. Allocation/validation exceptions here
     // cannot leave an earlier copy pending.
-    std::vector<ResolvedSnapshotTransfer> transfers;
+    std::vector<SessionSnapshotTransfer> transfers;
     transfers.reserve(snapshot.ranges.size());
     for (const auto& range :
          snapshot.ranges) {
@@ -192,20 +203,7 @@ void capture_serial_session_snapshot(
         transfers.push_back({range.storage, source.address, destination, range.bytes});
     }
 
-    for (const auto& transfer : transfers) {
-        if (transfer.storage ==
-            SessionStateStorage::device) {
-            backend.capture_device(
-                transfer.source,
-                transfer.destination,
-                transfer.bytes);
-        } else {
-            backend.capture_host(
-                transfer.source,
-                transfer.destination,
-                transfer.bytes);
-        }
-    }
+    backend.capture_batch(transfers);
 }
 
 void restore_serial_session_snapshot(
@@ -248,7 +246,7 @@ void restore_serial_session_snapshot(
     validate_section(snapshot_memory.host_section_base,
         snapshot_memory.host_section_bytes, restore.snapshot_host_bytes, "host");
 
-    std::vector<ResolvedSnapshotTransfer> transfers;
+    std::vector<SessionSnapshotTransfer> transfers;
     transfers.reserve(restore.ranges.size());
     for (const auto& range : restore.ranges) {
         validate_storage(range.storage);
@@ -276,20 +274,7 @@ void restore_serial_session_snapshot(
     }
 
     try {
-        for (const auto& transfer : transfers) {
-            if (transfer.storage ==
-                SessionStateStorage::device) {
-                backend.restore_device(
-                    transfer.source,
-                    transfer.destination,
-                    transfer.bytes);
-            } else {
-                backend.restore_host(
-                    transfer.source,
-                    transfer.destination,
-                    transfer.bytes);
-            }
-        }
+        backend.restore_batch(transfers);
     } catch (...) {
         session.health =
             SerialSessionHealth::poisoned;
