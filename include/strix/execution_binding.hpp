@@ -27,6 +27,7 @@ struct ExecutionBindingRequest {
     bool wave8_q8_gdn_output = false;
     bool wave8_q8_qsa_output = false;
     bool parallel_moe_router = false;
+    bool staged_moe_router_logits = false;
     bool ranked_moe_router_topk = false;
     bool wave_moe_router_topk = false;
     bool prefetch_q8_qsa_input = false;

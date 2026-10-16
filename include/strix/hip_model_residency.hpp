@@ -48,7 +48,10 @@ struct HipModelResidencyReservation {
     std::uint64_t registered_alias_bytes = 0;
     std::uint64_t copied_reserved_bytes = 0;
     std::uint64_t retained_reserved_bytes = 0;
+    // Setup peak includes the expert-only temporary pinned copy lease; it is
+    // retired before consumer bindings are published and is not retained backing.
     std::uint64_t setup_peak_reserved_bytes = 0;
+    std::uint64_t setup_staging_reserved_bytes = 0;
     std::uint64_t copy_payload_bytes = 0, copy_tensor_count = 0, copy_range_count = 0;
 };
 [[nodiscard]] HipModelResidencyReservation plan_hip_model_residency_reservation(

@@ -1,6 +1,8 @@
 #include "../apps/hip_decode_options.hpp"
 #include <iostream>
 #include <array>
+#include <string>
+#include <vector>
 using namespace strix;
 using namespace strix::decode_cli;
 namespace {
@@ -24,7 +26,121 @@ template<class Function> void rejects(Function operation, std::string_view messa
     }
 }
 }
+#ifdef STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME
+
+void transposed_island_cli_contract(){
+    using namespace strix;
+    using namespace strix::decode_cli;
+    const auto expect_case=[](bool ok,const char* message){expect(ok,message);};
+    const auto parse_args=[](std::vector<std::string> args){
+        std::vector<char*> argv;for(auto& value:args)argv.push_back(value.data());
+        return parse_options(static_cast<int>(argv.size()),argv.data());
+    };
+    const auto reject_args=[&](const std::vector<std::string>& args,const char* message){
+        bool failed=false;try{(void)parse_args(args);}catch(const std::invalid_argument&){failed=true;}
+        expect_case(failed,message);
+    };
+    const auto set_arg=[](std::vector<std::string>& args,const std::string& key,const std::string& value){
+        for(std::size_t i=0;i+1U<args.size();++i)if(args[i]==key){args[i+1U]=value;return;}
+        throw std::logic_error("transposed fixture key absent");
+    };
+    const auto remove_arg=[](std::vector<std::string>& args,const std::string& key){
+        for(auto it=args.begin();it!=args.end();++it)if(*it==key){
+            const auto end=it+1!=args.end() && !(it+1)->starts_with("--") ? it+2 : it+1;
+            args.erase(it,end);return;
+        }
+        throw std::logic_error("transposed fixture option absent");
+    };
+
+    const auto flags=[] {
+        return std::vector<std::string>{"decoder","target.gguf","1","--context","8192","--generate","20",
+            "--optimization-profile","manual",
+            "--gdn-recurrent-layout","transposed","--gdn-islands",
+            "--parallel-hyper-mix","--staged-hyper-projections","--fused-staged-hyper-mix",
+            "--typed-fused-hyper-projections","--prefetch-typed-hyper-rows","--prefetch-q8-hyper-output",
+            "--lane-chain-hyper-output","--virtual-q8-lm-head","--prefetch-q8-lm-head","--wave8-q8-lm-head",
+            "--parallel-moe-router","--wave-moe-router-topk","--q4k-a8g32-gate-up","--grouped-exact-q51-down",
+            "--q51-slot-parallel-down","--batched-moe-activation","--deferred-moe-status",
+            "--virtual-q8-gdn-input","--prefetch-q8-gdn-input","--virtual-q8-gdn-output",
+            "--wave8-q8-gdn-input","--wave8-q8-gdn-output","--prefetch-q8-qsa-input","--wave8-q8-qsa-output",
+            "--prefetch-q8-shared-expert","--prepared-eager","--moe-shared-overlap"};
+    };
+    const auto model=ModelContract::qwen38_flash_next(); gguf::FileInfo info;
+    ModelManifest manifest;manifest.architecture="qwen3next";
+    manifest.layout_identity=model_manifest_layout_identity(manifest);
+    const auto resolve=[&](Options& o){
+        validate_resolved_gdn_recurrent_layout(o);validate_resolved_gdn_islands(o);
+        auto result=resolve_optimization_profile(o,model,info,manifest,validated_model_content_identity,true);
+        apply_numerical_profile(o,model,manifest,validated_model_content_identity,true,result);
+        return result;
+    };
+    for(const auto* profile:{"hc-splitk-f32+q51-q80-a8-down-v1",
+            "hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup-v1"}){
+        auto args=flags();args.insert(args.end(),{"--numerical-profile",profile});
+        auto o=parse_args(args);const auto result=resolve(o);
+        expect_case(!result.automatic_applied && result.requested=="manual" &&
+            o.gdn_recurrent_layout==HipGdnRecurrentLayout::transposed && o.gdn_islands &&
+            result.selected.find(profile)!=std::string::npos,
+            "explicit manual transposed islands compose only through the complete selected numerical recipe");
+        auto missing=args;remove_arg(missing,"--wave8-q8-lm-head");
+        bool rejected=false;try{auto incomplete=parse_args(missing);(void)resolve(incomplete);}
+        catch(const std::invalid_argument&){rejected=true;}
+        expect_case(rejected,"numerical composition cannot invent absent manual full-organization flags");
+        auto automatic=args;set_arg(automatic,"--optimization-profile","auto");
+        reject_args(automatic,"numerical transposed islands cannot enter automatic organization");
+        auto wrong_layout=args;set_arg(wrong_layout,"--gdn-recurrent-layout","stride33");
+        reject_args(wrong_layout,"numerical composition does not admit stride33");
+        auto no_islands=args;remove_arg(no_islands,"--gdn-islands");
+        reject_args(no_islands,"nonbaseline arithmetic composition requires actual islands");
+        auto implicit=args;remove_arg(implicit,"--optimization-profile");
+        reject_args(implicit,"numerical composition requires an explicitly selected manual organization");
+        auto unmarked=o;unmarked.numerical_profile_explicit=false;
+        bool implicit_recipe_rejected=false;
+        try{validate_numerical_profile_cli(unmarked);}catch(const std::invalid_argument&){implicit_recipe_rejected=true;}
+        expect_case(implicit_recipe_rejected,"layout composition does not infer an arithmetic recipe");
+    }
+    for(const auto* profile:{"q51-a8-down-v1","hc-deferred-norm-f32+q51-q80-a8-down-v1",
+            "hc-deferred-norm-f32+q51-q80-a8-down+q5k-a8-gateup-v1"}){
+        auto args=flags();args.insert(args.end(),{"--numerical-profile",profile});
+        reject_args(args,"transposed islands exclude every unadmitted arithmetic recipe");
+    }
+    auto exact=parse_args(flags());const auto exact_result=resolve(exact);
+    expect_case(exact.numerical_profile==DecodeNumericalProfile::exact_v5 && !exact_result.automatic_applied,
+        "manual exact-v5 retains its arithmetic identity with explicit transposed islands");
+    for(const auto layout:{HipGdnRecurrentLayout::stride32,HipGdnRecurrentLayout::stride33,
+            static_cast<HipGdnRecurrentLayout>(99)}){
+        expect_case(!gdn_island_recurrent_layout_admitted(layout),"shared island admission excludes every other layout");
+    }
+    expect_case(gdn_island_recurrent_layout_admitted(HipGdnRecurrentLayout::baseline) &&
+        gdn_island_recurrent_layout_admitted(HipGdnRecurrentLayout::transposed),
+        "shared island predicate admits exactly incumbent and transposed layouts");
+    for(unsigned fault=0;fault<8U;++fault){
+        auto bad=exact;
+        if(fault==0U)bad.optimization_profile=OptimizationProfile::automatic;
+        if(fault==1U)bad.gdn_recurrent_storage=GdnRecurrentStorage::value_key;
+        if(fault==2U)bad.known_prefix_window=true;
+        if(fault==3U)bad.prompt_lookup=true;
+        if(fault==4U)bad.serving_concurrency_explicit=true;
+        if(fault==5U)bad.mtp.supplied=true;
+        if(fault==6U)bad.execution.mode=DecodeExecutionMode::graph;
+        if(fault==7U)bad.gdn_recurrent_layout=HipGdnRecurrentLayout::stride32;
+        bool rejected=false;try{validate_resolved_gdn_islands(bad);}catch(const std::invalid_argument&){rejected=true;}
+        expect_case(rejected,"transposed island controller/layout/storage admission rejects before native setup");
+    }
+    auto automatic=parse_args({"decoder","target.gguf","1","--generate","20"});
+    const auto automatic_result=resolve_optimization_profile(automatic,model,info,manifest,
+        validated_model_content_identity,true);
+    expect_case(automatic_result.automatic_applied && automatic.gdn_recurrent_layout==HipGdnRecurrentLayout::baseline,
+        "automatic generation preserves the incumbent recurrent layout");
+}
+
+#endif
+
 int main() {
+#ifdef STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME
+    transposed_island_cli_contract();
+#endif
+
     const auto model = ModelContract::qwen38_flash_next();
     gguf::FileInfo info;
     ModelManifest manifest;
@@ -443,7 +559,7 @@ int main() {
         "GDN recurrent layout must be baseline, stride32, stride33 or transposed");
     auto bad_layout = defaults; bad_layout.gdn_recurrent_layout = HipGdnRecurrentLayout::stride32; bad_layout.gdn_islands = true;
     rejects([&] { validate_resolved_gdn_recurrent_layout(bad_layout); },
-        "GDN recurrent LDS layout requires eager floating execution without islands");
+        "GDN recurrent LDS layout requires eager floating execution with an admitted island layout");
 #ifdef STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME
     auto hierarchical = parse({"decoder", "fixture.gguf", "1", "--qsa-hierarchical-selection"});
     const auto hierarchical_profile = resolve_optimization_profile(hierarchical, model, info, manifest,

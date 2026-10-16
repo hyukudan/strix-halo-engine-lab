@@ -267,3 +267,15 @@ before inference. Appending a row or finishing the file after target consumption
 uses the same poison/drain failure path as the score ledger. Full-logit exports
 are for independent KL/top-1 analysis, not a performance run; no metric or
 qualification is inferred merely because a file was created.
+
+## Experimental recurrent island layout
+
+`--gdn-recurrent-layout transposed` can explicitly compose with GDN islands in
+manual ordinary eager execution with key-value recurrent storage. Baseline stays
+the default; stride32 and stride33 remain excluded from islands. The existing
+layout marker and island organization receipt identify this unqualified candidate.
+The explicit split-K f32 Q51/Q80 recipe and its Q5K gate/up extension may request
+this composition only with their complete manual organization flags. Automatic
+profile selection, deferred-normalization recipes and other controllers retain
+their existing admission. Whole-state and whole-model bitwise validation and complete-request performance
+qualification are required before adoption; source admission is not qualification.

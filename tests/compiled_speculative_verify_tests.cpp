@@ -1581,6 +1581,13 @@ int main() {
                                       router_registry, binding, buffers)); }
     catch (const std::invalid_argument&) { router_mismatch = true; }
     expect(router_mismatch, "verify compilation rejects parallel router under default admission");
+    const auto staged_registry = make_registry(model,4,".staged_logits",true);
+    bool staged_rejected = false;
+    try { (void)strix::compile_speculative_verify_execution(model,4,staged_registry,router_binding,router_buffers); }
+    catch (const std::invalid_argument& error) {
+        staged_rejected = std::string(error.what()) == "staged router logits does not support speculative verify";
+    }
+    expect(staged_rejected,"speculative verify rejects a selected staged router even with parallel workspace");
     auto ranked_binding = router_binding; ranked_binding.ranked_moe_router_topk = true;
     const auto ranked_registry = make_registry(model, 4, "", true, true);
     const auto ranked_compiled = strix::compile_speculative_verify_execution(model, 4, ranked_registry, ranked_binding, router_buffers);

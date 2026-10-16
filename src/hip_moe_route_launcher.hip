@@ -83,6 +83,8 @@ const char* activation_name(
 
 void validate_config(
     const HipMoeRouteLauncherConfig& config) {
+    if (config.staged_logits && !config.parallel_projection)
+        throw std::invalid_argument("staged router logits requires parallel projection");
     if (config.wave_topk)
         validate_wave_router_selection_contract(config.expert_count, config.top_k, config.parallel_projection, config.ranked_topk);
     if (config.ranked_topk && !config.parallel_projection)
@@ -451,6 +453,13 @@ constexpr std::uint32_t kRouterDeclaredLdsBytes =
     (kRouterProjectionLdsBytes + 255U) & ~255U;
 static_assert(kRouterDeclaredLdsBytes == 9472U);
 
+__device__ __forceinline__ float router_dot_ascending(
+    const float* input, const float* coefficients, std::uint32_t count, float sum) {
+    for (std::uint32_t feature = 0; feature < count; ++feature)
+        sum = __builtin_fmaf(input[feature], coefficients[feature], sum);
+    return sum;
+}
+
 template <typename Activation, RouterWeightKind WeightKind>
 __global__ void parallel_moe_route_logits_kernel(
     const Activation* hidden, const void* weights, std::uint32_t hidden_size,
@@ -485,14 +494,50 @@ __global__ void parallel_moe_route_logits_kernel(
         }
         __syncthreads();
         if (lane < kRouterExpertsPerBlock && expert_base + lane < expert_count)
-            for (std::uint32_t feature = 0; feature < count; ++feature)
-                // Baseline gfx1151 code objects use fused FP32 accumulation
-                // in the ascending dot chain; pin that operation explicitly.
-                sum = __builtin_fmaf(tile_input[feature], tile_weights[lane][feature], sum);
+            sum = router_dot_ascending(tile_input, tile_weights[lane], count, sum);
         __syncthreads();
     }
     if (lane < kRouterExpertsPerBlock && expert_base + lane < expert_count)
         workspace[static_cast<std::uint64_t>(row) * expert_count + expert_base + lane] = sum;
+}
+
+// Full-row staging changes data movement only. One lane in each of two
+// waves retains the exact ascending fused accumulation chain used above.
+template <typename Activation>
+__global__ void staged_moe_route_logits_kernel(const Activation* hidden, const void* weights,
+    float* workspace) {
+    constexpr std::uint32_t width = 2560;
+    constexpr std::uint32_t experts = 512;
+    constexpr std::uint32_t threads = 256;
+    const auto row = static_cast<std::uint32_t>(blockIdx.y);
+    const auto lane = static_cast<std::uint32_t>(threadIdx.x);
+    const auto expert = static_cast<std::uint32_t>(blockIdx.x) * 2U;
+    __shared__ float input[width];
+    __shared__ float coefficients[2][width];
+    for (std::uint32_t feature = lane; feature < width; feature += threads)
+        input[feature] = load_activation(hidden, static_cast<std::uint64_t>(row) * width + feature);
+    // Eligibility proves every row starts at a real 16-byte-aligned address.
+    const auto* packed = reinterpret_cast<const float4*>(weights);
+    float4 values[5];
+    #pragma unroll
+    for (std::uint32_t item = 0; item < 5; ++item)
+        values[item] = packed[(static_cast<std::uint64_t>(expert) * width) / 4U + lane + item * threads];
+    #pragma unroll
+    for (std::uint32_t item = 0; item < 5; ++item) {
+        const auto flat = lane + item * threads;
+        const auto group = flat / (width / 4U);
+        const auto feature = (flat % (width / 4U)) * 4U;
+        coefficients[group][feature] = values[item].x;
+        coefficients[group][feature + 1U] = values[item].y;
+        coefficients[group][feature + 2U] = values[item].z;
+        coefficients[group][feature + 3U] = values[item].w;
+    }
+    __syncthreads();
+    if (lane == 0U || lane == 32U) {
+        const auto group = lane / 32U;
+        const float sum = router_dot_ascending(input, coefficients[group], width, 0.0F);
+        workspace[static_cast<std::uint64_t>(row) * experts + expert + group] = sum;
+    }
 }
 
 __global__ void parallel_moe_route_select_kernel(
@@ -1032,11 +1077,20 @@ void launch_typed(
         return;
     }
     const auto workspace = prepare_parallel_router_workspace(context, config);
+    const bool staged = config.staged_logits && WeightKind == RouterWeightKind::f32 &&
+        staged_router_logits_eligible(config.hidden_size, config.expert_count, 0, weight.address);
+    if (staged) {
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(staged_moe_route_logits_kernel<Activation>),
+            dim3(256U, context.logical_rows), dim3(256U), 0, hip_execution_stream(),
+            reinterpret_cast<const Activation*>(hidden.address), reinterpret_cast<const void*>(weight.address),
+            reinterpret_cast<float*>(workspace.address));
+    } else {
     hipLaunchKernelGGL(HIP_KERNEL_NAME(parallel_moe_route_logits_kernel<Activation, WeightKind>),
         dim3((config.expert_count + kRouterExpertsPerBlock - 1U) / kRouterExpertsPerBlock, context.logical_rows),
         dim3(kRouterProjectionThreads), 0, hip_execution_stream(),
         reinterpret_cast<const Activation*>(hidden.address), reinterpret_cast<const void*>(weight.address),
         config.hidden_size, config.expert_count, reinterpret_cast<float*>(workspace.address));
+    }
     check_hip(hipGetLastError(), "HIP parallel MoE route logits launch");
     if (config.wave_topk) {
         hipLaunchKernelGGL(wave_parallel_moe_route_select_kernel, dim3(context.logical_rows), dim3(kThreads),
@@ -1322,7 +1376,7 @@ std::string route_kernel_id(
             request.logical_rows) +
         ".c" +
         std::to_string(
-            request.request_concurrency) + (config.wave_topk ? ".wave.parallel" : config.ranked_topk ? ".ranked.parallel" :
+            request.request_concurrency) + (config.staged_logits ? ".staged_logits" : "") + (config.wave_topk ? ".wave.parallel" : config.ranked_topk ? ".ranked.parallel" :
             config.parallel_projection ? ".parallel" : "");
 }
 
@@ -1343,6 +1397,7 @@ std::uint64_t launcher_identity(
             ? 1ULL
             : 0ULL);
     if (config.parallel_projection) hash_u64(hash, 0x524f555445525057ULL);
+    if (config.staged_logits) hash_u64(hash, 0x5354474c4f474954ULL);
     if (config.ranked_topk) hash_u64(hash, 0x52414e4b544f504bULL);
     if (config.wave_topk) hash_u64(hash, 0x57415645544f504bULL);
     return hash;
@@ -1362,6 +1417,8 @@ void register_hip_moe_route_kernel_variant(
             error);
     }
     validate_config(config);
+    if (config.staged_logits != request.staged_moe_router_logits)
+        throw std::invalid_argument("staged router variant mode differs from binding request");
     if (config.wave_topk != request.wave_moe_router_topk)
         throw std::invalid_argument("wave router variant mode differs from binding request");
     if (config.ranked_topk != request.ranked_moe_router_topk)
@@ -1411,6 +1468,7 @@ void register_hip_moe_route_kernel_variant(
     variant.resources.workgroup_threads =
         kThreads;
     variant.resources.lds_bytes =
+        config.staged_logits ? staged_router_logits_lds_bytes :
         config.parallel_projection ? kRouterDeclaredLdsBytes :
         (kMaxExperts + kThreads) * sizeof(float);
     variant.numerics.input_precision =
@@ -1429,7 +1487,7 @@ void register_hip_moe_route_kernel_variant(
         "row-major+ggml-router";
     variant.output_layout =
         "topk-indices+fp32-weights";
-    variant.compiler_identity = config.wave_topk ? "hip-gfx1151-moe-route-v6-wave-parallel" : config.ranked_topk ? "hip-gfx1151-moe-route-v5-ranked-parallel" : config.parallel_projection
+    variant.compiler_identity = config.staged_logits ? "hip-gfx1151-moe-route-v7-staged-logits" : config.wave_topk ? "hip-gfx1151-moe-route-v6-wave-parallel" : config.ranked_topk ? "hip-gfx1151-moe-route-v5-ranked-parallel" : config.parallel_projection
         ? "hip-gfx1151-moe-route-v4-parallel" : "hip-gfx1151-moe-route-v2";
     variant.measured_seconds = 0.0;
 
@@ -1480,7 +1538,8 @@ register_for_compiled_execution(
         const auto& binding = compiled.bindings.bindings[index];
         const auto& io = compiled.io.steps[index];
         if (!binding.kernel_id.has_value() ||
-            (binding.kernel_id->ends_with(".parallel") != config_.parallel_projection ||
+            ((binding.kernel_id->find(".staged_logits") != std::string::npos) != config_.staged_logits ||
+             binding.kernel_id->ends_with(".parallel") != config_.parallel_projection ||
              binding.kernel_id->ends_with(".ranked.parallel") != config_.ranked_topk ||
              binding.kernel_id->ends_with(".wave.parallel") != config_.wave_topk))
             throw std::invalid_argument("router launcher mode differs from compiled kernel binding");

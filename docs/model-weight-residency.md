@@ -25,8 +25,11 @@ manifest roles. Each active tier requires all three explicit byte arguments:
 
 `PAYLOAD` must equal the sum of selected tensor payload bytes. The retained and
 setup limits bound declared model backing: the page-rounded source mapping plus
-the copied arena, including copied boundary padding. Registered aliases do not
-add another backing reservation. These limits exclude decoder workspaces and
+the copied arena, including copied boundary padding. Expert setup peak also
+includes one temporary pinned host source of at most 32 MiB (or the largest
+logical copied range, if smaller). This temporary lease is retired before
+consumer bindings are published and does not increase retained backing.
+Registered aliases do not add another backing reservation. These limits exclude decoder workspaces and
 driver allocations; they are not observations of physical RAM use or available
 capacity. A model mapping and its copied file cache can coexist during setup.
 
@@ -36,6 +39,12 @@ registered. Admission rejects registration of an expert range's interior pages
 or complete coverage of a copied range by registered boundary pages. This avoids
 keeping the entire copied expert population explicitly registered as well.
 A backing range can use several transfers, split at source registration boundaries.
+For experts, each bounded chunk is copied from the mapping into the same pinned
+source lease, then transferred to its unchanged arena offset. The original-device
+completion guard drains each transfer before the lease is reused or released.
+Source payload and boundary padding bytes are preserved. Normalization and hot
+tiers retain their direct-copy path. Staging adds startup memory traffic and does
+not establish a speed improvement or removal of file-cache pressure.
 It does not assert how the HIP runtime stages or pins copy sources internally.
 
 Copies finish before bindings become available. Tensor addresses preserve the

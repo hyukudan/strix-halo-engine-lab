@@ -395,6 +395,9 @@ void selective_owned_and_faults(const std::filesystem::path& path) {
         auto owner = std::make_shared<strix::HipModelResidency>(
             strix::HipModelResidency::create(mapped, manifest, generations, policy));
         auto inventory = owner->owner_inventory(owner);
+        expect(reservation.setup_staging_reserved_bytes == 0 && diag::stats().staging_allocations == 0 &&
+            reservation.setup_peak_reserved_bytes == reservation.retained_reserved_bytes,
+            "normalization and hot tiers keep direct copies without temporary pinned backing");
         expect(owner->copy_tier() == tier && owner->mode() == strix::HipModelResidencyMode::registered_file_mapping &&
             owner->copied_bytes() == plan.arena_bytes && reservation.copy_payload_bytes == *policy.copy_payload_bytes &&
             inventory.known_allocated_storage_bytes == plan.arena_bytes && inventory.known_backings.size() == 2U &&
@@ -555,12 +558,13 @@ strix::HipModelResidencyPolicy experts_policy() {
     policy.copy_tier = strix::HipModelCopyTier::experts;
     policy.copy_payload_bytes = 28672U;
     policy.coalesce_gap_bytes = 0;
-    policy.reservation_limits = {102400U, 102400U};
+    policy.reservation_limits = {102400U, 122880U};
     return policy;
 }
 
 void experts_owned_and_faults(const std::filesystem::path& original_path) {
     namespace diag = strix::model_residency_diagnostic;
+    diag::set_fault_plan();
     auto path = original_path; path += ".experts";
     write_fixture(path, 65536U);
     try {
@@ -574,7 +578,7 @@ void experts_owned_and_faults(const std::filesystem::path& original_path) {
         expect(plan.tensors == std::vector<std::uint32_t>{2U, 5U} && plan.ranges.size() == 2U &&
             plan.payload_bytes == 28672U && plan.arena_bytes == 36864U &&
             reservation.registered_alias_bytes == 20480U && reservation.retained_reserved_bytes == 102400U &&
-            reservation.setup_peak_reserved_bytes == 102400U,
+            reservation.setup_staging_reserved_bytes == 20480U && reservation.setup_peak_reserved_bytes == 122880U,
             "experts fixture has two padded copies and only four nonexpert registration ranges");
 
         std::vector<strix::HipModelResidencyPolicy> invalid;
@@ -583,7 +587,8 @@ void experts_owned_and_faults(const std::filesystem::path& original_path) {
         bad = policy; bad.reservation_limits.retained_bytes.reset(); invalid.push_back(bad);
         bad = policy; bad.reservation_limits.setup_peak_bytes.reset(); invalid.push_back(bad);
         bad = policy; bad.reservation_limits.retained_bytes = 102399U; invalid.push_back(bad);
-        bad = policy; bad.reservation_limits.setup_peak_bytes = 102399U; invalid.push_back(bad);
+        bad = policy; bad.reservation_limits.setup_peak_bytes = 122879U; invalid.push_back(bad);
+        bad = policy; bad.reservation_limits.setup_peak_bytes = 102400U; invalid.push_back(bad);
         bad = policy; bad.coalesce_gap_bytes = 4096U; invalid.push_back(bad);
         bad = policy; bad.mode = strix::HipModelResidencyMode::resident_copy; invalid.push_back(bad);
         bad = policy; bad.promote_file_backed_candidates = true; invalid.push_back(bad);
@@ -600,7 +605,7 @@ void experts_owned_and_faults(const std::filesystem::path& original_path) {
             }
             const auto calls = diag::stats();
             expect(rejected && before.next() == 100000 && calls.registrations == 0 && calls.alias_queries == 0 &&
-                calls.allocations == 0 && calls.copies == 0 && calls.frees == 0,
+                calls.allocations == 0 && calls.copies == 0 && calls.frees == 0 && calls.staging_allocations == 0,
                 "experts invalid geometry/ownership/budgets reject before generation or HIP mutation");
         };
         for (const auto& input_policy : invalid) reject_before_hip(manifest, input_policy);
@@ -632,6 +637,7 @@ void experts_owned_and_faults(const std::filesystem::path& original_path) {
             const auto old_plan = strix::plan_hip_model_residency_reservation(*mapped, manifest, none);
             auto baseline = strix::HipModelResidency::create(mapped, manifest, generations, none);
             expect(old_plan.registered_alias_bytes == 40960U && baseline.registered_bytes() == 40960U &&
+                old_plan.setup_staging_reserved_bytes == 0 && diag::stats().staging_allocations == 0 &&
                 baseline.copied_bytes() == 0 && baseline.binding().tensors[2].storage ==
                     strix::RuntimeTensorStorage::registered_file_mapped,
                 "tier none preserves expert source registration without copied backing");
@@ -641,6 +647,9 @@ void experts_owned_and_faults(const std::filesystem::path& original_path) {
             strix::HipModelResidency::create(mapped, manifest, generations, policy));
         auto inventory = owner->owner_inventory(owner);
         expect(diag::stats().registrations == 4U && diag::stats().allocations == 1U && diag::stats().copies == 6U &&
+            diag::stats().staging_allocations == 1U && diag::stats().acquired_staging_allocations == 1U &&
+            diag::stats().staging_frees == 1U && diag::stats().released_staging_allocations == 1U &&
+            diag::stats().staging_copy_chunks == 6U && diag::stats().maximum_staging_copy_bytes == 12288U &&
             owner->registered_bytes() == 20480U && owner->copied_bytes() == 36864U &&
             inventory.known_backings.size() == 2U && inventory.known_allocated_storage_bytes == 36864U &&
             inventory.unique_backing_reserved_bytes == 102400U,
@@ -743,7 +752,8 @@ void experts_owned_and_faults(const std::filesystem::path& original_path) {
             diag::FaultPlan{diag::Fault::device_alias, 1U}, diag::FaultPlan{diag::Fault::device_alias, 4U},
             diag::FaultPlan{diag::Fault::alias_alignment, 1U}, diag::FaultPlan{diag::Fault::allocation, 1U},
             diag::FaultPlan{diag::Fault::arena_alignment, 1U}, diag::FaultPlan{diag::Fault::copy, 1U},
-            diag::FaultPlan{diag::Fault::copy, 2U}, diag::FaultPlan{diag::Fault::copy, 6U}};
+            diag::FaultPlan{diag::Fault::copy, 2U}, diag::FaultPlan{diag::Fault::copy, 6U},
+            diag::FaultPlan{diag::Fault::staging_allocation, 1U}, diag::FaultPlan{diag::Fault::staging_post_allocate, 1U}};
         for (const auto fault : faults) {
             diag::set_fault_plan(fault); bool rejected = false;
             try { static_cast<void>(strix::HipModelResidency::create(mapped, manifest, generations, policy)); }
@@ -751,12 +761,63 @@ void experts_owned_and_faults(const std::filesystem::path& original_path) {
             const auto calls = diag::stats();
             expect(rejected && calls.acquired_allocations <= 1U && calls.frees == calls.acquired_allocations &&
                 calls.acquired_allocations == calls.released_allocations &&
-                calls.acquired_registrations == calls.released_registrations,
-                "experts partial setup retires all aliases and frees only an actually acquired arena");
+                calls.acquired_registrations == calls.released_registrations &&
+                calls.acquired_staging_allocations == calls.released_staging_allocations &&
+                calls.staging_frees == calls.acquired_staging_allocations && calls.staging_frees <= 1U,
+                "experts partial setup retires aliases, one arena and only an actually acquired pinned source");
+            if (fault.fault == diag::Fault::staging_allocation)
+                expect(calls.staging_allocations == 1U && calls.acquired_staging_allocations == 0 && calls.staging_frees == 0,
+                    "failed pinned allocation does not manufacture a lease or free");
+            if (fault.fault == diag::Fault::staging_post_allocate)
+                expect(calls.staging_allocations == 1U && calls.acquired_staging_allocations == 1U && calls.staging_frees == 1U,
+                    "an acquired pinned source survives guard failure and is retired once");
             diag::set_fault_plan();
             { auto retry = strix::HipModelResidency::create(mapped, manifest, generations, policy);
               expect(retry.copy_tier() == policy.copy_tier, "experts fresh creation succeeds after each injected failure"); }
         }
+        // This cap is compiled only into the diagnostic executable; production
+        // still uses min(32 MiB, largest logical range). It forces a real tail.
+        diag::set_fault_plan({diag::Fault::none, 1U, 8192U});
+        const auto chunk_plan = strix::plan_hip_model_residency_reservation(*mapped,manifest,policy);
+        expect(chunk_plan.setup_staging_reserved_bytes == 8192U &&
+            chunk_plan.setup_peak_reserved_bytes == 110592U && chunk_plan.retained_reserved_bytes == 102400U,
+            "diagnostic chunk capacity is included in pre-HIP temporary budgeting");
+        {
+            auto chunked = strix::HipModelResidency::create(mapped,manifest,generations,policy);
+            const auto calls = diag::stats();
+            expect(calls.copies == 7U && calls.staging_copy_chunks == 7U &&
+                calls.maximum_staging_copy_bytes == 8192U && calls.staging_allocations == 1U &&
+                calls.staging_frees == 1U && calls.acquired_staging_allocations == calls.released_staging_allocations,
+                "one retired staging lease serves every real bounded chunk and short tail");
+            const auto expert_address = chunked.binding().tensors[2].address;
+            const auto base = expert_address - (manifest.tensors[2].absolute_offset - plan.ranges[0].file_begin);
+            for (const auto& range : plan.ranges) {
+                std::vector<std::byte> bytes(static_cast<std::size_t>(range.file_end-range.file_begin));
+                check(hipMemcpy(bytes.data(),reinterpret_cast<void*>(base+range.arena_offset),bytes.size(),hipMemcpyDeviceToHost),
+                    "read every chunked expert arena byte");
+                const auto* expected = reinterpret_cast<const std::byte*>(mapped->base_address()+range.file_begin);
+                expect(std::equal(bytes.begin(),bytes.end(),expected),"chunk boundaries preserve complete source payload and padding");
+            }
+        }
+        for (const auto occurrence : {1U,4U,7U}) {
+            diag::set_fault_plan({diag::Fault::copy,occurrence,8192U});
+            bool rejected = false;
+            try { (void)strix::HipModelResidency::create(mapped,manifest,generations,policy); }
+            catch (const std::exception&) { rejected = true; }
+            const auto calls = diag::stats();
+            expect(rejected && calls.copies == occurrence && calls.frees == 1U &&
+                calls.acquired_allocations == calls.released_allocations &&
+                calls.acquired_registrations == calls.released_registrations &&
+                calls.staging_frees == 1U && calls.acquired_staging_allocations == calls.released_staging_allocations,
+                "first, middle and last chunk failures drain and retire both actual allocations");
+            // Retry with the same generation source object; never rewind or
+            // substitute a fake source to escape partial-setup accounting.
+            diag::set_fault_plan({diag::Fault::none,1U,8192U});
+            { auto retry = strix::HipModelResidency::create(mapped,manifest,generations,policy);
+              expect(retry.copy_tier()==policy.copy_tier && diag::stats().copies==7U,
+                  "same generation source supports fresh chunked creation after each failure"); }
+        }
+        diag::set_fault_plan();
         hipStream_t stream = nullptr;
         check(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), "experts capture stream");
         check(hipStreamBeginCapture(stream, hipStreamCaptureModeThreadLocal), "experts capture begin");
@@ -770,7 +831,7 @@ void experts_owned_and_faults(const std::filesystem::path& original_path) {
         hipGraph_t graph = nullptr; check(hipStreamEndCapture(stream, &graph), "experts capture end");
         std::size_t nodes = 0; check(hipGraphGetNodes(graph, nullptr, &nodes), "experts capture nodes");
         expect(rejected && nodes == 0 && before_capture.next() == 100000 && diag::stats().registrations == 0 &&
-            diag::stats().allocations == 0 && diag::stats().copies == 0,
+            diag::stats().allocations == 0 && diag::stats().copies == 0 && diag::stats().staging_allocations == 0,
             "experts owned capture rejects before generation, registration, allocation or graph nodes");
         check(hipGraphDestroy(graph), "experts capture graph destroy");
         check(hipStreamDestroy(stream), "experts capture stream destroy");

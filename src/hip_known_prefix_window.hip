@@ -53,6 +53,7 @@ ExecutionBindingRequest binding_request(const HipLauncherCatalogConfig& config) 
     request.wave8_q8_gdn_output = config.wave8_q8_gdn_output;
     request.wave8_q8_qsa_output = config.wave8_q8_qsa_output;
     request.parallel_moe_router = config.parallel_moe_router;
+    request.staged_moe_router_logits = config.staged_moe_router_logits;
     request.ranked_moe_router_topk = config.ranked_moe_router_topk;
     request.wave_moe_router_topk = config.wave_moe_router_topk;
     request.prefetch_q8_qsa_input = config.prefetch_q8_qsa_input;

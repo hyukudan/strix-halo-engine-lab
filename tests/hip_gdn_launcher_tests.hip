@@ -644,7 +644,8 @@ void run_gdn_island_fixture() {
     struct Case { unsigned profile; std::uint32_t key_heads, value_heads; };
     const std::array<Case,7> cases{{{0,16,48},{1,16,48},{2,16,48},{3,16,48},{4,16,48},{3,4,4},{3,4,12}}};
     std::vector<IslandSnapshot> virtual_eager_reference;
-    for (const auto test : cases) {
+    for (const auto test : cases) for (const auto selected_layout : {
+            strix::HipGdnRecurrentLayout::baseline, strix::HipGdnRecurrentLayout::transposed}) {
         const auto profile = test.profile;
         const bool prefetched = profile != 0U;
         const bool mixed_f32 = profile == 2U || profile == 4U;
@@ -814,10 +815,12 @@ void run_gdn_island_fixture() {
         config.virtual_q8_output_projection = prefetched;
         config.wave8_q8_input_projections = both_wave8;
         config.wave8_q8_output_projection = both_wave8;
+        config.recurrent_layout = selected_layout;
         strix::kernels::KernelRegistry variants;
         strix::ExecutionBindingRequest request;
         request.wave8_q8_gdn_input = both_wave8;
         request.wave8_q8_gdn_output = both_wave8;
+        request.gdn_recurrent_layout = selected_layout;
         strix::register_hip_gdn_kernel_variant(model, request, config, variants);
         const auto variant = variants.variants().front();
         strix::HipEmbeddingLauncherConfig embedding_config;
@@ -872,7 +875,21 @@ void run_gdn_island_fixture() {
                     hipMemcpyHostToDevice), "island input upload");
             });
         };
-        const auto eager = strix::make_hip_gdn_launcher(variant.id, &config);
+        // Both island layouts use the incumbent eager kernel as their oracle,
+        // not their own layout implementation. Whole state and workspace are
+        // compared after each evolving position, including prepared dispatch.
+        auto oracle_config = config;
+        oracle_config.recurrent_layout = strix::HipGdnRecurrentLayout::baseline;
+        auto oracle_request = request;
+        oracle_request.gdn_recurrent_layout = strix::HipGdnRecurrentLayout::baseline;
+        strix::kernels::KernelRegistry oracle_variants;
+        strix::register_hip_gdn_kernel_variant(model, oracle_request, oracle_config, oracle_variants);
+        const auto oracle_variant = oracle_variants.variants().front();
+        const auto eager = strix::make_hip_gdn_launcher(oracle_variant.id, &oracle_config);
+        expect((variant.id == oracle_variant.id) ==
+            (selected_layout == strix::HipGdnRecurrentLayout::baseline),
+            "transposed recurrence keeps a distinct existing layout marker while baseline identity stays unchanged");
+        context.kernel_id = oracle_variant.id;
         std::vector<IslandSnapshot> reference;
         for (std::uint64_t position = 0; position < 8U; ++position) {
             context.position = position; prepare_input(position); d1->begin();
@@ -888,6 +905,7 @@ void run_gdn_island_fixture() {
             std::cout << "GDN_ISLAND_EAGER_VIRTUAL_CROSSCHECK equal="
                 << (reference == virtual_eager_reference) << '\n';
         }
+        context.kernel_id = variant.id;
         reset_state();
         const auto create = [&](const strix::HipGdnLauncherConfig& selected, const strix::HipLaunchContext& scope) {
             return strix::HipGdnIslands::create(compiled, selected, d1->resources(), scope,
@@ -987,11 +1005,17 @@ void run_gdn_island_fixture() {
             expect(rejected && (expected_message.empty() || rejection == expected_message) && snapshot() == before,
                 "unsupported island creation rejects through its intended guard with no state/output effects");
         };
+        // Changing the admitted layout without changing the compiled numerical
+        // kernel ID must not create a graph under the wrong layout identity.
+        auto mismatched_layout = config;
+        mismatched_layout.recurrent_layout = selected_layout == strix::HipGdnRecurrentLayout::baseline
+            ? strix::HipGdnRecurrentLayout::transposed : strix::HipGdnRecurrentLayout::baseline;
+        reject_creation(mismatched_layout, d1->scope());
         if (profile == 0U) {
             for (const auto layout : {strix::HipGdnRecurrentLayout::stride32,
-                    strix::HipGdnRecurrentLayout::stride33, strix::HipGdnRecurrentLayout::transposed}) {
+                    strix::HipGdnRecurrentLayout::stride33}) {
                 auto candidate = config; candidate.recurrent_layout = layout;
-                reject_creation(candidate, d1->scope(), "GDN islands require the baseline recurrent LDS layout");
+                reject_creation(candidate, d1->scope(), "GDN islands require baseline or transposed recurrent LDS layout");
             }
             auto storage_candidate = config; storage_candidate.recurrent_storage = strix::GdnRecurrentStorage::value_key;
             reject_creation(storage_candidate, d1->scope(), "GDN islands require key-value recurrent storage");
@@ -1029,13 +1053,15 @@ void run_gdn_island_fixture() {
             "failed nested island creation unwinds the caller scope");
         if (both_wave8) {
             auto device_inputs = config; device_inputs.enable_device_graph_inputs = true;
-            reject_creation(device_inputs, d1->scope(), "wave8 GDN input supports eager execution only");
+            reject_creation(device_inputs, d1->scope(),
+                selected_layout == strix::HipGdnRecurrentLayout::baseline
+                    ? "wave8 GDN input supports eager execution only" : "GDN recurrent LDS layouts support eager execution only");
             auto capture_subject = create(config, d1->scope());
             strix::HipGdnLauncherBundle capture_bundle(config);
             strix::ExecutionLauncherRegistry capture_registry;
             capture_bundle.register_for_compiled_execution(compiled, capture_registry, capture_subject.get());
             const auto capture_arm = *capture_registry.find_kernel_launcher(variant.id);
-            const auto reject_replay_capture = [&](auto&& call) {
+            const auto reject_replay_capture = [&](auto&& call, std::string_view expected_rejection) {
                 reset_state(); prepare_input(0); context.position = 0;
                 const auto before = snapshot();
                 // Never run recovery, snapshots, D1 begin or a synchronizing
@@ -1058,11 +1084,13 @@ void run_gdn_island_fixture() {
                 check(count_error, "count both-wave8 rejected graph nodes");
                 check(destroy_error, "destroy both-wave8 rejected graph");
                 if (unexpected) std::rethrow_exception(unexpected);
-                expect(rejection == "wave8 GDN projections cannot be captured" && nodes == 0U && snapshot() == before,
+                expect(rejection == expected_rejection && nodes == 0U && snapshot() == before,
                     "actual eager/replay capture guard rejects before nodes or state effects");
                 expect(strix::current_hip_launch_context() == nullptr, "capture rejection unwinds replay scope");
             };
-            reject_replay_capture([&] { capture_arm.function(context, capture_arm.user_data); });
+            reject_replay_capture([&] { capture_arm.function(context, capture_arm.user_data); },
+                selected_layout == strix::HipGdnRecurrentLayout::baseline
+                    ? "wave8 GDN projections cannot be captured" : "GDN recurrent LDS layouts cannot be captured");
             expect(capture_subject->receipt().replays == 0U, "active capture never counts as a graph replay");
             bool sticky = false;
             try {
@@ -1073,7 +1101,8 @@ void run_gdn_island_fixture() {
             }
             expect(sticky && capture_subject->receipt().replays == 0U,
                 "capture-rejected island remains failed after the capture ends");
-            reject_replay_capture([&] { eager.function(context, eager.user_data); });
+            reject_replay_capture([&] { eager.function(context, eager.user_data); },
+                "wave8 GDN projections cannot be captured");
         }
         const auto conv_type = manifest.tensors[2].ggml_type;
         manifest.tensors[2].ggml_type = 2U; // Unsupported small type: prepare-only scope must unwind.
@@ -1112,7 +1141,7 @@ void run_gdn_island_fixture() {
         owner->memory.arena_base = scratch_address;
 
         // Every malformed replay uses a fresh owner because rejection is sticky.
-        for (unsigned fault = 0; fault < 13U; ++fault) {
+        for (unsigned fault = 0; fault < 14U; ++fault) {
             auto subject = create(config, d1->scope());
             strix::HipGdnLauncherBundle subject_bundle(config);
             strix::ExecutionLauncherRegistry subject_registry;
@@ -1150,6 +1179,8 @@ void run_gdn_island_fixture() {
             if (fault == 10U) {
                 ++live_state.device_allocation_generation;
             }
+            if (fault == 13U) bad_context.kernel_id = oracle_variant.id == variant.id
+                ? std::string_view("gdn.wrong-layout") : std::string_view(oracle_variant.id);
             if (fault == 11U) {
                 bad_memory.arena_base = owner->weights->binding().tensors[0].address;
                 bad_resources.scratch = &bad_memory;
@@ -1176,7 +1207,7 @@ void run_gdn_island_fixture() {
             }
             restore_metadata();
             if (alternate_stream_created) check(hipStreamDestroy(bad_scope.stream), "island wrong-stream teardown");
-            if (fault == 2U || fault == 3U || fault == 4U || fault == 5U || fault == 10U || fault == 12U)
+            if (fault == 2U || fault == 3U || fault == 4U || fault == 5U || fault == 10U || fault == 12U || fault == 13U)
                 expect(rejection == "GDN island replay scope, owner or complete descriptor changed",
                     "in-place generation/address/extent/type/state mutation reaches fixed descriptor rejection");
             expect(rejected && subject->receipt().replays == 0U && snapshot() == before,

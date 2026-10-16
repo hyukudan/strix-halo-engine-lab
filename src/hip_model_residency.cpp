@@ -10,6 +10,9 @@
 #include <algorithm>
 #include <atomic>
 #include <cstddef>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <limits>
 #include <new>
@@ -118,6 +121,77 @@ void selective_free(void* address) noexcept {
 #else
     static_cast<void>(error);
 #endif
+}
+
+// One setup-only pinned source. The object exists before allocation starts,
+// so a successful HIP allocation survives even a later guard exception.
+class ExpertCopyStaging final {
+public:
+    explicit ExpertCopyStaging(const HipSetupQuiescenceGuard& guard) : guard_(guard) {}
+    ExpertCopyStaging(const ExpertCopyStaging&) = delete;
+    ExpertCopyStaging& operator=(const ExpertCopyStaging&) = delete;
+    ~ExpertCopyStaging() noexcept {
+        if (!data_) return;
+        guard_.recover_or_fail_stop();
+        try { retire(); } catch (...) { fail_stop(); }
+    }
+    void allocate(std::uint64_t bytes) {
+        if (!bytes) return;
+        guard_.run([&] {
+#if defined(STRIX_BUILD_MODEL_RESIDENCY_DIAGNOSTIC)
+            const auto count = ++model_residency_diagnostic::counters.staging_allocations;
+            if (inject(model_residency_diagnostic::Fault::staging_allocation, count))
+                throw std::runtime_error("selective residency staging allocation: injected failure");
+#endif
+            void* acquired = nullptr;
+            const auto status = hipHostMalloc(&acquired, static_cast<std::size_t>(bytes), hipHostMallocDefault);
+            if (status != hipSuccess)
+                throw std::runtime_error(std::string("selective residency staging allocation: ") + hipGetErrorString(status));
+            data_ = acquired; // Publish ownership before any post-allocation check.
+            if (!data_) throw std::runtime_error("selective residency staging allocation returned no storage");
+#if defined(STRIX_BUILD_MODEL_RESIDENCY_DIAGNOSTIC)
+            ++model_residency_diagnostic::counters.acquired_staging_allocations;
+            if (inject(model_residency_diagnostic::Fault::staging_post_allocate, 1))
+                throw std::runtime_error("selective residency staging post-allocation: injected failure");
+#endif
+        });
+    }
+    void* data() const noexcept { return data_; }
+    void retire() {
+        if (!data_) return;
+        guard_.run([&] {
+            auto* acquired = data_;
+            data_ = nullptr; // Never retry an uncertain free, including unwinding.
+#if defined(STRIX_BUILD_MODEL_RESIDENCY_DIAGNOSTIC)
+            ++model_residency_diagnostic::counters.staging_frees;
+#endif
+            if (hipHostFree(acquired) != hipSuccess) fail_stop();
+#if defined(STRIX_BUILD_MODEL_RESIDENCY_DIAGNOSTIC)
+            ++model_residency_diagnostic::counters.released_staging_allocations;
+#endif
+        });
+    }
+private:
+    [[noreturn]] static void fail_stop() noexcept {
+        std::fputs("HIP expert staging retirement is unproved; terminating without owner cleanup\n", stderr);
+        std::fflush(nullptr);
+        std::_Exit(3);
+    }
+    const HipSetupQuiescenceGuard& guard_;
+    void* data_ = nullptr;
+};
+
+std::uint64_t expert_staging_capacity(const SelectiveCopyPlan& plan, HipModelCopyTier tier) {
+    if (tier != HipModelCopyTier::experts) return 0;
+    std::uint64_t cap = 32ULL * 1024ULL * 1024ULL;
+#if defined(STRIX_BUILD_MODEL_RESIDENCY_DIAGNOSTIC)
+    const auto requested = model_residency_diagnostic::fault_plan.staging_capacity_bytes;
+    if (requested > cap) throw std::invalid_argument("diagnostic staging capacity exceeds production cap");
+    if (requested) cap = requested;
+#endif
+    std::uint64_t largest = 0;
+    for (const auto& range : plan.ranges) largest = std::max(largest, range.file_end - range.file_begin);
+    return std::min(cap, largest);
 }
 
 // Process-local allocator lease IDs, never GPU/host virtual addresses.
@@ -375,9 +449,9 @@ HipModelResidencyReservation plan_hip_model_residency_reservation(const MappedMo
     }
     // Registration aliases the source mapping; only a real copy adds backing.
     result.retained_reserved_bytes = checked_add(result.mapped_reserved_bytes, result.copied_reserved_bytes);
-    // No explicit temporary payload allocation is owned by this setup path.
+    result.setup_staging_reserved_bytes = expert_staging_capacity(selective, policy.copy_tier);
     // Driver-internal memory and physical-page residency remain unobserved.
-    result.setup_peak_reserved_bytes = result.retained_reserved_bytes;
+    result.setup_peak_reserved_bytes = checked_add(result.retained_reserved_bytes, result.setup_staging_reserved_bytes);
     if (policy.reservation_limits.retained_bytes && result.retained_reserved_bytes > *policy.reservation_limits.retained_bytes)
         throw std::invalid_argument("HIP residency retained reservation exceeds explicit budget");
     if (policy.reservation_limits.setup_peak_bytes && result.setup_peak_reserved_bytes > *policy.reservation_limits.setup_peak_bytes)
@@ -742,6 +816,8 @@ HipModelResidency HipModelResidency::create_impl(const MappedModelFile& mapped,
 #endif
                 if (!aligned || result.copy_arena_bytes_ > UINTPTR_MAX - result.copy_arena_base_)
                     throw std::invalid_argument("selective residency requires page-congruent bounded arena");
+                ExpertCopyStaging staging(*result.selective_guard_);
+                staging.allocate(reservation.setup_staging_reserved_bytes);
                 auto source_registration = ranges.begin();
                 for (const auto& range : result.arena_ranges_) {
                     auto source_begin = range.file_begin;
@@ -757,15 +833,30 @@ HipModelResidency HipModelResidency::create_impl(const MappedModelFile& mapped,
                                     source_registration->end : source_registration->begin);
                         if (source_end <= source_begin)
                             throw std::logic_error("selective model copy source segment is empty");
-                        result.selective_guard_->run([&] {
-                            check_hip(selective_copy(reinterpret_cast<void*>(result.copy_arena_base_ +
-                                    range.arena_offset + (source_begin - range.file_begin)),
-                                reinterpret_cast<const void*>(mapped.base_address() + source_begin),
-                                static_cast<std::size_t>(source_end - source_begin)), "selective residency weight copy");
-                        });
-                        source_begin = source_end;
+                        while (source_begin < source_end) {
+                            const auto bytes = reservation.setup_staging_reserved_bytes
+                                ? std::min(source_end - source_begin, reservation.setup_staging_reserved_bytes)
+                                : source_end - source_begin;
+                            const auto* source = reinterpret_cast<const void*>(mapped.base_address() + source_begin);
+                            if (staging.data()) {
+                                std::memcpy(staging.data(), source, static_cast<std::size_t>(bytes));
+                                source = staging.data();
+#if defined(STRIX_BUILD_MODEL_RESIDENCY_DIAGNOSTIC)
+                                ++model_residency_diagnostic::counters.staging_copy_chunks;
+                                model_residency_diagnostic::counters.maximum_staging_copy_bytes =
+                                    std::max(model_residency_diagnostic::counters.maximum_staging_copy_bytes, bytes);
+#endif
+                            }
+                            result.selective_guard_->run([&] {
+                                check_hip(selective_copy(reinterpret_cast<void*>(result.copy_arena_base_ +
+                                        range.arena_offset + (source_begin - range.file_begin)), source,
+                                    static_cast<std::size_t>(bytes)), "selective residency weight copy");
+                            }); // Proves the source lease can be reused for the next chunk.
+                            source_begin += bytes;
+                        }
                     }
                 }
+                staging.retire(); // No temporary pinned backing escapes into retained ownership.
                 for (const auto index : selective.tensors) {
                     const auto& tensor = manifest.tensors[index];
                     const auto range = std::find_if(result.arena_ranges_.begin(), result.arena_ranges_.end(),

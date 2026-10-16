@@ -4279,6 +4279,12 @@ void validate_island_graph(hipGraph_t graph, const GdnKernelLedger& ledger,
             wave8_island_input_symbol(prepared.tensors.alpha.manifest->ggml_type),
             reinterpret_cast<const void*>(project_prefetch8_wave8_q8_fp32_to_bf16_kernel)};
     }
+    if (!gdn_island_recurrent_layout_admitted(config.recurrent_layout) ||
+        config.recurrent_storage != GdnRecurrentStorage::key_value)
+        throw std::runtime_error("GDN island recurrent configuration is not admitted");
+    const auto recurrent_symbol = config.recurrent_layout == HipGdnRecurrentLayout::baseline
+        ? reinterpret_cast<const void*>(recurrent_step_kernel)
+        : reinterpret_cast<const void*>(recurrent_layout_diagnostic_kernel<gdn_recurrent_layout_diagnostic::Layout::transposed>);
     for (const auto& expected : ledger) {
         std::size_t selected = count;
         for (std::size_t i = 0; i < count; ++i) {
@@ -4309,6 +4315,8 @@ void validate_island_graph(hipGraph_t graph, const GdnKernelLedger& ledger,
             ((ordinal < 4U && parameters.func != projection_symbols[ordinal]) ||
              (ordinal == 9U && parameters.func != projection_symbols[4])))
             throw std::runtime_error("GDN island captured projection symbol differs from its admitted wave8 organization");
+        if (ordinal == 7U && parameters.func != recurrent_symbol)
+            throw std::runtime_error("GDN island recurrent symbol differs from its admitted layout");
         used[selected] = true; previous = nodes[selected];
         ++ordinal;
     }
@@ -4395,8 +4403,8 @@ struct HipGdnIslands::Impl {
     void build() {
         if (current_hip_launch_context()) throw std::invalid_argument("GDN island setup requires no active launch scope");
         validate_config(config);
-        if (config.recurrent_layout != HipGdnRecurrentLayout::baseline)
-            throw std::invalid_argument("GDN islands require the baseline recurrent LDS layout");
+        if (!gdn_island_recurrent_layout_admitted(config.recurrent_layout))
+            throw std::invalid_argument("GDN islands require baseline or transposed recurrent LDS layout");
         if (config.recurrent_storage != GdnRecurrentStorage::key_value)
             throw std::invalid_argument("GDN islands require key-value recurrent storage");
         const bool legacy = !config.virtual_q8_input_projections && !config.prefetch_q8_input_projections &&
@@ -4540,6 +4548,8 @@ struct HipGdnIslands::Impl {
             resources->model_weights != &weights->binding() || weights->binding().model_content_identity != model_content ||
             weights->binding().manifest_layout_identity != manifest_identity || weights->generation() != weight_generation ||
             context.step_id >= steps.size() || !steps[context.step_id] ||
+            !context.kernel_id || !compiled.bindings.bindings[context.step_id].kernel_id ||
+            *context.kernel_id != *compiled.bindings.bindings[context.step_id].kernel_id ||
             !(island_descriptor(context, prepared, weights->binding(), &steps[context.step_id]->descriptor) ==
                 steps[context.step_id]->descriptor))
             throw std::invalid_argument("GDN island replay scope, owner or complete descriptor changed");

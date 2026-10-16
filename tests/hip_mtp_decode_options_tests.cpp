@@ -357,6 +357,18 @@ int main(){try{
     reject_as(teacher_mtp,
         "teacher-forced score requires at least two teacher inputs and generate 1 in serial eager full-output diagnostic mode",
         "teacher score never enters speculative controller execution");
+    {
+        auto baseline = experts_request();
+        require(!parse(baseline).staged_moe_router_logits,"staged logits defaults off");
+        baseline.push_back("--staged-moe-router-logits");
+        reject_as(baseline,"staged router logits requires parallel projection","staged logits requires explicit parallel topology");
+        baseline.push_back("--parallel-moe-router");
+        require(parse(baseline).staged_moe_router_logits,"staged logits explicit opt-in round trip");
+        auto mtp = request(); mtp.push_back("--parallel-moe-router"); mtp.push_back("--staged-moe-router-logits");
+        reject_as(mtp,"staged router logits excludes MTP","staged logits never silently enters the direct MTP path");
+        baseline.push_back("--staged-moe-router-logits");
+        reject_as(baseline,"duplicate staged MoE router logits option","duplicate staged logits rejected");
+    }
     expert_copy_cli_contract();
     return 0;
 }catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}

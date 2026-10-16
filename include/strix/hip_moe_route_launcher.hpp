@@ -19,6 +19,7 @@ struct HipMoeRouteLauncherConfig {
         HipActivationStorage::bf16;
     bool normalize_selected = true;
     bool parallel_projection = false;
+    bool staged_logits = false;
     bool ranked_topk = false;
     bool wave_topk = false;
     std::shared_ptr<const WaveRouterManifestAdmission> wave_manifest_admission;

@@ -3,9 +3,19 @@
 #include "strix/model_manifest.hpp"
 
 #include <stdexcept>
+#include <cstdint>
 #include <memory>
 
 namespace strix {
+
+// This is a dispatch eligibility predicate, not numerical qualification.
+inline constexpr bool staged_router_logits_eligible(std::uint64_t hidden, std::uint64_t experts,
+    std::uint32_t ggml_type, std::uintptr_t weight_address) noexcept {
+    return hidden == 2560 && experts == 512 && ggml_type == 0 &&
+        weight_address != 0 && weight_address % 16U == 0;
+}
+inline constexpr std::uint32_t staged_router_logits_lds_bytes = 30720;
+
 
 inline void validate_wave_router_selection_contract(
     std::uint64_t experts, std::uint64_t top_k, bool parallel, bool ranked) {

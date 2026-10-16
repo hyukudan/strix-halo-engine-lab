@@ -130,6 +130,18 @@ int main() try {
     auto hole=wave(p,3);hole.indices[0]=3;hole.values[0]=-INFINITY;
     caught=false;try{check_slots(hole,p);}catch(const std::runtime_error&){caught=true;}
     if(!caught)throw std::runtime_error("hole mutant survived");
+    if (!strix::staged_router_logits_eligible(2560,512,0,0x1000U) ||
+        strix::staged_router_logits_lds_bytes != 30720U)
+        throw std::runtime_error("staged router canonical resource contract");
+    for (const auto type : {1U,8U,30U})
+        if (strix::staged_router_logits_eligible(2560,512,type,0x1000U))
+            throw std::runtime_error("staged router accepted non-F32 weights");
+    for (const auto address : {std::uintptr_t{0},std::uintptr_t{0x1004},std::uintptr_t{0x1008}})
+        if (strix::staged_router_logits_eligible(2560,512,0,address))
+            throw std::runtime_error("staged router accepted missing or misaligned weights");
+    if (strix::staged_router_logits_eligible(2559,512,0,0x1000U) ||
+        strix::staged_router_logits_eligible(2560,511,0,0x1000U))
+        throw std::runtime_error("staged router accepted fallback geometry");
     strix::validate_wave_router_selection_contract(512,32,true,false);
     rejects([]{strix::validate_wave_router_selection_contract(512,33,true,false);});
     rejects([]{strix::validate_wave_router_selection_contract(512,10,false,false);});

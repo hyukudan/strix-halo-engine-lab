@@ -560,7 +560,8 @@ void run_case(
     bool seeded = false,
     bool nan_logits = false,
     bool exceptional_weights = false,
-    bool require_distinct_rows = false, float logit_spread = 0.0F, std::uint32_t requested_top_k = 0, bool wave_only = false, unsigned injected_logits = 0) {
+    bool require_distinct_rows = false, float logit_spread = 0.0F, std::uint32_t requested_top_k = 0, bool wave_only = false, unsigned injected_logits = 0,
+    bool staged_case = false) {
     auto model =
         strix::ModelContract::
             qwen38_flash_next();
@@ -1377,6 +1378,23 @@ void run_case(
     parallel_launcher.function(context, parallel_launcher.user_data);
     check(hipDeviceSynchronize(), "synchronize eager parallel router");
     verify_parallel();
+    if (staged_case) {
+    std::vector<std::uint32_t> original_logits(static_cast<std::size_t>(rows) * experts);
+    check(hipMemcpy(original_logits.data(), reinterpret_cast<void*>(workspace_address.address),
+        original_logits.size() * sizeof(std::uint32_t), hipMemcpyDeviceToHost), "save original logits bits");
+    auto staged_config = parallel_config; staged_config.staged_logits = true;
+    auto staged_launcher = strix::make_hip_moe_route_launcher("test.moe_route.staged_logits.parallel", &staged_config);
+    expect(staged_launcher.implementation_identity != parallel_launcher.implementation_identity,
+        "staged logits has its own implementation identity including fallback");
+    check(hipMemset(reinterpret_cast<void*>(workspace_address.address), 0xff, workspace_address.bytes), "poison staged workspace");
+    staged_launcher.function(context, staged_launcher.user_data);
+    check(hipDeviceSynchronize(), "synchronize staged router or exact fallback");
+    std::vector<std::uint32_t> staged_logits(original_logits.size());
+    check(hipMemcpy(staged_logits.data(), reinterpret_cast<void*>(workspace_address.address),
+        staged_logits.size() * sizeof(std::uint32_t), hipMemcpyDeviceToHost), "read staged logits bits");
+    expect(staged_logits == original_logits, "staged or fallback logits match every baseline bit");
+    verify_parallel();
+    }
     hipStream_t stream = nullptr;
     hipGraph_t graph = nullptr;
     hipGraphExec_t executable = nullptr;
@@ -1478,6 +1496,35 @@ void run_case(
     for (unsigned replay=0;replay<3;++replay) {
         poison_ranked();check(hipGraphLaunch(wave_executable,stream),"replay wave router");
         check(hipStreamSynchronize(stream),"wave router replay completion");verify_parallel();
+    }
+    if (staged_case) {
+        std::vector<std::uint32_t> reference_bits(static_cast<std::size_t>(rows)*experts);
+        check(hipMemcpy(reference_bits.data(),reinterpret_cast<void*>(workspace_address.address),
+            reference_bits.size()*4U,hipMemcpyDeviceToHost),"save wave logits before staged capture");
+        auto staged_wave_config = wave_config; staged_wave_config.staged_logits = true;
+        auto staged_wave = strix::make_hip_moe_route_launcher("test.moe_route.staged_logits.wave.parallel",&staged_wave_config);
+        hipGraph_t staged_graph = nullptr; hipGraphExec_t staged_exec = nullptr;
+        { strix::HipLaunchScope scope(launch_context);
+          check(hipStreamBeginCapture(stream,hipStreamCaptureModeThreadLocal),"capture staged wave router");
+          staged_wave.function(context,staged_wave.user_data);
+          check(hipStreamEndCapture(stream,&staged_graph),"finish staged wave capture"); }
+        const auto staged_functions = captured_functions(staged_graph);
+        expect(staged_functions.size()==2U && wave_functions.size()==2U &&
+            staged_functions[1]==wave_functions[1],"staged capture retains exactly two kernels and the original wave selection");
+        const bool eligible = strix::staged_router_logits_eligible(width,experts,ggml_type,runtime.tensors.front().address);
+        expect((staged_functions[0]!=wave_functions[0])==eligible,
+            "actual captured logits function changes exactly when runtime staging admission passes");
+        check(hipGraphInstantiate(&staged_exec,staged_graph,nullptr,nullptr,0),"instantiate staged wave graph");
+        for (unsigned replay=0;replay<2;++replay) {
+            poison_ranked(); check(hipGraphLaunch(staged_exec,stream),"replay staged wave graph");
+            check(hipStreamSynchronize(stream),"complete staged wave graph"); verify_parallel();
+            std::vector<std::uint32_t> observed(reference_bits.size());
+            check(hipMemcpy(observed.data(),reinterpret_cast<void*>(workspace_address.address),
+                observed.size()*4U,hipMemcpyDeviceToHost),"read staged wave logits bits");
+            expect(observed==reference_bits,"staged wave replay preserves all logits bits including exceptional values");
+        }
+        check(hipGraphExecDestroy(staged_exec),"destroy staged wave executable");
+        check(hipGraphDestroy(staged_graph),"destroy staged wave graph");
     }
     check(hipGraphExecDestroy(wave_executable),"destroy wave executable");check(hipGraphDestroy(wave_graph),"destroy wave graph");
     check(hipGraphExecDestroy(ranked_executable), "destroy ranked router executable");
@@ -1672,6 +1719,30 @@ void test_catalog_and_bundle() {
     };
     expect_preflight_rejected(bundle, parallel_compiled, "compiled workspace slots");
     expect_preflight_rejected(parallel_bundle, compiled, "compiled workspace slots");
+    auto staged_config = parallel_config; staged_config.staged_logits = true;
+    auto staged_request = parallel_request; staged_request.staged_moe_router_logits = true;
+    strix::kernels::KernelRegistry staged_kernels;
+    strix::register_hip_moe_route_kernel_variant(model, staged_request, staged_config, staged_kernels);
+    const auto& staged_variant = staged_kernels.variants().front();
+    expect(staged_variant.id.find(".staged_logits.parallel") != std::string::npos &&
+        staged_variant.compiler_identity == "hip-gfx1151-moe-route-v7-staged-logits" &&
+        staged_variant.resources.lds_bytes == 30720U && staged_variant.resources.workgroup_threads == 256U,
+        "staged router identity and conservative LDS/thread resource bound are explicit");
+    auto staged_compiled = parallel_compiled;
+    staged_compiled.bindings = strix::bind_serial_execution_plan(model,execution,staged_kernels,staged_request);
+    strix::HipMoeRouteLauncherBundle staged_bundle(staged_config); strix::ExecutionLauncherRegistry staged_launchers;
+    staged_bundle.register_for_compiled_execution(staged_compiled,staged_launchers);
+    expect_preflight_rejected(staged_bundle,parallel_compiled,"compiled kernel binding");
+    expect_preflight_rejected(parallel_bundle,staged_compiled,"compiled kernel binding");
+    bool staged_mismatch = false;
+    try { strix::register_hip_moe_route_kernel_variant(model,parallel_request,staged_config,staged_kernels); }
+    catch (const std::invalid_argument&) { staged_mismatch = true; }
+    expect(staged_mismatch,"staged variant cannot silently ignore the binding request");
+    auto invalid_staged = config; invalid_staged.staged_logits = true;
+    bool staged_rejected = false;
+    try { (void)strix::make_hip_moe_route_launcher("bad.staged_logits", &invalid_staged); }
+    catch (const std::invalid_argument&) { staged_rejected = true; }
+    expect(staged_rejected,"staged router requires parallel workspace topology");
     auto corrupt = parallel_compiled;
     corrupt.bindings = compiled.bindings;
     expect_preflight_rejected(parallel_bundle, corrupt, "compiled kernel binding");
@@ -1732,6 +1803,14 @@ void test_catalog_and_bundle() {
 
 int main() try {
     qualify_fixture_denormal_scope();
+    for (const auto activation : {strix::HipActivationStorage::bf16,strix::HipActivationStorage::fp32})
+        for (const bool normalize : {false,true}) {
+            run_case(0,activation,512,2560,2,normalize,false,true,false,false,false,true,0.0F,10,false,0,true);
+            run_case(0,activation,512,2560,2,normalize,false,false,false,true,false,false,0.0F,10,false,0,true);
+        }
+    // The explicit request must keep the original kernel for noncanonical shapes/types.
+    run_case(0,strix::HipActivationStorage::fp32,511,67,2,true,false,true,false,false,false,true,0.0F,10,false,0,true);
+    run_case(1,strix::HipActivationStorage::bf16,512,2560,2,true,false,true,false,false,false,true,0.0F,10,false,0,true);
     for (const auto experts : {1U, 31U, 255U, 256U, 257U, 511U, 512U})
         for (const auto k : {1U, std::min(experts, 16U)})
             for (const bool normalize : {false, true}) {

@@ -1381,6 +1381,8 @@ int STRIX_DECODE_ENTRY(
     catalog_config.wave_moe_router_topk = options.wave_moe_router_topk;
     catalog_config.wave_router_manifest_admission = wave_router_admission;
     binding_request.wave_moe_router_topk = options.wave_moe_router_topk;
+    catalog_config.staged_moe_router_logits = options.staged_moe_router_logits;
+    binding_request.staged_moe_router_logits = options.staged_moe_router_logits;
     catalog_config.parallel_moe_router = options.parallel_moe_router;
     binding_request.parallel_moe_router = options.parallel_moe_router;
     catalog_config.virtual_q8_gdn_input = options.virtual_q8_gdn_input;
@@ -1573,6 +1575,9 @@ int STRIX_DECODE_ENTRY(
         throw std::invalid_argument("wave router compiled bindings do not cover every route step");
     const auto wave_fallback_steps = compiled.execution.moe_route_steps - wave_eligible_steps;
     const std::string wave_router_mode_receipt =
+        "  \"staged_moe_router_logits\": " + std::string(options.staged_moe_router_logits ? "true" : "false") + ",\n" +
+        "  \"staged_moe_router_logits_admission\": \"runtime-F32-H2560-E512-weight16B-otherwise-original-logits\",\n" +
+        "  \"staged_moe_router_logits_qualification\": \"experimental-not-assessed\",\n" +
         "  \"wave_moe_router_topk\": " + std::string(options.wave_moe_router_topk ? "true" : "false") + ",\n" +
         "  \"wave_moe_router_topk_eligible_steps\": " + std::to_string(wave_eligible_steps) + ",\n" +
         "  \"wave_moe_router_topk_fallback_steps\": " + std::to_string(wave_fallback_steps) + ",\n";

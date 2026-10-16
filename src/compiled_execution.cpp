@@ -333,6 +333,8 @@ CompiledSerialExecution compile_serial_execution(
         (binding_request.device_graph_inputs || binding_request.require_graph_safe ||
          binding_request.logical_rows != 1 || binding_request.request_concurrency != 1))
         throw std::invalid_argument("Q8 projection organizations require eager C1 execution");
+    if (binding_request.staged_moe_router_logits && !binding_request.parallel_moe_router)
+        throw std::invalid_argument("staged router logits requires parallel projection");
     if (binding_request.wave_moe_router_topk &&
         (!binding_request.parallel_moe_router || binding_request.ranked_moe_router_topk))
         throw std::invalid_argument("wave router requires parallel topology and excludes ranked mode");
@@ -552,7 +554,8 @@ CompiledSerialExecution compile_serial_execution(
             binding.kernel_id->ends_with(moe_q4k_a8::runtime_kernel_suffix) != buffer_request.q4k_a8g32_gate_up)
             throw std::invalid_argument("bound Q4K A8 kernel differs from admitted topology");
         if (binding.op == SerialOp::moe_route && binding.kernel_id.has_value() &&
-            (binding.kernel_id->ends_with(".parallel") != buffer_request.parallel_moe_router ||
+            ((binding.kernel_id->find(".staged_logits") != std::string::npos) != binding_request.staged_moe_router_logits ||
+             binding.kernel_id->ends_with(".parallel") != buffer_request.parallel_moe_router ||
              binding.kernel_id->ends_with(".ranked.parallel") != binding_request.ranked_moe_router_topk ||
              binding.kernel_id->ends_with(".wave.parallel") != binding_request.wave_moe_router_topk))
             throw std::invalid_argument("bound router kernel differs from admitted topology");

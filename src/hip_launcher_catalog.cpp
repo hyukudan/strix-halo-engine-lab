@@ -238,7 +238,7 @@ HipMoeRouteLauncherConfig
 moe_route_config(
     const ModelContract& model,
     HipActivationStorage activation, bool parallel = false, bool ranked = false, bool wave = false,
-    std::shared_ptr<const WaveRouterManifestAdmission> admission = {}) {
+    std::shared_ptr<const WaveRouterManifestAdmission> admission = {}, bool staged = false) {
     HipMoeRouteLauncherConfig config;
     config.hidden_size =
         checked_u32(
@@ -257,6 +257,7 @@ moe_route_config(
     config.normalize_selected =
         model.norm_topk_probability;
     config.parallel_projection = parallel;
+    config.staged_logits = staged;
     config.ranked_topk = ranked;
     config.wave_topk = wave;
     config.wave_manifest_admission = std::move(admission);
@@ -389,6 +390,9 @@ void register_complete_hip_kernel_catalog(
          config.wave8_q8_gdn_output || config.wave8_q8_qsa_output) &&
         (config.enable_device_graph_inputs || request.device_graph_inputs || request.require_graph_safe || alternate_lm_head))
         throw std::invalid_argument("HIP catalog Q8 organizations support eager floating execution only");
+    if (config.staged_moe_router_logits != request.staged_moe_router_logits ||
+        (config.staged_moe_router_logits && !config.parallel_moe_router))
+        throw std::invalid_argument("staged router catalog mode differs from binding request");
     if (config.wave_moe_router_topk != request.wave_moe_router_topk ||
         (config.wave_moe_router_topk && (!config.parallel_moe_router || config.ranked_moe_router_topk)))
         throw std::invalid_argument("HIP catalog wave router mode differs from binding request");
@@ -522,7 +526,7 @@ void register_complete_hip_kernel_catalog(
     const auto moe_route =
         moe_route_config(
             model,
-            config.activation, config.parallel_moe_router, config.ranked_moe_router_topk, config.wave_moe_router_topk, config.wave_router_manifest_admission);
+            config.activation, config.parallel_moe_router, config.ranked_moe_router_topk, config.wave_moe_router_topk, config.wave_router_manifest_admission, config.staged_moe_router_logits);
     register_hip_moe_route_kernel_variant(
         model,
         request,
@@ -600,7 +604,7 @@ HipLauncherCatalog::HipLauncherCatalog(
       moe_route_(
           moe_route_config(
               model,
-              config.activation, config.parallel_moe_router, config.ranked_moe_router_topk, config.wave_moe_router_topk, config.wave_router_manifest_admission)),
+              config.activation, config.parallel_moe_router, config.ranked_moe_router_topk, config.wave_moe_router_topk, config.wave_router_manifest_admission, config.staged_moe_router_logits)),
       moe_experts_(
           moe_experts_config(
               model,
@@ -660,7 +664,7 @@ register_for_compiled_execution(
     if (splitk_deferred_norm_) validate_deferred_hc_catalog_model(compiled,resources);
     if (gdn_islands && (device_graph_inputs_ || alternate_lm_head_ || !deferred_moe_status_ || !resources ||
         (gdn_config_.wave8_q8_input_projections != gdn_config_.wave8_q8_output_projection) ||
-        gdn_config_.recurrent_layout != HipGdnRecurrentLayout::baseline))
+        !gdn_island_recurrent_layout_admitted(gdn_config_.recurrent_layout)))
         throw std::invalid_argument("GDN islands require eager floating execution with retained D1 resources");
     if (compiled.device_graph_inputs != device_graph_inputs_)
         throw std::invalid_argument("launcher catalog graph mode differs from compiled plan");

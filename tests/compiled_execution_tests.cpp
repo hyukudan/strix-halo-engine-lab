@@ -87,6 +87,7 @@ strix::kernels::KernelRegistry make_registry(
         registry.add(
             make_variant(
                 "test." + key + suffix +
+                    (step.op == strix::SerialOp::moe_route && request.staged_moe_router_logits ? ".staged_logits" : "") +
                     (step.op == strix::SerialOp::moe_route && request.wave_moe_router_topk ? ".wave.parallel" :
                      step.op == strix::SerialOp::moe_route && request.ranked_moe_router_topk ? ".ranked.parallel" :
                      step.op == strix::SerialOp::moe_route && request.parallel_moe_router ? ".parallel" : "") +
@@ -570,6 +571,17 @@ int main() {
         catch (const std::invalid_argument&) { return true; } return false;
     };
     expect(rejects_ranked(router_registry, ranked_binding, router_buffers), "ranked admission rejects parallel-only kernel");
+    auto staged_binding = router_binding; staged_binding.staged_moe_router_logits = true;
+    const auto staged_registry = make_registry(model, staged_binding);
+    const auto staged_compiled = strix::compile_serial_execution(model, staged_registry, staged_binding, router_buffers);
+    expect(staged_compiled.execution_identity != router_compiled.execution_identity &&
+        staged_compiled.kernel_plan_identity != router_compiled.kernel_plan_identity &&
+        staged_compiled.arena.total_bytes == router_compiled.arena.total_bytes,
+        "staged router changes implementation identities without another workspace");
+    expect(rejects_ranked(router_registry, staged_binding, router_buffers), "staged admission rejects original binding");
+    expect(rejects_ranked(staged_registry, router_binding, router_buffers), "original admission rejects staged binding");
+    auto invalid_staged = binding_request; invalid_staged.staged_moe_router_logits = true;
+    expect(rejects_ranked(registry, invalid_staged, buffer_request), "staged logits rejects missing parallel topology");
     expect(rejects_ranked(ranked_registry, router_binding, router_buffers), "parallel-only admission rejects ranked kernel");
     auto wave_binding = router_binding; wave_binding.wave_moe_router_topk = true;
     const auto wave_registry = make_registry(model, wave_binding);

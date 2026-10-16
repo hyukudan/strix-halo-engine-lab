@@ -168,6 +168,7 @@ struct Options {
     bool wave8_q8_gdn_output = false;
     bool wave8_q8_qsa_output = false;
     bool parallel_moe_router = false;
+    bool staged_moe_router_logits = false;
     bool virtual_q8_gdn_input = false;
     bool ranked_moe_router_topk = false;
     bool wave_moe_router_topk = false;
@@ -343,6 +344,20 @@ inline void validate_model_copy_cli(const Options& o) {
         throw std::invalid_argument("selective model copy requires exact-v5 or an admitted explicit expert recipe");
 }
 
+// An experimental layout composes only with an explicit complete manual
+// organization; it never changes automatic profile eligibility or defaults.
+inline bool explicit_transposed_gdn_islands(const Options& options) {
+    return options.gdn_islands && options.gdn_recurrent_layout == HipGdnRecurrentLayout::transposed &&
+        options.gdn_recurrent_layout_explicit && options.profile_explicit &&
+        options.optimization_profile == OptimizationProfile::manual &&
+        options.gdn_recurrent_storage == GdnRecurrentStorage::key_value;
+}
+inline bool transposed_gdn_island_numerical_recipe(const Options& options) {
+    return explicit_transposed_gdn_islands(options) && options.numerical_profile_explicit &&
+        (options.numerical_profile == DecodeNumericalProfile::hc_splitk_f32_q51_q80_a8_down_v1 ||
+         options.numerical_profile == DecodeNumericalProfile::hc_splitk_f32_q51_q80_a8_down_q5k_a8_gateup_v1);
+}
+
 // Arithmetic overlays never silently replace the selected submission profile.
 inline void validate_numerical_profile_cli(const Options& options) {
     if (options.numerical_profile == DecodeNumericalProfile::exact_v5) return;
@@ -354,7 +369,8 @@ inline void validate_numerical_profile_cli(const Options& options) {
         !options.serving_prefix_files.empty() || options.serving_concurrency != 1 ||
         options.serving_tensor_cohort_rows != 1 || options.serving_prefill_rows ||
         options.prefix_cache_roundtrip || options.gpu_greedy_token ||
-        options.moe_token_cost_policy || options.gdn_recurrent_layout != HipGdnRecurrentLayout::baseline ||
+        options.moe_token_cost_policy || (options.gdn_recurrent_layout != HipGdnRecurrentLayout::baseline &&
+            !transposed_gdn_island_numerical_recipe(options)) ||
         options.gdn_recurrent_storage != GdnRecurrentStorage::key_value ||
         options.qsa_hierarchical_selection || options.qsa_gqa_heads_per_block != 1 ||
         options.prefetch_hc_projection_next_tile || options.ranked_moe_router_topk ||
@@ -635,15 +651,28 @@ inline void validate_resolved_gdn_recurrent_layout(const Options& options) {
     (void)strix::gdn_recurrent_layout_marker(options.gdn_recurrent_layout);
     if (options.gdn_recurrent_layout != strix::HipGdnRecurrentLayout::baseline &&
         (options.execution.mode != strix::DecodeExecutionMode::eager ||
-         options.execution.integer_head != strix::DecodeIntegerHead::none || options.gdn_islands))
-        throw std::invalid_argument("GDN recurrent LDS layout requires eager floating execution without islands");
+         options.execution.integer_head != strix::DecodeIntegerHead::none ||
+         (options.gdn_islands && !gdn_island_recurrent_layout_admitted(options.gdn_recurrent_layout))))
+        throw std::invalid_argument("GDN recurrent LDS layout requires eager floating execution with an admitted island layout");
+    if (options.gdn_islands && options.gdn_recurrent_layout == HipGdnRecurrentLayout::transposed &&
+        (!explicit_transposed_gdn_islands(options) || options.mtp.enabled || options.mtp.supplied ||
+         options.known_prefix_window || options.known_prefix_rows_explicit || options.known_prefix_prefill_rows ||
+         options.known_prefix_expert_union || options.prompt_lookup || !options.serving_prefix_files.empty() ||
+         options.serving_concurrency_explicit || options.serving_tensor_cohort_explicit ||
+         options.serving_memory_explicit || options.serving_request_explicit || options.serving_headroom_explicit ||
+         options.serving_cache_entries_explicit || options.serving_cache_snapshot_explicit ||
+         options.serving_cache_peak_explicit || options.serving_cache_tokens_explicit ||
+         options.serving_prefill_rows || options.serving_prefill_explicit ||
+         options.serving_prefill_workspace_explicit || options.serving_prefill_metadata_explicit))
+        throw std::invalid_argument("transposed GDN islands require explicit manual ordinary eager C1 execution");
 }
 
 inline void validate_resolved_gdn_islands(const Options& options) {
     if (!options.gdn_islands) return;
+    validate_resolved_gdn_recurrent_layout(options);
     if (options.execution.mode != strix::DecodeExecutionMode::eager ||
         options.execution.integer_head != strix::DecodeIntegerHead::none || options.prefix_cache_roundtrip ||
-        options.gdn_recurrent_layout != strix::HipGdnRecurrentLayout::baseline ||
+        !gdn_island_recurrent_layout_admitted(options.gdn_recurrent_layout) ||
         options.gdn_recurrent_storage != strix::GdnRecurrentStorage::key_value ||
         (options.wave8_q8_gdn_input != options.wave8_q8_gdn_output))
         throw std::invalid_argument("GDN islands require eager floating execution without prefix roundtrip and paired wave8 GDN flags");
@@ -1232,6 +1261,11 @@ inline Options parse_options(
             continue;
 #endif
         }
+        if (argument == "--staged-moe-router-logits") {
+            if (options.staged_moe_router_logits) throw std::invalid_argument("duplicate staged MoE router logits option");
+            options.staged_moe_router_logits = true;
+            continue;
+        }
         if (argument == "--wave-moe-router-topk") {
             if (options.wave_moe_router_topk) throw std::invalid_argument("duplicate wave MoE router top-k option");
             options.wave_moe_router_topk = true;
@@ -1661,6 +1695,10 @@ inline Options parse_options(
     }
     if(options.grouped_exact_q51_down && !options.q4k_a8g32_gate_up)
         throw std::invalid_argument("--grouped-exact-q51-down requires --q4k-a8g32-gate-up");
+    if (options.staged_moe_router_logits && !options.parallel_moe_router)
+        throw std::invalid_argument("staged router logits requires parallel projection");
+    if (options.staged_moe_router_logits && (options.mtp.enabled || options.mtp.supplied))
+        throw std::invalid_argument("staged router logits excludes MTP");
     if (options.wave_moe_router_topk && (!options.parallel_moe_router || options.ranked_moe_router_topk))
         throw std::invalid_argument("--wave-moe-router-topk requires --parallel-moe-router and excludes --ranked-moe-router-topk");
     if (options.ranked_moe_router_topk && !options.parallel_moe_router)
