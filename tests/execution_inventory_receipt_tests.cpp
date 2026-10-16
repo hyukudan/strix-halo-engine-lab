@@ -99,6 +99,23 @@ int main() {
            text.find("\"qualification\":\"oracle_matched\"") != std::string::npos,
            "runtime launchers and declared kernel qualification remain distinct");
     expect(calls == 0, "inventory never calls a launcher");
+    expect(text.find("\"offline_tuning_selection\":null") != std::string::npos &&
+           text.find("\"numerical_contract_identity\":null") != std::string::npos,
+           "missing tuning request and unknown numerical equivalence remain explicit");
+    for (const auto reason : {strix::kernels::TuningSelectionReason::qualified_record,
+            strix::kernels::TuningSelectionReason::invalid_key,
+            strix::kernels::TuningSelectionReason::ambiguous_records,
+            strix::kernels::TuningSelectionReason::no_qualified_record}) {
+        auto tuned = fixture.compiled;
+        for (auto& binding : tuned.bindings.bindings) {
+            if (!binding.host_or_runtime_step) { binding.tuning_selection_reason = reason; break; }
+        }
+        const auto receipt = strix::decode_receipt::execution_inventory_receipt(tuned, fixture.launches, fixture.variants);
+        const std::string expected = std::string("\"offline_tuning_selection\":\"") +
+            strix::decode_receipt::execution_inventory_detail::tuning_reason(reason) + '"';
+        expect(receipt.find(expected) != std::string::npos,
+            "selected tuning/fallback reason was omitted from the compiled receipt");
+    }
 
     auto invalid = fixture.launches;
     ++invalid.execution_identity;

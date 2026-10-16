@@ -13,6 +13,15 @@
 
 namespace strix::decode_receipt {
 namespace execution_inventory_detail {
+inline const char* tuning_reason(kernels::TuningSelectionReason reason) {
+    switch (reason) {
+    case kernels::TuningSelectionReason::qualified_record: return "qualified_record";
+    case kernels::TuningSelectionReason::invalid_key: return "invalid_key";
+    case kernels::TuningSelectionReason::ambiguous_records: return "ambiguous_records";
+    case kernels::TuningSelectionReason::no_qualified_record: return "no_qualified_record";
+    }
+    throw std::invalid_argument("inventory tuning selection reason is invalid");
+}
 inline const char* qualification_name(kernels::QualificationStatus status) {
     switch (status) {
     case kernels::QualificationStatus::experimental: return "experimental";
@@ -89,7 +98,7 @@ inline std::string execution_inventory_receipt(
         const ExecutionLauncher* previous = nullptr;
         std::string key;
         if (binding.host_or_runtime_step) {
-            if (binding.kernel_id || binding.family || operator_family_for(step.op)) fail();
+            if (binding.kernel_id || binding.family || binding.tuning_selection_reason || operator_family_for(step.op)) fail();
             previous = bound_launchers.find_runtime_launcher(step.op);
             key = "runtime:" + std::string(to_string(step.op));
             ++runtime_count;
@@ -145,6 +154,10 @@ inline std::string execution_inventory_receipt(
             << ",\"launcher_bound\":true,\"launcher_implementation_identity\":" << launch.implementation_identity
             << ",\"kernel_id\":";
         if (binding.kernel_id) string(out, *binding.kernel_id); else out << "null";
+        out << ",\"offline_tuning_selection\":";
+        if (binding.tuning_selection_reason)
+            string(out, execution_inventory_detail::tuning_reason(*binding.tuning_selection_reason));
+        else out << "null";
         out << ",\"declared_variant\":";
         if (binding.host_or_runtime_step) out << "null";
         else {
@@ -167,6 +180,9 @@ inline std::string execution_inventory_receipt(
                 << ",\"qualification\":";
             string(out, execution_inventory_detail::qualification_name(variant.qualification));
             out << ",\"compiler_identity\":"; string(out, variant.compiler_identity);
+            out << ",\"numerical_contract_identity\":";
+            if (variant.numerical_contract_identity) out << variant.numerical_contract_identity;
+            else out << "null";
             out << '}';
         }
         out << '}';
