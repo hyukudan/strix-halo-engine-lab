@@ -161,6 +161,88 @@ float round_bf16(float value) {
     return static_cast<float>(std::copysign(std::ldexp(static_cast<double>(integer), exponent - 8), value));
 }
 
+// Canonical dimensions are essential: the smaller arithmetic fixture below
+// fits inside the old 65280-byte allocation and cannot exercise this gate.
+void canonical_slot_workspace_rejection(bool bf16) {
+    const auto model=strix::ModelContract::qwen38_flash_next();
+    const auto plan=strix::build_serial_decode_execution_plan(model);
+    const auto io=strix::build_serial_execution_io_plan(plan);
+    const auto& step=first_expert_step(plan);
+    const auto& step_io=io.steps[step.id];
+    strix::ExecutionBufferRequest request;
+    request.q4k_a8g32_gate_up=true; request.grouped_exact_q51_down=true;
+    request.q51_slot_parallel_down=false;
+    request.activation_element_bytes=bf16?2U:4U; request.mlp_intermediate_element_bytes=4U;
+    const auto arena=strix::build_serial_execution_arena_plan(model,request,plan,io,256U);
+    strix::HipSetupQuiescenceGuard guard;
+    void* owner=nullptr; hipStream_t stream=nullptr; hipGraph_t graph=nullptr;
+    bool capturing=false;
+    try {
+        guard.run([&] {
+            check(hipMalloc(&owner,static_cast<std::size_t>(arena.total_bytes)),"allocate canonical flag-off arena");
+            check(hipMemset(owner,0xa5,static_cast<std::size_t>(arena.total_bytes)),"poison every canonical arena byte");
+        });
+        strix::ExecutionMemoryBinding memory{0x5135314f4c445731ULL,
+            reinterpret_cast<std::uintptr_t>(owner),arena.total_bytes,1U};
+        const auto temporary=strix::resolve_execution_buffer(memory.execution_identity,arena,memory,step_io.temporaries[0]);
+        expect(temporary.bytes==65280U,"canonical flag-off temporary is exactly 65280 bytes");
+        expect(strix::moe_q4k_a8::build_runtime_workspace(2560,640,512,10,true).total_bytes==167680U,
+            "canonical flag-on temporary requirement is exactly 167680 bytes");
+        strix::ExecutionRuntimeResources resources; resources.scratch=&memory;
+        strix::ExecutionDispatchContext context;
+        context.execution_identity=memory.execution_identity; context.step_id=step.id;
+        context.op=step.op; context.layer=step.layer;
+        context.reads=step_io.reads; context.writes=step_io.writes; context.temporaries=step_io.temporaries;
+        context.arena=&arena; context.memory=&memory; context.resources=&resources;
+        strix::HipMoeExpertsLauncherConfig config;
+        config.hidden_size=2560U; config.intermediate_size=640U; config.expert_count=512U; config.top_k=10U;
+        config.activation=bf16?strix::HipActivationStorage::bf16:strix::HipActivationStorage::fp32;
+        config.q4k_a8g32_gate_up=true; config.grouped_exact_q51_down=true; config.q51_slot_parallel_down=true;
+        const auto launcher=strix::make_hip_moe_experts_launcher("test.q51-slot-parallel-v1"+
+            std::string(strix::moe_q4k_a8::grouped_q51_kernel_ending),&config);
+        std::vector<std::byte> before(static_cast<std::size_t>(arena.total_bytes)),after(before.size());
+        guard.run([&] {check(hipMemcpy(before.data(),owner,before.size(),hipMemcpyDeviceToHost),"read complete canonical arena before rejection");});
+        expect(std::all_of(before.begin(),before.end(),[](auto value) {return value==std::byte{0xa5};}),
+            "canonical rejection starts with every arena byte poisoned");
+        const auto unchanged=[&] {
+            guard.run([&] {check(hipMemcpy(after.data(),owner,after.size(),hipMemcpyDeviceToHost),"read every canonical arena byte after rejection");});
+            expect(before==after,"canonical old-workspace rejection preserves every arena byte");
+        };
+        bool rejected=false;
+        try {launcher.function(context,launcher.user_data);}
+        catch(const std::invalid_argument& error) {
+            rejected=std::string(error.what())=="HIP routed-expert buffers are undersized";
+        }
+        expect(rejected,"canonical flag-on launcher reaches exact old-workspace undersized admission gate");
+        unchanged();
+        check(hipStreamCreateWithFlags(&stream,hipStreamNonBlocking),"create canonical rejection stream");
+        check(hipStreamBeginCapture(stream,hipStreamCaptureModeThreadLocal),"begin canonical old-workspace capture");
+        capturing=true; rejected=false;
+        strix::HipLaunchContext launch_context; launch_context.stream=stream;
+        { strix::HipLaunchScope scope(launch_context);
+            try {launcher.function(context,launcher.user_data);}
+            catch(const std::invalid_argument& error) {
+                // Eager-only admission precedes the otherwise undersized check.
+                rejected=std::string(error.what())=="slot-parallel Q5_1 down admits eager execution only";
+            }
+        }
+        check(hipStreamEndCapture(stream,&graph),"end canonical rejection capture"); capturing=false;
+        std::size_t nodes=0; check(hipGraphGetNodes(graph,nullptr,&nodes),"count canonical rejected graph nodes");
+        expect(rejected&&nodes==0U,"canonical captured old-workspace call rejects at eager gate with no nodes");
+        unchanged();
+        check(hipGraphDestroy(graph),"destroy canonical empty graph"); graph=nullptr;
+        check(hipStreamDestroy(stream),"destroy canonical rejection stream"); stream=nullptr;
+        check(hipFree(owner),"free canonical rejection arena"); owner=nullptr;
+    } catch(...) {
+        if(capturing) {hipGraph_t abandoned=nullptr; (void)hipStreamEndCapture(stream,&abandoned); if(abandoned)(void)hipGraphDestroy(abandoned);}
+        guard.recover_or_fail_stop();
+        if(graph)(void)hipGraphDestroy(graph);
+        if(stream)(void)hipStreamDestroy(stream);
+        if(owner)(void)hipFree(owner);
+        throw;
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) try {
@@ -176,6 +258,7 @@ int main(int argc, char** argv) try {
     if(q4k_a8) throw std::invalid_argument("Q4K A8 test requires runtime capability");
 #endif
     const bool bf16 = requested_mode >= 4U;
+    if(slot_parallel_q51) canonical_slot_workspace_rejection(bf16);
     const auto mode = requested_mode % 4U;
     constexpr std::array<std::uint32_t, 3> types{12U, 13U, 7U};
     const auto gate_type = mode < 3U ? types[mode] : 12U;

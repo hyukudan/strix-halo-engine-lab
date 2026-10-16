@@ -64,6 +64,13 @@ struct Stream {
 void half_at(std::span<std::byte> row,unsigned block,unsigned offset,std::uint16_t bits) {
     row[block*24U+offset]=std::byte(bits&255U); row[block*24U+offset+1U]=std::byte(bits>>8U);
 }
+void code_at(std::span<std::byte> row,unsigned feature,unsigned code) {
+    const auto base=feature/32U*24U,lane=feature%32U;
+    const auto shift=lane/16U*4U;
+    const auto prior=std::to_integer<unsigned>(row[base+8U+lane%16U]);
+    row[base+8U+lane%16U]=std::byte((prior&~(15U<<shift))|((code&15U)<<shift));
+    if(code&16U) row[base+4U+lane/8U]|=std::byte(1U<<(lane%8U));
+}
 void run(Guard guard,old::Shape shape,unsigned special=0,bool duplicate=false) {
     const auto n=old::required_bytes(shape);
     const auto raw_bytes=candidate::required_rawdots_bytes(shape);
@@ -72,7 +79,7 @@ void run(Guard guard,old::Shape shape,unsigned special=0,bool duplicate=false) {
     std::vector<std::uint32_t> routes(shape.top_k);
     std::vector<float> mix(shape.top_k);
     for(unsigned slot=0;slot<shape.top_k;++slot) {
-        routes[slot]=duplicate?0U:(slot*3U+1U)%shape.experts;
+        routes[slot]=duplicate?0U:(slot*7U+1U)%shape.experts;
         mix[slot]=slot%2U?-0.75F:0.5F;
         if(special==1U) mix[slot]=slot%2U?-0.0F:0.0F;
         if(special==2U) mix[slot]=-1.0F;
@@ -84,7 +91,7 @@ void run(Guard guard,old::Shape shape,unsigned special=0,bool duplicate=false) {
             if(special==2U) value=0.0F;
             if(special==3U) value=std::bit_cast<float>((feature%127U)+1U);
             if(special==4U||special==5U) value=std::numeric_limits<float>::max();
-            if(special==6U||special==8U) value=std::bit_cast<float>(feature%2U?0x7fc54321U:0x7fc12345U);
+            if(special==6U||special==8U) value=std::bit_cast<float>((feature%2U?0x7fc54321U:0x7fc12345U)+slot*0x100U);
             if(special==7U) value=std::bit_cast<float>(0x80000001U);
             input[static_cast<std::size_t>(slot)*2U*shape.intermediate+feature]=value;
         }
@@ -93,9 +100,36 @@ void run(Guard guard,old::Shape shape,unsigned special=0,bool duplicate=false) {
     for(unsigned expert=0;expert<shape.experts;++expert) for(unsigned out=0;out<shape.hidden;++out) {
         auto row=std::span<std::byte>(weights).subspan((static_cast<std::size_t>(expert)*shape.hidden+out)*row_bytes,row_bytes);
         for(unsigned block=0;block<shape.intermediate/32U;++block) {
-            // Code zero with nonzero m exercises the offset term independently.
-            half_at(row,block,0,special==8U?0x7e11U:0x3c00U);
-            half_at(row,block,2,special==8U?0x7e22U:special==4U||special==5U?0x7bffU:0x3800U);
+            // Ordinary finite cases distinguish expert/output/block indexing;
+            // special values retain their constructive coefficient patterns.
+            const auto key=expert*17U+out*7U+block*3U;
+            const std::uint16_t d=static_cast<std::uint16_t>(special==0U?0x3000U+(key%4U)*0x400U:0x3c00U);
+            const std::uint16_t m=special==0U?static_cast<std::uint16_t>((key%2U?0x8000U:0U)|(0x3000U+((key/2U)%3U)*0x400U)):
+                static_cast<std::uint16_t>(special==4U||special==5U?0x7bffU:0x3800U);
+            half_at(row,block,0,special==8U?static_cast<std::uint16_t>(0x7e10U+expert):d);
+            half_at(row,block,2,special==8U?static_cast<std::uint16_t>(0x7e80U+expert):m);
+        }
+        if(special==0U) for(unsigned feature=0;feature<shape.intermediate;++feature)
+            code_at(row,feature,(expert*19U+out*11U+(feature/32U)*7U+feature*3U)%32U);
+    }
+    const bool finite_oracle=special<=3U||special==7U;
+    std::vector<std::uint32_t> independent_raw(static_cast<std::size_t>(raw_bytes/4U)),independent_output(shape.hidden);
+    if(finite_oracle) {
+        for(unsigned slot=0;slot<shape.top_k;++slot) for(unsigned out=0;out<shape.hidden;++out) {
+            const auto row=(static_cast<std::size_t>(routes[slot])*shape.hidden+out)*row_bytes;
+            const auto dot=q51_down_test::legacy(std::span<const float>(input).subspan(
+                static_cast<std::size_t>(slot)*2U*shape.intermediate,shape.intermediate),
+                std::span<const std::byte>(weights).subspan(row,row_bytes));
+            require(std::isfinite(dot),"finite raw-dot oracle escaped finite scope");
+            independent_raw[static_cast<std::size_t>(slot)*shape.hidden+out]=std::bit_cast<std::uint32_t>(dot);
+        }
+        for(unsigned out=0;out<shape.hidden;++out) {
+            std::array<float,10> dots{};
+            for(unsigned slot=0;slot<shape.top_k;++slot)
+                dots[slot]=std::bit_cast<float>(independent_raw[static_cast<std::size_t>(slot)*shape.hidden+out]);
+            const auto value=q51_down_test::combine(std::span<const float>(dots.data(),shape.top_k),mix);
+            require(std::isfinite(value),"finite slot-combine oracle escaped finite scope");
+            independent_output[out]=std::bit_cast<std::uint32_t>(value);
         }
     }
     Buffer activations(guard,n.intermediates),packed(guard,n.weights),ids(guard,n.routes),route_weights(guard,n.route_weights),
@@ -116,18 +150,18 @@ void run(Guard guard,old::Shape shape,unsigned special=0,bool duplicate=false) {
         return accumulation.read();
     };
     const auto expected=execute(false);
+    if(finite_oracle) require(expected==independent_output,"actual grouped accumulator differs from independent finite combine oracle");
     for(unsigned repeat=0;repeat<3U;++repeat) {
         require(execute(true)==expected,"slot-parallel complete accumulator differs bitwise from actual grouped kernel");
         require(status.read().front()==0U,"valid slot probe changed sticky status");
-        if(special<=3U||special==7U) {
-            const auto actual=raw.read();
-            for(unsigned slot=0;slot<shape.top_k;++slot) for(unsigned out=0;out<shape.hidden;++out) {
-                const auto row=(static_cast<std::size_t>(routes[slot])*shape.hidden+out)*row_bytes;
-                const auto dot=q51_down_test::legacy(std::span<const float>(input).subspan(
-                    static_cast<std::size_t>(slot)*2U*shape.intermediate,shape.intermediate),
-                    std::span<const std::byte>(weights).subspan(row,row_bytes));
-                require(actual[static_cast<std::size_t>(slot)*shape.hidden+out]==std::bit_cast<std::uint32_t>(dot),
-                    "raw dot differs from original virtual256 independent oracle");
+        const auto actual=raw.read();
+        if(finite_oracle) require(actual==independent_raw,"every raw dot equals independent original256 oracle bits");
+        if(special==6U||special==8U) {
+            for(unsigned slot=0;slot<shape.top_k;++slot) {
+                const auto bits=actual[static_cast<std::size_t>(slot)*shape.hidden];
+                require((bits&0x7fffffffU)>0x7f800000U,"NaN slot discriminator did not produce a NaN dot");
+                for(unsigned previous=0;previous<slot;++previous)
+                    require(bits!=actual[static_cast<std::size_t>(previous)*shape.hidden],"NaN slot payloads fail to discriminate merge operand precedence");
             }
         }
     }

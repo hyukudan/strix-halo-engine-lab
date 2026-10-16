@@ -29,8 +29,10 @@ separate finite scan; existing output checks and commit rules remain in force.
 The new path submits a dot grid across outputs and selected slots followed by
 one ordered merge. It adds one launch and approximately 204800 bytes of logical
 scratch traffic per eligible layer. The observed submission counter is reported
-separately from the grouped-path counter. Additional parallel work does not by
-itself establish improved occupancy or end-to-end throughput.
+separately from the grouped-path counter. It increments after both kernels are
+successfully enqueued, including calls later rejected by existing status checks.
+Additional parallel work does not by itself establish improved occupancy or
+end-to-end throughput.
 
 Source implementation and host/native fixtures are present. Qualification still
 requires source review, compiler arithmetic and resource inspection, native

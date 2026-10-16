@@ -806,6 +806,18 @@ int main() {
         slot_config.q51_slot_parallel_down = true;
         slot_config.grouped_exact_q51_down = true;
         slot_config.q4k_a8g32_gate_up = true;
+        {
+            strix::integer_projection::RuntimeConfig integer_config;
+            strix::kernels::KernelRegistry rejected_registry;
+            bool rejected = false;
+            try { strix::register_complete_hip_kernel_catalog(model, slot_request,
+                slot_config, rejected_registry, &integer_config); }
+            catch (const std::invalid_argument& error) {
+                rejected = std::string(error.what()).find("slot-parallel Q5_1") != std::string::npos;
+            }
+            expect(rejected && rejected_registry.variants().empty(),
+                   "public catalog rejects slot-parallel Q5_1 with integer head before publication");
+        }
         for (unsigned mutation = 0; mutation < 7; ++mutation) {
             auto bad_config = slot_config;
             auto bad_request = slot_request;

@@ -168,6 +168,11 @@ def validate_outer_receipt(receipt):
     for key in ("q4k_a8g32_gate_up", "grouped_exact_q51_down"):
         if key in receipt:
             boolean(receipt[key], key)
+    if "q51_slot_parallel_down" in receipt and receipt["q51_slot_parallel_down"] is not None:
+        boolean(receipt["q51_slot_parallel_down"], "q51_slot_parallel_down")
+    if ("q51_slot_parallel_down_qualification" in receipt and
+            receipt["q51_slot_parallel_down_qualification"] != "not_assessed"):
+        raise ValueError("q51_slot_parallel_down_qualification must be not_assessed")
 
 
 def profile(receipt):
@@ -389,9 +394,15 @@ def collect(repo, cache_path=None, receipt_path=None, audit_path=None, manifest_
             boolean(value, name)
     if hip is False and a8 is True:
         conflicts.append({"field": "build", "reason": "A8 configured without HIP runtime"})
-    for flag in ("q4k_a8g32_gate_up", "grouped_exact_q51_down"):
+    for flag in ("q4k_a8g32_gate_up", "grouped_exact_q51_down", "q51_slot_parallel_down"):
         if a8 is False and flag in receipt:
             agree("build/" + flag, False, receipt[flag])
+    slot_submissions = receipt.get("slot_parallel_q51_submissions")
+    if a8 is False and slot_submissions is not None and slot_submissions > 0:
+        agree("build/slot_parallel_q51_submissions", 0, slot_submissions)
+    if receipt.get("q51_slot_parallel_down") is True:
+        agree("overlay/q51-grouped", True, receipt.get("grouped_exact_q51_down"))
+        agree("overlay/q51-A8", True, receipt.get("q4k_a8g32_gate_up"))
     applied = effective["automatic_applied"]
     if applied is not None:
         agree("profile/manual", effective["selected"] == "manual", not applied)

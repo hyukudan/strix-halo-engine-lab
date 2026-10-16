@@ -308,7 +308,7 @@ void register_complete_hip_kernel_catalog(
     if (config.q51_slot_parallel_down != request.q51_slot_parallel_down ||
         (config.q51_slot_parallel_down && (!config.grouped_exact_q51_down || !config.q4k_a8g32_gate_up ||
          !request.grouped_exact_q51_down || !request.q4k_a8g32_gate_up ||
-         config.enable_device_graph_inputs || request.device_graph_inputs || request.require_graph_safe ||
+         config.enable_device_graph_inputs || request.device_graph_inputs || request.require_graph_safe || alternate_lm_head ||
          request.logical_rows != 1 || request.request_concurrency != 1)))
         throw std::invalid_argument("HIP catalog slot-parallel Q5_1 requires matching grouped eager C1 A8 mode");
     if(config.grouped_exact_q51_down != request.grouped_exact_q51_down)
@@ -499,6 +499,8 @@ HipLauncherCatalog::HipLauncherCatalog(
               model,
               config.activation,config.prefetch_q8_shared_expert,config.shared_expert_prefetch_layers,
               config.shared_expert_prefetch_stats)) {
+    if (config.q51_slot_parallel_down && alternate_lm_head_)
+        throw std::invalid_argument("HIP catalog slot-parallel Q5_1 excludes an integer LM head");
     if ((config.prefetch_q8_lm_head || config.wave8_q8_lm_head || config.wave8_q8_gdn_input ||
          config.wave8_q8_gdn_output || config.wave8_q8_qsa_output) &&
         (config.enable_device_graph_inputs || alternate_lm_head_))

@@ -42,6 +42,10 @@ class PrepareTests(unittest.TestCase):
             self.assertIn('!options.'+flag,text)
         self.assertIn('DecodeIntegerHead::none',text)
         self.assertIn('options.tokens!=std::vector<std::uint32_t>',text)
+        guard=text.split('private HC capture requires qualified all5 eager registered43/20')[0]
+        for flag in ['q51_slot_parallel_down','prefetch_hc_projection_next_tile']:
+            self.assertIn('options.'+flag,guard)
+            self.assertNotIn('!options.'+flag,guard)
     def test_duplicate_json_key_rejected(self):
         with tempfile.TemporaryDirectory()as temp:
             path=pathlib.Path(temp)/'duplicate.json';path.write_text('{"a":1,"a":2}')

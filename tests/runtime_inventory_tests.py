@@ -323,7 +323,7 @@ class InventoryTests(unittest.TestCase):
         self.assertTrue(result["consistent"])
 
     def test_explicit_A8_flags_are_strict_and_checked_without_auto_profile(self):
-        for flag in ("q4k_a8g32_gate_up", "grouped_exact_q51_down"):
+        for flag in ("q4k_a8g32_gate_up", "grouped_exact_q51_down", "q51_slot_parallel_down"):
             with self.subTest(flag=flag):
                 result = self.collect(cache_path=self.cache(a8="OFF"),
                     receipt_path=self.evidence("explicit.json", {flag: True}))
@@ -333,8 +333,39 @@ class InventoryTests(unittest.TestCase):
                     receipt_path=self.evidence("enabled.json", {flag: True}))["consistent"])
                 self.assertTrue(self.collect(receipt_path=self.evidence("unknown.json", {flag: True}))["consistent"])
                 for value in (0, 1, "false", None, [], {}):
+                    if flag == "q51_slot_parallel_down" and value is None:
+                        continue  # Nullable overlay declaration remains unknown, not false.
                     with self.subTest(value=value), self.assertRaises(ValueError):
                         self.collect(receipt_path=self.evidence("badflag.json", {flag: value}))
+
+    def test_slot_parallel_declared_qualification_and_prerequisite_conflicts(self):
+        for value in ("qualified", "", None, False, 1, [], {}):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                self.collect(receipt_path=self.evidence("bad-slot-qualification.json", {
+                    "q51_slot_parallel_down_qualification": value}))
+        for prerequisite in ("grouped_exact_q51_down", "q4k_a8g32_gate_up"):
+            receipt = {"q51_slot_parallel_down": True, prerequisite: False}
+            result = self.collect(receipt_path=self.evidence("bad-slot-prerequisite.json", receipt))
+            self.assertFalse(result["consistent"])
+            expected = "overlay/q51-grouped" if prerequisite == "grouped_exact_q51_down" else "overlay/q51-A8"
+            self.assertIn(expected, {item["field"] for item in result["conflicts"]})
+        # The roundtrip intentionally emits no grouped/A8 declarations. Absence
+        # stays unknown, and an actual build capability is checked separately.
+        receipt = {"q51_slot_parallel_down": True,
+                   "q51_slot_parallel_down_qualification": "not_assessed",
+                   "slot_parallel_q51_submissions": 43}
+        for cache in (None, self.cache(a8="ON")):
+            self.assertTrue(self.collect(cache_path=cache,
+                receipt_path=self.evidence("valid-slot-roundtrip.json", receipt))["consistent"])
+        for receipt in ({"slot_parallel_q51_submissions": 1},
+                        {"q51_slot_parallel_down": True, "slot_parallel_q51_submissions": 43}):
+            result = self.collect(cache_path=self.cache(a8="OFF"),
+                receipt_path=self.evidence("slot-count-no-A8.json", receipt))
+            self.assertFalse(result["consistent"])
+            self.assertIn("build/slot_parallel_q51_submissions", {item["field"] for item in result["conflicts"]})
+        self.assertTrue(self.collect(cache_path=self.cache(a8="OFF"),
+            receipt_path=self.evidence("slot-count-zero.json", {
+                "q51_slot_parallel_down": False, "slot_parallel_q51_submissions": 0}))["consistent"])
 
     def test_overflowing_JSON_floats_rejected_even_in_unconsumed_nested_metadata(self):
         for text in ('{"extra":{"value":1e999}}', '{"extra":[-1e999]}', '{"value":NaN}'):
