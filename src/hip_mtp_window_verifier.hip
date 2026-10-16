@@ -22,12 +22,13 @@ struct HipMtpWindowVerifier::Impl {
     std::shared_ptr<const void> resource_owner;
     std::array<std::shared_ptr<HipMtpTargetWindowCapture>,2> captures;
     std::unique_ptr<HipMtpTargetCheckpoint> checkpoint;
-    std::uint64_t retained=0;
+    std::uint64_t retained=0,maximum_history_intervals=0;
     bool busy=false,failed=false;
     Impl(std::shared_ptr<HipMtpTargetHidden> t,std::shared_ptr<HipKnownPrefixWindow> w,
          const ExecutionRuntimeResources& r,std::shared_ptr<const void> owner,
          HipMtpWindowVerificationPolicy policy,AllocationGenerationSource& generations)
-        :target(std::move(t)),window(std::move(w)),resources(r),resource_owner(std::move(owner)) {
+        :target(std::move(t)),window(std::move(w)),resources(r),resource_owner(std::move(owner)),
+         maximum_history_intervals(policy.capture.maximum_history_intervals) {
         require(target && window && resource_owner && resources.session_state_layout &&
             resources.session_state_memory==&target->memory_owner()->state() &&
             resources.scratch==&target->memory_owner()->scratch() &&
@@ -79,7 +80,10 @@ HipMtpVerifiedTargetRows HipMtpWindowVerifier::verify(SerialSessionContext& sess
     if(is_eos(pending))return out;
     const auto capacity=std::min(i.resources.session_state_layout->context_tokens,i.target->model().max_position_embeddings);
     require(session.next_position<capacity,"MTP verifier target context is full");
-    const bool use_window=candidates.size()+1>=rows && budget>=rows && capacity-session.next_position>=rows;
+    // Capture::begin needs room for one actual known-window chunk. Capacity
+    // exhaustion is an ordinary serial fallback, before pool/checkpoint work.
+    const bool use_window=candidates.size()+1>=rows && budget>=rows && capacity-session.next_position>=rows &&
+        session.arithmetic_lineage.intervals.size()<i.maximum_history_intervals;
     std::shared_ptr<HipMtpTargetWindowCapture> capture;
     if(use_window) {
         for(const auto& pool:i.captures)if(pool->ready_for_reuse()){capture=pool;break;}
@@ -92,8 +96,11 @@ HipMtpVerifiedTargetRows HipMtpWindowVerifier::verify(SerialSessionContext& sess
             std::vector<std::uint32_t> inputs;inputs.reserve(rows);inputs.push_back(pending);
             inputs.insert(inputs.end(),candidates.begin(),candidates.begin()+static_cast<std::ptrdiff_t>(rows-1));
             i.checkpoint->capture(session);
-            attempted_target=true;out.attempted_window=true;
             auto native=i.window->execute_mtp_captured(session,inputs,capture);
+            // Successful return proves actual target consumption. Rejected
+            // admission leaves the original ready session untouched; dispatch
+            // failures are already poisoned/drained by the native producer.
+            attempted_target=true;out.attempted_window=true;
             out.r2_dispatches=native.execution.r2_dispatches;
             out.projection_launches_saved=native.execution.projection_launches_saved;
             auto provisional=std::make_shared<const HipMtpTargetWindowBatch>(std::move(native.batch));
@@ -111,8 +118,8 @@ HipMtpVerifiedTargetRows HipMtpWindowVerifier::verify(SerialSessionContext& sess
             require(session_equal(initial.committed_session(),session),"MTP rejected window did not restore exact target frontier");
         }
         for(std::size_t index=0;out.emitted_tokens.size()<budget && session.next_position<capacity;++index) {
-            attempted_target=true;
             auto ticket=i.target->execute_serial(session,i.resources,dispatcher,pending);
+            attempted_target=true;
             pending=ticket.predicted_token();out.committed_rows.push_back(std::move(ticket));out.emitted_tokens.push_back(pending);
             const bool accepted=index<candidates.size() && candidates[index]==pending;
             if(accepted)++out.accepted_candidates;
@@ -120,8 +127,15 @@ HipMtpVerifiedTargetRows HipMtpWindowVerifier::verify(SerialSessionContext& sess
         }
         i.busy=false;return out;
     } catch(...) {
-        i.failed=true;i.busy=false;i.target->guard()->recover_or_fail_stop();
-        if(attempted_target){session.health=SerialSessionHealth::poisoned;session.arithmetic_lineage.tainted=true;}
+        i.failed=true;i.busy=false;
+        // Producers/checkpoint own cleanup for their submitted operations.
+        // Do not synchronize or poison a purely rejected predispatch scope.
+        // A failure after any successful target consumption still cannot
+        // publish a reusable partially completed verification transaction.
+        if(attempted_target || session.health==SerialSessionHealth::poisoned){
+            session.health=SerialSessionHealth::poisoned;session.arithmetic_lineage.tainted=true;
+            i.target->guard()->recover_or_fail_stop();
+        }
         throw;
     }
 }

@@ -27,7 +27,10 @@ std::vector<std::string> request(){
         "--mtp-policy-id","7","--mtp-candidate-depth","2"};
 }
 void set(std::vector<std::string>& values,const std::string& key,const std::string& value){
-    for(std::size_t i=0;i+1U<values.size();++i)if(values[i]==key){values[i+1U]=value;return;}
+    for(std::size_t i=0;i<values.size();++i){
+        if(values[i]==key && i+1U<values.size()){values[i+1U]=value;return;}
+        if(values[i].starts_with(key+"=")){values[i]=key+"="+value;return;}
+    }
     throw std::logic_error("fixture key absent");
 }
 void reject(const std::vector<std::string>& args,const char* message){
@@ -68,6 +71,35 @@ int main(){try{
     auto wide=request();wide.insert(wide.end(),{"--mtp-target-window-rows=2","--mtp-window-arena-bytes=1024",
         "--mtp-window-capture-bytes=1024","--mtp-window-checkpoint-bytes=1024","--mtp-window-total-bytes=8192",
         "--mtp-window-history-intervals=128"});
+    // B2: configured windows must be reachable with the admitted draft depth.
+    // Check exact admission cause, not any unrelated missing-budget rejection.
+    for(const auto rows:{2U,4U,8U}) {
+        auto minimum=wide;
+        set(minimum,"--mtp-target-window-rows",std::to_string(rows));
+        set(minimum,"--mtp-candidate-depth",std::to_string(rows-1U));
+        const auto admitted=parse(minimum);
+        require(admitted.mtp.window_rows==rows && admitted.mtp.candidate_depth==rows-1U,
+            "each closed MTP target window admits its exact minimum draft depth");
+        if(rows>2U) {
+            auto insufficient=minimum;
+            set(insufficient,"--mtp-candidate-depth",std::to_string(rows-2U));
+            bool depth_rejected=false;
+            try{(void)parse(insufficient);}catch(const std::invalid_argument& e){
+                depth_rejected=std::string(e.what())=="MTP target window requires candidate depth at least rows minus one";
+            }
+            require(depth_rejected,"insufficient draft depth rejects specifically before reserving any target window");
+        }
+    }
+    auto unreachable=wide;set(unreachable,"--mtp-target-window-rows","8");
+    bool unreachable_rejected=false;
+    try{(void)parse(unreachable);}catch(const std::invalid_argument& e){
+        unreachable_rejected=std::string(e.what())=="MTP target window requires candidate depth at least rows minus one";
+    }
+    require(unreachable_rejected,"depth2 cannot configure an unreachable eight-row target window");
+    require(strix::decode_cli::mtp_target_verification_name(0U)=="serial-target-fallback" &&
+        strix::decode_cli::mtp_target_verification_name(1U)=="closed-known-window-attempted-with-serial-fallback" &&
+        strix::decode_cli::mtp_target_verification_name(7U)==strix::decode_cli::mtp_target_verification_name(1U),
+        "receipt verification mode follows actual attempt evidence, never owner configuration alone");
     auto selected=parse(wide);selected.context_tokens=8192;
     bool failed=false;try{strix::decode_cli::validate_resolved_mtp_cli(selected);}catch(const std::invalid_argument&){failed=true;}
     require(failed,"MTP target windows cannot silently enable D1 or paired GDN optimizations");

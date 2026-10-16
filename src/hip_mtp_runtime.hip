@@ -78,6 +78,7 @@ void require_chain(const HipMtpTargetHiddenTicket& a,const HipMtpTargetHiddenTic
 struct HipMtpRuntime::Impl {
     std::shared_ptr<HipMtpResources> owner;
     std::unique_ptr<HipGreedyOutput> selector;
+    std::optional<HipMtpResources::NativeValidationScope> validation;
     std::optional<HipMtpTargetHiddenTicket> last_target,cycle_base,base_previous_target,reconcile_final;
     std::optional<std::uint32_t> last_teacher_next_input,base_previous_input;
     std::vector<HipMtpReplayRow> replay;
@@ -117,8 +118,10 @@ struct HipMtpRuntime::Impl {
         r.output=device(owner->view(HipMtpBuffer::fused_wide));return r;
     }
     MtpNativeContext context(std::uint64_t position) const {return {&owner->model(),&owner->plan(),&owner->tensors(),owner.get(),position};}
-    void preflight(std::uint64_t position,std::uint32_t token) const {
+    void preflight(std::uint64_t position,std::uint32_t token,bool already_admitted=false) const {
         require(!broken && !active && !current_hip_launch_context(),"MTP native input requires one healthy idle host protocol");
+        std::optional<HipMtpResources::NativeValidationScope> local_validation;
+        if(!already_admitted && !validation) local_validation.emplace(owner->admit_native_entry());
         const auto c=context(position);mtp_native::context(c);
         hipStreamCaptureStatus capture=hipStreamCaptureStatusNone;
         check(hipStreamIsCapturing(static_cast<hipStream_t>(owner->stream()),&capture),"MTP capture query failed");
@@ -153,7 +156,7 @@ struct HipMtpRuntime::Impl {
         check(hipMemcpyAsync(reinterpret_cast<void*>(destination.address),reinterpret_cast<const void*>(source.address),
             static_cast<std::size_t>(source.bytes),hipMemcpyDeviceToDevice,static_cast<hipStream_t>(owner->stream())),"MTP owned copy enqueue failed");
     }
-    void failure() noexcept {broken=true;active=false;owner->fail();}
+    void failure() noexcept {broken=true;active=false;owner->fail();validation.reset();}
     void stage(const MtpForwardStepContext& call) {
         const auto& input=*call.cycle_input;
         require(active && step<native_steps.size() && call.step_index==step && call.step==native_steps[step] &&
@@ -181,10 +184,16 @@ struct HipMtpRuntime::Impl {
     void start(MtpDraftCycleInput input,const HipMtpTargetHiddenTicket* source) {
         require(input.hidden_source_position==next_source && input.seed_position==next_source+1U &&
             input.seed_token_id<owner->model().vocab_size,"MTP source position/seed is not the next native row");
-        preflight(next_source,input.seed_token_id);
-        if(source) validate_ticket(*source);
-        require(epoch!=UINT64_MAX,"MTP native epoch exhausted");++epoch;
-        owner->mark_submitted();active=true;step=0;current=input;
+        require(!active && !validation,"MTP input cannot replace an active native admission");
+        validation.emplace(owner->admit_native_entry());
+        try {
+            preflight(next_source,input.seed_token_id);
+            if(source) validate_ticket(*source);
+            require(epoch!=UINT64_MAX,"MTP native epoch exhausted");
+            owner->mark_submitted();
+        } catch(...) {validation.reset();throw;}
+        ++epoch;
+        active=true;step=0;current=input;
         try {if(source) copy(owner->view(HipMtpBuffer::wide_current),source->view());} catch(...) {failure();throw;}
     }
     std::uint32_t finish() {
@@ -193,7 +202,7 @@ struct HipMtpRuntime::Impl {
             owner->complete();const auto logits=owner->view(HipMtpBuffer::logits);
             const auto token=selector->select(ExecutionBufferAddress{{},logits.address,logits.bytes,logits.allocation_generation},
                 static_cast<std::uint32_t>(owner->model().vocab_size),current.hidden_source_position,epoch);
-            active=false;++next_source;return token;
+            active=false;++next_source;validation.reset();return token;
         } catch(...) {failure();throw;}
     }
     std::uint32_t run_current() {
@@ -241,11 +250,14 @@ HipMtpNativeRowResult HipMtpRuntime::execute_diagnostic(const HipMtpTargetHidden
 }
 void HipMtpRuntime::prime_committed_rows(const QualifiedMtpDraftPlan& plan,const ActivatedMtpDraftPlan& activated,std::span<const HipMtpReplayRow> rows) {
     auto& p=*impl_;p.qualification(plan,activated);require(!p.cycle && !p.active,"MTP priming cannot interleave a proposal");
+    {
+    const auto admission=p.owner->admit_native_entry();
     for(std::size_t i=0;i<rows.size();++i) {
         p.validate_ticket(rows[i].hidden);require(rows[i].hidden.source_position()==p.next_source+i &&
             rows[i].next_input_token<p.owner->model().vocab_size,"MTP priming rows are invalid");
         if(i) {require_chain(rows[i-1U].hidden,rows[i].hidden);require(rows[i-1U].next_input_token==rows[i].hidden.input_token(),"MTP teacher priming token pair changed");}
-        p.preflight(rows[i].hidden.source_position(),rows[i].next_input_token);
+        p.preflight(rows[i].hidden.source_position(),rows[i].next_input_token,true);
+    }
     }
     for(const auto& row:rows) (void)p.teacher(row.hidden,row.next_input_token);
 }
@@ -257,7 +269,8 @@ void HipMtpRuntime::begin_cycle(std::uint32_t token,const HipMtpTargetHiddenTick
         require_chain(*p.last_target,ticket);
         require(p.last_teacher_next_input && *p.last_teacher_next_input==ticket.input_token(),"MTP cycle does not continue its actual primed target input");
     }
-    p.preflight(p.next_source,token);p.owner->require_idle();
+    const auto admission=p.owner->admit_native_entry();
+    p.preflight(p.next_source,token,true);p.owner->require_idle();
     try {
         p.owner->mark_submitted();p.copy(p.owner->view(HipMtpBuffer::kv_checkpoint),p.owner->view(HipMtpBuffer::kv));
         p.copy(p.owner->view(HipMtpBuffer::raw_index_checkpoint),p.owner->view(HipMtpBuffer::raw_index));
@@ -340,11 +353,16 @@ void HipMtpRuntime::reconcile_after_target(const QualifiedMtpDraftPlan& plan,con
         emitted.size()<=p.owner->budget().maximum_candidate_depth+1U,"MTP reconciliation requires actual committed target rows and owner state");
     // Output tokens do not attest draft-cache correctness; real committed
     // tickets and complete teacher-pair coverage above are the authority.
-    for(const auto& row:p.replay) p.preflight(row.hidden.source_position(),row.next_input_token);
-    try {
+    {
+        const auto admission=p.owner->admit_native_entry();
+        for(const auto& row:p.replay) p.preflight(row.hidden.source_position(),row.next_input_token,true);
+        try {
         p.owner->mark_submitted();p.copy(p.owner->view(HipMtpBuffer::kv),p.owner->view(HipMtpBuffer::kv_checkpoint));
         p.copy(p.owner->view(HipMtpBuffer::raw_index),p.owner->view(HipMtpBuffer::raw_index_checkpoint));
         p.copy(p.owner->view(HipMtpBuffer::wide_current),p.owner->view(HipMtpBuffer::wide_checkpoint));p.owner->complete();
+        } catch(...) {p.failure();throw;}
+    }
+    try {
         p.next_source=p.base_source;
         // First replay row is the checkpoint ticket, not a new committed row.
         p.last_target=p.base_previous_target;p.last_teacher_next_input=p.base_previous_input;

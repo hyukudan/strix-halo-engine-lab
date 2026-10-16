@@ -149,4 +149,31 @@ HipMtpGreedyCycleComponentReceipt qualify_hip_mtp_greedy_cycles(HipMtpGreedyRunt
         require_coverage(request.required_coverage,receipt.coverage);receipt.final_target=std::move(current);return receipt;
     }catch(...){native.cancel();throw;}
 }
+HipMtpGreedyCycleComponentReceipt qualify_hip_mtp_history_capacity_fallback(
+    HipMtpGreedyRuntime& greedy,HipMtpRuntime& native,std::shared_ptr<HipMtpTargetHidden> target,
+    std::shared_ptr<HipKnownPrefixWindow> window,const ExecutionRuntimeResources& resources,
+    std::shared_ptr<const void> target_owner,HipMtpWindowVerificationPolicy policy,
+    AllocationGenerationSource& generations,HipMtpTargetHiddenTicket initial,
+    const HipMtpGreedyCycleGolden& golden,const HipMtpGreedyCycleComponentRequest& request){
+    require(&greedy.native_runtime()==&native&&target&&window&&target_owner&&initial.valid()&&
+        resources.session_state_layout&&!golden.cycles.empty(),"MTP history fallback fixture requires real complete owners and trace");
+    const auto& first=golden.cycles.front();const auto rows=window->logical_rows();
+    const auto& session=initial.committed_session();
+    const auto capacity=std::min(resources.session_state_layout->context_tokens,target->model().max_position_embeddings);
+    require(policy.capture.maximum_history_intervals&&session.arithmetic_lineage.intervals.size()>=policy.capture.maximum_history_intervals&&
+        session.next_position<=capacity&&rows<=capacity-session.next_position&&target->retained_rows()>=rows+2U&&
+        first.maximum_candidates>=rows-1U&&first.proposed_candidates>=rows-1U&&first.token_budget>=rows&&
+        !is_eos(initial.predicted_token(),first.eos_tokens)&&!first.attempted_window&&!first.accepted_window&&!first.restored_checkpoint&&
+        first.consumed_target_rows>0U&&first.target_r2_dispatches==0U&&first.target_projection_launches_saved==0U,
+        "MTP history fallback trace must exhaust history but otherwise admit a full window and expect live serial consumption");
+    // Actual constructor owns the real policy/capture pools. This is not a
+    // boolean mock of use_window; before the fix this reaches Capture::begin,
+    // throws and poisons the transaction instead of completing the golden.
+    auto verifier=std::make_shared<HipMtpWindowVerifier>(std::move(target),std::move(window),resources,
+        std::move(target_owner),policy,generations);
+    greedy.use_window_verifier(verifier);
+    auto receipt=qualify_hip_mtp_greedy_cycles(greedy,native,std::move(initial),golden,request);
+    require(!verifier->failed()&&!greedy.failed()&&!native.failed(),"MTP history fallback must leave actual owners usable");
+    return receipt;
+}
 } // namespace strix::tests

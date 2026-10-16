@@ -224,6 +224,24 @@ void all_nan_and_retained_owner() {
     }
     require(weak.expired(), "greedy owner leaked source allocation");
 }
+void queued_rows() {
+    constexpr std::uint32_t n=513;
+    Fixture first(n),second(n);
+    std::vector<float> a(n,-2.0F),b(n,-3.0F);
+    a[255]=a[256]=7.0F;b.back()=9.0F;
+    first.upload(a);second.upload(b);
+    strix::HipGreedyOutput x(n,first.scratch,first.allocation,first.guard);
+    strix::HipGreedyOutput y(n,second.scratch,second.allocation,second.guard);
+    rejected([&]{static_cast<void>(x.complete());});
+    x.submit(first.view,n,41,1);y.submit(second.view,n,42,1);
+    require(x.stats().completed==0 && y.stats().completed==0,"queued rows were published before completion");
+    rejected([&]{x.submit(first.view,n,43,2);});
+    require(y.complete()==oracle(b) && x.complete()==oracle(a),"out-of-order completions disagree with independent oracle");
+    rejected([&]{static_cast<void>(x.complete());});
+    first.readonly_and_guards();second.readonly_and_guards();
+    require(x.stats().pool_allocations==3 && x.stats().calls==1 && x.stats().completed==1,
+        "split selection changed allocation or rejection counters");
+}
 } // namespace
 int main() try {
     int count = 0;
@@ -242,7 +260,7 @@ int main() try {
         rejected([&] { strix::HipGreedyOutput invalid(1, fixture.scratch, {}, fixture.guard); });
         rejected([&] { strix::HipGreedyOutput invalid(1, fixture.scratch, fixture.allocation, {}); });
     }
-    repeats(); nonfinite(); host_fault_boundaries(); all_nan_and_retained_owner();
+    repeats(); nonfinite(); host_fault_boundaries(); all_nan_and_retained_owner();queued_rows();
     std::cout << "GPU greedy exact first-max/finite/owners/repeats fixtures passed\n";
     return 0;
 } catch (const std::exception& e) {

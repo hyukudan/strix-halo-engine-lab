@@ -65,7 +65,6 @@ struct HipMtpTargetHidden::Impl {
     std::shared_ptr<HipRuntimeAllocator> allocator;
     std::shared_ptr<HipSetupQuiescenceGuard> guard;
     hipStream_t stream=nullptr;
-    hipEvent_t copied=nullptr;
     std::vector<Slot> slots;
     std::uint32_t tap_step=0;
     ExecutionBufferUse tap_use;
@@ -78,7 +77,6 @@ struct HipMtpTargetHidden::Impl {
     bool busy=false,failed=false;
     ~Impl() {
         if(guard) guard->recover_or_fail_stop();
-        if(copied) (void)hipEventDestroy(copied);
         if(stream) (void)hipStreamDestroy(stream);
         if(allocator && deferred_status.arena_base)
             allocator->free_device(deferred_status.arena_base,deferred_status.arena_bytes);
@@ -187,7 +185,6 @@ std::shared_ptr<HipMtpTargetHidden> HipMtpTargetHidden::create(
     i.selector=std::make_unique<HipGreedyOutput>(static_cast<std::uint32_t>(m.vocab_size),
         i.memory->scratch(),i.memory,i.guard);
     check(hipStreamCreateWithFlags(&i.stream,hipStreamNonBlocking),"MTP target capture stream");
-    check(hipEventCreateWithFlags(&i.copied,hipEventDisableTiming),"MTP target capture event");
     if(deferred.state_layout) {
         i.shadow=std::make_unique<SerialHostStateShadow>(*deferred.state_layout,i.memory->state(),deferred.generations->next());
         i.deferred_status={c.execution_identity,i.allocator->allocate_device(8,256),8,deferred.generations->next()};
@@ -243,7 +240,6 @@ HipMtpTargetHiddenTicket HipMtpTargetHidden::execute_serial(
                 throw std::invalid_argument("MTP target capture source is undersized");
             check(hipMemcpyAsync(reinterpret_cast<void*>(destination.address),
                 reinterpret_cast<const void*>(source.address),destination.bytes,hipMemcpyDeviceToDevice,owner.stream),"MTP target wide capture");
-            check(hipEventRecord(owner.copied,owner.stream),"MTP target capture record");
             captured=true;
         }
         void dispatch_kernel(const ExecutionDispatchContext& c) override {next.dispatch_kernel(c);after(c);}
@@ -263,7 +259,7 @@ HipMtpTargetHiddenTicket HipMtpTargetHidden::execute_serial(
             if(i.deferred_status.arena_base)
                 check(hipMemcpyAsync(&status,reinterpret_cast<const void*>(i.deferred_status.arena_base),sizeof(status),
                     hipMemcpyDeviceToHost,i.stream),"MTP target D1 readback");
-            check(hipEventSynchronize(i.copied),"MTP target capture completion");
+            // The copy and D1 readback precede this completion on the same stream.
             check(hipStreamSynchronize(i.stream),"MTP target execution completion");
             i.guard->require_original();
             if(i.deferred_status.arena_base)check_deferred_moe_status(status);

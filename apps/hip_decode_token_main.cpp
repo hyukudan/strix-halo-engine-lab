@@ -1886,6 +1886,9 @@ int main(
         if(!base_runtime_owner_inventory || !runtime_memory_inventory)
             throw std::logic_error("runtime inventory snapshots are missing actual retained pools");
         base_runtime_owner_inventory = strix::build_uma_owner_inventory(base_runtime_owner_inventory->pinned_views,observed.memory);
+        // This remains the original pre-optional-request snapshot. MTP owns
+        // its D1 later; its completion receipt reports that private owner under
+        // a distinct boundary rather than changing this historical snapshot.
         base_runtime_owner_inventory_receipt = strix::decode_receipt::runtime_owner_inventory_receipt(
             *base_runtime_owner_inventory,*runtime_memory_inventory,static_cast<bool>(deferred_moe));
     }

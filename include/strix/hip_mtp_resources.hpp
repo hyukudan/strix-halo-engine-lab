@@ -7,6 +7,7 @@
 #include "strix/hip_mtp_input_fusion.hpp"
 #include <array>
 #include <memory>
+#include <utility>
 
 namespace strix {
 class HipSetupQuiescenceGuard;
@@ -89,8 +90,26 @@ public:
     [[nodiscard]] const MtpDraftStateMemoryBinding& state_memory() const noexcept;
     [[nodiscard]] std::shared_ptr<const HipSetupQuiescenceGuard> guard() const noexcept;
     [[nodiscard]] void* stream() const noexcept;
-    // Every raw preflight calls validate before admitting any native work.
+    // Full source census/binding admission at each native entry boundary.
     void validate() const;
+    class NativeValidationScope {
+    public:
+        ~NativeValidationScope();
+        NativeValidationScope(NativeValidationScope&&) noexcept;
+        NativeValidationScope(const NativeValidationScope&)=delete;
+        NativeValidationScope& operator=(const NativeValidationScope&)=delete;
+        NativeValidationScope& operator=(NativeValidationScope&&)=delete;
+    private:
+        friend class HipMtpResources;
+        explicit NativeValidationScope(std::shared_ptr<const HipMtpResources> owner):owner_(std::move(owner)) {}
+        std::shared_ptr<const HipMtpResources> owner_;
+    };
+    // Serial, non-nesting capability; successful full admission is required to
+    // construct it. Keep this scope through all stages and actual completion.
+    [[nodiscard]] NativeValidationScope admit_native_entry() const;
+    // Cheap immutable-source/lease/current-device checks inside an admitted
+    // entry. Standalone raw calls retain full validation when no scope exists.
+    void validate_stage() const;
     // Native queue lifecycle only: not a semantic qualification or target
     // transaction. Failure remains sticky and cleanup proves quiescence.
     void require_idle() const;

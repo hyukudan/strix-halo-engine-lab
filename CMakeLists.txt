@@ -1375,7 +1375,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
     set_source_files_properties(src/hip_qsa_selection_diagnostic.hip
         PROPERTIES COMPILE_OPTIONS "-mno-wavefrontsize64;-fno-fast-math")
     set_source_files_properties(src/hip_mtp_input_fusion.hip
-        PROPERTIES COMPILE_OPTIONS "-mno-wavefrontsize64;-fno-fast-math;-ffp-contract=off")
+        PROPERTIES COMPILE_OPTIONS "-mno-wavefrontsize64;-fno-fast-math;-ffp-contract=off;-fhip-fp32-correctly-rounded-divide-sqrt;-fdenormal-fp-math=ieee")
     strix_target_warnings(strix_hip_runtime)
     if(BUILD_TESTING)
         target_compile_definitions(strix_hip_runtime PRIVATE STRIX_BUILD_GDN_LM_WAVE8_DIAGNOSTIC=1)

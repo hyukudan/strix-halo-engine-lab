@@ -158,7 +158,11 @@ void HipMtpTargetWindowCapture::record_row(const ExecutionDispatchContext& c){
 void HipMtpTargetWindowCapture::completed_before_publish(){
     auto& i=*impl_;i.require_pool();require(i.active && std::all_of(i.active->recorded.begin(),i.active->recorded.end(),[](auto x){return x==1U;}),
         "MTP window completed without every wide snapshot");
-    for(std::uint32_t row=0;row<i.rows;++row)i.active->predictions[row]=i.selectors[row]->select(i.logit_views[row],i.vocab,i.active->base.next_position+row,i.active->epoch);
+    // The actual producer has completed. Queue independent reductions/readbacks
+    // before waiting, then validate every result before the batch can publish.
+    for(std::uint32_t row=0;row<i.rows;++row)
+        i.selectors[row]->submit(i.logit_views[row],i.vocab,i.active->base.next_position+row,i.active->epoch);
+    for(std::uint32_t row=0;row<i.rows;++row)i.active->predictions[row]=i.selectors[row]->complete();
     i.active->completed=true;
 }
 HipMtpTargetWindowBatch HipMtpTargetWindowCapture::seal(const SerialSessionContext& session){

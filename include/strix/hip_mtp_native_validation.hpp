@@ -1,6 +1,7 @@
 #pragma once
 #include "strix/hip_mtp_resources.hpp"
 #include <hip/hip_runtime_api.h>
+#include <algorithm>
 #include <initializer_list>
 #include <limits>
 #include <stdexcept>
@@ -20,7 +21,7 @@ inline void context(const MtpNativeContext& c) {
         c.model!=&c.resources->model() || c.plan!=&c.resources->plan() ||
         c.tensors!=&c.resources->tensors())
         throw std::invalid_argument("MTP native owner context mismatch");
-    c.resources->validate();
+    c.resources->validate_stage();
     if (c.position>=c.resources->context_capacity())
         throw std::out_of_range("MTP native position exceeds retained capacity");
 }
@@ -44,7 +45,8 @@ inline void tensor(const MtpTensorView& t,std::initializer_list<std::uint64_t> s
         !t.runtime->allocation_generation || !runtime_tensor_gpu_visible(t.runtime->storage) ||
         t.runtime->bytes<bytes || t.manifest->byte_size<bytes ||
         t.runtime->bytes>std::numeric_limits<std::uintptr_t>::max()-t.runtime->address ||
-        t.manifest->dimensions!=std::vector<std::uint64_t>(shape))
+        t.manifest->dimensions.size()!=shape.size() ||
+        !std::equal(t.manifest->dimensions.begin(),t.manifest->dimensions.end(),shape.begin()))
         throw std::invalid_argument("MTP native tensor shape/storage/extent invalid");
 }
 inline void stream(const MtpNativeContext& c,void* stream) {

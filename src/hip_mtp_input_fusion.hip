@@ -74,18 +74,25 @@ __device__ float coefficient(const unsigned char* row,unsigned column) {
     return scale*static_cast<float>(code);
 }
 __global__ __launch_bounds__(128) void mtp_input_projections(HipMtpInputFusionRequest r) {
-    const unsigned job=blockIdx.x*blockDim.x+threadIdx.x;
-    const unsigned h=r.hidden_size,total=h*(1U+r.hc_count);
-    if(job>=total)return;
-    const bool embedding=job<h;
-    const unsigned output_row=embedding?job:(job-h)%h;
-    const unsigned stream=embedding?0U:(job-h)/h;
-    const auto* input=reinterpret_cast<const float*>(r.normalized_scratch.address)+(embedding?0U:h+stream*h);
+    const unsigned output_row=blockIdx.x*blockDim.x+threadIdx.x;
+    const unsigned h=r.hidden_size;
+    if(output_row>=h)return;
+    const auto* input=reinterpret_cast<const float*>(r.normalized_scratch.address);
     const auto* row=reinterpret_cast<const unsigned char*>(r.packed_projection.address)+output_row*r.projection_row_stride_bytes;
-    const unsigned half=embedding?0U:h;
-    float sum=0.0F;
-    for(unsigned col=0;col<h;++col) sum=fmaf(coefficient(row,half+col),input[col],sum);
-    reinterpret_cast<float*>(r.projection_scratch.address)[job]=rounded(sum,r.projection_rounding);
+    float embedding=0.0F;
+    for(unsigned col=0;col<h;++col)embedding=fmaf(coefficient(row,col),input[col],embedding);
+    auto* output=reinterpret_cast<float*>(r.projection_scratch.address);
+    output[output_row]=rounded(embedding,r.projection_rounding);
+    // Reuse each hidden-half coefficient across the HC chains. Each chain still
+    // evaluates coefficient-first FMA in ascending column order, rounding once.
+    float sums[4]={0.0F,0.0F,0.0F,0.0F};
+    for(unsigned col=0;col<h;++col){
+        const float weight=coefficient(row,h+col);
+        for(unsigned stream=0;stream<r.hc_count;++stream)
+            sums[stream]=fmaf(weight,input[h+stream*h+col],sums[stream]);
+    }
+    for(unsigned stream=0;stream<r.hc_count;++stream)
+        output[h+stream*h+output_row]=rounded(sums[stream],r.projection_rounding);
 }
 __global__ __launch_bounds__(128) void mtp_input_broadcast_add(HipMtpInputFusionRequest r) {
     const unsigned i=blockIdx.x*blockDim.x+threadIdx.x;
@@ -127,8 +134,9 @@ std::uint64_t hip_mtp_input_fusion_profile_identity(const HipMtpInputFusionReque
     std::uint64_t hash=14695981039346656037ULL;
     const auto add=[&](std::uint64_t v) {for(unsigned s=0;s<64U;s+=8U){hash^=(v>>s)&255U;hash*=1099511628211ULL;}};
     // Version specifies coefficient-first ascending FMA, 256-lane strided RMS
-    // tree, divide/sqrt, separate rounded projections and quiet-upper BF16 RNE.
-    add(0x4d54504655533201ULL);add(r.hidden_size);add(r.hc_count);add(std::bit_cast<std::uint32_t>(r.epsilon));
+    // tree, IEEE denormals/correctly rounded divide-sqrt, separate rounded
+    // projections and quiet-upper BF16 RNE. Rev3 pins the compiler FP policy.
+    add(0x4d54504655533301ULL);add(r.hidden_size);add(r.hc_count);add(std::bit_cast<std::uint32_t>(r.epsilon));
     add(static_cast<unsigned>(r.embedding_storage));add(static_cast<unsigned>(r.hidden_storage));add(static_cast<unsigned>(r.output_storage));
     add(static_cast<unsigned>(r.normalized_rounding));add(static_cast<unsigned>(r.projection_rounding));add(static_cast<unsigned>(r.norm_weight_encoding));
     add(static_cast<unsigned>(r.arithmetic));return hash;
@@ -141,7 +149,7 @@ void launch_hip_mtp_input_fusion(const HipMtpInputFusionRequest& r,void* raw_str
     if(capture!=hipStreamCaptureStatusNone)throw std::invalid_argument("MTP input fusion is eager only");
     check(hipPeekAtLastError(),"MTP input fusion prior HIP error");
     hipLaunchKernelGGL(mtp_input_norms,dim3(2U),dim3(256U),0U,stream,r);check(hipGetLastError(),"MTP input norms launch");
-    const unsigned jobs=r.hidden_size*(r.hc_count+1U);
+    const unsigned jobs=r.hidden_size;
     hipLaunchKernelGGL(mtp_input_projections,dim3((jobs+127U)/128U),dim3(128U),0U,stream,r);check(hipGetLastError(),"MTP split projection launch");
     const unsigned outputs=r.hidden_size*r.hc_count;
     hipLaunchKernelGGL(mtp_input_broadcast_add,dim3((outputs+127U)/128U),dim3(128U),0U,stream,r);check(hipGetLastError(),"MTP broadcast add launch");

@@ -50,6 +50,13 @@ public:
     // Position is the consumed INPUT position, not the predicted token position.
     [[nodiscard]] std::uint32_t select(const ExecutionBufferAddress& logits,
         std::uint32_t vocabulary_size, std::uint64_t position, std::uint64_t epoch);
+    // Split form for independently retained rows: submit all owners first, then
+    // complete all before publishing any token. The caller keeps every logits
+    // allocation immutable until its completion. Each owner allows one pending
+    // request; host-only rejection does not invalidate that pending request.
+    void submit(const ExecutionBufferAddress& logits, std::uint32_t vocabulary_size,
+        std::uint64_t position, std::uint64_t epoch);
+    [[nodiscard]] std::uint32_t complete();
     [[nodiscard]] HipGreedyOutputStats stats() const noexcept;
     [[nodiscard]] bool failed() const noexcept;
     // Total retained payload bytes: device partials + device reply + pinned host

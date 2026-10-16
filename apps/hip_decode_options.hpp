@@ -108,6 +108,11 @@ struct MtpCliOptions {
     std::uint64_t window_arena_bytes=0,window_capture_bytes=0,window_checkpoint_bytes=0,window_total_bytes=0,window_history_intervals=0;
     double max_hidden_error=0.0,max_logit_error=0.0;
 };
+// This is execution evidence: a configured owner alone is not an attempted
+// native window (EOS, remaining budget/context and history can choose serial).
+inline std::string_view mtp_target_verification_name(std::uint64_t attempted_windows) noexcept {
+    return attempted_windows ? "closed-known-window-attempted-with-serial-fallback" : "serial-target-fallback";
+}
 inline bool mtp_sha256_text(std::string_view value) noexcept {
     if(value.size()!=64U)return false;
     bool nonzero=false;
@@ -564,6 +569,8 @@ inline void validate_mtp_cli(const Options& o,bool resolved=false) {
     if(any_window && ((m.window_rows!=2U && m.window_rows!=4U && m.window_rows!=8U) || !m.window_arena_bytes ||
        !m.window_capture_bytes || !m.window_checkpoint_bytes || !m.window_total_bytes || !m.window_history_intervals))
         throw std::invalid_argument("MTP closed target windows require explicit rows2/4/8 and all five positive window budgets");
+    if(m.window_rows && m.candidate_depth<m.window_rows-1U)
+        throw std::invalid_argument("MTP target window requires candidate depth at least rows minus one");
     if(m.window_rows && (o.gdn_recurrent_layout!=HipGdnRecurrentLayout::baseline || o.gdn_recurrent_storage!=GdnRecurrentStorage::key_value ||
        o.qsa_hierarchical_selection || o.qsa_gqa_heads_per_block!=1U))
         throw std::invalid_argument("MTP closed target windows require baseline recurrent and QSA organizations");

@@ -1,5 +1,6 @@
 #pragma once
 #include "strix/hip_mtp_greedy_runtime.hpp"
+#include "strix/hip_mtp_window_verifier.hpp"
 #include <array>
 namespace strix::tests {
 struct HipMtpGreedyCycleGoldenRow {
@@ -47,5 +48,15 @@ struct HipMtpGreedyCycleComponentReceipt {
 // pins; the fixture retains only its single current ticket, not old batches.
 [[nodiscard]] HipMtpGreedyCycleComponentReceipt qualify_hip_mtp_greedy_cycles(
     HipMtpGreedyRuntime&,HipMtpRuntime&,HipMtpTargetHiddenTicket initial_target,
+    const HipMtpGreedyCycleGolden&,const HipMtpGreedyCycleComponentRequest&);
+// Regression for the real exhausted-history route: construct/attach an actual
+// verifier whose declared capture bound is already exhausted, with otherwise
+// window-eligible independent first-cycle trace. Must be called before the
+// consumer's first cycle. Capacity is NOT raised and no history is retagged.
+[[nodiscard]] HipMtpGreedyCycleComponentReceipt qualify_hip_mtp_history_capacity_fallback(
+    HipMtpGreedyRuntime&,HipMtpRuntime&,std::shared_ptr<HipMtpTargetHidden>,
+    std::shared_ptr<HipKnownPrefixWindow>,const ExecutionRuntimeResources&,
+    std::shared_ptr<const void> actual_target_owner,HipMtpWindowVerificationPolicy,
+    AllocationGenerationSource&,HipMtpTargetHiddenTicket initial_target,
     const HipMtpGreedyCycleGolden&,const HipMtpGreedyCycleComponentRequest&);
 } // namespace strix::tests

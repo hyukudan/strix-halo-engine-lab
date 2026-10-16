@@ -60,6 +60,12 @@ struct HipMtpResources::Impl {
     HipRuntimeAllocationDescription pool_lease;
     hipStream_t stream=nullptr;
     bool pending=false,failed=false;
+    mutable bool validation_entry=false;
+    const RuntimeTensorBinding* sidecar_data=nullptr;
+    const RuntimeTensorBinding* target_data=nullptr;
+    std::size_t sidecar_size=0,target_size=0;
+    std::uint64_t sidecar_generation=0,target_generation=0;
+    std::array<std::pair<const RuntimeTensorBinding*,RuntimeTensorBinding>,34> live_roles{};
     ~Impl() {
         if(!guard) return;
         guard->recover_or_fail_stop();
@@ -164,6 +170,26 @@ std::shared_ptr<HipMtpResources> HipMtpResources::create(const ModelContract& mo
         p.views[static_cast<std::size_t>(HipMtpBuffer::wide_current)].address,state_plan.total_bytes,p.pool_generation};
     p.guard->run([&] {check(hipStreamCreateWithFlags(&p.stream,hipStreamNonBlocking),"MTP stream creation failed");
         check(hipMemsetAsync(reinterpret_cast<void*>(p.pool),0,static_cast<std::size_t>(bytes),p.stream),"MTP pool initialization failed");});
+    // Save only actual stable retained table addresses after the factory has
+    // closed all 34 roles. A later reallocation is rejected before dereference.
+    p.sidecar_data=p.sidecar->binding().tensors.data(); p.sidecar_size=p.sidecar->binding().tensors.size();
+    p.target_data=p.target->binding().tensors.data(); p.target_size=p.target->binding().tensors.size();
+    p.sidecar_generation=p.sidecar->generation(); p.target_generation=p.target->generation();
+    const auto& roles=*p.tensors;
+    const std::array<MtpTensorView,34> selected{roles.embedding,roles.enorm,roles.hnorm,roles.eh_projection,
+        roles.attention_hc_norm,roles.attention_hc_down,roles.attention_hc_up,roles.attention_hc_inject,
+        roles.query,roles.key,roles.value,roles.attention_output,roles.query_norm,roles.key_norm,
+        roles.index_query,roles.index_key,roles.index_query_norm,roles.index_key_norm,
+        roles.mlp_hc_norm,roles.mlp_hc_down,roles.mlp_hc_up,roles.mlp_hc_inject,
+        roles.router,roles.expert_gate,roles.expert_up,roles.expert_down,
+        roles.shared_gate,roles.shared_up,roles.shared_down,roles.shared_scalar_gate,
+        roles.head_norm,roles.head_down,roles.head_up,roles.lm_head};
+    for(std::size_t i=0;i<selected.size();++i) {
+        const auto& actual=(i==0 || i==selected.size()-1)?p.target->binding():p.sidecar->binding();
+        const auto* live=find_runtime_tensor_binding(actual,selected[i].runtime->tensor_index);
+        require(live && same(*live,*selected[i].runtime),"MTP admitted live role differs from its immutable descriptor");
+        p.live_roles[i]={live,*selected[i].runtime};
+    }
     result->validate();return result;
 }
 MtpDeviceView HipMtpResources::view(HipMtpBuffer kind) const {
@@ -195,10 +221,42 @@ void HipMtpResources::validate() const {
     require(p.allocator->describe_allocation(p.pool,p.reservation.device_pool_bytes,HipRuntimeAllocationSpace::device)==p.pool_lease,
         "MTP original allocator lease changed");
 }
-void HipMtpResources::require_idle() const {validate();require(!impl_->pending,"MTP native queue is already pending");}
-void HipMtpResources::mark_submitted() {validate();impl_->pending=true;}
+HipMtpResources::NativeValidationScope::~NativeValidationScope() {
+    if(owner_) owner_->impl_->validation_entry=false;
+}
+HipMtpResources::NativeValidationScope::NativeValidationScope(NativeValidationScope&& other) noexcept
+    :owner_(std::exchange(other.owner_,nullptr)) {}
+HipMtpResources::NativeValidationScope HipMtpResources::admit_native_entry() const {
+    require(!impl_->validation_entry && !impl_->pending,"MTP native admission cannot nest or borrow queued work");
+    validate();
+    impl_->validation_entry=true;
+    return NativeValidationScope(shared_from_this());
+}
+void HipMtpResources::validate_stage() const {
+    const auto& p=*impl_;
+    if(!p.validation_entry) {validate();return;}
+    require(!p.failed && p.guard && p.pool && p.stream,"MTP owner is failed or uninitialized");
+    int device=-1;
+    check(hipGetDevice(&device),"MTP current device query failed");
+    require(device==p.guard->device_index(),"MTP native stage changed its admitted device");
+    const auto& sidecar=p.sidecar->binding(); const auto& target=p.target->binding();
+    require(p.sidecar->generation()==p.sidecar_generation && p.target->generation()==p.target_generation &&
+        sidecar.tensors.data()==p.sidecar_data && sidecar.tensors.size()==p.sidecar_size &&
+        target.tensors.data()==p.target_data && target.tensors.size()==p.target_size &&
+        sidecar.manifest_layout_identity==p.sidecar_runtime.manifest_layout_identity &&
+        target.manifest_layout_identity==p.target_runtime.manifest_layout_identity &&
+        sidecar.model_content_identity==p.sidecar_runtime.model_content_identity &&
+        target.model_content_identity==p.target_runtime.model_content_identity,
+        "MTP native stage retained weight owner/table changed");
+    for(const auto& role:p.live_roles)
+        require(role.first && same(*role.first,role.second),"MTP native stage weight descriptor/generation changed");
+    require(p.allocator->describe_allocation(p.pool,p.reservation.device_pool_bytes,HipRuntimeAllocationSpace::device)==p.pool_lease,
+        "MTP original allocator lease changed");
+}
+void HipMtpResources::require_idle() const {validate_stage();require(!impl_->pending,"MTP native queue is already pending");}
+void HipMtpResources::mark_submitted() {validate_stage();impl_->pending=true;}
 void HipMtpResources::complete() {
-    auto& p=*impl_;validate();require(p.pending,"MTP completion requires submitted native work");
+    auto& p=*impl_;validate_stage();require(p.pending,"MTP completion requires submitted native work");
     try {
         std::array<std::uint32_t,2> status{};const auto source=view(HipMtpBuffer::status);
         check(hipMemcpyAsync(status.data(),reinterpret_cast<const void*>(source.address),8U,hipMemcpyDeviceToHost,p.stream),"MTP status transfer failed");

@@ -127,6 +127,7 @@ struct HipGreedyOutput::Impl {
     ExecutionBufferAddress binding{};
     HipGreedyOutputStats counters{};
     std::uint64_t last_epoch = 0;
+    std::uint64_t pending_position = 0;
     bool bound = false, pending = false, broken = false;
 
     Impl(std::uint32_t vocab, ExecutionMemoryBinding arena, std::shared_ptr<const void> owner,
@@ -192,12 +193,13 @@ struct HipGreedyOutput::Impl {
         // A failed submission may have consumed this epoch. Never reuse it.
         last_epoch = epoch;
     }
-    std::uint32_t select(const ExecutionBufferAddress& input, std::uint32_t vocab,
-                         std::uint64_t position, std::uint64_t epoch) {
+    void submit(const ExecutionBufferAddress& input, std::uint32_t vocab,
+                std::uint64_t position, std::uint64_t epoch) {
         admit(input, vocab, epoch);
         require(counters.calls < std::numeric_limits<std::uint64_t>::max() / 64U,
                 "GPU greedy counters exhausted");
         ++counters.calls;
+        pending_position = position;
         pending = true;
         try {
             check(hipPeekAtLastError(), "GPU greedy preexisting HIP error");
@@ -226,6 +228,18 @@ struct HipGreedyOutput::Impl {
 #if defined(STRIX_BUILD_GREEDY_OUTPUT_DIAGNOSTIC)
             diagnostic_boundary(HipGreedyOutputDiagnosticFault::after_readback);
 #endif
+        } catch (...) {
+            broken = true; ++counters.failures;
+            guard->recover_or_fail_stop(); pending = false;
+            throw;
+        }
+    }
+    std::uint32_t complete() {
+        require(!broken && pending, "GPU greedy owner has no completable pending request");
+        const auto epoch = last_epoch;
+        const auto position = pending_position;
+        try {
+            guard->require_original();
             check(hipStreamSynchronize(stream), "complete greedy result");
             ++counters.stream_completions;
 #if defined(STRIX_BUILD_GREEDY_OUTPUT_DIAGNOSTIC)
@@ -267,8 +281,14 @@ HipGreedyOutput::HipGreedyOutput(std::uint32_t vocab, ExecutionMemoryBinding scr
 HipGreedyOutput::~HipGreedyOutput() = default;
 std::uint32_t HipGreedyOutput::select(const ExecutionBufferAddress& input,
     std::uint32_t vocab, std::uint64_t position, std::uint64_t epoch) {
-    return impl_->select(input, vocab, position, epoch);
+    impl_->submit(input, vocab, position, epoch);
+    return impl_->complete();
 }
+void HipGreedyOutput::submit(const ExecutionBufferAddress& input,
+    std::uint32_t vocab, std::uint64_t position, std::uint64_t epoch) {
+    impl_->submit(input, vocab, position, epoch);
+}
+std::uint32_t HipGreedyOutput::complete() { return impl_->complete(); }
 HipGreedyOutputStats HipGreedyOutput::stats() const noexcept { return impl_->counters; }
 bool HipGreedyOutput::failed() const noexcept { return impl_->broken; }
 std::uint64_t HipGreedyOutput::scratch_bytes() const noexcept { return required_scratch_bytes(impl_->vocabulary); }

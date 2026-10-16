@@ -111,6 +111,14 @@ and continuation coverage and compare complete final target and reconciled MTP
 states. They retain host receipts rather than keeping obsolete capture leases.
 The small payload fixture does not exercise a model forward.
 
+Window row selections submit all independent finite/first-max reductions before
+waiting for their replies; no row is published until every reply is validated.
+The serial target capture uses one completion of its owned stream for the wide
+copy and D1 readback. Fusion shares each hidden projection coefficient across
+the HC accumulation chains, preserving each chain's ascending FMA order. Its
+revision-three native arithmetic profile pins correctly rounded divide/sqrt and
+IEEE denormals; prior native profile goldens cannot qualify this profile.
+
 Still required after source integration is complete: compile/object preservation
 and new-instantiation checks; component and full checkpoint replay, including
 rejection, continuation, EOS/budget and native failure paths; native measurements;

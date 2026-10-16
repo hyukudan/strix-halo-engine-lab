@@ -175,10 +175,18 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
         const auto elapsed=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count();
         if(generated.back()==eos.front())stop="eos";
         assets->validate_assets_unchanged();
-        output<<"{\n"<<(completion_receipt?completion_receipt():std::string{})<<"  \"mode\":\"native-mtp-independent-replay-then-target-verified-greedy\",\n"
+        const auto mtp_d1_inventory=options.execution_inventory
+            ? std::string("  \"mtp_target_d1_inventory\":{\"boundary\":\"after-mtp-target-setup-and-request-completion\",\"present\":")+
+                (deferred_status?"true":"false")+",\"storage\":\""+(deferred_status?"unaccounted":"absent")+
+                "\",\"included_in_base_runtime_backing_inventory\":false,\"physical_fit\":null,"
+                "\"scope\":\"actual-target-private-D1-record-and-host-shadow-presence-not-allocation-census\"},\n"
+            : std::string{};
+        output<<"{\n"<<(completion_receipt?completion_receipt():std::string{})<<mtp_d1_inventory<<"  \"mode\":\"native-mtp-independent-replay-then-target-verified-greedy\",\n"
             <<"  \"mtp_native_hardware_qualified\":false,\n  \"mtp_performance_qualified\":false,\n"
             <<"  \"optimization_profile_selected\":\""<<decode_receipt::escape_json_string(resolved_profile)<<"\",\n"
-            <<"  \"mtp_target_verification\":\""<<(window?"closed-known-window-with-restore-and-serial-tail":"serial-target-fallback")<<"\",\n"
+            <<"  \"mtp_target_verification\":\""<<mtp_target_verification_name(window_attempts)<<"\",\n"
+            <<"  \"mtp_target_window_configured\":"<<(window?"true":"false")<<",\n"
+            <<"  \"mtp_requested_target_window_rows\":"<<m.window_rows<<",\n"
             <<"  \"mtp_reference_independence\":\"externally-supplied-provenance-pinned-not-inferred-from-digest\",\n"
             <<"  \"mtp_golden_file_sha256\":\""<<model_content_identity_hex(mtp_cli_digest(m.golden_sha256))<<"\",\n"
             <<"  \"mtp_golden_payload_sha256\":\""<<model_content_identity_hex(replay.golden_payload)<<"\",\n"
@@ -213,7 +221,11 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
             <<"  \"mtp_cycles\":"<<cycles<<",\n  \"mtp_proposed_candidates\":"<<proposed<<",\n  \"mtp_accepted_candidates\":"<<accepted<<",\n"
             <<"  \"mtp_consumed_generation_input_rows\":"<<target_rows<<",\n  \"mtp_attempted_target_windows\":"<<window_attempts<<",\n"
             <<"  \"mtp_accepted_target_windows\":"<<window_accepts<<",\n  \"mtp_restored_target_windows\":"<<window_restores<<",\n"
-            <<"  \"mtp_target_r2_dispatches\":"<<r2_dispatches<<",\n  \"mtp_generation_cycle_elapsed_ms\":"<<elapsed<<",\n"
+            <<"  \"mtp_target_r2_dispatches\":"<<r2_dispatches<<",\n"
+            <<"  \"mtp_target_r2_dispatches_scope\":\"actual-pair-entry-dispatches-only-excludes-wide-R4-R8\",\n"
+            <<"  \"mtp_target_wide_dispatches\":null,\n"
+            <<"  \"mtp_target_wide_dispatches_scope\":\"not-exposed-by-current-verifier-result-not-inferred-from-geometry\",\n"
+            <<"  \"mtp_generation_cycle_elapsed_ms\":"<<elapsed<<",\n"
             <<"  \"mtp_timing_scope\":\"post-prompt-and-independent-replay-cycles-only-host-completed-wall-not-GPU-kernel-time\",\n"
             <<"  \"prefix_tokens_consumed\":"<<options.tokens.size()<<",\n  \"final_position\":"<<session.next_position<<",\n"
             <<"  \"stop_reason\":\""<<stop<<"\",\n  \"generated_tokens\":[";
