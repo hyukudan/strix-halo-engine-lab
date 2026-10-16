@@ -77,6 +77,18 @@ void capture_serial_session_snapshot(
     // the complete range census before submitting any backend work.
     const ModelContract* compact_model = nullptr);
 
+// Complete payload restore with the same identity/range admission and single
+// completed batch, without publishing ANY session metadata. A distributed
+// owner must retain its prior typed frontier and independently quarantine/drain
+// on failure; successful bytes alone never authorize a serial-ready context.
+void restore_serial_session_snapshot_payload(
+    const SerialSessionRestorePlan& restore,
+    const SerialSessionStateLayout& state_layout,
+    const SessionStateMemoryBinding& state_memory,
+    const SessionSnapshotMemoryBinding& snapshot_memory,
+    SessionSnapshotTransferBackend& backend,
+    const ModelContract* compact_model = nullptr);
+
 void restore_serial_session_snapshot(
     SerialSessionContext& session,
     const SerialSessionRestorePlan& restore,

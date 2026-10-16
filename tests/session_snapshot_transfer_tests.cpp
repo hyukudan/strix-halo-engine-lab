@@ -569,6 +569,41 @@ int main() {
             "invalid last range is rejected before entering a batched backend");
     }
 
+    {
+        // A distributed owner restores bytes while its ordinary serial entry
+        // stays quarantined. No fabricated ready context is supplied here.
+        session.next_position=3; session.committed_tokens=3;
+        session.health=strix::SerialSessionHealth::poisoned;
+        session.arithmetic_lineage.tainted=true;
+        const auto generations=session.state.generations;
+        BatchBackend payload; payload.session=&session; payload.expected_position=3;
+        strix::restore_serial_session_snapshot_payload(restore,layout,state_memory,snapshot_memory,payload);
+        expect(payload.restores==1 && payload.ranges==restore.ranges.size() &&
+            session.next_position==3 && session.committed_tokens==3 &&
+            session.state.generations==generations && session.arithmetic_lineage.tainted &&
+            session.health==strix::SerialSessionHealth::poisoned,
+            "payload-only restore never publishes a serial frontier or clears quarantine");
+        for(const auto& range:restore.ranges) {
+            const auto* source=range.storage==strix::SessionStateStorage::device?snapshot_device.data():snapshot_host.data();
+            const auto* target=range.storage==strix::SessionStateStorage::device?device_state.data():host_state.data();
+            expect(std::memcmp(source+range.snapshot_offset,target+range.destination_offset,
+                static_cast<std::size_t>(range.bytes))==0,"payload-only restore copies every complete component range");
+        }
+        payload.completion_failure=true;
+        bool rejected=false;
+        try {strix::restore_serial_session_snapshot_payload(restore,layout,state_memory,snapshot_memory,payload);}
+        catch(const std::runtime_error&) {rejected=true;}
+        expect(rejected && session.next_position==3 && session.committed_tokens==3 &&
+            session.health==strix::SerialSessionHealth::poisoned && session.arithmetic_lineage.tainted,
+            "payload-only completion error cannot publish or clear caller metadata");
+        auto malformed=restore; ++malformed.ranges.back().destination_offset;
+        const auto batches=payload.restores; rejected=false;
+        try {strix::restore_serial_session_snapshot_payload(malformed,layout,state_memory,snapshot_memory,payload);}
+        catch(const std::invalid_argument&) {rejected=true;}
+        expect(rejected && payload.restores==batches,
+            "payload-only malformed final range fails before submitting any restore");
+    }
+
     if (failures == 0) {
         std::cout << "session snapshot transfer tests passed\n";
     }

@@ -218,13 +218,13 @@ void capture_serial_session_snapshot(
     backend.capture_batch(transfers);
 }
 
-void restore_serial_session_snapshot(
-    SerialSessionContext& session,
+namespace {
+std::vector<SessionSnapshotTransfer> prepare_snapshot_restore_transfers(
+    const SerialSessionContext* session,
     const SerialSessionRestorePlan& restore,
     const SerialSessionStateLayout& state_layout,
     const SessionStateMemoryBinding& state_memory,
     const SessionSnapshotMemoryBinding& snapshot_memory,
-    SessionSnapshotTransferBackend& backend,
     const ModelContract* compact_model) {
     validate_serial_session_restore_identity(restore);
     if (restore.policy == SessionSnapshotPolicy::occupied_kv_v1) {
@@ -256,20 +256,17 @@ void restore_serial_session_snapshot(
                 throw std::invalid_argument("occupied KV restore range is not canonical");
         }
     }
-    if (session.execution_identity == 0 ||
-        session.execution_identity !=
-            restore.compiled_execution_identity ||
-        session.runtime_compatibility_identity == 0 ||
-        session.state_layout_identity == 0) {
+    if (!restore.compiled_execution_identity || !restore.runtime_compatibility_identity || !restore.state_layout_identity ||
+        (session && (session->execution_identity == 0 ||
+        session->execution_identity != restore.compiled_execution_identity ||
+        session->runtime_compatibility_identity == 0 || session->state_layout_identity == 0))) {
         throw std::invalid_argument(
             "restore requires initialized serial session identities");
     }
-    if (restore.recurrent_storage != state_layout.recurrent_storage || restore.runtime_compatibility_identity !=
-            session.runtime_compatibility_identity ||
-        restore.state_layout_identity !=
-            session.state_layout_identity ||
-        restore.state_layout_identity !=
-            state_layout.layout_identity) {
+    if (restore.recurrent_storage != state_layout.recurrent_storage ||
+        (session && (restore.runtime_compatibility_identity != session->runtime_compatibility_identity ||
+                     restore.state_layout_identity != session->state_layout_identity)) ||
+        restore.state_layout_identity != state_layout.layout_identity) {
         throw std::invalid_argument(
             "restore plan is incompatible with serial session");
     }
@@ -321,6 +318,32 @@ void restore_serial_session_snapshot(
         transfers.push_back({range.storage, source, expected_destination, range.bytes});
     }
 
+    return transfers;
+}
+} // namespace
+
+void restore_serial_session_snapshot_payload(
+    const SerialSessionRestorePlan& restore,
+    const SerialSessionStateLayout& state_layout,
+    const SessionStateMemoryBinding& state_memory,
+    const SessionSnapshotMemoryBinding& snapshot_memory,
+    SessionSnapshotTransferBackend& backend,
+    const ModelContract* compact_model) {
+    const auto transfers = prepare_snapshot_restore_transfers(nullptr, restore,
+        state_layout, state_memory, snapshot_memory, compact_model);
+    backend.restore_batch(transfers);
+}
+
+void restore_serial_session_snapshot(
+    SerialSessionContext& session,
+    const SerialSessionRestorePlan& restore,
+    const SerialSessionStateLayout& state_layout,
+    const SessionStateMemoryBinding& state_memory,
+    const SessionSnapshotMemoryBinding& snapshot_memory,
+    SessionSnapshotTransferBackend& backend,
+    const ModelContract* compact_model) {
+    const auto transfers = prepare_snapshot_restore_transfers(&session, restore,
+        state_layout, state_memory, snapshot_memory, compact_model);
     try {
         backend.restore_batch(transfers);
     } catch (...) {
