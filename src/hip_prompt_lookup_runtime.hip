@@ -25,13 +25,22 @@ void lookup_check(hipError_t value) {
 // requires proven quiescence before its snapshot owner can unwind/free.
 class LookupTransfer final : public SessionSnapshotTransferBackend {
 public:
-    explicit LookupTransfer(std::shared_ptr<const HipSetupQuiescenceGuard> guard):guard_(std::move(guard)) {}
+    LookupTransfer(std::shared_ptr<const HipSetupQuiescenceGuard> guard,hipStream_t stream)
+        :guard_(std::move(guard)),backend_(stream,guard_) {}
+    void capture_batch(std::span<const SessionSnapshotTransfer> transfers) override {batch(transfers,true);}
+    void restore_batch(std::span<const SessionSnapshotTransfer> transfers) override {batch(transfers,false);}
     [[nodiscard]] bool failed() const noexcept { return failed_; }
     void capture_device(std::uintptr_t a,std::uintptr_t b,std::uint64_t n) override { copy(a,b,n,&HipSessionSnapshotTransferBackend::capture_device); }
     void capture_host(std::uintptr_t a,std::uintptr_t b,std::uint64_t n) override { copy(a,b,n,&HipSessionSnapshotTransferBackend::capture_host); }
     void restore_device(std::uintptr_t a,std::uintptr_t b,std::uint64_t n) override { copy(a,b,n,&HipSessionSnapshotTransferBackend::restore_device); }
     void restore_host(std::uintptr_t a,std::uintptr_t b,std::uint64_t n) override { copy(a,b,n,&HipSessionSnapshotTransferBackend::restore_host); }
 private:
+    void batch(std::span<const SessionSnapshotTransfer> transfers,bool capture) {
+        try {
+            guard_->require_original();
+            if(capture) backend_.capture_batch(transfers);else backend_.restore_batch(transfers);
+        } catch(...) {failed_=true;guard_->recover_or_fail_stop();throw;}
+    }
     void copy(std::uintptr_t a,std::uintptr_t b,std::uint64_t n,
         void (HipSessionSnapshotTransferBackend::*method)(std::uintptr_t,std::uintptr_t,std::uint64_t)) {
         try { guard_->require_original(); (backend_.*method)(a,b,n); }
@@ -100,7 +109,7 @@ struct HipPromptLookupRuntime::Impl {
         HipPromptLookupAdaptivePolicy adaptive)
         : owner(std::move(retained)), guard(std::move(original)), serial(std::move(s)), model(std::move(m)),
           config(std::move(cfg)), resources(r), compiled_window(std::move(w)), window(std::move(native)),
-          window_memory(memory), scope(stream), serial_scope(serial_stream), allocator(a), generations(g), transfer(guard), catalog(model,config) {
+          window_memory(memory), scope(stream), serial_scope(serial_stream), allocator(a), generations(g), transfer(guard,stream.stream), catalog(model,config) {
         adaptive_policy=adaptive;
         if(adaptive.enabled) {
             require_lookup(adaptive.context_bucket_tokens && adaptive.context_bucket_tokens<=1048576U,

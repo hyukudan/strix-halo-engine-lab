@@ -1,4 +1,8 @@
 #include "strix/hip_session_snapshot_transfer.hpp"
+#include "strix/execution_telemetry.hpp"
+#include <array>
+#include <limits>
+#include <memory>
 
 #include <hip/hip_runtime.h>
 
@@ -150,6 +154,53 @@ int main() try {
     expect(
         null_rejected,
         "HIP snapshot transfer rejects null non-empty range");
+
+    {
+        hipStream_t stream=nullptr;
+        check(hipStreamCreateWithFlags(&stream,hipStreamNonBlocking),"create snapshot batch stream");
+        auto guard=std::make_shared<strix::HipSetupQuiescenceGuard>();
+        strix::HipSessionSnapshotTransferBackend batched(stream,guard);
+        std::array<strix::SessionSnapshotTransfer,7> capture{},restore{};
+        for(std::size_t i=0;i<6U;++i) {
+            const auto offset=i*(bytes/6U);
+            const auto extent=i==5U?bytes-offset:bytes/6U;
+            capture[i]={strix::SessionStateStorage::device,reinterpret_cast<std::uintptr_t>(device_source)+offset,
+                reinterpret_cast<std::uintptr_t>(device_snapshot)+offset,extent};
+            restore[i]={strix::SessionStateStorage::device,reinterpret_cast<std::uintptr_t>(device_snapshot)+offset,
+                reinterpret_cast<std::uintptr_t>(device_destination)+offset,extent};
+        }
+        capture[6]={strix::SessionStateStorage::host,reinterpret_cast<std::uintptr_t>(host_source.data()),
+            reinterpret_cast<std::uintptr_t>(host_snapshot.data()),bytes};
+        restore[6]={strix::SessionStateStorage::host,reinterpret_cast<std::uintptr_t>(host_snapshot.data()),
+            reinterpret_cast<std::uintptr_t>(host_destination.data()),bytes};
+        std::fill(host_destination.begin(),host_destination.end(),0U);
+        check(hipMemset(device_destination,0,bytes),"clear batched destination");
+        strix::HostDispatchCounters counters;
+        {
+            strix::ExecutionTelemetryBinding observed(&counters);
+            batched.capture_batch(capture);
+            batched.restore_batch(restore);
+        }
+        check(hipMemcpy(device_check.data(),device_destination,bytes,hipMemcpyDeviceToHost),"read batched restored state");
+        expect(device_check==host_source && host_destination==host_source,
+            "owned-stream batches complete every host/device range before return");
+        const auto calls=[&](strix::ExecutionActivityKind kind) {return counters.activities()[static_cast<std::size_t>(kind)].calls;};
+        expect(calls(strix::ExecutionActivityKind::copy_async)==12U &&
+            calls(strix::ExecutionActivityKind::stream_sync)==2U &&
+            calls(strix::ExecutionActivityKind::copy_sync)==0U && calls(strix::ExecutionActivityKind::device_sync)==0U,
+            "six component copies per batch use one stream fence and no blocking global copy");
+        auto bad=restore;bad.back().storage=static_cast<strix::SessionStateStorage>(99U);
+        strix::HostDispatchCounters untouched;
+        bool rejected=false;
+        try {strix::ExecutionTelemetryBinding observed(&untouched);batched.restore_batch(bad);}
+        catch(const std::invalid_argument&) {rejected=true;}
+        expect(rejected && untouched.activities()[static_cast<std::size_t>(strix::ExecutionActivityKind::copy_async)].calls==0U,
+            "invalid final batch range is rejected before submitting the first device copy");
+        bad=restore;bad.back().source=std::numeric_limits<std::uintptr_t>::max();
+        rejected=false;try{batched.restore_batch(bad);}catch(const std::invalid_argument&){rejected=true;}
+        expect(rejected,"batch preflight rejects overflowing host address before enqueue");
+        check(hipStreamDestroy(stream),"destroy completed snapshot batch stream");
+    }
 
     check(
         hipFree(

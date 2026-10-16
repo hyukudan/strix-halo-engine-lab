@@ -4,6 +4,7 @@
 #include "strix/generation_output_dispatch.hpp"
 #include "strix/hip_generation_output.hpp"
 #include "strix/hip_serving_prefix_cache.hpp"
+#include "strix/hip_session_snapshot_transfer.hpp"
 #include "strix/hip_setup_quiescence.hpp"
 #include "strix/prepared_execution.hpp"
 #include "strix/prepared_serial_session.hpp"
@@ -28,59 +29,9 @@ void serving_check(hipError_t status, const char* operation) {
     if (status != hipSuccess)
         throw std::runtime_error(std::string(operation) + ": " + hipGetErrorString(status));
 }
-// Each complete snapshot batch uses this request's owned nonblocking stream. On a failed
-// enqueue/completion the original device is drained BEFORE a cache entry or
-// destination owner can unwind/free its buffers.
-class ServingPrefixTransfer final : public SessionSnapshotTransferBackend {
-public:
-    ServingPrefixTransfer(hipStream_t stream,std::shared_ptr<const HipSetupQuiescenceGuard> guard)
-        :stream_(stream),guard_(std::move(guard)) {}
-    void capture_batch(std::span<const SessionSnapshotTransfer> transfers) override {batch(transfers);}
-    void restore_batch(std::span<const SessionSnapshotTransfer> transfers) override {batch(transfers);}
-    void capture_device(std::uintptr_t a,std::uintptr_t b,std::uint64_t n) override {device(a,b,n);}
-    void capture_host(std::uintptr_t a,std::uintptr_t b,std::uint64_t n) override {host(a,b,n);}
-    void restore_device(std::uintptr_t a,std::uintptr_t b,std::uint64_t n) override {device(a,b,n);}
-    void restore_host(std::uintptr_t a,std::uintptr_t b,std::uint64_t n) override {host(a,b,n);}
-private:
-    void batch(std::span<const SessionSnapshotTransfer> transfers) {
-        // Validate the entire batch before its first enqueue, including direct
-        // callers outside the generic snapshot planner.
-        for(const auto& t:transfers) {
-            if((t.storage!=SessionStateStorage::device && t.storage!=SessionStateStorage::host) ||
-                !t.source || !t.destination || t.bytes>std::numeric_limits<std::size_t>::max() ||
-                t.bytes>std::numeric_limits<std::uintptr_t>::max()-t.source ||
-                t.bytes>std::numeric_limits<std::uintptr_t>::max()-t.destination)
-                throw std::invalid_argument("serving prefix batch extent is invalid");
-        }
-        try {
-            bool device_work=false;
-            for(const auto& t:transfers) {
-                if(t.storage==SessionStateStorage::host) {host(t.source,t.destination,t.bytes);continue;}
-                serving_check(hipMemcpyAsync(reinterpret_cast<void*>(t.destination),reinterpret_cast<const void*>(t.source),
-                    static_cast<std::size_t>(t.bytes),hipMemcpyDeviceToDevice,stream_),"enqueue serving prefix state batch");
-                device_work=true;
-            }
-            // Keep all seven components and their pinned owners live until ONE
-            // completion boundary; never publish restored metadata per range.
-            if(device_work) serving_check(hipStreamSynchronize(stream_),"complete serving prefix state batch");
-            guard_->require_original();
-        } catch(...) {guard_->recover_or_fail_stop();throw;}
-    }
-    void device(std::uintptr_t a,std::uintptr_t b,std::uint64_t n) {
-        if(!a || !b || n>std::numeric_limits<std::size_t>::max()) throw std::invalid_argument("serving prefix copy extent is invalid");
-        try {
-            serving_check(hipMemcpyAsync(reinterpret_cast<void*>(b),reinterpret_cast<const void*>(a),
-                static_cast<std::size_t>(n),hipMemcpyDeviceToDevice,stream_),"copy serving prefix state");
-            serving_check(hipStreamSynchronize(stream_),"complete serving prefix state copy");guard_->require_original();
-        } catch(...) {guard_->recover_or_fail_stop();throw;}
-    }
-    static void host(std::uintptr_t a,std::uintptr_t b,std::uint64_t n) {
-        if(!a || !b || n>std::numeric_limits<std::size_t>::max()) throw std::invalid_argument("serving prefix host extent is invalid");
-        std::memcpy(reinterpret_cast<void*>(b),reinterpret_cast<const void*>(a),static_cast<std::size_t>(n));
-    }
-    hipStream_t stream_;
-    std::shared_ptr<const HipSetupQuiescenceGuard> guard_;
-};
+// The shared transfer backend admits the full snapshot, queues its D2D
+// ranges on this request's owned stream and completes/drains before return.
+using ServingPrefixTransfer = HipSessionSnapshotTransferBackend;
 bool empty_binding(const ExecutionMemoryBinding& binding) noexcept {
     return !binding.execution_identity && !binding.arena_base && !binding.arena_bytes &&
         !binding.allocation_generation;
