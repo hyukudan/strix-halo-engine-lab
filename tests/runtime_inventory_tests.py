@@ -122,7 +122,9 @@ class InventoryTests(unittest.TestCase):
         receipt = self.receipt(True, "qualified-checkpoint")
         receipt.update(modes)
         result = self.collect(cache_path=self.cache(a8="ON"), receipt_path=self.evidence("all-overlays.json", receipt))
-        self.assertEqual(result["reported_opt_in_overlays"], modes)
+        self.assertEqual({key: value for key, value in result["reported_opt_in_overlays"].items()
+                          if value is not None}, modes)
+        self.assertIsNone(result["reported_opt_in_overlays"]["qsa_hierarchical_selection"])
 
     def test_overlay_absence_false_unknown_and_invalid_types(self):
         inactive = {key: False for key in ("batched_moe_activation", "prefetch_q8_lm_head",
