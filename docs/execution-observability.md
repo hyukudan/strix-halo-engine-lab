@@ -128,3 +128,26 @@ The default zero leaves legacy scheduling unchanged. Independent serving
 sessions have independent backend budgets; this is not a process-wide CPU
 budget, affinity policy or limit on custom source-internal threads. Receipts
 report the requested cap separately from unknown actual helper counts.
+
+## Opt-in device queue event trace
+
+`--device-queue-trace` requires host telemetry and resolved eager D1. It does not
+enable D1 or change any optimization flag. Graph, integer head, serving,
+known-prefix, prompt lookup and prefix roundtrip are rejected for this initial
+scope. Eager direct/prepared, sibling-stream overlap and GDN-island replay remain
+explicitly profileable; internal graph nodes are not expanded into kernel spans.
+
+The native observer preallocates2048 span slots (two timing events each) and an
+origin event during setup. It forwards the existing host counters and receives
+the actual dispatcher/TLS observer hooks. It retains the D1 stream/allocation
+owner; binding lifetime ends before observer destruction. Event API errors are
+sticky: the existing before-commit callback checks observer health before D1
+publication, with no error clearing or new per-operator synchronization.
+
+After normal existing producer completion, the decoder emits the standalone
+JSON event trace on stderr. Export uses only event query/elapsed APIs and adds
+no synchronization. Stored errors make the command fail rather than accepting a
+healthy trace. Unknown/unowned/captured spans, dropped capacity and incomplete
+queries stay explicitly labelled. Events perturb scheduling: these are launcher
+queue intervals (including gaps/waits), not individual kernel busy times, GPU
+submit counts or physical DRAM bytes. No benchmark tracing is automatic.

@@ -10,6 +10,8 @@
 #include <span>
 
 namespace strix {
+struct ExecutionDispatchContext;
+enum class QueueDependencyKind { event_record, event_wait };
 
 // Host launcher boundaries only. A returned launcher is not proof of a GPU
 // submit, GPU completion, visibility or token commit. One serialized owner
@@ -68,6 +70,12 @@ public:
     virtual ~ExecutionTelemetry() = default;
     virtual void observe(const HostDispatchObservation&) noexcept = 0;
     virtual void observe_activity(const ExecutionActivity&) noexcept {}
+    // Optional device observer. Tickets delimit launcher queue spans, never
+    // individual kernels. Callbacks never throw; stored API failures belong to
+    // the enclosing owner's precommit completion/error boundary.
+    [[nodiscard]] virtual std::uint64_t begin_queue_span(const ExecutionDispatchContext&) noexcept { return 0; }
+    virtual void end_queue_span(std::uint64_t, DispatchOutcome) noexcept {}
+    virtual void queue_dependency(QueueDependencyKind, std::uintptr_t, std::uintptr_t) noexcept {}
 };
 
 // One serialized host owner per thread. Null observers do not read a clock,

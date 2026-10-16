@@ -501,15 +501,19 @@ void DirectLaunchDispatcher::dispatch(const ExecutionDispatchContext& context, b
                 std::chrono::steady_clock::now() - start).count());
         observe_host_dispatch(*observer, event);
     };
+    std::uint64_t queue_ticket = 0;
     try {
         const auto& launcher = launcher_for(context, runtime_step);
         event.outcome = DispatchOutcome::failed;
+        queue_ticket = observer->begin_queue_span(context);
         launcher.function(context, launcher.user_data);
         event.outcome = DispatchOutcome::returned;
     } catch (...) {
+        observer->end_queue_span(queue_ticket,event.outcome);
         report();
         throw;
     }
+    observer->end_queue_span(queue_ticket,event.outcome);
     report();
 }
 

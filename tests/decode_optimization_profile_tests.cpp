@@ -338,6 +338,29 @@ int main() {
         rejects([&] { validate_resolved_known_prefix_window(bad); },
             "known-prefix window requires eager full-head generation without RAW/reference, alternate submission, cache, islands or candidate layouts");
     }
+    expect(!defaults.device_queue_trace, "device event profiling is off by default");
+    validate_resolved_device_queue_trace(defaults);
+    auto trace = defaults; trace.device_queue_trace = true; trace.host_dispatch_telemetry = true; trace.deferred_moe_status = true;
+    validate_resolved_device_queue_trace(trace);
+    for(unsigned mutation=0;mutation<8;++mutation) {
+        auto bad=trace;
+        if(mutation==0)bad.host_dispatch_telemetry=false;
+        if(mutation==1)bad.deferred_moe_status=false;
+        if(mutation==2)bad.execution.mode=DecodeExecutionMode::graph;
+        if(mutation==3)bad.serving_prefix_files={"not-opened"};
+        if(mutation==4)bad.known_prefix_window=true;
+        if(mutation==5)bad.prompt_lookup=true;
+        if(mutation==6)bad.prefix_cache_roundtrip=true;
+        if(mutation==7)bad.execution.integer_head=DecodeIntegerHead::a8_iu8;
+        rejects([&]{validate_resolved_device_queue_trace(bad);},
+            "device queue trace requires host telemetry and eager D1 C1 without graph, integer, serving, known-prefix, lookup or cache roundtrip");
+    }
+    expect(parse({"decoder","m","1","--host-dispatch-telemetry","--device-queue-trace"}).device_queue_trace,
+        "explicit device trace does not open a GPU or enable D1 implicitly");
+    rejects([]{(void)parse({"decoder","m","1","--device-queue-trace"});},
+        "device queue trace requires --host-dispatch-telemetry");
+    rejects([]{(void)parse({"decoder","m","1","--host-dispatch-telemetry","--device-queue-trace","--device-queue-trace"});},
+        "duplicate device queue trace option");
     expect(!defaults.prompt_lookup_adaptive, "adaptive lookup is default off");
     const auto adaptive_lookup = parse({"decoder", "m", "1", "--prompt-lookup", "--prompt-lookup-adaptive"});
     expect(adaptive_lookup.prompt_lookup_adaptive && !adaptive_lookup.prompt_lookup_depth_explicit &&

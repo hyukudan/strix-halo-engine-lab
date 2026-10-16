@@ -57,6 +57,13 @@ bool branch_op(SerialOp op) {
     return op == SerialOp::moe_route || op == SerialOp::shared_expert ||
            op == SerialOp::moe_experts || op == SerialOp::moe_combine;
 }
+void trace_dependency(QueueDependencyKind kind,hipStream_t stream,hipEvent_t event,std::uint32_t layer) noexcept {
+    if(auto* observer=current_execution_telemetry()) {
+        auto correlation=current_execution_correlation();correlation.layer=layer;
+        ExecutionCorrelationScope scoped(correlation);
+        observer->queue_dependency(kind,reinterpret_cast<std::uintptr_t>(stream),reinterpret_cast<std::uintptr_t>(event));
+    }
+}
 struct OverlapRange { std::uintptr_t address = 0; std::uint64_t bytes = 0; };
 class OverlapAllocationLease;
 struct OverlapLeaseRegistry { std::mutex mutex; std::vector<OverlapAllocationLease*> owners; };
@@ -192,15 +199,18 @@ void HipMoeSiblingStreams::fork_shared(std::uint32_t layer) {
     s.layer = layer; s.phase = Impl::Phase::forking;
     try {
         check(hipEventRecord(s.fork, s.main), "record shared producer-ready");
+        trace_dependency(QueueDependencyKind::event_record,s.main,s.fork,layer);
         ++s.counters.fork_records; // Actual successful fork-event recording, even if a later operation fails.
         s.work.state = HipMoeWorkState::submitted;
         check(hipStreamWaitEvent(s.side, s.fork, 0), "side waits for shared input producer");
+        trace_dependency(QueueDependencyKind::event_wait,s.side,s.fork,layer);
     } catch (...) { s.abort(); throw; }
     });
 }
 void HipMoeSiblingStreams::record_shared_done(std::uint32_t layer) {
     auto& s = *impl_; s.protected_call([&] { s.expected_phase(Impl::Phase::forking, layer);
-    try { check(hipEventRecord(s.join, s.side), "record shared branch done"); }
+    try { check(hipEventRecord(s.join, s.side), "record shared branch done");
+        trace_dependency(QueueDependencyKind::event_record,s.side,s.join,layer); }
     catch (...) { s.abort(); throw; }
     ++s.forks; s.phase = Impl::Phase::shared_recorded;
     });
@@ -212,7 +222,8 @@ void HipMoeSiblingStreams::begin_experts(std::uint32_t layer) {
 }
 void HipMoeSiblingStreams::join_before_combine(std::uint32_t layer) {
     auto& s = *impl_; s.protected_call([&] { s.expected_phase(Impl::Phase::routed, layer);
-    try { check(hipStreamWaitEvent(s.main, s.join, 0), "main joins shared before combine"); }
+    try { check(hipStreamWaitEvent(s.main, s.join, 0), "main joins shared before combine");
+        trace_dependency(QueueDependencyKind::event_wait,s.main,s.join,layer); }
     catch (...) { s.abort(); throw; }
     ++s.joins; ++s.counters.join_waits; s.phase = Impl::Phase::idle;
     });

@@ -184,6 +184,7 @@ struct Options {
     strix::KnownWindowOutputPolicy known_prefix_output_policy = strix::KnownWindowOutputPolicy::all_rows;
     bool known_prefix_output_policy_explicit = false;
     bool prompt_lookup_adaptive = false;
+    bool device_queue_trace = false;
     std::uint64_t ple_cache_rows = 0, ple_cache_budget_bytes = 0;
     bool ple_cache_rows_explicit = false, ple_cache_budget_explicit = false;
     std::uint64_t serving_cache_entries = 0, serving_cache_snapshot_bytes = 0;
@@ -270,6 +271,15 @@ inline void validate_resolved_q51_slot_parallel_down(const Options& options) {
 
 // Explicit per-backend helper cap overlays the resolved PLE choice; never
 // selects the planned backend or disables another requested optimization.
+inline void validate_resolved_device_queue_trace(const Options& options) {
+    if (!options.device_queue_trace) return;
+    if (!options.host_dispatch_telemetry || !options.deferred_moe_status ||
+        options.execution.mode != strix::DecodeExecutionMode::eager ||
+        options.execution.integer_head != strix::DecodeIntegerHead::none || !options.serving_prefix_files.empty() ||
+        options.known_prefix_window || options.prompt_lookup || options.prefix_cache_roundtrip)
+        throw std::invalid_argument("device queue trace requires host telemetry and eager D1 C1 without graph, integer, serving, known-prefix, lookup or cache roundtrip");
+}
+
 inline void validate_resolved_ple_cache(const Options& options) {
     if (!(options.ple_cache_rows_explicit || options.ple_cache_budget_explicit ||
           options.ple_cache_rows || options.ple_cache_budget_bytes)) return;
@@ -428,7 +438,7 @@ inline Options parse_options(
     if (argc < 2) {
         throw std::invalid_argument(
             "usage: strix-hip-decode-token MODEL.gguf [TOKEN_ID ...] "
-            "[--optimization-profile auto|manual] [--execution-inventory] [--host-dispatch-telemetry] [--execution-telemetry-trace] "
+            "[--optimization-profile auto|manual] [--execution-inventory] [--host-dispatch-telemetry] [--execution-telemetry-trace] [--device-queue-trace] "
             "[--gpu-greedy-token] [--logprob-token ID ...] [--offline-tuning-cache FILE [--offline-compile-provenance FILE]] [--gdn-recurrent-layout baseline|stride32|stride33|transposed] [--gdn-recurrent-storage key-value|value-key] [--known-prefix-window --known-prefix-rows 2|4|8 --known-prefix-expert-union] [--prompt-lookup [--prompt-lookup-depth 0|1|2 | --prompt-lookup-adaptive]] [--serve-prefix-u32le FILE ... --serve-concurrency 1|2|4 --serve-memory-budget-bytes N --serve-request-budget-bytes N --serve-headroom-bytes N] [--gdn-islands] [--qsa-hierarchical-selection] [--qsa-gqa-heads-per-block 1|2|4] [--prepared-eager] [--moe-shared-overlap] [--moe-overlap-arena-budget-bytes N] [--batched-moe-activation] [--validation-final-state DIR] [--validation-final-state-max-bytes N] [--reference FILE] [--max-logit-error X] "
             "[--context N] [--residency register|copy] [--coalesce-gap BYTES] "
             "[--planned-ple-io] [--ple-cpu-helper-threads 1..8] [--ple-cache-rows N --ple-cache-budget-bytes N] [--ple-max-rows-per-io N] [--ple-max-inflight-ios N] "
@@ -511,6 +521,11 @@ inline Options parse_options(
         if (argument == "--prompt-lookup") {
             if (options.prompt_lookup) throw std::invalid_argument("duplicate prompt lookup option");
             options.prompt_lookup = true;
+            continue;
+        }
+        if (argument == "--device-queue-trace") {
+            if (options.device_queue_trace) throw std::invalid_argument("duplicate device queue trace option");
+            options.device_queue_trace = true;
             continue;
         }
         if (argument == "--prompt-lookup-adaptive") {
@@ -1123,6 +1138,8 @@ inline Options parse_options(
         throw std::invalid_argument("adaptive prompt lookup requires --prompt-lookup without an explicit fixed depth");
     if (options.prompt_lookup_depth_explicit && !options.prompt_lookup)
         throw std::invalid_argument("prompt lookup depth requires --prompt-lookup");
+    if (options.device_queue_trace && !options.host_dispatch_telemetry)
+        throw std::invalid_argument("device queue trace requires --host-dispatch-telemetry");
     if (options.execution_telemetry_trace && !options.host_dispatch_telemetry)
         throw std::invalid_argument("execution telemetry trace requires host dispatch telemetry");
     if (options.context_tokens == 0) {

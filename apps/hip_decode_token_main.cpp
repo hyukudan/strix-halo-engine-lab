@@ -22,6 +22,7 @@
 #include "strix/offline_compile_provenance.hpp"
 #include "offline_tuning_build_context.hpp"
 #include "strix/hip_model_residency.hpp"
+#include "strix/hip_event_queue_trace.hpp"
 #include "strix/hip_runtime_allocator.hpp"
 #include "strix/hip_session_snapshot_transfer.hpp"
 #include "strix/launch_dispatch.hpp"
@@ -536,8 +537,8 @@ public:
           compiled_(std::move(compiled)), manifest_(std::move(manifest)), admitted_manifest_(std::move(admitted_manifest)),
           access_(std::move(access)),
           layout_(std::move(layout)), generations_(epoch), mapped_io_(*mapped_),
-          cache_source_(ple_policy.cache_capacity_rows ? std::make_shared<MappedModelIoSource>(mapped_) : nullptr),
-          planned_lookup_(cache_source_ ? *cache_source_ : mapped_io_, ple_policy, cache_source_),
+          ple_policy_(ple_policy),
+          planned_lookup_(mapped_io_, {ple_policy.max_rows_per_io, ple_policy.max_inflight_ios, ple_policy.cpu_helper_threads}),
           hash_(strix::build_ple_hash_contract(model)),
           planned_(planned), epoch_(epoch), request_id_(request_id), telemetry_(telemetry) {
         if (!mapped_ || !weights_ || !guard_ || !epoch_) throw std::invalid_argument("serving requires retained model and fresh epoch");
@@ -557,6 +558,12 @@ public:
         if (touched_) throw std::logic_error("serving storage cannot be initialized twice");
         touched_ = true;
         guard_->run([&] {
+            // initialize is called ONLY by an admitted scheduler factory. The
+            // constructor must not allocate cache payload before reservation.
+            if (ple_policy_.cache_capacity_rows) {
+                cache_source_ = std::make_shared<MappedModelIoSource>(mapped_);
+                cached_lookup_.emplace(*cache_source_, ple_policy_, cache_source_);
+            }
             memory_ = strix::RuntimeExecutionMemoryOwner::allocate(compiled_, layout_, allocator_, generations_);
             if (memory_.scratch().allocation_generation != epoch_) throw std::logic_error("serving admission epoch changed");
             admit(memory_.scratch());
@@ -571,7 +578,8 @@ public:
         resources.model_manifest = admitted_manifest_ ? &admitted_manifest_->manifest() : &manifest_;
         resources.model_weights = &weights_->binding(); resources.tensor_access = &access_;
         resources.session_state_layout = &layout_; resources.session_state_memory = &memory_.state();
-        resources.ple_lookup = planned_ ? static_cast<strix::PleLookupBackend*>(&planned_lookup_) : &mapped_lookup_;
+        resources.ple_lookup = planned_ ? (cached_lookup_ ? static_cast<strix::PleLookupBackend*>(&*cached_lookup_) :
+            static_cast<strix::PleLookupBackend*>(&planned_lookup_)) : &mapped_lookup_;
         resources.ple_hash_contract = &hash_; resources.ple_prefetch = &prefetch_;
         session.runtime_compatibility_identity = strix::build_runtime_execution_identities(
             compiled_.execution_identity, compiled_.arena, resources).compatibility_identity;
@@ -583,7 +591,9 @@ public:
         result.row = 0; result.rows = 1; result.phase = strix::ExecutionPhase::token;
         return result;
     }
-    [[nodiscard]] strix::PlannedPleCacheStats ple_cache_stats() const noexcept { return planned_lookup_.cache_stats(); }
+    [[nodiscard]] strix::PlannedPleCacheStats ple_cache_stats() const noexcept {
+        return cached_lookup_ ? cached_lookup_->cache_stats() : strix::PlannedPleCacheStats{};
+    }
     bool telemetry() const noexcept { return telemetry_; }
     strix::HostDispatchCounters counters;
     strix::SerialSessionContext session;
@@ -603,8 +613,10 @@ private:
     strix::RuntimeExecutionMemoryOwner memory_;
     MappedModelIoSource mapped_io_;
     strix::FileMappedPleLookupBackend mapped_lookup_;
+    strix::PlannedPleLookupPolicy ple_policy_;
     std::shared_ptr<MappedModelIoSource> cache_source_;
     strix::PlannedPleLookupBackend planned_lookup_;
+    std::optional<strix::PlannedPleLookupBackend> cached_lookup_;
     strix::PleHashContract hash_;
     strix::PleLookupPrefetchState prefetch_;
     bool planned_ = false;
@@ -774,6 +786,7 @@ int main(
             "  --serve-prefix-u32le FILE (repeat per request; independent C1 state, shared weights)\n"
             "  --serve-prefix-cache-entries N --serve-prefix-cache-snapshot-bytes N --serve-prefix-cache-capture-peak-bytes N --serve-prefix-cache-max-tokens N (all explicit, optional bounded shared pool)\n"
             "  --serve-concurrency 1|2|4 --serve-memory-budget-bytes N --serve-request-budget-bytes N --serve-headroom-bytes N\n"
+            "  --device-queue-trace (explicit profiling: requires host telemetry/eager D1; launcher queue spans, not kernel busy time)\n"
             "  --gdn-islands (experimental eager D1 GDN launch organization; paired wave8 GDN supported)\n"
             "  --prepared-eager (experimental immutable static submission plan)\n"
             "  --moe-shared-overlap [--moe-overlap-arena-budget-bytes N] (experimental eager D1)\n"
@@ -931,6 +944,7 @@ int main(
     strix::decode_cli::validate_resolved_serving(options);
     strix::decode_cli::validate_resolved_ple_cpu_helpers(options);
     strix::decode_cli::validate_resolved_ple_cache(options);
+    strix::decode_cli::validate_resolved_device_queue_trace(options);
     strix::decode_cli::validate_resolved_requested_logprobs(options, model.vocab_size);
     if (options.batched_moe_activation && !options.q4k_a8g32_gate_up)
         throw std::invalid_argument("batched MoE activation requires resolved Q4K A8 gate/up execution");
@@ -1746,8 +1760,25 @@ int main(
         ? strix::decode_receipt::execution_inventory_receipt(compiled, launch_plan, kernel_registry) +
             strix::decode_receipt::hip_runtime_environment_receipt() + model_owner_inventory_receipt
         : std::string{};
-    strix::DirectLaunchDispatcher direct_dispatcher(launch_plan,
-        host_telemetry.enabled ? &host_telemetry.counters : nullptr);
+    std::unique_ptr<strix::HipEventQueueTrace> device_queue_trace;
+    std::optional<strix::ExecutionTelemetryBinding> device_queue_binding;
+    strix::ExecutionTelemetry* active_observer = host_telemetry.enabled ? &host_telemetry.counters : nullptr;
+    if (options.device_queue_trace) {
+        if (!deferred_moe) throw std::logic_error("device queue trace is missing its owned D1 stream");
+        device_queue_trace = std::make_unique<strix::HipEventQueueTrace>(host_telemetry.counters,
+            std::static_pointer_cast<const void>(deferred_moe), original_work_device);
+        active_observer = device_queue_trace.get();
+        device_queue_binding.emplace(active_observer, strix::current_execution_correlation());
+    }
+    // Export only after the existing execution completion; this adds no fence.
+    // Binding dies before trace, while trace retains D1/main allocation owners.
+    const auto emit_device_queue_trace = [&] {
+        if (!device_queue_trace) return;
+        device_queue_trace->write_after_completion(std::cerr);
+        std::cerr << '\n';
+        device_queue_trace->require_healthy_before_commit();
+    };
+    strix::DirectLaunchDispatcher direct_dispatcher(launch_plan, active_observer);
     std::unique_ptr<strix::HipMoeOverlapDispatcher> moe_overlap;
     if (overlap_arena) {
         if (!deferred_moe) throw std::logic_error("MoE overlap is missing its main stream owner");
@@ -1755,7 +1786,7 @@ int main(
             launch_plan, deferred_moe->resources(), deferred_moe->scope().stream,
             std::static_pointer_cast<const void>(deferred_moe),
             std::static_pointer_cast<const void>(launcher_catalog), original_work_device,
-            host_telemetry.enabled ? &host_telemetry.counters : nullptr);
+            active_observer);
     }
     strix::EagerExecutionDispatcher& native_dispatcher = moe_overlap
         ? static_cast<strix::EagerExecutionDispatcher&>(*moe_overlap)
@@ -1897,6 +1928,7 @@ int main(
                 const auto complete_before_commit = [&] {
                     if (moe_overlap) moe_overlap->verify_before_commit(
                         output_dispatcher && output_dispatcher->state_only_active());
+                    if (device_queue_trace) device_queue_trace->require_healthy_before_commit();
                     deferred_moe->complete_before_commit();
                 };
                 if (prepared_eager) static_cast<void>(strix::execute_prepared_serial_token(
@@ -2338,6 +2370,7 @@ int main(
                 << restored_ms
                 << "\n"
                 << "}\n";
+            emit_device_queue_trace();
             return 0;
         }
 
@@ -2826,6 +2859,7 @@ int main(
                               backend.elapsed_ms().size()))
             << "\n";
         std::cout << "}\n";
+        emit_device_queue_trace();
         return 0;
     }
 
@@ -3121,6 +3155,7 @@ int main(
         << '\n'
         << '}' << '\n';
 
+    emit_device_queue_trace();
     return replay_assessment.has_value() &&
                    !replay_assessment->passes_declared_policy
                ? 2
