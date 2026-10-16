@@ -391,10 +391,108 @@ void known_prompt_tests() {
     }
 }
 
+void prepared_target_cursor_tests() {
+    const std::vector<std::uint32_t> prefix{1,2,3};
+    for(const std::uint64_t restored:{0ULL,1ULL,2ULL,3ULL})
+    for(const std::uint64_t budget:{0ULL,1ULL,3ULL})
+    for(const std::uint64_t capacity:{3ULL,16ULL})
+    for(const std::uint32_t eos:{4U,7U}) {
+        const strix::SerialGreedyRequest request{prefix,8,capacity,budget,eos};
+        PrefixBackend ordinary,split;
+        if(restored) ordinary.restored=split.restored=strix::GreedyPrefixRestore{restored,
+            restored==prefix.size()?std::optional<std::uint32_t>{4U}:std::nullopt};
+        const auto expected=strix::execute_serial_greedy_token_request(request,ordinary);
+        strix::SerialGreedyTokenCursor cursor(request);
+        while(!cursor.done()) {
+            const auto calls=split.calls;
+            const auto input=cursor.prepare_target(split);
+            expect(split.calls==calls,"preparing a cohort input never executes its target");
+            if(!input) continue; // Exact cached frontier needs no target input.
+            expect(input->position==cursor.result().final_position && input->vocab_size==8U && input->ticket,
+                "prepared input carries its original position/vocabulary and nonzero lease");
+            bool twice=false;try{(void)cursor.prepare_target(split);}catch(const std::logic_error&){twice=true;}
+            expect(twice && split.calls==calls,"second preparation cannot duplicate a leased target input");
+            std::optional<std::uint32_t> selected;
+            if(input->state_only) split.execute_state(input->token,input->position);
+            else selected=split.execute_greedy(input->token,input->position,input->vocab_size);
+            cursor.accept_target(split,*input,selected);
+        }
+        const auto result=cursor.take_result();
+        expect(result.generated_tokens==expected.generated_tokens && result.steps_executed==expected.steps_executed &&
+            result.final_position==expected.final_position && result.stop_reason==expected.stop_reason &&
+            result.restored_prefix_tokens==expected.restored_prefix_tokens && split.calls==ordinary.calls &&
+            split.captures==ordinary.captures && split.restores==ordinary.restores,
+            "split target completion preserves cache/prefill/greedy/EOS/capacity/budget and call ordering");
+    }
+    for(const unsigned mutation:{0U,1U,2U,3U,4U}) {
+        PrefixBackend backend;strix::SerialGreedyTokenCursor cursor({prefix,8,16,3,7});
+        const auto lease=cursor.prepare_target(backend);auto forged=*lease;
+        if(mutation==0U) ++forged.token;
+        if(mutation==1U) ++forged.position;
+        if(mutation==2U) ++forged.ticket;
+        if(mutation==3U) forged.state_only=false;
+        if(mutation==4U) ++forged.vocab_size;
+        bool rejected=false;try{cursor.accept_target(backend,forged,std::nullopt);}catch(const std::invalid_argument&){rejected=true;}
+        expect(rejected && cursor.failed() && backend.calls.empty() && !cursor.result().steps_executed,
+            "forged target lease fails before cursor publication and cannot resume");
+    }
+    {
+        PrefixBackend a,b;strix::SerialGreedyTokenCursor ca({prefix,8,16,3,7}),cb({prefix,8,16,3,7});
+        const auto la=ca.prepare_target(a),lb=cb.prepare_target(b);
+        expect(la->ticket==lb->ticket && la->token==lb->token,"foreign lease fixture has identical public value fields");
+        bool rejected=false;try{ca.accept_target(a,*lb,std::nullopt);}catch(const std::invalid_argument&){rejected=true;}
+        expect(rejected && ca.failed() && a.calls.empty(),"private cursor ownership prevents borrowing another request's equal lease");
+    }
+    {
+        PrefixBackend original,foreign;strix::SerialGreedyTokenCursor cursor({prefix,8,16,3,7});
+        const auto lease=cursor.prepare_target(original);
+        bool rejected=false;try{cursor.accept_target(foreign,*lease,std::nullopt);}catch(const std::invalid_argument&){rejected=true;}
+        expect(rejected && cursor.failed() && original.calls.empty() && foreign.calls.empty(),
+            "target lease completion cannot switch its borrowed backend/capture owner");
+    }
+    {
+        PrefixBackend backend;strix::SerialGreedyTokenCursor cursor({prefix,8,16,3,7});
+        const auto lease=cursor.prepare_target(backend);
+        cursor.cancel_prepared_target(*lease);
+        const auto result=cursor.take_result();
+        expect(cursor.cancelled() && !cursor.failed() && backend.calls.empty() && result.generated_tokens.empty() &&
+            result.steps_executed==0U && result.final_position==0U,
+            "pre-enqueue cancellation abandons exactly one lease without fake completed work");
+    }
+    for(const bool state_only:{false,true}) {
+        const std::vector<std::uint32_t> prompt=state_only?prefix:std::vector<std::uint32_t>{1U};
+        PrefixBackend backend;strix::SerialGreedyTokenCursor cursor({prompt,8,16,3,7});
+        const auto lease=cursor.prepare_target(backend);std::optional<std::uint32_t> selected;
+        if(lease->state_only)backend.execute_state(lease->token,lease->position);
+        else selected=backend.execute_greedy(lease->token,lease->position,lease->vocab_size);
+        cursor.cancel();cursor.accept_target(backend,*lease,selected);
+        const auto result=cursor.take_result();
+        expect(result.steps_executed==1U && result.final_position==1U && result.generated_tokens.empty() &&
+            backend.position==1U && backend.captures==0U && cursor.cancelled() && !cursor.failed(),
+            "cancellation after submission accounts completed state but emits/captures no pending result");
+    }
+    {
+        PrefixBackend backend;strix::SerialGreedyTokenCursor cursor({prefix,8,16,3,7});
+        const auto lease=cursor.prepare_target(backend);backend.execute_state(lease->token,lease->position);
+        cursor.accept_target(backend,*lease,std::nullopt);
+        bool rejected=false;try{cursor.accept_target(backend,*lease,std::nullopt);}catch(const std::invalid_argument&){rejected=true;}
+        expect(rejected && cursor.failed() && cursor.result().steps_executed==1U && backend.calls.size()==1U,
+            "completed target lease cannot publish or consume twice");
+    }
+    for(const bool state_only:{false,true}) {
+        const std::vector<std::uint32_t> prompt=state_only?prefix:std::vector<std::uint32_t>{1U};
+        PrefixBackend backend;strix::SerialGreedyTokenCursor cursor({prompt,8,16,3,7});const auto lease=cursor.prepare_target(backend);
+        bool rejected=false;try{cursor.accept_target(backend,*lease,state_only?std::optional<std::uint32_t>{2U}:std::nullopt);}
+        catch(const std::invalid_argument&){rejected=true;}
+        expect(rejected && cursor.failed() && backend.calls.empty(),"target completion requires exactly the selection intent leased");
+    }
+}
+
 }  // namespace
 
 int main() {
     prefix_cursor_tests();
+    prepared_target_cursor_tests();
     {
         const std::vector<std::uint32_t> prefix{
             1, 2,

@@ -84,6 +84,21 @@ public:
     virtual void capture_greedy_prefix(std::span<const std::uint32_t>, std::uint32_t, std::uint64_t) {}
 };
 
+class SerialGreedyTokenCursor;
+// An owner-bound single-input lease, not proof that any model work completed.
+// A cohort executor returns a finite validated selection only for token output;
+// state-only leases have no selection. Copying does not authorize a second use.
+struct SerialGreedyTargetInput {
+    std::uint32_t token = 0;
+    std::uint64_t position = 0, vocab_size = 0, ticket = 0;
+    bool state_only = false;
+    bool operator==(const SerialGreedyTargetInput&) const = default;
+private:
+    const SerialGreedyTokenCursor* owner_ = nullptr;
+    const SerialGreedyStepBackend* backend_ = nullptr;
+    friend class SerialGreedyTokenCursor;
+};
+
 // Incremental form of the token-output request controller. The prefix span is
 // borrowed and must stay immutable until completion. Each advance consumes at
 // most prefill_rows known inputs, or one pending generated input. The last
@@ -95,6 +110,21 @@ public:
     SerialGreedyTokenCursor(const SerialGreedyTokenCursor&) = delete;
     SerialGreedyTokenCursor& operator=(const SerialGreedyTokenCursor&) = delete;
     void advance(SerialGreedyStepBackend&, std::uint64_t prefill_rows = 1);
+    // Split the SAME controller policy around one target call. Preparation
+    // reserves response storage and performs the existing optional cache lookup.
+    // An exact cache hit can emit its pending selection and return no input.
+    // Only one lease may be outstanding; all access remains serialized.
+    [[nodiscard]] std::optional<SerialGreedyTargetInput> prepare_target(SerialGreedyStepBackend&);
+    // Call only AFTER the backend has completed/admitted/committed that input.
+    // This validates the lease and updates cursor accounting, capture and output.
+    // selected must be absent iff input.state_only. No state rollback is implied.
+    void accept_target(SerialGreedyStepBackend&, const SerialGreedyTargetInput&,
+        std::optional<std::uint32_t> selected);
+    // Only the coordinator that has NOT submitted the input may abandon it.
+    // After submission it must accept completed work or fail the target instead.
+    void cancel_prepared_target(const SerialGreedyTargetInput&);
+    void fail_target() noexcept { prepared_target_.reset(); failed_ = true; }
+
     void cancel() noexcept { if (!done_) { cancelled_ = true; done_ = true; } }
     [[nodiscard]] bool done() const noexcept { return done_; }
     [[nodiscard]] bool failed() const noexcept { return failed_; }
@@ -108,6 +138,8 @@ private:
     SerialGreedyRequestResult result_;
     std::size_t prefix_offset_ = 0;
     std::uint32_t pending_ = 0;
+    std::optional<SerialGreedyTargetInput> prepared_target_;
+    std::uint64_t next_target_ticket_ = 1;
     bool done_ = false, failed_ = false, cancelled_ = false, started_ = false;
 };
 

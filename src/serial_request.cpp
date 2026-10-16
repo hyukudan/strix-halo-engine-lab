@@ -326,66 +326,91 @@ void SerialGreedyTokenCursor::emit_pending() {
     } else if (result_.generated_tokens.size() >= request_.max_new_tokens) done_ = true;
 }
 
-void SerialGreedyTokenCursor::advance(SerialGreedyStepBackend& backend, std::uint64_t prefill_rows) {
-    if (failed_) throw std::logic_error("greedy token cursor cannot resume after backend failure");
-    if (done_) return;
-    if (!prefill_rows) throw std::invalid_argument("greedy prefill chunk must contain at least one row");
-    const auto consume = [&](std::uint32_t token) {
-        const auto selected = backend.execute_greedy(token, result_.final_position, request_.vocab_size);
-        if (static_cast<std::uint64_t>(selected) >= request_.vocab_size)
-            throw std::invalid_argument("greedy backend selected token outside vocabulary");
-        return selected;
-    };
+std::optional<SerialGreedyTargetInput> SerialGreedyTokenCursor::prepare_target(SerialGreedyStepBackend& backend) {
+    if(failed_) throw std::logic_error("greedy token cursor cannot resume after backend failure");
+    if(prepared_target_) throw std::logic_error("greedy token cursor already has an outstanding target input");
+    if(done_) return std::nullopt;
     try {
-        // Reserve the bounded response before the first backend can publish
-        // state. Later token delivery cannot allocate after a committed step.
-        bool restored_terminal = false;
-        if (!started_) {
-            const auto emissions = std::min(request_.max_new_tokens,
-                request_.context_capacity - request_.prefix_tokens.size() + 1U);
-            if (emissions > result_.generated_tokens.max_size())
+        if(!started_) {
+            const auto emissions=std::min(request_.max_new_tokens,
+                request_.context_capacity-request_.prefix_tokens.size()+1U);
+            if(emissions>result_.generated_tokens.max_size())
                 throw std::length_error("greedy response exceeds host vector capacity");
             result_.generated_tokens.reserve(static_cast<std::size_t>(emissions));
-            started_ = true;
-            if (const auto restored = backend.try_restore_greedy_prefix(request_)) {
-                if (!restored->consumed_prefix || restored->consumed_prefix > request_.prefix_tokens.size() ||
-                    (restored->consumed_prefix == request_.prefix_tokens.size()) != restored->pending_token.has_value() ||
-                    (restored->pending_token && static_cast<std::uint64_t>(*restored->pending_token) >= request_.vocab_size))
+            started_=true;
+            if(const auto restored=backend.try_restore_greedy_prefix(request_)) {
+                if(!restored->consumed_prefix || restored->consumed_prefix>request_.prefix_tokens.size() ||
+                    (restored->consumed_prefix==request_.prefix_tokens.size())!=restored->pending_token.has_value() ||
+                    (restored->pending_token && static_cast<std::uint64_t>(*restored->pending_token)>=request_.vocab_size))
                     throw std::invalid_argument("greedy prefix backend returned an invalid consumed/pending frontier");
-                prefix_offset_ = static_cast<std::size_t>(restored->consumed_prefix);
-                result_.restored_prefix_tokens = restored->consumed_prefix;
-                result_.final_position = restored->consumed_prefix;
-                restored_terminal = !prefilling();
-                if (restored->pending_token) pending_ = *restored->pending_token;
+                prefix_offset_=static_cast<std::size_t>(restored->consumed_prefix);
+                result_.restored_prefix_tokens=restored->consumed_prefix;
+                result_.final_position=restored->consumed_prefix;
+                if(restored->pending_token) pending_=*restored->pending_token;
+                if(!prefilling()) {emit_pending();return std::nullopt;}
             }
         }
-        bool completed_prefill_here = false;
-        if (prefilling()) {
-            std::uint64_t consumed = 0;
-            while (prefilling() && consumed < prefill_rows) {
-                const auto token = request_.prefix_tokens[prefix_offset_];
-                if (prefix_offset_ + 1U == request_.prefix_tokens.size()) pending_ = consume(token);
-                else backend.execute_state(token, result_.final_position);
-                ++prefix_offset_; ++consumed;
-                ++result_.steps_executed; ++result_.final_position;
-            }
-            if (prefilling()) return;
-            completed_prefill_here = true;
-        } else if (!restored_terminal) {
-            pending_ = consume(pending_);
-            ++result_.steps_executed; ++result_.final_position;
-        }
-        if (completed_prefill_here && request_.max_new_tokens)
+        if(!next_target_ticket_) throw std::overflow_error("greedy target input ticket exhausted");
+        SerialGreedyTargetInput input;
+        input.owner_=this;input.backend_=&backend;input.ticket=next_target_ticket_++;
+        input.token=prefilling()?request_.prefix_tokens[prefix_offset_]:pending_;
+        input.position=result_.final_position;input.vocab_size=request_.vocab_size;
+        input.state_only=prefilling() && prefix_offset_+1U<request_.prefix_tokens.size();
+        prepared_target_=input;
+        return input;
+    } catch(...) {failed_=true;throw;}
+}
+
+void SerialGreedyTokenCursor::accept_target(SerialGreedyStepBackend& backend,
+    const SerialGreedyTargetInput& input,std::optional<std::uint32_t> selected) {
+    if(failed_) throw std::logic_error("greedy token cursor cannot accept after backend failure");
+    try {
+        if(!prepared_target_ || *prepared_target_!=input || input.owner_!=this || input.backend_!=&backend ||
+            input.position!=result_.final_position || input.state_only==selected.has_value() ||
+            (selected && static_cast<std::uint64_t>(*selected)>=request_.vocab_size))
+            throw std::invalid_argument("greedy target completion differs from its outstanding input lease");
+        const bool was_prefilling=prefilling();
+        prepared_target_.reset();
+        if(selected) pending_=*selected;
+        if(was_prefilling) ++prefix_offset_;
+        ++result_.steps_executed;++result_.final_position;
+        // A cancellation observed after target submission still accounts for
+        // completed state; it emits/captures nothing and never consumes a bonus.
+        if(cancelled_) return;
+        if(prefilling()) return;
+        if(was_prefilling && request_.max_new_tokens)
             backend.capture_greedy_prefix(request_.prefix_tokens,pending_,request_.vocab_size);
         emit_pending();
-    } catch (...) {
-        failed_ = true;
-        throw;
-    }
+    } catch(...) {prepared_target_.reset();failed_=true;throw;}
+}
+
+void SerialGreedyTokenCursor::cancel_prepared_target(const SerialGreedyTargetInput& input) {
+    if(failed_ || !prepared_target_ || *prepared_target_!=input || input.owner_!=this)
+        throw std::invalid_argument("cannot cancel a different outstanding greedy target input");
+    prepared_target_.reset();
+    cancel();
+}
+
+void SerialGreedyTokenCursor::advance(SerialGreedyStepBackend& backend,std::uint64_t prefill_rows) {
+    if(failed_) throw std::logic_error("greedy token cursor cannot resume after backend failure");
+    if(prepared_target_) throw std::logic_error("greedy token cursor already has an outstanding target input");
+    if(done_) return;
+    if(!prefill_rows) throw std::invalid_argument("greedy prefill chunk must contain at least one row");
+    try {
+        for(std::uint64_t row=0;row<prefill_rows;++row) {
+            const auto input=prepare_target(backend);
+            if(!input) return;
+            std::optional<std::uint32_t> selected;
+            if(input->state_only) backend.execute_state(input->token,input->position);
+            else selected=backend.execute_greedy(input->token,input->position,input->vocab_size);
+            accept_target(backend,*input,selected);
+            if(done_ || !prefilling()) return;
+        }
+    } catch(...) {fail_target();throw;}
 }
 
 SerialGreedyRequestResult SerialGreedyTokenCursor::take_result() {
-    if (!done_ || failed_) throw std::logic_error("greedy token cursor result is incomplete or failed");
+    if (!done_ || failed_ || prepared_target_) throw std::logic_error("greedy token cursor result is incomplete or failed");
     return std::move(result_);
 }
 
