@@ -45,7 +45,8 @@ std::vector<char*> configure(int argc,char** argv){
             !std::filesystem::exists(request.export_path),"target input export needs a new path and explicit output/capture budgets, without golden options");
         forward.push_back(nullptr);return forward;
     }
-    require(!request.export_bytes && !request.export_capture_bytes && !request.export_greedy_rows && !request.path.empty() && decode_cli::mtp_sha256_text(request.sha) && request.file_bytes>=160U &&
+    require(!seen.contains("--qualification-export-bytes") && !seen.contains("--qualification-export-capture-bytes") &&
+        !seen.contains("--qualification-export-greedy-rows") && !request.path.empty() && decode_cli::mtp_sha256_text(request.sha) && request.file_bytes>=160U &&
         request.file_bytes<=(1ULL<<30U) && request.host_bytes>=262144U &&
         request.file_bytes<=(request.host_bytes-262144U)/3U && request.coverage<=31U,
         "qualification requires a pinned reference and explicit file/host budgets (host >= 3*file+256KiB)");
@@ -56,19 +57,19 @@ std::vector<char*> configure(int argc,char** argv){
 }
 }
 bool mtp_target_input_export_requested() noexcept{return !request.export_path.empty();}
-void validate_mtp_target_input_export(const decode_cli::Options& o){
+void validate_mtp_target_input_export(const decode_cli::Options& o,bool resolved){
     require(!o.mtp.enabled && !o.mtp.supplied && o.execution.mode==DecodeExecutionMode::eager && o.execution.integer_head==DecodeIntegerHead::none &&
         !o.prepared_eager && !o.moe_shared_overlap && !o.moe_token_cost_policy && !o.gdn_islands && !o.gpu_greedy_token &&
         !o.prefix_cache_roundtrip && !o.prompt_lookup && !o.known_prefix_window && o.serving_prefix_files.empty() && !o.device_queue_trace &&
         o.reference_path.empty() && o.raw_recording_path.empty() && o.validation_final_state_path.empty() && o.logprob_token_ids.empty() &&
         o.tokens.size()>=3U && o.tokens.size()<=4097U && request.export_greedy_rows<=4097U-o.tokens.size() &&
-        decode_cli::mtp_cli_add(o.tokens.size(),request.export_greedy_rows)<=o.context_tokens,
+        (!(resolved || o.context_explicit) || o.tokens.size()+request.export_greedy_rows<=o.context_tokens),
         "target input export requires 3..4097 prompt tokens and an ordinary eager target without MTP or other request controllers");
 }
 void export_mtp_target_inputs(const decode_cli::Options& o,const ModelContract& model,std::shared_ptr<::HipDecodeExperimentResources> actual,
     const CompiledSerialExecution& compiled,const ExecutionRuntimeResources& resources,SerialSessionContext& session,
     DirectLaunchDispatcher& dispatcher,AllocationGenerationSource& generations,bool d1){
-    validate_mtp_target_input_export(o);require(actual && !session.next_position && o.tokens.size()<=o.context_tokens,
+    validate_mtp_target_input_export(o,true);require(actual && !session.next_position && o.tokens.size()<=o.context_tokens,
         "target input export requires actual parents and a fresh bounded target");
     const auto rows=decode_cli::mtp_cli_add(o.tokens.size(),request.export_greedy_rows);
     const auto width=decode_cli::mtp_cli_mul(model.hidden_size,model.hc_count);

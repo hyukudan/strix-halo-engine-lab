@@ -860,7 +860,7 @@ int STRIX_DECODE_ENTRY(
             argv);
 #if defined(STRIX_MTP_MODEL_QUALIFICATION_RUNNER)
     const bool target_input_export = strix::tests::mtp_target_input_export_requested();
-    if(target_input_export)strix::tests::validate_mtp_target_input_export(options);
+    if(target_input_export)strix::tests::validate_mtp_target_input_export(options,false);
 #else
     constexpr bool target_input_export = false;
 #endif
@@ -980,7 +980,7 @@ int STRIX_DECODE_ENTRY(
         strix::model_content_identity_hex(mapped.content_identity()), has_auto_a8_runtime);
     strix::decode_cli::validate_resolved_mtp_cli(options);
 #if defined(STRIX_MTP_MODEL_QUALIFICATION_RUNNER)
-    if(target_input_export)strix::tests::validate_mtp_target_input_export(options);
+    if(target_input_export)strix::tests::validate_mtp_target_input_export(options,true);
 #endif
     strix::decode_cli::validate_resolved_prefix_roundtrip(options);
     strix::decode_cli::validate_resolved_q8_projection_organization(options);
