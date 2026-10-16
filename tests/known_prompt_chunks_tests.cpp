@@ -244,6 +244,26 @@ int main() {
         expect(failed&&sticky&&target.poisoned&&calls.size()==2U&&target.inputs==calls&&!cursor.frontier().valid&&
             cursor.progress().consumed_prompt_tokens==0U,"state-only backend failure cannot resume or pretend a partial native call was rolled back");
     }
+    for(const unsigned width:{2U,4U,8U}) for(const unsigned count:{1U,width,width+1U,2U*width}) {
+        Rows target;target.width=width;target.policy=Policy::state_only;
+        const std::vector<std::uint32_t> prompt(count,15U); // Known EOS is still input.
+        strix::KnownPromptChunkCursor cursor({prompt,3U,16U,3U+count,0U,15U,width,Policy::state_only},target,target);
+        while(cursor.advance()) {
+            expect(cursor.frontier().valid && cursor.frontier().logits.empty() &&
+                !cursor.frontier().unconsumed_selection && !cursor.frontier().selection_emitted,
+                "state-only zero-emission request never creates a logit or selection frontier");
+        }
+        expect(target.windows==count/width && target.state_windows==count/width &&
+            target.state_serials==count%width && target.serials==0U && target.inputs.size()==count,
+            "zero-emission request uses every complete window and omits ALL serial heads");
+        const auto before=target.inputs;const auto& result=cursor.finish_greedy();
+        expect(result.generated_tokens.empty() && result.steps_executed==0U && result.final_position==3U+count &&
+            result.stop_reason==strix::SerialRequestStopReason::max_new_tokens && target.inputs==before &&
+            cursor.progress().generation_complete && !cursor.progress().bonus_pending,
+            "zero-emission finish neither consumes a bonus nor runs a terminal model input");
+        bool rejected=false;try{(void)cursor.finish_greedy();}catch(const std::logic_error&){rejected=true;}
+        expect(rejected && target.inputs==before,"zero-emission finish remains one-shot");
+    }
     for(const auto policy:{Policy::terminal_row,Policy::state_only,static_cast<Policy>(255U)}) {
         Rows target;const std::vector<std::uint32_t> prompt{1U,2U,3U};bool rejected=false;
         try{strix::KnownPromptChunkCursor cursor({prompt,0U,16U,16U,1U,15U,2U,policy},target,target);}

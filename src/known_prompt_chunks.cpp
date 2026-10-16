@@ -30,7 +30,8 @@ KnownPromptChunkCursor::KnownPromptChunkCursor(KnownPromptChunkRequest request,
         throw std::length_error("known prompt frontier exceeds host storage capacity");
     // New cursor-owned presentation storage exists before the first pair can
     // consume state. Returned backend vectors follow their own native contract.
-    logits_.resize(static_cast<std::size_t>(request.vocab_size));
+    if(request.output_policy!=KnownWindowOutputPolicy::state_only || request.max_new_tokens)
+        logits_.resize(static_cast<std::size_t>(request.vocab_size));
     progress_.next_position=request.start_position;
 }
 
@@ -40,9 +41,10 @@ bool KnownPromptChunkCursor::advance() {
     const auto consumed=static_cast<std::size_t>(progress_.consumed_prompt_tokens);
     const auto remaining=request_.prompt_tokens.size()-consumed;
     const bool state_only=request_.output_policy==KnownWindowOutputPolicy::state_only;
-    const bool window=remaining>=request_.logical_rows&&(!state_only||remaining>request_.logical_rows);
+    const bool no_output=request_.max_new_tokens==0U;
+    const bool window=remaining>=request_.logical_rows&&(!state_only||no_output||remaining>request_.logical_rows);
     try {
-        if(state_only&&(window||remaining>1U)) {
+        if(state_only&&(no_output||window||remaining>1U)) {
             if(window) {
                 windows_.execute_state_rows(request_.prompt_tokens.subspan(consumed,request_.logical_rows),progress_.next_position);
                 ++progress_.state_only_windows;
@@ -61,7 +63,7 @@ bool KnownPromptChunkCursor::advance() {
         if(window) ++progress_.windows_executed;
         else ++progress_.serial_tail_steps;
         progress_.prefill_complete=progress_.consumed_prompt_tokens==request_.prompt_tokens.size();
-        if(progress_.prefill_complete) selection_=select_greedy_token(logits_,request_.vocab_size);
+        if(progress_.prefill_complete && has_logits_) selection_=select_greedy_token(logits_,request_.vocab_size);
         return true;
     } catch(...) {
         progress_.failed=true;has_logits_=false;selection_.reset();
@@ -74,8 +76,17 @@ void KnownPromptChunkCursor::cancel() noexcept {
 }
 
 const SerialGreedyRequestResult& KnownPromptChunkCursor::finish_greedy() {
-    if(progress_.failed || progress_.cancelled || !progress_.prefill_complete || !has_logits_ || generation_)
+    if(progress_.failed || progress_.cancelled || !progress_.prefill_complete ||
+        (!has_logits_ && request_.max_new_tokens) || generation_)
         throw std::logic_error("known-prompt generation requires a completed uncancelled fresh frontier");
+    if(!has_logits_) {
+        // Explicit state-only/maxnew0 consumed all known inputs without a head.
+        // There is no selection or pending bonus to manufacture or replay.
+        generation_.emplace();
+        generation_->final_position=progress_.next_position;
+        progress_.generation_complete=true;
+        return *generation_;
+    }
     const SerialGreedyContinuationRequest continuation{logits_,progress_.next_position,request_.vocab_size,
         request_.context_capacity,request_.max_new_tokens,request_.eos_token_id};
     try {

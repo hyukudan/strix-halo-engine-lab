@@ -55,6 +55,8 @@ struct KnownPromptChunkFrontier {
 // and unpadded serial R1 suffix rows. State-only windows are used only while
 // more than R inputs remain; the final <=R inputs use serial calls, preserving
 // a real full-output terminal frontier without replaying a consumed input.
+// Explicit state-only with max_new_tokens==0 omits every head and consumes
+// complete final windows without reserving vocabulary-sized presentation data.
 // An advance is one complete chunk; yielding
 // between calls pauses without recomputing a prompt or discarding its logits.
 // Native shared/mixed-GDN rows4/8 and all-Q8 GDN pair tiling are backend-specific; the cursor
