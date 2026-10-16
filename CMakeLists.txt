@@ -1067,6 +1067,11 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-mtp-forward-replay-tests)
     add_test(NAME strix-mtp-forward-replay-tests COMMAND strix-mtp-forward-replay-tests)
 
+    add_executable(strix-hip-mtp-decode-options-tests tests/hip_mtp_decode_options_tests.cpp)
+    target_link_libraries(strix-hip-mtp-decode-options-tests PRIVATE strix_core)
+    strix_target_warnings(strix-hip-mtp-decode-options-tests)
+    add_test(NAME strix-hip-mtp-decode-options-tests COMMAND strix-hip-mtp-decode-options-tests)
+
     add_executable(strix-mtp-forward-golden-file-tests tests/mtp_forward_golden_file_tests.cpp)
     target_link_libraries(strix-mtp-forward-golden-file-tests PRIVATE strix_core)
     strix_target_warnings(strix-mtp-forward-golden-file-tests)

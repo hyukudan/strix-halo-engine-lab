@@ -53,6 +53,7 @@
 #include "strix/moe_token_cost_backend.hpp"
 #include "hip_decode_experiment.hpp"
 #include "hip_decode_options.hpp"
+#include "hip_mtp_decode_bridge.hpp"
 #include "strix/q8_projection_organization.hpp"
 #include "strix/q8_projection_manifest.hpp"
 #include "strix/hc_projection_prefetch.hpp"
@@ -965,6 +966,7 @@ int main(
     const auto optimization_profile = strix::decode_cli::resolve_optimization_profile(
         options, model, info, manifest,
         strix::model_content_identity_hex(mapped.content_identity()), has_auto_a8_runtime);
+    strix::decode_cli::validate_resolved_mtp_cli(options);
     strix::decode_cli::validate_resolved_prefix_roundtrip(options);
     strix::decode_cli::validate_resolved_q8_projection_organization(options);
     strix::decode_cli::validate_resolved_hc_projection_next_tile(options);
@@ -1771,15 +1773,18 @@ int main(
 
     strix::FileMappedPleLookupBackend
         mapped_ple_lookup;
+    // Only the explicit MTP request needs an independently retained PLE parent.
+    auto mtp_mapped_ple_owner = options.mtp.enabled
+        ? std::make_shared<strix::FileMappedPleLookupBackend>() : std::shared_ptr<strix::FileMappedPleLookupBackend>{};
     MappedModelIoSource
         mapped_model_io(
             mapped);
     const auto planned_ple_policy = requested_ple_policy;
-    auto retained_ple_source = options.ple_cache_rows || options.known_prefix_prefill_rows
+    auto retained_ple_source = options.ple_cache_rows || options.known_prefix_prefill_rows || options.mtp.enabled
         ? std::make_shared<MappedModelIoSource>(mapped_owner) : std::shared_ptr<MappedModelIoSource>{};
     std::optional<strix::PlannedPleLookupBackend> local_planned_ple_lookup;
     std::shared_ptr<strix::PlannedPleLookupBackend> prefill_ple_owner;
-    if (options.known_prefix_prefill_rows)
+    if (options.known_prefix_prefill_rows || options.mtp.enabled)
         prefill_ple_owner = std::make_shared<strix::PlannedPleLookupBackend>(*retained_ple_source,
             planned_ple_policy, retained_ple_source);
     else local_planned_ple_lookup.emplace(retained_ple_source ? *retained_ple_source : mapped_model_io,
@@ -1793,7 +1798,7 @@ int main(
             ? static_cast<strix::PleLookupBackend*>(
                   &planned_ple_lookup)
             : static_cast<strix::PleLookupBackend*>(
-                  &mapped_ple_lookup);
+                  mtp_mapped_ple_owner ? mtp_mapped_ple_owner.get() : &mapped_ple_lookup);
 
     const auto ple_hash_contract =
         strix::build_ple_hash_contract(
@@ -1849,7 +1854,7 @@ int main(
             plan, pins, hipStreamLegacy);
     }
     std::shared_ptr<HipDeferredMoeStatus> deferred_moe;
-    if(options.deferred_moe_status) {
+    if(options.deferred_moe_status && !options.mtp.enabled) {
         const auto deferred_status_generation=generations.next();
         const auto deferred_shadow_generation=generations.next();
         deferred_moe=std::make_shared<HipDeferredMoeStatus>(resources,compiled.execution_identity,
@@ -1959,6 +1964,44 @@ int main(
         lm_io.writes.size() != 1) {
         throw std::logic_error(
             "compiled execution does not end in one logits write");
+    }
+
+    if (options.mtp.enabled) {
+        std::shared_ptr<strix::PleLookupBackend> owned_ple = options.planned_ple_io
+            ? std::static_pointer_cast<strix::PleLookupBackend>(prefill_ple_owner)
+            : std::static_pointer_cast<strix::PleLookupBackend>(mtp_mapped_ple_owner);
+        auto parents = std::make_shared<strix::decode_cli::MtpDecodeTargetParents>(
+            experiment_owner, launcher_catalog, std::move(owned_ple), ple_hash_contract);
+        strix::decode_cli::MtpDecodeWindowFactory make_window;
+        if (options.mtp.window_rows) {
+            // Prepare the real closed native owner BEFORE any prompt mutation.
+            // It retains all serial parents and its separate D1/arena ownership.
+            make_window = [&, parents](std::shared_ptr<strix::HipMtpTargetHidden> target) {
+                const auto plan = strix::compile_known_prefix_window(model, compiled, manifest, tensor_access,
+                    {true, true, true, options.mtp.window_rows, false, strix::KnownWindowOutputPolicy::all_rows});
+                if (!strix::known_window_has_promoted_steps(plan) || plan.arena.physical.total_bytes > options.mtp.window_arena_bytes ||
+                    plan.arena.physical.total_bytes > UINT64_MAX - 8U)
+                    throw std::invalid_argument("MTP actual closed target arena exceeds its explicit payload budget");
+                const auto requested_arena = plan.arena.physical.total_bytes + 8U;
+                if (requested_arena > options.mtp.window_arena_bytes || requested_arena >= options.mtp.window_total_bytes)
+                    throw std::invalid_argument("MTP target window arena/completion record exceeds total retained payload budget");
+                auto window_memory = std::make_shared<KnownPromptMemory>(plan, generations.next(), generations.next(),
+                    std::static_pointer_cast<const void>(parents), original_work_device);
+                auto window_owner = std::make_shared<strix::HipKnownPrefixWindow>(plan, compiled, model, catalog_config,
+                    parents->resources, window_memory->scratch, window_memory->scope, std::static_pointer_cast<const void>(window_memory));
+                strix::HipMtpWindowVerificationPolicy policy;
+                policy.capture = {options.mtp.window_capture_bytes, options.mtp.window_history_intervals};
+                policy.checkpoint_retained_byte_budget = options.mtp.window_checkpoint_bytes;
+                policy.total_retained_byte_budget = options.mtp.window_total_bytes - requested_arena;
+                return std::make_shared<strix::HipMtpWindowVerifier>(std::move(target), std::move(window_owner),
+                    parents->resources, parents, policy, generations);
+            };
+        }
+        setup_phase.reset();
+        strix::decode_cli::run_mtp_decode_bridge(options, model, compiled, parents, session, direct_dispatcher,
+            generations, catalog_config.deferred_moe_status, optimization_profile.selected, std::cout, std::move(make_window),
+            [&] { return execution_inventory_receipt + ple_cache_completed_receipt(); });
+        return 0;
     }
 
     std::unique_ptr<strix::PreparedEagerExecution> prepared_eager;

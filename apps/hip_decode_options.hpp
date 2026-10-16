@@ -94,7 +94,28 @@ struct OptimizationProfileResolution {
     std::string reason = "not-resolved";
     bool automatic_applied = false;
 };
+// Local, externally pinned MTP assets and independent replay evidence are
+// mandatory. None of these fields is an execution/qualification override.
+struct MtpCliOptions {
+    bool enabled=false,supplied=false;
+    std::string sidecar,sidecar_logical_name,sidecar_sha256,target_sha256,target_content,golden,golden_sha256;
+    std::string repository,revision,source_path,converter_sha256,norm_converter_sha256,converter_revision;
+    std::string conversion,normalized_rounding,projection_rounding,sidecar_residency;
+    std::uint64_t sidecar_bytes=0,header_bytes=0,sidecar_retained_bytes=0,sidecar_setup_bytes=0;
+    std::uint64_t golden_max_bytes=0,replay_host_bytes=0,runtime_bytes=0,target_capture_bytes=0;
+    std::uint64_t policy_identity=0;
+    std::uint32_t candidate_depth=0,window_rows=0;
+    std::uint64_t window_arena_bytes=0,window_capture_bytes=0,window_checkpoint_bytes=0,window_total_bytes=0,window_history_intervals=0;
+    double max_hidden_error=0.0,max_logit_error=0.0;
+};
+inline bool mtp_sha256_text(std::string_view value) noexcept {
+    if(value.size()!=64U)return false;
+    bool nonzero=false;
+    for(char ch:value){if(!((ch>='0'&&ch<='9')||(ch>='a'&&ch<='f')||(ch>='A'&&ch<='F')))return false;nonzero=nonzero||ch!='0';}
+    return nonzero;
+}
 struct Options {
+    MtpCliOptions mtp;
     bool moe_shared_overlap = false;
     bool moe_token_cost_policy = false;
     std::uint64_t moe_overlap_arena_budget_bytes = 64ULL * 1024ULL * 1024ULL;
@@ -512,12 +533,55 @@ inline void validate_resolved_gdn_islands(const Options& options) {
         throw std::invalid_argument("GDN islands require resolved D1 and virtual/prefetch input with virtual output");
 }
 
+inline void validate_mtp_cli(const Options& o,bool resolved=false) {
+    const auto& m=o.mtp;
+    if(!m.enabled){if(m.supplied)throw std::invalid_argument("MTP parameters require --mtp");return;}
+    if(o.execution.mode!=DecodeExecutionMode::eager || o.execution.integer_head!=DecodeIntegerHead::none ||
+       o.prepared_eager || o.moe_shared_overlap || o.moe_token_cost_policy || o.gdn_islands || o.gpu_greedy_token ||
+       o.prefix_cache_roundtrip || o.prompt_lookup || o.known_prefix_window || !o.serving_prefix_files.empty() ||
+       o.device_queue_trace || !o.reference_path.empty() || !o.raw_recording_path.empty() ||
+       !o.validation_final_state_path.empty() || !o.logprob_token_ids.empty())
+        throw std::invalid_argument("MTP requires its explicit raw eager target route without graph/prepared/overlap/islands/other controllers/recording");
+    if(o.tokens.size()<3U || o.tokens.size()>4097U || !o.generate_tokens || o.generate_tokens>UINT32_MAX ||
+       ((resolved || o.context_explicit) && (o.tokens.size()>o.context_tokens ||
+        o.generate_tokens>o.context_tokens-o.tokens.size()+1U)))
+        throw std::invalid_argument("MTP requires 3..4097 known prompt tokens, positive uint32 output budget and bounded target context");
+    if(m.sidecar.empty() || m.sidecar_logical_name.empty() || m.golden.empty() || m.repository.empty() || m.revision.empty() || m.source_path.empty() || m.converter_revision.empty() ||
+       !mtp_sha256_text(m.sidecar_sha256) || !mtp_sha256_text(m.target_sha256) || !mtp_sha256_text(m.target_content) ||
+       !mtp_sha256_text(m.golden_sha256) || !mtp_sha256_text(m.converter_sha256) || !mtp_sha256_text(m.norm_converter_sha256))
+        throw std::invalid_argument("MTP requires explicit local assets, full SHA256 pins and source/conversion provenance");
+    if(m.conversion!="effective-norm-embedding-first-v1" ||
+       (m.normalized_rounding!="fp32" && m.normalized_rounding!="bf16-rne") ||
+       (m.projection_rounding!="fp32" && m.projection_rounding!="bf16-rne") ||
+       (m.sidecar_residency!="register" && m.sidecar_residency!="copy"))
+        throw std::invalid_argument("MTP requires explicit admitted conversion, both cast boundaries and sidecar residency");
+    if(!m.sidecar_bytes || !m.header_bytes || m.header_bytes>32ULL*1024ULL*1024ULL || !m.sidecar_retained_bytes || !m.sidecar_setup_bytes ||
+       !m.golden_max_bytes || !m.replay_host_bytes || !m.runtime_bytes || !m.target_capture_bytes || !m.policy_identity ||
+       m.candidate_depth<1U || m.candidate_depth>8U || !std::isfinite(m.max_hidden_error) || m.max_hidden_error<0.0 ||
+       !std::isfinite(m.max_logit_error) || m.max_logit_error<0.0)
+        throw std::invalid_argument("MTP requires positive explicit asset/replay/runtime/capture budgets, policy identity and depth1..8");
+    const bool any_window=m.window_rows || m.window_arena_bytes || m.window_capture_bytes || m.window_checkpoint_bytes || m.window_total_bytes || m.window_history_intervals;
+    if(any_window && ((m.window_rows!=2U && m.window_rows!=4U && m.window_rows!=8U) || !m.window_arena_bytes ||
+       !m.window_capture_bytes || !m.window_checkpoint_bytes || !m.window_total_bytes || !m.window_history_intervals))
+        throw std::invalid_argument("MTP closed target windows require explicit rows2/4/8 and all five positive window budgets");
+    if(m.window_rows && (o.gdn_recurrent_layout!=HipGdnRecurrentLayout::baseline || o.gdn_recurrent_storage!=GdnRecurrentStorage::key_value ||
+       o.qsa_hierarchical_selection || o.qsa_gqa_heads_per_block!=1U))
+        throw std::invalid_argument("MTP closed target windows require baseline recurrent and QSA organizations");
+}
+inline void validate_resolved_mtp_cli(const Options& o) {
+    validate_mtp_cli(o,true);
+    if(o.mtp.enabled && o.mtp.window_rows && (!o.deferred_moe_status || !o.virtual_q8_gdn_input || !o.prefetch_q8_gdn_input ||
+       !o.virtual_q8_gdn_output || !o.wave8_q8_gdn_input || !o.wave8_q8_gdn_output))
+        throw std::invalid_argument("MTP target windows require resolved D1 and explicit paired wave8 GDN configuration");
+}
+
 inline Options parse_options(
     int argc,
     char** argv) {
     if (argc < 2) {
         throw std::invalid_argument(
             "usage: strix-hip-decode-token MODEL.gguf [TOKEN_ID ...] "
+            "[--mtp --mtp-sidecar FILE --mtp-sidecar-sha256 HEX --mtp-golden FILE --mtp-golden-sha256 HEX (explicit source/conversion/cast/budget options required)] "
             "[--optimization-profile auto|manual] [--execution-inventory] [--host-dispatch-telemetry] [--execution-telemetry-trace] [--device-queue-trace] "
             "[--gpu-greedy-token] [--logprob-token ID ...] [--offline-tuning-cache FILE [--offline-compile-provenance FILE]] [--gdn-recurrent-layout baseline|stride32|stride33|transposed] [--gdn-recurrent-storage key-value|value-key] [--known-prefix-window --known-prefix-rows 2|4|8 --known-prefix-expert-union] [--known-prefix-prefill-rows 16..2048 --known-prefix-workspace-budget-bytes N --known-prefix-host-metadata-budget-bytes N --known-prefix-uma-budget-bytes N --known-prefix-host-headroom-bytes N] [--prompt-lookup [--prompt-lookup-depth 0|1|2 | --prompt-lookup-adaptive] [--prompt-lookup-snapshot occupied-kv-v1 --prompt-lookup-snapshot-bytes N]] [--serve-prefix-u32le FILE ... --serve-concurrency 1|2|4 [--serve-tensor-cohort-rows 2|4 | --serve-prefill-rows 2|4|8|16..2048 --serve-prefill-workspace-budget-bytes N --serve-prefill-host-metadata-budget-bytes N] --serve-memory-budget-bytes N --serve-request-budget-bytes N --serve-headroom-bytes N] [--gdn-islands] [--qsa-hierarchical-selection] [--qsa-gqa-heads-per-block 1|2|4] [--prepared-eager] [--moe-shared-overlap [--moe-token-cost-policy]] [--moe-overlap-arena-budget-bytes N] [--batched-moe-activation] [--validation-final-state DIR] [--validation-final-state-max-bytes N] [--reference FILE] [--max-logit-error X] "
             "[--context N] [--residency register|copy] [--coalesce-gap BYTES] "
@@ -532,6 +596,7 @@ inline Options parse_options(
     options.model_path =
         argv[1];
     std::set<std::string_view> execution_option_names;
+    std::set<std::string> mtp_option_names;
 
     for (int index = 2;
          index < argc;
@@ -540,6 +605,60 @@ inline Options parse_options(
             argv[index];
         options.any_low_level_flag = options.any_low_level_flag ||
             is_low_level_optimization_option(argument);
+        if(argument=="--mtp") {
+            if(options.mtp.enabled)throw std::invalid_argument("duplicate MTP route option");
+            options.mtp.enabled=true;continue;
+        }
+        if(argument.starts_with("--mtp-")) {
+            const auto equal=argument.find('=');const auto key=argument.substr(0,equal);
+            if(!mtp_option_names.insert(std::string(key)).second)throw std::invalid_argument("duplicate MTP option");
+            std::string value;
+            if(equal!=std::string_view::npos)value=argument.substr(equal+1U);
+            else {if(index+1>=argc)throw std::invalid_argument("MTP option requires a value");value=argv[++index];}
+            if(value.empty())throw std::invalid_argument("MTP option value is empty");
+            auto& m=options.mtp;m.supplied=true;
+            if(key=="--mtp-sidecar")m.sidecar=value;
+            else if(key=="--mtp-sidecar-logical-name")m.sidecar_logical_name=value;
+            else if(key=="--mtp-sidecar-sha256")m.sidecar_sha256=value;
+            else if(key=="--mtp-target-sha256")m.target_sha256=value;
+            else if(key=="--mtp-target-content")m.target_content=value;
+            else if(key=="--mtp-golden")m.golden=value;
+            else if(key=="--mtp-golden-sha256")m.golden_sha256=value;
+            else if(key=="--mtp-source-repository")m.repository=value;
+            else if(key=="--mtp-source-revision")m.revision=value;
+            else if(key=="--mtp-source-path")m.source_path=value;
+            else if(key=="--mtp-converter-sha256")m.converter_sha256=value;
+            else if(key=="--mtp-norm-converter-sha256")m.norm_converter_sha256=value;
+            else if(key=="--mtp-converter-revision")m.converter_revision=value;
+            else if(key=="--mtp-conversion")m.conversion=value;
+            else if(key=="--mtp-normalized-rounding")m.normalized_rounding=value;
+            else if(key=="--mtp-projection-rounding")m.projection_rounding=value;
+            else if(key=="--mtp-sidecar-residency")m.sidecar_residency=value;
+            else if(key=="--mtp-max-hidden-error")m.max_hidden_error=parse_double(value,"MTP hidden policy");
+            else if(key=="--mtp-max-logit-error")m.max_logit_error=parse_double(value,"MTP logit policy");
+            else {
+                const auto n=parse_u64(value,"MTP option");
+                if(key=="--mtp-sidecar-bytes")m.sidecar_bytes=n;
+                else if(key=="--mtp-header-bytes")m.header_bytes=n;
+                else if(key=="--mtp-sidecar-retained-bytes")m.sidecar_retained_bytes=n;
+                else if(key=="--mtp-sidecar-setup-bytes")m.sidecar_setup_bytes=n;
+                else if(key=="--mtp-golden-max-bytes")m.golden_max_bytes=n;
+                else if(key=="--mtp-replay-host-bytes")m.replay_host_bytes=n;
+                else if(key=="--mtp-runtime-bytes")m.runtime_bytes=n;
+                else if(key=="--mtp-target-capture-bytes")m.target_capture_bytes=n;
+                else if(key=="--mtp-policy-id")m.policy_identity=n;
+                else if(key=="--mtp-window-arena-bytes")m.window_arena_bytes=n;
+                else if(key=="--mtp-window-capture-bytes")m.window_capture_bytes=n;
+                else if(key=="--mtp-window-checkpoint-bytes")m.window_checkpoint_bytes=n;
+                else if(key=="--mtp-window-total-bytes")m.window_total_bytes=n;
+                else if(key=="--mtp-window-history-intervals")m.window_history_intervals=n;
+                else if(key=="--mtp-candidate-depth" || key=="--mtp-target-window-rows") {
+                    if(n>UINT32_MAX)throw std::invalid_argument("MTP depth/rows exceeds uint32");
+                    if(key=="--mtp-candidate-depth")m.candidate_depth=static_cast<std::uint32_t>(n);else m.window_rows=static_cast<std::uint32_t>(n);
+                } else throw std::invalid_argument("unknown MTP option: "+std::string(key));
+            }
+            continue;
+        }
         if (argument == "--prefetch-hc-projection-next-tile") {
             if (options.prefetch_hc_projection_next_tile)
                 throw std::invalid_argument("duplicate HC next-tile prefetch option");
@@ -1356,6 +1475,7 @@ inline Options parse_options(
         throw std::invalid_argument("--fused-staged-hyper-mix requires --staged-hyper-projections");
     if (options.virtual_q8_lm_head && options.execution.integer_head != strix::DecodeIntegerHead::none)
         throw std::invalid_argument("integer and virtual Q8 LM heads are mutually exclusive");
+    validate_mtp_cli(options);
     return options;
 }
 
