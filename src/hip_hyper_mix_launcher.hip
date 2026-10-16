@@ -2104,7 +2104,7 @@ std::string kernel_id(
             request.request_concurrency) + (config.parallel ? ".parallel" : "") +
         (config.staged_projections ? ".staged" : "") + (config.fused_injection ? ".fused-injection-v5" : "") + (config.typed_projection ? ".typed-q8-f32-v1" : "") + (config.prefetch_rows ? ".prefetch-rows8-v2" : "") + (config.prefetch_q8_output ? ".prefetch-q8-output-v1" : "") +
         (config.splitk_projection ? (config.splitk_projection_fp64 ? ".splitk-hc-proj-fp64-oracle-v1" : ".splitk-hc-proj-fp32-v1") : "") +
-        (config.prefetch_hc_projection_next_tile ? hc_projection_next_tile_suffix : "") +
+        (config.prefetch_hc_projection_next_tile ? std::string(hc_projection_next_tile_suffix) : "") +
         (config.lane_chain_output ? lane_chain_hyper_output_suffix : "");
 }
 

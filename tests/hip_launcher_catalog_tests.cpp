@@ -525,10 +525,14 @@ int main() {
         strix::kernels::KernelRegistry next_registry;
         strix::register_complete_hip_kernel_catalog(model,next_request,next_config,next_registry);
         const auto next_compiled=strix::compile_serial_execution(model,next_registry,next_request,hc_buffers);
-        strix::HipLauncherCatalog next_catalog(model,next_config), legacy_catalog(model,hc_config);
+        strix::HipLauncherCatalog next_catalog(model,next_config);
         strix::ExecutionLauncherRegistry next_launchers;
-        next_catalog.register_for_compiled_execution(next_compiled,next_launchers);
+        bool missing_resources_rejected=false;
+        try {next_catalog.register_for_compiled_execution(next_compiled,next_launchers);}
+        catch(const std::invalid_argument&) {missing_resources_rejected=true;}
+        expect(missing_resources_rejected,"next-tile bundle requires whole-model runtime resources before registration");
         unsigned selected_hc=0,selected_chain=0;
+        std::string next_chain_id;
         for(const auto& binding:next_compiled.bindings.bindings) {
             if(binding.op!=strix::SerialOp::attn_hyper_mix && binding.op!=strix::SerialOp::mlp_hyper_mix && binding.op!=strix::SerialOp::final_hyper_mix)continue;
             ++selected_hc;
@@ -539,13 +543,13 @@ int main() {
             expect(position!=std::string::npos,"every HC down/inject consumer carries next-tile marker");
             if(id.ends_with(strix::lane_chain_hyper_output_suffix)) {
                 ++selected_chain;
+                if(next_chain_id.empty())next_chain_id=id;
                 expect(id.find(".prefetch-next-tile-v1")<id.find(strix::lane_chain_hyper_output_suffix),
                     "next-tile marker precedes terminal C1 suffix");
             }
             const auto* variant=next_registry.find(id);
-            const auto* launcher=next_launchers.find_kernel_launcher(id);
-            expect(variant && !variant->graph_safe && launcher && launcher->implementation_identity,
-                "next-tile selected launcher remains bound and eager only");
+            expect(variant && !variant->graph_safe,
+                "next-tile selected variant is explicitly eager only");
             if(position!=std::string::npos) {
                 auto old_id=id;old_id.erase(position,std::string(".prefetch-next-tile-v1").size());
                 const auto* legacy=hc_registry.find(old_id);
@@ -557,8 +561,16 @@ int main() {
         const auto must_reject=[&](auto&& action,const char* label) {
             bool failed=false;try{action();}catch(const std::invalid_argument&){failed=true;}expect(failed,label);
         };
-        must_reject([&]{strix::ExecutionLauncherRegistry bad;legacy_catalog.register_for_compiled_execution(next_compiled,bad);},
-            "incumbent catalog cannot bind next-tile IDs");
+        strix::HipHyperMixLauncherConfig incumbent;
+        incumbent.hidden_size=static_cast<std::uint32_t>(model.hidden_size);
+        incumbent.hc_count=static_cast<std::uint32_t>(model.hc_count);
+        incumbent.lowrank=static_cast<std::uint32_t>(model.hc_lowrank);
+        incumbent.parallel=true;incumbent.staged_projections=true;incumbent.fused_injection=true;
+        incumbent.typed_projection=true;incumbent.prefetch_rows=true;incumbent.prefetch_q8_output=true;
+        incumbent.lane_chain_output=true;
+        expect(!next_chain_id.empty(),"factory identity negative has a real selected next-tile C1 identity");
+        must_reject([&]{(void)strix::make_hip_hyper_mix_launcher(next_chain_id,&incumbent);},
+            "incumbent launcher configuration cannot bind a next-tile selected identity");
         must_reject([&]{(void)strix::compile_serial_execution(model,hc_registry,next_request,hc_buffers);},
             "next-tile request rejects incumbent selected IDs");
         must_reject([&]{(void)strix::compile_serial_execution(model,next_registry,hc_request,hc_buffers);},
@@ -606,11 +618,12 @@ int main() {
             auto invalid=next_request;
             if(invalid_mode==0)invalid.require_graph_safe=true;
             if(invalid_mode==1)invalid.device_graph_inputs=true;
-            if(invalid_mode==2)invalid.logical_rows=2;
+            auto invalid_buffers=hc_buffers;
+            if(invalid_mode==2){invalid.logical_rows=2;invalid_buffers.logical_rows=2;}
             if(invalid_mode==3)invalid.request_concurrency=2;
             must_reject([&]{strix::kernels::KernelRegistry bad;strix::register_complete_hip_kernel_catalog(model,invalid,next_config,bad);},
                 "next-tile catalog rejects graph/R2/C2 request");
-            must_reject([&]{(void)strix::compile_serial_execution(model,next_registry,invalid,hc_buffers);},
+            must_reject([&]{(void)strix::compile_serial_execution(model,next_registry,invalid,invalid_buffers);},
                 "compiled next-tile plan rejects graph/R2/C2 without relying on catalog");
         }
     }
