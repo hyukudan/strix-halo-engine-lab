@@ -1597,7 +1597,10 @@ inline OptimizationProfileResolution resolve_optimization_profile(
         options.gdn_islands = true;
         options.prepared_eager = true;
         options.moe_shared_overlap = true;
-        result.selected = "canonical-a8-wave-qsa-hc-shared-concurrency-v4";
+        options.prefetch_q8_lm_head = true;
+        options.wave8_q8_lm_head = true;
+        options.wave8_q8_qsa_output = true;
+        result.selected = "canonical-a8-wave-qsa-hc-shared-output-v5";
         result.reason = "qualified-ordinary-cpu-generation";
     }
     return result;

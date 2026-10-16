@@ -567,11 +567,12 @@ int main() {
     const auto concurrent_profile = resolve_optimization_profile(concurrent, model, info, manifest,
         validated_model_content_identity, true);
     expect(concurrent_profile.automatic_applied &&
-        concurrent_profile.selected == "canonical-a8-wave-qsa-hc-shared-concurrency-v4" &&
+        concurrent_profile.selected == "canonical-a8-wave-qsa-hc-shared-output-v5" &&
         concurrent_profile.reason == "qualified-ordinary-cpu-generation" &&
         concurrent.q51_slot_parallel_down && concurrent.batched_moe_activation &&
         concurrent.wave8_q8_gdn_input && concurrent.wave8_q8_gdn_output &&
         concurrent.gdn_islands && concurrent.prepared_eager && concurrent.moe_shared_overlap &&
+        concurrent.prefetch_q8_lm_head && concurrent.wave8_q8_lm_head && concurrent.wave8_q8_qsa_output &&
         !concurrent.gpu_greedy_token && concurrent.context_tokens == 8192 &&
         concurrent.moe_overlap_arena_budget_bytes == 64ULL * 1024ULL * 1024ULL,
         "ordinary CPU generation selects the literal complete concurrency profile without scalar output or budget growth");
@@ -597,7 +598,8 @@ int main() {
     validate_resolved_serving(concurrent);
     const auto submitted_flags = [](const Options& o) {
         return std::array{o.q51_slot_parallel_down,o.batched_moe_activation,o.wave8_q8_gdn_input,
-            o.wave8_q8_gdn_output,o.gdn_islands,o.prepared_eager,o.moe_shared_overlap};
+            o.wave8_q8_gdn_output,o.gdn_islands,o.prepared_eager,o.moe_shared_overlap,
+            o.prefetch_q8_lm_head,o.wave8_q8_lm_head,o.wave8_q8_qsa_output};
     };
     for (unsigned mutation = 0; mutation < 24; ++mutation) {
         auto ineligible = ordinary_request;
@@ -632,7 +634,7 @@ int main() {
         expect(retained.automatic_applied && retained.selected == (mutation == 11 ?
             "canonical-a8-ranked-qsa-hc-shared-deferred-v3" : "canonical-a8-wave-qsa-hc-shared-deferred-v3") &&
             submitted_flags(ineligible) == submitted_flags(before),
-            "ineligible concurrent request retains v3 and all seven explicit/default submission flags");
+            "ineligible concurrent request retains v3 and all ten explicit/default submission and projection flags");
     }
     auto preserved_overlay = ordinary_request;
     preserved_overlay.prompt_lookup = true; // An alternate route keeps its explicit compatible arithmetic overlays.
@@ -658,24 +660,25 @@ int main() {
     observational.validation_final_state_path = "fresh-final-state";
     observational.execution_inventory = observational.host_dispatch_telemetry = true;
     expect(resolve_optimization_profile(observational, model, info, manifest,
-        validated_model_content_identity, true).selected == "canonical-a8-wave-qsa-hc-shared-concurrency-v4" &&
+        validated_model_content_identity, true).selected == "canonical-a8-wave-qsa-hc-shared-output-v5" &&
         observational.validation_final_state_path == "fresh-final-state" &&
         observational.execution_inventory && observational.host_dispatch_telemetry,
         "post-request state validation and host observation do not silently switch arithmetic profiles");
     auto bounded_overlap = parse({"decoder", "fixture.gguf", "7734", "264", "4434", "--generate", "14",
         "--moe-shared-overlap", "--moe-overlap-arena-budget-bytes", "16777216"});
     expect(resolve_optimization_profile(bounded_overlap, model, info, manifest,
-        validated_model_content_identity, true).selected == "canonical-a8-wave-qsa-hc-shared-concurrency-v4" &&
+        validated_model_content_identity, true).selected == "canonical-a8-wave-qsa-hc-shared-output-v5" &&
         bounded_overlap.moe_overlap_budget_explicit && bounded_overlap.moe_overlap_arena_budget_bytes == 16777216ULL,
-        "automatic C never grows an explicit overlap reservation budget");
+        "automatic generation never grows an explicit overlap reservation budget");
 #ifdef STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME
-    auto explicit_c = parse({"decoder", "fixture.gguf", "7734", "264", "4434", "--generate", "14", "--optimization-profile", "auto",
+    auto explicit_d = parse({"decoder", "fixture.gguf", "7734", "264", "4434", "--generate", "14", "--optimization-profile", "auto",
         "--q51-slot-parallel-down", "--batched-moe-activation", "--wave8-q8-gdn-input", "--wave8-q8-gdn-output",
-        "--gdn-islands", "--prepared-eager", "--moe-shared-overlap"});
-    (void)resolve_optimization_profile(explicit_c, model, info, manifest, validated_model_content_identity, true);
-    expect(submitted_flags(explicit_c) == submitted_flags(concurrent) && explicit_c.context_tokens == concurrent.context_tokens &&
-        explicit_c.grouped_exact_q51_down && explicit_c.q4k_a8g32_gate_up && explicit_c.deferred_moe_status,
-        "actual explicit concurrency parser route agrees with literal auto-C flags and original prerequisites");
+        "--gdn-islands", "--prepared-eager", "--moe-shared-overlap",
+        "--prefetch-q8-lm-head", "--wave8-q8-lm-head", "--wave8-q8-qsa-output"});
+    (void)resolve_optimization_profile(explicit_d, model, info, manifest, validated_model_content_identity, true);
+    expect(submitted_flags(explicit_d) == submitted_flags(concurrent) && explicit_d.context_tokens == concurrent.context_tokens &&
+        explicit_d.grouped_exact_q51_down && explicit_d.q4k_a8g32_gate_up && explicit_d.deferred_moe_status,
+        "actual explicit output parser route agrees with all ten literal automatic flags and original prerequisites");
 #endif
     const auto selected = resolve_optimization_profile(on, model, info, manifest,
         validated_model_content_identity, true);
@@ -711,7 +714,10 @@ int main() {
                input.wave8_q8_gdn_input == before.wave8_q8_gdn_input &&
                input.wave8_q8_gdn_output == before.wave8_q8_gdn_output &&
                input.gdn_islands == before.gdn_islands && input.prepared_eager == before.prepared_eager &&
-               input.moe_shared_overlap == before.moe_shared_overlap,
+               input.moe_shared_overlap == before.moe_shared_overlap &&
+               input.prefetch_q8_lm_head == before.prefetch_q8_lm_head &&
+               input.wave8_q8_lm_head == before.wave8_q8_lm_head &&
+               input.wave8_q8_qsa_output == before.wave8_q8_qsa_output,
                "fallback retains explicit and previous defaults");
     };
     fallback(defaults, "checkpoint-content-not-qualified", true, "another-checkpoint");

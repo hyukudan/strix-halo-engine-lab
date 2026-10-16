@@ -70,7 +70,7 @@ All three decoder receipt paths add:
 | JSON field | Meaning |
 | --- | --- |
 | `optimization_profile_requested` | `auto` or `manual` |
-| `optimization_profile_selected` | `manual`, `canonical-a8-wave-qsa-hc-shared-deferred-v3` or `canonical-a8-ranked-qsa-hc-shared-deferred-v3` |
+| `optimization_profile_selected` | `manual`, `canonical-a8-wave-qsa-hc-shared-deferred-v3`, `canonical-a8-ranked-qsa-hc-shared-deferred-v3` or `canonical-a8-wave-qsa-hc-shared-output-v5` |
 | `optimization_profile_reason` | `qualified-checkpoint` denotes content admission, not bundle qualification; otherwise explicit ranked override or a specific fallback reason |
 | `optimization_profile_automatic_applied` | Whether the automatic bundle was added |
 
@@ -91,10 +91,11 @@ native compilation or GPU execution for v3 at that historical checkpoint.
 ## Ordinary-generation concurrency profile
 
 For the qualified checkpoint, ordinary CPU-output generation selects
-`canonical-a8-wave-qsa-hc-shared-concurrency-v4`. It retains the v3 arithmetic
+`canonical-a8-wave-qsa-hc-shared-output-v5`. It retains the v3 arithmetic
 bundle and adds slot-parallel Q5_1 down projection, batched MoE activation,
 paired wave8 Q8 GDN input/output, GDN islands, prepared eager submission and
-MoE/shared-expert overlap. Explicit overlap arena budgets are preserved.
+MoE/shared-expert overlap, prefetch8/wave8 Q8 LM head and wave8 Q8 QSA output.
+Explicit overlap arena budgets are preserved.
 
 All existing content, model, capability, context, residency and execution
 allowlist guards still apply. Manual mode and implicit low-level overrides keep
@@ -108,7 +109,7 @@ The qualification slice covers sixteen consumed rows, all 248320 FP32 logits
 per row, and all seven initial/final state payloads, compared bit for bit.
 Complete request measurements exclude model setup and retain every scheduled
 sample. This finite slice does not establish all-position or full-context
-coverage. Automatic-profile integration and its final build checks are recorded
+coverage. Automatic-profile integration, measured adoption and its final build checks are recorded
 separately from the historical v3 adoption below.
 
 ## Qualified adoption (2026-10-15)
