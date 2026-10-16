@@ -33,3 +33,13 @@ alone does not prove GPU completion. The trace neither grants numerical
 qualification nor establishes a performance improvement.
 
 HIP timing semantics follow the [event management API](https://rocm.docs.amd.com/projects/HIP/en/latest/doxygen/html/group___event.html).
+
+`tools/qualification/queue_trace_evidence.py` reads one existing exported trace
+object and writes a fresh JSON receipt without launching any process. It merges
+recorded intervals per queue before computing their union and overlap between
+distinct queues, retaining the declared request/session/execution/position groups.
+Unknown/dropped/error observations cannot count as complete coverage. These are
+observed launcher-span metrics including gaps and waits, not kernel utilization,
+a full-workload wall interval or a measured device critical path. Kernel busy
+time, kernel overlap and device critical path remain null. Source fixtures and
+this offline consumer are unexecuted until the final validation stage.

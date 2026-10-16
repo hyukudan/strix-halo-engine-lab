@@ -1164,6 +1164,8 @@ if(BUILD_TESTING)
     if(Python3_Interpreter_FOUND)
         add_test(NAME strix-ctest-evidence-tests
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/ctest_evidence_tests.py)
+        add_test(NAME strix-queue-trace-evidence-tests
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/queue_trace_evidence_tests.py)
         add_test(NAME strix-runtime-inventory-tests
             COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/tests/runtime_inventory_tests.py)
     endif()
