@@ -19,6 +19,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -363,6 +364,32 @@ void dispatch_failure() {
         same_calls(baseline, candidate);
         require(fixture.request.state.valid == before.valid && fixture.request.state.generations == before.generations,
                 "failed dispatch published request state");
+    }
+}
+void reject_stage_mapping_before_prepared_dispatch() {
+    Fixture fixture;
+    strix::PreparedEagerExecution prepared(fixture.compiled, fixture.owner->resources, fixture.request, fixture.owner);
+    // Deliberately invalid, never-dereferenced metadata handles prove that the
+    // ordinary route rejects the stage tag before calling a mapping helper.
+    alignas(std::max_align_t) const std::array<std::byte,16> inaccessible{};
+    for(const bool state_tag:{false,true}) {
+        auto resources=fixture.owner->resources;
+        auto memory=*resources.session_state_memory;
+        if(state_tag) {
+            memory.stage_mapping=reinterpret_cast<const strix::DistributedStageStateMapping*>(inaccessible.data());
+            resources.session_state_memory=&memory;
+        } else resources.distributed_stage=reinterpret_cast<const strix::DistributedStageResourcePlan*>(inaccessible.data());
+        const auto exact_rejection=[&](auto&& action) {
+            try {action();}catch(const std::invalid_argument& error) {
+                return std::string_view(error.what())=="ordinary prepared execution cannot consume stage-local resources";
+            }
+            return false;
+        };
+        Trace unused;
+        require(exact_rejection([&]{prepared.validate_dynamic(resources,fixture.request);}) &&
+            exact_rejection([&]{static_cast<void>(prepared.run(resources,fixture.request,unused));}) && unused.calls.empty() &&
+            exact_rejection([&]{strix::PreparedEagerExecution rejected(fixture.compiled,resources,fixture.request,fixture.owner);}),
+            "ordinary prepared construction and dynamic entry reject either stage tag before metadata access or dispatch");
     }
 }
 void dynamic_rejection() {
@@ -1135,6 +1162,7 @@ int main() try {
                   !std::is_move_constructible_v<strix::PreparedArenaViews> &&
                   !std::is_constructible_v<strix::PreparedArenaViews, const strix::CompiledSerialExecution&>);
     equivalence(); dispatch_failure(); dynamic_rejection(); preparation_rejection(); retained_owner(); session_adapter();
+    reject_stage_mapping_before_prepared_dispatch();
     public_run_admission(); ple_between_call_rejection(); ple_preflight_guards();
     ple_failure_boundaries(); ple_single_admission_and_lifetime();
     arena_parity_sweeps(); arena_fork_join(); arena_context_rejections();

@@ -1,6 +1,7 @@
 #include "strix/hip_indexed_attention_launcher.hpp"
 
 #include "strix/dispatch_resources.hpp"
+#include "strix/prepared_tensor_views.hpp"
 #include "strix/indexed_attention_state.hpp"
 #include "strix/indexed_attention_workspace.hpp"
 #include "strix/session_state_memory.hpp"
@@ -1671,6 +1672,16 @@ void assign_unique(
 
 IndexedTensors identify_tensors(
     const ExecutionDispatchContext& context) {
+    if(const auto* cached=context.prepared_tensor_views) {
+        if(!context.resources) throw std::invalid_argument("prepared attention roles require retained resources");
+        cached->validate_stage_scope(context.resources->distributed_stage,context.step_id);
+        cached->validate_source_handles(context.resources->model_manifest,context.resources->model_weights,context.resources->tensor_access);
+        const auto& r=cached->indexed_roles(context.execution_identity,context.step_id);
+        return {tensor_pair(context,r.q),tensor_pair(context,r.k),tensor_pair(context,r.v),tensor_pair(context,r.out),
+            tensor_pair(context,r.q_norm),tensor_pair(context,r.k_norm),tensor_pair(context,r.index_q),tensor_pair(context,r.index_k),
+            tensor_pair(context,r.index_q_norm),tensor_pair(context,r.index_k_norm)};
+    }
+
     const auto& attention =
         resolve_dispatch_tensor_access(
             context, 0);

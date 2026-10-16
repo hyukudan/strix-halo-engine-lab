@@ -3,6 +3,7 @@
 #include <optional>
 #include <array>
 #include <set>
+#include <tuple>
 
 #include <algorithm>
 #include <limits>
@@ -130,6 +131,93 @@ std::vector<PreparedSharedTensorRoles> cache_shared_roles(const ModelManifest& m
     }
     return result;
 }
+template<class Roles> struct RoleCache {Roles roles;bool valid=false;};
+struct PleRoleCache {PreparedPleTensorRoles roles;bool table_valid=false,valid=false;};
+struct RoutedRoleCache {PreparedRoutedTensorRoles roles;bool down_valid=false,valid=false;};
+RoleCache<PreparedIndexedTensorRoles> cache_indexed_roles(const ModelManifest& manifest,
+    const ExecutionTensorAccessPlan& accesses,std::uint32_t step) {
+    RoleCache<PreparedIndexedTensorRoles> result;
+    std::array<std::uint32_t,10> indices{},counts{};
+    for(unsigned slot=0;slot<3U;++slot) {
+        const auto* access=find_execution_tensor_access(accesses,step,slot);if(!access) return result;
+        for(const auto i:access->tensor_indices) {
+            const auto& name=manifest.tensors[i].name;std::size_t role=10U;
+            if(slot==0U) {
+                if(has(name,"attn_output") || has(name,"o_proj")) role=3;
+                else if(has(name,"attn_q") || has(name,"q_proj")) role=0;
+                else if(has(name,"attn_k") || has(name,"k_proj")) role=1;
+                else if(has(name,"attn_v") || has(name,"v_proj")) role=2;
+            } else if(slot==1U) {
+                if(has(name,"indexer.q_proj") || has(name,"indexer_q_proj")) role=6;
+                else if(has(name,"indexer.k_proj") || has(name,"indexer_k_proj")) role=7;
+                else if(has(name,"indexer.q_norm") || has(name,"indexer_q_norm")) role=8;
+                else if(has(name,"indexer.k_norm") || has(name,"indexer_k_norm")) role=9;
+            } else {
+                if(has(name,"attn_q_norm")) role=4;
+                else if(has(name,"attn_k_norm")) role=5;
+            }
+            if(role<10U) {indices[role]=i;++counts[role];}
+        }
+    }
+    result.valid=std::all_of(counts.begin(),counts.end(),[](auto n){return n==1U;});
+    result.roles={indices[0],indices[1],indices[2],indices[3],indices[4],indices[5],indices[6],indices[7],indices[8],indices[9]};
+    return result;
+}
+PleRoleCache cache_ple_roles(const ModelManifest& manifest,const ExecutionTensorAccessPlan& accesses,std::uint32_t step) {
+    PleRoleCache result;
+    const auto* table=find_execution_tensor_access(accesses,step,0U);
+    const auto* parameters=find_execution_tensor_access(accesses,step,1U);
+    result.table_valid=table && table->tensor_indices.size()==1U;
+    if(!result.table_valid || !parameters) return result;
+    std::array<std::uint32_t,6> indices{},counts{};
+    for(const auto i:parameters->tensor_indices) {
+        const auto& t=manifest.tensors[i];if(t.role!=TensorRole::ple_parameter) continue;
+        std::size_t role=6U;
+        if(has(t.name,"ple_norm_key")) role=2;
+        else if(has(t.name,"ple_norm_query")) role=3;
+        else if(has(t.name,"ple_norm_conv")) role=4;
+        else if(has(t.name,"ple_conv1d")) role=5;
+        else if(has(t.name,"ple_key")) role=0;
+        else if(has(t.name,"ple_value")) role=1;
+        if(role<6U) {indices[role]=i;++counts[role];}
+    }
+    result.valid=std::all_of(counts.begin(),counts.end(),[](auto n){return n==1U;});
+    result.roles={table->tensor_indices[0],indices[0],indices[1],indices[2],indices[3],indices[4],indices[5]};
+    return result;
+}
+std::vector<RoutedRoleCache> cache_routed_roles(const ModelManifest& manifest,
+    const ExecutionTensorAccessPlan& accesses,std::uint32_t step) {
+    const auto* access=find_execution_tensor_access(accesses,step,0U);if(!access) return {};
+    std::set<std::tuple<std::uint64_t,std::uint64_t,std::uint64_t>> geometries;
+    for(const auto i:access->tensor_indices) {
+        const auto& t=manifest.tensors[i];
+        if(t.role!=TensorRole::moe_expert || t.dimensions.size()<3U) continue;
+        const auto& d=t.dimensions;
+        geometries.emplace(d[0],d[1],d[2]);geometries.emplace(d[1],d[0],d[2]);
+        if(d[1]%2U==0U) geometries.emplace(d[0],d[1]/2U,d[2]);
+    }
+    std::vector<RoutedRoleCache> result;
+    for(const auto& [hidden,intermediate,experts]:geometries) {
+        std::array<std::uint32_t,4> indices{},counts{};
+        for(const auto i:access->tensor_indices) {
+            const auto& t=manifest.tensors[i];const auto& d=t.dimensions;
+            if(t.role!=TensorRole::moe_expert || d.size()<3U || d[2]!=experts) continue;
+            if(intermediate<=UINT64_MAX/2U && d[0]==hidden && d[1]==2U*intermediate && has(t.name,"gate_up")) {
+                indices[2]=i;++counts[2];continue;
+            }
+            if(d[0]==hidden && d[1]==intermediate) {
+                if(has(t.name,"gate") && !has(t.name,"gate_up")) {indices[0]=i;++counts[0];continue;}
+                if(has(t.name,"up")) {indices[1]=i;++counts[1];continue;}
+            }
+            if(d[0]==intermediate && d[1]==hidden && has(t.name,"down")) {indices[3]=i;++counts[3];}
+        }
+        const bool fused=counts[2]==1U && counts[0]==0U && counts[1]==0U;
+        const bool separate=counts[2]==0U && counts[0]==1U && counts[1]==1U;
+        result.push_back({{hidden,intermediate,experts,indices[0],indices[1],indices[2],indices[3],fused},
+            counts[3]==1U,counts[3]==1U && (fused || separate)});
+    }
+    return result;
+}
 } // namespace
 
 struct PreparedTensorViews::Impl {
@@ -148,6 +236,9 @@ struct PreparedTensorViews::Impl {
     std::vector<AccessRange> step_accesses;
     std::vector<GdnRoleCache> gdn;
     std::vector<std::vector<PreparedSharedTensorRoles>> shared;
+    std::vector<RoleCache<PreparedIndexedTensorRoles>> indexed;
+    std::vector<PleRoleCache> ple;
+    std::vector<std::vector<RoutedRoleCache>> routed;
 
     Impl(std::uint64_t identity, const SerialExecutionPlan& execution,
          const ModelManifest& source_manifest, const ModelRuntimeBinding& source_weights,
@@ -189,9 +280,13 @@ struct PreparedTensorViews::Impl {
             ++range.count;
         }
         gdn.resize(execution.steps.size());shared.resize(execution.steps.size());
+        indexed.resize(execution.steps.size());ple.resize(execution.steps.size());routed.resize(execution.steps.size());
         for(const auto& step:execution.steps) {
             if(step.op==SerialOp::gated_delta_net) gdn[step.id]=cache_gdn_roles(manifest,accesses,step.id);
             if(step.op==SerialOp::shared_expert) shared[step.id]=cache_shared_roles(manifest,accesses,step.id);
+            if(step.op==SerialOp::indexed_attention) indexed[step.id]=cache_indexed_roles(manifest,accesses,step.id);
+            if(step.op==SerialOp::ple) ple[step.id]=cache_ple_roles(manifest,accesses,step.id);
+            if(step.op==SerialOp::moe_experts) routed[step.id]=cache_routed_roles(manifest,accesses,step.id);
         }
         for (std::size_t i = 0; i < manifest.tensors.size(); ++i) {
             if (manifest.tensors[i].name.empty() ||
@@ -249,6 +344,33 @@ const PreparedSharedTensorRoles& PreparedTensorViews::shared_roles(std::uint64_t
     if(found==candidates.end() || found->hidden!=hidden || found->intermediate!=intermediate)
         throw std::invalid_argument("shared-expert tensor family is missing or ambiguous");
     return *found;
+}
+const PreparedIndexedTensorRoles& PreparedTensorViews::indexed_roles(std::uint64_t identity,std::uint32_t step) const {
+    impl_->require_execution(identity);
+    if(step>=impl_->indexed.size() || (impl_->stage && !impl_->stage->contains_step(step)) || !impl_->indexed[step].valid)
+        throw std::invalid_argument("indexed-attention tensor family is missing or ambiguous");
+    return impl_->indexed[step].roles;
+}
+const PreparedPleTensorRoles& PreparedTensorViews::ple_roles(std::uint64_t identity,std::uint32_t step) const {
+    impl_->require_execution(identity);
+    if(step>=impl_->ple.size() || (impl_->stage && !impl_->stage->contains_step(step)) || !impl_->ple[step].table_valid)
+        throw std::invalid_argument("HIP PLE requires exactly one n-gram table");
+    if(!impl_->ple[step].valid) throw std::invalid_argument("PLE parameter tensor family is missing or ambiguous");
+    return impl_->ple[step].roles;
+}
+const PreparedRoutedTensorRoles& PreparedTensorViews::routed_roles(std::uint64_t identity,std::uint32_t step,
+    std::uint64_t hidden,std::uint64_t intermediate,std::uint64_t experts) const {
+    impl_->require_execution(identity);
+    if(step>=impl_->routed.size() || (impl_->stage && !impl_->stage->contains_step(step)))
+        throw std::invalid_argument("prepared routed role step is outside its retained scope");
+    const auto& candidates=impl_->routed[step];const auto key=std::tuple{hidden,intermediate,experts};
+    const auto found=std::lower_bound(candidates.begin(),candidates.end(),key,[](const auto& record,const auto& shape) {
+        return std::tuple{record.roles.hidden,record.roles.intermediate,record.roles.experts}<shape;
+    });
+    if(found==candidates.end() || std::tuple{found->roles.hidden,found->roles.intermediate,found->roles.experts}!=key || !found->down_valid)
+        throw std::invalid_argument("routed expert down tensor is missing or ambiguous");
+    if(!found->valid) throw std::invalid_argument("routed expert gate/up tensor family is missing or ambiguous");
+    return found->roles;
 }
 const RuntimeTensorBinding& PreparedTensorViews::tensor(std::uint64_t identity, std::uint32_t index) const {
     impl_->require_execution(identity);

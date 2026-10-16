@@ -4,6 +4,7 @@
 #include "strix/q51_slot_parallel_contract.hpp"
 
 #include "strix/dispatch_resources.hpp"
+#include "strix/prepared_tensor_views.hpp"
 #include "strix/hip_setup_quiescence.hpp"
 #ifdef STRIX_BUILD_MOE_BATCHED_ACTIVATION_DIAGNOSTIC
 #include "strix/moe_batched_activation_diagnostic.hpp"
@@ -755,6 +756,16 @@ RoutedTensors identify_tensors(
     const ExecutionDispatchContext& context,
     const ExecutionTensorAccess& access,
     const HipMoeExpertsLauncherConfig& config) {
+    if(const auto* cached=context.prepared_tensor_views) {
+        if(!context.resources) throw std::invalid_argument("prepared routed roles require retained resources");
+        cached->validate_stage_scope(context.resources->distributed_stage,context.step_id);
+        cached->validate_source_handles(context.resources->model_manifest,context.resources->model_weights,context.resources->tensor_access);
+        const auto& r=cached->routed_roles(context.execution_identity,context.step_id,config.hidden_size,config.intermediate_size,config.expert_count);
+        RoutedTensors result;result.fused_gate_up=r.fused_gate_up;result.down=tensor_pair(context,r.down);
+        if(r.fused_gate_up) result.gate_up=tensor_pair(context,r.gate_up);
+        else {result.gate=tensor_pair(context,r.gate);result.up=tensor_pair(context,r.up);}
+        return result;
+    }
     RoutedTensors result;
     std::uint32_t fused = 0;
     std::uint32_t gate = 0;

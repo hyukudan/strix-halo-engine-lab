@@ -28,6 +28,13 @@ bool same_layout(const SerialSessionStateLayout& left, const SerialSessionStateL
     }
     return true;
 }
+void require_ordinary_resources(const ExecutionRuntimeResources& resources) {
+    // This runner owns the complete serial plan. The stage-specific participant
+    // is the only path allowed to publish/consume partial resource mappings.
+    // Reject even before any mapping helper can inspect borrowed metadata.
+    if (resources.distributed_stage || (resources.session_state_memory && resources.session_state_memory->stage_mapping))
+        throw std::invalid_argument("ordinary prepared execution cannot consume stage-local resources");
+}
 } // namespace
 
 struct PreparedEagerExecution::Impl {
@@ -50,6 +57,7 @@ struct PreparedEagerExecution::Impl {
          const EagerExecutionRequest& prototype, std::shared_ptr<const void> owner)
         : compiled(std::move(source)), actual_owner(std::move(owner)) {
         if (!actual_owner) throw std::invalid_argument("prepared eager execution requires retained actual owners");
+        require_ordinary_resources(resources);
         if (compiled.execution.steps.size() > std::numeric_limits<std::uint32_t>::max() ||
             !compiled.vocab_size || !compiled.max_position_embeddings)
             throw std::invalid_argument("prepared eager compiled bounds are invalid");
@@ -105,6 +113,7 @@ struct PreparedEagerExecution::Impl {
     }
 
     void validate_dynamic(const ExecutionRuntimeResources& resources, const EagerExecutionRequest& request) const {
+        require_ordinary_resources(resources);
         if (!resources.scratch || !resources.model_manifest || !resources.model_weights ||
             !resources.tensor_access || !resources.session_state_layout || !resources.session_state_memory)
             throw std::invalid_argument("compiled execution requires complete runtime resources");

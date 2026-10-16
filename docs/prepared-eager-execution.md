@@ -9,7 +9,9 @@ The prepared runner keeps dynamic token/shape/position checks, required state
 flags, generation-overflow checks, resource validation and compatibility/binding
 identities. A changed physical generation or binding requires new preparation.
 The state layout is compared with its prepared snapshot so mutation under a stale
-identity is rejected. A deeply owned tensor-view index snapshots the validated manifest, physical
+identity is rejected. Ordinary prepared construction and every dynamic entry reject
+stage-local weight scopes or state mappings before inspecting their metadata or
+submitting work; partial-stage execution has its own retained participant. A deeply owned tensor-view index snapshots the validated manifest, physical
 bindings and canonical step/slot access plan. Actual allocation owners remain
 strongly retained. Request token spans are never retained.
 
@@ -21,10 +23,11 @@ name lookup uses a prebuilt transparent tree and step/slot access uses the exist
 binary search. This avoids rescanning and validating every model tensor for each
 individual lookup. Before publishing the cache in any dispatch context, admission
 still compares all source metadata and physical identities; source descriptor
-handles are also checked at lookup. GDN and shared-expert launchers consume
+handles are also checked at lookup. GDN, shared-expert, QSA, PLE and routed-expert launchers consume
 precomputed typed tensor roles from that same snapshot. Discovery runs during
-preparation, including shared projection geometry; prepared dispatch does not
-repeat their name/role scans. Launcher-specific dynamic shape, numerical,
+preparation, including shared/routed projection geometry and separate/fused routed
+weights; prepared dispatch does not repeat their name/role scans. Routing indices
+and GPU-produced status remain dynamic. Launcher-specific dynamic shape, numerical,
 extent and generation checks remain. Dynamic entry admission is still linear
 in model metadata and is not claimed to meet every hot-path goal.
 

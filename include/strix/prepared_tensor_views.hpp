@@ -20,6 +20,18 @@ struct PreparedSharedTensorRoles {
     std::uint32_t gate=0,up=0,down=0,shared_gate=0;
 };
 
+struct PreparedIndexedTensorRoles {
+    std::uint32_t q=0,k=0,v=0,out=0,q_norm=0,k_norm=0,index_q=0,index_k=0,index_q_norm=0,index_k_norm=0;
+};
+struct PreparedPleTensorRoles {
+    std::uint32_t table=0,key=0,value=0,norm_key=0,norm_query=0,norm_conv=0,conv=0;
+};
+struct PreparedRoutedTensorRoles {
+    std::uint64_t hidden=0,intermediate=0,experts=0;
+    std::uint32_t gate=0,up=0,gate_up=0,down=0;
+    bool fused_gate_up=false;
+};
+
 // Immutable, deeply owned lookup metadata. Construction is not permission to
 // execute: PreparedEagerExecution (or the explicitly scoped distributed stage)
 // must validate the actual dynamic resources and
@@ -58,6 +70,10 @@ public:
     [[nodiscard]] const PreparedGdnTensorRoles& gdn_roles(std::uint64_t execution_identity,std::uint32_t step) const;
     [[nodiscard]] const PreparedSharedTensorRoles& shared_roles(std::uint64_t execution_identity,std::uint32_t step,
         std::uint64_t hidden,std::uint64_t intermediate) const;
+    [[nodiscard]] const PreparedIndexedTensorRoles& indexed_roles(std::uint64_t execution_identity,std::uint32_t step) const;
+    [[nodiscard]] const PreparedPleTensorRoles& ple_roles(std::uint64_t execution_identity,std::uint32_t step) const;
+    [[nodiscard]] const PreparedRoutedTensorRoles& routed_roles(std::uint64_t execution_identity,std::uint32_t step,
+        std::uint64_t hidden,std::uint64_t intermediate,std::uint64_t experts) const;
     // Valid lookups allocate nothing and return references into this deep
     // snapshot. Tensor index and dense step/slot lookup are O(1); name lookup
     // and a sparse-slot fallback are O(log N).

@@ -2,6 +2,7 @@
 #include "strix/hip_ple_launcher.hpp"
 
 #include "strix/dispatch_resources.hpp"
+#include "strix/prepared_tensor_views.hpp"
 #include "strix/ple_lookup.hpp"
 #include "strix/iq4_nl.hpp"
 #include "strix/ple_workspace.hpp"
@@ -891,6 +892,15 @@ PleTensors identify_tensors(
     const HipPleLauncherConfig& config) {
     PleTensors result;
 
+    const auto hc_hidden=config.model.hidden_size*config.model.hc_count;
+    if(const auto* cached=context.prepared_tensor_views) {
+        if(!context.resources) throw std::invalid_argument("prepared PLE roles require retained resources");
+        cached->validate_stage_scope(context.resources->distributed_stage,context.step_id);
+        cached->validate_source_handles(context.resources->model_manifest,context.resources->model_weights,context.resources->tensor_access);
+        const auto& r=cached->ple_roles(context.execution_identity,context.step_id);
+        result={tensor_pair(context,r.table),tensor_pair(context,r.key),tensor_pair(context,r.value),tensor_pair(context,r.norm_key),
+            tensor_pair(context,r.norm_query),tensor_pair(context,r.norm_conv),tensor_pair(context,r.conv)};
+    } else {
     const auto& table_access =
         resolve_dispatch_tensor_access(
             context, 0);
@@ -914,10 +924,6 @@ PleTensors identify_tensors(
     std::uint32_t norm_query = 0;
     std::uint32_t norm_conv = 0;
     std::uint32_t conv = 0;
-
-    const auto hc_hidden =
-        config.model.hidden_size *
-        config.model.hc_count;
 
     for (const auto index :
          parameter_access.tensor_indices) {
@@ -973,6 +979,8 @@ PleTensors identify_tensors(
         conv != 1) {
         throw std::invalid_argument(
             "PLE parameter tensor family is missing or ambiguous");
+    }
+
     }
 
     if (result.table.manifest->role !=

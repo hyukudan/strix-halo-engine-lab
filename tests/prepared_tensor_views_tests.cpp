@@ -67,7 +67,7 @@ struct Fixture {
     }
 };
 struct RoleFixture {
-    std::shared_ptr<std::array<std::byte,131072>> owner=std::make_shared<std::array<std::byte,131072>>();
+    std::shared_ptr<std::array<std::byte,1048576>> owner=std::make_shared<std::array<std::byte,1048576>>();
     ModelManifest manifest;
     ModelRuntimeBinding weights;
     SerialExecutionPlan execution;
@@ -93,10 +93,37 @@ struct RoleFixture {
         add("blk.1.shared_expert.up.weight",TensorRole::dense_projection,1,{64,32});
         add("blk.1.shared_expert.down.weight",TensorRole::dense_projection,1,{32,64});
         add("blk.1.shared_expert_gate.weight",TensorRole::dense_projection,1,{64});
+        add("blk.2.attn_q.weight",TensorRole::attention_projection,2,{64,32});
+        add("blk.2.attn_k.weight",TensorRole::attention_projection,2,{64,32});
+        add("blk.2.attn_v.weight",TensorRole::attention_projection,2,{64,32});
+        add("blk.2.attn_output.weight",TensorRole::attention_projection,2,{32,64});
+        add("blk.2.attn_q_norm.weight",TensorRole::normalization,2,{8});
+        add("blk.2.attn_k_norm.weight",TensorRole::normalization,2,{8});
+        add("blk.2.indexer.q_proj.weight",TensorRole::sparse_index,2,{64,32});
+        add("blk.2.indexer.k_proj.weight",TensorRole::sparse_index,2,{64,32});
+        add("blk.2.indexer.q_norm.weight",TensorRole::sparse_index,2,{8});
+        add("blk.2.indexer.k_norm.weight",TensorRole::sparse_index,2,{8});
+        add("per_layer_token_embd.weight",TensorRole::ngram_table,3,{4,16});
+        add("blk.3.ple_key.weight",TensorRole::ple_parameter,3,{4,16});
+        add("blk.3.ple_value.weight",TensorRole::ple_parameter,3,{4,8});
+        add("blk.3.ple_norm_key.weight",TensorRole::ple_parameter,3,{4});
+        add("blk.3.ple_norm_query.weight",TensorRole::ple_parameter,3,{4});
+        add("blk.3.ple_norm_conv.weight",TensorRole::ple_parameter,3,{4});
+        add("blk.3.ple_conv1d.weight",TensorRole::ple_parameter,3,{4,4});
+        add("blk.4.experts.gate.weight",TensorRole::moe_expert,4,{64,32,4});
+        add("blk.4.experts.up.weight",TensorRole::moe_expert,4,{64,32,4});
+        add("blk.4.experts.down.weight",TensorRole::moe_expert,4,{32,64,4});
+        add("blk.5.experts.gate_up.weight",TensorRole::moe_expert,5,{64,64,4});
+        add("blk.5.experts.down.weight",TensorRole::moe_expert,5,{32,64,4});
         require(manifest.total_tensor_bytes<=owner->size(),"role fixture actual backing too small");
         ExecutionStep gdn;gdn.id=0;gdn.op=SerialOp::gated_delta_net;gdn.layer=0;
         ExecutionStep shared;shared.id=1;shared.op=SerialOp::shared_expert;shared.layer=1;shared.dependencies={0};
-        execution.steps={gdn,shared};rebind();
+        execution.steps={gdn,shared};
+        for(const auto op:{SerialOp::indexed_attention,SerialOp::ple,SerialOp::moe_experts,SerialOp::moe_experts}) {
+            ExecutionStep next;next.id=static_cast<std::uint32_t>(execution.steps.size());next.op=op;
+            next.layer=next.id;next.dependencies={next.id-1U};execution.steps.push_back(std::move(next));
+        }
+        rebind();
     }
     void rebind() {
         manifest.layout_identity=model_manifest_layout_identity(manifest);
@@ -127,6 +154,21 @@ int main() try {
         gdn.dt==5 && gdn.a==6 && gdn.norm==7 && gdn.out==8,"prepared GDN typed roles differ from independent expected indices");
     require(shared.gate==9 && shared.up==10 && shared.down==11 && shared.shared_gate==12,
         "prepared shared typed roles confuse projection gate with scalar gate");
+    const auto& indexed=role_cache->indexed_roles(29,2);
+    require(indexed.q==13 && indexed.k==14 && indexed.v==15 && indexed.out==16 && indexed.q_norm==17 &&
+        indexed.k_norm==18 && indexed.index_q==19 && indexed.index_k==20 && indexed.index_q_norm==21 && indexed.index_k_norm==22,
+        "prepared QSA roles confuse attention and indexer/norm families");
+    const auto& ple=role_cache->ple_roles(29,3);
+    require(ple.table==23 && ple.key==24 && ple.value==25 && ple.norm_key==26 && ple.norm_query==27 && ple.norm_conv==28 && ple.conv==29,
+        "prepared PLE roles confuse key projections with their norms");
+    const auto& routed=role_cache->routed_roles(29,4,64,32,4);
+    const auto& fused=role_cache->routed_roles(29,5,64,32,4);
+    require(!routed.fused_gate_up && routed.gate==30 && routed.up==31 && routed.down==32 &&
+        fused.fused_gate_up && fused.gate_up==33 && fused.down==34,"prepared MoE roles lost separate/fused geometry or experts");
+    reject([&]{(void)role_cache->indexed_roles(29,0);});
+    reject([&]{(void)role_cache->ple_roles(29,2);});
+    reject([&]{(void)role_cache->routed_roles(29,4,64,32,5);});
+    reject([&]{(void)role_cache->routed_roles(29,5,64,64,4);});
     reject([&]{(void)role_cache->gdn_roles(30,0);});
     reject([&]{(void)role_cache->gdn_roles(29,1);});
     reject([&]{(void)role_cache->shared_roles(29,0,64,32);});
@@ -137,6 +179,8 @@ int main() try {
         for(unsigned i=0;i<1000U;++i) {
             (void)role_cache->gdn_roles(29,0);(void)role_cache->shared_roles(29,1,64,32);
             (void)role_cache->tensor(29,gdn.out);(void)role_cache->tensor(29,shared.shared_gate);
+            (void)role_cache->indexed_roles(29,2);(void)role_cache->ple_roles(29,3);
+            (void)role_cache->routed_roles(29,4,64,32,4);(void)role_cache->routed_roles(29,5,64,32,4);
         }
     }
     for(unsigned mode=0;mode<5U;++mode) {
@@ -156,6 +200,10 @@ int main() try {
     require(roles.manifest.tensors[permuted->gdn_roles(29,0).a].name=="blk.0.ssm_a.weight" &&
         roles.manifest.tensors[permuted->shared_roles(29,1,64,32).shared_gate].name=="blk.1.shared_expert_gate.weight",
         "prepared role cache assumed original tensor order");
+    require(roles.manifest.tensors[permuted->indexed_roles(29,2).index_k_norm].name=="blk.2.indexer.k_norm.weight" &&
+        roles.manifest.tensors[permuted->ple_roles(29,3).value].name=="blk.3.ple_value.weight" &&
+        roles.manifest.tensors[permuted->routed_roles(29,5,64,32,4).gate_up].name=="blk.5.experts.gate_up.weight",
+        "remaining prepared roles assumed original tensor positions");
     RoleFixture ambiguous;
     ambiguous.manifest.tensors[6].name="blk.0.ssm_alpha.duplicate";ambiguous.rebind();
     auto ambiguous_cache=ambiguous.prepare();reject([&]{(void)ambiguous_cache->gdn_roles(29,0);});
@@ -169,6 +217,12 @@ int main() try {
     shared_overlap.manifest.tensors[9].name="blk.1.shared_expert.gate_up.weight";shared_overlap.rebind();
     auto shared_overlap_cache=shared_overlap.prepare();
     reject([&]{(void)shared_overlap_cache->shared_roles(29,1,64,32);});
+    RoleFixture bad_indexed;bad_indexed.manifest.tensors[15].name="blk.2.attn_q.duplicate";bad_indexed.rebind();
+    auto indexed_bad_cache=bad_indexed.prepare();reject([&]{(void)indexed_bad_cache->indexed_roles(29,2);});
+    RoleFixture bad_ple;bad_ple.manifest.tensors[25].name="blk.3.ple_norm_key.duplicate";bad_ple.rebind();
+    auto ple_bad_cache=bad_ple.prepare();reject([&]{(void)ple_bad_cache->ple_roles(29,3);});
+    RoleFixture bad_routed;bad_routed.manifest.tensors[30].name="blk.4.experts.gate_up.weight";bad_routed.rebind();
+    auto routed_bad_cache=bad_routed.prepare();reject([&]{(void)routed_bad_cache->routed_roles(29,4,64,32,4);});
     RoleFixture legacy;legacy.manifest.tensors[6].name="blk.0.ssm_in.weight";legacy.rebind();
     auto legacy_cache=legacy.prepare();reject([&]{(void)legacy_cache->gdn_roles(29,0);});
     Fixture fixture;
