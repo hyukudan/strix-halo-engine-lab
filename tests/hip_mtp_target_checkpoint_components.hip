@@ -63,6 +63,15 @@ HipMtpTargetCheckpointComponentReceipt qualify_hip_mtp_target_window_checkpoint(
         auto execution=window->execute_mtp_captured(session,inputs,capture);
         checkpoint.restore_window(session,execution.batch);
         HipMtpTargetCheckpointComponentReceipt receipt;
+        receipt.logical_rows=execution.batch.logical_rows();
+        receipt.r2_dispatches=execution.execution.r2_dispatches;
+        receipt.projection_launches_saved=execution.execution.projection_launches_saved;
+        receipt.window_execution_identity=execution.batch.window_execution_identity();
+        receipt.window_kernel_plan_identity=execution.batch.window_kernel_plan_identity();
+        receipt.chunk_begin=execution.batch.chunk_begin();receipt.chunk_end=execution.batch.chunk_end();
+        require(receipt.logical_rows==inputs.size() && receipt.chunk_begin==recorded.next_position &&
+            receipt.chunk_end>=receipt.chunk_begin && receipt.chunk_end-receipt.chunk_begin==receipt.logical_rows,
+            "checkpoint observation does not bind the actual completed input chunk");
         receipt.exact_session_metadata_restored=same(session,recorded);
         for(std::uint64_t offset=0;offset<state.device_bytes;) {
             const auto count=std::min(chunk,state.device_bytes-offset);

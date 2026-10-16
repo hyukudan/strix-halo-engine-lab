@@ -128,6 +128,7 @@ void run_mtp_model_qualification(decode_cli::MtpDecodeQualificationContext& c){
         cycles.required_coverage={(request.coverage&1U)!=0U,(request.coverage&2U)!=0U,(request.coverage&4U)!=0U,(request.coverage&8U)!=0U,(request.coverage&16U)!=0U};
     }
     std::uint64_t completed=1;
+    std::optional<HipMtpTargetCheckpointComponentReceipt> checkpoint_observation;
     switch(g.kind){
     case MtpQualificationKind::history_fallback:{
         require(c.window && !g.cycles.cycles.empty(),"history fixture requires actual window and cycle trace");
@@ -165,8 +166,25 @@ void run_mtp_model_qualification(decode_cli::MtpDecodeQualificationContext& c){
             g.window.chunks.front().inputs,{c.options.mtp.window_capture_bytes,c.options.mtp.window_history_intervals},
             c.options.mtp.window_checkpoint_bytes,request.host_bytes,c.generations);
         require(receipt.full_device_bytes_restored && receipt.full_host_bytes_restored && receipt.deferred_status_restored && receipt.exact_session_metadata_restored,
-            "checkpoint fixture did not confirm every restoration component");break;
+            "checkpoint fixture did not confirm every restoration component");
+        checkpoint_observation=receipt;break;
     }
+    }
+    if(checkpoint_observation){
+        const auto& observed=*checkpoint_observation;
+        std::cout<<"{\"mode\":\"native-mtp-checkpoint-window-observation\",\"kind\":7,"
+            <<"\"scope\":\"one-successful-window-mutation-restored-to-own-baseline\","
+            <<"\"reference_file_sha256\":\""<<request.sha<<"\",\"logical_rows\":"<<observed.logical_rows
+            <<",\"window_execution_identity\":"<<observed.window_execution_identity
+            <<",\"window_kernel_plan_identity\":"<<observed.window_kernel_plan_identity
+            <<",\"chunk_begin\":"<<observed.chunk_begin<<",\"chunk_end\":"<<observed.chunk_end
+            <<",\"r2_dispatches\":"<<observed.r2_dispatches
+            <<",\"projection_launches_saved\":"<<observed.projection_launches_saved
+            <<",\"device_bytes_checked\":"<<observed.device_bytes_checked<<",\"host_bytes_checked\":"<<observed.host_bytes_checked
+            <<",\"deferred_bytes_checked\":"<<observed.deferred_bytes_checked
+            <<",\"checkpoint_reserved_bytes\":"<<observed.checkpoint_reserved_bytes
+            <<",\"full_device_bytes_restored\":true,\"full_host_bytes_restored\":true,\"deferred_status_restored\":true,"
+            <<"\"exact_session_metadata_restored\":true,\"performance_qualified\":false}\n";
     }
     std::cout<<"{\"mode\":\"native-mtp-model-fixture\",\"kind\":"<<static_cast<std::uint32_t>(g.kind)
         <<",\"completed_records\":"<<completed<<",\"native_fixture_passed\":true,\"performance_qualified\":false,"
