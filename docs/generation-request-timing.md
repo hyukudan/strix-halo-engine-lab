@@ -21,5 +21,9 @@ performance evidence. Existing per-step timing fields retain their original
 boundaries; CPU and GPU per-step sums cover different output work and are not a
 substitute for the common request measurement.
 
+This is the first request in a fresh process. First-use HIP code loading and cold
+caches can contribute to it. Host dispatch telemetry, when enabled, also adds
+counting overhead within the measured boundary.
+
 This source change has not been compiled, tested, or measured. It changes neither
 the request controller nor token/state publication or numerical operations.

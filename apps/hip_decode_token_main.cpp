@@ -1742,7 +1742,7 @@ int main(
             reference->steps.size());
     }
 
-    std::cout << '{' << '\n' << optimization_profile_receipt << eager_submission_receipt << overlap_receipt() << execution_inventory_receipt << gdn_output_mode_receipt() << wave_router_mode_receipt << deferred_moe_mode_receipt;
+    std::cout << '{' << '\n' << optimization_profile_receipt << eager_submission_receipt << execution_inventory_receipt << gdn_output_mode_receipt() << wave_router_mode_receipt << deferred_moe_mode_receipt;
     emit_q4k_a8_receipt();
     std::cout << "  \"model_content_identity\": \""
               << strix::model_content_identity_hex(
@@ -1955,6 +1955,7 @@ int main(
     std::cout << "  ]," << '\n';
     emit_q4k_a8_counts();
     // Dynamic counters belong after the raw token loop, not the JSON prefix.
+    std::cout << overlap_receipt();
     std::cout << strix::decode_detail::qsa_input_dispatch_receipt(qsa_prefetch_stats.get());
     std::cout << shared_dispatch_receipt.completed_counts();
     std::cout << strix::decode_detail::deferred_moe_completed_tokens_receipt(deferred_moe.get());
