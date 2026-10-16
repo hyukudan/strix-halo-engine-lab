@@ -63,6 +63,43 @@ class InventoryTests(unittest.TestCase):
                                "numerics": {"input_precision": "bf16", "accumulator_precision": "fp32",
                                             "output_precision": "fp32", "row_invariant": True, "deterministic": True}}}]}
 
+    def test_tuning_exporter_fields_roundtrip_without_inventing_qualification(self):
+        for reason in (None, "qualified_record", "invalid_key", "ambiguous_records",
+                       "no_qualified_record", "selection_policy_mismatch"):
+            with self.subTest(reason=reason):
+                inventory = self.selected_inventory()
+                step = inventory["steps"][0]
+                step["offline_tuning_selection"] = reason
+                step["declared_variant"]["numerical_contract_identity"] = 91 if reason == "qualified_record" else None
+                result = self.collect(receipt_path=self.evidence("tuning.json", {"execution_inventory": inventory}))
+                self.assertTrue(result["consistent"])
+                decode, verify, prefill = result["operators"]
+                self.assertEqual(decode["offline_tuning_selection"], reason)
+                self.assertIsNone(decode["qualification"])
+                self.assertIsNone(decode["executable_support"])
+                self.assertIsNone(verify["offline_tuning_selection"])
+                self.assertIsNone(prefill["offline_tuning_selection"])
+                self.assertEqual(result["qualification_state"], "not_assessed")
+
+    def test_tuning_exporter_rejects_unknown_tags_and_forged_numerical_evidence(self):
+        for reason in (True, 1, [], {}, "", "fastest"):
+            inventory = self.selected_inventory()
+            inventory["steps"][0]["offline_tuning_selection"] = reason
+            with self.subTest(reason=reason), self.assertRaises(ValueError):
+                self.collect(receipt_path=self.evidence("bad-tuning.json", {"execution_inventory": inventory}))
+        for identity in (True, False, 0, -1, 1 << 64, 1.0, "91"):
+            inventory = self.selected_inventory()
+            inventory["steps"][0]["declared_variant"]["numerical_contract_identity"] = identity
+            with self.subTest(identity=identity), self.assertRaises(ValueError):
+                self.collect(receipt_path=self.evidence("bad-contract.json", {"execution_inventory": inventory}))
+        inventory = self.selected_inventory()
+        inventory["steps"][0]["offline_tuning_selection"] = "qualified_record"
+        with self.assertRaises(ValueError):
+            self.collect(receipt_path=self.evidence("missing-contract.json", {"execution_inventory": inventory}))
+        inventory["steps"][0].update(runtime_step=True, kernel_id=None, declared_variant=None)
+        with self.assertRaises(ValueError):
+            self.collect(receipt_path=self.evidence("runtime-tuning.json", {"execution_inventory": inventory}))
+
     def test_auto_base_profile_with_overlays_is_consistent_but_not_combination_qualified(self):
         modes = {"eager_submission_mode": "prepared-static-plan-experimental-v1",
                  "moe_shared_overlap_mode": "eager-sibling-streams-experimental-v1",

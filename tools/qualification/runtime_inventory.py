@@ -318,7 +318,7 @@ def selected_operator_records(inventory, receipt, tensor_records, conflicts):
         closed_keys(step,
             {"step_id", "operator", "layer", "runtime_step", "launcher_bound",
              "launcher_implementation_identity", "kernel_id", "declared_variant"},
-            set(), "execution step")
+            {"offline_tuning_selection"}, "execution step")
         if (not isinstance(step, dict) or type(step.get("step_id")) is not int
                 or step["step_id"] != index or not isinstance(step.get("operator"), str)
                 or not step["operator"] or type(step.get("runtime_step")) is not bool
@@ -329,8 +329,13 @@ def selected_operator_records(inventory, receipt, tensor_records, conflicts):
         if step.get("layer") is not None:
             integer(step["layer"], "layer")
         variant = step.get("declared_variant")
+        tuning = step.get("offline_tuning_selection")
+        if tuning is not None and (not isinstance(tuning, str) or tuning not in {
+                "qualified_record", "invalid_key", "ambiguous_records",
+                "no_qualified_record", "selection_policy_mismatch"}):
+            raise ValueError("invalid offline tuning selection reason")
         if step["runtime_step"]:
-            if variant is not None or step.get("kernel_id") is not None:
+            if variant is not None or step.get("kernel_id") is not None or tuning is not None:
                 raise ValueError("runtime step cannot claim a kernel variant")
         else:
             if (not isinstance(variant, dict) or not isinstance(step.get("kernel_id"), str)
@@ -346,7 +351,12 @@ def selected_operator_records(inventory, receipt, tensor_records, conflicts):
             closed_keys(variant,
                 {"id", "phase", "logical_rows", "request_concurrency", "graph_safe",
                  "qualification", "input_layout", "output_layout", "compiler_identity", "numerics"},
-                {"family", "hidden_size", "auxiliary_size", "wave_size"}, "declared variant")
+                {"family", "hidden_size", "auxiliary_size", "wave_size", "numerical_contract_identity"}, "declared variant")
+            numerical = variant.get("numerical_contract_identity")
+            if numerical is not None and not integer(numerical, "numerical contract identity"):
+                raise ValueError("unknown numerical contract must be null, not zero")
+            if tuning == "qualified_record" and numerical is None:
+                raise ValueError("qualified tuning selection requires a declared numerical contract")
             for key in ("logical_rows", "request_concurrency", "family", "hidden_size", "auxiliary_size", "wave_size"):
                 if key in variant:
                     integer(variant[key], "variant " + key)
@@ -375,6 +385,7 @@ def selected_operator_records(inventory, receipt, tensor_records, conflicts):
                            "selected_request_concurrency": concurrency if admitted else None,
                            "launcher_bound_declared": True if admitted else None,
                            "declared_variant": variant if admitted else None,
+                           "offline_tuning_selection": tuning if admitted else None,
                            "compiled_support": None, "executable_support": None,
                            "allowed_logical_rows": None, "allowed_request_concurrency": None,
                            "tensor_formats_ggml": metadata.get("tensor_formats_ggml"),
