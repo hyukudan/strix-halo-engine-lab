@@ -35,7 +35,7 @@ void validate_execution_memory_binding(
 
     const auto maximum =
         std::numeric_limits<std::uintptr_t>::max();
-    if (arena.total_bytes >
+    if (memory.arena_bytes >
         static_cast<std::uint64_t>(
             maximum - memory.arena_base)) {
         throw std::overflow_error(
@@ -75,7 +75,9 @@ ExecutionBufferAddress resolve_execution_buffer(
         static_cast<std::uintptr_t>(
             allocation->offset);
 
-    if (allocation->bytes >
+    if (allocation->offset > arena.total_bytes ||
+        allocation->bytes > arena.total_bytes - allocation->offset ||
+        allocation->offset > memory.arena_bytes || allocation->bytes >
         memory.arena_bytes -
             allocation->offset) {
         throw std::invalid_argument(

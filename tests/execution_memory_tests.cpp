@@ -200,6 +200,26 @@ int main() {
     expect(overflow_rejected,
            "memory binding rejects address-range overflow");
 
+    auto declared_overflow = memory;
+    declared_overflow.arena_bytes = std::numeric_limits<std::uint64_t>::max();
+    bool declared_rejected = false;
+    try { strix::validate_execution_memory_binding(compiled.execution_identity, compiled.arena, declared_overflow); }
+    catch (const std::overflow_error&) { declared_rejected = true; }
+    expect(declared_rejected, "entire declared physical view must fit the address space");
+    for (const bool oversized_physical : {false, true}) {
+        auto forged = compiled.arena;
+        for (auto& allocation : forged.allocations) if (allocation.use == lm_io.reads[0]) {
+            allocation.offset = memory.arena_bytes + 1U;
+            allocation.bytes = 4;
+        }
+        auto physical = memory;
+        if (oversized_physical) physical.arena_bytes += 1024;
+        bool rejected = false;
+        try { static_cast<void>(strix::resolve_execution_buffer(compiled.execution_identity, forged, physical, lm_io.reads[0])); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        expect(rejected, "forged offsets cannot underflow bounds or enter excess physical capacity");
+    }
+
     if (failures == 0) {
         std::cout << "execution memory tests passed\n";
     }
