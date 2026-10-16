@@ -47,7 +47,7 @@ void capture(Graph& graph,Stream& stream,unsigned arm,const float* input,
     strix::HipLaunchContext context{};context.stream=stream.stream;
     const strix::HipLaunchScope scope(context);
     check(hipStreamBeginCapture(stream.stream,hipStreamCaptureModeThreadLocal));
-    try {strix::launch_output_by_kind(strix::WeightKind::q8_0,input,weights,width,rows,output,arm!=0U,arm==2U);}
+    try {strix::launch_output_by_kind(strix::WeightKind::q8_0,input,weights,width,rows,output,arm!=0U,arm==2U,strix::hip_execution_stream(),nullptr);}
     catch(...) {static_cast<void>(hipStreamEndCapture(stream.stream,&graph.graph));throw;}
     check(hipStreamEndCapture(stream.stream,&graph.graph));
     std::size_t count=0;check(hipGraphGetNodes(graph.graph,nullptr,&count));require(count==1,"projection receipt must contain exactly one kernel");
@@ -221,7 +221,7 @@ void run(unsigned width,unsigned rows,unsigned kind,bool cpu_only=false) {
             check(hipMemsetAsync(d_output.p,0xa5,eager.size()*2U,stream.stream));
             strix::HipLaunchContext context{};context.stream=stream.stream;
             const strix::HipLaunchScope scope(context);
-            strix::launch_output_by_kind(strix::WeightKind::q8_0,static_cast<float*>(d_input.p),binding,width,rows,output,true,true);
+            strix::launch_output_by_kind(strix::WeightKind::q8_0,static_cast<float*>(d_input.p),binding,width,rows,output,true,true,strix::hip_execution_stream(),nullptr);
             check(hipMemcpyAsync(eager.data(),d_output.p,eager.size()*2U,hipMemcpyDeviceToHost,stream.stream));
         });
         require(std::all_of(eager.begin(),eager.begin()+8,[](auto v){return v==0xa5a5U;}) &&
@@ -243,7 +243,7 @@ void run(unsigned width,unsigned rows,unsigned kind,bool cpu_only=false) {
     }
     for(const auto bad: {strix::WeightKind::f32,strix::WeightKind::q8_0}) {
         check(hipMemset(d_output.p,0xa5,(rows+16U)*2U));bool rejected=false;
-        try {strix::launch_output_by_kind(bad,static_cast<float*>(d_input.p),binding,bad==strix::WeightKind::q8_0?33U:width,rows,output,true);}
+        try {strix::launch_output_by_kind(bad,static_cast<float*>(d_input.p),binding,bad==strix::WeightKind::q8_0?33U:width,rows,output,true,false,strix::hip_execution_stream(),nullptr);}
         catch(const std::invalid_argument& e) {rejected=std::string(e.what())=="virtual Q8 GDN output requires aligned Q8_0 weights";}
         require(rejected,"wrong format/alignment must reject exact entry guard");
         std::vector<std::uint16_t> preserved(rows+16);check(hipMemcpy(preserved.data(),d_output.p,preserved.size()*2,hipMemcpyDeviceToHost));
@@ -266,7 +266,7 @@ void run(unsigned width,unsigned rows,unsigned kind,bool cpu_only=false) {
         {
             const strix::HipLaunchScope scope(context);
             check(hipStreamBeginCapture(stream.stream,hipStreamCaptureModeThreadLocal));
-            try {strix::launch_output_by_kind(strix::WeightKind::q8_0,bad_input,bad_binding,bad_width,bad_rows,bad_output,virtual_enabled,true);}
+            try {strix::launch_output_by_kind(strix::WeightKind::q8_0,bad_input,bad_binding,bad_width,bad_rows,bad_output,virtual_enabled,true,strix::hip_execution_stream(),nullptr);}
             catch(const std::invalid_argument&) {rejected=true;}
             check(hipStreamEndCapture(stream.stream,&rejected_graph.graph));
         }
