@@ -12,6 +12,9 @@
 #include <iostream>
 #include <stdexcept>
 #include <mutex>
+#include <memory>
+#include <limits>
+#include <string_view>
 #include <thread>
 
 namespace {
@@ -138,7 +141,145 @@ private:
 
 }  // namespace
 
+class CachePleSource final : public strix::SparseLookupIoSource {
+public:
+    std::atomic<unsigned> calls{0};
+    std::atomic<bool> fail{false};
+    void read(std::uint64_t offset, std::span<std::byte> output) override {
+        calls.fetch_add(1);
+        if (fail.load()) throw std::runtime_error("injected PLE source failure");
+        if (offset > 256U || output.size() > 256U - offset)
+            throw std::out_of_range("bounded PLE cache source extent");
+        for (std::size_t i = 0; i < output.size(); ++i)
+            output[i] = static_cast<std::byte>((offset + i) & 255U);
+    }
+};
+void qualify_row_cache_source_contract() {
+    auto source = std::make_shared<CachePleSource>();
+    std::weak_ptr<CachePleSource> weak = source;
+    strix::ManifestTensor table;
+    table.name = "cache.ngram"; table.role = strix::TensorRole::ngram_table;
+    table.ggml_type = 30; table.dimensions = {4, 8}; table.byte_size = 64; table.absolute_offset = 32;
+    strix::RuntimeTensorBinding runtime;
+    runtime.storage = strix::RuntimeTensorStorage::file_mapped;
+    runtime.bytes = 64; runtime.allocation_generation = 7;
+    strix::PlannedPleLookupPolicy policy;
+    policy.max_rows_per_io = 1; policy.max_inflight_ios = 1;
+    policy.cache_capacity_rows = 2; policy.cache_byte_budget = 16;
+    policy.cache_model_content.bytes[0] = 0x51;
+    const auto reservation = strix::PlannedPleLookupBackend::cache_reservation_bytes(policy);
+    expect(reservation > 16U, "row cache reservation includes preallocated tags and complete raw BF16 payloads");
+    {
+        strix::PlannedPleLookupBackend backend(*source, policy, source);
+        expect(backend.cache_stats().reserved_bytes == reservation, "cache reserve uses the public pure calculation");
+        const auto gather = [&](std::span<const std::uint64_t> rows) {
+            const strix::PleLookupRequest request{rows, 8, &table, &runtime};
+            const auto handle = backend.start(request);
+            std::vector<std::byte> result(rows.size() * 8U, std::byte{0xcd});
+            backend.finish(handle, result);
+            for (std::size_t row = 0; row < rows.size(); ++row)
+                for (std::size_t byte = 0; byte < 8U; ++byte)
+                    expect(result[row * 8U + byte] == static_cast<std::byte>(
+                        (table.absolute_offset + rows[row] * 8U + byte) & 255U),
+                        "cached and missed rows preserve full payload bits and request duplicate order");
+            return result;
+        };
+        const std::array<std::uint64_t, 3> initial{3, 1, 3};
+        const auto reference = gather(initial);
+        const auto reads = source->calls.load();
+        expect(reads == 2U && backend.cache_stats().inserted == 2U,
+            "cold cache submits two real reads for two unique rows, not a planner hit estimate");
+        expect(gather(initial) == reference && source->calls.load() == reads && backend.cache_stats().hits == 3U,
+            "all-hit lookup performs no source reads and handles an empty I/O future");
+        const std::array<std::uint64_t, 1> row4{4}, row1{1};
+        (void)gather(row4); // LRU row 1 is evicted; duplicate row 3 was most recently used.
+        const auto after4 = source->calls.load();
+        (void)gather(row1);
+        expect(source->calls.load() == after4 + 1U && backend.cache_stats().resident_rows == 2U &&
+            backend.cache_stats().evicted >= 2U, "bounded LRU evicts and rereads the actual least recent payload");
+        ++runtime.allocation_generation;
+        const auto before_generation = source->calls.load();
+        (void)gather(row1);
+        expect(source->calls.load() == before_generation + 1U && backend.cache_stats().invalidations == 1U,
+            "allocation generation change invalidates cached bytes before any hit");
+        table.absolute_offset += 8U;
+        const auto before_namespace = source->calls.load();
+        (void)gather(row1);
+        expect(source->calls.load() == before_namespace + 1U && backend.cache_stats().invalidations == 2U,
+            "same row ID with a different file window never returns old content");
+        const std::array<std::uint64_t, 1> row6{6};
+        const strix::PleLookupRequest cancelled{row6, 8, &table, &runtime};
+        const auto insert_before = backend.cache_stats().inserted;
+        const auto handle = backend.start(cancelled);
+        backend.cancel(handle);
+        expect(backend.cache_stats().inserted == insert_before,
+            "cancellation joins outstanding reads but does not publish cache entries");
+        const auto after_cancel = source->calls.load();
+        (void)gather(row6);
+        expect(source->calls.load() == after_cancel + 1U,
+            "cancelled miss must perform a real source read on retry");
+        const std::array<std::uint64_t, 2> mixed{6, 7};
+        source->fail = true;
+        const auto failure_handle = backend.start({mixed, 8, &table, &runtime});
+        std::array<std::byte, 16> untouched;
+        untouched.fill(std::byte{0x5a});
+        const auto before_failure = backend.cache_stats().inserted;
+        bool failed = false;
+        try { backend.finish(failure_handle, untouched); }
+        catch (const std::runtime_error& error) { failed = std::string_view(error.what()) == "injected PLE source failure"; }
+        expect(failed && backend.cache_stats().inserted == before_failure &&
+            std::all_of(untouched.begin(), untouched.end(), [](auto byte) { return byte == std::byte{0x5a}; }),
+            "failed mixed hit/miss I/O publishes neither cached rows nor a partial destination");
+        source->fail = false;
+        (void)gather(mixed);
+        source.reset();
+        expect(!weak.expired(), "backend retains the actual immutable I/O source owner during cached use");
+        (void)gather(row6);
+    }
+    expect(weak.expired(), "source owner is released after backend and its async pending work are destroyed");
+    auto dummy = std::make_shared<CachePleSource>();
+    bool owner_rejected = false;
+    try { strix::PlannedPleLookupBackend invalid(*dummy, policy); }
+    catch (const std::invalid_argument&) { owner_rejected = true; }
+    expect(owner_rejected, "cache requires a strong immutable source owner");
+    auto no_content = policy; no_content.cache_model_content = {};
+    bool content_rejected = false;
+    try { strix::PlannedPleLookupBackend invalid(*dummy, no_content, dummy); }
+    catch (const std::invalid_argument&) { content_rejected = true; }
+    expect(content_rejected, "cache requires explicit model content identity, not just address and generation");
+    auto partial = policy; partial.cache_byte_budget = 0;
+    bool partial_rejected = false;
+    try { (void)strix::PlannedPleLookupBackend::cache_reservation_bytes(partial); }
+    catch (const std::invalid_argument&) { partial_rejected = true; }
+    expect(partial_rejected, "partial cache budgets fail admission");
+    auto overflow = policy; overflow.cache_capacity_rows = std::numeric_limits<std::uint64_t>::max();
+    bool overflow_rejected = false;
+    try { (void)strix::PlannedPleLookupBackend::cache_reservation_bytes(overflow); }
+    catch (const std::overflow_error&) { overflow_rejected = true; }
+    expect(overflow_rejected, "cache tag reservation overflow fails before allocation");
+    auto tiny = policy; tiny.cache_byte_budget = 7;
+    strix::PlannedPleLookupBackend too_small(*dummy, tiny, dummy);
+    const std::array<std::uint64_t, 1> valid_row{0};
+    bool short_rejected = false;
+    try { (void)too_small.start({valid_row, 8, &table, &runtime}); }
+    catch (const std::invalid_argument&) { short_rejected = true; }
+    expect(short_rejected && dummy->calls == 0U, "undersized complete-row cache rejects before I/O");
+    auto changed_content = policy; changed_content.cache_model_content.bytes[0] ^= 1U;
+    strix::PlannedPleLookupBackend first_content(*dummy, policy, dummy);
+    strix::PlannedPleLookupBackend second_content(*dummy, changed_content, dummy);
+    expect(first_content.implementation_identity() != second_content.implementation_identity(),
+        "source cache identity distinguishes model content even with equal geometry and runtime addresses");
+    const std::array<std::uint64_t, 2> late_invalid{0, 8};
+    bool row_rejected = false;
+    try { (void)first_content.start({late_invalid, 8, &table, &runtime}); }
+    catch (const std::out_of_range&) { row_rejected = true; }
+    expect(row_rejected && dummy->calls == 0U, "late invalid row rejects before any cache lookup I/O");
+    strix::PlannedPleLookupBackend legacy(*dummy);
+    expect(legacy.cache_stats().reserved_bytes == 0U, "default backend does not allocate or admit a payload cache");
+}
+
 int main() {
+    qualify_row_cache_source_contract();
     const auto model =
         strix::ModelContract::qwen38_flash_next();
     const auto contract =

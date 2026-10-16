@@ -11,6 +11,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <future>
+#include <memory>
 #include <span>
 #include <vector>
 
@@ -112,6 +113,20 @@ struct PlannedPleLookupPolicy {
     // asynchronous lookup coordinator as a reader within this total budget.
     // Per backend/active lookup only; excludes threads internal to IoSource.
     std::uint32_t cpu_helper_threads = 0;
+    // Explicit independent payload cache. Both zero preserve the legacy path.
+    // Storage and tags are reserved once in the backend constructor, before
+    // any lookup. Budget excludes existing async I/O operation payloads.
+    std::uint64_t cache_capacity_rows = 0;
+    std::uint64_t cache_byte_budget = 0;
+    // Source bytes are immutable for this exact content identity throughout
+    // the retained source owner's lifetime. Cache never crosses this binding.
+    ModelContentIdentity cache_model_content{};
+};
+
+struct PlannedPleCacheStats {
+    std::uint64_t hits = 0, misses = 0, inserted = 0, evicted = 0, invalidations = 0;
+    std::uint64_t reserved_bytes = 0, resident_rows = 0;
+    bool saturated = false;
 };
 
 class PlannedPleLookupBackend final
@@ -120,11 +135,17 @@ public:
     // Source/config callers retain their owners until finish/cancel or backend
     // destruction has joined every submitted helper. No interruptible read
     // primitive exists: cancellation drains and discards, never releases early.
+    // Single active lookup / externally serialized instance, including stats.
+    // With caching enabled source_owner must retain this exact source and its
+    // immutable model bytes. Cached payloads are raw BF16 rows, not decoded IQ4.
     explicit PlannedPleLookupBackend(
         SparseLookupIoSource& source,
-        PlannedPleLookupPolicy policy = {});
+        PlannedPleLookupPolicy policy = {},
+        std::shared_ptr<const void> source_owner = {});
 
     [[nodiscard]] std::uint64_t implementation_identity() const noexcept override;
+    [[nodiscard]] PlannedPleCacheStats cache_stats() const noexcept;
+    [[nodiscard]] static std::uint64_t cache_reservation_bytes(PlannedPleLookupPolicy policy);
 
     [[nodiscard]] PleLookupHandle start(
         const PleLookupRequest& request) override;
@@ -144,11 +165,27 @@ private:
         std::uint32_t row_count = 0;
         std::vector<SparseLookupIoOperation> io_plan;
         std::future<SparseLookupIoExecution> future;
+        std::array<std::size_t, PleHashContract::maximum_heads> cached_slots{};
+        bool cache_enabled = false;
         bool active = false;
     };
 
     SparseLookupIoSource* source_ = nullptr;
     PlannedPleLookupPolicy policy_{};
+    std::shared_ptr<const void> source_owner_;
+    struct CacheSlot { std::uint64_t row = 0, age = 0; bool valid = false; };
+    std::vector<CacheSlot> cache_slots_;
+    std::vector<std::byte> cache_bytes_;
+    std::uint64_t cache_row_bytes_ = 0, cache_rows_ = 0;
+    const ManifestTensor* cache_manifest_ = nullptr;
+    const RuntimeTensorBinding* cache_runtime_ = nullptr;
+    RuntimeTensorBinding cache_binding_{};
+    std::uint64_t cache_offset_ = 0, cache_table_bytes_ = 0, cache_table_rows_ = 0;
+    PlannedPleCacheStats cache_counters_{};
+    void cache_count(std::uint64_t& counter) noexcept;
+    void cache_touch(std::size_t slot) noexcept;
+    void cache_admit(const PleLookupRequest& request);
+    void cache_insert(std::uint64_t row, const std::byte* bytes) noexcept;
     PleLookupHandle next_handle_ = 1;
     Pending pending_;
 };

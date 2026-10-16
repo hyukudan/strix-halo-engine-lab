@@ -184,6 +184,29 @@ int main() {
       ++accepted.context_tokens;
       rejects([&] { validate_resolved_requested_logprobs(accepted,16); }, "requested logprob receipt exceeds bounded row/value capacity"); }
     rejects([] { (void)parse({"decoder", "m", "1", "--logprob-token", "4294967296"}); }, "logprob token exceeds uint32");
+    expect(defaults.ple_cache_rows == 0 && defaults.ple_cache_budget_bytes == 0,
+        "PLE row cache remains absent by default");
+    validate_resolved_ple_cache(defaults);
+    auto cache_ple = parse({"decoder", "m", "1", "--ple-cache-rows", "8", "--ple-cache-budget-bytes", "4096"});
+    expect(cache_ple.ple_cache_rows == 8 && cache_ple.ple_cache_budget_bytes == 4096 && !cache_ple.any_low_level_flag,
+        "PLE cache limits do not silently select a kernel profile");
+    rejects([&] { validate_resolved_ple_cache(cache_ple); }, "PLE row cache requires resolved planned PLE I/O");
+    cache_ple.planned_ple_io = true;
+    validate_resolved_ple_cache(cache_ple);
+    rejects([] { (void)parse({"decoder", "m", "1", "--ple-cache-rows", "8"}); },
+        "PLE cache requires both positive explicit row and byte limits");
+    rejects([] { (void)parse({"decoder", "m", "1", "--ple-cache-rows", "0"}); }, "PLE cache limits must be positive");
+    rejects([] { (void)parse({"decoder", "m", "1", "--ple-cache-rows"}); }, "PLE cache option requires a value");
+    rejects([] { (void)parse({"decoder", "m", "1", "--ple-cache-rows", "2", "--ple-cache-rows", "4"}); },
+        "duplicate PLE cache limit");
+    for (unsigned mutation = 0; mutation < 4; ++mutation) {
+        auto bad = cache_ple;
+        if (mutation == 0) bad.ple_cache_rows_explicit = false;
+        if (mutation == 1) bad.ple_cache_budget_explicit = false;
+        if (mutation == 2) bad.ple_cache_rows = 0;
+        if (mutation == 3) bad.ple_cache_budget_bytes = 0;
+        rejects([&] { validate_resolved_ple_cache(bad); }, "PLE cache requires both positive explicit row and byte limits");
+    }
     expect(defaults.ple_cpu_helper_threads == 0 && !defaults.ple_cpu_helper_threads_explicit,
         "PLE helper budget default retains legacy backend behavior");
     validate_resolved_ple_cpu_helpers(defaults);

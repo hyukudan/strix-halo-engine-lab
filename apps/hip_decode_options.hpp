@@ -183,6 +183,8 @@ struct Options {
     strix::KnownWindowOutputPolicy known_prefix_output_policy = strix::KnownWindowOutputPolicy::all_rows;
     bool known_prefix_output_policy_explicit = false;
     bool prompt_lookup_adaptive = false;
+    std::uint64_t ple_cache_rows = 0, ple_cache_budget_bytes = 0;
+    bool ple_cache_rows_explicit = false, ple_cache_budget_explicit = false;
     std::uint64_t serving_cache_entries = 0, serving_cache_snapshot_bytes = 0;
     std::uint64_t serving_cache_capture_peak_bytes = 0, serving_cache_max_prefix_tokens = 0;
     bool serving_cache_entries_explicit = false, serving_cache_snapshot_explicit = false;
@@ -267,6 +269,16 @@ inline void validate_resolved_q51_slot_parallel_down(const Options& options) {
 
 // Explicit per-backend helper cap overlays the resolved PLE choice; never
 // selects the planned backend or disables another requested optimization.
+inline void validate_resolved_ple_cache(const Options& options) {
+    if (!(options.ple_cache_rows_explicit || options.ple_cache_budget_explicit ||
+          options.ple_cache_rows || options.ple_cache_budget_bytes)) return;
+    if (!options.ple_cache_rows_explicit || !options.ple_cache_budget_explicit ||
+        !options.ple_cache_rows || !options.ple_cache_budget_bytes)
+        throw std::invalid_argument("PLE cache requires both positive explicit row and byte limits");
+    if (!options.planned_ple_io)
+        throw std::invalid_argument("PLE row cache requires resolved planned PLE I/O");
+}
+
 inline void validate_resolved_ple_cpu_helpers(const Options& options) {
     if (options.ple_cpu_helper_threads > 8U ||
         (options.ple_cpu_helper_threads_explicit && options.ple_cpu_helper_threads == 0U))
@@ -322,6 +334,9 @@ inline void validate_resolved_known_prefix_window(const Options& options) {
 }
 
 inline void validate_resolved_serving(const Options& options) {
+    if ((options.ple_cache_rows_explicit || options.ple_cache_budget_explicit) &&
+        (!options.ple_cache_rows_explicit || !options.ple_cache_budget_explicit))
+        throw std::invalid_argument("PLE cache requires both positive explicit row and byte limits");
     validate_serving_prefix_cache_limits(options);
     if (options.serving_prefix_files.empty()) return;
     if (!options.generate_tokens || !options.tokens.empty() || !options.deferred_moe_status ||
@@ -413,7 +428,7 @@ inline Options parse_options(
             "[--optimization-profile auto|manual] [--execution-inventory] [--host-dispatch-telemetry] [--execution-telemetry-trace] "
             "[--gpu-greedy-token] [--logprob-token ID ...] [--offline-tuning-cache FILE] [--gdn-recurrent-layout baseline|stride32|stride33|transposed] [--gdn-recurrent-storage key-value|value-key] [--known-prefix-window --known-prefix-rows 2|4|8 --known-prefix-expert-union] [--prompt-lookup [--prompt-lookup-depth 0|1|2 | --prompt-lookup-adaptive]] [--serve-prefix-u32le FILE ... --serve-concurrency 1|2|4 --serve-memory-budget-bytes N --serve-request-budget-bytes N --serve-headroom-bytes N] [--gdn-islands] [--qsa-hierarchical-selection] [--qsa-gqa-heads-per-block 1|2|4] [--prepared-eager] [--moe-shared-overlap] [--moe-overlap-arena-budget-bytes N] [--batched-moe-activation] [--validation-final-state DIR] [--validation-final-state-max-bytes N] [--reference FILE] [--max-logit-error X] "
             "[--context N] [--residency register|copy] [--coalesce-gap BYTES] "
-            "[--planned-ple-io] [--ple-cpu-helper-threads 1..8] [--ple-max-rows-per-io N] [--ple-max-inflight-ios N] "
+            "[--planned-ple-io] [--ple-cpu-helper-threads 1..8] [--ple-cache-rows N --ple-cache-budget-bytes N] [--ple-max-rows-per-io N] [--ple-max-inflight-ios N] "
             "[--generate N] [--eos-token TOKEN_ID] [--prefix-cache-roundtrip] "
             "[--parallel-moe-router] [--ranked-moe-router-topk | --wave-moe-router-topk] "
             "[--prefetch-q8-qsa-input] [--prefetch-q8-shared-expert] [--prefetch-q8-lm-head [--wave8-q8-lm-head]] [--wave8-q8-gdn-input] [--wave8-q8-gdn-output] [--wave8-q8-qsa-output] [--virtual-q8-lm-head] [--virtual-q8-gdn-input [--prefetch-q8-gdn-input]] [--q4k-a8g32-gate-up [--grouped-exact-q51-down]] [--deferred-moe-status] "
@@ -907,6 +922,17 @@ inline Options parse_options(
             continue;
         }
 
+        if (argument == "--ple-cache-rows" || argument == "--ple-cache-budget-bytes") {
+            if (index + 1 >= argc) throw std::invalid_argument("PLE cache option requires a value");
+            bool& explicit_value = argument == "--ple-cache-rows" ? options.ple_cache_rows_explicit : options.ple_cache_budget_explicit;
+            if (explicit_value) throw std::invalid_argument("duplicate PLE cache limit");
+            const auto value = parse_u64(argv[++index], "PLE cache limit");
+            if (!value) throw std::invalid_argument("PLE cache limits must be positive");
+            explicit_value = true;
+            if (argument == "--ple-cache-rows") options.ple_cache_rows = value;
+            else options.ple_cache_budget_bytes = value;
+            continue;
+        }
         if (argument == "--ple-cpu-helper-threads" || argument.starts_with("--ple-cpu-helper-threads=")) {
             if (options.ple_cpu_helper_threads_explicit) throw std::invalid_argument("duplicate PLE CPU helper threads option");
             std::string_view value;
@@ -1069,6 +1095,9 @@ inline Options parse_options(
         options.prefix_cache_roundtrip || options.execution.mode != strix::DecodeExecutionMode::eager ||
         options.execution.integer_head != strix::DecodeIntegerHead::none))
         throw std::invalid_argument("GPU greedy token output requires eager generation without RAW, reference, roundtrip or integer head");
+    if ((options.ple_cache_rows_explicit || options.ple_cache_budget_explicit) &&
+        (!options.ple_cache_rows_explicit || !options.ple_cache_budget_explicit))
+        throw std::invalid_argument("PLE cache requires both positive explicit row and byte limits");
     validate_serving_prefix_cache_limits(options);
     if (options.serving_prefix_files.empty() && (options.serving_concurrency_explicit || options.serving_memory_explicit ||
         options.serving_request_explicit || options.serving_headroom_explicit))

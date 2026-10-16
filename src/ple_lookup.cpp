@@ -656,13 +656,77 @@ void FileMappedPleLookupBackend::cancel(
     }
 }
 
+std::uint64_t PlannedPleLookupBackend::cache_reservation_bytes(PlannedPleLookupPolicy policy) {
+    if ((policy.cache_capacity_rows == 0) != (policy.cache_byte_budget == 0))
+        throw std::invalid_argument("PLE row cache requires both capacity and byte budget");
+    if (policy.cache_capacity_rows > std::numeric_limits<std::size_t>::max() / sizeof(CacheSlot) ||
+        policy.cache_byte_budget > std::numeric_limits<std::size_t>::max())
+        throw std::overflow_error("PLE row cache reservation exceeds native extent");
+    return checked_add_lookup(policy.cache_byte_budget,
+        checked_mul_lookup(policy.cache_capacity_rows, sizeof(CacheSlot)));
+}
+PlannedPleCacheStats PlannedPleLookupBackend::cache_stats() const noexcept { return cache_counters_; }
+void PlannedPleLookupBackend::cache_count(std::uint64_t& counter) noexcept {
+    if (counter == std::numeric_limits<std::uint64_t>::max()) cache_counters_.saturated = true;
+    else ++counter;
+}
+void PlannedPleLookupBackend::cache_touch(std::size_t slot) noexcept {
+    const auto previous = cache_slots_[slot].valid ? cache_slots_[slot].age : cache_rows_;
+    for (auto& other : cache_slots_)
+        if (other.valid && other.age < previous) ++other.age;
+    cache_slots_[slot].age = 0;
+}
+void PlannedPleLookupBackend::cache_admit(const PleLookupRequest& request) {
+    if (!policy_.cache_capacity_rows) return;
+    const auto& m = *request.table_manifest;
+    const auto& r = *request.table_runtime;
+    if (!r.allocation_generation) throw std::invalid_argument("PLE row cache requires a live table allocation generation");
+    if (request.row_bytes > policy_.cache_byte_budget)
+        throw std::invalid_argument("PLE row cache byte budget cannot retain one complete row");
+    const bool same = cache_manifest_ == &m && cache_runtime_ == &r && cache_row_bytes_ == request.row_bytes &&
+        cache_offset_ == m.absolute_offset && cache_table_bytes_ == m.byte_size && cache_table_rows_ == m.dimensions[1] &&
+        cache_binding_.tensor_index == r.tensor_index && cache_binding_.storage == r.storage &&
+        cache_binding_.address == r.address && cache_binding_.bytes == r.bytes &&
+        cache_binding_.allocation_generation == r.allocation_generation && cache_binding_.owner_node == r.owner_node;
+    if (same) return;
+    if (cache_manifest_) cache_count(cache_counters_.invalidations);
+    for (auto& slot : cache_slots_) slot = {};
+    cache_counters_.resident_rows = 0;
+    cache_manifest_ = &m; cache_runtime_ = &r; cache_binding_ = r;
+    cache_row_bytes_ = request.row_bytes; cache_offset_ = m.absolute_offset;
+    cache_table_bytes_ = m.byte_size; cache_table_rows_ = m.dimensions[1];
+    cache_rows_ = std::min(policy_.cache_capacity_rows, policy_.cache_byte_budget / cache_row_bytes_);
+}
+void PlannedPleLookupBackend::cache_insert(std::uint64_t row, const std::byte* bytes) noexcept {
+    std::size_t chosen = 0;
+    for (std::size_t i = 0; i < static_cast<std::size_t>(cache_rows_); ++i) {
+        if (cache_slots_[i].valid && cache_slots_[i].row == row) { cache_touch(i); return; }
+        if (!cache_slots_[i].valid) { chosen = i; break; }
+        if (cache_slots_[i].age > cache_slots_[chosen].age) chosen = i;
+    }
+    auto& slot = cache_slots_[chosen];
+    if (slot.valid) cache_count(cache_counters_.evicted);
+    else ++cache_counters_.resident_rows;
+    cache_touch(chosen);
+    std::memcpy(cache_bytes_.data() + chosen * static_cast<std::size_t>(cache_row_bytes_), bytes,
+        static_cast<std::size_t>(cache_row_bytes_));
+    slot.row = row; slot.valid = true;
+    cache_count(cache_counters_.inserted);
+}
+
 PlannedPleLookupBackend::PlannedPleLookupBackend(
     SparseLookupIoSource& source,
-    PlannedPleLookupPolicy policy)
+    PlannedPleLookupPolicy policy, std::shared_ptr<const void> source_owner)
     : source_(&source),
-      policy_(policy) {
+      policy_(policy), source_owner_(std::move(source_owner)) {
     if (policy_.cpu_helper_threads > 8U)
         throw std::invalid_argument("planned PLE CPU helper budget must be zero or 1..8");
+    if (policy_.cache_capacity_rows && (!source_owner_ || !policy_.cache_model_content.valid()))
+        throw std::invalid_argument("PLE row cache requires retained immutable source and model content identity");
+    const auto reservation = cache_reservation_bytes(policy_);
+    cache_slots_.resize(static_cast<std::size_t>(policy_.cache_capacity_rows));
+    cache_bytes_.resize(static_cast<std::size_t>(policy_.cache_byte_budget));
+    cache_counters_.reserved_bytes = reservation;
     if (policy_.max_inflight_ios == 0) {
         throw std::invalid_argument(
             "planned PLE lookup requires non-zero inflight depth");
@@ -676,11 +740,19 @@ PlannedPleLookupBackend::implementation_identity() const noexcept {
     const auto legacy = base ^
            (policy_.max_rows_per_io << 17U) ^
            (policy_.max_inflight_ios << 33U);
-    if (!policy_.cpu_helper_threads) return legacy;
+    if (!policy_.cpu_helper_threads && !policy_.cache_capacity_rows) return legacy;
     auto hash = legacy;
     for (const auto value : {0x504c454350554231ULL, static_cast<unsigned long long>(policy_.cpu_helper_threads)})
         for (unsigned shift = 0; shift < 64; shift += 8)
             hash = (hash ^ ((value >> shift) & 255ULL)) * 1099511628211ULL;
+    if (policy_.cache_capacity_rows)
+        for (const auto value : {0x504c45524f574331ULL, static_cast<unsigned long long>(policy_.cache_capacity_rows),
+                static_cast<unsigned long long>(policy_.cache_byte_budget)})
+            for (unsigned shift = 0; shift < 64; shift += 8)
+                hash = (hash ^ ((value >> shift) & 255ULL)) * 1099511628211ULL;
+    if (policy_.cache_capacity_rows)
+        for (const auto byte : policy_.cache_model_content.bytes)
+            hash = (hash ^ byte) * 1099511628211ULL;
     return hash ? hash : 1;
 }
 
@@ -753,6 +825,24 @@ PlannedPleLookupBackend::start(
         }
     }
 
+    cache_admit(request);
+    std::array<std::uint64_t, PleHashContract::maximum_heads> missing_rows{};
+    std::array<std::size_t, PleHashContract::maximum_heads> cached_slots{};
+    cached_slots.fill(std::numeric_limits<std::size_t>::max());
+    std::size_t missing_count = 0;
+    for (std::size_t output = 0; output < request.row_ids.size(); ++output) {
+        if (policy_.cache_capacity_rows) {
+            for (std::size_t slot = 0; slot < static_cast<std::size_t>(cache_rows_); ++slot)
+                if (cache_slots_[slot].valid && cache_slots_[slot].row == request.row_ids[output]) {
+                    cached_slots[output] = slot;
+                    break;
+                }
+        }
+        if (cached_slots[output] == std::numeric_limits<std::size_t>::max()) {
+            missing_rows[missing_count++] = request.row_ids[output];
+            if (policy_.cache_capacity_rows) cache_count(cache_counters_.misses);
+        } else cache_count(cache_counters_.hits);
+    }
     SparseLookupRequest sparse_request;
     sparse_request.table_rows =
         manifest.dimensions[1];
@@ -763,12 +853,10 @@ PlannedPleLookupBackend::start(
         policy_.max_rows_per_io;
     sparse_request.max_inflight_ios =
         policy_.max_inflight_ios;
-    sparse_request.row_ids =
-        request.row_ids;
+    sparse_request.row_ids = std::span<const std::uint64_t>(missing_rows).first(missing_count);
 
-    auto plan =
-        build_sparse_lookup_plan(
-            sparse_request);
+    SparseLookupPlan plan;
+    if (missing_count) plan = build_sparse_lookup_plan(sparse_request);
     for (auto& operation :
          plan.io_plan) {
         if (operation.byte_offset >
@@ -795,8 +883,8 @@ PlannedPleLookupBackend::start(
     auto* source =
         source_;
     const auto helper_threads = policy_.cpu_helper_threads;
-    auto future =
-        std::async(
+    std::future<SparseLookupIoExecution> future;
+    if (missing_count) future = std::async(
             std::launch::async,
             [plan, source, helper_threads]() mutable {
                 if (helper_threads)
@@ -806,6 +894,8 @@ PlannedPleLookupBackend::start(
                     *source);
             });
 
+    pending_.cached_slots = cached_slots;
+    pending_.cache_enabled = policy_.cache_capacity_rows != 0;
     pending_.handle =
         handle;
     pending_.row_bytes =
@@ -849,8 +939,7 @@ void PlannedPleLookupBackend::finish(
         std::move(pending_);
     pending_ = {};
 
-    const auto execution =
-        current.future.get();
+    const auto execution = current.future.valid() ? current.future.get() : SparseLookupIoExecution{};
     if (execution.operation_payloads.size() !=
         current.io_plan.size()) {
         throw std::logic_error(
@@ -863,9 +952,12 @@ void PlannedPleLookupBackend::finish(
         const auto row =
             current.row_ids[output_row];
         const std::byte* source_row = nullptr;
+        const auto cached = current.cached_slots[output_row];
+        if (current.cache_enabled && cached != std::numeric_limits<std::size_t>::max())
+            source_row = cache_bytes_.data() + cached * static_cast<std::size_t>(current.row_bytes);
 
         for (std::size_t operation_index = 0;
-             operation_index <
+             source_row == nullptr && operation_index <
                 current.io_plan.size();
              ++operation_index) {
             const auto& operation =
@@ -921,6 +1013,10 @@ void PlannedPleLookupBackend::finish(
             static_cast<std::size_t>(
                 current.row_bytes));
     }
+    if (current.cache_enabled)
+        for (std::uint32_t row = 0; row < current.row_count; ++row)
+            cache_insert(current.row_ids[row], destination.data() +
+                static_cast<std::size_t>(row * current.row_bytes));
 }
 
 void PlannedPleLookupBackend::cancel(

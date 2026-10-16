@@ -135,6 +135,10 @@ public:
     explicit MappedModelIoSource(
         const strix::MappedModelFile& mapped)
         : mapped_(&mapped) {}
+    explicit MappedModelIoSource(std::shared_ptr<const strix::MappedModelFile> mapped)
+        : mapped_(mapped.get()), mapped_owner_(std::move(mapped)) {
+        if (!mapped_) throw std::invalid_argument("cached PLE source requires a retained mapping");
+    }
 
     void read(
         std::uint64_t byte_offset,
@@ -146,8 +150,18 @@ public:
 
 private:
     const strix::MappedModelFile* mapped_ = nullptr;
+    std::shared_ptr<const strix::MappedModelFile> mapped_owner_;
 };
 
+
+// Actual completed backend operations, never cache-derived timing estimates.
+std::string ple_row_cache_json(const strix::PlannedPleCacheStats& stats) {
+    return "{\"scope\":\"per-planned-backend-actual-row-cache-operations\",\"hits\":" + std::to_string(stats.hits) +
+        ",\"misses\":" + std::to_string(stats.misses) + ",\"inserted\":" + std::to_string(stats.inserted) +
+        ",\"evicted\":" + std::to_string(stats.evicted) + ",\"invalidations\":" + std::to_string(stats.invalidations) +
+        ",\"reserved_bytes\":" + std::to_string(stats.reserved_bytes) + ",\"resident_rows\":" + std::to_string(stats.resident_rows) +
+        ",\"saturated\":" + (stats.saturated ? "true" : "false") + "}";
+}
 
 struct RankedLogit {
     std::uint32_t token = 0;
@@ -521,7 +535,9 @@ public:
           compiled_(std::move(compiled)), manifest_(std::move(manifest)), admitted_manifest_(std::move(admitted_manifest)),
           access_(std::move(access)),
           layout_(std::move(layout)), generations_(epoch), mapped_io_(*mapped_),
-          planned_lookup_(mapped_io_, ple_policy), hash_(strix::build_ple_hash_contract(model)),
+          cache_source_(ple_policy.cache_capacity_rows ? std::make_shared<MappedModelIoSource>(mapped_) : nullptr),
+          planned_lookup_(cache_source_ ? *cache_source_ : mapped_io_, ple_policy, cache_source_),
+          hash_(strix::build_ple_hash_contract(model)),
           planned_(planned), epoch_(epoch), request_id_(request_id), telemetry_(telemetry) {
         if (!mapped_ || !weights_ || !guard_ || !epoch_) throw std::invalid_argument("serving requires retained model and fresh epoch");
         counters.enable_trace(trace);
@@ -566,6 +582,7 @@ public:
         result.row = 0; result.rows = 1; result.phase = strix::ExecutionPhase::token;
         return result;
     }
+    [[nodiscard]] strix::PlannedPleCacheStats ple_cache_stats() const noexcept { return planned_lookup_.cache_stats(); }
     bool telemetry() const noexcept { return telemetry_; }
     strix::HostDispatchCounters counters;
     strix::SerialSessionContext session;
@@ -585,6 +602,7 @@ private:
     strix::RuntimeExecutionMemoryOwner memory_;
     MappedModelIoSource mapped_io_;
     strix::FileMappedPleLookupBackend mapped_lookup_;
+    std::shared_ptr<MappedModelIoSource> cache_source_;
     strix::PlannedPleLookupBackend planned_lookup_;
     strix::PleHashContract hash_;
     strix::PleLookupPrefetchState prefetch_;
@@ -751,6 +769,7 @@ int main(
             "  --gdn-recurrent-storage key-value|value-key (experimental physical state layout, default key-value)\n"
             "  --known-prefix-window [--known-prefix-rows 2|4|8] [--known-prefix-output-policy all-rows|terminal-row|state-only] (experimental known prompt)\n"
             "  --prompt-lookup [--prompt-lookup-depth 0|1|2 | --prompt-lookup-adaptive] (experimental greedy target verification, default off)\n"
+            "  --ple-cache-rows N --ple-cache-budget-bytes N (optional bounded raw-row cache; requires planned PLE)\n"
             "  --serve-prefix-u32le FILE (repeat per request; independent C1 state, shared weights)\n"
             "  --serve-prefix-cache-entries N --serve-prefix-cache-snapshot-bytes N --serve-prefix-cache-capture-peak-bytes N --serve-prefix-cache-max-tokens N (all explicit, optional bounded shared pool)\n"
             "  --serve-concurrency 1|2|4 --serve-memory-budget-bytes N --serve-request-budget-bytes N --serve-headroom-bytes N\n"
@@ -910,6 +929,7 @@ int main(
     strix::decode_cli::validate_resolved_prompt_lookup(options);
     strix::decode_cli::validate_resolved_serving(options);
     strix::decode_cli::validate_resolved_ple_cpu_helpers(options);
+    strix::decode_cli::validate_resolved_ple_cache(options);
     strix::decode_cli::validate_resolved_requested_logprobs(options, model.vocab_size);
     if (options.batched_moe_activation && !options.q4k_a8g32_gate_up)
         throw std::invalid_argument("batched MoE activation requires resolved Q4K A8 gate/up execution");
@@ -918,6 +938,9 @@ int main(
     std::optional<strix::LoadedOfflineTuningCache> loaded_offline_tuning;
     if (!options.offline_tuning_cache_path.empty())
         loaded_offline_tuning.emplace(strix::load_offline_tuning_cache_file(options.offline_tuning_cache_path));
+    strix::PlannedPleLookupPolicy requested_ple_policy{options.ple_max_rows_per_io, options.ple_max_inflight_ios,
+        options.ple_cpu_helper_threads, options.ple_cache_rows, options.ple_cache_budget_bytes, mapped.content_identity()};
+    const auto requested_ple_cache_bytes = strix::PlannedPleLookupBackend::cache_reservation_bytes(requested_ple_policy);
     const std::string ple_cpu_helper_receipt = options.ple_cpu_helper_threads
         ? "  \"ple_cpu_helper_budget_requested\":" + std::to_string(options.ple_cpu_helper_threads) + ",\n" +
           "  \"ple_cpu_helper_budget_scope\":\"per-planned-backend-including-coordinator-excluding-custom-source-internal-threads\",\n" +
@@ -929,6 +952,11 @@ int main(
         "  \"optimization_profile_reason\": \"" + optimization_profile.reason + "\",\n" +
         "  \"optimization_profile_automatic_applied\": " +
         (optimization_profile.automatic_applied ? "true" : "false") + ",\n" + ple_cpu_helper_receipt;
+    if (options.ple_cache_rows)
+        optimization_profile_receipt += "  \"ple_row_cache_requested_rows\":" + std::to_string(options.ple_cache_rows) + ",\n" +
+            "  \"ple_row_cache_payload_budget_bytes\":" + std::to_string(options.ple_cache_budget_bytes) + ",\n" +
+            "  \"ple_row_cache_setup_reservation_bytes_per_backend\":" + std::to_string(requested_ple_cache_bytes) + ",\n" +
+            "  \"ple_row_cache_qualification\":\"not_assessed\",\n";
     const std::string eager_submission_receipt = options.prepared_eager
         ? "  \"eager_submission_mode\":\"prepared-static-plan-experimental-v1\",\n"
         : std::string{};
@@ -1250,7 +1278,8 @@ int main(
         live.state_layout_identity = strix::build_serial_session_state_layout(model, tuning_state_request).layout_identity;
         live.memory_regime = std::string(options.residency == strix::HipModelResidencyMode::registered_file_mapping ?
             "configured-registered-mapping" : "configured-copy") + ";coalesce:" + std::to_string(options.coalesce_gap_bytes) +
-            ";planned-PLE:" + std::to_string(options.planned_ple_io) + ";PLE-helper-cap:" + std::to_string(options.ple_cpu_helper_threads);
+            ";planned-PLE:" + std::to_string(options.planned_ple_io) + ";PLE-helper-cap:" + std::to_string(options.ple_cpu_helper_threads) +
+            ";PLE-cache-rows:" + std::to_string(options.ple_cache_rows) + ";PLE-cache-bytes:" + std::to_string(options.ple_cache_budget_bytes);
         live.resolved_configuration = "baseline-kernel-plan:" + std::to_string(compiled.kernel_plan_identity) +
             ";baseline-execution:" + std::to_string(compiled.execution_identity) + ";prepared:" + std::to_string(options.prepared_eager) +
             ";overlap:" + std::to_string(options.moe_shared_overlap) + ";GPU-scalar:" + std::to_string(options.gpu_greedy_token);
@@ -1416,6 +1445,7 @@ int main(
         if (model.vocab_size > UINT32_MAX) throw std::invalid_argument("serving GPU selector vocabulary exceeds uint32");
         minimum = checked_add(minimum, strix::HipServingGreedyBackend::output_reservation_bytes(static_cast<std::uint32_t>(model.vocab_size)));
         minimum = checked_add(minimum, sizeof(ServingSessionOwner));
+        minimum = checked_add(minimum, requested_ple_cache_bytes);
         std::optional<strix::HipServingPrefixCachePolicy> prefix_cache_policy;
         std::uint64_t prefix_cache_reservation = 0;
         if (options.serving_cache_entries_explicit) {
@@ -1463,7 +1493,7 @@ int main(
             for (unsigned reserved = 0; reserved < 3; ++reserved) static_cast<void>(generations.next());
             auto owner = std::make_shared<ServingSessionOwner>(mapped_owner, model_owner, original_work_device,
                 model, compiled, manifest, wave_router_admission, tensor_access, state_layout,
-                strix::PlannedPleLookupPolicy{options.ple_max_rows_per_io, options.ple_max_inflight_ios, options.ple_cpu_helper_threads},
+                requested_ple_policy,
                 options.planned_ple_io, epoch, static_cast<std::uint64_t>(i) + 1U,
                 options.host_dispatch_telemetry, options.execution_telemetry_trace);
             strix::SerialGreedyRequest serve_request{prefixes[i], model.vocab_size, options.context_tokens,
@@ -1536,6 +1566,7 @@ int main(
                 << ",\"queue_wait_ns\":" << metrics.queue_wait_ns << ",\"service_ns\":" << metrics.service_ns
                 << ",\"wall_ns\":" << metrics.wall_ns << ",\"chunks\":" << metrics.chunks
                 << ",\"emitted_tokens\":" << metrics.emitted_tokens
+                << (options.ple_cache_rows ? ",\"ple_row_cache\":" + ple_row_cache_json(owners[i]->ple_cache_stats()) : std::string{})
                 << ",\"inter_token_intervals\":" << metrics.inter_token_intervals
                 << ",\"inter_token_ns_total\":" << metrics.inter_token_ns_total
                 << ",\"inter_token_ns_max\":" << metrics.inter_token_ns_max
@@ -1588,17 +1619,16 @@ int main(
     MappedModelIoSource
         mapped_model_io(
             mapped);
-    strix::PlannedPleLookupPolicy
-        planned_ple_policy;
-    planned_ple_policy.max_rows_per_io =
-        options.ple_max_rows_per_io;
-    planned_ple_policy.max_inflight_ios =
-        options.ple_max_inflight_ios;
-    planned_ple_policy.cpu_helper_threads = options.ple_cpu_helper_threads;
+    const auto planned_ple_policy = requested_ple_policy;
+    auto retained_ple_source = options.ple_cache_rows
+        ? std::make_shared<MappedModelIoSource>(mapped_owner) : std::shared_ptr<MappedModelIoSource>{};
     strix::PlannedPleLookupBackend
         planned_ple_lookup(
-            mapped_model_io,
-            planned_ple_policy);
+            retained_ple_source ? *retained_ple_source : mapped_model_io,
+            planned_ple_policy, retained_ple_source);
+    const auto ple_cache_completed_receipt = [&]() -> std::string {
+        return options.ple_cache_rows ? "  \"ple_row_cache\":" + ple_row_cache_json(planned_ple_lookup.cache_stats()) + ",\n" : std::string{};
+    };
     strix::PleLookupBackend* ple_lookup =
         options.planned_ple_io
             ? static_cast<strix::PleLookupBackend*>(
@@ -2187,7 +2217,7 @@ int main(
                 << optimization_profile_receipt << eager_submission_receipt << overlap_receipt() << execution_inventory_receipt << gdn_output_mode_receipt() << wave_router_mode_receipt << deferred_moe_mode_receipt
                 << strix::decode_detail::qsa_input_dispatch_receipt(qsa_prefetch_stats.get())
                 << shared_dispatch_receipt.completed_counts()
-                << qsa_gqa_receipt() << gdn_recurrent_layout_receipt() << qsa_selection_receipt() << gdn_islands_receipt() << strix::decode_detail::deferred_moe_completed_tokens_receipt(deferred_moe.get())
+                << ple_cache_completed_receipt() << qsa_gqa_receipt() << gdn_recurrent_layout_receipt() << qsa_selection_receipt() << gdn_islands_receipt() << strix::decode_detail::deferred_moe_completed_tokens_receipt(deferred_moe.get())
                 << "  \"model_content_identity\": \""
                 << strix::model_content_identity_hex(
                        model_residency.binding().
@@ -2511,10 +2541,17 @@ int main(
         if (lookup_runtime) {
             if (options.prompt_lookup_adaptive) {
                 const auto& adaptive = lookup_runtime->adaptive_stats();
+                const strix::HipPromptLookupAdaptivePolicy adaptive_policy{};
                 const auto previous_precision = std::cout.precision(17);
                 std::cout << "  \"prompt_lookup_adaptive\":{\"enabled\":" << (adaptive.enabled ? "true" : "false")
                     << ",\"scope\":\"completed-host-wall-cycle-including-continuing-bonus-and-publication-not-GPU-time\","
-                    << "\"qualification\":\"not_assessed\",\"selected_depth\":" << adaptive.selected_depth
+                    << "\"qualification\":\"not_assessed\",\"measurement_eligibility\":\"completed-consumed-cycle\","
+                    << "\"totals_scope\":\"entire-request-across-context-resets\","
+                    << "\"bootstrap_samples_per_depth\":" << adaptive_policy.controller.bootstrap_samples_per_depth
+                    << ",\"context_bucket_tokens\":" << adaptive_policy.context_bucket_tokens
+                    << ",\"reexplore_interval\":" << adaptive_policy.controller.reexplore_interval
+                    << ",\"switch_hysteresis_fraction\":" << adaptive_policy.controller.switch_hysteresis_fraction
+                    << ",\"selected_depth\":" << adaptive.selected_depth
                     << ",\"completed_cycles\":" << adaptive.completed_cycles << ",\"censored_cycles\":" << adaptive.censored_cycles
                     << ",\"context_resets\":" << adaptive.context_resets << ",\"depths\":[";
                 for (std::size_t depth = 0; depth < 3U; ++depth) {
@@ -2687,7 +2724,7 @@ int main(
         emit_q4k_a8_counts();
         std::cout << strix::decode_detail::qsa_input_dispatch_receipt(qsa_prefetch_stats.get());
         std::cout << shared_dispatch_receipt.completed_counts();
-        std::cout << qsa_gqa_receipt() << gdn_recurrent_layout_receipt() << qsa_selection_receipt() << gdn_islands_receipt() << strix::decode_detail::deferred_moe_completed_tokens_receipt(deferred_moe.get());
+        std::cout << ple_cache_completed_receipt() << qsa_gqa_receipt() << gdn_recurrent_layout_receipt() << qsa_selection_receipt() << gdn_islands_receipt() << strix::decode_detail::deferred_moe_completed_tokens_receipt(deferred_moe.get());
         std::cout
             << "  \"model_content_identity\": \""
             << strix::model_content_identity_hex(
@@ -3005,7 +3042,7 @@ int main(
     std::cout << overlap_receipt();
     std::cout << strix::decode_detail::qsa_input_dispatch_receipt(qsa_prefetch_stats.get());
     std::cout << shared_dispatch_receipt.completed_counts();
-    std::cout << qsa_gqa_receipt() << gdn_recurrent_layout_receipt() << qsa_selection_receipt() << gdn_islands_receipt() << strix::decode_detail::deferred_moe_completed_tokens_receipt(deferred_moe.get());
+    std::cout << ple_cache_completed_receipt() << qsa_gqa_receipt() << gdn_recurrent_layout_receipt() << qsa_selection_receipt() << gdn_islands_receipt() << strix::decode_detail::deferred_moe_completed_tokens_receipt(deferred_moe.get());
     std::cout
         << "  \"decode_elapsed_ms_total\": "
         << decode_elapsed_ms_total

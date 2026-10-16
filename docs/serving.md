@@ -71,3 +71,16 @@ Receipts report actual pool lookups, hits, restored logical inputs, capture
 attempts, inserts, skips, failures and currently retained entries/bytes. These
 are operation counters, not measured time savings or physical-memory traffic.
 This integration remains source-only until final validation.
+
+## Independent bounded PLE row caches
+
+`--ple-cache-rows N --ple-cache-budget-bytes N` requires both positive explicit
+limits and resolved planned PLE I/O. It reserves payload and private row tags
+once per backend. Serving adds the pure requested amount to each request's
+minimum reservation before factories allocate it. Normal setup records the same
+reservation before construction. Each enabled backend retains an independent
+source object that itself retains the immutable mapped model; there is no cycle
+back to its request owner. Disabled caches preserve the existing borrowed source.
+Counters report actual hits/misses/inserts/evictions/invalidations and retained
+rows/bytes per backend, not measured I/O time savings. This cache is distinct
+from the shared full-state serving prefix pool.
