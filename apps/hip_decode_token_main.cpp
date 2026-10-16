@@ -11,6 +11,10 @@
 #include "strix/hip_gdn_islands.hpp"
 #include "strix/hip_known_prefix_window.hpp"
 #include "strix/hip_known_prompt_backend.hpp"
+#include "strix/hip_prompt_lookup_runtime.hpp"
+#include "strix/hip_serving_greedy_backend.hpp"
+#include "strix/greedy_serving_scheduler.hpp"
+#include "strix/known_prompt_chunks.hpp"
 #include "strix/hip_model_residency.hpp"
 #include "strix/hip_runtime_allocator.hpp"
 #include "strix/hip_session_snapshot_transfer.hpp"
@@ -64,6 +68,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <optional>
@@ -255,8 +260,18 @@ public:
 
     std::uint32_t execute_greedy(std::uint32_t input_token, std::uint64_t position,
                                  std::uint64_t vocab_size) override {
-        if (!greedy_output_)
-            return strix::SerialGreedyStepBackend::execute_greedy(input_token, position, vocab_size);
+        if (!greedy_output_) {
+            auto logits = execute(input_token, position);
+            auto correlation = strix::current_execution_correlation();
+            correlation.position = position; correlation.row = 0; correlation.rows = 1;
+            strix::ExecutionCorrelationScope select_correlation(correlation);
+            strix::ExecutionPhaseScope selection(strix::ExecutionPhase::selection);
+            return strix::select_greedy_token(logits, vocab_size);
+        }
+        auto correlation = strix::current_execution_correlation();
+        correlation.position = position; correlation.execution_identity = compiled_->execution_identity;
+        correlation.row = 0; correlation.rows = 1; correlation.step_id = UINT32_MAX;
+        strix::ExecutionCorrelationScope token_scope(correlation);
         if (vocab_size != vocab_size_ || position != session_->next_position ||
             session_->health != strix::SerialSessionHealth::ready)
             throw std::invalid_argument("scalar greedy request differs from live session");
@@ -274,8 +289,11 @@ public:
             const auto logits = strix::resolve_execution_buffer(compiled_->execution_identity,
                 compiled_->arena, *scratch_, lm_io_->writes[0]);
             if (recording_binding_) recording_binding_();
-            const auto token = greedy_output_->select(logits, static_cast<std::uint32_t>(vocab_size_),
-                position, session_->committed_tokens);
+            const auto token = [&] {
+                strix::ExecutionPhaseScope selection(strix::ExecutionPhase::selection);
+                return greedy_output_->select(logits, static_cast<std::uint32_t>(vocab_size_),
+                    position, session_->committed_tokens);
+            }();
             if (recording_binding_) recording_binding_();
             elapsed_ms_.push_back(std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - start).count());
@@ -297,6 +315,10 @@ public:
     std::vector<float> execute(
         std::uint32_t input_token,
         std::uint64_t position) override {
+        auto correlation = strix::current_execution_correlation();
+        correlation.position = position; correlation.execution_identity = compiled_->execution_identity;
+        correlation.row = 0; correlation.rows = 1; correlation.step_id = UINT32_MAX;
+        strix::ExecutionCorrelationScope token_scope(correlation);
         if (position != session_->next_position) {
             throw std::invalid_argument(
                 "greedy request position does not match serial session");
@@ -351,6 +373,7 @@ public:
         }
 
         if (recording_binding_) recording_binding_();
+        strix::ExecutionPhaseScope delivery(strix::ExecutionPhase::delivery);
         check_raw_copy(
             hipMemcpy(
                 logits.data(),
@@ -408,10 +431,13 @@ class KnownPromptMemory final {
 public:
     KnownPromptMemory(const strix::CompiledKnownPrefixWindow& plan, std::uint64_t arena_generation,
         std::uint64_t status_generation,
-        std::shared_ptr<const void> retained, std::shared_ptr<const strix::HipSetupQuiescenceGuard> guard)
+        std::shared_ptr<const void> retained, std::shared_ptr<const strix::HipSetupQuiescenceGuard> guard,
+        std::uint64_t serial_identity = 0, std::uint64_t serial_status_generation = 0)
         : retained_(std::move(retained)), guard_(std::move(guard)) {
         if (!retained_ || !guard_) throw std::invalid_argument("known prompt requires retained original resources");
         scratch = {plan.window_execution_identity, 0, plan.arena.physical.total_bytes, arena_generation};
+        if ((serial_identity == 0) != (serial_status_generation == 0))
+            throw std::invalid_argument("known memory serial status requires both identity and generation");
         if (!scratch.execution_identity || !scratch.arena_bytes || !arena_generation || !status_generation)
             throw std::invalid_argument("known prompt memory requires current nonempty bindings");
         try {
@@ -422,11 +448,20 @@ public:
                 check_hip(hipMalloc(&status_, 8), "allocate known-prompt completion record");
                 check_hip(hipMemsetAsync(arena_, 0, static_cast<std::size_t>(scratch.arena_bytes), scope.stream), "initialize known-prompt arena");
                 check_hip(hipMemsetAsync(status_, 0, 8, scope.stream), "initialize known-prompt completion record");
+                if (serial_identity) {
+                    check_hip(hipMalloc(&serial_status_, 8), "allocate prompt-lookup serial completion record");
+                    check_hip(hipMemsetAsync(serial_status_, 0, 8, scope.stream), "initialize prompt-lookup serial completion record");
+                }
             });
             // Eager window scope carries only its owned stream and D1 record.
             // Context capacity and vocabulary belong to the retained model/state.
             scope.deferred_moe_status = {plan.window_execution_identity,
                 reinterpret_cast<std::uintptr_t>(status_), 8, status_generation};
+            if (serial_identity) {
+                serial_scope.stream = scope.stream;
+                serial_scope.deferred_moe_status = {serial_identity,
+                    reinterpret_cast<std::uintptr_t>(serial_status_), 8, serial_status_generation};
+            }
         } catch (...) { release(); throw; }
     }
     ~KnownPromptMemory() { release(); }
@@ -434,11 +469,14 @@ public:
     KnownPromptMemory& operator=(const KnownPromptMemory&) = delete;
     strix::ExecutionMemoryBinding scratch;
     strix::HipLaunchContext scope;
+    strix::HipLaunchContext serial_scope;
 private:
     void release() noexcept {
         guard_->recover_or_fail_stop();
         if (arena_ && hipFree(arena_) != hipSuccess) std::_Exit(3);
         arena_ = nullptr;
+        if (serial_status_ && hipFree(serial_status_) != hipSuccess) std::_Exit(3);
+        serial_status_ = nullptr;
         if (status_ && hipFree(status_) != hipSuccess) std::_Exit(3);
         status_ = nullptr;
         if (scope.stream && hipStreamDestroy(scope.stream) != hipSuccess) std::_Exit(3);
@@ -446,8 +484,139 @@ private:
     }
     std::shared_ptr<const void> retained_;
     std::shared_ptr<const strix::HipSetupQuiescenceGuard> guard_;
-    void* arena_ = nullptr; void* status_ = nullptr;
+    void* arena_ = nullptr; void* status_ = nullptr; void* serial_status_ = nullptr;
 };
+
+// CPU construction precedes scheduler reservation; GPU storage is initialized
+// only inside the accepted factory. Immutable model weights are never cloned.
+class ServingSessionOwner final {
+public:
+    ServingSessionOwner(std::shared_ptr<const strix::MappedModelFile> mapped,
+        std::shared_ptr<strix::HipModelResidency> weights,
+        std::shared_ptr<const strix::HipSetupQuiescenceGuard> guard,
+        strix::ModelContract model, strix::CompiledSerialExecution compiled,
+        strix::ModelManifest manifest, std::shared_ptr<const strix::WaveRouterManifestAdmission> admitted_manifest,
+        strix::ExecutionTensorAccessPlan access, strix::SerialSessionStateLayout layout, strix::PlannedPleLookupPolicy ple_policy,
+        bool planned, std::uint64_t epoch, std::uint64_t request_id,
+        bool telemetry, bool trace)
+        : mapped_(std::move(mapped)), weights_(std::move(weights)), guard_(std::move(guard)),
+          compiled_(std::move(compiled)), manifest_(std::move(manifest)), admitted_manifest_(std::move(admitted_manifest)),
+          access_(std::move(access)),
+          layout_(std::move(layout)), generations_(epoch), mapped_io_(*mapped_),
+          planned_lookup_(mapped_io_, ple_policy), hash_(strix::build_ple_hash_contract(model)),
+          planned_(planned), epoch_(epoch), request_id_(request_id), telemetry_(telemetry) {
+        if (!mapped_ || !weights_ || !guard_ || !epoch_) throw std::invalid_argument("serving requires retained model and fresh epoch");
+        counters.enable_trace(trace);
+        session.execution_identity = compiled_.execution_identity;
+        session.state_layout_identity = layout_.layout_identity;
+        session.state.valid = all_persistent_state();
+    }
+    ~ServingSessionOwner() {
+        if (!touched_) return;
+        guard_->recover_or_fail_stop();
+        if (status_ && hipFree(status_) != hipSuccess) std::_Exit(3);
+        if (scope.stream && hipStreamDestroy(scope.stream) != hipSuccess) std::_Exit(3);
+        // memory_ then releases its own state/scratch before allocator_ dies.
+    }
+    void initialize(const std::function<void(const strix::ExecutionMemoryBinding&)>& admit) {
+        if (touched_) throw std::logic_error("serving storage cannot be initialized twice");
+        touched_ = true;
+        guard_->run([&] {
+            memory_ = strix::RuntimeExecutionMemoryOwner::allocate(compiled_, layout_, allocator_, generations_);
+            if (memory_.scratch().allocation_generation != epoch_) throw std::logic_error("serving admission epoch changed");
+            admit(memory_.scratch());
+            strix::initialize_hip_fresh_runtime_memory(memory_.scratch(), memory_.state());
+            check_hip(hipStreamCreateWithFlags(&scope.stream, hipStreamNonBlocking), "create serving stream");
+            check_hip(hipMalloc(&status_, sizeof(strix::DeferredMoeFirstError)), "allocate serving status");
+            check_hip(hipMemsetAsync(status_, 0, sizeof(strix::DeferredMoeFirstError), scope.stream), "initialize serving status");
+        });
+        scope.deferred_moe_status = {compiled_.execution_identity, reinterpret_cast<std::uintptr_t>(status_),
+            sizeof(strix::DeferredMoeFirstError), generations_.next()};
+        resources.scratch = &memory_.scratch();
+        resources.model_manifest = admitted_manifest_ ? &admitted_manifest_->manifest() : &manifest_;
+        resources.model_weights = &weights_->binding(); resources.tensor_access = &access_;
+        resources.session_state_layout = &layout_; resources.session_state_memory = &memory_.state();
+        resources.ple_lookup = planned_ ? static_cast<strix::PleLookupBackend*>(&planned_lookup_) : &mapped_lookup_;
+        resources.ple_hash_contract = &hash_; resources.ple_prefetch = &prefetch_;
+        session.runtime_compatibility_identity = strix::build_runtime_execution_identities(
+            compiled_.execution_identity, compiled_.arena, resources).compatibility_identity;
+    }
+    strix::ExecutionCorrelation correlation(std::uint64_t position) const noexcept {
+        strix::ExecutionCorrelation result;
+        result.request_id = request_id_; result.session_epoch = memory_.valid() ? memory_.state().device_allocation_generation : epoch_;
+        result.execution_identity = compiled_.execution_identity; result.position = position;
+        result.row = 0; result.rows = 1; result.phase = strix::ExecutionPhase::token;
+        return result;
+    }
+    bool telemetry() const noexcept { return telemetry_; }
+    strix::HostDispatchCounters counters;
+    strix::SerialSessionContext session;
+    strix::ExecutionRuntimeResources resources;
+    strix::HipLaunchContext scope;
+private:
+    std::shared_ptr<const strix::MappedModelFile> mapped_;
+    std::shared_ptr<strix::HipModelResidency> weights_;
+    std::shared_ptr<const strix::HipSetupQuiescenceGuard> guard_;
+    strix::CompiledSerialExecution compiled_;
+    strix::ModelManifest manifest_;
+    std::shared_ptr<const strix::WaveRouterManifestAdmission> admitted_manifest_;
+    strix::ExecutionTensorAccessPlan access_;
+    strix::SerialSessionStateLayout layout_;
+    strix::HipRuntimeAllocator allocator_{strix::HipHostAllocationMode::pageable_aligned};
+    strix::AllocationGenerationSource generations_;
+    strix::RuntimeExecutionMemoryOwner memory_;
+    MappedModelIoSource mapped_io_;
+    strix::FileMappedPleLookupBackend mapped_lookup_;
+    strix::PlannedPleLookupBackend planned_lookup_;
+    strix::PleHashContract hash_;
+    strix::PleLookupPrefetchState prefetch_;
+    bool planned_ = false;
+    std::uint64_t epoch_ = 0, request_id_ = 0;
+    bool telemetry_ = false, touched_ = false;
+    void* status_ = nullptr;
+};
+
+class ObservedServingBackend final : public strix::SerialGreedyStepBackend {
+public:
+    ObservedServingBackend(std::unique_ptr<strix::SerialGreedyStepBackend> backend,
+        std::shared_ptr<ServingSessionOwner> owner) : backend_(std::move(backend)), owner_(std::move(owner)) {}
+    std::vector<float> execute(std::uint32_t token, std::uint64_t position) override {
+        strix::ExecutionTelemetryBinding bind(&owner_->counters, owner_->correlation(position));
+        return backend_->execute(token, position);
+    }
+    std::uint32_t execute_greedy(std::uint32_t token, std::uint64_t position, std::uint64_t vocabulary) override {
+        strix::ExecutionTelemetryBinding bind(&owner_->counters, owner_->correlation(position));
+        return backend_->execute_greedy(token, position, vocabulary);
+    }
+    void execute_state(std::uint32_t token, std::uint64_t position) override {
+        auto correlation = owner_->correlation(position); correlation.phase = strix::ExecutionPhase::prefill;
+        strix::ExecutionTelemetryBinding bind(&owner_->counters, correlation);
+        backend_->execute_state(token, position);
+    }
+private:
+    std::unique_ptr<strix::SerialGreedyStepBackend> backend_;
+    std::shared_ptr<ServingSessionOwner> owner_;
+};
+
+std::vector<std::uint32_t> read_serving_prefix(const std::string& path, std::uint64_t capacity, std::uint64_t vocabulary) {
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    const auto end = file.tellg();
+    if (!file || end <= 0) throw std::invalid_argument("serving prefix file is empty or unavailable");
+    const auto bytes = static_cast<std::uint64_t>(end);
+    if (bytes % 4 || bytes / 4 > capacity || bytes / 4 > std::numeric_limits<std::size_t>::max())
+        throw std::invalid_argument("serving prefix must contain bounded little-endian uint32 tokens");
+    std::vector<std::uint32_t> tokens(static_cast<std::size_t>(bytes / 4));
+    file.seekg(0);
+    for (auto& token : tokens) {
+        std::array<unsigned char, 4> raw{};
+        if (!file.read(reinterpret_cast<char*>(raw.data()), 4)) throw std::runtime_error("serving prefix changed while reading");
+        token = static_cast<std::uint32_t>(raw[0]) | (static_cast<std::uint32_t>(raw[1]) << 8U) |
+            (static_cast<std::uint32_t>(raw[2]) << 16U) | (static_cast<std::uint32_t>(raw[3]) << 24U);
+        if (token >= vocabulary) throw std::invalid_argument("serving prefix token is outside vocabulary");
+    }
+    if (file.peek() != std::char_traits<char>::eof()) throw std::runtime_error("serving prefix grew while reading");
+    return tokens;
+}
 
 // Drain inside the transfer call before the caller's snapshot owner can unwind.
 class GuardedHipSnapshotTransfer final : public strix::SessionSnapshotTransferBackend {
@@ -498,14 +667,19 @@ int main(
         std::cout << "Usage: strix-hip-decode-token MODEL.gguf TOKEN_ID ... [options]\n"
             "  --context N --generate N --eos-token ID --residency register|copy\n"
             "  --optimization-profile auto|manual (default auto, qualified checkpoint only)\n"
-            "  --host-dispatch-telemetry (eager host launcher counters on stderr; profiling only)\n"
+            "  --host-dispatch-telemetry (host API/commit counters on stderr; profiling only)\n"
+            "  --execution-telemetry-trace (bounded 256-event correlated trace; profiling only)\n"
             "  --execution-inventory (include selected host launcher and declared variant metadata)\n"
             "  --gpu-greedy-token (experimental eager generation with small GPU selection result)\n"
             "  --batched-moe-activation (experimental eager A8 slot activation batching)\n"
             "  --qsa-gqa-heads-per-block 1|2|4 (experimental eager grouped attention; default1)\n"
             "  --qsa-hierarchical-selection (experimental exact top512, eager D1, context<=131072)\n"
             "  --gdn-recurrent-layout baseline|stride32|stride33|transposed (experimental eager LDS organization)\n"
+            "  --gdn-recurrent-storage key-value|value-key (experimental physical state layout, default key-value)\n"
             "  --known-prefix-window (experimental paired known prompt; complete heads, separate window owner)\n"
+            "  --prompt-lookup [--prompt-lookup-depth 0|1|2] (experimental greedy target verification, default off)\n"
+            "  --serve-prefix-u32le FILE (repeat per request; independent C1 state, shared weights)\n"
+            "  --serve-concurrency 1|2|4 --serve-memory-budget-bytes N --serve-request-budget-bytes N --serve-headroom-bytes N\n"
             "  --gdn-islands (experimental eager D1 GDN launch organization; paired wave8 GDN supported)\n"
             "  --prepared-eager (experimental immutable static submission plan)\n"
             "  --moe-shared-overlap [--moe-overlap-arena-budget-bytes N] (experimental eager D1)\n"
@@ -535,6 +709,19 @@ int main(
         parse_options(
             argc,
             argv);
+
+    // Bind before model residency/setup; retain through destruction of every
+    // subsequently constructed GPU owner. Reporting happens after that cleanup.
+    HostTelemetryReport host_telemetry;
+    host_telemetry.enabled = options.host_dispatch_telemetry;
+    host_telemetry.counters.enable_trace(options.execution_telemetry_trace);
+    strix::ExecutionCorrelation request_correlation;
+    request_correlation.request_id = 1; // one request per decoder process
+    request_correlation.phase = strix::ExecutionPhase::admission;
+    strix::ExecutionTelemetryBinding telemetry_binding(
+        host_telemetry.enabled ? &host_telemetry.counters : nullptr, request_correlation);
+    std::optional<strix::ExecutionPhaseScope> setup_phase;
+    if (host_telemetry.enabled) setup_phase.emplace(strix::ExecutionPhase::admission);
 
     const auto model =
         strix::ModelContract::
@@ -624,9 +811,9 @@ int main(
             info);
     strix::AllocationGenerationSource
         generations;
-    auto mapped_owner = std::make_shared<strix::MappedModelFile>(
+    std::shared_ptr<const strix::MappedModelFile> mapped_owner = std::make_shared<strix::MappedModelFile>(
         strix::MappedModelFile::open_read_only(options.model_path, "model", generations));
-    auto& mapped = *mapped_owner;
+    const auto& mapped = *mapped_owner;
 
 #ifdef STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME
     constexpr bool has_auto_a8_runtime = true;
@@ -642,9 +829,12 @@ int main(
     strix::decode_cli::validate_resolved_q51_slot_parallel_down(options);
     strix::decode_cli::validate_resolved_gdn_islands(options);
     strix::decode_cli::validate_resolved_gdn_recurrent_layout(options);
+    strix::decode_cli::validate_resolved_gdn_recurrent_storage(options);
     strix::decode_cli::validate_resolved_qsa_hierarchical_selection(options);
     strix::decode_cli::validate_resolved_qsa_gqa(options);
     strix::decode_cli::validate_resolved_known_prefix_window(options);
+    strix::decode_cli::validate_resolved_prompt_lookup(options);
+    strix::decode_cli::validate_resolved_serving(options);
     if (options.batched_moe_activation && !options.q4k_a8g32_gate_up)
         throw std::invalid_argument("batched MoE activation requires resolved Q4K A8 gate/up execution");
     if (options.moe_shared_overlap && !options.deferred_moe_status)
@@ -849,6 +1039,7 @@ int main(
     catalog_config.wave8_q8_lm_head = options.wave8_q8_lm_head;
     catalog_config.wave8_q8_gdn_input = options.wave8_q8_gdn_input;
     catalog_config.gdn_recurrent_layout = binding_request.gdn_recurrent_layout = options.gdn_recurrent_layout;
+    catalog_config.gdn_recurrent_storage = binding_request.gdn_recurrent_storage = options.gdn_recurrent_storage;
     catalog_config.wave8_q8_gdn_output = options.wave8_q8_gdn_output;
     catalog_config.wave8_q8_qsa_output = options.wave8_q8_qsa_output;
     binding_request.prefetch_q8_lm_head = options.prefetch_q8_lm_head;
@@ -964,6 +1155,7 @@ int main(
         state_request;
     state_request.context_tokens =
         options.context_tokens;
+    state_request.recurrent_storage = options.gdn_recurrent_storage;
     const auto state_layout =
         strix::build_serial_session_state_layout(
             model,
@@ -983,8 +1175,23 @@ int main(
     residency_policy.promote_file_backed_candidates = graph_mode;
 
     auto model_owner = std::make_shared<strix::HipModelResidency>(
-        strix::HipModelResidency::create(mapped, manifest, generations, residency_policy));
+        strix::HipModelResidency::create(mapped_owner, manifest, generations, residency_policy));
     auto& model_residency = *model_owner;
+    // Keep the actual registration/copy owner and its exact map control block
+    // pinned in the optional inventory; this is virtual backing, not RSS/PFN evidence.
+    std::optional<strix::UmaOwnerInventory> model_owner_inventory;
+    if (options.execution_inventory)
+        model_owner_inventory.emplace(model_residency.owner_inventory(model_owner, mapped_owner));
+    const auto model_owner_inventory_receipt = [&]() -> std::string {
+        if (!model_owner_inventory) return {};
+        const auto& inventory = *model_owner_inventory;
+        const auto& reservation = model_residency.reservation();
+        return "  \"model_backing_inventory_kind\":\"retained-owner-virtual-extents-not-physical-residency\",\n" +
+            std::string("  \"model_backing_inventory_unique_count\":") + std::to_string(inventory.known_backings.size()) + ",\n" +
+            "  \"model_backing_inventory_reservation_upper_bound_bytes\":" + std::to_string(inventory.reservation_upper_bound_bytes) + ",\n" +
+            "  \"model_backing_inventory_retained_reserved_bytes\":" + std::to_string(reservation.retained_reserved_bytes) + ",\n" +
+            "  \"model_backing_inventory_setup_peak_reserved_bytes\":" + std::to_string(reservation.setup_peak_reserved_bytes) + ",\n";
+    }();
     strix::q8_projection_organization::validate_resident_weights(q8_organization_plan, model_residency.binding());
     // Admission of actual device views happens before any token can enqueue work.
     for(const auto& projection:qsa_prefetch_plan.projections) {
@@ -1020,12 +1227,147 @@ int main(
             "reference checkpoint SHA-256 does not match loaded model");
     }
 
+    if (!options.serving_prefix_files.empty()) {
+        // No ordinary single-session arena is allocated on this route.
+        std::vector<std::vector<std::uint32_t>> prefixes;
+        prefixes.reserve(options.serving_prefix_files.size());
+        for (const auto& path : options.serving_prefix_files)
+            prefixes.push_back(read_serving_prefix(path, options.context_tokens, model.vocab_size));
+        const auto checked_add = [](std::uint64_t left, std::uint64_t right) {
+            if (right > UINT64_MAX - left) throw std::overflow_error("serving reservation overflows");
+            return left + right;
+        };
+        auto minimum = checked_add(compiled.arena.total_bytes, compiled.arena.alignment - 1U);
+        minimum = checked_add(minimum, checked_add(state_layout.device_total_bytes, state_layout.device_alignment - 1U));
+        minimum = checked_add(minimum, state_layout.host_total_bytes);
+        minimum = checked_add(minimum, sizeof(strix::DeferredMoeFirstError));
+        if (model.vocab_size > UINT32_MAX) throw std::invalid_argument("serving GPU selector vocabulary exceeds uint32");
+        minimum = checked_add(minimum, strix::HipServingGreedyBackend::output_reservation_bytes(static_cast<std::uint32_t>(model.vocab_size)));
+        minimum = checked_add(minimum, sizeof(ServingSessionOwner));
+        const auto shared_bytes = checked_add(model_residency.reservation().retained_reserved_bytes, options.serving_headroom);
+        if (shared_bytes > options.serving_memory_budget)
+            throw std::invalid_argument("serving model reservation plus headroom exceeds total budget");
+        strix::GreedyServingPolicy policy;
+        policy.concurrency = options.serving_concurrency;
+        policy.max_retained_requests = prefixes.size();
+        policy.reservation_budget_bytes = options.serving_memory_budget;
+        policy.shared_reservation_bytes = shared_bytes;
+        strix::ServingCompatibility compatibility{model_residency.binding().model_content_identity,
+            compiled.kernel_plan_identity, original_work_device->device_index()};
+        strix::GreedyServingScheduler scheduler(policy, compatibility, model_owner);
+        std::vector<std::shared_ptr<ServingSessionOwner>> owners;
+        std::vector<strix::ServingRequestHandle> handles;
+        owners.reserve(prefixes.size()); handles.reserve(prefixes.size());
+        setup_phase.reset();
+        const auto serving_start = std::chrono::steady_clock::now();
+        for (std::size_t i = 0; i < prefixes.size(); ++i) {
+            const auto maximum_emissions = std::min(options.generate_tokens,
+                options.context_tokens - static_cast<std::uint64_t>(prefixes[i].size()) + 1U);
+            if (maximum_emissions > UINT64_MAX / 8 || prefixes[i].size() > UINT64_MAX / 8)
+                throw std::overflow_error("serving token reservation overflows");
+            const auto token_bytes = checked_add(maximum_emissions * 8U, static_cast<std::uint64_t>(prefixes[i].size()) * 8U);
+            if (checked_add(minimum, token_bytes) > options.serving_request_budget)
+                throw std::invalid_argument("serving request budget is below known state/scratch/selector/token payload");
+            // Reserve an exclusive four-generation range: scratch, device state,
+            // host state, D1 record. The factory proves the first actual epoch.
+            const auto epoch = generations.next();
+            for (unsigned reserved = 0; reserved < 3; ++reserved) static_cast<void>(generations.next());
+            auto owner = std::make_shared<ServingSessionOwner>(mapped_owner, model_owner, original_work_device,
+                model, compiled, manifest, wave_router_admission, tensor_access, state_layout,
+                strix::PlannedPleLookupPolicy{options.ple_max_rows_per_io, options.ple_max_inflight_ios},
+                options.planned_ple_io, epoch, static_cast<std::uint64_t>(i) + 1U,
+                options.host_dispatch_telemetry, options.execution_telemetry_trace);
+            strix::SerialGreedyRequest serve_request{prefixes[i], model.vocab_size, options.context_tokens,
+                options.generate_tokens, generation_eos};
+            const auto submission = scheduler.submit(serve_request, compatibility,
+                reinterpret_cast<std::uintptr_t>(&owner->session), epoch, options.serving_request_budget, owner,
+                [&, owner]() -> std::unique_ptr<strix::SerialGreedyStepBackend> {
+                    std::optional<strix::ExecutionTelemetryBinding> observed;
+                    if (owner->telemetry()) observed.emplace(&owner->counters, owner->correlation(0));
+                    owner->initialize([&](const strix::ExecutionMemoryBinding& scratch) {
+                        strix::q8_projection_organization::validate_output_steps(q8_organization_plan,
+                            model, compiled, tensor_access, scratch, model_residency.binding());
+                        strix::hc_projection_prefetch::validate_runtime(hc_next_tile_plan,
+                            model, manifest, compiled, tensor_access, scratch, model_residency.binding());
+                    });
+                    std::unique_ptr<strix::SerialGreedyStepBackend> target = std::make_unique<strix::HipServingGreedyBackend>(
+                        compiled, model, catalog_config, owner->resources, owner->session, owner->scope,
+                        std::static_pointer_cast<const void>(owner), options.prepared_eager);
+                    if (owner->telemetry()) return std::make_unique<ObservedServingBackend>(std::move(target), owner);
+                    return target;
+                });
+            if (submission.admission != strix::ServingAdmission::accepted)
+                throw std::invalid_argument("serving request was rejected by bounded admission");
+            owners.push_back(std::move(owner)); handles.push_back(submission.request);
+        }
+        scheduler.run_until_idle();
+        const auto serving_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - serving_start).count();
+        bool passed = true;
+        std::cout << "{\n" << optimization_profile_receipt << model_owner_inventory_receipt
+            << "  \"serving\":true,\n  \"serving_qualification\":\"not_assessed\",\n"
+            << "  \"serving_execution\":\"independent-C1-sessions-and-owned-streams-not-tensor-batching\",\n"
+            << "  \"gdn_recurrent_storage\":\"" << (options.gdn_recurrent_storage == strix::GdnRecurrentStorage::key_value ? "key-value" : "value-key") << "\",\n"
+            << "  \"serving_concurrency\":" << options.serving_concurrency << ",\n"
+            << "  \"serving_prepared_eager\":" << (options.prepared_eager ? "true" : "false") << ",\n"
+            << "  \"serving_request_budget_bytes\":" << options.serving_request_budget << ",\n"
+            << "  \"serving_shared_and_headroom_reservation_bytes\":" << shared_bytes << ",\n"
+            << "  \"serving_reserved_bytes_with_live_handles\":" << scheduler.reserved_bytes() << ",\n"
+            << "  \"serving_reservation_scope\":\"declared-backing-and-request-budgets-not-physical-RSS-or-fit-proof\",\n"
+            << "  \"serving_admission_to_completion_elapsed_ms\":" << serving_ms << ",\n"
+            << "  \"requests\":[";
+        for (std::size_t i = 0; i < handles.size(); ++i) {
+            const auto state = handles[i].state(); const auto metrics = handles[i].metrics();
+            const auto& result = handles[i].result();
+            passed = passed && state == strix::ServingRequestState::completed;
+            if (i) std::cout << ',';
+            std::cout << "{\"request_id\":" << i + 1U << ",\"state\":" << static_cast<unsigned>(state)
+                << ",\"execution_identity\":" << owners[i]->session.execution_identity
+                << ",\"runtime_compatibility_identity\":" << owners[i]->session.runtime_compatibility_identity
+                << ",\"committed_tokens\":" << owners[i]->session.committed_tokens
+                << ",\"final_position\":" << result.final_position
+                << ",\"steps_executed\":" << result.steps_executed
+                << ",\"stop_reason\":\"" << stop_reason_name(result.stop_reason) << "\""
+                << ",\"queue_wait_ns\":" << metrics.queue_wait_ns << ",\"service_ns\":" << metrics.service_ns
+                << ",\"wall_ns\":" << metrics.wall_ns << ",\"chunks\":" << metrics.chunks
+                << ",\"emitted_tokens\":" << metrics.emitted_tokens
+                << ",\"inter_token_intervals\":" << metrics.inter_token_intervals
+                << ",\"inter_token_ns_total\":" << metrics.inter_token_ns_total
+                << ",\"inter_token_ns_max\":" << metrics.inter_token_ns_max
+                << ",\"time_to_first_token_ns\":";
+            if (metrics.time_to_first_token_ns) std::cout << *metrics.time_to_first_token_ns; else std::cout << "null";
+            std::cout << ",\"inter_token_log2_ns_histogram\":[";
+            for (std::size_t bin = 0; bin < metrics.inter_token_ns_histogram.size(); ++bin) {
+                if (bin) std::cout << ',';
+                std::cout << metrics.inter_token_ns_histogram[bin];
+            }
+            std::cout << "],\"metrics_saturated\":" << (metrics.saturated ? "true" : "false") << ",\"prefix_tokens\":[";
+            for (std::size_t j = 0; j < prefixes[i].size(); ++j) { if (j) std::cout << ','; std::cout << prefixes[i][j]; }
+            std::cout << "],\"generated_tokens\":[";
+            for (std::size_t j = 0; j < result.generated_tokens.size(); ++j) { if (j) std::cout << ','; std::cout << result.generated_tokens[j]; }
+            std::cout << "]}";
+            if (options.host_dispatch_telemetry) {
+                std::cerr << "{\"serving_request_id\":" << i + 1U << ",\"scope\":\"factory-and-worker-calls-before-owner-teardown\",\"telemetry\":";
+                strix::write_host_dispatch_telemetry(std::cerr, owners[i]->counters); std::cerr << "}\n";
+            }
+        }
+        std::cout << "],\n\"all_completed\":" << (passed ? "true" : "false") << "\n}\n";
+        return passed ? 0 : 2;
+    }
+    setup_phase.reset();
+    if (host_telemetry.enabled) setup_phase.emplace(strix::ExecutionPhase::prepare);
     auto allocator_owner = std::make_shared<strix::HipRuntimeAllocator>(
         strix::HipHostAllocationMode::pageable_aligned);
     auto& allocator = *allocator_owner;
     auto memory_owner = std::make_shared<strix::RuntimeExecutionMemoryOwner>(
         strix::RuntimeExecutionMemoryOwner::allocate(compiled, state_layout, allocator, generations));
     auto& memory = *memory_owner;
+    {
+        auto correlation = strix::current_execution_correlation();
+        correlation.execution_identity = compiled.execution_identity;
+        correlation.session_epoch = memory.state().device_allocation_generation;
+        correlation.phase = strix::ExecutionPhase::prepare;
+        strix::set_execution_correlation(correlation);
+    }
     strix::q8_projection_organization::validate_output_steps(
         q8_organization_plan, model, compiled, tensor_access, memory.scratch(), model_residency.binding());
     strix::hc_projection_prefetch::validate_runtime(
@@ -1134,10 +1476,8 @@ int main(
     const auto launch_plan = strix::compile_launch_plan(compiled, launchers);
     const auto execution_inventory_receipt = options.execution_inventory
         ? strix::decode_receipt::execution_inventory_receipt(compiled, launch_plan, kernel_registry) +
-            strix::decode_receipt::hip_runtime_environment_receipt()
+            strix::decode_receipt::hip_runtime_environment_receipt() + model_owner_inventory_receipt
         : std::string{};
-    HostTelemetryReport host_telemetry;
-    host_telemetry.enabled = options.host_dispatch_telemetry;
     strix::DirectLaunchDispatcher direct_dispatcher(launch_plan,
         host_telemetry.enabled ? &host_telemetry.counters : nullptr);
     std::unique_ptr<strix::HipMoeOverlapDispatcher> moe_overlap;
@@ -1207,8 +1547,11 @@ int main(
             compiled, current_resources, prototype, owner);
     }
     const auto gdn_recurrent_layout_receipt = [&]() -> std::string {
-        if (options.gdn_recurrent_layout == strix::HipGdnRecurrentLayout::baseline) return {};
-        return "  \"gdn_recurrent_layout\": \"" +
+        std::string storage;
+        if (options.gdn_recurrent_storage != strix::GdnRecurrentStorage::key_value)
+            storage = "  \"gdn_recurrent_storage\":\"value-key\",\n  \"gdn_recurrent_storage_qualification\":\"not_assessed\",\n";
+        if (options.gdn_recurrent_layout == strix::HipGdnRecurrentLayout::baseline) return storage;
+        return storage + "  \"gdn_recurrent_layout\": \"" +
             std::string(strix::gdn_recurrent_layout_marker(options.gdn_recurrent_layout)) + "\",\n"
             "  \"gdn_recurrent_layout_qualification\": \"not_assessed\",\n";
     };
@@ -1265,6 +1608,13 @@ int main(
     };
     std::uint64_t input_access_epoch = 1;
     const std::function<void(std::uint32_t)> execute_native_token = [&](std::uint32_t token) {
+        auto correlation = strix::current_execution_correlation();
+        correlation.position = session.next_position;
+        correlation.execution_identity = compiled.execution_identity;
+        correlation.row = 0; correlation.rows = 1; correlation.step_id = UINT32_MAX;
+        strix::ExecutionCorrelationScope token_correlation(correlation);
+        strix::ExecutionPhaseScope token_phase(session.next_position < options.tokens.size() || !options.generate_tokens
+            ? strix::ExecutionPhase::prefill : strix::ExecutionPhase::token);
         original_work_device->require_original();
         if (arena_pin) {
             if (input_access_epoch == UINT64_MAX) throw std::overflow_error("integer input epochs exhausted");
@@ -1447,6 +1797,7 @@ int main(
         });
     };
 
+    setup_phase.reset();
     if (options.generate_tokens != 0) {
         if (options.prefix_cache_roundtrip) {
             HipSerialGreedyStepBackend
@@ -1473,7 +1824,21 @@ int main(
             }
 
             GuardedHipSnapshotTransfer snapshot_transfer(raw_require_identity, raw_drain_or_fail);
-            auto prefix_cache =
+            // Admit the retained snapshot budget BEFORE capture allocates it.
+            // This route holds one entry, so no second capture can overlap it.
+            strix::SerialSessionSnapshotRequest snapshot_request;
+            snapshot_request.compiled_execution_identity = session.execution_identity;
+            snapshot_request.runtime_compatibility_identity = session.runtime_compatibility_identity;
+            snapshot_request.next_position = session.next_position;
+            snapshot_request.committed_tokens = session.committed_tokens;
+            snapshot_request.state = session.state;
+            snapshot_request.alignment = 64;
+            const auto snapshot_plan = strix::build_serial_session_snapshot_plan(model, state_layout, snapshot_request);
+            if (snapshot_plan.device_bytes > UINT64_MAX - snapshot_plan.host_bytes)
+                throw std::overflow_error("prefix snapshot retained budget overflows");
+            const auto snapshot_budget = snapshot_plan.device_bytes + snapshot_plan.host_bytes;
+            strix::SerialPrefixCache prefix_pool(1, snapshot_budget);
+            auto captured_prefix =
                 strix::SerialPrefixCacheEntry::capture(
                     model,
                     options.tokens,
@@ -1485,6 +1850,14 @@ int main(
                     snapshot_transfer);
             check_raw_copy(hipDeviceSynchronize(), "hipDeviceSynchronize(prefix capture)", raw_drain_or_fail);
             raw_require_identity();
+            if (prefix_pool.insert(std::move(captured_prefix), experiment_owner) != strix::SerialPrefixCacheAdmission::inserted)
+                throw std::logic_error("prefix snapshot failed bounded-cache admission");
+            auto prefix_handle = prefix_pool.find(options.tokens, session.execution_identity,
+                session.runtime_compatibility_identity, session.state_layout_identity, &session.arithmetic_lineage);
+            if (!prefix_handle) throw std::logic_error("fresh bounded prefix snapshot did not match its source");
+            // The aliasing handle retains snapshot, allocator and original backing
+            // owners until every guarded transfer has completed or drained.
+            const auto& prefix_cache = *prefix_handle;
             if (raw_recording) {
                 raw_recording->capture_prefix_restore_source(prefix_cache.prefix(), session, raw_state_reader);
             }
@@ -1619,6 +1992,9 @@ int main(
                 << "  \"runtime_compatibility_identity\": "
                 << identities.compatibility_identity
                 << ",\n"
+                << "  \"prefix_cache_max_entries\":1,\n"
+                << "  \"prefix_cache_snapshot_byte_budget\":" << snapshot_budget << ",\n"
+                << "  \"prefix_cache_retained_snapshot_bytes\":" << prefix_pool.snapshot_bytes() << ",\n"
                 << "  \"prefix_identity\": "
                 << prefix_cache.prefix().
                        prefix_identity
@@ -1739,7 +2115,18 @@ int main(
         std::shared_ptr<strix::HipKnownPrefixWindow> known_prefix_owner;
         std::unique_ptr<strix::HipKnownPromptBackend> known_prefix_backend;
         std::optional<strix::KnownPromptGreedyResult> known_prefix_result;
-        if (options.known_prefix_window) {
+        std::optional<strix::KnownPromptChunkProgress> known_prefix_progress;
+        std::unique_ptr<strix::HipPromptLookupRuntime> lookup_runtime;
+        struct LookupStats {
+            std::uint64_t cycles = 0, proposed = 0, accepted = 0, discarded = 0, replayed = 0;
+            std::uint64_t snapshots = 0, restores = 0, consumed_bonuses = 0;
+            bool saturated = false;
+            void add(std::uint64_t& counter, std::uint64_t value) noexcept {
+                if (value > UINT64_MAX - counter) { counter = UINT64_MAX; saturated = true; }
+                else counter += value;
+            }
+        } lookup_stats;
+        if (options.known_prefix_window || options.prompt_lookup) {
             known_prefix_plan = strix::compile_known_prefix_window(model, compiled, manifest, tensor_access, {true, true, true});
             if (!known_prefix_plan->r2_steps) throw std::invalid_argument("known prompt has no admitted paired operators");
             if (model.vocab_size > std::numeric_limits<std::uint32_t>::max())
@@ -1748,12 +2135,20 @@ int main(
             const auto status_generation = generations.next();
             known_prefix_memory = std::make_shared<KnownPromptMemory>(*known_prefix_plan, arena_generation,
                 status_generation,
-                std::static_pointer_cast<const void>(experiment_owner), original_work_device);
+                std::static_pointer_cast<const void>(experiment_owner), original_work_device,
+                options.prompt_lookup ? compiled.execution_identity : 0,
+                options.prompt_lookup ? generations.next() : 0);
             known_prefix_owner = std::make_shared<strix::HipKnownPrefixWindow>(*known_prefix_plan, compiled, model,
                 catalog_config, resources, known_prefix_memory->scratch, known_prefix_memory->scope,
                 std::static_pointer_cast<const void>(known_prefix_memory));
-            known_prefix_backend = std::make_unique<strix::HipKnownPromptBackend>(known_prefix_owner, session,
-                known_prefix_memory->scratch, model.vocab_size, original_work_device);
+            if (options.known_prefix_window)
+                known_prefix_backend = std::make_unique<strix::HipKnownPromptBackend>(known_prefix_owner, session,
+                    known_prefix_memory->scratch, model.vocab_size, original_work_device);
+            if (options.prompt_lookup)
+                lookup_runtime = std::make_unique<strix::HipPromptLookupRuntime>(compiled, model, catalog_config,
+                    resources, *known_prefix_plan, known_prefix_owner, known_prefix_memory->scratch,
+                    known_prefix_memory->serial_scope, known_prefix_memory->scope,
+                    std::static_pointer_cast<const void>(known_prefix_memory), original_work_device, allocator, generations);
         }
 
         const bool generation_request_timing_enabled =
@@ -1762,15 +2157,84 @@ int main(
             ? std::chrono::steady_clock::now()
             : std::chrono::steady_clock::time_point{};
         const auto result = [&]() -> strix::SerialGreedyRequestResult {
+            if (lookup_runtime) {
+                // Keep ordinary inclusive-EOS / unconsumed-last-token semantics.
+                // Only the existing speculation planner chooses target/accepted
+                // tokens; this loop owns the user output budget, not a new verifier.
+                if (request.prefix_tokens.empty() || session.next_position != 0 ||
+                    request.prefix_tokens.size() > request.context_capacity ||
+                    request.prefix_tokens.size() > compiled.max_position_embeddings)
+                    throw std::invalid_argument("prompt lookup requires a fresh, in-capacity known prefix");
+                const auto committed_before_lookup = session.committed_tokens;
+                try {
+                for (const auto token : request.prefix_tokens) execute_native_token(token);
+                lookup_runtime->prime_from_serial_logits(session);
+                strix::PromptLookupDraftBackend lookup({3, 4096}, request.prefix_tokens);
+                auto draft = lookup.make_state(session);
+                const std::array<std::uint32_t, 1> eos{request.eos_token_id};
+                strix::SerialGreedyRequestResult generated;
+                while (generated.generated_tokens.size() < request.max_new_tokens) {
+                    strix::GreedyDraftExecutionRequest cycle_request;
+                    cycle_request.max_candidate_depth = options.prompt_lookup_depth;
+                    cycle_request.token_budget = static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                        request.max_new_tokens - generated.generated_tokens.size(), UINT32_MAX));
+                    cycle_request.eos_tokens = eos;
+                    const auto cycle = lookup_runtime->cycle(session, lookup, draft, cycle_request);
+                    const auto& plan = cycle.target_cycle.plan;
+                    if (plan.emitted_tokens.empty() || plan.emitted_tokens.size() > cycle_request.token_budget ||
+                        !lookup_runtime->pending_bonus() || *lookup_runtime->pending_bonus() != plan.emitted_tokens.back())
+                        throw std::logic_error("prompt lookup returned inconsistent pending output");
+                    lookup_stats.add(lookup_stats.cycles, 1);
+                    lookup_stats.add(lookup_stats.proposed, cycle.proposed_tokens.size());
+                    lookup_stats.add(lookup_stats.accepted, plan.verification.accepted_matches);
+                    lookup_stats.add(lookup_stats.discarded, plan.verification.candidate_states_to_crop);
+                    lookup_stats.add(lookup_stats.replayed, cycle.target_cycle.replayed_tokens);
+                    lookup_stats.add(lookup_stats.snapshots, cycle.target_cycle.snapshot_captured ? 1U : 0U);
+                    lookup_stats.add(lookup_stats.restores, cycle.target_cycle.restored_pre_window ? 1U : 0U);
+                    generated.generated_tokens.insert(generated.generated_tokens.end(), plan.emitted_tokens.begin(), plan.emitted_tokens.end());
+                    generated.final_position = session.next_position;
+                    generated.steps_executed = session.committed_tokens; // final logical input history, not transient verify work
+                    if (plan.verification.stopped_on_eos) {
+                        generated.stop_reason = strix::SerialRequestStopReason::eos;
+                        break;
+                    }
+                    if (session.next_position >= request.context_capacity) {
+                        generated.stop_reason = strix::SerialRequestStopReason::context_capacity;
+                        break;
+                    }
+                    if (generated.generated_tokens.size() >= request.max_new_tokens) break;
+                    // Never consume the final emitted bonus on EOS, output-budget
+                    // exhaustion or context exhaustion. History already contains it.
+                    lookup_runtime->consume_pending_bonus(session, lookup, draft);
+                    lookup_stats.add(lookup_stats.consumed_bonuses, 1);
+                }
+                return generated;
+                } catch (...) {
+                    if (session.committed_tokens != committed_before_lookup) {
+                        session.health = strix::SerialSessionHealth::poisoned;
+                        session.arithmetic_lineage.tainted = true;
+                    }
+                    original_work_device->recover_or_fail_stop();
+                    throw;
+                }
+            }
             if (!known_prefix_backend) return options.gpu_greedy_token
                 ? strix::execute_serial_greedy_token_request(request, backend)
                 : strix::execute_serial_greedy_request(request, backend);
-            strix::KnownPromptGreedyRequest paired;
+            strix::KnownPromptChunkRequest paired;
             paired.prompt_tokens = options.tokens;
             paired.start_position = session.next_position;
             paired.vocab_size = request.vocab_size; paired.context_capacity = request.context_capacity;
             paired.max_new_tokens = request.max_new_tokens; paired.eos_token_id = request.eos_token_id;
-            known_prefix_result = strix::execute_known_prompt_greedy_request(paired, *known_prefix_backend, backend);
+            strix::KnownPromptChunkCursor chunks(paired, *known_prefix_backend, backend);
+            while (chunks.advance()) { /* one complete causal R2 pair or final R1 tail */ }
+            const auto& generated = chunks.finish_greedy();
+            known_prefix_progress = chunks.progress();
+            known_prefix_result.emplace();
+            known_prefix_result->consumed_prompt_tokens = known_prefix_progress->consumed_prompt_tokens;
+            known_prefix_result->windows_executed = known_prefix_progress->windows_executed;
+            known_prefix_result->serial_prompt_steps = known_prefix_progress->serial_tail_steps;
+            known_prefix_result->generation = generated;
             if (!known_prefix_result->generation) throw std::logic_error("known prompt unexpectedly stopped before generation");
             auto total = *known_prefix_result->generation;
             if (known_prefix_result->consumed_prompt_tokens > std::numeric_limits<std::uint64_t>::max() - total.steps_executed)
@@ -1808,6 +2272,26 @@ int main(
                 });
         }
         std::cout << "{\n" << optimization_profile_receipt << eager_submission_receipt << overlap_receipt() << execution_inventory_receipt << gdn_output_mode_receipt() << wave_router_mode_receipt << deferred_moe_mode_receipt;
+        if (lookup_runtime) {
+            std::cout << "  \"prompt_lookup\":true,\n"
+                << "  \"prompt_lookup_qualification\":\"not_assessed\",\n"
+                << "  \"prompt_lookup_max_depth\":" << options.prompt_lookup_depth << ",\n"
+                << "  \"prompt_lookup_ngram_size\":3,\n"
+                << "  \"prompt_lookup_history_capacity_tokens\":4096,\n"
+                << "  \"prompt_lookup_cycles\":" << lookup_stats.cycles << ",\n"
+                << "  \"prompt_lookup_proposed_tokens\":" << lookup_stats.proposed << ",\n"
+                << "  \"prompt_lookup_accepted_candidates\":" << lookup_stats.accepted << ",\n"
+                << "  \"prompt_lookup_discarded_candidate_states\":" << lookup_stats.discarded << ",\n"
+                << "  \"prompt_lookup_replayed_tokens\":" << lookup_stats.replayed << ",\n"
+                << "  \"prompt_lookup_snapshots\":" << lookup_stats.snapshots << ",\n"
+                << "  \"prompt_lookup_restores\":" << lookup_stats.restores << ",\n"
+                << "  \"prompt_lookup_consumed_bonuses\":" << lookup_stats.consumed_bonuses << ",\n"
+                << "  \"prompt_lookup_stats_saturated\":" << (lookup_stats.saturated ? "true" : "false") << ",\n"
+                << "  \"prompt_lookup_final_bonus_pending\":" << (lookup_runtime->pending_bonus() ? "true" : "false") << ",\n"
+                << "  \"prompt_lookup_full_logits_d2h_bytes\":0,\n"
+                << "  \"prompt_lookup_serial_status_execution_identity\":" << known_prefix_memory->serial_scope.deferred_moe_status.execution_identity << ",\n"
+                << "  \"prompt_lookup_window_status_execution_identity\":" << known_prefix_memory->scope.deferred_moe_status.execution_identity << ",\n";
+        }
         if (known_prefix_result) {
             const auto observed = known_prefix_backend->stats();
             std::array<std::uint64_t, strix::known_window_r2_variant_slots> compiled_variants{};
@@ -1816,6 +2300,9 @@ int main(
                 if (index >= compiled_variants.size()) throw std::logic_error("unknown prompt variant in source receipt");
                 if (index) ++compiled_variants[index];
             }
+            std::cout << "  \"known_prefix_chunk_cursor\":true,\n"
+                      << "  \"known_prefix_generation_input_tokens_consumed\":" << known_prefix_progress->consumed_generation_tokens << ",\n"
+                      << "  \"known_prefix_final_bonus_pending\":" << (known_prefix_progress->bonus_pending ? "true" : "false") << ",\n";
             std::cout << "  \"known_prefix_completed_windows\":" << observed.windows << ",\n"
                 << "  \"known_prefix_stats_saturated\":" << (observed.saturated ? "true" : "false") << ",\n"
                 << "  \"known_prefix_r2_dispatches\":" << observed.r2_dispatches << ",\n"
@@ -1936,6 +2423,8 @@ int main(
             << "  \"final_position\": "
             << result.final_position
             << ",\n"
+            << (lookup_runtime ? "  \"prompt_lookup_timing_scope\":\"generation_request_elapsed_ms_only\"\n" : "");
+        if (!lookup_runtime) std::cout
             << (known_prefix_backend ? "  \"known_prefix_serial_tail_and_generation_elapsed_ms_total\": " :
                 greedy_output ? "  \"generation_step_elapsed_ms_total\": " : "  \"decode_elapsed_ms_total\": ")
             << elapsed_total
@@ -1947,8 +2436,8 @@ int main(
                     : elapsed_total /
                           static_cast<double>(
                               backend.elapsed_ms().size()))
-            << "\n"
-            << "}\n";
+            << "\n";
+        std::cout << "}\n";
         return 0;
     }
 

@@ -468,12 +468,24 @@ void DirectLaunchDispatcher::dispatch_runtime_step(
 }
 
 void DirectLaunchDispatcher::dispatch(const ExecutionDispatchContext& context, bool runtime_step) {
-    if (!telemetry_) {
+    auto* observer = telemetry_ ? telemetry_ : current_execution_telemetry();
+    if (!observer) {
         const auto& launcher = launcher_for(context, runtime_step);
         launcher.function(context, launcher.user_data);
         return;
     }
+    auto correlation = current_execution_correlation();
+    correlation.execution_identity = context.execution_identity;
+    correlation.position = context.position;
+    correlation.step_id = context.step_id;
+    correlation.op = context.op;
+    correlation.layer = context.layer.value_or(UINT32_MAX);
+    correlation.rows = context.logical_rows;
+    correlation.phase = ExecutionPhase::operator_step;
+    if (context.logical_rows == 1 && correlation.row == UINT32_MAX) correlation.row = 0;
+    ExecutionCorrelationScope activity_scope(correlation);
     HostDispatchObservation event;
+    event.correlation = correlation;
     event.execution_identity = context.execution_identity;
     event.position = context.position;
     event.step_id = context.step_id;
@@ -487,7 +499,7 @@ void DirectLaunchDispatcher::dispatch(const ExecutionDispatchContext& context, b
         event.host_elapsed_ns = static_cast<std::uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now() - start).count());
-        telemetry_->observe(event);
+        observe_host_dispatch(*observer, event);
     };
     try {
         const auto& launcher = launcher_for(context, runtime_step);

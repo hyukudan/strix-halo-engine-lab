@@ -2,6 +2,7 @@
 
 #include "strix/execution_plan.hpp"
 #include "strix/gdn_recurrent_layout.hpp"
+#include "strix/gdn_recurrent_storage.hpp"
 #include "strix/kernel_registry.hpp"
 #include "strix/model_contract.hpp"
 
@@ -45,6 +46,7 @@ struct ExecutionBindingRequest {
     std::uint32_t qsa_gqa_heads_per_block = 1;
     // Borrowed only during compilation; no tuning search runs in the token loop.
     const kernels::OfflineTuningPlan* offline_tuning = nullptr;
+    GdnRecurrentStorage gdn_recurrent_storage = GdnRecurrentStorage::key_value;
 };
 
 struct ExecutionKernelBinding {

@@ -97,6 +97,105 @@ int main() try {
     require(saturated.saturated() && saturated.totals().host_elapsed_ns ==
             std::numeric_limits<std::uint64_t>::max(), "counter overflow is explicit and contained");
 
+    // Source fixtures: these are not a runtime/driver observation or a test run.
+    HostDispatchCounters activity;
+    activity.enable_trace(true);
+    ExecutionCorrelation correlation;
+    correlation.request_id = 17; correlation.session_epoch = 29;
+    correlation.position = 41; correlation.row = 1; correlation.rows = 1;
+    correlation.step_id = 53; correlation.layer = 7; correlation.op = SerialOp::lm_head;
+    {
+        ExecutionTelemetryBinding binding(&activity, correlation);
+        observe_execution_activity(ExecutionActivityKind::copy_async, 64, 1, true, 3,
+            CopyDirection::host_to_device, 11);
+        observe_execution_activity(ExecutionActivityKind::copy_sync, 128, 1, false, 5,
+            CopyDirection::device_to_host, 12, -1);
+        observe_execution_activity(ExecutionActivityKind::device_alloc, 256);
+        observe_execution_activity(ExecutionActivityKind::device_free);
+        observe_execution_activity(ExecutionActivityKind::proposed_state_write);
+        require(activity.activities()[static_cast<std::size_t>(ExecutionActivityKind::token_commit)].units == 0,
+            "proposed persistent generations do not commit a token");
+        observe_execution_activity(ExecutionActivityKind::token_commit, 0, 2);
+        execution_telemetry_capture_change(true);
+        observe_execution_activity(ExecutionActivityKind::copy_async, 8, 1, true, 7,
+            CopyDirection::host_to_device, 11);
+        observe_execution_activity(ExecutionActivityKind::graph_capture_end);
+        execution_telemetry_capture_change(false);
+        auto inner = current_execution_correlation(); inner.row = 0; inner.position = 42;
+        {
+            ExecutionCorrelationScope nested(inner);
+            for (unsigned repeat = 0; repeat < 3; ++repeat) {
+                execution_telemetry_replay_attempted();
+                observe_execution_activity(ExecutionActivityKind::graph_replay);
+            }
+        }
+        require(current_execution_correlation().row == 1 && current_execution_correlation().position == 41 &&
+            current_execution_correlation().graph_replay == 3, "scope restores row but retains global replay ordinal");
+        {
+            ExecutionTelemetryBinding disabled(nullptr);
+            observe_execution_activity(ExecutionActivityKind::token_commit, 0, 99);
+            require(current_execution_telemetry() == nullptr, "nested null binding disables observation");
+        }
+        require(current_execution_telemetry() == &activity, "nested binding restores owner");
+        auto event = ExecutionActivity{};
+        event.kind = static_cast<ExecutionActivityKind>(UINT32_MAX);
+        activity.observe_activity(event); // Invalid kind cannot index storage or produce a trace entry.
+    }
+    require(current_execution_telemetry() == nullptr && !execution_telemetry_during_capture(),
+        "binding lifetime restores outer observer/capture state");
+    const auto& h2d = activity.copy_directions()[static_cast<std::size_t>(CopyDirection::host_to_device)];
+    const auto& d2h = activity.copy_directions()[static_cast<std::size_t>(CopyDirection::device_to_host)];
+    require(h2d.calls == 2 && h2d.accepted_bytes == 72 && h2d.requested_bytes == 72 &&
+        d2h.failed == 1 && d2h.requested_bytes == 128 && !d2h.accepted_bytes,
+        "failed copies retain requested bytes but never count accepted logical bytes");
+    require(activity.captured_activities()[static_cast<std::size_t>(ExecutionActivityKind::copy_async)].calls == 1 &&
+        activity.activities()[static_cast<std::size_t>(ExecutionActivityKind::graph_replay)].succeeded == 3 &&
+        activity.activities()[static_cast<std::size_t>(ExecutionActivityKind::graph_capture_end)].succeeded == 1,
+        "capture host calls, a completed capture API and N replay APIs remain separate");
+    require(activity.trace()[1].correlation.request_id == 17 && activity.trace()[1].correlation.session_epoch == 29 &&
+        activity.trace()[1].correlation.step_id == 53 && activity.trace()[1].correlation.layer == 7 &&
+        activity.trace()[1].stream == 11, "trace contains actual supplied request/epoch/operator/row/stream correlation");
+    std::ostringstream activity_json;
+    write_host_dispatch_telemetry(activity_json, activity);
+    require(activity_json.str().find("\"token_commits\":2") != std::string::npos &&
+        activity_json.str().find("\"gpu_submits\":null") != std::string::npos &&
+        activity_json.str().find("\"graph_replays\":3") != std::string::npos,
+        "publication/capture/replay events do not manufacture kernel submits or completions");
+    HostDispatchCounters bounded;
+    bounded.enable_trace(true);
+    {
+        ExecutionTelemetryBinding binding(&bounded);
+        for (unsigned i = 0; i < 300; ++i) observe_execution_activity(ExecutionActivityKind::stream_sync);
+    }
+    require(bounded.trace().size() == 256 && bounded.trace_dropped() == 45 &&
+        bounded.activities()[static_cast<std::size_t>(ExecutionActivityKind::stream_sync)].calls == 300,
+        "fixed trace truncation preserves complete aggregate counters");
+    struct ReentrantObserver final : ExecutionTelemetry {
+        unsigned calls = 0;
+        void observe(const HostDispatchObservation&) noexcept override {}
+        void observe_activity(const ExecutionActivity&) noexcept override {
+            ++calls;
+            observe_execution_activity(ExecutionActivityKind::device_alloc, 99);
+        }
+    } reentrant;
+    {
+        ExecutionTelemetryBinding binding(&reentrant);
+        observe_execution_activity(ExecutionActivityKind::device_free);
+    }
+    require(reentrant.calls == 2, "observer callback recursion is suppressed, including instrumented HIP calls");
+    ExecutionActivity huge;
+    huge.kind = ExecutionActivityKind::copy_sync; huge.requested_bytes = UINT64_MAX;
+    bounded.observe_activity(huge); bounded.observe_activity(huge);
+    require(bounded.saturated() && bounded.activities()[static_cast<std::size_t>(ExecutionActivityKind::copy_sync)].accepted_bytes == UINT64_MAX,
+        "logical byte counters saturate instead of wrapping into the execution path");
+    {
+        ExecutionTelemetryBinding binding(&activity, correlation);
+        try { ExecutionPhaseScope phase(ExecutionPhase::selection); throw std::runtime_error("original"); }
+        catch (const std::runtime_error&) {}
+    }
+    require(activity.phases()[static_cast<std::size_t>(ExecutionPhase::selection)].failed == 1,
+        "semantic host phase exceptions are observed without altering propagation");
+
     const std::array<GpuTraceInterval, 5> overlap{{
         {30, 35, 2, 9}, {0, 10, 1, 9}, {5, 20, 2, 9}, {8, 12, 3, 9}, {20, 20, 3, 9}}};
     const auto time = summarize_gpu_trace(overlap);

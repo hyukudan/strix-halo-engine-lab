@@ -62,6 +62,7 @@ struct HipLauncherCatalogConfig {
     std::uint32_t qsa_gqa_heads_per_block = 1;
     std::shared_ptr<QsaHierarchicalSelectionStats> qsa_selection_stats;
     std::shared_ptr<QsaHierarchicalSelectionStats> qsa_gqa_stats;
+    GdnRecurrentStorage gdn_recurrent_storage = GdnRecurrentStorage::key_value;
 };
 
 void register_complete_hip_kernel_catalog(

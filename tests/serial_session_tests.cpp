@@ -1,4 +1,5 @@
 #include "strix/serial_session.hpp"
+#include "strix/execution_telemetry.hpp"
 
 #include <set>
 #include <string>
@@ -160,6 +161,14 @@ struct SessionDispatcher final
 }  // namespace
 
 int main() {
+    strix::HostDispatchCounters publication_telemetry;
+    publication_telemetry.enable_trace(true);
+    strix::ExecutionCorrelation correlation;
+    correlation.request_id = 11; correlation.session_epoch = 3;
+    strix::ExecutionTelemetryBinding observation(&publication_telemetry, correlation);
+    const auto observed_commits = [&] {
+        return publication_telemetry.activities()[static_cast<std::size_t>(strix::ExecutionActivityKind::token_commit)].units;
+    };
     const auto model =
         strix::ModelContract::qwen38_flash_next();
 
@@ -234,6 +243,7 @@ int main() {
     expect(session.next_position == 1 &&
                session.committed_tokens == 1,
            "successful serial token commits position and token count");
+    expect(observed_commits() == 1, "telemetry observes actual first session publication once");
     expect(strix::arithmetic_lineage_serial_only(session.arithmetic_lineage,
                compiled.execution_identity, 1),
            "real serial producer publishes its one-row arithmetic lineage after state completion");
@@ -253,6 +263,7 @@ int main() {
     expect(session.next_position == 2 &&
                session.committed_tokens == 2,
            "second serial token advances from committed session state");
+    expect(observed_commits() == 2, "telemetry observes actual second session publication once");
     expect(strix::arithmetic_lineage_valid(session.arithmetic_lineage, 2) &&
                session.arithmetic_lineage.intervals.size() == 1 &&
                session.arithmetic_lineage.intervals[0].reduction_plan_identity == compiled.kernel_plan_identity,
@@ -280,6 +291,7 @@ int main() {
     }
     expect(failure_observed,
            "injected serial kernel failure propagates");
+    expect(observed_commits() == 2, "failed partial execution cannot create a telemetry commit");
     expect(session.next_position ==
                before_failure.next_position &&
                session.committed_tokens ==

@@ -43,44 +43,70 @@ qualification are explicitly catalog declarations; native qualification remains
 null. The selected decode geometry does not admit verify or prefill geometries.
 Without this option the larger inventory is neither constructed nor emitted.
 
-## Optional eager host dispatcher telemetry
+## Optional host instrumentation
 
-The decoder accepts `--host-dispatch-telemetry`. One JSON summary is written to
-stderr when the dispatcher owner leaves scope, including failure unwinding.
-Stdout keeps its existing decoder receipt. The option preserves automatic
-profile selection and is rejected with graph execution: graph capture host calls
-do not represent replay execution.
+`--host-dispatch-telemetry` binds one serialized thread-local observer before
+model setup and retains it through GPU-owner teardown. Its schema-2 JSON goes
+to stderr, including exception unwinding. It does not change profile selection.
+`--execution-telemetry-trace` additionally retains the first 256 correlated events;
+it requires the counter option and reports dropped events explicitly. Both
+options are for diagnostic runs, and must be absent from speed measurements.
 
-The observer measures steady-clock time around actual compiled host launcher
-lookup, validation and invocation. Counts distinguish successful returns,
-rejections before invocation, and exceptions after invocation. Events expose
-execution identity, position, step, operator, layer and logical shape to a
-caller-supplied observer; the built-in summary aggregates by operator. Observers
-are non-owning, noexcept and serialized with their dispatcher, and must outlive
-every dispatch call. The built-in counters use fixed storage and report overflow
-by saturation. With no observer there are no timestamp reads or observer calls.
+Fixed counters distinguish host launcher return/rejection/failure, actual HIP
+copy/memset calls, allocation/free/registration calls, stream/event waits,
+synchronization calls, capture, instantiate and replay API results. Successful
+copy bytes are *accepted logical request bytes*, including queued async work,
+not physical transfers or proof of completion. Failed calls retain their
+requested byte count and original error code. Allocator bookkeeping and actual
+freed byte counts remain unknown; no pointer-to-allocation shadow map is added.
 
-A successful return is not proof of a GPU submit, completion, CPU visibility or
-token commit. A failed launcher may have partially enqueued work. Those GPU and
-publication counts, graph counts, HIP copy bytes, allocations and synchronization
-counts remain null. The hook does not change error handling or memory ownership.
-It is not a GPU duration, complete token wall time or profiler replacement.
-Keep the option off during speed measurements; instrumentation overhead has not
-yet been measured on the target hardware.
+Session-publication hooks run only after successful serial/prepared/window
+commit. Proposed state generations remain a separate event and are never
+promoted into token commits. Graph capture host calls and replay API calls have
+separate counters. A trace `during_capture` labels the host-thread capture
+interval, not the membership or execution count of graph nodes. Replay ordinals
+identify API attempts; successful/failed replay counts remain distinct. GPU
+kernel submissions/completions and physical transfer bytes stay null. A returned
+launcher or synchronization alone does not invent such a count.
+
+Correlation records request, execution, position, layer, operator, row and step.
+The decoder's one-request process uses request id 1; `session_epoch` is explicitly
+the state device-allocation generation, not an inferred semantic reset counter.
+Joint R2 operations use an unknown individual-row sentinel and rows=2; R1 loops
+retain their actual row index. Host steady-clock phase intervals cover admission,
+prepare, prefill/token, selection and full-logit delivery; operator durations are
+actual host launcher intervals. Nested phases overlap and must not be summed as
+a disjoint request wall time. No GPU duration is derived from these clocks.
+
+The HIP redirects are force-included only into runtime and decoder compilation.
+The full SDK is parsed before the function-like redirects, and wrapper bodies
+call the original API before macro definitions, avoiding recursive interception.
+Function-pointer calls, other host threads and external-library/driver internals
+are outside this coverage. With no observer the wrappers directly call HIP,
+without timestamp reads, observer allocation, locks or additional HIP queries.
+The observer owns only fixed arrays and saturating integers. This source change
+has not been compiled or executed; target overhead remains unmeasured.
 
 `summarize_gpu_trace` separately aggregates supplied profiler intervals in one
-clock domain. It reports their sum and busy union across all queues, checking
-invalid ranges, mixed clocks and overflow. It never subtracts GPU sums from a
-host-clock duration. It does not infer dependencies or a DAG critical path.
+clock domain. It reports sum and busy union across all queues, rejecting invalid
+ranges, mixed clocks and overflow. It neither subtracts a GPU sum from host wall
+time nor infers dependencies or a DAG critical path. Hardware profiler/page-fault
+capabilities are not discovered by these hooks and remain unobserved.
 
-## Remaining integration
+## Retained backing and bounded prefix snapshots
 
-This increment exports the selected decode plan, not a complete cross-phase
-capability catalog. It does not instrument every HIP allocation/copy/synchronization, trace request/session
-epochs and graph replays, or measure prepare, selection, commit and delivery.
-Those are remaining inventory/telemetry work, not implied by these interfaces.
-Target HIP compilation, native execution and complete-workload measurements
-remain separate gates from portable tests.
+With execution inventory enabled, main consumes `HipModelResidency`'s actual
+strong mapping/registration/copy owner inventory. Registered aliases reuse their
+backing identity; copied allocations have distinct identities. The reported
+reservation/peak values are declared virtual retained extents, not RSS/PFN or
+physical-page measurements. No model bytes are duplicated for this inventory.
+
+The explicit prefix-roundtrip path now stores its snapshot in a one-entry
+`SerialPrefixCache`. Its retained byte budget is computed from the exact snapshot
+plan before allocation; the capture candidate peak is outside the retained-cache
+budget, and only this one capture is live. The aliasing lookup handle pins both
+snapshot and actual experiment/allocator owners through completion or guarded
+failure drain. Default decoding creates neither the pool nor a snapshot.
 
 ## Requested HIP process settings
 

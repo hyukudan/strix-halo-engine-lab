@@ -62,3 +62,37 @@ paired work. Actual successful-window telemetry uses saturating counters and
 reports saturation without affecting computation. Source receipts remain
 `not_assessed`; compiler/native, full-model, cache/prompt and timing qualification
 for the complete source batch are pending. No speedup is claimed here.
+
+
+## Explicit prompt-lookup request route
+
+`--prompt-lookup --prompt-lookup-depth 0|1|2` is a separate experimental greedy
+route, default off. It requires the same paired-wave8 GDN and D1 configuration
+as the known-prefix owner. It rejects graph, integer heads, prepared/overlap,
+islands, prefix roundtrip, RAW/reference output, alternate recurrent layouts and
+candidate QSA modes rather than changing any requested flags. It is distinct
+from `--known-prefix-window` and `--gpu-greedy-token`.
+
+The prompt is consumed through the existing complete serial target. The terminal
+head is selected on device; each cycle then uses the existing prompt-lookup
+proposal and speculation transaction, with real R2 verification at depth two,
+explicit serial verification at one, and frontier-only selection at zero.
+Three persistent firstmax/finite selectors avoid full-vocabulary D2H. The serial
+and R2 completion records have different execution identities on one retained
+stream, initialized once; neither is retagged or cleared to hide an error.
+Original state owners are reused; serial shadow completion is not applied to a
+window transaction.
+
+Accepted candidate inputs advance target state. Each cycle retains one emitted
+bonus that has not been consumed. Only continuation consumes that bonus, without
+appending it to draft history again. EOS, output budget and context exhaustion
+leave the final emitted token pending, matching the ordinary greedy frontier.
+Snapshots restore both bytes and producer lineage; native failure remains sticky.
+Receipts report observed proposal/acceptance/replay/snapshot counts and explicitly
+unassessed qualification. Timing uses the common complete request timer, not an
+empty legacy backend vector. Final-state validation remains outside timing and
+compares final logical history, not transient discarded verification work.
+
+Source only: no compilation, tests, native execution or performance measurements
+have been run for this integration. It does not implement sampling, learned
+draft models, automatic depth selection or a default promotion.

@@ -38,8 +38,14 @@ function(strix_target_warnings target)
     endif()
 endfunction()
 
+find_package(Threads REQUIRED)
+
 add_library(strix_core STATIC
     src/final_generation_state_export.cpp
+    src/greedy_serving_scheduler.cpp
+    src/generation_output.cpp
+    src/known_prompt_chunks.cpp
+    src/offline_tuning_cache.cpp
     src/uma_owner_inventory.cpp
     src/moe_fork_join_arena.cpp
     src/prepared_execution.cpp
@@ -189,6 +195,7 @@ add_library(strix_core STATIC
 )
 target_include_directories(strix_core PUBLIC include)
 target_compile_features(strix_core PUBLIC cxx_std_20)
+target_link_libraries(strix_core PUBLIC Threads::Threads)
 if(STRIX_USE_OPENSSL_SHA256)
     find_package(OpenSSL REQUIRED COMPONENTS Crypto)
     target_link_libraries(strix_core PRIVATE OpenSSL::Crypto)
@@ -293,6 +300,22 @@ if(BUILD_TESTING)
     target_link_libraries(strix-execution-inventory-receipt-tests PRIVATE strix_core)
     strix_target_warnings(strix-execution-inventory-receipt-tests)
     add_test(NAME strix-execution-inventory-receipt-tests COMMAND strix-execution-inventory-receipt-tests)
+    add_executable(strix-known-prompt-chunks-tests tests/known_prompt_chunks_tests.cpp)
+    target_link_libraries(strix-known-prompt-chunks-tests PRIVATE strix_core)
+    strix_target_warnings(strix-known-prompt-chunks-tests)
+    add_test(NAME strix-known-prompt-chunks-tests COMMAND strix-known-prompt-chunks-tests)
+    add_executable(strix-offline-tuning-cache-tests tests/offline_tuning_cache_tests.cpp)
+    target_link_libraries(strix-offline-tuning-cache-tests PRIVATE strix_core)
+    strix_target_warnings(strix-offline-tuning-cache-tests)
+    add_test(NAME strix-offline-tuning-cache-tests COMMAND strix-offline-tuning-cache-tests)
+    add_executable(strix-generation-output-tests tests/generation_output_tests.cpp)
+    target_link_libraries(strix-generation-output-tests PRIVATE strix_core)
+    strix_target_warnings(strix-generation-output-tests)
+    add_test(NAME strix-generation-output-tests COMMAND strix-generation-output-tests)
+    add_executable(strix-greedy-serving-scheduler-tests tests/greedy_serving_scheduler_tests.cpp)
+    target_link_libraries(strix-greedy-serving-scheduler-tests PRIVATE strix_core)
+    strix_target_warnings(strix-greedy-serving-scheduler-tests)
+    add_test(NAME strix-greedy-serving-scheduler-tests COMMAND strix-greedy-serving-scheduler-tests)
     add_executable(strix-execution-telemetry-tests tests/execution_telemetry_tests.cpp)
     target_link_libraries(strix-execution-telemetry-tests PRIVATE strix_core)
     strix_target_warnings(strix-execution-telemetry-tests)
@@ -1188,6 +1211,8 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         src/hip_gdn_launcher.hip
         src/hip_known_prefix_window.hip
         src/hip_known_prompt_backend.cpp
+        src/hip_prompt_lookup_runtime.hip
+        src/hip_serving_greedy_backend.hip
         src/hip_hyper_mix_launcher.hip
         src/hip_indexed_attention_launcher.hip
         src/hip_qsa_selection_diagnostic.hip
@@ -1209,6 +1234,10 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         "${STRIX_HIP_INCLUDE_DIR}"
     )
     target_compile_features(strix_hip_runtime PUBLIC cxx_std_20)
+    # Host-side redirects only: SDK declarations are included before macros;
+    # kernels are never counted as submits by this observer.
+    target_compile_options(strix_hip_runtime PRIVATE
+        "SHELL:-include \"${CMAKE_CURRENT_SOURCE_DIR}/include/strix/hip_runtime_telemetry.hpp\"")
     target_compile_definitions(
         strix_hip_runtime
         PUBLIC
@@ -1274,6 +1303,8 @@ if(STRIX_ENABLE_HIP_RUNTIME)
     strix_target_warnings(
         strix-hip-decode-token
     )
+    target_compile_options(strix-hip-decode-token PRIVATE
+        "SHELL:-include \"${CMAKE_CURRENT_SOURCE_DIR}/include/strix/hip_runtime_telemetry.hpp\"")
     if(BUILD_TESTING)
         add_test(NAME strix-virtual-q8-gdn-output-cli-tests
             COMMAND ${CMAKE_COMMAND} -DBINARY=$<TARGET_FILE:strix-hip-decode-token>
@@ -1576,6 +1607,15 @@ if(STRIX_ENABLE_HIP_RUNTIME)
 
         # Explicit known-prompt/cache/continuation qualification; requires the
         # real model and ROOT-sealed inputs, so it is not an automatic CTest.
+        # Explicit model-dependent serving qualification; never automatic CTest.
+        add_executable(strix-hip-serving-greedy-model-qualification tests/hip_serving_greedy_backend_tests.hip)
+        set_target_properties(strix-hip-serving-greedy-model-qualification PROPERTIES
+            HIP_ARCHITECTURES gfx1151 HIP_STANDARD 20 HIP_STANDARD_REQUIRED YES)
+        target_compile_definitions(strix-hip-serving-greedy-model-qualification PRIVATE STRIX_BUILD_GREEDY_OUTPUT_DIAGNOSTIC=1)
+        target_compile_options(strix-hip-serving-greedy-model-qualification PRIVATE -fno-fast-math -ffp-contract=off)
+        target_link_libraries(strix-hip-serving-greedy-model-qualification PRIVATE strix_hip_runtime Threads::Threads)
+        strix_target_warnings(strix-hip-serving-greedy-model-qualification)
+
         add_executable(strix-hip-known-prompt-model-qualification tests/hip_known_prompt_model_qualification.hip)
         set_target_properties(strix-hip-known-prompt-model-qualification PROPERTIES
             HIP_ARCHITECTURES gfx1151 HIP_STANDARD 20 HIP_STANDARD_REQUIRED YES)

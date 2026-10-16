@@ -12,7 +12,7 @@ struct HipDecodeExperimentResources final : strix::HipSerialGraphResources {
     HipDecodeExperimentResources& operator=(const HipDecodeExperimentResources&) = delete;
     HipDecodeExperimentResources(HipDecodeExperimentResources&&) = delete;
     HipDecodeExperimentResources& operator=(HipDecodeExperimentResources&&) = delete;
-    std::shared_ptr<strix::MappedModelFile> mapped;
+    std::shared_ptr<const strix::MappedModelFile> mapped;
     std::shared_ptr<strix::HipModelResidency> model;
     std::shared_ptr<strix::HipRuntimeAllocator> allocator;
     std::shared_ptr<strix::RuntimeExecutionMemoryOwner> memory;
@@ -20,7 +20,7 @@ struct HipDecodeExperimentResources final : strix::HipSerialGraphResources {
     strix::ExecutionTensorAccessPlan tensor_access;
     strix::SerialSessionStateLayout layout;
     strix::ExecutionRuntimeResources resources;
-    HipDecodeExperimentResources(std::shared_ptr<strix::MappedModelFile> file,
+    HipDecodeExperimentResources(std::shared_ptr<const strix::MappedModelFile> file,
         std::shared_ptr<strix::HipModelResidency> weights,
         std::shared_ptr<strix::HipRuntimeAllocator> allocation_provider,
         std::shared_ptr<strix::RuntimeExecutionMemoryOwner> allocations,

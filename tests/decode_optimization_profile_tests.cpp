@@ -171,6 +171,44 @@ int main() {
         rejects([&] { validate_resolved_known_prefix_window(bad); },
             "known-prefix window requires eager full-head generation without RAW/reference, alternate submission, cache, islands or candidate layouts");
     }
+    expect(!defaults.prompt_lookup, "prompt lookup remains opt-in");
+    validate_resolved_prompt_lookup(defaults);
+    auto lookup = paired_prompt;
+    lookup.known_prefix_window = false; lookup.prompt_lookup = true;
+    for (std::uint32_t depth = 0; depth <= 2; ++depth) {
+        lookup.prompt_lookup_depth = depth;
+        validate_resolved_prompt_lookup(lookup);
+    }
+    expect(parse({"decoder", "m", "1", "--prompt-lookup", "--prompt-lookup-depth", "0"}).prompt_lookup_depth == 0,
+        "explicit depth zero preserves the device frontier route");
+    rejects([] { (void)parse({"decoder", "m", "1", "--prompt-lookup-depth", "1"}); },
+        "depth flag cannot silently enable lookup");
+    rejects([] { (void)parse({"decoder", "m", "1", "--prompt-lookup", "--prompt-lookup-depth", "3"}); },
+        "lookup cannot manufacture an unsupported target depth");
+    rejects([] { (void)parse({"decoder", "m", "1", "--prompt-lookup", "--prompt-lookup"}); },
+        "duplicate lookup flag");
+    for (unsigned mutation = 0; mutation < 14; ++mutation) {
+        auto bad = lookup;
+        if (mutation == 0) bad.known_prefix_window = true;
+        if (mutation == 1) bad.prepared_eager = true;
+        if (mutation == 2) bad.moe_shared_overlap = true;
+        if (mutation == 3) bad.gdn_islands = true;
+        if (mutation == 4) bad.gpu_greedy_token = true;
+        if (mutation == 5) bad.execution.mode = DecodeExecutionMode::graph;
+        if (mutation == 6) bad.execution.integer_head = DecodeIntegerHead::a8_iu8;
+        if (mutation == 7) bad.prefix_cache_roundtrip = true;
+        if (mutation == 8) bad.reference_path = "not-opened";
+        if (mutation == 9) bad.raw_recording_path = "not-opened";
+        if (mutation == 10) bad.qsa_hierarchical_selection = true;
+        if (mutation == 11) bad.qsa_gqa_heads_per_block = 4;
+        if (mutation == 12) bad.gdn_recurrent_layout = HipGdnRecurrentLayout::stride32;
+        if (mutation == 13) bad.generate_tokens = 0;
+        rejects([&] { validate_resolved_prompt_lookup(bad); }, "lookup rejects incompatible explicit route without disabling its flags");
+    }
+    auto missing_lookup_status = lookup; missing_lookup_status.deferred_moe_status = false;
+    rejects([&] { validate_resolved_prompt_lookup(missing_lookup_status); }, "lookup requires the actual D1 owner");
+    auto missing_lookup_wave = lookup; missing_lookup_wave.wave8_q8_gdn_input = false;
+    rejects([&] { validate_resolved_prompt_lookup(missing_lookup_wave); }, "lookup requires the actual paired GDN variant");
     paired_prompt.wave8_q8_gdn_output = false;
     rejects([&] { validate_resolved_known_prefix_window(paired_prompt); },
         "known-prefix window requires resolved D1 and explicit paired wave8 GDN input/output");
@@ -226,6 +264,55 @@ int main() {
     rejects([] { (void)parse({"decoder", "m", "1", "--qsa-hierarchical-selection"}); },
         "--qsa-hierarchical-selection requires the experimental runtime build capability");
 #endif
+    auto serving = defaults;
+    serving.tokens.clear(); serving.serving_prefix_files = {"not-opened.u32le"};
+    serving.generate_tokens = 4; serving.deferred_moe_status = true;
+    serving.serving_memory_budget = 100; serving.serving_request_budget = 10; serving.serving_headroom = 1;
+    serving.serving_memory_explicit = serving.serving_request_explicit = serving.serving_headroom_explicit = true;
+    for (const auto concurrency : {1U, 2U, 4U}) {
+        serving.serving_concurrency = concurrency;
+        validate_resolved_serving(serving);
+    }
+    const auto file_request = parse({"decoder", "m", "--serve-prefix-u32le", "not-opened.u32le", "--generate", "4",
+        "--serve-concurrency", "2", "--serve-memory-budget-bytes", "100", "--serve-request-budget-bytes", "10", "--serve-headroom-bytes", "1"});
+    expect(file_request.tokens.empty() && file_request.serving_prefix_files.size() == 1 &&
+        !file_request.any_low_level_flag, "serving parser records file requests without changing optimization profile");
+    rejects([] { (void)parse({"decoder", "m", "1", "--serve-concurrency", "2"}); },
+        "serving controls cannot silently change an ordinary request");
+    rejects([] { (void)parse({"decoder", "m", "1", "--serve-concurrency", "3"}); },
+        "serving geometry is a closed worker family");
+    for (unsigned mutation = 0; mutation < 13; ++mutation) {
+        auto bad = serving;
+        if (mutation == 0) bad.serving_headroom_explicit = false;
+        if (mutation == 1) bad.serving_request_budget = 0;
+        if (mutation == 2) bad.serving_headroom = bad.serving_memory_budget;
+        if (mutation == 3) bad.moe_shared_overlap = true;
+        if (mutation == 4) bad.gdn_islands = true;
+        if (mutation == 5) bad.known_prefix_window = true;
+        if (mutation == 6) bad.prompt_lookup = true;
+        if (mutation == 7) bad.prefix_cache_roundtrip = true;
+        if (mutation == 8) bad.execution.mode = DecodeExecutionMode::graph;
+        if (mutation == 9) bad.execution.integer_head = DecodeIntegerHead::a8_iu8;
+        if (mutation == 10) bad.tokens = {1};
+        if (mutation == 11) bad.execution_inventory = true;
+        if (mutation == 12) bad.deferred_moe_status = false;
+        rejects([&] { validate_resolved_serving(bad); }, "serving rejects missing reservations and unsupported explicit modes");
+    }
+    auto stored = defaults;
+    stored.gdn_recurrent_storage = GdnRecurrentStorage::value_key;
+    validate_resolved_gdn_recurrent_storage(stored);
+    expect(parse({"decoder", "m", "1", "--gdn-recurrent-storage=value-key"}).gdn_recurrent_storage == GdnRecurrentStorage::value_key,
+        "physical storage has an explicit independent selector");
+    for (unsigned mutation = 0; mutation < 5; ++mutation) {
+        auto bad = stored;
+        if (mutation == 0) bad.gdn_islands = true;
+        if (mutation == 1) bad.known_prefix_window = true;
+        if (mutation == 2) bad.prompt_lookup = true;
+        if (mutation == 3) bad.execution.mode = DecodeExecutionMode::graph;
+        if (mutation == 4) bad.execution.integer_head = DecodeIntegerHead::a8_iu8;
+        rejects([&] { validate_resolved_gdn_recurrent_storage(bad); }, "physical state storage does not enter unadmitted graph/R2 modes");
+    }
+    rejects([] { (void)parse({"decoder", "m", "1", "--gdn-recurrent-storage", "unknown"}); }, "storage selector rejects unknown versions");
     auto instrumented = parse({"decoder", "fixture.gguf", "1", "--host-dispatch-telemetry"});
     const auto instrumented_profile = resolve_optimization_profile(instrumented, model, info, manifest,
         validated_model_content_identity, true);

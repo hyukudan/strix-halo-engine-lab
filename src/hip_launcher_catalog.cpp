@@ -29,7 +29,8 @@ std::uint32_t checked_u32(
 
 HipGdnLauncherConfig make_gdn_config(const ModelContract& model,
     HipActivationStorage activation, bool graph, bool virtual_q8, bool prefetch_q8, bool virtual_output,
-    bool wave8, bool wave8_output, HipGdnRecurrentLayout recurrent_layout = HipGdnRecurrentLayout::baseline) {
+    bool wave8, bool wave8_output, HipGdnRecurrentLayout recurrent_layout = HipGdnRecurrentLayout::baseline,
+    GdnRecurrentStorage recurrent_storage = GdnRecurrentStorage::key_value) {
     HipGdnLauncherConfig config;
     config.model = model;
     config.activation = activation;
@@ -40,6 +41,7 @@ HipGdnLauncherConfig make_gdn_config(const ModelContract& model,
     config.virtual_q8_output_projection = virtual_output;
     config.wave8_q8_output_projection = wave8_output;
     config.recurrent_layout = recurrent_layout;
+    config.recurrent_storage = recurrent_storage;
     return config;
 }
 
@@ -261,7 +263,16 @@ void register_complete_hip_kernel_catalog(
     HipLauncherCatalogConfig config,
     kernels::KernelRegistry& registry,
     const integer_projection::RuntimeConfig* alternate_lm_head) {
+    validate_gdn_recurrent_storage(config.gdn_recurrent_storage);
+    if (config.gdn_recurrent_storage != GdnRecurrentStorage::key_value && config.enable_device_graph_inputs)
+        throw std::invalid_argument("GDN recurrent storage candidate requires eager execution");
     (void)gdn_recurrent_layout_marker(config.gdn_recurrent_layout);
+    if (request.gdn_recurrent_storage != config.gdn_recurrent_storage)
+        throw std::invalid_argument("GDN recurrent storage request/config mismatch");
+    if (config.gdn_recurrent_storage != GdnRecurrentStorage::key_value &&
+        (alternate_lm_head || request.require_graph_safe || request.device_graph_inputs ||
+         request.logical_rows != 1 || request.request_concurrency != 1))
+        throw std::invalid_argument("GDN recurrent storage candidate requires eager floating C1 execution");
     if (request.gdn_recurrent_layout != config.gdn_recurrent_layout)
         throw std::invalid_argument("GDN recurrent layout request/config mismatch");
     if (config.gdn_recurrent_layout != HipGdnRecurrentLayout::baseline &&
@@ -389,7 +400,7 @@ void register_complete_hip_kernel_catalog(
         qualification);
 
     const auto gdn = make_gdn_config(model, config.activation,
-        config.enable_device_graph_inputs, config.virtual_q8_gdn_input, config.prefetch_q8_gdn_input, config.virtual_q8_gdn_output, config.wave8_q8_gdn_input, config.wave8_q8_gdn_output, config.gdn_recurrent_layout);
+        config.enable_device_graph_inputs, config.virtual_q8_gdn_input, config.prefetch_q8_gdn_input, config.virtual_q8_gdn_output, config.wave8_q8_gdn_input, config.wave8_q8_gdn_output, config.gdn_recurrent_layout, config.gdn_recurrent_storage);
     register_hip_gdn_kernel_variant(
         model,
         request,
@@ -496,7 +507,7 @@ HipLauncherCatalog::HipLauncherCatalog(
               config.activation, config.enable_device_graph_inputs)),
       gdn_config_(
           make_gdn_config(model, config.activation,
-              config.enable_device_graph_inputs, config.virtual_q8_gdn_input, config.prefetch_q8_gdn_input, config.virtual_q8_gdn_output, config.wave8_q8_gdn_input, config.wave8_q8_gdn_output, config.gdn_recurrent_layout)),
+              config.enable_device_graph_inputs, config.virtual_q8_gdn_input, config.prefetch_q8_gdn_input, config.virtual_q8_gdn_output, config.wave8_q8_gdn_input, config.wave8_q8_gdn_output, config.gdn_recurrent_layout, config.gdn_recurrent_storage)),
       gdn_(gdn_config_),
       indexed_attention_(
           indexed_attention_config(
@@ -528,7 +539,12 @@ HipLauncherCatalog::HipLauncherCatalog(
               model,
               config.activation,config.prefetch_q8_shared_expert,config.shared_expert_prefetch_layers,
               config.shared_expert_prefetch_stats)) {
+    validate_gdn_recurrent_storage(config.gdn_recurrent_storage);
+    if (config.gdn_recurrent_storage != GdnRecurrentStorage::key_value && config.enable_device_graph_inputs)
+        throw std::invalid_argument("GDN recurrent storage candidate requires eager execution");
     (void)gdn_recurrent_layout_marker(config.gdn_recurrent_layout);
+    if (config.gdn_recurrent_storage != GdnRecurrentStorage::key_value && alternate_lm_head_)
+        throw std::invalid_argument("GDN recurrent storage candidate excludes alternate integer head");
     if (config.gdn_recurrent_layout != HipGdnRecurrentLayout::baseline &&
         (config.enable_device_graph_inputs || alternate_lm_head_))
         throw std::invalid_argument("GDN recurrent LDS layouts support eager floating execution only");

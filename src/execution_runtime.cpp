@@ -1,4 +1,5 @@
 #include "strix/execution_runtime.hpp"
+#include "strix/execution_telemetry.hpp"
 
 #include <limits>
 #include <stdexcept>
@@ -388,6 +389,18 @@ EagerExecutionResult execute_serial_eager(
         context.position =
             request.position;
 
+        std::optional<ExecutionCorrelationScope> activity_scope;
+        if (current_execution_telemetry()) {
+            auto correlation = current_execution_correlation();
+            correlation.execution_identity = execution_identity;
+            correlation.position = request.position;
+            correlation.step_id = step.id;
+            correlation.op = step.op; correlation.layer = step.layer.value_or(UINT32_MAX);
+            correlation.rows = request.logical_rows;
+            correlation.row = request.logical_rows == 1 ? 0U : UINT32_MAX;
+            correlation.phase = ExecutionPhase::operator_step;
+            activity_scope.emplace(correlation);
+        }
         if (binding.host_or_runtime_step) {
             dispatcher.dispatch_runtime_step(context);
             ++result.runtime_steps;
@@ -403,6 +416,8 @@ EagerExecutionResult execute_serial_eager(
         // visible to subsequent steps.
         result.state.publish_write(
             step.writes_state);
+        if (step.writes_state != PersistentState::none)
+            observe_execution_activity(ExecutionActivityKind::proposed_state_write);
 
         completed[step.id] = true;
         result.completion_order.push_back(step.id);

@@ -1,3 +1,4 @@
+#include "strix/execution_telemetry.hpp"
 #include "strix/serial_session.hpp"
 
 #include <algorithm>
@@ -39,6 +40,12 @@ EagerExecutionResult execute_serial_token(
         throw std::invalid_argument(
             "serial session state-layout identity does not match resources");
     }
+    auto telemetry_correlation = current_execution_correlation();
+    telemetry_correlation.execution_identity = session.execution_identity;
+    telemetry_correlation.position = session.next_position;
+    telemetry_correlation.row = 0; telemetry_correlation.rows = 1;
+    telemetry_correlation.step_id = UINT32_MAX;
+    ExecutionCorrelationScope token_scope(telemetry_correlation);
     if (session.health != SerialSessionHealth::ready) {
         throw std::logic_error(
             "serial session is poisoned and requires recovery");
@@ -156,6 +163,15 @@ EagerExecutionResult execute_serial_token(
     session.arithmetic_lineage = std::move(next_lineage);
     ++session.next_position;
     ++session.committed_tokens;
+    {
+        auto correlation = current_execution_correlation();
+        correlation.execution_identity = session.execution_identity;
+        correlation.position = session.next_position - 1;
+        correlation.row = 0; correlation.rows = 1; correlation.step_id = UINT32_MAX;
+        correlation.phase = ExecutionPhase::commit;
+        ExecutionCorrelationScope commit_scope(correlation);
+        observe_execution_activity(ExecutionActivityKind::token_commit);
+    }
     return result;
 }
 
@@ -188,6 +204,12 @@ EagerExecutionResult execute_serial_token(
             "serial session state-layout identity does not match allocated state");
     }
 
+    auto telemetry_correlation = current_execution_correlation();
+    telemetry_correlation.execution_identity = session.execution_identity;
+    telemetry_correlation.position = session.next_position;
+    telemetry_correlation.row = 0; telemetry_correlation.rows = 1;
+    telemetry_correlation.step_id = UINT32_MAX;
+    ExecutionCorrelationScope token_scope(telemetry_correlation);
     if (session.health != SerialSessionHealth::ready) {
         throw std::logic_error(
             "serial session is poisoned and requires recovery");
@@ -274,6 +296,15 @@ EagerExecutionResult execute_serial_token(
     session.arithmetic_lineage = std::move(next_lineage);
     ++session.next_position;
     ++session.committed_tokens;
+    {
+        auto correlation = current_execution_correlation();
+        correlation.execution_identity = session.execution_identity;
+        correlation.position = session.next_position - 1;
+        correlation.row = 0; correlation.rows = 1; correlation.step_id = UINT32_MAX;
+        correlation.phase = ExecutionPhase::commit;
+        ExecutionCorrelationScope commit_scope(correlation);
+        observe_execution_activity(ExecutionActivityKind::token_commit);
+    }
 
     return result;
 }

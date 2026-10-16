@@ -142,5 +142,10 @@ int main() {
         rejects([&] { (void)parse({"decoder", "m", "1", flag, "--integer-lm-head", "a8-iu8"}); },
             "output organizations exclude integer head before model IO");
     }
+    rejects([&] { (void)parse({"decoder", "m", "1", "--execution-telemetry-trace"}); },
+        "bounded trace requires explicit observer");
+    auto observed = parse({"decoder", "m", "1", "--host-dispatch-telemetry", "--execution-telemetry-trace"});
+    expect(observed.host_dispatch_telemetry && observed.execution_telemetry_trace &&
+        observed.optimization_profile == OptimizationProfile::automatic, "observer does not change automatic profile");
     return failures ? 1 : 0;
 }

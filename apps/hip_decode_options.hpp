@@ -1,6 +1,7 @@
 #pragma once
 #include "strix/decode_execution_options.hpp"
 #include "strix/gdn_recurrent_layout.hpp"
+#include "strix/gdn_recurrent_storage.hpp"
 #include "strix/hip_model_residency.hpp"
 #include "strix/raw_baseline_recording.hpp"
 #include "strix/final_generation_state_export.hpp"
@@ -100,6 +101,7 @@ struct Options {
     bool gpu_greedy_token = false;
     bool execution_inventory = false;
     bool host_dispatch_telemetry = false;
+    bool execution_telemetry_trace = false;
     OptimizationProfile optimization_profile = OptimizationProfile::automatic;
     bool profile_explicit = false;
     bool any_low_level_flag = false;
@@ -160,6 +162,16 @@ struct Options {
     bool qsa_hierarchical_selection = false;
     std::uint32_t qsa_gqa_heads_per_block = 1;
     bool qsa_gqa_explicit = false;
+    bool prompt_lookup = false;
+    std::uint32_t prompt_lookup_depth = 2;
+    bool prompt_lookup_depth_explicit = false;
+    std::vector<std::string> serving_prefix_files;
+    std::uint32_t serving_concurrency = 1;
+    std::uint64_t serving_memory_budget = 0, serving_request_budget = 0, serving_headroom = 0;
+    bool serving_concurrency_explicit = false, serving_memory_explicit = false;
+    bool serving_request_explicit = false, serving_headroom_explicit = false;
+    strix::GdnRecurrentStorage gdn_recurrent_storage = strix::GdnRecurrentStorage::key_value;
+    bool gdn_recurrent_storage_explicit = false;
 };
 
 inline bool is_low_level_optimization_option(std::string_view argument) {
@@ -217,16 +229,50 @@ inline void validate_resolved_q51_slot_parallel_down(const Options& options) {
 
 inline void validate_resolved_known_prefix_window(const Options& options) {
     if (!options.known_prefix_window) return;
+    if (options.prompt_lookup) throw std::invalid_argument("known prefix and prompt lookup are separate request routes");
     if (!options.generate_tokens || options.execution.mode != strix::DecodeExecutionMode::eager ||
         options.execution.integer_head != strix::DecodeIntegerHead::none || options.gpu_greedy_token ||
         options.prepared_eager || options.moe_shared_overlap || options.gdn_islands || options.prefix_cache_roundtrip ||
         !options.reference_path.empty() || !options.raw_recording_path.empty() ||
         options.gdn_recurrent_layout != strix::HipGdnRecurrentLayout::baseline ||
+        options.gdn_recurrent_storage != strix::GdnRecurrentStorage::key_value ||
         options.qsa_hierarchical_selection || options.qsa_gqa_heads_per_block != 1)
         throw std::invalid_argument("known-prefix window requires eager full-head generation without RAW/reference, alternate submission, cache, islands or candidate layouts");
     if (!options.deferred_moe_status || !options.virtual_q8_gdn_input || !options.prefetch_q8_gdn_input ||
         !options.virtual_q8_gdn_output || !options.wave8_q8_gdn_input || !options.wave8_q8_gdn_output)
         throw std::invalid_argument("known-prefix window requires resolved D1 and explicit paired wave8 GDN input/output");
+}
+
+inline void validate_resolved_serving(const Options& options) {
+    if (options.serving_prefix_files.empty()) return;
+    if (!options.generate_tokens || !options.tokens.empty() || !options.deferred_moe_status ||
+        options.execution.mode != strix::DecodeExecutionMode::eager ||
+        options.execution.integer_head != strix::DecodeIntegerHead::none || options.moe_shared_overlap ||
+        options.gdn_islands || options.prefix_cache_roundtrip || options.known_prefix_window || options.prompt_lookup ||
+        !options.reference_path.empty() || !options.raw_recording_path.empty() || !options.validation_final_state_path.empty() ||
+        options.execution_inventory)
+        throw std::invalid_argument("serving requires eager D1 generation from prefix files, without positional tokens, graph/integer, overlap/islands, cache, paired/prompt routes or single-session validation outputs");
+    if ((options.serving_concurrency != 1 && options.serving_concurrency != 2 && options.serving_concurrency != 4) ||
+        options.serving_prefix_files.size() > 64 || !options.serving_memory_budget || !options.serving_request_budget ||
+        !options.serving_memory_explicit || !options.serving_request_explicit || !options.serving_headroom_explicit ||
+        options.serving_headroom >= options.serving_memory_budget)
+        throw std::invalid_argument("serving requires concurrency 1/2/4, at most64 requests and explicit total/request/headroom reservation bytes");
+}
+
+inline void validate_resolved_prompt_lookup(const Options& options) {
+    if (!options.prompt_lookup) return;
+    if (options.known_prefix_window || options.prompt_lookup_depth > 2 ||
+        !options.generate_tokens || options.execution.mode != strix::DecodeExecutionMode::eager ||
+        options.execution.integer_head != strix::DecodeIntegerHead::none || options.gpu_greedy_token ||
+        options.prepared_eager || options.moe_shared_overlap || options.gdn_islands || options.prefix_cache_roundtrip ||
+        !options.reference_path.empty() || !options.raw_recording_path.empty() ||
+        options.gdn_recurrent_layout != strix::HipGdnRecurrentLayout::baseline ||
+        options.gdn_recurrent_storage != strix::GdnRecurrentStorage::key_value ||
+        options.qsa_hierarchical_selection || options.qsa_gqa_heads_per_block != 1)
+        throw std::invalid_argument("prompt lookup requires eager generation with its own device selectors, without alternate submission/cache/RAW/reference/candidate layouts");
+    if (!options.deferred_moe_status || !options.virtual_q8_gdn_input || !options.prefetch_q8_gdn_input ||
+        !options.virtual_q8_gdn_output || !options.wave8_q8_gdn_input || !options.wave8_q8_gdn_output)
+        throw std::invalid_argument("prompt lookup requires resolved D1 and paired wave8 GDN input/output");
 }
 
 inline void validate_resolved_qsa_gqa(const Options& options) {
@@ -247,6 +293,15 @@ inline void validate_resolved_qsa_hierarchical_selection(const Options& options)
         throw std::invalid_argument("hierarchical QSA requires eager D1 without integer head or roundtrip and context<=131072");
 }
 
+inline void validate_resolved_gdn_recurrent_storage(const Options& options) {
+    strix::validate_gdn_recurrent_storage(options.gdn_recurrent_storage);
+    if (options.gdn_recurrent_storage != strix::GdnRecurrentStorage::key_value &&
+        (options.execution.mode != strix::DecodeExecutionMode::eager ||
+         options.execution.integer_head != strix::DecodeIntegerHead::none || options.gdn_islands ||
+         options.known_prefix_window || options.prompt_lookup))
+        throw std::invalid_argument("GDN value-key storage requires eager C1 without graph/integer, islands or R2 routes");
+}
+
 inline void validate_resolved_gdn_recurrent_layout(const Options& options) {
     (void)strix::gdn_recurrent_layout_marker(options.gdn_recurrent_layout);
     if (options.gdn_recurrent_layout != strix::HipGdnRecurrentLayout::baseline &&
@@ -260,6 +315,7 @@ inline void validate_resolved_gdn_islands(const Options& options) {
     if (options.execution.mode != strix::DecodeExecutionMode::eager ||
         options.execution.integer_head != strix::DecodeIntegerHead::none || options.prefix_cache_roundtrip ||
         options.gdn_recurrent_layout != strix::HipGdnRecurrentLayout::baseline ||
+        options.gdn_recurrent_storage != strix::GdnRecurrentStorage::key_value ||
         (options.wave8_q8_gdn_input != options.wave8_q8_gdn_output))
         throw std::invalid_argument("GDN islands require eager floating execution without prefix roundtrip and paired wave8 GDN flags");
     if (!options.deferred_moe_status || !options.virtual_q8_gdn_input ||
@@ -273,8 +329,8 @@ inline Options parse_options(
     if (argc < 2) {
         throw std::invalid_argument(
             "usage: strix-hip-decode-token MODEL.gguf [TOKEN_ID ...] "
-            "[--optimization-profile auto|manual] [--execution-inventory] [--host-dispatch-telemetry] "
-            "[--gpu-greedy-token] [--gdn-recurrent-layout baseline|stride32|stride33|transposed] [--known-prefix-window] [--gdn-islands] [--qsa-hierarchical-selection] [--qsa-gqa-heads-per-block 1|2|4] [--prepared-eager] [--moe-shared-overlap] [--moe-overlap-arena-budget-bytes N] [--batched-moe-activation] [--validation-final-state DIR] [--validation-final-state-max-bytes N] [--reference FILE] [--max-logit-error X] "
+            "[--optimization-profile auto|manual] [--execution-inventory] [--host-dispatch-telemetry] [--execution-telemetry-trace] "
+            "[--gpu-greedy-token] [--gdn-recurrent-layout baseline|stride32|stride33|transposed] [--gdn-recurrent-storage key-value|value-key] [--known-prefix-window] [--prompt-lookup] [--prompt-lookup-depth 0|1|2] [--serve-prefix-u32le FILE ... --serve-concurrency 1|2|4 --serve-memory-budget-bytes N --serve-request-budget-bytes N --serve-headroom-bytes N] [--gdn-islands] [--qsa-hierarchical-selection] [--qsa-gqa-heads-per-block 1|2|4] [--prepared-eager] [--moe-shared-overlap] [--moe-overlap-arena-budget-bytes N] [--batched-moe-activation] [--validation-final-state DIR] [--validation-final-state-max-bytes N] [--reference FILE] [--max-logit-error X] "
             "[--context N] [--residency register|copy] [--coalesce-gap BYTES] "
             "[--planned-ple-io] [--ple-max-rows-per-io N] [--ple-max-inflight-ios N] "
             "[--generate N] [--eos-token TOKEN_ID] [--prefix-cache-roundtrip] "
@@ -313,9 +369,59 @@ inline Options parse_options(
             enabled = true;
             continue;
         }
+        if (argument == "--serve-prefix-u32le") {
+            if (index + 1 >= argc || options.serving_prefix_files.size() >= 64)
+                throw std::invalid_argument("serving prefix requires a file and at most64 requests");
+            options.serving_prefix_files.emplace_back(argv[++index]);
+            continue;
+        }
+        if (argument == "--serve-concurrency" || argument == "--serve-memory-budget-bytes" ||
+            argument == "--serve-request-budget-bytes" || argument == "--serve-headroom-bytes") {
+            if (index + 1 >= argc) throw std::invalid_argument("serving option requires a value");
+            const auto value = parse_u64(argv[++index], "serving option");
+            bool* explicit_value = argument == "--serve-concurrency" ? &options.serving_concurrency_explicit :
+                argument == "--serve-memory-budget-bytes" ? &options.serving_memory_explicit :
+                argument == "--serve-request-budget-bytes" ? &options.serving_request_explicit : &options.serving_headroom_explicit;
+            if (*explicit_value) throw std::invalid_argument("duplicate serving option");
+            *explicit_value = true;
+            if (argument == "--serve-concurrency") {
+                if (value != 1 && value != 2 && value != 4) throw std::invalid_argument("serving concurrency must be1,2or4");
+                options.serving_concurrency = static_cast<std::uint32_t>(value);
+            } else if (argument == "--serve-memory-budget-bytes") options.serving_memory_budget = value;
+            else if (argument == "--serve-request-budget-bytes") options.serving_request_budget = value;
+            else options.serving_headroom = value;
+            continue;
+        }
+        if (argument == "--prompt-lookup") {
+            if (options.prompt_lookup) throw std::invalid_argument("duplicate prompt lookup option");
+            options.prompt_lookup = true;
+            continue;
+        }
+        if (argument == "--prompt-lookup-depth") {
+            if (options.prompt_lookup_depth_explicit || index + 1 >= argc)
+                throw std::invalid_argument("prompt lookup depth requires one value zero, one or two");
+            const auto value = parse_u64(argv[++index], "prompt lookup depth");
+            if (value > 2) throw std::invalid_argument("prompt lookup depth must be zero, one or two");
+            options.prompt_lookup_depth = static_cast<std::uint32_t>(value);
+            options.prompt_lookup_depth_explicit = true;
+            continue;
+        }
         if (argument == "--known-prefix-window") {
             if (options.known_prefix_window) throw std::invalid_argument("duplicate known-prefix window option");
             options.known_prefix_window = true;
+            continue;
+        }
+        if (argument == "--gdn-recurrent-storage" || argument.starts_with("--gdn-recurrent-storage=")) {
+            if (options.gdn_recurrent_storage_explicit) throw std::invalid_argument("duplicate GDN recurrent storage option");
+            std::string_view value;
+            if (argument == "--gdn-recurrent-storage") {
+                if (index + 1 >= argc) throw std::invalid_argument("GDN recurrent storage requires a value");
+                value = argv[++index];
+            } else value = argument.substr(std::string_view("--gdn-recurrent-storage=").size());
+            if (value == "key-value") options.gdn_recurrent_storage = strix::GdnRecurrentStorage::key_value;
+            else if (value == "value-key") options.gdn_recurrent_storage = strix::GdnRecurrentStorage::value_key;
+            else throw std::invalid_argument("GDN recurrent storage must be key-value or value-key");
+            options.gdn_recurrent_storage_explicit = true;
             continue;
         }
         if (argument == "--gdn-recurrent-layout" || argument.starts_with("--gdn-recurrent-layout=")) {
@@ -401,6 +507,11 @@ inline Options parse_options(
             if (options.execution_inventory)
                 throw std::invalid_argument("duplicate execution inventory option");
             options.execution_inventory = true;
+            continue;
+        }
+        if (argument == "--execution-telemetry-trace") {
+            if (options.execution_telemetry_trace) throw std::invalid_argument("duplicate execution telemetry trace option");
+            options.execution_telemetry_trace = true;
             continue;
         }
         if (argument == "--host-dispatch-telemetry") {
@@ -734,7 +845,7 @@ inline Options parse_options(
                 token));
     }
 
-    if (options.tokens.empty() &&
+    if (options.tokens.empty() && options.serving_prefix_files.empty() &&
         options.reference_path.empty()) {
         throw std::invalid_argument(
             "at least one token id or --reference is required");
@@ -745,9 +856,9 @@ inline Options parse_options(
             "--generate and --reference are separate execution modes");
     }
     if (options.generate_tokens != 0 &&
-        options.tokens.empty()) {
+        options.tokens.empty() && options.serving_prefix_files.empty()) {
         throw std::invalid_argument(
-            "--generate requires at least one prefix token id");
+            "--generate requires at least one prefix token id or serving prefix file");
     }
     if (options.validation_final_state_budget_explicit && options.validation_final_state_path.empty())
         throw std::invalid_argument("final state export budget requires --validation-final-state");
@@ -796,8 +907,13 @@ inline Options parse_options(
         options.prefix_cache_roundtrip || options.execution.mode != strix::DecodeExecutionMode::eager ||
         options.execution.integer_head != strix::DecodeIntegerHead::none))
         throw std::invalid_argument("GPU greedy token output requires eager generation without RAW, reference, roundtrip or integer head");
-    if (options.host_dispatch_telemetry && options.execution.mode == strix::DecodeExecutionMode::graph)
-        throw std::invalid_argument("host dispatch telemetry requires eager mode; graph replay is not host dispatch");
+    if (options.serving_prefix_files.empty() && (options.serving_concurrency_explicit || options.serving_memory_explicit ||
+        options.serving_request_explicit || options.serving_headroom_explicit))
+        throw std::invalid_argument("serving controls require --serve-prefix-u32le");
+    if (options.prompt_lookup_depth_explicit && !options.prompt_lookup)
+        throw std::invalid_argument("prompt lookup depth requires --prompt-lookup");
+    if (options.execution_telemetry_trace && !options.host_dispatch_telemetry)
+        throw std::invalid_argument("execution telemetry trace requires host dispatch telemetry");
     if (options.context_tokens == 0) {
         throw std::invalid_argument(
             "context must be non-zero");

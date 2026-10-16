@@ -346,6 +346,11 @@ CompiledSerialExecution compile_serial_execution(
     if (binding_request.parallel_moe_router != buffer_request.parallel_moe_router)
         throw std::invalid_argument("router kernel request differs from buffer admission");
 
+    validate_gdn_recurrent_storage(binding_request.gdn_recurrent_storage);
+    if (binding_request.gdn_recurrent_storage != GdnRecurrentStorage::key_value &&
+        (binding_request.device_graph_inputs || binding_request.require_graph_safe ||
+         binding_request.logical_rows != 1 || binding_request.request_concurrency != 1))
+        throw std::invalid_argument("GDN recurrent storage candidate requires eager C1 execution");
     (void)gdn_recurrent_layout_marker(binding_request.gdn_recurrent_layout);
     if (binding_request.gdn_recurrent_layout != HipGdnRecurrentLayout::baseline &&
         (binding_request.device_graph_inputs || binding_request.require_graph_safe ||
@@ -430,6 +435,14 @@ CompiledSerialExecution compile_serial_execution(
                 if (!tail.empty() && tail != lane_chain_hyper_output_suffix)
                     throw std::invalid_argument("bound HC next-tile marker must precede only the terminal lane-chain suffix");
             }
+        }
+        if (binding.op == SerialOp::gated_delta_net && binding.kernel_id) {
+            const auto marker = gdn_recurrent_storage_marker(GdnRecurrentStorage::value_key);
+            const auto first = binding.kernel_id->find(marker);
+            const bool selected = binding_request.gdn_recurrent_storage == GdnRecurrentStorage::value_key;
+            if ((first != std::string::npos) != selected ||
+                (first != std::string::npos && binding.kernel_id->find(marker, first + marker.size()) != std::string::npos))
+                throw std::invalid_argument("bound GDN recurrent storage marker differs from request");
         }
         if (binding.op == SerialOp::gated_delta_net && binding.kernel_id) {
             const auto expected = gdn_recurrent_layout_marker(binding_request.gdn_recurrent_layout);

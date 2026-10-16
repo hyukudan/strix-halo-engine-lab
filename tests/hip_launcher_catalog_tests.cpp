@@ -978,6 +978,39 @@ int main() {
         catch (const std::invalid_argument&) { rejected = true; }
         expect(rejected && rejected_registry.variants().empty(), "LDS layout mismatch rejects before variant publication");
     }
+    {
+        strix::ExecutionBindingRequest storage_request;
+        storage_request.minimum_qualification = strix::kernels::QualificationStatus::experimental;
+        storage_request.gdn_recurrent_storage = strix::GdnRecurrentStorage::value_key;
+        strix::HipLauncherCatalogConfig storage_config;
+        storage_config.gdn_recurrent_storage = strix::GdnRecurrentStorage::value_key;
+        strix::kernels::KernelRegistry storage_registry;
+        strix::register_complete_hip_kernel_catalog(model, storage_request, storage_config, storage_registry);
+        const auto storage_compiled = strix::compile_serial_execution(model, storage_registry, storage_request, {});
+        unsigned marked = 0;
+        for (const auto& binding : storage_compiled.bindings.bindings) if (binding.op == strix::SerialOp::gated_delta_net) {
+            expect(binding.kernel_id && binding.kernel_id->find(".state-vk-v1") != std::string::npos,
+                "physical recurrent state layout is bound into each selected GDN identity");
+            ++marked;
+        }
+        expect(marked == 36, "physical storage candidate covers the actual GDN family");
+        auto mismatch = storage_config; mismatch.gdn_recurrent_storage = strix::GdnRecurrentStorage::key_value;
+        strix::kernels::KernelRegistry rejected_registry;
+        bool rejected = false;
+        try { strix::register_complete_hip_kernel_catalog(model, storage_request, mismatch, rejected_registry); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        expect(rejected && rejected_registry.variants().empty(), "storage mismatch rejects before registration");
+        auto graph_request = storage_request; graph_request.require_graph_safe = true;
+        rejected = false;
+        try { (void)strix::compile_serial_execution(model, storage_registry, graph_request, {}); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        expect(rejected, "physical state layout cannot enter a graph request");
+        auto missing_marker = storage_request; missing_marker.gdn_recurrent_storage = strix::GdnRecurrentStorage::key_value;
+        rejected = false;
+        try { (void)strix::compile_serial_execution(model, storage_registry, missing_marker, {}); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        expect(rejected, "candidate registry cannot silently bind incumbent state layout");
+    }
     if (failures == 0) {
         std::cout
             << "HIP launcher catalog tests passed\n";
