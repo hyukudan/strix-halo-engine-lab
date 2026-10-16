@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <condition_variable>
 #include <deque>
@@ -67,6 +68,7 @@ struct GreedyServingJob {
     std::atomic<ServingRequestState> state{ServingRequestState::queued};
     std::atomic<bool> cancel_requested{false};
     Clock::time_point admitted = Clock::now(), queued = admitted;
+    std::optional<Clock::time_point> last_token;
     ServingRequestMetrics metrics;
     std::exception_ptr error;
     GreedyServingJob(Reservation lease, std::shared_ptr<const void> model,
@@ -179,8 +181,21 @@ struct GreedyServingScheduler::Impl {
                 try {
                     job->cursor.advance(*job->backend, policy.prefill_chunk_rows);
                     accumulate(job->metrics.chunks, 1, job->metrics.saturated);
-                    if (!job->metrics.time_to_first_token_ns && !job->cursor.result().generated_tokens.empty())
-                        job->metrics.time_to_first_token_ns = elapsed(job->admitted, Clock::now());
+                    const auto emitted = job->cursor.result().generated_tokens.size();
+                    if (emitted > job->metrics.emitted_tokens) {
+                        const auto delivered = Clock::now();
+                        if (!job->last_token) job->metrics.time_to_first_token_ns = elapsed(job->admitted, delivered);
+                        else {
+                            const auto interval = elapsed(*job->last_token, delivered);
+                            accumulate(job->metrics.inter_token_intervals, 1, job->metrics.saturated);
+                            accumulate(job->metrics.inter_token_ns_total, interval, job->metrics.saturated);
+                            job->metrics.inter_token_ns_max = std::max(job->metrics.inter_token_ns_max, interval);
+                            const auto bucket = interval > 1 ? std::bit_width(interval) - 1U : 0U;
+                            accumulate(job->metrics.inter_token_ns_histogram[bucket], 1, job->metrics.saturated);
+                        }
+                        job->last_token = delivered;
+                        job->metrics.emitted_tokens = emitted;
+                    }
                     if (job->cursor.done()) state = ServingRequestState::completed;
                     else if (job->cancel_requested.load(std::memory_order_acquire) || stop.stop_requested()) state = ServingRequestState::cancelled;
                 } catch (...) { job->error = std::current_exception(); state = ServingRequestState::failed; }

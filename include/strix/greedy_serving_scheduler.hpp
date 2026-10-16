@@ -4,6 +4,7 @@
 #include "strix/serial_request.hpp"
 
 #include <cstddef>
+#include <array>
 #include <cstdint>
 #include <exception>
 #include <functional>
@@ -37,6 +38,12 @@ struct ServingRequestMetrics {
     // Service durations across requests overlap; they are not GPU busy time.
     std::uint64_t queue_wait_ns = 0, service_ns = 0, wall_ns = 0;
     std::uint64_t chunks = 0;
+    std::uint64_t emitted_tokens = 0, inter_token_intervals = 0;
+    std::uint64_t inter_token_ns_total = 0, inter_token_ns_max = 0;
+    // Bin 0: [0,1] ns; bin b>0: [2^b,2^(b+1)-1] ns.
+    // Fixed storage avoids allocation after backend publication. Quantiles
+    // derived from this histogram are bounds, never exact percentiles.
+    std::array<std::uint64_t, 64> inter_token_ns_histogram{};
     std::optional<std::uint64_t> time_to_first_token_ns;
     bool saturated = false;
 };

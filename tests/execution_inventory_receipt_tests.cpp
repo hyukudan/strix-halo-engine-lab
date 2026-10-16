@@ -4,6 +4,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 namespace {
 int failures = 0;
@@ -102,17 +103,19 @@ int main() {
     expect(text.find("\"offline_tuning_selection\":null") != std::string::npos &&
            text.find("\"numerical_contract_identity\":null") != std::string::npos,
            "missing tuning request and unknown numerical equivalence remain explicit");
-    for (const auto reason : {strix::kernels::TuningSelectionReason::qualified_record,
-            strix::kernels::TuningSelectionReason::invalid_key,
-            strix::kernels::TuningSelectionReason::ambiguous_records,
-            strix::kernels::TuningSelectionReason::no_qualified_record}) {
+    constexpr std::pair<strix::kernels::TuningSelectionReason, const char*> reasons[]{
+        {strix::kernels::TuningSelectionReason::qualified_record, "qualified_record"},
+        {strix::kernels::TuningSelectionReason::invalid_key, "invalid_key"},
+        {strix::kernels::TuningSelectionReason::ambiguous_records, "ambiguous_records"},
+        {strix::kernels::TuningSelectionReason::no_qualified_record, "no_qualified_record"}};
+    for (const auto& [reason, name] : reasons) {
         auto tuned = fixture.compiled;
         for (auto& binding : tuned.bindings.bindings) {
             if (!binding.host_or_runtime_step) { binding.tuning_selection_reason = reason; break; }
         }
         const auto receipt = strix::decode_receipt::execution_inventory_receipt(tuned, fixture.launches, fixture.variants);
         const std::string expected = std::string("\"offline_tuning_selection\":\"") +
-            strix::decode_receipt::execution_inventory_detail::tuning_reason(reason) + '"';
+            name + '"';
         expect(receipt.find(expected) != std::string::npos,
             "selected tuning/fallback reason was omitted from the compiled receipt");
     }

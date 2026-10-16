@@ -116,6 +116,13 @@ int main() try {
             "queued cancellation affected another session or submitted work");
         require(first.request.result().generated_tokens == std::vector<std::uint32_t>({4, 5, 6}),
             "caller mutation changed the admitted request");
+        const auto metrics = first.request.metrics();
+        std::uint64_t intervals = 0;
+        for (const auto bin : metrics.inter_token_ns_histogram) intervals += bin;
+        require(metrics.emitted_tokens == 3 && metrics.inter_token_intervals == 2 && intervals == 2 &&
+            metrics.time_to_first_token_ns.has_value(), "host token delivery metrics lost intervals");
+        require(second.request.metrics().emitted_tokens == 0 &&
+            !second.request.metrics().time_to_first_token_ns, "queued cancellation invented token timing");
         require(scheduler.reserved_bytes() == 2112, "completed handles prematurely released their resource reservations");
         auto blocked = scheduler.submit({prefix, 16, 10, 3, 15}, compatibility(), 3, 1, 1024, owner, factory);
         require(blocked.admission == strix::ServingAdmission::request_limit, "retained handles bypassed admission limits");
