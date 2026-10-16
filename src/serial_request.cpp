@@ -1,9 +1,11 @@
 #include "strix/serial_request.hpp"
 #include "strix/serial_decode_replay.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <limits>
 #include <stdexcept>
+#include <utility>
 
 namespace strix {
 
@@ -287,43 +289,71 @@ void SerialGreedyStepBackend::execute_state(std::uint32_t input_token, std::uint
 
 SerialGreedyRequestResult execute_serial_greedy_token_request(
     const SerialGreedyRequest& request, SerialGreedyStepBackend& backend) {
-    validate_greedy_request(request);
-    SerialGreedyRequestResult result;
-    std::uint64_t position = 0;
-    std::uint32_t next = 0;
+    SerialGreedyTokenCursor cursor(request);
+    while (!cursor.done()) cursor.advance(backend, std::numeric_limits<std::uint64_t>::max());
+    return cursor.take_result();
+}
+
+SerialGreedyTokenCursor::SerialGreedyTokenCursor(SerialGreedyRequest request) : request_(request) {
+    validate_greedy_request(request_);
+}
+
+void SerialGreedyTokenCursor::emit_pending() {
+    if (result_.generated_tokens.size() >= request_.max_new_tokens) { done_ = true; return; }
+    result_.generated_tokens.push_back(pending_);
+    if (pending_ == request_.eos_token_id) {
+        result_.stop_reason = SerialRequestStopReason::eos;
+        done_ = true;
+    } else if (result_.final_position >= request_.context_capacity) {
+        result_.stop_reason = SerialRequestStopReason::context_capacity;
+        done_ = true;
+    } else if (result_.generated_tokens.size() >= request_.max_new_tokens) done_ = true;
+}
+
+void SerialGreedyTokenCursor::advance(SerialGreedyStepBackend& backend, std::uint64_t prefill_rows) {
+    if (failed_) throw std::logic_error("greedy token cursor cannot resume after backend failure");
+    if (done_) return;
+    if (!prefill_rows) throw std::invalid_argument("greedy prefill chunk must contain at least one row");
     const auto consume = [&](std::uint32_t token) {
-        const auto selected = backend.execute_greedy(token, position, request.vocab_size);
-        // A generic backend is responsible for containing its own post-submit
-        // failures. The CLI's resident selector rejects this before returning
-        // and poisons its session on any failure after state consumption.
-        if (static_cast<std::uint64_t>(selected) >= request.vocab_size)
+        const auto selected = backend.execute_greedy(token, result_.final_position, request_.vocab_size);
+        if (static_cast<std::uint64_t>(selected) >= request_.vocab_size)
             throw std::invalid_argument("greedy backend selected token outside vocabulary");
         return selected;
     };
-    for (const auto token : request.prefix_tokens) {
-        if (position + 1U == request.prefix_tokens.size()) next = consume(token);
-        else backend.execute_state(token, position);
-        ++result.steps_executed;
-        ++position;
-    }
-    result.final_position = position;
-    while (result.generated_tokens.size() < request.max_new_tokens) {
-        result.generated_tokens.push_back(next);
-        if (next == request.eos_token_id) {
-            result.stop_reason = SerialRequestStopReason::eos;
-            break;
+    try {
+        // Reserve the bounded response before the first backend can publish
+        // state. Later token delivery cannot allocate after a committed step.
+        if (result_.steps_executed == 0) {
+            const auto emissions = std::min(request_.max_new_tokens,
+                request_.context_capacity - request_.prefix_tokens.size() + 1U);
+            if (emissions > result_.generated_tokens.max_size())
+                throw std::length_error("greedy response exceeds host vector capacity");
+            result_.generated_tokens.reserve(static_cast<std::size_t>(emissions));
         }
-        if (position >= request.context_capacity) {
-            result.stop_reason = SerialRequestStopReason::context_capacity;
-            break;
+        if (prefilling()) {
+            std::uint64_t consumed = 0;
+            while (prefilling() && consumed < prefill_rows) {
+                const auto token = request_.prefix_tokens[prefix_offset_];
+                if (prefix_offset_ + 1U == request_.prefix_tokens.size()) pending_ = consume(token);
+                else backend.execute_state(token, result_.final_position);
+                ++prefix_offset_; ++consumed;
+                ++result_.steps_executed; ++result_.final_position;
+            }
+            if (prefilling()) return;
+        } else {
+            pending_ = consume(pending_);
+            ++result_.steps_executed; ++result_.final_position;
         }
-        if (result.generated_tokens.size() >= request.max_new_tokens) break;
-        next = consume(next);
-        ++result.steps_executed;
-        ++position;
-        result.final_position = position;
+        emit_pending();
+    } catch (...) {
+        failed_ = true;
+        throw;
     }
-    return result;
+}
+
+SerialGreedyRequestResult SerialGreedyTokenCursor::take_result() {
+    if (!done_ || failed_) throw std::logic_error("greedy token cursor result is incomplete or failed");
+    return std::move(result_);
 }
 
 }  // namespace strix

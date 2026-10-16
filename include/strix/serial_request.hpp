@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <optional>
@@ -57,6 +58,33 @@ public:
     // Prefix positions with no requested output still consume all model state.
     // The default preserves the complete existing execution.
     virtual void execute_state(std::uint32_t input_token, std::uint64_t position);
+};
+
+// Incremental form of the token-output request controller. The prefix span is
+// borrowed and must stay immutable until completion. Each advance consumes at
+// most prefill_rows known inputs, or one pending generated input. The last
+// emitted token stays unconsumed at EOS/budget/capacity/cancellation boundaries.
+// Backend calls must contain their own completion and post-submit failures.
+class SerialGreedyTokenCursor final {
+public:
+    explicit SerialGreedyTokenCursor(SerialGreedyRequest request);
+    SerialGreedyTokenCursor(const SerialGreedyTokenCursor&) = delete;
+    SerialGreedyTokenCursor& operator=(const SerialGreedyTokenCursor&) = delete;
+    void advance(SerialGreedyStepBackend&, std::uint64_t prefill_rows = 1);
+    void cancel() noexcept { if (!done_) { cancelled_ = true; done_ = true; } }
+    [[nodiscard]] bool done() const noexcept { return done_; }
+    [[nodiscard]] bool failed() const noexcept { return failed_; }
+    [[nodiscard]] bool cancelled() const noexcept { return cancelled_; }
+    [[nodiscard]] bool prefilling() const noexcept { return prefix_offset_ < request_.prefix_tokens.size(); }
+    [[nodiscard]] const SerialGreedyRequestResult& result() const noexcept { return result_; }
+    [[nodiscard]] SerialGreedyRequestResult take_result();
+private:
+    void emit_pending();
+    SerialGreedyRequest request_;
+    SerialGreedyRequestResult result_;
+    std::size_t prefix_offset_ = 0;
+    std::uint32_t pending_ = 0;
+    bool done_ = false, failed_ = false, cancelled_ = false;
 };
 
 // Experimental full-output prompt route. Both inputs are already known; this

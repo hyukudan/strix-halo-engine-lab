@@ -204,6 +204,8 @@ ExecutionBindingPlan bind_serial_execution_plan(
             if(wanted!=actual){std::string id=selected->id;if(actual)id.resize(id.size()-shared_expert_prefetch::kernel_suffix.size());else id+=shared_expert_prefetch::kernel_suffix;selected=registry.find(id);if(selected && !kernels::matches(*selected,query))selected=nullptr;}
         }
         if (request.offline_tuning && selected) {
+            if (step.id >= request.offline_tuning->step_keys.size())
+                throw std::invalid_argument("offline tuning step identity is outside its provenance keys");
             const auto tuned = registry.select_tuned(query,
                 request.offline_tuning->step_keys[step.id], request.offline_tuning->records);
             binding.tuning_selection_reason = tuned.reason;
