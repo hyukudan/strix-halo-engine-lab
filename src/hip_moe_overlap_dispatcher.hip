@@ -158,7 +158,9 @@ struct HipMoeSiblingStreams::Impl {
     template<class Work> void protected_call(Work&& call) {
         try { call(); } catch (...) { abort(); throw; }
     }
-    void begin(std::uint64_t p, std::uint64_t committed, std::uint32_t layers) {
+    void begin(std::uint64_t p, std::uint64_t committed, std::uint32_t layers, MoeTokenSchedule schedule) {
+        require(schedule == MoeTokenSchedule::serial_expanded || schedule == MoeTokenSchedule::fork_join,
+                "invalid MoE token schedule");
         require(!active && !broken && phase == Phase::idle && layers &&
                 work.token_epoch < std::numeric_limits<std::uint64_t>::max() &&
                 p < std::numeric_limits<std::uint64_t>::max() && committed < std::numeric_limits<std::uint64_t>::max(),
@@ -167,14 +169,17 @@ struct HipMoeSiblingStreams::Impl {
                 layers <= std::numeric_limits<std::uint64_t>::max() - counters.join_waits &&
                 layers <= std::numeric_limits<std::uint64_t>::max() - counters.committed_layers &&
                 counters.verified_tokens < std::numeric_limits<std::uint64_t>::max() &&
-                counters.committed_tokens < std::numeric_limits<std::uint64_t>::max(), "MoE sibling counters exhausted");
+                counters.committed_tokens < std::numeric_limits<std::uint64_t>::max() &&
+                counters.serial_tokens < std::numeric_limits<std::uint64_t>::max() &&
+                counters.fork_join_tokens < std::numeric_limits<std::uint64_t>::max(), "MoE sibling counters exhausted");
         guard->require_original();
         hipStreamCaptureStatus main_capture{}, side_capture{};
         check(hipStreamIsCapturing(main, &main_capture), "query MoE main capture");
         check(hipStreamIsCapturing(side, &side_capture), "query MoE side capture");
         require(main_capture == hipStreamCaptureStatusNone && side_capture == hipStreamCaptureStatusNone,
                 "MoE sibling phase one rejects graph capture");
-        position = p; committed_before = committed; expected = layers; forks = joins = 0;
+        position = p; committed_before = committed; expected = schedule == MoeTokenSchedule::fork_join ? layers : 0U; forks = joins = 0;
+        work.schedule = schedule;
         active = true; verified = false;
         ++work.token_epoch; work.input_position = p; work.committed_before = committed;
         work.state = HipMoeWorkState::prepared; work.gpu_completed = work.validated = work.committed = false;
@@ -190,8 +195,8 @@ HipMoeSiblingStreams::HipMoeSiblingStreams(hipStream_t main, std::shared_ptr<con
     std::shared_ptr<const HipSetupQuiescenceGuard> guard)
     : impl_(std::make_unique<Impl>(main, std::move(owner), std::move(guard))) {}
 HipMoeSiblingStreams::~HipMoeSiblingStreams() = default;
-void HipMoeSiblingStreams::begin_token(std::uint64_t position, std::uint64_t committed, std::uint32_t layers) {
-    impl_->protected_call([&] { impl_->begin(position, committed, layers); });
+void HipMoeSiblingStreams::begin_token(std::uint64_t position, std::uint64_t committed, std::uint32_t layers, MoeTokenSchedule schedule) {
+    impl_->protected_call([&] { impl_->begin(position, committed, layers, schedule); });
 }
 void HipMoeSiblingStreams::fork_shared(std::uint32_t layer) {
     auto& s = *impl_; s.protected_call([&] { s.expected_phase(Impl::Phase::idle, layer);
@@ -252,6 +257,8 @@ void HipMoeSiblingStreams::mark_committed(std::uint64_t next, std::uint64_t comm
     require(s.active && s.verified && !s.broken && next == s.position + 1U && committed == s.committed_before + 1U,
             "MoE sibling completion requires actual serial-token commit");
     ++s.counters.committed_tokens; s.counters.committed_layers += s.expected;
+    if (s.work.schedule == MoeTokenSchedule::serial_expanded) ++s.counters.serial_tokens;
+    else ++s.counters.fork_join_tokens;
     s.work.committed = true; s.work.state = HipMoeWorkState::committed;
     s.active = false; s.verified = false;
     // Completion and validation preceded commit, so this owner may now reuse
@@ -295,6 +302,7 @@ struct HipMoeOverlapDispatcher::Impl {
     std::size_t cursor = 0, layer_cursor = 0;
     std::uint64_t position = 0;
     bool active = false;
+    MoeTokenSchedule schedule = MoeTokenSchedule::fork_join;
     Impl(const CompiledSerialExecution& execution, const MoeForkJoinArenaPlan& arena,
          const CompiledLaunchPlan& launch, const ExecutionRuntimeResources& bound, hipStream_t main,
          std::shared_ptr<const void> owner, std::shared_ptr<const void> configs,
@@ -432,18 +440,24 @@ struct HipMoeOverlapDispatcher::Impl {
                 if (c.op == SerialOp::shared_expert) {
                     require(c.step_id == layer.shared_step && c.writes_state == PersistentState::none,
                             "unexpected shared branch or persistent state writer");
-                    streams.fork_shared(layer.layer);
-                    {
-                        HipSharedExpertSideScope side(streams.main_stream(), streams.side_stream());
+                    if (schedule == MoeTokenSchedule::serial_expanded) {
                         direct.dispatch_kernel(c);
+                    } else {
+                        streams.fork_shared(layer.layer);
+                        {
+                            HipSharedExpertSideScope side(streams.main_stream(), streams.side_stream());
+                            direct.dispatch_kernel(c);
+                        }
+                        streams.record_shared_done(layer.layer);
                     }
-                    streams.record_shared_done(layer.layer);
                 } else if (c.op == SerialOp::moe_experts) {
                     require(c.step_id == layer.experts_step, "unexpected routed branch");
-                    streams.begin_experts(layer.layer); direct.dispatch_kernel(c);
+                    if (schedule == MoeTokenSchedule::fork_join) streams.begin_experts(layer.layer);
+                    direct.dispatch_kernel(c);
                 } else {
                     require(c.step_id == layer.combine_step, "unexpected MoE combine");
-                    streams.join_before_combine(layer.layer); direct.dispatch_kernel(c); ++layer_cursor;
+                    if (schedule == MoeTokenSchedule::fork_join) streams.join_before_combine(layer.layer);
+                    direct.dispatch_kernel(c); ++layer_cursor;
                 }
             } else {
                 if (runtime_step) direct.dispatch_runtime_step(c); else direct.dispatch_kernel(c);
@@ -458,10 +472,12 @@ HipMoeOverlapDispatcher::HipMoeOverlapDispatcher(const CompiledSerialExecution& 
     std::shared_ptr<const HipSetupQuiescenceGuard> guard, ExecutionTelemetry* telemetry)
     : impl_(std::make_unique<Impl>(compiled,plan,launches,resources,main,std::move(owner),std::move(launchers),std::move(guard),telemetry)) {}
 HipMoeOverlapDispatcher::~HipMoeOverlapDispatcher() = default;
-void HipMoeOverlapDispatcher::begin_token(const SerialSessionContext& session) {
+void HipMoeOverlapDispatcher::begin_token(const SerialSessionContext& session, MoeTokenSchedule schedule) {
     auto& s = *impl_;
     try {
     require(!s.active && !s.streams.failed(), "MoE overlap token is already active or failed");
+    require(schedule == MoeTokenSchedule::serial_expanded || schedule == MoeTokenSchedule::fork_join,
+            "invalid MoE token schedule");
     s.validate_owner_epoch(true); s.validate_d1();
     require((!s.session_owner || s.session_owner == &session) &&
             session.health == SerialSessionHealth::ready && !session.arithmetic_lineage.tainted &&
@@ -483,7 +499,8 @@ void HipMoeOverlapDispatcher::begin_token(const SerialSessionContext& session) {
     s.allocation_lease.claim({{{s.scratch.arena_base,s.scratch.arena_bytes},
         {s.state_memory.device_base,s.state_memory.device_bytes}, {s.state_memory.host_base,s.state_memory.host_bytes},
         {record.arena_base,record.arena_bytes}}});
-    s.streams.begin_token(session.next_position,session.committed_tokens,static_cast<std::uint32_t>(s.plan.layers().size()));
+    s.streams.begin_token(session.next_position,session.committed_tokens,static_cast<std::uint32_t>(s.plan.layers().size()),schedule);
+    s.schedule = schedule;
     s.session_owner = &session; s.entry_state = session.state; s.committed_before = session.committed_tokens;
     s.entry_history = session.arithmetic_lineage.history_identity; s.entry_intervals = session.arithmetic_lineage.intervals.size();
     s.d1_record = current_hip_launch_context()->deferred_moe_status; s.d1_bound = true;

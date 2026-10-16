@@ -1,5 +1,6 @@
 #pragma once
 #include "strix/hip_launch_context.hpp"
+#include "strix/moe_token_schedule.hpp"
 #include "strix/launch_dispatch.hpp"
 #include "strix/moe_fork_join_arena.hpp"
 #include "strix/serial_session.hpp"
@@ -35,7 +36,9 @@ private:
 };
 struct HipMoeOverlapStats {
     std::uint64_t fork_records = 0, join_waits = 0, verified_tokens = 0;
+    // committed_layers counts actual fork/join layers, not serial traversals.
     std::uint64_t committed_tokens = 0, committed_layers = 0, aborted_tokens = 0;
+    std::uint64_t serial_tokens = 0, fork_join_tokens = 0;
 };
 enum class HipMoeWorkState { idle, prepared, submitted, gpu_completed, validated, committed, recyclable, failed_drained };
 // Observation only, never an admission permit. Host callback return is not GPU
@@ -46,6 +49,7 @@ struct HipMoeWorkTicket {
     std::uint64_t input_position = 0, committed_before = 0;
     std::uint64_t binding_identity = 0, scratch_generation = 0;
     std::uint64_t state_device_generation = 0, state_host_generation = 0, status_generation = 0;
+    MoeTokenSchedule schedule = MoeTokenSchedule::fork_join;
     HipMoeWorkState state = HipMoeWorkState::idle;
     // validated covers branch completion/metadata. The enclosing D1 completion
     // hook must still validate its main-only logical record before real commit.
@@ -63,7 +67,8 @@ public:
     ~HipMoeSiblingStreams();
     HipMoeSiblingStreams(const HipMoeSiblingStreams&) = delete;
     HipMoeSiblingStreams& operator=(const HipMoeSiblingStreams&) = delete;
-    void begin_token(std::uint64_t input_position, std::uint64_t committed_before, std::uint32_t expected_layers);
+    void begin_token(std::uint64_t input_position, std::uint64_t committed_before, std::uint32_t expected_layers,
+                     MoeTokenSchedule = MoeTokenSchedule::fork_join);
     void fork_shared(std::uint32_t layer);
     void record_shared_done(std::uint32_t layer);
     void begin_experts(std::uint32_t layer);
@@ -84,7 +89,8 @@ private:
 };
 // Real dispatcher adapter for the immutable expanded S04a arena and a FRESH
 // launch plan compiled against that new identity. It keeps original host step
-// order route/shared/experts/combine; ONLY shared launches on side. All kernels,
+// order route/shared/experts/combine. Fork/join sends only shared to side;
+// serial-expanded sends every step to main under the same owner/lease. All kernels,
 // launcher math, catalog IDs and DirectLaunchDispatcher behavior stay original.
 // compiled/resources/telemetry objects themselves must outlive this adapter;
 // supplied pins must retain their actual allocation and launcher-config owners.
@@ -104,7 +110,9 @@ public:
     ~HipMoeOverlapDispatcher();
     HipMoeOverlapDispatcher(const HipMoeOverlapDispatcher&) = delete;
     HipMoeOverlapDispatcher& operator=(const HipMoeOverlapDispatcher&) = delete;
-    void begin_token(const SerialSessionContext&);
+    // Both modes retain the SAME exclusive allocation lease and publication checks.
+    // Serial mode emits every original step on main; it never forks side work.
+    void begin_token(const SerialSessionContext&, MoeTokenSchedule = MoeTokenSchedule::fork_join);
     void dispatch_kernel(const ExecutionDispatchContext&) override;
     void dispatch_runtime_step(const ExecutionDispatchContext&) override;
     // Explicit composition with state-only prefix output: only the single final

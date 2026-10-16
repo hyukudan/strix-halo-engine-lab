@@ -15,6 +15,7 @@
 #include "strix/model_runtime_binding.hpp"
 #include "strix/session_state_layout.hpp"
 #include "strix/session_state_memory.hpp"
+#include "strix/hip_session_snapshot_transfer.hpp"
 
 #include <hip/hip_runtime.h>
 
@@ -1423,6 +1424,143 @@ int main() try {
         for (std::size_t i = 0; i < runtime.tensors.size(); ++i)
             expect(immutable_weights[i] == read(runtime.tensors[i].address, runtime.tensors[i].bytes),
                 "production hierarchical selection preserves every weight byte");
+    }
+
+    // Compact rollback is a logical-prefix contract. Exercise the REAL QSA
+    // reader after speculative writes and poison every inactive future KV row;
+    // compare produced outputs/active state, never the unspecified flat tail.
+    {
+        struct SnapshotOwners {
+            strix::HipSetupQuiescenceGuard guard;
+            hipStream_t stream = nullptr;
+            void* state = nullptr; void* saved = nullptr;
+            ~SnapshotOwners() {
+                guard.recover_or_fail_stop();
+                if (saved) (void)hipFree(saved);
+                if (state) (void)hipFree(state);
+                if (stream) (void)hipStreamDestroy(stream);
+            }
+        } own;
+        auto snapshot_model = model;
+        snapshot_model.gdn_key_heads = snapshot_model.gdn_value_heads = 1;
+        snapshot_model.gdn_key_head_dim = snapshot_model.gdn_value_head_dim = 2;
+        auto snapshot_manifest = manifest;
+        snapshot_manifest.total_tensor_bytes = 0;
+        auto snapshot_weights = runtime;
+        auto snapshot_access = access;
+        for (std::size_t i = 0; i < host_weights.size(); ++i) {
+            auto values = *host_weights[i];
+            if (snapshot_manifest.tensors[i].name.find("norm.weight") != std::string::npos)
+                for (auto& value : values) value += 1.0F;
+            snapshot_manifest.tensors[i].ggml_type = 0;
+            snapshot_manifest.tensors[i].byte_size = values.size() * sizeof(float);
+            snapshot_manifest.total_tensor_bytes += snapshot_manifest.tensors[i].byte_size;
+            snapshot_weights.tensors[i].bytes = values.size() * sizeof(float);
+            own.guard.run([&] { check(hipMemcpy(device_weights[i], values.data(), values.size() * sizeof(float),
+                hipMemcpyHostToDevice), "restore compact QSA F32 fixture weights"); });
+        }
+        snapshot_manifest.layout_identity = strix::model_manifest_layout_identity(snapshot_manifest);
+        snapshot_weights.manifest_layout_identity = snapshot_manifest.layout_identity;
+        snapshot_access.manifest_layout_identity = snapshot_manifest.layout_identity;
+        const auto layout = strix::build_serial_session_state_layout(snapshot_model, {8,256,64,true});
+        std::vector<std::byte> host_bytes(static_cast<std::size_t>(layout.host_total_bytes));
+        own.guard.run([&] {
+            check(hipStreamCreateWithFlags(&own.stream, hipStreamNonBlocking), "create compact QSA stream");
+            check(hipMalloc(&own.state, layout.device_total_bytes), "allocate canonical compact QSA state");
+            check(hipMalloc(&own.saved, layout.device_total_bytes), "allocate compact QSA snapshot capacity");
+        });
+        const strix::SessionStateMemoryBinding memory{layout.layout_identity,
+            reinterpret_cast<std::uintptr_t>(own.state),layout.device_total_bytes,31,
+            reinterpret_cast<std::uintptr_t>(host_bytes.data()),host_bytes.size(),32};
+        auto snapshot_resources = resources;
+        snapshot_resources.model_manifest = &snapshot_manifest; snapshot_resources.model_weights = &snapshot_weights;
+        snapshot_resources.tensor_access = &snapshot_access;
+        snapshot_resources.session_state_layout = &layout; snapshot_resources.session_state_memory = &memory;
+        auto row_context = context;
+        row_context.resources = &snapshot_resources; row_context.session_state_layout = &layout;
+        row_context.session_state_memory = &memory;
+        auto snapshot_config = config; snapshot_config.model = snapshot_model;
+        const auto production = strix::make_hip_indexed_attention_launcher("test.compact.qsa", &snapshot_config);
+        strix::HipLaunchContext scope; scope.stream = own.stream;
+        const auto run = [&](std::uint64_t position, unsigned salt) {
+            auto values = hidden;
+            for (std::size_t i = 0; i < values.size(); ++i)
+                values[i] = float_to_bf16(static_cast<float>(static_cast<int>((i + salt * 3U) % 23U) - 11) / 17.0F);
+            own.guard.run([&] {
+                check(hipMemcpy(reinterpret_cast<void*>(input.address),values.data(),values.size()*2U,
+                    hipMemcpyHostToDevice),"copy compact QSA continuation input");
+                row_context.position = position;
+                const strix::HipLaunchScope active(scope);
+                production.function(row_context,production.user_data);
+            });
+        };
+        const auto* kv = strix::find_session_state_allocation(layout, strix::SessionStateComponent::attention_kv);
+        const auto row_bytes = strix::build_indexed_attention_state_layout(snapshot_model).kv_row_bytes;
+        for (auto occupied : {1ULL,3ULL,5ULL}) {
+            std::vector<std::uint16_t> expected_output;
+            std::vector<std::byte> expected_state;
+            for (auto policy : {strix::SessionSnapshotPolicy::full_components, strix::SessionSnapshotPolicy::occupied_kv_v1}) {
+                std::fill(host_bytes.begin(),host_bytes.end(),std::byte{0});
+                own.guard.run([&] { check(hipMemset(own.state,0,layout.device_total_bytes),"reset compact QSA state"); });
+                for (std::uint64_t p = 0; p < occupied; ++p) run(p,static_cast<unsigned>(p));
+                strix::SerialSessionSnapshotRequest request;
+                request.compiled_execution_identity = scratch.execution_identity;
+                request.runtime_compatibility_identity = 0x515341;
+                request.next_position = request.committed_tokens = occupied;
+                request.state.valid = strix::PersistentState::attention_kv | strix::PersistentState::sparse_index;
+                request.state.generations.fill(4); request.policy = policy;
+                const auto plan = strix::build_serial_session_snapshot_plan(snapshot_model,layout,request);
+                const auto restore = strix::build_serial_session_restore_plan(snapshot_model,layout,0x515341,plan);
+                const strix::SessionSnapshotMemoryBinding saved{plan.plan_identity,
+                    reinterpret_cast<std::uintptr_t>(own.saved),layout.device_total_bytes,0,0,33};
+                strix::HipSessionSnapshotTransferBackend transfer;
+                strix::capture_serial_session_snapshot(plan,layout,memory,saved,transfer,
+                    policy == strix::SessionSnapshotPolicy::occupied_kv_v1 ? &snapshot_model : nullptr);
+                run(occupied,77); run(occupied+1U,78); // provisional rows to reject
+                strix::SerialSessionContext session;
+                session.execution_identity = scratch.execution_identity; session.runtime_compatibility_identity = 0x515341;
+                session.state_layout_identity = layout.layout_identity;
+                session.next_position = session.committed_tokens = occupied+2U;
+                strix::restore_serial_session_snapshot(session,restore,layout,memory,saved,transfer,
+                    policy == strix::SessionSnapshotPolicy::occupied_kv_v1 ? &snapshot_model : nullptr);
+                // Different current input must overwrite the ENTIRE poisoned
+                // row before any selected-key/value read can observe it.
+                const std::vector<std::uint16_t> poison(static_cast<std::size_t>((8U-occupied)*row_bytes/2U),0x7fc1U);
+                own.guard.run([&] {
+                    for (std::uint64_t l=0;l<snapshot_model.full_attention_layers;++l)
+                        check(hipMemcpy(reinterpret_cast<void*>(memory.device_base+kv->offset+(l*8U+occupied)*row_bytes),
+                            poison.data(),poison.size()*2U,hipMemcpyHostToDevice),"poison inactive future KV rows");
+                });
+                run(occupied,123);
+                std::vector<std::uint16_t> produced(hidden_width);
+                std::vector<std::byte> persisted(static_cast<std::size_t>(layout.device_total_bytes));
+                own.guard.run([&] {
+                    check(hipMemcpy(produced.data(),reinterpret_cast<const void*>(output.address),produced.size()*2U,
+                        hipMemcpyDeviceToHost),"read compact QSA output");
+                    check(hipMemcpy(persisted.data(),own.state,persisted.size(),hipMemcpyDeviceToHost),"read compact QSA active state");
+                });
+                for (const auto bits : produced) expect(std::isfinite(bf16_to_float(bits)),
+                    "inactive future NaN KV cannot contaminate current QSA output");
+                if (policy == strix::SessionSnapshotPolicy::full_components) {
+                    expected_output = produced; expected_state = persisted;
+                } else {
+                    expect(produced == expected_output,"compact QSA rollback continuation equals full snapshot output bits");
+                    for (const auto& allocation : layout.allocations) {
+                        if (allocation.storage != strix::SessionStateStorage::device) continue;
+                        if (allocation.component == strix::SessionStateComponent::attention_kv) {
+                            for (std::uint64_t l=0;l<snapshot_model.full_attention_layers;++l) {
+                                const auto begin=allocation.offset+l*8U*row_bytes;
+                                const auto rows=occupied+(l==strix::indexed_attention_layer_ordinal(snapshot_model,*step.layer)?1U:0U);
+                                expect(std::equal(persisted.begin()+begin,persisted.begin()+begin+rows*row_bytes,
+                                    expected_state.begin()+begin),"all occupied KV layers equal after actual QSA continuation");
+                            }
+                        } else expect(std::equal(persisted.begin()+allocation.offset,
+                            persisted.begin()+allocation.offset+allocation.bytes,expected_state.begin()+allocation.offset),
+                            "QSA compact rollback preserves all non-KV device state");
+                    }
+                }
+            }
+        }
     }
 
     for (auto* pointer :

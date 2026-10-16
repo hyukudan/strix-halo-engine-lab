@@ -1,6 +1,7 @@
 #include "strix/session_snapshot_transfer.hpp"
 
 #include "strix/model_contract.hpp"
+#include "strix/indexed_attention_state.hpp"
 
 #include <algorithm>
 #include <cstring>
@@ -111,9 +112,125 @@ strix::PersistentState all_state() {
            PersistentState::position_history;
 }
 
+void occupied_kv_roundtrip() {
+    using namespace strix;
+    auto model = ModelContract::qwen38_flash_next();
+    model.gdn_key_heads = model.gdn_value_heads = 1;
+    model.gdn_key_head_dim = model.gdn_value_head_dim = 2;
+    const auto layout = build_serial_session_state_layout(model, {8, 64, 64, true});
+    std::vector<std::uint8_t> device(static_cast<std::size_t>(layout.device_total_bytes), 0x35U);
+    std::vector<std::uint8_t> host(static_cast<std::size_t>(layout.host_total_bytes), 0x47U);
+    const auto* kv = find_session_state_allocation(layout, SessionStateComponent::attention_kv);
+    const auto row = build_indexed_attention_state_layout(model).kv_row_bytes;
+    for (std::uint64_t layer = 0; layer < model.full_attention_layers; ++layer)
+        for (std::uint64_t token = 0; token < layout.context_tokens; ++token)
+            for (std::uint64_t byte = 0; byte < row; ++byte)
+                device[kv->offset + (layer * layout.context_tokens + token) * row + byte] =
+                    static_cast<std::uint8_t>(layer * 23U + token * 7U + byte);
+    const auto original = device;
+    const auto original_host = host;
+    const SessionStateMemoryBinding memory{layout.layout_identity,
+        reinterpret_cast<std::uintptr_t>(device.data()), device.size(), 17,
+        reinterpret_cast<std::uintptr_t>(host.data()), host.size(), 18};
+    for (auto occupied : {0ULL, 1ULL, 3ULL, 4ULL, 5ULL, 8ULL}) {
+        std::copy(original.begin(), original.end(), device.begin());
+        std::copy(original_host.begin(), original_host.end(), host.begin());
+        SerialSessionSnapshotRequest request;
+        request.compiled_execution_identity = 0x1234; request.runtime_compatibility_identity = 0x5678;
+        request.next_position = request.committed_tokens = occupied;
+        request.state.valid = all_state(); request.state.generations.fill(9);
+        request.policy = SessionSnapshotPolicy::occupied_kv_v1;
+        const auto plan = build_serial_session_snapshot_plan(model, layout, request);
+        const auto restore = build_serial_session_restore_plan(model, layout, 0x5678, plan);
+        std::vector<std::uint8_t> saved_device(static_cast<std::size_t>(plan.device_bytes));
+        std::vector<std::uint8_t> saved_host(static_cast<std::size_t>(plan.host_bytes));
+        const SessionSnapshotMemoryBinding saved{plan.plan_identity,
+            reinterpret_cast<std::uintptr_t>(saved_device.data()), saved_device.size(),
+            reinterpret_cast<std::uintptr_t>(saved_host.data()), saved_host.size(), 19};
+        BatchBackend backend;
+        SerialSessionContext session;
+        session.execution_identity = 0x1234; session.runtime_compatibility_identity = 0x5678;
+        session.state_layout_identity = layout.layout_identity;
+        session.next_position = session.committed_tokens = 8;
+        backend.session = &session; backend.expected_position = 8;
+        capture_serial_session_snapshot(plan, layout, memory, saved, backend, &model);
+        expect(backend.captures == 1, "occupied KV submits exactly one capture batch");
+        // Each copied KV source range stops before its own inactive tail.
+        for (const auto& range : plan.ranges) if (range.component == SessionStateComponent::attention_kv)
+            expect(range.bytes == occupied * row && (range.source_offset - kv->offset) %
+                (layout.context_tokens * row) == 0, "no inactive KV/PAD byte enters the snapshot payload");
+        std::fill(device.begin(), device.end(), 0xd3U);
+        std::fill(host.begin(), host.end(), 0xd3U);
+        restore_serial_session_snapshot(session, restore, layout, memory, saved, backend, &model);
+        expect(session.next_position == occupied && session.state.generations == request.state.generations &&
+            host == original_host && backend.restores == 1, "compact restore publishes saved consumed frontier only after completion");
+        for (const auto& allocation : layout.allocations) if (allocation.storage == SessionStateStorage::device) {
+            for (std::uint64_t i = 0; i < allocation.bytes; ++i) {
+                const bool active = allocation.component != SessionStateComponent::attention_kv ||
+                    (i % (layout.context_tokens * row)) < occupied * row;
+                expect(device[allocation.offset + i] == (active ? original[allocation.offset + i] : 0xd3U),
+                    "all occupied layers and non-KV state restore; inactive KV remains explicitly unspecified");
+            }
+        }
+        if (occupied < layout.context_tokens) {
+            auto reference = original;
+            // Logical continuation writes the complete new row before any read.
+            for (std::uint64_t layer = 0; layer < model.full_attention_layers; ++layer) {
+                const auto first = kv->offset + (layer * layout.context_tokens + occupied) * row;
+                std::fill_n(device.begin() + first, row, 0x29U);
+                std::fill_n(reference.begin() + first, row, 0x29U);
+                const auto base = kv->offset + layer * layout.context_tokens * row;
+                expect(std::equal(device.begin() + base, device.begin() + base + (occupied + 1U) * row,
+                    reference.begin() + base), "continuation reads only restored prefix plus fully overwritten current KV row");
+            }
+        }
+        for (unsigned fault = 0; fault < 12U; ++fault) {
+            auto bad = plan;
+            if (fault == 0) ++bad.ranges.back().source_offset;
+            if (fault == 1) bad.ranges.pop_back();
+            if (fault == 2) bad.ranges.back().destination_offset = UINT64_MAX;
+            if (fault == 3) bad.ranges.back().bytes = UINT64_MAX;
+            if (fault == 4) bad.policy = static_cast<SessionSnapshotPolicy>(88);
+            if (fault == 5) ++bad.state.generations[0];
+            if (fault == 6) bad.ranges.back().storage = static_cast<SessionStateStorage>(88);
+            if (fault == 10) bad.policy = SessionSnapshotPolicy::full_components;
+            if (fault == 11 && occupied) ++bad.ranges[model.full_attention_layers - 1U].source_offset;
+            if (fault == 11 && !occupied) ++bad.ranges[0].source_offset;
+            auto truncated = saved;
+            if (fault == 7) --truncated.device_section_bytes;
+            if (fault == 9) truncated.allocation_generation = 0;
+            MemcpyBackend untouched;
+            bool rejected = false;
+            try { capture_serial_session_snapshot(bad, layout, memory, truncated, untouched, fault == 8U ? nullptr : &model); }
+            catch (const std::exception&) { rejected = true; }
+            expect(rejected && untouched.calls == 0, "compact malformed late range/header/truncation rejects before any copy");
+        }
+        auto forged = restore; ++forged.ranges.back().destination_offset;
+        MemcpyBackend untouched;
+        bool rejected = false;
+        try { restore_serial_session_snapshot(session, forged, layout, memory, saved, untouched, &model); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        expect(rejected && untouched.calls == 0, "compact restore validates interior destinations before any copy");
+        forged = restore; forged.policy = SessionSnapshotPolicy::full_components;
+        rejected = false;
+        try { restore_serial_session_snapshot(session, forged, layout, memory, saved, untouched); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        expect(rejected && untouched.calls == 0, "compact-to-full forged restore policy cannot bypass canonical admission");
+        session.next_position = session.committed_tokens = 8;
+        session.health = SerialSessionHealth::ready;
+        backend.completion_failure = true;
+        rejected = false;
+        try { restore_serial_session_snapshot(session, restore, layout, memory, saved, backend, &model); }
+        catch (const std::runtime_error&) { rejected = true; }
+        expect(rejected && session.health == SerialSessionHealth::poisoned && session.arithmetic_lineage.tainted &&
+            session.next_position == 8, "compact failed batch completion poisons without publishing rollback metadata");
+    }
+}
+
 }  // namespace
 
 int main() {
+    occupied_kv_roundtrip();
     const auto model =
         strix::ModelContract::qwen38_flash_next();
 

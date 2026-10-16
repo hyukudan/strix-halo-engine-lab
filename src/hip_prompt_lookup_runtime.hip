@@ -87,6 +87,8 @@ struct HipPromptLookupRuntime::Impl {
     struct Point { SerialSessionContext session; std::uint32_t token = 0; bool valid = false; };
     Point base, verified, replayed;
     HipPromptLookupAdaptivePolicy adaptive_policy;
+    HipPromptLookupSnapshotPolicy snapshot_policy;
+    std::uint64_t latest_snapshot_payload_bytes = 0;
     HipPromptLookupAdaptiveStats adaptive_stats;
     std::optional<ObservedSpeculationController> adaptive_controller;
     struct AdaptiveContext {
@@ -106,11 +108,15 @@ struct HipPromptLookupRuntime::Impl {
         const ExecutionRuntimeResources& r, CompiledKnownPrefixWindow w, std::shared_ptr<HipKnownPrefixWindow> native,
         ExecutionMemoryBinding memory, HipLaunchContext serial_stream, HipLaunchContext stream, std::shared_ptr<const void> retained,
         std::shared_ptr<const HipSetupQuiescenceGuard> original, RuntimeMemoryAllocator& a, AllocationGenerationSource& g,
-        HipPromptLookupAdaptivePolicy adaptive)
+        HipPromptLookupAdaptivePolicy adaptive, HipPromptLookupSnapshotPolicy snapshot)
         : owner(std::move(retained)), guard(std::move(original)), serial(std::move(s)), model(std::move(m)),
           config(std::move(cfg)), resources(r), compiled_window(std::move(w)), window(std::move(native)),
           window_memory(memory), scope(stream), serial_scope(serial_stream), allocator(a), generations(g), transfer(guard,stream.stream), catalog(model,config) {
         adaptive_policy=adaptive;
+        snapshot_policy=snapshot;
+        validate_session_snapshot_policy(snapshot.format);
+        require_lookup(snapshot.format!=SessionSnapshotPolicy::occupied_kv_v1 || snapshot.max_payload_bytes,
+            "occupied KV lookup snapshot requires a positive payload budget");
         if(adaptive.enabled) {
             require_lookup(adaptive.context_bucket_tokens && adaptive.context_bucket_tokens<=1048576U,
                 "prompt lookup adaptive context bucket must be within one and 1048576 tokens");
@@ -311,9 +317,10 @@ HipPromptLookupRuntime::HipPromptLookupRuntime(CompiledSerialExecution serial,Mo
     HipLauncherCatalogConfig config,const ExecutionRuntimeResources& resources,CompiledKnownPrefixWindow compiled_window,
     std::shared_ptr<HipKnownPrefixWindow> window,ExecutionMemoryBinding scratch,HipLaunchContext serial_scope,HipLaunchContext scope,
     std::shared_ptr<const void> owner,std::shared_ptr<const HipSetupQuiescenceGuard> guard,
-    RuntimeMemoryAllocator& allocator,AllocationGenerationSource& generations,HipPromptLookupAdaptivePolicy adaptive)
+    RuntimeMemoryAllocator& allocator,AllocationGenerationSource& generations,HipPromptLookupAdaptivePolicy adaptive,
+    HipPromptLookupSnapshotPolicy snapshot)
     :impl_(std::make_unique<Impl>(std::move(serial),std::move(model),std::move(config),resources,std::move(compiled_window),
-        std::move(window),scratch,serial_scope,scope,std::move(owner),std::move(guard),allocator,generations,adaptive)) {}
+        std::move(window),scratch,serial_scope,scope,std::move(owner),std::move(guard),allocator,generations,adaptive,snapshot)) {}
 HipPromptLookupRuntime::~HipPromptLookupRuntime()=default;
 void HipPromptLookupRuntime::prime_from_serial_logits(SerialSessionContext& session) {
     impl_->admit(session);
@@ -373,6 +380,24 @@ GreedyDraftExecutionResult HipPromptLookupRuntime::cycle(SerialSessionContext& s
     require_lookup(request.max_candidate_depth<=2U,"prompt lookup maps depths only to zero, one or two target rows");
     require_lookup(draft_state.proposal_identity==lookup.proposal_identity(),"prompt lookup proposal owner changed");
     auto selected_request=request;
+    selected_request.snapshot_policy=impl_->snapshot_policy.format;
+    selected_request.max_snapshot_payload_bytes=impl_->snapshot_policy.max_payload_bytes;
+    // Admit current occupied bytes before proposing/altering drafter state.
+    // The generic executor repeats the budget check before snapshot allocation.
+    if(selected_request.snapshot_policy==SessionSnapshotPolicy::occupied_kv_v1 &&
+        selected_request.max_candidate_depth && selected_request.token_budget>1U &&
+        session.next_position<impl_->resources.session_state_layout->context_tokens) {
+        SerialSessionSnapshotRequest snapshot;
+        snapshot.compiled_execution_identity=session.execution_identity;
+        snapshot.runtime_compatibility_identity=session.runtime_compatibility_identity;
+        snapshot.next_position=session.next_position; snapshot.committed_tokens=session.committed_tokens;
+        snapshot.state=session.state; snapshot.alignment=selected_request.snapshot_alignment;
+        snapshot.policy=selected_request.snapshot_policy;
+        const auto plan=build_serial_session_snapshot_plan(impl_->model,*impl_->resources.session_state_layout,snapshot);
+        require_lookup(plan.device_bytes<=UINT64_MAX-plan.host_bytes &&
+            plan.device_bytes+plan.host_bytes<=impl_->snapshot_policy.max_payload_bytes,
+            "occupied KV lookup snapshot exceeds its payload budget");
+    }
     if(impl_->adaptive_policy.enabled) impl_->start_adaptive(session,draft_state,selected_request,started);
     GreedyDraftExecutionResult result;
     try {
@@ -399,6 +424,10 @@ GreedyDraftExecutionResult HipPromptLookupRuntime::cycle(SerialSessionContext& s
         throw std::invalid_argument("prompt lookup cycle emitted no frontier");
     }
     impl_->pending=result.target_cycle.plan.emitted_tokens.back();
+    if(result.target_cycle.snapshot_captured) {
+        const auto& snapshot=result.target_cycle.plan.pre_window_snapshot;
+        impl_->latest_snapshot_payload_bytes=snapshot.device_bytes+snapshot.host_bytes;
+    }
     impl_->stopped_on_eos=result.target_cycle.plan.verification.stopped_on_eos;
     if(impl_->adaptive_measurement.active) impl_->adaptive_measurement.emitted=result.target_cycle.plan.emitted_tokens.size();
     return result;
@@ -420,6 +449,8 @@ void HipPromptLookupRuntime::consume_pending_bonus(SerialSessionContext& session
     impl_->pending.reset();
 }
 std::optional<std::uint32_t> HipPromptLookupRuntime::pending_bonus() const noexcept { return impl_->pending; }
+const HipPromptLookupSnapshotPolicy& HipPromptLookupRuntime::snapshot_policy() const noexcept {return impl_->snapshot_policy;}
+std::uint64_t HipPromptLookupRuntime::latest_snapshot_payload_bytes() const noexcept {return impl_->latest_snapshot_payload_bytes;}
 void HipPromptLookupRuntime::finish_adaptive_cycle(const SerialSessionContext& session) noexcept {
     if(impl_->adaptive_policy.enabled) impl_->finish_adaptive(session);
 }

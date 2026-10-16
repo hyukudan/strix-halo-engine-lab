@@ -69,6 +69,8 @@ SerialPrefixSnapshot make_serial_prefix_snapshot(
     std::span<const std::uint32_t> prefix_tokens,
     const SerialSessionSnapshotPlan& snapshot,
     const ArithmeticLineage& arithmetic_lineage) {
+    if (snapshot.policy != SessionSnapshotPolicy::full_components)
+        throw std::invalid_argument("serial prefix cache requires a full-component snapshot");
     if (prefix_tokens.empty()) {
         throw std::invalid_argument(
             "serial prefix snapshot requires a non-empty prefix");
@@ -118,7 +120,7 @@ bool serial_prefix_snapshot_matches(
     std::uint64_t runtime_compatibility_identity,
     std::uint64_t state_layout_identity,
     const ArithmeticLineage* requested_history) noexcept {
-    if (prefix.prefix_identity == 0 ||
+    if (prefix.snapshot.policy != SessionSnapshotPolicy::full_components || prefix.prefix_identity == 0 ||
         prefix.snapshot.plan_identity == 0 ||
         requested_prefix.size() !=
             prefix.prefix_tokens.size() ||

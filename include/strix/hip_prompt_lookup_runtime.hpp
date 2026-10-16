@@ -4,6 +4,7 @@
 #include "strix/prompt_lookup_draft.hpp"
 #include "strix/speculation_executor.hpp"
 #include "strix/speculation_controller.hpp"
+#include "strix/session_snapshot.hpp"
 #include <array>
 #include <memory>
 #include <optional>
@@ -14,6 +15,12 @@ struct HipPromptLookupAdaptivePolicy {
     bool enabled = false;
     ObservedSpeculationPolicy controller{};
     std::uint64_t context_bucket_tokens = 256;
+};
+struct HipPromptLookupSnapshotPolicy {
+    SessionSnapshotPolicy format = SessionSnapshotPolicy::full_components;
+    // Retained compact device+host payload, excluding allocator overhead.
+    // Zero retains the legacy unbounded full-component behavior only.
+    std::uint64_t max_payload_bytes = 0;
 };
 struct HipPromptLookupAdaptiveStats {
     bool enabled = false;
@@ -41,7 +48,7 @@ public:
         ExecutionMemoryBinding window_scratch, HipLaunchContext serial_scope, HipLaunchContext window_scope,
         std::shared_ptr<const void> actual_owner, std::shared_ptr<const HipSetupQuiescenceGuard> guard,
         RuntimeMemoryAllocator& snapshot_allocator, AllocationGenerationSource& generations,
-        HipPromptLookupAdaptivePolicy adaptive = {});
+        HipPromptLookupAdaptivePolicy adaptive = {}, HipPromptLookupSnapshotPolicy snapshot = {});
     ~HipPromptLookupRuntime();
     HipPromptLookupRuntime(const HipPromptLookupRuntime&) = delete;
     HipPromptLookupRuntime& operator=(const HipPromptLookupRuntime&) = delete;
@@ -64,6 +71,10 @@ public:
     void finish_adaptive_cycle(const SerialSessionContext& session) noexcept;
     [[nodiscard]] const HipPromptLookupAdaptiveStats& adaptive_stats() const noexcept;
     [[nodiscard]] std::optional<std::uint32_t> pending_bonus() const noexcept;
+    [[nodiscard]] const HipPromptLookupSnapshotPolicy& snapshot_policy() const noexcept;
+    // Last successfully captured snapshot belonging to a completed cycle.
+    // Not a peak, cumulative transfer counter or whole-process memory measure.
+    [[nodiscard]] std::uint64_t latest_snapshot_payload_bytes() const noexcept;
     [[nodiscard]] std::vector<std::uint32_t> verify_target_candidates(SerialSessionContext&,
         const ExecutionRuntimeResources&, std::span<const std::uint32_t>) override;
     void replay_target_token(SerialSessionContext&, const ExecutionRuntimeResources&, std::uint32_t) override;

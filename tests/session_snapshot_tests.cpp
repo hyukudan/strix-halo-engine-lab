@@ -167,6 +167,43 @@ int main() {
     catch (const std::invalid_argument&) { storage_rejected = true; }
     expect(storage_rejected, "snapshot rejects forged storage enum with an incumbent layout identity");
 
+    for (const auto occupied : {0ULL, 1ULL, 3ULL, 4ULL, 5ULL, 32768ULL}) {
+        auto compact_request = request;
+        compact_request.next_position = occupied;
+        compact_request.committed_tokens = occupied;
+        compact_request.policy = strix::SessionSnapshotPolicy::occupied_kv_v1;
+        const auto compact = strix::build_serial_session_snapshot_plan(model, layout, compact_request);
+        strix::validate_serial_session_snapshot_plan(model, layout, compact);
+        const auto row = strix::base_kv_bytes_per_token(model) / model.full_attention_layers;
+        std::uint64_t layers = 0;
+        for (const auto& range : compact.ranges) {
+            const auto* allocation = strix::find_session_state_allocation(layout, range.component);
+            if (range.component == strix::SessionStateComponent::attention_kv) {
+                expect(range.source_offset == allocation->offset + layers * layout.context_tokens * row &&
+                    range.bytes == occupied * row, "occupied KV preserves each capacity-strided layer prefix");
+                ++layers;
+            } else expect(range.source_offset == allocation->offset && range.bytes == allocation->bytes,
+                "occupied KV leaves sparse, recurrent, convolution and host histories complete");
+        }
+        expect(layers == (occupied ? model.full_attention_layers : 0ULL) &&
+            compact.plan_identity != snapshot.plan_identity, "compact format has closed range census and distinct identity");
+        if (occupied) {
+            for (unsigned fault = 0; fault < 6U; ++fault) {
+                auto bad = compact;
+                if (fault == 0) bad.ranges.erase(bad.ranges.begin() + model.full_attention_layers - 1U);
+                if (fault == 1) ++bad.ranges[1].source_offset;
+                if (fault == 2) bad.ranges[1] = bad.ranges[0];
+                if (fault == 3) ++bad.ranges.back().bytes;
+                if (fault == 4) bad.policy = static_cast<strix::SessionSnapshotPolicy>(99);
+                if (fault == 5) ++bad.next_position;
+                bool rejected = false;
+                try { strix::validate_serial_session_snapshot_plan(model, layout, bad); }
+                catch (const std::exception&) { rejected = true; }
+                expect(rejected, "compact snapshot rejects missing layer, forged stride/duplicate/payload/policy/frontier");
+            }
+        }
+    }
+
     if (failures == 0) {
         std::cout << "session snapshot tests passed\n";
     }

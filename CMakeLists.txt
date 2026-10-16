@@ -66,6 +66,7 @@ add_library(strix_core STATIC
     src/offline_compile_provenance.cpp
     src/uma_owner_inventory.cpp
     src/moe_fork_join_arena.cpp
+    src/moe_token_cost_backend.cpp
     src/prepared_execution.cpp
     src/prepared_tensor_views.cpp
     src/prepared_arena_views.cpp
@@ -319,6 +320,11 @@ if(BUILD_TESTING)
     target_link_libraries(strix-execution-inventory-receipt-tests PRIVATE strix_core)
     strix_target_warnings(strix-execution-inventory-receipt-tests)
     add_test(NAME strix-execution-inventory-receipt-tests COMMAND strix-execution-inventory-receipt-tests)
+    add_executable(strix-moe-token-cost-backend-tests tests/moe_token_cost_backend_tests.cpp)
+    target_link_libraries(strix-moe-token-cost-backend-tests PRIVATE strix_core)
+    strix_target_warnings(strix-moe-token-cost-backend-tests)
+    add_test(NAME strix-moe-token-cost-backend-tests COMMAND strix-moe-token-cost-backend-tests)
+
     add_executable(strix-serving-cohort-tests tests/serving_cohort_tests.cpp)
     target_link_libraries(strix-serving-cohort-tests PRIVATE strix_core)
     strix_target_warnings(strix-serving-cohort-tests)

@@ -24,7 +24,7 @@ void hash_u64(
 bool same_snapshot_structure(
     const SerialSessionSnapshotPlan& left,
     const SerialSessionSnapshotPlan& right) {
-    if (left.recurrent_storage != right.recurrent_storage || left.plan_identity !=
+    if (left.policy != right.policy || left.recurrent_storage != right.recurrent_storage || left.plan_identity !=
             right.plan_identity ||
         left.device_bytes !=
             right.device_bytes ||
@@ -67,6 +67,11 @@ std::uint64_t build_identity(
     hash_u64(
         hash,
         plan.snapshot_plan_identity);
+    if (plan.policy != SessionSnapshotPolicy::full_components) {
+        hash_u64(hash, 0x4f43434b565231ULL);
+        hash_u64(hash, static_cast<std::uint32_t>(plan.policy));
+        hash_u64(hash, plan.snapshot_alignment);
+    }
     hash_u64(
         hash,
         plan.state_layout_identity);
@@ -119,6 +124,7 @@ build_serial_session_restore_plan(
     const SerialSessionStateLayout& destination_layout,
     std::uint64_t runtime_compatibility_identity,
     const SerialSessionSnapshotPlan& snapshot) {
+    validate_session_snapshot_policy(snapshot.policy);
     if (runtime_compatibility_identity == 0 ||
         snapshot.runtime_compatibility_identity !=
             runtime_compatibility_identity) {
@@ -146,6 +152,7 @@ build_serial_session_restore_plan(
         snapshot.alignment;
     expected_request.state =
         snapshot.state;
+    expected_request.policy = snapshot.policy;
 
     const auto expected_snapshot =
         build_serial_session_snapshot_plan(
@@ -161,6 +168,8 @@ build_serial_session_restore_plan(
     }
 
     SerialSessionRestorePlan restore;
+    restore.policy = snapshot.policy;
+    restore.snapshot_alignment = snapshot.alignment;
     restore.recurrent_storage = destination_layout.recurrent_storage;
     restore.compiled_execution_identity =
         snapshot.compiled_execution_identity;
@@ -192,7 +201,10 @@ build_serial_session_restore_plan(
             throw std::invalid_argument(
                 "restore destination component is missing");
         }
-        if (destination->storage !=
+        if (source.source_offset < destination->offset ||
+            source.source_offset - destination->offset > destination->bytes ||
+            source.bytes > destination->bytes - (source.source_offset - destination->offset) ||
+            destination->storage !=
             source.storage ||
             source.bytes >
                 destination->bytes) {
@@ -219,7 +231,7 @@ build_serial_session_restore_plan(
                 source.component,
                 source.storage,
                 source.destination_offset,
-                destination->offset,
+                source.source_offset,
                 source.bytes,
             });
     }
@@ -231,6 +243,12 @@ build_serial_session_restore_plan(
             "restore plan identity must be non-zero");
     }
     return restore;
+}
+
+void validate_serial_session_restore_identity(const SerialSessionRestorePlan& restore) {
+    validate_session_snapshot_policy(restore.policy);
+    if (!restore.plan_identity || build_identity(restore) != restore.plan_identity)
+        throw std::invalid_argument("restore metadata identity mismatch");
 }
 
 }  // namespace strix

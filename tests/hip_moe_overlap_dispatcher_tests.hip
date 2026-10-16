@@ -220,13 +220,26 @@ void cancellation_and_owner_lifetime() {
     streams.reset(); // No record_shared_done/join: destruction must drain side independently.
     require(weak.expired(),"quiescent branch owner was not released after event/stream teardown");
 }
-void graph_rejected() {
+void serial_schedule_protocol() {
+    for (const bool invalid_schedule : {false,true}) {
+        auto resources = std::make_shared<Resources>();
+        strix::HipMoeSiblingStreams streams(resources->main,resources,resources->guard);
+        if (invalid_schedule) reject([&] { streams.begin_token(0,0,1,static_cast<strix::MoeTokenSchedule>(99)); });
+        else {
+            streams.begin_token(0,0,1,strix::MoeTokenSchedule::serial_expanded);
+            reject([&] { streams.fork_shared(0); });
+        }
+        require(streams.failed() && streams.stats().fork_records == 0U && streams.stats().join_waits == 0U &&
+            streams.stats().committed_tokens == 0U, "serial/invalid schedule submitted an unauthorized fork or commit");
+    }
+}
+void graph_rejected(strix::MoeTokenSchedule schedule = strix::MoeTokenSchedule::fork_join) {
     auto resources = std::make_shared<Resources>();
     strix::HipMoeSiblingStreams streams(resources->main,resources,resources->guard);
     check(hipStreamBeginCapture(resources->main,hipStreamCaptureModeThreadLocal), "fixture graph begin");
     bool failed = false;
     std::exception_ptr unexpected;
-    try { streams.begin_token(0,0,1); } catch (const std::logic_error&) { failed = true; }
+    try { streams.begin_token(0,0,1,schedule); } catch (const std::logic_error&) { failed = true; }
     catch (...) { unexpected = std::current_exception(); }
     hipGraph_t graph = nullptr;
     check(hipStreamEndCapture(resources->main,&graph), "fixture graph end");
@@ -413,7 +426,9 @@ struct Callbacks {
                 hipLaunchKernelGGL(producer,dim3(1),dim3(1),0,strix::hip_execution_stream(),address(layer.input),layer.layer+1U);
             } else if (c.step_id == layer.shared_step || c.step_id == layer.experts_step) {
                 const bool shared = c.step_id == layer.shared_step;
-                require((strix::hip_deferred_moe_status() == nullptr) == shared, "adapter D1 publisher scope differs");
+                require((strix::hip_deferred_moe_status() == nullptr) ==
+                    (shared && self.overlap->ticket().schedule == strix::MoeTokenSchedule::fork_join),
+                    "adapter D1 publisher scope differs");
                 hipLaunchKernelGGL(toy_branch,dim3(1),dim3(1),0,strix::hip_execution_stream(),address(layer.input),
                     address(shared ? layer.shared_output : layer.routed_output),
                     address(shared ? layer.shared_temporary : layer.routed_temporary),shared ? 3U : 7U);
@@ -449,7 +464,7 @@ struct Callbacks {
         }
     }
 };
-void actual_adapter(bool prepared_mode, bool omit_head, unsigned failure) {
+void actual_adapter(bool prepared_mode, bool omit_head, unsigned failure, unsigned scheduling = 0U) {
     const bool between_tokens = failure >= 9U;
     Fixture fixture;
     auto callbacks = std::make_shared<Callbacks>(Callbacks{fixture,prepared_mode,failure == 1U});
@@ -487,7 +502,10 @@ void actual_adapter(bool prepared_mode, bool omit_head, unsigned failure) {
     try {
         strix::HipLaunchScope scope(context);
         for (unsigned repeat = 0; repeat < (failure && !between_tokens ? 1U : 2U); ++repeat) {
-        overlap.begin_token(session);
+        const auto schedule = scheduling == 1U || (scheduling == 2U && repeat == 0U)
+            ? strix::MoeTokenSchedule::serial_expanded : strix::MoeTokenSchedule::fork_join;
+        overlap.begin_token(session,schedule);
+        require(overlap.ticket().schedule == schedule, "adapter lost the selected whole-token schedule");
         require(overlap.ticket().binding_identity && overlap.ticket().session_epoch &&
             overlap.ticket().scratch_generation == initial_scratch.allocation_generation &&
             overlap.ticket().state_device_generation == initial_state_binding.device_allocation_generation &&
@@ -547,6 +565,11 @@ void actual_adapter(bool prepared_mode, bool omit_head, unsigned failure) {
         overlap.ticket().committed == (published != 0U) && hipStreamQuery(fixture.owner->gpu->main) == hipSuccess,
         "adapter must drain failures and cannot recycle before validated actual session commit");
     if (!failure) {
+        const auto serial_tokens = scheduling == 1U ? 2U : (scheduling == 2U ? 1U : 0U);
+        require(overlap.stats().serial_tokens == serial_tokens &&
+            overlap.stats().fork_join_tokens == 2U - serial_tokens &&
+            overlap.stats().join_waits == (2U - serial_tokens) * fixture.plan->layers().size(),
+            "serial scheduling must keep the lease and commit but emit no fork/join events");
         require(callbacks->head_calls == (omit_head ? 0U : 2U) &&
                 output.omitted_heads() == (omit_head ? 2U : 0U) && (!prepared_mode || callbacks->cached_calls > 0U),
                 "adapter prefix/prepared composition differs");
@@ -569,9 +592,16 @@ void actual_adapter(bool prepared_mode, bool omit_head, unsigned failure) {
 int main() try {
     int devices = 0;
     if (hipGetDeviceCount(&devices) != hipSuccess || !devices) return 77;
-    positive(false); positive(true); negative_scope_and_protocol(); graph_rejected(); cancellation_and_owner_lifetime();
+    positive(false); positive(true); negative_scope_and_protocol(); graph_rejected();
+    graph_rejected(strix::MoeTokenSchedule::serial_expanded); serial_schedule_protocol();
+    cancellation_and_owner_lifetime();
     for (const bool prepared : {false,true}) for (const bool omit : {false,true})
         adapter_fixture::actual_adapter(prepared,omit,0);
+    for (unsigned scheduling : {1U,2U})
+        for (const bool prepared : {false,true}) for (const bool omit : {false,true})
+            adapter_fixture::actual_adapter(prepared,omit,0,scheduling);
+    adapter_fixture::actual_adapter(false,false,1,1U);
+    adapter_fixture::actual_adapter(true,true,2,1U);
     adapter_fixture::actual_adapter(false,false,1);
     adapter_fixture::actual_adapter(true,true,2);
     for (unsigned mutation = 3U; mutation <= 8U; ++mutation)

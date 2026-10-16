@@ -78,7 +78,7 @@ public:
         const ArithmeticLineage* requested_history = nullptr) const;
 
     [[nodiscard]] bool valid() const noexcept {
-        return prefix_.prefix_identity != 0 &&
+        return prefix_.snapshot.policy == SessionSnapshotPolicy::full_components && prefix_.prefix_identity != 0 &&
                arithmetic_lineage_valid(prefix_.arithmetic_lineage, prefix_.snapshot.next_position) &&
                memory_.valid();
     }

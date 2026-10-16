@@ -34,6 +34,8 @@ struct SerialSessionRestorePlan {
 
     std::vector<SessionRestoreRange> ranges;
     GdnRecurrentStorage recurrent_storage = GdnRecurrentStorage::key_value;
+    SessionSnapshotPolicy policy = SessionSnapshotPolicy::full_components;
+    std::uint64_t snapshot_alignment = 64;
 };
 
 [[nodiscard]] SerialSessionRestorePlan
@@ -42,5 +44,6 @@ build_serial_session_restore_plan(
     const SerialSessionStateLayout& destination_layout,
     std::uint64_t runtime_compatibility_identity,
     const SerialSessionSnapshotPlan& snapshot);
+void validate_serial_session_restore_identity(const SerialSessionRestorePlan& restore);
 
 }  // namespace strix

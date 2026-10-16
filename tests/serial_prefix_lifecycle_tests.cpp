@@ -5,6 +5,7 @@
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace {
@@ -491,6 +492,22 @@ int main() {
         expect(unknown_rejected, "prefix creation requires actual recorded history");
     }
 
+    {
+        auto compact_request = request;
+        compact_request.policy = strix::SessionSnapshotPolicy::occupied_kv_v1;
+        const auto compact = strix::build_serial_session_snapshot_plan(model, layout, compact_request);
+        bool rejected = false;
+        try { (void)strix::make_serial_prefix_snapshot(tokens, compact, {}); }
+        catch (const std::invalid_argument& error) {
+            rejected = std::string(error.what()).find("full-component") != std::string::npos;
+        }
+        expect(rejected, "complete serving prefix cache rejects a compact snapshot at its own gate");
+        auto forged = prefix;
+        forged.snapshot.policy = strix::SessionSnapshotPolicy::occupied_kv_v1;
+        expect(!strix::serial_prefix_snapshot_matches(forged, tokens, request.compiled_execution_identity,
+            request.runtime_compatibility_identity, layout.layout_identity),
+            "prefix matching rejects a forged compact policy even with unchanged prefix identity");
+    }
     if (failures == 0) {
         std::cout
             << "serial prefix lifecycle tests passed\n";

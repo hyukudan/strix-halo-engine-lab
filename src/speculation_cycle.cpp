@@ -24,6 +24,9 @@ prepare_greedy_speculation_cycle(
     const ModelContract& model,
     const SerialSessionStateLayout& state_layout,
     const GreedySpeculationCycleRequest& request) {
+    validate_session_snapshot_policy(request.snapshot_policy);
+    if (request.snapshot_policy == SessionSnapshotPolicy::occupied_kv_v1 && !request.max_snapshot_payload_bytes)
+        throw std::invalid_argument("occupied KV snapshot requires a positive payload budget");
     if (const auto error = model.validate();
         !error.empty()) {
         throw std::invalid_argument(error);
@@ -98,12 +101,19 @@ prepare_greedy_speculation_cycle(
             request.state;
         snapshot_request.alignment =
             request.snapshot_alignment;
+        snapshot_request.policy = request.snapshot_policy;
 
         preparation.pre_window_snapshot =
             build_serial_session_snapshot_plan(
                 model,
                 state_layout,
                 snapshot_request);
+        const auto& snapshot = preparation.pre_window_snapshot;
+        if (snapshot.device_bytes > std::numeric_limits<std::uint64_t>::max() - snapshot.host_bytes)
+            throw std::overflow_error("speculation snapshot payload byte overflow");
+        if (request.max_snapshot_payload_bytes &&
+            snapshot.device_bytes + snapshot.host_bytes > request.max_snapshot_payload_bytes)
+            throw std::invalid_argument("speculation snapshot exceeds its payload budget");
     }
 
     return preparation;

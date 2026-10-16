@@ -135,7 +135,15 @@ void capture_serial_session_snapshot(
     const SerialSessionStateLayout& state_layout,
     const SessionStateMemoryBinding& state_memory,
     const SessionSnapshotMemoryBinding& snapshot_memory,
-    SessionSnapshotTransferBackend& backend) {
+    SessionSnapshotTransferBackend& backend,
+    const ModelContract* compact_model) {
+    // Authenticate the stored format before branching; a compact plan cannot
+    // bypass canonical admission by changing its public policy field to full.
+    validate_serial_session_snapshot_identity(snapshot);
+    if (snapshot.policy == SessionSnapshotPolicy::occupied_kv_v1) {
+        if (!compact_model) throw std::invalid_argument("occupied KV capture requires the canonical model contract");
+        validate_serial_session_snapshot_plan(*compact_model, state_layout, snapshot);
+    }
     validate_snapshot_memory_binding(
         snapshot,
         snapshot_memory);
@@ -174,9 +182,11 @@ void capture_serial_session_snapshot(
             find_session_state_allocation(
                 state_layout,
                 range.component);
-        if (allocation == nullptr ||
-            range.source_offset !=
-                allocation->offset) {
+        if (allocation == nullptr || range.source_offset < allocation->offset ||
+            range.source_offset - allocation->offset > allocation->bytes ||
+            range.bytes > allocation->bytes - (range.source_offset - allocation->offset) ||
+            (snapshot.policy == SessionSnapshotPolicy::full_components &&
+             range.source_offset != allocation->offset)) {
             throw std::invalid_argument(
                 "snapshot capture currently requires component-prefix ranges");
         }
@@ -188,7 +198,9 @@ void capture_serial_session_snapshot(
                  : state_memory.host_base) +
             static_cast<std::uintptr_t>(
                 range.source_offset);
-        if (source.address != expected_source) {
+        const auto relative = range.source_offset - allocation->offset;
+        if (source.address > std::numeric_limits<std::uintptr_t>::max() - relative ||
+            source.address + relative != expected_source) {
             throw std::invalid_argument(
                 "snapshot source offset does not match bound state layout");
         }
@@ -199,8 +211,8 @@ void capture_serial_session_snapshot(
                 range.storage,
                 range.destination_offset,
                 range.bytes);
-        validate_transfer_extent(source.address, range.bytes);
-        transfers.push_back({range.storage, source.address, destination, range.bytes});
+        validate_transfer_extent(expected_source, range.bytes);
+        transfers.push_back({range.storage, expected_source, destination, range.bytes});
     }
 
     backend.capture_batch(transfers);
@@ -212,7 +224,38 @@ void restore_serial_session_snapshot(
     const SerialSessionStateLayout& state_layout,
     const SessionStateMemoryBinding& state_memory,
     const SessionSnapshotMemoryBinding& snapshot_memory,
-    SessionSnapshotTransferBackend& backend) {
+    SessionSnapshotTransferBackend& backend,
+    const ModelContract* compact_model) {
+    validate_serial_session_restore_identity(restore);
+    if (restore.policy == SessionSnapshotPolicy::occupied_kv_v1) {
+        if (!compact_model) throw std::invalid_argument("occupied KV restore requires the canonical model contract");
+        SerialSessionSnapshotRequest request;
+        request.compiled_execution_identity = restore.compiled_execution_identity;
+        request.runtime_compatibility_identity = restore.runtime_compatibility_identity;
+        request.next_position = restore.next_position;
+        request.committed_tokens = restore.committed_tokens;
+        request.state = restore.state;
+        request.policy = restore.policy;
+        // The compact payload alignment is part of both identities; carry it
+        // explicitly rather than guessing it from the first range offset.
+        request.alignment = restore.snapshot_alignment;
+        const auto snapshot = build_serial_session_snapshot_plan(*compact_model, state_layout, request);
+        const auto expected = build_serial_session_restore_plan(*compact_model, state_layout,
+            restore.runtime_compatibility_identity, snapshot);
+        if (restore.plan_identity != expected.plan_identity ||
+            restore.snapshot_plan_identity != expected.snapshot_plan_identity ||
+            restore.snapshot_device_bytes != expected.snapshot_device_bytes ||
+            restore.snapshot_host_bytes != expected.snapshot_host_bytes ||
+            restore.recurrent_storage != expected.recurrent_storage ||
+            restore.ranges.size() != expected.ranges.size())
+            throw std::invalid_argument("occupied KV restore structure or identity is invalid");
+        for (std::size_t i = 0; i < expected.ranges.size(); ++i) {
+            const auto& a = restore.ranges[i]; const auto& b = expected.ranges[i];
+            if (a.component != b.component || a.storage != b.storage || a.snapshot_offset != b.snapshot_offset ||
+                a.destination_offset != b.destination_offset || a.bytes != b.bytes)
+                throw std::invalid_argument("occupied KV restore range is not canonical");
+        }
+    }
     if (session.execution_identity == 0 ||
         session.execution_identity !=
             restore.compiled_execution_identity ||
@@ -259,18 +302,23 @@ void restore_serial_session_snapshot(
         const auto source = section_address(
             snapshot_memory, range.storage, range.snapshot_offset, range.bytes);
         const auto* allocation = find_session_state_allocation(state_layout, range.component);
-        if (!allocation || range.destination_offset != allocation->offset)
+        if (!allocation || range.destination_offset < allocation->offset ||
+            range.destination_offset - allocation->offset > allocation->bytes ||
+            range.bytes > allocation->bytes - (range.destination_offset - allocation->offset) ||
+            (restore.policy == SessionSnapshotPolicy::full_components && range.destination_offset != allocation->offset))
             throw std::invalid_argument("restore destination offset does not match state allocation");
         const auto expected_destination =
             (range.storage == SessionStateStorage::device
                  ? state_memory.device_base : state_memory.host_base) +
             static_cast<std::uintptr_t>(range.destination_offset);
-        if (destination.address != expected_destination) {
+        const auto relative = range.destination_offset - allocation->offset;
+        if (destination.address > std::numeric_limits<std::uintptr_t>::max() - relative ||
+            destination.address + relative != expected_destination) {
             throw std::invalid_argument(
                 "restore destination offset does not match bound state layout");
         }
-        validate_transfer_extent(destination.address, range.bytes);
-        transfers.push_back({range.storage, source, destination.address, range.bytes});
+        validate_transfer_extent(expected_destination, range.bytes);
+        transfers.push_back({range.storage, source, expected_destination, range.bytes});
     }
 
     try {

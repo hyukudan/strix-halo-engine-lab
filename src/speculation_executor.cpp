@@ -129,7 +129,8 @@ void restore_base(
             !arithmetic_lineage_valid(restored_history, snapshot.next_position)))
             throw std::invalid_argument("speculation snapshot producer history is invalid");
         restore_serial_session_snapshot(session, restore, *resources.session_state_layout,
-            *resources.session_state_memory, snapshot_memory, transfer);
+            *resources.session_state_memory, snapshot_memory, transfer,
+            snapshot.policy == SessionSnapshotPolicy::occupied_kv_v1 ? &model : nullptr);
         const auto identities = build_runtime_execution_identities(compiled.execution_identity,
             compiled.arena, resources);
         if (identities.binding_identity != binding_identity || identities.compatibility_identity != snapshot.runtime_compatibility_identity ||
@@ -197,6 +198,8 @@ execute_greedy_speculation_cycle(
         request.eos_tokens;
     prepare_request.snapshot_alignment =
         request.snapshot_alignment;
+    prepare_request.snapshot_policy = request.snapshot_policy;
+    prepare_request.max_snapshot_payload_bytes = request.max_snapshot_payload_bytes;
 
     const auto preparation =
         prepare_greedy_speculation_cycle(
@@ -219,7 +222,7 @@ execute_greedy_speculation_cycle(
             *resources.session_state_layout,
             *resources.session_state_memory,
             snapshot_owner.binding(),
-            snapshot_transfer);
+            snapshot_transfer, request.snapshot_policy == SessionSnapshotPolicy::occupied_kv_v1 ? &model : nullptr);
         snapshot_captured = true;
     }
 
@@ -460,6 +463,10 @@ execute_greedy_speculation_with_draft(
     GreedySpeculationExecutionBackend& target_backend) {
     GreedyDraftExecutionResult result;
 
+    validate_session_snapshot_policy(request.snapshot_policy);
+    if (request.snapshot_policy == SessionSnapshotPolicy::occupied_kv_v1 && !request.max_snapshot_payload_bytes)
+        throw std::invalid_argument("occupied KV snapshot requires a positive payload budget");
+
     validate_session_binding(
         model, compiled,
         resources,
@@ -531,6 +538,8 @@ execute_greedy_speculation_with_draft(
         request.eos_tokens;
     target_request.snapshot_alignment =
         request.snapshot_alignment;
+    target_request.snapshot_policy = request.snapshot_policy;
+    target_request.max_snapshot_payload_bytes = request.max_snapshot_payload_bytes;
 
     try {
         result.target_cycle =

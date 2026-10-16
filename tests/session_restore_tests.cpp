@@ -167,6 +167,18 @@ int main() {
     expect(corruption_rejected,
            "restore rejects mutated snapshot range even if header identity is unchanged");
 
+    auto compact_request = aligned_request;
+    compact_request.policy = strix::SessionSnapshotPolicy::occupied_kv_v1;
+    const auto compact = strix::build_serial_session_snapshot_plan(model, layout, compact_request);
+    const auto compact_restore = strix::build_serial_session_restore_plan(model, layout,
+        request.runtime_compatibility_identity, compact);
+    expect(compact_restore.policy == compact.policy && compact_restore.snapshot_alignment == compact.alignment &&
+        compact_restore.ranges.size() == compact.ranges.size(), "compact restore retains version, alignment and full layer census");
+    for (std::size_t i = 0; i < compact.ranges.size(); ++i)
+        expect(compact_restore.ranges[i].destination_offset == compact.ranges[i].source_offset &&
+            compact_restore.ranges[i].snapshot_offset == compact.ranges[i].destination_offset,
+            "compact restore writes each saved layer at its original physical stride");
+
     if (failures == 0) {
         std::cout << "session restore tests passed\n";
     }

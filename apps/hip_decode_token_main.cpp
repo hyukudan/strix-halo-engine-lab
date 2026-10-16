@@ -49,6 +49,7 @@
 #include "strix/prepared_serial_session.hpp"
 #include "strix/moe_fork_join_arena.hpp"
 #include "strix/hip_moe_overlap_dispatcher.hpp"
+#include "strix/moe_token_cost_backend.hpp"
 #include "hip_decode_experiment.hpp"
 #include "hip_decode_options.hpp"
 #include "strix/q8_projection_organization.hpp"
@@ -964,6 +965,7 @@ int main(
     strix::decode_cli::validate_resolved_qsa_hierarchical_selection(options);
     strix::decode_cli::validate_resolved_qsa_gqa(options);
     strix::decode_cli::validate_resolved_known_prefix_window(options);
+    strix::decode_cli::validate_moe_token_cost_options(options);
     strix::decode_cli::validate_resolved_prompt_lookup(options);
     strix::decode_cli::validate_resolved_serving(options);
     strix::decode_cli::validate_resolved_ple_cpu_helpers(options);
@@ -1956,6 +1958,7 @@ int main(
             "  \"moe_shared_overlap_committed_layers\":" + std::to_string(stats.committed_layers) + ",\n" +
             "  \"moe_shared_overlap_aborted_tokens\":" + std::to_string(stats.aborted_tokens) + ",\n";
     };
+    auto moe_token_schedule = strix::MoeTokenSchedule::fork_join;
     std::uint64_t input_access_epoch = 1;
     const std::function<void(std::uint32_t)> execute_native_token = [&](std::uint32_t token) {
         auto correlation = strix::current_execution_correlation();
@@ -1975,7 +1978,7 @@ int main(
             deferred_moe->begin();
             try {
                 strix::HipLaunchScope scope(deferred_moe->scope());
-                if (moe_overlap) moe_overlap->begin_token(session);
+                if (moe_overlap) moe_overlap->begin_token(session, moe_token_schedule);
                 const auto complete_before_commit = [&] {
                     if (moe_overlap) moe_overlap->verify_before_commit(
                         output_dispatcher && output_dispatcher->state_only_active());
@@ -2466,6 +2469,28 @@ int main(
         if (!options.logprob_token_ids.empty())
             requested_logprobs = std::make_unique<RequestedLogprobBackend>(backend, options.logprob_token_ids,
                 model.vocab_size, options.context_tokens, session, original_work_device);
+        strix::SerialGreedyStepBackend* generation_backend = requested_logprobs
+            ? static_cast<strix::SerialGreedyStepBackend*>(requested_logprobs.get())
+            : static_cast<strix::SerialGreedyStepBackend*>(&backend);
+        std::unique_ptr<strix::MoeTokenCostBackend> token_cost_backend;
+        if (options.moe_token_cost_policy) {
+            token_cost_backend = std::make_unique<strix::MoeTokenCostBackend>(*generation_backend,
+                [&]() {
+                    strix::MoeTokenCostContext context;
+                    context.model_content = model_residency.binding().model_content_identity;
+                    context.execution_identity = compiled.execution_identity;
+                    context.kernel_plan_identity = compiled.kernel_plan_identity;
+                    context.runtime_compatibility_identity = session.runtime_compatibility_identity;
+                    // Actual immutable resolved catalog/config plan, not a cache-provided identity.
+                    context.resolved_profile_identity = compiled.kernel_plan_identity;
+                    context.position = session.next_position; context.context_capacity = options.context_tokens;
+                    context.committed_tokens = session.committed_tokens; context.vocab_size = model.vocab_size;
+                    context.eos_token_id = generation_eos; context.cancelled = false;
+                    context.ready = session.health == strix::SerialSessionHealth::ready && !session.arithmetic_lineage.tainted;
+                    return context;
+                }, [&](strix::MoeTokenSchedule mode) { moe_token_schedule = mode; });
+            generation_backend = token_cost_backend.get();
+        }
         std::optional<strix::CompiledKnownPrefixWindow> known_prefix_plan;
         std::shared_ptr<strix::CompiledKnownPrefixPrefill> known_prefill_plan;
         std::optional<strix::UmaReservationEstimate> known_prefill_reservation;
@@ -2590,7 +2615,8 @@ int main(
                     resources, *known_prefix_plan, known_prefix_owner, known_prefix_memory->scratch,
                     known_prefix_memory->serial_scope, known_prefix_memory->scope,
                     std::static_pointer_cast<const void>(known_prefix_memory), original_work_device, allocator, generations,
-                    strix::HipPromptLookupAdaptivePolicy{.enabled = options.prompt_lookup_adaptive});
+                    strix::HipPromptLookupAdaptivePolicy{.enabled = options.prompt_lookup_adaptive},
+                    strix::HipPromptLookupSnapshotPolicy{options.prompt_lookup_snapshot, options.prompt_lookup_snapshot_bytes});
         }
 
         const bool generation_request_timing_enabled =
@@ -2666,10 +2692,9 @@ int main(
                     throw;
                 }
             }
-            if (requested_logprobs) return strix::execute_serial_greedy_request(request, *requested_logprobs);
             if (!known_prefix_backend) return options.gpu_greedy_token
-                ? strix::execute_serial_greedy_token_request(request, backend)
-                : strix::execute_serial_greedy_request(request, backend);
+                ? strix::execute_serial_greedy_token_request(request, *generation_backend)
+                : strix::execute_serial_greedy_request(request, *generation_backend);
             strix::KnownPromptChunkRequest paired;
             paired.prompt_tokens = options.tokens;
             paired.start_position = session.next_position;
@@ -2724,7 +2749,47 @@ int main(
                 });
         }
         std::cout << "{\n" << optimization_profile_receipt << eager_submission_receipt << overlap_receipt() << execution_inventory_receipt << gdn_output_mode_receipt() << wave_router_mode_receipt << deferred_moe_mode_receipt;
+        if (token_cost_backend) {
+            const auto observed = token_cost_backend->stats();
+            const strix::ObservedMoeTokenCostPolicy policy{};
+            const auto schedule = moe_overlap->stats();
+            const auto previous_precision = std::cout.precision(17);
+            std::cout << "  \"moe_token_cost_policy\":{\"enabled\":true,\"qualification\":\"not_assessed\""
+                << ",\"scope\":\"complete-host-wall-input-through-native-completion-output-delivery-and-commit-not-GPU-time\""
+                << ",\"cost_comparison\":\"online-observed-not-paired-benchmark\""
+                << ",\"intent_controllers\":\"separate-full-greedy-state\""
+                << ",\"resolved_profile_identity\":" << compiled.kernel_plan_identity
+                << ",\"bootstrap_samples_per_arm\":" << policy.bootstrap_samples_per_arm
+                << ",\"reexplore_interval\":" << policy.reexplore_interval
+                << ",\"switch_hysteresis_fraction\":" << policy.switch_hysteresis_fraction
+                << ",\"context_bucket_tokens\":" << policy.context_bucket_tokens
+                << ",\"selection_changes\":" << observed.selection_changes << ",\"key_resets\":" << observed.key_resets
+                << ",\"last_selected\":\"" << (observed.last_selected == strix::MoeTokenSchedule::serial_expanded ? "serial-expanded" : "fork-join")
+                << "\",\"serial_schedule_tokens\":" << schedule.serial_tokens
+                << ",\"fork_join_schedule_tokens\":" << schedule.fork_join_tokens
+                << ",\"saturated\":" << (observed.saturated ? "true" : "false") << ",\"arms\":[";
+            for (std::size_t arm = 0; arm < 2U; ++arm) {
+                if (arm) std::cout << ',';
+                const auto& value = observed.arms[arm];
+                std::cout << "{\"schedule\":\"" << (arm ? "fork-join" : "serial-expanded")
+                    << "\",\"selected\":" << value.selected << ",\"observed\":" << value.observed
+                    << ",\"censored\":" << value.censored << ",\"complete_wall_seconds\":" << value.complete_wall_seconds << '}';
+            }
+            std::cout << "]},\n";
+            std::cout.precision(previous_precision);
+        }
         if (lookup_runtime) {
+            if (options.prompt_lookup_snapshot_explicit || options.prompt_lookup_snapshot_bytes_explicit) {
+                const auto& snapshot = lookup_runtime->snapshot_policy();
+                std::cout << "  \"prompt_lookup_snapshot\":{\"policy\":\"" << strix::session_snapshot_policy_name(snapshot.format)
+                    << "\",\"max_payload_bytes\":" << snapshot.max_payload_bytes
+                    << ",\"latest_completed_snapshot_payload_bytes\":" << lookup_runtime->latest_snapshot_payload_bytes()
+                    << ",\"payload_scope\":\"latest-completed-cycle-not-total-or-peak\""
+                    << ",\"state_comparison_scope\":\"" <<
+                        (snapshot.format == strix::SessionSnapshotPolicy::occupied_kv_v1 ?
+                            "occupied-KV-plus-full-other-components-tail-KV-indeterminate" : "full-components") << "\""
+                    << ",\"qualification\":\"not_assessed\"},\n";
+            }
             if (options.prompt_lookup_adaptive) {
                 const auto& adaptive = lookup_runtime->adaptive_stats();
                 const strix::HipPromptLookupAdaptivePolicy adaptive_policy{};

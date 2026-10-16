@@ -72,7 +72,10 @@ void capture_serial_session_snapshot(
     const SerialSessionStateLayout& state_layout,
     const SessionStateMemoryBinding& state_memory,
     const SessionSnapshotMemoryBinding& snapshot_memory,
-    SessionSnapshotTransferBackend& backend);
+    SessionSnapshotTransferBackend& backend,
+    // Required only for occupied_kv_v1: verifies canonical layer geometry and
+    // the complete range census before submitting any backend work.
+    const ModelContract* compact_model = nullptr);
 
 void restore_serial_session_snapshot(
     SerialSessionContext& session,
@@ -80,6 +83,7 @@ void restore_serial_session_snapshot(
     const SerialSessionStateLayout& state_layout,
     const SessionStateMemoryBinding& state_memory,
     const SessionSnapshotMemoryBinding& snapshot_memory,
-    SessionSnapshotTransferBackend& backend);
+    SessionSnapshotTransferBackend& backend,
+    const ModelContract* compact_model = nullptr);
 
 }  // namespace strix

@@ -189,5 +189,37 @@ int main() {
         "--serve-tensor-cohort-rows=4"}); }, "tensor cohort duplicate rejects instead of overriding");
     { auto bad = cohort; bad.serving_tensor_cohort_rows = 4; bad.serving_concurrency = 2;
       rejects([&] { validate_resolved_serving(bad); }, "tensor cohort width cannot exceed request concurrency"); }
+    auto compact_snapshot = parse({"decoder", "m", "1", "--prompt-lookup",
+        "--prompt-lookup-snapshot=occupied-kv-v1", "--prompt-lookup-snapshot-bytes", "65536"});
+    expect(compact_snapshot.prompt_lookup_snapshot == SessionSnapshotPolicy::occupied_kv_v1 &&
+        compact_snapshot.prompt_lookup_snapshot_bytes == 65536U, "compact lookup snapshot is explicitly budgeted");
+    expect(defaults.prompt_lookup_snapshot == SessionSnapshotPolicy::full_components &&
+        !defaults.prompt_lookup_snapshot_bytes, "snapshot default remains complete legacy state");
+    rejects([] { (void)parse({"decoder", "m", "1", "--prompt-lookup-snapshot", "occupied-kv-v1",
+        "--prompt-lookup-snapshot-bytes", "4"}); }, "snapshot option cannot be ignored by non-lookup route");
+    rejects([] { (void)parse({"decoder", "m", "1", "--prompt-lookup", "--prompt-lookup-snapshot", "occupied-kv-v1"}); },
+        "compact snapshot requires positive explicit payload budget");
+    rejects([] { (void)parse({"decoder", "m", "1", "--prompt-lookup", "--prompt-lookup-snapshot-bytes", "4"}); },
+        "snapshot budget never silently selects compact policy");
+    rejects([] { (void)parse({"decoder", "m", "1", "--prompt-lookup", "--prompt-lookup-snapshot", "unknown"}); },
+        "snapshot format is a closed enum");
+    rejects([] { (void)parse({"decoder", "m", "1", "--prompt-lookup", "--prompt-lookup-snapshot", "occupied-kv-v1",
+        "--prompt-lookup-snapshot-bytes", "0"}); }, "compact snapshot rejects zero budget");
+    auto token_cost = parse({"decoder", "m", "1", "--generate", "4", "--deferred-moe-status",
+        "--moe-shared-overlap", "--moe-overlap-arena-budget-bytes", "1024", "--moe-token-cost-policy"});
+    expect(token_cost.moe_token_cost_policy && token_cost.moe_shared_overlap,
+        "observed token policy overlays the already requested overlap owner");
+    expect(!defaults.moe_token_cost_policy, "online observed policy is default off");
+    for (unsigned missing = 0; missing < 3U; ++missing) {
+        auto bad = token_cost;
+        if (!missing) bad.generate_tokens = 0;
+        if (missing == 1U) bad.deferred_moe_status = false;
+        if (missing == 2U) bad.moe_shared_overlap = false;
+        rejects([&] { validate_moe_token_cost_options(bad); }, "observed policy never turns on its prerequisites");
+    }
+    { auto bad = token_cost; bad.prompt_lookup = true;
+      rejects([&] { validate_moe_token_cost_options(bad); }, "lookup cannot share observed-token owner"); }
+    { auto bad = token_cost; bad.known_prefix_window = true;
+      rejects([&] { validate_moe_token_cost_options(bad); }, "known windows cannot masquerade as serial token samples"); }
     return failures ? 1 : 0;
 }

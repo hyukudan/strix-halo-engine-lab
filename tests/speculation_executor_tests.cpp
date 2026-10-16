@@ -105,6 +105,19 @@ public:
     }
 };
 
+class ForbiddenSnapshotAllocator final : public strix::RuntimeMemoryAllocator {
+public:
+    unsigned calls = 0;
+    std::uintptr_t allocate_device(std::uint64_t, std::uint64_t) override {
+        ++calls; throw std::logic_error("unexpected snapshot device allocation");
+    }
+    std::uintptr_t allocate_host(std::uint64_t, std::uint64_t) override {
+        ++calls; throw std::logic_error("unexpected snapshot host allocation");
+    }
+    void free_device(std::uintptr_t, std::uint64_t) noexcept override {}
+    void free_host(std::uintptr_t, std::uint64_t) noexcept override {}
+};
+
 class FakeDraftBackend final
     : public strix::GreedyDraftProposalBackend {
 public:
@@ -966,6 +979,74 @@ int main() {
         expect(rejected && backend.verify_calls==1 && draft.calls==0,"frontier beyond capacity rejects before callbacks");
     }
 
+    // Compact snapshots exercise the actual generic cycle/restore lifecycle;
+    // this backend records transfers, so these cases prove control flow only.
+    for (unsigned matches = 0; matches <= 2U; ++matches) {
+        Fixture fixture;
+        FakeSpeculationBackend backend; backend.publish_lineage = true;
+        backend.target_tokens = matches == 0U ? std::vector<std::uint32_t>{9,8,7} :
+            matches == 1U ? std::vector<std::uint32_t>{10,9,7} : std::vector<std::uint32_t>{10,20,7};
+        const std::vector<std::uint32_t> candidates{10,20};
+        strix::GreedySpeculationExecutionRequest request;
+        request.candidate_tokens = candidates; request.token_budget = 3;
+        request.snapshot_policy = strix::SessionSnapshotPolicy::occupied_kv_v1;
+        request.max_snapshot_payload_bytes = UINT64_MAX;
+        CountingTransfer local;
+        const auto result = strix::execute_greedy_speculation_cycle(fixture.model,fixture.compiled,
+            fixture.resources,fixture.session,request,allocator,generations,local,backend);
+        expect(result.snapshot_captured && fixture.session.next_position == 10U + matches &&
+            fixture.session.committed_tokens == 10U + matches &&
+            result.plan.pre_window_snapshot.policy == request.snapshot_policy &&
+            result.plan.emitted_tokens.size() == matches + 1U &&
+            local.captures == static_cast<int>(fixture.model.full_attention_layers + 6U),
+            "compact cycle snapshots all occupied layers and leaves emitted bonus unconsumed");
+        expect((matches == 2U ? local.restores == 0 : local.restores > 0) &&
+            fixture.session.health == strix::SerialSessionHealth::ready,
+            "compact accepted prefix uses existing restore/replay transaction");
+        backend.replay_target_token(fixture.session,fixture.resources,7);
+        expect(fixture.session.next_position == 11U + matches,
+            "serial continuation consumes the previously emitted bonus exactly once");
+    }
+    for (unsigned fault = 0; fault < 3U; ++fault) {
+        Fixture fixture;
+        FakeSpeculationBackend backend; backend.target_tokens = {10,20,7};
+        const std::vector<std::uint32_t> candidates{10,20};
+        strix::GreedySpeculationExecutionRequest request;
+        request.candidate_tokens = candidates; request.token_budget = 3;
+        request.snapshot_policy = fault == 2U ? static_cast<strix::SessionSnapshotPolicy>(77) :
+            strix::SessionSnapshotPolicy::occupied_kv_v1;
+        request.max_snapshot_payload_bytes = fault == 0U ? 0 : 1;
+        CountingTransfer local;
+        ForbiddenSnapshotAllocator forbidden;
+        bool rejected = false;
+        try { (void)strix::execute_greedy_speculation_cycle(fixture.model,fixture.compiled,fixture.resources,
+            fixture.session,request,forbidden,generations,local,backend); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        expect(rejected && forbidden.calls == 0 && backend.verify_calls == 0 && local.captures == 0 && fixture.session.next_position == 10 &&
+            fixture.session.health == strix::SerialSessionHealth::ready,
+            "compact missing/undersized budget or unknown format rejects before capture and target mutation");
+    }
+    for (unsigned failure = 0; failure < 3U; ++failure) {
+        Fixture fixture;
+        FakeSpeculationBackend backend; backend.publish_lineage = true;
+        backend.target_tokens = {10,9,7};
+        if (failure == 0U) backend.fail_verify = true;
+        if (failure == 1U) backend.fail_replay_after = 0;
+        if (failure == 2U) backend.mutate_scratch = &fixture.scratch;
+        const std::vector<std::uint32_t> candidates{10,20};
+        strix::GreedySpeculationExecutionRequest request;
+        request.candidate_tokens = candidates; request.token_budget = 3;
+        request.snapshot_policy = strix::SessionSnapshotPolicy::occupied_kv_v1;
+        request.max_snapshot_payload_bytes = UINT64_MAX;
+        CountingTransfer local;
+        bool rejected = false;
+        try { (void)strix::execute_greedy_speculation_cycle(fixture.model,fixture.compiled,fixture.resources,
+            fixture.session,request,allocator,generations,local,backend); }
+        catch (const std::exception&) { rejected = true; }
+        expect(rejected && local.captures > 0 && (failure != 2U ? fixture.session.next_position == 10 :
+            fixture.session.health == strix::SerialSessionHealth::poisoned && fixture.session.arithmetic_lineage.tainted),
+            "compact verify/replay failures restore base; changed binding generation cannot redirect rollback");
+    }
     if (failures == 0) {
         std::cout << "speculation executor tests passed\n";
     }

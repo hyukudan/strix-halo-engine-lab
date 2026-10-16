@@ -3,6 +3,7 @@
 #include "strix/gdn_recurrent_layout.hpp"
 #include "strix/gdn_recurrent_storage.hpp"
 #include "strix/known_window_output_policy.hpp"
+#include "strix/session_snapshot.hpp"
 #include "strix/hip_model_residency.hpp"
 #include "strix/raw_baseline_recording.hpp"
 #include "strix/final_generation_state_export.hpp"
@@ -95,6 +96,7 @@ struct OptimizationProfileResolution {
 };
 struct Options {
     bool moe_shared_overlap = false;
+    bool moe_token_cost_policy = false;
     std::uint64_t moe_overlap_arena_budget_bytes = 64ULL * 1024ULL * 1024ULL;
     bool moe_overlap_budget_explicit = false;
     bool batched_moe_activation = false;
@@ -186,6 +188,9 @@ struct Options {
     strix::KnownWindowOutputPolicy known_prefix_output_policy = strix::KnownWindowOutputPolicy::all_rows;
     bool known_prefix_output_policy_explicit = false;
     bool prompt_lookup_adaptive = false;
+    strix::SessionSnapshotPolicy prompt_lookup_snapshot = strix::SessionSnapshotPolicy::full_components;
+    std::uint64_t prompt_lookup_snapshot_bytes = 0;
+    bool prompt_lookup_snapshot_explicit = false, prompt_lookup_snapshot_bytes_explicit = false;
     bool device_queue_trace = false;
     std::uint32_t known_prefix_prefill_rows = 0;
     bool known_prefix_prefill_explicit = false;
@@ -402,7 +407,30 @@ inline void validate_resolved_serving(const Options& options) {
         throw std::invalid_argument("serving requires concurrency 1/2/4, at most64 requests and explicit total/request/headroom reservation bytes");
 }
 
+inline void validate_moe_token_cost_options(const Options& options) {
+    if (!options.moe_token_cost_policy) return;
+    if (!options.generate_tokens || !options.deferred_moe_status || !options.moe_shared_overlap ||
+        options.execution.mode != strix::DecodeExecutionMode::eager ||
+        options.execution.integer_head != strix::DecodeIntegerHead::none ||
+        !options.serving_prefix_files.empty() || options.prompt_lookup || options.known_prefix_window ||
+        options.prefix_cache_roundtrip || !options.raw_recording_path.empty() || !options.reference_path.empty())
+        throw std::invalid_argument("observed MoE token policy requires eager generation, D1 and explicit overlap without serving, lookup, known-window, RAW, reference, roundtrip or integer modes");
+}
+inline void validate_prompt_lookup_snapshot_options(const Options& options) {
+    strix::validate_session_snapshot_policy(options.prompt_lookup_snapshot);
+    const bool selected = options.prompt_lookup_snapshot_explicit || options.prompt_lookup_snapshot_bytes_explicit ||
+        options.prompt_lookup_snapshot != strix::SessionSnapshotPolicy::full_components || options.prompt_lookup_snapshot_bytes;
+    if (!selected) return;
+    if (!options.prompt_lookup || options.serving_prefix_files.size() || options.known_prefix_window)
+        throw std::invalid_argument("snapshot policy is an explicit prompt-lookup-only option");
+    if (options.prompt_lookup_snapshot == strix::SessionSnapshotPolicy::occupied_kv_v1) {
+        if (!options.prompt_lookup_snapshot_explicit || !options.prompt_lookup_snapshot_bytes_explicit || !options.prompt_lookup_snapshot_bytes)
+            throw std::invalid_argument("occupied KV snapshot requires explicit positive payload budget");
+    } else if (options.prompt_lookup_snapshot_bytes_explicit || options.prompt_lookup_snapshot_bytes)
+        throw std::invalid_argument("snapshot byte limit is reserved for explicit occupied-KV policy");
+}
 inline void validate_resolved_prompt_lookup(const Options& options) {
+    validate_prompt_lookup_snapshot_options(options);
     if (options.prompt_lookup_adaptive && (!options.prompt_lookup || options.prompt_lookup_depth_explicit))
         throw std::invalid_argument("adaptive prompt lookup requires --prompt-lookup without an explicit fixed depth");
     if (!options.prompt_lookup) return;
@@ -475,7 +503,7 @@ inline Options parse_options(
         throw std::invalid_argument(
             "usage: strix-hip-decode-token MODEL.gguf [TOKEN_ID ...] "
             "[--optimization-profile auto|manual] [--execution-inventory] [--host-dispatch-telemetry] [--execution-telemetry-trace] [--device-queue-trace] "
-            "[--gpu-greedy-token] [--logprob-token ID ...] [--offline-tuning-cache FILE [--offline-compile-provenance FILE]] [--gdn-recurrent-layout baseline|stride32|stride33|transposed] [--gdn-recurrent-storage key-value|value-key] [--known-prefix-window --known-prefix-rows 2|4|8 --known-prefix-expert-union] [--known-prefix-prefill-rows 16..2048 --known-prefix-workspace-budget-bytes N --known-prefix-host-metadata-budget-bytes N --known-prefix-uma-budget-bytes N --known-prefix-host-headroom-bytes N] [--prompt-lookup [--prompt-lookup-depth 0|1|2 | --prompt-lookup-adaptive]] [--serve-prefix-u32le FILE ... --serve-concurrency 1|2|4 [--serve-tensor-cohort-rows 2|4] --serve-memory-budget-bytes N --serve-request-budget-bytes N --serve-headroom-bytes N] [--gdn-islands] [--qsa-hierarchical-selection] [--qsa-gqa-heads-per-block 1|2|4] [--prepared-eager] [--moe-shared-overlap] [--moe-overlap-arena-budget-bytes N] [--batched-moe-activation] [--validation-final-state DIR] [--validation-final-state-max-bytes N] [--reference FILE] [--max-logit-error X] "
+            "[--gpu-greedy-token] [--logprob-token ID ...] [--offline-tuning-cache FILE [--offline-compile-provenance FILE]] [--gdn-recurrent-layout baseline|stride32|stride33|transposed] [--gdn-recurrent-storage key-value|value-key] [--known-prefix-window --known-prefix-rows 2|4|8 --known-prefix-expert-union] [--known-prefix-prefill-rows 16..2048 --known-prefix-workspace-budget-bytes N --known-prefix-host-metadata-budget-bytes N --known-prefix-uma-budget-bytes N --known-prefix-host-headroom-bytes N] [--prompt-lookup [--prompt-lookup-depth 0|1|2 | --prompt-lookup-adaptive] [--prompt-lookup-snapshot occupied-kv-v1 --prompt-lookup-snapshot-bytes N]] [--serve-prefix-u32le FILE ... --serve-concurrency 1|2|4 [--serve-tensor-cohort-rows 2|4] --serve-memory-budget-bytes N --serve-request-budget-bytes N --serve-headroom-bytes N] [--gdn-islands] [--qsa-hierarchical-selection] [--qsa-gqa-heads-per-block 1|2|4] [--prepared-eager] [--moe-shared-overlap [--moe-token-cost-policy]] [--moe-overlap-arena-budget-bytes N] [--batched-moe-activation] [--validation-final-state DIR] [--validation-final-state-max-bytes N] [--reference FILE] [--max-logit-error X] "
             "[--context N] [--residency register|copy] [--coalesce-gap BYTES] "
             "[--planned-ple-io] [--ple-cpu-helper-threads 1..8] [--ple-cache-rows N --ple-cache-budget-bytes N] [--ple-max-rows-per-io N] [--ple-max-inflight-ios N] "
             "[--generate N] [--eos-token TOKEN_ID] [--prefix-cache-roundtrip] "
@@ -575,6 +603,27 @@ inline Options parse_options(
         if (argument == "--device-queue-trace") {
             if (options.device_queue_trace) throw std::invalid_argument("duplicate device queue trace option");
             options.device_queue_trace = true;
+            continue;
+        }
+        if (argument == "--prompt-lookup-snapshot" || argument.starts_with("--prompt-lookup-snapshot=")) {
+            if (options.prompt_lookup_snapshot_explicit) throw std::invalid_argument("duplicate prompt lookup snapshot policy");
+            options.prompt_lookup_snapshot_explicit = true;
+            std::string_view value;
+            if (argument == "--prompt-lookup-snapshot") {
+                if (index + 1 >= argc) throw std::invalid_argument("snapshot policy requires a value");
+                value = argv[++index];
+            } else value = argument.substr(std::string_view("--prompt-lookup-snapshot=").size());
+            if (value == "full-components") options.prompt_lookup_snapshot = strix::SessionSnapshotPolicy::full_components;
+            else if (value == "occupied-kv-v1") options.prompt_lookup_snapshot = strix::SessionSnapshotPolicy::occupied_kv_v1;
+            else throw std::invalid_argument("snapshot policy must be full-components or occupied-kv-v1");
+            continue;
+        }
+        if (argument == "--prompt-lookup-snapshot-bytes") {
+            if (options.prompt_lookup_snapshot_bytes_explicit || index + 1 >= argc)
+                throw std::invalid_argument("snapshot payload budget requires exactly one positive value");
+            options.prompt_lookup_snapshot_bytes_explicit = true;
+            options.prompt_lookup_snapshot_bytes = parse_u64(argv[++index], "snapshot payload budget");
+            if (!options.prompt_lookup_snapshot_bytes) throw std::invalid_argument("snapshot payload budget must be positive");
             continue;
         }
         if (argument == "--prompt-lookup-adaptive") {
@@ -743,6 +792,11 @@ inline Options parse_options(
             options.batched_moe_activation = true;
             continue;
 #endif
+        }
+        if (argument == "--moe-token-cost-policy") {
+            if (options.moe_token_cost_policy) throw std::invalid_argument("duplicate observed MoE token policy");
+            options.moe_token_cost_policy = true;
+            continue;
         }
         if (argument == "--moe-shared-overlap") {
             if (options.moe_shared_overlap)
@@ -1204,6 +1258,8 @@ inline Options parse_options(
         throw std::invalid_argument("PLE cache requires both positive explicit row and byte limits");
     if (!options.offline_compile_provenance_path.empty() && options.offline_tuning_cache_path.empty())
         throw std::invalid_argument("offline compile provenance requires --offline-tuning-cache");
+    validate_moe_token_cost_options(options);
+    validate_prompt_lookup_snapshot_options(options);
     validate_known_prefill_options(options);
     validate_serving_prefix_cache_limits(options);
     if (options.serving_prefix_files.empty() && (options.serving_tensor_cohort_explicit || options.serving_concurrency_explicit || options.serving_memory_explicit ||

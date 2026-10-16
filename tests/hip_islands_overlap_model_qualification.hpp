@@ -44,11 +44,11 @@ int qualify_islands_overlap(const Options& args) {
     unsigned cases = 0;
     // The identical expanded compiled plan/arena is used even when overlap is
     // disabled. This isolates launch organization without changing identities.
-    for (unsigned mode = 0; mode < 10U; ++mode) {
-        const bool negative = mode >= 8U;
-        const bool use_islands = negative || (mode & 1U) != 0U;
-        const bool use_overlap = negative || (mode & 2U) != 0U;
-        const bool use_prepared = negative || (mode & 4U) != 0U;
+    for (unsigned mode = 0; mode < 12U; ++mode) {
+        const bool negative = mode == 8U || mode == 9U;
+        const bool use_islands = mode >= 10U || negative || (mode & 1U) != 0U;
+        const bool use_overlap = mode >= 10U || negative || (mode & 2U) != 0U;
+        const bool use_prepared = mode >= 10U || negative || (mode & 4U) != 0U;
         auto session = initial_session;
         restore_state(owner, initial, initial_session, session);
         auto d1 = std::make_shared<HipDeferredMoeStatus>(owner->resources, owner->serial.execution_identity,
@@ -77,6 +77,7 @@ int qualify_islands_overlap(const Options& args) {
             prepared = std::make_unique<strix::PreparedEagerExecution>(owner->serial,
                 d1->resources(), prototype, d1);
         }
+        std::uint64_t fork_tokens = 0;
         std::vector<std::string> observed_logits;
         bool expected_failure = false;
         const auto count = negative ? 1U : args.start + args.rows;
@@ -84,7 +85,12 @@ int qualify_islands_overlap(const Options& args) {
             d1->begin();
             try {
                 strix::HipLaunchScope scope(d1->scope());
-                if (overlap) overlap->begin_token(session);
+                if (overlap) {
+                    const auto schedule = mode == 10U || (mode == 11U && position % 2U == 0U)
+                        ? strix::MoeTokenSchedule::serial_expanded : strix::MoeTokenSchedule::fork_join;
+                    overlap->begin_token(session,schedule);
+                    if (schedule == strix::MoeTokenSchedule::fork_join) ++fork_tokens;
+                }
                 const auto completion = [&] {
                     if (overlap) overlap->verify_before_commit();
                     if (mode == 9U) throw std::runtime_error("composition injected completion failure");
@@ -134,10 +140,12 @@ int qualify_islands_overlap(const Options& args) {
             if (islands) require(islands->receipt().replays == count * islands->receipt().islands,
                 "composition island receipt does not count all actual GDN replays");
             if (overlap) require(overlap->stats().committed_tokens == count &&
-                overlap->stats().join_waits == count * owner->overlap_plan->layers().size(),
+                overlap->stats().join_waits == fork_tokens * owner->overlap_plan->layers().size() &&
+                overlap->stats().fork_join_tokens == fork_tokens && overlap->stats().serial_tokens == count - fork_tokens,
                 "composition overlap receipt differs from actual committed tokens/layers");
         } else require(expected_failure, "injected composition failure was not reached");
         receipt << (cases ? "," : "") << "{\"islands\":" << (use_islands ? "true" : "false")
+            << ",\"schedule_case\":" << mode
             << ",\"overlap\":" << (use_overlap ? "true" : "false") << ",\"prepared\":"
             << (use_prepared ? "true" : "false") << ",\"injected_failure\":" << (negative ? "true" : "false")
             << ",\"session\":";
@@ -150,7 +158,7 @@ int qualify_islands_overlap(const Options& args) {
         // prepared snapshots, overlap side stream, catalog graphs and D1.
         owner->guard->recover_or_fail_stop();
     }
-    require(cases == 10U && hash_file(args.model) == args.model_sha &&
+    require(cases == 12U && hash_file(args.model) == args.model_sha &&
         hash_file(args.teacher) == args.teacher_sha && hash_file(executable) == executable_sha,
         "composition source inputs changed or case coverage is incomplete");
     receipt << "],\"finished\":true,\"passed\":true,\"full_model\":true,\"model_sha256\":"

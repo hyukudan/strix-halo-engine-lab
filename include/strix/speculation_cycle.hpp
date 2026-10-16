@@ -24,6 +24,8 @@ struct GreedySpeculationCycleRequest {
     std::span<const std::uint32_t> eos_tokens;
 
     std::uint64_t snapshot_alignment = 64;
+    SessionSnapshotPolicy snapshot_policy = SessionSnapshotPolicy::full_components;
+    std::uint64_t max_snapshot_payload_bytes = 0;
 };
 
 struct GreedySpeculationPreparation {

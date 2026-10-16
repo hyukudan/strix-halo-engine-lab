@@ -63,6 +63,8 @@ struct GreedySpeculationExecutionRequest {
     std::uint32_t token_budget = 1;
     std::span<const std::uint32_t> eos_tokens;
     std::uint64_t snapshot_alignment = 64;
+    SessionSnapshotPolicy snapshot_policy = SessionSnapshotPolicy::full_components;
+    std::uint64_t max_snapshot_payload_bytes = 0;
 };
 
 struct GreedySpeculationExecutionResult {
@@ -77,6 +79,8 @@ struct GreedyDraftExecutionRequest {
     std::uint32_t token_budget = 1;
     std::span<const std::uint32_t> eos_tokens;
     std::uint64_t snapshot_alignment = 64;
+    SessionSnapshotPolicy snapshot_policy = SessionSnapshotPolicy::full_components;
+    std::uint64_t max_snapshot_payload_bytes = 0;
 };
 
 struct GreedyDraftExecutionResult {

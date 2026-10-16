@@ -48,6 +48,7 @@ SerialPrefixCacheEntry::capture(
         throw std::invalid_argument("serial prefix greedy frontier has invalid model, vocabulary or token");
 
     SerialSessionSnapshotRequest request;
+    request.policy = SessionSnapshotPolicy::full_components;
     request.compiled_execution_identity =
         session.execution_identity;
     request.runtime_compatibility_identity =

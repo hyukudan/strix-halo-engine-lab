@@ -9,6 +9,13 @@
 
 namespace strix {
 
+enum class SessionSnapshotPolicy : std::uint32_t {
+    full_components = 0,
+    occupied_kv_v1 = 1,
+};
+void validate_session_snapshot_policy(SessionSnapshotPolicy policy);
+[[nodiscard]] const char* session_snapshot_policy_name(SessionSnapshotPolicy policy);
+
 struct SessionSnapshotRange {
     SessionStateComponent component =
         SessionStateComponent::attention_kv;
@@ -27,6 +34,7 @@ struct SerialSessionSnapshotRequest {
     std::uint64_t committed_tokens = 0;
     PersistentStateGenerations state;
     std::uint64_t alignment = 64;
+    SessionSnapshotPolicy policy = SessionSnapshotPolicy::full_components;
 };
 
 struct SerialSessionSnapshotPlan {
@@ -44,6 +52,9 @@ struct SerialSessionSnapshotPlan {
 
     std::vector<SessionSnapshotRange> ranges;
     GdnRecurrentStorage recurrent_storage = GdnRecurrentStorage::key_value;
+    // occupied_kv_v1 preserves logical rows [0,next_position) in every KV
+    // layer; inactive KV bytes are unspecified. All other components are full.
+    SessionSnapshotPolicy policy = SessionSnapshotPolicy::full_components;
 };
 
 [[nodiscard]] SerialSessionSnapshotPlan
@@ -51,5 +62,10 @@ build_serial_session_snapshot_plan(
     const ModelContract& model,
     const SerialSessionStateLayout& layout,
     const SerialSessionSnapshotRequest& request);
+
+// Reconstructs canonical ranges and identity, including all occupied KV layers.
+void validate_serial_session_snapshot_plan(const ModelContract& model,
+    const SerialSessionStateLayout& layout, const SerialSessionSnapshotPlan& snapshot);
+void validate_serial_session_snapshot_identity(const SerialSessionSnapshotPlan& snapshot);
 
 }  // namespace strix
