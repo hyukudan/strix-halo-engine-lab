@@ -784,6 +784,14 @@ int qualify(const Options& args) {
     };
     restore_hit();
     const auto first_hit_calls = transfer.restores;
+    // The cached causal state is retained, but B2's identical terminal rows
+    // must not serve as stale output evidence for the new window owner.
+    require(!window && !owner->prefetch.active, "fresh-owner scratch reset requires no window and inactive PLE");
+    owner->guard->run([&] {
+        hip_check(hipMemsetAsync(reinterpret_cast<void*>(owner->window_memory.arena_base), 0,
+            static_cast<std::size_t>(owner->window_memory.arena_bytes), owner->stream),
+            "clear stale window outputs before fresh-owner replay");
+    });
     b3.oracle = cut_oracle; // independently constructed cut, never copied from live session
     window = std::make_unique<strix::HipKnownPrefixWindow>(owner->window, owner->serial, owner->model, config,
         owner->resources, owner->window_memory, owner->scope(), std::static_pointer_cast<const void>(owner));
@@ -895,6 +903,7 @@ int qualify(const Options& args) {
         << ",\"stopped_windows\":" << stopped.windows_executed
         << ",\"g4_prompt_driver_cancel\":true,\"g4_cache_resume\":true,\"g4_cache_negative_matrix\":true"
         << ",\"g4_owner_admission_recovery\":true,\"g4_partial_restore_recovery\":true"
+        << ",\"g4_fresh_owner_scratch_cleared\":true"
         << ",\"native_post_dispatch_fault_injection\":\"not_covered\",\"full_heads_foundation_only\":true"
         << ",\"B3_row_coverage_begin\":2,\"quality\":false,\"performance\":false}\n";
     output.close();
