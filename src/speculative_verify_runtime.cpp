@@ -1,3 +1,4 @@
+#include "strix/execution_telemetry.hpp"
 #include "strix/speculative_verify_runtime.hpp"
 
 #include "strix/dispatch_resources.hpp"
@@ -161,6 +162,15 @@ execute_compiled_speculative_verify_eager(
         post_position;
     session.committed_tokens =
         post_committed;
+    {
+        auto correlation = current_execution_correlation();
+        correlation.execution_identity = session.execution_identity;
+        correlation.position = result.base_position;
+        correlation.row = UINT32_MAX; correlation.rows = compiled.candidate_depth;
+        correlation.step_id = UINT32_MAX; correlation.phase = ExecutionPhase::commit;
+        ExecutionCorrelationScope commit_scope(correlation);
+        observe_execution_activity(ExecutionActivityKind::token_commit, 0, compiled.candidate_depth);
+    }
     // This window producer has no qualified canonical lineage recorder yet.
     // Do not retain or relabel the earlier serial history after window mutation.
     session.arithmetic_lineage = {};
@@ -388,6 +398,19 @@ KnownWindowResult execute_known_prefix_window_eager(
             if (!result.execution.state.contains(step.reads_state))
                 throw std::logic_error("known window persistent state disappeared after admission");
             if (selected[i]) {
+                std::optional<ExecutionCorrelationScope> joint_scope;
+                std::optional<ExecutionPhaseScope> joint_elapsed;
+                if (current_execution_telemetry()) {
+                    auto correlation = current_execution_correlation();
+                    correlation.execution_identity = serial.execution_identity;
+                    correlation.position = contexts[i][0].position;
+                    correlation.rows = 2; correlation.row = UINT32_MAX;
+                    correlation.step_id = step.id; correlation.op = step.op;
+                    correlation.layer = step.layer.value_or(UINT32_MAX);
+                    correlation.phase = ExecutionPhase::operator_step;
+                    joint_scope.emplace(correlation);
+                    joint_elapsed.emplace(ExecutionPhase::operator_step);
+                }
                 selected[i]->launch(contexts[i], selected[i]->config);
                 ++result.r2_dispatches; ++result.execution.kernel_steps;
                 ++result.r2_variant_dispatches[static_cast<std::uint32_t>(window.r2_variant[i])];
@@ -397,6 +420,12 @@ KnownWindowResult execute_known_prefix_window_eager(
             } else {
                 for (std::size_t r = 0; r < 2; ++r) {
                     const auto& context = contexts[i][r];
+                    std::optional<ExecutionCorrelationScope> row_scope;
+                    if (current_execution_telemetry()) {
+                        auto correlation = current_execution_correlation();
+                        correlation.row = static_cast<std::uint32_t>(r); correlation.rows = 1;
+                        row_scope.emplace(correlation);
+                    }
                     // Host position history is one word. Materialise the row's
                     // own value before every declared reader; this changes no
                     // semantic write count and never exposes the future row.
@@ -434,6 +463,15 @@ KnownWindowResult execute_known_prefix_window_eager(
     session.state = result.execution.state;
     session.arithmetic_lineage = std::move(next_lineage);
     session.next_position = post_position; session.committed_tokens = post_committed;
+    {
+        auto correlation = current_execution_correlation();
+        correlation.execution_identity = session.execution_identity;
+        correlation.position = post_position - 2;
+        correlation.row = UINT32_MAX; correlation.rows = 2; correlation.step_id = UINT32_MAX;
+        correlation.phase = ExecutionPhase::commit;
+        ExecutionCorrelationScope commit_scope(correlation);
+        observe_execution_activity(ExecutionActivityKind::token_commit, 0, 2);
+    }
     return result;
 }
 
