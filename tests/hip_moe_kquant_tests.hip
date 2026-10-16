@@ -298,18 +298,23 @@ void a8_down_runtime_admission() {
         strix::HipLaunchContext scope;
         scope.stream = stream;
         scope.deferred_moe_status = {memory.execution_identity,reinterpret_cast<std::uintptr_t>(record),8U,2U};
-        for (const bool phase_b : {false,true}) {
+        for (const unsigned candidate_phase : {0U,1U,2U}) {
+            const bool phase_b = candidate_phase != 0U;
+            const bool q5k_gate_up = candidate_phase == 2U;
             strix::HipMoeExpertsLauncherConfig config;
             config.hidden_size = 2560U; config.intermediate_size = 640U; config.expert_count = 512U; config.top_k = 10U;
             config.q4k_a8g32_gate_up = true; config.grouped_exact_q51_down = true; config.q51_slot_parallel_down = true;
             config.batched_slot_activation = true; config.deferred_moe_status = true;
             config.a8_down_q51 = true; config.a8_down_q80 = phase_b;
+            config.q5k_a8g32_gate_up = q5k_gate_up;
             config.q4k_a8_quiescence = guard;
             strix::ExecutionBindingRequest request;
             request.q4k_a8g32_gate_up = true; request.grouped_exact_q51_down = true; request.q51_slot_parallel_down = true;
             request.batched_moe_activation = true; request.deferred_moe_status = true;
             request.a8_down_q51 = true; request.a8_down_q80 = phase_b;
+            request.q5k_a8g32_gate_up = q5k_gate_up;
             const std::string id = "hip.moe_experts.bf16.h2560.m640.e512.k10.r1.c1.batched-slot-activation-v1.deferred-status-v1" +
+                (q5k_gate_up ? std::string(strix::moe_q4k_a8::q5k_gate_up_kernel_marker) : "") +
                 std::string(strix::moe_q4k_a8::q51_a8_down_kernel_marker) +
                 (phase_b ? std::string(strix::moe_q4k_a8::q80_a8_down_kernel_marker) : "") +
                 std::string(strix::moe_q4k_a8::a8_down_kernel_ending);
@@ -323,7 +328,28 @@ void a8_down_runtime_admission() {
             context.kernel_id = id;
             auto wrong = config; wrong.a8_down_q51 = false;
             rejects([&] { (void)strix::make_hip_moe_experts_launcher(id,&wrong); },
-                phase_b ? "phase b requires" : "cannot select an exact");
+                q5k_gate_up ? "complete Q5_1/Q8_0" : (phase_b ? "phase b requires" : "cannot select an exact"));
+            if (q5k_gate_up) {
+                auto incomplete = config; incomplete.a8_down_q80 = false;
+                rejects([&] { (void)strix::make_hip_moe_experts_launcher(id,&incomplete); },"complete Q5_1/Q8_0");
+                incomplete = config; incomplete.q4k_a8g32_gate_up = false;
+                rejects([&] { (void)strix::make_hip_moe_experts_launcher(id,&incomplete); },"complete Q5_1/Q8_0");
+                const std::string marker(strix::moe_q4k_a8::q5k_gate_up_kernel_marker);
+                auto missing = id;
+                missing.erase(missing.find(marker),marker.size());
+                rejects([&] { (void)strix::make_hip_moe_experts_launcher(missing,&config); },"missing, foreign or duplicate");
+                rejects([&] { (void)strix::make_hip_moe_experts_launcher(marker+id,&config); },"missing, foreign or duplicate");
+                rejects([&] { (void)strix::make_hip_moe_experts_launcher(missing+marker,&config); },"mixed arithmetic configuration");
+                auto disabled = config; disabled.q5k_a8g32_gate_up = false;
+                rejects([&] { (void)strix::make_hip_moe_experts_launcher(id,&disabled); },"missing, foreign or duplicate");
+                const auto old_launcher = strix::make_hip_moe_experts_launcher(missing,&disabled);
+                expect(old_launcher.implementation_identity != launcher.implementation_identity,
+                    "Q5_K A8 gate/up implementation identity differs from the retained fallback");
+                auto mismatched_request = request; mismatched_request.q5k_a8g32_gate_up = false;
+                rejects([&] { strix::kernels::KernelRegistry r;
+                    strix::register_hip_moe_experts_kernel_variant(model,mismatched_request,config,r); },
+                    "gate/up config differs");
+            }
             rejects([&] { (void)strix::make_hip_moe_experts_launcher("bad.q51-slot-parallel-v1"+id,&config); },
                 "mixed arithmetic configuration");
             auto graph_request = request; graph_request.require_graph_safe = true;

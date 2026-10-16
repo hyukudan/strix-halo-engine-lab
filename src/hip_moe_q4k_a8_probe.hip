@@ -112,6 +112,60 @@ __global__ void project(const unsigned char* gate,const unsigned char* up,const 
     acc=acc+__shfl_xor(acc,4,32);
     if(c==0) output[(slot*2U+which)*rows+row]=acc;
 }
+// Distinct unsigned-five-bit format; incumbent Q4K symbol/body above stays literal.
+__global__ void project_q5k(const unsigned char* gate,const unsigned char* up,const unsigned* routes,
+    const signed char* codes,const float* deltas,const int* sums,const unsigned* status,
+    float* output,unsigned hidden,unsigned rows) {
+    __shared__ __align__(16) signed char local_codes[max_hidden];
+    __shared__ __align__(16) float local_deltas[max_hidden/32U];
+    __shared__ __align__(16) int local_sums[max_hidden/32U];
+    // Prior kernels are on the same stream; this kernel never changes status.
+    if(*status!=0) return;
+    for(unsigned i=threadIdx.x;i<hidden;i+=256U) local_codes[i]=codes[i];
+    for(unsigned i=threadIdx.x;i<hidden/32U;i+=256U) {local_deltas[i]=deltas[i];local_sums[i]=sums[i];}
+    __syncthreads();
+    const unsigned lane=threadIdx.x&31U,c=lane&7U,p=c/2U,h=c&1U;
+    const unsigned row=blockIdx.x*32U+(threadIdx.x/32U)*4U+lane/8U;
+    const unsigned which=blockIdx.y,slot=blockIdx.z,expert=routes[slot];
+    const unsigned blocks=hidden/256U;
+    const auto* weights=(which==0?gate:up)+(static_cast<unsigned long long>(expert)*rows+row)*blocks*176U;
+    float acc=0.0F;
+    #pragma unroll 1
+    for(unsigned block=0;block<blocks;++block) {
+        const auto* packed=weights+block*176U;
+        const uint4 hd=*reinterpret_cast<const uint4*>(packed);
+        const uint4 q=*reinterpret_cast<const uint4*>(packed+48U+c*16U);
+        const int4 a0=*reinterpret_cast<const int4*>(local_codes+block*256U+p*64U+h*16U);
+        const int4 a1=*reinterpret_cast<const int4*>(local_codes+block*256U+p*64U+32U+h*16U);
+        const uint4 qh=*reinterpret_cast<const uint4*>(packed+16U+h*16U);
+        constexpr unsigned mask=0x0f0f0f0fU;
+        const auto g0=2U*p,g1=g0+1U;
+        const uint4 q0{(q.x&mask)|(((qh.x>>g0)&0x01010101U)<<4U),
+            (q.y&mask)|(((qh.y>>g0)&0x01010101U)<<4U),
+            (q.z&mask)|(((qh.z>>g0)&0x01010101U)<<4U),
+            (q.w&mask)|(((qh.w>>g0)&0x01010101U)<<4U)};
+        const uint4 q1{((q.x>>4U)&mask)|(((qh.x>>g1)&0x01010101U)<<4U),
+            ((q.y>>4U)&mask)|(((qh.y>>g1)&0x01010101U)<<4U),
+            ((q.z>>4U)&mask)|(((qh.z>>g1)&0x01010101U)<<4U),
+            ((q.w>>4U)&mask)|(((qh.w>>g1)&0x01010101U)<<4U)};
+        int r0=dot(a0.x,q0.x,0);r0=dot(a0.y,q0.y,r0);r0=dot(a0.z,q0.z,r0);r0=dot(a0.w,q0.w,r0);
+        int r1=dot(a1.x,q1.x,0);r1=dot(a1.y,q1.y,r1);r1=dot(a1.z,q1.z,r1);r1=dot(a1.w,q1.w,r1);
+        r0+=__shfl_xor(r0,1,32);r1+=__shfl_xor(r1,1,32);
+        const int i0=static_cast<int>(factor(hd,g0,false))*r0,i1=static_cast<int>(factor(hd,g1,false))*r1;
+        const int j0=static_cast<int>(factor(hd,g0,true))*local_sums[block*8U+g0];
+        const int j1=static_cast<int>(factor(hd,g1,true))*local_sums[block*8U+g1];
+        const float d=half_float(hd.x&65535U),dm=half_float(hd.x>>16U);
+        const float u0=d*static_cast<float>(i0),v0=dm*static_cast<float>(j0),t0=u0-v0;
+        const float u1=d*static_cast<float>(i1),v1=dm*static_cast<float>(j1),t1=u1-v1;
+        const float c0=local_deltas[block*8U+g0]*t0,c1=local_deltas[block*8U+g1]*t1;
+        const float paired=c0+c1;
+        acc=acc+paired;
+    }
+    // Only c0 is observable. c0 receives exactly ((p0+p1)+(p2+p3)).
+    acc=acc+__shfl_xor(acc,2,32);
+    acc=acc+__shfl_xor(acc,4,32);
+    if(c==0) output[(slot*2U+which)*rows+row]=acc;
+}
 // Two independent projection DAGs consume the same staged activation values.
 // Keep all affine corrections, operand order and rounding boundaries literal.
 __device__ __forceinline__ float paired_shared(const unsigned char* packed,int4 a0,int4 a1,
@@ -176,8 +230,23 @@ void check(hipError_t error,const char* operation) {
     if(error!=hipSuccess) throw std::runtime_error(std::string(operation)+": "+hipGetErrorString(error));
 }
 }
+namespace {
+void admit_q5k_stream(hipStream_t stream) {
+    if (!stream || stream == hipStreamLegacy || stream == hipStreamPerThread)
+        throw std::invalid_argument("Q5K A8 requires explicitly owned eager stream");
+    const auto* context = current_hip_launch_context();
+    if (context && (context->stream != stream || context->graph_capture || context->status.arena_base ||
+        context->arguments.memory.arena_base))
+        throw std::invalid_argument("Q5K A8 rejects graph or foreign launch context");
+    hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
+    check(hipStreamIsCapturing(stream,&capture),"Q5K A8 capture query");
+    if (capture != hipStreamCaptureStatusNone)
+        throw std::invalid_argument("Q5K A8 rejects capture before enqueue");
+}
+}
 void enqueue_probe(const Request& request,const Bindings& b,hipStream_t stream) {
     validate(request,b);
+    if (request.gate_type == 13) admit_q5k_stream(stream);
     check(hipPeekAtLastError(),"Q4K A8 pre-enqueue stale error");
     auto* status=reinterpret_cast<unsigned*>(b.status.address);
     const auto* routes=reinterpret_cast<const unsigned*>(b.routes.address);
@@ -189,13 +258,20 @@ void enqueue_probe(const Request& request,const Bindings& b,hipStream_t stream) 
     if(request.input==InputKind::bf16) quantize<true><<<1,256,0,stream>>>(input,request.shape.hidden,codes,deltas,sums,status);
     else quantize<false><<<1,256,0,stream>>>(input,request.shape.hidden,codes,deltas,sums,status);
     check(hipGetLastError(),"Q4K A8 quantizer enqueue");
-    project<<<dim3(request.shape.rows/32U,2,request.shape.top_k),256,0,stream>>>(
-        reinterpret_cast<const unsigned char*>(b.gate.address),reinterpret_cast<const unsigned char*>(b.up.address),
-        routes,codes,deltas,sums,status,reinterpret_cast<float*>(b.output.address),request.shape.hidden,request.shape.rows);
+    if (request.gate_type == 13) {
+        project_q5k<<<dim3(request.shape.rows/32U,2,request.shape.top_k),256,0,stream>>>(
+            reinterpret_cast<const unsigned char*>(b.gate.address),reinterpret_cast<const unsigned char*>(b.up.address),
+            routes,codes,deltas,sums,status,reinterpret_cast<float*>(b.output.address),request.shape.hidden,request.shape.rows);
+    } else {
+        project<<<dim3(request.shape.rows/32U,2,request.shape.top_k),256,0,stream>>>(
+            reinterpret_cast<const unsigned char*>(b.gate.address),reinterpret_cast<const unsigned char*>(b.up.address),
+            routes,codes,deltas,sums,status,reinterpret_cast<float*>(b.output.address),request.shape.hidden,request.shape.rows);
+    }
     check(hipGetLastError(),"Q4K A8 projection enqueue");
 }
 void enqueue_probe_shared_gate_up(const Request& request,const Bindings& b,hipStream_t stream) {
     validate(request,b);
+    if (request.gate_type != 12) throw std::invalid_argument("shared gate/up staging supports Q4K only");
     check(hipPeekAtLastError(),"Q4K A8 pre-enqueue stale error");
     auto* status=reinterpret_cast<unsigned*>(b.status.address);
     const auto* routes=reinterpret_cast<const unsigned*>(b.routes.address);
@@ -214,6 +290,7 @@ void enqueue_probe_shared_gate_up(const Request& request,const Bindings& b,hipSt
 }
 void enqueue_quantize_only(const Request& request,const Bindings& b,hipStream_t stream) {
     validate(request,b);
+    if (request.gate_type == 13) admit_q5k_stream(stream);
     check(hipPeekAtLastError(),"Q4K A8 pre-enqueue stale error");
     auto* status=reinterpret_cast<unsigned*>(b.status.address);
     const auto* routes=reinterpret_cast<const unsigned*>(b.routes.address);
@@ -235,8 +312,8 @@ void enqueue_half_conversion_probe(std::uint32_t* output,hipStream_t stream) {
     half_conversion<<<256,256,0,stream>>>(output);check(hipGetLastError(),"Q4K A8 half conversion enqueue");
 }
 
-// A8 down is a separate, explicitly selected numerical contract. Incumbent
-// quantize/project/enqueue bodies above remain unchanged.
+// A8 down is a separate, explicitly selected numerical contract.
+// The incumbent Q4K quantize/project arithmetic bodies above remain unchanged.
 namespace {
 __device__ void down_error(unsigned* status,unsigned* aggregate,unsigned bits) {
     atomicOr(status,bits);

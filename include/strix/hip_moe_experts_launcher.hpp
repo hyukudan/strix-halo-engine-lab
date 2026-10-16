@@ -31,6 +31,7 @@ struct HipMoeExpertsLauncherConfig {
     // Explicit experimental arithmetic; defaults retain every original path.
     bool a8_down_q51 = false;
     bool a8_down_q80 = false;
+    bool q5k_a8g32_gate_up = false;
 };
 
 void register_hip_moe_experts_kernel_variant(

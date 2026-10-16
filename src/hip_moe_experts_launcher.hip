@@ -146,6 +146,9 @@ void check_hip(
 
 void validate_config(
     const HipMoeExpertsLauncherConfig& config) {
+    if (config.q5k_a8g32_gate_up &&
+        (!config.q4k_a8g32_gate_up || !config.a8_down_q51 || !config.a8_down_q80))
+        throw std::invalid_argument("Q5_K A8 gate/up requires the complete Q5_1/Q8_0 A8 down profile");
     if (config.a8_down_q80 && !config.a8_down_q51)
         throw std::invalid_argument("Q8_0 A8 down phase b requires Q5_1 A8 down");
     if (config.a8_down_q51 || config.a8_down_q80) {
@@ -1286,7 +1289,10 @@ PreparedQ4kA8 prepare_q4k_a8(const HipMoeExpertsLauncherConfig& config,
         config.a8_down_q51 || config.a8_down_q80);
     if (temporary.bytes < layout.total_bytes)
         throw std::invalid_argument("Q4K A8 runtime temporary is undersized");
-    const auto gate_bytes = required_weight_bytes(WeightKind::q4_k, config.hidden_size,
+    const auto gate_type = tensors.gate.manifest->ggml_type;
+    if (gate_type == 13U && !config.q5k_a8g32_gate_up)
+        throw std::invalid_argument("Q5_K A8 gate/up requires its explicit candidate");
+    const auto gate_bytes = required_weight_bytes(weight_kind(gate_type), config.hidden_size,
         config.intermediate_size, config.expert_count);
     // Validate entire runtime owners, not just the exact probe slices. Read-only
     // owners can alias each other; scratch and semantic output cannot alias any.
@@ -1297,7 +1303,7 @@ PreparedQ4kA8 prepare_q4k_a8(const HipMoeExpertsLauncherConfig& config,
         {tensors.down.runtime->address,tensors.down.runtime->bytes}}});
     moe_q4k_a8::Request request;
     request.enabled = true;
-    request.approved_numerical_identity = moe_q4k_a8::numerical_identity;
+    request.approved_numerical_identity = moe_q4k_a8::numerical_identity_for_gate_type(gate_type);
     request.input = config.activation == HipActivationStorage::bf16 ?
         moe_q4k_a8::InputKind::bf16 : moe_q4k_a8::InputKind::fp32;
     request.shape = {config.hidden_size, config.intermediate_size, config.expert_count, config.top_k, 1};
@@ -1477,6 +1483,8 @@ void launch_q4k_a8_typed(const HipMoeExpertsLauncherConfig& config,
                 std::to_string(host_status));
     }
     if (config.q4k_a8_stats) config.q4k_a8_stats->quantized_submissions.fetch_add(1,std::memory_order_relaxed);
+    if (request.gate_type == 13U && config.q4k_a8_stats)
+        config.q4k_a8_stats->q5k_a8_gate_up_submissions.fetch_add(1,std::memory_order_relaxed);
     if(grouped_q51 && config.q4k_a8_stats)
         config.q4k_a8_stats->grouped_q51_submissions.fetch_add(1,std::memory_order_relaxed);
     if ((config.a8_down_q51 || config.a8_down_q80) && !prepared.a8_down_request &&
@@ -1678,7 +1686,7 @@ PreparedMoeExperts prepare_moe_experts(
         if (tensors.fused_gate_up || tensors.gate.manifest->ggml_type != tensors.up.manifest->ggml_type ||
             (tensors.gate.manifest->ggml_type != 12 && tensors.gate.manifest->ggml_type != 13))
             throw std::invalid_argument("Q4K A8 runtime requires separate paired Q4K or Q5K gate/up");
-        if (tensors.gate.manifest->ggml_type == 12)
+        if (tensors.gate.manifest->ggml_type == 12 || config.q5k_a8g32_gate_up)
             quantized = prepare_q4k_a8(config, hidden, route_indices, route_weights, output, temporary, tensors);
 #endif
     }
@@ -1747,6 +1755,7 @@ std::string kernel_id(
             request.request_concurrency) +
         (config.batched_slot_activation ? ".batched-slot-activation-v1" : "") +
         (config.deferred_moe_status ? ".deferred-status-v1" : "") +
+        (config.q5k_a8g32_gate_up ? std::string(moe_q4k_a8::q5k_gate_up_kernel_marker) : "") +
         (config.a8_down_q51 ? std::string(moe_q4k_a8::q51_a8_down_kernel_marker) : "") +
         (config.a8_down_q80 ? std::string(moe_q4k_a8::q80_a8_down_kernel_marker) : "") +
         ((config.a8_down_q51 || config.a8_down_q80) ? std::string(moe_q4k_a8::a8_down_kernel_ending) :
@@ -1774,12 +1783,19 @@ std::uint64_t implementation_identity(
     if (config.batched_slot_activation) hash_u64(hash,0x42415453494c5531ULL);
     if (config.a8_down_q51) hash_u64(hash,0x5135314138445631ULL);
     if (config.a8_down_q80) hash_u64(hash,0x5138304138445631ULL);
+    if (config.q5k_a8g32_gate_up) hash_u64(hash,0x51354b4138475531ULL);
     return hash;
 }
 
 void validate_q51_slot_kernel_id(std::string_view id, const HipMoeExpertsLauncherConfig& config) {
+    const auto q5k_marker = moe_q4k_a8::q5k_gate_up_kernel_marker;
+    const auto q5k_position = id.find(q5k_marker);
+    if ((q5k_position != std::string_view::npos) != config.q5k_a8g32_gate_up ||
+        (config.q5k_a8g32_gate_up && id.find(q5k_marker,q5k_position+q5k_marker.size()) != std::string_view::npos))
+        throw std::invalid_argument("Q5_K A8 id has missing, foreign or duplicate gate/up marker");
     if (config.a8_down_q51 || config.a8_down_q80) {
         const auto tail =
+            (config.q5k_a8g32_gate_up ? std::string(q5k_marker) : "") +
             (config.a8_down_q51 ? std::string(moe_q4k_a8::q51_a8_down_kernel_marker) : "") +
             (config.a8_down_q80 ? std::string(moe_q4k_a8::q80_a8_down_kernel_marker) : "") +
             std::string(moe_q4k_a8::a8_down_kernel_ending);
@@ -1841,6 +1857,8 @@ void register_hip_moe_experts_kernel_variant(
         throw std::invalid_argument("Q4K A8 variant config differs from binding request");
     if (request.a8_down_q51 != config.a8_down_q51 || request.a8_down_q80 != config.a8_down_q80)
         throw std::invalid_argument("A8 down config differs from binding request");
+    if (request.q5k_a8g32_gate_up != config.q5k_a8g32_gate_up)
+        throw std::invalid_argument("Q5_K A8 gate/up config differs from binding request");
     if ((config.a8_down_q51 || config.a8_down_q80) &&
         (model.hidden_layers != 48U || model.bytes_fp32 != 4U))
         throw std::invalid_argument("A8 down registers canonical 48-layer FP32 control geometry only");
@@ -1941,10 +1959,15 @@ void register_hip_moe_experts_kernel_variant(
             variant.numerics.accumulator_precision += ";" + std::string(moe_q4k_a8::q80_a8_down_numerical_identity);
         else
             variant.numerics.accumulator_precision += ";four-q4k-q80-legacy-slot-down";
-        variant.numerics.accumulator_precision += ";layer2-q5k-q80-literal-fallback:final-scan-bf16-commit-d1";
+        if (config.q5k_a8g32_gate_up)
+            variant.numerics.accumulator_precision += ";" + std::string(moe_q4k_a8::q5k_numerical_identity) +
+                ";layer2-q5k-q80-a8:final-scan-bf16-commit-d1";
+        else
+            variant.numerics.accumulator_precision += ";layer2-q5k-q80-literal-fallback:final-scan-bf16-commit-d1";
         variant.compiler_identity = "hip-gfx1151-moe-a8-down-strict-v1:activation-quantize:integer-rawdots:incumbent-slot-merge:final-scan-commit-d1";
         if (config.a8_down_q51) variant.compiler_identity += ":q51-iu5";
         if (config.a8_down_q80) variant.compiler_identity += ":q80-is8";
+        if (config.q5k_a8g32_gate_up) variant.compiler_identity += ":q5k-a8g32-gateup-v1";
         variant.graph_safe = false;
     }
     variant.measured_seconds = 0.0;
@@ -2337,7 +2360,7 @@ hipStream_t known_moe_rows_stream() {
 }
 KnownMoeRowsPrepared prepare_known_moe_rows(std::span<const ExecutionDispatchContext> rows,
     const HipMoeExpertsLauncherConfig& config, const q51_known_rows::Workspace& extra) {
-    if (config.a8_down_q51 || config.a8_down_q80)
+    if (config.a8_down_q51 || config.a8_down_q80 || config.q5k_a8g32_gate_up)
         throw std::invalid_argument("A8 down rejects known-window CSR rows");
     if (rows.size() != 2U && rows.size() != 4U && rows.size() != 8U)
         throw std::invalid_argument("known-window routed rows require R2/R4/R8");

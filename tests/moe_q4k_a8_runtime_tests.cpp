@@ -123,6 +123,20 @@ int main() {
     validate_a8_down_manifest(model,actual_census,true,false);
     rejects([&]{validate_a8_down_manifest(model,actual_census,false,true);},"Q8_0 phase b requires the Q5_1 candidate");
     validate_a8_down_manifest(model,actual_census,true,true);
+    validate_q5k_a8_manifest(model,actual_census);
+    auto q5k_census = actual_census;
+    q5k_census.legacy_q5k_layers = {1U};
+    rejects([&]{validate_q5k_a8_manifest(model,q5k_census);},"Q5_K A8 rejects a relabeled gate/up layer");
+    q5k_census = actual_census; q5k_census.q5k_with_q80_down_layers = {3U};
+    rejects([&]{validate_q5k_a8_manifest(model,q5k_census);},"Q5_K A8 rejects a relabeled down layer");
+    q5k_census = actual_census; q5k_census.legacy_q5k_layers.push_back(3U);
+    rejects([&]{validate_q5k_a8_manifest(model,q5k_census);},"Q5_K A8 rejects extra Q5_K layers");
+    auto undersized_q5k = actual_types;
+    for (auto& tensor : undersized_q5k.tensors)
+        if (*tensor.layer == 2U && tensor.name.find("down_exps") == std::string::npos)
+            tensor.byte_size = 471859200ULL;
+    rejects([&]{(void)classify_runtime_manifest(model,undersized_q5k);},
+        "Q5_K owner extent must be 576716800, never the Q4_K 471859200 byte extent");
     rejects([&]{validate_a8_down_manifest(model,actual_census,false,false);},"A8 down manifest requires explicit candidate");
     rejects([&]{validate_a8_down_manifest(model,c,true,true);},"A8 down rejects same-sized incorrect layer census");
     auto bad_census = actual_census;
@@ -173,6 +187,8 @@ int main() {
         const auto candidate = prefix + ";" + std::string(a8_down_gate_up_raw_identity) + ";" +
             std::string(q51_a8_down_raw_identity) + ";" + std::string(q80_a8_down_raw_identity);
         check(candidate.size() <= 512,"both down A8 RAW tags remain bounded with existing head profiles");
+        check((candidate + ";" + std::string(q5k_gate_up_raw_identity)).size() <= 512,
+            "Q5_K A8 gate/up RAW tag remains bounded with existing head/down profiles");
         prefix += ";" + std::string(runtime_numerical_identity) + ";" + std::string(grouped_q51_raw_identity);
         check(prefix.size()<=512,"combined RAW numerical identity remains inside512 byte contract");
     };

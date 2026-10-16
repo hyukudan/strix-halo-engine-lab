@@ -92,6 +92,7 @@ strix::kernels::KernelRegistry make_registry(
                      step.op == strix::SerialOp::moe_route && request.parallel_moe_router ? ".parallel" : "") +
                     (step.op == strix::SerialOp::moe_experts && request.batched_moe_activation ? ".batched-slot-activation-v1" : "") +
                     (step.op == strix::SerialOp::moe_experts && request.deferred_moe_status ? ".deferred-status-v1" : "") +
+                    (step.op == strix::SerialOp::moe_experts && request.q5k_a8g32_gate_up ? ".q5k-a8g32-gateup-v1" : "") +
                     (step.op == strix::SerialOp::moe_experts && request.a8_down_q51 ? ".q51-a8g32-down-v1" : "") +
                     (step.op == strix::SerialOp::moe_experts && request.a8_down_q80 ? ".q80-a8g32-down-v1" : "") +
                     (step.op == strix::SerialOp::moe_experts && request.a8_down_q51 ? ".mixed-a8-down-v1" : "") +
@@ -715,6 +716,20 @@ int main() {
         "Q8 extension has its own identity while reusing quantized down storage");
     expect(rejects_deferred(down_registry,q80_binding,q80_buffers,
         "bound A8 down numerical identity differs from request"), "Q8 extension rejects Q51-only kernel identity");
+    auto q5k_binding=q80_binding;
+    auto q5k_buffers=q80_buffers;
+    q5k_binding.q5k_a8g32_gate_up=true;
+    q5k_buffers.q5k_a8g32_gate_up=true;
+    const auto q5k_registry=make_registry(model,q5k_binding);
+    const auto q5k_compiled=strix::compile_serial_execution(model,q5k_registry,q5k_binding,q5k_buffers);
+    expect(q5k_compiled.execution_identity!=q80_compiled.execution_identity &&
+        q5k_compiled.kernel_plan_identity!=q80_compiled.kernel_plan_identity &&
+        q5k_compiled.arena.total_bytes==q80_compiled.arena.total_bytes,
+        "Q5K gate/up has separate identities with unchanged A8 arena");
+    expect(rejects_deferred(q5k_registry,q5k_binding,q80_buffers,
+        "Q5K A8 gate/up differs from buffer admission"),"Q5K gate/up cannot borrow another profile admission");
+    expect(rejects_deferred(q80_registry,q5k_binding,q5k_buffers,
+        "bound Q5K A8 gate/up identity differs from request"),"Q5K gate/up rejects missing numerical marker");
 
     if (failures == 0) {
         std::cout << "compiled execution tests passed\n";

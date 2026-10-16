@@ -166,6 +166,9 @@ checkpoint has the qualification of the ordinary automatic profile.
 | `hc-splitk-f32+q51-a8-down-v1` | FP32 split-K | A8 activation and integer Q5_1 dot |
 | `q51-q80-a8-down-v1` | Existing selected path | A8 activation and integer Q5_1 plus eligible Q8_0 dots |
 | `hc-splitk-f32+q51-q80-a8-down-v1` | FP32 split-K | Both eligible A8 down formats |
+| `hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup-v1` | FP32 split-K | Adds unsigned-five-bit A8 gate/up at layer2 and its Q8_0 A8 down |
+| `hc-deferred-norm-f32+q51-q80-a8-down-v1` | FP32 split-K with deferred per-stream RMS | Both eligible A8 down formats |
+| `hc-deferred-norm-f32+q51-q80-a8-down+q5k-a8-gateup-v1` | Deferred per-stream RMS | Both down formats plus layer2 Q5_K A8 gate/up |
 
 These alternatives change rounding or reduction association. They are explicit
 candidates with `not_assessed` numerical qualification, not aliases for exact
@@ -195,7 +198,14 @@ not reused from a baseline plan.
 The admitted routed census is43 Q4_K/Q5_1 layers, four Q4_K/Q8_0 layers and one
 Q5_K/Q8_0 fallback layer. The Q51-only recipe preserves the four Q8_0 fallback
 layers; the Q51/Q80 recipe changes only those four additional eligible down
-projections. The Q5_K gate/up layer remains on its original path. Compact RAW
+projections. Those original six profiles preserve the Q5_K gate/up layer.
+The explicit `+q5k-a8-gateup-v1` atom instead admits only canonical layer2,
+using the original unsigned-five-bit qh bit-plane with the versioned integer
+A8 gate/up epilogue. Its down uses the existing Q8_0 A8 recipe. The canonical
+43/four/one classification remains unchanged; selected execution then has48
+quantized gate/up layers,43 Q5_1 A8 down layers and five Q8_0 A8 down layers,
+with no legacy Q5_K submission. Missing or different census/content fails closed.
+Compact RAW
 identities distinguish the new down arithmetic and do not claim the incumbent
 exact-grouped Q5_1 reduction. Integer activation codes, FP32 scales, tiny-group
 handling, integer dot order and ordered route merge are versioned contracts.
@@ -203,8 +213,22 @@ handling, integer dot order and ordered route merge are versioned contracts.
 Receipts distinguish configured recipes and model eligibility/fallback lists from
 `hc_splitk_f32_submissions`, `q51_a8_down_submissions`,
 `q80_a8_down_submissions` and `q80_a8_down_legacy_fallback_submissions`.
-These are actual successful host enqueues. They are not graph replay counts,
+`hc_materialized_norm_submissions`, `hc_deferred_norm_submissions` and
+`q5k_a8_gate_up_submissions` separately report the additional actual producers.
+These are successful host enqueues. They are not graph replay counts,
 physical traffic estimates or performance measurements.
+
+Deferred HC is restricted to all97 canonical mixers, including the final mixer.
+Every norm is F32[10240], every up projection is admitted Q8_0, and every
+selected binding uses the deferred lane-chain recipe. No lane-chain-off variant
+is registered or chosen for that profile; partial eligibility fails before any
+HC launch. The existing materialized path and its mixed fallback stay intact
+for older profiles. The new split-K computes per-stream inverse RMS in the
+existing workspace, and the lane-chain output reloads raw BF16 input and F32
+gains. Live range/generation checks preserve disjoint input, output, workspace
+and weight owners. Injection consumes the original expanded input and its
+separate projection result, not a fictitious normalized buffer. The arithmetic
+association has its own identity; no equivalence to the previous path is claimed.
 
 ## Teacher-forced scoring diagnostic
 
@@ -228,3 +252,14 @@ run: complete-request timing is disabled, and its score ledger is not a speed
 measurement. Arithmetic candidates retain their explicit recipe and unassessed
 qualification; computing scores alone does not approve their quality thresholds
 or change defaults.
+
+
+`--teacher-logits-file PATH` optionally writes complete finite FP32 logits for
+all N-1 scored rows, in ascending vocabulary order, to an exclusively created
+bounded diagnostic file. It requires teacher-forced scoring. The header binds
+vocabulary and all teacher IDs; per-row input/position fields and a completion
+footer prevent accepting an interrupted stream. The file is capped at16GiB
+before inference. Appending a row or finishing the file after target consumption
+uses the same poison/drain failure path as the score ledger. Full-logit exports
+are for independent KL/top-1 analysis, not a performance run; no metric or
+qualification is inferred merely because a file was created.

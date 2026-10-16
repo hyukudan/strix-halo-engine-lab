@@ -21,6 +21,7 @@ struct ExecutionBufferRequest {
     std::uint32_t qsa_gqa_heads_per_block = 1;
     bool a8_down_q51 = false;
     bool a8_down_q80 = false;
+    bool q5k_a8g32_gate_up = false;
 };
 
 struct ExecutionBufferPlan {

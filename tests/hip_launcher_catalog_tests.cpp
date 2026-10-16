@@ -526,6 +526,9 @@ int main() {
 
 
     {
+        const auto must_reject=[&](auto&& action,const char* label) {
+            bool failed=false;try{action();}catch(const std::invalid_argument&){failed=true;}expect(failed,label);
+        };
         auto hc_request=request;hc_request.lane_chain_hyper_output=true;
         for(const auto& step:execution.steps)if(step.op==strix::SerialOp::attn_hyper_mix || step.op==strix::SerialOp::mlp_hyper_mix)hc_request.lane_chain_hyper_output_eligible_steps.push_back(step.id);
         strix::HipLauncherCatalogConfig hc_config;hc_config.parallel_hyper_mix=true;hc_config.staged_hyper_projections=true;hc_config.fused_staged_hyper_mix=true;hc_config.typed_hyper_projection=true;hc_config.prefetch_typed_hyper_rows=true;hc_config.prefetch_q8_hyper_output=true;hc_config.lane_chain_hyper_output=true;
@@ -541,6 +544,45 @@ int main() {
         expect(rejected,"HC catalog rejects inverse config/request opt-in mismatch");
         strix::ExecutionBufferRequest hc_buffers;const auto hc_compiled=strix::compile_serial_execution(model,hc_registry,hc_request,hc_buffers);
         expect(hc_compiled.bindings.missing_steps==0,"mixed candidate/base catalog compiles complete plan");
+        // Deferred HC is all-or-nothing; it must not inherit this mixed
+        // candidate/base catalog even though the original path permits it.
+        auto deferred_config=hc_config;
+        deferred_config.numerical_profile=strix::DecodeNumericalProfile::hc_deferred_norm_f32_q51_q80_a8_down_v1;
+        deferred_config.splitk_hyper_projection=deferred_config.splitk_deferred_norm=true;
+        deferred_config.q4k_a8g32_gate_up=deferred_config.grouped_exact_q51_down=true;
+        deferred_config.q51_slot_parallel_down=deferred_config.batched_moe_activation=true;
+        deferred_config.deferred_moe_status=deferred_config.a8_down_q51=deferred_config.a8_down_q80=true;
+        auto deferred_request=hc_request;
+        deferred_request.q4k_a8g32_gate_up=deferred_request.grouped_exact_q51_down=true;
+        deferred_request.q51_slot_parallel_down=deferred_request.batched_moe_activation=true;
+        deferred_request.deferred_moe_status=deferred_request.a8_down_q51=deferred_request.a8_down_q80=true;
+        for(const auto& step:execution.steps)if(step.op==strix::SerialOp::final_hyper_mix)
+            deferred_request.lane_chain_hyper_output_eligible_steps.push_back(step.id);
+        strix::kernels::KernelRegistry deferred_registry;
+        strix::register_complete_hip_kernel_catalog(model,deferred_request,deferred_config,deferred_registry);
+        std::uint32_t deferred_variants=0;
+        for(const auto& variant:deferred_registry.variants())if(variant.family==strix::kernels::OperatorFamily::hyper_mix) {
+            ++deferred_variants;
+            expect(variant.id.find(".hc-deferred-norm-v1")!=std::string::npos &&
+                variant.id.ends_with(strix::lane_chain_hyper_output_suffix),
+                "every deferred HC catalog variant requires the lane-chain recipe");
+        }
+        expect(deferred_variants==1U,"deferred HC never registers a lane-chain-off fallback variant");
+        auto deferred_missing=deferred_config;deferred_missing.lane_chain_hyper_output=false;
+        must_reject([&]{strix::kernels::KernelRegistry bad;strix::register_complete_hip_kernel_catalog(model,deferred_request,deferred_missing,bad);},
+            "deferred HC catalog rejects missing lane-chain rather than silently changing the numerical recipe");
+        auto deferred_forged=deferred_config;deferred_forged.q5k_a8g32_gate_up=true;
+        must_reject([&]{strix::kernels::KernelRegistry bad;strix::register_complete_hip_kernel_catalog(model,deferred_request,deferred_forged,bad);},
+            "typed deferred profile rejects unrequested Q5K arithmetic");
+        strix::HipLauncherCatalog deferred_owner(model,deferred_config);
+        strix::ExecutionLauncherRegistry no_resources_registry;
+        must_reject([&]{deferred_owner.register_for_compiled_execution(hc_compiled,no_resources_registry);},
+            "deferred HC requires full metadata before any launcher registration");
+        expect(no_resources_registry.find_runtime_launcher(strix::SerialOp::position_prepare)==nullptr,
+            "missing deferred metadata publishes no position runtime launcher");
+        for(const auto& variant:deferred_registry.variants())
+            expect(no_resources_registry.find_kernel_launcher(variant.id)==nullptr,
+                "missing deferred metadata publishes no partial kernel registry");
         strix::kernels::KernelRegistry candidate_only;
         for(const auto& variant:hc_registry.variants())if(variant.family!=strix::kernels::OperatorFamily::hyper_mix || variant.id.ends_with(strix::lane_chain_hyper_output_suffix))candidate_only.add(variant);
         rejected=false;try{(void)strix::compile_serial_execution(model,candidate_only,hc_request,hc_buffers);}catch(const std::invalid_argument&){rejected=true;}
@@ -584,9 +626,6 @@ int main() {
             }
         }
         expect(selected_hc==97 && selected_chain==96,"next-tile covers97 HC consumers with unchanged96 C1 assignments");
-        const auto must_reject=[&](auto&& action,const char* label) {
-            bool failed=false;try{action();}catch(const std::invalid_argument&){failed=true;}expect(failed,label);
-        };
         strix::HipHyperMixLauncherConfig incumbent;
         incumbent.hidden_size=static_cast<std::uint32_t>(model.hidden_size);
         incumbent.hc_count=static_cast<std::uint32_t>(model.hc_count);

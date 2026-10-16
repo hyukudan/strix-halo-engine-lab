@@ -905,15 +905,25 @@ int main() {
            !manual_increments.lane_chain_hyper_output && !manual_increments.q4k_a8g32_gate_up &&
            manual_increments.context_tokens == 128,
            "manual increments preserve their flags without adding the automatic bundle");
-    const std::array<std::string_view, 6> numerical_names{
+    const std::array<std::string_view, 9> numerical_names{
         "exact-v5", "hc-splitk-f32-v1", "q51-a8-down-v1", "hc-splitk-f32+q51-a8-down-v1",
-        "q51-q80-a8-down-v1", "hc-splitk-f32+q51-q80-a8-down-v1"};
+        "q51-q80-a8-down-v1", "hc-splitk-f32+q51-q80-a8-down-v1",
+        "hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup-v1",
+        "hc-deferred-norm-f32+q51-q80-a8-down-v1",
+        "hc-deferred-norm-f32+q51-q80-a8-down+q5k-a8-gateup-v1"};
     for (const auto name : numerical_names) {
         const std::string value(name);
         auto candidate = parse({"decoder", "fixture.gguf", "1", "--generate", "2", "--numerical-profile", value.c_str()});
         expect(candidate.numerical_profile_explicit && !candidate.any_low_level_flag &&
             numerical_profile_name(candidate.numerical_profile) == name,
             "typed numerical option is independent of low-level fallback selection");
+        expect(numerical_profile_q5k_a8_gateup(candidate.numerical_profile) ==
+                (name.find("+q5k-a8-gateup-v1") != std::string_view::npos) &&
+            numerical_profile_hc_deferred_norm(candidate.numerical_profile) == name.starts_with("hc-deferred-norm-f32") &&
+            numerical_profile_hc_splitk(candidate.numerical_profile) == name.starts_with("hc-") &&
+            numerical_profile_q51_a8_down(candidate.numerical_profile) == (name.find("q51") != std::string_view::npos) &&
+            numerical_profile_q80_a8_down(candidate.numerical_profile) == (name.find("q80") != std::string_view::npos),
+            "typed numerical atoms select exact static host recipes for all old and new profiles");
         auto base = resolve_optimization_profile(candidate, model, numerical_router_info, manifest, validated_model_content_identity, true);
         const auto numerical_base_selected = base.selected;
         expect(numerical_base_selected == "canonical-a8-wave-qsa-hc-shared-output-v5" && candidate.prepared_eager &&
@@ -926,6 +936,13 @@ int main() {
             base.reason == "qualified-ordinary-cpu-generation" && candidate.q51_slot_parallel_down,
             "numerical recipe adds its identity without changing organization or reason");
         if (name != "exact-v5") {
+            if (numerical_profile_hc_deferred_norm(candidate.numerical_profile)) {
+                auto partial = candidate; partial.lane_chain_hyper_output = false;
+                rejects([&] { auto result = base; apply_numerical_profile(partial, model, manifest,
+                    validated_model_content_identity, true, result); },
+                    "numerical profile requires the resolved full v5 organization without implicit flag changes");
+                expect(!partial.lane_chain_hyper_output,"deferred normalization cannot silently restore a missing lane-chain path");
+            }
             auto missing = candidate; missing.q51_slot_parallel_down = false;
             rejects([&] { auto result = base; apply_numerical_profile(missing, model, manifest,
                 validated_model_content_identity, true, result); },
@@ -951,6 +968,13 @@ int main() {
                 "numerical profile requires ordinary eager floating C1 execution without alternate controllers or layouts");
         }
     }
+    expect(static_cast<int>(DecodeNumericalProfile::exact_v5) == 0 &&
+        static_cast<int>(DecodeNumericalProfile::hc_splitk_f32_q51_q80_a8_down_v1) == 5,
+        "new arithmetic atoms append enum values without changing the six existing profile identities");
+    rejects([] { (void)parse({"decoder", "m", "1", "--numerical-profile", "hc-deferred-norm-fp64-v1"}); },
+        "--numerical-profile requires a supported numerical recipe");
+    rejects([] { (void)parse({"decoder", "m", "1", "--numerical-profile", "q5k-a8-gateup-v1"}); },
+        "--numerical-profile requires a supported numerical recipe");
     rejects([] { (void)parse({"decoder", "m", "1", "--numerical-profile", "hc-splitk-fp64-v1"}); },
         "--numerical-profile requires a supported numerical recipe");
     rejects([] { (void)parse({"decoder", "m", "1", "--numerical-profile"}); },
@@ -962,6 +986,19 @@ int main() {
     auto teacher = parse({"decoder", "m", "1", "2", "3", "--generate", "1", "--teacher-forced-score"});
     expect(teacher.teacher_forced_score && !teacher.any_low_level_flag && teacher.logprob_token_ids.empty(),
         "teacher forcing has a separate bounded dynamic-label diagnostic intent");
+    auto spool_teacher = parse({"decoder", "m", "1", "2", "--generate", "1", "--teacher-forced-score", "--teacher-logits-file", "fresh-logits.bin"});
+    expect(spool_teacher.teacher_logits_path == "fresh-logits.bin" && !spool_teacher.any_low_level_flag,
+        "teacher full-logit spool preserves diagnostic intent without selecting a numerical recipe");
+    auto equals_spool = parse({"decoder", "m", "1", "2", "--generate", "1", "--teacher-forced-score", "--teacher-logits-file=fresh-logits.bin"});
+    expect(equals_spool.teacher_logits_path == spool_teacher.teacher_logits_path,"teacher spool accepts equal syntax");
+    rejects([] { (void)parse({"decoder", "m", "1", "2", "--generate", "1", "--teacher-logits-file", "unused.bin"}); },
+        "teacher logits file requires teacher-forced score");
+    rejects([] { (void)parse({"decoder", "m", "1", "2", "--generate", "1", "--teacher-forced-score", "--teacher-logits-file="}); },
+        "teacher logits file requires a nonempty path");
+    rejects([] { (void)parse({"decoder", "m", "1", "2", "--generate", "1", "--teacher-forced-score", "--teacher-logits-file"}); },
+        "teacher logits file requires a nonempty path");
+    rejects([] { (void)parse({"decoder", "m", "1", "2", "--generate", "1", "--teacher-forced-score", "--teacher-logits-file=a", "--teacher-logits-file=b"}); },
+        "duplicate teacher logits file option");
     validate_resolved_teacher_forced_score(teacher, 4);
     rejects([&] { validate_resolved_teacher_forced_score(teacher, 3); }, "teacher input exceeds model vocabulary");
     auto short_context = teacher; short_context.context_tokens = 2;

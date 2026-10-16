@@ -105,6 +105,36 @@ void config_and_identity_tests() {
            "both modes off preserve the qualified C1 implementation hash");
 
     auto fp32 = admitted();
+    auto deferred=fp32;
+    deferred.lane_chain_output=true;
+    deferred.splitk_deferred_norm=true;
+    const auto deferred_variant=descriptor(deferred);
+    expect(deferred_variant.id.find(".hc-deferred-norm-v1")!=std::string::npos &&
+        deferred_variant.id.ends_with(strix::lane_chain_hyper_output_suffix) &&
+        deferred_variant.numerics.accumulator_precision==strix::deferred_hc_numerical_identity,
+        "deferred RMS has its own explicit numerical contract and terminal output identity");
+    const auto deferred_launcher=strix::make_hip_hyper_mix_launcher(deferred_variant.id,&deferred);
+    auto materialized=deferred;
+    materialized.splitk_deferred_norm=false;
+    const auto materialized_variant=descriptor(materialized);
+    expect(deferred_launcher.implementation_identity!=
+        strix::make_hip_hyper_mix_launcher(materialized_variant.id,&materialized).implementation_identity,
+        "deferred RMS cannot reuse the materialized implementation identity");
+    for(unsigned mutation=0;mutation<5U;++mutation) {
+        auto bad=deferred;
+        if(mutation==0)bad.splitk_projection=false;
+        if(mutation==1)bad.splitk_projection_fp64=true;
+        if(mutation==2)bad.lane_chain_output=false;
+        if(mutation==3)bad.hidden_size=1280U;
+        if(mutation==4)bad.activation=strix::HipActivationStorage::fp32;
+        rejects_config(bad,"deferred HC RMS requires");
+    }
+    for(const auto& foreign_id:{materialized_variant.id,deferred_variant.id+".foreign"}) {
+        bool rejected=false;
+        try{(void)strix::make_hip_hyper_mix_launcher(foreign_id,&deferred);}
+        catch(const std::invalid_argument&){rejected=true;}
+        expect(rejected,"deferred RMS rejects missing or foreign launcher identity");
+    }
     auto fp64 = fp32;
     fp64.splitk_projection_fp64 = true;
     const auto variant32 = descriptor(fp32);

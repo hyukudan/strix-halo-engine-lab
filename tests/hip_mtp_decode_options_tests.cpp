@@ -197,11 +197,16 @@ int main(){try{
         "--mtp-window-capture-bytes=1024","--mtp-window-checkpoint-bytes=1024","--mtp-window-total-bytes=8192",
         "--mtp-window-history-intervals=128","--mtp-window-expert-union","--mtp-window-expert-union-bytes=512"});
     reject_as(metadata_union,"MTP window expert union requires an actual target window and a positive explicit budget within arena and total window budgets","metadata-only route cannot accept unused union workspace");
-    auto numerical_mtp = request();
-    numerical_mtp.insert(numerical_mtp.end(), {"--numerical-profile", "q51-a8-down-v1"});
-    reject_as(numerical_mtp,
-        "numerical profile requires ordinary eager floating C1 execution without alternate controllers or layouts",
-        "MTP cannot inherit a new target arithmetic recipe before its separate qualification");
+    for (const auto* profile : {"q51-a8-down-v1",
+        "hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup-v1",
+        "hc-deferred-norm-f32+q51-q80-a8-down-v1",
+        "hc-deferred-norm-f32+q51-q80-a8-down+q5k-a8-gateup-v1"}) {
+        auto numerical_mtp = request();
+        numerical_mtp.insert(numerical_mtp.end(), {"--numerical-profile", profile});
+        reject_as(numerical_mtp,
+            "numerical profile requires ordinary eager floating C1 execution without alternate controllers or layouts",
+            "MTP cannot inherit an unqualified target arithmetic atom");
+    }
     auto exact_mtp = request();
     exact_mtp.insert(exact_mtp.end(), {"--numerical-profile=exact-v5"});
     require(parse(exact_mtp).numerical_profile == strix::DecodeNumericalProfile::exact_v5,

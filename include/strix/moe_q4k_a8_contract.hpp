@@ -1,4 +1,5 @@
 #pragma once
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -10,6 +11,10 @@ inline constexpr std::uint32_t max_hidden = 2560, max_rows = 640, max_experts = 
 inline constexpr std::string_view numerical_identity =
     "strix-moe-q4k-a8g32-probe-v2:f32-div-rne:g32-sym127-zero1-finite-noflush:"
     "dot-s8xu8-i32:combine-separate-f32:pair-ascending-sb-tree4:writer-c0:wave32:proj-nonfinite=propagate-unqualified";
+inline constexpr std::string_view q5k_numerical_identity =
+    "strix-moe-q5k-a8g32-probe-v1:f32-div-rne:g32-sym127-zero1-finite-noflush:"
+    "dot-s8xu5qh-i32:combine-separate-f32:pair-ascending-sb-tree4:writer-c0:wave32:proj-nonfinite=propagate-unqualified";
+[[nodiscard]] std::string_view numerical_identity_for_gate_type(std::uint32_t gate_type);
 struct QuantizedRow {
     std::vector<std::int8_t> codes;
     std::vector<float> deltas;
@@ -27,6 +32,13 @@ void require_f32_environment();
 // Quantized reference with the versioned FP32 order, not legacy exact arithmetic.
 // Qualified scope requires finite headers AND every combine intermediate finite.
 [[nodiscard]] float evaluate_row(std::span<const std::byte> q4k, const QuantizedRow& row);
+
+// Separate unsigned-five-bit contract; the Q4K oracle/admission remains closed.
+[[nodiscard]] std::array<std::uint8_t,32> decode_q5k_codes(std::span<const std::byte> block,
+    std::uint32_t group);
+[[nodiscard]] IntegerGroup integer_group_q5k(std::span<const std::uint8_t> q,
+    std::span<const std::int8_t> a, Factors factors);
+[[nodiscard]] float evaluate_q5k_row(std::span<const std::byte> q5k, const QuantizedRow& row);
 
 enum class InputKind { bf16, fp32 };
 struct Shape { std::uint32_t hidden = 256, rows = 32, experts = 1, top_k = 1, logical_rows = 1; };

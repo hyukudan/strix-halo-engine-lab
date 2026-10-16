@@ -1,5 +1,6 @@
 #include "strix/hip_lane_chain_hyper_output_tests.hpp"
 #include "strix/hip_lane_chain_hyper_projection_tests.hpp"
+#include "strix/hip_hc_deferred_norm_tests.hpp"
 #include "strix/hip_launch_context.hpp"
 #include "strix/hip_hyper_mix_launcher.hpp"
 #include "strix/hip_mtp_projection.hpp"
@@ -103,6 +104,12 @@ const char* storage_name(
 
 void validate_config(
     const HipHyperMixLauncherConfig& config) {
+    if (config.splitk_deferred_norm && (!config.splitk_projection || config.splitk_projection_fp64 ||
+        !config.lane_chain_output || !config.fused_injection || !config.typed_projection ||
+        !config.staged_projections || !config.parallel || config.prefetch_hc_projection_next_tile ||
+        config.hidden_size != 2560U || config.hc_count != 4U || config.lowrank != 320U ||
+        config.activation != HipActivationStorage::bf16))
+        throw std::invalid_argument("deferred HC RMS requires canonical eager FP32 split-K lane-chain execution");
     if (config.prefetch_hc_projection_next_tile &&
         (!config.parallel || !config.staged_projections || !config.fused_injection ||
          !config.typed_projection || !config.prefetch_rows || config.splitk_projection ||
@@ -1042,6 +1049,155 @@ __device__ __forceinline__ void splitk_hyper_lane_dots(
     }
 }
 
+template <unsigned R, typename Acc, bool Injection>
+__device__ __forceinline__ void deferred_hyper_lane_dots(
+    const std::uint16_t* raw, const float* norm, const void* weights, unsigned first, unsigned valid,
+    unsigned tile, unsigned lane, Acc (&sums)[R]) {
+    float4 x[5];
+#pragma unroll
+    for (unsigned s=0;s<5U;++s) {
+        const unsigned feature=tile*640U+s*128U+lane*4U;
+        x[s]=make_float4(__fmul_rn(load_activation(raw,feature),norm[feature]),
+            __fmul_rn(load_activation(raw,feature+1U),norm[feature+1U]),
+            __fmul_rn(load_activation(raw,feature+2U),norm[feature+2U]),
+            __fmul_rn(load_activation(raw,feature+3U),norm[feature+3U]));
+    }
+    if constexpr (Injection) {
+        float4 w[R][5];
+#pragma unroll
+        for (unsigned r=0;r<R;++r) if(r<valid) {
+#pragma unroll
+            for(unsigned s=0;s<5U;++s)
+                w[r][s]=*reinterpret_cast<const float4*>(
+                    static_cast<const float*>(weights)+
+                    static_cast<std::uint64_t>(first+r)*10240U+tile*640U+s*128U+lane*4U);
+        }
+#pragma unroll
+        for(unsigned r=0;r<R;++r) {
+            sums[r]=Acc{0};
+            if(r<valid) {
+#pragma unroll
+                for(unsigned s=0;s<5U;++s) {
+                    if constexpr(sizeof(Acc)==sizeof(float)) {
+                        sums[r]=fmaf(x[s].x,w[r][s].x,sums[r]);
+                        sums[r]=fmaf(x[s].y,w[r][s].y,sums[r]);
+                        sums[r]=fmaf(x[s].z,w[r][s].z,sums[r]);
+                        sums[r]=fmaf(x[s].w,w[r][s].w,sums[r]);
+                    } else {
+                        sums[r]=fma(static_cast<double>(x[s].x),static_cast<double>(w[r][s].x),sums[r]);
+                        sums[r]=fma(static_cast<double>(x[s].y),static_cast<double>(w[r][s].y),sums[r]);
+                        sums[r]=fma(static_cast<double>(x[s].z),static_cast<double>(w[r][s].z),sums[r]);
+                        sums[r]=fma(static_cast<double>(x[s].w),static_cast<double>(w[r][s].w),sums[r]);
+                    }
+                }
+            }
+        }
+    } else {
+        unsigned packed[R][5];
+        float scales[R][5];
+#pragma unroll
+        for(unsigned r=0;r<R;++r) if(r<valid) {
+#pragma unroll
+            for(unsigned s=0;s<5U;++s) {
+                const auto* block=static_cast<const unsigned char*>(weights)+
+                    static_cast<std::uint64_t>(first+r)*320U*34U+
+                    static_cast<std::uint64_t>(tile*20U+4U*s+lane/8U)*34U;
+                // Original 34-byte blocks are only 2-aligned. Never issue an
+                // incorrectly aligned 32-bit load for this packed code quartet.
+                const auto bits=*reinterpret_cast<const unsigned short*>(block);
+                const auto* codes=reinterpret_cast<const unsigned short*>(block+2U+4U*(lane%8U));
+                scales[r][s]=__half2float(__ushort_as_half(bits));
+                packed[r][s]=static_cast<unsigned>(codes[0])|
+                    (static_cast<unsigned>(codes[1])<<16U);
+            }
+        }
+#pragma unroll
+        for(unsigned r=0;r<R;++r) {
+            sums[r]=Acc{0};
+            if(r<valid) {
+#pragma unroll
+                for(unsigned s=0;s<5U;++s) {
+                    const float inputs[4]={x[s].x,x[s].y,x[s].z,x[s].w};
+#pragma unroll
+                    for(unsigned j=0;j<4U;++j) {
+                        const unsigned byte=(packed[r][s]>>(j*8U))&255U;
+                        const int code=byte<128U?static_cast<int>(byte):static_cast<int>(byte)-256;
+                        const float coefficient=scales[r][s]*static_cast<float>(code);
+                        if constexpr(sizeof(Acc)==sizeof(float))
+                            sums[r]=fmaf(inputs[j],coefficient,sums[r]);
+                        else
+                            sums[r]=fma(static_cast<double>(inputs[j]),static_cast<double>(coefficient),sums[r]);
+                    }
+                }
+            }
+        }
+    }
+#pragma unroll
+    for(unsigned r=0;r<R;++r) if(r<valid) {
+#pragma unroll
+        for(unsigned offset=16U;offset!=0U;offset/=2U)
+            sums[r]=sums[r]+__shfl_xor(sums[r],static_cast<int>(offset),32);
+    }
+}
+
+// Deferred RMS: each wave owns 640 raw features. The four stream inverses
+// are reproduced in every projection block; only block zero publishes them.
+template <unsigned R>
+__global__ __launch_bounds__(512) void deferred_hyper_projection_kernel(
+    const std::uint16_t* raw,const float* norm,const void* down,unsigned rank,
+    float epsilon,float* inverse_out,float* low,const void* inject,float* injection,unsigned low_blocks,
+    float* inverse_audit,float* scaled_audit) {
+    __shared__ float red[16][R];
+    __shared__ float square[16];
+    __shared__ float inverse[4];
+    const unsigned lane=threadIdx.x%32U,tile=threadIdx.x/32U;
+    const auto* input=raw+static_cast<std::uint64_t>(blockIdx.y)*10240U;
+    float sum=0.0F;
+#pragma unroll
+    for(unsigned part=0;part<5U;++part) {
+#pragma unroll
+        for(unsigned j=0;j<4U;++j) {
+            const float value=load_activation(input,tile*640U+part*128U+lane*4U+j);
+            sum=fmaf(value,value,sum);
+        }
+    }
+#pragma unroll
+    for(unsigned offset=16U;offset!=0U;offset/=2U)
+        sum=sum+__shfl_xor(sum,static_cast<int>(offset),32);
+    if(lane==0U)square[tile]=sum;
+    __syncthreads();
+    if(threadIdx.x<4U) {
+        float total=0.0F;
+#pragma unroll
+        for(unsigned k=0;k<4U;++k)total=total+square[threadIdx.x*4U+k];
+        inverse[threadIdx.x]=rsqrtf(total/2560.0F+epsilon);
+        if(blockIdx.x==0U)inverse_out[static_cast<std::uint64_t>(blockIdx.y)*4U+threadIdx.x]=inverse[threadIdx.x];
+        if(inverse_audit)inverse_audit[static_cast<std::uint64_t>(blockIdx.x)*4U+threadIdx.x]=inverse[threadIdx.x];
+    }
+    __syncthreads();
+    const bool is_inject=blockIdx.x>=low_blocks;
+    const unsigned first=(is_inject?blockIdx.x-low_blocks:blockIdx.x)*R;
+    const unsigned remaining=(is_inject?4U:rank)-first;
+    const unsigned valid=remaining<R?remaining:R;
+    float sums[R];
+    if(is_inject)deferred_hyper_lane_dots<R,float,true>(input,norm,inject,first,valid,tile,lane,sums);
+    else deferred_hyper_lane_dots<R,float,false>(input,norm,down,first,valid,tile,lane,sums);
+    if(lane==0U) {
+#pragma unroll
+        for(unsigned r=0;r<R;++r)if(r<valid)red[tile][r]=sums[r];
+    }
+    __syncthreads();
+    if(threadIdx.x<valid) {
+        float total=0.0F;
+#pragma unroll
+        for(unsigned k=0;k<16U;++k)total=fmaf(red[k][threadIdx.x],inverse[k/4U],total);
+        const float scaled=total/4.0F;
+        if(scaled_audit)scaled_audit[(is_inject?rank:0U)+first+threadIdx.x]=scaled;
+        if(is_inject)injection[static_cast<std::uint64_t>(blockIdx.y)*4U+first+threadIdx.x]=2.0F*sigmoid(scaled);
+        else low[static_cast<std::uint64_t>(blockIdx.y)*rank+first+threadIdx.x]=scaled*sigmoid(scaled);
+    }
+}
+
 template <unsigned R, typename Acc>
 __global__ __launch_bounds__(512) void splitk_hyper_projection_kernel(
     const float* __restrict__ normalized,const void* __restrict__ down,unsigned width,unsigned streams,
@@ -1442,6 +1598,42 @@ __global__ void lane_chain_hyper_output_kernel(const float* normalized,const flo
     }
 }
 
+template <typename Storage>
+__global__ void deferred_lane_chain_hyper_output_kernel(const Storage* raw,const float* inverse,const float* norm,const float* low,const void* up,
+    std::uint32_t hidden,std::uint32_t streams,std::uint32_t rank,Storage* output){
+    extern __shared__ __align__(16) unsigned char staging[];
+    const auto lane=threadIdx.x&31U,stream=threadIdx.x/32U;
+    const std::uint64_t row=blockIdx.y,first=static_cast<std::uint64_t>(blockIdx.x)*32U;
+    const std::uint64_t tile_bytes=34ULL*rank,row_bytes=static_cast<std::uint64_t>(rank/32U)*34U;
+    auto* stage=staging+stream*tile_bytes;
+    const auto* source=static_cast<const unsigned char*>(up)+(static_cast<std::uint64_t>(stream)*hidden+first)*row_bytes;
+    for(std::uint64_t offset=static_cast<std::uint64_t>(lane)*16U;offset<tile_bytes;offset+=512U)
+        *reinterpret_cast<uint4*>(stage+offset)=*reinterpret_cast<const uint4*>(source+offset);
+    __syncthreads();
+    float gate=0.0F;
+    for(std::uint32_t block=0;block<rank/32U;++block){
+        const auto* weight=stage+static_cast<std::uint64_t>(lane)*row_bytes+static_cast<std::uint64_t>(block)*34U;
+        const auto scale_bits=static_cast<unsigned short>(static_cast<unsigned>(weight[0])|(static_cast<unsigned>(weight[1])<<8U));
+        const float scale=__half2float(__ushort_as_half(scale_bits));
+        for(std::uint32_t k=0;k<32U;++k){
+            const float coefficient=scale*static_cast<float>(static_cast<signed char>(weight[2U+k]));
+            gate+=low[row*rank+static_cast<std::uint64_t>(block)*32U+k]*coefficient;
+        }
+    }
+    auto* sig=reinterpret_cast<float*>(staging+static_cast<std::uint64_t>(streams)*tile_bytes);
+    sig[stream*32U+lane]=sigmoid(gate);
+    __syncthreads();
+    if(stream==0U){
+        float mixed=0.0F;const auto feature=first+lane;
+        for(std::uint32_t t=0;t<streams;++t) {
+            const auto index=static_cast<std::uint64_t>(t)*hidden+feature;
+            const float n=__fmul_rn(__fmul_rn(load_activation(raw,row*static_cast<std::uint64_t>(hidden)*streams+index),inverse[row*streams+t]),norm[index]);
+            mixed+=n*sig[t*32U+lane];
+        }
+        store_activation(&output[row*hidden+feature],mixed/static_cast<float>(streams));
+    }
+}
+
 bool supported_norm_type(
     std::uint32_t ggml_type) noexcept {
     return ggml_type == 0 ||
@@ -1601,11 +1793,15 @@ void launch_typed(
         auto* normalized = reinterpret_cast<float*>(temporary.address);
         auto* low = normalized + static_cast<std::uint64_t>(context.logical_rows) * width;
         constexpr std::uint32_t projection_threads = 32;
+        if (!config.splitk_deferred_norm) {
         hipLaunchKernelGGL(HIP_KERNEL_NAME(prepare_hyper_norm_kernel<Storage>),
             dim3(config.hc_count, context.logical_rows), dim3(kThreads), 0, hip_execution_stream(),
             reinterpret_cast<const Storage*>(input.address), reinterpret_cast<const void*>(norm_runtime.address),
             norm_manifest.ggml_type, config.hidden_size, config.hc_count, config.rms_epsilon, normalized);
         check_hip(hipGetLastError(), "parallel hyper-mix normalization launch");
+        if(config.arithmetic_stats)
+            config.arithmetic_stats->materialized_norm_submissions.fetch_add(1,std::memory_order_relaxed);
+        }
         if (config.staged_projections) {
             if (config.fused_injection) {
                 const auto lowrank_blocks = (config.lowrank + kStagedOutputs - 1U) / kStagedOutputs;
@@ -1623,7 +1819,21 @@ void launch_typed(
                                 inject_runtime ? reinterpret_cast<const void*>(inject_runtime->address) : nullptr,
                                 injection_output ? reinterpret_cast<float*>(injection_output->address) : nullptr, blocks);
                         };
-                        if (config.splitk_projection_fp64) launch.template operator()<double>();
+                        if (config.splitk_deferred_norm) {
+                            hipLaunchKernelGGL(HIP_KERNEL_NAME(deferred_hyper_projection_kernel<outputs>),
+                                grid,dim3(512U),0,hip_execution_stream(),
+                                reinterpret_cast<const std::uint16_t*>(input.address),
+                                reinterpret_cast<const float*>(norm_runtime.address),
+                                reinterpret_cast<const void*>(down_runtime.address),config.lowrank,
+                                config.rms_epsilon,normalized,low,
+                                inject_runtime ? reinterpret_cast<const void*>(inject_runtime->address) : nullptr,
+                                injection_output ? reinterpret_cast<float*>(injection_output->address) : nullptr,blocks,nullptr,nullptr);
+                            check_hip(hipGetLastError(), "deferred RMS hyper projection enqueue");
+                            if(config.arithmetic_stats) {
+                                config.arithmetic_stats->splitk_f32_submissions.fetch_add(1,std::memory_order_relaxed);
+                                config.arithmetic_stats->deferred_norm_submissions.fetch_add(1,std::memory_order_relaxed);
+                            }
+                        } else if (config.splitk_projection_fp64) launch.template operator()<double>();
                         else {
                             launch.template operator()<float>();
                             check_hip(hipGetLastError(), "FP32 split-K hyper projection enqueue");
@@ -1663,7 +1873,15 @@ void launch_typed(
                     injection_output ? reinterpret_cast<float*>(injection_output->address) : nullptr, lowrank_blocks);
                 }
                 check_hip(hipGetLastError(), "fused staged hyper-mix projection launch");
-                if(config.lane_chain_output){
+                if(config.splitk_deferred_norm){
+                    hipLaunchKernelGGL(HIP_KERNEL_NAME(deferred_lane_chain_hyper_output_kernel<Storage>),
+                        dim3(config.hidden_size/32U,context.logical_rows),dim3(32U*config.hc_count),
+                        static_cast<std::size_t>(lane_chain_hyper_output_lds(config.hc_count,config.lowrank)),hip_execution_stream(),
+                        reinterpret_cast<const Storage*>(input.address),normalized,
+                        reinterpret_cast<const float*>(norm_runtime.address),low,
+                        reinterpret_cast<const void*>(up_runtime.address),config.hidden_size,config.hc_count,config.lowrank,
+                        reinterpret_cast<Storage*>(output.address));
+                }else if(config.lane_chain_output){
                     hipLaunchKernelGGL(HIP_KERNEL_NAME(lane_chain_hyper_output_kernel<Storage>),
                         dim3(config.hidden_size/32U,context.logical_rows),dim3(32U*config.hc_count),
                         static_cast<std::size_t>(lane_chain_hyper_output_lds(config.hc_count,config.lowrank)),hip_execution_stream(),
@@ -1810,6 +2028,15 @@ PreparedHyperMix prepare_hyper_mix(
                 user_data);
     validate_config(config);
 
+    if(config.splitk_deferred_norm) {
+        if(context.logical_rows!=1U || context.request_concurrency!=1U || hip_graph_status() ||
+            (current_hip_launch_context() && current_hip_launch_context()->graph_capture))
+            throw std::invalid_argument("deferred HC RMS supports eager R1 C1 only");
+        hipStreamCaptureStatus capture=hipStreamCaptureStatusNone;
+        check_hip(hipStreamIsCapturing(hip_execution_stream(),&capture),"query deferred HC RMS capture");
+        if(capture!=hipStreamCaptureStatusNone)
+            throw std::invalid_argument("deferred HC RMS cannot be captured");
+    }
     if(config.prefetch_hc_projection_next_tile) {
         if(context.logical_rows!=1U || context.request_concurrency!=1U ||
            (current_hip_launch_context() && current_hip_launch_context()->graph_capture))
@@ -2009,6 +2236,9 @@ PreparedHyperMix prepare_hyper_mix(
         }
     }
 
+    if(config.splitk_deferred_norm && (norm_manifest.ggml_type!=0U ||
+        norm_manifest.dimensions!=std::vector<std::uint64_t>{10240U} || norm_manifest.byte_size!=40960U))
+        throw std::invalid_argument("deferred HC RMS requires its canonical F32 norm owner");
     if(config.lane_chain_output){
         if(!lane_chain_hyper_output_eligible(up_manifest,config.hidden_size,config.hc_count,config.lowrank,up_runtime.address%16U) || up_runtime.bytes<up_manifest.byte_size ||
            up_manifest.byte_size>std::numeric_limits<std::uintptr_t>::max()-up_runtime.address)
@@ -2119,6 +2349,7 @@ std::string kernel_id(
             request.request_concurrency) + (config.parallel ? ".parallel" : "") +
         (config.staged_projections ? ".staged" : "") + (config.fused_injection ? ".fused-injection-v5" : "") + (config.typed_projection ? ".typed-q8-f32-v1" : "") + (config.prefetch_rows ? ".prefetch-rows8-v2" : "") + (config.prefetch_q8_output ? ".prefetch-q8-output-v1" : "") +
         (config.splitk_projection ? (config.splitk_projection_fp64 ? ".splitk-hc-proj-fp64-oracle-v1" : ".splitk-hc-proj-fp32-v1") : "") +
+        (config.splitk_deferred_norm ? ".hc-deferred-norm-v1" : "") +
         (config.prefetch_hc_projection_next_tile ? std::string(hc_projection_next_tile_suffix) : "") +
         (config.lane_chain_output ? lane_chain_hyper_output_suffix : "");
 }
@@ -2150,6 +2381,7 @@ std::uint64_t implementation_identity(
     if (config.prefetch_rows) hash_u64(hash, 0x5052464852430802ULL);
     if (config.prefetch_q8_output) hash_u64(hash, 0x5052464855500801ULL);
     if (config.splitk_projection) hash_u64(hash, config.splitk_projection_fp64 ? 0x534b484346363401ULL : 0x534b484346333201ULL);
+    if (config.splitk_deferred_norm) hash_u64(hash, 0x48434446524d5301ULL);
     if(config.lane_chain_output)hash_u64(hash,0x4c414e4548430001ULL);
     if(config.prefetch_hc_projection_next_tile)hash_u64(hash,0x48434e4558540001ULL);
     return hash;
@@ -2273,6 +2505,62 @@ void hc_projection_diagnostic::enqueue_splitk(
     check_hip(hipGetLastError(),"HC split-K projection final enqueue");
 }
 
+void hc_deferred_norm_diagnostic::enqueue(Span raw,Span norm,Span down,Span inject,Span up,
+    Span inverse,Span low,Span injection,Span output,Span inverse_audit,Span scaled_audit,float epsilon,hipStream_t stream) {
+    const bool with_inject=inject.address!=0U;
+    if(!std::isfinite(epsilon) || epsilon<=0.0F || with_inject!=(injection.address!=0U) ||
+        (!with_inject && (inject.bytes || injection.bytes)))
+        throw std::invalid_argument("deferred HC diagnostic epsilon/injection differs");
+    const auto check=[](Span span,std::uint64_t required,std::uint64_t alignment) {
+        if(!span.address || span.address%alignment || span.bytes<required ||
+            span.bytes>std::numeric_limits<std::uintptr_t>::max()-span.address)
+            throw std::invalid_argument("deferred HC diagnostic owner extent/alignment differs");
+    };
+    check(raw,20480U,2U);check(norm,40960U,4U);check(down,3481600U,16U);
+    check(up,3481600U,16U);check(inverse,16U,4U);check(low,1280U,4U);check(output,5120U,2U);
+    if(with_inject){check(inject,163840U,16U);check(injection,16U,4U);}
+    if(inverse_audit.address)check(inverse_audit,(80U+(with_inject?1U:0U))*16U,4U);
+    else if(inverse_audit.bytes)throw std::invalid_argument("deferred HC diagnostic empty audit extent differs");
+    if(scaled_audit.address)check(scaled_audit,(320U+(with_inject?4U:0U))*4U,4U);
+    else if(scaled_audit.bytes)throw std::invalid_argument("deferred HC diagnostic empty scaled audit extent differs");
+    const auto overlaps=[](Span a,Span b) {
+        return a.address && b.address && a.address<b.address+b.bytes && b.address<a.address+a.bytes;
+    };
+    const std::array<Span,5> reads{raw,norm,down,inject,up};
+    const std::array<Span,6> writes{inverse,low,injection,output,inverse_audit,scaled_audit};
+    for(std::size_t i=0;i<writes.size();++i) {
+        for(const auto read:reads)if(overlaps(writes[i],read))
+            throw std::invalid_argument("deferred HC diagnostic read/write alias");
+        for(std::size_t j=i+1;j<writes.size();++j)if(overlaps(writes[i],writes[j]))
+            throw std::invalid_argument("deferred HC diagnostic mutable alias");
+    }
+    hipStreamCaptureStatus capture=hipStreamCaptureStatusNone;
+    check_hip(hipStreamIsCapturing(stream,&capture),"deferred HC diagnostic capture query");
+    if(capture!=hipStreamCaptureStatusNone || hip_graph_status() ||
+        (current_hip_launch_context() && current_hip_launch_context()->graph_capture))
+        throw std::invalid_argument("deferred HC diagnostic rejects capture");
+    int device=0;hipDeviceProp_t properties{};
+    check_hip(hipGetDevice(&device),"deferred HC diagnostic device");
+    check_hip(hipGetDeviceProperties(&properties,device),"deferred HC diagnostic device properties");
+    if(properties.warpSize!=32 || std::string_view(properties.gcnArchName,7U)!="gfx1151")
+        throw std::invalid_argument("deferred HC diagnostic requires gfx1151 wave32");
+    check_hip(hipPeekAtLastError(),"deferred HC diagnostic stale error");
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(deferred_hyper_projection_kernel<4U>),
+        dim3(80U+(with_inject?1U:0U)),dim3(512U),0,stream,
+        reinterpret_cast<const std::uint16_t*>(raw.address),reinterpret_cast<const float*>(norm.address),
+        reinterpret_cast<const void*>(down.address),320U,epsilon,reinterpret_cast<float*>(inverse.address),
+        reinterpret_cast<float*>(low.address),reinterpret_cast<const void*>(inject.address),
+        reinterpret_cast<float*>(injection.address),80U,reinterpret_cast<float*>(inverse_audit.address),
+        reinterpret_cast<float*>(scaled_audit.address));
+    check_hip(hipGetLastError(),"deferred HC diagnostic projection enqueue");
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(deferred_lane_chain_hyper_output_kernel<std::uint16_t>),
+        dim3(80U),dim3(128U),static_cast<std::size_t>(lane_chain_hyper_output_lds(4U,320U)),stream,
+        reinterpret_cast<const std::uint16_t*>(raw.address),reinterpret_cast<const float*>(inverse.address),
+        reinterpret_cast<const float*>(norm.address),reinterpret_cast<const float*>(low.address),
+        reinterpret_cast<const void*>(up.address),2560U,4U,320U,reinterpret_cast<std::uint16_t*>(output.address));
+    check_hip(hipGetLastError(),"deferred HC diagnostic lane-chain enqueue");
+}
+
 void register_hip_hyper_mix_kernel_variant(
     const ModelContract& model,
     const ExecutionBindingRequest& request,
@@ -2359,6 +2647,7 @@ void register_hip_hyper_mix_kernel_variant(
         storage_name(
             config.activation);
     variant.numerics.accumulator_precision =
+        config.splitk_deferred_norm ? std::string(deferred_hc_numerical_identity) :
         config.splitk_projection_fp64 ? "fp64-projection/fp32-epilogue" : "fp32";
     variant.numerics.output_precision =
         storage_name(
@@ -2373,6 +2662,7 @@ void register_hip_hyper_mix_kernel_variant(
     variant.output_layout =
         "row-major+fp32-injection";
     variant.compiler_identity =
+        config.splitk_deferred_norm ? "hip-gfx1151-hyper-mix-splitk-fp32-deferred-rms-v1" :
         config.splitk_projection ? (config.splitk_projection_fp64 ? "hip-gfx1151-hyper-mix-splitk-fp64-oracle-v1" : "hip-gfx1151-hyper-mix-splitk-fp32-v1") :
         config.lane_chain_output ? "hip-gfx1151-hyper-mix-v10-lane-chain-output" :
         config.prefetch_q8_output && config.prefetch_rows ? "hip-gfx1151-hyper-mix-v9-q8-output-prefetch8-with-projection-prefetch" :
@@ -2399,10 +2689,16 @@ make_hip_hyper_mix_launcher(
             "HIP hyper-mix launcher requires id and config");
     }
     validate_config(*config);
-    if(config->prefetch_hc_projection_next_tile || kernel_id_value.find(hc_projection_next_tile_suffix)!=std::string::npos) {
+    constexpr std::string_view deferred_marker=".hc-deferred-norm-v1";
+    const auto deferred_position=kernel_id_value.find(deferred_marker);
+    if((deferred_position!=std::string::npos)!=config->splitk_deferred_norm ||
+        (deferred_position!=std::string::npos &&
+         kernel_id_value.find(deferred_marker,deferred_position+deferred_marker.size())!=std::string::npos))
+        throw std::invalid_argument("deferred HC RMS launcher identity differs");
+    if(config->splitk_deferred_norm || config->prefetch_hc_projection_next_tile || kernel_id_value.find(hc_projection_next_tile_suffix)!=std::string::npos) {
         ExecutionBindingRequest expected;
         if(kernel_id_value!=kernel_id(expected,*config))
-            throw std::invalid_argument("next-tile HC launcher requires exact eager identity");
+            throw std::invalid_argument("HC launcher requires exact eager identity");
     }
     if(kernel_id_value.ends_with(lane_chain_hyper_output_suffix)!=config->lane_chain_output)
         throw std::invalid_argument("lane-chain HC output launcher identity differs");
@@ -2524,9 +2820,45 @@ void preflight_splitk_hyper_projection_model(const CompiledSerialExecution& comp
                 throw std::invalid_argument("split-K HC projection output aliases input");
         }
         if (overlaps(low,injection)) throw std::invalid_argument("split-K HC projection outputs overlap");
+        if (config.splitk_deferred_norm) {
+            const auto& norm_access=resolve_dispatch_tensor_access(context,0);
+            const auto& norm_manifest=manifest_tensor(context,norm_access);
+            const auto& norm_owner=runtime_tensor(context,norm_access);
+            const auto& up_access=resolve_dispatch_tensor_access(context,2);
+            const auto& up_manifest=manifest_tensor(context,up_access);
+            const auto& up_owner=runtime_tensor(context,up_access);
+            if(norm_manifest.ggml_type!=0U || norm_manifest.dimensions!=std::vector<std::uint64_t>{10240U} ||
+                norm_manifest.byte_size!=40960U || !lane_chain_hyper_output_eligible(up_manifest,
+                config.hidden_size,config.hc_count,config.lowrank,up_owner.address%16U))
+                throw std::invalid_argument("deferred HC RMS whole-model norm/up contract differs");
+            checked({norm_owner.address,norm_owner.bytes},40960U,4U);
+            checked({up_owner.address,up_owner.bytes},up_manifest.byte_size,16U);
+            const auto raw=resolve_dispatch_read(context,0);
+            const auto result=resolve_dispatch_write(context,0);
+            checked({raw.address,raw.bytes},20480U,2U);
+            checked({result.address,result.bytes},5120U,2U);
+            const std::array<Span,5> reads{{{raw.address,raw.bytes},{norm_owner.address,norm_owner.bytes},
+                down,{up_owner.address,up_owner.bytes},inject}};
+            const std::array<Span,3> writes{{{temporary.address,temporary.bytes},
+                {result.address,result.bytes},injection}};
+            for(std::size_t i=0;i<writes.size();++i) {
+                for(const auto read:reads)if(overlaps(writes[i],read))
+                    throw std::invalid_argument("deferred HC RMS whole-model read/write alias");
+                for(std::size_t j=i+1;j<writes.size();++j)if(overlaps(writes[i],writes[j]))
+                    throw std::invalid_argument("deferred HC RMS whole-model mutable alias");
+            }
+            if(step.id>=compiled.bindings.bindings.size())
+                throw std::invalid_argument("deferred HC RMS missing whole-model binding");
+            const auto& binding=compiled.bindings.bindings[step.id];
+            if(!binding.kernel_id || binding.kernel_id->find(".hc-deferred-norm-v1")==std::string::npos ||
+                !binding.kernel_id->ends_with(lane_chain_hyper_output_suffix))
+                throw std::invalid_argument("deferred HC RMS whole-model identity cannot fall back");
+        }
         ++count;
     }
     if (!count) throw std::invalid_argument("split-K HC preflight found no mixer bindings");
+    if(config.splitk_deferred_norm && (count!=97U || compiled.logical_rows!=1U))
+        throw std::invalid_argument("deferred HC RMS requires all 97 canonical mixers");
     // Device queries happen once, after every host owner has been admitted, and
     // before the bundle registers its first launcher or captures any graph.
     int device = 0;hipDeviceProp_t properties{};
@@ -2581,6 +2913,8 @@ register_for_compiled_execution(
                 if(owner.bytes<up.byte_size || up.byte_size>std::numeric_limits<std::uintptr_t>::max()-owner.address)throw std::invalid_argument("lane-chain HC output up owner extent differs");
                 if(eligible && (owner.address%16U || owner.bytes<up.byte_size || up.byte_size>std::numeric_limits<std::uintptr_t>::max()-owner.address))throw std::invalid_argument("lane-chain HC output up owner admission differs");
             }
+            if(config_.splitk_deferred_norm && !eligible)
+                throw std::invalid_argument("deferred HC RMS forbids lane-chain fallback");
             const auto& id=!eligible?base_id:candidate_id;
             if(*binding.kernel_id!=id)throw std::invalid_argument("typed hyper bundle differs from selected kernel identity");
             selected_ids.insert(id);

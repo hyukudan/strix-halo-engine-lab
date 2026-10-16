@@ -112,6 +112,7 @@ int main() {
     expect(quantized_down_buffers.mlp_intermediate_bytes > exact_down_buffers.mlp_intermediate_bytes,
            "down quantization reserves distinct codes scales and sums beyond exact raw dots");
     a8_down.a8_down_q80 = true;
+    a8_down.q5k_a8g32_gate_up = true;
     expect(strix::build_serial_execution_buffer_plan(model, a8_down).mlp_intermediate_bytes ==
                quantized_down_buffers.mlp_intermediate_bytes,
            "Q8 extension reuses the same exclusive down workspace");

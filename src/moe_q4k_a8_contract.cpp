@@ -134,17 +134,83 @@ float evaluate_row(std::span<const std::byte> weights, const QuantizedRow& row) 
     const float left = accum[0]+accum[1], right = accum[2]+accum[3]; const float value = left+right;
     check(std::isfinite(left) && std::isfinite(right) && std::isfinite(value), "Q4K A8 combine overflow/nonfinite"); return value;
 }
+std::string_view numerical_identity_for_gate_type(std::uint32_t gate_type) {
+    if (gate_type == 12) return numerical_identity;
+    if (gate_type == 13) return q5k_numerical_identity;
+    throw std::invalid_argument("A8 gate/up requires type12 or type13");
+}
+std::array<std::uint8_t,32> decode_q5k_codes(std::span<const std::byte> block, std::uint32_t group) {
+    check(block.size() == 176 && group < 8, "Q5K block/group invalid");
+    std::array<std::uint8_t,32> result{};
+    for (unsigned lane = 0; lane < 32; ++lane) {
+        const auto packed = byte(block[48U+(group/2U)*32U+lane]);
+        const auto low = group%2U == 0 ? packed&15U : packed>>4U;
+        const auto high = (byte(block[16U+lane])>>group)&1U;
+        result[lane] = static_cast<std::uint8_t>(low|(high<<4U));
+    }
+    return result;
+}
+IntegerGroup integer_group_q5k(std::span<const std::uint8_t> q,
+    std::span<const std::int8_t> a, Factors factors) {
+    check(q.size() == 32 && a.size() == 32 && factors.scale <= 63 && factors.minimum <= 63,
+        "Q5K integer group shape/factors invalid");
+    std::int64_t raw = 0, sum = 0;
+    for (unsigned lane = 0; lane < 32; ++lane) {
+        check(q[lane] <= 31 && a[lane] != -128, "Q5K/A8 code out of contract");
+        raw += static_cast<std::int64_t>(q[lane])*a[lane]; sum += a[lane];
+    }
+    const auto scaled = raw*factors.scale, minimum = sum*factors.minimum;
+    check(std::abs(raw) <= 125984 && std::abs(sum) <= 4064 && std::abs(scaled) <= 7936992 &&
+        std::abs(minimum) <= 256032, "Q5K integer bound violated");
+    return {static_cast<std::int32_t>(raw),static_cast<std::int32_t>(sum),
+        static_cast<std::int32_t>(scaled),static_cast<std::int32_t>(minimum)};
+}
+float evaluate_q5k_row(std::span<const std::byte> weights, const QuantizedRow& row) {
+    require_f32_environment(); check_row(row);
+    check(weights.size() == row.codes.size()/256U*176U, "Q5K packed row size mismatch");
+    std::array<float,4> accum{};
+    for (std::size_t block = 0; block < row.codes.size()/256U; ++block)
+        for (unsigned pair = 0; pair < 4; ++pair) {
+            const auto packed = weights.subspan(block*176U,176U);
+            std::array<float,2> contributions{};
+            for (unsigned half = 0; half < 2; ++half) {
+                const auto local_group = pair*2U+half;
+                const auto group = block*8U+local_group;
+                const auto codes = decode_q5k_codes(packed,local_group);
+                const auto ints = integer_group_q5k(codes,
+                    std::span<const std::int8_t>(row.codes.data()+group*32U,32),
+                    decode_factors(packed.subspan(4,12),local_group));
+                const float d = half_bits_to_float(le16(packed.data())),
+                    dm = half_bits_to_float(le16(packed.data()+2));
+                check(std::isfinite(d) && std::isfinite(dm), "Q5K A8 header must be finite");
+                const float u = d*static_cast<float>(ints.scaled);
+                const float v = dm*static_cast<float>(ints.minimum);
+                const float t = u-v;
+                contributions[half] = row.deltas[group]*t;
+                check(std::isfinite(u) && std::isfinite(v) && std::isfinite(t) &&
+                    std::isfinite(contributions[half]), "Q5K A8 combine outside qualified finite scope");
+            }
+            const float paired = contributions[0]+contributions[1];
+            accum[pair] = accum[pair]+paired;
+            check(std::isfinite(paired) && std::isfinite(accum[pair]), "Q5K A8 accumulation outside qualified scope");
+        }
+    const float left = accum[0]+accum[1], right = accum[2]+accum[3];
+    const float result = left+right;
+    check(std::isfinite(left) && std::isfinite(right) && std::isfinite(result), "Q5K A8 combine overflow/nonfinite");
+    return result;
+}
 void validate(const Request& request, const Bindings& b) {
-    check(request.enabled && request.approved_numerical_identity == numerical_identity,
+    check(request.enabled && request.approved_numerical_identity == numerical_identity_for_gate_type(request.gate_type),
         "Q4K A8 probe requires explicit matching numerical identity approval");
     const auto s = request.shape;
     check(s.hidden >= 256 && s.hidden <= max_hidden && s.hidden%256U == 0 && s.rows > 0 &&
         s.rows <= max_rows && s.rows%32U == 0 && s.experts > 0 && s.experts <= max_experts &&
         s.top_k > 0 && s.top_k <= max_top_k && s.logical_rows == 1, "Q4K A8 probe admits bounded C1 dimensions only");
     check(request.input == InputKind::bf16 || request.input == InputKind::fp32, "Q4K A8 input storage unsupported");
-    check(request.gate_type == 12 && request.up_type == 12 && !request.fused_gate_up,
-        "Q4K A8 prototype requires separate type12 gate/up tensors");
-    const std::uint64_t weight_bytes = static_cast<std::uint64_t>(s.experts)*s.rows*(s.hidden/256U)*144U;
+    check(request.gate_type == request.up_type && !request.fused_gate_up,
+        "A8 prototype requires separate matching type12 or type13 gate/up tensors");
+    const std::uint64_t block_bytes = request.gate_type == 13 ? 176U : 144U;
+    const std::uint64_t weight_bytes = static_cast<std::uint64_t>(s.experts)*s.rows*(s.hidden/256U)*block_bytes;
     const std::uint64_t output_bytes = static_cast<std::uint64_t>(s.top_k)*2U*s.rows*4U;
     const std::array<DeviceBytes,9> views{b.input,b.gate,b.up,b.routes,b.codes,b.deltas,b.sums,b.status,b.output};
     const std::array<std::uint64_t,9> required{static_cast<std::uint64_t>(s.hidden)*(request.input==InputKind::bf16?2U:4U),

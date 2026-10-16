@@ -215,6 +215,7 @@ struct Options {
     bool ple_cpu_helper_threads_explicit = false;
     std::vector<std::uint32_t> logprob_token_ids;
     bool teacher_forced_score = false;
+    std::string teacher_logits_path;
     bool known_prefix_expert_union = false;
     std::string offline_tuning_cache_path;
     std::string offline_compile_provenance_path;
@@ -382,6 +383,8 @@ inline void validate_resolved_requested_logprobs(const Options& options, std::ui
 }
 
 inline void validate_teacher_forced_score(const Options& options) {
+    if (!options.teacher_logits_path.empty() && !options.teacher_forced_score)
+        throw std::invalid_argument("teacher logits file requires teacher-forced score");
     if (!options.teacher_forced_score) return;
     if (options.generate_tokens != 1 || options.tokens.size() < 2 || options.tokens.size() > 262144U ||
         options.execution.mode != DecodeExecutionMode::eager || options.execution.integer_head != DecodeIntegerHead::none ||
@@ -648,8 +651,8 @@ inline Options parse_options(
             "usage: strix-hip-decode-token MODEL.gguf [TOKEN_ID ...] "
             "[--mtp --mtp-sidecar FILE --mtp-sidecar-sha256 HEX --mtp-golden FILE --mtp-golden-sha256 HEX [--mtp-window-expert-union --mtp-window-expert-union-bytes N] (explicit source/conversion/cast/budget options required)] "
             "[--optimization-profile auto|manual] [--execution-inventory] [--host-dispatch-telemetry] [--execution-telemetry-trace] [--device-queue-trace] "
-            "[--numerical-profile exact-v5|hc-splitk-f32-v1|q51-a8-down-v1|hc-splitk-f32+q51-a8-down-v1|q51-q80-a8-down-v1|hc-splitk-f32+q51-q80-a8-down-v1] "
-            "[--teacher-forced-score --generate 1] "
+            "[--numerical-profile exact-v5|hc-splitk-f32-v1|q51-a8-down-v1|hc-splitk-f32+q51-a8-down-v1|q51-q80-a8-down-v1|hc-splitk-f32+q51-q80-a8-down-v1|hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup-v1|hc-deferred-norm-f32+q51-q80-a8-down-v1|hc-deferred-norm-f32+q51-q80-a8-down+q5k-a8-gateup-v1] "
+            "[--teacher-forced-score --generate 1 [--teacher-logits-file PATH]] "
             "[--gpu-greedy-token] [--logprob-token ID ...] [--offline-tuning-cache FILE [--offline-compile-provenance FILE]] [--gdn-recurrent-layout baseline|stride32|stride33|transposed] [--gdn-recurrent-storage key-value|value-key] [--known-prefix-window --known-prefix-rows 2|4|8 --known-prefix-expert-union] [--known-prefix-prefill-rows 16..2048 --known-prefix-workspace-budget-bytes N --known-prefix-host-metadata-budget-bytes N --known-prefix-uma-budget-bytes N --known-prefix-host-headroom-bytes N] [--prompt-lookup [--prompt-lookup-depth 0|1|2 | --prompt-lookup-adaptive] [--prompt-lookup-snapshot occupied-kv-v1 --prompt-lookup-snapshot-bytes N]] [--serve-prefix-u32le FILE ... --serve-concurrency 1|2|4 [--serve-tensor-cohort-rows 2|4 | --serve-prefill-rows 2|4|8|16..2048 --serve-prefill-workspace-budget-bytes N --serve-prefill-host-metadata-budget-bytes N] --serve-memory-budget-bytes N --serve-request-budget-bytes N --serve-headroom-bytes N] [--gdn-islands] [--qsa-hierarchical-selection] [--qsa-gqa-heads-per-block 1|2|4] [--prepared-eager] [--moe-shared-overlap [--moe-token-cost-policy]] [--moe-overlap-arena-budget-bytes N] [--batched-moe-activation] [--validation-final-state DIR] [--validation-final-state-max-bytes N] [--reference FILE] [--max-logit-error X] "
             "[--context N] [--residency register|copy] [--coalesce-gap BYTES] "
             "[--planned-ple-io] [--ple-cpu-helper-threads 1..8] [--ple-cache-rows N --ple-cache-budget-bytes N] [--ple-max-rows-per-io N] [--ple-max-inflight-ios N] "
@@ -672,6 +675,17 @@ inline Options parse_options(
             argv[index];
         options.any_low_level_flag = options.any_low_level_flag ||
             is_low_level_optimization_option(argument);
+        if (argument == "--teacher-logits-file" || argument.starts_with("--teacher-logits-file=")) {
+            if (!options.teacher_logits_path.empty())
+                throw std::invalid_argument("duplicate teacher logits file option");
+            const auto value = argument == "--teacher-logits-file" ?
+                (index + 1 < argc ? std::string_view(argv[++index]) : std::string_view{}) :
+                argument.substr(std::string_view("--teacher-logits-file=").size());
+            if (value.empty() || value.starts_with("--"))
+                throw std::invalid_argument("teacher logits file requires a nonempty path");
+            options.teacher_logits_path = value;
+            continue;
+        }
         if (argument == "--teacher-forced-score") {
             if (options.teacher_forced_score)
                 throw std::invalid_argument("duplicate teacher-forced score option");

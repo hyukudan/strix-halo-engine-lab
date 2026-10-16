@@ -68,6 +68,8 @@ struct HipLauncherCatalogConfig {
     bool a8_down_q51 = false;
     bool a8_down_q80 = false;
     std::shared_ptr<HipHyperMixArithmeticStats> arithmetic_stats;
+    bool q5k_a8g32_gate_up = false;
+    bool splitk_deferred_norm = false;
 };
 
 void register_complete_hip_kernel_catalog(
@@ -114,6 +116,7 @@ public:
 private:
     bool device_graph_inputs_ = false;
     bool deferred_moe_status_ = false;
+    bool splitk_deferred_norm_ = false;
     std::shared_ptr<integer_projection::HipIntegerProjectionRuntimeBundle> alternate_lm_head_;
     HipElementwiseLauncherBundle elementwise_;
     HipPleLauncherBundle ple_;

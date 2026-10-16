@@ -56,6 +56,8 @@ ExecutionBufferPlan build_serial_execution_buffer_plan(
         throw std::invalid_argument("grouped exact Q5_1 down requires Q4K A8 slot workspace");
     if (request.q51_slot_parallel_down && !request.grouped_exact_q51_down)
         throw std::invalid_argument("Q5_1 slot-parallel down requires grouped Q5_1 workspace");
+    if (request.q5k_a8g32_gate_up && (!request.a8_down_q51 || !request.a8_down_q80))
+        throw std::invalid_argument("Q5K A8 gate/up requires both A8 down formats");
     if ((request.a8_down_q51 || request.a8_down_q80) &&
         (!request.a8_down_q51 || !request.q4k_a8g32_gate_up || !request.q51_slot_parallel_down ||
          request.logical_rows != 1 || request.activation_element_bytes != 2 ||

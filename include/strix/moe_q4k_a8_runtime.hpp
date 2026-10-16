@@ -20,6 +20,8 @@ inline constexpr std::string_view runtime_numerical_identity =
     "separate-f32-pair4-c0:legacy-silu-down-slot-order:finite-pipeline-failclosed";
 inline constexpr std::string_view q51_a8_down_kernel_marker = ".q51-a8g32-down-v1";
 inline constexpr std::string_view q80_a8_down_kernel_marker = ".q80-a8g32-down-v1";
+inline constexpr std::string_view q5k_gate_up_kernel_marker = ".q5k-a8g32-gateup-v1";
+inline constexpr std::string_view q5k_gate_up_raw_identity = "q5ka8v1:g32s127:u5qh:pair4c0";
 inline constexpr std::string_view a8_down_kernel_ending =
     ".mixed-a8-down-v1.q4k-a8g32-gateup-v2";
 // Compact RAW tags identify the new arithmetic without exceeding the RAW ABI.
@@ -66,6 +68,7 @@ struct RuntimeDispatchStats {
     std::atomic<std::uint64_t> a8_down_q51_submissions{0};
     std::atomic<std::uint64_t> a8_down_q80_submissions{0};
     std::atomic<std::uint64_t> a8_down_q80_legacy_submissions{0};
+    std::atomic<std::uint64_t> q5k_a8_gate_up_submissions{0};
 };
 struct RuntimeLayerClassification {
     std::vector<std::uint32_t> quantized_layers;
@@ -88,4 +91,7 @@ void validate_slot_parallel_manifest(
 void validate_a8_down_manifest(const ModelContract&, const RuntimeLayerClassification&,
     bool a8_down_q51, bool a8_down_q80);
 void validate_a8_down_content(const ModelContentIdentity&);
+// The explicit Q5_K candidate promotes only canonical layer 2. Classification
+// remains by stored weight type; it does not relabel Q5_K as Q4_K.
+void validate_q5k_a8_manifest(const ModelContract&, const RuntimeLayerClassification&);
 }  // namespace strix::moe_q4k_a8

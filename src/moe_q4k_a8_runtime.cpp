@@ -158,6 +158,13 @@ void validate_a8_down_manifest(const ModelContract& model,
         classification.q5k_with_q80_down_layers != std::vector<std::uint32_t>{2U})
         throw std::invalid_argument("A8 down requires canonical 43 Q5_1, four Q8_0 and one Q5_K fallback layers");
 }
+void validate_q5k_a8_manifest(const ModelContract& model,
+    const RuntimeLayerClassification& classification) {
+    validate_a8_down_manifest(model, classification, true, true);
+    if (classification.legacy_q5k_layers != std::vector<std::uint32_t>{2U} ||
+        classification.q5k_with_q80_down_layers != std::vector<std::uint32_t>{2U})
+        throw std::invalid_argument("Q5_K A8 requires only canonical layer 2 paired with Q8_0 down");
+}
 void validate_a8_down_content(const ModelContentIdentity& content) {
     // Loader-framed content identity of the admitted original GGUF, not a
     // layout-only or filename claim and not a numerical qualification flag.

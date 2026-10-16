@@ -2,6 +2,8 @@
 
 #include "strix/runtime_launchers.hpp"
 #include "strix/hip_integer_projection_runtime.hpp"
+#include "strix/execution_tensor_access.hpp"
+#include "strix/lane_chain_hyper_output.hpp"
 
 #include <limits>
 #include <stdexcept>
@@ -118,7 +120,7 @@ hyper_mix_config(
     const ModelContract& model,
     HipActivationStorage activation, bool parallel, bool staged, bool fused, bool typed, bool prefetch_rows, bool prefetch_output, bool lane_chain,
     bool splitk, bool splitk_fp64, bool next_tile,
-    std::shared_ptr<HipHyperMixArithmeticStats> arithmetic_stats = {}) {
+    std::shared_ptr<HipHyperMixArithmeticStats> arithmetic_stats = {}, bool deferred_norm = false) {
     HipHyperMixLauncherConfig config;
     config.hidden_size =
         checked_u32(
@@ -145,6 +147,7 @@ hyper_mix_config(
     config.prefetch_q8_output = prefetch_output;
     config.lane_chain_output = lane_chain;
     config.splitk_projection = splitk;
+    config.splitk_deferred_norm = deferred_norm;
     config.splitk_projection_fp64 = splitk_fp64;
     config.arithmetic_stats = std::move(arithmetic_stats);
     config.prefetch_hc_projection_next_tile = next_tile;
@@ -199,7 +202,7 @@ moe_experts_config(
     const ModelContract& model,
     HipActivationStorage activation, bool q4k_a8 = false,
     std::shared_ptr<moe_q4k_a8::RuntimeDispatchStats> stats = {}, bool grouped_q51=false, bool deferred_status=false, bool batched_activation=false, bool slot_parallel=false,
-    bool a8_down_q51=false, bool a8_down_q80=false) {
+    bool a8_down_q51=false, bool a8_down_q80=false, bool q5k_a8_gateup=false) {
     HipMoeExpertsLauncherConfig config;
     config.hidden_size =
         checked_u32(
@@ -224,6 +227,7 @@ moe_experts_config(
     config.q51_slot_parallel_down = slot_parallel;
     config.a8_down_q51 = a8_down_q51;
     config.a8_down_q80 = a8_down_q80;
+    config.q5k_a8g32_gate_up = q5k_a8_gateup;
     config.deferred_moe_status = deferred_status;
     config.batched_slot_activation = batched_activation;
     config.q4k_a8_stats = std::move(stats);
@@ -259,12 +263,55 @@ moe_route_config(
     return config;
 }
 
+// Metadata-only admission. Physical ranges and generations are checked by
+// the HC bundle before publishing its first launcher or enqueueing any work.
+void validate_deferred_hc_catalog_model(const CompiledSerialExecution& compiled,
+    const ExecutionRuntimeResources* resources) {
+    if (!resources || !resources->model_manifest || !resources->tensor_access ||
+        compiled.logical_rows != 1U || compiled.request_concurrency != 1U || compiled.device_graph_inputs ||
+        compiled.bindings.bindings.size() != compiled.execution.steps.size() ||
+        !resources->model_manifest->layout_identity ||
+        resources->tensor_access->manifest_layout_identity != resources->model_manifest->layout_identity)
+        throw std::invalid_argument("HC deferred normalization requires complete canonical R1 C1 metadata");
+    std::uint32_t count = 0;
+    for (const auto& step : compiled.execution.steps) {
+        if (step.op != SerialOp::attn_hyper_mix && step.op != SerialOp::mlp_hyper_mix &&
+            step.op != SerialOp::final_hyper_mix) continue;
+        if (step.id >= compiled.bindings.bindings.size())
+            throw std::invalid_argument("HC deferred mixer binding is absent");
+        const auto& binding = compiled.bindings.bindings[step.id];
+        if (binding.host_or_runtime_step || !binding.kernel_id ||
+            binding.kernel_id->find(".hc-deferred-norm-v1") == std::string::npos ||
+            !binding.kernel_id->ends_with(lane_chain_hyper_output_suffix))
+            throw std::invalid_argument("HC deferred normalization rejects every non-lane-chain mixer fallback");
+        const auto tensor = [&](std::uint32_t slot) -> const ManifestTensor& {
+            const auto* access = find_execution_tensor_access(*resources->tensor_access,step.id,slot);
+            if (!access || access->op != step.op || access->tensor_indices.size() != 1U ||
+                access->tensor_indices.front() >= resources->model_manifest->tensors.size())
+                throw std::invalid_argument("HC deferred canonical tensor role is absent");
+            return resources->model_manifest->tensors[access->tensor_indices.front()];
+        };
+        const auto& norm = tensor(0U);const auto& up = tensor(2U);
+        if (norm.ggml_type != 0U || norm.dimensions != std::vector<std::uint64_t>{10240U} ||
+            norm.byte_size != 40960U || !lane_chain_hyper_output_eligible(up,2560U,4U,320U,0U))
+            throw std::invalid_argument("HC deferred normalization requires F32 wide norm and eligible Q8 up for every mixer");
+        ++count;
+    }
+    if (count != 97U)
+        throw std::invalid_argument("HC deferred normalization requires all 97 canonical mixers without fallback");
+}
+
 void validate_numerical_catalog_config(const ModelContract& model, const HipLauncherCatalogConfig& config) {
     if (numerical_profile_name(config.numerical_profile).empty())
         throw std::invalid_argument("HIP catalog numerical profile is invalid");
     if (config.a8_down_q51 != numerical_profile_q51_a8_down(config.numerical_profile) ||
         config.a8_down_q80 != numerical_profile_q80_a8_down(config.numerical_profile))
         throw std::invalid_argument("HIP catalog A8 down recipe differs from typed numerical profile");
+    if (config.q5k_a8g32_gate_up != numerical_profile_q5k_a8_gateup(config.numerical_profile) ||
+        config.splitk_deferred_norm != numerical_profile_hc_deferred_norm(config.numerical_profile))
+        throw std::invalid_argument("HIP catalog Q5K or HC deferred recipe differs from typed numerical profile");
+    if (config.splitk_deferred_norm && (!config.lane_chain_hyper_output || config.prefetch_hc_projection_next_tile))
+        throw std::invalid_argument("HC deferred normalization requires all mixers on the lane-chain path");
     if (config.numerical_profile == DecodeNumericalProfile::exact_v5) return;
     if (config.splitk_hyper_projection != numerical_profile_hc_splitk(config.numerical_profile) ||
         config.splitk_hyper_projection_fp64 || config.enable_device_graph_inputs ||
@@ -286,6 +333,7 @@ void register_complete_hip_kernel_catalog(
     const integer_projection::RuntimeConfig* alternate_lm_head) {
     validate_numerical_catalog_config(model, config);
     if (request.a8_down_q51 != config.a8_down_q51 || request.a8_down_q80 != config.a8_down_q80 ||
+        request.q5k_a8g32_gate_up != config.q5k_a8g32_gate_up ||
         (config.numerical_profile != DecodeNumericalProfile::exact_v5 &&
          (alternate_lm_head || request.device_graph_inputs || request.require_graph_safe ||
           request.logical_rows != 1 || request.request_concurrency != 1)))
@@ -462,14 +510,14 @@ void register_complete_hip_kernel_catalog(
         hyper_mix_config(
             model,
             config.activation, config.parallel_hyper_mix, config.staged_hyper_projections, config.fused_staged_hyper_mix, config.typed_hyper_projection, config.prefetch_typed_hyper_rows, config.prefetch_q8_hyper_output, config.lane_chain_hyper_output,
-            config.splitk_hyper_projection, config.splitk_hyper_projection_fp64, config.prefetch_hc_projection_next_tile, config.arithmetic_stats);
+            config.splitk_hyper_projection, config.splitk_hyper_projection_fp64, config.prefetch_hc_projection_next_tile, config.arithmetic_stats, config.splitk_deferred_norm);
     register_hip_hyper_mix_kernel_variant(
         model,
         request,
         hyper_mix,
         registry,
         qualification);
-    if(config.lane_chain_hyper_output){hyper_mix.lane_chain_output=false;register_hip_hyper_mix_kernel_variant(model,request,hyper_mix,registry,qualification);}
+    if(config.lane_chain_hyper_output && !config.splitk_deferred_norm){hyper_mix.lane_chain_output=false;register_hip_hyper_mix_kernel_variant(model,request,hyper_mix,registry,qualification);}
 
     const auto moe_route =
         moe_route_config(
@@ -485,7 +533,7 @@ void register_complete_hip_kernel_catalog(
     const auto moe_experts =
         moe_experts_config(
             model,
-            config.activation, config.q4k_a8g32_gate_up, config.q4k_a8_stats, config.grouped_exact_q51_down, config.deferred_moe_status, config.batched_moe_activation, config.q51_slot_parallel_down, config.a8_down_q51, config.a8_down_q80);
+            config.activation, config.q4k_a8g32_gate_up, config.q4k_a8_stats, config.grouped_exact_q51_down, config.deferred_moe_status, config.batched_moe_activation, config.q51_slot_parallel_down, config.a8_down_q51, config.a8_down_q80, config.q5k_a8g32_gate_up);
     register_hip_moe_experts_kernel_variant(
         model,
         request,
@@ -524,7 +572,7 @@ HipLauncherCatalog::HipLauncherCatalog(
     const ModelContract& model,
     HipLauncherCatalogConfig config,
     std::shared_ptr<integer_projection::HipIntegerProjectionRuntimeBundle> alternate_lm_head)
-    : device_graph_inputs_(config.enable_device_graph_inputs), deferred_moe_status_(config.deferred_moe_status), alternate_lm_head_(std::move(alternate_lm_head)), elementwise_(
+    : device_graph_inputs_(config.enable_device_graph_inputs), deferred_moe_status_(config.deferred_moe_status), splitk_deferred_norm_(config.splitk_deferred_norm), alternate_lm_head_(std::move(alternate_lm_head)), elementwise_(
           elementwise_config(
               model,
               config.activation)),
@@ -548,7 +596,7 @@ HipLauncherCatalog::HipLauncherCatalog(
           hyper_mix_config(
               model,
               config.activation, config.parallel_hyper_mix, config.staged_hyper_projections, config.fused_staged_hyper_mix, config.typed_hyper_projection, config.prefetch_typed_hyper_rows, config.prefetch_q8_hyper_output, config.lane_chain_hyper_output,
-              config.splitk_hyper_projection, config.splitk_hyper_projection_fp64, config.prefetch_hc_projection_next_tile, config.arithmetic_stats)),
+              config.splitk_hyper_projection, config.splitk_hyper_projection_fp64, config.prefetch_hc_projection_next_tile, config.arithmetic_stats, config.splitk_deferred_norm)),
       moe_route_(
           moe_route_config(
               model,
@@ -556,7 +604,7 @@ HipLauncherCatalog::HipLauncherCatalog(
       moe_experts_(
           moe_experts_config(
               model,
-              config.activation, config.q4k_a8g32_gate_up, config.q4k_a8_stats, config.grouped_exact_q51_down, config.deferred_moe_status, config.batched_moe_activation, config.q51_slot_parallel_down, config.a8_down_q51, config.a8_down_q80)),
+              config.activation, config.q4k_a8g32_gate_up, config.q4k_a8_stats, config.grouped_exact_q51_down, config.deferred_moe_status, config.batched_moe_activation, config.q51_slot_parallel_down, config.a8_down_q51, config.a8_down_q80, config.q5k_a8g32_gate_up)),
       lm_head_(
           lm_head_config(
               model,
@@ -609,6 +657,7 @@ register_for_compiled_execution(
     ExecutionLauncherRegistry& registry,
     const ExecutionRuntimeResources* resources,
     std::shared_ptr<HipGdnIslands> gdn_islands) {
+    if (splitk_deferred_norm_) validate_deferred_hc_catalog_model(compiled,resources);
     if (gdn_islands && (device_graph_inputs_ || alternate_lm_head_ || !deferred_moe_status_ || !resources ||
         (gdn_config_.wave8_q8_input_projections != gdn_config_.wave8_q8_output_projection) ||
         gdn_config_.recurrent_layout != HipGdnRecurrentLayout::baseline))

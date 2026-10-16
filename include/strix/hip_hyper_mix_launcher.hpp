@@ -18,10 +18,14 @@ inline constexpr std::string_view splitk_hc_fp32_numerical_identity =
     "hc-down-splitk16x640-r40-fp32-v1";
 inline constexpr std::string_view splitk_hc_fp64_numerical_identity =
     "hc-down-splitk16x640-r40-fp64-oracle-v1";
+inline constexpr std::string_view deferred_hc_numerical_identity =
+    "hc-down-splitk16x640-r40-fp32-deferred-rms-v1";
 
 struct HipHyperMixArithmeticStats {
     // Actual successful host enqueues; graph replays are never inferred.
     std::atomic<std::uint64_t> splitk_f32_submissions{0};
+    std::atomic<std::uint64_t> deferred_norm_submissions{0};
+    std::atomic<std::uint64_t> materialized_norm_submissions{0};
 };
 
 struct HipHyperMixLauncherConfig {
@@ -39,6 +43,7 @@ struct HipHyperMixLauncherConfig {
     // Experimental integration, selected only by a diagnostic host driver.
     bool splitk_projection = false;
     bool splitk_projection_fp64 = false;
+    bool splitk_deferred_norm = false;
     // Exact current-weight, eager-only raw next-tile projection pipeline.
     bool prefetch_hc_projection_next_tile = false;
     HipActivationStorage activation =
@@ -73,7 +78,10 @@ class HipHyperMixLauncherBundle {
 public:
     explicit HipHyperMixLauncherBundle(
         HipHyperMixLauncherConfig config)
-        : config_(config), fallback_config_(config) { fallback_config_.lane_chain_output=false; }
+        : config_(config), fallback_config_(config) {
+        fallback_config_.lane_chain_output=false;
+        fallback_config_.splitk_deferred_norm=false;
+    }
 
     HipHyperMixLauncherBundle(
         const HipHyperMixLauncherBundle&) = delete;
