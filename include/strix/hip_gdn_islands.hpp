@@ -31,7 +31,8 @@ struct HipGdnIslandReceipt {
 };
 
 // Fixed R1 GDN islands, constructed before registering the launch plan. Setup
-// requires no active HipLaunchScope and exclusive ownership through quiescence.
+// requires no active HipLaunchScope and exclusive ownership through quiescence;
+// the owner installs its retained real D1 scope internally for prepare only.
 // resources_owner must retain the actual D1 object and its borrowed resource
 // owners; weights must be the residency whose binding is in those resources.
 // Metadata must remain stable during each call. Replay is available only via

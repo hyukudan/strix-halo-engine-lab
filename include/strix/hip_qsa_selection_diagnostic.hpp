@@ -16,7 +16,7 @@ static_assert(sizeof(Item) == 8);
 // Each block id denotes its original input position; padding ids remain unique.
 [[nodiscard]] std::uint32_t selected_count(Shape);
 [[nodiscard]] std::uint64_t scratch_items(Shape); // EACH ping/pong; max16384 items.
-// Source-only diagnostic, not decoder integration or a selected default.
+// Shared exact selection backend, used by opt-in production and component diagnostics.
 // Caller owns an explicit non-default stream and all views until completion,
 // including after enqueue exceptions. No allocation, synchronization, status
 // clearing or host publication occurs here. Producer must precede on same stream

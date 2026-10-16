@@ -157,7 +157,7 @@ def validate_outer_receipt(receipt):
     # consumed here are checked. A missing or explicit null identity stays unknown.
     for key in ("execution_identity", "kernel_plan_identity", "launch_plan_identity",
                 "runtime_compatibility_identity", "context_tokens", "final_position",
-                "next_position", "committed_tokens", "steps_executed", "slot_parallel_q51_submissions"):
+                "next_position", "committed_tokens", "steps_executed", "slot_parallel_q51_submissions", "qsa_hierarchical_selection_submissions"):
         if receipt.get(key) is not None:
             integer(receipt[key], key)
     for key in ("model_sha256", "model_content_identity", "binary_sha256"):
@@ -168,6 +168,40 @@ def validate_outer_receipt(receipt):
     for key in ("q4k_a8g32_gate_up", "grouped_exact_q51_down"):
         if key in receipt:
             boolean(receipt[key], key)
+    if "gdn_recurrent_layout" in receipt and receipt["gdn_recurrent_layout"] not in (".lds32-v1", ".lds33-v1", ".lds-transposed-v1"):
+        raise ValueError("invalid reported GDN recurrent layout")
+    if "gdn_recurrent_layout_qualification" in receipt and receipt["gdn_recurrent_layout_qualification"] != "not_assessed":
+        raise ValueError("GDN recurrent layout qualification must be not_assessed")
+    if "qsa_gqa_heads_per_block" in receipt:
+        if type(receipt["qsa_gqa_heads_per_block"]) is not int or receipt["qsa_gqa_heads_per_block"] not in (1, 2, 4):
+            raise ValueError("invalid QSA heads per block")
+    if "qsa_gqa_qualification" in receipt and receipt["qsa_gqa_qualification"] != "not_assessed":
+        raise ValueError("QSA GQA qualification must be not_assessed")
+    if "qsa_gqa_submissions" in receipt:
+        integer(receipt["qsa_gqa_submissions"], "QSA GQA submissions")
+    if "qsa_gqa_layer_submissions" in receipt:
+        counts = receipt["qsa_gqa_layer_submissions"]
+        if not isinstance(counts, list) or len(counts) != 48:
+            raise ValueError("QSA GQA layer submissions require 48 counters")
+        for count in counts:
+            integer(count, "QSA GQA layer submissions")
+        if sum(counts) != receipt.get("qsa_gqa_submissions"):
+            raise ValueError("QSA GQA total/layer submissions differ")
+    if "qsa_hierarchical_selection" in receipt:
+        boolean(receipt["qsa_hierarchical_selection"], "qsa_hierarchical_selection")
+    if ("qsa_hierarchical_selection_qualification" in receipt and
+            receipt["qsa_hierarchical_selection_qualification"] != "not_assessed"):
+        raise ValueError("hierarchical QSA qualification must be not_assessed")
+    if "qsa_hierarchical_selection_layer_submissions" in receipt:
+        counts = receipt["qsa_hierarchical_selection_layer_submissions"]
+        if not isinstance(counts, list) or len(counts) != 48:
+            raise ValueError("hierarchical QSA layer submissions require 48 counters")
+        for count in counts:
+            integer(count, "hierarchical QSA layer submissions")
+        if sum(counts) != receipt.get("qsa_hierarchical_selection_submissions"):
+            raise ValueError("hierarchical QSA total/layer submissions differ")
+    if receipt.get("qsa_hierarchical_selection") is False and receipt.get("qsa_hierarchical_selection_submissions", 0):
+        raise ValueError("disabled hierarchical QSA cannot submit work")
     if "q51_slot_parallel_down" in receipt and receipt["q51_slot_parallel_down"] is not None:
         boolean(receipt["q51_slot_parallel_down"], "q51_slot_parallel_down")
     if ("q51_slot_parallel_down_qualification" in receipt and
@@ -197,7 +231,7 @@ def reported_opt_in_overlays(receipt):
             raise ValueError(f"{key} must be a nonempty string or null")
         values[key] = value
     for key in ("batched_moe_activation", "prefetch_q8_lm_head", "wave8_q8_lm_head", "wave8_q8_gdn_input",
-                "wave8_q8_gdn_output", "wave8_q8_qsa_output", "prefetch_hc_projection_next_tile", "q51_slot_parallel_down"):
+                "wave8_q8_gdn_output", "wave8_q8_qsa_output", "prefetch_hc_projection_next_tile", "q51_slot_parallel_down", "qsa_hierarchical_selection"):
         value = receipt.get(key)
         if value is not None:
             boolean(value, key)

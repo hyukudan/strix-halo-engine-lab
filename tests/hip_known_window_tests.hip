@@ -105,7 +105,7 @@ std::vector<unsigned char> f32(std::size_t size, float base, float variation = 0
 }
 struct Weight { Span device; std::vector<unsigned char> original; };
 struct Result {
-    std::array<std::vector<unsigned char>, 2> output;
+    std::array<std::vector<unsigned char>, 2> output, temporary;
     std::vector<unsigned char> matrix, convolution;
 };
 
@@ -114,6 +114,7 @@ struct Result {
 struct Fixture {
     Owner owner; // retained until every stream operation and borrowed owner is drained
     const bool gdn;
+    const bool f32_gates;
     ModelContract model = ModelContract::qwen38_flash_next();
     SerialExecutionPlan execution = build_serial_decode_execution_plan(model);
     SerialExecutionIoPlan io = build_serial_execution_io_plan(execution);
@@ -139,7 +140,8 @@ struct Fixture {
     ExecutionLauncher selected;
     Span matrix, convolution;
 
-    explicit Fixture(bool is_gdn, bool shared_prefetch = false) : gdn(is_gdn) {
+    explicit Fixture(bool is_gdn, bool shared_prefetch = false, bool mixed_gates = false)
+        : gdn(is_gdn), f32_gates(mixed_gates) {
         const auto wanted = gdn ? SerialOp::gated_delta_net : SerialOp::shared_expert;
         const auto found = std::find_if(execution.steps.begin(), execution.steps.end(),
             [&](const auto& value) { return value.op == wanted && value.layer == 0U; });
@@ -232,8 +234,10 @@ struct Fixture {
         add("blk.0.ssm_conv1d.weight", TensorRole::recurrent_state, 0U, {4, 10240}, f32(4U * 10240U, 0.2F, 0.015F));
         add("blk.0.ssm_dt.bias", TensorRole::recurrent_state, 0U, {48}, f32(48U, -0.1F, 0.01F));
         add("blk.0.ssm_a", TensorRole::recurrent_state, 0U, {48}, f32(48U, -0.25F, 0.01F));
-        add("blk.0.ssm_beta.weight", TensorRole::recurrent_state, 8U, {2560, 48}, q8(2560, 48, 6));
-        add("blk.0.ssm_alpha.weight", TensorRole::recurrent_state, 8U, {2560, 48}, q8(2560, 48, 7));
+        add("blk.0.ssm_beta.weight", TensorRole::recurrent_state, f32_gates ? 0U : 8U, {2560, 48},
+            f32_gates ? f32(2560U * 48U, 0.0005F, 0.0001F) : q8(2560, 48, 6));
+        add("blk.0.ssm_alpha.weight", TensorRole::recurrent_state, f32_gates ? 0U : 8U, {2560, 48},
+            f32_gates ? f32(2560U * 48U, -0.0004F, 0.0001F) : q8(2560, 48, 7));
         add("blk.0.ssm_norm.weight", TensorRole::recurrent_state, 0U, {128}, f32(128U, 0.75F, 0.01F));
         add("blk.0.ssm_out.weight", TensorRole::recurrent_state, 8U, {6144, 2560}, q8(6144, 2560, 8));
         access.accesses.push_back({step.id, step.op, 0U, {2, 3, 4, 5, 6, 7, 8}});
@@ -266,11 +270,13 @@ struct Fixture {
     }
     HipLaunchContext scope() const { HipLaunchContext result; result.stream = owner.stream; return result; }
     void preflight(std::span<const ExecutionDispatchContext, 2> contexts) const {
-        if (gdn) gdn_known_window_r2_preflight(contexts, gdn_config);
+        if (gdn && f32_gates) gdn_known_window_r2_f32_gates_preflight(contexts, gdn_config);
+        else if (gdn) gdn_known_window_r2_preflight(contexts, gdn_config);
         else shared_expert_known_window_r2_preflight(contexts, shared_config);
     }
     void launch(std::span<const ExecutionDispatchContext, 2> contexts) const {
-        if (gdn) gdn_known_window_r2_launch(contexts, gdn_config);
+        if (gdn && f32_gates) gdn_known_window_r2_f32_gates_launch(contexts, gdn_config);
+        else if (gdn) gdn_known_window_r2_launch(contexts, gdn_config);
         else shared_expert_known_window_r2_launch(contexts, shared_config);
     }
     void prepare(unsigned flavor, bool swapped = false) {
@@ -281,7 +287,11 @@ struct Fixture {
             constexpr std::array<std::uint16_t, 12> edge{0, 0x8000, 1, 0x8001, 0x007f, 0x807f,
                 0x7f80, 0xff80, 0x7fc1, 0xffc2, 0x7f81, 0xff83};
             for (std::size_t i = 0; i < values.size(); ++i) {
-                if (flavor == 1U) values[i] = edge[(i + source_row * 3U) % 6U];
+                if (flavor == 4U) values[i] = i % 32U == 3U ? static_cast<std::uint16_t>(source_row ? 0xff83U : 0x7f81U) :
+                    i % 32U == 7U ? static_cast<std::uint16_t>(source_row ? 0xffc3U : 0x7fc1U) :
+                    bf16((i == 255U || i == 256U || i == 2559U) ? 2.0F :
+                        (i % 2U ? -1.0F : 1.0F) * (source_row ? 0.125F : 0.25F));
+                else if (flavor == 1U) values[i] = edge[(i + source_row * 3U) % 6U];
                 else if (flavor == 3U) values[i] = edge[(i + source_row * 5U) % edge.size()];
                 else if (flavor == 2U) values[i] = bf16((i % 2U ? -1.0F : 1.0F) * (source_row ? 0.125F : 0.25F));
                 else values[i] = bf16(static_cast<float>(static_cast<int>((i * 7U + source_row * 11U) % 29U) - 14) * (source_row ? -0.043F : 0.031F));
@@ -327,7 +337,10 @@ struct Fixture {
             require(shared_config.prefetch_stats->dispatched_projections.load(std::memory_order_relaxed) - before == (candidate ? 3U : 6U),
                 "shared R2 actual projection submission count differs");
         Result result;
-        for (unsigned row = 0; row < 2U; ++row) result.output[row] = read({output[row].address, output[row].bytes});
+        for (unsigned row = 0; row < 2U; ++row) {
+            result.output[row] = read({output[row].address, output[row].bytes});
+            result.temporary[row] = read({temporary[row].address, temporary[row].bytes});
+        }
         if (gdn) { result.matrix = read(matrix); result.convolution = read(convolution); }
         readonly();
         return result;
@@ -335,6 +348,7 @@ struct Fixture {
 };
 void same(const Result& left, const Result& right) {
     require(left.output == right.output, "R2 output rows differ bitwise from two selected serial calls");
+    require(left.temporary == right.temporary, "R2 complete row temporaries differ bitwise from selected serial calls");
     require(left.matrix == right.matrix, "R2 complete recurrent matrix differs from serial after two rows");
     require(left.convolution == right.convolution, "R2 complete convolution history differs from serial after two rows");
 }
@@ -547,6 +561,196 @@ void gdn_projection_rows(Fixture& fixture) {
         adversarial_q8_weight(fixture, item.weight, item.width, item.outputs, [&] { compare(4U); });
     }
 }
+
+// Typed stage observation keeps NaN payloads visible before dt/sigmoid overwrite
+// beta/gate. Synthetic canonical geometry only, not real-weight/model evidence.
+void gdn_typed_input_stage(Fixture& fixture) {
+    constexpr std::uint64_t prefix_bytes = 16528ULL * sizeof(float);
+    const auto run = [&](GdnKnownWindowProjectionMode mode) {
+        fixture.reset();
+        {
+            const HipLaunchScope scope(fixture.scope());
+            gdn_known_window_r2_input_stage_probe(fixture.rows, fixture.gdn_config,
+                fixture.f32_gates ? GdnKnownWindowFormat::q8_rows2_f32_gates : GdnKnownWindowFormat::q8_all5, mode);
+        }
+        fixture.owner.finish();
+        auto expected = fixture.seed;
+        std::array<std::vector<unsigned char>,2> result;
+        for (unsigned row = 0; row < 2U; ++row) {
+            require(fixture.temporary[row].bytes >= prefix_bytes, "typed input prefix exceeds temporary");
+            result[row] = read({fixture.temporary[row].address, prefix_bytes});
+            std::copy(result[row].begin(), result[row].end(), expected.begin() +
+                static_cast<std::ptrdiff_t>(fixture.temporary[row].address - fixture.scratch.address));
+        }
+        require(read(fixture.scratch) == expected,
+            "input-stage probe touched core, row outputs, input or non-prefix scratch bytes");
+        require(read(fixture.state) == fixture.initial_state, "input-stage probe touched persistent state");
+        fixture.readonly();
+        return result;
+    };
+    for (unsigned flavor = 0; flavor < 5U; ++flavor) {
+        fixture.prepare(flavor);
+        const auto reference = run(GdnKnownWindowProjectionMode::incumbent_row_loop);
+        require(run(GdnKnownWindowProjectionMode::rows2) == reference,
+            "typed R2 complete 16528-F32 input prefix differs bitwise from both incumbent rows");
+        require(run(GdnKnownWindowProjectionMode::rows2) == reference,
+            "typed R2 input prefix is not bitwise repeatable");
+    }
+}
+
+template<class Work> void adversarial_f32_gates(Fixture& fixture, Work&& work) {
+    require(fixture.f32_gates, "F32 adversary requires actual F32 gate owners");
+    const std::array<std::vector<unsigned char>,2> saved{fixture.weights[5].original, fixture.weights[6].original};
+    constexpr std::array<std::uint32_t,16> patterns{0x00000000U,0x80000000U,0x00000001U,0x80000001U,
+        0x007fffffU,0x807fffffU,0x00800000U,0x80800000U,0x7f800000U,0xff800000U,
+        0x7fc00001U,0xffc12345U,0x7f800001U,0xff812345U,0x7f7fffffU,0xff7fffffU};
+    constexpr std::array<unsigned,4> outputs{0,1,46,47}, features{0,255,256,2559};
+    for (unsigned gate = 0; gate < 2U; ++gate) {
+        auto& target = fixture.weights[5U + gate];
+        require(target.original.size() == 491520U, "F32 gate fixture extent differs");
+        for (unsigned o = 0; o < outputs.size(); ++o)
+            for (unsigned f = 0; f < features.size(); ++f) {
+                const auto bits = patterns[(o * 4U + f + gate * 5U) % patterns.size()];
+                const auto offset = (static_cast<std::size_t>(outputs[o]) * 2560U + features[f]) * 4U;
+                std::memcpy(target.original.data() + offset, &bits, sizeof(bits));
+            }
+        for (const auto output : outputs) {
+            constexpr std::array<std::uint32_t,2> cancellation{0x3f800000U,0xbf800000U};
+            std::memcpy(target.original.data() + (static_cast<std::size_t>(output) * 2560U + 64U) * 4U,
+                cancellation.data(), sizeof(cancellation));
+        }
+    }
+    const auto restore = [&] {
+        for (unsigned gate = 0; gate < 2U; ++gate) {
+            fixture.weights[5U + gate].original = saved[gate];
+            fixture.owner.quiescence.run([&] { write(fixture.weights[5U + gate].device, saved[gate]); });
+        }
+    };
+    try {
+        for (const auto index : {5U,6U}) write(fixture.weights[index].device, fixture.weights[index].original);
+        work(); fixture.owner.finish();
+    } catch (...) {
+        const auto error = std::current_exception();
+        fixture.owner.quiescence.recover_or_fail_stop(); restore(); std::rethrow_exception(error);
+    }
+    restore();
+}
+
+void wrong_gdn_entry(Fixture& fixture) {
+    fixture.prepare(0U); fixture.reset();
+    const auto scratch = read(fixture.scratch), state = read(fixture.state);
+    const auto call = [&](bool launch) {
+        if (fixture.f32_gates) {
+            if (launch) gdn_known_window_r2_launch(fixture.rows, fixture.gdn_config);
+            else gdn_known_window_r2_preflight(fixture.rows, fixture.gdn_config);
+        } else {
+            if (launch) gdn_known_window_r2_f32_gates_launch(fixture.rows, fixture.gdn_config);
+            else gdn_known_window_r2_f32_gates_preflight(fixture.rows, fixture.gdn_config);
+        }
+    };
+    {
+        const HipLaunchScope scope(fixture.scope());
+        std::string message;
+        try { call(false); } catch (const std::invalid_argument& error) { message = error.what(); }
+        require(message == (fixture.f32_gates ? "GDN known-window R2 requires all five Q8_0 projections" :
+            "GDN known-window R2 F32-gate variant requires Q8_0 qkv/z/out and F32 beta/alpha"),
+            "wrong closed GDN entry did not preserve its exact format rejection");
+    }
+    check(hipStreamBeginCapture(fixture.owner.stream, hipStreamCaptureModeThreadLocal), "capture wrong typed GDN entry");
+    std::exception_ptr error;
+    try { const HipLaunchScope scope(fixture.scope()); invalid([&] { call(true); }); }
+    catch (...) { error = std::current_exception(); }
+    hipGraph_t graph{};
+    check(hipStreamEndCapture(fixture.owner.stream, &graph), "end wrong typed GDN entry capture");
+    require(graph != nullptr, "wrong typed GDN entry did not return graph");
+    try { fixture.owner.graphs.push_back(graph); } catch (...) { (void)hipGraphDestroy(graph); throw; }
+    std::size_t nodes = 0; check(hipGraphGetNodes(graph, nullptr, &nodes), "wrong typed GDN entry nodes");
+    require(nodes == 0U, "wrong typed GDN entry enqueued capture nodes");
+    if (error) std::rethrow_exception(error);
+    fixture.owner.finish();
+    require(read(fixture.scratch) == scratch && read(fixture.state) == state,
+        "wrong typed GDN entry changed scratch or state");
+}
+
+void mixed_gdn_rejections(Fixture& fixture) {
+    fixture.prepare(0U); fixture.reset();
+    const auto before_scratch = read(fixture.scratch), before_state = read(fixture.state);
+    const auto original_manifest = fixture.manifest;
+    const auto original_runtime = fixture.runtime;
+    const auto restore = [&] { fixture.manifest = original_manifest; fixture.runtime = original_runtime; };
+    for (unsigned fault = 0; fault < 14U; ++fault) {
+        restore();
+        auto contexts = fixture.rows;
+        auto other_runtime = fixture.runtime;
+        auto other_resources = fixture.resources[1];
+        if (fault == 0U || fault == 1U) {
+            const auto index = fault == 0U ? 5U : 6U;
+            fixture.manifest.tensors[index].ggml_type = 8U;
+            fixture.manifest.tensors[index].byte_size = 2560ULL / 32U * 34U * 48U;
+        }
+        if (fault == 2U || fault == 3U) fixture.manifest.tensors[5].ggml_type = fault == 2U ? 1U : 30U;
+        if (fault == 4U) {
+            fixture.manifest.tensors[0].ggml_type = 0U;
+            fixture.manifest.tensors[0].byte_size = 2560ULL * 10240U * 4U;
+        }
+        if (fault == 5U) fixture.runtime.tensors[5].bytes = 491520U - 4U;
+        if (fault == 6U) fixture.runtime.tensors[5].address += 2U;
+        if (fault == 7U) fixture.runtime.tensors[5].address = fixture.output[0].address;
+        if (fault == 8U) fixture.runtime.tensors[5].address = fixture.temporary[1].address;
+        if (fault == 9U) {
+            other_resources.model_weights = &other_runtime;
+            contexts[1].resources = &other_resources;
+        }
+        if (fault == 10U) fixture.runtime.tensors[5].allocation_generation = 0U;
+        if (fault == 11U) fixture.manifest.tensors[5].byte_size -= 4U;
+        if (fault == 12U) fixture.manifest.tensors[5].dimensions[1] = 47U;
+        if (fault == 13U) fixture.runtime.tensors[6].address += 2U;
+        try {
+            { const HipLaunchScope scope(fixture.scope()); invalid([&] { fixture.preflight(contexts); }); }
+            capture_rejection(fixture, contexts);
+            fixture.owner.finish();
+            require(read(fixture.scratch) == before_scratch && read(fixture.state) == before_state,
+                "mixed typed metadata rejection changed scratch or persistent state");
+        } catch (...) { restore(); throw; }
+    }
+    restore(); fixture.readonly();
+}
+
+void family_gdn_f32_gates() {
+    Fixture fixture(true, false, true);
+    Result finite_reference;
+    for (unsigned flavor = 0; flavor < 5U; ++flavor) {
+        fixture.prepare(flavor);
+        const auto reference = fixture.run(false);
+        same(reference, fixture.run(true)); same(reference, fixture.run(true));
+        if (flavor < 3U) finite(reference);
+        if (flavor == 0U) finite_reference = reference;
+    }
+    fixture.prepare(0U, true);
+    const auto swapped = fixture.run(true);
+    same(fixture.run(false), swapped); finite(swapped);
+    require(swapped.convolution != finite_reference.convolution && swapped.matrix != finite_reference.matrix,
+        "mixed F32 GDN causal-order witness is insensitive to swapped rows");
+    rejections(fixture); mixed_gdn_rejections(fixture); wrong_gdn_entry(fixture);
+    gdn_typed_input_stage(fixture);
+    adversarial_f32_gates(fixture, [&] {
+        gdn_typed_input_stage(fixture);
+        for (const auto flavor : {0U,3U,4U}) {
+            fixture.prepare(flavor);
+            const auto reference = fixture.run(false);
+            same(reference, fixture.run(true)); same(reference, fixture.run(true));
+        }
+    });
+    for (const auto index : {0U,1U,8U}) {
+        const auto& dims = fixture.manifest.tensors[index].dimensions;
+        adversarial_q8_weight(fixture, index, static_cast<std::uint32_t>(dims[0]),
+            static_cast<std::uint32_t>(dims[1]), [&] {
+                fixture.prepare(4U); same(fixture.run(false), fixture.run(true));
+                if (index != 8U) gdn_typed_input_stage(fixture);
+            });
+    }
+}
+
 void family(bool gdn, bool prefetch = false) {
     Fixture fixture(gdn, prefetch);
     Result finite_reference;
@@ -568,7 +772,7 @@ void family(bool gdn, bool prefetch = false) {
             "finite GDN fixture is insensitive to causal input order");
     }
     rejections(fixture);
-    if (gdn) gdn_projection_rows(fixture);
+    if (gdn) { gdn_projection_rows(fixture); gdn_typed_input_stage(fixture); wrong_gdn_entry(fixture); }
     else for (unsigned weight = 0; weight < 3U; ++weight) {
         const auto& dimensions = fixture.manifest.tensors[weight].dimensions;
         adversarial_q8_weight(fixture, weight, static_cast<std::uint32_t>(dimensions[0]),
@@ -585,6 +789,7 @@ int main() try {
     family(false, false);
     family(false, true);
     family(true);
+    family_gdn_f32_gates();
     std::cout << "known-window shared/GDN component fixtures passed\n";
     return 0;
 } catch (const std::exception& error) {

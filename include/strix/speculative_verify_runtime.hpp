@@ -46,6 +46,7 @@ struct KnownWindowResult {
     std::uint32_t logical_row_steps = 0;
     std::uint32_t r2_dispatches = 0;
     std::uint32_t row_loop_dispatches = 0;
+    std::array<std::uint32_t, known_window_r2_variant_slots> r2_variant_dispatches{};
 };
 
 // Two KNOWN input tokens only. This API neither predicts a future greedy token

@@ -18,6 +18,17 @@ void expect(bool condition, const char* message) {
 }  // namespace
 
 int main() {
+    expect(strix::build_qsa_hierarchical_selection_layout(2048).scratch_bytes == 0 &&
+        strix::build_qsa_hierarchical_selection_layout(2051).scratch_bytes == 0 &&
+        strix::build_qsa_hierarchical_selection_layout(2052).scratch_bytes == 4096 &&
+        strix::build_qsa_hierarchical_selection_layout(131072).scratch_bytes == 131072,
+        "hierarchical scratch follows actual complete-block buckets including tails");
+    for (const auto invalid : {0ULL, 131073ULL, ~0ULL}) {
+        bool rejected = false;
+        try { (void)strix::build_qsa_hierarchical_selection_layout(invalid); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        expect(rejected, "hierarchical capacity bounds reject zero and overflow without allocating");
+    }
     const auto plan =
         strix::build_qsa_compressed_selection_plan(
             2048,

@@ -45,6 +45,37 @@ constexpr std::size_t transfer_chunk = 8U * 1024U * 1024U;
 void require(bool condition, const char* reason) {
     if (!condition) throw std::invalid_argument(reason);
 }
+// This driver deliberately qualifies the canonical mixed-format mapping, not
+// the older all-five-Q8 variant. Counters are source ledgers, not timing.
+using VariantCounts = std::array<std::uint32_t, strix::known_window_r2_variant_slots>;
+constexpr VariantCounts expected_variants{0, 48, 0, 36};
+VariantCounts variant_steps(const strix::CompiledKnownPrefixWindow& window) {
+    VariantCounts counts{};
+    for (const auto variant : window.r2_variant) {
+        const auto index = static_cast<std::uint32_t>(variant);
+        require(index < counts.size(), "unknown compiled known-window variant");
+        if (index) ++counts[index];
+    }
+    return counts;
+}
+void require_mixed_window(const strix::CompiledKnownPrefixWindow& window) {
+    require(window.r2_steps == 84 && variant_steps(window) == expected_variants &&
+        window.projection_launches_saved == 252 &&
+        window.logical_projection_weight_bytes_avoided == 2456616960ULL,
+        "real model does not admit exactly 48 shared, zero all-Q8 GDN and 36 mixed GDN R2 steps");
+}
+bool mixed_dispatch_counts(const strix::KnownWindowResult& result) {
+    return result.r2_dispatches == 84 && result.row_loop_dispatches == 708 &&
+        result.r2_variant_dispatches == expected_variants && result.projection_launches_saved == 252 &&
+        result.logical_projection_weight_bytes_avoided == 2456616960ULL;
+}
+std::string variant_counts_json(const VariantCounts& counts) {
+    std::ostringstream out;
+    out << '[';
+    for (std::size_t i = 0; i < counts.size(); ++i) out << (i ? "," : "") << counts[i];
+    out << ']';
+    return out.str();
+}
 void hip_check(hipError_t status, const char* operation) {
     if (status != hipSuccess)
         throw std::runtime_error(std::string(operation) + ": " + hipGetErrorString(status));
@@ -203,8 +234,8 @@ std::shared_ptr<Owners> load(const Options& args, const strix::HipLauncherCatalo
     owner->access = strix::compile_execution_tensor_access_plan(owner->serial.execution, owner->manifest,
         index, strix::build_serial_execution_tensor_requirements(owner->serial.execution));
     owner->window = strix::compile_known_prefix_window(owner->model, owner->serial,
-        owner->manifest, owner->access, {true, true});
-    require(owner->window.r2_steps == 84, "real model does not admit all 48 shared and 36 GDN R2 steps");
+        owner->manifest, owner->access, {true, true, true});
+    require_mixed_window(owner->window);
     const auto projections = strix::q8_projection_organization::build_manifest_plan(
         owner->model, owner->manifest, false, true, true, false);
     strix::SerialSessionStateLayoutRequest state_request;
@@ -418,6 +449,7 @@ struct RowRecord {
 };
 struct WindowRecord {
     std::uint64_t position, r2_dispatches, row_loop_dispatches;
+    VariantCounts r2_variant_dispatches;
 };
 struct Branch {
     std::string name;
@@ -479,10 +511,11 @@ public:
             owner->window.window_execution_identity, owner->window.window_kernel_plan_identity,
             owner->window.window_execution_identity);
         const auto result = window->execute(session, tokens);
-        require(owner->window.r2_steps == 84 && result.r2_dispatches == 84 && result.row_loop_dispatches == 708,
-            "G4 window did not execute the closed 84/708 dispatches");
+        require_mixed_window(owner->window);
+        require(mixed_dispatch_counts(result),
+            "G4 window did not execute the closed mixed-format 84/708 and variant dispatches");
         require(!owner->prefetch.active, "G4 window left an active PLE lookup");
-        branch.windows.push_back({position, result.r2_dispatches, result.row_loop_dispatches});
+        branch.windows.push_back({position, result.r2_dispatches, result.row_loop_dispatches, result.r2_variant_dispatches});
         branch.calls.push_back("window:" + std::to_string(position) + ":" +
             std::to_string(tokens[0]) + ":" + std::to_string(tokens[1]));
         (void)record_row(owner, branch, output, result.logits[0], position, tokens[0], "window-row0");
@@ -566,7 +599,8 @@ void write_branch(std::ostream& out, const Branch& branch, const strix::SerialSe
     for (std::size_t i = 0; i < branch.windows.size(); ++i) {
         const auto& w = branch.windows[i];
         out << (i ? "," : "") << "{\"position\":" << w.position << ",\"r2_dispatches\":" << w.r2_dispatches
-            << ",\"row_loop_dispatches\":" << w.row_loop_dispatches << '}';
+            << ",\"row_loop_dispatches\":" << w.row_loop_dispatches
+            << ",\"r2_variant_dispatches\":" << variant_counts_json(w.r2_variant_dispatches) << '}';
     }
     require(branch.controller.has_value(), "G4 final branch controller missing");
     const auto& result = *branch.controller;
@@ -860,7 +894,7 @@ int qualify(const Options& args) {
     cached.entry.reset(); // A9: free snapshot only after drain, before successful publication
     const auto pending = args.output / "result.pending.json";
     auto output = output_file(pending);
-    output << "{\"schema\":\"known-prompt-g4-qualification-v1\",\"finished\":true,\"passed\":true"
+    output << "{\"schema\":\"known-prompt-g4-qualification-v2\",\"finished\":true,\"passed\":true"
         << ",\"profile\":" << quote(args.profile) << ",\"model_sha256\":" << quote(args.model_sha)
         << ",\"model_content_identity\":" << quote(hex(owner->mapped->content_identity()))
         << ",\"prompt_sha256\":" << quote(args.teacher_sha) << ",\"executable_sha256\":" << quote(executable_sha)
@@ -872,7 +906,12 @@ int qualify(const Options& args) {
         << ",\"window_kernel_plan_identity\":" << owner->window.window_kernel_plan_identity
         << ",\"manifest_layout_identity\":" << owner->manifest.layout_identity
         << ",\"tensor_access_plan_identity\":" << owner->access.plan_identity
-        << ",\"source_counts\":{\"r2_steps\":84,\"per_window_r2_dispatches\":84,\"per_window_row_loop_dispatches\":708}"
+        << ",\"source_counts\":{\"r2_steps\":" << owner->window.r2_steps
+        << ",\"r2_variant_steps\":" << variant_counts_json(variant_steps(owner->window))
+        << ",\"per_window_r2_variant_dispatches\":" << variant_counts_json(expected_variants)
+        << ",\"per_window_r2_dispatches\":84,\"per_window_row_loop_dispatches\":708"
+        << ",\"projection_launches_saved\":" << owner->window.projection_launches_saved
+        << ",\"logical_projection_weight_bytes_avoided\":" << owner->window.logical_projection_weight_bytes_avoided << '}'
         << ",\"capacity\":{\"disk_available\":" << free_disk << ",\"disk_required\":" << required_disk
         << ",\"device_free\":" << free_device << ",\"device_total\":" << total_device
         << ",\"snapshot_device_required\":" << capacity_plan.device_bytes << "},\"snapshot\":{\"identity\":"

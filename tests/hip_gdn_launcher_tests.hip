@@ -32,6 +32,7 @@
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -639,12 +640,19 @@ struct IslandSnapshot {
 // Component qualification only: a real mapped/registered weight owner and the
 // real D1 owner, but one bounded GDN layer, not a full-model profile claim.
 void run_gdn_island_fixture() {
-    for (const unsigned profile : {0U, 1U, 2U}) {
+    struct Case { unsigned profile; std::uint32_t key_heads, value_heads; };
+    const std::array<Case,7> cases{{{0,16,48},{1,16,48},{2,16,48},{3,16,48},{4,16,48},{3,4,4},{3,4,12}}};
+    std::vector<IslandSnapshot> virtual_eager_reference;
+    for (const auto test : cases) {
+        const auto profile = test.profile;
         const bool prefetched = profile != 0U;
-        const bool mixed_f32 = profile == 2U;
+        const bool mixed_f32 = profile == 2U || profile == 4U;
+        const bool both_wave8 = profile == 3U || profile == 4U;
         IslandTemporaryFile file;
         auto owner = std::make_shared<IslandFixtureStorage>();
         auto& model = owner->model;
+        model.gdn_key_heads = test.key_heads;
+        model.gdn_value_heads = test.value_heads;
         auto& compiled = owner->compiled;
         const auto full_plan = strix::build_serial_decode_execution_plan(model);
         auto component_gdn = gdn_step(full_plan);
@@ -803,8 +811,12 @@ void run_gdn_island_fixture() {
         config.virtual_q8_input_projections = prefetched;
         config.prefetch_q8_input_projections = prefetched;
         config.virtual_q8_output_projection = prefetched;
+        config.wave8_q8_input_projections = both_wave8;
+        config.wave8_q8_output_projection = both_wave8;
         strix::kernels::KernelRegistry variants;
         strix::ExecutionBindingRequest request;
+        request.wave8_q8_gdn_input = both_wave8;
+        request.wave8_q8_gdn_output = both_wave8;
         strix::register_hip_gdn_kernel_variant(model, request, config, variants);
         const auto variant = variants.variants().front();
         strix::HipEmbeddingLauncherConfig embedding_config;
@@ -868,6 +880,13 @@ void run_gdn_island_fixture() {
         }
         expect(reference[0].state != reference[1].state,
             "island replay oracle observes evolving recurrent/convolution bytes, not an all-zero state fixture");
+        if (profile == 1U) virtual_eager_reference = reference;
+        if (profile == 3U && test.key_heads == 16U && test.value_heads == 48U) {
+            // A descriptive cross-check, separate from this profile's own
+            // bitwise eager/island qualification gate.
+            std::cout << "GDN_ISLAND_EAGER_VIRTUAL_CROSSCHECK equal="
+                << (reference == virtual_eager_reference) << '\n';
+        }
         reset_state();
         const auto create = [&](const strix::HipGdnLauncherConfig& selected, const strix::HipLaunchContext& scope) {
             return strix::HipGdnIslands::create(compiled, selected, d1->resources(), scope,
@@ -941,7 +960,7 @@ void run_gdn_island_fixture() {
                 }
                 d1->complete_before_commit();
                 expect(snapshot() == reference[static_cast<std::size_t>(position)],
-                    "registered legacy/prefetch GDN island preserves whole output/workspace/matrix/convolution bits at successive positions");
+                    "registered legacy/prefetch/both-wave8 GDN island preserves whole output/workspace/matrix/convolution bits at successive positions");
             }
         }
         expect(prepared_dispatcher.prepared_gdn_calls == 8U,
@@ -964,31 +983,130 @@ void run_gdn_island_fixture() {
             expect(rejected && (expected_message.empty() || rejection == expected_message) && snapshot() == before,
                 "unsupported island creation rejects through its intended guard with no state/output effects");
         };
+        if (profile == 0U) {
+            for (const auto layout : {strix::HipGdnRecurrentLayout::stride32,
+                    strix::HipGdnRecurrentLayout::stride33, strix::HipGdnRecurrentLayout::transposed}) {
+                auto candidate = config; candidate.recurrent_layout = layout;
+                reject_creation(candidate, d1->scope(), "GDN islands require the baseline recurrent LDS layout");
+            }
+        }
         auto wave8 = config; wave8.virtual_q8_input_projections = true;
         wave8.prefetch_q8_input_projections = true; wave8.wave8_q8_input_projections = true;
+        wave8.wave8_q8_output_projection = false;
         strix::kernels::KernelRegistry wave8_variants;
-        strix::register_hip_gdn_kernel_variant(model, request, wave8, wave8_variants);
+        auto wave8_request = request;
+        wave8_request.wave8_q8_gdn_input = true;
+        wave8_request.wave8_q8_gdn_output = false;
+        strix::register_hip_gdn_kernel_variant(model, wave8_request, wave8, wave8_variants);
         const auto wave8_variant = wave8_variants.variants().front();
         compiled.bindings.bindings[step.id].kernel_id = wave8_variant.id;
-        reject_creation(wave8, d1->scope());
+        reject_creation(wave8, d1->scope(), "GDN islands require a complete eager R1/C1 legacy, prefetch8 or both-wave8 source");
         wave8 = config; wave8.virtual_q8_output_projection = true;
         wave8.wave8_q8_output_projection = true;
+        wave8.wave8_q8_input_projections = false;
         strix::kernels::KernelRegistry wave8_output_variants;
-        strix::register_hip_gdn_kernel_variant(model, request, wave8, wave8_output_variants);
+        auto wave8_output_request = request;
+        wave8_output_request.wave8_q8_gdn_output = true;
+        wave8_output_request.wave8_q8_gdn_input = false;
+        strix::register_hip_gdn_kernel_variant(model, wave8_output_request, wave8, wave8_output_variants);
         const auto wave8_output_variant = wave8_output_variants.variants().front();
         compiled.bindings.bindings[step.id].kernel_id = wave8_output_variant.id;
-        reject_creation(wave8, d1->scope());
+        reject_creation(wave8, d1->scope(), "GDN islands require a complete eager R1/C1 legacy, prefetch8 or both-wave8 source");
         compiled.bindings.bindings[step.id].kernel_id = variant.id;
         auto no_stream = d1->scope(); no_stream.stream = nullptr; reject_creation(config, no_stream);
         auto whole_graph = d1->scope(); whole_graph.graph_capture = true; reject_creation(config, whole_graph);
+        {
+            const strix::HipLaunchScope caller_scope(d1->scope());
+            reject_creation(config, d1->scope(), "GDN island setup requires no active launch scope");
+        }
+        expect(strix::current_hip_launch_context() == nullptr,
+            "failed nested island creation unwinds the caller scope");
+        if (both_wave8) {
+            auto device_inputs = config; device_inputs.enable_device_graph_inputs = true;
+            reject_creation(device_inputs, d1->scope(), "wave8 GDN input supports eager execution only");
+            auto capture_subject = create(config, d1->scope());
+            strix::HipGdnLauncherBundle capture_bundle(config);
+            strix::ExecutionLauncherRegistry capture_registry;
+            capture_bundle.register_for_compiled_execution(compiled, capture_registry, capture_subject.get());
+            const auto capture_arm = *capture_registry.find_kernel_launcher(variant.id);
+            const auto reject_replay_capture = [&](auto&& call) {
+                reset_state(); prepare_input(0); context.position = 0;
+                const auto before = snapshot();
+                // Never run recovery, snapshots, D1 begin or a synchronizing
+                // helper until capture has ended, including on exception.
+                check(hipStreamBeginCapture(d1->scope().stream, hipStreamCaptureModeThreadLocal),
+                    "begin both-wave8 replay rejection capture");
+                std::exception_ptr unexpected;
+                std::string rejection;
+                try {
+                    const strix::HipLaunchScope replay_scope(d1->scope());
+                    call();
+                } catch (const std::invalid_argument& error) { rejection = error.what(); }
+                catch (...) { unexpected = std::current_exception(); }
+                hipGraph_t graph{};
+                check(hipStreamEndCapture(d1->scope().stream, &graph), "end both-wave8 rejection capture");
+                if (!graph) throw std::runtime_error("both-wave8 rejection capture produced no graph");
+                std::size_t nodes = 0;
+                const auto count_error = hipGraphGetNodes(graph, nullptr, &nodes);
+                const auto destroy_error = hipGraphDestroy(graph);
+                check(count_error, "count both-wave8 rejected graph nodes");
+                check(destroy_error, "destroy both-wave8 rejected graph");
+                if (unexpected) std::rethrow_exception(unexpected);
+                expect(rejection == "wave8 GDN projections cannot be captured" && nodes == 0U && snapshot() == before,
+                    "actual eager/replay capture guard rejects before nodes or state effects");
+                expect(strix::current_hip_launch_context() == nullptr, "capture rejection unwinds replay scope");
+            };
+            reject_replay_capture([&] { capture_arm.function(context, capture_arm.user_data); });
+            expect(capture_subject->receipt().replays == 0U, "active capture never counts as a graph replay");
+            bool sticky = false;
+            try {
+                const strix::HipLaunchScope replay_scope(d1->scope());
+                capture_arm.function(context, capture_arm.user_data);
+            } catch (const std::logic_error& error) {
+                sticky = std::string_view(error.what()) == "GDN island owner is failed and cannot be reused";
+            }
+            expect(sticky && capture_subject->receipt().replays == 0U,
+                "capture-rejected island remains failed after the capture ends");
+            reject_replay_capture([&] { eager.function(context, eager.user_data); });
+        }
+        const auto conv_type = manifest.tensors[2].ggml_type;
+        manifest.tensors[2].ggml_type = 2U; // Unsupported small type: prepare-only scope must unwind.
+        try {
+            reject_creation(config, d1->scope(), "HIP GDN small tensors support F32, F16 and BF16");
+        } catch (...) { manifest.tensors[2].ggml_type = conv_type; throw; }
+        manifest.tensors[2].ggml_type = conv_type;
+        expect(strix::current_hip_launch_context() == nullptr,
+            "prepare failure cannot leak the internally retained D1 scope");
+        { const auto recovered = create(config, d1->scope());
+          expect(recovered->receipt().replays == 0U, "fresh valid setup succeeds after a prepare failure without warmup"); }
         auto aliased_status = d1->scope();
         aliased_status.deferred_moe_status.arena_base = owner->memory.arena_base;
         reject_creation(config, aliased_status, "GDN island scratch, state and D1 record owners must be disjoint");
         aliased_status.deferred_moe_status.arena_base = owner->state.device_base;
         reject_creation(config, aliased_status, "GDN island scratch, state and D1 record owners must be disjoint");
 
+        // A non-GDN mapped tensor reaches the all-weight alias gate before
+        // selected-GDN residency checks; retain its real object and restore it.
+        auto& creation_weights = const_cast<strix::ModelRuntimeBinding&>(owner->weights->binding());
+        const auto embedding_address = creation_weights.tensors[9].address;
+        creation_weights.tensors[9].address = owner->memory.arena_base;
+        try {
+            reject_creation(config, d1->scope(), "GDN island writable owner aliases weights");
+        } catch (...) { creation_weights.tensors[9].address = embedding_address; throw; }
+        creation_weights.tensors[9].address = embedding_address;
+        // State's real allocation is larger than this component arena, so this
+        // alias passes native extent/type checks and reaches pairwise ownership.
+        if (owner->layout.device_total_bytes < owner->memory.arena_bytes)
+            throw std::logic_error("island overlap fixture needs state allocation to contain the arena extent");
+        const auto scratch_address = owner->memory.arena_base;
+        owner->memory.arena_base = owner->state.device_base;
+        try {
+            reject_creation(config, d1->scope(), "GDN island scratch, state and D1 record owners must be disjoint");
+        } catch (...) { owner->memory.arena_base = scratch_address; throw; }
+        owner->memory.arena_base = scratch_address;
+
         // Every malformed replay uses a fresh owner because rejection is sticky.
-        for (unsigned fault = 0; fault < 12U; ++fault) {
+        for (unsigned fault = 0; fault < 13U; ++fault) {
             auto subject = create(config, d1->scope());
             strix::HipGdnLauncherBundle subject_bundle(config);
             strix::ExecutionLauncherRegistry subject_registry;
@@ -1006,18 +1124,19 @@ void run_gdn_island_fixture() {
             auto& live_state = const_cast<strix::SessionStateMemoryBinding&>(*context.session_state_memory);
             const auto original_tensor = live_runtime.tensors[0];
             const auto original_state = live_state;
-            const auto original_type = manifest.tensors[0].ggml_type;
+            const auto original_type = manifest.tensors[2].ggml_type;
             const auto restore_metadata = [&] {
                 live_runtime.tensors[0] = original_tensor;
                 live_state = original_state;
-                manifest.tensors[0].ggml_type = original_type;
+                manifest.tensors[2].ggml_type = original_type;
             };
             if (fault == 0U) { bad_scope.deferred_moe_status = {}; }
             if (fault == 1U) { bad_scope.stream = hipStreamPerThread; }
             if (fault == 2U) { ++live_runtime.tensors[0].allocation_generation; }
             if (fault == 3U) { live_runtime.tensors[0].address += 16U; }
             if (fault == 4U) { live_runtime.tensors[0].bytes += 16U; }
-            if (fault == 5U) { manifest.tensors[0].ggml_type = 0U; }
+            if (fault == 5U) { manifest.tensors[2].ggml_type = 1U; }
+            if (fault == 12U) { manifest.tensors[2].ggml_type = 30U; }
             if (fault == 6U) { bad_context.writes = context.reads; }
             if (fault == 7U) { ++bad_scope.deferred_moe_status.allocation_generation; }
             if (fault == 8U) bad_context.resources = &bad_resources; // Equal values, wrong resource object.
@@ -1051,14 +1170,16 @@ void run_gdn_island_fixture() {
             }
             restore_metadata();
             if (alternate_stream_created) check(hipStreamDestroy(bad_scope.stream), "island wrong-stream teardown");
-            if (fault == 2U || fault == 3U || fault == 4U || fault == 10U)
+            if (fault == 2U || fault == 3U || fault == 4U || fault == 5U || fault == 10U || fault == 12U)
                 expect(rejection == "GDN island replay scope, owner or complete descriptor changed",
-                    "in-place generation/address/extent/state mutation reaches fixed descriptor rejection");
+                    "in-place generation/address/extent/type/state mutation reaches fixed descriptor rejection");
             expect(rejected && subject->receipt().replays == 0U && snapshot() == before,
                 "island scope/owner/generation/pointer/extent/type/alias/resource mutations reject before replay");
             bool sticky = false;
             try { const strix::HipLaunchScope scope(d1->scope()); arm.function(context, arm.user_data); }
-            catch (const std::exception&) { sticky = true; }
+            catch (const std::logic_error& error) {
+                sticky = std::string_view(error.what()) == "GDN island owner is failed and cannot be reused";
+            }
             expect(sticky && subject->receipt().replays == 0U && snapshot() == before,
                 "failed island owner cannot silently fall back or be reused with restored metadata");
         }
@@ -1909,6 +2030,155 @@ int main(int argc, char** argv) try {
     const auto first_conv = actual_conv;
     const auto first_matrix = actual_matrix;
     const auto first_output = actual_output;
+    if (argc == 1) {
+        // Production R1 dispatch, not the standalone recurrent-kernel seam.
+        // Distinct head/key/value seeds exercise every logical column and tile;
+        // snapshots include all scratch and state-owner bytes, including guards.
+        const std::array<strix::HipGdnRecurrentLayout, 4> layouts{
+            strix::HipGdnRecurrentLayout::baseline, strix::HipGdnRecurrentLayout::stride32,
+            strix::HipGdnRecurrentLayout::stride33, strix::HipGdnRecurrentLayout::transposed};
+        std::array<strix::HipGdnLauncherConfig, 4> layout_configs{config, config, config, config};
+        std::array<strix::ExecutionLauncher, 4> layout_launchers;
+        std::array<std::string, 4> layout_ids;
+        for (std::size_t index = 0; index < layouts.size(); ++index) {
+            layout_configs[index].recurrent_layout = layouts[index];
+            auto request = gdn_request; request.gdn_recurrent_layout = layouts[index];
+            strix::kernels::KernelRegistry variants;
+            strix::register_hip_gdn_kernel_variant(model, request, layout_configs[index], variants);
+            const auto variant = variants.variants().front();
+            layout_ids[index] = variant.id;
+            layout_launchers[index] = strix::make_hip_gdn_launcher(variant.id, &layout_configs[index]);
+            expect(variant.qualification == strix::kernels::QualificationStatus::experimental && !variant.graph_safe,
+                "explicit recurrent LDS organization remains experimental and eager only");
+            expect(variant.resources.lds_bytes == (layouts[index] == strix::HipGdnRecurrentLayout::stride33 ? 17152U : 16640U),
+                "selected LDS declaration includes physical stride, immutable deltas and graph broadcast");
+            if (index) {
+                expect(variant.id == layout_ids[0] + std::string(strix::gdn_recurrent_layout_marker(layouts[index])) &&
+                    layout_launchers[index].implementation_identity != layout_launchers[0].implementation_identity,
+                    "LDS choices bind distinct explicit IDs and organization identities");
+            }
+        }
+        for (std::size_t selected = 0; selected < layouts.size(); ++selected)
+            for (std::size_t configured = 0; configured < layouts.size(); ++configured) {
+                bool accepted = true;
+                try { static_cast<void>(strix::make_hip_gdn_launcher(layout_ids[selected], &layout_configs[configured])); }
+                catch (const std::invalid_argument&) { accepted = false; }
+                expect(accepted == (selected == configured), "LDS factory rejects every cross-bound organization");
+                strix::CompiledSerialExecution bound;
+                bound.execution_identity = memory.execution_identity;
+                bound.execution.steps.push_back(step);
+                strix::ExecutionKernelBinding binding;
+                binding.step_id = step.id; binding.op = step.op; binding.kernel_id = layout_ids[selected];
+                bound.bindings.bindings.push_back(binding);
+                strix::HipGdnLauncherBundle bundle(layout_configs[configured]);
+                strix::ExecutionLauncherRegistry registered;
+                accepted = true;
+                try { bundle.register_for_compiled_execution(bound, registered); }
+                catch (const std::invalid_argument&) { accepted = false; }
+                expect(accepted == (selected == configured), "LDS bundle admits exactly its selected organization");
+            }
+        const auto saved_hidden = hidden_values;
+        const auto saved_position = context.position;
+        std::vector<std::byte> saved_state(static_cast<std::size_t>(state_memory.device_bytes));
+        check(hipMemcpy(saved_state.data(), state_device, saved_state.size(), hipMemcpyDeviceToHost), "save pre-LDS state owner");
+        auto seed = std::vector<std::byte>(saved_state.size(), std::byte{0x5a});
+        std::vector<float> seeded_matrix(matrix_state.size());
+        for (std::size_t index = 0; index < seeded_matrix.size(); ++index) {
+            const auto lane = (index / 128U) % 128U;
+            const auto column = index % 128U;
+            const auto head = index / (128U * 128U);
+            seeded_matrix[index] = static_cast<float>(static_cast<int>((head * 97U + lane * 17U + column * 29U) % 251U) - 125) * 0.000003F;
+        }
+        std::memcpy(seed.data() + (matrix_address.address - state_memory.device_base), seeded_matrix.data(), matrix_address.bytes);
+        std::memcpy(seed.data() + (conv_address.address - state_memory.device_base), conv_state.data(), conv_address.bytes);
+        hipStream_t layout_stream = nullptr;
+        check(hipStreamCreateWithFlags(&layout_stream, hipStreamNonBlocking), "create LDS production stream");
+        strix::HipLaunchContext layout_scope; layout_scope.stream = layout_stream;
+        const auto snapshot_layout = [&] {
+            IslandSnapshot result;
+            result.arena.resize(static_cast<std::size_t>(arena.total_bytes));
+            result.state.resize(saved_state.size());
+            check(hipMemcpy(result.arena.data(), arena_pointer, result.arena.size(), hipMemcpyDeviceToHost), "read LDS full arena");
+            check(hipMemcpy(result.state.data(), state_device, result.state.size(), hipMemcpyDeviceToHost), "read LDS full state owner");
+            return result;
+        };
+        const auto sequence = [&](const strix::ExecutionLauncher& arm) {
+            check(hipMemcpy(state_device, seed.data(), seed.size(), hipMemcpyHostToDevice), "restore LDS asymmetric state owner");
+            std::vector<IslandSnapshot> results;
+            for (std::uint64_t position = 0; position < 4U; ++position) {
+                context.position = position;
+                for (std::size_t feature = 0; feature < hidden_values.size(); ++feature)
+                    hidden_values[feature] = float_to_bf16(static_cast<float>(static_cast<int>((feature * 31U + position * 43U) % 97U) - 48) / 113.0F);
+                poison_arena(layout_stream);
+                check(hipStreamSynchronize(layout_stream), "drain LDS input poison");
+                const auto before = snapshot_layout();
+                { const strix::HipLaunchScope scope(layout_scope); arm.preflight(context, arm.user_data); }
+                expect(snapshot_layout() == before, "LDS production pure preflight leaves all owner bytes unchanged");
+                { const strix::HipLaunchScope scope(layout_scope); arm.function(context, arm.user_data); }
+                check(hipStreamSynchronize(layout_stream), "drain LDS production row");
+                results.push_back(snapshot_layout());
+            }
+            return results;
+        };
+        const auto reference = sequence(layout_launchers[0]);
+        expect(reference.front().state != reference.back().state, "LDS sequence witness changes recurrent/convolution state");
+        for (std::size_t index = 1; index < layouts.size(); ++index) {
+            for (unsigned repeat = 0; repeat < 2U; ++repeat)
+                expect(sequence(layout_launchers[index]) == reference,
+                    "production LDS32/33/transposed preserve full arena and state bytes through repeated causal rows");
+            const auto before = snapshot_layout();
+            hipGraph_t rejected_graph = nullptr;
+            bool rejected = false; std::string rejection;
+            check(hipStreamBeginCapture(layout_stream, hipStreamCaptureModeThreadLocal), "begin LDS rejection capture");
+            {
+                const strix::HipLaunchScope scope(layout_scope);
+                try { layout_launchers[index].function(context, layout_launchers[index].user_data); }
+                catch (const std::invalid_argument& error) { rejected = true; rejection = error.what(); }
+            }
+            check(hipStreamEndCapture(layout_stream, &rejected_graph), "end LDS rejection capture");
+            std::size_t nodes = 0; check(hipGraphGetNodes(rejected_graph, nullptr, &nodes), "count LDS rejected nodes");
+            expect(rejected && rejection == "GDN recurrent LDS layouts cannot be captured" && nodes == 0U && snapshot_layout() == before,
+                "LDS capture rejects at its own gate with zero nodes and unchanged full owner payloads");
+            check(hipGraphDestroy(rejected_graph), "destroy LDS rejected graph");
+            auto graph_config = layout_configs[index]; graph_config.enable_device_graph_inputs = true;
+            rejected = false; rejection.clear();
+            try { static_cast<void>(strix::make_hip_gdn_launcher(layout_ids[index], &graph_config)); }
+            catch (const std::invalid_argument& error) { rejected = true; rejection = error.what(); }
+            expect(rejected && rejection == "GDN recurrent LDS layouts support eager execution only",
+                "LDS whole-graph configuration cannot acquire a launcher");
+            std::array<strix::ExecutionDispatchContext, 2> rows{context, context};
+            for (unsigned mixed = 0; mixed < 2U; ++mixed) {
+                rejected = false; rejection.clear();
+                try {
+                    if (mixed) strix::gdn_known_window_r2_f32_gates_preflight(rows, layout_configs[index]);
+                    else strix::gdn_known_window_r2_preflight(rows, layout_configs[index]);
+                } catch (const std::invalid_argument& error) { rejected = true; rejection = error.what(); }
+                expect(rejected && rejection == "GDN known-window R2 requires the baseline recurrent LDS layout" && snapshot_layout() == before,
+                    "both closed R2 formats reject unqualified LDS composition before any state effects");
+            }
+            auto mismatched = gdn_request;
+            rejected = false; rejection.clear();
+            try { strix::kernels::KernelRegistry unused; strix::register_hip_gdn_kernel_variant(model, mismatched, layout_configs[index], unused); }
+            catch (const std::invalid_argument& error) { rejected = true; rejection = error.what(); }
+            expect(rejected && rejection == "GDN recurrent LDS request/config mismatch", "registry binds explicit LDS request to actual config");
+            auto graph_request = gdn_request;
+            graph_request.gdn_recurrent_layout = layouts[index]; graph_request.require_graph_safe = true;
+            rejected = false; rejection.clear();
+            try { strix::kernels::KernelRegistry unused; strix::register_hip_gdn_kernel_variant(model, graph_request, layout_configs[index], unused); }
+            catch (const std::invalid_argument& error) { rejected = true; rejection = error.what(); }
+            expect(rejected && rejection == "GDN recurrent LDS layouts register eager variants only",
+                "public registry cannot label an LDS candidate graph safe");
+        }
+        auto invalid_layout = config; invalid_layout.recurrent_layout = static_cast<strix::HipGdnRecurrentLayout>(99U);
+        bool invalid_rejected = false;
+        try { static_cast<void>(strix::make_hip_gdn_launcher(layout_ids[0], &invalid_layout)); }
+        catch (const std::invalid_argument& error) { invalid_rejected = std::string_view(error.what()) == "GDN recurrent LDS layout is invalid"; }
+        expect(invalid_rejected, "invalid LDS enum cannot silently select a candidate");
+        check(hipStreamDestroy(layout_stream), "destroy LDS production stream");
+        hidden_values = saved_hidden; context.position = saved_position;
+        check(hipMemcpy(state_device, saved_state.data(), saved_state.size(), hipMemcpyHostToDevice), "restore pre-LDS state owner");
+        check(hipMemcpy(arena_pointer, first_arena.data(), first_arena.size(), hipMemcpyHostToDevice), "restore pre-LDS arena");
+    }
     config.virtual_q8_input_projections = candidate_enabled;
     config.prefetch_q8_input_projections = prefetch_enabled;
     config.wave8_q8_input_projections = wave8_enabled;

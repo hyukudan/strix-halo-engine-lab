@@ -1,10 +1,35 @@
 #pragma once
 
 #include <cstdint>
+#include <array>
+#include <atomic>
+#include <string_view>
+#include <stdexcept>
 #include <span>
 #include <vector>
 
 namespace strix {
+inline constexpr std::string_view qsa_hierarchical_selection_marker = ".hierarchical-top512-v1";
+inline constexpr std::uint64_t qsa_hierarchical_selection_max_visible = 131072;
+[[nodiscard]] inline std::string_view qsa_gqa_organization_marker(std::uint32_t heads) {
+    switch (heads) {
+    case 1: return {};
+    case 2: return ".gqa-heads2-v1";
+    case 4: return ".gqa-heads4-v1";
+    default: throw std::invalid_argument("QSA heads per block must be 1, 2 or 4");
+    }
+}
+struct QsaHierarchicalSelectionLayout {
+    std::uint64_t scratch_items = 0;
+    std::uint64_t scratch_bytes = 0; // EACH of ping and pong; eight-byte candidates.
+};
+[[nodiscard]] QsaHierarchicalSelectionLayout build_qsa_hierarchical_selection_layout(
+    std::uint64_t maximum_visible);
+struct QsaHierarchicalSelectionStats {
+    std::atomic<std::uint64_t> submissions{0};
+    std::array<std::atomic<std::uint64_t>, 48> layer_submissions{};
+};
+
 
 struct QsaCompressedSelectionPlan {
     std::uint64_t token_budget = 0;

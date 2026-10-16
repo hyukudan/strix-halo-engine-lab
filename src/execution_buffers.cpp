@@ -163,7 +163,7 @@ ExecutionBufferPlan build_serial_execution_buffer_plan(
 
     const auto indexed_workspace =
         build_indexed_attention_workspace_layout(
-            model);
+            model, 256, request.qsa_hierarchical_selection, request.qsa_gqa_heads_per_block);
     plan.indexed_attention_workspace_bytes =
         checked_mul(
             request.logical_rows,

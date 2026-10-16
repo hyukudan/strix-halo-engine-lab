@@ -288,7 +288,7 @@ KnownWindowResult execute_known_prefix_window_eager(
         throw std::overflow_error("known window logical row-step count overflow");
     std::vector<std::array<ExecutionDispatchContext, 2>> contexts(steps);
     std::vector<const KnownWindowR2Entry*> selected(steps, nullptr);
-    std::array<bool, 3> seen{};
+    std::array<bool, known_window_r2_variant_slots> seen{};
     for (const auto& entry : r2_entries) {
         const auto id = static_cast<std::uint32_t>(entry.variant);
         if (id == 0 || id >= seen.size() || seen[id] || !entry.config || !entry.preflight || !entry.launch)
@@ -390,6 +390,7 @@ KnownWindowResult execute_known_prefix_window_eager(
             if (selected[i]) {
                 selected[i]->launch(contexts[i], selected[i]->config);
                 ++result.r2_dispatches; ++result.execution.kernel_steps;
+                ++result.r2_variant_dispatches[static_cast<std::uint32_t>(window.r2_variant[i])];
                 ++result.execution.completed_steps; result.execution.completion_order.push_back(step.id);
                 result.execution.state.publish_write(step.writes_state);
                 result.execution.state.publish_write(step.writes_state);

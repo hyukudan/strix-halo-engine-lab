@@ -40,6 +40,37 @@ constexpr std::size_t transfer_chunk = 8U * 1024U * 1024U;
 void require(bool condition, const char* reason) {
     if (!condition) throw std::invalid_argument(reason);
 }
+// This driver deliberately qualifies the canonical mixed-format mapping, not
+// the older all-five-Q8 variant. Counters are source ledgers, not timing.
+using VariantCounts = std::array<std::uint32_t, strix::known_window_r2_variant_slots>;
+constexpr VariantCounts expected_variants{0, 48, 0, 36};
+VariantCounts variant_steps(const strix::CompiledKnownPrefixWindow& window) {
+    VariantCounts counts{};
+    for (const auto variant : window.r2_variant) {
+        const auto index = static_cast<std::uint32_t>(variant);
+        require(index < counts.size(), "unknown compiled known-window variant");
+        if (index) ++counts[index];
+    }
+    return counts;
+}
+void require_mixed_window(const strix::CompiledKnownPrefixWindow& window) {
+    require(window.r2_steps == 84 && variant_steps(window) == expected_variants &&
+        window.projection_launches_saved == 252 &&
+        window.logical_projection_weight_bytes_avoided == 2456616960ULL,
+        "real model does not admit exactly 48 shared, zero all-Q8 GDN and 36 mixed GDN R2 steps");
+}
+bool mixed_dispatch_counts(const strix::KnownWindowResult& result) {
+    return result.r2_dispatches == 84 && result.row_loop_dispatches == 708 &&
+        result.r2_variant_dispatches == expected_variants && result.projection_launches_saved == 252 &&
+        result.logical_projection_weight_bytes_avoided == 2456616960ULL;
+}
+std::string variant_counts_json(const VariantCounts& counts) {
+    std::ostringstream out;
+    out << '[';
+    for (std::size_t i = 0; i < counts.size(); ++i) out << (i ? "," : "") << counts[i];
+    out << ']';
+    return out.str();
+}
 void hip_check(hipError_t status, const char* operation) {
     if (status != hipSuccess)
         throw std::runtime_error(std::string(operation) + ": " + hipGetErrorString(status));
@@ -201,8 +232,8 @@ std::shared_ptr<Owners> load(const Options& args, const strix::HipLauncherCatalo
     owner->access = strix::compile_execution_tensor_access_plan(owner->serial.execution, owner->manifest,
         index, strix::build_serial_execution_tensor_requirements(owner->serial.execution));
     owner->window = strix::compile_known_prefix_window(owner->model, owner->serial,
-        owner->manifest, owner->access, {true, true});
-    require(owner->window.r2_steps == 84, "real model does not admit all 48 shared and 36 GDN R2 steps");
+        owner->manifest, owner->access, {true, true, true});
+    require_mixed_window(owner->window);
     const auto projections = strix::q8_projection_organization::build_manifest_plan(
         owner->model, owner->manifest, false, true, true, false);
     strix::SerialSessionStateLayoutRequest state_request;
@@ -447,7 +478,7 @@ std::uint64_t owner_negative_cases(const std::shared_ptr<Owners>& owner,
     strix::register_complete_hip_kernel_catalog(owner->model, deferred_binding, deferred_config, deferred_kernels);
     const auto deferred_serial = strix::compile_serial_execution(owner->model, deferred_kernels, deferred_binding, buffers, 256);
     const auto deferred_window = strix::compile_known_prefix_window(owner->model, deferred_serial,
-        owner->manifest, owner->access, {true, true});
+        owner->manifest, owner->access, {true, true, true});
     auto deferred_scratch = owner->memory->scratch();
     deferred_scratch.execution_identity = deferred_serial.execution_identity;
     auto deferred_resources = owner->resources;
@@ -592,12 +623,12 @@ int qualify(const Options& args) {
         session.state_layout_identity == prefix.state_layout_identity;
     require(hash_file(args.teacher) == args.teacher_sha && hash_file(args.model) == args.model_sha &&
         hash_file(executable) == executable_sha, "input/model/executable content changed during qualification");
-    const bool dispatch_counts_equal = owner->window.r2_steps == 84 && result.r2_dispatches == 84 &&
-        result.row_loop_dispatches == 708;
+    const bool dispatch_counts_equal = variant_steps(owner->window) == expected_variants &&
+        mixed_dispatch_counts(result);
     const bool passed = full_logits_equal && all_state_equal && lineage_equal && metadata_equal && dispatch_counts_equal;
     const auto pending = args.output / "result.pending.json";
     auto output = output_file(pending);
-    output << "{\"schema\":\"known-prefix-model-qualification-v1\",\"finished\":true,\"passed\":"
+    output << "{\"schema\":\"known-prefix-model-qualification-v2\",\"finished\":true,\"passed\":"
         << (passed ? "true" : "false") << ",\"profile\":" << quote(args.profile)
         << ",\"model_sha256\":" << quote(args.model_sha) << ",\"model_content_identity\":"
         << quote(hex(owner->mapped->content_identity())) << ",\"teacher_sha256\":" << quote(args.teacher_sha)
@@ -611,6 +642,8 @@ int qualify(const Options& args) {
         << ",\"window_execution_identity\":" << owner->window.window_execution_identity
         << ",\"window_kernel_plan_identity\":" << owner->window.window_kernel_plan_identity
         << ",\"r2_steps\":" << owner->window.r2_steps
+        << ",\"r2_variant_steps\":" << variant_counts_json(variant_steps(owner->window))
+        << ",\"r2_variant_dispatches\":" << variant_counts_json(result.r2_variant_dispatches)
         << ",\"logical_projection_weight_bytes_avoided\":" << owner->window.logical_projection_weight_bytes_avoided
         << ",\"projection_launches_saved\":" << owner->window.projection_launches_saved
         << ",\"r2_dispatches\":" << result.r2_dispatches << ",\"row_loop_dispatches\":" << result.row_loop_dispatches

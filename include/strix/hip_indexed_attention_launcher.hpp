@@ -6,6 +6,7 @@
 #include "strix/model_contract.hpp"
 #include "strix/graph_attention_state.hpp"
 #include "strix/qsa_input_prefetch.hpp"
+#include "strix/qsa_selection_plan.hpp"
 
 #include <string>
 #include <memory>
@@ -23,6 +24,10 @@ struct HipIndexedAttentionLauncherConfig {
     bool wave8_q8_output = false;
     std::vector<std::uint32_t> prefetch_eligible_layers;
     std::shared_ptr<qsa_input_prefetch::RuntimeDispatchStats> prefetch_stats;
+    bool qsa_hierarchical_selection = false;
+    std::uint32_t qsa_gqa_heads_per_block = 1;
+    std::shared_ptr<QsaHierarchicalSelectionStats> selection_stats;
+    std::shared_ptr<QsaHierarchicalSelectionStats> gqa_stats;
 };
 
 enum class HipQsaInputProjectionMode {legacy256,virtual256,prefetch8};

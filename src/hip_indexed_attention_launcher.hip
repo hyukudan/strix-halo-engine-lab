@@ -7,9 +7,9 @@
 #include "strix/hip_launch_context.hpp"
 #include "strix/graph_operator_control.hpp"
 #include "strix/q8_projection_organization.hpp"
-#ifdef STRIX_BUILD_QSA_GQA_REUSE_DIAGNOSTIC
+#include "strix/hip_qsa_selection_diagnostic.hpp"
+#include "strix/deferred_moe_status.hpp"
 #include "strix/hip_qsa_gqa_reuse_diagnostic.hpp"
-#endif
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -169,6 +169,10 @@ struct WorkspacePointers {
     float* current_v = nullptr;
     float* attention_scores = nullptr;
     float* attention_output = nullptr;
+    qsa_selection_diagnostic::Item* selection_ping = nullptr;
+    qsa_selection_diagnostic::Item* selection_pong = nullptr;
+    std::uint32_t* selection_status = nullptr;
+    std::uint64_t* attention_position = nullptr;
 };
 
 void hash_u64(
@@ -223,6 +227,15 @@ void validate_config(
         throw std::invalid_argument(error);
     }
     qsa_input_prefetch::validate_layers(config.model,config.prefetch_q8_input,config.prefetch_eligible_layers);
+    (void)qsa_gqa_organization_marker(config.qsa_gqa_heads_per_block);
+    if (config.qsa_gqa_heads_per_block != 1 && (config.enable_device_graph_inputs || config.model.head_dim != 256 ||
+        config.model.attention_heads > 64 || config.model.hidden_layers > 48 ||
+        config.model.indexer_budget != 2048 || config.model.indexer_compress_ratio != 4))
+        throw std::invalid_argument("QSA GQA organization requires eager head256/budget2048/compression4");
+    if (config.qsa_hierarchical_selection && (config.enable_device_graph_inputs ||
+        config.model.indexer_budget != 2048 || config.model.indexer_compress_ratio != 4 ||
+        config.model.hidden_layers > 48))
+        throw std::invalid_argument("hierarchical QSA requires eager budget2048/compression4 and at most48 layers");
     if (config.activation !=
         HipActivationStorage::bf16) {
         throw std::invalid_argument(
@@ -1194,6 +1207,29 @@ __global__ void fill_visible_indices_kernel(
         selected[index] =
             index;
     }
+}
+
+// Device-owned control storage avoids a borrowed host async-copy lifetime.
+__global__ void prepare_qsa_gqa_control(std::uint64_t* position, std::uint32_t* status,
+    std::uint64_t scalar_position, bool preserve_selection_error) {
+    if (threadIdx.x == 0) {
+        *position = scalar_position;
+        if (!preserve_selection_error) *status = 0;
+    }
+}
+__global__ void publish_qsa_attention_status(const std::uint32_t* local, DeferredMoeFirstError* first_error) {
+    if (threadIdx.x == 0) merge_deferred_moe_first_error(*first_error, *local, DeferredMoeDomain::qsa_attention);
+}
+
+// Local status belongs to this QSA workspace, not to the D1 domain word.
+// Preserve the complete first D1 error and make indices safe even on rejection;
+// the D1 completion fence rejects the token before host publication.
+__global__ void publish_qsa_selection_status(const std::uint32_t* local,
+    DeferredMoeFirstError* first_error, std::uint32_t* selected, std::uint32_t count) {
+    const auto bits = *local;
+    const auto index = static_cast<std::uint32_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (bits && index < count) selected[index] = 0;
+    if (index == 0) merge_deferred_moe_first_error(*first_error, bits, DeferredMoeDomain::qsa_selection);
 }
 
 __global__ void select_blocks_kernel(
@@ -2259,6 +2295,10 @@ WorkspacePointers workspace_pointers(
         reinterpret_cast<float*>(
             base +
             layout.attention_output_offset),
+        layout.selection_ping_bytes ? reinterpret_cast<qsa_selection_diagnostic::Item*>(base + layout.selection_ping_offset) : nullptr,
+        layout.selection_pong_bytes ? reinterpret_cast<qsa_selection_diagnostic::Item*>(base + layout.selection_pong_offset) : nullptr,
+        layout.selection_status_bytes ? reinterpret_cast<std::uint32_t*>(base + layout.selection_status_offset) : nullptr,
+        layout.attention_position_bytes ? reinterpret_cast<std::uint64_t*>(base + layout.attention_position_offset) : nullptr,
     };
 }
 
@@ -2316,6 +2356,20 @@ PreparedIndexedLaunch prepare_indexed_attention_launch(
         if (capture != hipStreamCaptureStatusNone)
             throw std::invalid_argument("wave8 QSA output supports eager execution only");
     }
+    if (config.qsa_hierarchical_selection || config.qsa_gqa_heads_per_block != 1) {
+        const auto* scope = current_hip_launch_context();
+        if (!scope || scope->graph_capture || !scope->stream || scope->stream == hipStreamLegacy ||
+            scope->stream == hipStreamPerThread || !hip_deferred_moe_status() ||
+            scope->deferred_moe_status.execution_identity != context.execution_identity ||
+            scope->deferred_moe_status.arena_bytes != 8 || !scope->deferred_moe_status.allocation_generation ||
+            scope->deferred_moe_status.arena_base % alignof(DeferredMoeFirstError) ||
+            scope->deferred_moe_status.arena_base > UINTPTR_MAX - 8U)
+            throw std::invalid_argument("hierarchical QSA requires its current owned eager D1 scope");
+        hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
+        check_hip(hipStreamIsCapturing(scope->stream, &capture), "HIP hierarchical QSA capture query");
+        if (capture != hipStreamCaptureStatusNone)
+            throw std::invalid_argument("hierarchical QSA supports eager execution only");
+    }
     const auto& model =
         config.model;
 
@@ -2331,7 +2385,7 @@ PreparedIndexedLaunch prepare_indexed_attention_launch(
 
     const auto workspace_layout =
         build_indexed_attention_workspace_layout(
-            model);
+            model, 256, config.qsa_hierarchical_selection, config.qsa_gqa_heads_per_block);
     if (temporary.bytes <
         workspace_layout.total_bytes) {
         throw std::invalid_argument(
@@ -2522,6 +2576,48 @@ PreparedIndexedLaunch prepare_indexed_attention_launch(
         for(unsigned i=0;i<writes.size();++i){if(!valid(writes[i]))throw std::invalid_argument("QSA prefetch invalid writable owner");for(auto view:reads)if(overlap(writes[i],view))throw std::invalid_argument("QSA prefetch writable/read owner overlap");for(unsigned j=0;j<i;++j)if(overlap(writes[i],writes[j]))throw std::invalid_argument("QSA prefetch writable owner overlap");}
     }
 
+    if (config.qsa_hierarchical_selection || config.qsa_gqa_heads_per_block != 1) {
+        if ((config.qsa_hierarchical_selection && session_layout.context_tokens > qsa_hierarchical_selection_max_visible) ||
+            session_layout.context_tokens > 262144 || temporary.address % 8U ||
+            !context.layer || *context.layer >= 48 || device_graph)
+            throw std::invalid_argument("hierarchical QSA context, layer or workspace alignment is outside admission");
+        const auto& record = current_hip_launch_context()->deferred_moe_status;
+        struct Range { std::uintptr_t address; std::uint64_t bytes; };
+        const auto valid = [](Range x) { return x.address && x.bytes && x.bytes <= UINTPTR_MAX - x.address; };
+        const auto overlaps = [](Range x, Range y) { return x.address < y.address + y.bytes && y.address < x.address + x.bytes; };
+        const Range status{record.arena_base, record.arena_bytes};
+        std::array<Range, 11> reads{};
+        reads[0] = {input.address, input.bytes};
+        std::size_t read_index = 1;
+        for (const auto* tensor : {&tensors.q, &tensors.k, &tensors.v, &tensors.out, &tensors.q_norm,
+            &tensors.k_norm, &tensors.index_q, &tensors.index_k, &tensors.index_q_norm, &tensors.index_k_norm})
+            reads[read_index++] = {tensor->runtime->address, tensor->runtime->bytes};
+        const std::array<Range, 4> writes{{{temporary.address, temporary.bytes}, {output.address, output.bytes},
+            {kv_state.address, kv_state.bytes}, {raw_state.address, raw_state.bytes}}};
+        for (const auto read : reads)
+            if (!valid(read) || overlaps(status, read)) throw std::invalid_argument("hierarchical QSA invalid or status-aliasing read owner");
+        for (std::size_t i = 0; i < writes.size(); ++i) {
+            if (!valid(writes[i]) || overlaps(status, writes[i]))
+                throw std::invalid_argument("hierarchical QSA invalid or status-aliasing write owner");
+            for (const auto read : reads) if (overlaps(writes[i], read))
+                throw std::invalid_argument("hierarchical QSA writable/read owner overlap");
+            for (std::size_t j = 0; j < i; ++j) if (overlaps(writes[i], writes[j]))
+                throw std::invalid_argument("hierarchical QSA writable owner overlap");
+        }
+        hipPointerAttribute_t attributes{};
+        check_hip(hipPointerGetAttributes(&attributes, reinterpret_cast<const void*>(record.arena_base)),
+            "HIP hierarchical QSA status device");
+        int device = -1;
+        check_hip(hipGetDevice(&device), "HIP hierarchical QSA current device");
+        if (attributes.type != hipMemoryTypeDevice || attributes.isManaged || attributes.device != device)
+            throw std::invalid_argument("hierarchical QSA D1 record is not on the current device");
+        hipDeviceptr_t allocation{}; std::size_t bytes = 0;
+        check_hip(hipMemGetAddressRange(&allocation, &bytes, reinterpret_cast<hipDeviceptr_t>(record.arena_base)),
+            "HIP hierarchical QSA status extent");
+        const auto base = reinterpret_cast<std::uintptr_t>(allocation);
+        if (record.arena_base < base || record.arena_base - base > bytes || 8U > bytes - (record.arena_base - base))
+            throw std::invalid_argument("hierarchical QSA D1 record exceeds physical owner");
+    }
     if (device_graph) {
         const auto& scope = *current_hip_launch_context();
         if (!config.enable_device_graph_inputs || scope.context_tokens != session_layout.context_tokens ||
@@ -2546,6 +2642,8 @@ PreparedIndexedLaunch prepare_indexed_attention_launch(
              tensor->manifest->ggml_type == 0 ? 4U : 2U});
         (void)prepare_graph_operator_control(request);
     }
+    if (config.qsa_hierarchical_selection || config.qsa_gqa_heads_per_block != 1)
+        check_hip(hipPeekAtLastError(), "HIP hierarchical QSA preexisting error");
     return {input, output, temporary, workspace_layout, workspace, &session_layout,
             dynamic_position, device_graph, kv_state, raw_state, tensors, hidden,
             attention_heads, kv_heads, head_dim, attention_width, kv_width,
@@ -2729,6 +2827,24 @@ void launch_indexed_attention(const ExecutionDispatchContext& context, void* use
             tensors.index_k_norm,
             model,
             std::max(complete_blocks, 1U), dynamic_selection);
+        if (config.qsa_hierarchical_selection) {
+            using namespace qsa_selection_diagnostic;
+            const Shape shape{complete_blocks, visible - complete_blocks * ratio};
+            const auto items = scratch_items(shape);
+            check_hip(hipMemsetAsync(workspace.selection_status, 0, sizeof(std::uint32_t), hip_execution_stream()),
+                "HIP hierarchical QSA local status reset");
+            enqueue(shape, {workspace.block_scores, complete_blocks}, {workspace.selected_indices, selected_count},
+                {workspace.selection_ping, items}, {workspace.selection_pong, items},
+                {workspace.selection_status, 1}, hip_execution_stream());
+            hipLaunchKernelGGL(publish_qsa_selection_status, dim3((selected_count + kThreads - 1U) / kThreads),
+                dim3(kThreads), 0, hip_execution_stream(), workspace.selection_status,
+                reinterpret_cast<DeferredMoeFirstError*>(hip_deferred_moe_status()), workspace.selected_indices, selected_count);
+            check_hip(hipGetLastError(), "HIP hierarchical QSA deferred status publication");
+            if (config.selection_stats) {
+                config.selection_stats->submissions.fetch_add(1, std::memory_order_relaxed);
+                config.selection_stats->layer_submissions[*context.layer].fetch_add(1, std::memory_order_relaxed);
+            }
+        } else {
         hipLaunchKernelGGL(
             select_blocks_kernel,
             dim3(1),
@@ -2743,6 +2859,7 @@ void launch_indexed_attention(const ExecutionDispatchContext& context, void* use
         check_hip(
             hipGetLastError(),
             "HIP indexed-attention top-k block selection");
+        }
     }
 
     // Main Q/K/V projections.
@@ -2803,6 +2920,32 @@ void launch_indexed_attention(const ExecutionDispatchContext& context, void* use
         hipGetLastError(),
         "HIP indexed-attention KV state update");
 
+    if (config.qsa_gqa_heads_per_block != 1) {
+        hipLaunchKernelGGL(prepare_qsa_gqa_control, dim3(1), dim3(1), 0, hip_execution_stream(),
+            workspace.attention_position, workspace.selection_status, context.position,
+            config.qsa_hierarchical_selection && complete_blocks > block_topk);
+        check_hip(hipGetLastError(), "HIP QSA grouped attention control");
+        using namespace qsa_gqa_reuse_diagnostic;
+        const Shape shape{attention_heads, kv_heads, head_dim,
+            checked_u32(prepared.session_layout->context_tokens, "QSA GQA context")};
+        const auto maximum = maximum_selected_tokens(shape);
+        const Bindings views{
+            {reinterpret_cast<std::uintptr_t>(workspace.q_gate), static_cast<std::uint64_t>(q_gate_width) * sizeof(float)},
+            {kv_state.address, static_cast<std::uint64_t>(shape.context_tokens) * kv_width * 2U * sizeof(std::uint16_t)},
+            {reinterpret_cast<std::uintptr_t>(workspace.selected_indices), static_cast<std::uint64_t>(maximum) * sizeof(std::uint32_t)},
+            {reinterpret_cast<std::uintptr_t>(workspace.attention_position), sizeof(std::uint64_t)},
+            {reinterpret_cast<std::uintptr_t>(workspace.selection_status), sizeof(std::uint32_t)},
+            {reinterpret_cast<std::uintptr_t>(workspace.attention_scores), static_cast<std::uint64_t>(attention_heads) * maximum * sizeof(float)},
+            {reinterpret_cast<std::uintptr_t>(workspace.attention_output), static_cast<std::uint64_t>(attention_width) * sizeof(float)}};
+        enqueue(shape, views, config.qsa_gqa_heads_per_block == 2 ? Mode::heads2 : Mode::heads4, hip_execution_stream());
+        hipLaunchKernelGGL(publish_qsa_attention_status, dim3(1), dim3(1), 0, hip_execution_stream(),
+            workspace.selection_status, reinterpret_cast<DeferredMoeFirstError*>(hip_deferred_moe_status()));
+        check_hip(hipGetLastError(), "HIP QSA grouped attention deferred publication");
+        if (config.gqa_stats) {
+            config.gqa_stats->submissions.fetch_add(1, std::memory_order_relaxed);
+            config.gqa_stats->layer_submissions[*context.layer].fetch_add(1, std::memory_order_relaxed);
+        }
+    } else {
     const auto score_blocks64 = prepare_indexed_attention_score_grid(attention_heads, selected_count);
     hipLaunchKernelGGL(
         attention_score_kernel,
@@ -2868,6 +3011,8 @@ void launch_indexed_attention(const ExecutionDispatchContext& context, void* use
         hipGetLastError(),
         "HIP indexed-attention value/gate launch");
 
+    }
+
     launch_linear_float_to_bf16(
         tensors.out,
         workspace.attention_output,
@@ -2913,6 +3058,8 @@ std::string kernel_id(
         ".c" +
         std::to_string(
             request.request_concurrency) + (request.device_graph_inputs ? ".device" : ".scalar") +
+        std::string(qsa_gqa_organization_marker(config.qsa_gqa_heads_per_block)) +
+        (config.qsa_hierarchical_selection ? std::string(qsa_hierarchical_selection_marker) : "") +
         (config.wave8_q8_output ? std::string(q8_projection_organization::qsa_output_wave8_marker) : "") +
         (config.prefetch_q8_input ? std::string(qsa_input_prefetch::kernel_suffix) : "");
 }
@@ -2962,6 +3109,10 @@ std::uint64_t implementation_identity(
     hash_u64(hash, config.model.max_position_embeddings);
     if(config.prefetch_q8_input){hash_u64(hash,0x5153415052465631ULL);for(auto layer:config.prefetch_eligible_layers)hash_u64(hash,layer);}
     if(config.wave8_q8_output) hash_u64(hash, 0x5153414f57385631ULL);
+    if(config.qsa_hierarchical_selection) hash_u64(hash, 0x515341544f503531ULL);
+    if(config.qsa_gqa_heads_per_block != 1) {
+        hash_u64(hash, 0x5153414751417631ULL); hash_u64(hash, config.qsa_gqa_heads_per_block);
+    }
     return hash;
 }
 
@@ -3016,6 +3167,14 @@ void register_hip_indexed_attention_kernel_variant(
         throw std::invalid_argument(error);
     }
     validate_config(config);
+    if (request.qsa_gqa_heads_per_block != config.qsa_gqa_heads_per_block)
+        throw std::invalid_argument("QSA GQA request/config mismatch");
+    if (config.qsa_gqa_heads_per_block != 1 && (!request.deferred_moe_status || request.device_graph_inputs || request.require_graph_safe))
+        throw std::invalid_argument("QSA GQA organization registers eager D1 variants only");
+    if (request.qsa_hierarchical_selection != config.qsa_hierarchical_selection)
+        throw std::invalid_argument("hierarchical QSA request/config mismatch");
+    if (config.qsa_hierarchical_selection && (!request.deferred_moe_status || request.device_graph_inputs || request.require_graph_safe))
+        throw std::invalid_argument("hierarchical QSA registers eager D1 variants only");
     if (request.wave8_q8_qsa_output != config.wave8_q8_output)
         throw std::invalid_argument("wave8 QSA output request/config mismatch");
     if (config.wave8_q8_output && (request.device_graph_inputs || request.require_graph_safe))
@@ -3086,7 +3245,10 @@ void register_hip_indexed_attention_kernel_variant(
         sizeof(float);
     variant.resources.scratch_bytes =
         build_indexed_attention_workspace_layout(
-            model).total_bytes;
+            model, 256, config.qsa_hierarchical_selection, config.qsa_gqa_heads_per_block).total_bytes;
+    if (config.qsa_hierarchical_selection) variant.resources.lds_bytes = 8192;
+    if (config.qsa_gqa_heads_per_block != 1) variant.resources.lds_bytes =
+        std::max(variant.resources.lds_bytes, config.qsa_gqa_heads_per_block * 1024U);
     variant.numerics.input_precision =
         "bf16";
     variant.numerics.accumulator_precision =
@@ -3105,6 +3267,8 @@ void register_hip_indexed_attention_kernel_variant(
     variant.compiler_identity =
         config.prefetch_q8_input ? "hip-gfx1151-indexed-attention-v3-prefetch8-virtual256-q8-qsa-input" : "hip-gfx1151-indexed-attention-v2";
     if (config.wave8_q8_output) variant.compiler_identity += ":wave8-q8-qsa-output-v1";
+    if (config.qsa_hierarchical_selection) variant.compiler_identity += ":hierarchical-top512-v1";
+    if (config.qsa_gqa_heads_per_block != 1) variant.compiler_identity += ":gqa-heads" + std::to_string(config.qsa_gqa_heads_per_block) + "-v1";
     variant.measured_seconds = 0.0;
 
     registry.add(
@@ -3121,7 +3285,9 @@ make_hip_indexed_attention_launcher(
             "HIP indexed-attention launcher requires id and config");
     }
     validate_config(*config);
-    if (config->wave8_q8_output ||
+    if (config->wave8_q8_output || config->qsa_hierarchical_selection || config->qsa_gqa_heads_per_block != 1 ||
+        kernel_id_value.find(".gqa-heads2-v1") != std::string::npos || kernel_id_value.find(".gqa-heads4-v1") != std::string::npos ||
+        kernel_id_value.find(qsa_hierarchical_selection_marker) != std::string::npos ||
         kernel_id_value.find(q8_projection_organization::qsa_output_wave8_marker) != std::string::npos) {
         ExecutionBindingRequest request;
         if (kernel_id_value != kernel_id(request, *config))
@@ -3279,9 +3445,8 @@ void launch_hip_graph_attention_state(const GraphAttentionStatePlan& plan,
     throw std::logic_error("unreachable attention norm encoding");
 }
 
-#ifdef STRIX_BUILD_QSA_GQA_REUSE_DIAGNOSTIC
 namespace {
-// Test-only grouping of independent heads. Each head retains the incumbent
+// Shared grouping of independent heads. Each head retains the incumbent
 // 256-feature product/store and 128->1 tree. Only the BF16 K load is shared.
 template <std::uint32_t Heads>
 __global__ void qsa_gqa_score_diagnostic_kernel(
@@ -3495,6 +3660,5 @@ void enqueue_scores(Shape shape, const Bindings& bindings, Mode mode, hipStream_
     enqueue_impl(shape, bindings, mode, stream, true);
 }
 } // namespace qsa_gqa_reuse_diagnostic
-#endif
 
 }  // namespace strix

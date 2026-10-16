@@ -1,9 +1,10 @@
 # Hierarchical QSA selection diagnostic
 
-The independent testing target `strix_qsa_selection_diagnostic` implements the
-fixed top-512, compression-four block selection contract for up to 32768 blocks
-and 131072 visible tokens. It is not linked into the decoder and does not add a
-runtime option or default selection.
+The shared selection backend implements fixed top-512, compression-four block
+selection for up to 32768 blocks and 131072 visible tokens. The diagnostic target
+and the decoder's explicit `--qsa-hierarchical-selection` path link the same
+implementation. The runtime flag defaults off and does not alter automatic
+profile selection. Its source integration remains unqualified.
 
 For sparse selection, a validation kernel first rejects nonfinite scores through
 caller-owned sticky status. Tiles sort 1024 candidates cooperatively and retain
@@ -44,6 +45,40 @@ Admission fixtures also reject legacy/per-thread streams and malformed empty,
 null and misaligned workspace views before capture submits any node.
 
 These fixture additions have not been compiled or executed in this stage.
-Compilation, execution,
-ISA/resource checks and timing are deferred. Decoder workspace/status integration,
-complete attention equality and long-context model measurements remain open.
+Compilation, execution, ISA/resource checks and timing are deferred. Production
+source integration and complete-attention fixture source are present; their
+execution and long-context model qualification remain open.
+
+The decoder option requires eager R1/C1, the owned deferred-completion stream,
+compression four, budget 2048 and a session context of at most 131072. Whole-graph,
+integer-head and prefix-roundtrip modes reject the option. Prepared submission,
+GPU token selection, shared overlap and projection organization options remain
+independent. No default flag is enabled or disabled by this option.
+
+With the option off, workspace offsets, bytes, kernel IDs and implementation
+identities remain the incumbent values. With it on, the arena appends aligned
+ping/pong regions and a separate four-byte local status. Each region is bounded
+at 128 KiB; the local status is separate from the eight-byte deferred first-error
+record. Positions that use all visible tokens keep the incumbent direct path.
+For sparse selection the caller resets only its local status, computes the
+unchanged block scores, and invokes the shared backend. A final publisher records
+nonfinite rejection in the distinct `qsa_selection` error domain while preserving
+any earlier first error. On rejection it writes safe zero indices before later
+attention gathers. The token completion fence rejects the token before session
+publication; this does not promise rollback of partially written device state.
+No helper clears or aliases the caller's existing first-error record.
+
+Selected variant IDs contain `.hierarchical-top512-v1` before projection suffixes;
+compiler and implementation identities and opt-in workspace identity bind the
+organization. Arithmetic in score producers, projections, softmax and value
+accumulation stays unchanged. Sparse selection submissions are counted by layer
+only after the complete helper and status-publisher enqueues succeed. Post-loop
+receipts emit the total and 48 layer counters with `not_assessed` qualification.
+These counters prove host submission, not device completion or measured speed.
+
+The added production fixture source compares the complete ordered indices,
+attention output and persistent state at direct/sparse boundaries, with tied and
+varied histories, two deterministic repetitions and read-only weights. Separate
+nonfinite cases check the QSA error domain, earlier-error preservation and safe
+indices; metadata and actual-capture negatives require no submitted nodes or
+owner writes. These new fixtures have not been executed.

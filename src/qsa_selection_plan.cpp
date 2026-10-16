@@ -5,6 +5,14 @@
 
 namespace strix {
 
+QsaHierarchicalSelectionLayout build_qsa_hierarchical_selection_layout(std::uint64_t maximum_visible) {
+    if (!maximum_visible || maximum_visible > qsa_hierarchical_selection_max_visible)
+        throw std::invalid_argument("hierarchical QSA requires visible capacity in 1..131072");
+    const auto blocks = maximum_visible / 4U;
+    const auto items = blocks <= 512U ? 0U : ((blocks + 1023U) / 1024U) * 512U;
+    return {items, items * 8U};
+}
+
 QsaCompressedSelectionPlan
 build_qsa_compressed_selection_plan(
     std::uint64_t token_budget,

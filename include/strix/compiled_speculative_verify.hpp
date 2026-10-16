@@ -29,11 +29,15 @@ enum class KnownWindowR2Variant : std::uint32_t {
     none = 0,
     shared_q8_virtual256_r2_v1 = 1,
     gdn_q8_virtual256_r2_v1 = 2,
+    // Large projections share Q8 weights; both small F32 gates retain R1 math.
+    gdn_q8_rows2_f32_gates_r1_v1 = 3,
 };
+inline constexpr std::uint32_t known_window_r2_variant_slots = 4;
 
 struct KnownWindowRequest {
     bool r2_shared_expert = false;
     bool r2_gdn = false;
+    bool r2_gdn_f32_gates = false;
 };
 
 struct CompiledKnownPrefixWindow {
@@ -68,6 +72,11 @@ struct CompiledKnownPrefixWindow {
 // Call before callbacks/enqueues: this is admission, not a per-step hot check.
 void validate_compiled_known_prefix_window(
     const CompiledKnownPrefixWindow& window, const CompiledSerialExecution& serial);
+
+// Bind each promoted numerical variant to the actual selected tensor formats.
+void validate_known_prefix_window_formats(
+    const CompiledKnownPrefixWindow& window, const CompiledSerialExecution& serial,
+    const ModelManifest& manifest, const ExecutionTensorAccessPlan& tensor_access);
 
 struct CompiledSpeculativeVerifyExecution {
     SerialExecutionPlan topology;

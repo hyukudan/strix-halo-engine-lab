@@ -6,6 +6,9 @@
 #include "strix/execution_tensor_access.hpp"
 #include "strix/hip_indexed_attention_launcher.hpp"
 #include "strix/hip_launch_context.hpp"
+#include "strix/hip_setup_quiescence.hpp"
+#include "strix/deferred_moe_status.hpp"
+#include "strix/indexed_attention_workspace.hpp"
 #include "strix/indexed_attention_state.hpp"
 #include "strix/model_contract.hpp"
 #include "strix/model_manifest.hpp"
@@ -1196,6 +1199,230 @@ int main() try {
         check(hipFree(arguments),"free QSA comparison arguments");
         check(hipFree(status),"free QSA comparison status");
         check(hipStreamDestroy(stream),"destroy QSA comparison stream");
+    }
+
+    // Production hierarchical selection: reuse the actual complete QSA
+    // launcher, weights and resource descriptors, with independently reset
+    // history for each arm. No benchmark or whole-model claim is made here.
+    {
+        struct Owned {
+            strix::HipSetupQuiescenceGuard guard;
+            hipStream_t stream = nullptr;
+            void* arena = nullptr; void* state = nullptr; void* error = nullptr;
+            ~Owned() {
+                guard.recover_or_fail_stop();
+                if (arena) (void)hipFree(arena);
+                if (state) (void)hipFree(state);
+                if (error) (void)hipFree(error);
+                if (stream) (void)hipStreamDestroy(stream);
+            }
+        } own;
+        auto large_model = model;
+        large_model.indexer_budget = 2048; large_model.indexer_compress_ratio = 4;
+        large_model.max_position_embeddings = 2056;
+        strix::ExecutionBufferRequest large_buffers;
+        large_buffers.qsa_hierarchical_selection = true;
+        large_buffers.qsa_gqa_heads_per_block = 4;
+        const auto large_arena = strix::build_serial_execution_arena_plan(large_model, large_buffers, execution, io, 256);
+        strix::ExecutionMemoryBinding large_scratch{0x51534153454c7631ULL, 0, large_arena.total_bytes, 3};
+        const auto contract = strix::build_indexed_attention_state_layout(large_model);
+        const auto history_kv_bytes = large_model.max_position_embeddings * contract.kv_row_bytes;
+        const auto history_raw_bytes = large_model.max_position_embeddings * contract.raw_index_row_bytes;
+        auto history_layout = state_layout;
+        history_layout.context_tokens = large_model.max_position_embeddings;
+        history_layout.device_total_bytes = history_kv_bytes + history_raw_bytes;
+        history_layout.layout_identity = 0x51534153454c5354ULL;
+        history_layout.allocations[0].bytes = history_kv_bytes;
+        history_layout.allocations[1].offset = history_kv_bytes;
+        history_layout.allocations[1].bytes = history_raw_bytes;
+        own.guard.run([&] {
+            check(hipStreamCreateWithFlags(&own.stream, hipStreamNonBlocking), "create hierarchical QSA stream");
+            check(hipMalloc(&own.arena, static_cast<std::size_t>(large_scratch.arena_bytes)), "allocate hierarchical arena");
+            check(hipMalloc(&own.state, static_cast<std::size_t>(history_layout.device_total_bytes)), "allocate hierarchical history");
+            check(hipMalloc(&own.error, sizeof(strix::DeferredMoeFirstError)), "allocate hierarchical D1 record");
+        });
+        large_scratch.arena_base = reinterpret_cast<std::uintptr_t>(own.arena);
+        auto history_memory = state_memory;
+        history_memory.layout_identity = history_layout.layout_identity;
+        history_memory.device_base = reinterpret_cast<std::uintptr_t>(own.state);
+        history_memory.device_bytes = history_layout.device_total_bytes;
+        history_memory.device_allocation_generation = 4;
+        auto large_resources = resources;
+        large_resources.scratch = &large_scratch;
+        large_resources.session_state_layout = &history_layout;
+        large_resources.session_state_memory = &history_memory;
+        auto large_context = context;
+        large_context.execution_identity = large_scratch.execution_identity;
+        large_context.arena = &large_arena; large_context.memory = &large_scratch;
+        large_context.resources = &large_resources;
+        large_context.session_state_layout = &history_layout;
+        large_context.session_state_memory = &history_memory;
+        const auto large_input = strix::resolve_execution_buffer(large_scratch.execution_identity,
+            large_arena, large_scratch, step_io.reads[0]);
+        const auto large_output = strix::resolve_execution_buffer(large_scratch.execution_identity,
+            large_arena, large_scratch, step_io.writes[0]);
+        const auto large_temp = strix::resolve_execution_buffer(large_scratch.execution_identity,
+            large_arena, large_scratch, step_io.temporaries[0]);
+        const auto selected_layout = strix::build_indexed_attention_workspace_layout(large_model, 256, true);
+        strix::HipLaunchContext large_scope;
+        large_scope.stream = own.stream;
+        large_scope.deferred_moe_status = {large_scratch.execution_identity,
+            reinterpret_cast<std::uintptr_t>(own.error), 8, 5};
+        auto candidate_config = config;
+        candidate_config.model = large_model;
+        candidate_config.qsa_hierarchical_selection = true;
+        candidate_config.selection_stats = std::make_shared<strix::QsaHierarchicalSelectionStats>();
+        auto reference_config = candidate_config;
+        reference_config.qsa_hierarchical_selection = false;
+        strix::ExecutionBindingRequest selected_request;
+        selected_request.deferred_moe_status = true;
+        selected_request.qsa_hierarchical_selection = true;
+        strix::kernels::KernelRegistry selected_kernels;
+        strix::register_hip_indexed_attention_kernel_variant(large_model, selected_request, candidate_config, selected_kernels);
+        auto candidate = strix::make_hip_indexed_attention_launcher(selected_kernels.variants().front().id, &candidate_config);
+        auto reference = strix::make_hip_indexed_attention_launcher("test.hierarchical.reference", &reference_config);
+        const auto read = [&](std::uintptr_t address, std::uint64_t bytes) {
+            std::vector<std::byte> result(static_cast<std::size_t>(bytes));
+            own.guard.run([&] { check(hipMemcpy(result.data(), reinterpret_cast<const void*>(address),
+                result.size(), hipMemcpyDeviceToHost), "read hierarchical payload"); });
+            return result;
+        };
+        std::vector<std::uint16_t> history(static_cast<std::size_t>(history_layout.device_total_bytes / 2U));
+        const auto reset = [&](unsigned flavor, bool nonfinite, strix::DeferredMoeFirstError prior = {}) {
+            for (std::size_t i = 0; i < history.size(); ++i)
+                history[i] = flavor ? float_to_bf16(static_cast<float>(static_cast<int>(i % 13U) - 6) / 128.0F) : 0;
+            if (nonfinite) history[static_cast<std::size_t>(history_kv_bytes / 2U)] = 0x7fc1U;
+            std::vector<std::uint16_t> current(hidden_width);
+            for (std::size_t i = 0; i < current.size(); ++i)
+                current[i] = float_to_bf16(static_cast<float>(static_cast<int>(i % 11U) - 5) / 32.0F);
+            own.guard.run([&] {
+                check(hipMemcpy(own.state, history.data(), static_cast<std::size_t>(history_layout.device_total_bytes), hipMemcpyHostToDevice), "reset hierarchical history");
+                check(hipMemset(own.arena, 0xa5, static_cast<std::size_t>(large_scratch.arena_bytes)), "poison hierarchical arena");
+                check(hipMemcpy(reinterpret_cast<void*>(large_input.address), current.data(), current.size() * 2U, hipMemcpyHostToDevice), "reset hierarchical input");
+                check(hipMemcpy(own.error, &prior, sizeof(prior), hipMemcpyHostToDevice), "reset caller-owned D1 between independent fixture arms");
+            });
+        };
+        const auto run = [&](const strix::ExecutionLauncher& selected) {
+            own.guard.run([&] { const strix::HipLaunchScope scoped(large_scope);
+                selected.function(large_context, selected.user_data); });
+        };
+        std::vector<std::vector<std::byte>> immutable_weights;
+        for (const auto& tensor : runtime.tensors) immutable_weights.push_back(read(tensor.address, tensor.bytes));
+        for (const unsigned flavor : {0U, 1U}) {
+            for (const std::uint64_t position : {0ULL, 2043ULL, 2047ULL, 2048ULL, 2051ULL, 2052ULL}) {
+                large_context.position = position;
+                reset(flavor, false); run(reference);
+                const auto expected_output = read(large_output.address, hidden_width * 2U);
+                const auto expected_state = read(history_memory.device_base, history_memory.device_bytes);
+                const auto visible = position + 1U;
+                const auto count = std::min(visible / 4U, std::uint64_t{512}) * 4U + visible % 4U;
+                const auto expected_indices = read(large_temp.address + selected_layout.selected_indices_offset, count * 4U);
+                for (unsigned repeat = 0; repeat < 2; ++repeat) {
+                    reset(flavor, false);
+                    const auto prior = candidate_config.selection_stats->submissions.load();
+                    run(candidate);
+                    expect(expected_output == read(large_output.address, hidden_width * 2U) &&
+                        expected_state == read(history_memory.device_base, history_memory.device_bytes) &&
+                        expected_indices == read(large_temp.address + selected_layout.selected_indices_offset, count * 4U),
+                        "hierarchical production preserves full attention output, state and chronological indices");
+                    expect(candidate_config.selection_stats->submissions.load() - prior == (visible / 4U > 512U ? 1U : 0U),
+                        "hierarchical production counter reports only actual sparse candidate submissions");
+                    const strix::DeferredMoeFirstError zero{};
+                    expect(read(reinterpret_cast<std::uintptr_t>(own.error), 8) ==
+                        std::vector<std::byte>(reinterpret_cast<const std::byte*>(&zero), reinterpret_cast<const std::byte*>(&zero) + 8),
+                        "finite hierarchical attention leaves D1 success intact");
+                }
+            }
+        }
+        // Same production projection/state setup with the shared GQA2/4
+        // backend, independently of the hierarchical-selection option.
+        for (const auto heads : {2U, 4U}) for (const bool hierarchical : {false, true}) {
+            auto grouped_config = candidate_config;
+            grouped_config.qsa_gqa_heads_per_block = heads;
+            grouped_config.qsa_hierarchical_selection = hierarchical;
+            grouped_config.gqa_stats = std::make_shared<strix::QsaHierarchicalSelectionStats>();
+            auto grouped_request = selected_request;
+            grouped_request.qsa_gqa_heads_per_block = heads;
+            grouped_request.qsa_hierarchical_selection = hierarchical;
+            strix::kernels::KernelRegistry grouped_kernels;
+            strix::register_hip_indexed_attention_kernel_variant(large_model, grouped_request, grouped_config, grouped_kernels);
+            auto grouped = strix::make_hip_indexed_attention_launcher(grouped_kernels.variants().front().id, &grouped_config);
+            for (const std::uint64_t position : {0ULL, 2047ULL, 2048ULL, 2051ULL, 2052ULL}) {
+                large_context.position = position;
+                reset(1, false); run(reference);
+                const auto expected_output = read(large_output.address, hidden_width * 2U);
+                const auto expected_state = read(history_memory.device_base, history_memory.device_bytes);
+                const auto visible = position + 1U;
+                const auto count = std::min(visible / 4U, std::uint64_t{512}) * 4U + visible % 4U;
+                const auto expected_indices = read(large_temp.address + selected_layout.selected_indices_offset, count * 4U);
+                for (unsigned repeat = 0; repeat < 2; ++repeat) {
+                    reset(1, false);
+                    const auto before = grouped_config.gqa_stats->submissions.load();
+                    run(grouped);
+                    expect(expected_output == read(large_output.address, hidden_width * 2U) &&
+                        expected_state == read(history_memory.device_base, history_memory.device_bytes) &&
+                        expected_indices == read(large_temp.address + selected_layout.selected_indices_offset, count * 4U),
+                        "production GQA2/4 preserves output/state and exact selection with either selector");
+                    expect(grouped_config.gqa_stats->submissions.load() == before + 1U,
+                        "production grouped-attention counter proves actual candidate submission");
+                }
+            }
+            large_context.position = 0;
+            reset(0, false);
+            const std::uint16_t nonfinite = 0x7fc1U;
+            own.guard.run([&] { check(hipMemcpy(reinterpret_cast<void*>(large_input.address), &nonfinite,
+                sizeof(nonfinite), hipMemcpyHostToDevice), "inject grouped-attention nonfinite input"); });
+            run(grouped);
+            strix::DeferredMoeFirstError rejected{};
+            const auto error = read(reinterpret_cast<std::uintptr_t>(own.error), 8);
+            std::memcpy(&rejected, error.data(), 8);
+            expect(rejected.domain == 4U && rejected.bits != 0U,
+                "grouped attention rejection uses its own deferred error domain");
+        }
+        large_context.position = 2051;
+        for (const auto prior : {strix::DeferredMoeFirstError{}, strix::DeferredMoeFirstError{1, 8}}) {
+            reset(0, true, prior); run(candidate);
+            strix::DeferredMoeFirstError observed{};
+            const auto error_bytes = read(reinterpret_cast<std::uintptr_t>(own.error), 8);
+            std::memcpy(&observed, error_bytes.data(), 8);
+            expect(observed.domain == (prior.domain ? prior.domain : 3U) && observed.bits == (prior.domain ? prior.bits : 1U),
+                "nonfinite QSA selection publishes its real domain while preserving an earlier first error");
+            const auto count = 2048U;
+            expect(read(large_temp.address + selected_layout.selected_indices_offset, count * 4U) == std::vector<std::byte>(count * 4U),
+                "rejected sparse selection sanitizes indices before any attention gather");
+        }
+        for (unsigned mutation = 0; mutation < 5; ++mutation) {
+            reset(0, false);
+            auto bad_scope = large_scope;
+            if (mutation == 0) bad_scope.deferred_moe_status = {};
+            if (mutation == 1) bad_scope.deferred_moe_status.allocation_generation = 0;
+            if (mutation == 2) bad_scope.deferred_moe_status.arena_base = large_temp.address;
+            if (mutation == 3) bad_scope.deferred_moe_status.execution_identity ^= 1U;
+            const auto before_arena = read(large_scratch.arena_base, large_scratch.arena_bytes);
+            const auto before_state = read(history_memory.device_base, history_memory.device_bytes);
+            if (mutation < 4) {
+                bool metadata_rejected = false;
+                try { const strix::HipLaunchScope scoped(bad_scope); candidate.preflight(large_context, candidate.user_data); }
+                catch (const std::invalid_argument&) { metadata_rejected = true; }
+                expect(metadata_rejected && before_arena == read(large_scratch.arena_base, large_scratch.arena_bytes) &&
+                    before_state == read(history_memory.device_base, history_memory.device_bytes),
+                    "actual eager hierarchical metadata rejects without writes");
+            }
+            hipGraph_t graph = nullptr; bool rejected = false;
+            check(hipStreamBeginCapture(own.stream, hipStreamCaptureModeThreadLocal), "capture hierarchical admission rejection");
+            try { const strix::HipLaunchScope scoped(bad_scope); candidate.preflight(large_context, candidate.user_data); }
+            catch (const std::invalid_argument&) { rejected = true; }
+            check(hipStreamEndCapture(own.stream, &graph), "end hierarchical admission rejection");
+            std::size_t nodes = 1;
+            check(hipGraphGetNodes(graph, nullptr, &nodes), "hierarchical rejection nodes");
+            expect(rejected && nodes == 0 && before_arena == read(large_scratch.arena_base, large_scratch.arena_bytes) &&
+                before_state == read(history_memory.device_base, history_memory.device_bytes),
+                "hierarchical invalid D1/capture metadata rejects before enqueue and owner writes");
+            check(hipGraphDestroy(graph), "destroy hierarchical rejected graph");
+        }
+        for (std::size_t i = 0; i < runtime.tensors.size(); ++i)
+            expect(immutable_weights[i] == read(runtime.tensors[i].address, runtime.tensors[i].bytes),
+                "production hierarchical selection preserves every weight byte");
     }
 
     for (auto* pointer :

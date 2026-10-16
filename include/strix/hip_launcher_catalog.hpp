@@ -57,6 +57,11 @@ struct HipLauncherCatalogConfig {
     bool prefetch_q8_shared_expert = false;
     std::vector<std::uint32_t> shared_expert_prefetch_layers;
     std::shared_ptr<shared_expert_prefetch::RuntimeDispatchStats> shared_expert_prefetch_stats;
+    HipGdnRecurrentLayout gdn_recurrent_layout = HipGdnRecurrentLayout::baseline;
+    bool qsa_hierarchical_selection = false;
+    std::uint32_t qsa_gqa_heads_per_block = 1;
+    std::shared_ptr<QsaHierarchicalSelectionStats> qsa_selection_stats;
+    std::shared_ptr<QsaHierarchicalSelectionStats> qsa_gqa_stats;
 };
 
 void register_complete_hip_kernel_catalog(
@@ -85,7 +90,10 @@ public:
     void register_for_compiled_execution(
         const CompiledSerialExecution& compiled,
         ExecutionLauncherRegistry& registry,
-        const ExecutionRuntimeResources* resources = nullptr);
+        const ExecutionRuntimeResources* resources = nullptr,
+        std::shared_ptr<HipGdnIslands> gdn_islands = {});
+
+    [[nodiscard]] const HipGdnLauncherConfig& gdn_config() const noexcept { return gdn_config_; }
 
     // Derive the closed QSA position-reader set from this catalog's owned
     // configurations and actual factories, rather than trusting arbitrary
@@ -99,10 +107,14 @@ public:
 
 private:
     bool device_graph_inputs_ = false;
+    bool deferred_moe_status_ = false;
     std::shared_ptr<integer_projection::HipIntegerProjectionRuntimeBundle> alternate_lm_head_;
     HipElementwiseLauncherBundle elementwise_;
     HipPleLauncherBundle ple_;
+    const HipGdnLauncherConfig gdn_config_;
     HipGdnLauncherBundle gdn_;
+    // Append-only retention: registry userdata borrows the corresponding owner.
+    std::vector<std::shared_ptr<HipGdnIslands>> gdn_island_owners_;
     HipIndexedAttentionLauncherBundle indexed_attention_;
     HipEmbeddingLauncherBundle embedding_;
     HipHyperMixLauncherBundle hyper_mix_;

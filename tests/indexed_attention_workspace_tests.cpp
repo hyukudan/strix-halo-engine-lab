@@ -77,6 +77,39 @@ int main() {
         zero_alignment,
         "indexed-attention workspace rejects zero alignment");
 
+    const auto hierarchical = strix::build_indexed_attention_workspace_layout(model, 256, true);
+    expect(hierarchical.index_query_offset == layout.index_query_offset &&
+        hierarchical.attention_output_offset == layout.attention_output_offset &&
+        hierarchical.selection_ping_offset >= layout.total_bytes &&
+        hierarchical.selection_ping_bytes == 131072 && hierarchical.selection_pong_bytes == 131072 &&
+        hierarchical.selection_status_bytes == 4 && hierarchical.selection_status_offset % 256 == 0 &&
+        hierarchical.selection_pong_offset >= hierarchical.selection_ping_offset + hierarchical.selection_ping_bytes &&
+        hierarchical.selection_status_offset >= hierarchical.selection_pong_offset + hierarchical.selection_pong_bytes,
+        "opt-in selection scratch appends bounded aligned regions without moving incumbent views");
+    for (const auto heads : {2U, 4U}) {
+        const auto grouped = strix::build_indexed_attention_workspace_layout(model, 256, false, heads);
+        expect(grouped.attention_output_offset == layout.attention_output_offset && grouped.attention_position_bytes == 8 &&
+            grouped.selection_status_bytes == 4 && grouped.selection_ping_bytes == 0 && grouped.selection_pong_bytes == 0,
+            "grouped attention appends only bounded control storage without moving incumbent views");
+        const auto both = strix::build_indexed_attention_workspace_layout(model, 256, true, heads);
+        expect(both.selection_ping_bytes == hierarchical.selection_ping_bytes && both.attention_position_bytes == 8 &&
+            both.selection_status_offset >= both.attention_position_offset + both.attention_position_bytes,
+            "hierarchical selection and grouped attention share one disjoint local status");
+    }
+    const auto explicit_off = strix::build_indexed_attention_workspace_layout(model, 256, false);
+    expect(explicit_off.total_bytes == layout.total_bytes && explicit_off.selection_status_bytes == 0,
+        "OFF workspace bytes remain identical");
+    for (const auto alignment : {1ULL, 4ULL}) {
+        bool rejected = false;
+        try { (void)strix::build_indexed_attention_workspace_layout(model, alignment, true); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        expect(rejected, "hierarchical workspace rejects Item-misaligned layouts");
+    }
+    auto wrong_budget = model; wrong_budget.indexer_budget = 1024;
+    bool wrong = false;
+    try { (void)strix::build_indexed_attention_workspace_layout(wrong_budget, 256, true); }
+    catch (const std::invalid_argument&) { wrong = true; }
+    expect(wrong, "hierarchical workspace rejects a different selection contract");
     if (failures == 0) {
         std::cout
             << "indexed-attention workspace tests passed\n";

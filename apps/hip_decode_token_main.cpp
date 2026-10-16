@@ -8,6 +8,9 @@
 #include "strix/execution_tensor_access.hpp"
 #include "strix/gguf_reader.hpp"
 #include "strix/hip_launcher_catalog.hpp"
+#include "strix/hip_gdn_islands.hpp"
+#include "strix/hip_known_prefix_window.hpp"
+#include "strix/hip_known_prompt_backend.hpp"
 #include "strix/hip_model_residency.hpp"
 #include "strix/hip_runtime_allocator.hpp"
 #include "strix/hip_session_snapshot_transfer.hpp"
@@ -51,6 +54,8 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <array>
+#include <memory>
 #include <cerrno>
 #include <chrono>
 #include <cmath>
@@ -397,6 +402,52 @@ private:
     strix::GenerationOutputDispatcher* output_dispatcher_ = nullptr;
 };
 
+// A separate physical window arena and completion record. Serial D1 keeps its
+// existing shadow transaction; known pairs never call its begin/complete path.
+class KnownPromptMemory final {
+public:
+    KnownPromptMemory(const strix::CompiledKnownPrefixWindow& plan, std::uint64_t arena_generation,
+        std::uint64_t status_generation, std::uint64_t context, std::uint32_t vocabulary,
+        std::shared_ptr<const void> retained, std::shared_ptr<const strix::HipSetupQuiescenceGuard> guard)
+        : retained_(std::move(retained)), guard_(std::move(guard)) {
+        if (!retained_ || !guard_) throw std::invalid_argument("known prompt requires retained original resources");
+        scratch = {plan.window_execution_identity, 0, plan.arena.physical.total_bytes, arena_generation};
+        if (!scratch.execution_identity || !scratch.arena_bytes || !arena_generation || !status_generation)
+            throw std::invalid_argument("known prompt memory requires current nonempty bindings");
+        try {
+            guard_->run([&] {
+                check_hip(hipStreamCreateWithFlags(&scope.stream, hipStreamNonBlocking), "create known-prompt stream");
+                check_hip(hipMalloc(&arena_, static_cast<std::size_t>(scratch.arena_bytes)), "allocate known-prompt arena");
+                scratch.arena_base = reinterpret_cast<std::uintptr_t>(arena_);
+                check_hip(hipMalloc(&status_, 8), "allocate known-prompt completion record");
+                check_hip(hipMemsetAsync(arena_, 0, static_cast<std::size_t>(scratch.arena_bytes), scope.stream), "initialize known-prompt arena");
+                check_hip(hipMemsetAsync(status_, 0, 8, scope.stream), "initialize known-prompt completion record");
+            });
+            scope.context_tokens = context; scope.vocabulary_size = vocabulary;
+            scope.deferred_moe_status = {plan.window_execution_identity,
+                reinterpret_cast<std::uintptr_t>(status_), 8, status_generation};
+        } catch (...) { release(); throw; }
+    }
+    ~KnownPromptMemory() { release(); }
+    KnownPromptMemory(const KnownPromptMemory&) = delete;
+    KnownPromptMemory& operator=(const KnownPromptMemory&) = delete;
+    strix::ExecutionMemoryBinding scratch;
+    strix::HipLaunchContext scope;
+private:
+    void release() noexcept {
+        guard_->recover_or_fail_stop();
+        if (arena_ && hipFree(arena_) != hipSuccess) std::_Exit(3);
+        arena_ = nullptr;
+        if (status_ && hipFree(status_) != hipSuccess) std::_Exit(3);
+        status_ = nullptr;
+        if (scope.stream && hipStreamDestroy(scope.stream) != hipSuccess) std::_Exit(3);
+        scope.stream = nullptr;
+    }
+    std::shared_ptr<const void> retained_;
+    std::shared_ptr<const strix::HipSetupQuiescenceGuard> guard_;
+    void* arena_ = nullptr; void* status_ = nullptr;
+};
+
 // Drain inside the transfer call before the caller's snapshot owner can unwind.
 class GuardedHipSnapshotTransfer final : public strix::SessionSnapshotTransferBackend {
 public:
@@ -450,6 +501,11 @@ int main(
             "  --execution-inventory (include selected host launcher and declared variant metadata)\n"
             "  --gpu-greedy-token (experimental eager generation with small GPU selection result)\n"
             "  --batched-moe-activation (experimental eager A8 slot activation batching)\n"
+            "  --qsa-gqa-heads-per-block 1|2|4 (experimental eager grouped attention; default1)\n"
+            "  --qsa-hierarchical-selection (experimental exact top512, eager D1, context<=131072)\n"
+            "  --gdn-recurrent-layout baseline|stride32|stride33|transposed (experimental eager LDS organization)\n"
+            "  --known-prefix-window (experimental paired known prompt; complete heads, separate window owner)\n"
+            "  --gdn-islands (experimental eager D1 GDN launch organization; paired wave8 GDN supported)\n"
             "  --prepared-eager (experimental immutable static submission plan)\n"
             "  --moe-shared-overlap [--moe-overlap-arena-budget-bytes N] (experimental eager D1)\n"
             "  --virtual-q8-gdn-output (exact original256-tree Q8 output)\n"
@@ -583,6 +639,11 @@ int main(
     strix::decode_cli::validate_resolved_q8_projection_organization(options);
     strix::decode_cli::validate_resolved_hc_projection_next_tile(options);
     strix::decode_cli::validate_resolved_q51_slot_parallel_down(options);
+    strix::decode_cli::validate_resolved_gdn_islands(options);
+    strix::decode_cli::validate_resolved_gdn_recurrent_layout(options);
+    strix::decode_cli::validate_resolved_qsa_hierarchical_selection(options);
+    strix::decode_cli::validate_resolved_qsa_gqa(options);
+    strix::decode_cli::validate_resolved_known_prefix_window(options);
     if (options.batched_moe_activation && !options.q4k_a8g32_gate_up)
         throw std::invalid_argument("batched MoE activation requires resolved Q4K A8 gate/up execution");
     if (options.moe_shared_overlap && !options.deferred_moe_status)
@@ -716,6 +777,10 @@ int main(
     if(options.prefetch_q8_qsa_input) qsa_input_mode_receipt+="],\n";
     const auto qsa_prefetch_stats=options.prefetch_q8_qsa_input ?
         std::make_shared<strix::qsa_input_prefetch::RuntimeDispatchStats>() : nullptr;
+    const auto qsa_gqa_stats = options.qsa_gqa_heads_per_block != 1 ?
+        std::make_shared<strix::QsaHierarchicalSelectionStats>() : nullptr;
+    const auto qsa_selection_stats = options.qsa_hierarchical_selection ?
+        std::make_shared<strix::QsaHierarchicalSelectionStats>() : nullptr;
     const auto shared_prefetch_plan=options.prefetch_q8_shared_expert?strix::shared_expert_prefetch::build_plan(model,manifest):strix::shared_expert_prefetch::Plan{};
     std::string shared_mode_receipt="  \"prefetch_q8_shared_expert\": "+std::string(options.prefetch_q8_shared_expert?"true":"false")+",\n";
     if(options.prefetch_q8_shared_expert) shared_mode_receipt+="  \"prefetch_q8_shared_expert_eligible_steps\": "+std::to_string(shared_prefetch_plan.eligible_steps)+",\n";
@@ -782,6 +847,7 @@ int main(
     catalog_config.prefetch_q8_lm_head = options.prefetch_q8_lm_head;
     catalog_config.wave8_q8_lm_head = options.wave8_q8_lm_head;
     catalog_config.wave8_q8_gdn_input = options.wave8_q8_gdn_input;
+    catalog_config.gdn_recurrent_layout = binding_request.gdn_recurrent_layout = options.gdn_recurrent_layout;
     catalog_config.wave8_q8_gdn_output = options.wave8_q8_gdn_output;
     catalog_config.wave8_q8_qsa_output = options.wave8_q8_qsa_output;
     binding_request.prefetch_q8_lm_head = options.prefetch_q8_lm_head;
@@ -794,6 +860,11 @@ int main(
     catalog_config.q4k_a8g32_gate_up = options.q4k_a8g32_gate_up;
     catalog_config.grouped_exact_q51_down = options.grouped_exact_q51_down;
     catalog_config.q51_slot_parallel_down = options.q51_slot_parallel_down;
+    catalog_config.qsa_hierarchical_selection = options.qsa_hierarchical_selection;
+    catalog_config.qsa_selection_stats = qsa_selection_stats;
+    catalog_config.qsa_gqa_heads_per_block = binding_request.qsa_gqa_heads_per_block = options.qsa_gqa_heads_per_block;
+    catalog_config.qsa_gqa_stats = qsa_gqa_stats;
+    binding_request.qsa_hierarchical_selection = options.qsa_hierarchical_selection;
     catalog_config.q4k_a8_stats = q4k_a8_stats;
     binding_request.q4k_a8g32_gate_up = options.q4k_a8g32_gate_up;
     binding_request.grouped_exact_q51_down = options.grouped_exact_q51_down;
@@ -841,6 +912,8 @@ int main(
     buffer_request.q4k_a8g32_gate_up = options.q4k_a8g32_gate_up;
     buffer_request.grouped_exact_q51_down = options.grouped_exact_q51_down;
     buffer_request.q51_slot_parallel_down = options.q51_slot_parallel_down;
+    buffer_request.qsa_hierarchical_selection = options.qsa_hierarchical_selection;
+    buffer_request.qsa_gqa_heads_per_block = options.qsa_gqa_heads_per_block;
     buffer_request.activation_element_bytes =
         2;
     buffer_request.control_element_bytes =
@@ -1036,16 +1109,6 @@ int main(
         integer_bundle = std::make_shared<strix::integer_projection::HipIntegerProjectionRuntimeBundle>(
             plan, pins, hipStreamLegacy);
     }
-    auto launcher_catalog = std::make_shared<strix::HipLauncherCatalog>(model, catalog_config, integer_bundle);
-    strix::ExecutionLauncherRegistry launchers;
-    launcher_catalog->register_for_compiled_execution(compiled, launchers, &resources);
-    if (launcher_catalog->audit(compiled, launchers).missing_steps)
-        throw std::logic_error("HIP launcher catalog is incomplete for actual compiled execution");
-    const auto launch_plan = strix::compile_launch_plan(compiled, launchers);
-    const auto execution_inventory_receipt = options.execution_inventory
-        ? strix::decode_receipt::execution_inventory_receipt(compiled, launch_plan, kernel_registry) +
-            strix::decode_receipt::hip_runtime_environment_receipt()
-        : std::string{};
     std::shared_ptr<HipDeferredMoeStatus> deferred_moe;
     if(options.deferred_moe_status) {
         const auto deferred_status_generation=generations.next();
@@ -1053,6 +1116,25 @@ int main(
         deferred_moe=std::make_shared<HipDeferredMoeStatus>(resources,compiled.execution_identity,
             deferred_status_generation,deferred_shadow_generation,experiment_owner,original_work_device);
     }
+    auto launcher_catalog = std::make_shared<strix::HipLauncherCatalog>(model, catalog_config, integer_bundle);
+    std::shared_ptr<strix::HipGdnIslands> gdn_islands;
+    if (options.gdn_islands) {
+        if (!deferred_moe) throw std::logic_error("GDN islands are missing their D1 owner");
+        gdn_islands = strix::HipGdnIslands::create(compiled, launcher_catalog->gdn_config(),
+            deferred_moe->resources(), deferred_moe->scope(), model_owner,
+            std::static_pointer_cast<const void>(deferred_moe), original_work_device);
+    }
+
+    strix::ExecutionLauncherRegistry launchers;
+    launcher_catalog->register_for_compiled_execution(compiled, launchers,
+        gdn_islands ? &deferred_moe->resources() : &resources, gdn_islands);
+    if (launcher_catalog->audit(compiled, launchers).missing_steps)
+        throw std::logic_error("HIP launcher catalog is incomplete for actual compiled execution");
+    const auto launch_plan = strix::compile_launch_plan(compiled, launchers);
+    const auto execution_inventory_receipt = options.execution_inventory
+        ? strix::decode_receipt::execution_inventory_receipt(compiled, launch_plan, kernel_registry) +
+            strix::decode_receipt::hip_runtime_environment_receipt()
+        : std::string{};
     HostTelemetryReport host_telemetry;
     host_telemetry.enabled = options.host_dispatch_telemetry;
     strix::DirectLaunchDispatcher direct_dispatcher(launch_plan,
@@ -1123,6 +1205,48 @@ int main(
         prepared_eager = std::make_unique<strix::PreparedEagerExecution>(
             compiled, current_resources, prototype, owner);
     }
+    const auto gdn_recurrent_layout_receipt = [&]() -> std::string {
+        if (options.gdn_recurrent_layout == strix::HipGdnRecurrentLayout::baseline) return {};
+        return "  \"gdn_recurrent_layout\": \"" +
+            std::string(strix::gdn_recurrent_layout_marker(options.gdn_recurrent_layout)) + "\",\n"
+            "  \"gdn_recurrent_layout_qualification\": \"not_assessed\",\n";
+    };
+    const auto qsa_gqa_receipt = [&]() -> std::string {
+        if (!qsa_gqa_stats) return {};
+        std::string result = "  \"qsa_gqa_heads_per_block\": " + std::to_string(options.qsa_gqa_heads_per_block) + ",\n"
+            "  \"qsa_gqa_qualification\": \"not_assessed\",\n"
+            "  \"qsa_gqa_submissions\": " + std::to_string(qsa_gqa_stats->submissions.load(std::memory_order_relaxed)) + ",\n";
+        result += "  \"qsa_gqa_layer_submissions\": [";
+        for (std::size_t layer = 0; layer < qsa_gqa_stats->layer_submissions.size(); ++layer) {
+            if (layer) result += ',';
+            result += std::to_string(qsa_gqa_stats->layer_submissions[layer].load(std::memory_order_relaxed));
+        }
+        return result + "],\n";
+    };
+    const auto qsa_selection_receipt = [&]() -> std::string {
+        if (!qsa_selection_stats) return {};
+        std::string result = "  \"qsa_hierarchical_selection\": true,\n"
+            "  \"qsa_hierarchical_selection_qualification\": \"not_assessed\",\n"
+            "  \"qsa_hierarchical_selection_submissions\": " +
+            std::to_string(qsa_selection_stats->submissions.load(std::memory_order_relaxed)) + ",\n";
+        result += "  \"qsa_hierarchical_selection_layer_submissions\": [";
+        for (std::size_t layer = 0; layer < qsa_selection_stats->layer_submissions.size(); ++layer) {
+            if (layer) result += ',';
+            result += std::to_string(qsa_selection_stats->layer_submissions[layer].load(std::memory_order_relaxed));
+        }
+        return result + "],\n";
+    };
+    const auto gdn_islands_receipt = [&]() -> std::string {
+        if (!gdn_islands) return {};
+        const auto observed = gdn_islands->receipt();
+        return "  \"gdn_islands\": true,\n  \"gdn_islands_qualification\": \"not_assessed\",\n" +
+            std::string("  \"gdn_islands_organization_identity\": ") + std::to_string(observed.organization_identity) + ",\n" +
+            "  \"gdn_islands_count\": " + std::to_string(observed.islands) + ",\n" +
+            "  \"gdn_islands_kernel_nodes\": " + std::to_string(observed.kernel_nodes) + ",\n" +
+            "  \"gdn_islands_setup_memory_observed\": " + (observed.memory_observed ? "true" : "false") + ",\n" +
+            "  \"gdn_islands_setup_free_delta_bytes\": " + std::to_string(observed.observed_setup_free_delta_bytes) + ",\n" +
+            "  \"gdn_islands_replays\": " + std::to_string(observed.replays) + ",\n";
+    };
     const auto overlap_receipt = [&]() -> std::string {
         if (!moe_overlap) return {};
         const auto stats = moe_overlap->stats();
@@ -1482,7 +1606,7 @@ int main(
                 << optimization_profile_receipt << eager_submission_receipt << overlap_receipt() << execution_inventory_receipt << gdn_output_mode_receipt() << wave_router_mode_receipt << deferred_moe_mode_receipt
                 << strix::decode_detail::qsa_input_dispatch_receipt(qsa_prefetch_stats.get())
                 << shared_dispatch_receipt.completed_counts()
-                << strix::decode_detail::deferred_moe_completed_tokens_receipt(deferred_moe.get())
+                << qsa_gqa_receipt() << gdn_recurrent_layout_receipt() << qsa_selection_receipt() << gdn_islands_receipt() << strix::decode_detail::deferred_moe_completed_tokens_receipt(deferred_moe.get())
                 << "  \"model_content_identity\": \""
                 << strix::model_content_identity_hex(
                        model_residency.binding().
@@ -1609,14 +1733,50 @@ int main(
         request.eos_token_id =
             generation_eos;
 
+        std::optional<strix::CompiledKnownPrefixWindow> known_prefix_plan;
+        std::shared_ptr<KnownPromptMemory> known_prefix_memory;
+        std::shared_ptr<strix::HipKnownPrefixWindow> known_prefix_owner;
+        std::unique_ptr<strix::HipKnownPromptBackend> known_prefix_backend;
+        std::optional<strix::KnownPromptGreedyResult> known_prefix_result;
+        if (options.known_prefix_window) {
+            known_prefix_plan = strix::compile_known_prefix_window(model, compiled, manifest, tensor_access, {true, true, true});
+            if (!known_prefix_plan->r2_steps) throw std::invalid_argument("known prompt has no admitted paired operators");
+            if (model.vocab_size > std::numeric_limits<std::uint32_t>::max())
+                throw std::invalid_argument("known-prompt vocabulary exceeds uint32");
+            const auto arena_generation = generations.next();
+            const auto status_generation = generations.next();
+            known_prefix_memory = std::make_shared<KnownPromptMemory>(*known_prefix_plan, arena_generation,
+                status_generation, options.context_tokens, static_cast<std::uint32_t>(model.vocab_size),
+                std::static_pointer_cast<const void>(experiment_owner), original_work_device);
+            known_prefix_owner = std::make_shared<strix::HipKnownPrefixWindow>(*known_prefix_plan, compiled, model,
+                catalog_config, resources, known_prefix_memory->scratch, known_prefix_memory->scope,
+                std::static_pointer_cast<const void>(known_prefix_memory));
+            known_prefix_backend = std::make_unique<strix::HipKnownPromptBackend>(known_prefix_owner, session,
+                known_prefix_memory->scratch, model.vocab_size, original_work_device);
+        }
+
         const bool generation_request_timing_enabled =
             !raw_recording && !final_state_metadata;
         const auto generation_request_start = generation_request_timing_enabled
             ? std::chrono::steady_clock::now()
             : std::chrono::steady_clock::time_point{};
-        const auto result = options.gpu_greedy_token
-            ? strix::execute_serial_greedy_token_request(request, backend)
-            : strix::execute_serial_greedy_request(request, backend);
+        const auto result = [&]() -> strix::SerialGreedyRequestResult {
+            if (!known_prefix_backend) return options.gpu_greedy_token
+                ? strix::execute_serial_greedy_token_request(request, backend)
+                : strix::execute_serial_greedy_request(request, backend);
+            strix::KnownPromptGreedyRequest paired;
+            paired.prompt_tokens = options.tokens;
+            paired.start_position = session.next_position;
+            paired.vocab_size = request.vocab_size; paired.context_capacity = request.context_capacity;
+            paired.max_new_tokens = request.max_new_tokens; paired.eos_token_id = request.eos_token_id;
+            known_prefix_result = strix::execute_known_prompt_greedy_request(paired, *known_prefix_backend, backend);
+            if (!known_prefix_result->generation) throw std::logic_error("known prompt unexpectedly stopped before generation");
+            auto total = *known_prefix_result->generation;
+            if (known_prefix_result->consumed_prompt_tokens > std::numeric_limits<std::uint64_t>::max() - total.steps_executed)
+                throw std::overflow_error("known-prompt total execution count overflow");
+            total.steps_executed += known_prefix_result->consumed_prompt_tokens;
+            return total;
+        }();
         const auto generation_request_stop = generation_request_timing_enabled
             ? std::chrono::steady_clock::now()
             : std::chrono::steady_clock::time_point{};
@@ -1647,6 +1807,36 @@ int main(
                 });
         }
         std::cout << "{\n" << optimization_profile_receipt << eager_submission_receipt << overlap_receipt() << execution_inventory_receipt << gdn_output_mode_receipt() << wave_router_mode_receipt << deferred_moe_mode_receipt;
+        if (known_prefix_result) {
+            const auto observed = known_prefix_backend->stats();
+            std::array<std::uint64_t, strix::known_window_r2_variant_slots> compiled_variants{};
+            for (const auto variant : known_prefix_plan->r2_variant) {
+                const auto index = static_cast<std::uint32_t>(variant);
+                if (index >= compiled_variants.size()) throw std::logic_error("unknown prompt variant in source receipt");
+                if (index) ++compiled_variants[index];
+            }
+            std::cout << "  \"known_prefix_completed_windows\":" << observed.windows << ",\n"
+                << "  \"known_prefix_stats_saturated\":" << (observed.saturated ? "true" : "false") << ",\n"
+                << "  \"known_prefix_r2_dispatches\":" << observed.r2_dispatches << ",\n"
+                << "  \"known_prefix_row_loop_dispatches\":" << observed.row_loop_dispatches << ",\n"
+                << "  \"known_prefix_logical_projection_weight_bytes_avoided\":" << observed.logical_projection_weight_bytes_avoided << ",\n"
+                << "  \"known_prefix_projection_launches_saved\":" << observed.projection_launches_saved << ",\n"
+                << "  \"known_prefix_r2_variant_dispatches\":[";
+            for (std::size_t i = 0; i < observed.r2_variant_dispatches.size(); ++i)
+                std::cout << (i ? "," : "") << observed.r2_variant_dispatches[i];
+            std::cout << "],\n  \"known_prefix_source_variant_steps\":[";
+            for (std::size_t i = 0; i < compiled_variants.size(); ++i) std::cout << (i ? "," : "") << compiled_variants[i];
+            std::cout << "],\n  \"known_prefix_window\":true,\n"
+                << "  \"known_prefix_window_qualification\":\"not_assessed\",\n"
+                << "  \"known_prefix_consumed_prompt_tokens\":" << known_prefix_result->consumed_prompt_tokens << ",\n"
+                << "  \"known_prefix_windows_executed\":" << known_prefix_result->windows_executed << ",\n"
+                << "  \"known_prefix_serial_prompt_steps\":" << known_prefix_result->serial_prompt_steps << ",\n"
+                << "  \"known_prefix_window_execution_identity\":" << known_prefix_plan->window_execution_identity << ",\n"
+                << "  \"known_prefix_window_kernel_plan_identity\":" << known_prefix_plan->window_kernel_plan_identity << ",\n"
+                << "  \"known_prefix_source_r2_steps\":" << known_prefix_plan->r2_steps << ",\n"
+                << "  \"known_prefix_source_projection_launches_saved_per_window\":" << known_prefix_plan->projection_launches_saved << ",\n"
+                << "  \"known_prefix_source_logical_weight_bytes_avoided_per_window\":" << known_prefix_plan->logical_projection_weight_bytes_avoided << ",\n";
+        }
         if (generation_request_timing_enabled)
             std::cout << "  \"generation_request_elapsed_ms\":" << generation_request_elapsed_ms << ",\n"
                       << "  \"generation_request_output_tokens\":" << result.generated_tokens.size() << ",\n"
@@ -1689,7 +1879,7 @@ int main(
         emit_q4k_a8_counts();
         std::cout << strix::decode_detail::qsa_input_dispatch_receipt(qsa_prefetch_stats.get());
         std::cout << shared_dispatch_receipt.completed_counts();
-        std::cout << strix::decode_detail::deferred_moe_completed_tokens_receipt(deferred_moe.get());
+        std::cout << qsa_gqa_receipt() << gdn_recurrent_layout_receipt() << qsa_selection_receipt() << gdn_islands_receipt() << strix::decode_detail::deferred_moe_completed_tokens_receipt(deferred_moe.get());
         std::cout
             << "  \"model_content_identity\": \""
             << strix::model_content_identity_hex(
@@ -1745,10 +1935,12 @@ int main(
             << "  \"final_position\": "
             << result.final_position
             << ",\n"
-            << (greedy_output ? "  \"generation_step_elapsed_ms_total\": " : "  \"decode_elapsed_ms_total\": ")
+            << (known_prefix_backend ? "  \"known_prefix_serial_tail_and_generation_elapsed_ms_total\": " :
+                greedy_output ? "  \"generation_step_elapsed_ms_total\": " : "  \"decode_elapsed_ms_total\": ")
             << elapsed_total
             << ",\n"
-            << (greedy_output ? "  \"generation_step_elapsed_ms_per_step\": " : "  \"decode_elapsed_ms_per_step\": ")
+            << (known_prefix_backend ? "  \"known_prefix_serial_tail_and_generation_elapsed_ms_per_step\": " :
+                greedy_output ? "  \"generation_step_elapsed_ms_per_step\": " : "  \"decode_elapsed_ms_per_step\": ")
             << (backend.elapsed_ms().empty()
                     ? 0.0
                     : elapsed_total /
@@ -2003,7 +2195,7 @@ int main(
     std::cout << overlap_receipt();
     std::cout << strix::decode_detail::qsa_input_dispatch_receipt(qsa_prefetch_stats.get());
     std::cout << shared_dispatch_receipt.completed_counts();
-    std::cout << strix::decode_detail::deferred_moe_completed_tokens_receipt(deferred_moe.get());
+    std::cout << qsa_gqa_receipt() << gdn_recurrent_layout_receipt() << qsa_selection_receipt() << gdn_islands_receipt() << strix::decode_detail::deferred_moe_completed_tokens_receipt(deferred_moe.get());
     std::cout
         << "  \"decode_elapsed_ms_total\": "
         << decode_elapsed_ms_total

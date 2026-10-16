@@ -1,10 +1,10 @@
 # Selected-attention GQA reuse diagnostic
 
-This test-only experiment groups two or four query heads sharing the same KV
+The shared backend groups two or four query heads sharing the same KV
 head in one workgroup. The reference arm invokes the original score, softmax
 and value/gate kernels in their original translation unit. The candidate replaces
-only score and value/gate. No production call site, kernel catalog, profile,
-workspace, KV state format or default selects the new kernels.
+only score and value/gate. The explicit production option `--qsa-gqa-heads-per-block 2|4` now selects these
+same kernels. The default remains one head; the KV state format is unchanged.
 
 For QK, every feature loads one BF16 key value and uses it for each local query
 head. Each head still stores 256 individual FP32 products and reduces exactly
@@ -79,3 +79,28 @@ output projection. It does not test KV append, a complete QSA layer, batching,
 session restore or full-model fidelity. Source, compiler/ISA, native bitwise,
 complete-operator, model-quality and full-workload performance gates remain
 pending. No build, test or benchmark of these additions has been run.
+
+Production source integration requires eager C1 with head dimension 256,
+compression four, budget 2048 and the caller's owned deferred-completion stream.
+Whole-graph, integer-head and prefix-roundtrip modes reject candidate grouping.
+A caller-owned eight-byte position and four-byte status live in appended arena
+storage; a small same-stream control kernel writes position without borrowing
+an asynchronous host buffer. With hierarchical selection enabled, its rejection
+status is preserved. Otherwise only this local status is initialized. No helper
+clears the separate deferred first-error record.
+
+The shared backend's source and output validation surrounds the same score,
+softmax and value/gate computation used by the component diagnostic. A publisher
+uses the distinct `qsa_attention` domain and preserves any earlier selection or
+MoE error. The existing token completion fence rejects a failed token before
+host publication. Metadata admission checks all source, writable and record
+ranges before the first projection is submitted; actual capture is rejected.
+
+Candidate IDs carry `.gqa-heads2-v1` or `.gqa-heads4-v1`, with explicit request,
+catalog, compiler/implementation and workspace binding. Receipts report actual
+host submissions and per-layer counters after the loop, labelled `not_assessed`.
+These counters are not device-completion or performance measurements. Added
+production fixture source compares full outputs, state and chronological indices
+against the incumbent, including selector composition and masked group tails.
+No compilation, fixture execution or benchmark has been performed for this source
+integration; joint review and final validation remain pending.

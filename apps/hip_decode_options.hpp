@@ -1,5 +1,6 @@
 #pragma once
 #include "strix/decode_execution_options.hpp"
+#include "strix/gdn_recurrent_layout.hpp"
 #include "strix/hip_model_residency.hpp"
 #include "strix/raw_baseline_recording.hpp"
 #include "strix/final_generation_state_export.hpp"
@@ -152,6 +153,13 @@ struct Options {
     strix::RawBaselineStatePolicy raw_state_policy = strix::RawBaselineStatePolicy::final;
     bool raw_policy_supplied = false;
     strix::DecodeExecutionOptions execution;
+    bool gdn_islands = false;
+    bool known_prefix_window = false;
+    strix::HipGdnRecurrentLayout gdn_recurrent_layout = strix::HipGdnRecurrentLayout::baseline;
+    bool gdn_recurrent_layout_explicit = false;
+    bool qsa_hierarchical_selection = false;
+    std::uint32_t qsa_gqa_heads_per_block = 1;
+    bool qsa_gqa_explicit = false;
 };
 
 inline bool is_low_level_optimization_option(std::string_view argument) {
@@ -207,6 +215,58 @@ inline void validate_resolved_q51_slot_parallel_down(const Options& options) {
         throw std::invalid_argument("slot-parallel Q5_1 down requires resolved grouped eager A8 execution");
 }
 
+inline void validate_resolved_known_prefix_window(const Options& options) {
+    if (!options.known_prefix_window) return;
+    if (!options.generate_tokens || options.execution.mode != strix::DecodeExecutionMode::eager ||
+        options.execution.integer_head != strix::DecodeIntegerHead::none || options.gpu_greedy_token ||
+        options.prepared_eager || options.moe_shared_overlap || options.gdn_islands || options.prefix_cache_roundtrip ||
+        !options.reference_path.empty() || !options.raw_recording_path.empty() ||
+        options.gdn_recurrent_layout != strix::HipGdnRecurrentLayout::baseline ||
+        options.qsa_hierarchical_selection || options.qsa_gqa_heads_per_block != 1)
+        throw std::invalid_argument("known-prefix window requires eager full-head generation without RAW/reference, alternate submission, cache, islands or candidate layouts");
+    if (!options.deferred_moe_status || !options.virtual_q8_gdn_input || !options.prefetch_q8_gdn_input ||
+        !options.virtual_q8_gdn_output || !options.wave8_q8_gdn_input || !options.wave8_q8_gdn_output)
+        throw std::invalid_argument("known-prefix window requires resolved D1 and explicit paired wave8 GDN input/output");
+}
+
+inline void validate_resolved_qsa_gqa(const Options& options) {
+    if (options.qsa_gqa_heads_per_block != 1 && options.qsa_gqa_heads_per_block != 2 && options.qsa_gqa_heads_per_block != 4)
+        throw std::invalid_argument("QSA heads per block must be 1, 2 or 4");
+    if (options.qsa_gqa_heads_per_block != 1 &&
+        (!options.deferred_moe_status || options.execution.mode != strix::DecodeExecutionMode::eager ||
+         options.execution.integer_head != strix::DecodeIntegerHead::none || options.prefix_cache_roundtrip ||
+         options.context_tokens > 262144))
+        throw std::invalid_argument("QSA grouped attention requires eager D1 without integer head or roundtrip and context<=262144");
+}
+
+inline void validate_resolved_qsa_hierarchical_selection(const Options& options) {
+    if (!options.qsa_hierarchical_selection) return;
+    if (!options.deferred_moe_status || options.execution.mode != strix::DecodeExecutionMode::eager ||
+        options.execution.integer_head != strix::DecodeIntegerHead::none || options.prefix_cache_roundtrip ||
+        options.context_tokens > 131072)
+        throw std::invalid_argument("hierarchical QSA requires eager D1 without integer head or roundtrip and context<=131072");
+}
+
+inline void validate_resolved_gdn_recurrent_layout(const Options& options) {
+    (void)strix::gdn_recurrent_layout_marker(options.gdn_recurrent_layout);
+    if (options.gdn_recurrent_layout != strix::HipGdnRecurrentLayout::baseline &&
+        (options.execution.mode != strix::DecodeExecutionMode::eager ||
+         options.execution.integer_head != strix::DecodeIntegerHead::none || options.gdn_islands))
+        throw std::invalid_argument("GDN recurrent LDS layout requires eager floating execution without islands");
+}
+
+inline void validate_resolved_gdn_islands(const Options& options) {
+    if (!options.gdn_islands) return;
+    if (options.execution.mode != strix::DecodeExecutionMode::eager ||
+        options.execution.integer_head != strix::DecodeIntegerHead::none || options.prefix_cache_roundtrip ||
+        options.gdn_recurrent_layout != strix::HipGdnRecurrentLayout::baseline ||
+        (options.wave8_q8_gdn_input != options.wave8_q8_gdn_output))
+        throw std::invalid_argument("GDN islands require eager floating execution without prefix roundtrip and paired wave8 GDN flags");
+    if (!options.deferred_moe_status || !options.virtual_q8_gdn_input ||
+        !options.prefetch_q8_gdn_input || !options.virtual_q8_gdn_output)
+        throw std::invalid_argument("GDN islands require resolved D1 and virtual/prefetch input with virtual output");
+}
+
 inline Options parse_options(
     int argc,
     char** argv) {
@@ -214,7 +274,7 @@ inline Options parse_options(
         throw std::invalid_argument(
             "usage: strix-hip-decode-token MODEL.gguf [TOKEN_ID ...] "
             "[--optimization-profile auto|manual] [--execution-inventory] [--host-dispatch-telemetry] "
-            "[--gpu-greedy-token] [--prepared-eager] [--moe-shared-overlap] [--moe-overlap-arena-budget-bytes N] [--batched-moe-activation] [--validation-final-state DIR] [--validation-final-state-max-bytes N] [--reference FILE] [--max-logit-error X] "
+            "[--gpu-greedy-token] [--gdn-recurrent-layout baseline|stride32|stride33|transposed] [--known-prefix-window] [--gdn-islands] [--qsa-hierarchical-selection] [--qsa-gqa-heads-per-block 1|2|4] [--prepared-eager] [--moe-shared-overlap] [--moe-overlap-arena-budget-bytes N] [--batched-moe-activation] [--validation-final-state DIR] [--validation-final-state-max-bytes N] [--reference FILE] [--max-logit-error X] "
             "[--context N] [--residency register|copy] [--coalesce-gap BYTES] "
             "[--planned-ple-io] [--ple-max-rows-per-io N] [--ple-max-inflight-ios N] "
             "[--generate N] [--eos-token TOKEN_ID] [--prefix-cache-roundtrip] "
@@ -252,6 +312,55 @@ inline Options parse_options(
             if (enabled) throw std::invalid_argument("duplicate Q8 projection organization option");
             enabled = true;
             continue;
+        }
+        if (argument == "--known-prefix-window") {
+            if (options.known_prefix_window) throw std::invalid_argument("duplicate known-prefix window option");
+            options.known_prefix_window = true;
+            continue;
+        }
+        if (argument == "--gdn-recurrent-layout" || argument.starts_with("--gdn-recurrent-layout=")) {
+            if (options.gdn_recurrent_layout_explicit) throw std::invalid_argument("duplicate GDN recurrent layout option");
+            std::string_view value;
+            if (argument == "--gdn-recurrent-layout") {
+                if (index + 1 >= argc) throw std::invalid_argument("GDN recurrent layout requires a value");
+                value = argv[++index];
+            } else value = argument.substr(std::string_view("--gdn-recurrent-layout=").size());
+            if (value == "baseline") options.gdn_recurrent_layout = strix::HipGdnRecurrentLayout::baseline;
+            else if (value == "stride32") options.gdn_recurrent_layout = strix::HipGdnRecurrentLayout::stride32;
+            else if (value == "stride33") options.gdn_recurrent_layout = strix::HipGdnRecurrentLayout::stride33;
+            else if (value == "transposed") options.gdn_recurrent_layout = strix::HipGdnRecurrentLayout::transposed;
+            else throw std::invalid_argument("GDN recurrent layout must be baseline, stride32, stride33 or transposed");
+            options.gdn_recurrent_layout_explicit = true;
+            continue;
+        }
+        if (argument == "--qsa-gqa-heads-per-block") {
+            if (options.qsa_gqa_explicit || index + 1 >= argc)
+                throw std::invalid_argument("QSA heads per block requires one value");
+            const std::string_view value = argv[++index];
+            if (value == "1") options.qsa_gqa_heads_per_block = 1;
+            else if (value == "2") options.qsa_gqa_heads_per_block = 2;
+            else if (value == "4") options.qsa_gqa_heads_per_block = 4;
+            else throw std::invalid_argument("QSA heads per block must be 1, 2 or 4");
+            options.qsa_gqa_explicit = true;
+            continue;
+        }
+        if (argument == "--qsa-hierarchical-selection") {
+#ifndef STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME
+            throw std::invalid_argument("--qsa-hierarchical-selection requires the experimental runtime build capability");
+#else
+            if (options.qsa_hierarchical_selection) throw std::invalid_argument("duplicate hierarchical QSA option");
+            options.qsa_hierarchical_selection = true;
+            continue;
+#endif
+        }
+        if (argument == "--gdn-islands") {
+#ifndef STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME
+            throw std::invalid_argument("--gdn-islands requires the experimental runtime build capability");
+#else
+            if (options.gdn_islands) throw std::invalid_argument("duplicate GDN islands option");
+            options.gdn_islands = true;
+            continue;
+#endif
         }
         if (argument == "--batched-moe-activation") {
 #ifndef STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME
@@ -674,6 +783,10 @@ inline Options parse_options(
     if ((options.moe_overlap_budget_explicit && !options.moe_shared_overlap) ||
         (options.moe_shared_overlap && !options.moe_overlap_arena_budget_bytes))
         throw std::invalid_argument("MoE overlap arena budget requires enabled overlap and nonzero bytes");
+    if (options.gdn_islands && (options.execution.mode != strix::DecodeExecutionMode::eager ||
+        options.execution.integer_head != strix::DecodeIntegerHead::none || options.prefix_cache_roundtrip ||
+        (options.wave8_q8_gdn_input != options.wave8_q8_gdn_output)))
+        throw std::invalid_argument("GDN islands require eager floating execution without prefix roundtrip and paired wave8 GDN flags");
     if (options.prepared_eager && (options.prefix_cache_roundtrip ||
         options.execution.mode != strix::DecodeExecutionMode::eager ||
         options.execution.integer_head != strix::DecodeIntegerHead::none))

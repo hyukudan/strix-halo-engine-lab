@@ -17,6 +17,8 @@ struct ExecutionBufferRequest {
     bool q4k_a8g32_gate_up = false;
     bool grouped_exact_q51_down = false;
     bool q51_slot_parallel_down = false;
+    bool qsa_hierarchical_selection = false;
+    std::uint32_t qsa_gqa_heads_per_block = 1;
 };
 
 struct ExecutionBufferPlan {

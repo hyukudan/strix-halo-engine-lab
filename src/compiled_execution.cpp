@@ -1,4 +1,5 @@
 #include "strix/compiled_execution.hpp"
+#include "strix/qsa_selection_plan.hpp"
 #include "strix/q8_projection_organization.hpp"
 #include "strix/qsa_input_prefetch.hpp"
 #include "strix/lane_chain_hyper_output.hpp"
@@ -217,6 +218,11 @@ std::uint64_t build_execution_identity(
     if (buffer_request.q4k_a8g32_gate_up) hash_u64(hash, 0x51344b4138473332ULL);
     if (buffer_request.grouped_exact_q51_down) hash_u64(hash, 0x5135314752505631ULL);
     if (buffer_request.q51_slot_parallel_down) hash_u64(hash, 0x5135315350415231ULL);
+    if (buffer_request.qsa_hierarchical_selection) hash_u64(hash, 0x515341544f503531ULL);
+    if (buffer_request.qsa_gqa_heads_per_block != 1) {
+        hash_u64(hash, 0x5153414751417631ULL);
+        hash_u64(hash, buffer_request.qsa_gqa_heads_per_block);
+    }
 
     hash_u64(hash, compiled.arena.alignment);
     hash_u64(hash, compiled.arena.total_bytes);
@@ -340,6 +346,24 @@ CompiledSerialExecution compile_serial_execution(
     if (binding_request.parallel_moe_router != buffer_request.parallel_moe_router)
         throw std::invalid_argument("router kernel request differs from buffer admission");
 
+    (void)gdn_recurrent_layout_marker(binding_request.gdn_recurrent_layout);
+    if (binding_request.gdn_recurrent_layout != HipGdnRecurrentLayout::baseline &&
+        (binding_request.device_graph_inputs || binding_request.require_graph_safe ||
+         binding_request.logical_rows != 1 || binding_request.request_concurrency != 1))
+        throw std::invalid_argument("GDN recurrent LDS layout requires eager C1 execution");
+    (void)qsa_gqa_organization_marker(binding_request.qsa_gqa_heads_per_block);
+    if (binding_request.qsa_gqa_heads_per_block != buffer_request.qsa_gqa_heads_per_block)
+        throw std::invalid_argument("QSA GQA organization differs from buffer admission");
+    if (binding_request.qsa_gqa_heads_per_block != 1 &&
+        (!binding_request.deferred_moe_status || binding_request.device_graph_inputs || binding_request.require_graph_safe ||
+         binding_request.logical_rows != 1 || binding_request.request_concurrency != 1))
+        throw std::invalid_argument("QSA GQA organization requires eager C1 deferred completion");
+    if (binding_request.qsa_hierarchical_selection != buffer_request.qsa_hierarchical_selection)
+        throw std::invalid_argument("hierarchical QSA request differs from buffer admission");
+    if (binding_request.qsa_hierarchical_selection &&
+        (!binding_request.deferred_moe_status || binding_request.device_graph_inputs || binding_request.require_graph_safe ||
+         binding_request.logical_rows != 1 || binding_request.request_concurrency != 1))
+        throw std::invalid_argument("hierarchical QSA requires eager C1 deferred completion");
     if (binding_request.q51_slot_parallel_down != buffer_request.q51_slot_parallel_down)
         throw std::invalid_argument("slot-parallel Q5_1 request differs from buffer admission");
     if (binding_request.q51_slot_parallel_down &&
@@ -407,6 +431,19 @@ CompiledSerialExecution compile_serial_execution(
                     throw std::invalid_argument("bound HC next-tile marker must precede only the terminal lane-chain suffix");
             }
         }
+        if (binding.op == SerialOp::gated_delta_net && binding.kernel_id) {
+            const auto expected = gdn_recurrent_layout_marker(binding_request.gdn_recurrent_layout);
+            unsigned found = 0;
+            for (const auto layout : {HipGdnRecurrentLayout::stride32, HipGdnRecurrentLayout::stride33, HipGdnRecurrentLayout::transposed}) {
+                const auto marker = gdn_recurrent_layout_marker(layout);
+                if (binding.kernel_id->find(marker) != std::string::npos) {
+                    ++found;
+                    if (marker != expected) throw std::invalid_argument("bound GDN recurrent LDS layout differs from request");
+                }
+            }
+            if (found != (expected.empty() ? 0U : 1U))
+                throw std::invalid_argument("bound GDN recurrent LDS layout marker is missing or ambiguous");
+        }
         if (binding.op == SerialOp::gated_delta_net && binding.kernel_id &&
             (binding.kernel_id->find(q8_projection_organization::gdn_wave8_marker) != std::string::npos) != binding_request.wave8_q8_gdn_input)
             throw std::invalid_argument("bound GDN wave8 organization differs from request");
@@ -416,6 +453,22 @@ CompiledSerialExecution compile_serial_execution(
         if (binding.op == SerialOp::indexed_attention && binding.kernel_id &&
             (binding.kernel_id->find(q8_projection_organization::qsa_output_wave8_marker) != std::string::npos) != binding_request.wave8_q8_qsa_output)
             throw std::invalid_argument("bound QSA output wave8 organization differs from request");
+        if (binding.op == SerialOp::indexed_attention && binding.kernel_id) {
+            const auto expected = qsa_gqa_organization_marker(binding_request.qsa_gqa_heads_per_block);
+            unsigned markers = 0;
+            for (const auto heads : {2U, 4U}) {
+                const auto marker = qsa_gqa_organization_marker(heads);
+                if (binding.kernel_id->find(marker) != std::string::npos) {
+                    ++markers;
+                    if (marker != expected) throw std::invalid_argument("bound QSA GQA organization differs from request");
+                }
+            }
+            if (markers != (expected.empty() ? 0U : 1U))
+                throw std::invalid_argument("bound QSA GQA marker is missing or ambiguous");
+        }
+        if (binding.op == SerialOp::indexed_attention && binding.kernel_id &&
+            (binding.kernel_id->find(qsa_hierarchical_selection_marker) != std::string::npos) != binding_request.qsa_hierarchical_selection)
+            throw std::invalid_argument("bound hierarchical QSA selection differs from request");
         if (binding.op == SerialOp::lm_head && binding.kernel_id) {
             const bool p1 = binding.kernel_id->find(q8_projection_organization::lm_prefetch_marker) != std::string::npos;
             const bool p8 = binding.kernel_id->find(q8_projection_organization::lm_wave8_marker) != std::string::npos;

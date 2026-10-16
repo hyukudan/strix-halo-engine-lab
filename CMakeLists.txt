@@ -1187,8 +1187,10 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         src/hip_embedding_launcher.hip
         src/hip_gdn_launcher.hip
         src/hip_known_prefix_window.hip
+        src/hip_known_prompt_backend.cpp
         src/hip_hyper_mix_launcher.hip
         src/hip_indexed_attention_launcher.hip
+        src/hip_qsa_selection_diagnostic.hip
         src/hip_serial_graph.hip
         src/hip_direct_transport_gpu_export.cpp
         src/hip_direct_gpu_pool_allocator.cpp
@@ -1229,6 +1231,8 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         target_link_libraries(strix_hip_runtime PUBLIC strix_q4k_a8_hip_probe)
         target_compile_definitions(strix_hip_runtime PUBLIC STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME=1)
     endif()
+    set_source_files_properties(src/hip_qsa_selection_diagnostic.hip
+        PROPERTIES COMPILE_OPTIONS "-mno-wavefrontsize64;-fno-fast-math")
     strix_target_warnings(strix_hip_runtime)
     if(BUILD_TESTING)
         target_compile_definitions(strix_hip_runtime PRIVATE STRIX_BUILD_GDN_LM_WAVE8_DIAGNOSTIC=1)
@@ -1238,12 +1242,8 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         target_compile_definitions(strix_hip_runtime PRIVATE STRIX_BUILD_SHARED_EXPERT_ROWS_DIAGNOSTIC=1)
         target_compile_definitions(strix_hip_runtime PRIVATE STRIX_BUILD_QSA_GQA_REUSE_DIAGNOSTIC=1)
         target_compile_definitions(strix_hip_runtime PRIVATE STRIX_BUILD_MOE_BATCHED_ACTIVATION_DIAGNOSTIC=1)
-        add_library(strix_qsa_selection_diagnostic STATIC src/hip_qsa_selection_diagnostic.hip)
-        target_include_directories(strix_qsa_selection_diagnostic PUBLIC include "${STRIX_HIP_INCLUDE_DIR}")
-        target_link_libraries(strix_qsa_selection_diagnostic PUBLIC strix_core "${STRIX_HIP_RUNTIME_LIBRARY}")
-        set_target_properties(strix_qsa_selection_diagnostic PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
-        target_compile_options(strix_qsa_selection_diagnostic PRIVATE -mno-wavefrontsize64 -fno-fast-math)
-        strix_target_warnings(strix_qsa_selection_diagnostic)
+        add_library(strix_qsa_selection_diagnostic INTERFACE)
+        target_link_libraries(strix_qsa_selection_diagnostic INTERFACE strix_hip_runtime)
         add_executable(strix-hip-qsa-selection-diagnostic-tests tests/hip_qsa_selection_diagnostic_tests.hip)
         target_link_libraries(strix-hip-qsa-selection-diagnostic-tests PRIVATE strix_qsa_selection_diagnostic)
         set_target_properties(strix-hip-qsa-selection-diagnostic-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)

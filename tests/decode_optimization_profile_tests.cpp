@@ -32,7 +32,7 @@ int main() {
            defaults.context_tokens == 128 && !defaults.q4k_a8g32_gate_up &&
            !defaults.profile_explicit && !defaults.any_low_level_flag &&
            !defaults.prefetch_q8_qsa_input && !defaults.prefetch_q8_shared_expert &&
-           !defaults.deferred_moe_status && !defaults.gpu_greedy_token && !defaults.prepared_eager && !defaults.moe_shared_overlap && !defaults.batched_moe_activation,
+           !defaults.deferred_moe_status && !defaults.gpu_greedy_token && !defaults.prepared_eager && !defaults.moe_shared_overlap && !defaults.batched_moe_activation && !defaults.gdn_islands,
            "parser defers auto until content identification");
     auto on = defaults;
     auto inventory_only = parse({"decoder", "fixture.gguf", "1", "--execution-inventory"});
@@ -91,6 +91,140 @@ int main() {
 #else
     rejects([] { static_cast<void>(parse({"decoder", "m", "1", "--batched-moe-activation"})); },
         "--batched-moe-activation requires the experimental runtime build capability");
+#endif
+#ifdef STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME
+    auto islands = parse({"decoder", "fixture.gguf", "1", "--generate", "2", "--gdn-islands",
+        "--prepared-eager", "--gpu-greedy-token", "--moe-shared-overlap"});
+    const auto islands_profile = resolve_optimization_profile(islands, model, info, manifest,
+        validated_model_content_identity, true);
+    validate_resolved_gdn_islands(islands);
+    expect(islands.gdn_islands && !islands.any_low_level_flag && islands_profile.automatic_applied &&
+        islands.prepared_eager && islands.gpu_greedy_token && islands.moe_shared_overlap &&
+        islands.deferred_moe_status && islands.virtual_q8_gdn_input && islands.prefetch_q8_gdn_input &&
+        islands.virtual_q8_gdn_output && !islands.wave8_q8_gdn_input && !islands.wave8_q8_gdn_output,
+        "GDN islands preserve automatic arithmetic and compose with eager submission overlays");
+    auto wave_islands = parse({"decoder", "fixture.gguf", "1", "--gdn-islands",
+        "--wave8-q8-gdn-input", "--wave8-q8-gdn-output"});
+    const auto wave_islands_profile = resolve_optimization_profile(wave_islands, model, info, manifest,
+        validated_model_content_identity, true);
+    validate_resolved_gdn_islands(wave_islands);
+    expect(wave_islands_profile.automatic_applied && wave_islands.wave8_q8_gdn_input && wave_islands.wave8_q8_gdn_output,
+        "paired wave8 island organization preserves explicitly requested geometry without altering defaults");
+    rejects([] { static_cast<void>(parse({"decoder", "m", "1", "--gdn-islands", "--gdn-islands"})); },
+        "duplicate GDN islands option");
+    for (const auto* wave : {"--wave8-q8-gdn-input", "--wave8-q8-gdn-output"})
+        rejects([&] { static_cast<void>(parse({"decoder", "m", "1", "--gdn-islands", wave})); },
+            "GDN islands require eager floating execution without prefix roundtrip and paired wave8 GDN flags");
+    rejects([] { static_cast<void>(parse({"decoder", "m", "1", "--gdn-islands", "--prefix-cache-roundtrip", "--generate", "2"})); },
+        "GDN islands require eager floating execution without prefix roundtrip and paired wave8 GDN flags");
+    auto unsupported_islands = islands;
+    unsupported_islands.execution.mode = DecodeExecutionMode::graph;
+    rejects([&] { validate_resolved_gdn_islands(unsupported_islands); },
+        "GDN islands require eager floating execution without prefix roundtrip and paired wave8 GDN flags");
+    unsupported_islands = islands;
+    unsupported_islands.execution.integer_head = DecodeIntegerHead::a8_iu8;
+    rejects([&] { validate_resolved_gdn_islands(unsupported_islands); },
+        "GDN islands require eager floating execution without prefix roundtrip and paired wave8 GDN flags");
+    for (unsigned missing = 0; missing < 4; ++missing) {
+        auto missing_dependency = islands;
+        if (missing == 0) missing_dependency.deferred_moe_status = false;
+        if (missing == 1) missing_dependency.virtual_q8_gdn_input = false;
+        if (missing == 2) missing_dependency.prefetch_q8_gdn_input = false;
+        if (missing == 3) missing_dependency.virtual_q8_gdn_output = false;
+        rejects([&] { validate_resolved_gdn_islands(missing_dependency); },
+            "GDN islands require resolved D1 and virtual/prefetch input with virtual output");
+    }
+    auto manual_islands = parse({"decoder", "m", "1", "--optimization-profile", "manual", "--gdn-islands"});
+    rejects([&] { validate_resolved_gdn_islands(manual_islands); },
+        "GDN islands require resolved D1 and virtual/prefetch input with virtual output");
+#else
+    rejects([] { static_cast<void>(parse({"decoder", "m", "1", "--gdn-islands"})); },
+        "--gdn-islands requires the experimental runtime build capability");
+#endif
+    validate_resolved_gdn_islands(defaults);
+    expect(!defaults.qsa_hierarchical_selection, "hierarchical QSA stays opt-in");
+    validate_resolved_qsa_hierarchical_selection(defaults);
+    expect(!defaults.known_prefix_window, "known-prefix route stays opt-in");
+    validate_resolved_known_prefix_window(defaults);
+    auto paired_prompt = defaults;
+    paired_prompt.known_prefix_window = true; paired_prompt.generate_tokens = 3;
+    paired_prompt.deferred_moe_status = true;
+    paired_prompt.virtual_q8_gdn_input = paired_prompt.prefetch_q8_gdn_input = true;
+    paired_prompt.virtual_q8_gdn_output = paired_prompt.wave8_q8_gdn_input = paired_prompt.wave8_q8_gdn_output = true;
+    validate_resolved_known_prefix_window(paired_prompt);
+    expect(parse({"decoder", "m", "1", "--known-prefix-window"}).known_prefix_window,
+        "parser records opt-in before resolved profile admission");
+    rejects([] { (void)parse({"decoder", "m", "1", "--known-prefix-window", "--known-prefix-window"}); },
+        "duplicate known-prefix window option");
+    for (unsigned mutation = 0; mutation < 10; ++mutation) {
+        auto bad = paired_prompt;
+        if (mutation == 0) bad.gpu_greedy_token = true;
+        if (mutation == 1) bad.prepared_eager = true;
+        if (mutation == 2) bad.moe_shared_overlap = true;
+        if (mutation == 3) bad.gdn_islands = true;
+        if (mutation == 4) bad.qsa_hierarchical_selection = true;
+        if (mutation == 5) bad.qsa_gqa_heads_per_block = 2;
+        if (mutation == 6) bad.gdn_recurrent_layout = HipGdnRecurrentLayout::stride33;
+        if (mutation == 7) bad.execution.mode = DecodeExecutionMode::graph;
+        if (mutation == 8) bad.execution.integer_head = DecodeIntegerHead::a8_iu8;
+        if (mutation == 9) bad.raw_recording_path = "unused-RAW-path";
+        rejects([&] { validate_resolved_known_prefix_window(bad); },
+            "known-prefix window requires eager full-head generation without RAW/reference, alternate submission, cache, islands or candidate layouts");
+    }
+    paired_prompt.wave8_q8_gdn_output = false;
+    rejects([&] { validate_resolved_known_prefix_window(paired_prompt); },
+        "known-prefix window requires resolved D1 and explicit paired wave8 GDN input/output");
+    expect(defaults.qsa_gqa_heads_per_block == 1 && defaults.gdn_recurrent_layout == HipGdnRecurrentLayout::baseline,
+        "existing QSA and GDN organizations remain default");
+    for (const auto* value : {"1", "2", "4"}) {
+        auto grouped = parse({"decoder", "fixture.gguf", "1", "--qsa-gqa-heads-per-block", value});
+        const auto selected_grouped = resolve_optimization_profile(grouped, model, info, manifest,
+            validated_model_content_identity, true);
+        validate_resolved_qsa_gqa(grouped);
+        expect(selected_grouped.automatic_applied && !grouped.any_low_level_flag,
+            "explicit GQA geometry preserves the automatic arithmetic profile");
+    }
+    rejects([] { (void)parse({"decoder", "m", "1", "--qsa-gqa-heads-per-block", "3"}); },
+        "QSA heads per block must be 1, 2 or 4");
+    rejects([] { (void)parse({"decoder", "m", "1", "--qsa-gqa-heads-per-block", "2", "--qsa-gqa-heads-per-block", "4"}); },
+        "QSA heads per block requires one value");
+    for (const auto* layout : {"baseline", "stride32", "stride33", "transposed"}) {
+        auto chosen_layout = parse({"decoder", "fixture.gguf", "1", "--gdn-recurrent-layout", layout});
+        const auto layout_profile = resolve_optimization_profile(chosen_layout, model, info, manifest,
+            validated_model_content_identity, true);
+        validate_resolved_gdn_recurrent_layout(chosen_layout);
+        expect(chosen_layout.gdn_recurrent_layout_explicit && !chosen_layout.any_low_level_flag && layout_profile.automatic_applied,
+            "explicit GDN LDS geometry preserves automatic selection");
+    }
+    expect(parse({"decoder", "m", "1", "--gdn-recurrent-layout=stride33"}).gdn_recurrent_layout == HipGdnRecurrentLayout::stride33,
+        "GDN recurrent layout also accepts the explicit equals form");
+    rejects([] { (void)parse({"decoder", "m", "1", "--gdn-recurrent-layout", "other"}); },
+        "GDN recurrent layout must be baseline, stride32, stride33 or transposed");
+    auto bad_layout = defaults; bad_layout.gdn_recurrent_layout = HipGdnRecurrentLayout::stride32; bad_layout.gdn_islands = true;
+    rejects([&] { validate_resolved_gdn_recurrent_layout(bad_layout); },
+        "GDN recurrent LDS layout requires eager floating execution without islands");
+#ifdef STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME
+    auto hierarchical = parse({"decoder", "fixture.gguf", "1", "--qsa-hierarchical-selection"});
+    const auto hierarchical_profile = resolve_optimization_profile(hierarchical, model, info, manifest,
+        validated_model_content_identity, true);
+    validate_resolved_qsa_hierarchical_selection(hierarchical);
+    expect(hierarchical.qsa_hierarchical_selection && !hierarchical.any_low_level_flag && hierarchical_profile.automatic_applied,
+        "hierarchical selection preserves automatic kernel profile selection");
+    rejects([] { (void)parse({"decoder", "m", "1", "--qsa-hierarchical-selection", "--qsa-hierarchical-selection"}); },
+        "duplicate hierarchical QSA option");
+    for (unsigned mutation = 0; mutation < 5; ++mutation) {
+        auto bad = hierarchical;
+        if (mutation == 0) bad.deferred_moe_status = false;
+        if (mutation == 1) bad.execution.mode = DecodeExecutionMode::graph;
+        if (mutation == 2) bad.execution.integer_head = DecodeIntegerHead::a8_iu8;
+        if (mutation == 3) bad.prefix_cache_roundtrip = true;
+        if (mutation == 4) bad.context_tokens = 131073;
+        rejects([&] { validate_resolved_qsa_hierarchical_selection(bad); },
+            "hierarchical QSA requires eager D1 without integer head or roundtrip and context<=131072");
+    }
+#else
+    rejects([] { (void)parse({"decoder", "m", "1", "--qsa-hierarchical-selection"}); },
+        "--qsa-hierarchical-selection requires the experimental runtime build capability");
 #endif
     auto instrumented = parse({"decoder", "fixture.gguf", "1", "--host-dispatch-telemetry"});
     const auto instrumented_profile = resolve_optimization_profile(instrumented, model, info, manifest,

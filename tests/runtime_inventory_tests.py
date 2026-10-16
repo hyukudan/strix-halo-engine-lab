@@ -90,7 +90,7 @@ class InventoryTests(unittest.TestCase):
     def test_overlay_absence_false_unknown_and_invalid_types(self):
         inactive = {key: False for key in ("batched_moe_activation", "prefetch_q8_lm_head",
                                           "wave8_q8_lm_head", "wave8_q8_gdn_input",
-                                          "wave8_q8_gdn_output", "wave8_q8_qsa_output", "prefetch_hc_projection_next_tile", "q51_slot_parallel_down")}
+                                          "wave8_q8_gdn_output", "wave8_q8_qsa_output", "prefetch_hc_projection_next_tile", "q51_slot_parallel_down", "qsa_hierarchical_selection")}
         result = self.collect(receipt_path=self.evidence("no-overlays.json", inactive))
         for key in inactive:
             self.assertIs(result["reported_opt_in_overlays"][key], False)
@@ -104,7 +104,7 @@ class InventoryTests(unittest.TestCase):
                 with self.subTest(field=field, value=value), self.assertRaises(ValueError):
                     self.collect(receipt_path=self.evidence("invalid-overlay.json", {field: value}))
         for field in ("batched_moe_activation", "prefetch_q8_lm_head", "wave8_q8_lm_head", "wave8_q8_gdn_input",
-                      "wave8_q8_gdn_output", "wave8_q8_qsa_output", "prefetch_hc_projection_next_tile", "q51_slot_parallel_down"):
+                      "wave8_q8_gdn_output", "wave8_q8_qsa_output", "prefetch_hc_projection_next_tile", "q51_slot_parallel_down", "qsa_hierarchical_selection"):
             for value in (1, 0, 0.0, "true", [], {}):
                 with self.subTest(field=field, value=value), self.assertRaises(ValueError):
                     self.collect(receipt_path=self.evidence("invalid-bool-overlay.json", {field: value}))
@@ -474,6 +474,38 @@ class InventoryTests(unittest.TestCase):
             with self.subTest(status=status), self.assertRaises(ValueError):
                 INVENTORY.operator_records({"requirements": [{"op": "lm_head", "status": status}]}, {})
 
+
+    def test_grouped_attention_and_recurrent_layout_contract(self):
+        for heads in (1, 2, 4):
+            INVENTORY.validate_outer_receipt({"qsa_gqa_heads_per_block": heads, "qsa_gqa_qualification": "not_assessed"})
+        for heads in (True, 0, 3, "2", None):
+            with self.subTest(heads=heads), self.assertRaises(ValueError):
+                INVENTORY.validate_outer_receipt({"qsa_gqa_heads_per_block": heads})
+        for layout in (".lds32-v1", ".lds33-v1", ".lds-transposed-v1"):
+            INVENTORY.validate_outer_receipt({"gdn_recurrent_layout": layout, "gdn_recurrent_layout_qualification": "not_assessed"})
+        with self.assertRaises(ValueError):
+            INVENTORY.validate_outer_receipt({"gdn_recurrent_layout": "unknown"})
+        with self.assertRaises(ValueError):
+            INVENTORY.validate_outer_receipt({"qsa_gqa_submissions": 1, "qsa_gqa_layer_submissions": [0] * 48})
+
+    def test_hierarchical_qsa_observation_contract(self):
+        counts = [0] * 48
+        counts[3] = 2
+        good = {"qsa_hierarchical_selection": True,
+                "qsa_hierarchical_selection_qualification": "not_assessed",
+                "qsa_hierarchical_selection_submissions": 2,
+                "qsa_hierarchical_selection_layer_submissions": counts}
+        INVENTORY.validate_outer_receipt(good)
+        for key, value in (("qsa_hierarchical_selection", 1),
+                           ("qsa_hierarchical_selection_qualification", "passed"),
+                           ("qsa_hierarchical_selection_submissions", 3),
+                           ("qsa_hierarchical_selection_layer_submissions", counts[:-1])):
+            bad = dict(good); bad[key] = value
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                INVENTORY.validate_outer_receipt(bad)
+        bad = dict(good); bad["qsa_hierarchical_selection"] = False
+        with self.assertRaises(ValueError):
+            INVENTORY.validate_outer_receipt(bad)
 
     def test_reported_environment_never_proves_effective_queues_or_overlap(self):
         value = {"source": "decoder-process", "requested": {key: None for key in INVENTORY.RUNTIME_ENVIRONMENT_KEYS},

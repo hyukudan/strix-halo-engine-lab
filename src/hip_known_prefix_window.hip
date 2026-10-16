@@ -89,7 +89,7 @@ struct HipKnownPrefixWindow::Impl {
     std::vector<std::uint64_t> position_readers;
     HipSharedExpertLauncherConfig shared_config, shared_fallback;
     HipGdnLauncherConfig gdn_config;
-    std::array<KnownWindowR2Entry, 2> r2_entries;
+    std::array<KnownWindowR2Entry, 3> r2_entries;
     DeferredMoeFirstError completion_status{};
     bool failed = false;
 
@@ -106,6 +106,9 @@ struct HipKnownPrefixWindow::Impl {
             serial.request_concurrency != 1U || config.activation != HipActivationStorage::bf16)
             throw std::invalid_argument("known-window native owner supports eager BF16 C1 plans only");
         validate_compiled_known_prefix_window(window, serial);
+        if (!resources.model_manifest || !resources.tensor_access)
+            throw std::invalid_argument("known-window native owner requires manifest and tensor access resources");
+        validate_known_prefix_window_formats(window, serial, *resources.model_manifest, *resources.tensor_access);
         kernels::KernelRegistry admitted;
         register_complete_hip_kernel_catalog(model, binding_request(config), config, admitted);
         for (const auto& binding : serial.bindings.bindings)
@@ -224,6 +227,13 @@ struct HipKnownPrefixWindow::Impl {
             },
             [](std::span<const ExecutionDispatchContext, 2> rows, void* object) {
                 gdn_known_window_r2_launch(rows, static_cast<Impl*>(object)->gdn_config);
+            }};
+        r2_entries[2] = {KnownWindowR2Variant::gdn_q8_rows2_f32_gates_r1_v1, this,
+            [](std::span<const ExecutionDispatchContext, 2> rows, void* object) {
+                gdn_known_window_r2_f32_gates_preflight(rows, static_cast<Impl*>(object)->gdn_config);
+            },
+            [](std::span<const ExecutionDispatchContext, 2> rows, void* object) {
+                gdn_known_window_r2_f32_gates_launch(rows, static_cast<Impl*>(object)->gdn_config);
             }};
     }
     void complete() {

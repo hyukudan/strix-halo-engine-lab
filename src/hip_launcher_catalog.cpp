@@ -27,9 +27,9 @@ std::uint32_t checked_u32(
 
 
 
-HipGdnLauncherConfig gdn_config(const ModelContract& model,
+HipGdnLauncherConfig make_gdn_config(const ModelContract& model,
     HipActivationStorage activation, bool graph, bool virtual_q8, bool prefetch_q8, bool virtual_output,
-    bool wave8, bool wave8_output) {
+    bool wave8, bool wave8_output, HipGdnRecurrentLayout recurrent_layout = HipGdnRecurrentLayout::baseline) {
     HipGdnLauncherConfig config;
     config.model = model;
     config.activation = activation;
@@ -39,6 +39,7 @@ HipGdnLauncherConfig gdn_config(const ModelContract& model,
     config.wave8_q8_input_projections = wave8;
     config.virtual_q8_output_projection = virtual_output;
     config.wave8_q8_output_projection = wave8_output;
+    config.recurrent_layout = recurrent_layout;
     return config;
 }
 
@@ -47,7 +48,9 @@ indexed_attention_config(
     const ModelContract& model,
     HipActivationStorage activation, bool graph = false, bool prefetch = false,
     std::vector<std::uint32_t> layers = {}, std::shared_ptr<qsa_input_prefetch::RuntimeDispatchStats> stats = {},
-    bool wave8_output = false) {
+    bool wave8_output = false, bool hierarchical_selection = false,
+    std::shared_ptr<QsaHierarchicalSelectionStats> selection_stats = {},
+    std::uint32_t gqa_heads = 1, std::shared_ptr<QsaHierarchicalSelectionStats> gqa_stats = {}) {
     HipIndexedAttentionLauncherConfig config;
     config.model = model;
     config.activation = activation;
@@ -56,6 +59,10 @@ indexed_attention_config(
     config.prefetch_eligible_layers=std::move(layers);
     config.prefetch_stats=std::move(stats);
     config.wave8_q8_output = wave8_output;
+    config.qsa_hierarchical_selection = hierarchical_selection;
+    config.selection_stats = std::move(selection_stats);
+    config.qsa_gqa_heads_per_block = gqa_heads;
+    config.gqa_stats = std::move(gqa_stats);
     return config;
 }
 
@@ -254,6 +261,27 @@ void register_complete_hip_kernel_catalog(
     HipLauncherCatalogConfig config,
     kernels::KernelRegistry& registry,
     const integer_projection::RuntimeConfig* alternate_lm_head) {
+    (void)gdn_recurrent_layout_marker(config.gdn_recurrent_layout);
+    if (request.gdn_recurrent_layout != config.gdn_recurrent_layout)
+        throw std::invalid_argument("GDN recurrent layout request/config mismatch");
+    if (config.gdn_recurrent_layout != HipGdnRecurrentLayout::baseline &&
+        (alternate_lm_head || config.enable_device_graph_inputs || request.device_graph_inputs || request.require_graph_safe))
+        throw std::invalid_argument("GDN recurrent LDS layouts support eager floating execution only");
+    (void)qsa_gqa_organization_marker(config.qsa_gqa_heads_per_block);
+    if (request.qsa_gqa_heads_per_block != config.qsa_gqa_heads_per_block)
+        throw std::invalid_argument("QSA GQA catalog request/config mismatch");
+    if (config.qsa_gqa_heads_per_block != 1 &&
+        (alternate_lm_head || config.enable_device_graph_inputs || !config.deferred_moe_status ||
+         !request.deferred_moe_status || request.device_graph_inputs || request.require_graph_safe ||
+         request.logical_rows != 1 || request.request_concurrency != 1))
+        throw std::invalid_argument("QSA GQA catalog requires eager C1 deferred completion without integer head");
+    if (request.qsa_hierarchical_selection != config.qsa_hierarchical_selection)
+        throw std::invalid_argument("hierarchical QSA catalog request/config mismatch");
+    if (config.qsa_hierarchical_selection &&
+        (alternate_lm_head || config.enable_device_graph_inputs || !config.deferred_moe_status ||
+         !request.deferred_moe_status || request.device_graph_inputs || request.require_graph_safe ||
+         request.logical_rows != 1 || request.request_concurrency != 1))
+        throw std::invalid_argument("hierarchical QSA catalog requires eager C1 deferred completion without integer head");
     if (alternate_lm_head && config.virtual_q8_lm_head)
         throw std::invalid_argument("integer and virtual Q8 LM heads are mutually exclusive");
     if (alternate_lm_head && config.enable_device_graph_inputs)
@@ -360,8 +388,8 @@ void register_complete_hip_kernel_catalog(
         registry,
         qualification);
 
-    const auto gdn = gdn_config(model, config.activation,
-        config.enable_device_graph_inputs, config.virtual_q8_gdn_input, config.prefetch_q8_gdn_input, config.virtual_q8_gdn_output, config.wave8_q8_gdn_input, config.wave8_q8_gdn_output);
+    const auto gdn = make_gdn_config(model, config.activation,
+        config.enable_device_graph_inputs, config.virtual_q8_gdn_input, config.prefetch_q8_gdn_input, config.virtual_q8_gdn_output, config.wave8_q8_gdn_input, config.wave8_q8_gdn_output, config.gdn_recurrent_layout);
     register_hip_gdn_kernel_variant(
         model,
         request,
@@ -372,7 +400,7 @@ void register_complete_hip_kernel_catalog(
     const auto indexed =
         indexed_attention_config(
             model,
-            config.activation, config.enable_device_graph_inputs, config.prefetch_q8_qsa_input, config.qsa_input_prefetch_layers, config.qsa_input_prefetch_stats, config.wave8_q8_qsa_output);
+            config.activation, config.enable_device_graph_inputs, config.prefetch_q8_qsa_input, config.qsa_input_prefetch_layers, config.qsa_input_prefetch_stats, config.wave8_q8_qsa_output, config.qsa_hierarchical_selection, config.qsa_selection_stats, config.qsa_gqa_heads_per_block, config.qsa_gqa_stats);
     if(config.prefetch_q8_qsa_input){auto base=indexed;base.prefetch_q8_input=false;base.prefetch_eligible_layers.clear();auto base_request=request;base_request.prefetch_q8_qsa_input=false;base_request.qsa_input_prefetch_layers.clear();register_hip_indexed_attention_kernel_variant(model,base_request,base,registry,qualification);}
     register_hip_indexed_attention_kernel_variant(
         model,
@@ -458,7 +486,7 @@ HipLauncherCatalog::HipLauncherCatalog(
     const ModelContract& model,
     HipLauncherCatalogConfig config,
     std::shared_ptr<integer_projection::HipIntegerProjectionRuntimeBundle> alternate_lm_head)
-    : device_graph_inputs_(config.enable_device_graph_inputs), alternate_lm_head_(std::move(alternate_lm_head)), elementwise_(
+    : device_graph_inputs_(config.enable_device_graph_inputs), deferred_moe_status_(config.deferred_moe_status), alternate_lm_head_(std::move(alternate_lm_head)), elementwise_(
           elementwise_config(
               model,
               config.activation)),
@@ -466,13 +494,14 @@ HipLauncherCatalog::HipLauncherCatalog(
           ple_config(
               model,
               config.activation, config.enable_device_graph_inputs)),
-      gdn_(
-          gdn_config(model, config.activation,
-              config.enable_device_graph_inputs, config.virtual_q8_gdn_input, config.prefetch_q8_gdn_input, config.virtual_q8_gdn_output, config.wave8_q8_gdn_input, config.wave8_q8_gdn_output)),
+      gdn_config_(
+          make_gdn_config(model, config.activation,
+              config.enable_device_graph_inputs, config.virtual_q8_gdn_input, config.prefetch_q8_gdn_input, config.virtual_q8_gdn_output, config.wave8_q8_gdn_input, config.wave8_q8_gdn_output, config.gdn_recurrent_layout)),
+      gdn_(gdn_config_),
       indexed_attention_(
           indexed_attention_config(
               model,
-              config.activation, config.enable_device_graph_inputs, config.prefetch_q8_qsa_input, config.qsa_input_prefetch_layers, config.qsa_input_prefetch_stats, config.wave8_q8_qsa_output)),
+              config.activation, config.enable_device_graph_inputs, config.prefetch_q8_qsa_input, config.qsa_input_prefetch_layers, config.qsa_input_prefetch_stats, config.wave8_q8_qsa_output, config.qsa_hierarchical_selection, config.qsa_selection_stats, config.qsa_gqa_heads_per_block, config.qsa_gqa_stats)),
       embedding_(
           embedding_config(
               model,
@@ -499,6 +528,17 @@ HipLauncherCatalog::HipLauncherCatalog(
               model,
               config.activation,config.prefetch_q8_shared_expert,config.shared_expert_prefetch_layers,
               config.shared_expert_prefetch_stats)) {
+    (void)gdn_recurrent_layout_marker(config.gdn_recurrent_layout);
+    if (config.gdn_recurrent_layout != HipGdnRecurrentLayout::baseline &&
+        (config.enable_device_graph_inputs || alternate_lm_head_))
+        throw std::invalid_argument("GDN recurrent LDS layouts support eager floating execution only");
+    (void)qsa_gqa_organization_marker(config.qsa_gqa_heads_per_block);
+    if (config.qsa_gqa_heads_per_block != 1 &&
+        (config.enable_device_graph_inputs || alternate_lm_head_ || !config.deferred_moe_status))
+        throw std::invalid_argument("QSA GQA catalog requires eager deferred completion without integer head");
+    if (config.qsa_hierarchical_selection &&
+        (config.enable_device_graph_inputs || alternate_lm_head_ || !config.deferred_moe_status))
+        throw std::invalid_argument("hierarchical QSA catalog requires eager deferred completion without integer head");
     if (config.q51_slot_parallel_down && alternate_lm_head_)
         throw std::invalid_argument("HIP catalog slot-parallel Q5_1 excludes an integer LM head");
     if ((config.prefetch_q8_lm_head || config.wave8_q8_lm_head || config.wave8_q8_gdn_input ||
@@ -521,9 +561,16 @@ void HipLauncherCatalog::
 register_for_compiled_execution(
     const CompiledSerialExecution& compiled,
     ExecutionLauncherRegistry& registry,
-    const ExecutionRuntimeResources* resources) {
+    const ExecutionRuntimeResources* resources,
+    std::shared_ptr<HipGdnIslands> gdn_islands) {
+    if (gdn_islands && (device_graph_inputs_ || alternate_lm_head_ || !deferred_moe_status_ || !resources ||
+        (gdn_config_.wave8_q8_input_projections != gdn_config_.wave8_q8_output_projection) ||
+        gdn_config_.recurrent_layout != HipGdnRecurrentLayout::baseline))
+        throw std::invalid_argument("GDN islands require eager floating execution with retained D1 resources");
     if (compiled.device_graph_inputs != device_graph_inputs_)
         throw std::invalid_argument("launcher catalog graph mode differs from compiled plan");
+    // Retain before publishing any borrowed island userdata, including partial registration failure.
+    if (gdn_islands) gdn_island_owners_.push_back(gdn_islands);
     if (device_graph_inputs_) register_hip_graph_position_launcher(registry);
     else register_default_runtime_launchers(registry);
     elementwise_.
@@ -537,7 +584,7 @@ register_for_compiled_execution(
     gdn_.
         register_for_compiled_execution(
             compiled,
-            registry);
+            registry, gdn_islands.get());
     indexed_attention_.
         register_for_compiled_execution(
             compiled,

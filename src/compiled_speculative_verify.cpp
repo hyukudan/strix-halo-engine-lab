@@ -497,21 +497,38 @@ bool window_shared_types(const ModelManifest& manifest, const ExecutionTensorAcc
         "known window scalar gate extent/alignment mismatch");
     return g && u && d;
 }
-bool window_gdn_types(const ModelManifest& manifest, const ExecutionTensorAccessPlan& access,
-    const ExecutionStep& step) {
-    bool eligible = true;
+enum class WindowGdnFormat { unsupported, all_q8, q8_large_f32_gates };
+WindowGdnFormat window_gdn_format(const ModelManifest& manifest, const ExecutionTensorAccessPlan& access,
+    const ExecutionStep& step, bool admit_f32_gates) {
+    bool all_q8 = true, large_q8 = true, f32_gates = true;
+    std::size_t index = 0;
     for (const auto& item : std::array<std::pair<std::string_view, std::array<std::uint64_t, 2>>, 5>{{
         {"attn_qkv.weight", {2560, 10240}}, {"attn_gate.weight", {2560, 6144}},
         {"ssm_beta.weight", {2560, 48}}, {"ssm_alpha.weight", {2560, 48}},
         {"ssm_out.weight", {6144, 2560}}}}) {
         const auto& tensor = window_tensor(manifest, access, step.id, step.op, *step.layer, item.first);
-        eligible = window_matrix(tensor, item.second[0], item.second[1]) && eligible;
+        // Always resolve and shape-check all five operands, even for fallback.
+        const bool q8 = window_matrix(tensor, item.second[0], item.second[1]);
+        all_q8 = q8 && all_q8;
+        if (index == 2U || index == 3U) {
+            f32_gates = tensor.ggml_type == 0U && f32_gates;
+            if (admit_f32_gates && tensor.ggml_type == 0U) {
+                window_require(tensor.byte_size == 491520ULL && tensor.absolute_offset % 16U == 0 &&
+                    tensor.byte_size <= std::numeric_limits<std::uint64_t>::max() - tensor.absolute_offset,
+                    "known window F32 gate extent/alignment is invalid");
+            }
+        } else large_q8 = q8 && large_q8;
+        ++index;
     }
-    return eligible;
+    if (all_q8) return WindowGdnFormat::all_q8;
+    if (admit_f32_gates && large_q8 && f32_gates) return WindowGdnFormat::q8_large_f32_gates;
+    return WindowGdnFormat::unsupported;
 }
 constexpr std::uint64_t known_shared_projection_bytes = 3ULL * (2560ULL / 32ULL * 34ULL * 640ULL);
 constexpr std::uint64_t known_gdn_projection_bytes = 2560ULL / 32ULL * 34ULL *
     (10240ULL + 6144ULL + 48ULL + 48ULL) + 6144ULL / 32ULL * 34ULL * 2560ULL;
+constexpr std::uint64_t known_gdn_q8_large_projection_bytes = 2560ULL / 32ULL * 34ULL *
+    (10240ULL + 6144ULL) + 6144ULL / 32ULL * 34ULL * 2560ULL;
 std::pair<std::uint64_t, std::uint64_t> known_window_identities(
     const CompiledKnownPrefixWindow& window, const CompiledSerialExecution& serial) {
     window_require(window.mode.size() == serial.execution.steps.size() &&
@@ -532,9 +549,15 @@ std::pair<std::uint64_t, std::uint64_t> known_window_identities(
                 binding.kernel_id && known_shared_id(*binding.kernel_id), "known window shared variant/source ID mismatch"); ++r2;
             avoided += known_shared_projection_bytes; launches += 3;
         } else if (mode == KnownWindowStepMode::r2_gdn_staged) {
-            window_require(step.op == SerialOp::gated_delta_net && variant == KnownWindowR2Variant::gdn_q8_virtual256_r2_v1 &&
+            window_require(step.op == SerialOp::gated_delta_net &&
+                (variant == KnownWindowR2Variant::gdn_q8_virtual256_r2_v1 ||
+                 variant == KnownWindowR2Variant::gdn_q8_rows2_f32_gates_r1_v1) &&
                 binding.kernel_id && *binding.kernel_id == known_gdn_wave8, "known window GDN variant/source ID mismatch"); ++r2;
-            avoided += known_gdn_projection_bytes; launches += 5;
+            if (variant == KnownWindowR2Variant::gdn_q8_virtual256_r2_v1) {
+                avoided += known_gdn_projection_bytes; launches += 5;
+            } else {
+                avoided += known_gdn_q8_large_projection_bytes; launches += 3;
+            }
         } else throw std::invalid_argument("known window mode is not in the closed table");
         hash_u64(kernel, step.id); hash_u64(kernel, static_cast<std::uint64_t>(mode));
         hash_u64(kernel, static_cast<std::uint64_t>(variant));
@@ -617,13 +640,21 @@ CompiledKnownPrefixWindow compile_known_prefix_window(
                     window_tensor(manifest, tensor_access, step.id, step.op, *step.layer, suffix).byte_size;
             output.projection_launches_saved += 3;
         } else if (request.r2_gdn && step.op == SerialOp::gated_delta_net && binding.kernel_id &&
-            *binding.kernel_id == known_gdn_wave8 && window_gdn_types(manifest, tensor_access, step)) {
-            output.mode[i] = KnownWindowStepMode::r2_gdn_staged;
-            output.r2_variant[i] = KnownWindowR2Variant::gdn_q8_virtual256_r2_v1;
-            for (const auto suffix : {"attn_qkv.weight", "attn_gate.weight", "ssm_beta.weight", "ssm_alpha.weight", "ssm_out.weight"})
-                output.logical_projection_weight_bytes_avoided +=
-                    window_tensor(manifest, tensor_access, step.id, step.op, *step.layer, suffix).byte_size;
-            output.projection_launches_saved += 5;
+            *binding.kernel_id == known_gdn_wave8) {
+            const auto format = window_gdn_format(manifest, tensor_access, step, request.r2_gdn_f32_gates);
+            if (format != WindowGdnFormat::unsupported) {
+                const bool mixed = format == WindowGdnFormat::q8_large_f32_gates;
+                output.mode[i] = KnownWindowStepMode::r2_gdn_staged;
+                output.r2_variant[i] = mixed ? KnownWindowR2Variant::gdn_q8_rows2_f32_gates_r1_v1 :
+                    KnownWindowR2Variant::gdn_q8_virtual256_r2_v1;
+                for (const auto suffix : {"attn_qkv.weight", "attn_gate.weight", "ssm_beta.weight", "ssm_alpha.weight", "ssm_out.weight"}) {
+                    if (mixed && (std::string_view(suffix) == "ssm_beta.weight" ||
+                                  std::string_view(suffix) == "ssm_alpha.weight")) continue;
+                    output.logical_projection_weight_bytes_avoided +=
+                        window_tensor(manifest, tensor_access, step.id, step.op, *step.layer, suffix).byte_size;
+                }
+                output.projection_launches_saved += mixed ? 3U : 5U;
+            }
         }
         if (output.mode[i] == KnownWindowStepMode::r1_row_loop) {
             ++output.row_loop_steps; if (binding.host_or_runtime_step) ++output.runtime_row_steps;
@@ -665,6 +696,28 @@ void validate_compiled_known_prefix_window(
     const auto identities = known_window_identities(window, serial);
     window_require(window.window_execution_identity == identities.first &&
         window.window_kernel_plan_identity == identities.second, "known window identities no longer match its content");
+}
+
+void validate_known_prefix_window_formats(
+    const CompiledKnownPrefixWindow& window, const CompiledSerialExecution& serial,
+    const ModelManifest& manifest, const ExecutionTensorAccessPlan& tensor_access) {
+    validate_compiled_known_prefix_window(window, serial);
+    window_require(manifest.layout_identity == window.manifest_layout_identity &&
+        tensor_access.plan_identity == window.tensor_access_plan_identity &&
+        tensor_access.manifest_layout_identity == manifest.layout_identity,
+        "known window format provenance differs from its compiled manifest/access plan");
+    for (std::size_t i = 0; i < window.mode.size(); ++i) {
+        const auto& step = serial.execution.steps[i];
+        if (window.mode[i] == KnownWindowStepMode::r2_shared_q8) {
+            window_require(window_shared_types(manifest, tensor_access, step),
+                "known window shared variant differs from the selected tensor formats");
+        } else if (window.mode[i] == KnownWindowStepMode::r2_gdn_staged) {
+            const auto expected = window.r2_variant[i] == KnownWindowR2Variant::gdn_q8_virtual256_r2_v1 ?
+                WindowGdnFormat::all_q8 : WindowGdnFormat::q8_large_f32_gates;
+            window_require(window_gdn_format(manifest, tensor_access, step, true) == expected,
+                "known window GDN variant differs from the selected tensor formats");
+        }
+    }
 }
 
 }  // namespace strix

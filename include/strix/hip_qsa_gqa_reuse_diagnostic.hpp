@@ -72,7 +72,8 @@ inline Launch validate(Shape shape, const Bindings& bindings, Mode mode) {
     return {maximum, head_blocks * maximum, head_blocks, 256U, 256U, heads, heads * 1024U};
 }
 
-// Test-only, no allocation/synchronization/status clear or production routing.
+// Shared backend for explicit production grouping and component qualification;
+// no allocation, synchronization or status clear.
 // All calls, eager and captured, read uint64 position from device. Visible tokens
 // are position+1; count=min(visible/4,512)*4+visible%4. selected[0:count]
 // must be strictly chronological, unique and below visible. Its remaining slots

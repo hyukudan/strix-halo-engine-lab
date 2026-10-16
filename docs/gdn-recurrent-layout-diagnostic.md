@@ -24,3 +24,12 @@ deferred to the validation stage. Padding is a bank-conflict hypothesis, not a
 measured gain. ISA, resources, native output/state equality and complete-operator
 timing are required before selecting a layout. Persistent state transposition,
 recurrence over several retained input rows and rollback are separate remaining increments.
+
+Production source now exposes the same existing implementations through
+`--gdn-recurrent-layout baseline|stride32|stride33|transposed`. Baseline remains
+the default and retains its IDs. Explicit candidates have distinct markers and
+compiler/implementation identities and require eager floating execution. Islands
+and known-prefix R2 reject candidate layouts. No persistent-state format or
+recurrence arithmetic is changed; these remain unqualified opt-ins pending the
+final joint source/compiler/native/model checks. No tests were executed during
+this implementation stage.

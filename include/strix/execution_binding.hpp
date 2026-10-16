@@ -1,6 +1,7 @@
 #pragma once
 
 #include "strix/execution_plan.hpp"
+#include "strix/gdn_recurrent_layout.hpp"
 #include "strix/kernel_registry.hpp"
 #include "strix/model_contract.hpp"
 
@@ -39,6 +40,9 @@ struct ExecutionBindingRequest {
     bool deferred_moe_status = false;
     bool prefetch_q8_shared_expert = false;
     std::vector<std::uint32_t> shared_expert_prefetch_layers;
+    HipGdnRecurrentLayout gdn_recurrent_layout = HipGdnRecurrentLayout::baseline;
+    bool qsa_hierarchical_selection = false;
+    std::uint32_t qsa_gqa_heads_per_block = 1;
 };
 
 struct ExecutionKernelBinding {

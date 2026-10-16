@@ -136,6 +136,19 @@ int main()try{
     catch(const std::invalid_argument&){}shadow.cancel();
     expect(!ran&&untouched.calls==0&&preflight.health==strix::SerialSessionHealth::ready&&preflight.committed_tokens==0,"preflight failure stays ready without dispatch or publication");
     strix::check_deferred_moe_status({});
+    strix::DeferredMoeFirstError qsa_error{};
+    strix::merge_deferred_moe_first_error(qsa_error, 1, strix::DeferredMoeDomain::qsa_selection);
+    expect(qsa_error.domain == 3 && qsa_error.bits == 1, "QSA uses its own domain, not a MoE domain alias");
+    strix::merge_deferred_moe_first_error(qsa_error, 15, strix::DeferredMoeDomain::q4k_a8);
+    expect(qsa_error.domain == 3 && qsa_error.bits == 1, "later MoE errors cannot overwrite first QSA error");
+    bool attention_rejected = false;
+    try { strix::check_deferred_moe_status({4, 8}); }
+    catch (const std::invalid_argument&) { attention_rejected = true; }
+    expect(attention_rejected, "grouped attention uses a separate completion error domain");
+    bool qsa_rejected = false;
+    try { strix::check_deferred_moe_status(qsa_error); }
+    catch (const std::invalid_argument& error) { qsa_rejected = std::string(error.what()).find("QSA selection") != std::string::npos; }
+    expect(qsa_rejected, "QSA completion is rejected before successful publication");
     for(const auto record:{strix::DeferredMoeFirstError{1,1},strix::DeferredMoeFirstError{2,15}}){
         bool rejected=false;try{strix::check_deferred_moe_status(record);}catch(const std::invalid_argument&){rejected=true;}
         expect(rejected,"legacy and A8 status failures preserve original exception class");

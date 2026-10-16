@@ -311,6 +311,32 @@ int main() {
         compiled,
         launchers);
 
+    expect(!catalog.gdn_config().enable_device_graph_inputs &&
+        !catalog.gdn_config().virtual_q8_input_projections &&
+        !catalog.gdn_config().prefetch_q8_input_projections &&
+        !catalog.gdn_config().virtual_q8_output_projection,
+        "catalog exposes its exact default GDN configuration without changing selection");
+    strix::ExecutionLauncherRegistry explicit_no_islands;
+    catalog.register_for_compiled_execution(compiled, explicit_no_islands, nullptr, {});
+    expect(strix::compile_launch_plan(compiled, launchers).plan_identity ==
+        strix::compile_launch_plan(compiled, explicit_no_islands).plan_identity,
+        "explicit absent island owner preserves ordinary launcher identity");
+    {
+        strix::HipLauncherCatalogConfig island_config;
+        island_config.virtual_q8_gdn_input = true;
+        island_config.prefetch_q8_gdn_input = true;
+        island_config.virtual_q8_gdn_output = true;
+        island_config.deferred_moe_status = true;
+        strix::HipLauncherCatalog island_catalog(model, island_config);
+        const auto& captured = island_catalog.gdn_config();
+        expect(captured.virtual_q8_input_projections && captured.prefetch_q8_input_projections &&
+            captured.virtual_q8_output_projection && !captured.wave8_q8_input_projections &&
+            !captured.wave8_q8_output_projection,
+            "catalog retains the exact prefetch8 and virtual-output configuration for island construction");
+        island_config.virtual_q8_gdn_input = false;
+        expect(island_catalog.gdn_config().virtual_q8_input_projections,
+            "borrowed construction configuration mutations cannot change the owned snapshot");
+    }
     const auto coverage =
         catalog.audit(
             compiled,
@@ -864,6 +890,93 @@ int main() {
             }
             expect(rejected, "slot-parallel Q5_1 direct compile rejects incompatible requests before binding");
         }
+    }
+    {
+        strix::ExecutionBindingRequest selection_request;
+        selection_request.minimum_qualification = strix::kernels::QualificationStatus::experimental;
+        selection_request.deferred_moe_status = true;
+        selection_request.qsa_hierarchical_selection = true;
+        strix::ExecutionBufferRequest selection_buffers;
+        selection_buffers.qsa_hierarchical_selection = true;
+        strix::HipLauncherCatalogConfig selection_config;
+        selection_config.deferred_moe_status = true;
+        selection_config.qsa_hierarchical_selection = true;
+        strix::kernels::KernelRegistry selection_registry;
+        strix::register_complete_hip_kernel_catalog(model, selection_request, selection_config, selection_registry);
+        const auto selected = strix::compile_serial_execution(model, selection_registry, selection_request, selection_buffers);
+        unsigned marked = 0;
+        for (const auto& binding : selected.bindings.bindings) if (binding.op == strix::SerialOp::indexed_attention) {
+            expect(binding.kernel_id && binding.kernel_id->find(strix::qsa_hierarchical_selection_marker) != std::string::npos,
+                "all QSA steps bind the explicit hierarchical selector identity");
+            ++marked;
+        }
+        expect(marked == 12, "hierarchical selection has complete twelve-layer coverage");
+        strix::HipLauncherCatalog selection_catalog(model, selection_config);
+        strix::ExecutionLauncherRegistry selected_launchers;
+        selection_catalog.register_for_compiled_execution(selected, selected_launchers);
+        expect(selection_catalog.audit(selected, selected_launchers).missing_steps == 0,
+            "hierarchical catalog retains full operator coverage");
+        for (unsigned mutation = 0; mutation < 4; ++mutation) {
+            auto bad_request = selection_request; auto bad_buffers = selection_buffers;
+            if (mutation == 0) bad_buffers.qsa_hierarchical_selection = false;
+            if (mutation == 1) bad_request.deferred_moe_status = false;
+            if (mutation == 2) bad_request.device_graph_inputs = true;
+            if (mutation == 3) bad_request.logical_rows = bad_buffers.logical_rows = 2;
+            bool rejected = false;
+            try { (void)strix::compile_serial_execution(model, selection_registry, bad_request, bad_buffers); }
+            catch (const std::invalid_argument&) { rejected = true; }
+            expect(rejected, "hierarchical compiler rejects unsupported or undersized admission before allocation");
+        }
+    }
+    for (const auto heads : {2U, 4U}) {
+        strix::ExecutionBindingRequest grouped_request;
+        grouped_request.minimum_qualification = strix::kernels::QualificationStatus::experimental;
+        grouped_request.deferred_moe_status = true;
+        grouped_request.qsa_gqa_heads_per_block = heads;
+        strix::ExecutionBufferRequest grouped_buffers;
+        grouped_buffers.qsa_gqa_heads_per_block = heads;
+        strix::HipLauncherCatalogConfig grouped_config;
+        grouped_config.deferred_moe_status = true;
+        grouped_config.qsa_gqa_heads_per_block = heads;
+        strix::kernels::KernelRegistry grouped_registry;
+        strix::register_complete_hip_kernel_catalog(model, grouped_request, grouped_config, grouped_registry);
+        const auto grouped_compiled = strix::compile_serial_execution(model, grouped_registry, grouped_request, grouped_buffers);
+        unsigned marked = 0;
+        for (const auto& binding : grouped_compiled.bindings.bindings) if (binding.op == strix::SerialOp::indexed_attention) {
+            expect(binding.kernel_id && binding.kernel_id->find(strix::qsa_gqa_organization_marker(heads)) != std::string::npos,
+                "each QSA step binds the exact requested grouped-head identity");
+            ++marked;
+        }
+        expect(marked == 12, "grouped attention has complete QSA layer coverage");
+        auto bad_buffers = grouped_buffers; bad_buffers.qsa_gqa_heads_per_block = 1;
+        bool rejected = false;
+        try { (void)strix::compile_serial_execution(model, grouped_registry, grouped_request, bad_buffers); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        expect(rejected, "grouped attention cannot use incumbent buffer admission");
+    }
+    for (const auto layout : {strix::HipGdnRecurrentLayout::stride32, strix::HipGdnRecurrentLayout::stride33,
+                              strix::HipGdnRecurrentLayout::transposed}) {
+        strix::ExecutionBindingRequest layout_request;
+        layout_request.minimum_qualification = strix::kernels::QualificationStatus::experimental;
+        layout_request.gdn_recurrent_layout = layout;
+        strix::HipLauncherCatalogConfig layout_config;
+        layout_config.gdn_recurrent_layout = layout;
+        strix::kernels::KernelRegistry layout_registry;
+        strix::register_complete_hip_kernel_catalog(model, layout_request, layout_config, layout_registry);
+        const auto layout_compiled = strix::compile_serial_execution(model, layout_registry, layout_request, {});
+        unsigned marked = 0;
+        for (const auto& binding : layout_compiled.bindings.bindings) if (binding.op == strix::SerialOp::gated_delta_net) {
+            expect(binding.kernel_id && binding.kernel_id->find(strix::gdn_recurrent_layout_marker(layout)) != std::string::npos,
+                "each GDN step binds its requested recurrent LDS geometry");
+            ++marked;
+        }
+        expect(marked == 36, "recurrent layout covers all GDN layers");
+        auto mismatch = layout_config; mismatch.gdn_recurrent_layout = strix::HipGdnRecurrentLayout::baseline;
+        strix::kernels::KernelRegistry rejected_registry;
+        bool rejected = false;
+        try { strix::register_complete_hip_kernel_catalog(model, layout_request, mismatch, rejected_registry); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        expect(rejected && rejected_registry.variants().empty(), "LDS layout mismatch rejects before variant publication");
     }
     if (failures == 0) {
         std::cout

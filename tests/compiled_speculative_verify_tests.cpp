@@ -15,6 +15,9 @@
 
 #include <set>
 #include <string>
+#include <string_view>
+#include <span>
+#include <vector>
 #include <utility>
 
 #include <iostream>
@@ -122,7 +125,7 @@ struct KnownFixture {
     strix::ModelManifest manifest;
     strix::ExecutionTensorAccessPlan access;
 };
-KnownFixture make_known_fixture(const strix::ModelContract& model) {
+KnownFixture make_known_fixture(const strix::ModelContract& model, std::uint32_t gate_type = 8U) {
     KnownFixture fixture;
     fixture.serial.execution = strix::build_serial_decode_execution_plan(model);
     fixture.serial.io = strix::build_serial_execution_io_plan(fixture.serial.execution);
@@ -160,7 +163,9 @@ KnownFixture make_known_fixture(const strix::ModelContract& model) {
                 suffix.starts_with("ssm_") ? strix::TensorRole::recurrent_state : strix::TensorRole::dense_projection;
             value.layer = step.layer; value.dimensions = std::move(dimensions); value.ggml_type = type;
             value.absolute_offset = offset;
-            value.byte_size = type == 8 ? value.dimensions[0] / 32U * 34U * value.dimensions[1] : value.dimensions[0] * 4U;
+            std::uint64_t elements = 1;
+            for (const auto extent : value.dimensions) elements *= extent;
+            value.byte_size = type == 8 ? value.dimensions[0] / 32U * 34U * value.dimensions[1] : elements * 4U;
             offset += (value.byte_size + 255U) / 256U * 256U;
             tensors.tensor_indices.push_back(static_cast<std::uint32_t>(fixture.manifest.tensors.size()));
             fixture.manifest.tensors.push_back(std::move(value));
@@ -175,8 +180,8 @@ KnownFixture make_known_fixture(const strix::ModelContract& model) {
             binding.kernel_id = "hip.gdn.bf16.h2560.kh16.vh48.d128.r1.c1.scalar.wave8-input-v1.wave8-q8-output-v1.prefetch8.virtual256.q8-input.virtual256.q8-output";
             tensor("attn_qkv.weight", {2560,10240}, 8);
             tensor("attn_gate.weight", {2560,6144}, 8);
-            tensor("ssm_beta.weight", {2560,48}, 8);
-            tensor("ssm_alpha.weight", {2560,48}, 8);
+            tensor("ssm_beta.weight", {2560,48}, gate_type);
+            tensor("ssm_alpha.weight", {2560,48}, gate_type);
             tensor("ssm_out.weight", {6144,2560}, 8);
         } else if (step.op == strix::SerialOp::ple) {
             // Only metadata is retained. A start-fault backend below never
@@ -306,7 +311,8 @@ void recording_window_kernel(const strix::ExecutionDispatchContext& context, voi
     for (std::size_t i = 0; i < context.writes.size(); ++i)
         write_word(strix::resolve_dispatch_write(context, i).address, value + i);
 }
-void recording_r2_preflight(std::span<const strix::ExecutionDispatchContext, 2> rows, void*) {
+void recording_r2_preflight(std::span<const strix::ExecutionDispatchContext, 2> rows, void* opaque) {
+    ++static_cast<WindowTrace*>(opaque)->admissions;
     if (rows[0].step_id != rows[1].step_id || rows[1].position != rows[0].position + 1 ||
         rows[0].execution_identity != rows[1].execution_identity)
         throw std::invalid_argument("mock R2 admission needs adjacent rows of one step");
@@ -338,10 +344,10 @@ struct KnownRuntimeFixture {
     std::array<std::uint32_t, 2> tokens{7, 11};
     std::uint32_t quiesces = 0;
 
-    explicit KnownRuntimeFixture(const strix::ModelContract& model, bool promote = false)
-        : source(make_known_fixture(model)),
+    explicit KnownRuntimeFixture(const strix::ModelContract& model, bool promote = false, bool mixed = false)
+        : source(make_known_fixture(model, mixed ? 0U : 8U)),
           window(strix::compile_known_prefix_window(model, source.serial, source.manifest,
-              source.access, {promote, promote})),
+              source.access, {promote, promote, mixed})),
           serial_pool(static_cast<std::size_t>((source.serial.arena.total_bytes + 7U) / 8U)),
           window_pool(static_cast<std::size_t>((window.arena.physical.total_bytes + 7U) / 8U)),
           state_words(7U * 48U, 0) {
@@ -398,6 +404,10 @@ struct KnownRuntimeFixture {
                 &recording_r2_preflight, &recording_r2_launch},
             {strix::KnownWindowR2Variant::gdn_q8_virtual256_r2_v1, &trace,
                 &recording_r2_preflight, &recording_r2_launch}}};
+        return run_entries(callbacks, entries);
+    }
+    strix::KnownWindowResult run_entries(strix::KnownWindowExecutionHooks callbacks,
+        std::span<const strix::KnownWindowR2Entry> entries) {
         return strix::execute_known_prefix_window_eager(window, source.serial, resources,
             window_memory, session, tokens, {&row_launch[0], &row_launch[1]}, entries, callbacks);
     }
@@ -728,6 +738,153 @@ void known_window_tests(const strix::ModelContract& model) {
     expect(caught, "tainted lineage cannot become a clean chunk producer");
 }
 
+
+// Format/dispatch source witnesses only. Actual historical golden IDs must be
+// captured from the frozen pre-change build during the final validation phase.
+void known_window_mixed_format_tests(const strix::ModelContract& model) {
+    using Variant = strix::KnownWindowR2Variant;
+    const auto q8 = make_known_fixture(model);
+    const auto old_request = strix::compile_known_prefix_window(model, q8.serial, q8.manifest, q8.access, {true,true});
+    const auto extra_request = strix::compile_known_prefix_window(model, q8.serial, q8.manifest, q8.access, {true,true,true});
+    expect(old_request.window_execution_identity == extra_request.window_execution_identity &&
+        old_request.window_kernel_plan_identity == extra_request.window_kernel_plan_identity &&
+        old_request.r2_variant == extra_request.r2_variant && old_request.projection_launches_saved == 324U &&
+        old_request.logical_projection_weight_bytes_avoided == 2466017280ULL &&
+        std::count(old_request.r2_variant.begin(), old_request.r2_variant.end(), Variant::gdn_q8_virtual256_r2_v1) == 36 &&
+        std::count(old_request.r2_variant.begin(), old_request.r2_variant.end(), Variant::shared_q8_virtual256_r2_v1) == 48,
+        "unused F32-gate opt-in leaves all-Q8 identities, variant table and ledgers unchanged");
+    const auto mixed = make_known_fixture(model, 0U);
+    const auto fallback = strix::compile_known_prefix_window(model, mixed.serial, mixed.manifest, mixed.access, {true,true});
+    const auto shared_only = strix::compile_known_prefix_window(model, mixed.serial, mixed.manifest, mixed.access, {true,false});
+    expect(fallback.r2_steps == 48U && fallback.projection_launches_saved == 144U &&
+        fallback.logical_projection_weight_bytes_avoided == 250675200ULL &&
+        fallback.window_execution_identity == shared_only.window_execution_identity &&
+        fallback.window_kernel_plan_identity == shared_only.window_kernel_plan_identity,
+        "old two-boolean request keeps all mixed GDN steps as explicit R1 fallback");
+    const auto inert_flag = strix::compile_known_prefix_window(model, mixed.serial, mixed.manifest, mixed.access, {true,false,true});
+    expect(inert_flag.window_execution_identity == shared_only.window_execution_identity &&
+        inert_flag.r2_variant == shared_only.r2_variant,
+        "the F32-gate flag cannot enable GDN promotion without the GDN opt-in");
+    const auto promoted = strix::compile_known_prefix_window(model, mixed.serial, mixed.manifest, mixed.access, {true,true,true});
+    std::array<std::uint32_t, strix::known_window_r2_variant_slots> counts{};
+    for (const auto variant : promoted.r2_variant) ++counts[static_cast<std::size_t>(variant)];
+    expect(promoted.r2_steps == 84U && counts[1] == 48U && counts[2] == 0U && counts[3] == 36U &&
+        promoted.projection_launches_saved == 252U &&
+        promoted.logical_projection_weight_bytes_avoided == 2456616960ULL &&
+        promoted.window_kernel_plan_identity != old_request.window_kernel_plan_identity &&
+        promoted.window_execution_identity != fallback.window_execution_identity,
+        "mixed promotion counts only three reused Q8 projections and identifies variant 3 separately");
+    strix::validate_known_prefix_window_formats(promoted, mixed.serial, mixed.manifest, mixed.access);
+    const auto tensor = [](auto& source, std::string_view name) -> strix::ManifestTensor& {
+        const auto found = std::find_if(source.manifest.tensors.begin(), source.manifest.tensors.end(),
+            [&](const auto& value) { return value.name == name; });
+        if (found == source.manifest.tensors.end()) throw std::logic_error("mixed format fixture tensor missing");
+        return *found;
+    };
+    const auto reject = [&](auto&& action, const char* message) {
+        bool caught = false;
+        try { action(); } catch (const std::invalid_argument&) { caught = true; }
+        expect(caught, message);
+    };
+    for (const auto name : {"blk.0.ssm_beta.weight", "blk.0.ssm_alpha.weight"}) {
+        auto asymmetric = mixed;
+        auto& gate = tensor(asymmetric, name);
+        gate.ggml_type = 8U; gate.byte_size = 2560ULL / 32U * 34U * 48U;
+        const auto result = strix::compile_known_prefix_window(model, asymmetric.serial,
+            asymmetric.manifest, asymmetric.access, {true,true,true});
+        expect(result.r2_steps == 83U, "asymmetric F32/Q8 gates fall back only their own GDN layer");
+    }
+    for (const auto type : {1U, 30U}) {
+        auto unsupported = mixed;
+        tensor(unsupported, "blk.0.ssm_beta.weight").ggml_type = type;
+        const auto result = strix::compile_known_prefix_window(model, unsupported.serial,
+            unsupported.manifest, unsupported.access, {true,true,true});
+        expect(result.r2_steps == 83U, "F16/BF16 gates do not enter the closed F32 gate variant");
+    }
+    {
+        auto unsupported = mixed;
+        auto& qkv = tensor(unsupported, "blk.0.attn_qkv.weight");
+        qkv.ggml_type = 0U; qkv.byte_size = 2560ULL * 10240U * 4U;
+        expect(strix::compile_known_prefix_window(model, unsupported.serial, unsupported.manifest,
+            unsupported.access, {true,true,true}).r2_steps == 83U, "F32 large projection remains explicit R1 fallback");
+    }
+    for (unsigned fault = 0; fault < 4U; ++fault) {
+        auto malformed = mixed;
+        auto& gate = tensor(malformed, "blk.0.ssm_beta.weight");
+        if (fault == 0U) --gate.byte_size;
+        if (fault == 1U) ++gate.absolute_offset;
+        if (fault == 2U) gate.absolute_offset = std::numeric_limits<std::uint64_t>::max() - 15U;
+        if (fault == 3U) gate.dimensions[1] = 47U;
+        reject([&] { (void)strix::compile_known_prefix_window(model, malformed.serial,
+            malformed.manifest, malformed.access, {true,true,true}); }, "recognised malformed F32 gate rejects before runtime");
+        if (fault < 3U)
+            expect(strix::compile_known_prefix_window(model, malformed.serial, malformed.manifest,
+                malformed.access, {true,true}).r2_steps == 48U,
+                "disabled F32 format preserves old unsupported-type extent fallback");
+    }
+    for (unsigned fault = 0; fault < 4U; ++fault) {
+        auto malformed = mixed;
+        auto& gate = tensor(malformed, "blk.0.ssm_beta.weight");
+        const auto index = static_cast<std::uint32_t>(&gate - malformed.manifest.tensors.data());
+        if (fault == 0U) gate.name += ".missing";
+        if (fault == 1U) malformed.manifest.tensors.push_back(gate);
+        if (fault == 2U) {
+            const auto selected = std::find_if(malformed.access.accesses.begin(), malformed.access.accesses.end(),
+                [&](const auto& access) { return std::find(access.tensor_indices.begin(), access.tensor_indices.end(), index) != access.tensor_indices.end(); });
+            if (selected == malformed.access.accesses.end()) throw std::logic_error("mixed selected gate missing");
+            selected->tensor_indices.push_back(index);
+        }
+        if (fault == 3U) gate.layer = 1U;
+        reject([&] { (void)strix::compile_known_prefix_window(model, malformed.serial,
+            malformed.manifest, malformed.access, {true,true,true}); },
+            "missing/duplicate/duplicate-selected/wrong-layer F32 gate cannot bypass exact tensor selection");
+    }
+    // This is a consistent, compiler-produced variant-3 table/identity/counter
+    // combination supplied with all-Q8 metadata: structural validation alone
+    // cannot establish the format, but the mandatory manifest check must.
+    strix::validate_compiled_known_prefix_window(promoted, q8.serial);
+    reject([&] { strix::validate_known_prefix_window_formats(promoted, q8.serial, q8.manifest, q8.access); },
+        "consistent variant-3 forgery over all-Q8 metadata fails manifest revalidation");
+    reject([&] { strix::validate_known_prefix_window_formats(old_request, mixed.serial, mixed.manifest, mixed.access); },
+        "variant-2 table cannot admit actual F32 gates");
+    auto changed = promoted;
+    const auto qsa = std::find_if(mixed.serial.execution.steps.begin(), mixed.serial.execution.steps.end(),
+        [](const auto& step) { return step.op == strix::SerialOp::indexed_attention; });
+    if (qsa == mixed.serial.execution.steps.end()) throw std::logic_error("mixed fixture lacks QSA");
+    changed.mode[qsa->id] = strix::KnownWindowStepMode::r2_gdn_staged;
+    changed.r2_variant[qsa->id] = Variant::gdn_q8_rows2_f32_gates_r1_v1;
+    reject([&] { strix::validate_compiled_known_prefix_window(changed, mixed.serial); }, "variant 3 cannot be forged onto QSA");
+    changed = promoted; ++changed.projection_launches_saved;
+    reject([&] { strix::validate_compiled_known_prefix_window(changed, mixed.serial); }, "mixed launch counter forgery rejects");
+    changed = promoted; ++changed.logical_projection_weight_bytes_avoided;
+    reject([&] { strix::validate_compiled_known_prefix_window(changed, mixed.serial); }, "mixed payload counter forgery rejects");
+
+    KnownRuntimeFixture runtime(model, true, true);
+    const std::array<strix::KnownWindowR2Entry, 3> entries{{
+        {Variant::shared_q8_virtual256_r2_v1, &runtime.trace, &recording_r2_preflight, &recording_r2_launch},
+        {Variant::gdn_q8_virtual256_r2_v1, &runtime.trace, &recording_r2_preflight, &recording_r2_launch},
+        {Variant::gdn_q8_rows2_f32_gates_r1_v1, &runtime.trace, &recording_r2_preflight, &recording_r2_launch}}};
+    const auto result = runtime.run_entries(runtime.hooks(), entries);
+    expect(result.r2_variant_dispatches == std::array<std::uint32_t,4>{0,48,0,36} &&
+        result.r2_dispatches == 84U && result.row_loop_dispatches == 708U &&
+        result.projection_launches_saved == 252U && result.logical_projection_weight_bytes_avoided == 2456616960ULL,
+        "runtime reports actual closed variant-3 dispatches independently of logical launches");
+    for (const bool duplicate : {false, true}) {
+        runtime.reset();
+        auto bad_entries = std::vector<strix::KnownWindowR2Entry>(entries.begin(), entries.end());
+        if (duplicate) bad_entries.push_back(entries.back()); else bad_entries.pop_back();
+        std::uint32_t scopes = 0;
+        auto hooks = runtime.hooks(); hooks.preflight_scope = [&] { ++scopes; };
+        const auto state = runtime.state_words;
+        reject([&] { (void)runtime.run_entries(hooks, bad_entries); },
+            "missing/duplicate variant-3 implementation fails closed");
+        expect(runtime.trace.calls == 0U && runtime.trace.admissions == 0U && scopes == 0U &&
+            runtime.state_words == state && runtime.quiesces == 0U &&
+            runtime.session.health == strix::SerialSessionHealth::ready && runtime.session.committed_tokens == 0U,
+            "entry-table failure occurs before any admission, dispatch, state write or poison scope");
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -940,6 +1097,7 @@ int main() {
 
     known_window_tests(model);
     known_window_runtime_tests(model);
+    known_window_mixed_format_tests(model);
 
     if (failures == 0) {
         std::cout << "compiled speculative verify tests passed\n";

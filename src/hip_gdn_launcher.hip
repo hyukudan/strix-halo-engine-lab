@@ -1,6 +1,4 @@
-#ifdef STRIX_BUILD_GDN_RECURRENT_LAYOUT_DIAGNOSTIC
 #include "strix/gdn_recurrent_layout_diagnostic.hpp"
-#endif
 #ifdef STRIX_BUILD_GDN_LM_WAVE8_DIAGNOSTIC
 #include "strix/hip_gdn_lm_wave8_diagnostic.hpp"
 #endif
@@ -200,6 +198,13 @@ void validate_config(
         throw std::invalid_argument(
             error);
     }
+    if (config.recurrent_layout != HipGdnRecurrentLayout::baseline &&
+        config.recurrent_layout != HipGdnRecurrentLayout::stride32 &&
+        config.recurrent_layout != HipGdnRecurrentLayout::stride33 &&
+        config.recurrent_layout != HipGdnRecurrentLayout::transposed)
+        throw std::invalid_argument("GDN recurrent LDS layout is invalid");
+    if (config.recurrent_layout != HipGdnRecurrentLayout::baseline && config.enable_device_graph_inputs)
+        throw std::invalid_argument("GDN recurrent LDS layouts support eager execution only");
     if (config.prefetch_q8_input_projections && !config.virtual_q8_input_projections)
         throw std::invalid_argument("HIP GDN prefetch Q8 input requires virtual Q8 input");
     if (config.wave8_q8_input_projections) {
@@ -1414,9 +1419,9 @@ void recurrent_step_kernel(
     }
 }
 
-#ifdef STRIX_BUILD_GDN_RECURRENT_LAYOUT_DIAGNOSTIC
 // Only physical LDS addresses differ from the incumbent recurrence. Logical
 // columns, arithmetic expressions, barriers and separate delta lifetime remain.
+// These same instantiations serve explicit eager choices and diagnostic probes.
 template <gdn_recurrent_layout_diagnostic::Layout Layout>
 __device__ __forceinline__ constexpr std::size_t recurrent_layout_index(
     std::uint32_t lane, std::uint32_t column) {
@@ -1627,8 +1632,6 @@ void recurrent_layout_diagnostic_kernel(
             retained[column];
     }
 }
-
-#endif
 
 __global__ void gated_rms_norm_kernel(
     float* core,
@@ -2302,6 +2305,14 @@ PreparedGdnLaunch prepare_gdn_launch(
     const auto& config = *config_ptr;
     validate_config(config);
 
+    if (config.recurrent_layout != HipGdnRecurrentLayout::baseline) {
+        if (const auto* scope = current_hip_launch_context(); scope && scope->graph_capture)
+            throw std::invalid_argument("GDN recurrent LDS layouts support eager execution only");
+        hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
+        check_hip(hipStreamIsCapturing(hip_execution_stream(), &capture), "query GDN recurrent LDS capture");
+        if (capture != hipStreamCaptureStatusNone)
+            throw std::invalid_argument("GDN recurrent LDS layouts cannot be captured");
+    }
     if (config.wave8_q8_input_projections || config.wave8_q8_output_projection) {
         if (const auto* scope = current_hip_launch_context(); scope && scope->graph_capture)
             throw std::invalid_argument("wave8 GDN projections support eager execution only");
@@ -2524,6 +2535,33 @@ void preflight_gdn(const ExecutionDispatchContext& context, void* user_data) {
     static_cast<void>(prepare_gdn_launch(context, static_cast<const HipGdnLauncherConfig*>(user_data)));
 }
 
+void emit_gdn_recurrent_layout(const PreparedGdnLaunch& row, HipGdnRecurrentLayout layout,
+    const GdnEmitTarget& target) {
+    const auto grid = dim3(row.value_heads * (row.head_dim / kValueTile));
+    const auto block = dim3(kRecurrentThreads);
+#define STRIX_GDN_RECURRENT_LAYOUT(kernel) \
+    record_gdn_kernel(target.ledger, reinterpret_cast<const void*>(kernel), grid, block); \
+    hipLaunchKernelGGL(kernel, grid, block, 0, target.stream, \
+        row.workspace.qkv, row.workspace.beta, row.workspace.gate, \
+        reinterpret_cast<float*>(row.matrix_state.address), row.workspace.core, \
+        row.key_heads, row.value_heads, row.head_dim, target.graph_status)
+    switch (layout) {
+    case HipGdnRecurrentLayout::stride32:
+        STRIX_GDN_RECURRENT_LAYOUT(HIP_KERNEL_NAME(recurrent_layout_diagnostic_kernel<gdn_recurrent_layout_diagnostic::Layout::stride32>));
+        break;
+    case HipGdnRecurrentLayout::stride33:
+        STRIX_GDN_RECURRENT_LAYOUT(HIP_KERNEL_NAME(recurrent_layout_diagnostic_kernel<gdn_recurrent_layout_diagnostic::Layout::stride33>));
+        break;
+    case HipGdnRecurrentLayout::transposed:
+        STRIX_GDN_RECURRENT_LAYOUT(HIP_KERNEL_NAME(recurrent_layout_diagnostic_kernel<gdn_recurrent_layout_diagnostic::Layout::transposed>));
+        break;
+    default:
+        throw std::invalid_argument("GDN recurrent LDS candidate is invalid");
+    }
+#undef STRIX_GDN_RECURRENT_LAYOUT
+    check_hip(hipGetLastError(), "HIP GDN recurrent LDS layout launch");
+}
+
 void emit_gdn_sequence(const PreparedGdnLaunch& prepared, const HipGdnLauncherConfig& config,
     const GdnEmitTarget& target) {
     const auto& input = prepared.input; const auto& output = prepared.output;
@@ -2671,26 +2709,30 @@ void emit_gdn_sequence(const PreparedGdnLaunch& prepared, const HipGdnLauncherCo
     const auto tiles =
         head_dim /
         kValueTile;
-    record_gdn_kernel(target.ledger, reinterpret_cast<const void*>(recurrent_step_kernel),
-        dim3(value_heads * tiles), dim3(kRecurrentThreads));
-    hipLaunchKernelGGL(
-        recurrent_step_kernel,
-        dim3(value_heads * tiles),
-        dim3(kRecurrentThreads),
-        0,
-        target.stream,
-        workspace.qkv,
-        workspace.beta,
-        workspace.gate,
-        reinterpret_cast<float*>(
-            matrix_state.address),
-        workspace.core,
-        key_heads,
-        value_heads,
-        head_dim, target.graph_status);
-    check_hip(
-        hipGetLastError(),
-        "HIP GDN recurrent update launch");
+    if (config.recurrent_layout == HipGdnRecurrentLayout::baseline) {
+        record_gdn_kernel(target.ledger, reinterpret_cast<const void*>(recurrent_step_kernel),
+            dim3(value_heads * tiles), dim3(kRecurrentThreads));
+        hipLaunchKernelGGL(
+            recurrent_step_kernel,
+            dim3(value_heads * tiles),
+            dim3(kRecurrentThreads),
+            0,
+            target.stream,
+            workspace.qkv,
+            workspace.beta,
+            workspace.gate,
+            reinterpret_cast<float*>(
+                matrix_state.address),
+            workspace.core,
+            key_heads,
+            value_heads,
+            head_dim, target.graph_status);
+        check_hip(
+            hipGetLastError(),
+            "HIP GDN recurrent update launch");
+    } else {
+        emit_gdn_recurrent_layout(prepared, config.recurrent_layout, target);
+    }
     if (target.graph_status != nullptr) {
         hipLaunchKernelGGL(validate_gdn_graph_values, dim3(32), dim3(kProjectionThreads), 0,
             target.stream, workspace.core, value_width, target.graph_status);
@@ -2748,6 +2790,12 @@ void launch_gdn(const ExecutionDispatchContext& context, void* user_data) {
          graph ? graph->context_tokens : 0, nullptr});
 }
 
+bool has_gdn_recurrent_layout_marker(std::string_view id) noexcept {
+    return id.find(".lds32-v1") != std::string_view::npos ||
+        id.find(".lds33-v1") != std::string_view::npos ||
+        id.find(".lds-transposed-v1") != std::string_view::npos;
+}
+
 std::string kernel_id(
     const ExecutionBindingRequest& request,
     const HipGdnLauncherConfig& config) {
@@ -2770,6 +2818,7 @@ std::string kernel_id(
         ".c" +
         std::to_string(
             request.request_concurrency) + (request.device_graph_inputs ? ".device" : ".scalar") +
+        std::string(gdn_recurrent_layout_marker(config.recurrent_layout)) +
         (config.wave8_q8_input_projections ? std::string(q8_projection_organization::gdn_wave8_marker) : "") +
         (config.wave8_q8_output_projection ? std::string(q8_projection_organization::gdn_output_wave8_marker) : "") +
         (config.prefetch_q8_input_projections ? ".prefetch8" : "") +
@@ -2828,12 +2877,17 @@ std::uint64_t implementation_identity(
     if (config.prefetch_q8_input_projections) hash_u64(hash, 0x47444e5138504631ULL);
     if (config.wave8_q8_input_projections) hash_u64(hash, 0x47444e5138574156ULL);
     if (config.wave8_q8_output_projection) hash_u64(hash, 0x47444e514f573831ULL);
+    if (config.recurrent_layout != HipGdnRecurrentLayout::baseline) {
+        hash_u64(hash, 0x47444e4c44533031ULL); // GDN LDS organization version 1.
+        hash_u64(hash, static_cast<std::uint32_t>(config.recurrent_layout));
+    }
     return hash;
 }
 
 
 // R2 consumes the same complete pure host admission as the R1 factory.
 using GdnKnownWindowRow = PreparedGdnLaunch;
+enum class Format { all_q8, q8_large_f32_gates };
 
 void launch_gdn_known_window_core(const GdnKnownWindowRow& row,
     const HipGdnLauncherConfig& config) {
@@ -2980,8 +3034,11 @@ void require_gdn_known_window_disjoint(GdnKnownWindowRange a, GdnKnownWindowRang
         throw std::invalid_argument("GDN known-window writable or row views alias");
 }
 std::array<GdnKnownWindowRow, 2> prepare_gdn_known_window_rows(
-    std::span<const ExecutionDispatchContext, 2> rows, const HipGdnLauncherConfig& config) {
+    std::span<const ExecutionDispatchContext, 2> rows, const HipGdnLauncherConfig& config,
+    Format format) {
     validate_config(config);
+    if (config.recurrent_layout != HipGdnRecurrentLayout::baseline)
+        throw std::invalid_argument("GDN known-window R2 requires the baseline recurrent LDS layout");
     const auto& model = config.model;
     if (!config.virtual_q8_input_projections || !config.prefetch_q8_input_projections ||
         !config.wave8_q8_input_projections || !config.virtual_q8_output_projection ||
@@ -3061,9 +3118,22 @@ std::array<GdnKnownWindowRow, 2> prepare_gdn_known_window_rows(
         readonly[i + 2U] = {x.runtime->address, x.runtime->bytes};
         validate_gdn_known_window_range(readonly[i + 2U], x.manifest->ggml_type == 0U ? 4U : 2U);
     }
-    for (const auto member : {&GdnTensors::qkv, &GdnTensors::z, &GdnTensors::beta, &GdnTensors::alpha, &GdnTensors::out})
-        if ((result[0].tensors.*member).manifest->ggml_type != 8U)
-            throw std::invalid_argument("GDN known-window R2 requires all five Q8_0 projections");
+    if (format == Format::all_q8) {
+        for (const auto member : {&GdnTensors::qkv, &GdnTensors::z, &GdnTensors::beta, &GdnTensors::alpha, &GdnTensors::out})
+            if ((result[0].tensors.*member).manifest->ggml_type != 8U)
+                throw std::invalid_argument("GDN known-window R2 requires all five Q8_0 projections");
+    } else {
+        const auto& tensors = result[0].tensors;
+        const auto is_f32_gate = [](const TensorPair& tensor) {
+            const auto& manifest = *tensor.manifest;
+            return manifest.ggml_type == 0U && manifest.dimensions.size() == 2U &&
+                manifest.dimensions[0] == 2560U && manifest.dimensions[1] == 48U &&
+                manifest.byte_size == 491520ULL;
+        };
+        if (tensors.qkv.manifest->ggml_type != 8U || tensors.z.manifest->ggml_type != 8U ||
+            tensors.out.manifest->ggml_type != 8U || !is_f32_gate(tensors.beta) || !is_f32_gate(tensors.alpha))
+            throw std::invalid_argument("GDN known-window R2 F32-gate variant requires Q8_0 qkv/z/out and F32 beta/alpha");
+    }
     const std::array<GdnKnownWindowRange, 6> writable{{
         {result[0].output.address, result[0].output.bytes}, {result[1].output.address, result[1].output.bytes},
         {result[0].temporary.address, result[0].temporary.bytes}, {result[1].temporary.address, result[1].temporary.bytes},
@@ -3078,17 +3148,7 @@ std::array<GdnKnownWindowRow, 2> prepare_gdn_known_window_rows(
     return result;
 }
 
-}  // namespace
-
-
-void gdn_known_window_r2_preflight(std::span<const ExecutionDispatchContext, 2> rows,
-    const HipGdnLauncherConfig& config) {
-    static_cast<void>(prepare_gdn_known_window_rows(rows, config));
-}
-void gdn_known_window_r2_launch(std::span<const ExecutionDispatchContext, 2> rows,
-    const HipGdnLauncherConfig& config) {
-    // Repeat current-view validation at this public entry; preflight isn't a permit.
-    const auto prepared = prepare_gdn_known_window_rows(rows, config);
+void enqueue_gdn_known_window_inputs(const std::array<GdnKnownWindowRow, 2>& prepared, Format format) {
     const auto& a = prepared[0]; const auto& b = prepared[1];
     const auto* input0 = reinterpret_cast<const std::uint16_t*>(a.input.address);
     const auto* input1 = reinterpret_cast<const std::uint16_t*>(b.input.address);
@@ -3101,8 +3161,25 @@ void gdn_known_window_r2_launch(std::span<const ExecutionDispatchContext, 2> row
     };
     project(a.tensors.qkv, a.conv_width, a.workspace.qkv, b.workspace.qkv);
     project(a.tensors.z, a.value_width, a.workspace.z, b.workspace.z);
-    project(a.tensors.beta, a.value_heads, a.workspace.beta, b.workspace.beta);
-    project(a.tensors.alpha, a.value_heads, a.workspace.gate, b.workspace.gate);
+    if (format == Format::all_q8) {
+        project(a.tensors.beta, a.value_heads, a.workspace.beta, b.workspace.beta);
+        project(a.tensors.alpha, a.value_heads, a.workspace.gate, b.workspace.gate);
+    } else {
+        for (const auto& row : prepared) {
+            const auto* input = reinterpret_cast<const std::uint16_t*>(row.input.address);
+            launch_projection_by_kind(weight_kind(row.tensors.beta.manifest->ggml_type), input,
+                *row.tensors.beta.runtime, row.hidden, row.value_heads, row.workspace.beta,
+                row.projection_mode, hip_execution_stream(), nullptr);
+            launch_projection_by_kind(weight_kind(row.tensors.alpha.manifest->ggml_type), input,
+                *row.tensors.alpha.runtime, row.hidden, row.value_heads, row.workspace.gate,
+                row.projection_mode, hip_execution_stream(), nullptr);
+        }
+    }
+}
+
+void enqueue_gdn_known_window_completion(const std::array<GdnKnownWindowRow, 2>& prepared,
+    const HipGdnLauncherConfig& config) {
+    const auto& a = prepared[0]; const auto& b = prepared[1];
     // Causality is unchanged: the same stream finishes row0's state update
     // before row1 reads that matrix/convolution state. Workspace rows are disjoint.
     launch_gdn_known_window_core(a, config);
@@ -3115,8 +3192,58 @@ void gdn_known_window_r2_launch(std::span<const ExecutionDispatchContext, 2> row
     check_hip(hipGetLastError(), "GDN known-window R2 output projection launch");
 }
 
+}  // namespace
+
+void gdn_known_window_r2_preflight(std::span<const ExecutionDispatchContext, 2> rows,
+    const HipGdnLauncherConfig& config) {
+    static_cast<void>(prepare_gdn_known_window_rows(rows, config, Format::all_q8));
+}
+void gdn_known_window_r2_launch(std::span<const ExecutionDispatchContext, 2> rows,
+    const HipGdnLauncherConfig& config) {
+    // Repeat current-view validation at this public entry; preflight isn't a permit.
+    const auto prepared = prepare_gdn_known_window_rows(rows, config, Format::all_q8);
+    enqueue_gdn_known_window_inputs(prepared, Format::all_q8);
+    enqueue_gdn_known_window_completion(prepared, config);
+}
+void gdn_known_window_r2_f32_gates_preflight(std::span<const ExecutionDispatchContext, 2> rows,
+    const HipGdnLauncherConfig& config) {
+    static_cast<void>(prepare_gdn_known_window_rows(rows, config, Format::q8_large_f32_gates));
+}
+void gdn_known_window_r2_f32_gates_launch(std::span<const ExecutionDispatchContext, 2> rows,
+    const HipGdnLauncherConfig& config) {
+    const auto prepared = prepare_gdn_known_window_rows(rows, config, Format::q8_large_f32_gates);
+    enqueue_gdn_known_window_inputs(prepared, Format::q8_large_f32_gates);
+    enqueue_gdn_known_window_completion(prepared, config);
+}
 
 #ifdef STRIX_BUILD_KNOWN_WINDOW_DIAGNOSTIC
+void gdn_known_window_r2_input_stage_probe(std::span<const ExecutionDispatchContext, 2> rows,
+    const HipGdnLauncherConfig& config, GdnKnownWindowFormat format,
+    GdnKnownWindowProjectionMode mode) {
+    if ((format != GdnKnownWindowFormat::q8_all5 && format != GdnKnownWindowFormat::q8_rows2_f32_gates) ||
+        (mode != GdnKnownWindowProjectionMode::incumbent_row_loop && mode != GdnKnownWindowProjectionMode::rows2))
+        throw std::invalid_argument("GDN known-window input-stage diagnostic format or mode is invalid");
+    const auto internal_format = format == GdnKnownWindowFormat::q8_all5
+        ? Format::all_q8 : Format::q8_large_f32_gates;
+    const auto prepared = prepare_gdn_known_window_rows(rows, config, internal_format);
+    if (mode == GdnKnownWindowProjectionMode::rows2) {
+        enqueue_gdn_known_window_inputs(prepared, internal_format);
+    } else {
+        for (const auto& row : prepared) {
+            const auto* input = reinterpret_cast<const std::uint16_t*>(row.input.address);
+            const auto project = [&](const TensorPair& tensor, std::uint32_t outputs, float* output) {
+                launch_projection_by_kind(weight_kind(tensor.manifest->ggml_type), input,
+                    *tensor.runtime, row.hidden, outputs, output, row.projection_mode,
+                    hip_execution_stream(), nullptr);
+            };
+            project(row.tensors.qkv, row.conv_width, row.workspace.qkv);
+            project(row.tensors.z, row.value_width, row.workspace.z);
+            project(row.tensors.beta, row.value_heads, row.workspace.beta);
+            project(row.tensors.alpha, row.value_heads, row.workspace.gate);
+        }
+    }
+}
+
 void gdn_known_window_r2_projection_probe(GdnKnownWindowProjectionDirection direction,
     GdnKnownWindowProjectionMode mode, std::span<const GdnKnownWindowProjectionView, 2> input,
     GdnKnownWindowProjectionView weights, std::span<const GdnKnownWindowProjectionView, 2> output,
@@ -3181,6 +3308,11 @@ void register_hip_gdn_kernel_variant(
     kernels::KernelRegistry& registry,
     kernels::QualificationStatus qualification) {
     validate_config(config);
+    if (request.gdn_recurrent_layout != config.recurrent_layout)
+        throw std::invalid_argument("GDN recurrent LDS request/config mismatch");
+    if (config.recurrent_layout != HipGdnRecurrentLayout::baseline &&
+        (request.device_graph_inputs || request.require_graph_safe))
+        throw std::invalid_argument("GDN recurrent LDS layouts register eager variants only");
     if (request.wave8_q8_gdn_input != config.wave8_q8_input_projections)
         throw std::invalid_argument("GDN wave8 request/config mismatch");
     if (request.wave8_q8_gdn_output != config.wave8_q8_output_projection)
@@ -3262,7 +3394,8 @@ void register_hip_gdn_kernel_variant(
     variant.resources.lds_bytes =
         // Conservative 256-byte-aligned bound for both FP32 arrays and the
         // graph rejection broadcast, including possible compiler padding.
-        ((kRecurrentThreads * kValueTile * sizeof(float) +
+        ((kRecurrentThreads *
+          (config.recurrent_layout == HipGdnRecurrentLayout::stride33 ? 33U : kValueTile) * sizeof(float) +
           kValueTile * sizeof(float) + sizeof(std::uint32_t) + 255U) / 256U) * 256U;
     variant.resources.scratch_bytes =
         build_serial_execution_buffer_plan(
@@ -3295,6 +3428,8 @@ void register_hip_gdn_kernel_variant(
     if(config.virtual_q8_output_projection) variant.compiler_identity += "-virtual256-q8-output";
     if(config.wave8_q8_input_projections) variant.compiler_identity += ":wave8-input-v1";
     if(config.wave8_q8_output_projection) variant.compiler_identity += ":wave8-q8-output-v1";
+    if(config.recurrent_layout != HipGdnRecurrentLayout::baseline)
+        variant.compiler_identity += ":gdn-recurrent" + std::string(gdn_recurrent_layout_marker(config.recurrent_layout));
     variant.measured_seconds = 0.0;
 
     registry.add(
@@ -3437,7 +3572,8 @@ bool same_island_config(const HipGdnLauncherConfig& a, const HipGdnLauncherConfi
         a.prefetch_q8_input_projections == b.prefetch_q8_input_projections &&
         a.wave8_q8_input_projections == b.wave8_q8_input_projections &&
         a.virtual_q8_output_projection == b.virtual_q8_output_projection &&
-        a.wave8_q8_output_projection == b.wave8_q8_output_projection;
+        a.wave8_q8_output_projection == b.wave8_q8_output_projection &&
+        a.recurrent_layout == b.recurrent_layout;
 }
 
 std::uint64_t island_organization_identity(const HipGdnLauncherConfig& config) noexcept {
@@ -3457,7 +3593,19 @@ void require_island_d1_scope(const HipLaunchContext& scope, std::uint64_t identi
         record.arena_base > std::numeric_limits<std::uintptr_t>::max() - 8U)
         throw std::invalid_argument("GDN islands require an owned eager D1 stream and bounded eight-byte record");
 }
-void validate_island_graph(hipGraph_t graph, const GdnKernelLedger& ledger) {
+const void* wave8_island_input_symbol(std::uint32_t ggml_type) {
+    switch (weight_kind(ggml_type)) {
+    case WeightKind::f32: return reinterpret_cast<const void*>(project_bf16_to_fp32_kernel<WeightKind::f32>);
+    case WeightKind::f16: return reinterpret_cast<const void*>(project_bf16_to_fp32_kernel<WeightKind::f16>);
+    case WeightKind::bf16: return reinterpret_cast<const void*>(project_bf16_to_fp32_kernel<WeightKind::bf16>);
+    case WeightKind::q8_0: return reinterpret_cast<const void*>(project_prefetch8_wave8_q8_bf16_to_fp32_kernel);
+    case WeightKind::iq4_nl: return reinterpret_cast<const void*>(project_bf16_to_fp32_kernel<WeightKind::iq4_nl>);
+    case WeightKind::iq4_xs: return reinterpret_cast<const void*>(project_bf16_to_fp32_kernel<WeightKind::iq4_xs>);
+    }
+    throw std::invalid_argument("GDN island input projection type is unsupported");
+}
+void validate_island_graph(hipGraph_t graph, const GdnKernelLedger& ledger,
+    const PreparedGdnLaunch& prepared, const HipGdnLauncherConfig& config) {
     if (ledger.size() != 10) throw std::runtime_error("GDN island emitter must record ten kernel nodes");
     std::size_t count = 0;
     check_hip(hipGraphGetNodes(graph, nullptr, &count), "GDN island node count");
@@ -3467,6 +3615,17 @@ void validate_island_graph(hipGraph_t graph, const GdnKernelLedger& ledger) {
     if (count != ledger.size()) throw std::runtime_error("GDN island node inventory changed");
     std::vector<bool> used(count, false);
     hipGraphNode_t previous = nullptr;
+    std::size_t ordinal = 0;
+    // Derive symbols from admitted types/config independently of the emitter's
+    // ledger: numerical equality alone cannot distinguish projection geometries.
+    std::array<const void*, 5> projection_symbols{};
+    if (config.wave8_q8_input_projections && config.wave8_q8_output_projection) {
+        projection_symbols = {wave8_island_input_symbol(prepared.tensors.qkv.manifest->ggml_type),
+            wave8_island_input_symbol(prepared.tensors.z.manifest->ggml_type),
+            wave8_island_input_symbol(prepared.tensors.beta.manifest->ggml_type),
+            wave8_island_input_symbol(prepared.tensors.alpha.manifest->ggml_type),
+            reinterpret_cast<const void*>(project_prefetch8_wave8_q8_fp32_to_bf16_kernel)};
+    }
     for (const auto& expected : ledger) {
         std::size_t selected = count;
         for (std::size_t i = 0; i < count; ++i) {
@@ -3493,7 +3652,12 @@ void validate_island_graph(hipGraph_t graph, const GdnKernelLedger& ledger) {
             parameters.blockDim.x != expected.block.x || parameters.blockDim.y != expected.block.y ||
             parameters.blockDim.z != expected.block.z || parameters.sharedMemBytes != expected.shared_bytes)
             throw std::runtime_error("GDN island kernel node differs from the emitter ledger");
+        if (config.wave8_q8_input_projections && config.wave8_q8_output_projection &&
+            ((ordinal < 4U && parameters.func != projection_symbols[ordinal]) ||
+             (ordinal == 9U && parameters.func != projection_symbols[4])))
+            throw std::runtime_error("GDN island captured projection symbol differs from its admitted wave8 organization");
         used[selected] = true; previous = nodes[selected];
+        ++ordinal;
     }
 }
 } // namespace
@@ -3578,17 +3742,21 @@ struct HipGdnIslands::Impl {
     void build() {
         if (current_hip_launch_context()) throw std::invalid_argument("GDN island setup requires no active launch scope");
         validate_config(config);
+        if (config.recurrent_layout != HipGdnRecurrentLayout::baseline)
+            throw std::invalid_argument("GDN islands require the baseline recurrent LDS layout");
         const bool legacy = !config.virtual_q8_input_projections && !config.prefetch_q8_input_projections &&
             !config.virtual_q8_output_projection;
         const bool profile = config.virtual_q8_input_projections && config.prefetch_q8_input_projections &&
             config.virtual_q8_output_projection;
-        if (config.enable_device_graph_inputs || config.wave8_q8_input_projections || config.wave8_q8_output_projection ||
+        if (config.enable_device_graph_inputs ||
+            config.wave8_q8_input_projections != config.wave8_q8_output_projection ||
+            (config.wave8_q8_input_projections && !profile) ||
             (!legacy && !profile) ||
             compiled.device_graph_inputs || compiled.logical_rows != 1 || compiled.request_concurrency != 1 ||
             !compiled.execution_identity || !compiled.kernel_plan_identity ||
             compiled.execution.steps.size() != compiled.io.steps.size() ||
             compiled.execution.steps.size() != compiled.bindings.bindings.size())
-            throw std::invalid_argument("GDN islands require a complete eager R1/C1 non-wave8 source");
+            throw std::invalid_argument("GDN islands require a complete eager R1/C1 legacy, prefetch8 or both-wave8 source");
         if (!resources_owner || !weights || !guard || &weights->binding() != resources->model_weights || !weights->generation())
             throw std::invalid_argument("GDN islands require the actual retained D1 and weight owners");
         require_island_d1_scope(scope, compiled.execution_identity);
@@ -3661,7 +3829,10 @@ struct HipGdnIslands::Impl {
                 context.session_state_memory = resources->session_state_memory;
                 context.reads_state = step.reads_state; context.writes_state = step.writes_state;
                 context.kernel_id = *compiled.bindings.bindings[i].kernel_id;
-                const auto prepared = prepare_gdn_launch(context, &config);
+                const auto prepared = [&] {
+                    const HipLaunchScope prepare_scope(scope);
+                    return prepare_gdn_launch(context, &config);
+                }();
                 auto island = std::make_unique<Island>();
                 island->descriptor = island_descriptor(context, prepared, weights->binding());
                 for (const auto& buffer : island->descriptor.buffers) device_range(buffer);
@@ -3674,6 +3845,8 @@ struct HipGdnIslands::Impl {
                 }
                 steps[i] = std::move(island);
                 GdnKernelLedger ledger; ledger.reserve(10);
+                if (current_hip_launch_context())
+                    throw std::runtime_error("GDN island capture requires no active launch scope before capture");
                 check_hip(hipStreamBeginCapture(setup_stream, hipStreamCaptureModeThreadLocal), "GDN island capture begin");
                 capturing = true;
                 hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
@@ -3684,7 +3857,7 @@ struct HipGdnIslands::Impl {
                 const auto ended = hipStreamEndCapture(setup_stream, &steps[i]->graph);
                 if (ended == hipSuccess || ended == hipErrorStreamCaptureInvalidated) capturing = false;
                 check_hip(ended, "GDN island capture end");
-                validate_island_graph(steps[i]->graph, ledger);
+                validate_island_graph(steps[i]->graph, ledger, prepared, config);
                 check_hip(hipGraphInstantiate(&steps[i]->executable, steps[i]->graph, nullptr, nullptr, 0), "GDN island instantiate");
             }
         } catch (...) { finish_capture(); throw; }
@@ -3798,6 +3971,11 @@ make_hip_gdn_launcher(
             "HIP GDN launcher requires id and config");
     }
     validate_config(*config);
+    if (config->recurrent_layout != HipGdnRecurrentLayout::baseline || has_gdn_recurrent_layout_marker(kernel_id_value)) {
+        ExecutionBindingRequest request;
+        if (kernel_id_value != kernel_id(request, *config))
+            throw std::invalid_argument("GDN recurrent LDS launcher requires its exact eager C1 kernel id");
+    }
     if (config->wave8_q8_input_projections || config->wave8_q8_output_projection ||
         kernel_id_value.find(q8_projection_organization::gdn_wave8_marker) != std::string::npos ||
         kernel_id_value.find(q8_projection_organization::gdn_output_wave8_marker) != std::string::npos) {
@@ -3847,6 +4025,13 @@ register_for_compiled_execution(
         }
 
         std::string_view selected_id=*binding.kernel_id;
+        if (config_.recurrent_layout != HipGdnRecurrentLayout::baseline || has_gdn_recurrent_layout_marker(selected_id)) {
+            ExecutionBindingRequest request;
+            request.logical_rows = compiled.logical_rows;
+            request.request_concurrency = compiled.request_concurrency;
+            if (*binding.kernel_id != kernel_id(request, config_))
+                throw std::invalid_argument("HIP GDN selected kernel disagrees with recurrent LDS configuration");
+        }
         constexpr std::string_view output_suffix=".virtual256.q8-output";
         if(selected_id.ends_with(output_suffix)!=config_.virtual_q8_output_projection)
             throw std::invalid_argument("HIP GDN selected kernel disagrees with virtual Q8 output configuration");

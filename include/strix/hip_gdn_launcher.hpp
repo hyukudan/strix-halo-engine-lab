@@ -1,6 +1,7 @@
 #pragma once
 
 #include "strix/execution_binding.hpp"
+#include "strix/gdn_recurrent_layout.hpp"
 #include "strix/hip_runtime_launchers.hpp"
 #include "strix/launch_dispatch.hpp"
 #include "strix/model_contract.hpp"
@@ -26,6 +27,8 @@ struct HipGdnLauncherConfig {
     bool virtual_q8_output_projection = false;
     // Explicit eager FP32 output organization; requires virtual Q8 output.
     bool wave8_q8_output_projection = false;
+    // Eager experimental LDS organization; persistent state layout is unchanged.
+    HipGdnRecurrentLayout recurrent_layout = HipGdnRecurrentLayout::baseline;
 };
 
 // Closed eager R2 window helper. Each context remains an R1 row view. Both
@@ -36,10 +39,22 @@ void gdn_known_window_r2_preflight(std::span<const ExecutionDispatchContext, 2> 
     const HipGdnLauncherConfig& config);
 void gdn_known_window_r2_launch(std::span<const ExecutionDispatchContext, 2> rows,
     const HipGdnLauncherConfig& config);
+// Closed mixed variant: paired Q8 qkv/z/out and incumbent F32 beta/alpha
+// projections for each row. The same deep admission and lifetime rules apply.
+void gdn_known_window_r2_f32_gates_preflight(std::span<const ExecutionDispatchContext, 2> rows,
+    const HipGdnLauncherConfig& config);
+void gdn_known_window_r2_f32_gates_launch(std::span<const ExecutionDispatchContext, 2> rows,
+    const HipGdnLauncherConfig& config);
 
 #ifdef STRIX_BUILD_KNOWN_WINDOW_DIAGNOSTIC
 enum class GdnKnownWindowProjectionDirection { bf16_to_fp32, fp32_to_bf16 };
 enum class GdnKnownWindowProjectionMode { incumbent_row_loop, rows2 };
+enum class GdnKnownWindowFormat : std::uint32_t { q8_all5 = 2, q8_rows2_f32_gates = 3 };
+// Test-only full input-stage payloads. Both modes perform complete typed row
+// admission; neither updates the causal state, core workspace or final output.
+void gdn_known_window_r2_input_stage_probe(std::span<const ExecutionDispatchContext, 2> rows,
+    const HipGdnLauncherConfig& config, GdnKnownWindowFormat format,
+    GdnKnownWindowProjectionMode mode);
 struct GdnKnownWindowProjectionView { std::uintptr_t address = 0; std::uint64_t bytes = 0; };
 // Test-only projection payloads on independent row addresses (contiguous
 // or strided). Same incumbent epilogues; no state mutation, allocation or sync.
@@ -77,6 +92,7 @@ public:
     HipGdnLauncherBundle& operator=(
         HipGdnLauncherBundle&&) = delete;
 
+    // Caller retains islands until all borrowing plans/dispatchers and their work are quiescent.
     void register_for_compiled_execution(
         const CompiledSerialExecution& compiled,
         ExecutionLauncherRegistry& registry, HipGdnIslands* islands = nullptr);
