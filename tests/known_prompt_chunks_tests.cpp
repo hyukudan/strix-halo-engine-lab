@@ -13,7 +13,8 @@ void expect(bool condition,const char* text) {
 }
 class Rows final : public strix::KnownPromptWindowBackend, public strix::SerialGreedyStepBackend {
 public:
-    std::uint32_t vocabulary=16;
+    std::uint32_t vocabulary=16, width=2;
+    std::uint32_t logical_rows() const noexcept override {return width;}
     unsigned windows=0,serials=0;
     bool fail_partial_window=false,bad_extent=false,nonfinite=false,poisoned=false;
     std::vector<std::pair<std::uint64_t,std::uint32_t>> inputs;
@@ -25,6 +26,16 @@ public:
     }
     std::vector<float> execute(std::uint32_t token,std::uint64_t position) override {
         ++serials;inputs.emplace_back(position,token);return values(token);
+    }
+    std::vector<float> execute_rows(std::span<const std::uint32_t> tokens,std::uint64_t position) override {
+        if(tokens.size()!=width) throw std::invalid_argument("recording backend width mismatch");
+        if(width==2U) return execute_window({tokens[0],tokens[1]},position);
+        ++windows;
+        for(std::size_t row=0;row<tokens.size();++row) {
+            inputs.emplace_back(position+row,tokens[row]);
+            if(fail_partial_window && row==1U) {poisoned=true;throw std::runtime_error("partial wide failure");}
+        }
+        return values(tokens.back());
     }
     std::vector<float> execute_window(std::array<std::uint32_t,2> tokens,std::uint64_t position) override {
         ++windows;inputs.emplace_back(position,tokens[0]);
@@ -132,6 +143,44 @@ int main() {
             "partial/native/output failure forbids resume and invalidates retained frontier without fake rollback");
         if(failure==0) expect(rows.poisoned && rows.inputs.size()==1 && cursor.progress().consumed_prompt_tokens==0,
             "failed-call counters do not pretend partially consumed opaque target state was restored");
+    }
+    for(const std::uint32_t width:{4U,8U}) {
+        for(const std::size_t count:{1U,3U,4U,7U,8U,9U,17U}) {
+            std::vector<std::uint32_t> prompt;
+            for(std::size_t i=0;i<count;++i) prompt.push_back(static_cast<std::uint32_t>(i%14U)+1U);
+            Rows target;target.width=width;
+            strix::KnownPromptChunkCursor cursor({prompt,2,16,64,1,15,width},target,target);
+            std::size_t chunks=0;
+            while(cursor.advance()) {
+                ++chunks;
+                const auto saved=target.inputs;
+                const auto frontier=cursor.frontier();
+                expect(frontier.valid && !frontier.logits.empty() && frontier.state_position==2U+saved.size() &&
+                    target.inputs==saved,"wide chunk pause keeps its full frontier and does not replay known tokens");
+            }
+            expect(target.windows==count/width && target.serials==count%width &&
+                chunks==count/width+count%width,"wide cursor invokes only full configured R and explicit unpadded R1 suffix");
+            for(std::size_t row=0;row<count;++row)
+                expect(target.inputs[row]==std::pair<std::uint64_t,std::uint32_t>{2U+row,prompt[row]},
+                    "wide and suffix calls preserve every absolute known position and token");
+            const auto& result=cursor.finish_greedy();
+            expect(result.steps_executed==0U && result.generated_tokens.size()==1U &&
+                result.generated_tokens[0]==(prompt.back()+1U)%16U && target.inputs.size()==count,
+                "wide frontier emits the terminal selection without consuming a predicted second token");
+        }
+        Rows mismatch;const std::vector<std::uint32_t> prompt(width,1U);
+        bool rejected=false;
+        try {strix::KnownPromptChunkCursor cursor({prompt,0,16,64,1,15,width},mismatch,mismatch);}
+        catch(const std::invalid_argument&) {rejected=true;}
+        expect(rejected && mismatch.inputs.empty(),"wide request rejects an R2-only backend before any input");
+        Rows failing;failing.width=width;failing.fail_partial_window=true;
+        strix::KnownPromptChunkCursor cursor({prompt,0,16,64,1,15,width},failing,failing);
+        rejected=false;try {(void)cursor.advance();} catch(const std::runtime_error&) {rejected=true;}
+        const auto count=failing.inputs.size();bool sticky=false;
+        try {(void)cursor.advance();} catch(const std::logic_error&) {sticky=true;}
+        expect(rejected && sticky && failing.poisoned && failing.inputs.size()==count &&
+            cursor.progress().consumed_prompt_tokens==0U && !cursor.frontier().valid,
+            "wide partial failure is sticky without pretending an opaque target rollback");
     }
     if(!failures) std::cout<<"known prompt chunk tests passed\n";
     return failures?1:0;

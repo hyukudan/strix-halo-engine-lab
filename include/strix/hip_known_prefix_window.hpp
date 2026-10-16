@@ -7,10 +7,11 @@
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <span>
 
 namespace strix {
 
-// Native eager owner for two KNOWN input tokens, not speculative generation.
+// Native eager owner for 2/4/8 KNOWN input tokens, not speculative generation.
 // The caller's actual_owner retains every borrowed model/state/arena/stream
 // allocation and descriptor. Metadata and allocation contents are exclusively
 // owned from construction through destruction; no concurrent calls or aliases
@@ -41,6 +42,9 @@ public:
 
     [[nodiscard]] KnownWindowResult execute(SerialSessionContext& session,
         std::array<std::uint32_t, 2> tokens);
+    [[nodiscard]] KnownWindowResult execute(SerialSessionContext& session,
+        std::span<const std::uint32_t> tokens);
+    [[nodiscard]] std::uint32_t logical_rows() const noexcept;
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

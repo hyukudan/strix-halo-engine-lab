@@ -296,7 +296,9 @@ ExecutionArenaPlan build_serial_execution_arena_plan(
 }
 
 KnownWindowArena build_known_window_arena(
-    const ExecutionArenaPlan& serial, std::uint64_t alignment) {
+    const ExecutionArenaPlan& serial, std::uint64_t alignment, std::uint32_t logical_rows) {
+    if (logical_rows!=2U && logical_rows!=4U && logical_rows!=8U)
+        throw std::invalid_argument("known window rows must be two, four or eight");
     if (!serial.alignment || !alignment || alignment % serial.alignment != 0 ||
         !serial.total_bytes || serial.allocations.empty()) {
         throw std::invalid_argument("known window requires a complete aligned serial arena");
@@ -326,7 +328,8 @@ KnownWindowArena build_known_window_arena(
     result.physical.allocations = serial.allocations;
     for (auto& allocation : result.physical.allocations) {
         const auto stride = align_up(allocation.bytes, alignment);
-        allocation.bytes = checked_add(stride, stride);
+        allocation.bytes = 0;
+        for(std::uint32_t row=0;row<logical_rows;++row) allocation.bytes=checked_add(allocation.bytes,stride);
         allocation.offset = 0;
         result.physical.naive_nonaliased_bytes = checked_add(
             result.physical.naive_nonaliased_bytes, allocation.bytes);
@@ -362,16 +365,16 @@ KnownWindowArena build_known_window_arena(
         active.push_back(&allocation);
     }
     result.physical.total_bytes = align_up(result.physical.total_bytes, alignment);
-    result.row_view = {result.physical, result.physical};
+    result.row_view.assign(logical_rows,result.physical);
     for (std::size_t i = 0; i < result.physical.allocations.size(); ++i) {
         const auto& physical = result.physical.allocations[i];
         const auto* original = find_arena_allocation(serial, physical.use);
         if (!original) throw std::logic_error("known window lost a serial allocation");
-        const auto stride = physical.bytes / 2;
+        const auto stride = physical.bytes / logical_rows;
         result.row_stride.push_back(stride);
         for (std::size_t row = 0; row < result.row_view.size(); ++row) {
             auto& allocation = result.row_view[row].allocations[i];
-            allocation.offset = checked_add(physical.offset, row == 0 ? 0 : stride);
+            allocation.offset = checked_add(physical.offset, static_cast<std::uint64_t>(row)*stride);
             allocation.bytes = original->bytes;
         }
     }

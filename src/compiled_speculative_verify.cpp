@@ -533,9 +533,12 @@ std::pair<std::uint64_t, std::uint64_t> known_window_identities(
     const CompiledKnownPrefixWindow& window, const CompiledSerialExecution& serial) {
     window_require(window.mode.size() == serial.execution.steps.size() &&
         window.r2_variant.size() == window.mode.size(), "known window mode table is incomplete");
-    auto kernel = fnv_offset; window_hash_text(kernel, "known-window-r2-kernels-v1");
+    window_require(window.logical_rows==2U || window.logical_rows==4U || window.logical_rows==8U,
+        "known window rows are outside the closed table");
+    auto kernel = fnv_offset; window_hash_text(kernel, window.logical_rows==2U ? "known-window-r2-kernels-v1" : "known-window-rows-kernels-v1");
+    if(window.logical_rows!=2U) hash_u64(kernel,window.logical_rows);
     hash_u64(kernel, serial.kernel_plan_identity); hash_u64(kernel, window.mode.size());
-    std::uint32_t r2 = 0, loops = 0, runtime = 0;
+    std::uint32_t r2 = 0, loops = 0, runtime = 0, shared_rows = 0, gdn_rows = 0;
     std::uint64_t avoided = 0;
     std::uint32_t launches = 0;
     for (std::size_t i = 0; i < window.mode.size(); ++i) {
@@ -547,16 +550,31 @@ std::pair<std::uint64_t, std::uint64_t> known_window_identities(
         } else if (mode == KnownWindowStepMode::r2_shared_q8) {
             window_require(step.op == SerialOp::shared_expert && variant == KnownWindowR2Variant::shared_q8_virtual256_r2_v1 &&
                 binding.kernel_id && known_shared_id(*binding.kernel_id), "known window shared variant/source ID mismatch"); ++r2;
+            window_require(window.logical_rows==2U,"R2 shared mode requires a two-row window");
             avoided += known_shared_projection_bytes; launches += 3;
+        } else if(mode==KnownWindowStepMode::shared_rows) {
+            window_require(step.op==SerialOp::shared_expert && binding.kernel_id && known_shared_id(*binding.kernel_id) &&
+                ((window.logical_rows==4U && variant==KnownWindowR2Variant::shared_q8_virtual256_r4_v1) ||
+                 (window.logical_rows==8U && variant==KnownWindowR2Variant::shared_q8_virtual256_r8_v1)),
+                "known window shared rows variant/source ID mismatch");
+            ++shared_rows;avoided+=known_shared_projection_bytes*(window.logical_rows-1U);
+            launches+=3U*(window.logical_rows-1U);
+        } else if (mode == KnownWindowStepMode::gdn_rows) {
+            window_require(step.op==SerialOp::gated_delta_net && binding.kernel_id && *binding.kernel_id==known_gdn_wave8 &&
+                ((window.logical_rows==4U && variant==KnownWindowR2Variant::gdn_q8_rows4_f32_gates_r1_v1) ||
+                 (window.logical_rows==8U && variant==KnownWindowR2Variant::gdn_q8_rows8_f32_gates_r1_v1)),
+                "known window GDN rows variant/source ID mismatch");
+            ++gdn_rows; avoided+=known_gdn_q8_large_projection_bytes*(window.logical_rows-1U);
+            launches+=3U*(window.logical_rows-1U);
         } else if (mode == KnownWindowStepMode::r2_gdn_staged) {
             window_require(step.op == SerialOp::gated_delta_net &&
                 (variant == KnownWindowR2Variant::gdn_q8_virtual256_r2_v1 ||
                  variant == KnownWindowR2Variant::gdn_q8_rows2_f32_gates_r1_v1) &&
                 binding.kernel_id && *binding.kernel_id == known_gdn_wave8, "known window GDN variant/source ID mismatch"); ++r2;
             if (variant == KnownWindowR2Variant::gdn_q8_virtual256_r2_v1) {
-                avoided += known_gdn_projection_bytes; launches += 5;
+                avoided += known_gdn_projection_bytes*(window.logical_rows/2U); launches += 5U*(window.logical_rows/2U);
             } else {
-                avoided += known_gdn_q8_large_projection_bytes; launches += 3;
+                avoided += known_gdn_q8_large_projection_bytes*(window.logical_rows/2U); launches += 3U*(window.logical_rows/2U);
             }
         } else throw std::invalid_argument("known window mode is not in the closed table");
         hash_u64(kernel, step.id); hash_u64(kernel, static_cast<std::uint64_t>(mode));
@@ -564,13 +582,15 @@ std::pair<std::uint64_t, std::uint64_t> known_window_identities(
         hash_u64(kernel, binding.host_or_runtime_step);
         if (binding.kernel_id) window_hash_text(kernel, *binding.kernel_id);
     }
-    window_require(r2 == window.r2_steps && loops == window.row_loop_steps && runtime == window.runtime_row_steps,
+    window_require(r2 == window.r2_steps && loops == window.row_loop_steps && runtime == window.runtime_row_steps &&
+        shared_rows==window.shared_rows_steps && gdn_rows==window.gdn_rows_steps,
         "known window counters do not match its actual mode table");
     window_require(avoided == window.logical_projection_weight_bytes_avoided &&
         launches == window.projection_launches_saved,
         "known window logical projection counters differ from the closed operand shapes");
     hash_u64(kernel, avoided); hash_u64(kernel, launches);
-    auto execution = fnv_offset; window_hash_text(execution, "known-window-r2-v1");
+    auto execution = fnv_offset; window_hash_text(execution, window.logical_rows==2U ? "known-window-r2-v1" : "known-window-rows-v1");
+    if(window.logical_rows!=2U) hash_u64(execution,window.logical_rows);
     hash_u64(execution, window_serial_fingerprint(serial)); hash_u64(execution, kernel);
     hash_u64(execution, window.manifest_layout_identity); hash_u64(execution, window.tensor_access_plan_identity);
     window_hash_arena(execution, window.arena.physical);
@@ -621,48 +641,57 @@ CompiledKnownPrefixWindow compile_known_prefix_window(
             for (auto use : *uses) window_require(find_arena_allocation(serial.arena, use) != nullptr,
                 "known window serial IO references an unallocated use");
     }
+    window_require(request.logical_rows==2U || request.logical_rows==4U || request.logical_rows==8U,
+        "known window rows must be two, four or eight");
     CompiledKnownPrefixWindow output;
+    output.logical_rows=request.logical_rows;
     output.serial_execution_identity = serial.execution_identity;
     output.serial_kernel_plan_identity = serial.kernel_plan_identity;
     output.manifest_layout_identity = manifest.layout_identity;
     output.tensor_access_plan_identity = tensor_access.plan_identity;
-    output.arena = build_known_window_arena(serial.arena, serial.arena.alignment);
+    output.arena = build_known_window_arena(serial.arena, serial.arena.alignment,output.logical_rows);
     output.mode.assign(serial.execution.steps.size(), KnownWindowStepMode::r1_row_loop);
     output.r2_variant.assign(serial.execution.steps.size(), KnownWindowR2Variant::none);
     for (std::size_t i = 0; i < output.mode.size(); ++i) {
         const auto& step = serial.execution.steps[i]; const auto& binding = serial.bindings.bindings[i];
         if (request.r2_shared_expert && step.op == SerialOp::shared_expert && binding.kernel_id &&
             known_shared_id(*binding.kernel_id) && window_shared_types(manifest, tensor_access, step)) {
-            output.mode[i] = KnownWindowStepMode::r2_shared_q8;
-            output.r2_variant[i] = KnownWindowR2Variant::shared_q8_virtual256_r2_v1;
+            output.mode[i] = output.logical_rows==2U ? KnownWindowStepMode::r2_shared_q8 : KnownWindowStepMode::shared_rows;
+            output.r2_variant[i] = output.logical_rows==2U ? KnownWindowR2Variant::shared_q8_virtual256_r2_v1 :
+                output.logical_rows==4U ? KnownWindowR2Variant::shared_q8_virtual256_r4_v1 : KnownWindowR2Variant::shared_q8_virtual256_r8_v1;
             for (const auto suffix : {"ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight"})
                 output.logical_projection_weight_bytes_avoided +=
-                    window_tensor(manifest, tensor_access, step.id, step.op, *step.layer, suffix).byte_size;
-            output.projection_launches_saved += 3;
+                    window_tensor(manifest, tensor_access, step.id, step.op, *step.layer, suffix).byte_size*(output.logical_rows-1U);
+            output.projection_launches_saved += 3U*(output.logical_rows-1U);
         } else if (request.r2_gdn && step.op == SerialOp::gated_delta_net && binding.kernel_id &&
             *binding.kernel_id == known_gdn_wave8) {
             const auto format = window_gdn_format(manifest, tensor_access, step, request.r2_gdn_f32_gates);
             if (format != WindowGdnFormat::unsupported) {
                 const bool mixed = format == WindowGdnFormat::q8_large_f32_gates;
-                output.mode[i] = KnownWindowStepMode::r2_gdn_staged;
-                output.r2_variant[i] = mixed ? KnownWindowR2Variant::gdn_q8_rows2_f32_gates_r1_v1 :
-                    KnownWindowR2Variant::gdn_q8_virtual256_r2_v1;
+                const bool wide = mixed && output.logical_rows!=2U;
+                output.mode[i] = wide ? KnownWindowStepMode::gdn_rows : KnownWindowStepMode::r2_gdn_staged;
+                output.r2_variant[i] = wide ? (output.logical_rows==4U ?
+                    KnownWindowR2Variant::gdn_q8_rows4_f32_gates_r1_v1 : KnownWindowR2Variant::gdn_q8_rows8_f32_gates_r1_v1) :
+                    mixed ? KnownWindowR2Variant::gdn_q8_rows2_f32_gates_r1_v1 : KnownWindowR2Variant::gdn_q8_virtual256_r2_v1;
+                const auto saved_copies = wide ? output.logical_rows-1U : output.logical_rows/2U;
                 for (const auto suffix : {"attn_qkv.weight", "attn_gate.weight", "ssm_beta.weight", "ssm_alpha.weight", "ssm_out.weight"}) {
                     if (mixed && (std::string_view(suffix) == "ssm_beta.weight" ||
                                   std::string_view(suffix) == "ssm_alpha.weight")) continue;
                     output.logical_projection_weight_bytes_avoided +=
-                        window_tensor(manifest, tensor_access, step.id, step.op, *step.layer, suffix).byte_size;
+                        window_tensor(manifest, tensor_access, step.id, step.op, *step.layer, suffix).byte_size*saved_copies;
                 }
-                output.projection_launches_saved += mixed ? 3U : 5U;
+                output.projection_launches_saved += (mixed ? 3U : 5U)*saved_copies;
             }
         }
         if (output.mode[i] == KnownWindowStepMode::r1_row_loop) {
             ++output.row_loop_steps; if (binding.host_or_runtime_step) ++output.runtime_row_steps;
-        } else ++output.r2_steps;
+        } else if(output.mode[i]==KnownWindowStepMode::shared_rows) ++output.shared_rows_steps;
+        else if(output.mode[i]==KnownWindowStepMode::gdn_rows) ++output.gdn_rows_steps;
+        else ++output.r2_steps;
     }
     const auto identities = known_window_identities(output, serial);
     output.window_execution_identity = identities.first; output.window_kernel_plan_identity = identities.second;
-    output.row_plan = {serial, serial};
+    output.row_plan.assign(output.logical_rows,serial);
     for (std::size_t row = 0; row < output.row_plan.size(); ++row) {
         output.row_plan[row].execution_identity = output.window_execution_identity;
         output.row_plan[row].arena = output.arena.row_view[row];
@@ -680,7 +709,10 @@ void validate_compiled_known_prefix_window(
     window_require(window.serial_execution_identity == serial.execution_identity &&
         window.serial_kernel_plan_identity == serial.kernel_plan_identity && window.manifest_layout_identity &&
         window.tensor_access_plan_identity, "known window serial/provenance identities differ");
-    const auto arena = build_known_window_arena(serial.arena, serial.arena.alignment);
+    window_require((window.logical_rows==2U || window.logical_rows==4U || window.logical_rows==8U) &&
+        window.row_plan.size()==window.logical_rows && window.arena.row_view.size()==window.logical_rows,
+        "known window row clone count differs from its closed geometry");
+    const auto arena = build_known_window_arena(serial.arena, serial.arena.alignment,window.logical_rows);
     window_require(window_same_arena(arena.physical, window.arena.physical) &&
         arena.row_stride == window.arena.row_stride, "known window physical allocation/stride mutated");
     for (std::size_t row = 0; row < window.row_plan.size(); ++row) {
@@ -708,10 +740,10 @@ void validate_known_prefix_window_formats(
         "known window format provenance differs from its compiled manifest/access plan");
     for (std::size_t i = 0; i < window.mode.size(); ++i) {
         const auto& step = serial.execution.steps[i];
-        if (window.mode[i] == KnownWindowStepMode::r2_shared_q8) {
+        if (window.mode[i] == KnownWindowStepMode::r2_shared_q8 || window.mode[i] == KnownWindowStepMode::shared_rows) {
             window_require(window_shared_types(manifest, tensor_access, step),
                 "known window shared variant differs from the selected tensor formats");
-        } else if (window.mode[i] == KnownWindowStepMode::r2_gdn_staged) {
+        } else if (window.mode[i] == KnownWindowStepMode::r2_gdn_staged || window.mode[i] == KnownWindowStepMode::gdn_rows) {
             const auto expected = window.r2_variant[i] == KnownWindowR2Variant::gdn_q8_virtual256_r2_v1 ?
                 WindowGdnFormat::all_q8 : WindowGdnFormat::q8_large_f32_gates;
             window_require(window_gdn_format(manifest, tensor_access, step, true) == expected,

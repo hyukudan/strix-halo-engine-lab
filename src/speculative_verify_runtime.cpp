@@ -208,12 +208,16 @@ KnownWindowResult execute_known_prefix_window_eager(
     const CompiledKnownPrefixWindow& window, const CompiledSerialExecution& serial,
     const ExecutionRuntimeResources& serial_resources,
     const ExecutionMemoryBinding& window_scratch, SerialSessionContext& session,
-    std::array<std::uint32_t, 2> tokens,
-    std::array<const CompiledLaunchPlan*, 2> row_launch,
+    std::span<const std::uint32_t> tokens,
+    std::span<const CompiledLaunchPlan* const> row_launch,
     std::span<const KnownWindowR2Entry> r2_entries,
+    std::span<const KnownWindowRowsEntry> rows_entries,
     const KnownWindowExecutionHooks& hooks) {
     // Every allocation, clone, mode and identity is checked before callbacks.
     validate_compiled_known_prefix_window(window, serial);
+    const auto rows = window.logical_rows;
+    if(tokens.size()!=rows || row_launch.size()!=rows)
+        throw std::invalid_argument("known window token/launch row count differs from its compiled geometry");
     if (!hooks.preflight_scope || !hooks.complete || !hooks.quiesce_or_fail_stop)
         throw std::invalid_argument("known window requires deep admission, owned scope, completion and fail-stop hooks");
     if (session.health != SerialSessionHealth::ready)
@@ -233,8 +237,8 @@ KnownWindowResult execute_known_prefix_window_eager(
     for (const auto token : tokens)
         if (!serial.vocab_size || static_cast<std::uint64_t>(token) >= serial.vocab_size)
             throw std::invalid_argument("known window input token is outside the compiled vocabulary");
-    const auto post_position = checked_add(session.next_position, 2, "known window position overflow");
-    const auto post_committed = checked_add(session.committed_tokens, 2, "known window committed-token overflow");
+    const auto post_position = checked_add(session.next_position, rows, "known window position overflow");
+    const auto post_committed = checked_add(session.committed_tokens, rows, "known window committed-token overflow");
     if (post_position > serial.max_position_embeddings ||
         post_position > serial_resources.session_state_layout->context_tokens)
         throw std::out_of_range("known window exceeds allocated context capacity");
@@ -263,9 +267,9 @@ KnownWindowResult execute_known_prefix_window_eager(
         if (weight.address) disjoint_from_window(weight.address, weight.bytes);
     if (serial_resources.ple_prefetch && serial_resources.ple_prefetch->active)
         throw std::invalid_argument("known window cannot borrow an active PLE lookup");
-    std::array<ExecutionRuntimeResources, 2> resources{serial_resources, serial_resources};
-    std::array<EagerExecutionRequest, 2> requests;
-    for (std::size_t r = 0; r < 2; ++r) {
+    std::vector<ExecutionRuntimeResources> resources(rows, serial_resources);
+    std::vector<EagerExecutionRequest> requests(rows);
+    for (std::size_t r = 0; r < rows; ++r) {
         resources[r].scratch = &window_scratch;
         validate_execution_runtime_resources(window.window_execution_identity, window.arena.row_view[r],
             resources[r], session.next_position + r);
@@ -294,21 +298,29 @@ KnownWindowResult execute_known_prefix_window_eager(
     }
     std::array<std::uint64_t, 6> pending_writes{};
     const auto steps = serial.execution.steps.size();
-    if (steps > std::numeric_limits<std::uint32_t>::max() / 2U)
+    if (steps > std::numeric_limits<std::uint32_t>::max() / rows)
         throw std::overflow_error("known window logical row-step count overflow");
-    std::vector<std::array<ExecutionDispatchContext, 2>> contexts(steps);
+    std::vector<std::vector<ExecutionDispatchContext>> contexts(steps, std::vector<ExecutionDispatchContext>(rows));
     std::vector<const KnownWindowR2Entry*> selected(steps, nullptr);
+    std::vector<const KnownWindowRowsEntry*> selected_rows(steps, nullptr);
     std::array<bool, known_window_r2_variant_slots> seen{};
     for (const auto& entry : r2_entries) {
         const auto id = static_cast<std::uint32_t>(entry.variant);
-        if (id == 0 || id >= seen.size() || seen[id] || !entry.config || !entry.preflight || !entry.launch)
+        if (id == 0 || id > 3U || seen[id] || !entry.config || !entry.preflight || !entry.launch)
             throw std::invalid_argument("known window R2 entry table is invalid or ambiguous");
         seen[id] = true;
     }
+    for(const auto& entry:rows_entries) {
+        const auto id=static_cast<std::uint32_t>(entry.variant);
+        if(id<4U || id>=seen.size() || seen[id] || !entry.config || !entry.preflight || !entry.launch)
+            throw std::invalid_argument("known window wide entry table is invalid or ambiguous");
+        seen[id]=true;
+    }
     KnownWindowResult result;
+    result.logits.resize(rows);
     result.execution.state = session.state;
-    result.execution.completion_order.reserve(2U * steps);
-    result.logical_row_steps = static_cast<std::uint32_t>(2U * steps);
+    result.execution.completion_order.reserve(rows * steps);
+    result.logical_row_steps = static_cast<std::uint32_t>(rows * steps);
     result.logical_projection_weight_bytes_avoided = window.logical_projection_weight_bytes_avoided;
     result.projection_launches_saved = window.projection_launches_saved;
     for (std::size_t i = 0; i < steps; ++i) {
@@ -316,8 +328,8 @@ KnownWindowResult execute_known_prefix_window_eager(
         for (std::size_t flag = 0; flag < window_state_flags.size(); ++flag)
             if ((static_cast<std::uint32_t>(step.writes_state) &
                  static_cast<std::uint32_t>(window_state_flags[flag])) != 0)
-                pending_writes[flag] = checked_add(pending_writes[flag], 2, "known window state-write count overflow");
-        for (std::size_t r = 0; r < 2; ++r) {
+                pending_writes[flag] = checked_add(pending_writes[flag], rows, "known window state-write count overflow");
+        for (std::size_t r = 0; r < rows; ++r) {
             auto& c = contexts[i][r];
             const auto& plan = window.row_plan[r];
             const auto& io = plan.io.steps[i];
@@ -334,19 +346,26 @@ KnownWindowResult execute_known_prefix_window_eager(
         }
         if (window.mode[i] != KnownWindowStepMode::r1_row_loop) {
             if (window_reads_position(step.reads_state))
-                throw std::invalid_argument("known window R2 entries cannot consume host position history");
-            const auto found = std::find_if(r2_entries.begin(), r2_entries.end(),
-                [&](const KnownWindowR2Entry& e) { return e.variant == window.r2_variant[i]; });
-            if (found == r2_entries.end()) throw std::invalid_argument("known window R2 implementation is missing");
-            selected[i] = &*found;
+                throw std::invalid_argument("known window promoted entries cannot consume host position history");
+            if(window.mode[i]==KnownWindowStepMode::shared_rows || window.mode[i]==KnownWindowStepMode::gdn_rows) {
+                const auto found=std::find_if(rows_entries.begin(),rows_entries.end(),
+                    [&](const KnownWindowRowsEntry& e){return e.variant==window.r2_variant[i];});
+                if(found==rows_entries.end()) throw std::invalid_argument("known window wide implementation is missing");
+                selected_rows[i]=&*found;
+            } else {
+                const auto found = std::find_if(r2_entries.begin(), r2_entries.end(),
+                    [&](const KnownWindowR2Entry& e) { return e.variant == window.r2_variant[i]; });
+                if (found == r2_entries.end()) throw std::invalid_argument("known window R2 implementation is missing");
+                selected[i] = &*found;
+            }
         }
     }
     for (std::size_t flag = 0; flag < window_state_flags.size(); ++flag)
         if (pending_writes[flag] > std::numeric_limits<std::uint64_t>::max() - session.state.generations[flag])
             throw std::overflow_error("known window persistent-state generation overflow");
     if (steps == 0 || serial.execution.steps.back().op != SerialOp::lm_head)
-        throw std::invalid_argument("known window requires both terminal logit rows");
-    for (std::size_t r = 0; r < 2; ++r) {
+        throw std::invalid_argument("known window requires every configured terminal logit row");
+    for (std::size_t r = 0; r < rows; ++r) {
         if (contexts.back()[r].writes.size() != 1)
             throw std::invalid_argument("known window terminal head requires one output");
         result.logits[r] = resolve_dispatch_write(contexts.back()[r], 0);
@@ -369,8 +388,11 @@ KnownWindowResult execute_known_prefix_window_eager(
     // A missing callback is not an implicit permit. Every row-loop launcher
     // proves its current metadata before PLE can start or any word is written.
     for (std::size_t i = 0; i < steps; ++i) {
-        if (selected[i]) selected[i]->preflight(contexts[i], selected[i]->config);
-        else for (std::size_t r = 0; r < 2; ++r) {
+        if(selected_rows[i]) selected_rows[i]->preflight(contexts[i],selected_rows[i]->config);
+        else if (selected[i]) {
+            for(std::size_t r=0;r<rows;r+=2U)
+                selected[i]->preflight(std::span<const ExecutionDispatchContext,2>(contexts[i].data()+r,2U),selected[i]->config);
+        } else for (std::size_t r = 0; r < rows; ++r) {
             const auto& launcher = row_launch[r]->steps[i];
             if (!launcher.preflight)
                 throw std::invalid_argument("known window row launcher lacks pure metadata preflight");
@@ -378,8 +400,9 @@ KnownWindowResult execute_known_prefix_window_eager(
         }
     }
     if (hooks.preflight_plan) hooks.preflight_plan();
-    DirectLaunchDispatcher row0(*row_launch[0]), row1(*row_launch[1]);
-    std::array<DirectLaunchDispatcher*, 2> dispatchers{&row0, &row1};
+    std::vector<DirectLaunchDispatcher> dispatchers;
+    dispatchers.reserve(rows);
+    for(const auto* plan:row_launch) dispatchers.emplace_back(*plan);
     // As in the serial session API, a lookup start that returns no handle or
     // throws before host/device mutation is an admission/start failure, not a
     // poisoned target. The backend owns cancellation of any failed start.
@@ -397,28 +420,37 @@ KnownWindowResult execute_known_prefix_window_eager(
             const auto& step = serial.execution.steps[i];
             if (!result.execution.state.contains(step.reads_state))
                 throw std::logic_error("known window persistent state disappeared after admission");
-            if (selected[i]) {
-                std::optional<ExecutionCorrelationScope> joint_scope;
-                std::optional<ExecutionPhaseScope> joint_elapsed;
-                if (current_execution_telemetry()) {
-                    auto correlation = current_execution_correlation();
-                    correlation.execution_identity = serial.execution_identity;
-                    correlation.position = contexts[i][0].position;
-                    correlation.rows = 2; correlation.row = UINT32_MAX;
-                    correlation.step_id = step.id; correlation.op = step.op;
-                    correlation.layer = step.layer.value_or(UINT32_MAX);
-                    correlation.phase = ExecutionPhase::operator_step;
-                    joint_scope.emplace(correlation);
-                    joint_elapsed.emplace(ExecutionPhase::operator_step);
+            if (selected[i] || selected_rows[i]) {
+                const auto width=selected_rows[i] ? rows : 2U;
+                for(std::uint32_t first=0;first<rows;first+=width) {
+                    std::optional<ExecutionCorrelationScope> joint_scope;
+                    std::optional<ExecutionPhaseScope> joint_elapsed;
+                    if (current_execution_telemetry()) {
+                        auto correlation=current_execution_correlation();
+                        correlation.execution_identity=serial.execution_identity;
+                        correlation.position=contexts[i][first].position;
+                        correlation.rows=width; correlation.row=UINT32_MAX;
+                        correlation.step_id=step.id; correlation.op=step.op;
+                        correlation.layer=step.layer.value_or(UINT32_MAX);
+                        correlation.phase=ExecutionPhase::operator_step;
+                        joint_scope.emplace(correlation);
+                        joint_elapsed.emplace(ExecutionPhase::operator_step);
+                    }
+                    if(selected_rows[i]) {
+                        selected_rows[i]->launch(contexts[i],selected_rows[i]->config);
+                        if(window.mode[i]==KnownWindowStepMode::shared_rows) ++result.shared_rows_dispatches;
+                        else ++result.gdn_rows_dispatches;
+                    } else {
+                        selected[i]->launch(std::span<const ExecutionDispatchContext,2>(contexts[i].data()+first,2U),selected[i]->config);
+                        ++result.r2_dispatches;
+                    }
+                    ++result.execution.kernel_steps;
+                    ++result.r2_variant_dispatches[static_cast<std::uint32_t>(window.r2_variant[i])];
+                    ++result.execution.completed_steps; result.execution.completion_order.push_back(step.id);
+                    for(std::uint32_t r=0;r<width;++r) result.execution.state.publish_write(step.writes_state);
                 }
-                selected[i]->launch(contexts[i], selected[i]->config);
-                ++result.r2_dispatches; ++result.execution.kernel_steps;
-                ++result.r2_variant_dispatches[static_cast<std::uint32_t>(window.r2_variant[i])];
-                ++result.execution.completed_steps; result.execution.completion_order.push_back(step.id);
-                result.execution.state.publish_write(step.writes_state);
-                result.execution.state.publish_write(step.writes_state);
             } else {
-                for (std::size_t r = 0; r < 2; ++r) {
+                for (std::size_t r = 0; r < rows; ++r) {
                     const auto& context = contexts[i][r];
                     std::optional<ExecutionCorrelationScope> row_scope;
                     if (current_execution_telemetry()) {
@@ -431,12 +463,12 @@ KnownWindowResult execute_known_prefix_window_eager(
                     // semantic write count and never exposes the future row.
                     if (window_reads_position(step.reads_state))
                         materialize_position(context, context.position);
-                    if (r == 1 && step.op == SerialOp::ple && serial_resources.ple_prefetch && serial_resources.ple_prefetch->active)
+                    if (r > 0 && step.op == SerialOp::ple && serial_resources.ple_prefetch && serial_resources.ple_prefetch->active)
                         throw std::logic_error("known window row0 did not consume its sole PLE lookup");
                     if (window.row_plan[r].bindings.bindings[i].host_or_runtime_step) {
-                        dispatchers[r]->dispatch_runtime_step(context); ++result.execution.runtime_steps;
+                        dispatchers[r].dispatch_runtime_step(context); ++result.execution.runtime_steps;
                     } else {
-                        dispatchers[r]->dispatch_kernel(context); ++result.execution.kernel_steps;
+                        dispatchers[r].dispatch_kernel(context); ++result.execution.kernel_steps;
                     }
                     ++result.row_loop_dispatches; ++result.execution.completed_steps;
                     result.execution.completion_order.push_back(step.id);
@@ -447,11 +479,11 @@ KnownWindowResult execute_known_prefix_window_eager(
         if (serial_resources.ple_prefetch && serial_resources.ple_prefetch->active)
             throw std::logic_error("known window completed without consuming its PLE lookup");
         hooks.complete();
-        materialize_position(contexts.back()[1], post_position - 1);
+        materialize_position(contexts.back()[rows-1U], post_position - 1);
         std::uint64_t final_position_word = 0;
         std::memcpy(&final_position_word, reinterpret_cast<const void*>(position_state.address), sizeof(final_position_word));
         if (final_position_word != post_position - 1)
-            throw std::logic_error("known window final host position differs from two serial tokens");
+            throw std::logic_error("known window final host position differs from the serial row frontier");
     } catch (...) {
         if (serial_resources.ple_lookup && serial_resources.ple_prefetch)
             cancel_ple_lookup_prefetch(*serial_resources.ple_lookup, *serial_resources.ple_prefetch);
@@ -466,13 +498,23 @@ KnownWindowResult execute_known_prefix_window_eager(
     {
         auto correlation = current_execution_correlation();
         correlation.execution_identity = session.execution_identity;
-        correlation.position = post_position - 2;
-        correlation.row = UINT32_MAX; correlation.rows = 2; correlation.step_id = UINT32_MAX;
+        correlation.position = post_position - rows;
+        correlation.row = UINT32_MAX; correlation.rows = rows; correlation.step_id = UINT32_MAX;
         correlation.phase = ExecutionPhase::commit;
         ExecutionCorrelationScope commit_scope(correlation);
-        observe_execution_activity(ExecutionActivityKind::token_commit, 0, 2);
+        observe_execution_activity(ExecutionActivityKind::token_commit, 0, rows);
     }
     return result;
+}
+
+KnownWindowResult execute_known_prefix_window_eager(
+    const CompiledKnownPrefixWindow& window, const CompiledSerialExecution& serial,
+    const ExecutionRuntimeResources& serial_resources, const ExecutionMemoryBinding& scratch,
+    SerialSessionContext& session, std::array<std::uint32_t,2> tokens,
+    std::array<const CompiledLaunchPlan*,2> launch,
+    std::span<const KnownWindowR2Entry> entries, const KnownWindowExecutionHooks& hooks) {
+    return execute_known_prefix_window_eager(window,serial,serial_resources,scratch,session,
+        std::span<const std::uint32_t>(tokens),std::span<const CompiledLaunchPlan* const>(launch),entries,{},hooks);
 }
 
 }  // namespace strix

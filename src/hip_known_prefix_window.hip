@@ -83,14 +83,16 @@ struct HipKnownPrefixWindow::Impl {
     RuntimeExecutionIdentities original_identities;
     SerialSessionStateLayout original_state_layout;
     std::unique_ptr<const PreparedTensorViews> metadata;
-    std::array<ExecutionRuntimeResources, 2> row_resources;
-    std::array<std::unique_ptr<HipLauncherCatalog>, 2> catalogs;
-    std::array<ExecutionLauncherRegistry, 2> registries;
-    std::array<CompiledLaunchPlan, 2> launch_plans;
+    std::vector<ExecutionRuntimeResources> row_resources;
+    std::vector<std::unique_ptr<HipLauncherCatalog>> catalogs;
+    std::vector<ExecutionLauncherRegistry> registries;
+    std::vector<CompiledLaunchPlan> launch_plans;
+    std::vector<const CompiledLaunchPlan*> launch_pointers;
     std::vector<std::uint64_t> position_readers;
     HipSharedExpertLauncherConfig shared_config, shared_fallback;
     HipGdnLauncherConfig gdn_config;
     std::array<KnownWindowR2Entry, 3> r2_entries;
+    std::array<KnownWindowRowsEntry,4> rows_entries;
     DeferredMoeFirstError completion_status{};
     bool failed = false;
 
@@ -124,7 +126,12 @@ struct HipKnownPrefixWindow::Impl {
             *resources.model_manifest, *resources.model_weights, *resources.tensor_access, actual_owner);
         validate_execution_memory_binding(window.window_execution_identity, window.arena.physical, scratch);
         validate_scope();
-        for (std::size_t row = 0; row < 2U; ++row) {
+        row_resources.resize(window.logical_rows);
+        catalogs.resize(window.logical_rows);
+        registries.resize(window.logical_rows);
+        launch_plans.resize(window.logical_rows);
+        launch_pointers.reserve(window.logical_rows);
+        for (std::size_t row = 0; row < window.logical_rows; ++row) {
             row_resources[row] = resources;
             row_resources[row].scratch = &scratch;
             catalogs[row] = std::make_unique<HipLauncherCatalog>(model, config);
@@ -135,12 +142,14 @@ struct HipKnownPrefixWindow::Impl {
             for (const auto& launcher : launch_plans[row].steps)
                 if (!launcher.preflight)
                     throw std::invalid_argument("known-window native row contains a launcher without deep preflight");
+            launch_pointers.push_back(&launch_plans[row]);
             const auto readers = catalogs[row]->known_window_position_readers(window.row_plan[row], registries[row]);
             position_readers.insert(position_readers.end(), readers.begin(), readers.end());
         }
         std::sort(position_readers.begin(), position_readers.end());
         position_readers.erase(std::unique(position_readers.begin(), position_readers.end()), position_readers.end());
         setup_r2();
+        setup_rows();
         // Setup only: no execution callback clears or reads this record before
         // all deep admission. Exclusive status ownership preserves zero across
         // successful calls; any exception disables the owner permanently.
@@ -197,7 +206,7 @@ struct HipKnownPrefixWindow::Impl {
             throw std::invalid_argument("known-window retained runtime bindings or state layout changed");
         validate_scope();
     }
-    const HipSharedExpertLauncherConfig& shared_for(std::span<const ExecutionDispatchContext, 2> rows) const {
+    const HipSharedExpertLauncherConfig& shared_for(std::span<const ExecutionDispatchContext> rows) const {
         if (!rows[0].kernel_id) throw std::invalid_argument("known-window shared row has no serial kernel id");
         return rows[0].kernel_id->ends_with(shared_expert_prefetch::kernel_suffix) ? shared_config : shared_fallback;
     }
@@ -240,6 +249,28 @@ struct HipKnownPrefixWindow::Impl {
                 gdn_known_window_r2_f32_gates_launch(rows, static_cast<Impl*>(object)->gdn_config);
             }};
     }
+    void setup_rows() {
+        for(std::size_t i=0;i<2U;++i) {
+            rows_entries[i]={i==0U ? KnownWindowR2Variant::shared_q8_virtual256_r4_v1 :
+                KnownWindowR2Variant::shared_q8_virtual256_r8_v1,this,
+                [](std::span<const ExecutionDispatchContext> rows,void* object) {
+                    const auto& self=*static_cast<Impl*>(object);
+                    shared_expert_known_window_rows_preflight(rows,self.shared_for(rows));
+                },
+                [](std::span<const ExecutionDispatchContext> rows,void* object) {
+                    const auto& self=*static_cast<Impl*>(object);
+                    shared_expert_known_window_rows_launch(rows,self.shared_for(rows));
+                }};
+            rows_entries[i+2U]={i==0U ? KnownWindowR2Variant::gdn_q8_rows4_f32_gates_r1_v1 :
+                KnownWindowR2Variant::gdn_q8_rows8_f32_gates_r1_v1,this,
+                [](std::span<const ExecutionDispatchContext> rows,void* object) {
+                    gdn_known_window_rows_preflight(rows,static_cast<Impl*>(object)->gdn_config);
+                },
+                [](std::span<const ExecutionDispatchContext> rows,void* object) {
+                    gdn_known_window_rows_launch(rows,static_cast<Impl*>(object)->gdn_config);
+                }};
+        }
+    }
     void complete() {
         guard.require_original();
         if (config.deferred_moe_status)
@@ -250,12 +281,16 @@ struct HipKnownPrefixWindow::Impl {
         guard.require_original();
         if (config.deferred_moe_status) check_deferred_moe_status(completion_status);
     }
-    KnownWindowResult execute(SerialSessionContext& session, std::array<std::uint32_t, 2> tokens) {
+    KnownWindowResult execute(SerialSessionContext& session, std::span<const std::uint32_t> tokens) {
         if (failed) throw std::logic_error("known-window native owner cannot be reused after an exception");
+        bool owned_eager_scope_admitted=false;
         try {
+            if(tokens.size()!=window.logical_rows)
+                throw std::invalid_argument("known-window native input row count differs from its compiled window");
             if (current_hip_launch_context())
                 throw std::invalid_argument("known-window native owner cannot nest a HIP launch scope");
             validate_metadata();
+            owned_eager_scope_admitted=true;
             const HipLaunchScope active(scope);
             KnownWindowExecutionHooks hooks;
             hooks.preflight_scope = [&] { validate_scope(); };
@@ -264,10 +299,11 @@ struct HipKnownPrefixWindow::Impl {
             hooks.quiesce_or_fail_stop = [&] { failed = true; guard.recover_or_fail_stop(); };
             hooks.position_reader_implementations = position_readers;
             return execute_known_prefix_window_eager(window, serial, resources, scratch, session, tokens,
-                {&launch_plans[0], &launch_plans[1]}, r2_entries, hooks);
+                launch_pointers, r2_entries, rows_entries, hooks);
         } catch (...) {
             failed = true;
-            guard.recover_or_fail_stop();
+            // A rejected foreign capture/scope must never be drained here.
+            if(owned_eager_scope_admitted) guard.recover_or_fail_stop();
             throw;
         }
     }
@@ -281,6 +317,10 @@ HipKnownPrefixWindow::HipKnownPrefixWindow(CompiledKnownPrefixWindow window,
           std::move(config), serial_resources, window_scratch, scope, std::move(actual_owner))) {}
 HipKnownPrefixWindow::~HipKnownPrefixWindow() = default;
 KnownWindowResult HipKnownPrefixWindow::execute(SerialSessionContext& session, std::array<std::uint32_t, 2> tokens) {
-    return impl_->execute(session, tokens);
+    return impl_->execute(session, std::span<const std::uint32_t>(tokens));
 }
+KnownWindowResult HipKnownPrefixWindow::execute(SerialSessionContext& session, std::span<const std::uint32_t> tokens) {
+    return impl_->execute(session,tokens);
+}
+std::uint32_t HipKnownPrefixWindow::logical_rows() const noexcept { return impl_->window.logical_rows; }
 } // namespace strix

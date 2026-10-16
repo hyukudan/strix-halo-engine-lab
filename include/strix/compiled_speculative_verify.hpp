@@ -14,6 +14,7 @@
 
 #include <array>
 #include <cstdint>
+#include <vector>
 
 namespace strix {
 
@@ -21,9 +22,11 @@ enum class KnownWindowStepMode : std::uint8_t {
     r1_row_loop,
     r2_shared_q8,
     r2_gdn_staged,
+    shared_rows,
+    gdn_rows,
 };
 
-// Closed implementation table. These values identify a new R2 entry; they do
+// Closed implementation table. These values identify window entries; they do
 // not change any serial KernelVariant or claim hardware qualification.
 enum class KnownWindowR2Variant : std::uint32_t {
     none = 0,
@@ -31,13 +34,20 @@ enum class KnownWindowR2Variant : std::uint32_t {
     gdn_q8_virtual256_r2_v1 = 2,
     // Large projections share Q8 weights; both small F32 gates retain R1 math.
     gdn_q8_rows2_f32_gates_r1_v1 = 3,
+    shared_q8_virtual256_r4_v1 = 4,
+    shared_q8_virtual256_r8_v1 = 5,
+    gdn_q8_rows4_f32_gates_r1_v1 = 6,
+    gdn_q8_rows8_f32_gates_r1_v1 = 7,
 };
-inline constexpr std::uint32_t known_window_r2_variant_slots = 4;
+inline constexpr std::uint32_t known_window_r2_variant_slots = 8;
 
 struct KnownWindowRequest {
     bool r2_shared_expert = false;
     bool r2_gdn = false;
     bool r2_gdn_f32_gates = false;
+    // Native shared and mixed-GDN rows4/8 when selected, all-Q8 GDN pair tiles and R1
+    // fallback elsewhere. Does not register new serial kernel IDs.
+    std::uint32_t logical_rows = 2;
 };
 
 struct CompiledKnownPrefixWindow {
@@ -51,16 +61,19 @@ struct CompiledKnownPrefixWindow {
     // Fresh launch plans/dispatchers must be built for these row plans. Their
     // kernel IDs and serial kernel-plan identity stay intact; arena and
     // execution identity belong to the complete window.
-    std::array<CompiledSerialExecution, 2> row_plan;
+    std::vector<CompiledSerialExecution> row_plan;
     std::vector<KnownWindowStepMode> mode;
     std::vector<KnownWindowR2Variant> r2_variant;
     std::uint32_t r2_steps = 0;
     std::uint32_t row_loop_steps = 0;
     std::uint32_t runtime_row_steps = 0;
     // Logical repeated projection payload/launches removed by the closed R2
-    // mapping; neither counter measures DRAM traffic or elapsed time.
+    // or wide mapping; neither counter measures DRAM traffic or elapsed time.
     std::uint64_t logical_projection_weight_bytes_avoided = 0;
     std::uint32_t projection_launches_saved = 0;
+    std::uint32_t logical_rows = 2;
+    std::uint32_t shared_rows_steps = 0;
+    std::uint32_t gdn_rows_steps = 0;
 };
 
 [[nodiscard]] CompiledKnownPrefixWindow compile_known_prefix_window(

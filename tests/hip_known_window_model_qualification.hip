@@ -43,7 +43,12 @@ void require(bool condition, const char* reason) {
 // This driver deliberately qualifies the canonical mixed-format mapping, not
 // the older all-five-Q8 variant. Counters are source ledgers, not timing.
 using VariantCounts = std::array<std::uint32_t, strix::known_window_r2_variant_slots>;
-constexpr VariantCounts expected_variants{0, 48, 0, 36};
+VariantCounts expected_variants(std::uint32_t rows) {
+    VariantCounts counts{};
+    if(rows==2U) {counts[1]=48U;counts[3]=36U;}
+    else {counts[rows==4U?4U:5U]=48U;counts[rows==4U?6U:7U]=36U;}
+    return counts;
+}
 VariantCounts variant_steps(const strix::CompiledKnownPrefixWindow& window) {
     VariantCounts counts{};
     for (const auto variant : window.r2_variant) {
@@ -54,15 +59,20 @@ VariantCounts variant_steps(const strix::CompiledKnownPrefixWindow& window) {
     return counts;
 }
 void require_mixed_window(const strix::CompiledKnownPrefixWindow& window) {
-    require(window.r2_steps == 84 && variant_steps(window) == expected_variants &&
-        window.projection_launches_saved == 252 &&
-        window.logical_projection_weight_bytes_avoided == 2456616960ULL,
-        "real model does not admit exactly 48 shared, zero all-Q8 GDN and 36 mixed GDN R2 steps");
+    const auto rows=window.logical_rows;
+    require((rows==2U ? window.r2_steps==84U && !window.shared_rows_steps && !window.gdn_rows_steps :
+        !window.r2_steps && window.shared_rows_steps==48U && window.gdn_rows_steps==36U) &&
+        variant_steps(window) == expected_variants(rows) &&
+        window.projection_launches_saved == 252U*(rows-1U) &&
+        window.logical_projection_weight_bytes_avoided == 2456616960ULL*(rows-1U),
+        "real model does not admit exactly 48 shared and 36 mixed GDN steps at the configured width");
 }
-bool mixed_dispatch_counts(const strix::KnownWindowResult& result) {
-    return result.r2_dispatches == 84 && result.row_loop_dispatches == 708 &&
-        result.r2_variant_dispatches == expected_variants && result.projection_launches_saved == 252 &&
-        result.logical_projection_weight_bytes_avoided == 2456616960ULL;
+bool mixed_dispatch_counts(const strix::KnownWindowResult& result,std::uint32_t rows) {
+    return result.r2_dispatches == (rows==2U?84U:0U) &&
+        result.shared_rows_dispatches==(rows==2U?0U:48U) && result.gdn_rows_dispatches==(rows==2U?0U:36U) &&
+        result.row_loop_dispatches == 354U*rows &&
+        result.r2_variant_dispatches == expected_variants(rows) && result.projection_launches_saved == 252U*(rows-1U) &&
+        result.logical_projection_weight_bytes_avoided == 2456616960ULL*(rows-1U);
 }
 std::string variant_counts_json(const VariantCounts& counts) {
     std::ostringstream out;
@@ -101,6 +111,7 @@ struct Options {
     std::filesystem::path model, teacher, output;
     std::string model_sha, teacher_sha, profile = "q8-wave8";
     std::uint64_t start = 0;
+    std::uint32_t rows = 2;
 };
 Options options(int argc, char** argv) {
     Options result;
@@ -117,6 +128,10 @@ Options options(int argc, char** argv) {
         else if (key == "--teacher-sha256") result.teacher_sha = value;
         else if (key == "--output") result.output = value;
         else if (key == "--profile") result.profile = value;
+        else if(key=="--rows") {
+            const auto parsed=std::from_chars(value.data(),value.data()+value.size(),result.rows);
+            require(parsed.ec==std::errc{} && parsed.ptr==value.data()+value.size(),"invalid row count");
+        }
         else if (key == "--start-position") {
             const auto parsed = std::from_chars(value.data(), value.data() + value.size(), result.start);
             require(parsed.ec == std::errc{} && parsed.ptr == value.data() + value.size(), "invalid start position");
@@ -126,15 +141,16 @@ Options options(int argc, char** argv) {
         "required: --model --model-sha256 --teacher-u32le --teacher-sha256 --output");
     require(digest_text(result.model_sha) && digest_text(result.teacher_sha), "expected lowercase SHA256 pins required");
     require(result.profile == "q8-wave8" || result.profile == "q8-wave8-a8-q51", "unsupported closed profile");
-    require(result.start <= context_tokens - 2U, "two known rows exceed the fixed 8192-token context");
+    require(result.rows==2U || result.rows==4U || result.rows==8U,"known rows must be 2,4 or8");
+    require(result.start <= context_tokens - result.rows, "known rows exceed the fixed 8192-token context");
     require(!std::filesystem::exists(result.output), "output directory must be fresh");
     return result;
 }
 std::vector<std::uint32_t> teacher_tokens(const Options& args, std::uint64_t vocabulary) {
     require(hash_file(args.teacher) == args.teacher_sha, "teacher SHA differs before execution");
     const auto bytes = std::filesystem::file_size(args.teacher);
-    require(bytes % 4U == 0 && bytes >= (args.start + 2U) * 4U && bytes <= context_tokens * 4U,
-        "teacher file must contain bounded explicit u32le tokens including both requested rows");
+    require(bytes % 4U == 0 && bytes >= (args.start + args.rows) * 4U && bytes <= context_tokens * 4U,
+        "teacher file must contain bounded explicit u32le tokens including all requested rows");
     std::ifstream input(args.teacher, std::ios::binary);
     input.exceptions(std::ios::failbit | std::ios::badbit);
     std::vector<std::uint32_t> result;
@@ -232,7 +248,7 @@ std::shared_ptr<Owners> load(const Options& args, const strix::HipLauncherCatalo
     owner->access = strix::compile_execution_tensor_access_plan(owner->serial.execution, owner->manifest,
         index, strix::build_serial_execution_tensor_requirements(owner->serial.execution));
     owner->window = strix::compile_known_prefix_window(owner->model, owner->serial,
-        owner->manifest, owner->access, {true, true, true});
+        owner->manifest, owner->access, {true, true, true, args.rows});
     require_mixed_window(owner->window);
     const auto projections = strix::q8_projection_organization::build_manifest_plan(
         owner->model, owner->manifest, false, true, true, false);
@@ -432,7 +448,7 @@ std::uint64_t owner_negative_cases(const std::shared_ptr<Owners>& owner,
     const strix::HipLauncherCatalogConfig& config, const strix::ExecutionBindingRequest& binding,
     const strix::ExecutionBufferRequest& buffers, const std::vector<StateFile>& initial,
     const strix::SerialSessionContext& saved, strix::SerialSessionContext& session,
-    std::array<std::uint32_t, 2> tokens) {
+    std::span<const std::uint32_t> tokens) {
     std::uint64_t cases = 0;
     const auto retained = std::static_pointer_cast<const void>(owner);
     const auto reject_constructor = [&](const strix::CompiledKnownPrefixWindow& window,
@@ -478,7 +494,7 @@ std::uint64_t owner_negative_cases(const std::shared_ptr<Owners>& owner,
     strix::register_complete_hip_kernel_catalog(owner->model, deferred_binding, deferred_config, deferred_kernels);
     const auto deferred_serial = strix::compile_serial_execution(owner->model, deferred_kernels, deferred_binding, buffers, 256);
     const auto deferred_window = strix::compile_known_prefix_window(owner->model, deferred_serial,
-        owner->manifest, owner->access, {true, true, true});
+        owner->manifest, owner->access, {true, true, true, owner->window.logical_rows});
     auto deferred_scratch = owner->memory->scratch();
     deferred_scratch.execution_identity = deferred_serial.execution_identity;
     auto deferred_resources = owner->resources;
@@ -500,7 +516,9 @@ std::uint64_t owner_negative_cases(const std::shared_ptr<Owners>& owner,
         strix::HipKnownPrefixWindow failed(owner->window, owner->serial, owner->model, config,
             owner->resources, owner->window_memory, owner->scope(), retained);
         bool rejected = false;
-        try { (void)failed.execute(session, {static_cast<std::uint32_t>(owner->model.vocab_size), tokens[1]}); }
+        auto bad_tokens=std::vector<std::uint32_t>(tokens.begin(),tokens.end());
+        bad_tokens.back()=static_cast<std::uint32_t>(owner->model.vocab_size);
+        try { (void)failed.execute(session, std::span<const std::uint32_t>(bad_tokens)); }
         catch (const std::invalid_argument& error) {
             require(std::string_view(error.what()).find("outside the compiled vocabulary") != std::string_view::npos,
                 "owner execute preflight rejected for the wrong reason");
@@ -563,12 +581,12 @@ int qualify(const Options& args) {
     const auto initial = dump_state(owner, args.output, "initial");
     auto metadata = output_file(args.output / "initial-session.json");
     write_session(metadata, prefix); metadata.close();
-    const auto rejected_owner_cases = owner_negative_cases(owner, config, binding, buffers, initial, prefix, session,
-        {teacher[static_cast<std::size_t>(args.start)], teacher[static_cast<std::size_t>(args.start) + 1U]});
-    std::array<std::vector<float>, 2> reference;
-    std::array<std::string, 2> reference_sha, candidate_sha;
+    const auto tokens=std::span<const std::uint32_t>(teacher).subspan(static_cast<std::size_t>(args.start),args.rows);
+    const auto rejected_owner_cases = owner_negative_cases(owner, config, binding, buffers, initial, prefix, session,tokens);
+    std::vector<std::vector<float>> reference(args.rows);
+    std::vector<std::string> reference_sha(args.rows), candidate_sha(args.rows);
     const auto logit_use = owner->serial.io.steps.back().writes.front();
-    for (std::size_t r = 0; r < 2; ++r) {
+    for (std::size_t r = 0; r < args.rows; ++r) {
         serial_step(teacher[static_cast<std::size_t>(args.start) + r]);
         const auto path = args.output / ("serial-logits-" + std::to_string(r) + ".f32");
         reference[r] = logits(owner, strix::resolve_execution_buffer(owner->serial.execution_identity,
@@ -585,11 +603,11 @@ int qualify(const Options& args) {
             "restored initial component differs");
     strix::HipKnownPrefixWindow window(owner->window, owner->serial, owner->model, config,
         owner->resources, owner->window_memory, owner->scope(), std::static_pointer_cast<const void>(owner));
-    const auto result = window.execute(session, {teacher[static_cast<std::size_t>(args.start)],
-        teacher[static_cast<std::size_t>(args.start) + 1U]});
+    const auto result = window.execute(session,tokens);
+    require(result.logits.size()==args.rows,"native owner did not return every full-head row");
     require(!owner->prefetch.active, "window left an active PLE lookup");
     bool full_logits_equal = true;
-    for (std::size_t r = 0; r < 2; ++r) {
+    for (std::size_t r = 0; r < args.rows; ++r) {
         const auto path = args.output / ("window-logits-" + std::to_string(r) + ".f32");
         const auto candidate = logits(owner, result.logits[r], path);
         candidate_sha[r] = hash_file(path);
@@ -603,7 +621,7 @@ int qualify(const Options& args) {
             serial_state[i].bytes == window_state[i].bytes && serial_state[i].sha == window_state[i].sha &&
             equal_files(serial_state[i].path, window_state[i].path);
     const auto expected_lineage = strix::prepare_prefill_chunk_lineage(prefix.arithmetic_lineage,
-        args.start, args.start + 2U, owner->window.window_execution_identity,
+        args.start, args.start + args.rows, owner->window.window_execution_identity,
         owner->window.window_kernel_plan_identity, owner->window.window_execution_identity);
     const bool lineage_equal = session.arithmetic_lineage.intervals == expected_lineage.intervals &&
         session.arithmetic_lineage.history_identity == expected_lineage.history_identity &&
@@ -614,17 +632,17 @@ int qualify(const Options& args) {
         "unexpected position history storage");
     std::uint64_t position_word = 0;
     std::memcpy(&position_word, reinterpret_cast<const void*>(position.address), sizeof(position_word));
-    const bool metadata_equal = session.next_position == args.start + 2U &&
+    const bool metadata_equal = session.next_position == args.start + args.rows &&
         session.committed_tokens == serial_session.committed_tokens &&
         session.state.valid == serial_session.state.valid && session.state.generations == serial_session.state.generations &&
-        session.health == strix::SerialSessionHealth::ready && position_word == args.start + 1U &&
+        session.health == strix::SerialSessionHealth::ready && position_word == args.start + args.rows - 1U &&
         session.execution_identity == prefix.execution_identity &&
         session.runtime_compatibility_identity == prefix.runtime_compatibility_identity &&
         session.state_layout_identity == prefix.state_layout_identity;
     require(hash_file(args.teacher) == args.teacher_sha && hash_file(args.model) == args.model_sha &&
         hash_file(executable) == executable_sha, "input/model/executable content changed during qualification");
-    const bool dispatch_counts_equal = variant_steps(owner->window) == expected_variants &&
-        mixed_dispatch_counts(result);
+    const bool dispatch_counts_equal = variant_steps(owner->window) == expected_variants(args.rows) &&
+        mixed_dispatch_counts(result,args.rows);
     const bool passed = full_logits_equal && all_state_equal && lineage_equal && metadata_equal && dispatch_counts_equal;
     const auto pending = args.output / "result.pending.json";
     auto output = output_file(pending);
@@ -633,8 +651,9 @@ int qualify(const Options& args) {
         << ",\"model_sha256\":" << quote(args.model_sha) << ",\"model_content_identity\":"
         << quote(hex(owner->mapped->content_identity())) << ",\"teacher_sha256\":" << quote(args.teacher_sha)
         << ",\"executable_sha256\":" << quote(executable_sha) << ",\"context_tokens\":" << context_tokens
-        << ",\"start_position\":" << args.start << ",\"tokens\":[" << teacher[static_cast<std::size_t>(args.start)]
-        << ',' << teacher[static_cast<std::size_t>(args.start) + 1U] << "]"
+        << ",\"start_position\":" << args.start << ",\"logical_rows\":" << args.rows << ",\"tokens\":[";
+    for(std::size_t r=0;r<tokens.size();++r) output<<(r?",":"")<<tokens[r];
+    output << "]"
         << ",\"serial_execution_identity\":" << owner->serial.execution_identity
         << ",\"serial_kernel_plan_identity\":" << owner->serial.kernel_plan_identity
         << ",\"manifest_layout_identity\":" << owner->manifest.layout_identity
@@ -642,11 +661,15 @@ int qualify(const Options& args) {
         << ",\"window_execution_identity\":" << owner->window.window_execution_identity
         << ",\"window_kernel_plan_identity\":" << owner->window.window_kernel_plan_identity
         << ",\"r2_steps\":" << owner->window.r2_steps
+        << ",\"shared_rows_steps\":" << owner->window.shared_rows_steps
+        << ",\"gdn_rows_steps\":" << owner->window.gdn_rows_steps
         << ",\"r2_variant_steps\":" << variant_counts_json(variant_steps(owner->window))
         << ",\"r2_variant_dispatches\":" << variant_counts_json(result.r2_variant_dispatches)
         << ",\"logical_projection_weight_bytes_avoided\":" << owner->window.logical_projection_weight_bytes_avoided
         << ",\"projection_launches_saved\":" << owner->window.projection_launches_saved
         << ",\"r2_dispatches\":" << result.r2_dispatches << ",\"row_loop_dispatches\":" << result.row_loop_dispatches
+        << ",\"shared_rows_dispatches\":" << result.shared_rows_dispatches
+        << ",\"gdn_rows_dispatches\":" << result.gdn_rows_dispatches
         << ",\"owner_negative_cases\":" << rejected_owner_cases
         << ",\"owner_negative_session_and_state_unchanged\":true"
         << ",\"full_logits_bits_equal\":" << (full_logits_equal ? "true" : "false")
@@ -654,7 +677,7 @@ int qualify(const Options& args) {
         << ",\"six_generations_and_position_equal\":" << (metadata_equal ? "true" : "false")
         << ",\"expected_chunk_lineage_equal\":" << (lineage_equal ? "true" : "false")
         << ",\"quality_qualification\":false,\"performance_measurement\":false,\"logits\":[";
-    for (std::size_t r = 0; r < 2; ++r)
+    for (std::size_t r = 0; r < args.rows; ++r)
         output << (r ? "," : "") << "{\"row\":" << r << ",\"serial_sha256\":" << quote(reference_sha[r])
             << ",\"window_sha256\":" << quote(candidate_sha[r]) << '}';
     output << "],\"initial_state\":"; write_states(output, initial);

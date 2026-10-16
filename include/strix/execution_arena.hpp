@@ -25,17 +25,17 @@ struct ExecutionArenaPlan {
     std::vector<ExecutionArenaAllocation> allocations;
 };
 
-// Two known inputs share one physical arena. Each row view retains the exact
+// Two, four or eight known inputs share one physical arena. Each row view retains the exact
 // serial payload sizes and uses; only offsets change. Strides are indexed in
 // the same order as physical.allocations, including lifetime-reused regions.
 struct KnownWindowArena {
     ExecutionArenaPlan physical;
     std::vector<std::uint64_t> row_stride;
-    std::array<ExecutionArenaPlan, 2> row_view;
+    std::vector<ExecutionArenaPlan> row_view;
 };
 
 [[nodiscard]] KnownWindowArena build_known_window_arena(
-    const ExecutionArenaPlan& serial, std::uint64_t alignment = 256);
+    const ExecutionArenaPlan& serial, std::uint64_t alignment = 256, std::uint32_t logical_rows = 2);
 
 [[nodiscard]] ExecutionArenaPlan build_serial_execution_arena_plan(
     const ModelContract& model,

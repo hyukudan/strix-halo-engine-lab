@@ -9,14 +9,15 @@
 #include <cstdint>
 #include <functional>
 #include <span>
+#include <vector>
 
 namespace strix {
 
 struct CompiledLaunchPlan;
 
-// The caller retains both row registries/configs and every resource owner until
+// The caller retains all row registries/configs and every resource owner until
 // completion or quiesce_or_fail_stop. The runtime invokes each selected R1
-// launcher's pure preflight on both rows; a missing callback fails admission.
+// launcher's pure preflight on all rows; a missing callback fails admission.
 // preflight_plan optionally adds owner policy. preflight_scope proves an owned eager stream and
 // deferred-status parity, and null graph-position arguments. complete drains/checks status before publication.
 struct KnownWindowExecutionHooks {
@@ -38,18 +39,28 @@ struct KnownWindowR2Entry {
     void (*launch)(std::span<const ExecutionDispatchContext, 2>, void*) = nullptr;
 };
 
+// Separate closed wide entry: R2 callbacks retain their fixed-span contract.
+struct KnownWindowRowsEntry {
+    KnownWindowR2Variant variant = KnownWindowR2Variant::none;
+    void* config = nullptr;
+    void (*preflight)(std::span<const ExecutionDispatchContext>, void*) = nullptr;
+    void (*launch)(std::span<const ExecutionDispatchContext>, void*) = nullptr;
+};
+
 struct KnownWindowResult {
     EagerExecutionResult execution;
-    std::array<ExecutionBufferAddress, 2> logits;
+    std::vector<ExecutionBufferAddress> logits;
     std::uint64_t logical_projection_weight_bytes_avoided = 0;
     std::uint32_t projection_launches_saved = 0;
     std::uint32_t logical_row_steps = 0;
     std::uint32_t r2_dispatches = 0;
     std::uint32_t row_loop_dispatches = 0;
+    std::uint32_t shared_rows_dispatches = 0;
+    std::uint32_t gdn_rows_dispatches = 0;
     std::array<std::uint32_t, known_window_r2_variant_slots> r2_variant_dispatches{};
 };
 
-// Two KNOWN input tokens only. This API neither predicts a future greedy token
+// Compatibility entry for two KNOWN input tokens only. This API neither predicts a future greedy token
 // nor authorises speculative reuse. Row launch plans must be freshly built from
 // window.row_plan[r], preserving each serial incumbent kernel id.
 [[nodiscard]] KnownWindowResult execute_known_prefix_window_eager(
@@ -59,6 +70,17 @@ struct KnownWindowResult {
     std::array<std::uint32_t, 2> tokens,
     std::array<const CompiledLaunchPlan*, 2> row_launch,
     std::span<const KnownWindowR2Entry> r2_entries,
+    const KnownWindowExecutionHooks& hooks);
+
+// Complete known R=2/4/8 window, with explicit wide/shared and GDN entries.
+[[nodiscard]] KnownWindowResult execute_known_prefix_window_eager(
+    const CompiledKnownPrefixWindow& window, const CompiledSerialExecution& serial,
+    const ExecutionRuntimeResources& serial_resources,
+    const ExecutionMemoryBinding& window_scratch, SerialSessionContext& session,
+    std::span<const std::uint32_t> tokens,
+    std::span<const CompiledLaunchPlan* const> row_launch,
+    std::span<const KnownWindowR2Entry> r2_entries,
+    std::span<const KnownWindowRowsEntry> rows_entries,
     const KnownWindowExecutionHooks& hooks);
 
 struct SpeculativeVerifyExecutionResult {

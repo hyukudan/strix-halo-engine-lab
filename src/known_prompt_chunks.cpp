@@ -16,6 +16,10 @@ KnownPromptChunkCursor::KnownPromptChunkCursor(KnownPromptChunkRequest request,
     const SerialGreedyTokenCursor validated({request.prompt_tokens,request.vocab_size,
         request.context_capacity,request.max_new_tokens,request.eos_token_id});
     (void)validated;
+    if(request.logical_rows != 2U && request.logical_rows != 4U && request.logical_rows != 8U)
+        throw std::invalid_argument("known prompt chunk rows must be 2, 4 or 8");
+    if(windows.logical_rows()!=request.logical_rows)
+        throw std::invalid_argument("known prompt chunk backend row width differs from the request");
     if(request.start_position>request.context_capacity ||
         request.prompt_tokens.size()>request.context_capacity-request.start_position)
         throw std::invalid_argument("known prompt chunks exceed the remaining context capacity");
@@ -32,17 +36,17 @@ bool KnownPromptChunkCursor::advance() {
     if(progress_.cancelled || progress_.prefill_complete) return false;
     const auto consumed=static_cast<std::size_t>(progress_.consumed_prompt_tokens);
     const auto remaining=request_.prompt_tokens.size()-consumed;
-    const bool pair=remaining>=2U;
+    const bool window=remaining>=request_.logical_rows;
     try {
-        auto values=pair ? windows_.execute_window({request_.prompt_tokens[consumed],request_.prompt_tokens[consumed+1U]},
+        auto values=window ? windows_.execute_rows(request_.prompt_tokens.subspan(consumed, request_.logical_rows),
                 progress_.next_position) : serial_.execute(request_.prompt_tokens[consumed],progress_.next_position);
         validate_serial_decode_engine_logits(values,request_.vocab_size);
         std::copy(values.begin(),values.end(),logits_.begin());
         has_logits_=true;
-        const auto rows=pair?2U:1U;
+        const auto rows=window?request_.logical_rows:1U;
         progress_.consumed_prompt_tokens+=rows;
         progress_.next_position+=rows;
-        if(pair) ++progress_.windows_executed;
+        if(window) ++progress_.windows_executed;
         else ++progress_.serial_tail_steps;
         progress_.prefill_complete=progress_.consumed_prompt_tokens==request_.prompt_tokens.size();
         if(progress_.prefill_complete) selection_=select_greedy_token(logits_,request_.vocab_size);

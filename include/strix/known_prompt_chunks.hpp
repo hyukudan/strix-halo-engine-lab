@@ -18,6 +18,7 @@ struct KnownPromptChunkRequest {
     std::uint64_t context_capacity = 0;
     std::uint64_t max_new_tokens = 0;
     std::uint32_t eos_token_id = 0;
+    std::uint32_t logical_rows = 2;
 };
 struct KnownPromptChunkProgress {
     std::uint64_t next_position = 0;
@@ -47,10 +48,11 @@ struct KnownPromptChunkFrontier {
     bool selection_emitted = false;
 };
 
-// Incremental known-input prefill, using only the existing canonical R2 owner
-// and a final odd R1 row. An advance is exactly one complete chunk; yielding
+// Incremental known-input prefill with complete configured 2/4/8-row windows
+// and unpadded serial R1 suffix rows. An advance is one complete chunk; yielding
 // between calls pauses without recomputing a prompt or discarding its logits.
-// No R4/R8 matrix execution, new arithmetic or kernel IDs are implied.
+// Native shared/mixed-GDN rows4/8 and all-Q8 GDN pair tiling are backend-specific; the cursor
+// does not infer a projection amortization from the logical window width.
 //
 // Backends are borrowed for the entire cursor lifetime. The caller retains all
 // backend/session/resource owners and serializes access. Their methods must
@@ -64,7 +66,7 @@ public:
         KnownPromptWindowBackend& windows, SerialGreedyStepBackend& serial);
     KnownPromptChunkCursor(const KnownPromptChunkCursor&) = delete;
     KnownPromptChunkCursor& operator=(const KnownPromptChunkCursor&) = delete;
-    // True iff one canonical pair/tail completed. False after prefill/cancel.
+    // True iff one complete configured window or serial suffix row completed. False after prefill/cancel.
     [[nodiscard]] bool advance();
     void cancel() noexcept;
     // Explicit one-shot generation after complete prefill. Delegates the

@@ -231,6 +231,7 @@ struct WindowTrace {
     std::uint32_t admissions = 0;
     bool fail_kernel = false;
     bool fail_qsa = false;
+    std::uint64_t fail_position = std::numeric_limits<std::uint64_t>::max();
     strix::SessionStateMemoryBinding* rebind_after_qsa = nullptr;
     std::uint32_t rebindings = 0;
     std::vector<std::uint64_t> qsa_positions;
@@ -285,7 +286,8 @@ void recording_window_kernel(const strix::ExecutionDispatchContext& context, voi
             ++trace.rebindings;
         }
     }
-    if (trace.fail_kernel && context.position == 1 && context.op == strix::SerialOp::gated_delta_net)
+    if (((trace.fail_kernel && context.position == 1) || context.position==trace.fail_position) &&
+        context.op == strix::SerialOp::gated_delta_net)
         throw std::runtime_error("injected row1 kernel failure");
     if (trace.fail_qsa && context.position == 1 && context.op == strix::SerialOp::indexed_attention)
         throw std::runtime_error("injected row1 QSA failure");
@@ -326,6 +328,18 @@ void recording_r2_launch(std::span<const strix::ExecutionDispatchContext, 2> row
     recording_window_kernel(rows[1], opaque);
 }
 
+void recording_rows_preflight(std::span<const strix::ExecutionDispatchContext> rows,void* opaque) {
+    if(rows.size()!=4U && rows.size()!=8U) throw std::invalid_argument("mock wide rows require4/8");
+    for(std::size_t r=0;r<rows.size();r+=2U)
+        recording_r2_preflight(std::span<const strix::ExecutionDispatchContext,2>(rows.data()+r,2U),opaque);
+    for(std::size_t r=1;r<rows.size();++r)
+        if(rows[r].position!=rows[0].position+r || rows[r].execution_identity!=rows[0].execution_identity)
+            throw std::invalid_argument("mock wide rows are not one adjacent window");
+}
+void recording_rows_launch(std::span<const strix::ExecutionDispatchContext> rows,void* opaque) {
+    for(const auto& row:rows) recording_window_kernel(row,opaque);
+}
+
 struct KnownRuntimeFixture {
     KnownFixture source;
     strix::CompiledKnownPrefixWindow window;
@@ -339,15 +353,16 @@ struct KnownRuntimeFixture {
     WindowTrace trace;
     strix::ExecutionLauncherRegistry registry;
     strix::CompiledLaunchPlan serial_launch;
-    std::array<strix::CompiledLaunchPlan, 2> row_launch;
+    std::vector<strix::CompiledLaunchPlan> row_launch;
     std::array<std::uint64_t, 1> allowed_readers{recording_qsa_identity};
-    std::array<std::uint32_t, 2> tokens{7, 11};
+    std::vector<std::uint32_t> tokens{7,11};
     std::uint32_t quiesces = 0;
 
-    explicit KnownRuntimeFixture(const strix::ModelContract& model, bool promote = false, bool mixed = false)
+    explicit KnownRuntimeFixture(const strix::ModelContract& model, bool promote = false, bool mixed = false,
+        std::uint32_t rows = 2)
         : source(make_known_fixture(model, mixed ? 0U : 8U)),
           window(strix::compile_known_prefix_window(model, source.serial, source.manifest,
-              source.access, {promote, promote, mixed})),
+              source.access, {promote, promote, mixed, rows})),
           serial_pool(static_cast<std::size_t>((source.serial.arena.total_bytes + 7U) / 8U)),
           window_pool(static_cast<std::size_t>((window.arena.physical.total_bytes + 7U) / 8U)),
           state_words(7U * 48U, 0) {
@@ -380,7 +395,10 @@ struct KnownRuntimeFixture {
                 &recording_window_kernel, &trace, &recording_window_preflight});
         }
         serial_launch = strix::compile_launch_plan(source.serial, registry);
-        for (std::size_t r = 0; r < 2; ++r)
+        row_launch.resize(rows);
+        tokens.resize(rows);
+        for(std::uint32_t r=2;r<rows;++r) tokens[r]=13U+r;
+        for (std::size_t r = 0; r < rows; ++r)
             row_launch[r] = strix::compile_launch_plan(window.row_plan[r], registry);
         reset();
     }
@@ -408,8 +426,10 @@ struct KnownRuntimeFixture {
     }
     strix::KnownWindowResult run_entries(strix::KnownWindowExecutionHooks callbacks,
         std::span<const strix::KnownWindowR2Entry> entries) {
+        std::vector<const strix::CompiledLaunchPlan*> plans;
+        for(const auto& plan:row_launch) plans.push_back(&plan);
         return strix::execute_known_prefix_window_eager(window, source.serial, resources,
-            window_memory, session, tokens, {&row_launch[0], &row_launch[1]}, entries, callbacks);
+            window_memory, session, tokens, plans, entries, {}, callbacks);
     }
     std::uint64_t serial_token(std::uint32_t token) {
         strix::DirectLaunchDispatcher dispatcher(serial_launch);
@@ -649,6 +669,101 @@ void known_window_runtime_tests(const strix::ModelContract& model) {
     }
 }
 
+// Full causal core coverage with honest host-recording launchers. Native
+// projection math/owner integration is separately covered by the opt-in driver.
+void known_window_wide_runtime_tests(const strix::ModelContract& model) {
+    using V=strix::KnownWindowR2Variant;
+    for(const std::uint32_t rows:{4U,8U}) for(const bool promote:{false,true}) for(const bool mixed:{false,true}) {
+        KnownRuntimeFixture baseline(model,false,mixed,rows);
+        std::vector<std::uint64_t> expected;
+        for(const auto token:baseline.tokens) expected.push_back(baseline.serial_token(token));
+        const auto expected_words=baseline.state_words;
+        const auto expected_generations=baseline.session.state.generations;
+        const auto expected_ple=baseline.trace.ple_previous;
+        const auto continuation=baseline.serial_token(29);
+        const auto continuation_state=baseline.state_words;
+        KnownRuntimeFixture candidate(model,promote,mixed,rows);
+        const std::array<strix::KnownWindowR2Entry,2> pairs{{
+            {V::gdn_q8_virtual256_r2_v1,&candidate.trace,&recording_r2_preflight,&recording_r2_launch},
+            {V::gdn_q8_rows2_f32_gates_r1_v1,&candidate.trace,&recording_r2_preflight,&recording_r2_launch}}};
+        const std::array<strix::KnownWindowRowsEntry,2> wide{{
+            {rows==4U?V::shared_q8_virtual256_r4_v1:V::shared_q8_virtual256_r8_v1,
+                &candidate.trace,&recording_rows_preflight,&recording_rows_launch},
+            {rows==4U?V::gdn_q8_rows4_f32_gates_r1_v1:V::gdn_q8_rows8_f32_gates_r1_v1,
+                &candidate.trace,&recording_rows_preflight,&recording_rows_launch}}};
+        std::vector<const strix::CompiledLaunchPlan*> plans;
+        for(const auto& plan:candidate.row_launch) plans.push_back(&plan);
+        const auto result=strix::execute_known_prefix_window_eager(candidate.window,candidate.source.serial,
+            candidate.resources,candidate.window_memory,candidate.session,candidate.tokens,plans,pairs,wide,candidate.hooks());
+        std::set<std::uintptr_t> output_addresses;
+        expect(result.logits.size()==rows,"wide core returns every full-head row");
+        for(std::uint32_t row=0;row<rows;++row) {
+            expect(read_word(result.logits[row].address)==expected[row],"wide core retains every serial row output");
+            output_addresses.insert(result.logits[row].address);
+        }
+        expect(output_addresses.size()==rows && candidate.state_words==expected_words &&
+            candidate.session.state.generations==expected_generations && candidate.trace.ple_previous==expected_ple,
+            "wide row arenas, seven recurrences, six generations and causal PLE match serial");
+        expect(candidate.session.next_position==rows && candidate.session.committed_tokens==rows &&
+            read_word(candidate.position_address())==rows-1U && candidate.quiesces==0 &&
+            candidate.session.arithmetic_lineage.intervals.size()==1U,
+            "wide core commits the whole known frontier exactly once after completion");
+        expect(result.shared_rows_dispatches==(promote?48U:0U) &&
+            result.gdn_rows_dispatches==(promote&&mixed?36U:0U) &&
+            result.r2_dispatches==(promote&&!mixed?36U*(rows/2U):0U),
+            "actual wide shared/GDN and contiguous R2 tile dispatches remain distinct");
+        expect(candidate.serial_token(29)==continuation && candidate.state_words==continuation_state,
+            "serial continuation after wide commit preserves all recurrent state");
+    }
+    for(const std::uint32_t rows:{4U,8U}) {
+        for(const unsigned fault:{0U,1U,2U,3U,4U}) {
+            KnownRuntimeFixture candidate(model,false,false,rows);
+            auto hooks=candidate.hooks();
+            if(fault==0U) candidate.window.arena.row_view.back().allocations[0].offset=candidate.window.arena.row_view[0].allocations[0].offset;
+            if(fault==1U) candidate.tokens.back()=static_cast<std::uint32_t>(model.vocab_size);
+            if(fault==2U) candidate.row_launch.back().steps.back().preflight=&throwing_window_preflight;
+            if(fault==3U) candidate.session.next_position=64U-rows+1U;
+            if(fault==4U) --candidate.window.logical_rows;
+            const auto original=candidate.state_words;
+            bool rejected=false;
+            try {(void)candidate.run(hooks);} catch(const std::exception&) {rejected=true;}
+            expect(rejected && candidate.trace.calls==0U && candidate.state_words==original &&
+                candidate.session.health==strix::SerialSessionHealth::ready && candidate.quiesces==0U,
+                "late wide row/token/arena/geometry/capacity fault rejects before state or dispatch");
+        }
+        for(const bool completion_failure:{false,true}) {
+            KnownRuntimeFixture failing(model,false,false,rows);
+            auto hooks=failing.hooks();
+            if(completion_failure) hooks.complete=[] {throw std::runtime_error("wide completion failure");};
+            else failing.trace.fail_position=rows-1U;
+            bool threw=false;try {(void)failing.run(hooks);} catch(const std::runtime_error&) {threw=true;}
+            expect(threw && failing.trace.calls>0U && failing.quiesces==1U &&
+                failing.session.health==strix::SerialSessionHealth::poisoned && failing.session.arithmetic_lineage.tainted &&
+                failing.session.next_position==0U && failing.session.committed_tokens==0U,
+                "late wide dispatch/completion failure drains once and poisons without publishing a partial commit");
+        }
+        KnownRuntimeFixture candidate(model,true,true,rows);
+        std::vector<const strix::CompiledLaunchPlan*> plans;
+        for(const auto& plan:candidate.row_launch) plans.push_back(&plan);
+        bool rejected=false;
+        try {(void)strix::execute_known_prefix_window_eager(candidate.window,candidate.source.serial,candidate.resources,
+            candidate.window_memory,candidate.session,candidate.tokens,plans,{}, {},candidate.hooks());}
+        catch(const std::invalid_argument&) {rejected=true;}
+        expect(rejected && !candidate.trace.calls && !candidate.quiesces,
+            "missing wide typed entry never falls through to a pair or an arbitrary launcher");
+        const auto shared=rows==4U?V::shared_q8_virtual256_r4_v1:V::shared_q8_virtual256_r8_v1;
+        const std::array<strix::KnownWindowRowsEntry,2> duplicated{{
+            {shared,&candidate.trace,&recording_rows_preflight,&recording_rows_launch},
+            {shared,&candidate.trace,&recording_rows_preflight,&recording_rows_launch}}};
+        rejected=false;
+        try {(void)strix::execute_known_prefix_window_eager(candidate.window,candidate.source.serial,candidate.resources,
+            candidate.window_memory,candidate.session,candidate.tokens,plans,{},duplicated,candidate.hooks());}
+        catch(const std::invalid_argument&) {rejected=true;}
+        expect(rejected && !candidate.trace.calls && !candidate.quiesces,
+            "ambiguous wide typed entries reject before the first dispatch");
+    }
+}
+
 void known_window_tests(const strix::ModelContract& model) {
     const auto fixture = make_known_fixture(model);
     const auto off = strix::compile_known_prefix_window(model, fixture.serial, fixture.manifest, fixture.access);
@@ -741,6 +856,59 @@ void known_window_tests(const strix::ModelContract& model) {
 
 // Format/dispatch source witnesses only. Actual historical golden IDs must be
 // captured from the frozen pre-change build during the final validation phase.
+void known_window_wide_compiler_tests(const strix::ModelContract& model) {
+    using V=strix::KnownWindowR2Variant;
+    const auto source=make_known_fixture(model,0U);
+    const auto base=strix::compile_known_prefix_window(model,source.serial,source.manifest,source.access,{true,true,true});
+    const auto explicit_two=strix::compile_known_prefix_window(model,source.serial,source.manifest,source.access,{true,true,true,2});
+    expect(base.window_execution_identity==explicit_two.window_execution_identity &&
+        base.window_kernel_plan_identity==explicit_two.window_kernel_plan_identity,
+        "default R2 uses the unchanged identity domain and physical geometry");
+    std::set<std::uint64_t> identities{base.window_execution_identity};
+    for(const std::uint32_t rows:{4U,8U}) {
+        const auto wide=strix::compile_known_prefix_window(model,source.serial,source.manifest,source.access,{true,true,true,rows});
+        strix::validate_known_prefix_window_formats(wide,source.serial,source.manifest,source.access);
+        expect(wide.logical_rows==rows && wide.row_plan.size()==rows && !wide.r2_steps &&
+            wide.shared_rows_steps==48U && wide.gdn_rows_steps==36U &&
+            wide.logical_projection_weight_bytes_avoided==2456616960ULL*(rows-1U) &&
+            wide.projection_launches_saved==252U*(rows-1U),
+            "wide compiler counts actual wide projections and logical reuse, not fictitious R2 tiles");
+        expect(identities.insert(wide.window_execution_identity).second,
+            "R2/R4/R8 windows retain distinct complete execution identities");
+        for(const auto variant:wide.r2_variant)
+            expect(variant==V::none || variant==(rows==4U?V::shared_q8_virtual256_r4_v1:V::shared_q8_virtual256_r8_v1) ||
+                variant==(rows==4U?V::gdn_q8_rows4_f32_gates_r1_v1:V::gdn_q8_rows8_f32_gates_r1_v1),
+                "mixed wide table never silently aliases a two-row numerical variant");
+        for(std::uint32_t row=0;row<rows;++row) {
+            expect(wide.row_plan[row].kernel_plan_identity==source.serial.kernel_plan_identity &&
+                wide.row_plan[row].logical_rows==1U,"every wide row remains an incumbent R1 plan");
+            for(std::size_t i=0;i<wide.arena.physical.allocations.size();++i) {
+                const auto& physical=wide.arena.physical.allocations[i];
+                const auto* original=strix::find_arena_allocation(source.serial.arena,physical.use);
+                expect(original && wide.arena.row_view[row].allocations[i].bytes==original->bytes &&
+                    wide.arena.row_view[row].allocations[i].offset==physical.offset+row*wide.arena.row_stride[i],
+                    "wide row payloads are bounded stripes of their actual serial allocations");
+            }
+        }
+        for(const unsigned fault:{0U,1U,2U}) {
+            auto changed=wide;
+            if(fault==0U) ++changed.gdn_rows_steps;
+            if(fault==1U) changed.r2_variant[static_cast<std::size_t>(std::find(changed.mode.begin(),changed.mode.end(),
+                strix::KnownWindowStepMode::gdn_rows)-changed.mode.begin())]=V::gdn_q8_rows2_f32_gates_r1_v1;
+            if(fault==2U) changed.row_plan.pop_back();
+            bool rejected=false;try {strix::validate_compiled_known_prefix_window(changed,source.serial);}
+            catch(const std::invalid_argument&) {rejected=true;}
+            expect(rejected,"wide table rejects forged counts, wrong-width variants and missing row plans");
+        }
+    }
+    for(const std::uint32_t rows:{0U,1U,3U,16U}) {
+        bool rejected=false;
+        try {(void)strix::compile_known_prefix_window(model,source.serial,source.manifest,source.access,{true,true,true,rows});}
+        catch(const std::invalid_argument&) {rejected=true;}
+        expect(rejected,"known windows admit only the closed R2/R4/R8 row table");
+    }
+}
+
 void known_window_mixed_format_tests(const strix::ModelContract& model) {
     using Variant = strix::KnownWindowR2Variant;
     const auto q8 = make_known_fixture(model);
@@ -1097,7 +1265,9 @@ int main() {
 
     known_window_tests(model);
     known_window_runtime_tests(model);
+    known_window_wide_runtime_tests(model);
     known_window_mixed_format_tests(model);
+    known_window_wide_compiler_tests(model);
 
     if (failures == 0) {
         std::cout << "compiled speculative verify tests passed\n";
