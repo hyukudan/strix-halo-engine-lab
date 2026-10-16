@@ -43,6 +43,8 @@ struct ExecutionBindingRequest {
     HipGdnRecurrentLayout gdn_recurrent_layout = HipGdnRecurrentLayout::baseline;
     bool qsa_hierarchical_selection = false;
     std::uint32_t qsa_gqa_heads_per_block = 1;
+    // Borrowed only during compilation; no tuning search runs in the token loop.
+    const kernels::OfflineTuningPlan* offline_tuning = nullptr;
 };
 
 struct ExecutionKernelBinding {
@@ -51,6 +53,7 @@ struct ExecutionKernelBinding {
     std::optional<kernels::OperatorFamily> family;
     std::optional<std::string> kernel_id;
     bool host_or_runtime_step = false;
+    std::optional<kernels::TuningSelectionReason> tuning_selection_reason;
 };
 
 struct ExecutionBindingPlan {

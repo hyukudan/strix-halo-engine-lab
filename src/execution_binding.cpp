@@ -149,6 +149,8 @@ ExecutionBindingPlan bind_serial_execution_plan(
     }
     shared_expert_prefetch::validate_layers(model.hidden_layers,request.prefetch_q8_shared_expert,request.shared_expert_prefetch_layers);
     ExecutionBindingPlan output;
+    if (request.offline_tuning && request.offline_tuning->step_keys.size() != plan.steps.size())
+        throw std::invalid_argument("offline tuning requires one provenance key per compiled step");
     output.bindings.reserve(plan.steps.size());
 
     for (const auto& step : plan.steps) {
@@ -200,6 +202,13 @@ ExecutionBindingPlan bind_serial_execution_plan(
             const bool wanted=shared_expert_prefetch::selected(request.prefetch_q8_shared_expert,request.shared_expert_prefetch_layers,step.layer);
             const bool actual=selected->id.ends_with(shared_expert_prefetch::kernel_suffix);
             if(wanted!=actual){std::string id=selected->id;if(actual)id.resize(id.size()-shared_expert_prefetch::kernel_suffix.size());else id+=shared_expert_prefetch::kernel_suffix;selected=registry.find(id);if(selected && !kernels::matches(*selected,query))selected=nullptr;}
+        }
+        if (request.offline_tuning && selected) {
+            const auto tuned = registry.select_tuned(query,
+                request.offline_tuning->step_keys[step.id], request.offline_tuning->records);
+            binding.tuning_selection_reason = tuned.reason;
+            if (tuned.reason == kernels::TuningSelectionReason::qualified_record)
+                selected = tuned.variant;
         }
         if (selected == nullptr) {
             ++output.missing_steps;

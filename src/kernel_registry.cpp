@@ -161,6 +161,60 @@ const KernelVariant* KernelRegistry::select(const KernelQuery& query) const noex
     return best;
 }
 
+TunedKernelSelection KernelRegistry::select_tuned(const KernelQuery& query,
+    const OfflineTuningKey& key, std::span<const OfflineTuningRecord> records) const noexcept {
+    const auto fallback = select(query);
+    const auto digest = [](const std::string& value) {
+        return value.size() == 64 && std::any_of(value.begin(), value.end(), [](char c) { return c != '0'; }) &&
+            std::all_of(value.begin(), value.end(), [](char c) {
+                return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+            });
+    };
+    if (key.gfx_target.empty() || key.device_sku.empty() || !key.compute_units ||
+        key.compiler_identity.empty() || key.hip_identity.empty() || !digest(key.binary_sha256) ||
+        !digest(key.model_content_sha256) || !digest(key.compiler_flags_sha256) ||
+        key.input_precision.empty() || key.accumulator_precision.empty() || key.output_precision.empty() ||
+        key.weight_format.empty() || key.input_layout.empty() || key.output_layout.empty() || key.state_layout.empty() ||
+        key.context_bucket.empty() || key.memory_regime.empty() || !key.m || !key.n || !key.k ||
+        !key.numerical_contract_identity || key.family != query.family || key.phase != query.phase ||
+        key.shape != query.shape || (query.required_wave && key.wave != *query.required_wave))
+        return {fallback, TuningSelectionReason::invalid_key};
+    // Repeated records for one candidate require offline reconciliation rather
+    // than choosing whichever duplicate happens to report the fastest sample.
+    for (std::size_t i = 0; i < records.size(); ++i) {
+        if (records[i].key != key) continue;
+        for (std::size_t j = 0; j < i; ++j)
+            if (records[j].key == key && records[j].kernel_id == records[i].kernel_id)
+                return {fallback, TuningSelectionReason::ambiguous_records};
+    }
+    const KernelVariant* best = nullptr;
+    double seconds = 0;
+    bool baseline_measured = false;
+    for (const auto& record : records) {
+        if (record.key != key || !record.complete_workload || !record.owners_and_resources_qualified ||
+            record.samples < 3 || !digest(record.qualification_receipt_sha256) ||
+            !std::isfinite(record.median_complete_seconds) || record.median_complete_seconds <= 0) continue;
+        const auto* candidate = find(record.kernel_id);
+        if (!candidate || !matches(*candidate, query) ||
+            (candidate->qualification != QualificationStatus::target_qualified &&
+             candidate->qualification != QualificationStatus::production) ||
+            candidate->wave != key.wave || candidate->compiler_identity != key.compiler_identity ||
+            candidate->numerical_contract_identity != key.numerical_contract_identity ||
+            candidate->input_layout != key.input_layout || candidate->output_layout != key.output_layout ||
+            candidate->numerics.input_precision != key.input_precision ||
+            candidate->numerics.accumulator_precision != key.accumulator_precision ||
+            candidate->numerics.output_precision != key.output_precision) continue;
+        if (candidate == fallback) baseline_measured = true;
+        if (!best || record.median_complete_seconds < seconds ||
+            (record.median_complete_seconds == seconds && candidate->id < best->id)) {
+            best = candidate;
+            seconds = record.median_complete_seconds;
+        }
+    }
+    return best && baseline_measured ? TunedKernelSelection{best, TuningSelectionReason::qualified_record} :
+        TunedKernelSelection{fallback, TuningSelectionReason::no_qualified_record};
+}
+
 std::uint64_t plan_identity(
     std::span<const KernelVariant* const> selected) noexcept {
     constexpr std::uint64_t offset = 14695981039346656037ULL;
