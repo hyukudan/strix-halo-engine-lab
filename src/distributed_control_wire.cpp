@@ -305,6 +305,28 @@ void validate_direct_gpu_control(const DistributedDirectGpuControlFrame& value) 
     }
 }
 
+void token_state_write(Writer& w,const PersistentStateGenerations& state) {
+    w.u32(static_cast<std::uint32_t>(state.valid));for(const auto value:state.generations) w.u64(value);
+}
+PersistentStateGenerations token_state_read(Reader& r) {
+    PersistentStateGenerations state;const auto flags=r.u32();
+    if(flags & ~63U) throw std::invalid_argument("distributed token state has unknown flags");
+    state.valid=static_cast<PersistentState>(flags);for(auto& value:state.generations) value=r.u64();return state;
+}
+void token_shape(const DistributedTokenMessage& m) {
+    const auto kind=static_cast<std::uint32_t>(m.kind);
+    if(kind<1U || kind>6U || m.sender_node>1U || !m.sequence || m.sequence==std::numeric_limits<std::uint64_t>::max() || m.binding.contract_version!=1U ||
+        !m.binding.model_content_identity.valid() || !m.binding.request_id || !m.binding.connection_epoch || !m.binding.generation || !m.binding.boundary_dtype_id ||
+        !m.binding_identity || distributed_token_binding_identity(m.binding)!=m.binding_identity)
+        throw std::invalid_argument("distributed token wire message has invalid kind, identity or sequence");
+    const auto flags_valid=[](const PersistentStateGenerations& state){return !(static_cast<std::uint32_t>(state.valid)&~63U);};
+    if(!flags_valid(m.binding.initial_global_state) || !flags_valid(m.receipt.local_state))
+        throw std::invalid_argument("distributed token wire state has unknown flags");
+    for(std::uint32_t node=0;node<2U;++node)
+        if(m.binding.peers[node].node!=node || !flags_valid(m.binding.peers[node].initial_state))
+            throw std::invalid_argument("distributed token wire peer table is invalid");
+}
+
 }  // namespace
 
 DistributedControlFrameKind
@@ -350,6 +372,7 @@ inspect_distributed_control_frame_kind(
     case DistributedControlFrameKind::
             boundary_transfer:
     case DistributedControlFrameKind::direct_gpu_stream:
+    case DistributedControlFrameKind::token_transaction:
         return static_cast<
             DistributedControlFrameKind>(
                 raw_kind);
@@ -634,5 +657,36 @@ FramedDistributedControlWire::await_boundary_transfer(
         frame_bytes,
         limits_);
 }
+
+std::vector<std::byte> encode_distributed_token_message(const DistributedTokenMessage& m,DistributedControlWireLimits limits) {
+    token_shape(m);Writer w;const auto& b=m.binding;
+    w.u32(b.contract_version);w.u64(b.serial_execution_identity);w.u64(b.kernel_plan_identity);w.u64(b.placement_plan_identity);
+    for(const auto byte:b.model_content_identity.bytes) w.u16(byte);
+    w.u64(b.request_id);w.u64(b.connection_epoch);w.u64(b.generation);w.u64(b.position);
+    w.u64(b.committed_tokens);w.u64(b.previous_history_identity);w.u32(b.input_token);w.u32(b.boundary_dtype_id);token_state_write(w,b.initial_global_state);
+    for(const auto& p:b.peers) {
+        w.u32(p.node);w.u32(p.first_step);w.u32(p.last_step);w.u64(p.runtime_compatibility_identity);
+        w.u64(p.state_layout_identity);w.u64(p.context_capacity);token_state_write(w,p.initial_state);
+    }
+    w.u64(m.binding_identity);w.u64(m.sequence);w.u64(m.decision_identity);w.u32(m.sender_node);w.u32(static_cast<std::uint32_t>(m.kind));
+    w.u64(m.receipt.snapshot_plan_identity);w.u64(m.receipt.snapshot_generation);token_state_write(w,m.receipt.local_state);w.u32(m.receipt.completed_steps);
+    return frame(DistributedControlFrameKind::token_transaction,w.take(),limits);
+}
+DistributedTokenMessage decode_distributed_token_message(std::span<const std::byte> bytes,DistributedControlWireLimits limits) {
+    Reader r(payload_of(bytes,DistributedControlFrameKind::token_transaction,limits));DistributedTokenMessage m;auto& b=m.binding;
+    b.contract_version=r.u32();b.serial_execution_identity=r.u64();b.kernel_plan_identity=r.u64();b.placement_plan_identity=r.u64();
+    for(auto& byte:b.model_content_identity.bytes) {const auto value=r.u16();if(value>255U) throw std::invalid_argument("distributed model digest byte is noncanonical");byte=static_cast<std::uint8_t>(value);}
+    b.request_id=r.u64();b.connection_epoch=r.u64();b.generation=r.u64();b.position=r.u64();
+    b.committed_tokens=r.u64();b.previous_history_identity=r.u64();b.input_token=r.u32();b.boundary_dtype_id=r.u32();b.initial_global_state=token_state_read(r);
+    for(auto& p:b.peers) {
+        p.node=r.u32();p.first_step=r.u32();p.last_step=r.u32();p.runtime_compatibility_identity=r.u64();
+        p.state_layout_identity=r.u64();p.context_capacity=r.u64();p.initial_state=token_state_read(r);
+    }
+    m.binding_identity=r.u64();m.sequence=r.u64();m.decision_identity=r.u64();m.sender_node=r.u32();m.kind=static_cast<DistributedTokenMessageKind>(r.u32());
+    m.receipt.snapshot_plan_identity=r.u64();m.receipt.snapshot_generation=r.u64();m.receipt.local_state=token_state_read(r);m.receipt.completed_steps=r.u32();
+    require_consumed(r);token_shape(m);return m;
+}
+void FramedDistributedTokenWire::send(const DistributedTokenMessage& m) {stream_->send(encode_distributed_token_message(m,limits_));}
+DistributedTokenMessage FramedDistributedTokenWire::receive() {return decode_distributed_token_message(stream_->receive(),limits_);}
 
 }  // namespace strix

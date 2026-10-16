@@ -1,6 +1,7 @@
 #pragma once
 
 #include "strix/distributed_remote_control.hpp"
+#include "strix/distributed_token_transaction.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -14,6 +15,7 @@ enum class DistributedControlFrameKind : std::uint16_t {
     remote_step_ack = 2,
     boundary_transfer = 3,
     direct_gpu_stream = 4,
+    token_transaction = 5,
 };
 
 // Explicit dedicated-channel extension: v2 outer framing is unchanged; this
@@ -87,6 +89,23 @@ decode_distributed_boundary_transfer(
     const DistributedDirectGpuControlFrame&, DistributedControlWireLimits limits = {});
 [[nodiscard]] DistributedDirectGpuControlFrame decode_distributed_direct_gpu_control(
     std::span<const std::byte>, DistributedControlWireLimits limits = {});
+
+// Dedicated transaction channel or explicit caller demultiplexing. Existing
+// remote-step server handlers do not silently consume or acknowledge kind5.
+[[nodiscard]] std::vector<std::byte> encode_distributed_token_message(
+    const DistributedTokenMessage&,DistributedControlWireLimits limits = {});
+[[nodiscard]] DistributedTokenMessage decode_distributed_token_message(
+    std::span<const std::byte>,DistributedControlWireLimits limits = {});
+class FramedDistributedTokenWire final {
+public:
+    explicit FramedDistributedTokenWire(DistributedControlByteStream& stream,DistributedControlWireLimits limits = {})
+        :stream_(&stream),limits_(limits) {}
+    void send(const DistributedTokenMessage& message);
+    [[nodiscard]] DistributedTokenMessage receive();
+private:
+    DistributedControlByteStream* stream_;
+    DistributedControlWireLimits limits_;
+};
 
 class FramedDistributedControlWire final
     : public DistributedControlWireBackend {

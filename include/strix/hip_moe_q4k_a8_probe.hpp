@@ -9,6 +9,9 @@ inline constexpr unsigned invalid_route = 1U, nonfinite_activation = 2U, invalid
 // After an enqueue exception, every writable view is indeterminate even if status is0.
 // Read-only data stays immutable; mutable views/status have exclusive stream ownership.
 void enqueue_probe(const Request&, const Bindings&, hipStream_t stream = nullptr);
+// Exact incumbent route validation and quantizer only. Produces one A8 image;
+// projection output is admitted but untouched. No reset/allocation/sync.
+void enqueue_quantize_only(const Request&, const Bindings&, hipStream_t stream);
 // Standalone diagnostic only. Same validation, quantizer, status and output
 // contract; one CTA stages activations once for independent gate/up sums.
 // Finite scope only; nonfinite projection payload/sign is not qualified.

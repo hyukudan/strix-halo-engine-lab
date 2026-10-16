@@ -16,6 +16,12 @@ struct HipDistributedStageToken {
     std::uint64_t position = 0;
     std::uint32_t input_token = 0;
     PersistentStateGenerations initial_state;
+    // Explicit suffix-controller mode only: full begin preflight validates the
+    // host word extent but does not require its old value to be the new input
+    // position yet. The controller snapshots first and materializes position
+    // only after both peers prepared. Every actual position reader still
+    // checks the exact word. No additional state generation is published.
+    bool controller_materializes_position = false;
 };
 struct HipDistributedStageResult {
     HipDistributedStageToken token;

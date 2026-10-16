@@ -28,6 +28,7 @@ struct HipKnownPromptBackendStats {
     std::uint64_t completed_input_rows = 0;
     std::uint64_t shared_rows_dispatches = 0;
     std::uint64_t gdn_rows_dispatches = 0;
+    std::uint64_t routed_expert_union_dispatches = 0;
 };
 
 // Experimental eager prompt adapter, not speculative generation. Every input

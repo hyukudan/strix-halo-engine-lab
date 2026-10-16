@@ -3,13 +3,20 @@
 #include "strix/hip_launcher_catalog.hpp"
 #include "strix/hip_launch_context.hpp"
 #include "strix/speculative_verify_runtime.hpp"
+#include "strix/q51_known_rows.hpp"
 
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
 
 namespace strix {
+struct HipKnownPrefixUnionObservation {
+    std::uint64_t first_position = 0;
+    std::uint32_t layer = 0;
+    q51_known_rows::Summary group;
+};
 
 // Native eager owner for 2/4/8 KNOWN input tokens, not speculative generation.
 // The caller's actual_owner retains every borrowed model/state/arena/stream
@@ -33,7 +40,8 @@ public:
         HipLauncherCatalogConfig config,
         const ExecutionRuntimeResources& serial_resources,
         ExecutionMemoryBinding window_scratch, HipLaunchContext scope,
-        std::shared_ptr<const void> actual_owner);
+        std::shared_ptr<const void> actual_owner,
+        q51_known_rows::Workspace routed_union_workspace = {});
     ~HipKnownPrefixWindow();
     HipKnownPrefixWindow(const HipKnownPrefixWindow&) = delete;
     HipKnownPrefixWindow& operator=(const HipKnownPrefixWindow&) = delete;
@@ -45,6 +53,9 @@ public:
     [[nodiscard]] KnownWindowResult execute(SerialSessionContext& session,
         std::span<const std::uint32_t> tokens);
     [[nodiscard]] std::uint32_t logical_rows() const noexcept;
+    // Last eligible layer in the last SUCCESSFULLY completed window only.
+    // Not aggregate reuse, DRAM traffic, timing or model qualification.
+    [[nodiscard]] std::optional<HipKnownPrefixUnionObservation> latest_routed_union_observation() const noexcept;
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

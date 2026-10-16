@@ -199,6 +199,10 @@ struct HipDistributedStage::Impl {
             throw std::invalid_argument("HIP distributed stage token controller binding is invalid or stale");
         if(resources.ple_prefetch && resources.ple_prefetch->active)
             throw std::invalid_argument("HIP distributed stage cannot borrow an active PLE lookup");
+        if(value.controller_materializes_position && (first==0U ||
+            std::any_of(serial.execution.steps.begin()+first,serial.execution.steps.begin()+last+1U,
+                [](const auto& step){return step.op==SerialOp::position_prepare;})))
+            throw std::invalid_argument("HIP distributed controller position mode requires a suffix without position_prepare");
         auto generations=value.initial_state;
         const HipLaunchScope launch_scope(scope);
         bool local_position_prepared=false;
@@ -224,7 +228,7 @@ struct HipDistributedStage::Impl {
                 if(history.storage!=SessionStateStorage::host || !history.address || history.bytes<sizeof(std::uint64_t))
                     throw std::invalid_argument("HIP distributed stage requires a prepared host position word");
                 std::uint64_t word=0;std::memcpy(&word,reinterpret_cast<const void*>(history.address),sizeof(word));
-                if(word!=value.position) throw std::invalid_argument("HIP distributed stage controller did not materialize the peer position");
+                if(!value.controller_materializes_position && word!=value.position) throw std::invalid_argument("HIP distributed stage controller did not materialize the peer position");
             }
         }
         token=value;local=value.initial_state;cursor=first;active=true;
@@ -241,6 +245,13 @@ struct HipDistributedStage::Impl {
                 incoming.node!=placement.local_node || incoming.placement_ambiguous)
                 throw std::invalid_argument("HIP distributed stage callback is foreign, duplicated or out of order");
             const HipLaunchScope launch_scope(scope);const auto& c=contexts[cursor-first];
+            if(c.op!=SerialOp::position_prepare && has_state(c.reads_state,PersistentState::position_history)) {
+                const auto history=resolve_dispatch_state(c,SessionStateComponent::position_history);
+                if(history.storage!=SessionStateStorage::host || !history.address || history.bytes<sizeof(std::uint64_t))
+                    throw std::invalid_argument("HIP distributed stage requires a prepared host position word");
+                std::uint64_t word=0;std::memcpy(&word,reinterpret_cast<const void*>(history.address),sizeof(word));
+                if(word!=token.position) throw std::invalid_argument("HIP distributed stage controller did not materialize the peer position");
+            }
             if(c.op==SerialOp::ple && resources.ple_lookup && resources.ple_hash_contract && resources.ple_prefetch)
                 start_ple_lookup_prefetch(*resources.ple_hash_contract,c.step_id,token.input_token,token.position,
                     *resources.model_manifest,*resources.model_weights,*resources.tensor_access,

@@ -210,6 +210,20 @@ void enqueue_probe_shared_gate_up(const Request& request,const Bindings& b,hipSt
         routes,codes,deltas,sums,status,reinterpret_cast<float*>(b.output.address),request.shape.hidden,request.shape.rows);
     check(hipGetLastError(),"Q4K A8 shared gate/up projection enqueue");
 }
+void enqueue_quantize_only(const Request& request,const Bindings& b,hipStream_t stream) {
+    validate(request,b);
+    check(hipPeekAtLastError(),"Q4K A8 pre-enqueue stale error");
+    auto* status=reinterpret_cast<unsigned*>(b.status.address);
+    const auto* routes=reinterpret_cast<const unsigned*>(b.routes.address);
+    validate_routes<<<1,32,0,stream>>>(routes,request.shape.top_k,request.shape.experts,status);
+    check(hipGetLastError(),"Q4K A8 route enqueue");
+    const void* input=reinterpret_cast<const void*>(b.input.address);
+    auto* codes=reinterpret_cast<signed char*>(b.codes.address);auto* deltas=reinterpret_cast<float*>(b.deltas.address);
+    auto* sums=reinterpret_cast<int*>(b.sums.address);
+    if(request.input==InputKind::bf16)quantize<true><<<1,256,0,stream>>>(input,request.shape.hidden,codes,deltas,sums,status);
+    else quantize<false><<<1,256,0,stream>>>(input,request.shape.hidden,codes,deltas,sums,status);
+    check(hipGetLastError(),"Q4K A8 quantizer enqueue");
+}
 void enqueue_division_probe(const std::uint32_t* a,const std::uint32_t* b,std::uint32_t* output,unsigned count,hipStream_t stream) {
     if(!a || !b || !output || count==0) throw std::invalid_argument("invalid division receipt bindings");
     division_receipt<<<(count+255U)/256U,256,0,stream>>>(a,b,output,count);check(hipGetLastError(),"Q4K A8 division receipt enqueue");

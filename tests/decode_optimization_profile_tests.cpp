@@ -146,6 +146,13 @@ int main() {
     validate_resolved_qsa_hierarchical_selection(defaults);
     expect(!defaults.known_prefix_window, "known-prefix route stays opt-in");
     validate_resolved_known_prefix_window(defaults);
+    expect(defaults.offline_tuning_cache_path.empty(), "offline persisted tuning stays opt-in");
+    const auto persisted = parse({"decoder", "m", "1", "--offline-tuning-cache", "source-only-cache.bin"});
+    expect(persisted.offline_tuning_cache_path == "source-only-cache.bin" && !persisted.any_low_level_flag,
+        "persisted tuning does not silently alter base optimization profile");
+    rejects([] { (void)parse({"decoder", "m", "1", "--offline-tuning-cache"}); }, "offline tuning cache requires a file");
+    rejects([] { (void)parse({"decoder", "m", "1", "--offline-tuning-cache", "a", "--offline-tuning-cache", "b"}); },
+        "duplicate offline tuning cache option");
     expect(defaults.logprob_token_ids.empty(), "requested logprobs are opt-in");
     auto logprobs = parse({"decoder", "m", "1", "--generate", "3", "--logprob-token", "0", "--logprob-token", "15", "--logprob-token", "0"});
     expect(logprobs.logprob_token_ids == std::vector<std::uint32_t>({0,15,0}) && !logprobs.any_low_level_flag,
@@ -208,6 +215,27 @@ int main() {
     validate_resolved_known_prefix_window(paired_prompt);
     expect(parse({"decoder", "m", "1", "--known-prefix-window"}).known_prefix_window,
         "parser records opt-in before resolved profile admission");
+    expect(!defaults.known_prefix_expert_union, "known-prefix routed expert union stays opt-in");
+    expect(parse({"decoder", "m", "1", "--known-prefix-window", "--known-prefix-expert-union"}).known_prefix_expert_union &&
+        !parse({"decoder", "m", "1", "--known-prefix-window", "--known-prefix-expert-union"}).any_low_level_flag,
+        "union overlay preserves automatic profile selection");
+    rejects([] { (void)parse({"decoder", "m", "1", "--known-prefix-expert-union"}); },
+        "known-prefix expert union requires --known-prefix-window");
+    rejects([] { (void)parse({"decoder", "m", "1", "--known-prefix-window", "--known-prefix-expert-union", "--known-prefix-expert-union"}); },
+        "duplicate known-prefix expert union option");
+    { auto selected = paired_prompt; selected.known_prefix_expert_union = true;
+      selected.q4k_a8g32_gate_up = selected.grouped_exact_q51_down = selected.q51_slot_parallel_down = true;
+      validate_resolved_known_prefix_window(selected);
+      for (unsigned missing = 0; missing < 4U; ++missing) {
+          auto bad = selected;
+          if (missing == 0U) bad.q4k_a8g32_gate_up = false;
+          if (missing == 1U) bad.grouped_exact_q51_down = false;
+          if (missing == 2U) bad.q51_slot_parallel_down = false;
+          if (missing == 3U) bad.deferred_moe_status = false;
+          rejects([&] { validate_resolved_known_prefix_window(bad); },
+              "known-prefix expert union requires resolved A8/grouped Q5_1/slot-parallel/D1");
+      }
+    }
     expect(defaults.known_prefix_rows == 2 && !defaults.known_prefix_rows_explicit,
         "known-prefix logical rows default to two without changing automatic profile");
     for (const auto* text : {"2", "4", "8"}) {

@@ -91,6 +91,8 @@ DistributedControlServer::serve_one() {
             remote_step_ack:
         throw std::invalid_argument(
             "distributed control server cannot consume unsolicited ACK frame");
+    case DistributedControlFrameKind::token_transaction:
+        throw std::invalid_argument("token transactions require their dedicated control channel");
     case DistributedControlFrameKind::direct_gpu_stream:
         throw std::invalid_argument(
             "GPU transport control requires its dedicated experimental channel");

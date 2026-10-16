@@ -10,9 +10,11 @@
 #endif
 #ifdef STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME
 #include "strix/hip_moe_q4k_a8_probe.hpp"
+#include "strix/hip_moe_q4k_a8_known_rows.hpp"
 #include "strix/hip_q51_grouped_down_probe.hpp"
 #endif
 #include <array>
+#include <algorithm>
 #include <limits>
 #include <optional>
 
@@ -1978,3 +1980,435 @@ void enqueue(Shape shape, const Bindings& bindings, Mode mode, hipStream_t strea
 #endif
 
 }  // namespace strix
+
+namespace strix {
+namespace {
+#ifdef STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME
+struct KnownMoeRowsDevice {
+    const float* intermediates[8]{};
+    const std::uint32_t* routes[8]{};
+    const float* route_weights[8]{};
+    std::uint32_t* status[8]{};
+    float* rawdots[8]{};
+    float* accumulation[8]{};
+    std::uint16_t* output[8]{};
+};
+struct KnownMoeCsrDevice {
+    std::uint32_t* header; // union status, touched count, batch count
+    std::uint32_t* offsets;
+    std::uint32_t* touched;
+    std::uint32_t* rows;
+    std::uint32_t* slots;
+    std::uint32_t* batch_experts;
+    std::uint32_t* batch_begins;
+};
+
+// An invalid route/quantization in ANY row skips all projection producers.
+// These candidate-only guards prevent consumers from reading the unproduced
+// workspace without contaminating valid rows' local first-error provenance.
+__global__ void known_moe_rows_finite_kernel(const float* values,std::uint32_t count,
+    std::uint32_t* status,const std::uint32_t* global_status,bool bf16_commit) {
+    if(*global_status!=0U)return;
+    const auto index=blockIdx.x*blockDim.x+threadIdx.x;
+    __shared__ std::uint32_t initial_status;
+    if(threadIdx.x==0U)initial_status=atomicOr(status,0U);
+    __syncthreads();
+    if(initial_status!=0U)return;
+    if(index<count&&(__float_as_uint(values[index])&0x7fffffffU)>=
+        (bf16_commit?0x7f7f8000U:0x7f800000U))atomicOr(status,8U);
+}
+__global__ void known_moe_rows_activation_kernel(float* slots,std::uint32_t intermediate_size,
+    const std::uint32_t* status,const std::uint32_t* global_status) {
+    if(*global_status!=0U||*status!=0U)return;
+    const auto index=static_cast<std::uint32_t>(blockIdx.x)*blockDim.x+threadIdx.x;
+    if(index>=intermediate_size)return;
+    auto* workspace=slots+2ULL*blockIdx.y*intermediate_size;
+    const float gate=workspace[index];
+    const float up=workspace[intermediate_size+index];
+    workspace[index]=(gate/(1.0F+expf(-gate)))*up;
+}
+
+// Bounded device transcription of build_moe_route_plan's CSR ordering.
+// There is no dense expert-by-token payload and no host route readback.
+// One lane owns all metadata, so repeated expert rows are stable row/slot order.
+__global__ void known_moe_csr_kernel(KnownMoeRowsDevice view, KnownMoeCsrDevice csr,
+    std::uint32_t row_count, std::uint32_t experts, std::uint32_t top_k) {
+    if (threadIdx.x != 0U) return;
+    for (unsigned word = 0; word < sizeof(q51_known_rows::Summary)/sizeof(std::uint32_t); ++word) csr.header[word] = 0U;
+    csr.header[3] = row_count * top_k; csr.header[6] = row_count; csr.header[7] = 1U;
+    for (std::uint32_t e = 0; e <= experts; ++e) csr.offsets[e] = 0U;
+    for (std::uint32_t r = 0; r < row_count; ++r) {
+        for (std::uint32_t s = 0; s < top_k; ++s) {
+            const auto e = view.routes[r][s];
+            const bool bad = e >= experts || !isfinite(view.route_weights[r][s]);
+            if (bad) atomicOr(view.status[r], 1U);
+            else ++csr.offsets[e + 1U];
+        }
+        csr.header[0] |= *view.status[r];
+    }
+    if (csr.header[0]) return;
+    for (std::uint32_t e = 0; e < experts; ++e) {
+        if (csr.offsets[e + 1U]) {
+            csr.touched[csr.header[1]++] = e;
+            if (csr.offsets[e + 1U] > csr.header[5]) csr.header[5] = csr.offsets[e + 1U];
+        }
+        csr.offsets[e + 1U] += csr.offsets[e];
+    }
+    // Duplicate experts in a source row remain distinct slot assignments,
+    // matching the incumbent. Expert ranges are tiled into <=row_count
+    // assignments, so repeated rows cannot overflow the register tile.
+    for (std::uint32_t t = 0; t < csr.header[1]; ++t) {
+        const auto e = csr.touched[t]; auto cursor = csr.offsets[e];
+        std::uint32_t unique_rows = 0U;
+        for (std::uint32_t r = 0; r < row_count; ++r) {
+            bool found = false;
+            for (std::uint32_t s = 0; s < top_k; ++s)
+                if (view.routes[r][s] == e) { csr.rows[cursor] = r; csr.slots[cursor++] = s; found = true; }
+            unique_rows += found ? 1U : 0U;
+        }
+        ++csr.header[8U + unique_rows - 1U];
+        csr.header[4] += cursor - csr.offsets[e] - unique_rows;
+        for (auto begin = csr.offsets[e]; begin < cursor; begin += row_count) {
+            const auto batch = csr.header[2]++;
+            csr.batch_experts[batch] = e;
+            csr.batch_begins[batch] = begin;
+            const auto batch_size = cursor - begin < row_count ? cursor - begin : row_count;
+            ++csr.header[16U + batch_size - 1U];
+        }
+    }
+    csr.batch_begins[csr.header[2]] = row_count * top_k;
+}
+
+template <unsigned Rows>
+__global__ void known_moe_q51_csr_down_kernel(KnownMoeRowsDevice view, KnownMoeCsrDevice csr,
+    const void* weights, std::uint32_t intermediate_size, std::uint32_t hidden_size) {
+    if (csr.header[0] || blockIdx.y >= csr.header[2]) return;
+    const auto lane = static_cast<std::uint32_t>(threadIdx.x) % 32U;
+    const auto wave = static_cast<std::uint32_t>(threadIdx.x) / 32U;
+    const auto out = static_cast<std::uint32_t>(blockIdx.x) * 8U + wave;
+    if (out >= hidden_size) return;
+    const auto expert = csr.batch_experts[blockIdx.y];
+    const auto begin = csr.batch_begins[blockIdx.y], end = csr.batch_begins[blockIdx.y + 1U];
+    const auto row = static_cast<std::uint64_t>(expert) * hidden_size + out;
+    float partial[Rows][8] = {};
+    for (std::uint32_t chunk = 0; chunk < intermediate_size; chunk += 256U) {
+#pragma unroll
+        for (unsigned j = 0; j < 8U; ++j) {
+            const auto feature = chunk + 8U * lane + j;
+            if (feature < intermediate_size) {
+                const float coefficient = load_weight<WeightKind::q5_1>(weights, intermediate_size, row, feature);
+#pragma unroll
+                for (unsigned a = 0; a < Rows; ++a) if (begin + a < end) {
+                    const auto r = csr.rows[begin + a], slot = csr.slots[begin + a];
+                    const auto input_base = static_cast<std::uint64_t>(slot) * 2U * intermediate_size;
+                    // Same x*coefficient expression, +0 seed and ascending
+                    // feature sequence as the incumbent slot-parallel kernel.
+                    partial[a][j] += view.intermediates[r][input_base + feature] * coefficient;
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (unsigned a = 0; a < Rows; ++a) if (begin + a < end) {
+        auto* sum = partial[a];
+#pragma unroll
+        for (unsigned distance = 16U; distance > 0U; distance >>= 1U) {
+#pragma unroll
+            for (unsigned j = 0; j < 8U; ++j) {
+                const auto neighbor = __shfl_down(sum[j], distance, 32);
+                if (lane < distance) sum[j] += neighbor;
+            }
+        }
+        if (lane == 0U) {
+#pragma unroll
+            for (unsigned j = 0; j < 4U; ++j) sum[j] += sum[j + 4U];
+#pragma unroll
+            for (unsigned j = 0; j < 2U; ++j) sum[j] += sum[j + 2U];
+            sum[0] += sum[1];
+            view.rawdots[csr.rows[begin + a]][static_cast<std::uint64_t>(csr.slots[begin + a]) * hidden_size + out] = sum[0];
+        }
+    }
+}
+
+__global__ void known_moe_rows_status_kernel(KnownMoeRowsDevice view, KnownMoeCsrDevice csr,
+    std::uint32_t row_count) {
+    if (threadIdx.x != 0U) return;
+    for (std::uint32_t r = 0; r < row_count; ++r) csr.header[0] |= *view.status[r];
+}
+__global__ void known_moe_rows_merge_kernel(KnownMoeRowsDevice view, KnownMoeCsrDevice csr,
+    std::uint32_t row, std::uint32_t hidden_size, std::uint32_t experts, std::uint32_t top_k) {
+    if (csr.header[0] || *view.status[row]) return;
+    const auto out = static_cast<std::uint32_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (out >= hidden_size) return;
+    float current = 0.0F;
+    for (std::uint32_t slot = 0; slot < top_k; ++slot) {
+        if (view.routes[row][slot] >= experts) return;
+        const float weight = view.route_weights[row][slot];
+        const float dot = view.rawdots[row][static_cast<std::uint64_t>(slot) * hidden_size + out];
+        asm volatile("v_fmac_f32 %0, %1, %2" : "+v"(current) : "s"(weight), "v"(dot));
+    }
+    view.accumulation[row][out] = current;
+}
+__global__ void known_moe_rows_commit_kernel(KnownMoeRowsDevice view, KnownMoeCsrDevice csr,
+    std::uint32_t row, std::uint32_t hidden_size) {
+    if (csr.header[0] || *view.status[row]) return;
+    const auto out = blockIdx.x * blockDim.x + threadIdx.x;
+    if (out < hidden_size) store_activation(view.output[row] + out, view.accumulation[row][out]);
+}
+
+struct KnownMoeRowsPrepared {
+    std::array<PreparedMoeExperts, 8> rows{};
+    std::array<moe_q4k_a8::Bindings, 8> quantized_bindings{};
+    q51_known_rows::Workspace workspace;
+    KnownMoeRowsDevice device;
+    KnownMoeCsrDevice csr{};
+};
+struct KnownMoeRange { std::uintptr_t address; std::uint64_t bytes; };
+void known_moe_range(KnownMoeRange r) {
+    if (!r.address || !r.bytes || r.bytes > UINTPTR_MAX - r.address)
+        throw std::invalid_argument("known-window routed rows owner range is invalid");
+}
+bool known_moe_overlap(KnownMoeRange a, KnownMoeRange b) {
+    return a.address < b.address + b.bytes && b.address < a.address + a.bytes;
+}
+hipStream_t known_moe_rows_stream() {
+    const auto* scope = current_hip_launch_context();
+    if (!scope || scope->graph_capture || !scope->stream || scope->stream == hipStreamLegacy ||
+        scope->stream == hipStreamPerThread || !scope->deferred_moe_status.arena_base)
+        throw std::invalid_argument("known-window routed rows require explicit eager D1 scope");
+    require_q51_slot_eager_stream(scope->stream);
+    return scope->stream;
+}
+KnownMoeRowsPrepared prepare_known_moe_rows(std::span<const ExecutionDispatchContext> rows,
+    const HipMoeExpertsLauncherConfig& config, const q51_known_rows::Workspace& extra) {
+    if (rows.size() != 2U && rows.size() != 4U && rows.size() != 8U)
+        throw std::invalid_argument("known-window routed rows require R2/R4/R8");
+    const auto layout = q51_known_rows::scratch_layout(static_cast<std::uint32_t>(rows.size()),
+        config.expert_count, config.top_k);
+    validate_config(config);
+    if (!config.q4k_a8g32_gate_up || !config.grouped_exact_q51_down || !config.q51_slot_parallel_down ||
+        !config.deferred_moe_status || config.activation != HipActivationStorage::bf16)
+        throw std::invalid_argument("known-window routed rows require BF16 A8 slot-parallel Q5_1 D1 configuration");
+    (void)known_moe_rows_stream();
+    const auto& first = rows.front();
+    if (!first.execution_identity || !first.layer || !first.kernel_id || !first.resources ||
+        !first.resources->scratch || !first.arena || !first.resources->model_manifest ||
+        !first.resources->model_weights || !first.resources->tensor_access)
+        throw std::invalid_argument("known-window routed rows require retained execution resources");
+    const auto& memory = *first.resources->scratch;
+    validate_execution_memory_binding(first.execution_identity, *first.arena, memory);
+    if (!extra.owner || extra.memory.execution_identity != first.execution_identity ||
+        !extra.memory.allocation_generation || extra.memory.arena_base % 256U || extra.memory.arena_bytes != layout.bytes)
+        throw std::invalid_argument("known-window routed rows CSR owner identity/extent differs");
+    known_moe_range({extra.memory.arena_base, extra.memory.arena_bytes});
+    if (first.reads.size() != 3U || first.writes.size() != 1U || first.temporaries.size() != 1U ||
+        first.reads_state != PersistentState::none || first.writes_state != PersistentState::none ||
+        first.session_state_layout != first.resources->session_state_layout ||
+        first.session_state_memory != first.resources->session_state_memory ||
+        *first.kernel_id != kernel_id(ExecutionBindingRequest{}, config))
+        throw std::invalid_argument("known-window routed rows selected serial kernel/IO differs");
+    validate_model_runtime_binding(*first.resources->model_manifest, *first.resources->model_weights);
+    KnownMoeRowsPrepared out;
+    std::array<KnownMoeRange, 16> writes{};
+    std::array<KnownMoeRange, 24> reads{};
+    for (std::size_t r = 0; r < rows.size(); ++r) {
+        const auto& row = rows[r];
+        if (!row.resources || row.resources->scratch != first.resources->scratch ||
+            row.resources->model_manifest != first.resources->model_manifest ||
+            row.resources->model_weights != first.resources->model_weights ||
+            row.resources->tensor_access != first.resources->tensor_access ||
+            row.resources->session_state_layout != first.resources->session_state_layout ||
+            row.resources->session_state_memory != first.resources->session_state_memory ||
+            row.resources->ple_lookup != first.resources->ple_lookup ||
+            row.resources->ple_hash_contract != first.resources->ple_hash_contract ||
+            row.resources->ple_prefetch != first.resources->ple_prefetch ||
+            row.session_state_layout != first.session_state_layout || row.session_state_memory != first.session_state_memory ||
+            (row.memory && row.memory != row.resources->scratch) || row.prepared_tensor_views || row.prepared_arena_views ||
+            row.execution_identity != first.execution_identity || row.step_id != first.step_id || row.op != SerialOp::moe_experts ||
+            row.layer != first.layer || row.kernel_id != first.kernel_id || row.logical_rows != 1U || row.request_concurrency != 1U ||
+            row.reads_state != first.reads_state || row.writes_state != first.writes_state ||
+            first.position > UINT64_MAX - r || row.position != first.position + r ||
+            row.reads.size() != 3U || row.writes.size() != 1U || row.temporaries.size() != 1U ||
+            !std::equal(row.reads.begin(), row.reads.end(), first.reads.begin()) ||
+            row.writes[0] != first.writes[0] || row.temporaries[0] != first.temporaries[0] || !row.arena)
+            throw std::invalid_argument("known-window routed rows source/position/owner differs");
+        validate_execution_memory_binding(row.execution_identity, *row.arena, memory);
+        out.rows[r] = prepare_moe_experts(row, const_cast<HipMoeExpertsLauncherConfig*>(&config));
+        const auto& p = out.rows[r];
+        if (!p.quantized || !p.quantized->slot_parallel_q51 || p.tensors.fused_gate_up ||
+            p.tensors.gate.manifest->ggml_type != 12U || p.tensors.up.manifest->ggml_type != 12U ||
+            p.tensors.down.manifest->ggml_type != 7U)
+            throw std::invalid_argument("known-window routed rows require separate Q4K gate/up and Q5_1 down");
+        const std::array views{p.hidden, p.route_indices, p.route_weights, p.output, p.temporary};
+        const auto& p0 = out.rows[0];
+        const std::array base{p0.hidden, p0.route_indices, p0.route_weights, p0.output, p0.temporary};
+        for (unsigned v = 0; v < views.size(); ++v) {
+            const auto current = views[v]; known_moe_range({current.address, current.bytes});
+            if (current.address < memory.arena_base || current.address - memory.arena_base > memory.arena_bytes ||
+                current.bytes > memory.arena_bytes - (current.address - memory.arena_base) ||
+                current.allocation_generation != memory.allocation_generation || base[v].bytes > UINT64_MAX - 255U)
+                throw std::invalid_argument("known-window routed rows view exceeds retained physical allocation");
+            const auto stride = (base[v].bytes + 255U) / 256U * 256U;
+            if (current.bytes != base[v].bytes || stride > (UINTPTR_MAX - base[v].address) / rows.size() ||
+                current.address != base[v].address + r * stride)
+                throw std::invalid_argument("known-window routed rows stripe differs from serial allocation");
+        }
+        const std::array tensor_pairs{p.tensors.gate, p.tensors.up, p.tensors.down};
+        for (unsigned t = 0; t < tensor_pairs.size(); ++t) {
+            const auto& pair = tensor_pairs[t]; const auto& dims = pair.manifest->dimensions;
+            const auto width = t == 2U ? config.intermediate_size : config.hidden_size;
+            const auto outputs = t == 2U ? config.hidden_size : config.intermediate_size;
+            const auto required = required_weight_bytes(t == 2U ? WeightKind::q5_1 : WeightKind::q4_k,
+                width, outputs, config.expert_count);
+            if (pair.manifest->layer != row.layer || dims.size() != 3U || dims[0] != width || dims[1] != outputs ||
+                dims[2] != config.expert_count || pair.manifest->byte_size != required || !pair.runtime->allocation_generation)
+                throw std::invalid_argument("known-window routed rows selected tensor metadata differs");
+        }
+        reads[3U*r] = {p.hidden.address, p.hidden.bytes};
+        reads[3U*r+1U] = {p.route_indices.address, p.route_indices.bytes};
+        reads[3U*r+2U] = {p.route_weights.address, p.route_weights.bytes};
+        writes[2U*r] = {p.output.address, p.output.bytes}; writes[2U*r+1U] = {p.temporary.address, p.temporary.bytes};
+        const auto& q = *p.quantized;
+        out.quantized_bindings[r]=q.bindings;
+        out.device.intermediates[r] = reinterpret_cast<const float*>(q.bindings.output.address);
+        out.device.routes[r] = reinterpret_cast<const std::uint32_t*>(p.route_indices.address);
+        out.device.route_weights[r] = reinterpret_cast<const float*>(p.route_weights.address);
+        out.device.status[r] = reinterpret_cast<std::uint32_t*>(q.bindings.status.address);
+        out.device.rawdots[r] = reinterpret_cast<float*>(p.temporary.address + q.layout.rawdots_offset);
+        out.device.accumulation[r] = reinterpret_cast<float*>(p.temporary.address + q.layout.accumulation_offset);
+        out.device.output[r] = reinterpret_cast<std::uint16_t*>(p.output.address);
+    }
+    const auto disjoint = [](KnownMoeRange a, KnownMoeRange b) {
+        known_moe_range(a); known_moe_range(b);
+        if (known_moe_overlap(a,b)) throw std::invalid_argument("known-window routed rows writable owner aliases storage");
+    };
+    const KnownMoeRange csr_range{extra.memory.arena_base, extra.memory.arena_bytes};
+    disjoint(csr_range, {memory.arena_base, memory.arena_bytes});
+    const auto& d1 = current_hip_launch_context()->deferred_moe_status;
+    disjoint(csr_range, {d1.arena_base, d1.arena_bytes});
+    for (const auto& weight : first.resources->model_weights->tensors) {
+        if (!weight.address || !weight.bytes) continue;
+        known_moe_range({weight.address, weight.bytes});
+        disjoint(csr_range, {weight.address, weight.bytes});
+        for (std::size_t w = 0; w < 2U*rows.size(); ++w) disjoint(writes[w], {weight.address, weight.bytes});
+    }
+    if (const auto* state = first.resources->session_state_memory) {
+        for (const auto s : {KnownMoeRange{state->host_base,state->host_bytes}, KnownMoeRange{state->device_base,state->device_bytes}})
+            if (s.bytes) { disjoint(csr_range,s); for (std::size_t w=0;w<2U*rows.size();++w) disjoint(writes[w],s); }
+    }
+    for (std::size_t w = 0; w < 2U*rows.size(); ++w) {
+        disjoint(writes[w], {d1.arena_base,d1.arena_bytes});
+        for (std::size_t r = 0; r < 3U*rows.size(); ++r) disjoint(writes[w], reads[r]);
+        for (std::size_t other = 0; other < w; ++other) disjoint(writes[w], writes[other]);
+    }
+    const auto ptr = [&](std::uint64_t offset) { return reinterpret_cast<std::uint32_t*>(extra.memory.arena_base+offset); };
+    out.csr = {ptr(layout.header),ptr(layout.offsets),ptr(layout.touched),ptr(layout.rows),ptr(layout.slots),
+        ptr(layout.batch_experts),ptr(layout.batch_begins)};
+    out.workspace=extra;
+    moe_q4k_a8::known_rows::preflight(out.rows[0].quantized->request,
+        std::span<const moe_q4k_a8::Bindings>(out.quantized_bindings.data(),rows.size()),extra,hip_execution_stream());
+    return out;
+}
+
+void known_moe_rows_enqueue(std::span<const ExecutionDispatchContext> rows,
+    const HipMoeExpertsLauncherConfig& config, const KnownMoeRowsPrepared& p) {
+    const auto stream = hip_execution_stream();
+    check_hip(hipPeekAtLastError(), "known-window routed rows stale error");
+    const auto scan = [&](unsigned r, const float* values, std::uint32_t count, bool bf16 = false) {
+        hipLaunchKernelGGL(known_moe_rows_finite_kernel,dim3((count+255U)/256U),dim3(256),0,stream,
+            values,count,p.device.status[r],p.csr.header,bf16);
+        check_hip(hipGetLastError(),"known-window routed rows finite scan");
+    };
+    for (unsigned r = 0; r < rows.size(); ++r) {
+        const auto& q = *p.rows[r].quantized;
+        check_hip(hipMemsetAsync(p.device.accumulation[r],0,
+            static_cast<std::size_t>(q.layout.accumulation_bytes+4U),stream),"known-window routed rows clear accumulation/status");
+        hipLaunchKernelGGL(validate_routes_kernel,dim3(1),dim3(256),0,stream,p.device.routes[r],p.device.route_weights[r],
+            config.top_k,config.expert_count,p.device.status[r],nullptr);
+        check_hip(hipGetLastError(),"known-window routed rows route validation");
+        moe_q4k_a8::enqueue_quantize_only(q.request,q.bindings,stream);
+    }
+    hipLaunchKernelGGL(known_moe_csr_kernel,dim3(1),dim3(1),0,stream,p.device,p.csr,
+        static_cast<std::uint32_t>(rows.size()),config.expert_count,config.top_k);
+    check_hip(hipGetLastError(),"known-window routed rows CSR");
+    moe_q4k_a8::known_rows::enqueue(p.rows[0].quantized->request,
+        std::span<const moe_q4k_a8::Bindings>(p.quantized_bindings.data(),rows.size()),p.workspace,stream);
+    for(unsigned r=0;r<rows.size();++r) {
+        const auto& q=*p.rows[r].quantized;
+        auto* workspace = reinterpret_cast<float*>(q.bindings.output.address);
+        scan(r,workspace,2U*config.intermediate_size*config.top_k);
+        if (config.batched_slot_activation) {
+            hipLaunchKernelGGL(known_moe_rows_activation_kernel,dim3((config.intermediate_size+255U)/256U,config.top_k),
+                dim3(256),0,stream,workspace,config.intermediate_size,p.device.status[r],p.csr.header);
+            check_hip(hipGetLastError(),"known-window routed rows batched SiLU");
+            if (config.q4k_a8_stats) {
+                config.q4k_a8_stats->batched_activation_launches.fetch_add(1,std::memory_order_relaxed);
+                config.q4k_a8_stats->batched_activation_slots.fetch_add(config.top_k,std::memory_order_relaxed);
+            }
+        } else for (unsigned slot = 0; slot < config.top_k; ++slot) {
+            hipLaunchKernelGGL(known_moe_rows_activation_kernel,dim3((config.intermediate_size+255U)/256U),dim3(256),0,stream,
+                workspace+2ULL*slot*config.intermediate_size,config.intermediate_size,p.device.status[r],p.csr.header);
+            check_hip(hipGetLastError(),"known-window routed rows incumbent SiLU");
+        }
+        scan(r,workspace,2U*config.intermediate_size*config.top_k);
+    }
+    hipLaunchKernelGGL(known_moe_rows_status_kernel,dim3(1),dim3(1),0,stream,p.device,p.csr,
+        static_cast<std::uint32_t>(rows.size()));
+    check_hip(hipGetLastError(),"known-window routed rows gate/up status admission");
+    const auto weights = reinterpret_cast<const void*>(p.rows[0].tensors.down.runtime->address);
+#define STRIX_KNOWN_MOE_DOWN(R) \
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(known_moe_q51_csr_down_kernel<R>), \
+        dim3((config.hidden_size+7U)/8U,static_cast<unsigned>(rows.size())*config.top_k),dim3(256),0,stream, \
+        p.device,p.csr,weights,config.intermediate_size,config.hidden_size)
+    if (rows.size()==2U) { STRIX_KNOWN_MOE_DOWN(2); }
+    else if (rows.size()==4U) { STRIX_KNOWN_MOE_DOWN(4); }
+    else { STRIX_KNOWN_MOE_DOWN(8); }
+#undef STRIX_KNOWN_MOE_DOWN
+    check_hip(hipGetLastError(),"known-window routed rows shared-decode Q5_1 down");
+    for (unsigned r = 0; r < rows.size(); ++r) {
+        hipLaunchKernelGGL(known_moe_rows_merge_kernel,dim3((config.hidden_size+255U)/256U),dim3(256),0,stream,
+            p.device,p.csr,r,config.hidden_size,config.expert_count,config.top_k);
+        check_hip(hipGetLastError(),"known-window routed rows ordered merge");
+        scan(r,p.device.accumulation[r],config.hidden_size,true);
+    }
+    hipLaunchKernelGGL(known_moe_rows_status_kernel,dim3(1),dim3(1),0,stream,p.device,p.csr,
+        static_cast<std::uint32_t>(rows.size()));
+    check_hip(hipGetLastError(),"known-window routed rows all-row commit admission");
+    for (unsigned r = 0; r < rows.size(); ++r) {
+        hipLaunchKernelGGL(known_moe_rows_commit_kernel,dim3((config.hidden_size+255U)/256U),dim3(256),0,stream,
+            p.device,p.csr,r,config.hidden_size);
+        check_hip(hipGetLastError(),"known-window routed rows output commit");
+        // Validation is phased: bad quantization/routes abort all projections.
+        // Preserve the first logical row among errors actually produced; do
+        // not claim to discover arithmetic errors in work that was skipped.
+        enqueue_deferred_moe_status(p.device.status[r],DeferredMoeDomain::q4k_a8);
+        if (config.q4k_a8_stats) {
+            config.q4k_a8_stats->quantized_submissions.fetch_add(1,std::memory_order_relaxed);
+            config.q4k_a8_stats->grouped_q51_submissions.fetch_add(1,std::memory_order_relaxed);
+            config.q4k_a8_stats->slot_parallel_q51_submissions.fetch_add(1,std::memory_order_relaxed);
+        }
+    }
+}
+#endif
+} // namespace
+
+void moe_experts_known_window_rows_preflight(std::span<const ExecutionDispatchContext> rows,
+    const HipMoeExpertsLauncherConfig& config, const q51_known_rows::Workspace& workspace) {
+#ifdef STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME
+    (void)prepare_known_moe_rows(rows,config,workspace);
+#else
+    (void)rows; (void)config; (void)workspace;
+    throw std::invalid_argument("known-window routed rows require built A8 runtime");
+#endif
+}
+void moe_experts_known_window_rows_launch(std::span<const ExecutionDispatchContext> rows,
+    const HipMoeExpertsLauncherConfig& config, const q51_known_rows::Workspace& workspace) {
+#ifdef STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME
+    const auto prepared=prepare_known_moe_rows(rows,config,workspace);
+    known_moe_rows_enqueue(rows,config,prepared);
+#else
+    (void)rows; (void)config; (void)workspace;
+    throw std::invalid_argument("known-window routed rows require built A8 runtime");
+#endif
+}
+} // namespace strix

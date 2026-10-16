@@ -46,6 +46,7 @@ add_library(strix_core STATIC
     src/generation_output.cpp
     src/known_prompt_chunks.cpp
     src/offline_tuning_cache.cpp
+    src/offline_tuning_preparation.cpp
     src/uma_owner_inventory.cpp
     src/moe_fork_join_arena.cpp
     src/prepared_execution.cpp
@@ -87,6 +88,7 @@ add_library(strix_core STATIC
     src/distributed_placement.cpp
     src/distributed_data_plane.cpp
     src/distributed_native_backend.cpp
+    src/distributed_token_transaction.cpp
     src/distributed_remote_control.cpp
     src/distributed_control_wire.cpp
     src/distributed_control_server.cpp
@@ -304,6 +306,10 @@ if(BUILD_TESTING)
     target_link_libraries(strix-known-prompt-chunks-tests PRIVATE strix_core)
     strix_target_warnings(strix-known-prompt-chunks-tests)
     add_test(NAME strix-known-prompt-chunks-tests COMMAND strix-known-prompt-chunks-tests)
+    add_executable(strix-offline-tuning-preparation-tests tests/offline_tuning_preparation_tests.cpp)
+    target_link_libraries(strix-offline-tuning-preparation-tests PRIVATE strix_core)
+    strix_target_warnings(strix-offline-tuning-preparation-tests)
+    add_test(NAME strix-offline-tuning-preparation-tests COMMAND strix-offline-tuning-preparation-tests)
     add_executable(strix-offline-tuning-cache-tests tests/offline_tuning_cache_tests.cpp)
     target_link_libraries(strix-offline-tuning-cache-tests PRIVATE strix_core)
     strix_target_warnings(strix-offline-tuning-cache-tests)
@@ -767,6 +773,11 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-execution-resources-tests)
     add_test(NAME strix-execution-resources-tests COMMAND strix-execution-resources-tests)
 
+    add_executable(strix-distributed-token-transaction-tests tests/distributed_token_transaction_tests.cpp)
+    target_link_libraries(strix-distributed-token-transaction-tests PRIVATE strix_core)
+    strix_target_warnings(strix-distributed-token-transaction-tests)
+    add_test(NAME strix-distributed-token-transaction-tests COMMAND strix-distributed-token-transaction-tests)
+
     add_executable(strix-distributed-placement-tests tests/distributed_placement_tests.cpp)
     target_link_libraries(strix-distributed-placement-tests PRIVATE strix_core)
     strix_target_warnings(strix-distributed-placement-tests)
@@ -1170,8 +1181,8 @@ if(STRIX_ENABLE_HIP_RUNTIME)
     )
 
     if(STRIX_BUILD_EXPERIMENTAL_Q4K_A8_PROBE OR STRIX_ENABLE_EXPERIMENTAL_Q4K_A8_RUNTIME)
-        # Only this isolated arithmetic TU receives the strict experimental flags.
-        add_library(strix_q4k_a8_hip_probe STATIC src/hip_moe_q4k_a8_probe.hip)
+        # Only these isolated arithmetic TUs receive the strict experimental flags.
+        add_library(strix_q4k_a8_hip_probe STATIC src/hip_moe_q4k_a8_probe.hip src/hip_moe_q4k_a8_known_rows.hip)
         target_link_libraries(strix_q4k_a8_hip_probe PUBLIC strix_q4k_a8_contract "${STRIX_HIP_RUNTIME_LIBRARY}")
         foreach(target strix_q4k_a8_hip_probe)
             target_include_directories(${target} PUBLIC include "${STRIX_HIP_INCLUDE_DIR}")
@@ -1214,6 +1225,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         src/hip_prompt_lookup_runtime.hip
         src/hip_serving_greedy_backend.hip
         src/hip_distributed_stage.hip
+        src/hip_distributed_transaction.hip
         src/hip_hyper_mix_launcher.hip
         src/hip_indexed_attention_launcher.hip
         src/hip_qsa_selection_diagnostic.hip
@@ -1297,6 +1309,14 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         strix-hip-decode-token
         apps/hip_decode_token_main.cpp
     )
+    # This embeds DECLARED configuration only. Heterogeneous per-source HIP
+    # argv is not represented completely, so live flags SHA stays unknown.
+    file(SHA256 "${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt" STRIX_DECLARED_CMAKE_SOURCE_SHA)
+    string(HEX "cmake=${STRIX_DECLARED_CMAKE_SOURCE_SHA};cxx=${CMAKE_CXX_COMPILER_ID}/${CMAKE_CXX_COMPILER_VERSION}/${CMAKE_CXX_COMPILER};hip=${CMAKE_HIP_COMPILER_ID}/${CMAKE_HIP_COMPILER_VERSION}/${CMAKE_HIP_COMPILER};build=${CMAKE_BUILD_TYPE};cxxflags=${CMAKE_CXX_FLAGS};hipflags=${CMAKE_HIP_FLAGS};debug=${CMAKE_HIP_FLAGS_DEBUG};release=${CMAKE_HIP_FLAGS_RELEASE};reldeb=${CMAKE_HIP_FLAGS_RELWITHDEBINFO};minsize=${CMAKE_HIP_FLAGS_MINSIZEREL};per-source=unresolved" STRIX_DECLARED_BUILD_CONTEXT_HEX)
+    file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/generated")
+    configure_file(apps/offline_tuning_build_context.hpp.in
+        "${CMAKE_CURRENT_BINARY_DIR}/generated/offline_tuning_build_context.hpp" @ONLY)
+    target_include_directories(strix-hip-decode-token PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
     target_link_libraries(
         strix-hip-decode-token
         PRIVATE strix_hip_runtime
@@ -1621,6 +1641,33 @@ if(STRIX_ENABLE_HIP_RUNTIME)
             -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
         strix_target_warnings(strix-hip-gdn-wide-projection-tests)
         add_test(NAME strix-hip-gdn-wide-projection-tests COMMAND strix-hip-gdn-wide-projection-tests)
+
+        if(STRIX_ENABLE_EXPERIMENTAL_Q4K_A8_RUNTIME)
+            add_executable(strix-hip-moe-q4k-a8-known-rows-tests tests/hip_moe_q4k_a8_known_rows_tests.hip)
+            set_target_properties(strix-hip-moe-q4k-a8-known-rows-tests PROPERTIES
+                HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+            target_link_libraries(strix-hip-moe-q4k-a8-known-rows-tests PRIVATE strix_hip_runtime)
+            target_compile_options(strix-hip-moe-q4k-a8-known-rows-tests PRIVATE
+                -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
+            strix_target_warnings(strix-hip-moe-q4k-a8-known-rows-tests)
+            foreach(rows 2 4 8)
+                add_test(NAME strix-hip-moe-q4k-a8-known-rows-${rows}
+                    COMMAND strix-hip-moe-q4k-a8-known-rows-tests ${rows})
+            endforeach()
+            add_executable(strix-hip-moe-known-rows-tests tests/hip_moe_known_rows_tests.hip)
+            set_target_properties(strix-hip-moe-known-rows-tests PROPERTIES
+                HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+            target_link_libraries(strix-hip-moe-known-rows-tests PRIVATE strix_hip_runtime)
+            target_compile_options(strix-hip-moe-known-rows-tests PRIVATE
+                -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
+            strix_target_warnings(strix-hip-moe-known-rows-tests)
+            foreach(rows 2 4 8)
+                foreach(batched 0 1)
+                    add_test(NAME strix-hip-moe-known-rows-${rows}-batched-${batched}
+                        COMMAND strix-hip-moe-known-rows-tests ${rows} ${batched})
+                endforeach()
+            endforeach()
+        endif()
 
         add_executable(strix-hip-known-window-tests tests/hip_known_window_tests.hip)
         set_target_properties(strix-hip-known-window-tests PROPERTIES

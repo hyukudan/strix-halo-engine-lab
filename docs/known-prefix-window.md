@@ -103,3 +103,26 @@ compares final logical history, not transient discarded verification work.
 Source only: no compilation, tests, native execution or performance measurements
 have been run for this integration. It does not implement sampling, learned
 draft models, automatic depth selection or a default promotion.
+
+## Routed expert union overlay
+
+`--known-prefix-expert-union` is default-off and requires the explicit known
+window plus resolved A8 gate/up, grouped Q5_1 down, slot-parallel and D1. The
+compiler names actual eligible routed variants per logical row width. Other
+formats keep their original R1 path; no eligible step means an explicit fallback
+receipt and no extra workspace allocation, not a claimed promotion.
+
+Only a window with eligible union steps allocates the separate CSR workspace,
+once during setup. Its exact requirement is checked against a separate 64 KiB
+budget before allocation; its binding has the window execution identity, a fresh
+generation and 256-byte alignment. The native owner retains its actual allocator
+owner until original-device quiescence. No per-window-call allocation or default
+path allocation is introduced. Receipts distinguish source eligibility, reserved
+workspace and actual completed union dispatches. Logical reuse is not a physical
+traffic, qualification or speed claim.
+
+The candidate quantizes each input row once and shares packed gate/up and down
+weights across bounded expert assignment tiles. Duplicate row/slot assignments
+remain distinct and the down merge retains ascending slot order. The 128-byte
+GPU summary describes only the last eligible layer of the last completed window;
+its histograms are not whole-request reuse or measured memory traffic.

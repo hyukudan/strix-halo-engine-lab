@@ -91,18 +91,24 @@ struct HipKnownPrefixWindow::Impl {
     std::vector<std::uint64_t> position_readers;
     HipSharedExpertLauncherConfig shared_config, shared_fallback;
     HipGdnLauncherConfig gdn_config;
+    HipMoeExpertsLauncherConfig routed_config;
+    q51_known_rows::Workspace routed_workspace;
+    q51_known_rows::Summary pending_union_summary;
+    std::uint32_t last_union_layer = 0;
+    std::optional<HipKnownPrefixUnionObservation> last_union_observation;
     std::array<KnownWindowR2Entry, 3> r2_entries;
-    std::array<KnownWindowRowsEntry,4> rows_entries;
+    std::vector<KnownWindowRowsEntry> rows_entries;
     DeferredMoeFirstError completion_status{};
     bool failed = false;
 
     Impl(CompiledKnownPrefixWindow source, CompiledSerialExecution serial_source,
         ModelContract model_source, HipLauncherCatalogConfig config_source,
         const ExecutionRuntimeResources& serial_resources, ExecutionMemoryBinding memory,
-        HipLaunchContext native_scope, std::shared_ptr<const void> owner)
+        HipLaunchContext native_scope, std::shared_ptr<const void> owner,
+        q51_known_rows::Workspace union_workspace)
         : actual_owner(std::move(owner)), window(std::move(source)), serial(std::move(serial_source)),
           model(std::move(model_source)), config(std::move(config_source)), resources(serial_resources),
-          scratch(memory), scope(native_scope) {
+          scratch(memory), scope(native_scope), routed_workspace(std::move(union_workspace)) {
         if (!actual_owner) throw std::invalid_argument("known-window native owner requires retained actual owners");
         if (const auto error = model.validate(); !error.empty()) throw std::invalid_argument(error);
         if (config.gdn_recurrent_storage != GdnRecurrentStorage::key_value ||
@@ -150,6 +156,7 @@ struct HipKnownPrefixWindow::Impl {
         position_readers.erase(std::unique(position_readers.begin(), position_readers.end()), position_readers.end());
         setup_r2();
         setup_rows();
+        setup_routed_union();
         // Setup only: no execution callback clears or reads this record before
         // all deep admission. Exclusive status ownership preserves zero across
         // successful calls; any exception disables the owner permanently.
@@ -250,6 +257,7 @@ struct HipKnownPrefixWindow::Impl {
             }};
     }
     void setup_rows() {
+        rows_entries.resize(4);
         for(std::size_t i=0;i<2U;++i) {
             rows_entries[i]={i==0U ? KnownWindowR2Variant::shared_q8_virtual256_r4_v1 :
                 KnownWindowR2Variant::shared_q8_virtual256_r8_v1,this,
@@ -271,8 +279,55 @@ struct HipKnownPrefixWindow::Impl {
                 }};
         }
     }
+    void setup_routed_union() {
+        const auto& workspace=routed_workspace.memory;
+        if(!window.routed_expert_union_steps) {
+            if(routed_workspace.owner || !empty(workspace))
+                throw std::invalid_argument("unused known-window routed union workspace");
+            return;
+        }
+        if(!config.q4k_a8g32_gate_up || !config.grouped_exact_q51_down ||
+            !config.q51_slot_parallel_down || !config.deferred_moe_status || !routed_workspace.owner ||
+            workspace.execution_identity!=window.window_execution_identity ||
+            !workspace.arena_base || workspace.arena_base%256U || !workspace.allocation_generation ||
+            workspace.arena_bytes!=q51_known_rows::required_scratch_bytes(window.logical_rows,
+                u32(model.num_experts),u32(model.num_experts_per_token)) ||
+            workspace.arena_bytes>std::numeric_limits<std::uintptr_t>::max()-workspace.arena_base)
+            throw std::invalid_argument("known-window routed union requires its exact retained extra workspace and configured serial policy");
+        status_disjoint(workspace.arena_base,workspace.arena_bytes);
+        routed_config.hidden_size=u32(model.hidden_size);
+        routed_config.intermediate_size=u32(model.moe_intermediate_size);
+        routed_config.expert_count=u32(model.num_experts);
+        routed_config.top_k=u32(model.num_experts_per_token);
+        routed_config.activation=config.activation;
+        routed_config.q4k_a8g32_gate_up=config.q4k_a8g32_gate_up;
+        routed_config.batched_slot_activation=config.batched_moe_activation;
+        routed_config.grouped_exact_q51_down=config.grouped_exact_q51_down;
+        routed_config.q51_slot_parallel_down=config.q51_slot_parallel_down;
+        routed_config.deferred_moe_status=config.deferred_moe_status;
+        routed_config.q4k_a8_stats=config.q4k_a8_stats;
+        routed_config.q4k_a8_quiescence=std::make_shared<HipSetupQuiescenceGuard>();
+        for(std::size_t i=0;i<window.mode.size();++i)
+            if(window.mode[i]==KnownWindowStepMode::routed_expert_union)
+                last_union_layer=serial.execution.steps[i].layer.value();
+        const auto variant=window.logical_rows==2U?KnownWindowR2Variant::routed_q51_union_rows2_v1:
+            window.logical_rows==4U?KnownWindowR2Variant::routed_q51_union_rows4_v1:KnownWindowR2Variant::routed_q51_union_rows8_v1;
+        rows_entries.push_back({variant,this,
+            [](std::span<const ExecutionDispatchContext> rows,void* object) {
+                const auto& self=*static_cast<Impl*>(object);
+                moe_experts_known_window_rows_preflight(rows,self.routed_config,self.routed_workspace);
+            },
+            [](std::span<const ExecutionDispatchContext> rows,void* object) {
+                const auto& self=*static_cast<Impl*>(object);
+                moe_experts_known_window_rows_launch(rows,self.routed_config,self.routed_workspace);
+            }});
+    }
     void complete() {
         guard.require_original();
+        if(window.routed_expert_union_steps)
+            check(hipMemcpyAsync(&pending_union_summary,
+                reinterpret_cast<const void*>(routed_workspace.memory.arena_base),sizeof(pending_union_summary),
+                hipMemcpyDeviceToHost,scope.stream),"read latest routed expert union metadata");
         if (config.deferred_moe_status)
             check(hipMemcpyAsync(&completion_status,
                 reinterpret_cast<const void*>(scope.deferred_moe_status.arena_base), sizeof(completion_status),
@@ -280,6 +335,27 @@ struct HipKnownPrefixWindow::Impl {
         check(hipStreamSynchronize(scope.stream), "complete known-window native stream");
         guard.require_original();
         if (config.deferred_moe_status) check_deferred_moe_status(completion_status);
+        if(window.routed_expert_union_steps) {
+            const auto& s=pending_union_summary;
+            const auto assignments=window.logical_rows*u32(model.num_experts_per_token);
+            std::uint64_t experts=0,batches=0,batch_assignments=0,unique_row_assignments=0;
+            for(std::uint32_t i=0;i<8U;++i) {
+                experts+=s.rows_per_expert_histogram[i];
+                unique_row_assignments+=static_cast<std::uint64_t>(i+1U)*s.rows_per_expert_histogram[i];
+                batches+=s.batch_size_histogram[i];
+                batch_assignments+=static_cast<std::uint64_t>(i+1U)*s.batch_size_histogram[i];
+                if(i>=window.logical_rows && (s.rows_per_expert_histogram[i] || s.batch_size_histogram[i]))
+                    throw std::runtime_error("routed expert union histogram exceeds its admitted row count");
+            }
+            if(s.status || s.version!=1U || s.logical_rows!=window.logical_rows || s.assignments!=assignments ||
+                !s.touched || s.touched>assignments || s.touched>model.num_experts ||
+                s.batches<s.touched || s.batches>assignments || !s.maximum_assignments ||
+                s.maximum_assignments>assignments || s.duplicate_assignments>assignments ||
+                experts!=s.touched || batches!=s.batches || batch_assignments!=assignments ||
+                unique_row_assignments+s.duplicate_assignments!=assignments ||
+                std::any_of(s.reserved,s.reserved+8U,[](auto v){return v!=0U;}))
+                throw std::runtime_error("routed expert union metadata disagrees with its completed window");
+        }
     }
     KnownWindowResult execute(SerialSessionContext& session, std::span<const std::uint32_t> tokens) {
         if (failed) throw std::logic_error("known-window native owner cannot be reused after an exception");
@@ -298,8 +374,12 @@ struct HipKnownPrefixWindow::Impl {
             hooks.complete = [&] { complete(); };
             hooks.quiesce_or_fail_stop = [&] { failed = true; guard.recover_or_fail_stop(); };
             hooks.position_reader_implementations = position_readers;
-            return execute_known_prefix_window_eager(window, serial, resources, scratch, session, tokens,
+            const auto first_position=session.next_position;
+            auto result=execute_known_prefix_window_eager(window, serial, resources, scratch, session, tokens,
                 launch_pointers, r2_entries, rows_entries, hooks);
+            if(window.routed_expert_union_steps)
+                last_union_observation=HipKnownPrefixUnionObservation{first_position,last_union_layer,pending_union_summary};
+            return result;
         } catch (...) {
             failed = true;
             // A rejected foreign capture/scope must never be drained here.
@@ -312,9 +392,11 @@ struct HipKnownPrefixWindow::Impl {
 HipKnownPrefixWindow::HipKnownPrefixWindow(CompiledKnownPrefixWindow window,
     CompiledSerialExecution serial_snapshot, ModelContract model, HipLauncherCatalogConfig config,
     const ExecutionRuntimeResources& serial_resources, ExecutionMemoryBinding window_scratch,
-    HipLaunchContext scope, std::shared_ptr<const void> actual_owner)
+    HipLaunchContext scope, std::shared_ptr<const void> actual_owner,
+    q51_known_rows::Workspace routed_union_workspace)
     : impl_(std::make_unique<Impl>(std::move(window), std::move(serial_snapshot), std::move(model),
-          std::move(config), serial_resources, window_scratch, scope, std::move(actual_owner))) {}
+          std::move(config), serial_resources, window_scratch, scope, std::move(actual_owner),
+          std::move(routed_union_workspace))) {}
 HipKnownPrefixWindow::~HipKnownPrefixWindow() = default;
 KnownWindowResult HipKnownPrefixWindow::execute(SerialSessionContext& session, std::array<std::uint32_t, 2> tokens) {
     return impl_->execute(session, std::span<const std::uint32_t>(tokens));
@@ -323,4 +405,7 @@ KnownWindowResult HipKnownPrefixWindow::execute(SerialSessionContext& session, s
     return impl_->execute(session,tokens);
 }
 std::uint32_t HipKnownPrefixWindow::logical_rows() const noexcept { return impl_->window.logical_rows; }
+std::optional<HipKnownPrefixUnionObservation> HipKnownPrefixWindow::latest_routed_union_observation() const noexcept {
+    return impl_->failed?std::nullopt:impl_->last_union_observation;
+}
 } // namespace strix

@@ -8,6 +8,8 @@
 #include <string>
 #include <memory>
 #include "strix/moe_q4k_a8_runtime.hpp"
+#include "strix/q51_known_rows.hpp"
+#include <span>
 
 namespace strix {
 class HipSetupQuiescenceGuard;
@@ -40,6 +42,25 @@ void register_hip_moe_experts_kernel_variant(
 make_hip_moe_experts_launcher(
     std::string kernel_id,
     HipMoeExpertsLauncherConfig* config);
+
+// Explicit retained known-prefix window R2/R4/R8 organization, not an R1
+// variant or automatic strategy. Requires the selected Q4K A8 / Q5_1
+// slot-parallel layer, BF16 C1 rows and owned eager D1 scope. Quantization,
+// gate/up and SiLU retain their incumbent per-row kernels. Device CSR groups
+// only selected assignments; down reuses each decoded coefficient across the
+// expert's rows and scatters raw dots before the original ordered slot FMA.
+// Every row and the exclusive CSR owner are admitted before any enqueue.
+// The caller admits session/epoch, holds exclusive allocation leases, retains
+// all descriptors/owners and drains the stream before reuse or destruction.
+// No host payload reads, allocation, synchronization, capture or publication.
+void moe_experts_known_window_rows_preflight(
+    std::span<const ExecutionDispatchContext> rows,
+    const HipMoeExpertsLauncherConfig& config,
+    const q51_known_rows::Workspace& workspace);
+void moe_experts_known_window_rows_launch(
+    std::span<const ExecutionDispatchContext> rows,
+    const HipMoeExpertsLauncherConfig& config,
+    const q51_known_rows::Workspace& workspace);
 
 class HipMoeExpertsLauncherBundle {
 public:

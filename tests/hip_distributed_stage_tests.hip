@@ -1,6 +1,7 @@
 // Opt-in real-model COMPONENT fixture. No network, peer, transport transfer,
 // distributed token commit, latency measurement or sharded-memory claim.
 #include "strix/hip_distributed_stage.hpp"
+#include "strix/hip_distributed_transaction.hpp"
 #include "strix/deferred_moe_status.hpp"
 #include "strix/hip_model_residency.hpp"
 #include "strix/hip_runtime_allocator.hpp"
@@ -87,6 +88,33 @@ std::shared_ptr<Owner> load(const std::filesystem::path& path) {
         &o->memory->state(),&o->ple,&o->hash,&o->prefetch};
     return o;
 }
+// Two local peers share only immutable mapped/resident weights. Each keeps
+// genuinely distinct seven-state, scratch, status, PLE and stream owners.
+std::shared_ptr<Owner> clone_local(const std::shared_ptr<Owner>& source) {
+    auto o=std::make_shared<Owner>();
+    o->model=source->model;o->manifest=source->manifest;o->serial=source->serial;o->access=source->access;
+    o->layout=source->layout;o->mapped=source->mapped;o->resident=source->resident;o->config=source->config;
+    o->allocator=std::make_shared<strix::HipRuntimeAllocator>(strix::HipHostAllocationMode::pageable_aligned);
+    o->memory=std::make_shared<strix::RuntimeExecutionMemoryOwner>(strix::RuntimeExecutionMemoryOwner::allocate(
+        o->serial,o->layout,*o->allocator,o->generations));
+    o->status={o->serial.execution_identity,o->allocator->allocate_device(8U,256U),8U,o->generations.next()};
+    o->guard.run([&] {
+        check(hipStreamCreateWithFlags(&o->stream,hipStreamNonBlocking),"create second local peer stream");
+        strix::initialize_hip_fresh_runtime_memory(o->memory->scratch(),o->memory->state());
+        check(hipMemsetAsync(reinterpret_cast<void*>(o->status.arena_base),0,8U,o->stream),"initialize second peer D1 record");
+    });
+    o->hash=strix::build_ple_hash_contract(o->model);
+    o->resources={&o->memory->scratch(),&o->manifest,&o->resident->binding(),&o->access,&o->layout,
+        &o->memory->state(),&o->ple,&o->hash,&o->prefetch};
+    return o;
+}
+strix::SerialSessionContext fresh_session(const Owner& o) {
+    strix::SerialSessionContext s;s.execution_identity=o.serial.execution_identity;
+    s.state_layout_identity=o.layout.layout_identity;
+    s.runtime_compatibility_identity=strix::build_runtime_execution_identities(o.serial.execution_identity,o.serial.arena,o.resources).compatibility_identity;
+    for(const auto& a:o.layout.allocations) s.state.valid=s.state.valid|a.state_flag;
+    return s;
+}
 struct Snapshot {
     std::vector<std::byte> scratch,device,host;
 };
@@ -141,6 +169,133 @@ strix::DistributedPlacementPlan placement(const Owner& o,std::uint32_t cut) {
     require(p.executable && !p.boundaries.empty(),"component cut has no derived real IO placement");
     return p;
 }
+enum class TransactionOutcome {rollback,commit,lost_decision};
+void transaction_component(const std::shared_ptr<Owner>& first,const strix::SerialSessionContext& initial_session,
+    std::uint32_t cut,std::uint32_t input,TransactionOutcome outcome) {
+    auto second=clone_local(first);
+    const auto before0=snapshot(*first);restore(*second,before0);
+    const auto before1=snapshot(*second);
+    auto session0=initial_session,session1=initial_session;
+    session1.runtime_compatibility_identity=fresh_session(*second).runtime_compatibility_identity;
+    const auto saved0=session0,saved1=session1;
+    const auto plan=placement(*first,cut);
+    strix::DistributedTokenBinding binding;
+    binding.serial_execution_identity=first->serial.execution_identity;binding.kernel_plan_identity=first->serial.kernel_plan_identity;
+    binding.placement_plan_identity=plan.plan_identity;binding.model_content_identity=first->resident->binding().model_content_identity;
+    binding.request_id=17U;binding.connection_epoch=29U;binding.generation=1U;binding.input_token=input;binding.boundary_dtype_id=1U;
+    binding.position=session0.next_position;binding.committed_tokens=session0.committed_tokens;
+    binding.previous_history_identity=session0.arithmetic_lineage.history_identity;
+    binding.initial_global_state=session0.state;
+    for(std::uint32_t node=0;node<2U;++node) {
+        const auto& o=node?*second:*first;const auto& session=node?session1:session0;
+        auto& peer=binding.peers[node];peer.node=node;peer.first_step=node?cut+1U:0U;
+        peer.last_step=node?static_cast<std::uint32_t>(o.serial.execution.steps.size()-1U):cut;
+        peer.runtime_compatibility_identity=session.runtime_compatibility_identity;
+        peer.state_layout_identity=session.state_layout_identity;peer.context_capacity=o.layout.context_tokens;peer.initial_state=session.state;
+    }
+    const auto budget=[](const Owner& o) {
+        require(o.layout.device_total_bytes<=std::numeric_limits<std::uint64_t>::max()-o.layout.host_total_bytes,"snapshot budget overflow");
+        // Snapshot sections include alignment padding; budget is the complete
+        // existing owner extents plus one alignment quantum per component.
+        const auto bytes=o.layout.device_total_bytes+o.layout.host_total_bytes;
+        require(bytes<=std::numeric_limits<std::uint64_t>::max()-4096U,"snapshot padding budget overflow");
+        return bytes+4096U;
+    };
+    strix::HipDistributedTokenParticipant p0(first->serial,plan,first->model,first->config,first->resources,session0,
+        first->scope(),first,*first->allocator,first->generations,binding,0U,budget(*first));
+    strix::HipDistributedTokenParticipant p1(second->serial,plan,second->model,second->config,second->resources,session1,
+        second->scope(),second,*second->allocator,second->generations,binding,1U,budget(*second));
+    auto capacity_binding=binding;capacity_binding.position=first->layout.context_tokens;
+    bool capacity_rejected=false;
+    try {
+        strix::HipDistributedTokenParticipant invalid(first->serial,plan,first->model,first->config,first->resources,session0,
+            first->scope(),first,*first->allocator,first->generations,capacity_binding,0U,budget(*first));
+    } catch(const std::invalid_argument&) {capacity_rejected=true;}
+    require(capacity_rejected && session0.health==strix::SerialSessionHealth::ready,
+        "out-of-capacity transaction changed the original session before admission");
+    const auto prepared0=p0.prepare(),prepared1=p1.prepare();p0.observe_peer(prepared1);p1.observe_peer(prepared0);
+    require(session0.health==strix::SerialSessionHealth::poisoned && session1.health==strix::SerialSessionHealth::poisoned,
+        "prepared physical frontiers were exposed to an ordinary serial caller");
+    std::array<strix::transport::DirectTransportNativeLinkSession*,1> unavailable{nullptr};NoControl control;NoStaging staging;
+    strix::NativeDistributedBackend backend(unavailable,control,p0,staging);
+    for(std::uint32_t i=0;i<=cut;++i) backend.execute_local_step(plan.steps[i]);
+    const auto ready=p0.finish_local();p1.observe_peer(ready);
+    // Component-only local D2D transfer of the REAL derived arena boundary.
+    // This deliberately does not exercise a physical/network transport.
+    for(const auto& boundary:plan.boundaries) {
+        const auto source=p0.completed_boundary_views(boundary);
+        require(source.size()==boundary.payloads.size(),"transaction boundary arity changed");
+        for(std::size_t i=0;i<source.size();++i) {
+            const auto target=strix::resolve_execution_buffer(second->serial.execution_identity,second->serial.arena,
+                second->memory->scratch(),boundary.payloads[i]);
+            require(target.bytes==source[i].bytes,"transaction boundary source/destination extents differ");
+            check(hipMemcpy(reinterpret_cast<void*>(target.address),reinterpret_cast<const void*>(source[i].address),
+                static_cast<std::size_t>(target.bytes),hipMemcpyDeviceToDevice),"component local peer boundary transfer");
+        }
+    }
+    strix::NativeDistributedBackend peer_backend(unavailable,control,p1,staging);
+    for(std::uint32_t i=cut+1U;i<plan.steps.size();++i) peer_backend.execute_local_step(plan.steps[i]);
+    const auto ready1=p1.finish_local();p0.observe_peer(ready1);
+    const auto* position_allocation=strix::find_session_state_allocation(second->layout,strix::SessionStateComponent::position_history);
+    require(position_allocation!=nullptr,"transaction fixture has no position word");
+    std::uint64_t word=0;std::memcpy(&word,reinterpret_cast<const void*>(second->memory->state().host_base+
+        static_cast<std::uintptr_t>(position_allocation->offset)),sizeof(word));
+    require(word==binding.position,"suffix did not materialize the explicit position after both preparations");
+    auto expected1=saved1.state;
+    for(std::uint32_t i=cut+1U;i<plan.steps.size();++i) expected1.publish_write(first->serial.execution.steps[i].writes_state);
+    require(ready1.receipt.local_state.generations==expected1.generations,
+        "controller position materialization fabricated a generation");
+    if(outcome!=TransactionOutcome::rollback) {
+        const auto commit=p0.decide_commit();
+        require(p0.decision_identity()!=0U && !p0.committed_frontier(),"native decision alone published global commit");
+        if(outcome==TransactionOutcome::lost_decision) {
+            const auto irreversible=p0.decision_identity();
+            // Decision was made locally but deliberately never delivered.
+            p0.communication_failed();p1.communication_failed();
+            bool blocked0=false,blocked1=false;
+            try {(void)p0.restore_local();} catch(const std::logic_error&) {blocked0=true;}
+            try {(void)p1.restore_local();} catch(const std::logic_error&) {blocked1=true;}
+            require(blocked0 && blocked1 && p0.phase()==strix::DistributedTokenPhase::in_doubt &&
+                p1.phase()==strix::DistributedTokenPhase::in_doubt && p0.decision_identity()==irreversible &&
+                session0.health==strix::SerialSessionHealth::poisoned && session1.health==strix::SerialSessionHealth::poisoned &&
+                !p0.committed_frontier() && !p1.committed_frontier(),"lost decision allowed unilateral rollback/reuse or fabricated acknowledgement");
+            return;
+        }
+        p1.observe_peer(commit);
+        const auto ack0=p0.acknowledge_commit();p1.observe_peer(ack0);
+        require(!p0.committed_frontier() && !p1.committed_frontier(),"one peer ACK published global commit");
+        const auto ack1=p1.acknowledge_commit();p0.observe_peer(ack1);
+        const auto done0=p0.committed_frontier(),done1=p1.committed_frontier();
+        require(done0 && done1 && done0->decision_identity==done1->decision_identity &&
+            done0->next_position==binding.position+1U && done1->history_identity==done0->history_identity &&
+            done0->committed_tokens==binding.committed_tokens+1U &&
+            done0->local_state[1].generations==ready1.receipt.local_state.generations &&
+            session0.health==strix::SerialSessionHealth::poisoned && session1.health==strix::SerialSessionHealth::poisoned,
+            "native global frontier did not require both receipts or retagged a partial peer as a healthy serial session");
+        return;
+    }
+    const auto abort=p0.decide_abort();p1.observe_peer(abort);
+    const auto restored0=p0.restore_local();p1.observe_peer(restored0);
+    bool rejected=false;try {p0.finalize_rollback();} catch(const std::logic_error&) {rejected=true;}
+    require(rejected && session0.health==strix::SerialSessionHealth::poisoned,"one restored peer republished history before the other restored");
+    const auto restored1=p1.restore_local();p0.observe_peer(restored1);
+    p0.finalize_rollback();p1.finalize_rollback();
+    const auto after0=snapshot(*first),after1=snapshot(*second);
+    require(after0.device==before0.device && after0.host==before0.host && after1.device==before1.device && after1.host==before1.host,
+        "bilateral rollback did not restore all seven complete physical state components");
+    const auto same=[](const strix::SerialSessionContext& a,const strix::SerialSessionContext& b) {
+        return a.health==b.health && a.execution_identity==b.execution_identity && a.next_position==b.next_position &&
+            a.state_layout_identity==b.state_layout_identity && a.runtime_compatibility_identity==b.runtime_compatibility_identity &&
+            a.committed_tokens==b.committed_tokens && a.state.generations==b.state.generations && a.state.valid==b.state.valid &&
+            a.arithmetic_lineage.history_identity==b.arithmetic_lineage.history_identity &&
+            a.arithmetic_lineage.intervals==b.arithmetic_lineage.intervals && a.arithmetic_lineage.tainted==b.arithmetic_lineage.tainted;
+    };
+    require(same(session0,saved0) && same(session1,saved1),"rollback failed to republish exact saved history only after both restores");
+    rejected=false;try {p0.finalize_rollback();} catch(const std::logic_error&) {rejected=true;}
+    require(rejected,"rollback publication was repeated using a moved history");
+    // This local component exercised REAL target callbacks and all7 snapshot
+    // transfers. There is no network, distributed commit or continuation claim.
+}
 int run(const std::filesystem::path& model,const std::string& expected,std::uint32_t input,const std::filesystem::path& output) {
     require(!std::filesystem::exists(output),"output must be fresh");
     require(digest(model)==expected,"model SHA before differs");
@@ -166,10 +321,14 @@ int run(const std::filesystem::path& model,const std::string& expected,std::uint
         });
     });
     require(reference.observed,"reference did not observe the actual intermediate stage");
+    const auto full_reference=snapshot(*o);const auto full_reference_session=session;
     restore(*o,initial);session=base;
     const auto plan=placement(*o,cut);
     strix::HipDistributedStage stage(o->serial,plan,0,cut,o->model,o->config,o->resources,o->scope(),o);
     strix::HipDistributedStageToken token;token.request={1,1,1,1};token.position=0;token.input_token=input;token.initial_state=base.state;
+    auto wrong_controller=token;wrong_controller.controller_materializes_position=true;
+    bool controller_rejected=false;try {stage.begin_token(wrong_controller);} catch(const std::invalid_argument&) {controller_rejected=true;}
+    require(controller_rejected,"prefix containing position_prepare accepted suffix controller materialization");
     stage.begin_token(token);
     std::array<strix::transport::DirectTransportNativeLinkSession*,1> unavailable{nullptr};
     NoControl control;NoStaging staging;
@@ -203,11 +362,18 @@ int run(const std::filesystem::path& model,const std::string& expected,std::uint
     require(rejected && failed.failed(),"queued GPU callback error did not drain and disable owner");
     bool sticky=false;try {failed.execute_local_step(plan.steps[1]);} catch(const std::logic_error&) {sticky=true;}
     require(sticky,"failed stage was reused");
+    restore(*o,full_reference);session=full_reference_session;
+    require(session.next_position>0U,"transaction rollback must exercise a nonzero input position and retained history");
+    transaction_component(o,session,cut,input,TransactionOutcome::rollback);
+    restore(*o,full_reference);session=full_reference_session;
+    transaction_component(o,session,cut,input,TransactionOutcome::commit);
+    restore(*o,full_reference);session=full_reference_session;
+    transaction_component(o,session,cut,input,TransactionOutcome::lost_decision);
     require(digest(model)==expected,"model SHA after differs");
     std::ofstream out(output,std::ios::binary);out.exceptions(std::ios::failbit|std::ios::badbit);
     out<<"{\"schema\":\"hip-distributed-stage-component-v1\",\"finished\":true,\"component_passed\":true,"
         "\"transport_exercised\":false,\"distributed_model_qualified\":false,\"global_commit_published\":false,"
-        "\"all_weights_local\":true,\"stage_steps\":"<<result.completed_steps<<",\"boundary_bytes\":"<<boundary_bytes
+        "\"bilateral_snapshot_rollback_component\":true,\"transaction_commit_and_lost_decision_components\":true,\"all_weights_local\":true,\"stage_steps\":"<<result.completed_steps<<",\"boundary_bytes\":"<<boundary_bytes
         <<",\"model_sha256\":\""<<expected<<"\"}\n";
     return 0;
 }

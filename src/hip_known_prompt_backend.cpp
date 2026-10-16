@@ -109,6 +109,7 @@ struct HipKnownPromptBackend::Impl {
             add_prompt_stat(next.completed_input_rows, rows, next.saturated);
             add_prompt_stat(next.shared_rows_dispatches, result.shared_rows_dispatches, next.saturated);
             add_prompt_stat(next.gdn_rows_dispatches, result.gdn_rows_dispatches, next.saturated);
+            add_prompt_stat(next.routed_expert_union_dispatches, result.routed_expert_union_dispatches, next.saturated);
             add_prompt_stat(next.r2_dispatches, result.r2_dispatches, next.saturated);
             add_prompt_stat(next.row_loop_dispatches, result.row_loop_dispatches, next.saturated);
             add_prompt_stat(next.logical_projection_weight_bytes_avoided,

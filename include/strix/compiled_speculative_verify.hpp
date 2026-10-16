@@ -24,6 +24,7 @@ enum class KnownWindowStepMode : std::uint8_t {
     r2_gdn_staged,
     shared_rows,
     gdn_rows,
+    routed_expert_union,
 };
 
 // Closed implementation table. These values identify window entries; they do
@@ -38,8 +39,11 @@ enum class KnownWindowR2Variant : std::uint32_t {
     shared_q8_virtual256_r8_v1 = 5,
     gdn_q8_rows4_f32_gates_r1_v1 = 6,
     gdn_q8_rows8_f32_gates_r1_v1 = 7,
+    routed_q51_union_rows2_v1 = 8,
+    routed_q51_union_rows4_v1 = 9,
+    routed_q51_union_rows8_v1 = 10,
 };
-inline constexpr std::uint32_t known_window_r2_variant_slots = 8;
+inline constexpr std::uint32_t known_window_r2_variant_slots = 11;
 
 struct KnownWindowRequest {
     bool r2_shared_expert = false;
@@ -48,6 +52,8 @@ struct KnownWindowRequest {
     // Native shared and mixed-GDN rows4/8 when selected, all-Q8 GDN pair tiles and R1
     // fallback elsewhere. Does not register new serial kernel IDs.
     std::uint32_t logical_rows = 2;
+    // Explicit grouped Q5_1 down candidate; unmatched formats retain R1.
+    bool routed_expert_union = false;
 };
 
 struct CompiledKnownPrefixWindow {
@@ -74,7 +80,14 @@ struct CompiledKnownPrefixWindow {
     std::uint32_t logical_rows = 2;
     std::uint32_t shared_rows_steps = 0;
     std::uint32_t gdn_rows_steps = 0;
+    std::uint32_t routed_expert_union_steps = 0;
 };
+
+// Complete wide entries do not contribute to the legacy paired-step counter.
+// Admission must cover every closed mode without adding counters that could overflow.
+[[nodiscard]] inline bool known_window_has_promoted_steps(const CompiledKnownPrefixWindow& window) noexcept {
+    return window.r2_steps || window.shared_rows_steps || window.gdn_rows_steps || window.routed_expert_union_steps;
+}
 
 [[nodiscard]] CompiledKnownPrefixWindow compile_known_prefix_window(
     const ModelContract& model, const CompiledSerialExecution& serial,

@@ -16,6 +16,9 @@
 #include "strix/greedy_serving_scheduler.hpp"
 #include "strix/known_prompt_chunks.hpp"
 #include "strix/generation_output.hpp"
+#include "strix/q51_known_rows.hpp"
+#include "strix/offline_tuning_preparation.hpp"
+#include "offline_tuning_build_context.hpp"
 #include "strix/hip_model_residency.hpp"
 #include "strix/hip_runtime_allocator.hpp"
 #include "strix/hip_session_snapshot_transfer.hpp"
@@ -433,10 +436,14 @@ public:
     KnownPromptMemory(const strix::CompiledKnownPrefixWindow& plan, std::uint64_t arena_generation,
         std::uint64_t status_generation,
         std::shared_ptr<const void> retained, std::shared_ptr<const strix::HipSetupQuiescenceGuard> guard,
-        std::uint64_t serial_identity = 0, std::uint64_t serial_status_generation = 0)
+        std::uint64_t serial_identity = 0, std::uint64_t serial_status_generation = 0,
+        std::uint64_t union_bytes = 0, std::uint64_t union_generation = 0)
         : retained_(std::move(retained)), guard_(std::move(guard)) {
         if (!retained_ || !guard_) throw std::invalid_argument("known prompt requires retained original resources");
         scratch = {plan.window_execution_identity, 0, plan.arena.physical.total_bytes, arena_generation};
+        if ((union_bytes == 0) != (union_generation == 0) || union_bytes > 65536U)
+            throw std::invalid_argument("known prompt union workspace exceeds its separate 64KiB setup budget");
+        union_scratch = {union_bytes ? plan.window_execution_identity : 0, 0, union_bytes, union_generation};
         if ((serial_identity == 0) != (serial_status_generation == 0))
             throw std::invalid_argument("known memory serial status requires both identity and generation");
         if (!scratch.execution_identity || !scratch.arena_bytes || !arena_generation || !status_generation)
@@ -449,6 +456,12 @@ public:
                 check_hip(hipMalloc(&status_, 8), "allocate known-prompt completion record");
                 check_hip(hipMemsetAsync(arena_, 0, static_cast<std::size_t>(scratch.arena_bytes), scope.stream), "initialize known-prompt arena");
                 check_hip(hipMemsetAsync(status_, 0, 8, scope.stream), "initialize known-prompt completion record");
+                if (union_bytes) {
+                    check_hip(hipMalloc(&union_, static_cast<std::size_t>(union_bytes)), "allocate known-prompt expert union workspace");
+                    union_scratch.arena_base = reinterpret_cast<std::uintptr_t>(union_);
+                    if (union_scratch.arena_base % 256U) throw std::runtime_error("known-prompt expert union allocation is not 256-byte aligned");
+                    check_hip(hipMemsetAsync(union_, 0, static_cast<std::size_t>(union_bytes), scope.stream), "initialize known-prompt expert union workspace");
+                }
                 if (serial_identity) {
                     check_hip(hipMalloc(&serial_status_, 8), "allocate prompt-lookup serial completion record");
                     check_hip(hipMemsetAsync(serial_status_, 0, 8, scope.stream), "initialize prompt-lookup serial completion record");
@@ -469,11 +482,14 @@ public:
     KnownPromptMemory(const KnownPromptMemory&) = delete;
     KnownPromptMemory& operator=(const KnownPromptMemory&) = delete;
     strix::ExecutionMemoryBinding scratch;
+    strix::ExecutionMemoryBinding union_scratch;
     strix::HipLaunchContext scope;
     strix::HipLaunchContext serial_scope;
 private:
     void release() noexcept {
         guard_->recover_or_fail_stop();
+        if (union_ && hipFree(union_) != hipSuccess) std::_Exit(3);
+        union_ = nullptr;
         if (arena_ && hipFree(arena_) != hipSuccess) std::_Exit(3);
         arena_ = nullptr;
         if (serial_status_ && hipFree(serial_status_) != hipSuccess) std::_Exit(3);
@@ -485,7 +501,7 @@ private:
     }
     std::shared_ptr<const void> retained_;
     std::shared_ptr<const strix::HipSetupQuiescenceGuard> guard_;
-    void* arena_ = nullptr; void* status_ = nullptr; void* serial_status_ = nullptr;
+    void* arena_ = nullptr; void* status_ = nullptr; void* serial_status_ = nullptr; void* union_ = nullptr;
 };
 
 // CPU construction precedes scheduler reservation; GPU storage is initialized
@@ -887,12 +903,15 @@ int main(
         throw std::invalid_argument("batched MoE activation requires resolved Q4K A8 gate/up execution");
     if (options.moe_shared_overlap && !options.deferred_moe_status)
         throw std::invalid_argument("MoE shared overlap requires the resolved eager deferred-status owner");
+    std::optional<strix::LoadedOfflineTuningCache> loaded_offline_tuning;
+    if (!options.offline_tuning_cache_path.empty())
+        loaded_offline_tuning.emplace(strix::load_offline_tuning_cache_file(options.offline_tuning_cache_path));
     const std::string ple_cpu_helper_receipt = options.ple_cpu_helper_threads
         ? "  \"ple_cpu_helper_budget_requested\":" + std::to_string(options.ple_cpu_helper_threads) + ",\n" +
           "  \"ple_cpu_helper_budget_scope\":\"per-planned-backend-including-coordinator-excluding-custom-source-internal-threads\",\n" +
           "  \"ple_cpu_helpers_actual\":null,\n"
         : std::string{};
-    const std::string optimization_profile_receipt =
+    std::string optimization_profile_receipt =
         "  \"optimization_profile_requested\": \"" + optimization_profile.requested + "\",\n" +
         "  \"optimization_profile_selected\": \"" + optimization_profile.selected + "\",\n" +
         "  \"optimization_profile_reason\": \"" + optimization_profile.reason + "\",\n" +
@@ -1177,6 +1196,94 @@ int main(
             binding_request,
             buffer_request,
             256);
+    std::optional<strix::PreparedOfflineTuning> offline_tuning_owner;
+    std::optional<strix::kernels::OfflineTuningPlan> offline_tuning_plan;
+    if (loaded_offline_tuning) {
+        original_work_device->require_original();
+        hipDeviceProp_t properties{};
+        check_hip(hipGetDeviceProperties(&properties, original_work_device->device_index()), "observe offline tuning device properties");
+        int runtime_version = 0, driver_version = 0;
+        check_hip(hipRuntimeGetVersion(&runtime_version), "observe offline tuning runtime version");
+        check_hip(hipDriverGetVersion(&driver_version), "observe offline tuning driver version");
+        original_work_device->require_original();
+        if (!std::memchr(properties.name, '\0', sizeof(properties.name)))
+            throw std::invalid_argument("offline tuning runtime SKU is not bounded");
+        const auto declared = strix::decode_cli::offline_tuning_declared_build_context_hex;
+        const auto declared_sha = strix::model_content_identity_hex(strix::sha256_bytes(
+            std::as_bytes(std::span(declared.data(), declared.size()))));
+        strix::OfflineTuningLiveContext live;
+        live.gfx_target = original_work_device->architecture();
+        live.device_sku = std::string(properties.name) + ";processor-count-domain=HIP-reported-multiprocessorCount";
+        if (properties.multiProcessorCount > 0)
+            live.runtime_reported_processor_count = static_cast<std::uint32_t>(properties.multiProcessorCount);
+        live.hip_identity = "runtime:" + std::to_string(runtime_version) + ";driver:" + std::to_string(driver_version) +
+            ";declared-cmake-context:" + declared_sha;
+        std::string binary_identity_source = "unavailable";
+#if defined(__linux__)
+        std::error_code executable_error;
+        const auto executable = std::filesystem::canonical("/proc/self/exe", executable_error);
+        if (!executable_error && !executable.empty()) {
+            // Hash the process inode, not a pathname that could be replaced
+            // after canonicalization. No model bytes are rehashed here.
+            live.binary_sha256 = strix::model_content_identity_hex(strix::sha256_file_content("/proc/self/exe"));
+            binary_identity_source = "canonical-proc-self-exe-inode-setup-once";
+        }
+#endif
+        live.model_content_sha256 = strix::model_content_identity_hex(mapped.content_identity());
+        live.compiler_flags_sha256 = std::string(strix::decode_cli::offline_tuning_live_compiler_flags_sha256);
+        live.context_tokens = options.context_tokens;
+        strix::SerialSessionStateLayoutRequest tuning_state_request;
+        tuning_state_request.context_tokens = options.context_tokens;
+        tuning_state_request.recurrent_storage = options.gdn_recurrent_storage;
+        live.state_layout_identity = strix::build_serial_session_state_layout(model, tuning_state_request).layout_identity;
+        live.memory_regime = std::string(options.residency == strix::HipModelResidencyMode::registered_file_mapping ?
+            "configured-registered-mapping" : "configured-copy") + ";coalesce:" + std::to_string(options.coalesce_gap_bytes) +
+            ";planned-PLE:" + std::to_string(options.planned_ple_io) + ";PLE-helper-cap:" + std::to_string(options.ple_cpu_helper_threads);
+        live.resolved_configuration = "baseline-kernel-plan:" + std::to_string(compiled.kernel_plan_identity) +
+            ";baseline-execution:" + std::to_string(compiled.execution_identity) + ";prepared:" + std::to_string(options.prepared_eager) +
+            ";overlap:" + std::to_string(options.moe_shared_overlap) + ";GPU-scalar:" + std::to_string(options.gpu_greedy_token);
+        for (const auto* name : {"GPU_MAX_HW_QUEUES", "HSA_ENABLE_SDMA", "HSA_OVERRIDE_GFX_VERSION", "AMD_SERIALIZE_KERNEL",
+                "AMD_SERIALIZE_COPY", "HIP_LAUNCH_BLOCKING", "HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES"}) {
+            live.resolved_configuration += ';'; live.resolved_configuration += name; live.resolved_configuration += '=';
+            if (const auto* value = std::getenv(name)) {
+                std::size_t size = 0;
+                while (size <= 4096U && value[size]) ++size;
+                if (size > 4096U) throw std::invalid_argument("offline tuning runtime setting is oversized");
+                live.resolved_configuration.append(value,size);
+            } else live.resolved_configuration += "<absent>";
+        }
+        const auto tuning_access = strix::compile_execution_tensor_access_plan(compiled.execution, manifest, tensor_index,
+            strix::build_serial_execution_tensor_requirements(compiled.execution));
+        offline_tuning_owner.emplace(std::move(*loaded_offline_tuning), live, model, compiled, manifest, tuning_access,
+            kernel_registry, binding_request);
+        loaded_offline_tuning.reset();
+        offline_tuning_plan = offline_tuning_owner->plan();
+        binding_request.offline_tuning = &*offline_tuning_plan;
+        // The only tuned query is preparation. All owners/spans outlive binding
+        // and execution; no file load, model hash or tuning search per token.
+        compiled = strix::compile_serial_execution(model, kernel_registry, binding_request, buffer_request, 256);
+        std::array<std::uint64_t,5> reasons{};
+        for (const auto& binding : compiled.bindings.bindings)
+            if (binding.tuning_selection_reason) {
+                const auto index = static_cast<std::size_t>(*binding.tuning_selection_reason);
+                if (index >= reasons.size()) throw std::logic_error("unknown offline tuning selection reason");
+                ++reasons[index];
+            }
+        optimization_profile_receipt += "  \"offline_tuning_cache_sha256\":\"" + offline_tuning_owner->payload_sha256() + "\",\n" +
+            "  \"offline_tuning_cache_bytes\":" + std::to_string(offline_tuning_owner->payload_bytes()) + ",\n" +
+            "  \"offline_tuning_cache_records\":" + std::to_string(offline_tuning_owner->record_count()) + ",\n" +
+            "  \"offline_tuning_declared_cmake_context_sha256\":\"" + declared_sha + "\",\n" +
+            "  \"offline_tuning_build_context_provenance\":\"DECLARED-CMake-not-observed-or-attested-argv\",\n" +
+            "  \"offline_tuning_compiler_flags_provenance\":\"" + std::string(strix::decode_cli::offline_tuning_flags_provenance) + "\",\n" +
+            "  \"offline_tuning_compiler_flags_sha256\":null,\n" +
+            "  \"offline_tuning_runtime_reported_processor_count\":" + std::to_string(live.runtime_reported_processor_count) + ",\n" +
+            "  \"offline_tuning_processor_count_scope\":\"HIP-multiprocessorCount-not-physical-CU-proof\",\n" +
+            "  \"offline_tuning_binary_sha256\":" + (live.binary_sha256.empty() ? "null" : "\"" + live.binary_sha256 + "\"") + ",\n" +
+            "  \"offline_tuning_binary_identity_source\":\"" + binary_identity_source + "\",\n" +
+            "  \"offline_tuning_selection_reason_counts\":{\"qualified_record\":" + std::to_string(reasons[0]) +
+            ",\"invalid_key\":" + std::to_string(reasons[1]) + ",\"ambiguous_records\":" + std::to_string(reasons[2]) +
+            ",\"no_qualified_record\":" + std::to_string(reasons[3]) + ",\"selection_policy_mismatch\":" + std::to_string(reasons[4]) + "},\n";
+    }
     std::optional<strix::MoeForkJoinArenaPlan> overlap_arena;
     if (options.moe_shared_overlap) {
         overlap_arena.emplace(strix::prepare_moe_fork_join_arena(
@@ -2186,20 +2293,33 @@ int main(
         } lookup_stats;
         if (options.known_prefix_window || options.prompt_lookup) {
             known_prefix_plan = strix::compile_known_prefix_window(model, compiled, manifest, tensor_access,
-                {true, true, true, options.known_prefix_window ? options.known_prefix_rows : 2U});
-            if (!known_prefix_plan->r2_steps) throw std::invalid_argument("known prompt has no admitted paired operators");
+                {true, true, true, options.known_prefix_window ? options.known_prefix_rows : 2U, options.known_prefix_expert_union});
+            if (!strix::known_window_has_promoted_steps(*known_prefix_plan))
+                throw std::invalid_argument("known prompt has no admitted known-window operators");
             if (model.vocab_size > std::numeric_limits<std::uint32_t>::max())
                 throw std::invalid_argument("known-prompt vocabulary exceeds uint32");
+            std::uint64_t union_bytes = 0;
+            if (options.known_prefix_expert_union && known_prefix_plan->routed_expert_union_steps) {
+                if (model.num_experts > UINT32_MAX || model.num_experts_per_token > UINT32_MAX)
+                    throw std::invalid_argument("known-prefix expert union geometry exceeds uint32");
+                union_bytes = strix::q51_known_rows::required_scratch_bytes(known_prefix_plan->logical_rows,
+                    static_cast<std::uint32_t>(model.num_experts), static_cast<std::uint32_t>(model.num_experts_per_token));
+                if (!union_bytes || union_bytes > 65536U)
+                    throw std::invalid_argument("known-prefix expert union exceeds separate 64KiB setup budget");
+            }
             const auto arena_generation = generations.next();
             const auto status_generation = generations.next();
             known_prefix_memory = std::make_shared<KnownPromptMemory>(*known_prefix_plan, arena_generation,
                 status_generation,
                 std::static_pointer_cast<const void>(experiment_owner), original_work_device,
                 options.prompt_lookup ? compiled.execution_identity : 0,
-                options.prompt_lookup ? generations.next() : 0);
+                options.prompt_lookup ? generations.next() : 0,
+                union_bytes, union_bytes ? generations.next() : 0);
             known_prefix_owner = std::make_shared<strix::HipKnownPrefixWindow>(*known_prefix_plan, compiled, model,
                 catalog_config, resources, known_prefix_memory->scratch, known_prefix_memory->scope,
-                std::static_pointer_cast<const void>(known_prefix_memory));
+                std::static_pointer_cast<const void>(known_prefix_memory),
+                union_bytes ? strix::q51_known_rows::Workspace{known_prefix_memory->union_scratch,
+                    std::static_pointer_cast<const void>(known_prefix_memory)} : strix::q51_known_rows::Workspace{});
             if (options.known_prefix_window)
                 known_prefix_backend = std::make_unique<strix::HipKnownPromptBackend>(known_prefix_owner, session,
                     known_prefix_memory->scratch, model.vocab_size, original_work_device);
@@ -2374,6 +2494,20 @@ int main(
             std::cout.precision(previous_precision);
         }
         if (known_prefix_result) {
+            if (const auto latest = known_prefix_owner->latest_routed_union_observation()) {
+                const auto& group = latest->group;
+                std::cout << "  \"known_prefix_expert_union_latest_group\":{\"scope\":\"latest-completed-window-last-eligible-layer\","
+                    << "\"first_position\":" << latest->first_position << ",\"layer\":" << latest->layer
+                    << ",\"status\":" << group.status << ",\"version\":" << group.version
+                    << ",\"logical_rows\":" << group.logical_rows << ",\"touched_experts\":" << group.touched
+                    << ",\"batches\":" << group.batches << ",\"assignments\":" << group.assignments
+                    << ",\"duplicate_assignments\":" << group.duplicate_assignments
+                    << ",\"maximum_assignments\":" << group.maximum_assignments << ",\"rows_per_expert_histogram\":[";
+                for (std::size_t i = 0; i < 8U; ++i) std::cout << (i ? "," : "") << group.rows_per_expert_histogram[i];
+                std::cout << "],\"batch_size_histogram\":[";
+                for (std::size_t i = 0; i < 8U; ++i) std::cout << (i ? "," : "") << group.batch_size_histogram[i];
+                std::cout << "],\"histogram_bucket_rows\":\"index-plus-one\",\"whole-model-aggregation\":false},\n";
+            }
             const auto observed = known_prefix_backend->stats();
             std::array<std::uint64_t, strix::known_window_r2_variant_slots> compiled_variants{};
             for (const auto variant : known_prefix_plan->r2_variant) {
@@ -2381,7 +2515,15 @@ int main(
                 if (index >= compiled_variants.size()) throw std::logic_error("unknown prompt variant in source receipt");
                 if (index) ++compiled_variants[index];
             }
-            std::cout << "  \"known_prefix_logical_rows\":" << known_prefix_plan->logical_rows << ",\n"
+            std::cout << "  \"known_prefix_expert_union_requested\":" << (options.known_prefix_expert_union ? "true" : "false") << ",\n"
+                      << "  \"known_prefix_expert_union_source_steps\":" << known_prefix_plan->routed_expert_union_steps << ",\n"
+                      << "  \"known_prefix_expert_union_workspace_budget_bytes\":" << (options.known_prefix_expert_union ? 65536U : 0U) << ",\n"
+                      << "  \"known_prefix_expert_union_workspace_reserved_bytes\":" << known_prefix_memory->union_scratch.arena_bytes << ",\n"
+                      << "  \"known_prefix_expert_union_workspace_generation\":" << known_prefix_memory->union_scratch.allocation_generation << ",\n"
+                      << "  \"known_prefix_expert_union_workspace_lifetime\":\"setup-allocation-retained-until-original-device-quiescence-no-per-call-allocation\",\n"
+                      << "  \"known_prefix_expert_union_reason\":\"" << (!options.known_prefix_expert_union ? "not-requested" :
+                          known_prefix_plan->routed_expert_union_steps ? "eligible-closed-variants" : "no-eligible-routed-q51-steps-fallback") << "\",\n"
+                      << "  \"known_prefix_logical_rows\":" << known_prefix_plan->logical_rows << ",\n"
                       << "  \"known_prefix_suffix_policy\":\"unpadded-serial-R1\",\n"
                       << "  \"known_prefix_projection_dispatch_accounting\":\"actual-closed-variant-table-not-logical-row-inference\",\n"
                       << "  \"known_prefix_chunk_cursor\":true,\n"
@@ -2392,6 +2534,7 @@ int main(
                 << "  \"known_prefix_native_completed_input_rows\":" << observed.completed_input_rows << ",\n"
                 << "  \"known_prefix_native_shared_rows_dispatches\":" << observed.shared_rows_dispatches << ",\n"
                 << "  \"known_prefix_native_gdn_rows_dispatches\":" << observed.gdn_rows_dispatches << ",\n"
+                << "  \"known_prefix_routed_expert_union_dispatches\":" << observed.routed_expert_union_dispatches << ",\n"
                 << "  \"known_prefix_r2_dispatches\":" << observed.r2_dispatches << ",\n"
                 << "  \"known_prefix_row_loop_dispatches\":" << observed.row_loop_dispatches << ",\n"
                 << "  \"known_prefix_logical_projection_weight_bytes_avoided\":" << observed.logical_projection_weight_bytes_avoided << ",\n"
@@ -2400,9 +2543,10 @@ int main(
             for (std::size_t i = 0; i < observed.r2_variant_dispatches.size(); ++i)
                 std::cout << (i ? "," : "") << observed.r2_variant_dispatches[i];
             std::cout << "],\n  \"known_prefix_variant_names\":[";
-            constexpr std::array<std::string_view, 8> variant_names{
+            constexpr std::array<std::string_view, 11> variant_names{
                 "none", "shared-q8-rows2", "gdn-all-q8-pair-tiles", "gdn-q8-rows2-f32-gates-r1",
-                "shared-q8-rows4", "shared-q8-rows8", "gdn-q8-rows4-f32-gates-r1", "gdn-q8-rows8-f32-gates-r1"};
+                "shared-q8-rows4", "shared-q8-rows8", "gdn-q8-rows4-f32-gates-r1", "gdn-q8-rows8-f32-gates-r1",
+                "routed-q51-union-rows2", "routed-q51-union-rows4", "routed-q51-union-rows8"};
             for (std::size_t i = 0; i < compiled_variants.size(); ++i) {
                 if (i >= variant_names.size()) throw std::logic_error("unknown known-prefix variant name");
                 std::cout << (i ? "," : "") << '"' << variant_names[i] << '"';

@@ -177,6 +177,8 @@ struct Options {
     std::uint32_t ple_cpu_helper_threads = 0;
     bool ple_cpu_helper_threads_explicit = false;
     std::vector<std::uint32_t> logprob_token_ids;
+    bool known_prefix_expert_union = false;
+    std::string offline_tuning_cache_path;
 };
 
 inline bool is_low_level_optimization_option(std::string_view argument) {
@@ -261,11 +263,16 @@ inline void validate_resolved_known_prefix_window(const Options& options) {
     if (options.known_prefix_rows != 2 && options.known_prefix_rows != 4 && options.known_prefix_rows != 8)
         throw std::invalid_argument("known-prefix rows must be 2, 4 or 8");
     if (!options.known_prefix_window) {
+        if (options.known_prefix_expert_union)
+            throw std::invalid_argument("known-prefix expert union requires --known-prefix-window");
         if (options.known_prefix_rows_explicit || options.known_prefix_rows != 2)
             throw std::invalid_argument("known-prefix rows require --known-prefix-window");
         return;
     }
     if (options.prompt_lookup) throw std::invalid_argument("known prefix and prompt lookup are separate request routes");
+    if (options.known_prefix_expert_union && (!options.q4k_a8g32_gate_up || !options.grouped_exact_q51_down ||
+        !options.q51_slot_parallel_down || !options.deferred_moe_status))
+        throw std::invalid_argument("known-prefix expert union requires resolved A8/grouped Q5_1/slot-parallel/D1");
     if (!options.generate_tokens || options.execution.mode != strix::DecodeExecutionMode::eager ||
         options.execution.integer_head != strix::DecodeIntegerHead::none || options.gpu_greedy_token ||
         options.prepared_eager || options.moe_shared_overlap || options.gdn_islands || options.prefix_cache_roundtrip ||
@@ -366,7 +373,7 @@ inline Options parse_options(
         throw std::invalid_argument(
             "usage: strix-hip-decode-token MODEL.gguf [TOKEN_ID ...] "
             "[--optimization-profile auto|manual] [--execution-inventory] [--host-dispatch-telemetry] [--execution-telemetry-trace] "
-            "[--gpu-greedy-token] [--logprob-token ID ...] [--gdn-recurrent-layout baseline|stride32|stride33|transposed] [--gdn-recurrent-storage key-value|value-key] [--known-prefix-window --known-prefix-rows 2|4|8] [--prompt-lookup] [--prompt-lookup-depth 0|1|2] [--serve-prefix-u32le FILE ... --serve-concurrency 1|2|4 --serve-memory-budget-bytes N --serve-request-budget-bytes N --serve-headroom-bytes N] [--gdn-islands] [--qsa-hierarchical-selection] [--qsa-gqa-heads-per-block 1|2|4] [--prepared-eager] [--moe-shared-overlap] [--moe-overlap-arena-budget-bytes N] [--batched-moe-activation] [--validation-final-state DIR] [--validation-final-state-max-bytes N] [--reference FILE] [--max-logit-error X] "
+            "[--gpu-greedy-token] [--logprob-token ID ...] [--offline-tuning-cache FILE] [--gdn-recurrent-layout baseline|stride32|stride33|transposed] [--gdn-recurrent-storage key-value|value-key] [--known-prefix-window --known-prefix-rows 2|4|8 --known-prefix-expert-union] [--prompt-lookup] [--prompt-lookup-depth 0|1|2] [--serve-prefix-u32le FILE ... --serve-concurrency 1|2|4 --serve-memory-budget-bytes N --serve-request-budget-bytes N --serve-headroom-bytes N] [--gdn-islands] [--qsa-hierarchical-selection] [--qsa-gqa-heads-per-block 1|2|4] [--prepared-eager] [--moe-shared-overlap] [--moe-overlap-arena-budget-bytes N] [--batched-moe-activation] [--validation-final-state DIR] [--validation-final-state-max-bytes N] [--reference FILE] [--max-logit-error X] "
             "[--context N] [--residency register|copy] [--coalesce-gap BYTES] "
             "[--planned-ple-io] [--ple-cpu-helper-threads 1..8] [--ple-max-rows-per-io N] [--ple-max-inflight-ios N] "
             "[--generate N] [--eos-token TOKEN_ID] [--prefix-cache-roundtrip] "
@@ -442,6 +449,12 @@ inline Options parse_options(
             options.prompt_lookup_depth_explicit = true;
             continue;
         }
+        if (argument == "--offline-tuning-cache") {
+            if (!options.offline_tuning_cache_path.empty()) throw std::invalid_argument("duplicate offline tuning cache option");
+            if (index + 1 >= argc || !*argv[index + 1]) throw std::invalid_argument("offline tuning cache requires a file");
+            options.offline_tuning_cache_path = argv[++index];
+            continue;
+        }
         if (argument == "--logprob-token") {
             if (index + 1 >= argc) throw std::invalid_argument("logprob token requires an ID");
             if (options.logprob_token_ids.size() == 64U) throw std::invalid_argument("requested logprob ID list exceeds 64 entries");
@@ -461,6 +474,11 @@ inline Options parse_options(
             if (rows != 2 && rows != 4 && rows != 8) throw std::invalid_argument("known-prefix rows must be 2, 4 or 8");
             options.known_prefix_rows = static_cast<std::uint32_t>(rows);
             options.known_prefix_rows_explicit = true;
+            continue;
+        }
+        if (argument == "--known-prefix-expert-union") {
+            if (options.known_prefix_expert_union) throw std::invalid_argument("duplicate known-prefix expert union option");
+            options.known_prefix_expert_union = true;
             continue;
         }
         if (argument == "--known-prefix-window") {
@@ -980,6 +998,8 @@ inline Options parse_options(
     if (options.serving_prefix_files.empty() && (options.serving_concurrency_explicit || options.serving_memory_explicit ||
         options.serving_request_explicit || options.serving_headroom_explicit))
         throw std::invalid_argument("serving controls require --serve-prefix-u32le");
+    if (options.known_prefix_expert_union && !options.known_prefix_window)
+        throw std::invalid_argument("known-prefix expert union requires --known-prefix-window");
     if (options.known_prefix_rows_explicit && !options.known_prefix_window)
         throw std::invalid_argument("known-prefix rows require --known-prefix-window");
     if (options.prompt_lookup_depth_explicit && !options.prompt_lookup)

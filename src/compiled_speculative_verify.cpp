@@ -445,6 +445,13 @@ bool known_shared_id(std::string_view id) {
     return id == known_shared_base || id == std::string(known_shared_base) +
         std::string(shared_expert_prefetch::kernel_suffix);
 }
+bool known_routed_union_id(std::string_view id) {
+    constexpr std::string_view base="hip.moe_experts.bf16.h2560.m640.e512.k10.r1.c1";
+    constexpr std::string_view suffix=".deferred-status-v1.q51-slot-parallel-v1"
+        ".grouped-exact-q51-down-v1.q4k-a8g32-gateup-v2";
+    return id==std::string(base)+std::string(suffix) ||
+        id==std::string(base)+".batched-slot-activation-v1"+std::string(suffix);
+}
 const ManifestTensor& window_tensor(const ModelManifest& manifest,
     const ExecutionTensorAccessPlan& access, std::uint32_t step, SerialOp op,
     std::uint32_t layer, std::string_view suffix) {
@@ -457,7 +464,8 @@ const ManifestTensor& window_tensor(const ModelManifest& manifest,
     }
     window_require(selected != nullptr && selected->layer == layer,
         "known window promoted tensor family is missing or has the wrong layer");
-    const auto role = suffix.starts_with("attn_") ? TensorRole::attention_projection :
+    const auto role = suffix.ends_with("_exps.weight") ? TensorRole::moe_expert :
+        suffix.starts_with("attn_") ? TensorRole::attention_projection :
         suffix.starts_with("ssm_") ? TensorRole::recurrent_state : TensorRole::dense_projection;
     window_require(selected->role == role, "known window promoted tensor role is invalid");
     unsigned matches = 0;
@@ -470,6 +478,27 @@ const ManifestTensor& window_tensor(const ModelManifest& manifest,
     }
     window_require(matches == 1, "known window promoted tensor is not selected exactly once");
     return *selected;
+}
+bool window_routed_union_types(const ModelManifest& manifest, const ExecutionTensorAccessPlan& access,
+    const ExecutionStep& step) {
+    bool eligible=true;
+    for(const auto suffix:{"ffn_gate_exps.weight","ffn_up_exps.weight","ffn_down_exps.weight"}) {
+        const bool down=std::string_view(suffix)=="ffn_down_exps.weight";
+        const auto width=down?640ULL:2560ULL, outputs=down?2560ULL:640ULL;
+        const auto& tensor=window_tensor(manifest,access,step.id,step.op,*step.layer,suffix);
+        window_require(tensor.dimensions==std::vector<std::uint64_t>{width,outputs,512ULL},
+            "known window routed expert shape differs from canonical operands");
+        if(tensor.ggml_type!=(down?7U:12U)) {eligible=false;continue;}
+        const auto bytes=down?(width/32ULL*22ULL*outputs*512ULL):(width/256ULL*144ULL*outputs*512ULL);
+        window_require(tensor.byte_size==bytes && tensor.absolute_offset%16U==0 &&
+            bytes<=std::numeric_limits<std::uint64_t>::max()-tensor.absolute_offset,
+            "known window routed expert extent/alignment is invalid");
+    }
+    return eligible;
+}
+KnownWindowR2Variant routed_union_variant(std::uint32_t rows) {
+    return rows==2U?KnownWindowR2Variant::routed_q51_union_rows2_v1:
+        rows==4U?KnownWindowR2Variant::routed_q51_union_rows4_v1:KnownWindowR2Variant::routed_q51_union_rows8_v1;
 }
 bool window_matrix(const ManifestTensor& tensor, std::uint64_t width, std::uint64_t rows) {
     window_require(tensor.dimensions == std::vector<std::uint64_t>{width, rows},
@@ -538,7 +567,7 @@ std::pair<std::uint64_t, std::uint64_t> known_window_identities(
     auto kernel = fnv_offset; window_hash_text(kernel, window.logical_rows==2U ? "known-window-r2-kernels-v1" : "known-window-rows-kernels-v1");
     if(window.logical_rows!=2U) hash_u64(kernel,window.logical_rows);
     hash_u64(kernel, serial.kernel_plan_identity); hash_u64(kernel, window.mode.size());
-    std::uint32_t r2 = 0, loops = 0, runtime = 0, shared_rows = 0, gdn_rows = 0;
+    std::uint32_t r2 = 0, loops = 0, runtime = 0, shared_rows = 0, gdn_rows = 0, routed_union=0;
     std::uint64_t avoided = 0;
     std::uint32_t launches = 0;
     for (std::size_t i = 0; i < window.mode.size(); ++i) {
@@ -566,6 +595,13 @@ std::pair<std::uint64_t, std::uint64_t> known_window_identities(
                 "known window GDN rows variant/source ID mismatch");
             ++gdn_rows; avoided+=known_gdn_q8_large_projection_bytes*(window.logical_rows-1U);
             launches+=3U*(window.logical_rows-1U);
+        } else if (mode==KnownWindowStepMode::routed_expert_union) {
+            window_require(step.op==SerialOp::moe_experts && binding.kernel_id &&
+                known_routed_union_id(*binding.kernel_id) && variant==routed_union_variant(window.logical_rows),
+                "known window routed expert union variant/source ID mismatch");
+            ++routed_union;
+            // Routes are device results. No static weight-byte or launch-saving
+            // claim is inferred before the actual union has been constructed.
         } else if (mode == KnownWindowStepMode::r2_gdn_staged) {
             window_require(step.op == SerialOp::gated_delta_net &&
                 (variant == KnownWindowR2Variant::gdn_q8_virtual256_r2_v1 ||
@@ -583,7 +619,8 @@ std::pair<std::uint64_t, std::uint64_t> known_window_identities(
         if (binding.kernel_id) window_hash_text(kernel, *binding.kernel_id);
     }
     window_require(r2 == window.r2_steps && loops == window.row_loop_steps && runtime == window.runtime_row_steps &&
-        shared_rows==window.shared_rows_steps && gdn_rows==window.gdn_rows_steps,
+        shared_rows==window.shared_rows_steps && gdn_rows==window.gdn_rows_steps &&
+        routed_union==window.routed_expert_union_steps,
         "known window counters do not match its actual mode table");
     window_require(avoided == window.logical_projection_weight_bytes_avoided &&
         launches == window.projection_launches_saved,
@@ -683,10 +720,16 @@ CompiledKnownPrefixWindow compile_known_prefix_window(
                 output.projection_launches_saved += (mixed ? 3U : 5U)*saved_copies;
             }
         }
+        if(request.routed_expert_union && step.op==SerialOp::moe_experts && binding.kernel_id &&
+            known_routed_union_id(*binding.kernel_id) && window_routed_union_types(manifest,tensor_access,step)) {
+            output.mode[i]=KnownWindowStepMode::routed_expert_union;
+            output.r2_variant[i]=routed_union_variant(output.logical_rows);
+        }
         if (output.mode[i] == KnownWindowStepMode::r1_row_loop) {
             ++output.row_loop_steps; if (binding.host_or_runtime_step) ++output.runtime_row_steps;
         } else if(output.mode[i]==KnownWindowStepMode::shared_rows) ++output.shared_rows_steps;
         else if(output.mode[i]==KnownWindowStepMode::gdn_rows) ++output.gdn_rows_steps;
+        else if(output.mode[i]==KnownWindowStepMode::routed_expert_union) ++output.routed_expert_union_steps;
         else ++output.r2_steps;
     }
     const auto identities = known_window_identities(output, serial);
@@ -743,6 +786,9 @@ void validate_known_prefix_window_formats(
         if (window.mode[i] == KnownWindowStepMode::r2_shared_q8 || window.mode[i] == KnownWindowStepMode::shared_rows) {
             window_require(window_shared_types(manifest, tensor_access, step),
                 "known window shared variant differs from the selected tensor formats");
+        } else if(window.mode[i]==KnownWindowStepMode::routed_expert_union) {
+            window_require(window_routed_union_types(manifest,tensor_access,step),
+                "known window routed union differs from the selected tensor formats");
         } else if (window.mode[i] == KnownWindowStepMode::r2_gdn_staged || window.mode[i] == KnownWindowStepMode::gdn_rows) {
             const auto expected = window.r2_variant[i] == KnownWindowR2Variant::gdn_q8_virtual256_r2_v1 ?
                 WindowGdnFormat::all_q8 : WindowGdnFormat::q8_large_f32_gates;

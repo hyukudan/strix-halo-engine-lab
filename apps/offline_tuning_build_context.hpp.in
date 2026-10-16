@@ -1,0 +1,10 @@
+#pragma once
+#include <string_view>
+namespace strix::decode_cli {
+// DECLARED CMake configuration, not observed compiler argv or attestation.
+inline constexpr std::string_view offline_tuning_declared_build_context_hex = "@STRIX_DECLARED_BUILD_CONTEXT_HEX@";
+// Per-source HIP options and evaluated compiler invocations are heterogeneous.
+// Until a complete representation is supplied by the build, fail closed.
+inline constexpr std::string_view offline_tuning_live_compiler_flags_sha256 = "";
+inline constexpr std::string_view offline_tuning_flags_provenance = "unknown-heterogeneous-per-source-options-not-observed-argv";
+}

@@ -125,7 +125,8 @@ struct KnownFixture {
     strix::ModelManifest manifest;
     strix::ExecutionTensorAccessPlan access;
 };
-KnownFixture make_known_fixture(const strix::ModelContract& model, std::uint32_t gate_type = 8U) {
+KnownFixture make_known_fixture(const strix::ModelContract& model, std::uint32_t gate_type = 8U,
+    bool routed_union = false) {
     KnownFixture fixture;
     fixture.serial.execution = strix::build_serial_decode_execution_plan(model);
     fixture.serial.io = strix::build_serial_execution_io_plan(fixture.serial.execution);
@@ -159,13 +160,15 @@ KnownFixture make_known_fixture(const strix::ModelContract& model, std::uint32_t
         const auto tensor = [&](std::string suffix, std::vector<std::uint64_t> dimensions, std::uint32_t type) {
             strix::ManifestTensor value;
             value.name = "blk." + std::to_string(*step.layer) + "." + suffix;
-            value.role = suffix.starts_with("attn_") ? strix::TensorRole::attention_projection :
+            value.role = suffix.ends_with("_exps.weight") ? strix::TensorRole::moe_expert :
+                suffix.starts_with("attn_") ? strix::TensorRole::attention_projection :
                 suffix.starts_with("ssm_") ? strix::TensorRole::recurrent_state : strix::TensorRole::dense_projection;
             value.layer = step.layer; value.dimensions = std::move(dimensions); value.ggml_type = type;
             value.absolute_offset = offset;
             std::uint64_t elements = 1;
             for (const auto extent : value.dimensions) elements *= extent;
-            value.byte_size = type == 8 ? value.dimensions[0] / 32U * 34U * value.dimensions[1] : elements * 4U;
+            value.byte_size = type == 8 ? value.dimensions[0] / 32U * 34U * value.dimensions[1] :
+                type==12U ? elements/256U*144U : type==7U ? elements/32U*22U : elements * 4U;
             offset += (value.byte_size + 255U) / 256U * 256U;
             tensors.tensor_indices.push_back(static_cast<std::uint32_t>(fixture.manifest.tensors.size()));
             fixture.manifest.tensors.push_back(std::move(value));
@@ -176,6 +179,12 @@ KnownFixture make_known_fixture(const strix::ModelContract& model, std::uint32_t
             tensor("ffn_up_shexp.weight", {2560,640}, 8);
             tensor("ffn_down_shexp.weight", {640,2560}, 8);
             tensor("ffn_gate_inp_shexp.weight", {2560}, 0);
+        } else if(step.op==strix::SerialOp::moe_experts && routed_union) {
+            binding.kernel_id="hip.moe_experts.bf16.h2560.m640.e512.k10.r1.c1.deferred-status-v1"
+                ".q51-slot-parallel-v1.grouped-exact-q51-down-v1.q4k-a8g32-gateup-v2";
+            tensor("ffn_gate_exps.weight",{2560,640,512},12);
+            tensor("ffn_up_exps.weight",{2560,640,512},12);
+            tensor("ffn_down_exps.weight",{640,2560,512},7);
         } else if (step.op == strix::SerialOp::gated_delta_net) {
             binding.kernel_id = "hip.gdn.bf16.h2560.kh16.vh48.d128.r1.c1.scalar.wave8-input-v1.wave8-q8-output-v1.prefetch8.virtual256.q8-input.virtual256.q8-output";
             tensor("attn_qkv.weight", {2560,10240}, 8);
@@ -329,7 +338,7 @@ void recording_r2_launch(std::span<const strix::ExecutionDispatchContext, 2> row
 }
 
 void recording_rows_preflight(std::span<const strix::ExecutionDispatchContext> rows,void* opaque) {
-    if(rows.size()!=4U && rows.size()!=8U) throw std::invalid_argument("mock wide rows require4/8");
+    if(rows.size()!=2U && rows.size()!=4U && rows.size()!=8U) throw std::invalid_argument("mock joint rows require2/4/8");
     for(std::size_t r=0;r<rows.size();r+=2U)
         recording_r2_preflight(std::span<const strix::ExecutionDispatchContext,2>(rows.data()+r,2U),opaque);
     for(std::size_t r=1;r<rows.size();++r)
@@ -359,10 +368,10 @@ struct KnownRuntimeFixture {
     std::uint32_t quiesces = 0;
 
     explicit KnownRuntimeFixture(const strix::ModelContract& model, bool promote = false, bool mixed = false,
-        std::uint32_t rows = 2)
-        : source(make_known_fixture(model, mixed ? 0U : 8U)),
+        std::uint32_t rows = 2, bool routed_union = false)
+        : source(make_known_fixture(model, mixed ? 0U : 8U,routed_union)),
           window(strix::compile_known_prefix_window(model, source.serial, source.manifest,
-              source.access, {promote, promote, mixed, rows})),
+              source.access, {promote, promote, mixed, rows,routed_union})),
           serial_pool(static_cast<std::size_t>((source.serial.arena.total_bytes + 7U) / 8U)),
           window_pool(static_cast<std::size_t>((window.arena.physical.total_bytes + 7U) / 8U)),
           state_words(7U * 48U, 0) {
@@ -764,11 +773,101 @@ void known_window_wide_runtime_tests(const strix::ModelContract& model) {
     }
 }
 
+void known_window_routed_union_runtime_tests(const strix::ModelContract& model) {
+    using V=strix::KnownWindowR2Variant;
+    for(const std::uint32_t rows:{2U,4U,8U}) {
+        KnownRuntimeFixture baseline(model,false,false,rows,true);
+        std::vector<std::uint64_t> expected;
+        for(const auto token:baseline.tokens) expected.push_back(baseline.serial_token(token));
+        const auto state=baseline.state_words;
+        const auto generations=baseline.session.state.generations;
+        KnownRuntimeFixture grouped(model,false,false,rows,true);
+        const auto variant=rows==2U?V::routed_q51_union_rows2_v1:
+            rows==4U?V::routed_q51_union_rows4_v1:V::routed_q51_union_rows8_v1;
+        const std::array<strix::KnownWindowRowsEntry,1> entries{{
+            {variant,&grouped.trace,&recording_rows_preflight,&recording_rows_launch}}};
+        std::vector<const strix::CompiledLaunchPlan*> plans;
+        for(const auto& plan:grouped.row_launch) plans.push_back(&plan);
+        const auto result=strix::execute_known_prefix_window_eager(grouped.window,grouped.source.serial,
+            grouped.resources,grouped.window_memory,grouped.session,grouped.tokens,plans,{},entries,grouped.hooks());
+        expect(grouped.state_words==state && grouped.session.state.generations==generations &&
+            grouped.session.next_position==rows && grouped.session.committed_tokens==rows,
+            "typed expert union scheduling retains all seven states and exactly one full-window frontier");
+        for(std::uint32_t row=0;row<rows;++row)
+            expect(read_word(result.logits[row].address)==expected[row],"expert union preserves every row's complete output");
+        expect(result.routed_expert_union_dispatches==48U && result.gdn_rows_dispatches==0U &&
+            result.shared_rows_dispatches==0U && result.r2_dispatches==0U &&
+            result.r2_variant_dispatches[static_cast<std::size_t>(variant)]==48U &&
+            result.logical_projection_weight_bytes_avoided==0U && result.projection_launches_saved==0U,
+            "expert union dispatches are explicit and do not masquerade as GDN or static savings");
+        KnownRuntimeFixture missing(model,false,false,rows,true);
+        plans.clear();for(const auto& plan:missing.row_launch) plans.push_back(&plan);
+        bool rejected=false;
+        try{(void)strix::execute_known_prefix_window_eager(missing.window,missing.source.serial,
+            missing.resources,missing.window_memory,missing.session,missing.tokens,plans,{}, {},missing.hooks());}
+        catch(const std::invalid_argument&){rejected=true;}
+        expect(rejected && missing.trace.calls==0U && missing.quiesces==0U && missing.session.next_position==0U,
+            "missing grouped expert callback rejects before dispatch or state mutation");
+    }
+}
+
+void known_window_routed_union_compiler_tests(const strix::ModelContract& model) {
+    using V=strix::KnownWindowR2Variant;
+    using M=strix::KnownWindowStepMode;
+    const auto fixture=make_known_fixture(model,0U,true);
+    for(const std::uint32_t rows:{2U,4U,8U}) {
+        const auto off=strix::compile_known_prefix_window(model,fixture.serial,fixture.manifest,fixture.access,
+            {true,true,true,rows,false});
+        const auto on=strix::compile_known_prefix_window(model,fixture.serial,fixture.manifest,fixture.access,
+            {true,true,true,rows,true});
+        expect(off.routed_expert_union_steps==0U && on.routed_expert_union_steps==48U &&
+            on.row_loop_steps+48U==off.row_loop_steps && on.window_execution_identity!=off.window_execution_identity &&
+            on.window_kernel_plan_identity!=off.window_kernel_plan_identity,
+            "expert union is explicitly selected with distinct whole-window identities");
+        expect(strix::known_window_has_promoted_steps(off) && strix::known_window_has_promoted_steps(on),
+            "CLI admission accepts wide complete operators even when there are no paired steps");
+        expect(on.logical_projection_weight_bytes_avoided==off.logical_projection_weight_bytes_avoided &&
+            on.projection_launches_saved==off.projection_launches_saved,
+            "dynamic routed unions never manufacture static weight or launch savings");
+        const auto expected=rows==2U?V::routed_q51_union_rows2_v1:
+            rows==4U?V::routed_q51_union_rows4_v1:V::routed_q51_union_rows8_v1;
+        std::size_t first=0;
+        for(std::size_t i=0;i<on.mode.size();++i) if(on.mode[i]==M::routed_expert_union) {
+            first=i;
+            expect(on.r2_variant[i]==expected && on.row_plan.back().bindings.bindings[i].kernel_id==
+                fixture.serial.bindings.bindings[i].kernel_id,"union callback retains every incumbent R1 source ID");
+        }
+        strix::validate_known_prefix_window_formats(on,fixture.serial,fixture.manifest,fixture.access);
+        const auto reject=[&](auto&& operation,const char* message) {
+            bool rejected=false;try{operation();}catch(const std::invalid_argument&){rejected=true;}expect(rejected,message);
+        };
+        auto changed=on;++changed.routed_expert_union_steps;
+        reject([&]{strix::validate_compiled_known_prefix_window(changed,fixture.serial);},"forged union counter rejects");
+        changed=on;changed.r2_variant[first]=V::shared_q8_virtual256_r2_v1;
+        reject([&]{strix::validate_compiled_known_prefix_window(changed,fixture.serial);},"wrong union variant rejects");
+        auto malformed=fixture;
+        auto tensor=std::find_if(malformed.manifest.tensors.begin(),malformed.manifest.tensors.end(),
+            [](const auto& t){return t.name=="blk.0.ffn_gate_exps.weight";});
+        expect(tensor!=malformed.manifest.tensors.end(),"union fixture supplies actual routed tensor family");
+        if(tensor==malformed.manifest.tensors.end()) continue;
+        --tensor->byte_size;
+        reject([&]{(void)strix::compile_known_prefix_window(model,malformed.serial,malformed.manifest,
+            malformed.access,{false,false,false,rows,true});},"short routed union weight rejects before callbacks");
+        tensor->ggml_type=13U; // Different gate format remains the real serial fallback.
+        const auto fallback=strix::compile_known_prefix_window(model,malformed.serial,malformed.manifest,
+            malformed.access,{false,false,false,rows,true});
+        expect(fallback.routed_expert_union_steps==47U,"unmatched routed formats retain their original row loop");
+        reject([&]{strix::validate_known_prefix_window_formats(on,malformed.serial,malformed.manifest,malformed.access);},
+            "an already compiled union cannot inherit a changed gate format");
+    }
+}
+
 void known_window_tests(const strix::ModelContract& model) {
     const auto fixture = make_known_fixture(model);
     const auto off = strix::compile_known_prefix_window(model, fixture.serial, fixture.manifest, fixture.access);
     expect(off.r2_steps == 0 && off.row_loop_steps == fixture.serial.execution.steps.size(),
         "known window default never promotes a serial kernel");
+    expect(!strix::known_window_has_promoted_steps(off),"an all-row-loop plan has no promoted operators");
     expect(off.logical_projection_weight_bytes_avoided == 0 && off.projection_launches_saved == 0,
         "all-off row loops claim no logical projection savings");
     const auto on = strix::compile_known_prefix_window(model, fixture.serial, fixture.manifest, fixture.access, {true,true});
@@ -1033,7 +1132,7 @@ void known_window_mixed_format_tests(const strix::ModelContract& model) {
         {Variant::gdn_q8_virtual256_r2_v1, &runtime.trace, &recording_r2_preflight, &recording_r2_launch},
         {Variant::gdn_q8_rows2_f32_gates_r1_v1, &runtime.trace, &recording_r2_preflight, &recording_r2_launch}}};
     const auto result = runtime.run_entries(runtime.hooks(), entries);
-    expect(result.r2_variant_dispatches == std::array<std::uint32_t,4>{0,48,0,36} &&
+    expect(result.r2_variant_dispatches == std::array<std::uint32_t,strix::known_window_r2_variant_slots>{0,48,0,36} &&
         result.r2_dispatches == 84U && result.row_loop_dispatches == 708U &&
         result.projection_launches_saved == 252U && result.logical_projection_weight_bytes_avoided == 2456616960ULL,
         "runtime reports actual closed variant-3 dispatches independently of logical launches");
@@ -1263,6 +1362,8 @@ int main() {
     catch(const std::invalid_argument&){deferred_rejected=true;}
     expect(deferred_rejected,"deferred MoE explicitly rejects speculative verification");
 
+    known_window_routed_union_compiler_tests(model);
+    known_window_routed_union_runtime_tests(model);
     known_window_tests(model);
     known_window_runtime_tests(model);
     known_window_wide_runtime_tests(model);
