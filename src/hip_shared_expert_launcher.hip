@@ -1,5 +1,6 @@
 #include "strix/hip_launch_context.hpp"
 #include "strix/hip_shared_expert_launcher.hpp"
+#include "strix/shared_expert_rows_diagnostic_contract.hpp"
 #if defined(STRIX_BUILD_SHARED_EXPERT_ROWS_DIAGNOSTIC)
 #include "strix/hip_shared_expert_rows_diagnostic.hpp"
 #endif
@@ -941,7 +942,12 @@ void launch_typed(
             output.address),config.prefetch_q8 && shared_expert_prefetch::eligible(*tensors.down.manifest),config.prefetch_stats.get());
 }
 
-void launch_shared_expert(
+struct PreparedSharedExpert {
+    const HipSharedExpertLauncherConfig& config;
+    ExecutionBufferAddress input, output, temporary;
+    SharedTensors tensors;
+};
+PreparedSharedExpert prepare_shared_expert(
     const ExecutionDispatchContext& context,
     void* user_data) {
     if (context.op !=
@@ -1046,6 +1052,25 @@ void launch_shared_expert(
         for(auto v:reads)if(!valid(v))throw std::invalid_argument("shared prefetch read owner invalid");
         for(unsigned i=0;i<writes.size();++i){if(!valid(writes[i]))throw std::invalid_argument("shared prefetch write owner invalid");for(auto v:reads)if(overlap(writes[i],v))throw std::invalid_argument("shared prefetch writable/read alias");for(unsigned j=0;j<i;++j)if(overlap(writes[i],writes[j]))throw std::invalid_argument("shared prefetch writable alias");}
     }
+
+    return {config, input, output, temporary, tensors};
+}
+
+void preflight_shared_expert(const ExecutionDispatchContext& context, void* user_data) {
+    if (const auto* scope = current_hip_launch_context(); scope && scope->graph_capture)
+        throw std::invalid_argument("known-window launcher preflight requires eager scope");
+    static_cast<void>(prepare_shared_expert(context, user_data));
+}
+
+void launch_shared_expert(
+    const ExecutionDispatchContext& context,
+    void* user_data) {
+    const auto prepared = prepare_shared_expert(context, user_data);
+    const auto& config = prepared.config;
+    const auto& input = prepared.input;
+    const auto& output = prepared.output;
+    const auto& temporary = prepared.temporary;
+    const auto& tensors = prepared.tensors;
 
     switch (config.activation) {
     case HipActivationStorage::bf16:
@@ -1235,6 +1260,7 @@ make_hip_shared_expert_launcher(
             *config),
         &launch_shared_expert,
         config,
+        &preflight_shared_expert,
     };
 }
 
@@ -1261,7 +1287,6 @@ register_for_compiled_execution(
 
 }  // namespace strix
 
-#if defined(STRIX_BUILD_SHARED_EXPERT_ROWS_DIAGNOSTIC)
 namespace strix {
 namespace {
 // Each wave handles one output feature and all Rows independent input vectors.
@@ -1354,6 +1379,12 @@ __global__ void shared_rows_q8_projection_kernel(
         }
     }
 }
+} // namespace
+} // namespace strix
+
+#if defined(STRIX_BUILD_SHARED_EXPERT_ROWS_DIAGNOSTIC)
+namespace strix {
+namespace {
 template <unsigned Rows>
 void enqueue_shared_rows_projection(bool down, shared_expert_rows_diagnostic::Shape s,
     shared_expert_rows_diagnostic::Span input, shared_expert_rows_diagnostic::Span weights,
@@ -1449,3 +1480,227 @@ void enqueue(Shape s, Span input, Weights weights, Span workspace, Span output, 
 } // namespace shared_expert_rows_diagnostic
 } // namespace strix
 #endif
+
+namespace strix {
+namespace {
+using KnownSharedSpan = shared_expert_rows_diagnostic::Span;
+struct KnownSharedR2Views {
+    shared_expert_rows_diagnostic::Shape shape;
+    KnownSharedSpan input, workspace, output;
+    shared_expert_rows_diagnostic::Weights weights;
+};
+
+bool known_shared_overlap(KnownSharedSpan left, KnownSharedSpan right) {
+    return left.address < right.address + right.bytes && right.address < left.address + left.bytes;
+}
+void known_shared_range(KnownSharedSpan view) {
+    if (!view.address || !view.bytes || view.bytes > UINTPTR_MAX - view.address)
+        throw std::invalid_argument("known-window shared R2 owner range is invalid");
+}
+std::uint64_t known_shared_stride(const ExecutionBufferAddress& first,
+                                  const ExecutionBufferAddress& second) {
+    if (first.bytes != second.bytes || first.bytes > UINT64_MAX - 255U || second.address <= first.address)
+        throw std::invalid_argument("known-window shared R2 row extent/order differs");
+    const auto expected = (first.bytes + 255U) / 256U * 256U;
+    const auto stride = static_cast<std::uint64_t>(second.address - first.address);
+    if (stride != expected)
+        throw std::invalid_argument("known-window shared R2 row stride differs from serial allocation");
+    return stride;
+}
+const ExecutionMemoryBinding& known_shared_memory(const ExecutionDispatchContext& row) {
+    if (!row.resources || !row.resources->scratch || !row.arena)
+        throw std::invalid_argument("known-window shared R2 requires retained row resources");
+    const auto& memory = *row.resources->scratch;
+    validate_execution_memory_binding(row.execution_identity, *row.arena, memory);
+    if (row.memory && row.memory != row.resources->scratch)
+        throw std::invalid_argument("known-window shared R2 scratch aliases another memory binding");
+    return memory;
+}
+KnownSharedR2Views known_shared_r2_views(std::span<const ExecutionDispatchContext, 2> rows,
+                                       const HipSharedExpertLauncherConfig& config) {
+    validate_config(config);
+    if (config.activation != HipActivationStorage::bf16 || config.hidden_size != 2560U ||
+        config.intermediate_size != 640U)
+        throw std::invalid_argument("known-window shared R2 requires canonical BF16 geometry");
+    if (const auto* scope = current_hip_launch_context(); scope && scope->graph_capture)
+        throw std::invalid_argument("known-window shared R2 is eager only");
+    const auto& first = rows[0];
+    const auto& second = rows[1];
+    if (!first.execution_identity || first.execution_identity != second.execution_identity ||
+        first.op != SerialOp::shared_expert || second.op != first.op || first.step_id != second.step_id ||
+        !first.layer || first.layer != second.layer || first.position == UINT64_MAX ||
+        second.position != first.position + 1U || !first.kernel_id || first.kernel_id != second.kernel_id)
+        throw std::invalid_argument("known-window shared R2 row identity/position differs");
+    ExecutionBindingRequest serial_shape;
+    if (*first.kernel_id != kernel_id(serial_shape, config) ||
+        (config.prefetch_q8 && !shared_expert_prefetch::selected(true, config.prefetch_eligible_layers, first.layer)))
+        throw std::invalid_argument("known-window shared R2 serial base/prefetch ID differs");
+    if (!first.resources || !second.resources ||
+        first.resources->scratch != second.resources->scratch ||
+        first.resources->model_manifest != second.resources->model_manifest ||
+        first.resources->model_weights != second.resources->model_weights ||
+        first.resources->tensor_access != second.resources->tensor_access)
+        throw std::invalid_argument("known-window shared R2 weight/access owners differ");
+    std::array<ExecutionBufferAddress, 2> input{}, output{}, workspace{};
+    std::array<SharedTensors, 2> tensors{};
+    const ExecutionMemoryBinding* shared_memory = nullptr;
+    for (unsigned index = 0; index < 2U; ++index) {
+        const auto& row = rows[index];
+        if (row.prepared_tensor_views || row.prepared_arena_views ||
+            row.logical_rows != 1U || row.request_concurrency != 1U || row.reads.size() != 1U ||
+            row.writes.size() != 1U || row.temporaries.size() != 1U ||
+            row.reads[0] != first.reads[0] || row.writes[0] != first.writes[0] ||
+            row.temporaries[0] != first.temporaries[0])
+            throw std::invalid_argument("known-window shared R2 requires matching C1 row IO");
+        const auto& memory = known_shared_memory(row);
+        if (shared_memory && (memory.arena_base != shared_memory->arena_base ||
+            memory.arena_bytes != shared_memory->arena_bytes ||
+            memory.allocation_generation != shared_memory->allocation_generation))
+            throw std::invalid_argument("known-window shared R2 rows use different allocations");
+        shared_memory = &memory;
+        if (!row.resources->model_manifest || !row.resources->model_weights || !row.resources->tensor_access)
+            throw std::invalid_argument("known-window shared R2 model resources are missing");
+        validate_model_runtime_binding(*row.resources->model_manifest, *row.resources->model_weights);
+        input[index] = resolve_dispatch_read(row, 0);
+        output[index] = resolve_dispatch_write(row, 0);
+        workspace[index] = resolve_dispatch_temporary(row, 0);
+        for (const auto view : {input[index], output[index], workspace[index]}) {
+            known_shared_range({view.address, view.bytes});
+            if (view.allocation_generation != memory.allocation_generation)
+                throw std::invalid_argument("known-window shared R2 resolved allocation is stale");
+        }
+        const auto& access = resolve_dispatch_tensor_access(row, 0);
+        tensors[index] = identify_tensors(row, access, config);
+        const auto validate_weight = [&](const TensorPair& tensor, std::uint32_t width,
+                                         std::uint32_t outputs, std::uint32_t type) {
+            if (!tensor.manifest || !tensor.runtime || tensor.manifest->ggml_type != type ||
+                tensor.manifest->layer != row.layer || !tensor.runtime->allocation_generation ||
+                tensor.manifest->absolute_offset % 16U || tensor.runtime->address % 16U)
+                throw std::invalid_argument("known-window shared R2 tensor type/layer/owner differs");
+            const auto& dims = tensor.manifest->dimensions;
+            if (dims.empty() || dims[0] != width ||
+                (outputs == 1U ? !(dims.size() == 1U || (dims.size() == 2U && dims[1] == 1U)) :
+                                  !(dims.size() == 2U && dims[1] == outputs)))
+                throw std::invalid_argument("known-window shared R2 tensor dimensions differ");
+            validate_tensor(tensor, width, outputs, "known-window shared R2");
+            const auto required = required_weight_bytes(weight_kind(type), width, outputs);
+            if (tensor.manifest->byte_size != required)
+                throw std::invalid_argument("known-window shared R2 tensor byte extent differs");
+            known_shared_range({tensor.runtime->address, tensor.runtime->bytes});
+        };
+        validate_weight(tensors[index].gate, config.hidden_size, config.intermediate_size, 8U);
+        validate_weight(tensors[index].up, config.hidden_size, config.intermediate_size, 8U);
+        validate_weight(tensors[index].down, config.intermediate_size, config.hidden_size, 8U);
+        validate_weight(tensors[index].shared_gate, config.hidden_size, 1U, 0U);
+    }
+    const auto pairs = [](const SharedTensors& value) {
+        return std::array{value.gate, value.up, value.down, value.shared_gate};
+    };
+    const auto row0_weights = pairs(tensors[0]);
+    const auto row1_weights = pairs(tensors[1]);
+    std::array<KnownSharedSpan, 6> reads{};
+    reads[0] = {input[0].address, input[0].bytes}; reads[1] = {input[1].address, input[1].bytes};
+    for (unsigned index = 0; index < 4U; ++index) {
+        const auto& left = *row0_weights[index].runtime;
+        const auto& right = *row1_weights[index].runtime;
+        // Prepared row caches may own separate immutable binding snapshots.
+        // Compare their source tensor and complete physical binding, rather
+        // than requiring the snapshot objects themselves to share an address.
+        if (row0_weights[index].manifest != row1_weights[index].manifest ||
+            left.tensor_index != right.tensor_index || left.storage != right.storage ||
+            left.address != right.address || left.bytes != right.bytes ||
+            left.allocation_generation != right.allocation_generation || left.owner_node != right.owner_node)
+            throw std::invalid_argument("known-window shared R2 resolved weight snapshots differ");
+        reads[index + 2U] = {row0_weights[index].runtime->address, row0_weights[index].runtime->bytes};
+    }
+    const std::array<KnownSharedSpan, 4> writes{{
+        {workspace[0].address, workspace[0].bytes}, {workspace[1].address, workspace[1].bytes},
+        {output[0].address, output[0].bytes}, {output[1].address, output[1].bytes}}};
+    for (unsigned index = 0; index < writes.size(); ++index) {
+        for (const auto read : reads) if (known_shared_overlap(writes[index], read))
+            throw std::invalid_argument("known-window shared R2 cross-row writable/read alias");
+        for (unsigned previous = 0; previous < index; ++previous)
+            if (known_shared_overlap(writes[index], writes[previous]))
+                throw std::invalid_argument("known-window shared R2 cross-row writable alias");
+    }
+    KnownSharedR2Views result;
+    result.shape = {config.hidden_size, config.intermediate_size, 2U,
+        known_shared_stride(input[0], input[1]), known_shared_stride(output[0], output[1]),
+        known_shared_stride(workspace[0], workspace[1])};
+    const auto layout = shared_expert_rows_diagnostic::layout(
+        result.shape, shared_expert_rows_diagnostic::Arm::shared_q8_rows);
+    if (input[0].bytes < static_cast<std::uint64_t>(config.hidden_size) * 2U ||
+        output[0].bytes < static_cast<std::uint64_t>(config.hidden_size) * 2U ||
+        workspace[0].bytes < static_cast<std::uint64_t>(config.intermediate_size) * 8U)
+        throw std::invalid_argument("known-window shared R2 row payload is undersized");
+    result.input = {input[0].address, layout.input_bytes};
+    result.output = {output[0].address, layout.output_bytes};
+    result.workspace = {workspace[0].address, layout.workspace_bytes};
+    result.weights = {{tensors[0].gate.runtime->address, layout.gate_up_weight_bytes},
+        {tensors[0].up.runtime->address, layout.gate_up_weight_bytes},
+        {tensors[0].down.runtime->address, layout.down_weight_bytes},
+        {tensors[0].shared_gate.runtime->address, layout.scalar_weight_bytes}};
+    (void)shared_expert_rows_diagnostic::validate(result.shape, result.input, result.weights,
+        result.workspace, result.output, shared_expert_rows_diagnostic::Arm::shared_q8_rows);
+    return result;
+}
+void known_shared_r2_projection(bool down, const KnownSharedR2Views& views,
+    KnownSharedSpan weight, KnownSharedSpan target, hipStream_t stream,
+    const HipSharedExpertLauncherConfig& config) {
+    const auto& shape = views.shape;
+    if (down) {
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(shared_rows_q8_projection_kernel<2U, true>),
+            dim3((shape.hidden + 7U) / 8U), dim3(256), 0, stream,
+            reinterpret_cast<const void*>(views.workspace.address), shape.workspace_stride_bytes,
+            reinterpret_cast<const void*>(weight.address), shape.intermediate, shape.hidden,
+            reinterpret_cast<void*>(target.address), shape.output_stride_bytes,
+            reinterpret_cast<const float*>(views.workspace.address) + shape.intermediate,
+            shape.workspace_stride_bytes / 4U);
+    } else {
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(shared_rows_q8_projection_kernel<2U, false>),
+            dim3((shape.intermediate + 7U) / 8U), dim3(256), 0, stream,
+            reinterpret_cast<const void*>(views.input.address), shape.input_stride_bytes,
+            reinterpret_cast<const void*>(weight.address), shape.hidden, shape.intermediate,
+            reinterpret_cast<void*>(target.address), shape.workspace_stride_bytes, nullptr, 0ULL);
+    }
+    check_hip(hipGetLastError(), "known-window shared R2 projection launch");
+    if (config.prefetch_q8 && config.prefetch_stats)
+        config.prefetch_stats->dispatched_projections.fetch_add(1, std::memory_order_relaxed);
+}
+} // namespace
+
+void shared_expert_known_window_r2_preflight(std::span<const ExecutionDispatchContext, 2> rows,
+    const HipSharedExpertLauncherConfig& config) {
+    (void)known_shared_r2_views(rows, config);
+}
+void shared_expert_known_window_r2_launch(std::span<const ExecutionDispatchContext, 2> rows,
+    const HipSharedExpertLauncherConfig& config) {
+    const auto views = known_shared_r2_views(rows, config);
+    const auto* scope = current_hip_launch_context();
+    if (!scope || scope->graph_capture || !scope->stream || scope->stream == hipStreamLegacy ||
+        scope->stream == hipStreamPerThread)
+        throw std::invalid_argument("known-window shared R2 requires explicit eager owned stream");
+    hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
+    check_hip(hipStreamIsCapturing(scope->stream, &capture), "known-window shared R2 capture query");
+    if (capture != hipStreamCaptureStatusNone)
+        throw std::invalid_argument("known-window shared R2 cannot run during capture");
+    check_hip(hipPeekAtLastError(), "known-window shared R2 stale launch error");
+    known_shared_r2_projection(false, views, views.weights.gate_q8, views.workspace, scope->stream, config);
+    auto up_target = views.workspace;
+    up_target.address += static_cast<std::uint64_t>(config.intermediate_size) * 4U;
+    known_shared_r2_projection(false, views, views.weights.up_q8, up_target, scope->stream, config);
+    for (unsigned row = 0; row < 2U; ++row) {
+        auto* workspace = reinterpret_cast<float*>(views.workspace.address + row * views.shape.workspace_stride_bytes);
+        const auto* hidden = reinterpret_cast<const std::uint16_t*>(views.input.address + row * views.shape.input_stride_bytes);
+        hipLaunchKernelGGL(gated_activation_kernel, dim3((config.intermediate_size + 255U) / 256U),
+            dim3(256), 0, scope->stream, workspace, config.intermediate_size);
+        check_hip(hipGetLastError(), "known-window shared R2 activation launch");
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(scalar_projection_kernel<std::uint16_t, WeightKind::f32>),
+            dim3(1), dim3(256), 0, scope->stream, hidden,
+            reinterpret_cast<const void*>(views.weights.shared_gate_f32.address), config.hidden_size,
+            workspace + config.intermediate_size);
+        check_hip(hipGetLastError(), "known-window shared R2 scalar launch");
+    }
+    known_shared_r2_projection(true, views, views.weights.down_q8, views.output, scope->stream, config);
+}
+} // namespace strix

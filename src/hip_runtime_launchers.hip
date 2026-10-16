@@ -248,10 +248,7 @@ __global__ void moe_combine_kernel(
         load_activation(&routed[index]));
 }
 
-template <typename Kernel>
-void launch_1d(
-    std::uint64_t elements,
-    Kernel&& launch) {
+std::uint32_t prepare_1d_blocks(std::uint64_t elements) {
     constexpr std::uint32_t threads = 256;
     if (elements == 0) {
         throw std::invalid_argument(
@@ -265,10 +262,14 @@ void launch_1d(
         throw std::overflow_error(
             "HIP elementwise grid exceeds uint32 block count");
     }
-    launch(
-        static_cast<std::uint32_t>(
-            blocks64),
-        threads);
+    return static_cast<std::uint32_t>(blocks64);
+}
+
+template <typename Kernel>
+void launch_1d(
+    std::uint64_t elements,
+    Kernel&& launch) {
+    launch(prepare_1d_blocks(elements), 256U);
     check_hip(
         hipGetLastError(),
         "HIP elementwise kernel launch");
@@ -319,7 +320,11 @@ void launch_hyper_expand_typed(
         });
 }
 
-void launch_hyper_expand(
+struct PreparedHyperExpand {
+    const HipElementwiseLauncherConfig& config;
+    ExecutionBufferAddress input, output;
+};
+PreparedHyperExpand prepare_hyper_expand(
     const ExecutionDispatchContext& context,
     void* user_data) {
     if (context.op !=
@@ -366,6 +371,25 @@ void launch_hyper_expand(
         output,
         output_required,
         "hyper-expand output");
+
+    static_cast<void>(prepare_1d_blocks(checked_mul(
+        checked_mul(context.logical_rows, config.hidden_size), config.hc_count)));
+    return {config, input, output};
+}
+
+void preflight_hyper_expand(const ExecutionDispatchContext& context, void* user_data) {
+    if (const auto* scope = current_hip_launch_context(); scope && scope->graph_capture)
+        throw std::invalid_argument("known-window launcher preflight requires eager scope");
+    static_cast<void>(prepare_hyper_expand(context, user_data));
+}
+
+void launch_hyper_expand(
+    const ExecutionDispatchContext& context,
+    void* user_data) {
+    const auto prepared = prepare_hyper_expand(context, user_data);
+    const auto& config = prepared.config;
+    const auto& input = prepared.input;
+    const auto& output = prepared.output;
 
     switch (config.activation) {
     case HipActivationStorage::bf16:
@@ -427,7 +451,11 @@ void launch_inject_typed(
         });
 }
 
-void launch_inject(
+struct PreparedInject {
+    const HipElementwiseLauncherConfig& config;
+    ExecutionBufferAddress hyper, hidden, weights, output;
+};
+PreparedInject prepare_inject(
     const ExecutionDispatchContext& context,
     void* user_data) {
     if (context.op != SerialOp::attn_inject &&
@@ -498,6 +526,26 @@ void launch_inject(
         expanded_bytes,
         "inject output");
 
+    static_cast<void>(prepare_1d_blocks(expanded_elements));
+    return {config, hyper, hidden, weights, output};
+}
+
+void preflight_inject(const ExecutionDispatchContext& context, void* user_data) {
+    if (const auto* scope = current_hip_launch_context(); scope && scope->graph_capture)
+        throw std::invalid_argument("known-window launcher preflight requires eager scope");
+    static_cast<void>(prepare_inject(context, user_data));
+}
+
+void launch_inject(
+    const ExecutionDispatchContext& context,
+    void* user_data) {
+    const auto prepared = prepare_inject(context, user_data);
+    const auto& config = prepared.config;
+    const auto& hyper = prepared.hyper;
+    const auto& hidden = prepared.hidden;
+    const auto& weights = prepared.weights;
+    const auto& output = prepared.output;
+
     switch (config.activation) {
     case HipActivationStorage::bf16:
         launch_inject_typed<
@@ -555,7 +603,11 @@ void launch_moe_combine_typed(
         });
 }
 
-void launch_moe_combine(
+struct PreparedMoeCombine {
+    const HipElementwiseLauncherConfig& config;
+    ExecutionBufferAddress shared, routed, output;
+};
+PreparedMoeCombine prepare_moe_combine(
     const ExecutionDispatchContext& context,
     void* user_data) {
     if (context.op !=
@@ -600,6 +652,25 @@ void launch_moe_combine(
         required,
         "MoE-combine output");
 
+    static_cast<void>(prepare_1d_blocks(checked_mul(context.logical_rows, config.hidden_size)));
+    return {config, shared, routed, output};
+}
+
+void preflight_moe_combine(const ExecutionDispatchContext& context, void* user_data) {
+    if (const auto* scope = current_hip_launch_context(); scope && scope->graph_capture)
+        throw std::invalid_argument("known-window launcher preflight requires eager scope");
+    static_cast<void>(prepare_moe_combine(context, user_data));
+}
+
+void launch_moe_combine(
+    const ExecutionDispatchContext& context,
+    void* user_data) {
+    const auto prepared = prepare_moe_combine(context, user_data);
+    const auto& config = prepared.config;
+    const auto& shared = prepared.shared;
+    const auto& routed = prepared.routed;
+    const auto& output = prepared.output;
+
     switch (config.activation) {
     case HipActivationStorage::bf16:
         launch_moe_combine_typed<
@@ -627,7 +698,8 @@ ExecutionLauncher make_launcher(
     std::string kernel_id,
     std::uint64_t tag,
     ExecutionLaunchFunction function,
-    HipElementwiseLauncherConfig* config) {
+    HipElementwiseLauncherConfig* config,
+    ExecutionLaunchFunction preflight) {
     if (kernel_id.empty()) {
         throw std::invalid_argument(
             "HIP launcher kernel id must not be empty");
@@ -644,6 +716,7 @@ ExecutionLauncher make_launcher(
         identity,
         function,
         config,
+        preflight,
     };
 }
 
@@ -821,7 +894,8 @@ make_hip_hyper_expand_launcher(
         std::move(kernel_id),
         hyper_expand_tag,
         &launch_hyper_expand,
-        config);
+        config,
+        &preflight_hyper_expand);
 }
 
 ExecutionLauncher
@@ -832,7 +906,8 @@ make_hip_inject_launcher(
         std::move(kernel_id),
         inject_tag,
         &launch_inject,
-        config);
+        config,
+        &preflight_inject);
 }
 
 ExecutionLauncher
@@ -843,7 +918,8 @@ make_hip_moe_combine_launcher(
         std::move(kernel_id),
         moe_combine_tag,
         &launch_moe_combine,
-        config);
+        config,
+        &preflight_moe_combine);
 }
 
 }  // namespace strix

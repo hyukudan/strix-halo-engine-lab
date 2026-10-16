@@ -1186,6 +1186,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         src/hip_ple_launcher.hip
         src/hip_embedding_launcher.hip
         src/hip_gdn_launcher.hip
+        src/hip_known_prefix_window.hip
         src/hip_hyper_mix_launcher.hip
         src/hip_indexed_attention_launcher.hip
         src/hip_serial_graph.hip
@@ -1233,6 +1234,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         target_compile_definitions(strix_hip_runtime PRIVATE STRIX_BUILD_GDN_LM_WAVE8_DIAGNOSTIC=1)
         target_compile_definitions(strix_hip_runtime PRIVATE STRIX_BUILD_GREEDY_OUTPUT_DIAGNOSTIC=1)
         target_compile_definitions(strix_hip_runtime PRIVATE STRIX_BUILD_GDN_RECURRENT_LAYOUT_DIAGNOSTIC=1)
+        target_compile_definitions(strix_hip_runtime PRIVATE STRIX_BUILD_KNOWN_WINDOW_DIAGNOSTIC=1)
         target_compile_definitions(strix_hip_runtime PRIVATE STRIX_BUILD_SHARED_EXPERT_ROWS_DIAGNOSTIC=1)
         target_compile_definitions(strix_hip_runtime PRIVATE STRIX_BUILD_QSA_GQA_REUSE_DIAGNOSTIC=1)
         target_compile_definitions(strix_hip_runtime PRIVATE STRIX_BUILD_MOE_BATCHED_ACTIVATION_DIAGNOSTIC=1)
@@ -1553,6 +1555,24 @@ if(STRIX_ENABLE_HIP_RUNTIME)
             NAME strix-hip-shared-expert-launcher-tests
             COMMAND strix-hip-shared-expert-launcher-tests
         )
+
+        add_executable(strix-hip-known-window-tests tests/hip_known_window_tests.hip)
+        set_target_properties(strix-hip-known-window-tests PROPERTIES
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+        target_link_libraries(strix-hip-known-window-tests PRIVATE strix_hip_runtime)
+        target_compile_definitions(strix-hip-known-window-tests PRIVATE STRIX_BUILD_KNOWN_WINDOW_DIAGNOSTIC=1)
+        target_compile_options(strix-hip-known-window-tests PRIVATE
+            -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
+        strix_target_warnings(strix-hip-known-window-tests)
+        add_test(NAME strix-hip-known-window-tests COMMAND strix-hip-known-window-tests)
+
+        # Full-model qualification is explicit and requires a model and teacher;
+        # it is intentionally absent from the automatic device regression.
+        add_executable(strix-hip-known-window-model-qualification tests/hip_known_window_model_qualification.hip)
+        set_target_properties(strix-hip-known-window-model-qualification PROPERTIES
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+        target_link_libraries(strix-hip-known-window-model-qualification PRIVATE strix_hip_runtime)
+        strix_target_warnings(strix-hip-known-window-model-qualification)
 
         add_executable(
             strix-hip-moe-experts-launcher-tests

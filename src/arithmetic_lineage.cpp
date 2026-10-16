@@ -74,6 +74,29 @@ bool arithmetic_lineage_serial_only(const ArithmeticLineage& lineage,
     return true;
 }
 
+ArithmeticLineage prepare_prefill_chunk_lineage(
+    const ArithmeticLineage& previous, std::uint64_t begin, std::uint64_t end,
+    std::uint64_t numerical_plan_identity, std::uint64_t reduction_plan_identity,
+    std::uint64_t state_update_identity) {
+    if (end <= begin || !numerical_plan_identity || !reduction_plan_identity ||
+        !state_update_identity) {
+        throw std::invalid_argument("prefill lineage requires a bounded chunk and exact identities");
+    }
+    if (previous.tainted) {
+        throw std::invalid_argument("tainted arithmetic lineage requires independently valid restore");
+    }
+    if (previous.history_identity == 0 && previous.intervals.empty()) {
+        if (begin != 0) return {};
+    } else if (!arithmetic_lineage_valid(previous, begin)) {
+        throw std::invalid_argument("prefill arithmetic lineage does not cover the current position");
+    }
+    auto next = previous;
+    next.intervals.push_back({begin, end, ArithmeticProducer::prefill_chunk,
+        numerical_plan_identity, reduction_plan_identity, state_update_identity});
+    next.history_identity = arithmetic_history_identity(next.intervals);
+    return next;
+}
+
 ArithmeticLineage prepare_serial_row_lineage(
     const ArithmeticLineage& previous, std::uint64_t position,
     std::uint64_t execution_identity, std::uint64_t reduction_plan_identity) {

@@ -45,4 +45,12 @@ struct ArithmeticLineage {
     const ArithmeticLineage& previous, std::uint64_t position,
     std::uint64_t execution_identity, std::uint64_t reduction_plan_identity);
 
+// A known-prefix window is a distinct producer. Preserve a validated prefix,
+// append one bounded chunk, and never coalesce adjacent chunk boundaries or
+// synthesize unknown earlier producer history.
+[[nodiscard]] ArithmeticLineage prepare_prefill_chunk_lineage(
+    const ArithmeticLineage& previous, std::uint64_t begin, std::uint64_t end,
+    std::uint64_t numerical_plan_identity, std::uint64_t reduction_plan_identity,
+    std::uint64_t state_update_identity);
+
 } // namespace strix

@@ -1556,6 +1556,24 @@ const RuntimeTensorBinding& runtime_tensor(
     return tensor;
 }
 
+ExecutionBufferAddress prepare_parallel_hyper_workspace(
+    const ExecutionDispatchContext& context, const HipHyperMixLauncherConfig& config,
+    const RuntimeTensorBinding& down_runtime, const RuntimeTensorBinding* inject_runtime) {
+    if (context.temporaries.size() != 1)
+        throw std::invalid_argument("parallel hyper-mix requires one admitted workspace");
+    const auto temporary = resolve_dispatch_temporary(context, 0);
+    if (temporary.use.buffer.buffer_class != ExecutionBufferClass::hyper_workspace)
+        throw std::invalid_argument("parallel hyper-mix requires its typed workspace binding");
+    const auto width = static_cast<std::uint64_t>(config.hidden_size) * config.hc_count;
+    const auto required = static_cast<std::uint64_t>(context.logical_rows) * (width + config.lowrank) * sizeof(float);
+    if (temporary.bytes < required || temporary.address % alignof(float) != 0)
+        throw std::invalid_argument("parallel hyper-mix workspace is undersized or unaligned");
+    if (config.splitk_projection && (context.logical_rows > 65535U || temporary.address % 16U ||
+        down_runtime.address % 16U || (inject_runtime && inject_runtime->address % 16U)))
+        throw std::invalid_argument("split-K HC launch owner alignment or row count differs");
+    return temporary;
+}
+
 template <typename Storage>
 void launch_typed(
     const ExecutionDispatchContext& context,
@@ -1570,20 +1588,11 @@ void launch_typed(
     const ManifestTensor& up_manifest,
     const RuntimeTensorBinding& up_runtime,
     const ManifestTensor* inject_manifest,
-    const RuntimeTensorBinding* inject_runtime) {
+    const RuntimeTensorBinding* inject_runtime,
+    const ExecutionBufferAddress* prepared_temporary) {
     if (config.parallel) {
-        if (context.temporaries.size() != 1)
-            throw std::invalid_argument("parallel hyper-mix requires one admitted workspace");
-        const auto temporary = resolve_dispatch_temporary(context, 0);
-        if (temporary.use.buffer.buffer_class != ExecutionBufferClass::hyper_workspace)
-            throw std::invalid_argument("parallel hyper-mix requires its typed workspace binding");
+        const auto& temporary = *prepared_temporary;
         const auto width = static_cast<std::uint64_t>(config.hidden_size) * config.hc_count;
-        const auto required = static_cast<std::uint64_t>(context.logical_rows) * (width + config.lowrank) * sizeof(float);
-        if (temporary.bytes < required || temporary.address % alignof(float) != 0)
-            throw std::invalid_argument("parallel hyper-mix workspace is undersized or unaligned");
-        if (config.splitk_projection && (context.logical_rows > 65535U || temporary.address % 16U ||
-            down_runtime.address % 16U || (inject_runtime && inject_runtime->address % 16U)))
-            throw std::invalid_argument("split-K HC launch owner alignment or row count differs");
         auto* normalized = reinterpret_cast<float*>(temporary.address);
         auto* low = normalized + static_cast<std::uint64_t>(context.logical_rows) * width;
         constexpr std::uint32_t projection_threads = 32;
@@ -1752,7 +1761,15 @@ void launch_typed(
         "HIP hyper-mix kernel launch");
 }
 
-void launch_hyper_mix(
+struct PreparedHyperMix {
+    const HipHyperMixLauncherConfig* config;
+    ExecutionBufferAddress input, output;
+    std::optional<ExecutionBufferAddress> injection_output, temporary;
+    const ManifestTensor *norm_manifest, *down_manifest, *up_manifest, *inject_manifest;
+    const RuntimeTensorBinding *norm_runtime, *down_runtime, *up_runtime, *inject_runtime;
+};
+
+PreparedHyperMix prepare_hyper_mix(
     const ExecutionDispatchContext& context,
     void* user_data) {
     const bool final_mix =
@@ -2036,47 +2053,35 @@ void launch_hyper_mix(
             inject_runtime?std::optional<View>{{inject_runtime->address,inject_runtime->bytes}}:std::nullopt,
             injection_output?std::optional<View>{{injection_output->address,injection_output->bytes}}:std::nullopt);
     }
+    std::optional<ExecutionBufferAddress> temporary;
+    if (config.parallel)
+        temporary = prepare_parallel_hyper_workspace(context, config, down_runtime, inject_runtime);
+    return {&config, input, output, injection_output, temporary,
+        &norm_manifest, &down_manifest, &up_manifest, inject_manifest,
+        &norm_runtime, &down_runtime, &up_runtime, inject_runtime};
+}
+
+void preflight_hyper_mix(const ExecutionDispatchContext& context, void* user_data) {
+    (void)prepare_hyper_mix(context, user_data);
+}
+
+void launch_hyper_mix(const ExecutionDispatchContext& context, void* user_data) {
+    const auto prepared = prepare_hyper_mix(context, user_data);
+    const auto& config = *prepared.config;
+    const auto invoke = [&]<typename Storage>() {
+        launch_typed<Storage>(context, config, prepared.input, prepared.output,
+            prepared.injection_output ? &*prepared.injection_output : nullptr,
+            *prepared.norm_manifest, *prepared.norm_runtime,
+            *prepared.down_manifest, *prepared.down_runtime,
+            *prepared.up_manifest, *prepared.up_runtime,
+            prepared.inject_manifest, prepared.inject_runtime,
+            prepared.temporary ? &*prepared.temporary : nullptr);
+    };
     switch (config.activation) {
-    case HipActivationStorage::bf16:
-        launch_typed<
-            std::uint16_t>(
-                context,
-                config,
-                input,
-                output,
-                injection_output
-                    ? &*injection_output
-                    : nullptr,
-                norm_manifest,
-                norm_runtime,
-                down_manifest,
-                down_runtime,
-                up_manifest,
-                up_runtime,
-                inject_manifest,
-                inject_runtime);
-        return;
-    case HipActivationStorage::fp32:
-        launch_typed<float>(
-            context,
-            config,
-            input,
-            output,
-            injection_output
-                ? &*injection_output
-                : nullptr,
-            norm_manifest,
-            norm_runtime,
-            down_manifest,
-            down_runtime,
-            up_manifest,
-            up_runtime,
-            inject_manifest,
-            inject_runtime);
-        return;
+    case HipActivationStorage::bf16: invoke.template operator()<std::uint16_t>(); return;
+    case HipActivationStorage::fp32: invoke.template operator()<float>(); return;
     }
-    throw std::logic_error(
-        "unreachable hyper-mix activation storage");
+    throw std::logic_error("unreachable hyper-mix activation storage");
 }
 
 std::string kernel_id(
@@ -2396,6 +2401,7 @@ make_hip_hyper_mix_launcher(
             *config),
         &launch_hyper_mix,
         config,
+        &preflight_hyper_mix,
     };
 }
 

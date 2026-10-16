@@ -14,6 +14,7 @@
 #endif
 #include <array>
 #include <limits>
+#include <optional>
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -1238,8 +1239,14 @@ void validate_q4k_a8_ranges(Q4kA8Range temporary, Q4kA8Range output,
     for (const auto r : readonly) { disjoint(temporary,r); disjoint(output,r); }
 }
 
-template <typename Storage>
-void launch_q4k_a8_typed(const HipMoeExpertsLauncherConfig& config,
+struct PreparedQ4kA8 {
+    moe_q4k_a8::RuntimeWorkspace layout;
+    moe_q4k_a8::Request request;
+    moe_q4k_a8::Bindings bindings;
+    bool grouped_q51, slot_parallel_q51;
+};
+
+PreparedQ4kA8 prepare_q4k_a8(const HipMoeExpertsLauncherConfig& config,
     const ExecutionBufferAddress& hidden, const ExecutionBufferAddress& route_indices,
     const ExecutionBufferAddress& route_weights, const ExecutionBufferAddress& output,
     const ExecutionBufferAddress& temporary, const RoutedTensors& tensors) {
@@ -1271,7 +1278,7 @@ void launch_q4k_a8_typed(const HipMoeExpertsLauncherConfig& config,
         return moe_q4k_a8::DeviceBytes{temporary.address + static_cast<std::uintptr_t>(offset), bytes};
     };
     const moe_q4k_a8::Bindings bindings{
-        {hidden.address, static_cast<std::uint64_t>(config.hidden_size) * sizeof(Storage)},
+        {hidden.address, static_cast<std::uint64_t>(config.hidden_size) * static_cast<std::uint32_t>(config.activation)},
         {tensors.gate.runtime->address,gate_bytes}, {tensors.up.runtime->address,gate_bytes},
         {route_indices.address, static_cast<std::uint64_t>(config.top_k) * sizeof(std::uint32_t)},
         slice(layout.codes_offset,layout.codes_bytes), slice(layout.deltas_offset,layout.deltas_bytes),
@@ -1298,6 +1305,20 @@ void launch_q4k_a8_typed(const HipMoeExpertsLauncherConfig& config,
                 {temporary.address+layout.rawdots_offset,layout.rawdots_bytes}});
         }
     }
+    return {layout, request, bindings, grouped_q51, slot_parallel_q51};
+}
+
+template <typename Storage>
+void launch_q4k_a8_typed(const HipMoeExpertsLauncherConfig& config,
+    const ExecutionBufferAddress& route_indices,
+    const ExecutionBufferAddress& route_weights, const ExecutionBufferAddress& output,
+    const ExecutionBufferAddress& temporary, const RoutedTensors& tensors,
+    const PreparedQ4kA8& prepared) {
+    const auto& layout = prepared.layout;
+    const auto& request = prepared.request;
+    const auto& bindings = prepared.bindings;
+    const bool grouped_q51 = prepared.grouped_q51;
+    const bool slot_parallel_q51 = prepared.slot_parallel_q51;
     auto* workspace = reinterpret_cast<float*>(bindings.output.address);
     auto* accumulation = reinterpret_cast<float*>(temporary.address + layout.accumulation_offset);
     auto* status = reinterpret_cast<std::uint32_t*>(bindings.status.address);
@@ -1393,7 +1414,16 @@ void launch_q4k_a8_typed(const HipMoeExpertsLauncherConfig& config,
 }
 #endif
 
-void launch_moe_experts(
+struct PreparedMoeExperts {
+    const HipMoeExpertsLauncherConfig* config;
+    ExecutionBufferAddress hidden, route_indices, route_weights, output, temporary;
+    RoutedTensors tensors;
+#ifdef STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME
+    std::optional<PreparedQ4kA8> quantized;
+#endif
+};
+
+PreparedMoeExperts prepare_moe_experts(
     const ExecutionDispatchContext& context,
     void* user_data) {
     if (context.op !=
@@ -1535,44 +1565,53 @@ void launch_moe_experts(
         }
     }
 
+#ifdef STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME
+    std::optional<PreparedQ4kA8> quantized;
+#endif
     if (config.q4k_a8g32_gate_up) {
 #ifdef STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME
         if (tensors.fused_gate_up || tensors.gate.manifest->ggml_type != tensors.up.manifest->ggml_type ||
             (tensors.gate.manifest->ggml_type != 12 && tensors.gate.manifest->ggml_type != 13))
             throw std::invalid_argument("Q4K A8 runtime requires separate paired Q4K or Q5K gate/up");
-        if (tensors.gate.manifest->ggml_type == 12) {
-            if (config.activation == HipActivationStorage::bf16)
-                launch_q4k_a8_typed<std::uint16_t>(config,hidden,route_indices,route_weights,output,temporary,tensors);
-            else launch_q4k_a8_typed<float>(config,hidden,route_indices,route_weights,output,temporary,tensors);
-            return;
-        }
-        if (config.q4k_a8_stats) config.q4k_a8_stats->legacy_q5k_submissions.fetch_add(1,std::memory_order_relaxed);
+        if (tensors.gate.manifest->ggml_type == 12)
+            quantized = prepare_q4k_a8(config, hidden, route_indices, route_weights, output, temporary, tensors);
 #endif
     }
-    switch (config.activation) {
-    case HipActivationStorage::bf16:
-        launch_typed<std::uint16_t>(
-            config,
-            hidden,
-            route_indices,
-            route_weights,
-            output,
-            temporary,
-            tensors);
-        return;
-    case HipActivationStorage::fp32:
-        launch_typed<float>(
-            config,
-            hidden,
-            route_indices,
-            route_weights,
-            output,
-            temporary,
-            tensors);
+    return {&config, hidden, route_indices, route_weights, output, temporary, tensors
+#ifdef STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME
+        , quantized
+#endif
+    };
+}
+
+void preflight_moe_experts(const ExecutionDispatchContext& context, void* user_data) {
+    (void)prepare_moe_experts(context, user_data);
+}
+
+void launch_moe_experts(const ExecutionDispatchContext& context, void* user_data) {
+    const auto prepared = prepare_moe_experts(context, user_data);
+    const auto& config = *prepared.config;
+#ifdef STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME
+    if (prepared.quantized) {
+        if (config.activation == HipActivationStorage::bf16)
+            launch_q4k_a8_typed<std::uint16_t>(config, prepared.route_indices,
+                prepared.route_weights, prepared.output, prepared.temporary, prepared.tensors, *prepared.quantized);
+        else launch_q4k_a8_typed<float>(config, prepared.route_indices,
+                prepared.route_weights, prepared.output, prepared.temporary, prepared.tensors, *prepared.quantized);
         return;
     }
-    throw std::logic_error(
-        "unreachable routed-expert activation storage");
+    if (config.q4k_a8g32_gate_up && config.q4k_a8_stats)
+        config.q4k_a8_stats->legacy_q5k_submissions.fetch_add(1,std::memory_order_relaxed);
+#endif
+    const auto invoke = [&]<typename Storage>() {
+        launch_typed<Storage>(config, prepared.hidden, prepared.route_indices,
+            prepared.route_weights, prepared.output, prepared.temporary, prepared.tensors);
+    };
+    switch (config.activation) {
+    case HipActivationStorage::bf16: invoke.template operator()<std::uint16_t>(); return;
+    case HipActivationStorage::fp32: invoke.template operator()<float>(); return;
+    }
+    throw std::logic_error("unreachable routed-expert activation storage");
 }
 
 std::string kernel_id(
@@ -1785,6 +1824,7 @@ make_hip_moe_experts_launcher(
             *config),
         &launch_moe_experts,
         config,
+        &preflight_moe_experts,
     };
 }
 

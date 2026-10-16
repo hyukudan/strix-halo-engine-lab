@@ -21,6 +21,8 @@ struct ExecutionLauncher {
     std::uint64_t implementation_identity = 0;
     ExecutionLaunchFunction function = nullptr;
     void* user_data = nullptr;
+    // Optional metadata-only admission; ordinary dispatch does not invoke it.
+    ExecutionLaunchFunction preflight = nullptr;
 };
 
 class ExecutionLauncherRegistry {
@@ -57,6 +59,8 @@ struct CompiledStepLauncher {
     std::uint64_t implementation_identity = 0;
     ExecutionLaunchFunction function = nullptr;
     void* user_data = nullptr;
+    // Optional metadata-only admission; ordinary dispatch does not invoke it.
+    ExecutionLaunchFunction preflight = nullptr;
 };
 
 struct MissingLauncher {

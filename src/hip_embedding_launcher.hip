@@ -524,7 +524,14 @@ void launch_by_weight(
         "unreachable embedding weight kind");
 }
 
-void launch_embedding(
+struct PreparedEmbedding {
+    const HipEmbeddingLauncherConfig& config;
+    ExecutionBufferAddress output;
+    const ManifestTensor& manifest_tensor;
+    const RuntimeTensorBinding& runtime_tensor;
+    EmbeddingWeightKind kind;
+};
+PreparedEmbedding prepare_embedding(
     const ExecutionDispatchContext& context,
     void* user_data) {
     if (context.op !=
@@ -630,6 +637,25 @@ void launch_embedding(
         throw std::invalid_argument(
             "HIP embedding output buffer is undersized");
     }
+
+    return {config, output, manifest_tensor, runtime_tensor, kind};
+}
+
+void preflight_embedding(const ExecutionDispatchContext& context, void* user_data) {
+    if (const auto* scope = current_hip_launch_context(); scope && scope->graph_capture)
+        throw std::invalid_argument("known-window launcher preflight requires eager scope");
+    static_cast<void>(prepare_embedding(context, user_data));
+}
+
+void launch_embedding(
+    const ExecutionDispatchContext& context,
+    void* user_data) {
+    const auto prepared = prepare_embedding(context, user_data);
+    const auto& config = prepared.config;
+    const auto& output = prepared.output;
+    const auto& manifest_tensor = prepared.manifest_tensor;
+    const auto& runtime_tensor = prepared.runtime_tensor;
+    const auto kind = prepared.kind;
 
     if (const auto* scope = current_hip_launch_context(); scope && scope->graph_capture) {
         if (!config.enable_device_graph_inputs || manifest_tensor.dimensions[1] != scope->vocabulary_size) {
@@ -794,6 +820,7 @@ make_hip_embedding_launcher(
             *config),
         &launch_embedding,
         config,
+        &preflight_embedding,
     };
 }
 

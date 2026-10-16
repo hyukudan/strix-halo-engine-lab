@@ -4,6 +4,11 @@
 #include "strix/shared_expert_prefetch.hpp"
 #include "strix/moe_q4k_a8_runtime.hpp"
 
+#include <algorithm>
+#include <array>
+#include <limits>
+#include <string_view>
+#include <utility>
 #include <span>
 #include <stdexcept>
 #include <vector>
@@ -352,6 +357,314 @@ compile_speculative_verify_execution(
     }
 
     return compiled;
+}
+
+
+namespace {
+void window_require(bool condition, const char* message) {
+    if (!condition) throw std::invalid_argument(message);
+}
+void window_hash_text(std::uint64_t& hash, std::string_view text) noexcept {
+    hash_u64(hash, text.size());
+    for (char value : text) hash_u64(hash, static_cast<unsigned char>(value));
+}
+void window_hash_use(std::uint64_t& hash, ExecutionBufferUse use) noexcept {
+    hash_u64(hash, static_cast<std::uint64_t>(use.buffer.buffer_class));
+    hash_u64(hash, use.buffer.slot); hash_u64(hash, use.generation);
+}
+void window_hash_arena(std::uint64_t& hash, const ExecutionArenaPlan& arena) noexcept {
+    hash_u64(hash, arena.alignment); hash_u64(hash, arena.total_bytes);
+    hash_u64(hash, arena.naive_nonaliased_bytes); hash_u64(hash, arena.allocations.size());
+    for (const auto& allocation : arena.allocations) {
+        window_hash_use(hash, allocation.use); hash_u64(hash, allocation.first_step);
+        hash_u64(hash, allocation.last_step); hash_u64(hash, allocation.offset);
+        hash_u64(hash, allocation.bytes);
+    }
+}
+std::uint64_t window_serial_fingerprint(const CompiledSerialExecution& serial) noexcept {
+    auto hash = fnv_offset;
+    window_hash_text(hash, "known-window-serial-source-v1");
+    for (auto value : {serial.execution_identity, serial.kernel_plan_identity, serial.vocab_size,
+                       serial.max_position_embeddings}) hash_u64(hash, value);
+    for (auto value : {serial.logical_rows, serial.request_concurrency, serial.dynamic_steps,
+                       serial.non_graph_safe_steps}) hash_u64(hash, value);
+    hash_u64(hash, serial.whole_plan_graph_safe); hash_u64(hash, serial.device_graph_inputs);
+    hash_u64(hash, serial.execution.steps.size());
+    for (const auto& step : serial.execution.steps) {
+        hash_u64(hash, step.id); hash_u64(hash, static_cast<std::uint64_t>(step.op));
+        hash_u64(hash, step.layer ? static_cast<std::uint64_t>(*step.layer) + 1U : 0U);
+        hash_u64(hash, static_cast<std::uint64_t>(step.reads_state));
+        hash_u64(hash, static_cast<std::uint64_t>(step.writes_state));
+        hash_u64(hash, step.dynamic_shape); hash_u64(hash, step.graph_safe_candidate);
+        hash_u64(hash, step.dependencies.size());
+        for (auto dependency : step.dependencies) hash_u64(hash, dependency);
+    }
+    for (auto value : {serial.execution.linear_attention_steps, serial.execution.indexed_attention_steps,
+        serial.execution.ple_steps, serial.execution.moe_route_steps, serial.execution.moe_expert_steps,
+        serial.bindings.bound_steps, serial.bindings.missing_steps, serial.bindings.host_or_runtime_steps})
+        hash_u64(hash, value);
+    hash_u64(hash, serial.bindings.bindings.size());
+    for (const auto& binding : serial.bindings.bindings) {
+        hash_u64(hash, binding.step_id); hash_u64(hash, static_cast<std::uint64_t>(binding.op));
+        hash_u64(hash, binding.family ? static_cast<std::uint64_t>(*binding.family) + 1U : 0U);
+        hash_u64(hash, binding.host_or_runtime_step); hash_u64(hash, binding.kernel_id.has_value());
+        if (binding.kernel_id) window_hash_text(hash, *binding.kernel_id);
+    }
+    for (auto value : {serial.io.expanded_hidden_slots, serial.io.hidden_slots, serial.io.injection_slots,
+        serial.io.route_index_slots, serial.io.route_weight_slots, serial.io.logits_slots,
+        serial.io.mlp_intermediate_slots, serial.io.gdn_workspace_slots, serial.io.ple_workspace_slots,
+        serial.io.indexed_attention_workspace_slots, serial.io.hyper_workspace_slots, serial.io.router_workspace_slots})
+        hash_u64(hash, value);
+    hash_u64(hash, serial.io.steps.size());
+    for (const auto& io : serial.io.steps) {
+        hash_u64(hash, io.step_id); hash_u64(hash, static_cast<std::uint64_t>(io.op));
+        for (const auto* uses : {&io.reads, &io.writes, &io.temporaries}) {
+            hash_u64(hash, uses->size());
+            for (auto use : *uses) window_hash_use(hash, use);
+        }
+    }
+    window_hash_arena(hash, serial.arena);
+    return hash;
+}
+bool window_same_arena(const ExecutionArenaPlan& left, const ExecutionArenaPlan& right) noexcept {
+    if (left.alignment != right.alignment || left.total_bytes != right.total_bytes ||
+        left.naive_nonaliased_bytes != right.naive_nonaliased_bytes ||
+        left.allocations.size() != right.allocations.size()) return false;
+    for (std::size_t i = 0; i < left.allocations.size(); ++i) {
+        const auto& a = left.allocations[i]; const auto& b = right.allocations[i];
+        if (a.use != b.use || a.first_step != b.first_step || a.last_step != b.last_step ||
+            a.offset != b.offset || a.bytes != b.bytes) return false;
+    }
+    return true;
+}
+constexpr std::string_view known_shared_base = "hip.shared_expert.bf16.h2560.m640.r1.c1";
+constexpr std::string_view known_gdn_wave8 =
+    "hip.gdn.bf16.h2560.kh16.vh48.d128.r1.c1.scalar.wave8-input-v1.wave8-q8-output-v1"
+    ".prefetch8.virtual256.q8-input.virtual256.q8-output";
+bool known_shared_id(std::string_view id) {
+    return id == known_shared_base || id == std::string(known_shared_base) +
+        std::string(shared_expert_prefetch::kernel_suffix);
+}
+const ManifestTensor& window_tensor(const ModelManifest& manifest,
+    const ExecutionTensorAccessPlan& access, std::uint32_t step, SerialOp op,
+    std::uint32_t layer, std::string_view suffix) {
+    const auto name = "blk." + std::to_string(layer) + "." + std::string(suffix);
+    const ManifestTensor* selected = nullptr; std::uint32_t index = 0;
+    for (std::size_t i = 0; i < manifest.tensors.size(); ++i) if (manifest.tensors[i].name == name) {
+        window_require(selected == nullptr, "known window tensor family is duplicated");
+        window_require(i <= std::numeric_limits<std::uint32_t>::max(), "known window tensor index overflows");
+        selected = &manifest.tensors[i]; index = static_cast<std::uint32_t>(i);
+    }
+    window_require(selected != nullptr && selected->layer == layer,
+        "known window promoted tensor family is missing or has the wrong layer");
+    const auto role = suffix.starts_with("attn_") ? TensorRole::attention_projection :
+        suffix.starts_with("ssm_") ? TensorRole::recurrent_state : TensorRole::dense_projection;
+    window_require(selected->role == role, "known window promoted tensor role is invalid");
+    unsigned matches = 0;
+    for (const auto& item : access.accesses) if (item.step_id == step) {
+        window_require(item.op == op, "known window tensor access operator mismatch");
+        for (auto candidate : item.tensor_indices) {
+            window_require(candidate < manifest.tensors.size(), "known window tensor access index is invalid");
+            if (candidate == index) ++matches;
+        }
+    }
+    window_require(matches == 1, "known window promoted tensor is not selected exactly once");
+    return *selected;
+}
+bool window_matrix(const ManifestTensor& tensor, std::uint64_t width, std::uint64_t rows) {
+    window_require(tensor.dimensions == std::vector<std::uint64_t>{width, rows},
+        "known window promoted matrix shape differs from its canonical operand");
+    if (tensor.ggml_type != 8U) return false; // Explicit per-op serial fallback.
+    const auto bytes = (width / 32U) * 34U * rows;
+    window_require(width % 32U == 0 && tensor.byte_size == bytes && tensor.absolute_offset % 16U == 0 &&
+        tensor.byte_size <= std::numeric_limits<std::uint64_t>::max() - tensor.absolute_offset,
+        "known window Q8 weight extent/alignment is invalid");
+    return true;
+}
+bool window_shared_types(const ModelManifest& manifest, const ExecutionTensorAccessPlan& access,
+    const ExecutionStep& step) {
+    const auto layer = *step.layer;
+    const auto& gate = window_tensor(manifest, access, step.id, step.op, layer, "ffn_gate_shexp.weight");
+    const auto& up = window_tensor(manifest, access, step.id, step.op, layer, "ffn_up_shexp.weight");
+    const auto& down = window_tensor(manifest, access, step.id, step.op, layer, "ffn_down_shexp.weight");
+    const auto& scalar = window_tensor(manifest, access, step.id, step.op, layer, "ffn_gate_inp_shexp.weight");
+    const bool g = window_matrix(gate, 2560, 640), u = window_matrix(up, 2560, 640),
+               d = window_matrix(down, 640, 2560);
+    window_require(scalar.dimensions == std::vector<std::uint64_t>{2560}, "known window scalar gate shape mismatch");
+    if (scalar.ggml_type != 0U) return false;
+    window_require(scalar.byte_size == 10240 && scalar.absolute_offset % 16U == 0 &&
+        scalar.byte_size <= std::numeric_limits<std::uint64_t>::max() - scalar.absolute_offset,
+        "known window scalar gate extent/alignment mismatch");
+    return g && u && d;
+}
+bool window_gdn_types(const ModelManifest& manifest, const ExecutionTensorAccessPlan& access,
+    const ExecutionStep& step) {
+    bool eligible = true;
+    for (const auto& item : std::array<std::pair<std::string_view, std::array<std::uint64_t, 2>>, 5>{{
+        {"attn_qkv.weight", {2560, 10240}}, {"attn_gate.weight", {2560, 6144}},
+        {"ssm_beta.weight", {2560, 48}}, {"ssm_alpha.weight", {2560, 48}},
+        {"ssm_out.weight", {6144, 2560}}}}) {
+        const auto& tensor = window_tensor(manifest, access, step.id, step.op, *step.layer, item.first);
+        eligible = window_matrix(tensor, item.second[0], item.second[1]) && eligible;
+    }
+    return eligible;
+}
+constexpr std::uint64_t known_shared_projection_bytes = 3ULL * (2560ULL / 32ULL * 34ULL * 640ULL);
+constexpr std::uint64_t known_gdn_projection_bytes = 2560ULL / 32ULL * 34ULL *
+    (10240ULL + 6144ULL + 48ULL + 48ULL) + 6144ULL / 32ULL * 34ULL * 2560ULL;
+std::pair<std::uint64_t, std::uint64_t> known_window_identities(
+    const CompiledKnownPrefixWindow& window, const CompiledSerialExecution& serial) {
+    window_require(window.mode.size() == serial.execution.steps.size() &&
+        window.r2_variant.size() == window.mode.size(), "known window mode table is incomplete");
+    auto kernel = fnv_offset; window_hash_text(kernel, "known-window-r2-kernels-v1");
+    hash_u64(kernel, serial.kernel_plan_identity); hash_u64(kernel, window.mode.size());
+    std::uint32_t r2 = 0, loops = 0, runtime = 0;
+    std::uint64_t avoided = 0;
+    std::uint32_t launches = 0;
+    for (std::size_t i = 0; i < window.mode.size(); ++i) {
+        const auto& step = serial.execution.steps[i]; const auto& binding = serial.bindings.bindings[i];
+        const auto mode = window.mode[i]; const auto variant = window.r2_variant[i];
+        if (mode == KnownWindowStepMode::r1_row_loop) {
+            window_require(variant == KnownWindowR2Variant::none, "row-loop step has a promoted variant");
+            ++loops; if (binding.host_or_runtime_step) ++runtime;
+        } else if (mode == KnownWindowStepMode::r2_shared_q8) {
+            window_require(step.op == SerialOp::shared_expert && variant == KnownWindowR2Variant::shared_q8_virtual256_r2_v1 &&
+                binding.kernel_id && known_shared_id(*binding.kernel_id), "known window shared variant/source ID mismatch"); ++r2;
+            avoided += known_shared_projection_bytes; launches += 3;
+        } else if (mode == KnownWindowStepMode::r2_gdn_staged) {
+            window_require(step.op == SerialOp::gated_delta_net && variant == KnownWindowR2Variant::gdn_q8_virtual256_r2_v1 &&
+                binding.kernel_id && *binding.kernel_id == known_gdn_wave8, "known window GDN variant/source ID mismatch"); ++r2;
+            avoided += known_gdn_projection_bytes; launches += 5;
+        } else throw std::invalid_argument("known window mode is not in the closed table");
+        hash_u64(kernel, step.id); hash_u64(kernel, static_cast<std::uint64_t>(mode));
+        hash_u64(kernel, static_cast<std::uint64_t>(variant));
+        hash_u64(kernel, binding.host_or_runtime_step);
+        if (binding.kernel_id) window_hash_text(kernel, *binding.kernel_id);
+    }
+    window_require(r2 == window.r2_steps && loops == window.row_loop_steps && runtime == window.runtime_row_steps,
+        "known window counters do not match its actual mode table");
+    window_require(avoided == window.logical_projection_weight_bytes_avoided &&
+        launches == window.projection_launches_saved,
+        "known window logical projection counters differ from the closed operand shapes");
+    hash_u64(kernel, avoided); hash_u64(kernel, launches);
+    auto execution = fnv_offset; window_hash_text(execution, "known-window-r2-v1");
+    hash_u64(execution, window_serial_fingerprint(serial)); hash_u64(execution, kernel);
+    hash_u64(execution, window.manifest_layout_identity); hash_u64(execution, window.tensor_access_plan_identity);
+    window_hash_arena(execution, window.arena.physical);
+    for (auto stride : window.arena.row_stride) hash_u64(execution, stride);
+    for (const auto& row : window.arena.row_view) window_hash_arena(execution, row);
+    window_require(kernel != 0 && execution != 0 && execution != serial.execution_identity,
+        "known window identities are empty or collide with the serial identity");
+    return {execution, kernel};
+}
+} // namespace
+
+CompiledKnownPrefixWindow compile_known_prefix_window(
+    const ModelContract& model, const CompiledSerialExecution& serial,
+    const ModelManifest& manifest, const ExecutionTensorAccessPlan& tensor_access,
+    const KnownWindowRequest& request) {
+    if (const auto error = model.validate(); !error.empty()) throw std::invalid_argument(error);
+    window_require(model.hidden_layers == 48 && model.hidden_size == 2560 && model.hc_count == 4 &&
+        model.hc_lowrank == 320 && model.moe_intermediate_size == 640 && model.shared_expert_intermediate_size == 640 &&
+        model.gdn_key_heads == 16 && model.gdn_key_head_dim == 128 && model.gdn_value_heads == 48 &&
+        model.gdn_value_head_dim == 128 && model.full_attention_layers == 12 && model.gdn_layers == 36 &&
+        model.attention_heads == 24 && model.kv_heads == 2 && model.head_dim == 256 &&
+        model.num_experts == 512 && model.num_experts_per_token == 10 &&
+        model.bytes_bf16 == 2 && model.bytes_fp32 == 4,
+        "known window currently supports the canonical R2 model only");
+    window_require(serial.execution_identity && serial.kernel_plan_identity && serial.logical_rows == 1 &&
+        serial.request_concurrency == 1 && !serial.device_graph_inputs &&
+        serial.vocab_size == model.vocab_size && serial.max_position_embeddings == model.max_position_embeddings &&
+        serial.bindings.missing_steps == 0 && serial.bindings.bindings.size() == serial.execution.steps.size(),
+        "known window requires a complete eager C1 serial source");
+    window_require(manifest.layout_identity && tensor_access.plan_identity &&
+        tensor_access.manifest_layout_identity == manifest.layout_identity,
+        "known window manifest/tensor access identities are missing or inconsistent");
+    const auto expected = build_serial_decode_execution_plan(model);
+    window_require(expected.steps.size() == serial.execution.steps.size(), "known window source topology is incomplete");
+    validate_serial_execution_io_plan(serial.execution, serial.io);
+    for (std::size_t i = 0; i < expected.steps.size(); ++i) {
+        const auto& a = expected.steps[i]; const auto& b = serial.execution.steps[i];
+        const auto& binding = serial.bindings.bindings[i];
+        window_require(a.id == b.id && a.op == b.op && a.layer == b.layer && a.dependencies == b.dependencies &&
+            a.reads_state == b.reads_state && a.writes_state == b.writes_state &&
+            a.dynamic_shape == b.dynamic_shape && a.graph_safe_candidate == b.graph_safe_candidate &&
+            binding.step_id == b.id && binding.op == b.op,
+            "known window source step/binding does not match the canonical topology");
+        window_require(binding.host_or_runtime_step == (b.op == SerialOp::position_prepare) &&
+            (binding.host_or_runtime_step ? !binding.kernel_id : binding.kernel_id && !binding.kernel_id->empty()),
+            "known window source runtime/kernel binding is invalid");
+        for (const auto* uses : {&serial.io.steps[i].reads, &serial.io.steps[i].writes, &serial.io.steps[i].temporaries})
+            for (auto use : *uses) window_require(find_arena_allocation(serial.arena, use) != nullptr,
+                "known window serial IO references an unallocated use");
+    }
+    CompiledKnownPrefixWindow output;
+    output.serial_execution_identity = serial.execution_identity;
+    output.serial_kernel_plan_identity = serial.kernel_plan_identity;
+    output.manifest_layout_identity = manifest.layout_identity;
+    output.tensor_access_plan_identity = tensor_access.plan_identity;
+    output.arena = build_known_window_arena(serial.arena, serial.arena.alignment);
+    output.mode.assign(serial.execution.steps.size(), KnownWindowStepMode::r1_row_loop);
+    output.r2_variant.assign(serial.execution.steps.size(), KnownWindowR2Variant::none);
+    for (std::size_t i = 0; i < output.mode.size(); ++i) {
+        const auto& step = serial.execution.steps[i]; const auto& binding = serial.bindings.bindings[i];
+        if (request.r2_shared_expert && step.op == SerialOp::shared_expert && binding.kernel_id &&
+            known_shared_id(*binding.kernel_id) && window_shared_types(manifest, tensor_access, step)) {
+            output.mode[i] = KnownWindowStepMode::r2_shared_q8;
+            output.r2_variant[i] = KnownWindowR2Variant::shared_q8_virtual256_r2_v1;
+            for (const auto suffix : {"ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight"})
+                output.logical_projection_weight_bytes_avoided +=
+                    window_tensor(manifest, tensor_access, step.id, step.op, *step.layer, suffix).byte_size;
+            output.projection_launches_saved += 3;
+        } else if (request.r2_gdn && step.op == SerialOp::gated_delta_net && binding.kernel_id &&
+            *binding.kernel_id == known_gdn_wave8 && window_gdn_types(manifest, tensor_access, step)) {
+            output.mode[i] = KnownWindowStepMode::r2_gdn_staged;
+            output.r2_variant[i] = KnownWindowR2Variant::gdn_q8_virtual256_r2_v1;
+            for (const auto suffix : {"attn_qkv.weight", "attn_gate.weight", "ssm_beta.weight", "ssm_alpha.weight", "ssm_out.weight"})
+                output.logical_projection_weight_bytes_avoided +=
+                    window_tensor(manifest, tensor_access, step.id, step.op, *step.layer, suffix).byte_size;
+            output.projection_launches_saved += 5;
+        }
+        if (output.mode[i] == KnownWindowStepMode::r1_row_loop) {
+            ++output.row_loop_steps; if (binding.host_or_runtime_step) ++output.runtime_row_steps;
+        } else ++output.r2_steps;
+    }
+    const auto identities = known_window_identities(output, serial);
+    output.window_execution_identity = identities.first; output.window_kernel_plan_identity = identities.second;
+    output.row_plan = {serial, serial};
+    for (std::size_t row = 0; row < output.row_plan.size(); ++row) {
+        output.row_plan[row].execution_identity = output.window_execution_identity;
+        output.row_plan[row].arena = output.arena.row_view[row];
+        output.row_plan[row].whole_plan_graph_safe = false;
+    }
+    validate_compiled_known_prefix_window(output, serial);
+    return output;
+}
+
+void validate_compiled_known_prefix_window(
+    const CompiledKnownPrefixWindow& window, const CompiledSerialExecution& serial) {
+    window_require(serial.logical_rows == 1 && serial.request_concurrency == 1 && !serial.device_graph_inputs &&
+        serial.execution_identity != 0 && serial.kernel_plan_identity != 0 &&
+        serial.bindings.bindings.size() == serial.execution.steps.size(), "known window source is not a complete serial plan");
+    window_require(window.serial_execution_identity == serial.execution_identity &&
+        window.serial_kernel_plan_identity == serial.kernel_plan_identity && window.manifest_layout_identity &&
+        window.tensor_access_plan_identity, "known window serial/provenance identities differ");
+    const auto arena = build_known_window_arena(serial.arena, serial.arena.alignment);
+    window_require(window_same_arena(arena.physical, window.arena.physical) &&
+        arena.row_stride == window.arena.row_stride, "known window physical allocation/stride mutated");
+    for (std::size_t row = 0; row < window.row_plan.size(); ++row) {
+        window_require(window_same_arena(arena.row_view[row], window.arena.row_view[row]) &&
+            window_same_arena(arena.row_view[row], window.row_plan[row].arena), "known window row views differ from the serial-derived layout");
+        auto restored = window.row_plan[row]; restored.execution_identity = serial.execution_identity;
+        restored.arena = serial.arena; restored.whole_plan_graph_safe = serial.whole_plan_graph_safe;
+        window_require(!window.row_plan[row].whole_plan_graph_safe &&
+            window.row_plan[row].execution_identity == window.window_execution_identity &&
+            window_serial_fingerprint(restored) == window_serial_fingerprint(serial),
+            "known window row clone changed serial topology, kernel IDs, IO or metadata");
+    }
+    const auto identities = known_window_identities(window, serial);
+    window_require(window.window_execution_identity == identities.first &&
+        window.window_kernel_plan_identity == identities.second, "known window identities no longer match its content");
 }
 
 }  // namespace strix

@@ -575,4 +575,11 @@ HipLauncherCatalog::audit(
         registry);
 }
 
+std::vector<std::uint64_t> HipLauncherCatalog::known_window_position_readers(
+    const CompiledSerialExecution& compiled, const ExecutionLauncherRegistry& registry) const {
+    if (device_graph_inputs_ || alternate_lm_head_)
+        throw std::invalid_argument("known window position readers require the eager floating catalog");
+    return indexed_attention_.known_window_position_readers(compiled, registry);
+}
+
 }  // namespace strix

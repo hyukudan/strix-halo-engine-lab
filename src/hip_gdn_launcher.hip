@@ -17,6 +17,7 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -875,6 +876,122 @@ void project_prefetch8_wave8_q8_fp32_to_bf16_kernel(
         partial[1] = gdn_output_virtual_tree_add(partial[1], partial[3]);
         partial[0] = gdn_output_virtual_tree_add(partial[0], partial[1]);
         output[row] = float_to_bf16(partial[0]);
+    }
+}
+
+
+// New-only rows2 arithmetic. The selected wave8 input ISA binds coefficient
+// to src0 and BF16 activation to src1; its FP32 output counterpart reverses
+// those two operands. Both selected trees bind lower/self to src0.
+__device__ __forceinline__ float gdn_known_window_q8_coefficient(
+    unsigned scale_bits, float code) {
+    float result;
+    asm volatile("v_fma_mix_f32 %0, %1, %2, neg(0) op_sel_hi:[1,0,0]"
+                 : "=v"(result) : "v"(scale_bits), "v"(code));
+    return result;
+}
+__device__ __forceinline__ float gdn_known_window_tree_add(float lower, float upper) {
+    float result;
+    asm volatile("v_add_f32 %0, %1, %2" : "=v"(result) : "v"(lower), "v"(upper));
+    return result;
+}
+template <bool Bf16Input>
+__device__ __forceinline__ void gdn_known_window_q8_rows2_dot(
+    const void* input0, const void* input1, const void* weights,
+    std::uint32_t width, std::uint32_t out, float (&result)[2]) {
+    const auto lane = static_cast<std::uint32_t>(threadIdx.x) % 32U;
+    float partial[2][8]{};
+    const auto* blocks = static_cast<const Q8Block*>(weights) +
+        static_cast<std::uint64_t>(out) * (width / 32U);
+    for (std::uint64_t chunk = 0; chunk < width; chunk += 256U) {
+        const auto base = chunk + 8U * lane;
+        if (base < width) {
+            const auto& block = blocks[base / 32U];
+            std::int8_t codes[8];
+#pragma unroll
+            for (unsigned local = 0; local < 8U; ++local)
+                codes[local] = block.values[base % 32U + local];
+            const auto scale_bits = static_cast<unsigned>(__half_as_ushort(block.scale));
+            float values[2][8];
+#pragma unroll
+            for (unsigned local = 0; local < 8U; ++local) {
+                if constexpr (Bf16Input) {
+                    values[0][local] = bf16_to_float(static_cast<const std::uint16_t*>(input0)[base + local]);
+                    values[1][local] = bf16_to_float(static_cast<const std::uint16_t*>(input1)[base + local]);
+                } else {
+                    values[0][local] = static_cast<const float*>(input0)[base + local];
+                    values[1][local] = static_cast<const float*>(input1)[base + local];
+                }
+            }
+#pragma unroll
+            for (unsigned local = 0; local < 8U; ++local) {
+                // One decoded coefficient is reused by two independent leaf chains.
+                const float coefficient = gdn_known_window_q8_coefficient(scale_bits,
+                    static_cast<float>(codes[local]));
+                if constexpr (Bf16Input) {
+                    asm volatile("v_fmac_f32 %0, %1, %2" : "+v"(partial[0][local])
+                                 : "v"(coefficient), "v"(values[0][local]));
+                    asm volatile("v_fmac_f32 %0, %1, %2" : "+v"(partial[1][local])
+                                 : "v"(coefficient), "v"(values[1][local]));
+                } else {
+                    asm volatile("v_fmac_f32 %0, %1, %2" : "+v"(partial[0][local])
+                                 : "v"(values[0][local]), "v"(coefficient));
+                    asm volatile("v_fmac_f32 %0, %1, %2" : "+v"(partial[1][local])
+                                 : "v"(values[1][local]), "v"(coefficient));
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (unsigned distance = 16U; distance; distance /= 2U) {
+#pragma unroll
+        for (unsigned row = 0; row < 2U; ++row) {
+#pragma unroll
+            for (unsigned local = 0; local < 8U; ++local) {
+                const float partner = __shfl_down(partial[row][local], distance, 32);
+                if constexpr (Bf16Input) {
+                    if (lane < distance)
+                        partial[row][local] = gdn_known_window_tree_add(partial[row][local], partner);
+                } else partial[row][local] = gdn_known_window_tree_add(partial[row][local], partner);
+            }
+        }
+    }
+    if (lane == 0U) {
+#pragma unroll
+        for (unsigned row = 0; row < 2U; ++row) {
+            auto* values = partial[row];
+            values[0] = gdn_known_window_tree_add(values[0], values[4]);
+            values[1] = gdn_known_window_tree_add(values[1], values[5]);
+            values[2] = gdn_known_window_tree_add(values[2], values[6]);
+            values[3] = gdn_known_window_tree_add(values[3], values[7]);
+            values[0] = gdn_known_window_tree_add(values[0], values[2]);
+            values[1] = gdn_known_window_tree_add(values[1], values[3]);
+            result[row] = gdn_known_window_tree_add(values[0], values[1]);
+        }
+    }
+}
+__global__ __launch_bounds__(256)
+void project_wave8_q8_bf16_to_fp32_rows2_kernel(
+    const std::uint16_t* input0, const std::uint16_t* input1, const void* weights,
+    std::uint32_t width, std::uint32_t outputs, float* output0, float* output1) {
+    const auto out = static_cast<std::uint32_t>(blockIdx.x) * 8U + static_cast<std::uint32_t>(threadIdx.x) / 32U;
+    if (out >= outputs) return; // complete-wave guard, no block barriers
+    float result[2]{};
+    gdn_known_window_q8_rows2_dot<true>(input0, input1, weights, width, out, result);
+    if ((threadIdx.x % 32U) == 0U) {
+        output0[out] = round_bf16(result[0]); output1[out] = round_bf16(result[1]);
+    }
+}
+__global__ __launch_bounds__(256)
+void project_wave8_q8_fp32_to_bf16_rows2_kernel(
+    const float* input0, const float* input1, const void* weights,
+    std::uint32_t width, std::uint32_t outputs, std::uint16_t* output0, std::uint16_t* output1) {
+    const auto out = static_cast<std::uint32_t>(blockIdx.x) * 8U + static_cast<std::uint32_t>(threadIdx.x) / 32U;
+    if (out >= outputs) return;
+    float result[2]{};
+    gdn_known_window_q8_rows2_dot<false>(input0, input1, weights, width, out, result);
+    if ((threadIdx.x % 32U) == 0U) {
+        output0[out] = float_to_bf16(result[0]); output1[out] = float_to_bf16(result[1]);
     }
 }
 
@@ -2114,9 +2231,18 @@ Workspace workspace_for(
     return result;
 }
 
-void launch_gdn(
-    const ExecutionDispatchContext& context,
-    void* user_data) {
+struct PreparedGdnLaunch {
+    ExecutionBufferAddress input, output, temporary;
+    Workspace workspace;
+    GdnTensors tensors;
+    SessionStateAddress matrix_state, conv_state;
+    std::uint32_t hidden, key_heads, value_heads, head_dim, value_width, conv_width, kernel;
+    ProjectionMode projection_mode;
+    bool graph_capture;
+};
+
+PreparedGdnLaunch prepare_gdn_launch(
+    const ExecutionDispatchContext& context, const HipGdnLauncherConfig* config_ptr) {
     if (context.op !=
         SerialOp::gated_delta_net) {
         throw std::invalid_argument(
@@ -2134,15 +2260,12 @@ void launch_gdn(
         throw std::invalid_argument(
             "HIP GDN v1 supports only C1 one-row decode");
     }
-    if (user_data == nullptr) {
+    if (config_ptr == nullptr) {
         throw std::invalid_argument(
             "HIP GDN requires configuration");
     }
 
-    const auto& config =
-        *static_cast<
-            HipGdnLauncherConfig*>(
-                user_data);
+    const auto& config = *config_ptr;
     validate_config(config);
 
     if (config.wave8_q8_input_projections || config.wave8_q8_output_projection) {
@@ -2330,11 +2453,6 @@ void launch_gdn(
             "HIP GDN persistent state bindings are invalid");
     }
 
-    const auto* hidden_input =
-        reinterpret_cast<
-            const std::uint16_t*>(
-                input.address);
-
     if (const auto* graph = current_hip_launch_context(); graph && graph->graph_capture) {
         if (!config.enable_device_graph_inputs) {
             throw std::invalid_argument("GDN device graph inputs are not explicitly enabled");
@@ -2362,6 +2480,29 @@ void launch_gdn(
                 tensor->runtime->allocation_generation, tensor->manifest->ggml_type == 0 ? 4U : 2U});
         }
         (void)prepare_graph_operator_control(request);
+    }
+    return {input, output, temporary, workspace, tensors, matrix_state, conv_state,
+            hidden, key_heads, value_heads, head_dim, value_width, conv_width, kernel,
+            projection_mode, current_hip_launch_context() && current_hip_launch_context()->graph_capture};
+}
+
+void preflight_gdn(const ExecutionDispatchContext& context, void* user_data) {
+    static_cast<void>(prepare_gdn_launch(context, static_cast<const HipGdnLauncherConfig*>(user_data)));
+}
+
+void launch_gdn(const ExecutionDispatchContext& context, void* user_data) {
+    const auto prepared = prepare_gdn_launch(context, static_cast<const HipGdnLauncherConfig*>(user_data));
+    const auto& config = *static_cast<const HipGdnLauncherConfig*>(user_data);
+    const auto& input = prepared.input; const auto& output = prepared.output;
+    const auto& workspace = prepared.workspace; const auto& tensors = prepared.tensors;
+    const auto& matrix_state = prepared.matrix_state; const auto& conv_state = prepared.conv_state;
+    const auto hidden = prepared.hidden, key_heads = prepared.key_heads, value_heads = prepared.value_heads;
+    const auto head_dim = prepared.head_dim, value_width = prepared.value_width, conv_width = prepared.conv_width;
+    const auto kernel = prepared.kernel;
+    const auto projection_mode = prepared.projection_mode;
+    const auto* hidden_input = reinterpret_cast<const std::uint16_t*>(input.address);
+    if (prepared.graph_capture) {
+        const auto* graph = current_hip_launch_context();
         hipLaunchKernelGGL(validate_gdn_graph_position, dim3(1), dim3(1), 0, hip_execution_stream(),
             hip_graph_position(), graph->context_tokens, hip_graph_status());
         check_hip(hipGetLastError(), "HIP GDN device position validation");
@@ -2640,7 +2781,348 @@ std::uint64_t implementation_identity(
     return hash;
 }
 
+
+// R2 consumes the same complete pure host admission as the R1 factory.
+using GdnKnownWindowRow = PreparedGdnLaunch;
+
+void launch_gdn_known_window_core(const GdnKnownWindowRow& row,
+    const HipGdnLauncherConfig& config) {
+    const auto& workspace = row.workspace; const auto& tensors = row.tensors;
+    const auto& matrix_state = row.matrix_state; const auto& conv_state = row.conv_state;
+    const auto key_heads = row.key_heads, value_heads = row.value_heads, head_dim = row.head_dim;
+    const auto value_width = row.value_width, conv_width = row.conv_width, kernel = row.kernel;
+    const auto conv_blocks =
+        (conv_width +
+         kProjectionThreads - 1U) /
+        kProjectionThreads;
+    hipLaunchKernelGGL(
+        conv_update_kernel,
+        dim3(conv_blocks),
+        dim3(kProjectionThreads),
+        0,
+        hip_execution_stream(),
+        workspace.qkv,
+        reinterpret_cast<
+            std::uint16_t*>(
+                conv_state.address),
+        reinterpret_cast<const void*>(
+            tensors.conv.runtime->
+                address),
+        small_weight_kind(
+            tensors.conv.manifest->
+                ggml_type),
+        conv_width,
+        kernel, hip_graph_status());
+    check_hip(
+        hipGetLastError(),
+        "HIP GDN causal convolution launch");
+
+    const auto parameter_blocks =
+        (value_heads +
+         kProjectionThreads - 1U) /
+        kProjectionThreads;
+    hipLaunchKernelGGL(
+        transform_beta_gate_kernel,
+        dim3(parameter_blocks),
+        dim3(kProjectionThreads),
+        0,
+        hip_execution_stream(),
+        workspace.beta,
+        workspace.gate,
+        reinterpret_cast<const void*>(
+            tensors.dt.runtime->
+                address),
+        small_weight_kind(
+            tensors.dt.manifest->
+                ggml_type),
+        reinterpret_cast<const void*>(
+            tensors.a.runtime->
+                address),
+        small_weight_kind(
+            tensors.a.manifest->
+                ggml_type),
+        value_heads);
+    check_hip(
+        hipGetLastError(),
+        "HIP GDN beta/gate transform launch");
+
+    hipLaunchKernelGGL(
+        normalize_qk_kernel,
+        dim3(key_heads * 2U),
+        dim3(kRecurrentThreads),
+        0,
+        hip_execution_stream(),
+        workspace.qkv,
+        key_heads,
+        head_dim,
+        config.model.
+            gdn_qk_l2_epsilon, hip_graph_status());
+    check_hip(
+        hipGetLastError(),
+        "HIP GDN q/k normalization launch");
+
+    if (hip_graph_status() != nullptr) {
+        hipLaunchKernelGGL(validate_gdn_graph_values, dim3(32), dim3(kProjectionThreads), 0,
+            hip_execution_stream(), workspace.qkv,
+            static_cast<std::uint64_t>(conv_width) + value_width + value_heads * 2ULL, hip_graph_status());
+        check_hip(hipGetLastError(), "HIP GDN finite recurrent input validation");
+    }
+    const auto tiles =
+        head_dim /
+        kValueTile;
+    hipLaunchKernelGGL(
+        recurrent_step_kernel,
+        dim3(value_heads * tiles),
+        dim3(kRecurrentThreads),
+        0,
+        hip_execution_stream(),
+        workspace.qkv,
+        workspace.beta,
+        workspace.gate,
+        reinterpret_cast<float*>(
+            matrix_state.address),
+        workspace.core,
+        key_heads,
+        value_heads,
+        head_dim, hip_graph_status());
+    check_hip(
+        hipGetLastError(),
+        "HIP GDN recurrent update launch");
+    if (hip_graph_status() != nullptr) {
+        hipLaunchKernelGGL(validate_gdn_graph_values, dim3(32), dim3(kProjectionThreads), 0,
+            hip_execution_stream(), workspace.core, value_width, hip_graph_status());
+        check_hip(hipGetLastError(), "HIP GDN finite recurrent output validation");
+    }
+
+    hipLaunchKernelGGL(
+        gated_rms_norm_kernel,
+        dim3(value_heads),
+        dim3(kRecurrentThreads),
+        0,
+        hip_execution_stream(),
+        workspace.core,
+        workspace.z,
+        reinterpret_cast<const void*>(
+            tensors.norm.runtime->
+                address),
+        small_weight_kind(
+            tensors.norm.manifest->
+                ggml_type),
+        value_heads,
+        head_dim,
+        config.model.
+            rms_norm_epsilon, hip_graph_status());
+    check_hip(
+        hipGetLastError(),
+        "HIP GDN gated RMSNorm launch");
+
+}
+
+
+struct GdnKnownWindowRange { std::uintptr_t address; std::uint64_t bytes; };
+void validate_gdn_known_window_range(GdnKnownWindowRange view, std::uint64_t alignment) {
+    if (!view.address || view.address % alignment || !view.bytes ||
+        view.bytes > std::numeric_limits<std::uintptr_t>::max() - view.address)
+        throw std::invalid_argument("GDN known-window owner alignment or extent is invalid");
+}
+void require_gdn_known_window_disjoint(GdnKnownWindowRange a, GdnKnownWindowRange b) {
+    if (a.address < b.address + b.bytes && b.address < a.address + a.bytes)
+        throw std::invalid_argument("GDN known-window writable or row views alias");
+}
+std::array<GdnKnownWindowRow, 2> prepare_gdn_known_window_rows(
+    std::span<const ExecutionDispatchContext, 2> rows, const HipGdnLauncherConfig& config) {
+    validate_config(config);
+    const auto& model = config.model;
+    if (!config.virtual_q8_input_projections || !config.prefetch_q8_input_projections ||
+        !config.wave8_q8_input_projections || !config.virtual_q8_output_projection ||
+        !config.wave8_q8_output_projection || config.enable_device_graph_inputs ||
+        model.hidden_size != 2560U || model.hidden_layers != 48U || model.full_attention_interval != 4U ||
+        model.gdn_key_heads != 16U || model.gdn_value_heads != 48U ||
+        model.gdn_key_head_dim != 128U || model.gdn_value_head_dim != 128U || model.gdn_conv_kernel != 4U)
+        throw std::invalid_argument("GDN known-window R2 requires canonical wave8 Q8 input and output");
+    const auto* scope = current_hip_launch_context();
+    if (!scope || scope->graph_capture || !hip_execution_stream() || hip_graph_status() || hip_graph_position())
+        throw std::invalid_argument("GDN known-window R2 requires one owned eager stream");
+    hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
+    check_hip(hipStreamIsCapturing(hip_execution_stream(), &capture), "query GDN known-window R2 capture");
+    if (capture != hipStreamCaptureStatusNone)
+        throw std::invalid_argument("GDN known-window R2 cannot be captured");
+    ExecutionBindingRequest selected;
+    const auto expected_kernel = kernel_id(selected, config);
+    const auto states = PersistentState::recurrent_matrix | PersistentState::convolution_history;
+    for (const auto& context : rows) {
+        if (!context.execution_identity || !context.arena || !context.resources || !context.resources->scratch ||
+            (context.memory && context.memory != context.resources->scratch) ||
+            context.prepared_tensor_views || context.prepared_arena_views ||
+            !context.resources->session_state_layout || !context.resources->session_state_memory ||
+            (context.session_state_layout && context.session_state_layout != context.resources->session_state_layout) ||
+            (context.session_state_memory && context.session_state_memory != context.resources->session_state_memory))
+            throw std::invalid_argument("GDN known-window R2 requires its current window resource bindings");
+        validate_execution_memory_binding(context.execution_identity, *context.arena, *context.resources->scratch);
+        if (!context.kernel_id || *context.kernel_id != expected_kernel ||
+            context.reads_state != states || context.writes_state != states)
+            throw std::invalid_argument("GDN known-window R2 selected serial variant or state flags differ");
+        if (context.position >= context.resources->session_state_layout->context_tokens ||
+            context.position >= model.max_position_embeddings)
+            throw std::invalid_argument("GDN known-window R2 position exceeds capacity");
+        // Validate whole supplied scratch views before workspace pointer arithmetic.
+        if (context.reads.size() != 1U || context.writes.size() != 1U || context.temporaries.size() != 1U)
+            throw std::invalid_argument("GDN known-window R2 requires exact row IO");
+        for (const auto view : {resolve_dispatch_read(context, 0), resolve_dispatch_write(context, 0),
+                               resolve_dispatch_temporary(context, 0)}) {
+            validate_gdn_known_window_range({view.address, view.bytes}, 16U);
+            const auto& owner = *context.resources->scratch;
+            if (view.address < owner.arena_base || view.address - owner.arena_base > owner.arena_bytes ||
+                view.bytes > owner.arena_bytes - (view.address - owner.arena_base))
+                throw std::invalid_argument("GDN known-window row view exceeds its physical owner");
+        }
+    }
+    const auto& a = rows[0]; const auto& b = rows[1];
+    if (a.execution_identity != b.execution_identity || a.step_id != b.step_id || a.op != b.op || a.layer != b.layer ||
+        a.reads[0] != b.reads[0] || a.writes[0] != b.writes[0] || a.temporaries[0] != b.temporaries[0] ||
+        a.resources->scratch != b.resources->scratch ||
+        a.resources->model_manifest != b.resources->model_manifest ||
+        a.resources->model_weights != b.resources->model_weights || a.resources->tensor_access != b.resources->tensor_access ||
+        a.resources->session_state_layout != b.resources->session_state_layout ||
+        a.resources->session_state_memory != b.resources->session_state_memory ||
+        a.position == std::numeric_limits<std::uint64_t>::max() || b.position != a.position + 1U)
+        throw std::invalid_argument("GDN known-window R2 rows do not share one ordered execution");
+    // Every incumbent row-level deep check completes before any kernel submission.
+    std::array<GdnKnownWindowRow, 2> result{
+        prepare_gdn_launch(a, &config), prepare_gdn_launch(b, &config)};
+    const auto same_state = [](const SessionStateAddress& x, const SessionStateAddress& y) {
+        return x.component == y.component && x.storage == y.storage && x.address == y.address &&
+            x.bytes == y.bytes && x.allocation_generation == y.allocation_generation && x.provisional == y.provisional;
+    };
+    if (!same_state(result[0].matrix_state, result[1].matrix_state) ||
+        !same_state(result[0].conv_state, result[1].conv_state))
+        throw std::invalid_argument("GDN known-window R2 causal states differ between rows");
+    const std::array<TensorPair GdnTensors::*, 9> members{
+        &GdnTensors::qkv, &GdnTensors::z, &GdnTensors::beta, &GdnTensors::alpha, &GdnTensors::conv,
+        &GdnTensors::dt, &GdnTensors::a, &GdnTensors::norm, &GdnTensors::out};
+    std::array<GdnKnownWindowRange, 11> readonly{};
+    readonly[0] = {result[0].input.address, result[0].input.bytes};
+    readonly[1] = {result[1].input.address, result[1].input.bytes};
+    require_gdn_known_window_disjoint(readonly[0], readonly[1]);
+    for (std::size_t i = 0; i < members.size(); ++i) {
+        const auto& x = result[0].tensors.*members[i]; const auto& y = result[1].tensors.*members[i];
+        if (x.manifest != y.manifest || x.runtime != y.runtime)
+            throw std::invalid_argument("GDN known-window R2 weights differ between rows");
+        readonly[i + 2U] = {x.runtime->address, x.runtime->bytes};
+        validate_gdn_known_window_range(readonly[i + 2U], x.manifest->ggml_type == 0U ? 4U : 2U);
+    }
+    for (const auto member : {&GdnTensors::qkv, &GdnTensors::z, &GdnTensors::beta, &GdnTensors::alpha, &GdnTensors::out})
+        if ((result[0].tensors.*member).manifest->ggml_type != 8U)
+            throw std::invalid_argument("GDN known-window R2 requires all five Q8_0 projections");
+    const std::array<GdnKnownWindowRange, 6> writable{{
+        {result[0].output.address, result[0].output.bytes}, {result[1].output.address, result[1].output.bytes},
+        {result[0].temporary.address, result[0].temporary.bytes}, {result[1].temporary.address, result[1].temporary.bytes},
+        {result[0].matrix_state.address, result[0].matrix_state.bytes},
+        {result[0].conv_state.address, result[0].conv_state.bytes}}};
+    for (std::size_t i = 0; i < writable.size(); ++i) {
+        validate_gdn_known_window_range(writable[i], i == 5U ? 2U : 4U);
+        for (const auto input : readonly) require_gdn_known_window_disjoint(writable[i], input);
+        for (std::size_t j = 0; j < i; ++j) require_gdn_known_window_disjoint(writable[i], writable[j]);
+    }
+    check_hip(hipPeekAtLastError(), "GDN known-window R2 pre-enqueue stale error");
+    return result;
+}
+
 }  // namespace
+
+
+void gdn_known_window_r2_preflight(std::span<const ExecutionDispatchContext, 2> rows,
+    const HipGdnLauncherConfig& config) {
+    static_cast<void>(prepare_gdn_known_window_rows(rows, config));
+}
+void gdn_known_window_r2_launch(std::span<const ExecutionDispatchContext, 2> rows,
+    const HipGdnLauncherConfig& config) {
+    // Repeat current-view validation at this public entry; preflight isn't a permit.
+    const auto prepared = prepare_gdn_known_window_rows(rows, config);
+    const auto& a = prepared[0]; const auto& b = prepared[1];
+    const auto* input0 = reinterpret_cast<const std::uint16_t*>(a.input.address);
+    const auto* input1 = reinterpret_cast<const std::uint16_t*>(b.input.address);
+    const auto project = [&](const TensorPair& tensor, std::uint32_t outputs, float* out0, float* out1) {
+        hipLaunchKernelGGL(project_wave8_q8_bf16_to_fp32_rows2_kernel,
+            dim3((outputs + 7U) / 8U), dim3(kProjectionThreads), 0, hip_execution_stream(),
+            input0, input1, reinterpret_cast<const void*>(tensor.runtime->address),
+            a.hidden, outputs, out0, out1);
+        check_hip(hipGetLastError(), "GDN known-window R2 input projection launch");
+    };
+    project(a.tensors.qkv, a.conv_width, a.workspace.qkv, b.workspace.qkv);
+    project(a.tensors.z, a.value_width, a.workspace.z, b.workspace.z);
+    project(a.tensors.beta, a.value_heads, a.workspace.beta, b.workspace.beta);
+    project(a.tensors.alpha, a.value_heads, a.workspace.gate, b.workspace.gate);
+    // Causality is unchanged: the same stream finishes row0's state update
+    // before row1 reads that matrix/convolution state. Workspace rows are disjoint.
+    launch_gdn_known_window_core(a, config);
+    launch_gdn_known_window_core(b, config);
+    hipLaunchKernelGGL(project_wave8_q8_fp32_to_bf16_rows2_kernel,
+        dim3((a.hidden + 7U) / 8U), dim3(kProjectionThreads), 0, hip_execution_stream(),
+        a.workspace.core, b.workspace.core, reinterpret_cast<const void*>(a.tensors.out.runtime->address),
+        a.value_width, a.hidden, reinterpret_cast<std::uint16_t*>(a.output.address),
+        reinterpret_cast<std::uint16_t*>(b.output.address));
+    check_hip(hipGetLastError(), "GDN known-window R2 output projection launch");
+}
+
+
+#ifdef STRIX_BUILD_KNOWN_WINDOW_DIAGNOSTIC
+void gdn_known_window_r2_projection_probe(GdnKnownWindowProjectionDirection direction,
+    GdnKnownWindowProjectionMode mode, std::span<const GdnKnownWindowProjectionView, 2> input,
+    GdnKnownWindowProjectionView weights, std::span<const GdnKnownWindowProjectionView, 2> output,
+    std::uint32_t width, std::uint32_t outputs, void* stream) {
+    if ((direction != GdnKnownWindowProjectionDirection::bf16_to_fp32 &&
+         direction != GdnKnownWindowProjectionDirection::fp32_to_bf16) ||
+        (mode != GdnKnownWindowProjectionMode::incumbent_row_loop && mode != GdnKnownWindowProjectionMode::rows2) ||
+        !stream || static_cast<hipStream_t>(stream) == hipStreamPerThread || static_cast<hipStream_t>(stream) == hipStreamLegacy)
+        throw std::invalid_argument("GDN known-window projection diagnostic mode or stream is invalid");
+    const bool bf16 = direction == GdnKnownWindowProjectionDirection::bf16_to_fp32;
+    for (unsigned row = 0; row < 2U; ++row) {
+        const q8_projection_organization::View x{input[row].address, input[row].bytes};
+        const q8_projection_organization::View w{weights.address, weights.bytes};
+        const q8_projection_organization::View y{output[row].address, output[row].bytes};
+        if (bf16) q8_projection_organization::validate_views(width, outputs, x, w, y);
+        else q8_projection_organization::validate_fp32_bf16_views(width, outputs, x, w, y);
+    }
+    for (unsigned row = 0; row < 2U; ++row) {
+        const GdnKnownWindowRange write{output[row].address, output[row].bytes};
+        for (const auto read : input) require_gdn_known_window_disjoint(write, {read.address, read.bytes});
+        require_gdn_known_window_disjoint(write, {weights.address, weights.bytes});
+    }
+    require_gdn_known_window_disjoint({output[0].address, output[0].bytes}, {output[1].address, output[1].bytes});
+    const auto native_stream = static_cast<hipStream_t>(stream);
+    const auto* packed = reinterpret_cast<const void*>(weights.address);
+    check_hip(hipPeekAtLastError(), "GDN known-window diagnostic pre-enqueue stale error");
+    if (mode == GdnKnownWindowProjectionMode::incumbent_row_loop) {
+        for (unsigned row = 0; row < 2U; ++row) {
+            if (bf16) {
+                hipLaunchKernelGGL(project_prefetch8_wave8_q8_bf16_to_fp32_kernel,
+                    dim3((outputs + 7U) / 8U), dim3(kProjectionThreads), 0, native_stream,
+                    reinterpret_cast<const std::uint16_t*>(input[row].address), packed, width, outputs,
+                    reinterpret_cast<float*>(output[row].address));
+            } else {
+                hipLaunchKernelGGL(project_prefetch8_wave8_q8_fp32_to_bf16_kernel,
+                    dim3((outputs + 7U) / 8U), dim3(kProjectionThreads), 0, native_stream,
+                    reinterpret_cast<const float*>(input[row].address), packed, width, outputs,
+                    reinterpret_cast<std::uint16_t*>(output[row].address));
+            }
+            check_hip(hipGetLastError(), "GDN known-window diagnostic incumbent projection");
+        }
+    } else if (bf16) {
+        hipLaunchKernelGGL(project_wave8_q8_bf16_to_fp32_rows2_kernel,
+            dim3((outputs + 7U) / 8U), dim3(kProjectionThreads), 0, native_stream,
+            reinterpret_cast<const std::uint16_t*>(input[0].address), reinterpret_cast<const std::uint16_t*>(input[1].address),
+            packed, width, outputs, reinterpret_cast<float*>(output[0].address), reinterpret_cast<float*>(output[1].address));
+        check_hip(hipGetLastError(), "GDN known-window diagnostic R2 input projection");
+    } else {
+        hipLaunchKernelGGL(project_wave8_q8_fp32_to_bf16_rows2_kernel,
+            dim3((outputs + 7U) / 8U), dim3(kProjectionThreads), 0, native_stream,
+            reinterpret_cast<const float*>(input[0].address), reinterpret_cast<const float*>(input[1].address),
+            packed, width, outputs, reinterpret_cast<std::uint16_t*>(output[0].address), reinterpret_cast<std::uint16_t*>(output[1].address));
+        check_hip(hipGetLastError(), "GDN known-window diagnostic R2 output projection");
+    }
+}
+#endif
 
 void register_hip_gdn_kernel_variant(
     const ModelContract& model,
@@ -2792,6 +3274,7 @@ make_hip_gdn_launcher(
             *config),
         &launch_gdn,
         config,
+        &preflight_gdn,
     };
 }
 

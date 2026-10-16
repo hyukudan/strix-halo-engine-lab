@@ -9,9 +9,8 @@
 
 namespace strix {
 
-void launch_position_prepare(
-    const ExecutionDispatchContext& context,
-    void*) {
+namespace {
+SessionStateAddress prepare_position_metadata(const ExecutionDispatchContext& context) {
     if (context.op !=
         SerialOp::position_prepare) {
         throw std::invalid_argument(
@@ -32,6 +31,15 @@ void launch_position_prepare(
             "position launcher requires writable host position state");
     }
 
+    return state;
+}
+void preflight_position_prepare(const ExecutionDispatchContext& context, void*) {
+    (void)prepare_position_metadata(context);
+}
+} // namespace
+
+void launch_position_prepare(const ExecutionDispatchContext& context, void*) {
+    const auto state = prepare_position_metadata(context);
     const auto position =
         context.position;
     std::memcpy(
@@ -106,6 +114,7 @@ make_position_prepare_launcher() {
         position_prepare_launcher_identity,
         &launch_position_prepare,
         nullptr,
+        &preflight_position_prepare,
     };
 }
 

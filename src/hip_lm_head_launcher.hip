@@ -614,7 +614,13 @@ void launch_by_weight(
         "unreachable LM-head weight kind");
 }
 
-void launch_lm_head(
+struct PreparedLmHead {
+    const HipLmHeadLauncherConfig& config;
+    ExecutionBufferAddress hidden, logits;
+    const RuntimeTensorBinding& runtime_tensor;
+    WeightKind kind;
+};
+PreparedLmHead prepare_lm_head(
     const ExecutionDispatchContext& context,
     void* user_data) {
     if (context.op !=
@@ -742,6 +748,29 @@ void launch_lm_head(
             {hidden.address, hidden.bytes}, {runtime_tensor.address, runtime_tensor.bytes},
             {logits.address, logits.bytes});
     }
+
+    // The virtual-wave branch checks this again at dispatch. Keep its static
+    // type requirement in the shared preparation before a window can enqueue.
+    if (config.virtual_q8_wave && kind != WeightKind::q8_0)
+        throw std::invalid_argument("virtual-wave LM head supports Q8_0 weights only");
+    return {config, hidden, logits, runtime_tensor, kind};
+}
+
+void preflight_lm_head(const ExecutionDispatchContext& context, void* user_data) {
+    if (const auto* scope = current_hip_launch_context(); scope && scope->graph_capture)
+        throw std::invalid_argument("known-window launcher preflight requires eager scope");
+    static_cast<void>(prepare_lm_head(context, user_data));
+}
+
+void launch_lm_head(
+    const ExecutionDispatchContext& context,
+    void* user_data) {
+    const auto prepared = prepare_lm_head(context, user_data);
+    const auto& config = prepared.config;
+    const auto& hidden = prepared.hidden;
+    const auto& logits = prepared.logits;
+    const auto& runtime_tensor = prepared.runtime_tensor;
+    const auto kind = prepared.kind;
 
     switch (config.input) {
     case HipActivationStorage::bf16:
@@ -918,6 +947,7 @@ make_hip_lm_head_launcher(
             *config),
         &launch_lm_head,
         config,
+        &preflight_lm_head,
     };
 }
 

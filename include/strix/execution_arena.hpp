@@ -4,6 +4,7 @@
 #include "strix/execution_io.hpp"
 #include "strix/model_contract.hpp"
 
+#include <array>
 #include <cstdint>
 #include <vector>
 
@@ -23,6 +24,18 @@ struct ExecutionArenaPlan {
     std::uint64_t naive_nonaliased_bytes = 0;
     std::vector<ExecutionArenaAllocation> allocations;
 };
+
+// Two known inputs share one physical arena. Each row view retains the exact
+// serial payload sizes and uses; only offsets change. Strides are indexed in
+// the same order as physical.allocations, including lifetime-reused regions.
+struct KnownWindowArena {
+    ExecutionArenaPlan physical;
+    std::vector<std::uint64_t> row_stride;
+    std::array<ExecutionArenaPlan, 2> row_view;
+};
+
+[[nodiscard]] KnownWindowArena build_known_window_arena(
+    const ExecutionArenaPlan& serial, std::uint64_t alignment = 256);
 
 [[nodiscard]] ExecutionArenaPlan build_serial_execution_arena_plan(
     const ModelContract& model,

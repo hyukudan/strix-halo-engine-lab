@@ -3,6 +3,7 @@
 
 #include "strix/dispatch_resources.hpp"
 #include "strix/ple_lookup.hpp"
+#include "strix/iq4_nl.hpp"
 #include "strix/ple_workspace.hpp"
 #include "strix/graph_ple.hpp"
 
@@ -1091,9 +1092,16 @@ __global__ void graph_ple_history_kernel(const std::uint32_t* token, const std::
     next[count - 1U] = *token;
 }
 
-void launch_ple(
-    const ExecutionDispatchContext& context,
-    void* user_data) {
+struct PreparedPleLaunch {
+    const HipPleLauncherConfig* config;
+    ExecutionBufferAddress input, output, temporary;
+    PleWorkspaceLayout workspace_layout;
+    std::uint64_t expanded;
+    PleTensors tensors;
+    SessionStateAddress ngram_state, conv_state;
+    PleHashContract hash_contract;
+};
+PreparedPleLaunch prepare_ple_launch(const ExecutionDispatchContext& context, void* user_data) {
     if (context.op !=
         SerialOp::ple) {
         throw std::invalid_argument(
@@ -1221,6 +1229,65 @@ void launch_ple(
     const auto hash_contract =
         build_ple_hash_contract(
             config.model);
+
+    return {&config, input, output, temporary, workspace_layout, expanded, tensors,
+        ngram_state, conv_state, hash_contract};
+}
+void preflight_ple(const ExecutionDispatchContext& context, void* user_data) {
+    const auto prepared = prepare_ple_launch(context, user_data);
+    if (const auto* scope = current_hip_launch_context(); scope && scope->graph_capture)
+        throw std::invalid_argument("known window PLE preflight is eager only");
+    // P0 uses the existing synchronous lookup/upload boundary. Never start or
+    // finish the single pending backend lookup during metadata admission.
+    if (prepared.config->upload_pool || prepared.config->enable_owned_event_upload)
+        throw std::invalid_argument("known window PLE requires synchronous upload without an event pool");
+    if (!dynamic_cast<FileMappedPleLookupBackend*>(context.resources->ple_lookup))
+        throw std::invalid_argument("known window PLE currently admits the synchronous file-mapped backend only");
+    const auto& table = *prepared.tensors.table.manifest;
+    const auto& binding = *prepared.tensors.table.runtime;
+    if (table.dimensions.size() != 2 || !table.dimensions[0] ||
+        table.dimensions[1] < prepared.hash_contract.minimum_table_rows ||
+        (table.ggml_type != 30U && table.ggml_type != 20U) ||
+        table.dimensions[0] > std::numeric_limits<std::uint64_t>::max() / 2U ||
+        table.dimensions[0] * 2U != prepared.hash_contract.row_bytes ||
+        binding.storage != RuntimeTensorStorage::file_mapped || !binding.address ||
+        binding.bytes > std::numeric_limits<std::uintptr_t>::max() - binding.address)
+        throw std::invalid_argument("known window PLE table metadata or mapping is incompatible");
+    auto stored_row_bytes = prepared.hash_contract.row_bytes;
+    if (table.ggml_type == 20U) {
+        if (table.dimensions[0] % iq4_nl::block_elements != 0U)
+            throw std::invalid_argument("known window PLE IQ4_NL rows require complete blocks");
+        stored_row_bytes = table.dimensions[0] / iq4_nl::block_elements * iq4_nl::block_bytes;
+    }
+    if (!stored_row_bytes || table.dimensions[1] > std::numeric_limits<std::uint64_t>::max() / stored_row_bytes ||
+        table.byte_size < table.dimensions[1] * stored_row_bytes || binding.bytes < table.byte_size)
+        throw std::invalid_argument("known window PLE declared table rows exceed the retained mapping");
+    if (context.resources->ple_hash_contract) {
+        const auto& a = *context.resources->ple_hash_contract;
+        const auto& b = prepared.hash_contract;
+        if (a.ngram_size != b.ngram_size || a.heads_per_ngram != b.heads_per_ngram ||
+            a.head_count != b.head_count || a.head_dim != b.head_dim || a.eos_token_id != b.eos_token_id ||
+            a.row_bytes != b.row_bytes || a.multipliers != b.multipliers || a.head_offsets != b.head_offsets ||
+            a.head_vocab_sizes != b.head_vocab_sizes || a.minimum_table_rows != b.minimum_table_rows)
+            throw std::invalid_argument("known window PLE prefetch hash contract differs from the selected launcher");
+    }
+    const auto bytes = static_cast<std::uint64_t>(prepared.hash_contract.head_count) * prepared.hash_contract.row_bytes;
+    if (bytes != prepared.workspace_layout.gathered_bytes || bytes > PleHashContract::maximum_heads * 512ULL)
+        throw std::invalid_argument("PLE gathered upload does not match its exact workspace region");
+}
+
+void launch_ple(const ExecutionDispatchContext& context, void* user_data) {
+    const auto prepared = prepare_ple_launch(context, user_data);
+    const auto& config = *prepared.config;
+    const auto& input = prepared.input;
+    const auto& output = prepared.output;
+    const auto& temporary = prepared.temporary;
+    const auto& workspace_layout = prepared.workspace_layout;
+    const auto expanded = prepared.expanded;
+    const auto& tensors = prepared.tensors;
+    const auto& ngram_state = prepared.ngram_state;
+    const auto& conv_state = prepared.conv_state;
+    const auto& hash_contract = prepared.hash_contract;
 
     alignas(64)
     std::array<
@@ -1772,6 +1839,7 @@ make_hip_ple_launcher(
             *config),
         &launch_ple,
         config,
+        &preflight_ple,
     };
 }
 

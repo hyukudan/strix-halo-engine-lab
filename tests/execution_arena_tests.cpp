@@ -3,6 +3,7 @@
 #include "strix/model_contract.hpp"
 
 #include <algorithm>
+#include <limits>
 
 #include <iostream>
 #include <stdexcept>
@@ -213,6 +214,51 @@ int main() {
     }
     expect(invalid_alignment,
            "zero arena alignment is rejected");
+
+
+    const auto window = strix::build_known_window_arena(aligned);
+    expect(window.row_stride.size() == window.physical.allocations.size(),
+        "known window retains a stride for every actual serial allocation");
+    for (std::size_t index = 0; index < window.physical.allocations.size(); ++index) {
+        const auto& physical = window.physical.allocations[index];
+        const auto& first = window.row_view[0].allocations[index];
+        const auto& second = window.row_view[1].allocations[index];
+        const auto* original = strix::find_arena_allocation(aligned, physical.use);
+        expect(original && first.bytes == original->bytes && second.bytes == original->bytes &&
+            second.offset == first.offset + window.row_stride[index] &&
+            first.offset + first.bytes <= second.offset &&
+            second.offset + second.bytes <= physical.offset + physical.bytes,
+            "known window preserves exact R1 payloads in disjoint aligned row slices");
+        expect(window.row_view[0].total_bytes == window.physical.total_bytes &&
+            window.row_view[1].total_bytes == window.physical.total_bytes,
+            "row views bind the complete physical allocation extent");
+        for (std::size_t previous = 0; previous < index; ++previous) {
+            const auto& other = window.physical.allocations[previous];
+            if (physical.first_step <= other.last_step && other.first_step <= physical.last_step)
+                expect(physical.offset + physical.bytes <= other.offset ||
+                    other.offset + other.bytes <= physical.offset,
+                    "known window never aliases live two-row allocation regions");
+        }
+    }
+    auto duplicate = aligned; duplicate.allocations.push_back(duplicate.allocations.front());
+    bool rejected_window = false;
+    try { (void)strix::build_known_window_arena(duplicate); }
+    catch (const std::invalid_argument&) { rejected_window = true; }
+    expect(rejected_window, "known window rejects duplicated serial uses");
+    auto malformed = aligned; malformed.allocations.front().first_step = malformed.allocations.front().last_step + 1U;
+    rejected_window = false;
+    try { (void)strix::build_known_window_arena(malformed); }
+    catch (const std::invalid_argument&) { rejected_window = true; }
+    expect(rejected_window, "known window rejects malformed source lifetimes");
+    strix::ExecutionArenaPlan huge;
+    huge.alignment = 1; huge.total_bytes = std::numeric_limits<std::uint64_t>::max();
+    auto huge_allocation = aligned.allocations.front();
+    huge_allocation.offset = 0; huge_allocation.bytes = std::numeric_limits<std::uint64_t>::max() / 2U + 1U;
+    huge.allocations.push_back(huge_allocation);
+    rejected_window = false;
+    try { (void)strix::build_known_window_arena(huge,1); }
+    catch (const std::overflow_error&) { rejected_window = true; }
+    expect(rejected_window, "known window rejects doubled row extent overflow");
 
     if (failures == 0) {
         std::cout << "execution arena tests passed\n";

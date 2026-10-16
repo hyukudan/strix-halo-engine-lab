@@ -2262,9 +2262,26 @@ WorkspacePointers workspace_pointers(
     };
 }
 
-void launch_indexed_attention(
-    const ExecutionDispatchContext& context,
-    void* user_data) {
+// Complete metadata-only preparation. GPU input values are never read here.
+struct PreparedIndexedLaunch {
+    ExecutionBufferAddress input, output, temporary;
+    IndexedAttentionWorkspaceLayout workspace_layout;
+    WorkspacePointers workspace;
+    const SerialSessionStateLayout* session_layout;
+    GraphPositionKernelArguments dynamic_position;
+    bool device_graph;
+    SessionStateAddress kv_state, raw_state;
+    IndexedTensors tensors;
+    std::uint32_t hidden, attention_heads, kv_heads, head_dim, attention_width, kv_width;
+    std::uint32_t q_gate_width, index_q_width, index_dim;
+};
+struct PreparedIndexedSelection {
+    std::uint32_t visible, ratio, block_topk, complete_blocks, selected_count;
+    GraphSelectionArguments dynamic_selection;
+};
+
+PreparedIndexedLaunch prepare_indexed_attention_launch(
+    const ExecutionDispatchContext& context, const HipIndexedAttentionLauncherConfig* config_ptr) {
     if (context.op !=
         SerialOp::indexed_attention) {
         throw std::invalid_argument(
@@ -2282,15 +2299,12 @@ void launch_indexed_attention(
         throw std::invalid_argument(
             "HIP indexed-attention v1 supports only C1 one-row execution");
     }
-    if (user_data == nullptr) {
+    if (config_ptr == nullptr) {
         throw std::invalid_argument(
             "HIP indexed attention requires configuration");
     }
 
-    const auto& config =
-        *static_cast<
-            HipIndexedAttentionLauncherConfig*>(
-                user_data);
+    const auto& config = *config_ptr;
     validate_config(config);
     if (config.wave8_q8_output) {
         const auto* scope = current_hip_launch_context();
@@ -2531,6 +2545,111 @@ void launch_indexed_attention(
             {tensor->runtime->address, tensor->runtime->bytes, tensor->runtime->allocation_generation,
              tensor->manifest->ggml_type == 0 ? 4U : 2U});
         (void)prepare_graph_operator_control(request);
+    }
+    return {input, output, temporary, workspace_layout, workspace, &session_layout,
+            dynamic_position, device_graph, kv_state, raw_state, tensors, hidden,
+            attention_heads, kv_heads, head_dim, attention_width, kv_width,
+            q_gate_width, index_q_width, index_dim};
+}
+
+PreparedIndexedSelection prepare_indexed_attention_selection(const ExecutionDispatchContext& context,
+    const PreparedIndexedLaunch& prepared, const ModelContract& model) {
+    const auto& session_layout = *prepared.session_layout;
+    const auto& workspace_layout = prepared.workspace_layout;
+    const auto dynamic_position = prepared.dynamic_position;
+    const auto device_graph = prepared.device_graph;
+    const auto visible64 =
+        device_graph ? session_layout.context_tokens : context.position + 1ULL;
+    if (visible64 >
+        std::numeric_limits<
+            std::uint32_t>::max()) {
+        throw std::overflow_error(
+            "indexed-attention visible token count exceeds uint32");
+    }
+    const auto visible =
+        static_cast<std::uint32_t>(
+            visible64);
+    const auto ratio =
+        checked_u32(
+            model.indexer_compress_ratio,
+            "indexer_compress_ratio");
+    const auto budget =
+        checked_u32(
+            model.indexer_budget,
+            "indexer_budget");
+    const auto complete_blocks =
+        visible / ratio;
+    const auto block_topk =
+        budget / ratio;
+    const auto selected_blocks =
+        std::min(
+            complete_blocks,
+            block_topk);
+    const auto tail =
+        visible -
+        complete_blocks *
+            ratio;
+    const auto selected_count = device_graph ? checked_u32(workspace_layout.maximum_selected_tokens, "maximum_selected_tokens") :
+        selected_blocks *
+            ratio +
+        tail;
+
+    if (selected_count == 0 ||
+        selected_count >
+            workspace_layout.
+                maximum_selected_tokens) {
+        throw std::logic_error(
+            "indexed-attention selected-token count exceeds workspace");
+    }
+
+    const GraphSelectionArguments dynamic_selection{dynamic_position, ratio, block_topk};
+    return {visible, ratio, block_topk, complete_blocks, selected_count, dynamic_selection};
+}
+
+std::uint64_t prepare_indexed_attention_score_grid(std::uint32_t attention_heads,
+    std::uint32_t selected_count) {
+    const auto score_blocks64 =
+        static_cast<std::uint64_t>(
+            attention_heads) *
+        selected_count;
+    if (score_blocks64 >
+        std::numeric_limits<
+            std::uint32_t>::max()) {
+        throw std::overflow_error(
+            "indexed-attention score grid exceeds uint32");
+    }
+    return score_blocks64;
+}
+
+void preflight_indexed_attention(const ExecutionDispatchContext& context, void* user_data) {
+    const auto prepared = prepare_indexed_attention_launch(context,
+        static_cast<const HipIndexedAttentionLauncherConfig*>(user_data));
+    const auto& model = static_cast<const HipIndexedAttentionLauncherConfig*>(user_data)->model;
+    // These guards otherwise occur in nested launch helpers after preceding
+    // projections. Preflight evaluates metadata only; the normal launch keeps
+    // each original check at its original phase.
+    static_cast<void>(checked_u32(model.indexer_n_heads, "indexer_n_heads"));
+    static_cast<void>(checked_u32(model.rotary_dim(), "rotary_dim"));
+    const auto selection = prepare_indexed_attention_selection(context, prepared, model);
+    static_cast<void>(prepare_indexed_attention_score_grid(prepared.attention_heads, selection.selected_count));
+    static_cast<void>(checked_u32(prepared.workspace_layout.maximum_selected_tokens, "maximum_selected_tokens"));
+}
+
+void launch_indexed_attention(const ExecutionDispatchContext& context, void* user_data) {
+    const auto prepared = prepare_indexed_attention_launch(context,
+        static_cast<const HipIndexedAttentionLauncherConfig*>(user_data));
+    const auto& config = *static_cast<const HipIndexedAttentionLauncherConfig*>(user_data);
+    const auto& model = config.model;
+    const auto& input = prepared.input; const auto& output = prepared.output;
+    const auto& workspace_layout = prepared.workspace_layout; const auto& workspace = prepared.workspace;
+    const auto dynamic_position = prepared.dynamic_position;
+    const auto device_graph = prepared.device_graph;
+    const auto& kv_state = prepared.kv_state; const auto& raw_state = prepared.raw_state;
+    const auto& tensors = prepared.tensors;
+    const auto hidden = prepared.hidden, attention_heads = prepared.attention_heads, kv_heads = prepared.kv_heads;
+    const auto head_dim = prepared.head_dim, attention_width = prepared.attention_width, kv_width = prepared.kv_width;
+    const auto q_gate_width = prepared.q_gate_width, index_q_width = prepared.index_q_width, index_dim = prepared.index_dim;
+    if (device_graph) {
         hipLaunchKernelGGL(validate_indexed_graph_control, dim3(1), dim3(kThreads), 0,
             hip_execution_stream(), dynamic_position,
             reinterpret_cast<const std::uint16_t*>(input.address), hidden);
@@ -2583,51 +2702,10 @@ void launch_indexed_attention(
         hipGetLastError(),
         "HIP indexed-attention raw-index state update");
 
-    const auto visible64 =
-        device_graph ? session_layout.context_tokens : context.position + 1ULL;
-    if (visible64 >
-        std::numeric_limits<
-            std::uint32_t>::max()) {
-        throw std::overflow_error(
-            "indexed-attention visible token count exceeds uint32");
-    }
-    const auto visible =
-        static_cast<std::uint32_t>(
-            visible64);
-    const auto ratio =
-        checked_u32(
-            model.indexer_compress_ratio,
-            "indexer_compress_ratio");
-    const auto budget =
-        checked_u32(
-            model.indexer_budget,
-            "indexer_budget");
-    const auto complete_blocks =
-        visible / ratio;
-    const auto block_topk =
-        budget / ratio;
-    const auto selected_blocks =
-        std::min(
-            complete_blocks,
-            block_topk);
-    const auto tail =
-        visible -
-        complete_blocks *
-            ratio;
-    const auto selected_count = device_graph ? checked_u32(workspace_layout.maximum_selected_tokens, "maximum_selected_tokens") :
-        selected_blocks *
-            ratio +
-        tail;
-
-    if (selected_count == 0 ||
-        selected_count >
-            workspace_layout.
-                maximum_selected_tokens) {
-        throw std::logic_error(
-            "indexed-attention selected-token count exceeds workspace");
-    }
-
-    const GraphSelectionArguments dynamic_selection{dynamic_position, ratio, block_topk};
+    const auto selection = prepare_indexed_attention_selection(context, prepared, model);
+    const auto visible = selection.visible, ratio = selection.ratio, block_topk = selection.block_topk;
+    const auto complete_blocks = selection.complete_blocks, selected_count = selection.selected_count;
+    const auto dynamic_selection = selection.dynamic_selection;
     if (!device_graph && complete_blocks <=
         block_topk) {
         const auto blocks =
@@ -2725,16 +2803,7 @@ void launch_indexed_attention(
         hipGetLastError(),
         "HIP indexed-attention KV state update");
 
-    const auto score_blocks64 =
-        static_cast<std::uint64_t>(
-            attention_heads) *
-        selected_count;
-    if (score_blocks64 >
-        std::numeric_limits<
-            std::uint32_t>::max()) {
-        throw std::overflow_error(
-            "indexed-attention score grid exceeds uint32");
-    }
+    const auto score_blocks64 = prepare_indexed_attention_score_grid(attention_heads, selected_count);
     hipLaunchKernelGGL(
         attention_score_kernel,
         dim3(
@@ -3064,6 +3133,7 @@ make_hip_indexed_attention_launcher(
             *config),
         &launch_indexed_attention,
         config,
+        &preflight_indexed_attention,
     };
 }
 
@@ -3097,6 +3167,57 @@ register_for_compiled_execution(
     }
     if(registered.empty())throw std::invalid_argument("compiled execution has no indexed-attention step");
     if(config_.prefetch_q8_input && !saw_prefetch)throw std::invalid_argument("QSA prefetch bundle requires eligible bound step");
+}
+
+std::vector<std::uint64_t>
+HipIndexedAttentionLauncherBundle::known_window_position_readers(
+    const CompiledSerialExecution& compiled,
+    const ExecutionLauncherRegistry& registry) const {
+    validate_config(config_);
+    validate_config(fallback_config_);
+    if (config_.enable_device_graph_inputs || fallback_config_.enable_device_graph_inputs ||
+        compiled.device_graph_inputs || compiled.logical_rows != 1 ||
+        compiled.request_concurrency != 1 || compiled.execution_identity == 0 ||
+        compiled.execution.steps.size() != compiled.bindings.bindings.size()) {
+        throw std::invalid_argument("QSA known-window readers require a valid eager C1 execution");
+    }
+    ExecutionBindingRequest shape;
+    shape.logical_rows = compiled.logical_rows;
+    shape.request_concurrency = compiled.request_concurrency;
+    shape.device_graph_inputs = compiled.device_graph_inputs;
+    std::vector<std::uint64_t> identities;
+    bool saw_prefetch = false;
+    for (std::size_t i = 0; i < compiled.execution.steps.size(); ++i) {
+        const auto& step = compiled.execution.steps[i];
+        const auto& binding = compiled.bindings.bindings[i];
+        if (step.op != SerialOp::indexed_attention) {
+            if (binding.op == SerialOp::indexed_attention)
+                throw std::invalid_argument("QSA known-window binding operator differs from execution");
+            continue;
+        }
+        if (step.id != i || binding.step_id != step.id || binding.op != step.op ||
+            !step.layer || binding.host_or_runtime_step || !binding.kernel_id || binding.kernel_id->empty()) {
+            throw std::invalid_argument("QSA known-window reader has invalid step binding");
+        }
+        const bool prefetch = qsa_input_prefetch::selected(
+            config_.prefetch_q8_input, config_.prefetch_eligible_layers, step.layer);
+        const auto* selected = prefetch ? &config_ : &fallback_config_;
+        if (*binding.kernel_id != kernel_id(shape, *selected))
+            throw std::invalid_argument("QSA known-window reader differs from bundle configuration");
+        const auto* launcher = registry.find_kernel_launcher(*binding.kernel_id);
+        const auto identity = implementation_identity(*selected);
+        if (!launcher || launcher->key != *binding.kernel_id || identity == 0 ||
+            launcher->implementation_identity != identity || launcher->function != &launch_indexed_attention ||
+            launcher->preflight != &preflight_indexed_attention || launcher->user_data != selected) {
+            throw std::invalid_argument("QSA known-window reader is not this bundle's exact launcher");
+        }
+        if (std::find(identities.begin(), identities.end(), identity) == identities.end())
+            identities.push_back(identity);
+        saw_prefetch |= prefetch;
+    }
+    if (identities.empty() || (config_.prefetch_q8_input && !saw_prefetch))
+        throw std::invalid_argument("QSA known-window bundle has no admitted eligible reader");
+    return identities;
 }
 
 namespace {

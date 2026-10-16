@@ -5,6 +5,8 @@
 #include "strix/execution_resources.hpp"
 #include "strix/execution_tensor_access.hpp"
 #include "strix/hip_ple_launcher.hpp"
+#include "strix/hip_launch_context.hpp"
+#include "strix/iq4_nl.hpp"
 #include "strix/memory_plan.hpp"
 #include "strix/model_contract.hpp"
 #include "strix/model_manifest.hpp"
@@ -23,6 +25,7 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -204,6 +207,184 @@ void upload(
                 sizeof(T),
             hipMemcpyHostToDevice),
         "copy PLE test weight");
+}
+
+// Uses the fixture's real device owners, but a retained small host table and
+// the actual synchronous backend. This exercises only factory.preflight.
+void pure_preflight_cases(const strix::ExecutionDispatchContext& source,
+    strix::HipPleLauncherConfig config) {
+    config.model.ngram_vocab_size_base = 17;
+    config.upload_pool = nullptr;
+    config.enable_owned_event_upload = false;
+    config.enable_resident_graph = false;
+    auto contract = strix::build_ple_hash_contract(config.model);
+    auto manifest = *source.resources->model_manifest;
+    auto runtime = *source.resources->model_weights;
+    auto access = *source.resources->tensor_access;
+    auto resources = *source.resources;
+    auto context = source;
+    strix::FileMappedPleLookupBackend backend;
+    strix::PleLookupPrefetchState pending;
+    // Nonfinite payloads are deliberate: metadata admission must never inspect
+    // table/activation/history values or produce the future row's hash.
+    std::vector<std::uint16_t> table(
+        static_cast<std::size_t>(contract.minimum_table_rows * contract.head_dim), 0x7fc1U);
+    manifest.tensors[0].dimensions = {contract.head_dim, contract.minimum_table_rows};
+    manifest.tensors[0].ggml_type = 30;
+    manifest.tensors[0].byte_size = table.size() * sizeof(std::uint16_t);
+    runtime.tensors[0].storage = strix::RuntimeTensorStorage::file_mapped;
+    runtime.tensors[0].address = reinterpret_cast<std::uintptr_t>(table.data());
+    runtime.tensors[0].bytes = manifest.tensors[0].byte_size;
+    const auto rebind_manifest = [&] {
+        manifest.layout_identity = strix::model_manifest_layout_identity(manifest);
+        runtime.manifest_layout_identity = manifest.layout_identity;
+        access.manifest_layout_identity = manifest.layout_identity;
+    };
+    rebind_manifest();
+    resources.model_manifest = &manifest;
+    resources.model_weights = &runtime;
+    resources.tensor_access = &access;
+    resources.ple_lookup = &backend;
+    resources.ple_hash_contract = &contract;
+    resources.ple_prefetch = &pending;
+    context.resources = &resources;
+    auto launcher = strix::make_hip_ple_launcher("test.ple.pure-preflight", &config);
+    expect(launcher.preflight != nullptr, "PLE factory publishes real metadata preflight");
+    if (!launcher.preflight) return;
+
+    const auto& scratch = *resources.scratch;
+    const auto& state = *resources.session_state_memory;
+    check(hipMemset(reinterpret_cast<void*>(scratch.arena_base), 0xa7,
+        static_cast<std::size_t>(scratch.arena_bytes)), "poison complete PLE preflight arena");
+    check(hipMemset(reinterpret_cast<void*>(state.device_base), 0x6d,
+        static_cast<std::size_t>(state.device_bytes)), "poison complete PLE preflight device state");
+    std::memset(reinterpret_cast<void*>(state.host_base), 0xd9,
+        static_cast<std::size_t>(state.host_bytes));
+    std::vector<std::byte> arena_before(static_cast<std::size_t>(scratch.arena_bytes));
+    std::vector<std::byte> device_before(static_cast<std::size_t>(state.device_bytes));
+    std::vector<std::byte> host_before(static_cast<std::size_t>(state.host_bytes));
+    check(hipMemcpy(arena_before.data(), reinterpret_cast<const void*>(scratch.arena_base),
+        arena_before.size(), hipMemcpyDeviceToHost), "snapshot full PLE preflight arena");
+    check(hipMemcpy(device_before.data(), reinterpret_cast<const void*>(state.device_base),
+        device_before.size(), hipMemcpyDeviceToHost), "snapshot full PLE preflight device state");
+    std::memcpy(host_before.data(), reinterpret_cast<const void*>(state.host_base), host_before.size());
+    const auto table_before = table;
+    const auto unchanged = [&] {
+        std::vector<std::byte> actual_arena(arena_before.size()), actual_device(device_before.size());
+        check(hipMemcpy(actual_arena.data(), reinterpret_cast<const void*>(scratch.arena_base),
+            actual_arena.size(), hipMemcpyDeviceToHost), "read complete PLE admission arena");
+        check(hipMemcpy(actual_device.data(), reinterpret_cast<const void*>(state.device_base),
+            actual_device.size(), hipMemcpyDeviceToHost), "read complete PLE admission state");
+        expect(actual_arena == arena_before, "PLE preflight preserves every scratch byte including padding");
+        expect(actual_device == device_before, "PLE preflight preserves every device-state byte");
+        expect(std::memcmp(host_before.data(), reinterpret_cast<const void*>(state.host_base),
+            host_before.size()) == 0, "PLE preflight preserves every host-history byte");
+        expect(table == table_before, "PLE preflight preserves retained table payload");
+        expect(!pending.active && pending.handle == 0 && pending.backend_identity == 0 &&
+            pending.lookup_bytes == 0 && pending.input_token_id == 0 && pending.position == 0 &&
+            pending.hash.row_count == 0 && pending.hash.context_count == 0 &&
+            std::all_of(pending.hash.row_ids.begin(), pending.hash.row_ids.end(), [](auto v) { return v == 0; }) &&
+            std::all_of(pending.hash.next_context.begin(), pending.hash.next_context.end(), [](auto v) { return v == 0; }),
+            "PLE preflight does not start, finish or publish pending lookup state");
+    };
+    launcher.preflight(context, launcher.user_data);
+    unchanged();
+    const auto saved_table = manifest.tensors[0];
+    const auto saved_binding = runtime.tensors[0];
+    const auto saved_contract = contract;
+    // The same retained allocation can expose an exact smaller packed extent;
+    // no quantized payload is decoded by metadata-only admission.
+    manifest.tensors[0].ggml_type = 20;
+    manifest.tensors[0].byte_size = contract.minimum_table_rows *
+        (contract.head_dim / strix::iq4_nl::block_elements) * strix::iq4_nl::block_bytes;
+    runtime.tensors[0].bytes = manifest.tensors[0].byte_size;
+    rebind_manifest();
+    launcher.preflight(context, launcher.user_data);
+    unchanged();
+    manifest.tensors[0] = saved_table;
+    runtime.tensors[0] = saved_binding;
+    rebind_manifest();
+    const auto reject = [&](const char* expected_message) {
+        bool rejected = false, intended = false;
+        try { launcher.preflight(context, launcher.user_data); }
+        catch (const std::invalid_argument& error) {
+            rejected = true; intended = error.what() == std::string(expected_message);
+        }
+        expect(rejected, "PLE malformed metadata rejects before lookup/upload");
+        expect(intended, "PLE rejection reaches the intended pure admission guard");
+        unchanged();
+        manifest.tensors[0] = saved_table;
+        runtime.tensors[0] = saved_binding;
+        contract = saved_contract;
+        rebind_manifest();
+    };
+    constexpr auto metadata_error = "known window PLE table metadata or mapping is incompatible";
+    constexpr auto extent_error = "known window PLE declared table rows exceed the retained mapping";
+    constexpr auto hash_error = "known window PLE prefetch hash contract differs from the selected launcher";
+    manifest.tensors[0].dimensions.push_back(1); rebind_manifest(); reject(metadata_error);
+    manifest.tensors[0].ggml_type = 0; rebind_manifest(); reject(metadata_error);
+    manifest.tensors[0].dimensions[1] = contract.minimum_table_rows - 1U;
+    rebind_manifest(); reject(metadata_error);
+    runtime.tensors[0].bytes = std::numeric_limits<std::uint64_t>::max(); reject(metadata_error);
+    manifest.tensors[0].dimensions[1] = std::numeric_limits<std::uint64_t>::max();
+    rebind_manifest(); reject(extent_error);
+    --manifest.tensors[0].byte_size; rebind_manifest(); reject(extent_error);
+    contract.ngram_size = 0; reject(hash_error);
+    contract.ngram_size = strix::PleHashContract::maximum_ngram + 1U; reject(hash_error);
+    contract.multipliers[0] ^= 2U; reject(hash_error);
+    contract.row_bytes += 2U; reject(hash_error);
+    contract.head_offsets[0] += 1U; reject(hash_error);
+    contract.head_vocab_sizes[0] += 1U; reject(hash_error);
+
+    hipStream_t stream = nullptr;
+    void* arguments = nullptr; void* status = nullptr;
+    check(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), "create PLE preflight capture stream");
+    const auto graph_layout = strix::graph_input_layout(1);
+    check(hipMalloc(&arguments, static_cast<std::size_t>(graph_layout.bytes)), "allocate PLE capture arguments");
+    check(hipMalloc(&status, sizeof(std::uint32_t)), "allocate PLE capture status");
+    strix::ExecutionMemoryBinding graph_memory;
+    graph_memory.execution_identity = scratch.execution_identity;
+    graph_memory.arena_base = reinterpret_cast<std::uintptr_t>(arguments);
+    graph_memory.arena_bytes = graph_layout.bytes; graph_memory.allocation_generation = 1;
+    strix::HipLaunchContext scope;
+    scope.stream = stream; scope.graph_capture = true;
+    scope.arguments = strix::bind_graph_inputs(graph_layout, graph_memory);
+    scope.status = graph_memory;
+    scope.status.arena_base = reinterpret_cast<std::uintptr_t>(status);
+    scope.status.arena_bytes = sizeof(std::uint32_t);
+    scope.context_tokens = resources.session_state_layout->context_tokens;
+    scope.vocabulary_size = static_cast<std::uint32_t>(config.model.vocab_size);
+    hipGraph_t graph = nullptr;
+    bool capture_rejected = false;
+    {
+        const strix::HipLaunchScope owned(scope);
+        check(hipStreamBeginCapture(stream, hipStreamCaptureModeThreadLocal), "begin pure PLE rejected capture");
+        try { launcher.preflight(context, launcher.user_data); }
+        catch (const std::invalid_argument& error) {
+            capture_rejected = std::string(error.what()) == "known window PLE preflight is eager only";
+        }
+        check(hipStreamEndCapture(stream, &graph), "end pure PLE rejected capture");
+    }
+    std::size_t nodes = 0;
+    check(hipGraphGetNodes(graph, nullptr, &nodes), "count pure PLE rejection graph nodes");
+    expect(capture_rejected && nodes == 0, "PLE pure capture rejection has zero enqueued nodes");
+    check(hipGraphDestroy(graph), "destroy pure PLE rejection graph");
+    check(hipFree(status), "free PLE capture status");
+    check(hipFree(arguments), "free PLE capture arguments");
+    check(hipStreamDestroy(stream), "destroy pure PLE capture stream");
+    unchanged();
+
+    // FileMappedPleLookupBackend is final. Its first real handle proves that
+    // none of the preceding callbacks started even a subsequently cancelled
+    // lookup. This request reads no table payload and performs no upload.
+    const std::array<std::uint64_t, 1> row{0};
+    strix::PleLookupRequest lookup;
+    lookup.row_ids = row; lookup.row_bytes = contract.row_bytes;
+    lookup.table_manifest = &manifest.tensors[0]; lookup.table_runtime = &runtime.tensors[0];
+    const auto first_handle = backend.start(lookup);
+    expect(first_handle == 1, "all PLE pure preflights leave the real backend completely unused");
+    backend.cancel(first_handle);
+    unchanged();
 }
 
 }  // namespace
@@ -824,6 +1005,8 @@ int main() try {
     }
     expect(output_equal, "PLE distinct folded key/query scales match FP64 gate oracle");
     expect(state_equal, "PLE folded convolution scales match independently normalized current value");
+
+    pure_preflight_cases(context, config);
 
     for (std::size_t index = 1;
          index < device_weights.size();

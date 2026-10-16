@@ -310,6 +310,7 @@ CompiledLaunchPlan compile_launch_plan(
                 launcher->implementation_identity,
                 launcher->function,
                 launcher->user_data,
+                launcher->preflight,
             });
 
         hash_u64(hash, step.id);
@@ -400,6 +401,7 @@ CompiledLaunchPlan compile_launch_plan(
                 launcher->implementation_identity,
                 launcher->function,
                 launcher->user_data,
+                launcher->preflight,
             });
 
         hash_u64(hash, step.id);

@@ -13,6 +13,7 @@
 #include "strix/launch_dispatch.hpp"
 #include "strix/model_contract.hpp"
 #include <memory>
+#include <vector>
 
 namespace strix {
 namespace integer_projection { struct RuntimeConfig; class HipIntegerProjectionRuntimeBundle; }
@@ -85,6 +86,12 @@ public:
         const CompiledSerialExecution& compiled,
         ExecutionLauncherRegistry& registry,
         const ExecutionRuntimeResources* resources = nullptr);
+
+    // Derive the closed QSA position-reader set from this catalog's owned
+    // configurations and actual factories, rather than trusting arbitrary
+    // identities supplied by a launch plan.
+    [[nodiscard]] std::vector<std::uint64_t> known_window_position_readers(
+        const CompiledSerialExecution& compiled, const ExecutionLauncherRegistry& registry) const;
 
     [[nodiscard]] LauncherCoverage audit(
         const CompiledSerialExecution& compiled,

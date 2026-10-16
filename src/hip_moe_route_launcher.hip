@@ -1005,15 +1005,8 @@ void launch_default_typed(
         "HIP MoE route kernel launch");
 }
 
-template <typename Activation, RouterWeightKind WeightKind>
-void launch_typed(
-    const ExecutionDispatchContext& context, const HipMoeRouteLauncherConfig& config,
-    const ExecutionBufferAddress& hidden, const RuntimeTensorBinding& weight,
-    const ExecutionBufferAddress& indices, const ExecutionBufferAddress& weights) {
-    if (!config.parallel_projection) {
-        launch_default_typed<Activation, WeightKind>(context, config, hidden, weight, indices, weights);
-        return;
-    }
+ExecutionBufferAddress prepare_parallel_router_workspace(
+    const ExecutionDispatchContext& context, const HipMoeRouteLauncherConfig& config) {
     if (context.logical_rows == 0 || context.logical_rows > 65535U)
         throw std::invalid_argument("parallel router row grid exceeds HIP launch limits");
     const auto workspace = resolve_dispatch_temporary(context, 0);
@@ -1025,6 +1018,19 @@ void launch_typed(
     if (workspace.use.buffer.buffer_class != ExecutionBufferClass::router_workspace ||
         workspace.address % 16U != 0 || workspace.bytes < required || workspace.allocation_generation == 0)
         throw std::invalid_argument("parallel router requires admitted aligned FP32 logits workspace");
+    return workspace;
+}
+
+template <typename Activation, RouterWeightKind WeightKind>
+void launch_typed(
+    const ExecutionDispatchContext& context, const HipMoeRouteLauncherConfig& config,
+    const ExecutionBufferAddress& hidden, const RuntimeTensorBinding& weight,
+    const ExecutionBufferAddress& indices, const ExecutionBufferAddress& weights) {
+    if (!config.parallel_projection) {
+        launch_default_typed<Activation, WeightKind>(context, config, hidden, weight, indices, weights);
+        return;
+    }
+    const auto workspace = prepare_parallel_router_workspace(context, config);
     hipLaunchKernelGGL(HIP_KERNEL_NAME(parallel_moe_route_logits_kernel<Activation, WeightKind>),
         dim3((config.expert_count + kRouterExpertsPerBlock - 1U) / kRouterExpertsPerBlock, context.logical_rows),
         dim3(kRouterProjectionThreads), 0, hip_execution_stream(),
@@ -1109,9 +1115,13 @@ void launch_by_weight(
         "unreachable router weight kind");
 }
 
-void launch_moe_route(
-    const ExecutionDispatchContext& context,
-    void* user_data) {
+struct PreparedRouterLaunch {
+    const HipMoeRouteLauncherConfig* config;
+    ExecutionBufferAddress hidden, indices, route_weights;
+    const RuntimeTensorBinding* runtime_tensor;
+    RouterWeightKind kind;
+};
+PreparedRouterLaunch prepare_router_launch(const ExecutionDispatchContext& context, void* user_data) {
     if (context.op !=
         SerialOp::moe_route) {
         throw std::invalid_argument(
@@ -1246,6 +1256,22 @@ void launch_moe_route(
             "HIP MoE route scratch buffers are undersized");
     }
 
+    return {&config, hidden, indices, route_weights, &runtime_tensor, kind};
+}
+void preflight_moe_route(const ExecutionDispatchContext& context, void* user_data) {
+    const auto prepared = prepare_router_launch(context, user_data);
+    if (prepared.config->parallel_projection)
+        (void)prepare_parallel_router_workspace(context, *prepared.config);
+}
+
+void launch_moe_route(const ExecutionDispatchContext& context, void* user_data) {
+    const auto prepared = prepare_router_launch(context, user_data);
+    const auto& config = *prepared.config;
+    const auto& hidden = prepared.hidden;
+    const auto& indices = prepared.indices;
+    const auto& route_weights = prepared.route_weights;
+    const auto& runtime_tensor = *prepared.runtime_tensor;
+    const auto kind = prepared.kind;
     switch (config.activation) {
     case HipActivationStorage::bf16:
         launch_by_weight<
@@ -1427,6 +1453,7 @@ make_hip_moe_route_launcher(
         launcher_identity(*config),
         &launch_moe_route,
         config,
+        &preflight_moe_route,
     };
 }
 

@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <string>
 #include <memory>
+#include <span>
 
 namespace strix {
 
@@ -45,6 +46,22 @@ void register_hip_shared_expert_kernel_variant(
 make_hip_shared_expert_launcher(
     std::string kernel_id,
     HipSharedExpertLauncherConfig* config);
+
+// Known-prefix window only: both contexts are C1 row views of one retained
+// window allocation and the same serial shared-expert step. Gate/up/down are
+// Q8_0, the scalar gate is F32, and H2560/M640 activations are BF16. Prepared
+// caches are absent; row.memory is null or the resources->scratch object itself.
+// Only the exact base
+// and prefetch serial IDs are admitted. Preflight performs no HIP enqueue.
+// Launch repeats the complete two-row preflight and requires an explicit eager
+// HipLaunchScope. The caller retains both contexts, config, all resource/weight
+// owners and the stream through quiescence, including after a launch exception.
+void shared_expert_known_window_r2_preflight(
+    std::span<const ExecutionDispatchContext, 2> rows,
+    const HipSharedExpertLauncherConfig& config);
+void shared_expert_known_window_r2_launch(
+    std::span<const ExecutionDispatchContext, 2> rows,
+    const HipSharedExpertLauncherConfig& config);
 
 class HipSharedExpertLauncherBundle {
 public:

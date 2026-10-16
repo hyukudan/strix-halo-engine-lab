@@ -9,6 +9,7 @@
 
 #include <string>
 #include <memory>
+#include <vector>
 
 namespace strix {
 
@@ -84,6 +85,12 @@ public:
     void register_for_compiled_execution(
         const CompiledSerialExecution& compiled,
         ExecutionLauncherRegistry& registry);
+
+    // Admit only this bundle's exact current eager QSA launchers. The bundle
+    // and its configurations must outlive use of the returned identities.
+    [[nodiscard]] std::vector<std::uint64_t> known_window_position_readers(
+        const CompiledSerialExecution& compiled,
+        const ExecutionLauncherRegistry& registry) const;
 
 private:
     HipIndexedAttentionLauncherConfig config_;

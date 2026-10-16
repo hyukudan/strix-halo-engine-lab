@@ -295,6 +295,89 @@ ExecutionArenaPlan build_serial_execution_arena_plan(
     return plan;
 }
 
+KnownWindowArena build_known_window_arena(
+    const ExecutionArenaPlan& serial, std::uint64_t alignment) {
+    if (!serial.alignment || !alignment || alignment % serial.alignment != 0 ||
+        !serial.total_bytes || serial.allocations.empty()) {
+        throw std::invalid_argument("known window requires a complete aligned serial arena");
+    }
+    for (std::size_t i = 0; i < serial.allocations.size(); ++i) {
+        const auto& current = serial.allocations[i];
+        if (!current.bytes || current.first_step > current.last_step ||
+            current.offset % serial.alignment != 0 ||
+            checked_add(current.offset, current.bytes) > serial.total_bytes) {
+            throw std::invalid_argument("known window serial allocation is invalid");
+        }
+        for (std::size_t j = 0; j < i; ++j) {
+            const auto& previous = serial.allocations[j];
+            if (current.use == previous.use) {
+                throw std::invalid_argument("known window serial use is duplicated");
+            }
+            const bool live = current.first_step <= previous.last_step &&
+                              previous.first_step <= current.last_step;
+            if (live && current.offset < checked_add(previous.offset, previous.bytes) &&
+                previous.offset < checked_add(current.offset, current.bytes)) {
+                throw std::invalid_argument("known window source aliases live serial allocations");
+            }
+        }
+    }
+    KnownWindowArena result;
+    result.physical.alignment = alignment;
+    result.physical.allocations = serial.allocations;
+    for (auto& allocation : result.physical.allocations) {
+        const auto stride = align_up(allocation.bytes, alignment);
+        allocation.bytes = checked_add(stride, stride);
+        allocation.offset = 0;
+        result.physical.naive_nonaliased_bytes = checked_add(
+            result.physical.naive_nonaliased_bytes, allocation.bytes);
+    }
+    std::stable_sort(result.physical.allocations.begin(), result.physical.allocations.end(),
+        [](const auto& left, const auto& right) {
+            if (left.first_step != right.first_step) return left.first_step < right.first_step;
+            if (left.bytes != right.bytes) return left.bytes > right.bytes;
+            if (left.use.buffer.buffer_class != right.use.buffer.buffer_class)
+                return left.use.buffer.buffer_class < right.use.buffer.buffer_class;
+            if (left.use.buffer.slot != right.use.buffer.slot)
+                return left.use.buffer.slot < right.use.buffer.slot;
+            return left.use.generation < right.use.generation;
+        });
+    std::vector<const ExecutionArenaAllocation*> active;
+    for (auto& allocation : result.physical.allocations) {
+        active.erase(std::remove_if(active.begin(), active.end(), [&](const auto* previous) {
+            return previous->last_step < allocation.first_step;
+        }), active.end());
+        std::sort(active.begin(), active.end(), [](const auto* left, const auto* right) {
+            return left->offset < right->offset;
+        });
+        std::uint64_t candidate = 0;
+        for (const auto* previous : active) {
+            candidate = align_up(candidate, alignment);
+            if (checked_add(candidate, allocation.bytes) <= previous->offset) break;
+            const auto previous_end = checked_add(previous->offset, previous->bytes);
+            if (candidate < previous_end) candidate = previous_end;
+        }
+        allocation.offset = align_up(candidate, alignment);
+        result.physical.total_bytes = std::max(result.physical.total_bytes,
+            checked_add(allocation.offset, allocation.bytes));
+        active.push_back(&allocation);
+    }
+    result.physical.total_bytes = align_up(result.physical.total_bytes, alignment);
+    result.row_view = {result.physical, result.physical};
+    for (std::size_t i = 0; i < result.physical.allocations.size(); ++i) {
+        const auto& physical = result.physical.allocations[i];
+        const auto* original = find_arena_allocation(serial, physical.use);
+        if (!original) throw std::logic_error("known window lost a serial allocation");
+        const auto stride = physical.bytes / 2;
+        result.row_stride.push_back(stride);
+        for (std::size_t row = 0; row < result.row_view.size(); ++row) {
+            auto& allocation = result.row_view[row].allocations[i];
+            allocation.offset = checked_add(physical.offset, row == 0 ? 0 : stride);
+            allocation.bytes = original->bytes;
+        }
+    }
+    return result;
+}
+
 const ExecutionArenaAllocation* find_arena_allocation(
     const ExecutionArenaPlan& plan,
     ExecutionBufferUse use) noexcept {
