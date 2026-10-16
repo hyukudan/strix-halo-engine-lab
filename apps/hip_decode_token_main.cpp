@@ -657,19 +657,34 @@ public:
     struct Row { std::uint32_t input; std::uint64_t position; std::vector<strix::RequestedLogprob> values; };
     RequestedLogprobBackend(strix::SerialGreedyStepBackend& target, std::span<const std::uint32_t> ids,
         std::uint64_t vocabulary, std::uint64_t capacity, strix::SerialSessionContext& session,
-        std::shared_ptr<const strix::HipSetupQuiescenceGuard> guard)
-        : target_(target), ids_(ids.begin(), ids.end()), vocabulary_(vocabulary), maximum_rows_(capacity), session_(session), guard_(std::move(guard)) {
-        if (!guard_ || ids_.empty() || ids_.size() > 64U || !capacity || capacity > 262144U || capacity > 1048576U / ids_.size())
+        std::shared_ptr<const strix::HipSetupQuiescenceGuard> guard,
+        std::span<const std::uint32_t> teacher_inputs = {})
+        : target_(target), ids_(ids.begin(), ids.end()), teacher_inputs_(teacher_inputs.begin(), teacher_inputs.end()),
+          vocabulary_(vocabulary), maximum_rows_(teacher_inputs.empty() ? capacity : teacher_inputs.size() - 1U),
+          session_(session), guard_(std::move(guard)) {
+        if (!guard_ || !capacity || capacity > 262144U ||
+            (teacher_inputs_.empty() && (ids_.empty() || ids_.size() > 64U || capacity > 1048576U / ids_.size())) ||
+            (!teacher_inputs_.empty() && (!ids_.empty() || teacher_inputs_.size() < 2U || teacher_inputs_.size() > capacity)))
             throw std::invalid_argument("invalid bounded requested logprob ledger");
         for (const auto id : ids_) if (id >= vocabulary_) throw std::invalid_argument("requested logprob ID is outside vocabulary");
-        rows_.reserve(static_cast<std::size_t>(capacity));
+        for (const auto id : teacher_inputs_) if (id >= vocabulary_) throw std::invalid_argument("teacher input is outside vocabulary");
+        rows_.reserve(static_cast<std::size_t>(maximum_rows_));
     }
     std::vector<float> execute(std::uint32_t token, std::uint64_t position) override {
-        if (rows_.size() == maximum_rows_) throw std::length_error("requested logprob ledger capacity exhausted");
+        if (!teacher_inputs_.empty() && (position >= teacher_inputs_.size() ||
+            teacher_inputs_[static_cast<std::size_t>(position)] != token || rows_.size() != position))
+            throw std::invalid_argument("teacher-forced score input or position differs from its retained sequence");
+        const bool terminal_teacher = !teacher_inputs_.empty() && position + 1U == teacher_inputs_.size();
+        if (!terminal_teacher && rows_.size() == maximum_rows_) throw std::length_error("requested logprob ledger capacity exhausted");
         const auto committed = session_.committed_tokens;
         try {
+            // Consume the final teacher input once, with ordinary full logits;
+            // it has no supplied next-token label and creates no ledger row.
+            if (terminal_teacher) return target_.execute(token, position);
+            const auto requested = teacher_inputs_.empty() ? std::span<const std::uint32_t>{ids_} :
+                std::span<const std::uint32_t>{teacher_inputs_}.subspan(static_cast<std::size_t>(position) + 1U, 1U);
             const strix::GenerationOutputRequest request{strix::GenerationOutputNeed::full_logits |
-                strix::GenerationOutputNeed::requested_logprobs, token, position, vocabulary_, ids_};
+                strix::GenerationOutputNeed::requested_logprobs, token, position, vocabulary_, requested};
             auto result = strix::execute_generation_output(request, target_);
             rows_.push_back({token, position, std::move(result.requested_logprobs)});
             return std::move(result.logits);
@@ -682,11 +697,15 @@ public:
             throw;
         }
     }
-    void execute_state(std::uint32_t token, std::uint64_t position) override { target_.execute_state(token, position); }
+    void execute_state(std::uint32_t token, std::uint64_t position) override {
+        if (!teacher_inputs_.empty()) static_cast<void>(execute(token, position));
+        else target_.execute_state(token, position);
+    }
     const std::vector<Row>& rows() const noexcept { return rows_; }
 private:
     strix::SerialGreedyStepBackend& target_;
     std::vector<std::uint32_t> ids_;
+    std::vector<std::uint32_t> teacher_inputs_;
     std::uint64_t vocabulary_;
     std::uint64_t maximum_rows_;
     strix::SerialSessionContext& session_;
@@ -975,9 +994,15 @@ int STRIX_DECODE_ENTRY(
 #else
     constexpr bool has_auto_a8_runtime = false;
 #endif
-    const auto optimization_profile = strix::decode_cli::resolve_optimization_profile(
+    auto optimization_profile = strix::decode_cli::resolve_optimization_profile(
         options, model, info, manifest,
         strix::model_content_identity_hex(mapped.content_identity()), has_auto_a8_runtime, !target_input_export);
+    const auto base_optimization_profile = optimization_profile.selected;
+    strix::decode_cli::apply_numerical_profile(options, model, manifest,
+        strix::model_content_identity_hex(mapped.content_identity()), has_auto_a8_runtime, optimization_profile);
+    const bool hc_splitk_f32 = strix::numerical_profile_hc_splitk(options.numerical_profile);
+    const bool a8_down_q51 = strix::numerical_profile_q51_a8_down(options.numerical_profile);
+    const bool a8_down_q80 = strix::numerical_profile_q80_a8_down(options.numerical_profile);
     strix::decode_cli::validate_resolved_mtp_cli(options);
 #if defined(STRIX_MTP_MODEL_QUALIFICATION_RUNNER)
     if(target_input_export)strix::tests::validate_mtp_target_input_export(options,true);
@@ -999,6 +1024,7 @@ int STRIX_DECODE_ENTRY(
     strix::decode_cli::validate_resolved_ple_cache(options);
     strix::decode_cli::validate_resolved_device_queue_trace(options);
     strix::decode_cli::validate_resolved_requested_logprobs(options, model.vocab_size);
+    strix::decode_cli::validate_resolved_teacher_forced_score(options, model.vocab_size);
     if (options.batched_moe_activation && !options.q4k_a8g32_gate_up)
         throw std::invalid_argument("batched MoE activation requires resolved Q4K A8 gate/up execution");
     if (options.moe_shared_overlap && !options.deferred_moe_status)
@@ -1033,6 +1059,10 @@ int STRIX_DECODE_ENTRY(
     std::string optimization_profile_receipt =
         "  \"optimization_profile_requested\": \"" + optimization_profile.requested + "\",\n" +
         "  \"optimization_profile_selected\": \"" + optimization_profile.selected + "\",\n" +
+        "  \"optimization_profile_base_selected\": \"" + base_optimization_profile + "\",\n" +
+        "  \"numerical_profile\": \"" + std::string(strix::numerical_profile_name(options.numerical_profile)) + "\",\n" +
+        "  \"numerical_profile_qualification\": \"" +
+        (options.numerical_profile == strix::DecodeNumericalProfile::exact_v5 ? std::string("unchanged-base-status") : std::string("not_assessed")) + "\",\n" +
         "  \"optimization_profile_reason\": \"" + optimization_profile.reason + "\",\n" +
         "  \"optimization_profile_automatic_applied\": " +
         (optimization_profile.automatic_applied ? "true" : "false") + ",\n" + ple_cpu_helper_receipt;
@@ -1067,8 +1097,15 @@ int STRIX_DECODE_ENTRY(
         throw std::invalid_argument("--grouped-exact-q51-down requires a Q4_K gate/up layer with Q5_1 down");
     if (options.q51_slot_parallel_down)
         strix::moe_q4k_a8::validate_slot_parallel_manifest(model, q4k_a8_layers);
+    if (a8_down_q51 || a8_down_q80) {
+        strix::moe_q4k_a8::validate_a8_down_content(mapped.content_identity());
+        strix::moe_q4k_a8::validate_a8_down_manifest(model, q4k_a8_layers, a8_down_q51, a8_down_q80);
+    }
     const auto q4k_a8_stats = options.q4k_a8g32_gate_up ?
         std::make_shared<strix::moe_q4k_a8::RuntimeDispatchStats>() : nullptr;
+    const auto hyper_arithmetic_stats = hc_splitk_f32 ?
+        std::make_shared<strix::HipHyperMixArithmeticStats>() : nullptr;
+    std::uint64_t hc_splitk_selected_steps = 0;
     const auto emit_q51_slot_receipt = [&] {
         if (options.q51_slot_parallel_down)
             std::cout << "  \"q51_slot_parallel_down\": true,\n"
@@ -1082,10 +1119,12 @@ int STRIX_DECODE_ENTRY(
         emit_q51_slot_receipt();
         std::cout << "  \"grouped_exact_q51_down\": " << (options.grouped_exact_q51_down ? "true" : "false") << ",\n"
             << "  \"grouped_q51_numerical_identity\": \""
-            << (options.grouped_exact_q51_down ? strix::moe_q4k_a8::grouped_q51_numerical_identity : std::string_view{"legacy"}) << "\",\n"
+            << (a8_down_q51 ? std::string_view{"replaced-by-q51-a8-down-v1"} :
+                options.grouped_exact_q51_down ? strix::moe_q4k_a8::grouped_q51_numerical_identity : std::string_view{"legacy"}) << "\",\n"
             << "  \"q4k_a8g32_gate_up\": " << (options.q4k_a8g32_gate_up ? "true" : "false") << ",\n"
             << "  \"q4k_a8g32_numerical_identity\": \""
-            << (options.q4k_a8g32_gate_up ? strix::moe_q4k_a8::runtime_numerical_identity : std::string_view{"legacy"}) << "\",\n"
+            << ((a8_down_q51 || a8_down_q80) ? strix::moe_q4k_a8::a8_down_gate_up_numerical_identity :
+                options.q4k_a8g32_gate_up ? strix::moe_q4k_a8::runtime_numerical_identity : std::string_view{"legacy"}) << "\",\n"
             << "  \"q4k_a8g32_quantized_layers\": [";
         for (std::size_t i=0;i<q4k_a8_layers.quantized_layers.size();++i)
             std::cout << (i ? "," : "") << q4k_a8_layers.quantized_layers[i];
@@ -1096,6 +1135,28 @@ int STRIX_DECODE_ENTRY(
         for(std::size_t i=0;i<q4k_a8_layers.q4k_with_q51_down_layers.size();++i)
             std::cout << (i ? "," : "") << q4k_a8_layers.q4k_with_q51_down_layers[i];
         std::cout << "],\n";
+        if (options.numerical_profile != strix::DecodeNumericalProfile::exact_v5) {
+            std::cout << "  \"hc_splitk_f32_selected_model_steps\":" << hc_splitk_selected_steps << ",\n"
+                << "  \"a8_down_q51_configured\":" << (a8_down_q51 ? "true" : "false") << ",\n"
+                << "  \"a8_down_q80_configured\":" << (a8_down_q80 ? "true" : "false") << ",\n"
+                << "  \"q51_a8_down_eligible_layers\":[";
+            if (a8_down_q51) for (std::size_t i=0;i<q4k_a8_layers.q4k_with_q51_down_layers.size();++i)
+                std::cout << (i ? "," : "") << q4k_a8_layers.q4k_with_q51_down_layers[i];
+            std::cout << "],\n  \"q80_a8_down_eligible_layers\":[";
+            if (a8_down_q80) for (std::size_t i=0;i<q4k_a8_layers.q4k_with_q80_down_layers.size();++i)
+                std::cout << (i ? "," : "") << q4k_a8_layers.q4k_with_q80_down_layers[i];
+            std::cout << "],\n  \"a8_down_legacy_fallback_layers\":[";
+            bool comma = false;
+            if (a8_down_q51) for (std::uint32_t layer=0;layer<model.hidden_layers;++layer) {
+                const auto& q51=q4k_a8_layers.q4k_with_q51_down_layers;
+                const auto& q80=q4k_a8_layers.q4k_with_q80_down_layers;
+                if (std::find(q51.begin(),q51.end(),layer)!=q51.end() ||
+                    (a8_down_q80 && std::find(q80.begin(),q80.end(),layer)!=q80.end())) continue;
+                std::cout << (comma ? "," : "") << layer;
+                comma = true;
+            }
+            std::cout << "],\n";
+        }
     };
     const auto emit_q4k_a8_counts = [&] {
         std::cout << "  \"q4k_a8g32_host_quantized_submissions\": "
@@ -1105,6 +1166,16 @@ int STRIX_DECODE_ENTRY(
             << ",\n  \"grouped_q51_host_submissions\": "
             << (q4k_a8_stats ? q4k_a8_stats->grouped_q51_submissions.load(std::memory_order_relaxed) : 0) << ",\n";
         emit_q51_slot_counts();
+        if (options.numerical_profile != strix::DecodeNumericalProfile::exact_v5)
+            std::cout << "  \"hc_splitk_f32_submissions\":"
+                << (hyper_arithmetic_stats ? hyper_arithmetic_stats->splitk_f32_submissions.load(std::memory_order_relaxed) : 0) << ",\n"
+                << "  \"q51_a8_down_submissions\":"
+                << (q4k_a8_stats ? q4k_a8_stats->a8_down_q51_submissions.load(std::memory_order_relaxed) : 0) << ",\n"
+                << "  \"q80_a8_down_submissions\":"
+                << (q4k_a8_stats ? q4k_a8_stats->a8_down_q80_submissions.load(std::memory_order_relaxed) : 0) << ",\n"
+                << "  \"q80_a8_down_legacy_fallback_submissions\":"
+                << (q4k_a8_stats ? q4k_a8_stats->a8_down_q80_legacy_submissions.load(std::memory_order_relaxed) : 0) << ",\n"
+                << "  \"numerical_counter_scope\":\"actual-host-enqueues-not-graph-replays-or-performance\",\n";
         if (options.batched_moe_activation) std::cout << "  \"batched_moe_activation\":true,\n"
             << "  \"batched_moe_activation_launches\":"
             << (q4k_a8_stats ? q4k_a8_stats->batched_activation_launches.load(std::memory_order_relaxed) : 0) << ",\n"
@@ -1225,6 +1296,10 @@ int STRIX_DECODE_ENTRY(
     catalog_config.typed_hyper_projection = options.typed_hyper_projection;
     catalog_config.prefetch_typed_hyper_rows = options.prefetch_typed_hyper_rows;
     catalog_config.prefetch_hc_projection_next_tile = options.prefetch_hc_projection_next_tile;
+    catalog_config.numerical_profile = options.numerical_profile;
+    catalog_config.splitk_hyper_projection = hc_splitk_f32;
+    catalog_config.splitk_hyper_projection_fp64 = false;
+    catalog_config.arithmetic_stats = hyper_arithmetic_stats;
     binding_request.prefetch_hc_projection_next_tile = options.prefetch_hc_projection_next_tile;
     catalog_config.prefetch_q8_hyper_output = options.prefetch_q8_hyper_output;
     catalog_config.lane_chain_hyper_output=options.lane_chain_hyper_output;
@@ -1257,6 +1332,8 @@ int STRIX_DECODE_ENTRY(
     binding_request.q4k_a8g32_gate_up = options.q4k_a8g32_gate_up;
     binding_request.grouped_exact_q51_down = options.grouped_exact_q51_down;
     binding_request.q51_slot_parallel_down = options.q51_slot_parallel_down;
+    catalog_config.a8_down_q51 = binding_request.a8_down_q51 = a8_down_q51;
+    catalog_config.a8_down_q80 = binding_request.a8_down_q80 = a8_down_q80;
     catalog_config.deferred_moe_status = options.deferred_moe_status;
     binding_request.deferred_moe_status = options.deferred_moe_status;
     catalog_config.ranked_moe_router_topk = options.ranked_moe_router_topk;
@@ -1300,6 +1377,8 @@ int STRIX_DECODE_ENTRY(
     buffer_request.q4k_a8g32_gate_up = options.q4k_a8g32_gate_up;
     buffer_request.grouped_exact_q51_down = options.grouped_exact_q51_down;
     buffer_request.q51_slot_parallel_down = options.q51_slot_parallel_down;
+    buffer_request.a8_down_q51 = a8_down_q51;
+    buffer_request.a8_down_q80 = a8_down_q80;
     buffer_request.qsa_hierarchical_selection = options.qsa_hierarchical_selection;
     buffer_request.qsa_gqa_heads_per_block = options.qsa_gqa_heads_per_block;
     buffer_request.activation_element_bytes =
@@ -1320,6 +1399,13 @@ int STRIX_DECODE_ENTRY(
             binding_request,
             buffer_request,
             256);
+    if (hc_splitk_f32) {
+        for (const auto& step : compiled.bindings.bindings)
+            if (step.kernel_id && step.kernel_id->find(".splitk-hc-proj-fp32-v1") != std::string::npos)
+                ++hc_splitk_selected_steps;
+        if (hc_splitk_selected_steps != 97)
+            throw std::invalid_argument("HC numerical profile requires all 97 compiled splitk FP32 mixer steps");
+    }
     std::optional<strix::PreparedOfflineTuning> offline_tuning_owner;
     std::optional<strix::kernels::OfflineTuningPlan> offline_tuning_plan;
     if (loaded_offline_tuning) {
@@ -1447,6 +1533,26 @@ int STRIX_DECODE_ENTRY(
         strix::build_serial_execution_tensor_requirements(compiled.execution));
     strix::qsa_input_prefetch::validate_tensor_access(qsa_prefetch_plan,manifest,compiled.execution,tensor_access);
     strix::shared_expert_prefetch::validate_tensor_access(shared_prefetch_plan,manifest,compiled.execution,tensor_access);
+    if (hc_splitk_f32) {
+        const auto require_hc_tensor = [&](std::uint32_t step, std::uint32_t slot,
+            std::uint32_t type, std::vector<std::uint64_t> dimensions, std::uint64_t bytes) {
+            const auto* access = strix::find_execution_tensor_access(tensor_access, step, slot);
+            if (!access || access->tensor_indices.size() != 1U || access->tensor_indices[0] >= manifest.tensors.size())
+                throw std::invalid_argument("HC numerical profile requires complete canonical tensor access before allocation");
+            const auto& tensor = manifest.tensors[access->tensor_indices[0]];
+            if (tensor.ggml_type != type || tensor.dimensions != dimensions || tensor.byte_size != bytes)
+                throw std::invalid_argument("HC numerical profile tensor format, shape or extent differs before allocation");
+        };
+        for (const auto& step : compiled.execution.steps) {
+            if (step.op != strix::SerialOp::attn_hyper_mix && step.op != strix::SerialOp::mlp_hyper_mix &&
+                step.op != strix::SerialOp::final_hyper_mix) continue;
+            require_hc_tensor(step.id, 0U, 0U, {10240U}, 40960U);
+            require_hc_tensor(step.id, 1U, 8U, {10240U,320U}, 3481600U);
+            require_hc_tensor(step.id, 2U, 8U, {320U,10240U}, 3481600U);
+            if (step.op != strix::SerialOp::final_hyper_mix)
+                require_hc_tensor(step.id, 3U, 0U, {10240U,4U}, 163840U);
+        }
+    }
     const auto hc_next_tile_plan = strix::hc_projection_prefetch::build_plan(
         model, manifest, compiled, tensor_access, options.prefetch_hc_projection_next_tile);
 
@@ -2258,9 +2364,14 @@ int STRIX_DECODE_ENTRY(
         metadata.numerical_identity = integer_config ? integer_config->approved_numerical_identity
             : strix::raw_floating_lm_head_numerical_identity(metadata.activation_storage);
         if (options.q4k_a8g32_gate_up)
-            metadata.numerical_identity += ";" + std::string(strix::moe_q4k_a8::runtime_numerical_identity);
-        if(options.grouped_exact_q51_down)
+            metadata.numerical_identity += ";" + std::string((a8_down_q51 || a8_down_q80)
+                ? strix::moe_q4k_a8::a8_down_gate_up_raw_identity : strix::moe_q4k_a8::runtime_numerical_identity);
+        if(options.grouped_exact_q51_down && !a8_down_q51)
             metadata.numerical_identity += ";" + std::string(strix::moe_q4k_a8::grouped_q51_raw_identity);
+        if (a8_down_q51)
+            metadata.numerical_identity += ";" + std::string(strix::moe_q4k_a8::q51_a8_down_raw_identity);
+        if (a8_down_q80)
+            metadata.numerical_identity += ";" + std::string(strix::moe_q4k_a8::q80_a8_down_raw_identity);
         if (catalog_config.splitk_hyper_projection)
             metadata.numerical_identity += ";" + std::string(catalog_config.splitk_hyper_projection_fp64
                 ? strix::splitk_hc_fp64_numerical_identity : strix::splitk_hc_fp32_numerical_identity);
@@ -2632,9 +2743,10 @@ int STRIX_DECODE_ENTRY(
             generation_eos;
 
         std::unique_ptr<RequestedLogprobBackend> requested_logprobs;
-        if (!options.logprob_token_ids.empty())
+        if (!options.logprob_token_ids.empty() || options.teacher_forced_score)
             requested_logprobs = std::make_unique<RequestedLogprobBackend>(backend, options.logprob_token_ids,
-                model.vocab_size, options.context_tokens, session, original_work_device);
+                model.vocab_size, options.context_tokens, session, original_work_device,
+                options.teacher_forced_score ? std::span<const std::uint32_t>{options.tokens} : std::span<const std::uint32_t>{});
         strix::SerialGreedyStepBackend* generation_backend = requested_logprobs
             ? static_cast<strix::SerialGreedyStepBackend*>(requested_logprobs.get())
             : static_cast<strix::SerialGreedyStepBackend*>(&backend);
@@ -2783,7 +2895,7 @@ int STRIX_DECODE_ENTRY(
         }
 
         const bool generation_request_timing_enabled =
-            !raw_recording && !final_state_metadata;
+            !raw_recording && !final_state_metadata && !options.teacher_forced_score;
         const auto generation_request_start = generation_request_timing_enabled
             ? std::chrono::steady_clock::now()
             : std::chrono::steady_clock::time_point{};
@@ -2882,6 +2994,13 @@ int STRIX_DECODE_ENTRY(
             total.steps_executed += known_prefix_result->consumed_prompt_tokens;
             return total;
         }();
+        if (options.teacher_forced_score && (!requested_logprobs ||
+            requested_logprobs->rows().size() != options.tokens.size() - 1U)) {
+            session.health = strix::SerialSessionHealth::poisoned;
+            session.arithmetic_lineage.tainted = true;
+            original_work_device->recover_or_fail_stop();
+            throw std::logic_error("teacher-forced score did not produce exactly N-1 next-token rows");
+        }
         const auto generation_request_stop = generation_request_timing_enabled
             ? std::chrono::steady_clock::now()
             : std::chrono::steady_clock::time_point{};
@@ -2999,7 +3118,9 @@ int STRIX_DECODE_ENTRY(
         }
         if (requested_logprobs) {
             const auto previous_precision = std::cout.precision(17);
-            std::cout << "  \"requested_logprobs_scope\":\"next-token-full-vocabulary-distribution-after-each-consumed-input\",\n"
+            std::cout << "  \"requested_logprobs_scope\":\""
+                      << (options.teacher_forced_score ? "teacher-forced-next-input-diagnostic-N-minus-1-rows-not-a-speed-run" :
+                          "next-token-full-vocabulary-distribution-after-each-consumed-input") << "\",\n"
                       << "  \"requested_logprobs_denominator\":\"full-vocabulary-fp64-logsumexp-ascending-id\",\n"
                       << "  \"requested_logprobs_qualification\":\"not_assessed\",\n"
                       << "  \"requested_logprobs_rows\":[";

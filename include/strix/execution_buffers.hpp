@@ -19,6 +19,8 @@ struct ExecutionBufferRequest {
     bool q51_slot_parallel_down = false;
     bool qsa_hierarchical_selection = false;
     std::uint32_t qsa_gqa_heads_per_block = 1;
+    bool a8_down_q51 = false;
+    bool a8_down_q80 = false;
 };
 
 struct ExecutionBufferPlan {

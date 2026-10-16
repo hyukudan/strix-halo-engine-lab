@@ -1,4 +1,6 @@
 #include "strix/hip_moe_q4k_a8_probe.hpp"
+#include "strix/hip_moe_a8_down.hpp"
+#include "strix/hip_launch_context.hpp"
 #if defined(__FAST_MATH__) || (defined(__FINITE_MATH_ONLY__) && __FINITE_MATH_ONLY__)
 #error "Q4K A8G32 requires nonfinite checks and strict floating-point semantics"
 #endif
@@ -232,4 +234,138 @@ void enqueue_half_conversion_probe(std::uint32_t* output,hipStream_t stream) {
     if(output==nullptr) throw std::invalid_argument("null half conversion destination");
     half_conversion<<<256,256,0,stream>>>(output);check(hipGetLastError(),"Q4K A8 half conversion enqueue");
 }
+
+// A8 down is a separate, explicitly selected numerical contract. Incumbent
+// quantize/project/enqueue bodies above remain unchanged.
+namespace {
+__device__ void down_error(unsigned* status,unsigned* aggregate,unsigned bits) {
+    atomicOr(status,bits);
+    if(aggregate) atomicOr(aggregate,down_aggregate_error);
+}
+__global__ void down_activation_quantize(float* intermediates,const unsigned* routes,
+    signed char* codes,float* deltas,int* sums,unsigned* status,unsigned* aggregate,
+    unsigned width,unsigned experts) {
+    if(*status!=0) return;
+    const unsigned lane=threadIdx.x&31U,wave=threadIdx.x/32U;
+    const unsigned group=blockIdx.x*8U+wave,slot=blockIdx.y;
+    if(group>=width/32U) return; // whole wave inactive, no cross-wave collectives
+    if(routes[slot]>=experts) {if(lane==0) down_error(status,aggregate,down_invalid_route);return;}
+    const unsigned at=slot*2U*width+group*32U+lane;
+    const float g=intermediates[at],u=intermediates[at+width];
+    const float h=(g/(1.0F+expf(-g)))*u;
+    const unsigned bad=static_cast<unsigned>(__ballot(!isfinite(g)||!isfinite(u)||!isfinite(h)));
+    if(bad!=0) {if(lane==0) down_error(status,aggregate,down_nonfinite_activation);return;}
+    float a=fabsf(h);
+    for(int stride=16;stride!=0;stride/=2) a=fmaxf(a,__shfl_xor(a,stride,32));
+    const bool tiny=a>0.0F && a<0x1p-119F;
+    const float delta=a==0.0F || tiny?1.0F:divide_rne(a,127.0F);
+    const float rounded=tiny?0.0F:rintf(divide_rne(h,delta));
+    const int code=static_cast<int>(fminf(127.0F,fmaxf(-127.0F,rounded)));
+    int sum=code;
+    for(int stride=16;stride!=0;stride/=2) sum+=__shfl_xor(sum,stride,32);
+    intermediates[at]=h;
+    codes[slot*width+group*32U+lane]=static_cast<signed char>(code);
+    if(lane==0) {deltas[slot*(width/32U)+group]=delta;sums[slot*(width/32U)+group]=sum;}
+}
+__device__ unsigned down_u16(const unsigned char* p) {
+    return static_cast<unsigned>(p[0])|(static_cast<unsigned>(p[1])<<8U);
+}
+__device__ unsigned down_u32(const unsigned char* p) {
+    // Q8_0 rows have34-byte blocks: never require a misaligned dword load.
+    return down_u16(p)|(down_u16(p+2U)<<16U);
+}
+__device__ unsigned down_q51_word(const unsigned char* block,unsigned first) {
+    const unsigned high=down_u32(block+4U);
+    unsigned result=0;
+    #pragma unroll
+    for(unsigned j=0;j<4U;++j) {
+        const unsigned i=first+j;
+        const unsigned packed=block[8U+i%16U];
+        const unsigned low=(i<16U?packed:packed>>4U)&15U;
+        const unsigned q=low|(((high>>i)&1U)<<4U);
+        result|=q<<(8U*j);
+    }
+    return result;
+}
+template<bool Q51>
+__global__ void down_rawdots(const unsigned char* weights,const unsigned* routes,
+    const signed char* codes,const float* deltas,const int* sums,float* rawdots,
+    unsigned* status,unsigned* aggregate,unsigned hidden,unsigned width,unsigned experts) {
+    if(*status!=0) return;
+    const unsigned lane=threadIdx.x&31U,owner=lane&3U;
+    const unsigned row=blockIdx.x*64U+(threadIdx.x/32U)*8U+lane/4U;
+    const unsigned slot=blockIdx.y,expert=routes[slot],groups=width/32U;
+    if(expert>=experts) {if(threadIdx.x==0) down_error(status,aggregate,down_invalid_route);return;}
+    constexpr unsigned block_bytes=Q51?24U:34U;
+    const auto* row_weights=weights+(static_cast<unsigned long long>(expert)*hidden+row)*groups*block_bytes;
+    float acc=0.0F;
+    #pragma unroll 1
+    for(unsigned group=owner;group<groups;group+=4U) {
+        const auto* packed=row_weights+group*block_bytes;
+        const auto* image=reinterpret_cast<const int*>(codes+slot*width+group*32U);
+        int integer=0;
+        #pragma unroll
+        for(unsigned word=0;word<8U;++word) {
+            if constexpr(Q51) integer=dot(image[word],down_q51_word(packed,word*4U),integer);
+            else integer=__builtin_amdgcn_sudot4(true,image[word],true,
+                static_cast<int>(down_u32(packed+2U+word*4U)),integer,false);
+        }
+        const float d=half_float(down_u16(packed));
+        const float first=d*static_cast<float>(integer);
+        float combined=first;
+        if constexpr(Q51) {
+            const float m=half_float(down_u16(packed+2U));
+            const float correction=m*static_cast<float>(sums[slot*groups+group]);
+            combined=first+correction;
+        }
+        const float contribution=deltas[slot*groups+group]*combined;
+        acc=acc+contribution;
+    }
+    acc=acc+__shfl_xor(acc,1,32);
+    acc=acc+__shfl_xor(acc,2,32);
+    if(owner==0) rawdots[slot*hidden+row]=acc;
+}
+void down_admit(const DownRequest& request,const DownBindings& b,hipStream_t stream) {
+    validate_down(request,b);
+    if(!stream || stream==hipStreamLegacy || stream==hipStreamPerThread)
+        throw std::invalid_argument("A8 down requires explicitly owned eager stream");
+    const auto* context=current_hip_launch_context();
+    if(context && (context->stream!=stream || context->graph_capture || context->status.arena_base ||
+        context->arguments.memory.arena_base))
+        throw std::invalid_argument("A8 down rejects graph or foreign launch context");
+    hipStreamCaptureStatus capture=hipStreamCaptureStatusNone;
+    check(hipStreamIsCapturing(stream,&capture),"A8 down capture query");
+    if(capture!=hipStreamCaptureStatusNone) throw std::invalid_argument("A8 down rejects capture before enqueue");
+    check(hipPeekAtLastError(),"A8 down pre-enqueue stale error");
+}
+}
+void enqueue_down_activation_quantize(const DownRequest& r,const DownBindings& b,hipStream_t stream) {
+    down_admit(r,b,stream);
+    down_activation_quantize<<<dim3((r.shape.intermediate/32U+7U)/8U,r.shape.top_k),256,0,stream>>>(
+        reinterpret_cast<float*>(b.intermediates.address),reinterpret_cast<const unsigned*>(b.routes.address),
+        reinterpret_cast<signed char*>(b.codes.address),reinterpret_cast<float*>(b.deltas.address),
+        reinterpret_cast<int*>(b.sums.address),reinterpret_cast<unsigned*>(b.status.address),
+        reinterpret_cast<unsigned*>(b.aggregate_status.address),r.shape.intermediate,r.shape.experts);
+    check(hipGetLastError(),"A8 down activation/quantization enqueue");
+}
+void enqueue_down_rawdots(const DownRequest& r,const DownBindings& b,hipStream_t stream) {
+    down_admit(r,b,stream);
+    if(r.weight_type==7) {
+        down_rawdots<true><<<dim3(r.shape.hidden/64U,r.shape.top_k),256,0,stream>>>(
+            reinterpret_cast<const unsigned char*>(b.weights.address),reinterpret_cast<const unsigned*>(b.routes.address),
+            reinterpret_cast<const signed char*>(b.codes.address),reinterpret_cast<const float*>(b.deltas.address),
+            reinterpret_cast<const int*>(b.sums.address),reinterpret_cast<float*>(b.rawdots.address),
+            reinterpret_cast<unsigned*>(b.status.address),reinterpret_cast<unsigned*>(b.aggregate_status.address),
+            r.shape.hidden,r.shape.intermediate,r.shape.experts);
+    } else {
+        down_rawdots<false><<<dim3(r.shape.hidden/64U,r.shape.top_k),256,0,stream>>>(
+            reinterpret_cast<const unsigned char*>(b.weights.address),reinterpret_cast<const unsigned*>(b.routes.address),
+            reinterpret_cast<const signed char*>(b.codes.address),reinterpret_cast<const float*>(b.deltas.address),
+            reinterpret_cast<const int*>(b.sums.address),reinterpret_cast<float*>(b.rawdots.address),
+            reinterpret_cast<unsigned*>(b.status.address),reinterpret_cast<unsigned*>(b.aggregate_status.address),
+            r.shape.hidden,r.shape.intermediate,r.shape.experts);
+    }
+    check(hipGetLastError(),"A8 down integer rawdot enqueue");
+}
+
 }

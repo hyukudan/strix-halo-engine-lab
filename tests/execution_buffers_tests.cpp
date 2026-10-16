@@ -102,6 +102,31 @@ int main() {
     expect(strix::build_serial_execution_buffer_plan(tail_model, router_request).router_workspace_bytes == 512ULL,
            "router workspace admission rounds the whole row span to 256 bytes");
 
+    strix::ExecutionBufferRequest a8_down;
+    a8_down.q4k_a8g32_gate_up = true;
+    a8_down.grouped_exact_q51_down = true;
+    a8_down.q51_slot_parallel_down = true;
+    const auto exact_down_buffers = strix::build_serial_execution_buffer_plan(model, a8_down);
+    a8_down.a8_down_q51 = true;
+    const auto quantized_down_buffers = strix::build_serial_execution_buffer_plan(model, a8_down);
+    expect(quantized_down_buffers.mlp_intermediate_bytes > exact_down_buffers.mlp_intermediate_bytes,
+           "down quantization reserves distinct codes scales and sums beyond exact raw dots");
+    a8_down.a8_down_q80 = true;
+    expect(strix::build_serial_execution_buffer_plan(model, a8_down).mlp_intermediate_bytes ==
+               quantized_down_buffers.mlp_intermediate_bytes,
+           "Q8 extension reuses the same exclusive down workspace");
+    for (unsigned failure_case = 0; failure_case != 4; ++failure_case) {
+        auto bad = a8_down;
+        if (failure_case == 0) bad.a8_down_q51 = false;
+        if (failure_case == 1) bad.logical_rows = 2;
+        if (failure_case == 2) bad.q51_slot_parallel_down = false;
+        if (failure_case == 3) bad.activation_element_bytes = 4;
+        bool rejected = false;
+        try { (void)strix::build_serial_execution_buffer_plan(model, bad); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        expect(rejected, "down quantization rejects unsupported storage or topology before allocation");
+    }
+
     if (failures == 0) {
         std::cout << "execution buffer tests passed\n";
     }

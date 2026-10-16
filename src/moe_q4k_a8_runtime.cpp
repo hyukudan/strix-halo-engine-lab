@@ -47,10 +47,16 @@ RuntimeWorkspace build_runtime_workspace(std::uint64_t hidden, std::uint64_t row
 }
 RuntimeWorkspace build_runtime_workspace(std::uint64_t hidden, std::uint64_t rows,
     std::uint64_t experts, std::uint64_t top_k, bool q51_slot_rawdots) {
+    return build_runtime_workspace(hidden, rows, experts, top_k, q51_slot_rawdots, false);
+}
+RuntimeWorkspace build_runtime_workspace(std::uint64_t hidden, std::uint64_t rows,
+    std::uint64_t experts, std::uint64_t top_k, bool q51_slot_rawdots, bool a8_down) {
     if (hidden < 256 || hidden > 2560 || hidden % 256 != 0 ||
         rows < 32 || rows > 640 || rows % 32 != 0 ||
         experts == 0 || experts > 512 || top_k == 0 || top_k > 10 || top_k > experts)
         throw std::invalid_argument("Q4K A8 runtime unsupported H/I/E/K geometry");
+    if (a8_down && (rows % 128U != 0 || hidden % 64U != 0))
+        throw std::invalid_argument("A8 down runtime requires I divisible by 128 and H divisible by 64");
     RuntimeWorkspace l;
     l.gate_up_bytes = mul(mul(mul(top_k, 2), rows), 4);
     l.accumulation_offset = align256(l.gate_up_bytes);
@@ -63,12 +69,21 @@ RuntimeWorkspace build_runtime_workspace(std::uint64_t hidden, std::uint64_t row
     l.sums_offset = align256(l.deltas_offset + l.deltas_bytes);
     l.sums_bytes = mul(hidden / 32, 4);
     l.total_bytes = align256(l.sums_offset + l.sums_bytes);
-    if (q51_slot_rawdots) {
+    if (q51_slot_rawdots || a8_down) {
         l.rawdots_offset = l.total_bytes;
         l.rawdots_bytes = mul(mul(top_k, hidden), 4U);
         if (l.rawdots_bytes > std::numeric_limits<std::uint64_t>::max() - l.rawdots_offset)
             throw std::overflow_error("Q5_1 raw-dot workspace addition overflow");
         l.total_bytes = align256(l.rawdots_offset + l.rawdots_bytes);
+    }
+    if (a8_down) {
+        l.down_codes_offset = l.total_bytes;
+        l.down_codes_bytes = mul(top_k, rows);
+        l.down_deltas_offset = align256(l.down_codes_offset + l.down_codes_bytes);
+        l.down_deltas_bytes = mul(mul(top_k, rows / 32U), 4U);
+        l.down_sums_offset = align256(l.down_deltas_offset + l.down_deltas_bytes);
+        l.down_sums_bytes = l.down_deltas_bytes;
+        l.total_bytes = align256(l.down_sums_offset + l.down_sums_bytes);
     }
     return l;
 }
@@ -107,6 +122,10 @@ RuntimeLayerClassification classify_runtime_manifest(
         (ts[0]->ggml_type == 12 ? result.quantized_layers : result.legacy_q5k_layers).push_back(layer);
         if(ts[0]->ggml_type==12 && ts[2]->ggml_type==7)
             result.q4k_with_q51_down_layers.push_back(layer);
+        if(ts[0]->ggml_type==12 && ts[2]->ggml_type==8)
+            result.q4k_with_q80_down_layers.push_back(layer);
+        if(ts[0]->ggml_type==13 && ts[2]->ggml_type==8)
+            result.q5k_with_q80_down_layers.push_back(layer);
     }
     if (result.quantized_layers.empty()) throw std::invalid_argument("Q4K A8 requires a Q4K routed layer");
     return result;
@@ -122,5 +141,30 @@ void validate_slot_parallel_manifest(const ModelContract& model, const RuntimeLa
             expected.push_back(layer);
     if (classification.q4k_with_q51_down_layers != expected)
         throw std::invalid_argument("Q5_1 slot-parallel down requires the complete canonical eligible layer set");
+}
+void validate_a8_down_manifest(const ModelContract& model,
+    const RuntimeLayerClassification& classification, bool q51, bool q80) {
+    if (!q51 && !q80)
+        throw std::invalid_argument("A8 down manifest admission requires an explicit candidate");
+    if (q80 && !q51)
+        throw std::invalid_argument("Q8_0 A8 down phase b requires the Q5_1 A8 down profile");
+    validate_slot_parallel_manifest(model, classification);
+    std::vector<std::uint32_t> q4k;
+    for (std::uint32_t layer = 0; layer < 48U; ++layer)
+        if (layer != 2U) q4k.push_back(layer);
+    if (classification.quantized_layers != q4k ||
+        classification.legacy_q5k_layers != std::vector<std::uint32_t>{2U} ||
+        classification.q4k_with_q80_down_layers != std::vector<std::uint32_t>{4U,30U,46U,47U} ||
+        classification.q5k_with_q80_down_layers != std::vector<std::uint32_t>{2U})
+        throw std::invalid_argument("A8 down requires canonical 43 Q5_1, four Q8_0 and one Q5_K fallback layers");
+}
+void validate_a8_down_content(const ModelContentIdentity& content) {
+    // Loader-framed content identity of the admitted original GGUF, not a
+    // layout-only or filename claim and not a numerical qualification flag.
+    constexpr std::array<std::uint8_t,32> expected{
+        0x37,0x26,0xd6,0xf0,0xd9,0xba,0x30,0xb9,0xd6,0x55,0xba,0x30,0x35,0x95,0x11,0x89,
+        0x41,0xba,0xec,0xa5,0xe6,0x94,0x5f,0xc8,0x78,0x5f,0x93,0x8e,0x0f,0x54,0x55,0xe4};
+    if (content.bytes != expected)
+        throw std::invalid_argument("A8 down requires the admitted model content identity");
 }
 }  // namespace strix::moe_q4k_a8

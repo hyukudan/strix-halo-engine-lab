@@ -243,11 +243,163 @@ void canonical_slot_workspace_rejection(bool bf16) {
     }
 }
 
+#ifdef STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME
+// Runtime admission is closed to canonical geometry, so use real bounded
+// scratch/D1 owners and symbolic model metadata. No expert-weight allocation
+// or launch is needed to prove rejection before the first write.
+void a8_down_runtime_admission() {
+    const auto model = strix::ModelContract::qwen38_flash_next();
+    const auto plan = strix::build_serial_decode_execution_plan(model);
+    const auto io = strix::build_serial_execution_io_plan(plan);
+    const auto& step = first_expert_step(plan);
+    const auto& step_io = io.steps[step.id];
+    strix::ExecutionBufferRequest buffers;
+    buffers.q4k_a8g32_gate_up = true; buffers.grouped_exact_q51_down = true;
+    buffers.q51_slot_parallel_down = true;
+    const auto arena = strix::build_serial_execution_arena_plan(model,buffers,plan,io,256U);
+    const auto guard = std::make_shared<const strix::HipSetupQuiescenceGuard>();
+    void* storage = nullptr; void* record = nullptr;
+    hipStream_t stream = nullptr; hipGraph_t graph = nullptr; bool capturing = false;
+    try {
+        check(hipMalloc(&storage,static_cast<std::size_t>(arena.total_bytes)),"allocate A8 down admission arena");
+        check(hipMalloc(&record,8U),"allocate A8 down admission D1");
+        check(hipStreamCreateWithFlags(&stream,hipStreamNonBlocking),"create A8 down admission stream");
+        check(hipMemset(storage,0xa5,static_cast<std::size_t>(arena.total_bytes)),"poison A8 down admission arena");
+        check(hipMemset(record,0x5a,8U),"poison A8 down admission D1");
+        strix::ExecutionMemoryBinding memory{0x4138444f574e5631ULL,
+            reinterpret_cast<std::uintptr_t>(storage),arena.total_bytes,1U};
+        strix::ModelRuntimeBinding weights;
+        weights.model_content_identity.bytes = {
+            0x37,0x26,0xd6,0xf0,0xd9,0xba,0x30,0xb9,0xd6,0x55,0xba,0x30,0x35,0x95,0x11,0x89,
+            0x41,0xba,0xec,0xa5,0xe6,0x94,0x5f,0xc8,0x78,0x5f,0x93,0x8e,0x0f,0x54,0x55,0xe4};
+        strix::ExecutionRuntimeResources resources; resources.scratch = &memory; resources.model_weights = &weights;
+        strix::ExecutionDispatchContext context;
+        context.execution_identity = memory.execution_identity; context.step_id = step.id; context.op = step.op;
+        context.layer = step.layer; context.reads = step_io.reads; context.writes = step_io.writes;
+        context.temporaries = step_io.temporaries; context.arena = &arena; context.memory = &memory; context.resources = &resources;
+        const auto temporary = strix::resolve_execution_buffer(memory.execution_identity,arena,memory,step_io.temporaries[0]);
+        expect(temporary.bytes == 167680U,"incumbent slot arena lacks the new down A8 regions");
+        std::vector<std::byte> before(static_cast<std::size_t>(arena.total_bytes)),after(before.size());
+        std::array<std::byte,8> before_record{},after_record{};
+        check(hipMemcpy(before.data(),storage,before.size(),hipMemcpyDeviceToHost),"snapshot A8 down admission arena");
+        check(hipMemcpy(before_record.data(),record,8U,hipMemcpyDeviceToHost),"snapshot A8 down admission D1");
+        const auto unchanged = [&] {
+            check(hipMemcpy(after.data(),storage,after.size(),hipMemcpyDeviceToHost),"read A8 down rejected arena");
+            check(hipMemcpy(after_record.data(),record,8U,hipMemcpyDeviceToHost),"read A8 down rejected D1");
+            expect(before == after && before_record == after_record,"A8 down admission preserves every arena and D1 byte");
+        };
+        const auto rejects = [&](auto&& operation,const char* fragment) {
+            bool rejected = false;
+            try { operation(); } catch (const std::invalid_argument& e) {
+                rejected = std::string(e.what()).find(fragment) != std::string::npos;
+            }
+            expect(rejected,"A8 down runtime rejects at the specified admission boundary");
+        };
+        strix::HipLaunchContext scope;
+        scope.stream = stream;
+        scope.deferred_moe_status = {memory.execution_identity,reinterpret_cast<std::uintptr_t>(record),8U,2U};
+        for (const bool phase_b : {false,true}) {
+            strix::HipMoeExpertsLauncherConfig config;
+            config.hidden_size = 2560U; config.intermediate_size = 640U; config.expert_count = 512U; config.top_k = 10U;
+            config.q4k_a8g32_gate_up = true; config.grouped_exact_q51_down = true; config.q51_slot_parallel_down = true;
+            config.batched_slot_activation = true; config.deferred_moe_status = true;
+            config.a8_down_q51 = true; config.a8_down_q80 = phase_b;
+            config.q4k_a8_quiescence = guard;
+            strix::ExecutionBindingRequest request;
+            request.q4k_a8g32_gate_up = true; request.grouped_exact_q51_down = true; request.q51_slot_parallel_down = true;
+            request.batched_moe_activation = true; request.deferred_moe_status = true;
+            request.a8_down_q51 = true; request.a8_down_q80 = phase_b;
+            const std::string id = "hip.moe_experts.bf16.h2560.m640.e512.k10.r1.c1.batched-slot-activation-v1.deferred-status-v1" +
+                std::string(strix::moe_q4k_a8::q51_a8_down_kernel_marker) +
+                (phase_b ? std::string(strix::moe_q4k_a8::q80_a8_down_kernel_marker) : "") +
+                std::string(strix::moe_q4k_a8::a8_down_kernel_ending);
+            strix::kernels::KernelRegistry registry;
+            strix::register_hip_moe_experts_kernel_variant(model,request,config,registry);
+            const auto* variant = registry.find(id);
+            expect(variant && !variant->graph_safe && variant->resources.scratch_bytes == 176128U &&
+                id.find(".grouped-exact-q51-down-v1") == std::string::npos,
+                "A8 down factory publishes explicit mixed arithmetic and complete scratch extent");
+            const auto launcher = strix::make_hip_moe_experts_launcher(id,&config);
+            context.kernel_id = id;
+            auto wrong = config; wrong.a8_down_q51 = false;
+            rejects([&] { (void)strix::make_hip_moe_experts_launcher(id,&wrong); },
+                phase_b ? "phase b requires" : "cannot select an exact");
+            rejects([&] { (void)strix::make_hip_moe_experts_launcher("bad.q51-slot-parallel-v1"+id,&config); },
+                "mixed arithmetic configuration");
+            auto graph_request = request; graph_request.require_graph_safe = true;
+            rejects([&] { strix::kernels::KernelRegistry r; strix::register_hip_moe_experts_kernel_variant(model,graph_request,config,r); },
+                "eager execution only");
+            rejects([&] { launcher.function(context,launcher.user_data); },"owned eager C1");
+            { strix::HipLaunchScope active(scope);
+                rejects([&] { launcher.preflight(context,launcher.user_data); },"buffers are undersized");
+                rejects([&] { launcher.function(context,launcher.user_data); },"buffers are undersized");
+                context.logical_rows = 2U;
+                rejects([&] { launcher.function(context,launcher.user_data); },"C1 one-row");
+                context.logical_rows = 1U;
+                context.layer = 2U; weights.model_content_identity.bytes[31] ^= 1U;
+                rejects([&] { launcher.function(context,launcher.user_data); },"admitted model content");
+                weights.model_content_identity.bytes[31] ^= 1U;
+                rejects([&] { launcher.function(context,launcher.user_data); },"buffers are undersized");
+                context.layer = step.layer;
+                rejects([&] { strix::moe_experts_known_window_rows_preflight({},config,{}); },"rejects known-window CSR");
+            }
+            unchanged();
+            auto graph_fields = scope;
+            graph_fields.status = {memory.execution_identity,reinterpret_cast<std::uintptr_t>(record),4U,2U};
+            { strix::HipLaunchScope active(graph_fields);
+                rejects([&] { launcher.function(context,launcher.user_data); },"owned eager C1");
+            }
+            graph_fields.status = {};
+            graph_fields.arguments.memory = {memory.execution_identity,memory.arena_base,64U,1U};
+            { strix::HipLaunchScope active(graph_fields);
+                rejects([&] { launcher.function(context,launcher.user_data); },"owned eager C1");
+            }
+            unchanged();
+            check(hipStreamBeginCapture(stream,hipStreamCaptureModeThreadLocal),"begin A8 down rejected capture"); capturing = true;
+            { strix::HipLaunchScope active(scope);
+                rejects([&] { launcher.function(context,launcher.user_data); },"rejects stream capture");
+            }
+            check(hipStreamEndCapture(stream,&graph),"end A8 down rejected capture"); capturing = false;
+            std::size_t nodes = 0; check(hipGraphGetNodes(graph,nullptr,&nodes),"count A8 down rejected nodes");
+            expect(nodes == 0U,"A8 down capture rejection submits no nodes");
+            check(hipGraphDestroy(graph),"destroy A8 down empty graph"); graph = nullptr;
+            const auto inputs = strix::graph_input_layout(1U);
+            auto graph_scope = scope; graph_scope.deferred_moe_status = {}; graph_scope.graph_capture = true;
+            graph_scope.arguments = strix::bind_graph_inputs(inputs,
+                {memory.execution_identity,memory.arena_base,inputs.bytes,1U});
+            graph_scope.status = {memory.execution_identity,reinterpret_cast<std::uintptr_t>(record),4U,2U};
+            graph_scope.context_tokens = 64U; graph_scope.vocabulary_size = static_cast<std::uint32_t>(model.vocab_size);
+            { strix::HipLaunchScope active(graph_scope);
+                rejects([&] { launcher.function(context,launcher.user_data); },"owned eager C1");
+            }
+            unchanged();
+        }
+        check(hipStreamDestroy(stream),"destroy A8 down admission stream"); stream = nullptr;
+        check(hipFree(record),"free A8 down admission D1"); record = nullptr;
+        check(hipFree(storage),"free A8 down admission arena"); storage = nullptr;
+    } catch (...) {
+        if (capturing) { hipGraph_t abandoned = nullptr; (void)hipStreamEndCapture(stream,&abandoned); if (abandoned) (void)hipGraphDestroy(abandoned); }
+        guard->recover_or_fail_stop();
+        if (graph) (void)hipGraphDestroy(graph);
+        if (stream) (void)hipStreamDestroy(stream);
+        if (record) (void)hipFree(record);
+        if (storage) (void)hipFree(storage);
+        throw;
+    }
+}
+#endif
+
 }  // namespace
 
 int main(int argc, char** argv) try {
     const unsigned int requested_mode = argc > 1 ? static_cast<unsigned int>(std::stoul(argv[1])) : 0U;
     if (requested_mode > 7U) throw std::invalid_argument("invalid K-quant test mode");
+#ifdef STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME
+    if (argc > 2 && std::string(argv[2]) == "a8-down-runtime-admission") {
+        a8_down_runtime_admission();
+        return failures == 0 ? 0 : 1;
+    }
+#endif
     const bool slot_parallel_q51=argc>2 && (std::string(argv[2])=="q4k-a8-q51-slot-parallel" ||
         std::string(argv[2])=="q4k-a8-q51-slot-parallel-duplicate");
     const bool grouped_q51=slot_parallel_q51 || (argc>2 && (std::string(argv[2])=="q4k-a8-q51-grouped" || std::string(argv[2])=="q4k-a8-q51-grouped-duplicate"));

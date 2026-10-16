@@ -61,9 +61,9 @@ status alongside wave routing and lane-chain HC output. Its own native, full-mod
 and clean automatic workload gates passed at the qualified source revision below.
 Earlier manual bundle evidence is retained separately; individual speedups are not
 added to infer the combination.
-The HC projection prototype adds no decoder option. Explicit experiment flags can
-compose with an explicitly requested automatic profile, but this does not qualify their combined cost
-or numerical behavior.
+Arithmetic candidates use the separate typed option below. Explicit experiment
+flags can compose with an explicitly requested automatic profile, but this does
+not qualify their combined cost or numerical behavior.
 
 All three decoder receipt paths add:
 
@@ -149,3 +149,82 @@ source adoption; it does not assert deployment of a user-facing remote binary.
 The low-level/manual defaults, explicit overrides and fallback contracts above
 remain in force. Additional graph, speculative, integer-head, model/context and
 projection-prototype combinations need their own qualification.
+
+
+## Explicit numerical recipes
+
+`--numerical-profile` selects an arithmetic overlay independently of automatic
+organization and submission. Its default, `exact-v5`, preserves the existing
+selected arithmetic; it does not mean that every manual configuration or every
+checkpoint has the qualification of the ordinary automatic profile.
+
+| Value | HC projection | Routed down projection |
+| --- | --- | --- |
+| `exact-v5` | Existing selected path | Existing selected path |
+| `hc-splitk-f32-v1` | FP32 split-K | Existing selected path |
+| `q51-a8-down-v1` | Existing selected path | A8 activation and integer Q5_1 dot |
+| `hc-splitk-f32+q51-a8-down-v1` | FP32 split-K | A8 activation and integer Q5_1 dot |
+| `q51-q80-a8-down-v1` | Existing selected path | A8 activation and integer Q5_1 plus eligible Q8_0 dots |
+| `hc-splitk-f32+q51-q80-a8-down-v1` | FP32 split-K | Both eligible A8 down formats |
+
+These alternatives change rounding or reduction association. They are explicit
+candidates with `not_assessed` numerical qualification, not aliases for exact
+baseline outputs. The FP64 HC control remains confined to diagnostic harnesses;
+there is no FP64 command-line recipe.
+
+The arithmetic option does not count as a low-level organization option. It is
+applied after the existing selector: ordinary automatic generation retains v5's
+prepared dispatch, graph islands, fork/join and projection organizations. The
+receipt retains `optimization_profile_base_selected`, appends the nondefault
+recipe to `optimization_profile_selected`, and reports `numerical_profile`.
+No prerequisite flag is enabled or disabled by this overlay. A manual or
+teacher-forced diagnostic must supply a full compatible organization when the
+base selector does not provide it.
+
+Nondefault recipes require the exact admitted content, canonical model geometry,
+context8192, registered weights, eager floating C1 execution and the full v5
+organization. Graph execution, integer heads, scalar-only output, MTP,
+known-prefix windows or CSR, serving/cohort execution, prompt lookup, prefix
+roundtrip, alternate recurrent layouts, GQA organizations and offline selection
+are rejected. Other checkpoints and missing prerequisites fail before device
+allocation. The HC metadata pass checks all97 selected mixer bindings and exact
+tensor formats/extents before residency; live owner and dispatch preflight still
+runs. Prepared launcher plans are built from the selected numerical kernel IDs,
+not reused from a baseline plan.
+
+The admitted routed census is43 Q4_K/Q5_1 layers, four Q4_K/Q8_0 layers and one
+Q5_K/Q8_0 fallback layer. The Q51-only recipe preserves the four Q8_0 fallback
+layers; the Q51/Q80 recipe changes only those four additional eligible down
+projections. The Q5_K gate/up layer remains on its original path. Compact RAW
+identities distinguish the new down arithmetic and do not claim the incumbent
+exact-grouped Q5_1 reduction. Integer activation codes, FP32 scales, tiny-group
+handling, integer dot order and ordered route merge are versioned contracts.
+
+Receipts distinguish configured recipes and model eligibility/fallback lists from
+`hc_splitk_f32_submissions`, `q51_a8_down_submissions`,
+`q80_a8_down_submissions` and `q80_a8_down_legacy_fallback_submissions`.
+These are actual successful host enqueues. They are not graph replay counts,
+physical traffic estimates or performance measurements.
+
+## Teacher-forced scoring diagnostic
+
+`--teacher-forced-score --generate 1` consumes a bounded sequence of at least two
+known input IDs. For input position `p < N-1`, it requests exactly the supplied
+ID at `p+1`, using the full finite vocabulary and the existing FP64
+log-sum-exp reduction in ascending vocabulary-ID order. The last teacher input is
+consumed once with ordinary full logits and creates no label row. The normal
+single pending greedy output remains separate from the teacher labels.
+
+`requested_logprobs_rows` must contain exactly `N-1` rows, each with its actual
+input token, position and one next-input ID/log probability. All labels and
+capacity bounds are checked before inference. Prefix state-only requests delegate
+to this same full-output consumer, so a score never skips its head or consumes
+an input twice. A post-consumption presentation failure poisons and drains the
+request instead of publishing a partial healthy result.
+
+This mode rejects static `--logprob-token` requests, RAW/state exports, replay
+references, scalar output and alternate controllers. It is a diagnostic scoring
+run: complete-request timing is disabled, and its score ledger is not a speed
+measurement. Arithmetic candidates retain their explicit recipe and unassessed
+qualification; computing scores alone does not approve their quality thresholds
+or change defaults.

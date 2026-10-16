@@ -3,6 +3,7 @@
 #include "strix/hip_moe_experts_launcher.hpp"
 #include "strix/deferred_moe_status.hpp"
 #include "strix/q51_slot_parallel_contract.hpp"
+#include "strix/moe_a8_down_contract.hpp"
 
 #include "strix/dispatch_resources.hpp"
 #include "strix/prepared_tensor_views.hpp"
@@ -14,6 +15,7 @@
 #include "strix/hip_moe_q4k_a8_probe.hpp"
 #include "strix/hip_moe_q4k_a8_known_rows.hpp"
 #include "strix/hip_q51_grouped_down_probe.hpp"
+#include "strix/hip_moe_a8_down.hpp"
 #endif
 #include <array>
 #include <algorithm>
@@ -144,6 +146,16 @@ void check_hip(
 
 void validate_config(
     const HipMoeExpertsLauncherConfig& config) {
+    if (config.a8_down_q80 && !config.a8_down_q51)
+        throw std::invalid_argument("Q8_0 A8 down phase b requires Q5_1 A8 down");
+    if (config.a8_down_q51 || config.a8_down_q80) {
+        if (!config.q4k_a8g32_gate_up || !config.grouped_exact_q51_down ||
+            !config.q51_slot_parallel_down || !config.batched_slot_activation || !config.deferred_moe_status)
+            throw std::invalid_argument("A8 down requires explicit A8 batched slot-parallel eager D1 configuration");
+        if (config.hidden_size != 2560U || config.intermediate_size != 640U ||
+            config.expert_count != 512U || config.top_k != 10U || config.activation != HipActivationStorage::bf16)
+            throw std::invalid_argument("A8 down requires canonical H/I/E/K geometry");
+    }
     if (config.batched_slot_activation && !config.q4k_a8g32_gate_up)
         throw std::invalid_argument("batched routed activation requires Q4K A8 independent slot workspace");
     if(config.grouped_exact_q51_down && !config.q4k_a8g32_gate_up)
@@ -155,7 +167,8 @@ void validate_config(
         throw std::invalid_argument("Q4K A8 runtime capability is not built");
 #else
         (void)moe_q4k_a8::build_runtime_workspace(config.hidden_size,
-            config.intermediate_size, config.expert_count, config.top_k, config.q51_slot_parallel_down);
+            config.intermediate_size, config.expert_count, config.top_k, config.q51_slot_parallel_down,
+            config.a8_down_q51 || config.a8_down_q80);
 #endif
     }
     if (config.hidden_size == 0 ||
@@ -1258,6 +1271,8 @@ struct PreparedQ4kA8 {
     moe_q4k_a8::Request request;
     moe_q4k_a8::Bindings bindings;
     bool grouped_q51, slot_parallel_q51;
+    std::optional<moe_q4k_a8::DownRequest> a8_down_request;
+    moe_q4k_a8::DownBindings a8_down_bindings;
 };
 
 PreparedQ4kA8 prepare_q4k_a8(const HipMoeExpertsLauncherConfig& config,
@@ -1267,7 +1282,8 @@ PreparedQ4kA8 prepare_q4k_a8(const HipMoeExpertsLauncherConfig& config,
     if (!config.q4k_a8_quiescence)
         throw std::invalid_argument("Q4K A8 runtime requires setup completion guard");
     const auto layout = moe_q4k_a8::build_runtime_workspace(config.hidden_size,
-        config.intermediate_size, config.expert_count, config.top_k, config.q51_slot_parallel_down);
+        config.intermediate_size, config.expert_count, config.top_k, config.q51_slot_parallel_down,
+        config.a8_down_q51 || config.a8_down_q80);
     if (temporary.bytes < layout.total_bytes)
         throw std::invalid_argument("Q4K A8 runtime temporary is undersized");
     const auto gate_bytes = required_weight_bytes(WeightKind::q4_k, config.hidden_size,
@@ -1300,7 +1316,10 @@ PreparedQ4kA8 prepare_q4k_a8(const HipMoeExpertsLauncherConfig& config,
         slice(layout.gate_up_offset,layout.gate_up_bytes)};
     // All admission is complete before even the initial clear is submitted.
     moe_q4k_a8::validate(request,bindings);
-    const bool grouped_q51=config.grouped_exact_q51_down && tensors.down.manifest->ggml_type==7U;
+    const auto down_type = tensors.down.manifest->ggml_type;
+    const bool integer_down = (config.a8_down_q51 && down_type == 7U) ||
+        (config.a8_down_q80 && down_type == 8U);
+    const bool grouped_q51=config.grouped_exact_q51_down && down_type==7U && !integer_down;
     const bool slot_parallel_q51=grouped_q51 && config.q51_slot_parallel_down;
     if(grouped_q51) {
         const q51_grouped_down::Request q51_request{true,q51_grouped_down::numerical_identity,
@@ -1319,7 +1338,23 @@ PreparedQ4kA8 prepare_q4k_a8(const HipMoeExpertsLauncherConfig& config,
                 {temporary.address+layout.rawdots_offset,layout.rawdots_bytes}});
         }
     }
-    return {layout, request, bindings, grouped_q51, slot_parallel_q51};
+    PreparedQ4kA8 result{layout, request, bindings, grouped_q51, slot_parallel_q51, std::nullopt, {}};
+    if (integer_down) {
+        const moe_q4k_a8::DownRequest down_request{true,moe_q4k_a8::down_numerical_identity(down_type),
+            {config.hidden_size,config.intermediate_size,config.expert_count,config.top_k},down_type};
+        const moe_q4k_a8::DownBindings down_bindings{
+            bindings.output, {tensors.down.runtime->address,
+                required_weight_bytes(weight_kind(down_type),config.intermediate_size,config.hidden_size,config.expert_count)},
+            bindings.routes, slice(layout.down_codes_offset,layout.down_codes_bytes),
+            slice(layout.down_deltas_offset,layout.down_deltas_bytes),
+            slice(layout.down_sums_offset,layout.down_sums_bytes),
+            slice(layout.rawdots_offset,layout.rawdots_bytes), bindings.status, {}};
+        // Full producer/consumer admission precedes even the local status clear.
+        moe_q4k_a8::validate_down(down_request,down_bindings);
+        result.a8_down_request = down_request;
+        result.a8_down_bindings = down_bindings;
+    }
+    return result;
 }
 
 template <typename Storage>
@@ -1353,6 +1388,10 @@ void launch_q4k_a8_typed(const HipMoeExpertsLauncherConfig& config,
             values,count,status,aggregate,bf16_commit);
         check_hip(hipGetLastError(),"Q4K A8 finite pipeline validation");
     };
+    if (prepared.a8_down_request) {
+        moe_q4k_a8::enqueue_down_activation_quantize(*prepared.a8_down_request,
+            prepared.a8_down_bindings,hip_execution_stream());
+    } else {
     scan(workspace,2U*config.intermediate_size*config.top_k);
     // Slot buffers are independent. Finish all original SiLU kernels before
     // checking their FP32 values, then preserve ascending down accumulation.
@@ -1375,7 +1414,22 @@ void launch_q4k_a8_typed(const HipMoeExpertsLauncherConfig& config,
         }
     }
     scan(workspace,2U*config.intermediate_size*config.top_k);
-    if(slot_parallel_q51) {
+    }
+    if (prepared.a8_down_request) {
+        moe_q4k_a8::enqueue_down_rawdots(*prepared.a8_down_request,
+            prepared.a8_down_bindings,hip_execution_stream());
+        // Same kernel body and operand order as the incumbent Q5_1 merge.
+        hipLaunchKernelGGL(q51_slot_parallel_merge_kernel,
+            dim3((config.hidden_size+kThreads-1U)/kThreads),dim3(kThreads),0,hip_execution_stream(),
+            reinterpret_cast<const float*>(prepared.a8_down_bindings.rawdots.address),routes,weights,
+            config.hidden_size,config.expert_count,config.top_k,accumulation,status);
+        check_hip(hipGetLastError(),"A8 down incumbent ordered slot merge");
+        if (config.q4k_a8_stats) {
+            auto& counter = prepared.a8_down_request->weight_type == 7U ?
+                config.q4k_a8_stats->a8_down_q51_submissions : config.q4k_a8_stats->a8_down_q80_submissions;
+            counter.fetch_add(1,std::memory_order_relaxed);
+        }
+    } else if(slot_parallel_q51) {
         auto* rawdots=reinterpret_cast<float*>(temporary.address+layout.rawdots_offset);
         hipLaunchKernelGGL(q51_slot_parallel_dot_kernel,
             dim3((config.hidden_size+7U)/8U,config.top_k),dim3(kThreads),0,hip_execution_stream(),
@@ -1425,6 +1479,9 @@ void launch_q4k_a8_typed(const HipMoeExpertsLauncherConfig& config,
     if (config.q4k_a8_stats) config.q4k_a8_stats->quantized_submissions.fetch_add(1,std::memory_order_relaxed);
     if(grouped_q51 && config.q4k_a8_stats)
         config.q4k_a8_stats->grouped_q51_submissions.fetch_add(1,std::memory_order_relaxed);
+    if ((config.a8_down_q51 || config.a8_down_q80) && !prepared.a8_down_request &&
+        tensors.down.manifest->ggml_type == 8U && config.q4k_a8_stats)
+        config.q4k_a8_stats->a8_down_q80_legacy_submissions.fetch_add(1,std::memory_order_relaxed);
 }
 #endif
 
@@ -1436,6 +1493,8 @@ struct PreparedMoeExperts {
     std::optional<PreparedQ4kA8> quantized;
 #endif
 };
+
+void validate_q51_slot_kernel_id(std::string_view id, const HipMoeExpertsLauncherConfig& config);
 
 PreparedMoeExperts prepare_moe_experts(
     const ExecutionDispatchContext& context,
@@ -1466,6 +1525,27 @@ PreparedMoeExperts prepare_moe_experts(
             HipMoeExpertsLauncherConfig*>(
                 user_data);
     validate_config(config);
+    if (config.a8_down_q51 || config.a8_down_q80) {
+        if (!config.q4k_a8_quiescence)
+            throw std::invalid_argument("A8 down requires retained setup completion guard on every layer");
+        if (!context.execution_identity || !context.kernel_id)
+            throw std::invalid_argument("A8 down requires a compiled arithmetic selection");
+        validate_q51_slot_kernel_id(*context.kernel_id,config);
+        const auto* scope = current_hip_launch_context();
+        if (!scope || scope->graph_capture || hip_graph_status() != nullptr ||
+            scope->status.arena_base || scope->arguments.memory.arena_base ||
+            !scope->stream || scope->stream == hipStreamLegacy || scope->stream == hipStreamPerThread)
+            throw std::invalid_argument("A8 down admits owned eager C1 execution only");
+        hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
+        check_hip(hipStreamIsCapturing(scope->stream,&capture),"query A8 down capture status");
+        if (capture != hipStreamCaptureStatusNone)
+            throw std::invalid_argument("A8 down rejects stream capture");
+        if (!context.layer || *context.layer >= 48U || !context.resources ||
+            !context.resources->model_weights || context.resources->distributed_stage)
+            throw std::invalid_argument("A8 down requires canonical unpartitioned model resources");
+        // This applies to every layer, including the literal Q5_K fallback.
+        moe_q4k_a8::validate_a8_down_content(context.resources->model_weights->model_content_identity);
+    }
 #ifdef STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME
     if (config.q51_slot_parallel_down) require_q51_slot_eager_stream(hip_execution_stream());
 #endif
@@ -1505,7 +1585,8 @@ PreparedMoeExperts prepare_moe_experts(
         sizeof(float);
     const auto temporary_required = config.q4k_a8g32_gate_up ?
         moe_q4k_a8::build_runtime_workspace(config.hidden_size, config.intermediate_size,
-            config.expert_count, config.top_k, config.q51_slot_parallel_down).total_bytes :
+            config.expert_count, config.top_k, config.q51_slot_parallel_down,
+            config.a8_down_q51 || config.a8_down_q80).total_bytes :
         (2ULL * config.intermediate_size + config.hidden_size) * sizeof(float) + sizeof(std::uint32_t);
 
     if (hidden.bytes <
@@ -1559,6 +1640,16 @@ PreparedMoeExperts prepare_moe_experts(
         config.hidden_size,
         config.expert_count,
         "routed down");
+
+    if (config.a8_down_q51 || config.a8_down_q80) {
+        const auto layer = *context.layer;
+        const bool q80_layer = layer == 2U || layer == 4U || layer == 30U || layer == 46U || layer == 47U;
+        const auto gate_type = layer == 2U ? 13U : 12U;
+        if (tensors.fused_gate_up || tensors.gate.manifest->ggml_type != gate_type ||
+            tensors.up.manifest->ggml_type != gate_type ||
+            tensors.down.manifest->ggml_type != (q80_layer ? 8U : 7U))
+            throw std::invalid_argument("A8 down layer types differ from canonical fallback census");
+    }
 
     if (config.deferred_moe_status) {
         const auto& record=current_hip_launch_context()->deferred_moe_status;
@@ -1656,9 +1747,12 @@ std::string kernel_id(
             request.request_concurrency) +
         (config.batched_slot_activation ? ".batched-slot-activation-v1" : "") +
         (config.deferred_moe_status ? ".deferred-status-v1" : "") +
-        (config.q51_slot_parallel_down ? ".q51-slot-parallel-v1" : "") +
-        (config.grouped_exact_q51_down ? ".grouped-exact-q51-down-v1" : "") +
-        (config.q4k_a8g32_gate_up ? std::string(moe_q4k_a8::runtime_kernel_suffix) : "");
+        (config.a8_down_q51 ? std::string(moe_q4k_a8::q51_a8_down_kernel_marker) : "") +
+        (config.a8_down_q80 ? std::string(moe_q4k_a8::q80_a8_down_kernel_marker) : "") +
+        ((config.a8_down_q51 || config.a8_down_q80) ? std::string(moe_q4k_a8::a8_down_kernel_ending) :
+            std::string(config.q51_slot_parallel_down ? ".q51-slot-parallel-v1" : "") +
+            (config.grouped_exact_q51_down ? ".grouped-exact-q51-down-v1" : "") +
+            (config.q4k_a8g32_gate_up ? std::string(moe_q4k_a8::runtime_kernel_suffix) : ""));
 }
 
 std::uint64_t implementation_identity(
@@ -1678,10 +1772,34 @@ std::uint64_t implementation_identity(
     if (config.q51_slot_parallel_down) hash_u64(hash,0x5135315350415231ULL);
     if (config.deferred_moe_status) hash_u64(hash,0x4445464d4f453031ULL);
     if (config.batched_slot_activation) hash_u64(hash,0x42415453494c5531ULL);
+    if (config.a8_down_q51) hash_u64(hash,0x5135314138445631ULL);
+    if (config.a8_down_q80) hash_u64(hash,0x5138304138445631ULL);
     return hash;
 }
 
-void validate_q51_slot_kernel_id(std::string_view id, bool enabled) {
+void validate_q51_slot_kernel_id(std::string_view id, const HipMoeExpertsLauncherConfig& config) {
+    if (config.a8_down_q51 || config.a8_down_q80) {
+        const auto tail =
+            (config.a8_down_q51 ? std::string(moe_q4k_a8::q51_a8_down_kernel_marker) : "") +
+            (config.a8_down_q80 ? std::string(moe_q4k_a8::q80_a8_down_kernel_marker) : "") +
+            std::string(moe_q4k_a8::a8_down_kernel_ending);
+        if (!id.ends_with(tail) || id.find(".q51-slot-parallel-v1") != std::string_view::npos ||
+            id.find(".grouped-exact-q51-down-v1") != std::string_view::npos)
+            throw std::invalid_argument("A8 down id differs from explicit mixed arithmetic configuration");
+        for (const auto marker : {moe_q4k_a8::q51_a8_down_kernel_marker,moe_q4k_a8::q80_a8_down_kernel_marker}) {
+            const auto pos = id.find(marker);
+            const bool expected = marker == moe_q4k_a8::q51_a8_down_kernel_marker ? config.a8_down_q51 : config.a8_down_q80;
+            if ((pos != std::string_view::npos) != expected || (expected &&
+                id.find(marker,pos+marker.size()) != std::string_view::npos))
+                throw std::invalid_argument("A8 down id has missing, foreign or duplicate arithmetic markers");
+        }
+        return;
+    }
+    if (id.find(moe_q4k_a8::q51_a8_down_kernel_marker) != std::string_view::npos ||
+        id.find(moe_q4k_a8::q80_a8_down_kernel_marker) != std::string_view::npos ||
+        id.find(".mixed-a8-down-v1") != std::string_view::npos)
+        throw std::invalid_argument("A8 down id cannot select an exact configuration");
+    const bool enabled = config.q51_slot_parallel_down;
     constexpr std::string_view marker=".q51-slot-parallel-v1";
     const auto position=id.find(marker);
     const bool present=position!=std::string_view::npos;
@@ -1721,6 +1839,13 @@ void register_hip_moe_experts_kernel_variant(
         throw std::invalid_argument("deferred MoE variant requires matching eager request");
     if (request.q4k_a8g32_gate_up != config.q4k_a8g32_gate_up)
         throw std::invalid_argument("Q4K A8 variant config differs from binding request");
+    if (request.a8_down_q51 != config.a8_down_q51 || request.a8_down_q80 != config.a8_down_q80)
+        throw std::invalid_argument("A8 down config differs from binding request");
+    if ((config.a8_down_q51 || config.a8_down_q80) &&
+        (model.hidden_layers != 48U || model.bytes_fp32 != 4U))
+        throw std::invalid_argument("A8 down registers canonical 48-layer FP32 control geometry only");
+    if ((config.a8_down_q51 || config.a8_down_q80) && (request.device_graph_inputs || request.require_graph_safe))
+        throw std::invalid_argument("A8 down registers eager C1 variants only");
     if (config.hidden_size !=
             model.hidden_size ||
         config.intermediate_size !=
@@ -1791,20 +1916,37 @@ void register_hip_moe_experts_kernel_variant(
     if (config.q4k_a8g32_gate_up) {
         variant.resources.lds_bytes = 3328;
         variant.resources.scratch_bytes = moe_q4k_a8::build_runtime_workspace(config.hidden_size,
-            config.intermediate_size,config.expert_count,config.top_k,config.q51_slot_parallel_down).total_bytes;
+            config.intermediate_size,config.expert_count,config.top_k,config.q51_slot_parallel_down,
+            config.a8_down_q51 || config.a8_down_q80).total_bytes;
         variant.numerics.accumulator_precision = std::string(moe_q4k_a8::runtime_numerical_identity);
         variant.compiler_identity = "hip-gfx1151-moe-q4k-a8g32-native-v2-probe-strict-rndiv-legacy-down";
     }
-    if(config.grouped_exact_q51_down) {
+    if(config.grouped_exact_q51_down && !config.a8_down_q51) {
         variant.numerics.accumulator_precision += ";" + std::string(moe_q4k_a8::grouped_q51_numerical_identity);
         variant.compiler_identity += ":grouped-exact-q51-down-v1";
     }
     if(config.deferred_moe_status) variant.compiler_identity += ":deferred-first-error-v1";
-    if(config.q51_slot_parallel_down) {
+    if(config.q51_slot_parallel_down && !config.a8_down_q51) {
         variant.numerics.accumulator_precision += ";" + std::string(q51_slot_parallel::numerical_identity);
         variant.compiler_identity += ":q51-slot-parallel-rawdot-v1";
     }
     if(config.batched_slot_activation) variant.compiler_identity += ":batched-slot-activation-v1";
+    if (config.a8_down_q51 || config.a8_down_q80) {
+        variant.numerics.accumulator_precision = std::string(moe_q4k_a8::a8_down_gate_up_numerical_identity);
+        if (config.a8_down_q51)
+            variant.numerics.accumulator_precision += ";" + std::string(moe_q4k_a8::q51_a8_down_numerical_identity);
+        else
+            variant.numerics.accumulator_precision += ";" + std::string(q51_slot_parallel::numerical_identity);
+        if (config.a8_down_q80)
+            variant.numerics.accumulator_precision += ";" + std::string(moe_q4k_a8::q80_a8_down_numerical_identity);
+        else
+            variant.numerics.accumulator_precision += ";four-q4k-q80-legacy-slot-down";
+        variant.numerics.accumulator_precision += ";layer2-q5k-q80-literal-fallback:final-scan-bf16-commit-d1";
+        variant.compiler_identity = "hip-gfx1151-moe-a8-down-strict-v1:activation-quantize:integer-rawdots:incumbent-slot-merge:final-scan-commit-d1";
+        if (config.a8_down_q51) variant.compiler_identity += ":q51-iu5";
+        if (config.a8_down_q80) variant.compiler_identity += ":q80-is8";
+        variant.graph_safe = false;
+    }
     variant.measured_seconds = 0.0;
 
     registry.add(
@@ -1821,12 +1963,13 @@ make_hip_moe_experts_launcher(
             "HIP routed-expert launcher requires id and config");
     }
     validate_config(*config);
-    validate_q51_slot_kernel_id(kernel_id_value,config->q51_slot_parallel_down);
+    validate_q51_slot_kernel_id(kernel_id_value,*config);
     if ((kernel_id_value.find(".batched-slot-activation-v1")!=std::string::npos)!=config->batched_slot_activation)
         throw std::invalid_argument("batched routed activation launcher id differs from config");
     if ((kernel_id_value.find(".deferred-status-v1")!=std::string::npos)!=config->deferred_moe_status)
         throw std::invalid_argument("deferred MoE launcher id differs from config");
-    if(kernel_id_value.ends_with(moe_q4k_a8::grouped_q51_kernel_ending)!=config->grouped_exact_q51_down)
+    if(!(config->a8_down_q51 || config->a8_down_q80) &&
+        kernel_id_value.ends_with(moe_q4k_a8::grouped_q51_kernel_ending)!=config->grouped_exact_q51_down)
         throw std::invalid_argument("grouped exact Q5_1 launcher id differs from config");
     if (kernel_id_value.ends_with(moe_q4k_a8::runtime_kernel_suffix) != config->q4k_a8g32_gate_up)
         throw std::invalid_argument("Q4K A8 launcher id differs from config");
@@ -1869,12 +2012,13 @@ register_for_compiled_execution(
             throw std::invalid_argument(
                 "HIP routed-expert step has no kernel binding");
         }
-        validate_q51_slot_kernel_id(*binding.kernel_id,config_.q51_slot_parallel_down);
+        validate_q51_slot_kernel_id(*binding.kernel_id,config_);
         if ((binding.kernel_id->find(".deferred-status-v1")!=std::string::npos)!=config_.deferred_moe_status)
             throw std::invalid_argument("deferred MoE bundle mode differs from compiled binding");
         if ((binding.kernel_id->find(".batched-slot-activation-v1")!=std::string::npos)!=config_.batched_slot_activation)
             throw std::invalid_argument("batched routed activation bundle differs from compiled selection");
-        if(binding.kernel_id->ends_with(moe_q4k_a8::grouped_q51_kernel_ending)!=config_.grouped_exact_q51_down)
+        if(!(config_.a8_down_q51 || config_.a8_down_q80) &&
+            binding.kernel_id->ends_with(moe_q4k_a8::grouped_q51_kernel_ending)!=config_.grouped_exact_q51_down)
             throw std::invalid_argument("grouped exact Q5_1 bundle differs from compiled selection");
         if (binding.kernel_id->ends_with(moe_q4k_a8::runtime_kernel_suffix) != config_.q4k_a8g32_gate_up)
             throw std::invalid_argument("Q4K A8 bundle mode differs from compiled selection");
@@ -2193,6 +2337,8 @@ hipStream_t known_moe_rows_stream() {
 }
 KnownMoeRowsPrepared prepare_known_moe_rows(std::span<const ExecutionDispatchContext> rows,
     const HipMoeExpertsLauncherConfig& config, const q51_known_rows::Workspace& extra) {
+    if (config.a8_down_q51 || config.a8_down_q80)
+        throw std::invalid_argument("A8 down rejects known-window CSR rows");
     if (rows.size() != 2U && rows.size() != 4U && rows.size() != 8U)
         throw std::invalid_argument("known-window routed rows require R2/R4/R8");
     const auto layout = q51_known_rows::scratch_layout(static_cast<std::uint32_t>(rows.size()),

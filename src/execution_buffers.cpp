@@ -56,6 +56,12 @@ ExecutionBufferPlan build_serial_execution_buffer_plan(
         throw std::invalid_argument("grouped exact Q5_1 down requires Q4K A8 slot workspace");
     if (request.q51_slot_parallel_down && !request.grouped_exact_q51_down)
         throw std::invalid_argument("Q5_1 slot-parallel down requires grouped Q5_1 workspace");
+    if ((request.a8_down_q51 || request.a8_down_q80) &&
+        (!request.a8_down_q51 || !request.q4k_a8g32_gate_up || !request.q51_slot_parallel_down ||
+         request.logical_rows != 1 || request.activation_element_bytes != 2 ||
+         model.hidden_size != 2560 || model.moe_intermediate_size != 640 ||
+         model.num_experts != 512 || model.num_experts_per_token != 10))
+        throw std::invalid_argument("A8 down workspace requires canonical one-row Q4K A8 topology");
 
     ExecutionBufferPlan plan;
     plan.logical_rows = request.logical_rows;
@@ -118,7 +124,7 @@ ExecutionBufferPlan build_serial_execution_buffer_plan(
             throw std::invalid_argument("Q4K A8 runtime requires C1 and typed FP32 workspace");
         const auto layout = moe_q4k_a8::build_runtime_workspace(model.hidden_size,
             model.moe_intermediate_size, model.num_experts, model.num_experts_per_token,
-            request.q51_slot_parallel_down);
+            request.q51_slot_parallel_down, request.a8_down_q51 || request.a8_down_q80);
         plan.mlp_intermediate_bytes = std::max(plan.mlp_intermediate_bytes, layout.total_bytes);
     }
 

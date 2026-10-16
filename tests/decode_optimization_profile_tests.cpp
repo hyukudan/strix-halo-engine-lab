@@ -826,6 +826,7 @@ int main() {
     expect(resolve_optimization_profile(bad_manifest, model, info, malformed,
         validated_model_content_identity, true).reason == "manifest-layout-not-qualified",
         "recomputed manifest identity required");
+    const auto numerical_router_info = info; // Preserve canonical metadata before the grouped-router rejection fixture.
     gguf::MetadataEntry group;
     group.key = "qwen3next.expert_group_count";
     info.metadata.push_back(group);
@@ -904,6 +905,82 @@ int main() {
            !manual_increments.lane_chain_hyper_output && !manual_increments.q4k_a8g32_gate_up &&
            manual_increments.context_tokens == 128,
            "manual increments preserve their flags without adding the automatic bundle");
+    const std::array<std::string_view, 6> numerical_names{
+        "exact-v5", "hc-splitk-f32-v1", "q51-a8-down-v1", "hc-splitk-f32+q51-a8-down-v1",
+        "q51-q80-a8-down-v1", "hc-splitk-f32+q51-q80-a8-down-v1"};
+    for (const auto name : numerical_names) {
+        const std::string value(name);
+        auto candidate = parse({"decoder", "fixture.gguf", "1", "--generate", "2", "--numerical-profile", value.c_str()});
+        expect(candidate.numerical_profile_explicit && !candidate.any_low_level_flag &&
+            numerical_profile_name(candidate.numerical_profile) == name,
+            "typed numerical option is independent of low-level fallback selection");
+        auto base = resolve_optimization_profile(candidate, model, numerical_router_info, manifest, validated_model_content_identity, true);
+        const auto numerical_base_selected = base.selected;
+        expect(numerical_base_selected == "canonical-a8-wave-qsa-hc-shared-output-v5" && candidate.prepared_eager &&
+            candidate.moe_shared_overlap && candidate.gdn_islands && candidate.q51_slot_parallel_down &&
+            candidate.batched_moe_activation && candidate.wave8_q8_gdn_input && candidate.wave8_q8_gdn_output &&
+            candidate.prefetch_q8_lm_head && candidate.wave8_q8_lm_head && candidate.wave8_q8_qsa_output,
+            "numerical overlay retains every v5 organization prerequisite");
+        apply_numerical_profile(candidate, model, manifest, validated_model_content_identity, true, base);
+        expect(base.selected == numerical_base_selected + (name == "exact-v5" ? "" : "+" + value) &&
+            base.reason == "qualified-ordinary-cpu-generation" && candidate.q51_slot_parallel_down,
+            "numerical recipe adds its identity without changing organization or reason");
+        if (name != "exact-v5") {
+            auto missing = candidate; missing.q51_slot_parallel_down = false;
+            rejects([&] { auto result = base; apply_numerical_profile(missing, model, manifest,
+                validated_model_content_identity, true, result); },
+                "numerical profile requires the resolved full v5 organization without implicit flag changes");
+            expect(!missing.q51_slot_parallel_down, "missing prerequisites are not silently enabled");
+            rejects([&] { auto result = base; apply_numerical_profile(candidate, model, manifest, "other-content", true, result); },
+                "numerical profile requires the admitted canonical content, model and context");
+            rejects([&] { auto result = base; apply_numerical_profile(candidate, model, manifest,
+                validated_model_content_identity, false, result); },
+                "numerical profile requires the admitted canonical content, model and context");
+            auto stale_manifest = manifest; ++stale_manifest.layout_identity;
+            rejects([&] { auto result = base; apply_numerical_profile(candidate, model, stale_manifest,
+                validated_model_content_identity, true, result); },
+                "numerical profile requires the admitted canonical content, model and context");
+            auto bad_mode = candidate; bad_mode.execution.mode = DecodeExecutionMode::graph;
+            rejects([&] { validate_numerical_profile_cli(bad_mode); },
+                "numerical profile requires ordinary eager floating C1 execution without alternate controllers or layouts");
+            bad_mode = candidate; bad_mode.known_prefix_window = true;
+            rejects([&] { validate_numerical_profile_cli(bad_mode); },
+                "numerical profile requires ordinary eager floating C1 execution without alternate controllers or layouts");
+            bad_mode = candidate; bad_mode.serving_concurrency = 2;
+            rejects([&] { validate_numerical_profile_cli(bad_mode); },
+                "numerical profile requires ordinary eager floating C1 execution without alternate controllers or layouts");
+        }
+    }
+    rejects([] { (void)parse({"decoder", "m", "1", "--numerical-profile", "hc-splitk-fp64-v1"}); },
+        "--numerical-profile requires a supported numerical recipe");
+    rejects([] { (void)parse({"decoder", "m", "1", "--numerical-profile"}); },
+        "--numerical-profile requires a supported numerical recipe");
+    rejects([] { (void)parse({"decoder", "m", "1", "--numerical-profile=unknown"}); },
+        "--numerical-profile requires a supported numerical recipe");
+    rejects([] { (void)parse({"decoder", "m", "1", "--numerical-profile=exact-v5", "--numerical-profile", "exact-v5"}); },
+        "duplicate numerical profile option");
+    auto teacher = parse({"decoder", "m", "1", "2", "3", "--generate", "1", "--teacher-forced-score"});
+    expect(teacher.teacher_forced_score && !teacher.any_low_level_flag && teacher.logprob_token_ids.empty(),
+        "teacher forcing has a separate bounded dynamic-label diagnostic intent");
+    validate_resolved_teacher_forced_score(teacher, 4);
+    rejects([&] { validate_resolved_teacher_forced_score(teacher, 3); }, "teacher input exceeds model vocabulary");
+    auto short_context = teacher; short_context.context_tokens = 2;
+    rejects([&] { validate_resolved_teacher_forced_score(short_context, 4); }, "teacher-forced score vocabulary or context is invalid");
+    for (const std::uint64_t generation : {0ULL, 2ULL}) {
+        auto invalid = teacher; invalid.generate_tokens = generation;
+        rejects([&] { validate_teacher_forced_score(invalid); },
+            "teacher-forced score requires at least two teacher inputs and generate 1 in serial eager full-output diagnostic mode");
+    }
+    rejects([] { (void)parse({"decoder", "m", "1", "--generate", "1", "--teacher-forced-score"}); },
+        "teacher-forced score requires at least two teacher inputs and generate 1 in serial eager full-output diagnostic mode");
+    rejects([] { (void)parse({"decoder", "m", "1", "2", "--generate", "1", "--teacher-forced-score", "--teacher-forced-score"}); },
+        "duplicate teacher-forced score option");
+    auto incompatible_teacher = teacher; incompatible_teacher.logprob_token_ids = {1};
+    rejects([&] { validate_teacher_forced_score(incompatible_teacher); },
+        "teacher-forced score requires at least two teacher inputs and generate 1 in serial eager full-output diagnostic mode");
+    incompatible_teacher = teacher; incompatible_teacher.mtp.enabled = true;
+    rejects([&] { validate_teacher_forced_score(incompatible_teacher); },
+        "teacher-forced score requires at least two teacher inputs and generate 1 in serial eager full-output diagnostic mode");
     std::cout << "Decode optimization profile failures=" << failures << '\n';
     return failures ? 1 : 0;
 }

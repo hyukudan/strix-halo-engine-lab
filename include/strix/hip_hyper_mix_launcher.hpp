@@ -5,6 +5,8 @@
 #include "strix/launch_dispatch.hpp"
 
 #include <cstdint>
+#include <atomic>
+#include <memory>
 #include <string>
 #include <string_view>
 
@@ -16,6 +18,11 @@ inline constexpr std::string_view splitk_hc_fp32_numerical_identity =
     "hc-down-splitk16x640-r40-fp32-v1";
 inline constexpr std::string_view splitk_hc_fp64_numerical_identity =
     "hc-down-splitk16x640-r40-fp64-oracle-v1";
+
+struct HipHyperMixArithmeticStats {
+    // Actual successful host enqueues; graph replays are never inferred.
+    std::atomic<std::uint64_t> splitk_f32_submissions{0};
+};
 
 struct HipHyperMixLauncherConfig {
     std::uint32_t hidden_size = 0;
@@ -36,6 +43,7 @@ struct HipHyperMixLauncherConfig {
     bool prefetch_hc_projection_next_tile = false;
     HipActivationStorage activation =
         HipActivationStorage::bf16;
+    std::shared_ptr<HipHyperMixArithmeticStats> arithmetic_stats;
 };
 
 void register_hip_hyper_mix_kernel_variant(

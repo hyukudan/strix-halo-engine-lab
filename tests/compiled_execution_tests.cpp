@@ -92,7 +92,10 @@ strix::kernels::KernelRegistry make_registry(
                      step.op == strix::SerialOp::moe_route && request.parallel_moe_router ? ".parallel" : "") +
                     (step.op == strix::SerialOp::moe_experts && request.batched_moe_activation ? ".batched-slot-activation-v1" : "") +
                     (step.op == strix::SerialOp::moe_experts && request.deferred_moe_status ? ".deferred-status-v1" : "") +
-                    (step.op == strix::SerialOp::moe_experts && request.grouped_exact_q51_down ? ".grouped-exact-q51-down-v1" : "") +
+                    (step.op == strix::SerialOp::moe_experts && request.a8_down_q51 ? ".q51-a8g32-down-v1" : "") +
+                    (step.op == strix::SerialOp::moe_experts && request.a8_down_q80 ? ".q80-a8g32-down-v1" : "") +
+                    (step.op == strix::SerialOp::moe_experts && request.a8_down_q51 ? ".mixed-a8-down-v1" : "") +
+                    (step.op == strix::SerialOp::moe_experts && request.grouped_exact_q51_down && !request.a8_down_q51 ? ".grouped-exact-q51-down-v1" : "") +
                     (step.op == strix::SerialOp::moe_experts && request.q4k_a8g32_gate_up ? ".q4k-a8g32-gateup-v2" : ""),
                 *family,
                 shape,
@@ -676,6 +679,43 @@ int main() {
     invalid_batch = batched_binding; invalid_batch.require_graph_safe = true;
     expect(rejects_deferred(batched_registry,invalid_batch,deferred_q51_buffers,
         "batched MoE activation requires eager C1 A8 execution"), "batched activation rejects graphs for its own cause");
+    auto down_binding = batched_binding;
+    down_binding.q51_slot_parallel_down = true;
+    down_binding.a8_down_q51 = true;
+    auto down_buffers = deferred_q51_buffers;
+    down_buffers.q51_slot_parallel_down = true;
+    down_buffers.a8_down_q51 = true;
+    const auto down_registry = make_registry(model, down_binding);
+    const auto down_compiled = strix::compile_serial_execution(model, down_registry, down_binding, down_buffers);
+    // Another buffer can dominate the lifetime-reused arena's total size.
+    // Check the actual routed workspace allocations rather than total growth.
+    std::size_t down_workspace_allocations = 0;
+    bool down_workspace_sizes_match = true;
+    for (const auto& allocation : down_compiled.arena.allocations) {
+        if (allocation.use.buffer.buffer_class != strix::ExecutionBufferClass::mlp_intermediate) continue;
+        ++down_workspace_allocations;
+        down_workspace_sizes_match &= allocation.bytes == 176128U;
+    }
+    expect(down_compiled.execution_identity != batched_compiled.execution_identity &&
+        down_compiled.kernel_plan_identity != batched_compiled.kernel_plan_identity &&
+        down_workspace_allocations != 0 && down_workspace_sizes_match,
+        "A8 down binds a new arithmetic identity and distinct workspace");
+    auto wrong_down_buffers = down_buffers;
+    wrong_down_buffers.a8_down_q51 = false;
+    expect(rejects_deferred(down_registry,down_binding,wrong_down_buffers,
+        "A8 down arithmetic differs from buffer admission"), "down numerical request cannot borrow exact workspace admission");
+    auto q80_binding = down_binding;
+    q80_binding.a8_down_q80 = true;
+    auto q80_buffers = down_buffers;
+    q80_buffers.a8_down_q80 = true;
+    const auto q80_registry = make_registry(model,q80_binding);
+    const auto q80_compiled = strix::compile_serial_execution(model,q80_registry,q80_binding,q80_buffers);
+    expect(q80_compiled.execution_identity != down_compiled.execution_identity &&
+        q80_compiled.arena.total_bytes == down_compiled.arena.total_bytes,
+        "Q8 extension has its own identity while reusing quantized down storage");
+    expect(rejects_deferred(down_registry,q80_binding,q80_buffers,
+        "bound A8 down numerical identity differs from request"), "Q8 extension rejects Q51-only kernel identity");
+
     if (failures == 0) {
         std::cout << "compiled execution tests passed\n";
     }

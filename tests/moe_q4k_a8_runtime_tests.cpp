@@ -67,12 +67,80 @@ int main() {
     rejects([]{(void)build_runtime_workspace(2560,640,513,10);}, "invalid E");
     rejects([]{(void)build_runtime_workspace(2560,640,5,10);}, "K exceeds E");
     rejects([]{(void)build_runtime_workspace(2560,640,512,11);}, "invalid K");
+    const auto down = build_runtime_workspace(2560,640,512,10,true,true);
+    check(down.rawdots_offset == 65280 && down.rawdots_bytes == 102400 &&
+        down.down_codes_offset == 167680 && down.down_codes_bytes == 6400 &&
+        down.down_deltas_offset == 174080 && down.down_deltas_bytes == 800 &&
+        down.down_sums_offset == 175104 && down.down_sums_bytes == 800 && down.total_bytes == 176128,
+        "canonical down A8 image and raw dots have distinct exact aligned regions");
+    for (unsigned h = 256; h <= 2560; h += 256) for (unsigned i = 128; i <= 640; i += 128)
+        for (unsigned k = 1; k <= 10; ++k) {
+            const auto original = build_runtime_workspace(h,i,512,k,true);
+            const auto unchanged = build_runtime_workspace(h,i,512,k,true,false);
+            const auto extended = build_runtime_workspace(h,i,512,k,true,true);
+            const auto no_old_slot_flag = build_runtime_workspace(h,i,512,k,false,true);
+            check(unchanged.total_bytes == original.total_bytes && unchanged.down_codes_bytes == 0 &&
+                unchanged.down_deltas_bytes == 0 && unchanged.down_sums_bytes == 0,
+                "explicit six-argument off preserves old workspace");
+            check(extended.gate_up_offset == original.gate_up_offset && extended.gate_up_bytes == original.gate_up_bytes &&
+                extended.accumulation_offset == original.accumulation_offset && extended.status_offset == original.status_offset &&
+                extended.codes_offset == original.codes_offset && extended.deltas_offset == original.deltas_offset &&
+                extended.sums_offset == original.sums_offset && extended.rawdots_offset == original.rawdots_offset &&
+                extended.rawdots_bytes == original.rawdots_bytes && extended.down_codes_offset == original.total_bytes &&
+                extended.down_codes_bytes == static_cast<std::uint64_t>(k)*i &&
+                extended.down_deltas_offset >= extended.down_codes_offset+extended.down_codes_bytes &&
+                extended.down_sums_offset >= extended.down_deltas_offset+extended.down_deltas_bytes &&
+                extended.total_bytes >= extended.down_sums_offset+extended.down_sums_bytes &&
+                (extended.down_codes_offset | extended.down_deltas_offset | extended.down_sums_offset | extended.total_bytes)%256U == 0 &&
+                extended.down_deltas_bytes == static_cast<std::uint64_t>(k)*(i/32U)*4U &&
+                extended.down_sums_bytes == extended.down_deltas_bytes,
+                "all down A8 regions are bounded, disjoint and do not move incumbent regions");
+            check(no_old_slot_flag.rawdots_offset == extended.rawdots_offset &&
+                no_old_slot_flag.rawdots_bytes == extended.rawdots_bytes &&
+                no_old_slot_flag.down_codes_offset == extended.down_codes_offset && no_old_slot_flag.total_bytes == extended.total_bytes,
+                "down A8 always owns raw dots even without incumbent Q5_1 raw-dot flag");
+        }
+    rejects([]{(void)build_runtime_workspace(2560,32,512,10,true,true);},"A8 down rejects I not divisible by128");
+    rejects([]{(void)build_runtime_workspace(2560,160,512,10,false,true);},"A8 down rejects unsupported lane-chain width");
+    rejects([]{(void)build_runtime_workspace(~0ULL,640,512,10,true,true);},"A8 down rejects overflowing shape before layout arithmetic");
     const auto model = strix::ModelContract::qwen38_flash_next();
     const auto m = manifest(model);
     const auto c = classify_runtime_manifest(model,m);
     check(c.quantized_layers.size() == 47 && c.legacy_q5k_layers == std::vector<std::uint32_t>{2},
         "synthetic canonical manifest classification 47 Q4K / layer2 Q5K");
     check(c.q4k_with_q51_down_layers.size()==47,"synthetic manifest classifies Q4K/Q5_1 targets");
+    auto actual_types = m;
+    for (auto& tensor : actual_types.tensors)
+        if (tensor.name.find("down_exps") != std::string::npos &&
+            (*tensor.layer == 4U || *tensor.layer == 30U || *tensor.layer == 46U || *tensor.layer == 47U)) {
+            tensor.ggml_type = 8U; tensor.byte_size = 891289600ULL;
+        }
+    const auto actual_census = classify_runtime_manifest(model,actual_types);
+    check(actual_census.q4k_with_q51_down_layers.size() == 43U &&
+        actual_census.q4k_with_q80_down_layers == std::vector<std::uint32_t>{4U,30U,46U,47U} &&
+        actual_census.q5k_with_q80_down_layers == std::vector<std::uint32_t>{2U},
+        "pinned model type census distinguishes four Q4K/Q8 and one Q5K/Q8 fallback");
+    validate_a8_down_manifest(model,actual_census,true,false);
+    rejects([&]{validate_a8_down_manifest(model,actual_census,false,true);},"Q8_0 phase b requires the Q5_1 candidate");
+    validate_a8_down_manifest(model,actual_census,true,true);
+    rejects([&]{validate_a8_down_manifest(model,actual_census,false,false);},"A8 down manifest requires explicit candidate");
+    rejects([&]{validate_a8_down_manifest(model,c,true,true);},"A8 down rejects same-sized incorrect layer census");
+    auto bad_census = actual_census;
+    bad_census.q4k_with_q80_down_layers[0] = 3U;
+    rejects([&]{validate_a8_down_manifest(model,bad_census,true,true);},"A8 down rejects relabeled Q8 layer");
+    bad_census = actual_census; bad_census.q5k_with_q80_down_layers.clear();
+    rejects([&]{validate_a8_down_manifest(model,bad_census,true,false);},"A8 down rejects incorrect down type on literal Q5K fallback");
+    auto wrong_model = model; wrong_model.hidden_layers = 47U;
+    rejects([&]{validate_a8_down_manifest(wrong_model,actual_census,true,true);},"A8 down rejects other model geometry");
+    const strix::ModelContentIdentity admitted_content{{
+        0x37,0x26,0xd6,0xf0,0xd9,0xba,0x30,0xb9,0xd6,0x55,0xba,0x30,0x35,0x95,0x11,0x89,
+        0x41,0xba,0xec,0xa5,0xe6,0x94,0x5f,0xc8,0x78,0x5f,0x93,0x8e,0x0f,0x54,0x55,0xe4}};
+    validate_a8_down_content(admitted_content);
+    rejects([]{validate_a8_down_content({});},"A8 down rejects absent content identity");
+    for (std::size_t byte = 0; byte < admitted_content.bytes.size(); ++byte) {
+        auto changed = admitted_content; changed.bytes[byte] ^= 1U;
+        rejects([&]{validate_a8_down_content(changed);},"A8 down rejects any changed content identity byte");
+    }
     auto bad = m;
     bad.tensors.pop_back(); rejects([&]{(void)classify_runtime_manifest(model,bad);}, "missing down");
     bad=m; bad.tensors.push_back(m.tensors[0]); rejects([&]{(void)classify_runtime_manifest(model,bad);}, "duplicate gate");
@@ -102,6 +170,9 @@ int main() {
     request.logical_rows=1; request.control_element_bytes=2;
     rejects([&]{(void)strix::build_serial_execution_buffer_plan(model,request);}, "mode rejects FP16 controls");
     const auto combined=[&](std::string prefix) {
+        const auto candidate = prefix + ";" + std::string(a8_down_gate_up_raw_identity) + ";" +
+            std::string(q51_a8_down_raw_identity) + ";" + std::string(q80_a8_down_raw_identity);
+        check(candidate.size() <= 512,"both down A8 RAW tags remain bounded with existing head profiles");
         prefix += ";" + std::string(runtime_numerical_identity) + ";" + std::string(grouped_q51_raw_identity);
         check(prefix.size()<=512,"combined RAW numerical identity remains inside512 byte contract");
     };

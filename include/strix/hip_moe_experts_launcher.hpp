@@ -28,6 +28,9 @@ struct HipMoeExpertsLauncherConfig {
     bool deferred_moe_status = false;
     std::shared_ptr<const HipSetupQuiescenceGuard> q4k_a8_quiescence;
     std::shared_ptr<moe_q4k_a8::RuntimeDispatchStats> q4k_a8_stats;
+    // Explicit experimental arithmetic; defaults retain every original path.
+    bool a8_down_q51 = false;
+    bool a8_down_q80 = false;
 };
 
 void register_hip_moe_experts_kernel_variant(

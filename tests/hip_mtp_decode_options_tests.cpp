@@ -197,5 +197,20 @@ int main(){try{
         "--mtp-window-capture-bytes=1024","--mtp-window-checkpoint-bytes=1024","--mtp-window-total-bytes=8192",
         "--mtp-window-history-intervals=128","--mtp-window-expert-union","--mtp-window-expert-union-bytes=512"});
     reject_as(metadata_union,"MTP window expert union requires an actual target window and a positive explicit budget within arena and total window budgets","metadata-only route cannot accept unused union workspace");
+    auto numerical_mtp = request();
+    numerical_mtp.insert(numerical_mtp.end(), {"--numerical-profile", "q51-a8-down-v1"});
+    reject_as(numerical_mtp,
+        "numerical profile requires ordinary eager floating C1 execution without alternate controllers or layouts",
+        "MTP cannot inherit a new target arithmetic recipe before its separate qualification");
+    auto exact_mtp = request();
+    exact_mtp.insert(exact_mtp.end(), {"--numerical-profile=exact-v5"});
+    require(parse(exact_mtp).numerical_profile == strix::DecodeNumericalProfile::exact_v5,
+        "explicit default arithmetic leaves the existing MTP controller contract unchanged");
+    auto teacher_mtp = request();
+    set(teacher_mtp, "--generate", "1");
+    teacher_mtp.push_back("--teacher-forced-score");
+    reject_as(teacher_mtp,
+        "teacher-forced score requires at least two teacher inputs and generate 1 in serial eager full-output diagnostic mode",
+        "teacher score never enters speculative controller execution");
     return 0;
 }catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}

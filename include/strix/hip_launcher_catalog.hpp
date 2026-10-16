@@ -12,6 +12,7 @@
 #include "strix/hip_runtime_launchers.hpp"
 #include "strix/launch_dispatch.hpp"
 #include "strix/model_contract.hpp"
+#include "strix/decode_numerical_profile.hpp"
 #include <memory>
 #include <vector>
 
@@ -63,6 +64,10 @@ struct HipLauncherCatalogConfig {
     std::shared_ptr<QsaHierarchicalSelectionStats> qsa_selection_stats;
     std::shared_ptr<QsaHierarchicalSelectionStats> qsa_gqa_stats;
     GdnRecurrentStorage gdn_recurrent_storage = GdnRecurrentStorage::key_value;
+    DecodeNumericalProfile numerical_profile = DecodeNumericalProfile::exact_v5;
+    bool a8_down_q51 = false;
+    bool a8_down_q80 = false;
+    std::shared_ptr<HipHyperMixArithmeticStats> arithmetic_stats;
 };
 
 void register_complete_hip_kernel_catalog(

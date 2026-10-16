@@ -117,7 +117,8 @@ HipHyperMixLauncherConfig
 hyper_mix_config(
     const ModelContract& model,
     HipActivationStorage activation, bool parallel, bool staged, bool fused, bool typed, bool prefetch_rows, bool prefetch_output, bool lane_chain,
-    bool splitk, bool splitk_fp64, bool next_tile) {
+    bool splitk, bool splitk_fp64, bool next_tile,
+    std::shared_ptr<HipHyperMixArithmeticStats> arithmetic_stats = {}) {
     HipHyperMixLauncherConfig config;
     config.hidden_size =
         checked_u32(
@@ -145,6 +146,7 @@ hyper_mix_config(
     config.lane_chain_output = lane_chain;
     config.splitk_projection = splitk;
     config.splitk_projection_fp64 = splitk_fp64;
+    config.arithmetic_stats = std::move(arithmetic_stats);
     config.prefetch_hc_projection_next_tile = next_tile;
     return config;
 }
@@ -196,7 +198,8 @@ HipMoeExpertsLauncherConfig
 moe_experts_config(
     const ModelContract& model,
     HipActivationStorage activation, bool q4k_a8 = false,
-    std::shared_ptr<moe_q4k_a8::RuntimeDispatchStats> stats = {}, bool grouped_q51=false, bool deferred_status=false, bool batched_activation=false, bool slot_parallel=false) {
+    std::shared_ptr<moe_q4k_a8::RuntimeDispatchStats> stats = {}, bool grouped_q51=false, bool deferred_status=false, bool batched_activation=false, bool slot_parallel=false,
+    bool a8_down_q51=false, bool a8_down_q80=false) {
     HipMoeExpertsLauncherConfig config;
     config.hidden_size =
         checked_u32(
@@ -219,6 +222,8 @@ moe_experts_config(
     config.q4k_a8g32_gate_up = q4k_a8;
     config.grouped_exact_q51_down = grouped_q51;
     config.q51_slot_parallel_down = slot_parallel;
+    config.a8_down_q51 = a8_down_q51;
+    config.a8_down_q80 = a8_down_q80;
     config.deferred_moe_status = deferred_status;
     config.batched_slot_activation = batched_activation;
     config.q4k_a8_stats = std::move(stats);
@@ -254,6 +259,22 @@ moe_route_config(
     return config;
 }
 
+void validate_numerical_catalog_config(const ModelContract& model, const HipLauncherCatalogConfig& config) {
+    if (numerical_profile_name(config.numerical_profile).empty())
+        throw std::invalid_argument("HIP catalog numerical profile is invalid");
+    if (config.a8_down_q51 != numerical_profile_q51_a8_down(config.numerical_profile) ||
+        config.a8_down_q80 != numerical_profile_q80_a8_down(config.numerical_profile))
+        throw std::invalid_argument("HIP catalog A8 down recipe differs from typed numerical profile");
+    if (config.numerical_profile == DecodeNumericalProfile::exact_v5) return;
+    if (config.splitk_hyper_projection != numerical_profile_hc_splitk(config.numerical_profile) ||
+        config.splitk_hyper_projection_fp64 || config.enable_device_graph_inputs ||
+        config.activation != HipActivationStorage::bf16 || !config.deferred_moe_status ||
+        model.hidden_size != 2560 || model.hc_count != 4 || model.hc_lowrank != 320 ||
+        model.moe_intermediate_size != 640 || model.num_experts != 512 ||
+        model.num_experts_per_token != 10 || model.hidden_layers != 48)
+        throw std::invalid_argument("HIP catalog numerical profile requires matching canonical eager BF16 arithmetic");
+}
+
 }  // namespace
 
 
@@ -263,6 +284,12 @@ void register_complete_hip_kernel_catalog(
     HipLauncherCatalogConfig config,
     kernels::KernelRegistry& registry,
     const integer_projection::RuntimeConfig* alternate_lm_head) {
+    validate_numerical_catalog_config(model, config);
+    if (request.a8_down_q51 != config.a8_down_q51 || request.a8_down_q80 != config.a8_down_q80 ||
+        (config.numerical_profile != DecodeNumericalProfile::exact_v5 &&
+         (alternate_lm_head || request.device_graph_inputs || request.require_graph_safe ||
+          request.logical_rows != 1 || request.request_concurrency != 1)))
+        throw std::invalid_argument("HIP catalog numerical profile request/config or C1 execution mismatch");
     validate_gdn_recurrent_storage(config.gdn_recurrent_storage);
     if (config.gdn_recurrent_storage != GdnRecurrentStorage::key_value && config.enable_device_graph_inputs)
         throw std::invalid_argument("GDN recurrent storage candidate requires eager execution");
@@ -435,7 +462,7 @@ void register_complete_hip_kernel_catalog(
         hyper_mix_config(
             model,
             config.activation, config.parallel_hyper_mix, config.staged_hyper_projections, config.fused_staged_hyper_mix, config.typed_hyper_projection, config.prefetch_typed_hyper_rows, config.prefetch_q8_hyper_output, config.lane_chain_hyper_output,
-            config.splitk_hyper_projection, config.splitk_hyper_projection_fp64, config.prefetch_hc_projection_next_tile);
+            config.splitk_hyper_projection, config.splitk_hyper_projection_fp64, config.prefetch_hc_projection_next_tile, config.arithmetic_stats);
     register_hip_hyper_mix_kernel_variant(
         model,
         request,
@@ -458,7 +485,7 @@ void register_complete_hip_kernel_catalog(
     const auto moe_experts =
         moe_experts_config(
             model,
-            config.activation, config.q4k_a8g32_gate_up, config.q4k_a8_stats, config.grouped_exact_q51_down, config.deferred_moe_status, config.batched_moe_activation, config.q51_slot_parallel_down);
+            config.activation, config.q4k_a8g32_gate_up, config.q4k_a8_stats, config.grouped_exact_q51_down, config.deferred_moe_status, config.batched_moe_activation, config.q51_slot_parallel_down, config.a8_down_q51, config.a8_down_q80);
     register_hip_moe_experts_kernel_variant(
         model,
         request,
@@ -521,7 +548,7 @@ HipLauncherCatalog::HipLauncherCatalog(
           hyper_mix_config(
               model,
               config.activation, config.parallel_hyper_mix, config.staged_hyper_projections, config.fused_staged_hyper_mix, config.typed_hyper_projection, config.prefetch_typed_hyper_rows, config.prefetch_q8_hyper_output, config.lane_chain_hyper_output,
-              config.splitk_hyper_projection, config.splitk_hyper_projection_fp64, config.prefetch_hc_projection_next_tile)),
+              config.splitk_hyper_projection, config.splitk_hyper_projection_fp64, config.prefetch_hc_projection_next_tile, config.arithmetic_stats)),
       moe_route_(
           moe_route_config(
               model,
@@ -529,7 +556,7 @@ HipLauncherCatalog::HipLauncherCatalog(
       moe_experts_(
           moe_experts_config(
               model,
-              config.activation, config.q4k_a8g32_gate_up, config.q4k_a8_stats, config.grouped_exact_q51_down, config.deferred_moe_status, config.batched_moe_activation, config.q51_slot_parallel_down)),
+              config.activation, config.q4k_a8g32_gate_up, config.q4k_a8_stats, config.grouped_exact_q51_down, config.deferred_moe_status, config.batched_moe_activation, config.q51_slot_parallel_down, config.a8_down_q51, config.a8_down_q80)),
       lm_head_(
           lm_head_config(
               model,
@@ -539,6 +566,9 @@ HipLauncherCatalog::HipLauncherCatalog(
               model,
               config.activation,config.prefetch_q8_shared_expert,config.shared_expert_prefetch_layers,
               config.shared_expert_prefetch_stats)) {
+    validate_numerical_catalog_config(model, config);
+    if (config.numerical_profile != DecodeNumericalProfile::exact_v5 && alternate_lm_head_)
+        throw std::invalid_argument("HIP catalog numerical profile excludes alternate integer head");
     validate_gdn_recurrent_storage(config.gdn_recurrent_storage);
     if (config.gdn_recurrent_storage != GdnRecurrentStorage::key_value && config.enable_device_graph_inputs)
         throw std::invalid_argument("GDN recurrent storage candidate requires eager execution");

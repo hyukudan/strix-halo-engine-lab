@@ -47,6 +47,8 @@ struct ExecutionBindingRequest {
     // Borrowed only during compilation; no tuning search runs in the token loop.
     const kernels::OfflineTuningPlan* offline_tuning = nullptr;
     GdnRecurrentStorage gdn_recurrent_storage = GdnRecurrentStorage::key_value;
+    bool a8_down_q51 = false;
+    bool a8_down_q80 = false;
 };
 
 struct ExecutionKernelBinding {

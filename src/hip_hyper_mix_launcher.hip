@@ -1592,6 +1592,9 @@ void launch_typed(
     const ManifestTensor* inject_manifest,
     const RuntimeTensorBinding* inject_runtime,
     const ExecutionBufferAddress* prepared_temporary) {
+    if (config.splitk_projection && (context.logical_rows != 1U || hip_graph_status() ||
+        (current_hip_launch_context() && current_hip_launch_context()->graph_capture)))
+        throw std::invalid_argument("split-K HC projection rejects captured or multirow execution");
     if (config.parallel) {
         const auto& temporary = *prepared_temporary;
         const auto width = static_cast<std::uint64_t>(config.hidden_size) * config.hc_count;
@@ -1621,7 +1624,12 @@ void launch_typed(
                                 injection_output ? reinterpret_cast<float*>(injection_output->address) : nullptr, blocks);
                         };
                         if (config.splitk_projection_fp64) launch.template operator()<double>();
-                        else launch.template operator()<float>();
+                        else {
+                            launch.template operator()<float>();
+                            check_hip(hipGetLastError(), "FP32 split-K hyper projection enqueue");
+                            if (config.arithmetic_stats)
+                                config.arithmetic_stats->splitk_f32_submissions.fetch_add(1, std::memory_order_relaxed);
+                        }
                     } else if (config.prefetch_hc_projection_next_tile) {
                         hipLaunchKernelGGL(next_tile_hyper_projection_kernel,
                             dim3(lowrank_blocks + injection_blocks, context.logical_rows), dim3(128U),
@@ -2292,8 +2300,9 @@ void register_hip_hyper_mix_kernel_variant(
         throw std::invalid_argument(
             "HIP hyper-mix variant requires non-zero rows and concurrency");
     }
-    if (config.splitk_projection && (request.logical_rows > 65535U || request.request_concurrency != 1U))
-        throw std::invalid_argument("split-K HC variant requires bounded rows and serial concurrency");
+    if (config.splitk_projection && (request.logical_rows != 1U || request.request_concurrency != 1U ||
+        request.require_graph_safe || request.device_graph_inputs))
+        throw std::invalid_argument("split-K HC variant requires eager one-row serial execution");
     if (qualification ==
             kernels::QualificationStatus::target_qualified ||
         qualification ==
@@ -2358,7 +2367,7 @@ void register_hip_hyper_mix_kernel_variant(
     variant.numerics.deterministic = true;
     variant.qualification =
         qualification;
-    variant.graph_safe = !config.prefetch_hc_projection_next_tile;
+    variant.graph_safe = !config.prefetch_hc_projection_next_tile && !config.splitk_projection;
     variant.input_layout =
         "hc-stream-major";
     variant.output_layout =
