@@ -10,6 +10,7 @@
 #include <stdexcept>
 #include <set>
 #include <string>
+#include <string_view>
 #include <utility>
 
 namespace q8 = strix::q8_projection_organization;
@@ -21,6 +22,15 @@ void expect(bool value, const char* message) {
 template<class F> void rejects(F&& action, const char* message) {
     bool rejected = false;
     try { action(); } catch (const std::invalid_argument&) { rejected = true; }
+    expect(rejected, message);
+}
+template<class F> void rejects_with(F&& action, std::string_view expected, const char* message) {
+    bool rejected = false;
+    try { action(); }
+    catch (const std::invalid_argument& error) {
+        rejected = std::string_view(error.what()) == expected;
+        if (!rejected) std::cerr << message << ": unexpected rejection: " << error.what() << '\n';
+    }
     expect(rejected, message);
 }
 
@@ -317,10 +327,12 @@ void test_output_step_admission() {
     bad_compiled = corrupt_arena(target_io.temporaries.front(), [&](auto& a) {
         a.bytes = q8::gdn_output_core_offset_bytes(model) + 6144U * 4U - 1U;
     });
-    rejects([&] { q8::validate_output_steps(plan, model, bad_compiled, access, memory, resident); },
+    rejects_with([&] { q8::validate_output_steps(plan, model, bad_compiled, access, memory, resident); },
+        "wave8 output projection source exceeds its workspace",
         "PhaseB actual temporary source too short rejects");
     bad_compiled = corrupt_arena(target_io.writes.front(), [](auto& a) { a.offset += 2U; });
-    rejects([&] { q8::validate_output_steps(plan, model, bad_compiled, access, memory, resident); },
+    rejects_with([&] { q8::validate_output_steps(plan, model, bad_compiled, access, memory, resident); },
+        "Q8 FP32 output projection view has invalid alignment or extent",
         "PhaseB destination-only misalignment rejects");
     const auto destination = strix::resolve_execution_buffer(compiled.execution_identity,
         compiled.arena, memory, target_io.writes.front());
@@ -341,10 +353,12 @@ void test_output_step_admission() {
         a.bytes = strix::build_indexed_attention_workspace_layout(model).attention_output_offset +
                   6144U * 4U - 1U;
     });
-    rejects([&] { q8::validate_output_steps(plan, model, bad_compiled, access, memory, resident); },
+    rejects_with([&] { q8::validate_output_steps(plan, model, bad_compiled, access, memory, resident); },
+        "wave8 output projection source exceeds its workspace",
         "PhaseB QSA-specific output source must fit its actual temporary");
     bad_compiled = corrupt_arena(qsa_io.writes.front(), [](auto& a) { a.offset += 2U; });
-    rejects([&] { q8::validate_output_steps(plan, model, bad_compiled, access, memory, resident); },
+    rejects_with([&] { q8::validate_output_steps(plan, model, bad_compiled, access, memory, resident); },
+        "Q8 FP32 output projection view has invalid alignment or extent",
         "PhaseB QSA destination-only misalignment rejects");
     auto short_plan = plan; short_plan.outputs.pop_back();
     rejects([&] { q8::validate_output_steps(short_plan, model, compiled, access, memory, resident); },

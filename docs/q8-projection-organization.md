@@ -17,16 +17,18 @@ activation slices and store BF16 results:
 - `--wave8-q8-qsa-output` replaces the output projection's 256-thread LDS
   reduction with eight independent output waves per block.
 
-Both keep the original 256-leaf DAG. Their separate add helpers preserve each
-consumer's ordered operands, including NaN payload priority. No intermediate
+Both are designed to keep the original 256-leaf DAG. Their separate add helpers
+encode each consumer's ordered operands; preservation of NaN payload priority
+requires the compiler and native checks below. No intermediate
 BF16 conversion is added to their FP32 input. The width comes from value heads
 or attention heads (6144 in the canonical model), rather than hidden size 2560.
 
 These options preserve automatic base-profile resolution. They do not enable
 themselves by default or inherit the base profile's qualification. A manual or
 fallback configuration must supply the existing virtual Q8 prerequisites;
-GDN also requires its existing prefetch option. Graph and integer-head modes
-are excluded. The launchers reject actual stream capture before enqueueing.
+The GDN input overlay also requires its existing input-prefetch option. Graph
+and integer-head modes are excluded. The launchers reject actual stream capture
+before enqueueing.
 
 Each row retains its coefficient expression, leaf accumulation, reduction tree,
 operand order and rounding points. Changing the load organization or block

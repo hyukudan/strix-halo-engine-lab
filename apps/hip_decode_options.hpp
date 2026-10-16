@@ -200,7 +200,7 @@ inline Options parse_options(
             "[--planned-ple-io] [--ple-max-rows-per-io N] [--ple-max-inflight-ios N] "
             "[--generate N] [--eos-token TOKEN_ID] [--prefix-cache-roundtrip] "
             "[--parallel-moe-router] [--ranked-moe-router-topk | --wave-moe-router-topk] "
-            "[--prefetch-q8-qsa-input] [--prefetch-q8-shared-expert] [--prefetch-q8-lm-head [--wave8-q8-lm-head]] [--wave8-q8-gdn-input] [--virtual-q8-lm-head] [--virtual-q8-gdn-input [--prefetch-q8-gdn-input]] [--q4k-a8g32-gate-up [--grouped-exact-q51-down]] [--deferred-moe-status] "
+            "[--prefetch-q8-qsa-input] [--prefetch-q8-shared-expert] [--prefetch-q8-lm-head [--wave8-q8-lm-head]] [--wave8-q8-gdn-input] [--wave8-q8-gdn-output] [--wave8-q8-qsa-output] [--virtual-q8-lm-head] [--virtual-q8-gdn-input [--prefetch-q8-gdn-input]] [--q4k-a8g32-gate-up [--grouped-exact-q51-down]] [--deferred-moe-status] "
             "[--parallel-hyper-mix [--staged-hyper-projections [--fused-staged-hyper-mix [--typed-fused-hyper-projections [--prefetch-typed-hyper-rows] [--prefetch-q8-hyper-output [--lane-chain-hyper-output]]]]]]");
     }
 

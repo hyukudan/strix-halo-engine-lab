@@ -231,6 +231,16 @@ void run(unsigned width,unsigned rows,unsigned kind,bool cpu_only=false) {
     std::vector<float> retained(input.size());std::vector<strix::Q8Block> retained_weights(weights.size());
     d_input.guard.run([&]{check(hipMemcpy(retained.data(),d_input.p,retained.size()*4,hipMemcpyDeviceToHost));check(hipMemcpy(retained_weights.data(),d_weights.p,retained_weights.size()*sizeof(strix::Q8Block),hipMemcpyDeviceToHost));});
     require(std::memcmp(retained.data(),input.data(),input.size()*4)==0 && std::memcmp(retained_weights.data(),weights.data(),weights.size()*sizeof(strix::Q8Block))==0,"borrowed input/weight bytes mutated");
+    if(kind>=23) {
+        // Report hardware discrimination without making it a success condition.
+        // GDN's incumbent for the new output overlay is the virtual kernel.
+        static std::array<std::uint16_t,8> virtual_payload{};
+        const auto pair=(kind-23U)/2U;
+        if((kind-23U)%2U==0) virtual_payload[pair]=candidate.front();
+        else std::cout<<"GDN_TREE_ROLE_RECEIPT stride="<<(128U>>pair)
+            <<" baseline_virtual_swapped_payload_discriminates="<<(virtual_payload[pair]!=candidate.front())
+            <<" baseline_virtual_first_bits="<<virtual_payload[pair]<<" swapped_bits="<<candidate.front()<<'\n';
+    }
     for(const auto bad: {strix::WeightKind::f32,strix::WeightKind::q8_0}) {
         check(hipMemset(d_output.p,0xa5,(rows+16U)*2U));bool rejected=false;
         try {strix::launch_output_by_kind(bad,static_cast<float*>(d_input.p),binding,bad==strix::WeightKind::q8_0?33U:width,rows,output,true);}
@@ -239,7 +249,7 @@ void run(unsigned width,unsigned rows,unsigned kind,bool cpu_only=false) {
         std::vector<std::uint16_t> preserved(rows+16);check(hipMemcpy(preserved.data(),d_output.p,preserved.size()*2,hipMemcpyDeviceToHost));
         require(std::all_of(preserved.begin(),preserved.end(),[](auto v){return v==0xa5a5U;}),"wrong format/alignment mutated output");
     }
-    for(unsigned fault=0;fault<8;++fault) {
+    for(unsigned fault=0;fault<9;++fault) {
         auto bad_binding=binding;auto* bad_input=static_cast<float*>(d_input.p);auto* bad_output=output;
         auto bad_width=width;auto bad_rows=rows;bool virtual_enabled=true;
         if(fault==0) virtual_enabled=false;
@@ -250,6 +260,7 @@ void run(unsigned width,unsigned rows,unsigned kind,bool cpu_only=false) {
         if(fault==5) bad_binding.address+=2;
         if(fault==6) bad_input=reinterpret_cast<float*>(reinterpret_cast<std::uintptr_t>(bad_input)+4U);
         if(fault==7) bad_output+=1;
+        if(fault==8) bad_width=33;
         check(hipMemset(d_output.p,0xa5,(rows+16U)*2U));
         strix::HipLaunchContext context{};context.stream=stream.stream;Graph rejected_graph;bool rejected=false;
         {

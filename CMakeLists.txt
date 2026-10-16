@@ -1697,9 +1697,9 @@ if(STRIX_ENABLE_HIP_RUNTIME)
             add_test(NAME strix-hip-gdn-wave8-q8-output-${wave8_output_width}-tests
                 COMMAND strix-hip-gdn-launcher-tests ${wave8_output_width} wave8-output)
         endforeach()
-        foreach(output_tail_heads IN ITEMS 4 12)
-            add_test(NAME strix-hip-gdn-wave8-q8-output-tail-${output_tail_heads}-tests
-                COMMAND strix-hip-gdn-launcher-tests 640 wave8-output ${output_tail_heads})
+        foreach(output_heads IN ITEMS 4 12)
+            add_test(NAME strix-hip-gdn-wave8-q8-output-heads-${output_heads}-tests
+                COMMAND strix-hip-gdn-launcher-tests 640 wave8-output ${output_heads})
         endforeach()
         add_executable(strix-hip-gdn-lm-wave8-diagnostic-tests tests/hip_gdn_lm_wave8_diagnostic_tests.hip)
         add_executable(strix-hip-shared-expert-rows-diagnostic-tests tests/hip_shared_expert_rows_diagnostic_tests.hip)
