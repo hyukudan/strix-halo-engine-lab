@@ -181,7 +181,7 @@ void native(){
     std::cout<<"HC splitK diagnostic native cases="<<cases<<" variants4 P1/P2 finitebits+100selfrepeat+eagergraph3 PASS; finite_outputs="<<summary.finite_outputs<<" classified_nonfinite_dot_outputs="<<summary.nonfinite_inputs_outputs<<" max_N2_fraction="<<summary.max_candidate_bound_fraction<<" max_N3_fraction="<<summary.max_epilogue_c_fraction<<" max_serial_abs="<<summary.max_serial_absolute<<" max_candidate_abs="<<summary.max_candidate_absolute<<" serial_bit_differences="<<summary.candidate_serial_bit_differences<<"; N4 raw CPU sanity only/device post bound; no model or M97 qualification\n";
 }
 
-std::string quote(const std::string& s){std::string v="\"";for(unsigned char c:s){require(c>=32U,"control character in JSON string");if(c=='"'||c=='\\')v+='\\';v+=static_cast<char>(c);}return v+'"';}
+std::string quote(const std::string& s){std::string v="\"";for(const char raw:s){const auto c=static_cast<unsigned char>(raw);require(c>=32U,"control character in JSON string");if(c=='"'||c=='\\')v+='\\';v+=static_cast<char>(c);}return v+'"';}
 template<class T> void array(std::ostream& out,const std::vector<T>& a){out<<'[';for(std::size_t j=0;j<a.size();++j)out<<(j?",":"")<<a[j];out<<']';}
 double median(std::vector<double> v){require(!v.empty(),"empty timing array");std::sort(v.begin(),v.end());return (v[(v.size()-1U)/2U]+v[v.size()/2U])*0.5;}
 std::vector<std::byte> file_bytes(const std::filesystem::path& path){std::ifstream in(path,std::ios::binary);require(in.good(),"open binary "+path.string());std::vector<char> raw((std::istreambuf_iterator<char>(in)),{});require(in.eof()||in.good(),"binary read failed");std::vector<std::byte> result(raw.size());std::memcpy(result.data(),raw.data(),raw.size());return result;}

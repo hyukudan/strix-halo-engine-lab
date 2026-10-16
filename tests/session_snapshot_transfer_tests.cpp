@@ -162,8 +162,16 @@ void occupied_kv_roundtrip() {
         std::fill(device.begin(), device.end(), 0xd3U);
         std::fill(host.begin(), host.end(), 0xd3U);
         restore_serial_session_snapshot(session, restore, layout, memory, saved, backend, &model);
-        expect(session.next_position == occupied && session.state.generations == request.state.generations &&
-            host == original_host && backend.restores == 1, "compact restore publishes saved consumed frontier only after completion");
+        // Payload includes declared components, not allocator alignment padding.
+        // This fixture deliberately clobbers padding too; those bytes remain
+        // unspecified and must not be mistaken for snapshotted host state.
+        auto expected_host = std::vector<std::uint8_t>(host.size(), 0xd3U);
+        for (const auto& allocation : layout.allocations) if (allocation.storage == SessionStateStorage::host)
+            std::copy_n(original_host.begin() + static_cast<std::ptrdiff_t>(allocation.offset),
+                static_cast<std::size_t>(allocation.bytes), expected_host.begin() + static_cast<std::ptrdiff_t>(allocation.offset));
+        expect(session.next_position == occupied && session.committed_tokens == occupied &&
+            session.health == SerialSessionHealth::ready && session.state.generations == request.state.generations &&
+            host == expected_host && backend.restores == 1, "compact restore publishes saved consumed frontier only after completion");
         for (const auto& allocation : layout.allocations) if (allocation.storage == SessionStateStorage::device) {
             for (std::uint64_t i = 0; i < allocation.bytes; ++i) {
                 const bool active = allocation.component != SessionStateComponent::attention_kv ||

@@ -1,5 +1,21 @@
 # Native MTP fixture runner
 
+For independent reference producers, the same executable also accepts ordinary
+target arguments without `--mtp`, plus `--qualification-export-target-input FILE`,
+`--qualification-export-bytes N` and `--qualification-export-capture-bytes N`.
+This separate diagnostic captures only actual target inputs for at least three
+prompt tokens. It never executes or activates the predictor and does not replace
+any qualification gate. Graph, other request controllers and golden options are
+rejected; the output path must be new. The native target keeps its resolved D1.
+
+The resulting `MTPINP01` input packet is little-endian: magic8, target content32,
+target execution uint64, kernel plan uint64, wide width uint32, row count uint32;
+each row is source position uint64, input token uint32, target prediction uint32
+and the complete BF16 wide words. Its JSON receipt pins the packet's actual SHA
+and the target file SHA. An independent predictor oracle uses adjacent **input**
+tokens for teacher forcing, not the target predictions. This records inputs; it
+does not establish independent target-model fidelity or expected MTP outputs.
+
 With HIP and `BUILD_TESTING`, `strix-hip-mtp-model-qualification` uses the same
 target, PLE, local sidecar and complete independent forward-replay setup as the
 decoder. It does not duplicate a model loader or bypass qualification. Pass the

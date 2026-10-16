@@ -47,9 +47,15 @@ struct HipMtpWindowVerifier::Impl {
             target->validate_window_capture(*capture);
             retained=mtp_native::sum(retained,capture->retained_payload_bytes());
         }
+        // Completed serial metadata admits capture, but bounded rollback belongs
+        // to the actual known-window producer queue and its retained owner.
+        // Full snapshots retain the original serial-target queue contract.
+        const auto checkpoint_stream=bounded?captures.front()->source_stream():target->stream();
+        const std::shared_ptr<const void> checkpoint_stream_owner=bounded?
+            std::shared_ptr<const void>(window):std::shared_ptr<const void>(target);
         checkpoint=std::make_unique<HipMtpTargetCheckpoint>(target->model(),target->compiled(),*resources.session_state_layout,
-            target->memory_owner(),target->weights_owner(),target->allocator(),static_cast<hipStream_t>(target->stream()),
-            target,target->guard(),policy.snapshot_policy,policy.checkpoint_retained_byte_budget,generations,
+            target->memory_owner(),target->weights_owner(),target->allocator(),static_cast<hipStream_t>(checkpoint_stream),
+            checkpoint_stream_owner,target->guard(),policy.snapshot_policy,policy.checkpoint_retained_byte_budget,generations,
             bounded?captures.front():std::shared_ptr<const HipMtpTargetWindowCapture>{});
         retained=mtp_native::sum(retained,checkpoint->reserved_bytes());
         require(retained<=policy.total_retained_byte_budget,"MTP actual verification pools exceed admitted reservation");

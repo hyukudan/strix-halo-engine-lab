@@ -36,8 +36,20 @@ HipMtpTargetCheckpointComponentReceipt qualify_hip_mtp_target_window_checkpoint(
     std::array<std::byte,65536> readback{};std::array<std::byte,8> baseline_status{};
     auto recorded=session;
     auto guard=target->guard();const auto stream=static_cast<hipStream_t>(target->stream());
+    // Baseline reads use the completed target stream; the rollback snapshot
+    // itself must follow the distinct actual window-producer stream and owner.
+    const auto checkpoint_stream=static_cast<hipStream_t>(capture->source_stream());
+    if(checkpoint_stream!=stream) {
+        bool wrong_stream_rejected=false;
+        try {
+            HipMtpTargetCheckpoint wrong(target->model(),target->compiled(),*resources.session_state_layout,
+                target->memory_owner(),target->weights_owner(),target->allocator(),stream,target,guard,
+                SessionSnapshotPolicy::full_components,checkpoint_budget,generations,capture);
+        }catch(const std::invalid_argument&){wrong_stream_rejected=true;}
+        require(wrong_stream_rejected,"bounded rollback accepted a foreign serial-target stream");
+    }
     HipMtpTargetCheckpoint checkpoint(target->model(),target->compiled(),*resources.session_state_layout,
-        target->memory_owner(),target->weights_owner(),target->allocator(),stream,target,guard,
+        target->memory_owner(),target->weights_owner(),target->allocator(),checkpoint_stream,window,guard,
         SessionSnapshotPolicy::full_components,checkpoint_budget,generations,capture);
     bool attempted=false;
     try {

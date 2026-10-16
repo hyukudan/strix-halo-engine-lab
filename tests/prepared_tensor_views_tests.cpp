@@ -14,15 +14,33 @@
 namespace {
 bool forbid_allocations = false;
 }
+#if defined(__GNUC__)
+[[gnu::noinline]]
+#endif
 void* operator new(std::size_t bytes) {
     if (forbid_allocations) throw std::bad_alloc();
     if (auto* memory = std::malloc(bytes ? bytes : 1U)) return memory;
     throw std::bad_alloc();
 }
+#if defined(__GNUC__)
+[[gnu::noinline]]
+#endif
 void* operator new[](std::size_t bytes) { return ::operator new(bytes); }
+#if defined(__GNUC__)
+[[gnu::noinline]]
+#endif
 void operator delete(void* memory) noexcept { std::free(memory); }
+#if defined(__GNUC__)
+[[gnu::noinline]]
+#endif
 void operator delete[](void* memory) noexcept { std::free(memory); }
+#if defined(__GNUC__)
+[[gnu::noinline]]
+#endif
 void operator delete(void* memory, std::size_t) noexcept { std::free(memory); }
+#if defined(__GNUC__)
+[[gnu::noinline]]
+#endif
 void operator delete[](void* memory, std::size_t) noexcept { std::free(memory); }
 
 namespace {
@@ -334,3 +352,4 @@ int main() try {
     forbid_allocations = false;
     std::cerr << error.what() << '\n'; return 1;
 }
+

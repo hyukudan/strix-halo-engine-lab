@@ -9,10 +9,12 @@ namespace strix {
 namespace {
 void require(bool condition,const char* message) {if(!condition) throw std::invalid_argument(message);}
 std::uint64_t add(std::uint64_t a,std::uint64_t b) {
-    if(b>UINT64_MAX-a) throw std::overflow_error("known prefill storage overflow");return a+b;
+    if(b>UINT64_MAX-a) throw std::overflow_error("known prefill storage overflow");
+    return a+b;
 }
 std::uint64_t multiply(std::uint64_t a,std::uint64_t b) {
-    if(b&&a>UINT64_MAX/b) throw std::overflow_error("known prefill storage overflow");return a*b;
+    if(b&&a>UINT64_MAX/b) throw std::overflow_error("known prefill storage overflow");
+    return a*b;
 }
 void hash(std::uint64_t& h,std::uint64_t value) {
     for(unsigned shift=0;shift<64;shift+=8) {h^=(value>>shift)&255U;h*=1099511628211ULL;}

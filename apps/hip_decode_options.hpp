@@ -97,7 +97,7 @@ struct OptimizationProfileResolution {
 // Local, externally pinned MTP assets and independent replay evidence are
 // mandatory. None of these fields is an execution/qualification override.
 struct MtpCliOptions {
-    bool enabled=false,supplied=false;
+    bool enabled=false,supplied=false,metadata_only=false;
     std::string sidecar,sidecar_logical_name,sidecar_sha256,target_sha256,target_content,golden,golden_sha256;
     std::string repository,revision,source_path,converter_sha256,norm_converter_sha256,converter_revision;
     std::string conversion,normalized_rounding,projection_rounding,sidecar_residency;
@@ -551,9 +551,9 @@ inline void validate_mtp_cli(const Options& o,bool resolved=false) {
        ((resolved || o.context_explicit) && (o.tokens.size()>o.context_tokens ||
         o.generate_tokens>o.context_tokens-o.tokens.size()+1U)))
         throw std::invalid_argument("MTP requires 3..4097 known prompt tokens, positive uint32 output budget and bounded target context");
-    if(m.sidecar.empty() || m.sidecar_logical_name.empty() || m.golden.empty() || m.repository.empty() || m.revision.empty() || m.source_path.empty() || m.converter_revision.empty() ||
+    if(m.sidecar.empty() || m.sidecar_logical_name.empty() || (!m.metadata_only && m.golden.empty()) || m.repository.empty() || m.revision.empty() || m.source_path.empty() || m.converter_revision.empty() ||
        !mtp_sha256_text(m.sidecar_sha256) || !mtp_sha256_text(m.target_sha256) || !mtp_sha256_text(m.target_content) ||
-       !mtp_sha256_text(m.golden_sha256) || !mtp_sha256_text(m.converter_sha256) || !mtp_sha256_text(m.norm_converter_sha256))
+       (!m.metadata_only && !mtp_sha256_text(m.golden_sha256)) || !mtp_sha256_text(m.converter_sha256) || !mtp_sha256_text(m.norm_converter_sha256))
         throw std::invalid_argument("MTP requires explicit local assets, full SHA256 pins and source/conversion provenance");
     if(m.conversion!="effective-norm-embedding-first-v1" ||
        (m.normalized_rounding!="fp32" && m.normalized_rounding!="bf16-rne") ||
@@ -645,7 +645,11 @@ inline Options parse_options(
             else if(key=="--mtp-max-logit-error")m.max_logit_error=parse_double(value,"MTP logit policy");
             else {
                 const auto n=parse_u64(value,"MTP option");
-                if(key=="--mtp-sidecar-bytes")m.sidecar_bytes=n;
+                if(key=="--mtp-metadata-only"){
+                    if(n!=1U)throw std::invalid_argument("MTP metadata-only requires value1");
+                    m.metadata_only=true;
+                }
+                else if(key=="--mtp-sidecar-bytes")m.sidecar_bytes=n;
                 else if(key=="--mtp-header-bytes")m.header_bytes=n;
                 else if(key=="--mtp-sidecar-retained-bytes")m.sidecar_retained_bytes=n;
                 else if(key=="--mtp-sidecar-setup-bytes")m.sidecar_setup_bytes=n;

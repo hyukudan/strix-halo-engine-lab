@@ -135,6 +135,8 @@ The complete eleven-stage diagnostic still supplies full-forward qualification
 evidence. Reconciliation does not run MoE or LM-head selection and does not
 publish temporary hidden/logit outputs. The first following proposal supplies
 its authoritative target wide input again.
+The CLI first obtains its activation evidence by complete diagnostic replay;
+it does not replace that full-forward qualification with cache-only priming.
 
 Predictor cache writes are append-only by logical row. Reconciliation replaces
 the affected rows before subsequent reads; rows at or above the current frontier

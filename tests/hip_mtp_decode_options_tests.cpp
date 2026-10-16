@@ -47,6 +47,16 @@ int main(){try{
     // Parsing precedes automatic context resolution. A normal512 output request
     // must remain admissible until the actual resolved context is known.
     good.context_tokens=8192;strix::decode_cli::validate_resolved_mtp_cli(good);
+    auto metadata=request();
+    for(const auto* key:{"--mtp-golden","--mtp-golden-sha256"}){
+        for(auto it=metadata.begin();it!=metadata.end();++it)if(*it==key){metadata.erase(it,it+2);break;}
+    }
+    reject(metadata,"ordinary MTP still requires independent golden pins");
+    metadata.insert(metadata.end(),{"--mtp-metadata-only","1"});
+    const auto probe=parse(metadata);
+    require(probe.mtp.metadata_only && probe.mtp.golden.empty() && probe.mtp.golden_sha256.empty(),
+        "explicit metadata diagnostic admits real assets without an expected-output file");
+    set(metadata,"--mtp-metadata-only","0");reject(metadata,"metadata diagnostic requires its explicit value");
     for(const auto* flag:{"--prepared-eager","--moe-shared-overlap","--gdn-islands","--gpu-greedy-token","--prompt-lookup",
         "--prefix-cache-roundtrip","--device-queue-trace"}){
         auto bad=request();bad.push_back(flag);reject(bad,"incompatible MTP route rejects at parsing before native setup");

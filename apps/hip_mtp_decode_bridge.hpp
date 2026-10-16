@@ -49,16 +49,19 @@ struct MtpDecodeTargetParents final {
 inline ModelContentIdentity mtp_cli_digest(std::string_view text) {
     if(!mtp_sha256_text(text))throw std::invalid_argument("MTP SHA256 pin is invalid");
     const auto digit=[](char ch)->unsigned {if(ch>='0'&&ch<='9')return static_cast<unsigned>(ch-'0');
-        if(ch>='a'&&ch<='f')return static_cast<unsigned>(ch-'a')+10U;return static_cast<unsigned>(ch-'A')+10U;};
+        if(ch>='a'&&ch<='f')return static_cast<unsigned>(ch-'a')+10U;
+        return static_cast<unsigned>(ch-'A')+10U;};
     ModelContentIdentity out;
     for(std::size_t i=0;i<out.bytes.size();++i)out.bytes[i]=static_cast<std::uint8_t>((digit(text[i*2U])<<4U)|digit(text[i*2U+1U]));
     return out;
 }
 inline std::uint64_t mtp_cli_add(std::uint64_t a,std::uint64_t b) {
-    if(b>UINT64_MAX-a)throw std::overflow_error("MTP CLI payload budget overflow");return a+b;
+    if(b>UINT64_MAX-a)throw std::overflow_error("MTP CLI payload budget overflow");
+    return a+b;
 }
 inline std::uint64_t mtp_cli_mul(std::uint64_t a,std::uint64_t b) {
-    if(b && a>UINT64_MAX/b)throw std::overflow_error("MTP CLI payload budget overflow");return a*b;
+    if(b && a>UINT64_MAX/b)throw std::overflow_error("MTP CLI payload budget overflow");
+    return a*b;
 }
 using MtpDecodeWindowFactory=std::function<std::shared_ptr<HipMtpWindowVerifier>(std::shared_ptr<HipMtpTargetHidden>)>;
 struct MtpDecodeQualificationContext {
@@ -90,15 +93,19 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
        session.health!=SerialSessionHealth::ready || session.execution_identity!=compiled.execution_identity)
         throw std::invalid_argument("MTP CLI requires a fresh actual target session");
     const auto& m=options.mtp;const auto& r=parents->resources;const auto& actual=*parents->experiment;
-    auto golden=read_mtp_forward_golden_file(m.golden,mtp_cli_digest(m.golden_sha256),m.golden_max_bytes);
+    const auto width=mtp_cli_mul(model.hidden_size,model.hc_count);
+    HipMtpForwardGolden golden;
+    if(m.metadata_only && qualify)throw std::invalid_argument("MTP metadata cannot replace native fixture execution");
+    if(!m.metadata_only){
+    golden=read_mtp_forward_golden_file(m.golden,mtp_cli_digest(m.golden_sha256),m.golden_max_bytes);
     if(golden.rows.size()+1U!=options.tokens.size())
         throw std::invalid_argument("MTP golden must cover every prompt predictor pair, leaving only its final pending target row");
-    const auto width=mtp_cli_mul(model.hidden_size,model.hc_count);
     for(std::size_t i=0;i<golden.rows.size();++i) {
         const auto& row=golden.rows[i];
         if(row.source_position!=i || row.source_input_token!=options.tokens[i] || row.next_input_token!=options.tokens[i+1U] ||
            row.target_hidden_bf16.size()!=width || row.next_hidden_bf16.size()!=width || row.full_logits.size()!=model.vocab_size)
             throw std::invalid_argument("MTP independent golden prompt chain or full-row geometry differs before target execution");
+    }
     }
     HipMtpAssetLoadRequest load;load.sidecar_path=m.sidecar;load.sidecar_logical_name=m.sidecar_logical_name;
     load.expected_target_file_sha256=mtp_cli_digest(m.target_sha256);load.expected_target_content=mtp_cli_digest(m.target_content);
@@ -118,6 +125,19 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
     auto native=HipMtpResources::create(model,assets->compiled(),assets->sidecar_manifest(),assets->sidecar_residency(),
         assets->target_manifest(),assets->target_residency(),assets->shared_target(),native_budget,actual.allocator);
     auto runtime=std::make_shared<HipMtpRuntime>(native);
+    if(m.metadata_only){
+        assets->validate_assets_unchanged();
+        output<<"{\"mode\":\"mtp-metadata-only\",\"mtp_executed\":false,\"mtp_activated\":false,\"mtp_qualified\":false,"
+            <<"\"proposal_identity\":"<<assets->compiled().proposal_identity<<",\"plan_identity\":"<<assets->compiled().plan_identity
+            <<",\"semantic_identity\":"<<assets->compiled().forward_semantics.contract_identity<<",\"native_profile_identity\":"<<runtime->numerical_profile_identity()
+            <<",\"head_profile_identity\":"<<hip_mtp_lm_head_profile_identity(model,native->tensors().lm_head)
+            <<",\"target_content\":\""<<model_content_identity_hex(assets->shared_target().target_model_content_identity)
+            <<"\",\"sidecar_content\":\""<<model_content_identity_hex(assets->shared_target().sidecar_model_content_identity)
+            <<"\",\"target_file_sha256\":\""<<model_content_identity_hex(actual.mapped->file_sha256())
+            <<"\",\"sidecar_file_sha256\":\""<<model_content_identity_hex(assets->sidecar_mapping()->file_sha256())
+            <<"\",\"normalized_rounding\":\""<<m.normalized_rounding<<"\",\"projection_rounding\":\""<<m.projection_rounding<<"\"}\n";
+        return;
+    }
     MtpForwardReplayPolicy policy{m.policy_identity,m.max_hidden_error,m.max_logit_error,2U,true};
     (void)assess_mtp_forward_replay(policy,{});
     if(golden.target_content!=assets->shared_target().target_model_content_identity ||
@@ -175,7 +195,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
         HipMtpGreedyRuntime greedy(runtime,qualified,activated,target,session,r,dispatcher,parents);
         if(window && !qualify)greedy.use_window_verifier(window);
         if(qualify){
-            MtpDecodeQualificationContext context{options,parents,native,target,window,session,dispatcher,generations,greedy,*runtime,std::move(pending)};
+            MtpDecodeQualificationContext context{options,parents,native,target,std::move(window),session,dispatcher,generations,greedy,*runtime,std::move(pending)};
             qualify(context);
             assets->validate_assets_unchanged();
             return;

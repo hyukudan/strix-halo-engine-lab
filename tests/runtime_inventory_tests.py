@@ -264,7 +264,7 @@ class InventoryTests(unittest.TestCase):
             result = self.collect(receipt_path=self.evidence("tiled-cohort.json", declaration))
             self.assertTrue(result["reported_opt_in_overlays"]["known_prefix_tiled_prefill"])
             self.assertEqual(result["reported_opt_in_overlays"]["serving_tensor_cohort"], width)
-            self.assertIsNone(result["profile_overlay_qualification"])
+            self.assertEqual(result["profile_overlay_qualification"], "not_assessed")
         neutral = self.collect(receipt_path=self.evidence("neutral-cohort.json", {
             "known_prefix_tiled_prefill": False, "serving_tensor_cohort": {"requested_rows": 1}}))
         self.assertIs(neutral["reported_opt_in_overlays"]["serving_tensor_cohort"], False)
@@ -285,7 +285,7 @@ class InventoryTests(unittest.TestCase):
             "prompt_lookup_snapshot": {"policy": "occupied-kv-v1", "max_payload_bytes": 8192}}))
         self.assertIs(active["reported_opt_in_overlays"]["moe_token_cost_policy"], True)
         self.assertEqual(active["reported_opt_in_overlays"]["prompt_lookup_snapshot"], "occupied-kv-v1")
-        self.assertIsNone(active["profile_overlay_qualification"])
+        self.assertEqual(active["profile_overlay_qualification"], "not_assessed")
         neutral = self.collect(receipt_path=self.evidence("cost-full.json", {
             "moe_token_cost_policy": {"enabled": False},
             "prompt_lookup_snapshot": {"policy": "full-components", "max_payload_bytes": 0}}))

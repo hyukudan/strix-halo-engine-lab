@@ -2935,7 +2935,7 @@ void emit_gdn_recurrent_layout(const PreparedGdnLaunch& row, HipGdnRecurrentLayo
     const auto block = dim3(kRecurrentThreads);
 #define STRIX_GDN_RECURRENT_LAYOUT(kernel) \
     record_gdn_kernel(target.ledger, reinterpret_cast<const void*>(kernel), grid, block); \
-    hipLaunchKernelGGL(kernel, grid, block, 0, target.stream, \
+    hipLaunchKernelGGL((kernel), grid, block, 0, target.stream, \
         row.workspace.qkv, row.workspace.beta, row.workspace.gate, \
         reinterpret_cast<float*>(row.matrix_state.address), row.workspace.core, \
         row.key_heads, row.value_heads, row.head_dim, target.graph_status)

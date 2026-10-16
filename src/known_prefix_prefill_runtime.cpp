@@ -16,7 +16,8 @@ namespace strix {
 namespace {
 void require(bool value,const char* message) {if(!value) throw std::invalid_argument(message);}
 std::uint64_t add(std::uint64_t a,std::uint64_t b,const char* message) {
-    if(b>UINT64_MAX-a) throw std::overflow_error(message);return a+b;
+    if(b>UINT64_MAX-a) throw std::overflow_error(message);
+    return a+b;
 }
 constexpr std::array flags{PersistentState::attention_kv,PersistentState::recurrent_matrix,
     PersistentState::convolution_history,PersistentState::sparse_index,PersistentState::ngram_history,PersistentState::position_history};

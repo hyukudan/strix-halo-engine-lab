@@ -330,7 +330,7 @@ struct HipMoeOverlapDispatcher::Impl {
                     launcher.implementation_identity && launcher.runtime_step == compiled.bindings.bindings[i].host_or_runtime_step,
                     "MoE overlap compiled launcher differs");
             for (std::size_t flag = 0; flag < state_flags.size(); ++flag)
-                if ((step.writes_state & state_flags[flag]) != PersistentState::none) ++writes[flag];
+                if (has_state(step.writes_state,state_flags[flag])) ++writes[flag];
         }
         accessed_allocations.resize(compiled.io.steps.size());
         accessed_weights.resize(compiled.io.steps.size());

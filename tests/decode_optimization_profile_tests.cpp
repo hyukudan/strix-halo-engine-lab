@@ -17,7 +17,9 @@ Options parse(std::initializer_list<const char*> args) {
 template<class Function> void rejects(Function operation, std::string_view message) {
     try { operation(); expect(false, "expected CLI rejection"); }
     catch (const std::invalid_argument& error) {
-        expect(std::string_view(error.what()) == message, "specific CLI rejection");
+        if (std::string_view(error.what()) != message) {
+            ++failures; std::cerr << "expected CLI rejection: " << message << "\nactual CLI rejection: " << error.what() << '\n';
+        }
     }
 }
 }
@@ -382,11 +384,11 @@ int main() {
     expect(parse({"decoder", "m", "1", "--prompt-lookup", "--prompt-lookup-depth", "0"}).prompt_lookup_depth == 0,
         "explicit depth zero preserves the device frontier route");
     rejects([] { (void)parse({"decoder", "m", "1", "--prompt-lookup-depth", "1"}); },
-        "depth flag cannot silently enable lookup");
+        "prompt lookup depth requires --prompt-lookup");
     rejects([] { (void)parse({"decoder", "m", "1", "--prompt-lookup", "--prompt-lookup-depth", "3"}); },
-        "lookup cannot manufacture an unsupported target depth");
+        "prompt lookup depth must be zero, one or two");
     rejects([] { (void)parse({"decoder", "m", "1", "--prompt-lookup", "--prompt-lookup"}); },
-        "duplicate lookup flag");
+        "duplicate prompt lookup option");
     for (unsigned mutation = 0; mutation < 14; ++mutation) {
         auto bad = lookup;
         if (mutation == 0) bad.known_prefix_window = true;
@@ -403,12 +405,12 @@ int main() {
         if (mutation == 11) bad.qsa_gqa_heads_per_block = 4;
         if (mutation == 12) bad.gdn_recurrent_layout = HipGdnRecurrentLayout::stride32;
         if (mutation == 13) bad.generate_tokens = 0;
-        rejects([&] { validate_resolved_prompt_lookup(bad); }, "lookup rejects incompatible explicit route without disabling its flags");
+        rejects([&] { validate_resolved_prompt_lookup(bad); }, "prompt lookup requires eager generation with its own device selectors, without alternate submission/cache/RAW/reference/candidate layouts");
     }
     auto missing_lookup_status = lookup; missing_lookup_status.deferred_moe_status = false;
-    rejects([&] { validate_resolved_prompt_lookup(missing_lookup_status); }, "lookup requires the actual D1 owner");
+    rejects([&] { validate_resolved_prompt_lookup(missing_lookup_status); }, "prompt lookup requires resolved D1 and paired wave8 GDN input/output");
     auto missing_lookup_wave = lookup; missing_lookup_wave.wave8_q8_gdn_input = false;
-    rejects([&] { validate_resolved_prompt_lookup(missing_lookup_wave); }, "lookup requires the actual paired GDN variant");
+    rejects([&] { validate_resolved_prompt_lookup(missing_lookup_wave); }, "prompt lookup requires resolved D1 and paired wave8 GDN input/output");
     paired_prompt.wave8_q8_gdn_output = false;
     rejects([&] { validate_resolved_known_prefix_window(paired_prompt); },
         "known-prefix window requires resolved D1 and explicit paired wave8 GDN input/output");
@@ -478,9 +480,9 @@ int main() {
     expect(file_request.tokens.empty() && file_request.serving_prefix_files.size() == 1 &&
         !file_request.any_low_level_flag, "serving parser records file requests without changing optimization profile");
     rejects([] { (void)parse({"decoder", "m", "1", "--serve-concurrency", "2"}); },
-        "serving controls cannot silently change an ordinary request");
+        "serving controls require --serve-prefix-u32le");
     rejects([] { (void)parse({"decoder", "m", "1", "--serve-concurrency", "3"}); },
-        "serving geometry is a closed worker family");
+        "serving concurrency must be1,2or4");
     const auto cached_serving = parse({"decoder", "m", "--serve-prefix-u32le", "not-opened.u32le", "--generate", "4",
         "--serve-prefix-cache-entries", "2", "--serve-prefix-cache-snapshot-bytes", "4096",
         "--serve-prefix-cache-capture-peak-bytes", "8192", "--serve-prefix-cache-max-tokens", "16"});
@@ -530,7 +532,9 @@ int main() {
         if (mutation == 10) bad.tokens = {1};
         if (mutation == 11) bad.execution_inventory = true;
         if (mutation == 12) bad.deferred_moe_status = false;
-        rejects([&] { validate_resolved_serving(bad); }, "serving rejects missing reservations and unsupported explicit modes");
+        rejects([&] { validate_resolved_serving(bad); }, mutation < 3 ?
+            "serving requires concurrency 1/2/4, at most64 requests and explicit total/request/headroom reservation bytes" :
+            "serving requires eager D1 generation from prefix files, without positional tokens, graph/integer, overlap/islands, cache, paired/prompt routes or single-session validation outputs");
     }
     auto stored = defaults;
     stored.gdn_recurrent_storage = GdnRecurrentStorage::value_key;
@@ -544,9 +548,9 @@ int main() {
         if (mutation == 2) bad.prompt_lookup = true;
         if (mutation == 3) bad.execution.mode = DecodeExecutionMode::graph;
         if (mutation == 4) bad.execution.integer_head = DecodeIntegerHead::a8_iu8;
-        rejects([&] { validate_resolved_gdn_recurrent_storage(bad); }, "physical state storage does not enter unadmitted graph/R2 modes");
+        rejects([&] { validate_resolved_gdn_recurrent_storage(bad); }, "GDN value-key storage requires eager C1 without graph/integer, islands or R2 routes");
     }
-    rejects([] { (void)parse({"decoder", "m", "1", "--gdn-recurrent-storage", "unknown"}); }, "storage selector rejects unknown versions");
+    rejects([] { (void)parse({"decoder", "m", "1", "--gdn-recurrent-storage", "unknown"}); }, "GDN recurrent storage must be key-value or value-key");
     auto instrumented = parse({"decoder", "fixture.gguf", "1", "--host-dispatch-telemetry"});
     const auto instrumented_profile = resolve_optimization_profile(instrumented, model, info, manifest,
         validated_model_content_identity, true);
@@ -773,3 +777,4 @@ int main() {
     std::cout << "Decode optimization profile failures=" << failures << '\n';
     return failures ? 1 : 0;
 }
+

@@ -137,9 +137,9 @@ int main() try {
             require(current_execution_telemetry() == nullptr, "nested null binding disables observation");
         }
         require(current_execution_telemetry() == &activity, "nested binding restores owner");
-        auto event = ExecutionActivity{};
-        event.kind = static_cast<ExecutionActivityKind>(UINT32_MAX);
-        activity.observe_activity(event); // Invalid kind cannot index storage or produce a trace entry.
+        auto invalid_event = ExecutionActivity{};
+        invalid_event.kind = static_cast<ExecutionActivityKind>(UINT32_MAX);
+        activity.observe_activity(invalid_event); // Invalid kind cannot index storage or produce a trace entry.
     }
     require(current_execution_telemetry() == nullptr && !execution_telemetry_during_capture(),
         "binding lifetime restores outer observer/capture state");

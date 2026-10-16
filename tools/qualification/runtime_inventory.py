@@ -307,7 +307,7 @@ def validate_outer_receipt(receipt):
             integer(count, "QSA GQA layer submissions")
         if sum(counts) != receipt.get("qsa_gqa_submissions"):
             raise ValueError("QSA GQA total/layer submissions differ")
-    if "qsa_hierarchical_selection" in receipt:
+    if "qsa_hierarchical_selection" in receipt and receipt["qsa_hierarchical_selection"] is not None:
         boolean(receipt["qsa_hierarchical_selection"], "qsa_hierarchical_selection")
     if ("qsa_hierarchical_selection_qualification" in receipt and
             receipt["qsa_hierarchical_selection_qualification"] != "not_assessed"):

@@ -547,7 +547,8 @@ void known_prefix_prefill_tests(const strix::ModelContract& model) {
             auto launch=strix::compile_launch_plan(source,f.registry);
             const auto state_before=f.state_words;const auto position_before=read_word(f.position_address());
             if(fault==0) launch.steps.back().preflight=[](const strix::ExecutionDispatchContext& c,void* p) {
-                if(c.position==15U) throw std::invalid_argument("late T row terminal admission failure");recording_window_preflight(c,p);};
+                if(c.position==15U) throw std::invalid_argument("late T row terminal admission failure");
+                recording_window_preflight(c,p);};
             if(fault==1) tokens.back()=static_cast<std::uint32_t>(model.vocab_size);
             if(fault==2) f.trace.fail_position=15U;
             const std::array<strix::KnownWindowRowsEntry,2> entries{{

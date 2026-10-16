@@ -1,5 +1,13 @@
 # Explicit native MTP CLI
 
+`--mtp-metadata-only 1` is an explicit diagnostic. It retains the same actual
+asset, provenance, rounding and budget admission, but does not require golden
+file/path pins. It loads the real owners and reports their plan, semantic and
+native/head profile identities, content identities and full file SHA values.
+It returns before any target or predictor forward and never activates or
+qualifies MTP. The ordinary path still requires independent expected outputs;
+the diagnostic cannot substitute for a model fixture invocation.
+
 `strix-hip-decode-token MODEL.gguf TOKEN... --generate N --mtp` selects a separate eager target request. It requires at least three prompt tokens and externally supplied independent full-forward reference rows for every adjacent prompt pair. The default decoder route and optimization profile remain unchanged. Graph, prepared dispatch, overlap, islands, other request controllers and recording/export routes are rejected before native setup rather than silently disabled.
 
 The request requires all of these values (each accepts `--name VALUE` or `--name=VALUE`):

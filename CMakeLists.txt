@@ -1343,8 +1343,8 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         strix_hip_runtime
         PUBLIC
         include
-        "${STRIX_HIP_INCLUDE_DIR}"
     )
+    target_include_directories(strix_hip_runtime SYSTEM PUBLIC "${STRIX_HIP_INCLUDE_DIR}")
     target_compile_features(strix_hip_runtime PUBLIC cxx_std_20)
     # Host-side redirects only: SDK declarations are included before macros;
     # kernels are never counted as submits by this observer.

@@ -1313,7 +1313,7 @@ int main() try {
             for (const std::uint64_t position : {0ULL, 2043ULL, 2047ULL, 2048ULL, 2051ULL, 2052ULL}) {
                 large_context.position = position;
                 reset(flavor, false); run(reference);
-                const auto expected_output = read(large_output.address, hidden_width * 2U);
+                const auto expected_sparse_output = read(large_output.address, hidden_width * 2U);
                 const auto expected_state = read(history_memory.device_base, history_memory.device_bytes);
                 const auto visible = position + 1U;
                 const auto count = std::min(visible / 4U, std::uint64_t{512}) * 4U + visible % 4U;
@@ -1322,7 +1322,7 @@ int main() try {
                     reset(flavor, false);
                     const auto prior = candidate_config.selection_stats->submissions.load();
                     run(candidate);
-                    expect(expected_output == read(large_output.address, hidden_width * 2U) &&
+                    expect(expected_sparse_output == read(large_output.address, hidden_width * 2U) &&
                         expected_state == read(history_memory.device_base, history_memory.device_bytes) &&
                         expected_indices == read(large_temp.address + selected_layout.selected_indices_offset, count * 4U),
                         "hierarchical production preserves full attention output, state and chronological indices");
@@ -1351,7 +1351,7 @@ int main() try {
             for (const std::uint64_t position : {0ULL, 2047ULL, 2048ULL, 2051ULL, 2052ULL}) {
                 large_context.position = position;
                 reset(1, false); run(reference);
-                const auto expected_output = read(large_output.address, hidden_width * 2U);
+                const auto expected_sparse_output = read(large_output.address, hidden_width * 2U);
                 const auto expected_state = read(history_memory.device_base, history_memory.device_bytes);
                 const auto visible = position + 1U;
                 const auto count = std::min(visible / 4U, std::uint64_t{512}) * 4U + visible % 4U;
@@ -1360,7 +1360,7 @@ int main() try {
                     reset(1, false);
                     const auto before = grouped_config.gqa_stats->submissions.load();
                     run(grouped);
-                    expect(expected_output == read(large_output.address, hidden_width * 2U) &&
+                    expect(expected_sparse_output == read(large_output.address, hidden_width * 2U) &&
                         expected_state == read(history_memory.device_base, history_memory.device_bytes) &&
                         expected_indices == read(large_temp.address + selected_layout.selected_indices_offset, count * 4U),
                         "production GQA2/4 preserves output/state and exact selection with either selector");
@@ -1497,7 +1497,7 @@ int main() try {
         const auto* kv = strix::find_session_state_allocation(layout, strix::SessionStateComponent::attention_kv);
         const auto row_bytes = strix::build_indexed_attention_state_layout(snapshot_model).kv_row_bytes;
         for (auto occupied : {1ULL,3ULL,5ULL}) {
-            std::vector<std::uint16_t> expected_output;
+            std::vector<std::uint16_t> expected_compact_output;
             std::vector<std::byte> expected_state;
             for (auto policy : {strix::SessionSnapshotPolicy::full_components, strix::SessionSnapshotPolicy::occupied_kv_v1}) {
                 std::fill(host_bytes.begin(),host_bytes.end(),std::byte{0});
@@ -1542,20 +1542,20 @@ int main() try {
                 for (const auto bits : produced) expect(std::isfinite(bf16_to_float(bits)),
                     "inactive future NaN KV cannot contaminate current QSA output");
                 if (policy == strix::SessionSnapshotPolicy::full_components) {
-                    expected_output = produced; expected_state = persisted;
+                    expected_compact_output = produced; expected_state = persisted;
                 } else {
-                    expect(produced == expected_output,"compact QSA rollback continuation equals full snapshot output bits");
+                    expect(produced == expected_compact_output,"compact QSA rollback continuation equals full snapshot output bits");
                     for (const auto& allocation : layout.allocations) {
                         if (allocation.storage != strix::SessionStateStorage::device) continue;
                         if (allocation.component == strix::SessionStateComponent::attention_kv) {
                             for (std::uint64_t l=0;l<snapshot_model.full_attention_layers;++l) {
                                 const auto begin=allocation.offset+l*8U*row_bytes;
                                 const auto rows=occupied+(l==strix::indexed_attention_layer_ordinal(snapshot_model,*step.layer)?1U:0U);
-                                expect(std::equal(persisted.begin()+begin,persisted.begin()+begin+rows*row_bytes,
-                                    expected_state.begin()+begin),"all occupied KV layers equal after actual QSA continuation");
+                                expect(std::equal(persisted.data()+begin,persisted.data()+begin+rows*row_bytes,
+                                    expected_state.data()+begin),"all occupied KV layers equal after actual QSA continuation");
                             }
-                        } else expect(std::equal(persisted.begin()+allocation.offset,
-                            persisted.begin()+allocation.offset+allocation.bytes,expected_state.begin()+allocation.offset),
+                        } else expect(std::equal(persisted.data()+allocation.offset,
+                            persisted.data()+allocation.offset+allocation.bytes,expected_state.data()+allocation.offset),
                             "QSA compact rollback preserves all non-KV device state");
                     }
                 }

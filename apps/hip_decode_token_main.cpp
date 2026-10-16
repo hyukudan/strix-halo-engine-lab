@@ -858,6 +858,12 @@ int STRIX_DECODE_ENTRY(
         parse_options(
             argc,
             argv);
+#if defined(STRIX_MTP_MODEL_QUALIFICATION_RUNNER)
+    const bool target_input_export = strix::tests::mtp_target_input_export_requested();
+    if(target_input_export)strix::tests::validate_mtp_target_input_export(options);
+#else
+    constexpr bool target_input_export = false;
+#endif
 
     // Bind before model residency/setup; retain through destruction of every
     // subsequently constructed GPU owner. Reporting happens after that cleanup.
@@ -973,6 +979,9 @@ int STRIX_DECODE_ENTRY(
         options, model, info, manifest,
         strix::model_content_identity_hex(mapped.content_identity()), has_auto_a8_runtime);
     strix::decode_cli::validate_resolved_mtp_cli(options);
+#if defined(STRIX_MTP_MODEL_QUALIFICATION_RUNNER)
+    if(target_input_export)strix::tests::validate_mtp_target_input_export(options);
+#endif
     strix::decode_cli::validate_resolved_prefix_roundtrip(options);
     strix::decode_cli::validate_resolved_q8_projection_organization(options);
     strix::decode_cli::validate_resolved_hc_projection_next_tile(options);
@@ -1860,7 +1869,7 @@ int STRIX_DECODE_ENTRY(
             plan, pins, hipStreamLegacy);
     }
     std::shared_ptr<HipDeferredMoeStatus> deferred_moe;
-    if(options.deferred_moe_status && !options.mtp.enabled) {
+    if(options.deferred_moe_status && !options.mtp.enabled && !target_input_export) {
         const auto deferred_status_generation=generations.next();
         const auto deferred_shadow_generation=generations.next();
         deferred_moe=std::make_shared<HipDeferredMoeStatus>(resources,compiled.execution_identity,
@@ -1975,6 +1984,14 @@ int STRIX_DECODE_ENTRY(
             "compiled execution does not end in one logits write");
     }
 
+#if defined(STRIX_MTP_MODEL_QUALIFICATION_RUNNER)
+    if(target_input_export){
+        setup_phase.reset();
+        strix::tests::export_mtp_target_inputs(options,model,experiment_owner,compiled,resources,session,direct_dispatcher,
+            generations,catalog_config.deferred_moe_status);
+        return 0;
+    }
+#endif
     if (options.mtp.enabled) {
         std::shared_ptr<strix::PleLookupBackend> owned_ple = options.planned_ple_io
             ? std::static_pointer_cast<strix::PleLookupBackend>(prefill_ple_owner)

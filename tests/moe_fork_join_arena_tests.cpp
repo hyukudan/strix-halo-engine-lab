@@ -207,7 +207,7 @@ void source_snapshot_and_rebind() {
     changed = source; changed.io.steps.back().reads.clear(); changed_source(changed);
     changed = source; ++changed.bindings.bound_steps; changed_source(changed);
     changed = source; changed.bindings.bindings.push_back({0U, strix::SerialOp::token_embedding,
-        strix::kernels::OperatorFamily::embedding_lookup, "changed.fixture", false}); changed_source(changed);
+        strix::kernels::OperatorFamily::embedding_lookup, "changed.fixture", false, std::nullopt}); changed_source(changed);
     changed = source; ++changed.arena.allocations.front().bytes; changed_source(changed);
     changed = source; ++changed.arena.naive_nonaliased_bytes; changed_source(changed);
     ++rebound.arena.allocations.front().bytes;

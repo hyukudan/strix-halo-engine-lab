@@ -292,7 +292,6 @@ struct Fixture {
         reset();const auto s=scope();{HipLaunchScope active(s);moe_experts_known_window_rows_launch(rows,config,workspace);}owner->drain();
         for(unsigned r=0;r<rows.size();++r) {
             const auto got=read({output[r].address,output[r].bytes});require(std::all_of(got.begin(),got.end(),[](auto b){return b==std::byte{0xa5};}),"invalid row partially published window output");
-            const auto l=moe_q4k_a8::build_runtime_workspace(H,I,E,K,true);
             const auto raw=read({temp[r].address+l.rawdots_offset,l.rawdots_bytes});require(std::all_of(raw.begin(),raw.end(),[](auto b){return b==std::byte{0xa5};}),"invalid CSR/prefix changed raw dots");
         }
         DeferredMoeFirstError error{};const auto bytes=read(record);std::memcpy(&error,bytes.data(),sizeof(error));

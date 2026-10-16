@@ -78,11 +78,25 @@ TransferHandle next_handle() {
 }
 class Writer {
 public:
+    explicit Writer(std::size_t size) : data(size) {}
     void integer(std::uint64_t value, unsigned bytes) {
-        for (unsigned index = 0; index < bytes; ++index) data.push_back(static_cast<std::byte>((value >> (index * 8U)) & 0xffU));
+        if (bytes == 0 || bytes > sizeof(value) || bytes > data.size() - offset_)
+            throw std::logic_error("copied packet integer exceeds its exact reserved frame");
+        for (unsigned index = 0; index < bytes; ++index)
+            data[offset_++] = static_cast<std::byte>((value >> (index * 8U)) & 0xffU);
     }
-    void append(std::span<const std::byte> bytes) { data.insert(data.end(), bytes.begin(), bytes.end()); }
+    void append(std::span<const std::byte> bytes) {
+        if (bytes.size() > data.size() - offset_)
+            throw std::logic_error("copied packet payload exceeds its exact reserved frame");
+        if (!bytes.empty()) std::memcpy(data.data() + offset_, bytes.data(), bytes.size());
+        offset_ += bytes.size();
+    }
+    void complete() const {
+        if (offset_ != data.size()) throw std::logic_error("copied packet has an unwritten frame suffix");
+    }
     std::vector<std::byte> data;
+private:
+    std::size_t offset_ = 0;
 };
 class Reader {
 public:
@@ -195,8 +209,18 @@ struct CopiedStreamTransportBackend::Impl {
     }
     std::vector<std::byte> packet(PacketKind kind, const Active& operation, std::span<const std::byte> payload = {}) {
         const auto& connection = state->connection_;
-        Writer writer;
-        writer.data.reserve(static_cast<std::size_t>(48 + connection.physical_link_id.size() + operation.metadata.size() + payload.size()));
+        // The packet already has a closed 48-byte header and exact payload
+        // lengths. Size once before encoding instead of growing the vector in
+        // each integer write (including its inlined realloc/deallocate path).
+        std::size_t frame_bytes = 48;
+        for (const auto bytes : {connection.physical_link_id.size(), operation.metadata.size(), payload.size()}) {
+            if (bytes > std::numeric_limits<std::uint32_t>::max() ||
+                bytes > std::numeric_limits<std::size_t>::max() - frame_bytes)
+                throw std::invalid_argument("copied packet length exceeds its wire or addressable bound");
+            frame_bytes += bytes;
+        }
+        if (frame_bytes > policy.maximum_frame_bytes) throw std::invalid_argument("copied packet exceeds frame budget");
+        Writer writer(frame_bytes);
         writer.integer(copied_magic, 4); writer.integer(copied_version, 4);
         writer.integer(static_cast<std::uint16_t>(kind), 2); writer.integer(0, 2);
         writer.integer(connection.local_node, 4); writer.integer(connection.peer_node, 4);
@@ -204,7 +228,7 @@ struct CopiedStreamTransportBackend::Impl {
         writer.integer(connection.physical_link_id.size(), 4); writer.integer(operation.metadata.size(), 4); writer.integer(payload.size(), 4);
         for (const auto character : connection.physical_link_id) writer.integer(static_cast<unsigned char>(character), 1);
         writer.append(operation.metadata); writer.append(payload);
-        if (writer.data.size() > policy.maximum_frame_bytes) throw std::invalid_argument("copied packet exceeds frame budget");
+        writer.complete();
         return std::move(writer.data);
     }
     std::span<const std::byte> unpack(std::span<const std::byte> packet_bytes, Active& operation, PacketKind kind) {

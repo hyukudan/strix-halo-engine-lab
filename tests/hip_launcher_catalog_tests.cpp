@@ -304,9 +304,9 @@ int main() {
     compiled.io = strix::build_serial_execution_io_plan(execution);
 
     strix::ExecutionLauncherRegistry launchers;
-    strix::HipLauncherCatalog catalog(
-        model,
-        {strix::HipActivationStorage::bf16});
+    strix::HipLauncherCatalogConfig catalog_config;
+    catalog_config.activation = strix::HipActivationStorage::bf16;
+    strix::HipLauncherCatalog catalog(model, catalog_config);
     catalog.register_for_compiled_execution(
         compiled,
         launchers);

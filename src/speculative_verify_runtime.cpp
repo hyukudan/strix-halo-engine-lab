@@ -419,8 +419,8 @@ KnownWindowResult execute_known_prefix_window_eager(
         const auto logits = resolve_dispatch_write(contexts.back()[r], 0);
         if (logits.bytes < serial.vocab_size * sizeof(float))
             throw std::invalid_argument("known window terminal logit row is undersized");
-        const auto selected=std::find(window.logit_row_indices.begin(),window.logit_row_indices.end(),r);
-        if(selected!=window.logit_row_indices.end())result.logits[static_cast<std::size_t>(selected-window.logit_row_indices.begin())]=logits;
+        const auto selected_logit_row=std::find(window.logit_row_indices.begin(),window.logit_row_indices.end(),r);
+        if(selected_logit_row!=window.logit_row_indices.end())result.logits[static_cast<std::size_t>(selected_logit_row-window.logit_row_indices.begin())]=logits;
     }
     const auto position_state = resolve_dispatch_state(contexts.front()[0], SessionStateComponent::position_history);
     if (position_state.storage != SessionStateStorage::host || !position_state.address ||
