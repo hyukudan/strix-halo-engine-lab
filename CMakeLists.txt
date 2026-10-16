@@ -1601,6 +1601,16 @@ if(STRIX_ENABLE_HIP_RUNTIME)
             endforeach()
         endforeach()
 
+        add_executable(strix-hip-gdn-retained-window-tests tests/hip_gdn_retained_window_tests.hip)
+        set_target_properties(strix-hip-gdn-retained-window-tests PROPERTIES
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+        target_link_libraries(strix-hip-gdn-retained-window-tests PRIVATE strix_hip_runtime)
+        target_compile_definitions(strix-hip-gdn-retained-window-tests PRIVATE STRIX_BUILD_KNOWN_WINDOW_DIAGNOSTIC=1)
+        target_compile_options(strix-hip-gdn-retained-window-tests PRIVATE
+            -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
+        strix_target_warnings(strix-hip-gdn-retained-window-tests)
+        add_test(NAME strix-hip-gdn-retained-window-tests COMMAND strix-hip-gdn-retained-window-tests)
+
         add_executable(strix-hip-gdn-wide-projection-tests tests/hip_gdn_wide_projection_tests.hip)
         set_target_properties(strix-hip-gdn-wide-projection-tests PROPERTIES
             HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)

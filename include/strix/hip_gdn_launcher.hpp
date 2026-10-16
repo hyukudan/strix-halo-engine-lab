@@ -67,6 +67,17 @@ void gdn_known_window_r2_input_stage_probe(std::span<const ExecutionDispatchCont
     const HipGdnLauncherConfig& config, GdnKnownWindowFormat format,
     GdnKnownWindowProjectionMode mode);
 struct GdnKnownWindowProjectionView { std::uintptr_t address = 0; std::uint64_t bytes = 0; };
+enum class GdnRetainedWindowMode { serial_rows, retained_rows };
+struct GdnRecurrentWindowRowView {
+    GdnKnownWindowProjectionView qkv, beta, gate, core;
+};
+// Standalone recurrence experiment on preprocessed FP32 rows, not a decoder
+// modality. Canonical key/value geometry 16/48/128, R2/R4, key-value matrix.
+// Caller retains exclusive state/output owners and immutable input rows until
+// completion of the explicit eager stream. No allocation, reset or commit.
+void gdn_recurrent_window_probe(std::span<const GdnRecurrentWindowRowView> rows,
+    GdnKnownWindowProjectionView state, std::uint32_t key_heads,
+    std::uint32_t value_heads, std::uint32_t head_dim, GdnRetainedWindowMode, void* stream);
 // Test-only projection payloads on independent row addresses (contiguous
 // or strided). Same incumbent epilogues; no state mutation, allocation or sync.
 void gdn_known_window_r2_projection_probe(GdnKnownWindowProjectionDirection,

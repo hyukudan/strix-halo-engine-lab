@@ -1495,6 +1495,95 @@ void recurrent_step_kernel(
     }
 }
 
+#ifdef STRIX_BUILD_KNOWN_WINDOW_DIAGNOSTIC
+template <unsigned Rows> struct GdnRecurrentWindowPointers {
+    const float* qkv[Rows];
+    const float* beta[Rows];
+    const float* gate[Rows];
+    float* core[Rows];
+};
+template <unsigned Rows>
+__global__ __launch_bounds__(kRecurrentThreads)
+void recurrent_retained_window_kernel(GdnRecurrentWindowPointers<Rows> rows, float* state,
+    std::uint32_t key_heads, std::uint32_t value_heads, std::uint32_t head_dim) {
+    static_assert(Rows == 2U || Rows == 4U);
+    const auto tile_count = head_dim / kValueTile;
+    const auto value_head = static_cast<std::uint32_t>(blockIdx.x) / tile_count;
+    const auto tile = static_cast<std::uint32_t>(blockIdx.x) % tile_count;
+    const auto lane = static_cast<std::uint32_t>(threadIdx.x);
+    if (value_head >= value_heads || lane >= head_dim) return;
+    const auto key_head = value_head % key_heads;
+    const auto value_base = tile * kValueTile;
+    const auto q_base = static_cast<std::uint64_t>(key_head) * head_dim;
+    const auto k_base = static_cast<std::uint64_t>(key_heads) * head_dim + q_base;
+    const auto v_base = static_cast<std::uint64_t>(key_heads) * head_dim * 2ULL +
+        static_cast<std::uint64_t>(value_head) * head_dim;
+    __shared__ float reduction[kRecurrentThreads * kValueTile];
+    __shared__ float deltas[kValueTile];
+    float retained[kValueTile];
+#pragma unroll
+    for (std::uint32_t column = 0; column < kValueTile; ++column) {
+        const auto state_index = (static_cast<std::uint64_t>(value_head) * head_dim + lane) * head_dim + value_base + column;
+        retained[column] = state[state_index];
+    }
+    for (unsigned row = 0; row < Rows; ++row) {
+        const auto* qkv = rows.qkv[row];
+        const auto* beta = rows.beta[row];
+        const auto* gate = rows.gate[row];
+#pragma unroll
+        for (std::uint32_t column = 0; column < kValueTile; ++column) {
+            retained[column] = retained[column] * expf(gate[value_head]);
+            reduction[static_cast<std::size_t>(lane) * kValueTile + column] = retained[column] * qkv[k_base + lane];
+        }
+        __syncthreads();
+        for (std::uint32_t stride = kRecurrentThreads / 2U; stride > 0; stride >>= 1U) {
+            if (lane < stride) {
+#pragma unroll
+                for (std::uint32_t column = 0; column < kValueTile; ++column)
+                    reduction[static_cast<std::size_t>(lane) * kValueTile + column] +=
+                        reduction[static_cast<std::size_t>(lane + stride) * kValueTile + column];
+            }
+            __syncthreads();
+        }
+        if (lane == 0) {
+#pragma unroll
+            for (std::uint32_t column = 0; column < kValueTile; ++column)
+                deltas[column] = (qkv[v_base + value_base + column] - reduction[column]) * beta[value_head];
+        }
+        __syncthreads();
+#pragma unroll
+        for (std::uint32_t column = 0; column < kValueTile; ++column) {
+            const auto delta = deltas[column];
+            retained[column] += qkv[k_base + lane] * delta;
+            reduction[static_cast<std::size_t>(lane) * kValueTile + column] = retained[column] * qkv[q_base + lane];
+        }
+        __syncthreads();
+        for (std::uint32_t stride = kRecurrentThreads / 2U; stride > 0; stride >>= 1U) {
+            if (lane < stride) {
+#pragma unroll
+                for (std::uint32_t column = 0; column < kValueTile; ++column)
+                    reduction[static_cast<std::size_t>(lane) * kValueTile + column] +=
+                        reduction[static_cast<std::size_t>(lane + stride) * kValueTile + column];
+            }
+            __syncthreads();
+        }
+        if (lane == 0) {
+#pragma unroll
+            for (std::uint32_t column = 0; column < kValueTile; ++column)
+                rows.core[row][static_cast<std::uint64_t>(value_head) * head_dim + value_base + column] = reduction[column];
+        }
+        // Replaces the incumbent kernel boundary: lane zero must finish reading
+        // the output tree before another wave starts overwriting its LDS.
+        __syncthreads();
+    }
+#pragma unroll
+    for (std::uint32_t column = 0; column < kValueTile; ++column) {
+        const auto state_index = (static_cast<std::uint64_t>(value_head) * head_dim + lane) * head_dim + value_base + column;
+        state[state_index] = retained[column];
+    }
+}
+#endif
+
 // Only physical LDS addresses differ from the incumbent recurrence. Logical
 // columns, arithmetic expressions, barriers and separate delta lifetime remain.
 // These same instantiations serve explicit eager choices and diagnostic probes.
@@ -3649,6 +3738,69 @@ void gdn_known_window_r2_f32_gates_launch(std::span<const ExecutionDispatchConte
 }
 
 #ifdef STRIX_BUILD_KNOWN_WINDOW_DIAGNOSTIC
+template <unsigned Rows>
+void enqueue_retained_recurrent_probe(std::span<const GdnRecurrentWindowRowView> input,
+    GdnKnownWindowProjectionView state, std::uint32_t key_heads,
+    std::uint32_t value_heads, std::uint32_t head_dim, hipStream_t stream) {
+    GdnRecurrentWindowPointers<Rows> views{};
+    for (unsigned r = 0; r < Rows; ++r) {
+        views.qkv[r] = reinterpret_cast<const float*>(input[r].qkv.address);
+        views.beta[r] = reinterpret_cast<const float*>(input[r].beta.address);
+        views.gate[r] = reinterpret_cast<const float*>(input[r].gate.address);
+        views.core[r] = reinterpret_cast<float*>(input[r].core.address);
+    }
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(recurrent_retained_window_kernel<Rows>),
+        dim3(value_heads * (head_dim / kValueTile)), dim3(kRecurrentThreads), 0, stream,
+        views, reinterpret_cast<float*>(state.address), key_heads, value_heads, head_dim);
+    check_hip(hipGetLastError(), "GDN retained-window diagnostic recurrence launch");
+}
+void gdn_recurrent_window_probe(std::span<const GdnRecurrentWindowRowView> rows,
+    GdnKnownWindowProjectionView state, std::uint32_t key_heads, std::uint32_t value_heads,
+    std::uint32_t head_dim, GdnRetainedWindowMode mode, void* stream) {
+    if ((rows.size() != 2U && rows.size() != 4U) || key_heads != 16U || value_heads != 48U || head_dim != 128U ||
+        (mode != GdnRetainedWindowMode::serial_rows && mode != GdnRetainedWindowMode::retained_rows) ||
+        !stream || static_cast<hipStream_t>(stream) == hipStreamLegacy || static_cast<hipStream_t>(stream) == hipStreamPerThread ||
+        current_hip_launch_context())
+        throw std::invalid_argument("GDN retained-window diagnostic requires canonical R2/R4 and a standalone eager stream");
+    std::array<GdnKnownWindowRange, 12> reads{};
+    std::array<GdnKnownWindowRange, 5> writes{};
+    const auto check_view = [](GdnKnownWindowProjectionView view, std::uint64_t required) {
+        validate_gdn_known_window_range({view.address, view.bytes}, 16U);
+        if (view.bytes < required) throw std::invalid_argument("GDN retained-window diagnostic view is undersized");
+    };
+    for (unsigned r = 0; r < rows.size(); ++r) {
+        check_view(rows[r].qkv, static_cast<std::uint64_t>(key_heads * 2U + value_heads) * head_dim * sizeof(float));
+        check_view(rows[r].beta, static_cast<std::uint64_t>(value_heads) * sizeof(float));
+        check_view(rows[r].gate, static_cast<std::uint64_t>(value_heads) * sizeof(float));
+        check_view(rows[r].core, static_cast<std::uint64_t>(value_heads) * head_dim * sizeof(float));
+        reads[3U*r] = {rows[r].qkv.address, rows[r].qkv.bytes};
+        reads[3U*r+1U] = {rows[r].beta.address, rows[r].beta.bytes};
+        reads[3U*r+2U] = {rows[r].gate.address, rows[r].gate.bytes};
+        writes[r] = {rows[r].core.address, rows[r].core.bytes};
+    }
+    check_view(state, static_cast<std::uint64_t>(value_heads) * head_dim * head_dim * sizeof(float));
+    writes[rows.size()] = {state.address, state.bytes};
+    for (unsigned i = 0; i <= rows.size(); ++i) {
+        for (unsigned r = 0; r < 3U*rows.size(); ++r) require_gdn_known_window_disjoint(writes[i], reads[r]);
+        for (unsigned j = 0; j < i; ++j) require_gdn_known_window_disjoint(writes[i], writes[j]);
+    }
+    const auto native_stream = static_cast<hipStream_t>(stream);
+    hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
+    check_hip(hipStreamIsCapturing(native_stream, &capture), "query GDN retained-window diagnostic capture");
+    if (capture != hipStreamCaptureStatusNone) throw std::invalid_argument("GDN retained-window diagnostic cannot be captured");
+    check_hip(hipPeekAtLastError(), "GDN retained-window diagnostic pre-enqueue stale error");
+    if (mode == GdnRetainedWindowMode::serial_rows) {
+        for (const auto& row : rows) {
+            hipLaunchKernelGGL(recurrent_step_kernel, dim3(value_heads * (head_dim / kValueTile)), dim3(kRecurrentThreads), 0,
+                native_stream, reinterpret_cast<const float*>(row.qkv.address), reinterpret_cast<const float*>(row.beta.address),
+                reinterpret_cast<const float*>(row.gate.address), reinterpret_cast<float*>(state.address),
+                reinterpret_cast<float*>(row.core.address), key_heads, value_heads, head_dim, nullptr);
+            check_hip(hipGetLastError(), "GDN retained-window diagnostic incumbent recurrence launch");
+        }
+    } else if (rows.size() == 2U) enqueue_retained_recurrent_probe<2U>(rows, state, key_heads, value_heads, head_dim, native_stream);
+    else enqueue_retained_recurrent_probe<4U>(rows, state, key_heads, value_heads, head_dim, native_stream);
+}
+
 void gdn_known_window_r2_input_stage_probe(std::span<const ExecutionDispatchContext, 2> rows,
     const HipGdnLauncherConfig& config, GdnKnownWindowFormat format,
     GdnKnownWindowProjectionMode mode) {
