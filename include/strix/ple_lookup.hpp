@@ -108,11 +108,18 @@ private:
 struct PlannedPleLookupPolicy {
     std::uint64_t max_rows_per_io = 4;
     std::uint64_t max_inflight_ios = 4;
+    // Zero preserves the legacy executor. Explicit 1..8 counts the outer
+    // asynchronous lookup coordinator as a reader within this total budget.
+    // Per backend/active lookup only; excludes threads internal to IoSource.
+    std::uint32_t cpu_helper_threads = 0;
 };
 
 class PlannedPleLookupBackend final
     : public PleLookupBackend {
 public:
+    // Source/config callers retain their owners until finish/cancel or backend
+    // destruction has joined every submitted helper. No interruptible read
+    // primitive exists: cancellation drains and discards, never releases early.
     explicit PlannedPleLookupBackend(
         SparseLookupIoSource& source,
         PlannedPleLookupPolicy policy = {});

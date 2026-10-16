@@ -174,6 +174,8 @@ struct Options {
     bool gdn_recurrent_storage_explicit = false;
     std::uint32_t known_prefix_rows = 2;
     bool known_prefix_rows_explicit = false;
+    std::uint32_t ple_cpu_helper_threads = 0;
+    bool ple_cpu_helper_threads_explicit = false;
 };
 
 inline bool is_low_level_optimization_option(std::string_view argument) {
@@ -227,6 +229,16 @@ inline void validate_resolved_q51_slot_parallel_down(const Options& options) {
          options.execution.mode != strix::DecodeExecutionMode::eager ||
          options.execution.integer_head != strix::DecodeIntegerHead::none))
         throw std::invalid_argument("slot-parallel Q5_1 down requires resolved grouped eager A8 execution");
+}
+
+// Explicit per-backend helper cap overlays the resolved PLE choice; never
+// selects the planned backend or disables another requested optimization.
+inline void validate_resolved_ple_cpu_helpers(const Options& options) {
+    if (options.ple_cpu_helper_threads > 8U ||
+        (options.ple_cpu_helper_threads_explicit && options.ple_cpu_helper_threads == 0U))
+        throw std::invalid_argument("PLE CPU helper threads must be 1 through 8 when explicit");
+    if (options.ple_cpu_helper_threads && !options.planned_ple_io)
+        throw std::invalid_argument("PLE CPU helper threads require resolved planned PLE I/O");
 }
 
 inline void validate_resolved_known_prefix_window(const Options& options) {
@@ -340,7 +352,7 @@ inline Options parse_options(
             "[--optimization-profile auto|manual] [--execution-inventory] [--host-dispatch-telemetry] [--execution-telemetry-trace] "
             "[--gpu-greedy-token] [--gdn-recurrent-layout baseline|stride32|stride33|transposed] [--gdn-recurrent-storage key-value|value-key] [--known-prefix-window --known-prefix-rows 2|4|8] [--prompt-lookup] [--prompt-lookup-depth 0|1|2] [--serve-prefix-u32le FILE ... --serve-concurrency 1|2|4 --serve-memory-budget-bytes N --serve-request-budget-bytes N --serve-headroom-bytes N] [--gdn-islands] [--qsa-hierarchical-selection] [--qsa-gqa-heads-per-block 1|2|4] [--prepared-eager] [--moe-shared-overlap] [--moe-overlap-arena-budget-bytes N] [--batched-moe-activation] [--validation-final-state DIR] [--validation-final-state-max-bytes N] [--reference FILE] [--max-logit-error X] "
             "[--context N] [--residency register|copy] [--coalesce-gap BYTES] "
-            "[--planned-ple-io] [--ple-max-rows-per-io N] [--ple-max-inflight-ios N] "
+            "[--planned-ple-io] [--ple-cpu-helper-threads 1..8] [--ple-max-rows-per-io N] [--ple-max-inflight-ios N] "
             "[--generate N] [--eos-token TOKEN_ID] [--prefix-cache-roundtrip] "
             "[--parallel-moe-router] [--ranked-moe-router-topk | --wave-moe-router-topk] "
             "[--prefetch-q8-qsa-input] [--prefetch-q8-shared-expert] [--prefetch-q8-lm-head [--wave8-q8-lm-head]] [--wave8-q8-gdn-input] [--wave8-q8-gdn-output] [--wave8-q8-qsa-output] [--virtual-q8-lm-head] [--virtual-q8-gdn-input [--prefetch-q8-gdn-input]] [--q4k-a8g32-gate-up [--grouped-exact-q51-down]] [--deferred-moe-status] "
@@ -779,6 +791,19 @@ inline Options parse_options(
             continue;
         }
 
+        if (argument == "--ple-cpu-helper-threads" || argument.starts_with("--ple-cpu-helper-threads=")) {
+            if (options.ple_cpu_helper_threads_explicit) throw std::invalid_argument("duplicate PLE CPU helper threads option");
+            std::string_view value;
+            if (argument == "--ple-cpu-helper-threads") {
+                if (index + 1 >= argc) throw std::invalid_argument("PLE CPU helper threads require a value");
+                value = argv[++index];
+            } else value = argument.substr(std::string_view("--ple-cpu-helper-threads=").size());
+            const auto count = parse_u64(value, "PLE CPU helper threads");
+            if (count < 1U || count > 8U) throw std::invalid_argument("PLE CPU helper threads must be 1 through 8 when explicit");
+            options.ple_cpu_helper_threads = static_cast<std::uint32_t>(count);
+            options.ple_cpu_helper_threads_explicit = true;
+            continue;
+        }
         if (argument == "--planned-ple-io") {
             options.planned_ple_io = true;
             continue;

@@ -2,12 +2,17 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <condition_variable>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <vector>
 #include <iostream>
 #include <stdexcept>
+#include <mutex>
+#include <thread>
 
 namespace {
 
@@ -97,6 +102,38 @@ public:
 
 private:
     std::vector<std::byte> bytes_;
+};
+
+class BudgetPleSource final : public strix::SparseLookupIoSource {
+public:
+    explicit BudgetPleSource(MemoryIoSource& source, bool blocked = false)
+        : source_(source), released_(!blocked) {}
+    std::atomic<unsigned> active{0}, peak{0}, calls{0}, caller_reads{0};
+    const std::thread::id caller = std::this_thread::get_id();
+    void read(std::uint64_t offset, std::span<std::byte> output) override {
+        const auto current = active.fetch_add(1) + 1;
+        struct Finish { std::atomic<unsigned>& value; ~Finish() { value.fetch_sub(1); } } finish{active};
+        auto prior = peak.load();
+        while (current > prior && !peak.compare_exchange_weak(prior, current)) {}
+        if (std::this_thread::get_id() == caller) caller_reads.fetch_add(1);
+        {
+            std::unique_lock lock(mutex_);
+            calls.fetch_add(1); condition_.notify_all();
+            condition_.wait(lock, [&] { return released_; });
+        }
+        source_.read(offset, output);
+    }
+    void wait_started() {
+        std::unique_lock lock(mutex_);
+        if (!condition_.wait_for(lock, std::chrono::seconds(5), [&] { return calls.load() != 0; }))
+            throw std::runtime_error("bounded PLE fixture source did not start");
+    }
+    void release() { std::lock_guard lock(mutex_); released_ = true; condition_.notify_all(); }
+private:
+    MemoryIoSource& source_;
+    std::mutex mutex_;
+    std::condition_variable condition_;
+    bool released_;
 };
 
 }  // namespace
@@ -470,6 +507,62 @@ int main() {
             concurrent_rejected,
             "planned PLE backend rejects overlapping lookup handles");
         backend.cancel(active);
+
+        const auto legacy_identity = 0x504c45504c414e31ULL ^ (2ULL << 17U) ^ (2ULL << 33U);
+        expect(backend.implementation_identity() == legacy_identity,
+            "zero CPU helper policy retains the exact incumbent backend identity");
+        std::array<std::uint64_t, 4> budget_identities{};
+        unsigned identity_index = 0;
+        for (const auto helpers : {1U,2U,4U,8U}) {
+            BudgetPleSource tracked(source);
+            auto bounded_policy = policy; bounded_policy.cpu_helper_threads = helpers;
+            bounded_policy.max_rows_per_io = 1; bounded_policy.max_inflight_ios = 8;
+            strix::PlannedPleLookupBackend bounded(tracked, bounded_policy);
+            budget_identities[identity_index++] = bounded.implementation_identity();
+            std::vector<std::uint16_t> bounded_rows(gathered.size(), 0xdead);
+            const auto pending = bounded.start(lookup);
+            bounded.finish(pending, std::as_writable_bytes(std::span(bounded_rows)));
+            expect(bounded_rows == gathered && tracked.active.load() == 0 && tracked.peak.load() <= helpers &&
+                tracked.caller_reads.load() == 0 && tracked.calls.load() == 2,
+                "planned backend includes its asynchronous coordinator within the explicit CPU reader budget");
+            // Cancel while a real source read is blocked. The cancellation
+            // thread is test control, not another backend/source worker.
+            BudgetPleSource blocked(source, true);
+            strix::PlannedPleLookupBackend cancelling(blocked, bounded_policy);
+            struct ReleaseOnExit { BudgetPleSource& source; ~ReleaseOnExit() { source.release(); } } release{blocked};
+            const auto cancelled_handle = cancelling.start(lookup);
+            blocked.wait_started();
+            std::promise<void> cancel_entered;
+            auto entered = cancel_entered.get_future();
+            std::atomic<bool> cancelled_done{false};
+            auto cancellation = std::async(std::launch::async, [&] {
+                cancel_entered.set_value(); cancelling.cancel(cancelled_handle); cancelled_done.store(true);
+            });
+            entered.wait();
+            expect(!cancelled_done.load() && blocked.active.load() != 0,
+                "cancel cannot return or release a source owner while its I/O is blocked");
+            blocked.release(); cancellation.get();
+            expect(cancelled_done.load() && blocked.active.load() == 0 && blocked.peak.load() <= helpers,
+                "cancel joins every submitted bounded reader before returning");
+            std::vector<std::uint16_t> retry_rows(gathered.size());
+            const auto retry = cancelling.start(lookup);
+            cancelling.finish(retry, std::as_writable_bytes(std::span(retry_rows)));
+            expect(retry_rows == gathered, "bounded planned backend is reusable after drained cancellation");
+        }
+        for (std::size_t a = 0; a < budget_identities.size(); ++a) {
+            expect(budget_identities[a] != legacy_identity, "explicit CPU policy changes backend organization identity");
+            for (std::size_t b = 0; b < a; ++b)
+                expect(budget_identities[a] != budget_identities[b], "different CPU helper budgets retain distinct backend identities");
+        }
+        for (const auto invalid_budget : {9U,UINT32_MAX}) {
+            BudgetPleSource untouched(source);
+            auto invalid_policy = policy; invalid_policy.cpu_helper_threads = invalid_budget;
+            bool rejected = false;
+            try { strix::PlannedPleLookupBackend invalid_backend(untouched, invalid_policy); }
+            catch (const std::invalid_argument&) { rejected = true; }
+            expect(rejected && untouched.calls.load() == 0,
+                "invalid helper admission fails before creating a lookup or consuming source I/O");
+        }
     }
 
     {

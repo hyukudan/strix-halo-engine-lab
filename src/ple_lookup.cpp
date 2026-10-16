@@ -661,6 +661,8 @@ PlannedPleLookupBackend::PlannedPleLookupBackend(
     PlannedPleLookupPolicy policy)
     : source_(&source),
       policy_(policy) {
+    if (policy_.cpu_helper_threads > 8U)
+        throw std::invalid_argument("planned PLE CPU helper budget must be zero or 1..8");
     if (policy_.max_inflight_ios == 0) {
         throw std::invalid_argument(
             "planned PLE lookup requires non-zero inflight depth");
@@ -671,9 +673,15 @@ std::uint64_t
 PlannedPleLookupBackend::implementation_identity() const noexcept {
     constexpr std::uint64_t base =
         0x504c45504c414e31ULL;
-    return base ^
+    const auto legacy = base ^
            (policy_.max_rows_per_io << 17U) ^
            (policy_.max_inflight_ios << 33U);
+    if (!policy_.cpu_helper_threads) return legacy;
+    auto hash = legacy;
+    for (const auto value : {0x504c454350554231ULL, static_cast<unsigned long long>(policy_.cpu_helper_threads)})
+        for (unsigned shift = 0; shift < 64; shift += 8)
+            hash = (hash ^ ((value >> shift) & 255ULL)) * 1099511628211ULL;
+    return hash ? hash : 1;
 }
 
 PleLookupHandle
@@ -786,10 +794,13 @@ PlannedPleLookupBackend::start(
         next_handle_++;
     auto* source =
         source_;
+    const auto helper_threads = policy_.cpu_helper_threads;
     auto future =
         std::async(
             std::launch::async,
-            [plan, source]() mutable {
+            [plan, source, helper_threads]() mutable {
+                if (helper_threads)
+                    return execute_sparse_lookup_io_plan(plan, *source, helper_threads);
                 return execute_sparse_lookup_io_plan(
                     plan,
                     *source);

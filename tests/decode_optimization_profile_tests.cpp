@@ -146,6 +146,29 @@ int main() {
     validate_resolved_qsa_hierarchical_selection(defaults);
     expect(!defaults.known_prefix_window, "known-prefix route stays opt-in");
     validate_resolved_known_prefix_window(defaults);
+    expect(defaults.ple_cpu_helper_threads == 0 && !defaults.ple_cpu_helper_threads_explicit,
+        "PLE helper budget default retains legacy backend behavior");
+    validate_resolved_ple_cpu_helpers(defaults);
+    for (const auto* value : {"1", "2", "8"}) {
+        auto explicit_helpers = parse({"decoder", "m", "1", "--ple-cpu-helper-threads", value});
+        expect(explicit_helpers.ple_cpu_helper_threads == parse_u64(value, "fixture") &&
+            !explicit_helpers.any_low_level_flag && !explicit_helpers.planned_ple_io,
+            "helper budget neither changes automatic profile nor implicitly enables planned PLE");
+        rejects([&] { validate_resolved_ple_cpu_helpers(explicit_helpers); },
+            "PLE CPU helper threads require resolved planned PLE I/O");
+        explicit_helpers.planned_ple_io = true;
+        validate_resolved_ple_cpu_helpers(explicit_helpers);
+    }
+    expect(parse({"decoder", "m", "1", "--planned-ple-io", "--ple-cpu-helper-threads=8"}).ple_cpu_helper_threads == 8,
+        "explicit planned backend accepts helper cap equals form");
+    for (const auto* value : {"0", "9"})
+        rejects([&] { (void)parse({"decoder", "m", "1", "--ple-cpu-helper-threads", value}); },
+            "PLE CPU helper threads must be 1 through 8 when explicit");
+    rejects([] { (void)parse({"decoder", "m", "1", "--ple-cpu-helper-threads", "2", "--ple-cpu-helper-threads=4"}); },
+        "duplicate PLE CPU helper threads option");
+    { auto invalid = defaults; invalid.ple_cpu_helper_threads = 9;
+      rejects([&] { validate_resolved_ple_cpu_helpers(invalid); }, "PLE CPU helper threads must be 1 through 8 when explicit"); }
+
     auto paired_prompt = defaults;
     paired_prompt.known_prefix_window = true; paired_prompt.generate_tokens = 3;
     paired_prompt.deferred_moe_status = true;

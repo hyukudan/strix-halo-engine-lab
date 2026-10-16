@@ -118,3 +118,13 @@ an empty string. The collector preserves this receipt instead of substituting
 its own process environment. Effective hardware queues and observed concurrency
 remain null: an environment request or two streams does not establish overlap.
 No setting is modified. These source changes have not been executed yet.
+
+## Planned PLE helper budget
+
+`--ple-cpu-helper-threads 1..8` is an explicit per-planned-backend upper
+bound, including its coordinator. It requires the resolved planned PLE backend
+and does not enable that backend or alter the optimization profile by itself.
+The default zero leaves legacy scheduling unchanged. Independent serving
+sessions have independent backend budgets; this is not a process-wide CPU
+budget, affinity policy or limit on custom source-internal threads. Receipts
+report the requested cap separately from unknown actual helper counts.

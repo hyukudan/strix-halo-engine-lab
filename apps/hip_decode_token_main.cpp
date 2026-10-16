@@ -835,16 +835,22 @@ int main(
     strix::decode_cli::validate_resolved_known_prefix_window(options);
     strix::decode_cli::validate_resolved_prompt_lookup(options);
     strix::decode_cli::validate_resolved_serving(options);
+    strix::decode_cli::validate_resolved_ple_cpu_helpers(options);
     if (options.batched_moe_activation && !options.q4k_a8g32_gate_up)
         throw std::invalid_argument("batched MoE activation requires resolved Q4K A8 gate/up execution");
     if (options.moe_shared_overlap && !options.deferred_moe_status)
         throw std::invalid_argument("MoE shared overlap requires the resolved eager deferred-status owner");
+    const std::string ple_cpu_helper_receipt = options.ple_cpu_helper_threads
+        ? "  \"ple_cpu_helper_budget_requested\":" + std::to_string(options.ple_cpu_helper_threads) + ",\n" +
+          "  \"ple_cpu_helper_budget_scope\":\"per-planned-backend-including-coordinator-excluding-custom-source-internal-threads\",\n" +
+          "  \"ple_cpu_helpers_actual\":null,\n"
+        : std::string{};
     const std::string optimization_profile_receipt =
         "  \"optimization_profile_requested\": \"" + optimization_profile.requested + "\",\n" +
         "  \"optimization_profile_selected\": \"" + optimization_profile.selected + "\",\n" +
         "  \"optimization_profile_reason\": \"" + optimization_profile.reason + "\",\n" +
         "  \"optimization_profile_automatic_applied\": " +
-        (optimization_profile.automatic_applied ? "true" : "false") + ",\n";
+        (optimization_profile.automatic_applied ? "true" : "false") + ",\n" + ple_cpu_helper_receipt;
     const std::string eager_submission_receipt = options.prepared_eager
         ? "  \"eager_submission_mode\":\"prepared-static-plan-experimental-v1\",\n"
         : std::string{};
@@ -1274,7 +1280,7 @@ int main(
             for (unsigned reserved = 0; reserved < 3; ++reserved) static_cast<void>(generations.next());
             auto owner = std::make_shared<ServingSessionOwner>(mapped_owner, model_owner, original_work_device,
                 model, compiled, manifest, wave_router_admission, tensor_access, state_layout,
-                strix::PlannedPleLookupPolicy{options.ple_max_rows_per_io, options.ple_max_inflight_ios},
+                strix::PlannedPleLookupPolicy{options.ple_max_rows_per_io, options.ple_max_inflight_ios, options.ple_cpu_helper_threads},
                 options.planned_ple_io, epoch, static_cast<std::uint64_t>(i) + 1U,
                 options.host_dispatch_telemetry, options.execution_telemetry_trace);
             strix::SerialGreedyRequest serve_request{prefixes[i], model.vocab_size, options.context_tokens,
@@ -1388,6 +1394,7 @@ int main(
         options.ple_max_rows_per_io;
     planned_ple_policy.max_inflight_ios =
         options.ple_max_inflight_ios;
+    planned_ple_policy.cpu_helper_threads = options.ple_cpu_helper_threads;
     strix::PlannedPleLookupBackend
         planned_ple_lookup(
             mapped_model_io,
