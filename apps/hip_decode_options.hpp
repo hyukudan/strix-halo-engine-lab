@@ -1498,7 +1498,7 @@ inline constexpr std::string_view validated_model_content_identity =
 inline OptimizationProfileResolution resolve_optimization_profile(
     Options& options, const ModelContract& model, const gguf::FileInfo& info,
     const ModelManifest& manifest, std::string_view content_identity,
-    bool has_q4k_a8_runtime) {
+    bool has_q4k_a8_runtime, bool permit_generation_defaults = true) {
     OptimizationProfileResolution result;
     const auto fallback = [&](std::string reason) {
         result.reason = std::move(reason);
@@ -1575,6 +1575,31 @@ inline OptimizationProfileResolution resolve_optimization_profile(
     result.selected = options.ranked_moe_router_topk ? "canonical-a8-ranked-qsa-hc-shared-deferred-v3" :
                                                     "canonical-a8-wave-qsa-hc-shared-deferred-v3";
     result.reason = options.ranked_moe_router_topk ? "explicit-ranked-router" : "qualified-checkpoint";
+    // Concurrent submission is an ordinary CPU-output generation default only. Keep the existing
+    // v3 policy for other controllers/intents or additional numerical choices;
+    // explicit options are never disabled to make a request eligible. The
+    // caller excludes diagnostic target-input export, which is not in Options.
+    const bool concurrency_generation = permit_generation_defaults && options.generate_tokens && !options.tokens.empty() &&
+        !options.mtp.enabled && options.serving_prefix_files.empty() && !options.prompt_lookup && !options.known_prefix_window &&
+        !options.prefix_cache_roundtrip && options.raw_recording_path.empty() && !options.gpu_greedy_token &&
+        options.logprob_token_ids.empty() && !options.device_queue_trace && !options.moe_token_cost_policy && !options.ranked_moe_router_topk &&
+        options.offline_tuning_cache_path.empty() && options.offline_compile_provenance_path.empty() &&
+        options.gdn_recurrent_layout == HipGdnRecurrentLayout::baseline &&
+        options.gdn_recurrent_storage == GdnRecurrentStorage::key_value &&
+        !options.qsa_hierarchical_selection && options.qsa_gqa_heads_per_block == 1 &&
+        !options.prefetch_hc_projection_next_tile && !options.prefetch_q8_lm_head && !options.wave8_q8_lm_head &&
+        !options.wave8_q8_qsa_output;
+    if (concurrency_generation) {
+        options.q51_slot_parallel_down = true;
+        options.batched_moe_activation = true;
+        options.wave8_q8_gdn_input = true;
+        options.wave8_q8_gdn_output = true;
+        options.gdn_islands = true;
+        options.prepared_eager = true;
+        options.moe_shared_overlap = true;
+        result.selected = "canonical-a8-wave-qsa-hc-shared-concurrency-v4";
+        result.reason = "qualified-ordinary-cpu-generation";
+    }
     return result;
 }
 

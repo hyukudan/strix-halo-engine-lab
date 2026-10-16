@@ -977,7 +977,7 @@ int STRIX_DECODE_ENTRY(
 #endif
     const auto optimization_profile = strix::decode_cli::resolve_optimization_profile(
         options, model, info, manifest,
-        strix::model_content_identity_hex(mapped.content_identity()), has_auto_a8_runtime);
+        strix::model_content_identity_hex(mapped.content_identity()), has_auto_a8_runtime, !target_input_export);
     strix::decode_cli::validate_resolved_mtp_cli(options);
 #if defined(STRIX_MTP_MODEL_QUALIFICATION_RUNNER)
     if(target_input_export)strix::tests::validate_mtp_target_input_export(options,true);

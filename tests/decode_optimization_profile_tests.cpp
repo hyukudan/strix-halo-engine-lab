@@ -1,5 +1,6 @@
 #include "../apps/hip_decode_options.hpp"
 #include <iostream>
+#include <array>
 using namespace strix;
 using namespace strix::decode_cli;
 namespace {
@@ -559,6 +560,123 @@ int main() {
            "host observation does not silently disable the qualified automatic profile");
     rejects([] { static_cast<void>(parse({"decoder", "m", "1", "--host-dispatch-telemetry",
         "--host-dispatch-telemetry"})); }, "duplicate host dispatch telemetry option");
+    // Policy-only metadata fixture: the content pin is a trusted resolver
+    // input here, not evidence that these synthetic metadata own actual assets.
+    const auto ordinary_request = parse({"decoder", "fixture.gguf", "7734", "264", "4434", "--generate", "14"});
+    auto concurrent = ordinary_request;
+    const auto concurrent_profile = resolve_optimization_profile(concurrent, model, info, manifest,
+        validated_model_content_identity, true);
+    expect(concurrent_profile.automatic_applied &&
+        concurrent_profile.selected == "canonical-a8-wave-qsa-hc-shared-concurrency-v4" &&
+        concurrent_profile.reason == "qualified-ordinary-cpu-generation" &&
+        concurrent.q51_slot_parallel_down && concurrent.batched_moe_activation &&
+        concurrent.wave8_q8_gdn_input && concurrent.wave8_q8_gdn_output &&
+        concurrent.gdn_islands && concurrent.prepared_eager && concurrent.moe_shared_overlap &&
+        !concurrent.gpu_greedy_token && concurrent.context_tokens == 8192 &&
+        concurrent.moe_overlap_arena_budget_bytes == 64ULL * 1024ULL * 1024ULL,
+        "ordinary CPU generation selects the literal complete concurrency profile without scalar output or budget growth");
+    expect(concurrent.parallel_hyper_mix && concurrent.staged_hyper_projections && concurrent.fused_staged_hyper_mix &&
+        concurrent.typed_hyper_projection && concurrent.prefetch_typed_hyper_rows && concurrent.prefetch_q8_hyper_output &&
+        concurrent.lane_chain_hyper_output && concurrent.virtual_q8_lm_head && concurrent.parallel_moe_router &&
+        concurrent.wave_moe_router_topk && concurrent.q4k_a8g32_gate_up && concurrent.grouped_exact_q51_down &&
+        concurrent.virtual_q8_gdn_input && concurrent.prefetch_q8_gdn_input && concurrent.virtual_q8_gdn_output &&
+        concurrent.prefetch_q8_qsa_input && concurrent.prefetch_q8_shared_expert && concurrent.deferred_moe_status,
+        "concurrent generation retains every literal baseline prerequisite rather than replacing the original arithmetic bundle");
+    // Use the real production resolved validators, not a test copy of the
+    // concurrency predicate. These callbacks are metadata-only on this path.
+    validate_resolved_mtp_cli(concurrent);
+    validate_resolved_q8_projection_organization(concurrent);
+    validate_resolved_q51_slot_parallel_down(concurrent);
+    validate_resolved_gdn_islands(concurrent);
+    validate_resolved_gdn_recurrent_layout(concurrent);
+    validate_resolved_gdn_recurrent_storage(concurrent);
+    validate_resolved_qsa_hierarchical_selection(concurrent);
+    validate_resolved_qsa_gqa(concurrent);
+    validate_resolved_known_prefix_window(concurrent);
+    validate_resolved_prompt_lookup(concurrent);
+    validate_resolved_serving(concurrent);
+    const auto submitted_flags = [](const Options& o) {
+        return std::array{o.q51_slot_parallel_down,o.batched_moe_activation,o.wave8_q8_gdn_input,
+            o.wave8_q8_gdn_output,o.gdn_islands,o.prepared_eager,o.moe_shared_overlap};
+    };
+    for (unsigned mutation = 0; mutation < 24; ++mutation) {
+        auto ineligible = ordinary_request;
+        if (mutation == 0) ineligible.generate_tokens = 0;
+        if (mutation == 1) ineligible.tokens.clear();
+        if (mutation == 2) ineligible.mtp.enabled = true;
+        if (mutation == 3) ineligible.serving_prefix_files = {"prefix.u32le"};
+        if (mutation == 4) ineligible.prompt_lookup = true;
+        if (mutation == 5) ineligible.known_prefix_window = true;
+        if (mutation == 6) ineligible.prefix_cache_roundtrip = true;
+        if (mutation == 7) ineligible.raw_recording_path = "fresh-raw";
+        if (mutation == 8) ineligible.gpu_greedy_token = true;
+        if (mutation == 9) ineligible.logprob_token_ids = {0};
+        if (mutation == 10) ineligible.moe_token_cost_policy = true;
+        if (mutation == 11) ineligible.ranked_moe_router_topk = true;
+        if (mutation == 12) ineligible.offline_tuning_cache_path = "cache.bin";
+        if (mutation == 13) ineligible.offline_compile_provenance_path = "provenance.bin";
+        if (mutation == 14) ineligible.gdn_recurrent_layout = HipGdnRecurrentLayout::stride32;
+        if (mutation == 15) ineligible.gdn_recurrent_storage = GdnRecurrentStorage::value_key;
+        if (mutation == 16) ineligible.qsa_hierarchical_selection = true;
+        if (mutation == 17) ineligible.qsa_gqa_heads_per_block = 2;
+        if (mutation == 18) ineligible.prefetch_hc_projection_next_tile = true;
+        if (mutation == 19) ineligible.prefetch_q8_lm_head = true;
+        if (mutation == 20) ineligible.wave8_q8_lm_head = true;
+        if (mutation == 21) ineligible.wave8_q8_qsa_output = true;
+        if (mutation == 23) ineligible.device_queue_trace = ineligible.host_dispatch_telemetry = true;
+        // Target-input export is deliberately a separate caller-supplied route
+        // bit because its private fixture options are not decoder Options.
+        const auto before = ineligible;
+        const auto retained = resolve_optimization_profile(ineligible, model, info, manifest,
+            validated_model_content_identity, true, mutation != 22);
+        expect(retained.automatic_applied && retained.selected == (mutation == 11 ?
+            "canonical-a8-ranked-qsa-hc-shared-deferred-v3" : "canonical-a8-wave-qsa-hc-shared-deferred-v3") &&
+            submitted_flags(ineligible) == submitted_flags(before),
+            "ineligible concurrent request retains v3 and all seven explicit/default submission flags");
+    }
+    auto preserved_overlay = ordinary_request;
+    preserved_overlay.prompt_lookup = true; // An alternate route keeps its explicit compatible arithmetic overlays.
+    preserved_overlay.q51_slot_parallel_down = preserved_overlay.wave8_q8_gdn_input = true;
+    const auto retained_overlay = resolve_optimization_profile(preserved_overlay, model, info, manifest,
+        validated_model_content_identity, true);
+    expect(retained_overlay.selected == "canonical-a8-wave-qsa-hc-shared-deferred-v3" &&
+        preserved_overlay.q51_slot_parallel_down && preserved_overlay.wave8_q8_gdn_input &&
+        !preserved_overlay.batched_moe_activation && !preserved_overlay.wave8_q8_gdn_output &&
+        !preserved_overlay.prepared_eager && !preserved_overlay.moe_shared_overlap && !preserved_overlay.gdn_islands,
+        "v3 preservation does not clear explicit overlays or complete them into concurrent generation on an excluded route");
+    auto manual_generation = ordinary_request;
+    manual_generation.optimization_profile = OptimizationProfile::manual;
+    manual_generation.prepared_eager = true;
+    const auto manual_generation_before = submitted_flags(manual_generation);
+    const auto manual_generation_profile = resolve_optimization_profile(manual_generation, model, info, manifest,
+        validated_model_content_identity, true);
+    expect(!manual_generation_profile.automatic_applied && manual_generation_profile.selected == "manual" &&
+        manual_generation_profile.reason == "explicit-manual" &&
+        submitted_flags(manual_generation) == manual_generation_before && manual_generation.context_tokens == 128,
+        "manual generation preserves its exact explicit submission flags and context");
+    auto observational = ordinary_request;
+    observational.validation_final_state_path = "fresh-final-state";
+    observational.execution_inventory = observational.host_dispatch_telemetry = true;
+    expect(resolve_optimization_profile(observational, model, info, manifest,
+        validated_model_content_identity, true).selected == "canonical-a8-wave-qsa-hc-shared-concurrency-v4" &&
+        observational.validation_final_state_path == "fresh-final-state" &&
+        observational.execution_inventory && observational.host_dispatch_telemetry,
+        "post-request state validation and host observation do not silently switch arithmetic profiles");
+    auto bounded_overlap = parse({"decoder", "fixture.gguf", "7734", "264", "4434", "--generate", "14",
+        "--moe-shared-overlap", "--moe-overlap-arena-budget-bytes", "16777216"});
+    expect(resolve_optimization_profile(bounded_overlap, model, info, manifest,
+        validated_model_content_identity, true).selected == "canonical-a8-wave-qsa-hc-shared-concurrency-v4" &&
+        bounded_overlap.moe_overlap_budget_explicit && bounded_overlap.moe_overlap_arena_budget_bytes == 16777216ULL,
+        "automatic C never grows an explicit overlap reservation budget");
+#ifdef STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME
+    auto explicit_c = parse({"decoder", "fixture.gguf", "7734", "264", "4434", "--generate", "14", "--optimization-profile", "auto",
+        "--q51-slot-parallel-down", "--batched-moe-activation", "--wave8-q8-gdn-input", "--wave8-q8-gdn-output",
+        "--gdn-islands", "--prepared-eager", "--moe-shared-overlap"});
+    (void)resolve_optimization_profile(explicit_c, model, info, manifest, validated_model_content_identity, true);
+    expect(submitted_flags(explicit_c) == submitted_flags(concurrent) && explicit_c.context_tokens == concurrent.context_tokens &&
+        explicit_c.grouped_exact_q51_down && explicit_c.q4k_a8g32_gate_up && explicit_c.deferred_moe_status,
+        "actual explicit concurrency parser route agrees with literal auto-C flags and original prerequisites");
+#endif
     const auto selected = resolve_optimization_profile(on, model, info, manifest,
         validated_model_content_identity, true);
     expect(selected.automatic_applied && selected.selected == "canonical-a8-wave-qsa-hc-shared-deferred-v3" &&
@@ -587,7 +705,13 @@ int main() {
                input.ranked_moe_router_topk == before.ranked_moe_router_topk &&
                input.prefetch_q8_qsa_input == before.prefetch_q8_qsa_input &&
                input.prefetch_q8_shared_expert == before.prefetch_q8_shared_expert &&
-               input.deferred_moe_status == before.deferred_moe_status,
+               input.deferred_moe_status == before.deferred_moe_status &&
+               input.q51_slot_parallel_down == before.q51_slot_parallel_down &&
+               input.batched_moe_activation == before.batched_moe_activation &&
+               input.wave8_q8_gdn_input == before.wave8_q8_gdn_input &&
+               input.wave8_q8_gdn_output == before.wave8_q8_gdn_output &&
+               input.gdn_islands == before.gdn_islands && input.prepared_eager == before.prepared_eager &&
+               input.moe_shared_overlap == before.moe_shared_overlap,
                "fallback retains explicit and previous defaults");
     };
     fallback(defaults, "checkpoint-content-not-qualified", true, "another-checkpoint");

@@ -88,6 +88,29 @@ Earlier decoder/catalog/catalog-fixture C++20 syntax checks with private HIP
 declarations covered capability present and absent; they do not establish fresh
 native compilation or GPU execution for v3 at that historical checkpoint.
 
+## Ordinary-generation concurrency profile
+
+For the qualified checkpoint, ordinary CPU-output generation selects
+`canonical-a8-wave-qsa-hc-shared-concurrency-v4`. It retains the v3 arithmetic
+bundle and adds slot-parallel Q5_1 down projection, batched MoE activation,
+paired wave8 Q8 GDN input/output, GDN islands, prepared eager submission and
+MoE/shared-expert overlap. Explicit overlap arena budgets are preserved.
+
+All existing content, model, capability, context, residency and execution
+allowlist guards still apply. Manual mode and implicit low-level overrides keep
+their behavior. MTP, serving, prompt lookup, known-prefix windows, prefix
+roundtrip, RAW, replay reference, target-input export, GPU scalar output,
+requested logprobs, device queue tracing, online MoE scheduling, ranked routing and additional
+numerical organizations retain the prior policy and their explicit flags.
+Post-request final-state validation and host observation remain permitted.
+
+The qualification slice covers sixteen consumed rows, all 248320 FP32 logits
+per row, and all seven initial/final state payloads, compared bit for bit.
+Complete request measurements exclude model setup and retain every scheduled
+sample. This finite slice does not establish all-position or full-context
+coverage. Automatic-profile integration and its final build checks are recorded
+separately from the historical v3 adoption below.
+
 ## Qualified adoption (2026-10-15)
 
 Source `265fd78762884d18eb32aa60294408f080088d52`, source archive SHA-256
