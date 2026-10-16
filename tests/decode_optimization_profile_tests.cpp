@@ -146,6 +146,37 @@ int main() {
     validate_resolved_qsa_hierarchical_selection(defaults);
     expect(!defaults.known_prefix_window, "known-prefix route stays opt-in");
     validate_resolved_known_prefix_window(defaults);
+    expect(defaults.logprob_token_ids.empty(), "requested logprobs are opt-in");
+    auto logprobs = parse({"decoder", "m", "1", "--generate", "3", "--logprob-token", "0", "--logprob-token", "15", "--logprob-token", "0"});
+    expect(logprobs.logprob_token_ids == std::vector<std::uint32_t>({0,15,0}) && !logprobs.any_low_level_flag,
+        "requested ID order/duplicates survive without disabling automatic profile");
+    validate_resolved_requested_logprobs(logprobs,16);
+    for (unsigned mutation = 0; mutation < 9U; ++mutation) {
+        auto bad = logprobs;
+        if (mutation == 0) bad.generate_tokens = 0;
+        if (mutation == 1) bad.gpu_greedy_token = true;
+        if (mutation == 2) bad.known_prefix_window = true;
+        if (mutation == 3) bad.prompt_lookup = true;
+        if (mutation == 4) bad.serving_prefix_files.push_back("source-only-prefix");
+        if (mutation == 5) bad.prefix_cache_roundtrip = true;
+        if (mutation == 6) bad.raw_recording_path = "source-only-raw";
+        if (mutation == 7) bad.reference_path = "source-only-reference";
+        if (mutation == 8) bad.generate_tokens = 0;
+        rejects([&] { validate_resolved_requested_logprobs(bad,16); },
+            "requested logprobs require serial full-output generation without scalar, window, lookup, serving, cache, RAW or reference modes");
+    }
+    { auto bad = logprobs; bad.logprob_token_ids.push_back(16);
+      rejects([&] { validate_resolved_requested_logprobs(bad,16); }, "requested logprob token exceeds model vocabulary"); }
+    { auto bad = logprobs; bad.logprob_token_ids.resize(65U);
+      rejects([&] { validate_resolved_requested_logprobs(bad,16); }, "requested logprob receipt exceeds bounded row/value capacity"); }
+    { auto bad = logprobs; bad.context_tokens = 262145;
+      rejects([&] { validate_resolved_requested_logprobs(bad,16); }, "requested logprob receipt exceeds bounded row/value capacity"); }
+    { auto accepted = logprobs; accepted.logprob_token_ids.assign(64U,0);accepted.context_tokens=16384;
+      accepted.prepared_eager=true;accepted.moe_shared_overlap=true;
+      validate_resolved_requested_logprobs(accepted,16);
+      ++accepted.context_tokens;
+      rejects([&] { validate_resolved_requested_logprobs(accepted,16); }, "requested logprob receipt exceeds bounded row/value capacity"); }
+    rejects([] { (void)parse({"decoder", "m", "1", "--logprob-token", "4294967296"}); }, "logprob token exceeds uint32");
     expect(defaults.ple_cpu_helper_threads == 0 && !defaults.ple_cpu_helper_threads_explicit,
         "PLE helper budget default retains legacy backend behavior");
     validate_resolved_ple_cpu_helpers(defaults);

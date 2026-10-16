@@ -176,6 +176,7 @@ struct Options {
     bool known_prefix_rows_explicit = false;
     std::uint32_t ple_cpu_helper_threads = 0;
     bool ple_cpu_helper_threads_explicit = false;
+    std::vector<std::uint32_t> logprob_token_ids;
 };
 
 inline bool is_low_level_optimization_option(std::string_view argument) {
@@ -239,6 +240,21 @@ inline void validate_resolved_ple_cpu_helpers(const Options& options) {
         throw std::invalid_argument("PLE CPU helper threads must be 1 through 8 when explicit");
     if (options.ple_cpu_helper_threads && !options.planned_ple_io)
         throw std::invalid_argument("PLE CPU helper threads require resolved planned PLE I/O");
+}
+
+inline void validate_resolved_requested_logprobs(const Options& options, std::uint64_t vocabulary) {
+    if (options.logprob_token_ids.empty()) return;
+    if (!options.generate_tokens || options.gpu_greedy_token || options.known_prefix_window || options.prompt_lookup ||
+        !options.serving_prefix_files.empty() || options.prefix_cache_roundtrip ||
+        !options.raw_recording_path.empty() || !options.reference_path.empty())
+        throw std::invalid_argument("requested logprobs require serial full-output generation without scalar, window, lookup, serving, cache, RAW or reference modes");
+    if (!vocabulary || vocabulary > std::numeric_limits<std::uint32_t>::max())
+        throw std::invalid_argument("requested logprobs require a uint32 vocabulary");
+    if (options.logprob_token_ids.size() > 64U || options.context_tokens > 262144U ||
+        options.context_tokens > 1048576U / options.logprob_token_ids.size())
+        throw std::invalid_argument("requested logprob receipt exceeds bounded row/value capacity");
+    for (const auto id : options.logprob_token_ids)
+        if (id >= vocabulary) throw std::invalid_argument("requested logprob token exceeds model vocabulary");
 }
 
 inline void validate_resolved_known_prefix_window(const Options& options) {
@@ -350,7 +366,7 @@ inline Options parse_options(
         throw std::invalid_argument(
             "usage: strix-hip-decode-token MODEL.gguf [TOKEN_ID ...] "
             "[--optimization-profile auto|manual] [--execution-inventory] [--host-dispatch-telemetry] [--execution-telemetry-trace] "
-            "[--gpu-greedy-token] [--gdn-recurrent-layout baseline|stride32|stride33|transposed] [--gdn-recurrent-storage key-value|value-key] [--known-prefix-window --known-prefix-rows 2|4|8] [--prompt-lookup] [--prompt-lookup-depth 0|1|2] [--serve-prefix-u32le FILE ... --serve-concurrency 1|2|4 --serve-memory-budget-bytes N --serve-request-budget-bytes N --serve-headroom-bytes N] [--gdn-islands] [--qsa-hierarchical-selection] [--qsa-gqa-heads-per-block 1|2|4] [--prepared-eager] [--moe-shared-overlap] [--moe-overlap-arena-budget-bytes N] [--batched-moe-activation] [--validation-final-state DIR] [--validation-final-state-max-bytes N] [--reference FILE] [--max-logit-error X] "
+            "[--gpu-greedy-token] [--logprob-token ID ...] [--gdn-recurrent-layout baseline|stride32|stride33|transposed] [--gdn-recurrent-storage key-value|value-key] [--known-prefix-window --known-prefix-rows 2|4|8] [--prompt-lookup] [--prompt-lookup-depth 0|1|2] [--serve-prefix-u32le FILE ... --serve-concurrency 1|2|4 --serve-memory-budget-bytes N --serve-request-budget-bytes N --serve-headroom-bytes N] [--gdn-islands] [--qsa-hierarchical-selection] [--qsa-gqa-heads-per-block 1|2|4] [--prepared-eager] [--moe-shared-overlap] [--moe-overlap-arena-budget-bytes N] [--batched-moe-activation] [--validation-final-state DIR] [--validation-final-state-max-bytes N] [--reference FILE] [--max-logit-error X] "
             "[--context N] [--residency register|copy] [--coalesce-gap BYTES] "
             "[--planned-ple-io] [--ple-cpu-helper-threads 1..8] [--ple-max-rows-per-io N] [--ple-max-inflight-ios N] "
             "[--generate N] [--eos-token TOKEN_ID] [--prefix-cache-roundtrip] "
@@ -424,6 +440,14 @@ inline Options parse_options(
             if (value > 2) throw std::invalid_argument("prompt lookup depth must be zero, one or two");
             options.prompt_lookup_depth = static_cast<std::uint32_t>(value);
             options.prompt_lookup_depth_explicit = true;
+            continue;
+        }
+        if (argument == "--logprob-token") {
+            if (index + 1 >= argc) throw std::invalid_argument("logprob token requires an ID");
+            if (options.logprob_token_ids.size() == 64U) throw std::invalid_argument("requested logprob ID list exceeds 64 entries");
+            const auto id = parse_u64(argv[++index], "logprob token");
+            if (id > std::numeric_limits<std::uint32_t>::max()) throw std::invalid_argument("logprob token exceeds uint32");
+            options.logprob_token_ids.push_back(static_cast<std::uint32_t>(id));
             continue;
         }
         if (argument == "--known-prefix-rows" || argument.starts_with("--known-prefix-rows=")) {

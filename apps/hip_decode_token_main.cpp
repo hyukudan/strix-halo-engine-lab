@@ -15,6 +15,7 @@
 #include "strix/hip_serving_greedy_backend.hpp"
 #include "strix/greedy_serving_scheduler.hpp"
 #include "strix/known_prompt_chunks.hpp"
+#include "strix/generation_output.hpp"
 #include "strix/hip_model_residency.hpp"
 #include "strix/hip_runtime_allocator.hpp"
 #include "strix/hip_session_snapshot_transfer.hpp"
@@ -576,6 +577,51 @@ private:
     void* status_ = nullptr;
 };
 
+// Presentation-only consumer. One target call per consumed input, with the
+// denominator over every finite vocabulary logit. The ledger is bounded before
+// inference and does not reinterpret requested IDs as a sampling support.
+class RequestedLogprobBackend final : public strix::SerialGreedyStepBackend {
+public:
+    struct Row { std::uint32_t input; std::uint64_t position; std::vector<strix::RequestedLogprob> values; };
+    RequestedLogprobBackend(strix::SerialGreedyStepBackend& target, std::span<const std::uint32_t> ids,
+        std::uint64_t vocabulary, std::uint64_t capacity, strix::SerialSessionContext& session,
+        std::shared_ptr<const strix::HipSetupQuiescenceGuard> guard)
+        : target_(target), ids_(ids.begin(), ids.end()), vocabulary_(vocabulary), maximum_rows_(capacity), session_(session), guard_(std::move(guard)) {
+        if (!guard_ || ids_.empty() || ids_.size() > 64U || !capacity || capacity > 262144U || capacity > 1048576U / ids_.size())
+            throw std::invalid_argument("invalid bounded requested logprob ledger");
+        for (const auto id : ids_) if (id >= vocabulary_) throw std::invalid_argument("requested logprob ID is outside vocabulary");
+        rows_.reserve(static_cast<std::size_t>(capacity));
+    }
+    std::vector<float> execute(std::uint32_t token, std::uint64_t position) override {
+        if (rows_.size() == maximum_rows_) throw std::length_error("requested logprob ledger capacity exhausted");
+        const auto committed = session_.committed_tokens;
+        try {
+            const strix::GenerationOutputRequest request{strix::GenerationOutputNeed::full_logits |
+                strix::GenerationOutputNeed::requested_logprobs, token, position, vocabulary_, ids_};
+            auto result = strix::execute_generation_output(request, target_);
+            rows_.push_back({token, position, std::move(result.requested_logprobs)});
+            return std::move(result.logits);
+        } catch (...) {
+            if (session_.committed_tokens != committed) {
+                session_.health = strix::SerialSessionHealth::poisoned;
+                session_.arithmetic_lineage.tainted = true;
+            }
+            guard_->recover_or_fail_stop();
+            throw;
+        }
+    }
+    void execute_state(std::uint32_t token, std::uint64_t position) override { target_.execute_state(token, position); }
+    const std::vector<Row>& rows() const noexcept { return rows_; }
+private:
+    strix::SerialGreedyStepBackend& target_;
+    std::vector<std::uint32_t> ids_;
+    std::uint64_t vocabulary_;
+    std::uint64_t maximum_rows_;
+    strix::SerialSessionContext& session_;
+    std::shared_ptr<const strix::HipSetupQuiescenceGuard> guard_;
+    std::vector<Row> rows_;
+};
+
 class ObservedServingBackend final : public strix::SerialGreedyStepBackend {
 public:
     ObservedServingBackend(std::unique_ptr<strix::SerialGreedyStepBackend> backend,
@@ -836,6 +882,7 @@ int main(
     strix::decode_cli::validate_resolved_prompt_lookup(options);
     strix::decode_cli::validate_resolved_serving(options);
     strix::decode_cli::validate_resolved_ple_cpu_helpers(options);
+    strix::decode_cli::validate_resolved_requested_logprobs(options, model.vocab_size);
     if (options.batched_moe_activation && !options.q4k_a8g32_gate_up)
         throw std::invalid_argument("batched MoE activation requires resolved Q4K A8 gate/up execution");
     if (options.moe_shared_overlap && !options.deferred_moe_status)
@@ -2117,6 +2164,10 @@ int main(
         request.eos_token_id =
             generation_eos;
 
+        std::unique_ptr<RequestedLogprobBackend> requested_logprobs;
+        if (!options.logprob_token_ids.empty())
+            requested_logprobs = std::make_unique<RequestedLogprobBackend>(backend, options.logprob_token_ids,
+                model.vocab_size, options.context_tokens, session, original_work_device);
         std::optional<strix::CompiledKnownPrefixWindow> known_prefix_plan;
         std::shared_ptr<KnownPromptMemory> known_prefix_memory;
         std::shared_ptr<strix::HipKnownPrefixWindow> known_prefix_owner;
@@ -2226,6 +2277,7 @@ int main(
                     throw;
                 }
             }
+            if (requested_logprobs) return strix::execute_serial_greedy_request(request, *requested_logprobs);
             if (!known_prefix_backend) return options.gpu_greedy_token
                 ? strix::execute_serial_greedy_token_request(request, backend)
                 : strix::execute_serial_greedy_request(request, backend);
@@ -2300,6 +2352,26 @@ int main(
                 << "  \"prompt_lookup_full_logits_d2h_bytes\":0,\n"
                 << "  \"prompt_lookup_serial_status_execution_identity\":" << known_prefix_memory->serial_scope.deferred_moe_status.execution_identity << ",\n"
                 << "  \"prompt_lookup_window_status_execution_identity\":" << known_prefix_memory->scope.deferred_moe_status.execution_identity << ",\n";
+        }
+        if (requested_logprobs) {
+            const auto previous_precision = std::cout.precision(17);
+            std::cout << "  \"requested_logprobs_scope\":\"next-token-full-vocabulary-distribution-after-each-consumed-input\",\n"
+                      << "  \"requested_logprobs_denominator\":\"full-vocabulary-fp64-logsumexp-ascending-id\",\n"
+                      << "  \"requested_logprobs_qualification\":\"not_assessed\",\n"
+                      << "  \"requested_logprobs_rows\":[";
+            bool first = true;
+            for (const auto& row : requested_logprobs->rows()) {
+                if (!first) std::cout << ',';
+                first = false;
+                std::cout << "{\"input_token\":" << row.input << ",\"position\":" << row.position << ",\"values\":[";
+                for (std::size_t i = 0; i < row.values.size(); ++i) {
+                    if (i) std::cout << ',';
+                    std::cout << "{\"token_id\":" << row.values[i].token_id << ",\"log_probability\":" << row.values[i].log_probability << '}';
+                }
+                std::cout << "]}";
+            }
+            std::cout << "],\n";
+            std::cout.precision(previous_precision);
         }
         if (known_prefix_result) {
             const auto observed = known_prefix_backend->stats();
