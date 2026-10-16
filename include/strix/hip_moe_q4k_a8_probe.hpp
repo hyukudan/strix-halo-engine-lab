@@ -9,6 +9,11 @@ inline constexpr unsigned invalid_route = 1U, nonfinite_activation = 2U, invalid
 // After an enqueue exception, every writable view is indeterminate even if status is0.
 // Read-only data stays immutable; mutable views/status have exclusive stream ownership.
 void enqueue_probe(const Request&, const Bindings&, hipStream_t stream = nullptr);
+// Standalone diagnostic only. Same validation, quantizer, status and output
+// contract; one CTA stages activations once for independent gate/up sums.
+// Finite scope only; nonfinite projection payload/sign is not qualified.
+inline constexpr std::string_view shared_gate_up_staging_marker = "a8-shared-gateup-staging-v1";
+void enqueue_probe_shared_gate_up(const Request&, const Bindings&, hipStream_t stream = nullptr);
 // Test-only rounded division receipt; count outputs, caller-owned storage.
 void enqueue_division_probe(const std::uint32_t* a,const std::uint32_t* b,
     std::uint32_t* output,unsigned count,hipStream_t stream = nullptr);

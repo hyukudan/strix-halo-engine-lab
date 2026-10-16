@@ -1,6 +1,7 @@
 #include "strix/hip_moe_q4k_a8_probe.hpp"
 #include "strix/hip_setup_quiescence.hpp"
 #include "q4k_a8_oracle.hpp"
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cmath>
@@ -13,6 +14,9 @@
 extern "C" __global__ void strix_q4k_a8_native_dot4_compile_probe(const int*,const unsigned*,int*);
 using namespace strix::moe_q4k_a8;
 namespace {
+using Enqueue = void (*)(const Request&, const Bindings&, hipStream_t);
+std::array<bool, 11> arithmetic_mutants{};
+std::array<bool, 7> shared_mutants{};
 void expect(bool value,const char* message) {if(!value) throw std::runtime_error(message);}
 void check(hipError_t error) {if(error!=hipSuccess) throw std::runtime_error(hipGetErrorString(error));}
 struct Buffer {
@@ -26,6 +30,11 @@ struct Buffer {
     template<class T> std::vector<T> read() const {
         std::vector<T> out(bytes/sizeof(T));
         quiescence.run([&]{check(hipMemcpy(out.data(),data(),bytes,hipMemcpyDeviceToHost));});return out;
+    }
+    std::vector<unsigned char> read_owner() const {
+        std::vector<unsigned char> result(bytes+32U);
+        quiescence.run([&]{check(hipMemcpy(result.data(),owner,result.size(),hipMemcpyDeviceToHost));});
+        return result;
     }
     void poison(hipStream_t stream=nullptr) {check(hipMemsetAsync(owner,0xa5,bytes+32U,stream));}
     void guards(unsigned char pattern=0xa5) const {
@@ -94,10 +103,60 @@ void conversion_receipts(const strix::HipSetupQuiescenceGuard& guard) {
     for(unsigned i=0;i<a.size();++i) expect(divided[i]==q4k_a8_oracle::divide(a[i],b[i]),"compiler RN division independent integer oracle");
     result.guards();
 }
-void projection_case(unsigned hidden,unsigned rows,unsigned top_k,bool bf16,unsigned special,const strix::HipSetupQuiescenceGuard& guard) {
+void fixture_power(unsigned hidden,unsigned rows,unsigned experts,unsigned special,
+    const QuantizedRow& quant,const std::vector<std::byte>& gate,const std::vector<std::byte>& up) {
+    if(special!=0U && special!=8U) return;
+    const auto pending=[&] {
+        if(special==8U) return !arithmetic_mutants[10];
+        return std::any_of(arithmetic_mutants.begin()+1,arithmetic_mutants.begin()+10,[](bool v){return !v;}) ||
+            std::any_of(shared_mutants.begin(),shared_mutants.end(),[](bool v){return !v;});
+    };
+    if(!pending()) return;
+    const auto row_bytes=static_cast<std::size_t>(hidden/256U)*144U;
+    const auto packed=[&](const auto& weights,unsigned expert,unsigned row) {
+        return std::span<const std::byte>(weights).subspan((static_cast<std::size_t>(expert)*rows+row)*row_bytes,row_bytes);
+    };
+    for(unsigned expert=0;expert<experts && pending();++expert) for(unsigned row=0;row<rows && pending();++row) {
+        const auto g=packed(gate,expert,row),u=packed(up,expert,row);
+        const float gv=q4k_a8_oracle::row(g,quant),uv=q4k_a8_oracle::row(u,quant);
+        const auto differs=[](float a,float b){return std::bit_cast<unsigned>(a)!=std::bit_cast<unsigned>(b);};
+        for(unsigned m=1;m<arithmetic_mutants.size();++m) {
+            if(arithmetic_mutants[m] || (special==8U && m!=10U) || (special==0U && m==10U)) continue;
+            try { arithmetic_mutants[m]=differs(uv,q4k_a8_oracle::row(u,quant,static_cast<q4k_a8_oracle::Mutation>(m))); }
+            catch(const std::invalid_argument&) {} // A nonfinite mutant is outside the finite power witness.
+        }
+        if(special==8U) continue;
+        shared_mutants[0]|=differs(gv,uv); // Swapped gate/up output addresses.
+        shared_mutants[4]|=differs(uv,gv); // Gate base pointer incorrectly used for up.
+        std::vector<std::byte> wrong_header(u.begin(),u.end()),wrong_q(u.begin(),u.end());
+        for(std::size_t b=0;b<hidden/256U;++b) {
+            std::copy_n(g.begin()+static_cast<std::ptrdiff_t>(b*144U),16,wrong_header.begin()+static_cast<std::ptrdiff_t>(b*144U));
+            std::copy_n(g.begin()+static_cast<std::ptrdiff_t>(b*144U+16U),128,wrong_q.begin()+static_cast<std::ptrdiff_t>(b*144U+16U));
+        }
+        shared_mutants[1]|=differs(uv,q4k_a8_oracle::row(wrong_header,quant));
+        shared_mutants[2]|=differs(uv,q4k_a8_oracle::row(wrong_q,quant));
+        // Model a single per-lane accumulator receiving gate then up for each
+        // original block. Repeating the activation block keeps its metadata
+        // associated with the corresponding interleaved weight block.
+        std::vector<std::byte> combined;combined.reserve(row_bytes*2U);
+        QuantizedRow repeated;
+        for(std::size_t b=0;b<hidden/256U;++b) for(const auto w:{g,u}) {
+            combined.insert(combined.end(),w.begin()+static_cast<std::ptrdiff_t>(b*144U),w.begin()+static_cast<std::ptrdiff_t>((b+1U)*144U));
+            repeated.codes.insert(repeated.codes.end(),quant.codes.begin()+static_cast<std::ptrdiff_t>(b*256U),quant.codes.begin()+static_cast<std::ptrdiff_t>((b+1U)*256U));
+            repeated.deltas.insert(repeated.deltas.end(),quant.deltas.begin()+static_cast<std::ptrdiff_t>(b*8U),quant.deltas.begin()+static_cast<std::ptrdiff_t>((b+1U)*8U));
+            repeated.sums.insert(repeated.sums.end(),quant.sums.begin()+static_cast<std::ptrdiff_t>(b*8U),quant.sums.begin()+static_cast<std::ptrdiff_t>((b+1U)*8U));
+        }
+        shared_mutants[3]|=differs(uv,q4k_a8_oracle::row(combined,repeated));
+        shared_mutants[5]|=differs(uv,q4k_a8_oracle::row(packed(up,expert,(row+1U)%rows),quant));
+        shared_mutants[6]|=differs(uv,q4k_a8_oracle::row(packed(up,(expert+1U)%experts,row),quant));
+    }
+}
+void projection_case(unsigned hidden,unsigned rows,unsigned top_k,bool bf16,unsigned special,const strix::HipSetupQuiescenceGuard& guard,
+    Enqueue enqueue) {
     Request req;req.enabled=true;req.approved_numerical_identity=numerical_identity;
-    req.input=bf16?InputKind::bf16:InputKind::fp32;req.shape={hidden,rows,2,top_k,1};
-    const std::size_t wb=2ULL*rows*(hidden/256U)*144U;
+    const unsigned experts=std::max(top_k,3U);
+    req.input=bf16?InputKind::bf16:InputKind::fp32;req.shape={hidden,rows,experts,top_k,1};
+    const std::size_t wb=static_cast<std::size_t>(experts)*rows*(hidden/256U)*144U;
     Buffer input(hidden*(bf16?2U:4U),guard),gate(wb,guard),up(wb,guard),routes(top_k*4U,guard),codes(hidden,guard),deltas(hidden/8U,guard),sums(hidden/8U,guard),status(4,guard),out(top_k*2U*rows*4U,guard);
     Bindings bind{input.view(),gate.view(),up.view(),routes.view(),codes.view(),deltas.view(),sums.view(),status.view(),out.view()};
     std::mt19937 random(0x314159U+hidden+rows+top_k+special);
@@ -125,6 +184,10 @@ void projection_case(unsigned hidden,unsigned rows,unsigned top_k,bool bf16,unsi
     for(auto* w:{&gw,&uw}) {
         for(auto& value:*w) value=static_cast<std::byte>(random()&255U);
         for(std::size_t block=0;block<wb/144U;++block) {
+            // An odd multiplier makes each expert/row/block code stamp
+            // distinct within each projection; gate/up use different offsets.
+            const unsigned stamp=static_cast<unsigned>(block)*0x9e3779b9U+(w==&gw?0x13579bdfU:0x2468ace0U);
+            for(unsigned byte=0;byte<4;++byte) (*w)[block*144U+16U+byte]=static_cast<std::byte>((stamp>>(8U*byte))&255U);
             const std::array<unsigned,10> headers{0,0x8000,1,0x8001,0x03ff,0x83ff,0x3c00,0xbc00,0x7bff,0xfbff};
             const unsigned d=special==6?0x7e01U:special==8?0xbc00U:headers[random()%headers.size()];
             const unsigned dm=special==8?0U:headers[random()%headers.size()];
@@ -132,9 +195,35 @@ void projection_case(unsigned hidden,unsigned rows,unsigned top_k,bool bf16,unsi
             (*w)[block*144U+2U]=static_cast<std::byte>(dm&255U);(*w)[block*144U+3U]=static_cast<std::byte>(dm>>8U);
         }
     }
-    for(unsigned i=0;i<top_k;++i) rt[i]=i&1U;
+    if(special>=9U) {
+        auto& weights=(special==9U || special==11U)?uw:gw;
+        const auto offset=(static_cast<std::size_t>(experts-1U)*rows+rows-1U)*(hidden/256U)*144U;
+        const unsigned scale=(special==9U || special==12U)?0x7e21U:0x7c00U;
+        weights[offset]=static_cast<std::byte>(scale&255U);weights[offset+1U]=static_cast<std::byte>(scale>>8U);
+    }
+    fixture_power(hidden,rows,experts,special,quant,gw,uw);
+    for(unsigned i=0;i<top_k;++i) rt[i]=i%3U==0U?experts-1U:experts-1U-(i%experts);
     const auto poison=[&]{status.poison();for(auto* b:{&codes,&deltas,&sums,&out}) b->poison();check(hipMemsetAsync(status.data(),0,4));};
-    guard.run([&]{check(hipMemsetAsync(input.owner,0xff,input.bytes+32U));check(hipMemsetAsync(gate.owner,0xff,gate.bytes+32U));check(hipMemsetAsync(up.owner,0xff,up.bytes+32U));check(hipMemsetAsync(routes.owner,0xff,routes.bytes+32U));input.upload(bf16?static_cast<const void*>(bx.data()):static_cast<const void*>(x.data()));gate.upload(gw.data());up.upload(uw.data());routes.upload(rt.data());poison();enqueue_probe(req,bind);});
+    guard.run([&]{check(hipMemsetAsync(input.owner,0xff,input.bytes+32U));check(hipMemsetAsync(gate.owner,0xff,gate.bytes+32U));check(hipMemsetAsync(up.owner,0xff,up.bytes+32U));check(hipMemsetAsync(routes.owner,0xff,routes.bytes+32U));input.upload(bf16?static_cast<const void*>(bx.data()):static_cast<const void*>(x.data()));gate.upload(gw.data());up.upload(uw.data());routes.upload(rt.data());poison();enqueue(req,bind,nullptr);});
+    if(enqueue==&enqueue_probe_shared_gate_up) {
+        const auto selected=std::array{codes.read_owner(),deltas.read_owner(),sums.read_owner(),status.read_owner(),out.read_owner()};
+        guard.run([&]{poison();enqueue_probe(req,bind);});
+        const auto reference=std::array{codes.read_owner(),deltas.read_owner(),sums.read_owner(),status.read_owner(),out.read_owner()};
+        for(unsigned view=0;view<selected.size();++view) {
+            if(view!=4U || (special!=4U && special!=6U && special<9U))
+                expect(selected[view]==reference[view],"shared staging differs from incumbent complete owner bytes");
+            else {
+                expect(std::equal(selected[view].begin(),selected[view].begin()+16,reference[view].begin()) &&
+                    std::equal(selected[view].end()-16,selected[view].end(),reference[view].end()-16),"shared staging output guard differs");
+                for(std::size_t at=16;at<selected[view].size()-16;at+=4) {
+                    unsigned a=0,b=0;std::memcpy(&a,selected[view].data()+at,4);std::memcpy(&b,reference[view].data()+at,4);
+                    expect(a==b || (std::isnan(std::bit_cast<float>(a)) && std::isnan(std::bit_cast<float>(b))),
+                        "unqualified projection differs beyond NaN payload/sign");
+                }
+            }
+        }
+        guard.run([&]{poison();enqueue(req,bind,nullptr);});
+    }
     const auto guards=[&]{status.guards();input.guards(0xff);gate.guards(0xff);up.guards(0xff);routes.guards(0xff);};
     const auto verify=[&] {
         expect(status.read<unsigned>()[0]==0,"valid probe status");
@@ -156,7 +245,7 @@ void projection_case(unsigned hidden,unsigned rows,unsigned top_k,bool bf16,unsi
         const unsigned expected=top_k*2U*rows;
         expect(qualified+unqualified==expected,"finite-scope accounting incomplete");
         if(special==6) expect(qualified==0 && unqualified==expected,"NaN-header scope must be wholly unqualified");
-        else if(special==4) expect(qualified>0 && unqualified>0,"FLT_MAX activation overflow control must be exercised");
+        else if(special==4 || special>=9U) expect(qualified>0 && unqualified>0,"partial nonfinite projection control must be exercised");
         else expect(unqualified==0 && qualified==expected,"finite oracle unexpectedly skipped GPU equality checks");
         guards();
         if(unqualified) {std::cout<<"unqualified_output_bits";for(auto bits:values) std::cout<<' '<<bits;std::cout<<'\n';}
@@ -167,7 +256,7 @@ void projection_case(unsigned hidden,unsigned rows,unsigned top_k,bool bf16,unsi
     hipStream_t stream{};hipGraph_t graph{};hipGraphExec_t executable{};
     check(hipStreamCreate(&stream));
     try {
-        guard.run([&]{check(hipStreamBeginCapture(stream,hipStreamCaptureModeGlobal));enqueue_probe(req,bind,stream);check(hipStreamEndCapture(stream,&graph));});
+        guard.run([&]{check(hipStreamBeginCapture(stream,hipStreamCaptureModeGlobal));enqueue(req,bind,stream);check(hipStreamEndCapture(stream,&graph));});
         check(hipGraphInstantiate(&executable,graph,nullptr,nullptr,0));
         for(unsigned replay=0;replay<3;++replay) {guard.run([&]{
             for(auto* b:{&codes,&deltas,&sums,&out}) b->poison(stream);
@@ -176,7 +265,7 @@ void projection_case(unsigned hidden,unsigned rows,unsigned top_k,bool bf16,unsi
             check(hipMemsetAsync(status.data(),0x40,4,stream));check(hipGraphLaunch(executable,stream));});
         for(auto* b:{&codes,&deltas,&sums,&out}) b->unchanged();
         expect(status.read<unsigned>()[0]==0x40404040U,"captured sticky status was evaluated at capture time");guards();
-        const unsigned invalid=2;
+        const unsigned invalid=experts;
         guard.run([&]{check(hipMemcpyAsync(routes.data(),&invalid,4,hipMemcpyHostToDevice,stream));
             for(auto* b:{&codes,&deltas,&sums,&out}) b->poison(stream);
             check(hipMemsetAsync(status.data(),0,4,stream));check(hipGraphLaunch(executable,stream));});
@@ -188,10 +277,10 @@ void projection_case(unsigned hidden,unsigned rows,unsigned top_k,bool bf16,unsi
         const auto old_stream=stream;stream=nullptr;check(hipStreamDestroy(old_stream));
     } catch(...) {guard.recover_or_fail_stop();if(executable) (void)hipGraphExecDestroy(executable);if(graph) (void)hipGraphDestroy(graph);if(stream) (void)hipStreamDestroy(stream);throw;}
     // Caller sticky status is never reset by the API; writes remain poison.
-    guard.run([&]{poison();check(hipMemsetAsync(status.data(),0x40,4));enqueue_probe(req,bind);});
+    guard.run([&]{poison();check(hipMemsetAsync(status.data(),0x40,4));enqueue(req,bind,nullptr);});
     for(auto* b:{&codes,&deltas,&sums,&out}) b->unchanged();expect(status.read<unsigned>()[0]==0x40404040U,"sticky status reset");guards();
     // Full route validation precedes any activation/output publication.
-    rt.back()=2;guard.run([&]{routes.upload(rt.data());poison();enqueue_probe(req,bind);});
+    rt.back()=experts;guard.run([&]{routes.upload(rt.data());poison();enqueue(req,bind,nullptr);});
     expect(status.read<unsigned>()[0]==invalid_route,"invalid route status");for(auto* b:{&codes,&deltas,&sums,&out}) b->unchanged();guards();
     rt.back()=0;guard.run([&]{routes.upload(rt.data());});
     // Invalid activation in LAST group must leave every external workspace/output unchanged.
@@ -199,7 +288,7 @@ void projection_case(unsigned hidden,unsigned rows,unsigned top_k,bool bf16,unsi
         if(error==0) {x.back()=std::numeric_limits<float>::quiet_NaN();bx.back()=0x7fc1U;}
         else if(error==1) {for(auto& value:x)value=std::bit_cast<float>(1U);if(bf16) continue;}
         else {for(auto& value:x) value=1.0F;for(auto& value:bx) value=0x3f80U;x.back()=error==2?std::numeric_limits<float>::infinity():-std::numeric_limits<float>::infinity();bx.back()=error==2?0x7f80U:0xff80U;}
-        guard.run([&]{input.upload(bf16?static_cast<const void*>(bx.data()):static_cast<const void*>(x.data()));poison();enqueue_probe(req,bind);});
+        guard.run([&]{input.upload(bf16?static_cast<const void*>(bx.data()):static_cast<const void*>(x.data()));poison();enqueue(req,bind,nullptr);});
         expect(status.read<unsigned>()[0]==(error==1?invalid_delta:nonfinite_activation),"invalid activation status");
         for(auto* b:{&codes,&deltas,&sums,&out}) b->unchanged();guards();
     }
@@ -207,7 +296,7 @@ void projection_case(unsigned hidden,unsigned rows,unsigned top_k,bool bf16,unsi
     for(unsigned bad=0;bad<3;++bad) {
         guard.run([&]{poison();});auto q=req;auto b=bind;
         if(bad==0) q.enabled=false;if(bad==1) q.gate_type=13;if(bad==2) b.output.bytes-=4;
-        bool rejected=false;try{enqueue_probe(q,b);}catch(const std::invalid_argument&){rejected=true;}
+        bool rejected=false;try{enqueue(q,b,nullptr);}catch(const std::invalid_argument&){rejected=true;}
         expect(rejected,"host rejection missing");for(auto* buffer:{&codes,&deltas,&sums,&out}) buffer->unchanged();expect(status.read<unsigned>()[0]==0,"host rejection changed status");
     }
 }
@@ -216,12 +305,21 @@ int main() try {
     strix::HipSetupQuiescenceGuard guard;
     expect(guard.architecture().starts_with("gfx1151"),"real gfx1151 required");require_f32_environment();
     dot_receipt(guard);conversion_receipts(guard);
-    for(bool bf16:{false,true}) for(unsigned hidden:{256U,512U,2560U}) projection_case(hidden,32,2,bf16,0,guard);
-    projection_case(2560,640,10,true,0,guard);
-    projection_case(256,32,1,false,1,guard);projection_case(256,32,1,false,2,guard);
-    projection_case(256,32,1,false,8,guard);
-    projection_case(2560,32,1,false,7,guard);
-    projection_case(256,32,1,false,5,guard);projection_case(256,32,1,false,6,guard);
-    projection_case(256,32,1,true,3,guard);projection_case(256,32,1,false,4,guard);
+    for(const Enqueue enqueue:{&enqueue_probe,&enqueue_probe_shared_gate_up}) {
+        for(bool bf16:{false,true}) for(unsigned hidden:{256U,512U,2560U})
+            for(unsigned rows:{32U,64U,640U}) for(unsigned top_k:{1U,2U,10U})
+                projection_case(hidden,rows,top_k,bf16,0,guard,enqueue);
+        projection_case(256,32,1,false,1,guard,enqueue);projection_case(256,32,1,false,2,guard,enqueue);
+        projection_case(256,32,1,false,8,guard,enqueue);
+        projection_case(2560,32,1,false,7,guard,enqueue);
+        projection_case(256,32,1,false,5,guard,enqueue);projection_case(256,32,1,false,6,guard,enqueue);
+        projection_case(256,32,1,true,3,guard,enqueue);projection_case(256,32,1,false,4,guard,enqueue);
+        // Nonfinite header in exactly one projection/expert/row. The peer
+        // projection remains covered by finite independent-oracle equality.
+        for(unsigned special:{9U,10U,11U,12U}) projection_case(512,64,2,true,special,guard,enqueue);
+    }
+    for(unsigned m=1;m<arithmetic_mutants.size();++m)
+        expect(arithmetic_mutants[m],"existing arithmetic mutation lacks a finite distinguishing fixture");
+    for(bool powered:shared_mutants) expect(powered,"shared gate/up routing/header/accumulator mutation lacks a fixture");
     std::cout<<"Standalone Q4K A8G32 GPU probe PASS; intentionally quantized, no legacy equality/full-model/performance claim\n";
 } catch(const std::exception& error) {std::cerr<<error.what()<<'\n';return 1;}
