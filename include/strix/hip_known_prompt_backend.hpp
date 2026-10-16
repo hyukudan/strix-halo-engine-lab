@@ -1,6 +1,7 @@
 #pragma once
 
 #include "strix/execution_memory.hpp"
+#include "strix/compiled_speculative_verify.hpp"
 #include "strix/serial_request.hpp"
 
 #include <array>
@@ -22,7 +23,7 @@ struct HipKnownPromptBackendStats {
     std::uint64_t row_loop_dispatches = 0;
     std::uint64_t logical_projection_weight_bytes_avoided = 0;
     std::uint64_t projection_launches_saved = 0;
-    std::array<std::uint64_t,4> r2_variant_dispatches{};
+    std::array<std::uint64_t, known_window_r2_variant_slots> r2_variant_dispatches{};
     bool saturated = false;
 };
 
