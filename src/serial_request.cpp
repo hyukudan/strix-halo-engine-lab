@@ -289,6 +289,13 @@ std::uint32_t SerialGreedyStepBackend::execute_greedy(
     return select_greedy_token(execute(input_token, position), vocab_size);
 }
 
+std::vector<float> KnownPromptWindowBackend::execute_rows(
+    std::span<const std::uint32_t> tokens, std::uint64_t position) {
+    if (logical_rows() != 2 || tokens.size() != 2)
+        throw std::invalid_argument("known-prompt compatibility backend requires exactly two rows");
+    return execute_window({tokens[0], tokens[1]}, position);
+}
+
 void SerialGreedyStepBackend::execute_state(std::uint32_t input_token, std::uint64_t position) {
     const auto logits = execute(input_token, position);
     // A generic full-output backend still produced these values. Validate its

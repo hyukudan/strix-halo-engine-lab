@@ -1011,6 +1011,79 @@ void project_wave8_q8_fp32_to_bf16_rows2_kernel(
     }
 }
 
+// New wide-window entry; the original R1/R2 definitions above remain intact.
+template <unsigned Rows> struct GdnWidePointers {
+    const void* input[Rows];
+    void* output[Rows];
+};
+template <unsigned Rows, bool Bf16Input>
+__global__ __launch_bounds__(256)
+void project_wave8_q8_wide_kernel(GdnWidePointers<Rows> views, const void* weights,
+    std::uint32_t width, std::uint32_t outputs) {
+    static_assert(Rows == 4U || Rows == 8U);
+    const auto lane = static_cast<std::uint32_t>(threadIdx.x) % 32U;
+    const auto out = static_cast<std::uint32_t>(blockIdx.x) * 8U + static_cast<std::uint32_t>(threadIdx.x) / 32U;
+    if (out >= outputs) return;
+    float partial[Rows][8]{};
+    const auto* blocks = static_cast<const Q8Block*>(weights) +
+        static_cast<std::uint64_t>(out) * (width / 32U);
+    for (std::uint64_t chunk = 0; chunk < width; chunk += 256U) {
+        const auto base = chunk + 8U * lane;
+        if (base < width) {
+            const auto& block = blocks[base / 32U];
+            std::int8_t codes[8];
+#pragma unroll
+            for (unsigned local = 0; local < 8U; ++local)
+                codes[local] = block.values[base % 32U + local];
+            const auto scale = static_cast<unsigned>(__half_as_ushort(block.scale));
+#pragma unroll
+            for (unsigned local = 0; local < 8U; ++local) {
+                const float coefficient = gdn_known_window_q8_coefficient(scale, static_cast<float>(codes[local]));
+#pragma unroll
+                for (unsigned row = 0; row < Rows; ++row) {
+                    if constexpr (Bf16Input) {
+                        const float value = bf16_to_float(static_cast<const std::uint16_t*>(views.input[row])[base + local]);
+                        asm volatile("v_fmac_f32 %0, %1, %2" : "+v"(partial[row][local])
+                                     : "v"(coefficient), "v"(value));
+                    } else {
+                        const float value = static_cast<const float*>(views.input[row])[base + local];
+                        asm volatile("v_fmac_f32 %0, %1, %2" : "+v"(partial[row][local])
+                                     : "v"(value), "v"(coefficient));
+                    }
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (unsigned distance = 16U; distance; distance /= 2U) {
+#pragma unroll
+        for (unsigned row = 0; row < Rows; ++row) {
+#pragma unroll
+            for (unsigned local = 0; local < 8U; ++local) {
+                const float partner = __shfl_down(partial[row][local], distance, 32);
+                if constexpr (Bf16Input) {
+                    if (lane < distance) partial[row][local] = gdn_known_window_tree_add(partial[row][local], partner);
+                } else partial[row][local] = gdn_known_window_tree_add(partial[row][local], partner);
+            }
+        }
+    }
+    if (lane == 0U) {
+#pragma unroll
+        for (unsigned row = 0; row < Rows; ++row) {
+            auto* values = partial[row];
+            values[0] = gdn_known_window_tree_add(values[0], values[4]);
+            values[1] = gdn_known_window_tree_add(values[1], values[5]);
+            values[2] = gdn_known_window_tree_add(values[2], values[6]);
+            values[3] = gdn_known_window_tree_add(values[3], values[7]);
+            values[0] = gdn_known_window_tree_add(values[0], values[2]);
+            values[1] = gdn_known_window_tree_add(values[1], values[3]);
+            const auto result = gdn_known_window_tree_add(values[0], values[1]);
+            if constexpr (Bf16Input) static_cast<float*>(views.output[row])[out] = round_bf16(result);
+            else static_cast<std::uint16_t*>(views.output[row])[out] = float_to_bf16(result);
+        }
+    }
+}
+
 __global__ void conv_update_kernel(
     float* qkv,
     std::uint16_t* conv_state,
@@ -3435,7 +3508,123 @@ void enqueue_gdn_known_window_completion(const std::array<GdnKnownWindowRow, 2>&
     check_hip(hipGetLastError(), "GDN known-window R2 output projection launch");
 }
 
+template <unsigned Rows>
+std::array<GdnKnownWindowRow, Rows> prepare_gdn_wide_rows(
+    std::span<const ExecutionDispatchContext> rows, const HipGdnLauncherConfig& config) {
+    static_assert(Rows == 4U || Rows == 8U);
+    if (rows.size() != Rows) throw std::invalid_argument("GDN wide-window row count differs");
+    std::array<GdnKnownWindowRow, Rows> result{};
+    // Reuse every incumbent deep row/format/state check, without enqueueing.
+    for (unsigned r = 0; r < Rows; r += 2U) {
+        const auto pair = prepare_gdn_known_window_rows(
+            std::span<const ExecutionDispatchContext, 2>(rows.data() + r, 2), config, Format::q8_large_f32_gates);
+        result[r] = pair[0]; result[r + 1U] = pair[1];
+    }
+    const auto& first = rows[0];
+    if (first.position > std::numeric_limits<std::uint64_t>::max() - (Rows - 1U))
+        throw std::invalid_argument("GDN wide-window position overflows");
+    const auto same_state = [](const SessionStateAddress& a, const SessionStateAddress& b) {
+        return a.component == b.component && a.storage == b.storage && a.address == b.address &&
+            a.bytes == b.bytes && a.allocation_generation == b.allocation_generation && a.provisional == b.provisional;
+    };
+    const std::array<TensorPair GdnTensors::*, 9> members{
+        &GdnTensors::qkv, &GdnTensors::z, &GdnTensors::beta, &GdnTensors::alpha, &GdnTensors::conv,
+        &GdnTensors::dt, &GdnTensors::a, &GdnTensors::norm, &GdnTensors::out};
+    std::array<GdnKnownWindowRange, Rows + 9U> readonly{};
+    std::array<GdnKnownWindowRange, 2U * Rows + 2U> writable{};
+    for (unsigned r = 0; r < Rows; ++r) {
+        const auto& context = rows[r];
+        if (context.execution_identity != first.execution_identity || context.step_id != first.step_id ||
+            context.op != first.op || context.layer != first.layer || context.position != first.position + r ||
+            context.reads[0] != first.reads[0] || context.writes[0] != first.writes[0] ||
+            context.temporaries[0] != first.temporaries[0] ||
+            context.resources->scratch != first.resources->scratch ||
+            context.resources->model_manifest != first.resources->model_manifest ||
+            context.resources->model_weights != first.resources->model_weights ||
+            context.resources->tensor_access != first.resources->tensor_access ||
+            context.resources->session_state_layout != first.resources->session_state_layout ||
+            context.resources->session_state_memory != first.resources->session_state_memory ||
+            !same_state(result[r].matrix_state, result[0].matrix_state) ||
+            !same_state(result[r].conv_state, result[0].conv_state))
+            throw std::invalid_argument("GDN wide-window rows do not retain one ordered session binding");
+        readonly[r] = {result[r].input.address, result[r].input.bytes};
+        for (unsigned prior = 0; prior < r; ++prior)
+            require_gdn_known_window_disjoint(readonly[r], readonly[prior]);
+        for (const auto member : members) {
+            const auto& a = result[0].tensors.*member; const auto& b = result[r].tensors.*member;
+            if (a.manifest != b.manifest || a.runtime != b.runtime)
+                throw std::invalid_argument("GDN wide-window projection owners differ between rows");
+        }
+        writable[2U * r] = {result[r].output.address, result[r].output.bytes};
+        writable[2U * r + 1U] = {result[r].temporary.address, result[r].temporary.bytes};
+    }
+    for (unsigned i = 0; i < members.size(); ++i) {
+        const auto& tensor = result[0].tensors.*members[i];
+        readonly[Rows + i] = {tensor.runtime->address, tensor.runtime->bytes};
+    }
+    writable[2U * Rows] = {result[0].matrix_state.address, result[0].matrix_state.bytes};
+    writable[2U * Rows + 1U] = {result[0].conv_state.address, result[0].conv_state.bytes};
+    // Pair admission alone cannot establish disjointness across pair boundaries.
+    for (unsigned i = 0; i < writable.size(); ++i) {
+        for (const auto read : readonly) require_gdn_known_window_disjoint(writable[i], read);
+        for (unsigned j = 0; j < i; ++j) require_gdn_known_window_disjoint(writable[i], writable[j]);
+    }
+    return result;
+}
+
+template <unsigned Rows>
+void enqueue_gdn_wide_rows(const std::array<GdnKnownWindowRow, Rows>& prepared,
+    const HipGdnLauncherConfig& config) {
+    const auto& first = prepared[0];
+    const auto project = [&](const TensorPair& tensor, std::uint32_t outputs, float* Workspace::* target) {
+        GdnWidePointers<Rows> views{};
+        for (unsigned r = 0; r < Rows; ++r) {
+            views.input[r] = reinterpret_cast<const void*>(prepared[r].input.address);
+            views.output[r] = prepared[r].workspace.*target;
+        }
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(project_wave8_q8_wide_kernel<Rows, true>),
+            dim3((outputs + 7U) / 8U), dim3(kProjectionThreads), 0, hip_execution_stream(),
+            views, reinterpret_cast<const void*>(tensor.runtime->address), first.hidden, outputs);
+        check_hip(hipGetLastError(), "GDN wide-window Q8 input projection launch");
+    };
+    project(first.tensors.qkv, first.conv_width, &Workspace::qkv);
+    project(first.tensors.z, first.value_width, &Workspace::z);
+    for (const auto& row : prepared) {
+        const auto* input = reinterpret_cast<const std::uint16_t*>(row.input.address);
+        launch_projection_by_kind(weight_kind(row.tensors.beta.manifest->ggml_type), input,
+            *row.tensors.beta.runtime, row.hidden, row.value_heads, row.workspace.beta,
+            row.projection_mode, hip_execution_stream(), nullptr);
+        launch_projection_by_kind(weight_kind(row.tensors.alpha.manifest->ggml_type), input,
+            *row.tensors.alpha.runtime, row.hidden, row.value_heads, row.workspace.gate,
+            row.projection_mode, hip_execution_stream(), nullptr);
+    }
+    // Preserve every causal state transition and rounding point in row order.
+    for (const auto& row : prepared) launch_gdn_known_window_core(row, config);
+    GdnWidePointers<Rows> views{};
+    for (unsigned r = 0; r < Rows; ++r) {
+        views.input[r] = prepared[r].workspace.core;
+        views.output[r] = reinterpret_cast<void*>(prepared[r].output.address);
+    }
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(project_wave8_q8_wide_kernel<Rows, false>),
+        dim3((first.hidden + 7U) / 8U), dim3(kProjectionThreads), 0, hip_execution_stream(),
+        views, reinterpret_cast<const void*>(first.tensors.out.runtime->address), first.value_width, first.hidden);
+    check_hip(hipGetLastError(), "GDN wide-window Q8 output projection launch");
+}
+
 }  // namespace
+
+void gdn_known_window_rows_preflight(std::span<const ExecutionDispatchContext> rows,
+    const HipGdnLauncherConfig& config) {
+    if (rows.size() == 4U) static_cast<void>(prepare_gdn_wide_rows<4U>(rows, config));
+    else if (rows.size() == 8U) static_cast<void>(prepare_gdn_wide_rows<8U>(rows, config));
+    else throw std::invalid_argument("GDN wide-window requires exactly four or eight rows");
+}
+void gdn_known_window_rows_launch(std::span<const ExecutionDispatchContext> rows,
+    const HipGdnLauncherConfig& config) {
+    if (rows.size() == 4U) enqueue_gdn_wide_rows<4U>(prepare_gdn_wide_rows<4U>(rows, config), config);
+    else if (rows.size() == 8U) enqueue_gdn_wide_rows<8U>(prepare_gdn_wide_rows<8U>(rows, config), config);
+    else throw std::invalid_argument("GDN wide-window requires exactly four or eight rows");
+}
 
 void gdn_known_window_r2_preflight(std::span<const ExecutionDispatchContext, 2> rows,
     const HipGdnLauncherConfig& config) {
@@ -3540,6 +3729,55 @@ void gdn_known_window_r2_projection_probe(GdnKnownWindowProjectionDirection dire
             reinterpret_cast<const float*>(input[0].address), reinterpret_cast<const float*>(input[1].address),
             packed, width, outputs, reinterpret_cast<std::uint16_t*>(output[0].address), reinterpret_cast<std::uint16_t*>(output[1].address));
         check_hip(hipGetLastError(), "GDN known-window diagnostic R2 output projection");
+    }
+}
+template <unsigned Rows, bool Bf16Input>
+void enqueue_gdn_wide_projection_probe(std::span<const GdnKnownWindowProjectionView> input,
+    GdnKnownWindowProjectionView weights, std::span<const GdnKnownWindowProjectionView> output,
+    std::uint32_t width, std::uint32_t outputs, hipStream_t stream) {
+    GdnWidePointers<Rows> views{};
+    for (unsigned r = 0; r < Rows; ++r) {
+        views.input[r] = reinterpret_cast<const void*>(input[r].address);
+        views.output[r] = reinterpret_cast<void*>(output[r].address);
+    }
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(project_wave8_q8_wide_kernel<Rows, Bf16Input>),
+        dim3((outputs + 7U) / 8U), dim3(kProjectionThreads), 0, stream,
+        views, reinterpret_cast<const void*>(weights.address), width, outputs);
+    check_hip(hipGetLastError(), "GDN wide-window diagnostic projection launch");
+}
+void gdn_known_window_rows_projection_probe(GdnKnownWindowProjectionDirection direction,
+    std::span<const GdnKnownWindowProjectionView> input, GdnKnownWindowProjectionView weights,
+    std::span<const GdnKnownWindowProjectionView> output, std::uint32_t width, std::uint32_t outputs, void* stream) {
+    if ((input.size() != 4U && input.size() != 8U) || output.size() != input.size() ||
+        (direction != GdnKnownWindowProjectionDirection::bf16_to_fp32 &&
+         direction != GdnKnownWindowProjectionDirection::fp32_to_bf16) ||
+        !stream || static_cast<hipStream_t>(stream) == hipStreamLegacy || static_cast<hipStream_t>(stream) == hipStreamPerThread)
+        throw std::invalid_argument("GDN wide-window diagnostic requires four/eight rows and an owned stream");
+    const bool bf16 = direction == GdnKnownWindowProjectionDirection::bf16_to_fp32;
+    for (unsigned r = 0; r < input.size(); ++r) {
+        const q8_projection_organization::View x{input[r].address, input[r].bytes}, w{weights.address, weights.bytes},
+            y{output[r].address, output[r].bytes};
+        if (bf16) q8_projection_organization::validate_views(width, outputs, x, w, y);
+        else q8_projection_organization::validate_fp32_bf16_views(width, outputs, x, w, y);
+        for (unsigned prior = 0; prior < r; ++prior) {
+            require_gdn_known_window_disjoint({input[r].address, input[r].bytes}, {input[prior].address, input[prior].bytes});
+            require_gdn_known_window_disjoint({output[r].address, output[r].bytes}, {output[prior].address, output[prior].bytes});
+        }
+        const GdnKnownWindowRange write{output[r].address, output[r].bytes};
+        for (const auto read : input) require_gdn_known_window_disjoint(write, {read.address, read.bytes});
+        require_gdn_known_window_disjoint(write, {weights.address, weights.bytes});
+    }
+    const auto native_stream = static_cast<hipStream_t>(stream);
+    hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
+    check_hip(hipStreamIsCapturing(native_stream, &capture), "query GDN wide diagnostic capture");
+    if (capture != hipStreamCaptureStatusNone) throw std::invalid_argument("GDN wide-window diagnostic cannot be captured");
+    check_hip(hipPeekAtLastError(), "GDN wide-window diagnostic pre-enqueue stale error");
+    if (input.size() == 4U) {
+        if (bf16) enqueue_gdn_wide_projection_probe<4U, true>(input, weights, output, width, outputs, native_stream);
+        else enqueue_gdn_wide_projection_probe<4U, false>(input, weights, output, width, outputs, native_stream);
+    } else {
+        if (bf16) enqueue_gdn_wide_projection_probe<8U, true>(input, weights, output, width, outputs, native_stream);
+        else enqueue_gdn_wide_projection_probe<8U, false>(input, weights, output, width, outputs, native_stream);
     }
 }
 #endif

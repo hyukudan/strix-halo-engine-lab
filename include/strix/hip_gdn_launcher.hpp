@@ -49,6 +49,14 @@ void gdn_known_window_r2_f32_gates_preflight(std::span<const ExecutionDispatchCo
 void gdn_known_window_r2_f32_gates_launch(std::span<const ExecutionDispatchContext, 2> rows,
     const HipGdnLauncherConfig& config);
 
+// Closed R4/R8 mixed-format windows. Three large Q8 projections share weights
+// across every row; the small F32 gates and causal state transitions retain
+// ascending R1 order. No padding rows, capture, storage conversion or commit.
+void gdn_known_window_rows_preflight(std::span<const ExecutionDispatchContext> rows,
+    const HipGdnLauncherConfig& config);
+void gdn_known_window_rows_launch(std::span<const ExecutionDispatchContext> rows,
+    const HipGdnLauncherConfig& config);
+
 #ifdef STRIX_BUILD_KNOWN_WINDOW_DIAGNOSTIC
 enum class GdnKnownWindowProjectionDirection { bf16_to_fp32, fp32_to_bf16 };
 enum class GdnKnownWindowProjectionMode { incumbent_row_loop, rows2 };
@@ -64,6 +72,10 @@ struct GdnKnownWindowProjectionView { std::uintptr_t address = 0; std::uint64_t 
 void gdn_known_window_r2_projection_probe(GdnKnownWindowProjectionDirection,
     GdnKnownWindowProjectionMode, std::span<const GdnKnownWindowProjectionView, 2> input,
     GdnKnownWindowProjectionView weights, std::span<const GdnKnownWindowProjectionView, 2> output,
+    std::uint32_t width, std::uint32_t outputs, void* stream);
+void gdn_known_window_rows_projection_probe(GdnKnownWindowProjectionDirection,
+    std::span<const GdnKnownWindowProjectionView> input, GdnKnownWindowProjectionView weights,
+    std::span<const GdnKnownWindowProjectionView> output,
     std::uint32_t width, std::uint32_t outputs, void* stream);
 #endif
 

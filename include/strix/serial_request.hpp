@@ -87,14 +87,20 @@ private:
     bool done_ = false, failed_ = false, cancelled_ = false;
 };
 
-// Experimental full-output prompt route. Both inputs are already known; this
-// interface does not predict a second autoregressive token. The backend commits
-// one causal window and returns the complete FP32 logits of its terminal row.
+// Experimental full-output prompt route. All inputs are already known. The
+// compatibility entry is R2; explicitly wider backends override execute_rows.
+// The backend commits one causal window and returns its terminal FP32 logits.
 class KnownPromptWindowBackend {
 public:
     virtual ~KnownPromptWindowBackend() = default;
+    [[nodiscard]] virtual std::uint32_t logical_rows() const noexcept { return 2; }
     [[nodiscard]] virtual std::vector<float> execute_window(
         std::array<std::uint32_t, 2> tokens, std::uint64_t position) = 0;
+    // Wider backends explicitly override both this entry and logical_rows().
+    // The compatibility implementation never disguises repeated pairs as a
+    // single larger native window.
+    [[nodiscard]] virtual std::vector<float> execute_rows(
+        std::span<const std::uint32_t> tokens, std::uint64_t position);
 };
 
 struct KnownPromptGreedyRequest {
