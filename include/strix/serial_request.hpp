@@ -1,6 +1,9 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
+#include <functional>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -55,6 +58,43 @@ public:
     // The default preserves the complete existing execution.
     virtual void execute_state(std::uint32_t input_token, std::uint64_t position);
 };
+
+// Experimental full-output prompt route. Both inputs are already known; this
+// interface does not predict a second autoregressive token. The backend commits
+// one causal window and returns the complete FP32 logits of its terminal row.
+class KnownPromptWindowBackend {
+public:
+    virtual ~KnownPromptWindowBackend() = default;
+    [[nodiscard]] virtual std::vector<float> execute_window(
+        std::array<std::uint32_t, 2> tokens, std::uint64_t position) = 0;
+};
+
+struct KnownPromptGreedyRequest {
+    // A non-empty known suffix, immutable for this call. An already consumed
+    // prefix is represented by start_position, never by re-executing its token.
+    std::span<const std::uint32_t> prompt_tokens;
+    std::uint64_t start_position = 0;
+    std::uint64_t vocab_size = 0;
+    std::uint64_t context_capacity = 0;
+    std::uint64_t max_new_tokens = 0;
+    std::uint32_t eos_token_id = 0;
+    // Consulted before another pair only after a completed window in this call.
+    // It is not called before the first pair, the odd tail, or generation.
+    std::function<bool(std::uint64_t next_position)> stop_between_windows;
+};
+
+struct KnownPromptGreedyResult {
+    std::uint64_t consumed_prompt_tokens = 0;
+    std::uint64_t windows_executed = 0;
+    std::uint64_t serial_prompt_steps = 0;
+    // Empty only when stopped between windows. Continuation retains the usual
+    // last-emitted-token/unconsumed frontier and counts generation steps only.
+    std::optional<SerialGreedyRequestResult> generation;
+};
+
+[[nodiscard]] KnownPromptGreedyResult execute_known_prompt_greedy_request(
+    const KnownPromptGreedyRequest& request,
+    KnownPromptWindowBackend& windows, SerialGreedyStepBackend& serial);
 
 [[nodiscard]] std::uint32_t select_greedy_token(
     std::span<const float> logits,

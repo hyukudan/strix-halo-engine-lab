@@ -229,6 +229,50 @@ SerialGreedyRequestResult execute_serial_greedy_request(
     return generated;
 }
 
+KnownPromptGreedyResult execute_known_prompt_greedy_request(
+    const KnownPromptGreedyRequest& request,
+    KnownPromptWindowBackend& windows, SerialGreedyStepBackend& serial) {
+    // Validate the entire suffix before either backend can consume state.
+    validate_greedy_request({request.prompt_tokens, request.vocab_size,
+        request.context_capacity, request.max_new_tokens, request.eos_token_id});
+    if (request.start_position > request.context_capacity ||
+        request.prompt_tokens.size() > request.context_capacity - request.start_position) {
+        throw std::invalid_argument("known prompt suffix exceeds remaining context capacity");
+    }
+
+    KnownPromptGreedyResult result;
+    std::vector<float> logits;
+    std::size_t consumed = 0;
+    auto position = request.start_position;
+    while (request.prompt_tokens.size() - consumed >= 2U) {
+        if (consumed != 0 && request.stop_between_windows && request.stop_between_windows(position)) {
+            return result;
+        }
+        logits = windows.execute_window(
+            {request.prompt_tokens[consumed], request.prompt_tokens[consumed + 1U]}, position);
+        consumed += 2U;
+        position += 2U;
+        result.consumed_prompt_tokens += 2U;
+        ++result.windows_executed;
+    }
+    if (consumed < request.prompt_tokens.size()) {
+        logits = serial.execute(request.prompt_tokens[consumed], position);
+        ++position;
+        ++result.consumed_prompt_tokens;
+        ++result.serial_prompt_steps;
+    }
+
+    SerialGreedyContinuationRequest continuation;
+    continuation.initial_logits = logits;
+    continuation.start_position = position;
+    continuation.vocab_size = request.vocab_size;
+    continuation.context_capacity = request.context_capacity;
+    continuation.max_new_tokens = request.max_new_tokens;
+    continuation.eos_token_id = request.eos_token_id;
+    result.generation = execute_serial_greedy_continuation(continuation, serial);
+    return result;
+}
+
 std::uint32_t SerialGreedyStepBackend::execute_greedy(
     std::uint32_t input_token, std::uint64_t position, std::uint64_t vocab_size) {
     return select_greedy_token(execute(input_token, position), vocab_size);

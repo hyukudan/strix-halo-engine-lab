@@ -1574,6 +1574,14 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         target_link_libraries(strix-hip-known-window-model-qualification PRIVATE strix_hip_runtime)
         strix_target_warnings(strix-hip-known-window-model-qualification)
 
+        # Explicit known-prompt/cache/continuation qualification; requires the
+        # real model and ROOT-sealed inputs, so it is not an automatic CTest.
+        add_executable(strix-hip-known-prompt-model-qualification tests/hip_known_prompt_model_qualification.hip)
+        set_target_properties(strix-hip-known-prompt-model-qualification PROPERTIES
+            HIP_ARCHITECTURES gfx1151 HIP_STANDARD 20 HIP_STANDARD_REQUIRED YES)
+        target_link_libraries(strix-hip-known-prompt-model-qualification PRIVATE strix_hip_runtime)
+        strix_target_warnings(strix-hip-known-prompt-model-qualification)
+
         add_executable(
             strix-hip-moe-experts-launcher-tests
             tests/hip_moe_experts_launcher_tests.hip
