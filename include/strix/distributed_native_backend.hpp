@@ -2,6 +2,7 @@
 
 #include "strix/direct_transport_native_session.hpp"
 #include "strix/distributed_runtime.hpp"
+#include "strix/distributed_position_completion.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -162,7 +163,10 @@ public:
     // closed to1024 local boundaries and64 links (<=65536 actual operations).
     void begin_token_retirement(const DistributedPlacementPlan&, const DistributedRuntimeRequest&,
         std::uint32_t local_node, std::uint64_t binding_identity,
-        std::shared_ptr<const void> actual_transport_owner);
+        std::shared_ptr<const void> actual_transport_owner,
+        NativeDistributedPositionDependencyPolicy = NativeDistributedPositionDependencyPolicy::reject);
+    // Logical position completion does not retire any native data operation.
+    void complete_position_dependencies(NativeDistributedPositionCompletion&&);
     [[nodiscard]] NativeDistributedTokenRetirement retire_token();
     // Missing boundaries are explicitly aborted, not completed. Every ACTUAL
     // operation must still be fully retired; a failed backend cannot mint it.

@@ -12,7 +12,7 @@ struct NativeDistributedTokenLedger {
         transport::DirectTransportNativeLinkSession* session=nullptr;
         transport::DirectTransportLease lease;
     };
-    struct Boundary { DistributedExecutionBoundary value; bool inbound=false, started=false, complete=false; };
+    struct Boundary { DistributedExecutionBoundary value; bool inbound=false, started=false, complete=false, logical_position=false; };
     struct Operation {
         std::size_t link=0;
         transport::TransferHandle handle=0;
@@ -22,6 +22,7 @@ struct NativeDistributedTokenLedger {
     DistributedRuntimeRequest request;
     std::uint64_t placement=0,binding=0;
     std::uint32_t node=0;
+    NativeDistributedPositionDependencyPolicy position_policy=NativeDistributedPositionDependencyPolicy::reject;
     std::shared_ptr<const void> actual_owner;
     DistributedBoundaryStagingProvider* staging=nullptr;
     std::vector<Link> links;
@@ -294,8 +295,11 @@ NativeDistributedBackend::NativeDistributedBackend(
 
 void NativeDistributedBackend::begin_token_retirement(const DistributedPlacementPlan& plan,
     const DistributedRuntimeRequest& request,std::uint32_t node,std::uint64_t binding,
-    std::shared_ptr<const void> actual_owner) {
+    std::shared_ptr<const void> actual_owner,NativeDistributedPositionDependencyPolicy position_policy) {
     require_healthy();
+    if(position_policy!=NativeDistributedPositionDependencyPolicy::reject &&
+        position_policy!=NativeDistributedPositionDependencyPolicy::materialized_input_position_v1)
+        throw std::invalid_argument("unknown logical position dependency policy");
     if(token_ || dispatched_ || !actual_owner || !binding || !plan.plan_identity || !plan.executable ||
         !plan.has_remote_work || node>1U || !request.connection_epoch || !request.request_id ||
         !request.generation || !request.dtype_id || sessions_.size()>64U || plan.boundaries.size()>1024U ||
@@ -303,6 +307,7 @@ void NativeDistributedBackend::begin_token_retirement(const DistributedPlacement
         throw std::invalid_argument("native token mode requires bounded exact placement and full-retirement actual transport owners before dispatch");
     auto ledger=std::make_shared<NativeDistributedTokenLedger>();
     ledger->request=request;ledger->placement=plan.plan_identity;ledger->binding=binding;ledger->node=node;
+    ledger->position_policy=position_policy;
     ledger->actual_owner=std::move(actual_owner);ledger->staging=staging_;
     ledger->links.reserve(sessions_.size());
     for(std::size_t index=0;index<sessions_.size();++index) {
@@ -310,17 +315,27 @@ void NativeDistributedBackend::begin_token_retirement(const DistributedPlacement
         ledger->links.push_back({&session,session.lease()});
     }
     ledger->boundaries.reserve(plan.boundaries.size());
+    std::size_t position_dependencies=0,data_boundaries=0;
     for(const auto& boundary:plan.boundaries) {
-        if(!boundary.boundary_id || !boundary.payload_bytes || boundary.payloads.empty() || boundary.payloads.size()>1024U ||
-            boundary.source_node==boundary.destination_node || boundary.source_node>1U || boundary.destination_node>1U)
+        const bool logical_position=
+            position_policy==NativeDistributedPositionDependencyPolicy::materialized_input_position_v1 &&
+            is_materialized_input_position_dependency(plan,boundary);
+        if(!boundary.boundary_id || (!logical_position && (!boundary.payload_bytes || boundary.payloads.empty())) ||
+            boundary.payloads.size()>1024U || boundary.source_node==boundary.destination_node ||
+            boundary.source_node>1U || boundary.destination_node>1U)
             throw std::invalid_argument("native token boundary metadata is invalid or unbounded");
+        if(logical_position) {
+            if(++position_dependencies>NativeDistributedPositionCompletion::maximum_dependencies)
+                throw std::invalid_argument("too many logical position dependencies");
+        } else ++data_boundaries;
         for(const auto& existing:ledger->boundaries)
             if(existing.value.boundary_id==boundary.boundary_id)
                 throw std::invalid_argument("native token boundary identity is duplicated");
         if(boundary.source_node==node || boundary.destination_node==node)
-            ledger->boundaries.push_back({boundary,boundary.destination_node==node,false,false});
+            ledger->boundaries.push_back({boundary,boundary.destination_node==node,false,false,logical_position});
     }
-    if(ledger->boundaries.empty()) throw std::invalid_argument("native token mode has no exact local boundaries");
+    if(ledger->boundaries.empty() || !data_boundaries)
+        throw std::invalid_argument("native token mode has no actual data boundary");
     ledger->operations.reserve(ledger->boundaries.size()*ledger->links.size());
     ledger->consumers.reserve(ledger->boundaries.size());
     token_=std::move(ledger);
@@ -337,7 +352,7 @@ void NativeDistributedBackend::begin_boundary(const DistributedExecutionBoundary
             descriptor.shape_fingerprint!=(boundary.boundary_id^boundary.payload_bytes))
             throw std::invalid_argument("native token transfer is foreign or stale");
         for(auto& expected:ledger.boundaries) if(expected.value.boundary_id==boundary.boundary_id) {
-            if(expected.started || expected.inbound!=inbound || !retirement_boundary_equal(expected.value,boundary))
+            if(expected.logical_position || expected.started || expected.inbound!=inbound || !retirement_boundary_equal(expected.value,boundary))
                 throw std::invalid_argument("native token boundary is duplicated, wrong-direction or mutated");
             expected.started=true;return;
         }
@@ -364,6 +379,34 @@ void NativeDistributedBackend::finish_boundary(const DistributedExecutionBoundar
         expected.complete=true;return;
     }
     throw std::logic_error("native token completion has no admitted boundary");
+}
+void NativeDistributedBackend::complete_position_dependencies(NativeDistributedPositionCompletion&& proof) {
+    require_healthy();
+    NativeTokenFailureLatch failure(token_,failed_);
+    if(!token_ || token_->position_policy!=NativeDistributedPositionDependencyPolicy::materialized_input_position_v1 ||
+        !proof.valid_ || !proof.owner_ || !proof.decision_ || !proof.count_ ||
+        proof.count_>proof.boundaries_.size() || proof.binding_!=token_->binding ||
+        proof.placement_!=token_->placement || proof.node_!=token_->node ||
+        !retirement_request_equal(proof.request_,token_->request))
+        throw std::invalid_argument("logical position proof is empty, foreign or unavailable");
+    std::size_t expected_count=0;
+    for(const auto& boundary:token_->boundaries) if(boundary.logical_position) {
+        if(boundary.started || boundary.complete)
+            throw std::logic_error("logical position completion is duplicated");
+        ++expected_count;
+        std::size_t matches=0;
+        for(std::size_t i=0;i<proof.count_;++i) matches+=proof.boundaries_[i]==boundary.value.boundary_id;
+        if(matches!=1U) throw std::invalid_argument("logical position proof omits or duplicates a dependency");
+    }
+    if(expected_count!=proof.count_)
+        throw std::invalid_argument("logical position proof has extra dependencies");
+    require_retirement_live(*token_);
+    // No allocation or fallible operation follows this logical publication.
+    // DMA handle completion remains independently checked by retire_token.
+    for(auto& boundary:token_->boundaries) if(boundary.logical_position) {
+        boundary.started=true;boundary.complete=true;
+    }
+    proof.valid_=false;
 }
 NativeDistributedTokenRetirement NativeDistributedBackend::retire(NativeDistributedRetirementOutcome outcome) {
     require_healthy();

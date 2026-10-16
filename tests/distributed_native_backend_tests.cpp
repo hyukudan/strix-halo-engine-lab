@@ -543,6 +543,8 @@ void token_retirement_source_cases() {
     static_assert(!std::is_copy_constructible_v<strix::NativeDistributedTokenRetirement>);
     static_assert(!std::is_copy_assignable_v<strix::NativeDistributedTokenRetirement>);
     static_assert(std::is_nothrow_move_constructible_v<strix::NativeDistributedTokenRetirement>);
+    static_assert(!std::is_copy_constructible_v<strix::NativeDistributedPositionCompletion>);
+    static_assert(std::is_nothrow_move_constructible_v<strix::NativeDistributedPositionCompletion>);
     const strix::DistributedRuntimeRequest request{77,2,3,7};
     const auto reject=[](auto&& operation) {try {operation();} catch(const std::exception&) {return true;}return false;};
     {
@@ -651,6 +653,48 @@ void token_retirement_source_cases() {
         expect(reject([&]{backend.begin_token_retirement(duplicate,request,0,99,owner);}),"duplicate closed boundary inventory rejects");
         backend.execute_local_step({});
         expect(reject([&]{backend.begin_token_retirement(owner->plan(),request,0,99,owner);}),"token mode cannot be enabled after dispatch");
+    }
+    // Position dependencies are logical ordering edges, never zero-byte DMA.
+    // This host metadata fixture cannot mint the private native-participant
+    // witness and must remain unable to promote completed data into that proof.
+    for(unsigned mode=0;mode<6U;++mode) {
+        auto owner=std::make_shared<TokenResources>();
+        auto plan=owner->plan();plan.steps.resize(4);
+        for(std::uint32_t i=0;i<4;++i) {plan.steps[i].step_id=i;plan.steps[i].node=i<2?0U:1U;}
+        plan.steps[0].op=strix::SerialOp::position_prepare;
+        plan.steps[1].op=strix::SerialOp::mlp_inject;
+        plan.steps[2].op=strix::SerialOp::attn_hyper_mix;
+        plan.steps[3].op=strix::SerialOp::indexed_attention;
+        plan.boundaries[0].source_step=1;plan.boundaries[0].destination_step=2;
+        strix::DistributedExecutionBoundary position;
+        position.boundary_id=5;position.source_node=0;position.destination_node=1;
+        position.source_step=0;position.destination_step=3;
+        plan.boundaries.push_back(position);
+        strix::NativeDistributedBackend backend(owner->sessions,owner->control,owner->local,owner->staging);
+        const auto policy=strix::NativeDistributedPositionDependencyPolicy::materialized_input_position_v1;
+        if(mode==0U) {
+            expect(reject([&]{backend.begin_token_retirement(plan,request,0,99,owner);}),
+                "legacy token mode rejects all zero-payload boundaries");
+        } else if(mode==1U || mode==2U) {
+            if(mode==1U) plan.steps[3].op=strix::SerialOp::gated_delta_net;
+            else plan.steps[0].node=1;
+            expect(reject([&]{backend.begin_token_retirement(plan,request,0,99,owner,policy);}),
+                "logical position opt-in cannot authorize another op or endpoint");
+        } else {
+            backend.begin_token_retirement(plan,request,0,99,owner,policy);
+            if(mode==3U) {
+                strix::NativeDistributedPositionCompletion empty;
+                expect(reject([&]{backend.complete_position_dependencies(std::move(empty));}) && owner->native.sends.empty(),
+                    "empty private position proof rejects before native transfers");
+            } else if(mode==4U) {
+                backend.send_boundary(plan.boundaries.front(),owner->outbound());
+                expect(reject([&]{static_cast<void>(backend.retire_token());}),
+                    "complete actual data handles cannot stand in for logical position completion");
+            } else {
+                auto aborted=backend.retire_aborted_token();
+                expect(owner->native.sends.empty(),"aborted unsubmitted position attempt never issues a zero-byte DMA");
+            }
+        }
     }
 }
 
