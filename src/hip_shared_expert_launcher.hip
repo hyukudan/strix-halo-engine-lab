@@ -1703,4 +1703,167 @@ void shared_expert_known_window_r2_launch(std::span<const ExecutionDispatchConte
     }
     known_shared_r2_projection(true, views, views.weights.down_q8, views.output, scope->stream, config);
 }
+
+namespace {
+KnownSharedR2Views known_shared_rows_views(std::span<const ExecutionDispatchContext> rows,
+    const HipSharedExpertLauncherConfig& config) {
+    if (rows.size() != 4U && rows.size() != 8U)
+        throw std::invalid_argument("known-window shared rows count must be R4 or R8");
+    const auto& first = rows.front();
+    if (first.position > UINT64_MAX - (rows.size() - 1U))
+        throw std::invalid_argument("known-window shared rows positions overflow");
+    // Retain the complete original admission, including exact tensor metadata,
+    // for every row. No pair is submitted while a later pair is unvalidated.
+    std::array<KnownSharedR2Views, 4> pairs{};
+    for (std::size_t pair = 0; pair < rows.size() / 2U; ++pair)
+        pairs[pair] = known_shared_r2_views(
+            std::span<const ExecutionDispatchContext, 2>(rows.data() + pair * 2U, 2U), config);
+    std::array<ExecutionBufferAddress, 8> inputs{}, outputs{}, workspaces{};
+    for (std::size_t r = 0; r < rows.size(); ++r) {
+        const auto& row = rows[r];
+        if (row.execution_identity != first.execution_identity || row.step_id != first.step_id ||
+            row.op != first.op || row.layer != first.layer || row.kernel_id != first.kernel_id ||
+            row.position != first.position + r || row.reads_state != first.reads_state ||
+            row.writes_state != first.writes_state || row.reads[0] != first.reads[0] ||
+            row.writes[0] != first.writes[0] || row.temporaries[0] != first.temporaries[0])
+            throw std::invalid_argument("known-window shared rows identity/position/IO differs");
+        const auto& a = *first.resources; const auto& b = *row.resources;
+        if (a.scratch != b.scratch || a.model_manifest != b.model_manifest || a.model_weights != b.model_weights ||
+            a.tensor_access != b.tensor_access || a.session_state_layout != b.session_state_layout ||
+            a.session_state_memory != b.session_state_memory || a.ple_lookup != b.ple_lookup ||
+            a.ple_hash_contract != b.ple_hash_contract || a.ple_prefetch != b.ple_prefetch ||
+            row.session_state_layout != first.session_state_layout || row.session_state_memory != first.session_state_memory)
+            throw std::invalid_argument("known-window shared rows retained resource owners differ");
+        const auto& memory = known_shared_memory(row);
+        if (memory.arena_bytes > UINTPTR_MAX - memory.arena_base)
+            throw std::invalid_argument("known-window shared rows scratch extent overflows");
+        if (memory.execution_identity != first.resources->scratch->execution_identity ||
+            memory.arena_base != first.resources->scratch->arena_base ||
+            memory.arena_bytes != first.resources->scratch->arena_bytes ||
+            memory.allocation_generation != first.resources->scratch->allocation_generation)
+            throw std::invalid_argument("known-window shared rows physical allocation differs");
+        inputs[r] = resolve_dispatch_read(row, 0);
+        outputs[r] = resolve_dispatch_write(row, 0);
+        workspaces[r] = resolve_dispatch_temporary(row, 0);
+        for (const auto view : {inputs[r], outputs[r], workspaces[r]}) {
+            if (view.address < memory.arena_base || view.address - memory.arena_base > memory.arena_bytes ||
+                view.bytes > memory.arena_bytes - (view.address - memory.arena_base))
+                throw std::invalid_argument("known-window shared rows resolved view exceeds physical scratch");
+        }
+        if (r && (known_shared_stride(inputs[r - 1U], inputs[r]) != pairs[0].shape.input_stride_bytes ||
+            known_shared_stride(outputs[r - 1U], outputs[r]) != pairs[0].shape.output_stride_bytes ||
+            known_shared_stride(workspaces[r - 1U], workspaces[r]) != pairs[0].shape.workspace_stride_bytes))
+            throw std::invalid_argument("known-window shared rows stripe differs");
+    }
+    const auto weights = [](const KnownSharedR2Views& p) {
+        return std::array{p.weights.gate_q8, p.weights.up_q8, p.weights.down_q8, p.weights.shared_gate_f32};
+    };
+    const auto first_weights = weights(pairs[0]);
+    for (std::size_t pair = 1; pair < rows.size() / 2U; ++pair) {
+        const auto other = weights(pairs[pair]);
+        for (std::size_t w = 0; w < first_weights.size(); ++w)
+            if (other[w].address != first_weights[w].address || other[w].bytes != first_weights[w].bytes)
+                throw std::invalid_argument("known-window shared rows selected weights differ");
+    }
+    std::array<KnownSharedSpan, 16> writes{};
+    for (std::size_t r = 0; r < rows.size(); ++r) {
+        writes[2U * r] = {outputs[r].address, outputs[r].bytes};
+        writes[2U * r + 1U] = {workspaces[r].address, workspaces[r].bytes};
+    }
+    for (std::size_t w = 0; w < 2U * rows.size(); ++w) {
+        for (std::size_t r = 0; r < rows.size(); ++r)
+            if (known_shared_overlap(writes[w], {inputs[r].address, inputs[r].bytes}))
+                throw std::invalid_argument("known-window shared rows cross-row writable/input alias");
+        for (const auto weight : first_weights) if (known_shared_overlap(writes[w], weight))
+            throw std::invalid_argument("known-window shared rows writable/weight alias");
+        for (std::size_t previous = 0; previous < w; ++previous)
+            if (known_shared_overlap(writes[w], writes[previous]))
+                throw std::invalid_argument("known-window shared rows cross-row writable alias");
+    }
+    auto result = pairs[0];
+    result.shape.rows = static_cast<std::uint32_t>(rows.size());
+    const auto layout = shared_expert_rows_diagnostic::layout(result.shape,
+        shared_expert_rows_diagnostic::Arm::shared_q8_rows);
+    result.input.bytes = layout.input_bytes; result.output.bytes = layout.output_bytes;
+    result.workspace.bytes = layout.workspace_bytes;
+    (void)shared_expert_rows_diagnostic::validate(result.shape, result.input, result.weights,
+        result.workspace, result.output, shared_expert_rows_diagnostic::Arm::shared_q8_rows);
+    return result;
+}
+hipStream_t known_shared_rows_stream() {
+    const auto* scope = current_hip_launch_context();
+    if (!scope || scope->graph_capture || !scope->stream || scope->stream == hipStreamLegacy ||
+        scope->stream == hipStreamPerThread)
+        throw std::invalid_argument("known-window shared rows requires explicit eager owned stream");
+    hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
+    check_hip(hipStreamIsCapturing(scope->stream, &capture), "known-window shared rows capture query");
+    if (capture != hipStreamCaptureStatusNone)
+        throw std::invalid_argument("known-window shared rows cannot run during capture");
+    return scope->stream;
+}
+template <unsigned Rows>
+void known_shared_rows_projection(bool down, const KnownSharedR2Views& views,
+    KnownSharedSpan weight, KnownSharedSpan target, hipStream_t stream,
+    const HipSharedExpertLauncherConfig& config) {
+    const auto& s = views.shape;
+    if (down) {
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(shared_rows_q8_projection_kernel<Rows, true>),
+            dim3((s.hidden + 7U) / 8U), dim3(256), 0, stream,
+            reinterpret_cast<const void*>(views.workspace.address), s.workspace_stride_bytes,
+            reinterpret_cast<const void*>(weight.address), s.intermediate, s.hidden,
+            reinterpret_cast<void*>(target.address), s.output_stride_bytes,
+            reinterpret_cast<const float*>(views.workspace.address) + s.intermediate, s.workspace_stride_bytes / 4U);
+    } else {
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(shared_rows_q8_projection_kernel<Rows, false>),
+            dim3((s.intermediate + 7U) / 8U), dim3(256), 0, stream,
+            reinterpret_cast<const void*>(views.input.address), s.input_stride_bytes,
+            reinterpret_cast<const void*>(weight.address), s.hidden, s.intermediate,
+            reinterpret_cast<void*>(target.address), s.workspace_stride_bytes, nullptr, 0ULL);
+    }
+    check_hip(hipGetLastError(), "known-window shared rows projection launch");
+    if (config.prefetch_q8 && config.prefetch_stats)
+        config.prefetch_stats->dispatched_projections.fetch_add(1, std::memory_order_relaxed);
+}
+template <unsigned Rows>
+void known_shared_rows_enqueue(const KnownSharedR2Views& views, hipStream_t stream,
+    const HipSharedExpertLauncherConfig& config) {
+    known_shared_rows_projection<Rows>(false, views, views.weights.gate_q8, views.workspace, stream, config);
+    auto up = views.workspace; up.address += static_cast<std::uint64_t>(config.intermediate_size) * 4U;
+    known_shared_rows_projection<Rows>(false, views, views.weights.up_q8, up, stream, config);
+    for (unsigned row = 0; row < Rows; ++row) {
+        auto* workspace = reinterpret_cast<float*>(views.workspace.address + row * views.shape.workspace_stride_bytes);
+        const auto* input = reinterpret_cast<const std::uint16_t*>(views.input.address + row * views.shape.input_stride_bytes);
+        hipLaunchKernelGGL(gated_activation_kernel, dim3((config.intermediate_size + 255U) / 256U),
+            dim3(256), 0, stream, workspace, config.intermediate_size);
+        check_hip(hipGetLastError(), "known-window shared rows activation launch");
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(scalar_projection_kernel<std::uint16_t, WeightKind::f32>),
+            dim3(1), dim3(256), 0, stream, input, reinterpret_cast<const void*>(views.weights.shared_gate_f32.address),
+            config.hidden_size, workspace + config.intermediate_size);
+        check_hip(hipGetLastError(), "known-window shared rows scalar launch");
+    }
+    known_shared_rows_projection<Rows>(true, views, views.weights.down_q8, views.output, stream, config);
+}
+} // namespace
+
+void shared_expert_known_window_rows_preflight(std::span<const ExecutionDispatchContext> rows,
+    const HipSharedExpertLauncherConfig& config) {
+    if (rows.size() == 2U) {
+        shared_expert_known_window_r2_preflight(std::span<const ExecutionDispatchContext, 2>(rows.data(), 2), config);
+        return;
+    }
+    static_cast<void>(known_shared_rows_views(rows, config));
+    static_cast<void>(known_shared_rows_stream());
+}
+void shared_expert_known_window_rows_launch(std::span<const ExecutionDispatchContext> rows,
+    const HipSharedExpertLauncherConfig& config) {
+    if (rows.size() == 2U) {
+        shared_expert_known_window_r2_launch(std::span<const ExecutionDispatchContext, 2>(rows.data(), 2), config);
+        return;
+    }
+    const auto views = known_shared_rows_views(rows, config);
+    const auto stream = known_shared_rows_stream();
+    check_hip(hipPeekAtLastError(), "known-window shared rows stale launch error");
+    if (rows.size() == 4U) known_shared_rows_enqueue<4U>(views, stream, config);
+    else known_shared_rows_enqueue<8U>(views, stream, config);
+}
 } // namespace strix

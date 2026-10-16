@@ -63,6 +63,23 @@ void shared_expert_known_window_r2_launch(
     std::span<const ExecutionDispatchContext, 2> rows,
     const HipSharedExpertLauncherConfig& config);
 
+// Closed retained-window R2/R4/R8 entry. R2 delegates to the unchanged typed
+// entry above. R4/R8 share each Q8 decode across independent row accumulators;
+// activation and F32 scalar gate retain the incumbent row-local kernels/order.
+// Row strides are align_up(serial allocation bytes,256) in one physical scratch
+// binding. All rows/weights/IO/positions and cross-row aliases are admitted
+// before enqueue. Both callbacks require an owned eager scope for R4/R8.
+// The window owner admits the actual session/allocation epoch; contexts expose
+// its execution identity and allocation generation, not a separate epoch token.
+// No allocation, host payload reads, capture, sync or publication. Retain every
+// borrowed descriptor/config/owner and stream through quiescence after errors.
+void shared_expert_known_window_rows_preflight(
+    std::span<const ExecutionDispatchContext> rows,
+    const HipSharedExpertLauncherConfig& config);
+void shared_expert_known_window_rows_launch(
+    std::span<const ExecutionDispatchContext> rows,
+    const HipSharedExpertLauncherConfig& config);
+
 class HipSharedExpertLauncherBundle {
 public:
     explicit HipSharedExpertLauncherBundle(
