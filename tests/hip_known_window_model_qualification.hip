@@ -10,6 +10,10 @@
 #include "strix/q8_projection_manifest.hpp"
 #include "strix/serial_session.hpp"
 #include "strix/gguf_reader.hpp"
+#include "strix/hip_gdn_islands.hpp"
+#include "strix/hip_moe_overlap_dispatcher.hpp"
+#include "strix/prepared_serial_session.hpp"
+#include "../apps/hip_deferred_moe_status.hpp"
 
 #include <hip/hip_runtime.h>
 
@@ -26,6 +30,7 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <span>
 #include <sstream>
 #include <stdexcept>
@@ -112,6 +117,7 @@ struct Options {
     std::string model_sha, teacher_sha, profile = "q8-wave8";
     std::uint64_t start = 0;
     std::uint32_t rows = 2;
+    bool islands_overlap_composition = false;
 };
 Options options(int argc, char** argv) {
     Options result;
@@ -128,6 +134,10 @@ Options options(int argc, char** argv) {
         else if (key == "--teacher-sha256") result.teacher_sha = value;
         else if (key == "--output") result.output = value;
         else if (key == "--profile") result.profile = value;
+        else if (key == "--composition") {
+            require(value == "islands-overlap", "unknown composition qualification");
+            result.islands_overlap_composition = true;
+        }
         else if(key=="--rows") {
             const auto parsed=std::from_chars(value.data(),value.data()+value.size(),result.rows);
             require(parsed.ec==std::errc{} && parsed.ptr==value.data()+value.size(),"invalid row count");
@@ -181,6 +191,7 @@ struct Owners {
     strix::ModelManifest manifest;
     strix::ExecutionTensorAccessPlan access;
     strix::CompiledSerialExecution serial;
+    std::optional<strix::MoeForkJoinArenaPlan> overlap_plan;
     strix::CompiledKnownPrefixWindow window;
     strix::SerialSessionStateLayout layout;
     std::shared_ptr<strix::MappedModelFile> mapped;
@@ -210,6 +221,7 @@ strix::HipLauncherCatalogConfig configure(const Options& args, strix::ExecutionB
                                           strix::ExecutionBufferRequest& buffers) {
     strix::HipLauncherCatalogConfig config;
     binding.minimum_qualification = strix::kernels::QualificationStatus::experimental;
+    config.deferred_moe_status = binding.deferred_moe_status = args.islands_overlap_composition;
     config.parallel_hyper_mix = true; config.staged_hyper_projections = true;
     config.fused_staged_hyper_mix = true; config.typed_hyper_projection = true;
     config.prefetch_typed_hyper_rows = true; config.prefetch_q8_hyper_output = true;
@@ -244,12 +256,19 @@ std::shared_ptr<Owners> load(const Options& args, const strix::HipLauncherCatalo
     strix::kernels::KernelRegistry kernels;
     strix::register_complete_hip_kernel_catalog(owner->model, binding, config, kernels);
     owner->serial = strix::compile_serial_execution(owner->model, kernels, binding, buffers, 256);
+    if (args.islands_overlap_composition) {
+        owner->overlap_plan.emplace(strix::prepare_moe_fork_join_arena(
+            owner->serial, 64ULL * 1024ULL * 1024ULL));
+        owner->serial = owner->overlap_plan->rebind_execution(owner->serial);
+    }
     const auto index = strix::build_model_tensor_index(owner->manifest);
     owner->access = strix::compile_execution_tensor_access_plan(owner->serial.execution, owner->manifest,
         index, strix::build_serial_execution_tensor_requirements(owner->serial.execution));
+    if (!args.islands_overlap_composition) {
     owner->window = strix::compile_known_prefix_window(owner->model, owner->serial,
         owner->manifest, owner->access, {true, true, true, args.rows});
     require_mixed_window(owner->window);
+    }
     const auto projections = strix::q8_projection_organization::build_manifest_plan(
         owner->model, owner->manifest, false, true, true, false);
     strix::SerialSessionStateLayoutRequest state_request;
@@ -264,13 +283,15 @@ std::shared_ptr<Owners> load(const Options& args, const strix::HipLauncherCatalo
         owner->serial, owner->layout, *owner->allocator, owner->generations));
     strix::q8_projection_organization::validate_output_steps(projections, owner->model, owner->serial,
         owner->access, owner->memory->scratch(), owner->resident->binding());
+    if (!args.islands_overlap_composition) {
     owner->window_memory = {owner->window.window_execution_identity, 0,
         owner->window.arena.physical.total_bytes, owner->generations.next()};
     owner->window_memory.arena_base = owner->allocator->allocate_device(owner->window_memory.arena_bytes, 256);
+    }
     owner->guard->run([&] {
         hip_check(hipStreamCreateWithFlags(&owner->stream, hipStreamNonBlocking), "create qualification stream");
         strix::initialize_hip_fresh_runtime_memory(owner->memory->scratch(), owner->memory->state());
-        hip_check(hipMemsetAsync(reinterpret_cast<void*>(owner->window_memory.arena_base), 0,
+        if (owner->window_memory.arena_base) hip_check(hipMemsetAsync(reinterpret_cast<void*>(owner->window_memory.arena_base), 0,
             static_cast<std::size_t>(owner->window_memory.arena_bytes), owner->stream), "initialize window scratch");
     });
     owner->ple_hash = strix::build_ple_hash_contract(owner->model);
@@ -546,7 +567,10 @@ std::uint64_t owner_negative_cases(const std::shared_ptr<Owners>& owner,
     return cases;
 }
 
+#include "hip_islands_overlap_model_qualification.hpp"
+
 int qualify(const Options& args) {
+    if (args.islands_overlap_composition) return qualify_islands_overlap(args);
     const auto teacher = teacher_tokens(args, strix::ModelContract::qwen38_flash_next().vocab_size);
     const auto executable = std::filesystem::canonical("/proc/self/exe");
     const auto executable_sha = hash_file(executable);

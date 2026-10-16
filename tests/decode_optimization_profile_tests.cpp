@@ -306,6 +306,16 @@ int main() {
         rejects([&] { validate_resolved_known_prefix_window(bad); },
             "known-prefix window requires eager full-head generation without RAW/reference, alternate submission, cache, islands or candidate layouts");
     }
+    expect(!defaults.prompt_lookup_adaptive, "adaptive lookup is default off");
+    const auto adaptive_lookup = parse({"decoder", "m", "1", "--prompt-lookup", "--prompt-lookup-adaptive"});
+    expect(adaptive_lookup.prompt_lookup_adaptive && !adaptive_lookup.prompt_lookup_depth_explicit &&
+        !adaptive_lookup.any_low_level_flag, "adaptive lookup does not replace automatic kernel profile");
+    rejects([] { (void)parse({"decoder", "m", "1", "--prompt-lookup-adaptive"}); },
+        "adaptive prompt lookup requires --prompt-lookup without an explicit fixed depth");
+    rejects([] { (void)parse({"decoder", "m", "1", "--prompt-lookup", "--prompt-lookup-adaptive", "--prompt-lookup-depth", "2"}); },
+        "adaptive prompt lookup requires --prompt-lookup without an explicit fixed depth");
+    rejects([] { (void)parse({"decoder", "m", "1", "--prompt-lookup", "--prompt-lookup-adaptive", "--prompt-lookup-adaptive"}); },
+        "duplicate prompt lookup adaptive option");
     expect(!defaults.prompt_lookup, "prompt lookup remains opt-in");
     validate_resolved_prompt_lookup(defaults);
     auto lookup = paired_prompt;

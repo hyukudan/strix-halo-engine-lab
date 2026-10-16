@@ -217,4 +217,64 @@ SpeculationDecision choose_speculation_depth(
     return decision;
 }
 
+ObservedSpeculationController::ObservedSpeculationController(ObservedSpeculationPolicy policy)
+    : policy_(policy) {
+    if (!policy_.bootstrap_samples_per_depth || policy_.bootstrap_samples_per_depth > 64U ||
+        !policy_.reexplore_interval || policy_.reexplore_interval > 1048576U ||
+        !std::isfinite(policy_.switch_hysteresis_fraction) ||
+        policy_.switch_hysteresis_fraction < 0.0 || policy_.switch_hysteresis_fraction >= 1.0)
+        throw std::invalid_argument("invalid observed speculation policy");
+}
+
+std::uint32_t ObservedSpeculationController::select(std::uint32_t maximum_depth) {
+    if (maximum_depth > 2U) throw std::invalid_argument("observed speculation supports only depths zero, one or two");
+    if (pending_) throw std::logic_error("finish the previous observed speculation cycle before selection");
+    exploring_ = false;
+    for (std::uint32_t depth = 0; depth <= maximum_depth; ++depth) {
+        if (costs_[depth].samples < policy_.bootstrap_samples_per_depth) {
+            pending_ = true; selected_depth_ = depth; return depth;
+        }
+    }
+    // Sum wall time / sum actually consumed tokens weights observations by
+    // useful work. The strict 3% default threshold matches the fixed-sample
+    // controller, including retaining the current choice at the boundary.
+    const auto rate = [&](std::uint32_t depth) {
+        return costs_[depth].complete_cycle_seconds / static_cast<double>(costs_[depth].committed_tokens);
+    };
+    std::uint32_t best = 0;
+    for (std::uint32_t depth = 1; depth <= maximum_depth; ++depth)
+        if (rate(depth) < rate(best)) best = depth;
+    if (preferred_depth_ > maximum_depth ||
+        rate(best) < rate(preferred_depth_) * (1.0 - policy_.switch_hysteresis_fraction))
+        preferred_depth_ = best;
+    selected_depth_ = preferred_depth_;
+    if (since_exploration_ >= policy_.reexplore_interval) {
+        selected_depth_ = exploration_cursor_ % (maximum_depth + 1U);
+        exploring_ = true;
+    }
+    pending_ = true;
+    return selected_depth_;
+}
+
+bool ObservedSpeculationController::observe(std::uint32_t depth, double seconds,
+                                           std::uint64_t committed) noexcept {
+    if (!pending_ || depth != selected_depth_ || depth > 2U || !std::isfinite(seconds) || seconds <= 0.0 ||
+        !committed || committed > depth + 1U) return false;
+    auto& cost = costs_[depth];
+    const double total = cost.complete_cycle_seconds + seconds;
+    if (cost.samples == std::numeric_limits<std::uint64_t>::max() ||
+        committed > std::numeric_limits<std::uint64_t>::max() - cost.committed_tokens || !std::isfinite(total)) return false;
+    ++cost.samples; cost.committed_tokens += committed; cost.complete_cycle_seconds = total;
+    if (exploring_) { since_exploration_ = 0; exploration_cursor_ = (depth + 1U) % 3U; }
+    else if (since_exploration_ != std::numeric_limits<std::uint64_t>::max()) ++since_exploration_;
+    pending_ = false; exploring_ = false;
+    return true;
+}
+
+void ObservedSpeculationController::cancel_observation() noexcept { pending_ = false; exploring_ = false; }
+void ObservedSpeculationController::reset() noexcept {
+    costs_ = {}; since_exploration_ = 0; preferred_depth_ = 0; exploration_cursor_ = 0;
+    selected_depth_ = 0; pending_ = false; exploring_ = false;
+}
+
 }  // namespace strix

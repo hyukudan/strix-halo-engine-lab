@@ -750,7 +750,7 @@ int main(
             "  --gdn-recurrent-layout baseline|stride32|stride33|transposed (experimental eager LDS organization)\n"
             "  --gdn-recurrent-storage key-value|value-key (experimental physical state layout, default key-value)\n"
             "  --known-prefix-window [--known-prefix-rows 2|4|8] [--known-prefix-output-policy all-rows|terminal-row|state-only] (experimental known prompt)\n"
-            "  --prompt-lookup [--prompt-lookup-depth 0|1|2] (experimental greedy target verification, default off)\n"
+            "  --prompt-lookup [--prompt-lookup-depth 0|1|2 | --prompt-lookup-adaptive] (experimental greedy target verification, default off)\n"
             "  --serve-prefix-u32le FILE (repeat per request; independent C1 state, shared weights)\n"
             "  --serve-prefix-cache-entries N --serve-prefix-cache-snapshot-bytes N --serve-prefix-cache-capture-peak-bytes N --serve-prefix-cache-max-tokens N (all explicit, optional bounded shared pool)\n"
             "  --serve-concurrency 1|2|4 --serve-memory-budget-bytes N --serve-request-budget-bytes N --serve-headroom-bytes N\n"
@@ -2374,7 +2374,8 @@ int main(
                 lookup_runtime = std::make_unique<strix::HipPromptLookupRuntime>(compiled, model, catalog_config,
                     resources, *known_prefix_plan, known_prefix_owner, known_prefix_memory->scratch,
                     known_prefix_memory->serial_scope, known_prefix_memory->scope,
-                    std::static_pointer_cast<const void>(known_prefix_memory), original_work_device, allocator, generations);
+                    std::static_pointer_cast<const void>(known_prefix_memory), original_work_device, allocator, generations,
+                    strix::HipPromptLookupAdaptivePolicy{.enabled = options.prompt_lookup_adaptive});
         }
 
         const bool generation_request_timing_enabled =
@@ -2422,17 +2423,23 @@ int main(
                     generated.steps_executed = session.committed_tokens; // final logical input history, not transient verify work
                     if (plan.verification.stopped_on_eos) {
                         generated.stop_reason = strix::SerialRequestStopReason::eos;
+                        lookup_runtime->finish_adaptive_cycle(session);
                         break;
                     }
                     if (session.next_position >= request.context_capacity) {
                         generated.stop_reason = strix::SerialRequestStopReason::context_capacity;
+                        lookup_runtime->finish_adaptive_cycle(session);
                         break;
                     }
-                    if (generated.generated_tokens.size() >= request.max_new_tokens) break;
+                    if (generated.generated_tokens.size() >= request.max_new_tokens) {
+                        lookup_runtime->finish_adaptive_cycle(session);
+                        break;
+                    }
                     // Never consume the final emitted bonus on EOS, output-budget
                     // exhaustion or context exhaustion. History already contains it.
                     lookup_runtime->consume_pending_bonus(session, lookup, draft);
                     lookup_stats.add(lookup_stats.consumed_bonuses, 1);
+                    lookup_runtime->finish_adaptive_cycle(session);
                 }
                 return generated;
                 } catch (...) {
@@ -2502,6 +2509,24 @@ int main(
         }
         std::cout << "{\n" << optimization_profile_receipt << eager_submission_receipt << overlap_receipt() << execution_inventory_receipt << gdn_output_mode_receipt() << wave_router_mode_receipt << deferred_moe_mode_receipt;
         if (lookup_runtime) {
+            if (options.prompt_lookup_adaptive) {
+                const auto& adaptive = lookup_runtime->adaptive_stats();
+                const auto previous_precision = std::cout.precision(17);
+                std::cout << "  \"prompt_lookup_adaptive\":{\"enabled\":" << (adaptive.enabled ? "true" : "false")
+                    << ",\"scope\":\"completed-host-wall-cycle-including-continuing-bonus-and-publication-not-GPU-time\","
+                    << "\"qualification\":\"not_assessed\",\"selected_depth\":" << adaptive.selected_depth
+                    << ",\"completed_cycles\":" << adaptive.completed_cycles << ",\"censored_cycles\":" << adaptive.censored_cycles
+                    << ",\"context_resets\":" << adaptive.context_resets << ",\"depths\":[";
+                for (std::size_t depth = 0; depth < 3U; ++depth) {
+                    if (depth) std::cout << ',';
+                    std::cout << "{\"depth\":" << depth << ",\"selections\":" << adaptive.depth_selections[depth]
+                        << ",\"samples\":" << adaptive.samples[depth] << ",\"emitted_tokens\":" << adaptive.emitted_tokens[depth]
+                        << ",\"committed_tokens\":" << adaptive.committed_tokens[depth]
+                        << ",\"complete_cycle_seconds\":" << adaptive.complete_cycle_seconds[depth] << '}';
+                }
+                std::cout << "]},\n";
+                std::cout.precision(previous_precision);
+            }
             std::cout << "  \"prompt_lookup\":true,\n"
                 << "  \"prompt_lookup_qualification\":\"not_assessed\",\n"
                 << "  \"prompt_lookup_max_depth\":" << options.prompt_lookup_depth << ",\n"

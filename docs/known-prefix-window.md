@@ -147,3 +147,19 @@ state/D1 checks; only the final serial input computes the full head for the
 frontier. `known_prefix_serial_lm_heads_omitted` and
 `known_prefix_serial_state_only_steps` describe that serial path separately from
 the native window omission counters. Default/all-row/RAW paths are unchanged.
+
+## Opt-in measured lookup depth
+
+`--prompt-lookup-adaptive` requires `--prompt-lookup` and rejects an explicit
+`--prompt-lookup-depth`; the existing fixed-depth default remains unchanged.
+The runtime selects only depths0/1/2. Completed host-wall observations include
+proposal, snapshot, verification, restore/replay, selection, main output handling
+and the pending bonus consumption when generation continues. Main closes each
+observation before its next iteration or terminal break. A final unconsumed
+bonus makes that observation censored rather than a fabricated cheap sample.
+
+The adaptive receipt reports actual selections, samples, emitted/committed inputs
+and complete-cycle seconds per depth. Host wall is not GPU busy time, a numerical
+qualification receipt or proof of speed. The controller's bounded exploration and
+context resets do not change the target's verifier, EOS or final-bonus policy.
+All arithmetic and ownership gates remain independently required.

@@ -3,13 +3,27 @@
 #include "strix/hip_launch_context.hpp"
 #include "strix/prompt_lookup_draft.hpp"
 #include "strix/speculation_executor.hpp"
+#include "strix/speculation_controller.hpp"
+#include <array>
 #include <memory>
 #include <optional>
 
 namespace strix {
 class HipSetupQuiescenceGuard;
-// Explicit experimental greedy target. No sampling/MTP or automatic depth
-// policy. D=2 uses the actual known-input R2 owner; D=1 is identified serial
+struct HipPromptLookupAdaptivePolicy {
+    bool enabled = false;
+    ObservedSpeculationPolicy controller{};
+    std::uint64_t context_bucket_tokens = 256;
+};
+struct HipPromptLookupAdaptiveStats {
+    bool enabled = false;
+    std::uint32_t selected_depth = 0;
+    std::uint64_t completed_cycles = 0, censored_cycles = 0, context_resets = 0;
+    std::array<std::uint64_t, 3> depth_selections{}, samples{}, emitted_tokens{}, committed_tokens{};
+    std::array<double, 3> complete_cycle_seconds{};
+};
+// Explicit experimental greedy target. No sampling/MTP. D=2 uses the actual
+// known-input R2 owner; D=1 is identified serial
 // fallback; D=0 selects the already-computed target frontier without consuming
 // state. Both complete R2 heads are selected on device with finite/firstmax.
 //
@@ -26,7 +40,8 @@ public:
         CompiledKnownPrefixWindow compiled_window, std::shared_ptr<HipKnownPrefixWindow> window,
         ExecutionMemoryBinding window_scratch, HipLaunchContext serial_scope, HipLaunchContext window_scope,
         std::shared_ptr<const void> actual_owner, std::shared_ptr<const HipSetupQuiescenceGuard> guard,
-        RuntimeMemoryAllocator& snapshot_allocator, AllocationGenerationSource& generations);
+        RuntimeMemoryAllocator& snapshot_allocator, AllocationGenerationSource& generations,
+        HipPromptLookupAdaptivePolicy adaptive = {});
     ~HipPromptLookupRuntime();
     HipPromptLookupRuntime(const HipPromptLookupRuntime&) = delete;
     HipPromptLookupRuntime& operator=(const HipPromptLookupRuntime&) = delete;
@@ -42,6 +57,12 @@ public:
     // now-consumed target state before the next proposal.
     void consume_pending_bonus(SerialSessionContext& session,
         const PromptLookupDraftBackend& lookup, DraftProposalStateContext& draft_state);
+    // Opt-in wall scope: cycle entry through this call, AFTER bonus consumption
+    // and caller publication/bookkeeping. An unconsumed terminal bonus censors
+    // the observation. No GPU-time/correctness qualification is inferred.
+    // Finish once before another adaptive cycle. Disabled mode reads no clock.
+    void finish_adaptive_cycle(const SerialSessionContext& session) noexcept;
+    [[nodiscard]] const HipPromptLookupAdaptiveStats& adaptive_stats() const noexcept;
     [[nodiscard]] std::optional<std::uint32_t> pending_bonus() const noexcept;
     [[nodiscard]] std::vector<std::uint32_t> verify_target_candidates(SerialSessionContext&,
         const ExecutionRuntimeResources&, std::span<const std::uint32_t>) override;

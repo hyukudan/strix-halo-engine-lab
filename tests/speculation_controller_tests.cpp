@@ -1,6 +1,7 @@
 #include "strix/speculation_controller.hpp"
 
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <vector>
 
@@ -137,6 +138,92 @@ int main() {
     }
     expect(duplicate,
            "controller rejects duplicate proposal/depth observations");
+
+    {
+        // These are synthetic host costs, not measurements or qualification
+        // of any native depth. Real lookup records only after bonus consumption.
+        strix::ObservedSpeculationController observed;
+        for (std::uint32_t depth=0; depth<3; ++depth) {
+            for (int repetition=0; repetition<2; ++repetition) {
+                expect(observed.select(2)==depth,"observed bootstrap measures serial before each positive depth");
+                const double seconds=depth==0 ? .010 : (depth==1 ? .018 : .021);
+                expect(observed.observe(depth,seconds,depth+1U),"completed full-cycle sample admitted");
+            }
+        }
+        expect(observed.select(2)==2,"observed controller compares full wall cost per consumed token");
+        expect(observed.observe(2,.021,3),"selected completed depth-two cycle recorded");
+        expect(observed.costs()[0].samples==2 && observed.costs()[2].committed_tokens==9,
+            "observed controller retains real sample and consumed-token counts");
+        observed.reset();
+        expect(observed.costs()[2].samples==0 && observed.select(2)==0,
+            "new runtime cost context discards all previous cost estimates");
+        observed.cancel_observation();
+        expect(observed.select(0)==0,"depth zero remains available under an effective zero cap");
+        observed.cancel_observation();
+        expect(observed.costs()[0].samples==0,"censored terminal frontier is not a free serial baseline");
+    }
+    {
+        strix::ObservedSpeculationPolicy observed_policy;
+        observed_policy.bootstrap_samples_per_depth=1;
+        observed_policy.reexplore_interval=4;
+        strix::ObservedSpeculationController observed(observed_policy);
+        expect(observed.select(1)==0 && observed.observe(0,.010,1),"synthetic completed baseline");
+        expect(observed.select(1)==1 && observed.observe(1,.0196,2),"synthetic marginal positive-depth cost");
+        expect(observed.select(1)==0,"three percent hysteresis retains serial at a two percent gain");
+        expect(observed.observe(0,.010,1),"record first exploitation cycle");
+        expect(observed.select(1)==0 && observed.observe(0,.010,1),"record second exploitation cycle");
+        expect(observed.select(1)==0 && observed.observe(0,.010,1),"bounded exploration includes actual depth zero");
+        for(int cycle=0;cycle<4;++cycle) {
+            expect(observed.select(1)==0,"preferred serial between exploration observations");
+            expect(observed.observe(0,.010,1),"complete serial cycle before next exploration");
+        }
+        expect(observed.select(1)==1,"bounded exploration revisits the other available depth");
+        observed.cancel_observation();
+    }
+    {
+        strix::ObservedSpeculationPolicy observed_policy;
+        observed_policy.bootstrap_samples_per_depth=1;
+        observed_policy.reexplore_interval=100;
+        strix::ObservedSpeculationController observed(observed_policy);
+        expect(observed.select(1)==0 && observed.observe(0,.010,1),"actual serial denominator is one");
+        expect(observed.select(1)==1 && observed.observe(1,.014,2),"positive-depth useful work can amortize full cost");
+        expect(observed.select(1)==1,"beneficial observed depth selected after serial baseline");
+        // A long bonus consumption/publication time must remain in the same
+        // unsplit scope, rather than comparing just the cheap verification.
+        expect(observed.observe(1,.100,1),"one accepted output still pays its complete observed wall cost");
+        expect(observed.select(1)==0,"full cycle slowdown returns to depth zero");
+        observed.cancel_observation();
+    }
+    {
+        strix::ObservedSpeculationController observed;
+        expect(!observed.observe(0,.010,1),"unselected sample cannot enter online costs");
+        expect(observed.select(2)==0,"start censored/invalid measurement checks");
+        for(double invalid:{0.0,-1.0,std::numeric_limits<double>::infinity(),std::numeric_limits<double>::quiet_NaN()})
+            expect(!observed.observe(0,invalid,1),"nonfinite or empty full wall observation rejected");
+        expect(!observed.observe(0,.010,0) && !observed.observe(0,.010,2) && !observed.observe(1,.010,1),
+            "zero/incorrect baseline denominator or foreign selected depth rejected");
+        expect(observed.costs()[0].samples==0,"invalid observations leave all cost totals unchanged");
+        bool pending_rejected=false;
+        try { static_cast<void>(observed.select(2)); } catch(const std::logic_error&) { pending_rejected=true; }
+        expect(pending_rejected,"cannot select twice across an unfinished observed cycle");
+        observed.cancel_observation();
+        bool cap_rejected=false;
+        try { static_cast<void>(observed.select(3)); } catch(const std::invalid_argument&) { cap_rejected=true; }
+        expect(cap_rejected,"unsupported observed depth rejected before selection");
+        expect(observed.select(0)==0 && observed.observe(0,.010,1),"healthy baseline survives cancelled observation");
+    }
+    {
+        bool invalid_policy=false;
+        try { strix::ObservedSpeculationPolicy p; p.bootstrap_samples_per_depth=0;
+            strix::ObservedSpeculationController observed(p); }
+        catch(const std::invalid_argument&) { invalid_policy=true; }
+        expect(invalid_policy,"zero bootstrap repetitions rejected before execution");
+        invalid_policy=false;
+        try { strix::ObservedSpeculationPolicy p; p.reexplore_interval=0;
+            strix::ObservedSpeculationController observed(p); }
+        catch(const std::invalid_argument&) { invalid_policy=true; }
+        expect(invalid_policy,"zero reexploration interval rejected before execution");
+    }
 
     if (failures == 0) {
         std::cout << "speculation controller tests passed\n";

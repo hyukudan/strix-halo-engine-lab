@@ -182,6 +182,7 @@ struct Options {
     std::string offline_tuning_cache_path;
     strix::KnownWindowOutputPolicy known_prefix_output_policy = strix::KnownWindowOutputPolicy::all_rows;
     bool known_prefix_output_policy_explicit = false;
+    bool prompt_lookup_adaptive = false;
     std::uint64_t serving_cache_entries = 0, serving_cache_snapshot_bytes = 0;
     std::uint64_t serving_cache_capture_peak_bytes = 0, serving_cache_max_prefix_tokens = 0;
     bool serving_cache_entries_explicit = false, serving_cache_snapshot_explicit = false;
@@ -338,6 +339,8 @@ inline void validate_resolved_serving(const Options& options) {
 }
 
 inline void validate_resolved_prompt_lookup(const Options& options) {
+    if (options.prompt_lookup_adaptive && (!options.prompt_lookup || options.prompt_lookup_depth_explicit))
+        throw std::invalid_argument("adaptive prompt lookup requires --prompt-lookup without an explicit fixed depth");
     if (!options.prompt_lookup) return;
     if (options.known_prefix_window || options.prompt_lookup_depth > 2 ||
         !options.generate_tokens || options.execution.mode != strix::DecodeExecutionMode::eager ||
@@ -408,7 +411,7 @@ inline Options parse_options(
         throw std::invalid_argument(
             "usage: strix-hip-decode-token MODEL.gguf [TOKEN_ID ...] "
             "[--optimization-profile auto|manual] [--execution-inventory] [--host-dispatch-telemetry] [--execution-telemetry-trace] "
-            "[--gpu-greedy-token] [--logprob-token ID ...] [--offline-tuning-cache FILE] [--gdn-recurrent-layout baseline|stride32|stride33|transposed] [--gdn-recurrent-storage key-value|value-key] [--known-prefix-window --known-prefix-rows 2|4|8 --known-prefix-expert-union] [--prompt-lookup] [--prompt-lookup-depth 0|1|2] [--serve-prefix-u32le FILE ... --serve-concurrency 1|2|4 --serve-memory-budget-bytes N --serve-request-budget-bytes N --serve-headroom-bytes N] [--gdn-islands] [--qsa-hierarchical-selection] [--qsa-gqa-heads-per-block 1|2|4] [--prepared-eager] [--moe-shared-overlap] [--moe-overlap-arena-budget-bytes N] [--batched-moe-activation] [--validation-final-state DIR] [--validation-final-state-max-bytes N] [--reference FILE] [--max-logit-error X] "
+            "[--gpu-greedy-token] [--logprob-token ID ...] [--offline-tuning-cache FILE] [--gdn-recurrent-layout baseline|stride32|stride33|transposed] [--gdn-recurrent-storage key-value|value-key] [--known-prefix-window --known-prefix-rows 2|4|8 --known-prefix-expert-union] [--prompt-lookup [--prompt-lookup-depth 0|1|2 | --prompt-lookup-adaptive]] [--serve-prefix-u32le FILE ... --serve-concurrency 1|2|4 --serve-memory-budget-bytes N --serve-request-budget-bytes N --serve-headroom-bytes N] [--gdn-islands] [--qsa-hierarchical-selection] [--qsa-gqa-heads-per-block 1|2|4] [--prepared-eager] [--moe-shared-overlap] [--moe-overlap-arena-budget-bytes N] [--batched-moe-activation] [--validation-final-state DIR] [--validation-final-state-max-bytes N] [--reference FILE] [--max-logit-error X] "
             "[--context N] [--residency register|copy] [--coalesce-gap BYTES] "
             "[--planned-ple-io] [--ple-cpu-helper-threads 1..8] [--ple-max-rows-per-io N] [--ple-max-inflight-ios N] "
             "[--generate N] [--eos-token TOKEN_ID] [--prefix-cache-roundtrip] "
@@ -490,6 +493,11 @@ inline Options parse_options(
         if (argument == "--prompt-lookup") {
             if (options.prompt_lookup) throw std::invalid_argument("duplicate prompt lookup option");
             options.prompt_lookup = true;
+            continue;
+        }
+        if (argument == "--prompt-lookup-adaptive") {
+            if (options.prompt_lookup_adaptive) throw std::invalid_argument("duplicate prompt lookup adaptive option");
+            options.prompt_lookup_adaptive = true;
             continue;
         }
         if (argument == "--prompt-lookup-depth") {
@@ -1071,6 +1079,8 @@ inline Options parse_options(
         throw std::invalid_argument("known-prefix expert union requires --known-prefix-window");
     if (options.known_prefix_rows_explicit && !options.known_prefix_window)
         throw std::invalid_argument("known-prefix rows require --known-prefix-window");
+    if (options.prompt_lookup_adaptive && (!options.prompt_lookup || options.prompt_lookup_depth_explicit))
+        throw std::invalid_argument("adaptive prompt lookup requires --prompt-lookup without an explicit fixed depth");
     if (options.prompt_lookup_depth_explicit && !options.prompt_lookup)
         throw std::invalid_argument("prompt lookup depth requires --prompt-lookup");
     if (options.execution_telemetry_trace && !options.host_dispatch_telemetry)

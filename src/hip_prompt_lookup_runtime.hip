@@ -7,6 +7,9 @@
 #include "strix/ple_lookup.hpp"
 #include <hip/hip_runtime.h>
 #include <array>
+#include <algorithm>
+#include <chrono>
+#include <cmath>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -74,14 +77,37 @@ struct HipPromptLookupRuntime::Impl {
     std::optional<std::uint32_t> pending;
     struct Point { SerialSessionContext session; std::uint32_t token = 0; bool valid = false; };
     Point base, verified, replayed;
+    HipPromptLookupAdaptivePolicy adaptive_policy;
+    HipPromptLookupAdaptiveStats adaptive_stats;
+    std::optional<ObservedSpeculationController> adaptive_controller;
+    struct AdaptiveContext {
+        std::uint64_t proposal = 0, bucket = 0, snapshot_alignment = 0;
+        std::uint32_t maximum_depth = 0;
+        std::vector<std::uint32_t> eos;
+        bool valid = false;
+    } adaptive_context;
+    struct AdaptiveMeasurement {
+        std::chrono::steady_clock::time_point started{};
+        std::uint64_t position = 0, committed = 0, emitted = 0;
+        std::uint32_t depth = 0;
+        bool active = false;
+    } adaptive_measurement;
 
     Impl(CompiledSerialExecution s, ModelContract m, HipLauncherCatalogConfig cfg,
         const ExecutionRuntimeResources& r, CompiledKnownPrefixWindow w, std::shared_ptr<HipKnownPrefixWindow> native,
         ExecutionMemoryBinding memory, HipLaunchContext serial_stream, HipLaunchContext stream, std::shared_ptr<const void> retained,
-        std::shared_ptr<const HipSetupQuiescenceGuard> original, RuntimeMemoryAllocator& a, AllocationGenerationSource& g)
+        std::shared_ptr<const HipSetupQuiescenceGuard> original, RuntimeMemoryAllocator& a, AllocationGenerationSource& g,
+        HipPromptLookupAdaptivePolicy adaptive)
         : owner(std::move(retained)), guard(std::move(original)), serial(std::move(s)), model(std::move(m)),
           config(std::move(cfg)), resources(r), compiled_window(std::move(w)), window(std::move(native)),
           window_memory(memory), scope(stream), serial_scope(serial_stream), allocator(a), generations(g), transfer(guard), catalog(model,config) {
+        adaptive_policy=adaptive;
+        if(adaptive.enabled) {
+            require_lookup(adaptive.context_bucket_tokens && adaptive.context_bucket_tokens<=1048576U,
+                "prompt lookup adaptive context bucket must be within one and 1048576 tokens");
+            adaptive_controller.emplace(adaptive.controller);
+            adaptive_stats.enabled=true;
+        }
         require_lookup(owner && guard && window && model.vocab_size && model.vocab_size <= std::numeric_limits<std::uint32_t>::max(),
             "prompt lookup requires retained native owners and a uint32 vocabulary");
         require_lookup(!serial.device_graph_inputs && !config.enable_device_graph_inputs && config.gdn_recurrent_layout == HipGdnRecurrentLayout::baseline,
@@ -213,18 +239,79 @@ struct HipPromptLookupRuntime::Impl {
             throw;
         }
     }
+    static void count(std::uint64_t& value,std::uint64_t increment=1) noexcept {
+        value=increment>std::numeric_limits<std::uint64_t>::max()-value ?
+            std::numeric_limits<std::uint64_t>::max() : value+increment;
+    }
+    void censor_adaptive() noexcept {
+        if(!adaptive_measurement.active) return;
+        count(adaptive_stats.censored_cycles);
+        adaptive_controller->cancel_observation();
+        adaptive_measurement.active=false;
+    }
+    void start_adaptive(const SerialSessionContext& session,const DraftProposalStateContext& draft_state,
+        GreedyDraftExecutionRequest& request,std::chrono::steady_clock::time_point started) {
+        require_lookup(!adaptive_measurement.active,"finish the previous adaptive prompt lookup cycle first");
+        require_lookup(request.token_budget!=0,"draft speculation token budget must be non-zero");
+        const auto remaining=std::min(resources.session_state_layout->context_tokens,model.max_position_embeddings)-session.next_position;
+        const auto cap=draft_state.phase==DraftProposalStatePhase::poisoned ? 0U :
+            static_cast<std::uint32_t>(std::min<std::uint64_t>(request.max_candidate_depth,
+                std::min<std::uint64_t>(remaining,request.token_budget-1U)));
+        const auto bucket=session.next_position/adaptive_policy.context_bucket_tokens;
+        // Execution, numerical and allocation identities are fixed for this
+        // retained runtime and checked by admit(). EOS is compared in full;
+        // neither a hash collision nor an unrelated bucket reuses cost data.
+        if(!adaptive_context.valid || adaptive_context.proposal!=draft_state.proposal_identity ||
+            adaptive_context.bucket!=bucket || adaptive_context.maximum_depth!=cap ||
+            adaptive_context.snapshot_alignment!=request.snapshot_alignment ||
+            !std::equal(adaptive_context.eos.begin(),adaptive_context.eos.end(),request.eos_tokens.begin(),request.eos_tokens.end())) {
+            std::vector<std::uint32_t> eos(request.eos_tokens.begin(),request.eos_tokens.end());
+            adaptive_context={draft_state.proposal_identity,bucket,request.snapshot_alignment,cap,std::move(eos),true};
+            adaptive_controller->reset();
+            count(adaptive_stats.context_resets);
+        }
+        const auto selected=adaptive_controller->select(cap);
+        request.max_candidate_depth=selected;
+        adaptive_measurement={started,session.next_position,session.committed_tokens,0,selected,true};
+        adaptive_stats.selected_depth=selected;
+        count(adaptive_stats.depth_selections[selected]);
+    }
+    void finish_adaptive(const SerialSessionContext& session) noexcept {
+        if(!adaptive_measurement.active) return;
+        const auto ended=std::chrono::steady_clock::now();
+        const auto& m=adaptive_measurement;
+        const bool complete=!pending && !failed && session.health==SerialSessionHealth::ready && !session.arithmetic_lineage.tainted &&
+            session.execution_identity==serial.execution_identity && session.state_layout_identity==resources.session_state_layout->layout_identity &&
+            session.runtime_compatibility_identity==original_identities.compatibility_identity &&
+            session.committed_tokens>=m.committed && session.next_position>=m.position && m.emitted &&
+            session.committed_tokens-m.committed==m.emitted && session.next_position-m.position==m.emitted;
+        const double seconds=std::chrono::duration<double>(ended-m.started).count();
+        const double total=adaptive_stats.complete_cycle_seconds[m.depth]+seconds;
+        if(!complete || !std::isfinite(total) || !adaptive_controller->observe(m.depth,seconds,m.emitted)) {
+            censor_adaptive();return;
+        }
+        count(adaptive_stats.completed_cycles);
+        count(adaptive_stats.samples[m.depth]);
+        count(adaptive_stats.emitted_tokens[m.depth],m.emitted);
+        count(adaptive_stats.committed_tokens[m.depth],session.committed_tokens-m.committed);
+        adaptive_stats.complete_cycle_seconds[m.depth]=total;
+        adaptive_measurement.active=false;
+    }
 };
 HipPromptLookupRuntime::HipPromptLookupRuntime(CompiledSerialExecution serial,ModelContract model,
     HipLauncherCatalogConfig config,const ExecutionRuntimeResources& resources,CompiledKnownPrefixWindow compiled_window,
     std::shared_ptr<HipKnownPrefixWindow> window,ExecutionMemoryBinding scratch,HipLaunchContext serial_scope,HipLaunchContext scope,
     std::shared_ptr<const void> owner,std::shared_ptr<const HipSetupQuiescenceGuard> guard,
-    RuntimeMemoryAllocator& allocator,AllocationGenerationSource& generations)
+    RuntimeMemoryAllocator& allocator,AllocationGenerationSource& generations,HipPromptLookupAdaptivePolicy adaptive)
     :impl_(std::make_unique<Impl>(std::move(serial),std::move(model),std::move(config),resources,std::move(compiled_window),
-        std::move(window),scratch,serial_scope,scope,std::move(owner),std::move(guard),allocator,generations)) {}
+        std::move(window),scratch,serial_scope,scope,std::move(owner),std::move(guard),allocator,generations,adaptive)) {}
 HipPromptLookupRuntime::~HipPromptLookupRuntime()=default;
 void HipPromptLookupRuntime::prime_from_serial_logits(SerialSessionContext& session) {
     impl_->admit(session);
     require_lookup(session.next_position>0,"prompt lookup prime requires a completed serial input");
+    if(impl_->adaptive_policy.enabled) {
+        impl_->censor_adaptive();impl_->adaptive_controller->reset();impl_->adaptive_context.valid=false;
+    }
     try {
         impl_->complete(impl_->serial_scope);
         impl_->base={session,impl_->select(*impl_->serial_select,impl_->serial_logits(),session.next_position-1U),true};
@@ -270,15 +357,20 @@ void HipPromptLookupRuntime::replay_target_token(SerialSessionContext& session,c
 }
 GreedyDraftExecutionResult HipPromptLookupRuntime::cycle(SerialSessionContext& session,PromptLookupDraftBackend& lookup,
     DraftProposalStateContext& draft_state,const GreedyDraftExecutionRequest& request) {
+    // Disabled mode performs no clock reads and retains the fixed request.
+    const auto started=impl_->adaptive_policy.enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     impl_->admit(session);
     require_lookup(!impl_->pending,"consume the pending bonus before another prompt lookup cycle");
     require_lookup(request.max_candidate_depth<=2U,"prompt lookup maps depths only to zero, one or two target rows");
     require_lookup(draft_state.proposal_identity==lookup.proposal_identity(),"prompt lookup proposal owner changed");
+    auto selected_request=request;
+    if(impl_->adaptive_policy.enabled) impl_->start_adaptive(session,draft_state,selected_request,started);
     GreedyDraftExecutionResult result;
     try {
-        result=execute_greedy_speculation_with_draft(impl_->model,impl_->serial,impl_->resources,session,request,
+        result=execute_greedy_speculation_with_draft(impl_->model,impl_->serial,impl_->resources,session,selected_request,
             impl_->allocator,impl_->generations,impl_->transfer,draft_state,lookup,*this);
     } catch(...) {
+        impl_->censor_adaptive();
         if(impl_->transfer.failed()) {
             impl_->failed=true; session.health=SerialSessionHealth::poisoned;session.arithmetic_lineage.tainted=true;
         }
@@ -291,11 +383,15 @@ GreedyDraftExecutionResult HipPromptLookupRuntime::cycle(SerialSessionContext& s
             begin_draft_proposal(draft_state,session);finish_draft_proposal(draft_state);
             lookup.reconcile_after_target(draft_state,session,result.target_cycle.plan.emitted_tokens);
             reconcile_draft_proposal_state(draft_state,session);
-        } catch(...) { poison_draft_proposal_state(draft_state); throw; }
+        } catch(...) { impl_->censor_adaptive();poison_draft_proposal_state(draft_state); throw; }
     }
-    require_lookup(!result.target_cycle.plan.emitted_tokens.empty(),"prompt lookup cycle emitted no frontier");
+    if(result.target_cycle.plan.emitted_tokens.empty()) {
+        impl_->censor_adaptive();
+        throw std::invalid_argument("prompt lookup cycle emitted no frontier");
+    }
     impl_->pending=result.target_cycle.plan.emitted_tokens.back();
     impl_->stopped_on_eos=result.target_cycle.plan.verification.stopped_on_eos;
+    if(impl_->adaptive_measurement.active) impl_->adaptive_measurement.emitted=result.target_cycle.plan.emitted_tokens.size();
     return result;
 }
 void HipPromptLookupRuntime::consume_pending_bonus(SerialSessionContext& session,const PromptLookupDraftBackend& lookup,
@@ -315,4 +411,8 @@ void HipPromptLookupRuntime::consume_pending_bonus(SerialSessionContext& session
     impl_->pending.reset();
 }
 std::optional<std::uint32_t> HipPromptLookupRuntime::pending_bonus() const noexcept { return impl_->pending; }
+void HipPromptLookupRuntime::finish_adaptive_cycle(const SerialSessionContext& session) noexcept {
+    if(impl_->adaptive_policy.enabled) impl_->finish_adaptive(session);
+}
+const HipPromptLookupAdaptiveStats& HipPromptLookupRuntime::adaptive_stats() const noexcept { return impl_->adaptive_stats; }
 } // namespace strix
