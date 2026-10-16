@@ -1,6 +1,7 @@
 // Explicit G4 known-prompt foundation qualification; never CTest or public CLI.
 // Full heads, correctness only. No speed or quality admission.
 #include "strix/hip_known_prefix_window.hpp"
+#include "strix/hip_known_prompt_backend.hpp"
 #include "strix/hip_model_residency.hpp"
 #include "strix/hip_runtime_allocator.hpp"
 #include "strix/hip_setup_quiescence.hpp"
@@ -64,9 +65,10 @@ void require_mixed_window(const strix::CompiledKnownPrefixWindow& window) {
         window.logical_projection_weight_bytes_avoided == 2456616960ULL,
         "real model does not admit exactly 48 shared, zero all-Q8 GDN and 36 mixed GDN R2 steps");
 }
-bool mixed_dispatch_counts(const strix::KnownWindowResult& result) {
-    return result.r2_dispatches == 84 && result.row_loop_dispatches == 708 &&
-        result.r2_variant_dispatches == expected_variants && result.projection_launches_saved == 252 &&
+bool mixed_dispatch_counts(const strix::HipKnownPromptBackendStats& result) {
+    return result.windows == 1U && !result.saturated && result.r2_dispatches == 84 && result.row_loop_dispatches == 708 &&
+        std::equal(result.r2_variant_dispatches.begin(), result.r2_variant_dispatches.end(), expected_variants.begin(), expected_variants.end()) &&
+        result.projection_launches_saved == 252 &&
         result.logical_projection_weight_bytes_avoided == 2456616960ULL;
 }
 std::string variant_counts_json(const VariantCounts& counts) {
@@ -430,7 +432,7 @@ strix::SerialSessionContext fresh_session(const std::shared_ptr<Owners>& owner) 
         session.state.valid = session.state.valid | allocation.state_flag;
     return session;
 }
-void reset_fresh(const std::shared_ptr<Owners>& owner, const std::unique_ptr<strix::HipKnownPrefixWindow>& window,
+void reset_fresh(const std::shared_ptr<Owners>& owner, const std::shared_ptr<strix::HipKnownPrefixWindow>& window,
                  strix::SerialSessionContext& session) {
     require(!window && !owner->prefetch.active, "reset requires a destroyed window and inactive PLE");
     owner->guard->run([&] {
@@ -502,7 +504,7 @@ private:
 class QualWindowBackend final : public strix::KnownPromptWindowBackend {
 public:
     QualWindowBackend(std::shared_ptr<Owners> value, strix::SerialSessionContext& current,
-        std::unique_ptr<strix::HipKnownPrefixWindow>& instance, Branch& records,
+        std::shared_ptr<strix::HipKnownPrefixWindow>& instance, Branch& records,
         const std::filesystem::path& directory)
         : owner(std::move(value)), session(current), window(instance), branch(records), output(directory) {}
     std::vector<float> execute_window(std::array<std::uint32_t, 2> tokens, std::uint64_t position) override {
@@ -510,16 +512,39 @@ public:
         const auto next_oracle = strix::prepare_prefill_chunk_lineage(branch.oracle, position, position + 2U,
             owner->window.window_execution_identity, owner->window.window_kernel_plan_identity,
             owner->window.window_execution_identity);
-        const auto result = window->execute(session, tokens);
+        // Exercise the actual production adapter once, not a second native
+        // execute beside the instrumentation. Its scope/stream/status owners
+        // are the same eager-only shape as the decoder's KnownPromptMemory.
+        // Keep this adapter local: window.reset() at cache/reset boundaries must
+        // destroy the native owner rather than leave a hidden retained alias.
+        strix::HipKnownPromptBackend production(window, session, owner->window_memory,
+            owner->model.vocab_size, owner->guard);
+        const auto returned_terminal = production.execute_window(tokens, position);
+        const auto result = production.stats();
         require_mixed_window(owner->window);
         require(mixed_dispatch_counts(result),
-            "G4 window did not execute the closed mixed-format 84/708 and variant dispatches");
+            "G4 production adapter did not execute one closed mixed-format 84/708 window with actual variant dispatches");
         require(!owner->prefetch.active, "G4 window left an active PLE lookup");
-        branch.windows.push_back({position, result.r2_dispatches, result.row_loop_dispatches, result.r2_variant_dispatches});
+        VariantCounts variant_dispatches{};
+        for (std::size_t i = 0; i < variant_dispatches.size(); ++i) {
+            require(result.r2_variant_dispatches[i] <= std::numeric_limits<std::uint32_t>::max(),
+                "G4 per-window production variant counter exceeds its recording type");
+            variant_dispatches[i] = static_cast<std::uint32_t>(result.r2_variant_dispatches[i]);
+        }
+        branch.windows.push_back({position, result.r2_dispatches, result.row_loop_dispatches, variant_dispatches});
         branch.calls.push_back("window:" + std::to_string(position) + ":" +
             std::to_string(tokens[0]) + ":" + std::to_string(tokens[1]));
-        (void)record_row(owner, branch, output, result.logits[0], position, tokens[0], "window-row0");
-        auto terminal = record_row(owner, branch, output, result.logits[1], position + 1U, tokens[1], "window-row1");
+        std::array<strix::ExecutionBufferAddress,2> row_logits;
+        for (std::size_t row = 0; row < row_logits.size(); ++row) {
+            const auto& plan = owner->window.row_plan[row];
+            row_logits[row] = strix::resolve_execution_buffer(plan.execution_identity, plan.arena,
+                owner->window_memory, plan.io.steps.back().writes.front());
+        }
+        (void)record_row(owner, branch, output, row_logits[0], position, tokens[0], "window-row0");
+        auto terminal = record_row(owner, branch, output, row_logits[1], position + 1U, tokens[1], "window-row1");
+        require(returned_terminal.size() == terminal.size() &&
+            std::memcmp(returned_terminal.data(), terminal.data(), terminal.size() * sizeof(float)) == 0,
+            "production adapter terminal full FP32 row differs bitwise from independent arena readback");
         branch.oracle = next_oracle;
         require_oracle(session, branch.oracle);
         return terminal;
@@ -527,7 +552,7 @@ public:
 private:
     std::shared_ptr<Owners> owner;
     strix::SerialSessionContext& session;
-    std::unique_ptr<strix::HipKnownPrefixWindow>& window;
+    std::shared_ptr<strix::HipKnownPrefixWindow>& window;
     Branch& branch;
     std::filesystem::path output;
 };
@@ -634,7 +659,7 @@ int qualify(const Options& args) {
     const auto config = configure(args, binding, buffers);
     const auto owner = load(args, config, binding, buffers);
     CacheLifetime cached(owner); // destroyed before model/state allocator
-    std::unique_ptr<strix::HipKnownPrefixWindow> window; // destroyed before cache on every exit
+    std::shared_ptr<strix::HipKnownPrefixWindow> window; // destroyed before cache on every exit
     auto catalog = std::make_shared<strix::HipLauncherCatalog>(owner->model, config);
     strix::ExecutionLauncherRegistry registry;
     catalog->register_for_compiled_execution(owner->serial, registry, &owner->resources);
@@ -679,7 +704,7 @@ int qualify(const Options& args) {
         "G4 controller lost EOS/budget priority or consumed its last emitted token");
 
     reset_fresh(owner, window, session);
-    window = std::make_unique<strix::HipKnownPrefixWindow>(owner->window, owner->serial, owner->model, config,
+    window = std::make_shared<strix::HipKnownPrefixWindow>(owner->window, owner->serial, owner->model, config,
         owner->resources, owner->window_memory, owner->scope(), std::static_pointer_cast<const void>(owner));
     QualSerialBackend serial2(owner, session, dispatcher, b2, args.output);
     QualWindowBackend windows2(owner, session, window, b2, args.output);
@@ -733,7 +758,7 @@ int qualify(const Options& args) {
         "G4 oracle witness cannot distinguish serial from chunk producers");
 
     // Missing G3 recovery leg only: no constructor-mutation matrix is repeated.
-    window = std::make_unique<strix::HipKnownPrefixWindow>(owner->window, owner->serial, owner->model, config,
+    window = std::make_shared<strix::HipKnownPrefixWindow>(owner->window, owner->serial, owner->model, config,
         owner->resources, owner->window_memory, owner->scope(), std::static_pointer_cast<const void>(owner));
     bool rejected = false;
     try { (void)window->execute(session, {static_cast<std::uint32_t>(owner->model.vocab_size), prompt[1]}); }
@@ -827,7 +852,7 @@ int qualify(const Options& args) {
             "clear stale window outputs before fresh-owner replay");
     });
     b3.oracle = cut_oracle; // independently constructed cut, never copied from live session
-    window = std::make_unique<strix::HipKnownPrefixWindow>(owner->window, owner->serial, owner->model, config,
+    window = std::make_shared<strix::HipKnownPrefixWindow>(owner->window, owner->serial, owner->model, config,
         owner->resources, owner->window_memory, owner->scope(), std::static_pointer_cast<const void>(owner));
     QualSerialBackend serial3(owner, session, dispatcher, b3, args.output);
     QualWindowBackend windows3(owner, session, window, b3, args.output);
@@ -943,6 +968,7 @@ int qualify(const Options& args) {
         << ",\"g4_prompt_driver_cancel\":true,\"g4_cache_resume\":true,\"g4_cache_negative_matrix\":true"
         << ",\"g4_owner_admission_recovery\":true,\"g4_partial_restore_recovery\":true"
         << ",\"g4_fresh_owner_scratch_cleared\":true"
+        << ",\"production_known_prompt_adapter\":true,\"production_adapter_lifetime\":\"per-window-fixture\""
         << ",\"native_post_dispatch_fault_injection\":\"not_covered\",\"full_heads_foundation_only\":true"
         << ",\"B3_row_coverage_begin\":2,\"quality\":false,\"performance\":false}\n";
     output.close();
