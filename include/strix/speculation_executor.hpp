@@ -85,6 +85,9 @@ struct GreedyDraftExecutionResult {
     GreedySpeculationExecutionResult target_cycle;
 };
 
+// The transaction retains producer history separately from the seven raw state
+// classes. Restore republishes it only after all transfers and compatibility
+// validation; native poison/taint remains sticky even when bytes are restored.
 [[nodiscard]] GreedySpeculationExecutionResult
 execute_greedy_speculation_cycle(
     const ModelContract& model,

@@ -32,6 +32,10 @@ public:
         std::shared_ptr<const void> logits_owner,
         std::shared_ptr<const HipSetupQuiescenceGuard> guard);
     ~HipGreedyOutput();
+    // Pure requested payload reservation; no HIP calls or allocation. Includes
+    // device partials + device reply + pinned reply. Rejects zero vocabulary
+    // and arithmetic overflow; excludes driver/stream/allocator overhead.
+    [[nodiscard]] static std::uint64_t required_scratch_bytes(std::uint32_t vocabulary_size);
     HipGreedyOutput(const HipGreedyOutput&) = delete;
     HipGreedyOutput& operator=(const HipGreedyOutput&) = delete;
     HipGreedyOutput(HipGreedyOutput&&) = delete;

@@ -71,6 +71,10 @@ class CountingTransfer final
 public:
     int captures = 0;
     int restores = 0;
+    int fail_restore_at = -1;
+    void restored() {
+        if (restores++ == fail_restore_at) throw std::runtime_error("injected partial restore failure");
+    }
 
     void capture_device(
         std::uintptr_t,
@@ -90,14 +94,14 @@ public:
         std::uintptr_t,
         std::uintptr_t,
         std::uint64_t) override {
-        ++restores;
+        restored();
     }
 
     void restore_host(
         std::uintptr_t,
         std::uintptr_t,
         std::uint64_t) override {
-        ++restores;
+        restored();
     }
 };
 
@@ -148,6 +152,9 @@ class FakeSpeculationBackend final
 public:
     std::vector<std::uint32_t> target_tokens;
     bool fail_verify = false;
+    bool publish_lineage = false;
+    bool native_failure = false;
+    strix::ExecutionMemoryBinding* mutate_scratch = nullptr;
     int fail_replay_after = -1;
     int verify_calls = 0;
     int replay_calls = 0;
@@ -158,6 +165,11 @@ public:
         const strix::ExecutionRuntimeResources&,
         std::span<const std::uint32_t> candidates) override {
         ++verify_calls;
+        if (native_failure) {
+            session.health = strix::SerialSessionHealth::poisoned;
+            session.arithmetic_lineage.tainted = true;
+            throw std::runtime_error("injected native completion failure");
+        }
         if (fail_verify) {
             throw std::runtime_error(
                 "injected verify failure");
@@ -167,6 +179,8 @@ public:
             const auto depth =
                 static_cast<std::uint64_t>(
                     candidates.size());
+            if (publish_lineage) session.arithmetic_lineage = strix::prepare_prefill_chunk_lineage(
+                session.arithmetic_lineage, session.next_position, session.next_position+depth, 0x1234, 0x5678, 0x9abc);
             session.next_position += depth;
             session.committed_tokens += depth;
             for (auto& generation :
@@ -174,6 +188,7 @@ public:
                 ++generation;
             }
         }
+        if (mutate_scratch) ++mutate_scratch->allocation_generation;
         return target_tokens;
     }
 
@@ -188,6 +203,8 @@ public:
                 "injected replay failure");
         }
         ++replay_calls;
+        if (publish_lineage) session.arithmetic_lineage = strix::prepare_serial_row_lineage(
+            session.arithmetic_lineage,session.next_position,session.execution_identity,0x7777);
         ++session.next_position;
         ++session.committed_tokens;
         for (auto& generation :
@@ -856,6 +873,97 @@ int main() {
         expect(result.proposal_depth_limit == 1 &&
                    draft.seen_max_depth == 1,
                "draft depth is clamped to remaining allocated target context");
+    }
+
+    // Transaction-owned producer history is republished only after successful
+    // raw-state restoration; byte restore alone cannot heal a native failure.
+    for (const unsigned accepted : {0U,1U,2U}) {
+        Fixture fixture;
+        for(std::uint64_t pos=0;pos<fixture.session.next_position;++pos)
+            fixture.session.arithmetic_lineage=strix::prepare_serial_row_lineage(
+                fixture.session.arithmetic_lineage,pos,fixture.compiled.execution_identity,0x7777);
+        const auto original=fixture.session.arithmetic_lineage;
+        FakeSpeculationBackend backend;
+        backend.publish_lineage=true;
+        backend.target_tokens=accepted==0U ? std::vector<std::uint32_t>{9,8,7} :
+            accepted==1U ? std::vector<std::uint32_t>{1,9,7} : std::vector<std::uint32_t>{1,2,7};
+        const std::vector<std::uint32_t> candidates{1,2};
+        strix::GreedySpeculationExecutionRequest request;
+        request.candidate_tokens=candidates;request.token_budget=3;
+        CountingTransfer local_transfer;
+        const auto result=strix::execute_greedy_speculation_cycle(fixture.model,fixture.compiled,
+            fixture.resources,fixture.session,request,allocator,generations,local_transfer,backend);
+        expect(strix::arithmetic_lineage_valid(fixture.session.arithmetic_lineage,10U+accepted),
+            "accepted/replayed target has complete valid producer history");
+        expect(fixture.session.next_position==10U+accepted && result.replayed_tokens==(accepted==2U?0U:accepted),
+            "rollback follows accepted input count and leaves emitted bonus unconsumed");
+        if(accepted==0U) expect(fixture.session.arithmetic_lineage.intervals==original.intervals &&
+            fixture.session.arithmetic_lineage.history_identity==original.history_identity &&
+            local_transfer.restores==local_transfer.captures && local_transfer.restores>=7,
+            "zero-match rollback restores every state range and exact original history");
+        if(accepted==1U) expect(fixture.session.arithmetic_lineage.intervals.back().producer==strix::ArithmeticProducer::serial_row &&
+            fixture.session.arithmetic_lineage.intervals.back().end==11,
+            "one-match rollback appends actual serial replay history rather than verifier chunk");
+        if(accepted==2U) expect(fixture.session.arithmetic_lineage.intervals.back().producer==strix::ArithmeticProducer::prefill_chunk &&
+            local_transfer.restores==0,"all-match retains the actual verified chunk producer");
+    }
+    for(const bool native_failure : {false,true}) {
+        Fixture fixture;
+        for(std::uint64_t pos=0;pos<fixture.session.next_position;++pos)
+            fixture.session.arithmetic_lineage=strix::prepare_serial_row_lineage(
+                fixture.session.arithmetic_lineage,pos,fixture.compiled.execution_identity,0x7777);
+        FakeSpeculationBackend backend;backend.publish_lineage=true;backend.native_failure=native_failure;
+        backend.target_tokens={9,8,7};
+        const std::vector<std::uint32_t> candidates{1,2};
+        strix::GreedySpeculationExecutionRequest request;request.candidate_tokens=candidates;request.token_budget=3;
+        CountingTransfer local_transfer;
+        if(!native_failure) local_transfer.fail_restore_at=2;
+        bool threw=false;
+        try { (void)strix::execute_greedy_speculation_cycle(fixture.model,fixture.compiled,fixture.resources,
+            fixture.session,request,allocator,generations,local_transfer,backend); }
+        catch(const std::runtime_error&) { threw=true; }
+        expect(threw && fixture.session.health==strix::SerialSessionHealth::poisoned && fixture.session.arithmetic_lineage.tainted,
+            "partial-transfer or native failure cannot be healed by restoring snapshot metadata");
+        if(native_failure) expect(local_transfer.restores==local_transfer.captures,
+            "native failure still restores all state bytes while preserving poison");
+        else expect(local_transfer.restores==3,"partial restore stops at failed transfer before publishing history");
+    }
+
+    {
+        Fixture fixture;
+        FakeSpeculationBackend backend;backend.target_tokens={9,8,7};backend.mutate_scratch=&fixture.scratch;
+        const std::vector<std::uint32_t> candidates{1,2};
+        strix::GreedySpeculationExecutionRequest request;request.candidate_tokens=candidates;request.token_budget=3;
+        CountingTransfer local_transfer;
+        bool rejected=false;
+        try { (void)strix::execute_greedy_speculation_cycle(fixture.model,fixture.compiled,fixture.resources,
+            fixture.session,request,allocator,generations,local_transfer,backend); }
+        catch(const std::invalid_argument&) { rejected=true; }
+        expect(rejected && local_transfer.restores==0 && fixture.session.health==strix::SerialSessionHealth::poisoned &&
+            fixture.session.arithmetic_lineage.tainted,"changed allocation generation cannot redirect snapshot restore or republish producer history");
+    }
+
+    {
+        Fixture fixture;
+        fixture.session.next_position=fixture.state_layout.context_tokens;
+        fixture.session.committed_tokens=fixture.session.next_position;
+        FakeDraftBackend draft;
+        auto draft_state=strix::make_draft_proposal_state(0x5555ULL,fixture.session);
+        FakeSpeculationBackend backend;backend.target_tokens={42};
+        strix::GreedyDraftExecutionRequest request;request.max_candidate_depth=2;request.token_budget=3;
+        CountingTransfer local_transfer;
+        const auto result=strix::execute_greedy_speculation_with_draft(fixture.model,fixture.compiled,fixture.resources,
+            fixture.session,request,allocator,generations,local_transfer,draft_state,draft,backend);
+        expect(result.proposal_depth_limit==0 && result.target_cycle.plan.emitted_tokens==std::vector<std::uint32_t>{42} &&
+            fixture.session.next_position==fixture.state_layout.context_tokens && draft.calls==0 &&
+            backend.verify_calls==1 && backend.replay_calls==0 && local_transfer.captures==0,
+            "exact-capacity frontier emits cached bonus at depth zero without another input or snapshot");
+        ++fixture.session.next_position;
+        bool rejected=false;
+        try { (void)strix::execute_greedy_speculation_with_draft(fixture.model,fixture.compiled,fixture.resources,
+            fixture.session,request,allocator,generations,local_transfer,draft_state,draft,backend); }
+        catch(const std::invalid_argument&) {rejected=true;}
+        expect(rejected && backend.verify_calls==1 && draft.calls==0,"frontier beyond capacity rejects before callbacks");
     }
 
     if (failures == 0) {

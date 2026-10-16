@@ -29,6 +29,7 @@ struct SessionMetadata {
     SerialSessionHealth health =
         SerialSessionHealth::ready;
     PersistentStateGenerations state;
+    ArithmeticLineage lineage;
 };
 
 SessionMetadata snapshot_metadata(
@@ -41,6 +42,7 @@ SessionMetadata snapshot_metadata(
         session.committed_tokens,
         session.health,
         session.state,
+        session.arithmetic_lineage,
     };
 }
 
@@ -56,14 +58,17 @@ bool same_identity(
 }
 
 void validate_session_binding(
-    const CompiledSerialExecution& compiled,
+    const ModelContract& model, const CompiledSerialExecution& compiled,
     const ExecutionRuntimeResources& resources,
     const SerialSessionContext& session) {
+    if(resources.session_state_layout && (session.next_position > resources.session_state_layout->context_tokens ||
+        session.next_position > model.max_position_embeddings))
+        throw std::invalid_argument("speculation frontier exceeds context capacity");
+    // A completed final input may still have one unconsumed greedy selection.
+    // This validates its retained metadata, not admission of another input row.
     validate_execution_runtime_resources(
-        compiled.execution_identity,
-        compiled.arena,
-        resources,
-        session.next_position);
+        compiled.execution_identity, compiled.arena, resources,
+        session.next_position ? session.next_position-1U : 0U);
 
     const auto identities =
         build_runtime_execution_identities(
@@ -85,6 +90,9 @@ void validate_session_binding(
         throw std::logic_error(
             "speculation requires a ready serial session");
     }
+    if (session.arithmetic_lineage.tainted || (!session.arithmetic_lineage.intervals.empty() &&
+        !arithmetic_lineage_valid(session.arithmetic_lineage, session.next_position)))
+        throw std::invalid_argument("speculation requires valid untainted producer history");
 }
 
 SerialSessionRestorePlan build_restore(
@@ -101,25 +109,46 @@ SerialSessionRestorePlan build_restore(
 
 void restore_base(
     SerialSessionContext& session,
-    const ModelContract& model,
+    const ModelContract& model, const CompiledSerialExecution& compiled,
     const ExecutionRuntimeResources& resources,
     const SerialSessionSnapshotPlan& snapshot,
     const SessionSnapshotMemoryBinding& snapshot_memory,
-    SessionSnapshotTransferBackend& transfer) {
-    const auto restore =
-        build_restore(
-            model,
-            *resources.session_state_layout,
-            snapshot,
-            session.runtime_compatibility_identity);
-
-    restore_serial_session_snapshot(
-        session,
-        restore,
-        *resources.session_state_layout,
-        *resources.session_state_memory,
-        snapshot_memory,
-        transfer);
+    const ArithmeticLineage& history, std::uint64_t binding_identity, SessionSnapshotTransferBackend& transfer) {
+    const bool retained_failure = session.health == SerialSessionHealth::poisoned || session.arithmetic_lineage.tainted;
+    try {
+        const auto before = build_runtime_execution_identities(compiled.execution_identity,compiled.arena,resources);
+        if(before.binding_identity!=binding_identity || before.compatibility_identity!=snapshot.runtime_compatibility_identity)
+            throw std::invalid_argument("speculation snapshot destination binding changed");
+        const auto restore = build_restore(model, *resources.session_state_layout,
+            snapshot, session.runtime_compatibility_identity);
+        // A transaction owns this exact pre-window history separately from the
+        // raw snapshot. Prepare its storage before transfer; never reconstruct
+        // history from provisional verifier state or erase a transfer failure.
+        auto restored_history = history;
+        if (restored_history.tainted || (!restored_history.intervals.empty() &&
+            !arithmetic_lineage_valid(restored_history, snapshot.next_position)))
+            throw std::invalid_argument("speculation snapshot producer history is invalid");
+        restore_serial_session_snapshot(session, restore, *resources.session_state_layout,
+            *resources.session_state_memory, snapshot_memory, transfer);
+        const auto identities = build_runtime_execution_identities(compiled.execution_identity,
+            compiled.arena, resources);
+        if (identities.binding_identity != binding_identity || identities.compatibility_identity != snapshot.runtime_compatibility_identity ||
+            session.execution_identity != snapshot.compiled_execution_identity ||
+            session.state_layout_identity != snapshot.state_layout_identity ||
+            session.runtime_compatibility_identity != snapshot.runtime_compatibility_identity ||
+            session.next_position != snapshot.next_position || session.committed_tokens != snapshot.committed_tokens)
+            throw std::invalid_argument("speculation restored state compatibility differs from its snapshot");
+        session.arithmetic_lineage = std::move(restored_history);
+        if (retained_failure) {
+            // Restoring bytes is not permission to heal a native/D1 failure.
+            session.health = SerialSessionHealth::poisoned;
+            session.arithmetic_lineage.tainted = true;
+        }
+    } catch (...) {
+        session.health = SerialSessionHealth::poisoned;
+        session.arithmetic_lineage.tainted = true;
+        throw;
+    }
 }
 
 }  // namespace
@@ -136,7 +165,7 @@ execute_greedy_speculation_cycle(
     SessionSnapshotTransferBackend& snapshot_transfer,
     GreedySpeculationExecutionBackend& backend) {
     validate_session_binding(
-        compiled,
+        model, compiled,
         resources,
         session);
 
@@ -147,6 +176,7 @@ execute_greedy_speculation_cycle(
 
     const auto base =
         snapshot_metadata(session);
+    const auto base_binding=build_runtime_execution_identities(compiled.execution_identity,compiled.arena,resources).binding_identity;
 
     GreedySpeculationCycleRequest prepare_request;
     prepare_request.compiled_execution_identity =
@@ -207,11 +237,11 @@ execute_greedy_speculation_cycle(
             try {
                 restore_base(
                     session,
-                    model,
+                    model, compiled,
                     resources,
                     preparation.pre_window_snapshot,
                     snapshot_owner.binding(),
-                    snapshot_transfer);
+                    base.lineage, base_binding, snapshot_transfer);
             } catch (...) {
                 session.health =
                     SerialSessionHealth::poisoned;
@@ -236,17 +266,18 @@ execute_greedy_speculation_cycle(
         std::rethrow_exception(original);
     }
 
-    if (!same_identity(session, base) ||
+    if (!same_identity(session, base) || session.arithmetic_lineage.tainted ||
+        (!session.arithmetic_lineage.intervals.empty() && !arithmetic_lineage_valid(session.arithmetic_lineage,session.next_position)) ||
         session.health !=
             SerialSessionHealth::ready) {
         if (snapshot_captured) {
             restore_base(
                 session,
-                model,
+                model, compiled,
                 resources,
                 preparation.pre_window_snapshot,
                 snapshot_owner.binding(),
-                snapshot_transfer);
+                base.lineage, base_binding, snapshot_transfer);
         } else {
             session.health =
                 SerialSessionHealth::poisoned;
@@ -276,11 +307,11 @@ execute_greedy_speculation_cycle(
                 expected_verify_committed) {
             restore_base(
                 session,
-                model,
+                model, compiled,
                 resources,
                 preparation.pre_window_snapshot,
                 snapshot_owner.binding(),
-                snapshot_transfer);
+                base.lineage, base_binding, snapshot_transfer);
             throw std::logic_error(
                 "target verifier did not leave state advanced through every candidate");
         }
@@ -292,7 +323,9 @@ execute_greedy_speculation_cycle(
             session.state.generations !=
                 base.state.generations ||
             session.state.valid !=
-                base.state.valid) {
+                base.state.valid || session.arithmetic_lineage.intervals!=base.lineage.intervals ||
+            session.arithmetic_lineage.history_identity!=base.lineage.history_identity || session.arithmetic_lineage.tainted!=base.lineage.tainted) {
+            session.arithmetic_lineage.tainted=true;
             session.health =
                 SerialSessionHealth::poisoned;
             throw std::logic_error(
@@ -323,11 +356,11 @@ execute_greedy_speculation_cycle(
             try {
                 restore_base(
                     session,
-                    model,
+                    model, compiled,
                     resources,
                     preparation.pre_window_snapshot,
                     snapshot_owner.binding(),
-                    snapshot_transfer);
+                    base.lineage, base_binding, snapshot_transfer);
             } catch (...) {
                 session.health =
                     SerialSessionHealth::poisoned;
@@ -343,11 +376,11 @@ execute_greedy_speculation_cycle(
     if (result.plan.restore_required) {
         restore_base(
             session,
-            model,
+            model, compiled,
             resources,
             preparation.pre_window_snapshot,
             snapshot_owner.binding(),
-            snapshot_transfer);
+            base.lineage, base_binding, snapshot_transfer);
         result.restored_pre_window = true;
 
         for (const auto token :
@@ -363,11 +396,11 @@ execute_greedy_speculation_cycle(
                 try {
                     restore_base(
                         session,
-                        model,
+                        model, compiled,
                         resources,
                         preparation.pre_window_snapshot,
                         snapshot_owner.binding(),
-                        snapshot_transfer);
+                        base.lineage, base_binding, snapshot_transfer);
                 } catch (...) {
                     session.health =
                         SerialSessionHealth::poisoned;
@@ -379,7 +412,9 @@ execute_greedy_speculation_cycle(
         }
     }
 
-    if (session.next_position !=
+    if (session.arithmetic_lineage.tainted ||
+        (!session.arithmetic_lineage.intervals.empty() && !arithmetic_lineage_valid(session.arithmetic_lineage,session.next_position)) ||
+        session.next_position !=
             result.plan.post_cycle_state_position ||
         session.committed_tokens !=
             result.plan.post_cycle_committed_tokens ||
@@ -389,11 +424,11 @@ execute_greedy_speculation_cycle(
             try {
                 restore_base(
                     session,
-                    model,
+                    model, compiled,
                     resources,
                     preparation.pre_window_snapshot,
                     snapshot_owner.binding(),
-                    snapshot_transfer);
+                    base.lineage, base_binding, snapshot_transfer);
             } catch (...) {
                 session.health =
                     SerialSessionHealth::poisoned;
@@ -426,7 +461,7 @@ execute_greedy_speculation_with_draft(
     GreedyDraftExecutionResult result;
 
     validate_session_binding(
-        compiled,
+        model, compiled,
         resources,
         session);
     if (request.token_budget == 0) {

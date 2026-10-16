@@ -133,7 +133,7 @@ struct HipGreedyOutput::Impl {
          std::shared_ptr<const HipSetupQuiescenceGuard> setup)
         : vocabulary(vocab), scratch(arena), execution_identity(arena.execution_identity),
           partial_count(vocab ? (vocab - 1U) / threads + 1U : 0),
-          partial_bytes(static_cast<std::uint64_t>(partial_count) * sizeof(Partial)),
+          partial_bytes(HipGreedyOutput::required_scratch_bytes(vocab) - 2U * sizeof(Reply)),
           source_owner(std::move(owner)), guard(std::move(setup)) {
         require(vocabulary && execution_identity && source_owner && guard,
                 "GPU greedy output requires fixed vocabulary, identity and actual retained owners");
@@ -253,6 +253,14 @@ struct HipGreedyOutput::Impl {
         }
     }
 };
+std::uint64_t HipGreedyOutput::required_scratch_bytes(std::uint32_t vocabulary) {
+    require(vocabulary != 0, "GPU greedy reservation requires nonzero vocabulary");
+    const auto count=(static_cast<std::uint64_t>(vocabulary)-1U)/threads+1U;
+    constexpr auto replies=2U*sizeof(Reply);
+    if(count>(std::numeric_limits<std::uint64_t>::max()-replies)/sizeof(Partial))
+        throw std::overflow_error("GPU greedy reservation overflow");
+    return count*sizeof(Partial)+replies;
+}
 HipGreedyOutput::HipGreedyOutput(std::uint32_t vocab, ExecutionMemoryBinding scratch,
     std::shared_ptr<const void> owner, std::shared_ptr<const HipSetupQuiescenceGuard> guard)
     : impl_(std::make_unique<Impl>(vocab, scratch, std::move(owner), std::move(guard))) {}
@@ -263,5 +271,5 @@ std::uint32_t HipGreedyOutput::select(const ExecutionBufferAddress& input,
 }
 HipGreedyOutputStats HipGreedyOutput::stats() const noexcept { return impl_->counters; }
 bool HipGreedyOutput::failed() const noexcept { return impl_->broken; }
-std::uint64_t HipGreedyOutput::scratch_bytes() const noexcept { return impl_->partial_bytes + 2U * sizeof(Reply); }
+std::uint64_t HipGreedyOutput::scratch_bytes() const noexcept { return required_scratch_bytes(impl_->vocabulary); }
 } // namespace strix
