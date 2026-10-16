@@ -15,7 +15,7 @@
 int strix_hip_decode_token_entry(int,char**);
 namespace strix::tests {
 namespace {
-struct Request {std::string path,sha,export_path;std::uint64_t file_bytes=0,host_bytes=0,coverage=31,export_bytes=0,export_capture_bytes=0,export_greedy_rows=0;};
+struct Request {std::string path,sha,export_path;std::uint64_t file_bytes=0,host_bytes=0,coverage=31,export_bytes=0,export_capture_bytes=0,export_greedy_rows=0;bool component_diagnostic=false;};
 Request request;
 std::optional<MtpQualificationReference> reference;
 void require(bool v,const char* message){if(!v)throw std::invalid_argument(message);}
@@ -36,11 +36,14 @@ std::vector<char*> configure(int argc,char** argv){
         else if(key=="--qualification-export-bytes")request.export_bytes=number(value);
         else if(key=="--qualification-export-capture-bytes")request.export_capture_bytes=number(value);
         else if(key=="--qualification-export-greedy-rows")request.export_greedy_rows=number(value);
+        else if(key=="--qualification-component-diagnostic"){
+            require(value=="1","component diagnostic must be explicitly enabled with 1");request.component_diagnostic=true;
+        }
         else throw std::invalid_argument("unknown qualification option");
     }
     if(!request.export_path.empty()){
         require(request.path.empty() && request.sha.empty() && !request.file_bytes && !request.host_bytes &&
-            !seen.contains("--qualification-coverage-mask") &&
+            !seen.contains("--qualification-coverage-mask") && !request.component_diagnostic &&
             request.export_bytes>=64U && request.export_bytes<=(1ULL<<30U) && request.export_capture_bytes && request.export_greedy_rows<=4096U &&
             !std::filesystem::exists(request.export_path),"target input export needs a new path and explicit output/capture budgets, without golden options");
         forward.push_back(nullptr);return forward;
@@ -53,10 +56,45 @@ std::vector<char*> configure(int argc,char** argv){
     require(std::find_if(forward.begin()+1,forward.end(),[](const char* p){return std::string_view(p)=="--mtp";})!=forward.end(),
         "qualification runner requires the explicit MTP route and all ordinary asset/replay pins");
     reference=read_mtp_qualification_reference(request.path,decode_cli::mtp_cli_digest(request.sha),request.file_bytes);
+    if(request.component_diagnostic){
+        require(!seen.contains("--qualification-coverage-mask") &&
+            (reference->kind==MtpQualificationKind::projection || reference->kind==MtpQualificationKind::shared ||
+             reference->kind==MtpQualificationKind::lm_head),
+            "component diagnostic requires only reference kinds 3, 4 or 6 without cycle coverage options");
+        require(std::none_of(forward.begin()+1,forward.end(),[](const char* p){
+            const std::string_view arg(p);return arg=="--mtp-metadata-only" || arg.starts_with("--mtp-metadata-only=");
+        }),"component diagnostic cannot be combined with metadata-only mode");
+    }
     forward.push_back(nullptr);return forward;
 }
 }
 bool mtp_target_input_export_requested() noexcept{return !request.export_path.empty();}
+bool mtp_component_diagnostic_requested() noexcept{return request.component_diagnostic;}
+void run_mtp_component_diagnostic(const std::shared_ptr<HipMtpResources>& owner,std::uint64_t actual_profile){
+    require(request.component_diagnostic && reference && owner && actual_profile,
+        "component diagnostic requires an explicitly admitted pinned reference and actual native resources");
+    const auto& g=*reference;
+    owner->validate();owner->require_idle();
+    require(g.target_content==owner->shared_target().target_model_content_identity &&
+        g.sidecar_content==owner->shared_target().sidecar_model_content_identity &&
+        g.proposal_identity==owner->plan().proposal_identity && g.plan_identity==owner->plan().plan_identity &&
+        g.semantic_identity==owner->plan().forward_semantics.contract_identity && g.native_profile_identity==actual_profile,
+        "component diagnostic reference does not bind actual assets/plan/semantics/native recipe");
+    std::uint64_t completed=1;
+    switch(g.kind){
+    case MtpQualificationKind::projection:testing::qualify_hip_mtp_projection_components(owner,g.projection);break;
+    case MtpQualificationKind::shared:testing::qualify_hip_mtp_shared_expert_component(owner,g.shared);break;
+    case MtpQualificationKind::lm_head:{
+        const auto receipt=qualify_hip_mtp_lm_head_component(owner,g.head,{hip_mtp_lm_head_golden_identity(g.head),request.host_bytes});
+        completed=receipt.outputs_compared;break;
+    }
+    default:throw std::invalid_argument("component diagnostic admits only reference kinds 3, 4 or 6");
+    }
+    owner->validate();owner->require_idle();
+    std::cout<<"{\"mode\":\"native-mtp-component-diagnostic\",\"kind\":"<<static_cast<std::uint32_t>(g.kind)
+        <<",\"completed_records\":"<<completed<<",\"component_passed\":true,\"full_forward_qualified\":false,"
+        <<"\"mtp_activated\":false,\"performance_qualified\":false,\"reference_file_sha256\":\""<<request.sha<<"\"}\n";
+}
 void validate_mtp_target_input_export(const decode_cli::Options& o,bool resolved){
     require(!o.mtp.enabled && !o.mtp.supplied && o.execution.mode==DecodeExecutionMode::eager && o.execution.integer_head==DecodeIntegerHead::none &&
         !o.prepared_eager && !o.moe_shared_overlap && !o.moe_token_cost_policy && !o.gdn_islands && !o.gpu_greedy_token &&

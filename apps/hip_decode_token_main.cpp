@@ -2029,7 +2029,11 @@ int STRIX_DECODE_ENTRY(
             generations, catalog_config.deferred_moe_status, optimization_profile.selected, std::cout, std::move(make_window),
             [&] { return execution_inventory_receipt + ple_cache_completed_receipt(); }
 #if defined(STRIX_MTP_MODEL_QUALIFICATION_RUNNER)
-            , strix::tests::run_mtp_model_qualification
+            , strix::tests::mtp_component_diagnostic_requested()
+                ? strix::decode_cli::MtpDecodeQualification{} : strix::decode_cli::MtpDecodeQualification{strix::tests::run_mtp_model_qualification}
+            , strix::tests::mtp_component_diagnostic_requested()
+                ? strix::decode_cli::MtpDecodeComponentDiagnostic{strix::tests::run_mtp_component_diagnostic}
+                : strix::decode_cli::MtpDecodeComponentDiagnostic{}
 #endif
             );
         return 0;

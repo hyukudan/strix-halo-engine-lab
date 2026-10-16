@@ -49,6 +49,13 @@ selected fixture and exits without ordinary generation. Its JSON records a
 completed fixture, not general hardware, model fidelity or performance approval.
 There is no automatic model CTest without externally supplied assets/references.
 
+For isolated arithmetic diagnosis, `--qualification-component-diagnostic 1`
+accepts only kinds 3, 4 and 6 with the same pinned reference, actual assets and
+native numerical profile. It runs the existing independent component fixture
+before full-forward replay, without activation or generation. Its separate
+`native-mtp-component-diagnostic` receipt cannot qualify the full predictor.
+The ordinary fixture and decoder routes retain their complete replay gate.
+
 The selected kind is stored in the reference:
 
 | Kind | Fixture |

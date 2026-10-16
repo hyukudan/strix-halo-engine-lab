@@ -22,6 +22,8 @@
 #include <chrono>
 #include <functional>
 #include <ostream>
+#include <sstream>
+#include <iomanip>
 #include <stdexcept>
 #include <utility>
 
@@ -78,6 +80,7 @@ struct MtpDecodeQualificationContext {
     HipMtpTargetHiddenTicket initial;
 };
 using MtpDecodeQualification=std::function<void(MtpDecodeQualificationContext&)>;
+using MtpDecodeComponentDiagnostic=std::function<void(const std::shared_ptr<HipMtpResources>&,std::uint64_t)>;
 
 // One synchronous CLI request with externally pinned evidence. Setup/loading,
 // independent replay, activation and generation have separate receipt scopes.
@@ -87,7 +90,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
     SerialSessionContext& session,DirectLaunchDispatcher& dispatcher,AllocationGenerationSource& generations,
     bool deferred_status,std::string_view resolved_profile,std::ostream& output,
     MtpDecodeWindowFactory make_window={},std::function<std::string()> completion_receipt={},
-    MtpDecodeQualification qualify={}) {
+    MtpDecodeQualification qualify={},MtpDecodeComponentDiagnostic component_diagnostic={}) {
     validate_resolved_mtp_cli(options);
     if(!options.mtp.enabled || !parents || session.next_position || session.committed_tokens ||
        session.health!=SerialSessionHealth::ready || session.execution_identity!=compiled.execution_identity)
@@ -95,7 +98,8 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
     const auto& m=options.mtp;const auto& r=parents->resources;const auto& actual=*parents->experiment;
     const auto width=mtp_cli_mul(model.hidden_size,model.hc_count);
     HipMtpForwardGolden golden;
-    if(m.metadata_only && qualify)throw std::invalid_argument("MTP metadata cannot replace native fixture execution");
+    if((m.metadata_only && (qualify || component_diagnostic)) || (qualify && component_diagnostic))
+        throw std::invalid_argument("MTP metadata, full fixture and component diagnostic routes are mutually exclusive");
     if(!m.metadata_only){
     golden=read_mtp_forward_golden_file(m.golden,mtp_cli_digest(m.golden_sha256),m.golden_max_bytes);
     if(golden.rows.size()+1U!=options.tokens.size())
@@ -147,6 +151,14 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
        golden.semantic_identity!=assets->compiled().forward_semantics.contract_identity ||
        golden.numerical_profile_identity!=runtime->numerical_profile_identity())
         throw std::invalid_argument("MTP golden does not bind actual verified assets, semantics and native cast profile");
+    if(component_diagnostic){
+        // Independent component inputs are admitted against these actual assets.
+        // This diagnostic neither runs full replay nor creates qualified/active
+        // greedy state, and cannot enter the ordinary generation path.
+        try {assets->validate_assets_unchanged();component_diagnostic(native,runtime->numerical_profile_identity());assets->validate_assets_unchanged();}
+        catch(...){runtime->cancel();throw;}
+        return;
+    }
     // Same complete known payload bound as the replay consumer; admit it before
     // the target prompt is mutated, rather than waiting until replay entry.
     auto replay_payload=mtp_cli_add(mtp_cli_mul(width,4U),mtp_cli_mul(model.vocab_size,4U));
@@ -185,8 +197,23 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
         // This call executes all eleven native stages for every independent
         // reference pair. The resulting real observation is the sole evidence.
         replay=replay_hip_mtp_forward(*runtime,replay_rows,golden,replay_request);
-        if(!replay.assessment.passes_declared_policy)
-            throw std::runtime_error("MTP actual full-hidden/full-vocabulary replay failed its declared policy; generation is not admitted");
+        if(!replay.assessment.passes_declared_policy){
+            std::ostringstream error;error<<std::setprecision(17)
+                <<"MTP actual full-hidden/full-vocabulary replay failed its declared policy; generation is not admitted"
+                <<"; hidden_max_abs_error="<<replay.observation.maximum_hidden_abs_error
+                <<"; logit_max_abs_error="<<replay.observation.maximum_logit_abs_error
+                <<"; hidden_values="<<replay.observation.hidden_values_compared
+                <<"; logit_values="<<replay.observation.logit_values_compared
+                <<"; tokens_match="<<replay.assessment.tokens_match
+                <<"; hidden_within_policy="<<replay.assessment.hidden_within_policy
+                <<"; logits_within_policy="<<replay.assessment.logits_within_policy
+                <<"; token_pairs=";
+            for(std::size_t i=0;i<replay.observation.engine_tokens.size();++i){
+                if(i)error<<',';
+                error<<replay.observation.reference_tokens.at(i)<<':'<<replay.observation.engine_tokens[i];
+            }
+            throw std::runtime_error(error.str());
+        }
         qualified=qualify_mtp_draft_plan(assets->compiled(),policy,replay.observation);
         require_qualified_mtp_draft_plan(qualified);
         activated=activate_mtp_draft_plan(assets->compiled(),policy,replay.observation);
