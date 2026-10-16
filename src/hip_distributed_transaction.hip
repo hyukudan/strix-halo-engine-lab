@@ -259,6 +259,7 @@ void HipDistributedTokenParticipant::begin_next(std::uint32_t input,std::uint64_
 }
 const DistributedTokenBinding& HipDistributedTokenParticipant::current_binding() const noexcept {return impl_->protocol.binding();}
 std::uint64_t HipDistributedTokenParticipant::binding_identity() const noexcept {return impl_->protocol.binding_identity();}
+std::uint32_t HipDistributedTokenParticipant::local_node() const noexcept {return impl_->node;}
 std::optional<DistributedSequenceFrontier> HipDistributedTokenParticipant::frontier() const {
     if(impl_->native_failed || impl_->protocol.phase()==DistributedTokenPhase::in_doubt) return std::nullopt;
     const auto committed=impl_->protocol.committed_sequence_frontier();

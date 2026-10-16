@@ -56,6 +56,7 @@ struct DirectGpuBoundaryStaging::Impl : std::enable_shared_from_this<Impl> {
         }
     };
     DistributedPlacementPlan placement;
+    std::uint32_t endpoint_node = 0;
     DistributedRuntimeRequest request;
     transport::DirectTransportLease lease;
     std::shared_ptr<DirectGpuBoundaryMemoryOwner> memory;
@@ -108,7 +109,7 @@ struct DirectGpuBoundaryStaging::Impl : std::enable_shared_from_this<Impl> {
     transport::TransferDescriptor validate(const DistributedExecutionBoundary& boundary, const DistributedBoundaryTransfer& transfer, bool inbound) {
         current();
         if (std::none_of(placement.boundaries.begin(), placement.boundaries.end(), [&](const auto& b) { return same_boundary(b, boundary); }) ||
-            (inbound ? boundary.destination_node : boundary.source_node) != placement.local_node ||
+            (inbound ? boundary.destination_node : boundary.source_node) != endpoint_node ||
             transfer.flow.direction != (inbound ? transport::LinkDirection::inbound : transport::LinkDirection::outbound) ||
             transfer.link_plan.kind != transport::PlanKind::single_link || transfer.link_plan.slices.size() != 1 || transfer.native_slices.size() != 1 ||
             transfer.link_plan.slices[0].link_index != lease.link_index || transfer.link_plan.slices[0].byte_offset != 0 ||
@@ -120,7 +121,7 @@ struct DirectGpuBoundaryStaging::Impl : std::enable_shared_from_this<Impl> {
         const auto expected = make_distributed_boundary_descriptor(placement, boundary, request.connection_epoch,
             request.request_id, request.generation, transfer.descriptor.sequence, request.dtype_id);
         if (!same_descriptor(expected, transfer.descriptor)) throw std::invalid_argument("GPU boundary descriptor is outside request authority");
-        const auto expected_flow = classify_distributed_boundary_flow(placement, boundary);
+        const auto expected_flow = classify_distributed_boundary_flow(placement, boundary, {}, endpoint_node);
         if (transfer.flow.flow_id != expected_flow.flow_id || transfer.flow.priority != expected_flow.priority) throw std::invalid_argument("GPU boundary flow identity is foreign");
         auto physical = expected; physical.connection_epoch = lease.connection_epoch; physical.sequence = transfer.native_slices[0].sequence;
         return physical;
@@ -148,14 +149,35 @@ struct DirectGpuBoundaryStaging::Impl : std::enable_shared_from_this<Impl> {
 DirectGpuBoundaryStaging::DirectGpuBoundaryStaging(DistributedPlacementPlan placement, DistributedRuntimeRequest request,
     transport::DirectTransportLease lease, std::shared_ptr<DirectGpuBoundaryMemoryOwner> memory,
     std::shared_ptr<transport::DirectGpuStreamGpu> gpu, std::shared_ptr<transport::DirectGpuBoundaryReceiveIo> receive)
+    : DirectGpuBoundaryStaging(std::move(placement), request, std::move(lease), std::move(memory),
+        std::move(gpu), std::move(receive), 0U, false) {}
+
+DirectGpuBoundaryStaging::DirectGpuBoundaryStaging(DistributedPlacementPlan placement, DistributedRuntimeRequest request,
+    transport::DirectTransportLease lease, std::shared_ptr<DirectGpuBoundaryMemoryOwner> memory,
+    std::shared_ptr<transport::DirectGpuStreamGpu> gpu, std::shared_ptr<transport::DirectGpuBoundaryReceiveIo> receive,
+    std::uint32_t endpoint_node)
+    : DirectGpuBoundaryStaging(std::move(placement), request, std::move(lease), std::move(memory),
+        std::move(gpu), std::move(receive), endpoint_node, true) {}
+
+DirectGpuBoundaryStaging::DirectGpuBoundaryStaging(DistributedPlacementPlan placement, DistributedRuntimeRequest request,
+    transport::DirectTransportLease lease, std::shared_ptr<DirectGpuBoundaryMemoryOwner> memory,
+    std::shared_ptr<transport::DirectGpuStreamGpu> gpu, std::shared_ptr<transport::DirectGpuBoundaryReceiveIo> receive,
+    std::uint32_t endpoint_node, bool explicit_endpoint)
     : impl_(std::make_shared<Impl>()) {
     auto& i = *impl_;
+    if (!explicit_endpoint) endpoint_node = placement.local_node;
+    if (explicit_endpoint && (endpoint_node > 1U || std::none_of(placement.boundaries.begin(), placement.boundaries.end(),
+        [&](const auto& b) {return b.source_node == endpoint_node || b.destination_node == endpoint_node;}) ||
+        std::any_of(placement.boundaries.begin(), placement.boundaries.end(),
+            [](const auto& b) {return b.source_node>1U || b.destination_node>1U;})))
+        throw std::invalid_argument("GPU boundary endpoint is outside the two-peer placement");
     if (!placement.executable || !placement.plan_identity || !placement.compiled_execution_identity ||
         !placement.manifest_layout_identity || !placement.tensor_access_identity || placement.boundaries.empty() || placement.boundaries.size() > 64 ||
         !request.connection_epoch || !request.request_id || !request.generation || !request.dtype_id || !memory || !gpu || !receive ||
         lease.physical_link_id.empty() || !lease.connection_epoch || !lease.pool_binding_identity || !lease.lease_generation) {
         throw std::invalid_argument("GPU boundary staging requires exact request, lease and retained owners");
     }
+    i.endpoint_node = endpoint_node;
     i.placement = std::move(placement); i.request = request; i.lease = std::move(lease); i.memory = std::move(memory);
     i.gpu = std::move(gpu); i.receive = std::move(receive); i.exported = i.gpu->exported_binding(); i.buffers = i.memory->current_buffers();
     if (i.buffers.empty() || i.buffers.size() > 4096 || i.exported.pool_binding_identity != i.lease.pool_binding_identity ||
@@ -167,7 +189,7 @@ DirectGpuBoundaryStaging::DirectGpuBoundaryStaging(DistributedPlacementPlan plac
     for (std::size_t n = 0; n < i.buffers.size(); ++n) for (std::size_t m = 0; m < n; ++m) {
         if (i.buffers[n].use == i.buffers[m].use) throw std::invalid_argument("GPU boundary memory inventory has duplicate execution identities");
     }
-    for (const auto& b : i.placement.boundaries) if (b.source_node == i.placement.local_node || b.destination_node == i.placement.local_node) {
+    for (const auto& b : i.placement.boundaries) if (b.source_node == i.endpoint_node || b.destination_node == i.endpoint_node) {
         if (!b.boundary_id || !b.payload_bytes || b.source_node == b.destination_node) throw std::invalid_argument("GPU boundary placement is invalid");
         static_cast<void>(i.segments(b)); static_cast<void>(i.pool_view(false, b.payload_bytes)); static_cast<void>(i.pool_view(true, b.payload_bytes));
     }

@@ -179,6 +179,37 @@ int main() {
             "foreign flow identity poisons distributed receive request");
     }
 
+    {
+        auto runtime=scheduler();
+        const auto plan=placement(0,0,1,4096);
+        const auto& boundary=plan.boundaries.front();
+        auto transfer=strix::plan_distributed_boundary_transfer(plan,boundary,runtime,9,17,1,1,1);
+        const auto sender=strix::classify_distributed_boundary_flow(plan,boundary);
+        expect(sender.flow_id==strix::classify_distributed_boundary_flow(plan,boundary,{},0).flow_id,
+            "legacy flow and explicit matching endpoint have identical hashes");
+        const auto legacy_receiver=placement(1,0,1,4096);
+        expect(strix::classify_distributed_boundary_flow(legacy_receiver,legacy_receiver.boundaries.front()).flow_id==
+            strix::classify_distributed_boundary_flow(legacy_receiver,legacy_receiver.boundaries.front(),{},1).flow_id,
+            "legacy node1 receive flow retains its exact matching-endpoint hash");
+        transfer.flow=strix::classify_distributed_boundary_flow(plan,boundary,{},1);
+        strix::DistributedRequestState request;
+        request.placement_plan_identity=plan.plan_identity;request.request_id=17;request.generation=1;
+        request.next_receive_sequence=1;
+        strix::validate_distributed_boundary_transfer_receive(request,plan,boundary,transfer,1);
+        expect(!request.failed && request.next_receive_sequence==2 && plan.local_node==0 &&
+            transfer.descriptor.model_plan_id==plan.plan_identity,
+            "explicit receive endpoint1 validates canonical plan0 without retagging its wire identity");
+        request.next_receive_sequence=1;request.failed=false;
+        transfer.flow=sender;
+        bool rejected=false;
+        try {strix::validate_distributed_boundary_transfer_receive(request,plan,boundary,transfer,1);}
+        catch(const std::exception&) {rejected=true;}
+        expect(rejected,"raw outbound sender flow cannot bypass explicit inbound normalization");
+        rejected=false;
+        try {(void)strix::classify_distributed_boundary_flow(plan,boundary,{},2);}
+        catch(const std::exception&) {rejected=true;}
+        expect(rejected,"foreign endpoint cannot classify a boundary it does not own");
+    }
     if (failures == 0) {
         std::cout
             << "distributed data plane tests passed\n";

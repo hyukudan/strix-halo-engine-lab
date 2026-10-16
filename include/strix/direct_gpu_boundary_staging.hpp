@@ -37,6 +37,12 @@ public:
         transport::DirectTransportLease, std::shared_ptr<DirectGpuBoundaryMemoryOwner>,
         std::shared_ptr<transport::DirectGpuStreamGpu>,
         std::shared_ptr<transport::DirectGpuBoundaryReceiveIo>);
+    // Explicit two-peer endpoint with the SAME canonical wire-plan identity.
+    // The legacy overload continues using placement.local_node unchanged.
+    DirectGpuBoundaryStaging(DistributedPlacementPlan, DistributedRuntimeRequest,
+        transport::DirectTransportLease, std::shared_ptr<DirectGpuBoundaryMemoryOwner>,
+        std::shared_ptr<transport::DirectGpuStreamGpu>,
+        std::shared_ptr<transport::DirectGpuBoundaryReceiveIo>, std::uint32_t endpoint_node);
     ~DirectGpuBoundaryStaging() override;
     [[nodiscard]] bool requires_full_send_retirement() const noexcept override { return true; }
     [[nodiscard]] transport::TransportBufferView stage_outbound(
@@ -48,6 +54,10 @@ public:
         const DistributedExecutionBoundary&, const DistributedBoundaryTransfer&) override;
     [[nodiscard]] bool failed() const noexcept;
 private:
+    DirectGpuBoundaryStaging(DistributedPlacementPlan, DistributedRuntimeRequest,
+        transport::DirectTransportLease, std::shared_ptr<DirectGpuBoundaryMemoryOwner>,
+        std::shared_ptr<transport::DirectGpuStreamGpu>,
+        std::shared_ptr<transport::DirectGpuBoundaryReceiveIo>, std::uint32_t endpoint_node, bool explicit_endpoint);
     struct Impl;
     std::shared_ptr<Impl> impl_;
 };

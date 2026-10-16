@@ -40,6 +40,7 @@ public:
     void begin_next(std::uint32_t input_token,std::uint64_t generation,NativeDistributedTokenRetirement&&);
     [[nodiscard]] const DistributedTokenBinding& current_binding() const noexcept;
     [[nodiscard]] std::uint64_t binding_identity() const noexcept;
+    [[nodiscard]] std::uint32_t local_node() const noexcept;
     [[nodiscard]] std::optional<DistributedSequenceFrontier> frontier() const;
     [[nodiscard]] DistributedTokenMessage prepare();
     void execute_local_step(const DistributedStepPlacement&) override;

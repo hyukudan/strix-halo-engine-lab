@@ -163,8 +163,35 @@ void failures() {
     Fixture premature(true); auto a = premature.make(); const auto t = premature.transfer(); static_cast<void>(a->stage_inbound(premature.boundary, t));
     rejects([&] { static_cast<void>(a->finish_inbound(premature.boundary, t)); }, "finish cannot substitute for GPU acquire and consumption");
 }
+void canonical_peer_endpoint() {
+    Fixture f; // Canonical wire plan0, boundary0->1 remains byte-for-byte.
+    const auto canonical_id=f.placement.plan_identity;
+    auto consumer=std::make_unique<DirectGpuBoundaryStaging>(f.placement,f.request,f.lease,
+        f.memory,f.gpu,f.receive,1U);
+    auto transfer=f.transfer();
+    const auto sender=transfer.flow;
+    transfer.flow=classify_distributed_boundary_flow(f.placement,f.boundary,{},1U);
+    expect(f.placement.local_node==0U && f.placement.plan_identity==canonical_id &&
+        transfer.descriptor.model_plan_id==canonical_id && transfer.flow.direction==LinkDirection::inbound &&
+        transfer.flow.flow_id!=sender.flow_id,"endpoint1 changes local flow only, never canonical wire identity");
+    const auto staged=consumer->stage_inbound(f.boundary,transfer);f.bind_receive(transfer,staged);
+    consumer->consume_inbound(f.boundary,staged);
+    expect(consumer->finish_inbound(f.boundary,transfer)->poll()==DistributedInboundCompletionStatus::complete,
+        "canonical wire plan0 supplies a real typed endpoint1 receive-consumer contract");
+    Fixture unknown;
+    rejects([&] {DirectGpuBoundaryStaging bad(unknown.placement,unknown.request,unknown.lease,
+        unknown.memory,unknown.gpu,unknown.receive,2U);},"unknown endpoint rejects before GPU calls");
+    expect(!unknown.gpu->copies && !unknown.receive->unpacks,"unknown endpoint has no producer or consumer mutation");
+    Fixture foreign;
+    auto endpoint=std::make_unique<DirectGpuBoundaryStaging>(foreign.placement,foreign.request,foreign.lease,
+        foreign.memory,foreign.gpu,foreign.receive,1U);
+    auto wrong=foreign.transfer();wrong.flow=classify_distributed_boundary_flow(foreign.placement,foreign.boundary,{},1U);
+    ++wrong.descriptor.model_plan_id;
+    rejects([&] {(void)endpoint->stage_inbound(foreign.boundary,wrong);},"foreign canonical wire identity rejects before receive staging");
+    expect(!foreign.gpu->copies && !foreign.receive->unpacks,"foreign endpoint metadata cannot start payload work");
+}
 } // namespace
 int main() {
-    try { successful_paths(); failures(); std::cout << "GPU boundary staging contract tests passed (synthetic GPU only).\n"; return 0; }
+    try { successful_paths(); failures(); canonical_peer_endpoint(); std::cout << "GPU boundary staging contract tests passed (synthetic GPU only).\n"; return 0; }
     catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }
 }

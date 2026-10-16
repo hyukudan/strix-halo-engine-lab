@@ -106,7 +106,7 @@ void validate_distributed_boundary_transfer_receive(
         classify_distributed_boundary_flow(
             placement,
             boundary,
-            flow_policy);
+            flow_policy, local_node);
 
     if (expected.direction !=
             transport::LinkDirection::inbound ||

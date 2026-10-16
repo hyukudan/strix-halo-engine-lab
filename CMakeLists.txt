@@ -1265,6 +1265,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         src/hip_event_queue_trace.hip
         src/hip_distributed_stage.hip
         src/hip_distributed_transaction.hip
+        src/hip_distributed_sequence.hip
         src/hip_hyper_mix_launcher.hip
         src/hip_indexed_attention_launcher.hip
         src/hip_qsa_selection_diagnostic.hip
@@ -1745,6 +1746,19 @@ if(STRIX_ENABLE_HIP_RUNTIME)
             -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
         target_link_libraries(strix-hip-distributed-stage-model-qualification PRIVATE strix_hip_runtime)
         strix_target_warnings(strix-hip-distributed-stage-model-qualification)
+
+        # Callable model fixture requires injected actual peer/link ownership.
+        # No standalone bootstrap or automatic model/transport execution.
+        add_library(strix-hip-distributed-sequence-model-fixture STATIC
+            tests/hip_distributed_sequence_model_qualification.hip)
+        set_target_properties(strix-hip-distributed-sequence-model-fixture PROPERTIES
+            HIP_ARCHITECTURES gfx1151 HIP_STANDARD 20 HIP_STANDARD_REQUIRED YES)
+        target_compile_options(strix-hip-distributed-sequence-model-fixture PRIVATE
+            -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
+        target_link_libraries(strix-hip-distributed-sequence-model-fixture PUBLIC strix_hip_runtime)
+        target_include_directories(strix-hip-distributed-sequence-model-fixture PUBLIC
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        strix_target_warnings(strix-hip-distributed-sequence-model-fixture)
 
         add_executable(strix-hip-serving-greedy-model-qualification tests/hip_serving_greedy_backend_tests.hip)
         set_target_properties(strix-hip-serving-greedy-model-qualification PROPERTIES

@@ -54,6 +54,12 @@ classify_distributed_boundary_flow(
     const DistributedPlacementPlan& plan,
     const DistributedExecutionBoundary& boundary,
     DistributedBoundaryFlowPolicy policy) {
+    return classify_distributed_boundary_flow(plan, boundary, policy, plan.local_node);
+}
+
+DistributedBoundaryFlow classify_distributed_boundary_flow(
+    const DistributedPlacementPlan& plan, const DistributedExecutionBoundary& boundary,
+    DistributedBoundaryFlowPolicy policy, std::uint32_t endpoint_node) {
     if (plan.plan_identity == 0 ||
         !plan.executable ||
         boundary.boundary_id == 0 ||
@@ -70,10 +76,10 @@ classify_distributed_boundary_flow(
 
     const bool local_source =
         boundary.source_node ==
-        plan.local_node;
+        endpoint_node;
     const bool local_destination =
         boundary.destination_node ==
-        plan.local_node;
+        endpoint_node;
     if (local_source ==
         local_destination) {
         throw std::invalid_argument(

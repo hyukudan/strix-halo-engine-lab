@@ -28,4 +28,10 @@ classify_distributed_boundary_flow(
     const DistributedExecutionBoundary& boundary,
     DistributedBoundaryFlowPolicy policy = {});
 
+// One canonical wire plan may serve both endpoints. The explicit endpoint
+// changes local direction/flow identity only; it never rewrites the plan ID.
+[[nodiscard]] DistributedBoundaryFlow classify_distributed_boundary_flow(
+    const DistributedPlacementPlan& plan, const DistributedExecutionBoundary& boundary,
+    DistributedBoundaryFlowPolicy policy, std::uint32_t endpoint_node);
+
 }  // namespace strix
