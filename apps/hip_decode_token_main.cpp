@@ -1564,9 +1564,20 @@ int main(
         request.eos_token_id =
             generation_eos;
 
+        const bool generation_request_timing_enabled =
+            !raw_recording && !final_state_metadata;
+        const auto generation_request_start = generation_request_timing_enabled
+            ? std::chrono::steady_clock::now()
+            : std::chrono::steady_clock::time_point{};
         const auto result = options.gpu_greedy_token
             ? strix::execute_serial_greedy_token_request(request, backend)
             : strix::execute_serial_greedy_request(request, backend);
+        const auto generation_request_stop = generation_request_timing_enabled
+            ? std::chrono::steady_clock::now()
+            : std::chrono::steady_clock::time_point{};
+        const auto generation_request_elapsed_ms =
+            std::chrono::duration<double, std::milli>(
+                generation_request_stop - generation_request_start).count();
         finalize_raw(result.generated_tokens, std::string(stop_reason_name(result.stop_reason)));
 
         double elapsed_total = 0.0;
@@ -1591,6 +1602,15 @@ int main(
                 });
         }
         std::cout << "{\n" << optimization_profile_receipt << eager_submission_receipt << overlap_receipt() << execution_inventory_receipt << gdn_output_mode_receipt() << wave_router_mode_receipt << deferred_moe_mode_receipt;
+        if (generation_request_timing_enabled)
+            std::cout << "  \"generation_request_elapsed_ms\":" << generation_request_elapsed_ms << ",\n"
+                      << "  \"generation_request_output_tokens\":" << result.generated_tokens.size() << ",\n"
+                      << "  \"generation_request_output_tokens_per_second\":"
+                      << (generation_request_elapsed_ms > 0.0
+                              ? static_cast<double>(result.generated_tokens.size()) * 1000.0 /
+                                    generation_request_elapsed_ms
+                              : 0.0) << ",\n"
+                      << "  \"generation_request_timing_scope\":\"full-request-including-prefix-execution-readback-token-selection-and-controller\",\n";
         if (final_state_metadata)
             std::cout << "  \"validation_final_state_timing_invalid\":true,\n"
                       << "  \"validation_final_state_manifest\":\""
