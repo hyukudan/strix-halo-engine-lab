@@ -197,6 +197,30 @@ class InventoryTests(unittest.TestCase):
             with self.subTest(declaration=declaration), self.assertRaises(ValueError):
                 self.collect(receipt_path=self.evidence("invalid-cohort.json", declaration))
 
+    def test_cost_policy_and_snapshot_format_are_only_declarations(self):
+        active = self.collect(receipt_path=self.evidence("cost-compact.json", {
+            "moe_token_cost_policy": {"enabled": True, "qualification": "not_assessed"},
+            "prompt_lookup_snapshot": {"policy": "occupied-kv-v1", "max_payload_bytes": 8192}}))
+        self.assertIs(active["reported_opt_in_overlays"]["moe_token_cost_policy"], True)
+        self.assertEqual(active["reported_opt_in_overlays"]["prompt_lookup_snapshot"], "occupied-kv-v1")
+        self.assertIsNone(active["profile_overlay_qualification"])
+        neutral = self.collect(receipt_path=self.evidence("cost-full.json", {
+            "moe_token_cost_policy": {"enabled": False},
+            "prompt_lookup_snapshot": {"policy": "full-components", "max_payload_bytes": 0}}))
+        self.assertIs(neutral["reported_opt_in_overlays"]["moe_token_cost_policy"], False)
+        self.assertIs(neutral["reported_opt_in_overlays"]["prompt_lookup_snapshot"], False)
+        for field in ("moe_token_cost_policy", "prompt_lookup_snapshot"):
+            result = self.collect(receipt_path=self.evidence("absent-cost.json", {field: None}))
+            self.assertIsNone(result["reported_opt_in_overlays"][field])
+        for value in (True, {}, {"policy": "occupied-kv-v1"},
+                      {"policy": "occupied-kv-v1", "max_payload_bytes": 0},
+                      {"policy": "occupied-kv-v1", "max_payload_bytes": True},
+                      {"policy": "future", "max_payload_bytes": 8192}):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                self.collect(receipt_path=self.evidence("bad-snapshot.json", {"prompt_lookup_snapshot": value}))
+        with self.assertRaises(ValueError):
+            self.collect(receipt_path=self.evidence("bad-cost.json", {"moe_token_cost_policy": {"enabled": 1}}))
+
     def test_overlay_absence_false_unknown_and_invalid_types(self):
         inactive = {key: False for key in ("batched_moe_activation", "prefetch_q8_lm_head",
                                           "wave8_q8_lm_head", "wave8_q8_gdn_input",

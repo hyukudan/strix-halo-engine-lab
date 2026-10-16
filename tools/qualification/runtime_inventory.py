@@ -257,7 +257,8 @@ def reported_opt_in_overlays(receipt):
         values[key] = (value if value else False) if value is not None else None
     digest = receipt.get("offline_tuning_cache_sha256")
     values["offline_tuning_cache_sha256"] = hex_identity(digest, "tuning payload") if digest is not None else None
-    for key, flag in (("prompt_lookup_adaptive", "enabled"), ("device_queue_trace", "profiling_only")):
+    for key, flag in (("prompt_lookup_adaptive", "enabled"), ("device_queue_trace", "profiling_only"),
+                      ("moe_token_cost_policy", "enabled")):
         value = receipt.get(key)
         if value is not None:
             if not isinstance(value, dict) or flag not in value:
@@ -274,6 +275,15 @@ def reported_opt_in_overlays(receipt):
             raise ValueError("unknown serving tensor cohort width")
         cohort = rows if rows != 1 else False
     values["serving_tensor_cohort"] = cohort
+    snapshot = receipt.get("prompt_lookup_snapshot")
+    if snapshot is not None:
+        if not isinstance(snapshot, dict) or snapshot.get("policy") not in ("full-components", "occupied-kv-v1"):
+            raise ValueError("prompt_lookup_snapshot requires a supported policy")
+        bound = integer(snapshot.get("max_payload_bytes"), "prompt_lookup_snapshot.max_payload_bytes")
+        if snapshot["policy"] == "occupied-kv-v1" and not bound:
+            raise ValueError("occupied-KV snapshot requires a positive payload bound")
+        snapshot = snapshot["policy"] if snapshot["policy"] != "full-components" else False
+    values["prompt_lookup_snapshot"] = snapshot
     return values
 
 
