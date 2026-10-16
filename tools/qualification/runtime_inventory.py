@@ -233,7 +233,7 @@ def reported_opt_in_overlays(receipt):
         values[key] = value
     for key in ("batched_moe_activation", "prefetch_q8_lm_head", "wave8_q8_lm_head", "wave8_q8_gdn_input",
                 "wave8_q8_gdn_output", "wave8_q8_qsa_output", "prefetch_hc_projection_next_tile", "q51_slot_parallel_down", "qsa_hierarchical_selection",
-                "known_prefix_window", "known_prefix_expert_union_requested", "prompt_lookup", "serving_prefix_cache_requested"):
+                "known_prefix_window", "known_prefix_tiled_prefill", "known_prefix_expert_union_requested", "prompt_lookup", "serving_prefix_cache_requested"):
         value = receipt.get(key)
         if value is not None:
             boolean(value, key)
@@ -265,6 +265,15 @@ def reported_opt_in_overlays(receipt):
             boolean(value[flag], key + "." + flag)
             value = value[flag]
         values[key] = value
+    cohort = receipt.get("serving_tensor_cohort")
+    if cohort is not None:
+        if not isinstance(cohort, dict) or "requested_rows" not in cohort:
+            raise ValueError("serving_tensor_cohort must contain typed requested_rows")
+        rows = integer(cohort["requested_rows"], "serving_tensor_cohort.requested_rows")
+        if rows not in (1, 2, 4):
+            raise ValueError("unknown serving tensor cohort width")
+        cohort = rows if rows != 1 else False
+    values["serving_tensor_cohort"] = cohort
     return values
 
 

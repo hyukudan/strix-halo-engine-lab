@@ -18,12 +18,29 @@ jobs:
       - name: Configure, build and test core
         shell: bash
         run: |
-          set -o pipefail
+          set -euo pipefail
           {
             cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
             cmake --build build
-            ctest --test-dir build --output-on-failure
+            # Declare all registered names before execution; this inventory is
+            # host coverage only, not native/model qualification.
+            ctest --test-dir build --show-only=json-v1 > host-ctest-registered.json
+            python3 -c 'import json; from pathlib import Path; data=json.loads(Path("host-ctest-registered.json").read_text()); Path("host-ctest-expected.json").write_text(json.dumps([row["name"] for row in data["tests"]])+"\n")'
+            ctest --test-dir build --output-on-failure --output-junit "$PWD/host-ctest-junit.xml"
           } 2>&1 | tee host-build.log
+
+      - name: Preserve individual host test outcomes
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          # A build failure cannot manufacture a passing empty test receipt.
+          test -f host-ctest-expected.json
+          test -f host-ctest-junit.xml
+          python3 tools/qualification/ctest_evidence.py \
+            --expected-names host-ctest-expected.json \
+            --junit host-ctest-junit.xml --stage host \
+            --output host-ctest-evidence.json
 
       - name: Configure UMA host lab
         run: cmake -S lab/uma_residency -B build/uma-residency -G Ninja -DCMAKE_BUILD_TYPE=Release
@@ -79,8 +96,15 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: host-build-log
-          path: host-build.log
-          if-no-files-found: ignore
+          path: |
+            host-build.log
+            host-ctest-registered.json
+            host-ctest-expected.json
+            host-ctest-junit.xml
+            host-ctest-evidence.json
+            build/Testing/Temporary/LastTest.log
+            build/Testing/Temporary/LastTestsFailed.log
+          if-no-files-found: warn
 
 
   hip-offline-build:
@@ -91,7 +115,7 @@ jobs:
       - name: Build gfx1151 HIP labs offline
         shell: bash
         run: |
-          set -o pipefail
+          set -euo pipefail
           {
             image='rocm/dev-ubuntu-24.04@sha256:bdc8e61026cbb844ede93d44d2c50055f51ebb2041906b60182bf3bee3139054'
             docker pull "$image"

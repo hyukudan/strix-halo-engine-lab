@@ -26,3 +26,10 @@ This utility is source only until the implementation bundle reaches its schedule
 validation stage. Its fixture source covers skips, absent/extra/duplicate cases,
 nested suite totals, contradictory metadata, diagnostic retention and output
 preservation; writing those fixtures is not a test result.
+
+The host CI job declares the complete configured CTest name inventory before
+execution and retains that inventory, JUnit, raw logs and the individual-case
+receipt even when tests fail. A skipped or missing case fails the receipt gate;
+a build failure cannot produce an empty passing receipt. The configured inventory
+is not an independent proof that every required test was registered. HIP offline
+compilation remains a separate job and does not execute or qualify native tests.

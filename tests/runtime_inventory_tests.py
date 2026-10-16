@@ -173,6 +173,30 @@ class InventoryTests(unittest.TestCase):
             with self.subTest(declaration=declaration), self.assertRaises(ValueError):
                 self.collect(receipt_path=self.evidence("invalid-new.json", declaration))
 
+    def test_tiled_prefill_and_real_serving_cohort_declarations(self):
+        for width in (2, 4):
+            declaration = {"known_prefix_tiled_prefill": True,
+                           "serving_tensor_cohort": {"requested_rows": width,
+                                                    "qualification": "not_assessed",
+                                                    "cohorts": 7}}
+            result = self.collect(receipt_path=self.evidence("tiled-cohort.json", declaration))
+            self.assertTrue(result["reported_opt_in_overlays"]["known_prefix_tiled_prefill"])
+            self.assertEqual(result["reported_opt_in_overlays"]["serving_tensor_cohort"], width)
+            self.assertIsNone(result["profile_overlay_qualification"])
+        neutral = self.collect(receipt_path=self.evidence("neutral-cohort.json", {
+            "known_prefix_tiled_prefill": False, "serving_tensor_cohort": {"requested_rows": 1}}))
+        self.assertIs(neutral["reported_opt_in_overlays"]["serving_tensor_cohort"], False)
+        self.assertIs(neutral["reported_opt_in_overlays"]["known_prefix_tiled_prefill"], False)
+        for field in ("known_prefix_tiled_prefill", "serving_tensor_cohort"):
+            unknown = self.collect(receipt_path=self.evidence("unknown-cohort.json", {field: None}))
+            self.assertIsNone(unknown["reported_opt_in_overlays"][field])
+        for declaration in ({"known_prefix_tiled_prefill": 1}, {"serving_tensor_cohort": True},
+                            {"serving_tensor_cohort": {}}, {"serving_tensor_cohort": {"requested_rows": True}},
+                            {"serving_tensor_cohort": {"requested_rows": 3}},
+                            {"serving_tensor_cohort": {"requested_rows": "4"}}):
+            with self.subTest(declaration=declaration), self.assertRaises(ValueError):
+                self.collect(receipt_path=self.evidence("invalid-cohort.json", declaration))
+
     def test_overlay_absence_false_unknown_and_invalid_types(self):
         inactive = {key: False for key in ("batched_moe_activation", "prefetch_q8_lm_head",
                                           "wave8_q8_lm_head", "wave8_q8_gdn_input",
