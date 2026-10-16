@@ -131,6 +131,7 @@ struct Options {
     bool wave_moe_router_topk = false;
     bool q4k_a8g32_gate_up = false;
     bool grouped_exact_q51_down = false;
+    bool q51_slot_parallel_down = false;
     bool deferred_moe_status = false;
     bool prefetch_q8_gdn_input = false;
     bool prefetch_q8_qsa_input = false;
@@ -196,6 +197,14 @@ inline void validate_resolved_hc_projection_next_tile(const Options& options) {
         options.execution.mode != strix::DecodeExecutionMode::eager ||
         options.execution.integer_head != strix::DecodeIntegerHead::none)
         throw std::invalid_argument("HC next-tile prefetch requires resolved parallel/staged/fused/typed/row-prefetch eager execution");
+}
+
+inline void validate_resolved_q51_slot_parallel_down(const Options& options) {
+    if (options.q51_slot_parallel_down &&
+        (!options.grouped_exact_q51_down || !options.q4k_a8g32_gate_up ||
+         options.execution.mode != strix::DecodeExecutionMode::eager ||
+         options.execution.integer_head != strix::DecodeIntegerHead::none))
+        throw std::invalid_argument("slot-parallel Q5_1 down requires resolved grouped eager A8 execution");
 }
 
 inline Options parse_options(
@@ -298,6 +307,11 @@ inline Options parse_options(
                 throw std::invalid_argument("--optimization-profile requires auto or manual");
             options.optimization_profile = parse_optimization_profile(argv[++index]);
             options.profile_explicit = true;
+            continue;
+        }
+        if (argument == "--q51-slot-parallel-down") {
+            if (options.q51_slot_parallel_down) throw std::invalid_argument("duplicate slot-parallel Q5_1 down option");
+            options.q51_slot_parallel_down = true;
             continue;
         }
         if (argument == "--grouped-exact-q51-down") {
@@ -641,6 +655,10 @@ inline Options parse_options(
         (options.execution.mode != strix::DecodeExecutionMode::eager ||
          options.execution.integer_head != strix::DecodeIntegerHead::none))
         throw std::invalid_argument("Q8 projection organizations require eager execution without integer head");
+    if (options.q51_slot_parallel_down &&
+        (options.execution.mode != strix::DecodeExecutionMode::eager ||
+         options.execution.integer_head != strix::DecodeIntegerHead::none))
+        throw std::invalid_argument("slot-parallel Q5_1 down requires eager execution without integer head");
     if (options.prefetch_hc_projection_next_tile &&
         (options.execution.mode != strix::DecodeExecutionMode::eager ||
          options.execution.integer_head != strix::DecodeIntegerHead::none))

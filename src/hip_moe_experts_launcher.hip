@@ -1,6 +1,7 @@
 #include "strix/hip_launch_context.hpp"
 #include "strix/hip_moe_experts_launcher.hpp"
 #include "strix/deferred_moe_status.hpp"
+#include "strix/q51_slot_parallel_contract.hpp"
 
 #include "strix/dispatch_resources.hpp"
 #include "strix/hip_setup_quiescence.hpp"
@@ -142,12 +143,14 @@ void validate_config(
         throw std::invalid_argument("batched routed activation requires Q4K A8 independent slot workspace");
     if(config.grouped_exact_q51_down && !config.q4k_a8g32_gate_up)
         throw std::invalid_argument("grouped exact Q5_1 down requires Q4K A8 slot workspace");
+    if (config.q51_slot_parallel_down && !config.grouped_exact_q51_down)
+        throw std::invalid_argument("slot-parallel Q5_1 down requires grouped exact Q5_1 workspace");
     if (config.q4k_a8g32_gate_up) {
 #ifndef STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME
         throw std::invalid_argument("Q4K A8 runtime capability is not built");
 #else
         (void)moe_q4k_a8::build_runtime_workspace(config.hidden_size,
-            config.intermediate_size, config.expert_count, config.top_k);
+            config.intermediate_size, config.expert_count, config.top_k, config.q51_slot_parallel_down);
 #endif
     }
     if (config.hidden_size == 0 ||
@@ -1144,6 +1147,78 @@ __global__ void q51_grouped_virtual256_down_probe_kernel(const float* intermedia
     if(lane==0U) accumulation[out]=current;
 }
 
+// Each complete wave owns exactly the incumbent's eight virtual leaves for
+// one (slot, output). Store the unweighted dot without arithmetic conversion.
+__global__ void q51_slot_parallel_dot_kernel(const float* intermediates,
+    const std::uint32_t* routes,const void* weights,
+    std::uint32_t intermediate_size,std::uint32_t hidden_size,std::uint32_t experts,
+    float* rawdots,const std::uint32_t* status) {
+    if(*status!=0U) return;
+    const auto lane=static_cast<std::uint32_t>(threadIdx.x)%32U;
+    const auto wave=static_cast<std::uint32_t>(threadIdx.x)/32U;
+    const auto out=static_cast<std::uint32_t>(blockIdx.x)*8U+wave;
+    if(out>=hidden_size) return;
+    const auto slot=static_cast<std::uint32_t>(blockIdx.y);
+    const auto expert=routes[slot];
+    if(expert>=experts) return;
+    const auto row=static_cast<std::uint64_t>(expert)*hidden_size+out;
+    const auto input_base=static_cast<std::uint64_t>(slot)*2U*intermediate_size;
+    float partial[8]={};
+    for(std::uint32_t chunk=0;chunk<intermediate_size;chunk+=256U) {
+#pragma unroll
+        for(unsigned j=0;j<8;++j) {
+            const auto feature=chunk+8U*lane+j;
+            if(feature<intermediate_size)
+                partial[j]+=intermediates[input_base+feature]*
+                    load_weight<WeightKind::q5_1>(weights,intermediate_size,row,feature);
+        }
+    }
+#pragma unroll
+    for(unsigned distance=16;distance>0;distance>>=1U) {
+#pragma unroll
+        for(unsigned j=0;j<8;++j) {
+            const auto neighbor=__shfl_down(partial[j],distance,32);
+            if(lane<distance) partial[j]+=neighbor;
+        }
+    }
+    if(lane==0U) {
+#pragma unroll
+        for(unsigned j=0;j<4;++j) partial[j]+=partial[j+4];
+#pragma unroll
+        for(unsigned j=0;j<2;++j) partial[j]+=partial[j+2];
+        partial[0]+=partial[1];
+        rawdots[static_cast<std::uint64_t>(slot)*hidden_size+out]=partial[0];
+    }
+}
+
+__global__ void q51_slot_parallel_merge_kernel(const float* rawdots,
+    const std::uint32_t* routes,const float* route_weights,
+    std::uint32_t hidden_size,std::uint32_t experts,std::uint32_t top_k,
+    float* accumulation,const std::uint32_t* status) {
+    if(*status!=0U) return;
+    const auto out=static_cast<std::uint32_t>(blockIdx.x)*blockDim.x+threadIdx.x;
+    if(out>=hidden_size) return;
+    float current=0.0F;
+    for(std::uint32_t slot=0;slot<top_k;++slot) {
+        if(routes[slot]>=experts) return;
+        const float weight=route_weights[slot];
+        const float dot=rawdots[static_cast<std::uint64_t>(slot)*hidden_size+out];
+        // Actual incumbent merge roles: weight src0, dot src1, accumulator src2.
+        // The read/write operand also preserves the positive-zero initial seed.
+        asm volatile("v_fmac_f32 %0, %1, %2" : "+v"(current) : "s"(weight), "v"(dot));
+    }
+    accumulation[out]=current;
+}
+
+void require_q51_slot_eager_stream(hipStream_t stream) {
+    if (hip_graph_status()!=nullptr)
+        throw std::invalid_argument("slot-parallel Q5_1 down admits eager execution only");
+    hipStreamCaptureStatus capture=hipStreamCaptureStatusNone;
+    check_hip(hipStreamIsCapturing(stream,&capture),"query slot-parallel Q5_1 capture status");
+    if (capture!=hipStreamCaptureStatusNone)
+        throw std::invalid_argument("slot-parallel Q5_1 down admits eager execution only");
+}
+
 struct Q4kA8Range { std::uintptr_t address; std::uint64_t bytes; };
 void validate_q4k_a8_ranges(Q4kA8Range temporary, Q4kA8Range output,
     const std::array<Q4kA8Range, 6>& readonly) {
@@ -1171,7 +1246,7 @@ void launch_q4k_a8_typed(const HipMoeExpertsLauncherConfig& config,
     if (!config.q4k_a8_quiescence)
         throw std::invalid_argument("Q4K A8 runtime requires setup completion guard");
     const auto layout = moe_q4k_a8::build_runtime_workspace(config.hidden_size,
-        config.intermediate_size, config.expert_count, config.top_k);
+        config.intermediate_size, config.expert_count, config.top_k, config.q51_slot_parallel_down);
     if (temporary.bytes < layout.total_bytes)
         throw std::invalid_argument("Q4K A8 runtime temporary is undersized");
     const auto gate_bytes = required_weight_bytes(WeightKind::q4_k, config.hidden_size,
@@ -1205,6 +1280,7 @@ void launch_q4k_a8_typed(const HipMoeExpertsLauncherConfig& config,
     // All admission is complete before even the initial clear is submitted.
     moe_q4k_a8::validate(request,bindings);
     const bool grouped_q51=config.grouped_exact_q51_down && tensors.down.manifest->ggml_type==7U;
+    const bool slot_parallel_q51=grouped_q51 && config.q51_slot_parallel_down;
     if(grouped_q51) {
         const q51_grouped_down::Request q51_request{true,q51_grouped_down::numerical_identity,
             {config.hidden_size,config.intermediate_size,config.expert_count,config.top_k}};
@@ -1213,6 +1289,14 @@ void launch_q4k_a8_typed(const HipMoeExpertsLauncherConfig& config,
             {bindings.output.address,n.intermediates},{tensors.down.runtime->address,n.weights},
             {route_indices.address,n.routes},{route_weights.address,n.route_weights},
             {bindings.status.address,n.status},{temporary.address+layout.accumulation_offset,n.accumulation}});
+        if (slot_parallel_q51) {
+            const q51_slot_parallel::Request parallel_request{true,q51_slot_parallel::numerical_identity,q51_request.shape};
+            q51_slot_parallel::validate(parallel_request,{
+                {bindings.output.address,n.intermediates},{tensors.down.runtime->address,n.weights},
+                {route_indices.address,n.routes},{route_weights.address,n.route_weights},
+                {bindings.status.address,n.status},{temporary.address+layout.accumulation_offset,n.accumulation},
+                {temporary.address+layout.rawdots_offset,layout.rawdots_bytes}});
+        }
     }
     auto* workspace = reinterpret_cast<float*>(bindings.output.address);
     auto* accumulation = reinterpret_cast<float*>(temporary.address + layout.accumulation_offset);
@@ -1256,7 +1340,20 @@ void launch_q4k_a8_typed(const HipMoeExpertsLauncherConfig& config,
         }
     }
     scan(workspace,2U*config.intermediate_size*config.top_k);
-    if(grouped_q51) {
+    if(slot_parallel_q51) {
+        auto* rawdots=reinterpret_cast<float*>(temporary.address+layout.rawdots_offset);
+        hipLaunchKernelGGL(q51_slot_parallel_dot_kernel,
+            dim3((config.hidden_size+7U)/8U,config.top_k),dim3(kThreads),0,hip_execution_stream(),
+            workspace,routes,reinterpret_cast<const void*>(tensors.down.runtime->address),
+            config.intermediate_size,config.hidden_size,config.expert_count,rawdots,status);
+        check_hip(hipGetLastError(),"native slot-parallel Q5_1 raw dots");
+        hipLaunchKernelGGL(q51_slot_parallel_merge_kernel,
+            dim3((config.hidden_size+kThreads-1U)/kThreads),dim3(kThreads),0,hip_execution_stream(),
+            rawdots,routes,weights,config.hidden_size,config.expert_count,config.top_k,accumulation,status);
+        check_hip(hipGetLastError(),"native slot-parallel Q5_1 ordered merge");
+        if (config.q4k_a8_stats)
+            config.q4k_a8_stats->slot_parallel_q51_submissions.fetch_add(1,std::memory_order_relaxed);
+    } else if(grouped_q51) {
         hipLaunchKernelGGL(q51_grouped_virtual256_down_probe_kernel,
             dim3((config.hidden_size+7U)/8U),dim3(kThreads),0,hip_execution_stream(),
             workspace,routes,weights,reinterpret_cast<const void*>(tensors.down.runtime->address),
@@ -1325,6 +1422,9 @@ void launch_moe_experts(
             HipMoeExpertsLauncherConfig*>(
                 user_data);
     validate_config(config);
+#ifdef STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME
+    if (config.q51_slot_parallel_down) require_q51_slot_eager_stream(hip_execution_stream());
+#endif
     if (config.deferred_moe_status != (hip_deferred_moe_status()!=nullptr))
         throw std::invalid_argument("deferred MoE launcher requires matching owned eager completion scope");
 
@@ -1361,7 +1461,7 @@ void launch_moe_experts(
         sizeof(float);
     const auto temporary_required = config.q4k_a8g32_gate_up ?
         moe_q4k_a8::build_runtime_workspace(config.hidden_size, config.intermediate_size,
-            config.expert_count, config.top_k).total_bytes :
+            config.expert_count, config.top_k, config.q51_slot_parallel_down).total_bytes :
         (2ULL * config.intermediate_size + config.hidden_size) * sizeof(float) + sizeof(std::uint32_t);
 
     if (hidden.bytes <
@@ -1503,6 +1603,7 @@ std::string kernel_id(
             request.request_concurrency) +
         (config.batched_slot_activation ? ".batched-slot-activation-v1" : "") +
         (config.deferred_moe_status ? ".deferred-status-v1" : "") +
+        (config.q51_slot_parallel_down ? ".q51-slot-parallel-v1" : "") +
         (config.grouped_exact_q51_down ? ".grouped-exact-q51-down-v1" : "") +
         (config.q4k_a8g32_gate_up ? std::string(moe_q4k_a8::runtime_kernel_suffix) : "");
 }
@@ -1521,9 +1622,20 @@ std::uint64_t implementation_identity(
             config.activation));
     if (config.q4k_a8g32_gate_up) hash_u64(hash,0x51344b4138473332ULL);
     if (config.grouped_exact_q51_down) hash_u64(hash,0x5135314752505631ULL);
+    if (config.q51_slot_parallel_down) hash_u64(hash,0x5135315350415231ULL);
     if (config.deferred_moe_status) hash_u64(hash,0x4445464d4f453031ULL);
     if (config.batched_slot_activation) hash_u64(hash,0x42415453494c5531ULL);
     return hash;
+}
+
+void validate_q51_slot_kernel_id(std::string_view id, bool enabled) {
+    constexpr std::string_view marker=".q51-slot-parallel-v1";
+    const auto position=id.find(marker);
+    const bool present=position!=std::string_view::npos;
+    const auto ending=std::string(marker)+std::string(moe_q4k_a8::grouped_q51_kernel_ending);
+    if (present!=enabled || (enabled && (!id.ends_with(ending) ||
+        id.find(marker,position+marker.size())!=std::string_view::npos)))
+        throw std::invalid_argument("slot-parallel Q5_1 id differs from config or marker placement");
 }
 
 }  // namespace
@@ -1547,6 +1659,10 @@ void register_hip_moe_experts_kernel_variant(
         throw std::invalid_argument("batched routed activation variant admits eager execution only");
     if(request.grouped_exact_q51_down != config.grouped_exact_q51_down)
         throw std::invalid_argument("grouped exact Q5_1 config differs from binding request");
+    if (request.q51_slot_parallel_down != config.q51_slot_parallel_down)
+        throw std::invalid_argument("slot-parallel Q5_1 config differs from binding request");
+    if (request.q51_slot_parallel_down && (request.device_graph_inputs || request.require_graph_safe))
+        throw std::invalid_argument("slot-parallel Q5_1 variant admits eager execution only");
     if (request.deferred_moe_status != config.deferred_moe_status ||
         (config.deferred_moe_status && (request.device_graph_inputs || request.require_graph_safe)))
         throw std::invalid_argument("deferred MoE variant requires matching eager request");
@@ -1612,7 +1728,7 @@ void register_hip_moe_experts_kernel_variant(
     variant.numerics.deterministic = true;
     variant.qualification =
         qualification;
-    variant.graph_safe = !config.deferred_moe_status;
+    variant.graph_safe = !config.deferred_moe_status && !config.q51_slot_parallel_down;
     variant.input_layout =
         "row-major+device-topk";
     variant.output_layout =
@@ -1622,7 +1738,7 @@ void register_hip_moe_experts_kernel_variant(
     if (config.q4k_a8g32_gate_up) {
         variant.resources.lds_bytes = 3328;
         variant.resources.scratch_bytes = moe_q4k_a8::build_runtime_workspace(config.hidden_size,
-            config.intermediate_size,config.expert_count,config.top_k).total_bytes;
+            config.intermediate_size,config.expert_count,config.top_k,config.q51_slot_parallel_down).total_bytes;
         variant.numerics.accumulator_precision = std::string(moe_q4k_a8::runtime_numerical_identity);
         variant.compiler_identity = "hip-gfx1151-moe-q4k-a8g32-native-v2-probe-strict-rndiv-legacy-down";
     }
@@ -1631,6 +1747,10 @@ void register_hip_moe_experts_kernel_variant(
         variant.compiler_identity += ":grouped-exact-q51-down-v1";
     }
     if(config.deferred_moe_status) variant.compiler_identity += ":deferred-first-error-v1";
+    if(config.q51_slot_parallel_down) {
+        variant.numerics.accumulator_precision += ";" + std::string(q51_slot_parallel::numerical_identity);
+        variant.compiler_identity += ":q51-slot-parallel-rawdot-v1";
+    }
     if(config.batched_slot_activation) variant.compiler_identity += ":batched-slot-activation-v1";
     variant.measured_seconds = 0.0;
 
@@ -1648,6 +1768,7 @@ make_hip_moe_experts_launcher(
             "HIP routed-expert launcher requires id and config");
     }
     validate_config(*config);
+    validate_q51_slot_kernel_id(kernel_id_value,config->q51_slot_parallel_down);
     if ((kernel_id_value.find(".batched-slot-activation-v1")!=std::string::npos)!=config->batched_slot_activation)
         throw std::invalid_argument("batched routed activation launcher id differs from config");
     if ((kernel_id_value.find(".deferred-status-v1")!=std::string::npos)!=config->deferred_moe_status)
@@ -1694,6 +1815,7 @@ register_for_compiled_execution(
             throw std::invalid_argument(
                 "HIP routed-expert step has no kernel binding");
         }
+        validate_q51_slot_kernel_id(*binding.kernel_id,config_.q51_slot_parallel_down);
         if ((binding.kernel_id->find(".deferred-status-v1")!=std::string::npos)!=config_.deferred_moe_status)
             throw std::invalid_argument("deferred MoE bundle mode differs from compiled binding");
         if ((binding.kernel_id->find(".batched-slot-activation-v1")!=std::string::npos)!=config_.batched_slot_activation)
@@ -1756,6 +1878,30 @@ void enqueue_original_receipt(const Request& request,const Bindings& b,hipStream
     }
 }
 } // namespace q51_grouped_down
+
+namespace q51_slot_parallel {
+void enqueue_slot_parallel_probe(const Request& request,const Bindings& b,hipStream_t stream) {
+    validate(request,b);
+    require_q51_slot_eager_stream(stream);
+    const q51_grouped_down::Request original_request{true,q51_grouped_down::numerical_identity,request.shape};
+    const q51_grouped_down::Bindings original{b.intermediates,b.weights,b.routes,b.route_weights,b.status,b.accumulation};
+    q51_grouped_down::enqueue_preflight(original_request,original,stream);
+    hipLaunchKernelGGL(q51_slot_parallel_dot_kernel,
+        dim3((request.shape.hidden+7U)/8U,request.shape.top_k),dim3(kThreads),0,stream,
+        reinterpret_cast<const float*>(b.intermediates.address),
+        reinterpret_cast<const std::uint32_t*>(b.routes.address),reinterpret_cast<const void*>(b.weights.address),
+        request.shape.intermediate,request.shape.hidden,request.shape.experts,
+        reinterpret_cast<float*>(b.rawdots.address),reinterpret_cast<const std::uint32_t*>(b.status.address));
+    check_hip(hipGetLastError(),"Q5_1 slot-parallel raw dots probe");
+    hipLaunchKernelGGL(q51_slot_parallel_merge_kernel,
+        dim3((request.shape.hidden+kThreads-1U)/kThreads),dim3(kThreads),0,stream,
+        reinterpret_cast<const float*>(b.rawdots.address),
+        reinterpret_cast<const std::uint32_t*>(b.routes.address),reinterpret_cast<const float*>(b.route_weights.address),
+        request.shape.hidden,request.shape.experts,request.shape.top_k,
+        reinterpret_cast<float*>(b.accumulation.address),reinterpret_cast<const std::uint32_t*>(b.status.address));
+    check_hip(hipGetLastError(),"Q5_1 slot-parallel ordered merge probe");
+}
+} // namespace q51_slot_parallel
 #endif
 
 #ifdef STRIX_BUILD_MOE_BATCHED_ACTIVATION_DIAGNOSTIC

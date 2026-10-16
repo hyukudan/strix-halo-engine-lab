@@ -216,6 +216,7 @@ std::uint64_t build_execution_identity(
     if (buffer_request.parallel_moe_router) hash_u64(hash, 0x524f555445525057ULL);
     if (buffer_request.q4k_a8g32_gate_up) hash_u64(hash, 0x51344b4138473332ULL);
     if (buffer_request.grouped_exact_q51_down) hash_u64(hash, 0x5135314752505631ULL);
+    if (buffer_request.q51_slot_parallel_down) hash_u64(hash, 0x5135315350415231ULL);
 
     hash_u64(hash, compiled.arena.alignment);
     hash_u64(hash, compiled.arena.total_bytes);
@@ -339,6 +340,13 @@ CompiledSerialExecution compile_serial_execution(
     if (binding_request.parallel_moe_router != buffer_request.parallel_moe_router)
         throw std::invalid_argument("router kernel request differs from buffer admission");
 
+    if (binding_request.q51_slot_parallel_down != buffer_request.q51_slot_parallel_down)
+        throw std::invalid_argument("slot-parallel Q5_1 request differs from buffer admission");
+    if (binding_request.q51_slot_parallel_down &&
+        (!binding_request.grouped_exact_q51_down || !binding_request.q4k_a8g32_gate_up ||
+         binding_request.device_graph_inputs || binding_request.require_graph_safe ||
+         binding_request.logical_rows != 1 || binding_request.request_concurrency != 1))
+        throw std::invalid_argument("slot-parallel Q5_1 down requires grouped eager C1 A8 execution");
     if(binding_request.grouped_exact_q51_down != buffer_request.grouped_exact_q51_down)
         throw std::invalid_argument("grouped exact Q5_1 down request differs from buffer admission");
     if(binding_request.grouped_exact_q51_down && !binding_request.q4k_a8g32_gate_up)
@@ -427,6 +435,16 @@ CompiledSerialExecution compile_serial_execution(
             (binding.kernel_id->find(".deferred-status-v1")!=std::string::npos)!=binding_request.deferred_moe_status)
             throw std::invalid_argument("bound deferred MoE status mode differs from request");
         if(binding.op==SerialOp::shared_expert && binding.kernel_id){const auto& step=compiled.execution.steps[binding.step_id];if(binding.kernel_id->ends_with(shared_expert_prefetch::kernel_suffix)!=shared_expert_prefetch::selected(binding_request.prefetch_q8_shared_expert,binding_request.shared_expert_prefetch_layers,step.layer))throw std::invalid_argument("bound shared prefetch differs from admitted topology");}
+        if (binding.kernel_id) {
+            constexpr std::string_view marker = ".q51-slot-parallel-v1";
+            const auto position = binding.kernel_id->find(marker);
+            const bool expected = binding.op == SerialOp::moe_experts && binding_request.q51_slot_parallel_down;
+            if ((position != std::string::npos) != expected)
+                throw std::invalid_argument("bound slot-parallel Q5_1 mode differs from request");
+            if (position != std::string::npos &&
+                std::string_view(*binding.kernel_id).substr(position + marker.size()) != moe_q4k_a8::grouped_q51_kernel_ending)
+                throw std::invalid_argument("slot-parallel Q5_1 marker must precede grouped A8 terminal");
+        }
         if(binding.op==SerialOp::moe_experts && binding.kernel_id &&
            binding.kernel_id->ends_with(moe_q4k_a8::grouped_q51_kernel_ending)!=buffer_request.grouped_exact_q51_down)
             throw std::invalid_argument("bound grouped exact Q5_1 down differs from admitted topology");

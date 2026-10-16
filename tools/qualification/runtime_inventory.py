@@ -157,7 +157,7 @@ def validate_outer_receipt(receipt):
     # consumed here are checked. A missing or explicit null identity stays unknown.
     for key in ("execution_identity", "kernel_plan_identity", "launch_plan_identity",
                 "runtime_compatibility_identity", "context_tokens", "final_position",
-                "next_position", "committed_tokens", "steps_executed"):
+                "next_position", "committed_tokens", "steps_executed", "slot_parallel_q51_submissions"):
         if receipt.get(key) is not None:
             integer(receipt[key], key)
     for key in ("model_sha256", "model_content_identity", "binary_sha256"):
@@ -192,7 +192,7 @@ def reported_opt_in_overlays(receipt):
             raise ValueError(f"{key} must be a nonempty string or null")
         values[key] = value
     for key in ("batched_moe_activation", "prefetch_q8_lm_head", "wave8_q8_lm_head", "wave8_q8_gdn_input",
-                "wave8_q8_gdn_output", "wave8_q8_qsa_output", "prefetch_hc_projection_next_tile"):
+                "wave8_q8_gdn_output", "wave8_q8_qsa_output", "prefetch_hc_projection_next_tile", "q51_slot_parallel_down"):
         value = receipt.get(key)
         if value is not None:
             boolean(value, key)

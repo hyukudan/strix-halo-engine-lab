@@ -16,6 +16,7 @@ struct ExecutionBufferRequest {
     bool parallel_moe_router = false;
     bool q4k_a8g32_gate_up = false;
     bool grouped_exact_q51_down = false;
+    bool q51_slot_parallel_down = false;
 };
 
 struct ExecutionBufferPlan {

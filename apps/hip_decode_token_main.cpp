@@ -456,6 +456,7 @@ int main(
             "  --wave8-q8-gdn-output (eager wave8 output; requires resolved virtual Q8 GDN output)\n"
             "  --wave8-q8-qsa-output (eager all-layer Q8 output organization)\n"
             "  --prefetch-hc-projection-next-tile (canonical eager typed HC projection overlay)\n"
+            "  --q51-slot-parallel-down (experimental eager grouped Q5_1 raw-dot overlay)\n"
             "  --lane-chain-hyper-output (requires --prefetch-q8-hyper-output)\n"
             "  --record-raw ABS_NEW_PRIVATE_DIRECTORY --record-max-bytes BYTES\n"
             "  --record-state-policy final|each --prefix-cache-roundtrip\n"
@@ -581,6 +582,7 @@ int main(
     strix::decode_cli::validate_resolved_prefix_roundtrip(options);
     strix::decode_cli::validate_resolved_q8_projection_organization(options);
     strix::decode_cli::validate_resolved_hc_projection_next_tile(options);
+    strix::decode_cli::validate_resolved_q51_slot_parallel_down(options);
     if (options.batched_moe_activation && !options.q4k_a8g32_gate_up)
         throw std::invalid_argument("batched MoE activation requires resolved Q4K A8 gate/up execution");
     if (options.moe_shared_overlap && !options.deferred_moe_status)
@@ -615,9 +617,21 @@ int main(
         strix::moe_q4k_a8::RuntimeLayerClassification{};
     if(options.grouped_exact_q51_down && q4k_a8_layers.q4k_with_q51_down_layers.empty())
         throw std::invalid_argument("--grouped-exact-q51-down requires a Q4_K gate/up layer with Q5_1 down");
+    if (options.q51_slot_parallel_down)
+        strix::moe_q4k_a8::validate_slot_parallel_manifest(model, q4k_a8_layers);
     const auto q4k_a8_stats = options.q4k_a8g32_gate_up ?
         std::make_shared<strix::moe_q4k_a8::RuntimeDispatchStats>() : nullptr;
+    const auto emit_q51_slot_receipt = [&] {
+        if (options.q51_slot_parallel_down)
+            std::cout << "  \"q51_slot_parallel_down\": true,\n"
+                         "  \"q51_slot_parallel_down_qualification\": \"not_assessed\",\n";
+    };
+    const auto emit_q51_slot_counts = [&] {
+        if (options.q51_slot_parallel_down) std::cout << "  \"slot_parallel_q51_submissions\": "
+            << (q4k_a8_stats ? q4k_a8_stats->slot_parallel_q51_submissions.load(std::memory_order_relaxed) : 0) << ",\n";
+    };
     const auto emit_q4k_a8_receipt = [&] {
+        emit_q51_slot_receipt();
         std::cout << "  \"grouped_exact_q51_down\": " << (options.grouped_exact_q51_down ? "true" : "false") << ",\n"
             << "  \"grouped_q51_numerical_identity\": \""
             << (options.grouped_exact_q51_down ? strix::moe_q4k_a8::grouped_q51_numerical_identity : std::string_view{"legacy"}) << "\",\n"
@@ -642,6 +656,7 @@ int main(
             << (q4k_a8_stats ? q4k_a8_stats->legacy_q5k_submissions.load(std::memory_order_relaxed) : 0)
             << ",\n  \"grouped_q51_host_submissions\": "
             << (q4k_a8_stats ? q4k_a8_stats->grouped_q51_submissions.load(std::memory_order_relaxed) : 0) << ",\n";
+        emit_q51_slot_counts();
         if (options.batched_moe_activation) std::cout << "  \"batched_moe_activation\":true,\n"
             << "  \"batched_moe_activation_launches\":"
             << (q4k_a8_stats ? q4k_a8_stats->batched_activation_launches.load(std::memory_order_relaxed) : 0) << ",\n"
@@ -778,9 +793,11 @@ int main(
     binding_request.batched_moe_activation = options.batched_moe_activation;
     catalog_config.q4k_a8g32_gate_up = options.q4k_a8g32_gate_up;
     catalog_config.grouped_exact_q51_down = options.grouped_exact_q51_down;
+    catalog_config.q51_slot_parallel_down = options.q51_slot_parallel_down;
     catalog_config.q4k_a8_stats = q4k_a8_stats;
     binding_request.q4k_a8g32_gate_up = options.q4k_a8g32_gate_up;
     binding_request.grouped_exact_q51_down = options.grouped_exact_q51_down;
+    binding_request.q51_slot_parallel_down = options.q51_slot_parallel_down;
     catalog_config.deferred_moe_status = options.deferred_moe_status;
     binding_request.deferred_moe_status = options.deferred_moe_status;
     catalog_config.ranked_moe_router_topk = options.ranked_moe_router_topk;
@@ -823,6 +840,7 @@ int main(
     buffer_request.parallel_moe_router = options.parallel_moe_router;
     buffer_request.q4k_a8g32_gate_up = options.q4k_a8g32_gate_up;
     buffer_request.grouped_exact_q51_down = options.grouped_exact_q51_down;
+    buffer_request.q51_slot_parallel_down = options.q51_slot_parallel_down;
     buffer_request.activation_element_bytes =
         2;
     buffer_request.control_element_bytes =
@@ -1457,8 +1475,11 @@ int main(
                     restore_stop -
                     restore_start).count();
 
+            std::cout << "{\n";
+            emit_q51_slot_receipt();
+            emit_q51_slot_counts();
             std::cout
-                << "{\n" << optimization_profile_receipt << eager_submission_receipt << overlap_receipt() << execution_inventory_receipt << gdn_output_mode_receipt() << wave_router_mode_receipt << deferred_moe_mode_receipt
+                << optimization_profile_receipt << eager_submission_receipt << overlap_receipt() << execution_inventory_receipt << gdn_output_mode_receipt() << wave_router_mode_receipt << deferred_moe_mode_receipt
                 << strix::decode_detail::qsa_input_dispatch_receipt(qsa_prefetch_stats.get())
                 << shared_dispatch_receipt.completed_counts()
                 << strix::decode_detail::deferred_moe_completed_tokens_receipt(deferred_moe.get())

@@ -32,6 +32,7 @@ struct ExecutionBindingRequest {
     bool q4k_a8g32_gate_up = false;
     bool batched_moe_activation = false;
     bool grouped_exact_q51_down = false;
+    bool q51_slot_parallel_down = false;
     bool lane_chain_hyper_output = false;
     bool prefetch_hc_projection_next_tile = false;
     std::vector<std::uint32_t> lane_chain_hyper_output_eligible_steps;

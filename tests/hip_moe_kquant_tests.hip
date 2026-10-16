@@ -166,9 +166,12 @@ float round_bf16(float value) {
 int main(int argc, char** argv) try {
     const unsigned int requested_mode = argc > 1 ? static_cast<unsigned int>(std::stoul(argv[1])) : 0U;
     if (requested_mode > 7U) throw std::invalid_argument("invalid K-quant test mode");
-    const bool grouped_q51=argc>2 && (std::string(argv[2])=="q4k-a8-q51-grouped" || std::string(argv[2])=="q4k-a8-q51-grouped-duplicate");
+    const bool slot_parallel_q51=argc>2 && (std::string(argv[2])=="q4k-a8-q51-slot-parallel" ||
+        std::string(argv[2])=="q4k-a8-q51-slot-parallel-duplicate");
+    const bool grouped_q51=slot_parallel_q51 || (argc>2 && (std::string(argv[2])=="q4k-a8-q51-grouped" || std::string(argv[2])=="q4k-a8-q51-grouped-duplicate"));
     const bool q4k_a8 = grouped_q51 || (argc > 2 && (std::string(argv[2]) == "q4k-a8" || std::string(argv[2]) == "q4k-a8-duplicate"));
-    const bool duplicate_routes = argc > 2 && (std::string(argv[2]) == "q4k-a8-duplicate" || std::string(argv[2])=="q4k-a8-q51-grouped-duplicate");
+    const bool duplicate_routes = argc > 2 && (std::string(argv[2]) == "q4k-a8-duplicate" || std::string(argv[2])=="q4k-a8-q51-grouped-duplicate" ||
+        std::string(argv[2])=="q4k-a8-q51-slot-parallel-duplicate");
 #ifndef STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME
     if(q4k_a8) throw std::invalid_argument("Q4K A8 test requires runtime capability");
 #endif
@@ -198,6 +201,33 @@ int main(int argc, char** argv) try {
         const auto launcher_golden=strix::make_hip_moe_experts_launcher(id,&golden);
         expect(launcher_golden.implementation_identity==5740034692284928882ULL,
             "default MoE implementation identity matches pre-edit FNV golden");
+        if(slot_parallel_q51) {
+            golden.q4k_a8g32_gate_up=true; golden.grouped_exact_q51_down=true; golden.q51_slot_parallel_down=true;
+            request.q4k_a8g32_gate_up=true; request.grouped_exact_q51_down=true; request.q51_slot_parallel_down=true;
+            strix::register_hip_moe_experts_kernel_variant(model,request,golden,registry);
+            const auto candidate_id=id+".q51-slot-parallel-v1"+std::string(strix::moe_q4k_a8::grouped_q51_kernel_ending);
+            const auto* variant=registry.find(candidate_id);
+            expect(variant&&!variant->graph_safe&&variant->resources.scratch_bytes==
+                strix::moe_q4k_a8::build_runtime_workspace(2560,640,512,10,true).total_bytes,
+                "registered slot variant has new ID, eager contract and flag-aware scratch resources");
+            auto candidate=strix::make_hip_moe_experts_launcher(candidate_id,&golden);
+            expect(candidate.implementation_identity!=launcher_golden.implementation_identity,
+                "slot candidate has distinct implementation identity");
+            const auto reject=[&](auto&& operation,const char* gate) {
+                bool rejected=false; try {operation();}
+                catch(const std::invalid_argument& error) {rejected=std::string(error.what()).find(gate)!=std::string::npos;}
+                expect(rejected,"slot admission reaches its intended metadata gate");
+            };
+            auto wrong_config=golden; wrong_config.q51_slot_parallel_down=false;
+            reject([&] {static_cast<void>(strix::make_hip_moe_experts_launcher(candidate_id,&wrong_config));},"slot-parallel Q5_1 id");
+            reject([&] {static_cast<void>(strix::make_hip_moe_experts_launcher(id+std::string(strix::moe_q4k_a8::grouped_q51_kernel_ending),&golden));},"slot-parallel Q5_1 id");
+            reject([&] {static_cast<void>(strix::make_hip_moe_experts_launcher(id+std::string(strix::moe_q4k_a8::grouped_q51_kernel_ending)+".q51-slot-parallel-v1",&golden));},"marker placement");
+            for(bool require_safe:{false,true}) {
+                auto graph_request=request; graph_request.device_graph_inputs=!require_safe; graph_request.require_graph_safe=require_safe;
+                strix::kernels::KernelRegistry graph_registry;
+                reject([&] {strix::register_hip_moe_experts_kernel_variant(model,graph_request,golden,graph_registry);},"slot-parallel Q5_1 variant admits eager");
+            }
+        }
     }
 
     const auto plan =
@@ -215,6 +245,7 @@ int main(int argc, char** argv) try {
     buffer_request.logical_rows = 1;
     buffer_request.q4k_a8g32_gate_up = q4k_a8;
     buffer_request.grouped_exact_q51_down=grouped_q51;
+    buffer_request.q51_slot_parallel_down=slot_parallel_q51;
     buffer_request.activation_element_bytes = bf16 ? 2U : 4U;
     buffer_request.mlp_intermediate_element_bytes = 4;
     const auto arena =
@@ -232,6 +263,8 @@ int main(int argc, char** argv) try {
             static_cast<std::size_t>(
                 arena.total_bytes)),
         "hipMalloc routed-expert arena");
+    if(slot_parallel_q51)
+        check(hipMemset(arena_pointer,0x5a,static_cast<std::size_t>(arena.total_bytes)),"initialize complete slot-parallel fixture arena");
 
     strix::ExecutionMemoryBinding memory;
     memory.execution_identity =
@@ -644,6 +677,131 @@ int main(int argc, char** argv) try {
     std::vector<std::byte> before(output_bytes), after(output_bytes);
     check(hipMemcpy(before.data(), reinterpret_cast<void*>(output.address), output_bytes,
                     hipMemcpyDeviceToHost), "snapshot committed routed output");
+    if(slot_parallel_q51) {
+        strix::HipSetupQuiescenceGuard guard;
+        const auto temporary=strix::resolve_execution_buffer(memory.execution_identity,arena,memory,step_io.temporaries[0]);
+        const auto layout=strix::moe_q4k_a8::build_runtime_workspace(hidden,intermediate,experts,top_k,true);
+        expect(layout.total_bytes<=temporary.bytes,"production candidate has flag-aware temporary capacity");
+        std::vector<std::byte> initial_arena(static_cast<std::size_t>(arena.total_bytes));
+        check(hipMemcpy(initial_arena.data(),arena_pointer,initial_arena.size(),hipMemcpyDeviceToHost),"retain complete fixture arena seed");
+        auto candidate_config=config;
+        candidate_config.q51_slot_parallel_down=true;
+        candidate_config.q4k_a8_stats=std::make_shared<strix::moe_q4k_a8::RuntimeDispatchStats>();
+        auto candidate=strix::make_hip_moe_experts_launcher("test.q51-slot-parallel-v1"+
+            std::string(strix::moe_q4k_a8::grouped_q51_kernel_ending),&candidate_config);
+        const auto raw_begin=static_cast<std::size_t>(temporary.address-memory.arena_base+layout.rawdots_offset);
+        const auto raw_end=raw_begin+static_cast<std::size_t>(layout.rawdots_bytes);
+        const auto raw_poison=[](const std::vector<std::byte>& bytes,std::size_t begin,std::size_t end) {
+            return std::all_of(bytes.begin()+static_cast<std::ptrdiff_t>(begin),bytes.begin()+static_cast<std::ptrdiff_t>(end),
+                [](auto value) {return value==std::byte{0x5a};});
+        };
+        struct Result { std::vector<std::byte> arena; unsigned status=0; bool rejected=false; };
+        const auto execute=[&](bool parallel) {
+            Result result; result.arena.resize(initial_arena.size());
+            guard.run([&] {
+                check(hipMemcpy(arena_pointer,initial_arena.data(),initial_arena.size(),hipMemcpyHostToDevice),"restore identical complete arena before production call");
+                auto& selected_launcher=parallel?candidate:launcher;
+                try { selected_launcher.function(context,selected_launcher.user_data); }
+                catch(const std::invalid_argument&) {result.rejected=true;}
+                check(hipMemcpy(result.arena.data(),arena_pointer,result.arena.size(),hipMemcpyDeviceToHost),"read complete production arena");
+                if(gate_type==12U)
+                    check(hipMemcpy(&result.status,reinterpret_cast<void*>(temporary.address+layout.status_offset),4,hipMemcpyDeviceToHost),"read precise production local status");
+                else
+                    check(hipMemcpy(&result.status,reinterpret_cast<void*>(temporary.address+(2ULL*intermediate+hidden)*4U),4,hipMemcpyDeviceToHost),"read precise fallback local status");
+            });
+            return result;
+        };
+        const auto pair=[&](unsigned expected_status,bool raw_untouched) {
+            const auto reference=execute(false),actual_candidate=execute(true);
+            expect(reference.rejected==(expected_status!=0U)&&actual_candidate.rejected==reference.rejected&&
+                reference.status==expected_status&&actual_candidate.status==expected_status,
+                "production original/candidate retain exact rejection and status bits");
+            expect(std::equal(reference.arena.begin(),reference.arena.begin()+static_cast<std::ptrdiff_t>(raw_begin),actual_candidate.arena.begin())&&
+                std::equal(reference.arena.begin()+static_cast<std::ptrdiff_t>(raw_end),reference.arena.end(),
+                    actual_candidate.arena.begin()+static_cast<std::ptrdiff_t>(raw_end)),
+                "production candidate preserves every arena byte outside dedicated raw dots");
+            if(expected_status!=0U) {
+                const auto out_begin=static_cast<std::size_t>(output.address-memory.arena_base);
+                expect(std::equal(initial_arena.begin()+static_cast<std::ptrdiff_t>(out_begin),
+                    initial_arena.begin()+static_cast<std::ptrdiff_t>(out_begin+output_bytes),
+                    actual_candidate.arena.begin()+static_cast<std::ptrdiff_t>(out_begin)),
+                    "production rejection preserves complete semantic output");
+            }
+            if(raw_untouched) expect(raw_poison(actual_candidate.arena,raw_begin,raw_end),"rejected/fallback production call changed raw dots");
+            return reference;
+        };
+        for(unsigned repeat=0;repeat<3U;++repeat) static_cast<void>(pair(0U,gate_type!=12U));
+        expect(candidate_config.q4k_a8_stats->slot_parallel_q51_submissions.load()==(gate_type==12U?3U:0U),
+            "production candidate counter proves actual selected branch and zero fallback submissions");
+        auto bad_arena=initial_arena;
+        const auto route_offset=static_cast<std::size_t>(route_indices.address-memory.arena_base);
+        const auto mix_offset=static_cast<std::size_t>(route_weights.address-memory.arena_base);
+        const auto input_offset=static_cast<std::size_t>(hidden_input.address-memory.arena_base);
+        const auto restore_arena=initial_arena;
+        const unsigned invalid_route=experts;
+        std::memcpy(initial_arena.data()+route_offset+4U,&invalid_route,4U); static_cast<void>(pair(1U,true));
+        initial_arena=restore_arena;
+        const unsigned nan_weight=0x7fc12345U;
+        std::memcpy(initial_arena.data()+mix_offset,&nan_weight,4U); static_cast<void>(pair(1U,true));
+        initial_arena=restore_arena;
+        if(gate_type==12U) {
+            if(bf16) { const std::uint16_t nan=0x7fc1U; std::memcpy(initial_arena.data()+input_offset,&nan,2U); }
+            else { const unsigned nan=0x7fc12345U; std::memcpy(initial_arena.data()+input_offset,&nan,4U); }
+            static_cast<void>(pair(2U,true)); initial_arena=restore_arena;
+            // Corrupt the selected down coefficient after finite gate/up and SiLU.
+            auto corrupt=down.packed; const std::uint16_t nan=0x7e11U;
+            const auto row=static_cast<std::size_t>(selected.front())*hidden*(intermediate/32U)*24U;
+            std::memcpy(corrupt.data()+row+2U,&nan,2U);
+            check(hipMemcpy(device_weights[2],corrupt.data(),corrupt.size(),hipMemcpyHostToDevice),"upload down-only nonfinite coefficient");
+            static_cast<void>(pair(8U,false));
+            check(hipMemcpy(device_weights[2],down.data(),down.size(),hipMemcpyHostToDevice),"restore finite down coefficient");
+            // Exact BF16 input 2^26 calibrates only a finite route weight. This
+            // reaches the actual FP32 finite/BF16-overflow boundary in both paths.
+            const float large=67108864.0F; const std::uint16_t large_bf16=0x4c80U;
+            for(unsigned index=0;index<hidden;++index)
+                std::memcpy(initial_arena.data()+input_offset+index*(bf16?2U:4U),bf16?static_cast<const void*>(&large_bf16):&large,bf16?2U:4U);
+            std::array<float,2> calibration{1.0F,0.0F};
+            std::memcpy(initial_arena.data()+mix_offset,calibration.data(),sizeof(calibration));
+            const auto finite=pair(0U,false);
+            float maximum=0.0F;
+            const auto accumulator_offset=static_cast<std::size_t>(temporary.address-memory.arena_base+layout.accumulation_offset);
+            for(unsigned index=0;index<hidden;++index) { float value=0.0F;
+                std::memcpy(&value,finite.arena.data()+accumulator_offset+index*4U,4U);
+                expect(std::isfinite(value),"slot threshold calibration is finite"); maximum=std::max(maximum,std::abs(value)); }
+            if(!(maximum>1.0F)) throw std::runtime_error("slot threshold calibration has no finite scale");
+            calibration[0]=std::bit_cast<float>(0x7f7fc000U)/maximum;
+            expect(std::isfinite(calibration[0]),"slot threshold route weight is finite");
+            std::memcpy(initial_arena.data()+mix_offset,calibration.data(),sizeof(calibration));
+            const auto band=pair(bf16?8U:0U,false);
+            bool reached=false;
+            for(unsigned index=0;index<hidden;++index) { unsigned bits=0;
+                std::memcpy(&bits,band.arena.data()+accumulator_offset+index*4U,4U); bits&=0x7fffffffU;
+                expect(bits<0x7f800000U,"slot threshold accumulator remains finite FP32"); reached|=bits>=0x7f7f8000U; }
+            expect(reached,"slot threshold fixture reaches actual BF16 rounding-overflow band");
+            initial_arena=restore_arena;
+        }
+        // Capture rejection must precede even the accumulation/status clear.
+        hipStream_t capture_stream=nullptr; hipGraph_t rejected_graph=nullptr;
+        check(hipMemcpy(arena_pointer,initial_arena.data(),initial_arena.size(),hipMemcpyHostToDevice),"restore pre-capture complete arena");
+        check(hipStreamCreateWithFlags(&capture_stream,hipStreamNonBlocking),"create production admission stream");
+        try {
+            check(hipStreamBeginCapture(capture_stream,hipStreamCaptureModeThreadLocal),"begin production rejection capture");
+            bool rejected=false; strix::HipLaunchContext launch_context; launch_context.stream=capture_stream;
+            { strix::HipLaunchScope scope(launch_context);
+                try {candidate.function(context,candidate.user_data);}
+                catch(const std::invalid_argument& error) {rejected=std::string(error.what()).find("eager execution only")!=std::string::npos;} }
+            check(hipStreamEndCapture(capture_stream,&rejected_graph),"end production rejection capture");
+            std::size_t nodes=0; check(hipGraphGetNodes(rejected_graph,nullptr,&nodes),"inspect rejected production graph");
+            check(hipMemcpy(bad_arena.data(),arena_pointer,bad_arena.size(),hipMemcpyDeviceToHost),"read untouched production rejection arena");
+            expect(rejected&&nodes==0U&&bad_arena==initial_arena,"production capture rejects before any clear, kernel or byte mutation");
+            check(hipGraphDestroy(rejected_graph),"destroy production rejection graph"); rejected_graph=nullptr;
+            check(hipStreamDestroy(capture_stream),"destroy production admission stream"); capture_stream=nullptr;
+        } catch(...) {guard.recover_or_fail_stop(); if(rejected_graph)(void)hipGraphDestroy(rejected_graph); if(capture_stream)(void)hipStreamDestroy(capture_stream); throw;}
+        for(auto* pointer:device_weights) check(hipFree(pointer),"free slot production weight");
+        check(hipFree(arena_pointer),"free slot production arena");
+        std::cout<<"Q5_1 slot-parallel production eager comparisons complete; source fixture is not model/performance qualification\n";
+        return failures?1:0;
+    }
     if(grouped_q51 && gate_type==12U) {
         expect(config.q4k_a8_stats->grouped_q51_submissions.load()==1U,"grouped Q5_1 native host branch actually submitted");
         const auto grouped_temporary=strix::resolve_execution_buffer(memory.execution_identity,arena,memory,step_io.temporaries[0]);

@@ -47,6 +47,19 @@ int main() {
                 q.sums_offset >= q.deltas_offset + q.deltas_bytes && q.total_bytes >= q.sums_offset + q.sums_bytes &&
                 (q.accumulation_offset | q.codes_offset | q.deltas_offset | q.sums_offset | q.total_bytes) % 256 == 0,
                 "all admitted regions bounded, disjoint and aligned");
+            const auto off = build_runtime_workspace(h,i,512,k,false);
+            const auto on = build_runtime_workspace(h,i,512,k,true);
+            check(off.total_bytes == q.total_bytes && off.rawdots_offset == 0 && off.rawdots_bytes == 0 &&
+                off.gate_up_bytes == q.gate_up_bytes && off.accumulation_offset == q.accumulation_offset &&
+                off.status_offset == q.status_offset && off.codes_offset == q.codes_offset &&
+                off.deltas_offset == q.deltas_offset && off.sums_offset == q.sums_offset,
+                "old four-argument layout equals explicit-off across admitted geometry");
+            check(on.rawdots_offset == q.total_bytes && on.rawdots_bytes == static_cast<std::uint64_t>(k)*h*4U &&
+                on.total_bytes == on.rawdots_offset + on.rawdots_bytes &&
+                on.gate_up_bytes == q.gate_up_bytes && on.accumulation_offset == q.accumulation_offset &&
+                on.status_offset == q.status_offset && on.codes_offset == q.codes_offset &&
+                on.deltas_offset == q.deltas_offset && on.sums_offset == q.sums_offset,
+                "raw dots append without moving any original internal region");
         }
     for (auto h : {0ULL,128ULL,257ULL,2816ULL,~0ULL})
         rejects([&]{(void)build_runtime_workspace(h,640,512,10);}, "invalid H");

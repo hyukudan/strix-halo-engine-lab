@@ -25,11 +25,15 @@ struct RuntimeWorkspace {
     std::uint64_t deltas_offset = 0, deltas_bytes = 0;
     std::uint64_t sums_offset = 0, sums_bytes = 0;
     std::uint64_t total_bytes = 0;
+    std::uint64_t rawdots_offset = 0, rawdots_bytes = 0;
 };
 // Pure host admission. All regions begin on relative 256-byte boundaries,
 // except status, which immediately follows accumulation for one ordered clear.
 [[nodiscard]] RuntimeWorkspace build_runtime_workspace(
     std::uint64_t hidden, std::uint64_t rows, std::uint64_t experts, std::uint64_t top_k);
+[[nodiscard]] RuntimeWorkspace build_runtime_workspace(
+    std::uint64_t hidden, std::uint64_t rows, std::uint64_t experts, std::uint64_t top_k,
+    bool q51_slot_rawdots);
 // Host submissions include graph captures; replay counts are not inferred.
 struct RuntimeDispatchStats {
     std::atomic<std::uint64_t> batched_activation_launches{0};
@@ -37,6 +41,7 @@ struct RuntimeDispatchStats {
     std::atomic<std::uint64_t> quantized_submissions{0};
     std::atomic<std::uint64_t> legacy_q5k_submissions{0};
     std::atomic<std::uint64_t> grouped_q51_submissions{0};
+    std::atomic<std::uint64_t> slot_parallel_q51_submissions{0};
 };
 struct RuntimeLayerClassification {
     std::vector<std::uint32_t> quantized_layers;
@@ -47,4 +52,8 @@ struct RuntimeLayerClassification {
 // This runs before GPU ownership or full weight loading.
 [[nodiscard]] RuntimeLayerClassification classify_runtime_manifest(
     const ModelContract& model, const ModelManifest& manifest);
+// Explicit current-model slot-parallel admission before residency. The five
+// noneligible layers retain their existing per-slot fallback.
+void validate_slot_parallel_manifest(
+    const ModelContract& model, const RuntimeLayerClassification& classification);
 }  // namespace strix::moe_q4k_a8

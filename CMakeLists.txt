@@ -51,6 +51,7 @@ add_library(strix_core STATIC
     src/lane_chain_hyper_output.cpp
     src/shared_expert_prefetch.cpp
     src/q51_grouped_down_contract.cpp
+    src/q51_slot_parallel_contract.cpp
     src/moe_q4k_a8_runtime.cpp
     src/gdn_output_admission.cpp
     src/arithmetic_lineage.cpp
@@ -686,6 +687,11 @@ if(BUILD_TESTING)
         target_compile_options(strix-q51-grouped-down-contract-tests PRIVATE -fno-fast-math -ffp-contract=off)
     endif()
     add_test(NAME strix-q51-grouped-down-contract-tests COMMAND strix-q51-grouped-down-contract-tests)
+
+    add_executable(strix-q51-slot-parallel-contract-tests tests/q51_slot_parallel_contract_tests.cpp)
+    target_link_libraries(strix-q51-slot-parallel-contract-tests PRIVATE strix_core)
+    strix_target_warnings(strix-q51-slot-parallel-contract-tests)
+    add_test(NAME strix-q51-slot-parallel-contract-tests COMMAND strix-q51-slot-parallel-contract-tests)
 
     add_executable(strix-moe-q4k-a8-runtime-tests tests/moe_q4k_a8_runtime_tests.cpp)
     target_link_libraries(strix-moe-q4k-a8-runtime-tests PRIVATE strix_core)
@@ -1576,6 +1582,20 @@ if(STRIX_ENABLE_HIP_RUNTIME)
             target_link_libraries(strix-hip-q51-grouped-down-probe-tests PRIVATE strix_hip_runtime)
             strix_target_warnings(strix-hip-q51-grouped-down-probe-tests)
             add_test(NAME strix-hip-q51-grouped-down-probe-tests COMMAND strix-hip-q51-grouped-down-probe-tests)
+            add_executable(strix-hip-q51-slot-parallel-probe-tests tests/hip_q51_slot_parallel_probe_tests.hip)
+            set_target_properties(strix-hip-q51-slot-parallel-probe-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+            target_link_libraries(strix-hip-q51-slot-parallel-probe-tests PRIVATE strix_hip_runtime)
+            target_compile_options(strix-hip-q51-slot-parallel-probe-tests PRIVATE -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
+            strix_target_warnings(strix-hip-q51-slot-parallel-probe-tests)
+            add_test(NAME strix-hip-q51-slot-parallel-probe-tests COMMAND strix-hip-q51-slot-parallel-probe-tests)
+            foreach(mode 0 1 4 5)
+                add_test(NAME strix-hip-moe-q51-slot-parallel-native-${mode}-tests
+                    COMMAND strix-hip-moe-kquant-tests ${mode} q4k-a8-q51-slot-parallel)
+            endforeach()
+            foreach(mode 0 4)
+                add_test(NAME strix-hip-moe-q51-slot-parallel-native-duplicate-${mode}-tests
+                    COMMAND strix-hip-moe-kquant-tests ${mode} q4k-a8-q51-slot-parallel-duplicate)
+            endforeach()
             foreach(mode 0 1 4 5)
                 add_test(NAME strix-hip-moe-q51-grouped-native-${mode}-tests
                     COMMAND strix-hip-moe-kquant-tests ${mode} q4k-a8-q51-grouped)

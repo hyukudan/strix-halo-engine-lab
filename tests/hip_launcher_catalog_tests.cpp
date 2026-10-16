@@ -797,6 +797,62 @@ int main() {
         }
     }
 
+    {
+        strix::ExecutionBindingRequest slot_request;
+        slot_request.q51_slot_parallel_down = true;
+        slot_request.grouped_exact_q51_down = true;
+        slot_request.q4k_a8g32_gate_up = true;
+        strix::HipLauncherCatalogConfig slot_config;
+        slot_config.q51_slot_parallel_down = true;
+        slot_config.grouped_exact_q51_down = true;
+        slot_config.q4k_a8g32_gate_up = true;
+        for (unsigned mutation = 0; mutation < 7; ++mutation) {
+            auto bad_config = slot_config;
+            auto bad_request = slot_request;
+            switch (mutation) {
+            case 0: bad_config.q51_slot_parallel_down = false; break;
+            case 1: bad_request.q51_slot_parallel_down = false; break;
+            case 2: bad_config.grouped_exact_q51_down = false; break;
+            case 3: bad_config.q4k_a8g32_gate_up = false; break;
+            case 4: bad_request.require_graph_safe = true; break;
+            case 5: bad_request.logical_rows = 2; break;
+            default: bad_request.request_concurrency = 2; break;
+            }
+            strix::kernels::KernelRegistry rejected_registry;
+            bool rejected = false;
+            try { strix::register_complete_hip_kernel_catalog(model, bad_request, bad_config, rejected_registry); }
+            catch (const std::invalid_argument& error) {
+                rejected = std::string(error.what()).find("slot-parallel Q5_1") != std::string::npos;
+            }
+            expect(rejected && rejected_registry.variants().empty(),
+                   "slot-parallel Q5_1 inconsistent catalog rejects before publication");
+        }
+        strix::ExecutionBufferRequest slot_buffers;
+        slot_buffers.grouped_exact_q51_down = true;
+        slot_buffers.q4k_a8g32_gate_up = true;
+        slot_buffers.q51_slot_parallel_down = true;
+        for (unsigned mutation = 0; mutation < 7; ++mutation) {
+            auto bad_request = slot_request;
+            auto bad_buffers = slot_buffers;
+            switch (mutation) {
+            case 0: bad_buffers.q51_slot_parallel_down = false; break;
+            case 1: bad_request.q51_slot_parallel_down = false; break;
+            case 2: bad_request.grouped_exact_q51_down = false; break;
+            case 3: bad_request.q4k_a8g32_gate_up = false; break;
+            case 4: bad_request.device_graph_inputs = true; break;
+            case 5: bad_request.logical_rows = bad_buffers.logical_rows = 2; break;
+            default: bad_request.request_concurrency = 2; break;
+            }
+            bool rejected = false;
+            try {
+                strix::kernels::KernelRegistry empty_registry;
+                (void)strix::compile_serial_execution(model, empty_registry, bad_request, bad_buffers);
+            } catch (const std::invalid_argument& error) {
+                rejected = std::string(error.what()).find("slot-parallel Q5_1") != std::string::npos;
+            }
+            expect(rejected, "slot-parallel Q5_1 direct compile rejects incompatible requests before binding");
+        }
+    }
     if (failures == 0) {
         std::cout
             << "HIP launcher catalog tests passed\n";

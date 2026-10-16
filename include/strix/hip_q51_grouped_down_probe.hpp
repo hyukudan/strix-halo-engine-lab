@@ -1,5 +1,6 @@
 #pragma once
 #include "strix/q51_grouped_down_contract.hpp"
+#include "strix/q51_slot_parallel_contract.hpp"
 #include <hip/hip_runtime.h>
 namespace strix::q51_grouped_down {
 // Standalone source/ISA prototype, available only with experimental A8 runtime.
@@ -13,3 +14,12 @@ namespace strix::q51_grouped_down {
 void enqueue_grouped_probe(const Request&,const Bindings&,hipStream_t stream=nullptr);
 void enqueue_original_receipt(const Request&,const Bindings&,hipStream_t stream=nullptr);
 } // namespace strix::q51_grouped_down
+
+namespace strix::q51_slot_parallel {
+// Eager-only two-kernel probe. Reuses the original route/weight validator,
+// then writes unweighted FP32 dots and merges slots in ascending order.
+// No clear, allocation, synchronization or semantic output publication.
+// Sticky status and invalid routes preserve accumulation and rawdots. The
+// caller retains immutable routes/weights/status and every owner until drain.
+void enqueue_slot_parallel_probe(const Request&, const Bindings&, hipStream_t stream=nullptr);
+} // namespace strix::q51_slot_parallel

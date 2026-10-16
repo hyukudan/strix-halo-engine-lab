@@ -40,6 +40,28 @@ int main() {
             validated_model_content_identity, has_a8);
     };
     expect(!defaults.prefetch_hc_projection_next_tile, "HC next-tile overlay defaults off");
+    expect(!defaults.q51_slot_parallel_down, "slot-parallel Q5_1 overlay defaults off");
+    auto q51 = parse({"decoder", "m", "1", "--q51-slot-parallel-down"});
+    expect(!q51.any_low_level_flag && resolve(q51, true).automatic_applied,
+        "slot-parallel Q5_1 overlay retains automatic base prerequisites");
+    validate_resolved_q51_slot_parallel_down(q51);
+    for (auto member : {&Options::grouped_exact_q51_down, &Options::q4k_a8g32_gate_up}) {
+        auto missing = q51; missing.*member = false;
+        rejects([&] { validate_resolved_q51_slot_parallel_down(missing); },
+            "slot-parallel Q5_1 rejects each missing resolved prerequisite");
+    }
+    auto q51_fallback = parse({"decoder", "m", "1", "--q51-slot-parallel-down"});
+    expect(resolve(q51_fallback, false).reason == "a8-runtime-not-built", "Q5_1 overlay preserves automatic fallback");
+    rejects([&] { validate_resolved_q51_slot_parallel_down(q51_fallback); }, "Q5_1 fallback cannot invent A8 prerequisites");
+    auto q51_manual = parse({"decoder", "m", "1", "--optimization-profile", "manual", "--q51-slot-parallel-down"});
+    (void)resolve(q51_manual, false);
+    rejects([&] { validate_resolved_q51_slot_parallel_down(q51_manual); }, "manual slot-parallel Q5_1 requires explicit grouped A8");
+    q51_manual.grouped_exact_q51_down = true;
+    q51_manual.q4k_a8g32_gate_up = true;
+    validate_resolved_q51_slot_parallel_down(q51_manual);
+    rejects([] { (void)parse({"decoder", "m", "1", "--q51-slot-parallel-down", "--q51-slot-parallel-down"}); }, "duplicate Q5_1 overlay rejects");
+    rejects([] { (void)parse({"decoder", "m", "1", "--q51-slot-parallel-down", "--execution-mode", "graph"}); }, "Q5_1 overlay excludes graph before model IO");
+    rejects([] { (void)parse({"decoder", "m", "1", "--q51-slot-parallel-down", "--integer-lm-head", "a8-iu8"}); }, "Q5_1 overlay excludes integer head before model IO");
     auto hc_next = parse({"decoder", "m", "1", "--prefetch-hc-projection-next-tile"});
     expect(!hc_next.any_low_level_flag && resolve(hc_next, true).automatic_applied,
         "HC next-tile overlays auto without disabling its prerequisites");

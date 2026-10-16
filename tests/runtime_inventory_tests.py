@@ -69,7 +69,7 @@ class InventoryTests(unittest.TestCase):
                  "generation_output_mode": "finite-firstmax-token-v1", "batched_moe_activation": True,
                  "prefetch_q8_lm_head": True, "wave8_q8_lm_head": True, "wave8_q8_gdn_input": True,
                  "wave8_q8_gdn_output": True, "wave8_q8_qsa_output": True,
-                 "prefetch_hc_projection_next_tile": True}
+                 "prefetch_hc_projection_next_tile": True, "q51_slot_parallel_down": True}
         for field, value in modes.items():
             with self.subTest(field=field):
                 receipt = self.receipt(True, "qualified-checkpoint")
@@ -90,7 +90,7 @@ class InventoryTests(unittest.TestCase):
     def test_overlay_absence_false_unknown_and_invalid_types(self):
         inactive = {key: False for key in ("batched_moe_activation", "prefetch_q8_lm_head",
                                           "wave8_q8_lm_head", "wave8_q8_gdn_input",
-                                          "wave8_q8_gdn_output", "wave8_q8_qsa_output", "prefetch_hc_projection_next_tile")}
+                                          "wave8_q8_gdn_output", "wave8_q8_qsa_output", "prefetch_hc_projection_next_tile", "q51_slot_parallel_down")}
         result = self.collect(receipt_path=self.evidence("no-overlays.json", inactive))
         for key in inactive:
             self.assertIs(result["reported_opt_in_overlays"][key], False)
@@ -104,13 +104,24 @@ class InventoryTests(unittest.TestCase):
                 with self.subTest(field=field, value=value), self.assertRaises(ValueError):
                     self.collect(receipt_path=self.evidence("invalid-overlay.json", {field: value}))
         for field in ("batched_moe_activation", "prefetch_q8_lm_head", "wave8_q8_lm_head", "wave8_q8_gdn_input",
-                      "wave8_q8_gdn_output", "wave8_q8_qsa_output", "prefetch_hc_projection_next_tile"):
+                      "wave8_q8_gdn_output", "wave8_q8_qsa_output", "prefetch_hc_projection_next_tile", "q51_slot_parallel_down"):
             for value in (1, 0, 0.0, "true", [], {}):
                 with self.subTest(field=field, value=value), self.assertRaises(ValueError):
                     self.collect(receipt_path=self.evidence("invalid-bool-overlay.json", {field: value}))
             unknown = self.collect(receipt_path=self.evidence("null-overlay.json", {field: None}))
             self.assertIsNone(unknown["reported_opt_in_overlays"][field])
             self.assertIsNone(unknown["profile_overlay_qualification"])
+
+    def test_slot_parallel_counter_is_a_typed_observation_not_a_qualification(self):
+        result = self.collect(receipt_path=self.evidence("slot-count.json", {
+            "q51_slot_parallel_down": True, "slot_parallel_q51_submissions": 43,
+            "q51_slot_parallel_down_qualification": "not_assessed"}))
+        self.assertTrue(result["reported_opt_in_overlays"]["q51_slot_parallel_down"])
+        self.assertEqual(result["profile_overlay_qualification"], "not_assessed")
+        for value in (-1, True, 1.5, "43", 2**64):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                self.collect(receipt_path=self.evidence("bad-slot-count.json", {
+                    "slot_parallel_q51_submissions": value}))
 
     def test_auto_fallback_is_effective_manual_not_v3(self):
         receipt = self.receipt()
