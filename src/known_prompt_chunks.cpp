@@ -16,8 +16,15 @@ KnownPromptChunkCursor::KnownPromptChunkCursor(KnownPromptChunkRequest request,
     const SerialGreedyTokenCursor validated({request.prompt_tokens,request.vocab_size,
         request.context_capacity,request.max_new_tokens,request.eos_token_id});
     (void)validated;
-    if(request.logical_rows != 2U && request.logical_rows != 4U && request.logical_rows != 8U)
-        throw std::invalid_argument("known prompt chunk rows must be 2, 4 or 8");
+    if(request.tiled_prefill) {
+        if(request.logical_rows<16U || request.logical_rows>2048U ||
+            !windows.supports_tiled_prefill())
+            throw std::invalid_argument("tiled prompt prefill requires an explicitly capable T16..2048 backend");
+        if(request.output_policy==KnownWindowOutputPolicy::state_only && request.max_new_tokens)
+            throw std::invalid_argument("state-only tiled prefill supports zero-emission requests only");
+    } else if((request.logical_rows!=2U && request.logical_rows!=4U && request.logical_rows!=8U) ||
+        windows.supports_tiled_prefill())
+        throw std::invalid_argument("known prompt chunk rows must be closed2/4/8 or explicit tiled prefill");
     if(windows.logical_rows()!=request.logical_rows)
         throw std::invalid_argument("known prompt chunk backend row width differs from the request");
     validate_known_window_output_policy(request.output_policy);

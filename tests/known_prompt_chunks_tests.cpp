@@ -14,6 +14,8 @@ void expect(bool condition,const char* text) {
 class Rows final : public strix::KnownPromptWindowBackend, public strix::SerialGreedyStepBackend {
 public:
     std::uint32_t vocabulary=16, width=2;
+    bool tiled=false;
+    bool supports_tiled_prefill() const noexcept override {return tiled;}
     strix::KnownWindowOutputPolicy policy=strix::KnownWindowOutputPolicy::all_rows;
     strix::KnownWindowOutputPolicy output_policy() const noexcept override {return policy;}
     std::uint32_t logical_rows() const noexcept override {return width;}
@@ -269,6 +271,45 @@ int main() {
         try{strix::KnownPromptChunkCursor cursor({prompt,0U,16U,16U,1U,15U,2U,policy},target,target);}
         catch(const std::invalid_argument&){rejected=true;}
         expect(rejected&&target.inputs.empty(),"unknown or mismatched output-policy backend rejects before consuming any input");
+    }
+    for(const unsigned width:{16U,17U,32U,2048U})
+    for(const unsigned count:{1U,width,width+1U,2U*width})
+    for(const auto policy:{Policy::all_rows,Policy::terminal_row,Policy::state_only}) {
+        Rows target;target.tiled=true;target.width=width;target.policy=policy;
+        std::vector<std::uint32_t> prompt;for(unsigned row=0;row<count;++row)prompt.push_back(row%14U+1U);
+        const auto budget=policy==Policy::state_only?0U:1U;
+        strix::KnownPromptChunkCursor cursor({prompt,5U,16U,5U+count,budget,15U,width,policy,true},target,target);
+        while(cursor.advance()) {}
+        expect(target.windows==count/width && target.inputs.size()==count &&
+            cursor.progress().serial_tail_steps==count%width && cursor.progress().consumed_prompt_tokens==count,
+            "explicit T prefill uses only complete unpadded windows and exact serial suffixes");
+        for(unsigned row=0;row<count;++row)
+            expect(target.inputs[row]==std::pair<std::uint64_t,std::uint32_t>{5U+row,prompt[row]},
+                "T prefill cursor preserves each absolute input/position without window replay");
+        const auto before=target.inputs;const auto& result=cursor.finish_greedy();
+        expect(result.final_position==5U+count && result.steps_executed==0U && target.inputs==before,
+            "tiled terminal frontier never consumes an emitted bonus at exact capacity");
+        if(policy==Policy::state_only)
+            expect(result.generated_tokens.empty() && cursor.frontier().logits.empty() &&
+                !cursor.frontier().unconsumed_selection && target.serials==0U,
+                "state-only T zero-emission prefill has no fabricated logit or selection");
+        else expect(result.generated_tokens==std::vector<std::uint32_t>{(prompt.back()+1U)%16U},
+            "T full/terminal output emits the actual final known-input selection once");
+    }
+    for(const unsigned invalid:{0U,1U,2U,3U,4U,5U}) {
+        const std::vector<std::uint32_t> prompt{1U,2U,3U};Rows target;target.tiled=true;target.width=16U;
+        strix::KnownPromptChunkRequest request{prompt,0U,16U,64U,1U,15U,16U,Policy::terminal_row,true};
+        if(invalid==0U) target.tiled=false;
+        if(invalid==1U) request.tiled_prefill=false;
+        if(invalid==2U) request.logical_rows=target.width=15U;
+        if(invalid==3U) request.logical_rows=target.width=2049U;
+        if(invalid==4U) request.logical_rows=target.width=8U;
+        if(invalid==5U) request.output_policy=target.policy=Policy::state_only;
+        else target.policy=Policy::terminal_row;
+        bool rejected=false;try{strix::KnownPromptChunkCursor cursor(request,target,target);}
+        catch(const std::invalid_argument&){rejected=true;}
+        expect(rejected && target.inputs.empty(),
+            "unsupported/nonexplicit/oversized/state-only-generation T rejects before target work");
     }
     if(!failures) std::cout<<"known prompt chunk tests passed\n";
     return failures?1:0;

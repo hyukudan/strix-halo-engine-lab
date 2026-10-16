@@ -150,6 +150,9 @@ class KnownPromptWindowBackend {
 public:
     virtual ~KnownPromptWindowBackend() = default;
     [[nodiscard]] virtual std::uint32_t logical_rows() const noexcept { return 2; }
+    // True only for an explicitly compiled tiled prefill owner; never inferred
+    // from row count or a generic execute_rows override.
+    [[nodiscard]] virtual bool supports_tiled_prefill() const noexcept { return false; }
     [[nodiscard]] virtual KnownWindowOutputPolicy output_policy() const noexcept {
         return KnownWindowOutputPolicy::all_rows;
     }
