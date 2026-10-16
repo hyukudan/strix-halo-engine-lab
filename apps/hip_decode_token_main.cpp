@@ -1012,6 +1012,7 @@ int STRIX_DECODE_ENTRY(
     const auto base_optimization_profile = optimization_profile.selected;
     strix::decode_cli::apply_numerical_profile(options, model, manifest,
         strix::model_content_identity_hex(mapped.content_identity()), has_auto_a8_runtime, optimization_profile);
+    strix::decode_cli::apply_model_copy_profile(options, optimization_profile);
     const bool hc_splitk_f32 = strix::numerical_profile_hc_splitk(options.numerical_profile);
     const bool hc_deferred_norm = strix::numerical_profile_hc_deferred_norm(options.numerical_profile);
     const bool q5k_a8_gateup = strix::numerical_profile_q5k_a8_gateup(options.numerical_profile);
@@ -1625,6 +1626,10 @@ int STRIX_DECODE_ENTRY(
     // Graph mode explicitly opts into a completely resident model, including
     // its PLE table; registered/file-backed views cannot enter capture.
     residency_policy.promote_file_backed_candidates = graph_mode;
+    residency_policy.copy_tier = options.model_copy_tier;
+    residency_policy.copy_payload_bytes = options.model_copy_payload_bytes;
+    residency_policy.reservation_limits.retained_bytes = options.model_retained_budget;
+    residency_policy.reservation_limits.setup_peak_bytes = options.model_setup_peak_budget;
 
     auto model_owner = std::make_shared<strix::HipModelResidency>(
         strix::HipModelResidency::create(mapped_owner, manifest, generations, residency_policy));
@@ -1643,6 +1648,19 @@ int STRIX_DECODE_ENTRY(
             "  \"model_backing_inventory_reservation_upper_bound_bytes\":" + std::to_string(inventory.reservation_upper_bound_bytes) + ",\n" +
             "  \"model_backing_inventory_retained_reserved_bytes\":" + std::to_string(reservation.retained_reserved_bytes) + ",\n" +
             "  \"model_backing_inventory_setup_peak_reserved_bytes\":" + std::to_string(reservation.setup_peak_reserved_bytes) + ",\n";
+    }();
+    const auto model_copy_receipt = [&]() -> std::string {
+        const auto& reservation = model_residency.reservation();
+        return std::string("  \"model_copy_tier\":\"") + std::string(strix::hip_model_copy_tier_name(model_residency.copy_tier())) + "\",\n" +
+            "  \"model_copy_qualification\":\"not_assessed\",\n" +
+            "  \"model_copy_payload_bytes\":" + std::to_string(reservation.copy_payload_bytes) + ",\n" +
+            "  \"model_copy_arena_reserved_bytes\":" + std::to_string(model_residency.copy_tier() == strix::HipModelCopyTier::none ? 0U : reservation.copied_reserved_bytes) + ",\n" +
+            "  \"model_copy_tensor_count\":" + std::to_string(reservation.copy_tensor_count) + ",\n" +
+            "  \"model_copy_range_count\":" + std::to_string(reservation.copy_range_count) + ",\n" +
+            "  \"model_registered_alias_bytes\":" + std::to_string(reservation.registered_alias_bytes) + ",\n" +
+            "  \"model_retained_reserved_bytes\":" + std::to_string(reservation.retained_reserved_bytes) + ",\n" +
+            "  \"model_setup_peak_reserved_bytes\":" + std::to_string(reservation.setup_peak_reserved_bytes) + ",\n" +
+            "  \"model_copy_reservation_scope\":\"declared-virtual-backing-not-physical-residency\",\n";
     }();
     strix::q8_projection_organization::validate_resident_weights(q8_organization_plan, model_residency.binding());
     // Admission of actual device views happens before any token can enqueue work.
@@ -3082,7 +3100,7 @@ int STRIX_DECODE_ENTRY(
                     raw_require_identity();
                 });
         }
-        std::cout << "{\n" << optimization_profile_receipt << eager_submission_receipt << overlap_receipt() << execution_inventory_receipt << gdn_output_mode_receipt() << wave_router_mode_receipt << deferred_moe_mode_receipt;
+        std::cout << "{\n" << optimization_profile_receipt << eager_submission_receipt << overlap_receipt() << execution_inventory_receipt << gdn_output_mode_receipt() << wave_router_mode_receipt << deferred_moe_mode_receipt << model_copy_receipt;
         if (token_cost_backend) {
             const auto observed = token_cost_backend->stats();
             const strix::ObservedMoeTokenCostPolicy policy{};
@@ -3461,6 +3479,7 @@ int STRIX_DECODE_ENTRY(
                       ? "register"
                       : "copy")
               << "\"," << '\n'
+              << model_copy_receipt
               << "  \"registered_bytes\": "
               << model_residency.registered_bytes()
               << ',' << '\n'

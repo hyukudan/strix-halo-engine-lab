@@ -464,6 +464,10 @@ if(BUILD_TESTING)
     target_link_libraries(strix-lane-chain-hyper-output-tests PRIVATE strix_core)
     strix_target_warnings(strix-lane-chain-hyper-output-tests)
     add_test(NAME strix-lane-chain-hyper-output-tests COMMAND strix-lane-chain-hyper-output-tests)
+    add_executable(strix-model-selective-copy-layout-tests tests/model_selective_copy_layout_tests.cpp)
+    target_link_libraries(strix-model-selective-copy-layout-tests PRIVATE strix_core)
+    strix_target_warnings(strix-model-selective-copy-layout-tests)
+    add_test(NAME strix-model-selective-copy-layout-tests COMMAND strix-model-selective-copy-layout-tests)
     add_executable(strix-gdn-output-admission-tests tests/gdn_output_admission_tests.cpp)
     target_link_libraries(strix-gdn-output-admission-tests PRIVATE strix_core)
     strix_target_warnings(strix-gdn-output-admission-tests)
@@ -2185,7 +2189,9 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         add_executable(
             strix-hip-model-residency-tests
             tests/hip_model_residency_tests.cpp
+            src/hip_model_residency.cpp
         )
+        target_compile_definitions(strix-hip-model-residency-tests PRIVATE STRIX_BUILD_MODEL_RESIDENCY_DIAGNOSTIC=1)
         target_link_libraries(
             strix-hip-model-residency-tests
             PRIVATE strix_hip_runtime

@@ -1018,6 +1018,92 @@ int main() {
     incompatible_teacher = teacher; incompatible_teacher.mtp.enabled = true;
     rejects([&] { validate_teacher_forced_score(incompatible_teacher); },
         "teacher-forced score requires at least two teacher inputs and generate 1 in serial eager full-output diagnostic mode");
+    // Stored-byte relocation has a separate closed admission contract and never
+    // acts as a low-level organization flag.
+    auto copy_options = parse({"decoder", "fixture.gguf", "1", "--generate", "2",
+        "--model-copy-tier", "hot_nonexpert", "--model-copy-payload-bytes", "4830154240",
+        "--model-retained-budget", "120000000000", "--model-setup-peak-budget", "120000000000"});
+    expect(copy_options.model_copy_tier == HipModelCopyTier::hot_nonexpert &&
+        copy_options.model_copy_payload_bytes == 4830154240ULL && !copy_options.any_low_level_flag,
+        "selective model copy records exact payload without disabling automatic organization");
+    auto copy_resolution = resolve_optimization_profile(copy_options, model, numerical_router_info, manifest,
+        validated_model_content_identity, true);
+    const auto copy_base_selected = copy_resolution.selected;
+    const auto copy_base_reason = copy_resolution.reason;
+    apply_numerical_profile(copy_options, model, manifest, validated_model_content_identity, true, copy_resolution);
+    apply_model_copy_profile(copy_options, copy_resolution);
+    expect(copy_base_selected == "canonical-a8-wave-qsa-hc-shared-output-v5" &&
+        copy_resolution.selected == copy_base_selected + "+model-copy-tier:hot_nonexpert" &&
+        copy_resolution.reason == copy_base_reason && copy_resolution.automatic_applied &&
+        copy_options.prepared_eager && copy_options.moe_shared_overlap && copy_options.gdn_islands &&
+        copy_options.wave8_q8_lm_head && copy_options.wave8_q8_qsa_output,
+        "selective relocation appends only its scope and retains the resolved v5 organization");
+    auto copy_none = parse({"decoder", "m", "1", "--model-copy-tier=none",
+        "--model-retained-budget=120000000000", "--model-setup-peak-budget=120000000000"});
+    OptimizationProfileResolution copy_none_resolution;
+    copy_none_resolution.selected = "unchanged";
+    apply_model_copy_profile(copy_none, copy_none_resolution);
+    expect(copy_none_resolution.selected == "unchanged" && !copy_none.any_low_level_flag &&
+        !copy_none.model_copy_payload_bytes, "none preserves the default profile and permits independent reservation limits");
+    auto copy_norm = parse({"decoder", "m", "1", "2", "--generate", "1", "--teacher-forced-score",
+        "--teacher-logits-file", "fresh-selective-logits.bin", "--execution-inventory",
+        "--model-copy-tier=normalization", "--model-copy-payload-bytes=3997696",
+        "--model-retained-budget=120000000000", "--model-setup-peak-budget=120000000000"});
+    expect(copy_norm.teacher_forced_score && copy_norm.execution_inventory &&
+        copy_norm.model_copy_tier == HipModelCopyTier::normalization && !copy_norm.any_low_level_flag,
+        "selective copy admits full-logit teacher diagnostics and inventory");
+    auto copy_allowed = copy_options;
+    copy_allowed.raw_recording_path = "future-raw-directory";
+    copy_allowed.validation_final_state_path = "future-state-directory";
+    copy_allowed.logprob_token_ids = {1};
+    validate_model_copy_cli(copy_allowed);
+    const auto reject_copy = [&](auto mutate, std::string_view message) {
+        auto invalid_copy = copy_options;
+        mutate(invalid_copy);
+        rejects([&] { validate_model_copy_cli(invalid_copy); }, message);
+    };
+    reject_copy([](auto& o) { o.model_copy_payload_bytes.reset(); },
+        "selective model copy requires positive exact payload, retained and setup-peak budgets");
+    reject_copy([](auto& o) { o.model_retained_budget.reset(); },
+        "selective model copy requires positive exact payload, retained and setup-peak budgets");
+    reject_copy([](auto& o) { o.model_setup_peak_budget.reset(); },
+        "selective model copy requires positive exact payload, retained and setup-peak budgets");
+    reject_copy([](auto& o) { o.residency = HipModelResidencyMode::resident_copy; },
+        "selective model copy requires register residency");
+    reject_copy([](auto& o) { o.execution.mode = DecodeExecutionMode::graph; },
+        "selective model copy requires eager execution");
+    reject_copy([](auto& o) { o.mtp.enabled = true; }, "selective model copy excludes MTP options");
+    reject_copy([](auto& o) { o.mtp.supplied = true; }, "selective model copy excludes MTP options");
+    reject_copy([](auto& o) { o.serving_memory_explicit = true; }, "selective model copy excludes serving options");
+    reject_copy([](auto& o) { o.serving_prefill_explicit = true; }, "selective model copy excludes serving options");
+    reject_copy([](auto& o) { o.execution.integer_head = DecodeIntegerHead::a8_iu8; },
+        "selective model copy excludes integer head");
+    reject_copy([](auto& o) { o.offline_tuning_cache_path = "cache"; },
+        "selective model copy excludes offline tuning and compile provenance");
+    reject_copy([](auto& o) { o.offline_compile_provenance_path = "provenance"; },
+        "selective model copy excludes offline tuning and compile provenance");
+    reject_copy([](auto& o) { o.known_prefix_window = true; },
+        "selective model copy excludes known-prefix window and prefill");
+    reject_copy([](auto& o) { o.known_prefix_prefill_rows = 16; },
+        "selective model copy excludes known-prefix window and prefill");
+    reject_copy([](auto& o) { o.prompt_lookup = true; }, "selective model copy excludes prompt lookup");
+    reject_copy([](auto& o) { o.prefix_cache_roundtrip = true; }, "selective model copy excludes prefix cache roundtrip");
+    reject_copy([](auto& o) { o.gpu_greedy_token = true; }, "selective model copy excludes GPU greedy token output");
+    reject_copy([](auto& o) { o.planned_ple_io = true; }, "selective model copy excludes planned PLE IO");
+    reject_copy([](auto& o) { o.numerical_profile = DecodeNumericalProfile::hc_splitk_f32_v1; },
+        "selective model copy currently requires exact-v5 numerical profile");
+    rejects([] { (void)parse({"decoder", "m", "1", "--model-copy-tier=unknown"}); },
+        "model copy tier must be none, normalization or hot_nonexpert");
+    rejects([] { (void)parse({"decoder", "m", "1", "--model-copy-tier"}); },
+        "model copy option requires a value");
+    rejects([] { (void)parse({"decoder", "m", "1", "--model-copy-tier=none", "--model-copy-tier=none"}); },
+        "duplicate model copy tier option");
+    rejects([] { (void)parse({"decoder", "m", "1", "--model-retained-budget=1", "--model-retained-budget=2"}); },
+        "duplicate model copy budget option");
+    rejects([] { (void)parse({"decoder", "m", "1", "--model-copy-payload-bytes=0"}); },
+        "model copy budgets must be positive");
+    rejects([] { (void)parse({"decoder", "m", "1", "--model-copy-payload-bytes=1"}); },
+        "model copy payload requires a selective model copy tier");
     std::cout << "Decode optimization profile failures=" << failures << '\n';
     return failures ? 1 : 0;
 }

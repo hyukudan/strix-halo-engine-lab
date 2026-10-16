@@ -8,9 +8,15 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
+#include <string_view>
 #include <vector>
 
 namespace strix {
+
+class HipSetupQuiescenceGuard;
+enum class HipModelCopyTier : std::uint8_t { none, normalization, hot_nonexpert };
+[[nodiscard]] std::string_view hip_model_copy_tier_name(HipModelCopyTier);
 
 enum class HipModelResidencyMode {
     registered_file_mapping,
@@ -31,6 +37,9 @@ struct HipModelResidencyPolicy {
     // Declared model backing reservations, not observed RAM or free capacity.
     // Optional limits are checked before registration or allocation.
     UmaReservationLimits reservation_limits;
+    HipModelCopyTier copy_tier = HipModelCopyTier::none;
+    // Exact selected tensor payload pin, independent of page-padded backing.
+    std::optional<std::uint64_t> copy_payload_bytes;
 };
 
 struct HipModelResidencyReservation {
@@ -39,6 +48,7 @@ struct HipModelResidencyReservation {
     std::uint64_t copied_reserved_bytes = 0;
     std::uint64_t retained_reserved_bytes = 0;
     std::uint64_t setup_peak_reserved_bytes = 0;
+    std::uint64_t copy_payload_bytes = 0, copy_tensor_count = 0, copy_range_count = 0;
 };
 [[nodiscard]] HipModelResidencyReservation plan_hip_model_residency_reservation(
     const MappedModelFile&, const ModelManifest&, HipModelResidencyPolicy = {});
@@ -51,6 +61,19 @@ struct CopyResidencyRange {
     const ModelManifest&, const HipModelResidencyPolicy&);
 [[nodiscard]] std::uint64_t copy_residency_tensor_offset(
     const ManifestTensor&, const std::vector<CopyResidencyRange>&);
+
+struct SelectiveCopyRange {
+    std::uint64_t file_begin = 0, file_end = 0, arena_offset = 0;
+};
+struct SelectiveCopyPlan {
+    std::vector<SelectiveCopyRange> ranges;
+    std::vector<std::uint32_t> tensors;
+    std::uint64_t payload_bytes = 0, arena_bytes = 0;
+};
+[[nodiscard]] bool selective_copy_eligible(const ManifestTensor&, HipModelCopyTier) noexcept;
+// Pure pre-allocation layout; padding copies actual source bytes only.
+[[nodiscard]] SelectiveCopyPlan build_selective_copy_plan(const ModelManifest&,
+    const HipModelResidencyPolicy&, std::uint64_t file_bytes, std::uint64_t page);
 
 class HipModelResidency : public std::enable_shared_from_this<HipModelResidency> {
 public:
@@ -110,6 +133,8 @@ public:
         return copied_bytes_;
     }
 
+    [[nodiscard]] HipModelCopyTier copy_tier() const noexcept { return copy_tier_; }
+
     [[nodiscard]] std::uint64_t generation() const noexcept {
         return generation_;
     }
@@ -144,6 +169,11 @@ private:
         HipModelResidencyMode::registered_file_mapping;
     std::vector<RegisteredRange> registered_ranges_;
     std::vector<CopiedRange> copied_ranges_;
+    HipModelCopyTier copy_tier_ = HipModelCopyTier::none;
+    std::uintptr_t copy_arena_base_ = 0;
+    std::uint64_t copy_arena_bytes_ = 0, copy_arena_identity_ = 0;
+    std::vector<SelectiveCopyRange> arena_ranges_;
+    std::shared_ptr<const HipSetupQuiescenceGuard> selective_guard_;
     std::uint64_t registered_bytes_ = 0;
     std::uint64_t copied_bytes_ = 0;
     std::uint64_t generation_ = 0;

@@ -211,6 +211,12 @@ int main(){try{
     exact_mtp.insert(exact_mtp.end(), {"--numerical-profile=exact-v5"});
     require(parse(exact_mtp).numerical_profile == strix::DecodeNumericalProfile::exact_v5,
         "explicit default arithmetic leaves the existing MTP controller contract unchanged");
+    auto selective_mtp = request();
+    selective_mtp.insert(selective_mtp.end(), {"--model-copy-tier=normalization",
+        "--model-copy-payload-bytes=3997696", "--model-retained-budget=120000000000",
+        "--model-setup-peak-budget=120000000000"});
+    reject_as(selective_mtp, "selective model copy excludes MTP options",
+        "selective target backing cannot implicitly qualify sidecar residency");
     auto teacher_mtp = request();
     set(teacher_mtp, "--generate", "1");
     teacher_mtp.push_back("--teacher-forced-score");

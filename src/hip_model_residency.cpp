@@ -1,5 +1,9 @@
 #include "strix/hip_model_residency.hpp"
 #include "strix/hip_setup_quiescence.hpp"
+#include "strix/hip_launch_context.hpp"
+#if defined(STRIX_BUILD_MODEL_RESIDENCY_DIAGNOSTIC)
+#include "strix/hip_model_residency_diagnostic.hpp"
+#endif
 
 #include <hip/hip_runtime.h>
 
@@ -19,7 +23,103 @@
 #endif
 
 namespace strix {
+#if defined(STRIX_BUILD_MODEL_RESIDENCY_DIAGNOSTIC)
+namespace model_residency_diagnostic {
 namespace {
+thread_local FaultPlan fault_plan;
+thread_local Stats counters;
+struct Quarantined { std::shared_ptr<const MappedModelFile> mapping; std::vector<std::uintptr_t> registrations; };
+// Deliberately no TLS destructor: an unretired failed registration must never
+// release its mapping during test failure/process teardown.
+thread_local auto* quarantined = new std::vector<Quarantined>;
+}
+void set_fault_plan(FaultPlan plan) {
+    if (!plan.occurrence) throw std::invalid_argument("diagnostic fault occurrence must be positive");
+    fault_plan = plan; counters = {};
+}
+Stats stats() noexcept { return counters; }
+void retire_quarantined_mappings() {
+    for (auto& entry : *quarantined) {
+        for (auto& address : entry.registrations) if (address) {
+            if (hipHostUnregister(reinterpret_cast<void*>(address)) != hipSuccess)
+                throw std::runtime_error("diagnostic quarantine retirement failed");
+            address = 0;
+        }
+    }
+    quarantined->clear();
+}
+} // namespace model_residency_diagnostic
+#endif
+namespace {
+#if defined(STRIX_BUILD_MODEL_RESIDENCY_DIAGNOSTIC)
+bool inject(model_residency_diagnostic::Fault fault, std::uint64_t occurrence) {
+    return model_residency_diagnostic::fault_plan.fault == fault &&
+        model_residency_diagnostic::fault_plan.occurrence == occurrence;
+}
+#endif
+hipError_t selective_register(void* address, std::size_t bytes) {
+#if defined(STRIX_BUILD_MODEL_RESIDENCY_DIAGNOSTIC)
+    ++model_residency_diagnostic::counters.registrations;
+#endif
+    const auto error = hipHostRegister(address, bytes, hipHostRegisterMapped);
+#if defined(STRIX_BUILD_MODEL_RESIDENCY_DIAGNOSTIC)
+    if (error == hipSuccess) ++model_residency_diagnostic::counters.acquired_registrations;
+#endif
+    return error;
+}
+hipError_t selective_alias(void** address, void* host) {
+#if defined(STRIX_BUILD_MODEL_RESIDENCY_DIAGNOSTIC)
+    const auto count = ++model_residency_diagnostic::counters.alias_queries;
+    if (inject(model_residency_diagnostic::Fault::device_alias, count)) return hipErrorInvalidValue;
+#endif
+    const auto error = hipHostGetDevicePointer(address, host, 0);
+#if defined(STRIX_BUILD_MODEL_RESIDENCY_DIAGNOSTIC)
+    if (error == hipSuccess && inject(model_residency_diagnostic::Fault::alias_alignment, count))
+        *address = reinterpret_cast<void*>(reinterpret_cast<std::uintptr_t>(*address) + 1U);
+#endif
+    return error;
+}
+hipError_t selective_allocate(void** address, std::size_t bytes) {
+#if defined(STRIX_BUILD_MODEL_RESIDENCY_DIAGNOSTIC)
+    const auto count = ++model_residency_diagnostic::counters.allocations;
+    if (inject(model_residency_diagnostic::Fault::allocation, count)) return hipErrorOutOfMemory;
+#endif
+    const auto error = hipMalloc(address, bytes);
+#if defined(STRIX_BUILD_MODEL_RESIDENCY_DIAGNOSTIC)
+    if (error == hipSuccess) ++model_residency_diagnostic::counters.acquired_allocations;
+#endif
+    return error;
+}
+hipError_t selective_copy(void* destination, const void* source, std::size_t bytes) {
+#if defined(STRIX_BUILD_MODEL_RESIDENCY_DIAGNOSTIC)
+    const auto count = ++model_residency_diagnostic::counters.copies;
+    if (inject(model_residency_diagnostic::Fault::copy, count)) return hipErrorInvalidValue;
+#endif
+    return hipMemcpy(destination, source, bytes, hipMemcpyHostToDevice);
+}
+hipError_t selective_unregister(void* address) {
+#if defined(STRIX_BUILD_MODEL_RESIDENCY_DIAGNOSTIC)
+    const auto count = ++model_residency_diagnostic::counters.unregisters;
+    if (inject(model_residency_diagnostic::Fault::unregister, count)) return hipErrorInvalidValue;
+#endif
+    const auto error = hipHostUnregister(address);
+#if defined(STRIX_BUILD_MODEL_RESIDENCY_DIAGNOSTIC)
+    if (error == hipSuccess) ++model_residency_diagnostic::counters.released_registrations;
+#endif
+    return error;
+}
+void selective_free(void* address) noexcept {
+#if defined(STRIX_BUILD_MODEL_RESIDENCY_DIAGNOSTIC)
+    ++model_residency_diagnostic::counters.frees;
+#endif
+    const auto error = hipFree(address);
+#if defined(STRIX_BUILD_MODEL_RESIDENCY_DIAGNOSTIC)
+    if (error == hipSuccess) ++model_residency_diagnostic::counters.released_allocations;
+#else
+    static_cast<void>(error);
+#endif
+}
+
 // Process-local allocator lease IDs, never GPU/host virtual addresses.
 std::atomic<std::uint64_t> next_residency_identity{1};
 std::uint64_t residency_identity() {
@@ -223,7 +323,16 @@ HipModelResidencyReservation plan_hip_model_residency_reservation(const MappedMo
         throw std::invalid_argument("HIP residency reservation requires live mapping and valid manifest");
     if (policy.mode != HipModelResidencyMode::registered_file_mapping && policy.mode != HipModelResidencyMode::resident_copy)
         throw std::invalid_argument("HIP model residency mode is invalid");
+    (void)hip_model_copy_tier_name(policy.copy_tier);
+    if (policy.copy_tier == HipModelCopyTier::none && policy.copy_payload_bytes)
+        throw std::invalid_argument("model copy payload requires a selective tier");
+    const auto selective = policy.copy_tier == HipModelCopyTier::none ? SelectiveCopyPlan{} :
+        build_selective_copy_plan(manifest, policy, mapped.bytes(), page_size());
     HipModelResidencyReservation result;
+    result.copy_payload_bytes = selective.payload_bytes;
+    result.copy_tensor_count = selective.tensors.size();
+    result.copy_range_count = selective.ranges.size();
+    result.copied_reserved_bytes = selective.arena_bytes;
     result.mapped_reserved_bytes = align_up(mapped.bytes(), page_size());
     const auto ranges = policy.mode == HipModelResidencyMode::registered_file_mapping
         ? build_registration_ranges(mapped, manifest, policy) : build_copy_ranges(mapped, manifest, policy);
@@ -253,6 +362,11 @@ HipModelResidency::HipModelResidency(
       copied_ranges_(
           std::move(
               other.copied_ranges_)),
+      copy_tier_(std::exchange(other.copy_tier_, HipModelCopyTier::none)),
+      copy_arena_base_(std::exchange(other.copy_arena_base_, 0)),
+      copy_arena_bytes_(std::exchange(other.copy_arena_bytes_, 0)),
+      copy_arena_identity_(std::exchange(other.copy_arena_identity_, 0)),
+      arena_ranges_(std::move(other.arena_ranges_)), selective_guard_(std::move(other.selective_guard_)),
       registered_bytes_(
           other.registered_bytes_),
       copied_bytes_(
@@ -271,6 +385,7 @@ HipModelResidency::HipModelResidency(
     other.source_bytes_ = 0; other.source_generation_ = 0; other.reservation_ = {};
     other.registered_ranges_.clear();
     other.copied_ranges_.clear();
+    other.arena_ranges_.clear();
 }
 
 HipModelResidency&
@@ -285,6 +400,12 @@ HipModelResidency::operator=(
         copied_ranges_ =
             std::move(
                 other.copied_ranges_);
+        copy_tier_ = std::exchange(other.copy_tier_, HipModelCopyTier::none);
+        copy_arena_base_ = std::exchange(other.copy_arena_base_, 0);
+        copy_arena_bytes_ = std::exchange(other.copy_arena_bytes_, 0);
+        copy_arena_identity_ = std::exchange(other.copy_arena_identity_, 0);
+        arena_ranges_ = std::move(other.arena_ranges_);
+        selective_guard_ = std::move(other.selective_guard_);
         registered_bytes_ =
             other.registered_bytes_;
         copied_bytes_ =
@@ -304,6 +425,7 @@ HipModelResidency::operator=(
         other.source_bytes_ = 0; other.source_generation_ = 0; other.reservation_ = {};
         other.registered_ranges_.clear();
         other.copied_ranges_.clear();
+        other.arena_ranges_.clear();
     }
     return *this;
 }
@@ -363,6 +485,19 @@ UmaOwnerInventory HipModelResidency::owner_inventory(std::shared_ptr<const HipMo
             UmaBackingKind::allocated_storage, "weights.copy", range.bytes, 0, range.bytes, pin,
             UmaAddressSpace::device, range.device_base});
     }
+    if (copy_arena_base_) {
+        if (!copy_arena_identity_ || !selective_guard_ || copy_arena_bytes_ != reservation_.copied_reserved_bytes)
+            throw std::invalid_argument("selective residency arena lacks its actual backing lease");
+        selective_guard_->require_original();
+        for (const auto& range : arena_ranges_) {
+            const auto bytes = range.file_end - range.file_begin;
+            if (range.arena_offset > copy_arena_bytes_ || bytes > copy_arena_bytes_ - range.arena_offset)
+                throw std::logic_error("selective residency inventory range exceeds arena");
+            views.push_back({next_uma_owner_view_identity(), {0x484950434f505931ULL, copy_arena_identity_, generation_},
+                UmaBackingKind::allocated_storage, "weights.copy", copy_arena_bytes_, range.arena_offset, bytes, pin,
+                UmaAddressSpace::device, copy_arena_base_ + static_cast<std::uintptr_t>(range.arena_offset)});
+        }
+    }
     auto result = build_uma_owner_inventory(views, std::move(observation));
     if (result.unique_backing_reserved_bytes != reservation_.retained_reserved_bytes)
         throw std::logic_error("HIP residency actual owner inventory differs from its declared reservation");
@@ -382,6 +517,7 @@ bool HipModelResidency::covers_device_range(
         if (contains(range.device_base, range.bytes)) return true;
     for (const auto& range : copied_ranges_)
         if (contains(range.device_base, range.bytes)) return true;
+    if (contains(copy_arena_base_, copy_arena_bytes_)) return true;
     return false;
 }
 
@@ -417,7 +553,23 @@ HipModelResidency HipModelResidency::create_impl(const MappedModelFile& mapped,
     }
 
     const auto reservation = plan_hip_model_residency_reservation(mapped, manifest, policy);
+    const bool selective_enabled = policy.copy_tier != HipModelCopyTier::none;
+    SelectiveCopyPlan selective;
+    std::shared_ptr<const HipSetupQuiescenceGuard> selective_guard;
+    if (selective_enabled) {
+        if (!mapping_owner) throw std::invalid_argument("selective residency requires the actual strong mapping owner");
+        selective = build_selective_copy_plan(manifest, policy, mapped.bytes(), page_size());
+        if (current_hip_launch_context())
+            throw std::invalid_argument("selective residency setup requires no active launch scope");
+        hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
+        check_hip(hipStreamIsCapturing(nullptr, &capture), "selective residency capture admission");
+        if (capture != hipStreamCaptureStatusNone)
+            throw std::invalid_argument("selective residency cannot be created during capture");
+        selective_guard = std::make_shared<const HipSetupQuiescenceGuard>();
+    }
     HipModelResidency result;
+    result.copy_tier_ = policy.copy_tier;
+    result.selective_guard_ = std::move(selective_guard);
     result.mapping_owner_ = std::move(mapping_owner);
     result.reservation_ = reservation;
     result.source_mapping_ = &mapped; result.source_base_ = mapped.base_address();
@@ -458,12 +610,8 @@ HipModelResidency HipModelResidency::create_impl(const MappedModelFile& mapped,
                             range.begin);
 
                 check_hip(
-                    hipHostRegister(
-                        reinterpret_cast<void*>(
-                            host),
-                        static_cast<std::size_t>(
-                            bytes),
-                        hipHostRegisterMapped),
+                    selective_enabled ? selective_register(reinterpret_cast<void*>(host), static_cast<std::size_t>(bytes)) :
+                    hipHostRegister(reinterpret_cast<void*>(host), static_cast<std::size_t>(bytes), hipHostRegisterMapped),
                     "hipHostRegister(model range)");
 
                 // Track the registration immediately: a device-alias query
@@ -476,7 +624,8 @@ HipModelResidency HipModelResidency::create_impl(const MappedModelFile& mapped,
                             bytes,
                         });
                 void* device = nullptr;
-                check_hip(hipHostGetDevicePointer(&device, reinterpret_cast<void*>(host), 0),
+                check_hip(selective_enabled ? selective_alias(&device, reinterpret_cast<void*>(host)) :
+                    hipHostGetDevicePointer(&device, reinterpret_cast<void*>(host), 0),
                     "hipHostGetDevicePointer(model range)");
                 result.registered_ranges_.back().device_base = reinterpret_cast<std::uintptr_t>(device);
                 result.registered_bytes_ =
@@ -539,6 +688,53 @@ HipModelResidency HipModelResidency::create_impl(const MappedModelFile& mapped,
                     offset;
                 runtime.allocation_generation =
                     generation;
+            }
+            if (selective_enabled) {
+                const auto page = page_size();
+                for (const auto& range : result.registered_ranges_)
+                    if (!range.device_base || range.device_base % page || range.host_base % page ||
+                        range.bytes > UINTPTR_MAX - range.device_base)
+                        throw std::invalid_argument("selective residency requires page-congruent registered aliases");
+                result.arena_ranges_ = std::move(selective.ranges);
+                result.copy_arena_identity_ = residency_identity();
+                void* arena = nullptr;
+                result.selective_guard_->run([&] {
+                    check_hip(selective_allocate(&arena, static_cast<std::size_t>(selective.arena_bytes)),
+                        "selective residency arena allocation");
+                    result.copy_arena_base_ = reinterpret_cast<std::uintptr_t>(arena);
+                    result.copy_arena_bytes_ = selective.arena_bytes;
+                });
+                bool aligned = result.copy_arena_base_ != 0 && result.copy_arena_base_ % page == 0;
+#if defined(STRIX_BUILD_MODEL_RESIDENCY_DIAGNOSTIC)
+                if (inject(model_residency_diagnostic::Fault::arena_alignment, 1)) aligned = false;
+#endif
+                if (!aligned || result.copy_arena_bytes_ > UINTPTR_MAX - result.copy_arena_base_)
+                    throw std::invalid_argument("selective residency requires page-congruent bounded arena");
+                for (const auto& range : result.arena_ranges_) {
+                    result.selective_guard_->run([&] {
+                        check_hip(selective_copy(reinterpret_cast<void*>(result.copy_arena_base_ + range.arena_offset),
+                            reinterpret_cast<const void*>(mapped.base_address() + range.file_begin),
+                            static_cast<std::size_t>(range.file_end - range.file_begin)), "selective residency weight copy");
+                    });
+                }
+                for (const auto index : selective.tensors) {
+                    const auto& tensor = manifest.tensors[index];
+                    const auto range = std::find_if(result.arena_ranges_.begin(), result.arena_ranges_.end(),
+                        [&](const auto& r) { return tensor.absolute_offset >= r.file_begin && tensor.absolute_offset <= r.file_end &&
+                            tensor.byte_size <= r.file_end - tensor.absolute_offset; });
+                    if (range == result.arena_ranges_.end()) throw std::logic_error("selective tensor lacks copied arena range");
+                    auto& runtime = result.binding_.tensors[index];
+                    runtime.storage = RuntimeTensorStorage::resident;
+                    runtime.address = result.copy_arena_base_ + range->arena_offset + tensor.absolute_offset - range->file_begin;
+                    if (runtime.address % page != tensor.absolute_offset % page || !result.covers_device_range(runtime.address, runtime.bytes))
+                        throw std::logic_error("selective tensor address congruence differs from source");
+                }
+                result.copied_bytes_ = selective.arena_bytes;
+                for (std::size_t index = 0; index < manifest.tensors.size(); ++index)
+                    if (manifest.tensors[index].placement.kind == PlacementKind::local &&
+                        result.binding_.tensors[index].address % page != manifest.tensors[index].absolute_offset % page)
+                        throw std::logic_error("selective residency changed a local tensor page-relative alignment");
+                result.selective_guard_->require_original();
             }
         } catch (...) {
             result.release();
@@ -659,19 +855,41 @@ HipModelResidency HipModelResidency::create_impl(const MappedModelFile& mapped,
 }
 
 void HipModelResidency::release() noexcept {
+    if (selective_guard_) {
+        try { selective_guard_->run([] {}); }
+        catch (...) { selective_guard_->recover_or_fail_stop(); }
+    }
     bool unregister_failed = false;
+#if defined(STRIX_BUILD_MODEL_RESIDENCY_DIAGNOSTIC)
+    std::vector<std::uintptr_t> failed_registrations;
+#endif
     for (const auto& range :
          registered_ranges_) {
-        if (hipHostUnregister(reinterpret_cast<void*>(range.host_base)) != hipSuccess)
+        const auto error = copy_tier_ != HipModelCopyTier::none ?
+            selective_unregister(reinterpret_cast<void*>(range.host_base)) : hipHostUnregister(reinterpret_cast<void*>(range.host_base));
+        if (error != hipSuccess) {
             unregister_failed = true;
+#if defined(STRIX_BUILD_MODEL_RESIDENCY_DIAGNOSTIC)
+            if (copy_tier_ != HipModelCopyTier::none) failed_registrations.push_back(range.host_base);
+#endif
+        }
     }
     if (unregister_failed && mapping_owner_) {
         // Quarantine only this failed strong lease. Do not unmap storage while
         // the runtime may still retain a registration. Allocation failure is
         // fail-stop rather than releasing a possibly live backing.
-        auto* retained = new (std::nothrow) std::shared_ptr<const MappedModelFile>(std::move(mapping_owner_));
-        if (!retained) std::terminate();
-        static_cast<void>(retained);
+#if defined(STRIX_BUILD_MODEL_RESIDENCY_DIAGNOSTIC)
+        if (copy_tier_ != HipModelCopyTier::none) {
+            ++model_residency_diagnostic::counters.quarantined_mappings;
+            auto& retained = *model_residency_diagnostic::quarantined;
+            retained.reserve(retained.size() + 1U); // Allocate before moving the last mapping pin.
+            retained.push_back({std::move(mapping_owner_), std::move(failed_registrations)});
+        } else
+#endif
+        {
+            auto* retained = new (std::nothrow) std::shared_ptr<const MappedModelFile>(std::move(mapping_owner_));
+            if (!retained) std::terminate();
+        }
     }
     registered_ranges_.clear();
 
@@ -683,6 +901,9 @@ void HipModelResidency::release() noexcept {
                     range.device_base)));
     }
     copied_ranges_.clear();
+    if (copy_arena_base_) selective_free(reinterpret_cast<void*>(copy_arena_base_));
+    copy_arena_base_ = 0; copy_arena_bytes_ = 0; copy_arena_identity_ = 0;
+    arena_ranges_.clear(); selective_guard_.reset(); copy_tier_ = HipModelCopyTier::none;
     registered_bytes_ = 0;
     copied_bytes_ = 0;
     generation_ = 0;

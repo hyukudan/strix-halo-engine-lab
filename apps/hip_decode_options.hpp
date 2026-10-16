@@ -147,6 +147,10 @@ struct Options {
     strix::HipModelResidencyMode residency =
         strix::HipModelResidencyMode::
             registered_file_mapping;
+    strix::HipModelCopyTier model_copy_tier = strix::HipModelCopyTier::none;
+    bool model_copy_tier_explicit = false;
+    std::optional<std::uint64_t> model_copy_payload_bytes;
+    std::optional<std::uint64_t> model_retained_budget, model_setup_peak_budget;
     std::uint64_t coalesce_gap_bytes = 4096;
     bool planned_ple_io = false;
     bool parallel_hyper_mix = false;
@@ -278,6 +282,55 @@ inline bool is_low_level_optimization_option(std::string_view argument) {
         "--ple-max-rows-per-io", "--ple-max-inflight-ios", "--coalesce-gap"})
         if (argument == option) return true;
     return false;
+}
+
+// Selective backing does not select arithmetic or turn off automatic organization.
+inline void validate_model_copy_cli(const Options& o) {
+    switch (o.model_copy_tier) {
+    case HipModelCopyTier::none:
+        if (o.model_copy_payload_bytes)
+            throw std::invalid_argument("model copy payload requires a selective model copy tier");
+        return;
+    case HipModelCopyTier::normalization:
+    case HipModelCopyTier::hot_nonexpert: break;
+    default: throw std::invalid_argument("unknown model copy tier");
+    }
+    if (!o.model_copy_payload_bytes || !*o.model_copy_payload_bytes ||
+        !o.model_retained_budget || !*o.model_retained_budget ||
+        !o.model_setup_peak_budget || !*o.model_setup_peak_budget)
+        throw std::invalid_argument("selective model copy requires positive exact payload, retained and setup-peak budgets");
+    if (o.residency != HipModelResidencyMode::registered_file_mapping)
+        throw std::invalid_argument("selective model copy requires register residency");
+    if (o.execution.mode != DecodeExecutionMode::eager)
+        throw std::invalid_argument("selective model copy requires eager execution");
+    if (o.mtp.enabled || o.mtp.supplied)
+        throw std::invalid_argument("selective model copy excludes MTP options");
+    if (!o.serving_prefix_files.empty() || o.serving_concurrency != 1 || o.serving_tensor_cohort_rows != 1 ||
+        o.serving_prefill_rows || o.serving_concurrency_explicit || o.serving_tensor_cohort_explicit ||
+        o.serving_memory_explicit || o.serving_request_explicit || o.serving_headroom_explicit ||
+        o.serving_cache_entries_explicit || o.serving_cache_snapshot_explicit || o.serving_cache_peak_explicit ||
+        o.serving_cache_tokens_explicit || o.serving_prefill_explicit || o.serving_prefill_workspace_explicit ||
+        o.serving_prefill_metadata_explicit)
+        throw std::invalid_argument("selective model copy excludes serving options");
+    if (o.execution.integer_head != DecodeIntegerHead::none)
+        throw std::invalid_argument("selective model copy excludes integer head");
+    if (!o.offline_tuning_cache_path.empty() || !o.offline_compile_provenance_path.empty())
+        throw std::invalid_argument("selective model copy excludes offline tuning and compile provenance");
+    if (o.known_prefix_window || o.known_prefix_rows_explicit || o.known_prefix_output_policy_explicit ||
+        o.known_prefix_expert_union || o.known_prefix_prefill_rows || o.known_prefix_prefill_explicit || o.known_prefill_workspace_explicit ||
+        o.known_prefill_metadata_explicit || o.known_prefill_uma_explicit || o.known_prefill_headroom_explicit)
+        throw std::invalid_argument("selective model copy excludes known-prefix window and prefill");
+    if (o.prompt_lookup || o.prompt_lookup_depth_explicit || o.prompt_lookup_adaptive ||
+        o.prompt_lookup_snapshot_explicit || o.prompt_lookup_snapshot_bytes_explicit)
+        throw std::invalid_argument("selective model copy excludes prompt lookup");
+    if (o.prefix_cache_roundtrip)
+        throw std::invalid_argument("selective model copy excludes prefix cache roundtrip");
+    if (o.gpu_greedy_token)
+        throw std::invalid_argument("selective model copy excludes GPU greedy token output");
+    if (o.planned_ple_io || o.ple_cpu_helper_threads_explicit || o.ple_cache_rows_explicit || o.ple_cache_budget_explicit)
+        throw std::invalid_argument("selective model copy excludes planned PLE IO");
+    if (o.numerical_profile != DecodeNumericalProfile::exact_v5)
+        throw std::invalid_argument("selective model copy currently requires exact-v5 numerical profile");
 }
 
 // Arithmetic overlays never silently replace the selected submission profile.
@@ -654,7 +707,7 @@ inline Options parse_options(
             "[--numerical-profile exact-v5|hc-splitk-f32-v1|q51-a8-down-v1|hc-splitk-f32+q51-a8-down-v1|q51-q80-a8-down-v1|hc-splitk-f32+q51-q80-a8-down-v1|hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup-v1|hc-deferred-norm-f32+q51-q80-a8-down-v1|hc-deferred-norm-f32+q51-q80-a8-down+q5k-a8-gateup-v1] "
             "[--teacher-forced-score --generate 1 [--teacher-logits-file PATH]] "
             "[--gpu-greedy-token] [--logprob-token ID ...] [--offline-tuning-cache FILE [--offline-compile-provenance FILE]] [--gdn-recurrent-layout baseline|stride32|stride33|transposed] [--gdn-recurrent-storage key-value|value-key] [--known-prefix-window --known-prefix-rows 2|4|8 --known-prefix-expert-union] [--known-prefix-prefill-rows 16..2048 --known-prefix-workspace-budget-bytes N --known-prefix-host-metadata-budget-bytes N --known-prefix-uma-budget-bytes N --known-prefix-host-headroom-bytes N] [--prompt-lookup [--prompt-lookup-depth 0|1|2 | --prompt-lookup-adaptive] [--prompt-lookup-snapshot occupied-kv-v1 --prompt-lookup-snapshot-bytes N]] [--serve-prefix-u32le FILE ... --serve-concurrency 1|2|4 [--serve-tensor-cohort-rows 2|4 | --serve-prefill-rows 2|4|8|16..2048 --serve-prefill-workspace-budget-bytes N --serve-prefill-host-metadata-budget-bytes N] --serve-memory-budget-bytes N --serve-request-budget-bytes N --serve-headroom-bytes N] [--gdn-islands] [--qsa-hierarchical-selection] [--qsa-gqa-heads-per-block 1|2|4] [--prepared-eager] [--moe-shared-overlap [--moe-token-cost-policy]] [--moe-overlap-arena-budget-bytes N] [--batched-moe-activation] [--validation-final-state DIR] [--validation-final-state-max-bytes N] [--reference FILE] [--max-logit-error X] "
-            "[--context N] [--residency register|copy] [--coalesce-gap BYTES] "
+            "[--context N] [--residency register|copy] [--coalesce-gap BYTES] [--model-copy-tier none|normalization|hot_nonexpert --model-copy-payload-bytes N --model-retained-budget N --model-setup-peak-budget N] "
             "[--planned-ple-io] [--ple-cpu-helper-threads 1..8] [--ple-cache-rows N --ple-cache-budget-bytes N] [--ple-max-rows-per-io N] [--ple-max-inflight-ios N] "
             "[--generate N] [--eos-token TOKEN_ID] [--prefix-cache-roundtrip] "
             "[--parallel-moe-router] [--ranked-moe-router-topk | --wave-moe-router-topk] "
@@ -675,6 +728,33 @@ inline Options parse_options(
             argv[index];
         options.any_low_level_flag = options.any_low_level_flag ||
             is_low_level_optimization_option(argument);
+        if (argument == "--model-copy-tier" || argument.starts_with("--model-copy-tier=") ||
+            argument == "--model-copy-payload-bytes" || argument.starts_with("--model-copy-payload-bytes=") ||
+            argument == "--model-retained-budget" || argument.starts_with("--model-retained-budget=") ||
+            argument == "--model-setup-peak-budget" || argument.starts_with("--model-setup-peak-budget=")) {
+            const auto equal = argument.find('=');
+            const auto key = argument.substr(0, equal);
+            const auto value = equal != std::string_view::npos ? argument.substr(equal + 1) :
+                (index + 1 < argc ? std::string_view(argv[++index]) : std::string_view{});
+            if (value.empty() || value.starts_with("--"))
+                throw std::invalid_argument("model copy option requires a value");
+            if (key == "--model-copy-tier") {
+                if (options.model_copy_tier_explicit) throw std::invalid_argument("duplicate model copy tier option");
+                options.model_copy_tier_explicit = true;
+                if (value == "none") options.model_copy_tier = strix::HipModelCopyTier::none;
+                else if (value == "normalization") options.model_copy_tier = strix::HipModelCopyTier::normalization;
+                else if (value == "hot_nonexpert") options.model_copy_tier = strix::HipModelCopyTier::hot_nonexpert;
+                else throw std::invalid_argument("model copy tier must be none, normalization or hot_nonexpert");
+            } else {
+                auto* target = key == "--model-copy-payload-bytes" ? &options.model_copy_payload_bytes :
+                    key == "--model-retained-budget" ? &options.model_retained_budget : &options.model_setup_peak_budget;
+                if (*target) throw std::invalid_argument("duplicate model copy budget option");
+                const auto bytes = parse_u64(value, "model copy budget");
+                if (!bytes) throw std::invalid_argument("model copy budgets must be positive");
+                *target = bytes;
+            }
+            continue;
+        }
         if (argument == "--teacher-logits-file" || argument.starts_with("--teacher-logits-file=")) {
             if (!options.teacher_logits_path.empty())
                 throw std::invalid_argument("duplicate teacher logits file option");
@@ -1458,6 +1538,7 @@ inline Options parse_options(
                 token));
     }
 
+    validate_model_copy_cli(options);
     if (options.tokens.empty() && options.serving_prefix_files.empty() &&
         options.reference_path.empty()) {
         throw std::invalid_argument(
@@ -1709,6 +1790,12 @@ inline OptimizationProfileResolution resolve_optimization_profile(
     return result;
 }
 
+inline void apply_model_copy_profile(const Options& options, OptimizationProfileResolution& resolution) {
+    validate_model_copy_cli(options);
+    if (options.model_copy_tier != HipModelCopyTier::none)
+        resolution.selected += "+model-copy-tier:" + std::string(hip_model_copy_tier_name(options.model_copy_tier));
+}
+
 // Apply only after the organization selector. Explicit diagnostic/manual
 // callers may supply the same complete organization; missing prerequisites
 // fail rather than being enabled or disabled by an arithmetic choice.
@@ -1717,6 +1804,7 @@ inline void apply_numerical_profile(
     std::string_view content_identity, bool has_q4k_a8_runtime,
     OptimizationProfileResolution& resolution) {
     if (options.numerical_profile == DecodeNumericalProfile::exact_v5) return;
+    validate_model_copy_cli(options);
     validate_numerical_profile_cli(options);
     if (numerical_profile_name(options.numerical_profile).empty())
         throw std::invalid_argument("unknown numerical profile");
