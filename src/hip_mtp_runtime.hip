@@ -43,13 +43,36 @@ void require_chain(const HipMtpTargetHiddenTicket& a,const HipMtpTargetHiddenTic
     require(a.valid() && b.valid() && a.same_producer(b) && a.source_position()!=UINT64_MAX &&
         b.source_position()==a.source_position()+1U,"MTP target tickets are not one actual consecutive producer");
     const auto& previous=a.committed_session();const auto& next=b.committed_session();
-    require(previous.execution_identity==next.execution_identity && previous.runtime_compatibility_identity==next.runtime_compatibility_identity &&
-        previous.state_layout_identity==next.state_layout_identity && previous.next_position==b.source_position() &&
-        previous.committed_tokens!=UINT64_MAX && next.committed_tokens==previous.committed_tokens+1U &&
-        next.next_position==previous.next_position+1U && !next.arithmetic_lineage.intervals.empty(),"MTP target ticket frontier changed");
-    const auto history=prepare_serial_row_lineage(previous.arithmetic_lineage,b.source_position(),next.execution_identity,
-        next.arithmetic_lineage.intervals.back().reduction_plan_identity);
-    require(arithmetic_lineage_matches(history,next.arithmetic_lineage,next.next_position),"MTP target ticket arithmetic history is not the actual serial continuation");
+    if(a.same_commit(b)) {
+        // Both snapshots belong to the same real whole-window commit. There is
+        // deliberately no invented SessionContext for an intermediate row.
+        require(a.is_window() && b.is_window() && a.chunk_begin()==b.chunk_begin() &&
+            a.chunk_end()==b.chunk_end() && same_session(previous,next),
+            "MTP adjacent rows do not retain the same actual whole-window commit");
+        return;
+    }
+    require(a.source_position()+1U==a.chunk_end() && b.source_position()==b.chunk_begin() &&
+        previous.execution_identity==next.execution_identity && previous.runtime_compatibility_identity==next.runtime_compatibility_identity &&
+        previous.state_layout_identity==next.state_layout_identity && previous.next_position==b.chunk_begin() &&
+        b.chunk_end()>b.chunk_begin() && next.next_position==b.chunk_end() &&
+        b.chunk_end()-b.chunk_begin()<=UINT64_MAX-previous.committed_tokens &&
+        next.committed_tokens==previous.committed_tokens+(b.chunk_end()-b.chunk_begin()) &&
+        !next.arithmetic_lineage.intervals.empty(),"MTP target ticket chunk frontier changed");
+    const auto& actual=next.arithmetic_lineage.intervals.back();
+    ArithmeticLineage history;
+    if(b.is_window()) {
+        require(actual.producer==ArithmeticProducer::known_window_chunk && actual.begin==b.chunk_begin() &&
+            actual.end==b.chunk_end(),"MTP target window lacks its actual whole-chunk producer receipt");
+        history=prepare_known_window_chunk_lineage(previous.arithmetic_lineage,b.chunk_begin(),b.chunk_end(),
+            actual.numerical_plan_identity,actual.reduction_plan_identity,actual.state_update_identity);
+    } else {
+        require(b.chunk_end()==b.chunk_begin()+1U && actual.producer==ArithmeticProducer::serial_row,
+            "MTP target serial ticket is not one actual serial row");
+        history=prepare_serial_row_lineage(previous.arithmetic_lineage,b.source_position(),next.execution_identity,
+            actual.reduction_plan_identity);
+    }
+    require(arithmetic_lineage_matches(history,next.arithmetic_lineage,next.next_position),
+        "MTP target ticket arithmetic history is not the actual producer continuation");
 }
 }
 struct HipMtpRuntime::Impl {
@@ -113,8 +136,17 @@ struct HipMtpRuntime::Impl {
         const auto v=ticket.view();const auto& session=ticket.committed_session();
         require(v.bytes==owner->view(HipMtpBuffer::wide_current).bytes && v.address && v.allocation_generation &&
             ticket.source_position()<owner->context_capacity() && ticket.source_position()!=UINT64_MAX &&
-            session.next_position==ticket.source_position()+1U && session.health==SerialSessionHealth::ready &&
+            ticket.chunk_begin()<=ticket.source_position() && ticket.source_position()<ticket.chunk_end() &&
+            session.next_position==ticket.chunk_end() && session.health==SerialSessionHealth::ready &&
             arithmetic_lineage_valid(session.arithmetic_lineage,session.next_position),"MTP target hidden width/frontier/history is invalid");
+        const auto& actual=session.arithmetic_lineage.intervals.back();
+        if(ticket.is_window()) {
+            require(actual.producer==ArithmeticProducer::known_window_chunk && actual.begin==ticket.chunk_begin() &&
+                actual.end==ticket.chunk_end(),"MTP target window ticket lacks its actual chunk history");
+        } else {
+            require(ticket.chunk_begin()==ticket.source_position() && ticket.chunk_end()==ticket.source_position()+1U &&
+                actual.producer==ArithmeticProducer::serial_row,"MTP target serial ticket frontier differs from its actual row");
+        }
     }
     void copy(MtpDeviceView destination,MtpDeviceView source) {
         require(destination.bytes==source.bytes,"MTP copy extents differ");
@@ -219,6 +251,7 @@ void HipMtpRuntime::prime_committed_rows(const QualifiedMtpDraftPlan& plan,const
 }
 void HipMtpRuntime::begin_cycle(std::uint32_t token,const HipMtpTargetHiddenTicket& ticket) {
     auto& p=*impl_;p.validate_ticket(ticket);require(!p.cycle && !p.active && ticket.source_position()==p.next_source &&
+        ticket.source_position()+1U==ticket.committed_session().next_position &&
         token==ticket.predicted_token(),"MTP cycle requires the actual pending target selection/frontier");
     if(p.last_target) {
         require_chain(*p.last_target,ticket);
@@ -281,7 +314,9 @@ std::uint32_t HipMtpRuntime::read_greedy_token(const QualifiedMtpDraftPlan& plan
 void HipMtpRuntime::set_reconciliation_rows(std::span<const HipMtpReplayRow> rows,const HipMtpTargetHiddenTicket& final_target) {
     auto& p=*impl_;require(p.cycle && !p.active && p.cycle_base && rows.size()<=p.owner->budget().maximum_candidate_depth+1U,
         "MTP reconciliation requires its bounded completed proposal");p.validate_ticket(final_target);
-    require(final_target.same_producer(*p.cycle_base) && final_target.source_position()>=p.base_source &&
+    require(final_target.same_producer(*p.cycle_base) &&
+        final_target.source_position()+1U==final_target.committed_session().next_position &&
+        final_target.source_position()>=p.base_source &&
         final_target.source_position()-p.base_source==rows.size(),"MTP reconciliation target rows do not cover the checkpoint frontier");
     for(std::size_t i=0;i<rows.size();++i) {
         p.validate_ticket(rows[i].hidden);require(rows[i].hidden.source_position()==p.base_source+i &&

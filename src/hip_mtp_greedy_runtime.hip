@@ -1,5 +1,6 @@
 #include "strix/hip_mtp_greedy_runtime.hpp"
 #include "strix/mtp_sidecar_binding.hpp"
+#include "strix/hip_mtp_window_verifier.hpp"
 #include <algorithm>
 #include <stdexcept>
 namespace strix {
@@ -20,6 +21,7 @@ struct HipMtpGreedyRuntime::Impl {
     QualifiedMtpDraftPlan plan;
     ActivatedMtpDraftPlan activation;
     std::shared_ptr<HipMtpTargetHidden> target;
+    std::shared_ptr<HipMtpWindowVerifier> window;
     SerialSessionContext* session;
     ExecutionRuntimeResources resources;
     DirectLaunchDispatcher* dispatcher;
@@ -54,7 +56,15 @@ HipMtpGreedyRuntime::HipMtpGreedyRuntime(std::shared_ptr<HipMtpRuntime> m,
     std::shared_ptr<const void> owner)
     :impl_(std::make_unique<Impl>(std::move(m),std::move(q),std::move(a),std::move(t),s,r,d,std::move(owner))){}
 HipMtpGreedyRuntime::~HipMtpGreedyRuntime()=default;
-bool HipMtpGreedyRuntime::failed() const noexcept {return impl_->failed || impl_->mtp->failed();}
+bool HipMtpGreedyRuntime::failed() const noexcept {
+    return impl_->failed || impl_->mtp->failed() || (impl_->window && impl_->window->failed());
+}
+const HipMtpRuntime& HipMtpGreedyRuntime::native_runtime() const noexcept {return *impl_->mtp;}
+void HipMtpGreedyRuntime::use_window_verifier(std::shared_ptr<HipMtpWindowVerifier> window) {
+    auto& i=*impl_;require(!i.busy && !failed() && !i.cycled && window && window->target_owner()==i.target,
+        "MTP window verifier must retain the same actual idle target before the first cycle");
+    i.window=std::move(window);
+}
 void HipMtpGreedyRuntime::prime_prompt(std::span<const HipMtpReplayRow> rows) {
     auto& i=*impl_;require(!i.busy && !failed(),"MTP greedy consumer is busy or failed");
     i.busy=true;
@@ -105,7 +115,8 @@ HipMtpGreedyCycleResult HipMtpGreedyRuntime::cycle(const HipMtpTargetHiddenTicke
         "MTP greedy cycle has no remaining target/predictor capacity");
     const auto remaining=std::min(capacity-i.session->next_position,
         i.mtp->resources().context_capacity()-initial.source_position());
-    const auto limit=std::min(max_candidates,i.mtp->resources().budget().maximum_candidate_depth);
+    auto limit=std::min(max_candidates,i.mtp->resources().budget().maximum_candidate_depth);
+    if(i.window)limit=std::min(limit,i.window->logical_rows()-1);
     const auto depth=static_cast<std::uint32_t>(std::min<std::uint64_t>(
         std::min(limit,budget-1),std::min<std::uint64_t>(remaining-1,i.target->retained_rows()-3)));
     HipMtpGreedyCycleResult out;
@@ -124,6 +135,22 @@ HipMtpGreedyCycleResult HipMtpGreedyRuntime::cycle(const HipMtpTargetHiddenTicke
         const auto candidates=i.backend->propose_candidates(*i.session,i.draft,depth);
         out.proposed_candidates=static_cast<std::uint32_t>(candidates.size());
         finish_draft_proposal(i.draft);
+        if(i.window) {
+            auto verified=i.window->verify(*i.session,*i.dispatcher,initial,candidates,budget,eos);
+            require(!verified.committed_rows.empty() && verified.committed_rows.size()==verified.emitted_tokens.size(),
+                "MTP target verifier returned no actual aligned committed output rows");
+            for(const auto& ticket:verified.committed_rows) {
+                replay.push_back({out.final_target,ticket.input_token()});out.final_target=ticket;
+            }
+            out.emitted_tokens=std::move(verified.emitted_tokens);
+            out.consumed_target_rows=verified.committed_rows.size();
+            out.accepted_candidates=verified.accepted_candidates;
+            out.attempted_target_window=verified.attempted_window;out.accepted_target_window=verified.accepted_window;
+            out.target_checkpoint_restored=verified.restored_checkpoint;
+            out.target_r2_dispatches=verified.r2_dispatches;
+            out.target_projection_launches_saved=verified.projection_launches_saved;
+            out.eos=is_eos(out.emitted_tokens.back());out.terminal_budget=out.emitted_tokens.size()>=budget;
+        } else {
         for(std::size_t index=0;;++index) {
             replay.push_back({out.final_target,pending});
             auto completed=i.target->execute_serial(*i.session,i.resources,*i.dispatcher,pending);
@@ -134,6 +161,7 @@ HipMtpGreedyCycleResult HipMtpGreedyRuntime::cycle(const HipMtpTargetHiddenTicke
             if(accepted)++out.accepted_candidates;
             out.eos=is_eos(pending);out.terminal_budget=out.emitted_tokens.size()>=budget;
             if(out.eos || out.terminal_budget || !accepted)break;
+        }
         }
         i.mtp->set_reconciliation_rows(replay,out.final_target);
         i.backend->reconcile_after_target(i.draft,*i.session,out.emitted_tokens);

@@ -643,6 +643,102 @@ void known_window_output_policy_tests(const strix::ModelContract& model) {
     }
 }
 
+void actual_known_window_lineage_tests(const strix::ModelContract& model) {
+    using namespace strix;
+    static_assert(static_cast<unsigned>(ArithmeticProducer::serial_row)==0U);
+    static_assert(static_cast<unsigned>(ArithmeticProducer::prefill_chunk)==1U);
+    auto chunks=prepare_known_window_chunk_lineage({},0,2,11,22,33);
+    chunks=prepare_known_window_chunk_lineage(chunks,2,4,11,22,33);
+    expect(arithmetic_lineage_valid(chunks,4) && chunks.intervals.size()==2U &&
+        chunks.intervals[0].producer==ArithmeticProducer::known_window_chunk && chunks.intervals[0].begin==0U &&
+        chunks.intervals[0].end==2U && chunks.intervals[1].begin==2U && chunks.intervals[1].end==4U,
+        "actual closed window lineage preserves whole chunk cuts without coalescing");
+    const auto prefill=prepare_prefill_chunk_lineage(prepare_prefill_chunk_lineage({},0,2,11,22,33),2,4,11,22,33);
+    const auto unsplit=prepare_known_window_chunk_lineage({},0,4,11,22,33);
+    expect(!arithmetic_lineage_matches(chunks,prefill,4) && !arithmetic_lineage_matches(chunks,unsplit,4) &&
+        !arithmetic_lineage_serial_only(chunks,11,4),"known window cannot relabel prefill, serial or an intermediate chunk prefix");
+    expect(prepare_known_window_chunk_lineage({},7,9,11,22,33).intervals.empty(),
+        "unknown prior history remains unknown for actual closed window lineage");
+    for(unsigned fault=0;fault<7U;++fault) {
+        bool rejected=false;
+        try {
+            if(fault==0U) (void)prepare_known_window_chunk_lineage({},2,2,11,22,33);
+            else if(fault==1U) (void)prepare_known_window_chunk_lineage({},0,2,0,22,33);
+            else if(fault==2U) (void)prepare_known_window_chunk_lineage({},0,2,11,0,33);
+            else if(fault==3U) (void)prepare_known_window_chunk_lineage({},0,2,11,22,0);
+            else if(fault==4U) {auto bad=chunks;bad.tainted=true;(void)prepare_known_window_chunk_lineage(bad,4,6,11,22,33);}
+            else if(fault==5U) (void)prepare_known_window_chunk_lineage(chunks,3,5,11,22,33);
+            else {auto bad=chunks;++bad.history_identity;(void)prepare_known_window_chunk_lineage(bad,4,6,11,22,33);}
+        } catch(const std::invalid_argument&) {rejected=true;}
+        expect(rejected,"actual closed window helper rejects invalid bounds, zero recipes and corrupt prior history");
+    }
+    KnownRuntimeFixture legacy(model);
+    (void)legacy.run(legacy.hooks());
+    const auto expected_legacy=prepare_prefill_chunk_lineage({},0,2,legacy.window.window_execution_identity,
+        legacy.window.window_kernel_plan_identity,legacy.window.window_execution_identity);
+    expect(arithmetic_lineage_matches(legacy.session.arithmetic_lineage,expected_legacy,2),
+        "disabled recorder preserves the existing complete default prefill history recipe");
+
+    KnownRuntimeFixture base(model);
+    auto recorded=base.hooks();recorded.record_actual_window_lineage=true;
+    recorded.complete=[&] {expect(base.session.next_position==0U && base.session.arithmetic_lineage.intervals.empty(),
+        "known window lineage is not published before actual completion succeeds");};
+    (void)base.run(recorded);
+    const auto first=base.session.arithmetic_lineage;
+    expect(arithmetic_lineage_valid(first,2) && first.intervals.size()==1U &&
+        first.intervals.front().producer==ArithmeticProducer::known_window_chunk &&
+        first.intervals.front().numerical_plan_identity==base.window.window_execution_identity &&
+        !arithmetic_lineage_matches(first,expected_legacy,2),"captured row-loop records its actual distinct window recipe");
+    recorded.complete=[&] {expect(base.session.next_position==2U && base.session.arithmetic_lineage.history_identity==first.history_identity,
+        "later chunk keeps the previously committed producer until completion");};
+    (void)base.run(recorded);
+    expect(base.session.arithmetic_lineage.intervals.size()==2U && base.session.arithmetic_lineage.intervals.back().begin==2U &&
+        base.session.arithmetic_lineage.intervals.back().end==4U &&
+        base.session.arithmetic_lineage.intervals.front().reduction_plan_identity==base.session.arithmetic_lineage.intervals.back().reduction_plan_identity,
+        "repeated identical implementations keep separate actual chunks with one stable recipe identity");
+    (void)base.serial_token(13U);
+    expect(arithmetic_lineage_valid(base.session.arithmetic_lineage,5) && base.session.arithmetic_lineage.intervals.size()==3U &&
+        base.session.arithmetic_lineage.intervals.back().producer==ArithmeticProducer::serial_row,
+        "real serial continuation appends to the complete actual window history");
+    for(unsigned mutation=0;mutation<2U;++mutation) {
+        KnownRuntimeFixture changed(model);
+        if(mutation==0U) changed.row_launch[1].steps[0].implementation_identity^=0x400U;
+        else changed.row_launch[1].plan_identity^=0x400U;
+        auto hooks=changed.hooks();hooks.record_actual_window_lineage=true;
+        (void)changed.run(hooks);
+        expect(!arithmetic_lineage_matches(first,changed.session.arithmetic_lineage,2),
+            "actual row implementation or launch-plan changes alter closed window provenance");
+    }
+    const auto entries=[](KnownRuntimeFixture& fixture,std::uint64_t shared_recipe) {
+        return std::array<KnownWindowR2Entry,2>{{
+            {KnownWindowR2Variant::shared_q8_virtual256_r2_v1,&fixture.trace,&recording_r2_preflight,&recording_r2_launch,shared_recipe},
+            {KnownWindowR2Variant::gdn_q8_virtual256_r2_v1,&fixture.trace,&recording_r2_preflight,&recording_r2_launch,0x5445535447444e31ULL}}};
+    };
+    KnownRuntimeFixture promoted(model,true),other_recipe(model,true),missing(model,true);
+    auto promoted_hooks=promoted.hooks();promoted_hooks.record_actual_window_lineage=true;
+    (void)promoted.run_entries(promoted_hooks,entries(promoted,0x5445535453485231ULL));
+    auto other_hooks=other_recipe.hooks();other_hooks.record_actual_window_lineage=true;
+    (void)other_recipe.run_entries(other_hooks,entries(other_recipe,0x5445535453485232ULL));
+    expect(!arithmetic_lineage_matches(promoted.session.arithmetic_lineage,other_recipe.session.arithmetic_lineage,2),
+        "actual promoted implementation recipe is bound independently of the unchanged variant enum");
+    const auto missing_words=missing.state_words;auto missing_hooks=missing.hooks();missing_hooks.record_actual_window_lineage=true;
+    bool rejected=false;
+    try {(void)missing.run_entries(missing_hooks,entries(missing,0U));} catch(const std::invalid_argument&) {rejected=true;}
+    expect(rejected && missing.trace.calls==0U && missing.state_words==missing_words && missing.quiesces==0U &&
+        missing.session.health==SerialSessionHealth::ready,"missing promoted recipe rejects before any dispatch or target mutation");
+    KnownRuntimeFixture unknown(model);unknown.session.next_position=2U;unknown.session.committed_tokens=2U;
+    auto unknown_hooks=unknown.hooks();unknown_hooks.record_actual_window_lineage=true;rejected=false;
+    try {(void)unknown.run(unknown_hooks);} catch(const std::invalid_argument&) {rejected=true;}
+    expect(rejected && unknown.trace.calls==0U && unknown.quiesces==0U && unknown.session.next_position==2U &&
+        unknown.session.arithmetic_lineage.intervals.empty(),"captured window refuses a fabricated missing prior producer frontier");
+    KnownRuntimeFixture failing(model);auto failure_hooks=failing.hooks();failure_hooks.record_actual_window_lineage=true;
+    failure_hooks.complete=[] {throw std::runtime_error("injected actual completion failure");};bool failed=false;
+    try {(void)failing.run(failure_hooks);} catch(const std::runtime_error&) {failed=true;}
+    expect(failed && failing.trace.calls>0U && failing.quiesces==1U && failing.session.health==SerialSessionHealth::poisoned &&
+        failing.session.next_position==0U && failing.session.committed_tokens==0U && failing.session.arithmetic_lineage.intervals.empty() &&
+        failing.session.arithmetic_lineage.tainted,"failed native completion drains and publishes neither chunk history nor target frontier");
+}
+
 void known_window_runtime_tests(const strix::ModelContract& model) {
     KnownRuntimeFixture fixture(model);
     const std::array<std::uint64_t, 2> expected{fixture.serial_token(7), fixture.serial_token(11)};
@@ -1556,6 +1652,7 @@ int main() {
     known_window_routed_union_runtime_tests(model);
     known_window_tests(model);
     known_window_runtime_tests(model);
+    actual_known_window_lineage_tests(model);
     known_window_output_policy_tests(model);
     known_window_wide_runtime_tests(model);
     known_window_mixed_format_tests(model);

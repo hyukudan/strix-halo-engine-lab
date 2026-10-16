@@ -14,6 +14,9 @@
 #include <span>
 
 namespace strix {
+class HipMtpTargetWindowCapture;
+struct HipMtpTargetWindowCapturePolicy;
+struct HipMtpTargetWindowExecution;
 struct HipKnownPrefixUnionObservation {
     std::uint64_t first_position = 0;
     std::uint32_t layer = 0;
@@ -66,6 +69,15 @@ public:
     // on the owned eager scope; throws follow the existing poison/drain path.
     [[nodiscard]] KnownWindowResult execute_validated(SerialSessionContext&,
         std::span<const std::uint32_t>,const std::function<void()>& before_publish);
+    // Typed opt-in target capture, closed R2/4/8 all-head windows only.
+    // Preparation allocates all snapshot/selector payload before target work.
+    // Returned batch proves only the ACTUAL committed whole chunk, not accepted
+    // speculative rows or an invented intermediate SerialSessionContext.
+    [[nodiscard]] std::shared_ptr<HipMtpTargetWindowCapture> prepare_mtp_target_capture(
+        const HipMtpTargetWindowCapturePolicy&);
+    [[nodiscard]] HipMtpTargetWindowExecution execute_mtp_captured(SerialSessionContext&,
+        std::span<const std::uint32_t>,std::shared_ptr<HipMtpTargetWindowCapture>,
+        const std::function<void()>& before_publish = {});
     [[nodiscard]] std::uint32_t logical_rows() const noexcept;
     [[nodiscard]] bool supports_tiled_prefill() const noexcept;
     // Immutable compiler-selected intent; verification consumers require all_rows.

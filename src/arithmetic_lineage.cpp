@@ -41,7 +41,8 @@ bool arithmetic_lineage_valid(const ArithmeticLineage& lineage,
             interval.end > resume_position || interval.numerical_plan_identity == 0 ||
             interval.reduction_plan_identity == 0 || interval.state_update_identity == 0 ||
             (interval.producer != ArithmeticProducer::serial_row &&
-             interval.producer != ArithmeticProducer::prefill_chunk)) {
+             interval.producer != ArithmeticProducer::prefill_chunk &&
+             interval.producer != ArithmeticProducer::known_window_chunk)) {
             return false;
         }
         next = interval.end;
@@ -125,6 +126,25 @@ ArithmeticLineage prepare_serial_row_lineage(
         } else { next.intervals.push_back(interval); }
     } else { next.intervals.push_back(interval); }
     next.history_identity = arithmetic_history_identity(next.intervals);
+    return next;
+}
+
+ArithmeticLineage prepare_known_window_chunk_lineage(
+    const ArithmeticLineage& previous,std::uint64_t begin,std::uint64_t end,
+    std::uint64_t numerical_plan_identity,std::uint64_t reduction_plan_identity,
+    std::uint64_t state_update_identity) {
+    if(end<=begin || !numerical_plan_identity || !reduction_plan_identity || !state_update_identity)
+        throw std::invalid_argument("known window lineage requires a bounded chunk and actual recipe identities");
+    if(previous.tainted) throw std::invalid_argument("tainted known window lineage requires independently valid restore");
+    if(!previous.history_identity && previous.intervals.empty()) {
+        if(begin) return {};
+    } else if(!arithmetic_lineage_valid(previous,begin)) {
+        throw std::invalid_argument("known window lineage does not cover its exact preceding frontier");
+    }
+    auto next=previous;
+    next.intervals.push_back({begin,end,ArithmeticProducer::known_window_chunk,
+        numerical_plan_identity,reduction_plan_identity,state_update_identity});
+    next.history_identity=arithmetic_history_identity(next.intervals);
     return next;
 }
 } // namespace strix

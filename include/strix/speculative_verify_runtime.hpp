@@ -30,6 +30,9 @@ struct KnownWindowExecutionHooks {
     // test may inject a recording QSA identity. Runtime position uses its fixed
     // default implementation identity, never the verify-window implementation.
     std::span<const std::uint64_t> position_reader_implementations;
+    // Captured native windows opt in explicitly. Records one real whole chunk
+    // only after complete succeeds; default legacy prefill labeling is intact.
+    bool record_actual_window_lineage = false;
 };
 
 struct KnownWindowR2Entry {
@@ -37,6 +40,9 @@ struct KnownWindowR2Entry {
     void* config = nullptr;
     void (*preflight)(std::span<const ExecutionDispatchContext, 2>, void*) = nullptr;
     void (*launch)(std::span<const ExecutionDispatchContext, 2>, void*) = nullptr;
+    // Actual closed native implementation recipe, never a callback address.
+    // Required only for selected entries when lineage recording is enabled.
+    std::uint64_t implementation_identity = 0;
 };
 
 // Separate closed wide entry: R2 callbacks retain their fixed-span contract.
@@ -45,6 +51,7 @@ struct KnownWindowRowsEntry {
     void* config = nullptr;
     void (*preflight)(std::span<const ExecutionDispatchContext>, void*) = nullptr;
     void (*launch)(std::span<const ExecutionDispatchContext>, void*) = nullptr;
+    std::uint64_t implementation_identity = 0;
 };
 
 struct KnownWindowResult {

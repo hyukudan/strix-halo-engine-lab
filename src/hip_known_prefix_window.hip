@@ -1,4 +1,5 @@
 #include "strix/hip_known_prefix_window.hpp"
+#include "strix/hip_mtp_target_window.hpp"
 
 #include "strix/deferred_moe_status.hpp"
 #include "strix/hip_setup_quiescence.hpp"
@@ -375,33 +376,133 @@ struct HipKnownPrefixWindow::Impl {
                 throw std::runtime_error("routed expert union metadata disagrees with its completed window");
         }
     }
+    static std::uint64_t capture_identity(std::string_view tag,std::uint64_t previous) {
+        std::uint64_t hash=14695981039346656037ULL;
+        for(const auto ch:tag){hash^=static_cast<unsigned char>(ch);hash*=1099511628211ULL;}
+        for(unsigned shift=0;shift<64U;shift+=8U){hash^=(previous>>shift)&255U;hash*=1099511628211ULL;}
+        if(!hash)throw std::logic_error("known-window capture identity is zero");return hash;
+    }
+    static std::uint64_t captured_recipe(KnownWindowR2Variant variant) {
+        std::string_view recipe;
+        switch(variant){
+        case KnownWindowR2Variant::shared_q8_virtual256_r2_v1: recipe="hip-shared-known-r2-q8virtual256-3proj-f32scalar-r1act-v1";break;
+        case KnownWindowR2Variant::gdn_q8_virtual256_r2_v1: recipe="hip-gdn-known-r2-5q8-staged-ordered-core-r1-v1";break;
+        case KnownWindowR2Variant::gdn_q8_rows2_f32_gates_r1_v1: recipe="hip-gdn-known-r2-3q8-smallf32-r1-ordered-core-v1";break;
+        case KnownWindowR2Variant::shared_q8_virtual256_r4_v1:
+        case KnownWindowR2Variant::shared_q8_virtual256_r8_v1: recipe="hip-shared-known-wide-q8virtual256-3proj-f32scalar-r1act-v1";break;
+        case KnownWindowR2Variant::gdn_q8_rows4_f32_gates_r1_v1:
+        case KnownWindowR2Variant::gdn_q8_rows8_f32_gates_r1_v1: recipe="hip-gdn-known-wide-3q8-smallf32-r1-ordered-core-v1";break;
+        case KnownWindowR2Variant::routed_q51_union_rows2_v1:
+        case KnownWindowR2Variant::routed_q51_union_rows4_v1:
+        case KnownWindowR2Variant::routed_q51_union_rows8_v1: recipe="hip-routed-known-q4ka8-q51-union-dot-orderedslot-v1";break;
+        default:throw std::invalid_argument("known-window capture has no closed native recipe");
+        }
+        return capture_identity(recipe,static_cast<std::uint32_t>(variant));
+    }
+    struct CapturedLauncher {
+        CompiledStepLauncher delegate;
+        HipMtpTargetWindowCapture* capture=nullptr;
+    };
+    static void capture_preflight(const ExecutionDispatchContext& context,void* object){
+        const auto& wrapper=*static_cast<CapturedLauncher*>(object);
+        wrapper.delegate.preflight(context,wrapper.delegate.user_data);wrapper.capture->preflight_row(context);
+    }
+    static void capture_launch(const ExecutionDispatchContext& context,void* object){
+        const auto& wrapper=*static_cast<CapturedLauncher*>(object);
+        wrapper.capture->preflight_row(context);
+        wrapper.delegate.function(context,wrapper.delegate.user_data);
+        wrapper.capture->record_row(context);
+    }
+    // Heap entries never move: observed launcher userdata and plan spans remain stable.
+    // A weak key retains only the capture control block, never its GPU owner.
+    struct PreparedCapture {
+        std::weak_ptr<HipMtpTargetWindowCapture> key;
+        HipMtpTargetWindowCapture* address=nullptr;
+        std::vector<CompiledLaunchPlan> plans;
+        std::vector<const CompiledLaunchPlan*> pointers;
+        std::vector<CapturedLauncher> launchers;
+        std::array<KnownWindowR2Entry,3> recorded_r2;
+        std::vector<KnownWindowRowsEntry> recorded_rows;
+    };
+    std::vector<std::unique_ptr<PreparedCapture>> prepared_captures;
+    bool executing=false;
+    void prepare_capture(const std::shared_ptr<HipMtpTargetWindowCapture>& capture) {
+        if(executing)throw std::logic_error("MTP target capture preparation requires an idle known-window owner");
+        // Expired entries are reclaimed only during idle setup, never on token execution.
+        std::erase_if(prepared_captures,[](const auto& entry){return entry->key.expired();});
+        auto entry=std::make_unique<PreparedCapture>();
+        entry->key=capture;entry->address=capture.get();entry->plans=launch_plans;
+        entry->launchers.resize(logical_rows());entry->pointers.reserve(logical_rows());
+        entry->recorded_r2=r2_entries;entry->recorded_rows=rows_entries;
+        for(auto& recipe:entry->recorded_r2)recipe.implementation_identity=captured_recipe(recipe.variant);
+        for(auto& recipe:entry->recorded_rows)recipe.implementation_identity=captured_recipe(recipe.variant);
+        const auto step=capture->tap_step();
+        for(std::uint32_t row=0;row<logical_rows();++row){
+            auto& plan=entry->plans[row];
+            if(step>=plan.steps.size() || plan.steps[step].op!=SerialOp::mlp_inject ||
+               !plan.steps[step].function || !plan.steps[step].preflight)
+                throw std::invalid_argument("MTP observed target launcher is not its actual last MLP injection");
+            auto& wrapper=entry->launchers[row];wrapper.delegate=plan.steps[step];wrapper.capture=capture.get();
+            plan.steps[step].function=&capture_launch;plan.steps[step].preflight=&capture_preflight;plan.steps[step].user_data=&wrapper;
+            plan.steps[step].implementation_identity=capture_identity("hip-mtp-post-mlpinject-wide-observer-v1",wrapper.delegate.implementation_identity);
+            plan.plan_identity=capture_identity("hip-mtp-observed-host-launch-plan-v1",plan.plan_identity);
+            entry->pointers.push_back(&plan);
+        }
+        prepared_captures.push_back(std::move(entry));
+    }
+    const PreparedCapture& prepared_capture(const std::shared_ptr<HipMtpTargetWindowCapture>& capture) const {
+        for(const auto& entry:prepared_captures)
+            if(entry->address==capture.get() && !entry->key.owner_before(capture) &&
+               !capture.owner_before(entry->key))return *entry;
+        throw std::invalid_argument("MTP target capture has no prepared plans on this actual known-window owner");
+    }
     KnownWindowResult execute(SerialSessionContext& session, std::span<const std::uint32_t> tokens,
-        const std::function<void()>& before_publish = {}) {
+        const std::function<void()>& before_publish = {},
+        const std::shared_ptr<HipMtpTargetWindowCapture>& capture = {},HipMtpTargetWindowBatch* batch=nullptr) {
         if (failed) throw std::logic_error("known-window native owner cannot be reused after an exception");
-        bool owned_eager_scope_admitted=false;
+        if(executing)throw std::logic_error("known-window native owner cannot execute recursively");
+        struct ExecutionLease {
+            bool& active;
+            explicit ExecutionLease(bool& value):active(value){active=true;}
+            ~ExecutionLease(){active=false;}
+        } execution_lease(executing);
+        bool owned_eager_scope_admitted=false,actual_window_committed=false;
+        const PreparedCapture* observed=nullptr;
         try {
             if(tokens.size()!=logical_rows())
                 throw std::invalid_argument("known-window native input row count differs from its compiled window");
             if (current_hip_launch_context())
                 throw std::invalid_argument("known-window native owner cannot nest a HIP launch scope");
             validate_metadata();
+            if(capture){
+                if(prefill || !batch)throw std::invalid_argument("MTP typed target capture supports closed windows only");
+                observed=&prepared_capture(capture);
+                capture->begin(this,session,tokens);
+            }
             owned_eager_scope_admitted=true;
             const HipLaunchScope active(scope);
             KnownWindowExecutionHooks hooks;
             hooks.preflight_scope = [&] { validate_scope(); };
             hooks.preflight_plan = [&] { validate_metadata(); };
-            hooks.complete = [&] { complete(); if(before_publish) before_publish(); };
+            hooks.complete = [&] { complete(); if(capture) capture->completed_before_publish(); if(before_publish) before_publish(); };
             hooks.quiesce_or_fail_stop = [&] { failed = true; guard.recover_or_fail_stop(); };
             hooks.position_reader_implementations = position_readers;
+            hooks.record_actual_window_lineage=static_cast<bool>(capture);
             const auto first_position=session.next_position;
             auto result=prefill ? execute_known_prefix_prefill_eager(*prefill,serial,resources,scratch,session,tokens,
                 launch_plans.front(),r2_entries,rows_entries,hooks) :
                 execute_known_prefix_window_eager(window, serial, resources, scratch, session, tokens,
-                    launch_pointers, r2_entries, rows_entries, hooks);
+                    capture?std::span<const CompiledLaunchPlan* const>(observed->pointers):std::span<const CompiledLaunchPlan* const>(launch_pointers),
+                    capture?std::span<const KnownWindowR2Entry>(observed->recorded_r2):std::span<const KnownWindowR2Entry>(r2_entries),
+                    capture?std::span<const KnownWindowRowsEntry>(observed->recorded_rows):std::span<const KnownWindowRowsEntry>(rows_entries),hooks);
+            actual_window_committed=true;
+            if(capture)*batch=capture->seal(session);
             if(window.routed_expert_union_steps)
                 last_union_observation=HipKnownPrefixUnionObservation{first_position+(prefill?(prefill->logical_rows/8U-1U)*8U:0U),last_union_layer,pending_union_summary};
             return result;
         } catch (...) {
+            if(capture)capture->abort();
+            if(actual_window_committed){session.health=SerialSessionHealth::poisoned;session.arithmetic_lineage.tainted=true;}
             failed = true;
             // A rejected foreign capture/scope must never be drained here.
             if(owned_eager_scope_admitted) guard.recover_or_fail_stop();
@@ -436,6 +537,19 @@ KnownWindowResult HipKnownPrefixWindow::execute(SerialSessionContext& session, s
 KnownWindowResult HipKnownPrefixWindow::execute_validated(SerialSessionContext& session,
     std::span<const std::uint32_t> tokens,const std::function<void()>& before_publish) {
     return impl_->execute(session,tokens,before_publish);
+}
+std::shared_ptr<HipMtpTargetWindowCapture> HipKnownPrefixWindow::prepare_mtp_target_capture(const HipMtpTargetWindowCapturePolicy& policy){
+    if(impl_->failed || impl_->prefill || impl_->executing || current_hip_launch_context())throw std::invalid_argument("MTP target capture requires a live closed eager window");
+    impl_->validate_metadata();
+    auto capture=HipMtpTargetWindowCapture::create(impl_.get(),impl_->model,impl_->serial,impl_->window,impl_->resources,
+        impl_->scratch,impl_->scope,impl_->actual_owner,policy);
+    impl_->prepare_capture(capture);
+    return capture;
+}
+HipMtpTargetWindowExecution HipKnownPrefixWindow::execute_mtp_captured(SerialSessionContext& session,std::span<const std::uint32_t> tokens,
+    std::shared_ptr<HipMtpTargetWindowCapture> capture,const std::function<void()>& before_publish){
+    if(!capture)throw std::invalid_argument("MTP target capture owner is absent");
+    HipMtpTargetWindowExecution out;out.execution=impl_->execute(session,tokens,before_publish,capture,&out.batch);return out;
 }
 std::uint32_t HipKnownPrefixWindow::logical_rows() const noexcept { return impl_->logical_rows(); }
 bool HipKnownPrefixWindow::supports_tiled_prefill() const noexcept {return impl_->prefill.has_value();}

@@ -6,7 +6,7 @@
 
 namespace strix {
 
-enum class ArithmeticProducer { serial_row, prefill_chunk };
+enum class ArithmeticProducer { serial_row, prefill_chunk, known_window_chunk };
 
 struct ArithmeticRowInterval {
     std::uint64_t begin = 0;
@@ -49,6 +49,14 @@ struct ArithmeticLineage {
 // append one bounded chunk, and never coalesce adjacent chunk boundaries or
 // synthesize unknown earlier producer history.
 [[nodiscard]] ArithmeticLineage prepare_prefill_chunk_lineage(
+    const ArithmeticLineage& previous, std::uint64_t begin, std::uint64_t end,
+    std::uint64_t numerical_plan_identity, std::uint64_t reduction_plan_identity,
+    std::uint64_t state_update_identity);
+
+// One actually completed closed known window, distinct from tiled prefill and
+// serial rows. Each call retains its full chunk boundary. Unknown prior history
+// returns empty; it is never replaced by fabricated per-row frontiers.
+[[nodiscard]] ArithmeticLineage prepare_known_window_chunk_lineage(
     const ArithmeticLineage& previous, std::uint64_t begin, std::uint64_t end,
     std::uint64_t numerical_plan_identity, std::uint64_t reduction_plan_identity,
     std::uint64_t state_update_identity);

@@ -202,6 +202,47 @@ void validate_window_launch_plan(const CompiledSerialExecution& row,
             throw std::invalid_argument("known window row launcher does not match the compiled step");
     }
 }
+struct ActualWindowRecipe {std::uint64_t reduction=0,state_update=0;};
+ActualWindowRecipe actual_window_recipe(const CompiledKnownPrefixWindow& window,
+    const CompiledSerialExecution& serial,std::span<const CompiledLaunchPlan* const> row_launch,
+    const std::vector<const KnownWindowR2Entry*>& selected,
+    const std::vector<const KnownWindowRowsEntry*>& selected_rows) {
+    const auto word=[](std::uint64_t& hash,std::uint64_t value) {
+        for(unsigned shift=0;shift<64U;shift+=8U) {hash^=(value>>shift)&255U;hash*=1099511628211ULL;}
+    };
+    std::uint64_t reduction=14695981039346656037ULL,state=14695981039346656037ULL;
+    word(reduction,0x4b57494e52454331ULL);word(state,0x4b57494e53544131ULL);
+    const auto both=[&](std::uint64_t value) {word(reduction,value);word(state,value);};
+    both(window.window_execution_identity);both(window.window_kernel_plan_identity);
+    both(serial.execution_identity);both(serial.kernel_plan_identity);both(window.logical_rows);
+    both(static_cast<std::uint64_t>(window.output_policy));both(window.logit_row_indices.size());
+    for(const auto row:window.logit_row_indices) both(row);
+    both(row_launch.size());
+    for(const auto* launch:row_launch) {
+        both(launch->execution_identity);both(launch->plan_identity);both(launch->steps.size());
+        for(const auto& step:launch->steps) {
+            both(step.step_id);both(static_cast<std::uint64_t>(step.op));both(step.runtime_step);
+            both(step.implementation_identity);
+        }
+    }
+    for(std::size_t i=0;i<serial.execution.steps.size();++i) {
+        const auto& step=serial.execution.steps[i];
+        both(step.id);both(static_cast<std::uint64_t>(step.op));both(step.layer?static_cast<std::uint64_t>(*step.layer)+1U:0U);
+        both(static_cast<std::uint64_t>(step.reads_state));both(static_cast<std::uint64_t>(step.writes_state));
+        both(static_cast<std::uint64_t>(window.mode[i]));both(static_cast<std::uint64_t>(window.r2_variant[i]));
+        const auto implementation=selected_rows[i]?selected_rows[i]->implementation_identity:
+            selected[i]?selected[i]->implementation_identity:0U;
+        if((selected_rows[i] || selected[i]) && !implementation)
+            throw std::invalid_argument("known window lineage requires every selected native recipe identity");
+        both(implementation);
+        // Bind each source kernel key as well as the actual row implementation.
+        const auto& binding=serial.bindings.bindings[i];
+        both(binding.host_or_runtime_step);both(binding.kernel_id.has_value());
+        if(binding.kernel_id) {both(binding.kernel_id->size());for(const char ch:*binding.kernel_id) both(static_cast<unsigned char>(ch));}
+    }
+    if(!reduction || !state) throw std::overflow_error("known window actual recipe identity is zero");
+    return {reduction,state};
+}
 }  // namespace
 
 KnownWindowResult execute_known_prefix_window_eager(
@@ -242,9 +283,11 @@ KnownWindowResult execute_known_prefix_window_eager(
     if (post_position > serial.max_position_embeddings ||
         post_position > serial_resources.session_state_layout->context_tokens)
         throw std::out_of_range("known window exceeds allocated context capacity");
-    auto next_lineage = prepare_prefill_chunk_lineage(session.arithmetic_lineage,
-        session.next_position, post_position, window.window_execution_identity,
-        window.window_kernel_plan_identity, window.window_execution_identity);
+    ArithmeticLineage next_lineage;
+    if(!hooks.record_actual_window_lineage)
+        next_lineage=prepare_prefill_chunk_lineage(session.arithmetic_lineage,
+            session.next_position,post_position,window.window_execution_identity,
+            window.window_kernel_plan_identity,window.window_execution_identity);
     validate_execution_memory_binding(window.window_execution_identity, window.arena.physical, window_scratch);
     const auto& old_scratch = *serial_resources.scratch;
     if (window_scratch.arena_bytes > std::numeric_limits<std::uintptr_t>::max() - window_scratch.arena_base ||
@@ -407,6 +450,13 @@ KnownWindowResult execute_known_prefix_window_eager(
         }
     }
     if (hooks.preflight_plan) hooks.preflight_plan();
+    if(hooks.record_actual_window_lineage) {
+        const auto recipe=actual_window_recipe(window,serial,row_launch,selected,selected_rows);
+        next_lineage=prepare_known_window_chunk_lineage(session.arithmetic_lineage,session.next_position,post_position,
+            window.window_execution_identity,recipe.reduction,recipe.state_update);
+        if(!arithmetic_lineage_valid(next_lineage,post_position))
+            throw std::invalid_argument("recorded known window requires complete actual preceding producer history");
+    }
     std::vector<DirectLaunchDispatcher> dispatchers;
     dispatchers.reserve(rows);
     for(const auto* plan:row_launch) dispatchers.emplace_back(*plan);

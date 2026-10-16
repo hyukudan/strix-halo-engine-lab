@@ -164,6 +164,8 @@ add_library(strix_core STATIC
     src/mtp_draft_cycle_input.cpp
     src/mtp_forward_replay.cpp
     src/mtp_forward_contract.cpp
+    src/mtp_forward_golden_file.cpp
+    src/mtp_target_window_policy.cpp
     src/mtp_sidecar_binding.cpp
     src/mtp_forward_semantics.cpp
     src/mtp_forward_runtime.cpp
@@ -1065,6 +1067,16 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-mtp-forward-replay-tests)
     add_test(NAME strix-mtp-forward-replay-tests COMMAND strix-mtp-forward-replay-tests)
 
+    add_executable(strix-mtp-forward-golden-file-tests tests/mtp_forward_golden_file_tests.cpp)
+    target_link_libraries(strix-mtp-forward-golden-file-tests PRIVATE strix_core)
+    strix_target_warnings(strix-mtp-forward-golden-file-tests)
+    add_test(NAME strix-mtp-forward-golden-file-tests COMMAND strix-mtp-forward-golden-file-tests)
+
+    add_executable(strix-mtp-target-window-policy-tests tests/mtp_target_window_policy_tests.cpp)
+    target_link_libraries(strix-mtp-target-window-policy-tests PRIVATE strix_core)
+    strix_target_warnings(strix-mtp-target-window-policy-tests)
+    add_test(NAME strix-mtp-target-window-policy-tests COMMAND strix-mtp-target-window-policy-tests)
+
     add_executable(strix-mtp-sidecar-binding-tests tests/mtp_sidecar_binding_tests.cpp)
     target_link_libraries(strix-mtp-sidecar-binding-tests PRIVATE strix_core)
     strix_target_warnings(strix-mtp-sidecar-binding-tests)
@@ -1286,6 +1298,9 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         src/hip_ple_launcher.hip
         src/hip_mtp_resources.hip
         src/hip_mtp_runtime.hip
+        src/hip_mtp_target_window.hip
+        src/hip_mtp_target_checkpoint.hip
+        src/hip_mtp_window_verifier.hip
         src/hip_mtp_target_hidden.hip
         src/hip_mtp_greedy_runtime.hip
         src/hip_mtp_asset_loader.hip
@@ -1365,7 +1380,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         target_compile_definitions(strix_hip_runtime PRIVATE STRIX_BUILD_SHARED_EXPERT_ROWS_DIAGNOSTIC=1)
         target_compile_definitions(strix_hip_runtime PRIVATE STRIX_BUILD_QSA_GQA_REUSE_DIAGNOSTIC=1)
         target_compile_definitions(strix_hip_runtime PRIVATE STRIX_BUILD_MOE_BATCHED_ACTIVATION_DIAGNOSTIC=1)
-        foreach(mtp_fixture input-fusion forward-replay)
+        foreach(mtp_fixture input-fusion forward-replay target-checkpoint)
             string(REPLACE "-" "_" mtp_fixture_file "${mtp_fixture}")
             add_executable(strix-hip-mtp-${mtp_fixture}-tests tests/hip_mtp_${mtp_fixture_file}_tests.hip)
             target_link_libraries(strix-hip-mtp-${mtp_fixture}-tests PRIVATE strix_hip_runtime)
@@ -1379,7 +1394,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         endforeach()
         # Callable fixture requires actual independently supplied component goldens.
         # Building this source library does not execute or qualify the components.
-        add_library(strix_mtp_projection_component_fixtures STATIC tests/hip_mtp_projection_components.hip tests/hip_mtp_shared_expert_components.hip)
+        add_library(strix_mtp_projection_component_fixtures STATIC tests/hip_mtp_projection_components.hip tests/hip_mtp_shared_expert_components.hip tests/hip_mtp_target_window_components.hip tests/hip_mtp_greedy_cycle_components.hip)
         target_link_libraries(strix_mtp_projection_component_fixtures PRIVATE strix_hip_runtime)
         set_target_properties(strix_mtp_projection_component_fixtures PROPERTIES
             HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
