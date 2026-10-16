@@ -19,6 +19,11 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <string_view>
+#include <type_traits>
+
+static_assert(!std::is_move_constructible_v<strix::HipMoeOverlapDispatcher>);
+static_assert(!std::is_move_constructible_v<strix::HipMoeSiblingStreams>);
 
 namespace {
 void check(hipError_t e, const char* text) {
@@ -81,6 +86,9 @@ void positive(bool shared_slow) {
     const auto context = resources->context();
     for (std::uint64_t token = 0; token < 3; ++token) {
         streams.begin_token(token,token,2);
+        require(streams.ticket().owner_epoch && streams.ticket().token_epoch == token + 1U &&
+            streams.ticket().state == strix::HipMoeWorkState::prepared && !streams.ticket().gpu_completed,
+            "begin owns a fresh ticket without claiming GPU completion");
         strix::HipLaunchScope original(context);
         const auto* outer_context = strix::current_hip_launch_context();
         std::array<std::uint32_t,2> oracle{};
@@ -113,10 +121,17 @@ void positive(bool shared_slow) {
             oracle[layer] = expected(seed,side_iterations,3U) ^ expected(seed,main_iterations,7U);
         }
         require(streams.stats().committed_tokens == token, "enqueued branch counted as committed");
+        require(streams.ticket().state == strix::HipMoeWorkState::submitted && !streams.ticket().gpu_completed &&
+            !streams.ticket().committed, "host returns and join enqueues cannot complete or publish a ticket");
         streams.verify_before_commit();
+        require(streams.ticket().state == strix::HipMoeWorkState::validated && streams.ticket().gpu_completed &&
+            streams.ticket().validated && streams.ticket().completion_queried && !streams.ticket().committed,
+            "successful stream proofs precede validation and serial publication");
         // This is a protocol fixture, not a real D1/session commit. The actual
         // dispatcher adapter requires the root's live SerialSessionContext.
         streams.mark_committed(token+1U,token+1U);
+        require(streams.ticket().state == strix::HipMoeWorkState::recyclable && streams.ticket().committed,
+            "only validated actual commit makes the event/arena ticket recyclable");
         std::array<std::uint32_t,8> result{};
         resources->guard->run([&] { check(hipMemcpy(result.data(),resources->memory,sizeof(result),hipMemcpyDeviceToHost), "fixture result"); });
         require(result[3] == oracle[0] && result[4] == oracle[1], "event fork/join failed to protect shared input/output");
@@ -143,17 +158,67 @@ void negative_scope_and_protocol() {
         require(strix::current_hip_launch_context() == previous && strix::hip_deferred_moe_status() == resources->memory + 6,
                 "exception failed to restore original context");
     }
-    streams.begin_token(0,0,1);
-    reject([&] { streams.verify_before_commit(); });
-    reject([&] { streams.begin_experts(0); });
-    streams.fork_shared(0);
-    require(streams.stats().fork_records == 1 && streams.stats().join_waits == 0,
-            "fork counter must record the actual fork event before shared-done");
-    reject([&] { streams.join_before_combine(0); });
-    reject([&] { streams.mark_committed(1,1); });
-    streams.abort();
-    require(streams.failed() && streams.stats().committed_tokens == 0, "incomplete branch published");
-    reject([&] { streams.begin_token(1,0,1); });
+    for (unsigned fault = 0; fault < 5U; ++fault) {
+        strix::HipMoeSiblingStreams subject(resources->main,resources,resources->guard);
+        subject.begin_token(0,0,1);
+        if (fault >= 2U) {
+            subject.fork_shared(0);
+            require(subject.stats().fork_records == 1 && subject.stats().join_waits == 0,
+                "fork counter records the actual event before shared-done");
+        }
+        if (fault == 0U) reject([&] { subject.verify_before_commit(); });
+        if (fault == 1U) reject([&] { subject.begin_experts(0); });
+        if (fault == 2U) reject([&] { subject.join_before_combine(0); });
+        if (fault == 3U) reject([&] { subject.mark_committed(1,1); });
+        if (fault == 4U) reject([&] { subject.begin_token(0,0,1); });
+        require(subject.failed() && subject.stats().committed_tokens == 0 &&
+            subject.ticket().state == strix::HipMoeWorkState::failed_drained,
+            "protocol failure must drain and permanently quarantine the ticket");
+        reject([&] { subject.begin_token(1,0,1); });
+    }
+}
+void cancellation_and_owner_lifetime() {
+    for (unsigned stop = 0; stop < 5U; ++stop) {
+        auto resources = std::make_shared<Resources>();
+        strix::HipMoeSiblingStreams streams(resources->main,resources,resources->guard);
+        streams.begin_token(0,0,1);
+        const auto context = resources->context();
+        {
+            const strix::HipLaunchScope scope(context);
+            hipLaunchKernelGGL(producer,dim3(1),dim3(1),0,resources->main,resources->memory,13U);
+            check(hipGetLastError(),"cancel producer");
+            streams.fork_shared(0);
+            { const strix::HipSharedExpertSideScope side(resources->main,streams.side_stream());
+              hipLaunchKernelGGL(branch,dim3(1),dim3(1),0,streams.side_stream(),resources->memory,1U,200000U,3U);
+              check(hipGetLastError(),"cancel slow side"); }
+            if (stop >= 1U) streams.record_shared_done(0);
+            if (stop >= 2U) {
+                streams.begin_experts(0);
+                hipLaunchKernelGGL(branch,dim3(1),dim3(1),0,resources->main,resources->memory,2U,200000U,7U);
+                check(hipGetLastError(),"cancel routed");
+            }
+            if (stop >= 3U) streams.join_before_combine(0);
+            if (stop == 4U) streams.verify_before_commit();
+            streams.abort();
+        }
+        require(streams.failed() && streams.ticket().state == strix::HipMoeWorkState::failed_drained &&
+            !streams.ticket().committed && streams.stats().aborted_tokens == 1 && streams.stats().committed_tokens == 0,
+            "cancellation cannot publish any partially completed fork/join token");
+        require(hipStreamQuery(streams.main_stream()) == hipSuccess && hipStreamQuery(streams.side_stream()) == hipSuccess,
+            "cancel returns only after both branch streams are quiescent, even before a join exists");
+        streams.abort(); require(streams.stats().aborted_tokens == 1,"cancel/outer-error cleanup must be idempotent");
+        reject([&] { streams.begin_token(0,0,1); });
+    }
+    auto resources = std::make_shared<Resources>();
+    std::weak_ptr<Resources> weak = resources;
+    auto streams = std::make_unique<strix::HipMoeSiblingStreams>(resources->main,resources,resources->guard);
+    streams->begin_token(0,0,1); streams->fork_shared(0);
+    hipLaunchKernelGGL(branch,dim3(1),dim3(1),0,streams->side_stream(),resources->memory,1U,200000U,3U);
+    check(hipGetLastError(),"pending owner side");
+    resources.reset();
+    require(!weak.expired(),"submitted branch retains its real allocation and borrowed-main owner");
+    streams.reset(); // No record_shared_done/join: destruction must drain side independently.
+    require(weak.expired(),"quiescent branch owner was not released after event/stream teardown");
 }
 void graph_rejected() {
     auto resources = std::make_shared<Resources>();
@@ -322,6 +387,10 @@ struct Callbacks {
     Fixture& fixture;
     bool prepared = false, fail_routed = false;
     std::uint32_t head_calls = 0, cached_calls = 0, publication_calls = 0;
+    unsigned mutation = 0;
+    bool injected = false;
+    strix::HipMoeOverlapDispatcher* overlap = nullptr;
+    const strix::SerialSessionContext* session = nullptr;
     static void launch(const strix::ExecutionDispatchContext& c, void* opaque) {
         auto& self = *static_cast<Callbacks*>(opaque);
         require((c.prepared_tensor_views != nullptr) == self.prepared, "adapter lost prepared tensor cache");
@@ -350,6 +419,25 @@ struct Callbacks {
                     address(shared ? layer.shared_temporary : layer.routed_temporary),shared ? 3U : 7U);
                 check(hipGetLastError(),"adapter branch launch");
                 if (!shared && self.fail_routed) throw std::runtime_error("injected routed callback after enqueue");
+                if (!self.injected && self.mutation && (self.mutation == 6U ? !shared : shared)) {
+                    self.injected = true;
+                    auto& owner = *self.fixture.owner;
+                    if (self.mutation == 3U) ++owner.scratch.allocation_generation;
+                    if (self.mutation == 4U) ++owner.state.device_allocation_generation;
+                    if (self.mutation == 5U) {
+                        const auto access = std::find_if(owner.access.accesses.begin(),owner.access.accesses.end(),
+                            [&](const auto& view) { return view.step_id == layer.experts_step && !view.tensor_indices.empty(); });
+                        require(access != owner.access.accesses.end(),"mutation fixture lacks routed weight access");
+                        const auto binding = std::find_if(owner.weights.tensors.begin(),owner.weights.tensors.end(),
+                            [&](const auto& tensor) { return tensor.tensor_index == access->tensor_indices.front(); });
+                        require(binding != owner.weights.tensors.end(),"mutation fixture lacks actual routed weight binding");
+                        ++binding->allocation_generation;
+                    }
+                    if (self.mutation == 6U)
+                        ++const_cast<strix::HipLaunchContext*>(strix::current_hip_launch_context())->deferred_moe_status.allocation_generation;
+                    if (self.mutation == 7U) self.overlap->begin_token(*self.session);
+                    if (self.mutation == 8U) self.overlap->abort();
+                }
             } else if (c.step_id == layer.combine_step) {
                 hipLaunchKernelGGL(toy_combine,dim3(1),dim3(1),0,strix::hip_execution_stream(),
                     address(layer.shared_output),address(layer.routed_output),
@@ -362,6 +450,7 @@ struct Callbacks {
     }
 };
 void actual_adapter(bool prepared_mode, bool omit_head, unsigned failure) {
+    const bool between_tokens = failure >= 9U;
     Fixture fixture;
     auto callbacks = std::make_shared<Callbacks>(Callbacks{fixture,prepared_mode,failure == 1U});
     strix::ExecutionLauncherRegistry registry;
@@ -387,12 +476,38 @@ void actual_adapter(bool prepared_mode, bool omit_head, unsigned failure) {
     session.runtime_compatibility_identity = strix::build_runtime_execution_identities(
         fixture.compiled.execution_identity,fixture.compiled.arena,fixture.owner->resources).compatibility_identity;
     session.state = fixture.request.state;
+    callbacks->mutation = failure >= 3U && failure <= 8U ? failure : 0U;
+    callbacks->overlap = &overlap; callbacks->session = &session;
+    const auto initial_scratch = fixture.owner->scratch;
+    const auto initial_state_binding = fixture.owner->state;
+    const auto initial_weight_bindings = fixture.owner->weights.tensors;
     auto context = fixture.owner->gpu->context();
     context.deferred_moe_status.execution_identity = fixture.compiled.execution_identity;
     bool caught = false;
     try {
         strix::HipLaunchScope scope(context);
+        for (unsigned repeat = 0; repeat < (failure && !between_tokens ? 1U : 2U); ++repeat) {
         overlap.begin_token(session);
+        require(overlap.ticket().binding_identity && overlap.ticket().session_epoch &&
+            overlap.ticket().scratch_generation == initial_scratch.allocation_generation &&
+            overlap.ticket().state_device_generation == initial_state_binding.device_allocation_generation &&
+            overlap.ticket().state_host_generation == initial_state_binding.host_allocation_generation &&
+            overlap.ticket().status_generation == context.deferred_moe_status.allocation_generation,
+            "adapter ticket binds the admitted physical allocation epoch");
+        require(overlap.ticket().token_epoch == repeat + 1U && !overlap.ticket().committed && !overlap.ticket().gpu_completed,
+            "a reused adapter starts a fresh uncompleted token epoch");
+        if (!failure && repeat == 0U) {
+            strix::HipMoeOverlapDispatcher contender(fixture.compiled,*fixture.plan,launches,fixture.owner->resources,
+                fixture.owner->gpu->main,fixture.owner,callbacks,fixture.owner->gpu->guard);
+            bool rejected = false;
+            try { contender.begin_token(session); }
+            catch (const std::logic_error& error) {
+                rejected = std::string_view(error.what()) == "MoE overlap allocation is retained by another pending owner";
+            }
+            require(rejected && contender.ticket().state == strix::HipMoeWorkState::failed_drained &&
+                overlap.ticket().state == strix::HipMoeWorkState::prepared,
+                "a second adapter cannot reuse a pending allocation, or invalidate its original ticket");
+        }
         const auto hook = [&] {
             overlap.verify_before_commit(output.state_only_active());
             if (failure == 2U) throw std::runtime_error("injected completion before publication");
@@ -407,16 +522,33 @@ void actual_adapter(bool prepared_mode, bool omit_head, unsigned failure) {
         if (omit_head) { strix::GenerationOutputDispatcher::StateOnlyScope intent(output); execute(); }
         else execute();
         overlap.mark_committed(session);
+        if (between_tokens && repeat == 0U) {
+            // The first ticket is committed and quiescent. Reusing the same
+            // pointer with a new allocation epoch must reject before token2.
+            if (failure == 9U) ++fixture.owner->scratch.allocation_generation;
+            if (failure == 10U) ++fixture.owner->state.host_allocation_generation;
+            if (failure == 11U) ++fixture.owner->weights.tensors.front().allocation_generation;
+            if (failure == 12U)
+                ++const_cast<strix::HipLaunchContext*>(strix::current_hip_launch_context())->deferred_moe_status.allocation_generation;
+        }
+        }
     } catch (const std::exception&) { overlap.abort(); caught = true; }
+    fixture.owner->scratch = initial_scratch; fixture.owner->state = initial_state_binding;
+    fixture.owner->weights.tensors = initial_weight_bindings;
     require(caught == (failure != 0U), "adapter transaction unexpected failure outcome");
-    require(session.committed_tokens == (failure ? 0U : 1U) && session.next_position == (failure ? 0U : 1U) &&
-            session.health == (failure ? strix::SerialSessionHealth::poisoned : strix::SerialSessionHealth::ready) &&
-            session.arithmetic_lineage.tainted == (failure != 0U) &&
-            callbacks->publication_calls == (failure ? 0U : 1U), "adapter published a failed token");
-    require(overlap.stats().committed_tokens == (failure ? 0U : 1U), "adapter counters invented a commit");
+    const auto published = failure ? (between_tokens ? 1U : 0U) : 2U;
+    const bool poisoned = failure && !between_tokens;
+    require(session.committed_tokens == published && session.next_position == published &&
+            session.health == (poisoned ? strix::SerialSessionHealth::poisoned : strix::SerialSessionHealth::ready) &&
+            session.arithmetic_lineage.tainted == poisoned &&
+            callbacks->publication_calls == published, "adapter published a failed token");
+    require(overlap.stats().committed_tokens == published, "adapter counters invented a commit");
+    require(overlap.ticket().state == (failure ? strix::HipMoeWorkState::failed_drained : strix::HipMoeWorkState::recyclable) &&
+        overlap.ticket().committed == (published != 0U) && hipStreamQuery(fixture.owner->gpu->main) == hipSuccess,
+        "adapter must drain failures and cannot recycle before validated actual session commit");
     if (!failure) {
-        require(callbacks->head_calls == (omit_head ? 0U : 1U) &&
-                output.omitted_heads() == (omit_head ? 1U : 0U) && (!prepared_mode || callbacks->cached_calls > 0U),
+        require(callbacks->head_calls == (omit_head ? 0U : 2U) &&
+                output.omitted_heads() == (omit_head ? 2U : 0U) && (!prepared_mode || callbacks->cached_calls > 0U),
                 "adapter prefix/prepared composition differs");
         std::vector<std::uint32_t> ledger(fixture.plan->layers().size()+2U);
         check(hipMemcpy(ledger.data(),fixture.owner->ledger,ledger.size()*sizeof(std::uint32_t),hipMemcpyDeviceToHost),"adapter ledger read");
@@ -437,11 +569,15 @@ void actual_adapter(bool prepared_mode, bool omit_head, unsigned failure) {
 int main() try {
     int devices = 0;
     if (hipGetDeviceCount(&devices) != hipSuccess || !devices) return 77;
-    positive(false); positive(true); negative_scope_and_protocol(); graph_rejected();
+    positive(false); positive(true); negative_scope_and_protocol(); graph_rejected(); cancellation_and_owner_lifetime();
     for (const bool prepared : {false,true}) for (const bool omit : {false,true})
         adapter_fixture::actual_adapter(prepared,omit,0);
     adapter_fixture::actual_adapter(false,false,1);
     adapter_fixture::actual_adapter(true,true,2);
+    for (unsigned mutation = 3U; mutation <= 8U; ++mutation)
+        adapter_fixture::actual_adapter(mutation % 2U != 0U,false,mutation);
+    for (unsigned mutation = 9U; mutation <= 12U; ++mutation)
+        adapter_fixture::actual_adapter(mutation % 2U != 0U,false,mutation);
     std::cout << "MoE sibling event/scope diagnostic fixtures completed\n";
     return 0;
 } catch (const std::exception& error) {

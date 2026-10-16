@@ -168,6 +168,10 @@ std::uint64_t build_identity(
                 : 0ULL);
     }
 
+    if (layout.recurrent_storage != GdnRecurrentStorage::key_value) {
+        hash_u64(hash, 0x47444e53544f5231ULL);
+        hash_u64(hash, static_cast<std::uint32_t>(layout.recurrent_storage));
+    }
     return hash;
 }
 
@@ -194,6 +198,8 @@ build_serial_session_state_layout(
     }
 
     SerialSessionStateLayout layout;
+    validate_gdn_recurrent_storage(request.recurrent_storage);
+    layout.recurrent_storage = request.recurrent_storage;
     layout.context_tokens =
         request.context_tokens;
     layout.device_alignment =
@@ -297,6 +303,51 @@ find_session_state_allocation(
     return found == layout.allocations.end()
         ? nullptr
         : &*found;
+}
+
+void validate_serial_session_state_layout_identity(
+    const ModelContract& model, const SerialSessionStateLayout& layout) {
+    validate_gdn_recurrent_storage(layout.recurrent_storage);
+    if (!layout.layout_identity || build_identity(model, layout) != layout.layout_identity)
+        throw std::invalid_argument("session-state layout metadata identity mismatch");
+}
+
+void convert_gdn_recurrent_host_storage(
+    GdnRecurrentHostView source, GdnRecurrentStorage source_storage,
+    GdnRecurrentHostView destination, GdnRecurrentStorage destination_storage,
+    std::uint64_t heads, std::uint64_t keys, std::uint64_t values,
+    const std::function<void()>& quiesce) {
+    validate_gdn_recurrent_storage(source_storage);
+    validate_gdn_recurrent_storage(destination_storage);
+    if (!heads || !keys || !values || !quiesce)
+        throw std::invalid_argument("GDN storage conversion requires dimensions and quiescence fence");
+    const auto count = checked_mul(checked_mul(heads, keys), values);
+    const auto bytes = checked_mul(count, sizeof(std::uint32_t));
+    const auto validate = [&](const GdnRecurrentHostView& view) {
+        const auto address = reinterpret_cast<std::uintptr_t>(view.words.data());
+        if (!view.owner || !view.allocation_generation || !view.owner_base ||
+            view.owner_bytes > std::numeric_limits<std::uintptr_t>::max() - view.owner_base ||
+            view.words.size() != count || !address || address % alignof(std::uint32_t) ||
+            address < view.owner_base || address - view.owner_base > view.owner_bytes ||
+            bytes > view.owner_bytes - (address - view.owner_base))
+            throw std::invalid_argument("GDN storage conversion view exceeds its retained owner");
+    };
+    validate(source);
+    validate(destination);
+    const auto a = reinterpret_cast<std::uintptr_t>(source.words.data());
+    const auto b = reinterpret_cast<std::uintptr_t>(destination.words.data());
+    if (a < b + bytes && b < a + bytes)
+        throw std::invalid_argument("GDN storage conversion requires disjoint staging views");
+    quiesce();
+    // Bit copies preserve NaN payloads, signed zeros and all FP32 encodings.
+    for (std::uint64_t h = 0; h < heads; ++h)
+        for (std::uint64_t k = 0; k < keys; ++k)
+            for (std::uint64_t v = 0; v < values; ++v) {
+                const auto kv = (h * keys + k) * values + v;
+                const auto vk = (h * values + v) * keys + k;
+                destination.words[destination_storage == GdnRecurrentStorage::key_value ? kv : vk] =
+                    source.words[source_storage == GdnRecurrentStorage::key_value ? kv : vk];
+            }
 }
 
 }  // namespace strix

@@ -33,6 +33,7 @@ struct SerialSessionRestorePlan {
     std::uint64_t plan_identity = 0;
 
     std::vector<SessionRestoreRange> ranges;
+    GdnRecurrentStorage recurrent_storage = GdnRecurrentStorage::key_value;
 };
 
 [[nodiscard]] SerialSessionRestorePlan

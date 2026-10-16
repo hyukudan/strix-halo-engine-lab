@@ -72,6 +72,26 @@ int main() {
                    snapshot.state.generations,
            "restore plan preserves committed session metadata");
 
+    auto vk_request = layout_request; vk_request.recurrent_storage = strix::GdnRecurrentStorage::value_key;
+    const auto vk_layout = strix::build_serial_session_state_layout(model, vk_request);
+    const auto vk_snapshot = strix::build_serial_session_snapshot_plan(model, vk_layout, request);
+    const auto vk_restore = strix::build_serial_session_restore_plan(model, vk_layout,
+        request.runtime_compatibility_identity, vk_snapshot);
+    expect(vk_restore.recurrent_storage == strix::GdnRecurrentStorage::value_key &&
+        vk_restore.plan_identity != restore.plan_identity,
+        "same-layout candidate restore retains physical storage identity");
+    bool storage_rejected = false;
+    try { static_cast<void>(strix::build_serial_session_restore_plan(model, layout,
+        request.runtime_compatibility_identity, vk_snapshot)); }
+    catch (const std::invalid_argument&) { storage_rejected = true; }
+    expect(storage_rejected, "restore cannot silently reinterpret a cross-layout payload");
+    auto forged_snapshot = snapshot; forged_snapshot.recurrent_storage = strix::GdnRecurrentStorage::value_key;
+    storage_rejected = false;
+    try { static_cast<void>(strix::build_serial_session_restore_plan(model, layout,
+        request.runtime_compatibility_identity, forged_snapshot)); }
+    catch (const std::invalid_argument&) { storage_rejected = true; }
+    expect(storage_rejected, "restore rejects same-ID forged physical storage metadata");
+
     for (std::size_t index = 0;
          index < restore.ranges.size();
          ++index) {

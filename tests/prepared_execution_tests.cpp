@@ -638,6 +638,7 @@ void ple_between_call_rejection() {
         {"host state extent", [&] { ++data.state.host_bytes; }},
         {"PLE hash multiplier", [&] { ++data.ple_contract.multipliers.front(); }},
         {"state layout allocation offset", [&] { data.layout.allocations.front().offset += data.layout.device_alignment; }},
+        {"forged state storage with unchanged layout identity", [&] { data.layout.recurrent_storage = strix::GdnRecurrentStorage::value_key; }},
         {"equal manifest at another descriptor handle", [&] { data.resources.model_manifest = &alternate_manifest; }},
         {"equal weights at another descriptor handle", [&] { data.resources.model_weights = &alternate_weights; }},
         {"equal access at another descriptor handle", [&] { data.resources.tensor_access = &alternate_access; }},

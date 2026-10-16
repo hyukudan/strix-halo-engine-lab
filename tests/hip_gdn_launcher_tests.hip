@@ -989,6 +989,8 @@ void run_gdn_island_fixture() {
                 auto candidate = config; candidate.recurrent_layout = layout;
                 reject_creation(candidate, d1->scope(), "GDN islands require the baseline recurrent LDS layout");
             }
+            auto storage_candidate = config; storage_candidate.recurrent_storage = strix::GdnRecurrentStorage::value_key;
+            reject_creation(storage_candidate, d1->scope(), "GDN islands require key-value recurrent storage");
         }
         auto wave8 = config; wave8.virtual_q8_input_projections = true;
         wave8.prefetch_q8_input_projections = true; wave8.wave8_q8_input_projections = true;
@@ -2102,8 +2104,35 @@ int main(int argc, char** argv) try {
             check(hipMemcpy(result.state.data(), state_device, result.state.size(), hipMemcpyDeviceToHost), "read LDS full state owner");
             return result;
         };
-        const auto sequence = [&](const strix::ExecutionLauncher& arm) {
-            check(hipMemcpy(state_device, seed.data(), seed.size(), hipMemcpyHostToDevice), "restore LDS asymmetric state owner");
+        const auto transpose_staging = [&](std::vector<std::byte>& bytes, bool to_value_key) {
+            const auto count = static_cast<std::size_t>(matrix_address.bytes / sizeof(std::uint32_t));
+            auto source = std::make_shared<std::vector<std::uint32_t>>(count);
+            auto destination = std::make_shared<std::vector<std::uint32_t>>(count);
+            const auto offset = matrix_address.address - state_memory.device_base;
+            std::memcpy(source->data(), bytes.data() + offset, matrix_address.bytes);
+            const auto view = [](const auto& owner) {
+                return strix::GdnRecurrentHostView{std::span<std::uint32_t>(*owner), owner,
+                    reinterpret_cast<std::uintptr_t>(owner->data()), owner->size() * sizeof(std::uint32_t), 1};
+            };
+            // All HIP producers have been synchronously drained before this
+            // host-only staging fence; conversion is never part of dispatch.
+            strix::convert_gdn_recurrent_host_storage(view(source),
+                to_value_key ? strix::GdnRecurrentStorage::key_value : strix::GdnRecurrentStorage::value_key,
+                view(destination),
+                to_value_key ? strix::GdnRecurrentStorage::value_key : strix::GdnRecurrentStorage::key_value,
+                model.gdn_value_heads, model.gdn_key_head_dim, model.gdn_value_head_dim, [] {});
+            std::memcpy(bytes.data() + offset, destination->data(), matrix_address.bytes);
+        };
+        const auto sequence = [&](const strix::ExecutionLauncher& arm, bool value_key = false) {
+            auto selected_seed = seed;
+            auto selected_request = state_request;
+            selected_request.recurrent_storage = value_key ? strix::GdnRecurrentStorage::value_key : strix::GdnRecurrentStorage::key_value;
+            const auto selected_layout = strix::build_serial_session_state_layout(model, selected_request);
+            auto selected_memory = state_memory; selected_memory.layout_identity = selected_layout.layout_identity;
+            resources.session_state_layout = &selected_layout; resources.session_state_memory = &selected_memory;
+            context.session_state_layout = &selected_layout; context.session_state_memory = &selected_memory;
+            if (value_key) transpose_staging(selected_seed, true);
+            check(hipMemcpy(state_device, selected_seed.data(), selected_seed.size(), hipMemcpyHostToDevice), "restore LDS asymmetric state owner");
             std::vector<IslandSnapshot> results;
             for (std::uint64_t position = 0; position < 4U; ++position) {
                 context.position = position;
@@ -2116,12 +2145,76 @@ int main(int argc, char** argv) try {
                 expect(snapshot_layout() == before, "LDS production pure preflight leaves all owner bytes unchanged");
                 { const strix::HipLaunchScope scope(layout_scope); arm.function(context, arm.user_data); }
                 check(hipStreamSynchronize(layout_stream), "drain LDS production row");
-                results.push_back(snapshot_layout());
+                auto result = snapshot_layout();
+                if (value_key) transpose_staging(result.state, false);
+                results.push_back(std::move(result));
             }
+            resources.session_state_layout = &state_layout; resources.session_state_memory = &state_memory;
+            context.session_state_layout = &state_layout; context.session_state_memory = &state_memory;
             return results;
         };
         const auto reference = sequence(layout_launchers[0]);
         expect(reference.front().state != reference.back().state, "LDS sequence witness changes recurrent/convolution state");
+        for (std::size_t index = 0; index < layouts.size(); ++index) {
+            auto storage_config = layout_configs[index];
+            storage_config.recurrent_storage = strix::GdnRecurrentStorage::value_key;
+            auto request = gdn_request; request.gdn_recurrent_layout = layouts[index];
+            request.gdn_recurrent_storage = strix::GdnRecurrentStorage::value_key;
+            strix::kernels::KernelRegistry registry;
+            strix::register_hip_gdn_kernel_variant(model, request, storage_config, registry);
+            const auto variant = registry.variants().front();
+            auto arm = strix::make_hip_gdn_launcher(variant.id, &storage_config);
+            expect(variant.id == layout_ids[index] + ".state-vk-v1" &&
+                arm.implementation_identity != layout_launchers[index].implementation_identity,
+                "physical matrix layout versions selected organization without changing numerical identity");
+            for (unsigned repeat = 0; repeat < 2; ++repeat)
+                expect(sequence(arm, true) == reference,
+                    "value/key storage with each LDS choice preserves full logical state and full arena across causal rows");
+            const auto before = snapshot_layout();
+            bool rejected = false; std::string reason;
+            try { arm.preflight(context, arm.user_data); }
+            catch (const std::invalid_argument& error) { rejected = true; reason = error.what(); }
+            expect(rejected && reason == "GDN recurrent storage differs from session layout" && snapshot_layout() == before,
+                "storage admission rejects wrong session metadata before any mutation");
+            hipGraph_t rejected_graph = nullptr;
+            check(hipStreamBeginCapture(layout_stream, hipStreamCaptureModeThreadLocal), "begin storage rejection capture");
+            rejected = false; reason.clear();
+            { const strix::HipLaunchScope scope(layout_scope);
+              try { arm.function(context, arm.user_data); }
+              catch (const std::invalid_argument& error) { rejected = true; reason = error.what(); } }
+            check(hipStreamEndCapture(layout_stream, &rejected_graph), "end storage rejection capture");
+            std::size_t storage_nodes = 0;
+            check(hipGraphGetNodes(rejected_graph, nullptr, &storage_nodes), "count storage rejected capture nodes");
+            expect(rejected && reason == "GDN recurrent storage cannot be captured" && storage_nodes == 0 && snapshot_layout() == before,
+                "physical storage capture rejects at its gate with zero nodes and unchanged full owners");
+            check(hipGraphDestroy(rejected_graph), "destroy storage rejection graph");
+            rejected = false;
+            try { static_cast<void>(strix::make_hip_gdn_launcher(variant.id, &layout_configs[index])); }
+            catch (const std::invalid_argument&) { rejected = true; }
+            expect(rejected, "physical storage ID cannot bind a key/value launcher");
+            auto wrong_request = request; wrong_request.gdn_recurrent_storage = strix::GdnRecurrentStorage::key_value;
+            rejected = false; reason.clear();
+            try { strix::kernels::KernelRegistry unused;
+                strix::register_hip_gdn_kernel_variant(model, wrong_request, storage_config, unused); }
+            catch (const std::invalid_argument& error) { rejected = true; reason = error.what(); }
+            expect(rejected && reason == "GDN recurrent storage request/config mismatch",
+                "registry cannot silently discard selected physical storage");
+            std::array<strix::ExecutionDispatchContext, 2> rows{context, context};
+            // Baseline LDS reaches the independent storage gate in both R2 entries.
+            if (index == 0) for (unsigned mixed = 0; mixed < 2; ++mixed) {
+                rejected = false; reason.clear();
+                try { if (mixed) strix::gdn_known_window_r2_f32_gates_preflight(rows, storage_config);
+                    else strix::gdn_known_window_r2_preflight(rows, storage_config); }
+                catch (const std::invalid_argument& error) { rejected = true; reason = error.what(); }
+                expect(rejected && reason == "GDN known-window R2 requires key-value recurrent storage" && snapshot_layout() == before,
+                    "closed R2 helpers reject physical-layout candidates without touching owners");
+            }
+            auto graph_config = storage_config; graph_config.enable_device_graph_inputs = true;
+            rejected = false;
+            try { static_cast<void>(strix::make_hip_gdn_launcher(variant.id, &graph_config)); }
+            catch (const std::invalid_argument&) { rejected = true; }
+            expect(rejected, "storage candidate cannot acquire device-graph launcher");
+        }
         for (std::size_t index = 1; index < layouts.size(); ++index) {
             for (unsigned repeat = 0; repeat < 2U; ++repeat)
                 expect(sequence(layout_launchers[index]) == reference,
@@ -2305,7 +2398,11 @@ int main(int argc, char** argv) try {
         if (prefetch_enabled) {
             auto streaming_config = config; streaming_config.prefetch_q8_input_projections = false;
             streaming_config.wave8_q8_input_projections = false;
-            auto streaming_launcher = strix::make_hip_gdn_launcher("test.gdn.streaming", &streaming_config);
+            auto streaming_request = gdn_request;
+            streaming_request.wave8_q8_gdn_output = streaming_config.wave8_q8_output_projection;
+            strix::kernels::KernelRegistry streaming_variants;
+            strix::register_hip_gdn_kernel_variant(model, streaming_request, streaming_config, streaming_variants);
+            auto streaming_launcher = strix::make_hip_gdn_launcher(streaming_variants.variants().front().id, &streaming_config);
             check(hipMemcpy(reinterpret_cast<void*>(matrix_address.address), matrix_state.data(), matrix_address.bytes,
                 hipMemcpyHostToDevice), "restore streaming reference matrix");
             check(hipMemcpy(reinterpret_cast<void*>(conv_address.address), conv_state.data(), conv_address.bytes,
@@ -2346,16 +2443,50 @@ int main(int argc, char** argv) try {
         baseline_config.virtual_q8_input_projections = false;
         baseline_config.prefetch_q8_input_projections = false;
         baseline_config.wave8_q8_input_projections = false;
-        const auto baseline_launcher = strix::make_hip_gdn_launcher("test.gdn.edge.legacy", &baseline_config);
+        const auto edge_launcher = [&](strix::HipGdnLauncherConfig& selected) {
+            auto request = gdn_request;
+            request.wave8_q8_gdn_input = selected.wave8_q8_input_projections;
+            request.wave8_q8_gdn_output = selected.wave8_q8_output_projection;
+            request.gdn_recurrent_layout = selected.recurrent_layout;
+            request.gdn_recurrent_storage = selected.recurrent_storage;
+            strix::kernels::KernelRegistry registry;
+            strix::register_hip_gdn_kernel_variant(model, request, selected, registry);
+            return strix::make_hip_gdn_launcher(registry.variants().front().id, &selected);
+        };
+        const auto baseline_launcher = edge_launcher(baseline_config);
         auto p1_config = config; p1_config.wave8_q8_input_projections = false;
-        const auto p1_launcher = strix::make_hip_gdn_launcher("test.gdn.edge.prefetch1", &p1_config);
+        const auto p1_launcher = edge_launcher(p1_config);
+        auto storage_config = config; storage_config.recurrent_storage = strix::GdnRecurrentStorage::value_key;
+        const auto storage_launcher = edge_launcher(storage_config);
         struct EdgeSnapshot {
             std::vector<std::byte> arena_bytes;
             std::vector<float> matrix_values;
             std::vector<std::uint16_t> convolution_values;
         };
-        const auto run_edge = [&](const strix::ExecutionLauncher& arm) {
-            check(hipMemcpy(reinterpret_cast<void*>(matrix_address.address), matrix_state.data(), matrix_address.bytes,
+        const auto run_edge = [&](const strix::ExecutionLauncher& arm, bool value_key = false) {
+            auto storage_request = state_request;
+            storage_request.recurrent_storage = value_key ? strix::GdnRecurrentStorage::value_key : strix::GdnRecurrentStorage::key_value;
+            const auto selected_layout = strix::build_serial_session_state_layout(model, storage_request);
+            auto selected_memory = state_memory; selected_memory.layout_identity = selected_layout.layout_identity;
+            resources.session_state_layout = &selected_layout; resources.session_state_memory = &selected_memory;
+            context.session_state_layout = &selected_layout; context.session_state_memory = &selected_memory;
+            auto seed_matrix = matrix_state;
+            const auto transpose = [&](std::vector<float>& values, bool forward) {
+                auto source = std::make_shared<std::vector<std::uint32_t>>(values.size());
+                auto destination = std::make_shared<std::vector<std::uint32_t>>(values.size());
+                std::memcpy(source->data(), values.data(), matrix_address.bytes);
+                const auto view = [](const auto& owner) {
+                    return strix::GdnRecurrentHostView{std::span<std::uint32_t>(*owner), owner,
+                        reinterpret_cast<std::uintptr_t>(owner->data()), owner->size() * sizeof(std::uint32_t), 1};
+                };
+                strix::convert_gdn_recurrent_host_storage(view(source),
+                    forward ? strix::GdnRecurrentStorage::key_value : strix::GdnRecurrentStorage::value_key,
+                    view(destination), forward ? strix::GdnRecurrentStorage::value_key : strix::GdnRecurrentStorage::key_value,
+                    model.gdn_value_heads, model.gdn_key_head_dim, model.gdn_value_head_dim, [] {});
+                std::memcpy(values.data(), destination->data(), matrix_address.bytes);
+            };
+            if (value_key) transpose(seed_matrix, true);
+            check(hipMemcpy(reinterpret_cast<void*>(matrix_address.address), seed_matrix.data(), matrix_address.bytes,
                 hipMemcpyHostToDevice), "restore edge recurrent state");
             check(hipMemcpy(reinterpret_cast<void*>(conv_address.address), conv_state.data(), conv_address.bytes,
                 hipMemcpyHostToDevice), "restore edge convolution state");
@@ -2369,6 +2500,9 @@ int main(int argc, char** argv) try {
                 hipMemcpyDeviceToHost), "read complete edge matrix");
             check(hipMemcpy(result.convolution_values.data(), reinterpret_cast<void*>(conv_address.address), conv_address.bytes,
                 hipMemcpyDeviceToHost), "read complete edge convolution");
+            if (value_key) transpose(result.matrix_values, false);
+            resources.session_state_layout = &state_layout; resources.session_state_memory = &state_memory;
+            context.session_state_layout = &state_layout; context.session_state_memory = &state_memory;
             return result;
         };
         const auto same = [&](const EdgeSnapshot& a, const EdgeSnapshot& b) {
@@ -2420,6 +2554,8 @@ int main(int argc, char** argv) try {
                 const auto p8 = run_edge(launcher);
                 expect(same(original, p1) && same(original, p8),
                     "production edge payloads preserve all arena, matrix and convolution bits in P1/P8");
+                expect(same(p8, run_edge(storage_launcher, true)),
+                    "paired wave8 and physical V/K state preserve logical matrix, convolution and all arena edge bits");
             }
         }
         hidden_values = saved_hidden;
@@ -2430,7 +2566,10 @@ int main(int argc, char** argv) try {
     }
     if(wave8_output_enabled) {
         auto baseline_config=config;baseline_config.wave8_q8_output_projection=false;
-        const auto baseline_launcher=strix::make_hip_gdn_launcher("test.gdn.output.virtual",&baseline_config);
+        auto baseline_request = gdn_request; baseline_request.wave8_q8_gdn_input = baseline_config.wave8_q8_input_projections;
+        strix::kernels::KernelRegistry baseline_variants;
+        strix::register_hip_gdn_kernel_variant(model, baseline_request, baseline_config, baseline_variants);
+        const auto baseline_launcher=strix::make_hip_gdn_launcher(baseline_variants.variants().front().id,&baseline_config);
         const auto saved_packed_output=packed_output;
         const auto observe_output_arm=[&](const strix::ExecutionLauncher& arm) {
             check(hipMemcpy(reinterpret_cast<void*>(matrix_address.address),matrix_state.data(),matrix_address.bytes,hipMemcpyHostToDevice),"restore output edge matrix");

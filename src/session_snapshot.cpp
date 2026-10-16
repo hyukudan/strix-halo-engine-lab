@@ -100,6 +100,10 @@ std::uint64_t build_identity(
             hash,
             range.provisional ? 1ULL : 0ULL);
     }
+    if (plan.recurrent_storage != GdnRecurrentStorage::key_value) {
+        hash_u64(hash, 0x47444e53544f5231ULL);
+        hash_u64(hash, static_cast<std::uint32_t>(plan.recurrent_storage));
+    }
     return hash;
 }
 
@@ -118,6 +122,7 @@ build_serial_session_snapshot_plan(
         throw std::invalid_argument(
             "snapshot requires a valid session-state layout");
     }
+    validate_serial_session_state_layout_identity(model, layout);
     if (request.compiled_execution_identity == 0) {
         throw std::invalid_argument(
             "snapshot requires compiled execution identity");
@@ -137,6 +142,7 @@ build_serial_session_snapshot_plan(
     }
 
     SerialSessionSnapshotPlan plan;
+    plan.recurrent_storage = layout.recurrent_storage;
     plan.compiled_execution_identity =
         request.compiled_execution_identity;
     plan.runtime_compatibility_identity =

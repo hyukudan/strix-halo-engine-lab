@@ -112,6 +112,8 @@ void success(const std::filesystem::path& base,unsigned index) {
     require(std::filesystem::is_directory(output) && !std::filesystem::exists(f.root/"finished.partial"),
             "final state publication was not a whole directory move");
     const auto manifest=text(output/"manifest.json");
+    require(manifest.find("\"recurrent_storage\":\"head-key-value-v1\"")!=std::string::npos,
+            "export omitted the physical recurrent matrix storage layout");
     require(manifest.find("\"consumed_input_tokens\":[1,2,3,4]")!=std::string::npos &&
             manifest.find("\"generated_tokens\":[3,4,5]")!=std::string::npos &&
             manifest.find("\"unconsumed_emitted_token\":5")!=std::string::npos &&

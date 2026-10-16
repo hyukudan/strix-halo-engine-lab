@@ -132,7 +132,7 @@ void capture_serial_session_snapshot(
         state_layout,
         state_memory);
 
-    if (snapshot.state_layout_identity !=
+    if (snapshot.recurrent_storage != state_layout.recurrent_storage || snapshot.state_layout_identity !=
         state_layout.layout_identity) {
         throw std::invalid_argument(
             "snapshot plan state layout does not match source state");
@@ -223,7 +223,7 @@ void restore_serial_session_snapshot(
         throw std::invalid_argument(
             "restore requires initialized serial session identities");
     }
-    if (restore.runtime_compatibility_identity !=
+    if (restore.recurrent_storage != state_layout.recurrent_storage || restore.runtime_compatibility_identity !=
             session.runtime_compatibility_identity ||
         restore.state_layout_identity !=
             session.state_layout_identity ||

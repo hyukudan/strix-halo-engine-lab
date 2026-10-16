@@ -95,6 +95,7 @@ void drain(const std::function<void()>& operation) noexcept {
     try { operation(); } catch (...) { std::terminate(); }
 }
 std::array<const SessionStateAllocation*, 7> allocations(const SerialSessionStateLayout& layout) {
+    validate_gdn_recurrent_storage(layout.recurrent_storage);
     require(layout.layout_identity && layout.context_tokens && layout.allocations.size() == names.size(),
             "final state export requires seven actual components");
     std::array<const SessionStateAllocation*, 7> out{};
@@ -209,6 +210,8 @@ void export_final_generation_state(const std::filesystem::path& path, FinalGener
                  << ",\"execution_identity\":" << session.execution_identity << ",\"runtime_compatibility_identity\":" << session.runtime_compatibility_identity
                  << ",\"runtime_binding_identity\":" << metadata.runtime_binding_identity << ",\"kernel_plan_identity\":" << metadata.kernel_plan_identity
                  << ",\"launch_plan_identity\":" << metadata.launch_plan_identity << ",\"state_layout_identity\":" << layout.layout_identity
+                 << ",\"recurrent_storage\":" << quote(layout.recurrent_storage == GdnRecurrentStorage::key_value
+                     ? "head-key-value-v1" : "head-value-key-v1")
                  << ",\"snapshot_plan_identity\":" << snapshot.plan_identity
                  << ",\"state_binding\":{\"device_base\":" << binding.device_base << ",\"device_bytes\":" << binding.device_bytes
                  << ",\"device_generation\":" << binding.device_allocation_generation << ",\"host_base\":" << binding.host_base

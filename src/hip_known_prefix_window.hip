@@ -28,6 +28,7 @@ bool same_layout(const SerialSessionStateLayout& a, const SerialSessionStateLayo
     if (a.layout_identity != b.layout_identity || a.context_tokens != b.context_tokens ||
         a.device_alignment != b.device_alignment || a.host_alignment != b.host_alignment ||
         a.device_total_bytes != b.device_total_bytes || a.host_total_bytes != b.host_total_bytes ||
+        a.recurrent_storage != b.recurrent_storage ||
         a.allocations.size() != b.allocations.size()) return false;
     for (std::size_t i = 0; i < a.allocations.size(); ++i) {
         const auto& x = a.allocations[i]; const auto& y = b.allocations[i];
@@ -102,6 +103,9 @@ struct HipKnownPrefixWindow::Impl {
           scratch(memory), scope(native_scope) {
         if (!actual_owner) throw std::invalid_argument("known-window native owner requires retained actual owners");
         if (const auto error = model.validate(); !error.empty()) throw std::invalid_argument(error);
+        if (config.gdn_recurrent_storage != GdnRecurrentStorage::key_value ||
+            (resources.session_state_layout && resources.session_state_layout->recurrent_storage != GdnRecurrentStorage::key_value))
+            throw std::invalid_argument("known-window native owner requires key-value recurrent storage");
         if (serial.device_graph_inputs || config.enable_device_graph_inputs || serial.logical_rows != 1U ||
             serial.request_concurrency != 1U || config.activation != HipActivationStorage::bf16)
             throw std::invalid_argument("known-window native owner supports eager BF16 C1 plans only");

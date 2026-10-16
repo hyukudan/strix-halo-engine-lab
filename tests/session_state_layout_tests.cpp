@@ -3,6 +3,10 @@
 #include "strix/memory_plan.hpp"
 
 #include <iostream>
+#include <array>
+#include <algorithm>
+#include <limits>
+#include <memory>
 #include <stdexcept>
 
 namespace {
@@ -142,6 +146,66 @@ int main() {
     }
     expect(context_rejected,
            "session state layout rejects context beyond model maximum");
+
+    auto vk_request = request;
+    vk_request.recurrent_storage = strix::GdnRecurrentStorage::value_key;
+    const auto vk = strix::build_serial_session_state_layout(model, vk_request);
+    expect(vk.layout_identity != layout.layout_identity && vk.device_total_bytes == layout.device_total_bytes &&
+        vk.host_total_bytes == layout.host_total_bytes && vk.allocations.size() == layout.allocations.size(),
+        "physical recurrent layout changes identity without changing any pool capacity");
+    auto explicit_baseline = request; explicit_baseline.recurrent_storage = strix::GdnRecurrentStorage::key_value;
+    expect(strix::build_serial_session_state_layout(model, explicit_baseline).layout_identity == layout.layout_identity,
+        "explicit incumbent storage retains the default layout identity");
+    auto forged = layout; forged.recurrent_storage = strix::GdnRecurrentStorage::value_key;
+    bool rejected = false;
+    try { strix::validate_serial_session_state_layout_identity(model, forged); }
+    catch (const std::invalid_argument&) { rejected = true; }
+    expect(rejected, "forged same-ID physical layout metadata is rejected");
+    auto invalid_storage_request = request;
+    invalid_storage_request.recurrent_storage = static_cast<strix::GdnRecurrentStorage>(99U);
+    rejected = false;
+    try { static_cast<void>(strix::build_serial_session_state_layout(model, invalid_storage_request)); }
+    catch (const std::invalid_argument&) { rejected = true; }
+    expect(rejected, "layout builder rejects unsupported physical storage enum");
+
+    // Non-square dimensions and two heads distinguish h/k/v addressing. All
+    // copies are integer bits, including NaN payloads and signed zero.
+    auto source = std::make_shared<std::array<std::uint32_t, 12>>(
+        std::array<std::uint32_t, 12>{0x7fc12345U,0x80000000U,0U,0x7f800000U,0xff800000U,1U,
+            0x3f800000U,0xbf800000U,0x00400000U,0xffc76543U,0x00800000U,0x7f7fffffU});
+    auto destination = std::make_shared<std::array<std::uint32_t, 12>>();
+    auto restored = std::make_shared<std::array<std::uint32_t, 12>>();
+    const auto view = [](const auto& owner) {
+        return strix::GdnRecurrentHostView{std::span<std::uint32_t>(*owner), owner,
+            reinterpret_cast<std::uintptr_t>(owner->data()), sizeof(*owner), 7};
+    };
+    unsigned fences = 0;
+    strix::convert_gdn_recurrent_host_storage(view(source), strix::GdnRecurrentStorage::key_value,
+        view(destination), strix::GdnRecurrentStorage::value_key, 2, 2, 3, [&] { ++fences; });
+    expect((*destination)[0] == (*source)[0] && (*destination)[1] == (*source)[3] &&
+        (*destination)[6] == (*source)[6] && (*destination)[9] == (*source)[10],
+        "once conversion maps non-square logical coordinates across separate heads");
+    strix::convert_gdn_recurrent_host_storage(view(destination), strix::GdnRecurrentStorage::value_key,
+        view(restored), strix::GdnRecurrentStorage::key_value, 2, 2, 3, [&] { ++fences; });
+    expect(*restored == *source && fences == 2, "cross-layout roundtrip preserves every FP32 bit and fences each conversion");
+    for (unsigned fault = 0; fault < 8; ++fault) {
+        auto bad_source = view(source); auto bad_destination = view(destination);
+        auto kind = strix::GdnRecurrentStorage::value_key;
+        if (fault == 0) bad_source.owner.reset();
+        if (fault == 1) bad_source.allocation_generation = 0;
+        if (fault == 2) bad_source.owner_bytes -= 1;
+        if (fault == 3) bad_destination.words = bad_destination.words.first(11);
+        if (fault == 4) bad_destination = bad_source;
+        if (fault == 5) kind = static_cast<strix::GdnRecurrentStorage>(99);
+        if (fault == 6) bad_source.owner_base = std::numeric_limits<std::uintptr_t>::max() - 1;
+        const auto before = *destination; const auto prior_fences = fences;
+        rejected = false;
+        try { strix::convert_gdn_recurrent_host_storage(bad_source, strix::GdnRecurrentStorage::key_value,
+            bad_destination, kind, 2, 2, 3, [&] { ++fences; if (fault == 7) throw std::runtime_error("fence failure"); }); }
+        catch (const std::exception&) { rejected = true; }
+        expect(rejected && *destination == before && fences == prior_fences + (fault == 7 ? 1U : 0U),
+            "conversion rejects malformed owner/extent/layout/alias or failed fence before modifying payload");
+    }
 
     if (failures == 0) {
         std::cout << "session state layout tests passed\n";

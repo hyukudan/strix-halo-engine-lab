@@ -355,6 +355,27 @@ int main() {
 
     session.health =
         strix::SerialSessionHealth::ready;
+    {
+        const auto before_device = device_state, before_host = host_state;
+        const auto before_snapshot_device = snapshot_device, before_snapshot_host = snapshot_host;
+        auto forged_snapshot = snapshot;
+        forged_snapshot.recurrent_storage = strix::GdnRecurrentStorage::value_key;
+        MemcpyBackend untouched;
+        bool rejected = false;
+        try { strix::capture_serial_session_snapshot(forged_snapshot, layout, state_memory, snapshot_memory, untouched); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        expect(rejected && untouched.calls == 0 && device_state == before_device && host_state == before_host &&
+            snapshot_device == before_snapshot_device && snapshot_host == before_snapshot_host,
+            "capture rejects same-ID forged physical storage before copying any owner bytes");
+        auto forged_restore = restore;
+        forged_restore.recurrent_storage = strix::GdnRecurrentStorage::value_key;
+        rejected = false;
+        try { strix::restore_serial_session_snapshot(session, forged_restore, layout, state_memory, snapshot_memory, untouched); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        expect(rejected && untouched.calls == 0 && device_state == before_device && host_state == before_host &&
+            session.health == strix::SerialSessionHealth::ready && session.next_position == restore.next_position,
+            "restore rejects forged physical storage before payload or session publication");
+    }
     MemcpyBackend failing;
     failing.fail_after = 1;
     bool failure_seen = false;

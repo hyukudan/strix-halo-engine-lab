@@ -205,6 +205,9 @@ void validate_config(
         throw std::invalid_argument("GDN recurrent LDS layout is invalid");
     if (config.recurrent_layout != HipGdnRecurrentLayout::baseline && config.enable_device_graph_inputs)
         throw std::invalid_argument("GDN recurrent LDS layouts support eager execution only");
+    validate_gdn_recurrent_storage(config.recurrent_storage);
+    if (config.recurrent_storage != GdnRecurrentStorage::key_value && config.enable_device_graph_inputs)
+        throw std::invalid_argument("GDN recurrent storage supports eager execution only");
     if (config.prefetch_q8_input_projections && !config.virtual_q8_input_projections)
         throw std::invalid_argument("HIP GDN prefetch Q8 input requires virtual Q8 input");
     if (config.wave8_q8_input_projections) {
@@ -1633,6 +1636,208 @@ void recurrent_layout_diagnostic_kernel(
     }
 }
 
+template <gdn_recurrent_layout_diagnostic::Layout Layout,
+    GdnRecurrentStorage Storage = GdnRecurrentStorage::key_value>
+__global__ __launch_bounds__(kRecurrentThreads)
+void recurrent_storage_kernel(
+    const float* qkv,
+    const float* beta,
+    const float* gate,
+    float* state,
+    float* core,
+    std::uint32_t key_heads,
+    std::uint32_t value_heads,
+    std::uint32_t head_dim, std::uint32_t* graph_status) {
+    __shared__ unsigned graph_reject;
+    if (graph_status != nullptr) {
+        if (threadIdx.x == 0) graph_reject = atomicAdd(graph_status, 0U) != 0;
+        __syncthreads();
+        if (graph_reject) return;
+    }
+    const auto tile_count =
+        head_dim /
+        kValueTile;
+    const auto block =
+        static_cast<std::uint32_t>(
+            blockIdx.x);
+    const auto value_head =
+        block /
+        tile_count;
+    const auto tile =
+        block %
+        tile_count;
+    const auto lane =
+        static_cast<std::uint32_t>(
+            threadIdx.x);
+
+    if (value_head >= value_heads ||
+        lane >= head_dim) {
+        return;
+    }
+
+    const auto key_head =
+        value_head %
+        key_heads;
+    const auto value_base =
+        tile *
+        kValueTile;
+
+    const auto q_base =
+        static_cast<std::uint64_t>(
+            key_head) *
+        head_dim;
+    const auto k_base =
+        static_cast<std::uint64_t>(
+            key_heads) *
+            head_dim +
+        q_base;
+    const auto v_base =
+        static_cast<std::uint64_t>(
+            key_heads) *
+            head_dim *
+            2ULL +
+        static_cast<std::uint64_t>(
+            value_head) *
+            head_dim;
+
+    __shared__ float reduction[
+        kRecurrentThreads *
+        (Layout == gdn_recurrent_layout_diagnostic::Layout::stride33 ? 33U : kValueTile)];
+    // The first reduction's broadcast must remain immutable while every wave
+    // reads it. Reusing reduction[column] for the next tree lets lane zero
+    // overwrite a delta before another wave has consumed it.
+    __shared__ float deltas[kValueTile];
+
+    float retained[kValueTile];
+#pragma unroll
+    for (std::uint32_t column = 0;
+         column < kValueTile;
+         ++column) {
+        const auto value_index =
+            value_base +
+            column;
+        const auto state_index =
+            (static_cast<std::uint64_t>(
+                 value_head) *
+                 head_dim +
+             (Storage == GdnRecurrentStorage::value_key ? value_index : lane)) *
+                head_dim +
+            (Storage == GdnRecurrentStorage::value_key ? lane : value_index);
+        retained[column] =
+            state[state_index] *
+            expf(
+                gate[value_head]);
+        reduction[recurrent_layout_index<Layout>(lane, column)] =
+            retained[column] *
+            qkv[
+                k_base +
+                lane];
+    }
+    __syncthreads();
+
+    for (std::uint32_t stride =
+             kRecurrentThreads / 2U;
+         stride > 0;
+         stride >>= 1U) {
+        if (lane < stride) {
+#pragma unroll
+            for (std::uint32_t column = 0;
+                 column < kValueTile;
+                 ++column) {
+                reduction[recurrent_layout_index<Layout>(lane, column)] +=
+                    reduction[recurrent_layout_index<Layout>(lane + stride, column)];
+            }
+        }
+        __syncthreads();
+    }
+
+    if (lane == 0) {
+#pragma unroll
+        for (std::uint32_t column = 0;
+             column < kValueTile;
+             ++column) {
+            const auto value_index =
+                value_base +
+                column;
+            deltas[column] =
+                (qkv[
+                     v_base +
+                     value_index] -
+                 reduction[recurrent_layout_index<Layout>(0U, column)]) *
+                beta[value_head];
+        }
+    }
+    __syncthreads();
+
+#pragma unroll
+    for (std::uint32_t column = 0;
+         column < kValueTile;
+         ++column) {
+        const auto delta =
+            deltas[column];
+        retained[column] +=
+            qkv[
+                k_base +
+                lane] *
+            delta;
+        reduction[recurrent_layout_index<Layout>(lane, column)] =
+            retained[column] *
+            qkv[
+                q_base +
+                lane];
+    }
+    __syncthreads();
+
+    for (std::uint32_t stride =
+             kRecurrentThreads / 2U;
+         stride > 0;
+         stride >>= 1U) {
+        if (lane < stride) {
+#pragma unroll
+            for (std::uint32_t column = 0;
+                 column < kValueTile;
+                 ++column) {
+                reduction[recurrent_layout_index<Layout>(lane, column)] +=
+                    reduction[recurrent_layout_index<Layout>(lane + stride, column)];
+            }
+        }
+        __syncthreads();
+    }
+
+    if (lane == 0) {
+#pragma unroll
+        for (std::uint32_t column = 0;
+             column < kValueTile;
+             ++column) {
+            core[
+                static_cast<std::uint64_t>(
+                    value_head) *
+                    head_dim +
+                value_base +
+                column] =
+                reduction[recurrent_layout_index<Layout>(0U, column)];
+        }
+    }
+
+#pragma unroll
+    for (std::uint32_t column = 0;
+         column < kValueTile;
+         ++column) {
+        const auto value_index =
+            value_base +
+            column;
+        const auto state_index =
+            (static_cast<std::uint64_t>(
+                 value_head) *
+                 head_dim +
+             (Storage == GdnRecurrentStorage::value_key ? value_index : lane)) *
+                head_dim +
+            (Storage == GdnRecurrentStorage::value_key ? lane : value_index);
+        state[state_index] =
+            retained[column];
+    }
+}
+
 __global__ void gated_rms_norm_kernel(
     float* core,
     const float* z,
@@ -2305,6 +2510,14 @@ PreparedGdnLaunch prepare_gdn_launch(
     const auto& config = *config_ptr;
     validate_config(config);
 
+    if (config.recurrent_storage != GdnRecurrentStorage::key_value) {
+        if (const auto* scope = current_hip_launch_context(); scope && scope->graph_capture)
+            throw std::invalid_argument("GDN recurrent storage supports eager execution only");
+        hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
+        check_hip(hipStreamIsCapturing(hip_execution_stream(), &capture), "query GDN recurrent storage capture");
+        if (capture != hipStreamCaptureStatusNone)
+            throw std::invalid_argument("GDN recurrent storage cannot be captured");
+    }
     if (config.recurrent_layout != HipGdnRecurrentLayout::baseline) {
         if (const auto* scope = current_hip_launch_context(); scope && scope->graph_capture)
             throw std::invalid_argument("GDN recurrent LDS layouts support eager execution only");
@@ -2498,6 +2711,11 @@ PreparedGdnLaunch prepare_gdn_launch(
             "HIP GDN persistent state bindings are invalid");
     }
 
+    const auto* storage_layout = context.resources && context.resources->session_state_layout
+        ? context.resources->session_state_layout : context.session_state_layout;
+    if (!storage_layout || storage_layout->recurrent_storage != config.recurrent_storage)
+        throw std::invalid_argument("GDN recurrent storage differs from session layout");
+
     if (const auto* graph = current_hip_launch_context(); graph && graph->graph_capture) {
         if (!config.enable_device_graph_inputs) {
             throw std::invalid_argument("GDN device graph inputs are not explicitly enabled");
@@ -2535,6 +2753,7 @@ void preflight_gdn(const ExecutionDispatchContext& context, void* user_data) {
     static_cast<void>(prepare_gdn_launch(context, static_cast<const HipGdnLauncherConfig*>(user_data)));
 }
 
+template <GdnRecurrentStorage Storage = GdnRecurrentStorage::key_value>
 void emit_gdn_recurrent_layout(const PreparedGdnLaunch& row, HipGdnRecurrentLayout layout,
     const GdnEmitTarget& target) {
     const auto grid = dim3(row.value_heads * (row.head_dim / kValueTile));
@@ -2546,14 +2765,27 @@ void emit_gdn_recurrent_layout(const PreparedGdnLaunch& row, HipGdnRecurrentLayo
         reinterpret_cast<float*>(row.matrix_state.address), row.workspace.core, \
         row.key_heads, row.value_heads, row.head_dim, target.graph_status)
     switch (layout) {
+    case HipGdnRecurrentLayout::baseline:
     case HipGdnRecurrentLayout::stride32:
-        STRIX_GDN_RECURRENT_LAYOUT(HIP_KERNEL_NAME(recurrent_layout_diagnostic_kernel<gdn_recurrent_layout_diagnostic::Layout::stride32>));
+        if constexpr (Storage == GdnRecurrentStorage::key_value) {
+            STRIX_GDN_RECURRENT_LAYOUT(HIP_KERNEL_NAME(recurrent_layout_diagnostic_kernel<gdn_recurrent_layout_diagnostic::Layout::stride32>));
+        } else {
+            STRIX_GDN_RECURRENT_LAYOUT(HIP_KERNEL_NAME(recurrent_storage_kernel<gdn_recurrent_layout_diagnostic::Layout::stride32, Storage>));
+        }
         break;
     case HipGdnRecurrentLayout::stride33:
-        STRIX_GDN_RECURRENT_LAYOUT(HIP_KERNEL_NAME(recurrent_layout_diagnostic_kernel<gdn_recurrent_layout_diagnostic::Layout::stride33>));
+        if constexpr (Storage == GdnRecurrentStorage::key_value) {
+            STRIX_GDN_RECURRENT_LAYOUT(HIP_KERNEL_NAME(recurrent_layout_diagnostic_kernel<gdn_recurrent_layout_diagnostic::Layout::stride33>));
+        } else {
+            STRIX_GDN_RECURRENT_LAYOUT(HIP_KERNEL_NAME(recurrent_storage_kernel<gdn_recurrent_layout_diagnostic::Layout::stride33, Storage>));
+        }
         break;
     case HipGdnRecurrentLayout::transposed:
-        STRIX_GDN_RECURRENT_LAYOUT(HIP_KERNEL_NAME(recurrent_layout_diagnostic_kernel<gdn_recurrent_layout_diagnostic::Layout::transposed>));
+        if constexpr (Storage == GdnRecurrentStorage::key_value) {
+            STRIX_GDN_RECURRENT_LAYOUT(HIP_KERNEL_NAME(recurrent_layout_diagnostic_kernel<gdn_recurrent_layout_diagnostic::Layout::transposed>));
+        } else {
+            STRIX_GDN_RECURRENT_LAYOUT(HIP_KERNEL_NAME(recurrent_storage_kernel<gdn_recurrent_layout_diagnostic::Layout::transposed, Storage>));
+        }
         break;
     default:
         throw std::invalid_argument("GDN recurrent LDS candidate is invalid");
@@ -2709,7 +2941,8 @@ void emit_gdn_sequence(const PreparedGdnLaunch& prepared, const HipGdnLauncherCo
     const auto tiles =
         head_dim /
         kValueTile;
-    if (config.recurrent_layout == HipGdnRecurrentLayout::baseline) {
+    if (config.recurrent_layout == HipGdnRecurrentLayout::baseline &&
+        config.recurrent_storage == GdnRecurrentStorage::key_value) {
         record_gdn_kernel(target.ledger, reinterpret_cast<const void*>(recurrent_step_kernel),
             dim3(value_heads * tiles), dim3(kRecurrentThreads));
         hipLaunchKernelGGL(
@@ -2731,7 +2964,10 @@ void emit_gdn_sequence(const PreparedGdnLaunch& prepared, const HipGdnLauncherCo
             hipGetLastError(),
             "HIP GDN recurrent update launch");
     } else {
-        emit_gdn_recurrent_layout(prepared, config.recurrent_layout, target);
+        if (config.recurrent_storage == GdnRecurrentStorage::value_key)
+            emit_gdn_recurrent_layout<GdnRecurrentStorage::value_key>(prepared, config.recurrent_layout, target);
+        else
+            emit_gdn_recurrent_layout(prepared, config.recurrent_layout, target);
     }
     if (target.graph_status != nullptr) {
         hipLaunchKernelGGL(validate_gdn_graph_values, dim3(32), dim3(kProjectionThreads), 0,
@@ -2819,6 +3055,7 @@ std::string kernel_id(
         std::to_string(
             request.request_concurrency) + (request.device_graph_inputs ? ".device" : ".scalar") +
         std::string(gdn_recurrent_layout_marker(config.recurrent_layout)) +
+        std::string(gdn_recurrent_storage_marker(config.recurrent_storage)) +
         (config.wave8_q8_input_projections ? std::string(q8_projection_organization::gdn_wave8_marker) : "") +
         (config.wave8_q8_output_projection ? std::string(q8_projection_organization::gdn_output_wave8_marker) : "") +
         (config.prefetch_q8_input_projections ? ".prefetch8" : "") +
@@ -2880,6 +3117,10 @@ std::uint64_t implementation_identity(
     if (config.recurrent_layout != HipGdnRecurrentLayout::baseline) {
         hash_u64(hash, 0x47444e4c44533031ULL); // GDN LDS organization version 1.
         hash_u64(hash, static_cast<std::uint32_t>(config.recurrent_layout));
+    }
+    if (config.recurrent_storage != GdnRecurrentStorage::key_value) {
+        hash_u64(hash, 0x47444e53544f5231ULL);
+        hash_u64(hash, static_cast<std::uint32_t>(config.recurrent_storage));
     }
     return hash;
 }
@@ -3039,6 +3280,8 @@ std::array<GdnKnownWindowRow, 2> prepare_gdn_known_window_rows(
     validate_config(config);
     if (config.recurrent_layout != HipGdnRecurrentLayout::baseline)
         throw std::invalid_argument("GDN known-window R2 requires the baseline recurrent LDS layout");
+    if (config.recurrent_storage != GdnRecurrentStorage::key_value)
+        throw std::invalid_argument("GDN known-window R2 requires key-value recurrent storage");
     const auto& model = config.model;
     if (!config.virtual_q8_input_projections || !config.prefetch_q8_input_projections ||
         !config.wave8_q8_input_projections || !config.virtual_q8_output_projection ||
@@ -3310,6 +3553,11 @@ void register_hip_gdn_kernel_variant(
     validate_config(config);
     if (request.gdn_recurrent_layout != config.recurrent_layout)
         throw std::invalid_argument("GDN recurrent LDS request/config mismatch");
+    if (request.gdn_recurrent_storage != config.recurrent_storage)
+        throw std::invalid_argument("GDN recurrent storage request/config mismatch");
+    if (config.recurrent_storage != GdnRecurrentStorage::key_value &&
+        (request.device_graph_inputs || request.require_graph_safe))
+        throw std::invalid_argument("GDN recurrent storage registers eager variants only");
     if (config.recurrent_layout != HipGdnRecurrentLayout::baseline &&
         (request.device_graph_inputs || request.require_graph_safe))
         throw std::invalid_argument("GDN recurrent LDS layouts register eager variants only");
@@ -3430,6 +3678,8 @@ void register_hip_gdn_kernel_variant(
     if(config.wave8_q8_output_projection) variant.compiler_identity += ":wave8-q8-output-v1";
     if(config.recurrent_layout != HipGdnRecurrentLayout::baseline)
         variant.compiler_identity += ":gdn-recurrent" + std::string(gdn_recurrent_layout_marker(config.recurrent_layout));
+    if(config.recurrent_storage != GdnRecurrentStorage::key_value)
+        variant.compiler_identity += ":gdn-storage" + std::string(gdn_recurrent_storage_marker(config.recurrent_storage));
     variant.measured_seconds = 0.0;
 
     registry.add(
@@ -3573,7 +3823,7 @@ bool same_island_config(const HipGdnLauncherConfig& a, const HipGdnLauncherConfi
         a.wave8_q8_input_projections == b.wave8_q8_input_projections &&
         a.virtual_q8_output_projection == b.virtual_q8_output_projection &&
         a.wave8_q8_output_projection == b.wave8_q8_output_projection &&
-        a.recurrent_layout == b.recurrent_layout;
+        a.recurrent_layout == b.recurrent_layout && a.recurrent_storage == b.recurrent_storage;
 }
 
 std::uint64_t island_organization_identity(const HipGdnLauncherConfig& config) noexcept {
@@ -3744,6 +3994,8 @@ struct HipGdnIslands::Impl {
         validate_config(config);
         if (config.recurrent_layout != HipGdnRecurrentLayout::baseline)
             throw std::invalid_argument("GDN islands require the baseline recurrent LDS layout");
+        if (config.recurrent_storage != GdnRecurrentStorage::key_value)
+            throw std::invalid_argument("GDN islands require key-value recurrent storage");
         const bool legacy = !config.virtual_q8_input_projections && !config.prefetch_q8_input_projections &&
             !config.virtual_q8_output_projection;
         const bool profile = config.virtual_q8_input_projections && config.prefetch_q8_input_projections &&
@@ -3971,6 +4223,11 @@ make_hip_gdn_launcher(
             "HIP GDN launcher requires id and config");
     }
     validate_config(*config);
+    if (config->recurrent_storage != GdnRecurrentStorage::key_value || kernel_id_value.find(".state-vk-v1") != std::string::npos) {
+        ExecutionBindingRequest request;
+        if (kernel_id_value != kernel_id(request, *config))
+            throw std::invalid_argument("GDN recurrent storage launcher requires its exact eager C1 kernel id");
+    }
     if (config->recurrent_layout != HipGdnRecurrentLayout::baseline || has_gdn_recurrent_layout_marker(kernel_id_value)) {
         ExecutionBindingRequest request;
         if (kernel_id_value != kernel_id(request, *config))
@@ -4025,6 +4282,13 @@ register_for_compiled_execution(
         }
 
         std::string_view selected_id=*binding.kernel_id;
+        if (config_.recurrent_storage != GdnRecurrentStorage::key_value || selected_id.find(".state-vk-v1") != std::string_view::npos) {
+            ExecutionBindingRequest request;
+            request.logical_rows = compiled.logical_rows;
+            request.request_concurrency = compiled.request_concurrency;
+            if (*binding.kernel_id != kernel_id(request, config_))
+                throw std::invalid_argument("HIP GDN selected kernel disagrees with recurrent storage configuration");
+        }
         if (config_.recurrent_layout != HipGdnRecurrentLayout::baseline || has_gdn_recurrent_layout_marker(selected_id)) {
             ExecutionBindingRequest request;
             request.logical_rows = compiled.logical_rows;

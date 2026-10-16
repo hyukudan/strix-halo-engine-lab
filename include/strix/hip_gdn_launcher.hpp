@@ -2,6 +2,7 @@
 
 #include "strix/execution_binding.hpp"
 #include "strix/gdn_recurrent_layout.hpp"
+#include "strix/gdn_recurrent_storage.hpp"
 #include "strix/hip_runtime_launchers.hpp"
 #include "strix/launch_dispatch.hpp"
 #include "strix/model_contract.hpp"
@@ -29,6 +30,8 @@ struct HipGdnLauncherConfig {
     bool wave8_q8_output_projection = false;
     // Eager experimental LDS organization; persistent state layout is unchanged.
     HipGdnRecurrentLayout recurrent_layout = HipGdnRecurrentLayout::baseline;
+    // Chosen with the session allocation/import; never converted per token.
+    GdnRecurrentStorage recurrent_storage = GdnRecurrentStorage::key_value;
 };
 
 // Closed eager R2 window helper. Each context remains an R1 row view. Both

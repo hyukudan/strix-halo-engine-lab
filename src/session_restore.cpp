@@ -24,7 +24,7 @@ void hash_u64(
 bool same_snapshot_structure(
     const SerialSessionSnapshotPlan& left,
     const SerialSessionSnapshotPlan& right) {
-    if (left.plan_identity !=
+    if (left.recurrent_storage != right.recurrent_storage || left.plan_identity !=
             right.plan_identity ||
         left.device_bytes !=
             right.device_bytes ||
@@ -104,6 +104,10 @@ std::uint64_t build_identity(
             range.destination_offset);
         hash_u64(hash, range.bytes);
     }
+    if (plan.recurrent_storage != GdnRecurrentStorage::key_value) {
+        hash_u64(hash, 0x47444e53544f5231ULL);
+        hash_u64(hash, static_cast<std::uint32_t>(plan.recurrent_storage));
+    }
     return hash;
 }
 
@@ -126,6 +130,8 @@ build_serial_session_restore_plan(
         throw std::invalid_argument(
             "snapshot state-layout identity mismatch");
     }
+    if (snapshot.recurrent_storage != destination_layout.recurrent_storage)
+        throw std::invalid_argument("snapshot recurrent storage differs from destination layout");
 
     SerialSessionSnapshotRequest expected_request;
     expected_request.compiled_execution_identity =
@@ -155,6 +161,7 @@ build_serial_session_restore_plan(
     }
 
     SerialSessionRestorePlan restore;
+    restore.recurrent_storage = destination_layout.recurrent_storage;
     restore.compiled_execution_identity =
         snapshot.compiled_execution_identity;
     restore.runtime_compatibility_identity =

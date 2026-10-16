@@ -154,6 +154,19 @@ int main() {
     expect(capacity_rejected,
            "snapshot rejects prefix beyond allocated context");
 
+    auto vk_request = layout_request; vk_request.recurrent_storage = strix::GdnRecurrentStorage::value_key;
+    const auto vk_layout = strix::build_serial_session_state_layout(model, vk_request);
+    const auto vk_snapshot = strix::build_serial_session_snapshot_plan(model, vk_layout, request);
+    expect(vk_snapshot.recurrent_storage == strix::GdnRecurrentStorage::value_key &&
+        vk_snapshot.plan_identity != snapshot.plan_identity && vk_snapshot.device_bytes == snapshot.device_bytes &&
+        vk_snapshot.host_bytes == snapshot.host_bytes,
+        "snapshot versions physical matrix storage while retaining exact payload extents");
+    auto forged_layout = layout; forged_layout.recurrent_storage = strix::GdnRecurrentStorage::value_key;
+    bool storage_rejected = false;
+    try { static_cast<void>(strix::build_serial_session_snapshot_plan(model, forged_layout, request)); }
+    catch (const std::invalid_argument&) { storage_rejected = true; }
+    expect(storage_rejected, "snapshot rejects forged storage enum with an incumbent layout identity");
+
     if (failures == 0) {
         std::cout << "session snapshot tests passed\n";
     }

@@ -19,6 +19,7 @@ bool same_layout(const SerialSessionStateLayout& left, const SerialSessionStateL
     if (left.context_tokens != right.context_tokens || left.device_alignment != right.device_alignment ||
         left.host_alignment != right.host_alignment || left.device_total_bytes != right.device_total_bytes ||
         left.host_total_bytes != right.host_total_bytes || left.layout_identity != right.layout_identity ||
+        left.recurrent_storage != right.recurrent_storage ||
         left.allocations.size() != right.allocations.size()) return false;
     for (std::size_t index = 0; index < left.allocations.size(); ++index) {
         const auto& a = left.allocations[index]; const auto& b = right.allocations[index];
