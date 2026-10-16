@@ -96,6 +96,15 @@ SerialGreedyRequestResult execute_serial_greedy_continuation(
         return result;
     }
 
+    // Reserve before the first continuation input can mutate model state. At
+    // most one final token is emitted without being consumed at capacity.
+    const auto remaining = request.context_capacity - request.start_position;
+    const auto emissions = remaining == std::numeric_limits<std::uint64_t>::max()
+        ? request.max_new_tokens : std::min(request.max_new_tokens, remaining + 1U);
+    if (emissions > result.generated_tokens.max_size())
+        throw std::length_error("greedy continuation response exceeds host vector capacity");
+    result.generated_tokens.reserve(static_cast<std::size_t>(emissions));
+
     std::uint64_t position =
         request.start_position;
     while (result.generated_tokens.size() <

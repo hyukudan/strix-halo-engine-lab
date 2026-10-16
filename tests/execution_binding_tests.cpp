@@ -113,6 +113,8 @@ int main() {
     {
         strix::ExecutionBindingRequest scoped;
         scoped.prefetch_q8_shared_expert = true;
+        for (std::uint32_t layer = 0; layer < model.hidden_layers; ++layer)
+            scoped.shared_expert_prefetch_layers.push_back(layer);
         const auto shape = strix::execution_shape_for(model, strix::SerialOp::shared_expert, scoped);
         auto ordinary = make_variant("shared.reference", strix::kernels::OperatorFamily::shared_expert, shape);
         ordinary.qualification = strix::kernels::QualificationStatus::target_qualified;
