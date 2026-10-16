@@ -708,6 +708,14 @@ public:
         strix::ExecutionTelemetryBinding bind(&owner_->counters, owner_->correlation(position));
         return backend_->execute_greedy(token, position, vocabulary);
     }
+    std::uint32_t prefill_chunk_rows() const noexcept override { return backend_->prefill_chunk_rows(); }
+    std::optional<std::uint32_t> execute_prefill_chunk(std::span<const std::uint32_t> tokens,
+        std::uint64_t position,std::uint64_t vocabulary,bool terminal) override {
+        auto correlation=owner_->correlation(position);correlation.phase=strix::ExecutionPhase::prefill;
+        correlation.rows=static_cast<std::uint32_t>(tokens.size());
+        strix::ExecutionTelemetryBinding bind(&owner_->counters,correlation);
+        return backend_->execute_prefill_chunk(tokens,position,vocabulary,terminal);
+    }
     void execute_state(std::uint32_t token, std::uint64_t position) override {
         auto correlation = owner_->correlation(position); correlation.phase = strix::ExecutionPhase::prefill;
         strix::ExecutionTelemetryBinding bind(&owner_->counters, correlation);
@@ -1510,6 +1518,10 @@ int main(
             if (right > UINT64_MAX - left) throw std::overflow_error("serving reservation overflows");
             return left + right;
         };
+        std::shared_ptr<const strix::HipServingPrefillPlan> serving_prefill;
+        if(options.serving_prefill_rows) serving_prefill=std::make_shared<const strix::HipServingPrefillPlan>(
+            strix::HipServingGreedyBackend::prepare_prefill(model,compiled,manifest,tensor_access,
+                options.serving_prefill_rows,options.serving_prefill_workspace_budget,options.serving_prefill_metadata_budget));
         auto minimum = checked_add(compiled.arena.total_bytes, compiled.arena.alignment - 1U);
         minimum = checked_add(minimum, checked_add(state_layout.device_total_bytes, state_layout.device_alignment - 1U));
         minimum = checked_add(minimum, state_layout.host_total_bytes);
@@ -1518,6 +1530,7 @@ int main(
         minimum = checked_add(minimum, strix::HipServingGreedyBackend::output_reservation_bytes(static_cast<std::uint32_t>(model.vocab_size)));
         minimum = checked_add(minimum, sizeof(ServingSessionOwner));
         minimum = checked_add(minimum, requested_ple_cache_bytes);
+        if(serving_prefill) minimum=checked_add(minimum,serving_prefill->per_request_reservation_bytes);
         std::optional<strix::HipServingPrefixCachePolicy> prefix_cache_policy;
         std::uint64_t prefix_cache_reservation = 0;
         if (options.serving_cache_entries_explicit) {
@@ -1528,8 +1541,9 @@ int main(
         }
         const auto cohort_reservation = options.serving_tensor_cohort_rows == 1 ? 0U :
             strix::HipServingCohort::requested_reservation_bytes(options.serving_tensor_cohort_rows);
-        const auto shared_bytes = checked_add(checked_add(checked_add(model_residency.reservation().retained_reserved_bytes,
-            options.serving_headroom), prefix_cache_reservation), cohort_reservation);
+        const auto shared_bytes = checked_add(checked_add(checked_add(checked_add(model_residency.reservation().retained_reserved_bytes,
+            options.serving_headroom), prefix_cache_reservation), cohort_reservation),
+            serving_prefill?serving_prefill->metadata_payload_bytes:0U);
         if (shared_bytes > options.serving_memory_budget)
             throw std::invalid_argument("serving model reservation plus headroom exceeds total budget");
         // Charge retained snapshots AND capture peak before pool construction or
@@ -1552,6 +1566,7 @@ int main(
         strix::GreedyServingPolicy policy;
         policy.concurrency = options.serving_concurrency;
         policy.tensor_cohort_rows = options.serving_tensor_cohort_rows;
+        if(serving_prefill) policy.prefill_chunk_rows=serving_prefill->rows;
         policy.max_retained_requests = prefixes.size();
         policy.reservation_budget_bytes = options.serving_memory_budget;
         policy.shared_reservation_bytes = shared_bytes;
@@ -1561,6 +1576,9 @@ int main(
         std::vector<std::shared_ptr<ServingSessionOwner>> owners;
         std::vector<strix::ServingRequestHandle> handles;
         owners.reserve(prefixes.size()); handles.reserve(prefixes.size());
+        // Borrowed while retained request handles own their backend; read only
+        // after run_until_idle, before either handles or scheduler are destroyed.
+        std::vector<strix::HipServingGreedyBackend*> native_targets(prefixes.size(),nullptr);
         setup_phase.reset();
         const auto serving_start = std::chrono::steady_clock::now();
         for (std::size_t i = 0; i < prefixes.size(); ++i) {
@@ -1584,7 +1602,7 @@ int main(
                 options.generate_tokens, generation_eos};
             const auto submission = scheduler.submit(serve_request, compatibility,
                 reinterpret_cast<std::uintptr_t>(&owner->session), epoch, options.serving_request_budget, owner,
-                [&, owner]() -> std::unique_ptr<strix::SerialGreedyStepBackend> {
+                [&, owner, i]() -> std::unique_ptr<strix::SerialGreedyStepBackend> {
                     std::optional<strix::ExecutionTelemetryBinding> observed;
                     if (owner->telemetry()) observed.emplace(&owner->counters, owner->correlation(0));
                     owner->initialize([&](const strix::ExecutionMemoryBinding& scratch) {
@@ -1593,9 +1611,11 @@ int main(
                         strix::hc_projection_prefetch::validate_runtime(hc_next_tile_plan,
                             model, manifest, compiled, tensor_access, scratch, model_residency.binding());
                     });
-                    std::unique_ptr<strix::SerialGreedyStepBackend> target = std::make_unique<strix::HipServingGreedyBackend>(
+                    auto native = std::make_unique<strix::HipServingGreedyBackend>(
                         compiled, model, catalog_config, owner->resources, owner->session, owner->scope,
-                        std::static_pointer_cast<const void>(owner), options.prepared_eager, prefix_cache);
+                        std::static_pointer_cast<const void>(owner), options.prepared_eager, prefix_cache, serving_prefill);
+                    native_targets[i]=native.get();
+                    std::unique_ptr<strix::SerialGreedyStepBackend> target=std::move(native);
                     if (owner->telemetry()) return std::make_unique<ObservedServingBackend>(std::move(target), owner);
                     return target;
                 });
@@ -1619,6 +1639,15 @@ int main(
             << "  \"serving_admission_to_completion_elapsed_ms\":" << serving_ms << ",\n"
             << "  \"serving_prefix_cache_requested\":" << (prefix_cache ? "true" : "false") << ",\n"
             << "  \"serving_prefix_cache_reservation_bytes\":" << prefix_cache_reservation << ",\n";
+        if(serving_prefill) {
+            std::cout << "  \"serving_prefill\":{\"rows\":" << serving_prefill->rows
+                << ",\"qualification\":\"not_assessed\",\"execution\":\"known-input-native-chunks-with-R1-tail\""
+                << ",\"workspace_payload_bytes\":" << serving_prefill->workspace_bytes
+                << ",\"known_plan_metadata_payload_bytes\":" << serving_prefill->metadata_payload_bytes
+                << ",\"runtime_payload_reservation_bytes\":" << serving_prefill->runtime_payload_bytes
+                << ",\"per_request_payload_reservation_bytes\":" << serving_prefill->per_request_reservation_bytes
+                << ",\"scope\":\"declared-payload-plus-explicit-serving-headroom-not-RSS-or-fit\"},\n";
+        }
         if (cohort) {
             const auto observed = cohort->stats();
             std::cout << "  \"serving_tensor_cohort\":{\"requested_rows\":" << options.serving_tensor_cohort_rows
@@ -1661,6 +1690,18 @@ int main(
                 << ",\"queue_wait_ns\":" << metrics.queue_wait_ns << ",\"service_ns\":" << metrics.service_ns
                 << ",\"wall_ns\":" << metrics.wall_ns << ",\"chunks\":" << metrics.chunks
                 << ",\"emitted_tokens\":" << metrics.emitted_tokens
+                << (serving_prefill && native_targets[i] ? [&] {
+                    const auto observed=native_targets[i]->prefill_stats();
+                    return std::string(",\"native_prefill\":{\"chunks\":")+std::to_string(observed.chunks)+
+                        ",\"consumed_rows\":"+std::to_string(observed.consumed_rows)+
+                        ",\"state_only_chunks\":"+std::to_string(observed.state_only_chunks)+
+                        ",\"terminal_chunks\":"+std::to_string(observed.terminal_chunks)+
+                        ",\"r2_dispatches\":"+std::to_string(observed.r2_dispatches)+
+                        ",\"shared_rows_dispatches\":"+std::to_string(observed.shared_rows_dispatches)+
+                        ",\"gdn_rows_dispatches\":"+std::to_string(observed.gdn_rows_dispatches)+
+                        ",\"omitted_lm_heads\":"+std::to_string(observed.omitted_lm_heads)+
+                        ",\"saturated\":"+(observed.saturated?"true":"false")+"}";
+                }() : std::string{})
                 << (options.ple_cache_rows ? ",\"ple_row_cache\":" + ple_row_cache_json(owners[i]->ple_cache_stats()) : std::string{})
                 << ",\"inter_token_intervals\":" << metrics.inter_token_intervals
                 << ",\"inter_token_ns_total\":" << metrics.inter_token_ns_total

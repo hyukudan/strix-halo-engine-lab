@@ -4,6 +4,7 @@
 #include "strix/hip_serving_prefix_cache.hpp"
 #include "strix/hip_serving_cohort.hpp"
 #include "strix/deferred_moe_status.hpp"
+#include "strix/arithmetic_lineage.hpp"
 #include "strix/greedy_serving_scheduler.hpp"
 #include "strix/hip_generation_output_diagnostic.hpp"
 #include "strix/hip_model_residency.hpp"
@@ -183,10 +184,10 @@ std::shared_ptr<SessionOwner> fresh_session(const std::shared_ptr<ModelOwner>& m
     auto owner=std::make_shared<SessionOwner>();owner->model=model;initialize_session(owner);return owner;
 }
 std::unique_ptr<strix::HipServingGreedyBackend> backend(const std::shared_ptr<SessionOwner>& owner,bool prepared,
-    std::shared_ptr<strix::HipServingPrefixCache> pool={}) {
+    std::shared_ptr<strix::HipServingPrefixCache> pool={},std::shared_ptr<const strix::HipServingPrefillPlan> prefill={}) {
     return std::make_unique<strix::HipServingGreedyBackend>(owner->model->compiled,owner->model->model,
         owner->model->config,owner->resources,owner->session,owner->scope,
-        std::static_pointer_cast<const void>(owner),prepared,std::move(pool));
+        std::static_pointer_cast<const void>(owner),prepared,std::move(pool),std::move(prefill));
 }
 void independent(const SessionOwner& a,const SessionOwner& b) {
     using Range=std::pair<std::uintptr_t,std::uint64_t>;
@@ -636,6 +637,75 @@ void qualify_tensor_cohorts(const std::shared_ptr<ModelOwner>& model,
         }
     }
 }
+void qualify_native_prefill(const std::shared_ptr<ModelOwner>& model,std::span<const std::uint32_t> source,
+    const std::filesystem::path& output) {
+    struct Case {std::uint32_t rows,length;std::uint64_t emissions;};
+    const std::array cases{Case{2,4,2},Case{2,5,0},Case{4,8,2},Case{8,16,0},Case{16,32,0},Case{16,33,2}};
+    for(std::size_t i=0;i<cases.size();++i) {
+        const auto c=cases[i];std::vector<std::uint32_t> prompt(c.length);
+        for(std::size_t n=0;n<prompt.size();++n) prompt[n]=source[n%source.size()];
+        auto reference=fresh_session(model),actual=fresh_session(model);independent(*reference,*actual);
+        auto baseline=backend(reference,false);
+        const strix::SerialGreedyRequest request{prompt,model->model.vocab_size,context_capacity,c.emissions,
+            static_cast<std::uint32_t>(model->model.ple_eos_token_id)};
+        const auto expected=strix::execute_serial_greedy_request(request,*baseline);
+        auto plan=std::make_shared<const strix::HipServingPrefillPlan>(strix::HipServingGreedyBackend::prepare_prefill(
+            model->model,model->compiled,model->manifest,model->access,c.rows,16ULL<<30,128ULL<<20));
+        require(plan->per_request_reservation_bytes>=plan->workspace_bytes && plan->metadata_payload_bytes,
+            "native prefill requested payload reservation omits actual workspace/metadata");
+        auto native=backend(actual,(i%2U)!=0,{},plan);
+        strix::SerialGreedyTokenCursor cursor(request);
+        while(!cursor.done()) cursor.advance(*native,c.rows);
+        const auto observed=cursor.take_result();
+        require(observed.generated_tokens==expected.generated_tokens && observed.steps_executed==expected.steps_executed &&
+            observed.final_position==expected.final_position && observed.stop_reason==expected.stop_reason,
+            "native serving prefill chunk/tail differs from full-F32 serial request");
+        require(actual->session.health==strix::SerialSessionHealth::ready && !actual->session.arithmetic_lineage.tainted &&
+            actual->session.next_position==reference->session.next_position && actual->session.committed_tokens==reference->session.committed_tokens &&
+            actual->session.state.valid==reference->session.state.valid && actual->session.state.generations==reference->session.state.generations,
+            "native prefill differs in committed frontier or state generations");
+        strix::ArithmeticLineage lineage;
+        std::uint64_t position=0;
+        while(c.length-position>=c.rows) {
+            const bool terminal=c.length-position==c.rows;
+            const auto& tiled=terminal?plan->terminal_tiled:plan->state_tiled;
+            const auto& small=terminal?plan->terminal_window:plan->state_window;
+            const auto execution=tiled?tiled->prefill_execution_identity:small.window_execution_identity;
+            const auto numerical=tiled?tiled->prefill_kernel_plan_identity:small.window_kernel_plan_identity;
+            lineage=strix::prepare_prefill_chunk_lineage(lineage,position,position+c.rows,execution,numerical,execution);
+            position+=c.rows;
+        }
+        while(position<observed.final_position) {
+            lineage=strix::prepare_serial_row_lineage(lineage,position,model->compiled.execution_identity,model->compiled.kernel_plan_identity);++position;
+        }
+        require(actual->session.arithmetic_lineage.intervals==lineage.intervals &&
+            actual->session.arithmetic_lineage.history_identity==lineage.history_identity,
+            "native prefill producer lineage differs from independent chunk/R1 schedule");
+        const auto name="native-prefill-"+std::to_string(i);
+        require(capture_state(actual,output/(name+"-actual"))==capture_state(reference,output/(name+"-reference")),
+            "native serving prefill changed one of seven full state components");
+        const auto stats=native->prefill_stats();
+        require(stats.chunks==c.length/c.rows && stats.consumed_rows==stats.chunks*c.rows &&
+            stats.terminal_chunks==(c.length%c.rows?0U:1U) && stats.state_only_chunks+stats.terminal_chunks==stats.chunks,
+            "native prefill receipt counted planned rows rather than completed chunks");
+    }
+    // Actual queued terminal selector failure must be contained BEFORE the
+    // window can publish its chunk generations/position/lineage.
+    auto owner=fresh_session(model);
+    auto plan=std::make_shared<const strix::HipServingPrefillPlan>(strix::HipServingGreedyBackend::prepare_prefill(
+        model->model,model->compiled,model->manifest,model->access,2,16ULL<<30,128ULL<<20));
+    auto native=backend(owner,false,{},plan);const auto before=owner->session;
+    strix::arm_hip_greedy_output_diagnostic_fault(strix::HipGreedyOutputDiagnosticFault::after_partials);
+    bool rejected=false;
+    try {(void)native->execute_prefill_chunk(source.first(2),0,model->model.vocab_size,true);}
+    catch(const std::runtime_error& e) {rejected=std::string_view(e.what())=="injected GPU greedy host boundary failure";}
+    strix::clear_hip_greedy_output_diagnostic_fault();
+    require(rejected && native->failed() && owner->session.health==strix::SerialSessionHealth::poisoned &&
+        owner->session.arithmetic_lineage.tainted && owner->session.next_position==before.next_position &&
+        owner->session.committed_tokens==before.committed_tokens && owner->session.state.generations==before.state.generations,
+        "native prefill selector failure published partial chunk metadata");
+    check(hipStreamQuery(owner->scope.stream));
+}
 int qualify(const Args& args) {
     const auto executable=std::filesystem::canonical("/proc/self/exe");
     const auto executable_sha=digest(executable);
@@ -648,6 +718,7 @@ int qualify(const Args& args) {
     base_backend.reset();
     const auto base_state=capture_state(base,args.output/"baseline");
     const auto base_metadata=base->session;
+    qualify_native_prefill(model,prompt,args.output);
     qualify_prefix_cache(model,prompt,base,baseline,base_state,args.output);
     qualify_tensor_cohorts(model,prompt,args.output,baseline,base_state,base_metadata);
     for(const std::uint32_t concurrency:{1U,2U,4U}) {
@@ -757,7 +828,7 @@ int qualify(const Args& args) {
     const auto pending=args.output/"result.pending.json";
     std::ofstream out(pending,std::ios::binary);out.exceptions(std::ios::failbit|std::ios::badbit);
     out<<"{\"schema\":\"serving-native-qualification-v1\",\"finished\":true,\"passed\":true,\"C\":[1,2,4],"
-        "\"full_state_components\":7,\"real_shared_projection_tensor_cohorts\":[2,4],\"other_cohort_operators\":\"original-R1\",\"complete_prefix_cache_cross_request\":true,\"cache_exact_and_proper_hits\":true,\"cache_pending_cancel_and_budget_miss\":true,\"baseline_full_F32_CPU_selection\":true,\"cancel_one_independent\":true,\"queued_selector_fault\":true,"
+        "\"full_state_components\":7,\"native_serving_prefill_chunks_and_R1_tail\":true,\"real_shared_projection_tensor_cohorts\":[2,4],\"other_cohort_operators\":\"original-R1\",\"complete_prefix_cache_cross_request\":true,\"cache_exact_and_proper_hits\":true,\"cache_pending_cancel_and_budget_miss\":true,\"baseline_full_F32_CPU_selection\":true,\"cancel_one_independent\":true,\"queued_selector_fault\":true,"
         "\"fault_is_reported_host_seam_not_driver_failure\":true,\"cross_thread_destruction\":true,\"native_model_qualification_only\":true,"
         "\"quality\":false,\"performance\":false,\"model_sha256\":\""<<args.model_sha<<"\",\"prompt_sha256\":\""<<args.prompt_sha
         <<"\",\"executable_sha256\":\""<<executable_sha<<"\",\"execution_identity\":"<<model->compiled.execution_identity

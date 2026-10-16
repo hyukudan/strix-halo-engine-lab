@@ -8,6 +8,7 @@
 
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
@@ -60,6 +61,11 @@ public:
         std::array<std::uint32_t, 2> tokens);
     [[nodiscard]] KnownWindowResult execute(SerialSessionContext& session,
         std::span<const std::uint32_t> tokens);
+    // Optional serving delivery validation AFTER producer/D1 completion but
+    // BEFORE publishing any session state/generations. Callback is synchronous
+    // on the owned eager scope; throws follow the existing poison/drain path.
+    [[nodiscard]] KnownWindowResult execute_validated(SerialSessionContext&,
+        std::span<const std::uint32_t>,const std::function<void()>& before_publish);
     [[nodiscard]] std::uint32_t logical_rows() const noexcept;
     [[nodiscard]] bool supports_tiled_prefill() const noexcept;
     // Immutable compiler-selected intent; verification consumers require all_rows.

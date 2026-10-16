@@ -76,6 +76,26 @@ class InventoryTests(unittest.TestCase):
             begin_steady_ns=0, end_steady_ns=0, meminfo_status="unsupported", process_status="unsupported")
         self.assertIsNone(INVENTORY.reported_uma_setup_observation(unknown)["reported"]["mem_total_bytes"])
 
+    def test_serving_prefill_source_declarations_do_not_qualify_combined_profile(self):
+        declaration = {"rows": 16, "qualification": "not_assessed", "execution": "known-input-native-chunks-with-R1-tail",
+            "workspace_payload_bytes": 4096, "known_plan_metadata_payload_bytes": 128,
+            "runtime_payload_reservation_bytes": 8192, "per_request_payload_reservation_bytes": 16384,
+            "scope": "declared-payload-plus-explicit-serving-headroom-not-RSS-or-fit"}
+        for width in (2, 4, 8, 16, 17, 2048):
+            value = dict(declaration, rows=width)
+            output = self.collect(receipt_path=self.evidence("serving-prefill.json", {"serving_prefill": value}))
+            self.assertEqual(output["reported_opt_in_overlays"]["serving_prefill"], width)
+            self.assertEqual(output["reported_serving_prefill"], value)
+            self.assertEqual(output["profile_overlay_qualification"], "not_assessed")
+            self.assertIsNone(output["native_tests_executed"])
+        for field, value in (("rows", 3), ("rows", 15), ("rows", 2049), ("rows", True),
+            ("qualification", "passed"), ("workspace_payload_bytes", 0),
+            ("runtime_payload_reservation_bytes", False), ("scope", "physical-fit")):
+            bad = dict(declaration);bad[field] = value
+            with self.subTest(field=field, value=value), self.assertRaises(ValueError):
+                INVENTORY.validate_serving_prefill(bad)
+        self.assertIsNone(self.collect()["reported_opt_in_overlays"]["serving_prefill"])
+
     def selected_inventory(self):
         return {"schema_version": 1, "evidence_kind": "compiled-selected-launchers",
                 "phase": "decode", "selected_logical_rows": 1, "selected_request_concurrency": 1,

@@ -397,13 +397,36 @@ void SerialGreedyTokenCursor::advance(SerialGreedyStepBackend& backend,std::uint
     if(done_) return;
     if(!prefill_rows) throw std::invalid_argument("greedy prefill chunk must contain at least one row");
     try {
-        for(std::uint64_t row=0;row<prefill_rows;++row) {
+        for(std::uint64_t row=0;row<prefill_rows;) {
             const auto input=prepare_target(backend);
             if(!input) return;
+            const auto width=prefilling()?backend.prefill_chunk_rows():0U;
+            if(width && (width<2U || width>2048U))
+                throw std::invalid_argument("known-input chunk capability is outside its admitted bounded width");
+            if(width && width<=prefill_rows-row && width<=request_.prefix_tokens.size()-prefix_offset_) {
+                const bool terminal=width==request_.prefix_tokens.size()-prefix_offset_;
+                const auto selected=backend.execute_prefill_chunk(
+                    request_.prefix_tokens.subspan(prefix_offset_,width),input->position,input->vocab_size,terminal);
+                if(!prepared_target_ || *prepared_target_!=*input || input->owner_!=this || input->backend_!=&backend ||
+                    input->position!=result_.final_position || terminal!=selected.has_value() ||
+                    (selected && static_cast<std::uint64_t>(*selected)>=request_.vocab_size))
+                    throw std::invalid_argument("known-input chunk completion differs from the outstanding prompt frontier");
+                prepared_target_.reset();
+                prefix_offset_+=width;result_.steps_executed+=width;result_.final_position+=width;row+=width;
+                if(selected) pending_=*selected;
+                if(cancelled_) return;
+                if(terminal) {
+                    if(request_.max_new_tokens)
+                        backend.capture_greedy_prefix(request_.prefix_tokens,pending_,request_.vocab_size);
+                    emit_pending();return;
+                }
+                continue;
+            }
             std::optional<std::uint32_t> selected;
             if(input->state_only) backend.execute_state(input->token,input->position);
             else selected=backend.execute_greedy(input->token,input->position,input->vocab_size);
             accept_target(backend,*input,selected);
+            ++row;
             if(done_ || !prefilling()) return;
         }
     } catch(...) {fail_target();throw;}

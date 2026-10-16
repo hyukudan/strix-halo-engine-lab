@@ -194,6 +194,23 @@ def reported_uma_setup_observation(receipt):
             "independently_verified": None, "capacity_qualification": None}
 
 
+def validate_serving_prefill(value):
+    if value is None:
+        return None
+    fields = {"workspace_payload_bytes", "known_plan_metadata_payload_bytes", "runtime_payload_reservation_bytes", "per_request_payload_reservation_bytes"}
+    closed_keys(value, fields | {"rows", "qualification", "execution", "scope"}, set(), "serving prefill")
+    rows = integer(value["rows"], "serving prefill rows")
+    if rows not in (2, 4, 8) and not 16 <= rows <= 2048:
+        raise ValueError("unsupported serving prefill width")
+    if (value["qualification"] != "not_assessed" or value["execution"] != "known-input-native-chunks-with-R1-tail" or
+            value["scope"] != "declared-payload-plus-explicit-serving-headroom-not-RSS-or-fit"):
+        raise ValueError("serving prefill declaration is not native or capacity qualification")
+    for field in fields:
+        if not integer(value[field], "serving prefill " + field):
+            raise ValueError("serving prefill payload declarations must be positive")
+    return rows
+
+
 def validate_outer_receipt(receipt):
     reported_uma_setup_observation(receipt)
     if receipt.get("hip_runtime_environment") is not None:
@@ -320,6 +337,7 @@ def reported_opt_in_overlays(receipt):
             raise ValueError("unknown serving tensor cohort width")
         cohort = rows if rows != 1 else False
     values["serving_tensor_cohort"] = cohort
+    values["serving_prefill"] = validate_serving_prefill(receipt.get("serving_prefill"))
     snapshot = receipt.get("prompt_lookup_snapshot")
     if snapshot is not None:
         if not isinstance(snapshot, dict) or snapshot.get("policy") not in ("full-components", "occupied-kv-v1"):
@@ -603,6 +621,7 @@ def collect(repo, cache_path=None, receipt_path=None, audit_path=None, manifest_
             "reported_model_content_identity": receipt.get("model_content_identity"),
             "binary": binary, "effective_profile": effective,
             "reported_opt_in_overlays": overlays,
+            "reported_serving_prefill": receipt.get("serving_prefill"),
             "profile_overlay_qualification": "not_assessed" if overlay_present else None,
             "profile_evidence": "decoder-receipt" if effective["requested"] is not None else None,
             "context_capacity_tokens": capacity, "occupied_prefix_tokens": occupied,

@@ -375,7 +375,8 @@ struct HipKnownPrefixWindow::Impl {
                 throw std::runtime_error("routed expert union metadata disagrees with its completed window");
         }
     }
-    KnownWindowResult execute(SerialSessionContext& session, std::span<const std::uint32_t> tokens) {
+    KnownWindowResult execute(SerialSessionContext& session, std::span<const std::uint32_t> tokens,
+        const std::function<void()>& before_publish = {}) {
         if (failed) throw std::logic_error("known-window native owner cannot be reused after an exception");
         bool owned_eager_scope_admitted=false;
         try {
@@ -389,7 +390,7 @@ struct HipKnownPrefixWindow::Impl {
             KnownWindowExecutionHooks hooks;
             hooks.preflight_scope = [&] { validate_scope(); };
             hooks.preflight_plan = [&] { validate_metadata(); };
-            hooks.complete = [&] { complete(); };
+            hooks.complete = [&] { complete(); if(before_publish) before_publish(); };
             hooks.quiesce_or_fail_stop = [&] { failed = true; guard.recover_or_fail_stop(); };
             hooks.position_reader_implementations = position_readers;
             const auto first_position=session.next_position;
@@ -431,6 +432,10 @@ KnownWindowResult HipKnownPrefixWindow::execute(SerialSessionContext& session, s
 }
 KnownWindowResult HipKnownPrefixWindow::execute(SerialSessionContext& session, std::span<const std::uint32_t> tokens) {
     return impl_->execute(session,tokens);
+}
+KnownWindowResult HipKnownPrefixWindow::execute_validated(SerialSessionContext& session,
+    std::span<const std::uint32_t> tokens,const std::function<void()>& before_publish) {
+    return impl_->execute(session,tokens,before_publish);
 }
 std::uint32_t HipKnownPrefixWindow::logical_rows() const noexcept { return impl_->logical_rows(); }
 bool HipKnownPrefixWindow::supports_tiled_prefill() const noexcept {return impl_->prefill.has_value();}

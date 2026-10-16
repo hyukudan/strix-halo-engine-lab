@@ -71,6 +71,18 @@ public:
     // Prefix positions with no requested output still consume all model state.
     // The default preserves the complete existing execution.
     virtual void execute_state(std::uint32_t input_token, std::uint64_t position);
+    // Explicit same-session known-input capability. Zero preserves scalar calls.
+    // Nonzero is a fixed admitted width2..2048; the scheduler never waits for
+    // other requests. Only a complete known span is submitted. The backend must
+    // retain its actual window/state/stream owners, complete and commit ALL rows
+    // before return, and contain post-submit failures. A miss is not supported.
+    [[nodiscard]] virtual std::uint32_t prefill_chunk_rows() const noexcept { return 0; }
+    // Return a finite validated firstmax iff terminal_output is true. The final
+    // prompt row still selects when max_new_tokens==0, matching scalar policy.
+    [[nodiscard]] virtual std::optional<std::uint32_t> execute_prefill_chunk(
+        std::span<const std::uint32_t>, std::uint64_t, std::uint64_t, bool) {
+        throw std::invalid_argument("backend has no admitted known-input chunk owner");
+    }
     // Optional complete-state prefix cache, queried once after response
     // reservation and before model execution. The concrete backend verifies
     // token/model/runtime/layout/history/owner identity before restoring all

@@ -1,5 +1,6 @@
 #include "strix/serial_request.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -63,7 +64,7 @@ struct PromptCall {
     bool operator==(const PromptCall&) const = default;
 };
 
-class PrefixBackend final : public strix::SerialGreedyStepBackend {
+class PrefixBackend : public strix::SerialGreedyStepBackend {
 public:
     std::optional<strix::GreedyPrefixRestore> restored;
     std::vector<std::pair<std::uint32_t,std::uint64_t>> calls;
@@ -90,6 +91,83 @@ public:
         captured.assign(prefix.begin(),prefix.end());pending=next;
     }
 };
+
+// Host policy fixture only. No native batching or performance is inferred.
+class ChunkBackend final : public PrefixBackend {
+public:
+    std::uint32_t width=4, chunk_calls=0;
+    bool malformed=false, throw_chunk=false;
+    strix::SerialGreedyTokenCursor* cancel_during=nullptr;
+    std::vector<std::vector<std::uint32_t>> known_chunks;
+    std::uint32_t prefill_chunk_rows() const noexcept override {return width;}
+    std::optional<std::uint32_t> execute_prefill_chunk(std::span<const std::uint32_t> tokens,
+        std::uint64_t p,std::uint64_t vocabulary,bool terminal) override {
+        ++chunk_calls;known_chunks.emplace_back(tokens.begin(),tokens.end());
+        expect(tokens.size()==width && p==position,"chunk receives a complete known span at its actual frontier");
+        if(throw_chunk) throw std::runtime_error("contained chunk failure");
+        std::uint32_t next=0;
+        for(const auto token:tokens) next=execute_greedy(token,position,vocabulary);
+        if(cancel_during) cancel_during->cancel();
+        if(malformed) return terminal?std::nullopt:std::optional<std::uint32_t>{next};
+        return terminal?std::optional<std::uint32_t>{next}:std::nullopt;
+    }
+};
+void chunk_cursor_tests() {
+    for(const unsigned length:{4U,5U,7U,8U}) for(const unsigned width:{2U,4U}) {
+        std::vector<std::uint32_t> prefix(length);for(unsigned i=0;i<length;++i) prefix[i]=i%6U;
+        strix::SerialGreedyRequest request{prefix,8,20,3,7};
+        PrefixBackend scalar;const auto reference=strix::execute_serial_greedy_token_request(request,scalar);
+        ChunkBackend backend;backend.width=width;strix::SerialGreedyTokenCursor cursor(request);
+        while(!cursor.done()) cursor.advance(backend,4);
+        const auto actual=cursor.take_result();
+        expect(actual.generated_tokens==reference.generated_tokens && actual.final_position==reference.final_position &&
+            actual.steps_executed==reference.steps_executed && actual.stop_reason==reference.stop_reason &&
+            backend.calls==scalar.calls && backend.captures==scalar.captures && backend.captured==prefix,
+            "chunk/scalar tails preserve consumed inputs, pending outputs, EOS, cache capture and actual row accounting");
+        expect(backend.chunk_calls>0U,"explicit complete known-input chunks actually use the capability");
+        std::size_t offset=0;for(const auto& chunk:backend.known_chunks) {
+            expect(offset+chunk.size()<=prefix.size() && std::equal(chunk.begin(),chunk.end(),prefix.begin()+offset),
+                "chunk capability never consumes an unknown generated input");offset+=chunk.size();
+        }
+    }
+    const std::vector<std::uint32_t> prefix{1,2,3,4};
+    for(const unsigned scenario:{0U,1U,2U,3U}) {
+        auto request=strix::SerialGreedyRequest{prefix,8,16,scenario==0U?0U:3U,7};
+        ChunkBackend backend;strix::SerialGreedyTokenCursor cursor(request);
+        if(scenario==1U) backend.cancel_during=&cursor;
+        if(scenario==2U) backend.malformed=true;
+        if(scenario==3U) backend.throw_chunk=true;
+        bool rejected=false;try {cursor.advance(backend,4);}catch(const std::exception&) {rejected=true;}
+        if(scenario<2U) {
+            expect(!rejected && cursor.done() && !cursor.failed() && cursor.result().final_position==4U &&
+                cursor.result().steps_executed==4U && cursor.result().generated_tokens.empty() && backend.captures==0U,
+                "zero emission or post-submit cancellation retains complete consumed prompt without pending publication");
+            expect(cursor.cancelled()==(scenario==1U),"cancellation remains distinct from a zero emission budget");
+        } else expect(rejected && cursor.failed() && cursor.result().generated_tokens.empty(),
+            "failed or malformed chunk permanently disables cursor without emitting a token");
+    }
+    for(const unsigned width:{1U,2049U}) {
+        ChunkBackend backend;backend.width=width;strix::SerialGreedyTokenCursor cursor({prefix,8,16,1,7});
+        bool rejected=false;try {cursor.advance(backend,4);}catch(const std::invalid_argument&) {rejected=true;}
+        expect(rejected && cursor.failed() && backend.calls.empty() && !backend.chunk_calls,
+            "invalid capability rejects before model execution");
+    }
+    {
+        ChunkBackend backend;strix::SerialGreedyTokenCursor cursor({prefix,8,16,1,7});
+        while(!cursor.done()) cursor.advance(backend,3);
+        expect(!backend.chunk_calls && cursor.result().final_position==4U,
+            "scheduler chunk budget smaller than native width retains bounded scalar progress");
+    }
+    {
+        const std::vector<std::uint32_t> cached_prefix{0,1,2,3,4};
+        ChunkBackend backend;backend.restored=strix::GreedyPrefixRestore{1,std::nullopt};
+        strix::SerialGreedyTokenCursor cursor({cached_prefix,8,16,1,7});cursor.advance(backend,4);
+        expect(cursor.done() && backend.chunk_calls==1U && backend.known_chunks.front()==std::vector<std::uint32_t>({1,2,3,4}) &&
+            cursor.result().restored_prefix_tokens==1U && cursor.result().steps_executed==4U &&
+            cursor.result().generated_tokens==std::vector<std::uint32_t>{5},
+            "proper-prefix restore chunks only the actual known suffix and preserves pending selection");
+    }
+}
 
 void prefix_cursor_tests() {
     const std::vector<std::uint32_t> prefix{1,2,3};
@@ -667,6 +745,7 @@ int main() {
     }
 
     known_prompt_tests();
+    chunk_cursor_tests();
 
     if (failures == 0) {
         std::cout

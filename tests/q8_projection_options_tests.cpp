@@ -221,5 +221,32 @@ int main() {
       rejects([&] { validate_moe_token_cost_options(bad); }, "lookup cannot share observed-token owner"); }
     { auto bad = token_cost; bad.known_prefix_window = true;
       rejects([&] { validate_moe_token_cost_options(bad); }, "known windows cannot masquerade as serial token samples"); }
+    {
+        auto prefill=cohort;prefill.serving_tensor_cohort_rows=1;prefill.serving_tensor_cohort_explicit=false;
+        prefill.serving_prefill_explicit=prefill.serving_prefill_workspace_explicit=prefill.serving_prefill_metadata_explicit=true;
+        prefill.serving_prefill_workspace_budget=1ULL<<30;prefill.serving_prefill_metadata_budget=1ULL<<24;
+        prefill.wave8_q8_gdn_input=prefill.wave8_q8_gdn_output=true;
+        prefill.virtual_q8_gdn_input=prefill.prefetch_q8_gdn_input=prefill.virtual_q8_gdn_output=true;
+        for(const auto rows:{2U,4U,8U,16U,17U,2048U}) {
+            prefill.serving_prefill_rows=rows;validate_resolved_serving(prefill);
+            expect(prefill.serving_prefill_rows==rows,"explicit serving prefill retains exact closed native width");
+        }
+        for(unsigned fault=0;fault<9U;++fault) {
+            auto bad=prefill;
+            if(!fault) bad.serving_prefill_workspace_budget=0;
+            if(fault==1U) bad.serving_prefill_metadata_explicit=false;
+            if(fault==2U) bad.serving_tensor_cohort_rows=2;
+            if(fault==3U) bad.serving_prefix_files.clear();
+            if(fault==4U) bad.serving_prefill_rows=3;
+            if(fault==5U) bad.gdn_recurrent_storage=strix::GdnRecurrentStorage::value_key;
+            if(fault==6U) bad.wave8_q8_gdn_output=false;
+            if(fault==7U) bad.qsa_gqa_heads_per_block=2;
+            if(fault==8U) bad.serving_cache_entries_explicit=true;
+            rejects([&]{validate_resolved_serving(bad);},"serving prefill never ignores missing budgets/profile or conflicting cohort/layout");
+        }
+        rejects([]{(void)parse({"decoder","m","--serve-prefill-rows","3"});},"unsupported native widths are rejected, not relabelled");
+        rejects([]{(void)parse({"decoder","m","--serve-prefill-rows","2","--serve-prefill-rows=4"});},"serving prefill duplicate forms reject");
+        expect(!defaults.serving_prefill_rows && !defaults.serving_prefill_explicit,"serving prefill is default off");
+    }
     return failures ? 1 : 0;
 }
