@@ -131,6 +131,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
             <<"\"proposal_identity\":"<<assets->compiled().proposal_identity<<",\"plan_identity\":"<<assets->compiled().plan_identity
             <<",\"semantic_identity\":"<<assets->compiled().forward_semantics.contract_identity<<",\"native_profile_identity\":"<<runtime->numerical_profile_identity()
             <<",\"head_profile_identity\":"<<hip_mtp_lm_head_profile_identity(model,native->tensors().lm_head)
+            <<",\"head_recipe\":"<<static_cast<std::uint32_t>(select_hip_mtp_lm_head_recipe(model,native->tensors().lm_head))
             <<",\"target_content\":\""<<model_content_identity_hex(assets->shared_target().target_model_content_identity)
             <<"\",\"sidecar_content\":\""<<model_content_identity_hex(assets->shared_target().sidecar_model_content_identity)
             <<"\",\"target_file_sha256\":\""<<model_content_identity_hex(actual.mapped->file_sha256())

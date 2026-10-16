@@ -69,6 +69,10 @@ HipMtpTargetCheckpointReservation plan_hip_mtp_target_checkpoint(
             for(std::uint64_t i=1;i<model.full_attention_layers;++i) total=add(total,alignment-1);
         }
     }
+    // Serial snapshot plans align the END of each section as well as each
+    // range start. Reserve that actual format extent before allocator padding.
+    result.device_payload_bytes=aligned(result.device_payload_bytes);
+    result.host_payload_bytes=aligned(result.host_payload_bytes);
     result.retained_bytes=add(result.device_payload_bytes,result.host_payload_bytes);
     if(result.device_payload_bytes) result.retained_bytes=add(result.retained_bytes,alignment-1);
     if(result.host_payload_bytes) result.retained_bytes=add(result.retained_bytes,alignment-1);

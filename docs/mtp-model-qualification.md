@@ -8,6 +8,15 @@ prompt tokens. It never executes or activates the predictor and does not replace
 any qualification gate. Graph, other request controllers and golden options are
 rejected; the output path must be new. The native target keeps its resolved D1.
 
+An optional `--qualification-export-greedy-rows N` appends up to 4096 serial
+target rows, consuming each preceding actual target prediction. Prompt plus
+continuation must fit the context and the 4097-row packet bound before execution.
+This fixed-length diagnostic records inputs even across an EOS prediction;
+reference producers apply their declared stopping policy. Its JSON records the
+prompt and continuation counts, actual committed input tokens, and the actual
+arithmetic history interval count after each row. It runs no predictor and
+provides no expected predictor output or window dispatch counters.
+
 The resulting `MTPINP01` input packet is little-endian: magic8, target content32,
 target execution uint64, kernel plan uint64, wide width uint32, row count uint32;
 each row is source position uint64, input token uint32, target prediction uint32

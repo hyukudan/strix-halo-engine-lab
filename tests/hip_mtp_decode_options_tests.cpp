@@ -56,6 +56,12 @@ int main(){try{
     const auto probe=parse(metadata);
     require(probe.mtp.metadata_only && probe.mtp.golden.empty() && probe.mtp.golden_sha256.empty(),
         "explicit metadata diagnostic admits real assets without an expected-output file");
+    for(const auto* unused:{"--mtp-golden","--mtp-golden-sha256"}){
+        auto bad=metadata;bad.insert(bad.end(),{unused,unused==std::string_view("--mtp-golden")?"unused.bin":std::string(64,'a')});
+        bool exact=false;try{(void)parse(bad);}catch(const std::invalid_argument& e){
+            exact=std::string(e.what())=="MTP metadata diagnostic does not accept unused golden options";}
+        require(exact,"metadata diagnostic rejects unused golden parameters explicitly");
+    }
     set(metadata,"--mtp-metadata-only","0");reject(metadata,"metadata diagnostic requires its explicit value");
     for(const auto* flag:{"--prepared-eager","--moe-shared-overlap","--gdn-islands","--gpu-greedy-token","--prompt-lookup",
         "--prefix-cache-roundtrip","--device-queue-trace"}){

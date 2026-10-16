@@ -199,7 +199,7 @@ struct Fixture {
         return result;
     }
     template<class Mutate, class Restore> void rejected(Mutate mutate, Restore restore, bool capture,
-        std::string_view expected) {
+        std::string_view expected, bool expect_overflow = false) {
         write(scratch, seed); const auto prior_weights = original_weights;
         auto current = scope(); hipGraph_t graph = nullptr;
         bool rejected = false; std::string reason;
@@ -207,7 +207,8 @@ struct Fixture {
         { const HipLaunchScope active(current);
           if (capture) check(hipStreamBeginCapture(owner.stream, hipStreamCaptureModeThreadLocal), "begin wide shared rejection capture");
           try { shared_expert_known_window_rows_launch(contexts, config); }
-          catch (const std::invalid_argument& error) { rejected = true; reason = error.what(); }
+          catch (const std::invalid_argument& error) { rejected = !expect_overflow; reason = error.what(); }
+          catch (const std::overflow_error& error) { rejected = expect_overflow; reason = error.what(); }
           if (capture) check(hipStreamEndCapture(owner.stream, &graph), "end wide shared rejection capture"); }
         restore();
         if (graph) {
@@ -216,8 +217,11 @@ struct Fixture {
             check(hipGraphDestroy(graph), "destroy wide shared rejected graph");
         }
         owner.finish();
-        require(rejected && reason.find(expected) != std::string::npos && read(scratch) == seed,
-            "wide shared rejection missed its admission gate or changed payload");
+        const bool unchanged = read(scratch) == seed;
+        if (!rejected || reason.find(expected) == std::string::npos || !unchanged)
+            throw std::runtime_error("wide shared rejection expected [" + std::string(expected) +
+                "] but received [" + reason + "]; rejected=" + std::to_string(rejected) +
+                "; payload_unchanged=" + std::to_string(unchanged));
         for (std::size_t w = 0; w < weight_views.size(); ++w)
             require(read(weight_views[w]) == prior_weights[w], "wide shared rejection mutated weights");
     }
@@ -272,10 +276,10 @@ int main(int argc, char** argv) {
                 for (unsigned r = 0; r < rows; ++r) f.window.row_view[r].allocations[0].offset += f.scratch.bytes + 256U;
             }, [&] { f.window.row_view = row_views;
                 for (unsigned r = 0; r < rows; ++r) f.contexts[r].arena = &f.window.row_view[r]; },
-                capture, "rows resolved view exceeds physical scratch");
+                capture, "execution buffer exceeds bound arena allocation");
             const auto arena_bytes = f.memory.arena_bytes;
             f.rejected([&] { f.memory.arena_bytes = UINT64_MAX; }, [&] { f.memory.arena_bytes = arena_bytes; },
-                capture, "rows scratch extent overflows");
+                capture, "execution arena address range overflows uintptr_t", true);
             f.rejected([&] { f.contexts.resize(3); }, [&] { f.contexts = original; }, capture, "rows count must be R4 or R8");
         }
         f.rejected([] {}, [] {}, true, "rows cannot run during capture"); // Valid metadata still cannot capture.

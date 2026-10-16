@@ -1381,8 +1381,20 @@ int main() try {
                 "grouped attention rejection uses its own deferred error domain");
         }
         large_context.position = 2051;
+        // Exercise both the first and last complete compressed block, so a
+        // late producer rejection cannot be lost before sorting or gathering.
+        // Inf and distinct NaN payloads must fail even when ReLU would mask the
+        // resulting NaN dot product to zero.
+        for (const std::uint64_t rejected_row : {0ULL, 2048ULL})
+        for (const std::uint16_t rejected_bits : {std::uint16_t{0x7fc1U}, std::uint16_t{0x7f80U}, std::uint16_t{0xff80U}})
         for (const auto prior : {strix::DeferredMoeFirstError{}, strix::DeferredMoeFirstError{1, 8}}) {
-            reset(0, true, prior); run(candidate);
+            reset(0, false, prior);
+            const auto rejected_feature = rejected_row ? large_model.indexer_head_dim - 1U : 0U;
+            const auto rejected_address = history_memory.device_base + history_kv_bytes +
+                (rejected_row * large_model.indexer_head_dim + rejected_feature) * sizeof(std::uint16_t);
+            own.guard.run([&] { check(hipMemcpy(reinterpret_cast<void*>(rejected_address), &rejected_bits,
+                sizeof(rejected_bits), hipMemcpyHostToDevice), "inject nonfinite compressed selection history"); });
+            run(candidate);
             strix::DeferredMoeFirstError observed{};
             const auto error_bytes = read(reinterpret_cast<std::uintptr_t>(own.error), 8);
             std::memcpy(&observed, error_bytes.data(), 8);
@@ -1392,6 +1404,20 @@ int main() try {
             expect(read(large_temp.address + selected_layout.selected_indices_offset, count * 4U) == std::vector<std::byte>(count * 4U),
                 "rejected sparse selection sanitizes indices before any attention gather");
         }
+        // Independent caller reset restores finite success after a rejection;
+        // the launcher's producer-local status must not leak between tokens.
+        reset(1, false); run(reference);
+        const auto recovered_output = read(large_output.address, hidden_width * 2U);
+        const auto recovered_state = read(history_memory.device_base, history_memory.device_bytes);
+        const auto recovered_indices = read(large_temp.address + selected_layout.selected_indices_offset, 2048U * 4U);
+        reset(1, false); run(candidate);
+        const strix::DeferredMoeFirstError recovered_error{};
+        expect(recovered_output == read(large_output.address, hidden_width * 2U) &&
+            recovered_state == read(history_memory.device_base, history_memory.device_bytes) &&
+            recovered_indices == read(large_temp.address + selected_layout.selected_indices_offset, 2048U * 4U) &&
+            read(reinterpret_cast<std::uintptr_t>(own.error), 8) == std::vector<std::byte>(
+                reinterpret_cast<const std::byte*>(&recovered_error), reinterpret_cast<const std::byte*>(&recovered_error) + 8),
+            "finite production selection recovers after an independently reset rejection arm");
         for (unsigned mutation = 0; mutation < 5; ++mutation) {
             reset(0, false);
             auto bad_scope = large_scope;

@@ -551,6 +551,8 @@ inline void validate_mtp_cli(const Options& o,bool resolved=false) {
        ((resolved || o.context_explicit) && (o.tokens.size()>o.context_tokens ||
         o.generate_tokens>o.context_tokens-o.tokens.size()+1U)))
         throw std::invalid_argument("MTP requires 3..4097 known prompt tokens, positive uint32 output budget and bounded target context");
+    if(m.metadata_only && (!m.golden.empty() || !m.golden_sha256.empty()))
+        throw std::invalid_argument("MTP metadata diagnostic does not accept unused golden options");
     if(m.sidecar.empty() || m.sidecar_logical_name.empty() || (!m.metadata_only && m.golden.empty()) || m.repository.empty() || m.revision.empty() || m.source_path.empty() || m.converter_revision.empty() ||
        !mtp_sha256_text(m.sidecar_sha256) || !mtp_sha256_text(m.target_sha256) || !mtp_sha256_text(m.target_content) ||
        (!m.metadata_only && !mtp_sha256_text(m.golden_sha256)) || !mtp_sha256_text(m.converter_sha256) || !mtp_sha256_text(m.norm_converter_sha256))

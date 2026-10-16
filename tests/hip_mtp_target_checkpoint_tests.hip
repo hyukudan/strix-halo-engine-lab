@@ -6,6 +6,7 @@
 #include <vector>
 #include <iostream>
 #include <stdexcept>
+#include <string>
 
 namespace {
 void independent_rollback_payload_fixture() {
@@ -76,9 +77,10 @@ int main() {
             auto& total=allocation.storage==SessionStateStorage::device?device:host;
             total=(total+255)/256*256+allocation.bytes;
         }
-        const auto require=[](bool pass) { if(!pass) throw std::logic_error("checkpoint geometry fixture failed"); };
-        require(full.device_payload_bytes==device && full.host_payload_bytes==host);
-        require(full.retained_bytes==device+host+(device?255:0)+(host?255:0));
+        device=(device+255)/256*256;host=(host+255)/256*256;
+        const auto require=[](bool pass,const char* message) { if(!pass) throw std::logic_error(message); };
+        require(full.device_payload_bytes==device && full.host_payload_bytes==host,"full checkpoint section endpoints must be aligned");
+        require(full.retained_bytes==device+host+(device?255:0)+(host?255:0),"checkpoint retained budget must include terminal and allocator alignment");
         for(const auto policy:{SessionSnapshotPolicy::full_components,SessionSnapshotPolicy::occupied_kv_v1}) {
             const auto capacity=plan_hip_mtp_target_checkpoint(model,layout,policy);
             for(const std::uint64_t position:{0ULL,1ULL,255ULL,256ULL,2048ULL}) {
@@ -91,22 +93,29 @@ int main() {
                     PersistentState::ngram_history|PersistentState::position_history;
                 request.state.generations.fill(3);
                 const auto plan=build_serial_session_snapshot_plan(model,layout,request);
-                require(plan.device_bytes<=capacity.device_payload_bytes && plan.host_bytes<=capacity.host_payload_bytes);
+                if(plan.device_bytes>capacity.device_payload_bytes || plan.host_bytes>capacity.host_payload_bytes)
+                    throw std::logic_error("checkpoint reservation smaller than actual snapshot: policy="+
+                        std::to_string(static_cast<unsigned>(policy))+" position="+std::to_string(position)+
+                        " device="+std::to_string(plan.device_bytes)+"/"+std::to_string(capacity.device_payload_bytes)+
+                        " host="+std::to_string(plan.host_bytes)+"/"+std::to_string(capacity.host_payload_bytes));
+                if(policy==SessionSnapshotPolicy::full_components)
+                    require(plan.device_bytes==capacity.device_payload_bytes && plan.host_bytes==capacity.host_payload_bytes,
+                        "full checkpoint reservation must match actual all-component format exactly");
                 // This request is a range-planner input, never a claimed ready
                 // SerialSessionContext or native arithmetic qualification.
                 const auto restore=build_serial_session_restore_plan(model,layout,23,plan);
-                require(restore.snapshot_plan_identity==plan.plan_identity);
+                require(restore.snapshot_plan_identity==plan.plan_identity,"restore identity must bind actual snapshot");
             }
         }
         bool rejected=false;
         try { (void)plan_hip_mtp_target_checkpoint(model,layout,static_cast<SessionSnapshotPolicy>(99)); }
         catch(const std::invalid_argument&) { rejected=true; }
-        require(rejected);
+        require(rejected,"unknown checkpoint snapshot policy must reject");
         auto stale=layout; ++stale.context_tokens;
         rejected=false;
         try { (void)plan_hip_mtp_target_checkpoint(model,stale,SessionSnapshotPolicy::full_components); }
         catch(const std::invalid_argument&) { rejected=true; }
-        require(rejected);
+        require(rejected,"stale layout identity must reject");
         std::cout<<"checkpoint reservation geometry passed\n";
         return 0;
     } catch(const std::exception& error) { std::cerr<<error.what()<<'\n'; return 1; }

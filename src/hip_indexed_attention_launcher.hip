@@ -1229,7 +1229,13 @@ __global__ void publish_qsa_attention_status(const std::uint32_t* local, Deferre
 // the D1 completion fence rejects the token before host publication.
 __global__ void publish_qsa_selection_status(const std::uint32_t* local,
     DeferredMoeFirstError* first_error, std::uint32_t* selected, std::uint32_t count) {
-    const auto bits = *local;
+    // The existing block-score producer reports nonfinite intermediates as
+    // graph arithmetic bit 8, before ReLU can mask NaNs. This eager selector's
+    // public status contract names that same failure nonfinite_score (bit 1).
+    // Preserve any other selector bits and the complete earlier D1 first error.
+    const auto producer_bits = *local;
+    const auto bits = (producer_bits & ~8U) |
+        ((producer_bits & 8U) ? qsa_selection_diagnostic::nonfinite_score : 0U);
     const auto index = static_cast<std::uint32_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (bits && index < count) selected[index] = 0;
     if (index == 0) merge_deferred_moe_first_error(*first_error, bits, DeferredMoeDomain::qsa_selection);
@@ -2834,18 +2840,26 @@ void launch_indexed_attention(const ExecutionDispatchContext& context, void* use
             hipGetLastError(),
             "HIP indexed-attention full-visible selection");
     } else {
+        auto score_selection = dynamic_selection;
+        if (config.qsa_hierarchical_selection) {
+            // Reset before the producer, not between production and selection.
+            // A null position retains eager scalar-position semantics while
+            // enabling its existing nonfinite-intermediate guards. In
+            // particular fmaxf(NaN, 0) must not silently admit a finite score.
+            check_hip(hipMemsetAsync(workspace.selection_status, 0, sizeof(std::uint32_t), hip_execution_stream()),
+                "HIP hierarchical QSA local status reset");
+            score_selection.position.status = workspace.selection_status;
+        }
         launch_block_scores(
             workspace,
             raw_state,
             tensors.index_k_norm,
             model,
-            std::max(complete_blocks, 1U), dynamic_selection);
+            std::max(complete_blocks, 1U), score_selection);
         if (config.qsa_hierarchical_selection) {
             using namespace qsa_selection_diagnostic;
             const Shape shape{complete_blocks, visible - complete_blocks * ratio};
             const auto items = scratch_items(shape);
-            check_hip(hipMemsetAsync(workspace.selection_status, 0, sizeof(std::uint32_t), hip_execution_stream()),
-                "HIP hierarchical QSA local status reset");
             enqueue(shape, {workspace.block_scores, complete_blocks}, {workspace.selected_indices, selected_count},
                 {workspace.selection_ping, items}, {workspace.selection_pong, items},
                 {workspace.selection_status, 1}, hip_execution_stream());
