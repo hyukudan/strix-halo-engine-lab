@@ -1,11 +1,14 @@
 #pragma once
 
+#include "strix/known_window_output_policy.hpp"
+
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <vector>
 
 namespace strix {
@@ -30,6 +33,9 @@ struct SerialGreedyRequestResult {
     std::uint64_t final_position = 0;
     SerialRequestStopReason stop_reason =
         SerialRequestStopReason::max_new_tokens;
+    // Logical known inputs restored from a complete-state cache. They do not
+    // contribute to steps_executed, which counts actual backend executions.
+    std::uint64_t restored_prefix_tokens = 0;
 };
 
 struct SerialGreedyContinuationRequest {
@@ -39,6 +45,13 @@ struct SerialGreedyContinuationRequest {
     std::uint64_t context_capacity = 0;
     std::uint64_t max_new_tokens = 0;
     std::uint32_t eos_token_id = 0;
+};
+
+struct GreedyPrefixRestore {
+    std::uint64_t consumed_prefix = 0;
+    // Present only for an exact full-prefix hit. This token has NOT been
+    // consumed; a proper-prefix hit continues with the known request suffix.
+    std::optional<std::uint32_t> pending_token;
 };
 
 class SerialGreedyStepBackend {
@@ -58,6 +71,17 @@ public:
     // Prefix positions with no requested output still consume all model state.
     // The default preserves the complete existing execution.
     virtual void execute_state(std::uint32_t input_token, std::uint64_t position);
+    // Optional complete-state prefix cache, queried once after response
+    // reservation and before model execution. The concrete backend verifies
+    // token/model/runtime/layout/history/owner identity before restoring all
+    // required state. A miss must not mutate state. Post-submit exceptions
+    // must poison/drain the backend's owned session before returning.
+    [[nodiscard]] virtual std::optional<GreedyPrefixRestore> try_restore_greedy_prefix(
+        const SerialGreedyRequest&) { return std::nullopt; }
+    // Called once after a newly consumed complete prompt and before emission.
+    // Capacity/admission misses are benign; transfer failures remain contained
+    // by the native owner. No token is consumed by this cache operation.
+    virtual void capture_greedy_prefix(std::span<const std::uint32_t>, std::uint32_t, std::uint64_t) {}
 };
 
 // Incremental form of the token-output request controller. The prefix span is
@@ -84,7 +108,7 @@ private:
     SerialGreedyRequestResult result_;
     std::size_t prefix_offset_ = 0;
     std::uint32_t pending_ = 0;
-    bool done_ = false, failed_ = false, cancelled_ = false;
+    bool done_ = false, failed_ = false, cancelled_ = false, started_ = false;
 };
 
 // Experimental full-output prompt route. All inputs are already known. The
@@ -94,6 +118,9 @@ class KnownPromptWindowBackend {
 public:
     virtual ~KnownPromptWindowBackend() = default;
     [[nodiscard]] virtual std::uint32_t logical_rows() const noexcept { return 2; }
+    [[nodiscard]] virtual KnownWindowOutputPolicy output_policy() const noexcept {
+        return KnownWindowOutputPolicy::all_rows;
+    }
     [[nodiscard]] virtual std::vector<float> execute_window(
         std::array<std::uint32_t, 2> tokens, std::uint64_t position) = 0;
     // Wider backends explicitly override both this entry and logical_rows().
@@ -101,6 +128,9 @@ public:
     // single larger native window.
     [[nodiscard]] virtual std::vector<float> execute_rows(
         std::span<const std::uint32_t> tokens, std::uint64_t position);
+    virtual void execute_state_rows(std::span<const std::uint32_t>, std::uint64_t) {
+        throw std::invalid_argument("known prompt backend does not support state-only windows");
+    }
 };
 
 struct KnownPromptGreedyRequest {

@@ -63,6 +63,100 @@ struct PromptCall {
     bool operator==(const PromptCall&) const = default;
 };
 
+class PrefixBackend final : public strix::SerialGreedyStepBackend {
+public:
+    std::optional<strix::GreedyPrefixRestore> restored;
+    std::vector<std::pair<std::uint32_t,std::uint64_t>> calls;
+    std::vector<std::uint32_t> captured;
+    std::uint64_t position=0;
+    std::uint32_t pending=0, restores=0, captures=0;
+    bool fail_restore=false,fail_capture=false;
+    std::vector<float> execute(std::uint32_t token,std::uint64_t p) override {
+        return logits(8,execute_greedy(token,p,8));
+    }
+    std::uint32_t execute_greedy(std::uint32_t token,std::uint64_t p,std::uint64_t) override {
+        expect(p==position,"restored cursor never replays an already consumed input");
+        calls.emplace_back(token,p);++position;return(token+1U)%8U;
+    }
+    void execute_state(std::uint32_t token,std::uint64_t p) override { (void)execute_greedy(token,p,8); }
+    std::optional<strix::GreedyPrefixRestore> try_restore_greedy_prefix(const strix::SerialGreedyRequest&) override {
+        ++restores;if(fail_restore)throw std::runtime_error("contained restore failure");
+        if(restored)position=restored->consumed_prefix;
+        return restored;
+    }
+    void capture_greedy_prefix(std::span<const std::uint32_t> prefix,std::uint32_t next,std::uint64_t vocab) override {
+        ++captures;if(fail_capture)throw std::runtime_error("contained capture failure");
+        expect(position==prefix.size() && next<vocab,"prefix capture occurs at the consumed prompt/pending token frontier");
+        captured.assign(prefix.begin(),prefix.end());pending=next;
+    }
+};
+
+void prefix_cursor_tests() {
+    const std::vector<std::uint32_t> prefix{1,2,3};
+    strix::SerialGreedyRequest request{prefix,8,16,3,7};
+    PrefixBackend baseline;
+    const auto expected=strix::execute_serial_greedy_token_request(request,baseline);
+    expect(expected.generated_tokens==std::vector<std::uint32_t>{4,5,6} && expected.steps_executed==5U &&
+        baseline.restores==1U && baseline.captures==1U && baseline.captured==prefix && baseline.pending==4U,
+        "cache miss preserves greedy calls and captures the unconsumed first output exactly once");
+    for(const std::uint64_t consumed:{1ULL,2ULL,3ULL}) {
+        PrefixBackend backend;
+        backend.restored=strix::GreedyPrefixRestore{consumed,consumed==prefix.size()?std::optional<std::uint32_t>{4}:std::nullopt};
+        strix::SerialGreedyTokenCursor cursor(request);
+        while(!cursor.done())cursor.advance(backend,1);
+        const auto result=cursor.take_result();
+        expect(result.generated_tokens==expected.generated_tokens && result.final_position==expected.final_position &&
+            result.stop_reason==expected.stop_reason && result.restored_prefix_tokens==consumed &&
+            result.steps_executed+consumed==expected.steps_executed && backend.restores==1U,
+            "proper/exact restored prefixes retain greedy output, frontier and actual execution counts");
+        expect(backend.calls.size()==result.steps_executed && backend.calls.front().second==consumed &&
+            backend.calls.back()==std::pair<std::uint32_t,std::uint64_t>{5,4},
+            "cached pending token is consumed once only when another output is requested");
+        expect(backend.captures==(consumed==prefix.size()?0U:1U),"exact hits do not capture another identical snapshot");
+    }
+    for(const unsigned boundary:{0U,1U,2U,3U}) {
+        auto bounded=request;
+        PrefixBackend backend;backend.restored=strix::GreedyPrefixRestore{3,4};
+        if(boundary==0U)bounded.max_new_tokens=0;
+        if(boundary==1U)bounded.max_new_tokens=1;
+        if(boundary==2U)bounded.context_capacity=prefix.size();
+        if(boundary==3U)backend.restored->pending_token=7;
+        const auto result=strix::execute_serial_greedy_token_request(bounded,backend);
+        expect(result.steps_executed==0U && result.restored_prefix_tokens==3U && result.final_position==3U &&
+            backend.calls.empty() && backend.captures==0U && result.generated_tokens.size()==(boundary==0U?0U:1U),
+            "zero budget/EOS/output budget/capacity leave the cached final output unconsumed");
+    }
+    {
+        PrefixBackend backend;backend.restored=strix::GreedyPrefixRestore{3,4};
+        strix::SerialGreedyTokenCursor cursor(request);cursor.advance(backend);cursor.cancel();
+        expect(cursor.cancelled() && cursor.result().generated_tokens==std::vector<std::uint32_t>{4} &&
+            backend.calls.empty() && backend.position==3U,"cancellation after a hit retains its unconsumed bonus");
+        PrefixBackend before;strix::SerialGreedyTokenCursor cancelled(request);cancelled.cancel();cancelled.advance(before);
+        expect(before.restores==0U && before.calls.empty(),"pre-start cancellation cannot restore target state");
+    }
+    for(const auto bad:std::array<strix::GreedyPrefixRestore,5>{{{0,std::nullopt},{4,std::nullopt},{3,std::nullopt},{1,4},{3,8}}}) {
+        PrefixBackend backend;backend.restored=bad;strix::SerialGreedyTokenCursor cursor(request);
+        bool rejected=false;try{cursor.advance(backend);}catch(const std::invalid_argument&){rejected=true;}
+        bool sticky=false;try{cursor.advance(backend);}catch(const std::logic_error&){sticky=true;}
+        expect(rejected && sticky && cursor.failed() && backend.calls.empty() && backend.restores==1U,
+            "malformed restore frontiers fail without target calls or a second restore attempt");
+    }
+    for(const bool capture:{false,true}) {
+        PrefixBackend backend;backend.fail_restore=!capture;backend.fail_capture=capture;
+        strix::SerialGreedyTokenCursor cursor(request);
+        bool failed=false;try{cursor.advance(backend,8);}catch(const std::runtime_error&){failed=true;}
+        expect(failed && cursor.failed() && cursor.result().generated_tokens.empty() &&
+            backend.calls.size()==(capture?3U:0U),"contained cache transfer errors stop before any output publication");
+    }
+    {
+        const std::array<std::uint32_t,1> short_prefix{1};
+        PrefixBackend backend;
+        strix::SerialGreedyTokenCursor cursor({short_prefix,8,UINT64_MAX,UINT64_MAX,7});
+        bool rejected=false;try{cursor.advance(backend);}catch(const std::length_error&){rejected=true;}
+        expect(rejected && backend.restores==0U && backend.calls.empty(),"response capacity is reserved before any cache restoration");
+    }
+}
+
 // Position-derived full rows make a wrong tail/frontier observable without
 // sharing the production scheduler's pair-selection logic.
 struct PromptScript {
@@ -300,6 +394,7 @@ void known_prompt_tests() {
 }  // namespace
 
 int main() {
+    prefix_cursor_tests();
     {
         const std::vector<std::uint32_t> prefix{
             1, 2,

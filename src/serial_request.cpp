@@ -339,13 +339,27 @@ void SerialGreedyTokenCursor::advance(SerialGreedyStepBackend& backend, std::uin
     try {
         // Reserve the bounded response before the first backend can publish
         // state. Later token delivery cannot allocate after a committed step.
-        if (result_.steps_executed == 0) {
+        bool restored_terminal = false;
+        if (!started_) {
             const auto emissions = std::min(request_.max_new_tokens,
                 request_.context_capacity - request_.prefix_tokens.size() + 1U);
             if (emissions > result_.generated_tokens.max_size())
                 throw std::length_error("greedy response exceeds host vector capacity");
             result_.generated_tokens.reserve(static_cast<std::size_t>(emissions));
+            started_ = true;
+            if (const auto restored = backend.try_restore_greedy_prefix(request_)) {
+                if (!restored->consumed_prefix || restored->consumed_prefix > request_.prefix_tokens.size() ||
+                    (restored->consumed_prefix == request_.prefix_tokens.size()) != restored->pending_token.has_value() ||
+                    (restored->pending_token && static_cast<std::uint64_t>(*restored->pending_token) >= request_.vocab_size))
+                    throw std::invalid_argument("greedy prefix backend returned an invalid consumed/pending frontier");
+                prefix_offset_ = static_cast<std::size_t>(restored->consumed_prefix);
+                result_.restored_prefix_tokens = restored->consumed_prefix;
+                result_.final_position = restored->consumed_prefix;
+                restored_terminal = !prefilling();
+                if (restored->pending_token) pending_ = *restored->pending_token;
+            }
         }
+        bool completed_prefill_here = false;
         if (prefilling()) {
             std::uint64_t consumed = 0;
             while (prefilling() && consumed < prefill_rows) {
@@ -356,10 +370,13 @@ void SerialGreedyTokenCursor::advance(SerialGreedyStepBackend& backend, std::uin
                 ++result_.steps_executed; ++result_.final_position;
             }
             if (prefilling()) return;
-        } else {
+            completed_prefill_here = true;
+        } else if (!restored_terminal) {
             pending_ = consume(pending_);
             ++result_.steps_executed; ++result_.final_position;
         }
+        if (completed_prefill_here && request_.max_new_tokens)
+            backend.capture_greedy_prefix(request_.prefix_tokens,pending_,request_.vocab_size);
         emit_pending();
     } catch (...) {
         failed_ = true;
