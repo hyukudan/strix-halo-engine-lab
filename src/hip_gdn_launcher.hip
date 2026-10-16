@@ -10,6 +10,7 @@
 #include "strix/q8_projection_manifest.hpp"
 
 #include "strix/dispatch_resources.hpp"
+#include "strix/prepared_tensor_views.hpp"
 #include "strix/execution_buffers.hpp"
 #include "strix/memory_plan.hpp"
 #include "strix/hip_launch_context.hpp"
@@ -2307,6 +2308,17 @@ void assign_unique(
 GdnTensors identify_tensors(
     const ExecutionDispatchContext& context,
     const HipGdnLauncherConfig& config) {
+    GdnTensors result;
+    if(const auto* cached=context.prepared_tensor_views) {
+        if(!context.resources) throw std::invalid_argument("prepared GDN roles require retained resources");
+        cached->validate_stage_scope(context.resources->distributed_stage,context.step_id);
+        cached->validate_source_handles(context.resources->model_manifest,context.resources->model_weights,context.resources->tensor_access);
+        const auto& roles=cached->gdn_roles(context.execution_identity,context.step_id);
+        result.qkv=tensor_pair(context,roles.qkv);result.z=tensor_pair(context,roles.z);
+        result.beta=tensor_pair(context,roles.beta);result.alpha=tensor_pair(context,roles.alpha);
+        result.conv=tensor_pair(context,roles.conv);result.dt=tensor_pair(context,roles.dt);
+        result.a=tensor_pair(context,roles.a);result.norm=tensor_pair(context,roles.norm);result.out=tensor_pair(context,roles.out);
+    } else {
     const auto& recurrent =
         resolve_dispatch_tensor_access(
             context, 0);
@@ -2314,7 +2326,6 @@ GdnTensors identify_tensors(
         resolve_dispatch_tensor_access(
             context, 1);
 
-    GdnTensors result;
     std::uint32_t qkv_count = 0;
     std::uint32_t z_count = 0;
     std::uint32_t beta_count = 0;
@@ -2440,6 +2451,8 @@ GdnTensors identify_tensors(
         out_count != 1) {
         throw std::invalid_argument(
             "HIP GDN tensor family is missing or ambiguous");
+    }
+
     }
 
     const auto hidden =

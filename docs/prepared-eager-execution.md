@@ -21,9 +21,12 @@ name lookup uses a prebuilt transparent tree and step/slot access uses the exist
 binary search. This avoids rescanning and validating every model tensor for each
 individual lookup. Before publishing the cache in any dispatch context, admission
 still compares all source metadata and physical identities; source descriptor
-handles are also checked at lookup. Launcher-specific shape/numerical checks and
-remaining operator-local tensor selection are unchanged. Dynamic admission is
-still linear in model metadata and is not claimed to meet every hot-path goal.
+handles are also checked at lookup. GDN and shared-expert launchers consume
+precomputed typed tensor roles from that same snapshot. Discovery runs during
+preparation, including shared projection geometry; prepared dispatch does not
+repeat their name/role scans. Launcher-specific dynamic shape, numerical,
+extent and generation checks remain. Dynamic entry admission is still linear
+in model metadata and is not claimed to meet every hot-path goal.
 
 Prepared scratch lookups use a private per-step allocation-index table over
 that same owned compiled snapshot. The table stores logical allocation indices,

@@ -150,7 +150,52 @@ def validate_runtime_environment(value):
         raise ValueError("runtime environment settings must be strings or null")
 
 
+def reported_uma_setup_observation(receipt):
+    keys = {"uma_setup_observation_boundary", "uma_setup_observation"}
+    if not (keys & receipt.keys()):
+        return None
+    if not keys <= receipt.keys() or receipt["uma_setup_observation_boundary"] != "after-base-runtime-D1-catalog-before-optional-request-setup":
+        raise ValueError("UMA setup observation requires its explicit sampling boundary")
+    value = receipt["uma_setup_observation"]
+    counters = {"mem_total_bytes", "mem_available_bytes", "process_rss_bytes", "process_peak_bytes", "gtt_reported_bytes"}
+    closed_keys(value, counters | {"kind", "supported", "observation_identity", "scope", "sampling", "begin_steady_ns",
+        "end_steady_ns", "meminfo_status", "process_status", "process_peak_kind", "rss_plus_gtt_computed"}, set(), "UMA setup observation")
+    if (value["kind"] != "reported-linux-host-counters-not-physical-fit" or
+        value["scope"] != "reported-system-and-self-process-memory" or
+        value["sampling"] != "bounded-two-file-read-interval-not-atomic" or
+        value["process_peak_kind"] != "VmHWM-resident-high-water-mark" or
+        boolean(value["rss_plus_gtt_computed"], "UMA RSS/GTT sum") or value["gtt_reported_bytes"] is not None):
+        raise ValueError("UMA observation cannot claim physical fit or combine RSS and GTT")
+    supported = boolean(value["supported"], "UMA platform support")
+    identity = integer(value["observation_identity"], "UMA observation identity")
+    begin = integer(value["begin_steady_ns"], "UMA sampling begin")
+    end = integer(value["end_steady_ns"], "UMA sampling end")
+    if end < begin or (supported and not identity):
+        raise ValueError("UMA observation identity or sampling interval is invalid")
+    statuses = {"unavailable", "read", "malformed", "oversized", "unsupported"}
+    for status, fields in (("meminfo_status", ("mem_total_bytes", "mem_available_bytes")),
+                           ("process_status", ("process_rss_bytes", "process_peak_bytes"))):
+        if not isinstance(value[status], str) or value[status] not in statuses:
+            raise ValueError("unknown UMA input status")
+        for field in fields:
+            if value[field] is not None:
+                integer(value[field], field)
+                if not supported or not identity or value[status] != "read":
+                    raise ValueError("unknown UMA input cannot carry a measured counter")
+    if not supported and (identity or begin or end or value["meminfo_status"] not in ("unavailable", "unsupported") or
+                          value["process_status"] not in ("unavailable", "unsupported")):
+        raise ValueError("unsupported UMA observation cannot claim an actual read")
+    total, available = value["mem_total_bytes"], value["mem_available_bytes"]
+    rss, peak = value["process_rss_bytes"], value["process_peak_bytes"]
+    if (total is not None and (not total or (available is not None and available > total))) or (
+            rss is not None and peak is not None and rss > peak):
+        raise ValueError("contradictory reported UMA counters")
+    return {"boundary": receipt["uma_setup_observation_boundary"], "reported": value,
+            "independently_verified": None, "capacity_qualification": None}
+
+
 def validate_outer_receipt(receipt):
+    reported_uma_setup_observation(receipt)
     if receipt.get("hip_runtime_environment") is not None:
         validate_runtime_environment(receipt["hip_runtime_environment"])
     # Outer receipts and external audit/probe schemas remain open: only fields
@@ -553,6 +598,7 @@ def collect(repo, cache_path=None, receipt_path=None, audit_path=None, manifest_
             "source": source, "inputs": inputs,
             "configured_build": cache, "build_completed": None,
             "reported_hip_runtime_environment": receipt.get("hip_runtime_environment"),
+            "reported_uma_setup_observation": reported_uma_setup_observation(receipt),
             "model": model, "reported_model_sha256": receipt.get("model_sha256"),
             "reported_model_content_identity": receipt.get("model_content_identity"),
             "binary": binary, "effective_profile": effective,

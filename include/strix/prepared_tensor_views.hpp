@@ -10,6 +10,16 @@
 namespace strix {
 class DistributedStageResourcePlan;
 
+// Host-only role descriptors retain GLOBAL canonical tensor indices. They do
+// not cache unchecked device addresses, launcher admission or state bindings.
+struct PreparedGdnTensorRoles {
+    std::uint32_t qkv=0,z=0,beta=0,alpha=0,conv=0,dt=0,a=0,norm=0,out=0;
+};
+struct PreparedSharedTensorRoles {
+    std::uint64_t hidden=0,intermediate=0;
+    std::uint32_t gate=0,up=0,down=0,shared_gate=0;
+};
+
 // Immutable, deeply owned lookup metadata. Construction is not permission to
 // execute: PreparedEagerExecution (or the explicitly scoped distributed stage)
 // must validate the actual dynamic resources and
@@ -42,6 +52,12 @@ public:
 
     // Scope must match its retained source and permits only actual local steps.
     void validate_stage_scope(const DistributedStageResourcePlan*,std::uint32_t step) const;
+    // Role discovery runs once against the owned manifest/access snapshot.
+    // Shared lookup is indexed by the actual static H/M geometry; no name,
+    // role or tensor-access scan runs here. Caller retains ordinary admission.
+    [[nodiscard]] const PreparedGdnTensorRoles& gdn_roles(std::uint64_t execution_identity,std::uint32_t step) const;
+    [[nodiscard]] const PreparedSharedTensorRoles& shared_roles(std::uint64_t execution_identity,std::uint32_t step,
+        std::uint64_t hidden,std::uint64_t intermediate) const;
     // Valid lookups allocate nothing and return references into this deep
     // snapshot. Tensor index and dense step/slot lookup are O(1); name lookup
     // and a sparse-slot fallback are O(log N).

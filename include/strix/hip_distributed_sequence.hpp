@@ -1,5 +1,6 @@
 #pragma once
 #include "strix/hip_distributed_transaction.hpp"
+#include "strix/hip_distributed_stage_resources.hpp"
 #include "strix/direct_gpu_boundary_staging.hpp"
 #include "strix/distributed_control_receiver.hpp"
 #include "strix/hip_setup_quiescence.hpp"
@@ -42,7 +43,24 @@ struct HipDistributedSequenceSetup {
     // data edge plus <=64 canonical position_prepare->suffix-QSA dependencies.
     // Logical position proof does not replace actual data retirement.
     bool layer_boundary_position_dependencies = false;
+    // Explicit actual stage owner. Null retains the legacy full-resource route.
+    // Its private model/resources/scope and participant owner must match exactly.
+    std::shared_ptr<HipDistributedStageResources> stage_owner;
 };
+struct HipDistributedStageSequenceOptions {
+    std::uint32_t maximum_inputs = 16;
+    std::uint64_t maximum_logit_payload_bytes = 0;
+    bool streaming = false;
+    std::uint64_t max_target_inputs = 0;
+    bool layer_boundary_position_dependencies = false;
+};
+// Uses the owner's genuine initialized p0 peer in the supplied jointly agreed
+// binding. Constructs the real participant and claims that owner once; no
+// ordinary SerialSessionContext is constructed or marked healthy. If setup
+// fails after claiming, discard this participant/owner rather than retrying it.
+[[nodiscard]] HipDistributedSequenceSetup make_hip_distributed_stage_sequence_setup(
+    std::shared_ptr<HipDistributedStageResources>, DistributedTokenBinding,
+    HipDistributedSequenceTransport, HipDistributedStageSequenceOptions);
 struct HipDistributedKnownInputResult {
     DistributedTokenCommit commit;
     std::uint32_t input_token = 0;

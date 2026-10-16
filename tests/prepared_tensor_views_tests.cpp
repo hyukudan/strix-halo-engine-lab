@@ -1,6 +1,8 @@
 #include "strix/prepared_tensor_views.hpp"
 
 #include <array>
+#include <cstddef>
+#include <algorithm>
 #include <cstdlib>
 #include <iostream>
 #include <memory>
@@ -64,12 +66,111 @@ struct Fixture {
         return std::make_unique<PreparedTensorViews>(17,execution,manifest,weights,access,owner);
     }
 };
+struct RoleFixture {
+    std::shared_ptr<std::array<std::byte,131072>> owner=std::make_shared<std::array<std::byte,131072>>();
+    ModelManifest manifest;
+    ModelRuntimeBinding weights;
+    SerialExecutionPlan execution;
+    ExecutionTensorAccessPlan access;
+    RoleFixture() {
+        manifest.architecture="host-role-descriptor-fixture";
+        const auto add=[&](std::string name,TensorRole role,std::uint32_t layer,std::vector<std::uint64_t> dims) {
+            ManifestTensor t;t.name=std::move(name);t.role=role;t.layer=layer;t.ggml_type=0;t.dimensions=std::move(dims);
+            t.byte_size=4;for(auto n:t.dimensions) t.byte_size*=n;
+            t.absolute_offset=manifest.total_tensor_bytes;manifest.total_tensor_bytes+=t.byte_size;
+            manifest.tensors.push_back(std::move(t));
+        };
+        add("blk.0.attn_qkv.weight",TensorRole::attention_projection,0,{64,96});
+        add("blk.0.attn_gate.weight",TensorRole::attention_projection,0,{64,32});
+        add("blk.0.ssm_beta.weight",TensorRole::recurrent_state,0,{64,4});
+        add("blk.0.ssm_alpha.weight",TensorRole::recurrent_state,0,{64,4});
+        add("blk.0.ssm_conv1d.weight",TensorRole::recurrent_state,0,{4,96});
+        add("blk.0.ssm_dt.bias",TensorRole::recurrent_state,0,{4});
+        add("blk.0.ssm_a.weight",TensorRole::recurrent_state,0,{4});
+        add("blk.0.ssm_norm.weight",TensorRole::recurrent_state,0,{8});
+        add("blk.0.ssm_out.weight",TensorRole::recurrent_state,0,{32,64});
+        add("blk.1.shared_expert.gate.weight",TensorRole::dense_projection,1,{64,32});
+        add("blk.1.shared_expert.up.weight",TensorRole::dense_projection,1,{64,32});
+        add("blk.1.shared_expert.down.weight",TensorRole::dense_projection,1,{32,64});
+        add("blk.1.shared_expert_gate.weight",TensorRole::dense_projection,1,{64});
+        require(manifest.total_tensor_bytes<=owner->size(),"role fixture actual backing too small");
+        ExecutionStep gdn;gdn.id=0;gdn.op=SerialOp::gated_delta_net;gdn.layer=0;
+        ExecutionStep shared;shared.id=1;shared.op=SerialOp::shared_expert;shared.layer=1;shared.dependencies={0};
+        execution.steps={gdn,shared};rebind();
+    }
+    void rebind() {
+        manifest.layout_identity=model_manifest_layout_identity(manifest);
+        weights={};weights.manifest_layout_identity=manifest.layout_identity;weights.model_content_identity.bytes[0]=7;
+        for(std::size_t i=0;i<manifest.tensors.size();++i) {
+            const auto& t=manifest.tensors[i];
+            weights.tensors.push_back({static_cast<std::uint32_t>(i),RuntimeTensorStorage::resident,
+                reinterpret_cast<std::uintptr_t>(owner->data()+t.absolute_offset),t.byte_size,9U,0U});
+        }
+        access=compile_execution_tensor_access_plan(execution,manifest,build_model_tensor_index(manifest),
+            build_serial_execution_tensor_requirements(execution));
+    }
+    std::unique_ptr<PreparedTensorViews> prepare() const {
+        return std::make_unique<PreparedTensorViews>(29,execution,manifest,weights,access,owner);
+    }
+};
 struct NoAllocations {
     NoAllocations() { forbid_allocations = true; }
     ~NoAllocations() { forbid_allocations = false; }
 };
 }
 int main() try {
+    RoleFixture roles;
+    auto role_cache=roles.prepare();
+    const auto& gdn=role_cache->gdn_roles(29,0);
+    const auto& shared=role_cache->shared_roles(29,1,64,32);
+    require(gdn.qkv==0 && gdn.z==1 && gdn.beta==2 && gdn.alpha==3 && gdn.conv==4 &&
+        gdn.dt==5 && gdn.a==6 && gdn.norm==7 && gdn.out==8,"prepared GDN typed roles differ from independent expected indices");
+    require(shared.gate==9 && shared.up==10 && shared.down==11 && shared.shared_gate==12,
+        "prepared shared typed roles confuse projection gate with scalar gate");
+    reject([&]{(void)role_cache->gdn_roles(30,0);});
+    reject([&]{(void)role_cache->gdn_roles(29,1);});
+    reject([&]{(void)role_cache->shared_roles(29,0,64,32);});
+    reject([&]{(void)role_cache->shared_roles(29,1,32,64);});
+    reject([&]{(void)role_cache->shared_roles(29,1,64,33);});
+    {
+        NoAllocations no_allocations;
+        for(unsigned i=0;i<1000U;++i) {
+            (void)role_cache->gdn_roles(29,0);(void)role_cache->shared_roles(29,1,64,32);
+            (void)role_cache->tensor(29,gdn.out);(void)role_cache->tensor(29,shared.shared_gate);
+        }
+    }
+    for(unsigned mode=0;mode<5U;++mode) {
+        auto saved=roles.manifest;auto old_weights=roles.weights;auto old_access=roles.access;
+        if(mode==0) roles.manifest.tensors[6].name="blk.0.ssm_alpha.other";
+        if(mode==1) ++roles.manifest.tensors[9].dimensions[1];
+        if(mode==2) ++roles.weights.tensors[8].allocation_generation;
+        if(mode==3) roles.access.accesses[0].tensor_indices.pop_back();
+        if(mode==4) roles.manifest.tensors[12].role=TensorRole::normalization;
+        reject([&]{role_cache->validate_source_metadata(roles.manifest,roles.weights,roles.access);});
+        roles.manifest=std::move(saved);roles.weights=std::move(old_weights);roles.access=std::move(old_access);
+    }
+    // Rebuild in a different manifest order: descriptors are derived from
+    // semantics/geometry, not source positions or a hard-coded canonical list.
+    std::reverse(roles.manifest.tensors.begin(),roles.manifest.tensors.end());roles.rebind();
+    auto permuted=roles.prepare();
+    require(roles.manifest.tensors[permuted->gdn_roles(29,0).a].name=="blk.0.ssm_a.weight" &&
+        roles.manifest.tensors[permuted->shared_roles(29,1,64,32).shared_gate].name=="blk.1.shared_expert_gate.weight",
+        "prepared role cache assumed original tensor order");
+    RoleFixture ambiguous;
+    ambiguous.manifest.tensors[6].name="blk.0.ssm_alpha.duplicate";ambiguous.rebind();
+    auto ambiguous_cache=ambiguous.prepare();reject([&]{(void)ambiguous_cache->gdn_roles(29,0);});
+    RoleFixture shared_ambiguous;
+    shared_ambiguous.manifest.tensors[9].name="blk.1.shared_expert.up.duplicate";shared_ambiguous.rebind();
+    auto shared_ambiguous_cache=shared_ambiguous.prepare();
+    reject([&]{(void)shared_ambiguous_cache->shared_roles(29,1,64,32);});
+    // Preserve the incumbent up-before-gate name priority rather than silently
+    // choosing whichever role makes an ambiguous family look complete.
+    RoleFixture shared_overlap;
+    shared_overlap.manifest.tensors[9].name="blk.1.shared_expert.gate_up.weight";shared_overlap.rebind();
+    auto shared_overlap_cache=shared_overlap.prepare();
+    reject([&]{(void)shared_overlap_cache->shared_roles(29,1,64,32);});
+    RoleFixture legacy;legacy.manifest.tensors[6].name="blk.0.ssm_in.weight";legacy.rebind();
+    auto legacy_cache=legacy.prepare();reject([&]{(void)legacy_cache->gdn_roles(29,0);});
     Fixture fixture;
     auto cached = fixture.prepare();
     cached->validate_source_metadata(fixture.manifest,fixture.weights,fixture.access);

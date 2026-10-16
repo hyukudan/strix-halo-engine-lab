@@ -7,6 +7,7 @@
 #endif
 
 #include "strix/dispatch_resources.hpp"
+#include "strix/prepared_tensor_views.hpp"
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -672,6 +673,13 @@ SharedTensors identify_tensors(
     const ExecutionDispatchContext& context,
     const ExecutionTensorAccess& access,
     const HipSharedExpertLauncherConfig& config) {
+    if(const auto* cached=context.prepared_tensor_views) {
+        if(!context.resources) throw std::invalid_argument("prepared shared roles require retained resources");
+        cached->validate_stage_scope(context.resources->distributed_stage,context.step_id);
+        cached->validate_source_handles(context.resources->model_manifest,context.resources->model_weights,context.resources->tensor_access);
+        const auto& roles=cached->shared_roles(context.execution_identity,context.step_id,config.hidden_size,config.intermediate_size);
+        return {tensor_pair(context,roles.gate),tensor_pair(context,roles.up),tensor_pair(context,roles.down),tensor_pair(context,roles.shared_gate)};
+    }
     SharedTensors result;
     std::uint32_t gate_matches = 0;
     std::uint32_t up_matches = 0;

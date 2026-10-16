@@ -23,6 +23,10 @@ struct DistributedSequenceQualificationResult {
     bool streaming_inputs = false;
     bool layer_boundary_position_dependencies = false;
     std::uint32_t data_boundaries = 0, logical_position_dependencies = 0;
+    bool stage_owned_resources = false, state_partitioned = false;
+    std::uint64_t stage_resource_identity = 0, state_mapping_identity = 0;
+    std::uint64_t retained_state_bytes = 0;
+    std::uint32_t compared_state_ranges = 0;
     // This callable case is not general link, memory-sharding, distributed
     // generation, crash-recovery or model-quality qualification.
 };
@@ -45,4 +49,14 @@ struct DistributedSequenceQualificationResult {
     HipDistributedSequenceSetup actual_setup, const DistributedSequenceReference& full_serial_reference,
     std::span<const std::uint32_t> known_inputs, const ModelContentIdentity& pinned_model_content,
     const SerialSessionContext& actual_ordinary_anchor);
+// Genuine typed stage owner/participant, no ordinary-session surrogate. The
+// independent reference remains a complete serial session with separate state.
+[[nodiscard]] DistributedSequenceQualificationResult qualify_hip_distributed_stage_inputs(
+    HipDistributedSequenceSetup actual_setup, const DistributedSequenceReference& full_serial_reference,
+    std::span<const std::uint32_t> known_inputs, const ModelContentIdentity& pinned_model_content);
+// Qualification-only payload comparison shared with the greedy fixture. Uses
+// global logical offsets from the retained mapping, never component-prefix or
+// full-flat comparison of absent state. Setup/reference retain all real owners.
+void compare_hip_distributed_owned_state(
+    const HipDistributedSequenceSetup&, const DistributedSequenceReference&);
 } // namespace strix::qualification

@@ -2,6 +2,7 @@
 #include "strix/deferred_moe_status.hpp"
 #include "strix/launch_dispatch.hpp"
 #include "strix/session_state_memory.hpp"
+#include "strix/distributed_stage_state.hpp"
 #include <hip/hip_runtime.h>
 #include <algorithm>
 #include <array>
@@ -10,6 +11,7 @@
 #include <cstddef>
 #include <cstring>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -19,17 +21,53 @@ namespace {
 void require_case(bool value,const char* reason) {if(!value) throw std::invalid_argument(reason);}
 void hip_case(hipError_t value) {if(value!=hipSuccess) throw std::runtime_error("distributed sequence qualification HIP failure");}
 void disjoint(std::uintptr_t a,std::uint64_t an,std::uintptr_t b,std::uint64_t bn) {
+    if(!an || !bn) {
+        require_case((an || !a) && (bn || !b),"qualification absent pool carries a nonzero address");
+        return;
+    }
     require_case(a && b && an && bn && an<=UINTPTR_MAX-a && bn<=UINTPTR_MAX-b && !(a<b+bn && b<a+an),
         "qualification reference and distributed mutable owners overlap or overflow");
 }
 struct OwnedRange {SessionStateAddress actual,reference;};
 std::vector<OwnedRange> owned_ranges(const HipDistributedSequenceSetup& setup,const DistributedSequenceReference& reference) {
     std::vector<OwnedRange> ranges;
+    require_case(setup.participant && setup.local_node<=1U && setup.participant->local_node()==setup.local_node &&
+        setup.resources.session_state_layout && setup.resources.session_state_memory &&
+        reference.resources.session_state_layout && reference.resources.session_state_memory &&
+        !reference.resources.session_state_memory->stage_mapping && !reference.resources.distributed_stage,
+        "qualification needs actual owned state and a complete independent serial reference");
     const auto& b=setup.participant->current_binding();const auto& peer=b.peers[setup.local_node];
+    require_case(peer.first_step<=peer.last_step && peer.last_step<setup.serial.execution.steps.size(),
+        "qualification owned step interval exceeds compiled execution");
     const auto& layout=*setup.resources.session_state_layout;const auto& memory=*setup.resources.session_state_memory;
     const auto& ref_layout=*reference.resources.session_state_layout;const auto& ref_memory=*reference.resources.session_state_memory;
     require_case(layout.layout_identity==ref_layout.layout_identity && layout.recurrent_storage==ref_layout.recurrent_storage,
         "qualification physical state layouts differ");
+    validate_serial_session_state_layout_identity(setup.model,ref_layout);
+    validate_session_state_memory_binding(ref_layout,ref_memory);
+    if(setup.stage_owner) {
+        const auto& owner=*setup.stage_owner;owner.validate();
+        require_case(setup.participant->stage_resources()==&owner &&
+            setup.resources.session_state_memory==owner.resources().session_state_memory &&
+            setup.resources.session_state_layout==owner.resources().session_state_layout &&
+            setup.resources.distributed_stage==&owner.plan(),"qualification state is not the actual retained stage owner");
+    }
+    if(const auto* mapping=memory.stage_mapping) {
+        require_case(setup.stage_owner && mapping->source_stage_identity()==setup.stage_owner->plan().identity(),
+            "qualification packed mapping belongs to another stage");
+        mapping->validate_source(setup.serial,setup.model,layout,setup.stage_owner->plan());
+        for(const auto& owned:mapping->ranges()) {
+            auto full=resolve_session_state(ref_layout,ref_memory,owned.component);
+            require_case(owned.logical_offset<=full.bytes && owned.bytes<=full.bytes-owned.logical_offset &&
+                owned.logical_offset<=UINTPTR_MAX-full.address &&
+                owned.bytes<=UINTPTR_MAX-(full.address+owned.logical_offset),
+                "qualification logical owned range exceeds the full serial reference");
+            full.address+=static_cast<std::uintptr_t>(owned.logical_offset);full.bytes=owned.bytes;
+            ranges.push_back({mapping->resolve(layout,memory,owned.component,owned.logical_offset,owned.bytes),full});
+        }
+        require_case(!ranges.empty(),"qualification packed stage has no actually owned range");
+        return ranges;
+    }
     for(std::uint32_t i=peer.first_step;i<=peer.last_step;++i) {
         const auto& step=setup.serial.execution.steps[i];
         if(step.op==SerialOp::gated_delta_net) {
@@ -78,10 +116,15 @@ void compare_ranges(const std::vector<OwnedRange>& ranges,HipSetupQuiescenceGuar
 }
 } // namespace
 
+void compare_hip_distributed_owned_state(const HipDistributedSequenceSetup& setup,const DistributedSequenceReference& reference) {
+    require_case(setup.actual_model_owner && reference.actual_owner,"qualification comparison requires actual retained owners");
+    HipSetupQuiescenceGuard guard;compare_ranges(owned_ranges(setup,reference),guard);
+}
+
 namespace {
 DistributedSequenceQualificationResult qualify_sequence_inputs(HipDistributedSequenceSetup setup,
     const DistributedSequenceReference& reference,std::span<const std::uint32_t> inputs,const ModelContentIdentity& pin,
-    const SerialSessionContext& ordinary_anchor,bool streaming) {
+    const SerialSessionContext* ordinary_anchor,bool streaming) {
     require_case(pin.valid() && setup.participant && setup.actual_model_owner && reference.actual_owner && reference.session &&
         setup.local_node<=1U && setup.resources.model_weights && reference.resources.model_weights &&
         setup.resources.scratch && setup.resources.session_state_memory && setup.resources.session_state_layout &&
@@ -103,8 +146,13 @@ DistributedSequenceQualificationResult qualify_sequence_inputs(HipDistributedSeq
     for(const auto& peer:binding.peers)
         require_case(binding.position<=peer.context_capacity && inputs.size()<=peer.context_capacity-binding.position,
             "qualification known input sequence exceeds a peer context");
-    const auto original_anchor=ordinary_anchor;
-    require_case(&ordinary_anchor!=reference.session,"qualification ordinary anchor aliases the serial reference");
+    std::optional<SerialSessionContext> original_anchor;
+    require_case(setup.stage_owner?!ordinary_anchor:ordinary_anchor!=nullptr,
+        "qualification stage owners cannot use a fabricated ordinary anchor");
+    if(ordinary_anchor) {
+        require_case(ordinary_anchor!=reference.session,"qualification ordinary anchor aliases the serial reference");
+        original_anchor=*ordinary_anchor;
+    }
     require_case(reference.session->next_position==binding.position && reference.session->committed_tokens==binding.committed_tokens &&
         reference.session->state.valid==binding.initial_global_state.valid &&
         reference.session->state.generations==binding.initial_global_state.generations,
@@ -150,11 +198,44 @@ DistributedSequenceQualificationResult qualify_sequence_inputs(HipDistributedSeq
         if(fault==4U) {bad.transport.step_control=bad.transport.token_control;reason="distinct bounded kind5";}
         if(fault==5U) {bad.transport.actual_owner.reset();reason="real one-link transport";}
         if(fault==6U) {bad.local_node^=1U;reason="participant and model";}
+        if(setup.stage_owner && (fault==2U || fault==3U || fault==6U)) reason="immutable actual owner";
         bool rejected=false;
         try {HipDistributedKnownSequence invalid(std::move(bad));}
         catch(const std::invalid_argument& error) {rejected=std::string(error.what()).find(reason)!=std::string::npos;}
         require_case(rejected && setup.participant->phase()==DistributedTokenPhase::preparing,
             "qualification invalid cut/endpoint/wire/owner did not reject at its intended pre-mutation gate");
+    }
+    if(setup.stage_owner) {
+        // Invalid public factory policy must reject BEFORE constructing or
+        // claiming another participant, even though this owner is already held.
+        bool no_budget=false;
+        try {(void)make_hip_distributed_stage_sequence_setup(setup.stage_owner,binding,setup.transport,{});}
+        catch(const std::invalid_argument& error) {no_budget=std::string(error.what()).find("bounded input/row policy")!=std::string::npos;}
+        require_case(no_budget && setup.participant->phase()==DistributedTokenPhase::preparing,
+            "qualification stage factory consumed an invalid budget");
+        for(unsigned fault=0;fault<8U;++fault) {
+            auto bad=setup;
+            ExecutionRuntimeResources copied=setup.stage_owner->resources();
+            SessionStateMemoryBinding state=*copied.session_state_memory;
+            ExecutionMemoryBinding scratch=*copied.scratch;
+            if(fault==0U) bad.stage_owner.reset();
+            if(fault==1U) {state.stage_mapping=nullptr;bad.resources.session_state_memory=&state;}
+            if(fault==2U) bad.serial.arena.allocations.front().offset^=256U;
+            if(fault==3U) ++bad.serial.execution.steps.front().id;
+            if(fault==4U) ++bad.model.ngram_hash_seed;
+            if(fault==5U) ++bad.scope.deferred_moe_status.allocation_generation;
+            if(fault==6U) bad.resources.scratch=&scratch; // Identical value, foreign binding object.
+            if(fault==7U) bad.actual_model_owner=std::shared_ptr<const void>(setup.stage_owner.get(),[](const void*){});
+            bool rejected=false;
+            try {HipDistributedKnownSequence invalid(std::move(bad));}
+            catch(const std::invalid_argument& error) {
+                const std::string message=error.what();
+                rejected=message.find(fault==0U?"explicit actual stage owner":fault==7U?
+                    "retained ownership":"immutable actual owner")!=std::string::npos;
+            }
+            require_case(rejected && setup.participant->phase()==DistributedTokenPhase::preparing,
+                "qualification forged stage owner/source scope did not reject before preparation");
+        }
     }
     if(setup.layer_boundary_position_dependencies) {
         // A structural guard is tested before canonical-ID comparison; no
@@ -215,6 +296,21 @@ DistributedSequenceQualificationResult qualify_sequence_inputs(HipDistributedSeq
     receipt.local_node=setup.local_node;receipt.known_inputs=static_cast<std::uint32_t>(inputs.size());
     receipt.streaming_inputs=streaming;
     receipt.layer_boundary_position_dependencies=setup.layer_boundary_position_dependencies;
+    receipt.stage_owned_resources=static_cast<bool>(setup.stage_owner);
+    receipt.compared_state_ranges=static_cast<std::uint32_t>(ranges.size());
+    if(setup.stage_owner) {
+        receipt.stage_resource_identity=setup.stage_owner->plan().identity();
+        receipt.retained_state_bytes=setup.stage_owner->reservation().retained_state_bytes;
+        receipt.state_partitioned=setup.stage_owner->reservation().state_partitioned;
+        if(const auto* mapping=setup.resources.session_state_memory->stage_mapping) {
+            receipt.state_mapping_identity=mapping->identity();
+            const auto typed_snapshot=build_stage_snapshot_plan(*mapping,setup.participant->binding_identity());
+            require_case(typed_snapshot.ranges.size()==ranges.size() &&
+                typed_snapshot.device_bytes<=UINT64_MAX-typed_snapshot.host_bytes &&
+                typed_snapshot.device_bytes+typed_snapshot.host_bytes<=setup.stage_owner->snapshot_budget_bytes(),
+                "qualification actual stage snapshot shape exceeds its retained budget");
+        }
+    }
     for(const auto& edge:setup.canonical_plan.boundaries) {
         if(is_materialized_input_position_dependency(setup.canonical_plan,edge)) ++receipt.logical_position_dependencies;
         else ++receipt.data_boundaries;
@@ -357,14 +453,14 @@ DistributedSequenceQualificationResult qualify_sequence_inputs(HipDistributedSeq
         frontier->commit().global_state.generations==reference.session->state.generations,
         "qualification final global write generations differ from full serial");
     compare_ranges(ranges,guard);
-    require_case(ordinary_anchor.health==SerialSessionHealth::poisoned && ordinary_anchor.arithmetic_lineage.tainted &&
-        ordinary_anchor.execution_identity==original_anchor.execution_identity &&
-        ordinary_anchor.state_layout_identity==original_anchor.state_layout_identity &&
-        ordinary_anchor.runtime_compatibility_identity==original_anchor.runtime_compatibility_identity &&
-        ordinary_anchor.next_position==original_anchor.next_position && ordinary_anchor.committed_tokens==original_anchor.committed_tokens &&
-        ordinary_anchor.state.valid==original_anchor.state.valid && ordinary_anchor.state.generations==original_anchor.state.generations &&
-        ordinary_anchor.arithmetic_lineage.intervals==original_anchor.arithmetic_lineage.intervals &&
-        ordinary_anchor.arithmetic_lineage.history_identity==original_anchor.arithmetic_lineage.history_identity,
+    if(ordinary_anchor) require_case(ordinary_anchor->health==SerialSessionHealth::poisoned && ordinary_anchor->arithmetic_lineage.tainted &&
+        ordinary_anchor->execution_identity==original_anchor->execution_identity &&
+        ordinary_anchor->state_layout_identity==original_anchor->state_layout_identity &&
+        ordinary_anchor->runtime_compatibility_identity==original_anchor->runtime_compatibility_identity &&
+        ordinary_anchor->next_position==original_anchor->next_position && ordinary_anchor->committed_tokens==original_anchor->committed_tokens &&
+        ordinary_anchor->state.valid==original_anchor->state.valid && ordinary_anchor->state.generations==original_anchor->state.generations &&
+        ordinary_anchor->arithmetic_lineage.intervals==original_anchor->arithmetic_lineage.intervals &&
+        ordinary_anchor->arithmetic_lineage.history_identity==original_anchor->arithmetic_lineage.history_identity,
         "qualification distributed continuation republished or changed its quarantined ordinary anchor");
     receipt.native_sequence_completed=true;receipt.terminal_rows_bitwise_equal=setup.local_node==1U;
     receipt.locally_owned_state_equal=true;
@@ -374,18 +470,24 @@ DistributedSequenceQualificationResult qualify_sequence_inputs(HipDistributedSeq
 DistributedSequenceQualificationResult qualify_hip_distributed_known_sequence(HipDistributedSequenceSetup setup,
     const DistributedSequenceReference& reference,std::span<const std::uint32_t> inputs,const ModelContentIdentity& pin,
     const SerialSessionContext& ordinary_anchor) {
-    return qualify_sequence_inputs(std::move(setup),reference,inputs,pin,ordinary_anchor,false);
+    return qualify_sequence_inputs(std::move(setup),reference,inputs,pin,&ordinary_anchor,false);
 }
 DistributedSequenceQualificationResult qualify_hip_distributed_streaming_inputs(HipDistributedSequenceSetup setup,
     const DistributedSequenceReference& reference,std::span<const std::uint32_t> inputs,const ModelContentIdentity& pin,
     const SerialSessionContext& ordinary_anchor) {
-    return qualify_sequence_inputs(std::move(setup),reference,inputs,pin,ordinary_anchor,true);
+    return qualify_sequence_inputs(std::move(setup),reference,inputs,pin,&ordinary_anchor,true);
 }
 DistributedSequenceQualificationResult qualify_hip_distributed_layer_boundary_inputs(HipDistributedSequenceSetup setup,
     const DistributedSequenceReference& reference,std::span<const std::uint32_t> inputs,const ModelContentIdentity& pin,
     const SerialSessionContext& ordinary_anchor) {
     require_case(setup.layer_boundary_position_dependencies,"qualification requires an explicit actual complete-layer setup");
     const bool streaming=setup.streaming;
-    return qualify_sequence_inputs(std::move(setup),reference,inputs,pin,ordinary_anchor,streaming);
+    return qualify_sequence_inputs(std::move(setup),reference,inputs,pin,&ordinary_anchor,streaming);
+}
+DistributedSequenceQualificationResult qualify_hip_distributed_stage_inputs(HipDistributedSequenceSetup setup,
+    const DistributedSequenceReference& reference,std::span<const std::uint32_t> inputs,const ModelContentIdentity& pin) {
+    require_case(static_cast<bool>(setup.stage_owner),"qualification requires an actual retained stage resource owner");
+    const bool streaming=setup.streaming;
+    return qualify_sequence_inputs(std::move(setup),reference,inputs,pin,nullptr,streaming);
 }
 } // namespace strix::qualification

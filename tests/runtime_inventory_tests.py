@@ -44,6 +44,38 @@ class InventoryTests(unittest.TestCase):
     def collect(self, **kwargs):
         return INVENTORY.collect(self.root, **kwargs)
 
+    def test_reported_uma_observation_is_retained_without_capacity_qualification(self):
+        sample = {"kind": "reported-linux-host-counters-not-physical-fit", "supported": True,
+            "observation_identity": 1, "scope": "reported-system-and-self-process-memory",
+            "sampling": "bounded-two-file-read-interval-not-atomic", "begin_steady_ns": 10, "end_steady_ns": 20,
+            "meminfo_status": "read", "process_status": "read", "mem_total_bytes": 131072,
+            "mem_available_bytes": 65536, "process_rss_bytes": 1024, "process_peak_bytes": 2048,
+            "process_peak_kind": "VmHWM-resident-high-water-mark", "gtt_reported_bytes": None, "rss_plus_gtt_computed": False}
+        receipt = {"uma_setup_observation_boundary": "after-base-runtime-D1-catalog-before-optional-request-setup",
+                   "uma_setup_observation": sample}
+        observed = INVENTORY.reported_uma_setup_observation(receipt)
+        self.assertEqual(observed["reported"], sample)
+        self.assertIsNone(observed["independently_verified"])
+        self.assertIsNone(observed["capacity_qualification"])
+        output = self.collect(receipt_path=self.evidence("uma.json", receipt))
+        self.assertEqual(output["reported_uma_setup_observation"], observed)
+        self.assertIsNone(INVENTORY.reported_uma_setup_observation({}))
+        for field, value in (("mem_available_bytes", 131073), ("process_rss_bytes", 2049),
+                             ("mem_total_bytes", True), ("end_steady_ns", 9), ("observation_identity", 0),
+                             ("rss_plus_gtt_computed", True), ("gtt_reported_bytes", 1),
+                             ("meminfo_status", "malformed"), ("supported", False)):
+            bad = copy.deepcopy(receipt);bad["uma_setup_observation"][field] = value
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                INVENTORY.reported_uma_setup_observation(bad)
+        bad = copy.deepcopy(receipt);del bad["uma_setup_observation_boundary"]
+        with self.assertRaises(ValueError): INVENTORY.reported_uma_setup_observation(bad)
+        unknown = copy.deepcopy(receipt)
+        for field in ("mem_total_bytes", "mem_available_bytes", "process_rss_bytes", "process_peak_bytes"):
+            unknown["uma_setup_observation"][field] = None
+        unknown["uma_setup_observation"].update(supported=False, observation_identity=0,
+            begin_steady_ns=0, end_steady_ns=0, meminfo_status="unsupported", process_status="unsupported")
+        self.assertIsNone(INVENTORY.reported_uma_setup_observation(unknown)["reported"]["mem_total_bytes"])
+
     def selected_inventory(self):
         return {"schema_version": 1, "evidence_kind": "compiled-selected-launchers",
                 "phase": "decode", "selected_logical_rows": 1, "selected_request_concurrency": 1,

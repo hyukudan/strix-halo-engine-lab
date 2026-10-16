@@ -11,6 +11,7 @@
 #include "strix/hip_gdn_islands.hpp"
 #include "strix/hip_embedding_launcher.hpp"
 #include "strix/prepared_execution.hpp"
+#include "strix/prepared_tensor_views.hpp"
 #include "strix/hip_model_residency.hpp"
 #include "strix/hip_launch_context.hpp"
 #include "../apps/hip_deferred_moe_status.hpp"
@@ -912,6 +913,9 @@ void run_gdn_island_fixture() {
                     const auto& resolved = strix::resolve_dispatch_tensor(current, "blk.0.ssm_out.weight");
                     expect(current.prepared_tensor_views != nullptr && &resolved != actual_,
                         "actual prepared dispatcher publishes deep-copied tensor metadata, not canonical owner pointers");
+                    const auto& roles=current.prepared_tensor_views->gdn_roles(current.execution_identity,current.step_id);
+                    expect(&current.prepared_tensor_views->tensor(current.execution_identity,roles.out)==&resolved,
+                        "actual prepared GDN path consumes the typed output role from its retained snapshot");
                     ++prepared_gdn_calls;
                 }
                 dispatcher_.dispatch_kernel(current);

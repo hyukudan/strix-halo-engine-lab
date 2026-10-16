@@ -65,6 +65,7 @@ add_library(strix_core STATIC
     src/offline_tuning_preparation.cpp
     src/offline_compile_provenance.cpp
     src/uma_owner_inventory.cpp
+    src/linux_uma_observation.cpp
     src/moe_fork_join_arena.cpp
     src/moe_token_cost_backend.cpp
     src/prepared_execution.cpp
@@ -807,6 +808,11 @@ if(BUILD_TESTING)
     target_link_libraries(strix-execution-resources-tests PRIVATE strix_core)
     strix_target_warnings(strix-execution-resources-tests)
     add_test(NAME strix-execution-resources-tests COMMAND strix-execution-resources-tests)
+
+    add_executable(strix-linux-uma-observation-tests tests/linux_uma_observation_tests.cpp)
+    target_link_libraries(strix-linux-uma-observation-tests PRIVATE strix_core)
+    strix_target_warnings(strix-linux-uma-observation-tests)
+    add_test(NAME strix-linux-uma-observation-tests COMMAND strix-linux-uma-observation-tests)
 
     add_executable(strix-distributed-stage-state-tests tests/distributed_stage_state_tests.cpp)
     target_link_libraries(strix-distributed-stage-state-tests PRIVATE strix_core)
@@ -1785,7 +1791,8 @@ if(STRIX_ENABLE_HIP_RUNTIME)
             -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
         target_include_directories(strix-hip-distributed-greedy-model-fixture PUBLIC
             ${CMAKE_CURRENT_SOURCE_DIR}/tests)
-        target_link_libraries(strix-hip-distributed-greedy-model-fixture PUBLIC strix_hip_runtime)
+        target_link_libraries(strix-hip-distributed-greedy-model-fixture PUBLIC
+            strix_hip_runtime strix-hip-distributed-sequence-model-fixture)
         strix_target_warnings(strix-hip-distributed-greedy-model-fixture)
 
         add_executable(strix-hip-serving-greedy-model-qualification tests/hip_serving_greedy_backend_tests.hip)

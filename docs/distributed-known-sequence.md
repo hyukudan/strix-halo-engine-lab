@@ -4,8 +4,9 @@
 the real token participant, native transport backend and concrete GPU boundary
 staging. It accepts two through sixteen literal known input tokens. It does not
 perform distributed greedy generation, sampling, memory sharding or recovery.
-Every peer retains its complete local model mapping/residency and seven-state
-snapshot owners. No default decoder route changes.
+The default full-resource route retains complete local model/state and snapshot
+owners. An explicit stage owner can retain selected weights and typed packed
+state as described below. No default decoder route changes.
 
 The first consumer admits one contiguous prefix on node0, one suffix on node1,
 one nonempty boundary from the last prefix operation to the first suffix
@@ -150,3 +151,78 @@ pre-PLE, malformed logical and implicit legacy-mode admissions. It accepts the
 explicit literal or retained streaming input mode. This cut enables a larger
 suffix structurally; it makes no measured balance, speed or physical capacity
 claim. Native, model, physical and complete-request qualification is pending.
+
+## Actual stage-owned resources
+
+`HipDistributedStageResources::create` can retain only the selected stage's
+weight backing. Its default state policy remains `full`; the explicit
+`local_owned_ranges` policy owns packed state pools and a typed snapshot of all
+and only its logical state ranges. Scratch remains the complete serial arena.
+The logical seven-component layout is retained as an addressing contract, not
+as a claim that absent remote state is allocated locally. The reservation
+reports full logical and actually retained state bytes separately.
+
+`make_hip_distributed_stage_sequence_setup` takes this actual shared owner, the
+jointly agreed initial binding, actual native transport and explicit sequence
+options. It constructs the real stage participant using the owner's genuine
+initialized position-zero frontier. The owner is claimed once; a failed setup
+after claiming requires fresh setup rather than retrying the same owner. No
+ordinary `SerialSessionContext` is created or marked healthy for a stage.
+
+The resulting `stage_owner` pin is explicit. Admission checks its actual shared
+ownership group, the participant's retained owner, every runtime-resource
+pointer, all compiled/model fields and the complete launch scope. Identical IDs
+on changed metadata, copied binding objects or a no-op deleter do not establish
+ownership. Each input revalidates the retained backing before continuation.
+The same owner is pinned by source staging and the actual native retirement
+ledger. Clearing a caller's setup cannot release work or storage still retained
+by the participant or proof. This path also feeds the existing greedy consumer
+through `HipDistributedSequenceSetup`; it changes no emission policy.
+
+The participant uses the distinct typed stage snapshot path when a packed map
+is present. It snapshots and restores actual local pools without republishing a
+full serial session. `DistributedStageStateMapping` maps each owned range's
+component-relative logical offset to its packed local offset; no contiguous
+component-prefix assumption is made. Prefix and suffix retain their own causal
+state and the replicated complete input-position word.
+
+The callable `qualify_hip_distributed_stage_inputs` and
+`qualify_hip_distributed_stage_greedy_request` share the existing execution and
+comparison machinery with the full-resource cases. They require the actual
+typed owner and independent complete serial reference, with no fabricated
+ordinary anchor. Every owned logical range compares against the corresponding
+interior range of that reference. Known inputs additionally compare every
+terminal FP32 bit; greedy compares the existing cursor's selected sequence,
+consumed/emitted counts and typed distributed generations. Absent remote ranges
+are not compared as though they were allocated. Source fixtures include forged
+same-ID arena/step/model metadata, mapping removal, foreign resource objects,
+D1 generation changes and non-owning alias pins. These remain unexecuted source
+fixtures until the separate qualification gates run.
+
+## Remaining two-host bootstrap boundary
+
+The model consumer, stage allocation, typed snapshots and callable cases are
+implemented source. A standalone two-host bootstrap still must assemble actual
+live providers and owners; there is no synthetic ready path or placeholder CLI.
+In particular:
+
+- Both hosts must load the pinned model, agree the same compiled/canonical cut
+  and exchange their genuine initial peer metadata before creating the bound
+  participants. Each host must admit its actual weight, scratch, local state,
+  snapshot, pool and headroom budgets.
+- The embedding owner must supply current native sessions, imported TX/RX pools,
+  GPU visibility/consumer providers, lease registry and a qualified link profile.
+  `LinuxDirectTransportDriverIo` still requires independent
+  `DirectGpuStreamQualification` for the exact observed device/driver/pool path;
+  its stock factory supplies no positive declaration.
+- The owner must establish bounded protected step, token and greedy channels,
+  separately from the driver's kind4 progress channel, and retain all sessions,
+  streams, driver and physical allocations through actual retirement or proven
+  lease closure. No implicit multiplexing or reconnect protocol is added.
+
+`LinuxDirectGpuStreamCommissioning` and its reports are experimental observations,
+not production IO providers, readiness declarations or model transport proofs.
+They cannot be substituted into this factory to bypass absent qualification.
+Executing these model cases, independently qualifying the physical path and
+binding a real standalone bootstrap remain outstanding; source assembly alone
+does not establish hardware readiness or memory fit.

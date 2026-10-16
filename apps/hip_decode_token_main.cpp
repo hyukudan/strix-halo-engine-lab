@@ -24,6 +24,7 @@
 #include "strix/offline_compile_provenance.hpp"
 #include "offline_tuning_build_context.hpp"
 #include "strix/hip_model_residency.hpp"
+#include "strix/linux_uma_observation.hpp"
 #include "strix/hip_event_queue_trace.hpp"
 #include "strix/hip_runtime_allocator.hpp"
 #include "strix/hip_session_snapshot_transfer.hpp"
@@ -1809,9 +1810,18 @@ int main(
     if (launcher_catalog->audit(compiled, launchers).missing_steps)
         throw std::logic_error("HIP launcher catalog is incomplete for actual compiled execution");
     const auto launch_plan = strix::compile_launch_plan(compiled, launchers);
+    std::string uma_setup_observation_receipt;
+    if (options.execution_inventory) {
+        const auto observed = strix::observe_linux_uma_memory();
+        uma_setup_observation_receipt = "  \"uma_setup_observation_boundary\":\"after-base-runtime-D1-catalog-before-optional-request-setup\",\n"
+            "  \"uma_setup_observation\":" +
+            strix::linux_uma_observation_json(observed) + ",\n";
+        if (model_owner_inventory)
+            model_owner_inventory = strix::build_uma_owner_inventory(model_owner_inventory->pinned_views, observed.memory);
+    }
     const auto execution_inventory_receipt = options.execution_inventory
         ? strix::decode_receipt::execution_inventory_receipt(compiled, launch_plan, kernel_registry) +
-            strix::decode_receipt::hip_runtime_environment_receipt() + model_owner_inventory_receipt
+            strix::decode_receipt::hip_runtime_environment_receipt() + model_owner_inventory_receipt + uma_setup_observation_receipt
         : std::string{};
     std::unique_ptr<strix::HipEventQueueTrace> device_queue_trace;
     std::optional<strix::ExecutionTelemetryBinding> device_queue_binding;

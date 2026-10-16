@@ -8,6 +8,8 @@ struct DistributedGreedyQualificationResult {
     std::uint64_t consumed_inputs = 0, emitted_tokens = 0;
     bool real_native_generation_completed = false, finish_confirmed = false;
     bool selected_sequence_matches_serial = false, locally_owned_state_equal = false;
+    bool stage_owned_resources = false, state_partitioned = false;
+    std::uint64_t stage_resource_identity = 0, state_mapping_identity = 0;
     // This case compares selected output and local owned state. Actual full
     // terminal-row equality is the separate streaming-input qualification.
     // No physical link commissioning, bootstrap or memory-sharding claim.
@@ -20,4 +22,11 @@ struct DistributedGreedyQualificationResult {
     DistributedGreedyRequestIdentity, std::span<const std::uint32_t> agreed_prompt,
     std::shared_ptr<DistributedControlByteStream> greedy_control,
     const SerialSessionContext& actual_ordinary_anchor);
+// Same real cursor/native consumer with a genuine typed stage owner. There is
+// no ordinary-session surrogate; only its actual logical owned slices compare
+// to the independent full reference. Full-row proof remains a separate case.
+[[nodiscard]] DistributedGreedyQualificationResult qualify_hip_distributed_stage_greedy_request(
+    HipDistributedSequenceSetup, const DistributedSequenceReference&,
+    DistributedGreedyRequestIdentity, std::span<const std::uint32_t> agreed_prompt,
+    std::shared_ptr<DistributedControlByteStream> greedy_control);
 } // namespace strix::qualification

@@ -7,6 +7,8 @@
 #include "strix/execution_tensor_access.hpp"
 #include "strix/hip_shared_expert_launcher.hpp"
 #include "strix/hip_launch_context.hpp"
+#include "strix/prepared_tensor_views.hpp"
+#include "strix/hip_setup_quiescence.hpp"
 #include "strix/model_contract.hpp"
 #include "strix/model_manifest.hpp"
 #include "strix/model_runtime_binding.hpp"
@@ -21,6 +23,7 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -43,6 +46,18 @@ void check(hipError_t error, const char* operation) {
             hipGetErrorString(error));
     }
 }
+
+struct SharedDeviceOwners {
+    strix::HipSetupQuiescenceGuard guard;
+    void* arena=nullptr;
+    std::vector<void*> weights;
+    ~SharedDeviceOwners() {
+        if(hipSetDevice(guard.device_index())!=hipSuccess) std::terminate();
+        guard.recover_or_fail_stop();
+        for(auto* address:weights) if(address && hipFree(address)!=hipSuccess) std::terminate();
+        if(arena && hipFree(arena)!=hipSuccess) std::terminate();
+    }
+};
 
 struct Q8Block {
     __half scale;
@@ -163,6 +178,7 @@ int main() try {
             io,
             256);
 
+    auto retained=std::make_shared<SharedDeviceOwners>();
     void* arena_pointer = nullptr;
     check(
         hipMalloc(
@@ -170,6 +186,7 @@ int main() try {
             static_cast<std::size_t>(
                 arena.total_bytes)),
         "hipMalloc shared-expert arena");
+    retained->arena=arena_pointer;
 
     strix::ExecutionMemoryBinding memory;
     memory.execution_identity =
@@ -377,9 +394,8 @@ int main() try {
         strix::model_manifest_layout_identity(
             manifest);
 
-    std::vector<void*> device_weights(
-        manifest.tensors.size(),
-        nullptr);
+    auto& device_weights=retained->weights;
+    device_weights.resize(manifest.tensors.size(),nullptr);
     const auto upload =
         [&](std::size_t index,
             const void* source,
@@ -532,6 +548,37 @@ int main() try {
         maximum_error <= 2e-4F,
         "mixed-format shared expert matches CPU reference");
 
+    {
+        // A real dense component uses the same allocation owners, original
+        // launch function and data. No model-wide prepared claim is implied.
+        auto component_step=step;component_step.id=0;component_step.dependencies.clear();
+        strix::SerialExecutionPlan component;component.steps={component_step};
+        const auto component_access=strix::compile_execution_tensor_access_plan(component,manifest,
+            strix::build_model_tensor_index(manifest),strix::build_serial_execution_tensor_requirements(component));
+        auto cached_resources=resources;cached_resources.tensor_access=&component_access;
+        strix::PreparedTensorViews views(memory.execution_identity,component,manifest,runtime,component_access,retained);
+        views.validate_source_metadata(manifest,runtime,component_access);
+        const auto& roles=views.shared_roles(memory.execution_identity,0,hidden,intermediate);
+        expect(roles.gate==0U && roles.up==1U && roles.down==2U && roles.shared_gate==3U,
+            "actual shared prepared component retains the typed projection/scalar roles");
+        const auto temporary=strix::resolve_execution_buffer(memory.execution_identity,arena,memory,step_io.temporaries[0]);
+        const auto read=[&](std::uintptr_t address,std::uint64_t bytes) {
+            std::vector<std::byte> result(static_cast<std::size_t>(bytes));
+            check(hipMemcpy(result.data(),reinterpret_cast<const void*>(address),result.size(),hipMemcpyDeviceToHost),
+                "read shared prepared component whole bytes");return result;
+        };
+        const auto baseline_output=read(output.address,output.bytes),baseline_temp=read(temporary.address,temporary.bytes);
+        check(hipMemset(reinterpret_cast<void*>(output.address),0xa5,hidden*sizeof(float)),"poison prepared shared output");
+        check(hipMemset(reinterpret_cast<void*>(temporary.address),0xa5,intermediate*2U*sizeof(float)),"poison prepared shared workspace");
+        auto cached_context=context;cached_context.execution_identity=memory.execution_identity;cached_context.step_id=0;
+        cached_context.resources=&cached_resources;cached_context.prepared_tensor_views=&views;
+        launcher.function(cached_context,launcher.user_data);
+        check(hipDeviceSynchronize(),"complete actual shared prepared component");
+        expect(read(output.address,output.bytes)==baseline_output && read(temporary.address,temporary.bytes)==baseline_temp,
+            "actual cached-role shared launcher differs from diagnostic whole output/workspace bytes");
+    }
+
+
 
     {
         const auto temporary=strix::resolve_execution_buffer(memory.execution_identity,arena,memory,step_io.temporaries[0]);
@@ -632,15 +679,8 @@ int main() try {
         check(hipStreamDestroy(stream),"destroy shared comparison stream");
     }
 
-    for (auto* pointer :
-         device_weights) {
-        check(
-            hipFree(pointer),
-            "hipFree shared-expert weight");
-    }
-    check(
-        hipFree(arena_pointer),
-        "hipFree shared-expert arena");
+    // retained owns all actual allocations through prepared/captured consumers.
+    retained.reset();
 
     if (failures == 0) {
         std::cout

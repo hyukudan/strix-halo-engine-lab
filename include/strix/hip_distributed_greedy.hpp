@@ -21,7 +21,9 @@ struct HipDistributedGreedyTerminalResult {
 // Caller supplies commissioned live native owners plus an independently bounded,
 // protected kind6 stream (distinct from step, token and GPU progress streams).
 // Both peers retain exactly the same actual prompt, SHA256 of u32 little-endian.
-// All local weights remain resident. Ordinary serial anchors stay quarantined.
+// Actual local backing and optional typed packed state stay retained through
+// SequenceSetup's stage_owner; no ordinary healthy stage session is fabricated.
+// Legacy ordinary serial anchors stay quarantined.
 // Serialized single request. No reconnect, retry, rollback after decision, or
 // independent firstmax verification by the scalar-receiving coordinator.
 class HipDistributedGreedyRequest final {

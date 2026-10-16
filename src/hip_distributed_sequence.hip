@@ -6,6 +6,7 @@
 #include <array>
 #include <bit>
 #include <cmath>
+#include <tuple>
 #include <exception>
 #include <limits>
 #include <optional>
@@ -21,6 +22,111 @@ bool same_flow(const DistributedBoundaryFlow& a,const DistributedBoundaryFlow& b
 bool same_boundary(const DistributedExecutionBoundary& a,const DistributedExecutionBoundary& b) {
     return a.boundary_id==b.boundary_id && a.source_step==b.source_step && a.destination_step==b.destination_step &&
         a.source_node==b.source_node && a.destination_node==b.destination_node && a.payload_bytes==b.payload_bytes && a.payloads==b.payloads;
+}
+void validate_target_limit(const DistributedTokenBinding& binding,std::uint64_t capacity,std::uint64_t count) {
+    require_sequence(count && count-1U<=UINT64_MAX-binding.generation && count<=UINT64_MAX-binding.position,
+        "sequence input/frontier or generation bound is invalid");
+    for(const auto& peer:binding.peers)
+        require_sequence(binding.position<=peer.context_capacity && count<=peer.context_capacity-binding.position,
+            "sequence exceeds a peer's context capacity");
+    require_sequence(binding.position<=capacity && count<=capacity-binding.position && count<=UINT64_MAX-binding.committed_tokens,
+        "sequence exceeds compiled context or committed-token counter capacity");
+}
+bool same_resources(const ExecutionRuntimeResources& a,const ExecutionRuntimeResources& b) {
+    return a.scratch==b.scratch && a.model_manifest==b.model_manifest && a.model_weights==b.model_weights &&
+        a.tensor_access==b.tensor_access && a.session_state_layout==b.session_state_layout &&
+        a.session_state_memory==b.session_state_memory && a.ple_lookup==b.ple_lookup &&
+        a.ple_hash_contract==b.ple_hash_contract && a.ple_prefetch==b.ple_prefetch && a.distributed_stage==b.distributed_stage;
+}
+bool same_memory(const ExecutionMemoryBinding& a,const ExecutionMemoryBinding& b) {
+    return a.execution_identity==b.execution_identity && a.arena_base==b.arena_base && a.arena_bytes==b.arena_bytes &&
+        a.allocation_generation==b.allocation_generation;
+}
+bool same_scope(const HipLaunchContext& a,const HipLaunchContext& b) {
+    return a.stream==b.stream && a.graph_capture==b.graph_capture && a.arguments==b.arguments &&
+        same_memory(a.status,b.status) && a.context_tokens==b.context_tokens && a.vocabulary_size==b.vocabulary_size &&
+        same_memory(a.ngram_input,b.ngram_input) && same_memory(a.ngram_output,b.ngram_output) &&
+        same_memory(a.deferred_moe_status,b.deferred_moe_status);
+}
+bool same_model(const ModelContract& a,const ModelContract& b) {
+    return a.vocab_size==b.vocab_size && a.hidden_size==b.hidden_size && a.max_position_embeddings==b.max_position_embeddings &&
+        a.hidden_layers==b.hidden_layers && a.full_attention_interval==b.full_attention_interval && a.ple_layer_1based==b.ple_layer_1based &&
+        a.ple_embed_dim==b.ple_embed_dim && a.ple_conv_kernel_size==b.ple_conv_kernel_size && a.ngram_size==b.ngram_size &&
+        a.heads_per_ngram==b.heads_per_ngram && a.ngram_vocab_size_base==b.ngram_vocab_size_base && a.ngram_vocab_divisor==b.ngram_vocab_divisor &&
+        a.ngram_hash_seed==b.ngram_hash_seed && a.ple_eos_token_id==b.ple_eos_token_id && a.hc_count==b.hc_count &&
+        a.hc_lowrank==b.hc_lowrank && a.full_attention_layers==b.full_attention_layers && a.gdn_layers==b.gdn_layers &&
+        a.attention_heads==b.attention_heads && a.kv_heads==b.kv_heads && a.head_dim==b.head_dim &&
+        a.mtp_full_attention_layers==b.mtp_full_attention_layers && a.mtp_use_dedicated_embeddings==b.mtp_use_dedicated_embeddings && a.mtp_hidden_state_source_layer_explicit==b.mtp_hidden_state_source_layer_explicit &&
+        a.gdn_key_heads==b.gdn_key_heads && a.gdn_key_head_dim==b.gdn_key_head_dim && a.gdn_value_heads==b.gdn_value_heads &&
+        a.gdn_value_head_dim==b.gdn_value_head_dim && a.gdn_conv_kernel==b.gdn_conv_kernel && a.indexer_n_heads==b.indexer_n_heads &&
+        a.indexer_kv_heads==b.indexer_kv_heads && a.indexer_head_dim==b.indexer_head_dim && a.indexer_budget==b.indexer_budget &&
+        a.indexer_compress_ratio==b.indexer_compress_ratio && std::bit_cast<std::uint32_t>(a.partial_rotary_factor)==std::bit_cast<std::uint32_t>(b.partial_rotary_factor) && std::bit_cast<std::uint32_t>(a.rope_theta)==std::bit_cast<std::uint32_t>(b.rope_theta) &&
+        a.moe_intermediate_size==b.moe_intermediate_size && a.shared_expert_intermediate_size==b.shared_expert_intermediate_size && a.num_experts==b.num_experts &&
+        a.num_experts_per_token==b.num_experts_per_token && std::bit_cast<std::uint32_t>(a.rms_norm_epsilon)==std::bit_cast<std::uint32_t>(b.rms_norm_epsilon) && a.norm_topk_probability==b.norm_topk_probability &&
+        a.gdn_output_gate_sigmoid==b.gdn_output_gate_sigmoid && a.gdn_qk_l2norm==b.gdn_qk_l2norm && std::bit_cast<std::uint32_t>(a.gdn_qk_l2_epsilon)==std::bit_cast<std::uint32_t>(b.gdn_qk_l2_epsilon) &&
+        a.gdn_conv_silu==b.gdn_conv_silu && a.bytes_bf16==b.bytes_bf16 && a.bytes_fp32==b.bytes_fp32;
+}
+bool same_compiled(const CompiledSerialExecution& a,const CompiledSerialExecution& b) {
+    if(a.execution_identity!=b.execution_identity || a.kernel_plan_identity!=b.kernel_plan_identity ||
+        a.dynamic_steps!=b.dynamic_steps || a.non_graph_safe_steps!=b.non_graph_safe_steps ||
+        a.whole_plan_graph_safe!=b.whole_plan_graph_safe || a.device_graph_inputs!=b.device_graph_inputs ||
+        a.logical_rows!=b.logical_rows || a.request_concurrency!=b.request_concurrency ||
+        a.vocab_size!=b.vocab_size || a.max_position_embeddings!=b.max_position_embeddings ||
+        a.execution.steps.size()!=b.execution.steps.size() || a.io.steps.size()!=b.io.steps.size() ||
+        a.bindings.bindings.size()!=b.bindings.bindings.size() || a.arena.allocations.size()!=b.arena.allocations.size()) return false;
+    if(std::tie(a.execution.linear_attention_steps,a.execution.indexed_attention_steps,a.execution.ple_steps,
+        a.execution.moe_route_steps,a.execution.moe_expert_steps)!=
+        std::tie(b.execution.linear_attention_steps,b.execution.indexed_attention_steps,b.execution.ple_steps,
+        b.execution.moe_route_steps,b.execution.moe_expert_steps) ||
+        std::tie(a.bindings.bound_steps,a.bindings.missing_steps,a.bindings.host_or_runtime_steps)!=
+        std::tie(b.bindings.bound_steps,b.bindings.missing_steps,b.bindings.host_or_runtime_steps) ||
+        std::tie(a.arena.alignment,a.arena.total_bytes,a.arena.naive_nonaliased_bytes)!=
+        std::tie(b.arena.alignment,b.arena.total_bytes,b.arena.naive_nonaliased_bytes) ||
+        std::tie(a.io.expanded_hidden_slots,a.io.hidden_slots,a.io.injection_slots,a.io.route_index_slots,a.io.route_weight_slots,
+        a.io.logits_slots,a.io.mlp_intermediate_slots,a.io.gdn_workspace_slots,a.io.ple_workspace_slots,
+        a.io.indexed_attention_workspace_slots,a.io.hyper_workspace_slots,a.io.router_workspace_slots)!=
+        std::tie(b.io.expanded_hidden_slots,b.io.hidden_slots,b.io.injection_slots,b.io.route_index_slots,b.io.route_weight_slots,
+        b.io.logits_slots,b.io.mlp_intermediate_slots,b.io.gdn_workspace_slots,b.io.ple_workspace_slots,
+        b.io.indexed_attention_workspace_slots,b.io.hyper_workspace_slots,b.io.router_workspace_slots)) return false;
+    for(std::size_t i=0;i<a.execution.steps.size();++i) {
+        const auto& x=a.execution.steps[i];const auto& y=b.execution.steps[i];
+        if(std::tie(x.id,x.op,x.layer,x.dependencies,x.reads_state,x.writes_state,x.graph_safe_candidate,x.dynamic_shape)!=
+            std::tie(y.id,y.op,y.layer,y.dependencies,y.reads_state,y.writes_state,y.graph_safe_candidate,y.dynamic_shape)) return false;
+    }
+    for(std::size_t i=0;i<a.io.steps.size();++i) {
+        const auto& x=a.io.steps[i];const auto& y=b.io.steps[i];
+        if(std::tie(x.step_id,x.op,x.reads,x.writes,x.temporaries)!=std::tie(y.step_id,y.op,y.reads,y.writes,y.temporaries)) return false;
+    }
+    for(std::size_t i=0;i<a.bindings.bindings.size();++i) {
+        const auto& x=a.bindings.bindings[i];const auto& y=b.bindings.bindings[i];
+        if(std::tie(x.step_id,x.op,x.family,x.kernel_id,x.host_or_runtime_step,x.tuning_selection_reason)!=
+            std::tie(y.step_id,y.op,y.family,y.kernel_id,y.host_or_runtime_step,y.tuning_selection_reason)) return false;
+    }
+    for(std::size_t i=0;i<a.arena.allocations.size();++i) {
+        const auto& x=a.arena.allocations[i];const auto& y=b.arena.allocations[i];
+        if(std::tie(x.use,x.first_step,x.last_step,x.offset,x.bytes)!=std::tie(y.use,y.first_step,y.last_step,y.offset,y.bytes)) return false;
+    }
+    return true;
+}
+void validate_stage_setup(const HipDistributedSequenceSetup& setup) {
+    if(!setup.stage_owner) {
+        require_sequence(!setup.resources.distributed_stage &&
+            (!setup.resources.session_state_memory || !setup.resources.session_state_memory->stage_mapping) &&
+            (!setup.participant || !setup.participant->stage_resources()),
+            "sequence scoped resources require their explicit actual stage owner");
+        return;
+    }
+    const auto& owner=*setup.stage_owner;owner.validate();
+    const std::shared_ptr<const void> actual=setup.stage_owner->shared_from_this();
+    require_sequence(!actual.owner_before(setup.stage_owner) && !setup.stage_owner.owner_before(actual) &&
+        setup.actual_model_owner.get()==actual.get() && !actual.owner_before(setup.actual_model_owner) &&
+        !setup.actual_model_owner.owner_before(actual) && setup.participant && setup.participant->stage_resources()==&owner,
+        "sequence stage participant and retained ownership do not match the actual owner");
+    require_sequence(setup.local_node==owner.plan().local_node() &&
+        setup.canonical_plan.plan_identity==owner.plan().placement_identity() &&
+        same_resources(setup.resources,owner.resources()) && same_scope(setup.scope,owner.scope()) &&
+        same_compiled(setup.serial,owner.serial()) && same_model(setup.model,owner.model()),
+        "sequence stage metadata/resources/scope differ from the immutable actual owner");
 }
 class SequenceMemory final : public DirectGpuBoundaryMemoryOwner {
 public:
@@ -124,6 +230,7 @@ struct HipDistributedKnownSequence::Impl {
     std::shared_ptr<Local> streaming_local;
 
     explicit Impl(HipDistributedSequenceSetup value):setup(std::move(value)) {
+        validate_stage_setup(setup);
         const auto& p=setup.canonical_plan;
         require_sequence(setup.participant && setup.actual_model_owner && setup.local_node<=1U &&
             (setup.streaming || (setup.maximum_inputs>=2U && setup.maximum_inputs<=16U)) && setup.maximum_logit_payload_bytes &&
@@ -234,14 +341,7 @@ struct HipDistributedKnownSequence::Impl {
         }
     }
     void admit_count(const DistributedTokenBinding& binding,std::uint64_t count) const {
-        require_sequence(count && count-1U<=UINT64_MAX-binding.generation && count<=UINT64_MAX-binding.position,
-            "sequence input/frontier or generation bound is invalid");
-        for(const auto& peer:binding.peers)
-            require_sequence(binding.position<=peer.context_capacity && count<=peer.context_capacity-binding.position,
-                "sequence exceeds a peer's context capacity");
-        require_sequence(binding.position<=setup.serial.max_position_embeddings &&
-            count<=setup.serial.max_position_embeddings-binding.position && count<=UINT64_MAX-binding.committed_tokens,
-            "sequence exceeds compiled context or committed-token counter capacity");
+        validate_target_limit(binding,setup.serial.max_position_embeddings,count);
     }
     void close_uncertain() noexcept {
         failed=true;
@@ -312,6 +412,7 @@ struct HipDistributedKnownSequence::Impl {
     // requested row; streaming supplies the same setup-allocated row each time.
     // Caller serializes access, admits count/input and owns the error boundary.
     void execute_one(const std::shared_ptr<Local>& local,std::uint32_t input) {
+        if(setup.stage_owner) setup.stage_owner->validate();
         require_sequence(setup.participant->binding_identity()==expected_binding_identity &&
             setup.participant->phase()==(completed?DistributedTokenPhase::committed:DistributedTokenPhase::preparing),
             "sequence participant changed outside its retained transaction owner");
@@ -369,6 +470,33 @@ struct HipDistributedKnownSequence::Impl {
         terminal_row_published=setup.streaming && setup.local_node==1U;
     }
 };
+
+HipDistributedSequenceSetup make_hip_distributed_stage_sequence_setup(
+    std::shared_ptr<HipDistributedStageResources> owner,DistributedTokenBinding binding,
+    HipDistributedSequenceTransport transport,HipDistributedStageSequenceOptions options) {
+    require_sequence(owner && options.maximum_logit_payload_bytes &&
+        (options.streaming?options.max_target_inputs>0U:
+            (options.max_target_inputs==0U && options.maximum_inputs>=2U && options.maximum_inputs<=16U)),
+        "stage sequence factory requires an actual owner and explicit bounded input/row policy");
+    owner->validate();
+    const auto actual=owner->shared_from_this();
+    require_sequence(!owner.owner_before(actual) && !actual.owner_before(owner),
+        "stage sequence factory requires the actual retained ownership group");
+    const auto vocab=owner->model().vocab_size;
+    require_sequence(vocab && vocab<=UINT64_MAX/sizeof(float) &&
+        options.maximum_logit_payload_bytes/(vocab*sizeof(float))>=(options.streaming?1U:2U),
+        "stage sequence factory full FP32 row exceeds its explicit payload budget");
+    if(options.streaming) validate_target_limit(binding,owner->serial().max_position_embeddings,options.max_target_inputs);
+    HipDistributedSequenceSetup setup;
+    setup.stage_owner=owner;setup.serial=owner->serial();setup.canonical_plan=owner->plan().canonical_placement();
+    setup.model=owner->model();setup.resources=owner->resources();setup.scope=owner->scope();setup.actual_model_owner=owner;
+    setup.transport=std::move(transport);setup.local_node=owner->plan().local_node();
+    setup.maximum_inputs=options.maximum_inputs;setup.maximum_logit_payload_bytes=options.maximum_logit_payload_bytes;
+    setup.streaming=options.streaming;setup.max_target_inputs=options.max_target_inputs;
+    setup.layer_boundary_position_dependencies=options.layer_boundary_position_dependencies;
+    setup.participant=std::make_shared<HipDistributedTokenParticipant>(std::move(owner),std::move(binding));
+    return setup;
+}
 
 HipDistributedKnownSequence::HipDistributedKnownSequence(HipDistributedSequenceSetup setup)
     :impl_(std::make_unique<Impl>(std::move(setup))) {}
