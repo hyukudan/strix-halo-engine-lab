@@ -5,6 +5,7 @@
 #include <cstdint>
 
 namespace strix {
+class DistributedStageStateMapping;
 
 struct SessionStateMemoryBinding {
     std::uint64_t layout_identity = 0;
@@ -16,6 +17,8 @@ struct SessionStateMemoryBinding {
     std::uintptr_t host_base = 0;
     std::uint64_t host_bytes = 0;
     std::uint64_t host_allocation_generation = 0;
+    // Explicit stage-local pools. Null preserves the complete legacy layout.
+    const DistributedStageStateMapping* stage_mapping = nullptr;
 };
 
 struct SessionStateAddress {

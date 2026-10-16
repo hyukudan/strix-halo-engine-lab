@@ -3,6 +3,7 @@
 #include "strix/hip_distributed_stage.hpp"
 #include "strix/hip_distributed_transaction.hpp"
 #include "strix/distributed_stage_resources.hpp"
+#include "strix/distributed_stage_state.hpp"
 #include "strix/prepared_tensor_views.hpp"
 #include "strix/deferred_moe_status.hpp"
 #include "strix/hip_model_residency.hpp"
@@ -378,6 +379,36 @@ void stage_resource_metadata_component(const std::shared_ptr<Owner>& o,std::uint
         }
         require(local && remote && bytes==plan.required_weight_bytes(),"stage selected-byte accounting or absent weights differ");
         strix::validate_stage_model_runtime_binding(plan,o->manifest,binding);
+        const auto mapping=strix::DistributedStageStateMapping::derive(o->serial,o->model,o->layout,plan);
+        mapping.validate_source(o->serial,o->model,o->layout,plan);
+        require(mapping.device_bytes()<=o->layout.device_total_bytes && mapping.host_bytes()<=o->layout.host_total_bytes,
+            "local state mapping exceeds the actual full-state backing in this metadata fixture");
+        // Full existing pools really own these extents; this verifies mapping
+        // semantics, not packed-allocation capacity. The production factory
+        // allocates only mapping.device_bytes()/host_bytes().
+        auto mapped_state=o->memory->state();mapped_state.stage_mapping=&mapping;
+        mapping.validate_memory(o->layout,mapped_state);
+        for(const auto& range:mapping.ranges()) {
+            const auto resolved=mapping.resolve(o->layout,mapped_state,range.component,range.logical_offset,range.bytes);
+            const auto base=range.storage==strix::SessionStateStorage::device?mapped_state.device_base:mapped_state.host_base;
+            require(resolved.address==base+range.local_offset && resolved.bytes==range.bytes,
+                "local state resolver invented a shifted global base or a full-component extent");
+        }
+        auto scoped_resources=o->resources;scoped_resources.model_weights=&binding;
+        scoped_resources.distributed_stage=&plan;scoped_resources.session_state_memory=&mapped_state;
+        strix::validate_stage_execution_runtime_resources(o->serial.execution_identity,o->serial.arena,scoped_resources,0U);
+        const auto ids=strix::build_stage_runtime_execution_identities(o->serial.execution_identity,o->serial.arena,scoped_resources);
+        require(ids.binding_identity && ids.compatibility_identity,"local state mapping did not bind actual physical metadata");
+        bool ordinary_rejected=false;
+        try {strix::validate_execution_runtime_resources(o->serial.execution_identity,o->serial.arena,scoped_resources,0U);}
+        catch(const std::invalid_argument&) {ordinary_rejected=true;}
+        require(ordinary_rejected,"ordinary full-runtime validation accepted a local state mapping");
+        const auto snapshot1=strix::build_stage_snapshot_plan(mapping,1U),snapshot2=strix::build_stage_snapshot_plan(mapping,2U);
+        require(snapshot1.mapping_identity==mapping.identity() && snapshot1.ranges==snapshot2.ranges &&
+            snapshot1.device_bytes==snapshot2.device_bytes && snapshot1.host_bytes==snapshot2.host_bytes &&
+            snapshot1.plan_identity!=snapshot2.plan_identity,
+            "logical token rebind changed physical local snapshot layout or failed to bind the token");
+
         bool rejected=false;
         try {strix::validate_model_runtime_binding(o->manifest,binding);} catch(const std::invalid_argument&) {rejected=true;}
         require(rejected,"ordinary whole-model admission accepted scoped absent weights");

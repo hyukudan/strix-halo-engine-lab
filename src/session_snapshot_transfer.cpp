@@ -137,6 +137,8 @@ void capture_serial_session_snapshot(
     const SessionSnapshotMemoryBinding& snapshot_memory,
     SessionSnapshotTransferBackend& backend,
     const ModelContract* compact_model) {
+    if (state_memory.stage_mapping)
+        throw std::invalid_argument("stage-local state requires the distinct typed stage snapshot format");
     // Authenticate the stored format before branching; a compact plan cannot
     // bypass canonical admission by changing its public policy field to full.
     validate_serial_session_snapshot_identity(snapshot);
@@ -226,6 +228,8 @@ std::vector<SessionSnapshotTransfer> prepare_snapshot_restore_transfers(
     const SessionStateMemoryBinding& state_memory,
     const SessionSnapshotMemoryBinding& snapshot_memory,
     const ModelContract* compact_model) {
+    if (state_memory.stage_mapping)
+        throw std::invalid_argument("stage-local state requires the distinct typed stage snapshot format");
     validate_serial_session_restore_identity(restore);
     if (restore.policy == SessionSnapshotPolicy::occupied_kv_v1) {
         if (!compact_model) throw std::invalid_argument("occupied KV restore requires the canonical model contract");

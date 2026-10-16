@@ -108,6 +108,7 @@ add_library(strix_core STATIC
     src/distributed_native_backend.cpp
     src/distributed_token_transaction.cpp
     src/distributed_stage_resources.cpp
+    src/distributed_stage_state.cpp
     src/distributed_greedy_control.cpp
     src/distributed_remote_control.cpp
     src/distributed_control_wire.cpp
@@ -806,6 +807,11 @@ if(BUILD_TESTING)
     target_link_libraries(strix-execution-resources-tests PRIVATE strix_core)
     strix_target_warnings(strix-execution-resources-tests)
     add_test(NAME strix-execution-resources-tests COMMAND strix-execution-resources-tests)
+
+    add_executable(strix-distributed-stage-state-tests tests/distributed_stage_state_tests.cpp)
+    target_link_libraries(strix-distributed-stage-state-tests PRIVATE strix_core)
+    strix_target_warnings(strix-distributed-stage-state-tests)
+    add_test(NAME strix-distributed-stage-state-tests COMMAND strix-distributed-stage-state-tests)
 
     add_executable(strix-distributed-greedy-control-tests tests/distributed_greedy_control_tests.cpp)
     target_link_libraries(strix-distributed-greedy-control-tests PRIVATE strix_core)

@@ -1,5 +1,6 @@
 #include "strix/hip_distributed_transaction.hpp"
 #include "strix/hip_distributed_stage_resources.hpp"
+#include "strix/distributed_stage_state.hpp"
 #include "strix/deferred_moe_status.hpp"
 #include "strix/hip_session_snapshot_transfer.hpp"
 #include "strix/hip_setup_quiescence.hpp"
@@ -39,6 +40,32 @@ void require_disjoint(std::uintptr_t a,std::uint64_t an,std::uintptr_t b,std::ui
     if(!a || !b || an>maximum-a || bn>maximum-b || (a<b+bn && b<a+an))
         throw std::invalid_argument("distributed transaction snapshot aliases a retained owner or overflows");
 }
+// Physical stage snapshot storage has its own type; never a forged full
+// SerialSessionSnapshotPlan. The participant retains the allocator owner and
+// drains its original device before this member is released.
+struct StageSnapshotOwner {
+    RuntimeMemoryAllocator* allocator=nullptr;
+    DistributedStageSnapshotMemoryBinding memory;
+    StageSnapshotOwner(const DistributedStageSnapshotPlan& plan,RuntimeMemoryAllocator& a,AllocationGenerationSource& generations)
+        :allocator(&a) {
+        memory.snapshot_plan_identity=plan.plan_identity;memory.allocation_generation=generations.next();
+        memory.device_section_bytes=plan.device_bytes;memory.host_section_bytes=plan.host_bytes;
+        try {
+            if(plan.device_bytes) memory.device_section_base=a.allocate_device(plan.device_bytes,256U);
+            if(plan.host_bytes) memory.host_section_base=a.allocate_host(plan.host_bytes,256U);
+            validate_stage_snapshot_binding(plan,memory);
+        } catch(...) {release();throw;}
+    }
+    StageSnapshotOwner(const StageSnapshotOwner&)=delete;
+    StageSnapshotOwner& operator=(const StageSnapshotOwner&)=delete;
+    ~StageSnapshotOwner() {release();}
+    void release() noexcept {
+        if(!allocator) return;
+        if(memory.host_section_base) allocator->free_host(memory.host_section_base,memory.host_section_bytes);
+        if(memory.device_section_base) allocator->free_device(memory.device_section_base,memory.device_section_bytes);
+        allocator=nullptr;
+    }
+};
 bool transaction_state_equal(const PersistentStateGenerations& a,const PersistentStateGenerations& b) {
     return a.valid==b.valid && a.generations==b.generations;
 }
@@ -65,6 +92,9 @@ struct HipDistributedTokenParticipant::Impl {
     SerialSessionRestorePlan restore;
     SessionSnapshotMemoryOwner snapshot_memory;
     SessionSnapshotMemoryBinding active_snapshot_memory;
+    std::optional<DistributedStageSnapshotPlan> stage_snapshot;
+    std::unique_ptr<StageSnapshotOwner> stage_snapshot_memory;
+    DistributedStageSnapshotMemoryBinding active_stage_snapshot_memory;
     std::optional<DistributedSequenceFrontier> sequence;
     HipSessionSnapshotTransferBackend transfer;
     std::unique_ptr<HipDistributedStage> stage;
@@ -84,6 +114,10 @@ struct HipDistributedTokenParticipant::Impl {
         if(!owner || node>1U || !budget || !resources.model_manifest || !resources.model_weights || !resources.tensor_access ||
             !resources.session_state_layout || !resources.session_state_memory || !resources.scratch)
             throw std::invalid_argument("distributed native transaction requires retained complete local resources");
+        // Reject foreign/nested capture before allocating either snapshot kind.
+        if(!scope.stream || scope.stream==hipStreamLegacy || scope.stream==hipStreamPerThread)
+            throw std::invalid_argument("distributed transaction requires its owned eager stream before snapshot allocation");
+        original();
         retained_layout=*resources.session_state_layout;
         position_word=resolve_session_state(*resources.session_state_layout,*resources.session_state_memory,SessionStateComponent::position_history);
         if(position_word.storage!=SessionStateStorage::host || !position_word.address || position_word.bytes<sizeof(std::uint64_t) ||
@@ -115,6 +149,15 @@ struct HipDistributedTokenParticipant::Impl {
         SerialSessionSnapshotRequest request;request.compiled_execution_identity=serial.execution_identity;
         request.runtime_compatibility_identity=identities.compatibility_identity;request.next_position=b.position;
         request.committed_tokens=b.committed_tokens;request.state=b.peers[node].initial_state;
+        if(const auto* mapping=resources.session_state_memory->stage_mapping) {
+            if(!stage_owner) throw std::invalid_argument("local state snapshot requires its actual typed stage owner");
+            stage_snapshot=build_stage_snapshot_plan(*mapping,protocol.binding_identity());
+            if(stage_snapshot->device_bytes>std::numeric_limits<std::uint64_t>::max()-stage_snapshot->host_bytes ||
+                stage_snapshot->device_bytes+stage_snapshot->host_bytes>budget)
+                throw std::invalid_argument("distributed native transaction local snapshot exceeds budget");
+            stage_snapshot_memory=std::make_unique<StageSnapshotOwner>(*stage_snapshot,allocator,generations);
+            active_stage_snapshot_memory=stage_snapshot_memory->memory;
+        } else {
         snapshot=build_serial_session_snapshot_plan(model,*resources.session_state_layout,request);
         if(snapshot.ranges.size()!=7U || snapshot.device_bytes>std::numeric_limits<std::uint64_t>::max()-snapshot.host_bytes ||
             snapshot.device_bytes+snapshot.host_bytes>budget)
@@ -133,10 +176,17 @@ struct HipDistributedTokenParticipant::Impl {
         snapshot_memory=SessionSnapshotMemoryOwner::allocate(snapshot,allocator,generations);
         active_snapshot_memory=snapshot_memory.binding();
         validate_snapshot_memory_binding(snapshot,active_snapshot_memory);
-        const auto& snap=snapshot_memory.binding();
-        require_disjoint(snap.device_section_base,snap.device_section_bytes,snap.host_section_base,snap.host_section_bytes);
-        for(const auto& section:std::array<std::pair<std::uintptr_t,std::uint64_t>,2>{{
-                {snap.device_section_base,snap.device_section_bytes},{snap.host_section_base,snap.host_section_bytes}}}) {
+        }
+        // Only physical addresses/bytes are shared for alias admission. Types
+        // and validation remain distinct for full serial and local snapshots.
+        const auto device_section=stage_snapshot?
+            std::pair{active_stage_snapshot_memory.device_section_base,active_stage_snapshot_memory.device_section_bytes}:
+            std::pair{active_snapshot_memory.device_section_base,active_snapshot_memory.device_section_bytes};
+        const auto host_section=stage_snapshot?
+            std::pair{active_stage_snapshot_memory.host_section_base,active_stage_snapshot_memory.host_section_bytes}:
+            std::pair{active_snapshot_memory.host_section_base,active_snapshot_memory.host_section_bytes};
+        require_disjoint(device_section.first,device_section.second,host_section.first,host_section.second);
+        for(const auto& section:std::array<std::pair<std::uintptr_t,std::uint64_t>,2>{{device_section,host_section}}) {
             require_disjoint(section.first,section.second,resources.session_state_memory->device_base,resources.session_state_memory->device_bytes);
             require_disjoint(section.first,section.second,resources.session_state_memory->host_base,resources.session_state_memory->host_bytes);
             require_disjoint(section.first,section.second,resources.scratch->arena_base,resources.scratch->arena_bytes);
@@ -203,7 +253,8 @@ struct HipDistributedTokenParticipant::Impl {
         catch(...) {uncertain();throw;}
     }
     DistributedTokenReceipt snapshot_receipt(PersistentStateGenerations state,std::uint32_t completed=0) const {
-        return {snapshot.plan_identity,active_snapshot_memory.allocation_generation,state,completed};
+        return stage_snapshot?DistributedTokenReceipt{stage_snapshot->plan_identity,active_stage_snapshot_memory.allocation_generation,state,completed}:
+            DistributedTokenReceipt{snapshot.plan_identity,active_snapshot_memory.allocation_generation,state,completed};
     }
 };
 HipDistributedTokenParticipant::HipDistributedTokenParticipant(CompiledSerialExecution serial,DistributedPlacementPlan plan,
@@ -249,7 +300,24 @@ void HipDistributedTokenParticipant::begin_next(std::uint32_t input,std::uint64_
     request.runtime_compatibility_identity=s.identities.compatibility_identity;
     request.next_position=binding.position;request.committed_tokens=binding.committed_tokens;
     request.state=binding.peers[s.node].initial_state;
-    auto snapshot=build_serial_session_snapshot_plan(s.model,*s.resources.session_state_layout,request);
+    SerialSessionSnapshotPlan snapshot;
+    SerialSessionRestorePlan restore;
+    SessionSnapshotMemoryBinding memory;
+    std::optional<DistributedStageSnapshotPlan> stage_snapshot;
+    DistributedStageSnapshotMemoryBinding stage_memory;
+    if(s.stage_snapshot) {
+        const auto* mapping=s.resources.session_state_memory->stage_mapping;
+        if(!mapping || !s.stage_snapshot_memory) throw std::invalid_argument("distributed local snapshot owner changed");
+        stage_snapshot=build_stage_snapshot_plan(*mapping,next.binding_identity());
+        if(stage_snapshot->mapping_identity!=s.stage_snapshot->mapping_identity ||
+            stage_snapshot->device_bytes!=s.stage_snapshot->device_bytes || stage_snapshot->host_bytes!=s.stage_snapshot->host_bytes ||
+            stage_snapshot->ranges!=s.stage_snapshot->ranges)
+            throw std::invalid_argument("distributed continuation changed local snapshot capacity or ranges");
+        stage_memory=s.stage_snapshot_memory->memory;
+        stage_memory.snapshot_plan_identity=stage_snapshot->plan_identity;
+        validate_stage_snapshot_binding(*stage_snapshot,stage_memory);
+    } else {
+    snapshot=build_serial_session_snapshot_plan(s.model,*s.resources.session_state_layout,request);
     // Logical snapshot metadata may change; the complete physical storage,
     // allocation generation and retained allocator owner never do. Rebinding is
     // admitted only for an identical canonical full-seven range layout.
@@ -265,10 +333,11 @@ void HipDistributedTokenParticipant::begin_next(std::uint32_t input,std::uint64_
             a.destination_offset!=b.destination_offset || a.bytes!=b.bytes || a.provisional!=b.provisional)
             throw std::invalid_argument("distributed continuation changed a retained snapshot range");
     }
-    auto memory=s.snapshot_memory.binding();memory.snapshot_plan_identity=snapshot.plan_identity;
+    memory=s.snapshot_memory.binding();memory.snapshot_plan_identity=snapshot.plan_identity;
     validate_snapshot_memory_binding(snapshot,memory);
-    auto restore=build_serial_session_restore_plan(s.model,*s.resources.session_state_layout,
+    restore=build_serial_session_restore_plan(s.model,*s.resources.session_state_layout,
         s.identities.compatibility_identity,snapshot);
+    }
     std::unique_ptr<HipDistributedStage> replacement;
     if(phase==DistributedTokenPhase::rolled_back) {
         // abort is sticky; never clear that latch. Build a genuinely new stage
@@ -289,6 +358,7 @@ void HipDistributedTokenParticipant::begin_next(std::uint32_t input,std::uint64_
     // teardown retains its original-device quiescence/fail-stop contract.
     s.sequence=std::move(frontier);s.protocol=std::move(next);
     s.snapshot=std::move(snapshot);s.restore=std::move(restore);s.active_snapshot_memory=memory;
+    s.stage_snapshot=std::move(stage_snapshot);s.active_stage_snapshot_memory=stage_memory;
     if(replacement) s.stage=std::move(replacement);
     s.prepared=false;s.ready=false;s.restored=false;s.rollback_published=false;s.position_materialized=false;
     s.position_completion_issued=false;
@@ -297,6 +367,7 @@ void HipDistributedTokenParticipant::begin_next(std::uint32_t input,std::uint64_
 const DistributedTokenBinding& HipDistributedTokenParticipant::current_binding() const noexcept {return impl_->protocol.binding();}
 std::uint64_t HipDistributedTokenParticipant::binding_identity() const noexcept {return impl_->protocol.binding_identity();}
 std::uint32_t HipDistributedTokenParticipant::local_node() const noexcept {return impl_->node;}
+const HipDistributedStageResources* HipDistributedTokenParticipant::stage_resources() const noexcept {return impl_->stage_owner.get();}
 NativeDistributedPositionCompletion HipDistributedTokenParticipant::mint_position_dependency_completion() {
     auto& s=*impl_;
     s.original();s.validate();
@@ -355,7 +426,9 @@ DistributedTokenMessage HipDistributedTokenParticipant::prepare() {
             // this owned nonblocking producer stream BEFORE the first copy.
             if(hipStreamSynchronize(s.scope.stream)!=hipSuccess)
                 throw std::runtime_error("distributed snapshot producer fence failed");
-            capture_serial_session_snapshot(s.snapshot,*s.resources.session_state_layout,*s.resources.session_state_memory,
+            if(s.stage_snapshot) capture_stage_snapshot_payload(*s.stage_snapshot,*s.resources.session_state_layout,
+                *s.resources.session_state_memory,s.active_stage_snapshot_memory,s.transfer);
+            else capture_serial_session_snapshot(s.snapshot,*s.resources.session_state_layout,*s.resources.session_state_memory,
                 s.active_snapshot_memory,s.transfer);
         });
         // Both peers must publish prepared before either can mutate the target.
@@ -418,8 +491,12 @@ DistributedTokenMessage HipDistributedTokenParticipant::restore_local() {
         throw std::logic_error("distributed rollback requires the agreed precommit abort decision");
     s.original();s.validate();s.stage->abort();
     try {
-        s.guard.run([&] {restore_serial_session_snapshot_payload(s.restore,*s.resources.session_state_layout,
-            *s.resources.session_state_memory,s.active_snapshot_memory,s.transfer);});
+        s.guard.run([&] {
+            if(s.stage_snapshot) restore_stage_snapshot_payload(*s.stage_snapshot,*s.resources.session_state_layout,
+                *s.resources.session_state_memory,s.active_stage_snapshot_memory,s.transfer);
+            else restore_serial_session_snapshot_payload(s.restore,*s.resources.session_state_layout,
+                *s.resources.session_state_memory,s.active_snapshot_memory,s.transfer);
+        });
         s.validate();s.restored=true;
         // No original history/session publication until BOTH restored receipts.
         return s.message(DistributedTokenMessageKind::restored,s.snapshot_receipt(s.protocol.binding().peers[s.node].initial_state));

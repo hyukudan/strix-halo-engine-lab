@@ -1,5 +1,6 @@
 #include "strix/execution_resources.hpp"
 #include "strix/distributed_stage_resources.hpp"
+#include "strix/distributed_stage_state.hpp"
 
 #include <stdexcept>
 
@@ -77,9 +78,16 @@ static void validate_resources_impl(
         throw std::invalid_argument(
             "tensor access plan manifest identity mismatch");
     }
+    if(const auto* mapping=resources.session_state_memory->stage_mapping) {
+        if(!scoped || !resources.distributed_stage || mapping->source_stage_identity()!=resources.distributed_stage->identity() ||
+            mapping->execution_identity()!=compiled_execution_identity || mapping->local_node()!=resources.distributed_stage->local_node())
+            throw std::invalid_argument("ordinary or foreign execution cannot consume stage-local state");
+        mapping->validate_memory(*resources.session_state_layout,*resources.session_state_memory);
+    } else {
     validate_session_state_memory_binding(
         *resources.session_state_layout,
         *resources.session_state_memory);
+    }
 
     if (resources.ple_lookup != nullptr &&
         resources.ple_lookup->implementation_identity() == 0) {
@@ -156,6 +164,8 @@ build_identities_impl(
             : 0ULL);
 
     if(scoped) hash_u64(compatibility,resources.distributed_stage->identity());
+    if(scoped && resources.session_state_memory->stage_mapping)
+        hash_u64(compatibility,resources.session_state_memory->stage_mapping->identity());
     if (compatibility == 0) {
         throw std::logic_error(
             "runtime compatibility identity must be non-zero");

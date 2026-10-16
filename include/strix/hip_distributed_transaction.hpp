@@ -32,8 +32,9 @@ public:
         SerialSessionContext& ordinary_session,HipLaunchContext scope,std::shared_ptr<const void> actual_owner,
         RuntimeMemoryAllocator& snapshot_allocator,AllocationGenerationSource& generations,
         DistributedTokenBinding binding,std::uint32_t local_node,std::uint64_t snapshot_budget_bytes);
-    // Phase1 capacity source: actual selected backing plus FULL initialized
-    // state/snapshot/scratch. No ordinary healthy serial context is fabricated.
+    // Capacity source: actual selected backing and either default FULL state or
+    // typed local owned ranges/snapshot; scratch stays full. No ordinary
+    // healthy serial context is fabricated.
     HipDistributedTokenParticipant(std::shared_ptr<HipDistributedStageResources>,DistributedTokenBinding);
     ~HipDistributedTokenParticipant();
     HipDistributedTokenParticipant(const HipDistributedTokenParticipant&) = delete;
@@ -46,6 +47,8 @@ public:
     [[nodiscard]] const DistributedTokenBinding& current_binding() const noexcept;
     [[nodiscard]] std::uint64_t binding_identity() const noexcept;
     [[nodiscard]] std::uint32_t local_node() const noexcept;
+    // Exact retained capacity owner, null for the original full serial anchor.
+    [[nodiscard]] const HipDistributedStageResources* stage_resources() const noexcept;
     // One logical-control capability per genuinely committed token. This does
     // not attest DMA; all data boundaries require independent retirement.
     [[nodiscard]] NativeDistributedPositionCompletion mint_position_dependency_completion();

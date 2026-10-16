@@ -10,7 +10,7 @@
 namespace strix {
 class HipDistributedTokenParticipant;
 class HipDistributedStageResources;
-// Produced only after genuine p0 initialization of COMPLETE local state pools.
+// Produced only after genuine p0 initialization of every actually owned range.
 // It carries no fabricated healthy ordinary serial session or nonzero prefix.
 class HipDistributedStageInitialFrontier final {
 public:
@@ -22,16 +22,20 @@ private:
     DistributedTokenPeer peer_;
     PersistentStateGenerations global_;
 };
+enum class HipDistributedStageStatePolicy { full = 0, local_owned_ranges = 1 };
 struct HipDistributedStageBudget {
     std::uint64_t retained_bytes=0,setup_peak_bytes=0,headroom_bytes=0,snapshot_bytes=0;
 };
 struct HipDistributedStageReservation {
     HipModelResidencyReservation weights;
-    std::uint64_t full_state_bytes=0,full_scratch_bytes=0,d1_bytes=8,snapshot_budget_bytes=0;
+    // Logical full-layout bytes are descriptive; retained_state_bytes is charged.
+    std::uint64_t full_state_bytes=0,retained_state_bytes=0,full_scratch_bytes=0,d1_bytes=8,snapshot_budget_bytes=0;
+    bool state_partitioned=false;
     std::uint64_t allocator_padding_bytes=0,headroom_bytes=0,retained_bytes=0,setup_peak_bytes=0;
 };
-// Capacity PHASE1: actual selected registered/copy backing; full state/snapshot/
-// scratch retained. Full file mapping is a retained source, not a claim that
+// Actual selected registered/copy backing. FULL state/snapshot is the default;
+// optional local_owned_ranges keeps a typed packed state map and snapshot.
+// Scratch remains full. Full file mapping is a retained source, not a claim that
 // all its pages are pinned/device-resident. No driver fit/performance claim.
 // One serialized caller owns setup/claim/progress; initial_frontier is claimed
 // exactly once by the participant, not a thread-safe shared session factory.
@@ -41,7 +45,8 @@ public:
         std::shared_ptr<const MappedModelFile>,const CompiledSerialExecution&,const ModelManifest&,
         const ExecutionTensorAccessPlan&,const DistributedPlacementPlan& canonical,std::uint32_t node,
         const ModelContract&,const HipLauncherCatalogConfig&,std::uint64_t context_capacity,
-        HipDistributedStageBudget,HipModelResidencyPolicy = {});
+        HipDistributedStageBudget,HipModelResidencyPolicy = {},
+        HipDistributedStageStatePolicy = HipDistributedStageStatePolicy::full);
     ~HipDistributedStageResources();
     HipDistributedStageResources(const HipDistributedStageResources&) = delete;
     HipDistributedStageResources& operator=(const HipDistributedStageResources&) = delete;
