@@ -293,6 +293,10 @@ inline void validate_model_copy_cli(const Options& o) {
         return;
     case HipModelCopyTier::normalization:
     case HipModelCopyTier::hot_nonexpert: break;
+    case HipModelCopyTier::experts:
+        if (o.coalesce_gap_bytes)
+            throw std::invalid_argument("expert model copy requires --coalesce-gap 0");
+        break;
     default: throw std::invalid_argument("unknown model copy tier");
     }
     if (!o.model_copy_payload_bytes || !*o.model_copy_payload_bytes ||
@@ -329,8 +333,14 @@ inline void validate_model_copy_cli(const Options& o) {
         throw std::invalid_argument("selective model copy excludes GPU greedy token output");
     if (o.planned_ple_io || o.ple_cpu_helper_threads_explicit || o.ple_cache_rows_explicit || o.ple_cache_budget_explicit)
         throw std::invalid_argument("selective model copy excludes planned PLE IO");
-    if (o.numerical_profile != DecodeNumericalProfile::exact_v5)
-        throw std::invalid_argument("selective model copy currently requires exact-v5 numerical profile");
+    // Explicit expert backing can compose with the two screened fast recipes.
+    // Admission does not qualify their combination; compare each recipe against
+    // its own unchanged-backing baseline before any performance adoption.
+    const bool expert_recipe = o.model_copy_tier == HipModelCopyTier::experts &&
+        (o.numerical_profile == DecodeNumericalProfile::hc_splitk_f32_q51_q80_a8_down_v1 ||
+         o.numerical_profile == DecodeNumericalProfile::hc_splitk_f32_q51_q80_a8_down_q5k_a8_gateup_v1);
+    if (o.numerical_profile != DecodeNumericalProfile::exact_v5 && !expert_recipe)
+        throw std::invalid_argument("selective model copy requires exact-v5 or an admitted explicit expert recipe");
 }
 
 // Arithmetic overlays never silently replace the selected submission profile.
@@ -707,7 +717,7 @@ inline Options parse_options(
             "[--numerical-profile exact-v5|hc-splitk-f32-v1|q51-a8-down-v1|hc-splitk-f32+q51-a8-down-v1|q51-q80-a8-down-v1|hc-splitk-f32+q51-q80-a8-down-v1|hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup-v1|hc-deferred-norm-f32+q51-q80-a8-down-v1|hc-deferred-norm-f32+q51-q80-a8-down+q5k-a8-gateup-v1] "
             "[--teacher-forced-score --generate 1 [--teacher-logits-file PATH]] "
             "[--gpu-greedy-token] [--logprob-token ID ...] [--offline-tuning-cache FILE [--offline-compile-provenance FILE]] [--gdn-recurrent-layout baseline|stride32|stride33|transposed] [--gdn-recurrent-storage key-value|value-key] [--known-prefix-window --known-prefix-rows 2|4|8 --known-prefix-expert-union] [--known-prefix-prefill-rows 16..2048 --known-prefix-workspace-budget-bytes N --known-prefix-host-metadata-budget-bytes N --known-prefix-uma-budget-bytes N --known-prefix-host-headroom-bytes N] [--prompt-lookup [--prompt-lookup-depth 0|1|2 | --prompt-lookup-adaptive] [--prompt-lookup-snapshot occupied-kv-v1 --prompt-lookup-snapshot-bytes N]] [--serve-prefix-u32le FILE ... --serve-concurrency 1|2|4 [--serve-tensor-cohort-rows 2|4 | --serve-prefill-rows 2|4|8|16..2048 --serve-prefill-workspace-budget-bytes N --serve-prefill-host-metadata-budget-bytes N] --serve-memory-budget-bytes N --serve-request-budget-bytes N --serve-headroom-bytes N] [--gdn-islands] [--qsa-hierarchical-selection] [--qsa-gqa-heads-per-block 1|2|4] [--prepared-eager] [--moe-shared-overlap [--moe-token-cost-policy]] [--moe-overlap-arena-budget-bytes N] [--batched-moe-activation] [--validation-final-state DIR] [--validation-final-state-max-bytes N] [--reference FILE] [--max-logit-error X] "
-            "[--context N] [--residency register|copy] [--coalesce-gap BYTES] [--model-copy-tier none|normalization|hot_nonexpert --model-copy-payload-bytes N --model-retained-budget N --model-setup-peak-budget N] "
+            "[--context N] [--residency register|copy] [--coalesce-gap BYTES] [--model-copy-tier none|normalization|hot_nonexpert|experts --model-copy-payload-bytes N --model-retained-budget N --model-setup-peak-budget N] "
             "[--planned-ple-io] [--ple-cpu-helper-threads 1..8] [--ple-cache-rows N --ple-cache-budget-bytes N] [--ple-max-rows-per-io N] [--ple-max-inflight-ios N] "
             "[--generate N] [--eos-token TOKEN_ID] [--prefix-cache-roundtrip] "
             "[--parallel-moe-router] [--ranked-moe-router-topk | --wave-moe-router-topk] "
@@ -744,7 +754,8 @@ inline Options parse_options(
                 if (value == "none") options.model_copy_tier = strix::HipModelCopyTier::none;
                 else if (value == "normalization") options.model_copy_tier = strix::HipModelCopyTier::normalization;
                 else if (value == "hot_nonexpert") options.model_copy_tier = strix::HipModelCopyTier::hot_nonexpert;
-                else throw std::invalid_argument("model copy tier must be none, normalization or hot_nonexpert");
+                else if (value == "experts") options.model_copy_tier = strix::HipModelCopyTier::experts;
+                else throw std::invalid_argument("model copy tier must be none, normalization, hot_nonexpert or experts");
             } else {
                 auto* target = key == "--model-copy-payload-bytes" ? &options.model_copy_payload_bytes :
                     key == "--model-retained-budget" ? &options.model_retained_budget : &options.model_setup_peak_budget;

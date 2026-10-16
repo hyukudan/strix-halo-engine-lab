@@ -15,7 +15,8 @@
 namespace strix {
 
 class HipSetupQuiescenceGuard;
-enum class HipModelCopyTier : std::uint8_t { none, normalization, hot_nonexpert };
+// Experts omit source registration except shared boundary pages; require gap zero.
+enum class HipModelCopyTier : std::uint8_t { none, normalization, hot_nonexpert, experts };
 [[nodiscard]] std::string_view hip_model_copy_tier_name(HipModelCopyTier);
 
 enum class HipModelResidencyMode {

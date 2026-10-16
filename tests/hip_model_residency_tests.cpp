@@ -18,6 +18,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #if defined(__linux__)
@@ -58,8 +59,8 @@ std::filesystem::path fixture_path() {
 }
 
 void write_fixture(
-    const std::filesystem::path& path) {
-    constexpr std::size_t bytes = 16U * 1024U;
+    const std::filesystem::path& path,
+    std::size_t bytes = 16U * 1024U) {
     std::vector<std::uint8_t> data(bytes);
     for (std::size_t index = 0;
          index < data.size();
@@ -518,6 +519,276 @@ void selective_owned_and_faults(const std::filesystem::path& path) {
     expect(weak.expired(), "test-only quarantine retirement releases mapping only after actual unregister");
     diag::set_fault_plan();
 }
+
+strix::ModelManifest experts_manifest() {
+    strix::ModelManifest manifest;
+    manifest.architecture = "experts-residency-fixture";
+    const auto add = [&](const char* name, std::uint64_t offset, std::uint64_t bytes,
+                         strix::TensorRole role, strix::ResidencyPolicy residency) {
+        strix::ManifestTensor tensor;
+        tensor.name = name; tensor.ggml_type = 0; tensor.dimensions = {bytes / 4U};
+        tensor.byte_size = bytes; tensor.absolute_offset = offset;
+        tensor.role = role; tensor.residency = residency;
+        manifest.total_tensor_bytes += bytes;
+        if (residency == strix::ResidencyPolicy::file_backed_candidate)
+            manifest.file_backed_candidate_bytes += bytes;
+        manifest.tensors.push_back(std::move(tensor));
+    };
+    using Role = strix::TensorRole;
+    using Residency = strix::ResidencyPolicy;
+    add("norm", 4108U, 1024U, Role::normalization, Residency::resident);
+    // The four small dense tensors share precisely the first/last source page
+    // of the two experts. Each expert still has several unregistered pages.
+    add("before.a", 8192U, 64U, Role::dense_projection, Residency::resident);
+    add("expert.a", 8256U, 16384U, Role::moe_expert, Residency::resident);
+    add("after.a", 24640U, 1024U, Role::dense_projection, Residency::resident);
+    add("before.b", 40960U, 192U, Role::dense_projection, Residency::resident);
+    add("expert.b", 41152U, 12288U, Role::moe_expert, Residency::resident);
+    add("after.b", 53440U, 1024U, Role::dense_projection, Residency::resident);
+    add("table", 61440U, 1024U, Role::ngram_table, Residency::file_backed_candidate);
+    manifest.layout_identity = strix::model_manifest_layout_identity(manifest);
+    return manifest;
+}
+
+strix::HipModelResidencyPolicy experts_policy() {
+    strix::HipModelResidencyPolicy policy;
+    policy.copy_tier = strix::HipModelCopyTier::experts;
+    policy.copy_payload_bytes = 28672U;
+    policy.coalesce_gap_bytes = 0;
+    policy.reservation_limits = {102400U, 102400U};
+    return policy;
+}
+
+void experts_owned_and_faults(const std::filesystem::path& original_path) {
+    namespace diag = strix::model_residency_diagnostic;
+    auto path = original_path; path += ".experts";
+    write_fixture(path, 65536U);
+    try {
+        const auto manifest = experts_manifest();
+        const auto policy = experts_policy();
+        strix::AllocationGenerationSource generations;
+        std::shared_ptr<const strix::MappedModelFile> mapped = std::make_shared<strix::MappedModelFile>(
+            strix::MappedModelFile::open_read_only(path, "experts-source", generations));
+        const auto plan = strix::build_selective_copy_plan(manifest, policy, mapped->bytes(), 4096U);
+        const auto reservation = strix::plan_hip_model_residency_reservation(*mapped, manifest, policy);
+        expect(plan.tensors == std::vector<std::uint32_t>{2U, 5U} && plan.ranges.size() == 2U &&
+            plan.payload_bytes == 28672U && plan.arena_bytes == 36864U &&
+            reservation.registered_alias_bytes == 20480U && reservation.retained_reserved_bytes == 102400U &&
+            reservation.setup_peak_reserved_bytes == 102400U,
+            "experts fixture has two padded copies and only four nonexpert registration ranges");
+
+        std::vector<strix::HipModelResidencyPolicy> invalid;
+        auto bad = policy; bad.copy_payload_bytes = 28673U; invalid.push_back(bad);
+        bad = policy; bad.copy_payload_bytes.reset(); invalid.push_back(bad);
+        bad = policy; bad.reservation_limits.retained_bytes.reset(); invalid.push_back(bad);
+        bad = policy; bad.reservation_limits.setup_peak_bytes.reset(); invalid.push_back(bad);
+        bad = policy; bad.reservation_limits.retained_bytes = 102399U; invalid.push_back(bad);
+        bad = policy; bad.reservation_limits.setup_peak_bytes = 102399U; invalid.push_back(bad);
+        bad = policy; bad.coalesce_gap_bytes = 4096U; invalid.push_back(bad);
+        bad = policy; bad.mode = strix::HipModelResidencyMode::resident_copy; invalid.push_back(bad);
+        bad = policy; bad.promote_file_backed_candidates = true; invalid.push_back(bad);
+        const auto reject_before_hip = [&](const strix::ModelManifest& input,
+                                            const strix::HipModelResidencyPolicy& input_policy,
+                                            bool borrowed = false, std::string_view expected_error = {}) {
+            diag::set_fault_plan(); strix::AllocationGenerationSource before(100000);
+            bool rejected = false;
+            try {
+                if (borrowed) static_cast<void>(strix::HipModelResidency::create(*mapped, input, before, input_policy));
+                else static_cast<void>(strix::HipModelResidency::create(mapped, input, before, input_policy));
+            } catch (const std::invalid_argument& error) {
+                rejected = expected_error.empty() || std::string_view(error.what()) == expected_error;
+            }
+            const auto calls = diag::stats();
+            expect(rejected && before.next() == 100000 && calls.registrations == 0 && calls.alias_queries == 0 &&
+                calls.allocations == 0 && calls.copies == 0 && calls.frees == 0,
+                "experts invalid geometry/ownership/budgets reject before generation or HIP mutation");
+        };
+        for (const auto& input_policy : invalid) reject_before_hip(manifest, input_policy);
+        reject_before_hip(manifest, policy, true);
+        auto short_expert = manifest;
+        short_expert.tensors[2].byte_size = 1024U; short_expert.tensors[2].dimensions = {256U};
+        short_expert.total_tensor_bytes -= 15360U;
+        short_expert.layout_identity = strix::model_manifest_layout_identity(short_expert);
+        bad = policy; bad.copy_payload_bytes = 13312U;
+        reject_before_hip(short_expert, bad, false,
+            "expert source is fully covered by registered boundary pages");
+        auto interior_alias = manifest;
+        // Remove both expert.a boundary aliases. Its sole overlap below is an
+        // interior page, so a weak "at most two overlap pages" check would pass.
+        interior_alias.tensors[1].absolute_offset = 0U;
+        interior_alias.tensors[3].absolute_offset = 32768U;
+        auto intruder = manifest.tensors[1]; intruder.name = "interior-alias";
+        intruder.absolute_offset = 16384U; intruder.byte_size = 4U; intruder.dimensions = {1U};
+        interior_alias.tensors.push_back(std::move(intruder)); interior_alias.total_tensor_bytes += 4U;
+        interior_alias.layout_identity = strix::model_manifest_layout_identity(interior_alias);
+        bad = policy; bad.reservation_limits = {131072U, 131072U};
+        reject_before_hip(interior_alias, bad, false,
+            "expert source interior overlaps registered model storage");
+
+        // Tier none still registers the experts and owns no copied backing.
+        diag::set_fault_plan();
+        {
+            strix::HipModelResidencyPolicy none;
+            const auto old_plan = strix::plan_hip_model_residency_reservation(*mapped, manifest, none);
+            auto baseline = strix::HipModelResidency::create(mapped, manifest, generations, none);
+            expect(old_plan.registered_alias_bytes == 40960U && baseline.registered_bytes() == 40960U &&
+                baseline.copied_bytes() == 0 && baseline.binding().tensors[2].storage ==
+                    strix::RuntimeTensorStorage::registered_file_mapped,
+                "tier none preserves expert source registration without copied backing");
+        }
+        diag::set_fault_plan();
+        auto owner = std::make_shared<strix::HipModelResidency>(
+            strix::HipModelResidency::create(mapped, manifest, generations, policy));
+        auto inventory = owner->owner_inventory(owner);
+        expect(diag::stats().registrations == 4U && diag::stats().allocations == 1U && diag::stats().copies == 6U &&
+            owner->registered_bytes() == 20480U && owner->copied_bytes() == 36864U &&
+            inventory.known_backings.size() == 2U && inventory.known_allocated_storage_bytes == 36864U &&
+            inventory.unique_backing_reserved_bytes == 102400U,
+            "experts source interiors are excluded from registration and all copies share one arena lease");
+        std::uintptr_t arena = 0;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> registered;
+        std::size_t copy_views = 0;
+        for (const auto& view : inventory.pinned_views) {
+            if (view.category == "weights.copy") {
+                ++copy_views;
+                const auto base = view.address - view.view_offset;
+                if (!arena) arena = base;
+                expect(base == arena && view.allocation_bytes == 36864U,
+                    "experts inventory exports two range views on exactly one arena backing");
+            } else if (view.category == "weights.registered-host")
+                registered.emplace_back(view.view_offset, view.view_offset + view.view_bytes);
+        }
+        expect(copy_views == 2U && registered.size() == 4U && arena % 4096U == 0,
+            "expert arena and nonexpert aliases have the expected page layout");
+        for (const auto& range : plan.ranges) {
+            std::uint64_t overlap = 0;
+            for (const auto& alias : registered) {
+                const auto begin = std::max(range.file_begin, alias.first);
+                const auto end = std::min(range.file_end, alias.second);
+                if (end > begin) overlap += end - begin;
+            }
+            expect(overlap == 8192U && overlap < range.file_end - range.file_begin,
+                "only two boundary pages of each expert remain registered");
+            std::vector<std::uint8_t> bytes(static_cast<std::size_t>(range.file_end - range.file_begin));
+            check(hipMemcpy(bytes.data(), reinterpret_cast<const void*>(arena + range.arena_offset), bytes.size(),
+                hipMemcpyDeviceToHost), "read synthetic experts and padding");
+            bool equal = true;
+            for (std::size_t i = 0; i < bytes.size(); ++i) equal = equal && bytes[i] == expected_byte(range.file_begin + i);
+            expect(equal, "every expert stored byte and boundary padding byte matches the mapped source");
+        }
+        for (std::size_t i = 0; i < manifest.tensors.size(); ++i) {
+            const auto& tensor = manifest.tensors[i]; const auto& binding = owner->binding().tensors[i];
+            expect(binding.tensor_index == i && binding.bytes == tensor.byte_size && binding.owner_node == tensor.placement.node &&
+                binding.address % 4096U == tensor.absolute_offset % 4096U,
+                "all expert experiment bindings preserve metadata and page-relative address congruence");
+            if (tensor.role == strix::TensorRole::moe_expert) {
+                expect(binding.storage == strix::RuntimeTensorStorage::resident &&
+                    binding.allocation_generation == owner->generation() && binding.address >= arena &&
+                    binding.address - arena < plan.arena_bytes && owner->covers_device_range(binding.address, binding.bytes),
+                    "expert binding gets the arena and explicit residency generation without a registered source alias");
+            } else if (tensor.residency == strix::ResidencyPolicy::file_backed_candidate) {
+                expect(binding.storage == strix::RuntimeTensorStorage::file_mapped &&
+                    binding.address == mapped->base_address() + tensor.absolute_offset &&
+                    binding.allocation_generation == mapped->allocation_generation(),
+                    "excluded table keeps its actual host mapping lease");
+            } else {
+                void* alias = nullptr;
+                check(hipHostGetDevicePointer(&alias, reinterpret_cast<void*>(mapped->base_address() + tensor.absolute_offset), 0),
+                    "query synthetic nonexpert alias");
+                expect(binding.storage == strix::RuntimeTensorStorage::registered_file_mapped &&
+                    binding.address == reinterpret_cast<std::uintptr_t>(alias) && binding.allocation_generation == owner->generation(),
+                    "nonexpert binding remains the actual registered alias");
+            }
+        }
+        {
+            auto fake_mapping = std::shared_ptr<const strix::MappedModelFile>(mapped.get(), [](const auto*) {});
+            auto fake_owner = std::shared_ptr<const strix::HipModelResidency>(owner.get(), [](const auto*) {});
+            bool rejected_mapping = false, rejected_owner = false;
+            try { static_cast<void>(owner->owner_inventory(owner, fake_mapping)); }
+            catch (const std::invalid_argument&) { rejected_mapping = true; }
+            try { static_cast<void>(owner->owner_inventory(fake_owner)); }
+            catch (const std::invalid_argument&) { rejected_owner = true; }
+            expect(rejected_mapping && rejected_owner, "experts inventory rejects fake control-block pins");
+        }
+        const auto mutation = static_cast<std::uint8_t>(expected_byte(8256U) ^ 0xffU);
+        check(hipMemset(reinterpret_cast<void*>(owner->binding().tensors[2].address), mutation, 1U), "mutate synthetic expert arena");
+        std::uint8_t observed = 0;
+        check(hipMemcpy(&observed, reinterpret_cast<const void*>(owner->binding().tensors[2].address), 1U,
+            hipMemcpyDeviceToHost), "consume synthetic expert binding");
+        expect(observed == mutation && *reinterpret_cast<const std::uint8_t*>(mapped->base_address() + 8256U) == expected_byte(8256U),
+            "expert consumer reads the separate arena while source bytes remain unchanged");
+        inventory = {}; const auto generation = owner->generation();
+        auto moved = std::make_shared<strix::HipModelResidency>(std::move(*owner));
+        expect(owner->generation() == 0 && owner->copied_bytes() == 0 && moved->generation() == generation,
+            "experts move construction transfers the arena and clears its source");
+        owner = std::move(moved);
+        auto assigned = std::make_shared<strix::HipModelResidency>(); *assigned = std::move(*owner);
+        expect(owner->generation() == 0 && assigned->generation() == generation && assigned->copy_tier() == policy.copy_tier,
+            "experts move assignment preserves its allocation generation and one arena");
+        owner = std::move(assigned); inventory = owner->owner_inventory(owner);
+        std::weak_ptr<const strix::MappedModelFile> mapping_weak = mapped;
+        std::weak_ptr<const strix::HipModelResidency> owner_weak = owner;
+        mapped.reset(); owner.reset();
+        expect(!mapping_weak.expired() && !owner_weak.expired() && diag::stats().frees == 0,
+            "experts inventory retains both actual owners through consumer lifetime");
+        inventory = {};
+        expect(mapping_weak.expired() && owner_weak.expired() && diag::stats().frees == 1U &&
+            diag::stats().acquired_allocations == diag::stats().released_allocations &&
+            diag::stats().acquired_registrations == diag::stats().released_registrations,
+            "experts pins retire aliases and one arena before releasing the source mapping");
+
+        mapped = std::make_shared<strix::MappedModelFile>(
+            strix::MappedModelFile::open_read_only(path, "experts-faults", generations));
+        const std::array faults{
+            diag::FaultPlan{diag::Fault::device_alias, 1U}, diag::FaultPlan{diag::Fault::device_alias, 4U},
+            diag::FaultPlan{diag::Fault::alias_alignment, 1U}, diag::FaultPlan{diag::Fault::allocation, 1U},
+            diag::FaultPlan{diag::Fault::arena_alignment, 1U}, diag::FaultPlan{diag::Fault::copy, 1U},
+            diag::FaultPlan{diag::Fault::copy, 2U}, diag::FaultPlan{diag::Fault::copy, 6U}};
+        for (const auto fault : faults) {
+            diag::set_fault_plan(fault); bool rejected = false;
+            try { static_cast<void>(strix::HipModelResidency::create(mapped, manifest, generations, policy)); }
+            catch (const std::exception&) { rejected = true; }
+            const auto calls = diag::stats();
+            expect(rejected && calls.acquired_allocations <= 1U && calls.frees == calls.acquired_allocations &&
+                calls.acquired_allocations == calls.released_allocations &&
+                calls.acquired_registrations == calls.released_registrations,
+                "experts partial setup retires all aliases and frees only an actually acquired arena");
+            diag::set_fault_plan();
+            { auto retry = strix::HipModelResidency::create(mapped, manifest, generations, policy);
+              expect(retry.copy_tier() == policy.copy_tier, "experts fresh creation succeeds after each injected failure"); }
+        }
+        hipStream_t stream = nullptr;
+        check(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), "experts capture stream");
+        check(hipStreamBeginCapture(stream, hipStreamCaptureModeThreadLocal), "experts capture begin");
+        diag::set_fault_plan(); strix::AllocationGenerationSource before_capture(100000); bool rejected = false;
+        {
+            strix::HipLaunchContext context; context.stream = stream;
+            const strix::HipLaunchScope scope(context);
+            try { static_cast<void>(strix::HipModelResidency::create(mapped, manifest, before_capture, policy)); }
+            catch (const std::invalid_argument&) { rejected = true; }
+        }
+        hipGraph_t graph = nullptr; check(hipStreamEndCapture(stream, &graph), "experts capture end");
+        std::size_t nodes = 0; check(hipGraphGetNodes(graph, nullptr, &nodes), "experts capture nodes");
+        expect(rejected && nodes == 0 && before_capture.next() == 100000 && diag::stats().registrations == 0 &&
+            diag::stats().allocations == 0 && diag::stats().copies == 0,
+            "experts owned capture rejects before generation, registration, allocation or graph nodes");
+        check(hipGraphDestroy(graph), "experts capture graph destroy");
+        check(hipStreamDestroy(stream), "experts capture stream destroy");
+        diag::set_fault_plan({diag::Fault::unregister, 1U});
+        auto quarantined = std::make_shared<strix::HipModelResidency>(
+            strix::HipModelResidency::create(mapped, manifest, generations, policy));
+        mapping_weak = mapped; mapped.reset(); quarantined.reset();
+        const auto calls = diag::stats();
+        expect(!mapping_weak.expired() && calls.quarantined_mappings == 1U && calls.frees == 1U &&
+            calls.acquired_allocations == calls.released_allocations &&
+            calls.acquired_registrations == calls.released_registrations + 1U,
+            "experts failed unregister keeps the source lease while freeing its independent arena once");
+        diag::retire_quarantined_mappings();
+        expect(mapping_weak.expired(), "experts quarantine releases mapping only after actual failed registration retirement");
+        diag::set_fault_plan();
+    } catch (...) { std::filesystem::remove(path); throw; }
+    std::filesystem::remove(path);
+}
 #endif
 
 }  // namespace
@@ -568,6 +839,7 @@ int main() try {
         shared_owner_inventory(path, manifest);
 #if defined(STRIX_BUILD_MODEL_RESIDENCY_DIAGNOSTIC)
         selective_owned_and_faults(path);
+        experts_owned_and_faults(path);
 #endif
 
         {

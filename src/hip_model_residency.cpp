@@ -204,6 +204,13 @@ bool should_promote(
     return true;
 }
 
+bool should_register(const ManifestTensor& tensor,
+    const HipModelResidencyPolicy& policy) noexcept {
+    return should_promote(tensor, policy) &&
+        !(policy.copy_tier == HipModelCopyTier::experts &&
+          selective_copy_eligible(tensor, HipModelCopyTier::experts));
+}
+
 struct HostRange {
     std::uint64_t begin = 0;
     std::uint64_t end = 0;
@@ -219,7 +226,7 @@ std::vector<HostRange> build_registration_ranges(
 
     for (const auto& tensor :
          manifest.tensors) {
-        if (!should_promote(
+        if (!should_register(
                 tensor,
                 policy)) {
             continue;
@@ -300,6 +307,29 @@ std::vector<HostRange> build_registration_ranges(
     return merged;
 }
 
+// Selected source interiors must remain unregistered. Retaining the mapping
+// keeps their bytes valid without requiring the source file cache to stay pinned.
+void validate_expert_registration(const SelectiveCopyPlan& selected,
+    const std::vector<HostRange>& registered, std::uint64_t page) {
+    std::size_t first = 0;
+    for (const auto& expert : selected.ranges) {
+        while (first < registered.size() && registered[first].end <= expert.file_begin) ++first;
+        std::uint64_t overlap = 0;
+        const auto interior_begin = std::min(checked_add(expert.file_begin, page), expert.file_end);
+        const auto interior_end = align_down(expert.file_end - 1U, page);
+        for (auto i = first; i < registered.size() && registered[i].begin < expert.file_end; ++i) {
+            const auto begin = std::max(expert.file_begin, registered[i].begin);
+            const auto end = std::min(expert.file_end, registered[i].end);
+            if (end <= begin) continue;
+            if (interior_begin < interior_end && begin < interior_end && end > interior_begin)
+                throw std::invalid_argument("expert source interior overlaps registered model storage");
+            overlap = checked_add(overlap, end - begin);
+        }
+        if (overlap >= expert.file_end - expert.file_begin)
+            throw std::invalid_argument("expert source is fully covered by registered boundary pages");
+    }
+}
+
 
 std::vector<HostRange> build_copy_ranges(
     const MappedModelFile& mapped,
@@ -336,6 +366,8 @@ HipModelResidencyReservation plan_hip_model_residency_reservation(const MappedMo
     result.mapped_reserved_bytes = align_up(mapped.bytes(), page_size());
     const auto ranges = policy.mode == HipModelResidencyMode::registered_file_mapping
         ? build_registration_ranges(mapped, manifest, policy) : build_copy_ranges(mapped, manifest, policy);
+    if (policy.copy_tier == HipModelCopyTier::experts)
+        validate_expert_registration(selective, ranges, page_size());
     for (const auto range : ranges) {
         if (policy.mode == HipModelResidencyMode::registered_file_mapping)
             result.registered_alias_bytes = checked_add(result.registered_alias_bytes, range.end - range.begin);
@@ -644,7 +676,7 @@ HipModelResidency HipModelResidency::create_impl(const MappedModelFile& mapped,
                     result.binding_.
                         tensors[index];
 
-                if (!should_promote(
+                if (!should_register(
                         tensor,
                         policy)) {
                     continue;
@@ -710,12 +742,29 @@ HipModelResidency HipModelResidency::create_impl(const MappedModelFile& mapped,
 #endif
                 if (!aligned || result.copy_arena_bytes_ > UINTPTR_MAX - result.copy_arena_base_)
                     throw std::invalid_argument("selective residency requires page-congruent bounded arena");
+                auto source_registration = ranges.begin();
                 for (const auto& range : result.arena_ranges_) {
-                    result.selective_guard_->run([&] {
-                        check_hip(selective_copy(reinterpret_cast<void*>(result.copy_arena_base_ + range.arena_offset),
-                            reinterpret_cast<const void*>(mapped.base_address() + range.file_begin),
-                            static_cast<std::size_t>(range.file_end - range.file_begin)), "selective residency weight copy");
-                    });
+                    auto source_begin = range.file_begin;
+                    while (source_begin < range.file_end) {
+                        auto source_end = range.file_end;
+                        // Keep each transfer within one source registration or
+                        // one unregistered span, including shared boundary pages.
+                        while (source_registration != ranges.end() && source_registration->end <= source_begin)
+                            ++source_registration;
+                        if (source_registration != ranges.end())
+                            source_end = std::min(source_end,
+                                source_registration->begin <= source_begin ?
+                                    source_registration->end : source_registration->begin);
+                        if (source_end <= source_begin)
+                            throw std::logic_error("selective model copy source segment is empty");
+                        result.selective_guard_->run([&] {
+                            check_hip(selective_copy(reinterpret_cast<void*>(result.copy_arena_base_ +
+                                    range.arena_offset + (source_begin - range.file_begin)),
+                                reinterpret_cast<const void*>(mapped.base_address() + source_begin),
+                                static_cast<std::size_t>(source_end - source_begin)), "selective residency weight copy");
+                        });
+                        source_begin = source_end;
+                    }
                 }
                 for (const auto index : selective.tensors) {
                     const auto& tensor = manifest.tensors[index];
@@ -725,11 +774,29 @@ HipModelResidency HipModelResidency::create_impl(const MappedModelFile& mapped,
                     if (range == result.arena_ranges_.end()) throw std::logic_error("selective tensor lacks copied arena range");
                     auto& runtime = result.binding_.tensors[index];
                     runtime.storage = RuntimeTensorStorage::resident;
-                    runtime.address = result.copy_arena_base_ + range->arena_offset + tensor.absolute_offset - range->file_begin;
+                    runtime.address = result.copy_arena_base_ + range->arena_offset + (tensor.absolute_offset - range->file_begin);
+                    runtime.allocation_generation = generation;
                     if (runtime.address % page != tensor.absolute_offset % page || !result.covers_device_range(runtime.address, runtime.bytes))
                         throw std::logic_error("selective tensor address congruence differs from source");
                 }
                 result.copied_bytes_ = selective.arena_bytes;
+                if (policy.copy_tier == HipModelCopyTier::experts) {
+                    std::size_t selected_count = 0;
+                    for (std::size_t index = 0; index < manifest.tensors.size(); ++index) {
+                        const auto& tensor = manifest.tensors[index];
+                        if (!should_promote(tensor, policy)) continue;
+                        const auto& runtime = result.binding_.tensors[index];
+                        const bool expert = selective_copy_eligible(tensor, policy.copy_tier);
+                        if (runtime.storage != (expert ? RuntimeTensorStorage::resident :
+                                RuntimeTensorStorage::registered_file_mapped) ||
+                            runtime.allocation_generation != generation ||
+                            !result.covers_device_range(runtime.address, runtime.bytes))
+                            throw std::logic_error("expert model copy has incomplete tensor backing");
+                        if (expert) ++selected_count;
+                    }
+                    if (selected_count != selective.tensors.size())
+                        throw std::logic_error("expert model copy binding census differs from plan");
+                }
                 for (std::size_t index = 0; index < manifest.tensors.size(); ++index)
                     if (manifest.tensors[index].placement.kind == PlacementKind::local &&
                         result.binding_.tensors[index].address % page != manifest.tensors[index].absolute_offset % page)

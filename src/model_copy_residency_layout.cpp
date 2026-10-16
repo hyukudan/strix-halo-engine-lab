@@ -25,6 +25,7 @@ std::string_view hip_model_copy_tier_name(HipModelCopyTier tier) {
     case HipModelCopyTier::none: return "none";
     case HipModelCopyTier::normalization: return "normalization";
     case HipModelCopyTier::hot_nonexpert: return "hot_nonexpert";
+    case HipModelCopyTier::experts: return "experts";
     }
     throw std::invalid_argument("invalid model copy tier");
 }
@@ -32,6 +33,7 @@ bool selective_copy_eligible(const ManifestTensor& tensor, HipModelCopyTier tier
     if (tensor.placement.kind != PlacementKind::local || tensor.residency != ResidencyPolicy::resident)
         return false;
     if (tier == HipModelCopyTier::normalization) return tensor.role == TensorRole::normalization;
+    if (tier == HipModelCopyTier::experts) return tensor.role == TensorRole::moe_expert;
     if (tier != HipModelCopyTier::hot_nonexpert) return false;
     switch (tensor.role) {
     case TensorRole::output_head: case TensorRole::normalization: case TensorRole::attention_projection:
@@ -50,6 +52,8 @@ SelectiveCopyPlan build_selective_copy_plan(const ModelManifest& manifest,
     }
     if (policy.mode != HipModelResidencyMode::registered_file_mapping || policy.promote_file_backed_candidates)
         throw std::invalid_argument("selective model copy requires registered mode without file candidate promotion");
+    if (policy.copy_tier == HipModelCopyTier::experts && policy.coalesce_gap_bytes)
+        throw std::invalid_argument("expert model copy requires zero registration coalescing gap");
     if (!policy.copy_payload_bytes || !*policy.copy_payload_bytes || !policy.reservation_limits.retained_bytes ||
         !policy.reservation_limits.setup_peak_bytes)
         throw std::invalid_argument("selective model copy requires payload and retained/setup budgets");

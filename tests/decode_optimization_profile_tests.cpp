@@ -1091,9 +1091,9 @@ int main() {
     reject_copy([](auto& o) { o.gpu_greedy_token = true; }, "selective model copy excludes GPU greedy token output");
     reject_copy([](auto& o) { o.planned_ple_io = true; }, "selective model copy excludes planned PLE IO");
     reject_copy([](auto& o) { o.numerical_profile = DecodeNumericalProfile::hc_splitk_f32_v1; },
-        "selective model copy currently requires exact-v5 numerical profile");
+        "selective model copy requires exact-v5 or an admitted explicit expert recipe");
     rejects([] { (void)parse({"decoder", "m", "1", "--model-copy-tier=unknown"}); },
-        "model copy tier must be none, normalization or hot_nonexpert");
+        "model copy tier must be none, normalization, hot_nonexpert or experts");
     rejects([] { (void)parse({"decoder", "m", "1", "--model-copy-tier"}); },
         "model copy option requires a value");
     rejects([] { (void)parse({"decoder", "m", "1", "--model-copy-tier=none", "--model-copy-tier=none"}); },

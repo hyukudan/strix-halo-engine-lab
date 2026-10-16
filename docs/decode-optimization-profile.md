@@ -1,5 +1,9 @@
 # Automatic decoder optimization profile
 
+Selective stored-byte model backing is documented in
+[model-weight-residency.md](model-weight-residency.md). It is an explicit
+experiment and does not change the automatic default.
+
 The decoder defaults to `--optimization-profile auto`. The low-level launcher
 configuration defaults remain conservative; the application resolves a content-admitted
 profile after reading GGUF metadata and identifying the immutable mapped file's

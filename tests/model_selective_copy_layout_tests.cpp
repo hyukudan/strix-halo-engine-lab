@@ -7,6 +7,7 @@
 #include <source_location>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace {
 void expect(bool value, std::source_location at = std::source_location::current()) {
@@ -37,6 +38,98 @@ strix::HipModelResidencyPolicy policy(strix::HipModelCopyTier tier, std::uint64_
     result.reservation_limits.retained_bytes = std::numeric_limits<std::uint64_t>::max();
     result.reservation_limits.setup_peak_bytes = std::numeric_limits<std::uint64_t>::max();
     return result;
+}
+void expert_selection_contract() {
+    using namespace strix;
+    constexpr std::uint64_t page = 4096, file_bytes = 98304;
+    ModelManifest manifest;
+    manifest.tensors = {tensor(TensorRole::normalization, 4103, 17),
+        tensor(TensorRole::moe_expert, 8201, 12320), tensor(TensorRole::dense_projection, 28675, 31),
+        tensor(TensorRole::moe_expert, 40971, 12336), tensor(TensorRole::moe_expert, 65549, 64),
+        tensor(TensorRole::moe_expert, 73731, 128), tensor(TensorRole::moe_expert, 81925, 128),
+        tensor(TensorRole::embedding, 90119, 128)};
+    // Selection follows typed placement/residency/role, not a suggestive name.
+    manifest.tensors[0].name = "blk.0.ffn_gate_exps.weight";
+    manifest.tensors[1].name = "typed.expert.without.filename.convention";
+    manifest.tensors[3].name = "blk.1.ffn_down_exps.weight";
+    manifest.tensors[4].placement.kind = PlacementKind::remote;
+    manifest.tensors[5].residency = ResidencyPolicy::file_backed_candidate;
+    manifest.tensors[6].residency = ResidencyPolicy::bounded_cache_candidate;
+    seal(manifest);
+    const auto identity = manifest.layout_identity;
+    auto experts = policy(HipModelCopyTier::experts, 24656);
+    expect(experts.coalesce_gap_bytes == 0);
+    const auto selected = build_selective_copy_plan(manifest, experts, file_bytes, page);
+    expect(selected.tensors == std::vector<std::uint32_t>({1, 3}));
+    expect(selected.payload_bytes == 24656 && selected.arena_bytes == 32768 && selected.ranges.size() == 2);
+    expect(selected.ranges[0].file_begin == 8192 && selected.ranges[0].file_end == 24576 &&
+        selected.ranges[0].arena_offset == 0);
+    expect(selected.ranges[1].file_begin == 40960 && selected.ranges[1].file_end == 57344 &&
+        selected.ranges[1].arena_offset == 16384);
+    for (const auto index : selected.tensors) {
+        const auto& t = manifest.tensors[index];
+        const auto range = std::find_if(selected.ranges.begin(), selected.ranges.end(), [&](const auto& r) {
+            return r.file_begin <= t.absolute_offset && t.absolute_offset < r.file_end &&
+                t.byte_size <= r.file_end - t.absolute_offset;
+        });
+        expect(range != selected.ranges.end());
+        const auto relative = range->arena_offset + t.absolute_offset - range->file_begin;
+        expect(relative % page == t.absolute_offset % page && relative <= selected.arena_bytes &&
+            t.byte_size <= selected.arena_bytes - relative);
+    }
+    for (const auto role : {TensorRole::unknown, TensorRole::embedding, TensorRole::output_head,
+        TensorRole::normalization, TensorRole::attention_projection, TensorRole::dense_projection,
+        TensorRole::moe_router, TensorRole::recurrent_state, TensorRole::sparse_index,
+        TensorRole::ngram_table, TensorRole::ple_parameter, TensorRole::mtp})
+        expect(!selective_copy_eligible(tensor(role, 0, 4), HipModelCopyTier::experts));
+    for (const auto index : {1U, 3U}) {
+        expect(selective_copy_eligible(manifest.tensors[index], HipModelCopyTier::experts));
+        for (const auto tier : {HipModelCopyTier::none, HipModelCopyTier::normalization, HipModelCopyTier::hot_nonexpert})
+            expect(!selective_copy_eligible(manifest.tensors[index], tier));
+    }
+    for (const auto index : {4U, 5U, 6U})
+        expect(!selective_copy_eligible(manifest.tensors[index], HipModelCopyTier::experts));
+    const auto norms = build_selective_copy_plan(manifest, policy(HipModelCopyTier::normalization, 17), file_bytes, page);
+    const auto hot = build_selective_copy_plan(manifest, policy(HipModelCopyTier::hot_nonexpert, 48), file_bytes, page);
+    expect(norms.tensors == std::vector<std::uint32_t>({0}) &&
+        hot.tensors == std::vector<std::uint32_t>({0, 2}));
+    for (const auto gap : {std::uint64_t{0}, std::uint64_t{4096}}) {
+        HipModelResidencyPolicy none; none.coalesce_gap_bytes = gap;
+        const auto empty = build_selective_copy_plan(manifest, none, file_bytes, page);
+        expect(empty.tensors.empty() && empty.ranges.empty() && empty.payload_bytes == 0 && empty.arena_bytes == 0);
+    }
+    for (const auto pin : {std::uint64_t{0}, std::uint64_t{24655}, std::uint64_t{24657}}) {
+        auto bad = experts; bad.copy_payload_bytes = pin;
+        rejects([&] { (void)build_selective_copy_plan(manifest, bad, file_bytes, page); });
+    }
+    for (const auto gap : {std::uint64_t{1}, std::uint64_t{4096}, UINT64_MAX}) {
+        auto bad = experts; bad.coalesce_gap_bytes = gap;
+        rejects([&] { (void)build_selective_copy_plan(manifest, bad, file_bytes, page); });
+    }
+    for (unsigned missing = 0; missing < 3; ++missing) {
+        auto bad = experts;
+        if (missing == 0) bad.copy_payload_bytes.reset();
+        if (missing == 1) bad.reservation_limits.retained_bytes.reset();
+        if (missing == 2) bad.reservation_limits.setup_peak_bytes.reset();
+        rejects([&] { (void)build_selective_copy_plan(manifest, bad, file_bytes, page); });
+    }
+    auto bad = experts; bad.mode = HipModelResidencyMode::resident_copy;
+    rejects([&] { (void)build_selective_copy_plan(manifest, bad, file_bytes, page); });
+    bad = experts; bad.promote_file_backed_candidates = true;
+    rejects([&] { (void)build_selective_copy_plan(manifest, bad, file_bytes, page); });
+    auto malformed = manifest; malformed.tensors[1].dimensions = {12319}; seal(malformed);
+    rejects([&] { (void)build_selective_copy_plan(malformed, experts, file_bytes, page); });
+    expect(hip_model_copy_tier_name(HipModelCopyTier::none) == "none" &&
+        hip_model_copy_tier_name(HipModelCopyTier::normalization) == "normalization" &&
+        hip_model_copy_tier_name(HipModelCopyTier::hot_nonexpert) == "hot_nonexpert" &&
+        hip_model_copy_tier_name(HipModelCopyTier::experts) == "experts");
+    rejects([&] { (void)hip_model_copy_tier_name(static_cast<HipModelCopyTier>(99)); });
+    expect(manifest.layout_identity == identity && model_manifest_layout_identity(manifest) == identity);
+    // Pure selection preserves the existing bounded EOF rule, including a partial final page.
+    ModelManifest eof; eof.tensors = {tensor(TensorRole::moe_expert, 53255, 12280)}; seal(eof);
+    const auto tail = build_selective_copy_plan(eof, policy(HipModelCopyTier::experts, 12280), 65535, page);
+    expect(tail.ranges.size() == 1 && tail.ranges[0].file_begin == 53248 &&
+        tail.ranges[0].file_end == 65535 && tail.ranges[0].arena_offset == 0 && tail.arena_bytes == 12287);
 }
 }
 
@@ -135,6 +228,7 @@ int main() try {
     rejects([&] { (void)build_selective_copy_plan(invalid, policy(HipModelCopyTier::normalization, 4), maximum, 4096); });
     invalid.tensors[0].byte_size = 1; invalid.tensors[0].dimensions = {1}; seal(invalid);
     rejects([&] { (void)build_selective_copy_plan(invalid, policy(HipModelCopyTier::normalization, 1), maximum, 4096); });
+    expert_selection_contract();
     std::cout << "selective model copy selection, page congruence and bounded layout PASS\n";
 } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';

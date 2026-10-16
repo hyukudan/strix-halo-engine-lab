@@ -40,6 +40,140 @@ void reject_as(const std::vector<std::string>& args,const char* expected,const c
     bool failed=false;try{(void)parse(args);}catch(const std::invalid_argument& error){failed=std::string(error.what())==expected;}
     require(failed,message);
 }
+void erase_option(std::vector<std::string>& args,const std::string& key){
+    for(auto it=args.begin();it!=args.end();++it){
+        if(*it==key){require(it+1!=args.end(),"fixture option needs a value");args.erase(it,it+2);return;}
+        if(it->starts_with(key+"=")){args.erase(it);return;}
+    }
+    throw std::logic_error("fixture option absent");
+}
+std::vector<std::string> experts_request(){
+    return {"decoder","target.gguf","1","2","3","--generate","20","--context","8192",
+        "--optimization-profile","auto","--model-copy-tier","experts",
+        "--model-copy-payload-bytes","24656","--model-retained-budget","131072",
+        "--model-setup-peak-budget","131072","--coalesce-gap","0"};
+}
+void expert_copy_cli_contract(){
+    using namespace strix;
+    using namespace strix::decode_cli;
+    auto args=experts_request();
+    set(args,"--model-copy-tier",std::string(hip_model_copy_tier_name(HipModelCopyTier::experts)));
+    const auto parsed=parse(args);
+    require(parsed.model_copy_tier==HipModelCopyTier::experts && parsed.model_copy_tier_explicit &&
+        parsed.model_copy_payload_bytes==24656 && parsed.model_retained_budget==131072 &&
+        parsed.model_setup_peak_budget==131072 && parsed.coalesce_gap_bytes==0 &&
+        parsed.numerical_profile==DecodeNumericalProfile::exact_v5 && !parsed.mtp.enabled,
+        "explicit experts round-trips its tier name and preserves exact payload/budgets/gap without selecting arithmetic or MTP");
+    auto equals=args;erase_option(equals,"--model-copy-tier");equals.push_back("--model-copy-tier=experts");
+    require(parse(equals).model_copy_tier==HipModelCopyTier::experts,"expert tier accepts equals syntax");
+    auto missing_gap=args;erase_option(missing_gap,"--coalesce-gap");
+    reject_as(missing_gap,"expert model copy requires --coalesce-gap 0","experts rejects the nonzero default gap");
+    for(const auto* value:{"1","4096"}){
+        auto bad=args;set(bad,"--coalesce-gap",value);
+        reject_as(bad,"expert model copy requires --coalesce-gap 0","experts requires zero gap explicitly");
+    }
+    for(const auto* key:{"--model-copy-payload-bytes","--model-retained-budget","--model-setup-peak-budget"}){
+        auto missing=args;erase_option(missing,key);
+        reject_as(missing,"selective model copy requires positive exact payload, retained and setup-peak budgets",
+            "experts rejects each missing reservation declaration before setup");
+        for(const auto* value:{"0","-1","18446744073709551616"}){
+            auto bad=args;set(bad,key,value);reject(bad,"experts rejects zero, negative and overflowing budget values");
+        }
+        auto duplicate=args;duplicate.push_back(std::string(key)+"=1");
+        reject(duplicate,"experts rejects duplicate payload and budget declarations");
+    }
+    for(const auto* tier:{"experts","none","normalization","hot_nonexpert"}){
+        auto duplicate=args;duplicate.push_back(std::string("--model-copy-tier=")+tier);
+        reject_as(duplicate,"duplicate model copy tier option","tiers cannot be repeated or combined");
+    }
+    auto unknown=args;set(unknown,"--model-copy-tier","EXPERTS");reject(unknown,"expert tier spelling is exact");
+    auto copied=args;copied.insert(copied.end(),{"--residency","copy"});
+    reject_as(copied,"selective model copy requires register residency","experts excludes whole-copy residency");
+    auto graph=args;graph.insert(graph.end(),{"--execution-mode","graph"});
+    reject_as(graph,"selective model copy requires eager execution","experts excludes an unqualified controller");
+    auto serving=args;serving.insert(serving.end(),{"--serve-concurrency","1"});
+    reject_as(serving,"selective model copy excludes serving options","even an explicit default serving selector is not unused expert admission");
+    auto mtp=request();mtp.insert(mtp.end(),{"--model-copy-tier=experts","--model-copy-payload-bytes=24656",
+        "--model-retained-budget=131072","--model-setup-peak-budget=131072","--coalesce-gap","0"});
+    reject_as(mtp,"selective model copy excludes MTP options","experts cannot implicitly qualify target/sidecar composition");
+    for(const auto* profile:{"q51-a8-down-v1","hc-deferred-norm-f32+q51-q80-a8-down-v1",
+        "hc-deferred-norm-f32+q51-q80-a8-down+q5k-a8-gateup-v1"}){
+        auto bad=args;bad.insert(bad.end(),{"--numerical-profile",profile});
+        reject_as(bad,"selective model copy requires exact-v5 or an admitted explicit expert recipe",
+            "experts excludes every unadmitted arithmetic recipe");
+    }
+    for(const auto* tier:{"normalization","hot_nonexpert"})
+        for(const auto* profile:{"hc-splitk-f32+q51-q80-a8-down-v1",
+            "hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup-v1",
+            "hc-deferred-norm-f32+q51-q80-a8-down-v1",
+            "hc-deferred-norm-f32+q51-q80-a8-down+q5k-a8-gateup-v1","q51-a8-down-v1"}){
+            auto bad=args;set(bad,"--model-copy-tier",tier);bad.insert(bad.end(),{"--numerical-profile",profile});
+            reject_as(bad,"selective model copy requires exact-v5 or an admitted explicit expert recipe",
+                "existing nonexpert tiers remain exact-v5 only");
+        }
+    const auto model=ModelContract::qwen38_flash_next();gguf::FileInfo info;
+    ModelManifest manifest;manifest.architecture="qwen3next";
+    manifest.layout_identity=model_manifest_layout_identity(manifest);
+    const auto resolve=[&](Options& o,bool has_a8){return resolve_optimization_profile(o,model,info,manifest,
+        validated_model_content_identity,has_a8);};
+    const auto same_organization=[](const Options& a,const Options& b){
+        for(auto member:{&Options::parallel_hyper_mix,&Options::staged_hyper_projections,&Options::fused_staged_hyper_mix,
+            &Options::q4k_a8g32_gate_up,&Options::grouped_exact_q51_down,&Options::q51_slot_parallel_down,
+            &Options::batched_moe_activation,&Options::deferred_moe_status,&Options::wave_moe_router_topk,
+            &Options::wave8_q8_gdn_input,&Options::wave8_q8_gdn_output,&Options::prefetch_q8_qsa_input,
+            &Options::prefetch_q8_shared_expert,&Options::prefetch_q8_lm_head,&Options::wave8_q8_lm_head,
+            &Options::wave8_q8_qsa_output,&Options::gdn_islands,&Options::prepared_eager,&Options::moe_shared_overlap})
+            require(a.*member==b.*member,"copy tier must not alter resolved organization flags");
+        require(a.numerical_profile==b.numerical_profile,"backing must not select arithmetic");
+    };
+    for(const auto* organization:{"auto","manual"})for(const bool has_a8:{false,true}){
+        auto selected_args=args;set(selected_args,"--optimization-profile",organization);
+        auto none_args=selected_args;set(none_args,"--model-copy-tier","none");erase_option(none_args,"--model-copy-payload-bytes");
+        auto none=parse(none_args);auto expert=parse(selected_args);
+        auto baseline=resolve(none,has_a8);auto selected=resolve(expert,has_a8);
+        require(selected.requested==baseline.requested && selected.selected==baseline.selected &&
+            selected.reason==baseline.reason && selected.automatic_applied==baseline.automatic_applied,
+            "experts preserves manual, automatic and missing-runtime resolution before suffixing");
+        same_organization(none,expert);
+        const auto baseline_name=baseline.selected;apply_model_copy_profile(none,baseline);apply_model_copy_profile(expert,selected);
+        require(none.model_copy_tier==HipModelCopyTier::none && baseline.selected==baseline_name &&
+            selected.selected==baseline_name+"+model-copy-tier:experts" && selected.reason==baseline.reason &&
+            selected.automatic_applied==baseline.automatic_applied,
+            "none remains unsuffixed and experts adds only its explicit backing suffix");
+        same_organization(none,expert);
+    }
+    // An explicit expert tier is source admission only: each arithmetic recipe
+    // must still satisfy its existing resolver/prerequisite checks independently.
+    for(const auto* profile:{"hc-splitk-f32+q51-q80-a8-down-v1",
+        "hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup-v1"}){
+        auto selected_args=args;selected_args.insert(selected_args.end(),{"--numerical-profile",profile});
+        auto none_args=selected_args;set(none_args,"--model-copy-tier","none");erase_option(none_args,"--model-copy-payload-bytes");
+        auto none=parse(none_args);auto expert=parse(selected_args);auto baseline=resolve(none,true);auto selected=resolve(expert,true);
+        require(selected.automatic_applied && baseline.automatic_applied,"explicit fast expert recipes retain admitted automatic prerequisites");
+        apply_numerical_profile(none,model,manifest,validated_model_content_identity,true,baseline);
+        apply_numerical_profile(expert,model,manifest,validated_model_content_identity,true,selected);
+        same_organization(none,expert);
+        require(selected.selected==baseline.selected,"same numerical recipe resolves identically before backing suffix");
+        apply_model_copy_profile(none,baseline);apply_model_copy_profile(expert,selected);
+        require(selected.selected==baseline.selected+"+model-copy-tier:experts",
+            "explicit expert composition preserves the numerical recipe name and adds only backing provenance");
+        auto manual_args=selected_args;set(manual_args,"--optimization-profile","manual");
+        auto manual=parse(manual_args);auto unresolved=resolve(manual,true);
+        bool rejected=false;try{apply_numerical_profile(manual,model,manifest,validated_model_content_identity,true,unresolved);}
+        catch(const std::invalid_argument&){rejected=true;}
+        require(rejected,"experts cannot invent missing manual numerical prerequisites");
+    }
+    for(const auto* organization:{"auto","manual"}){
+        auto defaults=parse({"decoder","target.gguf","1","--optimization-profile",organization});
+        auto selected=resolve(defaults,true);const auto name=selected.selected;apply_model_copy_profile(defaults,selected);
+        require(defaults.model_copy_tier==HipModelCopyTier::none && !defaults.model_copy_tier_explicit &&
+            !defaults.model_copy_payload_bytes && selected.selected==name,
+            "no manual or automatic profile implicitly selects experts or any other selective tier");
+    }
+    auto implicit_args=args;erase_option(implicit_args,"--optimization-profile");auto implicit=parse(implicit_args);
+    require(resolve(implicit,true).reason=="explicit-low-level-options",
+        "the existing explicit-gap low-level fallback is unchanged without an explicit organization selector");
+}
 }
 int main(){try{
     const auto legacy=parse({"decoder","target.gguf","1"});
@@ -223,5 +357,6 @@ int main(){try{
     reject_as(teacher_mtp,
         "teacher-forced score requires at least two teacher inputs and generate 1 in serial eager full-output diagnostic mode",
         "teacher score never enters speculative controller execution");
+    expert_copy_cli_contract();
     return 0;
 }catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}
