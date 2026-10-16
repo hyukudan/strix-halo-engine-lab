@@ -25,12 +25,15 @@ struct HipKnownPromptBackendStats {
     std::uint64_t projection_launches_saved = 0;
     std::array<std::uint64_t, known_window_r2_variant_slots> r2_variant_dispatches{};
     bool saturated = false;
+    std::uint64_t completed_input_rows = 0;
+    std::uint64_t shared_rows_dispatches = 0;
+    std::uint64_t gdn_rows_dispatches = 0;
 };
 
-// Experimental eager prompt adapter, not speculative generation. Both tokens
-// must already be known to the caller. The native owner computes both complete
-// heads, completes the causal window/D1 checks and commits its two rows before
-// this adapter downloads the terminal row's complete FP32 logits.
+// Experimental eager prompt adapter, not speculative generation. Every input
+// in the configured 2/4/8-row window is already known. The native owner computes
+// complete heads, completes causal window/D1 checks and commits all rows before
+// this adapter downloads only the terminal row's complete FP32 logits.
 //
 // window_scratch must be the exact retained physical owner passed to window.
 // The caller retains session through destruction and excludes concurrent access
@@ -55,8 +58,11 @@ public:
 
     [[nodiscard]] std::vector<float> execute_window(
         std::array<std::uint32_t, 2> tokens, std::uint64_t position) override;
+    [[nodiscard]] std::uint32_t logical_rows() const noexcept override;
+    [[nodiscard]] std::vector<float> execute_rows(
+        std::span<const std::uint32_t> tokens, std::uint64_t position) override;
     // A failed output copy/validation does not publish new telemetry, even
-    // though its session may already have consumed the two native rows.
+    // though its session may already have consumed the configured native rows.
     [[nodiscard]] HipKnownPromptBackendStats stats() const noexcept;
 private:
     struct Impl;

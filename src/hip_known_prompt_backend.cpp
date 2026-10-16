@@ -70,32 +70,35 @@ struct HipKnownPromptBackend::Impl {
             throw std::invalid_argument("known prompt terminal logits are outside the retained window arena");
     }
 
-    std::vector<float> execute(std::array<std::uint32_t,2> tokens, std::uint64_t position) {
+    std::vector<float> execute(std::span<const std::uint32_t> tokens, std::uint64_t position) {
         if (failed) throw std::logic_error("known prompt adapter cannot be reused after an exception");
         const auto committed_before = session.committed_tokens;
+        const auto rows = window->logical_rows();
         bool window_attempted = false;
         try {
             guard->require_original();
             if (current_hip_launch_context() || session.health != SerialSessionHealth::ready ||
                 session.arithmetic_lineage.tainted || position != session.next_position ||
-                position > std::numeric_limits<std::uint64_t>::max() - 2U ||
-                committed_before > std::numeric_limits<std::uint64_t>::max() - 2U ||
-                static_cast<std::uint64_t>(tokens[0]) >= vocab_size ||
-                static_cast<std::uint64_t>(tokens[1]) >= vocab_size)
+                tokens.size() != rows || (rows != 2U && rows != 4U && rows != 8U) ||
+                position > std::numeric_limits<std::uint64_t>::max() - rows ||
+                committed_before > std::numeric_limits<std::uint64_t>::max() - rows)
                 throw std::invalid_argument("known prompt window differs from the live eager session");
+            for (const auto token : tokens)
+                if (static_cast<std::uint64_t>(token) >= vocab_size)
+                    throw std::invalid_argument("known prompt token exceeds vocabulary");
             // Allocate host return storage before any model-state consumption.
             std::vector<float> logits(static_cast<std::size_t>(vocab_size));
             window_attempted = true;
             const auto result = window->execute(session, tokens);
-            if (session.health != SerialSessionHealth::ready || session.next_position != position + 2U ||
-                session.committed_tokens != committed_before + 2U)
-                throw std::logic_error("known prompt native window did not commit exactly two causal rows");
-            validate_terminal(result.logits[1]);
+            if (session.health != SerialSessionHealth::ready || session.next_position != position + rows ||
+                session.committed_tokens != committed_before + rows || result.logits.size() != rows)
+                throw std::logic_error("known prompt native window did not commit its configured causal rows");
+            validate_terminal(result.logits[rows - 1U]);
             // execute() has already fenced its owned producer stream and checked
             // D1 before publication. A synchronous full-row download introduces
             // no borrowed stream, no head omission and no additional D1 phase.
             guard->require_original();
-            check_prompt_copy(hipMemcpy(logits.data(), reinterpret_cast<const void*>(result.logits[1].address),
+            check_prompt_copy(hipMemcpy(logits.data(), reinterpret_cast<const void*>(result.logits[rows - 1U].address),
                 static_cast<std::size_t>(logits_bytes), hipMemcpyDeviceToHost));
             guard->require_original();
             validate_serial_decode_engine_logits(logits, vocab_size);
@@ -103,6 +106,9 @@ struct HipKnownPromptBackend::Impl {
             // actual native result. Saturation is telemetry, never admission.
             auto next = observed;
             add_prompt_stat(next.windows, 1U, next.saturated);
+            add_prompt_stat(next.completed_input_rows, rows, next.saturated);
+            add_prompt_stat(next.shared_rows_dispatches, result.shared_rows_dispatches, next.saturated);
+            add_prompt_stat(next.gdn_rows_dispatches, result.gdn_rows_dispatches, next.saturated);
             add_prompt_stat(next.r2_dispatches, result.r2_dispatches, next.saturated);
             add_prompt_stat(next.row_loop_dispatches, result.row_loop_dispatches, next.saturated);
             add_prompt_stat(next.logical_projection_weight_bytes_avoided,
@@ -136,6 +142,12 @@ HipKnownPromptBackend::HipKnownPromptBackend(std::shared_ptr<HipKnownPrefixWindo
     : impl_(std::make_unique<Impl>(std::move(window), session, window_scratch, vocab_size, std::move(guard))) {}
 HipKnownPromptBackend::~HipKnownPromptBackend() = default;
 std::vector<float> HipKnownPromptBackend::execute_window(std::array<std::uint32_t,2> tokens, std::uint64_t position) {
+    return impl_->execute(tokens, position);
+}
+std::uint32_t HipKnownPromptBackend::logical_rows() const noexcept {
+    return impl_->window->logical_rows();
+}
+std::vector<float> HipKnownPromptBackend::execute_rows(std::span<const std::uint32_t> tokens, std::uint64_t position) {
     return impl_->execute(tokens, position);
 }
 HipKnownPromptBackendStats HipKnownPromptBackend::stats() const noexcept {

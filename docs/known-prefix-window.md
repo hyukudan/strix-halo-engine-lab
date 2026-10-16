@@ -1,15 +1,20 @@
-# Two known input tokens
+# Known input windows
 
-The experimental known-prefix window compiles one layer-major traversal for two
+The experimental known-prefix window compiles one layer-major traversal for 2, 4 or 8
 already known inputs of one request. It does not predict the next greedy token.
 The existing serial and speculative-verify APIs retain their behavior. The explicit `--known-prefix-window` command-line route now connects the native
 owner and known-prompt controller. Default-profile selection remains unchanged.
 
-The compiler derives two disjoint row views from the actual serial allocations,
+`--known-prefix-rows 2|4|8` selects the logical width, defaulting to two. It
+requires `--known-prefix-window` and is rejected on the prompt-lookup route.
+The compiler derives disjoint row views from the actual serial allocations,
 including the serial expert workspace, and preserves each serial kernel ID.
 Window memory and arithmetic have separate identities. The default request uses
 explicit row loops for every step. Optional closed variants reuse Q8 shared-expert
-weights and wave8 GDN projection weights across both rows. Other operators and
+weights across native 2/4/8-row projection calls. Mixed GDN uses native
+2/4/8-row calls for its three large Q8 projections while the two F32 gates and
+recurrence remain ordered per-row. The all-Q8 GDN variant keeps contiguous
+two-row tiles. Dispatch receipts identify each actual closed variant separately. Other operators and
 unsupported serial variants keep their original one-row launches. GDN convolution
 and recurrence run for row zero before row one; indexed attention and PLE remain
 ordered per-row calls. P0 admits the synchronous file-mapped PLE backend without
@@ -27,8 +32,8 @@ Position history is a single host word. Before every admitted row reader it is
 resolved again and set to that row's position. This does not add semantic state
 generations. A failure after host or device mutation cancels PLE, drains, and
 poisons the session without publishing positions, generations or new lineage.
-Successful completion publishes a distinct prefill-chunk interval covering both
-inputs. It cannot claim a serial-only arithmetic history.
+Successful completion publishes a distinct prefill-chunk interval covering the complete
+known input window. It cannot claim a serial-only arithmetic history.
 
 This implementation requires source, compiler, native component, full-model
 logit/state and prompt-driver qualification. Component fixtures and structural
@@ -46,19 +51,21 @@ than assuming all five GDN projections are Q8. Compiled variant counts and actua
 per-variant dispatch counters are emitted separately. No fixed whole-network R2
 count is inferred from the model name.
 
-Known pairs use a separately retained window arena, owned stream and zeroed
+Known windows use a separately retained window arena, owned stream and zeroed
 completion record. The ordinary serial backend keeps its original resources and
-D1 shadow transaction for an odd prompt tail and autoregressive continuation.
-Pairs do not call that single-token shadow's begin/complete methods. Their native
-owner publishes two causal rows before the prompt adapter reads the terminal
-FP32 row, and all owners survive original-device quiescence. Both LM heads remain
+D1 shadow transaction for an incomplete window suffix and autoregressive continuation.
+Windows do not call that single-token shadow's begin/complete methods. Their native
+owner publishes its configured causal rows before the prompt adapter reads the terminal
+FP32 row, and all owners survive original-device quiescence. All LM heads remain
 computed; no speculative second input or head elision is introduced.
 
 The request controller's generation count is converted to total consumed rows
 for the existing output/final-state contract by adding consumed prompt rows.
-The common request timer includes the paired prompt path. Per-step serial timing
+The common request timer includes the complete known-window prompt path.
+The resumable cursor submits only complete selected-width windows; a shorter
+suffix uses original serial R1 calls without padding or fake row commits. Per-step serial timing
 is explicitly labelled as serial-tail-and-generation timing because it omits
-paired work. Actual successful-window telemetry uses saturating counters and
+known-window work. Actual successful-window telemetry uses saturating counters and
 reports saturation without affecting computation. Source receipts remain
 `not_assessed`; compiler/native, full-model, cache/prompt and timing qualification
 for the complete source batch are pending. No speedup is claimed here.

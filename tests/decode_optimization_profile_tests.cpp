@@ -154,6 +154,28 @@ int main() {
     validate_resolved_known_prefix_window(paired_prompt);
     expect(parse({"decoder", "m", "1", "--known-prefix-window"}).known_prefix_window,
         "parser records opt-in before resolved profile admission");
+    expect(defaults.known_prefix_rows == 2 && !defaults.known_prefix_rows_explicit,
+        "known-prefix logical rows default to two without changing automatic profile");
+    for (const auto* text : {"2", "4", "8"}) {
+        const auto selected = parse({"decoder", "m", "1", "--known-prefix-window", "--known-prefix-rows", text});
+        expect(selected.known_prefix_rows == parse_u64(text, "fixture") && !selected.any_low_level_flag,
+            "known-prefix row selection preserves automatic profile resolution");
+        auto admitted = paired_prompt; admitted.known_prefix_rows = selected.known_prefix_rows;
+        validate_resolved_known_prefix_window(admitted);
+    }
+    expect(parse({"decoder", "m", "1", "--known-prefix-window", "--known-prefix-rows=8"}).known_prefix_rows == 8,
+        "known-prefix rows supports explicit equals form");
+    for (const auto* text : {"0", "1", "3", "16"})
+        rejects([&] { (void)parse({"decoder", "m", "1", "--known-prefix-window", "--known-prefix-rows", text}); },
+            "known-prefix rows must be 2, 4 or 8");
+    rejects([] { (void)parse({"decoder", "m", "1", "--known-prefix-rows", "2"}); },
+        "known-prefix rows require --known-prefix-window");
+    rejects([] { (void)parse({"decoder", "m", "1", "--prompt-lookup", "--known-prefix-rows", "4"}); },
+        "known-prefix rows require --known-prefix-window");
+    rejects([] { (void)parse({"decoder", "m", "1", "--known-prefix-window", "--known-prefix-rows", "4", "--known-prefix-rows=8"}); },
+        "duplicate known-prefix rows option");
+    { auto bad = paired_prompt; bad.known_prefix_rows = 3;
+      rejects([&] { validate_resolved_known_prefix_window(bad); }, "known-prefix rows must be 2, 4 or 8"); }
     rejects([] { (void)parse({"decoder", "m", "1", "--known-prefix-window", "--known-prefix-window"}); },
         "duplicate known-prefix window option");
     for (unsigned mutation = 0; mutation < 10; ++mutation) {

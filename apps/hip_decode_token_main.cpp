@@ -676,7 +676,7 @@ int main(
             "  --qsa-hierarchical-selection (experimental exact top512, eager D1, context<=131072)\n"
             "  --gdn-recurrent-layout baseline|stride32|stride33|transposed (experimental eager LDS organization)\n"
             "  --gdn-recurrent-storage key-value|value-key (experimental physical state layout, default key-value)\n"
-            "  --known-prefix-window (experimental paired known prompt; complete heads, separate window owner)\n"
+            "  --known-prefix-window [--known-prefix-rows 2|4|8] (experimental known prompt; complete heads, separate window owner)\n"
             "  --prompt-lookup [--prompt-lookup-depth 0|1|2] (experimental greedy target verification, default off)\n"
             "  --serve-prefix-u32le FILE (repeat per request; independent C1 state, shared weights)\n"
             "  --serve-concurrency 1|2|4 --serve-memory-budget-bytes N --serve-request-budget-bytes N --serve-headroom-bytes N\n"
@@ -2127,7 +2127,8 @@ int main(
             }
         } lookup_stats;
         if (options.known_prefix_window || options.prompt_lookup) {
-            known_prefix_plan = strix::compile_known_prefix_window(model, compiled, manifest, tensor_access, {true, true, true});
+            known_prefix_plan = strix::compile_known_prefix_window(model, compiled, manifest, tensor_access,
+                {true, true, true, options.known_prefix_window ? options.known_prefix_rows : 2U});
             if (!known_prefix_plan->r2_steps) throw std::invalid_argument("known prompt has no admitted paired operators");
             if (model.vocab_size > std::numeric_limits<std::uint32_t>::max())
                 throw std::invalid_argument("known-prompt vocabulary exceeds uint32");
@@ -2226,8 +2227,9 @@ int main(
             paired.start_position = session.next_position;
             paired.vocab_size = request.vocab_size; paired.context_capacity = request.context_capacity;
             paired.max_new_tokens = request.max_new_tokens; paired.eos_token_id = request.eos_token_id;
+            paired.logical_rows = options.known_prefix_rows;
             strix::KnownPromptChunkCursor chunks(paired, *known_prefix_backend, backend);
-            while (chunks.advance()) { /* one complete causal R2 pair or final R1 tail */ }
+            while (chunks.advance()) { /* one complete configured window or one unpadded serial suffix row */ }
             const auto& generated = chunks.finish_greedy();
             known_prefix_progress = chunks.progress();
             known_prefix_result.emplace();
@@ -2300,11 +2302,17 @@ int main(
                 if (index >= compiled_variants.size()) throw std::logic_error("unknown prompt variant in source receipt");
                 if (index) ++compiled_variants[index];
             }
-            std::cout << "  \"known_prefix_chunk_cursor\":true,\n"
+            std::cout << "  \"known_prefix_logical_rows\":" << known_prefix_plan->logical_rows << ",\n"
+                      << "  \"known_prefix_suffix_policy\":\"unpadded-serial-R1\",\n"
+                      << "  \"known_prefix_projection_dispatch_accounting\":\"actual-closed-variant-table-not-logical-row-inference\",\n"
+                      << "  \"known_prefix_chunk_cursor\":true,\n"
                       << "  \"known_prefix_generation_input_tokens_consumed\":" << known_prefix_progress->consumed_generation_tokens << ",\n"
                       << "  \"known_prefix_final_bonus_pending\":" << (known_prefix_progress->bonus_pending ? "true" : "false") << ",\n";
             std::cout << "  \"known_prefix_completed_windows\":" << observed.windows << ",\n"
                 << "  \"known_prefix_stats_saturated\":" << (observed.saturated ? "true" : "false") << ",\n"
+                << "  \"known_prefix_native_completed_input_rows\":" << observed.completed_input_rows << ",\n"
+                << "  \"known_prefix_native_shared_rows_dispatches\":" << observed.shared_rows_dispatches << ",\n"
+                << "  \"known_prefix_native_gdn_rows_dispatches\":" << observed.gdn_rows_dispatches << ",\n"
                 << "  \"known_prefix_r2_dispatches\":" << observed.r2_dispatches << ",\n"
                 << "  \"known_prefix_row_loop_dispatches\":" << observed.row_loop_dispatches << ",\n"
                 << "  \"known_prefix_logical_projection_weight_bytes_avoided\":" << observed.logical_projection_weight_bytes_avoided << ",\n"
@@ -2312,6 +2320,14 @@ int main(
                 << "  \"known_prefix_r2_variant_dispatches\":[";
             for (std::size_t i = 0; i < observed.r2_variant_dispatches.size(); ++i)
                 std::cout << (i ? "," : "") << observed.r2_variant_dispatches[i];
+            std::cout << "],\n  \"known_prefix_variant_names\":[";
+            constexpr std::array<std::string_view, 8> variant_names{
+                "none", "shared-q8-rows2", "gdn-all-q8-pair-tiles", "gdn-q8-rows2-f32-gates-r1",
+                "shared-q8-rows4", "shared-q8-rows8", "gdn-q8-rows4-f32-gates-r1", "gdn-q8-rows8-f32-gates-r1"};
+            for (std::size_t i = 0; i < compiled_variants.size(); ++i) {
+                if (i >= variant_names.size()) throw std::logic_error("unknown known-prefix variant name");
+                std::cout << (i ? "," : "") << '"' << variant_names[i] << '"';
+            }
             std::cout << "],\n  \"known_prefix_source_variant_steps\":[";
             for (std::size_t i = 0; i < compiled_variants.size(); ++i) std::cout << (i ? "," : "") << compiled_variants[i];
             std::cout << "],\n  \"known_prefix_window\":true,\n"

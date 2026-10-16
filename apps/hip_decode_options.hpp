@@ -172,6 +172,8 @@ struct Options {
     bool serving_request_explicit = false, serving_headroom_explicit = false;
     strix::GdnRecurrentStorage gdn_recurrent_storage = strix::GdnRecurrentStorage::key_value;
     bool gdn_recurrent_storage_explicit = false;
+    std::uint32_t known_prefix_rows = 2;
+    bool known_prefix_rows_explicit = false;
 };
 
 inline bool is_low_level_optimization_option(std::string_view argument) {
@@ -228,7 +230,13 @@ inline void validate_resolved_q51_slot_parallel_down(const Options& options) {
 }
 
 inline void validate_resolved_known_prefix_window(const Options& options) {
-    if (!options.known_prefix_window) return;
+    if (options.known_prefix_rows != 2 && options.known_prefix_rows != 4 && options.known_prefix_rows != 8)
+        throw std::invalid_argument("known-prefix rows must be 2, 4 or 8");
+    if (!options.known_prefix_window) {
+        if (options.known_prefix_rows_explicit || options.known_prefix_rows != 2)
+            throw std::invalid_argument("known-prefix rows require --known-prefix-window");
+        return;
+    }
     if (options.prompt_lookup) throw std::invalid_argument("known prefix and prompt lookup are separate request routes");
     if (!options.generate_tokens || options.execution.mode != strix::DecodeExecutionMode::eager ||
         options.execution.integer_head != strix::DecodeIntegerHead::none || options.gpu_greedy_token ||
@@ -330,7 +338,7 @@ inline Options parse_options(
         throw std::invalid_argument(
             "usage: strix-hip-decode-token MODEL.gguf [TOKEN_ID ...] "
             "[--optimization-profile auto|manual] [--execution-inventory] [--host-dispatch-telemetry] [--execution-telemetry-trace] "
-            "[--gpu-greedy-token] [--gdn-recurrent-layout baseline|stride32|stride33|transposed] [--gdn-recurrent-storage key-value|value-key] [--known-prefix-window] [--prompt-lookup] [--prompt-lookup-depth 0|1|2] [--serve-prefix-u32le FILE ... --serve-concurrency 1|2|4 --serve-memory-budget-bytes N --serve-request-budget-bytes N --serve-headroom-bytes N] [--gdn-islands] [--qsa-hierarchical-selection] [--qsa-gqa-heads-per-block 1|2|4] [--prepared-eager] [--moe-shared-overlap] [--moe-overlap-arena-budget-bytes N] [--batched-moe-activation] [--validation-final-state DIR] [--validation-final-state-max-bytes N] [--reference FILE] [--max-logit-error X] "
+            "[--gpu-greedy-token] [--gdn-recurrent-layout baseline|stride32|stride33|transposed] [--gdn-recurrent-storage key-value|value-key] [--known-prefix-window --known-prefix-rows 2|4|8] [--prompt-lookup] [--prompt-lookup-depth 0|1|2] [--serve-prefix-u32le FILE ... --serve-concurrency 1|2|4 --serve-memory-budget-bytes N --serve-request-budget-bytes N --serve-headroom-bytes N] [--gdn-islands] [--qsa-hierarchical-selection] [--qsa-gqa-heads-per-block 1|2|4] [--prepared-eager] [--moe-shared-overlap] [--moe-overlap-arena-budget-bytes N] [--batched-moe-activation] [--validation-final-state DIR] [--validation-final-state-max-bytes N] [--reference FILE] [--max-logit-error X] "
             "[--context N] [--residency register|copy] [--coalesce-gap BYTES] "
             "[--planned-ple-io] [--ple-max-rows-per-io N] [--ple-max-inflight-ios N] "
             "[--generate N] [--eos-token TOKEN_ID] [--prefix-cache-roundtrip] "
@@ -404,6 +412,19 @@ inline Options parse_options(
             if (value > 2) throw std::invalid_argument("prompt lookup depth must be zero, one or two");
             options.prompt_lookup_depth = static_cast<std::uint32_t>(value);
             options.prompt_lookup_depth_explicit = true;
+            continue;
+        }
+        if (argument == "--known-prefix-rows" || argument.starts_with("--known-prefix-rows=")) {
+            if (options.known_prefix_rows_explicit) throw std::invalid_argument("duplicate known-prefix rows option");
+            std::string_view value;
+            if (argument == "--known-prefix-rows") {
+                if (index + 1 >= argc) throw std::invalid_argument("known-prefix rows require a value");
+                value = argv[++index];
+            } else value = argument.substr(std::string_view("--known-prefix-rows=").size());
+            const auto rows = parse_u64(value, "known-prefix rows");
+            if (rows != 2 && rows != 4 && rows != 8) throw std::invalid_argument("known-prefix rows must be 2, 4 or 8");
+            options.known_prefix_rows = static_cast<std::uint32_t>(rows);
+            options.known_prefix_rows_explicit = true;
             continue;
         }
         if (argument == "--known-prefix-window") {
@@ -910,6 +931,8 @@ inline Options parse_options(
     if (options.serving_prefix_files.empty() && (options.serving_concurrency_explicit || options.serving_memory_explicit ||
         options.serving_request_explicit || options.serving_headroom_explicit))
         throw std::invalid_argument("serving controls require --serve-prefix-u32le");
+    if (options.known_prefix_rows_explicit && !options.known_prefix_window)
+        throw std::invalid_argument("known-prefix rows require --known-prefix-window");
     if (options.prompt_lookup_depth_explicit && !options.prompt_lookup)
         throw std::invalid_argument("prompt lookup depth requires --prompt-lookup");
     if (options.execution_telemetry_trace && !options.host_dispatch_telemetry)

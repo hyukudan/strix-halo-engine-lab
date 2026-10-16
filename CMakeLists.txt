@@ -1587,6 +1587,30 @@ if(STRIX_ENABLE_HIP_RUNTIME)
             COMMAND strix-hip-shared-expert-launcher-tests
         )
 
+        add_executable(strix-hip-shared-known-window-rows-tests tests/hip_shared_known_window_rows_tests.hip)
+        set_target_properties(strix-hip-shared-known-window-rows-tests PROPERTIES
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+        target_link_libraries(strix-hip-shared-known-window-rows-tests PRIVATE strix_hip_runtime)
+        target_compile_options(strix-hip-shared-known-window-rows-tests PRIVATE
+            -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
+        strix_target_warnings(strix-hip-shared-known-window-rows-tests)
+        foreach(rows 4 8)
+            foreach(prefetch 0 1)
+                add_test(NAME strix-hip-shared-known-window-rows-${rows}-prefetch-${prefetch}
+                    COMMAND strix-hip-shared-known-window-rows-tests ${rows} ${prefetch})
+            endforeach()
+        endforeach()
+
+        add_executable(strix-hip-gdn-wide-projection-tests tests/hip_gdn_wide_projection_tests.hip)
+        set_target_properties(strix-hip-gdn-wide-projection-tests PROPERTIES
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+        target_link_libraries(strix-hip-gdn-wide-projection-tests PRIVATE strix_hip_runtime)
+        target_compile_definitions(strix-hip-gdn-wide-projection-tests PRIVATE STRIX_BUILD_KNOWN_WINDOW_DIAGNOSTIC=1)
+        target_compile_options(strix-hip-gdn-wide-projection-tests PRIVATE
+            -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
+        strix_target_warnings(strix-hip-gdn-wide-projection-tests)
+        add_test(NAME strix-hip-gdn-wide-projection-tests COMMAND strix-hip-gdn-wide-projection-tests)
+
         add_executable(strix-hip-known-window-tests tests/hip_known_window_tests.hip)
         set_target_properties(strix-hip-known-window-tests PROPERTIES
             HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
