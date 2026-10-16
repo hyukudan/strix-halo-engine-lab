@@ -52,6 +52,8 @@ struct KnownWindowResult {
     std::vector<ExecutionBufferAddress> logits;
     std::uint64_t logical_projection_weight_bytes_avoided = 0;
     std::uint32_t projection_launches_saved = 0;
+    // Row/operator work represented by actual dispatches, excluding omitted
+    // terminal heads. Promoted row groups still represent every source row.
     std::uint32_t logical_row_steps = 0;
     std::uint32_t r2_dispatches = 0;
     std::uint32_t row_loop_dispatches = 0;
@@ -59,6 +61,8 @@ struct KnownWindowResult {
     std::uint32_t gdn_rows_dispatches = 0;
     std::uint32_t routed_expert_union_dispatches = 0;
     std::array<std::uint32_t, known_window_r2_variant_slots> r2_variant_dispatches{};
+    std::vector<std::uint32_t> logit_row_indices;
+    std::uint32_t omitted_lm_heads = 0;
 };
 
 // Compatibility entry for two KNOWN input tokens only. This API neither predicts a future greedy token
@@ -73,7 +77,10 @@ struct KnownWindowResult {
     std::span<const KnownWindowR2Entry> r2_entries,
     const KnownWindowExecutionHooks& hooks);
 
-// Complete known R=2/4/8 window, with explicit wide/shared and GDN entries.
+// Complete causal known R=2/4/8 window, with explicit output policy and
+// wide/shared/GDN entries. All launchers, including omitted LM heads, undergo
+// full admission. logits are compact and indexed by logit_row_indices; an
+// omitted row never returns a stale scratch address as a produced output.
 [[nodiscard]] KnownWindowResult execute_known_prefix_window_eager(
     const CompiledKnownPrefixWindow& window, const CompiledSerialExecution& serial,
     const ExecutionRuntimeResources& serial_resources,

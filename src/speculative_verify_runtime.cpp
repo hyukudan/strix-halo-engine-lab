@@ -317,10 +317,13 @@ KnownWindowResult execute_known_prefix_window_eager(
         seen[id]=true;
     }
     KnownWindowResult result;
-    result.logits.resize(rows);
+    result.logits.resize(window.logit_row_indices.size());
+    result.logit_row_indices=window.logit_row_indices;
     result.execution.state = session.state;
     result.execution.completion_order.reserve(rows * steps);
     result.logical_row_steps = static_cast<std::uint32_t>(rows * steps);
+    result.omitted_lm_heads=rows-static_cast<std::uint32_t>(window.logit_row_indices.size());
+    result.logical_row_steps-=result.omitted_lm_heads;
     result.logical_projection_weight_bytes_avoided = window.logical_projection_weight_bytes_avoided;
     result.projection_launches_saved = window.projection_launches_saved;
     for (std::size_t i = 0; i < steps; ++i) {
@@ -369,9 +372,12 @@ KnownWindowResult execute_known_prefix_window_eager(
     for (std::size_t r = 0; r < rows; ++r) {
         if (contexts.back()[r].writes.size() != 1)
             throw std::invalid_argument("known window terminal head requires one output");
-        result.logits[r] = resolve_dispatch_write(contexts.back()[r], 0);
-        if (result.logits[r].bytes < serial.vocab_size * sizeof(float))
+        // Admission remains complete even for a deliberately omitted output.
+        const auto logits = resolve_dispatch_write(contexts.back()[r], 0);
+        if (logits.bytes < serial.vocab_size * sizeof(float))
             throw std::invalid_argument("known window terminal logit row is undersized");
+        const auto selected=std::find(window.logit_row_indices.begin(),window.logit_row_indices.end(),r);
+        if(selected!=window.logit_row_indices.end())result.logits[static_cast<std::size_t>(selected-window.logit_row_indices.begin())]=logits;
     }
     const auto position_state = resolve_dispatch_state(contexts.front()[0], SessionStateComponent::position_history);
     if (position_state.storage != SessionStateStorage::host || !position_state.address ||
@@ -454,6 +460,11 @@ KnownWindowResult execute_known_prefix_window_eager(
             } else {
                 for (std::size_t r = 0; r < rows; ++r) {
                     const auto& context = contexts[i][r];
+                    // The compiler proved this is the sole terminal, state-free
+                    // head. Its full launcher preflight already ran above for
+                    // every row, before PLE or any model/state mutation.
+                    if(i+1U==steps && step.op==SerialOp::lm_head &&
+                        !known_window_produces_logits(window.output_policy,static_cast<std::uint32_t>(r),rows))continue;
                     std::optional<ExecutionCorrelationScope> row_scope;
                     if (current_execution_telemetry()) {
                         auto correlation = current_execution_correlation();

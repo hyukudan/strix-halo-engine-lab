@@ -405,6 +405,7 @@ KnownWindowResult HipKnownPrefixWindow::execute(SerialSessionContext& session, s
     return impl_->execute(session,tokens);
 }
 std::uint32_t HipKnownPrefixWindow::logical_rows() const noexcept { return impl_->window.logical_rows; }
+KnownWindowOutputPolicy HipKnownPrefixWindow::output_policy() const noexcept { return impl_->window.output_policy; }
 std::optional<HipKnownPrefixUnionObservation> HipKnownPrefixWindow::latest_routed_union_observation() const noexcept {
     return impl_->failed?std::nullopt:impl_->last_union_observation;
 }

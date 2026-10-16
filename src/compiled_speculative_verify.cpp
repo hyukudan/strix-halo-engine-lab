@@ -564,6 +564,21 @@ std::pair<std::uint64_t, std::uint64_t> known_window_identities(
         window.r2_variant.size() == window.mode.size(), "known window mode table is incomplete");
     window_require(window.logical_rows==2U || window.logical_rows==4U || window.logical_rows==8U,
         "known window rows are outside the closed table");
+    validate_known_window_output_policy(window.output_policy);
+    window_require(!serial.execution.steps.empty() && serial.io.steps.size()==serial.execution.steps.size() &&
+        serial.execution.steps.back().id==serial.execution.steps.size()-1U &&
+        serial.execution.steps.back().op==SerialOp::lm_head &&
+        serial.execution.steps.back().reads_state==PersistentState::none &&
+        serial.execution.steps.back().writes_state==PersistentState::none &&
+        serial.io.steps.back().writes.size()==1U &&
+        serial.io.steps.back().writes[0].buffer.buffer_class==ExecutionBufferClass::logits &&
+        window.mode.back()==KnownWindowStepMode::r1_row_loop &&
+        !serial.bindings.bindings.back().host_or_runtime_step,
+        "known-window output policy requires a terminal state-free LM head");
+    std::vector<std::uint32_t> expected_logits;
+    for(std::uint32_t row=0;row<window.logical_rows;++row)
+        if(known_window_produces_logits(window.output_policy,row,window.logical_rows))expected_logits.push_back(row);
+    window_require(window.logit_row_indices==expected_logits,"known-window output row mapping differs from its policy");
     auto kernel = fnv_offset; window_hash_text(kernel, window.logical_rows==2U ? "known-window-r2-kernels-v1" : "known-window-rows-kernels-v1");
     if(window.logical_rows!=2U) hash_u64(kernel,window.logical_rows);
     hash_u64(kernel, serial.kernel_plan_identity); hash_u64(kernel, window.mode.size());
@@ -626,6 +641,14 @@ std::pair<std::uint64_t, std::uint64_t> known_window_identities(
         launches == window.projection_launches_saved,
         "known window logical projection counters differ from the closed operand shapes");
     hash_u64(kernel, avoided); hash_u64(kernel, launches);
+    // Preserve every byte of the default identity recipe. Nondefault output
+    // intent receives its own organization/lineage domain, not a serial ID.
+    if(window.output_policy!=KnownWindowOutputPolicy::all_rows) {
+        window_hash_text(kernel,"known-window-output-policy-v1");
+        hash_u64(kernel,static_cast<std::uint64_t>(window.output_policy));
+        hash_u64(kernel,window.logit_row_indices.size());
+        for(auto row:window.logit_row_indices)hash_u64(kernel,row);
+    }
     auto execution = fnv_offset; window_hash_text(execution, window.logical_rows==2U ? "known-window-r2-v1" : "known-window-rows-v1");
     if(window.logical_rows!=2U) hash_u64(execution,window.logical_rows);
     hash_u64(execution, window_serial_fingerprint(serial)); hash_u64(execution, kernel);
@@ -682,6 +705,10 @@ CompiledKnownPrefixWindow compile_known_prefix_window(
         "known window rows must be two, four or eight");
     CompiledKnownPrefixWindow output;
     output.logical_rows=request.logical_rows;
+    validate_known_window_output_policy(request.output_policy);
+    output.output_policy=request.output_policy;
+    for(std::uint32_t row=0;row<output.logical_rows;++row)
+        if(known_window_produces_logits(output.output_policy,row,output.logical_rows))output.logit_row_indices.push_back(row);
     output.serial_execution_identity = serial.execution_identity;
     output.serial_kernel_plan_identity = serial.kernel_plan_identity;
     output.manifest_layout_identity = manifest.layout_identity;

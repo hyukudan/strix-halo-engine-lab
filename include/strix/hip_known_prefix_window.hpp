@@ -53,6 +53,8 @@ public:
     [[nodiscard]] KnownWindowResult execute(SerialSessionContext& session,
         std::span<const std::uint32_t> tokens);
     [[nodiscard]] std::uint32_t logical_rows() const noexcept;
+    // Immutable compiler-selected intent; verification consumers require all_rows.
+    [[nodiscard]] KnownWindowOutputPolicy output_policy() const noexcept;
     // Last eligible layer in the last SUCCESSFULLY completed window only.
     // Not aggregate reuse, DRAM traffic, timing or model qualification.
     [[nodiscard]] std::optional<HipKnownPrefixUnionObservation> latest_routed_union_observation() const noexcept;

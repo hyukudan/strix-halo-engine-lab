@@ -29,12 +29,15 @@ struct HipKnownPromptBackendStats {
     std::uint64_t shared_rows_dispatches = 0;
     std::uint64_t gdn_rows_dispatches = 0;
     std::uint64_t routed_expert_union_dispatches = 0;
+    std::uint64_t omitted_lm_heads = 0;
+    std::uint64_t state_only_windows = 0;
 };
 
 // Experimental eager prompt adapter, not speculative generation. Every input
 // in the configured 2/4/8-row window is already known. The native owner computes
-// complete heads, completes causal window/D1 checks and commits all rows before
-// this adapter downloads only the terminal row's complete FP32 logits.
+// the configured heads, completes causal window/D1 checks and commits all rows.
+// Full-output methods download only the mapped terminal FP32 row; the explicit
+// state-only method returns no logits and never relabels older scratch as output.
 //
 // window_scratch must be the exact retained physical owner passed to window.
 // The caller retains session through destruction and excludes concurrent access
@@ -60,8 +63,10 @@ public:
     [[nodiscard]] std::vector<float> execute_window(
         std::array<std::uint32_t, 2> tokens, std::uint64_t position) override;
     [[nodiscard]] std::uint32_t logical_rows() const noexcept override;
+    [[nodiscard]] KnownWindowOutputPolicy output_policy() const noexcept override;
     [[nodiscard]] std::vector<float> execute_rows(
         std::span<const std::uint32_t> tokens, std::uint64_t position) override;
+    void execute_state_rows(std::span<const std::uint32_t> tokens,std::uint64_t position) override;
     // A failed output copy/validation does not publish new telemetry, even
     // though its session may already have consumed the configured native rows.
     [[nodiscard]] HipKnownPromptBackendStats stats() const noexcept;

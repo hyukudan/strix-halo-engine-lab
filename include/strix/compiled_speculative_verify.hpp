@@ -11,6 +11,7 @@
 #include "strix/model_contract.hpp"
 #include "strix/speculative_verify_binding.hpp"
 #include "strix/speculative_verify_plan.hpp"
+#include "strix/known_window_output_policy.hpp"
 
 #include <array>
 #include <cstdint>
@@ -54,6 +55,7 @@ struct KnownWindowRequest {
     std::uint32_t logical_rows = 2;
     // Explicit grouped Q5_1 down candidate; unmatched formats retain R1.
     bool routed_expert_union = false;
+    KnownWindowOutputPolicy output_policy = KnownWindowOutputPolicy::all_rows;
 };
 
 struct CompiledKnownPrefixWindow {
@@ -81,6 +83,9 @@ struct CompiledKnownPrefixWindow {
     std::uint32_t shared_rows_steps = 0;
     std::uint32_t gdn_rows_steps = 0;
     std::uint32_t routed_expert_union_steps = 0;
+    KnownWindowOutputPolicy output_policy = KnownWindowOutputPolicy::all_rows;
+    // Compact result.logits entries correspond to these original source rows.
+    std::vector<std::uint32_t> logit_row_indices;
 };
 
 // Complete wide entries do not contribute to the legacy paired-step counter.

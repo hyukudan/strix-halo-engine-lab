@@ -14,8 +14,11 @@ void expect(bool condition,const char* text) {
 class Rows final : public strix::KnownPromptWindowBackend, public strix::SerialGreedyStepBackend {
 public:
     std::uint32_t vocabulary=16, width=2;
+    strix::KnownWindowOutputPolicy policy=strix::KnownWindowOutputPolicy::all_rows;
+    strix::KnownWindowOutputPolicy output_policy() const noexcept override {return policy;}
     std::uint32_t logical_rows() const noexcept override {return width;}
     unsigned windows=0,serials=0;
+    unsigned state_windows=0,state_serials=0;
     bool fail_partial_window=false,bad_extent=false,nonfinite=false,poisoned=false;
     std::vector<std::pair<std::uint64_t,std::uint32_t>> inputs;
     std::vector<float> values(std::uint32_t input) const {
@@ -28,6 +31,7 @@ public:
         ++serials;inputs.emplace_back(position,token);return values(token);
     }
     std::vector<float> execute_rows(std::span<const std::uint32_t> tokens,std::uint64_t position) override {
+        if(policy==strix::KnownWindowOutputPolicy::state_only)throw std::logic_error("state-only mock cannot produce requested heads");
         if(tokens.size()!=width) throw std::invalid_argument("recording backend width mismatch");
         if(width==2U) return execute_window({tokens[0],tokens[1]},position);
         ++windows;
@@ -41,6 +45,16 @@ public:
         ++windows;inputs.emplace_back(position,tokens[0]);
         if(fail_partial_window) {poisoned=true;throw std::runtime_error("partial target window failure");}
         inputs.emplace_back(position+1U,tokens[1]);return values(tokens[1]);
+    }
+    void execute_state_rows(std::span<const std::uint32_t> tokens,std::uint64_t position) override {
+        if(policy!=strix::KnownWindowOutputPolicy::state_only||tokens.size()!=width)
+            throw std::invalid_argument("mock state-only window policy/width differs");
+        ++windows;++state_windows;
+        for(std::size_t row=0;row<tokens.size();++row){inputs.emplace_back(position+row,tokens[row]);
+            if(fail_partial_window&&row==1U){poisoned=true;throw std::runtime_error("partial state-only failure");}}
+    }
+    void execute_state(std::uint32_t token,std::uint64_t position) override {
+        ++state_serials;inputs.emplace_back(position,token);
     }
 };
 } // namespace
@@ -181,6 +195,60 @@ int main() {
         expect(rejected && sticky && failing.poisoned && failing.inputs.size()==count &&
             cursor.progress().consumed_prompt_tokens==0U && !cursor.frontier().valid,
             "wide partial failure is sticky without pretending an opaque target rollback");
+    }
+    using Policy=strix::KnownWindowOutputPolicy;
+    for(const unsigned width:{2U,4U,8U})for(const auto policy:{Policy::terminal_row,Policy::state_only}) {
+        for(const unsigned count:{1U,width,width+1U,2U*width,2U*width+1U}) {
+            std::vector<std::uint32_t> prompt;for(unsigned i=0;i<count;++i)prompt.push_back(i%12U+1U);
+            Rows target;target.width=width;target.policy=policy;
+            strix::KnownPromptChunkCursor cursor({prompt,3U,16U,64U,1U,15U,width,policy},target,target);
+            unsigned advances=0U;
+            while(cursor.advance()) {
+                ++advances;const auto before=target.inputs;const auto frontier=cursor.frontier();
+                expect(frontier.valid&&frontier.state_position==3U+target.inputs.size()&&target.inputs==before,
+                    "output-policy yield retains real causal state without recomputing known inputs");
+                if(policy==Policy::state_only&&!cursor.progress().prefill_complete)
+                    expect(frontier.logits.empty()&&!frontier.unconsumed_selection&&cursor.progress().emitted_tokens==0U,
+                        "state-only chunk never exposes stale logits or fabricates a generation frontier");
+            }
+            const auto state_windows=policy==Policy::state_only?(count-1U)/width:0U;
+            const auto full_windows=policy==Policy::terminal_row?count/width:0U;
+            const auto tail=count-(state_windows+full_windows)*width;
+            expect(target.state_windows==state_windows&&target.windows==state_windows+full_windows&&
+                target.state_serials==(policy==Policy::state_only?tail-1U:0U)&&
+                target.serials==(policy==Policy::state_only?1U:tail)&&
+                cursor.progress().state_only_windows==state_windows&&advances==state_windows+full_windows+tail,
+                "state-only uses only nonterminal full windows and an explicit bounded R1 terminal tail");
+            expect(!cursor.frontier().logits.empty()&&cursor.frontier().unconsumed_selection==(prompt.back()+1U)%16U,
+                "every prompt length and divisibility ends at an actual full-output terminal frontier");
+            for(unsigned row=0;row<count;++row)expect(target.inputs[row]==std::pair<std::uint64_t,std::uint32_t>{3U+row,prompt[row]},
+                "head omission consumes every known token once at its original absolute position");
+            const auto before=target.inputs;const auto& result=cursor.finish_greedy();
+            expect(result.generated_tokens==std::vector<std::uint32_t>{(prompt.back()+1U)%16U}&&
+                result.steps_executed==0U&&target.inputs==before&&cursor.progress().bonus_pending==result.generated_tokens.back(),
+                "terminal selection remains emitted and unconsumed after state-only or terminal-row prefill");
+        }
+        Rows target;target.width=width;target.policy=policy;const std::vector<std::uint32_t> prompt(width+1U,1U);
+        strix::KnownPromptChunkCursor cancelled({prompt,0U,16U,64U,1U,15U,width,policy},target,target);
+        expect(cancelled.advance(),"first output-policy chunk completes before cancellation");const auto calls=target.inputs;
+        cancelled.cancel();expect(!cancelled.advance()&&target.inputs==calls&&cancelled.frontier().valid,
+            "cancel after output-policy chunk preserves state and never consumes its remaining terminal input");
+        if(policy==Policy::state_only)expect(cancelled.frontier().logits.empty()&&!cancelled.frontier().unconsumed_selection,
+            "cancelled state-only frontier remains honestly without logits or an emitted bonus");
+    }
+    {
+        Rows target;target.policy=Policy::state_only;target.fail_partial_window=true;const std::vector<std::uint32_t> prompt{1U,2U,3U};
+        strix::KnownPromptChunkCursor cursor({prompt,0U,16U,16U,1U,15U,2U,Policy::state_only},target,target);
+        bool failed=false;try{(void)cursor.advance();}catch(const std::runtime_error&){failed=true;}
+        const auto calls=target.inputs;bool sticky=false;try{(void)cursor.advance();}catch(const std::logic_error&){sticky=true;}
+        expect(failed&&sticky&&target.poisoned&&calls.size()==2U&&target.inputs==calls&&!cursor.frontier().valid&&
+            cursor.progress().consumed_prompt_tokens==0U,"state-only backend failure cannot resume or pretend a partial native call was rolled back");
+    }
+    for(const auto policy:{Policy::terminal_row,Policy::state_only,static_cast<Policy>(255U)}) {
+        Rows target;const std::vector<std::uint32_t> prompt{1U,2U,3U};bool rejected=false;
+        try{strix::KnownPromptChunkCursor cursor({prompt,0U,16U,16U,1U,15U,2U,policy},target,target);}
+        catch(const std::invalid_argument&){rejected=true;}
+        expect(rejected&&target.inputs.empty(),"unknown or mismatched output-policy backend rejects before consuming any input");
     }
     if(!failures) std::cout<<"known prompt chunk tests passed\n";
     return failures?1:0;

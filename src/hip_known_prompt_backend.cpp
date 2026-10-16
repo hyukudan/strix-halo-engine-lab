@@ -9,6 +9,7 @@
 #include <hip/hip_runtime.h>
 
 #include <cstddef>
+#include <algorithm>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -70,13 +71,17 @@ struct HipKnownPromptBackend::Impl {
             throw std::invalid_argument("known prompt terminal logits are outside the retained window arena");
     }
 
-    std::vector<float> execute(std::span<const std::uint32_t> tokens, std::uint64_t position) {
+    std::vector<float> execute(std::span<const std::uint32_t> tokens, std::uint64_t position,bool state_only=false) {
         if (failed) throw std::logic_error("known prompt adapter cannot be reused after an exception");
         const auto committed_before = session.committed_tokens;
         const auto rows = window->logical_rows();
         bool window_attempted = false;
         try {
             guard->require_original();
+            const auto policy=window->output_policy();
+            validate_known_window_output_policy(policy);
+            if((policy==KnownWindowOutputPolicy::state_only)!=state_only)
+                throw std::invalid_argument("known prompt output method differs from native window policy");
             if (current_hip_launch_context() || session.health != SerialSessionHealth::ready ||
                 session.arithmetic_lineage.tainted || position != session.next_position ||
                 tokens.size() != rows || (rows != 2U && rows != 4U && rows != 8U) ||
@@ -87,25 +92,41 @@ struct HipKnownPromptBackend::Impl {
                 if (static_cast<std::uint64_t>(token) >= vocab_size)
                     throw std::invalid_argument("known prompt token exceeds vocabulary");
             // Allocate host return storage before any model-state consumption.
-            std::vector<float> logits(static_cast<std::size_t>(vocab_size));
+            std::vector<float> logits(state_only?0U:static_cast<std::size_t>(vocab_size));
             window_attempted = true;
             const auto result = window->execute(session, tokens);
             if (session.health != SerialSessionHealth::ready || session.next_position != position + rows ||
-                session.committed_tokens != committed_before + rows || result.logits.size() != rows)
+                session.committed_tokens != committed_before + rows || result.logits.size()!=result.logit_row_indices.size())
                 throw std::logic_error("known prompt native window did not commit its configured causal rows");
-            validate_terminal(result.logits[rows - 1U]);
+            std::size_t outputs=0U;
+            for(std::uint32_t r=0;r<rows;++r)if(known_window_produces_logits(policy,r,rows)) {
+                if(outputs>=result.logit_row_indices.size()||result.logit_row_indices[outputs]!=r)
+                    throw std::logic_error("known prompt native output mapping differs from its policy");
+                ++outputs;
+            }
+            if(outputs!=result.logits.size()||result.omitted_lm_heads!=rows-outputs)
+                throw std::logic_error("known prompt native output count differs from its policy");
             // execute() has already fenced its owned producer stream and checked
             // D1 before publication. A synchronous full-row download introduces
-            // no borrowed stream, no head omission and no additional D1 phase.
-            guard->require_original();
-            check_prompt_copy(hipMemcpy(logits.data(), reinterpret_cast<const void*>(result.logits[rows - 1U].address),
-                static_cast<std::size_t>(logits_bytes), hipMemcpyDeviceToHost));
-            guard->require_original();
-            validate_serial_decode_engine_logits(logits, vocab_size);
+            // no borrowed stream or additional D1 phase. Output intent was
+            // compiled/admitted before execution; never read omitted scratch.
+            if(!state_only) {
+                const auto terminal=std::find(result.logit_row_indices.begin(),result.logit_row_indices.end(),rows-1U);
+                if(terminal==result.logit_row_indices.end())throw std::logic_error("known prompt terminal output is missing");
+                const auto& view=result.logits[static_cast<std::size_t>(terminal-result.logit_row_indices.begin())];
+                validate_terminal(view);
+                guard->require_original();
+                check_prompt_copy(hipMemcpy(logits.data(), reinterpret_cast<const void*>(view.address),
+                    static_cast<std::size_t>(logits_bytes), hipMemcpyDeviceToHost));
+                guard->require_original();
+                validate_serial_decode_engine_logits(logits, vocab_size);
+            }
             // Publish only completed successful adapter returns, from the
             // actual native result. Saturation is telemetry, never admission.
             auto next = observed;
             add_prompt_stat(next.windows, 1U, next.saturated);
+            add_prompt_stat(next.omitted_lm_heads,result.omitted_lm_heads,next.saturated);
+            if(state_only)add_prompt_stat(next.state_only_windows,1U,next.saturated);
             add_prompt_stat(next.completed_input_rows, rows, next.saturated);
             add_prompt_stat(next.shared_rows_dispatches, result.shared_rows_dispatches, next.saturated);
             add_prompt_stat(next.gdn_rows_dispatches, result.gdn_rows_dispatches, next.saturated);
@@ -148,8 +169,12 @@ std::vector<float> HipKnownPromptBackend::execute_window(std::array<std::uint32_
 std::uint32_t HipKnownPromptBackend::logical_rows() const noexcept {
     return impl_->window->logical_rows();
 }
+KnownWindowOutputPolicy HipKnownPromptBackend::output_policy() const noexcept {return impl_->window->output_policy();}
 std::vector<float> HipKnownPromptBackend::execute_rows(std::span<const std::uint32_t> tokens, std::uint64_t position) {
     return impl_->execute(tokens, position);
+}
+void HipKnownPromptBackend::execute_state_rows(std::span<const std::uint32_t> tokens,std::uint64_t position) {
+    (void)impl_->execute(tokens,position,true);
 }
 HipKnownPromptBackendStats HipKnownPromptBackend::stats() const noexcept {
     return impl_->observed;

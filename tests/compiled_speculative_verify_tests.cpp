@@ -245,9 +245,11 @@ struct WindowTrace {
     std::uint32_t rebindings = 0;
     std::vector<std::uint64_t> qsa_positions;
     std::vector<std::uint64_t> ple_previous;
+    std::vector<std::uint64_t> head_positions, head_admissions;
 };
 void recording_window_preflight(const strix::ExecutionDispatchContext& context, void* opaque) {
     ++static_cast<WindowTrace*>(opaque)->admissions;
+    if(context.op==strix::SerialOp::lm_head)static_cast<WindowTrace*>(opaque)->head_admissions.push_back(context.position);
     if (context.logical_rows != 1 || context.request_concurrency != 1 || !context.resources)
         throw std::invalid_argument("mock R1 preflight requires a complete one-row binding");
     for (std::size_t i = 0; i < context.reads.size(); ++i) (void)strix::resolve_dispatch_read(context, i);
@@ -281,6 +283,7 @@ private:
 void recording_window_kernel(const strix::ExecutionDispatchContext& context, void* opaque) {
     auto& trace = *static_cast<WindowTrace*>(opaque);
     ++trace.calls;
+    if(context.op==strix::SerialOp::lm_head)trace.head_positions.push_back(context.position);
     if (context.logical_rows != 1 || context.request_concurrency != 1)
         throw std::logic_error("mock requires the incumbent R1 context");
     if (mock_has(context.reads_state, strix::PersistentState::position_history)) {
@@ -368,10 +371,11 @@ struct KnownRuntimeFixture {
     std::uint32_t quiesces = 0;
 
     explicit KnownRuntimeFixture(const strix::ModelContract& model, bool promote = false, bool mixed = false,
-        std::uint32_t rows = 2, bool routed_union = false)
+        std::uint32_t rows = 2, bool routed_union = false,
+        strix::KnownWindowOutputPolicy output_policy = strix::KnownWindowOutputPolicy::all_rows)
         : source(make_known_fixture(model, mixed ? 0U : 8U,routed_union)),
           window(strix::compile_known_prefix_window(model, source.serial, source.manifest,
-              source.access, {promote, promote, mixed, rows,routed_union})),
+              source.access, {promote, promote, mixed, rows,routed_union,output_policy})),
           serial_pool(static_cast<std::size_t>((source.serial.arena.total_bytes + 7U) / 8U)),
           window_pool(static_cast<std::size_t>((window.arena.physical.total_bytes + 7U) / 8U)),
           state_words(7U * 48U, 0) {
@@ -452,6 +456,83 @@ struct KnownRuntimeFixture {
             strix::SessionStateComponent::position_history).address;
     }
 };
+
+void known_window_output_policy_tests(const strix::ModelContract& model) {
+    using P=strix::KnownWindowOutputPolicy;
+    for(const std::uint32_t rows:{2U,4U,8U}) {
+        KnownRuntimeFixture baseline(model,false,false,rows);
+        const auto all=baseline.run(baseline.hooks());
+        const auto state=baseline.state_words;const auto generations=baseline.session.state.generations;
+        const auto ple=baseline.trace.ple_previous;std::vector<std::uint64_t> expected;
+        for(const auto& logit:all.logits)expected.push_back(read_word(logit.address));
+        const auto continuation=baseline.serial_token(31U);const auto continued=baseline.state_words;
+        const auto explicit_all=strix::compile_known_prefix_window(model,baseline.source.serial,baseline.source.manifest,
+            baseline.source.access,{false,false,false,rows,false,P::all_rows});
+        expect(explicit_all.window_execution_identity==baseline.window.window_execution_identity&&
+            explicit_all.window_kernel_plan_identity==baseline.window.window_kernel_plan_identity,
+            "explicit all-rows leaves the default known-window hash recipe and arena intact");
+        std::set<std::uint64_t> ids{explicit_all.window_execution_identity},kernels{explicit_all.window_kernel_plan_identity};
+        for(const auto policy:{P::terminal_row,P::state_only}) {
+            KnownRuntimeFixture f(model,false,false,rows,false,policy);const auto result=f.run(f.hooks());
+            const auto heads=policy==P::terminal_row?1U:0U;
+            const auto omitted=rows-heads;
+            expect(ids.insert(f.window.window_execution_identity).second&&kernels.insert(f.window.window_kernel_plan_identity).second,
+                "nondefault head policies receive distinct execution and organization identities");
+            expect(result.logits.size()==heads&&result.logit_row_indices==f.window.logit_row_indices&&result.omitted_lm_heads==omitted&&
+                f.trace.head_positions==(heads?std::vector<std::uint64_t>{rows-1U}:std::vector<std::uint64_t>{}),
+                "only explicitly mapped terminal heads dispatch, and absent outputs have no fake addresses");
+            if(heads)expect(result.logit_row_indices.front()==rows-1U&&read_word(result.logits.front().address)==expected.back(),
+                "compact terminal output maps to its real original row and complete R1 value");
+            std::vector<std::uint64_t> admitted;for(std::uint32_t r=0;r<rows;++r)admitted.push_back(r);
+            expect(f.trace.head_admissions==admitted,"every omitted head still receives full launcher metadata admission before mutation");
+            expect(f.state_words==state&&f.session.state.generations==generations&&f.trace.ple_previous==ple&&
+                f.session.next_position==rows&&f.session.committed_tokens==rows&&f.quiesces==0U&&
+                result.row_loop_dispatches==rows*f.source.serial.execution.steps.size()-omitted&&
+                result.logical_row_steps==rows*f.source.serial.execution.steps.size()-omitted,
+                "head omission preserves all seven state payloads, generations, PLE order and complete row commit");
+            expect(f.serial_token(31U)==continuation&&f.state_words==continued,
+                "serial continuation after either output policy observes the identical causal state");
+            for(unsigned fault=0;fault<2U;++fault) {
+                KnownRuntimeFixture bad(model,false,false,rows,false,policy);
+                // Row0 is omitted by BOTH policies, but its preflight cannot be bypassed.
+                if(fault==0U)bad.row_launch[0].steps.back().preflight=nullptr;
+                else bad.row_launch[0].steps.back().preflight=&throwing_window_preflight;
+                const auto before=bad.state_words;bool rejected=false;
+                try{(void)bad.run(bad.hooks());}catch(const std::exception&){rejected=true;}
+                expect(rejected&&bad.trace.calls==0U&&bad.state_words==before&&bad.session.health==strix::SerialSessionHealth::ready&&
+                    bad.session.committed_tokens==0U&&bad.session.next_position==0U&&bad.quiesces==0U,
+                    "omitted-head metadata failure rejects before any PLE/position/dispatch or poison");
+            }
+            KnownRuntimeFixture failing(model,false,false,rows,false,policy);failing.trace.fail_kernel=true;
+            const auto before=failing.session.state.generations;bool rejected=false;
+            try{(void)failing.run(failing.hooks());}catch(const std::runtime_error&){rejected=true;}
+            expect(rejected&&failing.session.health==strix::SerialSessionHealth::poisoned&&failing.quiesces==1U&&
+                failing.session.arithmetic_lineage.tainted&&failing.session.state.generations==before&&failing.session.committed_tokens==0U,
+                "post-submit head-policy failure retains drain/poison and no partial metadata commit");
+        }
+        for(unsigned fault=0;fault<5U;++fault) {
+            auto bad=explicit_all;
+            if(fault==0U)bad.output_policy=P::terminal_row;
+            if(fault==1U)bad.logit_row_indices={rows-1U};
+            if(fault==2U){bad.output_policy=P::terminal_row;bad.logit_row_indices={rows-1U};}
+            if(fault==3U)bad.output_policy=static_cast<P>(255U);
+            if(fault==4U)bad.logit_row_indices.push_back(rows-1U);
+            bool rejected=false;try{strix::validate_compiled_known_prefix_window(bad,baseline.source.serial);}catch(const std::invalid_argument&){rejected=true;}
+            expect(rejected,"forged policy, compact row map and unchanged identity cannot bypass window admission");
+        }
+        auto request=strix::KnownWindowRequest{};request.logical_rows=rows;request.output_policy=static_cast<P>(255U);
+        bool rejected=false;try{(void)strix::compile_known_prefix_window(model,baseline.source.serial,baseline.source.manifest,baseline.source.access,request);}
+        catch(const std::invalid_argument&){rejected=true;}
+        expect(rejected,"unknown requested output policy rejects during compilation");
+    }
+    for(const auto policy:{P::terminal_row,P::state_only}) {
+        auto source=make_known_fixture(model);source.serial.execution.steps.back().writes_state=strix::PersistentState::ngram_history;
+        strix::KnownWindowRequest request;request.output_policy=policy;bool rejected=false;
+        try{(void)strix::compile_known_prefix_window(model,source.serial,source.manifest,source.access,request);}
+        catch(const std::invalid_argument&){rejected=true;}
+        expect(rejected,"an output policy cannot admit a stateful or noncanonical terminal head");
+    }
+}
 
 void known_window_runtime_tests(const strix::ModelContract& model) {
     KnownRuntimeFixture fixture(model);
@@ -1366,6 +1447,7 @@ int main() {
     known_window_routed_union_runtime_tests(model);
     known_window_tests(model);
     known_window_runtime_tests(model);
+    known_window_output_policy_tests(model);
     known_window_wide_runtime_tests(model);
     known_window_mixed_format_tests(model);
     known_window_wide_compiler_tests(model);

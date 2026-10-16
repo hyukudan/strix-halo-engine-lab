@@ -92,6 +92,9 @@ struct HipPromptLookupRuntime::Impl {
             serial.io.steps.size()==serial.execution.steps.size() && serial.io.steps.back().writes.size()==1U,
             "prompt lookup requires an actual complete terminal LM head");
         validate_compiled_known_prefix_window(compiled_window,serial);
+        require_lookup(compiled_window.output_policy==KnownWindowOutputPolicy::all_rows&&
+            window->output_policy()==KnownWindowOutputPolicy::all_rows&&compiled_window.logical_rows==2U&&window->logical_rows()==2U,
+            "prompt lookup verification requires an all-rows two-row native window");
         validate_known_prefix_window_formats(compiled_window,serial,*resources.model_manifest,*resources.tensor_access);
         validate_execution_memory_binding(compiled_window.window_execution_identity,compiled_window.arena.physical,window_memory);
         catalog.register_for_compiled_execution(serial,registry,&resources);
@@ -248,6 +251,9 @@ std::vector<std::uint32_t> HipPromptLookupRuntime::verify_target_candidates(Seri
     try {
         attempted=true;
         const auto native=impl_->window->execute(session,{candidates[0],candidates[1]});
+        require_lookup(native.logits.size()==2U&&native.logit_row_indices.size()==2U&&
+            native.logit_row_indices[0]==0U&&native.logit_row_indices[1]==1U&&
+            native.omitted_lm_heads==0U,"prompt lookup verification requires every mapped candidate head");
         result.push_back(impl_->select(*impl_->row0_select,native.logits[0],position));
         result.push_back(impl_->select(*impl_->row1_select,native.logits[1],position+1U));
         impl_->verified={session,result.back(),true};

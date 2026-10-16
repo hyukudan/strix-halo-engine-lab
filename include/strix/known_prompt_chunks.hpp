@@ -19,6 +19,7 @@ struct KnownPromptChunkRequest {
     std::uint64_t max_new_tokens = 0;
     std::uint32_t eos_token_id = 0;
     std::uint32_t logical_rows = 2;
+    KnownWindowOutputPolicy output_policy = KnownWindowOutputPolicy::all_rows;
 };
 struct KnownPromptChunkProgress {
     std::uint64_t next_position = 0;
@@ -34,9 +35,11 @@ struct KnownPromptChunkProgress {
     bool generation_complete = false;
     bool cancelled = false;
     bool failed = false;
+    std::uint64_t state_only_windows = 0;
 };
 struct KnownPromptChunkFrontier {
     // False before any completed chunk and after an opaque backend failure.
+    // State-only chunks have a valid state frontier with empty logits/selection.
     bool valid = false;
     std::uint64_t state_position = 0;
     std::optional<std::uint64_t> last_input_position;
@@ -49,7 +52,10 @@ struct KnownPromptChunkFrontier {
 };
 
 // Incremental known-input prefill with complete configured 2/4/8-row windows
-// and unpadded serial R1 suffix rows. An advance is one complete chunk; yielding
+// and unpadded serial R1 suffix rows. State-only windows are used only while
+// more than R inputs remain; the final <=R inputs use serial calls, preserving
+// a real full-output terminal frontier without replaying a consumed input.
+// An advance is one complete chunk; yielding
 // between calls pauses without recomputing a prompt or discarding its logits.
 // Native shared/mixed-GDN rows4/8 and all-Q8 GDN pair tiling are backend-specific; the cursor
 // does not infer a projection amortization from the logical window width.

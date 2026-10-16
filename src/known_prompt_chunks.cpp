@@ -20,6 +20,9 @@ KnownPromptChunkCursor::KnownPromptChunkCursor(KnownPromptChunkRequest request,
         throw std::invalid_argument("known prompt chunk rows must be 2, 4 or 8");
     if(windows.logical_rows()!=request.logical_rows)
         throw std::invalid_argument("known prompt chunk backend row width differs from the request");
+    validate_known_window_output_policy(request.output_policy);
+    if(windows.output_policy()!=request.output_policy)
+        throw std::invalid_argument("known prompt chunk output policy differs from the backend");
     if(request.start_position>request.context_capacity ||
         request.prompt_tokens.size()>request.context_capacity-request.start_position)
         throw std::invalid_argument("known prompt chunks exceed the remaining context capacity");
@@ -36,13 +39,22 @@ bool KnownPromptChunkCursor::advance() {
     if(progress_.cancelled || progress_.prefill_complete) return false;
     const auto consumed=static_cast<std::size_t>(progress_.consumed_prompt_tokens);
     const auto remaining=request_.prompt_tokens.size()-consumed;
-    const bool window=remaining>=request_.logical_rows;
+    const bool state_only=request_.output_policy==KnownWindowOutputPolicy::state_only;
+    const bool window=remaining>=request_.logical_rows&&(!state_only||remaining>request_.logical_rows);
     try {
-        auto values=window ? windows_.execute_rows(request_.prompt_tokens.subspan(consumed, request_.logical_rows),
-                progress_.next_position) : serial_.execute(request_.prompt_tokens[consumed],progress_.next_position);
-        validate_serial_decode_engine_logits(values,request_.vocab_size);
-        std::copy(values.begin(),values.end(),logits_.begin());
-        has_logits_=true;
+        if(state_only&&(window||remaining>1U)) {
+            if(window) {
+                windows_.execute_state_rows(request_.prompt_tokens.subspan(consumed,request_.logical_rows),progress_.next_position);
+                ++progress_.state_only_windows;
+            } else serial_.execute_state(request_.prompt_tokens[consumed],progress_.next_position);
+            has_logits_=false;selection_.reset();
+        } else {
+            auto values=window ? windows_.execute_rows(request_.prompt_tokens.subspan(consumed, request_.logical_rows),
+                    progress_.next_position) : serial_.execute(request_.prompt_tokens[consumed],progress_.next_position);
+            validate_serial_decode_engine_logits(values,request_.vocab_size);
+            std::copy(values.begin(),values.end(),logits_.begin());
+            has_logits_=true;
+        }
         const auto rows=window?request_.logical_rows:1U;
         progress_.consumed_prompt_tokens+=rows;
         progress_.next_position+=rows;
@@ -62,7 +74,7 @@ void KnownPromptChunkCursor::cancel() noexcept {
 }
 
 const SerialGreedyRequestResult& KnownPromptChunkCursor::finish_greedy() {
-    if(progress_.failed || progress_.cancelled || !progress_.prefill_complete || generation_)
+    if(progress_.failed || progress_.cancelled || !progress_.prefill_complete || !has_logits_ || generation_)
         throw std::logic_error("known-prompt generation requires a completed uncancelled fresh frontier");
     const SerialGreedyContinuationRequest continuation{logits_,progress_.next_position,request_.vocab_size,
         request_.context_capacity,request_.max_new_tokens,request_.eos_token_id};
@@ -87,7 +99,7 @@ const SerialGreedyRequestResult& KnownPromptChunkCursor::finish_greedy() {
 
 KnownPromptChunkFrontier KnownPromptChunkCursor::frontier() const noexcept {
     KnownPromptChunkFrontier value;
-    value.valid=!progress_.failed && (has_logits_ || selection_.has_value());
+    value.valid=!progress_.failed && (progress_.consumed_prompt_tokens || has_logits_ || selection_.has_value());
     value.state_position=progress_.next_position;
     if(progress_.consumed_prompt_tokens || progress_.consumed_generation_tokens)
         value.last_input_position=progress_.next_position-1U;
