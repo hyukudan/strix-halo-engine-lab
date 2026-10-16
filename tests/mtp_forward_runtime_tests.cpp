@@ -30,6 +30,9 @@ public:
         expect(context.step_index == steps.size(),
                "MTP forward step index is contiguous");
         steps.push_back(context.step);
+        expect(context.predictor_position == context.cycle_input->hidden_source_position &&
+                   context.predictor_position + 1 == context.target_position,
+               "MTP rotary/cache position belongs to source hidden rather than shifted input token");
         positions.push_back(
             context.target_position);
         if (fail_at.has_value() &&
@@ -188,6 +191,8 @@ int main() {
         strix::make_draft_proposal_state(
             binding.compatibility_identity,
             target);
+
+    strix::begin_draft_proposal(proposal,target);
 
     strix::MtpDraftCycleInput cycle;
     cycle.proposal_identity =

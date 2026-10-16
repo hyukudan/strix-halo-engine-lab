@@ -1,3 +1,4 @@
+#include "strix/hip_mtp_projection.hpp"
 #include "strix/hip_launch_context.hpp"
 #include "strix/hip_moe_experts_launcher.hpp"
 #include "strix/deferred_moe_status.hpp"
@@ -2421,5 +2422,79 @@ void moe_experts_known_window_rows_launch(std::span<const ExecutionDispatchConte
     (void)rows; (void)config; (void)workspace;
     throw std::invalid_argument("known-window routed rows require built A8 runtime");
 #endif
+}
+} // namespace strix
+
+namespace strix {
+namespace {
+void mtp_moe_range(MtpDeviceView v,std::uint64_t required,unsigned alignment) {
+    if(!v.address || !v.allocation_generation || v.bytes<required || v.address%alignment ||
+       v.bytes>std::numeric_limits<std::uintptr_t>::max()-v.address)
+        throw std::invalid_argument("MTP routed device view is invalid");
+}
+bool mtp_moe_overlap(MtpDeviceView a,MtpDeviceView b){return a.address<b.address+b.bytes && b.address<a.address+a.bytes;}
+void mtp_moe_prepare(const MtpNativeContext& c) {
+    if(!c.model || !c.plan || !c.tensors || !c.resources)throw std::invalid_argument("MTP routed context is incomplete");
+    c.resources->validate();
+    if(c.model!=&c.resources->model() || c.plan!=&c.resources->plan() || c.tensors!=&c.resources->tensors() ||
+       c.position>=c.resources->context_capacity() || c.model->hidden_size!=2560U || c.model->moe_intermediate_size!=640U ||
+       c.model->num_experts!=512U || c.model->num_experts_per_token!=10U)
+        throw std::invalid_argument("MTP routed context is not bound to its actual canonical owner");
+    const auto& owner=*c.resources;const auto& t=*c.tensors;
+    const auto input=owner.view(HipMtpBuffer::hidden0),out=owner.view(HipMtpBuffer::hidden2),
+        temp=owner.view(HipMtpBuffer::moe_workspace),routes=owner.view(HipMtpBuffer::routes),
+        rw=owner.view(HipMtpBuffer::route_weights),status=owner.view(HipMtpBuffer::status);
+    mtp_moe_range(input,5120U,2U);mtp_moe_range(out,5120U,2U);mtp_moe_range(temp,(1280U+2560U)*4U,4U);
+    mtp_moe_range(routes,40U,4U);mtp_moe_range(rw,40U,4U);mtp_moe_range(status,4U,4U);
+    std::array<MtpDeviceView,3> weights{};const std::array tensors{t.expert_gate,t.expert_up,t.expert_down};
+    for(std::size_t i=0;i<tensors.size();++i){const auto pair=tensors[i];const bool down=i==2U;
+        const std::vector<std::uint64_t> dims{down?640U:2560U,down?2560U:640U,512U};
+        const std::uint64_t n=dims[0]/32U*34U*dims[1]*dims[2];
+        if(!pair.manifest || !pair.runtime || pair.manifest->ggml_type!=8U || pair.manifest->dimensions!=dims ||
+           pair.manifest->byte_size!=n || !runtime_tensor_gpu_visible(pair.runtime->storage))
+            throw std::invalid_argument("MTP routed tensors must be separate Q8 gate/up/down with exact expert geometry");
+        weights[i]={pair.runtime->address,pair.runtime->bytes,pair.runtime->allocation_generation};mtp_moe_range(weights[i],n,16U);
+    }
+    const std::array reads{input,routes,rw};const std::array writes{out,temp,status};
+    for(std::size_t i=0;i<writes.size();++i){
+        for(auto read:reads)if(mtp_moe_overlap(writes[i],read))throw std::invalid_argument("MTP routed writable view aliases input");
+        for(auto w:weights)if(mtp_moe_overlap(writes[i],w))throw std::invalid_argument("MTP routed writable view aliases weights");
+        for(std::size_t j=0;j<i;++j)if(mtp_moe_overlap(writes[i],writes[j]))throw std::invalid_argument("MTP routed writable views overlap");
+    }
+}
+}
+void preflight_hip_mtp_routed_experts(const MtpNativeContext& c){mtp_moe_prepare(c);}
+void launch_hip_mtp_routed_experts(const MtpNativeContext& c,void* raw_stream) {
+    mtp_moe_prepare(c);
+    if(!raw_stream || raw_stream!=c.resources->stream())throw std::invalid_argument("MTP routed stream differs from retained owner");
+    const auto stream=static_cast<hipStream_t>(raw_stream);hipStreamCaptureStatus capture=hipStreamCaptureStatusNone;
+    check_hip(hipStreamIsCapturing(stream,&capture),"MTP routed capture query");
+    if(capture!=hipStreamCaptureStatusNone)throw std::invalid_argument("MTP routed is eager only");
+    check_hip(hipPeekAtLastError(),"MTP routed prior HIP error");
+    const auto& o=*c.resources;const auto& t=*c.tensors;
+    const auto* input=reinterpret_cast<const std::uint16_t*>(o.view(HipMtpBuffer::hidden0).address);
+    const auto* routes=reinterpret_cast<const std::uint32_t*>(o.view(HipMtpBuffer::routes).address);
+    const auto* rw=reinterpret_cast<const float*>(o.view(HipMtpBuffer::route_weights).address);
+    auto* temp=reinterpret_cast<float*>(o.view(HipMtpBuffer::moe_workspace).address);auto* accumulation=temp+1280U;
+    auto* status=reinterpret_cast<std::uint32_t*>(o.view(HipMtpBuffer::status).address);
+    check_hip(hipMemsetAsync(accumulation,0,2560U*4U,stream),"MTP routed clear local accumulation");
+    hipLaunchKernelGGL(validate_routes_kernel,dim3(1),dim3(kThreads),0,stream,routes,rw,10U,512U,status,nullptr);
+    check_hip(hipGetLastError(),"MTP routed dynamic route validation");
+    for(unsigned slot=0;slot<10U;++slot){
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(selected_projection_kernel<std::uint16_t,WeightKind::q8_0>),dim3(640U),dim3(kThreads),0,stream,
+            input,routes,slot,reinterpret_cast<const void*>(t.expert_gate.runtime->address),2560U,640U,512U,temp,status);
+        check_hip(hipGetLastError(),"MTP routed Q8 gate");
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(selected_projection_kernel<std::uint16_t,WeightKind::q8_0>),dim3(640U),dim3(kThreads),0,stream,
+            input,routes,slot,reinterpret_cast<const void*>(t.expert_up.runtime->address),2560U,640U,512U,temp+640U,status);
+        check_hip(hipGetLastError(),"MTP routed Q8 up");
+        hipLaunchKernelGGL(routed_activation_kernel,dim3(3U),dim3(kThreads),0,stream,temp,640U,status);
+        check_hip(hipGetLastError(),"MTP routed activation");
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(selected_down_accumulate_kernel<float,WeightKind::q8_0>),dim3(2560U),dim3(kThreads),0,stream,
+            temp,routes,rw,slot,reinterpret_cast<const void*>(t.expert_down.runtime->address),640U,2560U,512U,accumulation,status);
+        check_hip(hipGetLastError(),"MTP routed ascending slot down");
+    }
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(commit_experts_kernel<std::uint16_t>),dim3(10U),dim3(kThreads),0,stream,
+        accumulation,reinterpret_cast<std::uint16_t*>(o.view(HipMtpBuffer::hidden2).address),2560U,status);
+    check_hip(hipGetLastError(),"MTP routed BF16 final commit");
 }
 } // namespace strix

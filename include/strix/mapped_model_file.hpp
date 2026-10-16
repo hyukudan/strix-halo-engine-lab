@@ -5,6 +5,7 @@
 #include "strix/runtime_allocator.hpp"
 
 #include <cstddef>
+#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <span>
@@ -53,6 +54,12 @@ public:
         return content_identity_;
     }
 
+    // Actual raw digest from the SAME full-file pass/FD used to establish the
+    // framed content identity at open; invalid on empty/moved-from owners.
+    [[nodiscard]] const ModelContentIdentity& file_sha256() const noexcept {return file_sha256_;}
+    // Setup-only FD/stat witness against the original hash+map observation.
+    // No rehash and no claim of protection against arbitrary privileged writers.
+    void validate_unchanged() const;
     [[nodiscard]] const std::string&
     logical_name() const noexcept {
         return logical_name_;
@@ -75,6 +82,8 @@ private:
     std::uint64_t allocation_generation_ = 0;
     std::string logical_name_;
     ModelContentIdentity content_identity_;
+    ModelContentIdentity file_sha256_;
+    std::array<std::uint64_t,7> file_state_{};
 };
 
 }  // namespace strix

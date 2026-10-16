@@ -20,6 +20,8 @@ struct MtpDraftCycleInput {
     // The source hidden is the target-produced wide HC state supplied to the
     // first MTP step. Its exact lifecycle is explicit rather than inferred from
     // a pointer or from target session counters.
+    // Exact shifted pairing: seed_position == hidden_source_position + 1.
+    // This source position is also the MTP rotary/cache position.
     std::uint64_t hidden_source_position = 0;
     std::uintptr_t hidden_address = 0;
     std::uint64_t hidden_elements = 0;

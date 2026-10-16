@@ -82,6 +82,16 @@ int main() {
             "b00361a396177a9cb410ff61f20015ad",
         "SHA-256 abc vector matches");
 
+    const strix::ModelContentFile one_file{"abc.bin",abc_path};
+    const auto single=strix::hash_single_model_content_file(one_file);
+    const std::vector<strix::ModelContentFile> one_files{one_file};
+    expect(single.file_sha256==abc && single.file_bytes==3 &&
+        single.content_identity==strix::build_model_content_identity(one_files),
+        "one full-file pass preserves raw digest, byte count and historical single-file aggregate framing");
+    bool empty_name_rejected=false;
+    try{(void)strix::hash_single_model_content_file({"",abc_path});}
+    catch(const std::invalid_argument&){empty_name_rejected=true;}
+    expect(empty_name_rejected,"single-file digest helper preserves nonempty logical identity contract");
     const std::string million_a(1'000'000, 'a');
     const auto million_path = root / "million-a.bin";
     write_file(million_path, million_a);

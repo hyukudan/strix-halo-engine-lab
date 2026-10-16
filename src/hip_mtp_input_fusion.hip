@@ -1,0 +1,149 @@
+#include "strix/hip_mtp_input_fusion.hpp"
+#include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
+#include <array>
+#include <bit>
+#include <cmath>
+#include <limits>
+#include <stdexcept>
+#include <string>
+
+namespace strix {
+namespace {
+std::uint64_t multiply(std::uint64_t a,std::uint64_t b) {
+    if(b && a>UINT64_MAX/b) throw std::overflow_error("MTP input fusion byte overflow");return a*b;
+}
+unsigned element_bytes(HipMtpInputStorage s) {
+    if(s==HipMtpInputStorage::bf16)return 2U;
+    if(s==HipMtpInputStorage::fp32)return 4U;
+    throw std::invalid_argument("MTP input fusion storage must be explicit BF16 or FP32");
+}
+void geometry(unsigned h,unsigned hc) {
+    if(h<32U || h>4096U || h%32U || (hc!=2U && hc!=4U))
+        throw std::invalid_argument("MTP input fusion geometry is unsupported");
+}
+void view(HipMtpInputFusionView v,std::uint64_t bytes,unsigned align) {
+    if(!v.address || !v.allocation_generation || v.bytes!=bytes || v.address%align ||
+       v.bytes>std::numeric_limits<std::uintptr_t>::max()-v.address)
+        throw std::invalid_argument("MTP input fusion view extent, alignment or generation is invalid");
+}
+bool overlaps(HipMtpInputFusionView a,HipMtpInputFusionView b) {
+    return a.address<b.address+b.bytes && b.address<a.address+a.bytes;
+}
+void check(hipError_t e,const char* where) {
+    if(e!=hipSuccess)throw std::runtime_error(std::string(where)+": "+hipGetErrorString(e));
+}
+__device__ float load_value(std::uintptr_t p,unsigned i,HipMtpInputStorage storage) {
+    return storage==HipMtpInputStorage::bf16?
+        __uint_as_float(static_cast<unsigned>(reinterpret_cast<const std::uint16_t*>(p)[i])<<16U):
+        reinterpret_cast<const float*>(p)[i];
+}
+__device__ std::uint16_t to_bf16(float x) {
+    const unsigned bits=__float_as_uint(x);
+    if((bits&0x7f800000U)==0x7f800000U && (bits&0x007fffffU))
+        return static_cast<std::uint16_t>((bits>>16U)|0x0040U);
+    return static_cast<std::uint16_t>((bits+0x7fffU+((bits>>16U)&1U))>>16U);
+}
+__device__ float rounded(float v,HipMtpInputRounding rounding) {
+    return rounding==HipMtpInputRounding::bf16_rne?__uint_as_float(static_cast<unsigned>(to_bf16(v))<<16U):v;
+}
+__global__ __launch_bounds__(256) void mtp_input_norms(HipMtpInputFusionRequest r) {
+    __shared__ float sums[256];
+    const unsigned lane=threadIdx.x;
+    const bool hidden=blockIdx.x!=0U;
+    const unsigned n=hidden?r.hidden_size*r.hc_count:r.hidden_size;
+    const auto input=hidden?r.wide_hidden.address:r.embedding.address;
+    const auto storage=hidden?r.hidden_storage:r.embedding_storage;
+    const auto* weights=reinterpret_cast<const float*>(hidden?r.hidden_norm.address:r.embedding_norm.address);
+    auto* out=reinterpret_cast<float*>(r.normalized_scratch.address)+(hidden?r.hidden_size:0U);
+    float sum=0.0F;
+    for(unsigned i=lane;i<n;i+=256U) {const float v=load_value(input,i,storage);sum=fmaf(v,v,sum);}
+    sums[lane]=sum;__syncthreads();
+    for(unsigned stride=128U;stride;stride>>=1U) {if(lane<stride)sums[lane]=sums[lane]+sums[lane+stride];__syncthreads();}
+    const float inverse=1.0F/sqrtf(sums[0]/static_cast<float>(n)+r.epsilon);
+    for(unsigned i=lane;i<n;i+=256U) {
+        const float gain=r.norm_weight_encoding==MtpNormWeightEncoding::gemma_offset?1.0F+weights[i]:weights[i];
+        const float normalized=load_value(input,i,storage)*inverse;
+        out[i]=rounded(normalized*gain,r.normalized_rounding);
+    }
+}
+__device__ float coefficient(const unsigned char* row,unsigned column) {
+    const auto* block=row+(column/32U)*34U;
+    const float scale=__half2float(*reinterpret_cast<const __half*>(block));
+    const auto code=static_cast<signed char>(block[2U+column%32U]);
+    return scale*static_cast<float>(code);
+}
+__global__ __launch_bounds__(128) void mtp_input_projections(HipMtpInputFusionRequest r) {
+    const unsigned job=blockIdx.x*blockDim.x+threadIdx.x;
+    const unsigned h=r.hidden_size,total=h*(1U+r.hc_count);
+    if(job>=total)return;
+    const bool embedding=job<h;
+    const unsigned output_row=embedding?job:(job-h)%h;
+    const unsigned stream=embedding?0U:(job-h)/h;
+    const auto* input=reinterpret_cast<const float*>(r.normalized_scratch.address)+(embedding?0U:h+stream*h);
+    const auto* row=reinterpret_cast<const unsigned char*>(r.packed_projection.address)+output_row*r.projection_row_stride_bytes;
+    const unsigned half=embedding?0U:h;
+    float sum=0.0F;
+    for(unsigned col=0;col<h;++col) sum=fmaf(coefficient(row,half+col),input[col],sum);
+    reinterpret_cast<float*>(r.projection_scratch.address)[job]=rounded(sum,r.projection_rounding);
+}
+__global__ __launch_bounds__(128) void mtp_input_broadcast_add(HipMtpInputFusionRequest r) {
+    const unsigned i=blockIdx.x*blockDim.x+threadIdx.x;
+    if(i>=r.hidden_size*r.hc_count)return;
+    const auto* projections=reinterpret_cast<const float*>(r.projection_scratch.address);
+    const float v=projections[i%r.hidden_size]+projections[r.hidden_size+i];
+    if(r.output_storage==HipMtpInputStorage::bf16)reinterpret_cast<std::uint16_t*>(r.output.address)[i]=to_bf16(v);
+    else reinterpret_cast<float*>(r.output.address)[i]=v;
+}
+} // namespace
+std::uint64_t hip_mtp_input_fusion_scratch_bytes(std::uint32_t h,std::uint32_t hc) {
+    geometry(h,hc);return multiply(multiply(h,static_cast<std::uint64_t>(hc)+1U),4U);
+}
+void preflight_hip_mtp_input_fusion(const HipMtpInputFusionRequest& r) {
+    geometry(r.hidden_size,r.hc_count);
+    if(!std::isfinite(r.epsilon) || r.epsilon<=0.0F || !r.norm_encoding_admitted ||
+       (r.norm_weight_encoding!=MtpNormWeightEncoding::gemma_offset && r.norm_weight_encoding!=MtpNormWeightEncoding::effective_scale) ||
+       r.arithmetic!=MtpInputFusionArithmetic::split_projections_then_add ||
+       (r.normalized_rounding!=HipMtpInputRounding::fp32 && r.normalized_rounding!=HipMtpInputRounding::bf16_rne) ||
+       (r.projection_rounding!=HipMtpInputRounding::fp32 && r.projection_rounding!=HipMtpInputRounding::bf16_rne))
+        throw std::invalid_argument("MTP input fusion needs explicit admitted norm encoding and split/cast profile");
+    const std::uint64_t h=r.hidden_size,wide=h*r.hc_count,row=(2U*h/32U)*34U;
+    if(r.projection_row_stride_bytes!=row)throw std::invalid_argument("MTP packed Q8 projection full-row stride is invalid");
+    view(r.embedding,h*element_bytes(r.embedding_storage),element_bytes(r.embedding_storage));
+    view(r.wide_hidden,wide*element_bytes(r.hidden_storage),element_bytes(r.hidden_storage));
+    view(r.embedding_norm,h*4U,4U);view(r.hidden_norm,wide*4U,4U);view(r.packed_projection,row*h,2U);
+    const auto scratch=hip_mtp_input_fusion_scratch_bytes(r.hidden_size,r.hc_count);
+    view(r.normalized_scratch,scratch,4U);view(r.projection_scratch,scratch,4U);
+    view(r.output,wide*element_bytes(r.output_storage),element_bytes(r.output_storage));
+    const std::array reads{r.embedding,r.wide_hidden,r.embedding_norm,r.hidden_norm,r.packed_projection};
+    const std::array writes{r.normalized_scratch,r.projection_scratch,r.output};
+    for(std::size_t i=0;i<writes.size();++i) {
+        for(auto input:reads)if(overlaps(writes[i],input))throw std::invalid_argument("MTP input fusion writable view aliases an input");
+        for(std::size_t j=0;j<i;++j)if(overlaps(writes[i],writes[j]))throw std::invalid_argument("MTP input fusion writable views overlap");
+    }
+}
+std::uint64_t hip_mtp_input_fusion_profile_identity(const HipMtpInputFusionRequest& r) {
+    preflight_hip_mtp_input_fusion(r);
+    std::uint64_t hash=14695981039346656037ULL;
+    const auto add=[&](std::uint64_t v) {for(unsigned s=0;s<64U;s+=8U){hash^=(v>>s)&255U;hash*=1099511628211ULL;}};
+    // Version specifies coefficient-first ascending FMA, 256-lane strided RMS
+    // tree, divide/sqrt, separate rounded projections and quiet-upper BF16 RNE.
+    add(0x4d54504655533201ULL);add(r.hidden_size);add(r.hc_count);add(std::bit_cast<std::uint32_t>(r.epsilon));
+    add(static_cast<unsigned>(r.embedding_storage));add(static_cast<unsigned>(r.hidden_storage));add(static_cast<unsigned>(r.output_storage));
+    add(static_cast<unsigned>(r.normalized_rounding));add(static_cast<unsigned>(r.projection_rounding));add(static_cast<unsigned>(r.norm_weight_encoding));
+    add(static_cast<unsigned>(r.arithmetic));return hash;
+}
+void launch_hip_mtp_input_fusion(const HipMtpInputFusionRequest& r,void* raw_stream) {
+    preflight_hip_mtp_input_fusion(r);
+    if(!raw_stream)throw std::invalid_argument("MTP input fusion requires an explicit owned stream");
+    const auto stream=static_cast<hipStream_t>(raw_stream);
+    hipStreamCaptureStatus capture=hipStreamCaptureStatusNone;check(hipStreamIsCapturing(stream,&capture),"MTP input fusion capture query");
+    if(capture!=hipStreamCaptureStatusNone)throw std::invalid_argument("MTP input fusion is eager only");
+    check(hipPeekAtLastError(),"MTP input fusion prior HIP error");
+    hipLaunchKernelGGL(mtp_input_norms,dim3(2U),dim3(256U),0U,stream,r);check(hipGetLastError(),"MTP input norms launch");
+    const unsigned jobs=r.hidden_size*(r.hc_count+1U);
+    hipLaunchKernelGGL(mtp_input_projections,dim3((jobs+127U)/128U),dim3(128U),0U,stream,r);check(hipGetLastError(),"MTP split projection launch");
+    const unsigned outputs=r.hidden_size*r.hc_count;
+    hipLaunchKernelGGL(mtp_input_broadcast_add,dim3((outputs+127U)/128U),dim3(128U),0U,stream,r);check(hipGetLastError(),"MTP broadcast add launch");
+}
+} // namespace strix

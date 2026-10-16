@@ -63,6 +63,21 @@ strix::MtpForwardReplayObservation passing_observation(
     return value;
 }
 
+// Historical portable qualification framing, deliberately without a native
+// profile word. Zero must preserve this identity rather than append a zero.
+std::uint64_t legacy_qualification_identity(const strix::CompiledMtpDraftPlan& plan,
+    const strix::MtpForwardReplayPolicy& policy,const strix::MtpForwardReplayObservation& observed) {
+    std::uint64_t hash=14695981039346656037ULL;
+    const auto word=[&](std::uint64_t value){for(unsigned shift=0;shift<64;shift+=8)
+        hash=(hash^((value>>shift)&255ULL))*1099511628211ULL;};
+    word(plan.plan_identity);word(plan.proposal_identity);word(policy.policy_identity);
+    word(observed.independent_reference_identity);word(observed.plan_identity);
+    word(observed.reference_tokens.size());
+    for(auto token:observed.reference_tokens)word(token);
+    for(auto token:observed.engine_tokens)word(token);
+    word(observed.hidden_values_compared);word(observed.logit_values_compared);
+    return hash;
+}
 }  // namespace
 
 int main() {
@@ -89,6 +104,33 @@ int main() {
     strix::require_qualified_mtp_draft_plan(
         qualified);
 
+    expect(!qualified.native_arithmetic_profile_identity && !qualified.replay_assessment.native_arithmetic_profile_identity &&
+        qualified.qualification_identity==legacy_qualification_identity(plan,replay_policy,observation),
+        "portable profile zero retains historical qualification identity framing");
+    auto native_a=observation;native_a.native_arithmetic_profile_identity=0x4d5450410001ULL;
+    auto native_b=native_a;native_b.native_arithmetic_profile_identity=0x4d5450410002ULL;
+    const auto qa=strix::qualify_mtp_draft_plan(plan,replay_policy,native_a);
+    const auto qb=strix::qualify_mtp_draft_plan(plan,replay_policy,native_b);
+    expect(qa.executable && qb.executable &&
+        qa.native_arithmetic_profile_identity==native_a.native_arithmetic_profile_identity &&
+        qa.replay_assessment.native_arithmetic_profile_identity==native_a.native_arithmetic_profile_identity &&
+        qb.native_arithmetic_profile_identity==native_b.native_arithmetic_profile_identity &&
+        qb.replay_assessment.native_arithmetic_profile_identity==native_b.native_arithmetic_profile_identity &&
+        qa.qualification_identity!=qb.qualification_identity && qa.qualification_identity!=qualified.qualification_identity,
+        "otherwise identical passing replay qualifications remain bound to distinct native arithmetic profiles");
+    strix::require_qualified_mtp_draft_plan(qa);strix::require_qualified_mtp_draft_plan(qb);
+    auto changed_profile=qa;changed_profile.native_arithmetic_profile_identity=native_b.native_arithmetic_profile_identity;
+    bool changed_profile_rejected=false;
+    try{strix::require_qualified_mtp_draft_plan(changed_profile);}catch(const std::logic_error&){changed_profile_rejected=true;}
+    expect(changed_profile_rejected,"qualified native profile cannot diverge from its replay assessment");
+    auto changed_assessment=qa;changed_assessment.replay_assessment.native_arithmetic_profile_identity=0;
+    bool changed_assessment_rejected=false;
+    try{strix::require_qualified_mtp_draft_plan(changed_assessment);}catch(const std::logic_error&){changed_assessment_rejected=true;}
+    expect(changed_assessment_rejected,"native qualification cannot be relabelled as portable replay by mutating its assessment");
+    auto native_failed=native_a;native_failed.engine_tokens[1]=999;
+    const auto native_rejected=strix::qualify_mtp_draft_plan(plan,replay_policy,native_failed);
+    expect(!native_rejected.executable && native_rejected.native_arithmetic_profile_identity==native_a.native_arithmetic_profile_identity,
+        "a native profile identifies failed evidence without promoting it to executable qualification");
     auto bad_tokens = observation;
     bad_tokens.engine_tokens[1] = 21;
     const auto rejected =

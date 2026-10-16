@@ -133,6 +133,8 @@ int main() {
             fixture.manifest,
             fixture.binding);
 
+    const auto explicit_null=strix::compile_mtp_draft_plan(fixture.model,fixture.manifest,fixture.binding,nullptr);
+    expect(explicit_null.plan_identity==plan.plan_identity,"default MTP plan has no inferred shared-target identity");
     expect(plan.plan_identity != 0 &&
                plan.proposal_identity ==
                    fixture.binding.compatibility_identity,

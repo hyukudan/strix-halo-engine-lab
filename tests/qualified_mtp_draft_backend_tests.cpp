@@ -128,6 +128,8 @@ int main() {
             draft_binding.compatibility_identity,
             target);
 
+    strix::begin_draft_proposal(proposal_state,target);
+
     FakeForward forward;
     strix::QualifiedMtpDraftBackend backend(
         plan,
@@ -146,12 +148,20 @@ int main() {
                forward.proposal_calls == 1,
            "qualified MTP wrapper forwards valid proposal request");
 
+    bool early_reconcile_rejected=false;
+    try {backend.reconcile_after_target(proposal_state,target,tokens);}
+    catch(const std::invalid_argument&) {early_reconcile_rejected=true;}
+    expect(early_reconcile_rejected,"MTP cannot reconcile an active proposal before finish");
+    strix::finish_draft_proposal(proposal_state);
     backend.reconcile_after_target(
         proposal_state,
         target,
         tokens);
     expect(forward.reconcile_calls == 1,
            "qualified MTP wrapper forwards valid reconciliation");
+
+    strix::reconcile_draft_proposal_state(proposal_state,target);
+    strix::begin_draft_proposal(proposal_state,target);
 
     const auto empty =
         backend.propose_candidates(

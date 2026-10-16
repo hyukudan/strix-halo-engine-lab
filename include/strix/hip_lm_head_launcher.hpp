@@ -56,4 +56,9 @@ private:
     HipLmHeadLauncherConfig config_;
 };
 
+// Source-only native MTP entry points; qualification is separate.
+struct MtpNativeContext;
+void preflight_hip_mtp_lm_head(const MtpNativeContext&);
+void launch_hip_mtp_lm_head(const MtpNativeContext&,void* stream);
+
 }  // namespace strix

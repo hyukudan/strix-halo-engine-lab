@@ -1,6 +1,7 @@
 #include "strix/mtp_input_fusion.hpp"
 
 #include <iostream>
+#include <cmath>
 #include <stdexcept>
 #include <vector>
 
@@ -116,7 +117,7 @@ int main() {
             packed == split &&
                 plan.eh_proj_input_size == 4 &&
                 plan.eh_proj_elements == 8,
-            "canonical packed eh_proj exactly matches split fusion oracle");
+            "small exactly representable real-arithmetic fixture agrees, without FP32 or BF16 equivalence claim");
 
         auto reversed =
             eh_proj;
@@ -162,6 +163,53 @@ int main() {
         }
         expect(rejected,
                "MTP fusion rejects flattened hidden state with wrong stream width");
+    }
+
+    {
+        auto model=strix::ModelContract::qwen38_flash_next();model.hidden_size=2;model.hc_count=2;
+        const auto plan=strix::build_mtp_input_fusion_plan(model);
+        const std::vector<double> embedding{0.0,0.0},hidden{1.0,1.0,3.0,3.0};
+        const std::vector<double> ew{0.0,0.0},hw{0.0,1.0,0.0,-1.0};
+        const auto normalized=strix::mtp_input_normalization_reference(plan,embedding,hidden,ew,hw,4.0,
+            strix::MtpNormWeightEncoding::gemma_offset);
+        // Whole residual mean square=(1+1+9+9)/4=5; epsilon4 gives denominator3.
+        // Effective gains [1,2,1,0] give the independently derived rational values.
+        expect(normalized.embedding==embedding && std::abs(normalized.wide_hidden[0]-1.0/3.0)<1e-15 &&
+            std::abs(normalized.wide_hidden[1]-2.0/3.0)<1e-15 && normalized.wide_hidden[2]==1.0 && normalized.wide_hidden[3]==0.0,
+            "wide RMS must combine unequal stream variances before reshaping");
+        const std::vector<double> eg{1.0,1.0},hg{1.0,2.0,1.0,0.0};
+        const auto converted=strix::mtp_input_normalization_reference(plan,embedding,hidden,eg,hg,4.0,
+            strix::MtpNormWeightEncoding::effective_scale);
+        expect(converted.wide_hidden==normalized.wide_hidden,
+            "preconverted checkpoint gains must not receive Gemma plus-one twice");
+        const auto double_offset=strix::mtp_input_normalization_reference(plan,embedding,hidden,eg,hg,4.0,
+            strix::MtpNormWeightEncoding::gemma_offset);
+        expect(double_offset.wide_hidden!=normalized.wide_hidden &&
+            std::abs(normalized.wide_hidden[0]-1.0/std::sqrt(5.0))>0.1,
+            "normalization fixture discriminates double offset and per-stream RMS mutants");
+        bool rejected=false;
+        try {(void)strix::mtp_input_normalization_reference(plan,embedding,hidden,ew,std::span<const double>(hw).first(2),4.0,
+            strix::MtpNormWeightEncoding::gemma_offset);} catch(const std::invalid_argument&) {rejected=true;}
+        expect(rejected,"hidden normalization scale must cover the complete wide residual");
+        rejected=false;try {(void)strix::mtp_input_normalization_reference(plan,embedding,hidden,ew,hw,0.0,
+            strix::MtpNormWeightEncoding::effective_scale);} catch(const std::invalid_argument&) {rejected=true;}
+        expect(rejected,"normalization rejects unspecified or zero epsilon");
+    }
+    {
+        auto model=strix::ModelContract::qwen38_flash_next();model.hidden_size=2;model.hc_count=2;
+        const auto plan=strix::build_mtp_input_fusion_plan(model);
+        const std::vector<float> embedding{1.0F,1.0F},hidden{1.0F,1.0F,1.0F,1.0F};
+        constexpr float a=33554432.0F; //2^25: adding one to -a rounds back to -a in FP32.
+        const std::vector<float> weights{a,0.0F,-a,1.0F, 0.0F,0.0F,0.0F,0.0F};
+        const auto split=strix::mtp_input_fusion_fp32_reference(plan,embedding,hidden,weights,
+            strix::MtpInputFusionArithmetic::split_projections_then_add);
+        const auto packed=strix::mtp_input_fusion_fp32_reference(plan,embedding,hidden,weights,
+            strix::MtpInputFusionArithmetic::packed_concat_chain);
+        // Split: e=a, h=round(-a+1)=-a, e+h=0.
+        // Continuous packed: ((a+0)-a)+1=1. No hardware observation is assumed.
+        expect(split==std::vector<float>({0.0F,0.0F,0.0F,0.0F}) &&
+            packed==std::vector<float>({1.0F,0.0F,1.0F,0.0F}),
+            "separate and packed FP32 projection chains are not numerically interchangeable");
     }
 
     if (failures == 0) {

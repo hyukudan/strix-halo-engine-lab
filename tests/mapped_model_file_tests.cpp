@@ -1,4 +1,6 @@
 #include "strix/mapped_model_file.hpp"
+#include "strix/model_content_hash.hpp"
+#include <span>
 
 #include <array>
 #include <cstddef>
@@ -96,6 +98,9 @@ int main() {
                mapped.allocation_generation() == 1,
            "mapped model owns stable read-only file mapping and content identity");
 
+    mapped.validate_unchanged();
+    const auto expected_raw=strix::sha256_bytes(std::as_bytes(std::span(bytes)));
+    expect(mapped.file_sha256()==expected_raw,"mapped raw file SHA comes from the original full-file pass, not framed content alias");
     std::array<std::byte, 16> direct_read{};
     mapped.read_at(
         123,
@@ -171,6 +176,17 @@ int main() {
                moved.valid(),
            "mapped model ownership moves without duplicate unmap");
 
+    expect(!mapped.file_sha256().valid() && moved.file_sha256()==expected_raw,
+        "raw file identity transfers with its actual mapping owner");
+    moved.validate_unchanged();
+    {
+        std::fstream changed(path,std::ios::in|std::ios::out|std::ios::binary);
+        changed.seekp(0);changed.put('x');changed.flush();
+        if(!changed) throw std::runtime_error("cannot mutate mapped identity fixture");
+    }
+    bool mutation_rejected=false;
+    try{moved.validate_unchanged();}catch(const std::runtime_error&){mutation_rejected=true;}
+    expect(mutation_rejected,"FD/stat setup witness rejects file mutation after the full-file hash");
     std::error_code error;
     std::filesystem::remove(
         path,

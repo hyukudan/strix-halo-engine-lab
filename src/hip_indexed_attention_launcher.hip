@@ -1,4 +1,6 @@
 #include "strix/hip_indexed_attention_launcher.hpp"
+#include "strix/hip_mtp_attention.hpp"
+#include "strix/hip_mtp_native_validation.hpp"
 
 #include "strix/dispatch_resources.hpp"
 #include "strix/prepared_tensor_views.hpp"
@@ -3673,3 +3675,146 @@ void enqueue_scores(Shape shape, const Bindings& bindings, Mode mode, hipStream_
 } // namespace qsa_gqa_reuse_diagnostic
 
 }  // namespace strix
+
+namespace strix {
+namespace {
+struct MtpAttentionPrepared {
+    MtpDeviceView input,output,work,kv,index,status;
+    WorkspacePointers workspace;
+    IndexedTensors tensors;
+    std::uint32_t hidden,heads,kv_heads,dim,attention_width,kv_width,q_width,index_width,index_dim;
+    std::uint32_t visible,ratio,topk,blocks,selected,maximum_selected;
+};
+MtpAttentionPrepared prepare_mtp_attention(const MtpNativeContext& c) {
+    mtp_native::context(c);const auto& m=*c.model;const auto& t=*c.tensors;
+    HipIndexedAttentionLauncherConfig config;config.model=m;validate_config(config);
+    const auto hidden=checked_u32(m.hidden_size,"MTP attention hidden");
+    const auto heads=checked_u32(m.attention_heads,"MTP attention heads");
+    const auto kv_heads=checked_u32(m.kv_heads,"MTP attention KV heads");
+    const auto dim=checked_u32(m.head_dim,"MTP attention dimension");
+    const auto attention_width=checked_u32(mtp_native::product(heads,dim),"MTP attention width");
+    const auto kv_width=checked_u32(mtp_native::product(kv_heads,dim),"MTP KV width");
+    const auto q_width=checked_u32(mtp_native::product(attention_width,2U),"MTP query/gate width");
+    const auto index_width=checked_u32(mtp_native::product(m.indexer_n_heads,m.indexer_head_dim),"MTP index query width");
+    const auto index_dim=checked_u32(m.indexer_head_dim,"MTP index dimension");
+    const auto pair=[](MtpTensorView x) {return TensorPair{x.manifest,x.runtime};};
+    IndexedTensors tensors{pair(t.query),pair(t.key),pair(t.value),pair(t.attention_output),pair(t.query_norm),pair(t.key_norm),
+        pair(t.index_query),pair(t.index_key),pair(t.index_query_norm),pair(t.index_key_norm)};
+    for(const auto* tensor:{&tensors.q,&tensors.k,&tensors.v,&tensors.out})
+        if(!tensor->manifest || !tensor->runtime || tensor->manifest->ggml_type!=8U)
+            throw std::invalid_argument("MTP attention profile requires original Q8 projections");
+    for(const auto* tensor:{&tensors.index_q,&tensors.index_k})
+        if(!tensor->manifest || !tensor->runtime || tensor->manifest->ggml_type!=30U)
+            throw std::invalid_argument("MTP attention profile requires original BF16 index projections");
+    for(const auto* tensor:{&tensors.q_norm,&tensors.k_norm,&tensors.index_q_norm,&tensors.index_k_norm})
+        if(!tensor->manifest || !tensor->runtime || tensor->manifest->ggml_type!=0U)
+            throw std::invalid_argument("MTP attention profile requires effective F32 norm gains");
+    validate_matrix(tensors.q,hidden,q_width,"MTP query");validate_matrix(tensors.k,hidden,kv_width,"MTP key");
+    validate_matrix(tensors.v,hidden,kv_width,"MTP value");validate_matrix(tensors.out,attention_width,hidden,"MTP output");
+    validate_matrix(tensors.index_q,hidden,index_width,"MTP index query");validate_matrix(tensors.index_k,hidden,index_dim,"MTP index key");
+    validate_norm(tensors.q_norm,dim,"MTP query norm");validate_norm(tensors.k_norm,dim,"MTP key norm");
+    validate_norm(tensors.index_q_norm,index_dim,"MTP index query norm");validate_norm(tensors.index_k_norm,index_dim,"MTP index key norm");
+    const auto& layout=c.resources->attention_workspace();
+    const auto input=mtp_native::buffer(c,HipMtpBuffer::hidden0,mtp_native::product(hidden,2U));
+    const auto output=mtp_native::buffer(c,HipMtpBuffer::hidden1,mtp_native::product(hidden,2U));
+    const auto work=mtp_native::buffer(c,HipMtpBuffer::attention_workspace,layout.total_bytes,256U);
+    const auto kv=mtp_native::buffer(c,HipMtpBuffer::kv,mtp_native::product(mtp_native::product(c.resources->context_capacity(),kv_width),4U));
+    const auto index=mtp_native::buffer(c,HipMtpBuffer::raw_index,mtp_native::product(mtp_native::product(c.resources->context_capacity(),index_dim),2U));
+    const auto status=mtp_native::buffer(c,HipMtpBuffer::status,8U);
+    mtp_native::disjoint({input,output,work,kv,index,status});
+    for(const auto* tensor:{&tensors.q,&tensors.k,&tensors.v,&tensors.out,&tensors.q_norm,&tensors.k_norm,
+        &tensors.index_q,&tensors.index_k,&tensors.index_q_norm,&tensors.index_k_norm}) {
+        const MtpDeviceView weights{tensor->runtime->address,tensor->runtime->bytes,tensor->runtime->allocation_generation};
+        const auto alignment=tensor->manifest->ggml_type==0U?4U:2U;
+        if(!weights.address || weights.address%alignment || !weights.allocation_generation || weights.bytes>UINTPTR_MAX-weights.address)
+            throw std::invalid_argument("MTP attention weight range is invalid");
+        mtp_native::disjoint({work,output,kv,index,status,weights});
+    }
+    const auto visible=checked_u32(c.position+1U,"MTP visible source rows");
+    const auto ratio=checked_u32(m.indexer_compress_ratio,"MTP compression ratio");
+    const auto topk=checked_u32(m.indexer_budget/m.indexer_compress_ratio,"MTP selected blocks");
+    const auto blocks=visible/ratio;
+    const auto selected=std::min(blocks,topk)*ratio+visible%ratio;
+    if(!selected || selected>layout.maximum_selected_tokens)
+        throw std::invalid_argument("MTP attention selection exceeds retained workspace");
+    (void)prepare_indexed_attention_score_grid(heads,selected);
+    const ExecutionBufferAddress temporary{{},work.address,work.bytes,work.allocation_generation};
+    return {input,output,work,kv,index,status,workspace_pointers(temporary,layout),tensors,hidden,heads,kv_heads,dim,
+        attention_width,kv_width,q_width,index_width,index_dim,visible,ratio,topk,blocks,selected,
+        checked_u32(layout.maximum_selected_tokens,"MTP maximum selected rows")};
+}
+void require_mtp_attention_stream(const MtpNativeContext& c,void* stream) {
+    mtp_native::stream(c,stream);
+    if(current_hip_launch_context()) throw std::invalid_argument("MTP attention cannot nest an active native scope");
+    hipStreamCaptureStatus capture=hipStreamCaptureStatusNone;
+    check_hip(hipStreamIsCapturing(static_cast<hipStream_t>(stream),&capture),"MTP attention capture query");
+    if(capture!=hipStreamCaptureStatusNone) throw std::invalid_argument("MTP attention supports eager execution only");
+}
+template<WeightKind Kind> void mtp_project(const MtpDeviceView& input,const TensorPair& tensor,
+    std::uint32_t width,std::uint32_t outputs,float* output,hipStream_t stream) {
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(linear_to_float_kernel<Kind>),dim3(outputs),dim3(kThreads),0,stream,
+        reinterpret_cast<const std::uint16_t*>(input.address),reinterpret_cast<const void*>(tensor.runtime->address),width,outputs,output);
+    check_hip(hipGetLastError(),"MTP attention projection enqueue");
+}
+void mtp_attention_finite(const MtpAttentionPrepared& p,const float* values,std::uint32_t count,hipStream_t stream) {
+    hipLaunchKernelGGL(validate_indexed_graph_values,dim3(1),dim3(kThreads),0,stream,values,count,
+        reinterpret_cast<std::uint32_t*>(p.status.address));
+    check_hip(hipGetLastError(),"MTP attention finite validation enqueue");
+}
+}
+void preflight_hip_mtp_attention(const MtpNativeContext& c) {(void)prepare_mtp_attention(c);}
+void launch_hip_mtp_indexer(const MtpNativeContext& c,void* raw_stream) {
+    const auto p=prepare_mtp_attention(c);require_mtp_attention_stream(c,raw_stream);
+    const auto stream=static_cast<hipStream_t>(raw_stream);const auto& m=*c.model;const auto& w=p.workspace;
+    mtp_project<WeightKind::bf16>(p.input,p.tensors.index_q,p.hidden,p.index_width,w.index_query,stream);
+    mtp_project<WeightKind::bf16>(p.input,p.tensors.index_k,p.hidden,p.index_dim,w.current_index_key,stream);
+    launch_norm_rope_typed<SmallWeightKind::f32>(w.index_query,checked_u32(m.indexer_n_heads,"MTP index heads"),p.index_dim,p.index_dim,
+        *p.tensors.index_q_norm.runtime,m,c.position,{},stream);
+    mtp_attention_finite(p,w.index_query,p.index_width,stream);mtp_attention_finite(p,w.current_index_key,p.index_dim,stream);
+    hipLaunchKernelGGL(store_raw_index_key_kernel,dim3((p.index_dim+kThreads-1U)/kThreads),dim3(kThreads),0,stream,
+        w.current_index_key,reinterpret_cast<std::uint16_t*>(p.index.address),p.index_dim,c.position,GraphPositionKernelArguments{});
+    check_hip(hipGetLastError(),"MTP raw index store enqueue");
+    const GraphSelectionArguments selection{{},p.ratio,p.topk};
+    if(p.blocks<=p.topk) {
+        hipLaunchKernelGGL(fill_visible_indices_kernel,dim3((p.visible+kThreads-1U)/kThreads),dim3(kThreads),0,stream,w.selected_indices,p.visible);
+        check_hip(hipGetLastError(),"MTP full-visible index enqueue");
+    } else {
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(block_score_kernel<SmallWeightKind::f32>),dim3(p.blocks),dim3(p.index_dim),
+            2ULL*p.index_dim*sizeof(float),stream,w.index_query,reinterpret_cast<const std::uint16_t*>(p.index.address),
+            checked_u32(m.indexer_n_heads,"MTP index heads"),p.index_dim,p.ratio,reinterpret_cast<const void*>(p.tensors.index_k_norm.runtime->address),
+            m.rms_norm_epsilon,checked_u32(m.rotary_dim(),"MTP rotary dimension"),m.rope_theta,w.block_scores,selection);
+        check_hip(hipGetLastError(),"MTP compressed index score enqueue");
+        mtp_attention_finite(p,w.block_scores,p.blocks,stream);
+        hipLaunchKernelGGL(select_blocks_kernel,dim3(1),dim3(1),0,stream,w.block_scores,p.blocks,p.topk,p.ratio,p.visible,w.selected_indices,selection);
+        check_hip(hipGetLastError(),"MTP compressed selection enqueue");
+    }
+}
+void launch_hip_mtp_sparse_attention(const MtpNativeContext& c,void* raw_stream) {
+    const auto p=prepare_mtp_attention(c);require_mtp_attention_stream(c,raw_stream);
+    const auto stream=static_cast<hipStream_t>(raw_stream);const auto& m=*c.model;const auto& w=p.workspace;
+    mtp_project<WeightKind::q8_0>(p.input,p.tensors.q,p.hidden,p.q_width,w.q_gate,stream);
+    mtp_project<WeightKind::q8_0>(p.input,p.tensors.k,p.hidden,p.kv_width,w.current_k,stream);
+    mtp_project<WeightKind::q8_0>(p.input,p.tensors.v,p.hidden,p.kv_width,w.current_v,stream);
+    launch_norm_rope_typed<SmallWeightKind::f32>(w.q_gate,p.heads,p.dim,p.dim*2U,*p.tensors.q_norm.runtime,m,c.position,{},stream);
+    launch_norm_rope_typed<SmallWeightKind::f32>(w.current_k,p.kv_heads,p.dim,p.dim,*p.tensors.k_norm.runtime,m,c.position,{},stream);
+    mtp_attention_finite(p,w.q_gate,p.q_width,stream);mtp_attention_finite(p,w.current_k,p.kv_width,stream);mtp_attention_finite(p,w.current_v,p.kv_width,stream);
+    hipLaunchKernelGGL(store_kv_kernel,dim3((p.kv_width+kThreads-1U)/kThreads),dim3(kThreads),0,stream,w.current_k,w.current_v,
+        reinterpret_cast<std::uint16_t*>(p.kv.address),p.kv_width,c.position,GraphPositionKernelArguments{});
+    check_hip(hipGetLastError(),"MTP KV store enqueue");
+    const GraphSelectionArguments selection{{},p.ratio,p.topk};
+    hipLaunchKernelGGL(attention_score_kernel,dim3(checked_u32(static_cast<std::uint64_t>(p.heads)*p.selected,"MTP attention score grid")),
+        dim3(kThreads),0,stream,w.q_gate,reinterpret_cast<const std::uint16_t*>(p.kv.address),w.selected_indices,p.selected,p.maximum_selected,
+        p.heads,p.kv_heads,p.dim,w.attention_scores,selection);
+    check_hip(hipGetLastError(),"MTP attention scores enqueue");
+    hipLaunchKernelGGL(attention_softmax_kernel,dim3(p.heads),dim3(kThreads),0,stream,w.attention_scores,p.selected,p.maximum_selected,selection);
+    check_hip(hipGetLastError(),"MTP attention softmax enqueue");
+    hipLaunchKernelGGL(attention_output_kernel,dim3(p.heads),dim3(p.dim),0,stream,w.q_gate,reinterpret_cast<const std::uint16_t*>(p.kv.address),
+        w.selected_indices,w.attention_scores,p.selected,p.maximum_selected,p.heads,p.kv_heads,p.dim,w.attention_output,selection);
+    check_hip(hipGetLastError(),"MTP attention value enqueue");
+    mtp_attention_finite(p,w.attention_output,p.attention_width,stream);
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(linear_float_to_bf16_kernel<WeightKind::q8_0>),dim3(p.hidden),dim3(kThreads),0,stream,
+        w.attention_output,reinterpret_cast<const void*>(p.tensors.out.runtime->address),p.attention_width,p.hidden,
+        reinterpret_cast<std::uint16_t*>(p.output.address));
+    check_hip(hipGetLastError(),"MTP attention output projection enqueue");
+}
+} // namespace strix

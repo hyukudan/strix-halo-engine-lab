@@ -1,0 +1,11 @@
+# MTP sidecar source and explicit shared tensors
+
+The sidecar loader has a closed typed profile for the 32-tensor Q8 predictor with one trailing block. It reads the explicit `qwen4exp.nextn_shared_target_tensors` GGUF boolean and validates the complete tensor census, actual names, formats, ranges, wide normalization and target geometry. The sidecar-scoped manifest classifies its own original block tensors as MTP; it never renumbers them into target layers or fabricates ordinary serial tensors. Other files continue to use their existing structural audit.
+
+A bounded remote header inspection and a declared remote object digest describe source metadata only. Live borrowing requires a matching verified full-file digest and the framed content identity from the same actual loader/mapping. These identities are different fields; declaring an LFS object digest does not establish that the full file was read. Conversion interpretation requires explicit pinned references for both packed projection layout and norm-gain conversion. A reference implementation is not an attestation of the published file's creation.
+
+This profile stores effective norm gains and embedding-first packed input weights. It never adds Gemma's offset twice. Raw-source Gemma offset and converted effective gain remain distinct typed encodings. The complete predictor still needs its own semantic, numerical and native qualification; source metadata does not activate those gates.
+
+Explicit sharing resolves only the real target `token_embd.weight` and `output.weight`, using target tensor indices, content and manifest identity. Both actual model owners remain retained. Source handles and physical generations are revalidated, and a foreign target content identity is rejected even when shapes match. Missing/false sharing metadata, a sidecar containing an ambiguous explicit head, absent target tensors, unresolved encoding or unverified assets cannot trigger a fallback.
+
+The compiler's optional shared binding is included in plan identity. Calls without it preserve the prior plan identity and leave missing head binding unresolved. No MTP weights or source-comparison artifacts are copied into this repository. This source increment has not been compiled, tested or executed.

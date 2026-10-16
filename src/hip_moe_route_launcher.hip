@@ -1,3 +1,4 @@
+#include "strix/hip_mtp_native_validation.hpp"
 #include "strix/hip_launch_context.hpp"
 #include "strix/hip_moe_route_launcher.hpp"
 #include "strix/wave_router_contract.hpp"
@@ -1523,6 +1524,41 @@ register_for_compiled_execution(
                 "HIP MoE route bundle currently requires one route kernel id for all serial layers");
         }
     }
+}
+
+void preflight_hip_mtp_route(const MtpNativeContext& c) {
+    mtp_native::context(c);
+    const auto h=c.model->hidden_size,e=c.model->num_experts,k=c.model->num_experts_per_token;
+    if(!h || h>std::numeric_limits<std::uint32_t>::max() || !e || e>kMaxExperts || !k || k>e || k>kWaveMaxTopK)
+        throw std::invalid_argument("MTP native router geometry unsupported");
+    const auto& t=c.tensors->router;
+    mtp_native::tensor(t,{h,e},mtp_native::product(mtp_native::product(h,e),4));
+    if(t.manifest->ggml_type!=0) throw std::invalid_argument("MTP native router requires F32 weights");
+    auto input=mtp_native::buffer(c,HipMtpBuffer::hidden0,mtp_native::product(h,2));
+    auto indices=mtp_native::buffer(c,HipMtpBuffer::routes,mtp_native::product(k,4));
+    auto weights=mtp_native::buffer(c,HipMtpBuffer::route_weights,mtp_native::product(k,4));
+    auto workspace=mtp_native::buffer(c,HipMtpBuffer::router_workspace,mtp_native::product(e,4));
+    mtp_native::disjoint({input,indices,weights,workspace,
+        {t.runtime->address,t.runtime->bytes,t.runtime->allocation_generation}});
+}
+void launch_hip_mtp_route(const MtpNativeContext& c,void* stream) {
+    preflight_hip_mtp_route(c); mtp_native::stream(c,stream);
+    check_hip(hipGetLastError(),"MTP router pending HIP error");
+    const auto h=static_cast<std::uint32_t>(c.model->hidden_size);
+    const auto e=static_cast<std::uint32_t>(c.model->num_experts);
+    const auto k=static_cast<std::uint32_t>(c.model->num_experts_per_token);
+    auto workspace=reinterpret_cast<float*>(c.resources->view(HipMtpBuffer::router_workspace).address);
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(parallel_moe_route_logits_kernel<std::uint16_t,RouterWeightKind::f32>),
+        dim3((e+kRouterExpertsPerBlock-1)/kRouterExpertsPerBlock),dim3(kRouterProjectionThreads),0,
+        reinterpret_cast<hipStream_t>(stream),
+        reinterpret_cast<const std::uint16_t*>(c.resources->view(HipMtpBuffer::hidden0).address),
+        reinterpret_cast<const void*>(c.tensors->router.runtime->address),h,e,workspace);
+    check_hip(hipGetLastError(),"MTP native parallel route projection launch");
+    hipLaunchKernelGGL(wave_parallel_moe_route_select_kernel,dim3(1),dim3(kThreads),0,
+        reinterpret_cast<hipStream_t>(stream),workspace,e,k,c.model->norm_topk_probability,
+        reinterpret_cast<std::uint32_t*>(c.resources->view(HipMtpBuffer::routes).address),
+        reinterpret_cast<float*>(c.resources->view(HipMtpBuffer::route_weights).address));
+    check_hip(hipGetLastError(),"MTP native parallel route selection launch");
 }
 
 }  // namespace strix

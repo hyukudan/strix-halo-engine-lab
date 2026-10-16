@@ -27,6 +27,9 @@ struct MtpForwardReplayObservation {
 
     std::uint64_t logit_values_compared = 0;
     double maximum_logit_abs_error = 0.0;
+    // Zero preserves portable/legacy scope. Native entry requires an exact
+    // nonzero match to its cast/reduction/kernel arithmetic profile.
+    std::uint64_t native_arithmetic_profile_identity = 0;
 };
 
 struct MtpForwardReplayAssessment {
@@ -38,6 +41,7 @@ struct MtpForwardReplayAssessment {
     bool logits_checked = false;
     bool logits_within_policy = false;
     bool passes_declared_policy = false;
+    std::uint64_t native_arithmetic_profile_identity = 0;
 };
 
 [[nodiscard]] MtpForwardReplayAssessment

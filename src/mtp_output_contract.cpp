@@ -79,7 +79,8 @@ void validate_mtp_output_structural_contract(
         !contract.mixer_semantics_resolved ||
         contract.head_mix_binding_resolved ||
         contract.head_binding_resolved ||
-        contract.output_semantics_resolved) {
+        contract.output_semantics_resolved || contract.lm_head_source!=MtpLmHeadSource::unresolved || contract.shared_target_binding_identity ||
+        contract.lm_head_manifest_layout_identity || contract.lm_head_model_content_identity.valid()) {
         throw std::invalid_argument(
             "MTP output structural contract is stale, incompatible or overclaims head binding");
     }
@@ -241,4 +242,22 @@ bind_mtp_output_head(
     return contract;
 }
 
+MtpOutputStructuralContract bind_mtp_output_head(const ModelContract& model,const ModelManifest& manifest,
+    const MtpDraftTensorAudit& audit,const MtpSharedTargetBinding& shared) {
+    if(shared.sidecar_manifest!=&manifest || !shared.sidecar_runtime || !shared.target_manifest || !shared.target_runtime)
+        throw std::invalid_argument("MTP explicit head binding has foreign or missing source handles");
+    validate_mtp_shared_target_binding(model,manifest,*shared.sidecar_runtime,*shared.target_manifest,
+        *shared.target_runtime,shared.target_model_content_identity,shared);
+    auto result=bind_mtp_output_head(model,manifest,audit);
+    if(result.head_binding_resolved || result.lm_head_source!=MtpLmHeadSource::unresolved || !result.head_mix_binding_resolved)
+        throw std::invalid_argument("MTP explicit target sharing conflicts with a sidecar head or incomplete output mixer");
+    result.lm_head_source=MtpLmHeadSource::target_shared_explicit;
+    result.lm_head_tensor_index=shared.target_output_tensor_index;
+    result.lm_head_manifest_layout_identity=shared.target_manifest_layout_identity;
+    result.lm_head_model_content_identity=shared.target_model_content_identity;
+    result.shared_target_binding_identity=shared.compatibility_identity;
+    result.head_binding_resolved=true;
+    result.output_semantics_resolved=result.mixer_semantics_resolved && result.head_mix_binding_resolved;
+    return result;
+}
 }  // namespace strix

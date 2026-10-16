@@ -1,3 +1,4 @@
+#include "strix/hip_mtp_native_validation.hpp"
 #include "strix/hip_embedding_launcher.hpp"
 #include "strix/hip_launch_context.hpp"
 
@@ -880,6 +881,37 @@ void launch_hip_graph_embedding(
     } else {
         launch_graph_by_kind<std::uint16_t>(kind, config, weights, vocabulary_size, context_tokens, arguments, output, status, native_stream);
     }
+}
+
+void preflight_hip_mtp_embedding(const MtpNativeContext& c,std::uint32_t token) {
+    mtp_native::context(c);
+    const auto h=c.model->hidden_size,v=c.model->vocab_size;
+    if(!h || h>std::numeric_limits<std::uint32_t>::max() || !v || token>=v)
+        throw std::invalid_argument("MTP native embedding geometry/token invalid");
+    const auto& t=c.tensors->embedding;
+    if(!t.manifest) throw std::invalid_argument("MTP actual shared embedding is missing");
+    mtp_native::tensor(t,{h,v},required_weight_bytes(weight_kind(t.manifest->ggml_type),static_cast<std::uint32_t>(h),v));
+    auto output=mtp_native::buffer(c,HipMtpBuffer::embedding,mtp_native::product(h,2));
+    mtp_native::disjoint({output,{t.runtime->address,t.runtime->bytes,t.runtime->allocation_generation}});
+}
+void launch_hip_mtp_embedding(const MtpNativeContext& c,std::uint32_t token,void* stream) {
+    preflight_hip_mtp_embedding(c,token);mtp_native::stream(c,stream);
+    check_hip(hipGetLastError(),"MTP embedding pending HIP error");
+    auto launch=[&]<EmbeddingWeightKind Kind>() {
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(embedding_kernel<std::uint16_t,Kind>),
+            dim3((static_cast<std::uint32_t>(c.model->hidden_size)+kThreads-1)/kThreads),dim3(kThreads),0,
+            reinterpret_cast<hipStream_t>(stream),reinterpret_cast<const void*>(c.tensors->embedding.runtime->address),
+            static_cast<std::uint32_t>(c.model->hidden_size),token,
+            reinterpret_cast<std::uint16_t*>(c.resources->view(HipMtpBuffer::embedding).address));
+    };
+    switch(weight_kind(c.tensors->embedding.manifest->ggml_type)) {
+    case EmbeddingWeightKind::f32:launch.template operator()<EmbeddingWeightKind::f32>();break;
+    case EmbeddingWeightKind::f16:launch.template operator()<EmbeddingWeightKind::f16>();break;
+    case EmbeddingWeightKind::bf16:launch.template operator()<EmbeddingWeightKind::bf16>();break;
+    case EmbeddingWeightKind::q8_0:launch.template operator()<EmbeddingWeightKind::q8_0>();break;
+    case EmbeddingWeightKind::iq4_xs:launch.template operator()<EmbeddingWeightKind::iq4_xs>();break;
+    }
+    check_hip(hipGetLastError(),"MTP native embedding launch");
 }
 
 }  // namespace strix

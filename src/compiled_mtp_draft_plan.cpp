@@ -108,6 +108,15 @@ std::uint64_t build_plan_identity_internal(
     hash_u64(
         hash,
         plan.forward_semantics.contract_identity);
+    // Explicit sharing is content-bound. Null/default plans preserve their
+    // historical identity; no external target is inferred from a missing head.
+    if(plan.output.shared_target_binding_identity) {
+        hash_u64(hash,plan.output.shared_target_binding_identity);
+        hash_u64(hash,static_cast<std::uint64_t>(plan.output.lm_head_source));
+        hash_u64(hash,plan.output.lm_head_tensor_index);
+        hash_u64(hash,plan.output.lm_head_manifest_layout_identity);
+        for(auto byte:plan.output.lm_head_model_content_identity.bytes) hash_u64(hash,byte);
+    }
     hash_u64(hash, plan.steps.size());
     for (const auto step : plan.steps) {
         hash_u64(
@@ -131,7 +140,8 @@ CompiledMtpDraftPlan
 compile_mtp_draft_plan(
     const ModelContract& model,
     const ModelManifest& manifest,
-    const MtpDraftRuntimeBinding& binding) {
+    const MtpDraftRuntimeBinding& binding,
+    const MtpSharedTargetBinding* shared_target) {
     validate_structural_binding(
         manifest,
         binding);
@@ -155,11 +165,11 @@ compile_mtp_draft_plan(
         audit_mtp_draft_tensor_families(
             manifest,
             binding);
-    plan.output =
-        bind_mtp_output_head(
-            model,
-            manifest,
-            plan.tensor_audit);
+    if(shared_target && (shared_target->sidecar_manifest!=&manifest ||
+        shared_target->sidecar_model_content_identity!=binding.model_content_identity))
+        throw std::invalid_argument("MTP compiled shared target descriptor belongs to another sidecar");
+    plan.output = shared_target ? bind_mtp_output_head(model,manifest,plan.tensor_audit,*shared_target) :
+        bind_mtp_output_head(model,manifest,plan.tensor_audit);
     plan.forward =
         build_mtp_forward_composition_contract(
             model,

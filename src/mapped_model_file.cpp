@@ -20,6 +20,12 @@ namespace {
 
 #if defined(__linux__)
 
+std::array<std::uint64_t,7> file_state(const struct stat& value) {
+    return {static_cast<std::uint64_t>(value.st_dev),static_cast<std::uint64_t>(value.st_ino),
+        static_cast<std::uint64_t>(value.st_size),static_cast<std::uint64_t>(value.st_mtim.tv_sec),
+        static_cast<std::uint64_t>(value.st_mtim.tv_nsec),static_cast<std::uint64_t>(value.st_ctim.tv_sec),
+        static_cast<std::uint64_t>(value.st_ctim.tv_nsec)};
+}
 bool same_file_state(
     const struct stat& left,
     const struct stat& right) noexcept {
@@ -50,12 +56,14 @@ MappedModelFile::MappedModelFile(
       logical_name_(
           std::move(other.logical_name_)),
       content_identity_(
-          other.content_identity_) {
+          other.content_identity_), file_sha256_(other.file_sha256_),file_state_(other.file_state_) {
     other.fd_ = -1;
     other.mapping_base_ = 0;
     other.bytes_ = 0;
     other.allocation_generation_ = 0;
     other.content_identity_ = {};
+    other.file_sha256_ = {};
+    other.file_state_ = {};
 }
 
 MappedModelFile&
@@ -73,12 +81,16 @@ MappedModelFile::operator=(
             std::move(other.logical_name_);
         content_identity_ =
             other.content_identity_;
+        file_sha256_=other.file_sha256_;
+        file_state_=other.file_state_;
 
         other.fd_ = -1;
         other.mapping_base_ = 0;
         other.bytes_ = 0;
         other.allocation_generation_ = 0;
         other.content_identity_ = {};
+        other.file_sha256_ = {};
+        other.file_state_ = {};
     }
     return *this;
 }
@@ -144,12 +156,11 @@ MappedModelFile MappedModelFile::open_read_only(
             mapped.logical_name_,
             proc_path,
         };
-        const std::array files{
-            content_file,
-        };
-        mapped.content_identity_ =
-            build_model_content_identity(
-                files);
+        const auto identities=hash_single_model_content_file(content_file);
+        if(identities.file_bytes!=mapped.bytes_)
+            throw std::runtime_error("model file extent changed during its full-file hash");
+        mapped.content_identity_=identities.content_identity;
+        mapped.file_sha256_=identities.file_sha256;
 
         struct stat after_hash {};
         if (::fstat(fd, &after_hash) != 0 ||
@@ -187,6 +198,7 @@ MappedModelFile MappedModelFile::open_read_only(
             throw std::runtime_error(
                 "model file changed while mapping");
         }
+        mapped.file_state_=file_state(after_map);
     } catch (...) {
         mapped.release();
         throw;
@@ -196,6 +208,16 @@ MappedModelFile MappedModelFile::open_read_only(
 #endif
 }
 
+void MappedModelFile::validate_unchanged() const {
+#if defined(__linux__)
+    struct stat current {};
+    if(!valid() || fd_<0 || !file_sha256_.valid() || !content_identity_.valid() ||
+        ::fstat(fd_,&current)!=0 || file_state(current)!=file_state_)
+        throw std::runtime_error("mapped model changed after its original full-file hash");
+#else
+    throw std::runtime_error("mapped model file validation requires native Linux");
+#endif
+}
 void MappedModelFile::read_at(
     std::uint64_t byte_offset,
     std::span<std::byte> destination) const {
@@ -371,6 +393,8 @@ void MappedModelFile::release() noexcept {
     allocation_generation_ = 0;
     logical_name_.clear();
     content_identity_ = {};
+    file_sha256_ = {};
+    file_state_ = {};
 }
 
 }  // namespace strix

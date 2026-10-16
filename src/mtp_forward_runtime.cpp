@@ -48,8 +48,8 @@ execute_qualified_mtp_forward(
             target_session.runtime_compatibility_identity ||
         cycle_input.seed_position <
             target_session.next_position ||
-        cycle_input.hidden_source_position >
-            cycle_input.seed_position ||
+        (cycle_input.seed_position == 0 ||
+         cycle_input.hidden_source_position != cycle_input.seed_position - 1) ||
         cycle_input.hidden_address == 0 ||
         cycle_input.hidden_elements !=
             plan.base.state.state_width ||
@@ -59,10 +59,8 @@ execute_qualified_mtp_forward(
             "qualified MTP forward cycle input is incompatible with plan/session");
     }
 
-    validate_mtp_draft_proposal_state(
-        binding,
-        proposal_state,
-        target_session);
+    validate_mtp_draft_proposal_phase(
+        binding, proposal_state, target_session, DraftProposalStatePhase::proposal_active);
     if (proposal_state.proposal_identity !=
         plan.base.proposal_identity) {
         throw std::invalid_argument(
@@ -99,6 +97,7 @@ execute_qualified_mtp_forward(
             cycle_input.seed_token_id;
         context.target_position =
             cycle_input.seed_position;
+        context.predictor_position = cycle_input.hidden_source_position;
         context.proposal_identity =
             plan.base.proposal_identity;
         context.plan_identity =

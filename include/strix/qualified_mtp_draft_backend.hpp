@@ -56,7 +56,8 @@ public:
 private:
     void validate_request(
         const SerialSessionContext& target_session,
-        const DraftProposalStateContext& proposal_state) const;
+        const DraftProposalStateContext& proposal_state,
+        DraftProposalStatePhase phase) const;
 
     const QualifiedMtpDraftPlan& qualified_plan_;
     const MtpDraftRuntimeBinding& binding_;

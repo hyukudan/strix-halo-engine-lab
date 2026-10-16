@@ -1,6 +1,7 @@
 #include "strix/mtp_forward_semantics.hpp"
 
 #include <limits>
+#include <bit>
 #include <stdexcept>
 
 namespace strix {
@@ -43,6 +44,13 @@ std::uint64_t build_identity(
     std::uint64_t hash =
         fnv_offset;
     hash_u64(hash, contract.semantic_revision);
+    hash_u64(hash, static_cast<std::uint64_t>(contract.predictor_position));
+    hash_u64(hash, contract.hidden_norm_elements);
+    hash_u64(hash, std::bit_cast<std::uint32_t>(contract.rms_norm_epsilon));
+    hash_u64(hash, contract.embedding_projected_once_then_broadcast?1U:0U);
+    hash_u64(hash, static_cast<std::uint64_t>(contract.hidden_norm_scope));
+    hash_u64(hash, static_cast<std::uint64_t>(contract.source_norm_weight_encoding));
+    hash_u64(hash, static_cast<std::uint64_t>(contract.input_arithmetic));
     hash_u64(hash, contract.hidden_size);
     hash_u64(hash, contract.hc_count);
     hash_u64(hash, contract.wide_hidden_size);
@@ -103,7 +111,10 @@ std::uint64_t build_identity(
 
 MtpForwardSemanticContract
 build_mtp_forward_semantic_contract(
-    const ModelContract& model) {
+    const ModelContract& model, MtpInputFusionArithmetic arithmetic) {
+    if(arithmetic!=MtpInputFusionArithmetic::split_projections_then_add &&
+       arithmetic!=MtpInputFusionArithmetic::packed_concat_chain)
+        throw std::invalid_argument("MTP input arithmetic profile is invalid");
     if (const auto error =
             model.validate();
         !error.empty()) {
@@ -118,7 +129,7 @@ build_mtp_forward_semantic_contract(
 
     MtpForwardSemanticContract
         contract;
-    contract.semantic_revision = 1;
+    contract.semantic_revision = 3;
     contract.hidden_size =
         model.hidden_size;
     contract.hc_count =
@@ -134,8 +145,13 @@ build_mtp_forward_semantic_contract(
     contract.eh_proj_output_size =
         model.hidden_size;
 
-    contract.hidden_rms_per_hc_stream =
-        true;
+    contract.hidden_norm_elements = contract.wide_hidden_size;
+    contract.rms_norm_epsilon = model.rms_norm_epsilon;
+    contract.embedding_projected_once_then_broadcast = true;
+    contract.hidden_norm_scope = MtpHiddenNormScope::wide_residual;
+    contract.source_norm_weight_encoding = MtpNormWeightEncoding::gemma_offset;
+    contract.input_arithmetic = arithmetic;
+    contract.hidden_rms_per_hc_stream = false;
     contract.token_rms_repeated_across_hc =
         true;
     contract.input_concat_order =
@@ -172,8 +188,15 @@ void validate_mtp_forward_semantic_contract(
     const MtpForwardSemanticContract& contract) {
     const auto expected =
         build_mtp_forward_semantic_contract(
-            model);
-    if (contract.semantic_revision !=
+            model, contract.input_arithmetic);
+    if (std::bit_cast<std::uint32_t>(contract.rms_norm_epsilon) != std::bit_cast<std::uint32_t>(expected.rms_norm_epsilon) ||
+        contract.embedding_projected_once_then_broadcast != expected.embedding_projected_once_then_broadcast ||
+        contract.hidden_norm_elements != expected.hidden_norm_elements ||
+        contract.predictor_position != expected.predictor_position ||
+        contract.hidden_norm_scope != expected.hidden_norm_scope ||
+        contract.source_norm_weight_encoding != expected.source_norm_weight_encoding ||
+        contract.input_arithmetic != expected.input_arithmetic ||
+        contract.semantic_revision !=
             expected.semantic_revision ||
         contract.hidden_size !=
             expected.hidden_size ||

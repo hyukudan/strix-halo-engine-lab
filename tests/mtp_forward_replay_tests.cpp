@@ -47,6 +47,22 @@ int main() {
                pass.passes_declared_policy,
            "MTP replay assessment accepts complete evidence within declared policy");
 
+    expect(!observation.native_arithmetic_profile_identity && !pass.native_arithmetic_profile_identity,
+        "portable replay assessment retains the legacy zero profile by default");
+    auto native_a=observation;native_a.native_arithmetic_profile_identity=0x4d5450410001ULL;
+    auto native_b=native_a;native_b.native_arithmetic_profile_identity=0x4d5450410002ULL;
+    const auto pa=strix::assess_mtp_forward_replay(policy,native_a);
+    const auto pb=strix::assess_mtp_forward_replay(policy,native_b);
+    expect(pa.passes_declared_policy && pb.passes_declared_policy &&
+        pa.native_arithmetic_profile_identity==native_a.native_arithmetic_profile_identity &&
+        pb.native_arithmetic_profile_identity==native_b.native_arithmetic_profile_identity &&
+        pa.native_arithmetic_profile_identity!=pb.native_arithmetic_profile_identity,
+        "assessment preserves distinct native profiles without changing replay tolerances or token policy");
+    auto failed_native=native_a;failed_native.maximum_logit_abs_error=policy.max_logit_abs_error*2;
+    const auto pn=strix::assess_mtp_forward_replay(policy,failed_native);
+    expect(!pn.passes_declared_policy && !pn.logits_within_policy &&
+        pn.native_arithmetic_profile_identity==native_a.native_arithmetic_profile_identity,
+        "failed native observations retain their profile for diagnostics rather than becoming portable or passing");
     auto token_mismatch = observation;
     token_mismatch.engine_tokens[1] = 99;
     const auto token_fail =

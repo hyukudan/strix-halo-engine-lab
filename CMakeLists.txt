@@ -164,6 +164,7 @@ add_library(strix_core STATIC
     src/mtp_draft_cycle_input.cpp
     src/mtp_forward_replay.cpp
     src/mtp_forward_contract.cpp
+    src/mtp_sidecar_binding.cpp
     src/mtp_forward_semantics.cpp
     src/mtp_forward_runtime.cpp
     src/mtp_input_fusion.cpp
@@ -1064,6 +1065,11 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-mtp-forward-replay-tests)
     add_test(NAME strix-mtp-forward-replay-tests COMMAND strix-mtp-forward-replay-tests)
 
+    add_executable(strix-mtp-sidecar-binding-tests tests/mtp_sidecar_binding_tests.cpp)
+    target_link_libraries(strix-mtp-sidecar-binding-tests PRIVATE strix_core)
+    strix_target_warnings(strix-mtp-sidecar-binding-tests)
+    add_test(NAME strix-mtp-sidecar-binding-tests COMMAND strix-mtp-sidecar-binding-tests)
+
     add_executable(strix-mtp-forward-semantics-tests tests/mtp_forward_semantics_tests.cpp)
     target_link_libraries(strix-mtp-forward-semantics-tests PRIVATE strix_core)
     strix_target_warnings(strix-mtp-forward-semantics-tests)
@@ -1278,6 +1284,13 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         src/hip_moe_route_launcher.hip
         src/hip_moe_experts_launcher.hip
         src/hip_ple_launcher.hip
+        src/hip_mtp_resources.hip
+        src/hip_mtp_runtime.hip
+        src/hip_mtp_target_hidden.hip
+        src/hip_mtp_greedy_runtime.hip
+        src/hip_mtp_asset_loader.hip
+        src/hip_mtp_input_fusion.hip
+        src/hip_mtp_forward_replay.hip
         src/hip_embedding_launcher.hip
         src/hip_gdn_launcher.hip
         src/hip_known_prefix_window.hip
@@ -1341,6 +1354,8 @@ if(STRIX_ENABLE_HIP_RUNTIME)
     endif()
     set_source_files_properties(src/hip_qsa_selection_diagnostic.hip
         PROPERTIES COMPILE_OPTIONS "-mno-wavefrontsize64;-fno-fast-math")
+    set_source_files_properties(src/hip_mtp_input_fusion.hip
+        PROPERTIES COMPILE_OPTIONS "-mno-wavefrontsize64;-fno-fast-math;-ffp-contract=off")
     strix_target_warnings(strix_hip_runtime)
     if(BUILD_TESTING)
         target_compile_definitions(strix_hip_runtime PRIVATE STRIX_BUILD_GDN_LM_WAVE8_DIAGNOSTIC=1)
@@ -1350,6 +1365,25 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         target_compile_definitions(strix_hip_runtime PRIVATE STRIX_BUILD_SHARED_EXPERT_ROWS_DIAGNOSTIC=1)
         target_compile_definitions(strix_hip_runtime PRIVATE STRIX_BUILD_QSA_GQA_REUSE_DIAGNOSTIC=1)
         target_compile_definitions(strix_hip_runtime PRIVATE STRIX_BUILD_MOE_BATCHED_ACTIVATION_DIAGNOSTIC=1)
+        foreach(mtp_fixture input-fusion forward-replay)
+            string(REPLACE "-" "_" mtp_fixture_file "${mtp_fixture}")
+            add_executable(strix-hip-mtp-${mtp_fixture}-tests tests/hip_mtp_${mtp_fixture_file}_tests.hip)
+            target_link_libraries(strix-hip-mtp-${mtp_fixture}-tests PRIVATE strix_hip_runtime)
+            set_target_properties(strix-hip-mtp-${mtp_fixture}-tests PROPERTIES
+                HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+            target_compile_options(strix-hip-mtp-${mtp_fixture}-tests PRIVATE
+                -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off)
+            strix_target_warnings(strix-hip-mtp-${mtp_fixture}-tests)
+            add_test(NAME strix-hip-mtp-${mtp_fixture}-tests COMMAND strix-hip-mtp-${mtp_fixture}-tests)
+            set_tests_properties(strix-hip-mtp-${mtp_fixture}-tests PROPERTIES SKIP_RETURN_CODE 77)
+        endforeach()
+        # Callable fixture requires actual independently supplied component goldens.
+        # Building this source library does not execute or qualify the components.
+        add_library(strix_mtp_projection_component_fixtures STATIC tests/hip_mtp_projection_components.hip tests/hip_mtp_shared_expert_components.hip)
+        target_link_libraries(strix_mtp_projection_component_fixtures PRIVATE strix_hip_runtime)
+        set_target_properties(strix_mtp_projection_component_fixtures PROPERTIES
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+        strix_target_warnings(strix_mtp_projection_component_fixtures)
         add_library(strix_qsa_selection_diagnostic INTERFACE)
         target_link_libraries(strix_qsa_selection_diagnostic INTERFACE strix_hip_runtime)
         add_executable(strix-hip-qsa-selection-diagnostic-tests tests/hip_qsa_selection_diagnostic_tests.hip)

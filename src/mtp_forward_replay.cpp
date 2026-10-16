@@ -33,6 +33,7 @@ assess_mtp_forward_replay(
     }
 
     MtpForwardReplayAssessment result;
+    result.native_arithmetic_profile_identity=observation.native_arithmetic_profile_identity;
     result.identity_valid =
         observation.proposal_identity != 0 &&
         observation.plan_identity != 0 &&

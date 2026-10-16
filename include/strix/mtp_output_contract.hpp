@@ -3,6 +3,7 @@
 #include "strix/model_contract.hpp"
 #include "strix/model_manifest.hpp"
 #include "strix/mtp_draft_tensor_audit.hpp"
+#include "strix/mtp_sidecar_binding.hpp"
 
 #include <cstdint>
 
@@ -12,6 +13,7 @@ enum class MtpLmHeadSource {
     unresolved,
     mtp_sidecar_shared_head,
     target_output_fallback,
+    target_shared_explicit,
 };
 
 struct MtpOutputStructuralContract {
@@ -37,6 +39,11 @@ struct MtpOutputStructuralContract {
     bool mixer_semantics_resolved = true;
     bool head_binding_resolved = false;
     bool output_semantics_resolved = false;
+    // Nonzero only for explicit sidecar metadata + verified assets. The head
+    // index then belongs to this TARGET manifest, never the sidecar namespace.
+    std::uint64_t shared_target_binding_identity = 0;
+    std::uint64_t lm_head_manifest_layout_identity = 0;
+    ModelContentIdentity lm_head_model_content_identity;
 };
 
 [[nodiscard]] MtpOutputStructuralContract
@@ -49,6 +56,10 @@ bind_mtp_output_head(
     const ModelManifest& manifest,
     const MtpDraftTensorAudit& audit);
 
+// No shape/absence-based fallback: the source contract must explicitly request
+// sharing and the supplied live target binding must pass full content checks.
+[[nodiscard]] MtpOutputStructuralContract bind_mtp_output_head(
+    const ModelContract&,const ModelManifest&,const MtpDraftTensorAudit&,const MtpSharedTargetBinding&);
 void validate_mtp_output_structural_contract(
     const ModelContract& model,
     const MtpOutputStructuralContract& contract);

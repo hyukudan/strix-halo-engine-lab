@@ -18,6 +18,7 @@ struct ActivatedMtpDraftPlan {
     // performance/hardware qualification.
     bool semantics_qualified = false;
     bool hardware_qualified = false;
+    std::uint64_t native_arithmetic_profile_identity = 0;
 };
 
 [[nodiscard]] ActivatedMtpDraftPlan

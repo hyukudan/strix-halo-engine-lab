@@ -44,4 +44,9 @@ void validate_mtp_draft_proposal_state(
     const DraftProposalStateContext& state,
     const SerialSessionContext& target_session);
 
+// Validate the actual lifecycle phase without manufacturing a synchronized copy.
+// Reconciliation admits only forward progress with equal position/token deltas.
+void validate_mtp_draft_proposal_phase(const MtpDraftRuntimeBinding&,
+    const DraftProposalStateContext&,const SerialSessionContext&,DraftProposalStatePhase);
+
 }  // namespace strix

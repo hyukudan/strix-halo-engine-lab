@@ -17,6 +17,7 @@ struct QualifiedMtpDraftPlan {
     std::uint64_t qualified_plan_identity = 0;
     std::uint64_t qualification_identity = 0;
     bool executable = false;
+    std::uint64_t native_arithmetic_profile_identity = 0;
 };
 
 [[nodiscard]] QualifiedMtpDraftPlan

@@ -56,7 +56,8 @@ recompute_compiled_mtp_draft_plan_identity(
 compile_mtp_draft_plan(
     const ModelContract& model,
     const ModelManifest& manifest,
-    const MtpDraftRuntimeBinding& binding);
+    const MtpDraftRuntimeBinding& binding,
+    const MtpSharedTargetBinding* shared_target = nullptr);
 
 void require_executable_mtp_draft_plan(
     const CompiledMtpDraftPlan& plan);

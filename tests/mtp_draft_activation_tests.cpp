@@ -56,6 +56,14 @@ strix::MtpForwardReplayObservation observation() {
     return result;
 }
 
+// Compatibility oracle for the pre-profile portable activation wire identity.
+std::uint64_t legacy_activation_identity(const strix::CompiledMtpDraftPlan& plan,
+    const strix::MtpForwardReplayPolicy& policy,const strix::MtpForwardReplayObservation& replay) {
+    std::uint64_t hash=14695981039346656037ULL;
+    for(const auto value:{plan.plan_identity,plan.proposal_identity,policy.policy_identity,replay.independent_reference_identity})
+        for(unsigned shift=0;shift<64;shift+=8)hash=(hash^((value>>shift)&255ULL))*1099511628211ULL;
+    return hash;
+}
 }  // namespace
 
 int main() {
@@ -84,6 +92,25 @@ int main() {
                    replay.independent_reference_identity,
            "activation identity is anchored to plan, policy and independent reference");
 
+    expect(!activated.native_arithmetic_profile_identity &&
+        activated.activation_identity==legacy_activation_identity(plan,replay_policy,replay),
+        "portable profile zero preserves the historical activation identity");
+    auto native_a=replay;native_a.native_arithmetic_profile_identity=0x4d5450410001ULL;
+    auto native_b=native_a;native_b.native_arithmetic_profile_identity=0x4d5450410002ULL;
+    const auto aa=strix::activate_mtp_draft_plan(plan,replay_policy,native_a);
+    const auto ab=strix::activate_mtp_draft_plan(plan,replay_policy,native_b);
+    const auto assessed=strix::assess_mtp_forward_replay(replay_policy,native_a);
+    expect(assessed.native_arithmetic_profile_identity==native_a.native_arithmetic_profile_identity &&
+        aa.native_arithmetic_profile_identity==assessed.native_arithmetic_profile_identity &&
+        ab.native_arithmetic_profile_identity==native_b.native_arithmetic_profile_identity &&
+        aa.activation_identity!=ab.activation_identity && aa.activation_identity!=activated.activation_identity,
+        "assessment-to-activation preserves the actual native arithmetic profile and separates otherwise identical evidence");
+    expect(aa.semantics_qualified && ab.semantics_qualified && !aa.hardware_qualified && !ab.hardware_qualified,
+        "profile-bound semantic activation still does not assert native hardware qualification");
+    auto native_bad=native_a;native_bad.engine_tokens[0]=999;
+    bool native_bad_rejected=false;
+    try{(void)strix::activate_mtp_draft_plan(plan,replay_policy,native_bad);}catch(const std::logic_error&){native_bad_rejected=true;}
+    expect(native_bad_rejected,"nonzero native arithmetic identity cannot bypass failing replay tokens");
     auto wrong_plan_evidence = replay;
     ++wrong_plan_evidence.plan_identity;
     bool wrong_identity_rejected = false;

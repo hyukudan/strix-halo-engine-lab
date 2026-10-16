@@ -76,4 +76,12 @@ private:
     HipElementwiseLauncherConfig config_;
 };
 
+// Source-only native MTP entry points; qualification is separate.
+struct MtpNativeContext;
+enum class MtpInjectRole : unsigned { attention, mlp };
+void preflight_hip_mtp_inject(const MtpNativeContext&,MtpInjectRole);
+void launch_hip_mtp_inject(const MtpNativeContext&,MtpInjectRole,void* stream);
+void preflight_hip_mtp_moe_combine(const MtpNativeContext&);
+void launch_hip_mtp_moe_combine(const MtpNativeContext&,void* stream);
+
 }  // namespace strix

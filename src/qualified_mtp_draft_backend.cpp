@@ -37,14 +37,12 @@ QualifiedMtpDraftBackend::QualifiedMtpDraftBackend(
 
 void QualifiedMtpDraftBackend::validate_request(
     const SerialSessionContext& target_session,
-    const DraftProposalStateContext& proposal_state) const {
+    const DraftProposalStateContext& proposal_state, DraftProposalStatePhase phase) const {
     require_qualified_mtp_draft_plan(
         qualified_plan_);
 
-    validate_mtp_draft_proposal_state(
-        binding_,
-        proposal_state,
-        target_session);
+    validate_mtp_draft_proposal_phase(
+        binding_, proposal_state, target_session, phase);
 
     if (proposal_state.proposal_identity !=
         qualified_plan_.base.proposal_identity) {
@@ -64,7 +62,7 @@ QualifiedMtpDraftBackend::propose_candidates(
 
     validate_request(
         target_session,
-        proposal_state);
+        proposal_state, DraftProposalStatePhase::proposal_active);
 
     auto tokens =
         backend_.propose_mtp_candidates(
@@ -98,7 +96,7 @@ void QualifiedMtpDraftBackend::reconcile_after_target(
     std::span<const std::uint32_t> emitted_tokens) {
     validate_request(
         target_session,
-        proposal_state);
+        proposal_state, DraftProposalStatePhase::reconciliation_required);
 
     backend_.reconcile_mtp_after_target(
         qualified_plan_,

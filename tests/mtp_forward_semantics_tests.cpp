@@ -25,7 +25,7 @@ int main() {
             model);
 
     expect(
-        contract.semantic_revision == 1 &&
+        contract.semantic_revision == 3 &&
             contract.hidden_size == 2560 &&
             contract.hc_count == 4 &&
             contract.wide_hidden_size == 10240 &&
@@ -34,12 +34,18 @@ int main() {
         "MTP semantic contract pins official NextN input/HC geometry");
 
     expect(
-        contract.hidden_rms_per_hc_stream &&
+        !contract.hidden_rms_per_hc_stream &&
+            contract.hidden_norm_elements == 10240 &&
+            contract.rms_norm_epsilon == model.rms_norm_epsilon &&
+            contract.embedding_projected_once_then_broadcast &&
+            contract.hidden_norm_scope == strix::MtpHiddenNormScope::wide_residual &&
+            contract.source_norm_weight_encoding == strix::MtpNormWeightEncoding::gemma_offset &&
+            contract.input_arithmetic == strix::MtpInputFusionArithmetic::split_projections_then_add &&
             contract.token_rms_repeated_across_hc &&
             contract.input_concat_order ==
                 strix::MtpInputConcatOrder::
                     embedding_then_hidden,
-        "MTP semantic contract pins hnorm/enorm and embedding-before-hidden concat");
+        "MTP revision two pins wide hidden normalization and separate projection arithmetic");
 
     expect(
         contract.attention_precedes_mlp &&
@@ -75,6 +81,29 @@ int main() {
     expect(
         rejected,
         "MTP semantic contract rejects stale/invented head injection");
+
+    const auto packed = strix::build_mtp_forward_semantic_contract(model,
+        strix::MtpInputFusionArithmetic::packed_concat_chain);
+    expect(packed.contract_identity != contract.contract_identity,
+        "split and packed arithmetic require different semantic identities");
+    strix::validate_mtp_forward_semantic_contract(model,packed);
+    wrong=contract;wrong.semantic_revision=1;wrong.hidden_rms_per_hc_stream=true;
+    rejected=false;try {strix::validate_mtp_forward_semantic_contract(model,wrong);}
+    catch(const std::invalid_argument&) {rejected=true;}
+    expect(rejected,"stale per-stream RMS revision must not qualify as wide normalization");
+    wrong=contract;wrong.input_arithmetic=strix::MtpInputFusionArithmetic::packed_concat_chain;
+    rejected=false;try {strix::validate_mtp_forward_semantic_contract(model,wrong);}
+    catch(const std::invalid_argument&) {rejected=true;}
+    expect(rejected,"arithmetic mutation cannot retain a former profile identity");
+    wrong=contract;wrong.source_norm_weight_encoding=strix::MtpNormWeightEncoding::effective_scale;
+    rejected=false;try {strix::validate_mtp_forward_semantic_contract(model,wrong);}
+    catch(const std::invalid_argument&) {rejected=true;}
+    expect(rejected,"source Gemma offset and converted runtime gain must not be conflated");
+
+    wrong=contract;wrong.rms_norm_epsilon=1e-5F;
+    rejected=false;try {strix::validate_mtp_forward_semantic_contract(model,wrong);}
+    catch(const std::invalid_argument&) {rejected=true;}
+    expect(rejected,"wide normalization epsilon is part of the semantic identity");
 
     if (failures == 0) {
         std::cout

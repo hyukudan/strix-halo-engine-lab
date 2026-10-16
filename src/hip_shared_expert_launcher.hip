@@ -1,3 +1,5 @@
+#include "strix/hip_mtp_shared_expert.hpp"
+#include "strix/hip_mtp_native_validation.hpp"
 #include "strix/hip_launch_context.hpp"
 #include "strix/hip_shared_expert_launcher.hpp"
 #include "strix/hip_shared_serving_cohort.hpp"
@@ -1997,5 +1999,61 @@ void shared_expert_serving_cohort_launch(std::span<const ExecutionDispatchContex
         prepared.pointers,reinterpret_cast<const unsigned char*>(prepared.views.output.address),
         reinterpret_cast<const unsigned char*>(prepared.views.workspace.address));
     check_hip(hipGetLastError(),"shared serving output/workspace scatter");
+}
+} // namespace strix
+
+namespace strix {
+namespace {
+void mtp_shared_prepare(const MtpNativeContext& c){
+    mtp_native::context(c);
+    if(c.model->hidden_size!=2560U || c.model->shared_expert_intermediate_size!=640U)
+        throw std::invalid_argument("MTP shared expert geometry is unsupported");
+    const auto input=mtp_native::buffer(c,HipMtpBuffer::hidden0,5120U,2U);
+    const auto output=mtp_native::buffer(c,HipMtpBuffer::hidden1,5120U,2U);
+    const auto workspace=mtp_native::buffer(c,HipMtpBuffer::moe_workspace,5120U,4U);
+    mtp_native::disjoint({input,output,workspace});
+    const auto& t=*c.tensors;const std::array tensors{t.shared_gate,t.shared_up,t.shared_down,t.shared_scalar_gate};
+    for(std::size_t i=0;i<tensors.size();++i){const auto pair=tensors[i];const bool scalar=i==3U,down=i==2U;
+        const std::vector<std::uint64_t> shape=scalar?std::vector<std::uint64_t>{2560U}:
+            std::vector<std::uint64_t>{down?640U:2560U,down?2560U:640U};
+        const std::uint64_t bytes=scalar?10240U:static_cast<std::uint64_t>(shape[0]/32U)*34U*shape[1];
+        if(!pair.manifest || !pair.runtime || pair.manifest->ggml_type!=(scalar?0U:8U) || pair.manifest->dimensions!=shape ||
+           pair.manifest->byte_size!=bytes || !runtime_tensor_gpu_visible(pair.runtime->storage) || !pair.runtime->address ||
+           !pair.runtime->allocation_generation || pair.runtime->bytes<bytes || pair.runtime->address%16U ||
+           pair.runtime->bytes>std::numeric_limits<std::uintptr_t>::max()-pair.runtime->address)
+            throw std::invalid_argument("MTP shared expert tensor type, shape, extent or owner is invalid");
+        const MtpDeviceView weights{pair.runtime->address,pair.runtime->bytes,pair.runtime->allocation_generation};
+        mtp_native::disjoint({weights,output,workspace});
+    }
+}
+}
+void preflight_hip_mtp_shared_expert(const MtpNativeContext& c){mtp_shared_prepare(c);}
+void launch_hip_mtp_shared_expert(const MtpNativeContext& c,void* raw_stream){
+    mtp_shared_prepare(c);
+    if(!raw_stream || raw_stream!=c.resources->stream())throw std::invalid_argument("MTP shared expert stream differs from actual owner");
+    const auto stream=static_cast<hipStream_t>(raw_stream);hipStreamCaptureStatus capture=hipStreamCaptureStatusNone;
+    check_hip(hipStreamIsCapturing(stream,&capture),"MTP shared capture query");
+    if(capture!=hipStreamCaptureStatusNone)throw std::invalid_argument("MTP shared expert is eager only");
+    check_hip(hipPeekAtLastError(),"MTP shared prior HIP error");
+    const auto& owner=*c.resources;const auto& t=*c.tensors;
+    const auto* input=reinterpret_cast<const std::uint16_t*>(owner.view(HipMtpBuffer::hidden0).address);
+    auto* workspace=reinterpret_cast<float*>(owner.view(HipMtpBuffer::moe_workspace).address);
+    auto* up=workspace+640U;
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(projection_to_fp32_kernel<std::uint16_t,WeightKind::q8_0>),dim3(640U),dim3(kThreads),0,stream,
+        input,reinterpret_cast<const void*>(t.shared_gate.runtime->address),2560U,640U,workspace);
+    check_hip(hipGetLastError(),"MTP shared Q8 gate projection");
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(projection_to_fp32_kernel<std::uint16_t,WeightKind::q8_0>),dim3(640U),dim3(kThreads),0,stream,
+        input,reinterpret_cast<const void*>(t.shared_up.runtime->address),2560U,640U,up);
+    check_hip(hipGetLastError(),"MTP shared Q8 up projection");
+    hipLaunchKernelGGL(gated_activation_kernel,dim3(3U),dim3(kThreads),0,stream,workspace,640U);
+    check_hip(hipGetLastError(),"MTP shared activation");
+    // Scalar replaces up[0] ONLY after activation consumed the complete up row.
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(scalar_projection_kernel<std::uint16_t,WeightKind::f32>),dim3(1U),dim3(kThreads),0,stream,
+        input,reinterpret_cast<const void*>(t.shared_scalar_gate.runtime->address),2560U,up);
+    check_hip(hipGetLastError(),"MTP shared F32 scalar gate");
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(down_projection_kernel<std::uint16_t,WeightKind::q8_0>),dim3(2560U),dim3(kThreads),0,stream,
+        workspace,up,reinterpret_cast<const void*>(t.shared_down.runtime->address),640U,2560U,
+        reinterpret_cast<std::uint16_t*>(owner.view(HipMtpBuffer::hidden1).address));
+    check_hip(hipGetLastError(),"MTP shared Q8 down output");
 }
 } // namespace strix

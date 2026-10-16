@@ -1,3 +1,4 @@
+#include "strix/hip_mtp_native_validation.hpp"
 #include "strix/hip_launch_context.hpp"
 #include "strix/hip_runtime_launchers.hpp"
 
@@ -1037,6 +1038,59 @@ register_for_compiled_execution(
                 *kind,
             });
     }
+}
+
+void preflight_hip_mtp_moe_combine(const MtpNativeContext& c) {
+    mtp_native::context(c);
+    const auto bytes=mtp_native::product(c.model->hidden_size,2);
+    auto a=mtp_native::buffer(c,HipMtpBuffer::hidden1,bytes);
+    auto b=mtp_native::buffer(c,HipMtpBuffer::hidden2,bytes);
+    auto out=mtp_native::buffer(c,HipMtpBuffer::hidden0,bytes);
+    mtp_native::disjoint({a,b,out});
+    (void)prepare_1d_blocks(c.model->hidden_size);
+}
+void launch_hip_mtp_moe_combine(const MtpNativeContext& c,void* stream) {
+    preflight_hip_mtp_moe_combine(c); mtp_native::stream(c,stream);
+    check_hip(hipGetLastError(),"MTP MoE combine pending HIP error");
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(moe_combine_kernel<std::uint16_t>),
+        dim3(prepare_1d_blocks(c.model->hidden_size)),dim3(256),0,
+        reinterpret_cast<hipStream_t>(stream),
+        reinterpret_cast<const std::uint16_t*>(c.resources->view(HipMtpBuffer::hidden1).address),
+        reinterpret_cast<const std::uint16_t*>(c.resources->view(HipMtpBuffer::hidden2).address),
+        reinterpret_cast<std::uint16_t*>(c.resources->view(HipMtpBuffer::hidden0).address),
+        c.model->hidden_size);
+    check_hip(hipGetLastError(),"MTP native MoE combine launch");
+}
+
+void preflight_hip_mtp_inject(const MtpNativeContext& c,MtpInjectRole role) {
+    mtp_native::context(c);
+    if(role!=MtpInjectRole::attention && role!=MtpInjectRole::mlp)
+        throw std::invalid_argument("MTP injection role unsupported");
+    const auto h=c.model->hidden_size,n=c.model->hc_count;
+    if(!h || h>std::numeric_limits<std::uint32_t>::max() || !n || n>std::numeric_limits<std::uint32_t>::max())
+        throw std::invalid_argument("MTP injection geometry exceeds native ABI");
+    const auto wide=mtp_native::product(mtp_native::product(h,n),2);
+    const auto attn=role==MtpInjectRole::attention;
+    auto input=mtp_native::buffer(c,attn?HipMtpBuffer::fused_wide:HipMtpBuffer::wide_work,wide);
+    auto hidden=mtp_native::buffer(c,attn?HipMtpBuffer::hidden1:HipMtpBuffer::hidden0,mtp_native::product(h,2));
+    auto injection=mtp_native::buffer(c,HipMtpBuffer::injection,mtp_native::product(n,4));
+    auto output=mtp_native::buffer(c,attn?HipMtpBuffer::wide_work:HipMtpBuffer::wide_next,wide);
+    mtp_native::disjoint({input,hidden,injection,output});
+    (void)prepare_1d_blocks(wide/2);
+}
+void launch_hip_mtp_inject(const MtpNativeContext& c,MtpInjectRole role,void* stream) {
+    preflight_hip_mtp_inject(c,role);mtp_native::stream(c,stream);
+    check_hip(hipGetLastError(),"MTP injection pending HIP error");
+    const auto attn=role==MtpInjectRole::attention;
+    const auto wide=mtp_native::product(c.model->hidden_size,c.model->hc_count);
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(inject_kernel<std::uint16_t>),
+        dim3(prepare_1d_blocks(wide)),dim3(256),0,reinterpret_cast<hipStream_t>(stream),
+        reinterpret_cast<const std::uint16_t*>(c.resources->view(attn?HipMtpBuffer::fused_wide:HipMtpBuffer::wide_work).address),
+        reinterpret_cast<const std::uint16_t*>(c.resources->view(attn?HipMtpBuffer::hidden1:HipMtpBuffer::hidden0).address),
+        reinterpret_cast<const float*>(c.resources->view(HipMtpBuffer::injection).address),
+        reinterpret_cast<std::uint16_t*>(c.resources->view(attn?HipMtpBuffer::wide_work:HipMtpBuffer::wide_next).address),
+        static_cast<std::uint32_t>(c.model->hidden_size),static_cast<std::uint32_t>(c.model->hc_count),1U);
+    check_hip(hipGetLastError(),"MTP native injection launch");
 }
 
 }  // namespace strix

@@ -45,6 +45,8 @@ std::uint64_t build_qualification_identity(
         hash,
         observation.independent_reference_identity);
     hash_u64(hash, observation.plan_identity);
+    if(observation.native_arithmetic_profile_identity)
+        hash_u64(hash,observation.native_arithmetic_profile_identity);
     hash_u64(
         hash,
         static_cast<std::uint64_t>(
@@ -101,6 +103,7 @@ qualify_mtp_draft_plan(
             observation);
     qualified.independent_reference_identity =
         observation.independent_reference_identity;
+    qualified.native_arithmetic_profile_identity=observation.native_arithmetic_profile_identity;
     qualified.qualified_plan_identity =
         plan.plan_identity;
 
@@ -136,6 +139,8 @@ void require_qualified_mtp_draft_plan(
         throw std::logic_error(
             "MTP qualified plan changed after replay qualification");
     }
+    if(plan.native_arithmetic_profile_identity!=plan.replay_assessment.native_arithmetic_profile_identity)
+        throw std::logic_error("MTP qualified arithmetic profile changed after replay");
     if (!plan.executable ||
         !plan.replay_assessment.passes_declared_policy) {
         throw std::logic_error(

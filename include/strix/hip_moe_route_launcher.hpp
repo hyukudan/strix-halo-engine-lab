@@ -60,4 +60,9 @@ private:
     HipMoeRouteLauncherConfig config_;
 };
 
+// Source-only native MTP entry points; qualification is separate.
+struct MtpNativeContext;
+void preflight_hip_mtp_route(const MtpNativeContext&);
+void launch_hip_mtp_route(const MtpNativeContext&,void* stream);
+
 }  // namespace strix

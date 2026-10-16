@@ -60,4 +60,8 @@ private:
     HipEmbeddingLauncherConfig config_;
 };
 
+struct MtpNativeContext;
+void preflight_hip_mtp_embedding(const MtpNativeContext&,std::uint32_t token);
+void launch_hip_mtp_embedding(const MtpNativeContext&,std::uint32_t token,void* stream);
+
 }  // namespace strix

@@ -204,4 +204,27 @@ void validate_mtp_draft_proposal_state(
         target_session);
 }
 
+void validate_mtp_draft_proposal_phase(const MtpDraftRuntimeBinding& binding,
+    const DraftProposalStateContext& state,const SerialSessionContext& target,
+    DraftProposalStatePhase phase) {
+    if(!binding.compatibility_identity || state.proposal_identity!=binding.compatibility_identity ||
+       !state.generation || !state.target_runtime_compatibility_identity ||
+       state.target_runtime_compatibility_identity!=target.runtime_compatibility_identity ||
+       target.health!=SerialSessionHealth::ready || state.phase!=phase ||
+       (phase!=DraftProposalStatePhase::proposal_active &&
+        phase!=DraftProposalStatePhase::reconciliation_required))
+        throw std::invalid_argument("MTP proposal phase/target binding invalid");
+    if(phase==DraftProposalStatePhase::proposal_active) {
+        if(state.synchronized_target_position!=target.next_position ||
+           state.synchronized_target_committed_tokens!=target.committed_tokens)
+            throw std::logic_error("MTP active proposal target frontier changed");
+    } else {
+        if(target.next_position<state.synchronized_target_position ||
+           target.committed_tokens<state.synchronized_target_committed_tokens ||
+           target.next_position-state.synchronized_target_position!=
+             target.committed_tokens-state.synchronized_target_committed_tokens)
+            throw std::logic_error("MTP reconciliation target progress is inconsistent");
+    }
+}
+
 }  // namespace strix

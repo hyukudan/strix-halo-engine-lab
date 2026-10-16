@@ -54,10 +54,10 @@ void validate_mtp_draft_cycle_input(
         throw std::out_of_range(
             "MTP seed position cannot precede target base position or exceed model range");
     }
-    if (input.hidden_source_position >
-            input.seed_position) {
+    if (input.seed_position == 0 ||
+        input.hidden_source_position != input.seed_position - 1) {
         throw std::invalid_argument(
-            "MTP hidden source position cannot be after seed position");
+            "MTP token at i+1 requires the wide hidden at i");
     }
 
     validate_mtp_draft_state_contract(

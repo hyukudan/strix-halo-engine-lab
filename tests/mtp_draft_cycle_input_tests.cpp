@@ -143,6 +143,14 @@ int main() {
         past_rejected,
         "MTP cycle rejects seed positions before target-session base");
 
+    for (const auto source : {input.seed_position, input.seed_position - 2}) {
+        auto misaligned=input;misaligned.hidden_source_position=source;
+        bool rejected=false;
+        try { strix::validate_mtp_draft_cycle_input(model,activation,state,session,misaligned); }
+        catch(const std::invalid_argument&) {rejected=true;}
+        expect(rejected,"MTP rejects unshifted or stale hidden/token pairing");
+    }
+
     auto future_hidden = input;
     future_hidden.hidden_source_position =
         input.seed_position + 1;

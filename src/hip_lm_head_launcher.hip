@@ -1,3 +1,4 @@
+#include "strix/hip_mtp_native_validation.hpp"
 #ifdef STRIX_BUILD_GDN_LM_WAVE8_DIAGNOSTIC
 #include "strix/hip_gdn_lm_wave8_diagnostic.hpp"
 #endif
@@ -1036,5 +1037,42 @@ void enqueue_lm(Shape shape, Span input, Span weights, Span output, Kind kind, A
 }
 } // namespace gdn_lm_wave8_diagnostic::detail
 #endif
+
+void preflight_hip_mtp_lm_head(const MtpNativeContext& c) {
+    mtp_native::context(c);
+    const auto h=c.model->hidden_size,v=c.model->vocab_size;
+    if(!h || h>std::numeric_limits<std::uint32_t>::max() ||
+       !v || v>std::numeric_limits<std::uint32_t>::max())
+        throw std::invalid_argument("MTP head geometry exceeds native launch ABI");
+    const auto& t=c.tensors->lm_head;
+    if(!t.manifest) throw std::invalid_argument("MTP shared output head is missing");
+    mtp_native::tensor(t,{h,v},required_weight_bytes(weight_kind(t.manifest->ggml_type),static_cast<std::uint32_t>(h),v));
+    auto input=mtp_native::buffer(c,HipMtpBuffer::hidden0,mtp_native::product(h,2));
+    auto out=mtp_native::buffer(c,HipMtpBuffer::logits,mtp_native::product(v,4));
+    mtp_native::disjoint({input,out,{t.runtime->address,t.runtime->bytes,t.runtime->allocation_generation}});
+}
+void launch_hip_mtp_lm_head(const MtpNativeContext& c,void* stream) {
+    preflight_hip_mtp_lm_head(c); mtp_native::stream(c,stream);
+    check_hip(hipGetLastError(),"MTP head pending HIP error");
+    auto launch=[&]<WeightKind Kind>() {
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(lm_head_kernel<std::uint16_t,Kind>),
+            dim3(static_cast<std::uint32_t>(c.model->vocab_size)),dim3(kThreads),0,
+            reinterpret_cast<hipStream_t>(stream),
+            reinterpret_cast<const std::uint16_t*>(c.resources->view(HipMtpBuffer::hidden0).address),
+            reinterpret_cast<const void*>(c.tensors->lm_head.runtime->address),
+            static_cast<std::uint32_t>(c.model->hidden_size),
+            static_cast<std::uint32_t>(c.model->vocab_size),
+            reinterpret_cast<float*>(c.resources->view(HipMtpBuffer::logits).address));
+    };
+    switch(weight_kind(c.tensors->lm_head.manifest->ggml_type)) {
+    case WeightKind::f32:launch.template operator()<WeightKind::f32>();break;
+    case WeightKind::f16:launch.template operator()<WeightKind::f16>();break;
+    case WeightKind::bf16:launch.template operator()<WeightKind::bf16>();break;
+    case WeightKind::q8_0:launch.template operator()<WeightKind::q8_0>();break;
+    case WeightKind::iq4_nl:launch.template operator()<WeightKind::iq4_nl>();break;
+    case WeightKind::iq4_xs:launch.template operator()<WeightKind::iq4_xs>();break;
+    }
+    check_hip(hipGetLastError(),"MTP native LM head launch");
+}
 
 }  // namespace strix

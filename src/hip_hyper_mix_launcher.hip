@@ -2,6 +2,7 @@
 #include "strix/hip_lane_chain_hyper_projection_tests.hpp"
 #include "strix/hip_launch_context.hpp"
 #include "strix/hip_hyper_mix_launcher.hpp"
+#include "strix/hip_mtp_projection.hpp"
 #include "strix/hc_projection_prefetch.hpp"
 #include "strix/distributed_stage_resources.hpp"
 #include "strix/lane_chain_hyper_output.hpp"
@@ -2654,3 +2655,77 @@ register_for_compiled_execution(
 }
 
 }  // namespace strix
+
+namespace strix {
+namespace {
+struct MtpHyperPrepared {
+    MtpDeviceView input,output,injection,workspace;
+    MtpTensorView norm,down,up,inject;
+    unsigned h,c,rank;
+};
+void mtp_hyper_range(MtpDeviceView v,std::uint64_t required,unsigned align) {
+    if(!v.address || !v.allocation_generation || v.bytes<required || v.address%align ||
+       v.bytes>std::numeric_limits<std::uintptr_t>::max()-v.address)
+        throw std::invalid_argument("MTP HC device view is invalid");
+}
+bool mtp_hyper_overlap(MtpDeviceView a,MtpDeviceView b){return a.address<b.address+b.bytes && b.address<a.address+a.bytes;}
+MtpDeviceView mtp_hyper_tensor(MtpTensorView t,unsigned type,std::vector<std::uint64_t> dims,std::uint64_t bytes) {
+    if(!t.manifest || !t.runtime || t.manifest->ggml_type!=type || t.manifest->dimensions!=dims ||
+       t.manifest->byte_size!=bytes || !runtime_tensor_gpu_visible(t.runtime->storage))
+        throw std::invalid_argument("MTP HC tensor format or geometry is invalid");
+    MtpDeviceView v{t.runtime->address,t.runtime->bytes,t.runtime->allocation_generation};mtp_hyper_range(v,bytes,16U);return v;
+}
+MtpHyperPrepared mtp_hyper_prepare(const MtpNativeContext& c,MtpHyperRole role) {
+    if(!c.model || !c.plan || !c.tensors || !c.resources ||
+       (role!=MtpHyperRole::attention && role!=MtpHyperRole::mlp && role!=MtpHyperRole::head))
+        throw std::invalid_argument("MTP HC context or role is invalid");
+    c.resources->validate();
+    if(c.model!=&c.resources->model() || c.plan!=&c.resources->plan() || c.tensors!=&c.resources->tensors() ||
+       c.position>=c.resources->context_capacity() || c.model->hidden_size!=2560U || c.model->hc_count!=4U || c.model->hc_lowrank!=320U)
+        throw std::invalid_argument("MTP HC context is not bound to its actual canonical owner");
+    const auto& t=*c.tensors;const auto& owner=*c.resources;
+    MtpHyperPrepared p{};p.h=2560U;p.c=4U;p.rank=320U;
+    if(role==MtpHyperRole::attention){p.input=owner.view(HipMtpBuffer::fused_wide);p.norm=t.attention_hc_norm;p.down=t.attention_hc_down;p.up=t.attention_hc_up;p.inject=t.attention_hc_inject;}
+    else if(role==MtpHyperRole::mlp){p.input=owner.view(HipMtpBuffer::wide_work);p.norm=t.mlp_hc_norm;p.down=t.mlp_hc_down;p.up=t.mlp_hc_up;p.inject=t.mlp_hc_inject;}
+    else {p.input=owner.view(HipMtpBuffer::wide_current);p.norm=t.head_norm;p.down=t.head_down;p.up=t.head_up;}
+    p.output=owner.view(HipMtpBuffer::hidden0);p.workspace=owner.view(HipMtpBuffer::hyper_workspace);
+    if(role!=MtpHyperRole::head)p.injection=owner.view(HipMtpBuffer::injection);
+    const std::uint64_t width=p.h*p.c;
+    const auto norm=mtp_hyper_tensor(p.norm,0U,{width},width*4U);
+    const auto down=mtp_hyper_tensor(p.down,8U,{width,p.rank},width/32U*34U*p.rank);
+    const auto up=mtp_hyper_tensor(p.up,8U,{p.rank,width},p.rank/32U*34U*width);
+    mtp_hyper_range(p.input,width*2U,2U);mtp_hyper_range(p.output,p.h*2U,2U);mtp_hyper_range(p.workspace,(width+p.rank)*4U,4U);
+    std::array<MtpDeviceView,4> weights{norm,down,up,{}};std::size_t count=3;
+    if(role!=MtpHyperRole::head){weights[3]=mtp_hyper_tensor(p.inject,8U,{width,p.c},width/32U*34U*p.c);count=4;mtp_hyper_range(p.injection,p.c*4U,4U);}
+    const std::array writes{p.output,p.workspace,p.injection};
+    for(std::size_t i=0;i<writes.size();++i)if(writes[i].bytes){
+        if(mtp_hyper_overlap(writes[i],p.input))throw std::invalid_argument("MTP HC output aliases input");
+        for(std::size_t j=0;j<count;++j)if(mtp_hyper_overlap(writes[i],weights[j]))throw std::invalid_argument("MTP HC writable view aliases weights");
+        for(std::size_t j=0;j<i;++j)if(writes[j].bytes && mtp_hyper_overlap(writes[i],writes[j]))throw std::invalid_argument("MTP HC writable owners overlap");
+    }
+    return p;
+}
+}
+void preflight_hip_mtp_hyper_mix(const MtpNativeContext& c,MtpHyperRole role){(void)mtp_hyper_prepare(c,role);}
+void launch_hip_mtp_hyper_mix(const MtpNativeContext& c,MtpHyperRole role,void* raw_stream) {
+    const auto p=mtp_hyper_prepare(c,role);
+    if(!raw_stream || raw_stream!=c.resources->stream())throw std::invalid_argument("MTP HC stream differs from retained owner");
+    const auto stream=static_cast<hipStream_t>(raw_stream);hipStreamCaptureStatus capture=hipStreamCaptureStatusNone;
+    check_hip(hipStreamIsCapturing(stream,&capture),"MTP HC capture query");
+    if(capture!=hipStreamCaptureStatusNone)throw std::invalid_argument("MTP HC is eager only");
+    check_hip(hipPeekAtLastError(),"MTP HC prior HIP error");
+    auto* normalized=reinterpret_cast<float*>(p.workspace.address);auto* low=normalized+p.h*p.c;
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(prepare_hyper_norm_kernel<std::uint16_t>),dim3(p.c),dim3(kThreads),0,stream,
+        reinterpret_cast<const std::uint16_t*>(p.input.address),reinterpret_cast<const void*>(p.norm.runtime->address),0U,
+        p.h,p.c,c.model->rms_norm_epsilon,normalized);check_hip(hipGetLastError(),"MTP HC normalization");
+    const unsigned low_blocks=(p.rank+kStagedOutputs-1U)/kStagedOutputs;
+    const bool inject=role!=MtpHyperRole::head;
+    hipLaunchKernelGGL(fused_staged_hyper_projection_kernel,dim3(low_blocks+(inject?1U:0U)),dim3(kStagedThreads),0,stream,
+        normalized,reinterpret_cast<const void*>(p.down.runtime->address),8U,p.h*p.c,p.c,p.rank,low,
+        inject?reinterpret_cast<const void*>(p.inject.runtime->address):nullptr,8U,
+        inject?reinterpret_cast<float*>(p.injection.address):nullptr,low_blocks);check_hip(hipGetLastError(),"MTP HC Q8 down/injection");
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(parallel_hyper_output_kernel<std::uint16_t>),dim3((p.h+255U)/256U),dim3(256U),0,stream,
+        normalized,low,reinterpret_cast<const void*>(p.up.runtime->address),8U,p.h,p.c,p.rank,
+        reinterpret_cast<std::uint16_t*>(p.output.address));check_hip(hipGetLastError(),"MTP HC Q8 output");
+}
+} // namespace strix

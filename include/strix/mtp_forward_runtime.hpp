@@ -22,6 +22,8 @@ struct MtpForwardStepContext {
     std::uint32_t step_index = 0;
     std::uint32_t input_token = 0;
     std::uint64_t target_position = 0;
+    // Attention/cache position belongs to hidden[i], paired with token[i+1].
+    std::uint64_t predictor_position = 0;
     std::uint64_t proposal_identity = 0;
     std::uint64_t plan_identity = 0;
     const MtpDraftRuntimeBinding* binding = nullptr;

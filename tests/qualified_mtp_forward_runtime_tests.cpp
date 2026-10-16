@@ -268,10 +268,11 @@ int main() {
         };
     const auto target =
         make_target();
-    const auto proposal_state =
+    auto proposal_state =
         strix::make_draft_proposal_state(
             binding.compatibility_identity,
             target);
+    strix::begin_draft_proposal(proposal_state,target);
 
     StepBackend steps;
     InputProvider inputs;
@@ -309,6 +310,7 @@ int main() {
             }),
         "successive MTP candidates dispatch at successive absolute seed positions");
 
+    strix::finish_draft_proposal(proposal_state);
     adapter.reconcile_mtp_after_target(
         plan,
         binding,

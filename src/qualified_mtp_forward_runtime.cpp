@@ -43,7 +43,8 @@ validate_plan_binding(
     require_qualified_mtp_draft_plan(
         qualified_plan);
 
-    if (activated_plan_.structural_plan_identity !=
+    if (activated_plan_.native_arithmetic_profile_identity != qualified_plan.native_arithmetic_profile_identity ||
+        activated_plan_.structural_plan_identity !=
             qualified_plan.base.plan_identity ||
         activated_plan_.proposal_identity !=
             qualified_plan.base.proposal_identity ||
@@ -142,6 +143,8 @@ reconcile_mtp_after_target(
         qualified_plan,
         binding);
 
+    validate_mtp_draft_proposal_phase(binding,proposal_state,target_session,
+        DraftProposalStatePhase::reconciliation_required);
     input_provider_->reconcile_after_target(
         qualified_plan,
         activated_plan_,

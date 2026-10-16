@@ -89,6 +89,9 @@ activate_mtp_draft_plan(
     hash_u64(
         hash,
         activated.independent_reference_identity);
+    activated.native_arithmetic_profile_identity=observation.native_arithmetic_profile_identity;
+    if(activated.native_arithmetic_profile_identity)
+        hash_u64(hash,activated.native_arithmetic_profile_identity);
     activated.activation_identity = hash;
     if (activated.activation_identity == 0) {
         throw std::logic_error(

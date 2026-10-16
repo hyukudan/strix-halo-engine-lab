@@ -468,6 +468,17 @@ ModelContentIdentity build_model_content_identity(
     return identity;
 }
 
+SingleModelContentIdentity hash_single_model_content_file(const ModelContentFile& file) {
+    if(file.logical_name.empty()) throw std::invalid_argument("model content logical file name must be non-empty");
+    const auto digest=hash_file_stable(file.path);
+    Sha256 aggregate;aggregate.update("STRIX-MODEL-CONTENT-V1");
+    aggregate.update_u64(static_cast<std::uint64_t>(file.logical_name.size()));
+    aggregate.update(file.logical_name);aggregate.update_u64(digest.bytes);
+    aggregate.update(digest.digest.bytes.data(),digest.digest.bytes.size());
+    const auto identity=aggregate.finalize();
+    if(!identity.valid() || !digest.digest.valid()) throw std::logic_error("model content SHA-256 identity unexpectedly all zero");
+    return {digest.digest,identity,digest.bytes};
+}
 std::string model_content_identity_hex(
     const ModelContentIdentity& identity) {
     constexpr char digits[] =
