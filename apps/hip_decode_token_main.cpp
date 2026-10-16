@@ -37,6 +37,7 @@
 #include "hip_decode_options.hpp"
 #include "strix/q8_projection_organization.hpp"
 #include "strix/q8_projection_manifest.hpp"
+#include "strix/hc_projection_prefetch.hpp"
 #include "hip_deferred_moe_status.hpp"
 #include "hip_decode_receipt_json.hpp"
 #include "execution_inventory_receipt.hpp"
@@ -454,6 +455,7 @@ int main(
             "  --virtual-q8-gdn-output (exact original256-tree Q8 output)\n"
             "  --wave8-q8-gdn-output (eager wave8 output; requires resolved virtual Q8 GDN output)\n"
             "  --wave8-q8-qsa-output (eager all-layer Q8 output organization)\n"
+            "  --prefetch-hc-projection-next-tile (canonical eager typed HC projection overlay)\n"
             "  --lane-chain-hyper-output (requires --prefetch-q8-hyper-output)\n"
             "  --record-raw ABS_NEW_PRIVATE_DIRECTORY --record-max-bytes BYTES\n"
             "  --record-state-policy final|each --prefix-cache-roundtrip\n"
@@ -578,6 +580,7 @@ int main(
         strix::model_content_identity_hex(mapped.content_identity()), has_auto_a8_runtime);
     strix::decode_cli::validate_resolved_prefix_roundtrip(options);
     strix::decode_cli::validate_resolved_q8_projection_organization(options);
+    strix::decode_cli::validate_resolved_hc_projection_next_tile(options);
     if (options.batched_moe_activation && !options.q4k_a8g32_gate_up)
         throw std::invalid_argument("batched MoE activation requires resolved Q4K A8 gate/up execution");
     if (options.moe_shared_overlap && !options.deferred_moe_status)
@@ -683,7 +686,10 @@ int main(
     const std::string lane_chain_mode_receipt=
         std::string("  \"lane_chain_hyper_output\": ") + (options.lane_chain_hyper_output ? "true" : "false") + ",\n" +
         "  \"lane_chain_hyper_output_eligible_steps\": " + std::to_string(lane_chain_steps.size()) + ",\n" +
-        "  \"lane_chain_hyper_output_fallback_steps\": " + std::to_string(options.lane_chain_hyper_output ? lane_chain_total-lane_chain_steps.size() : 0U) + ",\n";
+        "  \"lane_chain_hyper_output_fallback_steps\": " + std::to_string(options.lane_chain_hyper_output ? lane_chain_total-lane_chain_steps.size() : 0U) + ",\n" +
+        (options.prefetch_hc_projection_next_tile ?
+            "  \"prefetch_hc_projection_next_tile\": true,\n"
+            "  \"hc_projection_next_tile_qualification\": \"not_assessed\",\n" : "");
     const auto qsa_prefetch_plan=options.prefetch_q8_qsa_input ? strix::qsa_input_prefetch::build_plan(model,manifest) : strix::qsa_input_prefetch::Plan{};
     std::string qsa_input_mode_receipt="  \"prefetch_q8_qsa_input\": "+std::string(options.prefetch_q8_qsa_input?"true":"false")+",\n";
     if(options.prefetch_q8_qsa_input) qsa_input_mode_receipt+="  \"prefetch_q8_qsa_input_eligible_steps\": "+std::to_string(qsa_prefetch_plan.eligible_steps)+",\n";
@@ -751,6 +757,8 @@ int main(
     catalog_config.fused_staged_hyper_mix = options.fused_staged_hyper_mix;
     catalog_config.typed_hyper_projection = options.typed_hyper_projection;
     catalog_config.prefetch_typed_hyper_rows = options.prefetch_typed_hyper_rows;
+    catalog_config.prefetch_hc_projection_next_tile = options.prefetch_hc_projection_next_tile;
+    binding_request.prefetch_hc_projection_next_tile = options.prefetch_hc_projection_next_tile;
     catalog_config.prefetch_q8_hyper_output = options.prefetch_q8_hyper_output;
     catalog_config.lane_chain_hyper_output=options.lane_chain_hyper_output;
     binding_request.lane_chain_hyper_output=options.lane_chain_hyper_output;
@@ -857,6 +865,8 @@ int main(
         strix::build_serial_execution_tensor_requirements(compiled.execution));
     strix::qsa_input_prefetch::validate_tensor_access(qsa_prefetch_plan,manifest,compiled.execution,tensor_access);
     strix::shared_expert_prefetch::validate_tensor_access(shared_prefetch_plan,manifest,compiled.execution,tensor_access);
+    const auto hc_next_tile_plan = strix::hc_projection_prefetch::build_plan(
+        model, manifest, compiled, tensor_access, options.prefetch_hc_projection_next_tile);
 
     strix::SerialSessionStateLayoutRequest
         state_request;
@@ -926,6 +936,8 @@ int main(
     auto& memory = *memory_owner;
     strix::q8_projection_organization::validate_output_steps(
         q8_organization_plan, model, compiled, tensor_access, memory.scratch(), model_residency.binding());
+    strix::hc_projection_prefetch::validate_runtime(
+        hc_next_tile_plan, model, manifest, compiled, tensor_access, memory.scratch(), model_residency.binding());
 
     strix::initialize_hip_fresh_runtime_memory(
         memory.scratch(),

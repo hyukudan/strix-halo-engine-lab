@@ -8,6 +8,7 @@
 #include "strix/execution_tensor_access.hpp"
 #include "strix/hip_hyper_mix_launcher.hpp"
 #include "strix/hip_launch_context.hpp"
+#include "strix/hip_setup_quiescence.hpp"
 #include "strix/model_contract.hpp"
 #include "strix/model_manifest.hpp"
 #include "strix/model_runtime_binding.hpp"
@@ -581,7 +582,8 @@ template <typename FixtureType = Fixture>
 void run_numeric_fixture(
     strix::SerialOp op,
     bool with_injection, bool bf16 = false, bool enable_prefetch = false,
-    bool enable_output_prefetch = false, bool enable_lane_chain = false, std::uint32_t logical_rows = 1) {
+    bool enable_output_prefetch = false, bool enable_lane_chain = false, std::uint32_t logical_rows = 1,
+    bool enable_next_tile = false) {
     using Fixture = FixtureType;
     auto model =
         strix::ModelContract::
@@ -971,6 +973,94 @@ void run_numeric_fixture(
             "fused hyper-mix injection weights match CPU reference");
     }
 
+    if(enable_next_tile) {
+        strix::HipSetupQuiescenceGuard quiescence;
+        struct OwnedStream {
+            hipStream_t value=nullptr;strix::HipSetupQuiescenceGuard guard;
+            OwnedStream(){guard.run([&]{check(hipStreamCreateWithFlags(&value,hipStreamNonBlocking),"create next-tile fixture stream");});}
+            ~OwnedStream(){guard.recover_or_fail_stop();if(value)static_cast<void>(hipStreamDestroy(value));}
+        } stream;
+        auto baseline=config;baseline.parallel=true;baseline.staged_projections=true;baseline.fused_injection=true;
+        baseline.typed_projection=true;baseline.prefetch_rows=true;baseline.prefetch_q8_output=true;
+        baseline.lane_chain_output=enable_lane_chain;
+        auto candidate_config=baseline;candidate_config.prefetch_hc_projection_next_tile=true;
+        strix::ExecutionBindingRequest baseline_request;baseline_request.lane_chain_hyper_output=enable_lane_chain;
+        auto next_request=baseline_request;next_request.prefetch_hc_projection_next_tile=true;
+        strix::kernels::KernelRegistry baseline_registry,candidate_registry;
+        strix::register_hip_hyper_mix_kernel_variant(model,baseline_request,baseline,baseline_registry);
+        strix::register_hip_hyper_mix_kernel_variant(model,next_request,candidate_config,candidate_registry);
+        const auto old_variant=baseline_registry.variants().front(),new_variant=candidate_registry.variants().front();
+        auto baseline_launcher=strix::make_hip_hyper_mix_launcher(old_variant.id,&baseline);
+        auto candidate=strix::make_hip_hyper_mix_launcher(new_variant.id,&candidate_config);
+        expect(!new_variant.graph_safe && new_variant.id.find(strix::hc_projection_next_tile_suffix)!=std::string::npos &&
+            candidate.implementation_identity!=baseline_launcher.implementation_identity,"next-tile eager identity distinct");
+        expect(new_variant.id.ends_with(strix::lane_chain_hyper_output_suffix)==enable_lane_chain,"next-tile marker preserves C1 terminal selector");
+        const auto read_arena=[&] {
+            std::vector<std::byte> result(static_cast<std::size_t>(arena.total_bytes));
+            check(hipMemcpy(result.data(),arena_pointer,result.size(),hipMemcpyDeviceToHost),"read next-tile complete arena");return result;
+        };
+        // Fixture input is FP32 on the host; convert it to the actual BF16 input.
+        std::vector<std::uint16_t> next_input(fixture.input.size());
+        for(std::size_t i=0;i<next_input.size();++i)next_input[i]=static_cast<std::uint16_t>(
+            (std::bit_cast<std::uint32_t>(fixture.input[i])+0x7fffU+((std::bit_cast<std::uint32_t>(fixture.input[i])>>16U)&1U))>>16U);
+        const auto reset_bf16=[&] {
+            quiescence.run([&]{check(hipMemsetAsync(arena_pointer,0xa5,static_cast<std::size_t>(arena.total_bytes),stream.value),"poison next-tile arena");
+                check(hipMemcpyAsync(reinterpret_cast<void*>(input_address.address),next_input.data(),next_input.size()*2U,hipMemcpyHostToDevice,stream.value),"restore next-tile BF16 input");});
+        };
+        strix::HipLaunchContext scope;scope.stream=stream.value;
+        const auto run_arm=[&](const strix::ExecutionLauncher& arm) {
+            reset_bf16();quiescence.run([&]{strix::HipLaunchScope owned(scope);arm.function(context,arm.user_data);});return read_arena();
+        };
+        const auto original=run_arm(baseline_launcher);
+        for(unsigned replay=0;replay<3;++replay)expect(run_arm(candidate)==original,"next-tile entire arena/output/injection matches incumbent bits");
+        const auto reject=[&](auto mutate,auto restore,const char* message) {
+            reset_bf16();const auto before=read_arena();mutate();bool rejected=false;
+            try {strix::HipLaunchScope owned(scope);candidate.function(context,candidate.user_data);}
+            catch(const std::invalid_argument&) {rejected=true;}
+            quiescence.recover_or_fail_stop();restore();
+            expect(rejected && read_arena()==before,message);
+        };
+        reject([&]{candidate_config.prefetch_rows=false;},[&]{candidate_config.prefetch_rows=true;},"next-tile missing prerequisite rejects before any arena write");
+        reject([&]{context.logical_rows=2;},[&]{context.logical_rows=1;},"next-tile rows2 rejects before any arena write");
+        reject([&]{context.request_concurrency=2;},[&]{context.request_concurrency=1;},"next-tile concurrency2 rejects before any arena write");
+        const auto down_address=runtime.tensors[1].address,down_bytes=runtime.tensors[1].bytes;
+        reject([&]{runtime.tensors[1].address+=2U;},[&]{runtime.tensors[1].address=down_address;},"next-tile misaligned down rejects before normalization");
+        reject([&]{runtime.tensors[1].bytes=down_bytes-1U;},[&]{runtime.tensors[1].bytes=down_bytes;},"next-tile short down rejects before normalization");
+        const auto temp=strix::resolve_dispatch_temporary(context,0);
+        reject([&]{runtime.tensors[1].address=temp.address;},[&]{runtime.tensors[1].address=down_address;},"next-tile down aliases normalized workspace rejection");
+        for(const auto index:{0U,1U,2U}) {
+            const auto generation=runtime.tensors[index].allocation_generation;
+            reject([&]{runtime.tensors[index].allocation_generation=0;},
+                [&]{runtime.tensors[index].allocation_generation=generation;},"next-tile missing weight generation rejects before normalization");
+        }
+        for(const auto index:{0U,2U}) {
+            const auto address=runtime.tensors[index].address;
+            reject([&]{runtime.tensors[index].address+=4U;},[&]{runtime.tensors[index].address=address;},"next-tile misaligned norm/up rejects before normalization");
+            reject([&]{runtime.tensors[index].address=temp.address;},[&]{runtime.tensors[index].address=address;},"next-tile norm/up aliases workspace rejection");
+        }
+        if(with_injection) {
+            const auto inject_address=runtime.tensors[3].address;
+            reject([&]{runtime.tensors[3].address+=4U;},[&]{runtime.tensors[3].address=inject_address;},"next-tile misaligned inject rejects before normalization");
+        }
+        reset_bf16();const auto before_capture=read_arena();hipGraph_t graph=nullptr;bool capture_rejected=false;
+        {
+            strix::HipLaunchScope owned(scope);check(hipStreamBeginCapture(stream.value,hipStreamCaptureModeThreadLocal),"begin rejected next-tile production capture");
+            try {candidate.function(context,candidate.user_data);}catch(const std::invalid_argument&){capture_rejected=true;}
+            check(hipStreamEndCapture(stream.value,&graph),"end rejected next-tile production capture");
+        }
+        std::size_t nodes=0;check(hipGraphGetNodes(graph,nullptr,&nodes),"read rejected next-tile capture nodes");
+        expect(capture_rejected && nodes==0 && read_arena()==before_capture,"next-tile production capture rejects with zero nodes and no writes");
+        check(hipGraphDestroy(graph),"destroy rejected next-tile graph");
+        const std::array<const void*,4> source_weights{gguf_norm.data(),fixture.down.data(),fixture.up.data(),fixture.inject.data()};
+        for(std::size_t index=0;index<device_weights.size();++index) {
+            std::vector<std::byte> retained(static_cast<std::size_t>(runtime.tensors[index].bytes));
+            check(hipMemcpy(retained.data(),device_weights[index],retained.size(),hipMemcpyDeviceToHost),"read retained next-tile weight");
+            expect(std::memcmp(retained.data(),source_weights[index],retained.size())==0,"next-tile borrowed weights remain read-only");
+        }
+        quiescence.recover_or_fail_stop();
+        for(auto* pointer:device_weights)check(hipFree(pointer),"free next-tile integration weight");
+        check(hipFree(arena_pointer),"free next-tile integration arena");return;
+    }
     if(enable_lane_chain){
         auto reference_config=config;reference_config.parallel=true;reference_config.staged_projections=true;reference_config.fused_injection=true;reference_config.typed_projection=true;reference_config.prefetch_rows=true;reference_config.prefetch_q8_output=true;
         auto reference_launcher=strix::make_hip_hyper_mix_launcher("test.output.reference",&reference_config);
@@ -1832,6 +1922,13 @@ void run_prefetch_geometry() {
 }  // namespace
 
 int main(int argc, char** argv) try {
+    if(argc==2 && std::string_view(argv[1])=="next-tile") {
+        for(const auto op:{strix::SerialOp::attn_hyper_mix,strix::SerialOp::mlp_hyper_mix,strix::SerialOp::final_hyper_mix})
+            for(const bool c1:{false,true})
+                run_numeric_fixture<OutputPrefetchFixture<10240,4,320>>(op,op!=strix::SerialOp::final_hyper_mix,true,true,true,c1,1,true);
+        return failures==0?0:1;
+    }
+
     if(argc==2 && std::string_view(argv[1])=="lane-chain"){
         for(const auto op:{strix::SerialOp::attn_hyper_mix,strix::SerialOp::mlp_hyper_mix,strix::SerialOp::final_hyper_mix})for(bool bf16:{false,true}){
             run_numeric_fixture<OutputPrefetchFixture<256,4,32>>(op,op!=strix::SerialOp::final_hyper_mix,bf16,true,true,true,2);

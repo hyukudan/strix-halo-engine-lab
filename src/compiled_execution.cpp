@@ -312,6 +312,12 @@ CompiledSerialExecution compile_serial_execution(
 
     if (binding_request.wave8_q8_lm_head && !binding_request.prefetch_q8_lm_head)
         throw std::invalid_argument("wave8 Q8 LM head requires prefetch organization");
+    if (binding_request.prefetch_hc_projection_next_tile &&
+        (binding_request.device_graph_inputs || binding_request.require_graph_safe ||
+         binding_request.logical_rows != 1 || binding_request.request_concurrency != 1 ||
+         model.hidden_size != 2560 || model.hc_count != 4 || model.hc_lowrank != 320 ||
+         model.bytes_bf16 != 2 || model.bytes_fp32 != 4 || buffer_request.activation_element_bytes != 2))
+        throw std::invalid_argument("HC next-tile prefetch requires canonical eager C1 execution");
     if ((binding_request.prefetch_q8_lm_head || binding_request.wave8_q8_lm_head || binding_request.wave8_q8_gdn_input ||
          binding_request.wave8_q8_gdn_output || binding_request.wave8_q8_qsa_output) &&
         (binding_request.device_graph_inputs || binding_request.require_graph_safe ||
@@ -380,6 +386,19 @@ CompiledSerialExecution compile_serial_execution(
     }
 
     for (const auto& binding : compiled.bindings.bindings) {
+        if (binding.kernel_id) {
+            constexpr std::string_view marker = ".prefetch-next-tile-v1";
+            const auto position = binding.kernel_id->find(marker);
+            const bool hc = binding.op == SerialOp::attn_hyper_mix || binding.op == SerialOp::mlp_hyper_mix ||
+                            binding.op == SerialOp::final_hyper_mix;
+            if ((position != std::string::npos) != (hc && binding_request.prefetch_hc_projection_next_tile))
+                throw std::invalid_argument("bound HC next-tile prefetch differs from request");
+            if (position != std::string::npos) {
+                const std::string_view tail = std::string_view(*binding.kernel_id).substr(position + marker.size());
+                if (!tail.empty() && tail != lane_chain_hyper_output_suffix)
+                    throw std::invalid_argument("bound HC next-tile marker must precede only the terminal lane-chain suffix");
+            }
+        }
         if (binding.op == SerialOp::gated_delta_net && binding.kernel_id &&
             (binding.kernel_id->find(q8_projection_organization::gdn_wave8_marker) != std::string::npos) != binding_request.wave8_q8_gdn_input)
             throw std::invalid_argument("bound GDN wave8 organization differs from request");

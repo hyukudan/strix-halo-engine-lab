@@ -10,6 +10,8 @@
 
 namespace strix {
 
+inline constexpr std::string_view hc_projection_next_tile_suffix = ".prefetch-next-tile-v1";
+
 inline constexpr std::string_view splitk_hc_fp32_numerical_identity =
     "hc-down-splitk16x640-r40-fp32-v1";
 inline constexpr std::string_view splitk_hc_fp64_numerical_identity =
@@ -30,6 +32,8 @@ struct HipHyperMixLauncherConfig {
     // Experimental integration, selected only by a diagnostic host driver.
     bool splitk_projection = false;
     bool splitk_projection_fp64 = false;
+    // Exact current-weight, eager-only raw next-tile projection pipeline.
+    bool prefetch_hc_projection_next_tile = false;
     HipActivationStorage activation =
         HipActivationStorage::bf16;
 };

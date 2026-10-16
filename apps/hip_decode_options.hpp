@@ -118,6 +118,7 @@ struct Options {
     bool prefetch_typed_hyper_rows = false;
     bool prefetch_q8_hyper_output = false;
     bool lane_chain_hyper_output = false;
+    bool prefetch_hc_projection_next_tile = false;
     bool virtual_q8_lm_head = false;
     bool prefetch_q8_lm_head = false;
     bool wave8_q8_lm_head = false;
@@ -188,6 +189,15 @@ inline void validate_resolved_q8_projection_organization(const Options& options)
         throw std::invalid_argument("wave8 Q8 GDN input requires resolved virtual and prefetch Q8 input");
 }
 
+inline void validate_resolved_hc_projection_next_tile(const Options& options) {
+    if (!options.prefetch_hc_projection_next_tile) return;
+    if (!options.parallel_hyper_mix || !options.staged_hyper_projections || !options.fused_staged_hyper_mix ||
+        !options.typed_hyper_projection || !options.prefetch_typed_hyper_rows ||
+        options.execution.mode != strix::DecodeExecutionMode::eager ||
+        options.execution.integer_head != strix::DecodeIntegerHead::none)
+        throw std::invalid_argument("HC next-tile prefetch requires resolved parallel/staged/fused/typed/row-prefetch eager execution");
+}
+
 inline Options parse_options(
     int argc,
     char** argv) {
@@ -216,6 +226,12 @@ inline Options parse_options(
             argv[index];
         options.any_low_level_flag = options.any_low_level_flag ||
             is_low_level_optimization_option(argument);
+        if (argument == "--prefetch-hc-projection-next-tile") {
+            if (options.prefetch_hc_projection_next_tile)
+                throw std::invalid_argument("duplicate HC next-tile prefetch option");
+            options.prefetch_hc_projection_next_tile = true;
+            continue;
+        }
         if (argument == "--prefetch-q8-lm-head" || argument == "--wave8-q8-lm-head" ||
             argument == "--wave8-q8-gdn-input" || argument == "--wave8-q8-gdn-output" ||
             argument == "--wave8-q8-qsa-output") {
@@ -625,6 +641,10 @@ inline Options parse_options(
         (options.execution.mode != strix::DecodeExecutionMode::eager ||
          options.execution.integer_head != strix::DecodeIntegerHead::none))
         throw std::invalid_argument("Q8 projection organizations require eager execution without integer head");
+    if (options.prefetch_hc_projection_next_tile &&
+        (options.execution.mode != strix::DecodeExecutionMode::eager ||
+         options.execution.integer_head != strix::DecodeIntegerHead::none))
+        throw std::invalid_argument("HC next-tile prefetch requires eager execution without integer head");
     if (options.wave8_q8_lm_head && !options.prefetch_q8_lm_head)
         throw std::invalid_argument("wave8 Q8 LM head requires explicit prefetch Q8 LM head");
     if (options.batched_moe_activation && options.execution.mode != strix::DecodeExecutionMode::eager)

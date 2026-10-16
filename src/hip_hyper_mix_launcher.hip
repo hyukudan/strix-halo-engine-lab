@@ -2,6 +2,7 @@
 #include "strix/hip_lane_chain_hyper_projection_tests.hpp"
 #include "strix/hip_launch_context.hpp"
 #include "strix/hip_hyper_mix_launcher.hpp"
+#include "strix/hc_projection_prefetch.hpp"
 #include "strix/lane_chain_hyper_output.hpp"
 #include <set>
 
@@ -100,6 +101,12 @@ const char* storage_name(
 
 void validate_config(
     const HipHyperMixLauncherConfig& config) {
+    if (config.prefetch_hc_projection_next_tile &&
+        (!config.parallel || !config.staged_projections || !config.fused_injection ||
+         !config.typed_projection || !config.prefetch_rows || config.splitk_projection ||
+         config.splitk_projection_fp64 || config.hidden_size != 2560U || config.hc_count != 4U ||
+         config.lowrank != 320U || config.activation != HipActivationStorage::bf16))
+        throw std::invalid_argument("next-tile HC requires canonical BF16 typed prefetched eager projection");
     if (config.splitk_projection_fp64 && !config.splitk_projection)
         throw std::invalid_argument("FP64 HC diagnostic requires split-K projection");
     if (config.splitk_projection && (!config.parallel || !config.staged_projections ||
@@ -1100,6 +1107,149 @@ __global__ void splitk_hyper_finalize_kernel(
     else injection[static_cast<std::uint64_t>(blockIdx.y)*streams+output-rank]=2.0F*sigmoid(scaled);
 }
 
+// Exact C3 V2 current-weight pipeline; all incumbent kernels stay separate.
+template <std::uint32_t Kind> struct NextTileRaw;
+// Keep scale/code in independent 32-bit carriers before the current chain.
+// Actual overlap still requires a fresh G7 ISA audit, never this source comment.
+template <> struct NextTileRaw<8U> { std::uint32_t scale_bits; std::int32_t code; };
+template <> struct NextTileRaw<0U> { float value; };
+
+template <std::uint32_t Kind>
+__device__ __forceinline__ NextTileRaw<Kind> next_tile_load_raw(const void* weights,std::uint32_t width,
+    std::uint32_t output,std::uint32_t feature) {
+    if constexpr(Kind==8U){
+        const auto& block=static_cast<const Q8Block*>(weights)[
+            static_cast<std::uint64_t>(output)*(width/32U)+feature/32U];
+        return {static_cast<std::uint32_t>(__half_as_ushort(block.scale)),
+                static_cast<std::int32_t>(block.values[feature%32U])};
+    }else return {static_cast<const float*>(weights)[
+        static_cast<std::uint64_t>(output)*width+feature]};
+}
+template <std::uint32_t Kind>
+__device__ __forceinline__ float next_tile_decode(NextTileRaw<Kind> raw) {
+    if constexpr(Kind==8U) return __half2float(__ushort_as_half(
+        static_cast<unsigned short>(raw.scale_bits)))*static_cast<float>(raw.code);
+    else return raw.value;
+}
+
+template <std::uint32_t Kind,bool Full,std::uint32_t Threads,std::uint32_t Tile,
+          std::uint32_t Outputs>
+__device__ __forceinline__ void next_tile_prefetch(const float* normalized,const void* weights,
+    std::uint32_t width,std::uint32_t first,std::uint32_t valid,std::uint32_t tile,
+    float (&values)[Tile/Threads],NextTileRaw<Kind> (&raw)[Tile/Threads][Outputs]) {
+    const auto lane=threadIdx.x;
+#pragma unroll
+    for(std::uint32_t column=0;column<Tile/Threads;++column){
+        const auto feature=tile+lane+column*Threads;
+        if(feature<width){
+            values[column]=normalized[static_cast<std::uint64_t>(blockIdx.y)*width+feature];
+#pragma unroll
+            for(std::uint32_t local=0;local<Outputs;++local)
+                raw[column][local]=next_tile_load_raw<Kind>(weights,width,
+                    first+((Full || local<valid)?local:valid-1U),feature);
+        }
+    }
+}
+
+template <std::uint32_t Kind,bool Injection,bool Full,std::uint32_t Threads,
+          std::uint32_t Tile,std::uint32_t Outputs,bool Pipeline>
+__device__ __forceinline__ void next_tile_projection_role(const float* normalized,const void* weights,
+    std::uint32_t width,std::uint32_t streams,std::uint32_t outputs,
+    std::uint32_t role_block,float* output,float* values,float (*coefficients)[Tile+1U]) {
+    static_assert(Threads%32U==0U && Tile%Threads==0U && Tile/Threads<=2U);
+    static_assert(Outputs>=8U && Outputs<=32U && Outputs%4U==0U);
+    const auto lane=threadIdx.x;
+    const auto first=role_block*Outputs;
+    const auto left=outputs-first;
+    const auto valid=left<Outputs?left:Outputs;
+    const bool active=lane<Outputs && (Full || lane<valid);
+    float sum=0.0F;
+    [[maybe_unused]] float pending_values[Tile/Threads];
+    [[maybe_unused]] NextTileRaw<Kind> pending[Tile/Threads][Outputs];
+    if constexpr(Pipeline)
+        next_tile_prefetch<Kind,Full,Threads,Tile,Outputs>(normalized,weights,width,first,valid,0,
+            pending_values,pending);
+    for(std::uint32_t tile=0;tile<width;tile+=Tile){
+        const auto left_features=width-tile;
+        const auto count=left_features<Tile?left_features:Tile;
+        if constexpr(Pipeline){
+#pragma unroll
+            for(std::uint32_t column=0;column<Tile/Threads;++column){
+                const auto feature=lane+column*Threads;
+                if(feature<count){
+                    values[feature]=pending_values[column];
+#pragma unroll
+                    for(std::uint32_t local=0;local<Outputs;++local)
+                        coefficients[local][feature]=next_tile_decode<Kind>(pending[column][local]);
+                }
+            }
+        }else{
+#pragma unroll
+            for(std::uint32_t column=0;column<Tile/Threads;++column){
+                const auto feature=lane+column*Threads;
+                if(feature<count){
+                    const float value=normalized[static_cast<std::uint64_t>(blockIdx.y)*width+tile+feature];
+                    float prefetched[Outputs];
+#pragma unroll
+                    for(std::uint32_t local=0;local<Outputs;++local)
+                        prefetched[local]=typed_projection_weight<Kind>(weights,width,
+                            first+((Full || local<valid)?local:valid-1U),tile+feature);
+                    values[feature]=value;
+#pragma unroll
+                    for(std::uint32_t local=0;local<Outputs;++local)
+                        coefficients[local][feature]=prefetched[local];
+                }
+            }
+        }
+        __syncthreads(); // A: all staged values/coefficients are visible.
+        // Raw next-tile operands are not decoded until the next store phase.
+        // C++ placement is not proof of overlap: G7 requires actual ISA showing
+        // outstanding VMEM across the current chain, without an early vmcnt.
+        if constexpr(Pipeline)
+            if(tile+Tile<width)
+                next_tile_prefetch<Kind,Full,Threads,Tile,Outputs>(normalized,weights,width,first,valid,
+                    tile+Tile,pending_values,pending);
+        if(active)
+            for(std::uint32_t inner=0;inner<count;++inner)
+                sum+=values[inner]*coefficients[lane][inner];
+        __syncthreads(); // B: no producer overwrites LDS before all reads end.
+    }
+    if(active){
+        const float scaled=sum/static_cast<float>(streams);
+        output[static_cast<std::uint64_t>(blockIdx.y)*outputs+first+lane]=
+            Injection?2.0F*sigmoid(scaled):scaled*sigmoid(scaled);
+    }
+}
+
+__global__ __launch_bounds__(128) void next_tile_hyper_projection_kernel(const float* normalized,const void* down,
+    std::uint32_t width,std::uint32_t streams,std::uint32_t rank,float* low,
+    const void* inject,float* injection,std::uint32_t low_blocks) {
+    constexpr std::uint32_t Threads=128U,Tile=128U,Outputs=8U;
+    constexpr bool Pipeline=true;
+    __shared__ float values[Tile];
+    __shared__ float coefficients[Outputs][Tile+1U];
+    // Role selection is block-uniform. Injection retains eight output lanes.
+    if(blockIdx.x<low_blocks){
+        const auto left=rank-blockIdx.x*Outputs;
+        if(left>=Outputs)
+            next_tile_projection_role<8U,false,true,Threads,Tile,Outputs,Pipeline>(
+                normalized,down,width,streams,rank,blockIdx.x,low,values,coefficients);
+        else
+            next_tile_projection_role<8U,false,false,Threads,Tile,Outputs,Pipeline>(
+                normalized,down,width,streams,rank,blockIdx.x,low,values,coefficients);
+    }else{
+        const auto role_block=blockIdx.x-low_blocks;
+        const auto left=streams-role_block*8U;
+        if(left>=8U)
+            next_tile_projection_role<0U,true,true,Threads,Tile,8U,Pipeline>(
+                normalized,inject,width,streams,streams,role_block,injection,values,coefficients);
+        else
+            next_tile_projection_role<0U,true,false,Threads,Tile,8U,Pipeline>(
+                normalized,inject,width,streams,streams,role_block,injection,values,coefficients);
+    }
+}
+
+
 // Diagnostic exact projection prototype. No production launcher selects it.
 // Each active lane owns one entire ascending dot chain; K is never partitioned.
 __device__ __forceinline__ unsigned lane_chain_q8_byte(const uint4* words,unsigned byte){
@@ -1461,6 +1611,13 @@ void launch_typed(
                         };
                         if (config.splitk_projection_fp64) launch.template operator()<double>();
                         else launch.template operator()<float>();
+                    } else if (config.prefetch_hc_projection_next_tile) {
+                        hipLaunchKernelGGL(next_tile_hyper_projection_kernel,
+                            dim3(lowrank_blocks + injection_blocks, context.logical_rows), dim3(128U),
+                            0, hip_execution_stream(), normalized, reinterpret_cast<const void*>(down_runtime.address),
+                            static_cast<std::uint32_t>(width), config.hc_count, config.lowrank, low,
+                            inject_runtime ? reinterpret_cast<const void*>(inject_runtime->address) : nullptr,
+                            injection_output ? reinterpret_cast<float*>(injection_output->address) : nullptr, lowrank_blocks);
                     } else if (config.prefetch_rows) {
                         hipLaunchKernelGGL(batched_typed_hyper_projection_kernel,
                             dim3(lowrank_blocks + injection_blocks, context.logical_rows), dim3(kStagedThreads),
@@ -1626,6 +1783,15 @@ void launch_hyper_mix(
                 user_data);
     validate_config(config);
 
+    if(config.prefetch_hc_projection_next_tile) {
+        if(context.logical_rows!=1U || context.request_concurrency!=1U ||
+           (current_hip_launch_context() && current_hip_launch_context()->graph_capture))
+            throw std::invalid_argument("next-tile HC supports eager R1 C1 only");
+        hipStreamCaptureStatus capture=hipStreamCaptureStatusNone;
+        check_hip(hipStreamIsCapturing(hip_execution_stream(),&capture),"query next-tile HC capture");
+        if(capture!=hipStreamCaptureStatusNone)
+            throw std::invalid_argument("next-tile HC cannot be captured");
+    }
     const auto input =
         resolve_dispatch_read(
             context, 0);
@@ -1836,6 +2002,40 @@ void launch_hyper_mix(
             for(const auto& read:reads)if(overlap(writes[i],read))throw std::invalid_argument("lane-chain HC output read/write owners overlap");
         }
     }
+    if(config.prefetch_hc_projection_next_tile) {
+        const auto temporary=resolve_dispatch_temporary(context,0);
+        if(context.temporaries.size()!=1U || temporary.use.buffer.buffer_class!=ExecutionBufferClass::hyper_workspace ||
+           norm_manifest.dimensions.size()!=1U || norm_manifest.dimensions[0]!=10240U ||
+           down_manifest.dimensions.size()!=2U || down_manifest.dimensions[0]!=10240U || down_manifest.dimensions[1]!=320U || down_manifest.byte_size!=3481600U ||
+           up_manifest.dimensions.size()!=2U || up_manifest.dimensions[0]!=320U || up_manifest.dimensions[1]!=10240U ||
+           (inject_manifest && (inject_manifest->dimensions.size()!=2U || inject_manifest->dimensions[0]!=10240U ||
+                               inject_manifest->dimensions[1]!=4U || inject_manifest->byte_size!=163840U)))
+            throw std::invalid_argument("next-tile HC actual tensor/workspace geometry differs");
+        if(!temporary.address || temporary.address%16U || temporary.bytes<42240U ||
+           temporary.bytes>std::numeric_limits<std::uintptr_t>::max()-temporary.address)
+            throw std::invalid_argument("next-tile HC workspace alignment or extent differs");
+        if(!norm_runtime.allocation_generation || !down_runtime.allocation_generation || !up_runtime.allocation_generation ||
+           (inject_runtime && !inject_runtime->allocation_generation))
+            throw std::invalid_argument("next-tile HC weight generation is missing");
+        using hc_projection_prefetch::View;
+        const View norm_owner{norm_runtime.address,norm_runtime.bytes},up_owner{up_runtime.address,up_runtime.bytes};
+        hc_projection_prefetch::validate_view(norm_owner,norm_required);
+        hc_projection_prefetch::validate_view(up_owner,up_required);
+        const std::array<View,3> mutable_views{{{temporary.address,40960U},
+            {temporary.address+40960U,temporary.bytes-40960U},
+            {injection_output?injection_output->address:0U,injection_output?injection_output->bytes:0U}}};
+        // Validate every active mutable interval before doing overlap arithmetic.
+        for(std::size_t i=0;i<(injection_output?3U:2U);++i)
+            hc_projection_prefetch::validate_view(mutable_views[i],i==0U?40960U:i==1U?1280U:16U);
+        for(std::size_t i=0;i<(injection_output?3U:2U);++i)
+            if(hc_projection_prefetch::overlaps(mutable_views[i],norm_owner) || hc_projection_prefetch::overlaps(mutable_views[i],up_owner))
+                throw std::invalid_argument("next-tile HC projection workspace aliases norm/up weights");
+        hc_projection_prefetch::validate_projection_views(
+            {temporary.address,40960U},{temporary.address+40960U,temporary.bytes-40960U},
+            {down_runtime.address,down_runtime.bytes},
+            inject_runtime?std::optional<View>{{inject_runtime->address,inject_runtime->bytes}}:std::nullopt,
+            injection_output?std::optional<View>{{injection_output->address,injection_output->bytes}}:std::nullopt);
+    }
     switch (config.activation) {
     case HipActivationStorage::bf16:
         launch_typed<
@@ -1904,6 +2104,7 @@ std::string kernel_id(
             request.request_concurrency) + (config.parallel ? ".parallel" : "") +
         (config.staged_projections ? ".staged" : "") + (config.fused_injection ? ".fused-injection-v5" : "") + (config.typed_projection ? ".typed-q8-f32-v1" : "") + (config.prefetch_rows ? ".prefetch-rows8-v2" : "") + (config.prefetch_q8_output ? ".prefetch-q8-output-v1" : "") +
         (config.splitk_projection ? (config.splitk_projection_fp64 ? ".splitk-hc-proj-fp64-oracle-v1" : ".splitk-hc-proj-fp32-v1") : "") +
+        (config.prefetch_hc_projection_next_tile ? hc_projection_next_tile_suffix : "") +
         (config.lane_chain_output ? lane_chain_hyper_output_suffix : "");
 }
 
@@ -1935,6 +2136,7 @@ std::uint64_t implementation_identity(
     if (config.prefetch_q8_output) hash_u64(hash, 0x5052464855500801ULL);
     if (config.splitk_projection) hash_u64(hash, config.splitk_projection_fp64 ? 0x534b484346363401ULL : 0x534b484346333201ULL);
     if(config.lane_chain_output)hash_u64(hash,0x4c414e4548430001ULL);
+    if(config.prefetch_hc_projection_next_tile)hash_u64(hash,0x48434e4558540001ULL);
     return hash;
 }
 
@@ -2095,6 +2297,11 @@ void register_hip_hyper_mix_kernel_variant(
             "unmeasured HIP hyper-mix may only be experimental or oracle-matched");
     }
 
+    if(request.prefetch_hc_projection_next_tile!=config.prefetch_hc_projection_next_tile)
+        throw std::invalid_argument("next-tile HC request/config mismatch");
+    if(config.prefetch_hc_projection_next_tile && (model.hidden_layers!=48U || request.logical_rows!=1U || request.request_concurrency!=1U ||
+        request.device_graph_inputs || request.require_graph_safe))
+        throw std::invalid_argument("next-tile HC registers canonical48-layer eager R1 C1 only");
     if(config.lane_chain_output && !request.lane_chain_hyper_output)
         throw std::invalid_argument("lane-chain HC output requires matching binding opt-in");
     kernels::KernelVariant variant;
@@ -2144,7 +2351,7 @@ void register_hip_hyper_mix_kernel_variant(
     variant.numerics.deterministic = true;
     variant.qualification =
         qualification;
-    variant.graph_safe = true;
+    variant.graph_safe = !config.prefetch_hc_projection_next_tile;
     variant.input_layout =
         "hc-stream-major";
     variant.output_layout =
@@ -2159,6 +2366,7 @@ void register_hip_hyper_mix_kernel_variant(
         config.fused_injection ? "hip-gfx1151-hyper-mix-v5-fused-injection" :
         config.staged_projections ? "hip-gfx1151-hyper-mix-v4-staged" :
         config.parallel ? "hip-gfx1151-hyper-mix-v3-parallel" : "hip-gfx1151-hyper-mix-v2";
+    if(config.prefetch_hc_projection_next_tile)variant.compiler_identity += ":prefetch-next-tile-v1";
     variant.measured_seconds = 0.0;
 
     registry.add(
@@ -2175,6 +2383,11 @@ make_hip_hyper_mix_launcher(
             "HIP hyper-mix launcher requires id and config");
     }
     validate_config(*config);
+    if(config->prefetch_hc_projection_next_tile || kernel_id_value.find(hc_projection_next_tile_suffix)!=std::string::npos) {
+        ExecutionBindingRequest expected;
+        if(kernel_id_value!=kernel_id(expected,*config))
+            throw std::invalid_argument("next-tile HC launcher requires exact eager identity");
+    }
     if(kernel_id_value.ends_with(lane_chain_hyper_output_suffix)!=config->lane_chain_output)
         throw std::invalid_argument("lane-chain HC output launcher identity differs");
     return ExecutionLauncher{
@@ -2311,6 +2524,11 @@ register_for_compiled_execution(
     const CompiledSerialExecution& compiled,
     ExecutionLauncherRegistry& registry,
     const ExecutionRuntimeResources* resources) {
+    if(config_.prefetch_hc_projection_next_tile) {
+        validate_config(config_);
+        if(!resources || compiled.logical_rows!=1U || compiled.request_concurrency!=1U || compiled.device_graph_inputs)
+            throw std::invalid_argument("next-tile HC bundle requires eager R1 C1 resources");
+    }
     if (config_.splitk_projection) {
         if (!resources) throw std::invalid_argument("split-K HC bundle requires whole-model preflight resources");
         preflight_splitk_hyper_projection_model(compiled,*resources,config_);

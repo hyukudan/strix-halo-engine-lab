@@ -33,6 +33,7 @@ struct ExecutionBindingRequest {
     bool batched_moe_activation = false;
     bool grouped_exact_q51_down = false;
     bool lane_chain_hyper_output = false;
+    bool prefetch_hc_projection_next_tile = false;
     std::vector<std::uint32_t> lane_chain_hyper_output_eligible_steps;
     bool deferred_moe_status = false;
     bool prefetch_q8_shared_expert = false;

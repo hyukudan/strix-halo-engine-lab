@@ -39,6 +39,32 @@ int main() {
         return resolve_optimization_profile(options, model, info, manifest,
             validated_model_content_identity, has_a8);
     };
+    expect(!defaults.prefetch_hc_projection_next_tile, "HC next-tile overlay defaults off");
+    auto hc_next = parse({"decoder", "m", "1", "--prefetch-hc-projection-next-tile"});
+    expect(!hc_next.any_low_level_flag && resolve(hc_next, true).automatic_applied,
+        "HC next-tile overlays auto without disabling its prerequisites");
+    validate_resolved_hc_projection_next_tile(hc_next);
+    for (auto member : {&Options::parallel_hyper_mix, &Options::staged_hyper_projections,
+                        &Options::fused_staged_hyper_mix, &Options::typed_hyper_projection,
+                        &Options::prefetch_typed_hyper_rows}) {
+        auto missing = hc_next; missing.*member = false;
+        rejects([&] { validate_resolved_hc_projection_next_tile(missing); },
+            "HC next-tile rejects each unresolved prerequisite");
+    }
+    auto hc_fallback = parse({"decoder", "m", "1", "--prefetch-hc-projection-next-tile"});
+    expect(resolve(hc_fallback, false).reason == "a8-runtime-not-built", "HC next-tile preserves automatic fallback reason");
+    rejects([&] { validate_resolved_hc_projection_next_tile(hc_fallback); }, "fallback cannot invent HC prerequisites");
+    auto hc_manual_missing = parse({"decoder", "m", "1", "--optimization-profile", "manual", "--prefetch-hc-projection-next-tile"});
+    (void)resolve(hc_manual_missing, false);
+    rejects([&] { validate_resolved_hc_projection_next_tile(hc_manual_missing); }, "manual HC overlay needs explicit prerequisites");
+    auto hc_manual = parse({"decoder", "m", "1", "--optimization-profile", "manual",
+        "--parallel-hyper-mix", "--staged-hyper-projections", "--fused-staged-hyper-mix",
+        "--typed-fused-hyper-projections", "--prefetch-typed-hyper-rows", "--prefetch-hc-projection-next-tile"});
+    expect(!resolve(hc_manual, false).automatic_applied, "manual HC overlay preserves manual mode");
+    validate_resolved_hc_projection_next_tile(hc_manual);
+    rejects([] { (void)parse({"decoder", "m", "1", "--prefetch-hc-projection-next-tile", "--prefetch-hc-projection-next-tile"}); }, "duplicate HC overlay rejects");
+    rejects([] { (void)parse({"decoder", "m", "1", "--prefetch-hc-projection-next-tile", "--execution-mode", "graph"}); }, "HC overlay rejects graph before model IO");
+    rejects([] { (void)parse({"decoder", "m", "1", "--prefetch-hc-projection-next-tile", "--integer-lm-head", "a8-iu8"}); }, "HC overlay rejects integer head before model IO");
     for (const bool wave8 : {false, true}) {
         auto candidate = wave8 ? parse({"decoder", "m", "1", "--prefetch-q8-lm-head", "--wave8-q8-lm-head", "--wave8-q8-gdn-input"})
             : parse({"decoder", "m", "1", "--prefetch-q8-lm-head"});

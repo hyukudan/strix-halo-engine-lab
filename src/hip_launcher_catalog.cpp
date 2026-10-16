@@ -108,7 +108,7 @@ HipHyperMixLauncherConfig
 hyper_mix_config(
     const ModelContract& model,
     HipActivationStorage activation, bool parallel, bool staged, bool fused, bool typed, bool prefetch_rows, bool prefetch_output, bool lane_chain,
-    bool splitk, bool splitk_fp64) {
+    bool splitk, bool splitk_fp64, bool next_tile) {
     HipHyperMixLauncherConfig config;
     config.hidden_size =
         checked_u32(
@@ -136,6 +136,7 @@ hyper_mix_config(
     config.lane_chain_output = lane_chain;
     config.splitk_projection = splitk;
     config.splitk_projection_fp64 = splitk_fp64;
+    config.prefetch_hc_projection_next_tile = next_tile;
     return config;
 }
 
@@ -285,6 +286,18 @@ void register_complete_hip_kernel_catalog(
         throw std::invalid_argument("HIP catalog ranked router mode differs from binding request");
     if(config.lane_chain_hyper_output!=request.lane_chain_hyper_output)
         throw std::invalid_argument("HIP catalog lane-chain HC output differs from binding request");
+    if (config.prefetch_hc_projection_next_tile != request.prefetch_hc_projection_next_tile)
+        throw std::invalid_argument("HIP catalog HC next-tile prefetch differs from binding request");
+    if (config.prefetch_hc_projection_next_tile &&
+        (!config.parallel_hyper_mix || !config.staged_hyper_projections || !config.fused_staged_hyper_mix ||
+         !config.typed_hyper_projection || !config.prefetch_typed_hyper_rows ||
+         config.splitk_hyper_projection || config.splitk_hyper_projection_fp64 ||
+         config.activation != HipActivationStorage::bf16 || model.hidden_size != 2560 ||
+         model.hc_count != 4 || model.hc_lowrank != 320 ||
+         model.bytes_bf16 != 2 || model.bytes_fp32 != 4 ||
+         config.enable_device_graph_inputs || request.device_graph_inputs || request.require_graph_safe ||
+         request.logical_rows != 1 || request.request_concurrency != 1))
+        throw std::invalid_argument("HIP catalog HC next-tile prefetch requires canonical typed staged eager C1 execution");
     if (config.deferred_moe_status != request.deferred_moe_status ||
         (config.deferred_moe_status && (config.enable_device_graph_inputs || request.require_graph_safe)))
         throw std::invalid_argument("HIP catalog deferred MoE mode differs from eager request");
@@ -376,7 +389,7 @@ void register_complete_hip_kernel_catalog(
         hyper_mix_config(
             model,
             config.activation, config.parallel_hyper_mix, config.staged_hyper_projections, config.fused_staged_hyper_mix, config.typed_hyper_projection, config.prefetch_typed_hyper_rows, config.prefetch_q8_hyper_output, config.lane_chain_hyper_output,
-            config.splitk_hyper_projection, config.splitk_hyper_projection_fp64);
+            config.splitk_hyper_projection, config.splitk_hyper_projection_fp64, config.prefetch_hc_projection_next_tile);
     register_hip_hyper_mix_kernel_variant(
         model,
         request,
@@ -461,7 +474,7 @@ HipLauncherCatalog::HipLauncherCatalog(
           hyper_mix_config(
               model,
               config.activation, config.parallel_hyper_mix, config.staged_hyper_projections, config.fused_staged_hyper_mix, config.typed_hyper_projection, config.prefetch_typed_hyper_rows, config.prefetch_q8_hyper_output, config.lane_chain_hyper_output,
-              config.splitk_hyper_projection, config.splitk_hyper_projection_fp64)),
+              config.splitk_hyper_projection, config.splitk_hyper_projection_fp64, config.prefetch_hc_projection_next_tile)),
       moe_route_(
           moe_route_config(
               model,
