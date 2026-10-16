@@ -122,7 +122,7 @@ IEEE denormals; prior native profile goldens cannot qualify this profile.
 Still required after source integration is complete: compile/object preservation
 and new-instantiation checks; component and full checkpoint replay, including
 rejection, continuation, EOS/budget and native failure paths; native measurements;
-and the final requested external review. Closed-window capture, whole-chunk
+and review of resulting code corrections. Closed-window capture, whole-chunk
 promotion and rejection/replay are implemented in source and still require their
 native independent fixtures. No current speed, acceptance rate, native correctness or readiness
 claim is made by the source receipt.
