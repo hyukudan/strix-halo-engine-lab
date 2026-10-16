@@ -293,7 +293,7 @@ void register_complete_hip_kernel_catalog(
          !config.typed_hyper_projection || !config.prefetch_typed_hyper_rows ||
          config.splitk_hyper_projection || config.splitk_hyper_projection_fp64 ||
          config.activation != HipActivationStorage::bf16 || model.hidden_size != 2560 ||
-         model.hc_count != 4 || model.hc_lowrank != 320 ||
+         model.hc_count != 4 || model.hc_lowrank != 320 || model.hidden_layers != 48 ||
          model.bytes_bf16 != 2 || model.bytes_fp32 != 4 ||
          config.enable_device_graph_inputs || request.device_graph_inputs || request.require_graph_safe ||
          request.logical_rows != 1 || request.request_concurrency != 1))

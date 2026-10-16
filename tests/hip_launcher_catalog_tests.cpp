@@ -596,6 +596,12 @@ int main() {
             must_reject([&]{strix::kernels::KernelRegistry bad;strix::register_complete_hip_kernel_catalog(invalid_model,next_request,next_config,bad);},
                 "next-tile catalog rejects noncanonical model geometry");
         }
+        auto fewer_layers=model;fewer_layers.hidden_layers=44;fewer_layers.gdn_layers=33;fewer_layers.full_attention_layers=11;
+        expect(fewer_layers.validate().empty(),"HC layer-count negative uses a valid44-layer model");
+        must_reject([&]{strix::kernels::KernelRegistry bad;strix::register_complete_hip_kernel_catalog(fewer_layers,next_request,next_config,bad);},
+            "next-tile catalog requires all48 layers rather than a reduced valid model");
+        must_reject([&]{(void)strix::compile_serial_execution(fewer_layers,next_registry,next_request,hc_buffers);},
+            "compiled next-tile admission requires full97-mixer model");
         for(unsigned invalid_mode=0;invalid_mode<4;++invalid_mode) {
             auto invalid=next_request;
             if(invalid_mode==0)invalid.require_graph_safe=true;

@@ -315,7 +315,7 @@ CompiledSerialExecution compile_serial_execution(
     if (binding_request.prefetch_hc_projection_next_tile &&
         (binding_request.device_graph_inputs || binding_request.require_graph_safe ||
          binding_request.logical_rows != 1 || binding_request.request_concurrency != 1 ||
-         model.hidden_size != 2560 || model.hc_count != 4 || model.hc_lowrank != 320 ||
+         model.hidden_size != 2560 || model.hc_count != 4 || model.hc_lowrank != 320 || model.hidden_layers != 48 ||
          model.bytes_bf16 != 2 || model.bytes_fp32 != 4 || buffer_request.activation_element_bytes != 2))
         throw std::invalid_argument("HC next-tile prefetch requires canonical eager C1 execution");
     if ((binding_request.prefetch_q8_lm_head || binding_request.wave8_q8_lm_head || binding_request.wave8_q8_gdn_input ||
