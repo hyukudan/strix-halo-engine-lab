@@ -407,7 +407,7 @@ private:
 class KnownPromptMemory final {
 public:
     KnownPromptMemory(const strix::CompiledKnownPrefixWindow& plan, std::uint64_t arena_generation,
-        std::uint64_t status_generation, std::uint64_t context, std::uint32_t vocabulary,
+        std::uint64_t status_generation,
         std::shared_ptr<const void> retained, std::shared_ptr<const strix::HipSetupQuiescenceGuard> guard)
         : retained_(std::move(retained)), guard_(std::move(guard)) {
         if (!retained_ || !guard_) throw std::invalid_argument("known prompt requires retained original resources");
@@ -423,7 +423,8 @@ public:
                 check_hip(hipMemsetAsync(arena_, 0, static_cast<std::size_t>(scratch.arena_bytes), scope.stream), "initialize known-prompt arena");
                 check_hip(hipMemsetAsync(status_, 0, 8, scope.stream), "initialize known-prompt completion record");
             });
-            scope.context_tokens = context; scope.vocabulary_size = vocabulary;
+            // Eager window scope carries only its owned stream and D1 record.
+            // Context capacity and vocabulary belong to the retained model/state.
             scope.deferred_moe_status = {plan.window_execution_identity,
                 reinterpret_cast<std::uintptr_t>(status_), 8, status_generation};
         } catch (...) { release(); throw; }
@@ -1746,7 +1747,7 @@ int main(
             const auto arena_generation = generations.next();
             const auto status_generation = generations.next();
             known_prefix_memory = std::make_shared<KnownPromptMemory>(*known_prefix_plan, arena_generation,
-                status_generation, options.context_tokens, static_cast<std::uint32_t>(model.vocab_size),
+                status_generation,
                 std::static_pointer_cast<const void>(experiment_owner), original_work_device);
             known_prefix_owner = std::make_shared<strix::HipKnownPrefixWindow>(*known_prefix_plan, compiled, model,
                 catalog_config, resources, known_prefix_memory->scratch, known_prefix_memory->scope,
