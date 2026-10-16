@@ -1,0 +1,87 @@
+#pragma once
+
+#include "strix/serial_request.hpp"
+
+#include <cstdint>
+#include <optional>
+#include <span>
+#include <vector>
+
+namespace strix {
+
+struct KnownPromptChunkRequest {
+    // Borrowed immutable known inputs, including any literal interior EOS.
+    // Both backends must retain and use the same actual target session/owners.
+    std::span<const std::uint32_t> prompt_tokens;
+    std::uint64_t start_position = 0;
+    std::uint64_t vocab_size = 0;
+    std::uint64_t context_capacity = 0;
+    std::uint64_t max_new_tokens = 0;
+    std::uint32_t eos_token_id = 0;
+};
+struct KnownPromptChunkProgress {
+    std::uint64_t next_position = 0;
+    std::uint64_t consumed_prompt_tokens = 0;
+    std::uint64_t consumed_generation_tokens = 0;
+    std::uint64_t windows_executed = 0;
+    std::uint64_t serial_tail_steps = 0;
+    std::uint64_t emitted_tokens = 0;
+    // Last token actually emitted by generation, never consumed as an input.
+    // A merely computed prompt-frontier selection is not an emitted bonus.
+    std::optional<std::uint32_t> bonus_pending;
+    bool prefill_complete = false;
+    bool generation_complete = false;
+    bool cancelled = false;
+    bool failed = false;
+};
+struct KnownPromptChunkFrontier {
+    // False before any completed chunk and after an opaque backend failure.
+    bool valid = false;
+    std::uint64_t state_position = 0;
+    std::optional<std::uint64_t> last_input_position;
+    // Retained across pauses. Borrowed until the next mutating cursor call.
+    // Empty after generation consumed new inputs: the old prompt logits are
+    // deliberately not relabelled as the new target frontier.
+    std::span<const float> logits;
+    std::optional<std::uint32_t> unconsumed_selection;
+    bool selection_emitted = false;
+};
+
+// Incremental known-input prefill, using only the existing canonical R2 owner
+// and a final odd R1 row. An advance is exactly one complete chunk; yielding
+// between calls pauses without recomputing a prompt or discarding its logits.
+// No R4/R8 matrix execution, new arithmetic or kernel IDs are implied.
+//
+// Backends are borrowed for the entire cursor lifetime. The caller retains all
+// backend/session/resource owners and serializes access. Their methods must
+// fence/validate completed work and contain errors before returning. cancel()
+// is sticky, is called only between chunks and does not destroy those owners.
+// On a backend error the cursor cannot resume; its counters describe only
+// completed calls, not rollback of an opaque possibly poisoned target.
+class KnownPromptChunkCursor final {
+public:
+    KnownPromptChunkCursor(KnownPromptChunkRequest request,
+        KnownPromptWindowBackend& windows, SerialGreedyStepBackend& serial);
+    KnownPromptChunkCursor(const KnownPromptChunkCursor&) = delete;
+    KnownPromptChunkCursor& operator=(const KnownPromptChunkCursor&) = delete;
+    // True iff one canonical pair/tail completed. False after prefill/cancel.
+    [[nodiscard]] bool advance();
+    void cancel() noexcept;
+    // Explicit one-shot generation after complete prefill. Delegates the
+    // existing greedy continuation's EOS/budget/capacity/bonus policy unchanged.
+    // No cancellation is observed inside that existing synchronous call.
+    [[nodiscard]] const SerialGreedyRequestResult& finish_greedy();
+    [[nodiscard]] const KnownPromptChunkProgress& progress() const noexcept { return progress_; }
+    [[nodiscard]] KnownPromptChunkFrontier frontier() const noexcept;
+    [[nodiscard]] const std::optional<SerialGreedyRequestResult>& generation() const noexcept { return generation_; }
+private:
+    KnownPromptChunkRequest request_;
+    KnownPromptWindowBackend& windows_;
+    SerialGreedyStepBackend& serial_;
+    KnownPromptChunkProgress progress_;
+    std::vector<float> logits_;
+    std::optional<std::uint32_t> selection_;
+    std::optional<SerialGreedyRequestResult> generation_;
+    bool has_logits_ = false;
+};
+} // namespace strix
