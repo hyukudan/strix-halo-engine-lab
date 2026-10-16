@@ -63,11 +63,12 @@ std::uint64_t boundary_identity(
 
 }  // namespace
 
-DistributedPlacementPlan build_distributed_placement_plan(
+static DistributedPlacementPlan build_distributed_placement_plan_impl(
     const CompiledSerialExecution& compiled,
     const ModelManifest& manifest,
     const ExecutionTensorAccessPlan& tensor_access,
-    std::uint32_t local_node) {
+    std::uint32_t local_node, std::span<const std::uint32_t> compute_nodes,
+    bool explicit_compute) {
     if (compiled.execution_identity == 0 ||
         manifest.layout_identity == 0 ||
         tensor_access.plan_identity == 0 ||
@@ -79,6 +80,25 @@ DistributedPlacementPlan build_distributed_placement_plan(
             "distributed placement requires compatible compiled execution and tensor plan");
     }
 
+    if(explicit_compute) {
+        if(local_node>1U || compute_nodes.size()!=compiled.execution.steps.size() || compute_nodes.empty() ||
+            std::any_of(compute_nodes.begin(),compute_nodes.end(),[](auto node){return node>1U;}))
+            throw std::invalid_argument("explicit compute placement requires one node0/1 per serial step");
+        validate_serial_execution_io_plan(compiled.execution,compiled.io);
+        if(!compiled.arena.alignment || !compiled.arena.total_bytes)
+            throw std::invalid_argument("explicit compute placement requires a bounded serial arena");
+        for(std::size_t i=0;i<compiled.execution.steps.size();++i) {
+            if(compiled.execution.steps[i].id!=i)
+                throw std::invalid_argument("explicit compute placement requires dense serial IDs");
+            for(const auto* uses:{&compiled.io.steps[i].reads,&compiled.io.steps[i].writes,&compiled.io.steps[i].temporaries})
+                for(const auto use:*uses) {
+                    const auto* a=find_arena_allocation(compiled.arena,use);
+                    if(!a || !a->bytes || a->offset%compiled.arena.alignment ||
+                        checked_add(a->offset,a->bytes)>compiled.arena.total_bytes)
+                        throw std::invalid_argument("explicit compute placement IO has no bounded arena payload");
+                }
+        }
+    }
     DistributedPlacementPlan plan;
     plan.local_node = local_node;
     plan.compiled_execution_identity =
@@ -104,6 +124,8 @@ DistributedPlacementPlan build_distributed_placement_plan(
         placement.op = step.op;
         placement.node = local_node;
 
+        if(explicit_compute) placement.node=compute_nodes[index];
+        else {
         std::optional<std::uint32_t>
             declared_node;
         bool conflict = false;
@@ -173,6 +195,7 @@ DistributedPlacementPlan build_distributed_placement_plan(
             }
         }
 
+        }
         placement.remote =
             placement.node !=
             local_node;
@@ -349,6 +372,47 @@ DistributedPlacementPlan build_distributed_placement_plan(
             hash,
             boundary.boundary_id);
     }
+    if(explicit_compute) {
+        hash_u64(hash,0x535445504e4f4431ULL); // Explicit compute placement v1.
+        hash_u64(hash,compiled.kernel_plan_identity);hash_u64(hash,compiled.logical_rows);
+        hash_u64(hash,compiled.request_concurrency);hash_u64(hash,compiled.vocab_size);
+        hash_u64(hash,compiled.max_position_embeddings);hash_u64(hash,compiled.device_graph_inputs);
+        for(const auto& step:compiled.execution.steps) {
+            hash_u64(hash,step.id);hash_u64(hash,static_cast<std::uint64_t>(step.op));
+            hash_u64(hash,step.layer.has_value());if(step.layer) hash_u64(hash,*step.layer);
+            hash_u64(hash,static_cast<std::uint64_t>(step.reads_state));
+            hash_u64(hash,static_cast<std::uint64_t>(step.writes_state));
+            hash_u64(hash,step.graph_safe_candidate);hash_u64(hash,step.dynamic_shape);
+            hash_u64(hash,step.dependencies.size());for(const auto dependency:step.dependencies) hash_u64(hash,dependency);
+        }
+        hash_u64(hash,compiled.bindings.bindings.size());
+        for(const auto& binding:compiled.bindings.bindings) {
+            hash_u64(hash,binding.step_id);hash_u64(hash,static_cast<std::uint64_t>(binding.op));
+            hash_u64(hash,binding.host_or_runtime_step);hash_u64(hash,binding.family.has_value());
+            if(binding.family) hash_u64(hash,static_cast<std::uint64_t>(*binding.family));
+            hash_u64(hash,binding.kernel_id.has_value());
+            if(binding.kernel_id) {
+                hash_u64(hash,binding.kernel_id->size());
+                for(const char value:*binding.kernel_id) hash_u64(hash,static_cast<unsigned char>(value));
+            }
+        }
+        hash_u64(hash,compiled.arena.alignment);hash_u64(hash,compiled.arena.total_bytes);
+        hash_u64(hash,compiled.arena.allocations.size());
+        const auto use_hash=[&](ExecutionBufferUse use) {
+            hash_u64(hash,static_cast<std::uint64_t>(use.buffer.buffer_class));
+            hash_u64(hash,use.buffer.slot);hash_u64(hash,use.generation);
+        };
+        for(const auto& a:compiled.arena.allocations) {
+            use_hash(a.use);hash_u64(hash,a.offset);hash_u64(hash,a.bytes);
+            hash_u64(hash,a.first_step);hash_u64(hash,a.last_step);
+        }
+        for(const auto& io:compiled.io.steps) {
+            hash_u64(hash,io.step_id);hash_u64(hash,static_cast<std::uint64_t>(io.op));
+            for(const auto* uses:{&io.reads,&io.writes,&io.temporaries}) {
+                hash_u64(hash,uses->size());for(const auto use:*uses) use_hash(use);
+            }
+        }
+    }
     plan.plan_identity =
         hash;
     if (plan.plan_identity == 0) {
@@ -356,6 +420,17 @@ DistributedPlacementPlan build_distributed_placement_plan(
             "distributed placement plan identity must be non-zero");
     }
     return plan;
+}
+
+DistributedPlacementPlan build_distributed_placement_plan(
+    const CompiledSerialExecution& compiled,const ModelManifest& manifest,
+    const ExecutionTensorAccessPlan& access,std::uint32_t local_node) {
+    return build_distributed_placement_plan_impl(compiled,manifest,access,local_node,{},false);
+}
+DistributedPlacementPlan build_distributed_placement_plan(
+    const CompiledSerialExecution& compiled,const ModelManifest& manifest,
+    const ExecutionTensorAccessPlan& access,std::span<const std::uint32_t> nodes,std::uint32_t local_node) {
+    return build_distributed_placement_plan_impl(compiled,manifest,access,local_node,nodes,true);
 }
 
 DistributedExecutionDecision

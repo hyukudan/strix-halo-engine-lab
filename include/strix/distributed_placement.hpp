@@ -51,6 +51,14 @@ struct DistributedPlacementPlan {
     const ExecutionTensorAccessPlan& tensor_access,
     std::uint32_t local_node = 0);
 
+// Explicit compute placement, independent of immutable local weight copies.
+// The initial native stage component closes nodes to0/1 and requires one node
+// per dense serial step. Boundaries and identity are derived, never supplied.
+[[nodiscard]] DistributedPlacementPlan build_distributed_placement_plan(
+    const CompiledSerialExecution& compiled, const ModelManifest& manifest,
+    const ExecutionTensorAccessPlan& tensor_access,
+    std::span<const std::uint32_t> compute_nodes, std::uint32_t local_node = 0);
+
 enum class DistributedExecutionMode : std::uint8_t {
     local_only,
     distributed,

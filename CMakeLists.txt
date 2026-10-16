@@ -1213,6 +1213,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         src/hip_known_prompt_backend.cpp
         src/hip_prompt_lookup_runtime.hip
         src/hip_serving_greedy_backend.hip
+        src/hip_distributed_stage.hip
         src/hip_hyper_mix_launcher.hip
         src/hip_indexed_attention_launcher.hip
         src/hip_qsa_selection_diagnostic.hip
@@ -1642,6 +1643,16 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         # Explicit known-prompt/cache/continuation qualification; requires the
         # real model and ROOT-sealed inputs, so it is not an automatic CTest.
         # Explicit model-dependent serving qualification; never automatic CTest.
+        # Explicit local native stage component with a real model. This does
+        # not run transport or qualify a distributed model; never automatic CTest.
+        add_executable(strix-hip-distributed-stage-model-qualification tests/hip_distributed_stage_tests.hip)
+        set_target_properties(strix-hip-distributed-stage-model-qualification PROPERTIES
+            HIP_ARCHITECTURES gfx1151 HIP_STANDARD 20 HIP_STANDARD_REQUIRED YES)
+        target_compile_options(strix-hip-distributed-stage-model-qualification PRIVATE
+            -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
+        target_link_libraries(strix-hip-distributed-stage-model-qualification PRIVATE strix_hip_runtime)
+        strix_target_warnings(strix-hip-distributed-stage-model-qualification)
+
         add_executable(strix-hip-serving-greedy-model-qualification tests/hip_serving_greedy_backend_tests.hip)
         set_target_properties(strix-hip-serving-greedy-model-qualification PROPERTIES
             HIP_ARCHITECTURES gfx1151 HIP_STANDARD 20 HIP_STANDARD_REQUIRED YES)
