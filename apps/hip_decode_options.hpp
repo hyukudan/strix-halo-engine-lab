@@ -2,6 +2,7 @@
 #include "strix/decode_execution_options.hpp"
 #include "strix/gdn_recurrent_layout.hpp"
 #include "strix/gdn_recurrent_storage.hpp"
+#include "strix/known_window_output_policy.hpp"
 #include "strix/hip_model_residency.hpp"
 #include "strix/raw_baseline_recording.hpp"
 #include "strix/final_generation_state_export.hpp"
@@ -179,7 +180,36 @@ struct Options {
     std::vector<std::uint32_t> logprob_token_ids;
     bool known_prefix_expert_union = false;
     std::string offline_tuning_cache_path;
+    strix::KnownWindowOutputPolicy known_prefix_output_policy = strix::KnownWindowOutputPolicy::all_rows;
+    bool known_prefix_output_policy_explicit = false;
+    std::uint64_t serving_cache_entries = 0, serving_cache_snapshot_bytes = 0;
+    std::uint64_t serving_cache_capture_peak_bytes = 0, serving_cache_max_prefix_tokens = 0;
+    bool serving_cache_entries_explicit = false, serving_cache_snapshot_explicit = false;
+    bool serving_cache_peak_explicit = false, serving_cache_tokens_explicit = false;
 };
+
+// The wrapper can omit a terminal stateless head without allocating a GPU
+// selector. Only the explicit known-prefix state-only route needs that seam
+// independently of token-output mode; all other CPU/RAW routes stay unchanged.
+[[nodiscard]] inline bool needs_generation_output_dispatcher(const Options& options) noexcept {
+    return options.gpu_greedy_token || (options.known_prefix_window &&
+        options.known_prefix_output_policy == strix::KnownWindowOutputPolicy::state_only);
+}
+
+inline void validate_serving_prefix_cache_limits(const Options& options) {
+    const bool any_serving_cache_limit = options.serving_cache_entries_explicit || options.serving_cache_snapshot_explicit ||
+        options.serving_cache_peak_explicit || options.serving_cache_tokens_explicit ||
+        options.serving_cache_entries || options.serving_cache_snapshot_bytes ||
+        options.serving_cache_capture_peak_bytes || options.serving_cache_max_prefix_tokens;
+    if (any_serving_cache_limit && (options.serving_prefix_files.empty() ||
+        !options.serving_cache_entries_explicit || !options.serving_cache_snapshot_explicit ||
+        !options.serving_cache_peak_explicit || !options.serving_cache_tokens_explicit ||
+        !options.serving_cache_entries || !options.serving_cache_snapshot_bytes ||
+        !options.serving_cache_capture_peak_bytes || !options.serving_cache_max_prefix_tokens ||
+        options.serving_cache_entries > std::numeric_limits<std::size_t>::max() ||
+        options.serving_cache_max_prefix_tokens > options.context_tokens))
+        throw std::invalid_argument("serving prefix cache requires serving files and all four positive explicit bounded limits");
+}
 
 inline bool is_low_level_optimization_option(std::string_view argument) {
     for (const std::string_view option : {
@@ -260,6 +290,10 @@ inline void validate_resolved_requested_logprobs(const Options& options, std::ui
 }
 
 inline void validate_resolved_known_prefix_window(const Options& options) {
+    strix::validate_known_window_output_policy(options.known_prefix_output_policy);
+    if (!options.known_prefix_window && (options.known_prefix_output_policy_explicit ||
+        options.known_prefix_output_policy != strix::KnownWindowOutputPolicy::all_rows))
+        throw std::invalid_argument("known-prefix output policy requires --known-prefix-window");
     if (options.known_prefix_rows != 2 && options.known_prefix_rows != 4 && options.known_prefix_rows != 8)
         throw std::invalid_argument("known-prefix rows must be 2, 4 or 8");
     if (!options.known_prefix_window) {
@@ -287,6 +321,7 @@ inline void validate_resolved_known_prefix_window(const Options& options) {
 }
 
 inline void validate_resolved_serving(const Options& options) {
+    validate_serving_prefix_cache_limits(options);
     if (options.serving_prefix_files.empty()) return;
     if (!options.generate_tokens || !options.tokens.empty() || !options.deferred_moe_status ||
         options.execution.mode != strix::DecodeExecutionMode::eager ||
@@ -418,6 +453,23 @@ inline Options parse_options(
             options.serving_prefix_files.emplace_back(argv[++index]);
             continue;
         }
+        if (argument == "--serve-prefix-cache-entries" || argument == "--serve-prefix-cache-snapshot-bytes" ||
+            argument == "--serve-prefix-cache-capture-peak-bytes" || argument == "--serve-prefix-cache-max-tokens") {
+            if (index + 1 >= argc) throw std::invalid_argument("serving prefix cache option requires a value");
+            const auto value = parse_u64(argv[++index], "serving prefix cache");
+            bool* supplied = argument == "--serve-prefix-cache-entries" ? &options.serving_cache_entries_explicit :
+                argument == "--serve-prefix-cache-snapshot-bytes" ? &options.serving_cache_snapshot_explicit :
+                argument == "--serve-prefix-cache-capture-peak-bytes" ? &options.serving_cache_peak_explicit :
+                &options.serving_cache_tokens_explicit;
+            if (*supplied) throw std::invalid_argument("duplicate serving prefix cache option");
+            if (!value) throw std::invalid_argument("serving prefix cache limits must be positive");
+            *supplied = true;
+            if (argument == "--serve-prefix-cache-entries") options.serving_cache_entries = value;
+            else if (argument == "--serve-prefix-cache-snapshot-bytes") options.serving_cache_snapshot_bytes = value;
+            else if (argument == "--serve-prefix-cache-capture-peak-bytes") options.serving_cache_capture_peak_bytes = value;
+            else options.serving_cache_max_prefix_tokens = value;
+            continue;
+        }
         if (argument == "--serve-concurrency" || argument == "--serve-memory-budget-bytes" ||
             argument == "--serve-request-budget-bytes" || argument == "--serve-headroom-bytes") {
             if (index + 1 >= argc) throw std::invalid_argument("serving option requires a value");
@@ -461,6 +513,20 @@ inline Options parse_options(
             const auto id = parse_u64(argv[++index], "logprob token");
             if (id > std::numeric_limits<std::uint32_t>::max()) throw std::invalid_argument("logprob token exceeds uint32");
             options.logprob_token_ids.push_back(static_cast<std::uint32_t>(id));
+            continue;
+        }
+        if (argument == "--known-prefix-output-policy" || argument.starts_with("--known-prefix-output-policy=")) {
+            if (options.known_prefix_output_policy_explicit) throw std::invalid_argument("duplicate known-prefix output policy");
+            std::string_view value;
+            if (argument == "--known-prefix-output-policy") {
+                if (index + 1 >= argc) throw std::invalid_argument("known-prefix output policy requires a value");
+                value = argv[++index];
+            } else value = argument.substr(std::string_view("--known-prefix-output-policy=").size());
+            if (value == "all-rows") options.known_prefix_output_policy = strix::KnownWindowOutputPolicy::all_rows;
+            else if (value == "terminal-row") options.known_prefix_output_policy = strix::KnownWindowOutputPolicy::terminal_row;
+            else if (value == "state-only") options.known_prefix_output_policy = strix::KnownWindowOutputPolicy::state_only;
+            else throw std::invalid_argument("known-prefix output policy must be all-rows, terminal-row or state-only");
+            options.known_prefix_output_policy_explicit = true;
             continue;
         }
         if (argument == "--known-prefix-rows" || argument.starts_with("--known-prefix-rows=")) {
@@ -995,9 +1061,12 @@ inline Options parse_options(
         options.prefix_cache_roundtrip || options.execution.mode != strix::DecodeExecutionMode::eager ||
         options.execution.integer_head != strix::DecodeIntegerHead::none))
         throw std::invalid_argument("GPU greedy token output requires eager generation without RAW, reference, roundtrip or integer head");
+    validate_serving_prefix_cache_limits(options);
     if (options.serving_prefix_files.empty() && (options.serving_concurrency_explicit || options.serving_memory_explicit ||
         options.serving_request_explicit || options.serving_headroom_explicit))
         throw std::invalid_argument("serving controls require --serve-prefix-u32le");
+    if (options.known_prefix_output_policy_explicit && !options.known_prefix_window)
+        throw std::invalid_argument("known-prefix output policy requires --known-prefix-window");
     if (options.known_prefix_expert_union && !options.known_prefix_window)
         throw std::invalid_argument("known-prefix expert union requires --known-prefix-window");
     if (options.known_prefix_rows_explicit && !options.known_prefix_window)

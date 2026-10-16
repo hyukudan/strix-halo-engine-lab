@@ -236,6 +236,37 @@ int main() {
               "known-prefix expert union requires resolved A8/grouped Q5_1/slot-parallel/D1");
       }
     }
+    expect(!needs_generation_output_dispatcher(defaults), "ordinary CPU output does not construct an output wrapper");
+    { auto state = paired_prompt; state.known_prefix_output_policy = KnownWindowOutputPolicy::state_only;
+      expect(needs_generation_output_dispatcher(state) && !state.gpu_greedy_token,
+          "state-only known prefix uses head omission without a vocabulary selector");
+      state.known_prefix_output_policy = KnownWindowOutputPolicy::terminal_row;
+      expect(!needs_generation_output_dispatcher(state), "terminal-row windows retain ordinary serial output");
+      state.known_prefix_output_policy = KnownWindowOutputPolicy::all_rows;
+      expect(!needs_generation_output_dispatcher(state), "all-row windows preserve serial default output");
+      state.known_prefix_window = false; state.gpu_greedy_token = true;
+      expect(needs_generation_output_dispatcher(state), "existing GPU scalar output retains its wrapper"); }
+    expect(defaults.known_prefix_output_policy == KnownWindowOutputPolicy::all_rows &&
+        !defaults.known_prefix_output_policy_explicit, "known-window heads remain all rows by default");
+    for (const auto* policy : {"all-rows", "terminal-row", "state-only"}) {
+        const auto selected = parse({"decoder", "m", "1", "--known-prefix-window", "--known-prefix-output-policy", policy});
+        expect(known_window_output_policy_name(selected.known_prefix_output_policy) == policy &&
+            !selected.any_low_level_flag, "known-window output policy does not change optimization profile");
+        auto admitted = paired_prompt; admitted.known_prefix_output_policy = selected.known_prefix_output_policy;
+        validate_resolved_known_prefix_window(admitted);
+    }
+    expect(parse({"decoder", "m", "1", "--known-prefix-window", "--known-prefix-output-policy=terminal-row"}).known_prefix_output_policy ==
+        KnownWindowOutputPolicy::terminal_row, "output policy supports equals form");
+    rejects([] { (void)parse({"decoder", "m", "1", "--known-prefix-window", "--known-prefix-output-policy=other"}); },
+        "known-prefix output policy must be all-rows, terminal-row or state-only");
+    rejects([] { (void)parse({"decoder", "m", "1", "--known-prefix-window", "--known-prefix-output-policy"}); },
+        "known-prefix output policy requires a value");
+    rejects([] { (void)parse({"decoder", "m", "1", "--known-prefix-window", "--known-prefix-output-policy=all-rows", "--known-prefix-output-policy=state-only"}); },
+        "duplicate known-prefix output policy");
+    rejects([] { (void)parse({"decoder", "m", "1", "--prompt-lookup", "--known-prefix-output-policy=terminal-row"}); },
+        "known-prefix output policy requires --known-prefix-window");
+    { auto bad = paired_prompt; bad.known_prefix_output_policy = static_cast<KnownWindowOutputPolicy>(255);
+      rejects([&] { validate_resolved_known_prefix_window(bad); }, "unknown known-window output policy"); }
     expect(defaults.known_prefix_rows == 2 && !defaults.known_prefix_rows_explicit,
         "known-prefix logical rows default to two without changing automatic profile");
     for (const auto* text : {"2", "4", "8"}) {
@@ -385,6 +416,40 @@ int main() {
         "serving controls cannot silently change an ordinary request");
     rejects([] { (void)parse({"decoder", "m", "1", "--serve-concurrency", "3"}); },
         "serving geometry is a closed worker family");
+    const auto cached_serving = parse({"decoder", "m", "--serve-prefix-u32le", "not-opened.u32le", "--generate", "4",
+        "--serve-prefix-cache-entries", "2", "--serve-prefix-cache-snapshot-bytes", "4096",
+        "--serve-prefix-cache-capture-peak-bytes", "8192", "--serve-prefix-cache-max-tokens", "16"});
+    expect(cached_serving.serving_cache_entries == 2 && cached_serving.serving_cache_snapshot_bytes == 4096 &&
+        cached_serving.serving_cache_capture_peak_bytes == 8192 && cached_serving.serving_cache_max_prefix_tokens == 16 &&
+        !cached_serving.any_low_level_flag, "serving cache stores explicit independent budgets without opening files");
+    expect(!defaults.serving_cache_entries_explicit && defaults.serving_cache_entries == 0,
+        "serving cache is absent by default");
+    rejects([] { (void)parse({"decoder", "m", "1", "--serve-prefix-cache-entries", "1"}); },
+        "serving prefix cache requires serving files and all four positive explicit bounded limits");
+    rejects([] { (void)parse({"decoder", "m", "--serve-prefix-u32le", "x", "--generate", "4",
+        "--serve-prefix-cache-entries", "1"}); },
+        "serving prefix cache requires serving files and all four positive explicit bounded limits");
+    rejects([] { (void)parse({"decoder", "m", "1", "--serve-prefix-cache-entries", "0"}); },
+        "serving prefix cache limits must be positive");
+    rejects([] { (void)parse({"decoder", "m", "1", "--serve-prefix-cache-entries"}); },
+        "serving prefix cache option requires a value");
+    rejects([] { (void)parse({"decoder", "m", "1", "--serve-prefix-cache-entries", "1", "--serve-prefix-cache-entries", "2"}); },
+        "duplicate serving prefix cache option");
+    rejects([] { (void)parse({"decoder", "m", "--serve-prefix-u32le", "x", "--generate", "4", "--context", "8",
+        "--serve-prefix-cache-entries", "1", "--serve-prefix-cache-snapshot-bytes", "4096",
+        "--serve-prefix-cache-capture-peak-bytes", "8192", "--serve-prefix-cache-max-tokens", "16"}); },
+        "serving prefix cache requires serving files and all four positive explicit bounded limits");
+    for (unsigned mutation = 0; mutation < 6; ++mutation) {
+        auto bad = cached_serving;
+        if (mutation == 0) bad.serving_cache_entries_explicit = false;
+        if (mutation == 1) bad.serving_cache_snapshot_explicit = false;
+        if (mutation == 2) bad.serving_cache_peak_explicit = false;
+        if (mutation == 3) bad.serving_cache_tokens_explicit = false;
+        if (mutation == 4) bad.serving_cache_max_prefix_tokens = bad.context_tokens + 1U;
+        if (mutation == 5) bad.serving_prefix_files.clear();
+        rejects([&] { validate_serving_prefix_cache_limits(bad); },
+            "serving prefix cache requires serving files and all four positive explicit bounded limits");
+    }
     for (unsigned mutation = 0; mutation < 13; ++mutation) {
         auto bad = serving;
         if (mutation == 0) bad.serving_headroom_explicit = false;

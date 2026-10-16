@@ -1,6 +1,7 @@
 #pragma once
 
 #include "strix/model_contract.hpp"
+#include "strix/model_runtime_binding.hpp"
 #include "strix/runtime_allocator.hpp"
 #include "strix/serial_prefix_lifecycle.hpp"
 #include "strix/serial_session.hpp"
@@ -11,10 +12,19 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
 #include <vector>
 
 namespace strix {
+
+struct SerialPrefixGreedyFrontier {
+    ModelContentIdentity model_content;
+    std::uint64_t vocabulary_size = 0;
+    // Selected from the COMPLETE finite terminal vocabulary of this prefix.
+    // This token is pending: it has not been consumed into the snapshot state.
+    std::uint32_t pending_token = 0;
+};
 
 class SerialPrefixCacheEntry {
 public:
@@ -38,7 +48,8 @@ public:
         RuntimeMemoryAllocator& allocator,
         AllocationGenerationSource& generations,
         SessionSnapshotTransferBackend& backend,
-        std::uint64_t alignment = 64);
+        std::uint64_t alignment = 64,
+        std::optional<SerialPrefixGreedyFrontier> greedy_frontier = std::nullopt);
 
     void restore(
         SerialSessionContext& session,
@@ -72,6 +83,10 @@ public:
                memory_.valid();
     }
 
+    [[nodiscard]] const std::optional<SerialPrefixGreedyFrontier>& greedy_frontier() const noexcept {
+        return greedy_frontier_;
+    }
+
     [[nodiscard]] const SerialPrefixSnapshot&
     prefix() const noexcept {
         return prefix_;
@@ -84,6 +99,7 @@ public:
 
 private:
     SerialPrefixSnapshot prefix_;
+    std::optional<SerialPrefixGreedyFrontier> greedy_frontier_;
     SessionSnapshotMemoryOwner memory_;
 };
 
@@ -112,6 +128,13 @@ public:
         std::span<const std::uint32_t> prefix_tokens,
         std::uint64_t execution_identity, std::uint64_t runtime_compatibility_identity,
         std::uint64_t state_layout_identity, const ArithmeticLineage* history = nullptr);
+    // Longest exact token prefix with a real scalar frontier and the same
+    // model/runtime/layout/serial arithmetic history. No chunk-history promotion.
+    // The returned handle pins allocation owners through restore completion.
+    [[nodiscard]] std::shared_ptr<const SerialPrefixCacheEntry> find_longest_greedy(
+        std::span<const std::uint32_t> request_tokens, const ModelContentIdentity& model_content,
+        std::uint64_t vocabulary_size, std::uint64_t execution_identity,
+        std::uint64_t runtime_compatibility_identity, std::uint64_t state_layout_identity);
     // Evicts only unpinned snapshots; outstanding handles retain their owners.
     [[nodiscard]] std::size_t evict_unpinned() noexcept;
     [[nodiscard]] std::size_t size() const noexcept { return slots_.size(); }

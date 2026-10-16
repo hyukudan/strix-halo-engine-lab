@@ -13,6 +13,7 @@
 #include "strix/hip_known_prompt_backend.hpp"
 #include "strix/hip_prompt_lookup_runtime.hpp"
 #include "strix/hip_serving_greedy_backend.hpp"
+#include "strix/hip_serving_prefix_cache.hpp"
 #include "strix/greedy_serving_scheduler.hpp"
 #include "strix/known_prompt_chunks.hpp"
 #include "strix/generation_output.hpp"
@@ -228,14 +229,14 @@ public:
           vocab_size_(vocab_size), recording_(std::move(recording)), recording_binding_(std::move(recording_binding)), recording_drain_(std::move(recording_drain)), execute_override_(std::move(execute_override)), track_logit_hashes_(track_logit_hashes), prepublication_completion_(prepublication_completion), greedy_output_(greedy_output), output_dispatcher_(output_dispatcher) {
         if(prepublication_completion_&&!execute_override_)
             throw std::invalid_argument("checked completion requires the owned native token executor");
-        if (greedy_output_ && (recording_ || track_logit_hashes_))
-            throw std::invalid_argument("scalar greedy output cannot omit requested full-logit evidence");
+        if (output_dispatcher_ && (recording_ || track_logit_hashes_))
+            throw std::invalid_argument("state-only output dispatcher cannot omit requested full-logit evidence");
         if (greedy_output_ && !output_dispatcher_)
             throw std::invalid_argument("scalar greedy output requires its prefix output dispatcher");
     }
 
     void execute_state(std::uint32_t input_token, std::uint64_t position) override {
-        if (!greedy_output_) {
+        if (!output_dispatcher_) {
             strix::SerialGreedyStepBackend::execute_state(input_token, position);
             return;
         }
@@ -655,6 +656,16 @@ public:
         strix::ExecutionTelemetryBinding bind(&owner_->counters, correlation);
         backend_->execute_state(token, position);
     }
+    std::optional<strix::GreedyPrefixRestore> try_restore_greedy_prefix(const strix::SerialGreedyRequest& request) override {
+        auto correlation = owner_->correlation(owner_->session.next_position); correlation.phase = strix::ExecutionPhase::prefill;
+        strix::ExecutionTelemetryBinding bind(&owner_->counters, correlation);
+        return backend_->try_restore_greedy_prefix(request);
+    }
+    void capture_greedy_prefix(std::span<const std::uint32_t> prefix, std::uint32_t pending, std::uint64_t vocabulary) override {
+        auto correlation = owner_->correlation(owner_->session.next_position); correlation.phase = strix::ExecutionPhase::prefill;
+        strix::ExecutionTelemetryBinding bind(&owner_->counters, correlation);
+        backend_->capture_greedy_prefix(prefix, pending, vocabulary);
+    }
 private:
     std::unique_ptr<strix::SerialGreedyStepBackend> backend_;
     std::shared_ptr<ServingSessionOwner> owner_;
@@ -738,9 +749,10 @@ int main(
             "  --qsa-hierarchical-selection (experimental exact top512, eager D1, context<=131072)\n"
             "  --gdn-recurrent-layout baseline|stride32|stride33|transposed (experimental eager LDS organization)\n"
             "  --gdn-recurrent-storage key-value|value-key (experimental physical state layout, default key-value)\n"
-            "  --known-prefix-window [--known-prefix-rows 2|4|8] (experimental known prompt; complete heads, separate window owner)\n"
+            "  --known-prefix-window [--known-prefix-rows 2|4|8] [--known-prefix-output-policy all-rows|terminal-row|state-only] (experimental known prompt)\n"
             "  --prompt-lookup [--prompt-lookup-depth 0|1|2] (experimental greedy target verification, default off)\n"
             "  --serve-prefix-u32le FILE (repeat per request; independent C1 state, shared weights)\n"
+            "  --serve-prefix-cache-entries N --serve-prefix-cache-snapshot-bytes N --serve-prefix-cache-capture-peak-bytes N --serve-prefix-cache-max-tokens N (all explicit, optional bounded shared pool)\n"
             "  --serve-concurrency 1|2|4 --serve-memory-budget-bytes N --serve-request-budget-bytes N --serve-headroom-bytes N\n"
             "  --gdn-islands (experimental eager D1 GDN launch organization; paired wave8 GDN supported)\n"
             "  --prepared-eager (experimental immutable static submission plan)\n"
@@ -1404,9 +1416,26 @@ int main(
         if (model.vocab_size > UINT32_MAX) throw std::invalid_argument("serving GPU selector vocabulary exceeds uint32");
         minimum = checked_add(minimum, strix::HipServingGreedyBackend::output_reservation_bytes(static_cast<std::uint32_t>(model.vocab_size)));
         minimum = checked_add(minimum, sizeof(ServingSessionOwner));
-        const auto shared_bytes = checked_add(model_residency.reservation().retained_reserved_bytes, options.serving_headroom);
+        std::optional<strix::HipServingPrefixCachePolicy> prefix_cache_policy;
+        std::uint64_t prefix_cache_reservation = 0;
+        if (options.serving_cache_entries_explicit) {
+            prefix_cache_policy = strix::HipServingPrefixCachePolicy{
+                static_cast<std::size_t>(options.serving_cache_entries), options.serving_cache_snapshot_bytes,
+                options.serving_cache_capture_peak_bytes, options.serving_cache_max_prefix_tokens};
+            prefix_cache_reservation = strix::HipServingPrefixCache::requested_reservation_bytes(*prefix_cache_policy);
+        }
+        const auto shared_bytes = checked_add(checked_add(model_residency.reservation().retained_reserved_bytes,
+            options.serving_headroom), prefix_cache_reservation);
         if (shared_bytes > options.serving_memory_budget)
             throw std::invalid_argument("serving model reservation plus headroom exceeds total budget");
+        // Charge retained snapshots AND capture peak before pool construction or
+        // any request factory allocation. The pool owns independent snapshots.
+        std::shared_ptr<strix::HipServingPrefixCache> prefix_cache;
+        if (prefix_cache_policy) {
+            original_work_device->require_original();
+            prefix_cache = std::make_shared<strix::HipServingPrefixCache>(*prefix_cache_policy,
+                mapped.content_identity(), static_cast<std::uint32_t>(model.vocab_size));
+        }
         strix::GreedyServingPolicy policy;
         policy.concurrency = options.serving_concurrency;
         policy.max_retained_requests = prefixes.size();
@@ -1452,7 +1481,7 @@ int main(
                     });
                     std::unique_ptr<strix::SerialGreedyStepBackend> target = std::make_unique<strix::HipServingGreedyBackend>(
                         compiled, model, catalog_config, owner->resources, owner->session, owner->scope,
-                        std::static_pointer_cast<const void>(owner), options.prepared_eager);
+                        std::static_pointer_cast<const void>(owner), options.prepared_eager, prefix_cache);
                     if (owner->telemetry()) return std::make_unique<ObservedServingBackend>(std::move(target), owner);
                     return target;
                 });
@@ -1474,7 +1503,23 @@ int main(
             << "  \"serving_reserved_bytes_with_live_handles\":" << scheduler.reserved_bytes() << ",\n"
             << "  \"serving_reservation_scope\":\"declared-backing-and-request-budgets-not-physical-RSS-or-fit-proof\",\n"
             << "  \"serving_admission_to_completion_elapsed_ms\":" << serving_ms << ",\n"
-            << "  \"requests\":[";
+            << "  \"serving_prefix_cache_requested\":" << (prefix_cache ? "true" : "false") << ",\n"
+            << "  \"serving_prefix_cache_reservation_bytes\":" << prefix_cache_reservation << ",\n";
+        if (prefix_cache) {
+            const auto cache = prefix_cache->stats();
+            std::cout << "  \"serving_prefix_cache\":{\"scope\":\"shared-pool-actual-operations-not-speed-or-traffic\","
+                << "\"max_entries\":" << options.serving_cache_entries
+                << ",\"snapshot_budget_bytes\":" << options.serving_cache_snapshot_bytes
+                << ",\"capture_peak_bytes\":" << options.serving_cache_capture_peak_bytes
+                << ",\"max_prefix_tokens\":" << options.serving_cache_max_prefix_tokens
+                << ",\"lookups\":" << cache.lookups << ",\"hits\":" << cache.hits
+                << ",\"restored_prefix_tokens\":" << cache.restored_prefix_tokens
+                << ",\"capture_attempts\":" << cache.capture_attempts << ",\"inserted\":" << cache.inserted
+                << ",\"skipped\":" << cache.skipped << ",\"failures\":" << cache.failures
+                << ",\"entries\":" << cache.entries << ",\"snapshot_bytes\":" << cache.snapshot_bytes
+                << ",\"saturated\":" << (cache.saturated ? "true" : "false") << "},\n";
+        }
+        std::cout << "  \"requests\":[";
         for (std::size_t i = 0; i < handles.size(); ++i) {
             const auto state = handles[i].state(); const auto metrics = handles[i].metrics();
             const auto& result = handles[i].result();
@@ -1484,6 +1529,7 @@ int main(
                 << ",\"execution_identity\":" << owners[i]->session.execution_identity
                 << ",\"runtime_compatibility_identity\":" << owners[i]->session.runtime_compatibility_identity
                 << ",\"committed_tokens\":" << owners[i]->session.committed_tokens
+                << ",\"restored_prefix_tokens\":" << result.restored_prefix_tokens
                 << ",\"final_position\":" << result.final_position
                 << ",\"steps_executed\":" << result.steps_executed
                 << ",\"stop_reason\":\"" << stop_reason_name(result.stop_reason) << "\""
@@ -1654,7 +1700,7 @@ int main(
         ? static_cast<strix::EagerExecutionDispatcher&>(*moe_overlap)
         : static_cast<strix::EagerExecutionDispatcher&>(direct_dispatcher);
     std::unique_ptr<strix::GenerationOutputDispatcher> output_dispatcher;
-    if (options.gpu_greedy_token)
+    if (strix::decode_cli::needs_generation_output_dispatcher(options))
         output_dispatcher = std::make_unique<strix::GenerationOutputDispatcher>(native_dispatcher, compiled);
     strix::EagerExecutionDispatcher& dispatcher = output_dispatcher
         ? static_cast<strix::EagerExecutionDispatcher&>(*output_dispatcher)
@@ -2293,7 +2339,8 @@ int main(
         } lookup_stats;
         if (options.known_prefix_window || options.prompt_lookup) {
             known_prefix_plan = strix::compile_known_prefix_window(model, compiled, manifest, tensor_access,
-                {true, true, true, options.known_prefix_window ? options.known_prefix_rows : 2U, options.known_prefix_expert_union});
+                {true, true, true, options.known_prefix_window ? options.known_prefix_rows : 2U, options.known_prefix_expert_union,
+                 options.known_prefix_output_policy});
             if (!strix::known_window_has_promoted_steps(*known_prefix_plan))
                 throw std::invalid_argument("known prompt has no admitted known-window operators");
             if (model.vocab_size > std::numeric_limits<std::uint32_t>::max())
@@ -2407,6 +2454,7 @@ int main(
             paired.vocab_size = request.vocab_size; paired.context_capacity = request.context_capacity;
             paired.max_new_tokens = request.max_new_tokens; paired.eos_token_id = request.eos_token_id;
             paired.logical_rows = options.known_prefix_rows;
+            paired.output_policy = options.known_prefix_output_policy;
             strix::KnownPromptChunkCursor chunks(paired, *known_prefix_backend, backend);
             while (chunks.advance()) { /* one complete configured window or one unpadded serial suffix row */ }
             const auto& generated = chunks.finish_greedy();
@@ -2508,7 +2556,15 @@ int main(
                 for (std::size_t i = 0; i < 8U; ++i) std::cout << (i ? "," : "") << group.batch_size_histogram[i];
                 std::cout << "],\"histogram_bucket_rows\":\"index-plus-one\",\"whole-model-aggregation\":false},\n";
             }
+            std::cout << "  \"known_prefix_output_policy\":\"" << strix::known_window_output_policy_name(known_prefix_plan->output_policy)
+                << "\",\n  \"known_prefix_output_policy_qualification\":\"not_assessed\",\n";
+            // This dispatcher sees only the serial suffix/generation path.
+            // Native window omissions are reported separately by its owner.
+            std::cout << "  \"known_prefix_serial_lm_heads_omitted\":" << (output_dispatcher ? output_dispatcher->omitted_heads() : 0U)
+                << ",\n  \"known_prefix_serial_state_only_steps\":" << backend.prefix_state_elapsed_ms().size() << ",\n";
             const auto observed = known_prefix_backend->stats();
+            std::cout << "  \"known_prefix_omitted_lm_heads\":" << observed.omitted_lm_heads
+                << ",\n  \"known_prefix_state_only_windows\":" << observed.state_only_windows << ",\n";
             std::array<std::uint64_t, strix::known_window_r2_variant_slots> compiled_variants{};
             for (const auto variant : known_prefix_plan->r2_variant) {
                 const auto index = static_cast<std::uint32_t>(variant);

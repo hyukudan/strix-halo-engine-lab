@@ -1224,6 +1224,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         src/hip_known_prompt_backend.cpp
         src/hip_prompt_lookup_runtime.hip
         src/hip_serving_greedy_backend.hip
+        src/hip_serving_prefix_cache.hip
         src/hip_distributed_stage.hip
         src/hip_distributed_transaction.hip
         src/hip_hyper_mix_launcher.hip

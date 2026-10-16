@@ -126,3 +126,24 @@ weights across bounded expert assignment tiles. Duplicate row/slot assignments
 remain distinct and the down merge retains ascending slot order. The 128-byte
 GPU summary describes only the last eligible layer of the last completed window;
 its histograms are not whole-request reuse or measured memory traffic.
+
+## Explicit output intent
+
+`--known-prefix-output-policy all-rows|terminal-row|state-only` requires the
+known-prefix route and defaults to `all-rows`. The equals form is also accepted.
+`terminal-row` computes the final row's full head; `state-only` commits window
+state without producing or reusing old logits. The chunk cursor uses state-only
+windows only while more than one full configured window remains. It consumes
+the final at-most-R inputs as serial R1 calls, with a real full-output last input
+before generation; no consumed input is replayed and no padding is committed.
+Prompt lookup/verification retain all rows and reject this CLI selector.
+Receipts name the compiled policy and actual completed state-only windows and
+omitted heads. These counters do not establish performance or qualification.
+
+The explicit state-only CLI also equips the serial suffix backend with the
+existing head-omission dispatcher, without constructing a GPU selector or its
+vocabulary pool. Each nonterminal serial suffix input completes its normal
+state/D1 checks; only the final serial input computes the full head for the
+frontier. `known_prefix_serial_lm_heads_omitted` and
+`known_prefix_serial_state_only_steps` describe that serial path separately from
+the native window omission counters. Default/all-row/RAW paths are unchanged.

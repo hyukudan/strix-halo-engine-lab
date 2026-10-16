@@ -416,6 +416,75 @@ int main() {
     surviving_handle.reset();
     expect(allocator_lifetime.expired(), "snapshot buffers release before the final allocator owner");
 
+    // Scalar frontier is attached to the same complete snapshot, not a
+    // parallel cache keyed only by a hash or a token count.
+    {
+        auto retained_allocator=std::make_shared<VectorAllocator>();
+        strix::ModelContentIdentity content;content.bytes[0]=7U;
+        const auto original_session=session;
+        auto short_session=session;short_session.next_position=prefix_tokens.size();short_session.committed_tokens=prefix_tokens.size();
+        short_session.arithmetic_lineage={};
+        for(std::uint64_t pos=0;pos<prefix_tokens.size();++pos)
+            short_session.arithmetic_lineage=strix::prepare_serial_row_lineage(short_session.arithmetic_lineage,pos,session.execution_identity,0x1234U);
+        const auto frontier=strix::SerialPrefixGreedyFrontier{content,model.vocab_size,103U};
+        auto short_entry=strix::SerialPrefixCacheEntry::capture(model,prefix_tokens,short_session,layout,state_memory,
+            *retained_allocator,generations,transfer,64U,frontier);
+        const auto bytes=short_entry.memory().device_section_bytes+short_entry.memory().host_section_bytes;
+        strix::SerialPrefixCache pool(2U,bytes*2U);
+        expect(pool.insert(std::move(short_entry),retained_allocator)==strix::SerialPrefixCacheAdmission::inserted,"greedy cache retains the original snapshot allocation");
+        auto longer=prefix_tokens;longer.push_back(104U);auto longer_session=short_session;
+        longer_session.next_position=longer.size();longer_session.committed_tokens=longer.size();
+        longer_session.arithmetic_lineage=strix::prepare_serial_row_lineage(short_session.arithmetic_lineage,
+            prefix_tokens.size(),session.execution_identity,0x1234U);
+        auto long_entry=strix::SerialPrefixCacheEntry::capture(model,longer,longer_session,layout,state_memory,
+            *retained_allocator,generations,transfer,64U,strix::SerialPrefixGreedyFrontier{content,model.vocab_size,105U});
+        expect(pool.insert(std::move(long_entry),retained_allocator)==strix::SerialPrefixCacheAdmission::inserted,"longer complete greedy frontier admitted");
+        auto request=longer;request.push_back(106U);
+        auto hit=pool.find_longest_greedy(request,content,model.vocab_size,session.execution_identity,
+            session.runtime_compatibility_identity,session.state_layout_identity);
+        expect(hit && hit->prefix().prefix_tokens==longer && hit->greedy_frontier()->pending_token==105U,
+            "longest exact token prefix retains its unconsumed finite scalar frontier");
+        auto different_model=content;different_model.bytes[1]=1U;
+        expect(!pool.find_longest_greedy(request,different_model,model.vocab_size,session.execution_identity,
+            session.runtime_compatibility_identity,session.state_layout_identity),"greedy lookup rejects a different model SHA");
+        expect(!pool.find_longest_greedy(request,content,model.vocab_size-1U,session.execution_identity,
+            session.runtime_compatibility_identity,session.state_layout_identity),"greedy lookup rejects a different vocabulary");
+        expect(!pool.find_longest_greedy(request,content,model.vocab_size,session.execution_identity,
+            session.runtime_compatibility_identity+1U,session.state_layout_identity),"greedy lookup rejects a different runtime compatibility identity");
+        auto different_tokens=request;different_tokens[0]^=1U;
+        expect(!pool.find_longest_greedy(different_tokens,content,model.vocab_size,session.execution_identity,
+            session.runtime_compatibility_identity,session.state_layout_identity),"greedy lookup compares actual tokens, not only prefix lengths");
+        auto pinned_short=pool.find_longest_greedy(prefix_tokens,content,model.vocab_size,session.execution_identity,
+            session.runtime_compatibility_identity,session.state_layout_identity);
+        auto other_tokens=prefix_tokens;other_tokens[0]^=2U;
+        auto other=strix::SerialPrefixCacheEntry::capture(model,other_tokens,short_session,layout,state_memory,
+            *retained_allocator,generations,transfer,64U,frontier);
+        expect(pool.insert(std::move(other),retained_allocator)==strix::SerialPrefixCacheAdmission::pinned_capacity,
+            "in-flight greedy restores pin both entries against eviction");
+        bool invalid=false;
+        try {auto bad=strix::SerialPrefixCacheEntry::capture(model,prefix_tokens,short_session,layout,state_memory,
+            *retained_allocator,generations,transfer,64U,strix::SerialPrefixGreedyFrontier{content,model.vocab_size,static_cast<std::uint32_t>(model.vocab_size)});}
+        catch(const std::invalid_argument&) {invalid=true;}
+        expect(invalid,"capture rejects an out-of-vocabulary scalar frontier before any snapshot copy");
+        {
+            auto chunk_session=short_session;
+            chunk_session.arithmetic_lineage=strix::prepare_prefill_chunk_lineage({},0U,prefix_tokens.size(),
+                session.execution_identity,0x1234U,session.execution_identity);
+            auto chunk=strix::SerialPrefixCacheEntry::capture(model,prefix_tokens,chunk_session,layout,state_memory,
+                *retained_allocator,generations,transfer,64U,frontier);
+            strix::SerialPrefixCache general(1U,bytes);
+            expect(general.insert(std::move(chunk),retained_allocator)==strix::SerialPrefixCacheAdmission::inserted,
+                "general cache preserves explicitly recorded chunk-producer snapshots");
+            expect(general.find(prefix_tokens,session.execution_identity,session.runtime_compatibility_identity,
+                session.state_layout_identity,&chunk_session.arithmetic_lineage)!=nullptr,
+                "explicit chunk history still matches the general cache contract");
+            expect(!general.find_longest_greedy(prefix_tokens,content,model.vocab_size,session.execution_identity,
+                session.runtime_compatibility_identity,session.state_layout_identity),
+                "greedy serving must miss a nonserial producer even when its numerical execution ID matches");
+        }
+        session=original_session;
+    }
+
     if (failures == 0) {
         std::cout
             << "serial prefix cache tests passed\n";

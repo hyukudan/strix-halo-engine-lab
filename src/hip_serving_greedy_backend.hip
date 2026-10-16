@@ -3,6 +3,7 @@
 #include "strix/deferred_moe_status.hpp"
 #include "strix/generation_output_dispatch.hpp"
 #include "strix/hip_generation_output.hpp"
+#include "strix/hip_serving_prefix_cache.hpp"
 #include "strix/hip_setup_quiescence.hpp"
 #include "strix/prepared_execution.hpp"
 #include "strix/prepared_serial_session.hpp"
@@ -11,6 +12,8 @@
 #include <hip/hip_runtime.h>
 
 #include <cstddef>
+#include <algorithm>
+#include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -25,6 +28,33 @@ void serving_check(hipError_t status, const char* operation) {
     if (status != hipSuccess)
         throw std::runtime_error(std::string(operation) + ": " + hipGetErrorString(status));
 }
+// All copies complete on this request's owned nonblocking stream. On a failed
+// enqueue/completion the original device is drained BEFORE a cache entry or
+// destination owner can unwind/free its buffers.
+class ServingPrefixTransfer final : public SessionSnapshotTransferBackend {
+public:
+    ServingPrefixTransfer(hipStream_t stream,std::shared_ptr<const HipSetupQuiescenceGuard> guard)
+        :stream_(stream),guard_(std::move(guard)) {}
+    void capture_device(std::uintptr_t a,std::uintptr_t b,std::uint64_t n) override {device(a,b,n);}
+    void capture_host(std::uintptr_t a,std::uintptr_t b,std::uint64_t n) override {host(a,b,n);}
+    void restore_device(std::uintptr_t a,std::uintptr_t b,std::uint64_t n) override {device(a,b,n);}
+    void restore_host(std::uintptr_t a,std::uintptr_t b,std::uint64_t n) override {host(a,b,n);}
+private:
+    void device(std::uintptr_t a,std::uintptr_t b,std::uint64_t n) {
+        if(!a || !b || n>std::numeric_limits<std::size_t>::max()) throw std::invalid_argument("serving prefix copy extent is invalid");
+        try {
+            serving_check(hipMemcpyAsync(reinterpret_cast<void*>(b),reinterpret_cast<const void*>(a),
+                static_cast<std::size_t>(n),hipMemcpyDeviceToDevice,stream_),"copy serving prefix state");
+            serving_check(hipStreamSynchronize(stream_),"complete serving prefix state copy");guard_->require_original();
+        } catch(...) {guard_->recover_or_fail_stop();throw;}
+    }
+    static void host(std::uintptr_t a,std::uintptr_t b,std::uint64_t n) {
+        if(!a || !b || n>std::numeric_limits<std::size_t>::max()) throw std::invalid_argument("serving prefix host extent is invalid");
+        std::memcpy(reinterpret_cast<void*>(b),reinterpret_cast<const void*>(a),static_cast<std::size_t>(n));
+    }
+    hipStream_t stream_;
+    std::shared_ptr<const HipSetupQuiescenceGuard> guard_;
+};
 bool empty_binding(const ExecutionMemoryBinding& binding) noexcept {
     return !binding.execution_identity && !binding.arena_base && !binding.arena_bytes &&
         !binding.allocation_generation;
@@ -54,14 +84,20 @@ struct HipServingGreedyBackend::Impl {
     ExecutionBufferAddress logits;
     std::uint64_t epoch = 0;
     bool broken = false;
+    std::shared_ptr<HipServingPrefixCache> prefix_cache;
+    std::vector<std::uint32_t> request_prefix;
+    bool prefix_started=false,capture_enabled=false,capture_attempted=false,selected_valid=false;
+    std::uint32_t selected_token=0;
+    std::uint64_t selected_position=0;
 
     Impl(CompiledSerialExecution compiled, ModelContract contract, HipLauncherCatalogConfig cfg,
         const ExecutionRuntimeResources& original, SerialSessionContext& live_session,
-        HipLaunchContext stream, std::shared_ptr<const void> retained, bool prepared_mode)
+        HipLaunchContext stream, std::shared_ptr<const void> retained, bool prepared_mode,
+        std::shared_ptr<HipServingPrefixCache> pool)
         : owner(std::move(retained)), guard(std::make_shared<HipSetupQuiescenceGuard>()),
           serial(std::move(compiled)), model(std::move(contract)), config(std::move(cfg)),
           resources(original), session(live_session), scope(stream), use_prepared(prepared_mode),
-          catalog(model, config) {
+          catalog(model, config),prefix_cache(std::move(pool)) {
         serving_require(owner && model.vocab_size && model.vocab_size <= std::numeric_limits<std::uint32_t>::max() &&
             model.vocab_size <= std::numeric_limits<std::size_t>::max()/sizeof(float) &&
             model.vocab_size == serial.vocab_size && serial.logical_rows == 1 && serial.request_concurrency == 1,
@@ -71,6 +107,9 @@ struct HipServingGreedyBackend::Impl {
             "serving backend requires eager original-resource execution");
         enter_worker();
         identities = build_runtime_execution_identities(serial.execution_identity, serial.arena, resources);
+        if(prefix_cache) serving_require(prefix_cache->device_index()==guard->device_index() &&
+            prefix_cache->model_content()==resources.model_weights->model_content_identity &&
+            prefix_cache->vocabulary_size()==model.vocab_size,"serving prefix pool belongs to a different model or device");
         serving_require(session.health==SerialSessionHealth::ready && !session.arithmetic_lineage.tainted &&
             session.execution_identity==serial.execution_identity && session.state_layout_identity==resources.session_state_layout->layout_identity &&
             session.runtime_compatibility_identity==identities.compatibility_identity,
@@ -161,6 +200,9 @@ struct HipServingGreedyBackend::Impl {
             position < resources.session_state_layout->context_tokens &&
             session.committed_tokens != std::numeric_limits<std::uint64_t>::max(),
             "serving input or position exceeds its admitted capacity");
+        if(prefix_started && position<request_prefix.size())
+            serving_require(request_prefix[static_cast<std::size_t>(position)]==token,
+                "serving prefix input differs from the immutable cache request witness");
         EagerExecutionRequest request;
         request.input_token_id = token;
         request.position = position;
@@ -185,6 +227,7 @@ struct HipServingGreedyBackend::Impl {
     void run(std::uint32_t token, std::uint64_t position, bool state_only, Delivery&& delivery) {
         admit(token, position); // Pure rejection leaves the session untouched.
         bool attempted = false;
+        selected_valid=false;
         try {
             serving_check(hipPeekAtLastError(), "serving preexisting HIP error");
             const HipLaunchScope active(scope);
@@ -218,9 +261,10 @@ struct HipServingGreedyBackend::Impl {
 
 HipServingGreedyBackend::HipServingGreedyBackend(CompiledSerialExecution serial, ModelContract model,
     HipLauncherCatalogConfig config, const ExecutionRuntimeResources& resources, SerialSessionContext& session,
-    HipLaunchContext scope, std::shared_ptr<const void> owner, bool prepared_eager)
+    HipLaunchContext scope, std::shared_ptr<const void> owner, bool prepared_eager,
+    std::shared_ptr<HipServingPrefixCache> prefix_cache)
     : impl_(std::make_unique<Impl>(std::move(serial), std::move(model), std::move(config), resources,
-        session, scope, std::move(owner), prepared_eager)) {}
+        session, scope, std::move(owner), prepared_eager,std::move(prefix_cache))) {}
 HipServingGreedyBackend::~HipServingGreedyBackend() = default;
 std::uint64_t HipServingGreedyBackend::output_reservation_bytes(std::uint32_t vocabulary) {
     return HipGreedyOutput::required_scratch_bytes(vocabulary);
@@ -249,11 +293,61 @@ std::uint32_t HipServingGreedyBackend::execute_greedy(std::uint32_t token, std::
     impl_->run(token, position, false, [&] {
         result = impl_->output->select(impl_->logits, static_cast<std::uint32_t>(vocabulary), position, ++impl_->epoch);
     });
+    impl_->selected_valid=true;impl_->selected_token=result;impl_->selected_position=position;
     return result;
 }
 
 void HipServingGreedyBackend::execute_state(std::uint32_t token, std::uint64_t position) {
     impl_->run(token, position, true, [] {});
+}
+std::optional<GreedyPrefixRestore> HipServingGreedyBackend::try_restore_greedy_prefix(const SerialGreedyRequest& request) {
+    auto& s=*impl_;if(!s.prefix_cache) return std::nullopt;
+    if(s.broken || s.prefix_started) throw std::logic_error("serving prefix request was already started or failed");
+    s.enter_worker();s.validate_scope();
+    serving_require(!request.prefix_tokens.empty() && request.vocab_size==s.model.vocab_size &&
+        request.context_capacity==s.resources.session_state_layout->context_tokens &&
+        request.prefix_tokens.size()<=request.context_capacity && request.eos_token_id<request.vocab_size &&
+        s.session.next_position==0U && s.session.committed_tokens==0U &&
+        std::all_of(request.prefix_tokens.begin(),request.prefix_tokens.end(),[&](auto t){return t<request.vocab_size;}),
+        "serving cached request differs from its original fresh session");
+    s.admit(request.prefix_tokens.front(),0U); // deep source admission before any restore
+    serving_require(!s.resources.ple_prefetch || !s.resources.ple_prefetch->active,"serving restore cannot borrow active PLE work");
+    // Reserve the exact input witness BEFORE copying any cached target state.
+    std::vector<std::uint32_t> prefix(request.prefix_tokens.begin(),request.prefix_tokens.end());
+    s.request_prefix=std::move(prefix);s.prefix_started=true;s.capture_enabled=request.max_new_tokens!=0U;
+    try {
+        s.complete();ServingPrefixTransfer transfer(s.scope.stream,s.guard);
+        const auto result=s.prefix_cache->try_restore(s.model,request,s.session,*s.resources.session_state_layout,
+            *s.resources.session_state_memory,transfer);
+        s.complete();return result;
+    } catch(...) {
+        s.broken=true;s.guard->recover_or_fail_stop();s.session.health=SerialSessionHealth::poisoned;
+        s.session.arithmetic_lineage.tainted=true;throw;
+    }
+}
+void HipServingGreedyBackend::capture_greedy_prefix(std::span<const std::uint32_t> prefix,std::uint32_t pending,std::uint64_t vocabulary) {
+    auto& s=*impl_;if(!s.prefix_cache || !s.capture_enabled || s.capture_attempted) return;
+    try {s.enter_worker();s.validate_scope();}
+    catch(...) {
+        // Model consumption already completed before this hook. No new work
+        // was queued here: poison without synchronizing a foreign capture.
+        s.broken=true;s.session.health=SerialSessionHealth::poisoned;s.session.arithmetic_lineage.tainted=true;throw;
+    }
+    try {
+        serving_require(!s.broken && s.prefix_started && vocabulary==s.model.vocab_size && pending<vocabulary &&
+            prefix.size()==s.request_prefix.size() && std::equal(prefix.begin(),prefix.end(),s.request_prefix.begin()) &&
+            s.session.next_position==prefix.size() && s.selected_valid && s.selected_token==pending &&
+            s.selected_position+1U==prefix.size(),"serving cache capture has no actual terminal finite-selection witness");
+        serving_require(!s.resources.ple_prefetch || !s.resources.ple_prefetch->active,"serving capture requires retired PLE work");
+        s.complete();ServingPrefixTransfer transfer(s.scope.stream,s.guard);
+        s.prefix_cache->capture(s.model,prefix,pending,s.session,*s.resources.session_state_layout,*s.resources.session_state_memory,transfer);
+        s.complete();s.capture_attempted=true;
+    } catch(...) {
+        // The prefix model calls already committed. Never leave that consumed
+        // session healthy while reporting a failed cache-copy request.
+        s.broken=true;s.guard->recover_or_fail_stop();s.session.health=SerialSessionHealth::poisoned;
+        s.session.arithmetic_lineage.tainted=true;throw;
+    }
 }
 bool HipServingGreedyBackend::failed() const noexcept { return impl_->broken; }
 int HipServingGreedyBackend::device_index() const noexcept { return impl_->guard->device_index(); }

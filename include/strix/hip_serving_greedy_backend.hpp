@@ -8,6 +8,7 @@
 #include <memory>
 
 namespace strix {
+class HipServingPrefixCache;
 
 // One independently owned C1 session, transferable between scheduler workers
 // only while idle. The scheduler owns greedy/EOS/capacity/cancellation policy.
@@ -30,7 +31,8 @@ public:
     HipServingGreedyBackend(CompiledSerialExecution serial_snapshot, ModelContract model,
         HipLauncherCatalogConfig config, const ExecutionRuntimeResources& original_resources,
         SerialSessionContext& session, HipLaunchContext eager_scope,
-        std::shared_ptr<const void> actual_owner, bool prepared_eager = false);
+        std::shared_ptr<const void> actual_owner, bool prepared_eager = false,
+        std::shared_ptr<HipServingPrefixCache> prefix_cache = {});
     ~HipServingGreedyBackend();
     // Pure requested selector-pool payload, with overflow/zero checks. Excludes
     // allocator/stream overhead, model/state/scratch and response storage.
@@ -47,6 +49,8 @@ public:
     // Omits only the terminal state-free head via GenerationOutputDispatcher;
     // persistent state/PLE/D1 completion and lineage commit remain unchanged.
     void execute_state(std::uint32_t input_token, std::uint64_t position) override;
+    [[nodiscard]] std::optional<GreedyPrefixRestore> try_restore_greedy_prefix(const SerialGreedyRequest&) override;
+    void capture_greedy_prefix(std::span<const std::uint32_t>,std::uint32_t pending,std::uint64_t vocabulary) override;
     [[nodiscard]] bool failed() const noexcept;
     [[nodiscard]] int device_index() const noexcept;
 private:

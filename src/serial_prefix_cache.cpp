@@ -17,7 +17,7 @@ SerialPrefixCacheEntry::capture(
     RuntimeMemoryAllocator& allocator,
     AllocationGenerationSource& generations,
     SessionSnapshotTransferBackend& backend,
-    std::uint64_t alignment) {
+    std::uint64_t alignment, std::optional<SerialPrefixGreedyFrontier> greedy_frontier) {
     if (session.health !=
             SerialSessionHealth::ready) {
         throw std::invalid_argument(
@@ -42,6 +42,10 @@ SerialPrefixCacheEntry::capture(
         throw std::invalid_argument(
             "serial prefix cache capture requires a fully committed prefix");
     }
+
+    if(greedy_frontier && (!greedy_frontier->model_content.valid() ||
+        greedy_frontier->vocabulary_size!=model.vocab_size || greedy_frontier->pending_token>=model.vocab_size))
+        throw std::invalid_argument("serial prefix greedy frontier has invalid model, vocabulary or token");
 
     SerialSessionSnapshotRequest request;
     request.compiled_execution_identity =
@@ -84,6 +88,7 @@ SerialPrefixCacheEntry::capture(
     SerialPrefixCacheEntry entry;
     entry.prefix_ =
         std::move(prefix);
+    entry.greedy_frontier_=std::move(greedy_frontier);
     entry.memory_ =
         std::move(memory);
     return entry;
@@ -146,6 +151,26 @@ std::shared_ptr<const SerialPrefixCacheEntry> SerialPrefixCache::find(
         return handle;
     }
     return {};
+}
+
+std::shared_ptr<const SerialPrefixCacheEntry> SerialPrefixCache::find_longest_greedy(
+    std::span<const std::uint32_t> requested,const ModelContentIdentity& content,std::uint64_t vocabulary,
+    std::uint64_t execution,std::uint64_t compatibility,std::uint64_t layout) {
+    if(!content.valid() || !vocabulary || requested.empty()) return {};
+    std::size_t best=slots_.size(),length=0;
+    for(std::size_t i=0;i<slots_.size();++i) {
+        const auto& entry=*slots_[i].entry;const auto n=entry.prefix().prefix_tokens.size();
+        const auto& frontier=entry.greedy_frontier();
+        if(n<=length || n>requested.size() || !frontier || frontier->model_content!=content ||
+            frontier->vocabulary_size!=vocabulary || frontier->pending_token>=vocabulary ||
+            !arithmetic_lineage_serial_only(entry.prefix().arithmetic_lineage,execution,static_cast<std::uint64_t>(n)) ||
+            !entry.matches(requested.first(n),execution,compatibility,layout)) continue;
+        best=i;length=n;
+    }
+    if(best==slots_.size()) return {};
+    auto handle=slots_[best].entry;
+    std::rotate(slots_.begin()+best,slots_.begin()+best+1U,slots_.end());
+    return handle;
 }
 
 SerialPrefixCacheAdmission SerialPrefixCache::insert(

@@ -47,3 +47,27 @@ thread for that request's serialized calls. No non-atomic counter is shared by
 concurrent workers. Per-request reports cover factory/worker calls before owner
 teardown; the enclosing main-thread report covers remaining setup/teardown.
 The normal decoder route creates no scheduler or extra request storage.
+
+## Explicit shared prefix cache
+
+The optional shared pool requires all four positive limits:
+`--serve-prefix-cache-entries N`, `--serve-prefix-cache-snapshot-bytes N`,
+`--serve-prefix-cache-capture-peak-bytes N` and
+`--serve-prefix-cache-max-tokens N`. The token bound cannot exceed the selected
+context. Omitting these options preserves the existing no-cache route; partial,
+duplicate and out-of-serving controls are rejected.
+
+The pool's checked reservation includes retained snapshot payload, the declared
+capture peak and bounded entry/token bookkeeping. It is charged to the scheduler
+shared reservation before the pool or request factories are constructed, in
+addition to the shared model and caller headroom. Snapshots retain independent
+allocator owners rather than retaining a completed request's scratch/state/stream
+outside its request reservation. Cache identity and complete-state restoration
+remain the production backend's responsibility; an exact-prefix hit carries an
+unconsumed terminal token, while a proper-prefix hit continues its known suffix.
+The optional telemetry wrapper forwards both cache hooks unchanged.
+
+Receipts report actual pool lookups, hits, restored logical inputs, capture
+attempts, inserts, skips, failures and currently retained entries/bytes. These
+are operation counters, not measured time savings or physical-memory traffic.
+This integration remains source-only until final validation.

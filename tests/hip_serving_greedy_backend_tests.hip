@@ -1,6 +1,7 @@
 // Explicit full-model native qualification only. No automatic CTest/model run.
 // Source implementation is not a correctness, quality or throughput result.
 #include "strix/hip_serving_greedy_backend.hpp"
+#include "strix/hip_serving_prefix_cache.hpp"
 #include "strix/deferred_moe_status.hpp"
 #include "strix/greedy_serving_scheduler.hpp"
 #include "strix/hip_generation_output_diagnostic.hpp"
@@ -154,8 +155,9 @@ struct SessionOwner {
             allocator->free_device(scope.deferred_moe_status.arena_base,sizeof(strix::DeferredMoeFirstError));
     }
 };
-std::shared_ptr<SessionOwner> fresh_session(const std::shared_ptr<ModelOwner>& model) {
-    auto owner=std::make_shared<SessionOwner>();owner->model=model;
+void initialize_session(const std::shared_ptr<SessionOwner>& owner) {
+    require(owner && owner->model && !owner->memory,"serving fixture session was initialized twice");
+    const auto& model=owner->model;
     owner->memory=std::make_shared<strix::RuntimeExecutionMemoryOwner>(strix::RuntimeExecutionMemoryOwner::allocate(
         model->compiled,model->layout,*owner->allocator,owner->generations));
     owner->ple_hash=strix::build_ple_hash_contract(model->model);
@@ -175,12 +177,15 @@ std::shared_ptr<SessionOwner> fresh_session(const std::shared_ptr<ModelOwner>& m
         model->compiled.execution_identity,model->compiled.arena,owner->resources).compatibility_identity;
     for(const auto& allocation:model->layout.allocations)
         owner->session.state.valid=owner->session.state.valid|allocation.state_flag;
-    return owner;
 }
-std::unique_ptr<strix::HipServingGreedyBackend> backend(const std::shared_ptr<SessionOwner>& owner,bool prepared) {
+std::shared_ptr<SessionOwner> fresh_session(const std::shared_ptr<ModelOwner>& model) {
+    auto owner=std::make_shared<SessionOwner>();owner->model=model;initialize_session(owner);return owner;
+}
+std::unique_ptr<strix::HipServingGreedyBackend> backend(const std::shared_ptr<SessionOwner>& owner,bool prepared,
+    std::shared_ptr<strix::HipServingPrefixCache> pool={}) {
     return std::make_unique<strix::HipServingGreedyBackend>(owner->model->compiled,owner->model->model,
         owner->model->config,owner->resources,owner->session,owner->scope,
-        std::static_pointer_cast<const void>(owner),prepared);
+        std::static_pointer_cast<const void>(owner),prepared,std::move(pool));
 }
 void independent(const SessionOwner& a,const SessionOwner& b) {
     using Range=std::pair<std::uintptr_t,std::uint64_t>;
@@ -254,6 +259,152 @@ void same_result(const strix::SerialGreedyRequestResult& a,const strix::SerialGr
     require(a.generated_tokens==b.generated_tokens && a.steps_executed==b.steps_executed &&
         a.final_position==b.final_position && a.stop_reason==b.stop_reason,"serving greedy tokens/frontier differ");
 }
+void qualify_prefix_cache(const std::shared_ptr<ModelOwner>& model,const std::vector<std::uint32_t>& prompt,
+    const std::shared_ptr<SessionOwner>& reference,const strix::SerialGreedyRequestResult& baseline,
+    const StateHashes& baseline_state,const std::filesystem::path& directory) {
+    strix::SerialSessionSnapshotRequest shape;shape.compiled_execution_identity=model->compiled.execution_identity;
+    shape.runtime_compatibility_identity=reference->session.runtime_compatibility_identity;
+    shape.next_position=reference->session.next_position;shape.committed_tokens=reference->session.committed_tokens;shape.state=reference->session.state;
+    const auto snapshot=strix::build_serial_session_snapshot_plan(model->model,model->layout,shape);
+    require(snapshot.device_bytes<=UINT64_MAX-snapshot.host_bytes,"cache snapshot budget overflow");
+    const auto bytes=snapshot.device_bytes+snapshot.host_bytes;require(bytes && bytes<=UINT64_MAX/3U,"cache peak budget overflow");
+    const strix::HipServingPrefixCachePolicy cache_policy{2U,bytes*2U,bytes*3U,context_capacity};
+    const auto shared_bytes=strix::HipServingPrefixCache::requested_reservation_bytes(cache_policy);
+    const auto scheduled_policy=[&](std::uint32_t concurrency) {
+        auto p=policy(*model,concurrency);
+        require(p.reservation_budget_bytes<=UINT64_MAX-shared_bytes,"cache shared reservation overflow");
+        p.reservation_budget_bytes+=shared_bytes;p.shared_reservation_bytes=shared_bytes;return p;
+    };
+    // Charge the shared reservation before constructing a pool or request factory.
+    (void)scheduled_policy(1U);
+    auto pool=std::make_shared<strix::HipServingPrefixCache>(cache_policy,model->mapped->content_identity(),
+        static_cast<std::uint32_t>(model->model.vocab_size));
+    const auto unallocated=[&] {auto o=std::make_shared<SessionOwner>();o->model=model;return o;};
+    const auto submit=[&](strix::GreedyServingScheduler& scheduler,const std::shared_ptr<SessionOwner>& owner,
+        std::span<const std::uint32_t> tokens,bool prepared) {
+        return scheduler.submit(request(*model,tokens),compatibility(*model),reinterpret_cast<std::uintptr_t>(&owner->session),
+            1U,reservation(*model),owner,[owner,prepared,pool] {
+                // Scheduler reserves BEFORE the first device state/scratch/selector allocation.
+                initialize_session(owner);
+                require(owner->memory->scratch().allocation_generation==1U,"future factory allocation epoch differed from its reservation");
+                return backend(owner,prepared,pool);
+            });
+    };
+    {
+        strix::GreedyServingScheduler scheduler(scheduled_policy(1U),compatibility(*model),model);
+        auto owner=unallocated();const std::weak_ptr<SessionOwner> source_lifetime=owner;
+        auto submitted=submit(scheduler,owner,prompt,false);
+        require(submitted.admission==strix::ServingAdmission::accepted,"cache prime admission failed");scheduler.run_until_idle();
+        require(submitted.request.state()==strix::ServingRequestState::completed,"cache prime request failed");
+        same_result(baseline,submitted.request.result());same_metadata(reference->session,owner->session);
+        require(capture_state(owner,directory/"cache-prime")==baseline_state,"capture mutated the prime request's seven states");
+        const auto stats=pool->stats();require(stats.entries==1U && stats.inserted==1U && stats.hits==0U,"prime did not publish exactly one actual finite frontier");
+        submitted.request={};owner.reset();
+        require(source_lifetime.expired(),"cache retained the originating request state/scratch/stream outside its reservation");
+    }
+    for(const std::uint32_t concurrency:{1U,2U,4U}) {
+        strix::GreedyServingScheduler scheduler(scheduled_policy(concurrency),compatibility(*model),model);
+        std::vector<std::shared_ptr<SessionOwner>> owners;std::vector<strix::ServingRequestHandle> handles;
+        for(std::uint32_t n=0;n<concurrency;++n) {
+            auto owner=unallocated();auto submitted=submit(scheduler,owner,prompt,(n%2U)!=0U);
+            require(submitted.admission==strix::ServingAdmission::accepted,"cache-hit request was not reserved");
+            owners.push_back(owner);handles.push_back(submitted.request);
+        }
+        scheduler.run_until_idle();
+        for(std::uint32_t n=0;n<concurrency;++n) {
+            require(handles[n].state()==strix::ServingRequestState::completed,"cache-hit serving request failed");
+            const auto& result=handles[n].result();
+            require(result.generated_tokens==baseline.generated_tokens && result.final_position==baseline.final_position &&
+                result.stop_reason==baseline.stop_reason && result.restored_prefix_tokens==prompt.size() &&
+                result.steps_executed+result.restored_prefix_tokens==baseline.steps_executed,
+                "cache hit re-executed restored inputs, consumed the pending token twice or changed policy");
+            same_metadata(reference->session,owners[n]->session);
+            require(capture_state(owners[n],directory/("cache-hit-"+std::to_string(concurrency)+"-"+std::to_string(n)))==baseline_state,
+                "cross-request cache restore changed a complete state component");
+        }
+    }
+    {
+        auto longer=prompt;longer.push_back(prompt[0]);longer.push_back(prompt[1]);
+        auto serial=fresh_session(model);auto plain=backend(serial,false);
+        const auto expected=strix::execute_serial_greedy_token_request(request(*model,longer),*plain);plain.reset();
+        const auto expected_state=capture_state(serial,directory/"cache-longer-reference");
+        strix::GreedyServingScheduler scheduler(scheduled_policy(1U),compatibility(*model),model);
+        auto owner=unallocated();const auto submitted=submit(scheduler,owner,longer,true);
+        require(submitted.admission==strix::ServingAdmission::accepted,"proper-prefix cache admission failed");scheduler.run_until_idle();
+        require(submitted.request.state()==strix::ServingRequestState::completed,"proper-prefix restore failed");
+        const auto& result=submitted.request.result();
+        require(result.restored_prefix_tokens==prompt.size() && result.generated_tokens==expected.generated_tokens &&
+            result.final_position==expected.final_position && result.stop_reason==expected.stop_reason &&
+            result.steps_executed+result.restored_prefix_tokens==expected.steps_executed,
+            "proper-prefix hit skipped or re-executed the explicit known suffix");
+        same_metadata(serial->session,owner->session);
+        require(capture_state(owner,directory/"cache-proper-hit")==expected_state,"proper-prefix hit changed seven-state results");
+    }
+    {
+        auto prefix_reference=fresh_session(model);auto serial=backend(prefix_reference,false);
+        for(std::size_t i=0;i+1U<prompt.size();++i) serial->execute_state(prompt[i],i);
+        const auto pending=serial->execute_greedy(prompt.back(),prompt.size()-1U,model->model.vocab_size);serial.reset();
+        const auto expected_state=capture_state(prefix_reference,directory/"cache-cancel-reference");
+        auto owner=fresh_session(model);auto actual=backend(owner,true,pool);
+        auto cancel_request=request(*model,prompt);
+        // Explicit caller EOS distinct from this known scalar exercises pause/
+        // cancel even when the model's default EOS is its first greedy output.
+        cancel_request.eos_token_id=pending==0U?1U:0U;
+        strix::SerialGreedyTokenCursor cursor(cancel_request);cursor.advance(*actual,1U);
+        require(cursor.result().generated_tokens==std::vector<std::uint32_t>{pending} && cursor.result().steps_executed==0U &&
+            cursor.result().restored_prefix_tokens==prompt.size(),"exact cache hit did not deliver its unconsumed bonus without a target call");
+        cursor.cancel();cursor.advance(*actual,1U);
+        require(cursor.cancelled() && cursor.result().steps_executed==0U,"cancelled cached bonus was later consumed");
+        same_metadata(prefix_reference->session,owner->session);
+        require(capture_state(owner,directory/"cache-cancelled")==expected_state,"cancel changed the restored prefix frontier");
+    }
+    {
+        const strix::HipServingPrefixCachePolicy too_small{1U,1U,1U,context_capacity};
+        auto bounded=std::make_shared<strix::HipServingPrefixCache>(too_small,model->mapped->content_identity(),
+            static_cast<std::uint32_t>(model->model.vocab_size));
+        auto owner=fresh_session(model);auto actual=backend(owner,false,bounded);
+        const auto result=strix::execute_serial_greedy_token_request(request(*model,prompt),*actual);
+        same_result(baseline,result);same_metadata(reference->session,owner->session);
+        require(result.restored_prefix_tokens==0U && bounded->stats().entries==0U && bounded->stats().skipped==1U &&
+            owner->session.health==strix::SerialSessionHealth::ready,"benign snapshot-budget admission miss changed normal inference");
+        require(capture_state(owner,directory/"cache-budget-miss")==baseline_state,"budget miss changed complete target states");
+    }
+    {
+        auto empty=std::make_shared<strix::HipServingPrefixCache>(cache_policy,model->mapped->content_identity(),
+            static_cast<std::uint32_t>(model->model.vocab_size));
+        auto owner=fresh_session(model);auto actual=backend(owner,false,empty);
+        auto zero=request(*model,prompt);zero.max_new_tokens=0U;
+        const auto result=strix::execute_serial_greedy_token_request(zero,*actual);
+        require(result.generated_tokens.empty() && result.final_position==prompt.size() && empty->stats().capture_attempts==0U &&
+            empty->stats().entries==0U,"zero-emission request published a cache frontier without requested head delivery");
+    }
+    {
+        auto empty=std::make_shared<strix::HipServingPrefixCache>(cache_policy,model->mapped->content_identity(),
+            static_cast<std::uint32_t>(model->model.vocab_size));
+        auto owner=fresh_session(model);auto actual=backend(owner,false,empty);
+        require(!actual->try_restore_greedy_prefix(request(*model,prompt)),"fresh failed-capture fixture unexpectedly hit");
+        for(std::size_t i=0;i+1U<prompt.size();++i) actual->execute_state(prompt[i],i);
+        const auto pending=actual->execute_greedy(prompt.back(),prompt.size()-1U,model->model.vocab_size);
+        auto forged=prompt;forged[0]^=1U;bool rejected=false;
+        try {actual->capture_greedy_prefix(forged,pending,model->model.vocab_size);}
+        catch(const std::invalid_argument& error) {
+            rejected=std::string_view(error.what())=="serving cache capture has no actual terminal finite-selection witness";
+        }
+        require(rejected && actual->failed() && owner->session.health==strix::SerialSessionHealth::poisoned &&
+            owner->session.arithmetic_lineage.tainted && owner->session.next_position==prompt.size() && empty->stats().entries==0U,
+            "postconsumption capture failure left a healthy reusable session or published a forged prefix");
+    }
+
+    {
+        const auto device=model->guard->device_index();int devices=0;check(hipGetDeviceCount(&devices));
+        auto release=std::async(std::launch::async,[retained=std::move(pool),device,devices]() mutable {
+            if(devices>1) check(hipSetDevice((device+1)%devices));
+            retained.reset(); // final entries/allocator freed on a different thread/device TLS
+            int observed=-1;check(hipGetDevice(&observed));require(observed==device,"cache eviction/destruction did not bind its original device");
+        });release.get();
+    }
+
+}
 struct Gate {
     std::mutex mutex;
     std::condition_variable condition;
@@ -298,6 +449,7 @@ int qualify(const Args& args) {
     base_backend.reset();
     const auto base_state=capture_state(base,args.output/"baseline");
     const auto base_metadata=base->session;
+    qualify_prefix_cache(model,prompt,base,baseline,base_state,args.output);
     for(const std::uint32_t concurrency:{1U,2U,4U}) {
         strix::GreedyServingScheduler scheduler(policy(*model,concurrency),compatibility(*model),model);
         std::vector<std::shared_ptr<SessionOwner>> owners;
@@ -405,7 +557,7 @@ int qualify(const Args& args) {
     const auto pending=args.output/"result.pending.json";
     std::ofstream out(pending,std::ios::binary);out.exceptions(std::ios::failbit|std::ios::badbit);
     out<<"{\"schema\":\"serving-native-qualification-v1\",\"finished\":true,\"passed\":true,\"C\":[1,2,4],"
-        "\"full_state_components\":7,\"baseline_full_F32_CPU_selection\":true,\"cancel_one_independent\":true,\"queued_selector_fault\":true,"
+        "\"full_state_components\":7,\"complete_prefix_cache_cross_request\":true,\"cache_exact_and_proper_hits\":true,\"cache_pending_cancel_and_budget_miss\":true,\"baseline_full_F32_CPU_selection\":true,\"cancel_one_independent\":true,\"queued_selector_fault\":true,"
         "\"fault_is_reported_host_seam_not_driver_failure\":true,\"cross_thread_destruction\":true,\"native_model_qualification_only\":true,"
         "\"quality\":false,\"performance\":false,\"model_sha256\":\""<<args.model_sha<<"\",\"prompt_sha256\":\""<<args.prompt_sha
         <<"\",\"executable_sha256\":\""<<executable_sha<<"\",\"execution_identity\":"<<model->compiled.execution_identity
