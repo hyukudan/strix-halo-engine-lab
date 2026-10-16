@@ -2,11 +2,13 @@
 
 #include "strix/compiled_execution.hpp"
 
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
 
 namespace strix {
+struct SerialSessionContext;
 struct PreparedEagerExecutionResult {
     std::uint32_t completed_steps = 0;
     std::uint32_t kernel_steps = 0;
@@ -24,8 +26,14 @@ struct PreparedEagerExecutionResult {
 //
 // actual_owner must retain the actual prepared allocations. The caller must
 // additionally retain every borrowed resource/dispatcher and exclude mutation
-// until device quiescence. A returned dispatch is not a completion fence; the
-// session owner remains responsible for drain, commit and failure poisoning.
+// of resources and their reachable metadata from run()/session entry until
+// device quiescence, including through aliases held by backends or dispatchers.
+// PLE backend internal state and PleLookupPrefetchState may evolve as prescribed
+// by their protocol; implementation_identity() must remain invariant. Other
+// mutation inside that window is outside this contract and need not be detected.
+// Changes between calls are checked by each entry's full dynamic admission.
+// A returned dispatch is not a completion fence; the session owner remains
+// responsible for drain, commit and failure poisoning.
 class PreparedEagerExecution final {
 public:
     PreparedEagerExecution(CompiledSerialExecution compiled,
@@ -53,6 +61,16 @@ public:
     void validate_dynamic(const ExecutionRuntimeResources& resources,
                           const EagerExecutionRequest& request) const;
 private:
+    // Dispatch only. The sole friend validates the same resources and const
+    // request once before starting PLE work, within the same session call.
+    [[nodiscard]] PreparedEagerExecutionResult run_admitted(
+        const ExecutionRuntimeResources& resources,
+        const EagerExecutionRequest& request,
+        EagerExecutionDispatcher& dispatcher) const;
+    friend PreparedEagerExecutionResult execute_prepared_serial_token(
+        const PreparedEagerExecution& prepared, SerialSessionContext& session,
+        const ExecutionRuntimeResources& resources, std::uint32_t input_token_id,
+        EagerExecutionDispatcher& dispatcher, const std::function<void()>& before_commit);
     struct Impl;
     std::unique_ptr<const Impl> impl_;
 };

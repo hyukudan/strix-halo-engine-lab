@@ -105,9 +105,8 @@ struct PreparedEagerExecution::Impl {
         validate_request(resources, request);
     }
 
-    PreparedEagerExecutionResult run(const ExecutionRuntimeResources& resources,
+    PreparedEagerExecutionResult dispatch(const ExecutionRuntimeResources& resources,
         const EagerExecutionRequest& request, EagerExecutionDispatcher& dispatcher) const {
-        validate_dynamic(resources, request);
         PreparedEagerExecutionResult result;
         result.state = request.state;
         result.completion_order = order;
@@ -166,6 +165,11 @@ void PreparedEagerExecution::validate_dynamic(const ExecutionRuntimeResources& r
     const EagerExecutionRequest& request) const { impl_->validate_dynamic(resources, request); }
 PreparedEagerExecutionResult PreparedEagerExecution::run(const ExecutionRuntimeResources& resources,
     const EagerExecutionRequest& request, EagerExecutionDispatcher& dispatcher) const {
-    return impl_->run(resources, request, dispatcher);
+    impl_->validate_dynamic(resources, request);
+    return impl_->dispatch(resources, request, dispatcher);
+}
+PreparedEagerExecutionResult PreparedEagerExecution::run_admitted(const ExecutionRuntimeResources& resources,
+    const EagerExecutionRequest& request, EagerExecutionDispatcher& dispatcher) const {
+    return impl_->dispatch(resources, request, dispatcher);
 }
 } // namespace strix

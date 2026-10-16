@@ -2,10 +2,13 @@
 #include "strix/prepared_serial_session.hpp"
 #include "strix/dispatch_resources.hpp"
 #include "strix/model_tensor_index.hpp"
+#include "strix/ple_lookup.hpp"
 
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <cstdint>
+#include <functional>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -28,6 +31,50 @@ strix::PersistentState all_state() {
     return PersistentState::attention_kv | PersistentState::recurrent_matrix | PersistentState::convolution_history |
            PersistentState::sparse_index | PersistentState::ngram_history | PersistentState::position_history;
 }
+// Observes the existing protocol without adding a production admission hook.
+// Metadata and implementation identity stay immutable while a call is active.
+struct CountingPle final : strix::PleLookupBackend {
+    enum class StartFailure { none, throws, zero };
+    mutable std::uint64_t identity_calls = 0;
+    std::uint64_t start_calls = 0, finish_calls = 0, cancel_calls = 0;
+    StartFailure start_failure = StartFailure::none;
+    bool fail_finish = false, active = false;
+    std::uint64_t pending_bytes = 0;
+
+    std::uint64_t implementation_identity() const noexcept override {
+        ++identity_calls;
+        return 0x505245504c454331ULL;
+    }
+    strix::PleLookupHandle start(const strix::PleLookupRequest& request) override {
+        ++start_calls;
+        require(!active && request.table_manifest && request.table_runtime &&
+                request.table_manifest->ggml_type == 30U && request.row_ids.size() == 1U &&
+                request.row_bytes == 4U && request.row_ids.front() == 0U &&
+                request.table_runtime->bytes >= request.row_bytes,
+                "counting PLE received an invalid retained table request");
+        if (start_failure == StartFailure::throws) throw std::runtime_error("injected PLE start failure");
+        if (start_failure == StartFailure::zero) return 0;
+        pending_bytes = request.row_bytes;
+        active = true;
+        return 17;
+    }
+    void finish(strix::PleLookupHandle handle, std::span<std::byte> destination) override {
+        ++finish_calls;
+        require(active && handle == 17U && destination.size() == pending_bytes,
+                "counting PLE finish lost its active request");
+        if (fail_finish) throw std::runtime_error("injected PLE finish failure");
+        std::fill(destination.begin(), destination.end(), std::byte{0x2a});
+        active = false;
+    }
+    void cancel(strix::PleLookupHandle handle) noexcept override {
+        ++cancel_calls;
+        if (handle == 17U) active = false;
+    }
+    void clear_counts() {
+        require(!active, "counting PLE counters reset with live work");
+        identity_calls = start_calls = finish_calls = cancel_calls = 0;
+    }
+};
 struct Storage {
     std::vector<std::byte> scratch_bytes, device_bytes, host_bytes;
     std::array<float, 1> tensor_bytes{1.0F};
@@ -37,6 +84,9 @@ struct Storage {
     strix::ExecutionTensorAccessPlan access;
     strix::SerialSessionStateLayout layout;
     strix::SessionStateMemoryBinding state;
+    CountingPle ple_backend;
+    strix::PleHashContract ple_contract;
+    strix::PleLookupPrefetchState ple_prefetch;
     strix::ExecutionRuntimeResources resources;
 };
 std::uintptr_t allocate_aligned(std::vector<std::byte>& storage, std::uint64_t bytes, std::uint64_t alignment) {
@@ -138,6 +188,41 @@ struct Fixture {
     }
 };
 
+struct PleFixture : Fixture {
+    PleFixture() {
+        auto& data = *owner;
+        data.ple_contract.ngram_size = 2;
+        data.ple_contract.heads_per_ngram = 1;
+        data.ple_contract.head_count = 1;
+        data.ple_contract.head_dim = 2;
+        data.ple_contract.row_bytes = 4;
+        data.ple_contract.eos_token_id = 0;
+        data.ple_contract.multipliers[0] = 3;
+        data.ple_contract.multipliers[1] = 5;
+        data.ple_contract.head_vocab_sizes[0] = 1;
+        data.ple_contract.minimum_table_rows = 1;
+        const auto ple = std::find_if(compiled.execution.steps.begin(), compiled.execution.steps.end(),
+            [](const auto& step) { return step.op == strix::SerialOp::ple; });
+        require(ple != compiled.execution.steps.end(), "counting PLE fixture has no PLE step");
+        const auto* access = strix::find_execution_tensor_access(data.access, ple->id, 0);
+        require(access && access->tensor_indices.size() == 1U, "counting PLE table is not unique");
+        auto& table = data.manifest.tensors.at(access->tensor_indices.front());
+        table.dimensions = {2, 1}; table.ggml_type = 30; // One actual four-byte BF16 row.
+        require(table.byte_size == 4U && data.tensor_bytes.size() * sizeof(float) >= table.byte_size,
+                "counting PLE table backing is undersized");
+        data.manifest.layout_identity = strix::model_manifest_layout_identity(data.manifest);
+        data.weights.manifest_layout_identity = data.manifest.layout_identity;
+        data.access = strix::compile_execution_tensor_access_plan(compiled.execution, data.manifest,
+            strix::build_model_tensor_index(data.manifest),
+            strix::build_serial_execution_tensor_requirements(compiled.execution));
+        data.layout.context_tokens = 128; // Repeated accepted tokens and between-call mutation cases.
+        data.resources.ple_lookup = &data.ple_backend;
+        data.resources.ple_hash_contract = &data.ple_contract;
+        data.resources.ple_prefetch = &data.ple_prefetch;
+        request.position = 0;
+    }
+};
+
 struct Trace final : strix::EagerExecutionDispatcher {
     std::vector<strix::ExecutionDispatchContext> calls;
     std::optional<std::uint32_t> fail_step;
@@ -168,6 +253,34 @@ struct Trace final : strix::EagerExecutionDispatcher {
     }
     void dispatch_runtime_step(const strix::ExecutionDispatchContext& context) override {
         require(!context.kernel_id, "runtime context gained a kernel id"); record(context);
+    }
+};
+struct PleTrace final : strix::EagerExecutionDispatcher {
+    CountingPle& backend;
+    Trace trace;
+    bool consume = true;
+    std::optional<std::uint64_t> identities_at_first_dispatch;
+    explicit PleTrace(CountingPle& lookup) : backend(lookup) {}
+    void before() {
+        if (!identities_at_first_dispatch) identities_at_first_dispatch = backend.identity_calls;
+    }
+    void after(const strix::ExecutionDispatchContext& context) const {
+        if (consume && context.op == strix::SerialOp::ple && context.resources &&
+            context.resources->ple_prefetch && context.resources->ple_prefetch->active) {
+            std::array<std::byte, 16> bytes{};
+            require(context.resources->ple_prefetch->lookup_bytes == 4U,
+                    "counting PLE expected exactly one full row");
+            const auto hash = strix::finish_ple_lookup_prefetch(context.input_token_id, context.position,
+                backend, *context.resources->ple_prefetch, bytes);
+            require(hash.row_count == 1U && hash.context_count == 1U &&
+                    bytes.front() == std::byte{0x2a}, "counting PLE finish did not consume its row");
+        }
+    }
+    void dispatch_kernel(const strix::ExecutionDispatchContext& context) override {
+        before(); trace.dispatch_kernel(context); after(context);
+    }
+    void dispatch_runtime_step(const strix::ExecutionDispatchContext& context) override {
+        before(); trace.dispatch_runtime_step(context); after(context);
     }
 };
 template <typename Left, typename Right> bool same_span(const Left& left, const Right& right) {
@@ -411,6 +524,288 @@ void session_adapter() {
             "prepared session reused poisoned state");
     }
 }
+
+strix::EagerExecutionRequest session_request(const strix::SerialSessionContext& session, std::uint32_t token = 3U) {
+    strix::EagerExecutionRequest request;
+    request.logical_rows = 1; request.request_concurrency = 1;
+    request.input_token_id = token; request.position = session.next_position; request.state = session.state;
+    return request;
+}
+struct AdmissionCounts { std::uint64_t validation = 0, prefetch_start = 0; };
+AdmissionCounts admission_counts(const strix::PreparedEagerExecution& prepared,
+    const strix::ExecutionRuntimeResources& resources, const strix::EagerExecutionRequest& request,
+    CountingPle& backend) {
+    backend.clear_counts();
+    prepared.validate_dynamic(resources, request);
+    const auto validation = backend.identity_calls;
+    require(validation != 0U && backend.start_calls == 0U, "dynamic admission did not query PLE identity");
+    backend.clear_counts();
+    strix::PleLookupPrefetchState scratch;
+    require(prepared.ple_step_id().has_value(), "counting PLE calibration lost its prepared step");
+    strix::start_ple_lookup_prefetch(*resources.ple_hash_contract, *prepared.ple_step_id(),
+        request.input_token_id, request.position, *resources.model_manifest, *resources.model_weights,
+        *resources.tensor_access, *resources.session_state_layout, *resources.session_state_memory,
+        backend, scratch);
+    const auto start = backend.identity_calls;
+    strix::cancel_ple_lookup_prefetch(backend, scratch);
+    require(start != 0U && !scratch.active && !backend.active,
+            "counting PLE calibration leaked its independent prefetch");
+    backend.clear_counts();
+    return {validation, start};
+}
+void require_poisoned(const strix::SerialSessionContext& actual, const strix::SerialSessionContext& before) {
+    auto expected = before;
+    expected.health = strix::SerialSessionHealth::poisoned;
+    expected.arithmetic_lineage.tainted = true;
+    same_session(actual, expected);
+}
+void public_run_admission() {
+    PleFixture fixture;
+    auto& data = *fixture.owner;
+    strix::PreparedEagerExecution prepared(fixture.compiled, data.resources, fixture.request, fixture.owner);
+    const auto counts = admission_counts(prepared, data.resources, fixture.request, data.ple_backend);
+    prepared.validate_dynamic(data.resources, fixture.request);
+    const auto name = data.manifest.tensors.front().name;
+    data.manifest.tensors.front().name += ".between-public-calls";
+    PleTrace rejected(data.ple_backend);
+    require(rejects([&] { static_cast<void>(prepared.run(data.resources, fixture.request, rejected)); }) &&
+            rejected.trace.calls.empty() && data.ple_backend.start_calls == 0U,
+            "public run reused an earlier dynamic admission");
+    data.manifest.tensors.front().name = name;
+    auto request = fixture.request;
+    const std::uint32_t* stable_order = nullptr;
+    for (unsigned iteration = 0; iteration < 2U; ++iteration) {
+        data.ple_backend.clear_counts();
+        PleTrace dispatcher(data.ple_backend);
+        const auto result = prepared.run(data.resources, request, dispatcher);
+        require(dispatcher.identities_at_first_dispatch == counts.validation &&
+                data.ple_backend.start_calls == 0U && !data.ple_prefetch.active,
+                "public run did not perform exactly one independent full admission");
+        if (!stable_order) stable_order = result.completion_order.data();
+        require(result.completion_order.data() == stable_order &&
+                result.completed_steps == fixture.compiled.execution.steps.size(),
+                "public run changed immutable result storage");
+        request.state = result.state; ++request.position;
+    }
+}
+void ple_between_call_rejection() {
+    PleFixture fixture;
+    auto& data = *fixture.owner;
+    strix::PreparedEagerExecution prepared(fixture.compiled, data.resources, fixture.request, fixture.owner);
+    auto session = initial_session(fixture, prepared);
+    {
+        PleTrace first(data.ple_backend);
+        static_cast<void>(strix::execute_prepared_serial_token(prepared, session, data.resources, 3U, first));
+        require(data.ple_backend.finish_calls == 1U && !data.ple_prefetch.active,
+                "between-call fixture did not complete its first PLE token");
+    }
+    const auto manifest = data.manifest;
+    const auto weights = data.weights;
+    const auto access = data.access;
+    const auto scratch = data.scratch;
+    const auto layout = data.layout;
+    const auto state = data.state;
+    const auto resources = data.resources;
+    auto alternate_manifest = manifest;
+    auto alternate_weights = weights;
+    auto alternate_access = access;
+    const std::vector<std::pair<const char*, std::function<void()>>> mutations{
+        {"same-handle manifest name", [&] { data.manifest.tensors.front().name += ".changed"; }},
+        {"same-handle manifest dimensions", [&] { ++data.manifest.tensors.front().dimensions.front(); }},
+        {"same-handle manifest role", [&] { data.manifest.tensors.front().role =
+            data.manifest.tensors.front().role == strix::TensorRole::unknown ? strix::TensorRole::embedding : strix::TensorRole::unknown; }},
+        {"same-handle manifest residency", [&] { data.manifest.tensors.front().residency =
+            data.manifest.tensors.front().residency == strix::ResidencyPolicy::resident ?
+                strix::ResidencyPolicy::file_backed_candidate : strix::ResidencyPolicy::resident; }},
+        {"same-handle manifest file offset", [&] { ++data.manifest.tensors.front().absolute_offset; }},
+        {"same-handle access tensor index", [&] { ++data.access.accesses.front().tensor_indices.front(); }},
+        {"weight generation", [&] { ++data.weights.tensors.front().allocation_generation; }},
+        {"weight relocation", [&] { ++data.weights.tensors.front().address; }},
+        {"scratch generation", [&] { ++data.scratch.allocation_generation; }},
+        {"scratch relocation", [&] { data.scratch.arena_base += fixture.compiled.arena.alignment; }},
+        {"device state generation", [&] { ++data.state.device_allocation_generation; }},
+        {"host state generation", [&] { ++data.state.host_allocation_generation; }},
+        {"device state relocation", [&] { data.state.device_base += data.layout.device_alignment; }},
+        {"host state relocation", [&] { data.state.host_base += data.layout.host_alignment; }},
+        {"state layout allocation offset", [&] { data.layout.allocations.front().offset += data.layout.device_alignment; }},
+        {"equal manifest at another descriptor handle", [&] { data.resources.model_manifest = &alternate_manifest; }},
+        {"equal weights at another descriptor handle", [&] { data.resources.model_weights = &alternate_weights; }},
+        {"equal access at another descriptor handle", [&] { data.resources.tensor_access = &alternate_access; }},
+    };
+    for (const auto& [name, mutate] : mutations) {
+        const auto before = session;
+        const auto starts = data.ple_backend.start_calls;
+        mutate();
+        PleTrace rejected(data.ple_backend);
+        require(rejects([&] { static_cast<void>(strix::execute_prepared_serial_token(
+                    prepared, session, data.resources, 3U, rejected)); }) &&
+                rejected.trace.calls.empty() && data.ple_backend.start_calls == starts &&
+                !data.ple_prefetch.active && !data.ple_backend.active, name);
+        same_session(session, before);
+        PleTrace public_rejected(data.ple_backend);
+        const auto request = session_request(session);
+        require(rejects([&] { static_cast<void>(prepared.run(data.resources, request, public_rejected)); }) &&
+                public_rejected.trace.calls.empty() && data.ple_backend.start_calls == starts,
+                "public run admitted a between-call mutation");
+        data.manifest = manifest; data.weights = weights; data.access = access; data.scratch = scratch;
+        data.layout = layout; data.state = state; data.resources = resources;
+        PleTrace recovery(data.ple_backend);
+        static_cast<void>(strix::execute_prepared_serial_token(prepared, session, data.resources, 3U, recovery));
+        require(session.next_position == before.next_position + 1U &&
+                session.health == strix::SerialSessionHealth::ready && !data.ple_prefetch.active,
+                "rejected between-call mutation left sticky admission state");
+    }
+}
+void ple_preflight_guards() {
+    PleFixture fixture;
+    auto& data = *fixture.owner;
+    strix::PreparedEagerExecution prepared(fixture.compiled, data.resources, fixture.request, fixture.owner);
+    const auto base = initial_session(fixture, prepared);
+    const auto rejected = [&](strix::SerialSessionContext session,
+                              const strix::ExecutionRuntimeResources& resources, std::uint32_t token = 3U) {
+        const auto before = session;
+        const auto starts = data.ple_backend.start_calls;
+        PleTrace dispatcher(data.ple_backend);
+        require(rejects([&] { static_cast<void>(strix::execute_prepared_serial_token(
+            prepared, session, resources, token, dispatcher)); }) && dispatcher.trace.calls.empty() &&
+            data.ple_backend.start_calls == starts && !data.ple_prefetch.active && !data.ple_backend.active,
+            "session preflight invoked PLE or dispatch before rejecting an invalid entry");
+        same_session(session, before);
+    };
+    auto session = base; session.state.valid = strix::PersistentState::none; rejected(session, data.resources);
+    for (std::size_t index = 0; index < session.state.generations.size(); ++index) {
+        session = base; session.state.generations[index] = std::numeric_limits<std::uint64_t>::max();
+        rejected(session, data.resources);
+    }
+    session = base; session.next_position = data.layout.context_tokens; rejected(session, data.resources);
+    rejected(base, data.resources, static_cast<std::uint32_t>(fixture.compiled.vocab_size));
+    const std::vector<std::function<void(strix::ExecutionRuntimeResources&)>> missing{
+        [](auto& r) { r.scratch = nullptr; }, [](auto& r) { r.model_manifest = nullptr; },
+        [](auto& r) { r.model_weights = nullptr; }, [](auto& r) { r.tensor_access = nullptr; },
+        [](auto& r) { r.session_state_layout = nullptr; }, [](auto& r) { r.session_state_memory = nullptr; },
+    };
+    for (const auto& remove : missing) { auto resources = data.resources; remove(resources); rejected(base, resources); }
+    session = base; session.runtime_compatibility_identity = 0; rejected(session, data.resources);
+    session = base; ++session.runtime_compatibility_identity; rejected(session, data.resources);
+    session = base; ++session.state_layout_identity; rejected(session, data.resources);
+    session = base; ++session.execution_identity; rejected(session, data.resources);
+    session = base; session.health = strix::SerialSessionHealth::poisoned; rejected(session, data.resources);
+    session = base; session.committed_tokens = std::numeric_limits<std::uint64_t>::max(); rejected(session, data.resources);
+}
+void ple_failure_boundaries() {
+    for (const auto failure : {CountingPle::StartFailure::throws, CountingPle::StartFailure::zero}) {
+        PleFixture fixture; auto& data = *fixture.owner;
+        strix::PreparedEagerExecution prepared(fixture.compiled, data.resources, fixture.request, fixture.owner);
+        auto session = initial_session(fixture, prepared); const auto before = session;
+        data.ple_backend.start_failure = failure;
+        PleTrace dispatcher(data.ple_backend);
+        require(rejects([&] { static_cast<void>(strix::execute_prepared_serial_token(
+            prepared, session, data.resources, 3U, dispatcher)); }) && dispatcher.trace.calls.empty() &&
+            data.ple_backend.start_calls == 1U && data.ple_backend.cancel_calls == 0U &&
+            !data.ple_prefetch.active && !data.ple_backend.active,
+            "PLE start failure crossed its pre-dispatch transaction boundary");
+        same_session(session, before);
+        data.ple_backend.start_failure = CountingPle::StartFailure::none;
+        PleTrace retry(data.ple_backend);
+        static_cast<void>(strix::execute_prepared_serial_token(prepared, session, data.resources, 3U, retry));
+        require(session.next_position == 1U && data.ple_backend.finish_calls == 1U,
+                "pre-dispatch PLE start rejection could not be retried");
+    }
+    for (const unsigned location : {0U, 1U, 2U}) {
+        PleFixture fixture; auto& data = *fixture.owner;
+        strix::PreparedEagerExecution prepared(fixture.compiled, data.resources, fixture.request, fixture.owner);
+        const auto ple = *prepared.ple_step_id();
+        require(ple > 0U && ple + 1U < fixture.compiled.execution.steps.size(),
+                "PLE failure fixture cannot cover both sides of its runtime step");
+        auto session = initial_session(fixture, prepared); const auto before = session;
+        PleTrace dispatcher(data.ple_backend);
+        dispatcher.trace.fail_step = location == 0U ? ple - 1U : location == 1U ? ple : ple + 1U;
+        bool completed = false;
+        require(rejects([&] { static_cast<void>(strix::execute_prepared_serial_token(
+            prepared, session, data.resources, 3U, dispatcher, [&] { completed = true; })); }) && !completed,
+            "dispatch failure with active PLE reached completion publication");
+        require(data.ple_backend.cancel_calls == (location < 2U ? 1U : 0U) &&
+                data.ple_backend.finish_calls == (location < 2U ? 0U : 1U) &&
+                !data.ple_prefetch.active && !data.ple_backend.active,
+                "dispatch failure canceled an already consumed PLE or leaked an active one");
+        require_poisoned(session, before);
+        const auto starts = data.ple_backend.start_calls;
+        PleTrace poisoned(data.ple_backend);
+        require(rejects([&] { static_cast<void>(strix::execute_prepared_serial_token(
+            prepared, session, data.resources, 3U, poisoned)); }) && poisoned.trace.calls.empty() &&
+            data.ple_backend.start_calls == starts, "poisoned PLE session restarted work");
+    }
+    for (const unsigned failure : {0U, 1U, 2U}) {
+        PleFixture fixture; auto& data = *fixture.owner;
+        strix::PreparedEagerExecution prepared(fixture.compiled, data.resources, fixture.request, fixture.owner);
+        auto session = initial_session(fixture, prepared); const auto before = session;
+        PleTrace dispatcher(data.ple_backend);
+        dispatcher.consume = failure != 0U;
+        data.ple_backend.fail_finish = failure == 1U;
+        bool completed = false;
+        const auto complete = [&] {
+            completed = true; same_session(session, before);
+            throw std::runtime_error("injected post-PLE completion failure");
+        };
+        require(rejects([&] { static_cast<void>(strix::execute_prepared_serial_token(
+            prepared, session, data.resources, 3U, dispatcher, complete)); }),
+            "unconsumed/finish/completion failure was swallowed");
+        require(completed == (failure == 2U) &&
+                data.ple_backend.finish_calls == (failure == 0U ? 0U : 1U) &&
+                data.ple_backend.cancel_calls == (failure == 2U ? 0U : 1U) &&
+                !data.ple_prefetch.active && !data.ple_backend.active,
+                "PLE failure completion/cancel counts differ from the original transaction");
+        require_poisoned(session, before);
+    }
+}
+void ple_single_admission_and_lifetime() {
+    PleFixture fixture;
+    std::weak_ptr<Storage> lifetime = fixture.owner;
+    auto* data = fixture.owner.get();
+    {
+        strix::PreparedEagerExecution prepared(fixture.compiled, data->resources, fixture.request, fixture.owner);
+        auto session = initial_session(fixture, prepared);
+        const auto counts = admission_counts(prepared, data->resources, session_request(session), data->ple_backend);
+        fixture.owner.reset();
+        require(!lifetime.expired(), "prepared PLE backend/resources owner was not retained");
+        const std::uint32_t* stable_order = nullptr;
+        for (std::uint32_t token = 3; token < 7U; ++token) {
+            data->ple_backend.clear_counts();
+            const auto before = session;
+            PleTrace dispatcher(data->ple_backend);
+            bool completed = false;
+            const auto result = strix::execute_prepared_serial_token(prepared, session, data->resources, token, dispatcher, [&] {
+                same_session(session, before);
+                require(!data->ple_prefetch.active && data->ple_backend.finish_calls == 1U,
+                        "completion callback preceded PLE consumption");
+                completed = true;
+            });
+            require(dispatcher.identities_at_first_dispatch == counts.validation + counts.prefetch_start,
+                    "prepared session did not perform exactly one full admission before PLE and first dispatch");
+            require(completed && data->ple_backend.start_calls == 1U && data->ple_backend.finish_calls == 1U &&
+                    data->ple_backend.cancel_calls == 0U && !data->ple_prefetch.active && !data->ple_backend.active,
+                    "successful repeated PLE token has incomplete protocol counts");
+            if (!stable_order) stable_order = result.completion_order.data();
+            require(result.completion_order.data() == stable_order &&
+                    result.completion_order.size() == fixture.compiled.execution.steps.size(),
+                    "prepared PLE result lost its immutable complete submission order");
+            for (std::size_t index = 0; index < result.completion_order.size(); ++index)
+                require(result.completion_order[index] == fixture.compiled.execution.steps[index].id,
+                        "prepared PLE submission order differs from the original compiled plan");
+            require(session.next_position == before.next_position + 1U &&
+                    session.committed_tokens == before.committed_tokens + 1U &&
+                    strix::arithmetic_lineage_valid(session.arithmetic_lineage, session.next_position),
+                    "successful repeated PLE token did not publish contiguous session state");
+        }
+        data->ple_backend.clear_counts();
+        PleTrace public_dispatch(data->ple_backend);
+        const auto direct = prepared.run(data->resources, session_request(session), public_dispatch);
+        require(public_dispatch.identities_at_first_dispatch == counts.validation &&
+                direct.completion_order.data() == stable_order,
+                "public run after session calls reused a session-only admission or changed its result view");
+    }
+    require(lifetime.expired(), "prepared destruction leaked the PLE backend/resources owner");
+}
 } // namespace
 
 int main() try {
@@ -419,6 +814,8 @@ int main() try {
     static_assert(std::is_same_v<decltype(std::declval<const strix::PreparedEagerExecution&>().compiled()),
                                  const strix::CompiledSerialExecution&>);
     equivalence(); dispatch_failure(); dynamic_rejection(); preparation_rejection(); retained_owner(); session_adapter();
+    public_run_admission(); ple_between_call_rejection(); ple_preflight_guards();
+    ple_failure_boundaries(); ple_single_admission_and_lifetime();
     std::cout << "prepared eager host contract fixtures passed; no native work\n";
     return 0;
 } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }

@@ -6,8 +6,9 @@
 
 namespace strix {
 // Preserves the existing serial session's preflight, PLE, completion hook and
-// poison/commit boundaries. Only the immutable plan runner and cached PLE step
-// differ; device completion remains the caller's responsibility.
+// poison/commit boundaries. Full admission runs once, before PLE starts; the
+// private runner dispatches that same admitted request. Device completion
+// remains the caller's responsibility.
 PreparedEagerExecutionResult execute_prepared_serial_token(
     const PreparedEagerExecution& prepared,
     SerialSessionContext& session,
@@ -16,12 +17,15 @@ PreparedEagerExecutionResult execute_prepared_serial_token(
     EagerExecutionDispatcher& dispatcher,
     const std::function<void()>& before_commit) {
     const auto& compiled = prepared.compiled();
-    EagerExecutionRequest request;
-    request.logical_rows = 1;
-    request.request_concurrency = 1;
-    request.input_token_id = input_token_id;
-    request.position = session.next_position;
-    request.state = session.state;
+    const EagerExecutionRequest request = [&] {
+        EagerExecutionRequest value;
+        value.logical_rows = 1;
+        value.request_concurrency = 1;
+        value.input_token_id = input_token_id;
+        value.position = session.next_position;
+        value.state = session.state;
+        return value;
+    }();
     prepared.validate_dynamic(resources, request);
 
     if (session.runtime_compatibility_identity == 0 ||
@@ -98,7 +102,7 @@ PreparedEagerExecutionResult execute_prepared_serial_token(
     PreparedEagerExecutionResult result;
     try {
         result =
-            prepared.run(resources, request, dispatcher);
+            prepared.run_admitted(resources, request, dispatcher);
         if (resources.ple_prefetch != nullptr &&
             resources.ple_prefetch->active) {
             cancel_ple_lookup_prefetch(
