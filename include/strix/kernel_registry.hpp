@@ -138,7 +138,7 @@ struct OfflineTuningPlan {
     std::span<const OfflineTuningKey> step_keys;
     std::span<const OfflineTuningRecord> records;
 };
-enum class TuningSelectionReason { qualified_record, invalid_key, ambiguous_records, no_qualified_record };
+enum class TuningSelectionReason { qualified_record, invalid_key, ambiguous_records, no_qualified_record, selection_policy_mismatch };
 struct TunedKernelSelection {
     const KernelVariant* variant = nullptr;
     TuningSelectionReason reason = TuningSelectionReason::no_qualified_record;

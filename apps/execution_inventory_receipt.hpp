@@ -19,6 +19,7 @@ inline const char* tuning_reason(kernels::TuningSelectionReason reason) {
     case kernels::TuningSelectionReason::invalid_key: return "invalid_key";
     case kernels::TuningSelectionReason::ambiguous_records: return "ambiguous_records";
     case kernels::TuningSelectionReason::no_qualified_record: return "no_qualified_record";
+    case kernels::TuningSelectionReason::selection_policy_mismatch: return "selection_policy_mismatch";
     }
     throw std::invalid_argument("inventory tuning selection reason is invalid");
 }

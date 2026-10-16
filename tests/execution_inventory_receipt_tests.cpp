@@ -107,7 +107,8 @@ int main() {
         {strix::kernels::TuningSelectionReason::qualified_record, "qualified_record"},
         {strix::kernels::TuningSelectionReason::invalid_key, "invalid_key"},
         {strix::kernels::TuningSelectionReason::ambiguous_records, "ambiguous_records"},
-        {strix::kernels::TuningSelectionReason::no_qualified_record, "no_qualified_record"}};
+        {strix::kernels::TuningSelectionReason::no_qualified_record, "no_qualified_record"},
+        {strix::kernels::TuningSelectionReason::selection_policy_mismatch, "selection_policy_mismatch"}};
     for (const auto& [reason, name] : reasons) {
         auto tuned = fixture.compiled;
         for (auto& binding : tuned.bindings.bindings) {

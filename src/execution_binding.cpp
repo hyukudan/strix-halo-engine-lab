@@ -209,8 +209,24 @@ ExecutionBindingPlan bind_serial_execution_plan(
             const auto tuned = registry.select_tuned(query,
                 request.offline_tuning->step_keys[step.id], request.offline_tuning->records);
             binding.tuning_selection_reason = tuned.reason;
-            if (tuned.reason == kernels::TuningSelectionReason::qualified_record)
-                selected = tuned.variant;
+            if (tuned.reason == kernels::TuningSelectionReason::qualified_record) {
+                // Offline costs cannot reverse a layer-scoped user choice or
+                // use evidence for another resolved numerical contract.
+                const auto* candidate = tuned.variant;
+                bool compatible = candidate && selected->numerical_contract_identity != 0 &&
+                    candidate->numerical_contract_identity == selected->numerical_contract_identity;
+                if (candidate && step.op == SerialOp::indexed_attention)
+                    compatible = compatible && candidate->id.ends_with(qsa_input_prefetch::kernel_suffix) ==
+                        selected->id.ends_with(qsa_input_prefetch::kernel_suffix);
+                if (candidate && *binding.family == kernels::OperatorFamily::hyper_mix)
+                    compatible = compatible && candidate->id.ends_with(lane_chain_hyper_output_suffix) ==
+                        selected->id.ends_with(lane_chain_hyper_output_suffix);
+                if (candidate && step.op == SerialOp::shared_expert)
+                    compatible = compatible && candidate->id.ends_with(shared_expert_prefetch::kernel_suffix) ==
+                        selected->id.ends_with(shared_expert_prefetch::kernel_suffix);
+                if (compatible) selected = candidate;
+                else binding.tuning_selection_reason = kernels::TuningSelectionReason::selection_policy_mismatch;
+            }
         }
         if (selected == nullptr) {
             ++output.missing_steps;

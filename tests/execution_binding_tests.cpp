@@ -1,4 +1,5 @@
 #include "strix/execution_binding.hpp"
+#include "strix/shared_expert_prefetch.hpp"
 
 #include <iostream>
 #include <string>
@@ -108,6 +109,49 @@ int main() {
             model, plan, registry, request);
     expect(rows_two.bound_steps == 0,
            "row-class mismatch prevents accidental C1 kernel reuse");
+
+    {
+        strix::ExecutionBindingRequest scoped;
+        scoped.prefetch_q8_shared_expert = true;
+        const auto shape = strix::execution_shape_for(model, strix::SerialOp::shared_expert, scoped);
+        auto ordinary = make_variant("shared.reference", strix::kernels::OperatorFamily::shared_expert, shape);
+        ordinary.qualification = strix::kernels::QualificationStatus::target_qualified;
+        ordinary.measured_seconds = 1e-6; ordinary.numerical_contract_identity = 17;
+        auto prefetched = ordinary;
+        prefetched.id += strix::shared_expert_prefetch::kernel_suffix;
+        prefetched.measured_seconds = 2e-6;
+        strix::kernels::KernelRegistry scoped_registry;
+        scoped_registry.add(ordinary); scoped_registry.add(prefetched);
+        strix::kernels::OfflineTuningKey key;
+        key.gfx_target = "gfx1151"; key.device_sku = "fixture"; key.compute_units = 40;
+        key.compiler_identity = "test"; key.hip_identity = "fixture";
+        key.binary_sha256 = std::string(64, 'a'); key.model_content_sha256 = std::string(64, 'b');
+        key.compiler_flags_sha256 = std::string(64, 'c');
+        key.input_precision = key.output_precision = "bf16"; key.accumulator_precision = "fp32";
+        key.weight_format = "q8"; key.input_layout = key.output_layout = "test";
+        key.state_layout = "fixture"; key.context_bucket = "1-8192"; key.memory_regime = "registered";
+        key.family = ordinary.family; key.shape = shape; key.m = key.n = key.k = 1;
+        key.numerical_contract_identity = 17;
+        strix::kernels::OfflineTuningRecord baseline;
+        baseline.key = key; baseline.kernel_id = ordinary.id;
+        baseline.qualification_receipt_sha256 = std::string(64, 'd');
+        baseline.median_complete_seconds = 1e-6; baseline.samples = 3;
+        baseline.complete_workload = baseline.owners_and_resources_qualified = true;
+        auto prefetch_record = baseline;
+        prefetch_record.kernel_id = prefetched.id; prefetch_record.median_complete_seconds = 2e-6;
+        std::vector<strix::kernels::OfflineTuningKey> keys(plan.steps.size(), key);
+        std::vector<strix::kernels::OfflineTuningRecord> records{baseline, prefetch_record};
+        strix::kernels::OfflineTuningPlan tuning{keys, records}; scoped.offline_tuning = &tuning;
+        const auto result = strix::bind_serial_execution_plan(model, plan, scoped_registry, scoped);
+        std::size_t checked = 0;
+        for (const auto& binding : result.bindings) if (binding.op == strix::SerialOp::shared_expert) {
+            ++checked;
+            expect(binding.kernel_id == prefetched.id && binding.tuning_selection_reason ==
+                strix::kernels::TuningSelectionReason::selection_policy_mismatch,
+                "offline timings must not undo an explicit shared-expert layer policy");
+        }
+        expect(checked > 0, "scoped tuning fixture covers real shared-expert steps");
+    }
 
     if (failures == 0) {
         std::cout << "execution binding tests passed\n";
