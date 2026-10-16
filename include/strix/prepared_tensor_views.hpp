@@ -38,7 +38,8 @@ public:
                                  const ExecutionTensorAccessPlan*) const;
 
     // Valid lookups allocate nothing and return references into this deep
-    // snapshot. Index lookup is O(1); name and access lookup are O(log N).
+    // snapshot. Tensor index and dense step/slot lookup are O(1); name lookup
+    // and a sparse-slot fallback are O(log N).
     [[nodiscard]] const RuntimeTensorBinding& tensor(
         std::uint64_t execution_identity, std::uint32_t index) const;
     [[nodiscard]] const RuntimeTensorBinding& tensor(

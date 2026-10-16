@@ -1,5 +1,6 @@
 #include "strix/prepared_tensor_views.hpp"
 
+#include <algorithm>
 #include <limits>
 #include <map>
 #include <stdexcept>
@@ -66,6 +67,8 @@ struct PreparedTensorViews::Impl {
     const ModelRuntimeBinding* const weights_handle;
     const ExecutionTensorAccessPlan* const access_handle;
     std::map<std::string, std::uint32_t, std::less<>> names;
+    struct AccessRange { std::size_t begin = 0; std::size_t count = 0; };
+    std::vector<AccessRange> step_accesses;
 
     Impl(std::uint64_t identity, const SerialExecutionPlan& execution,
          const ModelManifest& source_manifest, const ModelRuntimeBinding& source_weights,
@@ -91,6 +94,17 @@ struct PreparedTensorViews::Impl {
         const auto expected = compile_execution_tensor_access_plan(execution, manifest, index, requirements);
         if (!same_access(expected, accesses))
             throw std::invalid_argument("prepared tensor access differs from canonical step/slot requirements");
+        // Canonical accesses are sorted by step and slot. Retain only offsets
+        // into our deep snapshot, never pointers into the caller's vectors.
+        step_accesses.resize(execution.steps.size());
+        for (std::size_t i = 0; i < accesses.accesses.size(); ++i) {
+            const auto step = accesses.accesses[i].step_id;
+            if (step >= step_accesses.size())
+                throw std::invalid_argument("prepared tensor access step is outside execution");
+            auto& range = step_accesses[step];
+            if (!range.count) range.begin = i;
+            ++range.count;
+        }
         for (std::size_t i = 0; i < manifest.tensors.size(); ++i) {
             if (manifest.tensors[i].name.empty() ||
                 !names.emplace(manifest.tensors[i].name, static_cast<std::uint32_t>(i)).second)
@@ -136,8 +150,21 @@ const RuntimeTensorBinding& PreparedTensorViews::tensor(std::uint64_t identity, 
 const ExecutionTensorAccess& PreparedTensorViews::access(std::uint64_t identity,
     std::uint32_t step_id, std::uint32_t binding_slot) const {
     impl_->require_execution(identity);
-    const auto* found = find_execution_tensor_access(impl_->accesses, step_id, binding_slot);
-    if (!found) throw std::invalid_argument("dispatch tensor binding slot is not present for this step");
+    if (step_id >= impl_->step_accesses.size())
+        throw std::invalid_argument("dispatch tensor binding slot is not present for this step");
+    const auto range = impl_->step_accesses[step_id];
+    if (binding_slot < range.count) {
+        const auto& entry = impl_->accesses.accesses[range.begin + binding_slot];
+        if (entry.binding_slot == binding_slot) return entry;
+    }
+    // Preserve support for canonical families with non-dense slots. Current
+    // production families take the constant-time indexed path above.
+    const auto first = impl_->accesses.accesses.begin() + range.begin;
+    const auto last = first + range.count;
+    const auto found = std::lower_bound(first, last, binding_slot,
+        [](const ExecutionTensorAccess& entry, std::uint32_t slot) { return entry.binding_slot < slot; });
+    if (found == last || found->binding_slot != binding_slot)
+        throw std::invalid_argument("dispatch tensor binding slot is not present for this step");
     return *found;
 }
 } // namespace strix
