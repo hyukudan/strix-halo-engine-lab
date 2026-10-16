@@ -493,6 +493,44 @@ DirectTransportNativeLinkSession::send_state(
     return sends_.state(handle);
 }
 
+namespace {
+bool retirement_lease_equal(const DirectTransportLease& a,const DirectTransportLease& b) noexcept {
+    return a.physical_link_id==b.physical_link_id && a.connection_epoch==b.connection_epoch &&
+        a.pool_binding_identity==b.pool_binding_identity && a.link_index==b.link_index && a.lease_generation==b.lease_generation;
+}
+bool retirement_descriptor_equal(const TransferDescriptor& a,const TransferDescriptor& b) noexcept {
+    return a.protocol_version==b.protocol_version && a.connection_epoch==b.connection_epoch &&
+        a.model_plan_id==b.model_plan_id && a.request_id==b.request_id && a.generation==b.generation &&
+        a.boundary_id==b.boundary_id && a.sequence==b.sequence && a.shape_fingerprint==b.shape_fingerprint &&
+        a.dtype_id==b.dtype_id && a.byte_length==b.byte_length;
+}
+}
+void DirectTransportNativeLinkSession::require_current_retirement_lease(const DirectTransportLease& expected) const {
+    require_current_lease();
+    if(!retirement_lease_equal(lease_,expected) ||
+        !assess_direct_native_readiness(backend_->capabilities(),backend_->direct_capabilities(),*link_).ready)
+        throw std::invalid_argument("retirement requires the current exact native provider/lease/pool binding");
+}
+void DirectTransportNativeLinkSession::require_retired_send(TransferHandle handle,
+    const DirectTransportLease& expected,std::uint64_t bytes) const {
+    require_current_retirement_lease(expected);
+    if(!bytes) throw std::invalid_argument("send retirement requires nonempty exact payload");
+    const auto& value=sends_.state(handle);
+    if(value.handle!=handle || value.failed || value.expected_bytes!=bytes ||
+        !value.local_buffer_reusable || !value.remote_transport_acked || !value.remote_consumer_complete)
+        throw std::logic_error("native send operation is not fully retired");
+}
+void DirectTransportNativeLinkSession::require_retired_receive(TransferHandle handle,
+    const DirectTransportLease& expected,const TransferDescriptor& descriptor) const {
+    require_current_retirement_lease(expected);
+    if(receive_quarantined_) throw std::logic_error("retirement cannot reuse a quarantined receive pool");
+    const auto& value=receives_.state(handle);
+    if(value.handle!=handle || value.failed || !retirement_descriptor_equal(value.descriptor,descriptor) ||
+        value.completed_bytes!=descriptor.byte_length || !value.consumer_credit_published ||
+        value.ownership!=BufferOwnership::reusable)
+        throw std::logic_error("native receive operation or its GPU consumer is not retired");
+}
+
 void DirectTransportNativeLinkSession::close() {
     require_active();
     closing_ = true;

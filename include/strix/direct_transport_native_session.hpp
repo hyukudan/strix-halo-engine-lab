@@ -118,6 +118,16 @@ public:
     send_state(
         TransferHandle handle) const;
 
+    // Revalidate actual current lease/interface/pools and native readiness before
+    // reading operation completion. A copied ACK or old completion map is not
+    // sufficient. No polling, mutation, device sync or new allocation here in
+    // this class; provider capability queries retain their own API contract.
+    void require_current_retirement_lease(const DirectTransportLease& expected) const;
+    void require_retired_send(TransferHandle, const DirectTransportLease& expected,
+                              std::uint64_t expected_bytes) const;
+    void require_retired_receive(TransferHandle, const DirectTransportLease& expected,
+                                 const TransferDescriptor& expected_descriptor) const;
+
     // On unproved backend release, throws while retaining the active host lease
     // and fencing new work. Retry close only to obtain actual release proof.
     void close();

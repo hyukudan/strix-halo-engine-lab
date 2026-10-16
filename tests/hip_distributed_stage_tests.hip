@@ -272,6 +272,43 @@ void transaction_component(const std::shared_ptr<Owner>& first,const strix::Seri
             done0->local_state[1].generations==ready1.receipt.local_state.generations &&
             session0.health==strix::SerialSessionHealth::poisoned && session1.health==strix::SerialSessionHealth::poisoned,
             "native global frontier did not require both receipts or retagged a partial peer as a healthy serial session");
+        const auto sequence0=p0.frontier(),sequence1=p1.frontier();
+        require(sequence0 && sequence1 && sequence0->commit().history_identity==done0->history_identity &&
+            sequence1->commit().local_state[1].generations==ready1.receipt.local_state.generations &&
+            p0.current_binding().generation==binding.generation && p0.binding_identity()==done0->binding_identity &&
+            session0.next_position==saved0.next_position && session1.next_position==saved1.next_position &&
+            session0.arithmetic_lineage.tainted && session1.arithmetic_lineage.tainted,
+            "typed distributed frontier mutated or revalidated an ordinary partial-state serial session");
+        if(binding.position+1U<first->layout.context_tokens) {
+            const auto next=sequence0->derive_next_binding(input,binding.generation+1U);
+            require(next.position==binding.position+1U && next.peers[0].initial_state.generations==done0->local_state[0].generations &&
+                next.peers[1].initial_state.generations==done0->local_state[1].generations,
+                "native-derived next logical frontier copied global generations into local peers");
+        }
+        // This local-D2D component cannot mint an actual transport retirement
+        // capability. Full multi-token begin_next is exercised only by the
+        // separate real-physical-setup sequence fixture, never a forged permit.
+        strix::NativeDistributedTokenRetirement missing;
+        const auto committed_bytes=snapshot(*first);
+        bool invalid_next=false;
+        try {p0.begin_next(static_cast<std::uint32_t>(first->model.vocab_size),binding.generation+1U,std::move(missing));}
+        catch(const std::invalid_argument&) {invalid_next=true;}
+        require(invalid_next && p0.phase()==strix::DistributedTokenPhase::committed && p0.frontier(),
+            "invalid next input destroyed the previously committed distributed frontier");
+        invalid_next=false;
+        try {p0.begin_next(input,binding.generation,std::move(missing));}
+        catch(const std::invalid_argument&) {invalid_next=true;}
+        require(invalid_next && p0.phase()==strix::DistributedTokenPhase::committed,
+            "repeated generation admitted or altered the committed frontier");
+        invalid_next=false;
+        try {p0.begin_next(input,binding.generation+1U,std::move(missing));}
+        catch(const std::exception&) {invalid_next=true;}
+        const auto refused_bytes=snapshot(*first);
+        require(invalid_next && p0.phase()==strix::DistributedTokenPhase::in_doubt && !p0.frontier() &&
+            session0.health==strix::SerialSessionHealth::poisoned && session0.arithmetic_lineage.tainted &&
+            refused_bytes.device==committed_bytes.device && refused_bytes.host==committed_bytes.host,
+            "empty retirement capability permitted a next token or changed local state before submission");
+
         return;
     }
     const auto abort=p0.decide_abort();p1.observe_peer(abort);

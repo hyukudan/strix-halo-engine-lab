@@ -92,6 +92,7 @@ DistributedTokenTransaction::DistributedTokenTransaction(const CompiledSerialExe
             throw std::invalid_argument("distributed token source has unknown persistent-state flags");
         expected_global_.publish_write(step.writes_state);
     }
+    vocab_size_=serial.vocab_size;maximum_position_=serial.max_position_embeddings;
     identity_=distributed_token_binding_identity(b);
     if(!identity_) throw std::invalid_argument("distributed token binding identity is empty");
 }
@@ -163,5 +164,25 @@ std::optional<DistributedTokenCommit> DistributedTokenTransaction::committed_fro
     auto history=offset;hash(history,binding_.previous_history_identity);hash(history,identity_);hash(history,decision_);
     return DistributedTokenCommit{identity_,decision_,binding_.position+1U,binding_.committed_tokens+1U,history,
         expected_global_,expected_local_};
+}
+DistributedSequenceFrontier::DistributedSequenceFrontier(DistributedTokenBinding binding,
+    DistributedTokenCommit commit,std::uint64_t vocab,std::uint64_t maximum)
+    :binding_(std::move(binding)),commit_(std::move(commit)),vocab_size_(vocab),maximum_position_(maximum) {}
+DistributedTokenBinding DistributedSequenceFrontier::derive_next_binding(std::uint32_t token,std::uint64_t generation) const {
+    if(token>=vocab_size_ || !generation || generation<=binding_.generation ||
+        commit_.next_position>=maximum_position_ || commit_.next_position>=binding_.peers[0].context_capacity ||
+        commit_.next_position>=binding_.peers[1].context_capacity ||
+        commit_.committed_tokens==std::numeric_limits<std::uint64_t>::max())
+        throw std::invalid_argument("distributed sequence next input, generation or capacity is invalid");
+    auto next=binding_;next.generation=generation;next.input_token=token;
+    next.position=commit_.next_position;next.committed_tokens=commit_.committed_tokens;
+    next.previous_history_identity=commit_.history_identity;next.initial_global_state=commit_.global_state;
+    for(std::size_t node=0;node<next.peers.size();++node) next.peers[node].initial_state=commit_.local_state[node];
+    return next;
+}
+std::optional<DistributedSequenceFrontier> DistributedTokenTransaction::committed_sequence_frontier() const {
+    const auto commit=committed_frontier();
+    if(!commit) return std::nullopt;
+    return DistributedSequenceFrontier(binding_,*commit,vocab_size_,maximum_position_);
 }
 } // namespace strix

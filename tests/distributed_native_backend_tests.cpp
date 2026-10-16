@@ -8,6 +8,7 @@
 #include <optional>
 #include <string>
 #include <utility>
+#include <type_traits>
 #include <vector>
 
 namespace {
@@ -506,9 +507,157 @@ bool receive_rejected(SingleFixture& fixture) {
     return false;
 }
 
+// Separate actual transport owners from the per-token backend adapter so the
+// proof can retain every borrowed object without a backend<->owner cycle.
+struct TokenResources {
+    NativeBackend native;
+    strix::transport::DirectLinkLifecycle lifecycle=link();
+    strix::transport::DirectTransportPoolMemoryBinding memory=pools();
+    strix::transport::DirectTransportLeaseRegistry leases;
+    strix::transport::DirectTransportNativeLinkSession session=
+        strix::transport::DirectTransportNativeLinkSession::open(native,leases,lifecycle,memory,0);
+    Control control;
+    Local local;
+    Staging staging;
+    std::array<strix::transport::DirectTransportNativeLinkSession*,1> sessions{&session};
+    strix::DistributedExecutionBoundary boundary;
+    TokenResources() {
+        staging.tx=memory.links[0].tx;staging.rx=memory.links[0].rx;staging.full_retirement=true;
+        native.full_send_events=true;
+        boundary.boundary_id=4;boundary.payload_bytes=128;boundary.source_node=0;boundary.destination_node=1;
+        boundary.payloads.push_back({{strix::ExecutionBufferClass::hidden,0},1});
+        control.inbound=transfer(strix::transport::LinkDirection::inbound);
+        control.inbound.descriptor.shape_fingerprint=boundary.boundary_id^boundary.payload_bytes;
+        control.inbound.native_slices={{lifecycle.connection_epoch,1}};
+    }
+    strix::DistributedPlacementPlan plan() const {
+        strix::DistributedPlacementPlan result;result.plan_identity=1;result.executable=true;result.has_remote_work=true;
+        result.local_node=0;result.boundaries={boundary};return result;
+    }
+    strix::DistributedBoundaryTransfer outbound() const {
+        auto result=transfer(strix::transport::LinkDirection::outbound);
+        result.descriptor.shape_fingerprint=boundary.boundary_id^boundary.payload_bytes;return result;
+    }
+};
+void token_retirement_source_cases() {
+    static_assert(!std::is_copy_constructible_v<strix::NativeDistributedTokenRetirement>);
+    static_assert(!std::is_copy_assignable_v<strix::NativeDistributedTokenRetirement>);
+    static_assert(std::is_nothrow_move_constructible_v<strix::NativeDistributedTokenRetirement>);
+    const strix::DistributedRuntimeRequest request{77,2,3,7};
+    const auto reject=[](auto&& operation) {try {operation();} catch(const std::exception&) {return true;}return false;};
+    {
+        auto owner=std::make_shared<TokenResources>();std::weak_ptr<TokenResources> lifetime=owner;
+        auto backend=std::make_unique<strix::NativeDistributedBackend>(owner->sessions,owner->control,owner->local,owner->staging);
+        backend->begin_token_retirement(owner->plan(),request,0,99,owner);
+        backend->send_boundary(owner->boundary,owner->outbound());
+        auto proof=backend->retire_token();auto moved=std::move(proof);
+        expect(reject([&]{static_cast<void>(backend->retire_token());}) &&
+            reject([&]{backend->execute_local_step({});}) &&
+            reject([&]{backend->send_boundary(owner->boundary,owner->outbound());}),
+            "mint seals backend against duplicate proof, local work and new transfer");
+        owner.reset();backend.reset();expect(!lifetime.expired(),"moved proof retains actual native session/pools/staging owners");
+        moved=strix::NativeDistributedTokenRetirement{};
+        expect(lifetime.expired(),"retired proof release does not retain an ownership cycle");
+    }
+    {
+        auto owner=std::make_shared<TokenResources>();
+        strix::NativeDistributedBackend backend(owner->sessions,owner->control,owner->local,owner->staging);
+        backend.begin_token_retirement(owner->plan(),request,1,99,owner); // canonical plan remains origin-local0
+        static_cast<void>(backend.receive_boundary(owner->boundary));
+        expect(owner->staging.proof->destroyed==0,"token ledger retains actual completed GPU consumer proof");
+        auto proof=backend.retire_token();
+        expect(owner->staging.proof->destroyed==0,"receipt mint does not destroy retained consumer proof");
+    }
+    {
+        auto owner=std::make_shared<TokenResources>();
+        strix::NativeDistributedBackend backend(owner->sessions,owner->control,owner->local,owner->staging);
+        backend.begin_token_retirement(owner->plan(),request,0,99,owner);
+        expect(reject([&]{static_cast<void>(backend.retire_token());}),"missing boundary cannot mint completed coverage");
+    }
+    {
+        auto owner=std::make_shared<TokenResources>();
+        strix::NativeDistributedBackend backend(owner->sessions,owner->control,owner->local,owner->staging);
+        backend.begin_token_retirement(owner->plan(),request,0,99,owner);
+        auto aborted=backend.retire_aborted_token();
+        expect(reject([&]{backend.execute_remote_step({});}),"aborted zero-transfer attempt is sealed, not falsely completed");
+    }
+    for(unsigned bad=0;bad<4U;++bad) {
+        auto owner=std::make_shared<TokenResources>();
+        strix::NativeDistributedBackend backend(owner->sessions,owner->control,owner->local,owner->staging);
+        backend.begin_token_retirement(owner->plan(),request,0,99,owner);
+        auto wrong=owner->outbound();
+        if(!bad) ++wrong.descriptor.generation;
+        if(bad==1U) ++wrong.descriptor.request_id;
+        if(bad==2U) ++wrong.descriptor.model_plan_id;
+        if(bad==3U) ++wrong.descriptor.shape_fingerprint;
+        expect(reject([&]{backend.send_boundary(owner->boundary,wrong);}) && owner->native.sends.empty(),
+            "foreign generation/request/plan/shape rejects before native preparation");
+    }
+    {
+        auto owner=std::make_shared<TokenResources>();
+        strix::NativeDistributedBackend backend(owner->sessions,owner->control,owner->local,owner->staging);
+        backend.begin_token_retirement(owner->plan(),request,0,99,owner);
+        backend.send_boundary(owner->boundary,owner->outbound());
+        expect(reject([&]{backend.send_boundary(owner->boundary,owner->outbound());}),"duplicate boundary cannot enter operation ledger");
+    }
+    {
+        auto owner=std::make_shared<TokenResources>();
+        strix::NativeDistributedBackend backend(owner->sessions,owner->control,owner->local,owner->staging);
+        backend.begin_token_retirement(owner->plan(),request,0,99,owner);
+        backend.send_boundary(owner->boundary,owner->outbound());++owner->lifecycle.connection_epoch;
+        expect(reject([&]{static_cast<void>(backend.retire_token());}),"stale actual lease defeats old complete handle flags");
+    }
+    {
+        auto owner=std::make_shared<TokenResources>();
+        strix::NativeDistributedBackend backend(owner->sessions,owner->control,owner->local,owner->staging);
+        backend.begin_token_retirement(owner->plan(),request,0,99,owner);
+        backend.send_boundary(owner->boundary,owner->outbound());owner->native.native_identity.driver_identity+="-changed";
+        expect(reject([&]{static_cast<void>(backend.retire_token());}),"changed actual native provider defeats old complete handles");
+    }
+    {
+        auto owner=std::make_shared<TokenResources>();
+        strix::NativeDistributedBackend backend(owner->sessions,owner->control,owner->local,owner->staging);
+        backend.begin_token_retirement(owner->plan(),request,0,99,owner);
+        backend.send_boundary(owner->boundary,owner->outbound());++owner->memory.binding_identity;
+        expect(reject([&]{static_cast<void>(backend.retire_token());}),"changed actual pool binding defeats complete operation flags");
+    }
+    {
+        auto owner=std::make_shared<TokenResources>();owner->native.omit_consumer_event=true;
+        strix::NativeDistributedBackend backend(owner->sessions,owner->control,owner->local,owner->staging,{4,1});
+        backend.begin_token_retirement(owner->plan(),request,0,99,owner);
+        expect(reject([&]{backend.send_boundary(owner->boundary,owner->outbound());}) &&
+            reject([&]{static_cast<void>(backend.retire_aborted_token());}),
+            "timeout without actual consumer credit cannot mint even an aborted retirement proof");
+    }
+    {
+        auto owner=std::make_shared<TokenResources>();
+        strix::NativeDistributedBackend backend(owner->sessions,owner->control,owner->local,owner->staging);
+        backend.begin_token_retirement(owner->plan(),request,0,99,owner);
+        auto extra=owner->boundary;extra.boundary_id=5;
+        auto data=owner->outbound();data.descriptor.boundary_id=5;data.descriptor.shape_fingerprint=5U^extra.payload_bytes;
+        expect(reject([&]{backend.send_boundary(extra,data);}) && owner->native.sends.empty(),
+            "extra undeclared boundary rejects before staging or native preparation");
+    }
+    {
+        auto owner=std::make_shared<TokenResources>();owner->staging.full_retirement=false;
+        strix::NativeDistributedBackend backend(owner->sessions,owner->control,owner->local,owner->staging);
+        expect(reject([&]{backend.begin_token_retirement(owner->plan(),request,0,99,owner);}),
+            "legacy local-only TX retirement cannot enter strict token mode");
+    }
+    {
+        auto owner=std::make_shared<TokenResources>();
+        strix::NativeDistributedBackend backend(owner->sessions,owner->control,owner->local,owner->staging);
+        auto duplicate=owner->plan();duplicate.boundaries.push_back(owner->boundary);
+        expect(reject([&]{backend.begin_token_retirement(duplicate,request,0,99,owner);}),"duplicate closed boundary inventory rejects");
+        backend.execute_local_step({});
+        expect(reject([&]{backend.begin_token_retirement(owner->plan(),request,0,99,owner);}),"token mode cannot be enabled after dispatch");
+    }
+}
+
 }  // namespace
 
 int main() {
+    token_retirement_source_cases();
     NativeBackend native;
     auto lifecycle = link();
     auto memory = pools();

@@ -6,7 +6,8 @@
 #include <memory>
 
 namespace strix {
-// One explicitly bound two-peer token transaction, not a distributed decoder or
+class NativeDistributedTokenRetirement;
+// Retained sequence of explicitly bound two-peer token transactions, not a distributed decoder or
 // a persistent crash-recovery service. Real stage execution and all seven local
 // snapshot transfers are owned here. The caller retains allocator/generations,
 // original session, resources, stream and model through actual_owner.
@@ -19,8 +20,9 @@ namespace strix {
 //
 // prepare quarantines the borrowed ordinary SerialSessionContext before peers
 // may execute. A committed distributed frontier is NOT a healthy full local
-// serial context. Only a confirmed two-peer predecision rollback may republish
-// its saved history; D1/transfer failures preserve poison. No D1 clear/retag.
+// serial context. Only initial confirmed two-peer predecision rollback may
+// republish its original serial history; later rollback retains only a typed
+// distributed frontier. D1/transfer failures preserve poison. No D1 clear/retag.
 class HipDistributedTokenParticipant final : public DistributedNativeLocalExecutor {
 public:
     HipDistributedTokenParticipant(CompiledSerialExecution serial,DistributedPlacementPlan canonical_plan,
@@ -31,6 +33,14 @@ public:
     ~HipDistributedTokenParticipant();
     HipDistributedTokenParticipant(const HipDistributedTokenParticipant&) = delete;
     HipDistributedTokenParticipant& operator=(const HipDistributedTokenParticipant&) = delete;
+    // Does not prepare or mutate the next target. The current transaction must
+    // have both commit ACKs, or a healthy bilateral rollback after a previous
+    // distributed commit. The move-only proof comes from actual retired native
+    // handles, not a token/control ACK. Source owners remain the same.
+    void begin_next(std::uint32_t input_token,std::uint64_t generation,NativeDistributedTokenRetirement&&);
+    [[nodiscard]] const DistributedTokenBinding& current_binding() const noexcept;
+    [[nodiscard]] std::uint64_t binding_identity() const noexcept;
+    [[nodiscard]] std::optional<DistributedSequenceFrontier> frontier() const;
     [[nodiscard]] DistributedTokenMessage prepare();
     void execute_local_step(const DistributedStepPlacement&) override;
     [[nodiscard]] DistributedTokenMessage finish_local();
@@ -42,7 +52,9 @@ public:
     [[nodiscard]] DistributedTokenMessage acknowledge_commit();
     [[nodiscard]] DistributedTokenMessage restore_local();
     // Requires both restored receipts; only healthy cancellation may restore
-    // saved ordinary-session history. Copy/D1 failures stay poisoned.
+    // saved ordinary-session history ONLY before any distributed commit. Later
+    // rollback republishes only the previous typed distributed frontier; the
+    // ordinary serial anchor stays poisoned. Copy/D1 failures stay poisoned.
     void finalize_rollback();
     void send(FramedDistributedTokenWire&,const DistributedTokenMessage&);
     void receive(FramedDistributedTokenWire&);

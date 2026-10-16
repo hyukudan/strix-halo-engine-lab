@@ -48,9 +48,10 @@ struct HipDistributedTokenParticipant::Impl {
     CompiledSerialExecution serial;
     DistributedPlacementPlan plan;
     ModelContract model;
+    HipLauncherCatalogConfig config;
     ExecutionRuntimeResources resources;
     SerialSessionContext& ordinary;
-    SerialSessionContext saved,restore_shadow;
+    SerialSessionContext saved;
     HipLaunchContext scope;
     std::uint32_t node;
     DistributedTokenTransaction protocol;
@@ -61,18 +62,20 @@ struct HipDistributedTokenParticipant::Impl {
     SerialSessionSnapshotPlan snapshot;
     SerialSessionRestorePlan restore;
     SessionSnapshotMemoryOwner snapshot_memory;
+    SessionSnapshotMemoryBinding active_snapshot_memory;
+    std::optional<DistributedSequenceFrontier> sequence;
     HipSessionSnapshotTransferBackend transfer;
     std::unique_ptr<HipDistributedStage> stage;
     bool prepared=false,ready=false,restored=false,native_failed=false,quarantined=false,rollback_published=false,position_materialized=false;
     std::uint64_t last_sent=0;
     std::optional<DistributedTokenMessage> last_emitted;
 
-    Impl(CompiledSerialExecution source,DistributedPlacementPlan placement,ModelContract contract,HipLauncherCatalogConfig config,
+    Impl(CompiledSerialExecution source,DistributedPlacementPlan placement,ModelContract contract,HipLauncherCatalogConfig launch_config,
         const ExecutionRuntimeResources& r,SerialSessionContext& session,HipLaunchContext native,std::shared_ptr<const void> retained,
         RuntimeMemoryAllocator& allocator,AllocationGenerationSource& generations,DistributedTokenBinding binding,
         std::uint32_t local_node,std::uint64_t budget)
         :owner(std::move(retained)),serial(std::move(source)),plan(std::move(placement)),model(std::move(contract)),
-         resources(r),ordinary(session),saved(session),restore_shadow(session),scope(native),node(local_node),
+         config(std::move(launch_config)),resources(r),ordinary(session),saved(session),scope(native),node(local_node),
          protocol(serial,plan,checked_manifest(r),checked_access(r),std::move(binding)) {
         if(!owner || node>1U || !budget || !resources.model_manifest || !resources.model_weights || !resources.tensor_access ||
             !resources.session_state_layout || !resources.session_state_memory || !resources.scratch)
@@ -116,7 +119,8 @@ struct HipDistributedTokenParticipant::Impl {
         restore=build_serial_session_restore_plan(model,*resources.session_state_layout,identities.compatibility_identity,snapshot);
         // Allocate both snapshot sections before any target state mutation.
         snapshot_memory=SessionSnapshotMemoryOwner::allocate(snapshot,allocator,generations);
-        validate_snapshot_memory_binding(snapshot,snapshot_memory.binding());
+        active_snapshot_memory=snapshot_memory.binding();
+        validate_snapshot_memory_binding(snapshot,active_snapshot_memory);
         const auto& snap=snapshot_memory.binding();
         require_disjoint(snap.device_section_base,snap.device_section_bytes,snap.host_section_base,snap.host_section_bytes);
         for(const auto& section:std::array<std::pair<std::uintptr_t,std::uint64_t>,2>{{
@@ -179,7 +183,7 @@ struct HipDistributedTokenParticipant::Impl {
         catch(...) {uncertain();throw;}
     }
     DistributedTokenReceipt snapshot_receipt(PersistentStateGenerations state,std::uint32_t completed=0) const {
-        return {snapshot.plan_identity,snapshot_memory.binding().allocation_generation,state,completed};
+        return {snapshot.plan_identity,active_snapshot_memory.allocation_generation,state,completed};
     }
 };
 HipDistributedTokenParticipant::HipDistributedTokenParticipant(CompiledSerialExecution serial,DistributedPlacementPlan plan,
@@ -189,6 +193,78 @@ HipDistributedTokenParticipant::HipDistributedTokenParticipant(CompiledSerialExe
     :impl_(std::make_unique<Impl>(std::move(serial),std::move(plan),std::move(model),std::move(config),resources,session,scope,
         std::move(owner),allocator,generations,std::move(binding),node,budget)) {}
 HipDistributedTokenParticipant::~HipDistributedTokenParticipant()=default;
+void HipDistributedTokenParticipant::begin_next(std::uint32_t input,std::uint64_t generation,
+    NativeDistributedTokenRetirement&& retirement) {
+    auto& s=*impl_;
+    const auto phase=s.protocol.phase();
+    if(s.native_failed || (phase!=DistributedTokenPhase::committed &&
+        !(phase==DistributedTokenPhase::rolled_back && s.rollback_published && s.sequence)))
+        throw std::logic_error("distributed continuation requires a committed or bilaterally restored distributed frontier");
+    s.original();s.validate();
+    const auto& current=s.protocol.binding();
+    if(current.generation==std::numeric_limits<std::uint64_t>::max() || generation!=current.generation+1U)
+        throw std::invalid_argument("distributed continuation generation must advance exactly once");
+    auto frontier=phase==DistributedTokenPhase::committed?s.protocol.committed_sequence_frontier():s.sequence;
+    if(!frontier) throw std::logic_error("distributed continuation has no two-ACK lineage");
+    auto binding=frontier->derive_next_binding(input,generation);
+    DistributedTokenTransaction next(s.serial,s.plan,*s.resources.model_manifest,*s.resources.tensor_access,binding);
+    SerialSessionSnapshotRequest request;
+    request.compiled_execution_identity=s.serial.execution_identity;
+    request.runtime_compatibility_identity=s.identities.compatibility_identity;
+    request.next_position=binding.position;request.committed_tokens=binding.committed_tokens;
+    request.state=binding.peers[s.node].initial_state;
+    auto snapshot=build_serial_session_snapshot_plan(s.model,*s.resources.session_state_layout,request);
+    // Logical snapshot metadata may change; the complete physical storage,
+    // allocation generation and retained allocator owner never do. Rebinding is
+    // admitted only for an identical canonical full-seven range layout.
+    if(snapshot.policy!=SessionSnapshotPolicy::full_components || s.snapshot.policy!=snapshot.policy ||
+        snapshot.ranges.size()!=7U || snapshot.ranges.size()!=s.snapshot.ranges.size() ||
+        snapshot.device_bytes!=s.snapshot.device_bytes || snapshot.host_bytes!=s.snapshot.host_bytes ||
+        snapshot.alignment!=s.snapshot.alignment || snapshot.state_layout_identity!=s.snapshot.state_layout_identity ||
+        snapshot.recurrent_storage!=s.snapshot.recurrent_storage)
+        throw std::invalid_argument("distributed continuation changed the retained snapshot capacity or format");
+    for(std::size_t i=0;i<snapshot.ranges.size();++i) {
+        const auto& a=snapshot.ranges[i];const auto& b=s.snapshot.ranges[i];
+        if(a.component!=b.component || a.storage!=b.storage || a.source_offset!=b.source_offset ||
+            a.destination_offset!=b.destination_offset || a.bytes!=b.bytes || a.provisional!=b.provisional)
+            throw std::invalid_argument("distributed continuation changed a retained snapshot range");
+    }
+    auto memory=s.snapshot_memory.binding();memory.snapshot_plan_identity=snapshot.plan_identity;
+    validate_snapshot_memory_binding(snapshot,memory);
+    auto restore=build_serial_session_restore_plan(s.model,*s.resources.session_state_layout,
+        s.identities.compatibility_identity,snapshot);
+    std::unique_ptr<HipDistributedStage> replacement;
+    if(phase==DistributedTokenPhase::rolled_back) {
+        // abort is sticky; never clear that latch. Build a genuinely new stage
+        // using the same actual owners after the complete bilateral restore.
+        std::vector<std::uint32_t> nodes;for(const auto& step:s.plan.steps) nodes.push_back(step.node);
+        const auto local_plan=build_distributed_placement_plan(s.serial,*s.resources.model_manifest,*s.resources.tensor_access,nodes,s.node);
+        const auto& peer=binding.peers[s.node];
+        replacement=std::make_unique<HipDistributedStage>(s.serial,local_plan,peer.first_step,peer.last_step,
+            s.model,s.config,s.resources,s.scope,s.owner);
+    }
+    const DistributedRuntimeRequest request_id{current.connection_epoch,current.request_id,current.generation,current.boundary_dtype_id};
+    try {
+        retirement.consume_matches(s.protocol.binding_identity(),current.placement_plan_identity,request_id,s.node,
+            phase==DistributedTokenPhase::committed?NativeDistributedRetirementOutcome::completed_boundaries:
+                NativeDistributedRetirementOutcome::aborted_attempt);
+    } catch(...) {s.uncertain();throw;}
+    // No fallible allocation follows consumed retirement proof. Replaced-stage
+    // teardown retains its original-device quiescence/fail-stop contract.
+    s.sequence=std::move(frontier);s.protocol=std::move(next);
+    s.snapshot=std::move(snapshot);s.restore=std::move(restore);s.active_snapshot_memory=memory;
+    if(replacement) s.stage=std::move(replacement);
+    s.prepared=false;s.ready=false;s.restored=false;s.rollback_published=false;s.position_materialized=false;
+    s.last_sent=0;s.last_emitted.reset();
+}
+const DistributedTokenBinding& HipDistributedTokenParticipant::current_binding() const noexcept {return impl_->protocol.binding();}
+std::uint64_t HipDistributedTokenParticipant::binding_identity() const noexcept {return impl_->protocol.binding_identity();}
+std::optional<DistributedSequenceFrontier> HipDistributedTokenParticipant::frontier() const {
+    if(impl_->native_failed || impl_->protocol.phase()==DistributedTokenPhase::in_doubt) return std::nullopt;
+    const auto committed=impl_->protocol.committed_sequence_frontier();
+    return committed?committed:impl_->sequence;
+}
+
 DistributedTokenMessage HipDistributedTokenParticipant::prepare() {
     auto& s=*impl_;
     if(s.prepared || s.protocol.phase()!=DistributedTokenPhase::preparing) throw std::logic_error("distributed participant cannot prepare twice");
@@ -207,7 +283,7 @@ DistributedTokenMessage HipDistributedTokenParticipant::prepare() {
             if(hipStreamSynchronize(s.scope.stream)!=hipSuccess)
                 throw std::runtime_error("distributed snapshot producer fence failed");
             capture_serial_session_snapshot(s.snapshot,*s.resources.session_state_layout,*s.resources.session_state_memory,
-                s.snapshot_memory.binding(),s.transfer);
+                s.active_snapshot_memory,s.transfer);
         });
         // Both peers must publish prepared before either can mutate the target.
         // Quarantine the ordinary serial entry before publishing that receipt.
@@ -269,11 +345,11 @@ DistributedTokenMessage HipDistributedTokenParticipant::restore_local() {
         throw std::logic_error("distributed rollback requires the agreed precommit abort decision");
     s.original();s.validate();s.stage->abort();
     try {
-        s.guard.run([&] {restore_serial_session_snapshot(s.restore_shadow,s.restore,*s.resources.session_state_layout,
-            *s.resources.session_state_memory,s.snapshot_memory.binding(),s.transfer);});
+        s.guard.run([&] {restore_serial_session_snapshot_payload(s.restore,*s.resources.session_state_layout,
+            *s.resources.session_state_memory,s.active_snapshot_memory,s.transfer);});
         s.validate();s.restored=true;
         // No original history/session publication until BOTH restored receipts.
-        return s.message(DistributedTokenMessageKind::restored,s.snapshot_receipt(s.saved.state));
+        return s.message(DistributedTokenMessageKind::restored,s.snapshot_receipt(s.protocol.binding().peers[s.node].initial_state));
     } catch(...) {s.native_failed=true;s.uncertain();throw;}
 }
 void HipDistributedTokenParticipant::finalize_rollback() {
@@ -291,7 +367,13 @@ void HipDistributedTokenParticipant::finalize_rollback() {
                 check_deferred_moe_status(record);
             }
         });
-        s.ordinary=std::move(s.saved);s.quarantined=false;s.rollback_published=true;
+        if(!s.sequence) {
+            // Only the initial, never-distributed serial anchor is eligible.
+            s.ordinary=std::move(s.saved);s.quarantined=false;
+        }
+        // With a previous distributed commit the typed sequence stays intact;
+        // all seven local bytes were restored but ordinary remains quarantined.
+        s.rollback_published=true;
     } catch(...) {s.native_failed=true;s.uncertain();throw;}
 }
 void HipDistributedTokenParticipant::send(FramedDistributedTokenWire& wire,const DistributedTokenMessage& m) {

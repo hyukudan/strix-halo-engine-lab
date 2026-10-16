@@ -378,6 +378,27 @@ int main() {
             session.send_state(20).remote_consumer_complete,
             "session routes send credits through owned completion bridge");
 
+        const auto retirement_lease=session.lease();
+        session.require_current_retirement_lease(retirement_lease);
+        session.require_retired_receive(10,retirement_lease,desc);
+        bool early_send_rejected=false;
+        try {session.require_retired_send(20,retirement_lease,128);}
+        catch(const std::logic_error&) {early_send_rejected=true;}
+        expect(early_send_rejected,"transport ACK and consumer credit without local DMA retirement are insufficient");
+        backend.events.push_back({Completion{20,CompletionKind::local_buffer_reusable,128},false});
+        static_cast<void>(session.poll_event());
+        session.require_retired_send(20,retirement_lease,128);
+        auto wrong_lease=retirement_lease;++wrong_lease.lease_generation;
+        bool foreign_lease_rejected=false;
+        try {session.require_retired_send(20,wrong_lease,128);}
+        catch(const std::invalid_argument&) {foreign_lease_rejected=true;}
+        auto short_descriptor=desc;--short_descriptor.byte_length;
+        bool wrong_descriptor_rejected=false;
+        try {session.require_retired_receive(10,retirement_lease,short_descriptor);}
+        catch(const std::logic_error&) {wrong_descriptor_rejected=true;}
+        expect(foreign_lease_rejected && wrong_descriptor_rejected,
+            "retirement checks exact lease generation and actual receive descriptor/extent");
+
         GpuCommitRecord record;
         record.protocol_version = desc.protocol_version;
         record.commit_word = gpu_commit_word;
@@ -426,7 +447,12 @@ int main() {
         auto session =
             DirectTransportNativeLinkSession::open(
                 backend, leases, lifecycle, memory, 0);
+        const auto retired_lease=session.lease();
         ++lifecycle.connection_epoch;
+        bool retirement_stale_rejected=false;
+        try {session.require_current_retirement_lease(retired_lease);}
+        catch(const std::logic_error&) {retirement_stale_rejected=true;}
+        expect(retirement_stale_rejected,"retirement admission rechecks actual current lease, not copied completion flags");
         bool stale_rejected = false;
         try {
             static_cast<void>(session.poll_event());

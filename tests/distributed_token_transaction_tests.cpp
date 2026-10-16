@@ -10,6 +10,7 @@
 #include <stdexcept>
 #include <utility>
 #include <vector>
+#include <type_traits>
 
 namespace {
 using namespace strix;
@@ -97,6 +98,65 @@ void commit_path(const Fixture& f) {
     require(done->global_state.generations==global.generations,"global state counted nonlocal or omitted writes");
     require(done->local_state[0].generations==t.expected_local_state(0).generations &&
         done->local_state[1].generations==t.expected_local_state(1).generations,"local stage generations were retagged global");
+}
+void finish_commit(DistributedTokenTransaction& t) {
+    prepare(t);ready(t);
+    require(!t.committed_sequence_frontier(),"ready without irreversible decision forged a sequence frontier");
+    auto m=message(t,0,DistributedTokenMessageKind::commit_decision);m.decision_identity=t.expected_commit_decision();t.observe(m);
+    require(!t.committed_sequence_frontier(),"decision without two ACKs forged a reusable sequence frontier");
+    const auto decision=t.decision_identity();
+    for(std::uint32_t node=0;node<2U;++node) {
+        m=message(t,node,DistributedTokenMessageKind::committed);m.decision_identity=decision;t.observe(m);
+        if(node==0U) require(!t.committed_sequence_frontier(),"one ACK minted a typed sequence frontier");
+    }
+}
+void persistent_frontier(const Fixture& f) {
+    static_assert(!std::is_default_constructible_v<DistributedSequenceFrontier>);
+    auto first=f.make();require(!first.committed_sequence_frontier(),"initial unexecuted token minted a frontier");
+    finish_commit(first);const auto frontier=first.committed_sequence_frontier();
+    require(frontier.has_value(),"two-ACK transaction did not expose typed frontier");
+    const auto next=frontier->derive_next_binding(7U,f.binding.generation+1U);
+    require(next.position==f.binding.position+1U && next.committed_tokens==f.binding.committed_tokens+1U &&
+        next.previous_history_identity==frontier->commit().history_identity &&
+        next.initial_global_state.generations==frontier->commit().global_state.generations &&
+        next.peers[0].initial_state.generations==frontier->commit().local_state[0].generations &&
+        next.peers[1].initial_state.generations==frontier->commit().local_state[1].generations &&
+        next.input_token==7U && next.generation==f.binding.generation+1U && next.request_id==f.binding.request_id &&
+        next.connection_epoch==f.binding.connection_epoch && next.placement_plan_identity==f.binding.placement_plan_identity &&
+        next.model_content_identity==f.binding.model_content_identity,
+        "next binding lost committed logical or immutable source provenance");
+    require(next.peers[0].initial_state.generations!=next.initial_global_state.generations &&
+        next.peers[1].initial_state.generations!=next.initial_global_state.generations,
+        "partial peer generations were relabelled as complete ordinary serial state");
+    DistributedTokenTransaction second(f.source,f.plan,f.manifest,f.access,next);finish_commit(second);
+    const auto done=second.committed_sequence_frontier();
+    require(done && done->commit().next_position==f.binding.position+2U &&
+        done->commit().committed_tokens==f.binding.committed_tokens+2U &&
+        done->commit().history_identity!=frontier->commit().history_identity,
+        "successive known inputs failed to chain distinct distributed commit history");
+    rejects([&]{(void)frontier->derive_next_binding(32U,f.binding.generation+1U);});
+    rejects([&]{(void)frontier->derive_next_binding(1U,f.binding.generation);});
+    rejects([&]{(void)frontier->derive_next_binding(1U,0U);});
+    // A later abort does not mint a different committed frontier. Retrying is
+    // bound to the previously committed prefix with a fresh attempt generation.
+    DistributedTokenTransaction aborted(f.source,f.plan,f.manifest,f.access,next);prepare(aborted);
+    auto m=message(aborted,0,DistributedTokenMessageKind::abort_decision);aborted.observe(m);
+    for(std::uint32_t node=0;node<2U;++node) {
+        m=message(aborted,node,DistributedTokenMessageKind::restored);m.receipt=receipt(aborted,node,false);aborted.observe(m);
+    }
+    require(aborted.phase()==DistributedTokenPhase::rolled_back && !aborted.committed_sequence_frontier(),
+        "rollback minted a committed token or new sequence history");
+    const auto retry=frontier->derive_next_binding(8U,next.generation+1U);
+    require(retry.position==next.position && retry.committed_tokens==next.committed_tokens &&
+        retry.previous_history_identity==next.previous_history_identity &&
+        retry.peers[0].initial_state.generations==next.peers[0].initial_state.generations,
+        "rollback retry advanced the unconsumed token frontier");
+    auto bounded=f;bounded.binding.peers[0].context_capacity=f.binding.position+1U;
+    auto at_end=bounded.make();finish_commit(at_end);
+    rejects([&]{(void)at_end.committed_sequence_frontier()->derive_next_binding(1U,bounded.binding.generation+1U);});
+    auto lost=f.make();prepare(lost);ready(lost);m=message(lost,0,DistributedTokenMessageKind::commit_decision);
+    m.decision_identity=lost.expected_commit_decision();lost.observe(m);lost.transport_failed();
+    require(!lost.committed_sequence_frontier(),"lost decision exposed a reusable persistent frontier");
 }
 void rollback_path(const Fixture& f) {
     auto t=f.make();prepare(t);
@@ -220,7 +280,7 @@ void wire_path(const Fixture& f) {
 } // namespace
 int main() {
     try {
-        Fixture f;commit_path(f);rollback_path(f);wrong_messages(f);wire_path(f);actual_partial_restore(f);
+        Fixture f;commit_path(f);persistent_frontier(f);rollback_path(f);wrong_messages(f);wire_path(f);actual_partial_restore(f);
         auto bad=f.binding;bad.input_token=32U;
         rejects([&]{DistributedTokenTransaction x(f.source,f.plan,f.manifest,f.access,bad);});
         bad=f.binding;bad.position=32U;rejects([&]{DistributedTokenTransaction x(f.source,f.plan,f.manifest,f.access,bad);});

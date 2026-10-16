@@ -54,6 +54,24 @@ struct DistributedTokenCommit {
     PersistentStateGenerations global_state;
     std::array<PersistentStateGenerations,2> local_state;
 };
+class DistributedTokenTransaction;
+// Typed distributed frontier: never a healthy ordinary SerialSessionContext.
+// Creation is private to an actually two-ACK committed transaction. Copies
+// retain that derivation; callers cannot construct an arbitrary ready frontier.
+class DistributedSequenceFrontier final {
+public:
+    [[nodiscard]] const DistributedTokenBinding& last_binding() const noexcept { return binding_; }
+    [[nodiscard]] const DistributedTokenCommit& commit() const noexcept { return commit_; }
+    [[nodiscard]] DistributedTokenBinding derive_next_binding(std::uint32_t input_token,
+        std::uint64_t generation) const;
+private:
+    friend class DistributedTokenTransaction;
+    DistributedSequenceFrontier(DistributedTokenBinding,DistributedTokenCommit,
+        std::uint64_t vocab_size,std::uint64_t maximum_position);
+    DistributedTokenBinding binding_;
+    DistributedTokenCommit commit_;
+    std::uint64_t vocab_size_=0,maximum_position_=0;
+};
 // One transaction only; no durable-log or crash recovery claim. A local commit
 // decision is irreversible even when its send/ACK fails. Unknown outcomes retain
 // snapshots and disable reuse; never restore one peer after deciding commit.
@@ -76,6 +94,7 @@ public:
     void observe(const DistributedTokenMessage&);
     void transport_failed() noexcept {phase_=DistributedTokenPhase::in_doubt;}
     [[nodiscard]] std::optional<DistributedTokenCommit> committed_frontier() const;
+    [[nodiscard]] std::optional<DistributedSequenceFrontier> committed_sequence_frontier() const;
 private:
     DistributedTokenBinding binding_;
     std::uint64_t identity_=0,decision_=0;
@@ -85,5 +104,6 @@ private:
     std::array<DistributedTokenReceipt,2> receipt_{};
     std::array<PersistentStateGenerations,2> expected_local_{};
     PersistentStateGenerations expected_global_;
+    std::uint64_t vocab_size_=0,maximum_position_=0;
 };
 } // namespace strix
