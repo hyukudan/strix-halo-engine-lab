@@ -295,10 +295,9 @@ ExecutionArenaPlan build_serial_execution_arena_plan(
     return plan;
 }
 
-KnownWindowArena build_known_window_arena(
+namespace {
+KnownWindowArena build_known_rows_arena(
     const ExecutionArenaPlan& serial, std::uint64_t alignment, std::uint32_t logical_rows) {
-    if (logical_rows!=2U && logical_rows!=4U && logical_rows!=8U)
-        throw std::invalid_argument("known window rows must be two, four or eight");
     if (!serial.alignment || !alignment || alignment % serial.alignment != 0 ||
         !serial.total_bytes || serial.allocations.empty()) {
         throw std::invalid_argument("known window requires a complete aligned serial arena");
@@ -379,6 +378,20 @@ KnownWindowArena build_known_window_arena(
         }
     }
     return result;
+}
+} // namespace
+
+KnownWindowArena build_known_window_arena(
+    const ExecutionArenaPlan& serial,std::uint64_t alignment,std::uint32_t logical_rows) {
+    if (logical_rows!=2U && logical_rows!=4U && logical_rows!=8U)
+        throw std::invalid_argument("known window rows must be two, four or eight");
+    return build_known_rows_arena(serial,alignment,logical_rows);
+}
+KnownWindowArena build_known_prefill_arena(
+    const ExecutionArenaPlan& serial,std::uint64_t alignment,std::uint32_t logical_rows) {
+    if(logical_rows<16U||logical_rows>2048U)
+        throw std::invalid_argument("known prefill rows must be within 16 and 2048");
+    return build_known_rows_arena(serial,alignment,logical_rows);
 }
 
 const ExecutionArenaAllocation* find_arena_allocation(

@@ -56,8 +56,11 @@ find_package(Threads REQUIRED)
 add_library(strix_core STATIC
     src/final_generation_state_export.cpp
     src/greedy_serving_scheduler.cpp
+    src/serving_cohort.cpp
     src/generation_output.cpp
     src/known_prompt_chunks.cpp
+    src/known_prefix_prefill.cpp
+    src/known_prefix_prefill_runtime.cpp
     src/offline_tuning_cache.cpp
     src/offline_tuning_preparation.cpp
     src/offline_compile_provenance.cpp
@@ -316,6 +319,11 @@ if(BUILD_TESTING)
     target_link_libraries(strix-execution-inventory-receipt-tests PRIVATE strix_core)
     strix_target_warnings(strix-execution-inventory-receipt-tests)
     add_test(NAME strix-execution-inventory-receipt-tests COMMAND strix-execution-inventory-receipt-tests)
+    add_executable(strix-serving-cohort-tests tests/serving_cohort_tests.cpp)
+    target_link_libraries(strix-serving-cohort-tests PRIVATE strix_core)
+    strix_target_warnings(strix-serving-cohort-tests)
+    add_test(NAME strix-serving-cohort-tests COMMAND strix-serving-cohort-tests)
+
     add_executable(strix-known-prompt-chunks-tests tests/known_prompt_chunks_tests.cpp)
     target_link_libraries(strix-known-prompt-chunks-tests PRIVATE strix_core)
     strix_target_warnings(strix-known-prompt-chunks-tests)
@@ -1148,6 +1156,8 @@ if(BUILD_TESTING)
 
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
+        add_test(NAME strix-ctest-evidence-tests
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/ctest_evidence_tests.py)
         add_test(NAME strix-runtime-inventory-tests
             COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/tests/runtime_inventory_tests.py)
     endif()
@@ -1242,6 +1252,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         src/hip_known_prompt_backend.cpp
         src/hip_prompt_lookup_runtime.hip
         src/hip_serving_greedy_backend.hip
+        src/hip_serving_cohort.hip
         src/hip_serving_prefix_cache.hip
         src/hip_event_queue_trace.hip
         src/hip_distributed_stage.hip

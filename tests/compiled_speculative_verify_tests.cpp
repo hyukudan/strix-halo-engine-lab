@@ -6,6 +6,7 @@
 #include "strix/dispatch_resources.hpp"
 #include "strix/runtime_launchers.hpp"
 #include "strix/speculative_verify_runtime.hpp"
+#include "strix/known_prefix_prefill.hpp"
 
 #include <algorithm>
 #include <array>
@@ -456,6 +457,114 @@ struct KnownRuntimeFixture {
             strix::SessionStateComponent::position_history).address;
     }
 };
+
+void known_prefix_prefill_tests(const strix::ModelContract& model) {
+    using P=strix::KnownWindowOutputPolicy;using V=strix::KnownWindowR2Variant;
+    // Host flow/state oracle only. Native projection arithmetic is exercised
+    // separately; these recording kernels deliberately use tiny state words.
+    for(bool mixed:{false,true}) for(auto rows:{16U,17U,32U}) for(auto policy:{P::all_rows,P::terminal_row,P::state_only}) {
+        KnownRuntimeFixture f(model,true,mixed);
+        strix::KnownPrefillRequest request;request.logical_rows=rows;request.r2_shared_expert=true;request.r2_gdn=true;
+        request.r2_gdn_f32_gates=mixed;request.output_policy=policy;
+        request.workspace_budget_bytes=UINT64_MAX;request.host_metadata_payload_budget_bytes=UINT64_MAX;
+        const auto prefill=strix::compile_known_prefix_prefill(model,f.source.serial,f.source.manifest,f.source.access,request);
+        strix::validate_compiled_known_prefix_prefill(prefill,f.source.serial);
+        std::vector<std::uint32_t> tokens(rows);for(std::uint32_t r=0;r<rows;++r) tokens[r]=7U+r*3U;
+        std::vector<std::uint64_t> expected_heads;
+        for(auto token:tokens) expected_heads.push_back(f.serial_token(token));
+        const auto expected_state=f.state_words;const auto expected_generations=f.session.state.generations;
+        const auto continuation=f.serial_token(91U);const auto continued_state=f.state_words;
+        f.window_pool.resize(static_cast<std::size_t>((prefill.arena.physical.total_bytes+7U)/8U));
+        f.window_memory={prefill.prefill_execution_identity,reinterpret_cast<std::uintptr_t>(f.window_pool.data()),
+            prefill.arena.physical.total_bytes,11U};
+        f.reset();
+        auto source=f.source.serial;source.execution_identity=prefill.prefill_execution_identity;source.arena=prefill.arena.row_view[0];
+        const auto launch=strix::compile_launch_plan(source,f.registry);
+        const std::array<strix::KnownWindowR2Entry,1> pairs{{{V::gdn_q8_virtual256_r2_v1,&f.trace,&recording_r2_preflight,&recording_r2_launch}}};
+        const std::array<strix::KnownWindowRowsEntry,2> wide{{
+            {V::shared_q8_virtual256_r8_v1,&f.trace,&recording_rows_preflight,&recording_rows_launch},
+            {V::gdn_q8_rows8_f32_gates_r1_v1,&f.trace,&recording_rows_preflight,&recording_rows_launch}}};
+        const auto result=strix::execute_known_prefix_prefill_eager(prefill,f.source.serial,f.resources,f.window_memory,
+            f.session,tokens,launch,pairs,wide,f.hooks());
+        expect(f.session.next_position==rows&&f.session.committed_tokens==rows&&f.session.state.generations==expected_generations,
+            "T prefill commits real T inputs and exactly serial state generations once");
+        expect(f.state_words==expected_state,"T step-major prefill preserves all seven logical host state payloads");
+        expect(result.shared_rows_dispatches==48U*(rows/8U)&&
+            (mixed?result.gdn_rows_dispatches==36U*(rows/8U):result.r2_dispatches==36U*(rows/2U)),
+            "T prefill uses real closed tiles at every source step and explicit row tails");
+        expect(f.trace.head_admissions.size()==rows,"every T head receives metadata preflight even when omitted");
+        const auto outputs=policy==P::all_rows?rows:(policy==P::terminal_row?1U:0U);
+        expect(result.logits.size()==outputs&&f.trace.head_positions.size()==outputs&&result.omitted_lm_heads==rows-outputs,
+            "T output policy maps only actual selected terminal heads");
+        for(std::size_t i=0;i<result.logits.size();++i)
+            expect(read_word(result.logits[i].address)==expected_heads[result.logit_row_indices[i]],"T selected head payload equals its serial row");
+        expect(f.trace.ple_previous.size()==rows,"PLE retains one ordered history transition per T row");
+        expect(f.trace.qsa_positions.size()==12U*rows,"every QSA layer reads every absolute causal row position");
+        for(std::size_t i=0;i<f.trace.qsa_positions.size();++i)
+            expect(f.trace.qsa_positions[i]==i%rows,"QSA observes no future host position across T tiles");
+        expect(!f.session.arithmetic_lineage.tainted&&strix::arithmetic_lineage_valid(f.session.arithmetic_lineage,rows)&&
+            f.session.arithmetic_lineage.intervals.back().numerical_plan_identity==prefill.prefill_execution_identity,
+            "T producer lineage uses the explicit new organization identity");
+        expect(f.serial_token(91U)==continuation&&f.state_words==continued_state,"serial continuation after T prefill retains every causal state");
+    }
+    {
+        KnownRuntimeFixture f(model,true,true);
+        strix::KnownPrefillRequest request;request.logical_rows=16;request.r2_shared_expert=true;request.r2_gdn=true;request.r2_gdn_f32_gates=true;
+        request.workspace_budget_bytes=UINT64_MAX;request.host_metadata_payload_budget_bytes=UINT64_MAX;
+        const auto good=strix::compile_known_prefix_prefill(model,f.source.serial,f.source.manifest,f.source.access,request);
+        for(unsigned fault=0;fault<6;++fault) {
+            auto bad=good;
+            if(fault==0) bad.logical_rows=8;
+            if(fault==1) ++bad.arena.row_view.back().allocations.back().offset;
+            if(fault==2) ++bad.arena.physical.allocations.back().bytes;
+            if(fault==3) bad.logit_row_indices.pop_back();
+            if(fault==4) bad.workspace_budget_bytes=bad.arena.physical.total_bytes-1U;
+            if(fault==5) bad.host_metadata_payload_budget_bytes=bad.host_metadata_payload_bytes-1U;
+            bool rejected=false;try {strix::validate_compiled_known_prefix_prefill(bad,f.source.serial);} catch(const std::exception&) {rejected=true;}
+            expect(rejected,"T prefill forged geometry/arena/map/budget rejected with unchanged identities");
+        }
+        for(auto rows:{15U,2049U}) {
+            auto bad=request;bad.logical_rows=rows;bool rejected=false;
+            try {(void)strix::compile_known_prefix_prefill(model,f.source.serial,f.source.manifest,f.source.access,bad);} catch(const std::invalid_argument&) {rejected=true;}
+            expect(rejected,"T prefill closed range rejects out-of-bounds geometry");
+        }
+        for(unsigned fault=0;fault<2;++fault) {
+            auto bad=request;if(fault==0) bad.workspace_budget_bytes=1;else bad.host_metadata_payload_budget_bytes=1;
+            bool rejected=false;try {(void)strix::compile_known_prefix_prefill(model,f.source.serial,f.source.manifest,f.source.access,bad);} catch(const std::invalid_argument&) {rejected=true;}
+            expect(rejected,"T arena and host payload budgets reject before native allocation or state mutation");
+        }
+        // Maximum T is a planner-only fixture: never allocate its model-sized
+        // scratch merely to inspect the bounded row-view/identity contract.
+        auto maximum=request;maximum.logical_rows=2048;
+        const auto maximum_plan=strix::compile_known_prefix_prefill(model,f.source.serial,f.source.manifest,f.source.access,maximum);
+        strix::validate_compiled_known_prefix_prefill(maximum_plan,f.source.serial);
+        expect(maximum_plan.arena.row_view.size()==2048U,"maximum T owns bounded row metadata without T topology clones");
+        for(unsigned fault=0;fault<4;++fault) {
+            f.reset();std::vector<std::uint32_t> tokens(16U,7U);
+            f.window_pool.resize(static_cast<std::size_t>((good.arena.physical.total_bytes+7U)/8U));
+            f.window_memory={good.prefill_execution_identity,reinterpret_cast<std::uintptr_t>(f.window_pool.data()),good.arena.physical.total_bytes,11U};
+            auto source=f.source.serial;source.execution_identity=good.prefill_execution_identity;source.arena=good.arena.row_view[0];
+            auto launch=strix::compile_launch_plan(source,f.registry);
+            const auto state_before=f.state_words;const auto position_before=read_word(f.position_address());
+            if(fault==0) launch.steps.back().preflight=[](const strix::ExecutionDispatchContext& c,void* p) {
+                if(c.position==15U) throw std::invalid_argument("late T row terminal admission failure");recording_window_preflight(c,p);};
+            if(fault==1) tokens.back()=static_cast<std::uint32_t>(model.vocab_size);
+            if(fault==2) f.trace.fail_position=15U;
+            const std::array<strix::KnownWindowRowsEntry,2> entries{{
+                {V::shared_q8_virtual256_r8_v1,&f.trace,&recording_rows_preflight,&recording_rows_launch},
+                {V::gdn_q8_rows8_f32_gates_r1_v1,&f.trace,&recording_rows_preflight,&recording_rows_launch}}};
+            bool rejected=false;
+            try {(void)strix::execute_known_prefix_prefill_eager(good,f.source.serial,f.resources,f.window_memory,f.session,tokens,
+                launch,{},fault==3?std::span<const strix::KnownWindowRowsEntry>{}:std::span<const strix::KnownWindowRowsEntry>(entries),f.hooks());}
+            catch(const std::exception&) {rejected=true;}
+            expect(rejected,"late T admission/callback fault is observable");
+            if(fault==2) expect(f.session.health==strix::SerialSessionHealth::poisoned&&f.session.arithmetic_lineage.tainted&&
+                f.quiesces==1&&f.session.committed_tokens==0,"T dispatch failure drains once and publishes no partial session metadata");
+            else expect(f.trace.calls==0&&f.session.health==strix::SerialSessionHealth::ready&&f.state_words==state_before&&
+                read_word(f.position_address())==position_before,"all T rows admit before any target mutation");
+        }
+    }
+}
 
 void known_window_output_policy_tests(const strix::ModelContract& model) {
     using P=strix::KnownWindowOutputPolicy;
@@ -1451,6 +1560,7 @@ int main() {
     known_window_wide_runtime_tests(model);
     known_window_mixed_format_tests(model);
     known_window_wide_compiler_tests(model);
+    known_prefix_prefill_tests(model);
 
     if (failures == 0) {
         std::cout << "compiled speculative verify tests passed\n";

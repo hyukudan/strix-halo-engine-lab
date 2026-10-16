@@ -4,6 +4,7 @@
 #include "strix/hip_launch_context.hpp"
 #include "strix/speculative_verify_runtime.hpp"
 #include "strix/q51_known_rows.hpp"
+#include "strix/known_prefix_prefill.hpp"
 
 #include <array>
 #include <cstdint>
@@ -42,6 +43,13 @@ public:
         ExecutionMemoryBinding window_scratch, HipLaunchContext scope,
         std::shared_ptr<const void> actual_owner,
         q51_known_rows::Workspace routed_union_workspace = {});
+    // Explicit T16..2048 step-major owner. Closed window construction above
+    // retains its original guards and identities. Every projection tile still
+    // uses a closed native 8/2 entry; this is not a general GEMM backend.
+    HipKnownPrefixWindow(CompiledKnownPrefixPrefill prefill,
+        CompiledSerialExecution serial_snapshot,ModelContract model,HipLauncherCatalogConfig config,
+        const ExecutionRuntimeResources& serial_resources,ExecutionMemoryBinding prefill_scratch,HipLaunchContext scope,
+        std::shared_ptr<const void> actual_owner,q51_known_rows::Workspace routed_union_workspace = {});
     ~HipKnownPrefixWindow();
     HipKnownPrefixWindow(const HipKnownPrefixWindow&) = delete;
     HipKnownPrefixWindow& operator=(const HipKnownPrefixWindow&) = delete;
@@ -53,6 +61,7 @@ public:
     [[nodiscard]] KnownWindowResult execute(SerialSessionContext& session,
         std::span<const std::uint32_t> tokens);
     [[nodiscard]] std::uint32_t logical_rows() const noexcept;
+    [[nodiscard]] bool supports_tiled_prefill() const noexcept;
     // Immutable compiler-selected intent; verification consumers require all_rows.
     [[nodiscard]] KnownWindowOutputPolicy output_policy() const noexcept;
     // Last eligible layer in the last SUCCESSFULLY completed window only.

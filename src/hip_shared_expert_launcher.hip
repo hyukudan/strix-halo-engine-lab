@@ -1,5 +1,6 @@
 #include "strix/hip_launch_context.hpp"
 #include "strix/hip_shared_expert_launcher.hpp"
+#include "strix/hip_shared_serving_cohort.hpp"
 #include "strix/shared_expert_rows_diagnostic_contract.hpp"
 #if defined(STRIX_BUILD_SHARED_EXPERT_ROWS_DIAGNOSTIC)
 #include "strix/hip_shared_expert_rows_diagnostic.hpp"
@@ -1865,5 +1866,128 @@ void shared_expert_known_window_rows_launch(std::span<const ExecutionDispatchCon
     check_hip(hipPeekAtLastError(), "known-window shared rows stale launch error");
     if (rows.size() == 4U) known_shared_rows_enqueue<4U>(views, stream, config);
     else known_shared_rows_enqueue<8U>(views, stream, config);
+}
+} // namespace strix
+
+namespace strix {
+namespace {
+struct ServingSharedPointers {
+    std::uintptr_t input[4]{}, output[4]{}, workspace[4]{};
+};
+struct ServingSharedPrepared { KnownSharedR2Views views; ServingSharedPointers pointers; };
+ServingSharedPrepared prepare_serving_shared(std::span<const ExecutionDispatchContext> rows,
+    const HipSharedExpertLauncherConfig& config,HipSharedServingStaging staging) {
+    if ((rows.size()!=2U && rows.size()!=4U) || rows.size()>staging.capacity_rows ||
+        config.hidden_size!=2560U || config.intermediate_size!=640U || config.activation!=HipActivationStorage::bf16 ||
+        !staging.address || staging.address%256U || !staging.allocation_generation ||
+        staging.bytes!=hip_shared_serving_staging_bytes(staging.capacity_rows) || staging.bytes>UINTPTR_MAX-staging.address)
+        throw std::invalid_argument("shared serving cohort has invalid canonical rows or staging");
+    ServingSharedPrepared result;
+    const auto range=[](KnownSharedSpan v) {
+        if(!v.address || !v.bytes || v.bytes>UINTPTR_MAX-v.address)
+            throw std::invalid_argument("shared serving cohort has an invalid retained range");
+    };
+    std::array<KnownSharedSpan,12> writes{}, reads{};
+    std::array<RuntimeTensorBinding,4> weights{};
+    const auto& first=rows.front();
+    for(std::size_t row=0;row<rows.size();++row) {
+        const auto& context=rows[row];
+        if(context.logical_rows!=1U || context.request_concurrency!=1U || !context.execution_identity ||
+            context.execution_identity!=first.execution_identity || context.step_id!=first.step_id || !context.layer || context.layer!=first.layer ||
+            !context.kernel_id || context.kernel_id!=first.kernel_id || context.reads_state!=PersistentState::none ||
+            context.writes_state!=PersistentState::none || !context.resources || !context.resources->model_weights ||
+            !context.resources->model_weights->model_content_identity.valid() ||
+            context.resources->model_weights->model_content_identity!=first.resources->model_weights->model_content_identity)
+            throw std::invalid_argument("shared serving cohort original C1 step or model differs");
+        constexpr std::string_view base="hip.shared_expert.bf16.h2560.m640.r1.c1";
+        const auto actual=*context.kernel_id;
+        const bool exact=config.prefetch_q8 ? actual.size()==base.size()+shared_expert_prefetch::kernel_suffix.size() &&
+            actual.starts_with(base) && actual.ends_with(shared_expert_prefetch::kernel_suffix) : actual==base;
+        if(!exact)
+            throw std::invalid_argument("shared serving cohort requires the exact selected serial shared ID");
+        const auto prepared=prepare_shared_expert(context,const_cast<HipSharedExpertLauncherConfig*>(&config));
+        const std::array<TensorPair,4> tensors{prepared.tensors.gate,prepared.tensors.up,prepared.tensors.down,prepared.tensors.shared_gate};
+        for(std::size_t i=0;i<tensors.size();++i) {
+            const auto& t=tensors[i]; const auto& w=*t.runtime;
+            if(t.manifest->ggml_type!=(i==3U?0U:8U) || !w.allocation_generation || w.address%16U ||
+                t.manifest->absolute_offset%16U)
+                throw std::invalid_argument("shared serving cohort requires aligned Q8 matrices and F32 scalar");
+            const auto& dims=t.manifest->dimensions;
+            const auto width=i==2U?640U:2560U;
+            const auto outputs=i==3U?1U:(i==2U?2560U:640U);
+            if(t.manifest->layer!=context.layer || dims.empty() || dims[0]!=width ||
+                (i==3U ? !(dims.size()==1U || (dims.size()==2U && dims[1]==1U)) : !(dims.size()==2U && dims[1]==outputs)) ||
+                t.manifest->byte_size<required_weight_bytes(weight_kind(t.manifest->ggml_type),width,outputs))
+                throw std::invalid_argument("shared serving cohort tensor shape or source extent differs");
+            range({w.address,w.bytes});
+            if(!row) weights[i]=w;
+            else if(w.tensor_index!=weights[i].tensor_index || w.storage!=weights[i].storage || w.address!=weights[i].address ||
+                w.bytes!=weights[i].bytes || w.allocation_generation!=weights[i].allocation_generation || w.owner_node!=weights[i].owner_node)
+                throw std::invalid_argument("shared serving cohort actual immutable weight owners differ");
+        }
+        const KnownSharedSpan input{prepared.input.address,prepared.input.bytes};
+        const KnownSharedSpan output{prepared.output.address,prepared.output.bytes};
+        const KnownSharedSpan work{prepared.temporary.address,prepared.temporary.bytes};
+        range(input); range(output); range(work);
+        if(input.address%16U || output.address%16U || work.address%16U)
+            throw std::invalid_argument("shared serving cohort row view is misaligned");
+        result.pointers.input[row]=input.address; result.pointers.output[row]=output.address; result.pointers.workspace[row]=work.address;
+        reads[row]=input; writes[2U*row]=output; writes[2U*row+1U]=work;
+    }
+    for(std::size_t i=0;i<4U;++i) reads[rows.size()+i]={weights[i].address,weights[i].bytes};
+    const KnownSharedSpan pool{staging.address,staging.bytes};
+    for(std::size_t i=0;i<rows.size()+4U;++i) {
+        if(known_shared_overlap(pool,reads[i])) throw std::invalid_argument("shared serving staging aliases a request input or weight");
+        for(std::size_t j=0;j<2U*rows.size();++j)
+            if(known_shared_overlap(writes[j],reads[i])) throw std::invalid_argument("shared serving cohort writable/read alias");
+    }
+    for(std::size_t i=0;i<2U*rows.size();++i) {
+        if(known_shared_overlap(pool,writes[i])) throw std::invalid_argument("shared serving staging aliases request writes");
+        for(std::size_t j=0;j<i;++j) if(known_shared_overlap(writes[i],writes[j]))
+            throw std::invalid_argument("shared serving cohort writable owners alias");
+    }
+    auto& view=result.views;
+    view.shape={2560U,640U,static_cast<std::uint32_t>(rows.size()),5120U,5120U,5120U};
+    view.input={staging.address,rows.size()*5120U};
+    view.workspace={staging.address+staging.capacity_rows*5120ULL,rows.size()*5120U};
+    view.output={staging.address+staging.capacity_rows*10240ULL,rows.size()*5120U};
+    view.weights={{weights[0].address,weights[0].bytes},{weights[1].address,weights[1].bytes},
+        {weights[2].address,weights[2].bytes},{weights[3].address,weights[3].bytes}};
+    return result;
+}
+__global__ void serving_shared_gather(ServingSharedPointers pointers,std::uint16_t* packed) {
+    const auto feature=static_cast<std::uint32_t>(blockIdx.x)*blockDim.x+threadIdx.x;
+    const auto row=static_cast<std::uint32_t>(blockIdx.y);
+    if(feature<2560U) packed[row*2560U+feature]=reinterpret_cast<const std::uint16_t*>(pointers.input[row])[feature];
+}
+__global__ void serving_shared_scatter(ServingSharedPointers pointers,const unsigned char* output,const unsigned char* work) {
+    const auto byte=static_cast<std::uint32_t>(blockIdx.x)*blockDim.x+threadIdx.x;
+    const auto row=static_cast<std::uint32_t>(blockIdx.y);
+    if(byte<5120U) {
+        reinterpret_cast<unsigned char*>(pointers.output[row])[byte]=output[row*5120U+byte];
+        reinterpret_cast<unsigned char*>(pointers.workspace[row])[byte]=work[row*5120U+byte];
+    }
+}
+} // namespace
+void shared_expert_serving_cohort_preflight(std::span<const ExecutionDispatchContext> rows,
+    const HipSharedExpertLauncherConfig& config,HipSharedServingStaging staging) {
+    (void)prepare_serving_shared(rows,config,staging);
+}
+void shared_expert_serving_cohort_launch(std::span<const ExecutionDispatchContext> rows,
+    const HipSharedExpertLauncherConfig& config,HipSharedServingStaging staging) {
+    const auto prepared=prepare_serving_shared(rows,config,staging);
+    const auto stream=known_shared_rows_stream();
+    const auto* scope=current_hip_launch_context();
+    if(scope->deferred_moe_status.arena_base) throw std::invalid_argument("shared serving cohort cannot publish a request D1 record");
+    check_hip(hipPeekAtLastError(),"shared serving cohort stale error");
+    hipLaunchKernelGGL(serving_shared_gather,dim3(10U,static_cast<unsigned>(rows.size())),dim3(256),0,stream,
+        prepared.pointers,reinterpret_cast<std::uint16_t*>(prepared.views.input.address));
+    check_hip(hipGetLastError(),"shared serving input gather");
+    if(rows.size()==2U) known_shared_rows_enqueue<2U>(prepared.views,stream,config);
+    else known_shared_rows_enqueue<4U>(prepared.views,stream,config);
+    hipLaunchKernelGGL(serving_shared_scatter,dim3(20U,static_cast<unsigned>(rows.size())),dim3(256),0,stream,
+        prepared.pointers,reinterpret_cast<const unsigned char*>(prepared.views.output.address),
+        reinterpret_cast<const unsigned char*>(prepared.views.workspace.address));
+    check_hip(hipGetLastError(),"shared serving output/workspace scatter");
 }
 } // namespace strix

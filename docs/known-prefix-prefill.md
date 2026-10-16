@@ -1,0 +1,9 @@
+# Explicit known-prefix prefill
+
+Source integration only; runtime, arithmetic and performance admission remain pending.
+
+`--known-prefix-window --known-prefix-prefill-rows T` selects T=16..2048, including odd tails. It requires all four explicit setup inputs: `--known-prefix-workspace-budget-bytes N`, `--known-prefix-host-metadata-budget-bytes N`, `--known-prefix-uma-budget-bytes N`, and `--known-prefix-host-headroom-bytes N`. The first three must be positive; headroom may explicitly be zero. The metadata limit covers two retained arena-vector payload copies; The reservation also charges known completion-order, logit-map/view and terminal-host-row payloads at setup peak. Fixed selection metadata and allocator/driver overhead require the caller's headroom. This is a declared reservation upper bound, not measured RSS or proof of physical fit. Unknown backing views are counted conservatively, without invented alias keys.
+
+The entire T-row striped arena is reserved before its allocation. Execution is step-major using existing closed eight/four/two-row operators and explicit serial suffixes, not complete eight-row forwards or a general GEMM implementation. Routed union scratch remains sized for eight rows. Its summary describes only the last eligible group in the last internal tile. Actual completed dispatch counters are reported separately from the eight-row selection ledger. Legacy per-window logical saving fields are zero for T, not a measured zero or a performance claim. Final-state validation remains available; state-only exports describe consumed inputs without an emitted bonus.
+
+The old `--known-prefix-rows 2|4|8` selector and all defaults remain unchanged. T cannot be combined with that explicit selector or prompt lookup. Output policy remains explicit: all-rows is the default, terminal-row is optional, and state-only is permitted only with zero generated tokens. No padding tokens or invented terminal prediction are used.

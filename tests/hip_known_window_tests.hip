@@ -115,6 +115,7 @@ struct Fixture {
     Owner owner; // retained until every stream operation and borrowed owner is drained
     const bool gdn;
     const bool f32_gates;
+    const std::uint32_t context_capacity;
     ModelContract model = ModelContract::qwen38_flash_next();
     SerialExecutionPlan execution = build_serial_decode_execution_plan(model);
     SerialExecutionIoPlan io = build_serial_execution_io_plan(execution);
@@ -140,8 +141,8 @@ struct Fixture {
     ExecutionLauncher selected;
     Span matrix, convolution;
 
-    explicit Fixture(bool is_gdn, bool shared_prefetch = false, bool mixed_gates = false)
-        : gdn(is_gdn), f32_gates(mixed_gates) {
+    explicit Fixture(bool is_gdn, bool shared_prefetch = false, bool mixed_gates = false,std::uint32_t context_tokens=4U)
+        : gdn(is_gdn), f32_gates(mixed_gates),context_capacity(context_tokens) {
         const auto wanted = gdn ? SerialOp::gated_delta_net : SerialOp::shared_expert;
         const auto found = std::find_if(execution.steps.begin(), execution.steps.end(),
             [&](const auto& value) { return value.op == wanted && value.layer == 0U; });
@@ -242,7 +243,7 @@ struct Fixture {
         add("blk.0.ssm_out.weight", TensorRole::recurrent_state, 8U, {6144, 2560}, q8(6144, 2560, 8));
         access.accesses.push_back({step.id, step.op, 0U, {2, 3, 4, 5, 6, 7, 8}});
         access.accesses.push_back({step.id, step.op, 1U, {0, 1}});
-        SerialSessionStateLayoutRequest request; request.context_tokens = 4U;
+        SerialSessionStateLayoutRequest request; request.context_tokens = context_capacity;
         state_layout = build_serial_session_state_layout(model, request);
         state = owner.allocate(state_layout.device_total_bytes);
         host_state.resize(static_cast<std::size_t>(state_layout.host_total_bytes));
@@ -751,6 +752,92 @@ void family_gdn_f32_gates() {
     }
 }
 
+// Native component evidence for the exact closed projection tiles used by the
+// T runtime. This does not replace full-model T producer/continuation gates.
+void family_prefill_tiles(bool gdn,std::uint32_t count) {
+    Fixture f(gdn,false,gdn,64U);
+    const auto arena=build_known_prefill_arena(f.serial,256U,count);
+    const auto storage=f.owner.allocate(arena.physical.total_bytes);
+    const ExecutionMemoryBinding memory{0x5450524546494c31ULL,storage.address,storage.bytes,41U};
+    auto resources=f.resources[0];resources.scratch=&memory;
+    std::vector<ExecutionDispatchContext> rows(count);
+    std::vector<ExecutionBufferAddress> input(count),output(count),temporary(count);
+    std::vector<unsigned char> seed(static_cast<std::size_t>(storage.bytes),0xa5U);
+    for(std::uint32_t r=0;r<count;++r) {
+        rows[r]=f.rows[0];rows[r].execution_identity=memory.execution_identity;rows[r].arena=&arena.row_view[r];
+        rows[r].memory=&memory;rows[r].resources=&resources;rows[r].position=r;rows[r].input_token_id=31U+r;
+        input[r]=resolve_dispatch_read(rows[r],0);output[r]=resolve_dispatch_write(rows[r],0);temporary[r]=resolve_dispatch_temporary(rows[r],0);
+        std::vector<std::uint16_t> values(2560U);
+        for(std::size_t col=0;col<values.size();++col)
+            values[col]=bf16(static_cast<float>(static_cast<int>((col*7U+r*13U)%37U)-18)*(.003F+static_cast<float>(r%5U)*.002F));
+        std::memcpy(seed.data()+(input[r].address-storage.address),values.data(),values.size()*2U);
+    }
+    struct Payload {std::vector<unsigned char> arena,state;};
+    const auto run=[&](bool candidate) {
+        write(storage,seed);if(gdn) write(f.state,f.initial_state);
+        {
+            const HipLaunchScope active(f.scope());
+            // Whole-T pure admission is complete before any row can mutate.
+            for(std::uint32_t first=0;first<count;) {
+                const auto width=candidate&&count-first>=8U?8U:1U;
+                if(width==8U) {
+                    const auto group=std::span<const ExecutionDispatchContext>(rows.data()+first,8U);
+                    if(gdn) gdn_known_window_rows_preflight(group,f.gdn_config);
+                    else shared_expert_known_window_rows_preflight(group,f.shared_config);
+                } else {require(f.selected.preflight!=nullptr,"serial component lacks pure preflight");f.selected.preflight(rows[first],f.selected.user_data);}
+                first+=width;
+            }
+            for(std::uint32_t first=0;first<count;) {
+                const auto width=candidate&&count-first>=8U?8U:1U;
+                if(width==8U) {
+                    const auto group=std::span<const ExecutionDispatchContext>(rows.data()+first,8U);
+                    if(gdn) gdn_known_window_rows_launch(group,f.gdn_config);
+                    else shared_expert_known_window_rows_launch(group,f.shared_config);
+                } else f.selected.function(rows[first],f.selected.user_data);
+                first+=width;
+            }
+        }
+        f.owner.finish();Payload result{read(storage),gdn?read(f.state):std::vector<unsigned char>{}};
+        auto unchanged=seed;
+        for(std::uint32_t r=0;r<count;++r) for(const auto view:{output[r],temporary[r]})
+            std::copy_n(result.arena.begin()+static_cast<std::ptrdiff_t>(view.address-storage.address),
+                static_cast<std::size_t>(view.bytes),unchanged.begin()+static_cast<std::ptrdiff_t>(view.address-storage.address));
+        require(result.arena==unchanged,"T projection tile modified read-only input or internal arena canary");guards(storage);
+        for(const auto& weight:f.weights) {require(read(weight.device)==weight.original,"T projection tile modified weights");guards(weight.device);}
+        if(gdn) {
+            auto expected=f.initial_state;
+            for(const auto view:{f.matrix,f.convolution}) std::copy_n(result.state.begin()+static_cast<std::ptrdiff_t>(view.address-f.state.address),
+                static_cast<std::size_t>(view.bytes),expected.begin()+static_cast<std::ptrdiff_t>(view.address-f.state.address));
+            require(result.state==expected,"T causal tile modified another layer/state component");guards(f.state);
+        }
+        return result;
+    };
+    const auto reference=run(false);
+    for(unsigned repeat=0;repeat<2U;++repeat) {
+        const auto candidate=run(true);
+        require(candidate.arena==reference.arena&&candidate.state==reference.state,
+            "T tiled exact projections/full workspace/causal state differ from ascending original R1 calls");
+    }
+    // Late tile admission faults must be rejected before the first tile runs.
+    write(storage,seed);if(gdn) write(f.state,f.initial_state);
+    const auto state_before=gdn?read(f.state):std::vector<unsigned char>{};
+    auto bad=rows;bad.back().resources=nullptr;bool rejected=false;
+    {
+        const HipLaunchScope active(f.scope());
+        try {for(std::uint32_t first=0;first<count;) {
+            const auto width=count-first>=8U?8U:1U;
+            if(width==8U) {
+                const auto group=std::span<const ExecutionDispatchContext>(bad.data()+first,8U);
+                if(gdn) gdn_known_window_rows_preflight(group,f.gdn_config);else shared_expert_known_window_rows_preflight(group,f.shared_config);
+            } else f.selected.preflight(bad[first],f.selected.user_data);
+            first+=width;
+        }}
+        catch(const std::exception&) {rejected=true;}
+        require(rejected,"late T row missing its resource owner reaches original admission before any tile enqueue");
+    }
+    f.owner.finish();require(read(storage)==seed&&(!gdn||read(f.state)==state_before),"late T admission failure changed arena or state");
+}
+
 void family(bool gdn, bool prefetch = false) {
     Fixture fixture(gdn, prefetch);
     Result finite_reference;
@@ -790,6 +877,7 @@ int main() try {
     family(false, true);
     family(true);
     family_gdn_f32_gates();
+    for(auto rows:{16U,17U}) {family_prefill_tiles(false,rows);family_prefill_tiles(true,rows);}
     std::cout << "known-window shared/GDN component fixtures passed\n";
     return 0;
 } catch (const std::exception& error) {

@@ -63,6 +63,7 @@ public:
     [[nodiscard]] std::vector<float> execute_window(
         std::array<std::uint32_t, 2> tokens, std::uint64_t position) override;
     [[nodiscard]] std::uint32_t logical_rows() const noexcept override;
+    [[nodiscard]] bool supports_tiled_prefill() const noexcept override;
     [[nodiscard]] KnownWindowOutputPolicy output_policy() const noexcept override;
     [[nodiscard]] std::vector<float> execute_rows(
         std::span<const std::uint32_t> tokens, std::uint64_t position) override;

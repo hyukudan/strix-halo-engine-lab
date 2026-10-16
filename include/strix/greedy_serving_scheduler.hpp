@@ -2,6 +2,7 @@
 
 #include "strix/model_runtime_binding.hpp"
 #include "strix/serial_request.hpp"
+#include "strix/serving_cohort.hpp"
 
 #include <cstddef>
 #include <array>
@@ -30,6 +31,9 @@ struct GreedyServingPolicy {
     std::uint32_t max_decode_burst = 8;
     std::uint64_t aging_ns = 1000000;
     std::uint64_t queue_timeout_ns = 0; // zero disables the queue timeout
+    // Independent worker path remains default. Explicit 2/4 forms one target
+    // cohort from currently ready requests; never waits to fill a batch.
+    std::uint32_t tensor_cohort_rows = 1;
 };
 enum class ServingRequestState { queued, running, completed, cancelled, failed, timed_out };
 enum class ServingAdmission { accepted, request_limit, reservation_budget, duplicate_session, incompatible };
@@ -80,7 +84,8 @@ class GreedyServingScheduler final {
 public:
     using BackendFactory = std::function<std::unique_ptr<SerialGreedyStepBackend>()>;
     GreedyServingScheduler(GreedyServingPolicy policy, ServingCompatibility compatibility,
-        std::shared_ptr<const void> shared_model_owner);
+        std::shared_ptr<const void> shared_model_owner,
+        std::shared_ptr<ServingCohortExecutor> cohort_executor = {});
     ~GreedyServingScheduler();
     GreedyServingScheduler(const GreedyServingScheduler&) = delete;
     GreedyServingScheduler& operator=(const GreedyServingScheduler&) = delete;

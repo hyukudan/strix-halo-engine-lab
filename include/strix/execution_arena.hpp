@@ -36,6 +36,9 @@ struct KnownWindowArena {
 
 [[nodiscard]] KnownWindowArena build_known_window_arena(
     const ExecutionArenaPlan& serial, std::uint64_t alignment = 256, std::uint32_t logical_rows = 2);
+// Separate bounded prefill geometry. Does not widen the closed window API.
+[[nodiscard]] KnownWindowArena build_known_prefill_arena(
+    const ExecutionArenaPlan& serial, std::uint64_t alignment, std::uint32_t logical_rows);
 
 [[nodiscard]] ExecutionArenaPlan build_serial_execution_arena_plan(
     const ModelContract& model,

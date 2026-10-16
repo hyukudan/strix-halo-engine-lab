@@ -51,6 +51,7 @@ struct HipServingGreedyBackend::Impl {
     const bool use_prepared;
     RuntimeExecutionIdentities identities;
     HipLauncherCatalog catalog;
+    HipSharedExpertLauncherConfig cohort_shared,cohort_shared_fallback;
     ExecutionLauncherRegistry registry;
     CompiledLaunchPlan launch_plan;
     std::unique_ptr<DirectLaunchDispatcher> direct;
@@ -60,7 +61,7 @@ struct HipServingGreedyBackend::Impl {
     std::unique_ptr<HipGreedyOutput> output;
     ExecutionBufferAddress logits;
     std::uint64_t epoch = 0;
-    bool broken = false;
+    bool broken = false, cohort_pending = false;
     std::shared_ptr<HipServingPrefixCache> prefix_cache;
     std::vector<std::uint32_t> request_prefix;
     bool prefix_started=false,capture_enabled=false,capture_attempted=false,selected_valid=false;
@@ -95,6 +96,9 @@ struct HipServingGreedyBackend::Impl {
             serial.io.steps.size() == serial.execution.steps.size() && serial.io.steps.back().writes.size() == 1,
             "serving backend requires a complete terminal LM head");
         validate_scope();
+        cohort_shared={static_cast<std::uint32_t>(model.hidden_size),static_cast<std::uint32_t>(model.shared_expert_intermediate_size),
+            config.activation,config.prefetch_q8_shared_expert,config.shared_expert_prefetch_layers,config.shared_expert_prefetch_stats};
+        cohort_shared_fallback=cohort_shared;cohort_shared_fallback.prefetch_q8=false;cohort_shared_fallback.prefetch_eligible_layers.clear();
         try {
         catalog.register_for_compiled_execution(serial, registry, &resources);
         serving_require(catalog.audit(serial, registry).missing_steps == 0,
@@ -166,6 +170,7 @@ struct HipServingGreedyBackend::Impl {
 
     void admit(std::uint32_t token, std::uint64_t position) const {
         if (broken) throw std::logic_error("serving backend is permanently failed");
+        serving_require(!cohort_pending,"serving backend already has a cohort target in flight");
         enter_worker();
         validate_scope();
         serving_require(position == session.next_position && session.health == SerialSessionHealth::ready &&
@@ -325,6 +330,42 @@ void HipServingGreedyBackend::capture_greedy_prefix(std::span<const std::uint32_
         s.broken=true;s.guard->recover_or_fail_stop();s.session.health=SerialSessionHealth::poisoned;
         s.session.arithmetic_lineage.tainted=true;throw;
     }
+}
+HipServingGreedyBackend::CohortKey HipServingGreedyBackend::cohort_key() const noexcept {
+    return {impl_->serial.execution_identity,impl_->resources.model_weights,&impl_->session,impl_->guard->device_index()};
+}
+HipServingCohortMember HipServingGreedyBackend::admit_cohort_target(const SerialGreedyTargetInput& target) {
+    impl_->admit(target.token,target.position);
+    serving_require(target.ticket && target.vocab_size==impl_->model.vocab_size &&
+        (target.state_only || impl_->epoch!=UINT64_MAX),"serving cohort ticket, vocabulary or selector epoch differs");
+    return {&impl_->serial,&impl_->model,&impl_->config,&impl_->resources,&impl_->session,
+        &impl_->launch_plan,impl_->direct.get(),impl_->scope,impl_->owner,impl_->guard,
+        &impl_->cohort_shared,&impl_->cohort_shared_fallback};
+}
+void HipServingGreedyBackend::begin_cohort_target() noexcept {
+    impl_->cohort_pending=true; impl_->selected_valid=false;
+}
+std::optional<std::uint32_t> HipServingGreedyBackend::complete_cohort_target(const SerialGreedyTargetInput& target) {
+    serving_require(impl_->cohort_pending,"serving cohort completion has no pending target");
+    impl_->complete();
+    if(target.state_only) return {};
+    return impl_->output->select(impl_->logits,static_cast<std::uint32_t>(target.vocab_size),target.position,++impl_->epoch);
+}
+void HipServingGreedyBackend::publish_cohort_target(const SerialGreedyTargetInput& target,
+    std::optional<std::uint32_t> selected) noexcept {
+    impl_->cohort_pending=false;
+    impl_->selected_valid=selected.has_value();
+    if(selected) { impl_->selected_token=*selected; impl_->selected_position=target.position; }
+}
+void HipServingGreedyBackend::poison_cohort_target() noexcept {
+    impl_->broken=true; impl_->cohort_pending=false; impl_->selected_valid=false;
+    if(impl_->resources.ple_lookup && impl_->resources.ple_prefetch)
+        cancel_ple_lookup_prefetch(*impl_->resources.ple_lookup,*impl_->resources.ple_prefetch);
+    // The original device is established even on a different scheduler worker.
+    try { impl_->enter_worker(); } catch(...) { std::_Exit(3); }
+    impl_->guard->recover_or_fail_stop();
+    impl_->session.health=SerialSessionHealth::poisoned;
+    impl_->session.arithmetic_lineage.tainted=true;
 }
 bool HipServingGreedyBackend::failed() const noexcept { return impl_->broken; }
 int HipServingGreedyBackend::device_index() const noexcept { return impl_->guard->device_index(); }

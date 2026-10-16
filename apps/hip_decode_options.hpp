@@ -168,6 +168,8 @@ struct Options {
     bool prompt_lookup_depth_explicit = false;
     std::vector<std::string> serving_prefix_files;
     std::uint32_t serving_concurrency = 1;
+    std::uint32_t serving_tensor_cohort_rows = 1;
+    bool serving_tensor_cohort_explicit = false;
     std::uint64_t serving_memory_budget = 0, serving_request_budget = 0, serving_headroom = 0;
     bool serving_concurrency_explicit = false, serving_memory_explicit = false;
     bool serving_request_explicit = false, serving_headroom_explicit = false;
@@ -185,6 +187,12 @@ struct Options {
     bool known_prefix_output_policy_explicit = false;
     bool prompt_lookup_adaptive = false;
     bool device_queue_trace = false;
+    std::uint32_t known_prefix_prefill_rows = 0;
+    bool known_prefix_prefill_explicit = false;
+    std::uint64_t known_prefill_workspace_budget = 0, known_prefill_metadata_budget = 0;
+    std::uint64_t known_prefill_uma_budget = 0, known_prefill_host_headroom = 0;
+    bool known_prefill_workspace_explicit = false, known_prefill_metadata_explicit = false;
+    bool known_prefill_uma_explicit = false, known_prefill_headroom_explicit = false;
     std::uint64_t ple_cache_rows = 0, ple_cache_budget_bytes = 0;
     bool ple_cache_rows_explicit = false, ple_cache_budget_explicit = false;
     std::uint64_t serving_cache_entries = 0, serving_cache_snapshot_bytes = 0;
@@ -313,7 +321,24 @@ inline void validate_resolved_requested_logprobs(const Options& options, std::ui
         if (id >= vocabulary) throw std::invalid_argument("requested logprob token exceeds model vocabulary");
 }
 
+inline void validate_known_prefill_options(const Options& options) {
+    const bool any = options.known_prefix_prefill_explicit || options.known_prefix_prefill_rows ||
+        options.known_prefill_workspace_explicit || options.known_prefill_metadata_explicit ||
+        options.known_prefill_uma_explicit || options.known_prefill_headroom_explicit;
+    if (!any) return;
+    if (!options.known_prefix_window || !options.known_prefix_prefill_explicit ||
+        options.known_prefix_prefill_rows < 16U || options.known_prefix_prefill_rows > 2048U ||
+        options.known_prefix_rows_explicit || options.prompt_lookup ||
+        !options.known_prefill_workspace_explicit || !options.known_prefill_metadata_explicit ||
+        !options.known_prefill_uma_explicit || !options.known_prefill_headroom_explicit ||
+        !options.known_prefill_workspace_budget || options.known_prefill_metadata_budget < 2U || !options.known_prefill_uma_budget)
+        throw std::invalid_argument("known prefill requires explicit T16..2048, window, all budgets/headroom and no small-row or lookup selector");
+    if (options.known_prefix_output_policy == strix::KnownWindowOutputPolicy::state_only && options.generate_tokens)
+        throw std::invalid_argument("tiled state-only prefill cannot generate without a terminal output frontier");
+}
+
 inline void validate_resolved_known_prefix_window(const Options& options) {
+    validate_known_prefill_options(options);
     strix::validate_known_window_output_policy(options.known_prefix_output_policy);
     if (!options.known_prefix_window && (options.known_prefix_output_policy_explicit ||
         options.known_prefix_output_policy != strix::KnownWindowOutputPolicy::all_rows))
@@ -331,7 +356,9 @@ inline void validate_resolved_known_prefix_window(const Options& options) {
     if (options.known_prefix_expert_union && (!options.q4k_a8g32_gate_up || !options.grouped_exact_q51_down ||
         !options.q51_slot_parallel_down || !options.deferred_moe_status))
         throw std::invalid_argument("known-prefix expert union requires resolved A8/grouped Q5_1/slot-parallel/D1");
-    if (!options.generate_tokens || options.execution.mode != strix::DecodeExecutionMode::eager ||
+    if ((!options.generate_tokens && !(options.known_prefix_prefill_rows &&
+          options.known_prefix_output_policy == strix::KnownWindowOutputPolicy::state_only)) ||
+        options.execution.mode != strix::DecodeExecutionMode::eager ||
         options.execution.integer_head != strix::DecodeIntegerHead::none || options.gpu_greedy_token ||
         options.prepared_eager || options.moe_shared_overlap || options.gdn_islands || options.prefix_cache_roundtrip ||
         !options.reference_path.empty() || !options.raw_recording_path.empty() ||
@@ -350,8 +377,17 @@ inline void validate_resolved_serving(const Options& options) {
         throw std::invalid_argument("PLE cache requires both positive explicit row and byte limits");
     if (!options.offline_compile_provenance_path.empty() && options.offline_tuning_cache_path.empty())
         throw std::invalid_argument("offline compile provenance requires --offline-tuning-cache");
+    validate_known_prefill_options(options);
     validate_serving_prefix_cache_limits(options);
-    if (options.serving_prefix_files.empty()) return;
+    if (options.serving_tensor_cohort_rows != 1 && options.serving_tensor_cohort_rows != 2 && options.serving_tensor_cohort_rows != 4)
+        throw std::invalid_argument("serving tensor cohort rows must be1,2or4");
+    if (options.serving_tensor_cohort_rows > options.serving_concurrency)
+        throw std::invalid_argument("serving tensor cohort exceeds admitted serving concurrency");
+    if (options.serving_prefix_files.empty()) {
+        if (options.serving_tensor_cohort_explicit || options.serving_tensor_cohort_rows != 1)
+            throw std::invalid_argument("tensor cohort requires --serve-prefix-u32le");
+        return;
+    }
     if (!options.generate_tokens || !options.tokens.empty() || !options.deferred_moe_status ||
         options.execution.mode != strix::DecodeExecutionMode::eager ||
         options.execution.integer_head != strix::DecodeIntegerHead::none || options.moe_shared_overlap ||
@@ -439,7 +475,7 @@ inline Options parse_options(
         throw std::invalid_argument(
             "usage: strix-hip-decode-token MODEL.gguf [TOKEN_ID ...] "
             "[--optimization-profile auto|manual] [--execution-inventory] [--host-dispatch-telemetry] [--execution-telemetry-trace] [--device-queue-trace] "
-            "[--gpu-greedy-token] [--logprob-token ID ...] [--offline-tuning-cache FILE [--offline-compile-provenance FILE]] [--gdn-recurrent-layout baseline|stride32|stride33|transposed] [--gdn-recurrent-storage key-value|value-key] [--known-prefix-window --known-prefix-rows 2|4|8 --known-prefix-expert-union] [--prompt-lookup [--prompt-lookup-depth 0|1|2 | --prompt-lookup-adaptive]] [--serve-prefix-u32le FILE ... --serve-concurrency 1|2|4 --serve-memory-budget-bytes N --serve-request-budget-bytes N --serve-headroom-bytes N] [--gdn-islands] [--qsa-hierarchical-selection] [--qsa-gqa-heads-per-block 1|2|4] [--prepared-eager] [--moe-shared-overlap] [--moe-overlap-arena-budget-bytes N] [--batched-moe-activation] [--validation-final-state DIR] [--validation-final-state-max-bytes N] [--reference FILE] [--max-logit-error X] "
+            "[--gpu-greedy-token] [--logprob-token ID ...] [--offline-tuning-cache FILE [--offline-compile-provenance FILE]] [--gdn-recurrent-layout baseline|stride32|stride33|transposed] [--gdn-recurrent-storage key-value|value-key] [--known-prefix-window --known-prefix-rows 2|4|8 --known-prefix-expert-union] [--known-prefix-prefill-rows 16..2048 --known-prefix-workspace-budget-bytes N --known-prefix-host-metadata-budget-bytes N --known-prefix-uma-budget-bytes N --known-prefix-host-headroom-bytes N] [--prompt-lookup [--prompt-lookup-depth 0|1|2 | --prompt-lookup-adaptive]] [--serve-prefix-u32le FILE ... --serve-concurrency 1|2|4 [--serve-tensor-cohort-rows 2|4] --serve-memory-budget-bytes N --serve-request-budget-bytes N --serve-headroom-bytes N] [--gdn-islands] [--qsa-hierarchical-selection] [--qsa-gqa-heads-per-block 1|2|4] [--prepared-eager] [--moe-shared-overlap] [--moe-overlap-arena-budget-bytes N] [--batched-moe-activation] [--validation-final-state DIR] [--validation-final-state-max-bytes N] [--reference FILE] [--max-logit-error X] "
             "[--context N] [--residency register|copy] [--coalesce-gap BYTES] "
             "[--planned-ple-io] [--ple-cpu-helper-threads 1..8] [--ple-cache-rows N --ple-cache-budget-bytes N] [--ple-max-rows-per-io N] [--ple-max-inflight-ios N] "
             "[--generate N] [--eos-token TOKEN_ID] [--prefix-cache-roundtrip] "
@@ -501,6 +537,19 @@ inline Options parse_options(
             else options.serving_cache_max_prefix_tokens = value;
             continue;
         }
+        if (argument == "--serve-tensor-cohort-rows" || argument.starts_with("--serve-tensor-cohort-rows=")) {
+            if (options.serving_tensor_cohort_explicit) throw std::invalid_argument("duplicate serving tensor cohort selector");
+            options.serving_tensor_cohort_explicit = true;
+            std::string_view value;
+            if (argument == "--serve-tensor-cohort-rows") {
+                if (index + 1 >= argc) throw std::invalid_argument("serving tensor cohort requires rows2or4");
+                value = argv[++index];
+            } else value = argument.substr(std::string_view("--serve-tensor-cohort-rows=").size());
+            const auto rows = parse_u64(value, "serving tensor cohort rows");
+            if (rows != 2 && rows != 4) throw std::invalid_argument("serving tensor cohort rows must be2or4");
+            options.serving_tensor_cohort_rows = static_cast<std::uint32_t>(rows);
+            continue;
+        }
         if (argument == "--serve-concurrency" || argument == "--serve-memory-budget-bytes" ||
             argument == "--serve-request-budget-bytes" || argument == "--serve-headroom-bytes") {
             if (index + 1 >= argc) throw std::invalid_argument("serving option requires a value");
@@ -560,6 +609,35 @@ inline Options parse_options(
             const auto id = parse_u64(argv[++index], "logprob token");
             if (id > std::numeric_limits<std::uint32_t>::max()) throw std::invalid_argument("logprob token exceeds uint32");
             options.logprob_token_ids.push_back(static_cast<std::uint32_t>(id));
+            continue;
+        }
+        if (argument == "--known-prefix-prefill-rows" || argument.starts_with("--known-prefix-prefill-rows=")) {
+            if (options.known_prefix_prefill_explicit) throw std::invalid_argument("duplicate known prefill rows option");
+            std::string_view value;
+            if (argument == "--known-prefix-prefill-rows") {
+                if (index + 1 >= argc) throw std::invalid_argument("known prefill rows require a value");
+                value = argv[++index];
+            } else value = argument.substr(std::string_view("--known-prefix-prefill-rows=").size());
+            const auto rows = parse_u64(value,"known prefill rows");
+            if (rows < 16U || rows > 2048U) throw std::invalid_argument("known prefill rows must be 16 through 2048");
+            options.known_prefix_prefill_rows = static_cast<std::uint32_t>(rows);
+            options.known_prefix_prefill_explicit = true;
+            continue;
+        }
+        if (argument == "--known-prefix-workspace-budget-bytes" || argument == "--known-prefix-host-metadata-budget-bytes" ||
+            argument == "--known-prefix-uma-budget-bytes" || argument == "--known-prefix-host-headroom-bytes") {
+            if (index + 1 >= argc) throw std::invalid_argument("known prefill budget requires a value");
+            bool* supplied = argument == "--known-prefix-workspace-budget-bytes" ? &options.known_prefill_workspace_explicit :
+                argument == "--known-prefix-host-metadata-budget-bytes" ? &options.known_prefill_metadata_explicit :
+                argument == "--known-prefix-uma-budget-bytes" ? &options.known_prefill_uma_explicit : &options.known_prefill_headroom_explicit;
+            if (*supplied) throw std::invalid_argument("duplicate known prefill budget");
+            const auto value = parse_u64(argv[++index],"known prefill budget");
+            if (!value && argument != "--known-prefix-host-headroom-bytes") throw std::invalid_argument("known prefill budgets must be positive");
+            *supplied = true;
+            if (argument == "--known-prefix-workspace-budget-bytes") options.known_prefill_workspace_budget = value;
+            else if (argument == "--known-prefix-host-metadata-budget-bytes") options.known_prefill_metadata_budget = value;
+            else if (argument == "--known-prefix-uma-budget-bytes") options.known_prefill_uma_budget = value;
+            else options.known_prefill_host_headroom = value;
             continue;
         }
         if (argument == "--known-prefix-output-policy" || argument.starts_with("--known-prefix-output-policy=")) {
@@ -1075,7 +1153,9 @@ inline Options parse_options(
     if (options.validation_final_state_budget_explicit && options.validation_final_state_path.empty())
         throw std::invalid_argument("final state export budget requires --validation-final-state");
     if (!options.validation_final_state_path.empty()) {
-        if (!options.validation_final_state_maximum_bytes || !options.generate_tokens ||
+        if (!options.validation_final_state_maximum_bytes || (!options.generate_tokens &&
+            !(options.known_prefix_window && options.known_prefix_prefill_rows &&
+              options.known_prefix_output_policy == strix::KnownWindowOutputPolicy::state_only)) ||
             !options.raw_recording_path.empty() || !options.reference_path.empty() ||
             options.prefix_cache_roundtrip || options.execution.mode != strix::DecodeExecutionMode::eager ||
             options.execution.integer_head != strix::DecodeIntegerHead::none)
@@ -1124,8 +1204,9 @@ inline Options parse_options(
         throw std::invalid_argument("PLE cache requires both positive explicit row and byte limits");
     if (!options.offline_compile_provenance_path.empty() && options.offline_tuning_cache_path.empty())
         throw std::invalid_argument("offline compile provenance requires --offline-tuning-cache");
+    validate_known_prefill_options(options);
     validate_serving_prefix_cache_limits(options);
-    if (options.serving_prefix_files.empty() && (options.serving_concurrency_explicit || options.serving_memory_explicit ||
+    if (options.serving_prefix_files.empty() && (options.serving_tensor_cohort_explicit || options.serving_concurrency_explicit || options.serving_memory_explicit ||
         options.serving_request_explicit || options.serving_headroom_explicit))
         throw std::invalid_argument("serving controls require --serve-prefix-u32le");
     if (options.known_prefix_output_policy_explicit && !options.known_prefix_window)

@@ -69,18 +69,24 @@ struct Fixture final : strix::SerialGreedyStepBackend {
         metadata.output_mode="fixture"; metadata.gpu_identity=std::string(32,'4'); metadata.gpu_architecture="synthetic";
         metadata.kernel_plan_identity=37; metadata.launch_plan_identity=41; metadata.runtime_binding_identity=43;
         metadata.hip_runtime_version=1; metadata.hip_driver_version=1;
-        result=strix::execute_serial_greedy_token_request(request,*this);
+        if (maximum == 0U) {
+            for (auto input : prefix) execute_state(input,session.next_position);
+            result.steps_executed=prefix.size(); result.final_position=session.next_position;
+        } else result=strix::execute_serial_greedy_token_request(request,*this);
         if(maximum==3U && eos==15U && context==16U)
             require(result.generated_tokens==std::vector<std::uint32_t>({3,4,5}) && result.steps_executed==4U,
                     "fixture does not use the actual controller bonus convention");
     }
-    std::vector<float> execute(std::uint32_t input,std::uint64_t position) override {
+    void execute_state(std::uint32_t input,std::uint64_t position) override {
         require(position==session.next_position,"fixture input frontier mismatch");
         for(auto* buffer:{&owner->device,&owner->host}) for(auto& byte:*buffer)
             byte^=static_cast<std::byte>(input+static_cast<std::uint32_t>(position));
         session.arithmetic_lineage=strix::prepare_serial_row_lineage(session.arithmetic_lineage,position,29,37);
         ++session.next_position; ++session.committed_tokens;
         for(auto& generation:session.state.generations) ++generation;
+    }
+    std::vector<float> execute(std::uint32_t input,std::uint64_t position) override {
+        execute_state(input,position);
         std::vector<float> logits(16,-1.0F); logits[static_cast<std::size_t>(position+2U)]=1.0F; return logits;
     }
     void run(const std::filesystem::path& destination,strix::FinalGenerationStatePolicy policy={}) {
@@ -187,6 +193,42 @@ void boundaries(const std::filesystem::path& base) {
                 "EOS/capacity/single-output frontier differs from production controller");
     }
 }
+void zero_emission(const std::filesystem::path& base) {
+    for (unsigned mode=0;mode<8U;++mode) {
+        Fixture f(base,60U+mode,0,15,mode==1U ? 2U : 16U);
+        const auto output=f.root/"finished";
+        if (mode==2U) f.result.generated_tokens.push_back(3U);
+        if (mode==3U) f.result.stop_reason=strix::SerialRequestStopReason::context_capacity;
+        if (mode==4U) --f.result.steps_executed;
+        if (mode==5U) ++f.session.next_position;
+        if (mode==6U) f.result.restored_prefix_tokens=1U;
+        if (mode==7U) f.session.state.valid=strix::PersistentState::attention_kv;
+        if (mode>=2U) {
+            rejects([&] { f.run(output); });
+            require(!f.copies && !std::filesystem::exists(output),
+                    "invalid zero-emission frontier reached state reads/publication");
+            continue;
+        }
+        f.run(output);
+        const auto manifest=text(output/"manifest.json");
+        require(manifest.find("\"consumed_input_tokens\":[1,2]")!=std::string::npos &&
+                manifest.find("\"generated_tokens\":[]")!=std::string::npos &&
+                manifest.find("\"unconsumed_emitted_token\":null")!=std::string::npos &&
+                manifest.find("\"bonus_pending\":false")!=std::string::npos &&
+                manifest.find("\"next_position\":2")!=std::string::npos && f.copies==9U,
+                "zero-emission export forged a bonus or omitted full component bytes");
+        constexpr std::array names{"attention-kv","recurrent-matrix","gdn-convolution","ple-convolution",
+                                   "sparse-index","ngram-history","position-history"};
+        for (std::size_t i=0;i<names.size();++i) {
+            const auto& allocation=f.layout.allocations[i];
+            const auto& bytes=allocation.storage==strix::SessionStateStorage::host?f.owner->host:f.owner->device;
+            const auto actual=text(output/(std::string(names[i])+".raw"));
+            require(actual.size()==allocation.bytes &&
+                    std::memcmp(actual.data(),bytes.data()+allocation.offset,actual.size())==0,
+                    "zero-emission export did not retain every component byte");
+        }
+    }
+}
 void cli(const std::filesystem::path& base) {
     const auto parse=[](std::vector<std::string> args) {
         std::vector<char*> argv;
@@ -226,7 +268,7 @@ int main() try {
     require(std::filesystem::create_directory(root),"cannot reserve final state fixture root");
     // Preserve failures for diagnosis; remove only this explicitly reserved root
     // after every source fixture has succeeded.
-    success(root,0); failures(root,10); boundaries(root); cli(root);
+    success(root,0); failures(root,10); boundaries(root); zero_emission(root); cli(root);
     require(std::filesystem::canonical(root.parent_path())==
             std::filesystem::canonical(std::filesystem::temp_directory_path()),"fixture cleanup escaped reserved parent");
     std::filesystem::remove_all(root);

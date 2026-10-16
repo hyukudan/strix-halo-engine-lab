@@ -147,5 +147,47 @@ int main() {
     auto observed = parse({"decoder", "m", "1", "--host-dispatch-telemetry", "--execution-telemetry-trace"});
     expect(observed.host_dispatch_telemetry && observed.execution_telemetry_trace &&
         observed.optimization_profile == OptimizationProfile::automatic, "observer does not change automatic profile");
+    auto tiled = parse({"decoder", "m", "1", "--known-prefix-window", "--known-prefix-prefill-rows=17",
+        "--known-prefix-workspace-budget-bytes", "4096", "--known-prefix-host-metadata-budget-bytes", "2048",
+        "--known-prefix-uma-budget-bytes", "8192", "--known-prefix-host-headroom-bytes", "0"});
+    expect(tiled.known_prefix_prefill_rows == 17 && tiled.known_prefix_rows == 2 && !tiled.known_prefix_rows_explicit,
+        "explicit T supports odd tails without relabelling the small-row selector");
+    for (const auto rows : {0U, 15U, 2049U}) {
+        auto bad = tiled; bad.known_prefix_prefill_rows = rows;
+        rejects([&] { validate_known_prefill_options(bad); }, "prefill closes T bounds");
+    }
+    for (unsigned missing = 0; missing < 4; ++missing) {
+        auto bad = tiled;
+        if (missing == 0) bad.known_prefill_workspace_explicit = false;
+        if (missing == 1) bad.known_prefill_metadata_explicit = false;
+        if (missing == 2) bad.known_prefill_uma_explicit = false;
+        if (missing == 3) bad.known_prefill_headroom_explicit = false;
+        rejects([&] { validate_known_prefill_options(bad); }, "every prefill reservation input is explicit");
+    }
+    { auto bad = tiled; bad.known_prefix_rows_explicit = true;
+      rejects([&] { validate_known_prefill_options(bad); }, "small and T selectors cannot silently override each other"); }
+    { auto bad = tiled; bad.known_prefill_metadata_budget = 1;
+      rejects([&] { validate_known_prefill_options(bad); }, "metadata budget admits both retained payload copies"); }
+    { auto bad = tiled; bad.prompt_lookup = true;
+      rejects([&] { validate_known_prefill_options(bad); }, "lookup verification requires all-row small windows"); }
+    { auto only_state = tiled; only_state.known_prefix_output_policy = KnownWindowOutputPolicy::state_only;
+      only_state.generate_tokens = 0; validate_known_prefill_options(only_state);
+      only_state.generate_tokens = 1;
+      rejects([&] { validate_known_prefill_options(only_state); }, "T state-only never fabricates terminal logits"); }
+    auto cohort = parse({"decoder", "m", "--serve-prefix-u32le", "p", "--serve-concurrency", "4",
+        "--serve-tensor-cohort-rows=2", "--serve-memory-budget-bytes", "1000000",
+        "--serve-request-budget-bytes", "1000", "--serve-headroom-bytes", "0", "--generate", "1"});
+    expect(cohort.serving_tensor_cohort_rows == 2 && cohort.serving_tensor_cohort_explicit,
+        "tensor cohort is a separate explicit overlay, not automatic concurrency");
+    cohort.deferred_moe_status = true;
+    validate_resolved_serving(cohort);
+    rejects([] { (void)parse({"decoder", "m", "1", "--serve-tensor-cohort-rows", "2"}); },
+        "tensor cohort cannot be silently ignored by normal decoder");
+    rejects([] { (void)parse({"decoder", "m", "--serve-prefix-u32le", "p", "--serve-tensor-cohort-rows", "3"}); },
+        "tensor cohort admits exactly two or four");
+    rejects([] { (void)parse({"decoder", "m", "--serve-prefix-u32le", "p", "--serve-tensor-cohort-rows", "2",
+        "--serve-tensor-cohort-rows=4"}); }, "tensor cohort duplicate rejects instead of overriding");
+    { auto bad = cohort; bad.serving_tensor_cohort_rows = 4; bad.serving_concurrency = 2;
+      rejects([&] { validate_resolved_serving(bad); }, "tensor cohort width cannot exceed request concurrency"); }
     return failures ? 1 : 0;
 }

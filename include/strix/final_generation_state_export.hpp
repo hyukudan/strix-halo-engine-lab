@@ -25,7 +25,10 @@ void validate_final_generation_state_destination(const std::filesystem::path&);
 void validate_final_generation_state_budget(const SerialSessionStateLayout&, FinalGenerationStatePolicy);
 
 // Validation-only synchronous whole-seven-component export. No logits/model
-// execution. Exclude mutation and retain real leases through original-device
+// execution. Zero-emission requests export the fully consumed prompt with a
+// null unconsumed token and bonus_pending=false. Cached/restored requests are
+// excluded because steps_executed must describe the complete consumed frontier.
+// Exclude mutation and retain real leases through original-device
 // quiescence, including errors. require_binding checks actual device/runtime/
 // state generations. before_publication rechecks model/executable hashes.
 // quiesce_or_fail_stop MUST drain original work or terminate without unwinding

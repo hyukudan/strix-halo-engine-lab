@@ -4,11 +4,29 @@
 #include "strix/hip_launch_context.hpp"
 #include "strix/serial_request.hpp"
 #include "strix/serial_session.hpp"
+#include "strix/serving_cohort.hpp"
 
 #include <memory>
 
 namespace strix {
 class HipServingPrefixCache;
+class HipSetupQuiescenceGuard;
+// Borrowed only by the single cohort owner while this request is leased idle.
+// Original C1 identities are never retagged to a known-window identity.
+struct HipServingCohortMember {
+    const CompiledSerialExecution* serial = nullptr;
+    const ModelContract* model = nullptr;
+    const HipLauncherCatalogConfig* config = nullptr;
+    const ExecutionRuntimeResources* resources = nullptr;
+    SerialSessionContext* session = nullptr;
+    const CompiledLaunchPlan* launches = nullptr;
+    DirectLaunchDispatcher* dispatcher = nullptr;
+    HipLaunchContext scope;
+    std::shared_ptr<const void> owner;
+    std::shared_ptr<const HipSetupQuiescenceGuard> guard;
+    const HipSharedExpertLauncherConfig* shared_config=nullptr;
+    const HipSharedExpertLauncherConfig* shared_fallback_config=nullptr;
+};
 
 // One independently owned C1 session, transferable between scheduler workers
 // only while idle. The scheduler owns greedy/EOS/capacity/cancellation policy.
@@ -51,6 +69,19 @@ public:
     void execute_state(std::uint32_t input_token, std::uint64_t position) override;
     [[nodiscard]] std::optional<GreedyPrefixRestore> try_restore_greedy_prefix(const SerialGreedyRequest&) override;
     void capture_greedy_prefix(std::span<const std::uint32_t>,std::uint32_t pending,std::uint64_t vocabulary) override;
+private:
+    friend class HipServingCohort;
+    // Internal production seam for HipServingCohort. Caller excludes all other
+    // accesses until completion/drain. Admission does not consume or publish.
+    struct CohortKey { std::uint64_t execution_identity=0; const ModelRuntimeBinding* weights=nullptr;
+        const SerialSessionContext* session=nullptr; int device=-1; };
+    [[nodiscard]] CohortKey cohort_key() const noexcept;
+    [[nodiscard]] HipServingCohortMember admit_cohort_target(const SerialGreedyTargetInput&);
+    void begin_cohort_target() noexcept;
+    [[nodiscard]] std::optional<std::uint32_t> complete_cohort_target(const SerialGreedyTargetInput&);
+    void publish_cohort_target(const SerialGreedyTargetInput&,std::optional<std::uint32_t>) noexcept;
+    void poison_cohort_target() noexcept;
+public:
     [[nodiscard]] bool failed() const noexcept;
     [[nodiscard]] int device_index() const noexcept;
 private:

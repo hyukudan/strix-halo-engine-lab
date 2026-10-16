@@ -74,6 +74,8 @@ struct HipKnownPrefixWindow::Impl {
     std::shared_ptr<const void> actual_owner;
     HipSetupQuiescenceGuard guard;
     CompiledKnownPrefixWindow window;
+    std::optional<CompiledKnownPrefixPrefill> prefill;
+    std::optional<CompiledSerialExecution> prefill_launcher_source;
     CompiledSerialExecution serial;
     ModelContract model;
     HipLauncherCatalogConfig config;
@@ -105,10 +107,11 @@ struct HipKnownPrefixWindow::Impl {
         ModelContract model_source, HipLauncherCatalogConfig config_source,
         const ExecutionRuntimeResources& serial_resources, ExecutionMemoryBinding memory,
         HipLaunchContext native_scope, std::shared_ptr<const void> owner,
-        q51_known_rows::Workspace union_workspace)
+        q51_known_rows::Workspace union_workspace,std::optional<CompiledKnownPrefixPrefill> tiled = std::nullopt)
         : actual_owner(std::move(owner)), window(std::move(source)), serial(std::move(serial_source)),
           model(std::move(model_source)), config(std::move(config_source)), resources(serial_resources),
           scratch(memory), scope(native_scope), routed_workspace(std::move(union_workspace)) {
+        prefill=std::move(tiled);
         if (!actual_owner) throw std::invalid_argument("known-window native owner requires retained actual owners");
         if (const auto error = model.validate(); !error.empty()) throw std::invalid_argument(error);
         if (config.gdn_recurrent_storage != GdnRecurrentStorage::key_value ||
@@ -118,6 +121,16 @@ struct HipKnownPrefixWindow::Impl {
             serial.request_concurrency != 1U || config.activation != HipActivationStorage::bf16)
             throw std::invalid_argument("known-window native owner supports eager BF16 C1 plans only");
         validate_compiled_known_prefix_window(window, serial);
+        if(prefill) {
+            validate_compiled_known_prefix_prefill(*prefill,serial);
+            if(prefill->tile8.window_execution_identity!=window.window_execution_identity||
+                prefill->tile8.window_kernel_plan_identity!=window.window_kernel_plan_identity)
+                throw std::invalid_argument("known prefill owner selection tile differs");
+            prefill_launcher_source=serial;
+            prefill_launcher_source->execution_identity=prefill->prefill_execution_identity;
+            prefill_launcher_source->arena=prefill->arena.row_view[0];
+            prefill_launcher_source->whole_plan_graph_safe=false;
+        }
         if (!resources.model_manifest || !resources.tensor_access)
             throw std::invalid_argument("known-window native owner requires manifest and tensor access resources");
         validate_known_prefix_window_formats(window, serial, *resources.model_manifest, *resources.tensor_access);
@@ -130,26 +143,28 @@ struct HipKnownPrefixWindow::Impl {
         original_state_layout = *resources.session_state_layout;
         metadata = std::make_unique<const PreparedTensorViews>(serial.execution_identity, serial.execution,
             *resources.model_manifest, *resources.model_weights, *resources.tensor_access, actual_owner);
-        validate_execution_memory_binding(window.window_execution_identity, window.arena.physical, scratch);
+        validate_execution_memory_binding(execution_identity(), physical_arena(), scratch);
         validate_scope();
-        row_resources.resize(window.logical_rows);
-        catalogs.resize(window.logical_rows);
-        registries.resize(window.logical_rows);
-        launch_plans.resize(window.logical_rows);
-        launch_pointers.reserve(window.logical_rows);
-        for (std::size_t row = 0; row < window.logical_rows; ++row) {
+        const auto launcher_rows=prefill?1U:window.logical_rows;
+        row_resources.resize(launcher_rows);
+        catalogs.resize(launcher_rows);
+        registries.resize(launcher_rows);
+        launch_plans.resize(launcher_rows);
+        launch_pointers.reserve(launcher_rows);
+        for (std::size_t row = 0; row < launcher_rows; ++row) {
+            const auto& row_source=prefill?*prefill_launcher_source:window.row_plan[row];
             row_resources[row] = resources;
             row_resources[row].scratch = &scratch;
             catalogs[row] = std::make_unique<HipLauncherCatalog>(model, config);
-            catalogs[row]->register_for_compiled_execution(window.row_plan[row], registries[row], &row_resources[row]);
-            if (catalogs[row]->audit(window.row_plan[row], registries[row]).missing_steps)
+            catalogs[row]->register_for_compiled_execution(row_source, registries[row], &row_resources[row]);
+            if (catalogs[row]->audit(row_source, registries[row]).missing_steps)
                 throw std::invalid_argument("known-window native row catalog coverage is incomplete");
-            launch_plans[row] = compile_launch_plan(window.row_plan[row], registries[row]);
+            launch_plans[row] = compile_launch_plan(row_source, registries[row]);
             for (const auto& launcher : launch_plans[row].steps)
                 if (!launcher.preflight)
                     throw std::invalid_argument("known-window native row contains a launcher without deep preflight");
             launch_pointers.push_back(&launch_plans[row]);
-            const auto readers = catalogs[row]->known_window_position_readers(window.row_plan[row], registries[row]);
+            const auto readers = catalogs[row]->known_window_position_readers(row_source, registries[row]);
             position_readers.insert(position_readers.end(), readers.begin(), readers.end());
         }
         std::sort(position_readers.begin(), position_readers.end());
@@ -167,6 +182,9 @@ struct HipKnownPrefixWindow::Impl {
         });
     }
     ~Impl() { guard.recover_or_fail_stop(); }
+    std::uint64_t execution_identity() const noexcept {return prefill?prefill->prefill_execution_identity:window.window_execution_identity;}
+    const ExecutionArenaPlan& physical_arena() const noexcept {return prefill?prefill->arena.physical:window.arena.physical;}
+    std::uint32_t logical_rows() const noexcept {return prefill?prefill->logical_rows:window.logical_rows;}
 
     void status_disjoint(std::uintptr_t address, std::uint64_t bytes) const {
         if (!bytes) return;
@@ -192,7 +210,7 @@ struct HipKnownPrefixWindow::Impl {
             if (!empty(status)) throw std::invalid_argument("known-window deferred configuration/scope parity differs");
             return;
         }
-        if (status.execution_identity != window.window_execution_identity || !status.arena_base ||
+        if (status.execution_identity != execution_identity() || !status.arena_base ||
             status.arena_base % alignof(std::uint64_t) || status.arena_bytes != sizeof(DeferredMoeFirstError) ||
             !status.allocation_generation || status.arena_bytes > std::numeric_limits<std::uintptr_t>::max() - status.arena_base)
             throw std::invalid_argument("known-window deferred status has stale identity, generation or extent");
@@ -288,7 +306,7 @@ struct HipKnownPrefixWindow::Impl {
         }
         if(!config.q4k_a8g32_gate_up || !config.grouped_exact_q51_down ||
             !config.q51_slot_parallel_down || !config.deferred_moe_status || !routed_workspace.owner ||
-            workspace.execution_identity!=window.window_execution_identity ||
+            workspace.execution_identity!=execution_identity() ||
             !workspace.arena_base || workspace.arena_base%256U || !workspace.allocation_generation ||
             workspace.arena_bytes!=q51_known_rows::required_scratch_bytes(window.logical_rows,
                 u32(model.num_experts),u32(model.num_experts_per_token)) ||
@@ -361,7 +379,7 @@ struct HipKnownPrefixWindow::Impl {
         if (failed) throw std::logic_error("known-window native owner cannot be reused after an exception");
         bool owned_eager_scope_admitted=false;
         try {
-            if(tokens.size()!=window.logical_rows)
+            if(tokens.size()!=logical_rows())
                 throw std::invalid_argument("known-window native input row count differs from its compiled window");
             if (current_hip_launch_context())
                 throw std::invalid_argument("known-window native owner cannot nest a HIP launch scope");
@@ -375,10 +393,12 @@ struct HipKnownPrefixWindow::Impl {
             hooks.quiesce_or_fail_stop = [&] { failed = true; guard.recover_or_fail_stop(); };
             hooks.position_reader_implementations = position_readers;
             const auto first_position=session.next_position;
-            auto result=execute_known_prefix_window_eager(window, serial, resources, scratch, session, tokens,
-                launch_pointers, r2_entries, rows_entries, hooks);
+            auto result=prefill ? execute_known_prefix_prefill_eager(*prefill,serial,resources,scratch,session,tokens,
+                launch_plans.front(),r2_entries,rows_entries,hooks) :
+                execute_known_prefix_window_eager(window, serial, resources, scratch, session, tokens,
+                    launch_pointers, r2_entries, rows_entries, hooks);
             if(window.routed_expert_union_steps)
-                last_union_observation=HipKnownPrefixUnionObservation{first_position,last_union_layer,pending_union_summary};
+                last_union_observation=HipKnownPrefixUnionObservation{first_position+(prefill?(prefill->logical_rows/8U-1U)*8U:0U),last_union_layer,pending_union_summary};
             return result;
         } catch (...) {
             failed = true;
@@ -398,14 +418,23 @@ HipKnownPrefixWindow::HipKnownPrefixWindow(CompiledKnownPrefixWindow window,
           std::move(config), serial_resources, window_scratch, scope, std::move(actual_owner),
           std::move(routed_union_workspace))) {}
 HipKnownPrefixWindow::~HipKnownPrefixWindow() = default;
+HipKnownPrefixWindow::HipKnownPrefixWindow(CompiledKnownPrefixPrefill prefill,
+    CompiledSerialExecution serial,ModelContract model,HipLauncherCatalogConfig config,
+    const ExecutionRuntimeResources& resources,ExecutionMemoryBinding memory,HipLaunchContext scope,
+    std::shared_ptr<const void> owner,q51_known_rows::Workspace workspace) {
+    auto tile=prefill.tile8;
+    impl_=std::make_unique<Impl>(std::move(tile),std::move(serial),std::move(model),std::move(config),resources,memory,
+        scope,std::move(owner),std::move(workspace),std::move(prefill));
+}
 KnownWindowResult HipKnownPrefixWindow::execute(SerialSessionContext& session, std::array<std::uint32_t, 2> tokens) {
     return impl_->execute(session, std::span<const std::uint32_t>(tokens));
 }
 KnownWindowResult HipKnownPrefixWindow::execute(SerialSessionContext& session, std::span<const std::uint32_t> tokens) {
     return impl_->execute(session,tokens);
 }
-std::uint32_t HipKnownPrefixWindow::logical_rows() const noexcept { return impl_->window.logical_rows; }
-KnownWindowOutputPolicy HipKnownPrefixWindow::output_policy() const noexcept { return impl_->window.output_policy; }
+std::uint32_t HipKnownPrefixWindow::logical_rows() const noexcept { return impl_->logical_rows(); }
+bool HipKnownPrefixWindow::supports_tiled_prefill() const noexcept {return impl_->prefill.has_value();}
+KnownWindowOutputPolicy HipKnownPrefixWindow::output_policy() const noexcept { return impl_->prefill?impl_->prefill->output_policy:impl_->window.output_policy; }
 std::optional<HipKnownPrefixUnionObservation> HipKnownPrefixWindow::latest_routed_union_observation() const noexcept {
     return impl_->failed?std::nullopt:impl_->last_union_observation;
 }

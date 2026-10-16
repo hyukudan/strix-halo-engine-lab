@@ -107,6 +107,7 @@ struct GreedyServingScheduler::Impl {
     const GreedyServingPolicy policy;
     const ServingCompatibility compatibility;
     const std::shared_ptr<const void> model_owner;
+    const std::shared_ptr<ServingCohortExecutor> cohort;
     const std::shared_ptr<ReservationBudget> budget = std::make_shared<ReservationBudget>();
     std::mutex mutex;
     std::mutex inline_execution;
@@ -118,19 +119,25 @@ struct GreedyServingScheduler::Impl {
     // Last member: partially constructed pools stop/join workers before state.
     std::vector<std::jthread> workers;
 
-    Impl(GreedyServingPolicy value, ServingCompatibility key, std::shared_ptr<const void> owner)
-        : policy(value), compatibility(std::move(key)), model_owner(std::move(owner)) {
+    Impl(GreedyServingPolicy value, ServingCompatibility key, std::shared_ptr<const void> owner,
+         std::shared_ptr<ServingCohortExecutor> executor)
+        : policy(value), compatibility(std::move(key)), model_owner(std::move(owner)),cohort(std::move(executor)) {
         if ((policy.concurrency != 1 && policy.concurrency != 2 && policy.concurrency != 4) ||
             !policy.max_retained_requests || !policy.prefill_chunk_rows || !policy.max_decode_burst ||
             !policy.reservation_budget_bytes || policy.shared_reservation_bytes > policy.reservation_budget_bytes ||
             !compatibility.model_content.valid() || !compatibility.numerical_identity ||
             compatibility.device_ordinal < 0 || !model_owner)
             throw std::invalid_argument("serving requires current owners, compatible identity and bounded resources");
+        if ((policy.tensor_cohort_rows!=1U && policy.tensor_cohort_rows!=2U && policy.tensor_cohort_rows!=4U) ||
+            policy.tensor_cohort_rows>policy.concurrency || (policy.tensor_cohort_rows>1U && !cohort))
+            throw std::invalid_argument("serving tensor cohort requires explicit executor and bounded C2/C4 capacity");
         budget->reserved = policy.shared_reservation_bytes;
         budget->limit = policy.reservation_budget_bytes;
         budget->max_requests = policy.max_retained_requests;
         retained.reserve(policy.max_retained_requests);
-        if (policy.concurrency != 1)
+        if (policy.tensor_cohort_rows>1U)
+            workers.emplace_back([this](std::stop_token stop) { cohort_worker(stop); });
+        else if (policy.concurrency != 1)
             for (std::uint32_t i = 0; i < policy.concurrency; ++i)
                 workers.emplace_back([this](std::stop_token stop) { worker(stop, false); });
     }
@@ -162,6 +169,121 @@ struct GreedyServingScheduler::Impl {
         else decode_burst = 0;
         accumulate(job->metrics.queue_wait_ns, elapsed(job->queued, now), job->metrics.saturated);
         return job;
+    }
+    void cohort_delivery_metrics(const std::shared_ptr<detail::GreedyServingJob>& job) noexcept {
+        const auto emitted=job->cursor.result().generated_tokens.size();
+        if(emitted<=job->metrics.emitted_tokens) return;
+        const auto delivered=Clock::now();
+        if(!job->last_token) job->metrics.time_to_first_token_ns=elapsed(job->admitted,delivered);
+        else {
+            const auto interval=elapsed(*job->last_token,delivered);
+            accumulate(job->metrics.inter_token_intervals,1,job->metrics.saturated);
+            accumulate(job->metrics.inter_token_ns_total,interval,job->metrics.saturated);
+            job->metrics.inter_token_ns_max=std::max(job->metrics.inter_token_ns_max,interval);
+            const auto bucket=interval>1?std::bit_width(interval)-1U:0U;
+            accumulate(job->metrics.inter_token_ns_histogram[bucket],1,job->metrics.saturated);
+        }
+        job->last_token=delivered; job->metrics.emitted_tokens=emitted;
+    }
+    void cohort_worker(std::stop_token stop) {
+        for(;;) {
+            std::array<std::shared_ptr<detail::GreedyServingJob>,4> jobs;
+            std::array<ServingRequestState,4> states{};
+            std::array<ServingCohortTarget,4> targets;
+            std::array<std::size_t,4> target_job{};
+            std::size_t count=0,target_count=0;
+            {
+                std::unique_lock lock(mutex);
+                if(!cv.wait(lock,stop,[&]{return !queue.empty();})) return;
+                // Only ready work: no timer, barrier, or speculative fill wait.
+                while(count<policy.tensor_cohort_rows && !queue.empty()) {
+                    jobs[count]=pick(); jobs[count]->state.store(ServingRequestState::running,std::memory_order_release);
+                    states[count]=ServingRequestState::queued; ++count; ++active;
+                }
+            }
+            const auto started=Clock::now();
+            for(std::size_t i=0;i<count;++i) {
+                auto& job=*jobs[i];
+                if(job.cancel_requested.load(std::memory_order_acquire) || stop.stop_requested()) {
+                    states[i]=ServingRequestState::cancelled; continue;
+                }
+                if(policy.queue_timeout_ns && elapsed(job.queued,started)>=policy.queue_timeout_ns) {
+                    states[i]=ServingRequestState::timed_out; continue;
+                }
+                try {
+                    const auto input=job.cursor.prepare_target(*job.backend);
+                    accumulate(job.metrics.chunks,1,job.metrics.saturated);
+                    if(input) {
+                        if(job.cancel_requested.load(std::memory_order_acquire) || stop.stop_requested()) {
+                            job.cursor.cancel_prepared_target(*input); states[i]=ServingRequestState::cancelled;
+                        } else { targets[target_count]={job.backend.get(),*input,{}}; target_job[target_count++]=i; }
+                    } else if(job.cursor.done()) states[i]=ServingRequestState::completed;
+                } catch(...) { job.error=std::current_exception(); states[i]=ServingRequestState::failed; }
+            }
+            std::size_t first=0;
+            while(first<target_count) {
+                // Recheck cancel immediately before submission, without
+                // attributing a fabricated target call to a cancelled lease.
+                const auto job_index=target_job[first]; auto& first_job=*jobs[job_index];
+                if(first_job.cancel_requested.load(std::memory_order_acquire) || stop.stop_requested()) {
+                    first_job.cursor.cancel_prepared_target(targets[first].input);
+                    states[job_index]=ServingRequestState::cancelled; ++first; continue;
+                }
+                std::size_t width=target_count-first>=4U?4U:(target_count-first>=2U?2U:1U);
+                std::array<SerialGreedyStepBackend*,4> backends{};
+                for(std::size_t row=0;row<width;++row) backends[row]=targets[first+row].backend;
+                if(width>1U && !cohort->compatible(std::span<SerialGreedyStepBackend* const>(backends.data(),width))) {
+                    width=2U;
+                    if(!cohort->compatible(std::span<SerialGreedyStepBackend* const>(backends.data(),width))) width=1U;
+                }
+                // A late cancellation removes only that member before any
+                // submit. Unaffected prepared leases remain ready for C1/2/4.
+                bool cancelled_member=false;
+                for(std::size_t row=1;row<width;++row) {
+                    const auto index=first+row; auto& job=*jobs[target_job[index]];
+                    if(job.cancel_requested.load(std::memory_order_acquire) || stop.stop_requested()) {
+                        job.cursor.cancel_prepared_target(targets[index].input);
+                        states[target_job[index]]=ServingRequestState::cancelled;
+                        for(std::size_t move=index+1U;move<target_count;++move) {
+                            targets[move-1U]=targets[move]; target_job[move-1U]=target_job[move];
+                        }
+                        --target_count; cancelled_member=true; break;
+                    }
+                }
+                if(cancelled_member) continue;
+                try {
+                    if(width==1U) execute_serving_target_fallback(targets[first]);
+                    else cohort->execute(std::span<ServingCohortTarget>(targets.data()+first,width));
+                    for(std::size_t row=0;row<width;++row) {
+                        const auto index=first+row; auto& job=*jobs[target_job[index]];
+                        try {
+                            if(job.cancel_requested.load(std::memory_order_acquire) || stop.stop_requested()) job.cursor.cancel();
+                            job.cursor.accept_target(*job.backend,targets[index].input,targets[index].selected);
+                            if(job.cursor.cancelled()) states[target_job[index]]=ServingRequestState::cancelled;
+                            else if(job.cursor.done()) states[target_job[index]]=ServingRequestState::completed;
+                        } catch(...) { job.error=std::current_exception(); states[target_job[index]]=ServingRequestState::failed; }
+                    }
+                } catch(...) {
+                    const auto error=std::current_exception();
+                    for(std::size_t row=0;row<width;++row) {
+                        auto& job=*jobs[target_job[first+row]];
+                        job.cursor.fail_target(); job.error=error; states[target_job[first+row]]=ServingRequestState::failed;
+                    }
+                }
+                first+=width;
+            }
+            for(std::size_t i=0;i<count;++i) {
+                auto& job=jobs[i]; cohort_delivery_metrics(job);
+                accumulate(job->metrics.service_ns,elapsed(started,Clock::now()),job->metrics.saturated);
+                std::lock_guard lock(mutex); --active;
+                if(states[i]==ServingRequestState::queued) {
+                    try { job->queued=Clock::now(); queue.push_back(job); job->state.store(ServingRequestState::queued,std::memory_order_release); }
+                    catch(...) { job->error=std::current_exception(); finish(job,ServingRequestState::failed); }
+                } else finish(job,states[i]);
+            }
+            cv.notify_all();
+            if(stop.stop_requested()) return;
+        }
     }
     void worker(std::stop_token stop, bool inline_worker) {
         for (;;) {
@@ -218,7 +340,8 @@ struct GreedyServingScheduler::Impl {
 };
 
 GreedyServingScheduler::GreedyServingScheduler(GreedyServingPolicy policy, ServingCompatibility compatibility,
-    std::shared_ptr<const void> owner) : impl_(std::make_unique<Impl>(policy, std::move(compatibility), std::move(owner))) {}
+    std::shared_ptr<const void> owner, std::shared_ptr<ServingCohortExecutor> cohort)
+    : impl_(std::make_unique<Impl>(policy, std::move(compatibility), std::move(owner),std::move(cohort))) {}
 GreedyServingScheduler::~GreedyServingScheduler() = default;
 
 ServingSubmission GreedyServingScheduler::submit(SerialGreedyRequest request,

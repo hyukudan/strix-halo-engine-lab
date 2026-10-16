@@ -112,10 +112,16 @@ std::array<const SessionStateAllocation*, 7> allocations(const SerialSessionStat
 }
 void validate_result(const SerialGreedyRequest& request, const SerialGreedyRequestResult& result,
                      const SerialSessionContext& session) {
-    require(!request.prefix_tokens.empty() && request.max_new_tokens && request.vocab_size &&
-            !result.generated_tokens.empty() && result.generated_tokens.size() <= request.max_new_tokens,
-            "final state export requires a completed nonempty greedy request");
-    const auto consumed = add(request.prefix_tokens.size(), result.generated_tokens.size() - 1U);
+    require(!request.prefix_tokens.empty() && request.vocab_size &&
+            request.vocab_size <= static_cast<std::uint64_t>(std::numeric_limits<std::uint32_t>::max()) + 1ULL &&
+            request.eos_token_id < request.vocab_size && !result.restored_prefix_tokens &&
+            result.generated_tokens.size() <= request.max_new_tokens &&
+            (request.max_new_tokens == 0U ? result.generated_tokens.empty() : !result.generated_tokens.empty()),
+            "final state export requires a complete uncached greedy or zero-emission prompt request");
+    // A zero-emission prompt has consumed every prefix input and has no selected
+    // bonus token. Avoid subtraction/back()/end()-1 on its empty output vector.
+    const auto consumed = request.max_new_tokens == 0U ? request.prefix_tokens.size()
+        : add(request.prefix_tokens.size(), result.generated_tokens.size() - 1U);
     require(result.steps_executed == consumed && result.final_position == consumed &&
             session.next_position == consumed && session.committed_tokens == consumed && consumed <= request.context_capacity,
             "final state export consumed frontier differs from actual request/session");
@@ -123,8 +129,12 @@ void validate_result(const SerialGreedyRequest& request, const SerialGreedyReque
             arithmetic_lineage_valid(session.arithmetic_lineage, consumed), "final state export session is unhealthy or incomplete");
     for (auto value : request.prefix_tokens) require(value < request.vocab_size, "final state prefix token outside vocabulary");
     for (auto value : result.generated_tokens) require(value < request.vocab_size, "final state generated token outside vocabulary");
-    require(request.eos_token_id < request.vocab_size &&
-            std::find(result.generated_tokens.begin(), result.generated_tokens.end() - 1, request.eos_token_id) == result.generated_tokens.end() - 1,
+    if (request.max_new_tokens == 0U) {
+        require(result.stop_reason == SerialRequestStopReason::max_new_tokens,
+                "final state zero-emission stop mismatch");
+        return;
+    }
+    require(std::find(result.generated_tokens.begin(), result.generated_tokens.end() - 1, request.eos_token_id) == result.generated_tokens.end() - 1,
             "final state export has an earlier EOS");
     const bool eos = result.generated_tokens.back() == request.eos_token_id;
     if (result.stop_reason == SerialRequestStopReason::eos) require(eos, "final state EOS stop mismatch");
@@ -228,9 +238,13 @@ void export_final_generation_state(const std::filesystem::path& path, FinalGener
         bool first = true;
         const auto token = [&](std::uint32_t value) { if (!first) manifest << ','; first = false; manifest << value; };
         for (auto value : request.prefix_tokens) token(value);
-        for (auto i = result.generated_tokens.begin(); i != result.generated_tokens.end() - 1; ++i) token(*i);
-        manifest << "],\"unconsumed_emitted_token\":" << result.generated_tokens.back()
-                 << ",\"stop_reason\":" << quote(result.stop_reason == SerialRequestStopReason::eos ? "eos" :
+        if (!result.generated_tokens.empty())
+            for (auto i = result.generated_tokens.begin(); i != result.generated_tokens.end() - 1; ++i) token(*i);
+        manifest << "],\"bonus_pending\":" << (result.generated_tokens.empty() ? "false" : "true")
+                 << ",\"unconsumed_emitted_token\":";
+        if (result.generated_tokens.empty()) manifest << "null";
+        else manifest << result.generated_tokens.back();
+        manifest << ",\"stop_reason\":" << quote(result.stop_reason == SerialRequestStopReason::eos ? "eos" :
                     result.stop_reason == SerialRequestStopReason::context_capacity ? "context_capacity" : "max_new_tokens")
                  << ",\"context_capacity\":" << request.context_capacity << ",\"maximum_generated_tokens\":" << request.max_new_tokens
                  << ",\"vocabulary_size\":" << request.vocab_size

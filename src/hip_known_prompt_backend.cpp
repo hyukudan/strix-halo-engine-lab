@@ -84,7 +84,7 @@ struct HipKnownPromptBackend::Impl {
                 throw std::invalid_argument("known prompt output method differs from native window policy");
             if (current_hip_launch_context() || session.health != SerialSessionHealth::ready ||
                 session.arithmetic_lineage.tainted || position != session.next_position ||
-                tokens.size() != rows || (rows != 2U && rows != 4U && rows != 8U) ||
+                tokens.size() != rows || (window->supports_tiled_prefill() ? (rows<16U||rows>2048U) : (rows != 2U && rows != 4U && rows != 8U)) ||
                 position > std::numeric_limits<std::uint64_t>::max() - rows ||
                 committed_before > std::numeric_limits<std::uint64_t>::max() - rows)
                 throw std::invalid_argument("known prompt window differs from the live eager session");
@@ -169,6 +169,7 @@ std::vector<float> HipKnownPromptBackend::execute_window(std::array<std::uint32_
 std::uint32_t HipKnownPromptBackend::logical_rows() const noexcept {
     return impl_->window->logical_rows();
 }
+bool HipKnownPromptBackend::supports_tiled_prefill() const noexcept {return impl_->window->supports_tiled_prefill();}
 KnownWindowOutputPolicy HipKnownPromptBackend::output_policy() const noexcept {return impl_->window->output_policy();}
 std::vector<float> HipKnownPromptBackend::execute_rows(std::span<const std::uint32_t> tokens, std::uint64_t position) {
     return impl_->execute(tokens, position);

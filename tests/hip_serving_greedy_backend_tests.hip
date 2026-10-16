@@ -2,6 +2,7 @@
 // Source implementation is not a correctness, quality or throughput result.
 #include "strix/hip_serving_greedy_backend.hpp"
 #include "strix/hip_serving_prefix_cache.hpp"
+#include "strix/hip_serving_cohort.hpp"
 #include "strix/deferred_moe_status.hpp"
 #include "strix/greedy_serving_scheduler.hpp"
 #include "strix/hip_generation_output_diagnostic.hpp"
@@ -244,7 +245,7 @@ std::uint64_t reservation(const ModelOwner& model) {
         strix::HipServingGreedyBackend::output_reservation_bytes(static_cast<std::uint32_t>(model.model.vocab_size))+1048576U;
 }
 strix::SerialGreedyRequest request(const ModelOwner& model,std::span<const std::uint32_t> prompt) {
-    return {prompt,model.model.vocab_size,context_capacity,generated_limit,model.model.ple_eos_token_id};
+    return {prompt,model.model.vocab_size,context_capacity,generated_limit,static_cast<std::uint32_t>(model.model.ple_eos_token_id)};
 }
 strix::ServingCompatibility compatibility(const ModelOwner& model) {
     return {model.mapped->content_identity(),model.compiled.kernel_plan_identity,model.guard->device_index()};
@@ -437,6 +438,204 @@ private:
     std::shared_ptr<Gate> gate_;
     bool paused_=false;
 };
+// Real model/session/backend/native cohort consumer. It is part of this
+// opt-in executable only, never an automatic CTest or throughput claim.
+class CohortWrapper final : public strix::SerialGreedyStepBackend {
+public:
+    strix::HipServingGreedyBackend* native;
+    explicit CohortWrapper(strix::HipServingGreedyBackend& value):native(&value) {}
+    CohortWrapper(std::unique_ptr<strix::HipServingGreedyBackend> value,std::shared_ptr<Gate> gate)
+        :native(value.get()),owned_(std::move(value)),gate_(std::move(gate)) {}
+    std::vector<float> execute(std::uint32_t t,std::uint64_t p) override { pause();return native->execute(t,p); }
+    std::uint32_t execute_greedy(std::uint32_t t,std::uint64_t p,std::uint64_t v) override {pause();return native->execute_greedy(t,p,v);}
+    void execute_state(std::uint32_t t,std::uint64_t p) override {pause();native->execute_state(t,p);}
+private:
+    void pause() {if(gate_ && !paused_) {paused_=true;gate_->pause();}}
+    std::unique_ptr<strix::HipServingGreedyBackend> owned_;
+    std::shared_ptr<Gate> gate_;
+    bool paused_=false;
+};
+std::string cohort_arena_hash(const std::shared_ptr<SessionOwner>& owner,const std::filesystem::path& path) {
+    require(!std::filesystem::exists(path),"cohort arena output already exists");
+    std::ofstream output(path,std::ios::binary);output.exceptions(std::ios::failbit|std::ios::badbit);
+    const auto& scratch=owner->memory->scratch();
+    std::vector<std::byte> bytes(transfer_chunk);
+    for(std::uint64_t offset=0;offset<scratch.arena_bytes;) {
+        const auto count=static_cast<std::size_t>(std::min<std::uint64_t>(bytes.size(),scratch.arena_bytes-offset));
+        owner->model->guard->run([&] {check(hipMemcpy(bytes.data(),reinterpret_cast<const void*>(scratch.arena_base+offset),count,hipMemcpyDeviceToHost));});
+        output.write(reinterpret_cast<const char*>(bytes.data()),static_cast<std::streamsize>(count));offset+=count;
+    }
+    output.close();return digest(path);
+}
+void qualify_tensor_cohorts(const std::shared_ptr<ModelOwner>& model,
+    const std::vector<std::uint32_t>& prompt,const std::filesystem::path& directory,
+    const strix::SerialGreedyRequestResult& baseline,const StateHashes& baseline_state,
+    const strix::SerialSessionContext& baseline_metadata) {
+    for(const auto rows:{2U,4U}) for(const bool prepared:{false,true}) {
+        strix::HipServingCohort cohort(model,rows);
+        std::array<std::shared_ptr<SessionOwner>,4> owners{},references{};
+        std::array<std::unique_ptr<strix::HipServingGreedyBackend>,4> actual,reference;
+        std::array<std::unique_ptr<strix::SerialGreedyTokenCursor>,4> cursors;
+        std::array<strix::ServingCohortTarget,4> targets;
+        std::array<std::vector<float>,4> full_reference;
+        for(unsigned row=0;row<rows;++row) {
+            owners[row]=fresh_session(model); references[row]=fresh_session(model);
+            actual[row]=backend(owners[row],prepared); reference[row]=backend(references[row],false);
+            for(unsigned previous=0;previous<row;++previous) independent(*owners[row],*owners[previous]);
+            const auto prefix=std::span<const std::uint32_t>(prompt).first(row+1U);
+            cursors[row]=std::make_unique<strix::SerialGreedyTokenCursor>(strix::SerialGreedyRequest{
+                prefix,model->model.vocab_size,context_capacity,1,static_cast<std::uint32_t>(model->model.ple_eos_token_id)});
+            // Arbitrary independent positions 0..R-1, not a causal p+r window.
+            for(unsigned position=0;position<row;++position) {
+                cursors[row]->advance(*actual[row],1);
+                reference[row]->execute_state(prompt[position],position);
+            }
+            const auto input=cursors[row]->prepare_target(*actual[row]);
+            require(input && input->position==row && !input->state_only,"native cohort cursor intent is wrong");
+            targets[row]={actual[row].get(),*input,{}};
+            full_reference[row]=reference[row]->execute(input->token,input->position);
+        }
+        cohort.execute(std::span<strix::ServingCohortTarget>(targets.data(),rows));
+        for(unsigned row=0;row<rows;++row) {
+            const auto view=strix::resolve_execution_buffer(model->compiled.execution_identity,model->compiled.arena,
+                owners[row]->memory->scratch(),model->compiled.io.steps.back().writes.front());
+            std::vector<float> values(static_cast<std::size_t>(model->model.vocab_size));
+            check(hipMemcpy(values.data(),reinterpret_cast<const void*>(view.address),values.size()*sizeof(float),hipMemcpyDeviceToHost));
+            require(values.size()==full_reference[row].size() &&
+                std::memcmp(values.data(),full_reference[row].data(),values.size()*sizeof(float))==0 &&
+                targets[row].selected==strix::select_greedy_token(full_reference[row],model->model.vocab_size),
+                "real serving cohort changed full FP32 logits or exact firstmax selection");
+            cursors[row]->accept_target(*actual[row],targets[row].input,targets[row].selected);
+            require(cursors[row]->done() && cursors[row]->result().final_position==row+1U &&
+                cursors[row]->result().generated_tokens.size()==1U,"native cohort consumed or emitted the pending token twice");
+            same_metadata(owners[row]->session,references[row]->session);
+            const auto name=std::string("tensor-")+std::to_string(rows)+(prepared?"-metadata-prepared-":"-ordinary-")+std::to_string(row);
+            require(cohort_arena_hash(owners[row],directory/(name+"-actual-arena.bin"))==
+                cohort_arena_hash(references[row],directory/(name+"-reference-arena.bin")),
+                "shared cohort staging did not preserve complete original temporary/arena bytes");
+            require(capture_state(owners[row],directory/(name+"-actual"))==
+                capture_state(references[row],directory/(name+"-reference")),
+                "real serving cohort changed a complete persistent state component");
+        }
+        require(cohort.stats().cohorts==1U && cohort.stats().targets==rows &&
+            cohort.stats().shared_tensor_steps==model->model.hidden_layers,
+            "native cohort did not execute its real shared tensor projection groups");
+    }
+    for(const auto rows:{2U,4U}) {
+        auto gate=std::make_shared<Gate>();
+        auto cohort=std::make_shared<strix::HipServingCohort>(model,rows,[](strix::SerialGreedyStepBackend& value) {
+            if(auto* wrapper=dynamic_cast<CohortWrapper*>(&value)) return wrapper->native;
+            return dynamic_cast<strix::HipServingGreedyBackend*>(&value);
+        });
+        auto scheduling=policy(*model,rows);scheduling.tensor_cohort_rows=rows;
+        scheduling.shared_reservation_bytes=strix::HipServingCohort::requested_reservation_bytes(rows);
+        scheduling.reservation_budget_bytes+=scheduling.shared_reservation_bytes;
+        strix::GreedyServingScheduler scheduler(scheduling,compatibility(*model),model,cohort);
+        struct Release {std::shared_ptr<Gate> gate;~Release(){gate->release();}} release{gate};
+        std::array<std::shared_ptr<SessionOwner>,4> owners;
+        std::array<strix::ServingRequestHandle,4> handles;
+        for(unsigned row=0;row<rows;++row) {
+            owners[row]=std::make_shared<SessionOwner>();owners[row]->model=model;
+            const auto owner=owners[row];const auto epoch=owner->generations.next();
+            const auto admitted=scheduler.submit(request(*model,prompt),compatibility(*model),
+                reinterpret_cast<std::uintptr_t>(&owner->session),epoch,reservation(*model),owner,[owner,gate] {
+                    initialize_session(owner); // after the scheduler reservation, not before
+                    return std::make_unique<CohortWrapper>(backend(owner,true),gate);
+                });
+            require(admitted.admission==strix::ServingAdmission::accepted,"native tensor cohort request was not admitted");
+            handles[row]=admitted.request;
+        }
+        gate->release();scheduler.run_until_idle();
+        require(cohort->stats().cohorts>0U && cohort->stats().shared_tensor_steps>0U,
+            "native scheduler did not consume the real tensor cohort path");
+        for(unsigned row=0;row<rows;++row) {
+            require(handles[row].state()==strix::ServingRequestState::completed,"native cohort scheduler request failed");
+            same_result(handles[row].result(),baseline);same_metadata(owners[row]->session,baseline_metadata);
+            require(capture_state(owners[row],directory/("tensor-scheduler-"+std::to_string(rows)+"-"+std::to_string(row)))==baseline_state,
+                "native tensor scheduler changed a complete persistent state component");
+        }
+    }
+    // Duplicate wrappers must not disguise the SAME native session as two rows.
+    {
+        auto owner=fresh_session(model);auto native=backend(owner,false);
+        CohortWrapper first(*native),second(*native);
+        strix::HipServingCohort cohort(model,2,[](strix::SerialGreedyStepBackend& value) {
+            return dynamic_cast<CohortWrapper&>(value).native;
+        });
+        std::array<strix::SerialGreedyStepBackend*,2> duplicates{&first,&second};
+        require(!cohort.compatible(duplicates),"two wrappers forged distinct native cohort owners");
+    }
+    // Capture rejection must finish capture BEFORE any drain/snapshot. The
+    // constructor and execution paths cannot synchronize a foreign capture.
+    {
+        auto owner=fresh_session(model);auto native=backend(owner,false);
+        bool rejected=false;hipGraph_t graph=nullptr;
+        check(hipStreamBeginCapture(owner->scope.stream,hipStreamCaptureModeThreadLocal));
+        {
+            const strix::HipLaunchScope active(owner->scope);
+            try { strix::HipServingCohort invalid(model,2); }
+            catch(const std::invalid_argument& error) { rejected=std::string_view(error.what())=="serving cohort setup requires no active launch scope"; }
+        }
+        check(hipStreamEndCapture(owner->scope.stream,&graph));
+        std::size_t nodes=0;check(hipGraphGetNodes(graph,nullptr,&nodes));check(hipGraphDestroy(graph));
+        require(rejected && nodes==0U && owner->session.next_position==0,
+            "cohort construction enqueued work or drained an unrelated capture");
+    }
+    for(const bool queued_fault:{false,true}) {
+        strix::HipServingCohort cohort(model,2);
+        std::array<std::shared_ptr<SessionOwner>,2> owners{fresh_session(model),fresh_session(model)};
+        std::array<std::unique_ptr<strix::HipServingGreedyBackend>,2> actual{backend(owners[0],false),backend(owners[1],false)};
+        const auto prefix=std::span<const std::uint32_t>(prompt).first(1);
+        std::array<std::unique_ptr<strix::SerialGreedyTokenCursor>,2> cursors;
+        std::array<strix::ServingCohortTarget,2> targets;
+        std::array<strix::SerialSessionContext,2> saved{owners[0]->session,owners[1]->session};
+        for(unsigned row=0;row<2U;++row) {
+            cursors[row]=std::make_unique<strix::SerialGreedyTokenCursor>(strix::SerialGreedyRequest{
+                prefix,model->model.vocab_size,context_capacity,1,static_cast<std::uint32_t>(model->model.ple_eos_token_id)});
+            targets[row]={actual[row].get(),*cursors[row]->prepare_target(*actual[row]),{}};
+        }
+        std::array<StateHashes,2> initial_state{};
+        std::array<std::string,2> initial_arena{};
+        if(!queued_fault) for(unsigned row=0;row<2U;++row) {
+            initial_state[row]=capture_state(owners[row],directory/("tensor-invalid-initial-"+std::to_string(row)));
+            initial_arena[row]=cohort_arena_hash(owners[row],directory/("tensor-invalid-initial-arena-"+std::to_string(row)+".bin"));
+        }
+        auto& last_scratch=const_cast<strix::ExecutionMemoryBinding&>(owners[1]->memory->scratch());
+        const auto generation=last_scratch.allocation_generation;
+        if(!queued_fault) last_scratch.allocation_generation=0;
+        else strix::arm_hip_greedy_output_diagnostic_fault(strix::HipGreedyOutputDiagnosticFault::after_partials);
+        bool rejected=false;
+        try { cohort.execute(targets); }
+        catch(const std::exception& error) {
+            if(queued_fault) require(std::string_view(error.what())=="injected GPU greedy host boundary failure",
+                "cohort fault did not reach a real queued selector boundary");
+            rejected=true;
+        }
+        last_scratch.allocation_generation=generation;
+        strix::clear_hip_greedy_output_diagnostic_fault();
+        require(rejected,"invalid/faulted serving cohort was accepted");
+        for(unsigned row=0;row<2U;++row) {
+            if(queued_fault) {
+                require(actual[row]->failed() && owners[row]->session.health==strix::SerialSessionHealth::poisoned &&
+                    owners[row]->session.arithmetic_lineage.tainted && owners[row]->session.committed_tokens==saved[row].committed_tokens &&
+                    owners[row]->session.next_position==saved[row].next_position &&
+                    owners[row]->session.state.generations==saved[row].state.generations,
+                    "postsubmission cohort failure published a commit or released a healthy reused session");
+                cursors[row]->fail_target();
+            } else {
+                same_metadata(owners[row]->session,saved[row]);
+                require(!actual[row]->failed(),"late preflight rejection poisoned an unsubmitted request");
+                require(capture_state(owners[row],directory/("tensor-invalid-after-"+std::to_string(row)))==initial_state[row] &&
+                    cohort_arena_hash(owners[row],directory/("tensor-invalid-after-arena-"+std::to_string(row)+".bin"))==initial_arena[row],
+                    "late cohort admission failure changed an earlier request's state or scratch bytes");
+                require(cohort.stats().cohorts==0U && cohort.stats().shared_tensor_steps==0U && cohort.stats().fallback_r1_steps==0U,
+                    "late invalid member passed target submission before complete cohort admission");
+                cursors[row]->cancel_prepared_target(targets[row].input);
+            }
+            check(hipStreamQuery(owners[row]->scope.stream));
+        }
+    }
+}
 int qualify(const Args& args) {
     const auto executable=std::filesystem::canonical("/proc/self/exe");
     const auto executable_sha=digest(executable);
@@ -450,6 +649,7 @@ int qualify(const Args& args) {
     const auto base_state=capture_state(base,args.output/"baseline");
     const auto base_metadata=base->session;
     qualify_prefix_cache(model,prompt,base,baseline,base_state,args.output);
+    qualify_tensor_cohorts(model,prompt,args.output,baseline,base_state,base_metadata);
     for(const std::uint32_t concurrency:{1U,2U,4U}) {
         strix::GreedyServingScheduler scheduler(policy(*model,concurrency),compatibility(*model),model);
         std::vector<std::shared_ptr<SessionOwner>> owners;
@@ -557,7 +757,7 @@ int qualify(const Args& args) {
     const auto pending=args.output/"result.pending.json";
     std::ofstream out(pending,std::ios::binary);out.exceptions(std::ios::failbit|std::ios::badbit);
     out<<"{\"schema\":\"serving-native-qualification-v1\",\"finished\":true,\"passed\":true,\"C\":[1,2,4],"
-        "\"full_state_components\":7,\"complete_prefix_cache_cross_request\":true,\"cache_exact_and_proper_hits\":true,\"cache_pending_cancel_and_budget_miss\":true,\"baseline_full_F32_CPU_selection\":true,\"cancel_one_independent\":true,\"queued_selector_fault\":true,"
+        "\"full_state_components\":7,\"real_shared_projection_tensor_cohorts\":[2,4],\"other_cohort_operators\":\"original-R1\",\"complete_prefix_cache_cross_request\":true,\"cache_exact_and_proper_hits\":true,\"cache_pending_cancel_and_budget_miss\":true,\"baseline_full_F32_CPU_selection\":true,\"cancel_one_independent\":true,\"queued_selector_fault\":true,"
         "\"fault_is_reported_host_seam_not_driver_failure\":true,\"cross_thread_destruction\":true,\"native_model_qualification_only\":true,"
         "\"quality\":false,\"performance\":false,\"model_sha256\":\""<<args.model_sha<<"\",\"prompt_sha256\":\""<<args.prompt_sha
         <<"\",\"executable_sha256\":\""<<executable_sha<<"\",\"execution_identity\":"<<model->compiled.execution_identity
