@@ -2,13 +2,14 @@
 #include "strix/distributed_control_wire.hpp"
 #include "strix/distributed_position_completion.hpp"
 #include "strix/hip_distributed_stage.hpp"
+#include "strix/hip_distributed_stage_resources.hpp"
 #include "strix/runtime_allocator.hpp"
+#include "strix/uma_owner_inventory.hpp"
 #include "strix/serial_session.hpp"
 #include <memory>
 
 namespace strix {
 class NativeDistributedTokenRetirement;
-class HipDistributedStageResources;
 // Retained sequence of explicitly bound two-peer token transactions, not a distributed decoder or
 // a persistent crash-recovery service. Real stage execution and all seven local
 // snapshot transfers are owned here. The caller retains allocator/generations,
@@ -25,7 +26,8 @@ class HipDistributedStageResources;
 // serial context. Only initial confirmed two-peer predecision rollback may
 // republish its original serial history; later rollback retains only a typed
 // distributed frontier. D1/transfer failures preserve poison. No D1 clear/retag.
-class HipDistributedTokenParticipant final : public DistributedNativeLocalExecutor {
+class HipDistributedTokenParticipant final : public DistributedNativeLocalExecutor,
+    public std::enable_shared_from_this<HipDistributedTokenParticipant> {
 public:
     HipDistributedTokenParticipant(CompiledSerialExecution serial,DistributedPlacementPlan canonical_plan,
         ModelContract model,HipLauncherCatalogConfig config,const ExecutionRuntimeResources& resources,
@@ -49,6 +51,10 @@ public:
     [[nodiscard]] std::uint32_t local_node() const noexcept;
     // Exact retained capacity owner, null for the original full serial anchor.
     [[nodiscard]] const HipDistributedStageResources* stage_resources() const noexcept;
+    // Stage-owned participants only. Includes the actual retained full or typed
+    // snapshot backing plus the stage inventory, excluding transport/caches.
+    [[nodiscard]] HipDistributedOwnerInventory owner_inventory(
+        std::shared_ptr<const HipDistributedTokenParticipant>,UmaMemoryObservation = {}) const;
     // One logical-control capability per genuinely committed token. This does
     // not attest DMA; all data boundaries require independent retirement.
     [[nodiscard]] NativeDistributedPositionCompletion mint_position_dependency_completion();

@@ -343,7 +343,7 @@ UmaOwnerInventory HipModelResidency::owner_inventory(std::shared_ptr<const HipMo
     const UmaBackingIdentity mapping_key{0x4849504d41503031ULL,
         static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(mapped_owner.get())), source_generation_};
     std::vector<UmaOwnerView> views;
-    views.push_back({residency_identity(), mapping_key, UmaBackingKind::file_mapping, "weights.mapping",
+    views.push_back({next_uma_owner_view_identity(), mapping_key, UmaBackingKind::file_mapping, "weights.mapping",
         reservation_.mapped_reserved_bytes, 0, source_bytes_, pin, UmaAddressSpace::host, source_base_});
     for (const auto& range : registered_ranges_) {
         if (range.host_base < source_base_ || range.host_base - source_base_ > reservation_.mapped_reserved_bytes ||
@@ -351,15 +351,15 @@ UmaOwnerInventory HipModelResidency::owner_inventory(std::shared_ptr<const HipMo
             !covers_device_range(range.device_base, range.bytes))
             throw std::invalid_argument("HIP residency registered alias exceeds its actual mapping owner");
         const auto offset = static_cast<std::uint64_t>(range.host_base - source_base_);
-        views.push_back({residency_identity(), mapping_key, UmaBackingKind::file_mapping, "weights.registered-host",
+        views.push_back({next_uma_owner_view_identity(), mapping_key, UmaBackingKind::file_mapping, "weights.registered-host",
             reservation_.mapped_reserved_bytes, offset, range.bytes, pin, UmaAddressSpace::host, range.host_base});
-        views.push_back({residency_identity(), mapping_key, UmaBackingKind::file_mapping, "weights.registered-device-alias",
+        views.push_back({next_uma_owner_view_identity(), mapping_key, UmaBackingKind::file_mapping, "weights.registered-device-alias",
             reservation_.mapped_reserved_bytes, offset, range.bytes, pin, UmaAddressSpace::device, range.device_base});
     }
     for (const auto& range : copied_ranges_) {
         if (!range.allocation_identity || !covers_device_range(range.device_base, range.bytes))
             throw std::invalid_argument("HIP residency copy lacks its actual owned backing lease");
-        views.push_back({residency_identity(), {0x484950434f505931ULL, range.allocation_identity, generation_},
+        views.push_back({next_uma_owner_view_identity(), {0x484950434f505931ULL, range.allocation_identity, generation_},
             UmaBackingKind::allocated_storage, "weights.copy", range.bytes, 0, range.bytes, pin,
             UmaAddressSpace::device, range.device_base});
     }

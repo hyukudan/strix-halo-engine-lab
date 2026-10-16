@@ -14,6 +14,13 @@ enum class HipHostAllocationMode {
     pageable_aligned,
     pinned_mapped,
 };
+enum class HipRuntimeAllocationSpace { device, host };
+struct HipRuntimeAllocationDescription {
+    std::uint64_t lease_identity=0;
+    std::uintptr_t raw_base=0;
+    std::uint64_t raw_bytes=0,view_offset=0,view_bytes=0;
+    bool operator==(const HipRuntimeAllocationDescription&) const = default;
+};
 
 void initialize_hip_fresh_runtime_memory(
     const ExecutionMemoryBinding& scratch,
@@ -22,6 +29,9 @@ void initialize_hip_fresh_runtime_memory(
 class HipRuntimeAllocator final
     : public RuntimeMemoryAllocator {
 public:
+    // Process-local allocation issuer; actual lease IDs are minted on allocate,
+    // independently of returned/raw addresses and caller generation numbers.
+    static constexpr std::uint64_t inventory_issuer=0x484950414c4c3031ULL;
     explicit HipRuntimeAllocator(
         HipHostAllocationMode host_mode =
             HipHostAllocationMode::pageable_aligned);
@@ -53,6 +63,11 @@ public:
     host_mode() const noexcept {
         return host_mode_;
     }
+    // Pure locked lookup of this allocator's LIVE exact requested allocation.
+    // Returns alignment reservation, not allocator/driver physical-page size.
+    // The actual owner must pin this allocator and allocation through use.
+    [[nodiscard]] HipRuntimeAllocationDescription describe_allocation(
+        std::uintptr_t,std::uint64_t,HipRuntimeAllocationSpace) const;
 
 private:
     // Dedicated transport allocator reuses geometry, not general allocation
@@ -61,6 +76,7 @@ private:
     struct BackingAllocation {
         std::uintptr_t raw_address = 0;
         std::uint64_t raw_bytes = 0;
+        std::uint64_t requested_bytes = 0,lease_identity = 0;
     };
 
     [[nodiscard]] static std::uint64_t checked_total(
@@ -74,7 +90,7 @@ private:
     void release_all() noexcept;
 
     HipHostAllocationMode host_mode_;
-    std::mutex mutex_;
+    mutable std::mutex mutex_;
     std::unordered_map<
         std::uintptr_t,
         BackingAllocation> device_backing_;
@@ -83,7 +99,7 @@ private:
         BackingAllocation> pinned_host_backing_;
     std::unordered_map<
         std::uintptr_t,
-        std::uint64_t> pageable_host_;
+        BackingAllocation> pageable_host_;
 };
 
 }  // namespace strix

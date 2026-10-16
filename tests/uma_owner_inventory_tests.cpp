@@ -21,6 +21,8 @@ UmaOwnerView view(std::uint64_t id, UmaBackingIdentity key, std::uint64_t extent
     return {id,key,UmaBackingKind::allocated_storage,"state",extent,offset,bytes,std::make_shared<int>(7)};
 }
 void aliases_and_copy() {
+    const auto first=next_uma_owner_view_identity(),second=next_uma_owner_view_identity();
+    require(first && second>first,"shared view identity issuer is not nonzero and monotonic");
     std::array<UmaOwnerView,3> records{view(1,{1,9,3},100,0,60),view(2,{1,9,3},100,40,60),view(3,{1,10,3},100,0,100)};
     // Host and GPU mappings share key1. Byte-identical copied data has key2.
     records[0].category = "CPU-state"; records[1].category = "GPU-state";

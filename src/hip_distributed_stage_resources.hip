@@ -6,6 +6,7 @@
 #include "strix/prepared_tensor_views.hpp"
 #include <hip/hip_runtime.h>
 #include <algorithm>
+#include <array>
 #include <limits>
 #include <optional>
 #include <stdexcept>
@@ -26,6 +27,32 @@ ModelManifest selected_manifest(const ModelManifest& source,const DistributedSta
         if(t.role==TensorRole::unknown) ++selected.unknown_tensor_count;
     }
     selected.layout_identity=model_manifest_layout_identity(selected);return selected;
+}
+struct PoolInventoryLease {
+    HipRuntimeAllocationDescription allocation;
+    std::uintptr_t address=0;
+    std::uint64_t bytes=0,generation=0;
+};
+PoolInventoryLease pool_lease(HipRuntimeAllocator& allocator,std::uintptr_t address,std::uint64_t bytes,
+    std::uint64_t generation,HipRuntimeAllocationSpace space) {
+    if(!bytes) {
+        if(address || generation) throw std::invalid_argument("stage absent pool carries an allocation binding");
+        return {};
+    }
+    if(!generation) throw std::invalid_argument("stage pool inventory lacks actual allocation generation");
+    return {allocator.describe_allocation(address,bytes,space),address,bytes,generation};
+}
+void append_pool(std::vector<UmaOwnerView>& views,const HipRuntimeAllocator& allocator,const PoolInventoryLease& lease,
+    std::uintptr_t address,std::uint64_t bytes,std::uint64_t generation,HipRuntimeAllocationSpace space,
+    const char* category,const std::shared_ptr<const void>& pin) {
+    if(lease.address!=address || lease.bytes!=bytes || lease.generation!=generation)
+        throw std::invalid_argument("stage inventory pool binding/generation changed");
+    if(!bytes) return;
+    const auto actual=allocator.describe_allocation(address,bytes,space);
+    if(actual!=lease.allocation) throw std::invalid_argument("stage inventory allocator lease changed");
+    views.push_back({next_uma_owner_view_identity(),{HipRuntimeAllocator::inventory_issuer,actual.lease_identity,generation},
+        UmaBackingKind::allocated_storage,category,actual.raw_bytes,actual.view_offset,actual.view_bytes,pin,
+        space==HipRuntimeAllocationSpace::device?UmaAddressSpace::device:UmaAddressSpace::host,address});
 }
 bool same_state(const PersistentStateGenerations& a,const PersistentStateGenerations& b) {
     return a.valid==b.valid && a.generations==b.generations;
@@ -52,6 +79,7 @@ struct HipDistributedStageResources::Impl {
     ExecutionMemoryBinding scratch;
     SessionStateMemoryBinding state;
     bool packed_pools=false;
+    std::array<PoolInventoryLease,4> inventory_pools{};
     FileMappedPleLookupBackend ple;
     PleHashContract hash;
     PleLookupPrefetchState prefetch;
@@ -174,6 +202,10 @@ std::shared_ptr<HipDistributedStageResources> HipDistributedStageResources::crea
     for(std::uint32_t i=plan.first_step();i<=plan.last_step();++i) needs_ple|=serial.execution.steps[i].op==SerialOp::ple;
     p.resources={&p.scratch,&p.manifest,&p.weights,&p.access,&p.layout,&p.state,
         needs_ple?&p.ple:nullptr,needs_ple?&p.hash:nullptr,needs_ple?&p.prefetch:nullptr,&*p.plan};
+    p.inventory_pools={pool_lease(p.allocator,p.scratch.arena_base,p.scratch.arena_bytes,p.scratch.allocation_generation,HipRuntimeAllocationSpace::device),
+        pool_lease(p.allocator,p.state.device_base,p.state.device_bytes,p.state.device_allocation_generation,HipRuntimeAllocationSpace::device),
+        pool_lease(p.allocator,p.state.host_base,p.state.host_bytes,p.state.host_allocation_generation,HipRuntimeAllocationSpace::host),
+        pool_lease(p.allocator,p.d1.arena_base,p.d1.arena_bytes,p.d1.allocation_generation,HipRuntimeAllocationSpace::device)};
     result->validate();
     // Own fresh buffers only; no borrowed serial context is created or retagged.
     p.guard.run([&] {
@@ -221,6 +253,33 @@ void HipDistributedStageResources::validate() const {
             t.absolute_offset>p.mapped_bytes || r.bytes>p.mapped_bytes-t.absolute_offset || r.address!=p.mapped_base+t.absolute_offset)
             throw std::invalid_argument("stage host weight is not the actual retained PLE mapping");
     }
+}
+HipDistributedOwnerInventory HipDistributedStageResources::owner_inventory(
+    std::shared_ptr<const HipDistributedStageResources> actual_owner,UmaMemoryObservation observation) const {
+    const auto self=weak_from_this().lock();
+    if(!self || actual_owner.get()!=this || actual_owner.owner_before(self) || self.owner_before(actual_owner))
+        throw std::invalid_argument("stage inventory requires its exact actual shared owner");
+    validate();const auto& p=*impl_;
+    auto weights=p.backing->owner_inventory(p.backing,p.mapped);
+    auto views=std::move(weights.pinned_views);
+    const std::shared_ptr<const void> pin=std::move(actual_owner);
+    append_pool(views,p.allocator,p.inventory_pools[0],p.scratch.arena_base,p.scratch.arena_bytes,
+        p.scratch.allocation_generation,HipRuntimeAllocationSpace::device,"stage.scratch",pin);
+    append_pool(views,p.allocator,p.inventory_pools[1],p.state.device_base,p.state.device_bytes,
+        p.state.device_allocation_generation,HipRuntimeAllocationSpace::device,"stage.state.device",pin);
+    append_pool(views,p.allocator,p.inventory_pools[2],p.state.host_base,p.state.host_bytes,
+        p.state.host_allocation_generation,HipRuntimeAllocationSpace::host,"stage.state.host",pin);
+    if(p.scope.deferred_moe_status.execution_identity!=p.d1.execution_identity ||
+        p.scope.deferred_moe_status.arena_base!=p.d1.arena_base || p.scope.deferred_moe_status.arena_bytes!=p.d1.arena_bytes ||
+        p.scope.deferred_moe_status.allocation_generation!=p.d1.allocation_generation)
+        throw std::invalid_argument("stage inventory D1 scope differs from its actual allocation");
+    append_pool(views,p.allocator,p.inventory_pools[3],p.d1.arena_base,p.d1.arena_bytes,
+        p.d1.allocation_generation,HipRuntimeAllocationSpace::device,"stage.D1",pin);
+    HipDistributedOwnerInventory result;
+    result.retained=build_uma_owner_inventory(views,std::move(observation));
+    result.unobserved_categories={"snapshot.unattached_participant","PLE.internal_storage_and_cache",
+        "transport.external_pools_and_driver","runtime.streams_events_driver","host.object_and_container_metadata"};
+    return result;
 }
 void HipDistributedStageResources::validate_initial_binding(const DistributedTokenBinding& b) const {
     validate();const auto& p=*impl_;

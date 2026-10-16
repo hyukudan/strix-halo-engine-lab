@@ -7,6 +7,9 @@
 #include <vector>
 
 namespace strix {
+// Process-local unique view token across all inventory producers. This token
+// is not an allocation lease, address, generation or physical-page identity.
+[[nodiscard]] std::uint64_t next_uma_owner_view_identity();
 // Issuer-scoped allocation/backing lease, NOT a virtual address or file-content
 // hash. All zero means unknown. A known key requires all three fields nonzero.
 // A copy has a distinct key even if every byte equals the source. CPU mapping,

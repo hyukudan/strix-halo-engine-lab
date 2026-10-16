@@ -28,10 +28,50 @@ void check(hipError_t error, const char* operation) {
             hipGetErrorString(error));
     }
 }
+template<class F> bool rejects_description(F&& f) {
+    try {f();} catch(const std::invalid_argument&) {return true;}
+    return false;
+}
+void allocation_descriptions() {
+    using namespace strix;
+    HipRuntimeAllocator allocator,foreign;
+    const auto device=allocator.allocate_device(65U,256U);
+    const auto first=allocator.describe_allocation(device,65U,HipRuntimeAllocationSpace::device);
+    expect(first.lease_identity && first.raw_bytes==320U && first.view_bytes==65U &&
+        first.view_offset<256U && first.raw_base+first.view_offset==device,
+        "actual device description retains the complete alignment reservation and returned view");
+    expect(allocator.describe_allocation(device,65U,HipRuntimeAllocationSpace::device)==first,
+        "describing a live allocation does not mint a new lease");
+    expect(rejects_description([&] {(void)foreign.describe_allocation(device,65U,HipRuntimeAllocationSpace::device);}) &&
+        rejects_description([&] {(void)allocator.describe_allocation(device,64U,HipRuntimeAllocationSpace::device);}) &&
+        rejects_description([&] {(void)allocator.describe_allocation(device+1U,64U,HipRuntimeAllocationSpace::device);}) &&
+        rejects_description([&] {(void)allocator.describe_allocation(device,65U,HipRuntimeAllocationSpace::host);}) &&
+        rejects_description([&] {(void)allocator.describe_allocation(device,65U,static_cast<HipRuntimeAllocationSpace>(99));}),
+        "foreign allocator, shortened/interior view, wrong space and unknown enum all reject");
+    allocator.free_device(device,65U);
+    expect(rejects_description([&] {(void)allocator.describe_allocation(device,65U,HipRuntimeAllocationSpace::device);}),
+        "freed device allocation no longer supplies a live lease");
+    const auto replacement=allocator.allocate_device(65U,256U);
+    expect(allocator.describe_allocation(replacement,65U,HipRuntimeAllocationSpace::device).lease_identity!=first.lease_identity,
+        "a new allocation gets a new lease even if the allocator reuses an address");
+    allocator.free_device(replacement,65U);
+    for(const auto mode:{HipHostAllocationMode::pageable_aligned,HipHostAllocationMode::pinned_mapped}) {
+        HipRuntimeAllocator host(mode);
+        const auto address=host.allocate_host(37U,64U);
+        const auto view=host.describe_allocation(address,37U,HipRuntimeAllocationSpace::host);
+        expect(view.lease_identity && view.view_bytes==37U && view.raw_base+view.view_offset==address &&
+            view.raw_bytes==(mode==HipHostAllocationMode::pageable_aligned?37U:100U),
+            "host description distinguishes exact pageable payload from pinned alignment backing");
+        host.free_host(address,37U);
+        expect(rejects_description([&] {(void)host.describe_allocation(address,37U,HipRuntimeAllocationSpace::host);}),
+            "freed host allocation no longer supplies a live lease");
+    }
+}
 
 }  // namespace
 
 int main() try {
+    allocation_descriptions();
     constexpr std::uint64_t scratch_bytes = 4096;
     constexpr std::uint64_t state_bytes = 8192;
     constexpr std::uint64_t host_bytes = 256;

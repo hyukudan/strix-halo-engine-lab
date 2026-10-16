@@ -33,6 +33,13 @@ struct HipDistributedStageReservation {
     bool state_partitioned=false;
     std::uint64_t allocator_padding_bytes=0,headroom_bytes=0,retained_bytes=0,setup_peak_bytes=0;
 };
+// Declared live storage only, never total process/RSS/UMA-fit evidence. Opaque
+// owners without a public allocation lease remain explicitly outside scope.
+struct HipDistributedOwnerInventory {
+    UmaOwnerInventory retained;
+    bool snapshot_included=false;
+    std::vector<std::string> unobserved_categories;
+};
 // Actual selected registered/copy backing. FULL state/snapshot is the default;
 // optional local_owned_ranges keeps a typed packed state map and snapshot.
 // Scratch remains full. Full file mapping is a retained source, not a claim that
@@ -63,6 +70,11 @@ public:
     [[nodiscard]] std::uint64_t snapshot_budget_bytes() const noexcept;
     // Revalidates actual retained backing and immutable source before borrowing.
     void validate() const;
+    // Exact shared object/control block from create, not an alias/no-op pin.
+    // No GPU allocation, copy or completion is performed. Caller serializes
+    // with progress/destruction; returned views keep actual owners alive.
+    [[nodiscard]] HipDistributedOwnerInventory owner_inventory(
+        std::shared_ptr<const HipDistributedStageResources>,UmaMemoryObservation = {}) const;
 private:
     friend class HipDistributedTokenParticipant;
     void validate_initial_binding(const DistributedTokenBinding&) const;

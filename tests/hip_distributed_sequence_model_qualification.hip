@@ -3,6 +3,7 @@
 #include "strix/launch_dispatch.hpp"
 #include "strix/session_state_memory.hpp"
 #include "strix/distributed_stage_state.hpp"
+#include "strix/hip_runtime_allocator.hpp"
 #include <hip/hip_runtime.h>
 #include <algorithm>
 #include <array>
@@ -124,7 +125,7 @@ void compare_hip_distributed_owned_state(const HipDistributedSequenceSetup& setu
 namespace {
 DistributedSequenceQualificationResult qualify_sequence_inputs(HipDistributedSequenceSetup setup,
     const DistributedSequenceReference& reference,std::span<const std::uint32_t> inputs,const ModelContentIdentity& pin,
-    const SerialSessionContext* ordinary_anchor,bool streaming) {
+    const SerialSessionContext* ordinary_anchor,bool streaming,bool include_inventory=false) {
     require_case(pin.valid() && setup.participant && setup.actual_model_owner && reference.actual_owner && reference.session &&
         setup.local_node<=1U && setup.resources.model_weights && reference.resources.model_weights &&
         setup.resources.scratch && setup.resources.session_state_memory && setup.resources.session_state_layout &&
@@ -174,6 +175,63 @@ DistributedSequenceQualificationResult qualify_sequence_inputs(HipDistributedSeq
     // Actual missing/expired native capability fails before model/reference
     // execution. This object is used below; no replacement participant is made.
     HipDistributedKnownSequence sequence(setup);
+    std::optional<HipDistributedOwnerInventory> initial_inventory;
+    if(include_inventory) {
+        require_case(static_cast<bool>(setup.stage_owner),"qualification inventory requires its actual stage owner");
+        initial_inventory=setup.participant->owner_inventory(setup.participant);
+        require_case(initial_inventory->snapshot_included && initial_inventory->retained.unique_backing_reserved_bytes.has_value() &&
+            !initial_inventory->unobserved_categories.empty(),"qualification owner inventory lost its exact storage scope");
+        auto* allocator=dynamic_cast<HipRuntimeAllocator*>(&setup.stage_owner->snapshot_allocator());
+        require_case(allocator!=nullptr,"qualification inventory needs the actual stage allocator");
+        const auto pool=[&](const char* category,std::uintptr_t address,std::uint64_t bytes,std::uint64_t generation) {
+            std::size_t matches=0;
+            for(const auto& view:initial_inventory->retained.pinned_views) if(view.category==category) {
+                ++matches;
+                require_case(view.address==address && view.view_bytes==bytes && view.backing.generation==generation &&
+                    view.backing.issuer==HipRuntimeAllocator::inventory_issuer && view.allocation_pin,
+                    "qualification inventory pool does not match its actual binding/generation");
+            }
+            require_case(matches==(bytes?1U:0U),"qualification inventory omitted or invented a live pool");
+        };
+        const auto& scratch=*setup.resources.scratch;const auto& state=*setup.resources.session_state_memory;
+        pool("stage.scratch",scratch.arena_base,scratch.arena_bytes,scratch.allocation_generation);
+        pool("stage.state.device",state.device_base,state.device_bytes,state.device_allocation_generation);
+        pool("stage.state.host",state.host_base,state.host_bytes,state.host_allocation_generation);
+        const auto& d1=setup.scope.deferred_moe_status;
+        pool("stage.D1",d1.arena_base,d1.arena_bytes,d1.allocation_generation);
+        std::uint64_t snapshots=0;
+        for(const auto& view:initial_inventory->retained.pinned_views) if(view.backing.issuer==HipRuntimeAllocator::inventory_issuer) {
+            const auto actual=allocator->describe_allocation(view.address,view.view_bytes,
+                view.address_space==UmaAddressSpace::device?HipRuntimeAllocationSpace::device:HipRuntimeAllocationSpace::host);
+            require_case(actual.lease_identity==view.backing.allocation && actual.raw_bytes==view.allocation_bytes &&
+                actual.view_offset==view.view_offset,"qualification inventory omitted actual allocator reservation/padding");
+            if(view.category=="stage.snapshot.host" || view.category=="stage.snapshot.device") {
+                require_case(view.allocation_bytes<=UINT64_MAX-snapshots,"qualification inventory snapshot byte overflow");
+                snapshots+=view.allocation_bytes;
+            }
+        }
+        const auto stage_only=setup.stage_owner->owner_inventory(setup.stage_owner);
+        require_case(snapshots && stage_only.retained.unique_backing_reserved_bytes.has_value() &&
+            *stage_only.retained.unique_backing_reserved_bytes<=UINT64_MAX-snapshots &&
+            *initial_inventory->retained.unique_backing_reserved_bytes==*stage_only.retained.unique_backing_reserved_bytes+snapshots,
+            "qualification inventory snapshot backing was aliased or omitted");
+        const auto repeated=setup.participant->owner_inventory(setup.participant);
+        auto joined=initial_inventory->retained.pinned_views;
+        joined.insert(joined.end(),repeated.retained.pinned_views.begin(),repeated.retained.pinned_views.end());
+        require_case(build_uma_owner_inventory(joined).unique_backing_reserved_bytes==initial_inventory->retained.unique_backing_reserved_bytes,
+            "qualification repeated actual backing leases were counted more than once");
+        for(unsigned fault=0;fault<2U;++fault) {
+            bool rejected=false;
+            try {
+                if(!fault) (void)setup.stage_owner->owner_inventory(std::shared_ptr<const HipDistributedStageResources>(
+                    setup.stage_owner.get(),[](const HipDistributedStageResources*){}));
+                else (void)setup.participant->owner_inventory(std::shared_ptr<const HipDistributedTokenParticipant>(
+                    setup.participant.get(),[](const HipDistributedTokenParticipant*){}));
+            } catch(const std::invalid_argument&) {rejected=true;}
+            require_case(rejected && setup.participant->phase()==DistributedTokenPhase::preparing,
+                "qualification inventory accepted a non-owning same-address control block");
+        }
+    }
     const auto data_boundary=std::find_if(setup.canonical_plan.boundaries.begin(),setup.canonical_plan.boundaries.end(),
         [](const auto& value) {return value.payload_bytes && !value.payloads.empty();});
     require_case(data_boundary!=setup.canonical_plan.boundaries.end(),"qualification has no actual native data boundary");
@@ -453,6 +511,11 @@ DistributedSequenceQualificationResult qualify_sequence_inputs(HipDistributedSeq
         frontier->commit().global_state.generations==reference.session->state.generations,
         "qualification final global write generations differ from full serial");
     compare_ranges(ranges,guard);
+    if(include_inventory) {
+        receipt.owner_inventory=setup.participant->owner_inventory(setup.participant);
+        require_case(receipt.owner_inventory->retained.unique_backing_reserved_bytes==initial_inventory->retained.unique_backing_reserved_bytes &&
+            receipt.owner_inventory->snapshot_included,"qualification retained storage changed across actual input transactions");
+    }
     if(ordinary_anchor) require_case(ordinary_anchor->health==SerialSessionHealth::poisoned && ordinary_anchor->arithmetic_lineage.tainted &&
         ordinary_anchor->execution_identity==original_anchor->execution_identity &&
         ordinary_anchor->state_layout_identity==original_anchor->state_layout_identity &&
@@ -485,9 +548,9 @@ DistributedSequenceQualificationResult qualify_hip_distributed_layer_boundary_in
     return qualify_sequence_inputs(std::move(setup),reference,inputs,pin,&ordinary_anchor,streaming);
 }
 DistributedSequenceQualificationResult qualify_hip_distributed_stage_inputs(HipDistributedSequenceSetup setup,
-    const DistributedSequenceReference& reference,std::span<const std::uint32_t> inputs,const ModelContentIdentity& pin) {
+    const DistributedSequenceReference& reference,std::span<const std::uint32_t> inputs,const ModelContentIdentity& pin,bool include_inventory) {
     require_case(static_cast<bool>(setup.stage_owner),"qualification requires an actual retained stage resource owner");
     const bool streaming=setup.streaming;
-    return qualify_sequence_inputs(std::move(setup),reference,inputs,pin,nullptr,streaming);
+    return qualify_sequence_inputs(std::move(setup),reference,inputs,pin,nullptr,streaming,include_inventory);
 }
 } // namespace strix::qualification

@@ -3,6 +3,7 @@
 #include "strix/distributed_stage_state.hpp"
 #include "strix/deferred_moe_status.hpp"
 #include "strix/hip_session_snapshot_transfer.hpp"
+#include "strix/hip_runtime_allocator.hpp"
 #include "strix/hip_setup_quiescence.hpp"
 #include "strix/prepared_tensor_views.hpp"
 #include "strix/session_snapshot_memory.hpp"
@@ -95,6 +96,8 @@ struct HipDistributedTokenParticipant::Impl {
     std::optional<DistributedStageSnapshotPlan> stage_snapshot;
     std::unique_ptr<StageSnapshotOwner> stage_snapshot_memory;
     DistributedStageSnapshotMemoryBinding active_stage_snapshot_memory;
+    std::array<HipRuntimeAllocationDescription,2> snapshot_inventory_leases{};
+    std::uint64_t snapshot_inventory_generation=0;
     std::optional<DistributedSequenceFrontier> sequence;
     HipSessionSnapshotTransferBackend transfer;
     std::unique_ptr<HipDistributedStage> stage;
@@ -185,6 +188,17 @@ struct HipDistributedTokenParticipant::Impl {
         const auto host_section=stage_snapshot?
             std::pair{active_stage_snapshot_memory.host_section_base,active_stage_snapshot_memory.host_section_bytes}:
             std::pair{active_snapshot_memory.host_section_base,active_snapshot_memory.host_section_bytes};
+        if(stage_owner) {
+            auto* actual_allocator=dynamic_cast<HipRuntimeAllocator*>(&allocator);
+            if(!actual_allocator || actual_allocator!=&stage_owner->snapshot_allocator())
+                throw std::invalid_argument("stage snapshot inventory requires its actual HIP allocator");
+            if(device_section.second) snapshot_inventory_leases[0]=actual_allocator->describe_allocation(
+                device_section.first,device_section.second,HipRuntimeAllocationSpace::device);
+            if(host_section.second) snapshot_inventory_leases[1]=actual_allocator->describe_allocation(
+                host_section.first,host_section.second,HipRuntimeAllocationSpace::host);
+            snapshot_inventory_generation=stage_snapshot?active_stage_snapshot_memory.allocation_generation:
+                active_snapshot_memory.allocation_generation;
+        }
         require_disjoint(device_section.first,device_section.second,host_section.first,host_section.second);
         for(const auto& section:std::array<std::pair<std::uintptr_t,std::uint64_t>,2>{{device_section,host_section}}) {
             require_disjoint(section.first,section.second,resources.session_state_memory->device_base,resources.session_state_memory->device_bytes);
@@ -402,6 +416,43 @@ NativeDistributedPositionCompletion HipDistributedTokenParticipant::mint_positio
     proof.valid_=true;
     s.position_completion_issued=true;
     return proof;
+}
+HipDistributedOwnerInventory HipDistributedTokenParticipant::owner_inventory(
+    std::shared_ptr<const HipDistributedTokenParticipant> actual_owner,UmaMemoryObservation observation) const {
+    const auto self=weak_from_this().lock();const auto& s=*impl_;
+    if(!self || actual_owner.get()!=this || actual_owner.owner_before(self) || self.owner_before(actual_owner) ||
+        !s.stage_owner || current_hip_launch_context())
+        throw std::invalid_argument("participant inventory requires its exact shared stage-owned participant outside a HIP scope");
+    s.guard.require_original();s.validate();
+    auto* allocator=dynamic_cast<HipRuntimeAllocator*>(&s.stage_owner->snapshot_allocator());
+    if(!allocator) throw std::invalid_argument("participant inventory requires its actual HIP snapshot allocator");
+    if(s.stage_snapshot) validate_stage_snapshot_binding(*s.stage_snapshot,s.active_stage_snapshot_memory);
+    else validate_snapshot_memory_binding(s.snapshot,s.active_snapshot_memory);
+    const auto generation=s.stage_snapshot?s.active_stage_snapshot_memory.allocation_generation:s.active_snapshot_memory.allocation_generation;
+    if(!generation || generation!=s.snapshot_inventory_generation)
+        throw std::invalid_argument("participant inventory snapshot allocation generation changed");
+    auto result=s.stage_owner->owner_inventory(s.stage_owner);
+    auto views=std::move(result.retained.pinned_views);
+    const std::shared_ptr<const void> pin=std::move(actual_owner);
+    for(std::size_t i=0;i<2U;++i) {
+        const auto address=s.stage_snapshot?(i?s.active_stage_snapshot_memory.host_section_base:s.active_stage_snapshot_memory.device_section_base):
+            (i?s.active_snapshot_memory.host_section_base:s.active_snapshot_memory.device_section_base);
+        const auto bytes=s.stage_snapshot?(i?s.active_stage_snapshot_memory.host_section_bytes:s.active_stage_snapshot_memory.device_section_bytes):
+            (i?s.active_snapshot_memory.host_section_bytes:s.active_snapshot_memory.device_section_bytes);
+        const auto& expected=s.snapshot_inventory_leases[i];
+        if(!bytes) {
+            if(address || expected.lease_identity) throw std::invalid_argument("participant inventory absent snapshot section changed");
+            continue;
+        }
+        const auto actual=allocator->describe_allocation(address,bytes,i?HipRuntimeAllocationSpace::host:HipRuntimeAllocationSpace::device);
+        if(actual!=expected) throw std::invalid_argument("participant inventory snapshot allocator lease changed");
+        views.push_back({next_uma_owner_view_identity(),{HipRuntimeAllocator::inventory_issuer,actual.lease_identity,generation},
+            UmaBackingKind::allocated_storage,i?"stage.snapshot.host":"stage.snapshot.device",actual.raw_bytes,
+            actual.view_offset,actual.view_bytes,pin,i?UmaAddressSpace::host:UmaAddressSpace::device,address});
+    }
+    result.retained=build_uma_owner_inventory(views,std::move(observation));result.snapshot_included=true;
+    std::erase(result.unobserved_categories,std::string("snapshot.unattached_participant"));
+    return result;
 }
 std::optional<DistributedSequenceFrontier> HipDistributedTokenParticipant::frontier() const {
     if(impl_->native_failed || impl_->protocol.phase()==DistributedTokenPhase::in_doubt) return std::nullopt;

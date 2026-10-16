@@ -4,6 +4,7 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -14,6 +15,16 @@
 
 namespace strix {
 namespace {
+
+std::atomic<std::uint64_t> next_allocation_lease{1};
+std::uint64_t allocation_lease() {
+    auto value=next_allocation_lease.load(std::memory_order_relaxed);
+    for(;;) {
+        if(!value || value==std::numeric_limits<std::uint64_t>::max())
+            throw std::overflow_error("HIP allocation lease identity exhausted");
+        if(next_allocation_lease.compare_exchange_weak(value,value+1U,std::memory_order_relaxed)) return value;
+    }
+}
 
 void check_hip(
     hipError_t error,
@@ -135,6 +146,7 @@ std::uintptr_t HipRuntimeAllocator::allocate_device(
     std::uint64_t alignment) {
     const auto total =
         checked_total(bytes, alignment);
+    const auto lease=allocation_lease();
 
     void* raw = nullptr;
     check_hip(
@@ -157,7 +169,7 @@ std::uintptr_t HipRuntimeAllocator::allocate_device(
                 aligned,
                 BackingAllocation{
                     raw_address,
-                    total,
+                    total, bytes, lease,
                 });
         static_cast<void>(iterator);
         if (!inserted) {
@@ -177,6 +189,7 @@ std::uintptr_t HipRuntimeAllocator::allocate_host(
     std::uint64_t alignment) {
     const auto total =
         checked_total(bytes, alignment);
+    const auto lease=allocation_lease();
 
     if (host_mode_ ==
         HipHostAllocationMode::pageable_aligned) {
@@ -197,21 +210,15 @@ std::uintptr_t HipRuntimeAllocator::allocate_host(
             throw std::bad_alloc();
         }
 
-        const auto address =
-            reinterpret_cast<std::uintptr_t>(
-                pointer);
-        std::lock_guard lock(mutex_);
-        const auto [iterator, inserted] =
-            pageable_host_.emplace(
-                address,
-                bytes);
-        static_cast<void>(iterator);
-        if (!inserted) {
-            std::free(pointer);
-            throw std::runtime_error(
-                "duplicate pageable host allocation address");
-        }
-        return address;
+        const auto address = reinterpret_cast<std::uintptr_t>(pointer);
+        try {
+            std::lock_guard lock(mutex_);
+            const auto [iterator, inserted] = pageable_host_.emplace(
+                address,BackingAllocation{address,bytes,bytes,lease});
+            static_cast<void>(iterator);
+            if(!inserted) throw std::runtime_error("duplicate pageable host allocation address");
+            return address;
+        } catch(...) {std::free(pointer);throw;}
     }
 
     void* raw = nullptr;
@@ -237,7 +244,7 @@ std::uintptr_t HipRuntimeAllocator::allocate_host(
                 aligned,
                 BackingAllocation{
                     raw_address,
-                    total,
+                    total, bytes, lease,
                 });
         static_cast<void>(iterator);
         if (!inserted) {
@@ -250,6 +257,25 @@ std::uintptr_t HipRuntimeAllocator::allocate_host(
             hipHostFree(raw));
         throw;
     }
+}
+
+HipRuntimeAllocationDescription HipRuntimeAllocator::describe_allocation(
+    std::uintptr_t address,std::uint64_t bytes,HipRuntimeAllocationSpace space) const {
+    if(!address || !bytes || (space!=HipRuntimeAllocationSpace::device && space!=HipRuntimeAllocationSpace::host))
+        throw std::invalid_argument("HIP allocation inventory needs a live exact allocation and closed space");
+    std::lock_guard lock(mutex_);
+    const auto& records=space==HipRuntimeAllocationSpace::device?device_backing_:
+        host_mode_==HipHostAllocationMode::pageable_aligned?pageable_host_:pinned_host_backing_;
+    const auto found=records.find(address);
+    if(found==records.end() || found->second.requested_bytes!=bytes)
+        throw std::invalid_argument("HIP allocation inventory address/extent is not owned by this allocator");
+    const auto& actual=found->second;
+    if(!actual.lease_identity || !actual.raw_address || address<actual.raw_address ||
+        actual.raw_bytes>std::numeric_limits<std::uintptr_t>::max()-actual.raw_address ||
+        address-actual.raw_address>actual.raw_bytes || bytes>actual.raw_bytes-(address-actual.raw_address))
+        throw std::invalid_argument("HIP allocation inventory backing is inconsistent or overflowing");
+    return {actual.lease_identity,actual.raw_address,actual.raw_bytes,
+        static_cast<std::uint64_t>(address-actual.raw_address),bytes};
 }
 
 void HipRuntimeAllocator::free_device(
@@ -320,7 +346,7 @@ void HipRuntimeAllocator::release_all() noexcept {
         BackingAllocation> pinned;
     std::unordered_map<
         std::uintptr_t,
-        std::uint64_t> pageable;
+        BackingAllocation> pageable;
 
     {
         std::lock_guard lock(mutex_);

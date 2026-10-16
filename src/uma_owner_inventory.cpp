@@ -1,5 +1,6 @@
 #include "strix/uma_owner_inventory.hpp"
 #include <algorithm>
+#include <atomic>
 #include <limits>
 #include <map>
 #include <set>
@@ -9,6 +10,7 @@
 
 namespace strix {
 namespace {
+std::atomic<std::uint64_t> next_view{1};
 std::uint64_t add(std::uint64_t a, std::uint64_t b) {
     if (b > std::numeric_limits<std::uint64_t>::max() - a)
         throw std::overflow_error("UMA inventory byte accounting overflow");
@@ -36,6 +38,14 @@ void validate_observation(const UmaMemoryObservation& observed) {
     // not established by these scalar observations. No cross-field sum/check.
 }
 } // namespace
+std::uint64_t next_uma_owner_view_identity() {
+    auto value=next_view.load(std::memory_order_relaxed);
+    for(;;) {
+        if(!value || value==std::numeric_limits<std::uint64_t>::max())
+            throw std::overflow_error("UMA owner view identity exhausted");
+        if(next_view.compare_exchange_weak(value,value+1U,std::memory_order_relaxed)) return value;
+    }
+}
 UmaOwnerInventory build_uma_owner_inventory(std::span<const UmaOwnerView> views,
                                             UmaMemoryObservation observation) {
     validate_observation(observation);

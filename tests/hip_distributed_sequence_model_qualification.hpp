@@ -27,6 +27,8 @@ struct DistributedSequenceQualificationResult {
     std::uint64_t stage_resource_identity = 0, state_mapping_identity = 0;
     std::uint64_t retained_state_bytes = 0;
     std::uint32_t compared_state_ranges = 0;
+    // Explicit opt-in; returned pins retain the actual stage/participant.
+    std::optional<HipDistributedOwnerInventory> owner_inventory;
     // This callable case is not general link, memory-sharding, distributed
     // generation, crash-recovery or model-quality qualification.
 };
@@ -53,7 +55,8 @@ struct DistributedSequenceQualificationResult {
 // independent reference remains a complete serial session with separate state.
 [[nodiscard]] DistributedSequenceQualificationResult qualify_hip_distributed_stage_inputs(
     HipDistributedSequenceSetup actual_setup, const DistributedSequenceReference& full_serial_reference,
-    std::span<const std::uint32_t> known_inputs, const ModelContentIdentity& pinned_model_content);
+    std::span<const std::uint32_t> known_inputs, const ModelContentIdentity& pinned_model_content,
+    bool include_owner_inventory = false);
 // Qualification-only payload comparison shared with the greedy fixture. Uses
 // global logical offsets from the retained mapping, never component-prefix or
 // full-flat comparison of absent state. Setup/reference retain all real owners.
