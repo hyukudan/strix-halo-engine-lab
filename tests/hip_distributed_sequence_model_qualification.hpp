@@ -20,10 +20,19 @@ struct DistributedSequenceQualificationResult {
     bool native_sequence_completed = false;
     bool terminal_rows_bitwise_equal = false; // terminal peer1 only
     bool locally_owned_state_equal = false;
+    bool streaming_inputs = false;
     // This callable case is not general link, memory-sharding, distributed
     // generation, crash-recovery or model-quality qualification.
 };
 [[nodiscard]] DistributedSequenceQualificationResult qualify_hip_distributed_known_sequence(
+    HipDistributedSequenceSetup actual_setup, const DistributedSequenceReference& full_serial_reference,
+    std::span<const std::uint32_t> known_inputs, const ModelContentIdentity& pinned_model_content,
+    const SerialSessionContext& actual_ordinary_anchor);
+// Exercises the retained one-input transaction with a literal input oracle.
+// One reusable actual row and one reusable reference row; this is not the
+// autoregressive cursor/wire qualification surface. Requires explicit streaming
+// setup and a fresh participant/independent serial reference on both peers.
+[[nodiscard]] DistributedSequenceQualificationResult qualify_hip_distributed_streaming_inputs(
     HipDistributedSequenceSetup actual_setup, const DistributedSequenceReference& full_serial_reference,
     std::span<const std::uint32_t> known_inputs, const ModelContentIdentity& pinned_model_content,
     const SerialSessionContext& actual_ordinary_anchor);

@@ -5,6 +5,7 @@
 #include <hip/hip_runtime.h>
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstddef>
 #include <cstring>
@@ -77,9 +78,10 @@ void compare_ranges(const std::vector<OwnedRange>& ranges,HipSetupQuiescenceGuar
 }
 } // namespace
 
-DistributedSequenceQualificationResult qualify_hip_distributed_known_sequence(HipDistributedSequenceSetup setup,
+namespace {
+DistributedSequenceQualificationResult qualify_sequence_inputs(HipDistributedSequenceSetup setup,
     const DistributedSequenceReference& reference,std::span<const std::uint32_t> inputs,const ModelContentIdentity& pin,
-    const SerialSessionContext& ordinary_anchor) {
+    const SerialSessionContext& ordinary_anchor,bool streaming) {
     require_case(pin.valid() && setup.participant && setup.actual_model_owner && reference.actual_owner && reference.session &&
         setup.local_node<=1U && setup.resources.model_weights && reference.resources.model_weights &&
         setup.resources.scratch && setup.resources.session_state_memory && setup.resources.session_state_layout &&
@@ -89,12 +91,13 @@ DistributedSequenceQualificationResult qualify_hip_distributed_known_sequence(Hi
     require_case(reference.resources.model_manifest && reference.resources.tensor_access &&
         reference.scope.stream && !reference.scope.graph_capture && !current_hip_launch_context() &&
         reference.session->health==SerialSessionHealth::ready && !reference.session->arithmetic_lineage.tainted &&
-        inputs.size()>=2U && inputs.size()<=setup.maximum_inputs && setup.model.vocab_size &&
+        setup.streaming==streaming && !inputs.empty() && inputs.size()<=UINT32_MAX &&
+        (streaming?inputs.size()<=setup.max_target_inputs:(inputs.size()>=2U && inputs.size()<=setup.maximum_inputs)) && setup.model.vocab_size &&
         setup.model.vocab_size<=UINT64_MAX/sizeof(float) && reference.maximum_logit_payload_bytes &&
-        inputs.size()<=reference.maximum_logit_payload_bytes/(setup.model.vocab_size*sizeof(float)),
+        (streaming?1U:inputs.size())<=reference.maximum_logit_payload_bytes/(setup.model.vocab_size*sizeof(float)),
         "qualification reference or retained terminal-row budget is invalid");
     const auto binding=setup.participant->current_binding();
-    require_case(inputs.size()<=16U && inputs.front()==binding.input_token &&
+    require_case((streaming || inputs.size()<=16U) && inputs.front()==binding.input_token &&
         inputs.size()-1U<=UINT64_MAX-binding.generation,"qualification known input sequence does not bind its participant");
     for(const auto token:inputs) require_case(token<setup.model.vocab_size,"qualification known input is outside vocabulary");
     for(const auto& peer:binding.peers)
@@ -143,9 +146,12 @@ DistributedSequenceQualificationResult qualify_hip_distributed_known_sequence(Hi
     }
     {
         auto low_budget=setup;low_budget.maximum_logit_payload_bytes=1;
-        HipDistributedKnownSequence limited(std::move(low_budget));
         bool rejected=false;
-        try {(void)limited.execute(inputs);}
+        try {
+            HipDistributedKnownSequence limited(std::move(low_budget));
+            if(streaming) (void)limited.execute_input(inputs.front());
+            else (void)limited.execute(inputs);
+        }
         catch(const std::invalid_argument& error) {rejected=std::string(error.what()).find("payload budget")!=std::string::npos;}
         require_case(rejected && setup.participant->phase()==DistributedTokenPhase::preparing,
             "qualification sequence budget did not reject before preparation or any wire send");
@@ -157,13 +163,16 @@ DistributedSequenceQualificationResult qualify_hip_distributed_known_sequence(Hi
     DistributedSequenceQualificationResult receipt;
     receipt.model_content=pin;receipt.input_u32le_sha256=sha256_bytes(encoded);
     receipt.local_node=setup.local_node;receipt.known_inputs=static_cast<std::uint32_t>(inputs.size());
+    receipt.streaming_inputs=streaming;
     HipLauncherCatalog catalog(setup.model,reference.config);
     ExecutionLauncherRegistry registry;catalog.register_for_compiled_execution(setup.serial,registry,&reference.resources);
     const auto launches=compile_launch_plan(setup.serial,registry);
     DirectLaunchDispatcher dispatch(launches);
-    std::vector<std::vector<float>> expected(inputs.size());
+    // Streaming qualification retains one reusable reference row. Legacy
+    // known-input qualification still allocates ALL row payloads before work.
+    std::vector<std::vector<float>> expected(streaming?1U:inputs.size());
     for(auto& row:expected) row.resize(static_cast<std::size_t>(setup.model.vocab_size));
-    for(std::size_t i=0;i<inputs.size();++i) {
+    const auto reference_step=[&](std::size_t i,std::vector<float>& row) {
         guard.run([&] {
             const HipLaunchScope scope(reference.scope);
             (void)execute_serial_token(setup.serial,*reference.session,reference.resources,inputs[i],dispatch,[&] {
@@ -178,26 +187,112 @@ DistributedSequenceQualificationResult qualify_hip_distributed_known_sequence(Hi
         });
         const auto logits=resolve_execution_buffer(setup.serial.execution_identity,setup.serial.arena,
             *reference.resources.scratch,setup.serial.io.steps.back().writes.front());
-        require_case(logits.bytes==expected[i].size()*sizeof(float),"qualification reference is not a full FP32 row");
-        guard.run([&] {hip_case(hipMemcpy(expected[i].data(),reinterpret_cast<const void*>(logits.address),
+        require_case(logits.bytes==row.size()*sizeof(float),"qualification reference is not a full FP32 row");
+        guard.run([&] {hip_case(hipMemcpy(row.data(),reinterpret_cast<const void*>(logits.address),
             logits.bytes,hipMemcpyDeviceToHost));});
-        for(const auto value:expected[i]) require_case(std::isfinite(value),"qualification reference row is nonfinite");
-    }
-    const auto result=sequence.execute(inputs);
-    require_case(result.inputs.size()==inputs.size() && result.coordinator_confirmation==(setup.local_node==0U),
-        "qualification sequence did not confirm every known input");
-    for(std::size_t i=0;i<result.inputs.size();++i) {
-        const auto& row=result.inputs[i];
-        require_case(row.input_token==inputs[i] && row.commit.next_position==binding.position+i+1U &&
-            row.commit.committed_tokens==binding.committed_tokens+i+1U && row.commit.decision_identity,
+        for(const auto value:row) require_case(std::isfinite(value),"qualification reference row is nonfinite");
+    };
+    const auto check_row=[&](std::size_t i,const DistributedTokenCommit& commit,std::uint32_t token,
+        std::uint32_t firstmax,std::span<const float> row,const std::vector<float>& wanted) {
+        require_case(token==inputs[i] && commit.next_position==binding.position+i+1U &&
+            commit.committed_tokens==binding.committed_tokens+i+1U && commit.decision_identity,
             "qualification committed frontier does not represent the actual known input prefix");
         if(setup.local_node) {
-            require_case(row.terminal_logits.size()==expected[i].size() &&
-                std::memcmp(row.terminal_logits.data(),expected[i].data(),expected[i].size()*sizeof(float))==0,
+            require_case(row.size()==wanted.size() && std::memcmp(row.data(),wanted.data(),wanted.size()*sizeof(float))==0,
                 "qualification actual native terminal FP32 row differs bitwise from serial");
-            const auto selected=static_cast<std::uint32_t>(std::max_element(expected[i].begin(),expected[i].end())-expected[i].begin());
-            require_case(row.terminal_firstmax==selected,"qualification terminal firstmax tie policy differs");
-        } else require_case(row.terminal_logits.empty(),"coordinator fabricated a local terminal FP32 row");
+            const auto selected=static_cast<std::uint32_t>(std::max_element(wanted.begin(),wanted.end())-wanted.begin());
+            require_case(firstmax==selected,"qualification terminal firstmax tie policy differs");
+        } else require_case(row.empty(),"coordinator fabricated a local terminal FP32 row");
+    };
+    require_case(sequence.completed_inputs()==0U && sequence.last_terminal_logits().empty(),
+        "qualification published a terminal row before any transaction");
+    // Both wrong-mode APIs must reject without preparation, transport or state
+    // mutation. A mode flag never relaxes the literal execute(span) contract.
+    {
+        bool rejected=false;
+        try {
+            if(streaming) (void)sequence.execute(inputs);
+            else (void)sequence.execute_input(inputs.front());
+        } catch(const std::invalid_argument&) {rejected=true;}
+        require_case(rejected && sequence.completed_inputs()==0U &&
+            setup.participant->phase()==DistributedTokenPhase::preparing,
+            "qualification cross-mode entry did not reject before preparation");
+    }
+    if(streaming) {
+        for(unsigned fault=0;fault<2U;++fault) {
+            auto bad=setup;
+            if(!fault) bad.max_target_inputs=0U;
+            else {
+                std::uint64_t capacity=setup.serial.max_position_embeddings;
+                for(const auto& peer:binding.peers) capacity=std::min(capacity,peer.context_capacity);
+                require_case(capacity>=binding.position && capacity-binding.position<UINT64_MAX,
+                    "qualification needs a representable streaming capacity-overflow witness");
+                bad.max_target_inputs=capacity-binding.position+1U;
+            }
+            bool rejected=false;
+            try {HipDistributedKnownSequence invalid(std::move(bad));}
+            catch(const std::invalid_argument& error) {
+                const std::string reason=error.what();
+                rejected=reason.find(!fault?"positive target limit":"capacity")!=std::string::npos ||
+                    (fault && reason.find("generation bound")!=std::string::npos);
+            }
+            require_case(rejected && setup.participant->phase()==DistributedTokenPhase::preparing,
+                "qualification streaming limit did not reject before target preparation");
+        }
+        bool rejected=false;
+        try {(void)sequence.execute_input(static_cast<std::uint32_t>(setup.model.vocab_size));}
+        catch(const std::invalid_argument&) {rejected=true;}
+        require_case(rejected && sequence.completed_inputs()==0U && sequence.last_terminal_logits().empty() &&
+            setup.participant->phase()==DistributedTokenPhase::preparing,
+            "qualification invalid streaming input changed its initial participant");
+        if(setup.model.vocab_size>1U) {
+            const auto other=static_cast<std::uint32_t>((static_cast<std::uint64_t>(inputs.front())+1U)%setup.model.vocab_size);
+            bool wrong_first=false;
+            try {(void)sequence.execute_input(other);}
+            catch(const std::invalid_argument& error) {
+                wrong_first=std::string(error.what()).find("negotiated binding")!=std::string::npos;
+            }
+            require_case(wrong_first && sequence.completed_inputs()==0U &&
+                setup.participant->phase()==DistributedTokenPhase::preparing,
+                "qualification streaming first input did not bind the negotiated token");
+        }
+        const float* terminal_storage=nullptr;
+        for(std::size_t i=0;i<inputs.size();++i) {
+            reference_step(i,expected.front());
+            const auto completion=sequence.execute_input(inputs[i]);
+            const auto row=sequence.last_terminal_logits();
+            check_row(i,completion.commit,completion.input_token,completion.terminal_firstmax,row,expected.front());
+            require_case(completion.terminal_peer==(setup.local_node==1U) && sequence.completed_inputs()==i+1U &&
+                setup.participant->phase()==DistributedTokenPhase::committed &&
+                completion.commit.binding_identity==setup.participant->binding_identity(),
+                "qualification streaming completion did not follow the actual committed binding");
+            if(setup.local_node) {
+                require_case(completion.terminal_firstmax_bits==std::bit_cast<std::uint32_t>(row[completion.terminal_firstmax]),
+                    "qualification streaming firstmax bits differ from the actual full terminal row");
+                if(!i) terminal_storage=row.data();
+                require_case(row.data()==terminal_storage,"qualification streaming terminal row was reallocated");
+            } else require_case(completion.terminal_firstmax==0U && completion.terminal_firstmax_bits==0U,
+                "qualification coordinator fabricated a terminal selection");
+        }
+        if(inputs.size()==setup.max_target_inputs) {
+            const auto previous=sequence.last_terminal_logits();
+            bool rejected_limit=false;
+            try {(void)sequence.execute_input(inputs.back());}
+            catch(const std::invalid_argument&) {rejected_limit=true;}
+            require_case(rejected_limit && sequence.completed_inputs()==inputs.size() &&
+                sequence.last_terminal_logits().data()==previous.data() &&
+                setup.participant->phase()==DistributedTokenPhase::committed,
+                "qualification exhausted streaming limit performed another transaction");
+        }
+    } else {
+        for(std::size_t i=0;i<inputs.size();++i) reference_step(i,expected[i]);
+        const auto result=sequence.execute(inputs);
+        require_case(result.inputs.size()==inputs.size() && result.coordinator_confirmation==(setup.local_node==0U) &&
+            sequence.completed_inputs()==inputs.size(),"qualification sequence did not confirm every known input");
+        for(std::size_t i=0;i<result.inputs.size();++i) {
+            const auto& row=result.inputs[i];
+            check_row(i,row.commit,row.input_token,row.terminal_firstmax,row.terminal_logits,expected[i]);
+        }
     }
     const auto frontier=setup.participant->frontier();
     require_case(frontier.has_value() && frontier->commit().global_state.valid==reference.session->state.valid &&
@@ -216,5 +311,16 @@ DistributedSequenceQualificationResult qualify_hip_distributed_known_sequence(Hi
     receipt.native_sequence_completed=true;receipt.terminal_rows_bitwise_equal=setup.local_node==1U;
     receipt.locally_owned_state_equal=true;
     return receipt;
+}
+} // namespace
+DistributedSequenceQualificationResult qualify_hip_distributed_known_sequence(HipDistributedSequenceSetup setup,
+    const DistributedSequenceReference& reference,std::span<const std::uint32_t> inputs,const ModelContentIdentity& pin,
+    const SerialSessionContext& ordinary_anchor) {
+    return qualify_sequence_inputs(std::move(setup),reference,inputs,pin,ordinary_anchor,false);
+}
+DistributedSequenceQualificationResult qualify_hip_distributed_streaming_inputs(HipDistributedSequenceSetup setup,
+    const DistributedSequenceReference& reference,std::span<const std::uint32_t> inputs,const ModelContentIdentity& pin,
+    const SerialSessionContext& ordinary_anchor) {
+    return qualify_sequence_inputs(std::move(setup),reference,inputs,pin,ordinary_anchor,true);
 }
 } // namespace strix::qualification

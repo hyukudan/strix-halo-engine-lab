@@ -4,6 +4,7 @@
 #include <hip/hip_runtime.h>
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <exception>
 #include <limits>
@@ -67,6 +68,8 @@ struct HipDistributedKnownSequence::Impl {
     DistributedExecutionBoundary boundary;
     std::uint32_t cut=0,last=0;
     bool used=false,started=false,failed=false,transport_live=false;
+    std::uint64_t completed=0,initial_generation=0,expected_binding_identity=0;
+    bool terminal_row_published=false;
     struct Local final : DistributedNativeLocalExecutor {
         Impl& owner;
         std::uint32_t next;
@@ -111,11 +114,14 @@ struct HipDistributedKnownSequence::Impl {
     };
     std::unique_ptr<Token> active;
     std::optional<NativeDistributedTokenRetirement> retirement;
+    // Allocated once at streaming setup. The previous proof/adapters must be
+    // consumed/released BEFORE resetting this executor or writing this row.
+    std::shared_ptr<Local> streaming_local;
 
     explicit Impl(HipDistributedSequenceSetup value):setup(std::move(value)) {
         const auto& p=setup.canonical_plan;
         require_sequence(setup.participant && setup.actual_model_owner && setup.local_node<=1U &&
-            setup.maximum_inputs>=2U && setup.maximum_inputs<=16U && setup.maximum_logit_payload_bytes &&
+            (setup.streaming || (setup.maximum_inputs>=2U && setup.maximum_inputs<=16U)) && setup.maximum_logit_payload_bytes &&
             setup.resources.scratch && setup.resources.model_weights && setup.resources.model_manifest && setup.resources.tensor_access &&
             setup.resources.session_state_layout && setup.resources.session_state_memory,
             "sequence requires bounded actual model, participant and resource owners");
@@ -176,6 +182,28 @@ struct HipDistributedKnownSequence::Impl {
             "sequence scheduler lacks the current qualified physical link");
         require_sequence(setup.scope.stream && setup.scope.stream!=hipStreamLegacy && setup.scope.stream!=hipStreamPerThread &&
             !setup.scope.graph_capture && !current_hip_launch_context(),"sequence requires its own eager HIP scope");
+        initial_generation=binding.generation;
+        expected_binding_identity=setup.participant->binding_identity();
+        require_sequence(setup.streaming?setup.max_target_inputs>0U:setup.max_target_inputs==0U,
+            "sequence streaming requires an explicit positive target limit and legacy mode requires zero");
+        if(setup.streaming) {
+            admit_count(binding,setup.max_target_inputs);
+            require_sequence(setup.maximum_logit_payload_bytes>=setup.model.vocab_size*sizeof(float),
+                "sequence streaming full FP32 row exceeds its explicit payload budget");
+            auto row=std::make_shared<HipDistributedKnownInputResult>();
+            if(setup.local_node) row->terminal_logits.resize(static_cast<std::size_t>(setup.model.vocab_size));
+            streaming_local=std::make_shared<Local>(*this,std::move(row));
+        }
+    }
+    void admit_count(const DistributedTokenBinding& binding,std::uint64_t count) const {
+        require_sequence(count && count-1U<=UINT64_MAX-binding.generation && count<=UINT64_MAX-binding.position,
+            "sequence input/frontier or generation bound is invalid");
+        for(const auto& peer:binding.peers)
+            require_sequence(binding.position<=peer.context_capacity && count<=peer.context_capacity-binding.position,
+                "sequence exceeds a peer's context capacity");
+        require_sequence(binding.position<=setup.serial.max_position_embeddings &&
+            count<=setup.serial.max_position_embeddings-binding.position && count<=UINT64_MAX-binding.committed_tokens,
+            "sequence exceeds compiled context or committed-token counter capacity");
     }
     void close_uncertain() noexcept {
         failed=true;
@@ -237,6 +265,64 @@ struct HipDistributedKnownSequence::Impl {
         active=std::move(token);
         transport_live=true;
     }
+    // Shared real one-input protocol. The legacy wrapper preallocates every
+    // requested row; streaming supplies the same setup-allocated row each time.
+    // Caller serializes access, admits count/input and owns the error boundary.
+    void execute_one(const std::shared_ptr<Local>& local,std::uint32_t input) {
+        require_sequence(setup.participant->binding_identity()==expected_binding_identity &&
+            setup.participant->phase()==(completed?DistributedTokenPhase::committed:DistributedTokenPhase::preparing),
+            "sequence participant changed outside its retained transaction owner");
+        terminal_row_published=false;
+        if(completed) {
+            require_sequence(retirement.has_value(),"sequence has no actual previous-token retirement");
+            setup.participant->begin_next(input,initial_generation+completed,std::move(*retirement));
+            retirement.reset();active.reset();
+        } else require_sequence(input==setup.participant->current_binding().input_token,
+            "sequence first input differs from its negotiated binding");
+        // No previous backend/proof can retain mutable executor state now.
+        local->next=setup.local_node?cut+1U:0U;
+        local->inbound_complete=false;local->ready.reset();
+        auto& row=*local->result;row.input_token=input;row.commit={};row.terminal_firstmax=0;
+        started=true;
+        FramedDistributedTokenWire wire(*setup.transport.token_control);
+        auto prepared=setup.participant->prepare();exchange(wire,prepared);
+        require_sequence(setup.participant->phase()==DistributedTokenPhase::executing,"sequence peers are not both prepared");
+        if(!setup.local_node) {
+            for(std::uint32_t step=0;step<=cut;++step) local->execute_local_step(setup.canonical_plan.steps[step]);
+            // Creating producer staging is intentionally AFTER finish_local.
+            adapters(local);
+            const auto& b=setup.participant->current_binding();
+            auto transfer=plan_distributed_boundary_transfer(setup.canonical_plan,boundary,*setup.transport.scheduler,
+                b.connection_epoch,b.request_id,b.generation,1U,b.boundary_dtype_id);
+            require_sequence(transfer.link_plan.kind==transport::PlanKind::single_link && transfer.link_plan.slices.size()==1U,
+                "sequence has no qualified single-link boundary plan");
+            active->backend->send_boundary(boundary,transfer);
+            for(std::uint32_t step=cut+1U;step<=last;++step)
+                active->backend->execute_remote_step(setup.canonical_plan.steps[step]);
+        } else {
+            adapters(local);
+            require_sequence(active->server->serve_one()==DistributedControlServerEvent::boundary_transfer,
+                "sequence suffix requires boundary metadata before any remote step");
+            (void)active->backend->receive_boundary(boundary);
+            local->inbound_complete=true;
+            for(std::uint32_t step=cut+1U;step<=last;++step)
+                require_sequence(active->server->serve_one()==DistributedControlServerEvent::remote_step,
+                    "sequence suffix received a duplicate boundary or unexpected frame");
+        }
+        require_sequence(local->ready.has_value(),"sequence local stage has no completed readiness receipt");
+        exchange(wire,*local->ready);
+        if(!setup.local_node) {const auto decision=setup.participant->decide_commit();setup.participant->send(wire,decision);}
+        else setup.participant->receive(wire);
+        const auto ack=setup.participant->acknowledge_commit();exchange(wire,ack);
+        const auto committed=setup.participant->committed_frontier();
+        require_sequence(committed.has_value() && setup.participant->frontier().has_value(),
+            "sequence cannot publish without both committed ACKs and typed frontier");
+        retirement.emplace(active->backend->retire_token());
+        row.commit=*committed; // Only after real transport retirement.
+        expected_binding_identity=setup.participant->binding_identity();
+        ++completed;
+        terminal_row_published=setup.streaming && setup.local_node==1U;
+    }
 };
 
 HipDistributedKnownSequence::HipDistributedKnownSequence(HipDistributedSequenceSetup setup)
@@ -244,7 +330,7 @@ HipDistributedKnownSequence::HipDistributedKnownSequence(HipDistributedSequenceS
 HipDistributedKnownSequence::~HipDistributedKnownSequence()=default;
 HipDistributedSequenceResult HipDistributedKnownSequence::execute(std::span<const std::uint32_t> inputs) {
     auto& s=*impl_;
-    require_sequence(!s.used && !s.failed && inputs.size()>=2U && inputs.size()<=s.setup.maximum_inputs,
+    require_sequence(!s.setup.streaming && !s.used && !s.failed && inputs.size()>=2U && inputs.size()<=s.setup.maximum_inputs,
         "sequence is single-use and requires bounded two-or-more known inputs");
     const auto binding=s.setup.participant->current_binding();
     require_sequence(inputs.front()==binding.input_token && inputs.size()-1U<=UINT64_MAX-binding.generation &&
@@ -272,55 +358,37 @@ HipDistributedSequenceResult HipDistributedKnownSequence::execute(std::span<cons
     }
     // All result payloads allocated before snapshot/PLE/target mutation.
     s.used=true;
-    FramedDistributedTokenWire wire(*s.setup.transport.token_control);
     try {
         for(std::size_t token=0;token<inputs.size();++token) {
-            const auto& local=locals[token];
-            auto& row=*local->result;
-            if(token) {
-                require_sequence(s.retirement.has_value(),"sequence has no actual previous-token retirement");
-                s.setup.participant->begin_next(inputs[token],binding.generation+token,std::move(*s.retirement));
-                s.retirement.reset();s.active.reset();
-            }
-            s.started=true;
-            auto prepared=s.setup.participant->prepare();s.exchange(wire,prepared);
-            require_sequence(s.setup.participant->phase()==DistributedTokenPhase::executing,"sequence peers are not both prepared");
-            if(!s.setup.local_node) {
-                for(std::uint32_t step=0;step<=s.cut;++step) local->execute_local_step(s.setup.canonical_plan.steps[step]);
-                // Creating producer staging is intentionally AFTER finish_local.
-                s.adapters(local);
-                const auto& b=s.setup.participant->current_binding();
-                auto transfer=plan_distributed_boundary_transfer(s.setup.canonical_plan,s.boundary,*s.setup.transport.scheduler,
-                    b.connection_epoch,b.request_id,b.generation,1U,b.boundary_dtype_id);
-                require_sequence(transfer.link_plan.kind==transport::PlanKind::single_link && transfer.link_plan.slices.size()==1U,
-                    "sequence has no qualified single-link boundary plan");
-                s.active->backend->send_boundary(s.boundary,transfer);
-                for(std::uint32_t step=s.cut+1U;step<=s.last;++step)
-                    s.active->backend->execute_remote_step(s.setup.canonical_plan.steps[step]);
-            } else {
-                s.adapters(local);
-                require_sequence(s.active->server->serve_one()==DistributedControlServerEvent::boundary_transfer,
-                    "sequence suffix requires boundary metadata before any remote step");
-                (void)s.active->backend->receive_boundary(s.boundary);
-                local->inbound_complete=true;
-                for(std::uint32_t step=s.cut+1U;step<=s.last;++step)
-                    require_sequence(s.active->server->serve_one()==DistributedControlServerEvent::remote_step,
-                        "sequence suffix received a duplicate boundary or unexpected frame");
-            }
-            require_sequence(local->ready.has_value(),"sequence local stage has no completed readiness receipt");
-            s.exchange(wire,*local->ready);
-            if(!s.setup.local_node) {const auto decision=s.setup.participant->decide_commit();s.setup.participant->send(wire,decision);}
-            else s.setup.participant->receive(wire);
-            const auto ack=s.setup.participant->acknowledge_commit();s.exchange(wire,ack);
-            const auto committed=s.setup.participant->committed_frontier();
-            require_sequence(committed.has_value() && s.setup.participant->frontier().has_value(),
-                "sequence cannot publish without both committed ACKs and typed frontier");
-            s.retirement.emplace(s.active->backend->retire_token());
-            row.commit=*committed; // Only after real transport retirement.
-            result.inputs[token]=std::move(row);
+            s.execute_one(locals[token],inputs[token]);
+            result.inputs[token]=std::move(*locals[token]->result);
         }
         result.coordinator_confirmation=s.setup.local_node==0U;
         return result;
     } catch(...) {s.close_uncertain();throw;}
 }
+HipDistributedInputCompletion HipDistributedKnownSequence::execute_input(std::uint32_t input) {
+    auto& s=*impl_;
+    require_sequence(s.setup.streaming && !s.failed && s.completed<s.setup.max_target_inputs &&
+        input<s.setup.model.vocab_size,"sequence streaming target is outside its admitted mode, count or vocabulary");
+    if(!s.completed) require_sequence(input==s.setup.participant->current_binding().input_token,
+        "sequence first input differs from its negotiated binding");
+    try {
+        s.execute_one(s.streaming_local,input);
+        const auto& row=*s.streaming_local->result;
+        HipDistributedInputCompletion result;
+        result.commit=row.commit;result.input_token=input;result.terminal_peer=s.setup.local_node==1U;
+        if(result.terminal_peer) {
+            result.terminal_firstmax=row.terminal_firstmax;
+            result.terminal_firstmax_bits=std::bit_cast<std::uint32_t>(row.terminal_logits[row.terminal_firstmax]);
+        }
+        return result;
+    } catch(...) {s.close_uncertain();throw;}
+}
+std::span<const float> HipDistributedKnownSequence::last_terminal_logits() const noexcept {
+    const auto& s=*impl_;
+    if(s.failed || !s.terminal_row_published || !s.streaming_local) return {};
+    return s.streaming_local->result->terminal_logits;
+}
+std::uint64_t HipDistributedKnownSequence::completed_inputs() const noexcept {return impl_->completed;}
 } // namespace strix

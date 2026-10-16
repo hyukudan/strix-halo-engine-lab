@@ -77,3 +77,39 @@ endpoints, channels, owners and result budget. There is deliberately no fake
 standalone executable, skip-success path or automatic CTest model run. Binding
 this callable case to a separately commissioned two-host physical bootstrap
 and executing all compiler, native, model and physical gates remains pending.
+
+## Retained one-input mode
+
+An explicit `HipDistributedSequenceSetup::streaming=true` admits a positive
+`max_target_inputs` before allocating the reusable row or preparing any target.
+The complete limit must fit both peer contexts, compiled positions, generation
+and committed-token counters. Its payload budget must fit one complete FP32
+vocabulary row. The default known-input mode keeps its single-use two-through-
+sixteen input contract; neither entry silently switches to the other mode.
+
+`execute_input(token)` performs the same actual one-input transaction and returns
+the committed frontier after both ACKs and a minted native retirement proof.
+On peer1 its completion also carries the actual finite firstmax token and the
+selected FP32 bits. Peer0 has no local terminal selection. The first input must
+match the negotiated binding. Later inputs consume the previous proof and derive
+the next binding through the retained participant's typed frontier. Only then
+may the same executor and host row be reset and reused. The final proof retains
+its actual transport, executor and row owners through the next continuation or
+destruction. A transaction failure invalidates row publication and quarantines
+the participant; it does not enable retry.
+
+`last_terminal_logits()` borrows the peer1 row after successful completion until
+the next admitted input or destruction, under serialized caller access. No row
+is published before completion, and no full-vocabulary history is retained in
+streaming mode. `completed_inputs()` counts only completed local transactions.
+There is no EOS, output-budget, pending-token or emission policy here. The
+autoregressive consumer must use the existing serial token cursor and a separate
+control protocol. A zero-target request can negotiate finish without calling
+`execute_input`; the component never fabricates prompt consumption.
+
+The callable `qualify_hip_distributed_streaming_inputs` consumes literal oracle
+inputs through this entry, retaining one independent serial reference row and
+one terminal row. It compares every FP32 bit, selected bits, typed commit and
+locally owned state, checks row storage reuse, and includes mode, budget, limit
+and first-input admission negatives. It is a source fixture, not an executed
+autoregressive, model or physical qualification result.
