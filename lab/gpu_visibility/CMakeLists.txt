@@ -1,0 +1,20 @@
+cmake_minimum_required(VERSION 3.24)
+project(strix_gpu_visibility LANGUAGES CXX HIP)
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    message(FATAL_ERROR "Native DMA-BUF commissioning requires Linux")
+endif()
+set(STRIX_ENABLE_HIP_RUNTIME ON CACHE BOOL "Build native HIP support for this explicit commissioning target")
+set(BUILD_TESTING OFF CACHE BOOL "Only build the requested commissioning executable")
+get_filename_component(STRIX_REPO "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
+add_subdirectory("${STRIX_REPO}" "${CMAKE_CURRENT_BINARY_DIR}/engine" EXCLUDE_FROM_ALL)
+if(NOT TARGET strix_hip_runtime)
+    message(FATAL_ERROR "Set STRIX_ENABLE_HIP_RUNTIME=ON and provide the actual ROCm toolchain")
+endif()
+add_executable(strix-gpu-visibility
+    visibility_main.hip
+    ../../src/hip_gpu_visibility_probe.hip
+    ../direct_gpu_stream/bounded_tcp_control.cpp)
+set_target_properties(strix-gpu-visibility PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+target_compile_features(strix-gpu-visibility PRIVATE cxx_std_20)
+target_link_libraries(strix-gpu-visibility PRIVATE strix_hip_runtime)
+target_compile_options(strix-gpu-visibility PRIVATE -Wall -Wextra -Werror -fno-strict-aliasing)
