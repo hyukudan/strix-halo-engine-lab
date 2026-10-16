@@ -54,6 +54,12 @@ UmaOwnerInventory build_uma_owner_inventory(std::span<const UmaOwnerView> views,
         require(view.view_offset <= view.allocation_bytes &&
                 view.view_bytes <= view.allocation_bytes - view.view_offset,
                 "UMA inventory view lies outside allocation");
+        require(view.address_space == UmaAddressSpace::unspecified || view.address_space == UmaAddressSpace::host ||
+                view.address_space == UmaAddressSpace::device, "UMA view address space is invalid");
+        require((view.address_space == UmaAddressSpace::unspecified && !view.address) ||
+                (view.address_space != UmaAddressSpace::unspecified && view.address &&
+                 view.view_bytes <= std::numeric_limits<std::uintptr_t>::max() - view.address),
+                "UMA view address evidence is incomplete or overflowing");
         result.logical_view_bytes = add(result.logical_view_bytes, view.view_bytes);
         categories[view.category] = add(categories[view.category], view.view_bytes);
         const auto& key = view.backing;
@@ -108,6 +114,30 @@ UmaOwnerInventory build_uma_owner_inventory(std::span<const UmaOwnerView> views,
     for (auto& [category, logical] : categories)
         result.logical_categories.push_back(UmaCategoryViews{category, logical});
     result.pinned_views.assign(views.begin(), views.end());
+    return result;
+}
+UmaReservationPlan build_uma_reservation_plan(std::span<const UmaOwnerView> retained,
+    std::span<const UmaOwnerView> setup_only, UmaReservationLimits limits, UmaMemoryObservation observation) {
+    UmaReservationPlan result;
+    result.retained = build_uma_owner_inventory(retained, observation);
+    std::vector<UmaOwnerView> peak(retained.begin(), retained.end());
+    peak.insert(peak.end(), setup_only.begin(), setup_only.end());
+    result.setup_peak = build_uma_owner_inventory(peak, std::move(observation));
+    if (limits.retained_bytes && result.retained.reservation_upper_bound_bytes > *limits.retained_bytes)
+        throw std::invalid_argument("UMA retained reservation exceeds explicit budget");
+    if (limits.setup_peak_bytes && result.setup_peak.reservation_upper_bound_bytes > *limits.setup_peak_bytes)
+        throw std::invalid_argument("UMA setup peak reservation exceeds explicit budget");
+    return result;
+}
+UmaReservationEstimate plan_uma_reservation_growth(const UmaOwnerInventory& live,
+    std::uint64_t additional_new_retained_bytes, std::uint64_t setup_temporary_bytes, UmaReservationLimits limits) {
+    UmaReservationEstimate result;
+    result.retained_reserved_bytes = add(live.reservation_upper_bound_bytes, additional_new_retained_bytes);
+    result.setup_peak_reserved_bytes = add(result.retained_reserved_bytes, setup_temporary_bytes);
+    if (limits.retained_bytes && result.retained_reserved_bytes > *limits.retained_bytes)
+        throw std::invalid_argument("UMA retained reservation exceeds explicit budget");
+    if (limits.setup_peak_bytes && result.setup_peak_reserved_bytes > *limits.setup_peak_bytes)
+        throw std::invalid_argument("UMA setup peak reservation exceeds explicit budget");
     return result;
 }
 } // namespace strix

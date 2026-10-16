@@ -16,6 +16,7 @@ struct UmaBackingIdentity {
     bool operator==(const UmaBackingIdentity&) const = default;
 };
 enum class UmaBackingKind { allocated_storage, file_mapping };
+enum class UmaAddressSpace { unspecified, host, device };
 struct UmaOwnerView {
     std::uint64_t view_identity = 0;
     UmaBackingIdentity backing;
@@ -25,6 +26,10 @@ struct UmaOwnerView {
     // Caller supplies the ACTUAL allocator/mapping lease, kept by the snapshot.
     // An opaque pin cannot independently prove physical page residency.
     std::shared_ptr<const void> allocation_pin;
+    // Actual API-returned view address, when supplied. Distinct CPU/GPU
+    // addresses may name one backing; addresses never establish backing keys.
+    UmaAddressSpace address_space = UmaAddressSpace::unspecified;
+    std::uintptr_t address = 0;
 };
 struct UmaMemoryObservation {
     // One coherent observation supplied by caller, never discovered or guessed
@@ -63,4 +68,28 @@ struct UmaOwnerInventory {
 // Existing MemoryPlan/decide_admission remain separate.
 [[nodiscard]] UmaOwnerInventory build_uma_owner_inventory(
     std::span<const UmaOwnerView>, UmaMemoryObservation observation = {});
+
+struct UmaReservationLimits {
+    std::optional<std::uint64_t> retained_bytes, setup_peak_bytes;
+};
+struct UmaReservationPlan {
+    UmaOwnerInventory retained;
+    UmaOwnerInventory setup_peak;
+};
+struct UmaReservationEstimate {
+    std::uint64_t retained_reserved_bytes = 0, setup_peak_reserved_bytes = 0;
+};
+// Pre-allocation growth estimate: new copies/repack storage are additional
+// backings; aliases contribute zero here. setup_temporary_bytes coexist with
+// both source and new retained copies. No fake pins for future allocations.
+[[nodiscard]] UmaReservationEstimate plan_uma_reservation_growth(
+    const UmaOwnerInventory& live, std::uint64_t additional_new_retained_bytes,
+    std::uint64_t setup_temporary_bytes, UmaReservationLimits limits = {});
+// Setup-only views are live concurrently with retained views, e.g. repack
+// staging. A retained repack copy has its own backing, while registered aliases
+// keep the source key. Limits use the conservative declared reservation bound,
+// never RSS/GTT or an asserted physical-page count. Both snapshots retain pins.
+[[nodiscard]] UmaReservationPlan build_uma_reservation_plan(
+    std::span<const UmaOwnerView> retained, std::span<const UmaOwnerView> setup_only,
+    UmaReservationLimits limits = {}, UmaMemoryObservation observation = {});
 } // namespace strix

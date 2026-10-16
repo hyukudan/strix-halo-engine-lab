@@ -105,9 +105,71 @@ void negative() {
     try { static_cast<void>(build_uma_owner_inventory(overflow)); } catch (const std::overflow_error&) { caught = true; }
     require(caught, "reserved-byte sum overflow was accepted");
 }
+void address_evidence_and_reservation_budget() {
+    auto mapping = view(20,{7,8,9},4096,0,4096); mapping.kind = UmaBackingKind::file_mapping;
+    mapping.category = "weights.mapping"; mapping.address_space = UmaAddressSpace::host; mapping.address = 0x10000;
+    auto registered = mapping; registered.view_identity = 21; registered.category = "weights.registered-alias";
+    registered.address_space = UmaAddressSpace::device; registered.address = 0x80000;
+    auto repack = view(22,{7,10,9},1024,0,1024); repack.category = "repack";
+    repack.address_space = UmaAddressSpace::device; repack.address = 0x90000;
+    auto staging = view(23,{7,11,9},256,0,256); staging.category = "staging";
+    const std::array retained{mapping,registered,repack};
+    const std::array setup{staging};
+    const auto plan = build_uma_reservation_plan(retained,setup,{5120,5376});
+    require(plan.retained.unique_backing_reserved_bytes == 5120 && plan.setup_peak.unique_backing_reserved_bytes == 5376 &&
+        plan.retained.logical_view_bytes == 9216 && plan.retained.known_alias_view_bytes == 4096,
+        "CPU/device aliases inflated retained or peak reservation; repack/staging copy was omitted");
+    require(plan.retained.pinned_views[1].address == 0x80000 && !plan.retained.observation.process_peak_bytes,
+        "actual alias evidence was lost or declared peak became observed peak");
+    const std::array source_views{mapping,registered};
+    const auto before_repack = build_uma_owner_inventory(source_views);
+    const auto estimated = plan_uma_reservation_growth(before_repack,1024,256,{5120,5376});
+    require(estimated.retained_reserved_bytes == plan.retained.reservation_upper_bound_bytes &&
+            estimated.setup_peak_reserved_bytes == plan.setup_peak.reservation_upper_bound_bytes,
+        "pre-allocation repack/staging estimate disagrees with actual retained/setup backing inventory");
+    invalid([&] { static_cast<void>(plan_uma_reservation_growth(before_repack,1024,256,{5120,5375})); });
+    bool overflow = false;
+    try { static_cast<void>(plan_uma_reservation_growth(before_repack,std::numeric_limits<std::uint64_t>::max(),0)); }
+    catch (const std::overflow_error&) { overflow = true; }
+    require(overflow, "pre-allocation reservation growth overflow was accepted");
+    invalid([&] { static_cast<void>(build_uma_reservation_plan(retained,setup,{5119,5376})); });
+    invalid([&] { static_cast<void>(build_uma_reservation_plan(retained,setup,{5120,5375})); });
+    // Repeated exports of the same backing have distinct view IDs but one
+    // reservation, including at the setup peak.
+    auto setup_alias = registered; setup_alias.view_identity = 24;
+    const std::array setup_aliases{setup_alias};
+    require(build_uma_reservation_plan(retained,setup_aliases).setup_peak.unique_backing_reserved_bytes == 5120,
+        "setup alias was counted as a new backing reservation");
+    for (unsigned mutation = 0; mutation < 4; ++mutation) {
+        auto bad = mapping;
+        if (mutation == 0) bad.address = 0;
+        if (mutation == 1) bad.address_space = UmaAddressSpace::unspecified;
+        if (mutation == 2) bad.address_space = static_cast<UmaAddressSpace>(99);
+        if (mutation == 3) bad.address = std::numeric_limits<std::uintptr_t>::max() - 1U;
+        invalid([&] { static_cast<void>(build_uma_owner_inventory(std::span<const UmaOwnerView>(&bad,1))); });
+    }
+    auto unknown = staging; unknown.backing = {};
+    const std::array unknown_setup{unknown};
+    const auto conservative = build_uma_reservation_plan(retained,unknown_setup);
+    require(!conservative.setup_peak.unique_backing_reserved_bytes && conservative.setup_peak.reservation_upper_bound_bytes == 5376,
+        "unknown setup owner acquired false physical identity or escaped the conservative budget");
+    std::weak_ptr<const void> lease;
+    UmaReservationPlan pinned;
+    {
+        auto only = view(30,{7,12,9},128,0,128);
+        lease = only.allocation_pin;
+        const std::array temporary{only};
+        pinned = build_uma_reservation_plan({},temporary);
+    }
+    require(!lease.expired() && pinned.setup_peak.pinned_views.size() == 1,
+        "setup budget snapshot discarded its consumer lease");
+    pinned = {};
+    require(lease.expired(), "setup budget snapshot leaked its last consumer lease");
+}
 } // namespace
 int main() try {
     aliases_and_copy(); sparse_and_nested(); unknown_and_observed(); identities_and_lifetime(); negative();
+    address_evidence_and_reservation_budget();
     std::cout << "UMA owner inventory source fixtures completed\n";
     return 0;
 } catch (const std::exception& error) {

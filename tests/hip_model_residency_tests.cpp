@@ -10,8 +10,10 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <memory>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #if defined(__linux__)
@@ -207,6 +209,122 @@ void verify_binding(
         "unpromoted file-backed tensor remains host-readable");
 }
 
+void shared_owner_inventory(const std::filesystem::path& path, const strix::ModelManifest& manifest) {
+    for (const auto mode : {strix::HipModelResidencyMode::registered_file_mapping,
+                           strix::HipModelResidencyMode::resident_copy}) {
+        strix::AllocationGenerationSource generations;
+        auto mapped = std::make_shared<strix::MappedModelFile>(
+            strix::MappedModelFile::open_read_only(path, "shared-residency-fixture", generations));
+        strix::HipModelResidencyPolicy policy; policy.mode = mode;
+        const auto planned = strix::plan_hip_model_residency_reservation(*mapped, manifest, policy);
+        expect(planned.retained_reserved_bytes == planned.mapped_reserved_bytes + planned.copied_reserved_bytes &&
+            planned.setup_peak_reserved_bytes == planned.retained_reserved_bytes &&
+            (mode != strix::HipModelResidencyMode::registered_file_mapping || planned.copied_reserved_bytes == 0),
+            "registration aliases do not add backing reservations; real copies do");
+        {
+            auto impossible = policy; impossible.reservation_limits.retained_bytes = 0;
+            strix::AllocationGenerationSource before_allocation(100000);
+            bool rejected = false;
+            try { static_cast<void>(strix::HipModelResidency::create(mapped, manifest, before_allocation, impossible)); }
+            catch (const std::invalid_argument& error) {
+                rejected = std::string_view(error.what()) == "HIP residency retained reservation exceeds explicit budget";
+            }
+            expect(rejected && before_allocation.next() == 100000,
+                "insufficient reservation budget rejects before allocation-generation admission");
+            impossible.reservation_limits = {}; impossible.reservation_limits.setup_peak_bytes = planned.setup_peak_reserved_bytes - 1U;
+            rejected = false;
+            try { static_cast<void>(strix::plan_hip_model_residency_reservation(*mapped, manifest, impossible)); }
+            catch (const std::invalid_argument& error) {
+                rejected = std::string_view(error.what()) == "HIP residency setup peak reservation exceeds explicit budget";
+            }
+            expect(rejected, "setup peak budget is independent from the retained budget");
+        }
+        policy.reservation_limits = {planned.retained_reserved_bytes, planned.setup_peak_reserved_bytes};
+        auto owner = std::make_shared<strix::HipModelResidency>(
+            strix::HipModelResidency::create(mapped, manifest, generations, policy));
+        auto inventory = owner->owner_inventory(owner);
+        expect(inventory.unique_backing_reserved_bytes == planned.retained_reserved_bytes &&
+            inventory.known_file_mapping_bytes == planned.mapped_reserved_bytes &&
+            inventory.known_allocated_storage_bytes == owner->copied_bytes() &&
+            !inventory.observation.process_rss_bytes && !inventory.observation.gtt_reported_bytes,
+            "actual residency backing inventory agrees with plan without inventing system observations");
+        std::size_t aliases = 0;
+        for (const auto& view : inventory.pinned_views) {
+            expect(view.address != 0 && view.backing.generation != 0 && view.allocation_pin,
+                "actual alias carries live address, backing generation and owners");
+            if (view.address_space == strix::UmaAddressSpace::device) {
+                ++aliases;
+                expect(owner->covers_device_range(view.address, view.view_bytes),
+                    "inventory device view is covered by the actual residency owner");
+            }
+        }
+        expect(aliases != 0, "inventory exports actual HIP device aliases rather than host address guesses");
+        if (mode == strix::HipModelResidencyMode::registered_file_mapping)
+            expect(inventory.known_alias_view_bytes == owner->registered_bytes() * 2U,
+                "registered host/device views share one source backing and are counted once");
+        // Export IDs are distinct across snapshots so inventories can be joined
+        // while the source backing lease still deduplicates.
+        auto second = owner->owner_inventory(owner);
+        auto joined = inventory.pinned_views;
+        joined.insert(joined.end(), second.pinned_views.begin(), second.pinned_views.end());
+        expect(strix::build_uma_owner_inventory(joined).unique_backing_reserved_bytes == planned.retained_reserved_bytes,
+            "repeated actual owner exports duplicate logical aliases, not physical backing reservations");
+        second = {}; joined.clear();
+        auto unrelated = std::make_shared<strix::MappedModelFile>(
+            strix::MappedModelFile::open_read_only(path, "other-mapping", generations));
+        bool rejected = false;
+        try { static_cast<void>(owner->owner_inventory(owner, unrelated)); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        expect(rejected, "equal file content cannot impersonate the retained mapping lease");
+        unrelated.reset();
+        auto fake_mapping_pin = std::shared_ptr<const strix::MappedModelFile>(mapped.get(), [](const auto*) {});
+        rejected = false;
+        try { static_cast<void>(owner->owner_inventory(owner, fake_mapping_pin)); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        expect(rejected, "same mapping pointer with a different control block is not its owning lease");
+        fake_mapping_pin.reset();
+        auto fake_residency_pin = std::shared_ptr<const strix::HipModelResidency>(owner.get(), [](const auto*) {});
+        rejected = false;
+        try { static_cast<void>(owner->owner_inventory(fake_residency_pin)); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        expect(rejected, "same residency pointer with a different control block is not its owning lease");
+        fake_residency_pin.reset();
+        inventory = {}; // Quiescent; no snapshot may observe mutable owner transfer.
+        const auto original_generation = owner->generation();
+        auto moved = std::make_shared<strix::HipModelResidency>(std::move(*owner));
+        rejected = false;
+        try { static_cast<void>(owner->owner_inventory(owner)); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        expect(rejected && owner->generation() == 0 && moved->generation() == original_generation,
+            "move preserves the live allocation generation and invalidates the old owner");
+        owner = std::move(moved);
+        inventory = owner->owner_inventory(owner);
+        std::weak_ptr<const strix::MappedModelFile> mapping_weak = mapped;
+        std::weak_ptr<const strix::HipModelResidency> residency_weak = owner;
+        mapped.reset(); owner.reset();
+        expect(!mapping_weak.expired() && !residency_weak.expired(), "inventory keeps actual mapping and HIP consumer owners alive");
+        verify_binding(*mapping_weak.lock(), residency_weak.lock()->binding(), mode);
+        inventory = {};
+        expect(mapping_weak.expired() && residency_weak.expired(), "inventory releases residency before the final mapping lease");
+    }
+    // A borrowed API retains its original lifetime contract; it cannot claim
+    // stronger mapping ownership just because a snapshot is requested later.
+    strix::AllocationGenerationSource generations;
+    auto mapped = std::make_shared<strix::MappedModelFile>(
+        strix::MappedModelFile::open_read_only(path, "borrowed-inventory-negative", generations));
+    strix::HipModelResidencyPolicy policy; policy.mode = strix::HipModelResidencyMode::resident_copy;
+    auto borrowed = std::make_shared<strix::HipModelResidency>(strix::HipModelResidency::create(*mapped, manifest, generations, policy));
+    bool rejected = false;
+    try { static_cast<void>(borrowed->owner_inventory(borrowed, mapped)); }
+    catch (const std::invalid_argument&) { rejected = true; }
+    expect(rejected, "borrowed residency cannot manufacture a strong mapping lease");
+    policy.mode = static_cast<strix::HipModelResidencyMode>(99);
+    rejected = false;
+    try { static_cast<void>(strix::plan_hip_model_residency_reservation(*mapped, manifest, policy)); }
+    catch (const std::invalid_argument&) { rejected = true; }
+    expect(rejected, "invalid residency mode cannot silently allocate a copied model");
+}
+
 }  // namespace
 
 int main() try {
@@ -252,6 +370,7 @@ int main() try {
                 residency.binding(),
                 policy.mode);
         }
+        shared_owner_inventory(path, manifest);
 
         {
             strix::HipModelResidencyPolicy
