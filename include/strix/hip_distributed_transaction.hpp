@@ -1,5 +1,6 @@
 #pragma once
 #include "strix/distributed_control_wire.hpp"
+#include "strix/distributed_position_completion.hpp"
 #include "strix/hip_distributed_stage.hpp"
 #include "strix/runtime_allocator.hpp"
 #include "strix/serial_session.hpp"
@@ -7,6 +8,7 @@
 
 namespace strix {
 class NativeDistributedTokenRetirement;
+class HipDistributedStageResources;
 // Retained sequence of explicitly bound two-peer token transactions, not a distributed decoder or
 // a persistent crash-recovery service. Real stage execution and all seven local
 // snapshot transfers are owned here. The caller retains allocator/generations,
@@ -30,6 +32,9 @@ public:
         SerialSessionContext& ordinary_session,HipLaunchContext scope,std::shared_ptr<const void> actual_owner,
         RuntimeMemoryAllocator& snapshot_allocator,AllocationGenerationSource& generations,
         DistributedTokenBinding binding,std::uint32_t local_node,std::uint64_t snapshot_budget_bytes);
+    // Phase1 capacity source: actual selected backing plus FULL initialized
+    // state/snapshot/scratch. No ordinary healthy serial context is fabricated.
+    HipDistributedTokenParticipant(std::shared_ptr<HipDistributedStageResources>,DistributedTokenBinding);
     ~HipDistributedTokenParticipant();
     HipDistributedTokenParticipant(const HipDistributedTokenParticipant&) = delete;
     HipDistributedTokenParticipant& operator=(const HipDistributedTokenParticipant&) = delete;
@@ -41,6 +46,9 @@ public:
     [[nodiscard]] const DistributedTokenBinding& current_binding() const noexcept;
     [[nodiscard]] std::uint64_t binding_identity() const noexcept;
     [[nodiscard]] std::uint32_t local_node() const noexcept;
+    // One logical-control capability per genuinely committed token. This does
+    // not attest DMA; all data boundaries require independent retirement.
+    [[nodiscard]] NativeDistributedPositionCompletion mint_position_dependency_completion();
     [[nodiscard]] std::optional<DistributedSequenceFrontier> frontier() const;
     [[nodiscard]] DistributedTokenMessage prepare();
     void execute_local_step(const DistributedStepPlacement&) override;

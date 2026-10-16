@@ -105,7 +105,8 @@ streaming mode. `completed_inputs()` counts only completed local transactions.
 There is no EOS, output-budget, pending-token or emission policy here. The
 autoregressive consumer must use the existing serial token cursor and a separate
 control protocol. A zero-target request can negotiate finish without calling
-`execute_input`; the component never fabricates prompt consumption.
+`execute_input`; the component never fabricates prompt consumption. This does
+not change the serial cursor's prompt-consumption policy at any output budget.
 
 The callable `qualify_hip_distributed_streaming_inputs` consumes literal oracle
 inputs through this entry, retaining one independent serial reference row and
@@ -113,3 +114,39 @@ one terminal row. It compares every FP32 bit, selected bits, typed commit and
 locally owned state, checks row storage reuse, and includes mode, budget, limit
 and first-input admission negatives. It is a source fixture, not an executed
 autoregressive, model or physical qualification result.
+
+## Explicit complete-layer cut
+
+`layer_boundary_position_dependencies=true` selects a separate bounded bridge.
+Its one data edge must connect `mlp_inject` in layer L to the first
+`attn_hyper_mix` in layer L+1. A cut before PLE, inside a layer, or with any
+additional live data crossing is rejected before preparation. The only other
+admitted edges are at most64 canonical zero-payload dependencies from prefix
+`position_prepare` to suffix indexed attention. Zero such dependencies is also
+valid. The complete canonical plan, edge list and original identity are retained
+and compared to a reconstruction; no edge is pruned or retagged.
+
+Concrete staging receives the selected data-boundary identity and the explicit
+position policy. It keeps that same complete plan but exposes only the selected
+nonzero payload to real native send/receive. Neither a zero-byte DMA nor a fake
+control completion is issued for logical position dependencies. The prefix
+finishes before staging resolves source views; the suffix's actual participant
+materializes the bound input position before executing its first operation.
+
+After real stage completion and both committed ACKs, the participant can mint a
+single-use position-completion proof for the exact token and full dependency
+list. The backend consumes this logical proof before issuing retirement. Its
+independent actual data handles still must retire; a host position word or token
+ACK cannot replace native transport completion. A later input consumes the same
+combined retirement gate before any scratch or source owner can be reused.
+The default strict route retains its one-boundary admission and policy.
+
+The callable `qualify_hip_distributed_layer_boundary_inputs` requires a separately
+constructed actual participant and canonical model placement at this cut. It
+compares full terminal rows, locally owned recurrent/attention/PLE state and
+global generations to the independent serial reference, counts every canonical
+data and logical dependency, and includes source fixtures rejecting interior,
+pre-PLE, malformed logical and implicit legacy-mode admissions. It accepts the
+explicit literal or retained streaming input mode. This cut enables a larger
+suffix structurally; it makes no measured balance, speed or physical capacity
+claim. Native, model, physical and complete-request qualification is pending.

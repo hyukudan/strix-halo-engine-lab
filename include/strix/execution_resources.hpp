@@ -12,6 +12,7 @@
 #include <cstdint>
 
 namespace strix {
+class DistributedStageResourcePlan;
 
 struct ExecutionRuntimeResources {
     const ExecutionMemoryBinding* scratch = nullptr;
@@ -23,6 +24,8 @@ struct ExecutionRuntimeResources {
     PleLookupBackend* ple_lookup = nullptr;
     const PleHashContract* ple_hash_contract = nullptr;
     PleLookupPrefetchState* ple_prefetch = nullptr;
+    // Explicit capacity-only materialization scope; ordinary execution rejects it.
+    const DistributedStageResourcePlan* distributed_stage = nullptr;
 };
 
 struct RuntimeExecutionIdentities {
@@ -42,4 +45,9 @@ build_runtime_execution_identities(
     const ExecutionArenaPlan& arena,
     const ExecutionRuntimeResources& resources);
 
+// Explicit scoped admissions. Full-model entrypoints above remain strict.
+void validate_stage_execution_runtime_resources(std::uint64_t,const ExecutionArenaPlan&,
+    const ExecutionRuntimeResources&,std::uint64_t position);
+[[nodiscard]] RuntimeExecutionIdentities build_stage_runtime_execution_identities(std::uint64_t,
+    const ExecutionArenaPlan&,const ExecutionRuntimeResources&);
 }  // namespace strix

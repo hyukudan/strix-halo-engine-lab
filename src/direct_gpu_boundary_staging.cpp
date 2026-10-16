@@ -57,6 +57,7 @@ struct DirectGpuBoundaryStaging::Impl : std::enable_shared_from_this<Impl> {
     };
     DistributedPlacementPlan placement;
     std::uint32_t endpoint_node = 0;
+    std::uint64_t payload_boundary_id = 0;
     DistributedRuntimeRequest request;
     transport::DirectTransportLease lease;
     std::shared_ptr<DirectGpuBoundaryMemoryOwner> memory;
@@ -107,6 +108,8 @@ struct DirectGpuBoundaryStaging::Impl : std::enable_shared_from_this<Impl> {
         return result;
     }
     transport::TransferDescriptor validate(const DistributedExecutionBoundary& boundary, const DistributedBoundaryTransfer& transfer, bool inbound) {
+        if (payload_boundary_id && boundary.boundary_id != payload_boundary_id)
+            throw std::invalid_argument("GPU staging cannot transfer a logical position dependency");
         current();
         if (std::none_of(placement.boundaries.begin(), placement.boundaries.end(), [&](const auto& b) { return same_boundary(b, boundary); }) ||
             (inbound ? boundary.destination_node : boundary.source_node) != endpoint_node ||
@@ -150,21 +153,26 @@ DirectGpuBoundaryStaging::DirectGpuBoundaryStaging(DistributedPlacementPlan plac
     transport::DirectTransportLease lease, std::shared_ptr<DirectGpuBoundaryMemoryOwner> memory,
     std::shared_ptr<transport::DirectGpuStreamGpu> gpu, std::shared_ptr<transport::DirectGpuBoundaryReceiveIo> receive)
     : DirectGpuBoundaryStaging(std::move(placement), request, std::move(lease), std::move(memory),
-        std::move(gpu), std::move(receive), 0U, false) {}
+        std::move(gpu), std::move(receive), 0U, false, 0U, NativeDistributedPositionDependencyPolicy::reject) {}
 
 DirectGpuBoundaryStaging::DirectGpuBoundaryStaging(DistributedPlacementPlan placement, DistributedRuntimeRequest request,
     transport::DirectTransportLease lease, std::shared_ptr<DirectGpuBoundaryMemoryOwner> memory,
     std::shared_ptr<transport::DirectGpuStreamGpu> gpu, std::shared_ptr<transport::DirectGpuBoundaryReceiveIo> receive,
-    std::uint32_t endpoint_node)
+    std::uint32_t endpoint_node, std::uint64_t payload_boundary_id, NativeDistributedPositionDependencyPolicy position_policy)
     : DirectGpuBoundaryStaging(std::move(placement), request, std::move(lease), std::move(memory),
-        std::move(gpu), std::move(receive), endpoint_node, true) {}
+        std::move(gpu), std::move(receive), endpoint_node, true, payload_boundary_id, position_policy) {}
 
 DirectGpuBoundaryStaging::DirectGpuBoundaryStaging(DistributedPlacementPlan placement, DistributedRuntimeRequest request,
     transport::DirectTransportLease lease, std::shared_ptr<DirectGpuBoundaryMemoryOwner> memory,
     std::shared_ptr<transport::DirectGpuStreamGpu> gpu, std::shared_ptr<transport::DirectGpuBoundaryReceiveIo> receive,
-    std::uint32_t endpoint_node, bool explicit_endpoint)
+    std::uint32_t endpoint_node, bool explicit_endpoint, std::uint64_t payload_boundary_id,
+    NativeDistributedPositionDependencyPolicy position_policy)
     : impl_(std::make_shared<Impl>()) {
     auto& i = *impl_;
+    const bool positions = position_policy == NativeDistributedPositionDependencyPolicy::materialized_input_position_v1;
+    if ((position_policy != NativeDistributedPositionDependencyPolicy::reject && !positions) ||
+        (positions ? (!explicit_endpoint || !payload_boundary_id || placement.local_node != 0U) : payload_boundary_id != 0U))
+        throw std::invalid_argument("GPU staging payload selector requires an explicit canonical position policy");
     if (!explicit_endpoint) endpoint_node = placement.local_node;
     if (explicit_endpoint && (endpoint_node > 1U || std::none_of(placement.boundaries.begin(), placement.boundaries.end(),
         [&](const auto& b) {return b.source_node == endpoint_node || b.destination_node == endpoint_node;}) ||
@@ -172,12 +180,33 @@ DirectGpuBoundaryStaging::DirectGpuBoundaryStaging(DistributedPlacementPlan plac
             [](const auto& b) {return b.source_node>1U || b.destination_node>1U;})))
         throw std::invalid_argument("GPU boundary endpoint is outside the two-peer placement");
     if (!placement.executable || !placement.plan_identity || !placement.compiled_execution_identity ||
-        !placement.manifest_layout_identity || !placement.tensor_access_identity || placement.boundaries.empty() || placement.boundaries.size() > 64 ||
+        !placement.manifest_layout_identity || !placement.tensor_access_identity || placement.boundaries.empty() ||
+        placement.boundaries.size() > (positions ? NativeDistributedPositionCompletion::maximum_dependencies + 1U : 64U) ||
         !request.connection_epoch || !request.request_id || !request.generation || !request.dtype_id || !memory || !gpu || !receive ||
         lease.physical_link_id.empty() || !lease.connection_epoch || !lease.pool_binding_identity || !lease.lease_generation) {
         throw std::invalid_argument("GPU boundary staging requires exact request, lease and retained owners");
     }
+    if (positions) {
+        std::size_t data = 0, logical = 0;
+        for (std::size_t n = 0; n < placement.boundaries.size(); ++n) {
+            const auto& b = placement.boundaries[n];
+            if (!b.boundary_id || std::any_of(placement.boundaries.begin(), placement.boundaries.begin() + n,
+                [&](const auto& previous) {return previous.boundary_id == b.boundary_id;}))
+                throw std::invalid_argument("GPU staging canonical boundary identity is empty or duplicated");
+            if (is_materialized_input_position_dependency(placement, b)) {++logical;continue;}
+            if (!b.payload_bytes || b.payloads.empty() || b.boundary_id != payload_boundary_id ||
+                b.source_node != 0U || b.destination_node != 1U || b.source_step >= b.destination_step ||
+                b.destination_step >= placement.steps.size() || placement.steps[b.source_step].step_id != b.source_step ||
+                placement.steps[b.destination_step].step_id != b.destination_step ||
+                placement.steps[b.source_step].node != 0U || placement.steps[b.destination_step].node != 1U)
+                throw std::invalid_argument("GPU staging selector does not describe one data edge and only logical position dependencies");
+            ++data;
+        }
+        if (data != 1U || logical > NativeDistributedPositionCompletion::maximum_dependencies)
+            throw std::invalid_argument("GPU staging requires exactly one selected data boundary and bounded position dependencies");
+    }
     i.endpoint_node = endpoint_node;
+    i.payload_boundary_id = payload_boundary_id;
     i.placement = std::move(placement); i.request = request; i.lease = std::move(lease); i.memory = std::move(memory);
     i.gpu = std::move(gpu); i.receive = std::move(receive); i.exported = i.gpu->exported_binding(); i.buffers = i.memory->current_buffers();
     if (i.buffers.empty() || i.buffers.size() > 4096 || i.exported.pool_binding_identity != i.lease.pool_binding_identity ||
@@ -190,6 +219,7 @@ DirectGpuBoundaryStaging::DirectGpuBoundaryStaging(DistributedPlacementPlan plac
         if (i.buffers[n].use == i.buffers[m].use) throw std::invalid_argument("GPU boundary memory inventory has duplicate execution identities");
     }
     for (const auto& b : i.placement.boundaries) if (b.source_node == i.endpoint_node || b.destination_node == i.endpoint_node) {
+        if (positions && b.boundary_id != payload_boundary_id) continue; // Logical census remains in the complete placement.
         if (!b.boundary_id || !b.payload_bytes || b.source_node == b.destination_node) throw std::invalid_argument("GPU boundary placement is invalid");
         static_cast<void>(i.segments(b)); static_cast<void>(i.pool_view(false, b.payload_bytes)); static_cast<void>(i.pool_view(true, b.payload_bytes));
     }

@@ -8,9 +8,11 @@
 #include <string_view>
 
 namespace strix {
+class DistributedStageResourcePlan;
 
 // Immutable, deeply owned lookup metadata. Construction is not permission to
-// execute: PreparedEagerExecution must validate the actual dynamic resources and
+// execute: PreparedEagerExecution (or the explicitly scoped distributed stage)
+// must validate the actual dynamic resources and
 // validate_source_metadata() before publishing this pointer in a run context.
 // The caller excludes metadata mutation and retains the prepared owner through
 // device quiescence. No request state or mutable "validated" flag is cached.
@@ -21,7 +23,8 @@ public:
         const ModelManifest& manifest,
         const ModelRuntimeBinding& weights,
         const ExecutionTensorAccessPlan& access,
-        std::shared_ptr<const void> actual_owner);
+        std::shared_ptr<const void> actual_owner,
+        const DistributedStageResourcePlan* stage_scope = nullptr);
     ~PreparedTensorViews();
     PreparedTensorViews(const PreparedTensorViews&) = delete;
     PreparedTensorViews& operator=(const PreparedTensorViews&) = delete;
@@ -37,6 +40,8 @@ public:
     void validate_source_handles(const ModelManifest*, const ModelRuntimeBinding*,
                                  const ExecutionTensorAccessPlan*) const;
 
+    // Scope must match its retained source and permits only actual local steps.
+    void validate_stage_scope(const DistributedStageResourcePlan*,std::uint32_t step) const;
     // Valid lookups allocate nothing and return references into this deep
     // snapshot. Tensor index and dense step/slot lookup are O(1); name lookup
     // and a sparse-slot fallback are O(log N).

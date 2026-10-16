@@ -18,6 +18,10 @@ void require_sequence(bool value,const char* reason) {if(!value) throw std::inva
 bool same_flow(const DistributedBoundaryFlow& a,const DistributedBoundaryFlow& b) {
     return a.flow_id==b.flow_id && a.direction==b.direction && a.priority==b.priority;
 }
+bool same_boundary(const DistributedExecutionBoundary& a,const DistributedExecutionBoundary& b) {
+    return a.boundary_id==b.boundary_id && a.source_step==b.source_step && a.destination_step==b.destination_step &&
+        a.source_node==b.source_node && a.destination_node==b.destination_node && a.payload_bytes==b.payload_bytes && a.payloads==b.payloads;
+}
 class SequenceMemory final : public DirectGpuBoundaryMemoryOwner {
 public:
     std::shared_ptr<const void> owner;
@@ -67,6 +71,7 @@ struct HipDistributedKnownSequence::Impl {
     HipSetupQuiescenceGuard guard;
     DistributedExecutionBoundary boundary;
     std::uint32_t cut=0,last=0;
+    std::size_t position_dependencies=0;
     bool used=false,started=false,failed=false,transport_live=false;
     std::uint64_t completed=0,initial_generation=0,expected_binding_identity=0;
     bool terminal_row_published=false;
@@ -128,11 +133,22 @@ struct HipDistributedKnownSequence::Impl {
         require_sequence(setup.model.validate().empty() && setup.model.vocab_size==setup.serial.vocab_size &&
             setup.model.max_position_embeddings==setup.serial.max_position_embeddings,
             "sequence model and compiled input/output bounds differ");
-        require_sequence(p.local_node==0U && p.executable && p.boundaries.size()==1U &&
+        require_sequence(p.local_node==0U && p.executable &&
+            (setup.layer_boundary_position_dependencies?(!p.boundaries.empty() &&
+                p.boundaries.size()<=NativeDistributedPositionCompletion::maximum_dependencies+1U):p.boundaries.size()==1U) &&
             p.compiled_execution_identity==setup.serial.execution_identity &&
             p.steps.size()==setup.serial.execution.steps.size() && !p.steps.empty(),
-            "sequence requires a canonical two-peer plan with exactly one boundary");
-        boundary=p.boundaries.front();cut=boundary.source_step;
+            setup.layer_boundary_position_dependencies?
+                "sequence requires one data boundary and at most64 logical dependencies in a canonical two-peer plan":
+                "sequence requires a canonical two-peer plan with exactly one boundary");
+        if(setup.layer_boundary_position_dependencies) {
+            std::size_t data=0;
+            for(const auto& candidate:p.boundaries) if(candidate.payload_bytes && !candidate.payloads.empty()) {
+                boundary=candidate;++data;
+            }
+            require_sequence(data==1U,"sequence layer boundary requires exactly one data boundary");
+        } else boundary=p.boundaries.front();
+        cut=boundary.source_step;
         require_sequence(p.steps.size()<=UINT32_MAX && cut+1ULL<p.steps.size() &&
             boundary.source_node==0U && boundary.destination_node==1U && boundary.destination_step==cut+1U,
             "sequence boundary must join the last prefix step to the first suffix step");
@@ -141,16 +157,38 @@ struct HipDistributedKnownSequence::Impl {
             require_sequence(p.steps[i].step_id==i && p.steps[i].op==setup.serial.execution.steps[i].op &&
                 p.steps[i].node==(i<=cut?0U:1U) && p.steps[i].remote==(i>cut) && !p.steps[i].placement_ambiguous,
                 "sequence requires a complete contiguous prefix/suffix placement");
+        if(setup.layer_boundary_position_dependencies) {
+            const auto& source=setup.serial.execution.steps[cut];
+            const auto& destination=setup.serial.execution.steps[cut+1U];
+            require_sequence(source.op==SerialOp::mlp_inject && source.layer.has_value() &&
+                destination.op==SerialOp::attn_hyper_mix && destination.layer.has_value() &&
+                *source.layer<UINT32_MAX && *destination.layer==*source.layer+1U,
+                "sequence layer cut must join complete adjacent layers without a PLE or interior-layer crossing");
+            for(std::size_t i=0;i<p.boundaries.size();++i) {
+                require_sequence(p.boundaries[i].boundary_id!=0U,"sequence canonical boundary identity is empty or duplicated");
+                for(std::size_t j=0;j<i;++j)
+                    require_sequence(p.boundaries[i].boundary_id!=p.boundaries[j].boundary_id,
+                        "sequence canonical boundary identity is empty or duplicated");
+            }
+            for(const auto& candidate:p.boundaries) if(candidate.boundary_id!=boundary.boundary_id) {
+                require_sequence(is_materialized_input_position_dependency(p,candidate) && candidate.source_step<=cut &&
+                    candidate.destination_step>cut,"sequence layer cut has an unsupported crossing dependency");
+                ++position_dependencies;
+            }
+            require_sequence(position_dependencies<=NativeDistributedPositionCompletion::maximum_dependencies,
+                "sequence layer cut has too many logical position dependencies");
+        }
         std::vector<std::uint32_t> nodes;
         for(const auto& step:p.steps) nodes.push_back(step.node);
         const auto canonical=build_distributed_placement_plan(setup.serial,*setup.resources.model_manifest,
             *setup.resources.tensor_access,nodes,0);
         require_sequence(canonical.plan_identity==p.plan_identity && canonical.remote_nodes==p.remote_nodes &&
+            canonical.manifest_layout_identity==p.manifest_layout_identity && canonical.tensor_access_identity==p.tensor_access_identity &&
+            canonical.executable==p.executable &&
             canonical.has_remote_work==p.has_remote_work &&
-            canonical.boundary_payload_bytes_per_token==p.boundary_payload_bytes_per_token && canonical.boundaries.size()==1U &&
-            canonical.boundaries.front().boundary_id==boundary.boundary_id &&
-            canonical.boundaries.front().payloads==boundary.payloads &&
-            canonical.boundaries.front().payload_bytes==boundary.payload_bytes,
+            canonical.boundary_payload_bytes_per_token==p.boundary_payload_bytes_per_token &&
+            canonical.boundaries.size()==p.boundaries.size() &&
+            std::equal(canonical.boundaries.begin(),canonical.boundaries.end(),p.boundaries.begin(),same_boundary),
             "sequence canonical placement metadata or identity changed");
         const auto& binding=setup.participant->current_binding();
         require_sequence(setup.participant->phase()==DistributedTokenPhase::preparing &&
@@ -244,7 +282,11 @@ struct HipDistributedKnownSequence::Impl {
         token->memory=std::make_shared<SequenceMemory>();
         auto& memory=*token->memory;memory.owner=setup.actual_model_owner;memory.participant=setup.participant;
         memory.serial=setup.serial;memory.resources=setup.resources;memory.boundary=boundary;memory.node=setup.local_node;
-        token->staging=std::make_shared<DirectGpuBoundaryStaging>(setup.canonical_plan,request,setup.transport.link->lease(),
+        if(setup.layer_boundary_position_dependencies)
+            token->staging=std::make_shared<DirectGpuBoundaryStaging>(setup.canonical_plan,request,setup.transport.link->lease(),
+                token->memory,setup.transport.gpu,setup.transport.receive,setup.local_node,boundary.boundary_id,
+                NativeDistributedPositionDependencyPolicy::materialized_input_position_v1);
+        else token->staging=std::make_shared<DirectGpuBoundaryStaging>(setup.canonical_plan,request,setup.transport.link->lease(),
             token->memory,setup.transport.gpu,setup.transport.receive,setup.local_node);
         DistributedNativeControlPlane* control=nullptr;
         if(!setup.local_node) {
@@ -261,7 +303,8 @@ struct HipDistributedKnownSequence::Impl {
         token->backend=std::make_unique<NativeDistributedBackend>(token->links,*control,*local,*token->staging);
         token->pins=std::make_shared<Token::Pins>(Token::Pins{setup.transport,setup.actual_model_owner,token->memory,token->staging,local});
         token->backend->begin_token_retirement(setup.canonical_plan,request,setup.local_node,
-            setup.participant->binding_identity(),token->pins);
+            setup.participant->binding_identity(),token->pins,setup.layer_boundary_position_dependencies?
+                NativeDistributedPositionDependencyPolicy::materialized_input_position_v1:NativeDistributedPositionDependencyPolicy::reject);
         active=std::move(token);
         transport_live=true;
     }
@@ -317,6 +360,8 @@ struct HipDistributedKnownSequence::Impl {
         const auto committed=setup.participant->committed_frontier();
         require_sequence(committed.has_value() && setup.participant->frontier().has_value(),
             "sequence cannot publish without both committed ACKs and typed frontier");
+        if(position_dependencies)
+            active->backend->complete_position_dependencies(setup.participant->mint_position_dependency_completion());
         retirement.emplace(active->backend->retire_token());
         row.commit=*committed; // Only after real transport retirement.
         expected_binding_identity=setup.participant->binding_identity();

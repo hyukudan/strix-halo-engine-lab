@@ -3,6 +3,7 @@
 #include "strix/hip_launch_context.hpp"
 #include "strix/hip_hyper_mix_launcher.hpp"
 #include "strix/hc_projection_prefetch.hpp"
+#include "strix/distributed_stage_resources.hpp"
 #include "strix/lane_chain_hyper_output.hpp"
 #include <set>
 
@@ -2536,6 +2537,8 @@ register_for_compiled_execution(
             throw std::invalid_argument("next-tile HC bundle requires eager R1 C1 resources");
     }
     if (config_.splitk_projection) {
+        if(resources && resources->distributed_stage)
+            throw std::invalid_argument("capacity stages do not admit experimental split-K HC");
         if (!resources) throw std::invalid_argument("split-K HC bundle requires whole-model preflight resources");
         preflight_splitk_hyper_projection_model(compiled,*resources,config_);
     }
@@ -2552,6 +2555,14 @@ register_for_compiled_execution(
             if(step.op!=SerialOp::attn_hyper_mix && step.op!=SerialOp::mlp_hyper_mix && step.op!=SerialOp::final_hyper_mix)continue;
             const auto& binding=compiled.bindings.bindings[index];
             if(binding.host_or_runtime_step || !binding.kernel_id)throw std::invalid_argument("HIP hyper-mix step has no kernel binding");
+            if(resources && resources->distributed_stage && !resources->distributed_stage->contains_step(step.id)) {
+                // Keep real global IDs registered for the dense source plan,
+                // but never resolve a nonlocal absent owner. The peer owning
+                // this step still performs the identical physical admission.
+                if(*binding.kernel_id!=candidate_id && *binding.kernel_id!=base_id)
+                    throw std::invalid_argument("nonlocal HC identity is outside the closed source family");
+                selected_ids.insert(*binding.kernel_id);continue;
+            }
             bool eligible=false;
             {
                 ExecutionDispatchContext context;context.execution_identity=compiled.execution_identity;context.step_id=step.id;context.op=step.op;context.resources=resources;

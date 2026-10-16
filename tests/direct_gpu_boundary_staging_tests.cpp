@@ -190,8 +190,66 @@ void canonical_peer_endpoint() {
     rejects([&] {(void)endpoint->stage_inbound(foreign.boundary,wrong);},"foreign canonical wire identity rejects before receive staging");
     expect(!foreign.gpu->copies && !foreign.receive->unpacks,"foreign endpoint metadata cannot start payload work");
 }
+// Synthetic metadata/copy contract only; these providers do not qualify a
+// physical link or mint the separate participant-only logical proof.
+void selected_payload_with_logical_positions() {
+    constexpr auto policy=NativeDistributedPositionDependencyPolicy::materialized_input_position_v1;
+    const auto add_positions=[](Fixture& f,std::uint32_t count) {
+        f.placement.steps.resize(3U+count);
+        for(std::uint32_t i=0;i<f.placement.steps.size();++i) {
+            auto& step=f.placement.steps[i];step.step_id=i;step.node=i<2U?0U:1U;step.remote=step.node!=0U;
+            step.op=i==0U?SerialOp::position_prepare:i==1U?SerialOp::mlp_inject:
+                i==2U?SerialOp::attn_hyper_mix:SerialOp::indexed_attention;
+        }
+        for(std::uint32_t i=0;i<count;++i)
+            f.placement.boundaries.push_back({100U+i,0U,3U+i,0U,1U,0U,{}});
+    };
+    const auto make=[&](Fixture& f,std::uint32_t node) {
+        return std::make_unique<DirectGpuBoundaryStaging>(f.placement,f.request,f.lease,
+            f.memory,f.gpu,f.receive,node,f.boundary.boundary_id,policy);
+    };
+    Fixture f;add_positions(f,64U);const auto id=f.placement.plan_identity;
+    auto sender=make(f,0U);const auto transfer=f.transfer();
+    expect(sender->stage_outbound(f.boundary,transfer).bytes==48U && f.gpu->copies==1U &&
+        f.placement.boundaries.size()==65U && f.placement.plan_identity==id &&
+        f.gpu->packed.model_plan_id==id,"selector transports one actual payload without rewriting canonical census or identity");
+    Fixture received;add_positions(received,2U);auto receiver=make(received,1U);
+    auto inbound=received.transfer();inbound.flow=classify_distributed_boundary_flow(received.placement,received.boundary,{},1U);
+    const auto view=receiver->stage_inbound(received.boundary,inbound);received.bind_receive(inbound,view);
+    receiver->consume_inbound(received.boundary,view);
+    expect(receiver->finish_inbound(received.boundary,inbound)->poll()==DistributedInboundCompletionStatus::complete &&
+        received.receive->unpacks==1U,"selected payload keeps actual endpoint1 receive and consumer completion");
+    Fixture no_positions;add_positions(no_positions,0U);
+    expect(make(no_positions,0U)->stage_outbound(no_positions.boundary,no_positions.transfer()).bytes==48U,
+        "explicit selected-data mode also permits a suffix with zero position dependencies");
+    for(unsigned fault=0;fault<9U;++fault) {
+        Fixture bad;add_positions(bad,1U);
+        std::uint64_t selector=bad.boundary.boundary_id;
+        auto chosen_policy=policy;
+        if(fault==0U) selector=0U;
+        if(fault==1U) chosen_policy=NativeDistributedPositionDependencyPolicy::reject;
+        if(fault==2U) ++selector;
+        if(fault==3U) bad.placement.boundaries.back().source_step=1U;
+        if(fault==4U) bad.placement.boundaries.back().destination_step=2U;
+        if(fault==5U) bad.placement.boundaries.back().payloads=bad.boundary.payloads;
+        if(fault==6U) bad.placement.boundaries.push_back(bad.boundary);
+        if(fault==7U) chosen_policy=static_cast<NativeDistributedPositionDependencyPolicy>(99);
+        if(fault==8U) bad.placement.boundaries.back().boundary_id=bad.boundary.boundary_id;
+        rejects([&] {DirectGpuBoundaryStaging invalid(bad.placement,bad.request,bad.lease,
+            bad.memory,bad.gpu,bad.receive,0U,selector,chosen_policy);},"invalid selector or logical dependency rejects upfront");
+        expect(!bad.gpu->copies && !bad.receive->unpacks,"invalid logical census must not enqueue data work");
+    }
+    Fixture strict;add_positions(strict,1U);
+    rejects([&] {(void)strict.make();},"legacy staging still rejects logical zero-byte edges");
+    Fixture excess;add_positions(excess,65U);
+    rejects([&] {(void)make(excess,0U);},"logical dependency count beyond64 rejects before payload work");
+    Fixture forbidden;add_positions(forbidden,1U);auto guarded=make(forbidden,0U);
+    rejects([&] {(void)guarded->stage_outbound(forbidden.placement.boundaries.back(),forbidden.transfer());},
+        "logical dependency cannot be submitted as zero-byte DMA");
+    expect(!forbidden.gpu->copies && !forbidden.receive->unpacks,"logical-only submission enqueues no data copy");
+}
 } // namespace
 int main() {
-    try { successful_paths(); failures(); canonical_peer_endpoint(); std::cout << "GPU boundary staging contract tests passed (synthetic GPU only).\n"; return 0; }
+    try { successful_paths(); failures(); canonical_peer_endpoint(); selected_payload_with_logical_positions(); std::cout << "GPU boundary staging contract tests passed (synthetic GPU only).\n"; return 0; }
     catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }
 }

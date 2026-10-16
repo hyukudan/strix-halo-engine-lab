@@ -1,4 +1,5 @@
 #include "strix/hip_distributed_stage.hpp"
+#include "strix/distributed_stage_resources.hpp"
 
 #include "strix/deferred_moe_status.hpp"
 #include "strix/dispatch_resources.hpp"
@@ -59,8 +60,16 @@ struct HipDistributedStage::Impl {
             !placement.executable || !placement.plan_identity || placement.compiled_execution_identity!=serial.execution_identity ||
             placement.steps.size()!=serial.execution.steps.size())
             throw std::invalid_argument("HIP distributed stage requires one complete eager C1 snapshot and contiguous placement");
+        if(!resources.model_manifest || !resources.model_weights || !resources.tensor_access ||
+            !resources.session_state_layout || !resources.session_state_memory || !resources.scratch)
+            throw std::invalid_argument("HIP distributed stage requires complete retained resource metadata");
         validate_serial_execution_io_plan(serial.execution,serial.io);
-        validate_execution_runtime_resources(serial.execution_identity,serial.arena,resources,0);
+        if(resources.distributed_stage) {
+            resources.distributed_stage->validate_source(serial,*resources.model_manifest,*resources.tensor_access);
+            if(resources.distributed_stage->local_node()!=placement.local_node || first!=resources.distributed_stage->first_step() || last!=resources.distributed_stage->last_step())
+                throw std::invalid_argument("capacity stage interval differs from its materialization scope");
+            validate_stage_execution_runtime_resources(serial.execution_identity,serial.arena,resources,0);
+        } else validate_execution_runtime_resources(serial.execution_identity,serial.arena,resources,0);
         std::vector<std::uint32_t> nodes;nodes.reserve(placement.steps.size());
         for(const auto& step:placement.steps) nodes.push_back(step.node);
         const auto derived=build_distributed_placement_plan(serial,*binding.model_manifest,*binding.tensor_access,nodes,placement.local_node);
@@ -79,6 +88,7 @@ struct HipDistributedStage::Impl {
             placement.tensor_access_identity!=resources.tensor_access->plan_identity)
             throw std::invalid_argument("HIP distributed stage placement provenance differs");
         for(const auto& weight:resources.model_weights->tensors) {
+            if(resources.distributed_stage && !resources.distributed_stage->requires_tensor(weight.tensor_index)) continue;
             const auto& tensor=resources.model_manifest->tensors[weight.tensor_index];
             const bool local_ple=tensor.role==TensorRole::ngram_table &&
                 tensor.residency==ResidencyPolicy::file_backed_candidate && weight.storage==RuntimeTensorStorage::file_mapped &&
@@ -104,16 +114,19 @@ struct HipDistributedStage::Impl {
             overlap(arena.arena_base,arena.arena_bytes,state.host_base,state.host_bytes) ||
             overlap(state.device_base,state.device_bytes,state.host_base,state.host_bytes))
             throw std::invalid_argument("HIP distributed stage scratch and persistent owners must be disjoint");
-        for(const auto& w:resources.model_weights->tensors)
+        for(const auto& w:resources.model_weights->tensors) {
+            if(resources.distributed_stage && !resources.distributed_stage->requires_tensor(w.tensor_index)) continue;
             if(overlap(arena.arena_base,arena.arena_bytes,w.address,w.bytes) ||
                 overlap(state.device_base,state.device_bytes,w.address,w.bytes) ||
                 overlap(state.host_base,state.host_bytes,w.address,w.bytes))
                 throw std::invalid_argument("HIP distributed stage writable owner aliases model weights");
+        }
         validate_scope();
-        identities=build_runtime_execution_identities(serial.execution_identity,serial.arena,resources);
+        identities=resources.distributed_stage?build_stage_runtime_execution_identities(serial.execution_identity,serial.arena,resources):
+            build_runtime_execution_identities(serial.execution_identity,serial.arena,resources);
         state_layout=*resources.session_state_layout;
         metadata=std::make_unique<const PreparedTensorViews>(serial.execution_identity,serial.execution,
-            *resources.model_manifest,*resources.model_weights,*resources.tensor_access,owner);
+            *resources.model_manifest,*resources.model_weights,*resources.tensor_access,owner,resources.distributed_stage);
         catalog.register_for_compiled_execution(serial,registry,&resources);
         launch=compile_launch_plan(serial,registry);
         dispatcher=std::make_unique<DirectLaunchDispatcher>(launch);
@@ -153,12 +166,15 @@ struct HipDistributedStage::Impl {
             disjoint(resources.scratch->arena_base,resources.scratch->arena_bytes);
             disjoint(resources.session_state_memory->device_base,resources.session_state_memory->device_bytes);
             disjoint(resources.session_state_memory->host_base,resources.session_state_memory->host_bytes);
-            for(const auto& w:resources.model_weights->tensors) disjoint(w.address,w.bytes);
+            for(const auto& w:resources.model_weights->tensors)
+                if(!resources.distributed_stage || resources.distributed_stage->requires_tensor(w.tensor_index)) disjoint(w.address,w.bytes);
         }
     }
     void validate_metadata() const {
+        if(resources.distributed_stage) resources.distributed_stage->validate_source(serial,*resources.model_manifest,*resources.tensor_access);
         metadata->validate_source_metadata(*resources.model_manifest,*resources.model_weights,*resources.tensor_access);
-        const auto now=build_runtime_execution_identities(serial.execution_identity,serial.arena,resources);
+        const auto now=resources.distributed_stage?build_stage_runtime_execution_identities(serial.execution_identity,serial.arena,resources):
+            build_runtime_execution_identities(serial.execution_identity,serial.arena,resources);
         if(now.compatibility_identity!=identities.compatibility_identity || now.binding_identity!=identities.binding_identity)
             throw std::invalid_argument("HIP distributed stage resource binding changed");
         const auto& current=*resources.session_state_layout;
@@ -216,6 +232,7 @@ struct HipDistributedStage::Impl {
             c.memory=resources.scratch;c.resources=&resources;c.session_state_layout=resources.session_state_layout;
             c.session_state_memory=resources.session_state_memory;c.reads_state=step.reads_state;c.writes_state=step.writes_state;
             c.position=value.position;c.input_token_id=value.input_token;
+            if(resources.distributed_stage) c.prepared_tensor_views=metadata.get();
             if(!binding.host_or_runtime_step) c.kernel_id=*binding.kernel_id;
             const auto& l=launch.steps[i];
             if(l.step_id!=step.id || l.op!=step.op || l.runtime_step!=binding.host_or_runtime_step ||

@@ -16,6 +16,7 @@ enum class DistributedControlFrameKind : std::uint16_t {
     boundary_transfer = 3,
     direct_gpu_stream = 4,
     token_transaction = 5,
+    greedy_control = 6,
 };
 
 // Explicit dedicated-channel extension: v2 outer framing is unchanged; this

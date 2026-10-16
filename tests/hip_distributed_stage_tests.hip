@@ -2,6 +2,8 @@
 // distributed token commit, latency measurement or sharded-memory claim.
 #include "strix/hip_distributed_stage.hpp"
 #include "strix/hip_distributed_transaction.hpp"
+#include "strix/distributed_stage_resources.hpp"
+#include "strix/prepared_tensor_views.hpp"
 #include "strix/deferred_moe_status.hpp"
 #include "strix/hip_model_residency.hpp"
 #include "strix/hip_runtime_allocator.hpp"
@@ -22,6 +24,7 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -264,6 +267,9 @@ void transaction_component(const std::shared_ptr<Owner>& first,const strix::Seri
         p1.observe_peer(commit);
         const auto ack0=p0.acknowledge_commit();p1.observe_peer(ack0);
         require(!p0.committed_frontier() && !p1.committed_frontier(),"one peer ACK published global commit");
+        bool early_position_proof=false;
+        try {(void)p0.mint_position_dependency_completion();} catch(const std::logic_error&) {early_position_proof=true;}
+        require(early_position_proof,"one ACK minted a logical position completion");
         const auto ack1=p1.acknowledge_commit();p0.observe_peer(ack1);
         const auto done0=p0.committed_frontier(),done1=p1.committed_frontier();
         require(done0 && done1 && done0->decision_identity==done1->decision_identity &&
@@ -272,6 +278,22 @@ void transaction_component(const std::shared_ptr<Owner>& first,const strix::Seri
             done0->local_state[1].generations==ready1.receipt.local_state.generations &&
             session0.health==strix::SerialSessionHealth::poisoned && session1.health==strix::SerialSessionHealth::poisoned,
             "native global frontier did not require both receipts or retagged a partial peer as a healthy serial session");
+        // Native local D2D execution + real two-ACK protocol, logical proof
+        // only: this does NOT mint transport/data-retirement authority.
+        const auto logical_count=std::count_if(plan.boundaries.begin(),plan.boundaries.end(),
+            [](const auto& boundary){return boundary.payload_bytes==0U;});
+        if(logical_count!=0) {
+            auto logical0=p0.mint_position_dependency_completion();
+            auto logical1=p1.mint_position_dependency_completion();
+            (void)logical0;(void)logical1;
+            bool duplicate=false;
+            try {(void)p0.mint_position_dependency_completion();} catch(const std::logic_error&) {duplicate=true;}
+            require(duplicate,"duplicate logical position capability was minted for one token");
+        } else {
+            bool empty=false;
+            try {(void)p0.mint_position_dependency_completion();} catch(const std::invalid_argument&) {empty=true;}
+            require(empty,"a plan without logical dependencies minted a nonempty position capability");
+        }
         const auto sequence0=p0.frontier(),sequence1=p1.frontier();
         require(sequence0 && sequence1 && sequence0->commit().history_identity==done0->history_identity &&
             sequence1->commit().local_state[1].generations==ready1.receipt.local_state.generations &&
@@ -333,6 +355,50 @@ void transaction_component(const std::shared_ptr<Owner>& first,const strix::Seri
     // This local component exercised REAL target callbacks and all7 snapshot
     // transfers. There is no network, distributed commit or continuation claim.
 }
+// Metadata/scoped-lookup fixture over genuine existing resident owners. It
+// does not pretend those already-full owners demonstrate selected-allocation
+// capacity; the production factory owns that separate materialization path.
+void stage_resource_metadata_component(const std::shared_ptr<Owner>& o,std::uint32_t cut) {
+    const auto canonical=placement(*o,cut);
+    for(std::uint32_t node=0;node<2U;++node) {
+        const auto plan=strix::DistributedStageResourcePlan::derive(o->serial,o->manifest,o->access,canonical,node);
+        plan.validate_source(o->serial,o->manifest,o->access);
+        require(plan.first_step()==(node?cut+1U:0U) && plan.last_step()==(node?o->serial.execution.steps.size()-1U:cut),
+            "stage resource scope does not match its actual contiguous interval");
+        std::vector<bool> expected(o->manifest.tensors.size());
+        for(const auto& access:o->access.accesses) if(plan.contains_step(access.step_id))
+            for(const auto index:access.tensor_indices) expected[index]=true;
+        auto binding=*o->resources.model_weights;
+        std::uint64_t bytes=0;std::optional<std::uint32_t> local,remote;
+        for(std::size_t i=0;i<binding.tensors.size();++i) {
+            require(plan.requires_tensor(static_cast<std::uint32_t>(i))==expected[i],"stage mask differs from actual per-step tensor accesses");
+            if(expected[i]) {local=static_cast<std::uint32_t>(i);bytes+=o->manifest.tensors[i].byte_size;}
+            else {remote=static_cast<std::uint32_t>(i);binding.tensors[i]={static_cast<std::uint32_t>(i),
+                strix::RuntimeTensorStorage::remote,0,o->manifest.tensors[i].byte_size,0,1U-node};}
+        }
+        require(local && remote && bytes==plan.required_weight_bytes(),"stage selected-byte accounting or absent weights differ");
+        strix::validate_stage_model_runtime_binding(plan,o->manifest,binding);
+        bool rejected=false;
+        try {strix::validate_model_runtime_binding(o->manifest,binding);} catch(const std::invalid_argument&) {rejected=true;}
+        require(rejected,"ordinary whole-model admission accepted scoped absent weights");
+        strix::PreparedTensorViews views(o->serial.execution_identity,o->serial.execution,o->manifest,binding,o->access,o,&plan);
+        views.validate_stage_scope(&plan,plan.first_step());
+        require(views.tensor(o->serial.execution_identity,*local).address==binding.tensors[*local].address,
+            "prepared stage lookup lost the actual retained local tensor");
+        rejected=false;try {(void)views.tensor(o->serial.execution_identity,*remote);} catch(const std::invalid_argument&) {rejected=true;}
+        require(rejected,"prepared stage lookup resolved an absent remote tensor");
+        auto mutated=binding;mutated.tensors[*local].allocation_generation=0;
+        rejected=false;try {strix::validate_stage_model_runtime_binding(plan,o->manifest,mutated);} catch(const std::invalid_argument&) {rejected=true;}
+        require(rejected,"scoped binding accepted a missing actual local allocation generation");
+        mutated=binding;mutated.tensors[*remote].address=1;
+        rejected=false;try {strix::validate_stage_model_runtime_binding(plan,o->manifest,mutated);} catch(const std::invalid_argument&) {rejected=true;}
+        require(rejected,"scoped binding accepted a fabricated remote backing address");
+    }
+    auto changed=canonical;changed.boundaries.front().payload_bytes^=1U;
+    bool rejected=false;try {(void)strix::DistributedStageResourcePlan::derive(o->serial,o->manifest,o->access,changed,0U);}
+    catch(const std::invalid_argument&) {rejected=true;}
+    require(rejected,"stage resource admission trusted a mutated canonical boundary");
+}
 int run(const std::filesystem::path& model,const std::string& expected,std::uint32_t input,const std::filesystem::path& output) {
     require(!std::filesystem::exists(output),"output must be fresh");
     require(digest(model)==expected,"model SHA before differs");
@@ -341,6 +407,7 @@ int run(const std::filesystem::path& model,const std::string& expected,std::uint
         return s.op==strix::SerialOp::mlp_inject && s.layer==0U;
     });
     require(found!=o->serial.execution.steps.end(),"no layer0 stage boundary");const auto cut=found->id;
+    stage_resource_metadata_component(o,cut);
     auto catalog=std::make_shared<strix::HipLauncherCatalog>(o->model,o->config);strix::ExecutionLauncherRegistry registry;
     catalog->register_for_compiled_execution(o->serial,registry,&o->resources);
     const auto launch=strix::compile_launch_plan(o->serial,registry);

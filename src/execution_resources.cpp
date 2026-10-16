@@ -1,4 +1,5 @@
 #include "strix/execution_resources.hpp"
+#include "strix/distributed_stage_resources.hpp"
 
 #include <stdexcept>
 
@@ -38,11 +39,11 @@ void hash_ptr(
 
 }  // namespace
 
-void validate_execution_runtime_resources(
+static void validate_resources_impl(
     std::uint64_t compiled_execution_identity,
     const ExecutionArenaPlan& arena,
     const ExecutionRuntimeResources& resources,
-    std::uint64_t position) {
+    std::uint64_t position,bool scoped) {
     if (compiled_execution_identity == 0) {
         throw std::invalid_argument(
             "compiled execution identity must be non-zero");
@@ -61,9 +62,15 @@ void validate_execution_runtime_resources(
         compiled_execution_identity,
         arena,
         *resources.scratch);
-    validate_model_runtime_binding(
-        *resources.model_manifest,
-        *resources.model_weights);
+    if(scoped) {
+        if(!resources.distributed_stage || resources.distributed_stage->execution_identity()!=compiled_execution_identity ||
+            resources.distributed_stage->access_identity()!=resources.tensor_access->plan_identity)
+            throw std::invalid_argument("stage runtime resource scope differs");
+        validate_stage_model_runtime_binding(*resources.distributed_stage,*resources.model_manifest,*resources.model_weights);
+    } else {
+        if(resources.distributed_stage) throw std::invalid_argument("ordinary execution cannot consume stage-local resources");
+        validate_model_runtime_binding(*resources.model_manifest,*resources.model_weights);
+    }
     if (resources.tensor_access->manifest_layout_identity !=
             resources.model_manifest->layout_identity ||
         resources.tensor_access->plan_identity == 0) {
@@ -99,16 +106,24 @@ void validate_execution_runtime_resources(
     }
 }
 
-RuntimeExecutionIdentities
-build_runtime_execution_identities(
+void validate_execution_runtime_resources(std::uint64_t identity,const ExecutionArenaPlan& arena,
+    const ExecutionRuntimeResources& resources,std::uint64_t position) {
+    validate_resources_impl(identity,arena,resources,position,false);
+}
+void validate_stage_execution_runtime_resources(std::uint64_t identity,const ExecutionArenaPlan& arena,
+    const ExecutionRuntimeResources& resources,std::uint64_t position) {
+    validate_resources_impl(identity,arena,resources,position,true);
+}
+static RuntimeExecutionIdentities
+build_identities_impl(
     std::uint64_t compiled_execution_identity,
     const ExecutionArenaPlan& arena,
-    const ExecutionRuntimeResources& resources) {
-    validate_execution_runtime_resources(
+    const ExecutionRuntimeResources& resources,bool scoped) {
+    validate_resources_impl(
         compiled_execution_identity,
         arena,
         resources,
-        0);
+        0,scoped);
 
     RuntimeExecutionIdentities identities;
 
@@ -140,6 +155,7 @@ build_runtime_execution_identities(
                   *resources.ple_hash_contract)
             : 0ULL);
 
+    if(scoped) hash_u64(compatibility,resources.distributed_stage->identity());
     if (compatibility == 0) {
         throw std::logic_error(
             "runtime compatibility identity must be non-zero");
@@ -208,4 +224,8 @@ build_runtime_execution_identities(
     return identities;
 }
 
+RuntimeExecutionIdentities build_runtime_execution_identities(std::uint64_t id,const ExecutionArenaPlan& arena,
+    const ExecutionRuntimeResources& resources) {return build_identities_impl(id,arena,resources,false);}
+RuntimeExecutionIdentities build_stage_runtime_execution_identities(std::uint64_t id,const ExecutionArenaPlan& arena,
+    const ExecutionRuntimeResources& resources) {return build_identities_impl(id,arena,resources,true);}
 }  // namespace strix

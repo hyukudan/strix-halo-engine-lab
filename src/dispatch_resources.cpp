@@ -1,4 +1,6 @@
 #include "strix/dispatch_resources.hpp"
+#include "strix/distributed_stage_resources.hpp"
+#include <algorithm>
 #include "strix/prepared_tensor_views.hpp"
 #include "strix/prepared_arena_views.hpp"
 
@@ -50,6 +52,7 @@ const PreparedTensorViews* prepared_views(const ExecutionDispatchContext& contex
     if (!context.prepared_tensor_views) return nullptr;
     if (!context.resources)
         throw std::invalid_argument("prepared tensor lookup requires its source resources");
+    context.prepared_tensor_views->validate_stage_scope(context.resources->distributed_stage,context.step_id);
     context.prepared_tensor_views->validate_source_handles(context.resources->model_manifest,
         context.resources->model_weights, context.resources->tensor_access);
     return context.prepared_tensor_views;
@@ -205,8 +208,12 @@ const RuntimeTensorBinding& resolve_dispatch_tensor(
         model_manifest(context);
     const auto& weights =
         model_weights(context);
-    validate_model_runtime_binding(
-        manifest, weights);
+    if(context.resources->distributed_stage) {
+        const auto& scope=*context.resources->distributed_stage;
+        if(context.execution_identity!=scope.execution_identity() || !scope.contains_step(context.step_id) || !scope.requires_tensor(tensor_index))
+            throw std::invalid_argument("dispatch tensor is outside the local stage scope");
+        validate_stage_model_runtime_binding(scope,manifest,weights);
+    } else validate_model_runtime_binding(manifest, weights);
 
     const auto* tensor =
         find_runtime_tensor_binding(
@@ -228,11 +235,13 @@ const RuntimeTensorBinding& resolve_dispatch_tensor(
     const auto& weights =
         model_weights(context);
 
-    const auto* tensor =
-        find_runtime_tensor_binding(
-            manifest,
-            weights,
-            tensor_name);
+    const RuntimeTensorBinding* tensor=nullptr;
+    if(context.resources->distributed_stage) {
+        const auto found=std::find_if(manifest.tensors.begin(),manifest.tensors.end(),[&](const auto& t){return t.name==tensor_name;});
+        if(found==manifest.tensors.end()) throw std::invalid_argument("dispatch stage tensor name is absent");
+        return resolve_dispatch_tensor(context,static_cast<std::uint32_t>(found-manifest.tensors.begin()));
+    }
+    tensor=find_runtime_tensor_binding(manifest,weights,tensor_name);
     if (tensor == nullptr) {
         throw std::invalid_argument(
             "dispatch tensor name is not present in manifest");

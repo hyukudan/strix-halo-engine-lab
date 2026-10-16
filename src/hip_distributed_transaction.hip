@@ -1,4 +1,5 @@
 #include "strix/hip_distributed_transaction.hpp"
+#include "strix/hip_distributed_stage_resources.hpp"
 #include "strix/deferred_moe_status.hpp"
 #include "strix/hip_session_snapshot_transfer.hpp"
 #include "strix/hip_setup_quiescence.hpp"
@@ -50,7 +51,8 @@ struct HipDistributedTokenParticipant::Impl {
     ModelContract model;
     HipLauncherCatalogConfig config;
     ExecutionRuntimeResources resources;
-    SerialSessionContext& ordinary;
+    SerialSessionContext* ordinary;
+    std::shared_ptr<HipDistributedStageResources> stage_owner;
     SerialSessionContext saved;
     HipLaunchContext scope;
     std::uint32_t node;
@@ -67,15 +69,17 @@ struct HipDistributedTokenParticipant::Impl {
     HipSessionSnapshotTransferBackend transfer;
     std::unique_ptr<HipDistributedStage> stage;
     bool prepared=false,ready=false,restored=false,native_failed=false,quarantined=false,rollback_published=false,position_materialized=false;
+    bool position_completion_issued=false;
     std::uint64_t last_sent=0;
     std::optional<DistributedTokenMessage> last_emitted;
 
     Impl(CompiledSerialExecution source,DistributedPlacementPlan placement,ModelContract contract,HipLauncherCatalogConfig launch_config,
-        const ExecutionRuntimeResources& r,SerialSessionContext& session,HipLaunchContext native,std::shared_ptr<const void> retained,
+        const ExecutionRuntimeResources& r,SerialSessionContext* session,HipLaunchContext native,std::shared_ptr<const void> retained,
         RuntimeMemoryAllocator& allocator,AllocationGenerationSource& generations,DistributedTokenBinding binding,
-        std::uint32_t local_node,std::uint64_t budget)
+        std::uint32_t local_node,std::uint64_t budget,std::shared_ptr<HipDistributedStageResources> scoped={})
         :owner(std::move(retained)),serial(std::move(source)),plan(std::move(placement)),model(std::move(contract)),
-         config(std::move(launch_config)),resources(r),ordinary(session),saved(session),scope(native),node(local_node),
+         config(std::move(launch_config)),resources(r),ordinary(session),stage_owner(std::move(scoped)),
+         saved(session?*session:SerialSessionContext{}),scope(native),node(local_node),
          protocol(serial,plan,checked_manifest(r),checked_access(r),std::move(binding)) {
         if(!owner || node>1U || !budget || !resources.model_manifest || !resources.model_weights || !resources.tensor_access ||
             !resources.session_state_layout || !resources.session_state_memory || !resources.scratch)
@@ -86,23 +90,31 @@ struct HipDistributedTokenParticipant::Impl {
             position_word.bytes>std::numeric_limits<std::uintptr_t>::max()-position_word.address)
             throw std::invalid_argument("distributed transaction requires a complete bounded host input-position word");
         const auto& b=protocol.binding();const auto& peer=b.peers[node];
-        identities=build_runtime_execution_identities(serial.execution_identity,serial.arena,resources);
-        if(ordinary.health!=SerialSessionHealth::ready || ordinary.arithmetic_lineage.tainted ||
-            !arithmetic_lineage_valid(ordinary.arithmetic_lineage,b.position) ||
-            ordinary.arithmetic_lineage.history_identity!=b.previous_history_identity ||
-            ordinary.execution_identity!=serial.execution_identity || ordinary.next_position!=b.position ||
-            ordinary.committed_tokens!=b.committed_tokens || ordinary.runtime_compatibility_identity!=identities.compatibility_identity ||
-            ordinary.state_layout_identity!=resources.session_state_layout->layout_identity ||
-            peer.runtime_compatibility_identity!=identities.compatibility_identity || peer.state_layout_identity!=ordinary.state_layout_identity ||
+        identities=resources.distributed_stage?build_stage_runtime_execution_identities(serial.execution_identity,serial.arena,resources):
+            build_runtime_execution_identities(serial.execution_identity,serial.arena,resources);
+        if(stage_owner) {
+            if(ordinary || !resources.distributed_stage || node!=stage_owner->plan().local_node())
+                throw std::invalid_argument("capacity participant has mismatched typed owners");
+            stage_owner->validate_initial_binding(b);
+        } else {
+            if(!ordinary || resources.distributed_stage) throw std::invalid_argument("ordinary participant requires the original complete serial anchor");
+        if(ordinary->health!=SerialSessionHealth::ready || ordinary->arithmetic_lineage.tainted ||
+            !arithmetic_lineage_valid(ordinary->arithmetic_lineage,b.position) ||
+            ordinary->arithmetic_lineage.history_identity!=b.previous_history_identity ||
+            ordinary->execution_identity!=serial.execution_identity || ordinary->next_position!=b.position ||
+            ordinary->committed_tokens!=b.committed_tokens || ordinary->runtime_compatibility_identity!=identities.compatibility_identity ||
+            ordinary->state_layout_identity!=resources.session_state_layout->layout_identity ||
+            peer.runtime_compatibility_identity!=identities.compatibility_identity || peer.state_layout_identity!=ordinary->state_layout_identity ||
             peer.context_capacity!=resources.session_state_layout->context_tokens ||
-            !transaction_state_equal(ordinary.state,peer.initial_state) ||
+            !transaction_state_equal(ordinary->state,peer.initial_state) ||
             resources.model_weights->model_content_identity!=b.model_content_identity)
             throw std::invalid_argument("distributed native transaction does not bind the original physical frontier");
+        }
         metadata=std::make_unique<const PreparedTensorViews>(serial.execution_identity,serial.execution,
-            *resources.model_manifest,*resources.model_weights,*resources.tensor_access,owner);
+            *resources.model_manifest,*resources.model_weights,*resources.tensor_access,owner,resources.distributed_stage);
         SerialSessionSnapshotRequest request;request.compiled_execution_identity=serial.execution_identity;
         request.runtime_compatibility_identity=identities.compatibility_identity;request.next_position=b.position;
-        request.committed_tokens=b.committed_tokens;request.state=ordinary.state;
+        request.committed_tokens=b.committed_tokens;request.state=b.peers[node].initial_state;
         snapshot=build_serial_session_snapshot_plan(model,*resources.session_state_layout,request);
         if(snapshot.ranges.size()!=7U || snapshot.device_bytes>std::numeric_limits<std::uint64_t>::max()-snapshot.host_bytes ||
             snapshot.device_bytes+snapshot.host_bytes>budget)
@@ -130,7 +142,8 @@ struct HipDistributedTokenParticipant::Impl {
             require_disjoint(section.first,section.second,resources.scratch->arena_base,resources.scratch->arena_bytes);
             require_disjoint(section.first,section.second,scope.deferred_moe_status.arena_base,scope.deferred_moe_status.arena_bytes);
             for(const auto& weight:resources.model_weights->tensors)
-                require_disjoint(section.first,section.second,weight.address,weight.bytes);
+                if(!resources.distributed_stage || resources.distributed_stage->requires_tensor(weight.tensor_index))
+                    require_disjoint(section.first,section.second,weight.address,weight.bytes);
         }
         std::vector<std::uint32_t> nodes;for(const auto& step:plan.steps) nodes.push_back(step.node);
         const auto local_plan=build_distributed_placement_plan(serial,*resources.model_manifest,*resources.tensor_access,nodes,node);
@@ -153,25 +166,32 @@ struct HipDistributedTokenParticipant::Impl {
     }
     void validate() const {
         metadata->validate_source_metadata(*resources.model_manifest,*resources.model_weights,*resources.tensor_access);
-        if(!transaction_layout_equal(retained_layout,*resources.session_state_layout) ||
-            ordinary.execution_identity!=saved.execution_identity || ordinary.next_position!=saved.next_position ||
-            ordinary.committed_tokens!=saved.committed_tokens || ordinary.state_layout_identity!=saved.state_layout_identity ||
-            ordinary.runtime_compatibility_identity!=saved.runtime_compatibility_identity ||
-            !transaction_state_equal(ordinary.state,saved.state) ||
-            ordinary.arithmetic_lineage.intervals!=saved.arithmetic_lineage.intervals ||
-            ordinary.arithmetic_lineage.history_identity!=saved.arithmetic_lineage.history_identity ||
-            ordinary.health!=(quarantined?SerialSessionHealth::poisoned:saved.health) ||
-            ordinary.arithmetic_lineage.tainted!=(quarantined?true:saved.arithmetic_lineage.tainted))
+        if(stage_owner) {
+            stage_owner->validate();
+            if(!transaction_layout_equal(retained_layout,*resources.session_state_layout))
+                throw std::invalid_argument("capacity participant full-state layout changed");
+        } else {
+        if(!transaction_layout_equal(retained_layout,*resources.session_state_layout) || !ordinary ||
+            ordinary->execution_identity!=saved.execution_identity || ordinary->next_position!=saved.next_position ||
+            ordinary->committed_tokens!=saved.committed_tokens || ordinary->state_layout_identity!=saved.state_layout_identity ||
+            ordinary->runtime_compatibility_identity!=saved.runtime_compatibility_identity ||
+            !transaction_state_equal(ordinary->state,saved.state) ||
+            ordinary->arithmetic_lineage.intervals!=saved.arithmetic_lineage.intervals ||
+            ordinary->arithmetic_lineage.history_identity!=saved.arithmetic_lineage.history_identity ||
+            ordinary->health!=(quarantined?SerialSessionHealth::poisoned:saved.health) ||
+            ordinary->arithmetic_lineage.tainted!=(quarantined?true:saved.arithmetic_lineage.tainted))
             throw std::invalid_argument("distributed transaction layout or quarantined session frontier changed");
+        }
         const auto current_word=resolve_session_state(*resources.session_state_layout,*resources.session_state_memory,SessionStateComponent::position_history);
         if(current_word.address!=position_word.address || current_word.bytes!=position_word.bytes ||
             current_word.storage!=position_word.storage || current_word.allocation_generation!=position_word.allocation_generation)
             throw std::invalid_argument("distributed transaction input-position owner changed");
-        const auto now=build_runtime_execution_identities(serial.execution_identity,serial.arena,resources);
+        const auto now=resources.distributed_stage?build_stage_runtime_execution_identities(serial.execution_identity,serial.arena,resources):
+            build_runtime_execution_identities(serial.execution_identity,serial.arena,resources);
         if(now.compatibility_identity!=identities.compatibility_identity || now.binding_identity!=identities.binding_identity)
             throw std::invalid_argument("distributed transaction physical owner binding changed");
     }
-    void quarantine() noexcept {ordinary.health=SerialSessionHealth::poisoned;ordinary.arithmetic_lineage.tainted=true;quarantined=true;}
+    void quarantine() noexcept {if(ordinary) {ordinary->health=SerialSessionHealth::poisoned;ordinary->arithmetic_lineage.tainted=true;}quarantined=true;}
     void uncertain() noexcept {
         protocol.transport_failed();quarantine();
         if(stage) stage->abort();
@@ -190,23 +210,39 @@ HipDistributedTokenParticipant::HipDistributedTokenParticipant(CompiledSerialExe
     ModelContract model,HipLauncherCatalogConfig config,const ExecutionRuntimeResources& resources,SerialSessionContext& session,
     HipLaunchContext scope,std::shared_ptr<const void> owner,RuntimeMemoryAllocator& allocator,AllocationGenerationSource& generations,
     DistributedTokenBinding binding,std::uint32_t node,std::uint64_t budget)
-    :impl_(std::make_unique<Impl>(std::move(serial),std::move(plan),std::move(model),std::move(config),resources,session,scope,
+    :impl_(std::make_unique<Impl>(std::move(serial),std::move(plan),std::move(model),std::move(config),resources,&session,scope,
         std::move(owner),allocator,generations,std::move(binding),node,budget)) {}
+HipDistributedTokenParticipant::HipDistributedTokenParticipant(std::shared_ptr<HipDistributedStageResources> owner,
+    DistributedTokenBinding binding) {
+    if(!owner) throw std::invalid_argument("capacity participant requires the actual stage resource owner");
+    owner->validate_initial_binding(binding);
+    impl_=std::make_unique<Impl>(owner->serial(),owner->plan().canonical_placement(),owner->model(),owner->config(),
+        owner->resources(),nullptr,owner->scope(),owner,owner->snapshot_allocator(),owner->generations(),
+        std::move(binding),owner->plan().local_node(),owner->snapshot_budget_bytes(),owner);
+    owner->claim_initial(impl_->protocol.binding());
+}
 HipDistributedTokenParticipant::~HipDistributedTokenParticipant()=default;
 void HipDistributedTokenParticipant::begin_next(std::uint32_t input,std::uint64_t generation,
     NativeDistributedTokenRetirement&& retirement) {
     auto& s=*impl_;
     const auto phase=s.protocol.phase();
     if(s.native_failed || (phase!=DistributedTokenPhase::committed &&
-        !(phase==DistributedTokenPhase::rolled_back && s.rollback_published && s.sequence)))
+        !(phase==DistributedTokenPhase::rolled_back && s.rollback_published && (s.sequence || s.stage_owner))))
         throw std::logic_error("distributed continuation requires a committed or bilaterally restored distributed frontier");
     s.original();s.validate();
     const auto& current=s.protocol.binding();
     if(current.generation==std::numeric_limits<std::uint64_t>::max() || generation!=current.generation+1U)
         throw std::invalid_argument("distributed continuation generation must advance exactly once");
     auto frontier=phase==DistributedTokenPhase::committed?s.protocol.committed_sequence_frontier():s.sequence;
-    if(!frontier) throw std::logic_error("distributed continuation has no two-ACK lineage");
-    auto binding=frontier->derive_next_binding(input,generation);
+    if(!frontier && !(s.stage_owner && phase==DistributedTokenPhase::rolled_back))
+        throw std::logic_error("distributed continuation has no admitted typed frontier");
+    auto binding=frontier?frontier->derive_next_binding(input,generation):current;
+    if(!frontier) {
+        // Healthy initial scoped rollback returns to the genuine initialized
+        // p0 seed, never an ordinary serial session. The attempt still advances.
+        if(input>=s.serial.vocab_size) throw std::invalid_argument("distributed retry input exceeds vocabulary");
+        binding.input_token=input;binding.generation=generation;
+    }
     DistributedTokenTransaction next(s.serial,s.plan,*s.resources.model_manifest,*s.resources.tensor_access,binding);
     SerialSessionSnapshotRequest request;
     request.compiled_execution_identity=s.serial.execution_identity;
@@ -255,11 +291,47 @@ void HipDistributedTokenParticipant::begin_next(std::uint32_t input,std::uint64_
     s.snapshot=std::move(snapshot);s.restore=std::move(restore);s.active_snapshot_memory=memory;
     if(replacement) s.stage=std::move(replacement);
     s.prepared=false;s.ready=false;s.restored=false;s.rollback_published=false;s.position_materialized=false;
+    s.position_completion_issued=false;
     s.last_sent=0;s.last_emitted.reset();
 }
 const DistributedTokenBinding& HipDistributedTokenParticipant::current_binding() const noexcept {return impl_->protocol.binding();}
 std::uint64_t HipDistributedTokenParticipant::binding_identity() const noexcept {return impl_->protocol.binding_identity();}
 std::uint32_t HipDistributedTokenParticipant::local_node() const noexcept {return impl_->node;}
+NativeDistributedPositionCompletion HipDistributedTokenParticipant::mint_position_dependency_completion() {
+    auto& s=*impl_;
+    s.original();s.validate();
+    const auto committed=s.protocol.committed_frontier();
+    if(s.position_completion_issued || !s.ready || s.native_failed || !committed ||
+        s.protocol.phase()!=DistributedTokenPhase::committed || !s.protocol.both_ready() ||
+        committed->binding_identity!=s.protocol.binding_identity() ||
+        !committed->decision_identity || committed->decision_identity!=s.protocol.decision_identity())
+        throw std::logic_error("distributed position completion requires an unissued two-ACK native commit");
+    std::uint64_t position=0;
+    std::memcpy(&position,reinterpret_cast<const void*>(s.position_word.address),sizeof(position));
+    const auto& b=s.protocol.binding();
+    if(position!=b.position)
+        throw std::invalid_argument("distributed position completion word differs from committed input position");
+    NativeDistributedPositionCompletion proof;
+    for(const auto& boundary:s.plan.boundaries) {
+        if(boundary.payload_bytes!=0U) continue;
+        if(!is_materialized_input_position_dependency(s.plan,boundary) ||
+            proof.count_==NativeDistributedPositionCompletion::maximum_dependencies)
+            throw std::invalid_argument("distributed position completion has unsupported logical dependencies");
+        for(std::size_t i=0;i<proof.count_;++i)
+            if(proof.boundaries_[i]==boundary.boundary_id)
+                throw std::invalid_argument("distributed position completion has duplicate logical dependencies");
+        proof.boundaries_[proof.count_++]=boundary.boundary_id;
+    }
+    if(proof.count_==0U)
+        throw std::invalid_argument("distributed position completion has no logical dependencies");
+    proof.request_={b.connection_epoch,b.request_id,b.generation,b.boundary_dtype_id};
+    proof.binding_=s.protocol.binding_identity();proof.placement_=b.placement_plan_identity;
+    proof.decision_=committed->decision_identity;proof.position_=b.position;proof.node_=s.node;
+    proof.owner_=s.owner;
+    proof.valid_=true;
+    s.position_completion_issued=true;
+    return proof;
+}
 std::optional<DistributedSequenceFrontier> HipDistributedTokenParticipant::frontier() const {
     if(impl_->native_failed || impl_->protocol.phase()==DistributedTokenPhase::in_doubt) return std::nullopt;
     const auto committed=impl_->protocol.committed_sequence_frontier();
@@ -368,9 +440,9 @@ void HipDistributedTokenParticipant::finalize_rollback() {
                 check_deferred_moe_status(record);
             }
         });
-        if(!s.sequence) {
+        if(!s.sequence && s.ordinary) {
             // Only the initial, never-distributed serial anchor is eligible.
-            s.ordinary=std::move(s.saved);s.quarantined=false;
+            *s.ordinary=std::move(s.saved);s.quarantined=false;
         }
         // With a previous distributed commit the typed sequence stays intact;
         // all seven local bytes were restored but ordinary remains quarantined.

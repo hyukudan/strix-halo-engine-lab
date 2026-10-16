@@ -107,6 +107,8 @@ add_library(strix_core STATIC
     src/distributed_data_plane.cpp
     src/distributed_native_backend.cpp
     src/distributed_token_transaction.cpp
+    src/distributed_stage_resources.cpp
+    src/distributed_greedy_control.cpp
     src/distributed_remote_control.cpp
     src/distributed_control_wire.cpp
     src/distributed_control_server.cpp
@@ -805,6 +807,11 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-execution-resources-tests)
     add_test(NAME strix-execution-resources-tests COMMAND strix-execution-resources-tests)
 
+    add_executable(strix-distributed-greedy-control-tests tests/distributed_greedy_control_tests.cpp)
+    target_link_libraries(strix-distributed-greedy-control-tests PRIVATE strix_core)
+    strix_target_warnings(strix-distributed-greedy-control-tests)
+    add_test(NAME strix-distributed-greedy-control-tests COMMAND strix-distributed-greedy-control-tests)
+
     add_executable(strix-distributed-token-transaction-tests tests/distributed_token_transaction_tests.cpp)
     target_link_libraries(strix-distributed-token-transaction-tests PRIVATE strix_core)
     strix_target_warnings(strix-distributed-token-transaction-tests)
@@ -1266,6 +1273,8 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         src/hip_distributed_stage.hip
         src/hip_distributed_transaction.hip
         src/hip_distributed_sequence.hip
+        src/hip_distributed_stage_resources.hip
+        src/hip_distributed_greedy.hip
         src/hip_hyper_mix_launcher.hip
         src/hip_indexed_attention_launcher.hip
         src/hip_qsa_selection_diagnostic.hip
@@ -1759,6 +1768,19 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         target_include_directories(strix-hip-distributed-sequence-model-fixture PUBLIC
             ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         strix_target_warnings(strix-hip-distributed-sequence-model-fixture)
+
+        # Callable actual native generation fixture; no synthetic bootstrap,
+        # main function or automatic model/transport execution.
+        add_library(strix-hip-distributed-greedy-model-fixture STATIC
+            tests/hip_distributed_greedy_model_qualification.hip)
+        set_target_properties(strix-hip-distributed-greedy-model-fixture PROPERTIES
+            HIP_ARCHITECTURES gfx1151 HIP_STANDARD 20 HIP_STANDARD_REQUIRED YES)
+        target_compile_options(strix-hip-distributed-greedy-model-fixture PRIVATE
+            -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
+        target_include_directories(strix-hip-distributed-greedy-model-fixture PUBLIC
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(strix-hip-distributed-greedy-model-fixture PUBLIC strix_hip_runtime)
+        strix_target_warnings(strix-hip-distributed-greedy-model-fixture)
 
         add_executable(strix-hip-serving-greedy-model-qualification tests/hip_serving_greedy_backend_tests.hip)
         set_target_properties(strix-hip-serving-greedy-model-qualification PROPERTIES

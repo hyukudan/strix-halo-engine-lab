@@ -1,4 +1,5 @@
 #include "strix/distributed_control_wire.hpp"
+#include "strix/distributed_greedy_control.hpp"
 
 #include <limits>
 #include <stdexcept>
@@ -373,6 +374,7 @@ inspect_distributed_control_frame_kind(
             boundary_transfer:
     case DistributedControlFrameKind::direct_gpu_stream:
     case DistributedControlFrameKind::token_transaction:
+    case DistributedControlFrameKind::greedy_control:
         return static_cast<
             DistributedControlFrameKind>(
                 raw_kind);
@@ -688,5 +690,53 @@ DistributedTokenMessage decode_distributed_token_message(std::span<const std::by
 }
 void FramedDistributedTokenWire::send(const DistributedTokenMessage& m) {stream_->send(encode_distributed_token_message(m,limits_));}
 DistributedTokenMessage FramedDistributedTokenWire::receive() {return decode_distributed_token_message(stream_->receive(),limits_);}
+
+// Kind6 reuses the existing strict outer frame/reader/writer. The dedicated
+// payload-v1 validator lives in distributed_greedy_control.cpp. Kind1..5 byte
+// encodings are intentionally unchanged.
+std::vector<std::byte> encode_distributed_greedy_message(const DistributedGreedyMessage& m,
+    DistributedControlWireLimits limits) {
+    if(limits.maximum_frame_bytes>64U*1024U) throw std::invalid_argument("greedy frame exceeds its closed64KiB limit");
+    validate_distributed_greedy_message(m);Writer w;const auto& q=m.request;
+    w.u32(m.payload_version);w.u32(static_cast<std::uint32_t>(m.kind));w.u32(q.contract_version);
+    for(const auto byte:q.model_content_identity.bytes) w.u16(byte);
+    for(const auto byte:q.prompt_sha256.bytes) w.u16(byte);
+    w.u64(q.serial_execution_identity);w.u64(q.kernel_plan_identity);w.u64(q.placement_plan_identity);
+    w.u64(q.request_id);w.u64(q.connection_epoch);w.u64(q.initial_binding_identity);
+    w.u64(q.initial_generation);w.u64(q.initial_history_identity);w.u64(q.prompt_tokens);
+    w.u64(q.vocab_size);w.u64(q.context_capacity);w.u64(q.max_new_tokens);w.u64(q.max_target_inputs);
+    w.u32(q.eos_token_id);w.u32(q.boundary_dtype_id);
+    w.u64(m.request_identity);w.u64(m.sequence);w.u32(m.sender_node);w.u32(m.receiver_node);
+    w.u64(m.generation);w.u64(m.binding_identity);w.u64(m.decision_identity);
+    w.u64(m.position);w.u64(m.committed_tokens);w.u64(m.history_identity);
+    w.u64(m.previous_binding_identity);w.u64(m.previous_decision_identity);w.u32(m.input_token);
+    w.u32(static_cast<std::uint32_t>(m.output_intent));w.boolean(m.selected_present);
+    w.u32(m.selected_token);w.u32(m.selected_logit_bits);w.u64(m.emitted_tokens);
+    w.boolean(m.pending_present);w.u32(m.pending_token);w.u32(static_cast<std::uint32_t>(m.finish_reason));
+    w.u32(static_cast<std::uint32_t>(m.failure));
+    return frame(DistributedControlFrameKind::greedy_control,w.take(),limits);
+}
+DistributedGreedyMessage decode_distributed_greedy_message(std::span<const std::byte> bytes,
+    DistributedControlWireLimits limits) {
+    if(limits.maximum_frame_bytes>64U*1024U) throw std::invalid_argument("greedy frame exceeds its closed64KiB limit");
+    Reader r(payload_of(bytes,DistributedControlFrameKind::greedy_control,limits));DistributedGreedyMessage m;auto& q=m.request;
+    m.payload_version=r.u32();m.kind=static_cast<DistributedGreedyMessageKind>(r.u32());q.contract_version=r.u32();
+    for(auto& byte:q.model_content_identity.bytes) {const auto value=r.u16();if(value>255U) throw std::invalid_argument("noncanonical greedy model digest byte");byte=static_cast<std::uint8_t>(value);}
+    for(auto& byte:q.prompt_sha256.bytes) {const auto value=r.u16();if(value>255U) throw std::invalid_argument("noncanonical greedy prompt digest byte");byte=static_cast<std::uint8_t>(value);}
+    q.serial_execution_identity=r.u64();q.kernel_plan_identity=r.u64();q.placement_plan_identity=r.u64();
+    q.request_id=r.u64();q.connection_epoch=r.u64();q.initial_binding_identity=r.u64();
+    q.initial_generation=r.u64();q.initial_history_identity=r.u64();q.prompt_tokens=r.u64();
+    q.vocab_size=r.u64();q.context_capacity=r.u64();q.max_new_tokens=r.u64();q.max_target_inputs=r.u64();
+    q.eos_token_id=r.u32();q.boundary_dtype_id=r.u32();
+    m.request_identity=r.u64();m.sequence=r.u64();m.sender_node=r.u32();m.receiver_node=r.u32();
+    m.generation=r.u64();m.binding_identity=r.u64();m.decision_identity=r.u64();
+    m.position=r.u64();m.committed_tokens=r.u64();m.history_identity=r.u64();
+    m.previous_binding_identity=r.u64();m.previous_decision_identity=r.u64();m.input_token=r.u32();
+    m.output_intent=static_cast<DistributedGreedyOutputIntent>(r.u32());m.selected_present=r.boolean();
+    m.selected_token=r.u32();m.selected_logit_bits=r.u32();m.emitted_tokens=r.u64();
+    m.pending_present=r.boolean();m.pending_token=r.u32();m.finish_reason=static_cast<DistributedGreedyFinishReason>(r.u32());
+    m.failure=static_cast<DistributedGreedyFailure>(r.u32());
+    require_consumed(r);validate_distributed_greedy_message(m);return m;
+}
 
 }  // namespace strix

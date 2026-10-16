@@ -126,13 +126,25 @@ DistributedSequenceQualificationResult qualify_sequence_inputs(HipDistributedSeq
     // Actual missing/expired native capability fails before model/reference
     // execution. This object is used below; no replacement participant is made.
     HipDistributedKnownSequence sequence(setup);
+    const auto data_boundary=std::find_if(setup.canonical_plan.boundaries.begin(),setup.canonical_plan.boundaries.end(),
+        [](const auto& value) {return value.payload_bytes && !value.payloads.empty();});
+    require_case(data_boundary!=setup.canonical_plan.boundaries.end(),"qualification has no actual native data boundary");
+    const auto data_index=static_cast<std::size_t>(data_boundary-setup.canonical_plan.boundaries.begin());
     const auto ranges=owned_ranges(setup,reference);
     compare_ranges(ranges,guard); // Actual starting owned payloads, not metadata alone.
     for(unsigned fault=0;fault<7U;++fault) {
         auto bad=setup;
         const char* reason="";
-        if(fault==0U) {bad.canonical_plan.boundaries.push_back(bad.canonical_plan.boundaries.front());reason="exactly one boundary";}
-        if(fault==1U) {++bad.canonical_plan.boundaries.front().destination_step;reason="last prefix step";}
+        if(fault==0U) {
+            if(setup.layer_boundary_position_dependencies && bad.canonical_plan.boundaries.size()>1U) {
+                const auto replacement=data_index?0U:1U;
+                const auto id=bad.canonical_plan.boundaries[replacement].boundary_id;
+                bad.canonical_plan.boundaries[replacement]=bad.canonical_plan.boundaries[data_index];
+                bad.canonical_plan.boundaries[replacement].boundary_id=id;
+            } else bad.canonical_plan.boundaries.push_back(bad.canonical_plan.boundaries[data_index]);
+            reason=setup.layer_boundary_position_dependencies?"exactly one data boundary":"exactly one boundary";
+        }
+        if(fault==1U) {++bad.canonical_plan.boundaries[data_index].destination_step;reason="last prefix step";}
         if(fault==2U) {++bad.canonical_plan.plan_identity;reason="canonical placement metadata";}
         if(fault==3U) {bad.local_node=2U;reason="bounded actual model";}
         if(fault==4U) {bad.transport.step_control=bad.transport.token_control;reason="distinct bounded kind5";}
@@ -143,6 +155,44 @@ DistributedSequenceQualificationResult qualify_sequence_inputs(HipDistributedSeq
         catch(const std::invalid_argument& error) {rejected=std::string(error.what()).find(reason)!=std::string::npos;}
         require_case(rejected && setup.participant->phase()==DistributedTokenPhase::preparing,
             "qualification invalid cut/endpoint/wire/owner did not reject at its intended pre-mutation gate");
+    }
+    if(setup.layer_boundary_position_dependencies) {
+        // A structural guard is tested before canonical-ID comparison; no
+        // forged boundary is offered to actual GPU or native transport APIs.
+        const auto negative=[&](HipDistributedSequenceSetup bad,const char* reason) {
+            bool rejected=false;
+            try {HipDistributedKnownSequence invalid(std::move(bad));}
+            catch(const std::invalid_argument& error) {rejected=std::string(error.what()).find(reason)!=std::string::npos;}
+            require_case(rejected && setup.participant->phase()==DistributedTokenPhase::preparing,
+                "qualification layer-cut admission reached the wrong gate or mutated its participant");
+        };
+        const auto move_cut=[&](HipDistributedSequenceSetup& bad,std::uint32_t cut) {
+            auto& data=bad.canonical_plan.boundaries[data_index];data.source_step=cut;data.destination_step=cut+1U;
+            for(auto& step:bad.canonical_plan.steps) {step.node=step.step_id<=cut?0U:1U;step.remote=step.node!=0U;}
+        };
+        auto interior=setup;
+        require_case(data_boundary->source_step>0U,"qualification complete-layer cut has no interior predecessor");
+        move_cut(interior,data_boundary->source_step-1U);
+        negative(std::move(interior),"complete adjacent layers");
+        for(const auto& step:setup.serial.execution.steps) if(step.op==SerialOp::ple && step.id>0U) {
+            auto before_ple=setup;move_cut(before_ple,step.id-1U);
+            negative(std::move(before_ple),"complete adjacent layers");break;
+        }
+        for(std::size_t z=0;z<setup.canonical_plan.boundaries.size();++z) {
+            if(z==data_index) continue;
+            for(unsigned mutation=0;mutation<4U;++mutation) {
+                auto bad=setup;auto& edge=bad.canonical_plan.boundaries[z];
+                if(mutation==0U) edge.source_step=data_boundary->source_step;
+                if(mutation==1U) edge.destination_step=data_boundary->destination_step;
+                if(mutation==2U) edge.payloads=data_boundary->payloads;
+                if(mutation==3U) edge.boundary_id=0U;
+                negative(std::move(bad),mutation==3U?"canonical boundary identity":"unsupported crossing dependency");
+            }
+        }
+        if(setup.canonical_plan.boundaries.size()>1U) {
+            auto strict=setup;strict.layer_boundary_position_dependencies=false;
+            negative(std::move(strict),"exactly one boundary");
+        }
     }
     {
         auto low_budget=setup;low_budget.maximum_logit_payload_bytes=1;
@@ -164,6 +214,14 @@ DistributedSequenceQualificationResult qualify_sequence_inputs(HipDistributedSeq
     receipt.model_content=pin;receipt.input_u32le_sha256=sha256_bytes(encoded);
     receipt.local_node=setup.local_node;receipt.known_inputs=static_cast<std::uint32_t>(inputs.size());
     receipt.streaming_inputs=streaming;
+    receipt.layer_boundary_position_dependencies=setup.layer_boundary_position_dependencies;
+    for(const auto& edge:setup.canonical_plan.boundaries) {
+        if(is_materialized_input_position_dependency(setup.canonical_plan,edge)) ++receipt.logical_position_dependencies;
+        else ++receipt.data_boundaries;
+    }
+    require_case(receipt.data_boundaries==1U && receipt.logical_position_dependencies<=64U &&
+        receipt.data_boundaries+receipt.logical_position_dependencies==setup.canonical_plan.boundaries.size(),
+        "qualification did not account for every canonical dependency");
     HipLauncherCatalog catalog(setup.model,reference.config);
     ExecutionLauncherRegistry registry;catalog.register_for_compiled_execution(setup.serial,registry,&reference.resources);
     const auto launches=compile_launch_plan(setup.serial,registry);
@@ -322,5 +380,12 @@ DistributedSequenceQualificationResult qualify_hip_distributed_streaming_inputs(
     const DistributedSequenceReference& reference,std::span<const std::uint32_t> inputs,const ModelContentIdentity& pin,
     const SerialSessionContext& ordinary_anchor) {
     return qualify_sequence_inputs(std::move(setup),reference,inputs,pin,ordinary_anchor,true);
+}
+DistributedSequenceQualificationResult qualify_hip_distributed_layer_boundary_inputs(HipDistributedSequenceSetup setup,
+    const DistributedSequenceReference& reference,std::span<const std::uint32_t> inputs,const ModelContentIdentity& pin,
+    const SerialSessionContext& ordinary_anchor) {
+    require_case(setup.layer_boundary_position_dependencies,"qualification requires an explicit actual complete-layer setup");
+    const bool streaming=setup.streaming;
+    return qualify_sequence_inputs(std::move(setup),reference,inputs,pin,ordinary_anchor,streaming);
 }
 } // namespace strix::qualification

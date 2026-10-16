@@ -38,6 +38,10 @@ struct HipDistributedSequenceSetup {
     // it retains ONE terminal row, not one row per possible target.
     bool streaming = false;
     std::uint64_t max_target_inputs = 0;
+    // Explicit complete-layer cut: one mlp_inject(L)->attn_hyper_mix(L+1)
+    // data edge plus <=64 canonical position_prepare->suffix-QSA dependencies.
+    // Logical position proof does not replace actual data retirement.
+    bool layer_boundary_position_dependencies = false;
 };
 struct HipDistributedKnownInputResult {
     DistributedTokenCommit commit;

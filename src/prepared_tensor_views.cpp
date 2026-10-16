@@ -1,4 +1,6 @@
 #include "strix/prepared_tensor_views.hpp"
+#include "strix/distributed_stage_resources.hpp"
+#include <optional>
 
 #include <algorithm>
 #include <limits>
@@ -64,6 +66,8 @@ struct PreparedTensorViews::Impl {
     const ModelManifest manifest;
     const ModelRuntimeBinding weights;
     const ExecutionTensorAccessPlan accesses;
+    const std::optional<DistributedStageResourcePlan> stage;
+    const DistributedStageResourcePlan* const stage_handle;
     const ModelManifest* const manifest_handle;
     const ModelRuntimeBinding* const weights_handle;
     const ExecutionTensorAccessPlan* const access_handle;
@@ -73,9 +77,10 @@ struct PreparedTensorViews::Impl {
 
     Impl(std::uint64_t identity, const SerialExecutionPlan& execution,
          const ModelManifest& source_manifest, const ModelRuntimeBinding& source_weights,
-         const ExecutionTensorAccessPlan& source_access, std::shared_ptr<const void> owner)
+         const ExecutionTensorAccessPlan& source_access, std::shared_ptr<const void> owner,const DistributedStageResourcePlan* scope)
         : execution_identity(identity), actual_owner(std::move(owner)), manifest(source_manifest),
-          weights(source_weights), accesses(source_access), manifest_handle(&source_manifest),
+          weights(source_weights), accesses(source_access), stage(scope?std::optional<DistributedStageResourcePlan>(*scope):std::nullopt),
+          stage_handle(scope), manifest_handle(&source_manifest),
           weights_handle(&source_weights), access_handle(&source_access) {
         if (!execution_identity || !actual_owner || execution.steps.empty() ||
             execution.steps.size() > std::numeric_limits<std::uint32_t>::max() ||
@@ -88,7 +93,10 @@ struct PreparedTensorViews::Impl {
             for (const auto dependency : step.dependencies) if (dependency >= step.id)
                 throw std::invalid_argument("prepared tensor execution dependency is invalid");
         }
-        validate_model_runtime_binding(manifest, weights);
+        if(stage && (stage->execution_identity()!=execution_identity || stage->manifest_identity()!=manifest.layout_identity || stage->access_identity()!=accesses.plan_identity))
+            throw std::invalid_argument("prepared stage source identity differs");
+        if(stage) validate_stage_model_runtime_binding(*stage,manifest,weights);
+        else validate_model_runtime_binding(manifest, weights);
         for (const auto& tensor : weights.tensors) validate_storage(tensor.storage);
         const auto index = build_model_tensor_index(manifest); // verifies actual layout and unique names
         const auto requirements = build_serial_execution_tensor_requirements(execution);
@@ -121,10 +129,14 @@ struct PreparedTensorViews::Impl {
 PreparedTensorViews::PreparedTensorViews(std::uint64_t execution_identity,
     const SerialExecutionPlan& execution, const ModelManifest& manifest,
     const ModelRuntimeBinding& weights, const ExecutionTensorAccessPlan& access,
-    std::shared_ptr<const void> actual_owner)
-    : impl_(std::make_unique<Impl>(execution_identity, execution, manifest, weights, access, std::move(actual_owner))) {}
+    std::shared_ptr<const void> actual_owner,const DistributedStageResourcePlan* scope)
+    : impl_(std::make_unique<Impl>(execution_identity, execution, manifest, weights, access, std::move(actual_owner),scope)) {}
 PreparedTensorViews::~PreparedTensorViews() = default;
 
+void PreparedTensorViews::validate_stage_scope(const DistributedStageResourcePlan* plan,std::uint32_t step) const {
+    if(plan!=impl_->stage_handle || (impl_->stage && (!plan || plan->identity()!=impl_->stage->identity() || !impl_->stage->contains_step(step))))
+        throw std::invalid_argument("prepared stage step or retained scope differs");
+}
 void PreparedTensorViews::validate_source_metadata(const ModelManifest& manifest,
     const ModelRuntimeBinding& weights, const ExecutionTensorAccessPlan& access) const {
     validate_source_handles(&manifest, &weights, &access);
@@ -140,13 +152,15 @@ void PreparedTensorViews::validate_source_handles(const ModelManifest* manifest,
 const RuntimeTensorBinding& PreparedTensorViews::tensor(std::uint64_t identity, std::uint32_t index) const {
     impl_->require_execution(identity);
     if (index >= impl_->weights.tensors.size()) throw std::out_of_range("dispatch tensor index is out of range");
+    if(impl_->stage && !impl_->stage->requires_tensor(index))
+        throw std::invalid_argument("prepared stage tensor is not locally materialized");
     return impl_->weights.tensors[index];
 }
 const RuntimeTensorBinding& PreparedTensorViews::tensor(std::uint64_t identity, std::string_view name) const {
     impl_->require_execution(identity);
     const auto found = impl_->names.find(name);
     if (found == impl_->names.end()) throw std::invalid_argument("dispatch tensor name is not present in manifest");
-    return impl_->weights.tensors[found->second];
+    return tensor(identity,found->second);
 }
 const ExecutionTensorAccess& PreparedTensorViews::access(std::uint64_t identity,
     std::uint32_t step_id, std::uint32_t binding_slot) const {
