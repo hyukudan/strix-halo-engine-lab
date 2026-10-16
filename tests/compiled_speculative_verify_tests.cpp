@@ -225,6 +225,9 @@ struct WindowTrace {
     std::uint32_t calls = 0;
     std::uint32_t admissions = 0;
     bool fail_kernel = false;
+    bool fail_qsa = false;
+    strix::SessionStateMemoryBinding* rebind_after_qsa = nullptr;
+    std::uint32_t rebindings = 0;
     std::vector<std::uint64_t> qsa_positions;
     std::vector<std::uint64_t> ple_previous;
 };
@@ -271,9 +274,16 @@ void recording_window_kernel(const strix::ExecutionDispatchContext& context, voi
         const auto word = read_word(position.address);
         if (word != context.position) throw std::logic_error("row reader observed future position");
         trace.qsa_positions.push_back(word);
+        if (context.op == strix::SerialOp::indexed_attention && trace.rebind_after_qsa &&
+            trace.rebindings == 0) {
+            ++trace.rebind_after_qsa->host_allocation_generation;
+            ++trace.rebindings;
+        }
     }
     if (trace.fail_kernel && context.position == 1 && context.op == strix::SerialOp::gated_delta_net)
         throw std::runtime_error("injected row1 kernel failure");
+    if (trace.fail_qsa && context.position == 1 && context.op == strix::SerialOp::indexed_attention)
+        throw std::runtime_error("injected row1 QSA failure");
     std::uint64_t value = 101U + context.input_token_id + 17U * context.position + context.step_id;
     // Snapshot all input words before writing any potentially reused arena slot.
     for (std::size_t i = 0; i < context.reads.size(); ++i)
@@ -443,8 +453,27 @@ void known_window_runtime_tests(const strix::ModelContract& model) {
     catch (const std::logic_error&) { caught = true; }
     expect(caught, "position reader witness detects omitted row0 materialization");
 
+    // Call the actual fixed-position launcher, independently of the recorder.
+    fixture.reset();
+    auto position_context = reader;
+    position_context.op = strix::SerialOp::position_prepare;
+    position_context.step_id = 1;
+    const auto position_launcher = strix::make_position_prepare_launcher();
+    auto position_words = fixture.state_words;
+    for (const std::uint64_t position : {7ULL, 8ULL}) {
+        position_context.position = position;
+        position_launcher.preflight(position_context, position_launcher.user_data);
+        position_launcher.function(position_context, position_launcher.user_data);
+        const auto position_index = static_cast<std::size_t>(
+            (fixture.position_address() - fixture.state_memory.host_base) / sizeof(std::uint64_t));
+        position_words[position_index] = position;
+        expect(read_word(fixture.position_address()) == position && fixture.state_words == position_words &&
+            fixture.trace.calls == 0,
+            "actual position_prepare writes p then p+1 and preserves every surrounding state word");
+    }
+
     const auto reject = [&](const std::function<void(KnownRuntimeFixture&, strix::KnownWindowExecutionHooks&)>& mutate,
-                            const char* message) {
+                            const char* message, const char* expected_error = nullptr) {
         KnownRuntimeFixture candidate(model);
         auto callbacks = candidate.hooks(); mutate(candidate, callbacks);
         const auto words = candidate.state_words;
@@ -452,10 +481,13 @@ void known_window_runtime_tests(const strix::ModelContract& model) {
         const auto position = candidate.session.next_position;
         const auto committed = candidate.session.committed_tokens;
         bool rejected = false;
-        try { (void)candidate.run(callbacks); } catch (const std::exception&) { rejected = true; }
+        std::string error;
+        try { (void)candidate.run(callbacks); }
+        catch (const std::exception& exception) { rejected = true; error = exception.what(); }
         expect(rejected && candidate.trace.calls == 0 && candidate.state_words == words &&
             candidate.session.health == health && candidate.session.next_position == position &&
-            candidate.session.committed_tokens == committed && candidate.quiesces == 0, message);
+            candidate.session.committed_tokens == committed && candidate.quiesces == 0 &&
+            (!expected_error || error == expected_error), message);
     };
     reject([](auto& f, auto&) { ++f.window.arena.row_stride.front(); }, "G0 rejects changed row stride before mutation");
     reject([](auto& f, auto&) { f.window.row_plan[1].arena = f.window.row_plan[0].arena; }, "G0 rejects aliased row views");
@@ -465,6 +497,9 @@ void known_window_runtime_tests(const strix::ModelContract& model) {
     reject([](auto& f, auto&) { f.serial_memory.arena_bytes = std::numeric_limits<std::uint64_t>::max(); },
         "G0 rejects an overflowing original serial owner extent");
     reject([](auto& f, auto&) { ++f.window.window_execution_identity; }, "G0 rejects changed window identity");
+    reject([](auto& f, auto&) { ++f.session.execution_identity; },
+        "G0 rejects a session belonging to a different serial execution before dispatch",
+        "known window serial session execution identity mismatch");
     reject([](auto& f, auto&) { f.layout.context_tokens = 1; }, "G0 rejects insufficient two-row capacity");
     reject([](auto& f, auto&) { f.tokens[1] = static_cast<std::uint32_t>(f.source.serial.vocab_size); },
         "G0 rejects an out-of-vocabulary row1 token");
@@ -490,6 +525,66 @@ void known_window_runtime_tests(const strix::ModelContract& model) {
     reject([](auto&, auto& h) { h.position_reader_implementations = {}; }, "G0 refuses unadmitted position readers");
     reject([](auto& f, auto&) { f.row_launch[0].steps[1].function = &recording_window_kernel; },
         "G0 rejects a fake position handler even with the incumbent implementation ID");
+    reject([](auto& f, auto&) {
+        const auto verify = strix::make_position_verify_window_launcher();
+        auto& position = f.row_launch[1].steps[1];
+        position.function = verify.function;
+        position.implementation_identity = verify.implementation_identity;
+        // Retain the pure metadata callback so C2, rather than a missing
+        // preflight, must reject the actual verify-window implementation.
+    }, "G0 rejects the actual verify-window position launcher at step1 before either row runs",
+        "known window position-history reader implementation is not admitted");
+    reject([](auto& f, auto&) {
+        const auto qsa = std::find_if(f.source.serial.execution.steps.begin(), f.source.serial.execution.steps.end(),
+            [](const auto& step) { return step.op == strix::SerialOp::indexed_attention; });
+        if (qsa == f.source.serial.execution.steps.end()) throw std::logic_error("fixture requires a QSA step");
+        f.window.mode[qsa->id] = strix::KnownWindowStepMode::r2_gdn_staged;
+        f.window.r2_variant[qsa->id] = strix::KnownWindowR2Variant::gdn_q8_virtual256_r2_v1;
+    }, "G0 window validation rejects a forged QSA position-reader R2 entry before callbacks",
+        "known window GDN variant/source ID mismatch");
+    reject([](auto& f, auto&) {
+        write_word(f.position_address(), 0x123456789abcdef0ULL);
+        auto& position = f.layout.allocations.back();
+        f.state_memory.device_base = f.position_address();
+        f.state_memory.device_bytes = position.bytes;
+        f.state_memory.device_allocation_generation = 9;
+        f.layout.device_total_bytes = position.bytes;
+        position.storage = strix::SessionStateStorage::device;
+        position.offset = 0;
+    }, "G0 rejects device position storage with zero dispatches, ready session and unchanged sentinel",
+        "known window requires writable bounded host position history");
+    reject([](auto& f, auto&) {
+        write_word(f.position_address(), 0x123456789abcdef0ULL);
+        f.layout.allocations.back().bytes = sizeof(std::uint64_t) - 1U;
+    }, "G0 rejects a short host position view with zero dispatches, ready session and unchanged sentinel",
+        "known window requires writable bounded host position history");
+    reject([](auto& f, auto&) {
+        write_word(f.position_address(), 0x123456789abcdef0ULL);
+        f.state_memory.host_base = 0;
+    }, "G0 rejects a null host position pool with zero dispatches, ready session and unchanged sentinel",
+        "host session-state pool has a null base");
+
+    {
+        KnownRuntimeFixture candidate(model);
+        const auto generations = candidate.session.state.generations;
+        const auto valid = candidate.session.state.valid;
+        const auto generation = candidate.state_memory.host_allocation_generation;
+        const auto compatibility = candidate.session.runtime_compatibility_identity;
+        candidate.trace.rebind_after_qsa = &candidate.state_memory;
+        std::string error;
+        try { (void)candidate.run(candidate.hooks()); }
+        catch (const std::invalid_argument& exception) { error = exception.what(); }
+        expect(error == "known window host position binding changed after admission" &&
+            candidate.trace.admissions > 0 && candidate.trace.calls > 0 && candidate.trace.rebindings == 1 &&
+            candidate.trace.qsa_positions == std::vector<std::uint64_t>{0} &&
+            candidate.state_memory.host_allocation_generation == generation + 1 &&
+            candidate.session.health == strix::SerialSessionHealth::poisoned && candidate.quiesces == 1 &&
+            candidate.session.arithmetic_lineage.tainted && candidate.session.arithmetic_lineage.intervals.empty() &&
+            candidate.session.state.generations == generations && candidate.session.state.valid == valid &&
+            candidate.session.next_position == 0 && candidate.session.committed_tokens == 0 &&
+            candidate.session.runtime_compatibility_identity == compatibility && read_word(candidate.position_address()) == 0,
+            "a generation swap inside QSA is re-resolved before row1, poisons and drains once without metadata publication");
+    }
     for (const bool zero : {false, true}) {
         KnownRuntimeFixture candidate(model);
         StartFaultLookup lookup(zero);
@@ -525,6 +620,22 @@ void known_window_runtime_tests(const strix::ModelContract& model) {
             candidate.session.arithmetic_lineage.tainted && candidate.session.committed_tokens == 0 &&
             candidate.session.next_position == 0 && candidate.quiesces == 1,
             "mid-dispatch/completion failure poisons, taints and drains exactly once without metadata commit");
+    }
+    {
+        KnownRuntimeFixture candidate(model);
+        candidate.trace.fail_qsa = true;
+        const auto generations = candidate.session.state.generations;
+        caught = false;
+        try { (void)candidate.run(candidate.hooks()); }
+        catch (const std::runtime_error& exception) {
+            caught = std::string(exception.what()) == "injected row1 QSA failure";
+        }
+        expect(caught && candidate.trace.qsa_positions == std::vector<std::uint64_t>{0, 1} &&
+            candidate.session.health == strix::SerialSessionHealth::poisoned &&
+            candidate.session.arithmetic_lineage.tainted && candidate.session.arithmetic_lineage.intervals.empty() &&
+            candidate.session.state.generations == generations && candidate.session.committed_tokens == 0 &&
+            candidate.session.next_position == 0 && candidate.quiesces == 1,
+            "an actual row1 QSA dispatch failure poisons and drains once without publishing generations or chunk metadata");
     }
 }
 

@@ -27,6 +27,7 @@
 #include <limits>
 #include <memory>
 #include <span>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -358,6 +359,144 @@ void write_states(std::ostream& output, const std::vector<StateFile>& files) {
     output << ']';
 }
 
+std::string session_text(const strix::SerialSessionContext& session) {
+    std::ostringstream output;
+    write_session(output, session);
+    return output.str();
+}
+
+// Check every live byte against the already SHA-pinned initial snapshot. This
+// implies the same seven full-component hashes without writing extra snapshots
+// for each rejected constructor. Transfers remain bounded to transfer_chunk.
+void require_unchanged(const std::shared_ptr<Owners>& owner, const std::vector<StateFile>& initial,
+                       const strix::SerialSessionContext& saved, const strix::SerialSessionContext& session) {
+    require(session_text(session) == session_text(saved), "owner rejection changed session metadata");
+    require(!owner->prefetch.active, "owner rejection activated a PLE lookup");
+    require(initial.size() == 7, "owner rejection requires all seven saved components");
+    std::vector<std::byte> expected(transfer_chunk), observed(transfer_chunk);
+    for (const auto& file : initial) {
+        require(hash_file(file.path) == file.sha && std::filesystem::file_size(file.path) == file.bytes,
+            "owner rejection initial snapshot changed");
+        const auto view = strix::resolve_session_state(owner->layout, owner->memory->state(), file.component);
+        require(view.bytes == file.bytes && view.storage == file.storage, "owner rejection changed state binding");
+        std::ifstream input(file.path, std::ios::binary);
+        input.exceptions(std::ios::failbit | std::ios::badbit);
+        for (std::uint64_t offset = 0; offset < view.bytes;) {
+            const auto count = static_cast<std::size_t>(std::min<std::uint64_t>(expected.size(), view.bytes - offset));
+            input.read(reinterpret_cast<char*>(expected.data()), static_cast<std::streamsize>(count));
+            owner->guard->run([&] {
+                if (view.storage == strix::SessionStateStorage::device)
+                    hip_check(hipMemcpyAsync(observed.data(), reinterpret_cast<const void*>(view.address + offset),
+                        count, hipMemcpyDeviceToHost, owner->stream), "check rejected owner state bytes");
+                else std::memcpy(observed.data(), reinterpret_cast<const void*>(view.address + offset), count);
+            });
+            require(std::memcmp(expected.data(), observed.data(), count) == 0,
+                "owner rejection changed full state bytes");
+            offset += count;
+        }
+    }
+}
+
+std::uint64_t owner_negative_cases(const std::shared_ptr<Owners>& owner,
+    const strix::HipLauncherCatalogConfig& config, const strix::ExecutionBindingRequest& binding,
+    const strix::ExecutionBufferRequest& buffers, const std::vector<StateFile>& initial,
+    const strix::SerialSessionContext& saved, strix::SerialSessionContext& session,
+    std::array<std::uint32_t, 2> tokens) {
+    std::uint64_t cases = 0;
+    const auto retained = std::static_pointer_cast<const void>(owner);
+    const auto reject_constructor = [&](const strix::CompiledKnownPrefixWindow& window,
+        const strix::CompiledSerialExecution& serial, const strix::HipLauncherCatalogConfig& cfg,
+        const strix::ExecutionRuntimeResources& resources, strix::ExecutionMemoryBinding memory,
+        strix::HipLaunchContext scope, std::string_view message) {
+        bool rejected = false;
+        try { strix::HipKnownPrefixWindow bad(window, serial, owner->model, cfg, resources, memory, scope, retained); }
+        catch (const std::invalid_argument& error) {
+            require(std::string_view(error.what()).find(message) != std::string_view::npos,
+                "owner constructor rejected for the wrong reason");
+            rejected = true;
+        }
+        require(rejected, "invalid native owner constructor was accepted");
+        require_unchanged(owner, initial, saved, session);
+        ++cases;
+    };
+    for (unsigned mutation = 0; mutation < 5U; ++mutation) {
+        auto scope = owner->scope();
+        if (mutation == 0U) scope.arguments.mode = strix::GraphArgumentMode::device_data;
+        if (mutation == 1U) scope.status.execution_identity = owner->window.window_execution_identity;
+        if (mutation == 2U) scope.ngram_input.execution_identity = owner->window.window_execution_identity;
+        if (mutation == 3U) scope.ngram_output.execution_identity = owner->window.window_execution_identity;
+        if (mutation == 4U) scope.graph_capture = true;
+        reject_constructor(owner->window, owner->serial, config, owner->resources, owner->window_memory, scope,
+            "requires empty graph bindings");
+    }
+    auto off_scope = owner->scope();
+    // This valid-looking status view is deliberately never read: D1-off must
+    // reject its presence before alias checks or the setup-only status copy.
+    off_scope.deferred_moe_status = {owner->window.window_execution_identity,
+        owner->window_memory.arena_base, 8, owner->window_memory.allocation_generation};
+    reject_constructor(owner->window, owner->serial, config, owner->resources, owner->window_memory, off_scope,
+        "configuration/scope parity differs");
+
+    // Construct real deferred IDs on the host so these negatives reach the
+    // scope guard, instead of failing earlier at catalog ID admission. All
+    // physical allocations stay original and no deferred owner ever launches.
+    auto deferred_config = config;
+    auto deferred_binding = binding;
+    deferred_config.deferred_moe_status = deferred_binding.deferred_moe_status = true;
+    strix::kernels::KernelRegistry deferred_kernels;
+    strix::register_complete_hip_kernel_catalog(owner->model, deferred_binding, deferred_config, deferred_kernels);
+    const auto deferred_serial = strix::compile_serial_execution(owner->model, deferred_kernels, deferred_binding, buffers, 256);
+    const auto deferred_window = strix::compile_known_prefix_window(owner->model, deferred_serial,
+        owner->manifest, owner->access, {true, true});
+    auto deferred_scratch = owner->memory->scratch();
+    deferred_scratch.execution_identity = deferred_serial.execution_identity;
+    auto deferred_resources = owner->resources;
+    deferred_resources.scratch = &deferred_scratch;
+    auto deferred_memory = owner->window_memory;
+    deferred_memory.execution_identity = deferred_window.window_execution_identity;
+    require(deferred_serial.arena.total_bytes <= deferred_scratch.arena_bytes &&
+        deferred_window.arena.physical.total_bytes <= deferred_memory.arena_bytes,
+        "deferred rejection fixture no longer fits the original retained scratch extents");
+    reject_constructor(deferred_window, deferred_serial, deferred_config, deferred_resources, deferred_memory,
+        owner->scope(), "stale identity, generation or extent");
+    auto stale_scope = owner->scope();
+    stale_scope.deferred_moe_status = {deferred_window.window_execution_identity ^ 1ULL,
+        owner->window_memory.arena_base, 8, owner->window_memory.allocation_generation};
+    reject_constructor(deferred_window, deferred_serial, deferred_config, deferred_resources, deferred_memory,
+        stale_scope, "stale identity, generation or extent");
+
+    {
+        strix::HipKnownPrefixWindow failed(owner->window, owner->serial, owner->model, config,
+            owner->resources, owner->window_memory, owner->scope(), retained);
+        bool rejected = false;
+        try { (void)failed.execute(session, {static_cast<std::uint32_t>(owner->model.vocab_size), tokens[1]}); }
+        catch (const std::invalid_argument& error) {
+            require(std::string_view(error.what()).find("outside the compiled vocabulary") != std::string_view::npos,
+                "owner execute preflight rejected for the wrong reason");
+            rejected = true;
+        }
+        require(rejected, "owner accepted invalid input token");
+        require_unchanged(owner, initial, saved, session);
+        ++cases;
+        rejected = false;
+        try { (void)failed.execute(session, tokens); }
+        catch (const std::logic_error& error) {
+            require(std::string_view(error.what()).find("cannot be reused after an exception") != std::string_view::npos,
+                "owner retry rejected for the wrong reason");
+            rejected = true;
+        }
+        require(rejected, "failed native owner was reused");
+        require_unchanged(owner, initial, saved, session);
+        ++cases;
+    }
+    // The positive run always starts from an explicit exact restore and later
+    // constructs a fresh owner; no failed-owner recovery is being qualified.
+    restore_state(owner, initial, saved, session);
+    require_unchanged(owner, initial, saved, session);
+    require(cases == 10, "incomplete native owner negative fixture coverage");
+    return cases;
+}
+
 int qualify(const Options& args) {
     const auto teacher = teacher_tokens(args, strix::ModelContract::qwen38_flash_next().vocab_size);
     const auto executable = std::filesystem::canonical("/proc/self/exe");
@@ -393,6 +532,8 @@ int qualify(const Options& args) {
     const auto initial = dump_state(owner, args.output, "initial");
     auto metadata = output_file(args.output / "initial-session.json");
     write_session(metadata, prefix); metadata.close();
+    const auto rejected_owner_cases = owner_negative_cases(owner, config, binding, buffers, initial, prefix, session,
+        {teacher[static_cast<std::size_t>(args.start)], teacher[static_cast<std::size_t>(args.start) + 1U]});
     std::array<std::vector<float>, 2> reference;
     std::array<std::string, 2> reference_sha, candidate_sha;
     const auto logit_use = owner->serial.io.steps.back().writes.front();
@@ -451,7 +592,9 @@ int qualify(const Options& args) {
         session.state_layout_identity == prefix.state_layout_identity;
     require(hash_file(args.teacher) == args.teacher_sha && hash_file(args.model) == args.model_sha &&
         hash_file(executable) == executable_sha, "input/model/executable content changed during qualification");
-    const bool passed = full_logits_equal && all_state_equal && lineage_equal && metadata_equal;
+    const bool dispatch_counts_equal = owner->window.r2_steps == 84 && result.r2_dispatches == 84 &&
+        result.row_loop_dispatches == 708;
+    const bool passed = full_logits_equal && all_state_equal && lineage_equal && metadata_equal && dispatch_counts_equal;
     const auto pending = args.output / "result.pending.json";
     auto output = output_file(pending);
     output << "{\"schema\":\"known-prefix-model-qualification-v1\",\"finished\":true,\"passed\":"
@@ -471,6 +614,8 @@ int qualify(const Options& args) {
         << ",\"logical_projection_weight_bytes_avoided\":" << owner->window.logical_projection_weight_bytes_avoided
         << ",\"projection_launches_saved\":" << owner->window.projection_launches_saved
         << ",\"r2_dispatches\":" << result.r2_dispatches << ",\"row_loop_dispatches\":" << result.row_loop_dispatches
+        << ",\"owner_negative_cases\":" << rejected_owner_cases
+        << ",\"owner_negative_session_and_state_unchanged\":true"
         << ",\"full_logits_bits_equal\":" << (full_logits_equal ? "true" : "false")
         << ",\"all_seven_state_bytes_equal\":" << (all_state_equal ? "true" : "false")
         << ",\"six_generations_and_position_equal\":" << (metadata_equal ? "true" : "false")
