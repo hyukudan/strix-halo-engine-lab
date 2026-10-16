@@ -1,5 +1,7 @@
 #include "strix/serial_prefix_cache.hpp"
 
+#include <algorithm>
+#include <limits>
 #include <stdexcept>
 #include <utility>
 
@@ -125,6 +127,88 @@ bool SerialPrefixCacheEntry::try_restore(
     restore_serial_prefix_snapshot(session, model, state_layout, state_memory, memory_.binding(),
                                   backend, requested_prefix, prefix_, requested_history);
     return true;
+}
+
+SerialPrefixCache::SerialPrefixCache(std::size_t max_entries, std::uint64_t snapshot_byte_budget)
+    : max_entries_(max_entries), byte_budget_(snapshot_byte_budget) {
+    if (!max_entries_ || !byte_budget_)
+        throw std::invalid_argument("serial prefix cache requires nonzero entry and snapshot budgets");
+    slots_.reserve(max_entries_);
+}
+
+std::shared_ptr<const SerialPrefixCacheEntry> SerialPrefixCache::find(
+    std::span<const std::uint32_t> tokens, std::uint64_t execution,
+    std::uint64_t compatibility, std::uint64_t layout, const ArithmeticLineage* history) {
+    for (std::size_t i = 0; i < slots_.size(); ++i) {
+        if (!slots_[i].entry->matches(tokens, execution, compatibility, layout, history)) continue;
+        auto handle = slots_[i].entry;
+        std::rotate(slots_.begin() + i, slots_.begin() + i + 1U, slots_.end());
+        return handle;
+    }
+    return {};
+}
+
+SerialPrefixCacheAdmission SerialPrefixCache::insert(
+    SerialPrefixCacheEntry entry, std::shared_ptr<const void> actual_owner) {
+    struct CandidateLifetime {
+        std::shared_ptr<const void> owner;
+        SerialPrefixCacheEntry& snapshot;
+        ~CandidateLifetime() { snapshot = SerialPrefixCacheEntry{}; }
+    } candidate_lifetime{actual_owner, entry};
+    // Keep the allocator alive while discarding a rejected candidate as well.
+    // Function-parameter destruction order must not decide resource lifetime.
+    if (!entry.valid() || !actual_owner)
+        throw std::invalid_argument("serial prefix cache insertion requires a valid snapshot and actual owner");
+    const auto& prefix = entry.prefix();
+    if (find(prefix.prefix_tokens, prefix.snapshot.compiled_execution_identity,
+        prefix.snapshot.runtime_compatibility_identity, prefix.snapshot.state_layout_identity,
+        &prefix.arithmetic_lineage)) return SerialPrefixCacheAdmission::already_present;
+    const auto& memory = entry.memory();
+    if (memory.device_section_bytes > std::numeric_limits<std::uint64_t>::max() - memory.host_section_bytes)
+        return SerialPrefixCacheAdmission::snapshot_budget_exceeded;
+    const auto bytes = memory.device_section_bytes + memory.host_section_bytes;
+    if (bytes > byte_budget_) return SerialPrefixCacheAdmission::snapshot_budget_exceeded;
+    auto remaining_bytes = snapshot_bytes_;
+    auto remaining_entries = slots_.size();
+    // Prove admission before evicting anything. A failed admission preserves all
+    // existing snapshots, including unpinned ones needed by another request.
+    for (const auto& slot : slots_) {
+        if (remaining_entries < max_entries_ && remaining_bytes <= byte_budget_ - bytes) break;
+        if (slot.entry.use_count() != 1) continue;
+        remaining_bytes -= slot.bytes;
+        --remaining_entries;
+    }
+    if (remaining_entries >= max_entries_ || remaining_bytes > byte_budget_ - bytes)
+        return SerialPrefixCacheAdmission::pinned_capacity;
+    struct RetainedEntry {
+        // Destruction releases the snapshot before its allocator/resource owner.
+        std::shared_ptr<const void> owner;
+        SerialPrefixCacheEntry entry;
+        RetainedEntry(std::shared_ptr<const void> value, SerialPrefixCacheEntry snapshot)
+            : owner(std::move(value)), entry(std::move(snapshot)) {}
+    };
+    auto retained = std::make_shared<RetainedEntry>(std::move(actual_owner), std::move(entry));
+    auto handle = std::shared_ptr<const SerialPrefixCacheEntry>(retained, &retained->entry);
+    for (std::size_t i = 0; i < slots_.size() &&
+        (slots_.size() >= max_entries_ || snapshot_bytes_ > byte_budget_ - bytes);) {
+        if (slots_[i].entry.use_count() != 1) { ++i; continue; }
+        snapshot_bytes_ -= slots_[i].bytes;
+        slots_.erase(slots_.begin() + i);
+    }
+    slots_.push_back({std::move(handle), bytes});
+    snapshot_bytes_ += bytes;
+    return SerialPrefixCacheAdmission::inserted;
+}
+
+std::size_t SerialPrefixCache::evict_unpinned() noexcept {
+    std::size_t evicted = 0;
+    for (std::size_t i = 0; i < slots_.size();) {
+        if (slots_[i].entry.use_count() != 1) { ++i; continue; }
+        snapshot_bytes_ -= slots_[i].bytes;
+        slots_.erase(slots_.begin() + i);
+        ++evicted;
+    }
+    return evicted;
 }
 
 }  // namespace strix

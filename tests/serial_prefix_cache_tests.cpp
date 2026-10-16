@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <memory>
 #include <stdexcept>
 #include <unordered_map>
 #include <vector>
@@ -364,6 +365,56 @@ int main() {
     expect(
         foreign_runtime_rejected,
         "prefix cache rejects restore into a foreign runtime");
+
+    // Actual snapshot allocations, including eviction while another request
+    // holds a handle. Token variants isolate cache keys, not model arithmetic.
+    auto cache_allocator = std::make_shared<VectorAllocator>();
+    const std::weak_ptr<VectorAllocator> allocator_lifetime = cache_allocator;
+    const auto capture_variant = [&](unsigned variant) {
+        auto tokens = prefix_tokens;
+        tokens.back() ^= variant;
+        return strix::SerialPrefixCacheEntry::capture(model, tokens, session,
+            layout, state_memory, *cache_allocator, generations, transfer);
+    };
+    auto first_entry = capture_variant(0);
+    const auto snapshot_bytes = first_entry.memory().device_section_bytes + first_entry.memory().host_section_bytes;
+    std::shared_ptr<const strix::SerialPrefixCacheEntry> surviving_handle;
+    auto tokens_b = prefix_tokens; tokens_b.back() ^= 1U;
+    auto tokens_c = prefix_tokens; tokens_c.back() ^= 2U;
+    {
+        strix::SerialPrefixCache pool(2, snapshot_bytes * 2U);
+        expect(pool.insert(std::move(first_entry), cache_allocator) == strix::SerialPrefixCacheAdmission::inserted,
+            "bounded cache admits the first complete snapshot");
+        auto pinned = pool.find(prefix_tokens, session.execution_identity,
+            session.runtime_compatibility_identity, session.state_layout_identity);
+        expect(pinned != nullptr, "cache lookup pins a complete snapshot");
+        expect(pool.insert(capture_variant(1), cache_allocator) == strix::SerialPrefixCacheAdmission::inserted &&
+            pool.insert(capture_variant(2), cache_allocator) == strix::SerialPrefixCacheAdmission::inserted,
+            "cache evicts an unpinned snapshot to admit another key");
+        expect(!pool.find(tokens_b, session.execution_identity, session.runtime_compatibility_identity,
+            session.state_layout_identity), "eviction removes the unpinned key");
+        surviving_handle = pool.find(tokens_c, session.execution_identity,
+            session.runtime_compatibility_identity, session.state_layout_identity);
+        expect(surviving_handle && pool.size() == 2U && pool.snapshot_bytes() == snapshot_bytes * 2U,
+            "cache accounts both retained physical snapshot sections");
+        expect(pool.insert(capture_variant(3), cache_allocator) == strix::SerialPrefixCacheAdmission::pinned_capacity &&
+            pool.size() == 2U && pool.evict_unpinned() == 0U,
+            "capacity rejection preserves both in-flight snapshots");
+        expect(pool.insert(capture_variant(0), cache_allocator) == strix::SerialPrefixCacheAdmission::already_present,
+            "duplicate capture does not replace a pinned snapshot");
+        pinned.reset();
+        expect(pool.evict_unpinned() == 1U && pool.snapshot_bytes() == snapshot_bytes,
+            "unpinning enables eviction and updates the byte budget");
+        cache_allocator.reset();
+        expect(!allocator_lifetime.expired(), "cache handles retain the actual snapshot allocator");
+    }
+    expect(!allocator_lifetime.expired() && surviving_handle,
+        "a lookup handle retains its snapshot and allocator after cache destruction");
+    if (surviving_handle) {
+        surviving_handle->restore(session, model, layout, state_memory, transfer, tokens_c);
+    }
+    surviving_handle.reset();
+    expect(allocator_lifetime.expired(), "snapshot buffers release before the final allocator owner");
 
     if (failures == 0) {
         std::cout

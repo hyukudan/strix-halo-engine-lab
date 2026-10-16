@@ -10,7 +10,9 @@
 #include "strix/session_state_memory.hpp"
 
 #include <cstdint>
+#include <memory>
 #include <span>
+#include <vector>
 
 namespace strix {
 
@@ -83,6 +85,47 @@ public:
 private:
     SerialPrefixSnapshot prefix_;
     SessionSnapshotMemoryOwner memory_;
+};
+
+enum class SerialPrefixCacheAdmission {
+    inserted,
+    already_present,
+    snapshot_budget_exceeded,
+    pinned_capacity,
+};
+
+// Serialized LRU of complete snapshots. The byte budget covers the retained
+// host/device snapshot sections, not allocator overhead or externally captured
+// candidates. Callers budget capture peaks separately. Entry count is bounded.
+// A lookup handle pins its snapshot AND the actual allocator/resource owner;
+// pinned entries cannot be evicted to admit another snapshot. Hold that handle
+// through transfer completion/device quiescence, including failure recovery.
+class SerialPrefixCache final {
+public:
+    SerialPrefixCache(std::size_t max_entries, std::uint64_t snapshot_byte_budget);
+    SerialPrefixCache(const SerialPrefixCache&) = delete;
+    SerialPrefixCache& operator=(const SerialPrefixCache&) = delete;
+
+    [[nodiscard]] SerialPrefixCacheAdmission insert(
+        SerialPrefixCacheEntry entry, std::shared_ptr<const void> actual_owner);
+    [[nodiscard]] std::shared_ptr<const SerialPrefixCacheEntry> find(
+        std::span<const std::uint32_t> prefix_tokens,
+        std::uint64_t execution_identity, std::uint64_t runtime_compatibility_identity,
+        std::uint64_t state_layout_identity, const ArithmeticLineage* history = nullptr);
+    // Evicts only unpinned snapshots; outstanding handles retain their owners.
+    [[nodiscard]] std::size_t evict_unpinned() noexcept;
+    [[nodiscard]] std::size_t size() const noexcept { return slots_.size(); }
+    [[nodiscard]] std::uint64_t snapshot_bytes() const noexcept { return snapshot_bytes_; }
+    [[nodiscard]] std::uint64_t snapshot_byte_budget() const noexcept { return byte_budget_; }
+private:
+    struct Slot {
+        std::shared_ptr<const SerialPrefixCacheEntry> entry;
+        std::uint64_t bytes = 0;
+    };
+    const std::size_t max_entries_;
+    const std::uint64_t byte_budget_;
+    std::uint64_t snapshot_bytes_ = 0;
+    std::vector<Slot> slots_; // least recently used first
 };
 
 }  // namespace strix
