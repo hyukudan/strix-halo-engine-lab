@@ -9,6 +9,7 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -27,6 +28,13 @@ constexpr std::uint32_t kWaveMaxTopK = 32;
 constexpr std::uint32_t kRouterWave = 32;
 constexpr std::uint32_t kWaveCandidates = kMaxExperts / kRouterWave;
 static_assert(kWaveCandidates <= 32);
+constexpr std::uint32_t kRouterMaxRows = 8;
+struct RouterRowsArgs {
+    const void* hidden[kRouterMaxRows];
+    float* workspace[kRouterMaxRows];
+    std::uint32_t* indices[kRouterMaxRows];
+    float* weights[kRouterMaxRows];
+};
 constexpr std::uint64_t kLauncherTag =
     0x4d4f45524f555432ULL;
 constexpr std::uint64_t fnv_offset =
@@ -540,10 +548,10 @@ __global__ void staged_moe_route_logits_kernel(const Activation* hidden, const v
     }
 }
 
-__global__ void parallel_moe_route_select_kernel(
+__device__ __forceinline__ void parallel_moe_route_select_row(
     const float* workspace, std::uint32_t expert_count, std::uint32_t top_k,
     bool normalize_selected, std::uint32_t* selected_indices, float* selected_weights) {
-    const auto row = static_cast<std::uint32_t>(blockIdx.x);
+    constexpr std::uint32_t row = 0; // Callers pass this row's own buffers.
     const auto lane = static_cast<std::uint32_t>(threadIdx.x);
     __shared__ float logits[kMaxExperts];
     __shared__ float scratch[kThreads];
@@ -698,10 +706,10 @@ __global__ void parallel_moe_route_select_kernel(
     }
 }
 
-__global__ void ranked_parallel_moe_route_select_kernel(
+__device__ __forceinline__ void ranked_parallel_moe_route_select_row(
     const float* workspace, std::uint32_t expert_count, std::uint32_t top_k,
     bool normalize_selected, std::uint32_t* selected_indices, float* selected_weights) {
-    const auto row = static_cast<std::uint32_t>(blockIdx.x);
+    constexpr std::uint32_t row = 0; // Callers pass this row's own buffers.
     const auto lane = static_cast<std::uint32_t>(threadIdx.x);
     __shared__ float logits[kMaxExperts];
     __shared__ float scratch[kThreads];
@@ -831,10 +839,10 @@ __global__ void ranked_parallel_moe_route_select_kernel(
     }
 }
 
-__global__ void wave_parallel_moe_route_select_kernel(
+__device__ __forceinline__ void wave_parallel_moe_route_select_row(
     const float* workspace, std::uint32_t expert_count, std::uint32_t top_k,
     bool normalize_selected, std::uint32_t* selected_indices, float* selected_weights) {
-    const auto row = static_cast<std::uint32_t>(blockIdx.x);
+    constexpr std::uint32_t row = 0; // Callers pass this row's own buffers.
     const auto lane = static_cast<std::uint32_t>(threadIdx.x);
     __shared__ float logits[kMaxExperts];
     __shared__ float scratch[kThreads];
@@ -977,6 +985,98 @@ __global__ void wave_parallel_moe_route_select_kernel(
                 selected_sum;
         }
     }
+}
+
+// Serial rows offset one buffer; window rows bring their own resolved
+// buffers. Both forms run the same per-row selection body.
+__global__ void parallel_moe_route_select_kernel(const float* workspace, std::uint32_t expert_count,
+    std::uint32_t top_k, bool normalize_selected, std::uint32_t* selected_indices, float* selected_weights) {
+    const auto row = static_cast<std::uint64_t>(blockIdx.x);
+    parallel_moe_route_select_row(workspace + row * expert_count, expert_count, top_k, normalize_selected,
+        selected_indices + row * top_k, selected_weights + row * top_k);
+}
+__global__ void ranked_parallel_moe_route_select_kernel(const float* workspace, std::uint32_t expert_count,
+    std::uint32_t top_k, bool normalize_selected, std::uint32_t* selected_indices, float* selected_weights) {
+    const auto row = static_cast<std::uint64_t>(blockIdx.x);
+    ranked_parallel_moe_route_select_row(workspace + row * expert_count, expert_count, top_k, normalize_selected,
+        selected_indices + row * top_k, selected_weights + row * top_k);
+}
+__global__ void wave_parallel_moe_route_select_kernel(const float* workspace, std::uint32_t expert_count,
+    std::uint32_t top_k, bool normalize_selected, std::uint32_t* selected_indices, float* selected_weights) {
+    const auto row = static_cast<std::uint64_t>(blockIdx.x);
+    wave_parallel_moe_route_select_row(workspace + row * expert_count, expert_count, top_k, normalize_selected,
+        selected_indices + row * top_k, selected_weights + row * top_k);
+}
+enum class RouterSelect { sorted, ranked, wave };
+template <RouterSelect Mode>
+__global__ void rows_moe_route_select_kernel(RouterRowsArgs rows, std::uint32_t expert_count,
+    std::uint32_t top_k, bool normalize_selected) {
+    const auto r = blockIdx.x;
+    if constexpr (Mode == RouterSelect::wave)
+        wave_parallel_moe_route_select_row(rows.workspace[r], expert_count, top_k, normalize_selected, rows.indices[r], rows.weights[r]);
+    else if constexpr (Mode == RouterSelect::ranked)
+        ranked_parallel_moe_route_select_row(rows.workspace[r], expert_count, top_k, normalize_selected, rows.indices[r], rows.weights[r]);
+    else
+        parallel_moe_route_select_row(rows.workspace[r], expert_count, top_k, normalize_selected, rows.indices[r], rows.weights[r]);
+}
+
+// Window rows share each staged weight tile; lane (expert, row) keeps the
+// serial chain: fused, ascending from feature zero, carried across tiles.
+constexpr std::uint32_t kRowsExpertsPerBlock = 2;
+constexpr std::uint32_t kRowsTile = 512;
+constexpr std::uint32_t kRowsPitch = kRowsTile + 4;
+template <typename Activation, RouterWeightKind WeightKind, std::uint32_t Rows>
+__global__ void __launch_bounds__(256) rows_moe_route_logits_kernel(RouterRowsArgs rows, const void* weights,
+    std::uint32_t hidden_size, std::uint32_t expert_count) {
+    constexpr std::uint32_t threads = 256;
+    constexpr std::uint32_t weight_items = kRowsExpertsPerBlock * kRowsTile / threads;
+    constexpr std::uint32_t input_items = Rows * kRowsTile / threads;
+    const auto lane = static_cast<std::uint32_t>(threadIdx.x);
+    const auto expert_base = static_cast<std::uint32_t>(blockIdx.x) * kRowsExpertsPerBlock;
+    __shared__ float coefficients[kRowsExpertsPerBlock][kRowsTile];
+    __shared__ float input[Rows][kRowsPitch];
+    float w[weight_items], x[input_items];
+    const auto fetch = [&](std::uint32_t tile) {
+        const auto count = hidden_size - tile < kRowsTile ? hidden_size - tile : kRowsTile;
+        #pragma unroll
+        for (std::uint32_t item = 0; item < weight_items; ++item) {
+            const auto flat = lane + item * threads;
+            const auto expert = expert_base + flat / kRowsTile;
+            const auto feature = flat % kRowsTile;
+            w[item] = expert < expert_count && feature < count
+                ? load_weight<WeightKind>(weights, hidden_size, expert, tile + feature) : 0.0F;
+        }
+        #pragma unroll
+        for (std::uint32_t item = 0; item < input_items; ++item) {
+            const auto flat = lane + item * threads;
+            const auto feature = flat % kRowsTile;
+            x[item] = feature < count ? load_activation(static_cast<const Activation*>(rows.hidden[flat / kRowsTile]),
+                static_cast<std::uint64_t>(tile) + feature) : 0.0F;
+        }
+    };
+    const auto chain_expert = lane / 32U, chain_row = lane % 32U;
+    const bool chain = chain_expert < kRowsExpertsPerBlock && chain_row < Rows &&
+        expert_base + chain_expert < expert_count;
+    float sum = 0.0F;
+    fetch(0);
+    for (std::uint32_t tile = 0; tile < hidden_size; tile += kRowsTile) {
+        const auto count = hidden_size - tile < kRowsTile ? hidden_size - tile : kRowsTile;
+        __syncthreads();
+        #pragma unroll
+        for (std::uint32_t item = 0; item < weight_items; ++item) {
+            const auto flat = lane + item * threads;
+            coefficients[flat / kRowsTile][flat % kRowsTile] = w[item];
+        }
+        #pragma unroll
+        for (std::uint32_t item = 0; item < input_items; ++item) {
+            const auto flat = lane + item * threads;
+            input[flat / kRowsTile][flat % kRowsTile] = x[item];
+        }
+        __syncthreads();
+        if (tile + kRowsTile < hidden_size) fetch(tile + kRowsTile);
+        if (chain) sum = router_dot_ascending(input[chain_row], coefficients[chain_expert], count, sum);
+    }
+    if (chain) rows.workspace[chain_row][expert_base + chain_expert] = sum;
 }
 
 std::uint64_t required_router_weight_bytes(
@@ -1403,7 +1503,103 @@ std::uint64_t launcher_identity(
     return hash;
 }
 
+struct PreparedRouterRows {
+    RouterRowsArgs args{};
+    std::uint32_t rows = 0;
+    const RuntimeTensorBinding* tensor = nullptr;
+    RouterWeightKind kind = RouterWeightKind::f32;
+};
+// Every row passes the complete serial admission; rows add only the window
+// shape (one step, consecutive positions, one weight) and cross-row aliasing.
+PreparedRouterRows prepare_router_rows(std::span<const ExecutionDispatchContext> rows,
+    const HipMoeRouteLauncherConfig& config) {
+    if (rows.size() != 2U && rows.size() != 4U && rows.size() != 8U)
+        throw std::invalid_argument("known-window router rows count must be 2, 4 or 8");
+    if (!config.parallel_projection)
+        throw std::invalid_argument("known-window router rows require the parallel router topology");
+    PreparedRouterRows out;
+    out.rows = static_cast<std::uint32_t>(rows.size());
+    struct Range { std::uintptr_t address; std::uint64_t bytes; };
+    std::array<Range, 3U * kRouterMaxRows> writes{};
+    std::array<Range, kRouterMaxRows> reads{};
+    const auto& first = rows.front();
+    auto* user = const_cast<HipMoeRouteLauncherConfig*>(&config);
+    for (std::size_t r = 0; r < rows.size(); ++r) {
+        const auto& row = rows[r];
+        if (row.logical_rows != 1U || row.request_concurrency != 1U ||
+            row.execution_identity != first.execution_identity || row.step_id != first.step_id ||
+            row.layer != first.layer || row.kernel_id != first.kernel_id || row.position != first.position + r)
+            throw std::invalid_argument("known-window router rows identity/position differs");
+        const auto prepared = prepare_router_launch(row, user);
+        const auto workspace = prepare_parallel_router_workspace(row, config);
+        if (r && (prepared.runtime_tensor->address != out.tensor->address || prepared.kind != out.kind))
+            throw std::invalid_argument("known-window router rows selected weights differ");
+        out.tensor = prepared.runtime_tensor; out.kind = prepared.kind;
+        out.args.hidden[r] = reinterpret_cast<const void*>(prepared.hidden.address);
+        out.args.workspace[r] = reinterpret_cast<float*>(workspace.address);
+        out.args.indices[r] = reinterpret_cast<std::uint32_t*>(prepared.indices.address);
+        out.args.weights[r] = reinterpret_cast<float*>(prepared.route_weights.address);
+        reads[r] = {prepared.hidden.address, static_cast<std::uint64_t>(config.hidden_size) *
+            (config.activation == HipActivationStorage::bf16 ? 2U : 4U)};
+        writes[3U * r] = {prepared.indices.address, config.top_k * 4ULL};
+        writes[3U * r + 1U] = {prepared.route_weights.address, config.top_k * 4ULL};
+        writes[3U * r + 2U] = {workspace.address, config.expert_count * 4ULL};
+    }
+    const auto overlap = [](Range a, Range b) { return a.address < b.address + b.bytes && b.address < a.address + a.bytes; };
+    const Range weight{out.tensor->address, out.tensor->bytes};
+    for (std::size_t w = 0; w < 3U * rows.size(); ++w) {
+        if (overlap(writes[w], weight)) throw std::invalid_argument("known-window router rows output aliases weights");
+        for (std::size_t r = 0; r < rows.size(); ++r)
+            if (overlap(writes[w], reads[r])) throw std::invalid_argument("known-window router rows output aliases an input row");
+        for (std::size_t o = 0; o < w; ++o)
+            if (overlap(writes[w], writes[o])) throw std::invalid_argument("known-window router rows outputs alias");
+    }
+    return out;
+}
+
+template <typename Activation, RouterWeightKind WeightKind>
+void launch_router_rows_typed(const PreparedRouterRows& p, const HipMoeRouteLauncherConfig& config) {
+    const dim3 grid((config.expert_count + kRowsExpertsPerBlock - 1U) / kRowsExpertsPerBlock);
+    const auto* weights = reinterpret_cast<const void*>(p.tensor->address);
+    const auto stream = hip_execution_stream();
+    if (p.rows == 2U) hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_moe_route_logits_kernel<Activation, WeightKind, 2U>),
+        grid, dim3(256U), 0, stream, p.args, weights, config.hidden_size, config.expert_count);
+    else if (p.rows == 4U) hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_moe_route_logits_kernel<Activation, WeightKind, 4U>),
+        grid, dim3(256U), 0, stream, p.args, weights, config.hidden_size, config.expert_count);
+    else hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_moe_route_logits_kernel<Activation, WeightKind, 8U>),
+        grid, dim3(256U), 0, stream, p.args, weights, config.hidden_size, config.expert_count);
+    check_hip(hipGetLastError(), "known-window router rows logits launch");
+    if (config.wave_topk) hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_moe_route_select_kernel<RouterSelect::wave>),
+        dim3(p.rows), dim3(kThreads), 0, stream, p.args, config.expert_count, config.top_k, config.normalize_selected);
+    else if (config.ranked_topk) hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_moe_route_select_kernel<RouterSelect::ranked>),
+        dim3(p.rows), dim3(kThreads), 0, stream, p.args, config.expert_count, config.top_k, config.normalize_selected);
+    else hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_moe_route_select_kernel<RouterSelect::sorted>),
+        dim3(p.rows), dim3(kThreads), 0, stream, p.args, config.expert_count, config.top_k, config.normalize_selected);
+    check_hip(hipGetLastError(), "known-window router rows selection launch");
+}
+template <typename Activation>
+void launch_router_rows_by_weight(const PreparedRouterRows& p, const HipMoeRouteLauncherConfig& config) {
+    switch (p.kind) {
+    case RouterWeightKind::f32: launch_router_rows_typed<Activation, RouterWeightKind::f32>(p, config); return;
+    case RouterWeightKind::f16: launch_router_rows_typed<Activation, RouterWeightKind::f16>(p, config); return;
+    case RouterWeightKind::bf16: launch_router_rows_typed<Activation, RouterWeightKind::bf16>(p, config); return;
+    case RouterWeightKind::q8_0: launch_router_rows_typed<Activation, RouterWeightKind::q8_0>(p, config); return;
+    }
+    throw std::logic_error("unreachable router weight kind");
+}
+
 }  // namespace
+
+void moe_route_known_window_rows_preflight(std::span<const ExecutionDispatchContext> rows,
+    const HipMoeRouteLauncherConfig& config) {
+    static_cast<void>(prepare_router_rows(rows, config));
+}
+void moe_route_known_window_rows_launch(std::span<const ExecutionDispatchContext> rows,
+    const HipMoeRouteLauncherConfig& config) {
+    const auto prepared = prepare_router_rows(rows, config);
+    if (config.activation == HipActivationStorage::bf16) launch_router_rows_by_weight<std::uint16_t>(prepared, config);
+    else launch_router_rows_by_weight<float>(prepared, config);
+}
 
 void register_hip_moe_route_kernel_variant(
     const ModelContract& model,

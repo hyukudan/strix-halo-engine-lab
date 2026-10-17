@@ -7,6 +7,7 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -129,6 +130,42 @@ __device__ void store_activation(
             rounded >> 16U);
 }
 
+// Serial and window-row kernels share these per-element bodies.
+template <typename Storage>
+__device__ __forceinline__ void inject_element(const Storage* hyper, const Storage* hidden, float weight, Storage* output) {
+    const float result = load_activation(hyper) + load_activation(hidden) * weight;
+    store_activation(output, result);
+}
+template <typename Storage>
+__device__ __forceinline__ void combine_element(const Storage* shared, const Storage* routed, Storage* output) {
+    store_activation(output, load_activation(shared) + load_activation(routed));
+}
+constexpr std::uint32_t kElementwiseMaxRows = 8;
+struct ElementwiseRowsArgs {
+    const void* first[kElementwiseMaxRows];
+    const void* second[kElementwiseMaxRows];
+    const float* weights[kElementwiseMaxRows];
+    void* output[kElementwiseMaxRows];
+};
+// blockIdx.y selects the window row; each row uses its own resolved buffers.
+template <typename Storage>
+__global__ void inject_rows_kernel(ElementwiseRowsArgs rows, std::uint32_t hidden_size, std::uint32_t hc_count) {
+    const auto index = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index >= static_cast<std::uint64_t>(hidden_size) * hc_count) return;
+    const auto r = blockIdx.y;
+    inject_element(static_cast<const Storage*>(rows.first[r]) + index,
+        static_cast<const Storage*>(rows.second[r]) + index % hidden_size,
+        rows.weights[r][index / hidden_size], static_cast<Storage*>(rows.output[r]) + index);
+}
+template <typename Storage>
+__global__ void combine_rows_kernel(ElementwiseRowsArgs rows, std::uint32_t hidden_size) {
+    const auto index = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index >= hidden_size) return;
+    const auto r = blockIdx.y;
+    combine_element(static_cast<const Storage*>(rows.first[r]) + index,
+        static_cast<const Storage*>(rows.second[r]) + index, static_cast<Storage*>(rows.output[r]) + index);
+}
+
 template <typename Storage>
 __global__ void hyper_expand_kernel(
     const Storage* input,
@@ -218,16 +255,7 @@ __global__ void inject_kernel(
                 hc_count) +
         stream;
 
-    const float result =
-        load_activation(
-            &hyper_input[index]) +
-        load_activation(
-            &hidden[hidden_index]) *
-        injection_weights[weight_index];
-
-    store_activation(
-        &output[index],
-        result);
+    inject_element(&hyper_input[index], &hidden[hidden_index], injection_weights[weight_index], &output[index]);
 }
 
 template <typename Storage>
@@ -243,10 +271,7 @@ __global__ void moe_combine_kernel(
     if (index >= elements) {
         return;
     }
-    store_activation(
-        &output[index],
-        load_activation(&shared[index]) +
-        load_activation(&routed[index]));
+    combine_element(&shared[index], &routed[index], &output[index]);
 }
 
 std::uint32_t prepare_1d_blocks(std::uint64_t elements) {
@@ -1091,6 +1116,106 @@ void launch_hip_mtp_inject(const MtpNativeContext& c,MtpInjectRole role,void* st
         reinterpret_cast<std::uint16_t*>(c.resources->view(attn?HipMtpBuffer::wide_work:HipMtpBuffer::wide_next).address),
         static_cast<std::uint32_t>(c.model->hidden_size),static_cast<std::uint32_t>(c.model->hc_count),1U);
     check_hip(hipGetLastError(),"MTP native injection launch");
+}
+
+}  // namespace strix
+
+namespace strix {
+namespace {
+struct ElementwiseRowView {
+    std::array<std::pair<std::uintptr_t, std::uint64_t>, 3> reads{};
+    std::pair<std::uintptr_t, std::uint64_t> write{};
+};
+// Each row passes the complete serial admission; rows add the window shape
+// (one step, consecutive positions) and cross-row aliasing. In-place rows
+// remain legal exactly as in the serial launcher.
+template <typename Prepare>
+ElementwiseRowsArgs prepare_elementwise_rows(std::span<const ExecutionDispatchContext> rows, Prepare&& prepare) {
+    if (rows.size() != 2U && rows.size() != 4U && rows.size() != 8U)
+        throw std::invalid_argument("known-window elementwise rows count must be 2, 4 or 8");
+    std::array<ElementwiseRowView, kElementwiseMaxRows> views{};
+    ElementwiseRowsArgs args{};
+    const auto& first = rows.front();
+    for (std::size_t r = 0; r < rows.size(); ++r) {
+        const auto& row = rows[r];
+        if (row.logical_rows != 1U || row.request_concurrency != 1U ||
+            row.execution_identity != first.execution_identity || row.step_id != first.step_id ||
+            row.op != first.op || row.layer != first.layer || row.kernel_id != first.kernel_id ||
+            row.position != first.position + r)
+            throw std::invalid_argument("known-window elementwise rows identity/position differs");
+        views[r] = prepare(row, args, r);
+    }
+    const auto overlap = [](auto a, auto b) { return a.first < b.first + b.second && b.first < a.first + a.second; };
+    for (std::size_t r = 0; r < rows.size(); ++r)
+        for (std::size_t o = 0; o < rows.size(); ++o) {
+            if (o == r) continue;
+            if (o < r && overlap(views[r].write, views[o].write))
+                throw std::invalid_argument("known-window elementwise rows outputs alias");
+            for (const auto read : views[o].reads) if (read.second && overlap(views[r].write, read))
+                throw std::invalid_argument("known-window elementwise rows output aliases another row's input");
+        }
+    return args;
+}
+ElementwiseRowsArgs prepare_inject_rows(std::span<const ExecutionDispatchContext> rows,
+    const HipElementwiseLauncherConfig& config) {
+    auto* user = const_cast<HipElementwiseLauncherConfig*>(&config);
+    const auto hidden = checked_mul(config.hidden_size, activation_bytes(config));
+    const auto expanded = checked_mul(hidden, config.hc_count);
+    return prepare_elementwise_rows(rows, [&](const ExecutionDispatchContext& row, ElementwiseRowsArgs& args, std::size_t r) {
+        const auto p = prepare_inject(row, user);
+        args.first[r] = reinterpret_cast<const void*>(p.hyper.address);
+        args.second[r] = reinterpret_cast<const void*>(p.hidden.address);
+        args.weights[r] = reinterpret_cast<const float*>(p.weights.address);
+        args.output[r] = reinterpret_cast<void*>(p.output.address);
+        return ElementwiseRowView{{{{p.hyper.address, expanded}, {p.hidden.address, hidden},
+            {p.weights.address, config.hc_count * 4ULL}}}, {p.output.address, expanded}};
+    });
+}
+ElementwiseRowsArgs prepare_combine_rows(std::span<const ExecutionDispatchContext> rows,
+    const HipElementwiseLauncherConfig& config) {
+    auto* user = const_cast<HipElementwiseLauncherConfig*>(&config);
+    const auto hidden = checked_mul(config.hidden_size, activation_bytes(config));
+    return prepare_elementwise_rows(rows, [&](const ExecutionDispatchContext& row, ElementwiseRowsArgs& args, std::size_t r) {
+        const auto p = prepare_moe_combine(row, user);
+        args.first[r] = reinterpret_cast<const void*>(p.shared.address);
+        args.second[r] = reinterpret_cast<const void*>(p.routed.address);
+        args.output[r] = reinterpret_cast<void*>(p.output.address);
+        return ElementwiseRowView{{{{p.shared.address, hidden}, {p.routed.address, hidden}, {0U, 0U}}},
+            {p.output.address, hidden}};
+    });
+}
+hipStream_t elementwise_rows_stream() { return hip_execution_stream(); }
+} // namespace
+
+void inject_known_window_rows_preflight(std::span<const ExecutionDispatchContext> rows,
+    const HipElementwiseLauncherConfig& config) {
+    static_cast<void>(prepare_inject_rows(rows, config));
+}
+void inject_known_window_rows_launch(std::span<const ExecutionDispatchContext> rows,
+    const HipElementwiseLauncherConfig& config) {
+    const auto args = prepare_inject_rows(rows, config);
+    const dim3 grid(prepare_1d_blocks(checked_mul(config.hidden_size, config.hc_count)), static_cast<std::uint32_t>(rows.size()));
+    if (config.activation == HipActivationStorage::bf16)
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(inject_rows_kernel<std::uint16_t>), grid, dim3(256U), 0,
+            elementwise_rows_stream(), args, config.hidden_size, config.hc_count);
+    else hipLaunchKernelGGL(HIP_KERNEL_NAME(inject_rows_kernel<float>), grid, dim3(256U), 0,
+            elementwise_rows_stream(), args, config.hidden_size, config.hc_count);
+    check_hip(hipGetLastError(), "known-window inject rows launch");
+}
+void moe_combine_known_window_rows_preflight(std::span<const ExecutionDispatchContext> rows,
+    const HipElementwiseLauncherConfig& config) {
+    static_cast<void>(prepare_combine_rows(rows, config));
+}
+void moe_combine_known_window_rows_launch(std::span<const ExecutionDispatchContext> rows,
+    const HipElementwiseLauncherConfig& config) {
+    const auto args = prepare_combine_rows(rows, config);
+    const dim3 grid(prepare_1d_blocks(config.hidden_size), static_cast<std::uint32_t>(rows.size()));
+    if (config.activation == HipActivationStorage::bf16)
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(combine_rows_kernel<std::uint16_t>), grid, dim3(256U), 0,
+            elementwise_rows_stream(), args, config.hidden_size);
+    else hipLaunchKernelGGL(HIP_KERNEL_NAME(combine_rows_kernel<float>), grid, dim3(256U), 0,
+            elementwise_rows_stream(), args, config.hidden_size);
+    check_hip(hipGetLastError(), "known-window MoE-combine rows launch");
 }
 
 }  // namespace strix

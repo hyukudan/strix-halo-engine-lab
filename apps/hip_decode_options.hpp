@@ -222,6 +222,8 @@ struct Options {
     bool teacher_forced_score = false;
     std::string teacher_logits_path;
     bool known_prefix_expert_union = false;
+    // Router + combine/inject rows entries in the known-prefix or MTP window.
+    bool known_window_router_rows = false;
     std::string offline_tuning_cache_path;
     std::string offline_compile_provenance_path;
     strix::KnownWindowOutputPolicy known_prefix_output_policy = strix::KnownWindowOutputPolicy::all_rows;
@@ -512,6 +514,8 @@ inline void validate_resolved_known_prefix_window(const Options& options) {
     if (!options.known_prefix_window) {
         if (options.known_prefix_expert_union)
             throw std::invalid_argument("known-prefix expert union requires --known-prefix-window");
+        if (options.known_window_router_rows && !options.mtp.window_rows)
+            throw std::invalid_argument("known-window router rows require --known-prefix-window or an MTP window");
         if (options.known_prefix_rows_explicit || options.known_prefix_rows != 2)
             throw std::invalid_argument("known-prefix rows require --known-prefix-window");
         return;
@@ -745,7 +749,7 @@ inline Options parse_options(
             "[--optimization-profile auto|manual] [--execution-inventory] [--host-dispatch-telemetry] [--execution-telemetry-trace] [--device-queue-trace] "
             "[--numerical-profile exact-v5|hc-splitk-f32-v1|q51-a8-down-v1|hc-splitk-f32+q51-a8-down-v1|q51-q80-a8-down-v1|hc-splitk-f32+q51-q80-a8-down-v1|hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup-v1|hc-deferred-norm-f32+q51-q80-a8-down-v1|hc-deferred-norm-f32+q51-q80-a8-down+q5k-a8-gateup-v1] "
             "[--teacher-forced-score --generate 1 [--teacher-logits-file PATH]] "
-            "[--gpu-greedy-token] [--logprob-token ID ...] [--offline-tuning-cache FILE [--offline-compile-provenance FILE]] [--gdn-recurrent-layout baseline|stride32|stride33|transposed] [--gdn-recurrent-storage key-value|value-key] [--known-prefix-window --known-prefix-rows 2|4|8 --known-prefix-expert-union] [--known-prefix-prefill-rows 16..2048 --known-prefix-workspace-budget-bytes N --known-prefix-host-metadata-budget-bytes N --known-prefix-uma-budget-bytes N --known-prefix-host-headroom-bytes N] [--prompt-lookup [--prompt-lookup-depth 0|1|2 | --prompt-lookup-adaptive] [--prompt-lookup-snapshot occupied-kv-v1 --prompt-lookup-snapshot-bytes N]] [--serve-prefix-u32le FILE ... --serve-concurrency 1|2|4 [--serve-tensor-cohort-rows 2|4 | --serve-prefill-rows 2|4|8|16..2048 --serve-prefill-workspace-budget-bytes N --serve-prefill-host-metadata-budget-bytes N] --serve-memory-budget-bytes N --serve-request-budget-bytes N --serve-headroom-bytes N] [--gdn-islands] [--qsa-hierarchical-selection] [--qsa-gqa-heads-per-block 1|2|4] [--prepared-eager] [--moe-shared-overlap [--moe-token-cost-policy]] [--moe-overlap-arena-budget-bytes N] [--batched-moe-activation] [--validation-final-state DIR] [--validation-final-state-max-bytes N] [--reference FILE] [--max-logit-error X] "
+            "[--gpu-greedy-token] [--logprob-token ID ...] [--offline-tuning-cache FILE [--offline-compile-provenance FILE]] [--gdn-recurrent-layout baseline|stride32|stride33|transposed] [--gdn-recurrent-storage key-value|value-key] [--known-prefix-window --known-prefix-rows 2|4|8 --known-prefix-expert-union] [--known-window-router-rows] [--known-prefix-prefill-rows 16..2048 --known-prefix-workspace-budget-bytes N --known-prefix-host-metadata-budget-bytes N --known-prefix-uma-budget-bytes N --known-prefix-host-headroom-bytes N] [--prompt-lookup [--prompt-lookup-depth 0|1|2 | --prompt-lookup-adaptive] [--prompt-lookup-snapshot occupied-kv-v1 --prompt-lookup-snapshot-bytes N]] [--serve-prefix-u32le FILE ... --serve-concurrency 1|2|4 [--serve-tensor-cohort-rows 2|4 | --serve-prefill-rows 2|4|8|16..2048 --serve-prefill-workspace-budget-bytes N --serve-prefill-host-metadata-budget-bytes N] --serve-memory-budget-bytes N --serve-request-budget-bytes N --serve-headroom-bytes N] [--gdn-islands] [--qsa-hierarchical-selection] [--qsa-gqa-heads-per-block 1|2|4] [--prepared-eager] [--moe-shared-overlap [--moe-token-cost-policy]] [--moe-overlap-arena-budget-bytes N] [--batched-moe-activation] [--validation-final-state DIR] [--validation-final-state-max-bytes N] [--reference FILE] [--max-logit-error X] "
             "[--context N] [--residency register|copy] [--coalesce-gap BYTES] [--model-copy-tier none|normalization|hot_nonexpert|experts --model-copy-payload-bytes N --model-retained-budget N --model-setup-peak-budget N] "
             "[--planned-ple-io] [--ple-cpu-helper-threads 1..8] [--ple-cache-rows N --ple-cache-budget-bytes N] [--ple-max-rows-per-io N] [--ple-max-inflight-ios N] "
             "[--generate N] [--eos-token TOKEN_ID] [--prefix-cache-roundtrip] "
@@ -1103,6 +1107,11 @@ inline Options parse_options(
             if (rows != 2 && rows != 4 && rows != 8) throw std::invalid_argument("known-prefix rows must be 2, 4 or 8");
             options.known_prefix_rows = static_cast<std::uint32_t>(rows);
             options.known_prefix_rows_explicit = true;
+            continue;
+        }
+        if (argument == "--known-window-router-rows") {
+            if (options.known_window_router_rows) throw std::invalid_argument("duplicate known-window router rows option");
+            options.known_window_router_rows = true;
             continue;
         }
         if (argument == "--known-prefix-expert-union") {

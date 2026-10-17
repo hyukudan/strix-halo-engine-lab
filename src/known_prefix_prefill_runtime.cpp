@@ -138,7 +138,7 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
             writes[f]=add(writes[f],rows,"known prefill state write count overflow");
         const auto mode=plan.tile8.mode[step];const auto id=static_cast<std::uint32_t>(plan.tile8.r2_variant[step]);
         const bool multi=mode!=KnownWindowStepMode::r1_row_loop;
-        const bool rows_entry=mode==KnownWindowStepMode::shared_rows||mode==KnownWindowStepMode::gdn_rows||mode==KnownWindowStepMode::routed_expert_union;
+        const bool rows_entry=known_window_rows_mode(mode);
         if(multi) require(!reads_position(serial.execution.steps[step].reads_state)&&(rows_entry?wide_by_id[id]!=nullptr:pair_by_id[id]!=nullptr),
             "known prefill selected closed implementation is missing");
         const auto width=multi?(rows_entry?8U:2U):1U;
@@ -166,7 +166,7 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
             const auto& source=serial.execution.steps[step];
             if(!result.execution.state.contains(source.reads_state)) throw std::logic_error("known prefill persistent state disappeared after admission");
             const auto mode=plan.tile8.mode[step];const auto id=static_cast<std::uint32_t>(plan.tile8.r2_variant[step]);
-            const bool rows_entry=mode==KnownWindowStepMode::shared_rows||mode==KnownWindowStepMode::gdn_rows||mode==KnownWindowStepMode::routed_expert_union;
+            const bool rows_entry=known_window_rows_mode(mode);
             const auto width=mode==KnownWindowStepMode::r1_row_loop?1U:(rows_entry?8U:2U);
             // All tiles of this source step run before advancing to its next
             // consumer/layer. Recurrent/conv/PLE/QSA rows remain increasing.
@@ -181,7 +181,7 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
                     wide_by_id[id]->launch(std::span<const ExecutionDispatchContext>(pack.data(),8),wide_by_id[id]->config);
                     if(mode==KnownWindowStepMode::shared_rows) ++result.shared_rows_dispatches;
                     else if(mode==KnownWindowStepMode::gdn_rows) ++result.gdn_rows_dispatches;
-                    else ++result.routed_expert_union_dispatches;
+                    else if(mode==KnownWindowStepMode::routed_expert_union) ++result.routed_expert_union_dispatches;
                 } else if(count==2U) {
                     pair_by_id[id]->launch(std::span<const ExecutionDispatchContext,2>(pack.data(),2),pair_by_id[id]->config);++result.r2_dispatches;
                 } else {
