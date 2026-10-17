@@ -3631,6 +3631,21 @@ QsaKnownRows<Rows> prepare_qsa_known_rows(std::span<const ExecutionDispatchConte
 template <WeightKind Kind, unsigned Rows>
 void launch_qsa_rows_input(bool prefetch, bool a8, const QsaRowsInputViews<Rows>& views, std::uint32_t hidden, hipStream_t stream,
     bool any_order = false) {
+    if constexpr (Rows > 8U) if (Kind != WeightKind::q8_0 || !prefetch) {
+        // Prefill blocks: only the prefetch8 Q8 site has a wide form; other kinds keep 8-row launches.
+        for (unsigned first = 0; first < Rows; first += 8U) {
+            QsaRowsInputViews<8U> slice{};
+            for (unsigned m = 0; m < 5U; ++m) slice.weights[m] = views.weights[m];
+            for (unsigned m = 0; m < 6U; ++m) slice.first[m] = views.first[m];
+            slice.count = views.count;
+            for (unsigned r = 0; r < 8U; ++r) {
+                slice.input[r] = views.input[first + r];
+                for (unsigned m = 0; m < 5U; ++m) slice.output[m][r] = views.output[m][first + r];
+            }
+            launch_qsa_rows_input<Kind, 8U>(prefetch, a8, slice, hidden, stream, any_order);
+        }
+        return;
+    }
     if constexpr (Kind == WeightKind::q8_0) if (prefetch) {
         QsaInputRowsSite<Rows> site{};
         for (unsigned m = 0; m < views.count; ++m) {
@@ -3653,6 +3668,14 @@ void launch_qsa_rows_input(bool prefetch, bool a8, const QsaRowsInputViews<Rows>
 template <WeightKind Kind, unsigned Rows>
 void launch_qsa_rows_output(bool wave8, bool a8, const QsaRowsOutputViews<Rows>& views, const void* weights,
     std::uint32_t width, std::uint32_t hidden, hipStream_t stream) {
+    if constexpr (Rows > 8U) if (Kind != WeightKind::q8_0 || !wave8) {
+        for (unsigned first = 0; first < Rows; first += 8U) {
+            QsaRowsOutputViews<8U> slice{};
+            for (unsigned r = 0; r < 8U; ++r) { slice.input[r] = views.input[first + r]; slice.output[r] = views.output[first + r]; }
+            launch_qsa_rows_output<Kind, 8U>(wave8, a8, slice, weights, width, hidden, stream);
+        }
+        return;
+    }
     if constexpr (Kind == WeightKind::q8_0) if (wave8) {
         QsaOutputRowsSite<Rows> site{};
         site.segments = q8_rows::segments({{weights, hidden}});
@@ -3683,8 +3706,10 @@ void dispatch_small_kind(std::uint32_t type, Launch&& launch) {
     }
 }
 
+// parts: 1 input projections, 2 norm/store/selection/attention (rows <= 8 only), 4 output projection.
 template <unsigned Rows>
-void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexedAttentionLauncherConfig& config) {
+void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexedAttentionLauncherConfig& config,
+    unsigned parts = 7U) {
     const auto& model = config.model;
     const auto& a = prepared.row[0];
     const auto& tensors = a.tensors;
@@ -3701,7 +3726,7 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
     // targets; the q and k norms follow a barrier-ordered index norm and touch only their own.
     static const bool any_order = strix_any_order_enabled();
     bool launched_group = false;
-    for (unsigned lead = 0; lead < 5U; ++lead) {
+    if (parts & 1U) for (unsigned lead = 0; lead < 5U; ++lead) {
         if (done[lead]) continue;
         // Group every matrix sharing the lead's serial organization (format + prefetch8).
         QsaRowsInputViews<Rows> input{};
@@ -3725,6 +3750,7 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
             config.prefetch_stats->dispatched_projections.fetch_add(input.count, std::memory_order_relaxed);
     }
 
+    if constexpr (Rows <= 8U) if (parts & 2U) {
     const auto norm = [&](const TensorPair& weights, float* WorkspacePointers::* target, std::uint32_t heads,
                           std::uint32_t head_dim, std::uint32_t stride, bool unordered) {
         QsaRowsNormViews<Rows> views{};
@@ -3807,6 +3833,8 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
     hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_output_rows_kernel<Rows>), dim3(a.attention_heads, Rows), dim3(a.head_dim), 0,
         stream, attention, kv, maximum_selected, a.attention_heads, a.kv_heads, a.head_dim);
     check_hip(hipGetLastError(), "QSA known-window value/gate launch");
+    }
+    if (!(parts & 4U)) return;
 
     QsaRowsOutputViews<Rows> out{};
     for (unsigned r = 0; r < Rows; ++r) {
@@ -3939,6 +3967,60 @@ std::uint64_t implementation_identity(
 }
 
 }  // namespace
+
+namespace {
+// Prefill: every 8-row tile is admitted like a window call. Input and output projections run
+// 64 rows per launch (R1-exact wide q8_rows); the attention part runs tile by tile in increasing
+// order, so each tile reads the KV the earlier tiles appended.
+std::vector<QsaKnownRows<8U>> prepare_qsa_prefill_rows(std::span<const ExecutionDispatchContext> rows,
+    const HipIndexedAttentionLauncherConfig& config, HipQsaIndexJournal journal) {
+    if (rows.size() < 16U || rows.size() % 8U) throw std::invalid_argument("QSA prefill rows require 8-row tiles");
+    if (config.known_window_a8_projections) throw std::invalid_argument("QSA prefill rows are not A8");
+    std::vector<QsaKnownRows<8U>> tiles;
+    tiles.reserve(rows.size() / 8U);
+    for (std::size_t t = 0; t < rows.size() / 8U; ++t) {
+        tiles.push_back(prepare_qsa_known_rows<8U>(rows.subspan(t * 8U, 8U), config, journal));
+        if (tiles.back().prefetch != tiles.front().prefetch || tiles.back().journal != tiles.front().journal)
+            throw std::invalid_argument("QSA prefill tiles select different organizations");
+    }
+    return tiles;
+}
+template <unsigned W>
+void enqueue_qsa_prefill_projection(const std::vector<QsaKnownRows<8U>>& tiles, std::size_t first,
+    const HipIndexedAttentionLauncherConfig& config, unsigned part) {
+    auto combined = std::make_unique<QsaKnownRows<W>>();
+    combined->prefetch = tiles[first].prefetch; combined->journal = tiles[first].journal;
+    for (unsigned r = 0; r < W; ++r) {
+        const auto& tile = tiles[first + r / 8U];
+        combined->row[r] = tile.row[r % 8U]; combined->selection[r] = tile.selection[r % 8U];
+        combined->position[r] = tile.position[r % 8U];
+    }
+    enqueue_qsa_known_rows<W>(*combined, config, part);
+}
+void enqueue_qsa_prefill_rows(const std::vector<QsaKnownRows<8U>>& tiles, const HipIndexedAttentionLauncherConfig& config) {
+    const auto projections = [&](unsigned part) {
+        for (std::size_t t = 0; t < tiles.size();) {
+            const auto left = tiles.size() - t;
+            if (left >= 8U) { enqueue_qsa_prefill_projection<64U>(tiles, t, config, part); t += 8U; }
+            else if (left >= 4U) { enqueue_qsa_prefill_projection<32U>(tiles, t, config, part); t += 4U; }
+            else if (left >= 2U) { enqueue_qsa_prefill_projection<16U>(tiles, t, config, part); t += 2U; }
+            else { enqueue_qsa_known_rows<8U>(tiles[t], config, part); t += 1U; }
+        }
+    };
+    projections(1U);
+    for (const auto& tile : tiles) enqueue_qsa_known_rows<8U>(tile, config, 2U);
+    projections(4U);
+}
+}  // namespace
+
+void indexed_attention_known_prefill_rows_preflight(std::span<const ExecutionDispatchContext> rows,
+    const HipIndexedAttentionLauncherConfig& config, HipQsaIndexJournal journal) {
+    static_cast<void>(prepare_qsa_prefill_rows(rows, config, journal));
+}
+void indexed_attention_known_prefill_rows_launch(std::span<const ExecutionDispatchContext> rows,
+    const HipIndexedAttentionLauncherConfig& config, HipQsaIndexJournal journal) {
+    enqueue_qsa_prefill_rows(prepare_qsa_prefill_rows(rows, config, journal), config);
+}
 
 void indexed_attention_known_window_rows_preflight(std::span<const ExecutionDispatchContext> rows,
     const HipIndexedAttentionLauncherConfig& config, HipQsaIndexJournal journal) {

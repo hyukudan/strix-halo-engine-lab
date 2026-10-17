@@ -347,6 +347,23 @@ struct HipKnownPrefixWindow::Impl {
                 [](std::span<const ExecutionDispatchContext> rows,void* object) {
                     static_cast<Impl*>(object)->ple_window->launch(rows);
                 }});
+        // STRIX_PREFILL_FULL_QSA=0: keep QSA rows in 8-row tiles.
+        static const bool qsa=[]{const char* v=std::getenv("STRIX_PREFILL_FULL_QSA");return !v||v[0]!='0';}();
+        if(qsa&&window.qsa_rows_steps)
+            for(std::size_t i=0;i<window.mode.size();++i) {
+                if(window.mode[i]!=KnownWindowStepMode::qsa_rows) continue;
+                const auto variant=window.r2_variant[i];
+                if(std::any_of(prefill_entries.begin(),prefill_entries.end(),[&](const auto& e){return e.variant==variant;})) continue;
+                prefill_entries.push_back({variant,this,
+                    [](std::span<const ExecutionDispatchContext> rows,void* object) {
+                        const auto& self=*static_cast<Impl*>(object);
+                        indexed_attention_known_prefill_rows_preflight(rows,self.qsa_for(rows));
+                    },
+                    [](std::span<const ExecutionDispatchContext> rows,void* object) {
+                        const auto& self=*static_cast<Impl*>(object);
+                        indexed_attention_known_prefill_rows_launch(rows,self.qsa_for(rows));
+                    }});
+            }
         // STRIX_PREFILL_FULL_SHARED=0: keep the shared expert in 8-row tiles.
         static const bool shared=[]{const char* v=std::getenv("STRIX_PREFILL_FULL_SHARED");return !v||v[0]!='0';}();
         if(shared&&!shared_config.known_window_a8_projections)

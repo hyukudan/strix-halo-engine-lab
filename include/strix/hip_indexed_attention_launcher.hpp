@@ -117,6 +117,11 @@ void indexed_attention_known_window_rows_preflight(std::span<const ExecutionDisp
     const HipIndexedAttentionLauncherConfig&, HipQsaIndexJournal journal = {});
 void indexed_attention_known_window_rows_launch(std::span<const ExecutionDispatchContext> rows,
     const HipIndexedAttentionLauncherConfig&, HipQsaIndexJournal journal = {});
+// Prefill: all T rows of a QSA step (8-row tiles; projections 64 rows per launch).
+void indexed_attention_known_prefill_rows_preflight(std::span<const ExecutionDispatchContext> rows,
+    const HipIndexedAttentionLauncherConfig&, HipQsaIndexJournal journal = {});
+void indexed_attention_known_prefill_rows_launch(std::span<const ExecutionDispatchContext> rows,
+    const HipIndexedAttentionLauncherConfig&, HipQsaIndexJournal journal = {});
 
 // Indexer partial-block tail around a window. Snapshot (before the window)
 // copies each QSA layer's raw cells [p - p%ratio, p) into the journal; commit
