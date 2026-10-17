@@ -161,6 +161,7 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
     lap("admit");
     hooks.preflight_scope();
     lap("scope");
+    std::array<double,32> mode_ms{};
     for(std::size_t step=0;step<steps;++step) {
         for(std::size_t f=0;f<flags.size();++f) if(
             (static_cast<std::uint32_t>(serial.execution.steps[step].writes_state)&static_cast<std::uint32_t>(flags[f])))
@@ -177,9 +178,25 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
         // each context before enqueueing, so an out-of-capacity block fails during launch (session
         // poisoned) instead of before it; capacity and positions are checked above for every block.
         if(preflight_known) continue;
+        const auto step_begin=timing?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
+        const auto step_done=[&]{
+            if(timing) mode_ms[static_cast<std::size_t>(mode)%mode_ms.size()]+=
+                std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-step_begin).count();
+        };
         if(rows_entry&&full_by_id[id]&&rows%8U==0U) {
             std::vector<ExecutionDispatchContext> all(rows);for(std::uint32_t r=0;r<rows;++r) all[r]=context(step,r);
-            full_by_id[id]->preflight(all,full_by_id[id]->config);
+            // Position-independent full-T entries: the compiled T arena (validated above for every row) makes tile t's
+            // views tile 0's plus t row strides, so the plan preflight admits the first and last two tiles; each
+            // launch still admits all of its tiles before enqueueing that step. QSA and PLE depend on positions, and the
+            // routed MoE workspace is sized for all T rows: those admit every tile here.
+            const bool edges=mode!=KnownWindowStepMode::qsa_rows&&mode!=KnownWindowStepMode::ple_rows&&
+                mode!=KnownWindowStepMode::routed_expert_union&&rows>32U;
+            if(edges) {
+                const std::span<const ExecutionDispatchContext> view(all);
+                full_by_id[id]->preflight(view.first(16U),full_by_id[id]->config);
+                full_by_id[id]->preflight(view.last(16U),full_by_id[id]->config);
+            } else full_by_id[id]->preflight(all,full_by_id[id]->config);
+            step_done();
             continue;
         }
         const auto width=multi?(rows_entry?8U:2U):1U;
@@ -191,7 +208,11 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
             else launch.steps[step].preflight(pack[0],launch.steps[step].user_data);
             first+=count;
         }
+        step_done();
     }
+    if(timing&&!preflight_known)
+        for(std::size_t m=0;m<mode_ms.size();++m) if(mode_ms[m]>0.5)
+            std::fprintf(stderr,"prefill preflight mode %2zu %8.2f ms\n",m,mode_ms[m]);
     for(std::size_t f=0;f<flags.size();++f) require(writes[f]<=UINT64_MAX-session.state.generations[f],"known prefill state generation overflow");
     lap("preflight");
     if(hooks.preflight_plan) hooks.preflight_plan();
