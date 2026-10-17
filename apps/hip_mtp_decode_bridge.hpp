@@ -208,6 +208,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
     std::vector<HipMtpReplayRow> replay_rows;replay_rows.reserve(golden.rows.size());
     std::vector<std::uint32_t> generated;generated.reserve(static_cast<std::size_t>(options.generate_tokens));
     std::uint64_t cycles=0,proposed=0,accepted=0,target_rows=0,window_attempts=0,window_accepts=0,window_restores=0,r2_dispatches=0;
+    std::array<std::uint64_t,9> chosen_rows{};
     HipMtpTargetHiddenTicket pending;
     HipMtpNativeForwardReplayResult replay;
     QualifiedMtpDraftPlan qualified;ActivatedMtpDraftPlan activated;
@@ -270,6 +271,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
         }
         HipMtpGreedyRuntime greedy(runtime,qualified,activated,target,session,r,dispatcher,parents);
         if(window && !qualify)greedy.use_window_verifier(window);
+        if(m.draft_chain)greedy.set_draft_min_probability(mtp_draft_min_probability(m));
         if(qualify){
             MtpDecodeQualificationContext context{options,parents,native,target,std::move(window),session,dispatcher,generations,greedy,*runtime,std::move(pending)};
             qualify(context);
@@ -289,6 +291,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
             pending=result.final_target;++cycles;proposed+=result.proposed_candidates;accepted+=result.accepted_candidates;
             target_rows+=result.consumed_target_rows;window_attempts+=result.attempted_target_window;window_accepts+=result.accepted_target_window;
             window_restores+=result.target_checkpoint_restored;r2_dispatches+=result.target_r2_dispatches;
+            ++chosen_rows[std::min<std::uint32_t>(result.target_window_rows,8U)];
         }
         const auto elapsed=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count();
         if(generated.back()==eos.front())stop="eos";
@@ -296,7 +299,8 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
         const auto native_stats=runtime->execution_stats();
         const auto draft_stats=runtime->draft_head()?runtime->draft_head()->stats():HipMtpDraftHeadStats{};
         std::optional<HipKnownPrefixUnionObservation> union_observation;
-        if(window)union_observation=window->window_owner()->latest_routed_union_observation();
+        if(window)for(const auto& owner:window->window_owners())
+            if(auto observed=owner->latest_routed_union_observation())union_observation=observed;
         if(m.window_expert_union && window_attempts &&
             (!parents->window_setup.union_source_steps || !union_observation))
             throw std::logic_error("MTP expert union completed no actual native group for an attempted window");
@@ -368,6 +372,16 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
             <<"  \"mtp_target_r2_dispatches_scope\":\"actual-pair-entry-dispatches-only-excludes-wide-R4-R8\",\n"
             <<"  \"mtp_target_wide_dispatches\":null,\n"
             <<"  \"mtp_target_wide_dispatches_scope\":\"not-exposed-by-current-verifier-result-not-inferred-from-geometry\",\n"
+            <<"  \"mtp_target_window_rows_set\":[";
+        if(window){const auto stats=window->owner_stats();for(std::size_t s=1;s<stats.size();++s)output<<(s>1?",":"")<<stats[s].rows;}
+        output<<"],\n  \"mtp_spec_min_p\":"<<mtp_draft_min_probability(m)<<",\n"
+            <<"  \"mtp_chosen_window_rows_histogram\":{";
+        for(std::size_t t=0,first=1;t<chosen_rows.size();++t)if(chosen_rows[t]){output<<(first?"":",")<<"\""<<t<<"\":"<<chosen_rows[t];first=0;}
+        output<<"},\n  \"mtp_chosen_window_rows_scope\":\"verifier-choice-per-cycle-1-is-serial-target-steps\",\n"
+            <<"  \"mtp_window_owner_cycle_ms_ema\":{";
+        if(window){const auto stats=window->owner_stats();
+            for(std::size_t s=0;s<stats.size();++s)output<<(s?",":"")<<"\""<<stats[s].rows<<"\":{\"cycles\":"<<stats[s].cycles<<",\"ema_ms\":"<<stats[s].cycle_ms_ema<<"}";}
+        output<<"},\n"
             <<"  \"mtp_draft_chain\":"<<(m.draft_chain?"true":"false")<<",\n"
             <<"  \"mtp_draft_exact_kernels\":"<<(m.draft_exact?"true":"false")<<",\n"
             <<"  \"mtp_draft_q4_head\":"<<(m.draft_q4?"true":"false")<<",\n"

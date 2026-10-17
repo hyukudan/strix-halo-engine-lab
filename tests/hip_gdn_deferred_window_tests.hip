@@ -214,10 +214,12 @@ struct Fixture {
         require(read(window.conv) == read(serial.conv), what + ": conv history differs");
     }
     // Window 1 (rows 0..t-1) from the initial state, keep n; window 2 (rows
-    // 8..8+t-1) applies those n first; keep m and commit. Serial: rows 0..n-1,
-    // 8..8+t-1 are re-run from the committed prefix for every comparison.
-    void scenario(unsigned t, unsigned n, unsigned m, bool capture) {
-        const auto label = "T=" + std::to_string(t) + " n_pending=" + std::to_string(n) + " n_keep=" + std::to_string(m);
+    // 8..8+u-1, u = t unless mixed sizes) applies those n first; keep m and commit.
+    // Serial: rows 0..n-1, 8..8+u-1 are re-run from the committed prefix for every comparison.
+    void scenario(unsigned t, unsigned n, unsigned m, bool capture, unsigned u = 0U) {
+        if (!u) u = t;
+        const auto label = "T=" + std::to_string(t) + (u != t ? "->" + std::to_string(u) : std::string{}) +
+            " n_pending=" + std::to_string(n) + " n_keep=" + std::to_string(m);
         reset();
         set_control(0U, 1U);
         window_rows(0U, t, false);
@@ -234,10 +236,10 @@ struct Fixture {
         write(serial.matrix, state0); write(serial.conv, history0);
         serial_rows(0U, n);
         set_control(n, 0U);
-        window_rows(8U, t, capture);
+        window_rows(8U, u, capture);
         same_state(label + " after pending commit");
-        serial_rows(8U, t);
-        same_rows(8U, t, label + " window 2");
+        serial_rows(8U, u);
+        same_rows(8U, u, label + " window 2");
         write(serial.matrix, state0); write(serial.conv, history0);
         serial_rows(0U, n); serial_rows(8U, m);
         set_control(m, 1U);
@@ -301,6 +303,9 @@ int main(int argc, char** argv) {
             Fixture fixture(variant.storage, variant.layout, variant.q8, variant.bf16_small, cases + 1U);
             for (const unsigned t : {1U, 2U, 3U, 4U, 8U})
                 for (unsigned n = 0; n <= t; ++n) { fixture.scenario(t, n, (t - n + 1U) % (t + 1U), n == 1U); ++cases; }
+            // Owners of different sizes sharing one pending record (adaptive verifier).
+            for (const auto [t, u] : {std::pair{2U, 4U}, std::pair{4U, 2U}, std::pair{8U, 2U}, std::pair{2U, 8U}, std::pair{4U, 8U}, std::pair{8U, 4U}})
+                for (unsigned n = 0; n <= t; ++n) { fixture.scenario(t, n, (n + 1U) % (u + 1U), n == 2U, u); ++cases; }
         }
         std::cout << "deferred GDN window: " << cases << " scenarios bit-exact (outputs, workspaces, matrix, conv history)\n";
         return 0;

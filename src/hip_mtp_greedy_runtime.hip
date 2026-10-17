@@ -30,6 +30,7 @@ struct HipMtpGreedyRuntime::Impl {
     std::unique_ptr<QualifiedMtpForwardRuntimeAdapter> adapter;
     std::unique_ptr<QualifiedMtpDraftBackend> backend;
     bool busy=false,failed=false,cycled=false;
+    float min_probability=0.0F;
     Impl(std::shared_ptr<HipMtpRuntime> m,QualifiedMtpDraftPlan q,ActivatedMtpDraftPlan a,
          std::shared_ptr<HipMtpTargetHidden> t,SerialSessionContext& s,const ExecutionRuntimeResources& r,
          DirectLaunchDispatcher& d,std::shared_ptr<const void> o)
@@ -64,6 +65,10 @@ void HipMtpGreedyRuntime::use_window_verifier(std::shared_ptr<HipMtpWindowVerifi
     auto& i=*impl_;require(!i.busy && !failed() && !i.cycled && window && window->target_owner()==i.target,
         "MTP window verifier must retain the same actual idle target before the first cycle");
     i.window=std::move(window);
+}
+void HipMtpGreedyRuntime::set_draft_min_probability(float p) {
+    auto& i=*impl_;require(!i.busy && !i.cycled && p>=0.0F && p<=1.0F,"MTP draft minimum probability is set once in [0, 1] before cycles");
+    i.min_probability=p;
 }
 void HipMtpGreedyRuntime::prime_prompt(std::span<const HipMtpReplayRow> rows) {
     auto& i=*impl_;require(!i.busy && !failed(),"MTP greedy consumer is busy or failed");
@@ -132,12 +137,13 @@ HipMtpGreedyCycleResult HipMtpGreedyRuntime::cycle(const HipMtpTargetHiddenTicke
         i.cycled=true;
         i.mtp->begin_cycle(pending,initial);
         begin_draft_proposal(i.draft,*i.session);
-        const auto candidates=i.mtp->draft_head()?i.mtp->propose_chain(i.plan,i.activation,*i.session,i.draft,depth):
+        const auto candidates=i.mtp->draft_head()?i.mtp->propose_chain(i.plan,i.activation,*i.session,i.draft,depth,i.min_probability):
             i.backend->propose_candidates(*i.session,i.draft,depth);
         out.proposed_candidates=static_cast<std::uint32_t>(candidates.size());
         finish_draft_proposal(i.draft);
         if(i.window) {
-            auto verified=i.window->verify(*i.session,*i.dispatcher,initial,candidates,budget,eos);
+            auto verified=i.window->verify(*i.session,*i.dispatcher,initial,candidates,budget,eos,
+                i.mtp->draft_head()?i.mtp->draft_probabilities():std::span<const float>{});
             require(!verified.committed_rows.empty() && verified.committed_rows.size()==verified.emitted_tokens.size(),
                 "MTP target verifier returned no actual aligned committed output rows");
             for(const auto& ticket:verified.committed_rows) {
@@ -150,6 +156,7 @@ HipMtpGreedyCycleResult HipMtpGreedyRuntime::cycle(const HipMtpTargetHiddenTicke
             out.target_checkpoint_restored=verified.restored_checkpoint;
             out.target_r2_dispatches=verified.r2_dispatches;
             out.target_projection_launches_saved=verified.projection_launches_saved;
+            out.target_window_rows=verified.chosen_rows;
             out.eos=is_eos(out.emitted_tokens.back());out.terminal_budget=out.emitted_tokens.size()>=budget;
         } else {
         for(std::size_t index=0;;++index) {

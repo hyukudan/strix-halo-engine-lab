@@ -11,8 +11,9 @@ namespace strix {
 namespace {
 constexpr unsigned threads=256;
 constexpr std::uint32_t max_slots=16;
-struct Partial {float value;std::uint32_t token,bad,valid;};
-struct Reply {std::uint32_t tokens[max_slots];std::uint32_t status;};
+// sum: sum of exp(logit - value) over the finite rows of the partial (softmax denominator at its max).
+struct Partial {float value;std::uint32_t token,bad,valid;float sum;};
+struct Reply {std::uint32_t tokens[max_slots];std::uint32_t status;float probabilities[max_slots];};
 void require(bool ok,const char* message) {if(!ok) throw std::invalid_argument(message);}
 void check(hipError_t e,const char* message) {if(e!=hipSuccess) throw std::runtime_error(std::string(message)+": "+hipGetErrorString(e));}
 // Same monotone key and lowest-token tie rule as the full greedy selector.
@@ -20,6 +21,15 @@ __device__ std::uint32_t numeric_key(float value) {
     auto bits=__float_as_uint(value);
     if((bits&0x7fffffffU)==0) bits=0;
     return (bits&0x80000000U)?~bits:(bits^0x80000000U);
+}
+__device__ float block_sum(float* values,float value) {
+    const auto lane=static_cast<unsigned>(threadIdx.x);
+    values[lane]=value;__syncthreads();
+    for(unsigned stride=threads/2;stride;stride>>=1U) {
+        if(lane<stride) values[lane]+=values[lane+stride];
+        __syncthreads();
+    }
+    return values[0];
 }
 __device__ Partial choose(Partial a,const Partial b) {
     const auto bad=a.bad|b.bad;
@@ -82,7 +92,8 @@ __global__ __launch_bounds__(threads) void draft_argmax_partials(const float* lo
     __shared__ Partial values[threads];
     const auto lane=static_cast<unsigned>(threadIdx.x);
     const auto index=static_cast<std::uint64_t>(blockIdx.x)*threads+lane;
-    Partial value{0.0F,0,0,0};
+    __shared__ float sums[threads];
+    Partial value{0.0F,0,0,0,0.0F};
     if(index<rows) {
         value.value=logits[index];value.token=ids?ids[index]:static_cast<std::uint32_t>(index);
         value.bad=(__float_as_uint(value.value)&0x7f800000U)==0x7f800000U?1U:0U;value.valid=value.bad==0?1U:0U;
@@ -92,24 +103,33 @@ __global__ __launch_bounds__(threads) void draft_argmax_partials(const float* lo
         if(lane<stride) values[lane]=choose(values[lane],values[lane+stride]);
         __syncthreads();
     }
-    if(!lane) partials[blockIdx.x]=values[0];
+    auto best=values[0];
+    best.sum=block_sum(sums,value.valid && best.valid?expf(value.value-best.value):0.0F);
+    if(!lane) partials[blockIdx.x]=best;
 }
 __global__ __launch_bounds__(threads) void draft_argmax_finish(const Partial* partials,std::uint32_t count,
     std::uint32_t step,std::uint32_t* slots,Reply* reply) {
     __shared__ Partial values[threads];
     const auto lane=static_cast<unsigned>(threadIdx.x);
-    Partial value{0.0F,0,0,0};
+    __shared__ float sums[threads];
+    Partial value{0.0F,0,0,0,0.0F};
     for(std::uint32_t i=lane;i<count;i+=threads) value=choose(value,partials[i]);
     values[lane]=value;__syncthreads();
     for(unsigned stride=threads/2;stride;stride>>=1U) {
         if(lane<stride) values[lane]=choose(values[lane],values[lane+stride]);
         __syncthreads();
     }
+    const auto best=values[0];
+    float sum=0.0F;
+    for(std::uint32_t i=lane;i<count;i+=threads) {
+        const auto& p=partials[i];if(p.valid && best.valid) sum+=p.sum*expf(p.value-best.value);
+    }
+    sum=block_sum(sums,sum);
     if(!lane) {
-        const auto best=values[0];const auto failed=best.bad|(best.valid?0U:2U);
+        const auto failed=best.bad|(best.valid?0U:2U);
         // A failed row still feeds a valid id forward; the chain reader rejects it.
         const auto token=failed?0U:best.token;
-        slots[step]=token;reply->tokens[step]=token;
+        slots[step]=token;reply->tokens[step]=token;reply->probabilities[step]=failed?0.0F:1.0F/sum;
         if(failed) reply->status|=failed<<(2U*step);
     }
 }
@@ -220,6 +240,10 @@ std::vector<std::uint32_t> HipMtpDraftHead::read(std::uint32_t count) const {
     std::vector<std::uint32_t> tokens(p.reply->tokens,p.reply->tokens+count);
     for(const auto token:tokens) require(token<p.config.vocab_size,"MTP draft head produced out-of-vocabulary token");
     return tokens;
+}
+float HipMtpDraftHead::probability(std::uint32_t step) const {
+    const auto& p=*impl_;require(step<p.config.max_depth,"MTP draft probability step is invalid");
+    const volatile float* mapped=p.reply->probabilities;return mapped[step];
 }
 bool HipMtpDraftHead::full() const noexcept {return impl_->config.full;}
 HipMtpDraftHeadStats HipMtpDraftHead::stats() const noexcept {

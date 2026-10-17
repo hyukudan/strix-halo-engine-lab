@@ -98,6 +98,10 @@ public:
     void commit_prefix(std::uint32_t n_keep);
     // Applies pending GDN rows before any ordinary serial token touches GDN state.
     void flush_deferred();
+    // Before either owner executes: adopt primary's deferred GDN rows/control so
+    // windows of different sizes over one session continue one pending protocol.
+    // flush_deferred() must then run on an owner that has executed a window.
+    void share_deferred(const HipKnownPrefixWindow& primary);
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

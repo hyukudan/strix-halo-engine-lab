@@ -89,6 +89,7 @@ struct HipMtpRuntime::Impl {
     std::optional<std::uint32_t> last_teacher_next_input,base_previous_input;
     std::vector<HipMtpReplayRow> replay;
     std::vector<std::uint32_t> candidates;
+    std::vector<float> probabilities;
     MtpDraftCycleInput current;
     HipMtpExecutionStats stats;
     std::uint64_t next_source=0,base_source=0,epoch=0,profile=0;
@@ -324,7 +325,7 @@ struct HipMtpRuntime::Impl {
     }
     // Sync-free proposal chain: identical stage launches to run_current per row,
     // except the head/selector and the device-fed next input token.
-    std::vector<std::uint32_t> chain(std::uint32_t depth) {
+    std::vector<std::uint32_t> chain(std::uint32_t depth,float min_probability) {
         require(draft && cycle && cycle_base && !active && !validation && candidates.empty() &&
             depth<=owner->budget().maximum_candidate_depth,"MTP draft chain requires a fresh bounded proposal");
         if(!depth) return {};
@@ -340,7 +341,8 @@ struct HipMtpRuntime::Impl {
             const auto* hidden=reinterpret_cast<const std::uint16_t*>(owner->view(HipMtpBuffer::hidden0).address);
             copy(owner->view(HipMtpBuffer::wide_current),cycle_base->view());
             draft->begin_chain();
-            for(std::uint32_t k=0;k<depth;++k) {
+            const auto requested=depth;
+            for(std::uint32_t k=0;k<requested;++k) {
                 const auto c=context(next_source+k);
                 if(k) launch_hip_mtp_embedding_device(c,draft->device_token(k-1U),stream);
                 else launch_hip_mtp_embedding(c,pending_token,stream);
@@ -358,9 +360,14 @@ struct HipMtpRuntime::Impl {
                 copy(owner->view(HipMtpBuffer::wide_current),owner->view(HipMtpBuffer::wide_next));
                 hyper(c,MtpHyperRole::head,stream);
                 draft->launch(hidden,k,stream);
+                if(min_probability>0.0F && k+1U<requested) {
+                    check(hipStreamSynchronize(static_cast<hipStream_t>(stream)),"MTP draft early-stop step");
+                    if(draft->probability(k)<min_probability) {depth=k+1U;break;}
+                }
             }
             owner->complete();
             auto tokens=draft->read(depth);
+            probabilities.resize(depth);for(std::uint32_t k=0;k<depth;++k) probabilities[k]=draft->probability(k);
             active=false;next_source+=depth;stats.full_forward_rows+=depth;validation.reset();
             // Row zero is the pending cycle input at base_source, as in read_greedy_token.
             first_cache_reusable=true;candidates=tokens;return tokens;
@@ -448,7 +455,7 @@ void HipMtpRuntime::begin_cycle(std::uint32_t token,const HipMtpTargetHiddenTick
     // bounded by its current source position after that row was overwritten.
     // The first proposal input always copies the authoritative cycle ticket.
     p.base_previous_target=p.last_target;p.base_previous_input=p.last_teacher_next_input;
-    p.cycle_base=ticket;p.base_source=p.next_source;p.pending_token=token;p.candidates.clear();p.cycle=true;p.first_cache_reusable=false;
+    p.cycle_base=ticket;p.base_source=p.next_source;p.pending_token=token;p.candidates.clear();p.probabilities.clear();p.cycle=true;p.first_cache_reusable=false;
     p.replay.clear();p.reconcile_final.reset();p.have_replay=false;
     if(p.draft) p.draft->observe(std::span<const std::uint32_t>(&token,1));
 }
@@ -482,12 +489,13 @@ void HipMtpRuntime::observe_draft_context(std::span<const std::uint32_t> tokens)
     auto& p=*impl_;require(p.draft && !p.active && !p.broken,"MTP draft context requires an enabled idle chain");p.draft->observe(tokens);
 }
 std::vector<std::uint32_t> HipMtpRuntime::propose_chain(const QualifiedMtpDraftPlan& plan,const ActivatedMtpDraftPlan& activated,
-    const SerialSessionContext& target,const DraftProposalStateContext& proposal,std::uint32_t depth) {
+    const SerialSessionContext& target,const DraftProposalStateContext& proposal,std::uint32_t depth,float min_probability) {
     auto& p=*impl_;p.qualification(plan,activated);
     validate_mtp_draft_proposal_phase(p.owner->binding(),proposal,target,DraftProposalStatePhase::proposal_active);
     require(p.cycle && p.cycle_base && same_session(target,p.cycle_base->committed_session()),"MTP draft chain does not match its native cycle");
-    return p.chain(depth);
+    return p.chain(depth,min_probability);
 }
+std::span<const float> HipMtpRuntime::draft_probabilities() const noexcept {return impl_->probabilities;}
 void HipMtpRuntime::dispatch_mtp_step(const MtpForwardStepContext& call) {
     auto& p=*impl_;
     try {

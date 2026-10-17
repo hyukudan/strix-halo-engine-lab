@@ -75,8 +75,12 @@ public:
     [[nodiscard]] const HipMtpDraftHead* draft_head() const noexcept;
     // Context ids for the draft vocabulary (prompt; cycles add their own tokens).
     void observe_draft_context(std::span<const std::uint32_t>);
+    // min_probability > 0 completes each draft before the next and stops after
+    // the first draft whose max softmax probability is below it (that draft is
+    // kept). Returns 1..depth drafts; probabilities of the last chain below.
     [[nodiscard]] std::vector<std::uint32_t> propose_chain(const QualifiedMtpDraftPlan&,const ActivatedMtpDraftPlan&,
-        const SerialSessionContext&,const DraftProposalStateContext&,std::uint32_t depth);
+        const SerialSessionContext&,const DraftProposalStateContext&,std::uint32_t depth,float min_probability=0.0F);
+    [[nodiscard]] std::span<const float> draft_probabilities() const noexcept;
     void dispatch_mtp_step(const MtpForwardStepContext&) override;
     [[nodiscard]] MtpDraftCycleInput make_cycle_input(const QualifiedMtpDraftPlan&,const ActivatedMtpDraftPlan&,
         const MtpDraftRuntimeBinding&,const MtpDraftStateMemoryBinding&,const SerialSessionContext&,

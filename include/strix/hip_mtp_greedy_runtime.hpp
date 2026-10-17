@@ -10,6 +10,7 @@ struct HipMtpGreedyCycleResult {
     HipMtpTargetHiddenTicket final_target;
     bool attempted_target_window=false,accepted_target_window=false,target_checkpoint_restored=false;
     std::uint32_t target_r2_dispatches=0,target_projection_launches_saved=0;
+    std::uint32_t target_window_rows=0; // verifier choice: owner rows, 1 = serial; 0 without verifier
 };
 // Explicit qualified native MTP consumer, with serial or prepared closed-window target verification.
 // Native execution/performance qualification is separate from source admission.
@@ -29,6 +30,9 @@ public:
     // Explicit prepared closed-window target verification. Must be configured
     // before the first cycle; absent configuration preserves serial verification.
     void use_window_verifier(std::shared_ptr<HipMtpWindowVerifier>);
+    // Draft chains stop after the first draft below this max softmax probability
+    // (0 = full depth); the verifier receives every draft probability.
+    void set_draft_min_probability(float);
     // Prime source positions in order with actual next prompt tokens. The last
     // prompt row is reserved for begin/cycle with its actual target prediction.
     void prime_prompt(std::span<const HipMtpReplayRow>);

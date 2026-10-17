@@ -43,6 +43,10 @@ public:
     [[nodiscard]] const std::uint32_t* device_token(std::uint32_t step) const;
     // Throws on a non-finite selected row; the caller already synchronized.
     [[nodiscard]] std::vector<std::uint32_t> read(std::uint32_t count) const;
+    // Max softmax probability of step's selected row over the active head rows
+    // (1/sum exp(l - max), finite rows only; 0 for a failed step). Same mapped
+    // reply and completion rule as read(); never affects the selected token.
+    [[nodiscard]] float probability(std::uint32_t step) const;
     [[nodiscard]] bool full() const noexcept;
     [[nodiscard]] HipMtpDraftHeadStats stats() const noexcept;
     // Device views for tests: compact logits [rows] and real ids [rows] (null in full mode).
