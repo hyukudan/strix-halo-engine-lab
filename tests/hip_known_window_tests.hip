@@ -1063,6 +1063,40 @@ void qsa_rows_family(bool prefetch, bool wave8, bool bf16_indexer) {
     check(hipEventDestroy(begin), "bench event"); check(hipEventDestroy(end), "bench event");
 }
 
+// Whole QSA layer (synthetic weights, model shapes) at long context: the
+// 1-row launcher at visible = context and T-row windows ending there.
+void bench_qsa_long_context() {
+    hipEvent_t begin{}, end{};
+    check(hipEventCreate(&begin), "bench event"); check(hipEventCreate(&end), "bench event");
+    for (const std::uint64_t context : {2049ULL, 4096ULL, 32768ULL, 131072ULL, 262144ULL}) {
+        QsaFixture f(true, true, true, context);
+        f.reset();
+        const auto time = [&](auto&& work) {
+            std::vector<float> samples;
+            for (unsigned i = 0; i < 23U; ++i) {
+                check(hipEventRecord(begin, f.owner.stream), "bench begin");
+                { const HipLaunchScope active(f.scope()); work(); }
+                check(hipEventRecord(end, f.owner.stream), "bench end");
+                check(hipEventSynchronize(end), "bench wait");
+                float ms = 0.0F; check(hipEventElapsedTime(&ms, begin, end), "bench elapsed");
+                if (i >= 3U) samples.push_back(ms);
+            }
+            std::sort(samples.begin(), samples.end());
+            return samples[samples.size() / 2U];
+        };
+        f.place(context - 1U);
+        const auto one_ms = time([&] { f.serial_rows(1U); });
+        std::cout << "QSA layer context=" << context << " 1-row=" << one_ms << "ms";
+        for (const std::uint32_t count : {2U, 4U, 8U}) {
+            f.place(context - count);
+            const auto rows_ms = time([&] { indexed_attention_known_window_rows_launch(f.group(count), f.config); });
+            std::cout << " T" << count << "=" << rows_ms << "ms";
+        }
+        std::cout << '\n' << std::flush;
+    }
+    check(hipEventDestroy(begin), "bench event"); check(hipEventDestroy(end), "bench event");
+}
+
 void family_prefill_tiles(bool gdn,std::uint32_t count) {
     Fixture f(gdn,false,gdn,64U);
     const auto arena=build_known_prefill_arena(f.serial,256U,count);
@@ -1751,6 +1785,7 @@ void rows_bench() {
 } // namespace
 
 int main(int argc, char** argv) try {
+    if (std::getenv("STRIX_QSA_LONG_BENCH")) { bench_qsa_long_context(); return 0; }
     if (argc > 1 && std::string_view(argv[1]) == "--rows-bench") { rows_bench(); return 0; }
     router_rows_family();
     elementwise_rows_family();

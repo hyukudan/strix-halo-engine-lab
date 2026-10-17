@@ -1253,7 +1253,7 @@ __global__ void publish_qsa_selection_status(const std::uint32_t* local,
     if (index == 0) merge_deferred_moe_first_error(*first_error, bits, DeferredMoeDomain::qsa_selection);
 }
 
-// Single-thread body: the C1 kernel's thread 0 and each known-window row's thread 0.
+// Single-thread reference selection (diagnostic only; production runs the parallel body below).
 __device__ __forceinline__ void select_blocks_body(
     float* block_scores,
     std::uint32_t num_blocks,
@@ -1355,11 +1355,131 @@ __device__ __forceinline__ void select_blocks_body(
     }
 }
 
-__global__ void select_blocks_kernel(float* block_scores, std::uint32_t num_blocks,
+__global__ void select_blocks_serial_kernel(float* block_scores, std::uint32_t num_blocks,
     std::uint32_t select_blocks, std::uint32_t compress_ratio, std::uint32_t visible_tokens,
     std::uint32_t* selected, GraphSelectionArguments dynamic) {
     if (blockIdx.x != 0 || threadIdx.x != 0) return;
     select_blocks_body(block_scores, num_blocks, select_blocks, compress_ratio, visible_tokens, selected, dynamic);
+}
+
+// Workgroup-parallel equivalent of select_blocks_body (every thread calls it).
+// The serial loop takes, slot by slot, the lowest-index maximal score > -inf
+// (NaN never wins) and falls back to block 0 once none is left; it then emits
+// the ascending sort of that multiset. Here a radix select over the ordered
+// key (11/11/10 bits, +0 == -0) finds the k-th largest key and an ordered
+// compaction keeps every greater key plus the lowest-index equal keys, so
+// slots come out ascending. Selected scores (and block 0 on fallback) become
+// -inf exactly as the serial loop leaves them.
+constexpr std::uint32_t kSelectThreads = 1024;
+constexpr std::uint32_t kSelectWaves = kSelectThreads / 32U;
+static_assert(kSelectWaves == 32U);
+__device__ __forceinline__ std::uint32_t select_key(float value) {
+    auto bits = __float_as_uint(value);
+    if ((bits & 0x7fffffffU) == 0) bits = 0;
+    return bits & 0x80000000U ? ~bits : bits | 0x80000000U;
+}
+// Inclusive workgroup prefix sum; total is the workgroup sum.
+__device__ __forceinline__ std::uint32_t select_scan(std::uint32_t value, std::uint32_t* waves, std::uint32_t& total) {
+    const auto lane = threadIdx.x % 32U, wave = threadIdx.x / 32U;
+    for (unsigned d = 1; d < 32U; d <<= 1U) { const auto up = __shfl_up(value, d, 32); if (lane >= d) value += up; }
+    if (lane == 31U) waves[wave] = value;
+    __syncthreads();
+    if (wave == 0) {
+        auto sum = waves[lane];
+        for (unsigned d = 1; d < 32U; d <<= 1U) { const auto up = __shfl_up(sum, d, 32); if (lane >= d) sum += up; }
+        waves[lane] = sum;
+    }
+    __syncthreads();
+    total = waves[kSelectWaves - 1U];
+    value += wave ? waves[wave - 1U] : 0U;
+    __syncthreads();
+    return value;
+}
+__device__ void select_blocks_parallel_body(float* block_scores, std::uint32_t num_blocks, std::uint32_t select_blocks,
+    std::uint32_t compress_ratio, std::uint32_t visible_tokens, std::uint32_t* selected, GraphSelectionArguments dynamic) {
+    const auto tid = static_cast<std::uint32_t>(threadIdx.x);
+    if (dynamic.position.position != nullptr) {
+        if (!graph_visible(dynamic, visible_tokens)) return;
+        num_blocks = visible_tokens / compress_ratio;
+        if (num_blocks <= dynamic.block_topk) {
+            for (auto token = tid; token < visible_tokens; token += kSelectThreads) selected[token] = token;
+            return;
+        }
+        select_blocks = dynamic.block_topk;
+    }
+    __shared__ std::uint32_t histogram[2048];
+    __shared__ std::uint32_t waves[kSelectWaves];
+    __shared__ std::uint32_t found_digit, found_need, found_count;
+    std::uint32_t prefix = 0, mask = 0, need = select_blocks, zeros = 0;
+    for (unsigned pass = 0; pass < 3U; ++pass) {
+        const unsigned shift = pass == 0 ? 21U : pass == 1 ? 10U : 0U;
+        const auto digits = pass == 2 ? 1024U : 2048U;
+        for (auto i = tid; i < 2048U; i += kSelectThreads) histogram[i] = 0;
+        __syncthreads();
+        for (std::uint32_t base = 0; base < num_blocks; base += kSelectThreads) {
+            const auto block = base + tid;
+            const float value = block < num_blocks ? block_scores[block] : -INFINITY;
+            const auto key = select_key(value);
+            const bool counted = value > -INFINITY && (key & mask) == prefix;
+            const auto digit = (key >> shift) & (digits - 1U);
+            // One atomic for the lanes sharing the first counted lane's digit.
+            const auto votes = __ballot(counted);
+            if (votes) {
+                const auto leader = static_cast<unsigned>(__builtin_ctzll(votes));
+                const auto lead = __shfl(digit, static_cast<int>(leader), 32);
+                const auto same = __ballot(counted && digit == lead);
+                if (counted && digit != lead) atomicAdd(&histogram[digit], 1U);
+                else if (tid % 32U == leader) atomicAdd(&histogram[lead], static_cast<std::uint32_t>(__popcll(same)));
+            }
+        }
+        __syncthreads();
+        const auto high = 2U * tid + 1U < digits ? histogram[2U * tid + 1U] : 0U;
+        const auto low = 2U * tid < digits ? histogram[2U * tid] : 0U;
+        std::uint32_t counted_total = 0;
+        const auto above = [&] { const auto inclusive = select_scan(high + low, waves, counted_total); return counted_total - inclusive; }();
+        if (pass == 0 && counted_total <= need) { zeros = need - counted_total; need = counted_total; break; }
+        if (above < need && need <= above + high) { found_digit = 2U * tid + 1U; found_need = need - above; found_count = high; }
+        else if (above + high < need && need <= above + high + low) { found_digit = 2U * tid; found_need = need - above - high; found_count = low; }
+        __syncthreads();
+        prefix |= found_digit << shift; mask |= (digits - 1U) << shift; need = found_need;
+        if (found_count == need) break;
+    }
+    for (auto token = tid; token < zeros * compress_ratio; token += kSelectThreads) selected[token] = token % compress_ratio;
+    std::uint32_t greater_before = 0, equal_before = 0;
+    for (std::uint32_t base = 0; base < num_blocks; base += 4U * kSelectThreads) {
+        const auto first = base + 4U * tid;
+        unsigned kind[4], greater = 0, equal = 0;
+        for (unsigned j = 0; j < 4U; ++j) {
+            const auto block = first + j;
+            const float value = block < num_blocks ? block_scores[block] : -INFINITY;
+            const auto masked = select_key(value) & mask;
+            kind[j] = !(value > -INFINITY) ? 0U : masked > prefix ? 1U : masked == prefix ? 2U : 0U;
+            greater += kind[j] == 1U; equal += kind[j] == 2U;
+        }
+        std::uint32_t tile = 0;
+        const auto packed = select_scan((greater << 16U) | equal, waves, tile);
+        auto g = greater_before + (packed >> 16U) - greater, e = equal_before + (packed & 0xffffU) - equal;
+        for (unsigned j = 0; j < 4U; ++j) {
+            if (kind[j] == 1U || (kind[j] == 2U && e < need)) {
+                const auto block = first + j, slot = zeros + g + min(e, need);
+                for (std::uint32_t offset = 0; offset < compress_ratio; ++offset)
+                    selected[slot * compress_ratio + offset] = block * compress_ratio + offset;
+                block_scores[block] = -INFINITY;
+            }
+            g += kind[j] == 1U; e += kind[j] == 2U;
+        }
+        greater_before += tile >> 16U; equal_before += tile & 0xffffU;
+    }
+    if (zeros && tid == 0) block_scores[0] = -INFINITY;
+    const auto complete_tokens = num_blocks * compress_ratio, selected_complete = select_blocks * compress_ratio;
+    for (auto token = complete_tokens + tid; token < visible_tokens; token += kSelectThreads)
+        selected[selected_complete + token - complete_tokens] = token;
+}
+
+__global__ __launch_bounds__(kSelectThreads) void select_blocks_kernel(float* block_scores, std::uint32_t num_blocks,
+    std::uint32_t select_blocks, std::uint32_t compress_ratio, std::uint32_t visible_tokens,
+    std::uint32_t* selected, GraphSelectionArguments dynamic) {
+    select_blocks_parallel_body(block_scores, num_blocks, select_blocks, compress_ratio, visible_tokens, selected, dynamic);
 }
 
 __device__ __forceinline__ void attention_score_body(
@@ -2912,7 +3032,7 @@ void launch_indexed_attention(const ExecutionDispatchContext& context, void* use
         hipLaunchKernelGGL(
             select_blocks_kernel,
             dim3(1),
-            dim3(1),
+            dim3(kSelectThreads),
             0, hip_execution_stream(),
             workspace.block_scores,
             complete_blocks,
@@ -3380,7 +3500,7 @@ template <unsigned Rows> struct QsaRowsSelectViews {
     std::uint32_t visible[Rows];
 };
 template <unsigned Rows>
-__global__ void select_rows_kernel(QsaRowsSelectViews<Rows> views, std::uint32_t compress_ratio, std::uint32_t block_topk) {
+__global__ __launch_bounds__(kSelectThreads) void select_rows_kernel(QsaRowsSelectViews<Rows> views, std::uint32_t compress_ratio, std::uint32_t block_topk) {
     const auto r = blockIdx.x;
     const auto visible = views.visible[r];
     const auto complete = visible / compress_ratio;
@@ -3388,9 +3508,8 @@ __global__ void select_rows_kernel(QsaRowsSelectViews<Rows> views, std::uint32_t
         for (std::uint32_t index = threadIdx.x; index < visible; index += blockDim.x) views.selected[r][index] = index;
         return;
     }
-    if (threadIdx.x == 0)
-        select_blocks_body(views.block_scores[r], complete, block_topk, compress_ratio, visible,
-            views.selected[r], GraphSelectionArguments{});
+    select_blocks_parallel_body(views.block_scores[r], complete, block_topk, compress_ratio, visible,
+        views.selected[r], GraphSelectionArguments{});
 }
 
 template <unsigned Rows> struct QsaRowsAttentionViews {
@@ -3652,7 +3771,7 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
         });
         check_hip(hipGetLastError(), "QSA known-window block-score launch");
     }
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(select_rows_kernel<Rows>), dim3(Rows), dim3(kThreads), 0, stream, select, s0.ratio, s0.block_topk);
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(select_rows_kernel<Rows>), dim3(Rows), dim3(kSelectThreads), 0, stream, select, s0.ratio, s0.block_topk);
     check_hip(hipGetLastError(), "QSA known-window selection launch");
 
     QsaRowsAttentionViews<Rows> attention{};
@@ -3898,6 +4017,45 @@ void launch_hip_qsa_input_projection_probe(HipQsaInputProjectionMode mode,HipQsa
     else hipLaunchKernelGGL(linear_prefetch8_q8_qsa_input_kernel,dim3(outputs),dim3(32),0,hip_stream,in,w,width,outputs,out);
     check_hip(hipGetLastError(),"QSA input projection probe launch");
 }
+
+#ifdef STRIX_BUILD_KNOWN_WINDOW_DIAGNOSTIC
+void launch_hip_qsa_block_select_probe(bool reference, std::span<const HipQsaBlockSelectRow> rows, std::uint32_t ratio,
+    std::uint32_t block_topk, const std::uint64_t* device_position, std::uint64_t context_tokens, std::uint32_t* device_status,
+    void* stream) {
+    const auto owned = static_cast<hipStream_t>(stream);
+    if (!owned || owned == hipStreamPerThread || owned == hipStreamLegacy || rows.empty() || rows.size() > 8U || !ratio ||
+        (device_position && (rows.size() != 1U || !device_status)))
+        throw std::invalid_argument("QSA block-select probe requires an owned stream, 1..8 rows and a guarded device position");
+    check_hip(hipPeekAtLastError(), "QSA block-select probe stale error");
+    const GraphSelectionArguments dynamic{{device_position, context_tokens, device_status}, ratio, block_topk};
+    if (reference || rows.size() == 1U) {
+        for (const auto& row : rows) {
+            const auto complete = row.visible / ratio;
+            if (!device_position && complete <= block_topk) {
+                if (row.visible) hipLaunchKernelGGL(fill_visible_indices_kernel, dim3((row.visible + kThreads - 1U) / kThreads),
+                    dim3(kThreads), 0, owned, row.selected, row.visible);
+            } else if (reference) hipLaunchKernelGGL(select_blocks_serial_kernel, dim3(1), dim3(1), 0, owned,
+                row.scores, complete, block_topk, ratio, row.visible, row.selected, dynamic);
+            else hipLaunchKernelGGL(select_blocks_kernel, dim3(1), dim3(kSelectThreads), 0, owned,
+                row.scores, complete, block_topk, ratio, row.visible, row.selected, dynamic);
+        }
+    } else {
+        const auto launch = [&](auto count) {
+            constexpr unsigned Rows = decltype(count)::value;
+            QsaRowsSelectViews<Rows> views{};
+            for (unsigned r = 0; r < Rows; ++r) {
+                views.block_scores[r] = rows[r].scores; views.selected[r] = rows[r].selected; views.visible[r] = rows[r].visible;
+            }
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(select_rows_kernel<Rows>), dim3(Rows), dim3(kSelectThreads), 0, owned, views, ratio, block_topk);
+        };
+        if (rows.size() == 2U) launch(std::integral_constant<unsigned, 2>{});
+        else if (rows.size() == 4U) launch(std::integral_constant<unsigned, 4>{});
+        else if (rows.size() == 8U) launch(std::integral_constant<unsigned, 8>{});
+        else throw std::invalid_argument("QSA block-select probe rows kernel takes 2, 4 or 8 rows");
+    }
+    check_hip(hipGetLastError(), "QSA block-select probe launch");
+}
+#endif
 
 #ifdef STRIX_BUILD_QSA_OUTPUT_PROJECTION_DIAGNOSTIC
 void launch_hip_qsa_output_projection_probe(HipQsaOutputProjectionMode mode,
@@ -4580,7 +4738,7 @@ void launch_hip_mtp_indexer(const MtpNativeContext& c,void* raw_stream) {
             m.rms_norm_epsilon,checked_u32(m.rotary_dim(),"MTP rotary dimension"),m.rope_theta,w.block_scores,selection);
         check_hip(hipGetLastError(),"MTP compressed index score enqueue");
         mtp_attention_finite(p,w.block_scores,p.blocks,stream);
-        hipLaunchKernelGGL(select_blocks_kernel,dim3(1),dim3(1),0,stream,w.block_scores,p.blocks,p.topk,p.ratio,p.visible,w.selected_indices,selection);
+        hipLaunchKernelGGL(select_blocks_kernel,dim3(1),dim3(kSelectThreads),0,stream,w.block_scores,p.blocks,p.topk,p.ratio,p.visible,w.selected_indices,selection);
         check_hip(hipGetLastError(),"MTP compressed selection enqueue");
     }
 }
