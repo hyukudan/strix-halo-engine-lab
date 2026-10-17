@@ -1021,7 +1021,7 @@ template <unsigned Rows, bool Bf16Input>
 __global__ __launch_bounds__(256)
 void project_wave8_q8_wide_kernel(GdnWidePointers<Rows> views, const void* weights,
     std::uint32_t width, std::uint32_t outputs) {
-    static_assert(Rows == 4U || Rows == 8U);
+    static_assert(Rows >= 1U && Rows <= 8U);
     const auto lane = static_cast<std::uint32_t>(threadIdx.x) % 32U;
     const auto out = static_cast<std::uint32_t>(blockIdx.x) * 8U + static_cast<std::uint32_t>(threadIdx.x) / 32U;
     if (out >= outputs) return;
@@ -2070,6 +2070,316 @@ __global__ void gated_rms_norm_kernel(
             norm_kind,
             threadIdx.x) *
         gate_value;
+}
+
+// Deferred-commit window. Every arithmetic expression and reduction tree below
+// repeats the incumbent R1 kernels; only work placement and LDS addresses differ.
+// Slot `pending_slot` holds rows saved by the previous window, the other slot
+// receives this window's rows (a window never commits its own rows).
+constexpr std::uint32_t kGdnWindowRows = gdn_window_max_rows;
+constexpr std::uint32_t kGdnWindowKernel = 4;
+// Plain IEEE add hidden from contraction; not volatile, so independent trees interleave.
+__device__ __forceinline__ float gdn_window_add(float lower, float upper) {
+    float result;
+    asm("v_add_f32 %0, %1, %2" : "=v"(result) : "v"(lower), "v"(upper));
+    return result;
+}
+template <unsigned Rows> struct GdnWindowRows {
+    float* qkv[Rows]; float* z[Rows]; float* beta[Rows]; float* gate[Rows]; float* core[Rows];
+};
+struct GdnWindowSaved { std::uintptr_t base; std::uint64_t row_bytes, k, v, beta, gate; };
+template <class T>
+__device__ __forceinline__ T* gdn_saved(const GdnWindowSaved& saved, std::uint32_t slot, std::uint32_t row,
+    std::uint64_t offset) {
+    return reinterpret_cast<T*>(saved.base + (static_cast<std::uint64_t>(slot) * kGdnWindowRows + row) *
+        saved.row_bytes + offset);
+}
+__device__ __forceinline__ std::uint32_t gdn_window_pending(const GdnWindowControl* control) {
+    return min(control->pending_rows, kGdnWindowRows);
+}
+// The incumbent 128-leaf tree: strides 64 and 32 through LDS, 16..1 by shuffles.
+__device__ __forceinline__ float gdn_window_sum128(float* scratch, std::uint32_t lane, float value) {
+    scratch[lane] = value;
+    __syncthreads();
+    if (lane < 64U) scratch[lane] = gdn_window_add(scratch[lane], scratch[lane + 64U]);
+    __syncthreads();
+    if (lane < 32U) {
+        float sum = gdn_window_add(scratch[lane], scratch[lane + 32U]);
+#pragma unroll
+        for (unsigned distance = 16U; distance; distance /= 2U)
+            sum = gdn_window_add(sum, __shfl_down(sum, distance, 32));
+        if (lane == 0U) scratch[0] = sum;
+    }
+    __syncthreads();
+    const float total = scratch[0];
+    __syncthreads();
+    return total;
+}
+__device__ __forceinline__ void gdn_window_shift(std::uint16_t (&window)[kGdnWindowKernel], std::uint16_t value) {
+#pragma unroll
+    for (std::uint32_t index = 0; index + 1U < kGdnWindowKernel; ++index) window[index] = window[index + 1U];
+    window[kGdnWindowKernel - 1U] = value;
+}
+// Conv history commit of the pending rows, then conv/SiLU, q/k L2 norm and
+// beta/gate transforms of every window row. Blocks own one 128-channel head;
+// the trailing block owns the per-head beta/gate scalars.
+template <unsigned Rows>
+__global__ __launch_bounds__(kRecurrentThreads)
+void gdn_window_prepare_kernel(GdnWindowRows<Rows> rows, std::uint16_t* conv_state, const void* conv_weights,
+    SmallWeightKind conv_kind, const void* dt, SmallWeightKind dt_kind, const void* a, SmallWeightKind a_kind,
+    GdnWindowSaved saved, const GdnWindowControl* control, std::uint32_t key_heads, std::uint32_t value_heads,
+    std::uint32_t head_dim, float epsilon) {
+    __shared__ float scratch[kRecurrentThreads];
+    const auto lane = static_cast<std::uint32_t>(threadIdx.x), block = static_cast<std::uint32_t>(blockIdx.x);
+    const auto pending = gdn_window_pending(control), slot = control->pending_slot & 1U, next = slot ^ 1U;
+    const auto key_width = key_heads * head_dim;
+    if (block >= key_heads * 2U + value_heads) {
+        for (auto head = lane; head < value_heads; head += kRecurrentThreads) {
+            for (unsigned row = 0; row < Rows; ++row) {
+                float* beta = rows.beta[row]; float* gate = rows.gate[row];
+                beta[head] = round_bf16(1.0F / (1.0F + expf(-beta[head])));
+                const float biased = gate[head] + load_small(dt, dt_kind, head);
+                gate[head] = load_small(a, a_kind, head) * softplus(biased);
+                gdn_saved<float>(saved, next, row, saved.beta)[head] = beta[head];
+                gdn_saved<float>(saved, next, row, saved.gate)[head] = gate[head];
+            }
+        }
+        return;
+    }
+    const auto channel = block * head_dim + lane;
+    auto* history = conv_state + static_cast<std::uint64_t>(channel) * kGdnWindowKernel;
+    std::uint16_t window[kGdnWindowKernel];
+#pragma unroll
+    for (std::uint32_t index = 0; index < kGdnWindowKernel; ++index) window[index] = history[index];
+    for (std::uint32_t row = 0; row < pending; ++row)
+        gdn_window_shift(window, gdn_saved<const std::uint16_t>(saved, slot, row, 0)[channel]);
+    if (pending) {
+#pragma unroll
+        for (std::uint32_t index = 0; index < kGdnWindowKernel; ++index) history[index] = window[index];
+    }
+    const bool is_qk = block < key_heads * 2U, is_key = is_qk && block >= key_heads;
+    for (unsigned row = 0; row < Rows; ++row) {
+        float* qkv = rows.qkv[row];
+        gdn_window_shift(window, float_to_bf16(qkv[channel]));
+        gdn_saved<std::uint16_t>(saved, next, row, 0)[channel] = window[kGdnWindowKernel - 1U];
+        float sum = 0.0F;
+        for (std::uint32_t index = 0; index < kGdnWindowKernel; ++index)
+            sum += bf16_to_float(window[index]) *
+                load_small(conv_weights, conv_kind, static_cast<std::uint64_t>(channel) * kGdnWindowKernel + index);
+        const float silu = sum / (1.0F + expf(-sum));
+        float value = round_bf16(silu);
+        if (is_qk) {
+            const float inverse = rsqrtf(gdn_window_sum128(scratch, lane, value * value) + epsilon);
+            const float q_scale = is_key ? 1.0F : rsqrtf(static_cast<float>(head_dim));
+            value = value * inverse * q_scale;
+            if (is_key) gdn_saved<float>(saved, next, row, saved.k)[channel - key_width] = value;
+        } else gdn_saved<float>(saved, next, row, saved.v)[channel - key_width * 2U] = value;
+        qkv[channel] = value;
+    }
+}
+template <GdnRecurrentStorage Storage>
+__device__ __forceinline__ std::uint64_t gdn_window_state_index(std::uint32_t value_head, std::uint32_t lane,
+    std::uint32_t value_index, std::uint32_t head_dim) {
+    return (static_cast<std::uint64_t>(value_head) * head_dim +
+        (Storage == GdnRecurrentStorage::value_key ? value_index : lane)) * head_dim +
+        (Storage == GdnRecurrentStorage::value_key ? lane : value_index);
+}
+// One wave per (value head, 8-column tile). Lane l holds keys l, l+32, l+64,
+// l+96, so the incumbent tree's stride-64 and stride-32 levels are in-lane,
+// (p[l] + p[l+64]) + (p[l+32] + p[l+96]), and strides 16..1 are shuffles.
+// Lane 0 holds the root; it is broadcast so every lane derives the same delta.
+constexpr std::uint32_t kGdnWindowColumns = 8;
+// Lane l < d receives lane l + d: permlanex16 across the two rows, then DPP row_shl.
+template <unsigned Distance>
+__device__ __forceinline__ float gdn_window_down(float value) {
+    if constexpr (Distance == 16U) {
+        const auto bits = __float_as_uint(value);
+        return __uint_as_float(__builtin_amdgcn_permlanex16(bits, bits, 0x76543210U, 0xfedcba98U, false, false));
+    } else {
+        const auto bits = __float_as_int(value);
+        return __int_as_float(__builtin_amdgcn_update_dpp(bits, bits, 0x100 + static_cast<int>(Distance), 0xf, 0xf, false));
+    }
+}
+__device__ __forceinline__ float gdn_window_key_sum(const float (&p)[4]) {
+    float sum = gdn_window_add(gdn_window_add(p[0], p[2]), gdn_window_add(p[1], p[3]));
+    sum = gdn_window_add(sum, gdn_window_down<16U>(sum));
+    sum = gdn_window_add(sum, gdn_window_down<8U>(sum));
+    sum = gdn_window_add(sum, gdn_window_down<4U>(sum));
+    sum = gdn_window_add(sum, gdn_window_down<2U>(sum));
+    sum = gdn_window_add(sum, gdn_window_down<1U>(sum));
+    return __int_as_float(__builtin_amdgcn_readfirstlane(__float_as_int(sum)));
+}
+struct GdnWindowInputs { float key[4], query[4], value[kGdnWindowColumns], beta, gate; };
+template <bool Output>
+__device__ __forceinline__ void gdn_window_step(float (&retained)[4][kGdnWindowColumns], const GdnWindowInputs& in,
+    float* core) {
+    float deltas[kGdnWindowColumns];
+    const float decay = expf(in.gate);
+#pragma unroll
+    for (std::uint32_t column = 0; column < kGdnWindowColumns; ++column) {
+        float products[4];
+#pragma unroll
+        for (std::uint32_t part = 0; part < 4U; ++part) {
+            retained[part][column] = retained[part][column] * decay;
+            products[part] = retained[part][column] * in.key[part];
+        }
+        deltas[column] = (in.value[column] - gdn_window_key_sum(products)) * in.beta;
+    }
+#pragma unroll
+    for (std::uint32_t column = 0; column < kGdnWindowColumns; ++column) {
+        float products[4];
+#pragma unroll
+        for (std::uint32_t part = 0; part < 4U; ++part) {
+            retained[part][column] += in.key[part] * deltas[column];
+            products[part] = retained[part][column] * in.query[part];
+        }
+        if constexpr (Output) {
+            const float sum = gdn_window_key_sum(products);
+            if (threadIdx.x == 0U) core[column] = sum;
+        }
+    }
+}
+// Read the tile once, apply the pending rows and write it once (if any), then
+// run the window rows in registers. Row inputs are loaded ahead of their step.
+template <unsigned Rows, GdnRecurrentStorage Storage>
+__device__ __forceinline__ void gdn_window_recurrence(const GdnWindowRows<Rows ? Rows : 1U>& rows, float* state,
+    const GdnWindowSaved& saved, const GdnWindowControl* control, std::uint32_t key_heads, std::uint32_t head_dim) {
+    const auto lane = static_cast<std::uint32_t>(threadIdx.x), tiles = head_dim / kGdnWindowColumns;
+    const auto value_head = static_cast<std::uint32_t>(blockIdx.x) / tiles;
+    const auto value_base = static_cast<std::uint32_t>(blockIdx.x) % tiles * kGdnWindowColumns;
+    const auto key_offset = value_head % key_heads * head_dim, key_width = key_heads * head_dim;
+    const auto value_offset = static_cast<std::uint64_t>(value_head) * head_dim + value_base;
+    const auto load = [&](const float* key, const float* query, const float* value, float beta, float gate) {
+        GdnWindowInputs in{};
+#pragma unroll
+        for (std::uint32_t part = 0; part < 4U; ++part) {
+            in.key[part] = key[part * 32U + lane];
+            if (query) in.query[part] = query[part * 32U + lane];
+        }
+#pragma unroll
+        for (std::uint32_t column = 0; column < kGdnWindowColumns; ++column) in.value[column] = value[column];
+        in.beta = beta; in.gate = gate;
+        return in;
+    };
+    const auto pending_inputs = [&](std::uint32_t slot, std::uint32_t row) {
+        return load(gdn_saved<const float>(saved, slot, row, saved.k) + key_offset, nullptr,
+            gdn_saved<const float>(saved, slot, row, saved.v) + value_offset,
+            gdn_saved<const float>(saved, slot, row, saved.beta)[value_head],
+            gdn_saved<const float>(saved, slot, row, saved.gate)[value_head]);
+    };
+    GdnWindowInputs window[Rows ? Rows : 1U];
+    if constexpr (Rows != 0U) {
+#pragma unroll
+        for (unsigned row = 0; row < Rows; ++row) {
+            const float* qkv = rows.qkv[row];
+            window[row] = load(qkv + key_width + key_offset, qkv + key_offset, qkv + key_width * 2U + value_offset,
+                rows.beta[row][value_head], rows.gate[row][value_head]);
+        }
+    }
+    float retained[4][kGdnWindowColumns];
+#pragma unroll
+    for (std::uint32_t part = 0; part < 4U; ++part)
+#pragma unroll
+        for (std::uint32_t column = 0; column < kGdnWindowColumns; ++column)
+            retained[part][column] = state[gdn_window_state_index<Storage>(value_head, part * 32U + lane, value_base + column, head_dim)];
+    const auto pending = gdn_window_pending(control), slot = control->pending_slot & 1U;
+    if (pending) {
+        auto next = pending_inputs(slot, 0U);
+        for (std::uint32_t row = 0; row < pending; ++row) {
+            const auto in = next;
+            if (row + 1U < pending) next = pending_inputs(slot, row + 1U);
+            gdn_window_step<false>(retained, in, nullptr);
+        }
+#pragma unroll
+        for (std::uint32_t part = 0; part < 4U; ++part)
+#pragma unroll
+            for (std::uint32_t column = 0; column < kGdnWindowColumns; ++column)
+                state[gdn_window_state_index<Storage>(value_head, part * 32U + lane, value_base + column, head_dim)] =
+                    retained[part][column];
+    }
+    if constexpr (Rows != 0U) {
+#pragma unroll
+        for (unsigned row = 0; row < Rows; ++row) gdn_window_step<true>(retained, window[row], rows.core[row] + value_offset);
+    }
+}
+template <unsigned Rows, GdnRecurrentStorage Storage>
+__global__ __launch_bounds__(32)
+void gdn_window_recurrent_kernel(GdnWindowRows<Rows> rows, float* state, GdnWindowSaved saved,
+    const GdnWindowControl* control, std::uint32_t key_heads, std::uint32_t head_dim) {
+    gdn_window_recurrence<Rows, Storage>(rows, state, saved, control, key_heads, head_dim);
+}
+// Standalone commit of the pending rows: recurrence tiles, then 32-channel conv groups.
+template <GdnRecurrentStorage Storage>
+__global__ __launch_bounds__(32)
+void gdn_window_commit_kernel(float* state, std::uint16_t* conv_state, GdnWindowSaved saved,
+    const GdnWindowControl* control, std::uint32_t key_heads, std::uint32_t value_heads, std::uint32_t head_dim) {
+    const auto tiles = value_heads * (head_dim / kGdnWindowColumns);
+    if (blockIdx.x < tiles) {
+        gdn_window_recurrence<0U, Storage>({}, state, saved, control, key_heads, head_dim);
+        return;
+    }
+    const auto pending = gdn_window_pending(control), slot = control->pending_slot & 1U;
+    if (!pending) return;
+    const auto channel = (static_cast<std::uint32_t>(blockIdx.x) - tiles) * 32U + static_cast<std::uint32_t>(threadIdx.x);
+    auto* history = conv_state + static_cast<std::uint64_t>(channel) * kGdnWindowKernel;
+    std::uint16_t window[kGdnWindowKernel];
+#pragma unroll
+    for (std::uint32_t index = 0; index < kGdnWindowKernel; ++index) window[index] = history[index];
+    for (std::uint32_t row = 0; row < pending; ++row)
+        gdn_window_shift(window, gdn_saved<const std::uint16_t>(saved, slot, row, 0)[channel]);
+#pragma unroll
+    for (std::uint32_t index = 0; index < kGdnWindowKernel; ++index) history[index] = window[index];
+}
+template <unsigned Rows>
+__global__ __launch_bounds__(kRecurrentThreads)
+void gdn_window_norm_kernel(GdnWindowRows<Rows> rows, const void* norm_weights, SmallWeightKind norm_kind,
+    std::uint32_t head_dim, float epsilon) {
+    __shared__ float scratch[kRecurrentThreads];
+    const auto lane = static_cast<std::uint32_t>(threadIdx.x), row = static_cast<std::uint32_t>(blockIdx.y);
+    const auto index = static_cast<std::uint64_t>(blockIdx.x) * head_dim + lane;
+    float* core = rows.core[row];
+    const float value = core[index];
+    const float inv = rsqrtf(gdn_window_sum128(scratch, lane, value * value) / static_cast<float>(head_dim) + epsilon);
+    const float gate_value = 1.0F / (1.0F + expf(-rows.z[row][index]));
+    core[index] = value * inv * load_small(norm_weights, norm_kind, lane) * gate_value;
+}
+// Batched F32 beta/alpha projections: per row the legacy 256-leaf chain and tree.
+template <unsigned Rows>
+__global__ __launch_bounds__(kProjectionThreads)
+void gdn_window_f32_gates_kernel(GdnWidePointers<Rows> input, const float* beta_weights, const float* alpha_weights,
+    GdnWindowRows<Rows> rows, std::uint32_t width, std::uint32_t heads) {
+    __shared__ float scratch[Rows][kProjectionThreads];
+    const auto lane = static_cast<std::uint32_t>(threadIdx.x);
+    const bool alpha = blockIdx.x >= heads;
+    const auto out = static_cast<std::uint32_t>(blockIdx.x) - (alpha ? heads : 0U);
+    const float* weights = (alpha ? alpha_weights : beta_weights) + static_cast<std::uint64_t>(out) * width;
+    float sum[Rows]{};
+    for (auto feature = lane; feature < width; feature += kProjectionThreads) {
+        const float weight = weights[feature];
+#pragma unroll
+        for (unsigned row = 0; row < Rows; ++row)
+            sum[row] += bf16_to_float(static_cast<const std::uint16_t*>(input.input[row])[feature]) * weight;
+    }
+#pragma unroll
+    for (unsigned row = 0; row < Rows; ++row) scratch[row][lane] = sum[row];
+    __syncthreads();
+    for (std::uint32_t stride = kProjectionThreads / 2U; stride > 32U; stride >>= 1U) {
+        if (lane < stride) {
+#pragma unroll
+            for (unsigned row = 0; row < Rows; ++row)
+                scratch[row][lane] = gdn_window_add(scratch[row][lane], scratch[row][lane + stride]);
+        }
+        __syncthreads();
+    }
+    if (lane >= 32U) return;
+#pragma unroll
+    for (unsigned row = 0; row < Rows; ++row) {
+        float total = gdn_window_add(scratch[row][lane], scratch[row][lane + 32U]);
+#pragma unroll
+        for (unsigned distance = 16U; distance; distance /= 2U)
+            total = gdn_window_add(total, __shfl_down(total, distance, 32));
+        if (lane == 0U) (alpha ? rows.gate[row] : rows.beta[row])[out] = round_bf16(total);
+    }
 }
 
 struct GdnKernelNode {
@@ -3749,6 +4059,267 @@ void gdn_known_window_r2_f32_gates_launch(std::span<const ExecutionDispatchConte
     enqueue_gdn_known_window_inputs(prepared, Format::q8_large_f32_gates);
     enqueue_gdn_known_window_completion(prepared, config);
 }
+
+namespace {
+struct GdnWindowShape {
+    std::uint32_t hidden, key_heads, value_heads, head_dim, key_width, value_width, conv_width;
+};
+GdnWindowShape gdn_window_shape(const ModelContract& model) {
+    const auto head_dim = static_cast<std::uint32_t>(model.gdn_key_head_dim);
+    const auto key_width = static_cast<std::uint32_t>(model.gdn_key_heads) * head_dim;
+    const auto value_width = static_cast<std::uint32_t>(model.gdn_value_heads) * head_dim;
+    return {static_cast<std::uint32_t>(model.hidden_size), static_cast<std::uint32_t>(model.gdn_key_heads),
+        static_cast<std::uint32_t>(model.gdn_value_heads), head_dim, key_width, value_width, key_width * 2U + value_width};
+}
+GdnWindowSaved gdn_window_saved(const ModelContract& model, const void* retained) {
+    const auto shape = gdn_window_shape(model);
+    const auto align = [](std::uint64_t bytes) { return (bytes + 255U) / 256U * 256U; };
+    GdnWindowSaved saved{reinterpret_cast<std::uintptr_t>(retained), 0, align(shape.conv_width * 2ULL), 0, 0, 0};
+    saved.v = saved.k + shape.key_width * 4ULL;
+    saved.beta = saved.v + shape.value_width * 4ULL;
+    saved.gate = saved.beta + shape.value_heads * 4ULL;
+    saved.row_bytes = align(saved.gate + shape.value_heads * 4ULL);
+    return saved;
+}
+template <unsigned Rows>
+GdnWindowRows<Rows> gdn_window_rows(std::span<const GdnWindowRow> input, const GdnWindowShape& shape) {
+    GdnWindowRows<Rows> rows{};
+    for (unsigned r = 0; r < Rows; ++r) {
+        rows.qkv[r] = input[r].workspace; rows.z[r] = rows.qkv[r] + shape.conv_width;
+        rows.beta[r] = rows.z[r] + shape.value_width; rows.gate[r] = rows.beta[r] + shape.value_heads;
+        rows.core[r] = rows.gate[r] + shape.value_heads;
+    }
+    return rows;
+}
+void validate_gdn_window(const GdnWindowLayer& layer, std::span<const GdnWindowRow> rows, bool window,
+    const GdnWindowControl* control, const HipGdnLauncherConfig& config, void* stream) {
+    validate_config(config);
+    if (!config.wave8_q8_input_projections || !config.wave8_q8_output_projection || config.model.gdn_conv_kernel != kGdnWindowKernel)
+        throw std::invalid_argument("GDN window requires wave8 Q8 input/output projections and conv kernel 4");
+    if (!control || !stream || !layer.matrix || !layer.conv_state || !layer.retained ||
+        reinterpret_cast<std::uintptr_t>(layer.retained) % 256U)
+        throw std::invalid_argument("GDN window state, retained rows, control or stream is missing");
+    if (!window) return;
+    if (rows.empty() || rows.size() > gdn_window_max_rows)
+        throw std::invalid_argument("GDN window requires 1..8 rows");
+    if (!layer.qkv || !layer.z || !layer.beta || !layer.alpha || !layer.out || !layer.conv || !layer.dt || !layer.a || !layer.norm)
+        throw std::invalid_argument("GDN window weights are missing");
+    if (layer.gate_type != 0U && layer.gate_type != 8U)
+        throw std::invalid_argument("GDN window beta/alpha must be F32 or Q8_0");
+    (void)small_weight_kind(layer.conv_type); (void)small_weight_kind(layer.dt_type);
+    (void)small_weight_kind(layer.a_type); (void)small_weight_kind(layer.norm_type);
+    for (const auto& row : rows)
+        if (!row.input || !row.output || !row.workspace || reinterpret_cast<std::uintptr_t>(row.workspace) % 16U)
+            throw std::invalid_argument("GDN window row views are missing or misaligned");
+}
+template <unsigned Rows>
+void enqueue_gdn_window(const GdnWindowLayer& layer, std::span<const GdnWindowRow> input,
+    const GdnWindowControl* control, const HipGdnLauncherConfig& config, hipStream_t stream) {
+    const auto shape = gdn_window_shape(config.model);
+    const auto rows = gdn_window_rows<Rows>(input, shape);
+    GdnWidePointers<Rows> x{};
+    for (unsigned r = 0; r < Rows; ++r) x.input[r] = input[r].input;
+    const auto project = [&](const void* weights, std::uint32_t outputs, float* const (&target)[Rows]) {
+        auto views = x;
+        for (unsigned r = 0; r < Rows; ++r) views.output[r] = target[r];
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(project_wave8_q8_wide_kernel<Rows, true>), dim3((outputs + 7U) / 8U),
+            dim3(kProjectionThreads), 0, stream, views, weights, shape.hidden, outputs);
+        check_hip(hipGetLastError(), "GDN window Q8 input projection launch");
+    };
+    project(layer.qkv, shape.conv_width, rows.qkv);
+    project(layer.z, shape.value_width, rows.z);
+    if (layer.gate_type == 0U) {
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_window_f32_gates_kernel<Rows>), dim3(shape.value_heads * 2U),
+            dim3(kProjectionThreads), 0, stream, x, static_cast<const float*>(layer.beta),
+            static_cast<const float*>(layer.alpha), rows, shape.hidden, shape.value_heads);
+        check_hip(hipGetLastError(), "GDN window F32 gate projection launch");
+    } else {
+        project(layer.beta, shape.value_heads, rows.beta);
+        project(layer.alpha, shape.value_heads, rows.gate);
+    }
+    const auto saved = gdn_window_saved(config.model, layer.retained);
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_window_prepare_kernel<Rows>),
+        dim3(shape.key_heads * 2U + shape.value_heads + 1U), dim3(kRecurrentThreads), 0, stream, rows,
+        layer.conv_state, layer.conv, small_weight_kind(layer.conv_type), layer.dt, small_weight_kind(layer.dt_type),
+        layer.a, small_weight_kind(layer.a_type), saved, control, shape.key_heads, shape.value_heads, shape.head_dim,
+        config.model.gdn_qk_l2_epsilon);
+    check_hip(hipGetLastError(), "GDN window prepare launch");
+    const auto tiles = dim3(shape.value_heads * (shape.head_dim / kGdnWindowColumns));
+    if (config.recurrent_storage == GdnRecurrentStorage::value_key)
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_window_recurrent_kernel<Rows, GdnRecurrentStorage::value_key>), tiles,
+            dim3(32), 0, stream, rows, layer.matrix, saved, control, shape.key_heads, shape.head_dim);
+    else
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_window_recurrent_kernel<Rows, GdnRecurrentStorage::key_value>), tiles,
+            dim3(32), 0, stream, rows, layer.matrix, saved, control, shape.key_heads, shape.head_dim);
+    check_hip(hipGetLastError(), "GDN window recurrence launch");
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_window_norm_kernel<Rows>), dim3(shape.value_heads, Rows),
+        dim3(kRecurrentThreads), 0, stream, rows, layer.norm, small_weight_kind(layer.norm_type), shape.head_dim,
+        config.model.rms_norm_epsilon);
+    check_hip(hipGetLastError(), "GDN window gated RMSNorm launch");
+    GdnWidePointers<Rows> views{};
+    for (unsigned r = 0; r < Rows; ++r) { views.input[r] = rows.core[r]; views.output[r] = input[r].output; }
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(project_wave8_q8_wide_kernel<Rows, false>), dim3((shape.hidden + 7U) / 8U),
+        dim3(kProjectionThreads), 0, stream, views, layer.out, shape.value_width, shape.hidden);
+    check_hip(hipGetLastError(), "GDN window Q8 output projection launch");
+}
+} // namespace
+
+std::uint64_t gdn_window_retained_row_bytes(const ModelContract& model) {
+    return gdn_window_saved(model, nullptr).row_bytes;
+}
+std::uint64_t gdn_window_retained_bytes(const ModelContract& model) {
+    return 2ULL * gdn_window_max_rows * gdn_window_retained_row_bytes(model);
+}
+void gdn_window_enqueue(const GdnWindowLayer& layer, std::span<const GdnWindowRow> rows,
+    const GdnWindowControl* control, const HipGdnLauncherConfig& config, void* stream) {
+    validate_gdn_window(layer, rows, true, control, config, stream);
+    const auto native = static_cast<hipStream_t>(stream);
+    switch (rows.size()) {
+    case 1: enqueue_gdn_window<1U>(layer, rows, control, config, native); break;
+    case 2: enqueue_gdn_window<2U>(layer, rows, control, config, native); break;
+    case 3: enqueue_gdn_window<3U>(layer, rows, control, config, native); break;
+    case 4: enqueue_gdn_window<4U>(layer, rows, control, config, native); break;
+    case 5: enqueue_gdn_window<5U>(layer, rows, control, config, native); break;
+    case 6: enqueue_gdn_window<6U>(layer, rows, control, config, native); break;
+    case 7: enqueue_gdn_window<7U>(layer, rows, control, config, native); break;
+    default: enqueue_gdn_window<8U>(layer, rows, control, config, native); break;
+    }
+}
+void gdn_window_commit_enqueue(const GdnWindowLayer& layer, const GdnWindowControl* control,
+    const HipGdnLauncherConfig& config, void* stream) {
+    validate_gdn_window(layer, {}, false, control, config, stream);
+    const auto shape = gdn_window_shape(config.model);
+    const auto saved = gdn_window_saved(config.model, layer.retained);
+    const auto grid = dim3(shape.value_heads * (shape.head_dim / kGdnWindowColumns) + shape.conv_width / 32U);
+    const auto native = static_cast<hipStream_t>(stream);
+    if (config.recurrent_storage == GdnRecurrentStorage::value_key)
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_window_commit_kernel<GdnRecurrentStorage::value_key>), grid,
+            dim3(32), 0, native, layer.matrix, layer.conv_state, saved, control,
+            shape.key_heads, shape.value_heads, shape.head_dim);
+    else
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_window_commit_kernel<GdnRecurrentStorage::key_value>), grid,
+            dim3(32), 0, native, layer.matrix, layer.conv_state, saved, control,
+            shape.key_heads, shape.value_heads, shape.head_dim);
+    check_hip(hipGetLastError(), "GDN window commit launch");
+}
+
+namespace {
+struct GdnWindowBinding {
+    GdnWindowLayer layer;
+    std::array<GdnWindowRow, gdn_window_max_rows> rows{};
+    std::size_t count = 0;
+};
+GdnWindowBinding bind_gdn_window(std::span<const ExecutionDispatchContext> rows, const HipGdnWindowConfig& config,
+    bool window) {
+    if (rows.empty() || rows.size() > gdn_window_max_rows || (!window && rows.size() != 1U))
+        throw std::invalid_argument("GDN window requires 1..8 row contexts");
+    GdnWindowBinding result;
+    std::array<PreparedGdnLaunch, gdn_window_max_rows> prepared{};
+    for (std::size_t r = 0; r < rows.size(); ++r) {
+        prepared[r] = prepare_gdn_launch(rows[r], &config.gdn);
+        const auto& first = prepared[0];
+        if (rows[r].layer != rows[0].layer || rows[r].position != rows[0].position + r ||
+            prepared[r].matrix_state.address != first.matrix_state.address ||
+            prepared[r].conv_state.address != first.conv_state.address ||
+            prepared[r].tensors.qkv.runtime != first.tensors.qkv.runtime ||
+            prepared[r].tensors.out.runtime != first.tensors.out.runtime)
+            throw std::invalid_argument("GDN window rows do not share one layer at consecutive positions");
+        result.rows[r] = {reinterpret_cast<const std::uint16_t*>(prepared[r].input.address),
+            reinterpret_cast<std::uint16_t*>(prepared[r].output.address), prepared[r].workspace.qkv};
+    }
+    const auto& row = prepared[0]; const auto& tensors = row.tensors;
+    if (tensors.qkv.manifest->ggml_type != 8U || tensors.z.manifest->ggml_type != 8U || tensors.out.manifest->ggml_type != 8U ||
+        tensors.beta.manifest->ggml_type != tensors.alpha.manifest->ggml_type)
+        throw std::invalid_argument("GDN window requires Q8_0 qkv/z/out and one beta/alpha type");
+    const auto& model = config.gdn.model;
+    const auto layer = static_cast<std::uint64_t>(*rows[0].layer);
+    const auto ordinal = layer - (layer + 1U) / model.full_attention_interval;
+    const auto per_layer = gdn_window_retained_bytes(model);
+    if (!config.retained || ordinal >= model.gdn_layers || config.retained_bytes < (ordinal + 1U) * per_layer)
+        throw std::invalid_argument("GDN window retained owner does not cover this layer");
+    const auto address = [](const TensorPair& tensor) { return reinterpret_cast<const void*>(tensor.runtime->address); };
+    auto& out = result.layer;
+    out.qkv = address(tensors.qkv); out.z = address(tensors.z); out.beta = address(tensors.beta);
+    out.alpha = address(tensors.alpha); out.out = address(tensors.out); out.conv = address(tensors.conv);
+    out.dt = address(tensors.dt); out.a = address(tensors.a); out.norm = address(tensors.norm);
+    out.gate_type = tensors.beta.manifest->ggml_type; out.conv_type = tensors.conv.manifest->ggml_type;
+    out.dt_type = tensors.dt.manifest->ggml_type; out.a_type = tensors.a.manifest->ggml_type;
+    out.norm_type = tensors.norm.manifest->ggml_type;
+    out.matrix = reinterpret_cast<float*>(row.matrix_state.address);
+    out.conv_state = reinterpret_cast<std::uint16_t*>(row.conv_state.address);
+    out.retained = static_cast<std::byte*>(config.retained) + ordinal * per_layer;
+    result.count = rows.size();
+    validate_gdn_window(out, {result.rows.data(), window ? result.count : 0U}, window, config.control, config.gdn,
+        hip_execution_stream());
+    return result;
+}
+} // namespace
+
+void gdn_window_rows_preflight(std::span<const ExecutionDispatchContext> rows, const HipGdnWindowConfig& config) {
+    static_cast<void>(bind_gdn_window(rows, config, true));
+}
+void gdn_window_rows_launch(std::span<const ExecutionDispatchContext> rows, const HipGdnWindowConfig& config) {
+    const auto bound = bind_gdn_window(rows, config, true);
+    gdn_window_enqueue(bound.layer, {bound.rows.data(), bound.count}, config.control, config.gdn, hip_execution_stream());
+}
+void gdn_window_commit_launch(const ExecutionDispatchContext& row, const HipGdnWindowConfig& config) {
+    const auto bound = bind_gdn_window({&row, 1U}, config, false);
+    gdn_window_commit_enqueue(bound.layer, config.control, config.gdn, hip_execution_stream());
+}
+
+#ifdef STRIX_BUILD_KNOWN_WINDOW_DIAGNOSTIC
+void gdn_window_serial_row_probe(const GdnWindowLayer& layer, const GdnWindowRow& row,
+    const HipGdnLauncherConfig& config, void* stream_ptr) {
+    const GdnWindowControl unused{};
+    validate_gdn_window(layer, {&row, 1U}, true, &unused, config, stream_ptr);
+    const auto shape = gdn_window_shape(config.model);
+    const auto stream = static_cast<hipStream_t>(stream_ptr);
+    const auto workspace = gdn_window_rows<1U>({&row, 1U}, shape);
+    const auto binding = [](const void* weights, std::uint64_t bytes) {
+        RuntimeTensorBinding result; result.address = reinterpret_cast<std::uintptr_t>(weights); result.bytes = bytes;
+        return result;
+    };
+    const auto q8 = [](std::uint32_t width, std::uint32_t outputs) { return width / 32ULL * outputs * sizeof(Q8Block); };
+    const auto gate_bytes = layer.gate_type ? q8(shape.hidden, shape.value_heads) : 4ULL * shape.hidden * shape.value_heads;
+    const auto mode = ProjectionMode::prefetch8_wave8;
+    launch_projection_by_kind(WeightKind::q8_0, row.input, binding(layer.qkv, q8(shape.hidden, shape.conv_width)),
+        shape.hidden, shape.conv_width, workspace.qkv[0], mode, stream, nullptr);
+    launch_projection_by_kind(WeightKind::q8_0, row.input, binding(layer.z, q8(shape.hidden, shape.value_width)),
+        shape.hidden, shape.value_width, workspace.z[0], mode, stream, nullptr);
+    launch_projection_by_kind(weight_kind(layer.gate_type), row.input, binding(layer.beta, gate_bytes),
+        shape.hidden, shape.value_heads, workspace.beta[0], mode, stream, nullptr);
+    launch_projection_by_kind(weight_kind(layer.gate_type), row.input, binding(layer.alpha, gate_bytes),
+        shape.hidden, shape.value_heads, workspace.gate[0], mode, stream, nullptr);
+    hipLaunchKernelGGL(conv_update_kernel, dim3((shape.conv_width + kProjectionThreads - 1U) / kProjectionThreads),
+        dim3(kProjectionThreads), 0, stream, workspace.qkv[0], layer.conv_state, layer.conv,
+        small_weight_kind(layer.conv_type), shape.conv_width, kGdnWindowKernel, nullptr);
+    hipLaunchKernelGGL(transform_beta_gate_kernel, dim3((shape.value_heads + kProjectionThreads - 1U) / kProjectionThreads),
+        dim3(kProjectionThreads), 0, stream, workspace.beta[0], workspace.gate[0], layer.dt,
+        small_weight_kind(layer.dt_type), layer.a, small_weight_kind(layer.a_type), shape.value_heads);
+    hipLaunchKernelGGL(normalize_qk_kernel, dim3(shape.key_heads * 2U), dim3(kRecurrentThreads), 0, stream,
+        workspace.qkv[0], shape.key_heads, shape.head_dim, config.model.gdn_qk_l2_epsilon, nullptr);
+    if (config.recurrent_layout == HipGdnRecurrentLayout::baseline && config.recurrent_storage == GdnRecurrentStorage::key_value) {
+        hipLaunchKernelGGL(recurrent_step_kernel, dim3(shape.value_heads * (shape.head_dim / kValueTile)),
+            dim3(kRecurrentThreads), 0, stream, workspace.qkv[0], workspace.beta[0], workspace.gate[0], layer.matrix,
+            workspace.core[0], shape.key_heads, shape.value_heads, shape.head_dim, nullptr);
+    } else {
+        PreparedGdnLaunch prepared{};
+        prepared.workspace = {workspace.qkv[0], workspace.z[0], workspace.beta[0], workspace.gate[0], workspace.core[0], 0};
+        prepared.matrix_state.address = reinterpret_cast<std::uintptr_t>(layer.matrix);
+        prepared.key_heads = shape.key_heads; prepared.value_heads = shape.value_heads; prepared.head_dim = shape.head_dim;
+        const GdnEmitTarget target{stream, nullptr, nullptr, 0, nullptr};
+        if (config.recurrent_storage == GdnRecurrentStorage::value_key)
+            emit_gdn_recurrent_layout<GdnRecurrentStorage::value_key>(prepared, config.recurrent_layout, target);
+        else emit_gdn_recurrent_layout(prepared, config.recurrent_layout, target);
+    }
+    hipLaunchKernelGGL(gated_rms_norm_kernel, dim3(shape.value_heads), dim3(kRecurrentThreads), 0, stream,
+        workspace.core[0], workspace.z[0], layer.norm, small_weight_kind(layer.norm_type), shape.value_heads,
+        shape.head_dim, config.model.rms_norm_epsilon, nullptr);
+    check_hip(hipGetLastError(), "GDN window serial reference core launch");
+    launch_output_by_kind(WeightKind::q8_0, workspace.core[0], binding(layer.out, q8(shape.value_width, shape.hidden)),
+        shape.value_width, shape.hidden, row.output, true, true, stream, nullptr);
+}
+#endif
 
 #ifdef STRIX_BUILD_KNOWN_WINDOW_DIAGNOSTIC
 template <unsigned Rows>
