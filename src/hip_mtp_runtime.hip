@@ -14,6 +14,7 @@
 #include "strix/mtp_sidecar_binding.hpp"
 #include <hip/hip_runtime.h>
 #include <algorithm>
+#include <cstdlib>
 #include <array>
 #include <limits>
 #include <optional>
@@ -485,6 +486,17 @@ void HipMtpRuntime::enable_draft_chain(HipMtpDraftHeadConfig config,bool exact) 
         p.hc_inject.reset(hc);
         launch_hip_mtp_dequantize_q8(reinterpret_cast<const void*>(p.owner->tensors().attention_hc_inject.runtime->address),inject,hc,p.owner->stream());
         launch_hip_mtp_dequantize_q8(reinterpret_cast<const void*>(p.owner->tensors().mlp_hc_inject.runtime->address),inject,hc+inject,p.owner->stream());
+        // STRIX_MTP_DRAFT_Q4_ALL=1: the draft's dense and expert projections read Q4_0 copies
+        // (proposals only; verification is unchanged).
+        if(std::getenv("STRIX_MTP_DRAFT_Q4_ALL")) {
+            const auto& t=p.owner->tensors();
+            for(const auto* v:{&t.eh_projection,&t.query,&t.key,&t.value,&t.attention_output,&t.expert_gate,&t.expert_up,
+                    &t.expert_down,&t.shared_gate,&t.shared_up,&t.shared_down}) {
+                require(v->manifest && v->runtime && v->manifest->ggml_type==8U && v->runtime->bytes%34U==0U,
+                    "MTP draft Q4 copies require Q8_0 sidecar projections");
+                register_hip_mtp_draft_q4(reinterpret_cast<const void*>(v->runtime->address),v->runtime->bytes/34U*32U,p.owner->stream());
+            }
+        }
         check(hipStreamSynchronize(static_cast<hipStream_t>(p.owner->stream())),"MTP draft HC injection copies");
     }
     p.draft=std::make_unique<HipMtpDraftHead>(reinterpret_cast<const void*>(head.runtime->address),std::move(config),p.owner->stream());

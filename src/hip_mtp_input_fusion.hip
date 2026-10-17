@@ -1,3 +1,4 @@
+#include "strix/hip_mtp_fast_draft.hpp"
 #include "strix/hip_mtp_input_fusion.hpp"
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
@@ -145,18 +146,25 @@ __global__ __launch_bounds__(128) void mtp_input_broadcast_add(HipMtpInputFusion
 // Draft-only fused projection + broadcast add: one wave per output row reads the
 // packed row once; lanes own 8-column groups, then a wave tree. Same rounding
 // points as the exact split kernels, different summation order.
-__global__ __launch_bounds__(256) void mtp_input_projections_wave(HipMtpInputFusionRequest r) {
+// Code j of a Q8_0 (34-byte) or Q4_0 (18-byte, low nibbles 0..15, high 16..31) block.
+template<bool Q4> __device__ __forceinline__ float block_code(const unsigned char* block,unsigned j) {
+    if constexpr(Q4) return static_cast<float>(static_cast<int>((block[2U+(j&15U)]>>(j>=16U?4U:0U))&15U)-8);
+    else return static_cast<float>(static_cast<signed char>(block[2U+j]));
+}
+template<bool Q4>
+__global__ __launch_bounds__(256) void mtp_input_projections_wave(HipMtpInputFusionRequest r,const unsigned char* weights) {
+    constexpr unsigned block=Q4?18U:34U;
     const unsigned lane=threadIdx.x%32U,row=blockIdx.x*8U+threadIdx.x/32U,h=r.hidden_size,hc=r.hc_count;
     if(row>=h)return;
     const auto* input=reinterpret_cast<const float*>(r.normalized_scratch.address);
-    const auto* packed=reinterpret_cast<const unsigned char*>(r.packed_projection.address)+static_cast<std::uint64_t>(row)*r.projection_row_stride_bytes;
+    const auto* packed=weights+static_cast<std::uint64_t>(row)*(2U*h/32U)*block;
     float embedding=0.0F,sums[4]={0.0F,0.0F,0.0F,0.0F};
     for(unsigned base=8U*lane;base<h;base+=256U) {
-        const auto* e=packed+(base/32U)*34U;const auto* w=packed+((h+base)/32U)*34U;
+        const auto* e=packed+(base/32U)*block;const auto* w=packed+((h+base)/32U)*block;
         const float es=__half2float(*reinterpret_cast<const __half*>(e)),ws=__half2float(*reinterpret_cast<const __half*>(w));
         for(unsigned i=0;i<8U;++i) {
-            embedding=fmaf(es*static_cast<float>(static_cast<signed char>(e[2U+base%32U+i])),input[base+i],embedding);
-            const float weight=ws*static_cast<float>(static_cast<signed char>(w[2U+base%32U+i]));
+            embedding=fmaf(es*block_code<Q4>(e,base%32U+i),input[base+i],embedding);
+            const float weight=ws*block_code<Q4>(w,base%32U+i);
             for(unsigned stream=0;stream<hc;++stream) sums[stream]=fmaf(weight,input[h+stream*h+base+i],sums[stream]);
         }
     }
@@ -232,7 +240,10 @@ void launch_hip_mtp_input_fusion_draft(const HipMtpInputFusionRequest& r,void* r
     if(!raw_stream)throw std::invalid_argument("MTP input fusion requires an explicit owned stream");
     const auto stream=static_cast<hipStream_t>(raw_stream);
     hipLaunchKernelGGL(mtp_input_norms,dim3(2U),dim3(256U),0U,stream,r);check(hipGetLastError(),"MTP input norms launch");
-    hipLaunchKernelGGL(mtp_input_projections_wave,dim3((r.hidden_size+7U)/8U),dim3(256U),0U,stream,r);
+    const auto* q8=reinterpret_cast<const unsigned char*>(r.packed_projection.address);
+    if(const auto* q4=static_cast<const unsigned char*>(hip_mtp_draft_q4(q8)))
+        hipLaunchKernelGGL(mtp_input_projections_wave<true>,dim3((r.hidden_size+7U)/8U),dim3(256U),0U,stream,r,q4);
+    else hipLaunchKernelGGL(mtp_input_projections_wave<false>,dim3((r.hidden_size+7U)/8U),dim3(256U),0U,stream,r,q8);
     check(hipGetLastError(),"MTP draft fused projection launch");
 }
 } // namespace strix

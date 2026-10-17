@@ -27,6 +27,11 @@ inline constexpr std::uint32_t hip_mtp_fast_moe_workspace_floats=11U*640U+1U;
 void launch_hip_mtp_draft_q8_gemv(const void* input,bool input_bf16,const void* q8,std::uint32_t width,
     std::uint32_t rows,void* output,bool output_bf16,void* stream);
 void launch_hip_mtp_fast_moe(const HipMtpFastMoeViews&,void* stream);
+// Draft-only Q4_0 copy of a Q8_0 tensor (elements % 32 == 0), converted on `stream` with the
+// draft head's rule and kept for the process. The draft GEMV, fast MoE and fused input
+// projection read the copy whenever every tensor they need has one.
+void register_hip_mtp_draft_q4(const void* q8,std::uint64_t elements,void* stream);
+const void* hip_mtp_draft_q4(const void* q8) noexcept;
 // Raw MTP HC mix (hidden 2560, 4 streams, rank 320, Q8 down/up, F32 norm): exact
 // staged path (inject Q8 [4][10240]) or draft split-K/lane-chain path (inject F32
 // [4][10240], 16-aligned). Null inject/injection for the head role. Workspace
