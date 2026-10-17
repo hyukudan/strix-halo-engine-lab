@@ -20,6 +20,9 @@ struct HipSharedExpertLauncherConfig {
     bool prefetch_q8 = false;
     std::vector<std::uint32_t> prefetch_eligible_layers;
     std::shared_ptr<shared_expert_prefetch::RuntimeDispatchStats> prefetch_stats;
+    // Opt-in known-window rows Q8 projections with per-32 int8 activations
+    // (dot4). Changes numerics: never bit-identical to the R1 row loop.
+    bool known_window_a8_projections = false;
 };
 
 enum class HipSharedQ8ProjectionMode {legacy256,virtual256,prefetch8};
@@ -33,6 +36,16 @@ void launch_hip_shared_q8_projection_probe(HipSharedQ8ProjectionRole,HipSharedQ8
     HipActivationStorage storage,HipSharedQ8ProjectionView input,HipSharedQ8ProjectionView weights,
     HipSharedQ8ProjectionView shared_gate,HipSharedQ8ProjectionView output,
     std::uint32_t width,std::uint32_t outputs,void* stream);
+#ifdef STRIX_BUILD_KNOWN_WINDOW_DIAGNOSTIC
+// Test-only T = 1/2/4/8 rows of the prefetch8 BF16 gate/up (FP32 out) or FP32 down
+// (per-row FP32 gate, BF16 out) projection: the q8_rows engine (exact or A8) or
+// the R1 kernel once per row. Exact 16-byte aligned views; gate empty for gate/up.
+enum class HipSharedRowsProbeMode { rows, rows_a8, row_loop };
+void launch_hip_shared_rows_projection_probe(HipSharedQ8ProjectionRole, HipSharedRowsProbeMode,
+    std::span<const HipSharedQ8ProjectionView> input, HipSharedQ8ProjectionView weights,
+    std::span<const HipSharedQ8ProjectionView> gate, std::span<const HipSharedQ8ProjectionView> output,
+    std::uint32_t width, std::uint32_t outputs, void* stream);
+#endif
 
 void register_hip_shared_expert_kernel_variant(
     const ModelContract& model,

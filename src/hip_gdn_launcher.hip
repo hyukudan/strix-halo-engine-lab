@@ -3,6 +3,7 @@
 #include "strix/hip_gdn_lm_wave8_diagnostic.hpp"
 #endif
 #include "strix/hip_gdn_launcher.hpp"
+#include "hip_q8_rows_gemv.hpp"
 #include "strix/hip_gdn_islands.hpp"
 #include "strix/hip_model_residency.hpp"
 #include "strix/hip_setup_quiescence.hpp"
@@ -897,6 +898,8 @@ void project_prefetch8_wave8_q8_fp32_to_bf16_kernel(
 }
 
 
+#ifdef STRIX_BUILD_KNOWN_WINDOW_DIAGNOSTIC
+// R2 reference kernels, kept for the R2 projection diagnostic.
 // New-only rows2 arithmetic. The selected wave8 input ISA binds coefficient
 // to src0 and BF16 activation to src1; its FP32 output counterpart reverses
 // those two operands. Both selected trees bind lower/self to src0.
@@ -1011,79 +1014,54 @@ void project_wave8_q8_fp32_to_bf16_rows2_kernel(
         output0[out] = float_to_bf16(result[0]); output1[out] = float_to_bf16(result[1]);
     }
 }
+#endif
 
-// New wide-window entry; the original R1/R2 definitions above remain intact.
+// Per-row activation/output pointers of the window kernels.
 template <unsigned Rows> struct GdnWidePointers {
     const void* input[Rows];
     void* output[Rows];
 };
-template <unsigned Rows, bool Bf16Input>
-__global__ __launch_bounds__(256)
-void project_wave8_q8_wide_kernel(GdnWidePointers<Rows> views, const void* weights,
-    std::uint32_t width, std::uint32_t outputs) {
-    static_assert(Rows >= 1U && Rows <= 8U);
-    const auto lane = static_cast<std::uint32_t>(threadIdx.x) % 32U;
-    const auto out = static_cast<std::uint32_t>(blockIdx.x) * 8U + static_cast<std::uint32_t>(threadIdx.x) / 32U;
-    if (out >= outputs) return;
-    float partial[Rows][8]{};
-    const auto* blocks = static_cast<const Q8Block*>(weights) +
-        static_cast<std::uint64_t>(out) * (width / 32U);
-    for (std::uint64_t chunk = 0; chunk < width; chunk += 256U) {
-        const auto base = chunk + 8U * lane;
-        if (base < width) {
-            const auto& block = blocks[base / 32U];
-            std::int8_t codes[8];
-#pragma unroll
-            for (unsigned local = 0; local < 8U; ++local)
-                codes[local] = block.values[base % 32U + local];
-            const auto scale = static_cast<unsigned>(__half_as_ushort(block.scale));
-#pragma unroll
-            for (unsigned local = 0; local < 8U; ++local) {
-                const float coefficient = gdn_known_window_q8_coefficient(scale, static_cast<float>(codes[local]));
-#pragma unroll
-                for (unsigned row = 0; row < Rows; ++row) {
-                    if constexpr (Bf16Input) {
-                        const float value = bf16_to_float(static_cast<const std::uint16_t*>(views.input[row])[base + local]);
-                        asm volatile("v_fmac_f32 %0, %1, %2" : "+v"(partial[row][local])
-                                     : "v"(coefficient), "v"(value));
-                    } else {
-                        const float value = static_cast<const float*>(views.input[row])[base + local];
-                        asm volatile("v_fmac_f32 %0, %1, %2" : "+v"(partial[row][local])
-                                     : "v"(value), "v"(coefficient));
-                    }
-                }
-            }
-        }
-    }
-#pragma unroll
-    for (unsigned distance = 16U; distance; distance /= 2U) {
-#pragma unroll
-        for (unsigned row = 0; row < Rows; ++row) {
-#pragma unroll
-            for (unsigned local = 0; local < 8U; ++local) {
-                const float partner = __shfl_down(partial[row][local], distance, 32);
-                if constexpr (Bf16Input) {
-                    if (lane < distance) partial[row][local] = gdn_known_window_tree_add(partial[row][local], partner);
-                } else partial[row][local] = gdn_known_window_tree_add(partial[row][local], partner);
-            }
-        }
-    }
-    if (lane == 0U) {
-#pragma unroll
-        for (unsigned row = 0; row < Rows; ++row) {
-            auto* values = partial[row];
-            values[0] = gdn_known_window_tree_add(values[0], values[4]);
-            values[1] = gdn_known_window_tree_add(values[1], values[5]);
-            values[2] = gdn_known_window_tree_add(values[2], values[6]);
-            values[3] = gdn_known_window_tree_add(values[3], values[7]);
-            values[0] = gdn_known_window_tree_add(values[0], values[2]);
-            values[1] = gdn_known_window_tree_add(values[1], values[3]);
-            const auto result = gdn_known_window_tree_add(values[0], values[1]);
-            if constexpr (Bf16Input) static_cast<float*>(views.output[row])[out] = round_bf16(result);
-            else static_cast<std::uint16_t*>(views.output[row])[out] = float_to_bf16(result);
-        }
-    }
+// T-row sites (q8_rows engine) of the R1 wave8 projections above: same
+// coefficient, FMA and tree operand bindings as the R2 kernels, per row.
+__device__ __forceinline__ float gdn_rows_coefficient(unsigned scale, std::int8_t code) {
+    float result;
+    asm("v_fma_mix_f32 %0, %1, %2, neg(0) op_sel_hi:[1,0,0]" : "=v"(result) : "v"(scale), "v"(static_cast<float>(code)));
+    return result;
 }
+__device__ __forceinline__ float gdn_rows_tree_add(float lower, float upper) {
+    float result;
+    asm("v_add_f32 %0, %1, %2" : "=v"(result) : "v"(lower), "v"(upper));
+    return result;
+}
+// qkv, z (and Q8 beta/alpha) segments from BF16 rows to BF16-rounded FP32 workspaces.
+template <unsigned Rows> struct GdnInputRowsSite {
+    using Input = std::uint16_t;
+    static constexpr unsigned rows = Rows;
+    const void* input[Rows];
+    q8_rows::Segments segments;
+    std::uint32_t width, outputs;
+    float* output[4][Rows];
+    __device__ static float coefficient(unsigned scale, std::int8_t code) { return gdn_rows_coefficient(scale, code); }
+    __device__ static void fma(float& acc, float c, float x) { asm("v_fmac_f32 %0, %1, %2" : "+v"(acc) : "v"(c), "v"(x)); }
+    __device__ static float add(float lower, float upper) { return gdn_rows_tree_add(lower, upper); }
+    __device__ void store(std::uint32_t out, unsigned r, float value) const {
+        unsigned m; std::uint32_t row;
+        static_cast<void>(q8_rows::segment_row(segments, out, width, m, row));
+        output[m][r][row] = round_bf16(value);
+    }
+};
+template <unsigned Rows> struct GdnOutputRowsSite {
+    using Input = float;
+    static constexpr unsigned rows = Rows;
+    const void* input[Rows];
+    q8_rows::Segments segments;
+    std::uint32_t width, outputs;
+    std::uint16_t* output[Rows];
+    __device__ static float coefficient(unsigned scale, std::int8_t code) { return gdn_rows_coefficient(scale, code); }
+    __device__ static void fma(float& acc, float c, float x) { asm("v_fmac_f32 %0, %1, %2" : "+v"(acc) : "v"(x), "v"(c)); }
+    __device__ static float add(float lower, float upper) { return gdn_rows_tree_add(lower, upper); }
+    __device__ void store(std::uint32_t out, unsigned r, float value) const { output[r][out] = float_to_bf16(value); }
+};
 
 __global__ void conv_update_kernel(
     float* qkv,
@@ -3838,6 +3816,10 @@ std::array<GdnKnownWindowRow, 2> prepare_gdn_known_window_rows(
     std::array<GdnKnownWindowRange, 11> readonly{};
     readonly[0] = {result[0].input.address, result[0].input.bytes};
     readonly[1] = {result[1].input.address, result[1].input.bytes};
+    // q8_rows reads BF16 rows and FP32 core rows as 16-byte vectors.
+    for (const auto& row : result)
+        if (row.input.address % 16U || reinterpret_cast<std::uintptr_t>(row.workspace.core) % 16U)
+            throw std::invalid_argument("GDN known-window rows require 16-byte aligned input and core rows");
     require_gdn_known_window_disjoint(readonly[0], readonly[1]);
     for (std::size_t i = 0; i < members.size(); ++i) {
         const auto& x = result[0].tensors.*members[i]; const auto& y = result[1].tensors.*members[i];
@@ -3876,23 +3858,24 @@ std::array<GdnKnownWindowRow, 2> prepare_gdn_known_window_rows(
     return result;
 }
 
-void enqueue_gdn_known_window_inputs(const std::array<GdnKnownWindowRow, 2>& prepared, Format format) {
-    const auto& a = prepared[0]; const auto& b = prepared[1];
-    const auto* input0 = reinterpret_cast<const std::uint16_t*>(a.input.address);
-    const auto* input1 = reinterpret_cast<const std::uint16_t*>(b.input.address);
-    const auto project = [&](const TensorPair& tensor, std::uint32_t outputs, float* out0, float* out1) {
-        hipLaunchKernelGGL(project_wave8_q8_bf16_to_fp32_rows2_kernel,
-            dim3((outputs + 7U) / 8U), dim3(kProjectionThreads), 0, hip_execution_stream(),
-            input0, input1, reinterpret_cast<const void*>(tensor.runtime->address),
-            a.hidden, outputs, out0, out1);
-        check_hip(hipGetLastError(), "GDN known-window R2 input projection launch");
-    };
-    project(a.tensors.qkv, a.conv_width, a.workspace.qkv, b.workspace.qkv);
-    project(a.tensors.z, a.value_width, a.workspace.z, b.workspace.z);
-    if (format == Format::all_q8) {
-        project(a.tensors.beta, a.value_heads, a.workspace.beta, b.workspace.beta);
-        project(a.tensors.alpha, a.value_heads, a.workspace.gate, b.workspace.gate);
-    } else {
+void enqueue_gdn_known_window_inputs(const std::array<GdnKnownWindowRow, 2>& prepared, Format format,
+    const HipGdnLauncherConfig& config) {
+    const auto& a = prepared[0];
+    const bool q8_gates = format == Format::all_q8;
+    GdnInputRowsSite<2U> in{};
+    const auto weights = [](const TensorPair& tensor) { return reinterpret_cast<const void*>(tensor.runtime->address); };
+    in.segments = q8_gates ? q8_rows::segments({{weights(a.tensors.qkv), a.conv_width}, {weights(a.tensors.z), a.value_width},
+        {weights(a.tensors.beta), a.value_heads}, {weights(a.tensors.alpha), a.value_heads}}) :
+        q8_rows::segments({{weights(a.tensors.qkv), a.conv_width}, {weights(a.tensors.z), a.value_width}});
+    in.width = a.hidden; in.outputs = in.segments.first[in.segments.count];
+    for (unsigned r = 0; r < 2U; ++r) {
+        const auto& w = prepared[r].workspace;
+        in.input[r] = reinterpret_cast<const void*>(prepared[r].input.address);
+        in.output[0][r] = w.qkv; in.output[1][r] = w.z; in.output[2][r] = w.beta; in.output[3][r] = w.gate;
+    }
+    q8_rows::launch(in, config.known_window_a8_projections, hip_execution_stream());
+    check_hip(hipGetLastError(), "GDN known-window R2 input projection launch");
+    if (!q8_gates) {
         for (const auto& row : prepared) {
             const auto* input = reinterpret_cast<const std::uint16_t*>(row.input.address);
             launch_projection_by_kind(weight_kind(row.tensors.beta.manifest->ggml_type), input,
@@ -3912,11 +3895,14 @@ void enqueue_gdn_known_window_completion(const std::array<GdnKnownWindowRow, 2>&
     // before row1 reads that matrix/convolution state. Workspace rows are disjoint.
     launch_gdn_known_window_core(a, config);
     launch_gdn_known_window_core(b, config);
-    hipLaunchKernelGGL(project_wave8_q8_fp32_to_bf16_rows2_kernel,
-        dim3((a.hidden + 7U) / 8U), dim3(kProjectionThreads), 0, hip_execution_stream(),
-        a.workspace.core, b.workspace.core, reinterpret_cast<const void*>(a.tensors.out.runtime->address),
-        a.value_width, a.hidden, reinterpret_cast<std::uint16_t*>(a.output.address),
-        reinterpret_cast<std::uint16_t*>(b.output.address));
+    GdnOutputRowsSite<2U> out{};
+    out.segments = q8_rows::segments({{reinterpret_cast<const void*>(a.tensors.out.runtime->address), a.hidden}});
+    out.width = a.value_width; out.outputs = a.hidden;
+    for (unsigned r = 0; r < 2U; ++r) {
+        out.input[r] = prepared[r].workspace.core;
+        out.output[r] = reinterpret_cast<std::uint16_t*>(prepared[r].output.address);
+    }
+    q8_rows::launch(out, config.known_window_a8_projections, hip_execution_stream());
     check_hip(hipGetLastError(), "GDN known-window R2 output projection launch");
 }
 
@@ -3935,6 +3921,9 @@ std::array<GdnKnownWindowRow, Rows> prepare_gdn_wide_rows(
     const auto& first = rows[0];
     if (first.position > std::numeric_limits<std::uint64_t>::max() - (Rows - 1U))
         throw std::invalid_argument("GDN wide-window position overflows");
+    if (config.known_window_a8_projections)
+        for (const auto width : {result[0].hidden, result[0].value_width})
+            if (Rows * (width / 32U) * 36U > 65536U) throw std::invalid_argument("GDN wide-window A8 activations exceed LDS");
     const auto same_state = [](const SessionStateAddress& a, const SessionStateAddress& b) {
         return a.component == b.component && a.storage == b.storage && a.address == b.address &&
             a.bytes == b.bytes && a.allocation_generation == b.allocation_generation && a.provisional == b.provisional;
@@ -3988,19 +3977,17 @@ template <unsigned Rows>
 void enqueue_gdn_wide_rows(const std::array<GdnKnownWindowRow, Rows>& prepared,
     const HipGdnLauncherConfig& config) {
     const auto& first = prepared[0];
-    const auto project = [&](const TensorPair& tensor, std::uint32_t outputs, float* Workspace::* target) {
-        GdnWidePointers<Rows> views{};
-        for (unsigned r = 0; r < Rows; ++r) {
-            views.input[r] = reinterpret_cast<const void*>(prepared[r].input.address);
-            views.output[r] = prepared[r].workspace.*target;
-        }
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(project_wave8_q8_wide_kernel<Rows, true>),
-            dim3((outputs + 7U) / 8U), dim3(kProjectionThreads), 0, hip_execution_stream(),
-            views, reinterpret_cast<const void*>(tensor.runtime->address), first.hidden, outputs);
-        check_hip(hipGetLastError(), "GDN wide-window Q8 input projection launch");
-    };
-    project(first.tensors.qkv, first.conv_width, &Workspace::qkv);
-    project(first.tensors.z, first.value_width, &Workspace::z);
+    // qkv and z share one launch; the output projection reads every row's core.
+    GdnInputRowsSite<Rows> in{};
+    in.segments = q8_rows::segments({{reinterpret_cast<const void*>(first.tensors.qkv.runtime->address), first.conv_width},
+        {reinterpret_cast<const void*>(first.tensors.z.runtime->address), first.value_width}});
+    in.width = first.hidden; in.outputs = first.conv_width + first.value_width;
+    for (unsigned r = 0; r < Rows; ++r) {
+        in.input[r] = reinterpret_cast<const void*>(prepared[r].input.address);
+        in.output[0][r] = prepared[r].workspace.qkv; in.output[1][r] = prepared[r].workspace.z;
+    }
+    q8_rows::launch(in, config.known_window_a8_projections, hip_execution_stream());
+    check_hip(hipGetLastError(), "GDN wide-window Q8 input projection launch");
     for (const auto& row : prepared) {
         const auto* input = reinterpret_cast<const std::uint16_t*>(row.input.address);
         launch_projection_by_kind(weight_kind(row.tensors.beta.manifest->ggml_type), input,
@@ -4012,14 +3999,14 @@ void enqueue_gdn_wide_rows(const std::array<GdnKnownWindowRow, Rows>& prepared,
     }
     // Preserve every causal state transition and rounding point in row order.
     for (const auto& row : prepared) launch_gdn_known_window_core(row, config);
-    GdnWidePointers<Rows> views{};
+    GdnOutputRowsSite<Rows> out{};
+    out.segments = q8_rows::segments({{reinterpret_cast<const void*>(first.tensors.out.runtime->address), first.hidden}});
+    out.width = first.value_width; out.outputs = first.hidden;
     for (unsigned r = 0; r < Rows; ++r) {
-        views.input[r] = prepared[r].workspace.core;
-        views.output[r] = reinterpret_cast<void*>(prepared[r].output.address);
+        out.input[r] = prepared[r].workspace.core;
+        out.output[r] = reinterpret_cast<std::uint16_t*>(prepared[r].output.address);
     }
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(project_wave8_q8_wide_kernel<Rows, false>),
-        dim3((first.hidden + 7U) / 8U), dim3(kProjectionThreads), 0, hip_execution_stream(),
-        views, reinterpret_cast<const void*>(first.tensors.out.runtime->address), first.value_width, first.hidden);
+    q8_rows::launch(out, config.known_window_a8_projections, hip_execution_stream());
     check_hip(hipGetLastError(), "GDN wide-window Q8 output projection launch");
 }
 
@@ -4046,7 +4033,7 @@ void gdn_known_window_r2_launch(std::span<const ExecutionDispatchContext, 2> row
     const HipGdnLauncherConfig& config) {
     // Repeat current-view validation at this public entry; preflight isn't a permit.
     const auto prepared = prepare_gdn_known_window_rows(rows, config, Format::all_q8);
-    enqueue_gdn_known_window_inputs(prepared, Format::all_q8);
+    enqueue_gdn_known_window_inputs(prepared, Format::all_q8, config);
     enqueue_gdn_known_window_completion(prepared, config);
 }
 void gdn_known_window_r2_f32_gates_preflight(std::span<const ExecutionDispatchContext, 2> rows,
@@ -4056,7 +4043,7 @@ void gdn_known_window_r2_f32_gates_preflight(std::span<const ExecutionDispatchCo
 void gdn_known_window_r2_f32_gates_launch(std::span<const ExecutionDispatchContext, 2> rows,
     const HipGdnLauncherConfig& config) {
     const auto prepared = prepare_gdn_known_window_rows(rows, config, Format::q8_large_f32_gates);
-    enqueue_gdn_known_window_inputs(prepared, Format::q8_large_f32_gates);
+    enqueue_gdn_known_window_inputs(prepared, Format::q8_large_f32_gates, config);
     enqueue_gdn_known_window_completion(prepared, config);
 }
 
@@ -4109,8 +4096,13 @@ void validate_gdn_window(const GdnWindowLayer& layer, std::span<const GdnWindowR
     (void)small_weight_kind(layer.conv_type); (void)small_weight_kind(layer.dt_type);
     (void)small_weight_kind(layer.a_type); (void)small_weight_kind(layer.norm_type);
     for (const auto& row : rows)
-        if (!row.input || !row.output || !row.workspace || reinterpret_cast<std::uintptr_t>(row.workspace) % 16U)
+        if (!row.input || !row.output || !row.workspace || reinterpret_cast<std::uintptr_t>(row.workspace) % 16U ||
+            reinterpret_cast<std::uintptr_t>(row.input) % 16U)
             throw std::invalid_argument("GDN window row views are missing or misaligned");
+    if (config.known_window_a8_projections)
+        for (const auto width : {static_cast<std::uint64_t>(config.model.hidden_size), static_cast<std::uint64_t>(gdn_window_shape(config.model).value_width)})
+            if (q8_rows::a8_bytes<gdn_window_max_rows>(width) > q8_rows::kLdsBytes)
+                throw std::invalid_argument("GDN window A8 activations exceed one block's LDS");
 }
 template <unsigned Rows>
 void enqueue_gdn_window(const GdnWindowLayer& layer, std::span<const GdnWindowRow> input,
@@ -4119,23 +4111,24 @@ void enqueue_gdn_window(const GdnWindowLayer& layer, std::span<const GdnWindowRo
     const auto rows = gdn_window_rows<Rows>(input, shape);
     GdnWidePointers<Rows> x{};
     for (unsigned r = 0; r < Rows; ++r) x.input[r] = input[r].input;
-    const auto project = [&](const void* weights, std::uint32_t outputs, float* const (&target)[Rows]) {
-        auto views = x;
-        for (unsigned r = 0; r < Rows; ++r) views.output[r] = target[r];
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(project_wave8_q8_wide_kernel<Rows, true>), dim3((outputs + 7U) / 8U),
-            dim3(kProjectionThreads), 0, stream, views, weights, shape.hidden, outputs);
-        check_hip(hipGetLastError(), "GDN window Q8 input projection launch");
-    };
-    project(layer.qkv, shape.conv_width, rows.qkv);
-    project(layer.z, shape.value_width, rows.z);
-    if (layer.gate_type == 0U) {
+    // qkv, z and Q8 beta/alpha share one q8_rows launch.
+    GdnInputRowsSite<Rows> in{};
+    const bool q8_gates = layer.gate_type != 0U;
+    in.segments = q8_gates ? q8_rows::segments({{layer.qkv, shape.conv_width}, {layer.z, shape.value_width},
+        {layer.beta, shape.value_heads}, {layer.alpha, shape.value_heads}}) :
+        q8_rows::segments({{layer.qkv, shape.conv_width}, {layer.z, shape.value_width}});
+    in.width = shape.hidden; in.outputs = in.segments.first[in.segments.count];
+    for (unsigned r = 0; r < Rows; ++r) {
+        in.input[r] = input[r].input;
+        in.output[0][r] = rows.qkv[r]; in.output[1][r] = rows.z[r]; in.output[2][r] = rows.beta[r]; in.output[3][r] = rows.gate[r];
+    }
+    q8_rows::launch(in, config.known_window_a8_projections, stream);
+    check_hip(hipGetLastError(), "GDN window Q8 input projection launch");
+    if (!q8_gates) {
         hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_window_f32_gates_kernel<Rows>), dim3(shape.value_heads * 2U),
             dim3(kProjectionThreads), 0, stream, x, static_cast<const float*>(layer.beta),
             static_cast<const float*>(layer.alpha), rows, shape.hidden, shape.value_heads);
         check_hip(hipGetLastError(), "GDN window F32 gate projection launch");
-    } else {
-        project(layer.beta, shape.value_heads, rows.beta);
-        project(layer.alpha, shape.value_heads, rows.gate);
     }
     const auto saved = gdn_window_saved(config.model, layer.retained);
     hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_window_prepare_kernel<Rows>),
@@ -4156,10 +4149,11 @@ void enqueue_gdn_window(const GdnWindowLayer& layer, std::span<const GdnWindowRo
         dim3(kRecurrentThreads), 0, stream, rows, layer.norm, small_weight_kind(layer.norm_type), shape.head_dim,
         config.model.rms_norm_epsilon);
     check_hip(hipGetLastError(), "GDN window gated RMSNorm launch");
-    GdnWidePointers<Rows> views{};
-    for (unsigned r = 0; r < Rows; ++r) { views.input[r] = rows.core[r]; views.output[r] = input[r].output; }
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(project_wave8_q8_wide_kernel<Rows, false>), dim3((shape.hidden + 7U) / 8U),
-        dim3(kProjectionThreads), 0, stream, views, layer.out, shape.value_width, shape.hidden);
+    GdnOutputRowsSite<Rows> out{};
+    out.segments = q8_rows::segments({{layer.out, shape.hidden}});
+    out.width = shape.value_width; out.outputs = shape.hidden;
+    for (unsigned r = 0; r < Rows; ++r) { out.input[r] = rows.core[r]; out.output[r] = static_cast<std::uint16_t*>(input[r].output); }
+    q8_rows::launch(out, config.known_window_a8_projections, stream);
     check_hip(hipGetLastError(), "GDN window Q8 output projection launch");
 }
 } // namespace
@@ -4395,7 +4389,7 @@ void gdn_known_window_r2_input_stage_probe(std::span<const ExecutionDispatchCont
         ? Format::all_q8 : Format::q8_large_f32_gates;
     const auto prepared = prepare_gdn_known_window_rows(rows, config, internal_format);
     if (mode == GdnKnownWindowProjectionMode::rows2) {
-        enqueue_gdn_known_window_inputs(prepared, internal_format);
+        enqueue_gdn_known_window_inputs(prepared, internal_format, config);
     } else {
         for (const auto& row : prepared) {
             const auto* input = reinterpret_cast<const std::uint16_t*>(row.input.address);
@@ -4467,30 +4461,44 @@ void gdn_known_window_r2_projection_probe(GdnKnownWindowProjectionDirection dire
         check_hip(hipGetLastError(), "GDN known-window diagnostic R2 output projection");
     }
 }
-template <unsigned Rows, bool Bf16Input>
-void enqueue_gdn_wide_projection_probe(std::span<const GdnKnownWindowProjectionView> input,
+template <unsigned Rows>
+void enqueue_gdn_wide_projection_probe(bool bf16, bool a8, std::span<const GdnKnownWindowProjectionView> input,
     GdnKnownWindowProjectionView weights, std::span<const GdnKnownWindowProjectionView> output,
     std::uint32_t width, std::uint32_t outputs, hipStream_t stream) {
-    GdnWidePointers<Rows> views{};
-    for (unsigned r = 0; r < Rows; ++r) {
-        views.input[r] = reinterpret_cast<const void*>(input[r].address);
-        views.output[r] = reinterpret_cast<void*>(output[r].address);
+    const auto segments = q8_rows::segments({{reinterpret_cast<const void*>(weights.address), outputs}});
+    if (bf16) {
+        GdnInputRowsSite<Rows> site{};
+        site.segments = segments; site.width = width; site.outputs = outputs;
+        for (unsigned r = 0; r < Rows; ++r) {
+            site.input[r] = reinterpret_cast<const void*>(input[r].address);
+            site.output[0][r] = reinterpret_cast<float*>(output[r].address);
+        }
+        q8_rows::launch(site, a8, stream);
+    } else {
+        GdnOutputRowsSite<Rows> site{};
+        site.segments = segments; site.width = width; site.outputs = outputs;
+        for (unsigned r = 0; r < Rows; ++r) {
+            site.input[r] = reinterpret_cast<const void*>(input[r].address);
+            site.output[r] = reinterpret_cast<std::uint16_t*>(output[r].address);
+        }
+        q8_rows::launch(site, a8, stream);
     }
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(project_wave8_q8_wide_kernel<Rows, Bf16Input>),
-        dim3((outputs + 7U) / 8U), dim3(kProjectionThreads), 0, stream,
-        views, reinterpret_cast<const void*>(weights.address), width, outputs);
     check_hip(hipGetLastError(), "GDN wide-window diagnostic projection launch");
 }
 void gdn_known_window_rows_projection_probe(GdnKnownWindowProjectionDirection direction,
     std::span<const GdnKnownWindowProjectionView> input, GdnKnownWindowProjectionView weights,
-    std::span<const GdnKnownWindowProjectionView> output, std::uint32_t width, std::uint32_t outputs, void* stream) {
-    if ((input.size() != 4U && input.size() != 8U) || output.size() != input.size() ||
+    std::span<const GdnKnownWindowProjectionView> output, std::uint32_t width, std::uint32_t outputs, void* stream,
+    GdnKnownWindowRowsProbeMode mode) {
+    const auto rows = static_cast<std::uint32_t>(input.size());
+    if (rows < 1U || rows > 8U || output.size() != rows ||
         (direction != GdnKnownWindowProjectionDirection::bf16_to_fp32 &&
          direction != GdnKnownWindowProjectionDirection::fp32_to_bf16) ||
+        (mode != GdnKnownWindowRowsProbeMode::rows && mode != GdnKnownWindowRowsProbeMode::rows_a8 &&
+         mode != GdnKnownWindowRowsProbeMode::row_loop) ||
         !stream || static_cast<hipStream_t>(stream) == hipStreamLegacy || static_cast<hipStream_t>(stream) == hipStreamPerThread)
-        throw std::invalid_argument("GDN wide-window diagnostic requires four/eight rows and an owned stream");
+        throw std::invalid_argument("GDN wide-window diagnostic requires 1..8 rows, a mode and an owned stream");
     const bool bf16 = direction == GdnKnownWindowProjectionDirection::bf16_to_fp32;
-    for (unsigned r = 0; r < input.size(); ++r) {
+    for (unsigned r = 0; r < rows; ++r) {
         const q8_projection_organization::View x{input[r].address, input[r].bytes}, w{weights.address, weights.bytes},
             y{output[r].address, output[r].bytes};
         if (bf16) q8_projection_organization::validate_views(width, outputs, x, w, y);
@@ -4503,17 +4511,36 @@ void gdn_known_window_rows_projection_probe(GdnKnownWindowProjectionDirection di
         for (const auto read : input) require_gdn_known_window_disjoint(write, {read.address, read.bytes});
         require_gdn_known_window_disjoint(write, {weights.address, weights.bytes});
     }
+    if (mode == GdnKnownWindowRowsProbeMode::rows_a8 && rows * width + rows * (width / 32U) * 4U > 65536U)
+        throw std::invalid_argument("GDN wide-window A8 activations exceed one block's LDS");
     const auto native_stream = static_cast<hipStream_t>(stream);
     hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
     check_hip(hipStreamIsCapturing(native_stream, &capture), "query GDN wide diagnostic capture");
     if (capture != hipStreamCaptureStatusNone) throw std::invalid_argument("GDN wide-window diagnostic cannot be captured");
     check_hip(hipPeekAtLastError(), "GDN wide-window diagnostic pre-enqueue stale error");
-    if (input.size() == 4U) {
-        if (bf16) enqueue_gdn_wide_projection_probe<4U, true>(input, weights, output, width, outputs, native_stream);
-        else enqueue_gdn_wide_projection_probe<4U, false>(input, weights, output, width, outputs, native_stream);
-    } else {
-        if (bf16) enqueue_gdn_wide_projection_probe<8U, true>(input, weights, output, width, outputs, native_stream);
-        else enqueue_gdn_wide_projection_probe<8U, false>(input, weights, output, width, outputs, native_stream);
+    const auto* packed = reinterpret_cast<const void*>(weights.address);
+    if (mode == GdnKnownWindowRowsProbeMode::row_loop) {
+        for (unsigned r = 0; r < rows; ++r) {
+            if (bf16) hipLaunchKernelGGL(project_prefetch8_wave8_q8_bf16_to_fp32_kernel, dim3((outputs + 7U) / 8U),
+                dim3(kProjectionThreads), 0, native_stream, reinterpret_cast<const std::uint16_t*>(input[r].address),
+                packed, width, outputs, reinterpret_cast<float*>(output[r].address));
+            else hipLaunchKernelGGL(project_prefetch8_wave8_q8_fp32_to_bf16_kernel, dim3((outputs + 7U) / 8U),
+                dim3(kProjectionThreads), 0, native_stream, reinterpret_cast<const float*>(input[r].address),
+                packed, width, outputs, reinterpret_cast<std::uint16_t*>(output[r].address));
+            check_hip(hipGetLastError(), "GDN wide-window diagnostic row-loop projection");
+        }
+        return;
+    }
+    const bool a8 = mode == GdnKnownWindowRowsProbeMode::rows_a8;
+    switch (rows) {
+    case 1: enqueue_gdn_wide_projection_probe<1U>(bf16, a8, input, weights, output, width, outputs, native_stream); break;
+    case 2: enqueue_gdn_wide_projection_probe<2U>(bf16, a8, input, weights, output, width, outputs, native_stream); break;
+    case 3: enqueue_gdn_wide_projection_probe<3U>(bf16, a8, input, weights, output, width, outputs, native_stream); break;
+    case 4: enqueue_gdn_wide_projection_probe<4U>(bf16, a8, input, weights, output, width, outputs, native_stream); break;
+    case 5: enqueue_gdn_wide_projection_probe<5U>(bf16, a8, input, weights, output, width, outputs, native_stream); break;
+    case 6: enqueue_gdn_wide_projection_probe<6U>(bf16, a8, input, weights, output, width, outputs, native_stream); break;
+    case 7: enqueue_gdn_wide_projection_probe<7U>(bf16, a8, input, weights, output, width, outputs, native_stream); break;
+    default: enqueue_gdn_wide_projection_probe<8U>(bf16, a8, input, weights, output, width, outputs, native_stream); break;
     }
 }
 #endif

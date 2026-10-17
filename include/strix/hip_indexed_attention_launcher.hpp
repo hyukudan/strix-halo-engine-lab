@@ -32,6 +32,9 @@ struct HipIndexedAttentionLauncherConfig {
     std::uint32_t qsa_gqa_heads_per_block = 1;
     std::shared_ptr<QsaHierarchicalSelectionStats> selection_stats;
     std::shared_ptr<QsaHierarchicalSelectionStats> gqa_stats;
+    // Opt-in known-window rows Q8 projections with per-32 int8 activations
+    // (dot4). Changes numerics: never bit-identical to the R1 row loop.
+    bool known_window_a8_projections = false;
 };
 
 enum class HipQsaInputProjectionMode {legacy256,virtual256,prefetch8};
@@ -65,6 +68,16 @@ enum class HipQsaOutputProjectionMode { legacy256, wave8 };
 void launch_hip_qsa_output_projection_probe(HipQsaOutputProjectionMode,
     HipQsaInputProjectionView input, HipQsaInputProjectionView weights,
     HipQsaInputProjectionView output, std::uint32_t width, std::uint32_t outputs, void* stream);
+#endif
+#ifdef STRIX_BUILD_KNOWN_WINDOW_DIAGNOSTIC
+// Test-only T = 1/2/4/8 rows of the prefetch8 input (BF16 -> BF16-rounded FP32)
+// or wave8 output (FP32 -> BF16) Q8_0 projection: the q8_rows engine (exact or
+// A8) or the C1 kernel once per row. Same ownership rules as the probes above.
+enum class HipQsaRowsProjection { input, output };
+enum class HipQsaRowsProbeMode { rows, rows_a8, row_loop };
+void launch_hip_qsa_rows_projection_probe(HipQsaRowsProjection, HipQsaRowsProbeMode,
+    std::span<const HipQsaInputProjectionView> input, HipQsaInputProjectionView weights,
+    std::span<const HipQsaInputProjectionView> output, std::uint32_t width, std::uint32_t outputs, void* stream);
 #endif
 
 // Experimental post-projection C1 norm/RoPE/KV stage. Async on caller's

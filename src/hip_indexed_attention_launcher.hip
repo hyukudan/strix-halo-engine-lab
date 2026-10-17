@@ -1,4 +1,5 @@
 #include "strix/hip_indexed_attention_launcher.hpp"
+#include "hip_q8_rows_gemv.hpp"
 #include "strix/hip_mtp_attention.hpp"
 #include "strix/hip_mtp_fast_draft.hpp"
 #include "strix/hip_mtp_native_validation.hpp"
@@ -3231,56 +3232,45 @@ __device__ __forceinline__ unsigned qsa_rows_matrix(const QsaRowsInputViews<Rows
     return m;
 }
 
-template <unsigned Rows>
-__global__ __launch_bounds__(32)
-void linear_prefetch8_q8_qsa_input_rows_kernel(QsaRowsInputViews<Rows> views, std::uint32_t input_width) {
-    if (blockIdx.x >= views.first[views.count]) return;
-    std::uint32_t row = 0;
-    const auto m = qsa_rows_matrix(views, blockIdx.x, row);
-    const auto lane = static_cast<std::uint32_t>(threadIdx.x);
-    float partial[Rows][8]{};
-    const auto* blocks = static_cast<const Q8Block*>(views.weights[m]) +
-        static_cast<std::uint64_t>(row) * (input_width / 32U);
-    for (std::uint64_t chunk = 0; chunk < input_width; chunk += 256U) {
-        const auto base = chunk + 8U * lane;
-        if (base < input_width) {
-            const auto feature = static_cast<std::uint32_t>(base);
-            const auto& block = blocks[feature / 32U];
-            std::int8_t codes[8];
-#pragma unroll
-            for (unsigned local = 0; local < 8; ++local) codes[local] = block.values[feature % 32U + local];
-            const float scale = __half2float(block.scale);
-#pragma unroll
-            for (unsigned r = 0; r < Rows; ++r) {
-                std::uint16_t bits[8];
-#pragma unroll
-                for (unsigned local = 0; local < 8; ++local) bits[local] = views.input[r][feature + local];
-#pragma unroll
-                for (unsigned local = 0; local < 8; ++local)
-                    partial[r][local] += bf16_to_float(bits[local]) * (scale * static_cast<float>(codes[local]));
-            }
-        }
-    }
-#pragma unroll
-    for (unsigned r = 0; r < Rows; ++r) {
-#pragma unroll
-        for (unsigned distance = 16; distance > 0; distance /= 2) {
-#pragma unroll
-            for (unsigned local = 0; local < 8; ++local) {
-                const auto partner = __shfl_down(partial[r][local], distance, 32);
-                if (lane < distance) partial[r][local] = qsa_input_legacy_tree_add(partial[r][local], partner);
-            }
-        }
-        if (lane == 0) {
-            auto* p = partial[r];
-            p[0] = qsa_input_legacy_tree_add(p[0], p[4]); p[1] = qsa_input_legacy_tree_add(p[1], p[5]);
-            p[2] = qsa_input_legacy_tree_add(p[2], p[6]); p[3] = qsa_input_legacy_tree_add(p[3], p[7]);
-            p[0] = qsa_input_legacy_tree_add(p[0], p[2]); p[1] = qsa_input_legacy_tree_add(p[1], p[3]);
-            p[0] = qsa_input_legacy_tree_add(p[0], p[1]);
-            views.output[m][r][row] = round_bf16(p[0]);
-        }
-    }
+// q8_rows sites of the C1 prefetch8 input and wave8 output kernels: the same
+// C++ coefficient/FMA expressions and upper-src0 tree additions, per row.
+__device__ __forceinline__ float qsa_rows_tree_add(float lower, float upper) {
+    float result;
+    asm("v_add_f32 %0, %1, %2" : "=v"(result) : "v"(upper), "v"(lower));
+    return result;
 }
+__device__ __forceinline__ float qsa_rows_coefficient(unsigned scale, std::int8_t code) {
+    return __half2float(__ushort_as_half(static_cast<unsigned short>(scale))) * static_cast<float>(code);
+}
+// index_q, index_k, q, k, v (five segments) from BF16 rows to BF16-rounded FP32.
+template <unsigned Rows> struct QsaInputRowsSite {
+    using Input = std::uint16_t;
+    static constexpr unsigned rows = Rows;
+    const void* input[Rows];
+    q8_rows::Segments segments;
+    std::uint32_t width, outputs;
+    float* output[5][Rows];
+    __device__ static float coefficient(unsigned scale, std::int8_t code) { return qsa_rows_coefficient(scale, code); }
+    __device__ static void fma(float& acc, float c, float x) { acc += x * c; }
+    __device__ static float add(float lower, float upper) { return qsa_rows_tree_add(lower, upper); }
+    __device__ void store(std::uint32_t out, unsigned r, float value) const {
+        unsigned m; std::uint32_t row;
+        static_cast<void>(q8_rows::segment_row(segments, out, width, m, row));
+        output[m][r][row] = round_bf16(value);
+    }
+};
+template <unsigned Rows> struct QsaOutputRowsSite {
+    using Input = float;
+    static constexpr unsigned rows = Rows;
+    const void* input[Rows];
+    q8_rows::Segments segments;
+    std::uint32_t width, outputs;
+    std::uint16_t* output[Rows];
+    __device__ static float coefficient(unsigned scale, std::int8_t code) { return qsa_rows_coefficient(scale, code); }
+    __device__ static void fma(float& acc, float c, float x) { acc += x * c; }
+    __device__ static float add(float lower, float upper) { return qsa_rows_tree_add(lower, upper); }
+    __device__ void store(std::uint32_t out, unsigned r, float value) const { output[r][out] = float_to_bf16(value); }
+};
 
 template <WeightKind Kind, unsigned Rows>
 __global__ void linear_to_float_rows_kernel(QsaRowsInputViews<Rows> views, std::uint32_t input_width) {
@@ -3314,54 +3304,6 @@ template <unsigned Rows> struct QsaRowsOutputViews {
     const float* input[Rows];
     std::uint16_t* output[Rows];
 };
-
-template <unsigned Rows>
-__global__ __launch_bounds__(256)
-void linear_prefetch8_wave8_q8_float_to_bf16_rows_kernel(QsaRowsOutputViews<Rows> views,
-    const void* weights, std::uint32_t input_width, std::uint32_t output_width) {
-    const auto row = static_cast<std::uint32_t>(blockIdx.x) * 8U + static_cast<std::uint32_t>(threadIdx.x) / 32U;
-    if (row >= output_width) return;
-    const auto lane = static_cast<std::uint32_t>(threadIdx.x) % 32U;
-    float partial[Rows][8]{};
-    const auto* blocks = static_cast<const Q8Block*>(weights) + static_cast<std::uint64_t>(row) * (input_width / 32U);
-    for (std::uint64_t chunk = 0; chunk < input_width; chunk += 256U) {
-        const auto base = chunk + 8U * lane;
-        if (base < input_width) {
-            const auto feature = static_cast<std::uint32_t>(base);
-            const auto& block = blocks[feature / 32U];
-            std::int8_t codes[8];
-#pragma unroll
-            for (unsigned local = 0; local < 8; ++local) codes[local] = block.values[feature % 32U + local];
-            const float scale = __half2float(block.scale);
-#pragma unroll
-            for (unsigned r = 0; r < Rows; ++r) {
-                float values[8];
-#pragma unroll
-                for (unsigned local = 0; local < 8; ++local) values[local] = views.input[r][feature + local];
-#pragma unroll
-                for (unsigned local = 0; local < 8; ++local)
-                    partial[r][local] += values[local] * (scale * static_cast<float>(codes[local]));
-            }
-        }
-    }
-#pragma unroll
-    for (unsigned r = 0; r < Rows; ++r) {
-#pragma unroll
-        for (unsigned distance = 16; distance > 0; distance /= 2) {
-#pragma unroll
-            for (unsigned local = 0; local < 8; ++local)
-                partial[r][local] = qsa_output_legacy_tree_add(partial[r][local], __shfl_down(partial[r][local], distance, 32));
-        }
-        if (lane == 0) {
-            auto* p = partial[r];
-            p[0] = qsa_output_legacy_tree_add(p[0], p[4]); p[1] = qsa_output_legacy_tree_add(p[1], p[5]);
-            p[2] = qsa_output_legacy_tree_add(p[2], p[6]); p[3] = qsa_output_legacy_tree_add(p[3], p[7]);
-            p[0] = qsa_output_legacy_tree_add(p[0], p[2]); p[1] = qsa_output_legacy_tree_add(p[1], p[3]);
-            p[0] = qsa_output_legacy_tree_add(p[0], p[1]);
-            views.output[r][row] = float_to_bf16(p[0]);
-        }
-    }
-}
 
 template <WeightKind Kind, unsigned Rows>
 __global__ void linear_float_to_bf16_rows_kernel(QsaRowsOutputViews<Rows> views, const void* weights,
@@ -3635,6 +3577,9 @@ QsaKnownRows<Rows> prepare_qsa_known_rows(std::span<const ExecutionDispatchConte
             throw std::invalid_argument("wave8 QSA output requires aligned Q8_0 weights");
         q8_projection_organization::validate_geometry(a.attention_width, a.hidden);
     }
+    if (config.known_window_a8_projections &&
+        q8_rows::a8_bytes<Rows>(std::max(a.hidden, a.attention_width)) > q8_rows::kLdsBytes)
+        throw std::invalid_argument("QSA known-window A8 activations exceed one block's LDS");
     if (journal.address || journal.bytes) {
         const auto& model = config.model;
         if (!journal.address || journal.address % 2U || journal.bytes != qsa_index_journal_bytes(model) ||
@@ -3649,21 +3594,32 @@ QsaKnownRows<Rows> prepare_qsa_known_rows(std::span<const ExecutionDispatchConte
 }
 
 template <WeightKind Kind, unsigned Rows>
-void launch_qsa_rows_input(bool prefetch, const QsaRowsInputViews<Rows>& views, std::uint32_t hidden, hipStream_t stream) {
+void launch_qsa_rows_input(bool prefetch, bool a8, const QsaRowsInputViews<Rows>& views, std::uint32_t hidden, hipStream_t stream) {
     if constexpr (Kind == WeightKind::q8_0) if (prefetch) {
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(linear_prefetch8_q8_qsa_input_rows_kernel<Rows>), dim3(views.first[views.count]), dim3(32), 0,
-            stream, views, hidden);
+        QsaInputRowsSite<Rows> site{};
+        for (unsigned m = 0; m < views.count; ++m) {
+            site.segments.weights[m] = static_cast<const unsigned char*>(views.weights[m]);
+            site.segments.first[m + 1U] = views.first[m + 1U];
+            for (unsigned r = 0; r < Rows; ++r) site.output[m][r] = views.output[m][r];
+        }
+        site.segments.count = views.count;
+        for (unsigned r = 0; r < Rows; ++r) site.input[r] = views.input[r];
+        site.width = hidden; site.outputs = views.first[views.count];
+        q8_rows::launch(site, a8, stream);
         return;
     }
     hipLaunchKernelGGL(HIP_KERNEL_NAME(linear_to_float_rows_kernel<Kind, Rows>), dim3(views.first[views.count]), dim3(kThreads), 0,
         stream, views, hidden);
 }
 template <WeightKind Kind, unsigned Rows>
-void launch_qsa_rows_output(bool wave8, const QsaRowsOutputViews<Rows>& views, const void* weights,
+void launch_qsa_rows_output(bool wave8, bool a8, const QsaRowsOutputViews<Rows>& views, const void* weights,
     std::uint32_t width, std::uint32_t hidden, hipStream_t stream) {
     if constexpr (Kind == WeightKind::q8_0) if (wave8) {
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(linear_prefetch8_wave8_q8_float_to_bf16_rows_kernel<Rows>), dim3((hidden + 7U) / 8U),
-            dim3(256), 0, stream, views, weights, width, hidden);
+        QsaOutputRowsSite<Rows> site{};
+        site.segments = q8_rows::segments({{weights, hidden}});
+        for (unsigned r = 0; r < Rows; ++r) { site.input[r] = views.input[r]; site.output[r] = views.output[r]; }
+        site.width = width; site.outputs = hidden;
+        q8_rows::launch(site, a8, stream);
         return;
     }
     hipLaunchKernelGGL(HIP_KERNEL_NAME(linear_float_to_bf16_rows_kernel<Kind, Rows>), dim3(hidden), dim3(kThreads), 0,
@@ -3717,7 +3673,8 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
             for (unsigned r = 0; r < Rows; ++r) input.output[g][r] = prepared.row[r].workspace.*targets[m];
         }
         dispatch_weight_kind(matrices[lead]->manifest->ggml_type, [&](auto kind) {
-            launch_qsa_rows_input<decltype(kind)::value, Rows>(prepared.prefetch[lead], input, a.hidden, stream);
+            launch_qsa_rows_input<decltype(kind)::value, Rows>(prepared.prefetch[lead], config.known_window_a8_projections,
+                input, a.hidden, stream);
         });
         check_hip(hipGetLastError(), "QSA known-window input projection launch");
         if (prepared.prefetch[lead] && config.prefetch_stats)
@@ -3803,7 +3760,7 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
         out.output[r] = reinterpret_cast<std::uint16_t*>(prepared.row[r].output.address);
     }
     dispatch_weight_kind(tensors.out.manifest->ggml_type, [&](auto kind) {
-        launch_qsa_rows_output<decltype(kind)::value, Rows>(config.wave8_q8_output, out,
+        launch_qsa_rows_output<decltype(kind)::value, Rows>(config.wave8_q8_output, config.known_window_a8_projections, out,
             reinterpret_cast<const void*>(tensors.out.runtime->address), a.attention_width, a.hidden, stream);
     });
     check_hip(hipGetLastError(), "QSA known-window output projection launch");
@@ -4080,6 +4037,79 @@ void launch_hip_qsa_output_projection_probe(HipQsaOutputProjectionMode mode,
     check_hip(hipGetLastError(), "HIP QSA output projection diagnostic launch");
 }
 #endif
+#ifdef STRIX_BUILD_KNOWN_WINDOW_DIAGNOSTIC
+namespace {
+template <unsigned Rows>
+void enqueue_qsa_rows_probe(bool input_side, bool a8, std::span<const HipQsaInputProjectionView> input,
+    HipQsaInputProjectionView weights, std::span<const HipQsaInputProjectionView> output, std::uint32_t width,
+    std::uint32_t outputs, hipStream_t stream) {
+    const auto segments = q8_rows::segments({{reinterpret_cast<const void*>(weights.address), outputs}});
+    if (input_side) {
+        QsaInputRowsSite<Rows> site{};
+        site.segments = segments; site.width = width; site.outputs = outputs;
+        for (unsigned r = 0; r < Rows; ++r) {
+            site.input[r] = reinterpret_cast<const void*>(input[r].address);
+            site.output[0][r] = reinterpret_cast<float*>(output[r].address);
+        }
+        q8_rows::launch(site, a8, stream);
+    } else {
+        QsaOutputRowsSite<Rows> site{};
+        site.segments = segments; site.width = width; site.outputs = outputs;
+        for (unsigned r = 0; r < Rows; ++r) {
+            site.input[r] = reinterpret_cast<const void*>(input[r].address);
+            site.output[r] = reinterpret_cast<std::uint16_t*>(output[r].address);
+        }
+        q8_rows::launch(site, a8, stream);
+    }
+}
+} // namespace
+void launch_hip_qsa_rows_projection_probe(HipQsaRowsProjection projection, HipQsaRowsProbeMode mode,
+    std::span<const HipQsaInputProjectionView> input, HipQsaInputProjectionView weights,
+    std::span<const HipQsaInputProjectionView> output, std::uint32_t width, std::uint32_t outputs, void* stream) {
+    const auto rows = static_cast<std::uint32_t>(input.size());
+    const bool input_side = projection == HipQsaRowsProjection::input;
+    if ((rows != 1U && rows != 2U && rows != 4U && rows != 8U) || output.size() != rows ||
+        (!input_side && projection != HipQsaRowsProjection::output) ||
+        (mode != HipQsaRowsProbeMode::rows && mode != HipQsaRowsProbeMode::rows_a8 && mode != HipQsaRowsProbeMode::row_loop) ||
+        !stream || static_cast<hipStream_t>(stream) == hipStreamLegacy || static_cast<hipStream_t>(stream) == hipStreamPerThread)
+        throw std::invalid_argument("QSA rows projection diagnostic requires 1/2/4/8 rows, a mode and an owned stream");
+    const auto overlap = [](HipQsaInputProjectionView x, HipQsaInputProjectionView y) {
+        return x.address < y.address + y.bytes && y.address < x.address + x.bytes;
+    };
+    for (unsigned r = 0; r < rows; ++r) {
+        const q8_projection_organization::View x{input[r].address, input[r].bytes}, w{weights.address, weights.bytes},
+            y{output[r].address, output[r].bytes};
+        if (input_side) q8_projection_organization::validate_views(width, outputs, x, w, y);
+        else q8_projection_organization::validate_fp32_bf16_views(width, outputs, x, w, y);
+        if (overlap(output[r], weights)) throw std::invalid_argument("QSA rows projection output aliases weights");
+        for (unsigned other = 0; other < rows; ++other)
+            if (overlap(output[r], input[other]) || (other < r && overlap(output[r], output[other])))
+                throw std::invalid_argument("QSA rows projection output aliases a row");
+    }
+    if (mode == HipQsaRowsProbeMode::rows_a8 && rows * width + rows * (width / 32U) * 4U > q8_rows::kLdsBytes)
+        throw std::invalid_argument("QSA rows A8 activations exceed one block's LDS");
+    const auto native = static_cast<hipStream_t>(stream);
+    check_hip(hipPeekAtLastError(), "QSA rows projection diagnostic pre-enqueue stale error");
+    const auto* packed = reinterpret_cast<const void*>(weights.address);
+    if (mode == HipQsaRowsProbeMode::row_loop) {
+        for (unsigned r = 0; r < rows; ++r) {
+            if (input_side) hipLaunchKernelGGL(linear_prefetch8_q8_qsa_input_kernel, dim3(outputs), dim3(32), 0, native,
+                reinterpret_cast<const std::uint16_t*>(input[r].address), packed, width, outputs, reinterpret_cast<float*>(output[r].address));
+            else hipLaunchKernelGGL(linear_prefetch8_wave8_q8_float_to_bf16_kernel, dim3((outputs + 7U) / 8U), dim3(256), 0, native,
+                reinterpret_cast<const float*>(input[r].address), packed, width, outputs, reinterpret_cast<std::uint16_t*>(output[r].address));
+            check_hip(hipGetLastError(), "QSA rows projection diagnostic row-loop launch");
+        }
+        return;
+    }
+    const bool a8 = mode == HipQsaRowsProbeMode::rows_a8;
+    if (rows == 1U) enqueue_qsa_rows_probe<1U>(input_side, a8, input, weights, output, width, outputs, native);
+    else if (rows == 2U) enqueue_qsa_rows_probe<2U>(input_side, a8, input, weights, output, width, outputs, native);
+    else if (rows == 4U) enqueue_qsa_rows_probe<4U>(input_side, a8, input, weights, output, width, outputs, native);
+    else enqueue_qsa_rows_probe<8U>(input_side, a8, input, weights, output, width, outputs, native);
+    check_hip(hipGetLastError(), "QSA rows projection diagnostic launch");
+}
+#endif
+
 
 void register_hip_indexed_attention_kernel_variant(
     const ModelContract& model,
