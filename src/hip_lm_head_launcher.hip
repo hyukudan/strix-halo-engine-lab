@@ -1112,5 +1112,15 @@ void launch_hip_mtp_lm_head(const MtpNativeContext& c,void* stream) {
     }
     check_hip(hipGetLastError(),"MTP native LM head launch");
 }
+void launch_hip_q8_head_rows(const std::uint16_t* hidden,const void* q8_rows,std::uint32_t hidden_size,
+    std::uint32_t rows,float* logits,void* stream) {
+    if(!hidden || !q8_rows || !logits || !stream || !rows || !hidden_size || hidden_size%32U || hidden_size>10240U ||
+       reinterpret_cast<std::uintptr_t>(q8_rows)%2U)
+        throw std::invalid_argument("Q8 draft head rows geometry/views invalid");
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(prefetch8_wave_q8_lm_head_kernel<std::uint16_t,8>),
+        dim3(rows/8U+static_cast<std::uint32_t>(rows%8U!=0U)),dim3(256U),0,reinterpret_cast<hipStream_t>(stream),
+        hidden,q8_rows,hidden_size,rows,logits);
+    check_hip(hipGetLastError(),"Q8 draft head rows launch");
+}
 
 }  // namespace strix

@@ -244,6 +244,13 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
         if(runtime->next_source_position()+1U!=session.next_position)
             throw std::logic_error("MTP replay did not prime the actual final prompt frontier");
         replay_rows.clear(); // release prompt snapshots before bounded cycles
+        if(m.draft_chain){
+            // Drafts only: the subset (or full) head changes acceptance, never target output.
+            HipMtpDraftHeadConfig draft;draft.full=m.draft_vocab.empty() && !m.draft_context_vocab;
+            if(!m.draft_vocab.empty())draft.base_tokens=HipMtpDraftHead::read_token_file(m.draft_vocab,static_cast<std::uint32_t>(model.vocab_size));
+            draft.context_capacity=m.draft_context_vocab;
+            runtime->enable_draft_chain(std::move(draft));runtime->observe_draft_context(options.tokens);
+        }
         HipMtpGreedyRuntime greedy(runtime,qualified,activated,target,session,r,dispatcher,parents);
         if(window && !qualify)greedy.use_window_verifier(window);
         if(qualify){
@@ -270,6 +277,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
         if(generated.back()==eos.front())stop="eos";
         assets->validate_assets_unchanged();
         const auto native_stats=runtime->execution_stats();
+        const auto draft_stats=runtime->draft_head()?runtime->draft_head()->stats():HipMtpDraftHeadStats{};
         std::optional<HipKnownPrefixUnionObservation> union_observation;
         if(window)union_observation=window->window_owner()->latest_routed_union_observation();
         if(m.window_expert_union && window_attempts &&
@@ -342,6 +350,9 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
             <<"  \"mtp_target_r2_dispatches_scope\":\"actual-pair-entry-dispatches-only-excludes-wide-R4-R8\",\n"
             <<"  \"mtp_target_wide_dispatches\":null,\n"
             <<"  \"mtp_target_wide_dispatches_scope\":\"not-exposed-by-current-verifier-result-not-inferred-from-geometry\",\n"
+            <<"  \"mtp_draft_chain\":"<<(m.draft_chain?"true":"false")<<",\n"
+            <<"  \"mtp_draft_head_rows\":"<<draft_stats.rows<<",\n  \"mtp_draft_base_rows\":"<<draft_stats.base_rows<<",\n"
+            <<"  \"mtp_draft_context_rows\":"<<draft_stats.context_rows<<",\n  \"mtp_draft_context_dropped\":"<<draft_stats.context_dropped<<",\n"
             <<"  \"mtp_generation_cycle_elapsed_ms\":"<<elapsed<<",\n"
             <<"  \"mtp_timing_scope\":\"post-prompt-and-independent-replay-cycles-only-host-completed-wall-not-GPU-kernel-time\",\n"
             <<"  \"prefix_tokens_consumed\":"<<options.tokens.size()<<",\n  \"final_position\":"<<session.next_position<<",\n"

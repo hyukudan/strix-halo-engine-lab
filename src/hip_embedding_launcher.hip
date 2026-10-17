@@ -340,6 +340,16 @@ __global__ void embedding_kernel(
 }
 
 template <typename Output, EmbeddingWeightKind Kind>
+__global__ void device_token_embedding_kernel(
+    const void* weights, std::uint32_t row_width, std::uint32_t vocabulary_size,
+    const std::uint32_t* token, Output* output) {
+    const auto id = *token < vocabulary_size ? *token : 0U;
+    for (std::uint64_t feature = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         feature < row_width; feature += static_cast<std::uint64_t>(gridDim.x) * blockDim.x)
+        store_output(&output[feature], load_weight<Kind>(weights, row_width, id, static_cast<std::uint32_t>(feature)));
+}
+
+template <typename Output, EmbeddingWeightKind Kind>
 __global__ void graph_embedding_kernel(
     const void* weights, std::uint32_t width, std::uint32_t vocabulary_size,
     std::uint64_t context_tokens, const std::uint32_t* token,
@@ -912,6 +922,27 @@ void launch_hip_mtp_embedding(const MtpNativeContext& c,std::uint32_t token,void
     case EmbeddingWeightKind::iq4_xs:launch.template operator()<EmbeddingWeightKind::iq4_xs>();break;
     }
     check_hip(hipGetLastError(),"MTP native embedding launch");
+}
+
+void launch_hip_mtp_embedding_device(const MtpNativeContext& c,const std::uint32_t* token,void* stream) {
+    if(!token) throw std::invalid_argument("MTP device-token embedding requires a token word");
+    preflight_hip_mtp_embedding(c,0U);mtp_native::stream(c,stream);
+    check_hip(hipGetLastError(),"MTP embedding pending HIP error");
+    auto launch=[&]<EmbeddingWeightKind Kind>() {
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(device_token_embedding_kernel<std::uint16_t,Kind>),
+            dim3((static_cast<std::uint32_t>(c.model->hidden_size)+kThreads-1)/kThreads),dim3(kThreads),0,
+            reinterpret_cast<hipStream_t>(stream),reinterpret_cast<const void*>(c.tensors->embedding.runtime->address),
+            static_cast<std::uint32_t>(c.model->hidden_size),static_cast<std::uint32_t>(c.model->vocab_size),token,
+            reinterpret_cast<std::uint16_t*>(c.resources->view(HipMtpBuffer::embedding).address));
+    };
+    switch(weight_kind(c.tensors->embedding.manifest->ggml_type)) {
+    case EmbeddingWeightKind::f32:launch.template operator()<EmbeddingWeightKind::f32>();break;
+    case EmbeddingWeightKind::f16:launch.template operator()<EmbeddingWeightKind::f16>();break;
+    case EmbeddingWeightKind::bf16:launch.template operator()<EmbeddingWeightKind::bf16>();break;
+    case EmbeddingWeightKind::q8_0:launch.template operator()<EmbeddingWeightKind::q8_0>();break;
+    case EmbeddingWeightKind::iq4_xs:launch.template operator()<EmbeddingWeightKind::iq4_xs>();break;
+    }
+    check_hip(hipGetLastError(),"MTP device-token embedding launch");
 }
 
 }  // namespace strix
