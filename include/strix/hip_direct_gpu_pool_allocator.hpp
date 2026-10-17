@@ -8,6 +8,8 @@ struct HipDirectGpuPoolPolicy {
     bool experimental_opt_in = false;
     std::uint64_t maximum_gpu_bytes = 128ULL * 1024ULL * 1024ULL;
     std::uint64_t maximum_alignment = 4096;
+    // Optional whole-allocation request quantum; observed native capacity is still checked.
+    std::uint64_t allocation_quantum = 1;
 };
 struct HipDirectGpuPoolCalls {
     HipDirectGpuExportCalls observations;

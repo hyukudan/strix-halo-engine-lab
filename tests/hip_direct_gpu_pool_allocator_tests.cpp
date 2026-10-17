@@ -86,6 +86,22 @@ std::shared_ptr<HipDirectGpuPoolAllocator> allocator(const std::shared_ptr<State
 
 int main() {
     {
+        auto state = std::make_shared<State>();
+        HipDirectGpuPoolPolicy selected{true, 6ULL * 1024ULL * 1024ULL, 4096, 2ULL * 1024ULL * 1024ULL};
+        HipDirectGpuPoolAllocator owner(state->device, selected, fixture_calls(state));
+        const auto address = owner.allocate_device(4ULL * 1024ULL * 1024ULL, 4096);
+        expect(state->requests == std::vector<std::size_t>{6ULL * 1024ULL * 1024ULL}, "selected backing quantum includes alignment slack before allocation");
+        expect(owner.retained_bytes() == 6ULL * 1024ULL * 1024ULL, "whole rounded native allocation is charged");
+        expect(rejected([&] { static_cast<void>(owner.allocate_device(1, 1)); }) && state->alloc_calls == 1, "rounded request cannot exceed remaining budget");
+        owner.free_device(address, 4ULL * 1024ULL * 1024ULL);
+        expect(owner.retained_bytes() == 0 && state->free_calls == 1, "rounded backing still frees by exact public view");
+    }
+    for (const auto quantum : {0ULL, 3ULL, 2ULL * 1024ULL * 1024ULL}) {
+        auto state = std::make_shared<State>(); auto selected = policy(); selected.allocation_quantum = quantum;
+        expect(rejected([&] { HipDirectGpuPoolAllocator owner(state->device, selected, fixture_calls(state)); }) && state->alloc_calls == 0, "invalid quantum is rejected without allocating");
+    }
+
+    {
         auto state = std::make_shared<State>(); auto calls = fixture_calls(state);
         expect(rejected([&] { HipDirectGpuPoolAllocator disabled(state->device, {}, calls); }), "uncached allocator requires explicit opt-in before allocation");
         expect(state->alloc_calls == 0, "default policy performs no allocation call");

@@ -328,7 +328,7 @@ int run(const Options& options, const std::vector<Options>& steps, const std::ve
     std::string architecture(properties.gcnArchName); const auto suffix = architecture.find(':'); if (suffix != std::string::npos) architecture.resize(suffix);
     if (uuid(device.uuid) != options.gpu_uuid || device.runtime_version != options.runtime_version || device.driver_version != options.driver_version || architecture != "gfx1151") throw std::runtime_error("commissioning observed GPU UUID/runtime/driver/architecture differs from operator expected identity");
     AllocationGenerationSource generations;
-    auto allocator = std::make_shared<HipDirectGpuPoolAllocator>(device, HipDirectGpuPoolPolicy{true, 128ULL * 1024ULL * 1024ULL, 4096});
+    auto allocator = std::make_shared<HipDirectGpuPoolAllocator>(device, HipDirectGpuPoolPolicy{true, 128ULL * 1024ULL * 1024ULL, 4096, 2ULL * 1024ULL * 1024ULL});
     const auto geometry = plan_multi_link_transport_pools(std::array{DirectFrameGeometry{4096, options.ring_frames, true}});
     auto exported = DirectGpuExportOwner::allocate_and_export(exporter, allocator, geometry, generations, device); auto lease = exported->retain_for_import();
     const auto maximum_bytes = *std::max_element(options.payload_sizes.begin(), options.payload_sizes.end());
