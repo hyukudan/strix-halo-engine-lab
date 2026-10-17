@@ -115,6 +115,7 @@ struct HipKnownPrefixWindow::Impl {
     HipMoeRouteLauncherConfig route_config;
     HipElementwiseLauncherConfig elementwise_config;
     q51_known_rows::Workspace routed_workspace;
+    q51_known_rows::Workspace prefill_routed_workspace; // all T rows of a prefill step (STRIX_PREFILL_FULL_MOE)
     q51_known_rows::Summary pending_union_summary;
     std::uint32_t last_union_layer = 0;
     std::optional<HipKnownPrefixUnionObservation> last_union_observation;
@@ -211,8 +212,8 @@ struct HipKnownPrefixWindow::Impl {
         position_readers.erase(std::unique(position_readers.begin(), position_readers.end()), position_readers.end());
         setup_r2();
         setup_rows();
-        if(prefill) setup_prefill_entries();
         setup_routed_union();
+        if(prefill) setup_prefill_entries();
         setup_hyper_rows();
         setup_deferred();
         setup_head_rows();
@@ -227,6 +228,7 @@ struct HipKnownPrefixWindow::Impl {
         });
     }
     ~Impl() { guard.recover_or_fail_stop(); }
+    bool full_prefill_union() const noexcept {return prefill&&prefill_routed_workspace.owner;}
     std::uint64_t execution_identity() const noexcept {return prefill?prefill->prefill_execution_identity:window.window_execution_identity;}
     const ExecutionArenaPlan& physical_arena() const noexcept {return prefill?prefill->arena.physical:window.arena.physical;}
     std::uint32_t logical_rows() const noexcept {return prefill?prefill->logical_rows:window.logical_rows;}
@@ -324,7 +326,6 @@ struct HipKnownPrefixWindow::Impl {
             }};
     }
     void setup_prefill_entries() {
-        // STRIX_PREFILL_FULL_GDN=0: keep the GDN step in 8-row tiles.
         // STRIX_PREFILL_FULL_HC=0: keep HC rows in separate 8-row launches.
         static const bool hc=[]{const char* v=std::getenv("STRIX_PREFILL_FULL_HC");return !v||v[0]!='0';}();
         if(hc&&window.hyper_mix_rows_steps)
@@ -386,7 +387,28 @@ struct HipKnownPrefixWindow::Impl {
                 [](std::span<const ExecutionDispatchContext> rows,void* object) {
                     moe_route_known_prefill_rows_launch(rows,static_cast<Impl*>(object)->route_config);
                 }});
+        // STRIX_PREFILL_FULL_GDN=0 / STRIX_PREFILL_FULL_MOE=0: keep that step in 8-row tiles.
         static const bool gdn=[]{const char* v=std::getenv("STRIX_PREFILL_FULL_GDN");return !v||v[0]!='0';}();
+        static const bool moe=[]{const char* v=std::getenv("STRIX_PREFILL_FULL_MOE");return !v||v[0]!='0';}();
+        if(moe && window.routed_expert_union_steps && (config.a8_down_q51 || config.a8_down_q80) && prefill->logical_rows%8U==0U) {
+            const auto bytes=q51_known_rows::prefill_scratch_bytes(prefill->logical_rows,u32(model.num_experts),u32(model.num_experts_per_token));
+            void* memory=nullptr;
+            guard.run([&] { check(hipMalloc(&memory,bytes),"allocate known prefill routed CSR"); });
+            std::shared_ptr<void> owner(memory,[](void* p){ if(p) (void)hipFree(p); });
+            const auto base=reinterpret_cast<std::uintptr_t>(memory);
+            if(base%256U) throw std::runtime_error("known prefill routed CSR allocation is not 256-byte aligned");
+            status_disjoint(base,bytes);
+            prefill_routed_workspace={{execution_identity(),base,bytes,routed_workspace.memory.allocation_generation^(1ULL<<63U)},owner};
+            prefill_entries.push_back({KnownWindowR2Variant::routed_a8_union_rows8_v1,this,
+                [](std::span<const ExecutionDispatchContext> rows,void* object) {
+                    const auto& self=*static_cast<Impl*>(object);
+                    moe_experts_known_prefill_rows_preflight(rows,self.routed_config,self.routed_workspace,self.prefill_routed_workspace);
+                },
+                [](std::span<const ExecutionDispatchContext> rows,void* object) {
+                    const auto& self=*static_cast<Impl*>(object);
+                    moe_experts_known_prefill_rows_launch(rows,self.routed_config,self.routed_workspace,self.prefill_routed_workspace);
+                }});
+        }
         if(!gdn) return;
         prefill_entries.push_back({KnownWindowR2Variant::gdn_q8_rows8_f32_gates_r1_v1,this,
             [](std::span<const ExecutionDispatchContext> rows,void* object) {
@@ -670,8 +692,8 @@ struct HipKnownPrefixWindow::Impl {
         guard.require_original();
         if(window.routed_expert_union_steps)
             check(hipMemcpyAsync(&pending_union_summary,
-                reinterpret_cast<const void*>(routed_workspace.memory.arena_base),sizeof(pending_union_summary),
-                hipMemcpyDeviceToHost,scope.stream),"read latest routed expert union metadata");
+                reinterpret_cast<const void*>(full_prefill_union()?prefill_routed_workspace.memory.arena_base:routed_workspace.memory.arena_base),
+                sizeof(pending_union_summary),hipMemcpyDeviceToHost,scope.stream),"read latest routed expert union metadata");
         if (config.deferred_moe_status)
             check(hipMemcpyAsync(&completion_status,
                 reinterpret_cast<const void*>(scope.deferred_moe_status.arena_base), sizeof(completion_status),
@@ -679,7 +701,20 @@ struct HipKnownPrefixWindow::Impl {
         check(hipStreamSynchronize(scope.stream), "complete known-window native stream");
         guard.require_original();
         if (config.deferred_moe_status) check_deferred_moe_status(completion_status);
-        if(window.routed_expert_union_steps) {
+        if(full_prefill_union()) {
+            // One CSR over all T rows: histogram buckets saturate at 8, batches hold <= 64 assignments.
+            const auto& s=pending_union_summary;
+            const auto assignments=prefill->logical_rows*u32(model.num_experts_per_token);
+            std::uint64_t experts=0,batches=0;
+            for(std::uint32_t i=0;i<8U;++i){experts+=s.rows_per_expert_histogram[i];batches+=s.batch_size_histogram[i];}
+            if(s.status || s.version!=1U || s.logical_rows!=prefill->logical_rows || s.assignments!=assignments ||
+                !s.touched || s.touched>assignments || s.touched>model.num_experts ||
+                s.batches<s.touched || s.batches>assignments || !s.maximum_assignments ||
+                s.maximum_assignments>assignments || s.duplicate_assignments>assignments ||
+                experts!=s.touched || batches!=s.batches ||
+                std::any_of(s.reserved,s.reserved+8U,[](auto v){return v!=0U;}))
+                throw std::runtime_error("routed expert union metadata disagrees with its completed prefill");
+        } else if(window.routed_expert_union_steps) {
             const auto& s=pending_union_summary;
             const auto assignments=window.logical_rows*u32(model.num_experts_per_token);
             std::uint64_t experts=0,batches=0,batch_assignments=0,unique_row_assignments=0;
@@ -847,7 +882,7 @@ struct HipKnownPrefixWindow::Impl {
             actual_window_committed=true;
             if(capture)*batch=capture->seal(session);
             if(window.routed_expert_union_steps)
-                last_union_observation=HipKnownPrefixUnionObservation{first_position+(prefill?(prefill->logical_rows/8U-1U)*8U:0U),last_union_layer,pending_union_summary};
+                last_union_observation=HipKnownPrefixUnionObservation{first_position+(prefill&&!full_prefill_union()?(prefill->logical_rows/8U-1U)*8U:0U),last_union_layer,pending_union_summary};
             return result;
         } catch (...) {
             if(capture)capture->abort();

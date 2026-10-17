@@ -3,6 +3,7 @@
 #error "A8 CSR gate/up requires strict floating-point semantics"
 #endif
 #include <hip/hip_fp16.h>
+#include <algorithm>
 #include <array>
 #include <cstdlib>
 #include <limits>
@@ -383,6 +384,234 @@ __global__ __launch_bounds__(256) void down_window(const unsigned char* weights,
         if(owner==0U)view.rawdots[csr.rows[begin+a]][csr.slots[begin+a]*hidden+row]=acc[a];
     }
 }
+template<class T> __device__ __forceinline__ T* at(StridedRows<T> v,unsigned r) {
+    return reinterpret_cast<T*>(reinterpret_cast<std::uintptr_t>(v.base)+static_cast<unsigned long long>(r)*v.stride);
+}
+// Prefill CSR over T*top_k assignments, one 1024-thread CTA: counting sort by
+// expert; assignment a=r*top_k+s goes to offsets[e]+#{a'<a with expert e}, so
+// each expert's rows (then slots) ascend. Batches are runs of at most `cap`
+// assignments of one expert. Runs after the prologue and folds every row
+// status into summary[0], so the projection kernels read one word.
+__global__ __launch_bounds__(1024) void build_prefill_csr(PrefillRows v,unsigned rows,unsigned experts,unsigned top_k,unsigned cap) {
+    const auto& csr=v.csr;
+    const unsigned t=threadIdx.x,count=rows*top_k;
+    __shared__ unsigned short expert_of[q51_known_rows::prefill_max_rows*10U];
+    __shared__ unsigned n_of[512],scan[3][512],hist[16],failure,status,duplicates,maximum;
+    if(t==0){failure=0U;status=0U;duplicates=0U;maximum=0U;}
+    if(t<16U)hist[t]=0U;
+    if(t<512U)n_of[t]=0U;
+    __syncthreads();
+    for(unsigned a=t;a<count;a+=1024U) {
+        const unsigned r=a/top_k,s=a%top_k,e=at(v.routes,r)[s];
+        if(e>=experts||!isfinite(at(v.route_weights,r)[s]))atomicOr(&failure,invalid_route);
+        expert_of[a]=static_cast<unsigned short>(e<experts?e:0U);
+    }
+    for(unsigned r=t;r<rows;r+=1024U){const unsigned s=*at(v.status,r);if(s)atomicOr(&status,s);}
+    __syncthreads();
+    if(failure){if(t<32U)csr.summary[t]=t==0U?failure|status:t==3U?count:t==6U?rows:t==7U?1U:0U;return;}
+    for(unsigned a=t;a<count;a+=1024U)atomicAdd(&n_of[expert_of[a]],1U);
+    __syncthreads();
+    const unsigned n=t<512U?n_of[t]:0U,nb=(n+cap-1U)/cap;
+    if(t<512U){scan[0][t]=n;scan[1][t]=n!=0U;scan[2][t]=nb;}
+    __syncthreads();
+    for(unsigned d=1U;d<512U;d<<=1U) {
+        unsigned x[3]={};
+        if(t>=d&&t<512U)for(unsigned k=0;k<3U;++k)x[k]=scan[k][t-d];
+        __syncthreads();
+        if(t>=d&&t<512U)for(unsigned k=0;k<3U;++k)scan[k][t]+=x[k];
+        __syncthreads();
+    }
+    if(t<experts) {
+        const unsigned off=scan[0][t]-n,touched=scan[1][t]-(n!=0U),batch=scan[2][t]-nb;
+        csr.offsets[t]=off;
+        if(t==experts-1U)csr.offsets[experts]=off+n;
+        if(n) {
+            csr.touched[touched]=t;atomicMax(&maximum,n);
+            for(unsigned b=0;b<nb;++b){csr.experts[batch+b]=t;csr.begins[batch+b]=off+b*cap;atomicAdd(&hist[8U+min(8U,min(cap,n-b*cap))-1U],1U);}
+            unsigned k=0U,unique=0U,last=UINT32_MAX;
+            for(unsigned a=0;a<count&&k<n;++a)if(expert_of[a]==t) {
+                const unsigned r=a/top_k;
+                csr.rows[off+k]=r;csr.slots[off+k]=a%top_k;++k;
+                unique+=r!=last;last=r;
+            }
+            atomicAdd(&hist[min(8U,unique)-1U],1U);atomicAdd(&duplicates,n-unique);
+        }
+    }
+    __syncthreads();
+    if(t==0U)csr.begins[scan[2][511]]=count;
+    if(t<32U)csr.summary[t]=t==0U?status:t==1U?scan[1][511]:t==2U?scan[2][511]:t==3U?count:t==4U?duplicates:t==5U?maximum:
+        t==6U?rows:t==7U?1U:t>=8U&&t<24U?hist[t-8U]:0U;
+}
+// project_window over strided prefill rows: same per-(row,slot) lane arithmetic,
+// staging, chains and A8 down quantizer epilogue. Grid x = CSR batch (runs of one
+// expert are adjacent, so their weight slices hit L2), y = 32-output tile.
+template<unsigned G,bool Q5K,unsigned Chunk=max_hidden/256U>
+__global__ __launch_bounds__(256) void project_prefill(const unsigned char* gate,const unsigned char* up,PrefillRows view,
+    unsigned hidden,unsigned outputs) {
+    const auto& csr=view.csr;
+    if(csr.summary[0]||blockIdx.x>=csr.summary[2])return;
+    const unsigned tile_index=blockIdx.y;
+    const auto begin=csr.begins[blockIdx.x],count=csr.begins[blockIdx.x+1U]-begin,expert=csr.experts[blockIdx.x];
+    __shared__ __align__(16) signed char local_codes[G][max_hidden];
+    __shared__ __align__(16) float local_deltas[G][max_hidden/32U];
+    __shared__ __align__(16) int local_sums[G][max_hidden/32U];
+    __shared__ float tile[2][G][32];
+    const unsigned lane=threadIdx.x&31U,c=lane&7U,p=c/2U,h=c&1U,wave=threadIdx.x/32U;
+    const unsigned out=tile_index*32U+wave*4U+lane/8U,blocks=hidden/256U;
+    constexpr unsigned block_bytes=Q5K?176U:144U;
+    const auto offset=(static_cast<unsigned long long>(expert)*outputs+out)*blocks*block_bytes;
+    const unsigned g0=2U*p,g1=g0+1U;
+    constexpr unsigned max_blocks=max_hidden/256U;
+    for(unsigned group=0;group<count;group+=G) {
+        if(group)__syncthreads();
+#pragma unroll
+        for(unsigned a=0;a<G;++a)if(group+a<count) {
+            const auto r=csr.rows[begin+group+a];
+            const auto* codes=at(view.codes,r);const auto* deltas=at(view.deltas,r);const auto* sums=at(view.sums,r);
+            for(unsigned i=16U*threadIdx.x;i<hidden;i+=4096U)
+                *reinterpret_cast<int4*>(local_codes[a]+i)=*reinterpret_cast<const int4*>(codes+i);
+            for(unsigned i=threadIdx.x;i<hidden/32U;i+=256U){local_deltas[a][i]=deltas[i];local_sums[a][i]=sums[i];}
+        }
+        __syncthreads();
+        float acc[2][G]={};
+#pragma unroll
+        for(unsigned m=0;m<2U;++m) {
+            const unsigned char* w=(m==0U?gate:up)+offset;
+            if constexpr(Q5K) {
+#pragma unroll 1
+                for(unsigned b=0;b<blocks;++b) {
+                    const auto* packed=w+b*176U;
+                    const uint4 hd=*reinterpret_cast<const uint4*>(packed);
+                    const uint4 q=*reinterpret_cast<const uint4*>(packed+48U+c*16U);
+                    const uint4 qh=*reinterpret_cast<const uint4*>(packed+16U+h*16U);
+#pragma unroll
+                    for(unsigned a=0;a<G;++a)if(group+a<count) {
+                        const int4 a0=*reinterpret_cast<const int4*>(local_codes[a]+b*256U+p*64U+h*16U);
+                        const int4 a1=*reinterpret_cast<const int4*>(local_codes[a]+b*256U+p*64U+32U+h*16U);
+                        const float pair=paired_q5k(hd,q,qh,p,a0,a1,local_sums[a][b*8U+g0],local_sums[a][b*8U+g1],
+                            local_deltas[a][b*8U+g0],local_deltas[a][b*8U+g1]);
+                        acc[m][a]=acc[m][a]+pair;
+                    }
+                }
+            } else {
+#pragma unroll
+                for(unsigned first=0;first<max_blocks;first+=Chunk) {
+                uint4 hd[Chunk],q[Chunk];
+#pragma unroll
+                for(unsigned i=0;i<Chunk;++i)if(first+i<blocks) {
+                    const unsigned b=first+i;
+                    hd[i]=*reinterpret_cast<const uint4*>(w+b*144U);q[i]=*reinterpret_cast<const uint4*>(w+b*144U+16U+c*16U);
+                }
+#pragma unroll
+                for(unsigned i=0;i<Chunk;++i)if(first+i<blocks) {
+                    const unsigned b=first+i;
+                    const auto k=coefficient(hd[i],q[i],p);
+#pragma unroll
+                    for(unsigned a=0;a<G;++a)if(group+a<count) {
+                        const int4 a0=*reinterpret_cast<const int4*>(local_codes[a]+b*256U+p*64U+h*16U);
+                        const int4 a1=*reinterpret_cast<const int4*>(local_codes[a]+b*256U+p*64U+32U+h*16U);
+                        const float pair=paired(k,a0,a1,local_sums[a][b*8U+g0],local_sums[a][b*8U+g1],
+                            local_deltas[a][b*8U+g0],local_deltas[a][b*8U+g1]);
+                        acc[m][a]=acc[m][a]+pair;
+                    }
+                }
+                }
+            }
+        }
+#pragma unroll
+        for(unsigned a=0;a<G;++a)if(group+a<count) {
+#pragma unroll
+            for(unsigned m=0;m<2U;++m){acc[m][a]=acc[m][a]+__shfl_xor(acc[m][a],2,32);acc[m][a]=acc[m][a]+__shfl_xor(acc[m][a],4,32);}
+            if(c==0U){tile[0][a][out%32U]=acc[0][a];tile[1][a][out%32U]=acc[1][a];}
+        }
+        // Serial down_activation_quantize for group tile_index of each staged (row, slot).
+        __syncthreads();
+        for(unsigned a=wave;a<G;a+=8U)if(group+a<count) {
+            const auto r=csr.rows[begin+group+a],slot=csr.slots[begin+group+a];
+            float* output=at(view.output,r);
+            const unsigned feature=tile_index*32U+lane,at_slot=slot*2U*outputs+feature;
+            const float g=tile[0][a][lane],u=tile[1][a][lane];
+            const float hv=(g/(1.0F+expf(-g)))*u;
+            output[at_slot+outputs]=u;
+            const unsigned bad=static_cast<unsigned>(__ballot(!isfinite(g)||!isfinite(u)||!isfinite(hv)));
+            if(bad!=0){output[at_slot]=g;if(lane==0){atomicOr(at(view.status,r),8U);atomicOr(csr.summary,8U);}continue;}
+            float x=fabsf(hv);
+            for(int stride=16;stride!=0;stride/=2) x=fmaxf(x,__shfl_xor(x,stride,32));
+            const bool tiny=x>0.0F && x<0x1p-119F;
+            const float delta=x==0.0F || tiny?1.0F:divide_rne(x,127.0F);
+            const float rounded=tiny?0.0F:rintf(divide_rne(hv,delta));
+            const int code=static_cast<int>(fminf(127.0F,fmaxf(-127.0F,rounded)));
+            int sum=code;
+            for(int stride=16;stride!=0;stride/=2) sum+=__shfl_xor(sum,stride,32);
+            output[at_slot]=hv;
+            at(view.down_codes,r)[slot*outputs+feature]=static_cast<signed char>(code);
+            if(lane==0){at(view.down_deltas,r)[slot*(outputs/32U)+tile_index]=delta;at(view.down_sums,r)[slot*(outputs/32U)+tile_index]=sum;}
+        }
+    }
+}
+// down_window over strided prefill rows, Rows staged rows at a time: same lane
+// chains, block decode and reduction per (row, slot). Grid x = batch, y = 64-row tile.
+template<unsigned Rows,bool Q51>
+__global__ __launch_bounds__(256) void down_prefill(const unsigned char* weights,PrefillRows view,unsigned hidden,unsigned width) {
+    const auto& csr=view.csr;
+    if(csr.summary[0]||blockIdx.x>=csr.summary[2])return;
+    const auto begin=csr.begins[blockIdx.x],count=csr.begins[blockIdx.x+1U]-begin,expert=csr.experts[blockIdx.x];
+    __shared__ __align__(16) signed char codes[Rows][max_rows];
+    __shared__ float deltas[Rows][max_rows/32U];
+    __shared__ int sums[Rows][max_rows/32U];
+    const unsigned groups=width/32U;
+    const unsigned lane=threadIdx.x&31U,owner=lane&3U;
+    const unsigned row=blockIdx.y*64U+(threadIdx.x/32U)*8U+lane/4U;
+    constexpr unsigned block_bytes=Q51?24U:34U;
+    const auto* row_weights=weights+(static_cast<unsigned long long>(expert)*hidden+row)*groups*block_bytes;
+    for(unsigned first=0;first<count;first+=Rows) {
+        if(first)__syncthreads();
+#pragma unroll
+        for(unsigned a=0;a<Rows;++a)if(first+a<count) {
+            const auto r=csr.rows[begin+first+a],slot=csr.slots[begin+first+a];
+            const auto* down_codes=at(view.down_codes,r)+slot*width;
+            const auto* down_deltas=at(view.down_deltas,r)+slot*groups;const auto* down_sums=at(view.down_sums,r)+slot*groups;
+            for(unsigned i=16U*threadIdx.x;i<width;i+=4096U)
+                *reinterpret_cast<int4*>(codes[a]+i)=*reinterpret_cast<const int4*>(down_codes+i);
+            for(unsigned i=threadIdx.x;i<groups;i+=256U){deltas[a][i]=down_deltas[i];sums[a][i]=down_sums[i];}
+        }
+        __syncthreads();
+        float acc[Rows]={};
+#pragma unroll 1
+        for(unsigned group=owner;group<groups;group+=4U) {
+            const auto* packed=row_weights+group*block_bytes;
+            unsigned words[8];
+#pragma unroll
+            for(unsigned word=0;word<8U;++word)words[word]=Q51?down_q51_word(packed,word*4U):down_u32(packed+2U+word*4U);
+            const float d=__half2float(__ushort_as_half(static_cast<unsigned short>(down_u16(packed))));
+            const float m=Q51?__half2float(__ushort_as_half(static_cast<unsigned short>(down_u16(packed+2U)))):0.0F;
+#pragma unroll
+            for(unsigned a=0;a<Rows;++a)if(first+a<count) {
+                const auto* image=reinterpret_cast<const int*>(codes[a]+group*32U);
+                int integer=0;
+#pragma unroll
+                for(unsigned word=0;word<8U;++word) {
+                    if constexpr(Q51) integer=dot(image[word],words[word],integer);
+                    else integer=__builtin_amdgcn_sudot4(true,image[word],true,static_cast<int>(words[word]),integer,false);
+                }
+                const float first_term=d*static_cast<float>(integer);
+                float combined=first_term;
+                if constexpr(Q51) {
+                    const float correction=m*static_cast<float>(sums[a][group]);
+                    combined=first_term+correction;
+                }
+                const float contribution=deltas[a][group]*combined;
+                acc[a]=acc[a]+contribution;
+            }
+        }
+#pragma unroll
+        for(unsigned a=0;a<Rows;++a)if(first+a<count) {
+            acc[a]=acc[a]+__shfl_xor(acc[a],1,32);
+            acc[a]=acc[a]+__shfl_xor(acc[a],2,32);
+            if(owner==0U)at(view.rawdots,csr.rows[begin+first+a])[csr.slots[begin+first+a]*hidden+row]=acc[a];
+        }
+    }
+}
 bool overlap(DeviceBytes a,DeviceBytes b){return a.address<b.address+b.bytes&&b.address<a.address+a.bytes;}
 void range(DeviceBytes v){if(!v.address||!v.bytes||v.bytes>UINTPTR_MAX-v.address)throw std::invalid_argument("A8 CSR gate/up owner range is invalid");}
 struct Prepared {DeviceRows rows;DeviceCsr csr;};
@@ -502,6 +731,35 @@ void enqueue_window(const Request& request,std::span<const Bindings> rows,const 
     else {if(count==2U){STRIX_A8_WINDOW_DOWN(2U,false);}else if(count==4U){STRIX_A8_WINDOW_DOWN(4U,false);}else{STRIX_A8_WINDOW_DOWN(8U,false);}}
 #undef STRIX_A8_WINDOW_DOWN
     check(hipGetLastError(),"A8 window shared integer down");
+}
+void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned count,unsigned clear_words,
+    const unsigned char* gate,const unsigned char* up,unsigned down_type,const unsigned char* down_weights,hipStream_t stream) {
+    const bool q5k=request.gate_type==13U;
+    if((down_type!=7U&&down_type!=8U)||(request.gate_type!=12U&&!q5k)||!gate||!up||!down_weights||
+       count<16U||count%8U||count>q51_known_rows::prefill_max_rows||request.shape.top_k>10U||request.shape.experts>512U||
+       request.shape.hidden>max_hidden||request.shape.hidden%256U||request.shape.rows>max_rows||request.shape.rows%128U||
+       request.shape.hidden%64U)
+        throw std::invalid_argument("A8 prefill geometry/format is invalid");
+    // STRIX_PREFILL_MOE_BATCH: assignments of one expert per CTA (default 8).
+    static const unsigned cap=[]{const char* v=std::getenv("STRIX_PREFILL_MOE_BATCH");const int n=v?std::atoi(v):8;
+        return n>=1&&n<=64?static_cast<unsigned>(n):8U;}();
+    enqueue_prefill_prologue(request,rows,count,clear_words,stream);
+    const unsigned assignments=count*request.shape.top_k;
+    hipLaunchKernelGGL(build_prefill_csr,dim3(1),dim3(1024),0,stream,rows,count,request.shape.experts,request.shape.top_k,cap);
+    check(hipGetLastError(),"A8 prefill CSR");
+    const unsigned batches=std::min(assignments,request.shape.experts+(assignments+cap-1U)/cap);
+    const dim3 project_grid(batches,request.shape.rows/32U);
+    if(q5k)hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill<4U,true>),project_grid,dim3(256),0,stream,gate,up,rows,
+        request.shape.hidden,request.shape.rows);
+    else hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill<4U,false>),project_grid,dim3(256),0,stream,gate,up,rows,
+        request.shape.hidden,request.shape.rows);
+    check(hipGetLastError(),"A8 prefill gate/up projection");
+    const dim3 down_grid(batches,request.shape.hidden/64U);
+    if(down_type==7U)hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill<8U,true>),down_grid,dim3(256),0,stream,down_weights,rows,
+        request.shape.hidden,request.shape.rows);
+    else hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill<8U,false>),down_grid,dim3(256),0,stream,down_weights,rows,
+        request.shape.hidden,request.shape.rows);
+    check(hipGetLastError(),"A8 prefill integer down");
 }
 void preflight(const Request& request,std::span<const Bindings> rows,const q51_known_rows::Workspace& workspace,hipStream_t stream) {
     (void)prepare(request,rows,workspace,stream);

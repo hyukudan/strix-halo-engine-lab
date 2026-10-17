@@ -29,10 +29,12 @@ struct ScratchLayout {
     std::uint64_t header = 0, offsets = 0, touched = 0, rows = 0, slots = 0;
     std::uint64_t batch_experts = 0, batch_begins = 0, bytes = 0;
 };
+// Known-prompt prefill: one CSR over all T rows of a step (T a multiple of 8).
+inline constexpr std::uint32_t prefill_max_rows = 2048;
 [[nodiscard]] inline ScratchLayout scratch_layout(std::uint32_t rows,
-    std::uint32_t experts, std::uint32_t top_k) {
-    if ((rows != 2U && rows != 4U && rows != 8U) || !experts || experts > 512U ||
-        !top_k || top_k > 10U || top_k > experts)
+    std::uint32_t experts, std::uint32_t top_k, bool prefill = false) {
+    if ((prefill ? rows < 16U || rows % 8U || rows > prefill_max_rows : rows != 2U && rows != 4U && rows != 8U) ||
+        !experts || experts > 512U || !top_k || top_k > 10U || top_k > experts)
         throw std::invalid_argument("Q5_1 known rows CSR geometry is invalid");
     const auto align = [](std::uint64_t n) { return (n + 255U) / 256U * 256U; };
     ScratchLayout out;
@@ -48,6 +50,10 @@ struct ScratchLayout {
 [[nodiscard]] inline std::uint64_t required_scratch_bytes(std::uint32_t rows,
     std::uint32_t experts, std::uint32_t top_k) {
     return scratch_layout(rows, experts, top_k).bytes;
+}
+[[nodiscard]] inline std::uint64_t prefill_scratch_bytes(std::uint32_t rows,
+    std::uint32_t experts, std::uint32_t top_k) {
+    return scratch_layout(rows, experts, top_k, true).bytes;
 }
 // An exclusive allocation, never a slice of window scratch/state/weights/D1.
 // The actual native window owner creates and leases this allocation. This

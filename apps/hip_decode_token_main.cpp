@@ -3309,7 +3309,8 @@ int STRIX_DECODE_ENTRY(
             if (const auto latest = known_prefix_owner->latest_routed_union_observation()) {
                 const auto& group = latest->group;
                 std::cout << "  \"known_prefix_expert_union_latest_group\":{\"scope\":\""
-                    << (known_prefill_plan ? "latest-completed-prefill-last-internal-tile-last-eligible-layer" : "latest-completed-window-last-eligible-layer")
+                    << (known_prefill_plan ? (group.logical_rows == 8U ? "latest-completed-prefill-last-internal-tile-last-eligible-layer" :
+                        "latest-completed-prefill-all-rows-last-eligible-layer") : "latest-completed-window-last-eligible-layer")
                     << "\","
                     << "\"first_position\":" << latest->first_position << ",\"layer\":" << latest->layer
                     << ",\"status\":" << group.status << ",\"version\":" << group.version

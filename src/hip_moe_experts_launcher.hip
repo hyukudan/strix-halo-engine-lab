@@ -2579,6 +2579,192 @@ void known_moe_rows_enqueue(std::span<const ExecutionDispatchContext> rows,
         }
     }
 }
+
+// Known-prompt prefill over T strided rows (A8 profile).
+using moe_q4k_a8::known_rows::StridedRows;
+struct KnownMoePrefillDevice {
+    StridedRows<const std::uint32_t> routes;
+    StridedRows<const float> route_weights;
+    StridedRows<std::uint32_t> status;
+    StridedRows<float> rawdots, accumulation;
+    StridedRows<std::uint16_t> output;
+};
+template <class T> __device__ __forceinline__ T* known_moe_prefill_row(StridedRows<T> v, std::uint32_t r) {
+    return reinterpret_cast<T*>(reinterpret_cast<std::uintptr_t>(v.base) + static_cast<std::uint64_t>(r) * v.stride);
+}
+// known_moe_rows_merge_kernel per strided row. header[0] already holds every
+// row status of the projection stages; a nonfinite sum also lands there.
+__global__ void known_moe_prefill_merge_kernel(KnownMoePrefillDevice view, std::uint32_t* header,
+    std::uint32_t hidden_size, std::uint32_t experts, std::uint32_t top_k) {
+    const auto row = blockIdx.y;
+    auto* status = known_moe_prefill_row(view.status, row);
+    if (header[0] || *status) return;
+    const auto out = static_cast<std::uint32_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (out >= hidden_size) return;
+    const auto* routes = known_moe_prefill_row(view.routes, row);
+    for (std::uint32_t slot = 0; slot < top_k; ++slot) if (routes[slot] >= experts) return;
+    const auto* rawdots = known_moe_prefill_row(view.rawdots, row);
+    const auto* route_weights = known_moe_prefill_row(view.route_weights, row);
+    float dots[10];
+#pragma unroll
+    for (std::uint32_t slot = 0; slot < 10U; ++slot) if (slot < top_k) dots[slot] = rawdots[static_cast<std::uint64_t>(slot) * hidden_size + out];
+    float current = 0.0F;
+#pragma unroll
+    for (std::uint32_t slot = 0; slot < 10U; ++slot) if (slot < top_k) {
+        const float weight = route_weights[slot];
+        asm volatile("v_fmac_f32 %0, %1, %2" : "+v"(current) : "s"(weight), "v"(dots[slot]));
+    }
+    known_moe_prefill_row(view.accumulation, row)[out] = current;
+    if ((__float_as_uint(current) & 0x7fffffffU) >= 0x7f7f8000U) { atomicOr(status, 8U); atomicOr(header, 8U); }
+}
+// known_moe_rows_commit_kernel over T rows; header[0] is the OR of every row status.
+__global__ void known_moe_prefill_commit_kernel(KnownMoePrefillDevice view, std::uint32_t* header,
+    std::uint32_t row_count, std::uint32_t hidden_size, std::uint32_t* record) {
+    const std::uint32_t failure = header[0];
+    if (blockIdx.x == 0U && blockIdx.y == 0U && threadIdx.x == 0U) {
+        if (failure & 7U) for (const auto word : {1U, 2U, 4U, 5U}) header[word] = 0U;
+        if (failure & 7U) for (std::uint32_t word = 8U; word < 24U; ++word) header[word] = 0U;
+        for (std::uint32_t r = 0; r < row_count; ++r)
+            merge_deferred_moe_first_error(*reinterpret_cast<DeferredMoeFirstError*>(record),
+                *known_moe_prefill_row(view.status, r), DeferredMoeDomain::q4k_a8);
+    }
+    if (failure) return;
+    const auto out = blockIdx.x * blockDim.x + threadIdx.x;
+    if (out < hidden_size) store_activation(known_moe_prefill_row(view.output, blockIdx.y) + out,
+        known_moe_prefill_row(view.accumulation, blockIdx.y)[out]);
+}
+struct KnownMoePrefillPrepared {
+    moe_q4k_a8::Request request;
+    moe_q4k_a8::known_rows::PrefillRows rows;
+    KnownMoePrefillDevice device;
+    std::uint32_t clear_words = 0, down_type = 0;
+    const unsigned char *gate = nullptr, *up = nullptr, *down = nullptr;
+};
+KnownMoePrefillPrepared prepare_known_moe_prefill(std::span<const ExecutionDispatchContext> rows,
+    const HipMoeExpertsLauncherConfig& config, const q51_known_rows::Workspace& window,
+    const q51_known_rows::Workspace& prefill) {
+    const auto count = static_cast<std::uint32_t>(rows.size());
+    if (count < 16U || count % 8U || count > q51_known_rows::prefill_max_rows)
+        throw std::invalid_argument("known prefill routed rows require T in [16, 2048], a multiple of 8");
+    if (!config.a8_down_q51 && !config.a8_down_q80)
+        throw std::invalid_argument("known prefill routed rows require the A8 down profile");
+    // Every view a kernel touches, per row; checked to be row 0 plus r * stride.
+    enum View : unsigned { input, routes, route_weights, codes, deltas, sums, status, intermediates, accumulation,
+        down_codes, down_deltas, down_sums, rawdots, output, view_count };
+    std::vector<std::array<std::uintptr_t, view_count>> address(count);
+    std::array<std::uint64_t, view_count> extent{};
+    KnownMoePrefillPrepared out;
+    for (std::uint32_t chunk = 0; chunk < count; chunk += 8U) {
+        // Window admission of each 8-row chunk (positions consecutive inside the chunk).
+        const auto p = prepare_known_moe_rows(rows.subspan(chunk, 8U), config, window);
+        if (chunk && rows[chunk].position != rows[chunk - 1U].position + 1U)
+            throw std::invalid_argument("known prefill routed rows positions are not consecutive");
+        for (std::uint32_t i = 0; i < 8U; ++i) {
+            const auto& e = p.rows[i];
+            const auto& q = *e.quantized;
+            const auto& b = p.quantized_bindings[i];
+            const auto& d = p.a8_down[i];
+            if (!q.a8_down_request || d.rawdots.address != reinterpret_cast<std::uintptr_t>(p.device.rawdots[i]))
+                throw std::invalid_argument("known prefill routed rows require the A8 down image");
+            const std::array<moe_q4k_a8::DeviceBytes, view_count> views{
+                moe_q4k_a8::DeviceBytes{e.hidden.address, e.hidden.bytes}, {e.route_indices.address, e.route_indices.bytes},
+                {e.route_weights.address, e.route_weights.bytes}, b.codes, b.deltas, b.sums, b.status, b.output,
+                {reinterpret_cast<std::uintptr_t>(p.device.accumulation[i]), q.layout.accumulation_bytes},
+                d.codes, d.deltas, d.sums, d.rawdots, {e.output.address, e.output.bytes}};
+            for (unsigned v = 0; v < view_count; ++v) {
+                if (chunk + i && views[v].bytes != extent[v])
+                    throw std::invalid_argument("known prefill routed rows view extent differs across rows");
+                extent[v] = views[v].bytes; address[chunk + i][v] = views[v].address;
+            }
+        }
+        if (!chunk) {
+            const auto& q = *p.rows[0].quantized;
+            out.request = q.request;
+            out.clear_words = static_cast<std::uint32_t>(q.layout.accumulation_bytes / 4U);
+            out.down_type = q.a8_down_request->weight_type;
+            out.gate = reinterpret_cast<const unsigned char*>(p.quantized_bindings[0].gate.address);
+            out.up = reinterpret_cast<const unsigned char*>(p.quantized_bindings[0].up.address);
+            out.down = reinterpret_cast<const unsigned char*>(p.a8_down[0].weights.address);
+        } else if (p.quantized_bindings[0].gate.address != reinterpret_cast<std::uintptr_t>(out.gate) ||
+            p.quantized_bindings[0].up.address != reinterpret_cast<std::uintptr_t>(out.up) ||
+            p.a8_down[0].weights.address != reinterpret_cast<std::uintptr_t>(out.down) ||
+            p.rows[0].quantized->request.gate_type != out.request.gate_type ||
+            p.rows[0].quantized->a8_down_request->weight_type != out.down_type)
+            throw std::invalid_argument("known prefill routed rows weights differ across chunks");
+    }
+    std::array<std::uint64_t, view_count> stride{};
+    for (unsigned v = 0; v < view_count; ++v) {
+        stride[v] = address[1][v] - address[0][v];
+        if (address[1][v] <= address[0][v] || stride[v] < extent[v])
+            throw std::invalid_argument("known prefill routed rows views are not row-striped");
+        for (std::uint32_t r = 0; r < count; ++r)
+            if (address[r][v] != address[0][v] + static_cast<std::uint64_t>(r) * stride[v])
+                throw std::invalid_argument("known prefill routed rows view stride differs");
+    }
+    const auto layout = q51_known_rows::scratch_layout(count, config.expert_count, config.top_k, true);
+    const auto& first = rows.front();
+    const auto& memory = *first.resources->scratch;
+    if (!prefill.owner || prefill.memory.execution_identity != first.execution_identity ||
+        !prefill.memory.allocation_generation || prefill.memory.arena_base % 256U ||
+        prefill.memory.arena_bytes != layout.bytes || prefill.memory.arena_bytes > UINTPTR_MAX - prefill.memory.arena_base)
+        throw std::invalid_argument("known prefill routed rows CSR owner identity/extent differs");
+    const KnownMoeRange csr_range{prefill.memory.arena_base, prefill.memory.arena_bytes};
+    const auto disjoint = [&](KnownMoeRange other) {
+        if (other.bytes && known_moe_overlap(csr_range, other))
+            throw std::invalid_argument("known prefill routed rows CSR aliases storage");
+    };
+    disjoint({memory.arena_base, memory.arena_bytes});
+    disjoint({window.memory.arena_base, window.memory.arena_bytes});
+    const auto& d1 = current_hip_launch_context()->deferred_moe_status;
+    disjoint({d1.arena_base, d1.arena_bytes});
+    for (const auto& weight : first.resources->model_weights->tensors) if (weight.address) disjoint({weight.address, weight.bytes});
+    if (const auto* state = first.resources->session_state_memory) {
+        disjoint({state->host_base, state->host_bytes}); disjoint({state->device_base, state->device_bytes});
+    }
+    const auto strided = [&]<class T>(View v) { return StridedRows<T>{reinterpret_cast<T*>(address[0][v]), stride[v]}; };
+    auto& r = out.rows;
+    r.input = strided.template operator()<const void>(input);
+    r.routes = strided.template operator()<const unsigned>(routes);
+    r.route_weights = strided.template operator()<const float>(route_weights);
+    r.codes = strided.template operator()<signed char>(codes);
+    r.deltas = strided.template operator()<float>(deltas);
+    r.sums = strided.template operator()<int>(sums);
+    r.status = strided.template operator()<unsigned>(status);
+    r.output = strided.template operator()<float>(intermediates);
+    r.clear = strided.template operator()<float>(accumulation);
+    r.down_codes = strided.template operator()<signed char>(down_codes);
+    r.down_deltas = strided.template operator()<float>(down_deltas);
+    r.down_sums = strided.template operator()<int>(down_sums);
+    r.rawdots = strided.template operator()<float>(rawdots);
+    const auto ptr = [&](std::uint64_t offset) { return reinterpret_cast<unsigned*>(prefill.memory.arena_base + offset); };
+    r.csr = {ptr(layout.header), ptr(layout.offsets), ptr(layout.touched), ptr(layout.rows), ptr(layout.slots),
+        ptr(layout.batch_experts), ptr(layout.batch_begins)};
+    out.device = {strided.template operator()<const std::uint32_t>(routes), strided.template operator()<const float>(route_weights),
+        strided.template operator()<std::uint32_t>(status), strided.template operator()<float>(rawdots),
+        strided.template operator()<float>(accumulation), strided.template operator()<std::uint16_t>(output)};
+    return out;
+}
+void known_moe_prefill_enqueue(std::uint32_t count, const HipMoeExpertsLauncherConfig& config, const KnownMoePrefillPrepared& p) {
+    const auto stream = hip_execution_stream();
+    check_hip(hipPeekAtLastError(), "known prefill routed rows stale error");
+    moe_q4k_a8::known_rows::enqueue_prefill(p.request, p.rows, count, p.clear_words, p.gate, p.up, p.down_type, p.down, stream);
+    hipLaunchKernelGGL(known_moe_prefill_merge_kernel, dim3((config.hidden_size + 255U) / 256U, count), dim3(256), 0, stream,
+        p.device, p.rows.csr.summary, config.hidden_size, config.expert_count, config.top_k);
+    check_hip(hipGetLastError(), "known prefill routed rows ordered merge");
+    hipLaunchKernelGGL(known_moe_prefill_commit_kernel, dim3((config.hidden_size + 255U) / 256U, count), dim3(256), 0, stream,
+        p.device, p.rows.csr.summary, count, config.hidden_size, hip_deferred_moe_status());
+    check_hip(hipGetLastError(), "known prefill routed rows output commit");
+    if (config.q4k_a8_stats) {
+        auto& stats = *config.q4k_a8_stats;
+        if (config.batched_slot_activation) {
+            stats.batched_activation_launches.fetch_add(count, std::memory_order_relaxed);
+            stats.batched_activation_slots.fetch_add(count * config.top_k, std::memory_order_relaxed);
+        }
+        stats.quantized_submissions.fetch_add(count, std::memory_order_relaxed);
+        (p.down_type == 7U ? stats.a8_down_q51_submissions : stats.a8_down_q80_submissions).fetch_add(count, std::memory_order_relaxed);
+        if (p.request.gate_type == 13U) stats.q5k_a8_gate_up_submissions.fetch_add(count, std::memory_order_relaxed);
+    }
+}
 #endif
 } // namespace
 
@@ -2599,6 +2785,25 @@ void moe_experts_known_window_rows_launch(std::span<const ExecutionDispatchConte
 #else
     (void)rows; (void)config; (void)workspace;
     throw std::invalid_argument("known-window routed rows require built A8 runtime");
+#endif
+}
+void moe_experts_known_prefill_rows_preflight(std::span<const ExecutionDispatchContext> rows,
+    const HipMoeExpertsLauncherConfig& config, const q51_known_rows::Workspace& window, const q51_known_rows::Workspace& prefill) {
+#ifdef STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME
+    (void)prepare_known_moe_prefill(rows,config,window,prefill);
+#else
+    (void)rows; (void)config; (void)window; (void)prefill;
+    throw std::invalid_argument("known prefill routed rows require built A8 runtime");
+#endif
+}
+void moe_experts_known_prefill_rows_launch(std::span<const ExecutionDispatchContext> rows,
+    const HipMoeExpertsLauncherConfig& config, const q51_known_rows::Workspace& window, const q51_known_rows::Workspace& prefill) {
+#ifdef STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME
+    const auto prepared=prepare_known_moe_prefill(rows,config,window,prefill);
+    known_moe_prefill_enqueue(static_cast<std::uint32_t>(rows.size()),config,prepared);
+#else
+    (void)rows; (void)config; (void)window; (void)prefill;
+    throw std::invalid_argument("known prefill routed rows require built A8 runtime");
 #endif
 }
 } // namespace strix

@@ -147,6 +147,26 @@ __global__ void window_prologue(known_rows::PrologueRows v, unsigned rows, unsig
     const unsigned bad=quantize_row<Bf16>(v.input[row],hidden,v.codes[row],v.deltas[row],v.sums[row],route_bits);
     if(threadIdx.x==0) *v.status[row]=route_bits|bad;
 }
+template<class T> __device__ __forceinline__ T* stride_row(known_rows::StridedRows<T> v,unsigned r) {
+    return reinterpret_cast<T*>(reinterpret_cast<std::uintptr_t>(v.base)+static_cast<std::uint64_t>(r)*v.stride);
+}
+// Prefill rows: the window prologue's row CTA on strided views (CSR built separately).
+template<bool Bf16>
+__global__ void prefill_prologue(known_rows::PrefillRows v, unsigned hidden, unsigned top_k, unsigned experts,
+    unsigned clear_words) {
+    const unsigned row=blockIdx.x;
+    __shared__ unsigned route_bits;
+    if(threadIdx.x==0) route_bits=0;
+    float* clear=stride_row(v.clear,row);
+    for(unsigned i=threadIdx.x;i<clear_words;i+=blockDim.x) clear[i]=0.0F;
+    __syncthreads();
+    if(threadIdx.x<top_k && (stride_row(v.routes,row)[threadIdx.x]>=experts || !isfinite(stride_row(v.route_weights,row)[threadIdx.x])))
+        atomicOr(&route_bits,invalid_route);
+    __syncthreads();
+    const unsigned bad=quantize_row<Bf16>(stride_row(v.input,row),hidden,stride_row(v.codes,row),stride_row(v.deltas,row),
+        stride_row(v.sums,row),route_bits);
+    if(threadIdx.x==0) *stride_row(v.status,row)=route_bits|bad;
+}
 __global__ void project(const unsigned char* gate,const unsigned char* up,const unsigned* routes,
     const signed char* codes,const float* deltas,const int* sums,const unsigned* status,
     float* output,unsigned hidden,unsigned rows) {
@@ -390,6 +410,14 @@ void enqueue_prologue(const Request& request,const PrologueRows& rows,unsigned c
     if(request.input==InputKind::bf16)window_prologue<true><<<count+1U,1024,0,stream>>>(rows,count,request.shape.hidden,request.shape.top_k,request.shape.experts,clear_words);
     else window_prologue<false><<<count+1U,1024,0,stream>>>(rows,count,request.shape.hidden,request.shape.top_k,request.shape.experts,clear_words);
     check(hipGetLastError(),"A8 window prologue enqueue");
+}
+void enqueue_prefill_prologue(const Request& request,const PrefillRows& rows,unsigned count,unsigned clear_words,hipStream_t stream) {
+    if(count<16U||count%8U||count>q51_known_rows::prefill_max_rows||request.shape.top_k>10U||request.shape.experts>512U)
+        throw std::invalid_argument("A8 prefill prologue geometry is invalid");
+    check(hipPeekAtLastError(),"A8 prefill prologue stale error");
+    if(request.input==InputKind::bf16)prefill_prologue<true><<<count,1024,0,stream>>>(rows,request.shape.hidden,request.shape.top_k,request.shape.experts,clear_words);
+    else prefill_prologue<false><<<count,1024,0,stream>>>(rows,request.shape.hidden,request.shape.top_k,request.shape.experts,clear_words);
+    check(hipGetLastError(),"A8 prefill prologue enqueue");
 }
 } // namespace known_rows
 void enqueue_division_probe(const std::uint32_t* a,const std::uint32_t* b,std::uint32_t* output,unsigned count,hipStream_t stream) {
