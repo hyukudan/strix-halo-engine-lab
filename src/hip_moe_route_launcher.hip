@@ -5,6 +5,7 @@
 
 #include "strix/dispatch_resources.hpp"
 
+#include <cstdlib>
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
@@ -1077,7 +1078,9 @@ __global__ void __launch_bounds__(256) wave_rows_moe_route_logits_kernel(RouterR
 // lane (expert, row) runs that pair's serial chain (fused, ascending from
 // feature zero) on its own coefficients. The one-expert-per-wave form above
 // left 32 - Rows lanes idle and needed 8x more waves for the same chains.
-template <typename Activation, std::uint32_t Rows>
+// Chunk = coefficients each lane has in flight per step: the 2048 chains of a 4-row window
+// are only 64 waves, so the stream is latency bound and a longer step overlaps more of it.
+template <typename Activation, std::uint32_t Rows, std::uint32_t Chunk = kWaveRowsChunk>
 __global__ void __launch_bounds__(256) lanes_rows_moe_route_logits_kernel(RouterRowsArgs rows,
     const float* __restrict__ weights, std::uint32_t hidden_size, std::uint32_t expert_count) {
     static_assert(Rows == 2U || Rows == 4U || Rows == 8U);
@@ -1091,10 +1094,13 @@ __global__ void __launch_bounds__(256) lanes_rows_moe_route_logits_kernel(Router
     const auto* __restrict__ coefficients = reinterpret_cast<const float4*>(weights + static_cast<std::uint64_t>(expert) * hidden_size);
     const auto* hidden = static_cast<const Activation*>(rows.hidden[row]);
     float sum = 0.0F;
-    for (std::uint32_t feature = 0; feature < hidden_size; feature += kWaveRowsChunk) {
-        float input[kWaveRowsChunk];
+    for (std::uint32_t feature = 0; feature < hidden_size; feature += Chunk) {
+        float4 coefficient[Chunk / 4U];
         #pragma unroll
-        for (std::uint32_t v = 0; v < kWaveRowsChunk / per_vector; ++v) {
+        for (std::uint32_t q = 0; q < Chunk / 4U; ++q) coefficient[q] = coefficients[(feature >> 2U) + q];
+        float input[Chunk];
+        #pragma unroll
+        for (std::uint32_t v = 0; v < Chunk / per_vector; ++v) {
             const auto packed = *reinterpret_cast<const uint4*>(hidden + feature + v * per_vector);
             const std::uint32_t words[4] = {packed.x, packed.y, packed.z, packed.w};
             #pragma unroll
@@ -1105,8 +1111,8 @@ __global__ void __launch_bounds__(256) lanes_rows_moe_route_logits_kernel(Router
             }
         }
         #pragma unroll
-        for (std::uint32_t q = 0; q < kWaveRowsChunk / 4U; ++q) {
-            const auto c = coefficients[(feature >> 2U) + q];
+        for (std::uint32_t q = 0; q < Chunk / 4U; ++q) {
+            const auto c = coefficient[q];
             sum = __builtin_fmaf(input[4U * q + 0U], c.x, sum);
             sum = __builtin_fmaf(input[4U * q + 1U], c.y, sum);
             sum = __builtin_fmaf(input[4U * q + 2U], c.z, sum);
@@ -1665,6 +1671,22 @@ void launch_router_rows_typed(const PreparedRouterRows& p, const HipMoeRouteLaun
         // 8 waves per block; each wave holds 32 / rows experts.
         const auto blocks = [&](std::uint32_t rows) { return dim3((config.expert_count * rows + 255U) / 256U); };
         const bool aligned = config.hidden_size % kWaveRowsChunk == 0U;
+        // STRIX_ROUTER_ROWS_CHUNK=64|128|256 (the hidden size must be a multiple): same chains; 128 measured best.
+        static const std::uint32_t chunk = [] {
+            const char* v = std::getenv("STRIX_ROUTER_ROWS_CHUNK");
+            const auto n = v ? static_cast<std::uint32_t>(std::atoi(v)) : 128U;
+            return n == 64U || n == 256U ? n : 128U;
+        }();
+        const auto lanes = [&]<std::uint32_t R>() {
+            if (chunk == 256U && config.hidden_size % 256U == 0U)
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(lanes_rows_moe_route_logits_kernel<Activation, R, 256U>),
+                    blocks(R), dim3(256U), 0, stream, p.args, f32, config.hidden_size, config.expert_count);
+            else if (chunk == 128U && config.hidden_size % 128U == 0U)
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(lanes_rows_moe_route_logits_kernel<Activation, R, 128U>),
+                    blocks(R), dim3(256U), 0, stream, p.args, f32, config.hidden_size, config.expert_count);
+            else hipLaunchKernelGGL(HIP_KERNEL_NAME(lanes_rows_moe_route_logits_kernel<Activation, R>),
+                    blocks(R), dim3(256U), 0, stream, p.args, f32, config.hidden_size, config.expert_count);
+        };
         if (!aligned) {
             const dim3 waves((config.expert_count + 7U) / 8U);
             if (p.rows == 2U) hipLaunchKernelGGL(HIP_KERNEL_NAME(wave_rows_moe_route_logits_kernel<Activation, 2U>),
@@ -1673,12 +1695,9 @@ void launch_router_rows_typed(const PreparedRouterRows& p, const HipMoeRouteLaun
                 waves, dim3(256U), 0, stream, p.args, f32, config.hidden_size, config.expert_count);
             else hipLaunchKernelGGL(HIP_KERNEL_NAME(wave_rows_moe_route_logits_kernel<Activation, 8U>),
                 waves, dim3(256U), 0, stream, p.args, f32, config.hidden_size, config.expert_count);
-        } else if (p.rows == 2U) hipLaunchKernelGGL(HIP_KERNEL_NAME(lanes_rows_moe_route_logits_kernel<Activation, 2U>),
-            blocks(2U), dim3(256U), 0, stream, p.args, f32, config.hidden_size, config.expert_count);
-        else if (p.rows == 4U) hipLaunchKernelGGL(HIP_KERNEL_NAME(lanes_rows_moe_route_logits_kernel<Activation, 4U>),
-            blocks(4U), dim3(256U), 0, stream, p.args, f32, config.hidden_size, config.expert_count);
-        else hipLaunchKernelGGL(HIP_KERNEL_NAME(lanes_rows_moe_route_logits_kernel<Activation, 8U>),
-            blocks(8U), dim3(256U), 0, stream, p.args, f32, config.hidden_size, config.expert_count);
+        } else if (p.rows == 2U) lanes.template operator()<2U>();
+        else if (p.rows == 4U) lanes.template operator()<4U>();
+        else lanes.template operator()<8U>();
     } else if (p.rows == 2U) hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_moe_route_logits_kernel<Activation, WeightKind, 2U>),
         grid, dim3(256U), 0, stream, p.args, weights, config.hidden_size, config.expert_count);
     else if (p.rows == 4U) hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_moe_route_logits_kernel<Activation, WeightKind, 4U>),

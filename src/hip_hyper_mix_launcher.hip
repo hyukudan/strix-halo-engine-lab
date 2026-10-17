@@ -1750,9 +1750,10 @@ __global__ void rows_batched_typed_hyper_projection_kernel(HyperRows rows, std::
 
 // Split-K P1: weights stay in registers while every row replays the R1 lane
 // chain, the xor reduction and the ordered 16-tile block sum.
-template <unsigned R, bool Injection>
+template <unsigned R, bool Injection, class LoadX>
 __device__ __forceinline__ void rows_splitk_hyper_lane_dots(const HyperRows& rows, unsigned count,
-    const void* weights, unsigned first, unsigned valid, unsigned tile, unsigned lane, float (*red)[16][R]) {
+    const void* weights, unsigned first, unsigned valid, unsigned tile, unsigned lane, float (*red)[16][R], LoadX&& load_x) {
+    (void)rows;
     float4 w[Injection ? R : 1U][5];
     unsigned packed[Injection ? 1U : R][5];
     float scales[Injection ? 1U : R][5];
@@ -1776,8 +1777,7 @@ __device__ __forceinline__ void rows_splitk_hyper_lane_dots(const HyperRows& row
     for (unsigned t=0;t<count;++t) {
         float4 x[5];
 #pragma unroll
-        for (unsigned s=0;s<5U;++s)
-            x[s]=*reinterpret_cast<const float4*>(rows.normalized[t]+tile*640U+s*128U+lane*4U);
+        for (unsigned s=0;s<5U;++s) x[s]=load_x(t,tile*640U+s*128U+lane*4U);
         float sums[R];
 #pragma unroll
         for(unsigned r=0;r<R;++r) {
@@ -1825,8 +1825,9 @@ __global__ __launch_bounds__(512) void rows_splitk_hyper_projection_kernel(Hyper
     const unsigned first=(is_inject?blockIdx.x-low_blocks:blockIdx.x)*R;
     const unsigned remaining=(is_inject?streams:rank)-first;
     const unsigned valid=remaining<R?remaining:R;
-    if(is_inject)rows_splitk_hyper_lane_dots<R,true>(rows,count,inject,first,valid,tile,lane,red);
-    else rows_splitk_hyper_lane_dots<R,false>(rows,count,down,first,valid,tile,lane,red);
+    const auto stored=[&](unsigned t,unsigned at){return *reinterpret_cast<const float4*>(rows.normalized[t]+at);};
+    if(is_inject)rows_splitk_hyper_lane_dots<R,true>(rows,count,inject,first,valid,tile,lane,red,stored);
+    else rows_splitk_hyper_lane_dots<R,false>(rows,count,down,first,valid,tile,lane,red,stored);
     __syncthreads();
     const unsigned t=threadIdx.x/R,r=threadIdx.x%R;
     if(t<count && r<valid) {
@@ -1834,6 +1835,81 @@ __global__ __launch_bounds__(512) void rows_splitk_hyper_projection_kernel(Hyper
 #pragma unroll
         for(unsigned k=0;k<16U;++k)total=total+red[t][k][r];
         const float scaled=total/static_cast<float>(streams);
+        if(is_inject)rows.injection[t][first+r]=2.0F*sigmoid(scaled);
+        else rows.low[t][first+r]=scaled*sigmoid(scaled);
+    }
+}
+
+// rows_prepare_hyper_norm_kernel folded into the split-K projection. Each wave rebuilds
+// one (row, stream) inverse with that kernel's 256-leaf order (leaf l = lane + 32 j sums
+// features l, l + 256, ...; strides 128..32 in registers, 16..1 across lanes), every block
+// normalises its inputs on the fly with the same product, and the blocks together store
+// the normalised rows the output kernel reads.
+template <unsigned R, typename Storage>
+__global__ __launch_bounds__(512) void rows_splitk_norm_hyper_projection_kernel(HyperRows rows, unsigned count,
+    const void* __restrict__ down, unsigned streams, unsigned rank, const void* __restrict__ inject, unsigned low_blocks,
+    const void* __restrict__ norm, std::uint32_t norm_type, unsigned hidden, float epsilon) {
+    __shared__ float red[kWindowRows][16][R];
+    __shared__ float inverse[kWindowRows][8];
+    const unsigned lane=threadIdx.x%32U,tile=threadIdx.x/32U;
+    for(unsigned pair=tile;pair<count*streams;pair+=16U) {
+        const unsigned t=pair/streams,stream=pair%streams;
+        const auto* input=static_cast<const Storage*>(rows.input[t]);
+        const auto base=static_cast<std::uint64_t>(stream)*hidden;
+        float leaf[8];
+#pragma unroll
+        for(unsigned j=0;j<8U;++j) {
+            float sum = 0.0F;
+            for (std::uint32_t feature = lane + 32U * j; feature < hidden; feature += kThreads) {
+                const float value = load_activation(input, base + feature);
+                sum += value * value;
+            }
+            leaf[j]=sum;
+        }
+#pragma unroll
+        for(unsigned j=0;j<4U;++j) leaf[j]+=leaf[j+4U];
+#pragma unroll
+        for(unsigned j=0;j<2U;++j) leaf[j]+=leaf[j+2U];
+        leaf[0]+=leaf[1];
+        float v=leaf[0];
+#pragma unroll
+        for(unsigned d=16U;d!=0U;d/=2U) {
+            const float partner=__shfl_down(v,d,32);
+            if(lane<d) v+=partner;
+        }
+        if(lane==0U) inverse[t][stream]=rsqrtf(v / static_cast<float>(hidden) + epsilon);
+    }
+    __syncthreads();
+    const auto width=static_cast<std::uint64_t>(streams)*hidden,total=width*count;
+    const auto share=(total+gridDim.x-1U)/gridDim.x,begin=share*blockIdx.x,end=begin+share<total?begin+share:total;
+    for(auto e=begin+threadIdx.x;e<end;e+=512U) {
+        const auto t=static_cast<unsigned>(e/width);const std::uint64_t at=e%width;
+        rows.normalized[t][at] = load_activation(static_cast<const Storage*>(rows.input[t]), at) *
+            inverse[t][static_cast<unsigned>(at/hidden)] * load_norm_weight(norm, norm_type, static_cast<std::uint32_t>(at));
+    }
+    const auto normalized=[&](unsigned t,unsigned at) {
+        const auto* input=static_cast<const Storage*>(rows.input[t]);
+        const float scale=inverse[t][at/hidden];
+        float4 x;
+        x.x = load_activation(input, at) * scale * load_norm_weight(norm, norm_type, at);
+        x.y = load_activation(input, at + 1U) * scale * load_norm_weight(norm, norm_type, at + 1U);
+        x.z = load_activation(input, at + 2U) * scale * load_norm_weight(norm, norm_type, at + 2U);
+        x.w = load_activation(input, at + 3U) * scale * load_norm_weight(norm, norm_type, at + 3U);
+        return x;
+    };
+    const bool is_inject=blockIdx.x>=low_blocks;
+    const unsigned first=(is_inject?blockIdx.x-low_blocks:blockIdx.x)*R;
+    const unsigned remaining=(is_inject?streams:rank)-first;
+    const unsigned valid=remaining<R?remaining:R;
+    if(is_inject)rows_splitk_hyper_lane_dots<R,true>(rows,count,inject,first,valid,tile,lane,red,normalized);
+    else rows_splitk_hyper_lane_dots<R,false>(rows,count,down,first,valid,tile,lane,red,normalized);
+    __syncthreads();
+    const unsigned t=threadIdx.x/R,r=threadIdx.x%R;
+    if(t<count && r<valid) {
+        float total_dot=0.0F;
+#pragma unroll
+        for(unsigned k=0;k<16U;++k)total_dot=total_dot+red[t][k][r];
+        const float scaled=total_dot/static_cast<float>(streams);
         if(is_inject)rows.injection[t][first+r]=2.0F*sigmoid(scaled);
         else rows.low[t][first+r]=scaled*sigmoid(scaled);
     }
@@ -2787,17 +2863,38 @@ void hyper_mix_known_window_rows_launch(std::span<const ExecutionDispatchContext
     const auto width = config.hidden_size * config.hc_count;
     const auto* inject = p.inject_runtime ? reinterpret_cast<const void*>(p.inject_runtime->address) : nullptr;
     const auto invoke = [&]<typename Storage>() {
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_prepare_hyper_norm_kernel<Storage>), dim3(config.hc_count, count),
-            dim3(kThreads), 0, hip_execution_stream(), prepared.rows, reinterpret_cast<const void*>(p.norm_runtime->address),
-            p.norm_manifest->ggml_type, config.hidden_size, config.rms_epsilon);
-        check_hip(hipGetLastError(), "known-window HC rows normalization launch");
-        if (config.splitk_projection) {
+        // STRIX_HC_ROWS_FUSED_NORM=1: the split-K projection also builds the normalisation.
+        static const bool fused_norm = std::getenv("STRIX_HC_ROWS_FUSED_NORM") != nullptr;
+        const bool fused = fused_norm && config.splitk_projection && config.hc_count <= 8U && config.hidden_size % 4U == 0U &&
+            count * config.hc_count <= 64U;
+        if (!fused) {
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_prepare_hyper_norm_kernel<Storage>), dim3(config.hc_count, count),
+                dim3(kThreads), 0, hip_execution_stream(), prepared.rows, reinterpret_cast<const void*>(p.norm_runtime->address),
+                p.norm_manifest->ggml_type, config.hidden_size, config.rms_epsilon);
+            check_hip(hipGetLastError(), "known-window HC rows normalization launch");
+        }
+        if (fused) {
+            static const unsigned fused_per_block = [] {
+                const char* v = std::getenv("STRIX_HC_ROWS_SPLITK_OUTPUTS");
+                const unsigned n = v ? static_cast<unsigned>(std::atoi(v)) : 2U;
+                return n == 4U ? 4U : 2U;
+            }();
+            const auto launch = [&]<unsigned outputs>() {
+                const auto blocks = (config.lowrank + outputs - 1U) / outputs;
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_splitk_norm_hyper_projection_kernel<outputs, Storage>),
+                    dim3(blocks + (inject ? (config.hc_count + outputs - 1U) / outputs : 0U)), dim3(512U), 0,
+                    hip_execution_stream(), prepared.rows, count, reinterpret_cast<const void*>(p.down_runtime->address),
+                    config.hc_count, config.lowrank, inject, blocks, reinterpret_cast<const void*>(p.norm_runtime->address),
+                    p.norm_manifest->ggml_type, config.hidden_size, config.rms_epsilon);
+            };
+            if (fused_per_block == 2U) launch.template operator()<2U>(); else launch.template operator()<4U>();
+        } else if (config.splitk_projection) {
             // Outputs per block only regroups independent output chains (bit-identical);
-            // STRIX_HC_ROWS_SPLITK_OUTPUTS=1|2|4|8 trades blocks in flight against input re-reads.
+            // STRIX_HC_ROWS_SPLITK_OUTPUTS=1|2|4|8 trades blocks in flight against input re-reads (2 measured best).
             static const unsigned per_block = [] {
                 const char* v = std::getenv("STRIX_HC_ROWS_SPLITK_OUTPUTS");
-                const unsigned n = v ? static_cast<unsigned>(std::atoi(v)) : 4U;
-                return n == 1U || n == 2U || n == 8U ? n : 4U;
+                const unsigned n = v ? static_cast<unsigned>(std::atoi(v)) : 2U;
+                return n == 1U || n == 4U || n == 8U ? n : 2U;
             }();
             const auto launch = [&]<unsigned outputs>() {
                 const auto blocks = (config.lowrank + outputs - 1U) / outputs;
