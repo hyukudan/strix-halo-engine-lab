@@ -81,8 +81,12 @@ template <class Site, bool Staged> constexpr unsigned outs_of() {
 template <class Site> constexpr unsigned a8_outs_of() {
     if constexpr (requires { Site::a8_outs; }) return Site::a8_outs; else return Site::rows > 1U ? 4U : 2U;
 }
+#ifndef STRIX_Q8_ROWS_PREFETCH
+#define STRIX_Q8_ROWS_PREFETCH 2U
+#endif
 template <class Site, bool Staged> constexpr unsigned prefetch_of() {
-    if constexpr (requires { Site::prefetch; }) return Site::prefetch; else return narrow_bf16<Site, Staged>() ? 1U : 2U;
+    if constexpr (requires { Site::prefetch; }) return Site::prefetch;
+    else return narrow_bf16<Site, Staged>() ? 1U : STRIX_Q8_ROWS_PREFETCH;
 }
 constexpr unsigned log2u(unsigned v) { return v <= 1U ? 0U : 1U + log2u(v / 2U); }
 // Trees reduce a power-of-two number of (output, row) pairs; spare pairs stay zero.

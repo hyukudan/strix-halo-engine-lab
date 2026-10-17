@@ -4,6 +4,7 @@
 #endif
 #include <hip/hip_fp16.h>
 #include <array>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -185,7 +186,9 @@ __device__ float divide_rne(float a,float b){return a/b;}
 // G re-reads its weight slice from cache per group. Epilogue per
 // (row,slot,output): the float profile's finite scan/SiLU/scan, or (A8Down)
 // the serial A8 down activation quantizer on the block's 32-output group.
-template<unsigned G,bool Q5K,bool A8Down>
+// Chunk: Q4_K K blocks held in registers at once (fewer lets more waves stay resident;
+// each accumulator still adds its blocks in ascending order).
+template<unsigned G,bool Q5K,bool A8Down,unsigned Chunk=max_hidden/256U>
 __global__ __launch_bounds__(256) void project_window(const unsigned char* gate,const unsigned char* up,DeviceRows view,DeviceCsr csr,
     unsigned rows,unsigned hidden,unsigned outputs) {
     unsigned failure=csr.summary[0];
@@ -233,14 +236,18 @@ __global__ __launch_bounds__(256) void project_window(const unsigned char* gate,
                     }
                 }
             } else {
-                uint4 hd[max_blocks],q[max_blocks];
 #pragma unroll
-                for(unsigned b=0;b<max_blocks;++b)if(b<blocks) {
-                    hd[b]=*reinterpret_cast<const uint4*>(w+b*144U);q[b]=*reinterpret_cast<const uint4*>(w+b*144U+16U+c*16U);
+                for(unsigned first=0;first<max_blocks;first+=Chunk) {
+                uint4 hd[Chunk],q[Chunk];
+#pragma unroll
+                for(unsigned i=0;i<Chunk;++i)if(first+i<blocks) {
+                    const unsigned b=first+i;
+                    hd[i]=*reinterpret_cast<const uint4*>(w+b*144U);q[i]=*reinterpret_cast<const uint4*>(w+b*144U+16U+c*16U);
                 }
 #pragma unroll
-                for(unsigned b=0;b<max_blocks;++b)if(b<blocks) {
-                    const auto k=coefficient(hd[b],q[b],p);
+                for(unsigned i=0;i<Chunk;++i)if(first+i<blocks) {
+                    const unsigned b=first+i;
+                    const auto k=coefficient(hd[i],q[i],p);
 #pragma unroll
                     for(unsigned a=0;a<G;++a)if(group+a<count) {
                         const int4 a0=*reinterpret_cast<const int4*>(local_codes[a]+b*256U+p*64U+h*16U);
@@ -249,6 +256,7 @@ __global__ __launch_bounds__(256) void project_window(const unsigned char* gate,
                             local_deltas[a][b*8U+g0],local_deltas[a][b*8U+g1]);
                         acc[m][a]=acc[m][a]+pair;
                     }
+                }
                 }
             }
         }
@@ -268,10 +276,10 @@ __global__ __launch_bounds__(256) void project_window(const unsigned char* gate,
         if constexpr(A8Down) {
             // Serial down_activation_quantize for group blockIdx.x of each staged
             // (row,slot): same lane = feature, collectives and fail-closed writes.
+            // One wave per staged (row, slot): rows are independent, each keeps the serial quantizer.
             __syncthreads();
-            if(wave==0U) {
-#pragma unroll
-                for(unsigned a=0;a<G;++a)if(group+a<count) {
+            {
+                for(unsigned a=wave;a<G;a+=8U)if(group+a<count) {
                     const auto r=csr.rows[begin+group+a],slot=csr.slots[begin+group+a];
                     const unsigned feature=blockIdx.x*32U+lane,at=slot*2U*outputs+feature;
                     const float g=tile[0][a][lane],u=tile[1][a][lane];
@@ -472,7 +480,14 @@ void enqueue_window(const Request& request,std::span<const Bindings> rows,const 
 #define STRIX_A8_WINDOW_PROJECT(G,Q5,A8) \
     hipLaunchKernelGGL(HIP_KERNEL_NAME(project_window<G,Q5,A8>),project_grid,dim3(256),0,stream,gate,up,p.rows,p.csr, \
         count,request.shape.hidden,request.shape.rows)
+    // STRIX_MOE_GATEUP_CHUNK=5: half the Q4_K blocks in registers at a time (same sums).
+    static const bool half_chunk=[]{const char* v=std::getenv("STRIX_MOE_GATEUP_CHUNK");return v && v[0]=='5';}();
+    const auto chunked=[&]<unsigned G>(){
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(project_window<G,false,true,5U>),project_grid,dim3(256),0,stream,gate,up,p.rows,p.csr,
+            count,request.shape.hidden,request.shape.rows);
+    };
     if(!a8){if(count==2U){STRIX_A8_WINDOW_PROJECT(2U,false,false);}else{STRIX_A8_WINDOW_PROJECT(4U,false,false);}}
+    else if(!q5k && half_chunk){if(count==2U)chunked.template operator()<2U>();else chunked.template operator()<4U>();}
     else if(!q5k){if(count==2U){STRIX_A8_WINDOW_PROJECT(2U,false,true);}else{STRIX_A8_WINDOW_PROJECT(4U,false,true);}}
     else {if(count==2U){STRIX_A8_WINDOW_PROJECT(2U,true,true);}else{STRIX_A8_WINDOW_PROJECT(4U,true,true);}}
 #undef STRIX_A8_WINDOW_PROJECT

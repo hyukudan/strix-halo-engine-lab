@@ -487,9 +487,11 @@ void HipMtpRuntime::enable_draft_chain(HipMtpDraftHeadConfig config,bool exact) 
         p.hc_inject.reset(hc);
         launch_hip_mtp_dequantize_q8(reinterpret_cast<const void*>(p.owner->tensors().attention_hc_inject.runtime->address),inject,hc,p.owner->stream());
         launch_hip_mtp_dequantize_q8(reinterpret_cast<const void*>(p.owner->tensors().mlp_hc_inject.runtime->address),inject,hc+inject,p.owner->stream());
-        // STRIX_MTP_DRAFT_Q4_ALL=1: the draft's dense and expert projections read Q4_0 copies
-        // (proposals only; verification is unchanged).
-        if(std::getenv("STRIX_MTP_DRAFT_Q4_ALL")) {
+        // The draft's dense and expert projections read Q4_0 copies (proposals only; verification
+        // is unchanged). With {2,4,8} windows the cheaper deep drafts win: 46.8 -> 47.9 tok/s.
+        // STRIX_MTP_DRAFT_Q4_ALL=0 keeps the Q8 sidecar.
+        const char* q4_all=std::getenv("STRIX_MTP_DRAFT_Q4_ALL");
+        if(!q4_all || q4_all[0]!='0') {
             const auto& t=p.owner->tensors();
             for(const auto* v:{&t.eh_projection,&t.query,&t.key,&t.value,&t.attention_output,&t.expert_gate,&t.expert_up,
                     &t.expert_down,&t.shared_gate,&t.shared_up,&t.shared_down}) {

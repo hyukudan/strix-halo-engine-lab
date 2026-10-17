@@ -43,6 +43,7 @@ struct HipMtpWindowVerifier::Impl {
         std::uint32_t rows=0;
         HipMtpWindowOwnerStats stats;
         std::shared_ptr<void> greedy_partials,greedy_replies;
+        bool warmed=false; // first window of an owner pays one-time admission and first-touch costs
     };
     std::shared_ptr<HipMtpTargetHidden> target;
     std::vector<Owner> owners; // ascending rows
@@ -79,7 +80,7 @@ struct HipMtpWindowVerifier::Impl {
                 "MTP window verifier requires actual closed all-row target owners");
             require(owners.empty() || (owners.back().rows<candidate->logical_rows() && candidate->defers_state() &&
                 owners.front().window->defers_state()),"MTP window owners must have distinct rows and prefix acceptance");
-            owners.push_back({candidate,{},candidate->logical_rows(),{candidate->logical_rows(),0,0.0},{},{}});
+            owners.push_back({candidate,{},candidate->logical_rows(),{candidate->logical_rows(),0,0.0},{},{},false});
         }
         window=owners.back().window;
         prefix=window->defers_state();
@@ -167,9 +168,15 @@ struct HipMtpWindowVerifier::Impl {
         if(last_end && emitted) {
             const auto ms=std::chrono::duration<double,std::milli>(now-*last_end).count();
             constexpr double alpha=0.25;
-            auto update=[&](double& ema,std::uint64_t& count,double value){ema=count?ema+alpha*(value-ema):value;++count;};
-            if(owner) update(owner->stats.cycle_ms_ema,owner->stats.cycles,ms);
-            else update(serial_ms_ema,serial_cycles,ms/static_cast<double>(emitted));
+            // A sample is capped at twice the running estimate: one slow cycle (page faults,
+            // a stalled host) must not price an owner out of every later choice.
+            auto update=[&](double& ema,std::uint64_t& count,double value){
+                ema=count?ema+alpha*(std::min(value,2.0*ema)-ema):value;++count;};
+            if(owner) {
+                // The owner's first window is not a cost sample; it stays unmeasured and is tried again.
+                if(owner->warmed) update(owner->stats.cycle_ms_ema,owner->stats.cycles,ms);
+                owner->warmed=true;
+            } else update(serial_ms_ema,serial_cycles,ms/static_cast<double>(emitted));
         }
         last_end=now;
     }
