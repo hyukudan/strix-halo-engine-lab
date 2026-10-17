@@ -126,13 +126,15 @@ struct KnownFixture {
     strix::ModelManifest manifest;
     strix::ExecutionTensorAccessPlan access;
 };
+constexpr std::string_view known_head_wave8 = "hip.lm_head.bf16.h2560.v248320.r1.c1.prefetch8-wave8-v1.virtual256.q8";
 constexpr std::string_view known_hyper_base="hip.hyper_mix.bf16.h2560.hc4.lr320.r1.c1.parallel.staged"
     ".fused-injection-v5.typed-q8-f32-v1.prefetch-rows8-v2.prefetch-q8-output-v1";
 bool hyper_op(strix::SerialOp op) {
     return op==strix::SerialOp::attn_hyper_mix || op==strix::SerialOp::mlp_hyper_mix || op==strix::SerialOp::final_hyper_mix;
 }
 KnownFixture make_known_fixture(const strix::ModelContract& model, std::uint32_t gate_type = 8U,
-    bool routed_union = false, bool hyper = false, bool qsa = false, std::uint32_t indexer_type = 8U) {
+    bool routed_union = false, bool hyper = false, bool qsa = false, std::uint32_t indexer_type = 8U,
+    std::uint32_t head_type = 0xffffffffU) {
     KnownFixture fixture;
     fixture.serial.execution = strix::build_serial_decode_execution_plan(model);
     fixture.serial.io = strix::build_serial_execution_io_plan(fixture.serial.execution);
@@ -207,6 +209,15 @@ KnownFixture make_known_fixture(const strix::ModelContract& model, std::uint32_t
             tensor("attn_q_norm.weight",{256},0); tensor("attn_k_norm.weight",{256},0);
             tensor("indexer.q_proj.weight",{2560,512},indexer_type); tensor("indexer.k_proj.weight",{2560,128},indexer_type);
             tensor("indexer.q_norm.weight",{128},0); tensor("indexer.k_norm.weight",{128},0);
+        } else if (step.op == strix::SerialOp::lm_head && head_type != 0xffffffffU) {
+            binding.kernel_id = std::string(known_head_wave8);
+            strix::ManifestTensor head;
+            head.name = "output.weight"; head.role = strix::TensorRole::output_head;
+            head.dimensions = {2560, model.vocab_size}; head.ggml_type = head_type; head.absolute_offset = offset;
+            head.byte_size = head_type == 8U ? 2560U / 32U * 34U * model.vocab_size : 2560U * 2U * model.vocab_size;
+            offset += (head.byte_size + 255U) / 256U * 256U;
+            tensors.tensor_indices.push_back(static_cast<std::uint32_t>(fixture.manifest.tensors.size()));
+            fixture.manifest.tensors.push_back(std::move(head));
         } else if (step.op == strix::SerialOp::ple) {
             // Only metadata is retained. A start-fault backend below never
             // accesses this table or claims a real PLE numerical baseline.
@@ -399,10 +410,10 @@ struct KnownRuntimeFixture {
 
     explicit KnownRuntimeFixture(const strix::ModelContract& model, bool promote = false, bool mixed = false,
         std::uint32_t rows = 2, bool routed_union = false,
-        strix::KnownWindowOutputPolicy output_policy = strix::KnownWindowOutputPolicy::all_rows, bool hyper = false, bool qsa = false)
-        : source(make_known_fixture(model, mixed ? 0U : 8U,routed_union,hyper,qsa)),
+        strix::KnownWindowOutputPolicy output_policy = strix::KnownWindowOutputPolicy::all_rows, bool hyper = false, bool qsa = false, bool head_rows = false)
+        : source(make_known_fixture(model, mixed ? 0U : 8U,routed_union,hyper,qsa,8U,head_rows ? 8U : 0xffffffffU)),
           window(strix::compile_known_prefix_window(model, source.serial, source.manifest,
-              source.access, {promote, promote, mixed, rows,routed_union,output_policy,hyper,qsa})),
+              source.access, {promote, promote, mixed, rows,routed_union,output_policy,hyper,qsa,false,false,head_rows})),
           serial_pool(static_cast<std::size_t>((source.serial.arena.total_bytes + 7U) / 8U)),
           window_pool(static_cast<std::size_t>((window.arena.physical.total_bytes + 7U) / 8U)),
           state_words(7U * 48U, 0) {
@@ -1226,6 +1237,74 @@ void known_window_qsa_tests(const strix::ModelContract& model) {
             missing.window_memory,missing.session,missing.tokens,plans,{},{},missing.hooks());},
             "missing QSA rows callback rejects before dispatch");
         expect(missing.trace.calls==0U && missing.session.next_position==0U,"rejected QSA window mutates nothing");
+void known_window_lm_head_rows_tests(const strix::ModelContract& model) {
+    using V=strix::KnownWindowR2Variant;
+    using M=strix::KnownWindowStepMode;
+    using P=strix::KnownWindowOutputPolicy;
+    const auto head_bytes=2560ULL/32ULL*34ULL*model.vocab_size;
+    const auto reject=[](auto&& operation,const char* message) {
+        bool rejected=false;try{operation();}catch(const std::invalid_argument&){rejected=true;}expect(rejected,message);
+    };
+    const auto fixture=make_known_fixture(model,0U,false,false,false,8U,8U);
+    for(const std::uint32_t rows:{2U,4U,8U}) {
+        const auto variant=rows==2U?V::lm_head_q8_prefetch8_rows2_v1:rows==4U?V::lm_head_q8_prefetch8_rows4_v1:V::lm_head_q8_prefetch8_rows8_v1;
+        const auto off=strix::compile_known_prefix_window(model,fixture.serial,fixture.manifest,fixture.access,
+            {true,true,true,rows,false,P::all_rows,false});
+        const auto on=strix::compile_known_prefix_window(model,fixture.serial,fixture.manifest,fixture.access,
+            {true,true,true,rows,false,P::all_rows,true});
+        strix::validate_known_prefix_window_formats(on,fixture.serial,fixture.manifest,fixture.access);
+        expect(off.lm_head_rows_steps==0U && off.mode.back()==M::r1_row_loop && on.lm_head_rows_steps==1U &&
+            on.mode.back()==M::lm_head_rows && on.r2_variant.back()==variant && on.row_loop_steps+1U==off.row_loop_steps &&
+            on.logical_projection_weight_bytes_avoided==off.logical_projection_weight_bytes_avoided+head_bytes*(rows-1U) &&
+            on.projection_launches_saved==off.projection_launches_saved+rows-1U &&
+            on.window_execution_identity!=off.window_execution_identity &&
+            on.window_kernel_plan_identity!=off.window_kernel_plan_identity && on.logit_row_indices.size()==rows &&
+            on.row_plan.back().bindings.bindings.back().kernel_id==fixture.serial.bindings.bindings.back().kernel_id,
+            "multi-row head is an explicit terminal mode with distinct identities and its R1 source ID");
+        for(const auto policy:{P::terminal_row,P::state_only}) {
+            const auto kept=strix::compile_known_prefix_window(model,fixture.serial,fixture.manifest,fixture.access,
+                {true,true,true,rows,false,policy,true});
+            expect(kept.lm_head_rows_steps==0U && kept.mode.back()==M::r1_row_loop,
+                "omitted-head policies keep the per-row terminal loop");
+        }
+        auto changed=on;++changed.lm_head_rows_steps;
+        reject([&]{strix::validate_compiled_known_prefix_window(changed,fixture.serial);},"forged head rows counter rejects");
+        changed=on;changed.r2_variant.back()=rows==2U?V::lm_head_q8_prefetch8_rows4_v1:V::lm_head_q8_prefetch8_rows2_v1;
+        reject([&]{strix::validate_compiled_known_prefix_window(changed,fixture.serial);},"wrong-width head variant rejects");
+        changed=on;changed.output_policy=P::terminal_row;changed.logit_row_indices={rows-1U};
+        reject([&]{strix::validate_compiled_known_prefix_window(changed,fixture.serial);},"head rows cannot claim an omitted-head policy");
+        auto bf16=make_known_fixture(model,0U,false,false,false,8U,30U);
+        const auto fallback=strix::compile_known_prefix_window(model,bf16.serial,bf16.manifest,bf16.access,
+            {true,true,true,rows,false,P::all_rows,true});
+        expect(fallback.lm_head_rows_steps==0U,"non-Q8 head retains its R1 row loop");
+        reject([&]{strix::validate_known_prefix_window_formats(on,bf16.serial,bf16.manifest,bf16.access);},
+            "a compiled head rows window cannot inherit a changed head format");
+        const auto plain=make_known_fixture(model,0U);
+        expect(strix::compile_known_prefix_window(model,plain.serial,plain.manifest,plain.access,
+            {true,true,true,rows,false,P::all_rows,true}).lm_head_rows_steps==0U,"other head kernel IDs stay R1");
+
+        KnownRuntimeFixture baseline(model,false,true,rows,false,P::all_rows,false,false,true);
+        std::vector<std::uint64_t> expected;
+        for(const auto token:baseline.tokens) expected.push_back(baseline.serial_token(token));
+        KnownRuntimeFixture candidate(model,false,true,rows,false,P::all_rows,false,false,true);
+        const std::array<strix::KnownWindowRowsEntry,1> entries{{
+            {variant,&candidate.trace,&recording_rows_preflight,&recording_rows_launch}}};
+        std::vector<const strix::CompiledLaunchPlan*> plans;
+        for(const auto& plan:candidate.row_launch) plans.push_back(&plan);
+        const auto result=strix::execute_known_prefix_window_eager(candidate.window,candidate.source.serial,
+            candidate.resources,candidate.window_memory,candidate.session,candidate.tokens,plans,{},entries,candidate.hooks());
+        expect(result.logits.size()==rows && result.lm_head_rows_dispatches==1U &&
+            result.r2_variant_dispatches[static_cast<std::size_t>(variant)]==1U &&
+            candidate.trace.head_positions.size()==rows && candidate.session.next_position==rows,
+            "terminal head runs once for all rows and still materialises every row logits");
+        for(std::uint32_t row=0;row<rows;++row)
+            expect(read_word(result.logits[row].address)==expected[row],"head rows keep every serial row output");
+        KnownRuntimeFixture missing(model,false,true,rows,false,P::all_rows,false,false,true);
+        plans.clear();for(const auto& plan:missing.row_launch) plans.push_back(&plan);
+        reject([&]{(void)strix::execute_known_prefix_window_eager(missing.window,missing.source.serial,missing.resources,
+            missing.window_memory,missing.session,missing.tokens,plans,{},{},missing.hooks());},
+            "missing head rows entry rejects before any dispatch");
+        expect(missing.trace.calls==0U && missing.session.next_position==0U,"rejected head rows window mutates nothing");
     }
 }
 
@@ -1871,6 +1950,7 @@ int main() {
     expect(deferred_rejected,"deferred MoE explicitly rejects speculative verification");
 
     known_window_routed_union_compiler_tests(model);
+    known_window_lm_head_rows_tests(model);
     known_window_routed_union_runtime_tests(model);
     known_window_hyper_rows_tests(model);
     known_window_qsa_tests(model);

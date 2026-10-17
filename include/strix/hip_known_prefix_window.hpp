@@ -14,6 +14,7 @@
 #include <span>
 
 namespace strix {
+struct HipGreedyRowsReply;
 class HipMtpTargetWindowCapture;
 struct HipMtpTargetWindowCapturePolicy;
 struct HipMtpTargetWindowExecution;
@@ -78,6 +79,12 @@ public:
     [[nodiscard]] HipMtpTargetWindowExecution execute_mtp_captured(SerialSessionContext&,
         std::span<const std::uint32_t>,std::shared_ptr<HipMtpTargetWindowCapture>,
         const std::function<void()>& before_publish = {});
+    // Opt-in device greedy selection enqueued right after the multi-row terminal
+    // head (KnownWindowRequest::lm_head_rows); logits stay materialised. After each
+    // successful execute, replies[r] (host-mapped coherent, logical_rows entries)
+    // holds row r's first-max finite token/status with no extra copy or sync.
+    // partials is retained device scratch of hip_greedy_rows_scratch_bytes(T, vocab).
+    void attach_greedy_rows(ExecutionBufferAddress partials, HipGreedyRowsReply* replies);
     [[nodiscard]] std::uint32_t logical_rows() const noexcept;
     [[nodiscard]] bool supports_tiled_prefill() const noexcept;
     // Immutable compiler-selected intent; verification consumers require all_rows.

@@ -3,6 +3,7 @@
 #include "strix/execution_memory.hpp"
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <string_view>
 
 namespace strix {
@@ -68,4 +69,17 @@ private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
+
+// Window greedy selection: the same all-vocabulary first-max finite rule as
+// HipGreedyOutput (numeric zeros equal, lowest token on ties) for 1..8 rows in
+// two launches. replies must be a host-mapped coherent allocation of rows
+// entries (hipHostMalloc mapped|coherent): after the stream drains, replies[r]
+// is row r's result with no copy. status bit0: a non-finite logit was seen;
+// bit1: no finite logit (token 0). Callers keep logits/partials immutable until
+// the stream completes; partials is device scratch of hip_greedy_rows_scratch_bytes.
+inline constexpr std::uint32_t hip_greedy_rows_max = 8;
+struct HipGreedyRowsReply { std::uint32_t token, status; };
+[[nodiscard]] std::uint64_t hip_greedy_rows_scratch_bytes(std::uint32_t rows, std::uint32_t vocabulary);
+void enqueue_hip_greedy_rows(std::span<const ExecutionBufferAddress> logits, std::uint32_t vocabulary,
+    ExecutionBufferAddress partials, HipGreedyRowsReply* replies, void* stream);
 } // namespace strix

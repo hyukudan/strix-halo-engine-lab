@@ -32,6 +32,7 @@ enum class KnownWindowStepMode : std::uint8_t {
     gdn_deferred_rows,
     // PLE rows looked up on the host before the window; convolution kept per row.
     ple_rows,
+    lm_head_rows,
 };
 
 // Closed implementation table. These values identify window entries; they do
@@ -65,8 +66,12 @@ enum class KnownWindowR2Variant : std::uint32_t {
     qsa_q8_bf16idx_rows2_r1_v1 = 21,
     qsa_q8_bf16idx_rows4_r1_v1 = 22,
     qsa_q8_bf16idx_rows8_r1_v1 = 23,
+    // Terminal prefetch8 BF16/Q8_0 head, one weight read for all rows, R1 math per row.
+    lm_head_q8_prefetch8_rows2_v1 = 24,
+    lm_head_q8_prefetch8_rows4_v1 = 25,
+    lm_head_q8_prefetch8_rows8_v1 = 26,
 };
-inline constexpr std::uint32_t known_window_r2_variant_slots = 24;
+inline constexpr std::uint32_t known_window_r2_variant_slots = 27;
 
 struct KnownWindowRequest {
     bool r2_shared_expert = false;
@@ -85,6 +90,8 @@ struct KnownWindowRequest {
     // Prefix-acceptance state handling: deferred GDN commit and per-row PLE snapshots.
     bool deferred_gdn = false;
     bool rows_ple = false;
+    // Multi-row terminal head for the prefetch Q8_0 incumbent; all-rows policy only.
+    bool lm_head_rows = false;
 };
 
 struct CompiledKnownPrefixWindow {
@@ -116,6 +123,7 @@ struct CompiledKnownPrefixWindow {
     std::uint32_t qsa_rows_steps = 0;
     std::uint32_t gdn_deferred_rows_steps = 0;
     std::uint32_t ple_rows_steps = 0;
+    std::uint32_t lm_head_rows_steps = 0;
     KnownWindowOutputPolicy output_policy = KnownWindowOutputPolicy::all_rows;
     // Compact result.logits entries correspond to these original source rows.
     std::vector<std::uint32_t> logit_row_indices;
@@ -126,7 +134,7 @@ struct CompiledKnownPrefixWindow {
 [[nodiscard]] inline bool known_window_has_promoted_steps(const CompiledKnownPrefixWindow& window) noexcept {
     return window.r2_steps || window.shared_rows_steps || window.gdn_rows_steps || window.routed_expert_union_steps ||
         window.hyper_mix_rows_steps || window.qsa_rows_steps ||
-        window.gdn_deferred_rows_steps || window.ple_rows_steps;
+        window.gdn_deferred_rows_steps || window.ple_rows_steps || window.lm_head_rows_steps;
 }
 
 [[nodiscard]] CompiledKnownPrefixWindow compile_known_prefix_window(
