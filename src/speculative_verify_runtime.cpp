@@ -1,3 +1,6 @@
+#include <cstdlib>
+#include <cstdio>
+#include <chrono>
 #include "strix/execution_telemetry.hpp"
 #include "strix/speculative_verify_runtime.hpp"
 
@@ -245,6 +248,23 @@ ActualWindowRecipe actual_window_recipe(const CompiledKnownPrefixWindow& window,
 }
 }  // namespace
 
+namespace {
+// STRIX_WINDOW_TIMING=1: host-side phase totals of every eager known window, printed at exit.
+struct WindowHostTiming {
+    double admit = 0, preflight = 0, plan = 0, launch = 0, complete = 0; std::uint64_t windows = 0;
+    bool enabled = std::getenv("STRIX_WINDOW_TIMING") != nullptr;
+    ~WindowHostTiming() {
+        if (enabled && windows)
+            std::fprintf(stderr, "window host timing: %llu windows, per window ms: admit %.3f preflight %.3f plan %.3f launch %.3f complete %.3f\n",
+                static_cast<unsigned long long>(windows), admit / static_cast<double>(windows), preflight / static_cast<double>(windows), plan / static_cast<double>(windows), launch / static_cast<double>(windows), complete / static_cast<double>(windows));
+    }
+};
+WindowHostTiming& window_host_timing() { static WindowHostTiming t; return t; }
+double window_ms_since(std::chrono::steady_clock::time_point t) {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t).count();
+}
+}  // namespace
+
 KnownWindowResult execute_known_prefix_window_eager(
     const CompiledKnownPrefixWindow& window, const CompiledSerialExecution& serial,
     const ExecutionRuntimeResources& serial_resources,
@@ -254,8 +274,14 @@ KnownWindowResult execute_known_prefix_window_eager(
     std::span<const KnownWindowR2Entry> r2_entries,
     std::span<const KnownWindowRowsEntry> rows_entries,
     const KnownWindowExecutionHooks& hooks) {
+    const auto timing_begin = std::chrono::steady_clock::now(); auto timing_mark = timing_begin;
+    // A repeat window of the same owner and launch plans re-checks only what changes per
+    // window (tokens, positions, capacity, session); its static admission already passed.
+    const void* preflight_key = row_launch.empty() ? nullptr : static_cast<const void*>(row_launch.front());
+    const bool preflight_known = hooks.preflight_memo && preflight_key &&
+        std::find(hooks.preflight_memo->begin(), hooks.preflight_memo->end(), preflight_key) != hooks.preflight_memo->end();
     // Every allocation, clone, mode and identity is checked before callbacks.
-    validate_compiled_known_prefix_window(window, serial);
+    if (!preflight_known) validate_compiled_known_prefix_window(window, serial);
     const auto rows = window.logical_rows;
     if(tokens.size()!=rows || row_launch.size()!=rows)
         throw std::invalid_argument("known window token/launch row count differs from its compiled geometry");
@@ -265,12 +291,12 @@ KnownWindowResult execute_known_prefix_window_eager(
         throw std::logic_error("known window requires a ready serial session");
     if (session.execution_identity != serial.execution_identity || !session.execution_identity)
         throw std::invalid_argument("known window serial session execution identity mismatch");
-    validate_execution_runtime_resources(serial.execution_identity, serial.arena,
+    if (!preflight_known) validate_execution_runtime_resources(serial.execution_identity, serial.arena,
         serial_resources, session.next_position);
-    const auto identities = build_runtime_execution_identities(serial.execution_identity,
-        serial.arena, serial_resources);
+    const auto identities = preflight_known ? RuntimeExecutionIdentities{} : build_runtime_execution_identities(
+        serial.execution_identity, serial.arena, serial_resources);
     if (!session.runtime_compatibility_identity ||
-        session.runtime_compatibility_identity != identities.compatibility_identity ||
+        (!preflight_known && session.runtime_compatibility_identity != identities.compatibility_identity) ||
         session.state_layout_identity != serial_resources.session_state_layout->layout_identity ||
         window.manifest_layout_identity != serial_resources.model_manifest->layout_identity ||
         window.tensor_access_plan_identity != serial_resources.tensor_access->plan_identity)
@@ -288,6 +314,7 @@ KnownWindowResult execute_known_prefix_window_eager(
         next_lineage=prepare_prefill_chunk_lineage(session.arithmetic_lineage,
             session.next_position,post_position,window.window_execution_identity,
             window.window_kernel_plan_identity,window.window_execution_identity);
+    if (!preflight_known) {
     validate_execution_memory_binding(window.window_execution_identity, window.arena.physical, window_scratch);
     const auto& old_scratch = *serial_resources.scratch;
     if (window_scratch.arena_bytes > std::numeric_limits<std::uintptr_t>::max() - window_scratch.arena_base ||
@@ -308,12 +335,17 @@ KnownWindowResult execute_known_prefix_window_eager(
     disjoint_from_window(persistent.host_base, persistent.host_bytes);
     for (const auto& weight : serial_resources.model_weights->tensors)
         if (weight.address) disjoint_from_window(weight.address, weight.bytes);
+    }
     if (serial_resources.ple_prefetch && serial_resources.ple_prefetch->active)
         throw std::invalid_argument("known window cannot borrow an active PLE lookup");
     std::vector<ExecutionRuntimeResources> resources(rows, serial_resources);
     std::vector<EagerExecutionRequest> requests(rows);
     for (std::size_t r = 0; r < rows; ++r) {
         resources[r].scratch = &window_scratch;
+        requests[r].input_token_id = tokens[r];
+        requests[r].position = session.next_position + r;
+        requests[r].state = session.state;
+        if (preflight_known) continue;
         validate_execution_runtime_resources(window.window_execution_identity, window.arena.row_view[r],
             resources[r], session.next_position + r);
         validate_window_launch_plan(window.row_plan[r], row_launch[r]);
@@ -332,9 +364,6 @@ KnownWindowResult execute_known_prefix_window_eager(
             if (!position && !qsa)
                 throw std::invalid_argument("known window position-history reader implementation is not admitted");
         }
-        requests[r].input_token_id = tokens[r];
-        requests[r].position = session.next_position + r;
-        requests[r].state = session.state;
         validate_eager_execution_preflight(window.row_plan[r].execution, window.row_plan[r].bindings,
             window.row_plan[r].io, window.row_plan[r].arena, requests[r],
             resources[r].session_state_layout, resources[r].session_state_memory, &resources[r]);
@@ -434,10 +463,11 @@ KnownWindowResult execute_known_prefix_window_eager(
             throw std::invalid_argument("known window host position binding changed after admission");
         std::memcpy(reinterpret_cast<void*>(current.address), &value, sizeof(value));
     };
+    window_host_timing().admit += window_ms_since(timing_mark); timing_mark = std::chrono::steady_clock::now();
     hooks.preflight_scope();
     // A missing callback is not an implicit permit. Every row-loop launcher
     // proves its current metadata before PLE can start or any word is written.
-    for (std::size_t i = 0; i < steps; ++i) {
+    for (std::size_t i = 0; i < steps && !preflight_known; ++i) {
         if(selected_rows[i]) selected_rows[i]->preflight(contexts[i],selected_rows[i]->config);
         else if (selected[i]) {
             for(std::size_t r=0;r<rows;r+=2U)
@@ -449,7 +479,10 @@ KnownWindowResult execute_known_prefix_window_eager(
             launcher.preflight(contexts[i][r], launcher.user_data);
         }
     }
+    window_host_timing().preflight += window_ms_since(timing_mark); timing_mark = std::chrono::steady_clock::now();
     if (hooks.preflight_plan) hooks.preflight_plan();
+    if (hooks.preflight_memo && !preflight_known) hooks.preflight_memo->push_back(preflight_key);
+    window_host_timing().plan += window_ms_since(timing_mark); timing_mark = std::chrono::steady_clock::now();
     if(hooks.record_actual_window_lineage) {
         const auto recipe=actual_window_recipe(window,serial,row_launch,selected,selected_rows);
         next_lineage=prepare_known_window_chunk_lineage(session.arithmetic_lineage,session.next_position,post_position,
@@ -544,7 +577,9 @@ KnownWindowResult execute_known_prefix_window_eager(
         }
         if (serial_resources.ple_prefetch && serial_resources.ple_prefetch->active)
             throw std::logic_error("known window completed without consuming its PLE lookup");
+        window_host_timing().launch += window_ms_since(timing_mark); timing_mark = std::chrono::steady_clock::now();
         hooks.complete();
+        window_host_timing().complete += window_ms_since(timing_mark); ++window_host_timing().windows;
         materialize_position(contexts.back()[rows-1U], post_position - 1);
         std::uint64_t final_position_word = 0;
         std::memcpy(&final_position_word, reinterpret_cast<const void*>(position_state.address), sizeof(final_position_word));
