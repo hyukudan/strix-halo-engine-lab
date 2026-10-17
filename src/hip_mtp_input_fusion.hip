@@ -102,6 +102,36 @@ __global__ __launch_bounds__(128) void mtp_input_broadcast_add(HipMtpInputFusion
     if(r.output_storage==HipMtpInputStorage::bf16)reinterpret_cast<std::uint16_t*>(r.output.address)[i]=to_bf16(v);
     else reinterpret_cast<float*>(r.output.address)[i]=v;
 }
+// Draft-only fused projection + broadcast add: one wave per output row reads the
+// packed row once; lanes own 8-column groups, then a wave tree. Same rounding
+// points as the exact split kernels, different summation order.
+__global__ __launch_bounds__(256) void mtp_input_projections_wave(HipMtpInputFusionRequest r) {
+    const unsigned lane=threadIdx.x%32U,row=blockIdx.x*8U+threadIdx.x/32U,h=r.hidden_size,hc=r.hc_count;
+    if(row>=h)return;
+    const auto* input=reinterpret_cast<const float*>(r.normalized_scratch.address);
+    const auto* packed=reinterpret_cast<const unsigned char*>(r.packed_projection.address)+static_cast<std::uint64_t>(row)*r.projection_row_stride_bytes;
+    float embedding=0.0F,sums[4]={0.0F,0.0F,0.0F,0.0F};
+    for(unsigned base=8U*lane;base<h;base+=256U) {
+        const auto* e=packed+(base/32U)*34U;const auto* w=packed+((h+base)/32U)*34U;
+        const float es=__half2float(*reinterpret_cast<const __half*>(e)),ws=__half2float(*reinterpret_cast<const __half*>(w));
+        for(unsigned i=0;i<8U;++i) {
+            embedding=fmaf(es*static_cast<float>(static_cast<signed char>(e[2U+base%32U+i])),input[base+i],embedding);
+            const float weight=ws*static_cast<float>(static_cast<signed char>(w[2U+base%32U+i]));
+            for(unsigned stream=0;stream<hc;++stream) sums[stream]=fmaf(weight,input[h+stream*h+base+i],sums[stream]);
+        }
+    }
+    for(unsigned d=16U;d;d>>=1U) {
+        embedding+=__shfl_xor(embedding,static_cast<int>(d),32);
+        for(unsigned stream=0;stream<4U;++stream) sums[stream]+=__shfl_xor(sums[stream],static_cast<int>(d),32);
+    }
+    if(lane)return;
+    const float projected=rounded(embedding,r.projection_rounding);
+    for(unsigned stream=0;stream<hc;++stream) {
+        const float v=projected+rounded(sums[stream],r.projection_rounding);
+        if(r.output_storage==HipMtpInputStorage::bf16)reinterpret_cast<std::uint16_t*>(r.output.address)[stream*h+row]=to_bf16(v);
+        else reinterpret_cast<float*>(r.output.address)[stream*h+row]=v;
+    }
+}
 } // namespace
 std::uint64_t hip_mtp_input_fusion_scratch_bytes(std::uint32_t h,std::uint32_t hc) {
     geometry(h,hc);return multiply(multiply(h,static_cast<std::uint64_t>(hc)+1U),4U);
@@ -153,5 +183,13 @@ void launch_hip_mtp_input_fusion(const HipMtpInputFusionRequest& r,void* raw_str
     hipLaunchKernelGGL(mtp_input_projections,dim3((jobs+127U)/128U),dim3(128U),0U,stream,r);check(hipGetLastError(),"MTP split projection launch");
     const unsigned outputs=r.hidden_size*r.hc_count;
     hipLaunchKernelGGL(mtp_input_broadcast_add,dim3((outputs+127U)/128U),dim3(128U),0U,stream,r);check(hipGetLastError(),"MTP broadcast add launch");
+}
+void launch_hip_mtp_input_fusion_draft(const HipMtpInputFusionRequest& r,void* raw_stream) {
+    preflight_hip_mtp_input_fusion(r);
+    if(!raw_stream)throw std::invalid_argument("MTP input fusion requires an explicit owned stream");
+    const auto stream=static_cast<hipStream_t>(raw_stream);
+    hipLaunchKernelGGL(mtp_input_norms,dim3(2U),dim3(256U),0U,stream,r);check(hipGetLastError(),"MTP input norms launch");
+    hipLaunchKernelGGL(mtp_input_projections_wave,dim3((r.hidden_size+7U)/8U),dim3(256U),0U,stream,r);
+    check(hipGetLastError(),"MTP draft fused projection launch");
 }
 } // namespace strix

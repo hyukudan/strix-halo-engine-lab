@@ -1352,6 +1352,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         src/hip_mtp_resources.hip
         src/hip_mtp_runtime.hip
         src/hip_mtp_draft_head.hip
+        src/hip_mtp_fast_draft.hip
         src/hip_mtp_target_window.hip
         src/hip_mtp_target_checkpoint.hip
         src/hip_mtp_window_verifier.hip
@@ -1434,7 +1435,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         target_compile_definitions(strix_hip_runtime PRIVATE STRIX_BUILD_SHARED_EXPERT_ROWS_DIAGNOSTIC=1)
         target_compile_definitions(strix_hip_runtime PRIVATE STRIX_BUILD_QSA_GQA_REUSE_DIAGNOSTIC=1)
         target_compile_definitions(strix_hip_runtime PRIVATE STRIX_BUILD_MOE_BATCHED_ACTIVATION_DIAGNOSTIC=1)
-        foreach(mtp_fixture input-fusion forward-replay target-checkpoint draft-head)
+        foreach(mtp_fixture input-fusion forward-replay target-checkpoint draft-head fast-draft)
             string(REPLACE "-" "_" mtp_fixture_file "${mtp_fixture}")
             add_executable(strix-hip-mtp-${mtp_fixture}-tests tests/hip_mtp_${mtp_fixture_file}_tests.hip)
             target_link_libraries(strix-hip-mtp-${mtp_fixture}-tests PRIVATE strix_hip_runtime)

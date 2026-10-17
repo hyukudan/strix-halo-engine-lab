@@ -249,7 +249,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
             HipMtpDraftHeadConfig draft;draft.full=m.draft_vocab.empty() && !m.draft_context_vocab;
             if(!m.draft_vocab.empty())draft.base_tokens=HipMtpDraftHead::read_token_file(m.draft_vocab,static_cast<std::uint32_t>(model.vocab_size));
             draft.context_capacity=m.draft_context_vocab;
-            runtime->enable_draft_chain(std::move(draft));runtime->observe_draft_context(options.tokens);
+            runtime->enable_draft_chain(std::move(draft),m.draft_exact);runtime->observe_draft_context(options.tokens);
         }
         HipMtpGreedyRuntime greedy(runtime,qualified,activated,target,session,r,dispatcher,parents);
         if(window && !qualify)greedy.use_window_verifier(window);
@@ -351,6 +351,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
             <<"  \"mtp_target_wide_dispatches\":null,\n"
             <<"  \"mtp_target_wide_dispatches_scope\":\"not-exposed-by-current-verifier-result-not-inferred-from-geometry\",\n"
             <<"  \"mtp_draft_chain\":"<<(m.draft_chain?"true":"false")<<",\n"
+            <<"  \"mtp_draft_exact_kernels\":"<<(m.draft_exact?"true":"false")<<",\n"
             <<"  \"mtp_draft_head_rows\":"<<draft_stats.rows<<",\n  \"mtp_draft_base_rows\":"<<draft_stats.base_rows<<",\n"
             <<"  \"mtp_draft_context_rows\":"<<draft_stats.context_rows<<",\n  \"mtp_draft_context_dropped\":"<<draft_stats.context_dropped<<",\n"
             <<"  \"mtp_generation_cycle_elapsed_ms\":"<<elapsed<<",\n"

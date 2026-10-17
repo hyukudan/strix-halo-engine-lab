@@ -69,8 +69,9 @@ public:
     // fed its token from device memory, the draft head (vocabulary subset or
     // full) selects on device into mapped memory, and one completion ends the
     // chain. Teacher cache rows of priming/reconciliation also complete once.
-    // Drafts only steer acceptance; target outputs are unchanged.
-    void enable_draft_chain(HipMtpDraftHeadConfig);
+    // Drafts only steer acceptance; target outputs are unchanged. Unless exact,
+    // draft rows use the fused input projection and the 2-launch Q8 MoE.
+    void enable_draft_chain(HipMtpDraftHeadConfig,bool exact=false);
     [[nodiscard]] const HipMtpDraftHead* draft_head() const noexcept;
     // Context ids for the draft vocabulary (prompt; cycles add their own tokens).
     void observe_draft_context(std::span<const std::uint32_t>);

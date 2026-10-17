@@ -1,3 +1,4 @@
+#include "strix/hip_mtp_fast_draft.hpp"
 #include "strix/hip_mtp_projection.hpp"
 #include "strix/hip_launch_context.hpp"
 #include "strix/hip_moe_experts_launcher.hpp"
@@ -2621,29 +2622,35 @@ void launch_hip_mtp_routed_experts(const MtpNativeContext& c,void* raw_stream) {
     if(capture!=hipStreamCaptureStatusNone)throw std::invalid_argument("MTP routed is eager only");
     check_hip(hipPeekAtLastError(),"MTP routed prior HIP error");
     const auto& o=*c.resources;const auto& t=*c.tensors;
-    const auto* input=reinterpret_cast<const std::uint16_t*>(o.view(HipMtpBuffer::hidden0).address);
-    const auto* routes=reinterpret_cast<const std::uint32_t*>(o.view(HipMtpBuffer::routes).address);
-    const auto* rw=reinterpret_cast<const float*>(o.view(HipMtpBuffer::route_weights).address);
-    auto* temp=reinterpret_cast<float*>(o.view(HipMtpBuffer::moe_workspace).address);auto* accumulation=temp+1280U;
-    auto* status=reinterpret_cast<std::uint32_t*>(o.view(HipMtpBuffer::status).address);
+    enqueue_hip_mtp_routed_experts_q8(reinterpret_cast<const std::uint16_t*>(o.view(HipMtpBuffer::hidden0).address),
+        reinterpret_cast<const std::uint32_t*>(o.view(HipMtpBuffer::routes).address),
+        reinterpret_cast<const float*>(o.view(HipMtpBuffer::route_weights).address),
+        reinterpret_cast<const void*>(t.expert_gate.runtime->address),reinterpret_cast<const void*>(t.expert_up.runtime->address),
+        reinterpret_cast<const void*>(t.expert_down.runtime->address),reinterpret_cast<float*>(o.view(HipMtpBuffer::moe_workspace).address),
+        reinterpret_cast<std::uint32_t*>(o.view(HipMtpBuffer::status).address),
+        reinterpret_cast<std::uint16_t*>(o.view(HipMtpBuffer::hidden2).address),stream);
+}
+void enqueue_hip_mtp_routed_experts_q8(const std::uint16_t* input,const std::uint32_t* routes,const float* rw,
+    const void* gate,const void* up,const void* down,float* temp,std::uint32_t* status,std::uint16_t* output,void* raw_stream) {
+    const auto stream=static_cast<hipStream_t>(raw_stream);auto* accumulation=temp+1280U;
     check_hip(hipMemsetAsync(accumulation,0,2560U*4U,stream),"MTP routed clear local accumulation");
     hipLaunchKernelGGL(validate_routes_kernel,dim3(1),dim3(kThreads),0,stream,routes,rw,10U,512U,status,nullptr);
     check_hip(hipGetLastError(),"MTP routed dynamic route validation");
     for(unsigned slot=0;slot<10U;++slot){
         hipLaunchKernelGGL(HIP_KERNEL_NAME(selected_projection_kernel<std::uint16_t,WeightKind::q8_0>),dim3(640U),dim3(kThreads),0,stream,
-            input,routes,slot,reinterpret_cast<const void*>(t.expert_gate.runtime->address),2560U,640U,512U,temp,status);
+            input,routes,slot,gate,2560U,640U,512U,temp,status);
         check_hip(hipGetLastError(),"MTP routed Q8 gate");
         hipLaunchKernelGGL(HIP_KERNEL_NAME(selected_projection_kernel<std::uint16_t,WeightKind::q8_0>),dim3(640U),dim3(kThreads),0,stream,
-            input,routes,slot,reinterpret_cast<const void*>(t.expert_up.runtime->address),2560U,640U,512U,temp+640U,status);
+            input,routes,slot,up,2560U,640U,512U,temp+640U,status);
         check_hip(hipGetLastError(),"MTP routed Q8 up");
         hipLaunchKernelGGL(routed_activation_kernel,dim3(3U),dim3(kThreads),0,stream,temp,640U,status);
         check_hip(hipGetLastError(),"MTP routed activation");
         hipLaunchKernelGGL(HIP_KERNEL_NAME(selected_down_accumulate_kernel<float,WeightKind::q8_0>),dim3(2560U),dim3(kThreads),0,stream,
-            temp,routes,rw,slot,reinterpret_cast<const void*>(t.expert_down.runtime->address),640U,2560U,512U,accumulation,status);
+            temp,routes,rw,slot,down,640U,2560U,512U,accumulation,status);
         check_hip(hipGetLastError(),"MTP routed ascending slot down");
     }
     hipLaunchKernelGGL(HIP_KERNEL_NAME(commit_experts_kernel<std::uint16_t>),dim3(10U),dim3(kThreads),0,stream,
-        accumulation,reinterpret_cast<std::uint16_t*>(o.view(HipMtpBuffer::hidden2).address),2560U,status);
+        accumulation,output,2560U,status);
     check_hip(hipGetLastError(),"MTP routed BF16 final commit");
 }
 } // namespace strix
