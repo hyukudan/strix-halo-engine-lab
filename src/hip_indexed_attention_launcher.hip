@@ -1735,33 +1735,28 @@ __device__ __forceinline__ void attention_output_body(
         kv_heads *
         head_dim;
 
+    // Sequential sum += score * value in slot order; eight slots' token indices and
+    // values are requested before they join the chain (latency, not arithmetic).
+    const auto* head_scores = scores + static_cast<std::uint64_t>(head) * maximum_selected;
+    const auto offset = static_cast<std::uint64_t>(kv_width) + static_cast<std::uint64_t>(kv_head) * head_dim + feature;
+    const auto value_at = [&](std::uint32_t token) {
+        return bf16_to_float(kv_state[static_cast<std::uint64_t>(token) * kv_width * 2ULL + offset]);
+    };
     float sum = 0.0F;
-    for (std::uint32_t slot = 0;
-         slot < selected_count;
-         ++slot) {
-        const auto token =
-            selected[slot];
-        const auto row_base =
-            static_cast<std::uint64_t>(
-                token) *
-            kv_width *
-            2ULL;
-        const auto value =
-            bf16_to_float(
-                kv_state[
-                    row_base +
-                    kv_width +
-                    static_cast<std::uint64_t>(
-                        kv_head) *
-                        head_dim +
-                    feature]);
-        sum +=
-            scores[
-                static_cast<std::uint64_t>(
-                    head) *
-                    maximum_selected +
-                slot] *
-            value;
+    std::uint32_t slot = 0;
+    for (; slot + 8U <= selected_count; slot += 8U) {
+        std::uint32_t token[8];
+#pragma unroll
+        for (unsigned i = 0; i < 8U; ++i) token[i] = selected[slot + i];
+        float value[8], score[8];
+#pragma unroll
+        for (unsigned i = 0; i < 8U; ++i) { value[i] = value_at(token[i]); score[i] = head_scores[slot + i]; }
+#pragma unroll
+        for (unsigned i = 0; i < 8U; ++i) sum += score[i] * value[i];
+    }
+    for (; slot < selected_count; ++slot) {
+        const float value = value_at(selected[slot]);
+        sum += head_scores[slot] * value;
     }
 
     // Preserve the model's BF16 attention output and BF16 sigmoid gate before
