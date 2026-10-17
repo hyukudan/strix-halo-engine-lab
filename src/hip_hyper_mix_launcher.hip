@@ -1898,7 +1898,9 @@ __global__ void rows_q8_batched_hyper_output_kernel(HyperRows rows, std::uint32_
 }
 
 // One staged up tile per block; each stream wave runs every row's R1 lane chain.
-template <typename Storage>
+// Count > 0 fixes the row count at compile time: rows advance together, each
+// coefficient decoded once for all of them, every row keeping its own serial chain.
+template <typename Storage, std::uint32_t Count = 0U>
 __global__ void rows_lane_chain_hyper_output_kernel(HyperRows rows, std::uint32_t count, const void* up,
     std::uint32_t hidden, std::uint32_t streams, std::uint32_t rank) {
     extern __shared__ __align__(16) unsigned char staging[];
@@ -1911,6 +1913,26 @@ __global__ void rows_lane_chain_hyper_output_kernel(HyperRows rows, std::uint32_
         *reinterpret_cast<uint4*>(stage+offset)=*reinterpret_cast<const uint4*>(source+offset);
     __syncthreads();
     auto* sig=reinterpret_cast<float*>(staging+static_cast<std::uint64_t>(streams)*tile_bytes);
+    if constexpr (Count != 0U) {
+    const float* low[Count];
+    float gate[Count];
+#pragma unroll
+    for(std::uint32_t t=0;t<Count;++t){ low[t]=rows.low[t]; gate[t]=0.0F; }
+    for(std::uint32_t block=0;block<rank/32U;++block){
+        const auto* weight=stage+static_cast<std::uint64_t>(lane)*row_bytes+static_cast<std::uint64_t>(block)*34U;
+        const auto scale_bits=static_cast<unsigned short>(static_cast<unsigned>(weight[0])|(static_cast<unsigned>(weight[1])<<8U));
+        const float scale=__half2float(__ushort_as_half(scale_bits));
+#pragma unroll
+        for(std::uint32_t k=0;k<32U;++k){
+            const float coefficient=scale*static_cast<float>(static_cast<signed char>(weight[2U+k]));
+#pragma unroll
+            for(std::uint32_t t=0;t<Count;++t)
+                gate[t]+=low[t][static_cast<std::uint64_t>(block)*32U+k]*coefficient;
+        }
+    }
+#pragma unroll
+    for(std::uint32_t t=0;t<Count;++t) sig[(t*streams+stream)*32U+lane]=sigmoid(gate[t]);
+    } else
     for(std::uint32_t t=0;t<count;++t){
         const auto* low=rows.low[t];
         float gate=0.0F;
@@ -2786,9 +2808,14 @@ void hyper_mix_known_window_rows_launch(std::span<const ExecutionDispatchContext
         if (config.lane_chain_output) {
             const auto lds = lane_chain_hyper_output_lds(config.hc_count, config.lowrank) +
                 static_cast<std::uint64_t>(count - 1U) * config.hc_count * 32U * sizeof(float);
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_lane_chain_hyper_output_kernel<Storage>), dim3(config.hidden_size / 32U),
-                dim3(32U * config.hc_count), static_cast<std::size_t>(lds), hip_execution_stream(), prepared.rows, count,
-                reinterpret_cast<const void*>(p.up_runtime->address), config.hidden_size, config.hc_count, config.lowrank);
+            const auto output = [&]<std::uint32_t Count>() {
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_lane_chain_hyper_output_kernel<Storage, Count>), dim3(config.hidden_size / 32U),
+                    dim3(32U * config.hc_count), static_cast<std::size_t>(lds), hip_execution_stream(), prepared.rows, count,
+                    reinterpret_cast<const void*>(p.up_runtime->address), config.hidden_size, config.hc_count, config.lowrank);
+            };
+            if (count == 2U) output.template operator()<2U>();
+            else if (count == 4U) output.template operator()<4U>();
+            else output.template operator()<0U>();
         } else {
             hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_q8_batched_hyper_output_kernel<Storage>),
                 dim3((config.hidden_size + kStagedOutputs - 1U) / kStagedOutputs), dim3(kStagedThreads), 0,
