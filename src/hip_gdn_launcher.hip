@@ -1044,7 +1044,8 @@ template <unsigned Rows> struct GdnInputRowsSite {
     std::uint32_t width, outputs;
     float* output[4][Rows];
     __device__ static float coefficient(unsigned scale, std::int8_t code) { return gdn_rows_coefficient(scale, code); }
-    __device__ static void fma(float& acc, float c, float x) { asm("v_fmac_f32 %0, %1, %2" : "+v"(acc) : "v"(c), "v"(x)); }
+    // Fused single-rounding FMA, the v_fmac_f32 of the R1 kernel; as a builtin the compiler may dual-issue it (VOPD).
+    __device__ static void fma(float& acc, float c, float x) { acc = __builtin_fmaf(c, x, acc); }
     __device__ static float add(float lower, float upper) { return gdn_rows_tree_add(lower, upper); }
     __device__ void store(std::uint32_t out, unsigned r, float value) const {
         unsigned m; std::uint32_t row;
@@ -1060,7 +1061,7 @@ template <unsigned Rows> struct GdnOutputRowsSite {
     std::uint32_t width, outputs;
     std::uint16_t* output[Rows];
     __device__ static float coefficient(unsigned scale, std::int8_t code) { return gdn_rows_coefficient(scale, code); }
-    __device__ static void fma(float& acc, float c, float x) { asm("v_fmac_f32 %0, %1, %2" : "+v"(acc) : "v"(x), "v"(c)); }
+    __device__ static void fma(float& acc, float c, float x) { acc = __builtin_fmaf(x, c, acc); }
     __device__ static float add(float lower, float upper) { return gdn_rows_tree_add(lower, upper); }
     __device__ void store(std::uint32_t out, unsigned r, float value) const { output[r][out] = float_to_bf16(value); }
 };
