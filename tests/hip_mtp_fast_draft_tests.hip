@@ -292,7 +292,11 @@ void bench(){
     const auto ple=[&](bool wave){strix::testing::enqueue_ple_q8_projection(wave,px.p,pk.p,2560,10240,po.p,hc.s);
         strix::testing::enqueue_ple_q8_projection(wave,px.p,pv.p,2560,2560,po.p,hc.s);};
     const double pg=time_gpu(hc.s,[&]{ple(false);}),pw=time_gpu(hc.s,[&]{ple(true);});
+    Device<std::uint16_t> iq(static_cast<std::size_t>(640)*2560);Device<float> io(640);
+    const double ix=time_gpu(hc.s,[&]{strix::enqueue_hip_mtp_attention_bf16_linear(px.p,iq.p,2560,512,io.p,hc.s);
+        strix::enqueue_hip_mtp_attention_bf16_linear(px.p,iq.p+512*2560,2560,128,io.p+512,hc.s);});
     std::printf("bench per draft, GPU median of 30 (ms)\n");
+    std::printf("  indexer BF16 q+k projections (exact, per draft)        %.4f\n",ix);
     std::printf("  HC mix exact staged (per mix, x3 per draft)            %.4f\n",he);
     std::printf("  HC mix draft split-K + lane-chain (per mix)            %.4f\n",hd);
     std::printf("  PLE key+value Q8 generic (target, per row)             %.4f\n",pg);

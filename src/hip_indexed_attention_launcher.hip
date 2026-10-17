@@ -4779,6 +4779,12 @@ void enqueue_hip_mtp_attention_q8_linear(const std::uint16_t* input,const void* 
         input,q8,width,rows,output);
     check_hip(hipGetLastError(),"MTP attention projection enqueue");
 }
+void enqueue_hip_mtp_attention_bf16_linear(const std::uint16_t* input,const void* bf16,std::uint32_t width,
+    std::uint32_t rows,float* output,void* stream) {
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(linear_to_float_kernel<WeightKind::bf16>),dim3(rows),dim3(kThreads),0,static_cast<hipStream_t>(stream),
+        input,bf16,width,rows,output);
+    check_hip(hipGetLastError(),"MTP attention BF16 projection enqueue");
+}
 namespace {
 void mtp_sparse_attention(const MtpNativeContext& c,void* raw_stream,bool draft) {
     const auto p=prepare_mtp_attention(c);require_mtp_attention_stream(c,raw_stream);
