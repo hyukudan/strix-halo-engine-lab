@@ -663,10 +663,13 @@ const q6p::Tensor* q6_head(const void* weights, std::uint32_t hidden, std::uint3
     const auto* q6 = q6p::find(weights);
     return q6 && q6->kind == q6p::Kind::q6p32 && q6->rows == vocab && q6->cols == hidden ? q6 : nullptr;
 }
+// Wide windows (staged, more than four rows) are VALU bound and the decode makes the Q6P32 head
+// slower (8 rows: 4.36 -> 4.51 ms in the window profile); they keep the Q8_0 head, same bits.
 template <unsigned Rows>
 void launch_lm_head_rows(const LmHeadRowsViews& views, const void* weights,
     std::uint32_t hidden, std::uint32_t vocab, hipStream_t stream) {
-    if (const auto* q6 = q6_head(weights, hidden, vocab)) launch_lm_head_rows_format<Rows, true>(views, q6->base, hidden, vocab, stream);
+    if (const auto* q6 = Rows <= 4U ? q6_head(weights, hidden, vocab) : nullptr)
+        launch_lm_head_rows_format<Rows, true>(views, q6->base, hidden, vocab, stream);
     else launch_lm_head_rows_format<Rows, false>(views, weights, hidden, vocab, stream);
 }
 // R1 prefetch8 wave8 head over a registered Q6P32 copy: the one-row rows kernel repeats the

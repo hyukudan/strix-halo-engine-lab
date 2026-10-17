@@ -116,12 +116,21 @@ def f16(x):
     return x.astype(np.float16).astype(np.float32)
 
 
+WEIGHTING = "imp-sqrt"
+
+
 def quantize_q6(w, imp):
     """w: (B, 32) float32 blocks, imp: (B, 32) importance. Returns q int8 (B, 32), d float16 (B,)."""
     w = w.astype(np.float32)
     # Importance-weighted error: imatrix column importance * sqrt(sigma2 + x^2); plain x^2 without one.
     sigma2 = 2.0 * np.mean(w * w, axis=1, keepdims=True)
-    weight = (imp * np.sqrt(sigma2 + w * w)) if imp is not None else (w * w + 1e-12)
+    # "imp": mean squared input per column, the output-error weight of independent inputs.
+    if imp is None:
+        weight = w * w + 1e-12
+    elif WEIGHTING == "imp":
+        weight = imp + 1e-12 * np.max(imp)
+    else:
+        weight = imp * np.sqrt(sigma2 + w * w)
     idx = np.argmax(np.abs(w), axis=1)
     m = w[np.arange(w.shape[0]), idx][:, None]  # signed max-abs element
     best_err = np.full(w.shape[0], np.inf, np.float64)
@@ -218,8 +227,9 @@ def job(args):
     return name, b"".join(emu), None, stats
 
 
-def init(path):
-    global SRC
+def init(path, weighting="imp-sqrt"):
+    global SRC, WEIGHTING
+    WEIGHTING = weighting
     f = open(path, "rb")
     SRC = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
 
@@ -268,6 +278,7 @@ def main():
     ap.add_argument("--no-router", action="store_true")
     ap.add_argument("--jobs", type=int, default=16)
     ap.add_argument("--stats")
+    ap.add_argument("--weighting", choices=["imp-sqrt", "imp"], default="imp-sqrt")
     a = ap.parse_args()
     m, kv, tensors, order, data = gguf_open(a.src)
     imat = load_imatrix(a.imatrix) if a.imatrix else {}
@@ -292,7 +303,7 @@ def main():
         print(f"copied in {time.time() - t0:.0f} s", flush=True)
         emu = open(a.emulated + ".part", "r+b")
     stats = {}
-    with ProcessPoolExecutor(a.jobs, initializer=init, initargs=(a.src,)) as ex:
+    with ProcessPoolExecutor(a.jobs, initializer=init, initargs=(a.src, a.weighting)) as ex:
         for name, emu_bytes, _, st in ex.map(job, todo):
             dims, tt, off = tensors[name]
             if not a.no_emulated:

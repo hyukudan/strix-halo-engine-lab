@@ -1472,11 +1472,23 @@ void bench_hyper_rows(bool splitk, bool lane, std::uint32_t count, bool cold) {
         return samples[samples.size() / 2U];
     };
     const auto serial = measure(false), rows = measure(true);
+    // Same rows with Q6P32 copies of the (six-bit) down and up tensors registered.
+    std::vector<unsigned char> q6_down(q6p::q6p32_bytes(320U, 10240U)), q6_up(q6p::q6p32_bytes(10240U, 320U));
+    require(q6p::to_q6p32(f.weights[1].original.data(), 320U, 10240U, q6_down.data()) &&
+        q6p::to_q6p32(f.weights[2].original.data(), 10240U, 320U, q6_up.data()), "HC bench weights are not six-bit");
+    const auto q6_down_device = f.owner.allocate(q6_down.size()), q6_up_device = f.owner.allocate(q6_up.size());
+    write(q6_down_device, q6_down); write(q6_up_device, q6_up);
+    q6p::register_tensor(reinterpret_cast<const void*>(f.weights[1].device.address),
+        {reinterpret_cast<const unsigned char*>(q6_down_device.address), 320U, 10240U, q6p::Kind::q6p32});
+    q6p::register_tensor(reinterpret_cast<const void*>(f.weights[2].device.address),
+        {reinterpret_cast<const unsigned char*>(q6_up_device.address), 10240U, 320U, q6p::Kind::q6p32});
+    const auto q6_rows = measure(true);
+    q6p::clear();
     f.owner.finish();
     (void)hipEventDestroy(start); (void)hipEventDestroy(stop);
     std::cout << "hc-rows-bench projection=" << (splitk ? "splitk-f32" : "batched-v8") << " output=" << (lane ? "lane-chain" : "q8-batched")
         << " T=" << count << (cold ? " cold" : " warm") << " serial_us=" << serial << " rows_us=" << rows
-        << " speedup=" << serial / rows << '\n';
+        << " rows_q6p32_us=" << q6_rows << " speedup=" << serial / rows << '\n';
 }
 // Terminal head over real window row views: the configured prefetch R1 head
 // per row is the oracle; device greedy rows land in host-mapped memory.
