@@ -82,7 +82,7 @@ enum class KnownWindowR2Variant : std::uint32_t {
     routed_a8_union_rows4_v1 = 31,
     routed_a8_union_rows8_v1 = 32,
 };
-inline constexpr std::uint32_t known_window_r2_variant_slots = 30;
+inline constexpr std::uint32_t known_window_r2_variant_slots = 33;
 
 struct KnownWindowRequest {
     bool r2_shared_expert = false;
