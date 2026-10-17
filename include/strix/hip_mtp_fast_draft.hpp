@@ -21,6 +21,11 @@ struct HipMtpFastMoeViews {
     std::uint32_t* status=nullptr;     // first-error word; invalid routes set bit 0
 };
 inline constexpr std::uint32_t hip_mtp_fast_moe_workspace_floats=11U*640U+1U;
+// Draft-only Q8_0 GEMV y[rows]=W[rows][width]*x, one wave per row (lanes own
+// 8-column groups, then a wave tree). Input BF16 or F32, output F32 or BF16 RNE.
+// width must be a multiple of 32.
+void launch_hip_mtp_draft_q8_gemv(const void* input,bool input_bf16,const void* q8,std::uint32_t width,
+    std::uint32_t rows,void* output,bool output_bf16,void* stream);
 void launch_hip_mtp_fast_moe(const HipMtpFastMoeViews&,void* stream);
 // Raw exact-path sequences behind the MTP routed/shared launchers (no owner
 // checks), shared with the draft benchmark/fixture. Routed temp needs 3840 floats,

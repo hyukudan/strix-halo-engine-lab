@@ -2585,7 +2585,7 @@ void mtp_moe_range(MtpDeviceView v,std::uint64_t required,unsigned alignment) {
 bool mtp_moe_overlap(MtpDeviceView a,MtpDeviceView b){return a.address<b.address+b.bytes && b.address<a.address+a.bytes;}
 void mtp_moe_prepare(const MtpNativeContext& c) {
     if(!c.model || !c.plan || !c.tensors || !c.resources)throw std::invalid_argument("MTP routed context is incomplete");
-    c.resources->validate();
+    c.resources->validate_stage();
     if(c.model!=&c.resources->model() || c.plan!=&c.resources->plan() || c.tensors!=&c.resources->tensors() ||
        c.position>=c.resources->context_capacity() || c.model->hidden_size!=2560U || c.model->moe_intermediate_size!=640U ||
        c.model->num_experts!=512U || c.model->num_experts_per_token!=10U)

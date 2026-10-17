@@ -92,7 +92,45 @@ __global__ __launch_bounds__(256) void mtp_fast_down(HipMtpFastMoeViews v) {
     sum=wave_sum(sum);
     if(!lane) v.output[row]=to_bf16(sum);
 }
+template<bool InBf16,bool OutBf16>
+__global__ __launch_bounds__(256) void mtp_draft_q8_gemv(const void* input,const unsigned char* q8,std::uint32_t width,
+    std::uint32_t rows,void* output) {
+    const unsigned lane=threadIdx.x%32U,row=blockIdx.x*waves+threadIdx.x/32U;
+    if(row>=rows) return;
+    const auto* r=q8+static_cast<std::uint64_t>(row)*(width/32U)*34U;
+    float sum=0.0F,x[8];
+    for(unsigned base=8U*lane;base<width;base+=256U) {
+        if constexpr(InBf16) {
+            const uint4 bits=*reinterpret_cast<const uint4*>(static_cast<const std::uint16_t*>(input)+base);
+            const unsigned w[4]={bits.x,bits.y,bits.z,bits.w};
+#pragma unroll
+            for(unsigned i=0;i<4;++i) {x[2*i]=__uint_as_float(w[i]<<16U);x[2*i+1]=__uint_as_float(w[i]&0xffff0000U);}
+        } else {
+            const auto* f=static_cast<const float*>(input)+base;
+#pragma unroll
+            for(unsigned i=0;i<8;++i) x[i]=f[i];
+        }
+        sum=q8_dot8(r,base,x,sum);
+    }
+    sum=wave_sum(sum);
+    if(lane) return;
+    if constexpr(OutBf16) static_cast<std::uint16_t*>(output)[row]=to_bf16(sum);
+    else static_cast<float*>(output)[row]=sum;
+}
 } // namespace
+void launch_hip_mtp_draft_q8_gemv(const void* input,bool input_bf16,const void* q8,std::uint32_t width,
+    std::uint32_t rows,void* output,bool output_bf16,void* stream) {
+    if(!input || !q8 || !output || !stream || !rows || !width || width%32U ||
+       reinterpret_cast<std::uintptr_t>(input)%(input_bf16?16U:4U) || reinterpret_cast<std::uintptr_t>(q8)%2U)
+        throw std::invalid_argument("MTP draft Q8 GEMV views are invalid");
+    const auto s=static_cast<hipStream_t>(stream);const dim3 grid((rows+waves-1U)/waves);
+    const auto* w=static_cast<const unsigned char*>(q8);
+    if(input_bf16 && output_bf16) hipLaunchKernelGGL(HIP_KERNEL_NAME(mtp_draft_q8_gemv<true,true>),grid,dim3(256),0,s,input,w,width,rows,output);
+    else if(input_bf16) hipLaunchKernelGGL(HIP_KERNEL_NAME(mtp_draft_q8_gemv<true,false>),grid,dim3(256),0,s,input,w,width,rows,output);
+    else if(output_bf16) hipLaunchKernelGGL(HIP_KERNEL_NAME(mtp_draft_q8_gemv<false,true>),grid,dim3(256),0,s,input,w,width,rows,output);
+    else hipLaunchKernelGGL(HIP_KERNEL_NAME(mtp_draft_q8_gemv<false,false>),grid,dim3(256),0,s,input,w,width,rows,output);
+    check(hipGetLastError(),"MTP draft Q8 GEMV launch");
+}
 void launch_hip_mtp_fast_moe(const HipMtpFastMoeViews& v,void* stream) {
     if(!v.input || !v.routes || !v.route_weights || !v.gate || !v.up || !v.down || !v.shared_gate || !v.shared_up ||
        !v.shared_down || !v.shared_scalar || !v.workspace || !v.output || !v.status || !stream ||

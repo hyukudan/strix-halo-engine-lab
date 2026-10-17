@@ -3,6 +3,7 @@
 // canonical sidecar geometry, plus a per-draft benchmark (--bench).
 #include "strix/hip_mtp_fast_draft.hpp"
 #include "strix/hip_mtp_input_fusion.hpp"
+#include "strix/hip_mtp_attention.hpp"
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 #include <algorithm>
@@ -169,6 +170,35 @@ void fusion_cases(){
         ok("draft input fusion within 2 bf16 ulp of output scale",worst<=scale*std::ldexp(1.0,-7));
     }
 }
+// Attention-shaped Q8 GEMVs: draft wave-per-row against the exact projection and
+// a double reference (BF16 in -> F32 out), and F32 in -> BF16 out against the reference.
+struct Gemv {
+    std::uint32_t width,rows;Device<std::uint8_t> w;Device<std::uint16_t> x;Device<float> xf,exact,fast;Device<std::uint16_t> fast_bf16;hipStream_t s=nullptr;
+    Gemv(std::uint32_t in,std::uint32_t out,std::uint32_t seed):width(in),rows(out),w(static_cast<std::size_t>(out)*in/32*34),x(in),xf(in),exact(out),fast(out),fast_bf16(out){
+        check(hipStreamCreateWithFlags(&s,hipStreamNonBlocking));
+        hipLaunchKernelGGL(fill_q8,dim3(2048),dim3(256),0,s,w.p,static_cast<std::uint64_t>(w.n/34),seed,-9);check(hipStreamSynchronize(s));
+        std::mt19937 g(seed);std::normal_distribution<float> n(0,1);std::vector<std::uint16_t> v(in);std::vector<float> f(in);
+        for(std::uint32_t i=0;i<in;++i){v[i]=bf16(n(g));f[i]=value(v[i]);}x.write(v);xf.write(f);
+    }
+    ~Gemv(){static_cast<void>(hipStreamDestroy(s));}
+};
+void gemv_cases(){
+    for(const auto [in,out]:{std::pair{H,12288U},std::pair{H,512U},std::pair{6144U,H}}){
+        Gemv m(in,out,in+out);
+        strix::enqueue_hip_mtp_attention_q8_linear(m.x.p,m.w.p,in,out,m.exact.p,m.s);
+        strix::launch_hip_mtp_draft_q8_gemv(m.x.p,true,m.w.p,in,out,m.fast.p,false,m.s);
+        strix::launch_hip_mtp_draft_q8_gemv(m.xf.p,false,m.w.p,in,out,m.fast_bf16.p,true,m.s);check(hipStreamSynchronize(m.s));
+        const auto e=m.exact.read(),f=m.fast.read();const auto b=m.fast_bf16.read();
+        const auto weights=host(m.w,0,m.w.n);std::vector<std::uint16_t> xs(in);check(hipMemcpy(xs.data(),m.x.p,in*2,hipMemcpyDeviceToHost));
+        std::vector<double> xd(in);for(std::uint32_t i=0;i<in;++i)xd[i]=value(xs[i]);
+        double scale=0,ee=0,fe=0,be=0;
+        for(std::uint32_t r=0;r<out;++r){const double ref=dot(weights.data()+static_cast<std::size_t>(r)*(in/32*34),xd);scale=std::max(scale,std::abs(ref));
+            ee=std::max(ee,std::abs(e[r]-ref));fe=std::max(fe,std::abs(f[r]-ref));be=std::max(be,std::abs(value(b[r])-ref));}
+        std::printf("gemv %ux%u: |ref|max %.4g exact err %.3g draft err %.3g draft->bf16 err %.3g\n",out,in,scale,ee,fe,be);
+        ok("draft Q8 GEMV F32 within exact error budget",fe<=std::max(2*ee,scale*1e-6));
+        ok("draft Q8 GEMV BF16 output within half a BF16 ulp of scale",be<=scale*std::ldexp(1.0,-8)+fe);
+    }
+}
 double median(std::vector<double> v){std::sort(v.begin(),v.end());return v[v.size()/2];}
 template<class F> double time_gpu(hipStream_t s,F&& body){
     hipEvent_t a,b;check(hipEventCreate(&a));check(hipEventCreate(&b));std::vector<double> t;
@@ -186,7 +216,16 @@ void bench(){
     Fusion f;
     const double fe=time_gpu(f.s,[&]{strix::launch_hip_mtp_input_fusion(f.request(f.out_exact,strix::HipMtpInputRounding::bf16_rne),f.s);});
     const double ff=time_gpu(f.s,[&]{strix::launch_hip_mtp_input_fusion_draft(f.request(f.out_fast,strix::HipMtpInputRounding::bf16_rne),f.s);});
+    Gemv q(H,12288U,1),kv(H,512U,2),o(6144U,H,3);
+    const double qe=time_gpu(q.s,[&]{strix::enqueue_hip_mtp_attention_q8_linear(q.x.p,q.w.p,H,12288U,q.exact.p,q.s);
+        strix::enqueue_hip_mtp_attention_q8_linear(kv.x.p,kv.w.p,H,512U,kv.exact.p,q.s);strix::enqueue_hip_mtp_attention_q8_linear(kv.x.p,kv.w.p,H,512U,kv.exact.p,q.s);
+        strix::enqueue_hip_mtp_attention_q8_linear(o.x.p,o.w.p,6144U,H,o.exact.p,q.s);});
+    const double qf=time_gpu(q.s,[&]{strix::launch_hip_mtp_draft_q8_gemv(q.x.p,true,q.w.p,H,12288U,q.fast.p,false,q.s);
+        strix::launch_hip_mtp_draft_q8_gemv(kv.x.p,true,kv.w.p,H,512U,kv.fast.p,false,q.s);strix::launch_hip_mtp_draft_q8_gemv(kv.x.p,true,kv.w.p,H,512U,kv.fast.p,false,q.s);
+        strix::launch_hip_mtp_draft_q8_gemv(o.xf.p,false,o.w.p,6144U,H,o.fast_bf16.p,true,q.s);});
     std::printf("bench per draft, GPU median of 30 (ms)\n");
+    std::printf("  attention Q8 q/k/v/out exact block-per-row kernel        %.4f\n",qe);
+    std::printf("  attention Q8 q/k/v/out draft wave-per-row GEMV           %.4f\n",qf);
     std::printf("  MoE exact (shared 5 + routed 42 + combine 1 launches)  %.4f\n",exact);
     std::printf("  MoE fast  (2 launches)                                 %.4f\n",fast);
     std::printf("  input fusion exact (3 launches)                        %.4f\n",fe);
@@ -197,6 +236,6 @@ int main(int argc,char** argv){
     try{
         int devices=0;if(hipGetDeviceCount(&devices)!=hipSuccess||!devices){std::cout<<"skip: no HIP device\n";return 77;}
         if(argc>1&&std::string(argv[1])=="--bench"){bench();return 0;}
-        fusion_cases();moe_cases();std::cout<<"passed "<<passed<<"\n";return 0;
+        fusion_cases();gemv_cases();moe_cases();std::cout<<"passed "<<passed<<"\n";return 0;
     }catch(const std::exception& e){std::cerr<<e.what()<<"\n";return 1;}
 }

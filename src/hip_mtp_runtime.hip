@@ -345,7 +345,8 @@ struct HipMtpRuntime::Impl {
                 if(draft_exact) launch_hip_mtp_input_fusion(fusion(),stream);
                 else launch_hip_mtp_input_fusion_draft(fusion(),stream);
                 launch_hip_mtp_hyper_mix(c,MtpHyperRole::attention,stream);
-                launch_hip_mtp_indexer(c,stream);launch_hip_mtp_sparse_attention(c,stream);
+                launch_hip_mtp_indexer(c,stream);
+                if(draft_exact) launch_hip_mtp_sparse_attention(c,stream); else launch_hip_mtp_sparse_attention_draft(c,stream);
                 launch_hip_mtp_inject(c,MtpInjectRole::attention,stream);launch_hip_mtp_hyper_mix(c,MtpHyperRole::mlp,stream);
                 launch_hip_mtp_route(c,stream);
                 if(draft_exact) {

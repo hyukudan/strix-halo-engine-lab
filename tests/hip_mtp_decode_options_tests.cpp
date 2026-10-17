@@ -201,6 +201,15 @@ int main(){try{
     reject([]{auto a=request();a.insert(a.end(),{"--mtp-draft-chain","--mtp-draft-chain"});return a;}(),"duplicate draft chain rejected");
     reject([]{auto a=request();a.push_back("--mtp-draft-chain=1");return a;}(),"draft chain takes no value");
     reject({"decoder","target.gguf","1","--mtp-draft-chain"},"draft chain cannot select MTP");
+    require(!subset.mtp.draft_exact && !subset.mtp.draft_q4,"draft chain defaults to fast kernels and the Q8 head");
+    chain.insert(chain.end(),{"--mtp-draft-exact","--mtp-draft-q4"});
+    const auto variants=parse(chain);
+    require(variants.mtp.draft_exact && variants.mtp.draft_q4,"draft exact/Q4 flags parse");
+    reject_as([]{auto a=request();a.push_back("--mtp-draft-exact");return a;}(),
+        "MTP draft vocabulary options require --mtp-draft-chain","draft exact requires the chain");
+    reject_as([]{auto a=request();a.insert(a.end(),{"--mtp-draft-chain","--mtp-draft-q4"});return a;}(),
+        "MTP draft Q4 head requires a draft vocabulary subset","Q4 head requires a subset");
+    reject([]{auto a=request();a.insert(a.end(),{"--mtp-draft-chain","--mtp-draft-exact","--mtp-draft-exact"});return a;}(),"duplicate draft exact rejected");
     auto metadata=request();
     for(const auto* key:{"--mtp-golden","--mtp-golden-sha256"}){
         for(auto it=metadata.begin();it!=metadata.end();++it)if(*it==key){metadata.erase(it,it+2);break;}
