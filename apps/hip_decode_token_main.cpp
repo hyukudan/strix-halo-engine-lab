@@ -2180,9 +2180,11 @@ int STRIX_DECODE_ENTRY(
             // It retains all serial parents and its separate D1/arena ownership.
             make_window = [&, parents](std::shared_ptr<strix::HipMtpTargetHidden> target) {
                 const auto plan = strix::compile_known_prefix_window(model, compiled, manifest, tensor_access,
-                    {true, true, true, options.mtp.window_rows, options.mtp.window_expert_union, strix::KnownWindowOutputPolicy::all_rows});
+                    {true, true, true, options.mtp.window_rows, options.mtp.window_expert_union, strix::KnownWindowOutputPolicy::all_rows,
+                     options.mtp.window_hyper_mix});
                 if (!strix::known_window_has_promoted_steps(plan) ||
-                    (options.mtp.window_expert_union && !plan.routed_expert_union_steps))
+                    (options.mtp.window_expert_union && !plan.routed_expert_union_steps) ||
+                    (options.mtp.window_hyper_mix && !plan.hyper_mix_rows_steps))
                     throw std::invalid_argument("MTP target window has no admitted requested operators");
                 std::uint64_t union_bytes = 0;
                 if (options.mtp.window_expert_union) {

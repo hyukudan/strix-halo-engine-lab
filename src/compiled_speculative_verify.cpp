@@ -503,6 +503,26 @@ bool window_routed_union_types(const ModelManifest& manifest, const ExecutionTen
     }
     return eligible;
 }
+// Typed prefetched Q8 HC selection, optional split-K FP32 projection and lane-chain output.
+bool known_hyper_rows_id(std::string_view id) {
+    constexpr std::string_view base="hip.hyper_mix.bf16.h2560.hc4.lr320.r1.c1.parallel.staged.fused-injection-v5"
+        ".typed-q8-f32-v1.prefetch-rows8-v2.prefetch-q8-output-v1";
+    if(!id.starts_with(base)) return false;
+    id.remove_prefix(base.size());
+    if(id.starts_with(".splitk-hc-proj-fp32-v1")) id.remove_prefix(std::string_view(".splitk-hc-proj-fp32-v1").size());
+    return id.empty() || id==lane_chain_hyper_output_suffix;
+}
+bool hyper_mix_op(SerialOp op) {
+    return op==SerialOp::attn_hyper_mix || op==SerialOp::mlp_hyper_mix || op==SerialOp::final_hyper_mix;
+}
+KnownWindowR2Variant hyper_rows_variant(std::uint32_t rows) {
+    return rows==2U?KnownWindowR2Variant::hyper_mix_rows2_v1:
+        rows==4U?KnownWindowR2Variant::hyper_mix_rows4_v1:KnownWindowR2Variant::hyper_mix_rows8_v1;
+}
+// Q8 down + Q8 up (+ F32 injection) per mixer, read once per window instead of per row.
+std::uint64_t known_hyper_projection_bytes(SerialOp op) {
+    return 2ULL*(10240ULL/32ULL*34ULL*320ULL) + (op==SerialOp::final_hyper_mix ? 0ULL : 10240ULL*4ULL*4ULL);
+}
 KnownWindowR2Variant routed_union_variant(std::uint32_t rows) {
     return rows==2U?KnownWindowR2Variant::routed_q51_union_rows2_v1:
         rows==4U?KnownWindowR2Variant::routed_q51_union_rows4_v1:KnownWindowR2Variant::routed_q51_union_rows8_v1;
@@ -589,7 +609,7 @@ std::pair<std::uint64_t, std::uint64_t> known_window_identities(
     auto kernel = fnv_offset; window_hash_text(kernel, window.logical_rows==2U ? "known-window-r2-kernels-v1" : "known-window-rows-kernels-v1");
     if(window.logical_rows!=2U) hash_u64(kernel,window.logical_rows);
     hash_u64(kernel, serial.kernel_plan_identity); hash_u64(kernel, window.mode.size());
-    std::uint32_t r2 = 0, loops = 0, runtime = 0, shared_rows = 0, gdn_rows = 0, routed_union=0;
+    std::uint32_t r2 = 0, loops = 0, runtime = 0, shared_rows = 0, gdn_rows = 0, routed_union=0, hyper_rows=0;
     std::uint64_t avoided = 0;
     std::uint32_t launches = 0;
     for (std::size_t i = 0; i < window.mode.size(); ++i) {
@@ -624,6 +644,11 @@ std::pair<std::uint64_t, std::uint64_t> known_window_identities(
             ++routed_union;
             // Routes are device results. No static weight-byte or launch-saving
             // claim is inferred before the actual union has been constructed.
+        } else if (mode==KnownWindowStepMode::hyper_mix_rows) {
+            window_require(hyper_mix_op(step.op) && binding.kernel_id && known_hyper_rows_id(*binding.kernel_id) &&
+                variant==hyper_rows_variant(window.logical_rows), "known window HC rows variant/source ID mismatch");
+            ++hyper_rows; avoided+=known_hyper_projection_bytes(step.op)*(window.logical_rows-1U);
+            launches+=2U*(window.logical_rows-1U);
         } else if (mode == KnownWindowStepMode::r2_gdn_staged) {
             window_require(step.op == SerialOp::gated_delta_net &&
                 (variant == KnownWindowR2Variant::gdn_q8_virtual256_r2_v1 ||
@@ -642,7 +667,7 @@ std::pair<std::uint64_t, std::uint64_t> known_window_identities(
     }
     window_require(r2 == window.r2_steps && loops == window.row_loop_steps && runtime == window.runtime_row_steps &&
         shared_rows==window.shared_rows_steps && gdn_rows==window.gdn_rows_steps &&
-        routed_union==window.routed_expert_union_steps,
+        routed_union==window.routed_expert_union_steps && hyper_rows==window.hyper_mix_rows_steps,
         "known window counters do not match its actual mode table");
     window_require(avoided == window.logical_projection_weight_bytes_avoided &&
         launches == window.projection_launches_saved,
@@ -759,11 +784,18 @@ CompiledKnownPrefixWindow compile_known_prefix_window(
             output.mode[i]=KnownWindowStepMode::routed_expert_union;
             output.r2_variant[i]=routed_union_variant(output.logical_rows);
         }
+        if(request.rows_hyper_mix && hyper_mix_op(step.op) && binding.kernel_id && known_hyper_rows_id(*binding.kernel_id)) {
+            output.mode[i]=KnownWindowStepMode::hyper_mix_rows;
+            output.r2_variant[i]=hyper_rows_variant(output.logical_rows);
+            output.logical_projection_weight_bytes_avoided+=known_hyper_projection_bytes(step.op)*(output.logical_rows-1U);
+            output.projection_launches_saved+=2U*(output.logical_rows-1U);
+        }
         if (output.mode[i] == KnownWindowStepMode::r1_row_loop) {
             ++output.row_loop_steps; if (binding.host_or_runtime_step) ++output.runtime_row_steps;
         } else if(output.mode[i]==KnownWindowStepMode::shared_rows) ++output.shared_rows_steps;
         else if(output.mode[i]==KnownWindowStepMode::gdn_rows) ++output.gdn_rows_steps;
         else if(output.mode[i]==KnownWindowStepMode::routed_expert_union) ++output.routed_expert_union_steps;
+        else if(output.mode[i]==KnownWindowStepMode::hyper_mix_rows) ++output.hyper_mix_rows_steps;
         else ++output.r2_steps;
     }
     const auto identities = known_window_identities(output, serial);

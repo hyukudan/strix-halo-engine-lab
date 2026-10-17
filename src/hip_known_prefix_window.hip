@@ -2,6 +2,8 @@
 #include "strix/hip_mtp_target_window.hpp"
 
 #include "strix/deferred_moe_status.hpp"
+#include "strix/hip_hyper_mix_launcher.hpp"
+#include "strix/lane_chain_hyper_output.hpp"
 #include "strix/hip_setup_quiescence.hpp"
 #include "strix/prepared_tensor_views.hpp"
 
@@ -96,6 +98,7 @@ struct HipKnownPrefixWindow::Impl {
     HipSharedExpertLauncherConfig shared_config, shared_fallback;
     HipGdnLauncherConfig gdn_config;
     HipMoeExpertsLauncherConfig routed_config;
+    HipHyperMixLauncherConfig hyper_config, hyper_fallback;
     q51_known_rows::Workspace routed_workspace;
     q51_known_rows::Summary pending_union_summary;
     std::uint32_t last_union_layer = 0;
@@ -174,6 +177,7 @@ struct HipKnownPrefixWindow::Impl {
         setup_r2();
         setup_rows();
         setup_routed_union();
+        setup_hyper_rows();
         // Setup only: no execution callback clears or reads this record before
         // all deep admission. Exclusive status ownership preserves zero across
         // successful calls; any exception disables the owner permanently.
@@ -342,6 +346,34 @@ struct HipKnownPrefixWindow::Impl {
                 moe_experts_known_window_rows_launch(rows,self.routed_config,self.routed_workspace);
             }});
     }
+    const HipHyperMixLauncherConfig& hyper_for(std::span<const ExecutionDispatchContext> rows) const {
+        if (!rows[0].kernel_id) throw std::invalid_argument("known-window HC row has no serial kernel id");
+        return rows[0].kernel_id->ends_with(lane_chain_hyper_output_suffix) ? hyper_config : hyper_fallback;
+    }
+    void setup_hyper_rows() {
+        if(!window.hyper_mix_rows_steps) return;
+        hyper_config.hidden_size=u32(model.hidden_size); hyper_config.hc_count=u32(model.hc_count);
+        hyper_config.lowrank=u32(model.hc_lowrank); hyper_config.rms_epsilon=static_cast<float>(model.rms_norm_epsilon);
+        hyper_config.activation=config.activation; hyper_config.parallel=config.parallel_hyper_mix;
+        hyper_config.staged_projections=config.staged_hyper_projections; hyper_config.fused_injection=config.fused_staged_hyper_mix;
+        hyper_config.typed_projection=config.typed_hyper_projection; hyper_config.prefetch_rows=config.prefetch_typed_hyper_rows;
+        hyper_config.prefetch_q8_output=config.prefetch_q8_hyper_output; hyper_config.lane_chain_output=config.lane_chain_hyper_output;
+        hyper_config.splitk_projection=config.splitk_hyper_projection; hyper_config.splitk_projection_fp64=config.splitk_hyper_projection_fp64;
+        hyper_config.splitk_deferred_norm=config.splitk_deferred_norm;
+        hyper_config.prefetch_hc_projection_next_tile=config.prefetch_hc_projection_next_tile;
+        hyper_config.arithmetic_stats=config.arithmetic_stats;
+        hyper_fallback=hyper_config; hyper_fallback.lane_chain_output=false;
+        rows_entries.push_back({window.logical_rows==2U?KnownWindowR2Variant::hyper_mix_rows2_v1:
+            window.logical_rows==4U?KnownWindowR2Variant::hyper_mix_rows4_v1:KnownWindowR2Variant::hyper_mix_rows8_v1,this,
+            [](std::span<const ExecutionDispatchContext> rows,void* object) {
+                const auto& self=*static_cast<Impl*>(object);
+                hyper_mix_known_window_rows_preflight(rows,self.hyper_for(rows));
+            },
+            [](std::span<const ExecutionDispatchContext> rows,void* object) {
+                const auto& self=*static_cast<Impl*>(object);
+                hyper_mix_known_window_rows_launch(rows,self.hyper_for(rows));
+            }});
+    }
     void complete() {
         guard.require_original();
         if(window.routed_expert_union_steps)
@@ -396,6 +428,9 @@ struct HipKnownPrefixWindow::Impl {
         case KnownWindowR2Variant::routed_q51_union_rows2_v1:
         case KnownWindowR2Variant::routed_q51_union_rows4_v1:
         case KnownWindowR2Variant::routed_q51_union_rows8_v1: recipe="hip-routed-known-q4ka8-q51-union-dot-orderedslot-v1";break;
+        case KnownWindowR2Variant::hyper_mix_rows2_v1:
+        case KnownWindowR2Variant::hyper_mix_rows4_v1:
+        case KnownWindowR2Variant::hyper_mix_rows8_v1: recipe="hip-hc-known-rows-typed-q8-r1-ordered-v1";break;
         default:throw std::invalid_argument("known-window capture has no closed native recipe");
         }
         return capture_identity(recipe,static_cast<std::uint32_t>(variant));

@@ -26,6 +26,7 @@ enum class KnownWindowStepMode : std::uint8_t {
     shared_rows,
     gdn_rows,
     routed_expert_union,
+    hyper_mix_rows,
 };
 
 // Closed implementation table. These values identify window entries; they do
@@ -43,8 +44,12 @@ enum class KnownWindowR2Variant : std::uint32_t {
     routed_q51_union_rows2_v1 = 8,
     routed_q51_union_rows4_v1 = 9,
     routed_q51_union_rows8_v1 = 10,
+    // attn/mlp/final HC: typed prefetched Q8 path, R1 order per row.
+    hyper_mix_rows2_v1 = 11,
+    hyper_mix_rows4_v1 = 12,
+    hyper_mix_rows8_v1 = 13,
 };
-inline constexpr std::uint32_t known_window_r2_variant_slots = 11;
+inline constexpr std::uint32_t known_window_r2_variant_slots = 14;
 
 struct KnownWindowRequest {
     bool r2_shared_expert = false;
@@ -56,6 +61,8 @@ struct KnownWindowRequest {
     // Explicit grouped Q5_1 down candidate; unmatched formats retain R1.
     bool routed_expert_union = false;
     KnownWindowOutputPolicy output_policy = KnownWindowOutputPolicy::all_rows;
+    // Multi-row HC mixers for the typed prefetched Q8 serial selection; others retain R1.
+    bool rows_hyper_mix = false;
 };
 
 struct CompiledKnownPrefixWindow {
@@ -83,6 +90,7 @@ struct CompiledKnownPrefixWindow {
     std::uint32_t shared_rows_steps = 0;
     std::uint32_t gdn_rows_steps = 0;
     std::uint32_t routed_expert_union_steps = 0;
+    std::uint32_t hyper_mix_rows_steps = 0;
     KnownWindowOutputPolicy output_policy = KnownWindowOutputPolicy::all_rows;
     // Compact result.logits entries correspond to these original source rows.
     std::vector<std::uint32_t> logit_row_indices;
@@ -91,7 +99,8 @@ struct CompiledKnownPrefixWindow {
 // Complete wide entries do not contribute to the legacy paired-step counter.
 // Admission must cover every closed mode without adding counters that could overflow.
 [[nodiscard]] inline bool known_window_has_promoted_steps(const CompiledKnownPrefixWindow& window) noexcept {
-    return window.r2_steps || window.shared_rows_steps || window.gdn_rows_steps || window.routed_expert_union_steps;
+    return window.r2_steps || window.shared_rows_steps || window.gdn_rows_steps || window.routed_expert_union_steps ||
+        window.hyper_mix_rows_steps;
 }
 
 [[nodiscard]] CompiledKnownPrefixWindow compile_known_prefix_window(

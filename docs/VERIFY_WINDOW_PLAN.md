@@ -66,6 +66,9 @@ so greedy acceptance is exact.
 - KP1 MoE union: parallel device CSR/plan build (replace the single-thread kernel), fast grouped
   down (Q5_1 / Q8_0 A8) and gate/up (Q4K/Q5K A8G32) for T = 2,4,8.
 - KP2 HC multi-row: typed hyper projection + lane-chain output + prepare norm for T rows.
+  Status: `hyper_mix_known_window_rows_*` (mode `hyper_mix_rows`, variants `hyper_mix_rows{2,4,8}_v1`,
+  request `rows_hyper_mix`, CLI `--mtp-window-hyper-mix`) covers the typed prefetched Q8 selection with split-K FP32
+  or v8 projection and lane-chain or Q8 batched output; component bit-exactness only, no model-level gate yet.
 - KP3 LM head multi-column + per-row device argmax to mapped memory.
 - KP4 GDN window (read-only state, saved inputs) + commit replay kernel.
 - KP5 QSA multi-row (append-all-then-attend) + indexer tail snapshot/commit.
