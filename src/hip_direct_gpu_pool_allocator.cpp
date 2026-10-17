@@ -76,7 +76,9 @@ struct HipDirectGpuPoolAllocator::Impl {
 HipDirectGpuPoolAllocator::HipDirectGpuPoolAllocator(DirectGpuExportDevice device, HipDirectGpuPoolPolicy policy, HipDirectGpuPoolCalls calls)
     : impl_(std::make_unique<Impl>(device, policy, std::move(calls))) {
     if (!policy.experimental_opt_in || policy.maximum_gpu_bytes == 0 || policy.maximum_gpu_bytes > 128ULL * 1024ULL * 1024ULL ||
-        policy.maximum_alignment == 0 || policy.maximum_alignment > 4096 || device.index < 0 ||
+        policy.maximum_alignment == 0 || policy.maximum_alignment > 4096 ||
+        policy.allocation_quantum == 0 || policy.allocation_quantum > policy.maximum_gpu_bytes ||
+        (policy.allocation_quantum & (policy.allocation_quantum - 1)) != 0 || device.index < 0 ||
         device.runtime_version <= 0 || device.driver_version <= 0 ||
         !std::any_of(device.uuid.begin(), device.uuid.end(), [](auto byte) { return byte != 0; }) ||
         !impl_->calls.allocate_with_flags || !impl_->calls.free_allocation) {
@@ -89,7 +91,13 @@ HipDirectGpuPoolAllocator::~HipDirectGpuPoolAllocator() {
 }
 std::uintptr_t HipDirectGpuPoolAllocator::allocate_device(std::uint64_t bytes, std::uint64_t alignment) {
     if (impl_->failed) throw std::logic_error("uncached transport allocator is failed");
-    const auto total = HipRuntimeAllocator::checked_total(bytes, alignment);
+    // Request the operator-selected backing quantum without treating it as
+    // proof of the native extent. Inspect and charge the actual extent below.
+    const auto allocation_quantum = impl_->policy.allocation_quantum;
+    const auto padded = HipRuntimeAllocator::checked_total(bytes, alignment);
+    if (padded > std::numeric_limits<std::uint64_t>::max() - (allocation_quantum - 1))
+        throw std::length_error("uncached transport allocation rounding overflows");
+    const auto total = (padded + allocation_quantum - 1) & ~(allocation_quantum - 1);
     const auto retained = impl_->bytes();
     if (alignment > impl_->policy.maximum_alignment || total > std::numeric_limits<std::size_t>::max() ||
         retained > impl_->policy.maximum_gpu_bytes || total > impl_->policy.maximum_gpu_bytes - retained) throw std::length_error("uncached transport allocation exceeds admitted bytes/alignment");
