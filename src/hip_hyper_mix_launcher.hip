@@ -2144,6 +2144,15 @@ template <typename T> __device__ __forceinline__ T* wide_row(T* base, std::uint6
 // Split-K lane tree over N partials at once: level d pairs lanes l and l ^ d exactly like the
 // window xor reduction, each lane keeping half of the values. Afterwards lane l holds the
 // N / 32 sums of partials wide_tree_first(l) + i.
+// Lane l ^ D's value (wave32): DPP row_xmask inside 16-lane rows, permlanex16 across them.
+template <unsigned D> __device__ __forceinline__ float wide_xor(float value) {
+    const int bits = __float_as_int(value);
+    if constexpr (D == 16U) {
+        const auto u = static_cast<unsigned>(bits);
+        return __uint_as_float(__builtin_amdgcn_permlanex16(u, u, 0x76543210U, 0xfedcba98U, false, false));
+    }
+    else return __int_as_float(__builtin_amdgcn_mov_dpp(bits, 0x160 + static_cast<int>(D), 0xf, 0xf, false));
+}
 template <unsigned N, unsigned Level = 0U>
 __device__ __forceinline__ void wide_lane_tree(float (&v)[N], unsigned lane) {
     static_assert(N >= 32U && (N & (N - 1U)) == 0U);
@@ -2153,7 +2162,7 @@ __device__ __forceinline__ void wide_lane_tree(float (&v)[N], unsigned lane) {
     for (unsigned i = 0; i < half; ++i) {
         const float keep = high ? v[i + half] : v[i];
         const float send = high ? v[i] : v[i + half];
-        v[i] = keep + __shfl_xor(send, static_cast<int>(d), 32);
+        v[i] = keep + wide_xor<d>(send);
     }
     if constexpr (Level < 4U) wide_lane_tree<N, Level + 1U>(v, lane);
 }
@@ -2168,12 +2177,12 @@ template <unsigned N> __device__ __forceinline__ unsigned wide_tree_first(unsign
 // row, lane l the window lane-l chain of each 640-feature tile (s, then j order), tile k's
 // partials go through the lane tree and are added to the running total in k order. The
 // 128-feature input chunks of the block rows are staged once in LDS for all waves.
-constexpr unsigned kWideProjectionWaves = 8U, kWideProjectionOutputs = 4U;
-template <unsigned Rows, bool Injection>
+constexpr unsigned kWideProjectionOutputs = 4U;
+template <unsigned Rows, unsigned Waves, bool Injection>
 __device__ __forceinline__ void wide_splitk_projection_body(const HyperWideRows& rows,
     const void* __restrict__ weights, unsigned streams, unsigned first, unsigned valid, float4 (*xs)[Rows][32]) {
     constexpr unsigned O = kWideProjectionOutputs, N = Rows * O, Chunks = 80U;
-    constexpr unsigned Staged = Rows * 32U / (32U * kWideProjectionWaves);
+    constexpr unsigned Staged = Rows * 32U / (32U * Waves);
     const unsigned lane = threadIdx.x % 32U, row0 = blockIdx.y * Rows;
     const auto x_at = [&](unsigned chunk, unsigned index) {
         const unsigned t = index / 32U, l = index % 32U;
@@ -2208,7 +2217,7 @@ __device__ __forceinline__ void wide_splitk_projection_body(const HyperWideRows&
     for (unsigned i = 0; i < N / 32U; ++i) total[i] = 0.0F;
 #pragma unroll
     for (unsigned m = 0; m < Staged; ++m) {
-        const unsigned index = threadIdx.x + m * 32U * kWideProjectionWaves;
+        const unsigned index = threadIdx.x + m * 32U * Waves;
         xs[0][index / 32U][index % 32U] = x_at(0U, index);
     }
     if (valid) load_weights(0U);
@@ -2217,7 +2226,7 @@ __device__ __forceinline__ void wide_splitk_projection_body(const HyperWideRows&
         float4 next[Staged];
         if (chunk + 1U < Chunks) {
 #pragma unroll
-            for (unsigned m = 0; m < Staged; ++m) next[m] = x_at(chunk + 1U, threadIdx.x + m * 32U * kWideProjectionWaves);
+            for (unsigned m = 0; m < Staged; ++m) next[m] = x_at(chunk + 1U, threadIdx.x + m * 32U * Waves);
         }
         if (valid) {
             float coefficient[O][4];
@@ -2256,7 +2265,7 @@ __device__ __forceinline__ void wide_splitk_projection_body(const HyperWideRows&
         if (chunk + 1U < Chunks) {
 #pragma unroll
             for (unsigned m = 0; m < Staged; ++m) {
-                const unsigned index = threadIdx.x + m * 32U * kWideProjectionWaves;
+                const unsigned index = threadIdx.x + m * 32U * Waves;
                 xs[(chunk + 1U) & 1U][index / 32U][index % 32U] = next[m];
             }
         }
@@ -2274,49 +2283,43 @@ __device__ __forceinline__ void wide_splitk_projection_body(const HyperWideRows&
     }
 }
 
-template <unsigned Rows>
-__global__ __launch_bounds__(256) void wide_splitk_hyper_projection_kernel(HyperWideRows rows,
+template <unsigned Rows, unsigned Waves>
+__global__ __launch_bounds__(32U * Waves) void wide_splitk_hyper_projection_kernel(HyperWideRows rows,
     const void* __restrict__ down, unsigned streams, unsigned rank, const void* __restrict__ inject, unsigned low_blocks) {
     __shared__ float4 xs[2][Rows][32];
     const unsigned wave = threadIdx.x / 32U;
     const bool is_inject = blockIdx.x >= low_blocks;
-    const unsigned first = (is_inject ? 0U : blockIdx.x * kWideProjectionWaves * kWideProjectionOutputs) + wave * kWideProjectionOutputs;
+    const unsigned first = (is_inject ? 0U : blockIdx.x * Waves * kWideProjectionOutputs) + wave * kWideProjectionOutputs;
     const unsigned total = is_inject ? streams : rank;
     const unsigned valid = first < total ? (total - first < kWideProjectionOutputs ? total - first : kWideProjectionOutputs) : 0U;
-    if (is_inject) wide_splitk_projection_body<Rows, true>(rows, inject, streams, first, valid, xs);
-    else wide_splitk_projection_body<Rows, false>(rows, down, streams, first, valid, xs);
+    if (is_inject) wide_splitk_projection_body<Rows, Waves, true>(rows, inject, streams, first, valid, xs);
+    else wide_splitk_projection_body<Rows, Waves, false>(rows, down, streams, first, valid, xs);
 }
 
-// Rank-320 lane chain over Rows rows per block: lane = output feature of one stream wave,
-// accumulators = rows. Each 32-code Q8 block is decoded once for all rows; the rows' low
-// values of that block sit in LDS (index-major, so one broadcast read serves four rows).
-// Same chain (block, then code order), coefficient expression and stream mix as the window kernel.
-constexpr unsigned kWideOutputWaves = 8U;
+// Rank-320 lane chain over Rows rows per block: lane = one output feature with the chains of all
+// its streams, accumulators = streams x rows. Each 32-code Q8 block is decoded once for all rows;
+// the rows' low values of that block sit in LDS (index-major, one broadcast read serves four rows
+// of every stream). Same chain (block, then code order), coefficient expression and stream mix
+// (in the lane, stream order) as the window kernel.
+constexpr unsigned kWideOutputWaves = 4U, kWideStreams = 4U;
 template <typename Storage, unsigned Rows>
-__global__ __launch_bounds__(256) void wide_lane_chain_hyper_output_kernel(HyperWideRows rows, const void* __restrict__ up,
-    std::uint32_t hidden, std::uint32_t streams) {
-    constexpr unsigned kBlocks = 10U, kRowBytes = kBlocks * 34U, Pitch = Rows + 4U, Staged = Rows * 32U / (32U * kWideOutputWaves);
+__global__ __launch_bounds__(128) void wide_lane_chain_hyper_output_kernel(HyperWideRows rows, const void* __restrict__ up,
+    std::uint32_t hidden) {
+    constexpr unsigned kBlocks = 10U, kRowBytes = kBlocks * 34U, Pitch = Rows + 4U, S = kWideStreams;
+    constexpr unsigned Staged = Rows * 32U / (32U * kWideOutputWaves);
     __shared__ __align__(16) float lows[2][32][Pitch];
-    __shared__ float sig[Rows][kWideOutputWaves][32];
-    const unsigned lane = threadIdx.x % 32U, wave = threadIdx.x / 32U, stream = wave % streams, group = wave / streams;
-    const unsigned groups = kWideOutputWaves / streams, row0 = blockIdx.y * Rows;
-    const std::uint64_t feature = static_cast<std::uint64_t>(blockIdx.x) * 32U * groups + group * 32U + lane;
-    const auto* row = static_cast<const unsigned char*>(up) + (static_cast<std::uint64_t>(stream) * hidden + feature) * kRowBytes;
+    const unsigned lane = threadIdx.x % 32U, wave = threadIdx.x / 32U, row0 = blockIdx.y * Rows;
+    const std::uint64_t feature = (static_cast<std::uint64_t>(blockIdx.x) * kWideOutputWaves + wave) * 32U + lane;
+    const auto* up_rows = static_cast<const unsigned char*>(up) + feature * kRowBytes;
     const auto low_at = [&](unsigned block, unsigned index) {
         const unsigned t = index / 32U, k = index % 32U;
         return row0 + t < rows.count ? wide_row(rows.normalized, rows.normalized_stride, row0 + t)[10240U + block * 32U + k] : 0.0F;
     };
-    // Block b's 34 bytes from the dword-aligned 36 around them (b * 34 % 4 is 0 or 2, the same for every lane).
-    const auto load_block = [&](unsigned block, unsigned (&words)[9]) {
-        const auto* aligned = reinterpret_cast<const unsigned*>(row + block * 34U - (block % 2U) * 2U);
+    float gate[S][Rows];
 #pragma unroll
-        for (unsigned n = 0; n < 9U; ++n) words[n] = aligned[n];
-    };
-    float gate[Rows];
+    for (unsigned s = 0; s < S; ++s)
 #pragma unroll
-    for (unsigned t = 0; t < Rows; ++t) gate[t] = 0.0F;
-    unsigned words[9];
-    load_block(0U, words);
+        for (unsigned t = 0; t < Rows; ++t) gate[s][t] = 0.0F;
 #pragma unroll
     for (unsigned m = 0; m < Staged; ++m) {
         const unsigned index = threadIdx.x + m * 32U * kWideOutputWaves;
@@ -2324,16 +2327,24 @@ __global__ __launch_bounds__(256) void wide_lane_chain_hyper_output_kernel(Hyper
     }
     __syncthreads();
     for (unsigned block = 0; block < kBlocks; ++block) {
-        // Block bytes 0-1 hold the scale, bytes 2-33 the codes; codes[m] = codes 4m .. 4m + 3.
+        // Block b's 34 bytes from the dword-aligned 36 around them (b * 34 % 4 is 0 or 2, the same for every lane):
+        // bytes 0-1 hold the scale, bytes 2-33 the codes; codes[s][m] = codes 4m .. 4m + 3 of stream s.
         const bool odd = block % 2U;
-        const auto scale_bits = static_cast<unsigned short>(odd ? words[0] >> 16U : words[0] & 0xffffU);
-        const float scale = __half2float(__ushort_as_half(scale_bits));
-        unsigned codes[8];
+        float scale[S];
+        unsigned codes[S][8];
 #pragma unroll
-        for (unsigned m = 0; m < 8U; ++m) codes[m] = odd ? words[m + 1U] : __builtin_amdgcn_alignbyte(words[m + 1U], words[m], 2U);
+        for (unsigned s = 0; s < S; ++s) {
+            const auto* aligned = reinterpret_cast<const unsigned*>(up_rows + static_cast<std::uint64_t>(s) * hidden * kRowBytes +
+                block * 34U - (odd ? 2U : 0U));
+            unsigned words[9];
+#pragma unroll
+            for (unsigned n = 0; n < 9U; ++n) words[n] = aligned[n];
+            scale[s] = __half2float(__ushort_as_half(static_cast<unsigned short>(odd ? words[0] >> 16U : words[0] & 0xffffU)));
+#pragma unroll
+            for (unsigned m = 0; m < 8U; ++m) codes[s][m] = odd ? words[m + 1U] : __builtin_amdgcn_alignbyte(words[m + 1U], words[m], 2U);
+        }
         float next[Staged];
         if (block + 1U < kBlocks) {
-            load_block(block + 1U, words);
 #pragma unroll
             for (unsigned m = 0; m < Staged; ++m) next[m] = low_at(block + 1U, threadIdx.x + m * 32U * kWideOutputWaves);
         }
@@ -2342,19 +2353,29 @@ __global__ __launch_bounds__(256) void wide_lane_chain_hyper_output_kernel(Hyper
         // block front-loads all of its LDS reads and spills.
 #pragma unroll 1
         for (unsigned m = 0; m < 8U; ++m) {
-            const unsigned four = codes[0];
+            unsigned four[S];
 #pragma unroll
-            for (unsigned n = 0; n < 7U; ++n) codes[n] = codes[n + 1U];
+            for (unsigned s = 0; s < S; ++s) {
+                four[s] = codes[s][0];
+#pragma unroll
+                for (unsigned n = 0; n < 7U; ++n) codes[s][n] = codes[s][n + 1U];
+            }
 #pragma unroll
             for (unsigned j = 0; j < 4U; ++j) {
-                const float coefficient = scale * static_cast<float>(static_cast<signed char>((four >> (8U * j)) & 255U));
+                float coefficient[S];
+#pragma unroll
+                for (unsigned s = 0; s < S; ++s)
+                    coefficient[s] = scale[s] * static_cast<float>(static_cast<signed char>((four[s] >> (8U * j)) & 255U));
 #pragma unroll
                 for (unsigned q = 0; q < Rows / 4U; ++q) {
                     const float4 low = *reinterpret_cast<const float4*>(&values[4U * m + j][4U * q]);
-                    gate[4U * q] += low.x * coefficient;
-                    gate[4U * q + 1U] += low.y * coefficient;
-                    gate[4U * q + 2U] += low.z * coefficient;
-                    gate[4U * q + 3U] += low.w * coefficient;
+#pragma unroll
+                    for (unsigned s = 0; s < S; ++s) {
+                        gate[s][4U * q] += low.x * coefficient[s];
+                        gate[s][4U * q + 1U] += low.y * coefficient[s];
+                        gate[s][4U * q + 2U] += low.z * coefficient[s];
+                        gate[s][4U * q + 3U] += low.w * coefficient[s];
+                    }
                 }
             }
         }
@@ -2368,17 +2389,18 @@ __global__ __launch_bounds__(256) void wide_lane_chain_hyper_output_kernel(Hyper
         __syncthreads();
     }
 #pragma unroll
-    for (unsigned t = 0; t < Rows; ++t) sig[t][wave][lane] = sigmoid(gate[t]);
-    __syncthreads();
-    for (unsigned t = stream; t < Rows && row0 + t < rows.count; t += streams) {
-        float mixed = 0.0F;
+    for (unsigned t = 0; t < Rows; ++t) {
+        if (row0 + t >= rows.count) break;
         const auto* normalized = wide_row(rows.normalized, rows.normalized_stride, row0 + t);
-        for (std::uint32_t s = 0; s < streams; ++s)
-            mixed += normalized[static_cast<std::uint64_t>(s) * hidden + feature] * sig[t][group * streams + s][lane];
+        float mixed = 0.0F;
+#pragma unroll
+        for (unsigned s = 0; s < S; ++s)
+            mixed += normalized[static_cast<std::uint64_t>(s) * hidden + feature] * sigmoid(gate[s][t]);
         store_activation(&wide_row(static_cast<Storage*>(rows.output), rows.output_stride, row0 + t)[feature],
-            mixed / static_cast<float>(streams));
+            mixed / static_cast<float>(S));
     }
 }
+
 
 bool supported_norm_type(
     std::uint32_t ggml_type) noexcept {
@@ -3378,8 +3400,8 @@ bool wide_hyper_rows(const PreparedHyperRows& prepared, const HipHyperMixLaunche
     static const bool fused_norm = std::getenv("STRIX_HC_ROWS_FUSED_NORM") != nullptr;
     if (!enabled || fused_norm || !config.splitk_projection || !config.lane_chain_output ||
         config.hidden_size * config.hc_count != 10240U || config.lowrank != 320U ||
-        !config.hc_count || kWideOutputWaves % config.hc_count || config.hidden_size % (32U * (kWideOutputWaves / config.hc_count)) ||
-        config.hc_count > kWideProjectionWaves * kWideProjectionOutputs || prepared.count != kWindowRows)
+        config.hc_count != kWideStreams || config.hidden_size % (32U * kWideOutputWaves) ||
+        config.hc_count > kWideProjectionOutputs || prepared.count != kWindowRows)
         return false;
     const auto& rows = prepared.rows;
     const auto at = [](const auto* pointer) { return reinterpret_cast<std::uintptr_t>(pointer); };
@@ -3406,13 +3428,16 @@ bool wide_hyper_rows(const PreparedHyperRows& prepared, const HipHyperMixLaunche
     return true;
 }
 
-// STRIX_HC_WIDE_ROWS: rows per projection block (8 or 16) and per output block (16 or 32).
+// STRIX_HC_WIDE_PROJECTION_ROWS (8, 16) / _WAVES (4, 8): projection block shape (default by row count); STRIX_HC_WIDE_OUTPUT_ROWS (16, 32;
+// default 32 from 128 rows on): output block rows.
 void launch_wide_hyper_rows(const PreparedHyperRows& prepared, const HyperTileRows& tile_rows, const HyperWideRows& wide,
     const HipHyperMixLauncherConfig& config, std::uint32_t tiles, bool norm) {
     static const unsigned projection_rows = [] {
-        const char* v = std::getenv("STRIX_HC_WIDE_PROJECTION_ROWS"); return v && std::atoi(v) == 8 ? 8U : 16U; }();
+        const char* v = std::getenv("STRIX_HC_WIDE_PROJECTION_ROWS"); return v ? static_cast<unsigned>(std::atoi(v)) : 0U; }();
+    static const unsigned projection_waves = [] {
+        const char* v = std::getenv("STRIX_HC_WIDE_PROJECTION_WAVES"); return v ? static_cast<unsigned>(std::atoi(v)) : 0U; }();
     static const unsigned output_rows = [] {
-        const char* v = std::getenv("STRIX_HC_WIDE_OUTPUT_ROWS"); return v && std::atoi(v) == 16 ? 16U : 32U; }();
+        const char* v = std::getenv("STRIX_HC_WIDE_OUTPUT_ROWS"); return v ? static_cast<unsigned>(std::atoi(v)) : 0U; }();
     const auto& p = prepared.first;
     const auto* inject = p.inject_runtime ? reinterpret_cast<const void*>(p.inject_runtime->address) : nullptr;
     const auto invoke = [&]<typename Storage>() {
@@ -3422,24 +3447,31 @@ void launch_wide_hyper_rows(const PreparedHyperRows& prepared, const HyperTileRo
                 p.norm_manifest->ggml_type, config.hidden_size, config.rms_epsilon);
             check_hip(hipGetLastError(), "prefill HC wide rows normalization launch");
         }
-        const auto projection = [&]<unsigned Rows>() {
-            const unsigned per_block = kWideProjectionWaves * kWideProjectionOutputs;
+        const auto projection = [&]<unsigned Rows, unsigned Waves>() {
+            const unsigned per_block = Waves * kWideProjectionOutputs;
             const unsigned low_blocks = (config.lowrank + per_block - 1U) / per_block;
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(wide_splitk_hyper_projection_kernel<Rows>),
-                dim3(low_blocks + (inject ? 1U : 0U), (wide.count + Rows - 1U) / Rows), dim3(32U * kWideProjectionWaves), 0,
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(wide_splitk_hyper_projection_kernel<Rows, Waves>),
+                dim3(low_blocks + (inject ? 1U : 0U), (wide.count + Rows - 1U) / Rows), dim3(32U * Waves), 0,
                 hip_execution_stream(), wide, reinterpret_cast<const void*>(p.down_runtime->address), config.hc_count,
                 config.lowrank, inject, low_blocks);
         };
-        if (projection_rows == 8U) projection.template operator()<8U>(); else projection.template operator()<16U>();
+        // Defaults (measured): 16 rows x 8 waves from 128 rows on, 8 x 4 below (more blocks in flight).
+        const bool large = wide.count >= 128U;
+        const unsigned shape_rows = projection_rows == 8U || projection_rows == 16U ? projection_rows : large ? 16U : 8U;
+        const unsigned shape_waves = projection_waves == 4U || projection_waves == 8U ? projection_waves : large ? 8U : 4U;
+        if (shape_rows == 8U) {
+            if (shape_waves == 4U) projection.template operator()<8U, 4U>(); else projection.template operator()<8U, 8U>();
+        } else {
+            if (shape_waves == 4U) projection.template operator()<16U, 4U>(); else projection.template operator()<16U, 8U>();
+        }
         check_hip(hipGetLastError(), "prefill HC wide rows projection launch");
         const auto output = [&]<unsigned Rows>() {
-            const unsigned features = 32U * (kWideOutputWaves / config.hc_count);
             hipLaunchKernelGGL(HIP_KERNEL_NAME(wide_lane_chain_hyper_output_kernel<Storage, Rows>),
-                dim3(config.hidden_size / features, (wide.count + Rows - 1U) / Rows), dim3(32U * kWideOutputWaves), 0,
-                hip_execution_stream(), wide, reinterpret_cast<const void*>(p.up_runtime->address), config.hidden_size,
-                config.hc_count);
+                dim3(config.hidden_size / (32U * kWideOutputWaves), (wide.count + Rows - 1U) / Rows), dim3(32U * kWideOutputWaves), 0,
+                hip_execution_stream(), wide, reinterpret_cast<const void*>(p.up_runtime->address), config.hidden_size);
         };
-        if (output_rows == 16U) output.template operator()<16U>(); else output.template operator()<32U>();
+        const unsigned rows_per_block = output_rows == 16U || output_rows == 32U ? output_rows : large ? 32U : 16U;
+        if (rows_per_block == 16U) output.template operator()<16U>(); else output.template operator()<32U>();
         check_hip(hipGetLastError(), "prefill HC wide rows output launch");
     };
     switch (config.activation) {
