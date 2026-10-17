@@ -2925,6 +2925,7 @@ void hyper_mix_known_window_rows_launch(std::span<const ExecutionDispatchContext
             };
             if (count == 2U) output.template operator()<2U>();
             else if (count == 4U) output.template operator()<4U>();
+            else if (count == 8U) output.template operator()<8U>();
             else output.template operator()<0U>();
         } else {
             hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_q8_batched_hyper_output_kernel<Storage>),

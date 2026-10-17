@@ -24,8 +24,9 @@ inline constexpr std::uint32_t hip_mtp_fast_moe_workspace_floats=11U*640U+1U;
 // Draft-only Q8_0 GEMV y[rows]=W[rows][width]*x, one wave per row (lanes own
 // 8-column groups, then a wave tree). Input BF16 or F32, output F32 or BF16 RNE.
 // width must be a multiple of 32.
+// any_order drops the barrier bit: the caller guarantees independence from the kernel queued before.
 void launch_hip_mtp_draft_q8_gemv(const void* input,bool input_bf16,const void* q8,std::uint32_t width,
-    std::uint32_t rows,void* output,bool output_bf16,void* stream);
+    std::uint32_t rows,void* output,bool output_bf16,void* stream,bool any_order=false);
 void launch_hip_mtp_fast_moe(const HipMtpFastMoeViews&,void* stream);
 // Draft-only Q4_0 copy of a Q8_0 tensor (elements % 32 == 0), converted on `stream` with the
 // draft head's rule and kept for the process. The draft GEMV, fast MoE and fused input

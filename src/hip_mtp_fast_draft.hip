@@ -1,5 +1,6 @@
 #include "strix/hip_mtp_fast_draft.hpp"
 #include <hip/hip_fp16.h>
+#include <hip/hip_ext.h>
 #include <hip/hip_runtime.h>
 #include <mutex>
 #include <stdexcept>
@@ -188,24 +189,28 @@ const void* hip_mtp_draft_q4(const void* q8) noexcept {
     return nullptr;
 }
 void launch_hip_mtp_draft_q8_gemv(const void* input,bool input_bf16,const void* q8,std::uint32_t width,
-    std::uint32_t rows,void* output,bool output_bf16,void* stream) {
+    std::uint32_t rows,void* output,bool output_bf16,void* stream,bool any_order) {
     if(!input || !q8 || !output || !stream || !rows || !width || width%32U ||
        reinterpret_cast<std::uintptr_t>(input)%(input_bf16?16U:4U) || reinterpret_cast<std::uintptr_t>(q8)%2U)
         throw std::invalid_argument("MTP draft Q8 GEMV views are invalid");
     const auto s=static_cast<hipStream_t>(stream);const dim3 grid((rows+waves-1U)/waves);
+    const auto start=[&](auto kernel,const unsigned char* w) {
+        if(any_order) hipExtLaunchKernelGGL(kernel,grid,dim3(256),0,s,nullptr,nullptr,hipExtAnyOrderLaunch,input,w,width,rows,output);
+        else hipLaunchKernelGGL(kernel,grid,dim3(256),0,s,input,w,width,rows,output);
+    };
     if(const auto* q4=static_cast<const unsigned char*>(hip_mtp_draft_q4(q8))) {
-        if(input_bf16 && output_bf16) hipLaunchKernelGGL(HIP_KERNEL_NAME(mtp_draft_q8_gemv<true,true,true>),grid,dim3(256),0,s,input,q4,width,rows,output);
-        else if(input_bf16) hipLaunchKernelGGL(HIP_KERNEL_NAME(mtp_draft_q8_gemv<true,false,true>),grid,dim3(256),0,s,input,q4,width,rows,output);
-        else if(output_bf16) hipLaunchKernelGGL(HIP_KERNEL_NAME(mtp_draft_q8_gemv<false,true,true>),grid,dim3(256),0,s,input,q4,width,rows,output);
-        else hipLaunchKernelGGL(HIP_KERNEL_NAME(mtp_draft_q8_gemv<false,false,true>),grid,dim3(256),0,s,input,q4,width,rows,output);
+        if(input_bf16 && output_bf16) start(mtp_draft_q8_gemv<true,true,true>,q4);
+        else if(input_bf16) start(mtp_draft_q8_gemv<true,false,true>,q4);
+        else if(output_bf16) start(mtp_draft_q8_gemv<false,true,true>,q4);
+        else start(mtp_draft_q8_gemv<false,false,true>,q4);
         check(hipGetLastError(),"MTP draft Q4 GEMV launch");
         return;
     }
     const auto* w=static_cast<const unsigned char*>(q8);
-    if(input_bf16 && output_bf16) hipLaunchKernelGGL(HIP_KERNEL_NAME(mtp_draft_q8_gemv<true,true>),grid,dim3(256),0,s,input,w,width,rows,output);
-    else if(input_bf16) hipLaunchKernelGGL(HIP_KERNEL_NAME(mtp_draft_q8_gemv<true,false>),grid,dim3(256),0,s,input,w,width,rows,output);
-    else if(output_bf16) hipLaunchKernelGGL(HIP_KERNEL_NAME(mtp_draft_q8_gemv<false,true>),grid,dim3(256),0,s,input,w,width,rows,output);
-    else hipLaunchKernelGGL(HIP_KERNEL_NAME(mtp_draft_q8_gemv<false,false>),grid,dim3(256),0,s,input,w,width,rows,output);
+    if(input_bf16 && output_bf16) start(mtp_draft_q8_gemv<true,true>,w);
+    else if(input_bf16) start(mtp_draft_q8_gemv<true,false>,w);
+    else if(output_bf16) start(mtp_draft_q8_gemv<false,true>,w);
+    else start(mtp_draft_q8_gemv<false,false>,w);
     check(hipGetLastError(),"MTP draft Q8 GEMV launch");
 }
 void launch_hip_mtp_fast_moe(const HipMtpFastMoeViews& v,void* stream) {

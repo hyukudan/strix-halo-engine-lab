@@ -4772,8 +4772,11 @@ template<WeightKind Kind> void mtp_project(const MtpDeviceView& input,const Tens
         reinterpret_cast<const std::uint16_t*>(input.address),reinterpret_cast<const void*>(tensor.runtime->address),width,outputs,output);
     check_hip(hipGetLastError(),"MTP attention projection enqueue");
 }
-void mtp_attention_finite(const MtpAttentionPrepared& p,const float* values,std::uint32_t count,hipStream_t stream) {
-    hipLaunchKernelGGL(validate_indexed_graph_values,dim3(1),dim3(kThreads),0,stream,values,count,
+void mtp_attention_finite(const MtpAttentionPrepared& p,const float* values,std::uint32_t count,hipStream_t stream,
+    bool any_order=false) {
+    if(any_order) hipExtLaunchKernelGGL(validate_indexed_graph_values,dim3(1),dim3(kThreads),0,stream,nullptr,nullptr,
+        hipExtAnyOrderLaunch,values,count,reinterpret_cast<std::uint32_t*>(p.status.address));
+    else hipLaunchKernelGGL(validate_indexed_graph_values,dim3(1),dim3(kThreads),0,stream,values,count,
         reinterpret_cast<std::uint32_t*>(p.status.address));
     check_hip(hipGetLastError(),"MTP attention finite validation enqueue");
 }
@@ -4848,17 +4851,24 @@ namespace {
 void mtp_sparse_attention(const MtpNativeContext& c,void* raw_stream,bool draft) {
     const auto p=prepare_mtp_attention(c);require_mtp_attention_stream(c,raw_stream);
     const auto stream=static_cast<hipStream_t>(raw_stream);const auto& m=*c.model;const auto& w=p.workspace;
-    const auto project=[&](const TensorPair& tensor,std::uint32_t outputs,float* output) {
+    // Draft any-order: k and v read the same input as q and write their own buffers; the q
+    // finite check is barrier-ordered after both norms, the k/v checks only OR the status word.
+    const bool unordered=draft && strix_any_order_enabled();
+    const auto project=[&](const TensorPair& tensor,std::uint32_t outputs,float* output,bool after_q) {
         if(draft) launch_hip_mtp_draft_q8_gemv(reinterpret_cast<const void*>(p.input.address),true,
-            reinterpret_cast<const void*>(tensor.runtime->address),p.hidden,outputs,output,false,stream);
+            reinterpret_cast<const void*>(tensor.runtime->address),p.hidden,outputs,output,false,stream,unordered && after_q);
         else mtp_project<WeightKind::q8_0>(p.input,tensor,p.hidden,outputs,output,stream);
     };
-    project(p.tensors.q,p.q_width,w.q_gate);project(p.tensors.k,p.kv_width,w.current_k);project(p.tensors.v,p.kv_width,w.current_v);
+    project(p.tensors.q,p.q_width,w.q_gate,false);project(p.tensors.k,p.kv_width,w.current_k,true);
+    project(p.tensors.v,p.kv_width,w.current_v,true);
     launch_norm_rope_typed<SmallWeightKind::f32>(w.q_gate,p.heads,p.dim,p.dim*2U,*p.tensors.q_norm.runtime,m,c.position,{},stream);
     launch_norm_rope_typed<SmallWeightKind::f32>(w.current_k,p.kv_heads,p.dim,p.dim,*p.tensors.k_norm.runtime,m,c.position,{},stream);
-    mtp_attention_finite(p,w.q_gate,p.q_width,stream);mtp_attention_finite(p,w.current_k,p.kv_width,stream);mtp_attention_finite(p,w.current_v,p.kv_width,stream);
+    mtp_attention_finite(p,w.q_gate,p.q_width,stream);mtp_attention_finite(p,w.current_k,p.kv_width,stream,unordered);
+    mtp_attention_finite(p,w.current_v,p.kv_width,stream,unordered);
     auto* cache_status=reinterpret_cast<std::uint32_t*>(p.status.address);
-    hipLaunchKernelGGL(validate_mtp_cache_casts,dim3(1),dim3(kThreads),0,stream,
+    if(unordered) hipExtLaunchKernelGGL(validate_mtp_cache_casts,dim3(1),dim3(kThreads),0,stream,nullptr,nullptr,hipExtAnyOrderLaunch,
+        static_cast<const float*>(nullptr),0U,w.current_k,w.current_v,p.kv_width,cache_status);
+    else hipLaunchKernelGGL(validate_mtp_cache_casts,dim3(1),dim3(kThreads),0,stream,
         static_cast<const float*>(nullptr),0U,w.current_k,w.current_v,p.kv_width,cache_status);
     check_hip(hipGetLastError(),"MTP full KV cache-cast validation enqueue");
     const GraphPositionKernelArguments guarded_cache{nullptr,c.resources->context_capacity(),cache_status};
