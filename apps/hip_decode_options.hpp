@@ -388,9 +388,11 @@ inline void validate_numerical_profile_cli(const Options& options) {
         options.execution.integer_head != DecodeIntegerHead::none ||
         // Prefix-accepting MTP windows reproduce each row's serial arithmetic (split-K HC rows are
         // byte-exact), so they may run under an arithmetic profile.
-        ((options.mtp.enabled || options.mtp.supplied) && !options.mtp.window_prefix) || options.known_prefix_window ||
-        options.known_prefix_rows_explicit || options.known_prefix_prefill_rows ||
-        options.known_prefix_expert_union || options.prompt_lookup ||
+        ((options.mtp.enabled || options.mtp.supplied) && !options.mtp.window_prefix) ||
+        // Known-prefix windows with the full row set compile the same operators as the prefix-accepting
+        // MTP window, so they run under an arithmetic profile too; the older partial sets do not.
+        ((options.known_prefix_window || options.known_prefix_rows_explicit || options.known_prefix_expert_union) &&
+            !options.known_prefix_full_rows) || options.known_prefix_prefill_rows || options.prompt_lookup ||
         !options.serving_prefix_files.empty() || options.serving_concurrency != 1 ||
         options.serving_tensor_cohort_rows != 1 || options.serving_prefill_rows ||
         options.prefix_cache_roundtrip || options.gpu_greedy_token ||
@@ -1976,7 +1978,8 @@ inline void apply_numerical_profile(
         !options.wave8_q8_gdn_input || !options.wave8_q8_gdn_output || !options.prefetch_q8_qsa_input ||
         !options.prefetch_q8_shared_expert || !options.virtual_q8_lm_head || !options.prefetch_q8_lm_head ||
         !options.wave8_q8_lm_head || !options.wave8_q8_qsa_output ||
-        (!options.mtp.window_prefix && (!options.prepared_eager || !options.gdn_islands || !options.moe_shared_overlap)))
+        (!options.mtp.window_prefix && !options.known_prefix_full_rows &&
+            (!options.prepared_eager || !options.gdn_islands || !options.moe_shared_overlap)))
         throw std::invalid_argument("numerical profile requires the resolved full v5 organization without implicit flag changes");
     resolution.selected += "+" + std::string(numerical_profile_name(options.numerical_profile));
 }
