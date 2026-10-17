@@ -2181,11 +2181,16 @@ int STRIX_DECODE_ENTRY(
             make_window = [&, parents](std::shared_ptr<strix::HipMtpTargetHidden> target) {
                 const auto plan = strix::compile_known_prefix_window(model, compiled, manifest, tensor_access,
                     {true, true, true, options.mtp.window_rows, options.mtp.window_expert_union, strix::KnownWindowOutputPolicy::all_rows,
-                     options.mtp.window_hyper_mix});
+                     options.mtp.window_hyper_mix, options.mtp.window_qsa_rows, options.mtp.window_prefix, options.mtp.window_prefix});
                 if (!strix::known_window_has_promoted_steps(plan) ||
                     (options.mtp.window_expert_union && !plan.routed_expert_union_steps) ||
-                    (options.mtp.window_hyper_mix && !plan.hyper_mix_rows_steps))
-                    throw std::invalid_argument("MTP target window has no admitted requested operators");
+                    (options.mtp.window_hyper_mix && !plan.hyper_mix_rows_steps) ||
+                    (options.mtp.window_qsa_rows && !plan.qsa_rows_steps) ||
+                    (options.mtp.window_prefix && (plan.gdn_deferred_rows_steps != model.gdn_layers || !plan.ple_rows_steps)))
+                    throw std::invalid_argument("MTP target window has no admitted requested operators: union " +
+                        std::to_string(plan.routed_expert_union_steps) + " hc " + std::to_string(plan.hyper_mix_rows_steps) +
+                        " qsa " + std::to_string(plan.qsa_rows_steps) + " gdn-deferred " + std::to_string(plan.gdn_deferred_rows_steps) +
+                        " ple " + std::to_string(plan.ple_rows_steps));
                 std::uint64_t union_bytes = 0;
                 if (options.mtp.window_expert_union) {
                     if (model.num_experts > UINT32_MAX || model.num_experts_per_token > UINT32_MAX)

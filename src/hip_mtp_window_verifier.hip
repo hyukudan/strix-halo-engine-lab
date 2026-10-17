@@ -1,12 +1,25 @@
 #include "strix/hip_mtp_window_verifier.hpp"
 #include "strix/mtp_target_window_policy.hpp"
 #include "strix/hip_mtp_native_validation.hpp"
+#include "strix/arithmetic_lineage.hpp"
+#include "strix/session_state_memory.hpp"
 #include <algorithm>
 #include <array>
+#include <cstring>
 #include <stdexcept>
 namespace strix {
 namespace {
 void require(bool value,const char* message){if(!value)throw std::invalid_argument(message);}
+void write_position_word(const ExecutionRuntimeResources& resources,std::uint64_t value) {
+    for(const auto& allocation:resources.session_state_layout->allocations) {
+        if(allocation.component!=SessionStateComponent::position_history) continue;
+        require(allocation.storage==SessionStateStorage::host && allocation.bytes>=sizeof(value) &&
+            resources.session_state_memory->host_base,"MTP prefix commit requires the host position word");
+        std::memcpy(reinterpret_cast<void*>(resources.session_state_memory->host_base+allocation.offset),&value,sizeof(value));
+        return;
+    }
+    throw std::invalid_argument("MTP prefix commit found no position history");
+}
 bool session_equal(const SerialSessionContext& a,const SerialSessionContext& b) {
     return a.execution_identity==b.execution_identity && a.state_layout_identity==b.state_layout_identity &&
         a.runtime_compatibility_identity==b.runtime_compatibility_identity && a.next_position==b.next_position &&
@@ -20,10 +33,10 @@ struct HipMtpWindowVerifier::Impl {
     std::shared_ptr<HipKnownPrefixWindow> window;
     ExecutionRuntimeResources resources;
     std::shared_ptr<const void> resource_owner;
-    std::array<std::shared_ptr<HipMtpTargetWindowCapture>,2> captures;
+    std::array<std::shared_ptr<HipMtpTargetWindowCapture>,4> captures;
     std::unique_ptr<HipMtpTargetCheckpoint> checkpoint;
     std::uint64_t retained=0,maximum_history_intervals=0;
-    bool busy=false,failed=false,bounded=false;
+    bool busy=false,failed=false,bounded=false,prefix=false;
     Impl(std::shared_ptr<HipMtpTargetHidden> t,std::shared_ptr<HipKnownPrefixWindow> w,
          const ExecutionRuntimeResources& r,std::shared_ptr<const void> owner,
          HipMtpWindowVerificationPolicy policy,AllocationGenerationSource& generations)
@@ -36,10 +49,11 @@ struct HipMtpWindowVerifier::Impl {
             window->output_policy()==KnownWindowOutputPolicy::all_rows &&
             (window->logical_rows()==2 || window->logical_rows()==4 || window->logical_rows()==8),
             "MTP window verifier requires actual closed all-row target owners");
+        prefix=window->defers_state();
         const auto reservation=bounded?plan_hip_mtp_target_window_rollback(target->model(),*resources.session_state_layout,0,window->logical_rows(),true).reservation:
             plan_hip_mtp_target_checkpoint(target->model(),*resources.session_state_layout,policy.snapshot_policy);
         const auto upper=mtp_native::sum(reservation.retained_bytes,
-            mtp_native::product(policy.capture.retained_byte_budget,2));
+            mtp_native::product(policy.capture.retained_byte_budget,4));
         require(policy.total_retained_byte_budget && reservation.retained_bytes<=policy.checkpoint_retained_byte_budget &&
             upper<=policy.total_retained_byte_budget,"MTP window verification exceeds upfront combined retained reservation");
         for(auto& capture:captures) {
@@ -50,6 +64,7 @@ struct HipMtpWindowVerifier::Impl {
         // Completed serial metadata admits capture, but bounded rollback belongs
         // to the actual known-window producer queue and its retained owner.
         // Full snapshots retain the original serial-target queue contract.
+        if(prefix) return; // deferred GDN + PLE snapshots replace the state checkpoint
         const auto checkpoint_stream=bounded?captures.front()->source_stream():target->stream();
         const std::shared_ptr<const void> checkpoint_stream_owner=bounded?
             std::shared_ptr<const void>(window):std::shared_ptr<const void>(target);
@@ -69,7 +84,7 @@ HipMtpWindowVerifier::~HipMtpWindowVerifier()=default;
 std::shared_ptr<HipMtpTargetHidden> HipMtpWindowVerifier::target_owner() const noexcept {return impl_->target;}
 std::shared_ptr<HipKnownPrefixWindow> HipMtpWindowVerifier::window_owner() const noexcept {return impl_->window;}
 std::uint32_t HipMtpWindowVerifier::logical_rows() const noexcept {return impl_->window->logical_rows();}
-bool HipMtpWindowVerifier::failed() const noexcept {return impl_->failed || impl_->checkpoint->failed();}
+bool HipMtpWindowVerifier::failed() const noexcept {return impl_->failed || (impl_->checkpoint && impl_->checkpoint->failed());}
 std::uint64_t HipMtpWindowVerifier::retained_payload_bytes() const noexcept {return impl_->retained;}
 HipMtpVerifiedTargetRows HipMtpWindowVerifier::verify(SerialSessionContext& session,DirectLaunchDispatcher& dispatcher,
     const HipMtpTargetHiddenTicket& initial,std::span<const std::uint32_t> candidates,
@@ -101,6 +116,36 @@ HipMtpVerifiedTargetRows HipMtpWindowVerifier::verify(SerialSessionContext& sess
     }
     i.busy=true;bool attempted_target=false;
     try {
+        if(use_window && i.prefix) {
+            std::vector<std::uint32_t> inputs;inputs.reserve(rows);inputs.push_back(pending);
+            for(std::uint32_t r=1;r<rows;++r) inputs.push_back(candidates[std::min<std::size_t>(r-1U,candidates.size()-1U)]);
+            const auto previous=session;
+            auto native=i.window->execute_mtp_captured(session,inputs,capture);
+            attempted_target=true;out.attempted_window=true;
+            out.r2_dispatches=native.execution.r2_dispatches;
+            out.projection_launches_saved=native.execution.projection_launches_saved;
+            auto provisional=std::make_shared<const HipMtpTargetWindowBatch>(std::move(native.batch));
+            std::vector<std::uint32_t> selected;selected.reserve(rows);
+            for(std::uint32_t row=0;row<rows;++row)selected.push_back(provisional->predicted_token(row));
+            // Longest accepted prefix: row a+1's input equals row a's prediction.
+            std::uint32_t a=0;
+            while(a+1U<rows && a<candidates.size() && a+1U<budget && inputs[a+1U]==selected[a] && !is_eos(selected[a])) ++a;
+            const auto n_keep=a+1U;
+            i.window->commit_prefix(n_keep);
+            if(n_keep<rows) {
+                const auto dropped=rows-n_keep;
+                session.next_position-=dropped;session.committed_tokens-=dropped;
+                const auto& last=session.arithmetic_lineage.intervals.back();
+                session.arithmetic_lineage=prepare_known_window_chunk_lineage(previous.arithmetic_lineage,last.begin,
+                    last.begin+n_keep,last.numerical_plan_identity,last.reduction_plan_identity,last.state_update_identity);
+                write_position_word(i.resources,session.next_position-1U);
+            }
+            out.committed_rows=i.target->accept_verified_prefix(provisional,initial,session,n_keep);
+            out.emitted_tokens.assign(selected.begin(),selected.begin()+n_keep);
+            out.accepted_candidates=a;out.accepted_window=n_keep==rows;
+            i.busy=false;return out;
+        }
+        if(i.prefix) i.window->flush_deferred();
         if(use_window) {
             std::vector<std::uint32_t> inputs;inputs.reserve(rows);inputs.push_back(pending);
             inputs.insert(inputs.end(),candidates.begin(),candidates.begin()+static_cast<std::ptrdiff_t>(rows-1));

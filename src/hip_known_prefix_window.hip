@@ -1,5 +1,6 @@
 #include "strix/hip_known_prefix_window.hpp"
 #include "strix/hip_mtp_target_window.hpp"
+#include "strix/hip_ple_launcher.hpp"
 
 #include "strix/deferred_moe_status.hpp"
 #include "strix/hip_hyper_mix_launcher.hpp"
@@ -11,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <deque>
 #include <limits>
 #include <memory>
 #include <stdexcept>
@@ -107,6 +109,18 @@ struct HipKnownPrefixWindow::Impl {
     std::optional<HipKnownPrefixUnionObservation> last_union_observation;
     std::array<KnownWindowR2Entry, 3> r2_entries;
     std::vector<KnownWindowRowsEntry> rows_entries;
+    // Prefix acceptance: deferred GDN rows (control word in host-mapped coherent memory, so the
+    // host publishes {n_keep, slot} without a copy) and per-row PLE snapshots.
+    struct HipFree { void operator()(void* p) const noexcept { if (p) (void)hipFree(p); } };
+    struct HipHostFree { void operator()(void* p) const noexcept { if (p) (void)hipHostFree(p); } };
+    std::unique_ptr<void, HipFree> gdn_retained;
+    std::unique_ptr<void, HipHostFree> gdn_control_host;
+    HipGdnWindowConfig gdn_window_config;
+    std::vector<ExecutionDispatchContext> gdn_commit_rows; // one row context per GDN layer (stable plan views)
+    std::deque<ExecutionRuntimeResources> gdn_commit_resources; // owned copies: the window's are call-local
+    std::unique_ptr<HipPleKnownWindow> ple_window;
+    std::uint32_t gdn_slot = 0;
+    bool gdn_pending = false;
     DeferredMoeFirstError completion_status{};
     bool failed = false;
 
@@ -180,6 +194,7 @@ struct HipKnownPrefixWindow::Impl {
         setup_rows();
         setup_routed_union();
         setup_hyper_rows();
+        setup_deferred();
         // Setup only: no execution callback clears or reads this record before
         // all deep admission. Exclusive status ownership preserves zero across
         // successful calls; any exception disables the owner permanently.
@@ -399,6 +414,77 @@ struct HipKnownPrefixWindow::Impl {
                 hyper_mix_known_window_rows_launch(rows,self.hyper_for(rows));
             }});
     }
+    GdnWindowControl* gdn_control() const noexcept { return static_cast<GdnWindowControl*>(gdn_control_host.get()); }
+    void setup_deferred() {
+        if(window.gdn_deferred_rows_steps) {
+            const auto per_layer=gdn_window_retained_bytes(model);
+            const auto bytes=per_layer*static_cast<std::uint64_t>(model.gdn_layers);
+            void* retained=nullptr; void* control=nullptr;
+            guard.run([&] {
+                check(hipMalloc(&retained,bytes),"allocate deferred GDN retained rows");
+                gdn_retained.reset(retained);
+                check(hipHostMalloc(&control,sizeof(GdnWindowControl),hipHostMallocMapped|hipHostMallocCoherent),
+                    "allocate deferred GDN control");
+                gdn_control_host.reset(control);
+            });
+            *gdn_control()=GdnWindowControl{};
+            void* device_control=nullptr;
+            check(hipHostGetDevicePointer(&device_control,control,0),"deferred GDN control device view");
+            gdn_window_config.gdn=gdn_config; gdn_window_config.retained=retained;
+            gdn_window_config.retained_bytes=bytes;
+            gdn_window_config.control=static_cast<const GdnWindowControl*>(device_control);
+            const auto variant=window.logical_rows==2U?KnownWindowR2Variant::gdn_deferred_rows2_v1:
+                window.logical_rows==4U?KnownWindowR2Variant::gdn_deferred_rows4_v1:KnownWindowR2Variant::gdn_deferred_rows8_v1;
+            rows_entries.push_back({variant,this,
+                [](std::span<const ExecutionDispatchContext> rows,void* object) {
+                    gdn_window_rows_preflight(rows,static_cast<Impl*>(object)->gdn_window_config);
+                },
+                [](std::span<const ExecutionDispatchContext> rows,void* object) {
+                    auto& self=*static_cast<Impl*>(object);
+                    gdn_window_rows_launch(rows,self.gdn_window_config);
+                    self.remember_gdn_layer(rows[0]);
+                }});
+        }
+        if(window.ple_rows_steps) {
+            ple_window=std::make_unique<HipPleKnownWindow>(model,config.activation,window.logical_rows);
+            rows_entries.push_back({KnownWindowR2Variant::ple_rows_host_staged_v1,this,
+                [](std::span<const ExecutionDispatchContext> rows,void* object) {
+                    static_cast<Impl*>(object)->ple_window->preflight(rows);
+                },
+                [](std::span<const ExecutionDispatchContext> rows,void* object) {
+                    static_cast<Impl*>(object)->ple_window->launch(rows);
+                }});
+        }
+    }
+    void remember_gdn_layer(const ExecutionDispatchContext& row) {
+        for(const auto& known:gdn_commit_rows) if(known.layer==row.layer) return;
+        gdn_commit_resources.push_back(*row.resources);
+        auto copy=row; copy.resources=&gdn_commit_resources.back();
+        gdn_commit_rows.push_back(copy);
+    }
+    // After a deferred window the target keeps rows [0, n_keep): GDN applies them in the next
+    // window (or flush_deferred), PLE restores row n_keep-1. Host work only, no device sync.
+    void commit_prefix(std::uint32_t n_keep) {
+        if(!n_keep || n_keep>window.logical_rows) throw std::invalid_argument("known-window prefix commit outside the window");
+        if(window.gdn_deferred_rows_steps) {
+            gdn_slot^=1U;
+            *gdn_control()=GdnWindowControl{n_keep,gdn_slot};
+            gdn_pending=true;
+        }
+        if(ple_window) ple_window->commit(n_keep,scope.stream);
+    }
+    // Applies pending GDN rows to the session state before any serial GDN token.
+    void flush_deferred() {
+        if(!gdn_pending) return;
+        if(gdn_commit_rows.size()!=static_cast<std::size_t>(model.gdn_layers))
+            throw std::logic_error("deferred GDN flush has not observed every GDN layer");
+        {
+            const HipLaunchScope active(scope);
+            for(const auto& row:gdn_commit_rows) gdn_window_commit_launch(row,gdn_window_config);
+        }
+        check(hipStreamSynchronize(scope.stream),"complete deferred GDN commit");
+        gdn_control()->pending_rows=0; gdn_pending=false;
+    }
     void complete() {
         guard.require_original();
         if(window.routed_expert_union_steps)
@@ -459,6 +545,10 @@ struct HipKnownPrefixWindow::Impl {
         case KnownWindowR2Variant::qsa_q8_rows2_r1_v1:
         case KnownWindowR2Variant::qsa_q8_rows4_r1_v1:
         case KnownWindowR2Variant::qsa_q8_rows8_r1_v1: recipe="hip-qsa-known-wide-q8-append-all-r1-attend-v1";break;
+        case KnownWindowR2Variant::gdn_deferred_rows2_v1:
+        case KnownWindowR2Variant::gdn_deferred_rows4_v1:
+        case KnownWindowR2Variant::gdn_deferred_rows8_v1: recipe="hip-gdn-window-deferred-commit-r1-tree-v1";break;
+        case KnownWindowR2Variant::ple_rows_host_staged_v1: recipe="hip-ple-window-host-staged-conv-snapshots-v1";break;
         default:throw std::invalid_argument("known-window capture has no closed native recipe");
         }
         return capture_identity(recipe,static_cast<std::uint32_t>(variant));
@@ -621,4 +711,10 @@ KnownWindowOutputPolicy HipKnownPrefixWindow::output_policy() const noexcept { r
 std::optional<HipKnownPrefixUnionObservation> HipKnownPrefixWindow::latest_routed_union_observation() const noexcept {
     return impl_->failed?std::nullopt:impl_->last_union_observation;
 }
+bool HipKnownPrefixWindow::defers_state() const noexcept {
+    return impl_->window.gdn_deferred_rows_steps || impl_->window.ple_rows_steps;
+}
+void HipKnownPrefixWindow::commit_prefix(std::uint32_t n_keep) { impl_->commit_prefix(n_keep); }
+void HipKnownPrefixWindow::flush_deferred() { impl_->flush_deferred(); }
+
 } // namespace strix

@@ -577,6 +577,10 @@ KnownWindowR2Variant qsa_rows_variant(std::uint32_t rows) {
     return rows==2U?KnownWindowR2Variant::qsa_q8_rows2_r1_v1:
         rows==4U?KnownWindowR2Variant::qsa_q8_rows4_r1_v1:KnownWindowR2Variant::qsa_q8_rows8_r1_v1;
 }
+KnownWindowR2Variant gdn_deferred_variant(std::uint32_t rows) {
+    return rows==2U ? KnownWindowR2Variant::gdn_deferred_rows2_v1 :
+        rows==4U ? KnownWindowR2Variant::gdn_deferred_rows4_v1 : KnownWindowR2Variant::gdn_deferred_rows8_v1;
+}
 enum class WindowGdnFormat { unsupported, all_q8, q8_large_f32_gates };
 WindowGdnFormat window_gdn_format(const ModelManifest& manifest, const ExecutionTensorAccessPlan& access,
     const ExecutionStep& step, bool admit_f32_gates) {
@@ -637,7 +641,7 @@ std::pair<std::uint64_t, std::uint64_t> known_window_identities(
     auto kernel = fnv_offset; window_hash_text(kernel, window.logical_rows==2U ? "known-window-r2-kernels-v1" : "known-window-rows-kernels-v1");
     if(window.logical_rows!=2U) hash_u64(kernel,window.logical_rows);
     hash_u64(kernel, serial.kernel_plan_identity); hash_u64(kernel, window.mode.size());
-    std::uint32_t r2 = 0, loops = 0, runtime = 0, shared_rows = 0, gdn_rows = 0, routed_union=0, hyper_rows=0, qsa_rows=0;
+    std::uint32_t r2 = 0, loops = 0, runtime = 0, shared_rows = 0, gdn_rows = 0, routed_union=0, hyper_rows=0, qsa_rows=0, gdn_deferred=0, ple_rows=0;
     std::uint64_t avoided = 0;
     std::uint32_t launches = 0;
     for (std::size_t i = 0; i < window.mode.size(); ++i) {
@@ -682,6 +686,15 @@ std::pair<std::uint64_t, std::uint64_t> known_window_identities(
                 variant==qsa_rows_variant(window.logical_rows), "known window QSA rows variant/source ID mismatch");
             ++qsa_rows; avoided+=known_qsa_projection_bytes*(window.logical_rows-1U);
             launches+=known_qsa_launches_saved(window.logical_rows);
+        } else if(mode==KnownWindowStepMode::gdn_deferred_rows) {
+            window_require(step.op==SerialOp::gated_delta_net && binding.kernel_id && *binding.kernel_id==known_gdn_wave8 &&
+                variant==gdn_deferred_variant(window.logical_rows), "known window deferred GDN variant/source ID mismatch");
+            ++gdn_deferred; avoided+=known_gdn_q8_large_projection_bytes*(window.logical_rows-1U);
+            launches+=3U*(window.logical_rows-1U);
+        } else if(mode==KnownWindowStepMode::ple_rows) {
+            window_require(step.op==SerialOp::ple && variant==KnownWindowR2Variant::ple_rows_host_staged_v1,
+                "known window PLE rows variant/source mismatch");
+            ++ple_rows;
         } else if (mode == KnownWindowStepMode::r2_gdn_staged) {
             window_require(step.op == SerialOp::gated_delta_net &&
                 (variant == KnownWindowR2Variant::gdn_q8_virtual256_r2_v1 ||
@@ -701,7 +714,8 @@ std::pair<std::uint64_t, std::uint64_t> known_window_identities(
     window_require(r2 == window.r2_steps && loops == window.row_loop_steps && runtime == window.runtime_row_steps &&
         shared_rows==window.shared_rows_steps && gdn_rows==window.gdn_rows_steps &&
         routed_union==window.routed_expert_union_steps && hyper_rows==window.hyper_mix_rows_steps &&
-        qsa_rows==window.qsa_rows_steps,
+        qsa_rows==window.qsa_rows_steps && gdn_deferred==window.gdn_deferred_rows_steps &&
+        ple_rows==window.ple_rows_steps,
         "known window counters do not match its actual mode table");
     window_require(avoided == window.logical_projection_weight_bytes_avoided &&
         launches == window.projection_launches_saved,
@@ -822,6 +836,29 @@ CompiledKnownPrefixWindow compile_known_prefix_window(
                     window_tensor(manifest,tensor_access,step.id,step.op,*step.layer,item.first).byte_size*(output.logical_rows-1U);
             output.projection_launches_saved+=known_qsa_launches_saved(output.logical_rows);
         }
+        if(request.deferred_gdn && step.op==SerialOp::gated_delta_net && binding.kernel_id &&
+            *binding.kernel_id==known_gdn_wave8 && window_gdn_format(manifest,tensor_access,step,true)!=WindowGdnFormat::unsupported) {
+            if(output.mode[i]==KnownWindowStepMode::r2_gdn_staged || output.mode[i]==KnownWindowStepMode::gdn_rows) {
+                // Replace the checkpointed wide GDN entry and its claimed savings.
+                const bool mixed=window_gdn_format(manifest,tensor_access,step,request.r2_gdn_f32_gates)==WindowGdnFormat::q8_large_f32_gates;
+                const bool wide=mixed && output.logical_rows!=2U;
+                const auto saved=wide ? output.logical_rows-1U : output.logical_rows/2U;
+                for(const auto suffix:{"attn_qkv.weight","attn_gate.weight","ssm_beta.weight","ssm_alpha.weight","ssm_out.weight"}) {
+                    if(mixed && (std::string_view(suffix)=="ssm_beta.weight" || std::string_view(suffix)=="ssm_alpha.weight")) continue;
+                    output.logical_projection_weight_bytes_avoided-=
+                        window_tensor(manifest,tensor_access,step.id,step.op,*step.layer,suffix).byte_size*saved;
+                }
+                output.projection_launches_saved-=(mixed ? 3U : 5U)*saved;
+            }
+            output.mode[i]=KnownWindowStepMode::gdn_deferred_rows;
+            output.r2_variant[i]=gdn_deferred_variant(output.logical_rows);
+            output.logical_projection_weight_bytes_avoided+=known_gdn_q8_large_projection_bytes*(output.logical_rows-1U);
+            output.projection_launches_saved+=3U*(output.logical_rows-1U);
+        }
+        if(request.rows_ple && step.op==SerialOp::ple) {
+            output.mode[i]=KnownWindowStepMode::ple_rows;
+            output.r2_variant[i]=KnownWindowR2Variant::ple_rows_host_staged_v1;
+        }
         if(request.routed_expert_union && step.op==SerialOp::moe_experts && binding.kernel_id &&
             known_routed_union_id(*binding.kernel_id) && window_routed_union_types(manifest,tensor_access,step)) {
             output.mode[i]=KnownWindowStepMode::routed_expert_union;
@@ -840,6 +877,8 @@ CompiledKnownPrefixWindow compile_known_prefix_window(
         else if(output.mode[i]==KnownWindowStepMode::routed_expert_union) ++output.routed_expert_union_steps;
         else if(output.mode[i]==KnownWindowStepMode::hyper_mix_rows) ++output.hyper_mix_rows_steps;
         else if(output.mode[i]==KnownWindowStepMode::qsa_rows) ++output.qsa_rows_steps;
+        else if(output.mode[i]==KnownWindowStepMode::gdn_deferred_rows) ++output.gdn_deferred_rows_steps;
+        else if(output.mode[i]==KnownWindowStepMode::ple_rows) ++output.ple_rows_steps;
         else ++output.r2_steps;
     }
     const auto identities = known_window_identities(output, serial);
@@ -902,6 +941,9 @@ void validate_known_prefix_window_formats(
         } else if(window.mode[i]==KnownWindowStepMode::routed_expert_union) {
             window_require(window_routed_union_types(manifest,tensor_access,step),
                 "known window routed union differs from the selected tensor formats");
+        } else if(window.mode[i]==KnownWindowStepMode::gdn_deferred_rows) {
+            window_require(window_gdn_format(manifest,tensor_access,step,true)!=WindowGdnFormat::unsupported,
+                "known window deferred GDN differs from the selected tensor formats");
         } else if (window.mode[i] == KnownWindowStepMode::r2_gdn_staged || window.mode[i] == KnownWindowStepMode::gdn_rows) {
             const auto expected = window.r2_variant[i] == KnownWindowR2Variant::gdn_q8_virtual256_r2_v1 ?
                 WindowGdnFormat::all_q8 : WindowGdnFormat::q8_large_f32_gates;

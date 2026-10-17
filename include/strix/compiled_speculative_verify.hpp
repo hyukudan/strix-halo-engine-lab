@@ -28,6 +28,10 @@ enum class KnownWindowStepMode : std::uint8_t {
     routed_expert_union,
     hyper_mix_rows,
     qsa_rows,
+    // GDN window without checkpoint: accepted rows are applied by the next window or a commit.
+    gdn_deferred_rows,
+    // PLE rows looked up on the host before the window; convolution kept per row.
+    ple_rows,
 };
 
 // Closed implementation table. These values identify window entries; they do
@@ -53,8 +57,12 @@ enum class KnownWindowR2Variant : std::uint32_t {
     qsa_q8_rows2_r1_v1 = 14,
     qsa_q8_rows4_r1_v1 = 15,
     qsa_q8_rows8_r1_v1 = 16,
+    gdn_deferred_rows2_v1 = 17,
+    gdn_deferred_rows4_v1 = 18,
+    gdn_deferred_rows8_v1 = 19,
+    ple_rows_host_staged_v1 = 20,
 };
-inline constexpr std::uint32_t known_window_r2_variant_slots = 17;
+inline constexpr std::uint32_t known_window_r2_variant_slots = 21;
 
 struct KnownWindowRequest {
     bool r2_shared_expert = false;
@@ -70,6 +78,9 @@ struct KnownWindowRequest {
     bool rows_hyper_mix = false;
     // All-Q8 QSA steps append every row's KV/index cells, then attend per row.
     bool qsa_rows = false;
+    // Prefix-acceptance state handling: deferred GDN commit and per-row PLE snapshots.
+    bool deferred_gdn = false;
+    bool rows_ple = false;
 };
 
 struct CompiledKnownPrefixWindow {
@@ -99,6 +110,8 @@ struct CompiledKnownPrefixWindow {
     std::uint32_t routed_expert_union_steps = 0;
     std::uint32_t hyper_mix_rows_steps = 0;
     std::uint32_t qsa_rows_steps = 0;
+    std::uint32_t gdn_deferred_rows_steps = 0;
+    std::uint32_t ple_rows_steps = 0;
     KnownWindowOutputPolicy output_policy = KnownWindowOutputPolicy::all_rows;
     // Compact result.logits entries correspond to these original source rows.
     std::vector<std::uint32_t> logit_row_indices;
@@ -108,7 +121,8 @@ struct CompiledKnownPrefixWindow {
 // Admission must cover every closed mode without adding counters that could overflow.
 [[nodiscard]] inline bool known_window_has_promoted_steps(const CompiledKnownPrefixWindow& window) noexcept {
     return window.r2_steps || window.shared_rows_steps || window.gdn_rows_steps || window.routed_expert_union_steps ||
-        window.hyper_mix_rows_steps || window.qsa_rows_steps;
+        window.hyper_mix_rows_steps || window.qsa_rows_steps ||
+        window.gdn_deferred_rows_steps || window.ple_rows_steps;
 }
 
 [[nodiscard]] CompiledKnownPrefixWindow compile_known_prefix_window(

@@ -396,7 +396,8 @@ KnownWindowResult execute_known_prefix_window_eager(
                 throw std::invalid_argument("known window promoted entries cannot consume host position history");
             if(window.mode[i]==KnownWindowStepMode::shared_rows || window.mode[i]==KnownWindowStepMode::gdn_rows ||
                 window.mode[i]==KnownWindowStepMode::routed_expert_union || window.mode[i]==KnownWindowStepMode::hyper_mix_rows ||
-                window.mode[i]==KnownWindowStepMode::qsa_rows) {
+                window.mode[i]==KnownWindowStepMode::qsa_rows || window.mode[i]==KnownWindowStepMode::gdn_deferred_rows ||
+                window.mode[i]==KnownWindowStepMode::ple_rows) {
                 const auto found=std::find_if(rows_entries.begin(),rows_entries.end(),
                     [&](const KnownWindowRowsEntry& e){return e.variant==window.r2_variant[i];});
                 if(found==rows_entries.end()) throw std::invalid_argument("known window wide implementation is missing");

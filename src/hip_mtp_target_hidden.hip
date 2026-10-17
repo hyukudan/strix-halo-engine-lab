@@ -9,6 +9,7 @@
 #include "strix/dispatch_resources.hpp"
 #include "strix/hip_mtp_native_validation.hpp"
 #include <algorithm>
+#include <optional>
 #include <stdexcept>
 #include <vector>
 namespace strix {
@@ -51,6 +52,9 @@ struct HipMtpTargetHiddenTicket::Lease {
     std::shared_ptr<const HipMtpTargetWindowBatch> batch;
     std::uint32_t batch_row=0;
     ModelContentIdentity content;
+    // Set for rows promoted from a partially accepted window: the batch's committed session
+    // covers every executed row, this one ends at the accepted prefix.
+    std::optional<SerialSessionContext> prefix_committed;
 };
 struct HipMtpTargetHidden::Impl {
     struct Slot {
@@ -109,6 +113,7 @@ std::uint64_t HipMtpTargetHiddenTicket::chunk_begin() const {
 }
 std::uint64_t HipMtpTargetHiddenTicket::chunk_end() const {
     if(!lease_)throw std::invalid_argument("MTP target hidden ticket is empty");
+    if(lease_->prefix_committed) return lease_->prefix_committed->next_position;
     return lease_->batch?lease_->batch->chunk_end():lease_->position+1;
 }
 MtpDeviceView HipMtpTargetHiddenTicket::view() const {
@@ -125,7 +130,7 @@ MtpDeviceView HipMtpTargetHiddenTicket::view() const {
 std::uint64_t HipMtpTargetHiddenTicket::source_position() const {if(!lease_)throw std::invalid_argument("MTP target hidden ticket is empty");return lease_->position;}
 std::uint32_t HipMtpTargetHiddenTicket::input_token() const {if(!lease_)throw std::invalid_argument("MTP target hidden ticket is empty");return lease_->token;}
 std::uint32_t HipMtpTargetHiddenTicket::predicted_token() const {if(!lease_)throw std::invalid_argument("MTP target hidden ticket is empty");return lease_->predicted;}
-const SerialSessionContext& HipMtpTargetHiddenTicket::committed_session() const {if(!lease_)throw std::invalid_argument("MTP target hidden ticket is empty");return lease_->batch?lease_->batch->committed_session():lease_->committed;}
+const SerialSessionContext& HipMtpTargetHiddenTicket::committed_session() const {if(!lease_)throw std::invalid_argument("MTP target hidden ticket is empty");return lease_->prefix_committed?*lease_->prefix_committed:lease_->batch?lease_->batch->committed_session():lease_->committed;}
 ModelContentIdentity HipMtpTargetHiddenTicket::target_content_identity() const {if(!lease_)throw std::invalid_argument("MTP target hidden ticket is empty");return lease_->content;}
 std::shared_ptr<HipMtpTargetHidden> HipMtpTargetHidden::create(
     const ModelContract& m,const CompiledSerialExecution& c,
@@ -331,6 +336,35 @@ std::vector<HipMtpTargetHiddenTicket> HipMtpTargetHidden::accept_verified_window
         lease->owner=shared_from_this();lease->batch=batch;lease->batch_row=row;
         lease->position=batch->source_position(row);lease->token=inputs[row];lease->predicted=predictions[row];
         lease->content=batch->target_content_identity();
+        HipMtpTargetHiddenTicket ticket;ticket.lease_=std::move(lease);result.push_back(std::move(ticket));
+    }
+    return result;
+}
+std::vector<HipMtpTargetHiddenTicket> HipMtpTargetHidden::accept_verified_prefix(
+    std::shared_ptr<const HipMtpTargetWindowBatch> batch,const HipMtpTargetHiddenTicket& base,
+    const SerialSessionContext& target,std::uint32_t n_keep) {
+    auto& i=*impl_;i.guard->require_original();i.memory->validate_inventory_ownership();
+    if(!batch || !batch->valid() || !base.lease_ || base.lease_->owner.get()!=this || i.busy || i.failed ||
+       !same_target_state(batch->source_state_memory_binding(),i.memory->state()) ||
+       !same_target_weights(batch->source_weights_binding(),i.weights->binding()) ||
+       batch->target_content_identity()!=i.weights->binding().model_content_identity ||
+       !same_target_session(batch->base_session(),base.committed_session()) ||
+       target.health!=SerialSessionHealth::ready || !n_keep || n_keep>batch->logical_rows() ||
+       batch->chunk_begin()!=base.source_position()+1 || batch->chunk_begin()+n_keep!=target.next_position ||
+       target.committed_tokens!=base.committed_session().committed_tokens+n_keep ||
+       !arithmetic_lineage_valid(target.arithmetic_lineage,target.next_position))
+        throw std::invalid_argument("MTP prefix promotion lacks exact actual target chunk binding");
+    std::vector<HipMtpTargetHiddenTicket> result;result.reserve(n_keep);
+    for(std::uint32_t row=0;row<n_keep;++row) {
+        if(batch->source_position(row)!=batch->chunk_begin()+row)
+            throw std::invalid_argument("MTP window source positions are not the actual contiguous chunk");
+        if(row && batch->input_token(row)!=batch->predicted_token(row-1U))
+            throw std::invalid_argument("MTP prefix row was not an accepted draft");
+        auto lease=std::make_shared<HipMtpTargetHiddenTicket::Lease>();
+        lease->owner=shared_from_this();lease->batch=batch;lease->batch_row=row;
+        lease->position=batch->source_position(row);lease->token=batch->input_token(row);
+        lease->predicted=batch->predicted_token(row);lease->content=batch->target_content_identity();
+        lease->prefix_committed=target; // every prefix row's chunk ends at the accepted frontier
         HipMtpTargetHiddenTicket ticket;ticket.lease_=std::move(lease);result.push_back(std::move(ticket));
     }
     return result;

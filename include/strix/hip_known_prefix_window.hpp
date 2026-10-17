@@ -85,6 +85,12 @@ public:
     // Last eligible layer in the last SUCCESSFULLY completed window only.
     // Not aggregate reuse, DRAM traffic, timing or model qualification.
     [[nodiscard]] std::optional<HipKnownPrefixUnionObservation> latest_routed_union_observation() const noexcept;
+    // Prefix acceptance (deferred GDN / PLE rows windows). The window executed all rows but only
+    // [0, n_keep) are committed; the caller rewinds its session frontier to match.
+    [[nodiscard]] bool defers_state() const noexcept;
+    void commit_prefix(std::uint32_t n_keep);
+    // Applies pending GDN rows before any ordinary serial token touches GDN state.
+    void flush_deferred();
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
