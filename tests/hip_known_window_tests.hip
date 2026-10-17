@@ -3,6 +3,8 @@
 #include "strix/execution_io.hpp"
 #include "strix/execution_plan.hpp"
 #include "strix/hip_gdn_launcher.hpp"
+#include "strix/hip_generation_output.hpp"
+#include "strix/hip_lm_head_launcher.hpp"
 #include "strix/hip_launch_context.hpp"
 #include "strix/hip_setup_quiescence.hpp"
 #include "strix/hip_shared_expert_launcher.hpp"
@@ -870,6 +872,103 @@ void family(bool gdn, bool prefetch = false) {
             });
     }
 }
+// Terminal head over real window row views: the configured prefetch R1 head
+// per row is the oracle; device greedy rows land in host-mapped memory.
+void family_lm_head_rows(std::uint32_t rows) {
+    Owner owner;
+    const auto model = ModelContract::qwen38_flash_next();
+    const auto plan = build_serial_decode_execution_plan(model);
+    const auto io = build_serial_execution_io_plan(plan);
+    const auto step = plan.steps.back();
+    require(step.op == SerialOp::lm_head, "canonical plan ends in its LM head");
+    constexpr std::uint32_t hidden = 2560U, vocab = 4099U;
+    const auto& step_io = io.steps[step.id];
+    ExecutionArenaPlan serial; serial.alignment = 256U;
+    serial.allocations.push_back({step_io.reads[0], step.id, step.id, 0, hidden * 2U});
+    serial.allocations.push_back({step_io.writes[0], step.id, step.id, 5120U, vocab * 4U + 64U});
+    serial.total_bytes = (5120U + vocab * 4U + 64U + 255U) / 256U * 256U;
+    serial.naive_nonaliased_bytes = serial.total_bytes;
+    const auto window = build_known_window_arena(serial, 256U, rows);
+    const auto scratch = owner.allocate(window.physical.total_bytes);
+    const ExecutionMemoryBinding memory{0x4b4e4f574e4c4d01ULL, scratch.address, scratch.bytes, 23U};
+    const auto weights = q8(hidden, vocab, 5U);
+    const auto device_weights = owner.allocate(weights.size());
+    write(device_weights, weights);
+    ModelManifest manifest; manifest.architecture = "qwen4_exp";
+    ManifestTensor tensor; tensor.name = "output.weight"; tensor.role = TensorRole::output_head;
+    tensor.dimensions = {hidden, vocab}; tensor.ggml_type = 8U; tensor.byte_size = weights.size();
+    manifest.tensors.push_back(tensor); manifest.total_tensor_bytes = tensor.byte_size;
+    manifest.layout_identity = model_manifest_layout_identity(manifest);
+    ModelRuntimeBinding runtime; runtime.manifest_layout_identity = manifest.layout_identity;
+    runtime.model_content_identity.bytes[0] = 1U;
+    runtime.tensors.push_back({0, RuntimeTensorStorage::resident, device_weights.address, device_weights.bytes, 1, 0});
+    ExecutionTensorAccessPlan access; access.manifest_layout_identity = manifest.layout_identity;
+    access.plan_identity = 0x4b4e4f574e4c4d02ULL; access.accesses.push_back({step.id, SerialOp::lm_head, 0, {0}});
+    const ExecutionRuntimeResources resources{&memory, &manifest, &runtime, &access};
+    HipLmHeadLauncherConfig config{hidden, vocab, HipActivationStorage::bf16, true, true, true};
+    const std::string id = "hip.lm_head.bf16.h2560.v4099.r1.c1.prefetch8-wave8-v1.virtual256.q8";
+    std::vector<ExecutionDispatchContext> contexts(rows);
+    std::vector<ExecutionBufferAddress> logits(rows);
+    for (std::uint32_t r = 0; r < rows; ++r) {
+        auto& c = contexts[r];
+        c.execution_identity = memory.execution_identity; c.step_id = step.id; c.op = step.op; c.kernel_id = id;
+        c.reads = step_io.reads; c.writes = step_io.writes; c.arena = &window.row_view[r]; c.memory = &memory;
+        c.resources = &resources; c.position = r;
+        const auto in = resolve_dispatch_read(c, 0);
+        std::vector<std::uint16_t> bits(hidden);
+        for (std::uint32_t i = 0; i < hidden; ++i)
+            bits[i] = bf16(static_cast<float>(static_cast<int>((i * (2U * r + 5U)) % 23U) - 11) / 17.0F);
+        write({in.address, hidden * 2U}, bytes_of(bits));
+        logits[r] = resolve_dispatch_write(c, 0);
+    }
+    HipLaunchContext scope; scope.stream = owner.stream;
+    const auto launcher = make_hip_lm_head_launcher(id, &config);
+    const auto run = [&](bool candidate) {
+        for (const auto& l : logits) check(hipMemset(reinterpret_cast<void*>(l.address), 0xff, l.bytes), "poison head rows");
+        {
+            const HipLaunchScope owned(scope);
+            if (candidate) { lm_head_known_window_rows_preflight(contexts, config); lm_head_known_window_rows_launch(contexts, config); }
+            else for (const auto& c : contexts) launcher.function(c, launcher.user_data);
+        }
+        owner.finish();
+        std::vector<std::vector<unsigned char>> out;
+        for (const auto& l : logits) out.push_back(read({l.address, l.bytes}));
+        return out;
+    };
+    const auto reference = run(false);
+    require(run(true) == reference && run(true) == reference, "window head rows differ from R1 head bytes or tails");
+    require(window.row_stride[1] != 0U, "window head rows use striped row views");
+    check(hipStreamBeginCapture(owner.stream, hipStreamCaptureModeThreadLocal), "begin head rows capture");
+    bool rejected = false;
+    { const HipLaunchScope owned(scope);
+      try { lm_head_known_window_rows_launch(contexts, config); } catch (const std::invalid_argument&) { rejected = true; } }
+    hipGraph_t graph{};
+    check(hipStreamEndCapture(owner.stream, &graph), "end head rows capture");
+    owner.graphs.push_back(graph);
+    std::size_t nodes = 0;
+    check(hipGraphGetNodes(graph, nullptr, &nodes), "count head rows capture nodes");
+    require(rejected && nodes == 0U, "eager-only head rows reject stream capture before any enqueue");
+    const auto partials = owner.allocate(hip_greedy_rows_scratch_bytes(rows, vocab));
+    HipGreedyRowsReply* replies = nullptr;
+    check(hipHostMalloc(reinterpret_cast<void**>(&replies), rows * sizeof(*replies), hipHostMallocMapped | hipHostMallocCoherent),
+        "allocate mapped head replies");
+    std::fill(replies, replies + rows, HipGreedyRowsReply{~0U, ~0U});
+    {
+        const HipLaunchScope owned(scope);
+        lm_head_known_window_rows_launch(contexts, config);
+        ExecutionBufferAddress p; p.address = partials.address; p.bytes = partials.bytes; p.allocation_generation = 1;
+        enqueue_hip_greedy_rows(logits, vocab, p, replies, owner.stream);
+    }
+    owner.finish();
+    for (std::uint32_t r = 0; r < rows; ++r) {
+        std::vector<float> values(vocab);
+        std::memcpy(values.data(), reference[r].data(), vocab * 4U);
+        std::uint32_t best = 0;
+        for (std::uint32_t i = 1; i < vocab; ++i) if (values[i] > values[best]) best = i;
+        require(replies[r].token == best && replies[r].status == 0U, "mapped greedy row differs from first-max R1 logits");
+    }
+    check(hipHostFree(replies), "free mapped head replies");
+}
 } // namespace
 
 int main() try {
@@ -878,7 +977,8 @@ int main() try {
     family(true);
     family_gdn_f32_gates();
     for(auto rows:{16U,17U}) {family_prefill_tiles(false,rows);family_prefill_tiles(true,rows);}
-    std::cout << "known-window shared/GDN component fixtures passed\n";
+    for(auto rows:{2U,4U,8U}) family_lm_head_rows(rows);
+    std::cout << "known-window shared/GDN/LM-head component fixtures passed\n";
     return 0;
 } catch (const std::exception& error) {
     std::cerr << "known-window component fixture failed: " << error.what() << '\n';

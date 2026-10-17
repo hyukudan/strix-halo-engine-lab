@@ -67,6 +67,7 @@ struct KnownWindowResult {
     std::uint32_t shared_rows_dispatches = 0;
     std::uint32_t gdn_rows_dispatches = 0;
     std::uint32_t routed_expert_union_dispatches = 0;
+    std::uint32_t lm_head_rows_dispatches = 0;
     std::array<std::uint32_t, known_window_r2_variant_slots> r2_variant_dispatches{};
     std::vector<std::uint32_t> logit_row_indices;
     std::uint32_t omitted_lm_heads = 0;

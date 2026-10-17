@@ -2,6 +2,8 @@
 #include "strix/hip_mtp_target_window.hpp"
 
 #include "strix/deferred_moe_status.hpp"
+#include "strix/dispatch_resources.hpp"
+#include "strix/hip_generation_output.hpp"
 #include "strix/hip_setup_quiescence.hpp"
 #include "strix/prepared_tensor_views.hpp"
 
@@ -96,6 +98,9 @@ struct HipKnownPrefixWindow::Impl {
     HipSharedExpertLauncherConfig shared_config, shared_fallback;
     HipGdnLauncherConfig gdn_config;
     HipMoeExpertsLauncherConfig routed_config;
+    HipLmHeadLauncherConfig head_config;
+    ExecutionBufferAddress greedy_partials{};
+    HipGreedyRowsReply* greedy_replies = nullptr;
     q51_known_rows::Workspace routed_workspace;
     q51_known_rows::Summary pending_union_summary;
     std::uint32_t last_union_layer = 0;
@@ -174,6 +179,7 @@ struct HipKnownPrefixWindow::Impl {
         setup_r2();
         setup_rows();
         setup_routed_union();
+        setup_head_rows();
         // Setup only: no execution callback clears or reads this record before
         // all deep admission. Exclusive status ownership preserves zero across
         // successful calls; any exception disables the owner permanently.
@@ -342,6 +348,34 @@ struct HipKnownPrefixWindow::Impl {
                 moe_experts_known_window_rows_launch(rows,self.routed_config,self.routed_workspace);
             }});
     }
+    void setup_head_rows() {
+        if(!window.lm_head_rows_steps) return;
+        head_config.hidden_size=u32(model.hidden_size); head_config.vocab_size=u32(model.vocab_size);
+        head_config.input=config.activation; head_config.virtual_q8_wave=config.virtual_q8_lm_head;
+        head_config.prefetch_q8_wave=config.prefetch_q8_lm_head; head_config.wave8_q8_wave=config.wave8_q8_lm_head;
+        const auto variant=window.logical_rows==2U?KnownWindowR2Variant::lm_head_q8_prefetch8_rows2_v1:
+            window.logical_rows==4U?KnownWindowR2Variant::lm_head_q8_prefetch8_rows4_v1:KnownWindowR2Variant::lm_head_q8_prefetch8_rows8_v1;
+        rows_entries.push_back({variant,this,
+            [](std::span<const ExecutionDispatchContext> rows,void* object) {
+                lm_head_known_window_rows_preflight(rows,static_cast<Impl*>(object)->head_config);
+            },
+            [](std::span<const ExecutionDispatchContext> rows,void* object) {
+                const auto& self=*static_cast<Impl*>(object);
+                lm_head_known_window_rows_launch(rows,self.head_config);
+                if(!self.greedy_replies) return;
+                std::array<ExecutionBufferAddress,hip_greedy_rows_max> logits{};
+                for(std::size_t r=0;r<rows.size();++r) logits[r]=resolve_dispatch_write(rows[r],0);
+                enqueue_hip_greedy_rows(std::span<const ExecutionBufferAddress>(logits.data(),rows.size()),
+                    self.head_config.vocab_size,self.greedy_partials,self.greedy_replies,hip_execution_stream());
+            }});
+    }
+    void attach_greedy_rows(ExecutionBufferAddress partials,HipGreedyRowsReply* replies) {
+        if(executing || failed || prefill || !window.lm_head_rows_steps || !replies ||
+            partials.bytes<hip_greedy_rows_scratch_bytes(window.logical_rows,u32(model.vocab_size)))
+            throw std::invalid_argument("known-window greedy rows require an idle multi-row head window and sized scratch");
+        status_disjoint(partials.address,partials.bytes);
+        greedy_partials=partials; greedy_replies=replies;
+    }
     void complete() {
         guard.require_original();
         if(window.routed_expert_union_steps)
@@ -396,6 +430,9 @@ struct HipKnownPrefixWindow::Impl {
         case KnownWindowR2Variant::routed_q51_union_rows2_v1:
         case KnownWindowR2Variant::routed_q51_union_rows4_v1:
         case KnownWindowR2Variant::routed_q51_union_rows8_v1: recipe="hip-routed-known-q4ka8-q51-union-dot-orderedslot-v1";break;
+        case KnownWindowR2Variant::lm_head_q8_prefetch8_rows2_v1:
+        case KnownWindowR2Variant::lm_head_q8_prefetch8_rows4_v1:
+        case KnownWindowR2Variant::lm_head_q8_prefetch8_rows8_v1: recipe="hip-lm-head-known-rows-q8prefetch8-r1tree-v1";break;
         default:throw std::invalid_argument("known-window capture has no closed native recipe");
         }
         return capture_identity(recipe,static_cast<std::uint32_t>(variant));
@@ -551,6 +588,9 @@ HipMtpTargetWindowExecution HipKnownPrefixWindow::execute_mtp_captured(SerialSes
     std::shared_ptr<HipMtpTargetWindowCapture> capture,const std::function<void()>& before_publish){
     if(!capture)throw std::invalid_argument("MTP target capture owner is absent");
     HipMtpTargetWindowExecution out;out.execution=impl_->execute(session,tokens,before_publish,capture,&out.batch);return out;
+}
+void HipKnownPrefixWindow::attach_greedy_rows(ExecutionBufferAddress partials,HipGreedyRowsReply* replies) {
+    impl_->attach_greedy_rows(partials,replies);
 }
 std::uint32_t HipKnownPrefixWindow::logical_rows() const noexcept { return impl_->logical_rows(); }
 bool HipKnownPrefixWindow::supports_tiled_prefill() const noexcept {return impl_->prefill.has_value();}

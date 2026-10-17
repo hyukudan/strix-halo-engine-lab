@@ -560,6 +560,26 @@ WindowGdnFormat window_gdn_format(const ModelManifest& manifest, const Execution
     if (admit_f32_gates && large_q8 && f32_gates) return WindowGdnFormat::q8_large_f32_gates;
     return WindowGdnFormat::unsupported;
 }
+bool known_head_id(std::string_view id, std::uint64_t vocab) {
+    const auto base = "hip.lm_head.bf16.h2560.v" + std::to_string(vocab) + ".r1.c1";
+    return id == base + ".prefetch8-wave8-v1.virtual256.q8" || id == base + ".prefetch8-load-v1.virtual256.q8";
+}
+KnownWindowR2Variant head_rows_variant(std::uint32_t rows) {
+    return rows==2U?KnownWindowR2Variant::lm_head_q8_prefetch8_rows2_v1:
+        rows==4U?KnownWindowR2Variant::lm_head_q8_prefetch8_rows4_v1:KnownWindowR2Variant::lm_head_q8_prefetch8_rows8_v1;
+}
+std::uint64_t known_head_bytes(std::uint64_t vocab) { return 2560ULL / 32ULL * 34ULL * vocab; }
+bool window_head_types(const ModelManifest& manifest, const ExecutionTensorAccessPlan& access,
+    const ExecutionStep& step, std::uint64_t vocab) {
+    const ManifestTensor* selected = nullptr;
+    for (const auto& item : access.accesses) if (item.step_id == step.id) {
+        window_require(item.op == step.op && item.tensor_indices.size() == 1U && !selected &&
+            item.tensor_indices[0] < manifest.tensors.size(), "known window head tensor access is not one tensor");
+        selected = &manifest.tensors[item.tensor_indices[0]];
+    }
+    window_require(selected && selected->role == TensorRole::output_head, "known window head tensor is missing");
+    return window_matrix(*selected, 2560, vocab);
+}
 constexpr std::uint64_t known_shared_projection_bytes = 3ULL * (2560ULL / 32ULL * 34ULL * 640ULL);
 constexpr std::uint64_t known_gdn_projection_bytes = 2560ULL / 32ULL * 34ULL *
     (10240ULL + 6144ULL + 48ULL + 48ULL) + 6144ULL / 32ULL * 34ULL * 2560ULL;
@@ -579,7 +599,8 @@ std::pair<std::uint64_t, std::uint64_t> known_window_identities(
         serial.execution.steps.back().writes_state==PersistentState::none &&
         serial.io.steps.back().writes.size()==1U &&
         serial.io.steps.back().writes[0].buffer.buffer_class==ExecutionBufferClass::logits &&
-        window.mode.back()==KnownWindowStepMode::r1_row_loop &&
+        (window.mode.back()==KnownWindowStepMode::r1_row_loop ||
+         (window.mode.back()==KnownWindowStepMode::lm_head_rows && window.output_policy==KnownWindowOutputPolicy::all_rows)) &&
         !serial.bindings.bindings.back().host_or_runtime_step,
         "known-window output policy requires a terminal state-free LM head");
     std::vector<std::uint32_t> expected_logits;
@@ -589,7 +610,7 @@ std::pair<std::uint64_t, std::uint64_t> known_window_identities(
     auto kernel = fnv_offset; window_hash_text(kernel, window.logical_rows==2U ? "known-window-r2-kernels-v1" : "known-window-rows-kernels-v1");
     if(window.logical_rows!=2U) hash_u64(kernel,window.logical_rows);
     hash_u64(kernel, serial.kernel_plan_identity); hash_u64(kernel, window.mode.size());
-    std::uint32_t r2 = 0, loops = 0, runtime = 0, shared_rows = 0, gdn_rows = 0, routed_union=0;
+    std::uint32_t r2 = 0, loops = 0, runtime = 0, shared_rows = 0, gdn_rows = 0, routed_union=0, head_rows=0;
     std::uint64_t avoided = 0;
     std::uint32_t launches = 0;
     for (std::size_t i = 0; i < window.mode.size(); ++i) {
@@ -624,6 +645,12 @@ std::pair<std::uint64_t, std::uint64_t> known_window_identities(
             ++routed_union;
             // Routes are device results. No static weight-byte or launch-saving
             // claim is inferred before the actual union has been constructed.
+        } else if (mode==KnownWindowStepMode::lm_head_rows) {
+            window_require(step.op==SerialOp::lm_head && i+1U==window.mode.size() && binding.kernel_id &&
+                known_head_id(*binding.kernel_id,serial.vocab_size) && variant==head_rows_variant(window.logical_rows),
+                "known window LM head rows variant/source ID mismatch");
+            ++head_rows; avoided+=known_head_bytes(serial.vocab_size)*(window.logical_rows-1U);
+            launches+=window.logical_rows-1U;
         } else if (mode == KnownWindowStepMode::r2_gdn_staged) {
             window_require(step.op == SerialOp::gated_delta_net &&
                 (variant == KnownWindowR2Variant::gdn_q8_virtual256_r2_v1 ||
@@ -642,7 +669,7 @@ std::pair<std::uint64_t, std::uint64_t> known_window_identities(
     }
     window_require(r2 == window.r2_steps && loops == window.row_loop_steps && runtime == window.runtime_row_steps &&
         shared_rows==window.shared_rows_steps && gdn_rows==window.gdn_rows_steps &&
-        routed_union==window.routed_expert_union_steps,
+        routed_union==window.routed_expert_union_steps && head_rows==window.lm_head_rows_steps,
         "known window counters do not match its actual mode table");
     window_require(avoided == window.logical_projection_weight_bytes_avoided &&
         launches == window.projection_launches_saved,
@@ -759,11 +786,21 @@ CompiledKnownPrefixWindow compile_known_prefix_window(
             output.mode[i]=KnownWindowStepMode::routed_expert_union;
             output.r2_variant[i]=routed_union_variant(output.logical_rows);
         }
+        if(request.lm_head_rows && output.output_policy==KnownWindowOutputPolicy::all_rows &&
+            i+1U==output.mode.size() && step.op==SerialOp::lm_head && binding.kernel_id &&
+            known_head_id(*binding.kernel_id,serial.vocab_size) &&
+            window_head_types(manifest,tensor_access,step,serial.vocab_size)) {
+            output.mode[i]=KnownWindowStepMode::lm_head_rows;
+            output.r2_variant[i]=head_rows_variant(output.logical_rows);
+            output.logical_projection_weight_bytes_avoided+=known_head_bytes(serial.vocab_size)*(output.logical_rows-1U);
+            output.projection_launches_saved+=output.logical_rows-1U;
+        }
         if (output.mode[i] == KnownWindowStepMode::r1_row_loop) {
             ++output.row_loop_steps; if (binding.host_or_runtime_step) ++output.runtime_row_steps;
         } else if(output.mode[i]==KnownWindowStepMode::shared_rows) ++output.shared_rows_steps;
         else if(output.mode[i]==KnownWindowStepMode::gdn_rows) ++output.gdn_rows_steps;
         else if(output.mode[i]==KnownWindowStepMode::routed_expert_union) ++output.routed_expert_union_steps;
+        else if(output.mode[i]==KnownWindowStepMode::lm_head_rows) ++output.lm_head_rows_steps;
         else ++output.r2_steps;
     }
     const auto identities = known_window_identities(output, serial);
@@ -820,6 +857,9 @@ void validate_known_prefix_window_formats(
         if (window.mode[i] == KnownWindowStepMode::r2_shared_q8 || window.mode[i] == KnownWindowStepMode::shared_rows) {
             window_require(window_shared_types(manifest, tensor_access, step),
                 "known window shared variant differs from the selected tensor formats");
+        } else if(window.mode[i]==KnownWindowStepMode::lm_head_rows) {
+            window_require(window_head_types(manifest,tensor_access,step,serial.vocab_size),
+                "known window LM head rows differ from the selected head format");
         } else if(window.mode[i]==KnownWindowStepMode::routed_expert_union) {
             window_require(window_routed_union_types(manifest,tensor_access,step),
                 "known window routed union differs from the selected tensor formats");
