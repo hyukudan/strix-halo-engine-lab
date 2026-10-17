@@ -2049,6 +2049,56 @@ __global__ void rows_lane_chain_hyper_output_kernel(HyperRows rows, std::uint32_
     }
 }
 
+// Rank-320 form of the rows lane chain: each lane loads its own 340-byte Q8 row straight into registers
+// (21 x 16 B + 4 B, all issued up front) and starts the chain as soon as the first block has arrived, so
+// the chain overlaps the remaining loads instead of following a whole-tile LDS stage. Same per-row chain
+// (block, then code order), same coefficient and accumulation expressions, same stream mix.
+template <typename Storage, std::uint32_t Count>
+__global__ void rows_lane_chain_hyper_output_regs_kernel(HyperRows rows, const void* up,
+    std::uint32_t hidden, std::uint32_t streams) {
+    constexpr std::uint32_t kBlocks = 10U, kRowBytes = kBlocks * 34U, kWords = kRowBytes / 4U;
+    extern __shared__ __align__(16) unsigned char staging[];
+    const auto lane = threadIdx.x & 31U, stream = threadIdx.x / 32U;
+    const std::uint64_t first = static_cast<std::uint64_t>(blockIdx.x) * 32U;
+    const auto* row = static_cast<const unsigned char*>(up) +
+        (static_cast<std::uint64_t>(stream) * hidden + first + lane) * kRowBytes;
+    unsigned words[kWords];
+#pragma unroll
+    for (std::uint32_t q = 0; q < kWords / 4U; ++q) {
+        const uint4 v = *reinterpret_cast<const uint4*>(row + 16U * q);
+        words[4U * q] = v.x; words[4U * q + 1U] = v.y; words[4U * q + 2U] = v.z; words[4U * q + 3U] = v.w;
+    }
+#pragma unroll
+    for (std::uint32_t w = (kWords / 4U) * 4U; w < kWords; ++w) words[w] = *reinterpret_cast<const unsigned*>(row + 4U * w);
+    const auto byte_at = [&](std::uint32_t i) -> unsigned { return (words[i / 4U] >> (8U * (i % 4U))) & 255U; };
+    auto* sig = reinterpret_cast<float*>(staging);
+    const float* low[Count];
+    float gate[Count];
+#pragma unroll
+    for (std::uint32_t t = 0; t < Count; ++t) { low[t] = rows.low[t]; gate[t] = 0.0F; }
+#pragma unroll
+    for (std::uint32_t block = 0; block < kBlocks; ++block) {
+        const auto scale_bits = static_cast<unsigned short>(byte_at(block * 34U) | (byte_at(block * 34U + 1U) << 8U));
+        const float scale = __half2float(__ushort_as_half(scale_bits));
+#pragma unroll
+        for (std::uint32_t k = 0; k < 32U; ++k) {
+            const float coefficient = scale * static_cast<float>(static_cast<signed char>(byte_at(block * 34U + 2U + k)));
+#pragma unroll
+            for (std::uint32_t t = 0; t < Count; ++t)
+                gate[t] += low[t][static_cast<std::uint64_t>(block) * 32U + k] * coefficient;
+        }
+    }
+#pragma unroll
+    for (std::uint32_t t = 0; t < Count; ++t) sig[(t * streams + stream) * 32U + lane] = sigmoid(gate[t]);
+    __syncthreads();
+    for (std::uint32_t t = stream; t < Count; t += streams) {
+        float mixed = 0.0F; const auto feature = first + lane;
+        for (std::uint32_t s2 = 0; s2 < streams; ++s2)
+            mixed += rows.normalized[t][static_cast<std::uint64_t>(s2) * hidden + feature] * sig[(t * streams + s2) * 32U + lane];
+        store_activation(&static_cast<Storage*>(rows.output[t])[feature], mixed / static_cast<float>(streams));
+    }
+}
+
 bool supported_norm_type(
     std::uint32_t ggml_type) noexcept {
     return ggml_type == 0 ||
@@ -2934,7 +2984,17 @@ void hyper_mix_known_window_rows_launch(std::span<const ExecutionDispatchContext
         if (config.lane_chain_output) {
             const auto lds = lane_chain_hyper_output_lds(config.hc_count, config.lowrank) +
                 static_cast<std::uint64_t>(count - 1U) * config.hc_count * 32U * sizeof(float);
+            // STRIX_HC_LANE_CHAIN_REGS=0: keep the LDS-staged form for rank 320 as well.
+            static const bool regs = [] { const char* v = std::getenv("STRIX_HC_LANE_CHAIN_REGS"); return !v || v[0] != '0'; }();
             const auto output = [&]<std::uint32_t Count>() {
+                // Register form only up to 4 rows: at 8 rows it runs out of registers (32.1 -> 37.3 us).
+                if constexpr (Count != 0U && Count <= 4U) if (regs && config.lowrank == 320U) {
+                    hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_lane_chain_hyper_output_regs_kernel<Storage, Count>),
+                        dim3(config.hidden_size / 32U), dim3(32U * config.hc_count),
+                        static_cast<std::size_t>(Count) * config.hc_count * 32U * sizeof(float), hip_execution_stream(),
+                        prepared.rows, reinterpret_cast<const void*>(p.up_runtime->address), config.hidden_size, config.hc_count);
+                    return;
+                }
                 hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_lane_chain_hyper_output_kernel<Storage, Count>), dim3(config.hidden_size / 32U),
                     dim3(32U * config.hc_count), static_cast<std::size_t>(lds), hip_execution_stream(), prepared.rows, count,
                     reinterpret_cast<const void*>(p.up_runtime->address), config.hidden_size, config.hc_count, config.lowrank);
