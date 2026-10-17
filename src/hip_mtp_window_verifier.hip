@@ -10,6 +10,7 @@
 #include <array>
 #include <chrono>
 #include <cstdlib>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <string_view>
@@ -167,6 +168,8 @@ struct HipMtpWindowVerifier::Impl {
         const auto now=std::chrono::steady_clock::now();
         if(last_end && emitted) {
             const auto ms=std::chrono::duration<double,std::milli>(now-*last_end).count();
+            static const bool log_cycles=std::getenv("STRIX_CYCLE_LOG")!=nullptr;
+            if(log_cycles) std::fprintf(stderr,"cycle rows=%u emitted=%zu ms=%.2f\n",owner?owner->rows:1U,emitted,ms);
             constexpr double alpha=0.25;
             // A sample is capped at twice the running estimate: one slow cycle (page faults,
             // a stalled host) must not price an owner out of every later choice.

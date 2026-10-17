@@ -37,6 +37,10 @@
 #include "strix/wave_router_contract.hpp"
 #include "strix/model_tensor_index.hpp"
 #include "strix/ple_lookup.hpp"
+#if defined(__linux__)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 #include "strix/runtime_allocator.hpp"
 #include "strix/raw_baseline_recording.hpp"
 #include "strix/final_generation_state_export.hpp"
@@ -99,6 +103,43 @@
 #include <vector>
 
 namespace {
+// File-backed tensors (the PLE n-gram table) are read row by row on the host during decode.
+// Another process can evict them, turning those reads into random disk I/O while the GPU waits
+// (and every fault pulls a whole readahead window for a ~100-byte row). Mark them random-access
+// and populate them once, after the model registration. STRIX_PLE_WARM=0 skips it.
+void warm_file_backed_tensors(const strix::MappedModelFile& mapped, const strix::ModelManifest& manifest) {
+#if defined(__linux__)
+    const char* v = std::getenv("STRIX_PLE_WARM");
+    if (v && v[0] == '0') return;
+    const auto page = static_cast<std::uintptr_t>(sysconf(_SC_PAGESIZE));
+    const auto t0 = std::chrono::steady_clock::now();
+    std::uint64_t bytes = 0;
+    for (const auto& tensor : manifest.tensors) {
+        if (tensor.residency != strix::ResidencyPolicy::file_backed_candidate || !tensor.byte_size) continue;
+        if (tensor.absolute_offset > mapped.bytes() || tensor.byte_size > mapped.bytes() - tensor.absolute_offset) continue;
+        const auto begin = (mapped.base_address() + tensor.absolute_offset) & ~(page - 1U);
+        const auto end = mapped.base_address() + tensor.absolute_offset + tensor.byte_size;
+        auto* address = reinterpret_cast<void*>(begin);
+        const auto length = static_cast<std::size_t>(end - begin);
+        (void)madvise(address, length, MADV_RANDOM);
+#if defined(MADV_POPULATE_READ)
+        if (madvise(address, length, MADV_POPULATE_READ) != 0)
+#endif
+        {
+            (void)madvise(address, length, MADV_WILLNEED);
+            volatile std::uint8_t sink = 0;
+            for (auto at = begin; at < end; at += page) sink = sink + *reinterpret_cast<const volatile std::uint8_t*>(at);
+            (void)sink;
+        }
+        bytes += tensor.byte_size;
+    }
+    if (bytes)
+        std::fprintf(stderr, "warmed %.1f GB of file-backed tensors in %.1f s\n", static_cast<double>(bytes) / 1e9,
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+#else
+    (void)mapped; (void)manifest;
+#endif
+}
 using strix::decode_cli::parse_options;
 
 // One optional stderr JSON record; stdout keeps its existing decoder receipt.
@@ -1639,6 +1680,8 @@ int STRIX_DECODE_ENTRY(
     auto model_owner = std::make_shared<strix::HipModelResidency>(
         strix::HipModelResidency::create(mapped_owner, manifest, generations, residency_policy));
     auto& model_residency = *model_owner;
+    // After registration: pinning the model may evict anything populated before it.
+    warm_file_backed_tensors(mapped, manifest);
     // Keep the actual registration/copy owner and its exact map control block
     // pinned in the optional inventory; this is virtual backing, not RSS/PFN evidence.
     std::optional<strix::UmaOwnerInventory> model_owner_inventory;
