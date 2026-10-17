@@ -185,6 +185,22 @@ int main(){try{
     // Parsing precedes automatic context resolution. A normal512 output request
     // must remain admissible until the actual resolved context is known.
     good.context_tokens=8192;strix::decode_cli::validate_resolved_mtp_cli(good);
+    require(!good.mtp.draft_chain && good.mtp.draft_vocab.empty() && !good.mtp.draft_context_vocab,
+        "ordinary MTP keeps the full-head per-draft path");
+    auto chain=request();chain.push_back("--mtp-draft-chain");
+    const auto full_chain=parse(chain);
+    require(full_chain.mtp.draft_chain && full_chain.mtp.draft_vocab.empty() && !full_chain.mtp.draft_context_vocab,
+        "draft chain alone keeps the full draft head");
+    chain.insert(chain.end(),{"--mtp-draft-vocab","base.u32","--mtp-draft-context-vocab=4096"});
+    const auto subset=parse(chain);
+    require(subset.mtp.draft_vocab=="base.u32" && subset.mtp.draft_context_vocab==4096U,"draft subset options parse");
+    reject_as([]{auto a=request();a.insert(a.end(),{"--mtp-draft-vocab","base.u32"});return a;}(),
+        "MTP draft vocabulary options require --mtp-draft-chain","draft vocabulary requires the chain");
+    reject([]{auto a=request();a.insert(a.end(),{"--mtp-draft-chain","--mtp-draft-context-vocab","0"});return a;}(),
+        "zero draft context cap rejected");
+    reject([]{auto a=request();a.insert(a.end(),{"--mtp-draft-chain","--mtp-draft-chain"});return a;}(),"duplicate draft chain rejected");
+    reject([]{auto a=request();a.push_back("--mtp-draft-chain=1");return a;}(),"draft chain takes no value");
+    reject({"decoder","target.gguf","1","--mtp-draft-chain"},"draft chain cannot select MTP");
     auto metadata=request();
     for(const auto* key:{"--mtp-golden","--mtp-golden-sha256"}){
         for(auto it=metadata.begin();it!=metadata.end();++it)if(*it==key){metadata.erase(it,it+2);break;}
