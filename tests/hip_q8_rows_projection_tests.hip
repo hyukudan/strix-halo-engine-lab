@@ -249,8 +249,11 @@ int main() try {
             // Tails: partial last chunk / fewer leaves than a wave, odd output groups.
             for (const std::uint32_t w : {32U, 96U, 288U, 640U}) for (const std::uint32_t o : {1U, 7U, 9U, 17U, 33U})
                 exact_case(stream, site, rows, w, o, 4U, cases);
-            // Direct (unstaged) organisation for BF16 rows at a width past the LDS budget.
-            if (bf16_input(site) && rows >= 4U) exact_case(stream, site, rows, 6144U, 9U, 2U, cases);
+            // BF16 rows past the LDS budget (direct), and staged with a partial last chunk and group tail.
+            if (bf16_input(site) && rows >= 4U) {
+                exact_case(stream, site, rows, 6144U, 9U, 2U, cases);
+                exact_case(stream, site, rows, 2400U, 5003U, 2U, cases);
+            }
         }
     std::cout << "q8_rows exact payloads equal the R1 kernels bitwise: " << cases << " cases\n";
     for (const auto site : sites)

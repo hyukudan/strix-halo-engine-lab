@@ -80,3 +80,8 @@ so greedy acceptance is exact.
 - KP4 GDN window (read-only state, saved inputs) + commit replay kernel.
 - KP5 QSA multi-row (append-all-then-attend) + indexer tail snapshot/commit.
 - KP6 router multi-row + top-k.
+- KP9 Q8 rows: `src/hip_q8_rows_gemv.hpp` reads each Q8_0 block once per wave for several outputs and all T rows,
+  keeping every row's R1 wave8 leaf order and tree operands; it serves GDN qkv+z/out, QSA input (five matrices,
+  one launch)/output and shared gate+up/down in the existing rows modes (2040 bitwise cases against the R1
+  kernels in `strix-hip-q8-rows-projection-tests`). Opt-in `known_window_a8_projections` (per-32 int8
+  activations, dot4) is numerically distinct and not part of any mode yet.

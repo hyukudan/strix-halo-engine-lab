@@ -10,9 +10,10 @@
 // reduce-scatter: each exchange halves the values a lane carries, so all
 // Outs x Rows trees cost about two full exchanges instead of five.
 //
-// Activations: when all rows fit kStageBytes they are staged in LDS once per
-// (persistent) block; otherwise each lane loads its leaves directly (they stay
-// cache-resident) and the weights are prefetched two chunks ahead.
+// Activations: for large T >= 4 projections whose rows fit kStageBytes they are
+// staged in LDS once per (persistent) block; otherwise each lane loads its
+// leaves directly (they stay cache-resident). Weights are prefetched two
+// 256-column chunks ahead.
 //
 // A8 path (opt-in, different numerics): activations are quantised per 32-element
 // block to int8 with a float scale in LDS; each lane owns whole Q8 blocks (one
@@ -56,15 +57,13 @@ inline Segments segments(std::initializer_list<std::pair<const void*, std::uint3
 }
 
 template <class Site, bool Staged> constexpr unsigned outs_of() {
-    if constexpr (requires { Site::outs; }) return Site::outs;
-    else if constexpr (Site::rows < 4U) return 4U;
-    else return Staged ? 16U / Site::rows : 2U;
+    if constexpr (requires { Site::outs; }) return Site::outs; else return !Staged && Site::rows <= 2U ? 4U : 2U;
 }
 template <class Site> constexpr unsigned a8_outs_of() {
     if constexpr (requires { Site::a8_outs; }) return Site::a8_outs; else return Site::rows > 1U ? 4U : 2U;
 }
-template <class Site, bool Staged> constexpr unsigned prefetch_of() {
-    if constexpr (requires { Site::prefetch; }) return Site::prefetch; else return Staged ? 1U : 2U;
+template <class Site> constexpr unsigned prefetch_of() {
+    if constexpr (requires { Site::prefetch; }) return Site::prefetch; else return 2U;
 }
 constexpr unsigned log2u(unsigned v) { return v <= 1U ? 0U : 1U + log2u(v / 2U); }
 
@@ -153,9 +152,22 @@ template <class Input> __device__ __forceinline__ void load8(const Input* p, flo
     }
 }
 extern __shared__ __align__(16) unsigned char q8_rows_lds[];
+inline unsigned compute_units() {
+    static const unsigned units = [] {
+        int device = 0, count = 0;
+        if (hipGetDevice(&device) != hipSuccess ||
+            hipDeviceGetAttribute(&count, hipDeviceAttributeMultiprocessorCount, device) != hipSuccess || count <= 0)
+            return 40U;
+        return static_cast<unsigned>(count);
+    }();
+    return units;
+}
+// Staging pays off for T >= 4 when the weight stream dwarfs every resident
+// block's copy of the rows; otherwise direct loads win.
 template <class Site> std::uint32_t staged_bytes(const Site& site) {
     const auto bytes = static_cast<std::uint64_t>(Site::rows) * site.width * sizeof(typename Site::Input);
-    return bytes <= kStageBytes ? static_cast<std::uint32_t>(bytes) : 0U;
+    const auto weights = static_cast<std::uint64_t>(site.outputs) * (site.width / 32U) * 34U;
+    return Site::rows >= 4U && bytes <= kStageBytes && weights >= 8U * bytes * compute_units() ? static_cast<std::uint32_t>(bytes) : 0U;
 }
 template <unsigned Rows> constexpr std::uint64_t a8_bytes(std::uint64_t width) { return Rows * width + Rows * (width / 32U) * 4U; }
 
@@ -177,7 +189,7 @@ template <unsigned Outs> struct Q8Fetch {
 template <class Site, unsigned Outs, bool Staged>
 __global__ __launch_bounds__(kThreads) void project_rows_kernel(Site site) {
     using Input = typename Site::Input;
-    constexpr unsigned Rows = Site::rows, N = Outs * Rows * 8U, Depth = prefetch_of<Site, Staged>();
+    constexpr unsigned Rows = Site::rows, N = Outs * Rows * 8U, Depth = prefetch_of<Site>();
     const unsigned lane = threadIdx.x & 31U;
     const std::uint32_t width = site.width, groups = (site.outputs + Outs - 1U) / Outs;
     if constexpr (Staged) {
@@ -309,16 +321,6 @@ __global__ __launch_bounds__(kA8Threads) void project_rows_a8_kernel(Site site) 
     }
 }
 
-inline unsigned compute_units() {
-    static const unsigned units = [] {
-        int device = 0, count = 0;
-        if (hipGetDevice(&device) != hipSuccess ||
-            hipDeviceGetAttribute(&count, hipDeviceAttributeMultiprocessorCount, device) != hipSuccess || count <= 0)
-            return 40U;
-        return static_cast<unsigned>(count);
-    }();
-    return units;
-}
 // Persistent grids never exceed the blocks that are resident at once.
 template <auto Kernel, unsigned Threads> unsigned resident_blocks(std::uint32_t lds_bytes) {
     static std::atomic<std::uint64_t> cached{0};
