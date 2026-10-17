@@ -1298,6 +1298,10 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         PATH_SUFFIXES lib lib64
         REQUIRED
     )
+    # The HIP compiler treats the toolkit include directory as implicit and searches /usr/include first, so a
+    # distribution HIP development package there (another HIP version) silently wins over the toolkit headers
+    # the runtime library belongs to. Put the toolkit headers first for every HIP translation unit.
+    add_compile_options("$<$<COMPILE_LANGUAGE:HIP>:SHELL:-isystem ${STRIX_HIP_INCLUDE_DIR}>")
 
     if(STRIX_BUILD_EXPERIMENTAL_Q4K_A8_PROBE OR STRIX_ENABLE_EXPERIMENTAL_Q4K_A8_RUNTIME)
         # Only these isolated arithmetic TUs receive the strict experimental flags.
