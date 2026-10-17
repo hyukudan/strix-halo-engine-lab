@@ -43,6 +43,19 @@ void launch_hip_qsa_input_projection_probe(HipQsaInputProjectionMode,
     HipQsaInputProjectionView input,HipQsaInputProjectionView weights,
     HipQsaInputProjectionView output,std::uint32_t width,std::uint32_t outputs,void* stream);
 
+#ifdef STRIX_BUILD_KNOWN_WINDOW_DIAGNOSTIC
+// Test-only QSA top-k block selection over caller-owned device views; no
+// allocation/sync. reference = the original single-thread loop, one launch per
+// row; otherwise the production kernels: one row = the C1 kernel (with a
+// device position: its graph-input form, sizes read on the device), 2/4/8 rows
+// = the known-window rows kernel. Without a device position a row with
+// visible/ratio <= block_topk takes the full-visible fill. Scores are consumed.
+struct HipQsaBlockSelectRow { float* scores = nullptr; std::uint32_t* selected = nullptr; std::uint32_t visible = 0; };
+void launch_hip_qsa_block_select_probe(bool reference, std::span<const HipQsaBlockSelectRow> rows, std::uint32_t ratio,
+    std::uint32_t block_topk, const std::uint64_t* device_position, std::uint64_t context_tokens, std::uint32_t* device_status,
+    void* stream);
+#endif
+
 #ifdef STRIX_BUILD_QSA_OUTPUT_PROJECTION_DIAGNOSTIC
 enum class HipQsaOutputProjectionMode { legacy256, wave8 };
 // Test-only explicit-stream entry. FP32 input and original Q8_0 weights produce
