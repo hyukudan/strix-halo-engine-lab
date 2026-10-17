@@ -21,8 +21,8 @@ struct DeviceRows {
     const unsigned* routes[8]{}; unsigned* status[8]{}; float* output[8]{};
 };
 struct DeviceCsr {
-    unsigned* summary; const unsigned* offsets; const unsigned* touched;
-    const unsigned* rows; const unsigned* slots; const unsigned* experts; const unsigned* begins;
+    unsigned* summary; unsigned* offsets; unsigned* touched;
+    unsigned* rows; unsigned* slots; unsigned* experts; unsigned* begins;
 };
 void check(hipError_t error,const char* operation) {
     if(error!=hipSuccess)throw std::runtime_error(std::string(operation)+": "+hipGetErrorString(error));
@@ -40,15 +40,16 @@ struct Coefficient {
     unsigned scale0,scale1,minimum0,minimum1;
     float d,dm;
 };
-__device__ Coefficient coefficient(const unsigned char* packed,unsigned c,unsigned p) {
-    const uint4 hd=*reinterpret_cast<const uint4*>(packed);
-    const uint4 q=*reinterpret_cast<const uint4*>(packed+16U+c*16U);
+__device__ Coefficient coefficient(uint4 hd,uint4 q,unsigned p) {
     constexpr unsigned mask=0x0f0f0f0fU;
     return {{q.x&mask,q.y&mask,q.z&mask,q.w&mask},
         {(q.x>>4U)&mask,(q.y>>4U)&mask,(q.z>>4U)&mask,(q.w>>4U)&mask},
         factor(hd,2U*p,false),factor(hd,2U*p+1U,false),factor(hd,2U*p,true),factor(hd,2U*p+1U,true),
         __half2float(__ushort_as_half(static_cast<unsigned short>(hd.x&65535U))),
         __half2float(__ushort_as_half(static_cast<unsigned short>(hd.x>>16U)))};
+}
+__device__ Coefficient coefficient(const unsigned char* packed,unsigned c,unsigned p) {
+    return coefficient(*reinterpret_cast<const uint4*>(packed),*reinterpret_cast<const uint4*>(packed+16U+c*16U),p);
 }
 __device__ __forceinline__ float paired(Coefficient q,int4 a0,int4 a1,int s0,int s1,float e0,float e1) {
     int r0=dot(a0.x,q.low.x,0);r0=dot(a0.y,q.low.y,r0);r0=dot(a0.z,q.low.z,r0);r0=dot(a0.w,q.low.w,r0);
@@ -149,6 +150,72 @@ __global__ void project_csr(const unsigned char* gate,const unsigned char* up,De
         }
     }
 }
+__device__ bool nonfinite(float x){return (__float_as_uint(x)&0x7fffffffU)>=0x7f800000U;}
+// project_csr arithmetic with every K block of a matrix loaded before its
+// chains (each wave fetches four complete packed rows at once). Batch rows are
+// staged G at a time; a batch wider than G re-reads its weight slice from
+// cache per group. The incumbent finite scan, SiLU and second scan are applied
+// per (row,slot,output).
+template<unsigned G>
+__global__ __launch_bounds__(256) void project_window(const unsigned char* gate,const unsigned char* up,DeviceRows view,DeviceCsr csr,
+    unsigned rows,unsigned hidden,unsigned outputs) {
+    unsigned failure=csr.summary[0];
+    for(unsigned r=0;r<rows;++r)failure|=*view.status[r];
+    if(failure||blockIdx.y>=csr.summary[2])return;
+    const auto begin=csr.begins[blockIdx.y],count=csr.begins[blockIdx.y+1U]-begin,expert=csr.experts[blockIdx.y];
+    __shared__ __align__(16) signed char local_codes[G][max_hidden];
+    __shared__ __align__(16) float local_deltas[G][max_hidden/32U];
+    __shared__ __align__(16) int local_sums[G][max_hidden/32U];
+    const unsigned lane=threadIdx.x&31U,c=lane&7U,p=c/2U,h=c&1U;
+    const unsigned out=blockIdx.x*32U+(threadIdx.x/32U)*4U+lane/8U,blocks=hidden/256U;
+    const auto offset=(static_cast<unsigned long long>(expert)*outputs+out)*blocks*144U;
+    const unsigned g0=2U*p,g1=g0+1U;
+    constexpr unsigned max_blocks=max_hidden/256U;
+    for(unsigned group=0;group<count;group+=G) {
+        if(group)__syncthreads();
+#pragma unroll
+        for(unsigned a=0;a<G;++a)if(group+a<count) {
+            const auto r=csr.rows[begin+group+a];
+            for(unsigned i=16U*threadIdx.x;i<hidden;i+=4096U)
+                *reinterpret_cast<int4*>(local_codes[a]+i)=*reinterpret_cast<const int4*>(view.codes[r]+i);
+            for(unsigned i=threadIdx.x;i<hidden/32U;i+=256U){local_deltas[a][i]=view.deltas[r][i];local_sums[a][i]=view.sums[r][i];}
+        }
+        __syncthreads();
+        float acc[2][G]={};
+#pragma unroll
+        for(unsigned m=0;m<2U;++m) {
+            const unsigned char* w=(m==0U?gate:up)+offset;
+            uint4 hd[max_blocks],q[max_blocks];
+#pragma unroll
+            for(unsigned b=0;b<max_blocks;++b)if(b<blocks) {
+                hd[b]=*reinterpret_cast<const uint4*>(w+b*144U);q[b]=*reinterpret_cast<const uint4*>(w+b*144U+16U+c*16U);
+            }
+#pragma unroll
+            for(unsigned b=0;b<max_blocks;++b)if(b<blocks) {
+                const auto k=coefficient(hd[b],q[b],p);
+#pragma unroll
+                for(unsigned a=0;a<G;++a)if(group+a<count) {
+                    const int4 a0=*reinterpret_cast<const int4*>(local_codes[a]+b*256U+p*64U+h*16U);
+                    const int4 a1=*reinterpret_cast<const int4*>(local_codes[a]+b*256U+p*64U+32U+h*16U);
+                    const float pair=paired(k,a0,a1,local_sums[a][b*8U+g0],local_sums[a][b*8U+g1],
+                        local_deltas[a][b*8U+g0],local_deltas[a][b*8U+g1]);
+                    acc[m][a]=acc[m][a]+pair;
+                }
+            }
+        }
+#pragma unroll
+        for(unsigned a=0;a<G;++a)if(group+a<count) {
+#pragma unroll
+            for(unsigned m=0;m<2U;++m){acc[m][a]=acc[m][a]+__shfl_xor(acc[m][a],2,32);acc[m][a]=acc[m][a]+__shfl_xor(acc[m][a],4,32);}
+            if(c==0U) {
+                const auto r=csr.rows[begin+group+a],slot=csr.slots[begin+group+a];
+                const float g=acc[0][a],u=acc[1][a],silu=(g/(1.0F+expf(-g)))*u;
+                view.output[r][(slot*2U)*outputs+out]=silu;view.output[r][(slot*2U+1U)*outputs+out]=u;
+                if(nonfinite(g)||nonfinite(u)||nonfinite(silu))atomicOr(view.status[r],8U);
+            }
+        }
+    }
+}
 bool overlap(DeviceBytes a,DeviceBytes b){return a.address<b.address+b.bytes&&b.address<a.address+a.bytes;}
 void range(DeviceBytes v){if(!v.address||!v.bytes||v.bytes>UINTPTR_MAX-v.address)throw std::invalid_argument("A8 CSR gate/up owner range is invalid");}
 struct Prepared {DeviceRows rows;DeviceCsr csr;};
@@ -188,6 +255,38 @@ Prepared prepare(const Request& request,std::span<const Bindings> rows,const q51
     return out;
 }
 } // namespace
+void enqueue_window(const Request& request,std::span<const Bindings> rows,const q51_known_rows::Workspace& workspace,
+    const WindowRows& window,hipStream_t stream) {
+    const auto p=prepare(request,rows,workspace,stream);
+    const DeviceBytes csr{workspace.memory.arena_base,workspace.memory.arena_bytes};
+    PrologueRows v;
+    for(unsigned r=0;r<rows.size();++r) {
+        const auto& b=rows[r];const auto weights=window.route_weights[r],clear=window.clear[r];
+        range(weights);range(clear);
+        if(weights.bytes<4ULL*request.shape.top_k||clear.bytes!=window.clear[0].bytes||clear.bytes%4U||clear.address%4U||
+           clear.bytes/4U>UINT32_MAX||overlap(clear,csr)||overlap(weights,csr))
+            throw std::invalid_argument("A8 window row extent is invalid");
+        for(unsigned q=0;q<rows.size();++q)for(const auto view:{rows[q].codes,rows[q].deltas,rows[q].sums,rows[q].status,
+            rows[q].output,rows[q].input,rows[q].routes,window.route_weights[q]})if(overlap(clear,view))
+            throw std::invalid_argument("A8 window cleared region aliases row storage");
+        v.input[r]=reinterpret_cast<const void*>(b.input.address);v.routes[r]=p.rows.routes[r];
+        v.route_weights[r]=reinterpret_cast<const float*>(weights.address);v.codes[r]=reinterpret_cast<signed char*>(b.codes.address);
+        v.deltas[r]=reinterpret_cast<float*>(b.deltas.address);v.sums[r]=reinterpret_cast<int*>(b.sums.address);
+        v.status[r]=p.rows.status[r];v.clear[r]=reinterpret_cast<float*>(clear.address);
+    }
+    v.csr={p.csr.summary,p.csr.offsets,p.csr.touched,p.csr.rows,p.csr.slots,p.csr.experts,p.csr.begins};
+    const auto count=static_cast<unsigned>(rows.size());
+    enqueue_prologue(request,v,count,static_cast<unsigned>(window.clear[0].bytes/4U),stream);
+#define STRIX_A8_WINDOW_PROJECT(R) \
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(project_window<(R>2U?4U:2U)>),dim3(request.shape.rows/32U,count*request.shape.top_k), \
+        dim3(256),0,stream,reinterpret_cast<const unsigned char*>(rows.front().gate.address), \
+        reinterpret_cast<const unsigned char*>(rows.front().up.address),p.rows,p.csr,count,request.shape.hidden,request.shape.rows)
+    if(count==2U){STRIX_A8_WINDOW_PROJECT(2);}
+    else if(count==4U){STRIX_A8_WINDOW_PROJECT(4);}
+    else {STRIX_A8_WINDOW_PROJECT(8);}
+#undef STRIX_A8_WINDOW_PROJECT
+    check(hipGetLastError(),"A8 window shared gate/up projection");
+}
 void preflight(const Request& request,std::span<const Bindings> rows,const q51_known_rows::Workspace& workspace,hipStream_t stream) {
     (void)prepare(request,rows,workspace,stream);
 }
