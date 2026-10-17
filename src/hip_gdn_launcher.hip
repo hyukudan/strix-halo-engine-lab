@@ -4704,13 +4704,13 @@ void gdn_known_window_rows_projection_probe(GdnKnownWindowProjectionDirection di
     std::span<const GdnKnownWindowProjectionView> output, std::uint32_t width, std::uint32_t outputs, void* stream,
     GdnKnownWindowRowsProbeMode mode) {
     const auto rows = static_cast<std::uint32_t>(input.size());
-    if (rows < 1U || rows > 8U || output.size() != rows ||
+    if (rows < 1U || (rows > 8U && rows != 16U && rows != 32U && rows != 64U) || output.size() != rows ||
         (direction != GdnKnownWindowProjectionDirection::bf16_to_fp32 &&
          direction != GdnKnownWindowProjectionDirection::fp32_to_bf16) ||
         (mode != GdnKnownWindowRowsProbeMode::rows && mode != GdnKnownWindowRowsProbeMode::rows_a8 &&
          mode != GdnKnownWindowRowsProbeMode::row_loop) ||
         !stream || static_cast<hipStream_t>(stream) == hipStreamLegacy || static_cast<hipStream_t>(stream) == hipStreamPerThread)
-        throw std::invalid_argument("GDN wide-window diagnostic requires 1..8 rows, a mode and an owned stream");
+        throw std::invalid_argument("GDN wide-window diagnostic requires 1..8, 16, 32 or 64 rows, a mode and an owned stream");
     const bool bf16 = direction == GdnKnownWindowProjectionDirection::bf16_to_fp32;
     for (unsigned r = 0; r < rows; ++r) {
         const q8_projection_organization::View x{input[r].address, input[r].bytes}, w{weights.address, weights.bytes},
@@ -4725,7 +4725,7 @@ void gdn_known_window_rows_projection_probe(GdnKnownWindowProjectionDirection di
         for (const auto read : input) require_gdn_known_window_disjoint(write, {read.address, read.bytes});
         require_gdn_known_window_disjoint(write, {weights.address, weights.bytes});
     }
-    if (mode == GdnKnownWindowRowsProbeMode::rows_a8 && rows * width + rows * (width / 32U) * 4U > 65536U)
+    if (mode == GdnKnownWindowRowsProbeMode::rows_a8 && (rows > 8U || rows * width + rows * (width / 32U) * 4U > 65536U))
         throw std::invalid_argument("GDN wide-window A8 activations exceed one block's LDS");
     const auto native_stream = static_cast<hipStream_t>(stream);
     hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
@@ -4754,6 +4754,9 @@ void gdn_known_window_rows_projection_probe(GdnKnownWindowProjectionDirection di
     case 5: enqueue_gdn_wide_projection_probe<5U>(bf16, a8, input, weights, output, width, outputs, native_stream); break;
     case 6: enqueue_gdn_wide_projection_probe<6U>(bf16, a8, input, weights, output, width, outputs, native_stream); break;
     case 7: enqueue_gdn_wide_projection_probe<7U>(bf16, a8, input, weights, output, width, outputs, native_stream); break;
+    case 16: enqueue_gdn_wide_projection_probe<16U>(bf16, a8, input, weights, output, width, outputs, native_stream); break;
+    case 32: enqueue_gdn_wide_projection_probe<32U>(bf16, a8, input, weights, output, width, outputs, native_stream); break;
+    case 64: enqueue_gdn_wide_projection_probe<64U>(bf16, a8, input, weights, output, width, outputs, native_stream); break;
     default: enqueue_gdn_wide_projection_probe<8U>(bf16, a8, input, weights, output, width, outputs, native_stream); break;
     }
 }

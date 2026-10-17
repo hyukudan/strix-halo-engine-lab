@@ -2151,12 +2151,12 @@ void launch_hip_shared_rows_projection_probe(HipSharedQ8ProjectionRole role, Hip
     std::uint32_t width, std::uint32_t outputs, void* stream) {
     const auto rows = static_cast<std::uint32_t>(input.size());
     const bool down = role == HipSharedQ8ProjectionRole::down;
-    if ((rows != 1U && rows != 2U && rows != 4U && rows != 8U) || output.size() != rows || gate.size() != (down ? rows : 0U) ||
+    if ((rows != 1U && rows != 2U && rows != 4U && rows != 8U && rows != 16U && rows != 32U && rows != 64U) || output.size() != rows || gate.size() != (down ? rows : 0U) ||
         (!down && role != HipSharedQ8ProjectionRole::gate_up) ||
         (mode != HipSharedRowsProbeMode::rows && mode != HipSharedRowsProbeMode::rows_a8 && mode != HipSharedRowsProbeMode::row_loop) ||
         !stream || static_cast<hipStream_t>(stream) == hipStreamLegacy || static_cast<hipStream_t>(stream) == hipStreamPerThread ||
         !width || width % 32U || !outputs)
-        throw std::invalid_argument("shared rows projection diagnostic requires 1/2/4/8 rows, a role, a mode and an owned stream");
+        throw std::invalid_argument("shared rows projection diagnostic requires 1/2/4/8/16/32/64 rows, a role, a mode and an owned stream");
     const auto overlap = [](HipSharedQ8ProjectionView x, HipSharedQ8ProjectionView y) {
         return x.address < y.address + y.bytes && y.address < x.address + x.bytes;
     };
@@ -2175,7 +2175,7 @@ void launch_hip_shared_rows_projection_probe(HipSharedQ8ProjectionRole role, Hip
                 (other < r && overlap(output[r], output[other])))
                 throw std::invalid_argument("shared rows projection output aliases a row");
     }
-    if (mode == HipSharedRowsProbeMode::rows_a8 && q8_rows::a8_bytes<8U>(width) / 8U * rows > q8_rows::kLdsBytes)
+    if (mode == HipSharedRowsProbeMode::rows_a8 && (rows > 8U || q8_rows::a8_bytes<8U>(width) / 8U * rows > q8_rows::kLdsBytes))
         throw std::invalid_argument("shared rows A8 activations exceed one block's LDS");
     const auto native = static_cast<hipStream_t>(stream);
     check_hip(hipPeekAtLastError(), "shared rows projection diagnostic pre-enqueue stale error");
@@ -2196,7 +2196,10 @@ void launch_hip_shared_rows_projection_probe(HipSharedQ8ProjectionRole role, Hip
     if (rows == 1U) enqueue_shared_rows_probe<1U>(down, a8, input, weights, gate, output, width, outputs, native);
     else if (rows == 2U) enqueue_shared_rows_probe<2U>(down, a8, input, weights, gate, output, width, outputs, native);
     else if (rows == 4U) enqueue_shared_rows_probe<4U>(down, a8, input, weights, gate, output, width, outputs, native);
-    else enqueue_shared_rows_probe<8U>(down, a8, input, weights, gate, output, width, outputs, native);
+    else if (rows == 8U) enqueue_shared_rows_probe<8U>(down, a8, input, weights, gate, output, width, outputs, native);
+    else if (rows == 16U) enqueue_shared_rows_probe<16U>(down, a8, input, weights, gate, output, width, outputs, native);
+    else if (rows == 32U) enqueue_shared_rows_probe<32U>(down, a8, input, weights, gate, output, width, outputs, native);
+    else enqueue_shared_rows_probe<64U>(down, a8, input, weights, gate, output, width, outputs, native);
     check_hip(hipGetLastError(), "shared rows projection diagnostic launch");
 }
 } // namespace strix

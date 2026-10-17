@@ -37,7 +37,7 @@ void launch_hip_shared_q8_projection_probe(HipSharedQ8ProjectionRole,HipSharedQ8
     HipSharedQ8ProjectionView shared_gate,HipSharedQ8ProjectionView output,
     std::uint32_t width,std::uint32_t outputs,void* stream);
 #ifdef STRIX_BUILD_KNOWN_WINDOW_DIAGNOSTIC
-// Test-only T = 1/2/4/8 rows of the prefetch8 BF16 gate/up (FP32 out) or FP32 down
+// Test-only T = 1/2/4/8/16/32/64 rows of the prefetch8 BF16 gate/up (FP32 out) or FP32 down
 // (per-row FP32 gate, BF16 out) projection: the q8_rows engine (exact or A8) or
 // the R1 kernel once per row. Exact 16-byte aligned views; gate empty for gate/up.
 enum class HipSharedRowsProbeMode { rows, rows_a8, row_loop };

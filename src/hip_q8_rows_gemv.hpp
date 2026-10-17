@@ -1,6 +1,7 @@
 #pragma once
 
-// T-row Q8_0 projections for known-prefix windows (T = 1, 2, 4, 8).
+// T-row Q8_0 projections for known-prefix windows (T = 1..8) and prompt
+// windows (T = 16, 32, 64; see project_wide_rows_kernel).
 //
 // Exact path: every row reproduces the wave8 virtual256 single-row arithmetic.
 // Lane l owns leaves 8l..8l+7 of each 256-wide chunk (eight ascending FMA
@@ -19,11 +20,12 @@
 // block to int8 with a float scale in LDS; each lane owns whole Q8 blocks (one
 // dot4 chain per row) and outputs/rows are reduced with a fixed tree.
 //
-// T may be any count up to 8 (3/5/6/7 pad the tree to a power of two).
-// A Site supplies Input (uint16_t BF16 or float), rows, input[], segments,
-// width, outputs, the coefficient/fma/add arithmetic of its R1 kernel and
-// store(out, row, value); it may override outs, a8_outs and prefetch. The
-// including translation unit owns the arithmetic flags.
+// T may be any count up to 8 (3/5/6/7 pad the tree to a power of two), or a
+// multiple of the wide batch (16, 32, 64) above 8; the A8 path stops at 8.
+// A Site supplies Input (uint16_t BF16 or float), rows, input[] (or
+// row_input(r)), segments, width, outputs, the coefficient/fma/add arithmetic of
+// its R1 kernel and store(out, row, value); it may override outs, a8_outs, sub
+// and prefetch. The including translation unit owns the arithmetic flags.
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_ext.h>
@@ -35,6 +37,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <initializer_list>
+#include <stdexcept>
+#include <type_traits>
 #include <utility>
 
 namespace strix {
@@ -176,6 +180,25 @@ template <class Input> __device__ __forceinline__ void load8(const Input* p, flo
         x[0] = a.x; x[1] = a.y; x[2] = a.z; x[3] = a.w; x[4] = b.x; x[5] = b.y; x[6] = b.z; x[7] = b.w;
     }
 }
+// load8 split into the 16/32-byte load and the unpack (same values).
+template <class Input> struct Raw8 {
+    uint4 q[sizeof(Input) / 2U];
+    __device__ __forceinline__ void load(const Input* p) {
+#pragma unroll
+        for (unsigned i = 0; i < sizeof(Input) / 2U; ++i) q[i] = reinterpret_cast<const uint4*>(p)[i];
+    }
+    __device__ __forceinline__ void unpack(float (&x)[8]) const {
+        if constexpr (sizeof(Input) == 2U) {
+            const unsigned w[4]{q[0].x, q[0].y, q[0].z, q[0].w};
+#pragma unroll
+            for (unsigned i = 0; i < 4U; ++i) { x[2U * i] = __uint_as_float(w[i] << 16U); x[2U * i + 1U] = __uint_as_float(w[i] & 0xffff0000U); }
+        } else {
+            const unsigned w[8]{q[0].x, q[0].y, q[0].z, q[0].w, q[1].x, q[1].y, q[1].z, q[1].w};
+#pragma unroll
+            for (unsigned i = 0; i < 8U; ++i) x[i] = __uint_as_float(w[i]);
+        }
+    }
+};
 extern __shared__ __align__(16) unsigned char q8_rows_lds[];
 inline unsigned compute_units() {
     static const unsigned units = [] {
@@ -257,6 +280,195 @@ __global__ __launch_bounds__(kThreads) void project_rows_kernel(Site site) {
             if (pair < Pairs && g * Outs + pair / Rows < site.outputs) site.store(g * Outs + pair / Rows, pair % Rows, value);
         });
     }
+}
+
+// Wide windows (Rows > 8, e.g. 16/32/64 prompt rows): the rows are split into
+// Rows / Sub batches and each wave runs the exact chains of Outs outputs x Sub
+// rows (Outs * Sub = 16 pairs: 128 accumulators, the R8 register footprint). The
+// 8 waves of a block take 8 output groups of one batch and consecutive blocks
+// take the batches of the same output groups, so they read the same weight bytes
+// at about the same time: DRAM serves each weight byte about once per window and
+// the other batches hit L2. Per (output, row) pair the arithmetic is the single-
+// row kernel's: leaf l of lane L is the ascending-k chain Site::fma over features
+// 8L + l + 256k, then the lane tree (16..1) and the leaf tree (4, 2, 1) of
+// reduce(); the reduce-scatter order of a pair does not depend on how many pairs
+// share the wave, so any (Outs, Sub) split gives the R1 bits.
+//
+// Defaults measured on gfx1151 (STRIX_Q8_ROWS_BENCH): Sub = 8, Outs = 2. Sub = 16,
+// Outs = 1 also fits 128 accumulators but reads every activation once per output
+// and is slower; Sub = 4, Outs = 4 helps only FP32 6144-wide inputs at 64 rows. A
+// site may set `static constexpr unsigned sub`; STRIX_Q8_ROWS_WIDE_SUB=4/8/16
+// overrides it for tuning and STRIX_Q8_ROWS_WIDE_STAGE=1 selects the LDS-staged
+// variant below (same arithmetic, not faster on the measured shapes).
+template <class Site> constexpr unsigned wide_sub_of() {
+    if constexpr (requires { Site::sub; }) return Site::sub; else return 8U;
+}
+template <class Site> constexpr unsigned wide_prefetch_of() {
+    if constexpr (requires { Site::prefetch; }) return Site::prefetch; else return STRIX_Q8_ROWS_PREFETCH;
+}
+// Row r's activations: a site may address rows itself (row_input(r), e.g. base +
+// r * stride for a uniformly strided arena) instead of carrying one pointer per row.
+template <class Site> __device__ __forceinline__ const typename Site::Input* row_input(const Site& site, unsigned r) {
+    if constexpr (requires { site.row_input(r); }) return site.row_input(r);
+    else return static_cast<const typename Site::Input*>(site.input[r]);
+}
+template <class Site, unsigned Outs, unsigned Sub>
+__global__ __launch_bounds__(kThreads) void project_wide_rows_kernel(Site site) {
+    using Input = typename Site::Input;
+    constexpr unsigned Rows = Site::rows, Batches = Rows / Sub, Pairs = Outs * Sub, N = pow2u(Pairs) * 8U;
+    constexpr unsigned Depth = wide_prefetch_of<Site>();
+    static_assert(Rows > 8U && Rows % Sub == 0U && Pairs <= 32U);
+    const unsigned lane = threadIdx.x & 31U, wave = threadIdx.x / 32U;
+    const std::uint32_t width = site.width, groups = (site.outputs + Outs - 1U) / Outs;
+    const std::uint32_t g = blockIdx.x / Batches * kWaves + wave;
+    const unsigned first = blockIdx.x % Batches * Sub;
+    if (g >= groups) return;
+    const unsigned char* w[Outs];
+    group_rows(site.segments, g, site.outputs, width, w);
+    const Input* x_row[Sub];
+#pragma unroll
+    for (unsigned r = 0; r < Sub; ++r) x_row[r] = row_input(site, first + r);
+    float v[N]{};
+    Q8Fetch<Outs> next[Depth];
+#pragma unroll
+    for (unsigned d = 0; d < Depth; ++d) if (8U * lane + 256U * d < width) next[d].load(w, 8U * lane + 256U * d);
+    for (std::uint32_t base = 8U * lane; base < width; base += 256U) {
+        // The chunk's activations are requested before the weight prefetch: loads
+        // retire in order, so waiting for them must not wait for the prefetch.
+        Raw8<Input> raw[Sub];
+#pragma unroll
+        for (unsigned r = 0; r < Sub; ++r) raw[r].load(x_row[r] + base);
+        const auto current = next[0];
+#pragma unroll
+        for (unsigned d = 1; d < Depth; ++d) next[d - 1U] = next[d];
+        if (base + 256U * Depth < width) next[Depth - 1U].load(w, base + 256U * Depth);
+        float coefficient[Outs][8];
+#pragma unroll
+        for (unsigned o = 0; o < Outs; ++o)
+#pragma unroll
+            for (unsigned l = 0; l < 8U; ++l)
+                coefficient[o][l] = Site::coefficient(current.scale[o], static_cast<std::int8_t>(current.codes[o] >> (8U * l)));
+#pragma unroll
+        for (unsigned r = 0; r < Sub; ++r) {
+            float x[8];
+            raw[r].unpack(x);
+#pragma unroll
+            for (unsigned o = 0; o < Outs; ++o)
+#pragma unroll
+                for (unsigned l = 0; l < 8U; ++l) Site::fma(v[(o * Sub + r) * 8U + l], coefficient[o][l], x[l]);
+        }
+    }
+    reduce<Site, N, 8U>(v, lane);
+    store_pairs<pow2u(Pairs)>(v[0], lane, [&](unsigned pair, float value) {
+        if (pair < Pairs && g * Outs + pair / Sub < site.outputs) site.store(g * Outs + pair / Sub, first + pair % Sub, value);
+    });
+}
+
+// Chunk-staged wide kernel: the 8 waves of a block take 8 output groups of one
+// row batch (consecutive blocks take the batches of the same output groups, so
+// their weight reads meet in L2). Each 256-feature chunk of the batch's Sub rows
+// is copied to LDS once per block, double-buffered with one barrier per chunk;
+// the copy of chunk k + 1 is requested before the weight prefetch and lands in
+// LDS after chunk k's FMAs. Waves past the last output group still copy and hit
+// every barrier (their clamped weight rows are read but never stored).
+// Barrier ordering LDS only: __syncthreads() also waits for every outstanding
+// global load (the weight prefetch) and invalidates L0 each chunk.
+__device__ __forceinline__ void lds_barrier() { asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory"); }
+template <class Input, unsigned Sub> constexpr unsigned stage_vectors() { return Sub * 256U * sizeof(Input) / 16U; }
+template <class Site, unsigned Outs, unsigned Sub>
+__global__ __launch_bounds__(kThreads) void project_wide_rows_staged_kernel(Site site) {
+    using Input = typename Site::Input;
+    constexpr unsigned Rows = Site::rows, Batches = Rows / Sub, Pairs = Outs * Sub, N = pow2u(Pairs) * 8U;
+    constexpr unsigned Depth = wide_prefetch_of<Site>(), Vectors = stage_vectors<Input, Sub>(), RowVectors = Vectors / Sub;
+    constexpr unsigned PerThread = (Vectors + kThreads - 1U) / kThreads;
+    static_assert(Rows > 8U && Rows % Sub == 0U && Pairs <= 32U && kThreads % RowVectors == 0U);
+    // Staged as FP32 (BF16 rows widened once per block, the exact bit shift of load8).
+    __shared__ float4 stage[2][Sub * 64U];
+    const unsigned lane = threadIdx.x & 31U, wave = threadIdx.x / 32U;
+    const std::uint32_t width = site.width, groups = (site.outputs + Outs - 1U) / Outs, chunks = (width + 255U) / 256U;
+    const std::uint32_t g = blockIdx.x / Batches * kWaves + wave;
+    const unsigned first = blockIdx.x % Batches * Sub;
+    // Thread t copies vectors t + kThreads * j; their rows are wave-uniform.
+    const Input* source[PerThread];
+#pragma unroll
+    for (unsigned j = 0; j < PerThread; ++j) {
+        const unsigned i = threadIdx.x + kThreads * j;
+        const unsigned row = static_cast<unsigned>(__builtin_amdgcn_readfirstlane(static_cast<int>(i / RowVectors)));
+        source[j] = row_input(site, first + (row < Sub ? row : 0U)) + (i % RowVectors) * (16U / sizeof(Input));
+    }
+    uint4 staged[PerThread]{};
+    const auto fetch = [&](std::uint32_t k) {
+#pragma unroll
+        for (unsigned j = 0; j < PerThread; ++j) {
+            const unsigned i = threadIdx.x + kThreads * j;
+            const std::uint32_t feature = 256U * k + (i % RowVectors) * (16U / sizeof(Input));
+            if ((Vectors % kThreads == 0U || i < Vectors) && feature < width)
+                staged[j] = *reinterpret_cast<const uint4*>(source[j] + 256U * k);
+        }
+    };
+    const auto commit = [&](std::uint32_t k) {
+#pragma unroll
+        for (unsigned j = 0; j < PerThread; ++j) {
+            const unsigned i = threadIdx.x + kThreads * j;
+            if (Vectors % kThreads == 0U || i < Vectors) {
+                if constexpr (sizeof(Input) == 2U) {
+                    const uint4 q = staged[j];
+                    stage[k & 1U][2U * i] = make_float4(__uint_as_float(q.x << 16U), __uint_as_float(q.x & 0xffff0000U),
+                        __uint_as_float(q.y << 16U), __uint_as_float(q.y & 0xffff0000U));
+                    stage[k & 1U][2U * i + 1U] = make_float4(__uint_as_float(q.z << 16U), __uint_as_float(q.z & 0xffff0000U),
+                        __uint_as_float(q.w << 16U), __uint_as_float(q.w & 0xffff0000U));
+                } else stage[k & 1U][i] = make_float4(__uint_as_float(staged[j].x), __uint_as_float(staged[j].y),
+                    __uint_as_float(staged[j].z), __uint_as_float(staged[j].w));
+            }
+        }
+    };
+    const unsigned char* w[Outs];
+    group_rows(site.segments, g < groups ? g : groups - 1U, site.outputs, width, w);
+    float v[N]{};
+    Q8Fetch<Outs> next[Depth];
+#pragma unroll
+    for (unsigned d = 0; d < Depth; ++d) if (8U * lane + 256U * d < width) next[d].load(w, 8U * lane + 256U * d);
+    fetch(0U);
+    commit(0U);
+    __syncthreads();
+    // Full chunks run unconditionally (a lane-dependent branch around the FMAs makes the
+    // compiler copy every accumulator each iteration); only a partial last chunk masks lanes.
+    const auto step = [&](std::uint32_t k, auto tail) {
+        const std::uint32_t base = 8U * lane + 256U * k;
+        if (k + 1U < chunks) fetch(k + 1U);
+        const auto current = next[0];
+#pragma unroll
+        for (unsigned d = 1; d < Depth; ++d) next[d - 1U] = next[d];
+        if (base + 256U * Depth < width) next[Depth - 1U].load(w, base + 256U * Depth);
+        if (!decltype(tail)::value || base < width) {
+            float coefficient[Outs][8];
+#pragma unroll
+            for (unsigned o = 0; o < Outs; ++o)
+#pragma unroll
+                for (unsigned l = 0; l < 8U; ++l)
+                    coefficient[o][l] = Site::coefficient(current.scale[o], static_cast<std::int8_t>(current.codes[o] >> (8U * l)));
+            const float4* chunk = stage[k & 1U];
+#pragma unroll
+            for (unsigned r = 0; r < Sub; ++r) {
+                const float4 lo = chunk[r * 64U + 2U * lane], hi = chunk[r * 64U + 2U * lane + 1U];
+                const float x[8]{lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};
+#pragma unroll
+                for (unsigned o = 0; o < Outs; ++o)
+#pragma unroll
+                    for (unsigned l = 0; l < 8U; ++l) Site::fma(v[(o * Sub + r) * 8U + l], coefficient[o][l], x[l]);
+            }
+        }
+        if (k + 1U < chunks) commit(k + 1U);
+        lds_barrier();
+    };
+    const std::uint32_t full = width / 256U;
+    for (std::uint32_t k = 0; k < full; ++k) step(k, std::false_type{});
+    if (full < chunks) step(full, std::true_type{});
+    if (g >= groups) return;
+    reduce<Site, N, 8U>(v, lane);
+    store_pairs<pow2u(Pairs)>(v[0], lane, [&](unsigned pair, float value) {
+        if (pair < Pairs && g * Outs + pair / Sub < site.outputs) site.store(g * Outs + pair / Sub, first + pair % Sub, value);
+    });
 }
 
 struct PlainTree { __device__ static float add(float lower, float upper) { return lower + upper; } };
@@ -360,6 +572,15 @@ template <auto Kernel, unsigned Threads> unsigned resident_blocks(std::uint32_t 
     return blocks;
 }
 
+// STRIX_Q8_ROWS_WIDE_SUB=4/8/16 overrides the rows per wave of Rows > 8 sites (tuning).
+inline unsigned wide_sub() {
+    static const unsigned sub = [] { const char* v = std::getenv("STRIX_Q8_ROWS_WIDE_SUB"); return v ? static_cast<unsigned>(std::atoi(v)) : 0U; }();
+    return sub;
+}
+inline bool wide_stage() {
+    static const bool stage = [] { const char* v = std::getenv("STRIX_Q8_ROWS_WIDE_STAGE"); return v && v[0] == '1'; }();
+    return stage;
+}
 // The caller validated width % 32 == 0, 16-byte aligned rows and, for A8,
 // a8_bytes<rows>(width) <= kLdsBytes. any_order drops the packet's barrier bit: the
 // caller guarantees the projection neither reads nor writes what the previously
@@ -371,7 +592,27 @@ template <class Site> void launch(const Site& site, bool a8, hipStream_t stream,
         else hipLaunchKernelGGL(kernel, dim3(blocks), dim3(threads), bytes, stream, site);
     };
     const auto groups_for = [&](unsigned outs, unsigned waves) { return ((site.outputs + outs - 1U) / outs + waves - 1U) / waves; };
-    if (a8) {
+    if constexpr (Site::rows > 8U) {
+        if (a8) throw std::invalid_argument("q8_rows: the A8 path supports at most 8 rows");
+        const auto wide = [&]<unsigned Sub>() {
+            constexpr unsigned Outs = 16U / Sub;
+            const unsigned blocks = groups_for(Outs, kWaves) * (Site::rows / Sub);
+            if (wide_stage()) {
+                constexpr auto kernel = project_wide_rows_staged_kernel<Site, Outs, Sub>;
+                start(kernel, blocks, kThreads, 0U);
+            } else {
+                constexpr auto kernel = project_wide_rows_kernel<Site, Outs, Sub>;
+                start(kernel, blocks, kThreads, 0U);
+            }
+        };
+        switch (wide_sub()) {
+        case 4U: wide.template operator()<4U>(); break;
+        case 8U: wide.template operator()<8U>(); break;
+        case 16U: wide.template operator()<16U>(); break;
+        default: wide.template operator()<wide_sub_of<Site>()>(); break;
+        }
+        return;
+    } else if (a8) {
         constexpr unsigned Outs = a8_outs_of<Site>();
         constexpr auto kernel = project_rows_a8_kernel<Site, Outs>;
         const auto bytes = static_cast<std::uint32_t>(a8_bytes<Site::rows>(site.width));

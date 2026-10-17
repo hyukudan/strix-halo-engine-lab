@@ -4122,11 +4122,11 @@ void launch_hip_qsa_rows_projection_probe(HipQsaRowsProjection projection, HipQs
     std::span<const HipQsaInputProjectionView> output, std::uint32_t width, std::uint32_t outputs, void* stream) {
     const auto rows = static_cast<std::uint32_t>(input.size());
     const bool input_side = projection == HipQsaRowsProjection::input;
-    if ((rows != 1U && rows != 2U && rows != 4U && rows != 8U) || output.size() != rows ||
+    if ((rows != 1U && rows != 2U && rows != 4U && rows != 8U && rows != 16U && rows != 32U && rows != 64U) || output.size() != rows ||
         (!input_side && projection != HipQsaRowsProjection::output) ||
         (mode != HipQsaRowsProbeMode::rows && mode != HipQsaRowsProbeMode::rows_a8 && mode != HipQsaRowsProbeMode::row_loop) ||
         !stream || static_cast<hipStream_t>(stream) == hipStreamLegacy || static_cast<hipStream_t>(stream) == hipStreamPerThread)
-        throw std::invalid_argument("QSA rows projection diagnostic requires 1/2/4/8 rows, a mode and an owned stream");
+        throw std::invalid_argument("QSA rows projection diagnostic requires 1/2/4/8/16/32/64 rows, a mode and an owned stream");
     const auto overlap = [](HipQsaInputProjectionView x, HipQsaInputProjectionView y) {
         return x.address < y.address + y.bytes && y.address < x.address + x.bytes;
     };
@@ -4140,7 +4140,7 @@ void launch_hip_qsa_rows_projection_probe(HipQsaRowsProjection projection, HipQs
             if (overlap(output[r], input[other]) || (other < r && overlap(output[r], output[other])))
                 throw std::invalid_argument("QSA rows projection output aliases a row");
     }
-    if (mode == HipQsaRowsProbeMode::rows_a8 && rows * width + rows * (width / 32U) * 4U > q8_rows::kLdsBytes)
+    if (mode == HipQsaRowsProbeMode::rows_a8 && (rows > 8U || rows * width + rows * (width / 32U) * 4U > q8_rows::kLdsBytes))
         throw std::invalid_argument("QSA rows A8 activations exceed one block's LDS");
     const auto native = static_cast<hipStream_t>(stream);
     check_hip(hipPeekAtLastError(), "QSA rows projection diagnostic pre-enqueue stale error");
@@ -4159,7 +4159,10 @@ void launch_hip_qsa_rows_projection_probe(HipQsaRowsProjection projection, HipQs
     if (rows == 1U) enqueue_qsa_rows_probe<1U>(input_side, a8, input, weights, output, width, outputs, native);
     else if (rows == 2U) enqueue_qsa_rows_probe<2U>(input_side, a8, input, weights, output, width, outputs, native);
     else if (rows == 4U) enqueue_qsa_rows_probe<4U>(input_side, a8, input, weights, output, width, outputs, native);
-    else enqueue_qsa_rows_probe<8U>(input_side, a8, input, weights, output, width, outputs, native);
+    else if (rows == 8U) enqueue_qsa_rows_probe<8U>(input_side, a8, input, weights, output, width, outputs, native);
+    else if (rows == 16U) enqueue_qsa_rows_probe<16U>(input_side, a8, input, weights, output, width, outputs, native);
+    else if (rows == 32U) enqueue_qsa_rows_probe<32U>(input_side, a8, input, weights, output, width, outputs, native);
+    else enqueue_qsa_rows_probe<64U>(input_side, a8, input, weights, output, width, outputs, native);
     check_hip(hipGetLastError(), "QSA rows projection diagnostic launch");
 }
 #endif

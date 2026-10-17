@@ -70,7 +70,7 @@ void launch_hip_qsa_output_projection_probe(HipQsaOutputProjectionMode,
     HipQsaInputProjectionView output, std::uint32_t width, std::uint32_t outputs, void* stream);
 #endif
 #ifdef STRIX_BUILD_KNOWN_WINDOW_DIAGNOSTIC
-// Test-only T = 1/2/4/8 rows of the prefetch8 input (BF16 -> BF16-rounded FP32)
+// Test-only T = 1/2/4/8/16/32/64 rows of the prefetch8 input (BF16 -> BF16-rounded FP32)
 // or wave8 output (FP32 -> BF16) Q8_0 projection: the q8_rows engine (exact or
 // A8) or the C1 kernel once per row. Same ownership rules as the probes above.
 enum class HipQsaRowsProjection { input, output };
