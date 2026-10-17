@@ -95,6 +95,9 @@ struct HipKnownPromptBackend::Impl {
             std::vector<float> logits(state_only?0U:static_cast<std::size_t>(vocab_size));
             window_attempted = true;
             const auto result = window->execute(session, tokens);
+            // A window with deferred GDN or per-row PLE keeps every row of a known prompt: commit them all
+            // and apply the pending GDN rows now (both are no-ops for windows without those operators).
+            if (!window->supports_tiled_prefill()) { window->commit_prefix(rows); window->flush_deferred(); }
             if (session.health != SerialSessionHealth::ready || session.next_position != position + rows ||
                 session.committed_tokens != committed_before + rows || result.logits.size()!=result.logit_row_indices.size())
                 throw std::logic_error("known prompt native window did not commit its configured causal rows");

@@ -242,6 +242,9 @@ struct Options {
     bool known_prefix_expert_union = false;
     // Router + combine/inject rows entries in the known-prefix or MTP window.
     bool known_window_router_rows = false;
+    // Known-prefix windows also use the verify window's deferred GDN, per-row PLE, router rows and
+    // combine/inject rows; each window commits all its rows and flushes before returning.
+    bool known_prefix_full_rows = false;
     std::string offline_tuning_cache_path;
     std::string offline_compile_provenance_path;
     strix::KnownWindowOutputPolicy known_prefix_output_policy = strix::KnownWindowOutputPolicy::all_rows;
@@ -534,6 +537,8 @@ inline void validate_resolved_known_prefix_window(const Options& options) {
     if (!options.known_prefix_window) {
         if (options.known_prefix_expert_union)
             throw std::invalid_argument("known-prefix expert union requires --known-prefix-window");
+        if (options.known_prefix_full_rows)
+            throw std::invalid_argument("known-prefix full rows require --known-prefix-window");
         if (options.known_window_router_rows && !options.mtp.window_rows)
             throw std::invalid_argument("known-window router rows require --known-prefix-window or an MTP window");
         if (options.known_prefix_rows_explicit || options.known_prefix_rows != 2)
@@ -1187,6 +1192,11 @@ inline Options parse_options(
             if (rows != 2 && rows != 4 && rows != 8) throw std::invalid_argument("known-prefix rows must be 2, 4 or 8");
             options.known_prefix_rows = static_cast<std::uint32_t>(rows);
             options.known_prefix_rows_explicit = true;
+            continue;
+        }
+        if (argument == "--known-prefix-full-rows") {
+            if (options.known_prefix_full_rows) throw std::invalid_argument("duplicate known-prefix full rows option");
+            options.known_prefix_full_rows = true;
             continue;
         }
         if (argument == "--known-window-router-rows") {

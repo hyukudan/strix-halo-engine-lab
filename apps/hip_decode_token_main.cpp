@@ -2935,9 +2935,15 @@ int STRIX_DECODE_ENTRY(
                      options.known_prefix_output_policy, options.known_prefill_workspace_budget, options.known_prefill_metadata_budget / 2U,
                      options.known_window_router_rows, options.known_window_router_rows}));
                 known_prefix_plan = known_prefill_plan->tile8; // selection ledger, never a relabelled T forward
-            } else known_prefix_plan = strix::compile_known_prefix_window(model, compiled, manifest, tensor_access,
-                {true, true, true, options.known_prefix_window ? options.known_prefix_rows : 2U, options.known_prefix_expert_union,
-                 options.known_prefix_output_policy, options.known_window_router_rows, options.known_window_router_rows});
+            } else {
+                const bool full = options.known_prefix_full_rows;
+                const bool rows_ops = full || options.known_window_router_rows;
+                known_prefix_plan = strix::compile_known_prefix_window(model, compiled, manifest, tensor_access,
+                    {true, true, true, options.known_prefix_window ? options.known_prefix_rows : 2U, options.known_prefix_expert_union,
+                     options.known_prefix_output_policy, rows_ops, rows_ops, full, full, false, full, full});
+                if (full && (known_prefix_plan->gdn_deferred_rows_steps != model.gdn_layers || !known_prefix_plan->ple_rows_steps))
+                    throw std::invalid_argument("known-prefix full rows did not admit deferred GDN and PLE rows for every layer");
+            }
             if (!strix::known_window_has_promoted_steps(*known_prefix_plan))
                 throw std::invalid_argument("known prompt has no admitted known-window operators");
             if (model.vocab_size > std::numeric_limits<std::uint32_t>::max())
@@ -3357,10 +3363,18 @@ int STRIX_DECODE_ENTRY(
             for (std::size_t i = 0; i < observed.r2_variant_dispatches.size(); ++i)
                 std::cout << (i ? "," : "") << observed.r2_variant_dispatches[i];
             std::cout << "],\n  \"known_prefix_variant_names\":[";
-            constexpr std::array<std::string_view, 11> variant_names{
+            // One name per KnownWindowR2Variant, in enum order.
+            constexpr std::array<std::string_view, strix::known_window_r2_variant_slots> variant_names{
                 "none", "shared-q8-rows2", "gdn-all-q8-pair-tiles", "gdn-q8-rows2-f32-gates-r1",
                 "shared-q8-rows4", "shared-q8-rows8", "gdn-q8-rows4-f32-gates-r1", "gdn-q8-rows8-f32-gates-r1",
-                "routed-q51-union-rows2", "routed-q51-union-rows4", "routed-q51-union-rows8"};
+                "routed-q51-union-rows2", "routed-q51-union-rows4", "routed-q51-union-rows8",
+                "hyper-mix-rows2", "hyper-mix-rows4", "hyper-mix-rows8",
+                "qsa-q8-rows2-r1", "qsa-q8-rows4-r1", "qsa-q8-rows8-r1",
+                "gdn-deferred-rows2", "gdn-deferred-rows4", "gdn-deferred-rows8", "ple-rows-host-staged",
+                "qsa-q8-bf16idx-rows2-r1", "qsa-q8-bf16idx-rows4-r1", "qsa-q8-bf16idx-rows8-r1",
+                "lm-head-q8-prefetch8-rows2", "lm-head-q8-prefetch8-rows4", "lm-head-q8-prefetch8-rows8",
+                "moe-route-rows", "moe-combine-rows", "inject-rows",
+                "routed-a8-union-rows2", "routed-a8-union-rows4", "routed-a8-union-rows8"};
             for (std::size_t i = 0; i < compiled_variants.size(); ++i) {
                 if (i >= variant_names.size()) throw std::logic_error("unknown known-prefix variant name");
                 std::cout << (i ? "," : "") << '"' << variant_names[i] << '"';
