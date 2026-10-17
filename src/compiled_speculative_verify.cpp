@@ -637,11 +637,7 @@ std::pair<std::uint64_t, std::uint64_t> known_window_identities(
     auto kernel = fnv_offset; window_hash_text(kernel, window.logical_rows==2U ? "known-window-r2-kernels-v1" : "known-window-rows-kernels-v1");
     if(window.logical_rows!=2U) hash_u64(kernel,window.logical_rows);
     hash_u64(kernel, serial.kernel_plan_identity); hash_u64(kernel, window.mode.size());
-<<<<<<< HEAD
-    std::uint32_t r2 = 0, loops = 0, runtime = 0, shared_rows = 0, gdn_rows = 0, routed_union=0, hyper_rows=0;
-=======
-    std::uint32_t r2 = 0, loops = 0, runtime = 0, shared_rows = 0, gdn_rows = 0, routed_union=0, qsa_rows=0;
->>>>>>> kp5-qsa-rows
+    std::uint32_t r2 = 0, loops = 0, runtime = 0, shared_rows = 0, gdn_rows = 0, routed_union=0, hyper_rows=0, qsa_rows=0;
     std::uint64_t avoided = 0;
     std::uint32_t launches = 0;
     for (std::size_t i = 0; i < window.mode.size(); ++i) {
@@ -676,19 +672,16 @@ std::pair<std::uint64_t, std::uint64_t> known_window_identities(
             ++routed_union;
             // Routes are device results. No static weight-byte or launch-saving
             // claim is inferred before the actual union has been constructed.
-<<<<<<< HEAD
         } else if (mode==KnownWindowStepMode::hyper_mix_rows) {
             window_require(hyper_mix_op(step.op) && binding.kernel_id && known_hyper_rows_id(*binding.kernel_id) &&
                 variant==hyper_rows_variant(window.logical_rows), "known window HC rows variant/source ID mismatch");
             ++hyper_rows; avoided+=known_hyper_projection_bytes(step.op)*(window.logical_rows-1U);
             launches+=2U*(window.logical_rows-1U);
-=======
         } else if(mode==KnownWindowStepMode::qsa_rows) {
             window_require(step.op==SerialOp::indexed_attention && binding.kernel_id && known_qsa_id(*binding.kernel_id) &&
                 variant==qsa_rows_variant(window.logical_rows), "known window QSA rows variant/source ID mismatch");
             ++qsa_rows; avoided+=known_qsa_projection_bytes*(window.logical_rows-1U);
             launches+=known_qsa_launches_saved(window.logical_rows);
->>>>>>> kp5-qsa-rows
         } else if (mode == KnownWindowStepMode::r2_gdn_staged) {
             window_require(step.op == SerialOp::gated_delta_net &&
                 (variant == KnownWindowR2Variant::gdn_q8_virtual256_r2_v1 ||
@@ -707,11 +700,8 @@ std::pair<std::uint64_t, std::uint64_t> known_window_identities(
     }
     window_require(r2 == window.r2_steps && loops == window.row_loop_steps && runtime == window.runtime_row_steps &&
         shared_rows==window.shared_rows_steps && gdn_rows==window.gdn_rows_steps &&
-<<<<<<< HEAD
-        routed_union==window.routed_expert_union_steps && hyper_rows==window.hyper_mix_rows_steps,
-=======
-        routed_union==window.routed_expert_union_steps && qsa_rows==window.qsa_rows_steps,
->>>>>>> kp5-qsa-rows
+        routed_union==window.routed_expert_union_steps && hyper_rows==window.hyper_mix_rows_steps &&
+        qsa_rows==window.qsa_rows_steps,
         "known window counters do not match its actual mode table");
     window_require(avoided == window.logical_projection_weight_bytes_avoided &&
         launches == window.projection_launches_saved,
@@ -848,11 +838,8 @@ CompiledKnownPrefixWindow compile_known_prefix_window(
         } else if(output.mode[i]==KnownWindowStepMode::shared_rows) ++output.shared_rows_steps;
         else if(output.mode[i]==KnownWindowStepMode::gdn_rows) ++output.gdn_rows_steps;
         else if(output.mode[i]==KnownWindowStepMode::routed_expert_union) ++output.routed_expert_union_steps;
-<<<<<<< HEAD
         else if(output.mode[i]==KnownWindowStepMode::hyper_mix_rows) ++output.hyper_mix_rows_steps;
-=======
         else if(output.mode[i]==KnownWindowStepMode::qsa_rows) ++output.qsa_rows_steps;
->>>>>>> kp5-qsa-rows
         else ++output.r2_steps;
     }
     const auto identities = known_window_identities(output, serial);

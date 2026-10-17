@@ -132,11 +132,7 @@ bool hyper_op(strix::SerialOp op) {
     return op==strix::SerialOp::attn_hyper_mix || op==strix::SerialOp::mlp_hyper_mix || op==strix::SerialOp::final_hyper_mix;
 }
 KnownFixture make_known_fixture(const strix::ModelContract& model, std::uint32_t gate_type = 8U,
-<<<<<<< HEAD
-    bool routed_union = false, bool hyper = false) {
-=======
-    bool routed_union = false, bool qsa = false) {
->>>>>>> kp5-qsa-rows
+    bool routed_union = false, bool hyper = false, bool qsa = false) {
     KnownFixture fixture;
     fixture.serial.execution = strix::build_serial_decode_execution_plan(model);
     fixture.serial.io = strix::build_serial_execution_io_plan(fixture.serial.execution);
@@ -403,17 +399,10 @@ struct KnownRuntimeFixture {
 
     explicit KnownRuntimeFixture(const strix::ModelContract& model, bool promote = false, bool mixed = false,
         std::uint32_t rows = 2, bool routed_union = false,
-<<<<<<< HEAD
-        strix::KnownWindowOutputPolicy output_policy = strix::KnownWindowOutputPolicy::all_rows, bool hyper = false)
-        : source(make_known_fixture(model, mixed ? 0U : 8U,routed_union,hyper)),
+        strix::KnownWindowOutputPolicy output_policy = strix::KnownWindowOutputPolicy::all_rows, bool hyper = false, bool qsa = false)
+        : source(make_known_fixture(model, mixed ? 0U : 8U,routed_union,hyper,qsa)),
           window(strix::compile_known_prefix_window(model, source.serial, source.manifest,
-              source.access, {promote, promote, mixed, rows,routed_union,output_policy,hyper})),
-=======
-        strix::KnownWindowOutputPolicy output_policy = strix::KnownWindowOutputPolicy::all_rows, bool qsa = false)
-        : source(make_known_fixture(model, mixed ? 0U : 8U,routed_union,qsa)),
-          window(strix::compile_known_prefix_window(model, source.serial, source.manifest,
-              source.access, {promote, promote, mixed, rows,routed_union,output_policy,qsa})),
->>>>>>> kp5-qsa-rows
+              source.access, {promote, promote, mixed, rows,routed_union,output_policy,hyper,qsa})),
           serial_pool(static_cast<std::size_t>((source.serial.arena.total_bytes + 7U) / 8U)),
           window_pool(static_cast<std::size_t>((window.arena.physical.total_bytes + 7U) / 8U)),
           state_words(7U * 48U, 0) {
@@ -1138,7 +1127,7 @@ void known_window_routed_union_runtime_tests(const strix::ModelContract& model) 
 void known_window_qsa_tests(const strix::ModelContract& model) {
     using V=strix::KnownWindowR2Variant;
     using M=strix::KnownWindowStepMode;
-    const auto fixture=make_known_fixture(model,0U,false,true);
+    const auto fixture=make_known_fixture(model,0U,false,false,true);
     const auto reject=[&](auto&& operation,const char* message) {
         bool rejected=false;try{operation();}catch(const std::invalid_argument&){rejected=true;}expect(rejected,message);
     };
@@ -1187,7 +1176,7 @@ void known_window_qsa_tests(const strix::ModelContract& model) {
         KnownRuntimeFixture baseline(model,false,false,rows);
         std::vector<std::uint64_t> serial;
         for(const auto token:baseline.tokens) serial.push_back(baseline.serial_token(token));
-        KnownRuntimeFixture wide(model,false,false,rows,false,strix::KnownWindowOutputPolicy::all_rows,true);
+        KnownRuntimeFixture wide(model,false,false,rows,false,strix::KnownWindowOutputPolicy::all_rows,false,true);
         const std::array<strix::KnownWindowRowsEntry,1> entries{{
             {expected,&wide.trace,&recording_rows_preflight,&recording_qsa_rows_launch}}};
         std::vector<const strix::CompiledLaunchPlan*> plans;
@@ -1200,7 +1189,7 @@ void known_window_qsa_tests(const strix::ModelContract& model) {
             expect(read_word(result.logits[row].address)==serial[row],"QSA rows preserve every row's complete output");
         expect(result.qsa_rows_dispatches==12U && result.r2_variant_dispatches[static_cast<std::size_t>(expected)]==12U,
             "QSA rows dispatch once per QSA layer");
-        KnownRuntimeFixture missing(model,false,false,rows,false,strix::KnownWindowOutputPolicy::all_rows,true);
+        KnownRuntimeFixture missing(model,false,false,rows,false,strix::KnownWindowOutputPolicy::all_rows,false,true);
         plans.clear();for(const auto& plan:missing.row_launch) plans.push_back(&plan);
         reject([&]{(void)strix::execute_known_prefix_window_eager(missing.window,missing.source.serial,missing.resources,
             missing.window_memory,missing.session,missing.tokens,plans,{},{},missing.hooks());},
@@ -1852,11 +1841,8 @@ int main() {
 
     known_window_routed_union_compiler_tests(model);
     known_window_routed_union_runtime_tests(model);
-<<<<<<< HEAD
     known_window_hyper_rows_tests(model);
-=======
     known_window_qsa_tests(model);
->>>>>>> kp5-qsa-rows
     known_window_tests(model);
     known_window_runtime_tests(model);
     actual_known_window_lineage_tests(model);

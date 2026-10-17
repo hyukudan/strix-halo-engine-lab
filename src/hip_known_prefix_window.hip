@@ -2,12 +2,9 @@
 #include "strix/hip_mtp_target_window.hpp"
 
 #include "strix/deferred_moe_status.hpp"
-<<<<<<< HEAD
 #include "strix/hip_hyper_mix_launcher.hpp"
 #include "strix/lane_chain_hyper_output.hpp"
-=======
 #include "strix/hip_indexed_attention_launcher.hpp"
->>>>>>> kp5-qsa-rows
 #include "strix/hip_setup_quiescence.hpp"
 #include "strix/prepared_tensor_views.hpp"
 
@@ -456,15 +453,12 @@ struct HipKnownPrefixWindow::Impl {
         case KnownWindowR2Variant::routed_q51_union_rows2_v1:
         case KnownWindowR2Variant::routed_q51_union_rows4_v1:
         case KnownWindowR2Variant::routed_q51_union_rows8_v1: recipe="hip-routed-known-q4ka8-q51-union-dot-orderedslot-v1";break;
-<<<<<<< HEAD
         case KnownWindowR2Variant::hyper_mix_rows2_v1:
         case KnownWindowR2Variant::hyper_mix_rows4_v1:
         case KnownWindowR2Variant::hyper_mix_rows8_v1: recipe="hip-hc-known-rows-typed-q8-r1-ordered-v1";break;
-=======
         case KnownWindowR2Variant::qsa_q8_rows2_r1_v1:
         case KnownWindowR2Variant::qsa_q8_rows4_r1_v1:
         case KnownWindowR2Variant::qsa_q8_rows8_r1_v1: recipe="hip-qsa-known-wide-q8-append-all-r1-attend-v1";break;
->>>>>>> kp5-qsa-rows
         default:throw std::invalid_argument("known-window capture has no closed native recipe");
         }
         return capture_identity(recipe,static_cast<std::uint32_t>(variant));
