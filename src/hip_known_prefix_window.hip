@@ -377,6 +377,24 @@ struct HipKnownPrefixWindow::Impl {
                     const auto& self=*static_cast<Impl*>(object);
                     shared_expert_known_prefill_rows_launch(rows,self.shared_for(rows.first(8U)));
                 }});
+        // STRIX_PREFILL_FULL_ELEMENTWISE=0: keep inject / MoE-combine rows in 8-row launches.
+        static const bool elementwise=[]{const char* v=std::getenv("STRIX_PREFILL_FULL_ELEMENTWISE");return !v||v[0]!='0';}();
+        if(elementwise) {
+            prefill_entries.push_back({KnownWindowR2Variant::inject_rows_v1,this,
+                [](std::span<const ExecutionDispatchContext> rows,void* object) {
+                    inject_known_prefill_rows_preflight(rows,static_cast<Impl*>(object)->elementwise_config);
+                },
+                [](std::span<const ExecutionDispatchContext> rows,void* object) {
+                    inject_known_prefill_rows_launch(rows,static_cast<Impl*>(object)->elementwise_config);
+                }});
+            prefill_entries.push_back({KnownWindowR2Variant::moe_combine_rows_v1,this,
+                [](std::span<const ExecutionDispatchContext> rows,void* object) {
+                    moe_combine_known_prefill_rows_preflight(rows,static_cast<Impl*>(object)->elementwise_config);
+                },
+                [](std::span<const ExecutionDispatchContext> rows,void* object) {
+                    moe_combine_known_prefill_rows_launch(rows,static_cast<Impl*>(object)->elementwise_config);
+                }});
+        }
         // STRIX_PREFILL_FULL_ROUTER=0: keep router rows in separate 8-row launches.
         static const bool router=[]{const char* v=std::getenv("STRIX_PREFILL_FULL_ROUTER");return !v||v[0]!='0';}();
         if(router)
