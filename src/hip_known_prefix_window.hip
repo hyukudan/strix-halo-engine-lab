@@ -325,6 +325,18 @@ struct HipKnownPrefixWindow::Impl {
     }
     void setup_prefill_entries() {
         // STRIX_PREFILL_FULL_GDN=0: keep the GDN step in 8-row tiles.
+        // STRIX_PREFILL_FULL_HC=0: keep HC rows in separate 8-row launches.
+        static const bool hc=[]{const char* v=std::getenv("STRIX_PREFILL_FULL_HC");return !v||v[0]!='0';}();
+        if(hc&&window.hyper_mix_rows_steps)
+            prefill_entries.push_back({KnownWindowR2Variant::hyper_mix_rows8_v1,this,
+                [](std::span<const ExecutionDispatchContext> rows,void* object) {
+                    const auto& self=*static_cast<Impl*>(object);
+                    hyper_mix_known_prefill_rows_preflight(rows,self.hyper_for(rows));
+                },
+                [](std::span<const ExecutionDispatchContext> rows,void* object) {
+                    const auto& self=*static_cast<Impl*>(object);
+                    hyper_mix_known_prefill_rows_launch(rows,self.hyper_for(rows));
+                }});
         static const bool gdn=[]{const char* v=std::getenv("STRIX_PREFILL_FULL_GDN");return !v||v[0]!='0';}();
         if(!gdn) return;
         prefill_entries.push_back({KnownWindowR2Variant::gdn_q8_rows8_f32_gates_r1_v1,this,

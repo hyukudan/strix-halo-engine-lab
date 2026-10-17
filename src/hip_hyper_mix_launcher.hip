@@ -28,6 +28,7 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <type_traits>
 #include <vector>
 
 namespace strix {
@@ -1662,14 +1663,35 @@ struct HyperRows {
     float* normalized[kWindowRows];
     float* low[kWindowRows];
     float* injection[kWindowRows];
+    // Prefill: blockIdx.z selects an 8-row tile, each view blockIdx.z * its stride bytes on (0 in windows).
+    std::uint64_t tile_input, tile_output, tile_normalized, tile_injection;
 };
+// Prefill tiles: the same views, blockIdx.z selects the 8-row tile. Window kernels take
+// HyperRows and compile without any tile arithmetic; HyperTileRows kernels shift each view
+// by blockIdx.z times its stride (the kernel argument itself is never written: a written
+// copy leaves the kernarg segment and dynamic row indexing goes to scratch).
+struct HyperTileRows : HyperRows {
+    std::uint32_t tiles; // tiles per block of the kernels that loop over tiles (grid z = all tiles / tiles)
+};
+template <typename Pointer> __device__ __forceinline__ Pointer tiled(Pointer pointer, std::uint64_t, const HyperRows&,
+    std::uint32_t = 0U) {
+    return pointer;
+}
+template <typename Pointer> __device__ __forceinline__ Pointer tiled(Pointer pointer, std::uint64_t stride, const HyperTileRows&,
+    std::uint32_t tile = blockIdx.z) {
+    const auto offset = static_cast<std::uint64_t>(tile) * stride;
+    return pointer ? reinterpret_cast<Pointer>(reinterpret_cast<std::uintptr_t>(pointer) + offset) : pointer;
+}
+template <class Rows> __device__ __forceinline__ std::uint32_t looped_tiles(const Rows& rows) {
+    if constexpr (std::is_same_v<Rows, HyperTileRows>) return rows.tiles; else return 1U;
+}
 
-template <typename Storage>
-__global__ void rows_prepare_hyper_norm_kernel(HyperRows rows, const void* norm, std::uint32_t norm_type,
+template <typename Storage, class Rows = HyperRows>
+__global__ void rows_prepare_hyper_norm_kernel(Rows rows, const void* norm, std::uint32_t norm_type,
     std::uint32_t hidden, float epsilon) {
     const auto stream = blockIdx.x;
-    const auto* input = static_cast<const Storage*>(rows.input[blockIdx.y]);
-    auto* normalized = rows.normalized[blockIdx.y];
+    const auto* input = static_cast<const Storage*>(tiled(rows.input[blockIdx.y], rows.tile_input, rows));
+    auto* normalized = tiled(rows.normalized[blockIdx.y], rows.tile_normalized, rows);
     const auto lane = threadIdx.x;
     const auto base = static_cast<std::uint64_t>(stream) * hidden;
     __shared__ float reduction[kThreads];
@@ -1697,8 +1719,8 @@ __global__ void rows_prepare_hyper_norm_kernel(HyperRows rows, const void* norm,
 __device__ __forceinline__ std::uint32_t rows_chain_row(std::uint32_t lane) {
     return lane / 32U + ((lane % 32U) < kStagedOutputs ? 0U : (lane % 32U) < 2U * kStagedOutputs ? 4U : kWindowRows);
 }
-template <std::uint32_t Kind, bool Injection, bool Full>
-__device__ void rows_typed_batched_projection_role(const HyperRows& rows, std::uint32_t count,
+template <std::uint32_t Kind, bool Injection, bool Full, class Rows>
+__device__ void rows_typed_batched_projection_role(const Rows& rows, std::uint32_t count,
     const void* weights, std::uint32_t width, std::uint32_t streams, std::uint32_t outputs,
     std::uint32_t role_block, float (*values)[kStagedPitch], float (*coefficients)[kStagedPitch]) {
     const auto lane = threadIdx.x;
@@ -1721,7 +1743,7 @@ __device__ void rows_typed_batched_projection_role(const HyperRows& rows, std::u
             }
             float staged[kWindowRows];
 #pragma unroll
-            for (std::uint32_t r = 0; r < kWindowRows; ++r) if (r < count) staged[r] = rows.normalized[r][tile + lane];
+            for (std::uint32_t r = 0; r < kWindowRows; ++r) if (r < count) staged[r] = tiled(rows.normalized[r], rows.tile_normalized, rows)[tile + lane];
 #pragma unroll
             for (std::uint32_t r = 0; r < kWindowRows; ++r) if (r < count) values[r][lane] = staged[r];
 #pragma unroll
@@ -1737,12 +1759,13 @@ __device__ void rows_typed_batched_projection_role(const HyperRows& rows, std::u
     }
     if (active) {
         const float scaled = sum / static_cast<float>(streams);
-        (Injection ? rows.injection[row] : rows.low[row])[chain] =
+        (Injection ? tiled(rows.injection[row], rows.tile_injection, rows) : tiled(rows.low[row], rows.tile_normalized, rows))[chain] =
             Injection ? 2.0F * sigmoid(scaled) : scaled * sigmoid(scaled);
     }
 }
 
-__global__ void rows_batched_typed_hyper_projection_kernel(HyperRows rows, std::uint32_t count,
+template <class Rows = HyperRows>
+__global__ void rows_batched_typed_hyper_projection_kernel(Rows rows, std::uint32_t count,
     const void* down, std::uint32_t width, std::uint32_t streams, std::uint32_t lowrank,
     const void* inject, std::uint32_t lowrank_blocks) {
     __shared__ float values[kWindowRows][kStagedPitch];
@@ -1767,8 +1790,8 @@ __global__ void rows_batched_typed_hyper_projection_kernel(HyperRows rows, std::
 
 // Split-K P1: weights stay in registers while every row replays the R1 lane
 // chain, the xor reduction and the ordered 16-tile block sum.
-template <unsigned R, bool Injection, class LoadX>
-__device__ __forceinline__ void rows_splitk_hyper_lane_dots(const HyperRows& rows, unsigned count,
+template <unsigned R, bool Injection, class LoadX, class Rows>
+__device__ __forceinline__ void rows_splitk_hyper_lane_dots(const Rows& rows, unsigned count,
     const void* weights, unsigned first, unsigned valid, unsigned tile, unsigned lane, float (*red)[16][R], LoadX&& load_x) {
     (void)rows;
     float4 w[Injection ? R : 1U][5];
@@ -1833,8 +1856,8 @@ __device__ __forceinline__ void rows_splitk_hyper_lane_dots(const HyperRows& row
     }
 }
 
-template <unsigned R>
-__global__ __launch_bounds__(512) void rows_splitk_hyper_projection_kernel(HyperRows rows, unsigned count,
+template <unsigned R, class Rows = HyperRows>
+__global__ __launch_bounds__(512) void rows_splitk_hyper_projection_kernel(Rows rows, unsigned count,
     const void* __restrict__ down, unsigned streams, unsigned rank, const void* __restrict__ inject, unsigned low_blocks) {
     __shared__ float red[kWindowRows][16][R];
     const unsigned lane=threadIdx.x%32U,tile=threadIdx.x/32U;
@@ -1842,7 +1865,7 @@ __global__ __launch_bounds__(512) void rows_splitk_hyper_projection_kernel(Hyper
     const unsigned first=(is_inject?blockIdx.x-low_blocks:blockIdx.x)*R;
     const unsigned remaining=(is_inject?streams:rank)-first;
     const unsigned valid=remaining<R?remaining:R;
-    const auto stored=[&](unsigned t,unsigned at){return *reinterpret_cast<const float4*>(rows.normalized[t]+at);};
+    const auto stored=[&](unsigned t,unsigned at){return *reinterpret_cast<const float4*>(tiled(rows.normalized[t], rows.tile_normalized, rows)+at);};
     if(is_inject)rows_splitk_hyper_lane_dots<R,true>(rows,count,inject,first,valid,tile,lane,red,stored);
     else rows_splitk_hyper_lane_dots<R,false>(rows,count,down,first,valid,tile,lane,red,stored);
     __syncthreads();
@@ -1852,8 +1875,8 @@ __global__ __launch_bounds__(512) void rows_splitk_hyper_projection_kernel(Hyper
 #pragma unroll
         for(unsigned k=0;k<16U;++k)total=total+red[t][k][r];
         const float scaled=total/static_cast<float>(streams);
-        if(is_inject)rows.injection[t][first+r]=2.0F*sigmoid(scaled);
-        else rows.low[t][first+r]=scaled*sigmoid(scaled);
+        if(is_inject)tiled(rows.injection[t], rows.tile_injection, rows)[first+r]=2.0F*sigmoid(scaled);
+        else tiled(rows.low[t], rows.tile_normalized, rows)[first+r]=scaled*sigmoid(scaled);
     }
 }
 
@@ -1862,8 +1885,8 @@ __global__ __launch_bounds__(512) void rows_splitk_hyper_projection_kernel(Hyper
 // features l, l + 256, ...; strides 128..32 in registers, 16..1 across lanes), every block
 // normalises its inputs on the fly with the same product, and the blocks together store
 // the normalised rows the output kernel reads.
-template <unsigned R, typename Storage>
-__global__ __launch_bounds__(512) void rows_splitk_norm_hyper_projection_kernel(HyperRows rows, unsigned count,
+template <unsigned R, typename Storage, class Rows = HyperRows>
+__global__ __launch_bounds__(512) void rows_splitk_norm_hyper_projection_kernel(Rows rows, unsigned count,
     const void* __restrict__ down, unsigned streams, unsigned rank, const void* __restrict__ inject, unsigned low_blocks,
     const void* __restrict__ norm, std::uint32_t norm_type, unsigned hidden, float epsilon) {
     __shared__ float red[kWindowRows][16][R];
@@ -1871,7 +1894,7 @@ __global__ __launch_bounds__(512) void rows_splitk_norm_hyper_projection_kernel(
     const unsigned lane=threadIdx.x%32U,tile=threadIdx.x/32U;
     for(unsigned pair=tile;pair<count*streams;pair+=16U) {
         const unsigned t=pair/streams,stream=pair%streams;
-        const auto* input=static_cast<const Storage*>(rows.input[t]);
+        const auto* input=static_cast<const Storage*>(tiled(rows.input[t], rows.tile_input, rows));
         const auto base=static_cast<std::uint64_t>(stream)*hidden;
         float leaf[8];
 #pragma unroll
@@ -1901,11 +1924,11 @@ __global__ __launch_bounds__(512) void rows_splitk_norm_hyper_projection_kernel(
     const auto share=(total+gridDim.x-1U)/gridDim.x,begin=share*blockIdx.x,end=begin+share<total?begin+share:total;
     for(auto e=begin+threadIdx.x;e<end;e+=512U) {
         const auto t=static_cast<unsigned>(e/width);const std::uint64_t at=e%width;
-        rows.normalized[t][at] = load_activation(static_cast<const Storage*>(rows.input[t]), at) *
+        tiled(rows.normalized[t], rows.tile_normalized, rows)[at] = load_activation(static_cast<const Storage*>(tiled(rows.input[t], rows.tile_input, rows)), at) *
             inverse[t][static_cast<unsigned>(at/hidden)] * load_norm_weight(norm, norm_type, static_cast<std::uint32_t>(at));
     }
     const auto normalized=[&](unsigned t,unsigned at) {
-        const auto* input=static_cast<const Storage*>(rows.input[t]);
+        const auto* input=static_cast<const Storage*>(tiled(rows.input[t], rows.tile_input, rows));
         const float scale=inverse[t][at/hidden];
         float4 x;
         x.x = load_activation(input, at) * scale * load_norm_weight(norm, norm_type, at);
@@ -1927,13 +1950,13 @@ __global__ __launch_bounds__(512) void rows_splitk_norm_hyper_projection_kernel(
 #pragma unroll
         for(unsigned k=0;k<16U;++k)total_dot=total_dot+red[t][k][r];
         const float scaled=total_dot/static_cast<float>(streams);
-        if(is_inject)rows.injection[t][first+r]=2.0F*sigmoid(scaled);
-        else rows.low[t][first+r]=scaled*sigmoid(scaled);
+        if(is_inject)tiled(rows.injection[t], rows.tile_injection, rows)[first+r]=2.0F*sigmoid(scaled);
+        else tiled(rows.low[t], rows.tile_normalized, rows)[first+r]=scaled*sigmoid(scaled);
     }
 }
 
-template <typename Storage, bool Full>
-__device__ void rows_q8_batched_hyper_output_role(const HyperRows& rows, std::uint32_t count, const void* up,
+template <typename Storage, bool Full, class Rows>
+__device__ void rows_q8_batched_hyper_output_role(const Rows& rows, std::uint32_t count, const void* up,
     std::uint32_t hidden, std::uint32_t streams, std::uint32_t lowrank,
     float (*values)[kStagedPitch], float (*coefficients)[kStagedPitch]) {
     const auto lane = threadIdx.x;
@@ -1959,7 +1982,7 @@ __device__ void rows_q8_batched_hyper_output_role(const HyperRows& rows, std::ui
                 }
                 float staged[kWindowRows];
 #pragma unroll
-                for (std::uint32_t r = 0; r < kWindowRows; ++r) if (r < count) staged[r] = rows.low[r][tile + lane];
+                for (std::uint32_t r = 0; r < kWindowRows; ++r) if (r < count) staged[r] = tiled(rows.low[r], rows.tile_normalized, rows)[tile + lane];
 #pragma unroll
                 for (std::uint32_t r = 0; r < kWindowRows; ++r) if (r < count) values[r][lane] = staged[r];
 #pragma unroll
@@ -1974,14 +1997,14 @@ __device__ void rows_q8_batched_hyper_output_role(const HyperRows& rows, std::ui
             __syncthreads();
         }
         if (active)
-            mixed += rows.normalized[row][stream * hidden + feature] * sigmoid(gate);
+            mixed += tiled(rows.normalized[row], rows.tile_normalized, rows)[stream * hidden + feature] * sigmoid(gate);
     }
     if (active)
-        store_activation(&static_cast<Storage*>(rows.output[row])[feature], mixed / static_cast<float>(streams));
+        store_activation(&static_cast<Storage*>(tiled(rows.output[row], rows.tile_output, rows))[feature], mixed / static_cast<float>(streams));
 }
 
-template <typename Storage>
-__global__ void rows_q8_batched_hyper_output_kernel(HyperRows rows, std::uint32_t count, const void* up,
+template <typename Storage, class Rows = HyperRows>
+__global__ void rows_q8_batched_hyper_output_kernel(Rows rows, std::uint32_t count, const void* up,
     std::uint32_t hidden, std::uint32_t streams, std::uint32_t lowrank) {
     __shared__ float values[kWindowRows][kStagedPitch];
     __shared__ float coefficients[kStagedOutputs][kStagedPitch];
@@ -1994,8 +2017,8 @@ __global__ void rows_q8_batched_hyper_output_kernel(HyperRows rows, std::uint32_
 // One staged up tile per block; each stream wave runs every row's R1 lane chain.
 // Count > 0 fixes the row count at compile time: rows advance together, each
 // coefficient decoded once for all of them, every row keeping its own serial chain.
-template <typename Storage, std::uint32_t Count = 0U>
-__global__ void rows_lane_chain_hyper_output_kernel(HyperRows rows, std::uint32_t count, const void* up,
+template <typename Storage, std::uint32_t Count = 0U, class Rows = HyperRows>
+__global__ void rows_lane_chain_hyper_output_kernel(Rows rows, std::uint32_t count, const void* up,
     std::uint32_t hidden, std::uint32_t streams, std::uint32_t rank) {
     extern __shared__ __align__(16) unsigned char staging[];
     const auto lane=threadIdx.x&31U,stream=threadIdx.x/32U;
@@ -2006,11 +2029,14 @@ __global__ void rows_lane_chain_hyper_output_kernel(HyperRows rows, std::uint32_
     stage_tile16(stage,source,tile_bytes,lane);
     __syncthreads();
     auto* sig=reinterpret_cast<float*>(staging+static_cast<std::uint64_t>(streams)*tile_bytes);
+    // Tile rows reuse the staged weight tile: one block runs the chains of every tile.
+    for(std::uint32_t z=0;z<looped_tiles(rows);++z){
+    if(z)__syncthreads();
     if constexpr (Count != 0U) {
     const float* low[Count];
     float gate[Count];
 #pragma unroll
-    for(std::uint32_t t=0;t<Count;++t){ low[t]=rows.low[t]; gate[t]=0.0F; }
+    for(std::uint32_t t=0;t<Count;++t){ low[t]=tiled(rows.low[t], rows.tile_normalized, rows, blockIdx.z * looped_tiles(rows) + z); gate[t]=0.0F; }
     for(std::uint32_t block=0;block<rank/32U;++block){
         const auto* weight=stage+static_cast<std::uint64_t>(lane)*row_bytes+static_cast<std::uint64_t>(block)*34U;
         const auto scale_bits=static_cast<unsigned short>(static_cast<unsigned>(weight[0])|(static_cast<unsigned>(weight[1])<<8U));
@@ -2027,7 +2053,7 @@ __global__ void rows_lane_chain_hyper_output_kernel(HyperRows rows, std::uint32_
     for(std::uint32_t t=0;t<Count;++t) sig[(t*streams+stream)*32U+lane]=sigmoid(gate[t]);
     } else
     for(std::uint32_t t=0;t<count;++t){
-        const auto* low=rows.low[t];
+        const auto* low=tiled(rows.low[t], rows.tile_normalized, rows, blockIdx.z * looped_tiles(rows) + z);
         float gate=0.0F;
         for(std::uint32_t block=0;block<rank/32U;++block){
             const auto* weight=stage+static_cast<std::uint64_t>(lane)*row_bytes+static_cast<std::uint64_t>(block)*34U;
@@ -2044,8 +2070,9 @@ __global__ void rows_lane_chain_hyper_output_kernel(HyperRows rows, std::uint32_
     for(std::uint32_t t=stream;t<count;t+=streams){
         float mixed=0.0F;const auto feature=first+lane;
         for(std::uint32_t s=0;s<streams;++s)
-            mixed+=rows.normalized[t][static_cast<std::uint64_t>(s)*hidden+feature]*sig[(t*streams+s)*32U+lane];
-        store_activation(&static_cast<Storage*>(rows.output[t])[feature],mixed/static_cast<float>(streams));
+            mixed+=tiled(rows.normalized[t], rows.tile_normalized, rows, blockIdx.z * looped_tiles(rows) + z)[static_cast<std::uint64_t>(s)*hidden+feature]*sig[(t*streams+s)*32U+lane];
+        store_activation(&static_cast<Storage*>(tiled(rows.output[t], rows.tile_output, rows, blockIdx.z * looped_tiles(rows) + z))[feature],mixed/static_cast<float>(streams));
+    }
     }
 }
 
@@ -2053,8 +2080,8 @@ __global__ void rows_lane_chain_hyper_output_kernel(HyperRows rows, std::uint32_
 // (21 x 16 B + 4 B, all issued up front) and starts the chain as soon as the first block has arrived, so
 // the chain overlaps the remaining loads instead of following a whole-tile LDS stage. Same per-row chain
 // (block, then code order), same coefficient and accumulation expressions, same stream mix.
-template <typename Storage, std::uint32_t Count>
-__global__ void rows_lane_chain_hyper_output_regs_kernel(HyperRows rows, const void* up,
+template <typename Storage, std::uint32_t Count, class Rows = HyperRows>
+__global__ void rows_lane_chain_hyper_output_regs_kernel(Rows rows, const void* up,
     std::uint32_t hidden, std::uint32_t streams) {
     constexpr std::uint32_t kBlocks = 10U, kRowBytes = kBlocks * 34U, kWords = kRowBytes / 4U;
     extern __shared__ __align__(16) unsigned char staging[];
@@ -2075,7 +2102,7 @@ __global__ void rows_lane_chain_hyper_output_regs_kernel(HyperRows rows, const v
     const float* low[Count];
     float gate[Count];
 #pragma unroll
-    for (std::uint32_t t = 0; t < Count; ++t) { low[t] = rows.low[t]; gate[t] = 0.0F; }
+    for (std::uint32_t t = 0; t < Count; ++t) { low[t] = tiled(rows.low[t], rows.tile_normalized, rows); gate[t] = 0.0F; }
 #pragma unroll
     for (std::uint32_t block = 0; block < kBlocks; ++block) {
         const auto scale_bits = static_cast<unsigned short>(byte_at(block * 34U) | (byte_at(block * 34U + 1U) << 8U));
@@ -2094,8 +2121,8 @@ __global__ void rows_lane_chain_hyper_output_regs_kernel(HyperRows rows, const v
     for (std::uint32_t t = stream; t < Count; t += streams) {
         float mixed = 0.0F; const auto feature = first + lane;
         for (std::uint32_t s2 = 0; s2 < streams; ++s2)
-            mixed += rows.normalized[t][static_cast<std::uint64_t>(s2) * hidden + feature] * sig[(t * streams + s2) * 32U + lane];
-        store_activation(&static_cast<Storage*>(rows.output[t])[feature], mixed / static_cast<float>(streams));
+            mixed += tiled(rows.normalized[t], rows.tile_normalized, rows)[static_cast<std::uint64_t>(s2) * hidden + feature] * sig[(t * streams + s2) * 32U + lane];
+        store_activation(&static_cast<Storage*>(tiled(rows.output[t], rows.tile_output, rows))[feature], mixed / static_cast<float>(streams));
     }
 }
 
@@ -2921,9 +2948,13 @@ void hyper_mix_known_window_rows_preflight(std::span<const ExecutionDispatchCont
     (void)prepare_hyper_rows(rows, config);
 }
 
-void hyper_mix_known_window_rows_launch(std::span<const ExecutionDispatchContext> rows,
-    const HipHyperMixLauncherConfig& config) {
-    const auto prepared = prepare_hyper_rows(rows, config);
+namespace {
+template <class Rows> std::uint32_t looped(const Rows& rows) {
+    if constexpr (std::is_same_v<Rows, HyperTileRows>) return rows.tiles; else return 1U;
+}
+template <class Rows>
+void launch_hyper_rows(const PreparedHyperRows& prepared, const Rows& rows, const HipHyperMixLauncherConfig& config,
+    std::uint32_t tiles) {
     const auto& p = prepared.first;
     const auto count = prepared.count;
     const auto width = config.hidden_size * config.hc_count;
@@ -2934,8 +2965,8 @@ void hyper_mix_known_window_rows_launch(std::span<const ExecutionDispatchContext
         const bool fused = fused_norm && config.splitk_projection && config.hc_count <= 8U && config.hidden_size % 4U == 0U &&
             count * config.hc_count <= 64U;
         if (!fused) {
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_prepare_hyper_norm_kernel<Storage>), dim3(config.hc_count, count),
-                dim3(kThreads), 0, hip_execution_stream(), prepared.rows, reinterpret_cast<const void*>(p.norm_runtime->address),
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_prepare_hyper_norm_kernel<Storage, Rows>), dim3(config.hc_count, count, tiles),
+                dim3(kThreads), 0, hip_execution_stream(), rows, reinterpret_cast<const void*>(p.norm_runtime->address),
                 p.norm_manifest->ggml_type, config.hidden_size, config.rms_epsilon);
             check_hip(hipGetLastError(), "known-window HC rows normalization launch");
         }
@@ -2947,9 +2978,9 @@ void hyper_mix_known_window_rows_launch(std::span<const ExecutionDispatchContext
             }();
             const auto launch = [&]<unsigned outputs>() {
                 const auto blocks = (config.lowrank + outputs - 1U) / outputs;
-                hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_splitk_norm_hyper_projection_kernel<outputs, Storage>),
-                    dim3(blocks + (inject ? (config.hc_count + outputs - 1U) / outputs : 0U)), dim3(512U), 0,
-                    hip_execution_stream(), prepared.rows, count, reinterpret_cast<const void*>(p.down_runtime->address),
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_splitk_norm_hyper_projection_kernel<outputs, Storage, Rows>),
+                    dim3(blocks + (inject ? (config.hc_count + outputs - 1U) / outputs : 0U), 1U, tiles), dim3(512U), 0,
+                    hip_execution_stream(), rows, count, reinterpret_cast<const void*>(p.down_runtime->address),
                     config.hc_count, config.lowrank, inject, blocks, reinterpret_cast<const void*>(p.norm_runtime->address),
                     p.norm_manifest->ggml_type, config.hidden_size, config.rms_epsilon);
             };
@@ -2964,9 +2995,9 @@ void hyper_mix_known_window_rows_launch(std::span<const ExecutionDispatchContext
             }();
             const auto launch = [&]<unsigned outputs>() {
                 const auto blocks = (config.lowrank + outputs - 1U) / outputs;
-                hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_splitk_hyper_projection_kernel<outputs>),
-                    dim3(blocks + (inject ? (config.hc_count + outputs - 1U) / outputs : 0U)), dim3(512U), 0,
-                    hip_execution_stream(), prepared.rows, count, reinterpret_cast<const void*>(p.down_runtime->address),
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_splitk_hyper_projection_kernel<outputs, Rows>),
+                    dim3(blocks + (inject ? (config.hc_count + outputs - 1U) / outputs : 0U), 1U, tiles), dim3(512U), 0,
+                    hip_execution_stream(), rows, count, reinterpret_cast<const void*>(p.down_runtime->address),
                     config.hc_count, config.lowrank, inject, blocks);
             };
             if (per_block == 1U) launch.template operator()<1U>();
@@ -2975,9 +3006,9 @@ void hyper_mix_known_window_rows_launch(std::span<const ExecutionDispatchContext
             else launch.template operator()<4U>();
         } else {
             const auto blocks = (config.lowrank + kStagedOutputs - 1U) / kStagedOutputs;
-            hipLaunchKernelGGL(rows_batched_typed_hyper_projection_kernel,
-                dim3(blocks + (inject ? (config.hc_count + kStagedOutputs - 1U) / kStagedOutputs : 0U)),
-                dim3(kStagedThreads), 0, hip_execution_stream(), prepared.rows, count,
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_batched_typed_hyper_projection_kernel<Rows>),
+                dim3(blocks + (inject ? (config.hc_count + kStagedOutputs - 1U) / kStagedOutputs : 0U), 1U, tiles),
+                dim3(kStagedThreads), 0, hip_execution_stream(), rows, count,
                 reinterpret_cast<const void*>(p.down_runtime->address), width, config.hc_count, config.lowrank, inject, blocks);
         }
         check_hip(hipGetLastError(), "known-window HC rows projection launch");
@@ -2989,14 +3020,15 @@ void hyper_mix_known_window_rows_launch(std::span<const ExecutionDispatchContext
             const auto output = [&]<std::uint32_t Count>() {
                 // Register form only up to 4 rows: at 8 rows it runs out of registers (32.1 -> 37.3 us).
                 if constexpr (Count != 0U && Count <= 4U) if (regs && config.lowrank == 320U) {
-                    hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_lane_chain_hyper_output_regs_kernel<Storage, Count>),
-                        dim3(config.hidden_size / 32U), dim3(32U * config.hc_count),
+                    hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_lane_chain_hyper_output_regs_kernel<Storage, Count, Rows>),
+                        dim3(config.hidden_size / 32U, 1U, tiles), dim3(32U * config.hc_count),
                         static_cast<std::size_t>(Count) * config.hc_count * 32U * sizeof(float), hip_execution_stream(),
-                        prepared.rows, reinterpret_cast<const void*>(p.up_runtime->address), config.hidden_size, config.hc_count);
+                        rows, reinterpret_cast<const void*>(p.up_runtime->address), config.hidden_size, config.hc_count);
                     return;
                 }
-                hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_lane_chain_hyper_output_kernel<Storage, Count>), dim3(config.hidden_size / 32U),
-                    dim3(32U * config.hc_count), static_cast<std::size_t>(lds), hip_execution_stream(), prepared.rows, count,
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_lane_chain_hyper_output_kernel<Storage, Count, Rows>),
+                    dim3(config.hidden_size / 32U, 1U, tiles / looped(rows)),
+                    dim3(32U * config.hc_count), static_cast<std::size_t>(lds), hip_execution_stream(), rows, count,
                     reinterpret_cast<const void*>(p.up_runtime->address), config.hidden_size, config.hc_count, config.lowrank);
             };
             if (count == 2U) output.template operator()<2U>();
@@ -3004,9 +3036,9 @@ void hyper_mix_known_window_rows_launch(std::span<const ExecutionDispatchContext
             else if (count == 8U) output.template operator()<8U>();
             else output.template operator()<0U>();
         } else {
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_q8_batched_hyper_output_kernel<Storage>),
-                dim3((config.hidden_size + kStagedOutputs - 1U) / kStagedOutputs), dim3(kStagedThreads), 0,
-                hip_execution_stream(), prepared.rows, count, reinterpret_cast<const void*>(p.up_runtime->address),
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_q8_batched_hyper_output_kernel<Storage, Rows>),
+                dim3((config.hidden_size + kStagedOutputs - 1U) / kStagedOutputs, 1U, tiles), dim3(kStagedThreads), 0,
+                hip_execution_stream(), rows, count, reinterpret_cast<const void*>(p.up_runtime->address),
                 config.hidden_size, config.hc_count, config.lowrank);
         }
         check_hip(hipGetLastError(), "known-window HC rows output launch");
@@ -3016,9 +3048,76 @@ void hyper_mix_known_window_rows_launch(std::span<const ExecutionDispatchContext
     case HipActivationStorage::fp32: invoke.template operator()<float>(); break;
     }
     if (config.arithmetic_stats) {
-        config.arithmetic_stats->materialized_norm_submissions.fetch_add(1, std::memory_order_relaxed);
-        if (config.splitk_projection) config.arithmetic_stats->splitk_f32_submissions.fetch_add(1, std::memory_order_relaxed);
+        config.arithmetic_stats->materialized_norm_submissions.fetch_add(tiles, std::memory_order_relaxed);
+        if (config.splitk_projection) config.arithmetic_stats->splitk_f32_submissions.fetch_add(tiles, std::memory_order_relaxed);
     }
+}
+}  // namespace
+
+void hyper_mix_known_window_rows_launch(std::span<const ExecutionDispatchContext> rows,
+    const HipHyperMixLauncherConfig& config) {
+    const auto prepared = prepare_hyper_rows(rows, config);
+    launch_hyper_rows(prepared, prepared.rows, config, 1U);
+}
+
+namespace {
+// All T rows of a prefill step as T/8 tiles of one launch. Each tile is admitted like an
+// 8-row window call; the tiles must be one uniform stride apart in every row view.
+PreparedHyperRows prepare_hyper_prefill_rows(std::span<const ExecutionDispatchContext> rows,
+    const HipHyperMixLauncherConfig& config, std::uint32_t& tiles) {
+    if (rows.size() < 16U || rows.size() % kWindowRows) throw std::invalid_argument("HC prefill rows require 8-row tiles");
+    tiles = static_cast<std::uint32_t>(rows.size() / kWindowRows);
+    if (tiles > 65535U) throw std::invalid_argument("HC prefill rows exceed the grid");
+    auto first = prepare_hyper_rows(rows.first(kWindowRows), config);
+    const auto at = [](const auto* pointer) { return reinterpret_cast<std::uintptr_t>(pointer); };
+    const auto second = prepare_hyper_rows(rows.subspan(kWindowRows, kWindowRows), config);
+    const auto stride = [&](const auto* a, const auto* b) -> std::uint64_t {
+        if (!a != !b) throw std::invalid_argument("HC prefill tiles bind different optional views");
+        if (!a) return 0U;
+        if (at(b) <= at(a) || (at(b) - at(a)) % 16U) throw std::invalid_argument("HC prefill tiles are not strided");
+        return at(b) - at(a);
+    };
+    first.rows.tile_input = stride(first.rows.input[0], second.rows.input[0]);
+    first.rows.tile_output = stride(first.rows.output[0], second.rows.output[0]);
+    first.rows.tile_normalized = stride(first.rows.normalized[0], second.rows.normalized[0]);
+    first.rows.tile_injection = stride(first.rows.injection[0], second.rows.injection[0]);
+    for (std::uint32_t t = 1; t < tiles; ++t) {
+        const auto tile = prepare_hyper_rows(rows.subspan(t * kWindowRows, kWindowRows), config);
+        const auto same = [&](const auto* a, const auto* b, std::uint64_t step) {
+            return a ? at(b) == at(a) + static_cast<std::uint64_t>(t) * step : b == nullptr;
+        };
+        for (std::uint32_t r = 0; r < kWindowRows; ++r)
+            if (!same(first.rows.input[r], tile.rows.input[r], first.rows.tile_input) ||
+                !same(first.rows.output[r], tile.rows.output[r], first.rows.tile_output) ||
+                !same(first.rows.normalized[r], tile.rows.normalized[r], first.rows.tile_normalized) ||
+                !same(first.rows.low[r], tile.rows.low[r], first.rows.tile_normalized) ||
+                !same(first.rows.injection[r], tile.rows.injection[r], first.rows.tile_injection))
+                throw std::invalid_argument("HC prefill tile views are not strided");
+    }
+    return first;
+}
+}  // namespace
+
+void hyper_mix_known_prefill_rows_preflight(std::span<const ExecutionDispatchContext> rows,
+    const HipHyperMixLauncherConfig& config) {
+    std::uint32_t tiles = 0;
+    (void)prepare_hyper_prefill_rows(rows, config, tiles);
+}
+
+void hyper_mix_known_prefill_rows_launch(std::span<const ExecutionDispatchContext> rows,
+    const HipHyperMixLauncherConfig& config) {
+    std::uint32_t tiles = 0;
+    const auto prepared = prepare_hyper_prefill_rows(rows, config, tiles);
+    HyperTileRows tile_rows;
+    static_cast<HyperRows&>(tile_rows) = prepared.rows;
+    // STRIX_HC_TILES_PER_BLOCK: 8-row tiles one lane-chain block runs on its staged weights.
+    static const std::uint32_t per_block = [] {
+        const char* v = std::getenv("STRIX_HC_TILES_PER_BLOCK");
+        const int n = v ? std::atoi(v) : 4;
+        return n == 1 || n == 2 || n == 4 || n == 8 ? static_cast<std::uint32_t>(n) : 4U;
+    }();
+    tile_rows.tiles = tiles % per_block ? 1U : per_block;
+    launch_hyper_rows(prepared, tile_rows, config, tiles);
 }
 
 void testing::enqueue_lane_chain_hyper_output_test(const HipHyperMixLauncherConfig& config,const float* normalized,const float* low,const void* up,void* output,std::uint32_t rows,bool lane_chain,hipStream_t stream){
