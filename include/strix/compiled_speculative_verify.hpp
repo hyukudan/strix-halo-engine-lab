@@ -27,6 +27,7 @@ enum class KnownWindowStepMode : std::uint8_t {
     gdn_rows,
     routed_expert_union,
     hyper_mix_rows,
+    qsa_rows,
 };
 
 // Closed implementation table. These values identify window entries; they do
@@ -48,8 +49,12 @@ enum class KnownWindowR2Variant : std::uint32_t {
     hyper_mix_rows2_v1 = 11,
     hyper_mix_rows4_v1 = 12,
     hyper_mix_rows8_v1 = 13,
+    // Q8 QSA projections read once per window; per-row selection/attention retain R1 math.
+    qsa_q8_rows2_r1_v1 = 14,
+    qsa_q8_rows4_r1_v1 = 15,
+    qsa_q8_rows8_r1_v1 = 16,
 };
-inline constexpr std::uint32_t known_window_r2_variant_slots = 14;
+inline constexpr std::uint32_t known_window_r2_variant_slots = 17;
 
 struct KnownWindowRequest {
     bool r2_shared_expert = false;
@@ -63,6 +68,8 @@ struct KnownWindowRequest {
     KnownWindowOutputPolicy output_policy = KnownWindowOutputPolicy::all_rows;
     // Multi-row HC mixers for the typed prefetched Q8 serial selection; others retain R1.
     bool rows_hyper_mix = false;
+    // All-Q8 QSA steps append every row's KV/index cells, then attend per row.
+    bool qsa_rows = false;
 };
 
 struct CompiledKnownPrefixWindow {
@@ -91,6 +98,7 @@ struct CompiledKnownPrefixWindow {
     std::uint32_t gdn_rows_steps = 0;
     std::uint32_t routed_expert_union_steps = 0;
     std::uint32_t hyper_mix_rows_steps = 0;
+    std::uint32_t qsa_rows_steps = 0;
     KnownWindowOutputPolicy output_policy = KnownWindowOutputPolicy::all_rows;
     // Compact result.logits entries correspond to these original source rows.
     std::vector<std::uint32_t> logit_row_indices;
@@ -100,7 +108,7 @@ struct CompiledKnownPrefixWindow {
 // Admission must cover every closed mode without adding counters that could overflow.
 [[nodiscard]] inline bool known_window_has_promoted_steps(const CompiledKnownPrefixWindow& window) noexcept {
     return window.r2_steps || window.shared_rows_steps || window.gdn_rows_steps || window.routed_expert_union_steps ||
-        window.hyper_mix_rows_steps;
+        window.hyper_mix_rows_steps || window.qsa_rows_steps;
 }
 
 [[nodiscard]] CompiledKnownPrefixWindow compile_known_prefix_window(

@@ -7,9 +7,13 @@
 #include "strix/graph_attention_state.hpp"
 #include "strix/qsa_input_prefetch.hpp"
 #include "strix/qsa_selection_plan.hpp"
+#include "strix/session_state_layout.hpp"
+#include "strix/session_state_memory.hpp"
 
-#include <string>
+#include <cstdint>
 #include <memory>
+#include <span>
+#include <string>
 #include <vector>
 
 namespace strix {
@@ -71,6 +75,40 @@ void register_hip_indexed_attention_kernel_variant(
 make_hip_indexed_attention_launcher(
     std::string kernel_id,
     HipIndexedAttentionLauncherConfig* config);
+
+// Optional device journal of raw indexer keys: per absolute layer,
+// (compress_ratio-1) partial-block tail cells, then up to eight window row keys.
+struct HipQsaIndexJournal { std::uintptr_t address = 0; std::uint64_t bytes = 0; };
+[[nodiscard]] std::uint64_t qsa_index_journal_bytes(const ModelContract&);
+
+// Known-prefix window: T = 2/4/8 rows of one QSA step at consecutive positions
+// p..p+T-1, eager only. Q/K/V/indexer and output weights are read once for all
+// rows; every row's raw-index key and K/V are appended before any row attends,
+// and row t sees exactly cells <= p+t. Each row's output, workspace and state
+// bytes equal the serial launcher's for this config (the row's serial kernel id
+// is checked). A bound journal receives the T raw keys for the tail commit.
+void indexed_attention_known_window_rows_preflight(std::span<const ExecutionDispatchContext> rows,
+    const HipIndexedAttentionLauncherConfig&, HipQsaIndexJournal journal = {});
+void indexed_attention_known_window_rows_launch(std::span<const ExecutionDispatchContext> rows,
+    const HipIndexedAttentionLauncherConfig&, HipQsaIndexJournal journal = {});
+
+// Indexer partial-block tail around a window. Snapshot (before the window)
+// copies each QSA layer's raw cells [p - p%ratio, p) into the journal; commit
+// restores them and re-appends the journal keys of the first n_keep rows at
+// p..p+n_keep-1. p and n_keep are device words (graph-capturable, no sync).
+// Cells past the accepted prefix stay stale: they are rewritten before any read.
+struct HipQsaIndexTailPlan {
+    HipQsaIndexJournal journal;
+    std::vector<std::uintptr_t> raw_index;
+    std::vector<std::uint32_t> layers;
+    std::uint64_t context_tokens = 0;
+    std::uint32_t index_dim = 0, ratio = 0;
+};
+[[nodiscard]] HipQsaIndexTailPlan prepare_qsa_index_tail(const ModelContract&, const SerialSessionStateLayout&,
+    const SessionStateMemoryBinding&, HipQsaIndexJournal);
+void enqueue_qsa_index_tail_snapshot(const HipQsaIndexTailPlan&, const std::uint64_t* device_position, void* stream);
+void enqueue_qsa_index_tail_commit(const HipQsaIndexTailPlan&, const std::uint64_t* device_position,
+    const std::uint32_t* device_n_keep, void* stream);
 
 class HipIndexedAttentionLauncherBundle {
 public:
