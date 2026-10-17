@@ -55,7 +55,9 @@ struct Owner {
         cleanup(hipStreamDestroy(stream));
     }
     Span allocate(std::uint64_t bytes) {
-        require(bytes && bytes < (1ULL << 30U), "fixture allocation exceeds its one-GiB bound");
+        // The long-context QSA bench owns whole-session state (~7 GiB at 256K).
+        const auto bound = std::getenv("STRIX_QSA_LONG_BENCH") ? (1ULL << 34U) : (1ULL << 30U);
+        require(bytes && bytes < bound, "fixture allocation exceeds its bound");
         void* pointer = nullptr;
         check(hipMalloc(&pointer, static_cast<std::size_t>(bytes + 512U)), "allocate guarded known-window fixture");
         try { allocations.push_back(pointer); }
