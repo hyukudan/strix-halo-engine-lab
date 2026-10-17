@@ -77,6 +77,10 @@ enum class KnownWindowR2Variant : std::uint32_t {
     moe_route_rows_v1 = 27,
     moe_combine_rows_v1 = 28,
     inject_rows_v1 = 29,
+    // A8 numerical profile union: Q4_K/Q5_K A8G32 gate/up, Q5_1/Q8_0 A8G32 down.
+    routed_a8_union_rows2_v1 = 30,
+    routed_a8_union_rows4_v1 = 31,
+    routed_a8_union_rows8_v1 = 32,
 };
 inline constexpr std::uint32_t known_window_r2_variant_slots = 30;
 

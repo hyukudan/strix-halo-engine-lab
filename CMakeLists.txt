@@ -1876,6 +1876,11 @@ if(STRIX_ENABLE_HIP_RUNTIME)
                     add_test(NAME strix-hip-moe-known-rows-${rows}-batched-${batched}
                         COMMAND strix-hip-moe-known-rows-tests ${rows} ${batched})
                 endforeach()
+                # A8 profile at canonical geometry: Q5_1, Q8_0 (layer 4), Q5_K+Q8_0 (layer 2).
+                foreach(profile a8q51 a8q80 a8q5k)
+                    add_test(NAME strix-hip-moe-known-rows-${rows}-${profile}
+                        COMMAND strix-hip-moe-known-rows-tests ${rows} 1 ${profile})
+                endforeach()
             endforeach()
         endif()
 

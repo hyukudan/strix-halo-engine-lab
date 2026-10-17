@@ -65,15 +65,18 @@ void guards(View v) {
 }
 // Independent packed patterns vary expert/output/block and gate/up. Small
 // finite scales keep the complete prefix within the incumbent finite domain.
+// Q5_1 (7) and Q8_0 (8) carry 32 features per block, Q4_K (12) and Q5_K (13) 256.
 std::vector<std::byte> packed(unsigned width,unsigned outputs,unsigned experts,unsigned type,unsigned salt) {
-    const auto block_elements=type==7U?32U:256U, block_bytes=type==7U?24U:144U;
+    const auto block_elements=type==7U||type==8U?32U:256U;
+    const auto block_bytes=type==7U?24U:type==8U?34U:type==12U?144U:176U;
     std::vector<std::byte> out(static_cast<std::size_t>(width/block_elements)*outputs*experts*block_bytes);
     const auto set16=[](std::byte* p,unsigned x) {p[0]=std::byte(x&255U);p[1]=std::byte(x>>8U);};
     for(std::size_t b=0;b<out.size()/block_bytes;++b) {
         auto* p=out.data()+b*block_bytes;
         set16(p,0x1400U+static_cast<unsigned>((b+salt)%3U)*0x400U);
+        if(type==8U){for(unsigned i=2U;i<block_bytes;++i) p[i]=std::byte((b*37U+i*19U+salt)%256U);continue;}
         set16(p+2,type==7U?0x8800U:0x1000U);
-        if(type==12U) for(unsigned i=0;i<12U;++i) p[4U+i]=std::byte((b*17U+i*23U+salt)%256U);
+        if(type!=7U) for(unsigned i=0;i<12U;++i) p[4U+i]=std::byte((b*17U+i*23U+salt)%256U);
         else for(unsigned i=0;i<4U;++i) p[4U+i]=std::byte((b*13U+i*29U+salt)%256U);
         const auto start=type==7U?8U:16U;
         for(unsigned i=start;i<block_bytes;++i) p[i]=std::byte((b*37U+i*19U+salt)%256U);
@@ -83,6 +86,9 @@ std::vector<std::byte> packed(unsigned width,unsigned outputs,unsigned experts,u
 // I640 exercises all three incumbent 256-feature chunks and the final
 // partial chunk. E96 also permits an eight-row, all-distinct route union.
 // The benchmark instantiates the actual H2560/E512 model geometry.
+// Serial arithmetic profile: float Q5_1 slot-parallel down, or the A8 profile
+// (Q5_1/Q8_0 A8G32 down, Q4_K or Q5_K A8G32 gate/up; canonical geometry only).
+struct Profile { bool a8=false; unsigned gate=12U, down=7U, layer=0U; };
 template<unsigned H,unsigned E> struct Fixture {
     static constexpr unsigned I=640,K=10;
     std::shared_ptr<Owner> owner=std::make_shared<Owner>();
@@ -108,11 +114,12 @@ template<unsigned H,unsigned E> struct Fixture {
     std::vector<std::byte> seed;
     std::vector<std::uint32_t> selected;
 
-    explicit Fixture(unsigned count,bool batched) {
+    Profile profile;
+    explicit Fixture(unsigned count,bool batched,Profile selected_profile={}):profile(selected_profile) {
         require(owner->guard.architecture()=="gfx1151","known routed fixture requires actual gfx1151");
         model.hidden_size=H;model.moe_intermediate_size=I;model.num_experts=E;model.num_experts_per_token=K;
         execution=build_serial_decode_execution_plan(model);io=build_serial_execution_io_plan(execution);
-        const auto found=std::find_if(execution.steps.begin(),execution.steps.end(),[](const auto& s){return s.op==SerialOp::moe_experts&&s.layer==0U;});
+        const auto found=std::find_if(execution.steps.begin(),execution.steps.end(),[&](const auto& s){return s.op==SerialOp::moe_experts&&s.layer==profile.layer;});
         require(found!=execution.steps.end(),"known routed step missing");step=*found;
         const auto& uses=io.steps[step.id];
         ExecutionArenaPlan serial;serial.alignment=256U;
@@ -120,7 +127,7 @@ template<unsigned H,unsigned E> struct Fixture {
             const auto offset=(serial.total_bytes+255U)/256U*256U;
             serial.allocations.push_back({use,step.id,step.id,offset,bytes});serial.total_bytes=offset+bytes;
         };
-        const auto layout=moe_q4k_a8::build_runtime_workspace(H,I,E,K,true);
+        const auto layout=moe_q4k_a8::build_runtime_workspace(H,I,E,K,true,profile.a8);
         alloc(uses.reads[0],H*2U);alloc(uses.reads[1],K*4U);alloc(uses.reads[2],K*4U);
         alloc(uses.writes[0],H*2U);alloc(uses.temporaries[0],layout.total_bytes);
         serial.naive_nonaliased_bytes=serial.total_bytes;window=build_known_window_arena(serial,256U,count);
@@ -128,19 +135,25 @@ template<unsigned H,unsigned E> struct Fixture {
         csr=owner->allocate(q51_known_rows::required_scratch_bytes(count,E,K));
         workspace={{memory.execution_identity,csr.address,csr.bytes,43U},owner};record=owner->allocate(8U);
         manifest.architecture="qwen4_exp";
-        add("blk.0.ffn_gate_exps.weight",12U,{H,I,E},packed(H,I,E,12U,3U));
-        add("blk.0.ffn_up_exps.weight",12U,{H,I,E},packed(H,I,E,12U,7U));
-        add("blk.0.ffn_down_exps.weight",7U,{I,H,E},packed(I,H,E,7U,13U));
+        const auto prefix="blk."+std::to_string(profile.layer)+".";
+        add(prefix+"ffn_gate_exps.weight",profile.gate,{H,I,E},packed(H,I,E,profile.gate,3U));
+        add(prefix+"ffn_up_exps.weight",profile.gate,{H,I,E},packed(H,I,E,profile.gate,7U));
+        add(prefix+"ffn_down_exps.weight",profile.down,{I,H,E},packed(I,H,E,profile.down,13U));
         manifest.layout_identity=model_manifest_layout_identity(manifest);weights.manifest_layout_identity=manifest.layout_identity;
-        weights.model_content_identity.bytes[0]=1U;access.manifest_layout_identity=manifest.layout_identity;access.plan_identity=71U;
+        weights.model_content_identity.bytes[0]=1U;
+        if(profile.a8) weights.model_content_identity.bytes={0x37,0x26,0xd6,0xf0,0xd9,0xba,0x30,0xb9,0xd6,0x55,0xba,0x30,0x35,0x95,0x11,0x89,
+            0x41,0xba,0xec,0xa5,0xe6,0x94,0x5f,0xc8,0x78,0x5f,0x93,0x8e,0x0f,0x54,0x55,0xe4};
+        access.manifest_layout_identity=manifest.layout_identity;access.plan_identity=71U;
         access.accesses.push_back({step.id,step.op,0U,{0U,1U,2U}});
         config.hidden_size=H;config.intermediate_size=I;config.expert_count=E;config.top_k=K;
         config.q4k_a8g32_gate_up=true;config.grouped_exact_q51_down=true;config.q51_slot_parallel_down=true;
         config.deferred_moe_status=true;config.batched_slot_activation=batched;
+        config.a8_down_q51=config.a8_down_q80=config.q5k_a8g32_gate_up=profile.a8;
         config.q4k_a8_quiescence=std::make_shared<HipSetupQuiescenceGuard>();
         config.q4k_a8_stats=std::make_shared<moe_q4k_a8::RuntimeDispatchStats>();
         ExecutionBindingRequest request;request.q4k_a8g32_gate_up=true;request.grouped_exact_q51_down=true;
         request.q51_slot_parallel_down=true;request.deferred_moe_status=true;request.batched_moe_activation=batched;
+        request.a8_down_q51=request.a8_down_q80=request.q5k_a8g32_gate_up=profile.a8;
         kernels::KernelRegistry registry;register_hip_moe_experts_kernel_variant(model,request,config,registry);
         id=registry.variants().front().id;incumbent=make_hip_moe_experts_launcher(id,&config);
         rows.resize(count);resources.resize(count);hidden.resize(count);routes.resize(count);mix.resize(count);output.resize(count);temp.resize(count);
@@ -154,7 +167,7 @@ template<unsigned H,unsigned E> struct Fixture {
     }
     void add(std::string name,unsigned type,std::vector<std::uint64_t> dims,std::vector<std::byte> data) {
         ManifestTensor t;t.name=std::move(name);t.ggml_type=type;t.dimensions=std::move(dims);t.byte_size=data.size();
-        t.absolute_offset=manifest.total_tensor_bytes;t.layer=0U;t.role=TensorRole::moe_expert;
+        t.absolute_offset=manifest.total_tensor_bytes;t.layer=profile.layer;t.role=TensorRole::moe_expert;
         manifest.total_tensor_bytes+=t.byte_size;manifest.tensors.push_back(std::move(t));
         const auto v=owner->allocate(data.size());upload(v,data.data(),data.size());
         weights.tensors.push_back({static_cast<std::uint32_t>(weight_views.size()),RuntimeTensorStorage::resident,v.address,v.bytes,37U,0U});
@@ -323,8 +336,8 @@ __global__ void flush_kernel(const uint4* p,std::size_t count,unsigned* sink) {
 // cold weights. A 256 MiB READ evicts L2/MALL without leaving dirty lines (a
 // write flush makes the timed reads pay its writebacks); a spin kernel hides
 // host enqueue cost.
-template<unsigned H,unsigned E> void bench(unsigned count,unsigned mode) {
-    Fixture<H,E> f(count,true);f.prepare(mode);
+template<unsigned H,unsigned E> void bench(unsigned count,unsigned mode,Profile profile={}) {
+    Fixture<H,E> f(count,true,profile);f.prepare(mode);
     const auto expected=f.run(false);require(f.run(true)==expected,"real-geometry candidate differs from per-row incumbent");f.check_csr();
     void* flush=nullptr;check(hipMalloc(&flush,(256U<<20U)+256U),"allocate flush");
     check(hipMemset(flush,1,(256U<<20U)+256U),"fill flush");
@@ -347,17 +360,42 @@ template<unsigned H,unsigned E> void bench(unsigned count,unsigned mode) {
     for(auto& v:ms)std::sort(v.begin(),v.end());
     const auto rows=ms[0][ms[0].size()/2U],candidate=ms[1][ms[1].size()/2U];
     std::set<unsigned> distinct(f.selected.begin(),f.selected.end());
-    std::cout<<"bench T="<<count<<" mode="<<mode<<" distinct="<<distinct.size()<<" union_us="<<candidate
+    std::cout<<"bench "<<(profile.a8?"a8":"f32")<<" gate="<<profile.gate<<" down="<<profile.down<<" T="<<count<<" mode="<<mode<<" distinct="<<distinct.size()<<" union_us="<<candidate
              <<" rows_x_1row_us="<<rows<<" ratio="<<candidate/rows<<'\n';
     (void)hipFree(flush);(void)hipEventDestroy(a);(void)hipEventDestroy(b);
 }
 } // namespace
 
+Profile parse_profile(std::string_view name) {
+    if(name=="a8q51")return {true,12U,7U};
+    // Canonical A8 census: Q8_0 down on layers 2/4/30/46/47, Q5_K gate/up on layer 2.
+    if(name=="a8q80")return {true,12U,8U,4U};
+    if(name=="a8q5k")return {true,13U,8U,2U};
+    require(name=="f32","profile must be f32/a8q51/a8q80/a8q5k");return {};
+}
+// A8 profile: canonical-geometry fixture, whole-arena equality with the serial
+// A8 launcher per routing pattern, CSR, and the device failure paths.
+void a8_fixture(unsigned count,Profile profile) {
+    Fixture<2560U,512U> f(count,true,profile);
+    for(unsigned mode=0;mode<6U;++mode) {
+        f.prepare(mode);const auto expected=f.run(false);
+        for(unsigned repeat=0;repeat<2U;++repeat){require(f.run(true)==expected,"A8 union whole arena differs from serial A8 rows");f.check_csr();}
+    }
+    for(unsigned mode=0;mode<3U;++mode)f.reject_device(mode);
+    f.readonly_and_guards();
+}
 int main(int argc,char** argv) try {
     if(argc>1&&std::string(argv[1])=="bench") {
-        if(argc>3) {bench<2560U,512U>(static_cast<unsigned>(std::stoul(argv[2])),static_cast<unsigned>(std::stoul(argv[3])));return 0;}
-        for(unsigned count:{2U,4U,8U})for(unsigned mode:{5U,1U,2U})bench<2560U,512U>(count,mode);
+        const auto profile=parse_profile(argc>4?argv[4]:"f32");
+        if(argc>3) {bench<2560U,512U>(static_cast<unsigned>(std::stoul(argv[2])),static_cast<unsigned>(std::stoul(argv[3])),profile);return 0;}
+        for(unsigned count:{2U,4U,8U})for(unsigned mode:{5U,1U,2U})bench<2560U,512U>(count,mode,profile);
         return 0;
+    }
+    if(argc>3&&std::string(argv[3])!="f32") {
+        const unsigned rows=static_cast<unsigned>(std::stoul(argv[1]));
+        require(rows==2U||rows==4U||rows==8U,"known routed fixture rows must be 2/4/8");
+        a8_fixture(rows,parse_profile(argv[3]));
+        std::cout<<"known routed rows "<<rows<<' '<<argv[3]<<" A8 fixture completed\n";return 0;
     }
     const unsigned count=argc>1?static_cast<unsigned>(std::stoul(argv[1])):2U;
     require(count==2U||count==4U||count==8U,"known routed fixture rows must be 2/4/8");

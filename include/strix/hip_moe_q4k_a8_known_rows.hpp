@@ -40,15 +40,26 @@ struct PrologueRows {
 // an invalid route it writes the fail-closed summary instead. Quantizer
 // failures are only in row status: consumers must check status as well.
 void enqueue_prologue(const Request&, const PrologueRows&, unsigned rows, unsigned clear_words, hipStream_t);
-// Window-owned rows: route weights and the per-row FP32 region zeroed by the prologue.
-struct WindowRows { std::array<DeviceBytes, 8> route_weights{}, clear{}; };
+// Window-owned rows: route weights and the per-row FP32 region zeroed by the
+// prologue. down_type 7/8 selects the A8 profile (Q5_1/Q8_0 A8G32 down) and
+// then needs each row's serial down image (codes/deltas/sums) and raw slot dots.
+struct WindowRows {
+    std::array<DeviceBytes, 8> route_weights{}, clear{};
+    std::uint32_t down_type = 0;
+    DeviceBytes down_weights{};
+    std::array<DeviceBytes, 8> down_codes{}, down_deltas{}, down_sums{}, rawdots{};
+};
 // Complete window producer: one prologue launch (rows plus the device CSR
 // build into the workspace: complete stable (row,slot) grouping, so no
 // separate admission), then shared gate/up with the finite scans and SiLU
 // fused per element. Leaves each row's slot workspace exactly as quantize/
 // project/scan/SiLU/scan would on success; any failure sets the same local
 // status bits. After an early (route/quantizer) failure the caller restores
-// the fail-closed summary (touched, batches, histograms zero).
+// the fail-closed summary (touched, batches, histograms zero). A8 profile
+// (down_type 7/8, Q4_K or Q5_K gate/up): projection plus the serial down
+// activation quantizer, then the shared integer down writes each row's raw
+// slot dots exactly as down_activation_quantize/down_rawdots would; the
+// caller merges and commits.
 void enqueue_window(const Request&, std::span<const Bindings>,
     const q51_known_rows::Workspace&, const WindowRows&, hipStream_t);
 } // namespace strix::moe_q4k_a8::known_rows

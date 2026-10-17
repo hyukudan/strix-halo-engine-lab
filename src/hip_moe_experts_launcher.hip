@@ -2358,6 +2358,7 @@ __global__ void known_moe_rows_commit_kernel(KnownMoeRowsDevice view, KnownMoeCs
 struct KnownMoeRowsPrepared {
     std::array<PreparedMoeExperts, 8> rows{};
     std::array<moe_q4k_a8::Bindings, 8> quantized_bindings{};
+    std::array<moe_q4k_a8::DownBindings, 8> a8_down{};
     q51_known_rows::Workspace workspace;
     KnownMoeRowsDevice device;
     KnownMoeCsrDevice csr{};
@@ -2380,8 +2381,6 @@ hipStream_t known_moe_rows_stream() {
 }
 KnownMoeRowsPrepared prepare_known_moe_rows(std::span<const ExecutionDispatchContext> rows,
     const HipMoeExpertsLauncherConfig& config, const q51_known_rows::Workspace& extra) {
-    if (config.a8_down_q51 || config.a8_down_q80 || config.q5k_a8g32_gate_up)
-        throw std::invalid_argument("A8 down rejects known-window CSR rows");
     if (rows.size() != 2U && rows.size() != 4U && rows.size() != 8U)
         throw std::invalid_argument("known-window routed rows require R2/R4/R8");
     const auto layout = q51_known_rows::scratch_layout(static_cast<std::uint32_t>(rows.size()),
@@ -2392,6 +2391,9 @@ KnownMoeRowsPrepared prepare_known_moe_rows(std::span<const ExecutionDispatchCon
         throw std::invalid_argument("known-window routed rows require BF16 A8 slot-parallel Q5_1 D1 configuration");
     if (config.intermediate_size % 32U || config.intermediate_size > 768U || config.hidden_size % 64U || config.top_k > 10U)
         throw std::invalid_argument("known-window routed rows union down geometry is unsupported");
+    const bool a8 = config.a8_down_q51 || config.a8_down_q80;
+    if (a8 && !config.q4k_a8_quiescence)
+        throw std::invalid_argument("known-window A8 routed rows require retained setup completion guard");
     (void)known_moe_rows_stream();
     const auto& first = rows.front();
     if (!first.execution_identity || !first.layer || !first.kernel_id || !first.resources ||
@@ -2411,6 +2413,12 @@ KnownMoeRowsPrepared prepare_known_moe_rows(std::span<const ExecutionDispatchCon
         *first.kernel_id != kernel_id(ExecutionBindingRequest{}, config))
         throw std::invalid_argument("known-window routed rows selected serial kernel/IO differs");
     validate_model_runtime_binding(*first.resources->model_manifest, *first.resources->model_weights);
+    if (a8) {
+        // Same admission as the serial A8 launcher on every layer.
+        if (*first.layer >= 48U || first.resources->distributed_stage)
+            throw std::invalid_argument("known-window A8 routed rows require canonical unpartitioned model resources");
+        moe_q4k_a8::validate_a8_down_content(first.resources->model_weights->model_content_identity);
+    }
     KnownMoeRowsPrepared out;
     std::array<KnownMoeRange, 16> writes{};
     std::array<KnownMoeRange, 24> reads{};
@@ -2438,10 +2446,15 @@ KnownMoeRowsPrepared prepare_known_moe_rows(std::span<const ExecutionDispatchCon
         validate_execution_memory_binding(row.execution_identity, *row.arena, memory);
         out.rows[r] = prepare_moe_experts(row, const_cast<HipMoeExpertsLauncherConfig*>(&config));
         const auto& p = out.rows[r];
-        if (!p.quantized || !p.quantized->slot_parallel_q51 || p.tensors.fused_gate_up ||
-            p.tensors.gate.manifest->ggml_type != 12U || p.tensors.up.manifest->ggml_type != 12U ||
-            p.tensors.down.manifest->ggml_type != 7U)
-            throw std::invalid_argument("known-window routed rows require separate Q4K gate/up and Q5_1 down");
+        const auto gate_type = p.tensors.gate.manifest->ggml_type, down_type = p.tensors.down.manifest->ggml_type;
+        // Float profile: Q4K gate/up + slot-parallel Q5_1 down. A8 profile:
+        // Q4K (or Q5K) gate/up + the serial Q5_1/Q8_0 A8G32 down request.
+        if (!p.quantized || p.tensors.fused_gate_up || p.tensors.up.manifest->ggml_type != gate_type ||
+            (a8 ? !p.quantized->a8_down_request || p.quantized->a8_down_request->weight_type != down_type ||
+                  (gate_type != 12U && !(gate_type == 13U && config.q5k_a8g32_gate_up)) :
+                  !p.quantized->slot_parallel_q51 || gate_type != 12U || down_type != 7U) ||
+            gate_type != out.rows[0].tensors.gate.manifest->ggml_type || down_type != out.rows[0].tensors.down.manifest->ggml_type)
+            throw std::invalid_argument("known-window routed rows require the serial Q4K/Q5K A8 gate/up and down formats");
         const std::array views{p.hidden, p.route_indices, p.route_weights, p.output, p.temporary};
         const auto& p0 = out.rows[0];
         const std::array base{p0.hidden, p0.route_indices, p0.route_weights, p0.output, p0.temporary};
@@ -2461,7 +2474,7 @@ KnownMoeRowsPrepared prepare_known_moe_rows(std::span<const ExecutionDispatchCon
             const auto& pair = tensor_pairs[t]; const auto& dims = pair.manifest->dimensions;
             const auto width = t == 2U ? config.intermediate_size : config.hidden_size;
             const auto outputs = t == 2U ? config.hidden_size : config.intermediate_size;
-            const auto required = required_weight_bytes(t == 2U ? WeightKind::q5_1 : WeightKind::q4_k,
+            const auto required = required_weight_bytes(weight_kind(pair.manifest->ggml_type),
                 width, outputs, config.expert_count);
             if (pair.manifest->layer != row.layer || dims.size() != 3U || dims[0] != width || dims[1] != outputs ||
                 dims[2] != config.expert_count || pair.manifest->byte_size != required || !pair.runtime->allocation_generation ||
@@ -2481,6 +2494,7 @@ KnownMoeRowsPrepared prepare_known_moe_rows(std::span<const ExecutionDispatchCon
         out.device.rawdots[r] = reinterpret_cast<float*>(p.temporary.address + q.layout.rawdots_offset);
         out.device.accumulation[r] = reinterpret_cast<float*>(p.temporary.address + q.layout.accumulation_offset);
         out.device.output[r] = reinterpret_cast<std::uint16_t*>(p.output.address);
+        if (a8) out.a8_down[r] = q.a8_down_bindings;
     }
     const auto disjoint = [](KnownMoeRange a, KnownMoeRange b) {
         known_moe_range(a); known_moe_range(b);
@@ -2524,15 +2538,23 @@ void known_moe_rows_enqueue(std::span<const ExecutionDispatchContext> rows,
         const auto& q = *p.rows[r].quantized;
         window.route_weights[r] = {p.rows[r].route_weights.address, p.rows[r].route_weights.bytes};
         window.clear[r] = {reinterpret_cast<std::uintptr_t>(p.device.accumulation[r]), q.layout.accumulation_bytes};
+        if (q.a8_down_request) {
+            const auto& d = p.a8_down[r];
+            window.down_codes[r] = d.codes; window.down_deltas[r] = d.deltas; window.down_sums[r] = d.sums; window.rawdots[r] = d.rawdots;
+        }
     }
-    moe_q4k_a8::known_rows::enqueue_window(p.rows[0].quantized->request,
+    const auto& first = *p.rows[0].quantized;
+    if (first.a8_down_request) { window.down_type = first.a8_down_request->weight_type; window.down_weights = p.a8_down[0].weights; }
+    moe_q4k_a8::known_rows::enqueue_window(first.request,
         std::span<const moe_q4k_a8::Bindings>(p.quantized_bindings.data(), count), p.workspace, window, stream);
     const auto weights = reinterpret_cast<const void*>(p.rows[0].tensors.down.runtime->address);
+    if (!first.a8_down_request) {
     constexpr unsigned down_group = 2U, down_outputs = 4U;
     hipLaunchKernelGGL(HIP_KERNEL_NAME(known_moe_q51_union_down_kernel<down_group, down_outputs>),
         dim3(config.hidden_size / (8U * down_outputs) * (count / down_group), count * config.top_k), dim3(256), 0, stream,
         p.device, p.csr, count, weights, config.intermediate_size, config.hidden_size);
     check_hip(hipGetLastError(), "known-window routed rows shared-decode Q5_1 down");
+    }
     hipLaunchKernelGGL(known_moe_rows_merge_kernel, dim3((config.hidden_size + 255U) / 256U, count), dim3(256), 0, stream,
         p.device, p.csr, config.hidden_size, config.expert_count, config.top_k);
     check_hip(hipGetLastError(), "known-window routed rows ordered merge");
@@ -2546,8 +2568,14 @@ void known_moe_rows_enqueue(std::span<const ExecutionDispatchContext> rows,
             stats.batched_activation_slots.fetch_add(count * config.top_k, std::memory_order_relaxed);
         }
         stats.quantized_submissions.fetch_add(count, std::memory_order_relaxed);
-        stats.grouped_q51_submissions.fetch_add(count, std::memory_order_relaxed);
-        stats.slot_parallel_q51_submissions.fetch_add(count, std::memory_order_relaxed);
+        if (first.a8_down_request) {
+            (first.a8_down_request->weight_type == 7U ? stats.a8_down_q51_submissions : stats.a8_down_q80_submissions)
+                .fetch_add(count, std::memory_order_relaxed);
+            if (first.request.gate_type == 13U) stats.q5k_a8_gate_up_submissions.fetch_add(count, std::memory_order_relaxed);
+        } else {
+            stats.grouped_q51_submissions.fetch_add(count, std::memory_order_relaxed);
+            stats.slot_parallel_q51_submissions.fetch_add(count, std::memory_order_relaxed);
+        }
     }
 }
 #endif
