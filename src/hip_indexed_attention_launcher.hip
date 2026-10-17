@@ -2911,6 +2911,12 @@ void preflight_indexed_attention(const ExecutionDispatchContext& context, void* 
     static_cast<void>(checked_u32(prepared.workspace_layout.maximum_selected_tokens, "maximum_selected_tokens"));
 }
 
+// Dense A8 R1 projections (defined with the rows sites below).
+void launch_qsa_dense_a8_inputs(const std::array<const TensorPair*, 5>& matrices, const std::array<std::uint32_t, 5>& outputs,
+    const std::array<float*, 5>& targets, const ExecutionBufferAddress& input, std::uint32_t hidden, hipStream_t stream);
+void launch_qsa_dense_a8_output(const TensorPair& weights, const float* input, const ExecutionBufferAddress& output,
+    std::uint32_t width, std::uint32_t hidden, hipStream_t stream);
+
 void launch_indexed_attention(const ExecutionDispatchContext& context, void* user_data) {
     const auto prepared = prepare_indexed_attention_launch(context,
         static_cast<const HipIndexedAttentionLauncherConfig*>(user_data));
@@ -2932,15 +2938,27 @@ void launch_indexed_attention(const ExecutionDispatchContext& context, void* use
         check_hip(hipGetLastError(), "HIP indexed-attention device control validation");
     }
 
+    // Dense A8: every Q8_0 input matrix (indexer and main) in one launch up front; the
+    // other formats keep their R1 kernels at their usual places.
+    const bool dense = config.dense_a8_projections;
+    if (dense) {
+        if (device_graph) throw std::invalid_argument("HIP indexed-attention dense A8 projections run eager");
+        launch_qsa_dense_a8_inputs({&tensors.index_q, &tensors.index_k, &tensors.q, &tensors.k, &tensors.v},
+            {index_q_width, index_dim, q_gate_width, kv_width, kv_width},
+            {workspace.index_query, workspace.current_index_key, workspace.q_gate, workspace.current_k, workspace.current_v},
+            input, hidden, hip_execution_stream());
+    }
+    const auto keep = [&](const TensorPair& tensor) { return !dense || tensor.manifest->ggml_type != 8U; };
+
     // Indexer projections. Outputs are rounded to BF16 values represented in
     // FP32 workspace so subsequent FP32 normalization starts from model dtype.
-    launch_linear_to_float(
+    if (keep(tensors.index_q)) launch_linear_to_float(
         tensors.index_q,
         input,
         hidden,
         index_q_width,
         workspace.index_query, config.prefetch_q8_input, config.prefetch_stats.get());
-    launch_linear_to_float(
+    if (keep(tensors.index_k)) launch_linear_to_float(
         tensors.index_k,
         input,
         hidden,
@@ -3049,19 +3067,19 @@ void launch_indexed_attention(const ExecutionDispatchContext& context, void* use
     }
 
     // Main Q/K/V projections.
-    launch_linear_to_float(
+    if (keep(tensors.q)) launch_linear_to_float(
         tensors.q,
         input,
         hidden,
         q_gate_width,
         workspace.q_gate, config.prefetch_q8_input, config.prefetch_stats.get());
-    launch_linear_to_float(
+    if (keep(tensors.k)) launch_linear_to_float(
         tensors.k,
         input,
         hidden,
         kv_width,
         workspace.current_k, config.prefetch_q8_input, config.prefetch_stats.get());
-    launch_linear_to_float(
+    if (keep(tensors.v)) launch_linear_to_float(
         tensors.v,
         input,
         hidden,
@@ -3199,7 +3217,9 @@ void launch_indexed_attention(const ExecutionDispatchContext& context, void* use
 
     }
 
-    launch_linear_float_to_bf16(
+    if (!keep(tensors.out))
+        launch_qsa_dense_a8_output(tensors.out, workspace.attention_output, output, attention_width, hidden, hip_execution_stream());
+    else launch_linear_float_to_bf16(
         tensors.out,
         workspace.attention_output,
         attention_width,
@@ -3273,6 +3293,33 @@ template <unsigned Rows> struct QsaOutputRowsSite {
     __device__ static float add(float lower, float upper) { return qsa_rows_tree_add(lower, upper); }
     __device__ void store(std::uint32_t out, unsigned r, float value) const { output[r][out] = float_to_bf16(value); }
 };
+
+void launch_qsa_dense_a8_inputs(const std::array<const TensorPair*, 5>& matrices, const std::array<std::uint32_t, 5>& outputs,
+    const std::array<float*, 5>& targets, const ExecutionBufferAddress& input, std::uint32_t hidden, hipStream_t stream) {
+    QsaInputRowsSite<1U> site{};
+    for (unsigned i = 0; i < 5U; ++i) {
+        if (matrices[i]->manifest->ggml_type != 8U) continue;
+        const auto m = site.segments.count++;
+        site.segments.weights[m] = reinterpret_cast<const unsigned char*>(matrices[i]->runtime->address);
+        site.segments.first[m + 1U] = site.segments.first[m] + outputs[i];
+        site.output[m][0] = targets[i];
+    }
+    if (!site.segments.count) return;
+    site.input[0] = reinterpret_cast<const void*>(input.address);
+    site.width = hidden; site.outputs = site.segments.first[site.segments.count];
+    q8_rows::launch(site, true, stream);
+    check_hip(hipGetLastError(), "HIP indexed-attention dense A8 input projection launch");
+}
+void launch_qsa_dense_a8_output(const TensorPair& weights, const float* input, const ExecutionBufferAddress& output,
+    std::uint32_t width, std::uint32_t hidden, hipStream_t stream) {
+    QsaOutputRowsSite<1U> site{};
+    site.segments = q8_rows::segments({{reinterpret_cast<const void*>(weights.runtime->address), hidden}});
+    site.input[0] = input;
+    site.output[0] = reinterpret_cast<std::uint16_t*>(output.address);
+    site.width = width; site.outputs = hidden;
+    q8_rows::launch(site, true, stream);
+    check_hip(hipGetLastError(), "HIP indexed-attention dense A8 output projection launch");
+}
 
 template <WeightKind Kind, unsigned Rows>
 __global__ void linear_to_float_rows_kernel(QsaRowsInputViews<Rows> views, std::uint32_t input_width) {
@@ -3778,9 +3825,8 @@ QsaKnownRows<Rows> prepare_qsa_known_rows(std::span<const ExecutionDispatchConte
             throw std::invalid_argument("wave8 QSA output requires aligned Q8_0 weights");
         q8_projection_organization::validate_geometry(a.attention_width, a.hidden);
     }
-    if (config.known_window_a8_projections &&
-        q8_rows::a8_bytes<Rows>(std::max(a.hidden, a.attention_width)) > q8_rows::kLdsBytes)
-        throw std::invalid_argument("QSA known-window A8 activations exceed one block's LDS");
+    if (config.dense_a8_projections && (!q8_rows::dense_a8_width(a.hidden) || !q8_rows::dense_a8_width(a.attention_width)))
+        throw std::invalid_argument("QSA known-window dense A8 width is not admitted");
     if (journal.address || journal.bytes) {
         const auto& model = config.model;
         if (!journal.address || journal.address % 2U || journal.bytes != qsa_index_journal_bytes(model) ||
@@ -3797,7 +3843,7 @@ QsaKnownRows<Rows> prepare_qsa_known_rows(std::span<const ExecutionDispatchConte
 template <WeightKind Kind, unsigned Rows>
 void launch_qsa_rows_input(bool prefetch, bool a8, const QsaRowsInputViews<Rows>& views, std::uint32_t hidden, hipStream_t stream,
     bool any_order = false) {
-    if constexpr (Rows > 8U) if (Kind != WeightKind::q8_0 || !prefetch) {
+    if constexpr (Rows > 8U) if (Kind != WeightKind::q8_0 || !(prefetch || a8)) {
         // Prefill blocks: only the prefetch8 Q8 site has a wide form; other kinds run Slice-row
         // launches of linear_to_float_rows_kernel (per row the same feature order and tree as
         // the 8-row window kernel). STRIX_QSA_INPUT_SLICE=8|16|32 (default 16).
@@ -3830,7 +3876,7 @@ void launch_qsa_rows_input(bool prefetch, bool a8, const QsaRowsInputViews<Rows>
         else run.template operator()<16U>();
         return;
     }
-    if constexpr (Kind == WeightKind::q8_0) if (prefetch) {
+    if constexpr (Kind == WeightKind::q8_0) if (prefetch || a8) {
         QsaInputRowsSite<Rows> site{};
         for (unsigned m = 0; m < views.count; ++m) {
             site.segments.weights[m] = static_cast<const unsigned char*>(views.weights[m]);
@@ -3852,7 +3898,7 @@ void launch_qsa_rows_input(bool prefetch, bool a8, const QsaRowsInputViews<Rows>
 template <WeightKind Kind, unsigned Rows>
 void launch_qsa_rows_output(bool wave8, bool a8, const QsaRowsOutputViews<Rows>& views, const void* weights,
     std::uint32_t width, std::uint32_t hidden, hipStream_t stream) {
-    if constexpr (Rows > 8U) if (Kind != WeightKind::q8_0 || !wave8) {
+    if constexpr (Rows > 8U) if (Kind != WeightKind::q8_0 || !(wave8 || a8)) {
         for (unsigned first = 0; first < Rows; first += 8U) {
             QsaRowsOutputViews<8U> slice{};
             for (unsigned r = 0; r < 8U; ++r) { slice.input[r] = views.input[first + r]; slice.output[r] = views.output[first + r]; }
@@ -3860,7 +3906,7 @@ void launch_qsa_rows_output(bool wave8, bool a8, const QsaRowsOutputViews<Rows>&
         }
         return;
     }
-    if constexpr (Kind == WeightKind::q8_0) if (wave8) {
+    if constexpr (Kind == WeightKind::q8_0) if (wave8 || a8) {
         QsaOutputRowsSite<Rows> site{};
         site.segments = q8_rows::segments({{weights, hidden}});
         for (unsigned r = 0; r < Rows; ++r) { site.input[r] = views.input[r]; site.output[r] = views.output[r]; }
@@ -3919,7 +3965,8 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
         QsaRowsInputViews<Rows> input{};
         for (unsigned r = 0; r < Rows; ++r) input.input[r] = reinterpret_cast<const std::uint16_t*>(prepared.row[r].input.address);
         for (unsigned m = lead; m < 5U; ++m) {
-            if (done[m] || prepared.prefetch[m] != prepared.prefetch[lead] ||
+            const bool dense_q8 = config.dense_a8_projections && matrices[lead]->manifest->ggml_type == 8U;
+            if (done[m] || (!dense_q8 && prepared.prefetch[m] != prepared.prefetch[lead]) ||
                 matrices[m]->manifest->ggml_type != matrices[lead]->manifest->ggml_type) continue;
             done[m] = true;
             const auto g = input.count++;
@@ -3928,7 +3975,7 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
             for (unsigned r = 0; r < Rows; ++r) input.output[g][r] = prepared.row[r].workspace.*targets[m];
         }
         dispatch_weight_kind(matrices[lead]->manifest->ggml_type, [&](auto kind) {
-            launch_qsa_rows_input<decltype(kind)::value, Rows>(prepared.prefetch[lead], config.known_window_a8_projections,
+            launch_qsa_rows_input<decltype(kind)::value, Rows>(prepared.prefetch[lead], config.dense_a8_projections,
                 input, a.hidden, stream, any_order && launched_group);
         });
         launched_group = true;
@@ -4104,7 +4151,7 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
         out.output[r] = reinterpret_cast<std::uint16_t*>(prepared.row[r].output.address);
     }
     dispatch_weight_kind(tensors.out.manifest->ggml_type, [&](auto kind) {
-        launch_qsa_rows_output<decltype(kind)::value, Rows>(config.wave8_q8_output, config.known_window_a8_projections, out,
+        launch_qsa_rows_output<decltype(kind)::value, Rows>(config.wave8_q8_output, config.dense_a8_projections, out,
             reinterpret_cast<const void*>(tensors.out.runtime->address), a.attention_width, a.hidden, stream);
     });
     check_hip(hipGetLastError(), "QSA known-window output projection launch");
@@ -4173,6 +4220,7 @@ std::string kernel_id(
         std::string(qsa_gqa_organization_marker(config.qsa_gqa_heads_per_block)) +
         (config.qsa_hierarchical_selection ? std::string(qsa_hierarchical_selection_marker) : "") +
         (config.wave8_q8_output ? std::string(q8_projection_organization::qsa_output_wave8_marker) : "") +
+        (config.dense_a8_projections ? std::string(q8_projection_organization::dense_a8_marker) : "") +
         (config.prefetch_q8_input ? std::string(qsa_input_prefetch::kernel_suffix) : "");
 }
 
@@ -4221,6 +4269,7 @@ std::uint64_t implementation_identity(
     hash_u64(hash, config.model.max_position_embeddings);
     if(config.prefetch_q8_input){hash_u64(hash,0x5153415052465631ULL);for(auto layer:config.prefetch_eligible_layers)hash_u64(hash,layer);}
     if(config.wave8_q8_output) hash_u64(hash, 0x5153414f57385631ULL);
+    if(config.dense_a8_projections) hash_u64(hash, 0x5153414441385631ULL); // QSADA8V1
     if(config.qsa_hierarchical_selection) hash_u64(hash, 0x515341544f503531ULL);
     if(config.qsa_gqa_heads_per_block != 1) {
         hash_u64(hash, 0x5153414751417631ULL); hash_u64(hash, config.qsa_gqa_heads_per_block);
@@ -4237,7 +4286,6 @@ namespace {
 std::vector<QsaKnownRows<8U>> prepare_qsa_prefill_rows(std::span<const ExecutionDispatchContext> rows,
     const HipIndexedAttentionLauncherConfig& config, HipQsaIndexJournal journal) {
     if (rows.size() < 16U || rows.size() % 8U) throw std::invalid_argument("QSA prefill rows require 8-row tiles");
-    if (config.known_window_a8_projections) throw std::invalid_argument("QSA prefill rows are not A8");
     std::vector<QsaKnownRows<8U>> tiles;
     tiles.reserve(rows.size() / 8U);
     for (std::size_t t = 0; t < rows.size() / 8U; ++t) {
@@ -4553,8 +4601,8 @@ void launch_hip_qsa_rows_projection_probe(HipQsaRowsProjection projection, HipQs
             if (overlap(output[r], input[other]) || (other < r && overlap(output[r], output[other])))
                 throw std::invalid_argument("QSA rows projection output aliases a row");
     }
-    if (mode == HipQsaRowsProbeMode::rows_a8 && (rows > 8U || rows * width + rows * (width / 32U) * 4U > q8_rows::kLdsBytes))
-        throw std::invalid_argument("QSA rows A8 activations exceed one block's LDS");
+    if (mode == HipQsaRowsProbeMode::rows_a8 && !q8_rows::dense_a8_width(width))
+        throw std::invalid_argument("QSA rows dense A8 width is not admitted");
     const auto native = static_cast<hipStream_t>(stream);
     check_hip(hipPeekAtLastError(), "QSA rows projection diagnostic pre-enqueue stale error");
     const auto* packed = reinterpret_cast<const void*>(weights.address);
@@ -4693,6 +4741,10 @@ void register_hip_indexed_attention_kernel_variant(
     variant.compiler_identity =
         config.prefetch_q8_input ? "hip-gfx1151-indexed-attention-v3-prefetch8-virtual256-q8-qsa-input" : "hip-gfx1151-indexed-attention-v2";
     if (config.wave8_q8_output) variant.compiler_identity += ":wave8-q8-qsa-output-v1";
+    if (config.dense_a8_projections) {
+        variant.numerics.accumulator_precision += ";" + std::string(q8_projection_organization::dense_a8_numerical_identity);
+        variant.compiler_identity += ":dense-a8-q80-v1";
+    }
     if (config.qsa_hierarchical_selection) variant.compiler_identity += ":hierarchical-top512-v1";
     if (config.qsa_gqa_heads_per_block != 1) variant.compiler_identity += ":gqa-heads" + std::to_string(config.qsa_gqa_heads_per_block) + "-v1";
     variant.measured_seconds = 0.0;

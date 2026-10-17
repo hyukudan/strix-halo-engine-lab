@@ -20,9 +20,10 @@ struct HipSharedExpertLauncherConfig {
     bool prefetch_q8 = false;
     std::vector<std::uint32_t> prefetch_eligible_layers;
     std::shared_ptr<shared_expert_prefetch::RuntimeDispatchStats> prefetch_stats;
-    // Opt-in known-window rows Q8 projections with per-32 int8 activations
-    // (dot4). Changes numerics: never bit-identical to the R1 row loop.
-    bool known_window_a8_projections = false;
+    // Dense A8 numerical profile (dense-a8-q80-v1): every Q8_0 projection of the
+    // step (R1, windows and prompt rows) runs Q8_0 x per-32 int8 activations
+    // through q8_rows::launch_dense_a8. Different numerics from the exact path.
+    bool dense_a8_projections = false;
 };
 
 enum class HipSharedQ8ProjectionMode {legacy256,virtual256,prefetch8};

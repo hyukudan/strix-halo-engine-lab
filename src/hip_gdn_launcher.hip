@@ -3646,6 +3646,29 @@ void emit_gdn_recurrent_layout(const PreparedGdnLaunch& row, HipGdnRecurrentLayo
     check_hip(hipGetLastError(), "HIP GDN recurrent LDS layout launch");
 }
 
+// Dense A8 R1 input projections: every Q8_0 matrix of qkv, z, beta, alpha in one q8_rows
+// launch (the rows contract of the window and prompt sites, so R1 rows match them).
+void launch_gdn_dense_a8_inputs(const PreparedGdnLaunch& prepared, hipStream_t stream) {
+    GdnInputRowsSite<1U> in{};
+    const auto add = [&](const TensorPair& tensor, std::uint32_t outputs, float* target) {
+        if (tensor.manifest->ggml_type != 8U) return;
+        const auto m = in.segments.count++;
+        in.segments.weights[m] = reinterpret_cast<const unsigned char*>(tensor.runtime->address);
+        in.segments.first[m + 1U] = in.segments.first[m] + outputs;
+        in.output[m][0] = target;
+    };
+    const auto& tensors = prepared.tensors;
+    add(tensors.qkv, prepared.conv_width, prepared.workspace.qkv);
+    add(tensors.z, prepared.value_width, prepared.workspace.z);
+    add(tensors.beta, prepared.value_heads, prepared.workspace.beta);
+    add(tensors.alpha, prepared.value_heads, prepared.workspace.gate);
+    if (!in.segments.count) return;
+    in.input[0] = reinterpret_cast<const void*>(prepared.input.address);
+    in.width = prepared.hidden; in.outputs = in.segments.first[in.segments.count];
+    q8_rows::launch(in, true, stream);
+    check_hip(hipGetLastError(), "HIP GDN dense A8 input projection launch");
+}
+
 void emit_gdn_sequence(const PreparedGdnLaunch& prepared, const HipGdnLauncherConfig& config,
     const GdnEmitTarget& target) {
     const auto& input = prepared.input; const auto& output = prepared.output;
@@ -3665,7 +3688,15 @@ void emit_gdn_sequence(const PreparedGdnLaunch& prepared, const HipGdnLauncherCo
         check_hip(hipGetLastError(), "HIP GDN finite input validation");
     }
 
-    launch_projection_by_kind(
+    const bool dense = config.dense_a8_projections;
+    if (dense) {
+        if (prepared.graph_capture || target.ledger || target.graph_status)
+            throw std::invalid_argument("HIP GDN dense A8 projections run eager outside islands and graphs");
+        launch_gdn_dense_a8_inputs(prepared, target.stream);
+    }
+    // Under dense A8 the Q8_0 matrices ran above; other formats keep their R1 kernels.
+    const auto keep = [&](const TensorPair& tensor) { return !dense || tensor.manifest->ggml_type != 8U; };
+    if (keep(tensors.qkv)) launch_projection_by_kind(
         weight_kind(
             tensors.qkv.manifest->
                 ggml_type),
@@ -3674,7 +3705,7 @@ void emit_gdn_sequence(const PreparedGdnLaunch& prepared, const HipGdnLauncherCo
         hidden,
         conv_width,
         workspace.qkv, projection_mode, target.stream, target.ledger);
-    launch_projection_by_kind(
+    if (keep(tensors.z)) launch_projection_by_kind(
         weight_kind(
             tensors.z.manifest->
                 ggml_type),
@@ -3683,7 +3714,7 @@ void emit_gdn_sequence(const PreparedGdnLaunch& prepared, const HipGdnLauncherCo
         hidden,
         value_width,
         workspace.z, projection_mode, target.stream, target.ledger);
-    launch_projection_by_kind(
+    if (keep(tensors.beta)) launch_projection_by_kind(
         weight_kind(
             tensors.beta.manifest->
                 ggml_type),
@@ -3692,7 +3723,7 @@ void emit_gdn_sequence(const PreparedGdnLaunch& prepared, const HipGdnLauncherCo
         hidden,
         value_heads,
         workspace.beta, projection_mode, target.stream, target.ledger);
-    launch_projection_by_kind(
+    if (keep(tensors.alpha)) launch_projection_by_kind(
         weight_kind(
             tensors.alpha.manifest->
                 ggml_type),
@@ -3851,7 +3882,15 @@ void emit_gdn_sequence(const PreparedGdnLaunch& prepared, const HipGdnLauncherCo
         hipGetLastError(),
         "HIP GDN gated RMSNorm launch");
 
-    launch_output_by_kind(
+    if (!keep(tensors.out)) {
+        GdnOutputRowsSite<1U> out{};
+        out.segments = q8_rows::segments({{reinterpret_cast<const void*>(tensors.out.runtime->address), hidden}});
+        out.width = value_width; out.outputs = hidden;
+        out.input[0] = workspace.core;
+        out.output[0] = reinterpret_cast<std::uint16_t*>(output.address);
+        q8_rows::launch(out, true, target.stream);
+        check_hip(hipGetLastError(), "HIP GDN dense A8 output projection launch");
+    } else launch_output_by_kind(
         weight_kind(
             tensors.out.manifest->
                 ggml_type),
@@ -3910,6 +3949,7 @@ std::string kernel_id(
         std::string(gdn_recurrent_storage_marker(config.recurrent_storage)) +
         (config.wave8_q8_input_projections ? std::string(q8_projection_organization::gdn_wave8_marker) : "") +
         (config.wave8_q8_output_projection ? std::string(q8_projection_organization::gdn_output_wave8_marker) : "") +
+        (config.dense_a8_projections ? std::string(q8_projection_organization::dense_a8_marker) : "") +
         (config.prefetch_q8_input_projections ? ".prefetch8" : "") +
         (config.virtual_q8_input_projections ? ".virtual256.q8-input" : "") +
         (config.virtual_q8_output_projection ? ".virtual256.q8-output" : "");
@@ -3966,6 +4006,7 @@ std::uint64_t implementation_identity(
     if (config.prefetch_q8_input_projections) hash_u64(hash, 0x47444e5138504631ULL);
     if (config.wave8_q8_input_projections) hash_u64(hash, 0x47444e5138574156ULL);
     if (config.wave8_q8_output_projection) hash_u64(hash, 0x47444e514f573831ULL);
+    if (config.dense_a8_projections) hash_u64(hash, 0x47444e4441385631ULL); // GDNDA8V1
     if (config.recurrent_layout != HipGdnRecurrentLayout::baseline) {
         hash_u64(hash, 0x47444e4c44533031ULL); // GDN LDS organization version 1.
         hash_u64(hash, static_cast<std::uint32_t>(config.recurrent_layout));
@@ -4262,7 +4303,7 @@ void enqueue_gdn_known_window_inputs(const std::array<GdnKnownWindowRow, 2>& pre
         in.input[r] = reinterpret_cast<const void*>(prepared[r].input.address);
         in.output[0][r] = w.qkv; in.output[1][r] = w.z; in.output[2][r] = w.beta; in.output[3][r] = w.gate;
     }
-    q8_rows::launch(in, config.known_window_a8_projections, hip_execution_stream());
+    q8_rows::launch(in, config.dense_a8_projections, hip_execution_stream());
     check_hip(hipGetLastError(), "GDN known-window R2 input projection launch");
     if (!q8_gates) {
         for (const auto& row : prepared) {
@@ -4291,7 +4332,7 @@ void enqueue_gdn_known_window_completion(const std::array<GdnKnownWindowRow, 2>&
         out.input[r] = prepared[r].workspace.core;
         out.output[r] = reinterpret_cast<std::uint16_t*>(prepared[r].output.address);
     }
-    q8_rows::launch(out, config.known_window_a8_projections, hip_execution_stream());
+    q8_rows::launch(out, config.dense_a8_projections, hip_execution_stream());
     check_hip(hipGetLastError(), "GDN known-window R2 output projection launch");
 }
 
@@ -4310,9 +4351,9 @@ std::array<GdnKnownWindowRow, Rows> prepare_gdn_wide_rows(
     const auto& first = rows[0];
     if (first.position > std::numeric_limits<std::uint64_t>::max() - (Rows - 1U))
         throw std::invalid_argument("GDN wide-window position overflows");
-    if (config.known_window_a8_projections)
+    if (config.dense_a8_projections)
         for (const auto width : {result[0].hidden, result[0].value_width})
-            if (Rows * (width / 32U) * 36U > 65536U) throw std::invalid_argument("GDN wide-window A8 activations exceed LDS");
+            if (!q8_rows::dense_a8_width(width)) throw std::invalid_argument("GDN wide-window dense A8 width is not admitted");
     const auto same_state = [](const SessionStateAddress& a, const SessionStateAddress& b) {
         return a.component == b.component && a.storage == b.storage && a.address == b.address &&
             a.bytes == b.bytes && a.allocation_generation == b.allocation_generation && a.provisional == b.provisional;
@@ -4375,7 +4416,7 @@ void enqueue_gdn_wide_rows(const std::array<GdnKnownWindowRow, Rows>& prepared,
         in.input[r] = reinterpret_cast<const void*>(prepared[r].input.address);
         in.output[0][r] = prepared[r].workspace.qkv; in.output[1][r] = prepared[r].workspace.z;
     }
-    q8_rows::launch(in, config.known_window_a8_projections, hip_execution_stream());
+    q8_rows::launch(in, config.dense_a8_projections, hip_execution_stream());
     check_hip(hipGetLastError(), "GDN wide-window Q8 input projection launch");
     for (const auto& row : prepared) {
         const auto* input = reinterpret_cast<const std::uint16_t*>(row.input.address);
@@ -4395,7 +4436,7 @@ void enqueue_gdn_wide_rows(const std::array<GdnKnownWindowRow, Rows>& prepared,
         out.input[r] = prepared[r].workspace.core;
         out.output[r] = reinterpret_cast<std::uint16_t*>(prepared[r].output.address);
     }
-    q8_rows::launch(out, config.known_window_a8_projections, hip_execution_stream());
+    q8_rows::launch(out, config.dense_a8_projections, hip_execution_stream());
     check_hip(hipGetLastError(), "GDN wide-window Q8 output projection launch");
 }
 
@@ -4605,7 +4646,7 @@ void enqueue_gdn_prefill_rows(const std::vector<std::array<GdnKnownWindowRow, 8U
         const int n = v ? std::atoi(v) : 64;
         return n == 8 || n == 16 || n == 32 ? static_cast<std::uint32_t>(n) : 64U;
     }();
-    const auto wide = config.known_window_a8_projections ? 8U : wide_env;
+    const auto wide = wide_env;
     const auto project_in = [&]<std::uint32_t W>(std::size_t first_tile) {
         GdnInputRowsSite<W> in{};
         in.segments = q8_rows::segments({{reinterpret_cast<const void*>(first.tensors.qkv.runtime->address), first.conv_width},
@@ -4616,7 +4657,7 @@ void enqueue_gdn_prefill_rows(const std::vector<std::array<GdnKnownWindowRow, 8U
             in.input[r] = reinterpret_cast<const void*>(row.input.address);
             in.output[0][r] = row.workspace.qkv; in.output[1][r] = row.workspace.z;
         }
-        q8_rows::launch(in, W == 8U && config.known_window_a8_projections, stream);
+        q8_rows::launch(in, config.dense_a8_projections, stream);
         check_hip(hipGetLastError(), "GDN prefill Q8 input projection launch");
     };
     const auto project_out = [&]<std::uint32_t W>(std::size_t first_tile) {
@@ -4628,7 +4669,7 @@ void enqueue_gdn_prefill_rows(const std::vector<std::array<GdnKnownWindowRow, 8U
             out.input[r] = row.workspace.core;
             out.output[r] = reinterpret_cast<std::uint16_t*>(row.output.address);
         }
-        q8_rows::launch(out, W == 8U && config.known_window_a8_projections, stream);
+        q8_rows::launch(out, config.dense_a8_projections, stream);
         check_hip(hipGetLastError(), "GDN prefill Q8 output projection launch");
     };
     // Largest width that divides what is left, so every row runs exactly once.
@@ -4755,10 +4796,9 @@ void validate_gdn_window(const GdnWindowLayer& layer, std::span<const GdnWindowR
         if (!row.input || !row.output || !row.workspace || reinterpret_cast<std::uintptr_t>(row.workspace) % 16U ||
             reinterpret_cast<std::uintptr_t>(row.input) % 16U)
             throw std::invalid_argument("GDN window row views are missing or misaligned");
-    if (config.known_window_a8_projections)
+    if (config.dense_a8_projections)
         for (const auto width : {static_cast<std::uint64_t>(config.model.hidden_size), static_cast<std::uint64_t>(gdn_window_shape(config.model).value_width)})
-            if (q8_rows::a8_bytes<gdn_window_max_rows>(width) > q8_rows::kLdsBytes)
-                throw std::invalid_argument("GDN window A8 activations exceed one block's LDS");
+            if (!q8_rows::dense_a8_width(width)) throw std::invalid_argument("GDN window dense A8 width is not admitted");
 }
 template <unsigned Rows>
 void enqueue_gdn_window(const GdnWindowLayer& layer, std::span<const GdnWindowRow> input,
@@ -4778,7 +4818,7 @@ void enqueue_gdn_window(const GdnWindowLayer& layer, std::span<const GdnWindowRo
         in.input[r] = input[r].input;
         in.output[0][r] = rows.qkv[r]; in.output[1][r] = rows.z[r]; in.output[2][r] = rows.beta[r]; in.output[3][r] = rows.gate[r];
     }
-    q8_rows::launch(in, config.known_window_a8_projections, stream);
+    q8_rows::launch(in, config.dense_a8_projections, stream);
     check_hip(hipGetLastError(), "GDN window Q8 input projection launch");
     if (!q8_gates) {
         // Any-order (STRIX_ANYORDER=0 disables): the F32 gates read the same inputs as the Q8 projection queued
@@ -4817,7 +4857,7 @@ void enqueue_gdn_window(const GdnWindowLayer& layer, std::span<const GdnWindowRo
     out.segments = q8_rows::segments({{layer.out, shape.hidden}});
     out.width = shape.value_width; out.outputs = shape.hidden;
     for (unsigned r = 0; r < Rows; ++r) { out.input[r] = rows.core[r]; out.output[r] = static_cast<std::uint16_t*>(input[r].output); }
-    q8_rows::launch(out, config.known_window_a8_projections, stream);
+    q8_rows::launch(out, config.dense_a8_projections, stream);
     check_hip(hipGetLastError(), "GDN window Q8 output projection launch");
 }
 } // namespace
@@ -5175,8 +5215,8 @@ void gdn_known_window_rows_projection_probe(GdnKnownWindowProjectionDirection di
         for (const auto read : input) require_gdn_known_window_disjoint(write, {read.address, read.bytes});
         require_gdn_known_window_disjoint(write, {weights.address, weights.bytes});
     }
-    if (mode == GdnKnownWindowRowsProbeMode::rows_a8 && (rows > 8U || rows * width + rows * (width / 32U) * 4U > 65536U))
-        throw std::invalid_argument("GDN wide-window A8 activations exceed one block's LDS");
+    if (mode == GdnKnownWindowRowsProbeMode::rows_a8 && !q8_rows::dense_a8_width(width))
+        throw std::invalid_argument("GDN wide-window dense A8 width is not admitted");
     const auto native_stream = static_cast<hipStream_t>(stream);
     hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
     check_hip(hipStreamIsCapturing(native_stream, &capture), "query GDN wide diagnostic capture");
@@ -5344,6 +5384,10 @@ void register_hip_gdn_kernel_variant(
     if(config.virtual_q8_output_projection) variant.compiler_identity += "-virtual256-q8-output";
     if(config.wave8_q8_input_projections) variant.compiler_identity += ":wave8-input-v1";
     if(config.wave8_q8_output_projection) variant.compiler_identity += ":wave8-q8-output-v1";
+    if(config.dense_a8_projections) {
+        variant.numerics.accumulator_precision += ";" + std::string(q8_projection_organization::dense_a8_numerical_identity);
+        variant.compiler_identity += ":dense-a8-q80-v1";
+    }
     if(config.recurrent_layout != HipGdnRecurrentLayout::baseline)
         variant.compiler_identity += ":gdn-recurrent" + std::string(gdn_recurrent_layout_marker(config.recurrent_layout));
     if(config.recurrent_storage != GdnRecurrentStorage::key_value)
@@ -5853,6 +5897,7 @@ std::shared_ptr<HipGdnIslands> HipGdnIslands::create(const CompiledSerialExecuti
     std::shared_ptr<const HipModelResidency> weights, std::shared_ptr<const void> owner,
     std::shared_ptr<const HipSetupQuiescenceGuard> guard, HipGdnIslandBudget budget) {
     if (!weights || !owner || !guard) throw std::invalid_argument("GDN island setup requires strong actual owners");
+    if (config.dense_a8_projections) throw std::invalid_argument("GDN islands capture the incumbent projections, not dense A8");
     auto impl = std::make_unique<Impl>(compiled, config, resources, scope, std::move(weights), std::move(owner), guard, budget);
     try { guard->run([&] { impl->build(); }); }
     catch (...) {
@@ -5901,6 +5946,10 @@ make_hip_gdn_launcher(
             "HIP GDN launcher requires id and config");
     }
     validate_config(*config);
+    if ((kernel_id_value.find(q8_projection_organization::dense_a8_marker) != std::string::npos) != config->dense_a8_projections)
+        throw std::invalid_argument("HIP GDN launcher dense A8 identity differs from config");
+    // The dense A8 scratch is allocated at setup, never on the first decode step.
+    if (config->dense_a8_projections) q8_rows::dense_a8_reserve();
     if (config->recurrent_storage != GdnRecurrentStorage::key_value || kernel_id_value.find(".state-vk-v1") != std::string::npos) {
         ExecutionBindingRequest request;
         if (kernel_id_value != kernel_id(request, *config))

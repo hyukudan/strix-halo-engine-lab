@@ -5,6 +5,7 @@
 #include "strix/hip_shared_expert_launcher.hpp"
 #include "hip_q8_rows_gemv.hpp"
 #include "strix/hip_shared_serving_cohort.hpp"
+#include "strix/q8_projection_organization.hpp"
 #include "strix/shared_expert_rows_diagnostic_contract.hpp"
 #if defined(STRIX_BUILD_SHARED_EXPERT_ROWS_DIAGNOSTIC)
 #include "strix/hip_shared_expert_rows_diagnostic.hpp"
@@ -906,6 +907,12 @@ void launch_down_by_kind(
         "HIP shared-expert down launch");
 }
 
+// Dense A8 R1 projections (defined with the rows sites below).
+void launch_shared_dense_a8_gate_up(const SharedTensors& tensors, const std::uint16_t* hidden, float* workspace,
+    std::uint32_t hidden_size, std::uint32_t intermediate_size, hipStream_t stream);
+void launch_shared_dense_a8_down(const SharedTensors& tensors, const float* intermediate, const float* shared_gate,
+    std::uint16_t* output, std::uint32_t hidden_size, std::uint32_t intermediate_size, hipStream_t stream);
+
 template <typename Storage>
 void launch_typed(
     const HipSharedExpertLauncherConfig& config,
@@ -928,7 +935,19 @@ void launch_typed(
         reinterpret_cast<const Storage*>(
             input.address);
 
-    launch_projection_by_kind(
+    // Dense A8: gate and up (both Q8_0) in one launch, down after the activation.
+    const bool dense = config.dense_a8_projections;
+    if constexpr (std::is_same_v<Storage, std::uint16_t>) {
+        if (dense) {
+            if (tensors.gate.manifest->ggml_type != 8U || tensors.up.manifest->ggml_type != 8U ||
+                tensors.down.manifest->ggml_type != 8U)
+                throw std::invalid_argument("HIP shared-expert dense A8 requires Q8_0 gate, up and down");
+            launch_shared_dense_a8_gate_up(tensors, hidden, workspace, config.hidden_size, config.intermediate_size,
+                hip_execution_stream());
+        }
+    } else if (dense) throw std::invalid_argument("HIP shared-expert dense A8 requires BF16 activations");
+
+    if (!dense) launch_projection_by_kind(
         weight_kind(
             tensors.gate.manifest->
                 ggml_type),
@@ -938,7 +957,7 @@ void launch_typed(
         config.intermediate_size,
         gate,config.prefetch_q8 && shared_expert_prefetch::eligible(*tensors.gate.manifest),config.prefetch_stats.get());
 
-    launch_projection_by_kind(
+    if (!dense) launch_projection_by_kind(
         weight_kind(
             tensors.up.manifest->
                 ggml_type),
@@ -972,6 +991,13 @@ void launch_typed(
         config.hidden_size,
         shared_gate);
 
+    if constexpr (std::is_same_v<Storage, std::uint16_t>) {
+        if (dense) {
+            launch_shared_dense_a8_down(tensors, gate, shared_gate, reinterpret_cast<std::uint16_t*>(output.address),
+                config.hidden_size, config.intermediate_size, hip_execution_stream());
+            return;
+        }
+    }
     launch_down_by_kind(
         weight_kind(
             tensors.down.manifest->
@@ -1156,7 +1182,9 @@ std::string kernel_id(
             request.logical_rows) +
         ".c" +
         std::to_string(
-            request.request_concurrency) + (config.prefetch_q8?std::string(shared_expert_prefetch::kernel_suffix):"");
+            request.request_concurrency) +
+        (config.dense_a8_projections ? std::string(q8_projection_organization::dense_a8_marker) : "") +
+        (config.prefetch_q8?std::string(shared_expert_prefetch::kernel_suffix):"");
 }
 
 std::uint64_t implementation_identity(
@@ -1170,6 +1198,7 @@ std::uint64_t implementation_identity(
         static_cast<std::uint64_t>(
             config.activation));
     if(config.prefetch_q8){hash_u64(hash,0x5348505246563031ULL);for(auto layer:config.prefetch_eligible_layers)hash_u64(hash,layer);}
+    if(config.dense_a8_projections) hash_u64(hash, 0x5348524441385631ULL); // SHRDA8V1
     return hash;
 }
 
@@ -1281,6 +1310,10 @@ void register_hip_shared_expert_kernel_variant(
         "row-major";
     variant.compiler_identity =
         config.prefetch_q8?"hip-gfx1151-shared-expert-v2-prefetch8-virtual256-q8":"hip-gfx1151-shared-expert-v1";
+    if (config.dense_a8_projections) {
+        variant.numerics.accumulator_precision += ";" + std::string(q8_projection_organization::dense_a8_numerical_identity);
+        variant.compiler_identity += ":dense-a8-q80-v1";
+    }
     variant.measured_seconds = 0.0;
 
     registry.add(
@@ -1464,6 +1497,28 @@ template <unsigned Rows> struct SharedDownRowsSite {
         store_activation(output[r] + out, gated);
     }
 };
+void launch_shared_dense_a8_gate_up(const SharedTensors& tensors, const std::uint16_t* hidden, float* workspace,
+    std::uint32_t hidden_size, std::uint32_t intermediate_size, hipStream_t stream) {
+    SharedGateUpRowsSite<1U> site{};
+    site.segments = q8_rows::segments({{reinterpret_cast<const void*>(tensors.gate.runtime->address), intermediate_size},
+        {reinterpret_cast<const void*>(tensors.up.runtime->address), intermediate_size}});
+    site.input[0] = hidden;
+    site.output[0] = workspace;  // gate then up, contiguous
+    site.width = hidden_size; site.outputs = 2U * intermediate_size;
+    q8_rows::launch(site, true, stream);
+    check_hip(hipGetLastError(), "HIP shared-expert dense A8 gate/up launch");
+}
+void launch_shared_dense_a8_down(const SharedTensors& tensors, const float* intermediate, const float* shared_gate,
+    std::uint16_t* output, std::uint32_t hidden_size, std::uint32_t intermediate_size, hipStream_t stream) {
+    SharedDownRowsSite<1U> site{};
+    site.segments = q8_rows::segments({{reinterpret_cast<const void*>(tensors.down.runtime->address), hidden_size}});
+    site.input[0] = intermediate;
+    site.gate[0] = shared_gate;
+    site.output[0] = output;
+    site.width = intermediate_size; site.outputs = hidden_size;
+    q8_rows::launch(site, true, stream);
+    check_hip(hipGetLastError(), "HIP shared-expert dense A8 down launch");
+}
 } // namespace
 } // namespace strix
 
@@ -1746,7 +1801,7 @@ void known_shared_engine_projection(bool down, const KnownSharedR2Views& views, 
             site.gate[r] = reinterpret_cast<const float*>(workspace) + s.intermediate;
             site.output[r] = reinterpret_cast<std::uint16_t*>(row(views.output, s.output_stride_bytes, r));
         }
-        q8_rows::launch(site, config.known_window_a8_projections, stream);
+        q8_rows::launch(site, config.dense_a8_projections, stream);
     } else {
         SharedGateUpRowsSite<Rows> site{};
         site.segments = q8_rows::segments({{reinterpret_cast<const void*>(views.weights.gate_q8.address), s.intermediate},
@@ -1759,16 +1814,16 @@ void known_shared_engine_projection(bool down, const KnownSharedR2Views& views, 
         // Any-order (STRIX_ANYORDER=0 disables): gate/up reads only the MoE input and writes this expert's own
         // workspace, independent of the router's top-k selection queued just before it.
         static const bool any_order = strix_any_order_enabled();
-        q8_rows::launch(site, config.known_window_a8_projections, stream, any_order);
+        q8_rows::launch(site, config.dense_a8_projections, stream, any_order);
     }
     check_hip(hipGetLastError(), "known-window shared rows projection launch");
     if (config.prefetch_q8 && config.prefetch_stats)
         config.prefetch_stats->dispatched_projections.fetch_add(down ? 1U : 2U, std::memory_order_relaxed);
 }
-void require_known_shared_a8(std::size_t rows, const HipSharedExpertLauncherConfig& config) {
-    if (config.known_window_a8_projections &&
-        rows * std::max(config.hidden_size, config.intermediate_size) / 32U * 36U > q8_rows::kLdsBytes)
-        throw std::invalid_argument("known-window shared A8 activations exceed one block's LDS");
+void require_known_shared_a8(std::size_t, const HipSharedExpertLauncherConfig& config) {
+    if (config.dense_a8_projections &&
+        (!q8_rows::dense_a8_width(config.hidden_size) || !q8_rows::dense_a8_width(config.intermediate_size)))
+        throw std::invalid_argument("known-window shared dense A8 width is not admitted");
 }
 } // namespace
 
@@ -1919,7 +1974,6 @@ KnownSharedR2Views known_shared_prefill_views(std::span<const ExecutionDispatchC
     const HipSharedExpertLauncherConfig& config) {
     if (rows.size() < 16U || rows.size() % 8U || rows.size() > 65535U)
         throw std::invalid_argument("known shared prefill rows require 8-row tiles");
-    if (config.known_window_a8_projections) throw std::invalid_argument("known shared prefill rows are not A8");
     auto views = known_shared_rows_views(rows.first(8U), config);
     const auto& s = views.shape;
     for (std::size_t t = 1; t < rows.size() / 8U; ++t) {
@@ -2246,8 +2300,8 @@ void launch_hip_shared_rows_projection_probe(HipSharedQ8ProjectionRole role, Hip
                 (other < r && overlap(output[r], output[other])))
                 throw std::invalid_argument("shared rows projection output aliases a row");
     }
-    if (mode == HipSharedRowsProbeMode::rows_a8 && (rows > 8U || q8_rows::a8_bytes<8U>(width) / 8U * rows > q8_rows::kLdsBytes))
-        throw std::invalid_argument("shared rows A8 activations exceed one block's LDS");
+    if (mode == HipSharedRowsProbeMode::rows_a8 && !q8_rows::dense_a8_width(width))
+        throw std::invalid_argument("shared rows dense A8 width is not admitted");
     const auto native = static_cast<hipStream_t>(stream);
     check_hip(hipPeekAtLastError(), "shared rows projection diagnostic pre-enqueue stale error");
     const auto* packed = reinterpret_cast<const void*>(weights.address);

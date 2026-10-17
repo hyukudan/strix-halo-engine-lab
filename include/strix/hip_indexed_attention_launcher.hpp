@@ -32,9 +32,10 @@ struct HipIndexedAttentionLauncherConfig {
     std::uint32_t qsa_gqa_heads_per_block = 1;
     std::shared_ptr<QsaHierarchicalSelectionStats> selection_stats;
     std::shared_ptr<QsaHierarchicalSelectionStats> gqa_stats;
-    // Opt-in known-window rows Q8 projections with per-32 int8 activations
-    // (dot4). Changes numerics: never bit-identical to the R1 row loop.
-    bool known_window_a8_projections = false;
+    // Dense A8 numerical profile (dense-a8-q80-v1): every Q8_0 projection of the
+    // step (R1, windows and prompt rows) runs Q8_0 x per-32 int8 activations
+    // through q8_rows::launch_dense_a8. Different numerics from the exact path.
+    bool dense_a8_projections = false;
 };
 
 enum class HipQsaInputProjectionMode {legacy256,virtual256,prefetch8};

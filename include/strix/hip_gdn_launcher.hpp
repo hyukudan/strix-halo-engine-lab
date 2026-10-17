@@ -32,9 +32,10 @@ struct HipGdnLauncherConfig {
     HipGdnRecurrentLayout recurrent_layout = HipGdnRecurrentLayout::baseline;
     // Chosen with the session allocation/import; never converted per token.
     GdnRecurrentStorage recurrent_storage = GdnRecurrentStorage::key_value;
-    // Opt-in known-window rows Q8 projections with per-32 int8 activations
-    // (dot4). Changes numerics: never bit-identical to the R1 row loop.
-    bool known_window_a8_projections = false;
+    // Dense A8 numerical profile (dense-a8-q80-v1): every Q8_0 projection of the
+    // step (R1, windows and prompt rows) runs Q8_0 x per-32 int8 activations
+    // through q8_rows::launch_dense_a8. Different numerics from the exact path.
+    bool dense_a8_projections = false;
 };
 
 // Closed eager R2 window helper. Each context remains an R1 row view. Both

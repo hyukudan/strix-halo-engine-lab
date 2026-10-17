@@ -529,6 +529,109 @@ void exact_case(hipStream_t stream, const Shape& shape, std::uint32_t rows, unsi
     ++cases;
 }
 
+// Engine forms (q8_rows::launch_dense_a8: quantizer + dot4 rows <= 8 / WMMA 16, 32, 64) through a
+// two-segment site, against the serial reference. Rows of one launch are rows base..base+R-1 of
+// the fixture; every R must give each row the reference bits.
+template <class In, unsigned Rows> struct EngineSite {
+    using Input = In;
+    static constexpr unsigned rows = Rows, a8_family = 3U;
+    const void* input[Rows];
+    q8_rows::Segments segments;
+    std::uint32_t width, outputs;
+    float* output;
+    __device__ static float coefficient(unsigned, std::int8_t) { return 0.0F; }
+    __device__ static void fma(float&, float, float) {}
+    __device__ static float add(float lower, float upper) { return lower + upper; }
+    __device__ void store(std::uint32_t out, unsigned r, float value) const { output[static_cast<std::uint64_t>(r) * outputs + out] = value; }
+};
+template <class In, unsigned Rows>
+void launch_engine(const Activations& a, std::uint32_t base, const Buffer& weights, std::uint32_t outputs, Buffer& out,
+    hipStream_t stream) {
+    EngineSite<In, Rows> site{};
+    const std::uint32_t split = outputs / 3U * 2U;
+    site.segments = q8_rows::segments({{weights.p, split},
+        {weights.as<unsigned char>() + static_cast<std::uint64_t>(split) * (a.width / 32U) * 34U, outputs - split}});
+    for (unsigned r = 0; r < Rows; ++r)
+        site.input[r] = a.input.as<unsigned char>() + static_cast<std::uint64_t>(base + r) * a.width * sizeof(In);
+    site.width = a.width; site.outputs = outputs; site.output = out.as<float>();
+    q8_rows::launch(site, true, stream);
+    check(hipGetLastError(), "engine dense A8 launch");
+}
+template <unsigned Rows>
+void launch_engine_rows(const Activations& a, std::uint32_t base, const Buffer& weights, std::uint32_t outputs, Buffer& out,
+    hipStream_t stream) {
+    if (a.bf) launch_engine<std::uint16_t, Rows>(a, base, weights, outputs, out, stream);
+    else launch_engine<float, Rows>(a, base, weights, outputs, out, stream);
+}
+void launch_engine_any(unsigned rows, const Activations& a, std::uint32_t base, const Buffer& weights, std::uint32_t outputs,
+    Buffer& out, hipStream_t stream) {
+    switch (rows) {
+    case 1: launch_engine_rows<1U>(a, base, weights, outputs, out, stream); break;
+    case 2: launch_engine_rows<2U>(a, base, weights, outputs, out, stream); break;
+    case 3: launch_engine_rows<3U>(a, base, weights, outputs, out, stream); break;
+    case 4: launch_engine_rows<4U>(a, base, weights, outputs, out, stream); break;
+    case 5: launch_engine_rows<5U>(a, base, weights, outputs, out, stream); break;
+    case 6: launch_engine_rows<6U>(a, base, weights, outputs, out, stream); break;
+    case 7: launch_engine_rows<7U>(a, base, weights, outputs, out, stream); break;
+    case 8: launch_engine_rows<8U>(a, base, weights, outputs, out, stream); break;
+    case 16: launch_engine_rows<16U>(a, base, weights, outputs, out, stream); break;
+    case 32: launch_engine_rows<32U>(a, base, weights, outputs, out, stream); break;
+    default: launch_engine_rows<64U>(a, base, weights, outputs, out, stream); break;
+    }
+}
+void engine_case(hipStream_t stream, const Shape& shape, unsigned flavor, std::uint32_t outputs, std::uint32_t& cases) {
+    constexpr std::uint32_t total = 64U;
+    std::mt19937 rng(4321U + flavor * 31U + shape.width + outputs);
+    const auto weights_host = make_weights(shape.width, outputs, flavor, rng);
+    const auto x = make_inputs(total, shape.width, shape.bf16, flavor, rng);
+    Buffer weights(weights_host.size()); weights.upload(weights_host);
+    Activations a(total, shape.width, shape.bf16); a.upload(x);
+    const auto q = quantize_reference(x, total, shape.width, 64U);
+    const std::string tag = std::string("engine ") + shape.name + " " + std::to_string(shape.width) + "->" + std::to_string(outputs) +
+        " flavor=" + std::to_string(flavor);
+    // Header quantizer against the reference (codes [row][feature], deltas [block * 64 + row]).
+    {
+        Buffer codes(static_cast<std::size_t>(total) * shape.width), deltas(static_cast<std::size_t>(shape.width / 32U) * 64U * 4U);
+        const auto quantize = [&](auto site) {
+            for (unsigned r = 0; r < total; ++r)
+                site.input[r] = a.input.as<unsigned char>() + static_cast<std::uint64_t>(r) * shape.width * (shape.bf16 ? 2U : 4U);
+            site.width = shape.width;
+            const std::uint32_t items = total * (shape.width / 8U);
+            hipLaunchKernelGGL(q8_rows::dense_a8_quantize_kernel<decltype(site)>, dim3((items + 255U) / 256U), dim3(256), 0, stream,
+                site, codes.as<std::int8_t>(), deltas.as<float>());
+            check(hipGetLastError(), "engine quantizer launch");
+        };
+        if (shape.bf16) quantize(EngineSite<std::uint16_t, total>{}); else quantize(EngineSite<float, total>{});
+        check(hipStreamSynchronize(stream), "engine quantizer");
+        require(codes.download<std::int8_t>() == q.codes, tag + ": header quantizer codes differ from the reference");
+        const auto d = deltas.download<float>();
+        require(!std::memcmp(d.data(), q.deltas.data(), d.size() * 4U), tag + ": header quantizer deltas differ from the reference");
+    }
+    const std::uint32_t step_n = outputs <= 2560U ? 7U : 37U;
+    std::vector<float> reference(static_cast<std::size_t>(total) * outputs, 0.0F);
+    for (std::uint32_t r = 0; r < total; ++r)
+        for (std::uint32_t n = r % step_n; n < outputs; n += step_n)
+            reference[static_cast<std::size_t>(r) * outputs + n] = reference_output(q, 64U, weights_host, shape.width, r, n);
+    Buffer out(static_cast<std::size_t>(total) * outputs * 4U);
+    for (const unsigned rows : {1U, 2U, 3U, 4U, 5U, 6U, 7U, 8U, 16U, 32U, 64U}) {
+        const std::uint32_t base = rows <= 8U ? (rows * 5U) % (total - rows + 1U) : 0U;
+        out.poison(stream);
+        launch_engine_any(rows, a, base, weights, outputs, out, stream);
+        check(hipStreamSynchronize(stream), "engine dense A8");
+        const auto got = out.download<float>();
+        for (std::uint32_t r = 0; r < rows; ++r)
+            for (std::uint32_t n = (base + r) % step_n; n < outputs; n += step_n) {
+                const float e = reference[static_cast<std::size_t>(base + r) * outputs + n];
+                const float g = got[static_cast<std::size_t>(r) * outputs + n];
+                if (std::bit_cast<std::uint32_t>(e) != std::bit_cast<std::uint32_t>(g))
+                    throw std::runtime_error(tag + " rows=" + std::to_string(rows) + ": row " + std::to_string(base + r) + " output " +
+                        std::to_string(n) + " reference " + describe(std::bit_cast<std::uint32_t>(e)) + " engine " +
+                        describe(std::bit_cast<std::uint32_t>(g)));
+            }
+        ++cases;
+    }
+}
+
 float median_us(const std::function<void()>& enqueue, hipStream_t stream, unsigned iterations = 30U) {
     hipEvent_t start, stop;
     check(hipEventCreate(&start), "event"); check(hipEventCreate(&stop), "event");
@@ -569,6 +672,34 @@ float baseline_shape_us(const Shape& shape, const Buffer& weights, hipStream_t s
     Buffer out(static_cast<std::size_t>(Rows) * shape.outputs * 4U);
     return shape.bf16 ? baseline_us<std::uint16_t, Rows>(shape, weights, rows_in, out, stream)
                       : baseline_us<float, Rows>(shape, weights, rows_in, out, stream);
+}
+
+void engine_bench(hipStream_t stream) {
+    std::cout.setf(std::ios::fixed); std::cout.precision(1);
+    for (const auto& shape : shapes) {
+        std::mt19937 rng(99U);
+        const auto weights_host = make_weights(shape.width, shape.outputs, 0U, rng);
+        Buffer weights(weights_host.size()); weights.upload(weights_host);
+        const double mb = static_cast<double>(weights_host.size()) / 1e6;
+        Activations a(64U, shape.width, shape.bf16);
+        a.upload(make_inputs(64U, shape.width, shape.bf16, 0U, rng));
+        Buffer out(static_cast<std::size_t>(64U) * shape.outputs * 4U);
+        std::cout << "engine " << shape.name << " " << shape.width << "->" << shape.outputs << " (" << mb
+                  << " MB): T  exact  dense-A8 (us, incl. quantizer)\n";
+        const auto exact = [&](unsigned rows) {
+            switch (rows) {
+            case 1: return baseline_shape_us<1U>(shape, weights, stream);
+            case 2: return baseline_shape_us<2U>(shape, weights, stream);
+            case 4: return baseline_shape_us<4U>(shape, weights, stream);
+            case 8: return baseline_shape_us<8U>(shape, weights, stream);
+            default: return baseline_shape_us<64U>(shape, weights, stream);
+            }
+        };
+        for (const unsigned rows : {1U, 2U, 4U, 8U, 64U}) {
+            const float dense = median_us([&] { launch_engine_any(rows, a, 0U, weights, shape.outputs, out, stream); }, stream);
+            std::cout << "    T=" << rows << "  " << exact(rows) << "  " << dense << "  (" << mb * 1e3 / dense << " GB/s)\n";
+        }
+    }
 }
 
 void bench(hipStream_t stream) {
@@ -632,6 +763,15 @@ int main() try {
     hipStream_t stream = nullptr;
     check(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), "create stream");
     if (!std::getenv("STRIX_DENSE_A8_BENCH_ONLY")) {
+        std::uint32_t engine_cases = 0;
+        for (const auto& shape : shapes) {
+            for (unsigned flavor = 0; flavor < 3U; ++flavor) engine_case(stream, shape, flavor, shape.outputs, engine_cases);
+            for (const std::uint32_t outputs : {64U, 192U, 1000U}) engine_case(stream, shape, outputs % 3U, outputs, engine_cases);
+            std::cout << "engine " << shape.name << ": ok\n";
+        }
+        std::cout << "dense A8 engine forms (rows 1..8, 16, 32, 64) == serial reference: " << engine_cases << " cases\n";
+    }
+    if (!std::getenv("STRIX_DENSE_A8_BENCH_ONLY") && !std::getenv("STRIX_DENSE_A8_ENGINE_ONLY")) {
         std::uint32_t cases = 0;
         for (const auto& shape : shapes) {
             for (const std::uint32_t rows : {64U, 128U, 256U})
@@ -645,7 +785,8 @@ int main() try {
         }
         std::cout << "dense A8: quantizer == reference, WMMA == dot4 == serial reference bitwise: " << cases << " cases\n";
     }
-    if (std::getenv("STRIX_DENSE_A8_BENCH")) bench(stream);
+    if (std::getenv("STRIX_DENSE_A8_BENCH")) engine_bench(stream);
+    if (std::getenv("STRIX_DENSE_A8_BENCH") && !std::getenv("STRIX_DENSE_A8_ENGINE_ONLY")) bench(stream);
     check(hipStreamDestroy(stream), "destroy stream");
     return 0;
 } catch (const std::exception& error) {

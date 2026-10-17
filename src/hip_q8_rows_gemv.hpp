@@ -16,16 +16,17 @@
 // leaves directly (they stay cache-resident). Weights are prefetched two
 // 256-column chunks ahead.
 //
-// A8 path (opt-in, different numerics): activations are quantised per 32-element
-// block to int8 with a float scale in LDS; each lane owns whole Q8 blocks (one
-// dot4 chain per row) and outputs/rows are reduced with a fixed tree.
+// Dense A8 path (numerical profile dense-a8-v1, different numerics): see
+// launch_dense_a8; every row count shares one per-row contract.
 //
 // T may be any count up to 8 (3/5/6/7 pad the tree to a power of two), or a
-// multiple of the wide batch (16, 32, 64) above 8; the A8 path stops at 8.
+// multiple of the wide batch (16, 32, 64) above 8.
 // A Site supplies Input (uint16_t BF16 or float), rows, input[] (or
 // row_input(r)), segments, width, outputs, the coefficient/fma/add arithmetic of
-// its R1 kernel and store(out, row, value); it may override outs, a8_outs, sub
-// and prefetch. The including translation unit owns the arithmetic flags.
+// its R1 kernel and store(out, row, value); it may override outs, sub, prefetch,
+// dense_a8_outs and a8_family (the dense A8 scratch family). The including
+// translation unit owns the arithmetic flags (the dense A8 kernels disable contraction
+// themselves and use explicit FMAs and round-to-nearest divisions).
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_ext.h>
@@ -52,7 +53,7 @@ inline bool strix_any_order_enabled() {
 
 namespace strix::q8_rows {
 
-constexpr unsigned kWaves = 8U, kThreads = 32U * kWaves, kA8Waves = 16U, kA8Threads = 32U * kA8Waves, kMaxSegments = 5U;
+constexpr unsigned kWaves = 8U, kThreads = 32U * kWaves, kMaxSegments = 5U;
 constexpr std::uint32_t kStageBytes = 48U * 1024U, kLdsBytes = 64U * 1024U;
 
 // Output index -> weight matrix and its row; segments share one input width.
@@ -81,9 +82,6 @@ template <class Site, bool Staged> constexpr unsigned outs_of() {
     if constexpr (requires { Site::outs; }) return Site::outs;
     else if constexpr (narrow_bf16<Site, Staged>()) return 1U;
     else return !Staged && Site::rows <= 2U ? 4U : 2U;
-}
-template <class Site> constexpr unsigned a8_outs_of() {
-    if constexpr (requires { Site::a8_outs; }) return Site::a8_outs; else return Site::rows > 1U ? 4U : 2U;
 }
 #ifndef STRIX_Q8_ROWS_PREFETCH
 #define STRIX_Q8_ROWS_PREFETCH 2U
@@ -283,7 +281,6 @@ template <class Site> std::uint32_t staged_bytes(const Site& site) {
     const auto weights = static_cast<std::uint64_t>(site.outputs) * (site.width / 32U) * 34U;
     return Site::rows >= 4U && bytes <= kStageBytes && weights >= 8U * bytes * compute_units() ? static_cast<std::uint32_t>(bytes) : 0U;
 }
-template <unsigned Rows> constexpr std::uint64_t a8_bytes(std::uint64_t width) { return Rows * width + Rows * (width / 32U) * 4U; }
 
 template <unsigned Outs> struct Q8Fetch {
     std::uint64_t codes[Outs];
@@ -791,91 +788,318 @@ __global__ __launch_bounds__(32U * Waves) void project_wide_rows_vopd_bf16_kerne
     });
 }
 
-struct PlainTree { __device__ static float add(float lower, float upper) { return lower + upper; } };
+// Dense A8 (numerical profile dense-a8-v1): Q8_0 weights x per-32 int8 activations.
+//
+// Quantizer, row r, block b (x = the BF16/FP32 activations as FP32):
+//   any x non-finite      -> delta = NaN (0x7fc00000), codes 0
+//   amax = max |x|; tiny = 0 < amax < 2^-119
+//   delta = amax == 0 || tiny ? 1 : amax / 127          (IEEE division, round to nearest even)
+//   code  = tiny ? 0 : clamp(rint(x / delta), -127, 127)
+// Projection, row r, output n, blocks in ascending order:
+//   acc = +0
+//   acc = fma(float(d_w[n][b]) * delta[r][b], float(sum_k q_w[n][b][k] * code[r][b][k]), acc)
+//   y   = isnan(acc) ? 0x7fc00000 : acc, then the site's store
+// The int32 block dot is exact in any order (|sum| < 2^20, so its float is exact); the FP32
+// product, the FMA and the ascending block chain are the contract. Every form below runs
+// that chain, so a row gets the same bits from R1 decode, a 2..8-row window (dot4 form)
+// and a 16/32/64-row prompt window (iu8 WMMA form).
+//
+// One quantizer launch per projection launch writes the rows' codes (int8 [row][feature])
+// and deltas (FP32 [block * kDenseA8Rows + row]) into a scratch slot of the site's family.
+// The site's coefficient/fma/add are not used; its store receives y.
+constexpr std::uint32_t kDenseA8Rows = 64U, kDenseA8MaxWidth = 8192U, kDenseA8Families = 4U;
+constexpr std::uint64_t kDenseA8CodeBytes = std::uint64_t{kDenseA8Rows} * kDenseA8MaxWidth;
+constexpr std::uint64_t kDenseA8SlotBytes = kDenseA8CodeBytes + std::uint64_t{kDenseA8MaxWidth / 32U} * kDenseA8Rows * 4U;
+constexpr std::uint32_t kDenseA8CanonicalNan = 0x7fc00000U;
+// Widths the dense A8 forms accept: whole 64-feature block pairs (dword-aligned Q8 rows).
+constexpr bool dense_a8_width(std::uint64_t width) { return width && width % 64U == 0U && width <= kDenseA8MaxWidth; }
 
-// Opt-in A8: per-row, per-32 block int8 activations with scale amax/127 (round to
-// nearest even, clamped to +-127; non-finite values quantise to zero). One
-// thread quantises one block into LDS; each lane then owns whole Q8 blocks.
-template <unsigned Outs> struct A8Fetch {
-    int codes[Outs][8];
-    float scale[Outs];
+struct DenseA8Slot { std::int8_t* codes; float* deltas; };
+inline unsigned char* dense_a8_pool() {
+    static unsigned char* const pool = [] {
+        void* p = nullptr;
+        if (hipMalloc(&p, kDenseA8SlotBytes * 2U * kDenseA8Families) != hipSuccess)
+            throw std::runtime_error("q8_rows: dense A8 scratch allocation failed");
+        return static_cast<unsigned char*>(p);
+    }();
+    return pool;
+}
+// Allocates the scratch before any launch (e.g. ahead of stream capture).
+inline void dense_a8_reserve() { static_cast<void>(dense_a8_pool()); }
+// Two slots per family, alternating per launch: projections are barrier-ordered, so a
+// quantizer launched any-order overlaps at most the projection of the other slot.
+inline DenseA8Slot dense_a8_slot(unsigned family) {
+    static std::atomic<unsigned> turn[kDenseA8Families]{};
+    family %= kDenseA8Families;
+    const unsigned slot = family * 2U + (turn[family].fetch_add(1U, std::memory_order_relaxed) & 1U);
+    auto* base = dense_a8_pool() + slot * kDenseA8SlotBytes;
+    return {reinterpret_cast<std::int8_t*>(base), reinterpret_cast<float*>(base + kDenseA8CodeBytes)};
+}
+template <class Site> constexpr unsigned a8_family_of() {
+    if constexpr (requires { Site::a8_family; }) return Site::a8_family; else return 0U;
+}
+
+__device__ __forceinline__ float dense_a8_canonical(float v) { return v != v ? __uint_as_float(kDenseA8CanonicalNan) : v; }
+template <unsigned D> __device__ __forceinline__ int lane_xor_int(int v) {
+    return __builtin_amdgcn_mov_dpp(v, 0x160 | static_cast<int>(D), 0xf, 0xf, false);
+}
+
+// One block's quarter (8 features; the block's four lanes form one DPP quad): codes packed
+// little-endian into two words, and the block's delta.
+__device__ __forceinline__ void dense_a8_quantize8(const float (&x)[8], unsigned (&word)[2], float& delta) {
+#pragma clang fp contract(off)
+    int bad = 0;
+    float amax = 0.0F;
+#pragma unroll
+    for (unsigned l = 0; l < 8U; ++l) { bad |= !isfinite(x[l]); amax = fmaxf(amax, fabsf(x[l])); }
+    bad |= lane_xor_int<1U>(bad); bad |= lane_xor_int<2U>(bad);
+    amax = fmaxf(amax, lane_xor<1U>(amax)); amax = fmaxf(amax, lane_xor<2U>(amax));
+    const bool tiny = amax > 0.0F && amax < 0x1p-119F;
+    delta = bad ? __uint_as_float(kDenseA8CanonicalNan) : amax == 0.0F || tiny ? 1.0F : __fdiv_rn(amax, 127.0F);
+    word[0] = word[1] = 0U;
+#pragma unroll
+    for (unsigned l = 0; l < 8U; ++l) {
+        const float rounded = bad || tiny ? 0.0F : rintf(__fdiv_rn(x[l], delta));
+        const int code = static_cast<int>(fminf(127.0F, fmaxf(-127.0F, rounded)));
+        word[l / 4U] |= (static_cast<unsigned>(code) & 0xffU) << (8U * (l % 4U));
+    }
+}
+// Four threads per block, 8 features each; rows * width / 8 is a multiple of four, so the
+// grid tail drops whole quads.
+template <class Site>
+__global__ __launch_bounds__(kThreads) void dense_a8_quantize_kernel(Site site, std::int8_t* codes, float* deltas) {
+    const std::uint32_t width = site.width, groups = width / 8U;
+    const std::uint32_t item = blockIdx.x * kThreads + threadIdx.x;
+    if (item >= Site::rows * groups) return;
+    const unsigned r = item / groups;
+    const std::uint32_t g = item % groups;
+    float x[8];
+    load8(row_input(site, r) + 8U * g, x);
+    unsigned word[2];
+    float delta;
+    dense_a8_quantize8(x, word, delta);
+    *reinterpret_cast<uint2*>(codes + static_cast<std::uint64_t>(r) * width + 8U * g) = make_uint2(word[0], word[1]);
+    if (!(g & 3U)) deltas[(g / 4U) * kDenseA8Rows + r] = delta;
+}
+
+struct __attribute__((aligned(4))) DenseA8Dword4 { unsigned x, y, z, w; };
+// Nine dwords from the block's dword-aligned start: an even block starts at its scale and
+// its codes sit two bytes in; an odd block starts two bytes before its scale (the previous
+// block's last codes) and its codes are dwords 1..8. Q8 rows hold an even block count, so
+// neither reads outside the row.
+template <unsigned Outs> struct DenseA8Weights {
+    unsigned d[Outs][9];
     __device__ __forceinline__ void load(const unsigned char* const (&w)[Outs], std::uint32_t b) {
 #pragma unroll
         for (unsigned o = 0; o < Outs; ++o) {
-            const unsigned char* block = w[o] + b * 34U;
-            scale[o] = __half2float(__ushort_as_half(*reinterpret_cast<const std::uint16_t*>(block)));
-            std::memcpy(codes[o], block + 2U, 32U);
+            const unsigned char* p = w[o] + (34U * b & ~3U);
+            const auto lo = reinterpret_cast<const DenseA8Dword4*>(p)[0], hi = reinterpret_cast<const DenseA8Dword4*>(p)[1];
+            d[o][0] = lo.x; d[o][1] = lo.y; d[o][2] = lo.z; d[o][3] = lo.w;
+            d[o][4] = hi.x; d[o][5] = hi.y; d[o][6] = hi.z; d[o][7] = hi.w;
+            d[o][8] = reinterpret_cast<const unsigned*>(p)[8];
         }
     }
 };
-template <class Site, unsigned Outs>
-__global__ __launch_bounds__(kA8Threads) void project_rows_a8_kernel(Site site) {
-    using Input = typename Site::Input;
-    constexpr unsigned Rows = Site::rows, Pairs = Outs * Rows, N = pow2u(Pairs);
-    const unsigned lane = threadIdx.x & 31U;
-    const std::uint32_t width = site.width, blocks = width / 32U, groups = (site.outputs + Outs - 1U) / Outs;
-    auto* codes = reinterpret_cast<std::int8_t*>(q8_rows_lds);
-    auto* scales = reinterpret_cast<float*>(q8_rows_lds + Rows * width);
-    for (std::uint32_t q = threadIdx.x; q < Rows * blocks; q += kA8Threads) {
-        const Input* source = static_cast<const Input*>(site.input[q / blocks]) + (q % blocks) * 32U;
-        float x[4][8];
-        float amax = 0.0F;
-#pragma unroll
-        for (unsigned i = 0; i < 4U; ++i) {
-            load8(source + 8U * i, x[i]);
-#pragma unroll
-            for (unsigned l = 0; l < 8U; ++l) {
-                if (!isfinite(x[i][l])) x[i][l] = 0.0F;
-                amax = fmaxf(amax, fabsf(x[i][l]));
-            }
-        }
-        const float inverse = amax > 0.0F ? 127.0F / amax : 0.0F;
-        int packed[8];
-#pragma unroll
-        for (unsigned k = 0; k < 8U; ++k) {
-            unsigned word = 0;
-#pragma unroll
-            for (unsigned j = 0; j < 4U; ++j) {
-                const auto code = static_cast<int>(rintf(fminf(127.0F, fmaxf(-127.0F, x[k / 2U][(k % 2U) * 4U + j] * inverse))));
-                word |= (static_cast<unsigned>(code) & 0xffU) << (8U * j);
-            }
-            packed[k] = static_cast<int>(word);
-        }
-        auto* target = reinterpret_cast<int4*>(codes + q * 32U);
-        target[0] = int4{packed[0], packed[1], packed[2], packed[3]};
-        target[1] = int4{packed[4], packed[5], packed[6], packed[7]};
-        scales[q] = amax / 127.0F;
-    }
-    __syncthreads();
-    for (std::uint32_t g = blockIdx.x * kA8Waves + threadIdx.x / 32U; g < groups; g += gridDim.x * kA8Waves) {
+// Program order of one wave's LDS accesses (the chain slots are wave-private).
+__device__ __forceinline__ void wave_lds_order() {
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
+    __builtin_amdgcn_wave_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
+}
+
+// 1..8 rows (R1 decode included). A wave owns Outs outputs at a time; lane l takes block
+// 32s + l of every 32-block superchunk s (whole blocks: eight dot4 per row, no lane
+// reduction) and writes (d_w * delta, float(dot)) of each (output, row) pair to its wave's
+// LDS slots; lane p < Pairs then runs pair p's chain over the superchunk's blocks in
+// ascending order. Weights stream two superchunks ahead through the wave's whole sequence
+// of (output group, superchunk) steps.
+//
+// Staged (small rows x width): a persistent grid; each block quantizes the rows into LDS
+// once (codes [row][feature], deltas [block * Rows + row]) and its waves loop over output
+// groups. Otherwise the rows come pre-quantized from the scratch slot (one group per wave).
+template <class Site> constexpr unsigned dense_a8_outs_of() {
+    if constexpr (requires { Site::dense_a8_outs; }) return Site::dense_a8_outs;
+    else return Site::rows <= 2U ? 1U : 2U;
+}
+template <unsigned Rows> constexpr std::uint64_t dense_a8_stage_bytes(std::uint64_t width) { return Rows * width + Rows * (width / 32U) * 4U; }
+template <class Site, unsigned Outs, bool Staged>
+__global__ __launch_bounds__(kThreads) void project_rows_dense_a8_kernel(Site site, const std::int8_t* codes, const float* deltas) {
+#pragma clang fp contract(off)
+    constexpr unsigned Rows = Site::rows, Pairs = Outs * Rows, Depth = 2U;
+    static_assert(Rows <= 8U && Pairs <= 16U);
+    __shared__ float2 chain[kWaves][Pairs][33];
+    const unsigned lane = threadIdx.x & 31U, wave = threadIdx.x / 32U;
+    const std::uint32_t width = site.width, blocks = width / 32U, supers = (blocks + 31U) / 32U;
+    const std::uint32_t groups = (site.outputs + Outs - 1U) / Outs, first = blockIdx.x * kWaves + wave;
+    const std::uint32_t step = Staged ? gridDim.x * kWaves : groups;
+    const std::uint32_t steps = first < groups ? (groups - first + step - 1U) / step * supers : 0U;
+    // Block 32s + l has the parity of l: byte selectors and scale half of the nine dwords.
+    const unsigned odd = lane & 1U, select = odd ? 0x07060504U : 0x05040302U, shift = odd ? 16U : 0U;
+    // Lanes past the last block repeat it; the chain never reads their slots.
+    const auto fetch = [&](std::uint32_t t, DenseA8Weights<Outs>& into) {
         const unsigned char* w[Outs];
-        group_rows(site.segments, g, site.outputs, width, w);
-        float v[N]{};
-        A8Fetch<Outs> next;
-        if (lane < blocks) next.load(w, lane);
-        for (std::uint32_t b = lane; b < blocks; b += 32U) {
-            const A8Fetch<Outs> current = next;
-            if (b + 32U < blocks) next.load(w, b + 32U);
+        group_rows(site.segments, first + t / supers * step, site.outputs, width, w);
+        into.load(w, std::min<std::uint32_t>(32U * (t % supers) + lane, blocks - 1U));
+    };
+    DenseA8Weights<Outs> next[Depth];
+#pragma unroll
+    for (unsigned d = 0; d < Depth; ++d) if (d < steps) fetch(d, next[d]);
+    auto* stage = reinterpret_cast<std::int8_t*>(q8_rows_lds);
+    auto* stage_delta = reinterpret_cast<float*>(q8_rows_lds + Rows * width);
+    if constexpr (Staged) {
+        for (std::uint32_t item = threadIdx.x; item < Rows * (width / 8U); item += kThreads) {
+            const unsigned r = item / (width / 8U);
+            const std::uint32_t g = item % (width / 8U);
+            float x[8];
+            load8(row_input(site, r) + 8U * g, x);
+            unsigned word[2];
+            float delta;
+            dense_a8_quantize8(x, word, delta);
+            *reinterpret_cast<uint2*>(stage + r * width + 8U * g) = make_uint2(word[0], word[1]);
+            if (!(g & 3U)) stage_delta[(g / 4U) * Rows + r] = delta;
+        }
+        __syncthreads();
+    }
+    float acc = 0.0F;
+    std::uint32_t s = 0, g = first;
+    for (std::uint32_t t = 0; t < steps; ++t) {
+        const std::uint32_t b = min(32U * s + lane, blocks - 1U);
+        int4 x[Rows][2];
+        float delta[Rows];
+#pragma unroll
+        for (unsigned r = 0; r < Rows; ++r) {
+            const auto* a = reinterpret_cast<const int4*>((Staged ? stage : codes) + static_cast<std::uint64_t>(r) * width + 32U * b);
+            x[r][0] = a[0]; x[r][1] = a[1];
+            delta[r] = Staged ? stage_delta[b * Rows + r] : deltas[b * kDenseA8Rows + r];
+        }
+        const auto current = next[0];
+#pragma unroll
+        for (unsigned d = 1; d < Depth; ++d) next[d - 1U] = next[d];
+        if (t + Depth < steps) fetch(t + Depth, next[Depth - 1U]);
+        wave_lds_order();
+#pragma unroll
+        for (unsigned o = 0; o < Outs; ++o) {
+            int q[8];
+#pragma unroll
+            for (unsigned k = 0; k < 8U; ++k) q[k] = static_cast<int>(__builtin_amdgcn_perm(current.d[o][k + 1U], current.d[o][k], select));
+            const float dw = __half2float(__ushort_as_half(static_cast<unsigned short>((current.d[o][0] >> shift) & 0xffffU)));
 #pragma unroll
             for (unsigned r = 0; r < Rows; ++r) {
-                const auto* a = reinterpret_cast<const int4*>(codes + (r * blocks + b) * 32U);
-                const int4 a0 = a[0], a1 = a[1];
-                const int av[8]{a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
-                const float s = scales[r * blocks + b];
+                const int a[8]{x[r][0].x, x[r][0].y, x[r][0].z, x[r][0].w, x[r][1].x, x[r][1].y, x[r][1].z, x[r][1].w};
+                int dot = 0;
 #pragma unroll
-                for (unsigned o = 0; o < Outs; ++o) {
-                    int dot = 0;
-#pragma unroll
-                    for (unsigned k = 0; k < 8U; ++k) dot = __builtin_amdgcn_sudot4(true, current.codes[o][k], true, av[k], dot, false);
-                    v[o * Rows + r] = fmaf(current.scale[o] * s, static_cast<float>(dot), v[o * Rows + r]);
-                }
+                for (unsigned k = 0; k < 8U; ++k) dot = __builtin_amdgcn_sudot4(true, a[k], true, q[k], dot, false);
+                chain[wave][o * Rows + r][lane] = make_float2(dw * delta[r], static_cast<float>(dot));
             }
         }
-        reduce<PlainTree, N, 1U>(v, lane);
-        store_pairs<N>(v[0], lane, [&](unsigned pair, float value) {
-            if (pair < Pairs && g * Outs + pair / Rows < site.outputs) site.store(g * Outs + pair / Rows, pair % Rows, value);
-        });
+        wave_lds_order();
+        if (lane < Pairs) {
+            const std::uint32_t count = min(32U, blocks - 32U * s);
+#pragma unroll
+            for (unsigned j = 0; j < 32U; ++j)
+                if (j < count) { const float2 c = chain[wave][lane][j]; acc = __builtin_fmaf(c.x, c.y, acc); }
+        }
+        if (++s == supers) {
+            if (lane < Pairs) {
+                const std::uint32_t out = g * Outs + lane / Rows;
+                if (out < site.outputs) site.store(out, lane % Rows, dense_a8_canonical(acc));
+            }
+            acc = 0.0F; s = 0; g += step;
+        }
     }
+}
+
+// 16/32/64 rows. A wave owns TM x TN 16x16 tiles (rows x outputs); the 4 waves of a block
+// share the row tiles and consecutive blocks share the output tiles. Per Q8_0 block pair
+// (68 bytes, dword aligned) each lane loads 17 dwords of its output row; the even block's
+// codes are realigned by two bytes, the odd block's are aligned. Per block: two
+// v_wmma_i32_16x16x16_iu8 (K = 16 + 16) on a zero accumulator, then the chain step per D
+// element. Layouts (wave32): A lane i%16 = row i, B lane i%16 = output i, D element e of
+// lane l = (row 2e + l/16, output l%16); the upper half wave repeats A/B.
+typedef int dense_a8_v4i __attribute__((ext_vector_type(4)));
+typedef int dense_a8_v8i __attribute__((ext_vector_type(8)));
+template <class Site, unsigned TM, unsigned TN>
+__global__ __launch_bounds__(128) void project_rows_dense_a8_wmma_kernel(Site site, const std::int8_t* codes, const float* deltas) {
+#pragma clang fp contract(off)
+    constexpr unsigned Rows = Site::rows;
+    static_assert(Rows % (16U * TM) == 0U && Rows <= kDenseA8Rows);
+    const unsigned lane = threadIdx.x & 31U, wave = threadIdx.x / 32U, i = lane & 15U, h = lane >> 4U;
+    constexpr std::uint32_t row_tiles = Rows / (16U * TM);
+    const std::uint32_t width = site.width, outputs = site.outputs, pairs = width / 64U;
+    const std::uint32_t m0 = blockIdx.x % row_tiles * 16U * TM, n0 = (blockIdx.x / row_tiles * 4U + wave) * 16U * TN;
+    if (n0 >= outputs) return;
+    const unsigned char* w[TN];
+#pragma unroll
+    for (unsigned t = 0; t < TN; ++t) {
+        unsigned m; std::uint32_t row;
+        w[t] = segment_row(site.segments, min(n0 + 16U * t + i, outputs - 1U), width, m, row);
+    }
+    const std::int8_t* a[TM];
+#pragma unroll
+    for (unsigned t = 0; t < TM; ++t) a[t] = codes + static_cast<std::uint64_t>(m0 + 16U * t + i) * width;
+    // Epilogue rows of this lane: m0 + 16 t + 2 e + h, immediate offsets of one delta index.
+    const std::uint32_t erow = m0 + h;
+    float acc[TM][TN][8];
+#pragma unroll
+    for (unsigned t = 0; t < TM; ++t)
+#pragma unroll
+        for (unsigned u = 0; u < TN; ++u)
+#pragma unroll
+            for (unsigned e = 0; e < 8U; ++e) acc[t][u][e] = 0.0F;
+    const dense_a8_v8i zero{};
+    for (std::uint32_t p = 0; p < pairs; ++p) {
+        dense_a8_v4i wb[2][TN][2];
+        float dw[2][TN];
+#pragma unroll
+        for (unsigned u = 0; u < TN; ++u) {
+            const auto* q4 = reinterpret_cast<const DenseA8Dword4*>(w[u] + 68U * p);
+            const DenseA8Dword4 c0 = q4[0], c1 = q4[1], c2 = q4[2], c3 = q4[3];
+            const unsigned last = reinterpret_cast<const unsigned*>(w[u] + 68U * p)[16];
+            const unsigned q[17]{c0.x, c0.y, c0.z, c0.w, c1.x, c1.y, c1.z, c1.w, c2.x, c2.y, c2.z, c2.w, c3.x, c3.y, c3.z, c3.w, last};
+            dw[0][u] = __half2float(__ushort_as_half(static_cast<unsigned short>(q[0] & 0xffffU)));
+            dw[1][u] = __half2float(__ushort_as_half(static_cast<unsigned short>(q[8] >> 16U)));
+#pragma unroll
+            for (unsigned k = 0; k < 4U; ++k) {
+                wb[0][u][0][k] = static_cast<int>(__builtin_amdgcn_alignbyte(q[k + 1U], q[k], 2U));
+                wb[0][u][1][k] = static_cast<int>(__builtin_amdgcn_alignbyte(q[k + 5U], q[k + 4U], 2U));
+                wb[1][u][0][k] = static_cast<int>(q[9U + k]);
+                wb[1][u][1][k] = static_cast<int>(q[13U + k]);
+            }
+        }
+        dense_a8_v4i ab[2][TM][2];
+#pragma unroll
+        for (unsigned t = 0; t < TM; ++t) {
+            const auto* x = reinterpret_cast<const dense_a8_v4i*>(a[t] + 64U * p);
+            ab[0][t][0] = x[0]; ab[0][t][1] = x[1]; ab[1][t][0] = x[2]; ab[1][t][1] = x[3];
+        }
+#pragma unroll
+        for (unsigned s = 0; s < 2U; ++s) {
+            const float* d = deltas + ((2U * p + s) * kDenseA8Rows + erow);
+            float da[TM][8];
+#pragma unroll
+            for (unsigned t = 0; t < TM; ++t)
+#pragma unroll
+                for (unsigned e = 0; e < 8U; ++e) da[t][e] = d[16U * t + 2U * e];
+#pragma unroll
+            for (unsigned t = 0; t < TM; ++t)
+#pragma unroll
+                for (unsigned u = 0; u < TN; ++u) {
+                    dense_a8_v8i c = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, ab[s][t][0], true, wb[s][u][0], zero, false);
+                    c = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, ab[s][t][1], true, wb[s][u][1], c, false);
+#pragma unroll
+                    for (unsigned e = 0; e < 8U; ++e) acc[t][u][e] = __builtin_fmaf(dw[s][u] * da[t][e], static_cast<float>(c[e]), acc[t][u][e]);
+                }
+        }
+    }
+#pragma unroll
+    for (unsigned t = 0; t < TM; ++t)
+#pragma unroll
+        for (unsigned u = 0; u < TN; ++u) {
+            const std::uint32_t n = n0 + 16U * u + i;
+            if (n < outputs)
+#pragma unroll
+                for (unsigned e = 0; e < 8U; ++e) site.store(n, m0 + 16U * t + 2U * e + h, dense_a8_canonical(acc[t][u][e]));
+        }
 }
 
 // Persistent grids never exceed the blocks that are resident at once.
@@ -905,11 +1129,77 @@ inline unsigned wide_kernel() { static const unsigned kernel = env_unsigned("STR
 inline bool wide_stage() { static const bool stage = env_unsigned("STRIX_Q8_ROWS_WIDE_STAGE", 0U) == 1U; return stage; }
 inline unsigned narrow_vopd() { static const unsigned vopd = env_unsigned("STRIX_Q8_ROWS_VOPD", 1U); return vopd; }
 inline unsigned narrow_fp32_min_width() { static const unsigned w = env_unsigned("STRIX_Q8_ROWS_VOPD_FP32_MIN", 1024U); return w; }
-// The caller validated width % 32 == 0, 16-byte aligned rows and, for A8,
-// a8_bytes<rows>(width) <= kLdsBytes. any_order drops the packet's barrier bit: the
-// caller guarantees the projection neither reads nor writes what the previously
-// queued kernel touches, so it may start while that kernel still runs.
+// STRIX_DENSE_A8_STAGE=0 never stages the rows in LDS, =2 stages every rows <= 8 launch
+// that fits (tuning); the default stages rows <= 2 up to kDenseA8StageBytes.
+inline unsigned dense_a8_stage_mode() {
+    static const unsigned mode = [] { const char* v = std::getenv("STRIX_DENSE_A8_STAGE"); return v ? static_cast<unsigned>(std::atoi(v)) : 1U; }();
+    return mode;
+}
+constexpr std::uint64_t kDenseA8StageBytes = 24U * 1024U;
+// Dense A8. Rows <= 8 whose activations fit LDS: one persistent launch that quantizes them
+// per block. Otherwise one quantizer launch into the family's scratch slot (any-order when
+// the caller allows it; it writes only the slot no queued projection reads) and one
+// barrier-ordered projection launch (dot4 rows <= 8, WMMA 16/32/64).
+template <class Site> void launch_dense_a8(const Site& site, hipStream_t stream, bool any_order) {
+    static_assert(Site::rows <= 8U || (Site::rows % 16U == 0U && Site::rows <= kDenseA8Rows));
+    if (!dense_a8_width(site.width))
+        throw std::invalid_argument("q8_rows: dense A8 requires a width that is a positive multiple of 64, at most 8192");
+    for (unsigned m = 0; m < site.segments.count; ++m)
+        if (reinterpret_cast<std::uintptr_t>(site.segments.weights[m]) % 4U)
+            throw std::invalid_argument("q8_rows: dense A8 requires dword-aligned Q8 weights");
+    const auto run = [&](auto kernel, unsigned blocks, unsigned threads, std::uint32_t bytes, bool unordered, const std::int8_t* codes,
+                         const float* deltas) {
+        if (unordered)
+            hipExtLaunchKernelGGL(kernel, dim3(blocks), dim3(threads), bytes, stream, nullptr, nullptr, hipExtAnyOrderLaunch, site,
+                codes, deltas);
+        else hipLaunchKernelGGL(kernel, dim3(blocks), dim3(threads), bytes, stream, site, codes, deltas);
+    };
+    if constexpr (Site::rows <= 8U) {
+        constexpr unsigned Outs = dense_a8_outs_of<Site>();
+        const unsigned groups = (site.outputs + Outs - 1U) / Outs;
+        const auto stage = dense_a8_stage_bytes<Site::rows>(site.width);
+        const auto chain = static_cast<std::uint64_t>(kWaves) * Outs * Site::rows * 33U * 8U;
+        const unsigned mode = dense_a8_stage_mode();
+        if (mode && stage + chain <= (mode == 2U ? kLdsBytes : kDenseA8StageBytes) && (mode == 2U || Site::rows <= 2U)) {
+            constexpr auto kernel = project_rows_dense_a8_kernel<Site, Outs, true>;
+            const auto bytes = static_cast<std::uint32_t>(stage);
+            run(kernel, std::min((groups + kWaves - 1U) / kWaves, resident_blocks<kernel, kThreads>(bytes)), kThreads, bytes, any_order,
+                nullptr, nullptr);
+            return;
+        }
+    }
+    const auto slot = dense_a8_slot(a8_family_of<Site>());
+    const auto items = Site::rows * (site.width / 8U);
+    const auto quantizer_blocks = dim3((items + kThreads - 1U) / kThreads);
+    if (any_order)
+        hipExtLaunchKernelGGL(dense_a8_quantize_kernel<Site>, quantizer_blocks, dim3(kThreads), 0, stream, nullptr, nullptr,
+            hipExtAnyOrderLaunch, site, slot.codes, slot.deltas);
+    else hipLaunchKernelGGL(dense_a8_quantize_kernel<Site>, quantizer_blocks, dim3(kThreads), 0, stream, site, slot.codes, slot.deltas);
+    if constexpr (Site::rows <= 8U) {
+        constexpr unsigned Outs = dense_a8_outs_of<Site>();
+        const unsigned groups = (site.outputs + Outs - 1U) / Outs;
+        run(project_rows_dense_a8_kernel<Site, Outs, false>, (groups + kWaves - 1U) / kWaves, kThreads, 0U, false, slot.codes, slot.deltas);
+    } else {
+        // Tiles measured on gfx1151: 4 row tiles for the wide input projections, 1 x 2 for the
+        // 2560-output ones, 1 x 1 for the 640-wide shared down.
+        const auto tiled = [&]<unsigned TM, unsigned TN>() {
+            constexpr unsigned row_tiles = Site::rows / (16U * TM);
+            run(project_rows_dense_a8_wmma_kernel<Site, TM, TN>, row_tiles * ((site.outputs + 64U * TN - 1U) / (64U * TN)), 128U, 0U,
+                false, slot.codes, slot.deltas);
+        };
+        constexpr unsigned TM = Site::rows >= 64U ? 4U : Site::rows / 16U;
+        if (site.outputs >= 8192U) tiled.template operator()<TM, 2U>();
+        else if (site.width > 640U) tiled.template operator()<1U, 2U>();
+        else tiled.template operator()<1U, 1U>();
+    }
+}
+
+// The caller validated width % 32 == 0 and 16-byte aligned rows. any_order drops the
+// packet's barrier bit: the caller guarantees the projection neither reads nor writes what
+// the previously queued kernel touches, so it may start while that kernel still runs.
+// a8 selects the dense A8 profile arithmetic (launch_dense_a8).
 template <class Site> void launch(const Site& site, bool a8, hipStream_t stream, bool any_order = false) {
+    if (a8) { launch_dense_a8(site, stream, any_order); return; }
     const auto start = [&](auto kernel, unsigned blocks, unsigned threads, std::uint32_t bytes) {
         if (any_order)
             hipExtLaunchKernelGGL(kernel, dim3(blocks), dim3(threads), bytes, stream, nullptr, nullptr, hipExtAnyOrderLaunch, site);
@@ -940,7 +1230,6 @@ template <class Site> void launch(const Site& site, bool a8, hipStream_t stream,
         }
     }
     if constexpr (Site::rows > 8U) {
-        if (a8) throw std::invalid_argument("q8_rows: the A8 path supports at most 8 rows");
         // Default: the VOPD kernels (4 outputs x 4 rows per wave, 4-wave blocks). FP32 inputs
         // narrower than 4 chunks (shared down, 640) keep the per-wave kernel, which is faster there.
         if constexpr (fused_fma_of<Site>() && Site::rows % 16U == 0U) {
@@ -977,13 +1266,6 @@ template <class Site> void launch(const Site& site, bool a8, hipStream_t stream,
         case 16U: wide.template operator()<16U>(); break;
         default: wide.template operator()<wide_sub_of<Site>()>(); break;
         }
-        return;
-    } else if (a8) {
-        constexpr unsigned Outs = a8_outs_of<Site>();
-        constexpr auto kernel = project_rows_a8_kernel<Site, Outs>;
-        const auto bytes = static_cast<std::uint32_t>(a8_bytes<Site::rows>(site.width));
-        const auto blocks = std::min(groups_for(Outs, kA8Waves), resident_blocks<kernel, kA8Threads>(bytes));
-        start(kernel, blocks, kA8Threads, bytes);
     } else if (const auto bytes = staged_bytes(site)) {
         constexpr unsigned Outs = outs_of<Site, true>();
         constexpr auto kernel = project_rows_kernel<Site, Outs, true>;
