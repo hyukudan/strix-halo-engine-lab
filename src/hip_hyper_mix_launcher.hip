@@ -1565,6 +1565,25 @@ __global__ void q8_batched_hyper_output_kernel(
             hidden, streams, lowrank, output, values, coefficients);
 }
 
+// Wave-strided 16-byte copy of a weight tile (bytes % 16 == 0) into LDS. A load-then-store loop keeps one
+// load in flight per lane, which leaves these few-block kernels latency bound. Here Depth loads are issued
+// before their stores, all unconditionally: an offset past the tile is clamped to its last 16 bytes, so it
+// re-reads and re-writes the same data (a guarded store would let the compiler sink its load behind the branch).
+// Same bytes, same LDS image.
+template<unsigned Depth=8U>
+__device__ __forceinline__ void stage_tile16(unsigned char* __restrict__ stage,const unsigned char* __restrict__ source,std::uint64_t bytes,unsigned lane){
+    for(std::uint64_t base=static_cast<std::uint64_t>(lane)*16U;base<bytes;base+=512ULL*Depth){
+        uint4 v[Depth];
+#pragma unroll
+        for(unsigned d=0;d<Depth;++d)
+            v[d]=*reinterpret_cast<const uint4*>(source+std::min<std::uint64_t>(base+512ULL*d,bytes-16U));
+        // Keep the scheduler from interleaving each store right behind its load (it reuses one register quad).
+        __builtin_amdgcn_sched_barrier(0);
+#pragma unroll
+        for(unsigned d=0;d<Depth;++d) *reinterpret_cast<uint4*>(stage+std::min<std::uint64_t>(base+512ULL*d,bytes-16U))=v[d];
+    }
+}
+
 // Exact output chains: one wave per stream and one lane per output feature.
 // Row tiles occupy 34*rank bytes; rank%32 makes every wave tile 16-aligned.
 template <typename Storage>
@@ -1576,8 +1595,7 @@ __global__ void lane_chain_hyper_output_kernel(const float* normalized,const flo
     const std::uint64_t tile_bytes=34ULL*rank,row_bytes=static_cast<std::uint64_t>(rank/32U)*34U;
     auto* stage=staging+stream*tile_bytes;
     const auto* source=static_cast<const unsigned char*>(up)+(static_cast<std::uint64_t>(stream)*hidden+first)*row_bytes;
-    for(std::uint64_t offset=static_cast<std::uint64_t>(lane)*16U;offset<tile_bytes;offset+=512U)
-        *reinterpret_cast<uint4*>(stage+offset)=*reinterpret_cast<const uint4*>(source+offset);
+    stage_tile16(stage,source,tile_bytes,lane);
     __syncthreads();
     float gate=0.0F;
     for(std::uint32_t block=0;block<rank/32U;++block){
@@ -1609,8 +1627,7 @@ __global__ void deferred_lane_chain_hyper_output_kernel(const Storage* raw,const
     const std::uint64_t tile_bytes=34ULL*rank,row_bytes=static_cast<std::uint64_t>(rank/32U)*34U;
     auto* stage=staging+stream*tile_bytes;
     const auto* source=static_cast<const unsigned char*>(up)+(static_cast<std::uint64_t>(stream)*hidden+first)*row_bytes;
-    for(std::uint64_t offset=static_cast<std::uint64_t>(lane)*16U;offset<tile_bytes;offset+=512U)
-        *reinterpret_cast<uint4*>(stage+offset)=*reinterpret_cast<const uint4*>(source+offset);
+    stage_tile16(stage,source,tile_bytes,lane);
     __syncthreads();
     float gate=0.0F;
     for(std::uint32_t block=0;block<rank/32U;++block){
@@ -1986,8 +2003,7 @@ __global__ void rows_lane_chain_hyper_output_kernel(HyperRows rows, std::uint32_
     const std::uint64_t tile_bytes=34ULL*rank,row_bytes=static_cast<std::uint64_t>(rank/32U)*34U;
     auto* stage=staging+stream*tile_bytes;
     const auto* source=static_cast<const unsigned char*>(up)+(static_cast<std::uint64_t>(stream)*hidden+first)*row_bytes;
-    for(std::uint64_t offset=static_cast<std::uint64_t>(lane)*16U;offset<tile_bytes;offset+=512U)
-        *reinterpret_cast<uint4*>(stage+offset)=*reinterpret_cast<const uint4*>(source+offset);
+    stage_tile16(stage,source,tile_bytes,lane);
     __syncthreads();
     auto* sig=reinterpret_cast<float*>(staging+static_cast<std::uint64_t>(streams)*tile_bytes);
     if constexpr (Count != 0U) {
