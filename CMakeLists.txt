@@ -1867,6 +1867,15 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         strix_target_warnings(strix-hip-q8-rows-projection-tests)
         add_test(NAME strix-hip-q8-rows-projection-tests COMMAND strix-hip-q8-rows-projection-tests)
 
+        # Dense A8 profile prototypes: dot4 decode form vs iu8 WMMA prefill form (header-only, standalone).
+        add_executable(strix-hip-dense-a8-wmma-tests tests/hip_dense_a8_wmma_tests.hip)
+        set_target_properties(strix-hip-dense-a8-wmma-tests PROPERTIES
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+        target_compile_options(strix-hip-dense-a8-wmma-tests PRIVATE
+            -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
+        strix_target_warnings(strix-hip-dense-a8-wmma-tests)
+        add_test(NAME strix-hip-dense-a8-wmma-tests COMMAND strix-hip-dense-a8-wmma-tests)
+
         if(STRIX_ENABLE_EXPERIMENTAL_Q4K_A8_RUNTIME)
             add_executable(strix-hip-moe-q4k-a8-known-rows-tests tests/hip_moe_q4k_a8_known_rows_tests.hip)
             set_target_properties(strix-hip-moe-q4k-a8-known-rows-tests PROPERTIES
