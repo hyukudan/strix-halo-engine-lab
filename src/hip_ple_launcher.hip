@@ -21,6 +21,7 @@
 #include <optional>
 #include <span>
 #include <stdexcept>
+#include <type_traits>
 #include <vector>
 #include <string>
 #include <string_view>
@@ -480,6 +481,53 @@ __global__ __launch_bounds__(256) void project_wave8_q8_bf16_to_fp32_kernel(
         partial[0] += partial[2]; partial[1] += partial[3];
         partial[0] += partial[1];
         output[row] = partial[0];
+    }
+}
+
+// project_wave8_q8_bf16_to_fp32_kernel for Rows inputs at once: each Q8 block is decoded once and
+// applied to every row with that row's own leaf accumulation and tree (bit-identical per row).
+template <unsigned Rows>
+__global__ __launch_bounds__(256) void project_wave8_q8_bf16_to_fp32_rows_kernel(
+    const std::uint16_t* input, std::uint32_t input_stride, const void* weights,
+    std::uint32_t input_width, std::uint32_t output_width, float* output, std::uint32_t output_stride) {
+    const auto row = static_cast<std::uint32_t>(blockIdx.x) * 8U + static_cast<std::uint32_t>(threadIdx.x) / 32U;
+    if (row >= output_width) return;
+    const auto lane = static_cast<std::uint32_t>(threadIdx.x) % 32U;
+    float partial[Rows][8]{};
+    const auto* blocks = static_cast<const Q8Block*>(weights) + static_cast<std::uint64_t>(row) * (input_width / 32U);
+    for (std::uint32_t chunk = 0; chunk < input_width; chunk += kThreads) {
+        const auto feature = chunk + 8U * lane;
+        if (feature < input_width) {
+            const auto& block = blocks[feature / 32U];
+            float weight[8];
+#pragma unroll
+            for (unsigned local = 0; local < 8; ++local)
+                weight[local] = __half2float(block.scale) * static_cast<float>(block.values[feature % 32U + local]);
+#pragma unroll
+            for (unsigned r = 0; r < Rows; ++r)
+#pragma unroll
+                for (unsigned local = 0; local < 8; ++local)
+                    partial[r][local] += bf16_to_float(input[r * input_stride + feature + local]) * weight[local];
+        }
+    }
+#pragma unroll
+    for (unsigned r = 0; r < Rows; ++r) {
+#pragma unroll
+        for (unsigned distance = 16; distance > 0; distance /= 2) {
+#pragma unroll
+            for (unsigned local = 0; local < 8; ++local) {
+                const auto partner = __shfl_down(partial[r][local], distance, 32);
+                if (lane < distance) partial[r][local] += partner;
+            }
+        }
+        if (lane == 0) {
+            auto* p = partial[r];
+            p[0] += p[4]; p[1] += p[5];
+            p[2] += p[6]; p[3] += p[7];
+            p[0] += p[2]; p[1] += p[3];
+            p[0] += p[1];
+            output[static_cast<std::uint64_t>(r) * output_stride + row] = p[0];
+        }
     }
 }
 
@@ -1329,7 +1377,9 @@ void preflight_ple(const ExecutionDispatchContext& context, void* user_data) {
         throw std::invalid_argument("PLE gathered upload does not match its exact workspace region");
 }
 
-void enqueue_ple_device(const PreparedPleLaunch& prepared, std::uint16_t* gathered) {
+// key/value: the row's key and value projections when a window computed them already for all its rows.
+void enqueue_ple_device(const PreparedPleLaunch& prepared, std::uint16_t* gathered, float* key_rows = nullptr,
+    float* value_rows = nullptr) {
     const auto& config = *prepared.config;
     const auto& input = prepared.input;
     const auto& output = prepared.output;
@@ -1362,6 +1412,9 @@ void enqueue_ple_device(const PreparedPleLaunch& prepared, std::uint16_t* gather
             workspace +
             workspace_layout.gate_offset);
 
+    if (key_rows) {
+        key = key_rows; value = value_rows;
+    } else {
     launch_projection_by_kind(
         weight_kind(
             tensors.key.manifest->
@@ -1385,6 +1438,7 @@ void enqueue_ple_device(const PreparedPleLaunch& prepared, std::uint16_t* gather
         static_cast<std::uint32_t>(
             config.model.hidden_size),
         value);
+    }
 
     hipLaunchKernelGGL(
         normalize_key_and_gate_kernel,
@@ -1962,12 +2016,46 @@ struct HipPleKnownWindow::Impl {
     std::array<hipEvent_t, 2> released{};
     std::array<bool, 2> recorded{};
     std::byte* snapshots = nullptr;
+    float* projections = nullptr;   // every row's key, then every row's value
     std::uintptr_t conv_address = 0, ngram_address = 0;
     std::vector<PleHashResult> hashes;
     ~Impl() {
         for (auto* p : staging) if (p) (void)hipHostFree(p);
         for (auto e : released) if (e) (void)hipEventDestroy(e);
         if (snapshots) (void)hipFree(snapshots);
+        if (projections) (void)hipFree(projections);
+    }
+    // Key and value projections of all rows, each Q8 weight block read once (the per-row
+    // wave8 arithmetic). False when a projection is not wave8 Q8: rows project one by one.
+    bool project_rows(const PreparedPleLaunch& p, const std::uint16_t* gathered, std::uint32_t count) const {
+        const auto width = static_cast<std::uint32_t>(config.model.ple_embed_dim);
+        if (weight_kind(p.tensors.key.manifest->ggml_type) != WeightKind::q8_0 ||
+            weight_kind(p.tensors.value.manifest->ggml_type) != WeightKind::q8_0 || width % 32U) return false;
+        const auto expanded = static_cast<std::uint32_t>(p.expanded), hidden = static_cast<std::uint32_t>(config.model.hidden_size);
+        const auto in_stride = static_cast<std::uint32_t>(stride / sizeof(std::uint16_t));
+        float* keys = projections; float* values = projections + static_cast<std::uint64_t>(max_rows) * expanded;
+        const auto launch = [&](auto rows) {
+            constexpr unsigned R = decltype(rows)::value;
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(project_wave8_q8_bf16_to_fp32_rows_kernel<R>), dim3((expanded + 7U) / 8U), dim3(256), 0,
+                hip_execution_stream(), gathered, in_stride, reinterpret_cast<const void*>(p.tensors.key.runtime->address), width,
+                expanded, keys, expanded);
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(project_wave8_q8_bf16_to_fp32_rows_kernel<R>), dim3((hidden + 7U) / 8U), dim3(256), 0,
+                hip_execution_stream(), gathered, in_stride, reinterpret_cast<const void*>(p.tensors.value.runtime->address), width,
+                hidden, values, hidden);
+        };
+        switch (count) {
+        case 1: launch(std::integral_constant<unsigned, 1>{}); break;
+        case 2: launch(std::integral_constant<unsigned, 2>{}); break;
+        case 3: launch(std::integral_constant<unsigned, 3>{}); break;
+        case 4: launch(std::integral_constant<unsigned, 4>{}); break;
+        case 5: launch(std::integral_constant<unsigned, 5>{}); break;
+        case 6: launch(std::integral_constant<unsigned, 6>{}); break;
+        case 7: launch(std::integral_constant<unsigned, 7>{}); break;
+        case 8: launch(std::integral_constant<unsigned, 8>{}); break;
+        default: return false;
+        }
+        check_hip(hipGetLastError(), "known-window PLE rows projection launch");
+        return true;
     }
     std::vector<PreparedPleLaunch> prepare(std::span<const ExecutionDispatchContext> spans) {
         if (spans.empty() || spans.size() > max_rows)
@@ -2009,6 +2097,10 @@ HipPleKnownWindow::HipPleKnownWindow(const ModelContract& model, HipActivationSt
     void* snap = nullptr;
     check_hip(hipMalloc(&snap, w.conv_bytes * max_rows), "known-window PLE convolution snapshots");
     w.snapshots = static_cast<std::byte*>(snap);
+    void* projections = nullptr;
+    check_hip(hipMalloc(&projections, sizeof(float) * max_rows * model.hidden_size * (model.hc_count + 1ULL)),
+        "known-window PLE row projections");
+    w.projections = static_cast<float*>(projections);
     w.hashes.resize(max_rows);
 }
 HipPleKnownWindow::~HipPleKnownWindow() = default;
@@ -2067,8 +2159,14 @@ void HipPleKnownWindow::launch(std::span<const ExecutionDispatchContext> rows) {
     void* device = nullptr;
     check_hip(hipHostGetDevicePointer(&device, staging, 0), "known-window PLE staging device view");
     const auto stream = hip_execution_stream();
+    const bool projected = w.project_rows(prepared[0], static_cast<const std::uint16_t*>(device), static_cast<std::uint32_t>(rows.size()));
+    const auto expanded = prepared[0].expanded, hidden = w.config.model.hidden_size;
     for (std::size_t r = 0; r < rows.size(); ++r) {
-        enqueue_ple_device(prepared[r], reinterpret_cast<std::uint16_t*>(static_cast<std::byte*>(device) + r * w.stride));
+        auto* gathered = reinterpret_cast<std::uint16_t*>(static_cast<std::byte*>(device) + r * w.stride);
+        if (projected)
+            enqueue_ple_device(prepared[r], gathered, w.projections + r * expanded,
+                w.projections + w.max_rows * expanded + r * hidden);
+        else enqueue_ple_device(prepared[r], gathered);
         check_hip(hipMemcpyAsync(w.snapshots + r * w.conv_bytes, reinterpret_cast<const void*>(prepared[r].conv_state.address),
             w.conv_bytes, hipMemcpyDeviceToDevice, stream), "known-window PLE convolution snapshot");
     }
