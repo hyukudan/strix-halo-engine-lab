@@ -132,7 +132,11 @@ bool hyper_op(strix::SerialOp op) {
     return op==strix::SerialOp::attn_hyper_mix || op==strix::SerialOp::mlp_hyper_mix || op==strix::SerialOp::final_hyper_mix;
 }
 KnownFixture make_known_fixture(const strix::ModelContract& model, std::uint32_t gate_type = 8U,
+<<<<<<< HEAD
     bool routed_union = false, bool hyper = false) {
+=======
+    bool routed_union = false, bool qsa = false) {
+>>>>>>> kp5-qsa-rows
     KnownFixture fixture;
     fixture.serial.execution = strix::build_serial_decode_execution_plan(model);
     fixture.serial.io = strix::build_serial_execution_io_plan(fixture.serial.execution);
@@ -168,7 +172,8 @@ KnownFixture make_known_fixture(const strix::ModelContract& model, std::uint32_t
             value.name = "blk." + std::to_string(*step.layer) + "." + suffix;
             value.role = suffix.ends_with("_exps.weight") ? strix::TensorRole::moe_expert :
                 suffix.starts_with("attn_") ? strix::TensorRole::attention_projection :
-                suffix.starts_with("ssm_") ? strix::TensorRole::recurrent_state : strix::TensorRole::dense_projection;
+                suffix.starts_with("ssm_") ? strix::TensorRole::recurrent_state :
+                suffix.starts_with("indexer.") ? strix::TensorRole::sparse_index : strix::TensorRole::dense_projection;
             value.layer = step.layer; value.dimensions = std::move(dimensions); value.ggml_type = type;
             value.absolute_offset = offset;
             std::uint64_t elements = 1;
@@ -198,6 +203,14 @@ KnownFixture make_known_fixture(const strix::ModelContract& model, std::uint32_t
             tensor("ssm_beta.weight", {2560,48}, gate_type);
             tensor("ssm_alpha.weight", {2560,48}, gate_type);
             tensor("ssm_out.weight", {6144,2560}, 8);
+        } else if(step.op==strix::SerialOp::indexed_attention && qsa) {
+            binding.kernel_id="hip.indexed_attention.bf16.h2560.q24x256.kv2.idx4x128.b2048.r1.c1.scalar"
+                ".wave8-q8-qsa-output-v1.prefetch8.virtual256.q8-qsa-in";
+            tensor("attn_q.weight",{2560,12288},8); tensor("attn_k.weight",{2560,512},8);
+            tensor("attn_v.weight",{2560,512},8); tensor("attn_output.weight",{6144,2560},8);
+            tensor("attn_q_norm.weight",{256},0); tensor("attn_k_norm.weight",{256},0);
+            tensor("indexer.q_proj.weight",{2560,512},8); tensor("indexer.k_proj.weight",{2560,128},8);
+            tensor("indexer.q_norm.weight",{128},0); tensor("indexer.k_norm.weight",{128},0);
         } else if (step.op == strix::SerialOp::ple) {
             // Only metadata is retained. A start-fault backend below never
             // accesses this table or claims a real PLE numerical baseline.
@@ -361,6 +374,14 @@ void recording_rows_preflight(std::span<const strix::ExecutionDispatchContext> r
 void recording_rows_launch(std::span<const strix::ExecutionDispatchContext> rows,void* opaque) {
     for(const auto& row:rows) recording_window_kernel(row,opaque);
 }
+// Native QSA rows consume each row's own context position, never the host word.
+void recording_qsa_rows_launch(std::span<const strix::ExecutionDispatchContext> rows,void* opaque) {
+    for(auto row:rows) {
+        row.reads_state=static_cast<strix::PersistentState>(static_cast<std::uint32_t>(row.reads_state)&
+            ~static_cast<std::uint32_t>(strix::PersistentState::position_history));
+        recording_window_kernel(row,opaque);
+    }
+}
 
 struct KnownRuntimeFixture {
     KnownFixture source;
@@ -382,10 +403,17 @@ struct KnownRuntimeFixture {
 
     explicit KnownRuntimeFixture(const strix::ModelContract& model, bool promote = false, bool mixed = false,
         std::uint32_t rows = 2, bool routed_union = false,
+<<<<<<< HEAD
         strix::KnownWindowOutputPolicy output_policy = strix::KnownWindowOutputPolicy::all_rows, bool hyper = false)
         : source(make_known_fixture(model, mixed ? 0U : 8U,routed_union,hyper)),
           window(strix::compile_known_prefix_window(model, source.serial, source.manifest,
               source.access, {promote, promote, mixed, rows,routed_union,output_policy,hyper})),
+=======
+        strix::KnownWindowOutputPolicy output_policy = strix::KnownWindowOutputPolicy::all_rows, bool qsa = false)
+        : source(make_known_fixture(model, mixed ? 0U : 8U,routed_union,qsa)),
+          window(strix::compile_known_prefix_window(model, source.serial, source.manifest,
+              source.access, {promote, promote, mixed, rows,routed_union,output_policy,qsa})),
+>>>>>>> kp5-qsa-rows
           serial_pool(static_cast<std::size_t>((source.serial.arena.total_bytes + 7U) / 8U)),
           window_pool(static_cast<std::size_t>((window.arena.physical.total_bytes + 7U) / 8U)),
           state_words(7U * 48U, 0) {
@@ -1107,6 +1135,80 @@ void known_window_routed_union_runtime_tests(const strix::ModelContract& model) 
     }
 }
 
+void known_window_qsa_tests(const strix::ModelContract& model) {
+    using V=strix::KnownWindowR2Variant;
+    using M=strix::KnownWindowStepMode;
+    const auto fixture=make_known_fixture(model,0U,false,true);
+    const auto reject=[&](auto&& operation,const char* message) {
+        bool rejected=false;try{operation();}catch(const std::invalid_argument&){rejected=true;}expect(rejected,message);
+    };
+    constexpr std::uint64_t layer_bytes=80ULL*34ULL*(12288ULL+512ULL+512ULL+512ULL+128ULL)+192ULL*34ULL*2560ULL;
+    for(const std::uint32_t rows:{2U,4U,8U}) {
+        strix::KnownWindowRequest request{true,true,true,rows};
+        const auto off=strix::compile_known_prefix_window(model,fixture.serial,fixture.manifest,fixture.access,request);
+        request.qsa_rows=true;
+        const auto on=strix::compile_known_prefix_window(model,fixture.serial,fixture.manifest,fixture.access,request);
+        expect(off.qsa_rows_steps==0U && on.qsa_rows_steps==12U && on.row_loop_steps+12U==off.row_loop_steps &&
+            on.logical_projection_weight_bytes_avoided==off.logical_projection_weight_bytes_avoided+12U*layer_bytes*(rows-1U) &&
+            on.projection_launches_saved==off.projection_launches_saved+12U*(6U*rows-2U) &&
+            on.window_execution_identity!=off.window_execution_identity &&
+            on.window_kernel_plan_identity!=off.window_kernel_plan_identity,
+            "QSA rows are explicitly selected with whole-window identities and static projection savings");
+        const auto expected=rows==2U?V::qsa_q8_rows2_r1_v1:rows==4U?V::qsa_q8_rows4_r1_v1:V::qsa_q8_rows8_r1_v1;
+        std::size_t first=0;
+        for(std::size_t i=0;i<on.mode.size();++i) if(on.mode[i]==M::qsa_rows) {
+            first=i;
+            expect(on.r2_variant[i]==expected && fixture.serial.execution.steps[i].op==strix::SerialOp::indexed_attention &&
+                on.row_plan.back().bindings.bindings[i].kernel_id==fixture.serial.bindings.bindings[i].kernel_id,
+                "QSA rows retain every incumbent R1 source ID");
+        }
+        strix::validate_known_prefix_window_formats(on,fixture.serial,fixture.manifest,fixture.access);
+        auto changed=on;++changed.qsa_rows_steps;
+        reject([&]{strix::validate_compiled_known_prefix_window(changed,fixture.serial);},"forged QSA rows counter rejects");
+        changed=on;changed.r2_variant[first]=V::gdn_q8_rows8_f32_gates_r1_v1;
+        reject([&]{strix::validate_compiled_known_prefix_window(changed,fixture.serial);},"wrong QSA rows variant rejects");
+        auto malformed=fixture;
+        auto tensor=std::find_if(malformed.manifest.tensors.begin(),malformed.manifest.tensors.end(),
+            [](const auto& t){return t.name=="blk.3.indexer.k_proj.weight";});
+        expect(tensor!=malformed.manifest.tensors.end(),"QSA fixture supplies the indexer key projection");
+        if(tensor==malformed.manifest.tensors.end()) continue;
+        --tensor->byte_size;
+        reject([&]{(void)strix::compile_known_prefix_window(model,malformed.serial,malformed.manifest,malformed.access,request);},
+            "short QSA projection weight rejects before callbacks");
+        tensor->ggml_type=30U; // A non-Q8 projection keeps that step on its serial row loop.
+        const auto fallback=strix::compile_known_prefix_window(model,malformed.serial,malformed.manifest,malformed.access,request);
+        const auto layer3=std::find_if(fixture.serial.execution.steps.begin(),fixture.serial.execution.steps.end(),
+            [](const auto& step){return step.op==strix::SerialOp::indexed_attention && step.layer==3U;})-fixture.serial.execution.steps.begin();
+        expect(fallback.qsa_rows_steps==11U && fallback.mode[static_cast<std::size_t>(layer3)]==M::r1_row_loop,
+            "unmatched QSA formats retain their row loop");
+        reject([&]{strix::validate_known_prefix_window_formats(on,malformed.serial,malformed.manifest,malformed.access);},
+            "an already compiled QSA window cannot inherit a changed projection format");
+
+        KnownRuntimeFixture baseline(model,false,false,rows);
+        std::vector<std::uint64_t> serial;
+        for(const auto token:baseline.tokens) serial.push_back(baseline.serial_token(token));
+        KnownRuntimeFixture wide(model,false,false,rows,false,strix::KnownWindowOutputPolicy::all_rows,true);
+        const std::array<strix::KnownWindowRowsEntry,1> entries{{
+            {expected,&wide.trace,&recording_rows_preflight,&recording_qsa_rows_launch}}};
+        std::vector<const strix::CompiledLaunchPlan*> plans;
+        for(const auto& plan:wide.row_launch) plans.push_back(&plan);
+        const auto result=strix::execute_known_prefix_window_eager(wide.window,wide.source.serial,wide.resources,
+            wide.window_memory,wide.session,wide.tokens,plans,{},entries,wide.hooks());
+        expect(wide.state_words==baseline.state_words && wide.session.state.generations==baseline.session.state.generations &&
+            wide.session.next_position==rows,"QSA rows keep every state word and one full-window frontier");
+        for(std::uint32_t row=0;row<rows;++row)
+            expect(read_word(result.logits[row].address)==serial[row],"QSA rows preserve every row's complete output");
+        expect(result.qsa_rows_dispatches==12U && result.r2_variant_dispatches[static_cast<std::size_t>(expected)]==12U,
+            "QSA rows dispatch once per QSA layer");
+        KnownRuntimeFixture missing(model,false,false,rows,false,strix::KnownWindowOutputPolicy::all_rows,true);
+        plans.clear();for(const auto& plan:missing.row_launch) plans.push_back(&plan);
+        reject([&]{(void)strix::execute_known_prefix_window_eager(missing.window,missing.source.serial,missing.resources,
+            missing.window_memory,missing.session,missing.tokens,plans,{},{},missing.hooks());},
+            "missing QSA rows callback rejects before dispatch");
+        expect(missing.trace.calls==0U && missing.session.next_position==0U,"rejected QSA window mutates nothing");
+    }
+}
+
 void known_window_routed_union_compiler_tests(const strix::ModelContract& model) {
     using V=strix::KnownWindowR2Variant;
     using M=strix::KnownWindowStepMode;
@@ -1750,7 +1852,11 @@ int main() {
 
     known_window_routed_union_compiler_tests(model);
     known_window_routed_union_runtime_tests(model);
+<<<<<<< HEAD
     known_window_hyper_rows_tests(model);
+=======
+    known_window_qsa_tests(model);
+>>>>>>> kp5-qsa-rows
     known_window_tests(model);
     known_window_runtime_tests(model);
     actual_known_window_lineage_tests(model);

@@ -2,8 +2,12 @@
 #include "strix/hip_mtp_target_window.hpp"
 
 #include "strix/deferred_moe_status.hpp"
+<<<<<<< HEAD
 #include "strix/hip_hyper_mix_launcher.hpp"
 #include "strix/lane_chain_hyper_output.hpp"
+=======
+#include "strix/hip_indexed_attention_launcher.hpp"
+>>>>>>> kp5-qsa-rows
 #include "strix/hip_setup_quiescence.hpp"
 #include "strix/prepared_tensor_views.hpp"
 
@@ -97,6 +101,7 @@ struct HipKnownPrefixWindow::Impl {
     std::vector<std::uint64_t> position_readers;
     HipSharedExpertLauncherConfig shared_config, shared_fallback;
     HipGdnLauncherConfig gdn_config;
+    HipIndexedAttentionLauncherConfig qsa_config, qsa_fallback;
     HipMoeExpertsLauncherConfig routed_config;
     HipHyperMixLauncherConfig hyper_config, hyper_fallback;
     q51_known_rows::Workspace routed_workspace;
@@ -241,6 +246,10 @@ struct HipKnownPrefixWindow::Impl {
         if (!rows[0].kernel_id) throw std::invalid_argument("known-window shared row has no serial kernel id");
         return rows[0].kernel_id->ends_with(shared_expert_prefetch::kernel_suffix) ? shared_config : shared_fallback;
     }
+    const HipIndexedAttentionLauncherConfig& qsa_for(std::span<const ExecutionDispatchContext> rows) const {
+        if (!rows[0].kernel_id) throw std::invalid_argument("known-window QSA row has no serial kernel id");
+        return rows[0].kernel_id->ends_with(qsa_input_prefetch::kernel_suffix) ? qsa_config : qsa_fallback;
+    }
     void setup_r2() {
         shared_config.hidden_size = u32(model.hidden_size);
         shared_config.intermediate_size = u32(model.shared_expert_intermediate_size);
@@ -302,6 +311,25 @@ struct HipKnownPrefixWindow::Impl {
                     gdn_known_window_rows_launch(rows,static_cast<Impl*>(object)->gdn_config);
                 }};
         }
+        if(!window.qsa_rows_steps) return;
+        qsa_config.model=model; qsa_config.activation=config.activation;
+        qsa_config.prefetch_q8_input=config.prefetch_q8_qsa_input;
+        qsa_config.prefetch_eligible_layers=config.qsa_input_prefetch_layers;
+        qsa_config.prefetch_stats=config.qsa_input_prefetch_stats;
+        qsa_config.wave8_q8_output=config.wave8_q8_qsa_output;
+        qsa_fallback=qsa_config;
+        qsa_fallback.prefetch_q8_input=false; qsa_fallback.prefetch_eligible_layers.clear();
+        const auto variant=window.logical_rows==2U?KnownWindowR2Variant::qsa_q8_rows2_r1_v1:
+            window.logical_rows==4U?KnownWindowR2Variant::qsa_q8_rows4_r1_v1:KnownWindowR2Variant::qsa_q8_rows8_r1_v1;
+        rows_entries.push_back({variant,this,
+            [](std::span<const ExecutionDispatchContext> rows,void* object) {
+                const auto& self=*static_cast<Impl*>(object);
+                indexed_attention_known_window_rows_preflight(rows,self.qsa_for(rows));
+            },
+            [](std::span<const ExecutionDispatchContext> rows,void* object) {
+                const auto& self=*static_cast<Impl*>(object);
+                indexed_attention_known_window_rows_launch(rows,self.qsa_for(rows));
+            }});
     }
     void setup_routed_union() {
         const auto& workspace=routed_workspace.memory;
@@ -428,9 +456,15 @@ struct HipKnownPrefixWindow::Impl {
         case KnownWindowR2Variant::routed_q51_union_rows2_v1:
         case KnownWindowR2Variant::routed_q51_union_rows4_v1:
         case KnownWindowR2Variant::routed_q51_union_rows8_v1: recipe="hip-routed-known-q4ka8-q51-union-dot-orderedslot-v1";break;
+<<<<<<< HEAD
         case KnownWindowR2Variant::hyper_mix_rows2_v1:
         case KnownWindowR2Variant::hyper_mix_rows4_v1:
         case KnownWindowR2Variant::hyper_mix_rows8_v1: recipe="hip-hc-known-rows-typed-q8-r1-ordered-v1";break;
+=======
+        case KnownWindowR2Variant::qsa_q8_rows2_r1_v1:
+        case KnownWindowR2Variant::qsa_q8_rows4_r1_v1:
+        case KnownWindowR2Variant::qsa_q8_rows8_r1_v1: recipe="hip-qsa-known-wide-q8-append-all-r1-attend-v1";break;
+>>>>>>> kp5-qsa-rows
         default:throw std::invalid_argument("known-window capture has no closed native recipe");
         }
         return capture_identity(recipe,static_cast<std::uint32_t>(variant));
