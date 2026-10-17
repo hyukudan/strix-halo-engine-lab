@@ -531,6 +531,16 @@ KnownWindowR2Variant hyper_rows_variant(std::uint32_t rows) {
 // Q8 down + Q8 up (+ F32 injection) per mixer, read once per window instead of per row.
 std::uint64_t known_hyper_projection_bytes(SerialOp op) {
     return 2ULL*(10240ULL/32ULL*34ULL*320ULL) + (op==SerialOp::final_hyper_mix ? 0ULL : 10240ULL*4ULL*4ULL);
+bool known_router_rows_id(std::string_view id) {
+    return id.starts_with("hip.moe_route.") && id.ends_with(".parallel");
+}
+KnownWindowStepMode known_elementwise_rows_mode(const ExecutionStep& step, std::string_view id,
+    std::uint64_t hidden_layers) {
+    if (step.op == SerialOp::moe_combine && id.starts_with("hip.moe_combine.")) return KnownWindowStepMode::moe_combine_rows;
+    if ((step.op == SerialOp::attn_inject ||
+         (step.op == SerialOp::mlp_inject && step.layer && *step.layer + 1U != hidden_layers)) &&
+        id.starts_with("hip.inject.")) return KnownWindowStepMode::inject_rows;
+    return KnownWindowStepMode::r1_row_loop;
 }
 KnownWindowR2Variant routed_union_variant(std::uint32_t rows) {
     return rows==2U?KnownWindowR2Variant::routed_q51_union_rows2_v1:
@@ -678,7 +688,9 @@ std::pair<std::uint64_t, std::uint64_t> known_window_identities(
     auto kernel = fnv_offset; window_hash_text(kernel, window.logical_rows==2U ? "known-window-r2-kernels-v1" : "known-window-rows-kernels-v1");
     if(window.logical_rows!=2U) hash_u64(kernel,window.logical_rows);
     hash_u64(kernel, serial.kernel_plan_identity); hash_u64(kernel, window.mode.size());
-    std::uint32_t r2 = 0, loops = 0, runtime = 0, shared_rows = 0, gdn_rows = 0, routed_union=0, hyper_rows=0, qsa_rows=0, gdn_deferred=0, ple_rows=0, head_rows=0;
+    std::uint32_t r2 = 0, loops = 0, runtime = 0, shared_rows = 0, gdn_rows = 0, routed_union=0, hyper_rows=0, qsa_rows=0, gdn_deferred=0, ple_rows=0, head_rows=0, router_rows=0, elementwise_rows=0;
+    std::uint64_t hidden_layers = 0;
+    for (const auto& step : serial.execution.steps) if (step.layer) hidden_layers = std::max<std::uint64_t>(hidden_layers, *step.layer + 1U);
     std::uint64_t avoided = 0;
     std::uint32_t launches = 0;
     for (std::size_t i = 0; i < window.mode.size(); ++i) {
@@ -740,6 +752,14 @@ std::pair<std::uint64_t, std::uint64_t> known_window_identities(
                 "known window LM head rows variant/source ID mismatch");
             ++head_rows; avoided+=known_head_bytes(serial.vocab_size)*(window.logical_rows-1U);
             launches+=window.logical_rows-1U;
+        } else if (mode==KnownWindowStepMode::moe_route_rows) {
+            window_require(step.op==SerialOp::moe_route && binding.kernel_id && known_router_rows_id(*binding.kernel_id) &&
+                variant==KnownWindowR2Variant::moe_route_rows_v1, "known window router rows variant/source ID mismatch");
+            ++router_rows;
+        } else if (mode==KnownWindowStepMode::moe_combine_rows || mode==KnownWindowStepMode::inject_rows) {
+            window_require(binding.kernel_id && known_elementwise_rows_mode(step,*binding.kernel_id,hidden_layers)==mode && variant==(mode==KnownWindowStepMode::inject_rows ? KnownWindowR2Variant::inject_rows_v1 :
+                KnownWindowR2Variant::moe_combine_rows_v1), "known window elementwise rows variant/source ID mismatch");
+            ++elementwise_rows;
         } else if (mode == KnownWindowStepMode::r2_gdn_staged) {
             window_require(step.op == SerialOp::gated_delta_net &&
                 (variant == KnownWindowR2Variant::gdn_q8_virtual256_r2_v1 ||
@@ -760,7 +780,8 @@ std::pair<std::uint64_t, std::uint64_t> known_window_identities(
         shared_rows==window.shared_rows_steps && gdn_rows==window.gdn_rows_steps &&
         routed_union==window.routed_expert_union_steps && hyper_rows==window.hyper_mix_rows_steps &&
         qsa_rows==window.qsa_rows_steps && gdn_deferred==window.gdn_deferred_rows_steps &&
-        ple_rows==window.ple_rows_steps && head_rows==window.lm_head_rows_steps,
+        ple_rows==window.ple_rows_steps && head_rows==window.lm_head_rows_steps &&
+        router_rows==window.router_rows_steps && elementwise_rows==window.combine_inject_rows_steps,
         "known window counters do not match its actual mode table");
     window_require(avoided == window.logical_projection_weight_bytes_avoided &&
         launches == window.projection_launches_saved,
@@ -915,6 +936,7 @@ CompiledKnownPrefixWindow compile_known_prefix_window(
             output.r2_variant[i]=hyper_rows_variant(output.logical_rows);
             output.logical_projection_weight_bytes_avoided+=known_hyper_projection_bytes(step.op)*(output.logical_rows-1U);
             output.projection_launches_saved+=2U*(output.logical_rows-1U);
+        }
         if(request.lm_head_rows && output.output_policy==KnownWindowOutputPolicy::all_rows &&
             i+1U==output.mode.size() && step.op==SerialOp::lm_head && binding.kernel_id &&
             known_head_id(*binding.kernel_id,serial.vocab_size) &&
@@ -923,6 +945,18 @@ CompiledKnownPrefixWindow compile_known_prefix_window(
             output.r2_variant[i]=head_rows_variant(output.logical_rows);
             output.logical_projection_weight_bytes_avoided+=known_head_bytes(serial.vocab_size)*(output.logical_rows-1U);
             output.projection_launches_saved+=output.logical_rows-1U;
+        }
+        if(request.router_rows && step.op==SerialOp::moe_route && binding.kernel_id && known_router_rows_id(*binding.kernel_id)) {
+            output.mode[i]=KnownWindowStepMode::moe_route_rows;
+            output.r2_variant[i]=KnownWindowR2Variant::moe_route_rows_v1;
+        }
+        if(request.combine_inject_rows && binding.kernel_id) {
+            const auto mode=known_elementwise_rows_mode(step,*binding.kernel_id,model.hidden_layers);
+            if(mode!=KnownWindowStepMode::r1_row_loop) {
+                output.mode[i]=mode;
+                output.r2_variant[i]=mode==KnownWindowStepMode::inject_rows ? KnownWindowR2Variant::inject_rows_v1 :
+                    KnownWindowR2Variant::moe_combine_rows_v1;
+            }
         }
         if (output.mode[i] == KnownWindowStepMode::r1_row_loop) {
             ++output.row_loop_steps; if (binding.host_or_runtime_step) ++output.runtime_row_steps;
@@ -934,6 +968,9 @@ CompiledKnownPrefixWindow compile_known_prefix_window(
         else if(output.mode[i]==KnownWindowStepMode::gdn_deferred_rows) ++output.gdn_deferred_rows_steps;
         else if(output.mode[i]==KnownWindowStepMode::ple_rows) ++output.ple_rows_steps;
         else if(output.mode[i]==KnownWindowStepMode::lm_head_rows) ++output.lm_head_rows_steps;
+        else if(output.mode[i]==KnownWindowStepMode::moe_route_rows) ++output.router_rows_steps;
+        else if(output.mode[i]==KnownWindowStepMode::moe_combine_rows || output.mode[i]==KnownWindowStepMode::inject_rows)
+            ++output.combine_inject_rows_steps;
         else ++output.r2_steps;
     }
     const auto identities = known_window_identities(output, serial);

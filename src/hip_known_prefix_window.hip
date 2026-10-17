@@ -8,6 +8,7 @@
 #include "strix/hip_indexed_attention_launcher.hpp"
 #include "strix/dispatch_resources.hpp"
 #include "strix/hip_generation_output.hpp"
+#include "strix/hip_moe_route_launcher.hpp"
 #include "strix/hip_setup_quiescence.hpp"
 #include "strix/prepared_tensor_views.hpp"
 
@@ -108,6 +109,8 @@ struct HipKnownPrefixWindow::Impl {
     HipLmHeadLauncherConfig head_config;
     ExecutionBufferAddress greedy_partials{};
     HipGreedyRowsReply* greedy_replies = nullptr;
+    HipMoeRouteLauncherConfig route_config;
+    HipElementwiseLauncherConfig elementwise_config;
     q51_known_rows::Workspace routed_workspace;
     q51_known_rows::Summary pending_union_summary;
     std::uint32_t last_union_layer = 0;
@@ -201,6 +204,7 @@ struct HipKnownPrefixWindow::Impl {
         setup_hyper_rows();
         setup_deferred();
         setup_head_rows();
+        setup_router_elementwise_rows();
         // Setup only: no execution callback clears or reads this record before
         // all deep admission. Exclusive status ownership preserves zero across
         // successful calls; any exception disables the owner permanently.
@@ -522,6 +526,37 @@ struct HipKnownPrefixWindow::Impl {
         status_disjoint(partials.address,partials.bytes);
         greedy_partials=partials; greedy_replies=replies;
     }
+    void setup_router_elementwise_rows() {
+        route_config.hidden_size=u32(model.hidden_size); route_config.expert_count=u32(model.num_experts);
+        route_config.top_k=u32(model.num_experts_per_token); route_config.activation=config.activation;
+        route_config.normalize_selected=model.norm_topk_probability;
+        route_config.parallel_projection=config.parallel_moe_router; route_config.staged_logits=config.staged_moe_router_logits;
+        route_config.ranked_topk=config.ranked_moe_router_topk; route_config.wave_topk=config.wave_moe_router_topk;
+        route_config.wave_manifest_admission=config.wave_router_manifest_admission;
+        elementwise_config.hidden_size=u32(model.hidden_size); elementwise_config.hc_count=u32(model.hc_count);
+        elementwise_config.activation=config.activation;
+        rows_entries.push_back({KnownWindowR2Variant::moe_route_rows_v1,this,
+            [](std::span<const ExecutionDispatchContext> rows,void* object) {
+                moe_route_known_window_rows_preflight(rows,static_cast<Impl*>(object)->route_config);
+            },
+            [](std::span<const ExecutionDispatchContext> rows,void* object) {
+                moe_route_known_window_rows_launch(rows,static_cast<Impl*>(object)->route_config);
+            }});
+        rows_entries.push_back({KnownWindowR2Variant::moe_combine_rows_v1,this,
+            [](std::span<const ExecutionDispatchContext> rows,void* object) {
+                moe_combine_known_window_rows_preflight(rows,static_cast<Impl*>(object)->elementwise_config);
+            },
+            [](std::span<const ExecutionDispatchContext> rows,void* object) {
+                moe_combine_known_window_rows_launch(rows,static_cast<Impl*>(object)->elementwise_config);
+            }});
+        rows_entries.push_back({KnownWindowR2Variant::inject_rows_v1,this,
+            [](std::span<const ExecutionDispatchContext> rows,void* object) {
+                inject_known_window_rows_preflight(rows,static_cast<Impl*>(object)->elementwise_config);
+            },
+            [](std::span<const ExecutionDispatchContext> rows,void* object) {
+                inject_known_window_rows_launch(rows,static_cast<Impl*>(object)->elementwise_config);
+            }});
+    }
     void complete() {
         guard.require_original();
         if(window.routed_expert_union_steps)
@@ -592,6 +627,9 @@ struct HipKnownPrefixWindow::Impl {
         case KnownWindowR2Variant::lm_head_q8_prefetch8_rows2_v1:
         case KnownWindowR2Variant::lm_head_q8_prefetch8_rows4_v1:
         case KnownWindowR2Variant::lm_head_q8_prefetch8_rows8_v1: recipe="hip-lm-head-known-rows-q8prefetch8-r1tree-v1";break;
+        case KnownWindowR2Variant::moe_route_rows_v1: recipe="hip-route-known-rows-tiled-ascending-chain-r1select-v1";break;
+        case KnownWindowR2Variant::moe_combine_rows_v1: recipe="hip-moe-combine-known-rows-r1element-v1";break;
+        case KnownWindowR2Variant::inject_rows_v1: recipe="hip-inject-known-rows-r1element-v1";break;
         default:throw std::invalid_argument("known-window capture has no closed native recipe");
         }
         return capture_identity(recipe,static_cast<std::uint32_t>(variant));
@@ -637,6 +675,7 @@ struct HipKnownPrefixWindow::Impl {
         for(std::uint32_t row=0;row<logical_rows();++row){
             auto& plan=entry->plans[row];
             if(step>=plan.steps.size() || plan.steps[step].op!=SerialOp::mlp_inject ||
+               window.mode[step]!=KnownWindowStepMode::r1_row_loop ||
                !plan.steps[step].function || !plan.steps[step].preflight)
                 throw std::invalid_argument("MTP observed target launcher is not its actual last MLP injection");
             auto& wrapper=entry->launchers[row];wrapper.delegate=plan.steps[step];wrapper.capture=capture.get();

@@ -33,6 +33,9 @@ enum class KnownWindowStepMode : std::uint8_t {
     // PLE rows looked up on the host before the window; convolution kept per row.
     ple_rows,
     lm_head_rows,
+    moe_route_rows,
+    moe_combine_rows,
+    inject_rows,
 };
 
 // Closed implementation table. These values identify window entries; they do
@@ -70,8 +73,12 @@ enum class KnownWindowR2Variant : std::uint32_t {
     lm_head_q8_prefetch8_rows2_v1 = 24,
     lm_head_q8_prefetch8_rows4_v1 = 25,
     lm_head_q8_prefetch8_rows8_v1 = 26,
+    // T-agnostic (2/4/8) entries; per-row bytes equal the serial launch.
+    moe_route_rows_v1 = 27,
+    moe_combine_rows_v1 = 28,
+    inject_rows_v1 = 29,
 };
-inline constexpr std::uint32_t known_window_r2_variant_slots = 27;
+inline constexpr std::uint32_t known_window_r2_variant_slots = 30;
 
 struct KnownWindowRequest {
     bool r2_shared_expert = false;
@@ -92,6 +99,11 @@ struct KnownWindowRequest {
     bool rows_ple = false;
     // Multi-row terminal head for the prefetch Q8_0 incumbent; all-rows policy only.
     bool lm_head_rows = false;
+    // Parallel router logits + selection for all rows in one entry.
+    bool router_rows = false;
+    // MoE combine and attn/mlp inject for all rows in one launch each. The
+    // last-layer MLP inject stays a row loop: MTP target capture observes it.
+    bool combine_inject_rows = false;
 };
 
 struct CompiledKnownPrefixWindow {
@@ -124,6 +136,8 @@ struct CompiledKnownPrefixWindow {
     std::uint32_t gdn_deferred_rows_steps = 0;
     std::uint32_t ple_rows_steps = 0;
     std::uint32_t lm_head_rows_steps = 0;
+    std::uint32_t router_rows_steps = 0;
+    std::uint32_t combine_inject_rows_steps = 0;
     KnownWindowOutputPolicy output_policy = KnownWindowOutputPolicy::all_rows;
     // Compact result.logits entries correspond to these original source rows.
     std::vector<std::uint32_t> logit_row_indices;
@@ -135,6 +149,16 @@ struct CompiledKnownPrefixWindow {
     return window.r2_steps || window.shared_rows_steps || window.gdn_rows_steps || window.routed_expert_union_steps ||
         window.hyper_mix_rows_steps || window.qsa_rows_steps ||
         window.gdn_deferred_rows_steps || window.ple_rows_steps || window.lm_head_rows_steps;
+        window.router_rows_steps || window.combine_inject_rows_steps;
+}
+// Modes dispatched through one KnownWindowRowsEntry covering every row.
+[[nodiscard]] inline bool known_window_rows_mode(KnownWindowStepMode mode) noexcept {
+    return mode == KnownWindowStepMode::shared_rows || mode == KnownWindowStepMode::gdn_rows ||
+        mode == KnownWindowStepMode::routed_expert_union || mode == KnownWindowStepMode::moe_route_rows ||
+        mode == KnownWindowStepMode::moe_combine_rows || mode == KnownWindowStepMode::inject_rows ||
+        mode == KnownWindowStepMode::hyper_mix_rows || mode == KnownWindowStepMode::qsa_rows ||
+        mode == KnownWindowStepMode::gdn_deferred_rows || mode == KnownWindowStepMode::ple_rows ||
+        mode == KnownWindowStepMode::lm_head_rows;
 }
 
 [[nodiscard]] CompiledKnownPrefixWindow compile_known_prefix_window(

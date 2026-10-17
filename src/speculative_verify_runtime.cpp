@@ -394,11 +394,7 @@ KnownWindowResult execute_known_prefix_window_eager(
             // QSA rows read each row's own context position, never the host word.
             if (window_reads_position(step.reads_state) && window.mode[i]!=KnownWindowStepMode::qsa_rows)
                 throw std::invalid_argument("known window promoted entries cannot consume host position history");
-            if(window.mode[i]==KnownWindowStepMode::shared_rows || window.mode[i]==KnownWindowStepMode::gdn_rows ||
-                window.mode[i]==KnownWindowStepMode::routed_expert_union || window.mode[i]==KnownWindowStepMode::hyper_mix_rows ||
-                window.mode[i]==KnownWindowStepMode::qsa_rows || window.mode[i]==KnownWindowStepMode::gdn_deferred_rows ||
-                window.mode[i]==KnownWindowStepMode::ple_rows ||
-                window.mode[i]==KnownWindowStepMode::lm_head_rows) {
+            if(known_window_rows_mode(window.mode[i])) {
                 const auto found=std::find_if(rows_entries.begin(),rows_entries.end(),
                     [&](const KnownWindowRowsEntry& e){return e.variant==window.r2_variant[i];});
                 if(found==rows_entries.end()) throw std::invalid_argument("known window wide implementation is missing");
@@ -504,7 +500,7 @@ KnownWindowResult execute_known_prefix_window_eager(
                         else if(window.mode[i]==KnownWindowStepMode::hyper_mix_rows) ++result.hyper_mix_rows_dispatches;
                         else if(window.mode[i]==KnownWindowStepMode::qsa_rows) ++result.qsa_rows_dispatches;
                         else if(window.mode[i]==KnownWindowStepMode::lm_head_rows) ++result.lm_head_rows_dispatches;
-                        else ++result.routed_expert_union_dispatches;
+                        else if(window.mode[i]==KnownWindowStepMode::routed_expert_union) ++result.routed_expert_union_dispatches;
                     } else {
                         selected[i]->launch(std::span<const ExecutionDispatchContext,2>(contexts[i].data()+first,2U),selected[i]->config);
                         ++result.r2_dispatches;

@@ -2181,7 +2181,9 @@ int STRIX_DECODE_ENTRY(
             make_window = [&, parents](std::shared_ptr<strix::HipMtpTargetHidden> target) {
                 const auto plan = strix::compile_known_prefix_window(model, compiled, manifest, tensor_access,
                     {true, true, true, options.mtp.window_rows, options.mtp.window_expert_union, strix::KnownWindowOutputPolicy::all_rows,
-                     options.mtp.window_hyper_mix, options.mtp.window_qsa_rows, options.mtp.window_prefix, options.mtp.window_prefix});
+                     options.mtp.window_hyper_mix, options.mtp.window_qsa_rows, options.mtp.window_prefix, options.mtp.window_prefix,
+                     options.mtp.window_prefix, options.mtp.window_prefix || options.known_window_router_rows,
+                     options.mtp.window_prefix || options.known_window_router_rows});
                 if (!strix::known_window_has_promoted_steps(plan) ||
                     (options.mtp.window_expert_union && !plan.routed_expert_union_steps) ||
                     (options.mtp.window_hyper_mix && !plan.hyper_mix_rows_steps) ||
@@ -2874,11 +2876,12 @@ int STRIX_DECODE_ENTRY(
             if (options.known_prefix_prefill_rows) {
                 known_prefill_plan = std::make_shared<strix::CompiledKnownPrefixPrefill>(strix::compile_known_prefix_prefill(model, compiled, manifest, tensor_access,
                     {options.known_prefix_prefill_rows, true, true, true, options.known_prefix_expert_union,
-                     options.known_prefix_output_policy, options.known_prefill_workspace_budget, options.known_prefill_metadata_budget / 2U}));
+                     options.known_prefix_output_policy, options.known_prefill_workspace_budget, options.known_prefill_metadata_budget / 2U,
+                     options.known_window_router_rows, options.known_window_router_rows}));
                 known_prefix_plan = known_prefill_plan->tile8; // selection ledger, never a relabelled T forward
             } else known_prefix_plan = strix::compile_known_prefix_window(model, compiled, manifest, tensor_access,
                 {true, true, true, options.known_prefix_window ? options.known_prefix_rows : 2U, options.known_prefix_expert_union,
-                 options.known_prefix_output_policy});
+                 options.known_prefix_output_policy, options.known_window_router_rows, options.known_window_router_rows});
             if (!strix::known_window_has_promoted_steps(*known_prefix_plan))
                 throw std::invalid_argument("known prompt has no admitted known-window operators");
             if (model.vocab_size > std::numeric_limits<std::uint32_t>::max())

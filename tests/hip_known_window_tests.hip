@@ -10,6 +10,10 @@
 #include "strix/hip_generation_output.hpp"
 #include "strix/hip_lm_head_launcher.hpp"
 #include "strix/hip_launch_context.hpp"
+#include "strix/execution_buffers.hpp"
+#include "strix/hip_moe_route_launcher.hpp"
+#include "strix/hip_runtime_launchers.hpp"
+#include "strix/wave_router_contract.hpp"
 #include "strix/hip_setup_quiescence.hpp"
 #include "strix/hip_shared_expert_launcher.hpp"
 #include "strix/session_state_layout.hpp"
@@ -33,6 +37,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -1491,9 +1496,263 @@ void family_lm_head_rows(std::uint32_t rows) {
     }
     check(hipHostFree(replies), "free mapped head replies");
 }
+// Router/combine/inject rows on the real parallel-router serial arena: every
+// row of one rows launch must equal T serial launches byte for byte across the
+// complete window arena (outputs, router logits workspace, untouched bytes).
+struct RowsStepFixture {
+    Owner owner;
+    ModelContract model = ModelContract::qwen38_flash_next();
+    SerialExecutionPlan execution = build_serial_decode_execution_plan(model);
+    SerialExecutionIoPlan io = build_serial_execution_io_plan(execution, true);
+    ExecutionArenaPlan serial;
+    KnownWindowArena window;
+    Span scratch, router;
+    ExecutionMemoryBinding memory;
+    ModelManifest manifest;
+    ModelRuntimeBinding runtime;
+    ExecutionTensorAccessPlan access;
+    std::shared_ptr<const WaveRouterManifestAdmission> admission;
+    ExecutionRuntimeResources resources;
+    HipElementwiseLauncherConfig elementwise{2560U, 4U, HipActivationStorage::bf16};
+    std::vector<unsigned char> seed;
+    const std::uint32_t rows;
+    explicit RowsStepFixture(std::uint32_t row_count, std::uint32_t router_type = 0U) : rows(row_count) {
+        ExecutionBufferRequest request; request.parallel_moe_router = true;
+        serial = build_serial_execution_arena_plan(model, request, execution, io, 256U);
+        window = build_known_window_arena(serial, 256U, rows);
+        scratch = owner.allocate(window.physical.total_bytes);
+        memory = {0x4b4e4f574e523301ULL + rows, scratch.address, scratch.bytes, 31U};
+        manifest.architecture = "qwen4_exp";
+        const auto route = step(SerialOp::moe_route, 0U);
+        ManifestTensor tensor;
+        tensor.name = "blk.0.ffn_gate_inp.weight"; tensor.role = TensorRole::moe_router; tensor.layer = 0U;
+        tensor.ggml_type = router_type; tensor.dimensions = {2560U, 512U};
+        std::vector<unsigned char> bytes;
+        if (router_type == 8U) bytes = q8(2560U, 512U, 9U);
+        else {
+            // Experts 7/300 and 11/12 are identical: exact logit ties exercise index order.
+            std::vector<float> values(2560U * 512U);
+            for (std::size_t i = 0; i < values.size(); ++i) {
+                const auto expert = i / 2560U, feature = i % 2560U;
+                const auto source = expert == 300U ? 7U : expert == 12U ? 11U : expert;
+                values[i] = 0.0007F * static_cast<float>(static_cast<int>((feature * 13U + source * 29U) % 61U) - 30) *
+                    (1.0F + 0.01F * static_cast<float>(source % 17U));
+            }
+            if (router_type == 30U) {
+                std::vector<std::uint16_t> half(values.size());
+                for (std::size_t i = 0; i < values.size(); ++i) half[i] = bf16(values[i]);
+                bytes = bytes_of(half);
+            } else bytes = bytes_of(values);
+        }
+        tensor.byte_size = bytes.size();
+        router = owner.allocate(bytes.size()); write(router, bytes);
+        manifest.total_tensor_bytes = tensor.byte_size;
+        manifest.tensors.push_back(tensor);
+        manifest.layout_identity = model_manifest_layout_identity(manifest);
+        runtime.manifest_layout_identity = manifest.layout_identity;
+        runtime.model_content_identity.bytes[0] = 1U;
+        runtime.tensors.push_back({0U, RuntimeTensorStorage::resident, router.address, router.bytes, 7U, 0U});
+        access.manifest_layout_identity = manifest.layout_identity;
+        access.plan_identity = 0x4b4e4f574e523302ULL;
+        access.accesses.push_back({route.id, route.op, 0U, {0U}});
+        admission = WaveRouterManifestAdmission::create(manifest);
+        resources = {&memory, &admission->manifest(), &runtime, &access};
+        // Finite moderate BF16 everywhere (so every FP32 view is finite too),
+        // plus signed zeros, subnormals, infinities and NaNs at fixed strides.
+        seed.resize(static_cast<std::size_t>(scratch.bytes));
+        constexpr std::array<std::uint16_t, 8> edge{0x0000, 0x8000, 0x0001, 0x8001, 0x7f80, 0xff80, 0x7fc1, 0xffc3};
+        std::uint32_t state = 0x9e3779b9U ^ rows;
+        for (std::size_t i = 0; i + 1U < seed.size(); i += 2U) {
+            state = state * 1664525U + 1013904223U;
+            auto value = bf16(static_cast<float>(static_cast<int>(state >> 20U) - 2048) * 0.00061F);
+            if (i % 4093U == 0U) value = edge[(i / 4093U) % edge.size()];
+            std::memcpy(seed.data() + i, &value, sizeof(value));
+        }
+    }
+    const ExecutionStep& step(SerialOp op, std::uint32_t layer) const {
+        const auto found = std::find_if(execution.steps.begin(), execution.steps.end(),
+            [&](const auto& value) { return value.op == op && value.layer == layer; });
+        require(found != execution.steps.end(), "rows fixture operator missing");
+        return *found;
+    }
+    std::vector<ExecutionDispatchContext> contexts(const ExecutionStep& s, std::string_view id) const {
+        std::vector<ExecutionDispatchContext> out(rows);
+        for (std::uint32_t r = 0; r < rows; ++r) {
+            auto& c = out[r];
+            c.execution_identity = memory.execution_identity; c.step_id = s.id; c.op = s.op; c.layer = s.layer;
+            c.kernel_id = id; c.reads = io.steps[s.id].reads; c.writes = io.steps[s.id].writes;
+            c.temporaries = io.steps[s.id].temporaries; c.arena = &window.row_view[r]; c.memory = &memory;
+            c.resources = &resources; c.reads_state = s.reads_state; c.writes_state = s.writes_state;
+            c.position = 5U + r; c.input_token_id = 40U + r;
+        }
+        return out;
+    }
+    HipLaunchContext scope() const { HipLaunchContext result; result.stream = owner.stream; return result; }
+    template <class Work> std::vector<unsigned char> run(Work&& work, const std::vector<unsigned char>& input) {
+        write(scratch, input);
+        { const HipLaunchScope owned(scope()); work(); }
+        owner.finish();
+        guards(scratch); guards(router);
+        return read(scratch);
+    }
+};
+HipMoeRouteLauncherConfig router_config(const RowsStepFixture& f, bool staged, bool ranked, bool wave) {
+    HipMoeRouteLauncherConfig config;
+    config.hidden_size = 2560U; config.expert_count = 512U; config.top_k = 10U;
+    config.normalize_selected = f.model.norm_topk_probability; config.parallel_projection = true;
+    config.staged_logits = staged; config.ranked_topk = ranked; config.wave_topk = wave;
+    if (wave) config.wave_manifest_admission = f.admission;
+    return config;
+}
+template <class Serial, class Rows>
+void rows_equal_serial(RowsStepFixture& f, std::span<const ExecutionDispatchContext> contexts,
+    Serial&& serial, Rows&& rows, const char* what) {
+    // Two different inputs: the seed and the seed rotated by one row stride.
+    for (unsigned variant = 0; variant < 2U; ++variant) {
+        auto input = f.seed;
+        if (variant) std::rotate(input.begin(), input.begin() + static_cast<std::ptrdiff_t>(f.window.row_stride.front()), input.end());
+        const auto reference = f.run([&] { for (const auto& c : contexts) serial(c); }, input);
+        require(reference != input, "rows fixture serial launches wrote nothing");
+        const auto candidate = f.run([&] { rows(contexts); }, input);
+        if (candidate != reference) throw std::runtime_error(std::string(what) + ": rows launch differs from serial row launches");
+        require(f.run([&] { rows(contexts); }, input) == candidate, "rows launch is not deterministic");
+    }
+}
+template <class Preflight> void rows_rejections(RowsStepFixture& f, const std::vector<ExecutionDispatchContext>& contexts,
+    Preflight&& preflight) {
+    const auto bad = [&](auto mutate) {
+        auto copy = contexts; mutate(copy);
+        invalid([&] { preflight(std::span<const ExecutionDispatchContext>(copy)); });
+    };
+    invalid([&] { preflight(std::span<const ExecutionDispatchContext>(contexts.data(), 3U)); });
+    bad([](auto& c) { c.back().position += 1U; });
+    bad([](auto& c) { c.back().step_id += 1U; });
+    bad([](auto& c) { c.back().execution_identity ^= 1U; });
+    bad([](auto& c) { c.back().logical_rows = 2U; });
+    bad([](auto& c) { c.back().arena = c.front().arena; }); // cross-row output alias
+    bad([](auto& c) { c.back().kernel_id = "hip.other"; });
+    static_cast<void>(f);
+}
+void router_rows_family() {
+    for (const auto type : {0U, 30U, 8U}) for (const auto rows : {2U, 4U, 8U}) {
+        RowsStepFixture f(rows, type);
+        const auto& s = f.step(SerialOp::moe_route, 0U);
+        struct Mode { bool staged, ranked, wave; const char* name; };
+        for (const auto mode : {Mode{true, false, true, "staged+wave"}, Mode{false, false, true, "wave"},
+                                Mode{false, true, false, "ranked"}, Mode{false, false, false, "sorted"},
+                                Mode{true, false, false, "staged+sorted"}}) {
+            auto config = router_config(f, mode.staged, mode.ranked, mode.wave);
+            const auto launcher = make_hip_moe_route_launcher("hip.moe_route.test.parallel", &config);
+            const auto contexts = f.contexts(s, launcher.key);
+            rows_equal_serial(f, contexts, [&](const ExecutionDispatchContext& c) { launcher.function(c, launcher.user_data); },
+                [&](std::span<const ExecutionDispatchContext> c) {
+                    moe_route_known_window_rows_preflight(c, config); moe_route_known_window_rows_launch(c, config);
+                }, mode.name);
+            if (rows == 4U) rows_rejections(f, contexts, [&](std::span<const ExecutionDispatchContext> c) {
+                moe_route_known_window_rows_preflight(c, config); });
+        }
+        auto serial_only = router_config(f, false, false, false); serial_only.parallel_projection = false;
+        const auto contexts = f.contexts(s, "hip.moe_route.test");
+        invalid([&] { moe_route_known_window_rows_preflight(contexts, serial_only); });
+    }
+    std::cout << "router rows 2/4/8 x F32/BF16/Q8_0 x staged/wave/ranked/sorted equal serial bytes\n";
+}
+void elementwise_rows_family() {
+    for (const auto rows : {2U, 4U, 8U}) {
+        RowsStepFixture f(rows);
+        for (const auto op : {SerialOp::attn_inject, SerialOp::mlp_inject, SerialOp::moe_combine}) for (const auto layer : {0U, 47U}) {
+            const auto& s = f.step(op, layer);
+            const bool inject = op != SerialOp::moe_combine;
+            const auto launcher = inject ? make_hip_inject_launcher("hip.inject.test", &f.elementwise) :
+                make_hip_moe_combine_launcher("hip.moe_combine.test", &f.elementwise);
+            const auto contexts = f.contexts(s, launcher.key);
+            const auto preflight = [&](std::span<const ExecutionDispatchContext> c) {
+                if (inject) inject_known_window_rows_preflight(c, f.elementwise); else moe_combine_known_window_rows_preflight(c, f.elementwise);
+            };
+            rows_equal_serial(f, contexts, [&](const ExecutionDispatchContext& c) { launcher.function(c, launcher.user_data); },
+                [&](std::span<const ExecutionDispatchContext> c) {
+                    preflight(c);
+                    if (inject) inject_known_window_rows_launch(c, f.elementwise); else moe_combine_known_window_rows_launch(c, f.elementwise);
+                }, inject ? "inject" : "combine");
+            if (rows == 4U && layer == 0U) rows_rejections(f, contexts, preflight);
+        }
+    }
+    std::cout << "attn/mlp inject and MoE combine rows 2/4/8 equal serial bytes\n";
+}
+
+// hipEvent timing: median over 25 samples (after 5 warmups) of 20 back-to-back
+// repetitions, so the GPU stays clocked up as in decode. "cold" sweeps 96 MB
+// (read only: no dirty write-back inside the timed work) through the 32 MB
+// MALL before every repetition, as decode evicts each layer's router between
+// tokens, and subtracts the sweep-only median.
+__global__ void bench_sweep_kernel(const uint4* data, std::uint64_t count, unsigned* sink) {
+    unsigned accumulator = 0;
+    for (auto i = static_cast<std::uint64_t>(blockIdx.x) * 256U + threadIdx.x; i < count; i += 256ULL * gridDim.x) {
+        const auto v = data[i]; accumulator ^= v.x ^ v.y ^ v.z ^ v.w;
+    }
+    if (accumulator == 0x12345679U) *sink = accumulator;
+}
+template <class Work> float median_us(RowsStepFixture& f, Span flush, bool cold, Work&& work) {
+    hipEvent_t begin{}, end{};
+    check(hipEventCreate(&begin), "create bench event"); check(hipEventCreate(&end), "create bench event");
+    const auto measure = [&](bool with_work) {
+        std::vector<float> samples;
+        const HipLaunchScope owned(f.scope());
+        for (int i = 0; i < 30; ++i) {
+            check(hipEventRecord(begin, f.owner.stream), "record bench begin");
+            for (int repeat = 0; repeat < 20; ++repeat) {
+                if (cold) {
+                    hipLaunchKernelGGL(bench_sweep_kernel, dim3(640), dim3(256), 0, f.owner.stream,
+                        reinterpret_cast<const uint4*>(flush.address), flush.bytes / 16U, reinterpret_cast<unsigned*>(flush.address));
+                    check(hipGetLastError(), "sweep MALL");
+                }
+                if (with_work) work();
+            }
+            check(hipEventRecord(end, f.owner.stream), "record bench end");
+            check(hipEventSynchronize(end), "complete bench sample");
+            float ms = 0.0F; check(hipEventElapsedTime(&ms, begin, end), "bench elapsed");
+            if (i >= 5) samples.push_back(ms * 1000.0F / 20.0F);
+        }
+        std::sort(samples.begin(), samples.end());
+        return samples[samples.size() / 2U];
+    };
+    const auto result = measure(true) - (cold ? measure(false) : 0.0F);
+    check(hipEventDestroy(begin), "destroy bench event"); check(hipEventDestroy(end), "destroy bench event");
+    return result;
+}
+void rows_bench() {
+    for (const auto rows : {2U, 4U, 8U}) {
+        RowsStepFixture f(rows);
+        const auto flush = f.owner.allocate(96ULL << 20U);
+        write(f.scratch, f.seed);
+        auto config = router_config(f, true, false, true);
+        const auto launcher = make_hip_moe_route_launcher("hip.moe_route.test.parallel", &config);
+        const auto route = f.contexts(f.step(SerialOp::moe_route, 0U), launcher.key);
+        for (const bool cold : {false, true}) {
+            const auto serial = median_us(f, flush, cold, [&] { for (const auto& c : route) launcher.function(c, launcher.user_data); });
+            const auto multi = median_us(f, flush, cold, [&] { moe_route_known_window_rows_launch(route, config); });
+            std::cout << "bench router staged+wave T=" << rows << (cold ? " cold" : " warm") << ": " << rows << "x serial "
+                      << serial << " us, rows " << multi << " us\n";
+        }
+        for (const auto op : {SerialOp::attn_inject, SerialOp::moe_combine}) {
+            const bool inject = op == SerialOp::attn_inject;
+            const auto el = inject ? make_hip_inject_launcher("hip.inject.test", &f.elementwise) :
+                make_hip_moe_combine_launcher("hip.moe_combine.test", &f.elementwise);
+            const auto contexts = f.contexts(f.step(op, 0U), el.key);
+            const auto serial = median_us(f, flush, false, [&] { for (const auto& c : contexts) el.function(c, el.user_data); });
+            const auto multi = median_us(f, flush, false, [&] {
+                if (inject) inject_known_window_rows_launch(contexts, f.elementwise); else moe_combine_known_window_rows_launch(contexts, f.elementwise); });
+            std::cout << "bench " << (inject ? "inject" : "combine") << " T=" << rows << " warm: " << rows << "x serial "
+                      << serial << " us, rows " << multi << " us\n";
+        }
+    }
+}
 } // namespace
 
-int main() try {
+int main(int argc, char** argv) try {
+    if (argc > 1 && std::string_view(argv[1]) == "--rows-bench") { rows_bench(); return 0; }
+    router_rows_family();
+    elementwise_rows_family();
     family(false, false);
     family(false, true);
     family(true);
