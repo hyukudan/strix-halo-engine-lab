@@ -2051,7 +2051,18 @@ struct HipPleKnownWindow::Impl {
         case 5: launch(std::integral_constant<unsigned, 5>{}); break;
         case 6: launch(std::integral_constant<unsigned, 6>{}); break;
         case 7: launch(std::integral_constant<unsigned, 7>{}); break;
-        case 8: launch(std::integral_constant<unsigned, 8>{}); break;
+        case 8: {
+            // Eight register-resident rows run 3x slower than two four-row passes (same rows' arithmetic).
+            launch(std::integral_constant<unsigned, 4>{});
+            const auto* upper = gathered + 4U * in_stride;
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(project_wave8_q8_bf16_to_fp32_rows_kernel<4>), dim3((expanded + 7U) / 8U), dim3(256), 0,
+                hip_execution_stream(), upper, in_stride, reinterpret_cast<const void*>(p.tensors.key.runtime->address), width,
+                expanded, keys + 4ULL * expanded, expanded);
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(project_wave8_q8_bf16_to_fp32_rows_kernel<4>), dim3((hidden + 7U) / 8U), dim3(256), 0,
+                hip_execution_stream(), upper, in_stride, reinterpret_cast<const void*>(p.tensors.value.runtime->address), width,
+                hidden, values + 4ULL * hidden, hidden);
+            break;
+        }
         default: return false;
         }
         check_hip(hipGetLastError(), "known-window PLE rows projection launch");

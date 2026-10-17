@@ -8,6 +8,8 @@
 
 #include "strix/dispatch_resources.hpp"
 
+#include <cstdlib>
+#include <string_view>
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
@@ -621,7 +623,18 @@ template <unsigned Rows>
 void launch_lm_head_rows(const LmHeadRowsViews& views, const void* weights,
     std::uint32_t hidden, std::uint32_t vocab, hipStream_t stream) {
     const auto lds = static_cast<std::uint64_t>(Rows) * hidden * 2U;
-    if (Rows > 4U && lds <= lm_head_rows_lds_limit) {
+    // STRIX_LM_HEAD_ROWS_WIDE=w16|direct (wide windows): 16 waves share one staged copy
+    // (twice the resident waves per CU), or no staging; same per-row arithmetic.
+    static const int wide = [] {
+        const char* v = std::getenv("STRIX_LM_HEAD_ROWS_WIDE");
+        return !v ? 0 : std::string_view(v) == "w16" ? 1 : std::string_view(v) == "direct" ? 2 : 0;
+    }();
+    if (Rows > 4U && lds <= lm_head_rows_lds_limit && wide == 1) {
+        constexpr auto rows_per_block = 16U * (lm_head_rows_groups / 2U);
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(prefetch8_wave_q8_lm_head_rows_kernel<16, Rows, lm_head_rows_groups / 2U>),
+            dim3((vocab + rows_per_block - 1U) / rows_per_block), dim3(512), static_cast<std::uint32_t>(lds), stream,
+            views, weights, hidden, vocab);
+    } else if (Rows > 4U && lds <= lm_head_rows_lds_limit && wide == 0) {
         constexpr auto rows_per_block = 8U * lm_head_rows_groups;
         hipLaunchKernelGGL(HIP_KERNEL_NAME(prefetch8_wave_q8_lm_head_rows_kernel<8, Rows, lm_head_rows_groups>),
             dim3((vocab + rows_per_block - 1U) / rows_per_block), dim3(256), static_cast<std::uint32_t>(lds), stream,
