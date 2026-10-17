@@ -1,3 +1,4 @@
+#include "strix/host_phase_timing.hpp"
 #include "strix/hip_mtp_runtime.hpp"
 #include "strix/hip_mtp_attention.hpp"
 #include "strix/hip_mtp_projection.hpp"
@@ -589,10 +590,12 @@ void HipMtpRuntime::reconcile_after_target(const QualifiedMtpDraftPlan& plan,con
         emitted.size()<=p.owner->budget().maximum_candidate_depth+1U,"MTP reconciliation requires actual committed target rows and owner state");
     // Output tokens do not attest draft-cache correctness; real committed
     // tickets and complete teacher-pair coverage above are the authority.
+    host_phase_mark("9a reconcile validation");
     {
         const auto admission=p.owner->admit_native_entry();
         for(const auto& row:p.replay) p.preflight(row.hidden.source_position(),row.next_input_token,true,true);
     }
+    host_phase_mark("9b reconcile preflight");
     try {
         p.next_source=p.base_source;
         // Earlier occupied rows were never overwritten. The whole proposal
@@ -606,8 +609,11 @@ void HipMtpRuntime::reconcile_after_target(const QualifiedMtpDraftPlan& plan,con
             if(!p.replay.empty() && p.first_cache_reusable && p.replay[0].hidden.same_commit(*p.cycle_base) &&
                p.replay[0].hidden.source_position()==p.base_source && p.replay[0].hidden.view()==p.cycle_base->view() &&
                p.replay[0].next_input_token==p.pending_token) {p.reuse_first_teacher_cache(p.replay[0]);first=1;}
+            host_phase_mark("9c reuse first cache");
             p.teacher_cache_rows(std::span<const HipMtpReplayRow>(p.replay).subspan(first));
+            host_phase_mark("9d teacher cache rows (gpu+sync)");
             p.draft->observe(emitted);first=p.replay.size();
+            host_phase_mark("9e draft observe");
         }
         for(std::size_t i=first;i<p.replay.size();++i) {
             const auto& row=p.replay[i];

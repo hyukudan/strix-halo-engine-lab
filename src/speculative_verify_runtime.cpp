@@ -1,3 +1,4 @@
+#include "strix/host_phase_timing.hpp"
 #include <cstdlib>
 #include <cstdio>
 #include <chrono>
@@ -252,11 +253,15 @@ namespace {
 // STRIX_WINDOW_TIMING=1: host-side phase totals of every eager known window, printed at exit.
 struct WindowHostTiming {
     double admit = 0, preflight = 0, plan = 0, launch = 0, complete = 0; std::uint64_t windows = 0;
+    double known_admit = 0, known_preflight = 0, known_plan = 0; std::uint64_t known = 0;
     bool enabled = std::getenv("STRIX_WINDOW_TIMING") != nullptr;
     ~WindowHostTiming() {
         if (enabled && windows)
             std::fprintf(stderr, "window host timing: %llu windows, per window ms: admit %.3f preflight %.3f plan %.3f launch %.3f complete %.3f\n",
                 static_cast<unsigned long long>(windows), admit / static_cast<double>(windows), preflight / static_cast<double>(windows), plan / static_cast<double>(windows), launch / static_cast<double>(windows), complete / static_cast<double>(windows));
+        if (enabled && known)
+            std::fprintf(stderr, "window host timing (repeat windows): %llu, per window ms: admit %.3f preflight %.3f plan %.3f\n",
+                static_cast<unsigned long long>(known), known_admit / static_cast<double>(known), known_preflight / static_cast<double>(known), known_plan / static_cast<double>(known));
     }
 };
 WindowHostTiming& window_host_timing() { static WindowHostTiming t; return t; }
@@ -274,6 +279,7 @@ KnownWindowResult execute_known_prefix_window_eager(
     std::span<const KnownWindowR2Entry> r2_entries,
     std::span<const KnownWindowRowsEntry> rows_entries,
     const KnownWindowExecutionHooks& hooks) {
+    host_phase_mark("5 captured window prologue");
     const auto timing_begin = std::chrono::steady_clock::now(); auto timing_mark = timing_begin;
     // A repeat window of the same owner and launch plans re-checks only what changes per
     // window (tokens, positions, capacity, session); its static admission already passed.
@@ -463,7 +469,8 @@ KnownWindowResult execute_known_prefix_window_eager(
             throw std::invalid_argument("known window host position binding changed after admission");
         std::memcpy(reinterpret_cast<void*>(current.address), &value, sizeof(value));
     };
-    window_host_timing().admit += window_ms_since(timing_mark); timing_mark = std::chrono::steady_clock::now();
+    { const auto ms = window_ms_since(timing_mark); window_host_timing().admit += ms; if (preflight_known) window_host_timing().known_admit += ms; }
+    timing_mark = std::chrono::steady_clock::now();
     hooks.preflight_scope();
     // A missing callback is not an implicit permit. Every row-loop launcher
     // proves its current metadata before PLE can start or any word is written.
@@ -479,10 +486,13 @@ KnownWindowResult execute_known_prefix_window_eager(
             launcher.preflight(contexts[i][r], launcher.user_data);
         }
     }
-    window_host_timing().preflight += window_ms_since(timing_mark); timing_mark = std::chrono::steady_clock::now();
+    { const auto ms = window_ms_since(timing_mark); window_host_timing().preflight += ms; if (preflight_known) window_host_timing().known_preflight += ms; }
+    timing_mark = std::chrono::steady_clock::now();
     if (hooks.preflight_plan) hooks.preflight_plan();
     if (hooks.preflight_memo && !preflight_known) hooks.preflight_memo->push_back(preflight_key);
-    window_host_timing().plan += window_ms_since(timing_mark); timing_mark = std::chrono::steady_clock::now();
+    { const auto ms = window_ms_since(timing_mark); window_host_timing().plan += ms;
+      if (preflight_known) { window_host_timing().known_plan += ms; ++window_host_timing().known; } }
+    timing_mark = std::chrono::steady_clock::now();
     if(hooks.record_actual_window_lineage) {
         const auto recipe=actual_window_recipe(window,serial,row_launch,selected,selected_rows);
         next_lineage=prepare_known_window_chunk_lineage(session.arithmetic_lineage,session.next_position,post_position,
@@ -496,6 +506,7 @@ KnownWindowResult execute_known_prefix_window_eager(
     // As in the serial session API, a lookup start that returns no handle or
     // throws before host/device mutation is an admission/start failure, not a
     // poisoned target. The backend owns cancellation of any failed start.
+    host_phase_mark("6 window admission");
     if (serial_resources.ple_lookup && serial_resources.ple_hash_contract && serial_resources.ple_prefetch) {
             const auto ple = std::find_if(serial.execution.steps.begin(), serial.execution.steps.end(),
                 [](const ExecutionStep& step) { return step.op == SerialOp::ple; });

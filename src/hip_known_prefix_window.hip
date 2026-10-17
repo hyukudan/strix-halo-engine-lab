@@ -817,6 +817,7 @@ std::shared_ptr<HipMtpTargetWindowCapture> HipKnownPrefixWindow::prepare_mtp_tar
     auto capture=HipMtpTargetWindowCapture::create(impl_.get(),impl_->model,impl_->serial,impl_->window,impl_->resources,
         impl_->scratch,impl_->scope,impl_->actual_owner,policy);
     impl_->prepare_capture(capture);
+    capture->use_device_greedy(impl_->greedy_replies);
     return capture;
 }
 HipMtpTargetWindowExecution HipKnownPrefixWindow::execute_mtp_captured(SerialSessionContext& session,std::span<const std::uint32_t> tokens,

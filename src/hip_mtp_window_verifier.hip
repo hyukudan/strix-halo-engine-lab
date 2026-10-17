@@ -1,13 +1,18 @@
+#include "strix/host_phase_timing.hpp"
 #include "strix/hip_mtp_window_verifier.hpp"
 #include "strix/mtp_target_window_policy.hpp"
 #include "strix/hip_mtp_native_validation.hpp"
 #include "strix/arithmetic_lineage.hpp"
 #include "strix/session_state_memory.hpp"
+#include "strix/hip_generation_output.hpp"
 #include <hip/hip_runtime.h>
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
+#include <memory>
+#include <string_view>
 #include <optional>
 #include <stdexcept>
 namespace strix {
@@ -37,6 +42,7 @@ struct HipMtpWindowVerifier::Impl {
         std::array<std::shared_ptr<HipMtpTargetWindowCapture>,4> captures;
         std::uint32_t rows=0;
         HipMtpWindowOwnerStats stats;
+        std::shared_ptr<void> greedy_partials,greedy_replies;
     };
     std::shared_ptr<HipMtpTargetHidden> target;
     std::vector<Owner> owners; // ascending rows
@@ -73,7 +79,7 @@ struct HipMtpWindowVerifier::Impl {
                 "MTP window verifier requires actual closed all-row target owners");
             require(owners.empty() || (owners.back().rows<candidate->logical_rows() && candidate->defers_state() &&
                 owners.front().window->defers_state()),"MTP window owners must have distinct rows and prefix acceptance");
-            owners.push_back({candidate,{},candidate->logical_rows(),{candidate->logical_rows(),0,0.0}});
+            owners.push_back({candidate,{},candidate->logical_rows(),{candidate->logical_rows(),0,0.0},{},{}});
         }
         window=owners.back().window;
         prefix=window->defers_state();
@@ -84,6 +90,22 @@ struct HipMtpWindowVerifier::Impl {
             mtp_native::product(policy.capture.retained_byte_budget,4U*owners.size()));
         require(policy.total_retained_byte_budget && reservation.retained_bytes<=policy.checkpoint_retained_byte_budget &&
             upper<=policy.total_retained_byte_budget,"MTP window verification exceeds upfront combined retained reservation");
+        // Every row's argmax runs on the window stream right after its head rows and lands in
+        // host-mapped memory: one completion per window instead of a selector round trip per
+        // row. STRIX_MTP_GREEDY_ROWS=0 keeps the per-row selectors.
+        const char* greedy_rows=std::getenv("STRIX_MTP_GREEDY_ROWS");
+        if(!greedy_rows || std::string_view(greedy_rows)!="0") for(auto& o:owners) {
+            const auto vocab=static_cast<std::uint32_t>(target->model().vocab_size);
+            const auto bytes=hip_greedy_rows_scratch_bytes(o.rows,vocab);
+            void* partials=nullptr;void* replies=nullptr;
+            require(hipMalloc(&partials,bytes)==hipSuccess,"MTP greedy rows scratch");
+            o.greedy_partials=std::shared_ptr<void>(partials,[](void* p){(void)hipFree(p);});
+            require(hipHostMalloc(&replies,sizeof(HipGreedyRowsReply)*o.rows,hipHostMallocMapped|hipHostMallocCoherent)==hipSuccess,
+                "MTP greedy rows replies");
+            o.greedy_replies=std::shared_ptr<void>(replies,[](void* p){(void)hipHostFree(p);});
+            ExecutionBufferAddress view{};view.address=reinterpret_cast<std::uintptr_t>(partials);view.bytes=bytes;
+            o.window->attach_greedy_rows(view,static_cast<HipGreedyRowsReply*>(replies));
+        }
         for(auto& o:owners) for(auto& capture:o.captures) {
             capture=o.window->prepare_mtp_target_capture(policy.capture);
             target->validate_window_capture(*capture);
@@ -218,7 +240,9 @@ HipMtpVerifiedTargetRows HipMtpWindowVerifier::verify(SerialSessionContext& sess
             std::vector<std::uint32_t> inputs;inputs.reserve(rows);inputs.push_back(pending);
             for(std::uint32_t r=1;r<rows;++r) inputs.push_back(candidates[std::min<std::size_t>(r-1U,candidates.size()-1U)]);
             const auto previous=session;
+            host_phase_mark("4 verify prologue");
             auto native=owner->window->execute_mtp_captured(session,inputs,capture);
+            host_phase_mark("7 window launch+wait");
             attempted_target=true;out.attempted_window=true;
             out.r2_dispatches=native.execution.r2_dispatches;
             out.projection_launches_saved=native.execution.projection_launches_saved;
@@ -229,7 +253,9 @@ HipMtpVerifiedTargetRows HipMtpWindowVerifier::verify(SerialSessionContext& sess
             std::uint32_t a=0;
             while(a+1U<rows && a<candidates.size() && a+1U<budget && inputs[a+1U]==selected[a] && !is_eos(selected[a])) ++a;
             const auto n_keep=a+1U;
+            host_phase_mark("7a select/accept");
             owner->window->commit_prefix(n_keep);i.last=owner;
+            host_phase_mark("7b commit prefix");
             if(n_keep<rows) {
                 const auto dropped=rows-n_keep;
                 session.next_position-=dropped;session.committed_tokens-=dropped;
@@ -238,11 +264,14 @@ HipMtpVerifiedTargetRows HipMtpWindowVerifier::verify(SerialSessionContext& sess
                     last.begin+n_keep,last.numerical_plan_identity,last.reduction_plan_identity,last.state_update_identity);
                 write_position_word(i.resources,session.next_position-1U);
             }
+            host_phase_mark("7c lineage");
             out.committed_rows=i.target->accept_verified_prefix(provisional,initial,session,n_keep);
+            host_phase_mark("7d accept prefix");
             out.emitted_tokens.assign(selected.begin(),selected.begin()+n_keep);
             out.accepted_candidates=a;out.accepted_window=n_keep==rows;
             if(probabilities.size()==candidates.size())i.calibrate(probabilities,a,rows-1U);
             i.observe(owner,n_keep);
+            host_phase_mark("7e calibrate/observe");
             i.busy=false;return out;
         }
         if(i.prefix && i.last) i.last->window->flush_deferred();

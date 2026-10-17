@@ -1,3 +1,4 @@
+#include "strix/host_phase_timing.hpp"
 #include "strix/hip_mtp_greedy_runtime.hpp"
 #include "strix/mtp_sidecar_binding.hpp"
 #include "strix/hip_mtp_window_verifier.hpp"
@@ -133,17 +134,22 @@ HipMtpGreedyCycleResult HipMtpGreedyRuntime::cycle(const HipMtpTargetHiddenTicke
     if(out.eos)return out;
     i.busy=true;
     try {
+        host_phase_mark("0 cycle start",true);
         validate_draft_proposal_state(i.draft,*i.session);
         i.cycled=true;
         i.mtp->begin_cycle(pending,initial);
         begin_draft_proposal(i.draft,*i.session);
+        host_phase_mark("1 begin cycle");
         const auto candidates=i.mtp->draft_head()?i.mtp->propose_chain(i.plan,i.activation,*i.session,i.draft,depth,i.min_probability):
             i.backend->propose_candidates(*i.session,i.draft,depth);
+        host_phase_mark("2 draft chain");
         out.proposed_candidates=static_cast<std::uint32_t>(candidates.size());
         finish_draft_proposal(i.draft);
+        host_phase_mark("3 finish proposal");
         if(i.window) {
             auto verified=i.window->verify(*i.session,*i.dispatcher,initial,candidates,budget,eos,
                 i.mtp->draft_head()?i.mtp->draft_probabilities():std::span<const float>{});
+            host_phase_mark("8 verify tail");
             require(!verified.committed_rows.empty() && verified.committed_rows.size()==verified.emitted_tokens.size(),
                 "MTP target verifier returned no actual aligned committed output rows");
             for(const auto& ticket:verified.committed_rows) {
@@ -171,9 +177,11 @@ HipMtpGreedyCycleResult HipMtpGreedyRuntime::cycle(const HipMtpTargetHiddenTicke
             if(out.eos || out.terminal_budget || !accepted)break;
         }
         }
+        host_phase_mark("9 cycle bookkeeping");
         i.mtp->set_reconciliation_rows(replay,out.final_target);
         i.backend->reconcile_after_target(i.draft,*i.session,out.emitted_tokens);
         reconcile_draft_proposal_state(i.draft,*i.session);
+        host_phase_mark("a reconcile");
         i.busy=false;return out;
     } catch(...) {
         i.mtp->cancel();i.failed=true;i.busy=false;poison_draft_proposal_state(i.draft);

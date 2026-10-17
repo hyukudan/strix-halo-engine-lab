@@ -7,6 +7,7 @@
 namespace strix {
 class HipKnownPrefixWindow;
 class HipMtpTargetWindowCapture;
+struct HipGreedyRowsReply;
 struct HipMtpTargetWindowCapturePolicy {
     std::uint64_t retained_byte_budget=0,maximum_history_intervals=0;
 };
@@ -76,6 +77,8 @@ private:
     void preflight_row(const ExecutionDispatchContext&) const;
     void record_row(const ExecutionDispatchContext&);
     void completed_before_publish();
+    // Host-mapped replies the window head rows fill (null: per-row selectors).
+    void use_device_greedy(const HipGreedyRowsReply* replies) noexcept;
     [[nodiscard]] HipMtpTargetWindowBatch seal(const SerialSessionContext&);
     void abort() noexcept;
     [[nodiscard]] std::uint32_t tap_step() const noexcept;
