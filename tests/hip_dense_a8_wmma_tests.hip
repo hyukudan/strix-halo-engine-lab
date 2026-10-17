@@ -262,7 +262,8 @@ struct Buffer {
     template <class T> std::vector<T> download() const {
         std::vector<T> v(bytes / sizeof(T)); check(hipMemcpy(v.data(), p, bytes, hipMemcpyDeviceToHost), "download"); return v;
     }
-    void poison() const { check(hipMemset(p, 0xa5, bytes), "poison"); }
+    // On the fixture stream (non-blocking: it does not order against null-stream memsets).
+    void poison(hipStream_t stream) const { check(hipMemsetAsync(p, 0xa5, bytes, stream), "poison"); }
 };
 
 float half_to_float(std::uint16_t h) {
@@ -471,7 +472,7 @@ void exact_case(hipStream_t stream, const Shape& shape, std::uint32_t rows, unsi
     const auto x = make_inputs(rows, shape.width, shape.bf16, flavor, rng);
     Buffer weights(weights_host.size()); weights.upload(weights_host);
     Activations a(rows, shape.width, shape.bf16); a.upload(x);
-    check(hipMemset(a.deltas.p, 0xff, a.deltas.bytes), "poison padding deltas (NaN)");
+    check(hipMemsetAsync(a.deltas.p, 0xff, a.deltas.bytes, stream), "poison padding deltas (NaN)");
     a.quantize(stream);
     check(hipStreamSynchronize(stream), "quantize");
     const auto q = quantize_reference(x, rows, shape.width, a.stride);
@@ -486,7 +487,7 @@ void exact_case(hipStream_t stream, const Shape& shape, std::uint32_t rows, unsi
 
     Buffer out(static_cast<std::size_t>(rows) * outputs * 4U);
     // Decode form: 8 rows per launch, group width 8 (the reference result for the WMMA kernels).
-    out.poison();
+    out.poison(stream);
     for (std::uint32_t r = 0; r < rows; r += 8U) launch_dot4_rows<8U>(std::min(8U, rows - r), a, weights, out, r, outputs, stream);
     check(hipStreamSynchronize(stream), "dot4");
     const auto decode = out.download<float>();
@@ -502,7 +503,7 @@ void exact_case(hipStream_t stream, const Shape& shape, std::uint32_t rows, unsi
         }
     // Other group widths and row counts (1..7 rows per launch at varying offsets).
     for (const unsigned g : {1U, 2U, 4U}) {
-        out.poison();
+        out.poison(stream);
         for (std::uint32_t r = 0, k = 0; r < rows; ++k) {
             const unsigned count = std::min(1U + (k * 3U + g) % 8U, rows - r);
             if (g == 1U) launch_dot4_rows<1U>(count, a, weights, out, r, outputs, stream);
@@ -515,7 +516,7 @@ void exact_case(hipStream_t stream, const Shape& shape, std::uint32_t rows, unsi
     }
     // Prefill form.
     for (const auto t : tiles) {
-        out.poison();
+        out.poison(stream);
         launch_wmma(t, a, weights, out, outputs, stream);
         check(hipStreamSynchronize(stream), "wmma");
         compare(decode, out.download<float>(), outputs, tag + " wmma " + tile_name(t));
