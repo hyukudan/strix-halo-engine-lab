@@ -1231,12 +1231,15 @@ void known_window_qsa_tests(const strix::ModelContract& model) {
             expect(read_word(result.logits[row].address)==serial[row],"QSA rows preserve every row's complete output");
         expect(result.qsa_rows_dispatches==12U && result.r2_variant_dispatches[static_cast<std::size_t>(expected)]==12U,
             "QSA rows dispatch once per QSA layer");
-        KnownRuntimeFixture missing(model,false,false,rows,false,strix::KnownWindowOutputPolicy::all_rows,true);
+        KnownRuntimeFixture missing(model,false,false,rows,false,strix::KnownWindowOutputPolicy::all_rows,false,true);
         plans.clear();for(const auto& plan:missing.row_launch) plans.push_back(&plan);
         reject([&]{(void)strix::execute_known_prefix_window_eager(missing.window,missing.source.serial,missing.resources,
             missing.window_memory,missing.session,missing.tokens,plans,{},{},missing.hooks());},
             "missing QSA rows callback rejects before dispatch");
         expect(missing.trace.calls==0U && missing.session.next_position==0U,"rejected QSA window mutates nothing");
+    }
+}
+
 void known_window_lm_head_rows_tests(const strix::ModelContract& model) {
     using V=strix::KnownWindowR2Variant;
     using M=strix::KnownWindowStepMode;

@@ -3,12 +3,12 @@
 #include "strix/execution_io.hpp"
 #include "strix/execution_plan.hpp"
 #include "strix/hip_gdn_launcher.hpp"
+#include "strix/hip_generation_output.hpp"
+#include "strix/hip_lm_head_launcher.hpp"
 #include "strix/hip_hyper_mix_launcher.hpp"
 #include "strix/hip_indexed_attention_launcher.hpp"
 #include "strix/indexed_attention_state.hpp"
 #include "strix/indexed_attention_workspace.hpp"
-#include "strix/hip_generation_output.hpp"
-#include "strix/hip_lm_head_launcher.hpp"
 #include "strix/hip_launch_context.hpp"
 #include "strix/execution_buffers.hpp"
 #include "strix/hip_moe_route_launcher.hpp"
@@ -1399,6 +1399,7 @@ void bench_hyper_rows(bool splitk, bool lane, std::uint32_t count, bool cold) {
     std::cout << "hc-rows-bench projection=" << (splitk ? "splitk-f32" : "batched-v8") << " output=" << (lane ? "lane-chain" : "q8-batched")
         << " T=" << count << (cold ? " cold" : " warm") << " serial_us=" << serial << " rows_us=" << rows
         << " speedup=" << serial / rows << '\n';
+}
 // Terminal head over real window row views: the configured prefetch R1 head
 // per row is the oracle; device greedy rows land in host-mapped memory.
 void family_lm_head_rows(std::uint32_t rows) {
@@ -1771,9 +1772,8 @@ int main(int argc, char** argv) try {
     qsa_rows_family(true, true, false);
     qsa_rows_family(false, false, true);
     qsa_rows_family(false, false, false);
-    std::cout << "known-window shared/GDN/QSA component fixtures passed\n";
     for(auto rows:{2U,4U,8U}) family_lm_head_rows(rows);
-    std::cout << "known-window shared/GDN/LM-head component fixtures passed\n";
+    std::cout << "known-window shared/GDN/QSA/LM-head component fixtures passed\n";
     return 0;
 } catch (const std::exception& error) {
     std::cerr << "known-window component fixture failed: " << error.what() << '\n';

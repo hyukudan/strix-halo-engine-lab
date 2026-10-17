@@ -148,7 +148,7 @@ struct CompiledKnownPrefixWindow {
 [[nodiscard]] inline bool known_window_has_promoted_steps(const CompiledKnownPrefixWindow& window) noexcept {
     return window.r2_steps || window.shared_rows_steps || window.gdn_rows_steps || window.routed_expert_union_steps ||
         window.hyper_mix_rows_steps || window.qsa_rows_steps ||
-        window.gdn_deferred_rows_steps || window.ple_rows_steps || window.lm_head_rows_steps;
+        window.gdn_deferred_rows_steps || window.ple_rows_steps || window.lm_head_rows_steps ||
         window.router_rows_steps || window.combine_inject_rows_steps;
 }
 // Modes dispatched through one KnownWindowRowsEntry covering every row.

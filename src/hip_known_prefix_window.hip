@@ -498,6 +498,7 @@ struct HipKnownPrefixWindow::Impl {
         }
         check(hipStreamSynchronize(scope.stream),"complete deferred GDN commit");
         gdn_control()->pending_rows=0; gdn_pending=false;
+    }
     void setup_head_rows() {
         if(!window.lm_head_rows_steps) return;
         head_config.hidden_size=u32(model.hidden_size); head_config.vocab_size=u32(model.vocab_size);

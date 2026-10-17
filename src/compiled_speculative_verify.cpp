@@ -531,6 +531,7 @@ KnownWindowR2Variant hyper_rows_variant(std::uint32_t rows) {
 // Q8 down + Q8 up (+ F32 injection) per mixer, read once per window instead of per row.
 std::uint64_t known_hyper_projection_bytes(SerialOp op) {
     return 2ULL*(10240ULL/32ULL*34ULL*320ULL) + (op==SerialOp::final_hyper_mix ? 0ULL : 10240ULL*4ULL*4ULL);
+}
 bool known_router_rows_id(std::string_view id) {
     return id.starts_with("hip.moe_route.") && id.ends_with(".parallel");
 }
