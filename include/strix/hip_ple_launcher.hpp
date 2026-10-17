@@ -9,6 +9,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <string>
 
 namespace strix {
@@ -70,6 +71,27 @@ private:
     struct OwnedUploads;
     std::unique_ptr<OwnedUploads> uploads_;
     HipPleLauncherConfig config_;
+};
+
+// Known-window PLE for T consecutive rows. The tokens of a verify window are known before it
+// starts, so every row's n-gram lookup is resolved on the host into pinned staging that the GPU
+// reads in place (unified memory: no copy and no synchronisation inside the window). The host
+// n-gram history is not advanced by launch(); the PLE convolution state after each row is kept,
+// and commit(n_keep) restores row n_keep-1's convolution state and publishes its history.
+class HipPleKnownWindow {
+public:
+    HipPleKnownWindow(const ModelContract& model, HipActivationStorage activation, std::uint32_t max_rows);
+    ~HipPleKnownWindow();
+    HipPleKnownWindow(const HipPleKnownWindow&) = delete;
+    HipPleKnownWindow& operator=(const HipPleKnownWindow&) = delete;
+    void preflight(std::span<const ExecutionDispatchContext> rows) const;
+    void launch(std::span<const ExecutionDispatchContext> rows);
+    // Enqueues on `stream` (a hipStream_t); the host history is written immediately.
+    void commit(std::uint32_t n_keep, void* stream);
+    [[nodiscard]] std::uint32_t last_rows() const noexcept;
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
 };
 
 }  // namespace strix
