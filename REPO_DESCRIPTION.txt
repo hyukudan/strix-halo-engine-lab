@@ -1,0 +1,3 @@
+LLM inference engine for AMD Strix Halo (gfx1151, ROCm/HIP) running Qwen3.8-Flash-Next: exact MTP speculative decoding with adaptive 2/4/8-row verify windows, bit-identical to serial greedy decode.
+
+Topics: llm-inference, amd, strix-halo, rocm, hip, gfx1151, speculative-decoding, mtp, mixture-of-experts, gguf, unified-memory

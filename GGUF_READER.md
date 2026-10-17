@@ -1,41 +1,41 @@
-# Lector GGUF A0.2
+# GGUF reader A0.2
 
-Fuente estructural fijada: `ggml-org/ggml@353b63b439f27ab2cc19dac97ab1681ba6d2d084`,
+Pinned structural source: `ggml-org/ggml@353b63b439f27ab2cc19dac97ab1681ba6d2d084`,
 `docs/gguf.md` (GGUF v3).
 
-Geometría `(elementos por bloque, bytes por bloque)` fijada desde
+`(elements per block, bytes per block)` geometry pinned from
 `ggml-org/llama.cpp@6c7a87f7e5e5cd75b8a641c3471f2dee84a6ed17`,
 `gguf-py/gguf/constants.py::GGML_QUANT_SIZES`.
 
-## Alcance implementado
+## Implemented scope
 
-- magic y versión v3;
-- enteros y floats little-endian sin depender del endianess del host;
-- tipos escalares, strings y arrays anidados de metadata;
-- límites previos a reservar para metadata, tensors, strings, arrays y profundidad;
-- claves jerárquicas ASCII, claves y nombres de tensor únicos;
-- booleanos restringidos a 0/1;
-- `general.alignment`, padding cero, dimensiones y offsets relativos/absolutos;
-- rechazo de tipos GGML retirados o desconocidos en la revisión fijada;
-- cálculo overflow-safe de bytes/rango para los tipos 0–39 vigentes, incluida
-  divisibilidad de la primera dimensión por el bloque cuantizado;
-- rechazo de rangos que salen del fichero o se solapan;
-- resumen de arrays sin conservar vocabularios/listas gigantes en memoria;
-- CLI JSON `strix-inspect-gguf`.
+- magic and version v3;
+- little-endian integers and floats without depending on host endianness;
+- scalar types, strings and nested metadata arrays;
+- limits checked before reserving for metadata, tensors, strings, arrays and depth;
+- hierarchical ASCII keys, unique keys and tensor names;
+- booleans restricted to 0/1;
+- `general.alignment`, zero padding, dimensions and relative/absolute offsets;
+- rejection of GGML types that are retired or unknown at the pinned revision;
+- overflow-safe byte/range computation for the current types 0–39, including
+  divisibility of the first dimension by the quantization block;
+- rejection of ranges that extend past the file or overlap;
+- array summaries without keeping huge vocabularies/lists in memory;
+- `strix-inspect-gguf` JSON CLI.
 
-## Límites deliberados
+## Deliberate limits
 
-- Solo little-endian. GGUF v3 permite big-endian, pero la especificación fijada
-  reconoce que el fichero no permite autodetectarlo de forma fiable.
-- Los nuevos tipos posteriores a la revisión fijada se rechazan hasta actualizar
-  explícitamente la tabla y sus fixtures.
-- No se aceptan versiones futuras por defecto. Actualizar la revisión de la spec
-  debe ser un cambio explícito con fixtures nuevos.
-- La metadata no se interpreta aún como contrato Qwen; el loader genérico y la
-  validación de arquitectura son capas separadas.
+- Little-endian only. GGUF v3 allows big-endian, but the pinned specification
+  acknowledges that the file does not allow reliable autodetection.
+- New types added after the pinned revision are rejected until the table and
+  its fixtures are explicitly updated.
+- Future versions are not accepted by default. Updating the spec revision must
+  be an explicit change with new fixtures.
+- Metadata is not yet interpreted as a Qwen contract; the generic loader and
+  architecture validation are separate layers.
 
-## Seguridad
+## Security
 
-El lector trata todo GGUF como entrada no confiable. Los contadores se validan
-antes de `reserve`, las sumas de offsets detectan overflow y los arrays llevan
-un presupuesto agregado. Los tests se ejecutan también con ASan+UBSan.
+The reader treats every GGUF file as untrusted input. Counts are validated
+before `reserve`, offset sums detect overflow and arrays share an aggregate
+budget. The tests also run under ASan+UBSan.

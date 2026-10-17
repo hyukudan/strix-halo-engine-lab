@@ -58,6 +58,16 @@ A wider kernel, larger speculative window, second node or second physical link i
 - [15 — Optimization strategy](architecture/15-optimization-strategy.md)
 - [16 — Direct GPU transport over USB4](architecture/16-direct-gpu-transport.md)
 
+## Speculative decode path
+
+- [Multi-row verify window: design and status](VERIFY_WINDOW_PLAN.md).
+- [MTP command line](mtp-native-cli.md) and [MTP runtime contract](mtp-native-runtime.md).
+- [Known-prefix window](known-prefix-window.md).
+- [Automatic decode optimization profile](decode-optimization-profile.md).
+
+The decisions behind this path (D-021 to D-031, and the measured rejections) are in
+[`DECISIONS.md`](../DECISIONS.md).
+
 ## Draft investigations
 
 - [Current qualification ledger](qualification-ledger.md).
