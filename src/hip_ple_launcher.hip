@@ -14,6 +14,9 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdlib>
+#include <cstdio>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -21,6 +24,7 @@
 #include <optional>
 #include <span>
 #include <stdexcept>
+#include <thread>
 #include <type_traits>
 #include <vector>
 #include <string>
@@ -2078,7 +2082,27 @@ struct HipPleKnownWindow::Impl {
         std::vector<PreparedPleLaunch> out;
         out.reserve(spans.size());
         for (std::size_t r = 0; r < spans.size(); ++r) {
-            out.push_back(prepare_ple_launch(spans[r], &config));
+            if (prefill && r > 0U) {
+                // Prefill rows of one step share config, tensors, layout, hash contract and session state with
+                // row 0 (checked below); only the row's own arena views differ, resolved and size-checked here.
+                const auto& row = spans[r];
+                const auto& head = spans[0];
+                if (row.op != head.op || row.step_id != head.step_id || row.layer != head.layer ||
+                    row.kernel_id != head.kernel_id || row.execution_identity != head.execution_identity ||
+                    row.resources != head.resources || row.logical_rows != 1U || row.request_concurrency != 1U ||
+                    row.reads.size() != 1U || row.writes.size() != 1U || row.temporaries.size() != 1U)
+                    throw std::invalid_argument("prefill PLE rows differ from their first row");
+                auto copy = out.front();
+                copy.input = resolve_dispatch_read(row, 0);
+                copy.output = resolve_dispatch_write(row, 0);
+                copy.temporary = resolve_dispatch_temporary(row, 0);
+                copy.ngram_state = resolve_dispatch_state(row, SessionStateComponent::ngram_history);
+                copy.conv_state = resolve_dispatch_state(row, SessionStateComponent::ple_convolution);
+                if (copy.input.bytes < out.front().input.bytes || copy.output.bytes < out.front().output.bytes ||
+                    copy.temporary.bytes < out.front().temporary.bytes)
+                    throw std::invalid_argument("prefill PLE row buffers are undersized");
+                out.push_back(copy);
+            } else out.push_back(prepare_ple_launch(spans[r], &config));
             const auto& a = out.front(); const auto& b = out.back();
             if (spans[r].position != spans[0].position + r || b.conv_state.address != a.conv_state.address ||
                 b.conv_state.bytes != a.conv_state.bytes || b.ngram_state.address != a.ngram_state.address ||
@@ -2128,7 +2152,16 @@ void HipPleKnownWindow::preflight(std::span<const ExecutionDispatchContext> rows
 
 void HipPleKnownWindow::launch(std::span<const ExecutionDispatchContext> rows) {
     auto& w = *impl_;
+    static const bool timing = [] { const char* v = std::getenv("STRIX_PREFILL_TIMING"); return v && v[0] == '1'; }();
+    auto mark = std::chrono::steady_clock::now();
+    const auto lap = [&](const char* name) {
+        if (!timing || !w.prefill) return;
+        const auto now = std::chrono::steady_clock::now();
+        std::fprintf(stderr, "prefill ple %-8s %8.2f ms\n", name, std::chrono::duration<double, std::milli>(now - mark).count());
+        mark = now;
+    };
     const auto prepared = w.prepare(rows);
+    lap("prepare");
     const auto& contract = prepared[0].hash_contract;
     auto& backend = *rows[0].resources->ple_lookup;
     auto* prefetch = rows[0].resources->ple_prefetch;
@@ -2143,10 +2176,22 @@ void HipPleKnownWindow::launch(std::span<const ExecutionDispatchContext> rows) {
     // The slot was last read by the window before the previous one.
     if (w.recorded[w.slot]) check_hip(hipEventSynchronize(w.released[w.slot]), "known-window PLE staging reuse");
     auto* staging = w.staging[w.slot];
+    // Prefill blocks on the file-mapped backend: the n-gram hashes chain row to row, but each row's
+    // gather (IQ4_NL decode to BF16) is independent, so the rows are hashed in order on this thread and
+    // gathered by up to 8 threads, each with its own stateless file-mapped backend.
+    static const std::uint64_t mapped_identity = FileMappedPleLookupBackend{}.implementation_identity();
+    const bool parallel = w.prefill && rows.size() >= 32U && backend.implementation_identity() == mapped_identity;
+    std::vector<std::size_t> deferred;
     for (std::size_t r = 0; r < rows.size(); ++r) {
         auto* destination = staging + r * w.stride;
         PleHashResult hash;
-        if (r == 0 && prefetch && prefetch->active) {
+        if (parallel && !(r == 0 && prefetch && prefetch->active)) {
+            hash = hash_ple_token(contract, rows[r].input_token_id,
+                std::span<const std::uint32_t>(previous.data(), context_count));
+            if (static_cast<std::uint64_t>(hash.row_count) * contract.row_bytes > w.stride)
+                throw std::overflow_error("PLE lookup exceeds window staging");
+            deferred.push_back(r);
+        } else if (r == 0 && prefetch && prefetch->active) {
             if (prefetch->lookup_bytes > w.stride) throw std::overflow_error("PLE prefetched lookup exceeds window staging");
             hash = finish_ple_lookup_prefetch(rows[0].input_token_id, rows[0].position, backend, *prefetch,
                 std::span<std::byte>(destination, static_cast<std::size_t>(prefetch->lookup_bytes)));
@@ -2172,6 +2217,37 @@ void HipPleKnownWindow::launch(std::span<const ExecutionDispatchContext> rows) {
         std::copy_n(hash.next_context.begin(), context_count, previous.begin());
         w.hashes[r] = hash;
     }
+    lap("hash");
+    if (!deferred.empty()) {
+        const auto workers = static_cast<std::size_t>(std::min(8U, std::max(1U, std::thread::hardware_concurrency())));
+        std::vector<std::exception_ptr> errors(workers);
+        const auto gather = [&](std::size_t worker) {
+            try {
+                FileMappedPleLookupBackend local;
+                for (std::size_t i = worker; i < deferred.size(); i += workers) {
+                    const auto r = deferred[i];
+                    const auto& hash = w.hashes[r];
+                    PleLookupRequest lookup;
+                    lookup.row_ids = std::span<const std::uint64_t>(hash.row_ids.data(), hash.row_count);
+                    lookup.row_bytes = contract.row_bytes;
+                    lookup.table_manifest = prepared[r].tensors.table.manifest;
+                    lookup.table_runtime = prepared[r].tensors.table.runtime;
+                    const auto handle = local.start(lookup);
+                    try {
+                        local.finish(handle, std::span<std::byte>(staging + r * w.stride,
+                            static_cast<std::size_t>(static_cast<std::uint64_t>(hash.row_count) * contract.row_bytes)));
+                    } catch (...) { local.cancel(handle); throw; }
+                }
+            } catch (...) { errors[worker] = std::current_exception(); }
+        };
+        std::vector<std::thread> threads;
+        threads.reserve(workers - 1U);
+        for (std::size_t t = 1; t < workers; ++t) threads.emplace_back(gather, t);
+        gather(0);
+        for (auto& thread : threads) thread.join();
+        for (const auto& error : errors) if (error) std::rethrow_exception(error);
+    }
+    lap("gather");
     void* device = nullptr;
     check_hip(hipHostGetDevicePointer(&device, staging, 0), "known-window PLE staging device view");
     const auto stream = hip_execution_stream();
