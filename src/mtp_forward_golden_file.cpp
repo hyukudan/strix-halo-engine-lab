@@ -6,6 +6,7 @@
 #include <fstream>
 #include <limits>
 #include <stdexcept>
+#include <string_view>
 
 namespace strix {
 namespace {
@@ -157,5 +158,20 @@ HipMtpForwardGolden read_mtp_forward_golden_file(const std::filesystem::path& pa
         throw std::runtime_error("MTP golden file changed size or could not be read completely");
     require(sha256_bytes(contents)==expected,"MTP golden full-file SHA differs");
     return decode(contents);
+}
+ModelContentIdentity write_mtp_forward_golden_file(const std::filesystem::path& path,
+    const HipMtpForwardGolden& golden,std::uint64_t maximum) {
+    const auto bytes=encode_mtp_forward_golden_file(golden,maximum);
+    require(!std::filesystem::exists(path),"MTP golden output file already exists");
+    {
+        std::ofstream file(path,std::ios::binary|std::ios::trunc);
+        if(!file.write(reinterpret_cast<const char*>(bytes.data()),static_cast<std::streamsize>(bytes.size())) || !file.flush())
+            throw std::runtime_error("cannot write MTP golden file");
+    }
+    return sha256_bytes(bytes);
+}
+ModelContentIdentity mtp_self_generated_golden_source() {
+    constexpr std::string_view marker="strix-mtp-golden:self-generated-native-forward:not-independent:v1";
+    return sha256_bytes(std::as_bytes(std::span<const char>(marker.data(),marker.size())));
 }
 } // namespace strix

@@ -217,6 +217,19 @@ int main(){try{
         require(exact,"metadata diagnostic rejects unused golden parameters explicitly");
     }
     set(metadata,"--mtp-metadata-only","0");reject(metadata,"metadata diagnostic requires its explicit value");
+    auto dump=request();
+    for(const auto* key:{"--mtp-golden","--mtp-golden-sha256"}){
+        for(auto it=dump.begin();it!=dump.end();++it)if(*it==key){dump.erase(it,it+2);break;}
+    }
+    dump.insert(dump.end(),{"--mtp-golden-dump","self.golden"});
+    const auto dumped=parse(dump);
+    require(dumped.mtp.golden_dump=="self.golden" && dumped.mtp.golden.empty() && !dumped.mtp.metadata_only,
+        "golden dump replaces the input golden pins");
+    reject_as([&]{auto a=dump;a.insert(a.end(),{"--mtp-golden","in.bin"});return a;}(),
+        "MTP golden dump writes a golden and does not accept an input golden","golden dump rejects an input golden");
+    reject_as([&]{auto a=dump;a.insert(a.end(),{"--mtp-metadata-only","1"});return a;}(),
+        "MTP metadata diagnostic does not accept unused golden options","golden dump excludes metadata diagnostic");
+    reject([&]{auto a=request();a.insert(a.end(),{"--mtp-golden-dump","self.golden"});return a;}(),"dump with full golden pins rejected");
     for(const auto* flag:{"--prepared-eager","--moe-shared-overlap","--gdn-islands","--gpu-greedy-token","--prompt-lookup",
         "--prefix-cache-roundtrip","--device-queue-trace"}){
         auto bad=request();bad.push_back(flag);reject(bad,"incompatible MTP route rejects at parsing before native setup");
