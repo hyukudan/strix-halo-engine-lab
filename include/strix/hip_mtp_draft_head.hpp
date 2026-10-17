@@ -18,6 +18,9 @@ struct HipMtpDraftHeadConfig {
     bool full=true;
     std::vector<std::uint32_t> base_tokens;
     std::uint32_t context_capacity=0;
+    // Subset rows requantized Q8_0 -> Q4_0 at gather (about half the head bytes);
+    // changes draft logits only, so acceptance must be checked A/B.
+    bool q4=false;
 };
 struct HipMtpDraftHeadStats {
     std::uint32_t rows=0,base_rows=0,context_rows=0,context_dropped=0;
