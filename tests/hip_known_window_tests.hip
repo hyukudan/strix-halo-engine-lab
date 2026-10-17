@@ -3,6 +3,7 @@
 #include "strix/execution_io.hpp"
 #include "strix/execution_plan.hpp"
 #include "strix/hip_gdn_launcher.hpp"
+#include "strix/hip_hyper_mix_launcher.hpp"
 #include "strix/hip_launch_context.hpp"
 #include "strix/hip_setup_quiescence.hpp"
 #include "strix/hip_shared_expert_launcher.hpp"
@@ -870,6 +871,227 @@ void family(bool gdn, bool prefetch = false) {
             });
     }
 }
+// HC rows: one canonical attn/mlp/final mixer, T row views of the window arena,
+// real HC shapes and formats (F32 norm, Q8 down/up, F32 injection).
+struct HyperFixture {
+    Owner owner;
+    ModelContract model = ModelContract::qwen38_flash_next();
+    SerialExecutionPlan execution = build_serial_decode_execution_plan(model);
+    SerialExecutionIoPlan io = build_serial_execution_io_plan(execution);
+    ExecutionStep step;
+    ExecutionArenaPlan serial;
+    KnownWindowArena window;
+    Span scratch;
+    ExecutionMemoryBinding memory;
+    ModelManifest manifest;
+    ModelRuntimeBinding runtime;
+    ExecutionTensorAccessPlan access;
+    std::vector<Weight> weights;
+    ExecutionRuntimeResources resources;
+    std::vector<ExecutionDispatchContext> rows;
+    std::vector<unsigned char> seed;
+    HipHyperMixLauncherConfig config;
+    std::string selected_id;
+    ExecutionLauncher selected;
+    bool final_mix;
+
+    HyperFixture(SerialOp op, bool splitk, bool lane, std::uint32_t count) : final_mix(op == SerialOp::final_hyper_mix) {
+        const auto found = std::find_if(execution.steps.begin(), execution.steps.end(),
+            [&](const auto& value) { return value.op == op && (final_mix || value.layer == 0U); });
+        require(found != execution.steps.end(), "canonical HC mixer missing");
+        step = *found;
+        const auto& step_io = io.steps[step.id];
+        require(step_io.reads.size() == 1U && step_io.writes.size() == (final_mix ? 1U : 2U) &&
+            step_io.temporaries.size() == 1U, "HC fixture IO contract differs");
+        serial.alignment = 256U;
+        const auto allocation = [&](ExecutionBufferUse use, std::uint64_t bytes) {
+            const auto offset = (serial.total_bytes + 255U) / 256U * 256U;
+            serial.allocations.push_back({use, step.id, step.id, offset, bytes});
+            serial.total_bytes = offset + bytes;
+        };
+        allocation(step_io.reads[0], 10240U * 2U);
+        allocation(step_io.writes[0], 2560U * 2U);
+        if (!final_mix) allocation(step_io.writes[1], 4U * 4U);
+        allocation(step_io.temporaries[0], (10240U + 320U) * 4U);
+        serial.total_bytes = (serial.total_bytes + 255U) / 256U * 256U;
+        serial.naive_nonaliased_bytes = serial.total_bytes;
+        window = build_known_window_arena(serial, 256U, count);
+        scratch = owner.allocate(window.physical.total_bytes);
+        memory = {0x4b4e4f574e484301ULL, scratch.address, scratch.bytes, 19U};
+        manifest.architecture = "qwen4_exp";
+        const auto salt = static_cast<unsigned>(op) * 7U;
+        add("hc_norm.weight", 0U, {10240}, f32(10240U, 1.0F, 0.04F));
+        add("hc_down.weight", 8U, {10240, 320}, q8(10240, 320, 11U + salt));
+        add("hc_up.weight", 8U, {320, 10240}, q8(320, 10240, 5U + salt));
+        if (!final_mix) add("hc_inject.weight", 0U, {10240, 4}, f32(40960U, 0.0004F, 0.0002F));
+        for (std::uint32_t slot = 0; slot < weights.size(); ++slot) access.accesses.push_back({step.id, step.op, slot, {slot}});
+        manifest.layout_identity = model_manifest_layout_identity(manifest);
+        runtime.manifest_layout_identity = manifest.layout_identity;
+        runtime.model_content_identity.bytes[0] = 1U;
+        access.manifest_layout_identity = manifest.layout_identity;
+        access.plan_identity = 0x4b4e4f574e484302ULL;
+        resources = {&memory, &manifest, &runtime, &access};
+        config.hidden_size = 2560U; config.hc_count = 4U; config.lowrank = 320U;
+        config.rms_epsilon = model.rms_norm_epsilon;
+        config.parallel = config.staged_projections = config.fused_injection = config.typed_projection = true;
+        config.prefetch_rows = config.prefetch_q8_output = true;
+        config.lane_chain_output = lane; config.splitk_projection = splitk;
+        ExecutionBindingRequest binding; binding.lane_chain_hyper_output = lane;
+        kernels::KernelRegistry registry;
+        register_hip_hyper_mix_kernel_variant(model, binding, config, registry);
+        require(registry.variants().size() == 1U, "HC serial selection is ambiguous");
+        selected_id = registry.variants().front().id;
+        selected = make_hip_hyper_mix_launcher(selected_id, &config);
+        rows.resize(count);
+        for (std::uint32_t r = 0; r < count; ++r) {
+            auto& context = rows[r];
+            context.execution_identity = memory.execution_identity;
+            context.step_id = step.id; context.op = step.op; context.layer = step.layer;
+            context.kernel_id = selected_id;
+            context.reads = step_io.reads; context.writes = step_io.writes; context.temporaries = step_io.temporaries;
+            context.arena = &window.row_view[r]; context.memory = &memory; context.resources = &resources;
+            context.position = r; context.input_token_id = 17U + r;
+        }
+    }
+    void add(std::string name, std::uint32_t type, std::vector<std::uint64_t> dimensions, std::vector<unsigned char> bytes) {
+        ManifestTensor tensor;
+        tensor.name = final_mix ? std::move(name) : "blk.0." + name; tensor.role = TensorRole::dense_projection;
+        tensor.layer = step.layer; tensor.ggml_type = type; tensor.dimensions = std::move(dimensions);
+        tensor.byte_size = bytes.size();
+        tensor.absolute_offset = (manifest.total_tensor_bytes + 15U) / 16U * 16U;
+        manifest.total_tensor_bytes = tensor.absolute_offset + tensor.byte_size;
+        const auto device = owner.allocate(bytes.size());
+        write(device, bytes);
+        const auto index = static_cast<std::uint32_t>(weights.size());
+        weights.push_back({device, std::move(bytes)});
+        manifest.tensors.push_back(std::move(tensor));
+        runtime.tensors.push_back({index, RuntimeTensorStorage::resident, device.address, device.bytes, 7U, 0U});
+    }
+    HipLaunchContext scope() const { HipLaunchContext result; result.stream = owner.stream; return result; }
+    void prepare(unsigned flavor) {
+        seed.assign(static_cast<std::size_t>(scratch.bytes), 0xa5);
+        constexpr std::array<std::uint16_t, 10> edge{0, 0x8000, 1, 0x8001, 0x007f, 0x807f, 0x0080, 0x4f00, 0xcf00, 0x3f80};
+        for (std::uint32_t r = 0; r < rows.size(); ++r) {
+            const auto source = flavor == 3U ? 0U : r;
+            std::vector<std::uint16_t> values(10240U);
+            for (std::size_t i = 0; i < values.size(); ++i) {
+                if (flavor == 1U) values[i] = edge[(i * 3U + source) % edge.size()];
+                else if (flavor == 2U) values[i] = bf16((i % 2U ? -1.0F : 1.0F) * std::ldexp(1.0F, static_cast<int>((i + source * 5U) % 41U) - 20));
+                else values[i] = bf16(static_cast<float>(static_cast<int>((i * 7U + source * 13U) % 37U) - 18) *
+                    (0.003F + static_cast<float>(source % 5U) * 0.002F));
+            }
+            const auto input = resolve_dispatch_read(rows[r], 0);
+            std::memcpy(seed.data() + (input.address - scratch.address), values.data(), values.size() * 2U);
+        }
+    }
+    void serial_rows() const { for (const auto& row : rows) selected.function(row, selected.user_data); }
+    void candidate_rows() const {
+        hyper_mix_known_window_rows_preflight(rows, config);
+        hyper_mix_known_window_rows_launch(rows, config);
+    }
+    std::vector<unsigned char> run(bool candidate) {
+        write(scratch, seed);
+        { const HipLaunchScope owned(scope()); if (candidate) candidate_rows(); else serial_rows(); }
+        owner.finish();
+        const auto result = read(scratch);
+        guards(scratch);
+        for (const auto& weight : weights) {
+            require(read(weight.device) == weight.original, "HC rows changed weights");
+            guards(weight.device);
+        }
+        auto unchanged = seed;
+        for (const auto& row : rows) {
+            std::vector<ExecutionBufferAddress> views{resolve_dispatch_write(row, 0), resolve_dispatch_temporary(row, 0)};
+            if (!final_mix) views.push_back(resolve_dispatch_write(row, 1));
+            for (const auto& view : views)
+                std::copy_n(result.begin() + static_cast<std::ptrdiff_t>(view.address - scratch.address),
+                    static_cast<std::size_t>(view.bytes), unchanged.begin() + static_cast<std::ptrdiff_t>(view.address - scratch.address));
+        }
+        require(result == unchanged, "HC rows modified a read-only input or interior canary");
+        return result;
+    }
+    std::vector<unsigned char> output(const std::vector<unsigned char>& arena, std::uint32_t r) const {
+        const auto view = resolve_dispatch_write(rows[r], 0);
+        const auto begin = arena.begin() + static_cast<std::ptrdiff_t>(view.address - scratch.address);
+        return {begin, begin + static_cast<std::ptrdiff_t>(view.bytes)};
+    }
+};
+
+void family_hyper_rows(SerialOp op, bool splitk, bool lane, std::uint32_t count) {
+    HyperFixture f(op, splitk, lane, count);
+    for (unsigned flavor = 0; flavor < 4U; ++flavor) {
+        f.prepare(flavor);
+        const auto serial = f.run(false);
+        const auto candidate = f.run(true);
+        require(candidate == serial, "HC rows output/injection/workspace differ bitwise from ascending R1 calls");
+        require(f.run(true) == candidate, "HC rows are not deterministic across repeats");
+        if (flavor == 0U) {
+            for (std::uint32_t r = 0; r < count; ++r) {
+                const auto bytes = f.output(candidate, r);
+                for (std::size_t offset = 0; offset < bytes.size(); offset += 2U) {
+                    std::uint16_t bits{}; std::memcpy(&bits, bytes.data() + offset, 2U);
+                    require((bits & 0x7f80U) != 0x7f80U, "finite HC fixture produced a nonfinite output");
+                }
+                if (r) require(bytes != f.output(candidate, 0U), "HC rows fixture is insensitive to the row input");
+            }
+        }
+        if (flavor == 3U)
+            for (std::uint32_t r = 1; r < count; ++r)
+                require(f.output(candidate, r) == f.output(candidate, 0U), "identical HC rows produce different bytes");
+    }
+    // Pure admission: every rejection precedes any enqueue.
+    f.prepare(0U); write(f.scratch, f.seed);
+    const auto reject = [&](auto&& work, const char* message) {
+        bool rejected = false;
+        { const HipLaunchScope owned(f.scope());
+          try { work(); } catch (const std::exception&) { rejected = true; } }
+        f.owner.finish();
+        require(rejected, message);
+        require(read(f.scratch) == f.seed, "rejected HC rows admission changed the arena");
+    };
+    reject([&] { hyper_mix_known_window_rows_preflight(std::span<const ExecutionDispatchContext>(f.rows.data(), 1U), f.config); },
+        "one-row HC rows entry was admitted");
+    auto other = f.config; other.lane_chain_output = !lane; other.prefetch_q8_output = true;
+    reject([&] { hyper_mix_known_window_rows_launch(f.rows, other); }, "HC rows accepted a different serial selection");
+    auto bad = f.rows; bad.back().arena = bad.front().arena;
+    reject([&] { hyper_mix_known_window_rows_launch(bad, f.config); }, "aliased HC row outputs were admitted");
+    bad = f.rows; bad.back().kernel_id = std::nullopt;
+    reject([&] { hyper_mix_known_window_rows_launch(bad, f.config); }, "HC row without serial id was admitted");
+    bad = f.rows; bad.back().resources = nullptr;
+    reject([&] { hyper_mix_known_window_rows_launch(bad, f.config); }, "late HC row without resources was admitted");
+    auto fp64 = f.config; fp64.splitk_projection = true; fp64.splitk_projection_fp64 = true;
+    reject([&] { hyper_mix_known_window_rows_preflight(f.rows, fp64); }, "FP64 HC oracle was admitted as a window entry");
+}
+
+// Median of warm hipEvent timings; MALL flushed before each sample when cold.
+void bench_hyper_rows(bool splitk, bool lane, std::uint32_t count, bool cold) {
+    HyperFixture f(SerialOp::attn_hyper_mix, splitk, lane, count);
+    f.prepare(0U); write(f.scratch, f.seed);
+    const auto flush = cold ? f.owner.allocate(96ULL << 20U) : Span{};
+    hipEvent_t start{}, stop{};
+    check(hipEventCreate(&start), "create HC bench event"); check(hipEventCreate(&stop), "create HC bench event");
+    const auto measure = [&](bool candidate) {
+        std::vector<float> samples;
+        const HipLaunchScope owned(f.scope());
+        for (unsigned i = 0; i < 28U; ++i) {
+            if (cold) check(hipMemsetAsync(reinterpret_cast<void*>(flush.address), static_cast<int>(i), flush.bytes, f.owner.stream), "flush MALL");
+            check(hipEventRecord(start, f.owner.stream), "record HC bench start");
+            if (candidate) hyper_mix_known_window_rows_launch(f.rows, f.config); else f.serial_rows();
+            check(hipEventRecord(stop, f.owner.stream), "record HC bench stop");
+            check(hipEventSynchronize(stop), "complete HC bench sample");
+            float ms = 0.0F; check(hipEventElapsedTime(&ms, start, stop), "HC bench elapsed");
+            if (i >= 3U) samples.push_back(ms * 1000.0F);
+        }
+        std::sort(samples.begin(), samples.end());
+        return samples[samples.size() / 2U];
+    };
+    const auto serial = measure(false), rows = measure(true);
+    f.owner.finish();
+    (void)hipEventDestroy(start); (void)hipEventDestroy(stop);
+    std::cout << "hc-rows-bench projection=" << (splitk ? "splitk-f32" : "batched-v8") << " output=" << (lane ? "lane-chain" : "q8-batched")
+        << " T=" << count << (cold ? " cold" : " warm") << " serial_us=" << serial << " rows_us=" << rows
+        << " speedup=" << serial / rows << '\n';
+}
 } // namespace
 
 int main() try {
@@ -878,6 +1100,15 @@ int main() try {
     family(true);
     family_gdn_f32_gates();
     for(auto rows:{16U,17U}) {family_prefill_tiles(false,rows);family_prefill_tiles(true,rows);}
+    std::uint32_t hc_cases = 0;
+    for (auto op : {SerialOp::attn_hyper_mix, SerialOp::mlp_hyper_mix, SerialOp::final_hyper_mix})
+        for (bool splitk : {false, true}) for (bool lane : {false, true}) for (std::uint32_t rows : {2U, 4U, 8U}) {
+            family_hyper_rows(op, splitk, lane, rows); ++hc_cases;
+        }
+    std::cout << "known-window HC rows bit-exact cases passed: " << hc_cases << '\n';
+    if (std::getenv("STRIX_HC_ROWS_BENCH"))
+        for (bool cold : {false, true}) for (bool splitk : {false, true}) for (bool lane : {false, true})
+            for (std::uint32_t rows : {2U, 4U, 8U}) bench_hyper_rows(splitk, lane, rows, cold);
     std::cout << "known-window shared/GDN component fixtures passed\n";
     return 0;
 } catch (const std::exception& error) {

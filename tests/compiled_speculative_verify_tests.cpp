@@ -126,8 +126,13 @@ struct KnownFixture {
     strix::ModelManifest manifest;
     strix::ExecutionTensorAccessPlan access;
 };
+constexpr std::string_view known_hyper_base="hip.hyper_mix.bf16.h2560.hc4.lr320.r1.c1.parallel.staged"
+    ".fused-injection-v5.typed-q8-f32-v1.prefetch-rows8-v2.prefetch-q8-output-v1";
+bool hyper_op(strix::SerialOp op) {
+    return op==strix::SerialOp::attn_hyper_mix || op==strix::SerialOp::mlp_hyper_mix || op==strix::SerialOp::final_hyper_mix;
+}
 KnownFixture make_known_fixture(const strix::ModelContract& model, std::uint32_t gate_type = 8U,
-    bool routed_union = false) {
+    bool routed_union = false, bool hyper = false) {
     KnownFixture fixture;
     fixture.serial.execution = strix::build_serial_decode_execution_plan(model);
     fixture.serial.io = strix::build_serial_execution_io_plan(fixture.serial.execution);
@@ -206,6 +211,10 @@ KnownFixture make_known_fixture(const strix::ModelContract& model, std::uint32_t
             tensors.tensor_indices.push_back(static_cast<std::uint32_t>(fixture.manifest.tensors.size()));
             fixture.manifest.tensors.push_back(std::move(table));
         }
+        // Mixed split-K / lane-chain selections; every typed prefetched Q8 mixer is eligible.
+        if (hyper && hyper_op(step.op))
+            binding.kernel_id = std::string(known_hyper_base) + (step.id % 3U ? ".splitk-hc-proj-fp32-v1" : "") +
+                (step.id % 2U ? ".lane-chain-v1" : "");
         fixture.serial.bindings.bindings.push_back(std::move(binding));
         if (!tensors.tensor_indices.empty()) fixture.access.accesses.push_back(std::move(tensors));
     }
@@ -373,10 +382,10 @@ struct KnownRuntimeFixture {
 
     explicit KnownRuntimeFixture(const strix::ModelContract& model, bool promote = false, bool mixed = false,
         std::uint32_t rows = 2, bool routed_union = false,
-        strix::KnownWindowOutputPolicy output_policy = strix::KnownWindowOutputPolicy::all_rows)
-        : source(make_known_fixture(model, mixed ? 0U : 8U,routed_union)),
+        strix::KnownWindowOutputPolicy output_policy = strix::KnownWindowOutputPolicy::all_rows, bool hyper = false)
+        : source(make_known_fixture(model, mixed ? 0U : 8U,routed_union,hyper)),
           window(strix::compile_known_prefix_window(model, source.serial, source.manifest,
-              source.access, {promote, promote, mixed, rows,routed_union,output_policy})),
+              source.access, {promote, promote, mixed, rows,routed_union,output_policy,hyper})),
           serial_pool(static_cast<std::size_t>((source.serial.arena.total_bytes + 7U) / 8U)),
           window_pool(static_cast<std::size_t>((window.arena.physical.total_bytes + 7U) / 8U)),
           state_words(7U * 48U, 0) {
@@ -1160,6 +1169,78 @@ void known_window_routed_union_compiler_tests(const strix::ModelContract& model)
     }
 }
 
+void known_window_hyper_rows_tests(const strix::ModelContract& model) {
+    using V=strix::KnownWindowR2Variant;
+    using M=strix::KnownWindowStepMode;
+    const auto reject=[](auto&& operation,const char* message) {
+        bool rejected=false;try{operation();}catch(const std::invalid_argument&){rejected=true;}expect(rejected,message);
+    };
+    auto fixture=make_known_fixture(model,8U,false,true);
+    // One unadmitted selection (deferred RMS) stays on its serial row loop.
+    const auto deferred=std::find_if(fixture.serial.execution.steps.begin(),fixture.serial.execution.steps.end(),
+        [](const auto& step){return step.op==strix::SerialOp::final_hyper_mix;})->id;
+    fixture.serial.bindings.bindings[deferred].kernel_id=std::string(known_hyper_base)+
+        ".splitk-hc-proj-fp32-v1.hc-deferred-norm-v1.lane-chain-v1";
+    for(const std::uint32_t rows:{2U,4U,8U}) {
+        const auto off=strix::compile_known_prefix_window(model,fixture.serial,fixture.manifest,fixture.access,
+            {true,true,true,rows,false});
+        const auto on=strix::compile_known_prefix_window(model,fixture.serial,fixture.manifest,fixture.access,
+            {true,true,true,rows,false,strix::KnownWindowOutputPolicy::all_rows,true});
+        expect(off.hyper_mix_rows_steps==0U && on.hyper_mix_rows_steps==96U && on.row_loop_steps+96U==off.row_loop_steps &&
+            on.window_execution_identity!=off.window_execution_identity &&
+            on.window_kernel_plan_identity!=off.window_kernel_plan_identity,
+            "HC rows are explicitly selected with distinct whole-window identities");
+        const auto variant=rows==2U?V::hyper_mix_rows2_v1:rows==4U?V::hyper_mix_rows4_v1:V::hyper_mix_rows8_v1;
+        std::size_t first=0;std::uint64_t bytes=0;
+        for(std::size_t i=0;i<on.mode.size();++i) {
+            const auto& step=fixture.serial.execution.steps[i];
+            if(on.mode[i]!=M::hyper_mix_rows) {
+                expect(!hyper_op(step.op) || i==deferred,"every admitted HC mixer is promoted");
+                continue;
+            }
+            if(!first) first=i;
+            expect(hyper_op(step.op) && on.r2_variant[i]==variant,"HC rows variant follows the window row count");
+            bytes+=(2ULL*3481600ULL+(step.op==strix::SerialOp::final_hyper_mix?0U:163840ULL))*(rows-1U);
+        }
+        expect(on.logical_projection_weight_bytes_avoided==off.logical_projection_weight_bytes_avoided+bytes &&
+            on.projection_launches_saved==off.projection_launches_saved+2U*96U*(rows-1U),
+            "HC rows count Q8 down/up and F32 injection once per window");
+        strix::validate_known_prefix_window_formats(on,fixture.serial,fixture.manifest,fixture.access);
+        auto changed=on;++changed.hyper_mix_rows_steps;
+        reject([&]{strix::validate_compiled_known_prefix_window(changed,fixture.serial);},"forged HC rows counter rejects");
+        changed=on;changed.r2_variant[first]=rows==2U?V::hyper_mix_rows4_v1:V::hyper_mix_rows2_v1;
+        reject([&]{strix::validate_compiled_known_prefix_window(changed,fixture.serial);},"wrong HC rows variant rejects");
+        changed=on;changed.mode[deferred]=M::hyper_mix_rows;changed.r2_variant[deferred]=variant;
+        --changed.row_loop_steps;++changed.hyper_mix_rows_steps;
+        reject([&]{strix::validate_compiled_known_prefix_window(changed,fixture.serial);},"unadmitted HC selection rejects");
+    }
+    for(const std::uint32_t rows:{2U,4U,8U}) {
+        KnownRuntimeFixture baseline(model,false,false,rows,false,strix::KnownWindowOutputPolicy::all_rows,true);
+        std::vector<std::uint64_t> expected;
+        for(const auto token:baseline.tokens) expected.push_back(baseline.serial_token(token));
+        KnownRuntimeFixture hc(model,false,false,rows,false,strix::KnownWindowOutputPolicy::all_rows,true);
+        const auto variant=rows==2U?V::hyper_mix_rows2_v1:rows==4U?V::hyper_mix_rows4_v1:V::hyper_mix_rows8_v1;
+        const std::array<strix::KnownWindowRowsEntry,1> entries{{{variant,&hc.trace,&recording_rows_preflight,&recording_rows_launch}}};
+        std::vector<const strix::CompiledLaunchPlan*> plans;
+        for(const auto& plan:hc.row_launch) plans.push_back(&plan);
+        const auto result=strix::execute_known_prefix_window_eager(hc.window,hc.source.serial,hc.resources,
+            hc.window_memory,hc.session,hc.tokens,plans,{},entries,hc.hooks());
+        expect(hc.state_words==baseline.state_words && hc.session.state.generations==baseline.session.state.generations &&
+            hc.session.next_position==rows,"HC rows keep every state and the full-window frontier");
+        for(std::uint32_t row=0;row<rows;++row)
+            expect(read_word(result.logits[row].address)==expected[row],"HC rows preserve the output of every row");
+        expect(result.hyper_mix_rows_dispatches==97U && result.r2_variant_dispatches[static_cast<std::size_t>(variant)]==97U &&
+            result.routed_expert_union_dispatches==0U && result.shared_rows_dispatches==0U,
+            "HC rows dispatch once per mixer for the whole window");
+        KnownRuntimeFixture missing(model,false,false,rows,false,strix::KnownWindowOutputPolicy::all_rows,true);
+        plans.clear();for(const auto& plan:missing.row_launch) plans.push_back(&plan);
+        reject([&]{(void)strix::execute_known_prefix_window_eager(missing.window,missing.source.serial,missing.resources,
+            missing.window_memory,missing.session,missing.tokens,plans,{},{},missing.hooks());},
+            "missing HC rows entry rejects before dispatch");
+        expect(!missing.trace.calls && !missing.quiesces,"missing HC rows entry never dispatches");
+    }
+}
+
 void known_window_tests(const strix::ModelContract& model) {
     const auto fixture = make_known_fixture(model);
     const auto off = strix::compile_known_prefix_window(model, fixture.serial, fixture.manifest, fixture.access);
@@ -1669,6 +1750,7 @@ int main() {
 
     known_window_routed_union_compiler_tests(model);
     known_window_routed_union_runtime_tests(model);
+    known_window_hyper_rows_tests(model);
     known_window_tests(model);
     known_window_runtime_tests(model);
     actual_known_window_lineage_tests(model);

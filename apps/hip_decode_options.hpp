@@ -111,6 +111,7 @@ struct MtpCliOptions {
     bool window_expert_union=false;
     std::uint64_t window_expert_union_bytes=0;
     bool window_expert_union_bytes_explicit=false;
+    bool window_hyper_mix=false;
 };
 // This is execution evidence: a configured owner alone is not an attempted
 // native window (EOS, remaining budget/context and history can choose serial).
@@ -719,6 +720,8 @@ inline void validate_mtp_cli(const Options& o,bool resolved=false) {
         !m.window_rows || m.metadata_only || m.window_expert_union_bytes>m.window_arena_bytes ||
         m.window_expert_union_bytes>m.window_total_bytes))
         throw std::invalid_argument("MTP window expert union requires an actual target window and a positive explicit budget within arena and total window budgets");
+    if(m.window_hyper_mix && (!m.window_rows || m.metadata_only))
+        throw std::invalid_argument("MTP window HC rows require an actual target window");
     if(m.window_rows && m.candidate_depth<m.window_rows-1U)
         throw std::invalid_argument("MTP target window requires candidate depth at least rows minus one");
     if(m.window_rows && (o.gdn_recurrent_layout!=HipGdnRecurrentLayout::baseline || o.gdn_recurrent_storage!=GdnRecurrentStorage::key_value ||
@@ -741,7 +744,7 @@ inline Options parse_options(
     if (argc < 2) {
         throw std::invalid_argument(
             "usage: strix-hip-decode-token MODEL.gguf [TOKEN_ID ...] "
-            "[--mtp --mtp-sidecar FILE --mtp-sidecar-sha256 HEX --mtp-golden FILE --mtp-golden-sha256 HEX [--mtp-window-expert-union --mtp-window-expert-union-bytes N] (explicit source/conversion/cast/budget options required)] "
+            "[--mtp --mtp-sidecar FILE --mtp-sidecar-sha256 HEX --mtp-golden FILE --mtp-golden-sha256 HEX [--mtp-window-expert-union --mtp-window-expert-union-bytes N] [--mtp-window-hyper-mix] (explicit source/conversion/cast/budget options required)] "
             "[--optimization-profile auto|manual] [--execution-inventory] [--host-dispatch-telemetry] [--execution-telemetry-trace] [--device-queue-trace] "
             "[--numerical-profile exact-v5|hc-splitk-f32-v1|q51-a8-down-v1|hc-splitk-f32+q51-a8-down-v1|q51-q80-a8-down-v1|hc-splitk-f32+q51-q80-a8-down-v1|hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup-v1|hc-deferred-norm-f32+q51-q80-a8-down-v1|hc-deferred-norm-f32+q51-q80-a8-down+q5k-a8-gateup-v1] "
             "[--teacher-forced-score --generate 1 [--teacher-logits-file PATH]] "
@@ -835,6 +838,10 @@ inline Options parse_options(
         if(argument=="--mtp-window-expert-union") {
             if(!mtp_option_names.insert(std::string(argument)).second)throw std::invalid_argument("duplicate MTP option");
             options.mtp.supplied=true;options.mtp.window_expert_union=true;continue;
+        }
+        if(argument=="--mtp-window-hyper-mix") {
+            if(!mtp_option_names.insert(std::string(argument)).second)throw std::invalid_argument("duplicate MTP option");
+            options.mtp.supplied=true;options.mtp.window_hyper_mix=true;continue;
         }
         if(argument.starts_with("--mtp-window-expert-union="))
             throw std::invalid_argument("MTP window expert union is a flag without a value");
