@@ -70,5 +70,9 @@ enum class HipMtpLmHeadRecipe : std::uint32_t {
 [[nodiscard]] std::uint64_t hip_mtp_lm_head_profile_identity(const ModelContract&,const MtpTensorView&);
 void preflight_hip_mtp_lm_head(const MtpNativeContext&);
 void launch_hip_mtp_lm_head(const MtpNativeContext&,void* stream);
+// Raw MTP draft head over Q8_0 rows [rows][hidden]: the prefetch8 wave8 recipe
+// above, so each row's logit is bit-identical to the same row of the full head.
+void launch_hip_q8_head_rows(const std::uint16_t* hidden,const void* q8_rows,std::uint32_t hidden_size,
+    std::uint32_t rows,float* logits,void* stream);
 
 }  // namespace strix

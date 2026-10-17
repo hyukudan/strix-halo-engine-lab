@@ -112,6 +112,10 @@ struct MtpCliOptions {
     std::uint64_t window_expert_union_bytes=0;
     bool window_expert_union_bytes_explicit=false;
     bool window_hyper_mix=false;
+    // Draft-only head/chain controls: they change acceptance, never target output.
+    bool draft_chain=false;
+    std::string draft_vocab;
+    std::uint32_t draft_context_vocab=0;
 };
 // This is execution evidence: a configured owner alone is not an attempted
 // native window (EOS, remaining budget/context and history can choose serial).
@@ -722,6 +726,8 @@ inline void validate_mtp_cli(const Options& o,bool resolved=false) {
         throw std::invalid_argument("MTP window expert union requires an actual target window and a positive explicit budget within arena and total window budgets");
     if(m.window_hyper_mix && (!m.window_rows || m.metadata_only))
         throw std::invalid_argument("MTP window HC rows require an actual target window");
+    if((!m.draft_vocab.empty() || m.draft_context_vocab) && !m.draft_chain)
+        throw std::invalid_argument("MTP draft vocabulary options require --mtp-draft-chain");
     if(m.window_rows && m.candidate_depth<m.window_rows-1U)
         throw std::invalid_argument("MTP target window requires candidate depth at least rows minus one");
     if(m.window_rows && (o.gdn_recurrent_layout!=HipGdnRecurrentLayout::baseline || o.gdn_recurrent_storage!=GdnRecurrentStorage::key_value ||
@@ -744,7 +750,7 @@ inline Options parse_options(
     if (argc < 2) {
         throw std::invalid_argument(
             "usage: strix-hip-decode-token MODEL.gguf [TOKEN_ID ...] "
-            "[--mtp --mtp-sidecar FILE --mtp-sidecar-sha256 HEX --mtp-golden FILE --mtp-golden-sha256 HEX [--mtp-window-expert-union --mtp-window-expert-union-bytes N] [--mtp-window-hyper-mix] (explicit source/conversion/cast/budget options required)] "
+            "[--mtp --mtp-sidecar FILE --mtp-sidecar-sha256 HEX --mtp-golden FILE --mtp-golden-sha256 HEX [--mtp-window-expert-union --mtp-window-expert-union-bytes N] [--mtp-window-hyper-mix] [--mtp-draft-chain [--mtp-draft-vocab FILE] [--mtp-draft-context-vocab N]] (explicit source/conversion/cast/budget options required)] "
             "[--optimization-profile auto|manual] [--execution-inventory] [--host-dispatch-telemetry] [--execution-telemetry-trace] [--device-queue-trace] "
             "[--numerical-profile exact-v5|hc-splitk-f32-v1|q51-a8-down-v1|hc-splitk-f32+q51-a8-down-v1|q51-q80-a8-down-v1|hc-splitk-f32+q51-q80-a8-down-v1|hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup-v1|hc-deferred-norm-f32+q51-q80-a8-down-v1|hc-deferred-norm-f32+q51-q80-a8-down+q5k-a8-gateup-v1] "
             "[--teacher-forced-score --generate 1 [--teacher-logits-file PATH]] "
@@ -843,6 +849,12 @@ inline Options parse_options(
             if(!mtp_option_names.insert(std::string(argument)).second)throw std::invalid_argument("duplicate MTP option");
             options.mtp.supplied=true;options.mtp.window_hyper_mix=true;continue;
         }
+        if(argument=="--mtp-draft-chain") {
+            if(!mtp_option_names.insert(std::string(argument)).second)throw std::invalid_argument("duplicate MTP option");
+            options.mtp.supplied=true;options.mtp.draft_chain=true;continue;
+        }
+        if(argument.starts_with("--mtp-draft-chain="))
+            throw std::invalid_argument("MTP draft chain is a flag without a value");
         if(argument.starts_with("--mtp-window-expert-union="))
             throw std::invalid_argument("MTP window expert union is a flag without a value");
         if(argument.starts_with("--mtp-")) {
@@ -870,6 +882,7 @@ inline Options parse_options(
             else if(key=="--mtp-normalized-rounding")m.normalized_rounding=value;
             else if(key=="--mtp-projection-rounding")m.projection_rounding=value;
             else if(key=="--mtp-sidecar-residency")m.sidecar_residency=value;
+            else if(key=="--mtp-draft-vocab")m.draft_vocab=value;
             else if(key=="--mtp-max-hidden-error")m.max_hidden_error=parse_double(value,"MTP hidden policy");
             else if(key=="--mtp-max-logit-error")m.max_logit_error=parse_double(value,"MTP logit policy");
             else {
@@ -893,6 +906,10 @@ inline Options parse_options(
                 else if(key=="--mtp-window-total-bytes")m.window_total_bytes=n;
                 else if(key=="--mtp-window-history-intervals")m.window_history_intervals=n;
                 else if(key=="--mtp-window-expert-union-bytes"){m.window_expert_union_bytes=n;m.window_expert_union_bytes_explicit=true;}
+                else if(key=="--mtp-draft-context-vocab"){
+                    if(!n || n>UINT32_MAX)throw std::invalid_argument("MTP draft context vocabulary cap must be 1..uint32");
+                    m.draft_context_vocab=static_cast<std::uint32_t>(n);
+                }
                 else if(key=="--mtp-candidate-depth" || key=="--mtp-target-window-rows") {
                     if(n>UINT32_MAX)throw std::invalid_argument("MTP depth/rows exceeds uint32");
                     if(key=="--mtp-candidate-depth")m.candidate_depth=static_cast<std::uint32_t>(n);else m.window_rows=static_cast<std::uint32_t>(n);

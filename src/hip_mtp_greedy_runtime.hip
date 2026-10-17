@@ -132,7 +132,8 @@ HipMtpGreedyCycleResult HipMtpGreedyRuntime::cycle(const HipMtpTargetHiddenTicke
         i.cycled=true;
         i.mtp->begin_cycle(pending,initial);
         begin_draft_proposal(i.draft,*i.session);
-        const auto candidates=i.backend->propose_candidates(*i.session,i.draft,depth);
+        const auto candidates=i.mtp->draft_head()?i.mtp->propose_chain(i.plan,i.activation,*i.session,i.draft,depth):
+            i.backend->propose_candidates(*i.session,i.draft,depth);
         out.proposed_candidates=static_cast<std::uint32_t>(candidates.size());
         finish_draft_proposal(i.draft);
         if(i.window) {
