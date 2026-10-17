@@ -1252,9 +1252,9 @@ void known_window_lm_head_rows_tests(const strix::ModelContract& model) {
     for(const std::uint32_t rows:{2U,4U,8U}) {
         const auto variant=rows==2U?V::lm_head_q8_prefetch8_rows2_v1:rows==4U?V::lm_head_q8_prefetch8_rows4_v1:V::lm_head_q8_prefetch8_rows8_v1;
         const auto off=strix::compile_known_prefix_window(model,fixture.serial,fixture.manifest,fixture.access,
-            {true,true,true,rows,false,P::all_rows,false});
+            {true,true,true,rows,false,P::all_rows,false,false,false,false,false});
         const auto on=strix::compile_known_prefix_window(model,fixture.serial,fixture.manifest,fixture.access,
-            {true,true,true,rows,false,P::all_rows,true});
+            {true,true,true,rows,false,P::all_rows,false,false,false,false,true});
         strix::validate_known_prefix_window_formats(on,fixture.serial,fixture.manifest,fixture.access);
         expect(off.lm_head_rows_steps==0U && off.mode.back()==M::r1_row_loop && on.lm_head_rows_steps==1U &&
             on.mode.back()==M::lm_head_rows && on.r2_variant.back()==variant && on.row_loop_steps+1U==off.row_loop_steps &&
@@ -1266,7 +1266,7 @@ void known_window_lm_head_rows_tests(const strix::ModelContract& model) {
             "multi-row head is an explicit terminal mode with distinct identities and its R1 source ID");
         for(const auto policy:{P::terminal_row,P::state_only}) {
             const auto kept=strix::compile_known_prefix_window(model,fixture.serial,fixture.manifest,fixture.access,
-                {true,true,true,rows,false,policy,true});
+                {true,true,true,rows,false,policy,false,false,false,false,true});
             expect(kept.lm_head_rows_steps==0U && kept.mode.back()==M::r1_row_loop,
                 "omitted-head policies keep the per-row terminal loop");
         }
@@ -1278,13 +1278,13 @@ void known_window_lm_head_rows_tests(const strix::ModelContract& model) {
         reject([&]{strix::validate_compiled_known_prefix_window(changed,fixture.serial);},"head rows cannot claim an omitted-head policy");
         auto bf16=make_known_fixture(model,0U,false,false,false,8U,30U);
         const auto fallback=strix::compile_known_prefix_window(model,bf16.serial,bf16.manifest,bf16.access,
-            {true,true,true,rows,false,P::all_rows,true});
+            {true,true,true,rows,false,P::all_rows,false,false,false,false,true});
         expect(fallback.lm_head_rows_steps==0U,"non-Q8 head retains its R1 row loop");
         reject([&]{strix::validate_known_prefix_window_formats(on,bf16.serial,bf16.manifest,bf16.access);},
             "a compiled head rows window cannot inherit a changed head format");
         const auto plain=make_known_fixture(model,0U);
         expect(strix::compile_known_prefix_window(model,plain.serial,plain.manifest,plain.access,
-            {true,true,true,rows,false,P::all_rows,true}).lm_head_rows_steps==0U,"other head kernel IDs stay R1");
+            {true,true,true,rows,false,P::all_rows,false,false,false,false,true}).lm_head_rows_steps==0U,"other head kernel IDs stay R1");
 
         KnownRuntimeFixture baseline(model,false,true,rows,false,P::all_rows,false,false,true);
         std::vector<std::uint64_t> expected;
