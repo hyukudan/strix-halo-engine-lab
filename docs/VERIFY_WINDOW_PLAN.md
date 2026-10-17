@@ -10,7 +10,12 @@ Measured on cluster2 (Bosgame M5, gfx1151), same 43-token prompt, 256 generated 
 | Strata `--spec 2`, no drafter | 22.5 | ~47 ms/round |
 | Strata MTP (`--spec 4 --mtp --lookup-chain 3`) | 36.2 | ~72 ms/round, 2.63 tokens/round |
 
-The single-token forward is already at parity. The ~2x gap is the multi-token forward:
+The single-token forward is already at parity. Update (same day, ablation on cluster2): dropping
+`--model-copy-tier experts` and `--staged-moe-router-logits` (both slower on this box) gives
+**40.7 ms/step = 24.6 tok/s**, byte-identical 256 tokens, ahead of Strata's no-draft 22.5. The A8 numerical
+profile `hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup-v1` is worth ~12 ms/token (54 ms without it) and requires
+prepared-eager + GDN islands; the MTP/window paths currently exclude all three (MTP's serial base runs at ~59
+ms/step), so the window must reproduce the A8 profile arithmetic per row. The ~2x gap is the multi-token forward:
 Strata verifies a 4-7 token window in ~1.5x a 1-token step and commits the longest accepted prefix.
 
 Our MTP R2 window is slower than plain decode (15 vs 19.4 tok/s; ~130 ms per cycle).
