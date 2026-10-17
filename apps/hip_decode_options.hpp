@@ -100,6 +100,9 @@ struct OptimizationProfileResolution {
 struct MtpCliOptions {
     bool enabled=false,supplied=false,metadata_only=false;
     std::string sidecar,sidecar_logical_name,sidecar_sha256,target_sha256,target_content,golden,golden_sha256;
+    // Developer route: write a SELF-generated (not independent) golden of the
+    // native forward over the prompt rows, then exit; never admits generation.
+    std::string golden_dump;
     std::string repository,revision,source_path,converter_sha256,norm_converter_sha256,converter_revision;
     std::string conversion,normalized_rounding,projection_rounding,sidecar_residency;
     std::uint64_t sidecar_bytes=0,header_bytes=0,sidecar_retained_bytes=0,sidecar_setup_bytes=0;
@@ -708,11 +711,14 @@ inline void validate_mtp_cli(const Options& o,bool resolved=false) {
        ((resolved || o.context_explicit) && (o.tokens.size()>o.context_tokens ||
         o.generate_tokens>o.context_tokens-o.tokens.size()+1U)))
         throw std::invalid_argument("MTP requires 3..4097 known prompt tokens, positive uint32 output budget and bounded target context");
-    if(m.metadata_only && (!m.golden.empty() || !m.golden_sha256.empty()))
+    if(m.metadata_only && (!m.golden.empty() || !m.golden_sha256.empty() || !m.golden_dump.empty()))
         throw std::invalid_argument("MTP metadata diagnostic does not accept unused golden options");
-    if(m.sidecar.empty() || m.sidecar_logical_name.empty() || (!m.metadata_only && m.golden.empty()) || m.repository.empty() || m.revision.empty() || m.source_path.empty() || m.converter_revision.empty() ||
+    if(!m.golden_dump.empty() && (!m.golden.empty() || !m.golden_sha256.empty()))
+        throw std::invalid_argument("MTP golden dump writes a golden and does not accept an input golden");
+    const bool needs_golden=!m.metadata_only && m.golden_dump.empty();
+    if(m.sidecar.empty() || m.sidecar_logical_name.empty() || (needs_golden && m.golden.empty()) || m.repository.empty() || m.revision.empty() || m.source_path.empty() || m.converter_revision.empty() ||
        !mtp_sha256_text(m.sidecar_sha256) || !mtp_sha256_text(m.target_sha256) || !mtp_sha256_text(m.target_content) ||
-       (!m.metadata_only && !mtp_sha256_text(m.golden_sha256)) || !mtp_sha256_text(m.converter_sha256) || !mtp_sha256_text(m.norm_converter_sha256))
+       (needs_golden && !mtp_sha256_text(m.golden_sha256)) || !mtp_sha256_text(m.converter_sha256) || !mtp_sha256_text(m.norm_converter_sha256))
         throw std::invalid_argument("MTP requires explicit local assets, full SHA256 pins and source/conversion provenance");
     if(m.conversion!="effective-norm-embedding-first-v1" ||
        (m.normalized_rounding!="fp32" && m.normalized_rounding!="bf16-rne") ||
@@ -761,7 +767,7 @@ inline Options parse_options(
     if (argc < 2) {
         throw std::invalid_argument(
             "usage: strix-hip-decode-token MODEL.gguf [TOKEN_ID ...] "
-            "[--mtp --mtp-sidecar FILE --mtp-sidecar-sha256 HEX --mtp-golden FILE --mtp-golden-sha256 HEX [--mtp-window-expert-union --mtp-window-expert-union-bytes N] [--mtp-window-hyper-mix] [--mtp-window-qsa-rows] [--mtp-window-prefix] [--mtp-draft-chain [--mtp-draft-vocab FILE] [--mtp-draft-context-vocab N]] (explicit source/conversion/cast/budget options required)] "
+            "[--mtp --mtp-sidecar FILE --mtp-sidecar-sha256 HEX (--mtp-golden FILE --mtp-golden-sha256 HEX | --mtp-golden-dump FILE) [--mtp-window-expert-union --mtp-window-expert-union-bytes N] [--mtp-window-hyper-mix] [--mtp-window-qsa-rows] [--mtp-window-prefix] [--mtp-draft-chain [--mtp-draft-vocab FILE] [--mtp-draft-context-vocab N]] (explicit source/conversion/cast/budget options required)] "
             "[--optimization-profile auto|manual] [--execution-inventory] [--host-dispatch-telemetry] [--execution-telemetry-trace] [--device-queue-trace] "
             "[--numerical-profile exact-v5|hc-splitk-f32-v1|q51-a8-down-v1|hc-splitk-f32+q51-a8-down-v1|q51-q80-a8-down-v1|hc-splitk-f32+q51-q80-a8-down-v1|hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup-v1|hc-deferred-norm-f32+q51-q80-a8-down-v1|hc-deferred-norm-f32+q51-q80-a8-down+q5k-a8-gateup-v1] "
             "[--teacher-forced-score --generate 1 [--teacher-logits-file PATH]] "
@@ -888,6 +894,7 @@ inline Options parse_options(
             else if(key=="--mtp-target-content")m.target_content=value;
             else if(key=="--mtp-golden")m.golden=value;
             else if(key=="--mtp-golden-sha256")m.golden_sha256=value;
+            else if(key=="--mtp-golden-dump")m.golden_dump=value;
             else if(key=="--mtp-source-repository")m.repository=value;
             else if(key=="--mtp-source-revision")m.revision=value;
             else if(key=="--mtp-source-path")m.source_path=value;

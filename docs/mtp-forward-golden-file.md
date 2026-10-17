@@ -39,3 +39,9 @@ and decoded vectors coexist; the file budget is not a claim about process RSS.
 The file SHA binds these container bytes. It is distinct from the runtime replay
 payload identity, which the native consumer computes separately after loading.
 No qualification or activation is implied by successful decoding.
+
+`write_mtp_forward_golden_file(path, golden, maximum_file_bytes)` encodes, writes
+a new file (never overwriting) and returns its full-file SHA256 pin. The
+developer `--mtp-golden-dump` route uses it with the explicit self-generated
+source marker `mtp_self_generated_golden_source()` /
+`mtp_self_generated_golden_reference`; see [native CLI](mtp-native-cli.md).
