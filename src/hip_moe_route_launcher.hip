@@ -1,6 +1,7 @@
 #include "strix/hip_mtp_native_validation.hpp"
 #include "strix/hip_launch_context.hpp"
 #include "strix/hip_moe_route_launcher.hpp"
+#include "strix/q6p_registry.hpp"
 #include "strix/wave_router_contract.hpp"
 
 #include "strix/dispatch_resources.hpp"
@@ -1092,9 +1093,11 @@ __global__ void __launch_bounds__(256) wave_rows_moe_route_logits_kernel(RouterR
 // left 32 - Rows lanes idle and needed 8x more waves for the same chains.
 // Chunk = coefficients each lane has in flight per step: the 2048 chains of a 4-row window
 // are only 64 waves, so the stream is latency bound and a longer step overlaps more of it.
-template <typename Activation, std::uint32_t Rows, std::uint32_t Chunk = kWaveRowsChunk, class Args = RouterRowsArgs>
+// Bf16: weights is the BF16 copy of F32 router weights that are exact BF16 values (a
+// registered strix::q6p copy); the expanded coefficients and the chain are unchanged.
+template <typename Activation, std::uint32_t Rows, std::uint32_t Chunk = kWaveRowsChunk, class Args = RouterRowsArgs, bool Bf16 = false>
 __global__ void __launch_bounds__(256) lanes_rows_moe_route_logits_kernel(Args rows,
-    const float* __restrict__ weights, std::uint32_t hidden_size, std::uint32_t expert_count) {
+    const void* __restrict__ weights, std::uint32_t hidden_size, std::uint32_t expert_count) {
     static_assert(Rows == 2U || Rows == 4U || Rows == 8U);
     constexpr std::uint32_t per_vector = 16U / sizeof(Activation);
     constexpr std::uint32_t experts_per_wave = 32U / Rows;
@@ -1103,13 +1106,30 @@ __global__ void __launch_bounds__(256) lanes_rows_moe_route_logits_kernel(Args r
     const auto expert = wave * experts_per_wave + lane / Rows;
     const auto row = lane % Rows;
     if (expert >= expert_count) return;
-    const auto* __restrict__ coefficients = reinterpret_cast<const float4*>(weights + static_cast<std::uint64_t>(expert) * hidden_size);
+    const auto* __restrict__ coefficients = reinterpret_cast<const float4*>(static_cast<const float*>(weights) +
+        static_cast<std::uint64_t>(expert) * hidden_size);
+    const auto* __restrict__ halves = reinterpret_cast<const uint4*>(static_cast<const std::uint16_t*>(weights) +
+        static_cast<std::uint64_t>(expert) * hidden_size);
     const auto* hidden = static_cast<const Activation*>(route_tiled(rows.hidden[row], rows.tile_hidden, rows));
     float sum = 0.0F;
     for (std::uint32_t feature = 0; feature < hidden_size; feature += Chunk) {
         float4 coefficient[Chunk / 4U];
-        #pragma unroll
-        for (std::uint32_t q = 0; q < Chunk / 4U; ++q) coefficient[q] = coefficients[(feature >> 2U) + q];
+        if constexpr (Bf16) {
+            uint4 packed[Chunk / 8U];
+            #pragma unroll
+            for (std::uint32_t q = 0; q < Chunk / 8U; ++q) packed[q] = halves[(feature >> 3U) + q];
+            #pragma unroll
+            for (std::uint32_t q = 0; q < Chunk / 8U; ++q) {
+                const std::uint32_t w[4] = {packed[q].x, packed[q].y, packed[q].z, packed[q].w};
+                coefficient[2U * q] = make_float4(__uint_as_float(w[0] << 16U), __uint_as_float(w[0] & 0xffff0000U),
+                    __uint_as_float(w[1] << 16U), __uint_as_float(w[1] & 0xffff0000U));
+                coefficient[2U * q + 1U] = make_float4(__uint_as_float(w[2] << 16U), __uint_as_float(w[2] & 0xffff0000U),
+                    __uint_as_float(w[3] << 16U), __uint_as_float(w[3] & 0xffff0000U));
+            }
+        } else {
+            #pragma unroll
+            for (std::uint32_t q = 0; q < Chunk / 4U; ++q) coefficient[q] = coefficients[(feature >> 2U) + q];
+        }
         float input[Chunk];
         #pragma unroll
         for (std::uint32_t v = 0; v < Chunk / per_vector; ++v) {
@@ -1452,6 +1472,14 @@ void launch_typed(
             dim3(256U, context.logical_rows), dim3(256U), 0, hip_execution_stream(),
             reinterpret_cast<const Activation*>(hidden.address), reinterpret_cast<const void*>(weight.address),
             reinterpret_cast<float*>(workspace.address));
+    } else if (const auto* bf16 = WeightKind == RouterWeightKind::f32 ? q6p::find(reinterpret_cast<const void*>(weight.address)) : nullptr;
+               bf16 && bf16->kind == q6p::Kind::bf16 && bf16->rows == config.expert_count && bf16->cols == config.hidden_size) {
+        // Registered BF16 copy of BF16-exact F32 weights: load_weight<bf16> yields the same coefficients.
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(parallel_moe_route_logits_kernel<Activation, RouterWeightKind::bf16>),
+            dim3((config.expert_count + kRouterExpertsPerBlock - 1U) / kRouterExpertsPerBlock, context.logical_rows),
+            dim3(kRouterProjectionThreads), 0, hip_execution_stream(),
+            reinterpret_cast<const Activation*>(hidden.address), reinterpret_cast<const void*>(bf16->base),
+            config.hidden_size, config.expert_count, reinterpret_cast<float*>(workspace.address));
     } else {
     hipLaunchKernelGGL(HIP_KERNEL_NAME(parallel_moe_route_logits_kernel<Activation, WeightKind>),
         dim3((config.expert_count + kRouterExpertsPerBlock - 1U) / kRouterExpertsPerBlock, context.logical_rows),
@@ -1848,6 +1876,10 @@ void launch_router_rows_typed(const PreparedRouterRows& p, const HipMoeRouteLaun
         }();
         // STRIX_ROUTER_STAGED=0: the lanes form below for the 2560-wide router as well (same chains).
         static const bool staged = [] { const char* v = std::getenv("STRIX_ROUTER_STAGED"); return !v || v[0] != '0'; }();
+        // A registered BF16 copy of the (BF16-exact) F32 weights replaces them: same coefficients and chains.
+        const auto* bf16 = q6p::find(weights);
+        const bool half = bf16 && bf16->kind == q6p::Kind::bf16 && bf16->rows == config.expert_count &&
+            bf16->cols == config.hidden_size;
         const auto lanes = [&]<std::uint32_t R>() {
             if (staged && config.hidden_size == 20U * 128U) {
                 // 16 experts per block: R / 2 chain waves and 8 loader waves keeping 8 chunks in flight.
@@ -1857,7 +1889,10 @@ void launch_router_rows_typed(const PreparedRouterRows& p, const HipMoeRouteLaun
                     0, stream, p.args, f32, config.expert_count);
                 return;
             }
-            if (chunk == 256U && config.hidden_size % 256U == 0U)
+            if (half && chunk == 128U && config.hidden_size % 128U == 0U)
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(lanes_rows_moe_route_logits_kernel<Activation, R, 128U, RouterRowsArgs, true>),
+                    blocks(R), dim3(256U), 0, stream, p.args, bf16->base, config.hidden_size, config.expert_count);
+            else if (chunk == 256U && config.hidden_size % 256U == 0U)
                 hipLaunchKernelGGL(HIP_KERNEL_NAME(lanes_rows_moe_route_logits_kernel<Activation, R, 256U>),
                     blocks(R), dim3(256U), 0, stream, p.args, f32, config.hidden_size, config.expert_count);
             else if (chunk == 128U && config.hidden_size % 128U == 0U)

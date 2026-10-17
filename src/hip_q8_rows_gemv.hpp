@@ -21,6 +21,10 @@
 //
 // T may be any count up to 8 (3/5/6/7 pad the tree to a power of two), or a
 // multiple of the wide batch (16, 32, 64) above 8.
+//
+// Q6P32: when every segment's Q8_0 tensor has a registered Q6P32 copy (see
+// strix/q6p_registry.hpp), the exact rows <= 8 kernel reads that copy instead. It decodes the same int8 codes and scales, so the arithmetic and the
+// output bits are unchanged.
 // A Site supplies Input (uint16_t BF16 or float), rows, input[] (or
 // row_input(r)), segments, width, outputs, the coefficient/fma/add arithmetic of
 // its R1 kernel and store(out, row, value); it may override outs, sub, prefetch,
@@ -41,6 +45,9 @@
 #include <stdexcept>
 #include <type_traits>
 #include <utility>
+
+#include "hip_q6p_weights.hpp"
+#include "strix/q6p_registry.hpp"
 
 namespace strix {
 // Launches that drop the AQL barrier bit for kernels proven independent of the one queued
@@ -295,11 +302,49 @@ template <unsigned Outs> struct Q8Fetch {
     }
 };
 
+// Q6P32 segments: weights[m] is the Q6P32 copy of a tensor with exactly the
+// segment's outputs as rows.
+__device__ __forceinline__ q6p::Row segment_row_q6(const Segments& s, std::uint32_t out, std::uint32_t width) {
+    unsigned m = 0;
+    while (m + 1U < s.count && out >= s.first[m + 1U]) ++m;
+    return q6p::row_of(s.weights[m], width, out - s.first[m]);
+}
+template <unsigned Outs> struct Q6Fetch {
+    q6p::Group group[Outs];
+    __device__ __forceinline__ void load(const q6p::Row (&w)[Outs], std::uint32_t base) {
+#pragma unroll
+        for (unsigned o = 0; o < Outs; ++o) group[o] = q6p::load_group(w[o], base);
+    }
+};
+template <bool Q6> struct RowsFormat;
+template <> struct RowsFormat<false> {
+    using Row = const unsigned char*;
+    template <unsigned Outs> using Fetch = Q8Fetch<Outs>;
+    template <unsigned Outs> __device__ static void rows(const Segments& s, std::uint32_t g, std::uint32_t outputs,
+        std::uint32_t width, Row (&w)[Outs]) { group_rows(s, g, outputs, width, w); }
+    template <unsigned Outs> __device__ static std::uint64_t codes(const Fetch<Outs>& f, unsigned o, std::uint32_t) { return f.codes[o]; }
+    template <unsigned Outs> __device__ static unsigned scale(const Fetch<Outs>& f, unsigned o) { return f.scale[o]; }
+};
+template <> struct RowsFormat<true> {
+    using Row = q6p::Row;
+    template <unsigned Outs> using Fetch = Q6Fetch<Outs>;
+    template <unsigned Outs> __device__ static void rows(const Segments& s, std::uint32_t g, std::uint32_t outputs,
+        std::uint32_t width, Row (&w)[Outs]) {
+#pragma unroll
+        for (unsigned o = 0; o < Outs; ++o) w[o] = q6p::uniform(segment_row_q6(s, min(g * Outs + o, outputs - 1U), width));
+    }
+    template <unsigned Outs> __device__ static std::uint64_t codes(const Fetch<Outs>& f, unsigned o, std::uint32_t base) {
+        return q6p::codes8(f.group[o].qs, f.group[o].qh, q6p::shift_of(base));
+    }
+    template <unsigned Outs> __device__ static unsigned scale(const Fetch<Outs>& f, unsigned o) { return f.group[o].scale; }
+};
+
 // Staged: every block copies all rows to LDS once, then loops over output groups.
 // Direct: one output group per wave.
-template <class Site, unsigned Outs, bool Staged>
+template <class Site, unsigned Outs, bool Staged, bool Q6 = false>
 __global__ __launch_bounds__(kThreads) void project_rows_kernel(Site site) {
     using Input = typename Site::Input;
+    using Format = RowsFormat<Q6>;
     constexpr unsigned Rows = Site::rows, Pairs = Outs * Rows, N = pow2u(Pairs) * 8U, Depth = prefetch_of<Site, Staged>();
     const unsigned lane = threadIdx.x & 31U;
     const std::uint32_t width = site.width, groups = (site.outputs + Outs - 1U) / Outs;
@@ -310,10 +355,10 @@ __global__ __launch_bounds__(kThreads) void project_rows_kernel(Site site) {
         __syncthreads();
     }
     for (std::uint32_t g = blockIdx.x * kWaves + threadIdx.x / 32U; g < groups; g += Staged ? gridDim.x * kWaves : groups) {
-        const unsigned char* w[Outs];
-        group_rows(site.segments, g, site.outputs, width, w);
+        typename Format::Row w[Outs];
+        Format::rows(site.segments, g, site.outputs, width, w);
         float v[N]{};
-        Q8Fetch<Outs> next[Depth];
+        typename Format::template Fetch<Outs> next[Depth];
 #pragma unroll
         for (unsigned d = 0; d < Depth; ++d) if (8U * lane + 256U * d < width) next[d].load(w, 8U * lane + 256U * d);
         for (std::uint32_t base = 8U * lane; base < width; base += 256U) {
@@ -323,10 +368,12 @@ __global__ __launch_bounds__(kThreads) void project_rows_kernel(Site site) {
             if (base + 256U * Depth < width) next[Depth - 1U].load(w, base + 256U * Depth);
             float coefficient[Outs][8];
 #pragma unroll
-            for (unsigned o = 0; o < Outs; ++o)
+            for (unsigned o = 0; o < Outs; ++o) {
+                const std::uint64_t codes = Format::codes(current, o, base);
 #pragma unroll
                 for (unsigned l = 0; l < 8U; ++l)
-                    coefficient[o][l] = Site::coefficient(current.scale[o], static_cast<std::int8_t>(current.codes[o] >> (8U * l)));
+                    coefficient[o][l] = Site::coefficient(Format::scale(current, o), static_cast<std::int8_t>(codes >> (8U * l)));
+            }
 #pragma unroll
             for (unsigned r = 0; r < Rows; ++r) {
                 float x[8];
@@ -1335,6 +1382,21 @@ template <auto Kernel, unsigned Threads> unsigned resident_blocks(std::uint32_t 
     return blocks;
 }
 
+// The Q6P32 copy of every segment, or false when any segment has none (or its
+// registered shape differs from the segment's outputs x width).
+template <class Site> bool q6_site(const Site& site, Site& result) {
+    if (!q6p::registered_count()) return false;
+    result = site;
+    for (unsigned m = 0; m < site.segments.count; ++m) {
+        const auto* t = q6p::find(site.segments.weights[m]);
+        if (!t || t->kind != q6p::Kind::q6p32 || t->cols != site.width ||
+            t->rows != site.segments.first[m + 1U] - site.segments.first[m])
+            return false;
+        result.segments.weights[m] = t->base;
+    }
+    return true;
+}
+
 // Rows > 8 tuning overrides: STRIX_Q8_ROWS_WIDE_KERNEL = 0 (one output group per wave,
 // project_wide_rows_kernel), 1 (shared coefficients, C++ FMA chains) or 2 (default:
 // the VOPD kernels where the site allows them); STRIX_Q8_ROWS_WIDE_SUB = 2/4/8/16 rows
@@ -1473,12 +1535,15 @@ template <class Site> void launch_dense_a8_quantized(const Site& site, const Den
 // a8 selects the dense A8 profile arithmetic (launch_dense_a8).
 template <class Site> void launch(const Site& site, bool a8, hipStream_t stream, bool any_order = false) {
     if (a8) { launch_dense_a8(site, stream, any_order); return; }
-    const auto start = [&](auto kernel, unsigned blocks, unsigned threads, std::uint32_t bytes) {
+    const auto start = [&](auto kernel, unsigned blocks, unsigned threads, std::uint32_t bytes, const Site& args) {
         if (any_order)
-            hipExtLaunchKernelGGL(kernel, dim3(blocks), dim3(threads), bytes, stream, nullptr, nullptr, hipExtAnyOrderLaunch, site);
-        else hipLaunchKernelGGL(kernel, dim3(blocks), dim3(threads), bytes, stream, site);
+            hipExtLaunchKernelGGL(kernel, dim3(blocks), dim3(threads), bytes, stream, nullptr, nullptr, hipExtAnyOrderLaunch, args);
+        else hipLaunchKernelGGL(kernel, dim3(blocks), dim3(threads), bytes, stream, args);
     };
     const auto groups_for = [&](unsigned outs, unsigned waves) { return ((site.outputs + outs - 1U) / outs + waves - 1U) / waves; };
+    // Q6P32 copies are looked up only on the project_rows_kernel paths (the VOPD and wide
+    // kernels keep the Q8_0 tensors; the bits are the same either way).
+    Site q6;
     // Verify windows of 4 and 8 rows: the 4-output x 4-row VOPD kernels with 1 or 2 waves per
     // block. Default: FP32 inputs of width >= 1024 (GDN and QSA output projections), which are
     // compute-bound at T = 4/8. BF16 inputs are at DRAM bandwidth there and the staged
@@ -1492,12 +1557,12 @@ template <class Site> void launch(const Site& site, bool a8, hipStream_t stream,
             if constexpr (sizeof(typename Site::Input) == 2U) {
                 if (narrow_vopd() == 2U) {
                     constexpr auto kernel = project_wide_rows_vopd_bf16_kernel<Site>;
-                    start(kernel, blocks, 32U * waves, 0U);
+                    start(kernel, blocks, 32U * waves, 0U, site);
                     return;
                 }
             } else if (site.width >= narrow_fp32_min_width()) {
                 constexpr auto kernel = project_wide_rows_coef_kernel<Site, 4U, 4U, 4U, true>;
-                start(kernel, blocks, 32U * waves, 0U);
+                start(kernel, blocks, 32U * waves, 0U, site);
                 return;
             }
         }
@@ -1509,11 +1574,11 @@ template <class Site> void launch(const Site& site, bool a8, hipStream_t stream,
             if (wide_kernel() == 2U && !wide_stage()) {
                 if constexpr (sizeof(typename Site::Input) == 2U) {
                     constexpr auto kernel = project_wide_rows_vopd_bf16_kernel<Site>;
-                    start(kernel, (site.outputs + 3U) / 4U * (Site::rows / 16U), 128U, 0U);
+                    start(kernel, (site.outputs + 3U) / 4U * (Site::rows / 16U), 128U, 0U, site);
                     return;
                 } else if (site.width >= wide_fp32_min_width()) {
                     constexpr auto kernel = project_wide_rows_coef_kernel<Site, 4U, 4U, 4U, true>;
-                    start(kernel, (site.outputs + 3U) / 4U * (Site::rows / 16U), 128U, 0U);
+                    start(kernel, (site.outputs + 3U) / 4U * (Site::rows / 16U), 128U, 0U, site);
                     return;
                 }
             }
@@ -1522,14 +1587,14 @@ template <class Site> void launch(const Site& site, bool a8, hipStream_t stream,
             constexpr unsigned Outs = 16U / Sub;
             if (wide_stage()) {
                 constexpr auto kernel = project_wide_rows_staged_kernel<Site, Outs, Sub>;
-                start(kernel, groups_for(Outs, kWaves) * (Site::rows / Sub), kThreads, 0U);
+                start(kernel, groups_for(Outs, kWaves) * (Site::rows / Sub), kThreads, 0U, site);
             } else if (wide_kernel() == 1U) {
                 constexpr unsigned waves = coef_waves<Site, Sub>();
                 constexpr auto kernel = project_wide_rows_coef_kernel<Site, Outs, Sub, kWaves, false>;
-                start(kernel, (site.outputs + Outs - 1U) / Outs * (Site::rows / Sub / waves), 32U * waves, 0U);
+                start(kernel, (site.outputs + Outs - 1U) / Outs * (Site::rows / Sub / waves), 32U * waves, 0U, site);
             } else {
                 constexpr auto kernel = project_wide_rows_kernel<Site, Outs, Sub>;
-                start(kernel, groups_for(Outs, kWaves) * (Site::rows / Sub), kThreads, 0U);
+                start(kernel, groups_for(Outs, kWaves) * (Site::rows / Sub), kThreads, 0U, site);
             }
         };
         switch (wide_sub()) {
@@ -1540,14 +1605,22 @@ template <class Site> void launch(const Site& site, bool a8, hipStream_t stream,
         default: wide.template operator()<wide_sub_of<Site>()>(); break;
         }
     } else if (const auto bytes = staged_bytes(site)) {
+        // The staging choice keeps the Q8_0 rule so both formats run the same organization.
         constexpr unsigned Outs = outs_of<Site, true>();
-        constexpr auto kernel = project_rows_kernel<Site, Outs, true>;
-        const auto blocks = std::min(groups_for(Outs, kWaves), resident_blocks<kernel, kThreads>(bytes));
-        start(kernel, blocks, kThreads, bytes);
+        if (q6_site(site, q6)) {
+            constexpr auto kernel = project_rows_kernel<Site, Outs, true, true>;
+            start(kernel, std::min(groups_for(Outs, kWaves), resident_blocks<kernel, kThreads>(bytes)), kThreads, bytes, q6);
+        } else {
+            constexpr auto kernel = project_rows_kernel<Site, Outs, true>;
+            start(kernel, std::min(groups_for(Outs, kWaves), resident_blocks<kernel, kThreads>(bytes)), kThreads, bytes, site);
+        }
     } else {
         constexpr unsigned Outs = outs_of<Site, false>();
-        constexpr auto kernel = project_rows_kernel<Site, Outs, false>;
-        start(kernel, groups_for(Outs, kWaves), kThreads, 0U);
+        // Measured: direct Q6P32 windows wider than four rows take one output per wave
+        // (GDN/QSA out at T=8: 129 -> 101 us cold); the per-output arithmetic is unchanged.
+        constexpr unsigned Q6Outs = Site::rows > 4U ? 1U : Outs;
+        if (q6_site(site, q6)) start(project_rows_kernel<Site, Q6Outs, false, true>, groups_for(Q6Outs, kWaves), kThreads, 0U, q6);
+        else start(project_rows_kernel<Site, Outs, false>, groups_for(Outs, kWaves), kThreads, 0U, site);
     }
 }
 

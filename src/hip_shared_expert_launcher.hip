@@ -836,6 +836,13 @@ void validate_tensor(
     }
 }
 
+// One-row q8_rows sites over a registered Q6P32 copy (bitwise the R1 prefetch8 kernels);
+// false when the weights have none.
+bool shared_q6_r1_gate_up(const std::uint16_t* input, const void* weights, std::uint32_t width, std::uint32_t outputs,
+    float* output, hipStream_t stream);
+bool shared_q6_r1_down(const float* input, const float* gate, const void* weights, std::uint32_t width,
+    std::uint32_t outputs, std::uint16_t* output, hipStream_t stream);
+
 template <typename Input>
 void launch_projection_by_kind(
     WeightKind kind,
@@ -844,6 +851,12 @@ void launch_projection_by_kind(
     std::uint32_t input_width,
     std::uint32_t output_width,
     float* output,bool prefetch=false,shared_expert_prefetch::RuntimeDispatchStats* stats=nullptr) {
+    if constexpr (std::is_same_v<Input, std::uint16_t>)
+        if(prefetch && kind==WeightKind::q8_0 && input_width%32U==0 &&
+           shared_q6_r1_gate_up(input,reinterpret_cast<const void*>(weights.address),input_width,output_width,output,hip_execution_stream())){
+            if(stats)stats->dispatched_projections.fetch_add(1,std::memory_order_relaxed);
+            return;
+        }
     if(prefetch && kind==WeightKind::q8_0 && input_width%32U==0){hipLaunchKernelGGL(HIP_KERNEL_NAME(shared_q8_virtual_projection_kernel<Input,true,8>),dim3(output_width/8U+(output_width%8U!=0U)),dim3(256),0,hip_execution_stream(),input,reinterpret_cast<const void*>(weights.address),input_width,output_width,output);check_hip(hipGetLastError(),"HIP shared prefetch8 gate/up launch");if(stats)stats->dispatched_projections.fetch_add(1,std::memory_order_relaxed);return;}
 #define STRIX_LAUNCH_CASE(kind_name)     hipLaunchKernelGGL(         HIP_KERNEL_NAME(             projection_to_fp32_kernel<                 Input, WeightKind::kind_name>),         dim3(output_width),         dim3(kThreads),         0, hip_execution_stream(),         input,         reinterpret_cast<const void*>(weights.address),         input_width,         output_width,         output)
     switch (kind) {
@@ -891,6 +904,13 @@ void launch_down_by_kind(
     std::uint32_t intermediate_size,
     std::uint32_t hidden_size,
     Output* output,bool prefetch=false,shared_expert_prefetch::RuntimeDispatchStats* stats=nullptr) {
+    if constexpr (std::is_same_v<Output, std::uint16_t>)
+        if(prefetch && kind==WeightKind::q8_0 && intermediate_size%32U==0 &&
+           shared_q6_r1_down(intermediate,shared_gate,reinterpret_cast<const void*>(weights.address),intermediate_size,hidden_size,output,
+               hip_execution_stream())){
+            if(stats)stats->dispatched_projections.fetch_add(1,std::memory_order_relaxed);
+            return;
+        }
     if(prefetch && kind==WeightKind::q8_0 && intermediate_size%32U==0){hipLaunchKernelGGL(HIP_KERNEL_NAME(shared_q8_virtual_down_kernel<Output,true,8>),dim3(hidden_size/8U+(hidden_size%8U!=0U)),dim3(256),0,hip_execution_stream(),intermediate,shared_gate,reinterpret_cast<const void*>(weights.address),intermediate_size,hidden_size,output);check_hip(hipGetLastError(),"HIP shared prefetch8 down launch");if(stats)stats->dispatched_projections.fetch_add(1,std::memory_order_relaxed);return;}
 #define STRIX_DOWN_CASE(kind_name)     hipLaunchKernelGGL(         HIP_KERNEL_NAME(             down_projection_kernel<                 Output, WeightKind::kind_name>),         dim3(hidden_size),         dim3(kThreads),         0, hip_execution_stream(),         intermediate,         shared_gate,         reinterpret_cast<const void*>(weights.address),         intermediate_size,         hidden_size,         output)
     switch (kind) {
@@ -1518,6 +1538,30 @@ void launch_shared_dense_a8_down(const SharedTensors& tensors, const float* inte
     site.width = intermediate_size; site.outputs = hidden_size;
     q8_rows::launch(site, true, stream);
     check_hip(hipGetLastError(), "HIP shared-expert dense A8 down launch");
+}
+bool shared_q6_r1_registered(const void* weights, std::uint32_t width, std::uint32_t outputs) {
+    const auto* q6 = q6p::find(weights);
+    return q6 && q6->kind == q6p::Kind::q6p32 && q6->rows == outputs && q6->cols == width;
+}
+bool shared_q6_r1_gate_up(const std::uint16_t* input, const void* weights, std::uint32_t width, std::uint32_t outputs,
+    float* output, hipStream_t stream) {
+    if (!shared_q6_r1_registered(weights, width, outputs)) return false;
+    SharedGateUpRowsSite<1> site{};
+    site.segments = q8_rows::segments({{weights, outputs}});
+    site.width = width; site.outputs = outputs; site.input[0] = input; site.output[0] = output;
+    q8_rows::launch(site, false, stream);
+    check_hip(hipGetLastError(), "HIP shared Q6P32 gate/up launch");
+    return true;
+}
+bool shared_q6_r1_down(const float* input, const float* gate, const void* weights, std::uint32_t width,
+    std::uint32_t outputs, std::uint16_t* output, hipStream_t stream) {
+    if (!shared_q6_r1_registered(weights, width, outputs)) return false;
+    SharedDownRowsSite<1> site{};
+    site.segments = q8_rows::segments({{weights, outputs}});
+    site.width = width; site.outputs = outputs; site.input[0] = input; site.gate[0] = gate; site.output[0] = output;
+    q8_rows::launch(site, false, stream);
+    check_hip(hipGetLastError(), "HIP shared Q6P32 down launch");
+    return true;
 }
 } // namespace
 } // namespace strix

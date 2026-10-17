@@ -16,6 +16,7 @@
 #include "strix/wave_router_contract.hpp"
 #include "strix/hip_setup_quiescence.hpp"
 #include "strix/hip_shared_expert_launcher.hpp"
+#include "strix/q6p_registry.hpp"
 #include "strix/session_state_layout.hpp"
 #include "strix/session_state_memory.hpp"
 
@@ -1388,12 +1389,28 @@ struct HyperFixture {
 
 void family_hyper_rows(SerialOp op, bool splitk, bool lane, std::uint32_t count) {
     HyperFixture f(op, splitk, lane, count);
+    // Q6P32 copies of the (six-bit) down and up tensors.
+    std::vector<unsigned char> q6_down(q6p::q6p32_bytes(320U, 10240U)), q6_up(q6p::q6p32_bytes(10240U, 320U));
+    require(q6p::to_q6p32(f.weights[1].original.data(), 320U, 10240U, q6_down.data()) &&
+        q6p::to_q6p32(f.weights[2].original.data(), 10240U, 320U, q6_up.data()), "HC fixture weights are not six-bit");
+    const auto q6_down_device = f.owner.allocate(q6_down.size()), q6_up_device = f.owner.allocate(q6_up.size());
+    write(q6_down_device, q6_down); write(q6_up_device, q6_up);
     for (unsigned flavor = 0; flavor < 4U; ++flavor) {
         f.prepare(flavor);
         const auto serial = f.run(false);
         const auto candidate = f.run(true);
         require(candidate == serial, "HC rows output/injection/workspace differ bitwise from ascending R1 calls");
         require(f.run(true) == candidate, "HC rows are not deterministic across repeats");
+        q6p::register_tensor(reinterpret_cast<const void*>(f.weights[1].device.address),
+            {reinterpret_cast<const unsigned char*>(q6_down_device.address), 320U, 10240U, q6p::Kind::q6p32});
+        q6p::register_tensor(reinterpret_cast<const void*>(f.weights[2].device.address),
+            {reinterpret_cast<const unsigned char*>(q6_up_device.address), 10240U, 320U, q6p::Kind::q6p32});
+        const auto hits = q6p::hits();
+        const auto q6 = f.run(true);
+        const auto used = q6p::hits() - hits;
+        q6p::clear();
+        require(q6 == candidate, "Q6P32 HC rows differ from the Q8_0 rows");
+        require(used == (splitk ? 1U : 0U) + (lane ? 1U : 0U), "Q6P32 HC rows did not read the registered copies");
         if (flavor == 0U) {
             for (std::uint32_t r = 0; r < count; ++r) {
                 const auto bytes = f.output(candidate, r);
@@ -1526,6 +1543,24 @@ void family_lm_head_rows(std::uint32_t rows) {
     };
     const auto reference = run(false);
     require(run(true) == reference && run(true) == reference, "window head rows differ from R1 head bytes or tails");
+    {
+        // Q6P32 copy of the (six-bit) head: the same bytes, with the Q8_0 head poisoned.
+        std::vector<unsigned char> packed(q6p::q6p32_bytes(vocab, hidden));
+        require(q6p::to_q6p32(weights.data(), vocab, hidden, packed.data()), "head fixture is not six-bit");
+        const auto device_q6 = owner.allocate(packed.size());
+        write(device_q6, packed);
+        check(hipMemset(reinterpret_cast<void*>(device_weights.address), 0xa5, device_weights.bytes), "poison Q8 head");
+        q6p::register_tensor(reinterpret_cast<const void*>(device_weights.address),
+            {reinterpret_cast<const unsigned char*>(device_q6.address), vocab, hidden, q6p::Kind::q6p32});
+        const auto q6_rows = run(true);
+        const auto hits = q6p::hits();
+        const auto q6_serial = run(false);
+        const auto serial_hits = q6p::hits() - hits;
+        q6p::clear();
+        write(device_weights, weights);
+        require(q6_rows == reference, "Q6P32 window head rows differ from the Q8_0 head");
+        require(q6_serial == reference && serial_hits == rows, "Q6P32 R1 head differs from the Q8_0 head or skipped the copy");
+    }
     require(window.row_stride[1] != 0U, "window head rows use striped row views");
     check(hipStreamBeginCapture(owner.stream, hipStreamCaptureModeThreadLocal), "begin head rows capture");
     bool rejected = false;
@@ -1716,8 +1751,36 @@ void router_rows_family() {
         auto serial_only = router_config(f, false, false, false); serial_only.parallel_projection = false;
         const auto contexts = f.contexts(s, "hip.moe_route.test");
         invalid([&] { moe_route_known_window_rows_preflight(contexts, serial_only); });
+        if (type == 0U) {
+            // A registered BF16 copy of BF16-exact F32 weights (as a dense Q6P32 pack provides it): same bytes.
+            const auto original = read(f.router);
+            std::vector<float> exact(original.size() / 4U);
+            std::vector<std::uint16_t> half(exact.size());
+            for (std::size_t i = 0; i < exact.size(); ++i) {
+                float value; std::memcpy(&value, original.data() + 4U * i, 4U);
+                half[i] = bf16(value);
+                exact[i] = std::bit_cast<float>(static_cast<std::uint32_t>(half[i]) << 16U);
+            }
+            write(f.router, bytes_of(exact));
+            const auto copy = f.owner.allocate(half.size() * 2U);
+            write(copy, bytes_of(half));
+            auto config = router_config(f, false, false, true);
+            const auto launcher = make_hip_moe_route_launcher("hip.moe_route.test.parallel", &config);
+            const auto rows_contexts = f.contexts(s, launcher.key);
+            const auto launch = [&] { moe_route_known_window_rows_preflight(rows_contexts, config);
+                moe_route_known_window_rows_launch(rows_contexts, config); };
+            const auto reference = f.run(launch, f.seed);
+            q6p::register_tensor(reinterpret_cast<const void*>(f.router.address),
+                {reinterpret_cast<const unsigned char*>(copy.address), 512U, 2560U, q6p::Kind::bf16});
+            const auto hits = q6p::hits();
+            const auto candidate = f.run(launch, f.seed);
+            const auto used = q6p::hits() - hits;
+            q6p::clear();
+            write(f.router, original);
+            require(candidate == reference && used == 1U, "BF16 router rows differ from the F32 rows or skipped the copy");
+        }
     }
-    std::cout << "router rows 2/4/8 x F32/BF16/Q8_0 x staged/wave/ranked/sorted equal serial bytes\n";
+    std::cout << "router rows 2/4/8 x F32/BF16/Q8_0 x staged/wave/ranked/sorted equal serial bytes; BF16 copies equal F32\n";
 }
 void elementwise_rows_family() {
     for (const auto rows : {2U, 4U, 8U}) {

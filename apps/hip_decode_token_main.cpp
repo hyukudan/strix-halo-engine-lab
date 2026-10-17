@@ -5,6 +5,8 @@
 #include "strix/gdn_output_admission.hpp"
 #include "strix/compiled_execution.hpp"
 #include "strix/teacher_logit_spool.hpp"
+#include "strix/hip_q6p_pack.hpp"
+#include "strix/q6p_registry.hpp"
 #include "strix/execution_resources.hpp"
 #include "strix/execution_tensor_access.hpp"
 #include "strix/gguf_reader.hpp"
@@ -1128,12 +1130,26 @@ int STRIX_DECODE_ENTRY(
 #else
     constexpr bool has_auto_a8_runtime = false;
 #endif
+    // A dense Q6P32 pack built from the validated checkpoint admits its emulated
+    // derivative (the pinned file) under the validated content's profiles.
+    auto admitted_content = strix::model_content_identity_hex(mapped.content_identity());
+    if (!options.dense_q6p_pack_path.empty()) {
+        const auto header = strix::read_q6p_pack_header(options.dense_q6p_pack_path);
+        if (header.format != "Q6P32-v1" || header.target_content != admitted_content ||
+            header.target_file_sha256 != strix::model_content_identity_hex(mapped.file_sha256()))
+            throw std::invalid_argument("dense Q6P32 pack does not pin this model file");
+        if (header.source_content == strix::decode_cli::validated_model_content_identity) {
+            admitted_content = std::string(strix::decode_cli::validated_model_content_identity);
+            unsigned char identity[32];
+            std::memcpy(identity, mapped.content_identity().bytes.data(), 32U);
+            strix::q6p::admit_derived_content(identity);
+        }
+    }
     auto optimization_profile = strix::decode_cli::resolve_optimization_profile(
-        options, model, info, manifest,
-        strix::model_content_identity_hex(mapped.content_identity()), has_auto_a8_runtime, !target_input_export);
+        options, model, info, manifest, admitted_content, has_auto_a8_runtime, !target_input_export);
     const auto base_optimization_profile = optimization_profile.selected;
     strix::decode_cli::apply_numerical_profile(options, model, manifest,
-        strix::model_content_identity_hex(mapped.content_identity()), has_auto_a8_runtime, optimization_profile);
+        admitted_content, has_auto_a8_runtime, optimization_profile);
     strix::decode_cli::apply_model_copy_profile(options, optimization_profile);
     const bool hc_splitk_f32 = strix::numerical_profile_hc_splitk(options.numerical_profile);
     const bool hc_deferred_norm = strix::numerical_profile_hc_deferred_norm(options.numerical_profile);
@@ -1805,6 +1821,14 @@ int STRIX_DECODE_ENTRY(
     auto model_owner = std::make_shared<strix::HipModelResidency>(
         strix::HipModelResidency::create(mapped_owner, manifest, generations, residency_policy));
     auto& model_residency = *model_owner;
+    std::shared_ptr<const strix::HipQ6pPack> dense_q6p_pack;
+    if (!options.dense_q6p_pack_path.empty()) {
+        dense_q6p_pack = strix::load_hip_q6p_pack(options.dense_q6p_pack_path, mapped, manifest,
+            model_residency.binding(), generations);
+        std::cerr << "dense Q6P32 pack: " << dense_q6p_pack->q6p_tensors << " Q6P32 + " << dense_q6p_pack->bf16_tensors
+                  << " BF16 tensors, " << dense_q6p_pack->q6p_bytes << " bytes replace " << dense_q6p_pack->replaced_bytes
+                  << (strix::q6p::kernels_enabled() ? "" : " (STRIX_Q6P=0: not read)") << '\n';
+    }
     // After registration: pinning the model may evict anything populated before it.
     warm_file_backed_tensors(mapped, manifest);
     // Keep the actual registration/copy owner and its exact map control block

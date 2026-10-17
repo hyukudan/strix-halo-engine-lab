@@ -7,6 +7,8 @@
 #include "strix/q8_projection_organization.hpp"
 
 #include "strix/dispatch_resources.hpp"
+#include "strix/q6p_registry.hpp"
+#include "hip_q6p_weights.hpp"
 
 #include <cstdlib>
 #include <string_view>
@@ -539,7 +541,9 @@ __device__ float lane_down(float value) {
 // R1 leaf, lane-tree and local-tree DAG of prefetch8_wave_q8_lm_head_kernel.
 // Groups > 1 stages all rows' BF16 inputs in LDS once per block, which then
 // covers Groups consecutive Waves-row tiles; it changes no arithmetic.
-template <unsigned Waves, unsigned Rows, unsigned Groups>
+// Q6: weights is the Q6P32 copy of the Q8_0 head; it yields the same codes and
+// scales (decoded where the Q8_0 path unpacks its prefetched codes).
+template <unsigned Waves, unsigned Rows, unsigned Groups, bool Q6 = false>
 __global__ __launch_bounds__(32U * Waves)
 void prefetch8_wave_q8_lm_head_rows_kernel(LmHeadRowsViews views, const void* weights,
     std::uint32_t input_width, std::uint32_t output_width) {
@@ -563,16 +567,26 @@ void prefetch8_wave_q8_lm_head_rows_kernel(LmHeadRowsViews views, const void* we
     // stop exactly where the R1 base < width guard stops accumulating.
     std::uint64_t next_codes = 0;
     __half next_scale{};
+    q6p::Group next_group{};
+    const auto q6_row = q6p::uniform(q6p::row_of(static_cast<const unsigned char*>(weights), input_width, row));
     const auto fetch = [&](std::uint32_t feature) {
-        const auto& block = blocks[feature / 32U];
-        __builtin_memcpy(&next_codes, block.values + feature % 32U, 8U);
-        next_scale = block.scale;
+        if constexpr (Q6) {
+            next_group = q6p::load_group(q6_row, feature);
+        } else {
+            const auto& block = blocks[feature / 32U];
+            __builtin_memcpy(&next_codes, block.values + feature % 32U, 8U);
+            next_scale = block.scale;
+        }
     };
     if (8U * lane < input_width) fetch(8U * lane);
     for (std::uint64_t chunk = 0; chunk < input_width; chunk += 256U) {
         const auto base = chunk + 8U * lane;
         if (base >= input_width) break;
         const auto feature = static_cast<std::uint32_t>(base);
+        if constexpr (Q6) {
+            next_codes = q6p::codes8(next_group.qs, next_group.qh, q6p::shift_of(feature));
+            next_scale = __ushort_as_half(static_cast<unsigned short>(next_group.scale));
+        }
         const auto packed = next_codes;
         const float scale = __half2float(next_scale);
         if (base + 256U < input_width) fetch(feature + 256U);
@@ -619,8 +633,8 @@ void prefetch8_wave_q8_lm_head_rows_kernel(LmHeadRowsViews views, const void* we
 // direct per-wave input loads from overflowing the vector cache.
 constexpr unsigned lm_head_rows_groups = 16;
 constexpr std::uint64_t lm_head_rows_lds_limit = 48U * 1024U;
-template <unsigned Rows>
-void launch_lm_head_rows(const LmHeadRowsViews& views, const void* weights,
+template <unsigned Rows, bool Q6>
+void launch_lm_head_rows_format(const LmHeadRowsViews& views, const void* weights,
     std::uint32_t hidden, std::uint32_t vocab, hipStream_t stream) {
     const auto lds = static_cast<std::uint64_t>(Rows) * hidden * 2U;
     // STRIX_LM_HEAD_ROWS_WIDE=w16|direct (wide windows): 16 waves share one staged copy
@@ -631,18 +645,41 @@ void launch_lm_head_rows(const LmHeadRowsViews& views, const void* weights,
     }();
     if (Rows > 4U && lds <= lm_head_rows_lds_limit && wide == 1) {
         constexpr auto rows_per_block = 16U * (lm_head_rows_groups / 2U);
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(prefetch8_wave_q8_lm_head_rows_kernel<16, Rows, lm_head_rows_groups / 2U>),
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(prefetch8_wave_q8_lm_head_rows_kernel<16, Rows, lm_head_rows_groups / 2U, Q6>),
             dim3((vocab + rows_per_block - 1U) / rows_per_block), dim3(512), static_cast<std::uint32_t>(lds), stream,
             views, weights, hidden, vocab);
     } else if (Rows > 4U && lds <= lm_head_rows_lds_limit && wide == 0) {
         constexpr auto rows_per_block = 8U * lm_head_rows_groups;
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(prefetch8_wave_q8_lm_head_rows_kernel<8, Rows, lm_head_rows_groups>),
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(prefetch8_wave_q8_lm_head_rows_kernel<8, Rows, lm_head_rows_groups, Q6>),
             dim3((vocab + rows_per_block - 1U) / rows_per_block), dim3(256), static_cast<std::uint32_t>(lds), stream,
             views, weights, hidden, vocab);
     } else {
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(prefetch8_wave_q8_lm_head_rows_kernel<8, Rows, 1>),
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(prefetch8_wave_q8_lm_head_rows_kernel<8, Rows, 1, Q6>),
             dim3((vocab + 7U) / 8U), dim3(256), 0, stream, views, weights, hidden, vocab);
     }
+}
+// The registered Q6P32 copy of the Q8_0 head replaces it when its shape matches.
+const q6p::Tensor* q6_head(const void* weights, std::uint32_t hidden, std::uint32_t vocab) {
+    const auto* q6 = q6p::find(weights);
+    return q6 && q6->kind == q6p::Kind::q6p32 && q6->rows == vocab && q6->cols == hidden ? q6 : nullptr;
+}
+template <unsigned Rows>
+void launch_lm_head_rows(const LmHeadRowsViews& views, const void* weights,
+    std::uint32_t hidden, std::uint32_t vocab, hipStream_t stream) {
+    if (const auto* q6 = q6_head(weights, hidden, vocab)) launch_lm_head_rows_format<Rows, true>(views, q6->base, hidden, vocab, stream);
+    else launch_lm_head_rows_format<Rows, false>(views, weights, hidden, vocab, stream);
+}
+// R1 prefetch8 wave8 head over a registered Q6P32 copy: the one-row rows kernel repeats the
+// R1 leaf, lane-tree and local-tree DAG. False when the head has no copy.
+bool launch_q6_head_r1(const std::uint16_t* hidden, const void* weights, std::uint32_t hidden_size,
+    std::uint32_t vocab, float* logits, hipStream_t stream) {
+    const auto* q6 = q6_head(weights, hidden_size, vocab);
+    if (!q6) return false;
+    LmHeadRowsViews views{};
+    views.input[0] = hidden;
+    views.output[0] = logits;
+    launch_lm_head_rows_format<1, true>(views, q6->base, hidden_size, vocab, stream);
+    return true;
 }
 
 template <
@@ -655,7 +692,10 @@ void launch_typed(
     const ExecutionBufferAddress& logits) {
     if (config.prefetch_q8_wave) {
         if constexpr (Kind == WeightKind::q8_0 && std::is_same_v<Input, std::uint16_t>) {
-            if (config.wave8_q8_wave) {
+            if (config.wave8_q8_wave && std::is_same_v<Input, std::uint16_t> &&
+                launch_q6_head_r1(reinterpret_cast<const std::uint16_t*>(hidden.address), reinterpret_cast<const void*>(weights.address),
+                    config.hidden_size, config.vocab_size, reinterpret_cast<float*>(logits.address), hip_execution_stream())) {
+            } else if (config.wave8_q8_wave) {
                 hipLaunchKernelGGL(HIP_KERNEL_NAME(prefetch8_wave_q8_lm_head_kernel<Input, 8>),
                     dim3((config.vocab_size + 7U) / 8U), dim3(256), 0, hip_execution_stream(),
                     reinterpret_cast<const Input*>(hidden.address),
@@ -1275,6 +1315,12 @@ void launch_hip_mtp_lm_head(const MtpNativeContext& c,void* stream) {
     check_hip(hipPeekAtLastError(),"MTP head pending HIP error");
     if(select_hip_mtp_lm_head_recipe(*c.model,c.tensors->lm_head)==HipMtpLmHeadRecipe::prefetch8_wave8_q8) {
         const auto outputs=static_cast<std::uint32_t>(c.model->vocab_size);
+        if(launch_q6_head_r1(reinterpret_cast<const std::uint16_t*>(c.resources->view(HipMtpBuffer::hidden0).address),
+            reinterpret_cast<const void*>(c.tensors->lm_head.runtime->address),static_cast<std::uint32_t>(c.model->hidden_size),outputs,
+            reinterpret_cast<float*>(c.resources->view(HipMtpBuffer::logits).address),reinterpret_cast<hipStream_t>(stream))) {
+            check_hip(hipGetLastError(),"MTP Q6P32 LM head launch");
+            return;
+        }
         hipLaunchKernelGGL(HIP_KERNEL_NAME(prefetch8_wave_q8_lm_head_kernel<std::uint16_t,8>),
             dim3(outputs/8U+static_cast<std::uint32_t>(outputs%8U!=0U)),dim3(256U),0,
             reinterpret_cast<hipStream_t>(stream),
@@ -1310,6 +1356,10 @@ void launch_hip_q8_head_rows(const std::uint16_t* hidden,const void* q8_rows,std
     if(!hidden || !q8_rows || !logits || !stream || !rows || !hidden_size || hidden_size%32U || hidden_size>10240U ||
        reinterpret_cast<std::uintptr_t>(q8_rows)%2U)
         throw std::invalid_argument("Q8 draft head rows geometry/views invalid");
+    if(launch_q6_head_r1(hidden,q8_rows,hidden_size,rows,logits,reinterpret_cast<hipStream_t>(stream))) {
+        check_hip(hipGetLastError(),"Q6P32 draft head rows launch");
+        return;
+    }
     hipLaunchKernelGGL(HIP_KERNEL_NAME(prefetch8_wave_q8_lm_head_kernel<std::uint16_t,8>),
         dim3(rows/8U+static_cast<std::uint32_t>(rows%8U!=0U)),dim3(256U),0,reinterpret_cast<hipStream_t>(stream),
         hidden,q8_rows,hidden_size,rows,logits);
