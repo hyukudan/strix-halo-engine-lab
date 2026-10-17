@@ -326,7 +326,8 @@ struct HipMtpRuntime::Impl {
     }
     // Sync-free proposal chain: identical stage launches to run_current per row,
     // except the head/selector and the device-fed next input token.
-    std::vector<std::uint32_t> chain(std::uint32_t depth,float min_probability) {
+    std::vector<std::uint32_t> chain(std::uint32_t depth,float min_probability,
+        const std::function<bool(std::span<const float>)>& keep_drafting) {
         require(draft && cycle && cycle_base && !active && !validation && candidates.empty() &&
             depth<=owner->budget().maximum_candidate_depth,"MTP draft chain requires a fresh bounded proposal");
         if(!depth) return {};
@@ -364,6 +365,10 @@ struct HipMtpRuntime::Impl {
                 if(min_probability>0.0F && k+1U<requested) {
                     check(hipStreamSynchronize(static_cast<hipStream_t>(stream)),"MTP draft early-stop step");
                     if(draft->probability(k)<min_probability) {depth=k+1U;break;}
+                    if(keep_drafting) {
+                        probabilities.resize(k+1U);for(std::uint32_t j=0;j<=k;++j) probabilities[j]=draft->probability(j);
+                        if(!keep_drafting(probabilities)) {depth=k+1U;break;}
+                    }
                 }
             }
             owner->complete();
@@ -509,11 +514,12 @@ void HipMtpRuntime::observe_draft_context(std::span<const std::uint32_t> tokens)
     auto& p=*impl_;require(p.draft && !p.active && !p.broken,"MTP draft context requires an enabled idle chain");p.draft->observe(tokens);
 }
 std::vector<std::uint32_t> HipMtpRuntime::propose_chain(const QualifiedMtpDraftPlan& plan,const ActivatedMtpDraftPlan& activated,
-    const SerialSessionContext& target,const DraftProposalStateContext& proposal,std::uint32_t depth,float min_probability) {
+    const SerialSessionContext& target,const DraftProposalStateContext& proposal,std::uint32_t depth,float min_probability,
+    const std::function<bool(std::span<const float>)>& keep_drafting) {
     auto& p=*impl_;p.qualification(plan,activated);
     validate_mtp_draft_proposal_phase(p.owner->binding(),proposal,target,DraftProposalStatePhase::proposal_active);
     require(p.cycle && p.cycle_base && same_session(target,p.cycle_base->committed_session()),"MTP draft chain does not match its native cycle");
-    return p.chain(depth,min_probability);
+    return p.chain(depth,min_probability,keep_drafting);
 }
 std::span<const float> HipMtpRuntime::draft_probabilities() const noexcept {return impl_->probabilities;}
 void HipMtpRuntime::dispatch_mtp_step(const MtpForwardStepContext& call) {

@@ -3,6 +3,8 @@
 #include "strix/mtp_sidecar_binding.hpp"
 #include "strix/hip_mtp_window_verifier.hpp"
 #include <algorithm>
+#include <cstdlib>
+#include <functional>
 #include <stdexcept>
 namespace strix {
 namespace {
@@ -140,7 +142,12 @@ HipMtpGreedyCycleResult HipMtpGreedyRuntime::cycle(const HipMtpTargetHiddenTicke
         i.mtp->begin_cycle(pending,initial);
         begin_draft_proposal(i.draft,*i.session);
         host_phase_mark("1 begin cycle");
-        const auto candidates=i.mtp->draft_head()?i.mtp->propose_chain(i.plan,i.activation,*i.session,i.draft,depth,i.min_probability):
+        // STRIX_MTP_DRAFT_WORTH=0: draft until min_probability only, without asking the window cost model.
+        static const bool worth=[]{const char* v=std::getenv("STRIX_MTP_DRAFT_WORTH");return !v || v[0]!='0';}();
+        const std::function<bool(std::span<const float>)> keep=worth && i.window?
+            std::function<bool(std::span<const float>)>([&](std::span<const float> p){return i.window->worth_drafting(p);}):
+            std::function<bool(std::span<const float>)>{};
+        const auto candidates=i.mtp->draft_head()?i.mtp->propose_chain(i.plan,i.activation,*i.session,i.draft,depth,i.min_probability,keep):
             i.backend->propose_candidates(*i.session,i.draft,depth);
         host_phase_mark("2 draft chain");
         out.proposed_candidates=static_cast<std::uint32_t>(candidates.size());

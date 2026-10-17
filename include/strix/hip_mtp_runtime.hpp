@@ -3,6 +3,7 @@
 #include "strix/hip_mtp_resources.hpp"
 #include "strix/hip_mtp_target_hidden.hpp"
 #include "strix/qualified_mtp_forward_runtime.hpp"
+#include <functional>
 #include <span>
 #include <vector>
 
@@ -78,8 +79,10 @@ public:
     // min_probability > 0 completes each draft before the next and stops after
     // the first draft whose max softmax probability is below it (that draft is
     // kept). Returns 1..depth drafts; probabilities of the last chain below.
+    // keep_drafting (optional) sees the probabilities so far and may stop the chain earlier.
     [[nodiscard]] std::vector<std::uint32_t> propose_chain(const QualifiedMtpDraftPlan&,const ActivatedMtpDraftPlan&,
-        const SerialSessionContext&,const DraftProposalStateContext&,std::uint32_t depth,float min_probability=0.0F);
+        const SerialSessionContext&,const DraftProposalStateContext&,std::uint32_t depth,float min_probability=0.0F,
+        const std::function<bool(std::span<const float>)>& keep_drafting={});
     [[nodiscard]] std::span<const float> draft_probabilities() const noexcept;
     void dispatch_mtp_step(const MtpForwardStepContext&) override;
     [[nodiscard]] MtpDraftCycleInput make_cycle_input(const QualifiedMtpDraftPlan&,const ActivatedMtpDraftPlan&,

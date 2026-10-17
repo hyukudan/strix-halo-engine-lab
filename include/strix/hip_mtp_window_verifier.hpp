@@ -52,6 +52,9 @@ public:
         const HipMtpTargetHiddenTicket& initial,std::span<const std::uint32_t> candidates,
         std::uint32_t output_budget,std::span<const std::uint32_t> eos_tokens,
         std::span<const float> candidate_probabilities={});
+    // Whether one more draft can still pay off: the next larger window, with the remaining drafts assumed
+    // as likely as the last one, beats the best window the current drafts already allow.
+    [[nodiscard]] bool worth_drafting(std::span<const float> probabilities) const;
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

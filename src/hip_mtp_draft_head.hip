@@ -2,6 +2,7 @@
 #include "strix/hip_lm_head_launcher.hpp"
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
+#include <algorithm>
 #include <fstream>
 #include <limits>
 #include <stdexcept>
@@ -251,7 +252,8 @@ HipMtpDraftHeadStats HipMtpDraftHead::stats() const noexcept {
 }
 const float* HipMtpDraftHead::logits() const noexcept {return impl_->logits;}
 const std::uint32_t* HipMtpDraftHead::ids() const noexcept {return impl_->ids;}
-std::vector<std::uint32_t> HipMtpDraftHead::read_token_file(const std::string& path,std::uint32_t vocabulary) {
+namespace {
+std::vector<std::uint32_t> read_one_token_file(const std::string& path,std::uint32_t vocabulary) {
     std::ifstream in(path,std::ios::binary|std::ios::ate);
     require(in.good(),"MTP draft vocabulary file cannot be opened");
     const auto bytes=static_cast<std::uint64_t>(in.tellg());
@@ -263,6 +265,20 @@ std::vector<std::uint32_t> HipMtpDraftHead::read_token_file(const std::string& p
         ids[i]=0;for(unsigned b=0;b<4U;++b) ids[i]|=static_cast<std::uint32_t>(raw[4*i+b])<<(8U*b);
         require(ids[i]<vocabulary,"MTP draft vocabulary id exceeds the model vocabulary");
     }
+    return ids;
+}
+} // namespace
+// A comma-separated list (a core subset plus language packs) is their union in file order, first occurrence kept.
+std::vector<std::uint32_t> HipMtpDraftHead::read_token_file(const std::string& paths,std::uint32_t vocabulary) {
+    std::vector<std::uint32_t> ids;std::vector<std::uint8_t> seen(vocabulary,0U);
+    for(std::size_t begin=0;begin<=paths.size();) {
+        const auto end=std::min(paths.find(',',begin),paths.size());
+        if(end>begin)
+            for(const auto id:read_one_token_file(paths.substr(begin,end-begin),vocabulary))
+                if(!seen[id]) {seen[id]=1U;ids.push_back(id);}
+        begin=end+1U;
+    }
+    require(!ids.empty(),"MTP draft vocabulary list names no ids");
     return ids;
 }
 } // namespace strix

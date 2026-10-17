@@ -142,6 +142,20 @@ struct HipMtpWindowVerifier::Impl {
         for(std::uint32_t j=1;j<rows && j<=p.size();++j){run*=acceptance(p[j-1U]);expected+=run;}
         return expected;
     }
+    bool worth_drafting(std::span<const float> p) const {
+        if(min_probability<=0.0F || p.empty()) return true;
+        const auto usable=p.size()+1U;
+        double best=serial_cycles?1.0/serial_ms_ema:0.0;
+        const Owner* next=nullptr;
+        for(const auto& o:owners) {
+            if(o.rows<=usable) {if(o.stats.cycles) best=std::max(best,expected_tokens(o.rows,p)/o.stats.cycle_ms_ema);}
+            else if(!next) next=&o;
+        }
+        if(!next) return false;
+        if(!next->stats.cycles) return true;
+        std::vector<float> assumed(p.begin(),p.end());assumed.resize(next->rows-1U,p.back());
+        return expected_tokens(next->rows,assumed)/next->stats.cycle_ms_ema>best;
+    }
     // nullptr = serial target steps.
     template<class Fits> Owner* choose(std::span<const float> p,std::size_t candidates,Fits fits) {
         auto largest=[&]()->Owner*{for(auto o=owners.rbegin();o!=owners.rend();++o) if(fits(*o)) return &*o;return nullptr;};
@@ -207,6 +221,9 @@ std::vector<HipMtpWindowOwnerStats> HipMtpWindowVerifier::owner_stats() const {
 std::uint32_t HipMtpWindowVerifier::logical_rows() const noexcept {return impl_->window->logical_rows();}
 bool HipMtpWindowVerifier::failed() const noexcept {return impl_->failed || (impl_->checkpoint && impl_->checkpoint->failed());}
 std::uint64_t HipMtpWindowVerifier::retained_payload_bytes() const noexcept {return impl_->retained;}
+bool HipMtpWindowVerifier::worth_drafting(std::span<const float> probabilities) const {
+    return impl_->worth_drafting(probabilities);
+}
 HipMtpVerifiedTargetRows HipMtpWindowVerifier::verify(SerialSessionContext& session,DirectLaunchDispatcher& dispatcher,
     const HipMtpTargetHiddenTicket& initial,std::span<const std::uint32_t> candidates,
     std::uint32_t budget,std::span<const std::uint32_t> eos,std::span<const float> probabilities) {
@@ -282,6 +299,12 @@ HipMtpVerifiedTargetRows HipMtpWindowVerifier::verify(SerialSessionContext& sess
             if(probabilities.size()==candidates.size())i.calibrate(probabilities,a,rows-1U);
             i.observe(owner,n_keep);
             host_phase_mark("7e calibrate/observe");
+            provisional.reset();
+            host_phase_mark("7f release provisional");
+            {auto done=std::move(native);}
+            host_phase_mark("7g release native");
+            capture.reset();
+            host_phase_mark("7h release capture");
             i.busy=false;return out;
         }
         if(i.prefix && i.last) i.last->window->flush_deferred();
