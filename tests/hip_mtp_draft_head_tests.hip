@@ -58,6 +58,12 @@ std::uint32_t reference(const std::vector<float>& logits,const std::vector<std::
     }
     return best;
 }
+// Max softmax probability in double over the finite logits.
+double max_probability(const std::vector<float>& logits) {
+    double m=-INFINITY,sum=0;for(const auto l:logits)if(std::isfinite(l))m=std::max(m,static_cast<double>(l));
+    for(const auto l:logits)if(std::isfinite(l))sum+=std::exp(static_cast<double>(l)-m);
+    return 1.0/sum;
+}
 struct Fixture {
     std::uint32_t h,v;Stream stream;Device<std::uint8_t> head;
     Fixture(std::uint32_t hidden,std::uint32_t vocab,std::uint32_t seed):h(hidden),v(vocab),head(static_cast<std::size_t>(vocab)*hidden/32U*34U) {
@@ -101,10 +107,12 @@ void exactness(std::uint32_t h,std::uint32_t v,std::uint32_t base_count,std::uin
     check(hipMemcpy(full_last.data(),full.logits(),v*4U,hipMemcpyDeviceToHost));
     bool bits=true;for(std::uint32_t j=0;j<stats.rows;++j)bits=bits&&std::bit_cast<std::uint32_t>(compact[j])==std::bit_cast<std::uint32_t>(references.back()[ids[j]]);
     bool full_bits=std::memcmp(full_last.data(),references.back().data(),v*4U)==0;
-    bool tokens=true;
+    bool tokens=true;double worst=0;
     for(std::uint32_t k=0;k<depth;++k) {
         std::vector<float> sub(stats.rows);for(std::uint32_t j=0;j<stats.rows;++j)sub[j]=references[k][ids[j]];
         tokens=tokens && full_tokens[k]==reference(references[k],{}) && subset_tokens[k]==reference(sub,ids);
+        for(const auto [got,want]:{std::pair{full.probability(k),max_probability(references[k])},std::pair{subset.probability(k),max_probability(sub)}})
+            worst=std::max(worst,std::fabs(got-want)/want);
         std::uint32_t slot=0;check(hipMemcpy(&slot,subset.device_token(k),4,hipMemcpyDeviceToHost));tokens=tokens&&slot==subset_tokens[k];
     }
     std::vector<std::uint32_t> unique(base);std::sort(unique.begin(),unique.end());unique.erase(std::unique(unique.begin(),unique.end()),unique.end());
@@ -112,6 +120,8 @@ void exactness(std::uint32_t h,std::uint32_t v,std::uint32_t base_count,std::uin
     case_named((std::string(name)+" subset rows bit-exact").c_str(),bits);
     case_named((std::string(name)+" full head bit-exact").c_str(),full_bits);
     case_named((std::string(name)+" argmax/slots").c_str(),tokens);
+    std::printf("  max softmax probability rel err %.3g (full step0 p=%.4g)\n",worst,full.probability(0));
+    case_named((std::string(name)+" max softmax probability").c_str(),worst<1e-4);
     case_named((std::string(name)+" base dedup + context cap").c_str(),stats.base_rows==unique.size() && stats.context_rows<=cap &&
         stats.rows==stats.base_rows+stats.context_rows && (stats.context_rows==cap || stats.context_dropped==0));
 }
@@ -135,7 +145,7 @@ void ties_and_nonfinite() {
     clean.begin_chain();bad.begin_chain();clean.launch(hidden.p,0,f.stream.s);bad.launch(hidden.p,0,f.stream.s);
     check(hipStreamSynchronize(f.stream.s));
     bool threw=false;try{(void)bad.read(1);}catch(const std::exception&){threw=true;}
-    case_named("non-finite subset row rejected",threw && clean.read(1).size()==1U);
+    case_named("non-finite subset row rejected",threw && clean.read(1).size()==1U && bad.probability(0)==0.0F && clean.probability(0)>0.0F);
     // Status of later steps does not affect an earlier prefix read.
     bad.begin_chain();clean.launch(hidden.p,0,f.stream.s);bad.launch(hidden.p,1,f.stream.s);check(hipStreamSynchronize(f.stream.s));
     threw=false;try{(void)bad.read(2);}catch(const std::exception&){threw=true;}
