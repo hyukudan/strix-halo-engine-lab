@@ -71,6 +71,7 @@ struct HipLauncherCatalogConfig {
     std::shared_ptr<HipHyperMixArithmeticStats> arithmetic_stats;
     bool q5k_a8g32_gate_up = false;
     bool splitk_deferred_norm = false;
+    bool dense_a8 = false;
 };
 
 void register_complete_hip_kernel_catalog(

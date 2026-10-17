@@ -444,12 +444,24 @@ bool window_same_arena(const ExecutionArenaPlan& left, const ExecutionArenaPlan&
     return true;
 }
 constexpr std::string_view known_shared_base = "hip.shared_expert.bf16.h2560.m640.r1.c1";
-constexpr std::string_view known_gdn_wave8 =
-    "hip.gdn.bf16.h2560.kh16.vh48.d128.r1.c1.scalar.wave8-input-v1.wave8-q8-output-v1"
-    ".prefetch8.virtual256.q8-input.virtual256.q8-output";
+constexpr std::string_view known_gdn_wave8_head = "hip.gdn.bf16.h2560.kh16.vh48.d128.r1.c1.scalar.wave8-input-v1.wave8-q8-output-v1";
+constexpr std::string_view known_gdn_wave8_tail = ".prefetch8.virtual256.q8-input.virtual256.q8-output";
+// The serial plan's dense A8 marker (one identity for the whole plan, checked by the
+// serial compiler) carries over to every window/prefill row of the step.
 bool known_shared_id(std::string_view id) {
-    return id == known_shared_base || id == std::string(known_shared_base) +
-        std::string(shared_expert_prefetch::kernel_suffix);
+    for (const bool dense : {false, true})
+        for (const bool prefetch : {false, true})
+            if (id == std::string(known_shared_base) + std::string(dense ? q8_projection_organization::dense_a8_marker : "") +
+                    std::string(prefetch ? shared_expert_prefetch::kernel_suffix : ""))
+                return true;
+    return false;
+}
+bool known_gdn_id(std::string_view id) {
+    for (const bool dense : {false, true})
+        if (id == std::string(known_gdn_wave8_head) + std::string(dense ? q8_projection_organization::dense_a8_marker : "") +
+                std::string(known_gdn_wave8_tail))
+            return true;
+    return false;
 }
 // Serial routed-expert arithmetic the union reproduces: the float profile
 // (slot-parallel Q5_1 down) or the A8 profile (Q5_1 A8 down, optional Q8_0
@@ -472,8 +484,9 @@ std::optional<RoutedUnionProfile> routed_union_profile(std::string_view id) {
 }
 bool known_qsa_id(std::string_view id) {
     constexpr std::string_view base="hip.indexed_attention.bf16.h2560.q24x256.kv2.idx4x128.b2048.r1.c1.scalar";
-    for(const bool wave8:{false,true}) for(const bool prefetch:{false,true})
+    for(const bool wave8:{false,true}) for(const bool dense:{false,true}) for(const bool prefetch:{false,true})
         if(id==std::string(base)+std::string(wave8?q8_projection_organization::qsa_output_wave8_marker:"")+
+            std::string(dense?q8_projection_organization::dense_a8_marker:"")+
             std::string(prefetch?qsa_input_prefetch::kernel_suffix:"")) return true;
     return false;
 }
@@ -733,7 +746,7 @@ std::pair<std::uint64_t, std::uint64_t> known_window_identities(
             ++shared_rows;avoided+=known_shared_projection_bytes*(window.logical_rows-1U);
             launches+=3U*(window.logical_rows-1U);
         } else if (mode == KnownWindowStepMode::gdn_rows) {
-            window_require(step.op==SerialOp::gated_delta_net && binding.kernel_id && *binding.kernel_id==known_gdn_wave8 &&
+            window_require(step.op==SerialOp::gated_delta_net && binding.kernel_id && known_gdn_id(*binding.kernel_id) &&
                 ((window.logical_rows==4U && variant==KnownWindowR2Variant::gdn_q8_rows4_f32_gates_r1_v1) ||
                  (window.logical_rows==8U && variant==KnownWindowR2Variant::gdn_q8_rows8_f32_gates_r1_v1)),
                 "known window GDN rows variant/source ID mismatch");
@@ -760,7 +773,7 @@ std::pair<std::uint64_t, std::uint64_t> known_window_identities(
             ++qsa_rows; avoided+=(bf16?known_qsa_bf16_indexer_projection_bytes:known_qsa_projection_bytes)*(window.logical_rows-1U);
             launches+=known_qsa_launches_saved(window.logical_rows);
         } else if(mode==KnownWindowStepMode::gdn_deferred_rows) {
-            window_require(step.op==SerialOp::gated_delta_net && binding.kernel_id && *binding.kernel_id==known_gdn_wave8 &&
+            window_require(step.op==SerialOp::gated_delta_net && binding.kernel_id && known_gdn_id(*binding.kernel_id) &&
                 variant==gdn_deferred_variant(window.logical_rows), "known window deferred GDN variant/source ID mismatch");
             ++gdn_deferred; avoided+=known_gdn_q8_large_projection_bytes*(window.logical_rows-1U);
             launches+=3U*(window.logical_rows-1U);
@@ -786,7 +799,7 @@ std::pair<std::uint64_t, std::uint64_t> known_window_identities(
             window_require(step.op == SerialOp::gated_delta_net &&
                 (variant == KnownWindowR2Variant::gdn_q8_virtual256_r2_v1 ||
                  variant == KnownWindowR2Variant::gdn_q8_rows2_f32_gates_r1_v1) &&
-                binding.kernel_id && *binding.kernel_id == known_gdn_wave8, "known window GDN variant/source ID mismatch"); ++r2;
+                binding.kernel_id && known_gdn_id(*binding.kernel_id), "known window GDN variant/source ID mismatch"); ++r2;
             if (variant == KnownWindowR2Variant::gdn_q8_virtual256_r2_v1) {
                 avoided += known_gdn_projection_bytes*(window.logical_rows/2U); launches += 5U*(window.logical_rows/2U);
             } else {
@@ -896,7 +909,7 @@ CompiledKnownPrefixWindow compile_known_prefix_window(
                     window_tensor(manifest, tensor_access, step.id, step.op, *step.layer, suffix).byte_size*(output.logical_rows-1U);
             output.projection_launches_saved += 3U*(output.logical_rows-1U);
         } else if (request.r2_gdn && step.op == SerialOp::gated_delta_net && binding.kernel_id &&
-            *binding.kernel_id == known_gdn_wave8) {
+            known_gdn_id(*binding.kernel_id)) {
             const auto format = window_gdn_format(manifest, tensor_access, step, request.r2_gdn_f32_gates);
             if (format != WindowGdnFormat::unsupported) {
                 const bool mixed = format == WindowGdnFormat::q8_large_f32_gates;
@@ -926,7 +939,7 @@ CompiledKnownPrefixWindow compile_known_prefix_window(
             output.projection_launches_saved+=known_qsa_launches_saved(output.logical_rows);
         }
         if(request.deferred_gdn && step.op==SerialOp::gated_delta_net && binding.kernel_id &&
-            *binding.kernel_id==known_gdn_wave8 && window_gdn_format(manifest,tensor_access,step,true)!=WindowGdnFormat::unsupported) {
+            known_gdn_id(*binding.kernel_id) && window_gdn_format(manifest,tensor_access,step,true)!=WindowGdnFormat::unsupported) {
             if(output.mode[i]==KnownWindowStepMode::r2_gdn_staged || output.mode[i]==KnownWindowStepMode::gdn_rows) {
                 // Replace the checkpointed wide GDN entry and its claimed savings.
                 const bool mixed=window_gdn_format(manifest,tensor_access,step,request.r2_gdn_f32_gates)==WindowGdnFormat::q8_large_f32_gates;

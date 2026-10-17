@@ -16,7 +16,11 @@ enum class DecodeNumericalProfile {
     hc_splitk_f32_q51_q80_a8_down_v1,
     hc_splitk_f32_q51_q80_a8_down_q5k_a8_gateup_v1,
     hc_deferred_norm_f32_q51_q80_a8_down_v1,
-    hc_deferred_norm_f32_q51_q80_a8_down_q5k_a8_gateup_v1
+    hc_deferred_norm_f32_q51_q80_a8_down_q5k_a8_gateup_v1,
+    // The q5k-a8-gateup profiles plus dense A8: every dense Q8_0 projection of the GDN,
+    // QSA and shared-expert steps runs Q8_0 x per-32 int8 activations (dense-a8-q80-v1).
+    hc_splitk_f32_q51_q80_a8_down_q5k_a8_gateup_dense_a8_v1,
+    hc_deferred_norm_f32_q51_q80_a8_down_q5k_a8_gateup_dense_a8_v1
 };
 
 inline constexpr std::string_view numerical_profile_name(DecodeNumericalProfile value) {
@@ -30,6 +34,10 @@ inline constexpr std::string_view numerical_profile_name(DecodeNumericalProfile 
     case DecodeNumericalProfile::hc_splitk_f32_q51_q80_a8_down_q5k_a8_gateup_v1: return "hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup-v1";
     case DecodeNumericalProfile::hc_deferred_norm_f32_q51_q80_a8_down_v1: return "hc-deferred-norm-f32+q51-q80-a8-down-v1";
     case DecodeNumericalProfile::hc_deferred_norm_f32_q51_q80_a8_down_q5k_a8_gateup_v1: return "hc-deferred-norm-f32+q51-q80-a8-down+q5k-a8-gateup-v1";
+    case DecodeNumericalProfile::hc_splitk_f32_q51_q80_a8_down_q5k_a8_gateup_dense_a8_v1:
+        return "hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup+dense-a8-v1";
+    case DecodeNumericalProfile::hc_deferred_norm_f32_q51_q80_a8_down_q5k_a8_gateup_dense_a8_v1:
+        return "hc-deferred-norm-f32+q51-q80-a8-down+q5k-a8-gateup+dense-a8-v1";
     }
     return {};
 }
@@ -40,18 +48,26 @@ inline constexpr std::optional<DecodeNumericalProfile> parse_decode_numerical_pr
              DecodeNumericalProfile::q51_q80_a8_down_v1, DecodeNumericalProfile::hc_splitk_f32_q51_q80_a8_down_v1,
              DecodeNumericalProfile::hc_splitk_f32_q51_q80_a8_down_q5k_a8_gateup_v1,
              DecodeNumericalProfile::hc_deferred_norm_f32_q51_q80_a8_down_v1,
-             DecodeNumericalProfile::hc_deferred_norm_f32_q51_q80_a8_down_q5k_a8_gateup_v1})
+             DecodeNumericalProfile::hc_deferred_norm_f32_q51_q80_a8_down_q5k_a8_gateup_v1,
+             DecodeNumericalProfile::hc_splitk_f32_q51_q80_a8_down_q5k_a8_gateup_dense_a8_v1,
+             DecodeNumericalProfile::hc_deferred_norm_f32_q51_q80_a8_down_q5k_a8_gateup_dense_a8_v1})
         if (numerical_profile_name(value) == name) return value;
     return std::nullopt;
 }
 
+inline constexpr bool numerical_profile_dense_a8(DecodeNumericalProfile value) {
+    return value == DecodeNumericalProfile::hc_splitk_f32_q51_q80_a8_down_q5k_a8_gateup_dense_a8_v1 ||
+        value == DecodeNumericalProfile::hc_deferred_norm_f32_q51_q80_a8_down_q5k_a8_gateup_dense_a8_v1;
+}
 inline constexpr bool numerical_profile_q5k_a8_gateup(DecodeNumericalProfile value) {
     return value == DecodeNumericalProfile::hc_splitk_f32_q51_q80_a8_down_q5k_a8_gateup_v1 ||
-        value == DecodeNumericalProfile::hc_deferred_norm_f32_q51_q80_a8_down_q5k_a8_gateup_v1;
+        value == DecodeNumericalProfile::hc_deferred_norm_f32_q51_q80_a8_down_q5k_a8_gateup_v1 ||
+        numerical_profile_dense_a8(value);
 }
 inline constexpr bool numerical_profile_hc_deferred_norm(DecodeNumericalProfile value) {
     return value == DecodeNumericalProfile::hc_deferred_norm_f32_q51_q80_a8_down_v1 ||
-        value == DecodeNumericalProfile::hc_deferred_norm_f32_q51_q80_a8_down_q5k_a8_gateup_v1;
+        value == DecodeNumericalProfile::hc_deferred_norm_f32_q51_q80_a8_down_q5k_a8_gateup_v1 ||
+        value == DecodeNumericalProfile::hc_deferred_norm_f32_q51_q80_a8_down_q5k_a8_gateup_dense_a8_v1;
 }
 inline constexpr bool numerical_profile_hc_splitk(DecodeNumericalProfile value) {
     return value == DecodeNumericalProfile::hc_splitk_f32_v1 ||

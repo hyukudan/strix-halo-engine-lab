@@ -221,6 +221,7 @@ std::uint64_t build_execution_identity(
     if (buffer_request.a8_down_q51) hash_u64(hash, 0x5135314138444e31ULL);
     if (buffer_request.a8_down_q80) hash_u64(hash, 0x5138304138444e31ULL);
     if (buffer_request.q5k_a8g32_gate_up) hash_u64(hash, 0x51354b4138475531ULL);
+    if (buffer_request.dense_a8) hash_u64(hash, 0x44454e5345413831ULL); // DENSEA81
     if (buffer_request.qsa_hierarchical_selection) hash_u64(hash, 0x515341544f503531ULL);
     if (buffer_request.qsa_gqa_heads_per_block != 1) {
         hash_u64(hash, 0x5153414751417631ULL);
@@ -378,6 +379,10 @@ CompiledSerialExecution compile_serial_execution(
         throw std::invalid_argument("slot-parallel Q5_1 request differs from buffer admission");
     if (binding_request.q5k_a8g32_gate_up != buffer_request.q5k_a8g32_gate_up)
         throw std::invalid_argument("Q5K A8 gate/up differs from buffer admission");
+    if (binding_request.dense_a8 != buffer_request.dense_a8)
+        throw std::invalid_argument("dense A8 differs from buffer admission");
+    if (binding_request.dense_a8 && !binding_request.q5k_a8g32_gate_up)
+        throw std::invalid_argument("dense A8 requires the Q5K A8 gate/up recipe");
     if (binding_request.q5k_a8g32_gate_up && (!binding_request.a8_down_q51 || !binding_request.a8_down_q80))
         throw std::invalid_argument("Q5K A8 gate/up requires both A8 down formats");
     if (binding_request.a8_down_q51 != buffer_request.a8_down_q51 ||
@@ -501,6 +506,15 @@ CompiledSerialExecution compile_serial_execution(
         if (binding.op == SerialOp::indexed_attention && binding.kernel_id &&
             (binding.kernel_id->find(qsa_hierarchical_selection_marker) != std::string::npos) != binding_request.qsa_hierarchical_selection)
             throw std::invalid_argument("bound hierarchical QSA selection differs from request");
+        if (binding.kernel_id) {
+            const auto first = binding.kernel_id->find(q8_projection_organization::dense_a8_marker);
+            const bool dense_op = binding.op == SerialOp::gated_delta_net || binding.op == SerialOp::indexed_attention ||
+                binding.op == SerialOp::shared_expert;
+            if ((first != std::string::npos) != (dense_op && binding_request.dense_a8) ||
+                (first != std::string::npos &&
+                 binding.kernel_id->find(q8_projection_organization::dense_a8_marker, first + 1U) != std::string::npos))
+                throw std::invalid_argument("bound dense A8 identity differs from request");
+        }
         if (binding.op == SerialOp::lm_head && binding.kernel_id) {
             const bool p1 = binding.kernel_id->find(q8_projection_organization::lm_prefetch_marker) != std::string::npos;
             const bool p8 = binding.kernel_id->find(q8_projection_organization::lm_wave8_marker) != std::string::npos;

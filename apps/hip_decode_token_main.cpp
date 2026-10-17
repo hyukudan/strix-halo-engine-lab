@@ -1059,6 +1059,7 @@ int STRIX_DECODE_ENTRY(
     const bool q5k_a8_gateup = strix::numerical_profile_q5k_a8_gateup(options.numerical_profile);
     const bool a8_down_q51 = strix::numerical_profile_q51_a8_down(options.numerical_profile);
     const bool a8_down_q80 = strix::numerical_profile_q80_a8_down(options.numerical_profile);
+    const bool dense_a8 = strix::numerical_profile_dense_a8(options.numerical_profile);
     strix::decode_cli::validate_resolved_mtp_cli(options);
 #if defined(STRIX_MTP_MODEL_QUALIFICATION_RUNNER)
     if(target_input_export)strix::tests::validate_mtp_target_input_export(options,true);
@@ -1206,7 +1207,10 @@ int STRIX_DECODE_ENTRY(
                     hc_splitk_f32 ? strix::splitk_hc_fp32_numerical_identity : std::string_view{"incumbent"}) << "\",\n"
                 << "  \"q5k_a8g32_gate_up_configured\":" << (q5k_a8_gateup ? "true" : "false") << ",\n"
                 << "  \"q5k_a8g32_gate_up_layers\":" << (q5k_a8_gateup ? "[2]" : "[]") << ",\n"
-                << "  \"q5k_a8g32_numerical_identity\":\"" << (q5k_a8_gateup ? strix::moe_q4k_a8::q5k_numerical_identity : std::string_view{"none"}) << "\",\n";
+                << "  \"q5k_a8g32_numerical_identity\":\"" << (q5k_a8_gateup ? strix::moe_q4k_a8::q5k_numerical_identity : std::string_view{"none"}) << "\",\n"
+                << "  \"dense_a8_configured\":" << (dense_a8 ? "true" : "false") << ",\n"
+                << "  \"dense_a8_steps\":\"" << (dense_a8 ? "gated_delta_net,indexed_attention,shared_expert" : "") << "\",\n"
+                << "  \"dense_a8_numerical_identity\":\"" << (dense_a8 ? strix::q8_projection_organization::dense_a8_numerical_identity : std::string_view{"none"}) << "\",\n";
             std::cout << "  \"hc_splitk_f32_selected_model_steps\":" << hc_splitk_selected_steps << ",\n"
                 << "  \"a8_down_q51_configured\":" << (a8_down_q51 ? "true" : "false") << ",\n"
                 << "  \"a8_down_q80_configured\":" << (a8_down_q80 ? "true" : "false") << ",\n"
@@ -1415,6 +1419,7 @@ int STRIX_DECODE_ENTRY(
     catalog_config.a8_down_q51 = binding_request.a8_down_q51 = a8_down_q51;
     catalog_config.a8_down_q80 = binding_request.a8_down_q80 = a8_down_q80;
     catalog_config.q5k_a8g32_gate_up = binding_request.q5k_a8g32_gate_up = q5k_a8_gateup;
+    catalog_config.dense_a8 = binding_request.dense_a8 = dense_a8;
     catalog_config.deferred_moe_status = options.deferred_moe_status;
     binding_request.deferred_moe_status = options.deferred_moe_status;
     catalog_config.ranked_moe_router_topk = options.ranked_moe_router_topk;
@@ -1463,6 +1468,7 @@ int STRIX_DECODE_ENTRY(
     buffer_request.a8_down_q51 = a8_down_q51;
     buffer_request.a8_down_q80 = a8_down_q80;
     buffer_request.q5k_a8g32_gate_up = q5k_a8_gateup;
+    buffer_request.dense_a8 = dense_a8;
     buffer_request.qsa_hierarchical_selection = options.qsa_hierarchical_selection;
     buffer_request.qsa_gqa_heads_per_block = options.qsa_gqa_heads_per_block;
     buffer_request.activation_element_bytes =
@@ -2509,6 +2515,8 @@ int STRIX_DECODE_ENTRY(
             metadata.numerical_identity += ";" + std::string(strix::moe_q4k_a8::q80_a8_down_raw_identity);
         if (q5k_a8_gateup)
             metadata.numerical_identity += ";" + std::string(strix::moe_q4k_a8::q5k_gate_up_raw_identity);
+        if (dense_a8)
+            metadata.numerical_identity += ";dense-a8-q80-v1";
         if (catalog_config.splitk_hyper_projection)
             metadata.numerical_identity += ";" + std::string(hc_deferred_norm ? strix::deferred_hc_numerical_identity :
                 catalog_config.splitk_hyper_projection_fp64 ? strix::splitk_hc_fp64_numerical_identity : strix::splitk_hc_fp32_numerical_identity);

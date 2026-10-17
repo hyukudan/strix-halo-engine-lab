@@ -1021,20 +1021,24 @@ int main() {
            !manual_increments.lane_chain_hyper_output && !manual_increments.q4k_a8g32_gate_up &&
            manual_increments.context_tokens == 128,
            "manual increments preserve their flags without adding the automatic bundle");
-    const std::array<std::string_view, 9> numerical_names{
+    const std::array<std::string_view, 11> numerical_names{
         "exact-v5", "hc-splitk-f32-v1", "q51-a8-down-v1", "hc-splitk-f32+q51-a8-down-v1",
         "q51-q80-a8-down-v1", "hc-splitk-f32+q51-q80-a8-down-v1",
         "hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup-v1",
         "hc-deferred-norm-f32+q51-q80-a8-down-v1",
-        "hc-deferred-norm-f32+q51-q80-a8-down+q5k-a8-gateup-v1"};
+        "hc-deferred-norm-f32+q51-q80-a8-down+q5k-a8-gateup-v1",
+        "hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup+dense-a8-v1",
+        "hc-deferred-norm-f32+q51-q80-a8-down+q5k-a8-gateup+dense-a8-v1"};
     for (const auto name : numerical_names) {
         const std::string value(name);
         auto candidate = parse({"decoder", "fixture.gguf", "1", "--generate", "2", "--numerical-profile", value.c_str()});
         expect(candidate.numerical_profile_explicit && !candidate.any_low_level_flag &&
             numerical_profile_name(candidate.numerical_profile) == name,
             "typed numerical option is independent of low-level fallback selection");
+        const bool dense = name.ends_with("+dense-a8-v1");
         expect(numerical_profile_q5k_a8_gateup(candidate.numerical_profile) ==
-                (name.find("+q5k-a8-gateup-v1") != std::string_view::npos) &&
+                (name.find("+q5k-a8-gateup") != std::string_view::npos) &&
+            numerical_profile_dense_a8(candidate.numerical_profile) == dense &&
             numerical_profile_hc_deferred_norm(candidate.numerical_profile) == name.starts_with("hc-deferred-norm-f32") &&
             numerical_profile_hc_splitk(candidate.numerical_profile) == name.starts_with("hc-") &&
             numerical_profile_q51_a8_down(candidate.numerical_profile) == (name.find("q51") != std::string_view::npos) &&
@@ -1043,7 +1047,7 @@ int main() {
         auto base = resolve_optimization_profile(candidate, model, numerical_router_info, manifest, validated_model_content_identity, true);
         const auto numerical_base_selected = base.selected;
         expect(numerical_base_selected == "canonical-a8-wave-qsa-hc-shared-output-v5" && candidate.prepared_eager &&
-            candidate.moe_shared_overlap && candidate.gdn_islands && candidate.q51_slot_parallel_down &&
+            candidate.moe_shared_overlap && candidate.gdn_islands == !dense && candidate.q51_slot_parallel_down &&
             candidate.batched_moe_activation && candidate.wave8_q8_gdn_input && candidate.wave8_q8_gdn_output &&
             candidate.prefetch_q8_lm_head && candidate.wave8_q8_lm_head && candidate.wave8_q8_qsa_output,
             "numerical overlay retains every v5 organization prerequisite");
@@ -1082,6 +1086,10 @@ int main() {
             bad_mode = candidate; bad_mode.serving_concurrency = 2;
             rejects([&] { validate_numerical_profile_cli(bad_mode); },
                 "numerical profile requires ordinary eager floating C1 execution without alternate controllers or layouts");
+            if (dense) {
+                auto with_islands = candidate; with_islands.gdn_islands = true;
+                rejects([&] { validate_numerical_profile_cli(with_islands); }, "dense A8 numerical profile excludes GDN islands");
+            }
         }
     }
     expect(static_cast<int>(DecodeNumericalProfile::exact_v5) == 0 &&

@@ -404,6 +404,9 @@ inline void validate_numerical_profile_cli(const Options& options) {
         options.prefetch_hc_projection_next_tile || options.ranked_moe_router_topk ||
         !options.offline_tuning_cache_path.empty() || !options.offline_compile_provenance_path.empty())
         throw std::invalid_argument("numerical profile requires ordinary eager floating C1 execution without alternate controllers or layouts");
+    // GDN islands capture the incumbent R1 projection kernels; dense A8 replaces them.
+    if (numerical_profile_dense_a8(options.numerical_profile) && options.gdn_islands)
+        throw std::invalid_argument("dense A8 numerical profile excludes GDN islands");
 }
 
 // Context can change only after immutable model/profile admission. Roundtrip
@@ -793,7 +796,7 @@ inline Options parse_options(
             "usage: strix-hip-decode-token MODEL.gguf [TOKEN_ID ...] "
             "[--mtp --mtp-sidecar FILE --mtp-sidecar-sha256 HEX (--mtp-golden FILE --mtp-golden-sha256 HEX | --mtp-golden-dump FILE) [--mtp-window-expert-union --mtp-window-expert-union-bytes N] [--mtp-window-hyper-mix] [--mtp-window-qsa-rows] [--mtp-window-prefix] [--mtp-draft-chain [--mtp-draft-vocab FILE[,FILE...]|auto:DIR] [--mtp-draft-context-vocab N] [--mtp-draft-exact] [--mtp-draft-q4]] (explicit source/conversion/cast/budget options required)] "
             "[--optimization-profile auto|manual] [--execution-inventory] [--host-dispatch-telemetry] [--execution-telemetry-trace] [--device-queue-trace] "
-            "[--numerical-profile exact-v5|hc-splitk-f32-v1|q51-a8-down-v1|hc-splitk-f32+q51-a8-down-v1|q51-q80-a8-down-v1|hc-splitk-f32+q51-q80-a8-down-v1|hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup-v1|hc-deferred-norm-f32+q51-q80-a8-down-v1|hc-deferred-norm-f32+q51-q80-a8-down+q5k-a8-gateup-v1] "
+            "[--numerical-profile exact-v5|hc-splitk-f32-v1|q51-a8-down-v1|hc-splitk-f32+q51-a8-down-v1|q51-q80-a8-down-v1|hc-splitk-f32+q51-q80-a8-down-v1|hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup-v1|hc-deferred-norm-f32+q51-q80-a8-down-v1|hc-deferred-norm-f32+q51-q80-a8-down+q5k-a8-gateup-v1|hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup+dense-a8-v1|hc-deferred-norm-f32+q51-q80-a8-down+q5k-a8-gateup+dense-a8-v1] "
             "[--teacher-forced-score --generate 1 [--teacher-logits-file PATH]] "
             "[--gpu-greedy-token] [--logprob-token ID ...] [--offline-tuning-cache FILE [--offline-compile-provenance FILE]] [--gdn-recurrent-layout baseline|stride32|stride33|transposed] [--gdn-recurrent-storage key-value|value-key] [--known-prefix-window --known-prefix-rows 2|4|8 --known-prefix-expert-union] [--known-window-router-rows] [--known-prefix-prefill-rows 16..2048 --known-prefix-workspace-budget-bytes N --known-prefix-host-metadata-budget-bytes N --known-prefix-uma-budget-bytes N --known-prefix-host-headroom-bytes N] [--prompt-lookup [--prompt-lookup-depth 0|1|2 | --prompt-lookup-adaptive] [--prompt-lookup-snapshot occupied-kv-v1 --prompt-lookup-snapshot-bytes N]] [--serve-prefix-u32le FILE ... --serve-concurrency 1|2|4 [--serve-tensor-cohort-rows 2|4 | --serve-prefill-rows 2|4|8|16..2048 --serve-prefill-workspace-budget-bytes N --serve-prefill-host-metadata-budget-bytes N] --serve-memory-budget-bytes N --serve-request-budget-bytes N --serve-headroom-bytes N] [--gdn-islands] [--qsa-hierarchical-selection] [--qsa-gqa-heads-per-block 1|2|4] [--prepared-eager] [--moe-shared-overlap [--moe-token-cost-policy]] [--moe-overlap-arena-budget-bytes N] [--batched-moe-activation] [--validation-final-state DIR] [--validation-final-state-max-bytes N] [--reference FILE] [--max-logit-error X] "
             "[--context N] [--residency register|copy] [--coalesce-gap BYTES] [--model-copy-tier none|normalization|hot_nonexpert|experts --model-copy-payload-bytes N --model-retained-budget N --model-setup-peak-budget N] "
@@ -1929,7 +1932,8 @@ inline OptimizationProfileResolution resolve_optimization_profile(
         options.batched_moe_activation = true;
         options.wave8_q8_gdn_input = true;
         options.wave8_q8_gdn_output = true;
-        options.gdn_islands = true;
+        // GDN islands capture the incumbent projections; the dense A8 profile runs without them.
+        options.gdn_islands = !numerical_profile_dense_a8(options.numerical_profile);
         options.prepared_eager = true;
         options.moe_shared_overlap = true;
         options.prefetch_q8_lm_head = true;
@@ -1980,7 +1984,8 @@ inline void apply_numerical_profile(
         !options.prefetch_q8_shared_expert || !options.virtual_q8_lm_head || !options.prefetch_q8_lm_head ||
         !options.wave8_q8_lm_head || !options.wave8_q8_qsa_output ||
         (!options.mtp.window_prefix && !options.known_prefix_full_rows &&
-            (!options.prepared_eager || !options.gdn_islands || !options.moe_shared_overlap)))
+            (!options.prepared_eager || !options.moe_shared_overlap ||
+             options.gdn_islands == numerical_profile_dense_a8(options.numerical_profile))))
         throw std::invalid_argument("numerical profile requires the resolved full v5 organization without implicit flag changes");
     resolution.selected += "+" + std::string(numerical_profile_name(options.numerical_profile));
 }

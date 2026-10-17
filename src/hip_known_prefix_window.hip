@@ -73,6 +73,7 @@ ExecutionBindingRequest binding_request(const HipLauncherCatalogConfig& config) 
     request.a8_down_q51 = config.a8_down_q51;
     request.a8_down_q80 = config.a8_down_q80;
     request.q5k_a8g32_gate_up = config.q5k_a8g32_gate_up;
+    request.dense_a8 = config.dense_a8;
     request.lane_chain_hyper_output = config.lane_chain_hyper_output;
     request.prefetch_hc_projection_next_tile = config.prefetch_hc_projection_next_tile;
     request.deferred_moe_status = config.deferred_moe_status;
@@ -295,6 +296,7 @@ struct HipKnownPrefixWindow::Impl {
         shared_config.prefetch_q8 = config.prefetch_q8_shared_expert;
         shared_config.prefetch_eligible_layers = config.shared_expert_prefetch_layers;
         shared_config.prefetch_stats = config.shared_expert_prefetch_stats;
+        shared_config.dense_a8_projections = config.dense_a8;
         shared_fallback = shared_config;
         shared_fallback.prefetch_q8 = false; shared_fallback.prefetch_eligible_layers.clear();
         gdn_config.model = model; gdn_config.activation = config.activation;
@@ -303,6 +305,7 @@ struct HipKnownPrefixWindow::Impl {
         gdn_config.wave8_q8_input_projections = config.wave8_q8_gdn_input;
         gdn_config.virtual_q8_output_projection = config.virtual_q8_gdn_output;
         gdn_config.wave8_q8_output_projection = config.wave8_q8_gdn_output;
+        gdn_config.dense_a8_projections = config.dense_a8;
         r2_entries[0] = {KnownWindowR2Variant::shared_q8_virtual256_r2_v1, this,
             [](std::span<const ExecutionDispatchContext, 2> rows, void* object) {
                 const auto& self = *static_cast<Impl*>(object);
@@ -369,7 +372,7 @@ struct HipKnownPrefixWindow::Impl {
             }
         // STRIX_PREFILL_FULL_SHARED=0: keep the shared expert in 8-row tiles.
         static const bool shared=[]{const char* v=std::getenv("STRIX_PREFILL_FULL_SHARED");return !v||v[0]!='0';}();
-        if(shared&&!shared_config.known_window_a8_projections)
+        if(shared)
             prefill_entries.push_back({KnownWindowR2Variant::shared_q8_virtual256_r8_v1,this,
                 [](std::span<const ExecutionDispatchContext> rows,void* object) {
                     const auto& self=*static_cast<Impl*>(object);
@@ -466,6 +469,7 @@ struct HipKnownPrefixWindow::Impl {
         qsa_config.prefetch_eligible_layers=config.qsa_input_prefetch_layers;
         qsa_config.prefetch_stats=config.qsa_input_prefetch_stats;
         qsa_config.wave8_q8_output=config.wave8_q8_qsa_output;
+        qsa_config.dense_a8_projections=config.dense_a8;
         qsa_fallback=qsa_config;
         qsa_fallback.prefetch_q8_input=false; qsa_fallback.prefetch_eligible_layers.clear();
         // One entry per QSA variant actually selected (layers may differ in indexer format).

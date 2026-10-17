@@ -51,6 +51,7 @@ struct ExecutionBindingRequest {
     bool a8_down_q51 = false;
     bool a8_down_q80 = false;
     bool q5k_a8g32_gate_up = false;
+    bool dense_a8 = false;
 };
 
 struct ExecutionKernelBinding {
