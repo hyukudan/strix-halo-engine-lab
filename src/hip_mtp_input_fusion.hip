@@ -94,6 +94,46 @@ __global__ __launch_bounds__(128) void mtp_input_projections(HipMtpInputFusionRe
     for(unsigned stream=0;stream<r.hc_count;++stream)
         output[h+stream*h+output_row]=rounded(sums[stream],r.projection_rounding);
 }
+// Same chains as mtp_input_projections, one thread per chain: role 0 is the
+// embedding chain, role 1 + s the HC stream s chain, each coefficient-first
+// ascending FMA. 32 rows per block stage contiguous 128-column runs of both
+// row halves (4 Q8 blocks = 136 bytes each) with coalesced loads, instead of
+// every lane walking its own 5 KB row.
+constexpr unsigned kStagedRows=32U,kStagedColumns=128U,kStagedRun=kStagedColumns/32U*34U;
+__global__ __launch_bounds__(160) void mtp_input_projections_staged(HipMtpInputFusionRequest r) {
+    __shared__ __align__(8) unsigned char stage[kStagedRows][2][kStagedRun];
+    const unsigned h=r.hidden_size,first=blockIdx.x*kStagedRows;
+    const unsigned local=threadIdx.x%kStagedRows,role=threadIdx.x/kStagedRows;
+    const auto* input=reinterpret_cast<const float*>(r.normalized_scratch.address);
+    const auto* packed=reinterpret_cast<const unsigned char*>(r.packed_projection.address);
+    float sum=0.0F;
+    constexpr unsigned words=kStagedRun/8U,pieces=kStagedRows*2U*words;
+    for(unsigned column=0;column<h;column+=kStagedColumns) {
+        for(unsigned piece=threadIdx.x;piece<pieces;piece+=blockDim.x) {
+            const unsigned row=piece/(2U*words),half=(piece/words)%2U,word=piece%words;
+            const auto offset=static_cast<std::uint64_t>(first+row)*r.projection_row_stride_bytes+
+                static_cast<std::uint64_t>((half*h+column)/32U)*34U+word*8U;
+            *reinterpret_cast<uint2*>(&stage[row][half][word*8U])=*reinterpret_cast<const uint2*>(packed+offset);
+        }
+        __syncthreads();
+        if(role<=r.hc_count) {
+            const auto* run=stage[local][role==0U?0:1];
+            const auto* x=input+(role==0U?0U:h+(role-1U)*h)+column;
+#pragma unroll
+            for(unsigned block=0;block<4U;++block) {
+                const auto* b=run+block*34U;
+                const float scale=__half2float(*reinterpret_cast<const __half*>(b));
+#pragma unroll 8
+                for(unsigned k=0;k<32U;++k)
+                    sum=fmaf(scale*static_cast<float>(static_cast<signed char>(b[2U+k])),x[block*32U+k],sum);
+            }
+        }
+        __syncthreads();
+    }
+    if(role>r.hc_count)return;
+    auto* output=reinterpret_cast<float*>(r.projection_scratch.address);
+    output[(role==0U?0U:h+(role-1U)*h)+first+local]=rounded(sum,r.projection_rounding);
+}
 __global__ __launch_bounds__(128) void mtp_input_broadcast_add(HipMtpInputFusionRequest r) {
     const unsigned i=blockIdx.x*blockDim.x+threadIdx.x;
     if(i>=r.hidden_size*r.hc_count)return;
@@ -180,7 +220,10 @@ void launch_hip_mtp_input_fusion(const HipMtpInputFusionRequest& r,void* raw_str
     check(hipPeekAtLastError(),"MTP input fusion prior HIP error");
     hipLaunchKernelGGL(mtp_input_norms,dim3(2U),dim3(256U),0U,stream,r);check(hipGetLastError(),"MTP input norms launch");
     const unsigned jobs=r.hidden_size;
-    hipLaunchKernelGGL(mtp_input_projections,dim3((jobs+127U)/128U),dim3(128U),0U,stream,r);check(hipGetLastError(),"MTP split projection launch");
+    if(r.hidden_size%kStagedColumns==0U && r.projection_row_stride_bytes%8U==0U && r.packed_projection.address%8U==0U)
+        hipLaunchKernelGGL(mtp_input_projections_staged,dim3(r.hidden_size/kStagedRows),dim3(kStagedRows*(1U+r.hc_count)),0U,stream,r);
+    else hipLaunchKernelGGL(mtp_input_projections,dim3((jobs+127U)/128U),dim3(128U),0U,stream,r);
+    check(hipGetLastError(),"MTP split projection launch");
     const unsigned outputs=r.hidden_size*r.hc_count;
     hipLaunchKernelGGL(mtp_input_broadcast_add,dim3((outputs+127U)/128U),dim3(128U),0U,stream,r);check(hipGetLastError(),"MTP broadcast add launch");
 }

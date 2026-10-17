@@ -525,6 +525,35 @@ __global__ void scalar_projection_kernel(
     }
 }
 
+// Window rows: activation and F32 scalar gate of every row in one launch
+// (blockIdx.y = row). Block 0 of a row writes the scalar into up[0] only after
+// its own activation consumed up[0]; both keep the per-row kernels' arithmetic.
+__global__ void __launch_bounds__(kThreads) rows_shared_activation_scalar_kernel(
+    std::uint64_t workspace_base, std::uint64_t workspace_stride, std::uint64_t input_base,
+    std::uint64_t input_stride, const void* scalar_weights, std::uint32_t intermediate_size,
+    std::uint32_t input_width) {
+    __shared__ float scratch[kThreads];
+    auto* workspace = reinterpret_cast<float*>(workspace_base + blockIdx.y * workspace_stride);
+    const auto index = static_cast<std::uint32_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index < intermediate_size) {
+        const float gate = workspace[index];
+        const float up = workspace[intermediate_size + index];
+        workspace[index] = (gate / (1.0F + expf(-gate))) * up;
+    }
+    if (blockIdx.x != 0) return;
+    const auto* input = reinterpret_cast<const std::uint16_t*>(input_base + blockIdx.y * input_stride);
+    float sum = 0.0F;
+    for (std::uint32_t feature = static_cast<std::uint32_t>(threadIdx.x); feature < input_width; feature += kThreads)
+        sum += load_activation(&input[feature]) * load_weight<WeightKind::f32>(scalar_weights, input_width, 0, feature);
+    scratch[threadIdx.x] = sum;
+    __syncthreads();
+    for (std::uint32_t stride = kThreads / 2U; stride > 0; stride >>= 1U) {
+        if (threadIdx.x < stride) scratch[threadIdx.x] += scratch[threadIdx.x + stride];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) workspace[intermediate_size] = 1.0F / (1.0F + expf(-scratch[0]));
+}
+
 template <
     typename Output,
     WeightKind Kind>
@@ -1872,17 +1901,11 @@ template <unsigned Rows>
 void known_shared_rows_enqueue(const KnownSharedR2Views& views, hipStream_t stream,
     const HipSharedExpertLauncherConfig& config) {
     known_shared_engine_projection<Rows>(false, views, stream, config);
-    for (unsigned row = 0; row < Rows; ++row) {
-        auto* workspace = reinterpret_cast<float*>(views.workspace.address + row * views.shape.workspace_stride_bytes);
-        const auto* input = reinterpret_cast<const std::uint16_t*>(views.input.address + row * views.shape.input_stride_bytes);
-        hipLaunchKernelGGL(gated_activation_kernel, dim3((config.intermediate_size + 255U) / 256U),
-            dim3(256), 0, stream, workspace, config.intermediate_size);
-        check_hip(hipGetLastError(), "known-window shared rows activation launch");
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(scalar_projection_kernel<std::uint16_t, WeightKind::f32>),
-            dim3(1), dim3(256), 0, stream, input, reinterpret_cast<const void*>(views.weights.shared_gate_f32.address),
-            config.hidden_size, workspace + config.intermediate_size);
-        check_hip(hipGetLastError(), "known-window shared rows scalar launch");
-    }
+    hipLaunchKernelGGL(rows_shared_activation_scalar_kernel, dim3((config.intermediate_size + kThreads - 1U) / kThreads, Rows),
+        dim3(kThreads), 0, stream, views.workspace.address, views.shape.workspace_stride_bytes, views.input.address,
+        views.shape.input_stride_bytes, reinterpret_cast<const void*>(views.weights.shared_gate_f32.address),
+        config.intermediate_size, config.hidden_size);
+    check_hip(hipGetLastError(), "known-window shared rows activation/scalar launch");
     known_shared_engine_projection<Rows>(true, views, stream, config);
 }
 } // namespace
