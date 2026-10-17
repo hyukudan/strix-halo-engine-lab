@@ -132,6 +132,9 @@ constexpr std::string_view known_hyper_base="hip.hyper_mix.bf16.h2560.hc4.lr320.
 bool hyper_op(strix::SerialOp op) {
     return op==strix::SerialOp::attn_hyper_mix || op==strix::SerialOp::mlp_hyper_mix || op==strix::SerialOp::final_hyper_mix;
 }
+// Routed experts of the union fixture: 0 = float profile with Q4_K/Q5_1 on every
+// layer, 1 = float profile id over the canonical census formats, 2 = A8 profile.
+unsigned routed_fixture_profile = 0U;
 KnownFixture make_known_fixture(const strix::ModelContract& model, std::uint32_t gate_type = 8U,
     bool routed_union = false, bool hyper = false, bool qsa = false, std::uint32_t indexer_type = 8U,
     std::uint32_t head_type = 0xffffffffU) {
@@ -176,8 +179,8 @@ KnownFixture make_known_fixture(const strix::ModelContract& model, std::uint32_t
             value.absolute_offset = offset;
             std::uint64_t elements = 1;
             for (const auto extent : value.dimensions) elements *= extent;
-            value.byte_size = type == 8 ? value.dimensions[0] / 32U * 34U * value.dimensions[1] :
-                type==12U ? elements/256U*144U : type==7U ? elements/32U*24U : type==30U ? elements * 2U : elements * 4U;
+            value.byte_size = type == 8 ? elements / 32U * 34U :
+                type==12U ? elements/256U*144U : type==13U ? elements/256U*176U : type==7U ? elements/32U*24U : type==30U ? elements * 2U : elements * 4U;
             offset += (value.byte_size + 255U) / 256U * 256U;
             tensors.tensor_indices.push_back(static_cast<std::uint32_t>(fixture.manifest.tensors.size()));
             fixture.manifest.tensors.push_back(std::move(value));
@@ -189,11 +192,18 @@ KnownFixture make_known_fixture(const strix::ModelContract& model, std::uint32_t
             tensor("ffn_down_shexp.weight", {640,2560}, 8);
             tensor("ffn_gate_inp_shexp.weight", {2560}, 0);
         } else if(step.op==strix::SerialOp::moe_experts && routed_union) {
-            binding.kernel_id="hip.moe_experts.bf16.h2560.m640.e512.k10.r1.c1.deferred-status-v1"
+            binding.kernel_id=routed_fixture_profile==2U ?
+                "hip.moe_experts.bf16.h2560.m640.e512.k10.r1.c1.batched-slot-activation-v1.deferred-status-v1"
+                ".q5k-a8g32-gateup-v1.q51-a8g32-down-v1.q80-a8g32-down-v1.mixed-a8-down-v1.q4k-a8g32-gateup-v2" :
+                "hip.moe_experts.bf16.h2560.m640.e512.k10.r1.c1.deferred-status-v1"
                 ".q51-slot-parallel-v1.grouped-exact-q51-down-v1.q4k-a8g32-gateup-v2";
-            tensor("ffn_gate_exps.weight",{2560,640,512},12);
-            tensor("ffn_up_exps.weight",{2560,640,512},12);
-            tensor("ffn_down_exps.weight",{640,2560,512},7);
+            const auto layer=step.layer.value_or(0U);
+            const bool census=routed_fixture_profile!=0U;
+            const bool q80=census && (layer==2U || layer==4U || layer==30U || layer==46U || layer==47U);
+            const std::uint32_t gate=census && layer==2U ? 13U : 12U;
+            tensor("ffn_gate_exps.weight",{2560,640,512},gate);
+            tensor("ffn_up_exps.weight",{2560,640,512},gate);
+            tensor("ffn_down_exps.weight",{640,2560,512},q80 ? 8U : 7U);
         } else if (step.op == strix::SerialOp::gated_delta_net) {
             binding.kernel_id = "hip.gdn.bf16.h2560.kh16.vh48.d128.r1.c1.scalar.wave8-input-v1.wave8-q8-output-v1.prefetch8.virtual256.q8-input.virtual256.q8-output";
             tensor("attn_qkv.weight", {2560,10240}, 8);
@@ -1311,6 +1321,37 @@ void known_window_lm_head_rows_tests(const strix::ModelContract& model) {
     }
 }
 
+// A8 profile: every census format (Q5_K gate/up, Q8_0 down) has an A8 union,
+// so all 48 MoE layers promote; the float profile keeps those 5 as row loops.
+void known_window_routed_a8_union_compiler_tests(const strix::ModelContract& model) {
+    using V=strix::KnownWindowR2Variant;
+    using M=strix::KnownWindowStepMode;
+    for(const unsigned profile:{1U,2U}) {
+        routed_fixture_profile=profile;
+        const auto fixture=make_known_fixture(model,0U,true);
+        routed_fixture_profile=0U;
+        for(const std::uint32_t rows:{2U,4U,8U}) {
+            const auto on=strix::compile_known_prefix_window(model,fixture.serial,fixture.manifest,fixture.access,
+                {true,true,true,rows,true});
+            const auto expected=profile==2U ? (rows==2U?V::routed_a8_union_rows2_v1:rows==4U?V::routed_a8_union_rows4_v1:V::routed_a8_union_rows8_v1) :
+                (rows==2U?V::routed_q51_union_rows2_v1:rows==4U?V::routed_q51_union_rows4_v1:V::routed_q51_union_rows8_v1);
+            expect(on.routed_expert_union_steps==(profile==2U?48U:43U),"A8 profile promotes all 48 MoE layers, float profile 43");
+            for(std::size_t i=0;i<on.mode.size();++i) if(on.mode[i]==M::routed_expert_union)
+                expect(on.r2_variant[i]==expected,"routed union variant follows the serial numerical profile");
+            strix::validate_known_prefix_window_formats(on,fixture.serial,fixture.manifest,fixture.access);
+            if(profile==2U) {
+                auto forged=on;
+                for(std::size_t i=0;i<forged.mode.size();++i) if(forged.mode[i]==M::routed_expert_union)
+                    {forged.r2_variant[i]=rows==2U?V::routed_q51_union_rows2_v1:rows==4U?V::routed_q51_union_rows4_v1:V::routed_q51_union_rows8_v1;break;}
+                bool rejected=false;
+                try{strix::validate_known_prefix_window_formats(forged,fixture.serial,fixture.manifest,fixture.access);}
+                catch(const std::invalid_argument&){rejected=true;}
+                expect(rejected,"float union variant cannot stand in for the A8 profile");
+            }
+        }
+    }
+}
+
 void known_window_routed_union_compiler_tests(const strix::ModelContract& model) {
     using V=strix::KnownWindowR2Variant;
     using M=strix::KnownWindowStepMode;
@@ -2008,6 +2049,7 @@ int main() {
     expect(deferred_rejected,"deferred MoE explicitly rejects speculative verification");
 
     known_window_routed_union_compiler_tests(model);
+    known_window_routed_a8_union_compiler_tests(model);
     known_window_router_rows_compiler_tests(model);
     known_window_lm_head_rows_tests(model);
     known_window_routed_union_runtime_tests(model);
