@@ -8,6 +8,7 @@
 #include "strix/hc_projection_prefetch.hpp"
 #include "strix/distributed_stage_resources.hpp"
 #include "strix/lane_chain_hyper_output.hpp"
+#include <cstdlib>
 #include <set>
 
 #include "strix/dispatch_resources.hpp"
@@ -2791,12 +2792,24 @@ void hyper_mix_known_window_rows_launch(std::span<const ExecutionDispatchContext
             p.norm_manifest->ggml_type, config.hidden_size, config.rms_epsilon);
         check_hip(hipGetLastError(), "known-window HC rows normalization launch");
         if (config.splitk_projection) {
-            constexpr unsigned outputs = 4U;
-            const auto blocks = (config.lowrank + outputs - 1U) / outputs;
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_splitk_hyper_projection_kernel<outputs>),
-                dim3(blocks + (inject ? (config.hc_count + outputs - 1U) / outputs : 0U)), dim3(512U), 0,
-                hip_execution_stream(), prepared.rows, count, reinterpret_cast<const void*>(p.down_runtime->address),
-                config.hc_count, config.lowrank, inject, blocks);
+            // Outputs per block only regroups independent output chains (bit-identical);
+            // STRIX_HC_ROWS_SPLITK_OUTPUTS=1|2|4|8 trades blocks in flight against input re-reads.
+            static const unsigned per_block = [] {
+                const char* v = std::getenv("STRIX_HC_ROWS_SPLITK_OUTPUTS");
+                const unsigned n = v ? static_cast<unsigned>(std::atoi(v)) : 4U;
+                return n == 1U || n == 2U || n == 8U ? n : 4U;
+            }();
+            const auto launch = [&]<unsigned outputs>() {
+                const auto blocks = (config.lowrank + outputs - 1U) / outputs;
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_splitk_hyper_projection_kernel<outputs>),
+                    dim3(blocks + (inject ? (config.hc_count + outputs - 1U) / outputs : 0U)), dim3(512U), 0,
+                    hip_execution_stream(), prepared.rows, count, reinterpret_cast<const void*>(p.down_runtime->address),
+                    config.hc_count, config.lowrank, inject, blocks);
+            };
+            if (per_block == 1U) launch.template operator()<1U>();
+            else if (per_block == 2U) launch.template operator()<2U>();
+            else if (per_block == 8U) launch.template operator()<8U>();
+            else launch.template operator()<4U>();
         } else {
             const auto blocks = (config.lowrank + kStagedOutputs - 1U) / kStagedOutputs;
             hipLaunchKernelGGL(rows_batched_typed_hyper_projection_kernel,
