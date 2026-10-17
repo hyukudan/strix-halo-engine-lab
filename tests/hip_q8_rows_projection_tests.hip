@@ -264,16 +264,20 @@ void wide_cases(hipStream_t stream, std::uint32_t& cases) {
 void wide_bench(hipStream_t stream) {
     Buffer flush(256ULL << 20U);
     check(hipMemset(reinterpret_cast<void*>(flush.address), 1, flush.bytes), "init flush");
+    // STRIX_Q8_ROWS_BENCH_ROWS=64 restricts the row counts, STRIX_Q8_ROWS_BENCH_COLD=1 skips warm runs.
+    std::vector<unsigned> counts{8U, 16U, 32U, 64U};
+    if (const char* v = std::getenv("STRIX_Q8_ROWS_BENCH_ROWS")) counts = {static_cast<unsigned>(std::atoi(v))};
+    const bool cold_only = std::getenv("STRIX_Q8_ROWS_BENCH_COLD") != nullptr;
     for (const bool cold : {false, true})
         for (const auto site : sites) {
-            if (site == Site::qsa_output) continue;  // same shape and arithmetic class as GDN out
+            if (cold_only && !cold) continue;
             const auto [width, outputs] = prefill_shape(site);
             const double weight_bytes = static_cast<double>(width / 32U) * outputs * 34.0;
             Fixture warmup(site, 1U, width, outputs); warmup.prepare(0);
             static_cast<void>(median_us(warmup, Mode::rows, cold, flush, stream));
             std::cout << (cold ? "cold " : "warm ") << name(site) << " " << width << "->" << outputs << " ("
                       << weight_bytes / 1e6 << " MB of Q8 weights)\n";
-            for (const unsigned rows : {8U, 16U, 32U, 64U}) {
+            for (const unsigned rows : counts) {
                 Fixture f(site, rows, width, outputs); f.prepare(0);
                 const auto us = median_us(f, Mode::rows, cold, flush, stream);
                 std::cout << "  T=" << rows << " " << us << " us  " << weight_bytes / (us * 1e3) << " GB/s weights  "

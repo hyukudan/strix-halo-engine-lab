@@ -1039,6 +1039,7 @@ __device__ __forceinline__ float gdn_rows_tree_add(float lower, float upper) {
 template <unsigned Rows> struct GdnInputRowsSite {
     using Input = std::uint16_t;
     static constexpr unsigned rows = Rows;
+    static constexpr bool fused_fma = true;  // Site::fma compiles to v_fmac_f32 (wide VOPD rows)
     const void* input[Rows];
     q8_rows::Segments segments;
     std::uint32_t width, outputs;
@@ -1056,6 +1057,7 @@ template <unsigned Rows> struct GdnInputRowsSite {
 template <unsigned Rows> struct GdnOutputRowsSite {
     using Input = float;
     static constexpr unsigned rows = Rows;
+    static constexpr bool fused_fma = true;  // Site::fma compiles to v_fmac_f32 (wide VOPD rows)
     const void* input[Rows];
     q8_rows::Segments segments;
     std::uint32_t width, outputs;

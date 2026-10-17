@@ -1436,6 +1436,7 @@ __device__ __forceinline__ float shared_rows_coefficient(unsigned scale, std::in
 template <unsigned Rows> struct SharedGateUpRowsSite {
     using Input = std::uint16_t;
     static constexpr unsigned rows = Rows;
+    static constexpr bool fused_fma = true;  // Site::fma compiles to v_fmac_f32 (wide VOPD rows)
     const void* input[Rows];
     q8_rows::Segments segments;
     std::uint32_t width, outputs;
@@ -1448,6 +1449,7 @@ template <unsigned Rows> struct SharedGateUpRowsSite {
 template <unsigned Rows> struct SharedDownRowsSite {
     using Input = float;
     static constexpr unsigned rows = Rows;
+    static constexpr bool fused_fma = true;  // Site::fma compiles to v_fmac_f32 (wide VOPD rows)
     const void* input[Rows];
     q8_rows::Segments segments;
     std::uint32_t width, outputs;
