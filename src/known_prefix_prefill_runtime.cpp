@@ -172,6 +172,10 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
         if(multi&&!((!reads_position(serial.execution.steps[step].reads_state)||mode==KnownWindowStepMode::qsa_rows)&&(rows_entry?wide_by_id[id]!=nullptr:pair_by_id[id]!=nullptr)))
             throw std::invalid_argument("known prefill selected closed implementation is missing (variant "+std::to_string(id)+
                 ", mode "+std::to_string(static_cast<unsigned>(mode))+")");
+        // Memoized blocks skip every step preflight, including the position-dependent QSA/PLE ones
+        // (re-running those costs ~17 ms of idle GPU per 64-row block). Their launchers still admit
+        // each context before enqueueing, so an out-of-capacity block fails during launch (session
+        // poisoned) instead of before it; capacity and positions are checked above for every block.
         if(preflight_known) continue;
         if(rows_entry&&full_by_id[id]&&rows%8U==0U) {
             std::vector<ExecutionDispatchContext> all(rows);for(std::uint32_t r=0;r<rows;++r) all[r]=context(step,r);
@@ -214,8 +218,13 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
                 correlation.rows=rows;correlation.row=UINT32_MAX;correlation.phase=ExecutionPhase::operator_step;
                 ExecutionCorrelationScope observed(correlation);
                 full_by_id[id]->launch(all,full_by_id[id]->config);
-                if(mode==KnownWindowStepMode::gdn_rows) ++result.gdn_rows_dispatches;
-                ++result.r2_variant_dispatches[id];
+                // Counted per 8-row tile, like the tile path, so receipts compare across both.
+                const auto tiles=rows/8U;
+                if(mode==KnownWindowStepMode::shared_rows) result.shared_rows_dispatches+=tiles;
+                else if(mode==KnownWindowStepMode::gdn_rows) result.gdn_rows_dispatches+=tiles;
+                else if(mode==KnownWindowStepMode::hyper_mix_rows) result.hyper_mix_rows_dispatches+=tiles;
+                else if(mode==KnownWindowStepMode::routed_expert_union) result.routed_expert_union_dispatches+=tiles;
+                result.r2_variant_dispatches[id]+=tiles;
                 if(launch.steps[step].runtime_step) ++result.execution.runtime_steps;else ++result.execution.kernel_steps;
                 ++result.execution.completed_steps;result.execution.completion_order.push_back(source.id);
                 for(std::uint32_t r=0;r<rows;++r) result.execution.state.publish_write(source.writes_state);

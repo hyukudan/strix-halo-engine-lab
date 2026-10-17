@@ -3094,6 +3094,24 @@ PreparedHyperRows prepare_hyper_prefill_rows(std::span<const ExecutionDispatchCo
                 !same(first.rows.injection[r], tile.rows.injection[r], first.rows.tile_injection))
                 throw std::invalid_argument("HC prefill tile views are not strided");
     }
+    // Tiles run concurrently: no written view of any row may reach any row's input.
+    const auto width = static_cast<std::uint64_t>(config.hidden_size) * config.hc_count;
+    const auto input_bytes = width * (config.activation == HipActivationStorage::bf16 ? 2U : 4U);
+    std::uintptr_t in_low = UINTPTR_MAX, in_high = 0;
+    for (std::uint32_t r = 0; r < kWindowRows; ++r) {
+        in_low = std::min(in_low, at(first.rows.input[r]));
+        in_high = std::max(in_high, at(first.rows.input[r]) + (tiles - 1U) * first.rows.tile_input + input_bytes);
+    }
+    const auto written = [&](const auto* const* views, std::uint64_t stride, std::uint64_t bytes) {
+        for (std::uint32_t r = 0; r < kWindowRows; ++r) {
+            if (!views[r]) continue;
+            const auto low = at(views[r]), high = low + (tiles - 1U) * stride + bytes;
+            if (low < in_high && in_low < high) throw std::invalid_argument("HC prefill outputs alias the input rows");
+        }
+    };
+    written(first.rows.output, first.rows.tile_output, input_bytes / config.hc_count);
+    written(first.rows.normalized, first.rows.tile_normalized, (width + config.lowrank) * sizeof(float));
+    written(first.rows.injection, first.rows.tile_injection, config.hc_count * sizeof(float));
     return first;
 }
 }  // namespace

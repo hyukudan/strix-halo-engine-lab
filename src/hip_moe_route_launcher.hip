@@ -18,6 +18,7 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace strix {
 namespace {
@@ -1772,8 +1773,12 @@ void route_prefill(std::span<const ExecutionDispatchContext> rows, const HipMoeR
     args.tile_weights = stride(first.args.weights[0], second.args.weights[0]);
     bool together = first.kind == RouterWeightKind::f32 && first.wave_logits && config.wave_topk &&
         config.hidden_size % 128U == 0U;
+    // Every tile is admitted (and the batched form decided) before anything is launched.
+    std::vector<PreparedRouterRows> prepared{first};
+    prepared.reserve(tiles);
     for (std::uint32_t t = 1; t < tiles; ++t) {
-        const auto tile = t < 2U ? second : prepare_router_rows(rows.subspan(t * 8U, 8U), config);
+        prepared.push_back(t < 2U ? second : prepare_router_rows(rows.subspan(t * 8U, 8U), config));
+        const auto& tile = prepared.back();
         together = together && tile.wave_logits;
         const auto offset = static_cast<std::uint64_t>(t);
         for (std::uint32_t r = 0; r < 8U; ++r)
@@ -1782,15 +1787,28 @@ void route_prefill(std::span<const ExecutionDispatchContext> rows, const HipMoeR
                 at(tile.args.indices[r]) != at(first.args.indices[r]) + offset * args.tile_indices ||
                 at(tile.args.weights[r]) != at(first.args.weights[r]) + offset * args.tile_weights)
                 throw std::invalid_argument("router prefill tile views are not strided");
-        if (launch && !together) {
-            if (t == 1U) {
-                if (config.activation == HipActivationStorage::bf16) launch_router_rows_by_weight<std::uint16_t>(first, config);
-                else launch_router_rows_by_weight<float>(first, config);
-            }
+    }
+    // Inputs of every row vs outputs of every row (tiles run concurrently in the batched form).
+    const auto span = [&](const auto* const* views, std::uint64_t stride, std::uint64_t bytes) {
+        std::uintptr_t low = UINTPTR_MAX, high = 0;
+        for (std::uint32_t r = 0; r < 8U; ++r) {
+            low = std::min(low, at(views[r]));
+            high = std::max(high, at(views[r]) + (tiles - 1U) * stride + bytes);
+        }
+        return std::pair<std::uintptr_t, std::uintptr_t>{low, high};
+    };
+    const auto hidden_bytes = static_cast<std::uint64_t>(config.hidden_size) *
+        (config.activation == HipActivationStorage::bf16 ? 2U : 4U);
+    const auto in = span(first.args.hidden, args.tile_hidden, hidden_bytes);
+    for (const auto& out : {span(first.args.workspace, args.tile_workspace, config.expert_count * 4ULL),
+             span(first.args.indices, args.tile_indices, config.top_k * 4ULL),
+             span(first.args.weights, args.tile_weights, config.top_k * 4ULL)})
+        if (out.first < in.second && in.first < out.second) throw std::invalid_argument("router prefill outputs alias the input rows");
+    if (launch && !together)
+        for (const auto& tile : prepared) {
             if (config.activation == HipActivationStorage::bf16) launch_router_rows_by_weight<std::uint16_t>(tile, config);
             else launch_router_rows_by_weight<float>(tile, config);
         }
-    }
     if (!launch || !together) return;
     const auto stream = hip_execution_stream();
     const auto* f32 = reinterpret_cast<const float*>(first.tensor->address);
