@@ -1789,18 +1789,12 @@ void shared_expert_known_window_r2_launch(std::span<const ExecutionDispatchConte
     check_hip(hipPeekAtLastError(), "known-window shared R2 stale launch error");
     require_known_shared_a8(2U, config);
     known_shared_engine_projection<2U>(false, views, scope->stream, config);
-    for (unsigned row = 0; row < 2U; ++row) {
-        auto* workspace = reinterpret_cast<float*>(views.workspace.address + row * views.shape.workspace_stride_bytes);
-        const auto* hidden = reinterpret_cast<const std::uint16_t*>(views.input.address + row * views.shape.input_stride_bytes);
-        hipLaunchKernelGGL(gated_activation_kernel, dim3((config.intermediate_size + 255U) / 256U),
-            dim3(256), 0, scope->stream, workspace, config.intermediate_size);
-        check_hip(hipGetLastError(), "known-window shared R2 activation launch");
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(scalar_projection_kernel<std::uint16_t, WeightKind::f32>),
-            dim3(1), dim3(256), 0, scope->stream, hidden,
-            reinterpret_cast<const void*>(views.weights.shared_gate_f32.address), config.hidden_size,
-            workspace + config.intermediate_size);
-        check_hip(hipGetLastError(), "known-window shared R2 scalar launch");
-    }
+    // Both rows' activation and F32 scalar gate in one launch, the per-row kernels' arithmetic.
+    hipLaunchKernelGGL(rows_shared_activation_scalar_kernel, dim3((config.intermediate_size + kThreads - 1U) / kThreads, 2U),
+        dim3(kThreads), 0, scope->stream, views.workspace.address, views.shape.workspace_stride_bytes, views.input.address,
+        views.shape.input_stride_bytes, reinterpret_cast<const void*>(views.weights.shared_gate_f32.address),
+        config.intermediate_size, config.hidden_size);
+    check_hip(hipGetLastError(), "known-window shared R2 activation/scalar launch");
     known_shared_engine_projection<2U>(true, views, scope->stream, config);
 }
 
