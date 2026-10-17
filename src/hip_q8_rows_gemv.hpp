@@ -547,24 +547,66 @@ template <class Site, unsigned Outs, unsigned Per> struct CoefProducer {
         }
     }
 };
+// Producer of the 4-output VOPD kernels with Waves = 4, 2 or 1 waves per block: lane L
+// of wave w decodes features 8L..8L+7 of outputs w * G .. w * G + G - 1 (G = 4 / Waves),
+// so every weight row pointer stays wave-uniform; same slots as CoefProducer.
+template <class Site, unsigned Waves> struct VopdProducer {
+    static constexpr unsigned G = 4U / Waves;
+    struct Fetch { unsigned scale[G]; std::uint64_t codes[G]; };
+    const unsigned char* pw[G];
+    unsigned po, pf;
+    std::uint32_t width;
+    __device__ __forceinline__ void init(const Site& site, std::uint32_t g, unsigned wave, unsigned lane) {
+        po = wave * G; pf = 8U * lane; width = site.width;
+#pragma unroll
+        for (unsigned j = 0; j < G; ++j) {
+            unsigned m; std::uint32_t row;
+            pw[j] = segment_row(site.segments, min(g * 4U + po + j, site.outputs - 1U), width, m, row);
+        }
+    }
+    __device__ __forceinline__ Fetch fetch(std::uint32_t k) const {
+        const std::uint32_t f = umin(256U * k + pf, width - 8U);
+        Fetch result;
+#pragma unroll
+        for (unsigned j = 0; j < G; ++j) {
+            const unsigned char* block = pw[j] + (f / 32U) * 34U;
+            result.scale[j] = *reinterpret_cast<const std::uint16_t*>(block);
+            std::memcpy(&result.codes[j], block + 2U + f % 32U, 8U);
+        }
+        return result;
+    }
+    __device__ __forceinline__ void produce(const Fetch& in, float4* buffer) const {
+#pragma unroll
+        for (unsigned j = 0; j < G; ++j) {
+            float c[8];
+#pragma unroll
+            for (unsigned i = 0; i < 8U; ++i) c[i] = Site::coefficient(in.scale[j], static_cast<std::int8_t>(in.codes[j] >> (8U * i)));
+            float4* target = buffer + (po + j) * 64U;
+            target[pf / 8U] = make_float4(c[0], c[1], c[2], c[3]);
+            target[32U + pf / 8U] = make_float4(c[4], c[5], c[6], c[7]);
+        }
+    }
+};
 template <class Site, unsigned Outs, unsigned Sub, unsigned W, bool Vopd>
 __global__ __launch_bounds__((32U * coef_waves<Site, Sub, W>())) void project_wide_rows_coef_kernel(Site site) {
     using Input = typename Site::Input;
     constexpr unsigned Rows = Site::rows, Batches = Rows / Sub, Waves = coef_waves<Site, Sub, W>(), Threads = 32U * Waves;
     constexpr unsigned Blocks = Batches / Waves, Pairs = Outs * Sub, N = pow2u(Pairs) * 8U, Per = Outs * 256U / Threads;
-    static_assert(Rows > 8U && Rows % Sub == 0U && Batches % Waves == 0U && Pairs <= 32U);
-    static_assert(Per == 2U || Per == 4U || Per == 8U, "each thread decodes 2, 4 or 8 coefficients per chunk");
+    static_assert((Rows > 8U || Vopd) && Rows % Sub == 0U && Batches % Waves == 0U && Pairs <= 32U);
+    static_assert(Vopd || Per == 2U || Per == 4U || Per == 8U, "each thread decodes 2, 4 or 8 coefficients per chunk");
     static_assert(!Vopd || (Outs == 4U && Sub == 4U && fused_fma_of<Site>()));
+    using Producer = std::conditional_t<Vopd, VopdProducer<Site, Waves>, CoefProducer<Site, Outs, (Per < 2U ? 2U : Per > 8U ? 8U : Per)>>;
     __shared__ float4 coef[2][Outs * 64U];
     const unsigned lane = threadIdx.x & 31U, wave = uniform(threadIdx.x / 32U);
     const std::uint32_t width = site.width, chunks = (width + 255U) / 256U, full = width / 256U;
     const std::uint32_t g = blockIdx.x / Blocks;
     const unsigned first = ((blockIdx.x % Blocks) * Waves + wave) * Sub;
-    CoefProducer<Site, Outs, Per> producer;
-    producer.po = uniform(threadIdx.x * Per / 256U);
-    producer.pf = threadIdx.x * Per % 256U;
-    producer.width = width;
-    {
+    Producer producer;
+    if constexpr (Vopd) producer.init(site, g, wave, lane);
+    else {
+        producer.po = uniform(threadIdx.x * Per / 256U);
+        producer.pf = threadIdx.x * Per % 256U;
+        producer.width = width;
         unsigned m; std::uint32_t row;
         producer.pw = segment_row(site.segments, min(g * Outs + producer.po, site.outputs - 1U), width, m, row);
     }
@@ -572,7 +614,7 @@ __global__ __launch_bounds__((32U * coef_waves<Site, Sub, W>())) void project_wi
 #pragma unroll
     for (unsigned r = 0; r < Sub; ++r) x_row[r] = row_input(site, first + r);
     float v[N]{};
-    typename CoefProducer<Site, Outs, Per>::Fetch ring[2]{producer.fetch(umin(1U, chunks - 1U)), producer.fetch(umin(2U, chunks - 1U))};
+    typename Producer::Fetch ring[2]{producer.fetch(umin(1U, chunks - 1U)), producer.fetch(umin(2U, chunks - 1U))};
     producer.produce(producer.fetch(0U), coef[0]);
     lds_fence_barrier();
     // Full chunks run unconditionally; only a partial last chunk masks lanes past the width
@@ -640,24 +682,17 @@ __global__ __launch_bounds__((32U * coef_waves<Site, Sub, W>())) void project_wi
 // which gives the DRAM weight loads two steps instead of one. The two raw buffers sit
 // in v192..v207 and v208..v223 (vopd_chunk / vopd_chunk_b1). Same arithmetic as
 // project_wide_rows_coef_kernel (and the same producer).
-template <class Site>
-__global__ __launch_bounds__(128) void project_wide_rows_vopd_bf16_kernel(Site site) {
-    static_assert(sizeof(typename Site::Input) == 2U && Site::rows % 16U == 0U && fused_fma_of<Site>());
-    constexpr unsigned Outs = 4U, Sub = 4U, Waves = 4U, Blocks = Site::rows / Sub / Waves, Per = 8U;
+template <class Site, unsigned Waves = (Site::rows / 4U < 4U ? Site::rows / 4U : 4U)>
+__global__ __launch_bounds__(32U * Waves) void project_wide_rows_vopd_bf16_kernel(Site site) {
+    static_assert(sizeof(typename Site::Input) == 2U && Site::rows % (4U * Waves) == 0U && fused_fma_of<Site>());
+    constexpr unsigned Outs = 4U, Sub = 4U, Blocks = Site::rows / Sub / Waves;
     __shared__ float4 coef[2][Outs * 64U];
     const unsigned lane = threadIdx.x & 31U, wave = uniform(threadIdx.x / 32U);
     const std::uint32_t width = site.width, chunks = (width + 255U) / 256U;
     const std::uint32_t g = blockIdx.x / Blocks;
     const unsigned first = ((blockIdx.x % Blocks) * Waves + wave) * Sub;
-    // Producer: wave w decodes output w's 256 coefficients of a chunk, 8 per lane.
-    CoefProducer<Site, Outs, Per> producer;
-    producer.po = wave;
-    producer.pf = lane * Per;
-    producer.width = width;
-    {
-        unsigned m; std::uint32_t row;
-        producer.pw = segment_row(site.segments, min(g * Outs + wave, site.outputs - 1U), width, m, row);
-    }
+    VopdProducer<Site, Waves> producer;
+    producer.init(site, g, wave, lane);
     const std::uint16_t* x_row[Sub];
 #pragma unroll
     for (unsigned r = 0; r < Sub; ++r) x_row[r] = row_input(site, first + r);
@@ -672,7 +707,7 @@ __global__ __launch_bounds__(128) void project_wide_rows_vopd_bf16_kernel(Site s
     float v[128]{};
     unsigned wa[16], wb[16];
     load_rows(wa, 0U);
-    typename CoefProducer<Site, Outs, Per>::Fetch ring[2]{producer.fetch(umin(1U, chunks - 1U)), producer.fetch(umin(2U, chunks - 1U))};
+    typename VopdProducer<Site, Waves>::Fetch ring[2]{producer.fetch(umin(1U, chunks - 1U)), producer.fetch(umin(2U, chunks - 1U))};
     producer.produce(producer.fetch(0U), coef[0]);
     lds_fence_barrier();
     const auto step = [&](std::uint32_t k, unsigned (&now)[16], unsigned (&later)[16], auto odd) {
@@ -808,6 +843,8 @@ inline unsigned env_unsigned(const char* name, unsigned fallback) {
 inline unsigned wide_sub() { static const unsigned sub = env_unsigned("STRIX_Q8_ROWS_WIDE_SUB", 0U); return sub; }
 inline unsigned wide_kernel() { static const unsigned kernel = env_unsigned("STRIX_Q8_ROWS_WIDE_KERNEL", 2U); return kernel; }
 inline bool wide_stage() { static const bool stage = env_unsigned("STRIX_Q8_ROWS_WIDE_STAGE", 0U) == 1U; return stage; }
+inline unsigned narrow_vopd() { static const unsigned vopd = env_unsigned("STRIX_Q8_ROWS_VOPD", 1U); return vopd; }
+inline unsigned narrow_fp32_min_width() { static const unsigned w = env_unsigned("STRIX_Q8_ROWS_VOPD_FP32_MIN", 1024U); return w; }
 // The caller validated width % 32 == 0, 16-byte aligned rows and, for A8,
 // a8_bytes<rows>(width) <= kLdsBytes. any_order drops the packet's barrier bit: the
 // caller guarantees the projection neither reads nor writes what the previously
@@ -819,6 +856,29 @@ template <class Site> void launch(const Site& site, bool a8, hipStream_t stream,
         else hipLaunchKernelGGL(kernel, dim3(blocks), dim3(threads), bytes, stream, site);
     };
     const auto groups_for = [&](unsigned outs, unsigned waves) { return ((site.outputs + outs - 1U) / outs + waves - 1U) / waves; };
+    // Verify windows of 4 and 8 rows: the 4-output x 4-row VOPD kernels with 1 or 2 waves per
+    // block. Default: FP32 inputs of width >= 1024 (GDN and QSA output projections), which are
+    // compute-bound at T = 4/8. BF16 inputs are at DRAM bandwidth there and the staged
+    // project_rows_kernel overlaps better with the window's concurrent kernels in decode, so
+    // they take VOPD only with STRIX_Q8_ROWS_VOPD=2. STRIX_Q8_ROWS_VOPD=0 disables both; the
+    // A8 path is unaffected.
+    if constexpr (fused_fma_of<Site>() && (Site::rows == 4U || Site::rows == 8U)) {
+        if (!a8 && narrow_vopd() != 0U) {
+            constexpr unsigned waves = Site::rows / 4U;
+            const unsigned blocks = (site.outputs + 3U) / 4U;
+            if constexpr (sizeof(typename Site::Input) == 2U) {
+                if (narrow_vopd() == 2U) {
+                    constexpr auto kernel = project_wide_rows_vopd_bf16_kernel<Site>;
+                    start(kernel, blocks, 32U * waves, 0U);
+                    return;
+                }
+            } else if (site.width >= narrow_fp32_min_width()) {
+                constexpr auto kernel = project_wide_rows_coef_kernel<Site, 4U, 4U, 4U, true>;
+                start(kernel, blocks, 32U * waves, 0U);
+                return;
+            }
+        }
+    }
     if constexpr (Site::rows > 8U) {
         if (a8) throw std::invalid_argument("q8_rows: the A8 path supports at most 8 rows");
         // Default: the VOPD kernels (4 outputs x 4 rows per wave, 4-wave blocks). FP32 inputs

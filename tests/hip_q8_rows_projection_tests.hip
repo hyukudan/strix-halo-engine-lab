@@ -300,6 +300,25 @@ int main() try {
         check(hipStreamDestroy(stream), "destroy stream");
         return 0;
     }
+    // STRIX_Q8_ROWS_DECODE_BENCH=1: only cold/warm timings of the T = 1/2/4/8 window shapes.
+    if (std::getenv("STRIX_Q8_ROWS_DECODE_BENCH")) {
+        Buffer flush(256ULL << 20U);
+        check(hipMemset(reinterpret_cast<void*>(flush.address), 1, flush.bytes), "init flush");
+        for (const bool cold : {false, true})
+            for (const auto site : sites) {
+                const auto [width, outputs] = model_shape(site);
+                Fixture warmup(site, 1U, width, outputs); warmup.prepare(0);
+                static_cast<void>(median_us(warmup, Mode::rows, cold, flush, stream));
+                std::cout << (cold ? "cold " : "warm ") << name(site) << " " << width << "->" << outputs << ":";
+                for (const unsigned rows : {1U, 2U, 4U, 8U}) {
+                    Fixture f(site, rows, width, outputs); f.prepare(0);
+                    std::cout << "  T" << rows << " " << median_us(f, Mode::rows, cold, flush, stream);
+                }
+                std::cout << " us\n";
+            }
+        check(hipStreamDestroy(stream), "destroy stream");
+        return 0;
+    }
     for (const auto site : sites)
         for (const unsigned rows : {1U, 2U, 4U, 8U}) {
             const auto [width, outputs] = model_shape(site);
