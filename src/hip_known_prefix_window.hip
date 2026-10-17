@@ -337,6 +337,16 @@ struct HipKnownPrefixWindow::Impl {
                     const auto& self=*static_cast<Impl*>(object);
                     hyper_mix_known_prefill_rows_launch(rows,self.hyper_for(rows));
                 }});
+        // STRIX_PREFILL_FULL_ROUTER=0: keep router rows in separate 8-row launches.
+        static const bool router=[]{const char* v=std::getenv("STRIX_PREFILL_FULL_ROUTER");return !v||v[0]!='0';}();
+        if(router)
+            prefill_entries.push_back({KnownWindowR2Variant::moe_route_rows_v1,this,
+                [](std::span<const ExecutionDispatchContext> rows,void* object) {
+                    moe_route_known_prefill_rows_preflight(rows,static_cast<Impl*>(object)->route_config);
+                },
+                [](std::span<const ExecutionDispatchContext> rows,void* object) {
+                    moe_route_known_prefill_rows_launch(rows,static_cast<Impl*>(object)->route_config);
+                }});
         static const bool gdn=[]{const char* v=std::getenv("STRIX_PREFILL_FULL_GDN");return !v||v[0]!='0';}();
         if(!gdn) return;
         prefill_entries.push_back({KnownWindowR2Variant::gdn_q8_rows8_f32_gates_r1_v1,this,
