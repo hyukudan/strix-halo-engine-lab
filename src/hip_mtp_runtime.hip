@@ -260,8 +260,7 @@ struct HipMtpRuntime::Impl {
         try {
             const auto c=context(current.hidden_source_position);void* stream=owner->stream();
             launch_hip_mtp_embedding(c,current.seed_token_id,stream);
-            launch_hip_mtp_input_fusion(fusion(),stream);
-            launch_hip_mtp_hyper_mix(c,MtpHyperRole::attention,stream);
+            cache_row_front(c,stream);
             launch_hip_mtp_cache_rows(c,stream);
             owner->complete();
             active=false;cache_only_active=false;++next_source;++stats.cache_only_rows;validation.reset();
@@ -315,8 +314,8 @@ struct HipMtpRuntime::Impl {
             for(const auto& row:rows) {
                 const auto c=context(row.hidden.source_position());
                 copy(owner->view(HipMtpBuffer::wide_current),row.hidden.view());
-                launch_hip_mtp_embedding(c,row.next_input_token,stream);launch_hip_mtp_input_fusion(fusion(),stream);
-                launch_hip_mtp_hyper_mix(c,MtpHyperRole::attention,stream);launch_hip_mtp_cache_rows(c,stream);
+                launch_hip_mtp_embedding(c,row.next_input_token,stream);cache_row_front(c,stream);
+                launch_hip_mtp_cache_rows(c,stream);
             }
             owner->complete();
             active=false;cache_only_active=false;next_source+=rows.size();stats.cache_only_rows+=rows.size();validation.reset();
@@ -372,6 +371,12 @@ struct HipMtpRuntime::Impl {
             // Row zero is the pending cycle input at base_source, as in read_greedy_token.
             first_cache_reusable=true;candidates=tokens;return tokens;
         } catch(...) {failure();throw;}
+    }
+    // Teacher cache rows only feed the predictor's own attention cache, so a
+    // draft-only chain builds them with the same fast kernels as its proposals.
+    void cache_row_front(const MtpNativeContext& c,void* stream) const {
+        if(draft && !draft_exact) {launch_hip_mtp_input_fusion_draft(fusion(),stream);hyper(c,MtpHyperRole::attention,stream);return;}
+        launch_hip_mtp_input_fusion(fusion(),stream);launch_hip_mtp_hyper_mix(c,MtpHyperRole::attention,stream);
     }
     void hyper(const MtpNativeContext& c,MtpHyperRole role,void* stream) const {
         if(draft_exact) {launch_hip_mtp_hyper_mix(c,role,stream);return;}
