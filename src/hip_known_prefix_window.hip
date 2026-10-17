@@ -70,6 +70,9 @@ ExecutionBindingRequest binding_request(const HipLauncherCatalogConfig& config) 
     request.batched_moe_activation = config.batched_moe_activation;
     request.grouped_exact_q51_down = config.grouped_exact_q51_down;
     request.q51_slot_parallel_down = config.q51_slot_parallel_down;
+    request.a8_down_q51 = config.a8_down_q51;
+    request.a8_down_q80 = config.a8_down_q80;
+    request.q5k_a8g32_gate_up = config.q5k_a8g32_gate_up;
     request.lane_chain_hyper_output = config.lane_chain_hyper_output;
     request.prefetch_hc_projection_next_tile = config.prefetch_hc_projection_next_tile;
     request.deferred_moe_status = config.deferred_moe_status;
@@ -383,12 +386,18 @@ struct HipKnownPrefixWindow::Impl {
         routed_config.grouped_exact_q51_down=config.grouped_exact_q51_down;
         routed_config.q51_slot_parallel_down=config.q51_slot_parallel_down;
         routed_config.deferred_moe_status=config.deferred_moe_status;
+        routed_config.a8_down_q51=config.a8_down_q51;
+        routed_config.a8_down_q80=config.a8_down_q80;
+        routed_config.q5k_a8g32_gate_up=config.q5k_a8g32_gate_up;
         routed_config.q4k_a8_stats=config.q4k_a8_stats;
         routed_config.q4k_a8_quiescence=std::make_shared<HipSetupQuiescenceGuard>();
         for(std::size_t i=0;i<window.mode.size();++i)
             if(window.mode[i]==KnownWindowStepMode::routed_expert_union)
                 last_union_layer=serial.execution.steps[i].layer.value();
-        const auto variant=window.logical_rows==2U?KnownWindowR2Variant::routed_q51_union_rows2_v1:
+        const bool a8=config.a8_down_q51 || config.a8_down_q80;
+        const auto variant=a8 ? (window.logical_rows==2U?KnownWindowR2Variant::routed_a8_union_rows2_v1:
+            window.logical_rows==4U?KnownWindowR2Variant::routed_a8_union_rows4_v1:KnownWindowR2Variant::routed_a8_union_rows8_v1) :
+            window.logical_rows==2U?KnownWindowR2Variant::routed_q51_union_rows2_v1:
             window.logical_rows==4U?KnownWindowR2Variant::routed_q51_union_rows4_v1:KnownWindowR2Variant::routed_q51_union_rows8_v1;
         rows_entries.push_back({variant,this,
             [](std::span<const ExecutionDispatchContext> rows,void* object) {
@@ -612,6 +621,9 @@ struct HipKnownPrefixWindow::Impl {
         case KnownWindowR2Variant::routed_q51_union_rows2_v1:
         case KnownWindowR2Variant::routed_q51_union_rows4_v1:
         case KnownWindowR2Variant::routed_q51_union_rows8_v1: recipe="hip-routed-known-q4ka8-q51-union-dot-orderedslot-v1";break;
+        case KnownWindowR2Variant::routed_a8_union_rows2_v1:
+        case KnownWindowR2Variant::routed_a8_union_rows4_v1:
+        case KnownWindowR2Variant::routed_a8_union_rows8_v1: recipe="hip-routed-known-q4k-q5k-a8-q51-q80-a8down-union-orderedslot-v1";break;
         case KnownWindowR2Variant::hyper_mix_rows2_v1:
         case KnownWindowR2Variant::hyper_mix_rows4_v1:
         case KnownWindowR2Variant::hyper_mix_rows8_v1: recipe="hip-hc-known-rows-typed-q8-r1-ordered-v1";break;

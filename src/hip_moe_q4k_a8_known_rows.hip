@@ -19,6 +19,7 @@ namespace {
 struct DeviceRows {
     const signed char* codes[8]{}; const float* deltas[8]{}; const int* sums[8]{};
     const unsigned* routes[8]{}; unsigned* status[8]{}; float* output[8]{};
+    signed char* down_codes[8]{}; float* down_deltas[8]{}; int* down_sums[8]{}; float* rawdots[8]{};
 };
 struct DeviceCsr {
     unsigned* summary; unsigned* offsets; unsigned* touched;
@@ -151,12 +152,40 @@ __global__ void project_csr(const unsigned char* gate,const unsigned char* up,De
     }
 }
 __device__ bool nonfinite(float x){return (__float_as_uint(x)&0x7fffffffU)>=0x7f800000U;}
-// project_csr arithmetic with every K block of a matrix loaded before its
-// chains (each wave fetches four complete packed rows at once). Batch rows are
-// staged G at a time; a batch wider than G re-reads its weight slice from
-// cache per group. The incumbent finite scan, SiLU and second scan are applied
-// per (row,slot,output).
-template<unsigned G>
+// Serial Q5_K A8G32 pair (project_q5k): unsigned five-bit codes from qs/qh,
+// then the project/project_csr affine and pair order.
+__device__ __forceinline__ float paired_q5k(uint4 hd,uint4 q,uint4 qh,unsigned p,int4 a0,int4 a1,int s0,int s1,float e0,float e1) {
+    constexpr unsigned mask=0x0f0f0f0fU;
+    const auto g0=2U*p,g1=g0+1U;
+    const uint4 q0{(q.x&mask)|(((qh.x>>g0)&0x01010101U)<<4U),
+        (q.y&mask)|(((qh.y>>g0)&0x01010101U)<<4U),
+        (q.z&mask)|(((qh.z>>g0)&0x01010101U)<<4U),
+        (q.w&mask)|(((qh.w>>g0)&0x01010101U)<<4U)};
+    const uint4 q1{((q.x>>4U)&mask)|(((qh.x>>g1)&0x01010101U)<<4U),
+        ((q.y>>4U)&mask)|(((qh.y>>g1)&0x01010101U)<<4U),
+        ((q.z>>4U)&mask)|(((qh.z>>g1)&0x01010101U)<<4U),
+        ((q.w>>4U)&mask)|(((qh.w>>g1)&0x01010101U)<<4U)};
+    int r0=dot(a0.x,q0.x,0);r0=dot(a0.y,q0.y,r0);r0=dot(a0.z,q0.z,r0);r0=dot(a0.w,q0.w,r0);
+    int r1=dot(a1.x,q1.x,0);r1=dot(a1.y,q1.y,r1);r1=dot(a1.z,q1.z,r1);r1=dot(a1.w,q1.w,r1);
+    r0+=__shfl_xor(r0,1,32);r1+=__shfl_xor(r1,1,32);
+    const int i0=static_cast<int>(factor(hd,g0,false))*r0,i1=static_cast<int>(factor(hd,g1,false))*r1;
+    const int j0=static_cast<int>(factor(hd,g0,true))*s0;
+    const int j1=static_cast<int>(factor(hd,g1,true))*s1;
+    const float d=__half2float(__ushort_as_half(static_cast<unsigned short>(hd.x&65535U)));
+    const float dm=__half2float(__ushort_as_half(static_cast<unsigned short>(hd.x>>16U)));
+    const float u0=d*static_cast<float>(i0),v0=dm*static_cast<float>(j0),t0=u0-v0;
+    const float u1=d*static_cast<float>(i1),v1=dm*static_cast<float>(j1),t1=u1-v1;
+    const float c0=e0*t0,c1=e1*t1;
+    return c0+c1;
+}
+__device__ float divide_rne(float a,float b){return a/b;}
+// project_csr arithmetic (Q4_K, or the serial Q5_K pair) with every K block of
+// a Q4_K matrix loaded before its chains (each wave fetches four complete
+// packed rows at once). Batch rows are staged G at a time; a batch wider than
+// G re-reads its weight slice from cache per group. Epilogue per
+// (row,slot,output): the float profile's finite scan/SiLU/scan, or (A8Down)
+// the serial A8 down activation quantizer on the block's 32-output group.
+template<unsigned G,bool Q5K,bool A8Down>
 __global__ __launch_bounds__(256) void project_window(const unsigned char* gate,const unsigned char* up,DeviceRows view,DeviceCsr csr,
     unsigned rows,unsigned hidden,unsigned outputs) {
     unsigned failure=csr.summary[0];
@@ -166,9 +195,11 @@ __global__ __launch_bounds__(256) void project_window(const unsigned char* gate,
     __shared__ __align__(16) signed char local_codes[G][max_hidden];
     __shared__ __align__(16) float local_deltas[G][max_hidden/32U];
     __shared__ __align__(16) int local_sums[G][max_hidden/32U];
-    const unsigned lane=threadIdx.x&31U,c=lane&7U,p=c/2U,h=c&1U;
-    const unsigned out=blockIdx.x*32U+(threadIdx.x/32U)*4U+lane/8U,blocks=hidden/256U;
-    const auto offset=(static_cast<unsigned long long>(expert)*outputs+out)*blocks*144U;
+    __shared__ float tile[2][G][32];
+    const unsigned lane=threadIdx.x&31U,c=lane&7U,p=c/2U,h=c&1U,wave=threadIdx.x/32U;
+    const unsigned out=blockIdx.x*32U+wave*4U+lane/8U,blocks=hidden/256U;
+    constexpr unsigned block_bytes=Q5K?176U:144U;
+    const auto offset=(static_cast<unsigned long long>(expert)*outputs+out)*blocks*block_bytes;
     const unsigned g0=2U*p,g1=g0+1U;
     constexpr unsigned max_blocks=max_hidden/256U;
     for(unsigned group=0;group<count;group+=G) {
@@ -185,21 +216,39 @@ __global__ __launch_bounds__(256) void project_window(const unsigned char* gate,
 #pragma unroll
         for(unsigned m=0;m<2U;++m) {
             const unsigned char* w=(m==0U?gate:up)+offset;
-            uint4 hd[max_blocks],q[max_blocks];
+            if constexpr(Q5K) {
+#pragma unroll 1
+                for(unsigned b=0;b<blocks;++b) {
+                    const auto* packed=w+b*176U;
+                    const uint4 hd=*reinterpret_cast<const uint4*>(packed);
+                    const uint4 q=*reinterpret_cast<const uint4*>(packed+48U+c*16U);
+                    const uint4 qh=*reinterpret_cast<const uint4*>(packed+16U+h*16U);
 #pragma unroll
-            for(unsigned b=0;b<max_blocks;++b)if(b<blocks) {
-                hd[b]=*reinterpret_cast<const uint4*>(w+b*144U);q[b]=*reinterpret_cast<const uint4*>(w+b*144U+16U+c*16U);
-            }
+                    for(unsigned a=0;a<G;++a)if(group+a<count) {
+                        const int4 a0=*reinterpret_cast<const int4*>(local_codes[a]+b*256U+p*64U+h*16U);
+                        const int4 a1=*reinterpret_cast<const int4*>(local_codes[a]+b*256U+p*64U+32U+h*16U);
+                        const float pair=paired_q5k(hd,q,qh,p,a0,a1,local_sums[a][b*8U+g0],local_sums[a][b*8U+g1],
+                            local_deltas[a][b*8U+g0],local_deltas[a][b*8U+g1]);
+                        acc[m][a]=acc[m][a]+pair;
+                    }
+                }
+            } else {
+                uint4 hd[max_blocks],q[max_blocks];
 #pragma unroll
-            for(unsigned b=0;b<max_blocks;++b)if(b<blocks) {
-                const auto k=coefficient(hd[b],q[b],p);
+                for(unsigned b=0;b<max_blocks;++b)if(b<blocks) {
+                    hd[b]=*reinterpret_cast<const uint4*>(w+b*144U);q[b]=*reinterpret_cast<const uint4*>(w+b*144U+16U+c*16U);
+                }
 #pragma unroll
-                for(unsigned a=0;a<G;++a)if(group+a<count) {
-                    const int4 a0=*reinterpret_cast<const int4*>(local_codes[a]+b*256U+p*64U+h*16U);
-                    const int4 a1=*reinterpret_cast<const int4*>(local_codes[a]+b*256U+p*64U+32U+h*16U);
-                    const float pair=paired(k,a0,a1,local_sums[a][b*8U+g0],local_sums[a][b*8U+g1],
-                        local_deltas[a][b*8U+g0],local_deltas[a][b*8U+g1]);
-                    acc[m][a]=acc[m][a]+pair;
+                for(unsigned b=0;b<max_blocks;++b)if(b<blocks) {
+                    const auto k=coefficient(hd[b],q[b],p);
+#pragma unroll
+                    for(unsigned a=0;a<G;++a)if(group+a<count) {
+                        const int4 a0=*reinterpret_cast<const int4*>(local_codes[a]+b*256U+p*64U+h*16U);
+                        const int4 a1=*reinterpret_cast<const int4*>(local_codes[a]+b*256U+p*64U+32U+h*16U);
+                        const float pair=paired(k,a0,a1,local_sums[a][b*8U+g0],local_sums[a][b*8U+g1],
+                            local_deltas[a][b*8U+g0],local_deltas[a][b*8U+g1]);
+                        acc[m][a]=acc[m][a]+pair;
+                    }
                 }
             }
         }
@@ -207,13 +256,123 @@ __global__ __launch_bounds__(256) void project_window(const unsigned char* gate,
         for(unsigned a=0;a<G;++a)if(group+a<count) {
 #pragma unroll
             for(unsigned m=0;m<2U;++m){acc[m][a]=acc[m][a]+__shfl_xor(acc[m][a],2,32);acc[m][a]=acc[m][a]+__shfl_xor(acc[m][a],4,32);}
-            if(c==0U) {
+            if constexpr(A8Down) {
+                if(c==0U){tile[0][a][out%32U]=acc[0][a];tile[1][a][out%32U]=acc[1][a];}
+            } else if(c==0U) {
                 const auto r=csr.rows[begin+group+a],slot=csr.slots[begin+group+a];
                 const float g=acc[0][a],u=acc[1][a],silu=(g/(1.0F+expf(-g)))*u;
                 view.output[r][(slot*2U)*outputs+out]=silu;view.output[r][(slot*2U+1U)*outputs+out]=u;
                 if(nonfinite(g)||nonfinite(u)||nonfinite(silu))atomicOr(view.status[r],8U);
             }
         }
+        if constexpr(A8Down) {
+            // Serial down_activation_quantize for group blockIdx.x of each staged
+            // (row,slot): same lane = feature, collectives and fail-closed writes.
+            __syncthreads();
+            if(wave==0U) {
+#pragma unroll
+                for(unsigned a=0;a<G;++a)if(group+a<count) {
+                    const auto r=csr.rows[begin+group+a],slot=csr.slots[begin+group+a];
+                    const unsigned feature=blockIdx.x*32U+lane,at=slot*2U*outputs+feature;
+                    const float g=tile[0][a][lane],u=tile[1][a][lane];
+                    const float hv=(g/(1.0F+expf(-g)))*u;
+                    view.output[r][at+outputs]=u;
+                    const unsigned bad=static_cast<unsigned>(__ballot(!isfinite(g)||!isfinite(u)||!isfinite(hv)));
+                    if(bad!=0){view.output[r][at]=g;if(lane==0)atomicOr(view.status[r],8U);continue;}
+                    float x=fabsf(hv);
+                    for(int stride=16;stride!=0;stride/=2) x=fmaxf(x,__shfl_xor(x,stride,32));
+                    const bool tiny=x>0.0F && x<0x1p-119F;
+                    const float delta=x==0.0F || tiny?1.0F:divide_rne(x,127.0F);
+                    const float rounded=tiny?0.0F:rintf(divide_rne(hv,delta));
+                    const int code=static_cast<int>(fminf(127.0F,fmaxf(-127.0F,rounded)));
+                    int sum=code;
+                    for(int stride=16;stride!=0;stride/=2) sum+=__shfl_xor(sum,stride,32);
+                    view.output[r][at]=hv;
+                    view.down_codes[r][slot*outputs+feature]=static_cast<signed char>(code);
+                    if(lane==0){view.down_deltas[r][slot*(outputs/32U)+blockIdx.x]=delta;view.down_sums[r][slot*(outputs/32U)+blockIdx.x]=sum;}
+                }
+            }
+        }
+    }
+}
+__device__ unsigned down_u16(const unsigned char* p) {
+    return static_cast<unsigned>(p[0])|(static_cast<unsigned>(p[1])<<8U);
+}
+__device__ unsigned down_u32(const unsigned char* p) {return down_u16(p)|(down_u16(p+2U)<<16U);}
+__device__ unsigned down_q51_word(const unsigned char* block,unsigned first) {
+    const unsigned high=down_u32(block+4U);
+    unsigned result=0;
+#pragma unroll
+    for(unsigned j=0;j<4U;++j) {
+        const unsigned i=first+j;
+        const unsigned packed=block[8U+i%16U];
+        const unsigned low=(i<16U?packed:packed>>4U)&15U;
+        const unsigned q=low|(((high>>i)&1U)<<4U);
+        result|=q<<(8U*j);
+    }
+    return result;
+}
+// Serial down_rawdots (Q5_1 s8xu5 / Q8_0 s8xs8 A8G32) per CSR batch: each
+// lane decodes its block words once and runs every staged row's chain with
+// the serial lane/group/tree order. Writes the incumbent raw slot dots. A
+// failing block (0,0) folds all row statuses into the summary.
+template<unsigned Rows,bool Q51>
+__global__ __launch_bounds__(256) void down_window(const unsigned char* weights,DeviceRows view,DeviceCsr csr,
+    unsigned rows,unsigned hidden,unsigned width) {
+    unsigned failure=csr.summary[0];
+    for(unsigned r=0;r<rows;++r)failure|=*view.status[r];
+    if(failure){if(blockIdx.x==0U&&blockIdx.y==0U&&threadIdx.x==0U)csr.summary[0]=failure;return;}
+    if(blockIdx.y>=csr.summary[2])return;
+    const auto begin=csr.begins[blockIdx.y],count=csr.begins[blockIdx.y+1U]-begin,expert=csr.experts[blockIdx.y];
+    __shared__ __align__(16) signed char codes[Rows][max_rows];
+    __shared__ float deltas[Rows][max_rows/32U];
+    __shared__ int sums[Rows][max_rows/32U];
+    const unsigned groups=width/32U;
+#pragma unroll
+    for(unsigned a=0;a<Rows;++a)if(a<count) {
+        const auto r=csr.rows[begin+a],slot=csr.slots[begin+a];
+        for(unsigned i=16U*threadIdx.x;i<width;i+=4096U)
+            *reinterpret_cast<int4*>(codes[a]+i)=*reinterpret_cast<const int4*>(view.down_codes[r]+slot*width+i);
+        for(unsigned i=threadIdx.x;i<groups;i+=256U){deltas[a][i]=view.down_deltas[r][slot*groups+i];sums[a][i]=view.down_sums[r][slot*groups+i];}
+    }
+    __syncthreads();
+    const unsigned lane=threadIdx.x&31U,owner=lane&3U;
+    const unsigned row=blockIdx.x*64U+(threadIdx.x/32U)*8U+lane/4U;
+    constexpr unsigned block_bytes=Q51?24U:34U;
+    const auto* row_weights=weights+(static_cast<unsigned long long>(expert)*hidden+row)*groups*block_bytes;
+    float acc[Rows]={};
+#pragma unroll 1
+    for(unsigned group=owner;group<groups;group+=4U) {
+        const auto* packed=row_weights+group*block_bytes;
+        unsigned words[8];
+#pragma unroll
+        for(unsigned word=0;word<8U;++word)words[word]=Q51?down_q51_word(packed,word*4U):down_u32(packed+2U+word*4U);
+        const float d=__half2float(__ushort_as_half(static_cast<unsigned short>(down_u16(packed))));
+        const float m=Q51?__half2float(__ushort_as_half(static_cast<unsigned short>(down_u16(packed+2U)))):0.0F;
+#pragma unroll
+        for(unsigned a=0;a<Rows;++a)if(a<count) {
+            const auto* image=reinterpret_cast<const int*>(codes[a]+group*32U);
+            int integer=0;
+#pragma unroll
+            for(unsigned word=0;word<8U;++word) {
+                if constexpr(Q51) integer=dot(image[word],words[word],integer);
+                else integer=__builtin_amdgcn_sudot4(true,image[word],true,static_cast<int>(words[word]),integer,false);
+            }
+            const float first=d*static_cast<float>(integer);
+            float combined=first;
+            if constexpr(Q51) {
+                const float correction=m*static_cast<float>(sums[a][group]);
+                combined=first+correction;
+            }
+            const float contribution=deltas[a][group]*combined;
+            acc[a]=acc[a]+contribution;
+        }
+    }
+#pragma unroll
+    for(unsigned a=0;a<Rows;++a)if(a<count) {
+        acc[a]=acc[a]+__shfl_xor(acc[a],1,32);
+        acc[a]=acc[a]+__shfl_xor(acc[a],2,32);
+        if(owner==0U)view.rawdots[csr.rows[begin+a]][csr.slots[begin+a]*hidden+row]=acc[a];
     }
 }
 bool overlap(DeviceBytes a,DeviceBytes b){return a.address<b.address+b.bytes&&b.address<a.address+a.bytes;}
@@ -257,35 +416,77 @@ Prepared prepare(const Request& request,std::span<const Bindings> rows,const q51
 } // namespace
 void enqueue_window(const Request& request,std::span<const Bindings> rows,const q51_known_rows::Workspace& workspace,
     const WindowRows& window,hipStream_t stream) {
-    const auto p=prepare(request,rows,workspace,stream);
+    auto p=prepare(request,rows,workspace,stream);
     const DeviceBytes csr{workspace.memory.arena_base,workspace.memory.arena_bytes};
+    const bool a8=window.down_type!=0U,q5k=request.gate_type==13U;
+    if((a8&&window.down_type!=7U&&window.down_type!=8U)||(q5k&&!a8))
+        throw std::invalid_argument("A8 window down/gate format combination is invalid");
+    const auto count=static_cast<unsigned>(rows.size()),groups=request.shape.rows/32U;
     PrologueRows v;
-    for(unsigned r=0;r<rows.size();++r) {
+    for(unsigned r=0;r<count;++r) {
         const auto& b=rows[r];const auto weights=window.route_weights[r],clear=window.clear[r];
         range(weights);range(clear);
         if(weights.bytes<4ULL*request.shape.top_k||clear.bytes!=window.clear[0].bytes||clear.bytes%4U||clear.address%4U||
            clear.bytes/4U>UINT32_MAX||overlap(clear,csr)||overlap(weights,csr))
             throw std::invalid_argument("A8 window row extent is invalid");
-        for(unsigned q=0;q<rows.size();++q)for(const auto view:{rows[q].codes,rows[q].deltas,rows[q].sums,rows[q].status,
+        for(unsigned q=0;q<count;++q)for(const auto view:{rows[q].codes,rows[q].deltas,rows[q].sums,rows[q].status,
             rows[q].output,rows[q].input,rows[q].routes,window.route_weights[q]})if(overlap(clear,view))
             throw std::invalid_argument("A8 window cleared region aliases row storage");
+        if(a8) {
+            const std::array down{window.down_codes[r],window.down_deltas[r],window.down_sums[r],window.rawdots[r]};
+            const std::array<std::uint64_t,4> need{static_cast<std::uint64_t>(request.shape.top_k)*request.shape.rows,
+                4ULL*request.shape.top_k*groups,4ULL*request.shape.top_k*groups,4ULL*request.shape.top_k*request.shape.hidden};
+            for(unsigned i=0;i<4U;++i) {
+                range(down[i]);
+                if(down[i].bytes<need[i]||down[i].address%16U||overlap(down[i],csr)||overlap(down[i],window.down_weights))
+                    throw std::invalid_argument("A8 window down row view is invalid");
+                for(unsigned q=0;q<count;++q)for(const auto view:{rows[q].codes,rows[q].deltas,rows[q].sums,rows[q].status,
+                    rows[q].output,rows[q].input,rows[q].routes,rows[q].gate,rows[q].up,window.clear[q],window.route_weights[q]})
+                    if(overlap(down[i],view))throw std::invalid_argument("A8 window down row view aliases row storage");
+                for(unsigned q=0;q<=r;++q)for(unsigned j=0;j<4U;++j)if((q<r||j<i)&&overlap(down[i],
+                    std::array{window.down_codes[q],window.down_deltas[q],window.down_sums[q],window.rawdots[q]}[j]))
+                    throw std::invalid_argument("A8 window down row views alias");
+            }
+            p.rows.down_codes[r]=reinterpret_cast<signed char*>(window.down_codes[r].address);
+            p.rows.down_deltas[r]=reinterpret_cast<float*>(window.down_deltas[r].address);
+            p.rows.down_sums[r]=reinterpret_cast<int*>(window.down_sums[r].address);
+            p.rows.rawdots[r]=reinterpret_cast<float*>(window.rawdots[r].address);
+        }
         v.input[r]=reinterpret_cast<const void*>(b.input.address);v.routes[r]=p.rows.routes[r];
         v.route_weights[r]=reinterpret_cast<const float*>(weights.address);v.codes[r]=reinterpret_cast<signed char*>(b.codes.address);
         v.deltas[r]=reinterpret_cast<float*>(b.deltas.address);v.sums[r]=reinterpret_cast<int*>(b.sums.address);
         v.status[r]=p.rows.status[r];v.clear[r]=reinterpret_cast<float*>(clear.address);
     }
+    if(a8) {
+        range(window.down_weights);
+        const std::uint64_t block_bytes=window.down_type==7U?24U:34U;
+        if(window.down_weights.bytes!=static_cast<std::uint64_t>(request.shape.experts)*request.shape.hidden*groups*block_bytes||
+           request.shape.rows>max_rows||request.shape.rows%128U||request.shape.hidden%64U||overlap(window.down_weights,csr))
+            throw std::invalid_argument("A8 window down weights/geometry are invalid");
+    }
     v.csr={p.csr.summary,p.csr.offsets,p.csr.touched,p.csr.rows,p.csr.slots,p.csr.experts,p.csr.begins};
-    const auto count=static_cast<unsigned>(rows.size());
     enqueue_prologue(request,v,count,static_cast<unsigned>(window.clear[0].bytes/4U),stream);
-#define STRIX_A8_WINDOW_PROJECT(R) \
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(project_window<(R>2U?4U:2U)>),dim3(request.shape.rows/32U,count*request.shape.top_k), \
-        dim3(256),0,stream,reinterpret_cast<const unsigned char*>(rows.front().gate.address), \
-        reinterpret_cast<const unsigned char*>(rows.front().up.address),p.rows,p.csr,count,request.shape.hidden,request.shape.rows)
-    if(count==2U){STRIX_A8_WINDOW_PROJECT(2);}
-    else if(count==4U){STRIX_A8_WINDOW_PROJECT(4);}
-    else {STRIX_A8_WINDOW_PROJECT(8);}
+    const auto* gate=reinterpret_cast<const unsigned char*>(rows.front().gate.address);
+    const auto* up=reinterpret_cast<const unsigned char*>(rows.front().up.address);
+    const dim3 project_grid(request.shape.rows/32U,count*request.shape.top_k);
+#define STRIX_A8_WINDOW_PROJECT(G,Q5,A8) \
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(project_window<G,Q5,A8>),project_grid,dim3(256),0,stream,gate,up,p.rows,p.csr, \
+        count,request.shape.hidden,request.shape.rows)
+    if(!a8){if(count==2U){STRIX_A8_WINDOW_PROJECT(2U,false,false);}else{STRIX_A8_WINDOW_PROJECT(4U,false,false);}}
+    else if(!q5k){if(count==2U){STRIX_A8_WINDOW_PROJECT(2U,false,true);}else{STRIX_A8_WINDOW_PROJECT(4U,false,true);}}
+    else {if(count==2U){STRIX_A8_WINDOW_PROJECT(2U,true,true);}else{STRIX_A8_WINDOW_PROJECT(4U,true,true);}}
 #undef STRIX_A8_WINDOW_PROJECT
     check(hipGetLastError(),"A8 window shared gate/up projection");
+    if(!a8)return;
+    const auto* down=reinterpret_cast<const unsigned char*>(window.down_weights.address);
+    const dim3 down_grid(request.shape.hidden/64U,count*request.shape.top_k);
+#define STRIX_A8_WINDOW_DOWN(R,Q51) \
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(down_window<R,Q51>),down_grid,dim3(256),0,stream,down,p.rows,p.csr, \
+        count,request.shape.hidden,request.shape.rows)
+    if(window.down_type==7U){if(count==2U){STRIX_A8_WINDOW_DOWN(2U,true);}else if(count==4U){STRIX_A8_WINDOW_DOWN(4U,true);}else{STRIX_A8_WINDOW_DOWN(8U,true);}}
+    else {if(count==2U){STRIX_A8_WINDOW_DOWN(2U,false);}else if(count==4U){STRIX_A8_WINDOW_DOWN(4U,false);}else{STRIX_A8_WINDOW_DOWN(8U,false);}}
+#undef STRIX_A8_WINDOW_DOWN
+    check(hipGetLastError(),"A8 window shared integer down");
 }
 void preflight(const Request& request,std::span<const Bindings> rows,const q51_known_rows::Workspace& workspace,hipStream_t stream) {
     (void)prepare(request,rows,workspace,stream);
