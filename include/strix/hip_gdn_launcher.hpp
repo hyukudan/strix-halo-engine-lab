@@ -32,6 +32,9 @@ struct HipGdnLauncherConfig {
     HipGdnRecurrentLayout recurrent_layout = HipGdnRecurrentLayout::baseline;
     // Chosen with the session allocation/import; never converted per token.
     GdnRecurrentStorage recurrent_storage = GdnRecurrentStorage::key_value;
+    // Opt-in known-window rows Q8 projections with per-32 int8 activations
+    // (dot4). Changes numerics: never bit-identical to the R1 row loop.
+    bool known_window_a8_projections = false;
 };
 
 // Closed eager R2 window helper. Each context remains an R1 row view. Both
@@ -135,10 +138,13 @@ void gdn_known_window_r2_projection_probe(GdnKnownWindowProjectionDirection,
     GdnKnownWindowProjectionMode, std::span<const GdnKnownWindowProjectionView, 2> input,
     GdnKnownWindowProjectionView weights, std::span<const GdnKnownWindowProjectionView, 2> output,
     std::uint32_t width, std::uint32_t outputs, void* stream);
+// T = 1/2/4/8 rows: the q8_rows engine (exact or A8) or the R1 kernel per row.
+enum class GdnKnownWindowRowsProbeMode { rows, rows_a8, row_loop };
 void gdn_known_window_rows_projection_probe(GdnKnownWindowProjectionDirection,
     std::span<const GdnKnownWindowProjectionView> input, GdnKnownWindowProjectionView weights,
     std::span<const GdnKnownWindowProjectionView> output,
-    std::uint32_t width, std::uint32_t outputs, void* stream);
+    std::uint32_t width, std::uint32_t outputs, void* stream,
+    GdnKnownWindowRowsProbeMode mode = GdnKnownWindowRowsProbeMode::rows);
 #endif
 
 void register_hip_gdn_kernel_variant(
