@@ -14,6 +14,8 @@ struct KnownPrefillRequest {
     bool router_rows=false,combine_inject_rows=false;
     // Rows HC mixers and QSA rows in 8-row tiles.
     bool rows_hyper_mix=false,qsa_rows=false;
+    // PLE rows from host-staged lookups (all T rows chained, see HipPleKnownWindow prefill).
+    bool rows_ple=false;
 };
 struct CompiledKnownPrefixPrefill {
     std::uint32_t logical_rows=0;

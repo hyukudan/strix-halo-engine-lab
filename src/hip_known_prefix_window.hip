@@ -337,6 +337,16 @@ struct HipKnownPrefixWindow::Impl {
                     const auto& self=*static_cast<Impl*>(object);
                     hyper_mix_known_prefill_rows_launch(rows,self.hyper_for(rows));
                 }});
+        // STRIX_PREFILL_FULL_PLE=0: PLE lookups and projections per 8-row tile (each tile still chains the history).
+        static const bool ple=[]{const char* v=std::getenv("STRIX_PREFILL_FULL_PLE");return !v||v[0]!='0';}();
+        if(ple&&window.ple_rows_steps)
+            prefill_entries.push_back({KnownWindowR2Variant::ple_rows_host_staged_v1,this,
+                [](std::span<const ExecutionDispatchContext> rows,void* object) {
+                    static_cast<Impl*>(object)->ple_window->preflight(rows);
+                },
+                [](std::span<const ExecutionDispatchContext> rows,void* object) {
+                    static_cast<Impl*>(object)->ple_window->launch(rows);
+                }});
         // STRIX_PREFILL_FULL_SHARED=0: keep the shared expert in 8-row tiles.
         static const bool shared=[]{const char* v=std::getenv("STRIX_PREFILL_FULL_SHARED");return !v||v[0]!='0';}();
         if(shared&&!shared_config.known_window_a8_projections)
@@ -528,7 +538,8 @@ struct HipKnownPrefixWindow::Impl {
                 }});
         }
         if(window.ple_rows_steps) {
-            ple_window=std::make_unique<HipPleKnownWindow>(model,config.activation,window.logical_rows);
+            ple_window=prefill ? std::make_unique<HipPleKnownWindow>(model,config.activation,prefill->logical_rows,true) :
+                std::make_unique<HipPleKnownWindow>(model,config.activation,window.logical_rows);
             rows_entries.push_back({KnownWindowR2Variant::ple_rows_host_staged_v1,this,
                 [](std::span<const ExecutionDispatchContext> rows,void* object) {
                     static_cast<Impl*>(object)->ple_window->preflight(rows);

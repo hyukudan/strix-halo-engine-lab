@@ -2935,7 +2935,7 @@ int STRIX_DECODE_ENTRY(
                      options.known_prefix_output_policy, options.known_prefill_workspace_budget, options.known_prefill_metadata_budget / 2U,
                      options.known_window_router_rows || options.known_prefix_full_rows,
                      options.known_window_router_rows || options.known_prefix_full_rows,
-                     options.known_prefix_full_rows, options.known_prefix_full_rows}));
+                     options.known_prefix_full_rows, options.known_prefix_full_rows, options.known_prefix_full_rows}));
                 known_prefix_plan = known_prefill_plan->tile8; // selection ledger, never a relabelled T forward
             } else {
                 const bool full = options.known_prefix_full_rows;

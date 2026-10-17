@@ -2011,6 +2011,7 @@ register_for_compiled_execution(
 struct HipPleKnownWindow::Impl {
     HipPleLauncherConfig config;
     std::uint32_t max_rows = 0, rows = 0, slot = 0;
+    bool prefill = false;
     std::uint64_t stride = 0, conv_bytes = 0;
     std::array<std::byte*, 2> staging{};
     std::array<hipEvent_t, 2> released{};
@@ -2027,13 +2028,14 @@ struct HipPleKnownWindow::Impl {
     }
     // Key and value projections of all rows, each Q8 weight block read once (the per-row
     // wave8 arithmetic). False when a projection is not wave8 Q8: rows project one by one.
-    bool project_rows(const PreparedPleLaunch& p, const std::uint16_t* gathered, std::uint32_t count) const {
+    bool project_rows(const PreparedPleLaunch& p, const std::uint16_t* gathered, std::uint32_t count, std::uint32_t first = 0U) const {
         const auto width = static_cast<std::uint32_t>(config.model.ple_embed_dim);
         if (weight_kind(p.tensors.key.manifest->ggml_type) != WeightKind::q8_0 ||
             weight_kind(p.tensors.value.manifest->ggml_type) != WeightKind::q8_0 || width % 32U) return false;
         const auto expanded = static_cast<std::uint32_t>(p.expanded), hidden = static_cast<std::uint32_t>(config.model.hidden_size);
         const auto in_stride = static_cast<std::uint32_t>(stride / sizeof(std::uint16_t));
-        float* keys = projections; float* values = projections + static_cast<std::uint64_t>(max_rows) * expanded;
+        float* keys = projections + static_cast<std::uint64_t>(first) * expanded;
+        float* values = projections + static_cast<std::uint64_t>(max_rows) * expanded + static_cast<std::uint64_t>(first) * hidden;
         const auto launch = [&](auto rows) {
             constexpr unsigned R = decltype(rows)::value;
             hipLaunchKernelGGL(HIP_KERNEL_NAME(project_wave8_q8_bf16_to_fp32_rows_kernel<R>), dim3((expanded + 7U) / 8U), dim3(256), 0,
@@ -2090,10 +2092,13 @@ struct HipPleKnownWindow::Impl {
     }
 };
 
-HipPleKnownWindow::HipPleKnownWindow(const ModelContract& model, HipActivationStorage activation, std::uint32_t max_rows)
+HipPleKnownWindow::HipPleKnownWindow(const ModelContract& model, HipActivationStorage activation, std::uint32_t max_rows,
+    bool prefill)
     : impl_(std::make_unique<Impl>()) {
     auto& w = *impl_;
-    if (!max_rows || max_rows > 8U) throw std::invalid_argument("known-window PLE supports one to eight rows");
+    if (!max_rows || max_rows > (prefill ? 2048U : 8U))
+        throw std::invalid_argument("known-window PLE supports one to eight rows (prefill: up to 2048)");
+    w.prefill = prefill;
     w.config.model = model; w.config.activation = activation; validate_config(w.config);
     w.max_rows = max_rows;
     w.stride = PleHashContract::maximum_heads * 512ULL;
@@ -2106,7 +2111,7 @@ HipPleKnownWindow::HipPleKnownWindow(const ModelContract& model, HipActivationSt
         check_hip(hipEventCreateWithFlags(&w.released[i], hipEventDisableTiming), "known-window PLE staging event");
     }
     void* snap = nullptr;
-    check_hip(hipMalloc(&snap, w.conv_bytes * max_rows), "known-window PLE convolution snapshots");
+    check_hip(hipMalloc(&snap, w.conv_bytes * (prefill ? 1U : max_rows)), "known-window PLE convolution snapshots");
     w.snapshots = static_cast<std::byte*>(snap);
     void* projections = nullptr;
     check_hip(hipMalloc(&projections, sizeof(float) * max_rows * model.hidden_size * (model.hc_count + 1ULL)),
@@ -2170,7 +2175,15 @@ void HipPleKnownWindow::launch(std::span<const ExecutionDispatchContext> rows) {
     void* device = nullptr;
     check_hip(hipHostGetDevicePointer(&device, staging, 0), "known-window PLE staging device view");
     const auto stream = hip_execution_stream();
-    const bool projected = w.project_rows(prepared[0], static_cast<const std::uint16_t*>(device), static_cast<std::uint32_t>(rows.size()));
+    bool projected = true;
+    if (w.prefill) {
+        // Eight-row projection groups over all rows (the window path's arithmetic per row).
+        for (std::uint32_t first = 0; first < rows.size() && projected; first += 8U) {
+            const auto count = std::min<std::uint32_t>(8U, static_cast<std::uint32_t>(rows.size()) - first);
+            projected = w.project_rows(prepared[first], reinterpret_cast<const std::uint16_t*>(static_cast<std::byte*>(device) +
+                first * w.stride), count, first);
+        }
+    } else projected = w.project_rows(prepared[0], static_cast<const std::uint16_t*>(device), static_cast<std::uint32_t>(rows.size()));
     const auto expanded = prepared[0].expanded, hidden = w.config.model.hidden_size;
     for (std::size_t r = 0; r < rows.size(); ++r) {
         auto* gathered = reinterpret_cast<std::uint16_t*>(static_cast<std::byte*>(device) + r * w.stride);
@@ -2178,6 +2191,7 @@ void HipPleKnownWindow::launch(std::span<const ExecutionDispatchContext> rows) {
             enqueue_ple_device(prepared[r], gathered, w.projections + r * expanded,
                 w.projections + w.max_rows * expanded + r * hidden);
         else enqueue_ple_device(prepared[r], gathered);
+        if (w.prefill) continue;
         check_hip(hipMemcpyAsync(w.snapshots + r * w.conv_bytes, reinterpret_cast<const void*>(prepared[r].conv_state.address),
             w.conv_bytes, hipMemcpyDeviceToDevice, stream), "known-window PLE convolution snapshot");
     }
@@ -2185,9 +2199,17 @@ void HipPleKnownWindow::launch(std::span<const ExecutionDispatchContext> rows) {
     w.recorded[w.slot] = true;
     w.rows = static_cast<std::uint32_t>(rows.size());
     w.conv_address = prepared[0].conv_state.address; w.ngram_address = prepared[0].ngram_state.address;
+    if (w.prefill) {
+        // Every prefill row is kept: the convolution state already is the last row's; publish its history.
+        const auto& hash = w.hashes[rows.size() - 1U];
+        std::memcpy(reinterpret_cast<void*>(w.ngram_address), hash.next_context.data(),
+            static_cast<std::size_t>(hash.context_count) * sizeof(std::uint32_t));
+        w.rows = 0;
+    }
 }
 
 void HipPleKnownWindow::commit(std::uint32_t n_keep, void* stream) {
+    if (impl_->prefill) throw std::logic_error("prefill PLE rows publish their history in launch()");
     auto& w = *impl_;
     if (!w.rows || !n_keep || n_keep > w.rows) throw std::invalid_argument("known-window PLE commit outside the last window");
     if (n_keep < w.rows)
