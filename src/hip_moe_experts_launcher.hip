@@ -2380,8 +2380,9 @@ hipStream_t known_moe_rows_stream() {
     require_q51_slot_eager_stream(scope->stream);
     return scope->stream;
 }
+// striped_weights: the caller checks the row stripes against every weight tensor once.
 KnownMoeRowsPrepared prepare_known_moe_rows(std::span<const ExecutionDispatchContext> rows,
-    const HipMoeExpertsLauncherConfig& config, const q51_known_rows::Workspace& extra) {
+    const HipMoeExpertsLauncherConfig& config, const q51_known_rows::Workspace& extra, bool striped_weights = false) {
     if (rows.size() != 2U && rows.size() != 4U && rows.size() != 8U)
         throw std::invalid_argument("known-window routed rows require R2/R4/R8");
     const auto layout = q51_known_rows::scratch_layout(static_cast<std::uint32_t>(rows.size()),
@@ -2505,7 +2506,7 @@ KnownMoeRowsPrepared prepare_known_moe_rows(std::span<const ExecutionDispatchCon
     disjoint(csr_range, {memory.arena_base, memory.arena_bytes});
     const auto& d1 = current_hip_launch_context()->deferred_moe_status;
     disjoint(csr_range, {d1.arena_base, d1.arena_bytes});
-    for (const auto& weight : first.resources->model_weights->tensors) {
+    if (!striped_weights) for (const auto& weight : first.resources->model_weights->tensors) {
         if (!weight.address || !weight.bytes) continue;
         known_moe_range({weight.address, weight.bytes});
         disjoint(csr_range, {weight.address, weight.bytes});
@@ -2650,13 +2651,13 @@ KnownMoePrefillPrepared prepare_known_moe_prefill(std::span<const ExecutionDispa
         throw std::invalid_argument("known prefill routed rows require the A8 down profile");
     // Every view a kernel touches, per row; checked to be row 0 plus r * stride.
     enum View : unsigned { input, routes, route_weights, codes, deltas, sums, status, intermediates, accumulation,
-        down_codes, down_deltas, down_sums, rawdots, output, view_count };
+        down_codes, down_deltas, down_sums, rawdots, output, temporary, view_count };
     std::vector<std::array<std::uintptr_t, view_count>> address(count);
     std::array<std::uint64_t, view_count> extent{};
     KnownMoePrefillPrepared out;
     for (std::uint32_t chunk = 0; chunk < count; chunk += 8U) {
         // Window admission of each 8-row chunk (positions consecutive inside the chunk).
-        const auto p = prepare_known_moe_rows(rows.subspan(chunk, 8U), config, window);
+        const auto p = prepare_known_moe_rows(rows.subspan(chunk, 8U), config, window, true);
         if (chunk && rows[chunk].position != rows[chunk - 1U].position + 1U)
             throw std::invalid_argument("known prefill routed rows positions are not consecutive");
         for (std::uint32_t i = 0; i < 8U; ++i) {
@@ -2670,7 +2671,8 @@ KnownMoePrefillPrepared prepare_known_moe_prefill(std::span<const ExecutionDispa
                 moe_q4k_a8::DeviceBytes{e.hidden.address, e.hidden.bytes}, {e.route_indices.address, e.route_indices.bytes},
                 {e.route_weights.address, e.route_weights.bytes}, b.codes, b.deltas, b.sums, b.status, b.output,
                 {reinterpret_cast<std::uintptr_t>(p.device.accumulation[i]), q.layout.accumulation_bytes},
-                d.codes, d.deltas, d.sums, d.rawdots, {e.output.address, e.output.bytes}};
+                d.codes, d.deltas, d.sums, d.rawdots, {e.output.address, e.output.bytes},
+                {e.temporary.address, e.temporary.bytes}};
             for (unsigned v = 0; v < view_count; ++v) {
                 if (chunk + i && views[v].bytes != extent[v])
                     throw std::invalid_argument("known prefill routed rows view extent differs across rows");
@@ -2717,7 +2719,20 @@ KnownMoePrefillPrepared prepare_known_moe_prefill(std::span<const ExecutionDispa
     disjoint({window.memory.arena_base, window.memory.arena_bytes});
     const auto& d1 = current_hip_launch_context()->deferred_moe_status;
     disjoint({d1.arena_base, d1.arena_bytes});
-    for (const auto& weight : first.resources->model_weights->tensors) if (weight.address) disjoint({weight.address, weight.bytes});
+    // The chunks skipped their weight scan: the writable stripes (BF16 output and the
+    // temporary holding every other written view) of all T rows against each tensor.
+    const std::array<KnownMoeRange, 2> stripes{
+        KnownMoeRange{address[0][output], (count - 1U) * stride[output] + extent[output]},
+        KnownMoeRange{address[0][temporary], (count - 1U) * stride[temporary] + extent[temporary]}};
+    const KnownMoeRange window_csr{window.memory.arena_base, window.memory.arena_bytes};
+    for (const auto& weight : first.resources->model_weights->tensors) {
+        if (!weight.address || !weight.bytes) continue;
+        const KnownMoeRange w{weight.address, weight.bytes};
+        known_moe_range(w); disjoint(w);
+        if (known_moe_overlap(window_csr, w)) throw std::invalid_argument("known prefill routed rows window CSR aliases weights");
+        for (const auto& stripe : stripes) if (known_moe_overlap(stripe, w))
+            throw std::invalid_argument("known prefill routed rows writable stripe aliases weights");
+    }
     if (const auto* state = first.resources->session_state_memory) {
         disjoint({state->host_base, state->host_bytes}); disjoint({state->device_base, state->device_bytes});
     }
