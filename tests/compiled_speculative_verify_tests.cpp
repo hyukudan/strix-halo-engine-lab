@@ -1160,6 +1160,61 @@ void known_window_routed_union_compiler_tests(const strix::ModelContract& model)
     }
 }
 
+void known_window_router_rows_compiler_tests(const strix::ModelContract& model) {
+    using V=strix::KnownWindowR2Variant;
+    using M=strix::KnownWindowStepMode;
+    auto fixture=make_known_fixture(model);
+    for(std::size_t i=0;i<fixture.serial.execution.steps.size();++i) {
+        const auto op=fixture.serial.execution.steps[i].op;
+        auto& id=fixture.serial.bindings.bindings[i].kernel_id;
+        if(op==strix::SerialOp::moe_route) id="hip.moe_route.bf16.h2560.e512.k10.r1.c1.staged_logits.wave.parallel";
+        else if(op==strix::SerialOp::attn_inject || op==strix::SerialOp::mlp_inject) id="hip.inject.bf16.h2560.hc4.r1.c1";
+        else if(op==strix::SerialOp::moe_combine) id="hip.moe_combine.bf16.h2560.hc4.r1.c1";
+    }
+    const auto reject=[&](auto&& operation,const char* message) {
+        bool rejected=false;try{operation();}catch(const std::invalid_argument&){rejected=true;}expect(rejected,message);
+    };
+    for(const std::uint32_t rows:{2U,4U,8U}) {
+        strix::KnownWindowRequest request{true,true,true,rows,false};
+        const auto off=strix::compile_known_prefix_window(model,fixture.serial,fixture.manifest,fixture.access,request);
+        request.router_rows=true;request.combine_inject_rows=true;
+        const auto on=strix::compile_known_prefix_window(model,fixture.serial,fixture.manifest,fixture.access,request);
+        expect(off.router_rows_steps==0U && off.combine_inject_rows_steps==0U && on.router_rows_steps==48U &&
+            on.combine_inject_rows_steps==48U+48U+47U && on.row_loop_steps+48U+143U==off.row_loop_steps &&
+            on.window_execution_identity!=off.window_execution_identity &&
+            on.window_kernel_plan_identity!=off.window_kernel_plan_identity,
+            "router/combine/inject rows are explicit and carry distinct whole-window identities");
+        std::size_t route=0,inject=0;
+        for(std::size_t i=0;i<on.mode.size();++i) {
+            const auto& step=fixture.serial.execution.steps[i];
+            if(step.op==strix::SerialOp::moe_route) {
+                route=i;expect(on.mode[i]==M::moe_route_rows && on.r2_variant[i]==V::moe_route_rows_v1,"router rows variant");
+            } else if(step.op==strix::SerialOp::moe_combine)
+                expect(on.mode[i]==M::moe_combine_rows && on.r2_variant[i]==V::moe_combine_rows_v1,"combine rows variant");
+            else if(step.op==strix::SerialOp::attn_inject || step.op==strix::SerialOp::mlp_inject) {
+                const bool tap=step.op==strix::SerialOp::mlp_inject && *step.layer+1U==model.hidden_layers;
+                expect(on.mode[i]==(tap?M::r1_row_loop:M::inject_rows) &&
+                    on.r2_variant[i]==(tap?V::none:V::inject_rows_v1),"inject rows keep the MTP-observed last MLP inject");
+                if(!tap) inject=i;
+            }
+        }
+        strix::validate_known_prefix_window_formats(on,fixture.serial,fixture.manifest,fixture.access);
+        auto changed=on;++changed.router_rows_steps;
+        reject([&]{strix::validate_compiled_known_prefix_window(changed,fixture.serial);},"forged router rows counter rejects");
+        changed=on;changed.r2_variant[route]=V::inject_rows_v1;
+        reject([&]{strix::validate_compiled_known_prefix_window(changed,fixture.serial);},"wrong router rows variant rejects");
+        changed=on;changed.mode[inject]=M::moe_combine_rows;changed.r2_variant[inject]=V::moe_combine_rows_v1;
+        reject([&]{strix::validate_compiled_known_prefix_window(changed,fixture.serial);},"inject cannot pose as combine");
+    }
+    auto serial_router=fixture;
+    for(std::size_t i=0;i<serial_router.serial.execution.steps.size();++i)
+        if(serial_router.serial.execution.steps[i].op==strix::SerialOp::moe_route)
+            serial_router.serial.bindings.bindings[i].kernel_id="hip.moe_route.bf16.h2560.e512.k10.r1.c1";
+    strix::KnownWindowRequest request{true,true,true,4U,false};request.router_rows=true;
+    expect(strix::compile_known_prefix_window(model,serial_router.serial,serial_router.manifest,serial_router.access,
+        request).router_rows_steps==0U,"non-parallel router binding keeps its row loop");
+}
+
 void known_window_tests(const strix::ModelContract& model) {
     const auto fixture = make_known_fixture(model);
     const auto off = strix::compile_known_prefix_window(model, fixture.serial, fixture.manifest, fixture.access);
@@ -1668,6 +1723,7 @@ int main() {
     expect(deferred_rejected,"deferred MoE explicitly rejects speculative verification");
 
     known_window_routed_union_compiler_tests(model);
+    known_window_router_rows_compiler_tests(model);
     known_window_routed_union_runtime_tests(model);
     known_window_tests(model);
     known_window_runtime_tests(model);
