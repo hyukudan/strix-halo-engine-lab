@@ -138,7 +138,7 @@ void gdn_known_window_r2_projection_probe(GdnKnownWindowProjectionDirection,
     GdnKnownWindowProjectionMode, std::span<const GdnKnownWindowProjectionView, 2> input,
     GdnKnownWindowProjectionView weights, std::span<const GdnKnownWindowProjectionView, 2> output,
     std::uint32_t width, std::uint32_t outputs, void* stream);
-// T = 1/2/4/8 rows: the q8_rows engine (exact or A8) or the R1 kernel per row.
+// T = 1..8 rows: the q8_rows engine (exact or A8) or the R1 kernel per row.
 enum class GdnKnownWindowRowsProbeMode { rows, rows_a8, row_loop };
 void gdn_known_window_rows_projection_probe(GdnKnownWindowProjectionDirection,
     std::span<const GdnKnownWindowProjectionView> input, GdnKnownWindowProjectionView weights,

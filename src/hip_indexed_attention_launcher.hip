@@ -3232,57 +3232,6 @@ __device__ __forceinline__ unsigned qsa_rows_matrix(const QsaRowsInputViews<Rows
     return m;
 }
 
-template <unsigned Rows>
-__global__ __launch_bounds__(32)
-void linear_prefetch8_q8_qsa_input_rows_kernel(QsaRowsInputViews<Rows> views, std::uint32_t input_width) {
-    if (blockIdx.x >= views.first[views.count]) return;
-    std::uint32_t row = 0;
-    const auto m = qsa_rows_matrix(views, blockIdx.x, row);
-    const auto lane = static_cast<std::uint32_t>(threadIdx.x);
-    float partial[Rows][8]{};
-    const auto* blocks = static_cast<const Q8Block*>(views.weights[m]) +
-        static_cast<std::uint64_t>(row) * (input_width / 32U);
-    for (std::uint64_t chunk = 0; chunk < input_width; chunk += 256U) {
-        const auto base = chunk + 8U * lane;
-        if (base < input_width) {
-            const auto feature = static_cast<std::uint32_t>(base);
-            const auto& block = blocks[feature / 32U];
-            std::int8_t codes[8];
-#pragma unroll
-            for (unsigned local = 0; local < 8; ++local) codes[local] = block.values[feature % 32U + local];
-            const float scale = __half2float(block.scale);
-#pragma unroll
-            for (unsigned r = 0; r < Rows; ++r) {
-                std::uint16_t bits[8];
-#pragma unroll
-                for (unsigned local = 0; local < 8; ++local) bits[local] = views.input[r][feature + local];
-#pragma unroll
-                for (unsigned local = 0; local < 8; ++local)
-                    partial[r][local] += bf16_to_float(bits[local]) * (scale * static_cast<float>(codes[local]));
-            }
-        }
-    }
-#pragma unroll
-    for (unsigned r = 0; r < Rows; ++r) {
-#pragma unroll
-        for (unsigned distance = 16; distance > 0; distance /= 2) {
-#pragma unroll
-            for (unsigned local = 0; local < 8; ++local) {
-                const auto partner = __shfl_down(partial[r][local], distance, 32);
-                if (lane < distance) partial[r][local] = qsa_input_legacy_tree_add(partial[r][local], partner);
-            }
-        }
-        if (lane == 0) {
-            auto* p = partial[r];
-            p[0] = qsa_input_legacy_tree_add(p[0], p[4]); p[1] = qsa_input_legacy_tree_add(p[1], p[5]);
-            p[2] = qsa_input_legacy_tree_add(p[2], p[6]); p[3] = qsa_input_legacy_tree_add(p[3], p[7]);
-            p[0] = qsa_input_legacy_tree_add(p[0], p[2]); p[1] = qsa_input_legacy_tree_add(p[1], p[3]);
-            p[0] = qsa_input_legacy_tree_add(p[0], p[1]);
-            views.output[m][r][row] = round_bf16(p[0]);
-        }
-    }
-}
-
 // q8_rows sites of the C1 prefetch8 input and wave8 output kernels: the same
 // C++ coefficient/FMA expressions and upper-src0 tree additions, per row.
 __device__ __forceinline__ float qsa_rows_tree_add(float lower, float upper) {

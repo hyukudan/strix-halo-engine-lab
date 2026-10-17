@@ -17,7 +17,7 @@
 #include <string>
 #include <vector>
 
-// q8_rows engine sites against their R1 kernels, T = 1/2/4/8: bitwise payloads
+// q8_rows engine sites against their R1 kernels, T = 1..8: bitwise payloads
 // (real and edge shapes, edge values), A8 error against the exact path, and with
 // STRIX_Q8_ROWS_BENCH=1 warm/cold timings at the model shapes.
 namespace {
@@ -254,6 +254,13 @@ int main() try {
                 exact_case(stream, site, rows, 6144U, 9U, 2U, cases);
                 exact_case(stream, site, rows, 2400U, 5003U, 2U, cases);
             }
+        }
+    // The deferred GDN window also runs 3/5/6/7 rows (padded reduction trees).
+    for (const auto site : {Site::gdn_input, Site::gdn_output})
+        for (const unsigned rows : {3U, 5U, 6U, 7U}) {
+            const auto [width, outputs] = model_shape(site);
+            exact_case(stream, site, rows, width, outputs, 4U, cases);
+            for (const std::uint32_t w : {96U, 640U}) for (const std::uint32_t o : {7U, 33U}) exact_case(stream, site, rows, w, o, 2U, cases);
         }
     std::cout << "q8_rows exact payloads equal the R1 kernels bitwise: " << cases << " cases\n";
     for (const auto site : sites)

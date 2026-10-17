@@ -19,6 +19,7 @@
 // block to int8 with a float scale in LDS; each lane owns whole Q8 blocks (one
 // dot4 chain per row) and outputs/rows are reduced with a fixed tree.
 //
+// T may be any count up to 8 (3/5/6/7 pad the tree to a power of two).
 // A Site supplies Input (uint16_t BF16 or float), rows, input[], segments,
 // width, outputs, the coefficient/fma/add arithmetic of its R1 kernel and
 // store(out, row, value); it may override outs, a8_outs and prefetch. The
@@ -73,6 +74,8 @@ template <class Site, bool Staged> constexpr unsigned prefetch_of() {
     if constexpr (requires { Site::prefetch; }) return Site::prefetch; else return narrow_bf16<Site, Staged>() ? 1U : 2U;
 }
 constexpr unsigned log2u(unsigned v) { return v <= 1U ? 0U : 1U + log2u(v / 2U); }
+// Trees reduce a power-of-two number of (output, row) pairs; spare pairs stay zero.
+constexpr unsigned pow2u(unsigned v) { return v <= 1U ? 1U : 2U * pow2u((v + 1U) / 2U); }
 
 __device__ __forceinline__ const unsigned char* segment_row(const Segments& s, std::uint32_t out, std::uint32_t width,
     unsigned& m, std::uint32_t& row) {
@@ -196,7 +199,7 @@ template <unsigned Outs> struct Q8Fetch {
 template <class Site, unsigned Outs, bool Staged>
 __global__ __launch_bounds__(kThreads) void project_rows_kernel(Site site) {
     using Input = typename Site::Input;
-    constexpr unsigned Rows = Site::rows, N = Outs * Rows * 8U, Depth = prefetch_of<Site, Staged>();
+    constexpr unsigned Rows = Site::rows, Pairs = Outs * Rows, N = pow2u(Pairs) * 8U, Depth = prefetch_of<Site, Staged>();
     const unsigned lane = threadIdx.x & 31U;
     const std::uint32_t width = site.width, groups = (site.outputs + Outs - 1U) / Outs;
     if constexpr (Staged) {
@@ -235,8 +238,8 @@ __global__ __launch_bounds__(kThreads) void project_rows_kernel(Site site) {
             }
         }
         reduce<Site, N, 8U>(v, lane);
-        store_pairs<Outs * Rows>(v[0], lane, [&](unsigned pair, float value) {
-            if (g * Outs + pair / Rows < site.outputs) site.store(g * Outs + pair / Rows, pair % Rows, value);
+        store_pairs<pow2u(Pairs)>(v[0], lane, [&](unsigned pair, float value) {
+            if (pair < Pairs && g * Outs + pair / Rows < site.outputs) site.store(g * Outs + pair / Rows, pair % Rows, value);
         });
     }
 }
@@ -261,7 +264,7 @@ template <unsigned Outs> struct A8Fetch {
 template <class Site, unsigned Outs>
 __global__ __launch_bounds__(kA8Threads) void project_rows_a8_kernel(Site site) {
     using Input = typename Site::Input;
-    constexpr unsigned Rows = Site::rows, N = Outs * Rows;
+    constexpr unsigned Rows = Site::rows, Pairs = Outs * Rows, N = pow2u(Pairs);
     const unsigned lane = threadIdx.x & 31U;
     const std::uint32_t width = site.width, blocks = width / 32U, groups = (site.outputs + Outs - 1U) / Outs;
     auto* codes = reinterpret_cast<std::int8_t*>(q8_rows_lds);
@@ -323,7 +326,7 @@ __global__ __launch_bounds__(kA8Threads) void project_rows_a8_kernel(Site site) 
         }
         reduce<PlainTree, N, 1U>(v, lane);
         store_pairs<N>(v[0], lane, [&](unsigned pair, float value) {
-            if (g * Outs + pair / Rows < site.outputs) site.store(g * Outs + pair / Rows, pair % Rows, value);
+            if (pair < Pairs && g * Outs + pair / Rows < site.outputs) site.store(g * Outs + pair / Rows, pair % Rows, value);
         });
     }
 }
