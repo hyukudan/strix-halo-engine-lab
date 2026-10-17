@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <limits>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -98,6 +99,45 @@ __global__ __launch_bounds__(threads) void greedy_output_finish(
         const auto best = values[0];
         *reply = Reply{epoch, position, best.token,
                        best.bad | (best.valid ? 0U : 2U), execution_identity};
+    }
+}
+struct GreedyRowsViews { const float* logits[hip_greedy_rows_max]; };
+__global__ __launch_bounds__(threads) void greedy_rows_partials(
+    GreedyRowsViews views, std::uint32_t vocabulary, std::uint32_t count, Partial* partials) {
+    __shared__ Partial values[threads];
+    const auto lane = static_cast<unsigned>(threadIdx.x);
+    const auto index = static_cast<std::uint64_t>(blockIdx.x) * threads + lane;
+    const auto* logits = views.logits[blockIdx.y];
+    Partial value{0.0F, 0, 0, 0};
+    if (index < vocabulary) {
+        value.value = logits[index]; value.token = static_cast<std::uint32_t>(index);
+        value.bad = (__float_as_uint(value.value) & 0x7f800000U) == 0x7f800000U ? 1U : 0U;
+        value.valid = value.bad == 0 ? 1U : 0U;
+    }
+    values[lane] = value;
+    __syncthreads();
+    for (unsigned stride = threads / 2; stride; stride >>= 1U) {
+        if (lane < stride) values[lane] = choose(values[lane], values[lane + stride]);
+        __syncthreads();
+    }
+    if (!lane) partials[static_cast<std::uint64_t>(blockIdx.y) * count + blockIdx.x] = values[0];
+}
+__global__ __launch_bounds__(threads) void greedy_rows_finish(
+    const Partial* partials, std::uint32_t count, HipGreedyRowsReply* replies) {
+    __shared__ Partial values[threads];
+    const auto lane = static_cast<unsigned>(threadIdx.x);
+    const auto* row = partials + static_cast<std::uint64_t>(blockIdx.x) * count;
+    Partial value{0.0F, 0, 0, 0};
+    for (std::uint64_t i = lane; i < count; i += threads) value = choose(value, row[i]);
+    values[lane] = value;
+    __syncthreads();
+    for (unsigned stride = threads / 2; stride; stride >>= 1U) {
+        if (lane < stride) values[lane] = choose(values[lane], values[lane + stride]);
+        __syncthreads();
+    }
+    if (!lane) {
+        const auto best = values[0];
+        replies[blockIdx.x] = HipGreedyRowsReply{best.token, best.bad | (best.valid ? 0U : 2U)};
     }
 }
 void check(hipError_t result, const char* operation) {
@@ -292,4 +332,35 @@ std::uint32_t HipGreedyOutput::complete() { return impl_->complete(); }
 HipGreedyOutputStats HipGreedyOutput::stats() const noexcept { return impl_->counters; }
 bool HipGreedyOutput::failed() const noexcept { return impl_->broken; }
 std::uint64_t HipGreedyOutput::scratch_bytes() const noexcept { return required_scratch_bytes(impl_->vocabulary); }
+std::uint64_t hip_greedy_rows_scratch_bytes(std::uint32_t rows, std::uint32_t vocabulary) {
+    require(rows && rows <= hip_greedy_rows_max && vocabulary, "GPU greedy rows require 1..8 rows and a nonzero vocabulary");
+    return static_cast<std::uint64_t>(rows) * ((static_cast<std::uint64_t>(vocabulary) - 1U) / threads + 1U) * sizeof(Partial);
+}
+void enqueue_hip_greedy_rows(std::span<const ExecutionBufferAddress> logits, std::uint32_t vocabulary,
+    ExecutionBufferAddress partials, HipGreedyRowsReply* replies, void* stream) {
+    const auto rows = static_cast<std::uint32_t>(logits.size());
+    const auto bytes = hip_greedy_rows_scratch_bytes(rows, vocabulary);
+    require(replies && partials.address && partials.address % alignof(Partial) == 0 && partials.bytes >= bytes,
+        "GPU greedy rows scratch/reply views are invalid");
+    GreedyRowsViews views{};
+    for (std::uint32_t r = 0; r < rows; ++r) {
+        const auto& view = logits[r];
+        require(view.address && view.address % alignof(float) == 0 &&
+            view.bytes >= static_cast<std::uint64_t>(vocabulary) * sizeof(float) &&
+            !overlaps(view.address, view.bytes, reinterpret_cast<const void*>(partials.address), bytes),
+            "GPU greedy rows logits span is invalid or aliases its scratch");
+        views.logits[r] = reinterpret_cast<const float*>(view.address);
+    }
+    void* device_replies = nullptr;
+    check(hipHostGetDevicePointer(&device_replies, replies, 0), "GPU greedy rows replies must be host-mapped");
+    const auto count = static_cast<std::uint32_t>((static_cast<std::uint64_t>(vocabulary) - 1U) / threads + 1U);
+    const auto queue = reinterpret_cast<hipStream_t>(stream);
+    auto* scratch = reinterpret_cast<Partial*>(partials.address);
+    check(hipPeekAtLastError(), "GPU greedy rows preexisting HIP error");
+    hipLaunchKernelGGL(greedy_rows_partials, dim3(count, rows), dim3(threads), 0, queue, views, vocabulary, count, scratch);
+    check(hipGetLastError(), "submit greedy rows partials");
+    hipLaunchKernelGGL(greedy_rows_finish, dim3(rows), dim3(threads), 0, queue, scratch, count,
+        static_cast<HipGreedyRowsReply*>(device_replies));
+    check(hipGetLastError(), "submit greedy rows finish");
+}
 } // namespace strix

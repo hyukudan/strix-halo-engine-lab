@@ -5,6 +5,7 @@
 #include "strix/launch_dispatch.hpp"
 
 #include <cstdint>
+#include <span>
 #include <string>
 
 namespace strix {
@@ -55,6 +56,16 @@ public:
 private:
     HipLmHeadLauncherConfig config_;
 };
+
+// Known-window terminal head for T=2..8 rows. Each context is the row's own R1
+// head dispatch; the configured eager prefetch BF16/Q8_0 head reads every weight
+// block once and keeps each row's R1 leaf/tree arithmetic, so every row's logits
+// equal its R1 launch bitwise. All rows share one head tensor; outputs are disjoint.
+inline constexpr std::uint32_t lm_head_window_max_rows = 8;
+void lm_head_known_window_rows_preflight(std::span<const ExecutionDispatchContext> rows,
+    const HipLmHeadLauncherConfig& config);
+void lm_head_known_window_rows_launch(std::span<const ExecutionDispatchContext> rows,
+    const HipLmHeadLauncherConfig& config);
 
 // Source-only native MTP entry points; qualification is separate.
 struct MtpNativeContext;
