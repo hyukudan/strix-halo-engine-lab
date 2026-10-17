@@ -1908,6 +1908,75 @@ void known_shared_rows_enqueue(const KnownSharedR2Views& views, hipStream_t stre
 }
 } // namespace
 
+namespace {
+// Prefill: all T rows of a shared-expert step. Every 8-row tile passes the window admission and
+// the tiles must continue the tile's own row strides, so the T rows are one strided view. The
+// Q8 projections run 64 (then 32/16/8) rows per launch with the R1-exact wide q8_rows sites and
+// the activation/scalar kernel covers all T rows.
+KnownSharedR2Views known_shared_prefill_views(std::span<const ExecutionDispatchContext> rows,
+    const HipSharedExpertLauncherConfig& config) {
+    if (rows.size() < 16U || rows.size() % 8U || rows.size() > 65535U)
+        throw std::invalid_argument("known shared prefill rows require 8-row tiles");
+    if (config.known_window_a8_projections) throw std::invalid_argument("known shared prefill rows are not A8");
+    auto views = known_shared_rows_views(rows.first(8U), config);
+    const auto& s = views.shape;
+    for (std::size_t t = 1; t < rows.size() / 8U; ++t) {
+        const auto tile = known_shared_rows_views(rows.subspan(t * 8U, 8U), config);
+        const auto rows_before = static_cast<std::uint64_t>(t) * 8U;
+        if (tile.shape.input_stride_bytes != s.input_stride_bytes || tile.shape.output_stride_bytes != s.output_stride_bytes ||
+            tile.shape.workspace_stride_bytes != s.workspace_stride_bytes ||
+            tile.input.address != views.input.address + rows_before * s.input_stride_bytes ||
+            tile.output.address != views.output.address + rows_before * s.output_stride_bytes ||
+            tile.workspace.address != views.workspace.address + rows_before * s.workspace_stride_bytes ||
+            tile.weights.gate_q8.address != views.weights.gate_q8.address || tile.weights.up_q8.address != views.weights.up_q8.address ||
+            tile.weights.down_q8.address != views.weights.down_q8.address ||
+            tile.weights.shared_gate_f32.address != views.weights.shared_gate_f32.address)
+            throw std::invalid_argument("known shared prefill tiles are not one strided view");
+    }
+    return views;
+}
+void known_shared_prefill_enqueue(std::span<const ExecutionDispatchContext> rows, const KnownSharedR2Views& views,
+    hipStream_t stream, const HipSharedExpertLauncherConfig& config) {
+    const auto& s = views.shape;
+    const auto at = [&](std::uint64_t r) {
+        auto v = views;
+        v.input.address += r * s.input_stride_bytes; v.output.address += r * s.output_stride_bytes;
+        v.workspace.address += r * s.workspace_stride_bytes;
+        return v;
+    };
+    const auto each_width = [&](bool down) {
+        for (std::uint64_t r = 0; r < rows.size();) {
+            const auto left = rows.size() - r;
+            if (left >= 64U) { known_shared_engine_projection<64U>(down, at(r), stream, config); r += 64U; }
+            else if (left >= 32U) { known_shared_engine_projection<32U>(down, at(r), stream, config); r += 32U; }
+            else if (left >= 16U) { known_shared_engine_projection<16U>(down, at(r), stream, config); r += 16U; }
+            else { known_shared_engine_projection<8U>(down, at(r), stream, config); r += 8U; }
+        }
+    };
+    each_width(false);
+    hipLaunchKernelGGL(rows_shared_activation_scalar_kernel,
+        dim3((config.intermediate_size + kThreads - 1U) / kThreads, static_cast<unsigned>(rows.size())),
+        dim3(kThreads), 0, stream, views.workspace.address, s.workspace_stride_bytes, views.input.address,
+        s.input_stride_bytes, reinterpret_cast<const void*>(views.weights.shared_gate_f32.address),
+        config.intermediate_size, config.hidden_size);
+    check_hip(hipGetLastError(), "known shared prefill activation/scalar launch");
+    each_width(true);
+}
+} // namespace
+
+void shared_expert_known_prefill_rows_preflight(std::span<const ExecutionDispatchContext> rows,
+    const HipSharedExpertLauncherConfig& config) {
+    static_cast<void>(known_shared_prefill_views(rows, config));
+    static_cast<void>(known_shared_rows_stream());
+}
+void shared_expert_known_prefill_rows_launch(std::span<const ExecutionDispatchContext> rows,
+    const HipSharedExpertLauncherConfig& config) {
+    const auto views = known_shared_prefill_views(rows, config);
+    const auto stream = known_shared_rows_stream();
+    check_hip(hipPeekAtLastError(), "known shared prefill stale launch error");
+    known_shared_prefill_enqueue(rows, views, stream, config);
+}
+
 void shared_expert_known_window_rows_preflight(std::span<const ExecutionDispatchContext> rows,
     const HipSharedExpertLauncherConfig& config) {
     if (rows.size() == 2U) {

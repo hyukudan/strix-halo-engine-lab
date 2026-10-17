@@ -92,6 +92,11 @@ void shared_expert_known_window_rows_preflight(
 void shared_expert_known_window_rows_launch(
     std::span<const ExecutionDispatchContext> rows,
     const HipSharedExpertLauncherConfig& config);
+// Prefill: all T rows of a shared-expert step (8-row tiles of one strided view).
+void shared_expert_known_prefill_rows_preflight(std::span<const ExecutionDispatchContext> rows,
+    const HipSharedExpertLauncherConfig& config);
+void shared_expert_known_prefill_rows_launch(std::span<const ExecutionDispatchContext> rows,
+    const HipSharedExpertLauncherConfig& config);
 
 class HipSharedExpertLauncherBundle {
 public:

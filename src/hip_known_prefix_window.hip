@@ -337,6 +337,18 @@ struct HipKnownPrefixWindow::Impl {
                     const auto& self=*static_cast<Impl*>(object);
                     hyper_mix_known_prefill_rows_launch(rows,self.hyper_for(rows));
                 }});
+        // STRIX_PREFILL_FULL_SHARED=0: keep the shared expert in 8-row tiles.
+        static const bool shared=[]{const char* v=std::getenv("STRIX_PREFILL_FULL_SHARED");return !v||v[0]!='0';}();
+        if(shared&&!shared_config.known_window_a8_projections)
+            prefill_entries.push_back({KnownWindowR2Variant::shared_q8_virtual256_r8_v1,this,
+                [](std::span<const ExecutionDispatchContext> rows,void* object) {
+                    const auto& self=*static_cast<Impl*>(object);
+                    shared_expert_known_prefill_rows_preflight(rows,self.shared_for(rows.first(8U)));
+                },
+                [](std::span<const ExecutionDispatchContext> rows,void* object) {
+                    const auto& self=*static_cast<Impl*>(object);
+                    shared_expert_known_prefill_rows_launch(rows,self.shared_for(rows.first(8U)));
+                }});
         // STRIX_PREFILL_FULL_ROUTER=0: keep router rows in separate 8-row launches.
         static const bool router=[]{const char* v=std::getenv("STRIX_PREFILL_FULL_ROUTER");return !v||v[0]!='0';}();
         if(router)
