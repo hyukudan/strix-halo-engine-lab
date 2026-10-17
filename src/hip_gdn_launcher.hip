@@ -4167,21 +4167,57 @@ void enqueue_gdn_prefill_rows(const std::vector<std::array<GdnKnownWindowRow, 8U
     const auto stream = hip_execution_stream();
     const auto& first = tiles[0][0];
     const auto count = static_cast<std::uint32_t>(tiles.size() * 8U);
-    for (const auto& tile : tiles) {
-        GdnInputRowsSite<8U> in{};
+    // Q8 projections run W rows per launch (64/32/16, R1-exact wide q8_rows; each weight byte is
+    // read from DRAM about once per launch). STRIX_PREFILL_GDN_WIDE=8 keeps 8-row projections.
+    static const std::uint32_t wide_env = [] {
+        const char* v = std::getenv("STRIX_PREFILL_GDN_WIDE");
+        const int n = v ? std::atoi(v) : 64;
+        return n == 8 || n == 16 || n == 32 ? static_cast<std::uint32_t>(n) : 64U;
+    }();
+    const auto wide = config.known_window_a8_projections ? 8U : wide_env;
+    const auto project_in = [&]<std::uint32_t W>(std::size_t first_tile) {
+        GdnInputRowsSite<W> in{};
         in.segments = q8_rows::segments({{reinterpret_cast<const void*>(first.tensors.qkv.runtime->address), first.conv_width},
             {reinterpret_cast<const void*>(first.tensors.z.runtime->address), first.value_width}});
         in.width = first.hidden; in.outputs = first.conv_width + first.value_width;
+        for (unsigned r = 0; r < W; ++r) {
+            const auto& row = tiles[first_tile + r / 8U][r % 8U];
+            in.input[r] = reinterpret_cast<const void*>(row.input.address);
+            in.output[0][r] = row.workspace.qkv; in.output[1][r] = row.workspace.z;
+        }
+        q8_rows::launch(in, W == 8U && config.known_window_a8_projections, stream);
+        check_hip(hipGetLastError(), "GDN prefill Q8 input projection launch");
+    };
+    const auto project_out = [&]<std::uint32_t W>(std::size_t first_tile) {
+        GdnOutputRowsSite<W> out{};
+        out.segments = q8_rows::segments({{reinterpret_cast<const void*>(first.tensors.out.runtime->address), first.hidden}});
+        out.width = first.value_width; out.outputs = first.hidden;
+        for (unsigned r = 0; r < W; ++r) {
+            const auto& row = tiles[first_tile + r / 8U][r % 8U];
+            out.input[r] = row.workspace.core;
+            out.output[r] = reinterpret_cast<std::uint16_t*>(row.output.address);
+        }
+        q8_rows::launch(out, W == 8U && config.known_window_a8_projections, stream);
+        check_hip(hipGetLastError(), "GDN prefill Q8 output projection launch");
+    };
+    // Largest width that divides what is left, so every row runs exactly once.
+    const auto each_width = [&](auto&& project) {
+        for (std::size_t t = 0; t < tiles.size();) {
+            const auto left = (tiles.size() - t) * 8U;
+            if (wide >= 64U && left >= 64U) { project.template operator()<64U>(t); t += 8U; }
+            else if (wide >= 32U && left >= 32U) { project.template operator()<32U>(t); t += 4U; }
+            else if (wide >= 16U && left >= 16U) { project.template operator()<16U>(t); t += 2U; }
+            else { project.template operator()<8U>(t); t += 1U; }
+        }
+    };
+    each_width(project_in);
+    for (const auto& tile : tiles) {
         GdnWidePointers<8U> x{};
         GdnWindowRows<8U> gates{};
         for (unsigned r = 0; r < 8U; ++r) {
-            in.input[r] = reinterpret_cast<const void*>(tile[r].input.address);
-            in.output[0][r] = tile[r].workspace.qkv; in.output[1][r] = tile[r].workspace.z;
-            x.input[r] = in.input[r];
+            x.input[r] = reinterpret_cast<const void*>(tile[r].input.address);
             gates.beta[r] = tile[r].workspace.beta; gates.gate[r] = tile[r].workspace.gate;
         }
-        q8_rows::launch(in, config.known_window_a8_projections, stream);
-        check_hip(hipGetLastError(), "GDN prefill Q8 input projection launch");
         hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_window_f32_gates_kernel<8U>), dim3(first.value_heads * 2U),
             dim3(kProjectionThreads), 0, stream, x, reinterpret_cast<const float*>(first.tensors.beta.runtime->address),
             reinterpret_cast<const float*>(first.tensors.alpha.runtime->address), gates, first.hidden, first.value_heads);
@@ -4207,17 +4243,7 @@ void enqueue_gdn_prefill_rows(const std::vector<std::array<GdnKnownWindowRow, 8U
         reinterpret_cast<const void*>(first.tensors.norm.runtime->address), small_weight_kind(first.tensors.norm.manifest->ggml_type),
         first.head_dim, config.model.rms_norm_epsilon);
     check_hip(hipGetLastError(), "GDN prefill gated RMSNorm launch");
-    for (const auto& tile : tiles) {
-        GdnOutputRowsSite<8U> out{};
-        out.segments = q8_rows::segments({{reinterpret_cast<const void*>(first.tensors.out.runtime->address), first.hidden}});
-        out.width = first.value_width; out.outputs = first.hidden;
-        for (unsigned r = 0; r < 8U; ++r) {
-            out.input[r] = tile[r].workspace.core;
-            out.output[r] = reinterpret_cast<std::uint16_t*>(tile[r].output.address);
-        }
-        q8_rows::launch(out, config.known_window_a8_projections, stream);
-        check_hip(hipGetLastError(), "GDN prefill Q8 output projection launch");
-    }
+    each_width(project_out);
 }
 }  // namespace
 
