@@ -120,6 +120,7 @@ struct HipKnownPrefixWindow::Impl {
     std::optional<HipKnownPrefixUnionObservation> last_union_observation;
     std::array<KnownWindowR2Entry, 3> r2_entries;
     std::vector<KnownWindowRowsEntry> rows_entries;
+    std::vector<KnownWindowRowsEntry> prefill_entries;
     // Prefix acceptance: deferred GDN rows (control word in host-mapped coherent memory, so the
     // host publishes {n_keep, slot} without a copy) and per-row PLE snapshots.
     struct HipFree { void operator()(void* p) const noexcept { if (p) (void)hipFree(p); } };
@@ -210,6 +211,7 @@ struct HipKnownPrefixWindow::Impl {
         position_readers.erase(std::unique(position_readers.begin(), position_readers.end()), position_readers.end());
         setup_r2();
         setup_rows();
+        if(prefill) setup_prefill_entries();
         setup_routed_union();
         setup_hyper_rows();
         setup_deferred();
@@ -320,6 +322,18 @@ struct HipKnownPrefixWindow::Impl {
             [](std::span<const ExecutionDispatchContext, 2> rows, void* object) {
                 gdn_known_window_r2_f32_gates_launch(rows, static_cast<Impl*>(object)->gdn_config);
             }};
+    }
+    void setup_prefill_entries() {
+        // STRIX_PREFILL_FULL_GDN=0: keep the GDN step in 8-row tiles.
+        static const bool gdn=[]{const char* v=std::getenv("STRIX_PREFILL_FULL_GDN");return !v||v[0]!='0';}();
+        if(!gdn) return;
+        prefill_entries.push_back({KnownWindowR2Variant::gdn_q8_rows8_f32_gates_r1_v1,this,
+            [](std::span<const ExecutionDispatchContext> rows,void* object) {
+                gdn_known_prefill_rows_preflight(rows,static_cast<Impl*>(object)->gdn_config);
+            },
+            [](std::span<const ExecutionDispatchContext> rows,void* object) {
+                gdn_known_prefill_rows_launch(rows,static_cast<Impl*>(object)->gdn_config);
+            }});
     }
     void setup_rows() {
         rows_entries.resize(4);
@@ -763,7 +777,7 @@ struct HipKnownPrefixWindow::Impl {
             if(!prefill) hooks.preflight_memo=&preflight_memo;
             const auto first_position=session.next_position;
             auto result=prefill ? execute_known_prefix_prefill_eager(*prefill,serial,resources,scratch,session,tokens,
-                launch_plans.front(),r2_entries,rows_entries,hooks) :
+                launch_plans.front(),r2_entries,rows_entries,hooks,prefill_entries) :
                 execute_known_prefix_window_eager(window, serial, resources, scratch, session, tokens,
                     capture?std::span<const CompiledLaunchPlan* const>(observed->pointers):std::span<const CompiledLaunchPlan* const>(launch_pointers),
                     capture?std::span<const KnownWindowR2Entry>(observed->recorded_r2):std::span<const KnownWindowR2Entry>(r2_entries),

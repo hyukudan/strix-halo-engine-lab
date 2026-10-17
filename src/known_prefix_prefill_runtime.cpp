@@ -11,6 +11,7 @@
 #include <limits>
 #include <stdexcept>
 #include <utility>
+#include <vector>
 
 namespace strix {
 namespace {
@@ -27,7 +28,8 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
     const CompiledSerialExecution& serial,const ExecutionRuntimeResources& serial_resources,
     const ExecutionMemoryBinding& memory,SerialSessionContext& session,std::span<const std::uint32_t> tokens,
     const CompiledLaunchPlan& launch,std::span<const KnownWindowR2Entry> pairs,
-    std::span<const KnownWindowRowsEntry> wide,const KnownWindowExecutionHooks& hooks) {
+    std::span<const KnownWindowRowsEntry> wide,const KnownWindowExecutionHooks& hooks,
+    std::span<const KnownWindowRowsEntry> full) {
     validate_compiled_known_prefix_prefill(plan,serial);
     const auto rows=plan.logical_rows;const auto steps=serial.execution.steps.size();
     require(tokens.size()==rows,"known prefill token count differs from compiled T");
@@ -87,6 +89,13 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
             "known prefill wide entry table is ambiguous or invalid");
         wide_by_id[id]=&entry;
     }
+    std::array<const KnownWindowRowsEntry*,known_window_r2_variant_slots> full_by_id{};
+    for(const auto& entry:full) {
+        const auto id=static_cast<std::uint32_t>(entry.variant);
+        require(id>=4U&&id<known_window_r2_variant_slots&&!full_by_id[id]&&entry.config&&entry.preflight&&entry.launch,
+            "known prefill full-T entry table is ambiguous or invalid");
+        full_by_id[id]=&entry;
+    }
     ExecutionRuntimeResources resources=serial_resources;resources.scratch=&memory;
     const auto context=[&](std::size_t step,std::uint32_t row) {
         const auto& s=serial.execution.steps[step];const auto& io=serial.io.steps[step];const auto& binding=serial.bindings.bindings[step];
@@ -139,8 +148,15 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
         const auto mode=plan.tile8.mode[step];const auto id=static_cast<std::uint32_t>(plan.tile8.r2_variant[step]);
         const bool multi=mode!=KnownWindowStepMode::r1_row_loop;
         const bool rows_entry=known_window_rows_mode(mode);
-        if(multi) require(!reads_position(serial.execution.steps[step].reads_state)&&(rows_entry?wide_by_id[id]!=nullptr:pair_by_id[id]!=nullptr),
-            "known prefill selected closed implementation is missing");
+        // QSA rows read each row's own context position, never the host word.
+        if(multi&&!((!reads_position(serial.execution.steps[step].reads_state)||mode==KnownWindowStepMode::qsa_rows)&&(rows_entry?wide_by_id[id]!=nullptr:pair_by_id[id]!=nullptr)))
+            throw std::invalid_argument("known prefill selected closed implementation is missing (variant "+std::to_string(id)+
+                ", mode "+std::to_string(static_cast<unsigned>(mode))+")");
+        if(rows_entry&&full_by_id[id]&&rows%8U==0U) {
+            std::vector<ExecutionDispatchContext> all(rows);for(std::uint32_t r=0;r<rows;++r) all[r]=context(step,r);
+            full_by_id[id]->preflight(all,full_by_id[id]->config);
+            continue;
+        }
         const auto width=multi?(rows_entry?8U:2U):1U;
         for(std::uint32_t first=0;first<rows;) {
             const auto count=rows-first>=width?width:1U;
@@ -167,6 +183,20 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
             if(!result.execution.state.contains(source.reads_state)) throw std::logic_error("known prefill persistent state disappeared after admission");
             const auto mode=plan.tile8.mode[step];const auto id=static_cast<std::uint32_t>(plan.tile8.r2_variant[step]);
             const bool rows_entry=known_window_rows_mode(mode);
+            if(rows_entry&&full_by_id[id]&&rows%8U==0U) {
+                std::vector<ExecutionDispatchContext> all(rows);for(std::uint32_t r=0;r<rows;++r) all[r]=context(step,r);
+                auto correlation=current_execution_correlation();correlation.execution_identity=plan.prefill_execution_identity;
+                correlation.position=all[0].position;correlation.step_id=source.id;correlation.op=source.op;correlation.layer=source.layer.value_or(UINT32_MAX);
+                correlation.rows=rows;correlation.row=UINT32_MAX;correlation.phase=ExecutionPhase::operator_step;
+                ExecutionCorrelationScope observed(correlation);
+                full_by_id[id]->launch(all,full_by_id[id]->config);
+                if(mode==KnownWindowStepMode::gdn_rows) ++result.gdn_rows_dispatches;
+                ++result.r2_variant_dispatches[id];
+                if(launch.steps[step].runtime_step) ++result.execution.runtime_steps;else ++result.execution.kernel_steps;
+                ++result.execution.completed_steps;result.execution.completion_order.push_back(source.id);
+                for(std::uint32_t r=0;r<rows;++r) result.execution.state.publish_write(source.writes_state);
+                continue;
+            }
             const auto width=mode==KnownWindowStepMode::r1_row_loop?1U:(rows_entry?8U:2U);
             // All tiles of this source step run before advancing to its next
             // consumer/layer. Recurrent/conv/PLE/QSA rows remain increasing.

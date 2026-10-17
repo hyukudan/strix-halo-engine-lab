@@ -55,6 +55,10 @@ void gdn_known_window_r2_f32_gates_launch(std::span<const ExecutionDispatchConte
 // Closed R4/R8 mixed-format windows. Three large Q8 projections share weights
 // across every row; the small F32 gates and causal state transitions retain
 // ascending R1 order. No padding rows, capture, storage conversion or commit.
+// Known-prompt prefill: T rows (multiple of 8, >= 16) of one GDN layer at consecutive positions, committed in
+// order (no deferral). Same per-row arithmetic as the window kernels; conv history and state written once.
+void gdn_known_prefill_rows_preflight(std::span<const ExecutionDispatchContext> rows, const HipGdnLauncherConfig& config);
+void gdn_known_prefill_rows_launch(std::span<const ExecutionDispatchContext> rows, const HipGdnLauncherConfig& config);
 void gdn_known_window_rows_preflight(std::span<const ExecutionDispatchContext> rows,
     const HipGdnLauncherConfig& config);
 void gdn_known_window_rows_launch(std::span<const ExecutionDispatchContext> rows,

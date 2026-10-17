@@ -392,7 +392,8 @@ inline void validate_numerical_profile_cli(const Options& options) {
         // Known-prefix windows with the full row set compile the same operators as the prefix-accepting
         // MTP window, so they run under an arithmetic profile too; the older partial sets do not.
         ((options.known_prefix_window || options.known_prefix_rows_explicit || options.known_prefix_expert_union) &&
-            !options.known_prefix_full_rows) || options.known_prefix_prefill_rows || options.prompt_lookup ||
+            !options.known_prefix_full_rows) || (options.known_prefix_prefill_rows && !options.known_prefix_full_rows) ||
+        options.prompt_lookup ||
         !options.serving_prefix_files.empty() || options.serving_concurrency != 1 ||
         options.serving_tensor_cohort_rows != 1 || options.serving_prefill_rows ||
         options.prefix_cache_roundtrip || options.gpu_greedy_token ||
