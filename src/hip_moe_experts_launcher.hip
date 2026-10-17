@@ -2182,157 +2182,177 @@ struct KnownMoeCsrDevice {
     std::uint32_t* batch_begins;
 };
 
-// An invalid route/quantization in ANY row skips all projection producers.
-// These candidate-only guards prevent consumers from reading the unproduced
-// workspace without contaminating valid rows' local first-error provenance.
-__global__ void known_moe_rows_finite_kernel(const float* values,std::uint32_t count,
-    std::uint32_t* status,const std::uint32_t* global_status,bool bf16_commit) {
-    if(*global_status!=0U)return;
-    const auto index=blockIdx.x*blockDim.x+threadIdx.x;
-    __shared__ std::uint32_t initial_status;
-    if(threadIdx.x==0U)initial_status=atomicOr(status,0U);
-    __syncthreads();
-    if(initial_status!=0U)return;
-    if(index<count&&(__float_as_uint(values[index])&0x7fffffffU)>=
-        (bf16_commit?0x7f7f8000U:0x7f800000U))atomicOr(status,8U);
+// The incumbent per-output reduction of eight lane leaves (__shfl_down tree
+// over 32 lanes, then ((s0+s4)+(s2+s6))+((s1+s5)+(s3+s7)) in lane 0) with
+// the same operand pairs, packing two then four leaves per register in DPP
+// bank masks. Result in lane 0; every lane must be active.
+#define STRIX_KNOWN_MOE_DPP(out, in, control, banks) \
+    asm("v_add_f32_dpp %0, %1, %1 " control " row_mask:0xf bank_mask:" banks : "=v"(out) : "v"(in))
+#define STRIX_KNOWN_MOE_DPP_INTO(out, in, control, banks) \
+    asm("v_add_f32_dpp %0, %1, %1 " control " row_mask:0xf bank_mask:" banks : "+v"(out) : "v"(in))
+__device__ __forceinline__ float known_moe_reduce_leaves(float (&leaf)[8]) {
+#pragma unroll
+    for (unsigned j = 0; j < 8U; ++j) {
+        const auto bits = __float_as_uint(leaf[j]);
+        leaf[j] += __uint_as_float(__builtin_amdgcn_permlanex16(bits, bits, 0x76543210U, 0xfedcba98U, false, false));
+    }
+    float pair[4], quad[2];
+    // Step 8: pair[p] lanes 0-7 hold leaf first[p], lanes 8-15 leaf first[p]+2.
+    constexpr unsigned first[4] = {0U, 1U, 4U, 5U};
+#pragma unroll
+    for (unsigned p = 0; p < 4U; ++p) {
+        STRIX_KNOWN_MOE_DPP(pair[p], leaf[first[p]], "row_shl:8", "0x3");
+        STRIX_KNOWN_MOE_DPP_INTO(pair[p], leaf[first[p] + 2U], "row_shr:8", "0xc");
+    }
+    // Step 4: banks 0..3 of quad[h] hold leaves 4h..4h+3; then steps 2 and 1.
+#pragma unroll
+    for (unsigned h = 0; h < 2U; ++h) {
+        STRIX_KNOWN_MOE_DPP(quad[h], pair[2U * h], "row_shl:4", "0x5");
+        STRIX_KNOWN_MOE_DPP_INTO(quad[h], pair[2U * h + 1U], "row_shr:4", "0xa");
+        float step;
+        STRIX_KNOWN_MOE_DPP(step, quad[h], "row_shl:2", "0xf");
+        STRIX_KNOWN_MOE_DPP(quad[h], step, "row_shl:1", "0xf");
+    }
+    float sum = quad[0] + quad[1], step;
+    STRIX_KNOWN_MOE_DPP(step, sum, "row_shl:8", "0xf");
+    STRIX_KNOWN_MOE_DPP(sum, step, "row_shl:4", "0xf");
+    return sum;
 }
-__global__ void known_moe_rows_activation_kernel(float* slots,std::uint32_t intermediate_size,
-    const std::uint32_t* status,const std::uint32_t* global_status) {
-    if(*global_status!=0U||*status!=0U)return;
-    const auto index=static_cast<std::uint32_t>(blockIdx.x)*blockDim.x+threadIdx.x;
-    if(index>=intermediate_size)return;
-    auto* workspace=slots+2ULL*blockIdx.y*intermediate_size;
-    const float gate=workspace[index];
-    const float up=workspace[intermediate_size+index];
-    workspace[index]=(gate/(1.0F+expf(-gate)))*up;
-}
+#undef STRIX_KNOWN_MOE_DPP_INTO
+#undef STRIX_KNOWN_MOE_DPP
 
-// Bounded device transcription of build_moe_route_plan's CSR ordering.
-// There is no dense expert-by-token payload and no host route readback.
-// One lane owns all metadata, so repeated expert rows are stable row/slot order.
-__global__ void known_moe_csr_kernel(KnownMoeRowsDevice view, KnownMoeCsrDevice csr,
-    std::uint32_t row_count, std::uint32_t experts, std::uint32_t top_k) {
-    if (threadIdx.x != 0U) return;
-    for (unsigned word = 0; word < sizeof(q51_known_rows::Summary)/sizeof(std::uint32_t); ++word) csr.header[word] = 0U;
-    csr.header[3] = row_count * top_k; csr.header[6] = row_count; csr.header[7] = 1U;
-    for (std::uint32_t e = 0; e <= experts; ++e) csr.offsets[e] = 0U;
-    for (std::uint32_t r = 0; r < row_count; ++r) {
-        for (std::uint32_t s = 0; s < top_k; ++s) {
-            const auto e = view.routes[r][s];
-            const bool bad = e >= experts || !isfinite(view.route_weights[r][s]);
-            if (bad) atomicOr(view.status[r], 1U);
-            else ++csr.offsets[e + 1U];
-        }
-        csr.header[0] |= *view.status[r];
+// One block per (CSR batch, 8*Outs outputs, group of G batch rows); row groups
+// are the fastest grid index so siblings re-reading a slice hit L2. Each wave
+// loads its Outs packed Q5_1 rows once, decodes every coefficient once and
+// applies it to the G rows staged in LDS. Per row/output the lane leaves,
+// x*coefficient expression, chunk order, +0 seed and reduction tree are the
+// incumbent slot-parallel kernel's. A failing block (0,0,0) folds every
+// projection-stage status into the summary (the incumbent status kernel); the
+// success path stores nothing before its loads, so batch metadata stays
+// scalar and the staged rows are requested ahead of the weights.
+template <unsigned G, unsigned Outs>
+__global__ __launch_bounds__(256) void known_moe_q51_union_down_kernel(KnownMoeRowsDevice view, KnownMoeCsrDevice csr,
+    std::uint32_t row_count, const void* weights, std::uint32_t intermediate_size, std::uint32_t hidden_size) {
+    std::uint32_t failure = csr.header[0];
+    for (std::uint32_t r = 0; r < row_count; ++r) failure |= *view.status[r];
+    if (failure) {
+        if (blockIdx.x == 0U && blockIdx.y == 0U && threadIdx.x == 0U) csr.header[0] = failure;
+        return;
     }
-    if (csr.header[0]) return;
-    for (std::uint32_t e = 0; e < experts; ++e) {
-        if (csr.offsets[e + 1U]) {
-            csr.touched[csr.header[1]++] = e;
-            if (csr.offsets[e + 1U] > csr.header[5]) csr.header[5] = csr.offsets[e + 1U];
-        }
-        csr.offsets[e + 1U] += csr.offsets[e];
-    }
-    // Duplicate experts in a source row remain distinct slot assignments,
-    // matching the incumbent. Expert ranges are tiled into <=row_count
-    // assignments, so repeated rows cannot overflow the register tile.
-    for (std::uint32_t t = 0; t < csr.header[1]; ++t) {
-        const auto e = csr.touched[t]; auto cursor = csr.offsets[e];
-        std::uint32_t unique_rows = 0U;
-        for (std::uint32_t r = 0; r < row_count; ++r) {
-            bool found = false;
-            for (std::uint32_t s = 0; s < top_k; ++s)
-                if (view.routes[r][s] == e) { csr.rows[cursor] = r; csr.slots[cursor++] = s; found = true; }
-            unique_rows += found ? 1U : 0U;
-        }
-        ++csr.header[8U + unique_rows - 1U];
-        csr.header[4] += cursor - csr.offsets[e] - unique_rows;
-        for (auto begin = csr.offsets[e]; begin < cursor; begin += row_count) {
-            const auto batch = csr.header[2]++;
-            csr.batch_experts[batch] = e;
-            csr.batch_begins[batch] = begin;
-            const auto batch_size = cursor - begin < row_count ? cursor - begin : row_count;
-            ++csr.header[16U + batch_size - 1U];
-        }
-    }
-    csr.batch_begins[csr.header[2]] = row_count * top_k;
-}
-
-template <unsigned Rows>
-__global__ void known_moe_q51_csr_down_kernel(KnownMoeRowsDevice view, KnownMoeCsrDevice csr,
-    const void* weights, std::uint32_t intermediate_size, std::uint32_t hidden_size) {
-    if (csr.header[0] || blockIdx.y >= csr.header[2]) return;
-    const auto lane = static_cast<std::uint32_t>(threadIdx.x) % 32U;
-    const auto wave = static_cast<std::uint32_t>(threadIdx.x) / 32U;
-    const auto out = static_cast<std::uint32_t>(blockIdx.x) * 8U + wave;
-    if (out >= hidden_size) return;
+    if (blockIdx.y >= csr.header[2]) return;
     const auto expert = csr.batch_experts[blockIdx.y];
-    const auto begin = csr.batch_begins[blockIdx.y], end = csr.batch_begins[blockIdx.y + 1U];
-    const auto row = static_cast<std::uint64_t>(expert) * hidden_size + out;
-    float partial[Rows][8] = {};
-    for (std::uint32_t chunk = 0; chunk < intermediate_size; chunk += 256U) {
+    const auto groups = (row_count + G - 1U) / G, tile = static_cast<std::uint32_t>(blockIdx.x) / groups;
+    const auto group = static_cast<std::uint32_t>(blockIdx.x) % groups * G;
+    const auto begin = csr.batch_begins[blockIdx.y] + group, end = csr.batch_begins[blockIdx.y + 1U];
+    if (begin >= end) return;
+    const auto count = end - begin;
+    __shared__ __align__(16) float staged[G][768]; // intermediate_size <= 768, admitted by the host
+    // One float4 per thread and staged row, requested before the weights.
+    const auto vector = 4U * static_cast<std::uint32_t>(threadIdx.x);
+    float4 row_vector[G];
 #pragma unroll
-        for (unsigned j = 0; j < 8U; ++j) {
-            const auto feature = chunk + 8U * lane + j;
-            if (feature < intermediate_size) {
-                const float coefficient = load_weight<WeightKind::q5_1>(weights, intermediate_size, row, feature);
+    for (unsigned a = 0; a < G; ++a) if (a < count && vector < intermediate_size)
+        row_vector[a] = *reinterpret_cast<const float4*>(view.intermediates[csr.rows[begin + a]] +
+            static_cast<std::uint64_t>(csr.slots[begin + a]) * 2U * intermediate_size + vector);
+    const auto lane = static_cast<std::uint32_t>(threadIdx.x) % 32U;
+    // hidden_size % (8*Outs) == 0 is admitted by the host: no wave leaves before the barrier.
+    const auto first = (tile * 8U + static_cast<std::uint32_t>(threadIdx.x) / 32U) * Outs;
+    constexpr unsigned chunks = 3U;
+    const auto blocks_per_row = intermediate_size / 32U, quarter = lane % 4U, shift = quarter >= 2U ? 4U : 0U;
+    const auto* base = static_cast<const unsigned char*>(weights);
+    uint2 header[Outs][chunks], packed[Outs][chunks];
 #pragma unroll
-                for (unsigned a = 0; a < Rows; ++a) if (begin + a < end) {
-                    const auto r = csr.rows[begin + a], slot = csr.slots[begin + a];
-                    const auto input_base = static_cast<std::uint64_t>(slot) * 2U * intermediate_size;
-                    // Same x*coefficient expression, +0 seed and ascending
-                    // feature sequence as the incumbent slot-parallel kernel.
-                    partial[a][j] += view.intermediates[r][input_base + feature] * coefficient;
-                }
-            }
+    for (unsigned o = 0; o < Outs; ++o)
+#pragma unroll
+        for (unsigned k = 0; k < chunks; ++k) if (256U * k + 8U * lane < intermediate_size) {
+            const auto* block = base + ((static_cast<std::uint64_t>(expert) * hidden_size + first + o) * blocks_per_row + 8U * k + lane / 4U) * 24U;
+            header[o][k] = *reinterpret_cast<const uint2*>(block);
+            packed[o][k] = *reinterpret_cast<const uint2*>(block + 8U + 8U * (quarter & 1U));
         }
-    }
 #pragma unroll
-    for (unsigned a = 0; a < Rows; ++a) if (begin + a < end) {
-        auto* sum = partial[a];
+    for (unsigned a = 0; a < G; ++a) if (a < count && vector < intermediate_size)
+        *reinterpret_cast<float4*>(&staged[a][vector]) = row_vector[a];
+    __syncthreads();
+    float partial[G][Outs][8] = {};
 #pragma unroll
-        for (unsigned distance = 16U; distance > 0U; distance >>= 1U) {
+    for (unsigned k = 0; k < chunks; ++k) {
+        const auto feature = 256U * k + 8U * lane;
+        if (feature >= intermediate_size) continue;
+        float xs[G][8];
+#pragma unroll
+        for (unsigned a = 0; a < G; ++a) if (a < count) {
+            const float4 x0 = *reinterpret_cast<const float4*>(&staged[a][feature]);
+            const float4 x1 = *reinterpret_cast<const float4*>(&staged[a][feature + 4U]);
+            xs[a][0] = x0.x; xs[a][1] = x0.y; xs[a][2] = x0.z; xs[a][3] = x0.w;
+            xs[a][4] = x1.x; xs[a][5] = x1.y; xs[a][6] = x1.z; xs[a][7] = x1.w;
+        }
+#pragma unroll
+        for (unsigned o = 0; o < Outs; ++o) {
+            const float d = __half2float(__ushort_as_half(static_cast<unsigned short>(header[o][k].x & 65535U)));
+            const float m = __half2float(__ushort_as_half(static_cast<unsigned short>(header[o][k].x >> 16U)));
+            const auto high_bits = (header[o][k].y >> (8U * quarter)) & 255U;
+            float coefficient[8];
 #pragma unroll
             for (unsigned j = 0; j < 8U; ++j) {
-                const auto neighbor = __shfl_down(sum[j], distance, 32);
-                if (lane < distance) sum[j] += neighbor;
+                const auto byte = ((j < 4U ? packed[o][k].x : packed[o][k].y) >> (8U * (j % 4U))) & 255U;
+                const auto low = (byte >> shift) & 15U, high = (high_bits >> j) & 1U;
+                coefficient[j] = d * static_cast<float>(low | (high << 4U)) + m;
             }
+#pragma unroll
+            for (unsigned a = 0; a < G; ++a) if (a < count)
+#pragma unroll
+                for (unsigned j = 0; j < 8U; ++j) partial[a][o][j] += xs[a][j] * coefficient[j];
         }
-        if (lane == 0U) {
+    }
 #pragma unroll
-            for (unsigned j = 0; j < 4U; ++j) sum[j] += sum[j + 4U];
+    for (unsigned a = 0; a < G; ++a) if (a < count) {
+        auto* target = view.rawdots[csr.rows[begin + a]] + static_cast<std::uint64_t>(csr.slots[begin + a]) * hidden_size + first;
 #pragma unroll
-            for (unsigned j = 0; j < 2U; ++j) sum[j] += sum[j + 2U];
-            sum[0] += sum[1];
-            view.rawdots[csr.rows[begin + a]][static_cast<std::uint64_t>(csr.slots[begin + a]) * hidden_size + out] = sum[0];
+        for (unsigned o = 0; o < Outs; ++o) {
+            const float sum = known_moe_reduce_leaves(partial[a][o]);
+            if (lane == 0U) target[o] = sum;
         }
     }
 }
 
-__global__ void known_moe_rows_status_kernel(KnownMoeRowsDevice view, KnownMoeCsrDevice csr,
-    std::uint32_t row_count) {
-    if (threadIdx.x != 0U) return;
-    for (std::uint32_t r = 0; r < row_count; ++r) csr.header[0] |= *view.status[r];
-}
+// Incumbent ordered merge and BF16 finite scan for every row in one launch.
+// header[0] already holds every pre-merge status (down kernel block (0,0)).
 __global__ void known_moe_rows_merge_kernel(KnownMoeRowsDevice view, KnownMoeCsrDevice csr,
-    std::uint32_t row, std::uint32_t hidden_size, std::uint32_t experts, std::uint32_t top_k) {
+    std::uint32_t hidden_size, std::uint32_t experts, std::uint32_t top_k) {
+    const auto row = blockIdx.y;
     if (csr.header[0] || *view.status[row]) return;
     const auto out = static_cast<std::uint32_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (out >= hidden_size) return;
+    for (std::uint32_t slot = 0; slot < top_k; ++slot) if (view.routes[row][slot] >= experts) return;
+    float dots[10];
+#pragma unroll
+    for (std::uint32_t slot = 0; slot < 10U; ++slot) if (slot < top_k) dots[slot] = view.rawdots[row][static_cast<std::uint64_t>(slot) * hidden_size + out];
     float current = 0.0F;
-    for (std::uint32_t slot = 0; slot < top_k; ++slot) {
-        if (view.routes[row][slot] >= experts) return;
+#pragma unroll
+    for (std::uint32_t slot = 0; slot < 10U; ++slot) if (slot < top_k) {
         const float weight = view.route_weights[row][slot];
-        const float dot = view.rawdots[row][static_cast<std::uint64_t>(slot) * hidden_size + out];
-        asm volatile("v_fmac_f32 %0, %1, %2" : "+v"(current) : "s"(weight), "v"(dot));
+        asm volatile("v_fmac_f32 %0, %1, %2" : "+v"(current) : "s"(weight), "v"(dots[slot]));
     }
     view.accumulation[row][out] = current;
+    if ((__float_as_uint(current) & 0x7fffffffU) >= 0x7f7f8000U) atomicOr(view.status[row], 8U);
 }
+// All-row commit admission, summary status and D1 publication in row order.
+// After a route/quantizer failure (bits 1|2|4, nothing projected) the summary
+// is the planner's fail-closed form: no touched experts, batches or histograms.
 __global__ void known_moe_rows_commit_kernel(KnownMoeRowsDevice view, KnownMoeCsrDevice csr,
-    std::uint32_t row, std::uint32_t hidden_size) {
-    if (csr.header[0] || *view.status[row]) return;
+    std::uint32_t row_count, std::uint32_t hidden_size, std::uint32_t* record) {
+    std::uint32_t failure = csr.header[0];
+    for (std::uint32_t r = 0; r < row_count; ++r) failure |= *view.status[r];
+    if (blockIdx.x == 0U && blockIdx.y == 0U && threadIdx.x == 0U) {
+        csr.header[0] = failure;
+        if (failure & 7U) for (const auto word : {1U, 2U, 4U, 5U}) csr.header[word] = 0U;
+        if (failure & 7U) for (std::uint32_t word = 8U; word < 24U; ++word) csr.header[word] = 0U;
+        for (std::uint32_t r = 0; r < row_count; ++r)
+            merge_deferred_moe_first_error(*reinterpret_cast<DeferredMoeFirstError*>(record), *view.status[r], DeferredMoeDomain::q4k_a8);
+    }
+    if (failure) return;
     const auto out = blockIdx.x * blockDim.x + threadIdx.x;
-    if (out < hidden_size) store_activation(view.output[row] + out, view.accumulation[row][out]);
+    if (out < hidden_size) store_activation(view.output[blockIdx.y] + out, view.accumulation[blockIdx.y][out]);
 }
 
 struct KnownMoeRowsPrepared {
@@ -2370,6 +2390,8 @@ KnownMoeRowsPrepared prepare_known_moe_rows(std::span<const ExecutionDispatchCon
     if (!config.q4k_a8g32_gate_up || !config.grouped_exact_q51_down || !config.q51_slot_parallel_down ||
         !config.deferred_moe_status || config.activation != HipActivationStorage::bf16)
         throw std::invalid_argument("known-window routed rows require BF16 A8 slot-parallel Q5_1 D1 configuration");
+    if (config.intermediate_size % 32U || config.intermediate_size > 768U || config.hidden_size % 64U || config.top_k > 10U)
+        throw std::invalid_argument("known-window routed rows union down geometry is unsupported");
     (void)known_moe_rows_stream();
     const auto& first = rows.front();
     if (!first.execution_identity || !first.layer || !first.kernel_id || !first.resources ||
@@ -2442,7 +2464,8 @@ KnownMoeRowsPrepared prepare_known_moe_rows(std::span<const ExecutionDispatchCon
             const auto required = required_weight_bytes(t == 2U ? WeightKind::q5_1 : WeightKind::q4_k,
                 width, outputs, config.expert_count);
             if (pair.manifest->layer != row.layer || dims.size() != 3U || dims[0] != width || dims[1] != outputs ||
-                dims[2] != config.expert_count || pair.manifest->byte_size != required || !pair.runtime->allocation_generation)
+                dims[2] != config.expert_count || pair.manifest->byte_size != required || !pair.runtime->allocation_generation ||
+                pair.runtime->address % 16U)
                 throw std::invalid_argument("known-window routed rows selected tensor metadata differs");
         }
         reads[3U*r] = {p.hidden.address, p.hidden.bytes};
@@ -2494,80 +2517,37 @@ KnownMoeRowsPrepared prepare_known_moe_rows(std::span<const ExecutionDispatchCon
 void known_moe_rows_enqueue(std::span<const ExecutionDispatchContext> rows,
     const HipMoeExpertsLauncherConfig& config, const KnownMoeRowsPrepared& p) {
     const auto stream = hip_execution_stream();
+    const auto count = static_cast<std::uint32_t>(rows.size());
     check_hip(hipPeekAtLastError(), "known-window routed rows stale error");
-    const auto scan = [&](unsigned r, const float* values, std::uint32_t count, bool bf16 = false) {
-        hipLaunchKernelGGL(known_moe_rows_finite_kernel,dim3((count+255U)/256U),dim3(256),0,stream,
-            values,count,p.device.status[r],p.csr.header,bf16);
-        check_hip(hipGetLastError(),"known-window routed rows finite scan");
-    };
-    for (unsigned r = 0; r < rows.size(); ++r) {
+    moe_q4k_a8::known_rows::WindowRows window;
+    for (unsigned r = 0; r < count; ++r) {
         const auto& q = *p.rows[r].quantized;
-        check_hip(hipMemsetAsync(p.device.accumulation[r],0,
-            static_cast<std::size_t>(q.layout.accumulation_bytes+4U),stream),"known-window routed rows clear accumulation/status");
-        hipLaunchKernelGGL(validate_routes_kernel,dim3(1),dim3(256),0,stream,p.device.routes[r],p.device.route_weights[r],
-            config.top_k,config.expert_count,p.device.status[r],nullptr);
-        check_hip(hipGetLastError(),"known-window routed rows route validation");
-        moe_q4k_a8::enqueue_quantize_only(q.request,q.bindings,stream);
+        window.route_weights[r] = {p.rows[r].route_weights.address, p.rows[r].route_weights.bytes};
+        window.clear[r] = {reinterpret_cast<std::uintptr_t>(p.device.accumulation[r]), q.layout.accumulation_bytes};
     }
-    hipLaunchKernelGGL(known_moe_csr_kernel,dim3(1),dim3(1),0,stream,p.device,p.csr,
-        static_cast<std::uint32_t>(rows.size()),config.expert_count,config.top_k);
-    check_hip(hipGetLastError(),"known-window routed rows CSR");
-    moe_q4k_a8::known_rows::enqueue(p.rows[0].quantized->request,
-        std::span<const moe_q4k_a8::Bindings>(p.quantized_bindings.data(),rows.size()),p.workspace,stream);
-    for(unsigned r=0;r<rows.size();++r) {
-        const auto& q=*p.rows[r].quantized;
-        auto* workspace = reinterpret_cast<float*>(q.bindings.output.address);
-        scan(r,workspace,2U*config.intermediate_size*config.top_k);
-        if (config.batched_slot_activation) {
-            hipLaunchKernelGGL(known_moe_rows_activation_kernel,dim3((config.intermediate_size+255U)/256U,config.top_k),
-                dim3(256),0,stream,workspace,config.intermediate_size,p.device.status[r],p.csr.header);
-            check_hip(hipGetLastError(),"known-window routed rows batched SiLU");
-            if (config.q4k_a8_stats) {
-                config.q4k_a8_stats->batched_activation_launches.fetch_add(1,std::memory_order_relaxed);
-                config.q4k_a8_stats->batched_activation_slots.fetch_add(config.top_k,std::memory_order_relaxed);
-            }
-        } else for (unsigned slot = 0; slot < config.top_k; ++slot) {
-            hipLaunchKernelGGL(known_moe_rows_activation_kernel,dim3((config.intermediate_size+255U)/256U),dim3(256),0,stream,
-                workspace+2ULL*slot*config.intermediate_size,config.intermediate_size,p.device.status[r],p.csr.header);
-            check_hip(hipGetLastError(),"known-window routed rows incumbent SiLU");
-        }
-        scan(r,workspace,2U*config.intermediate_size*config.top_k);
-    }
-    hipLaunchKernelGGL(known_moe_rows_status_kernel,dim3(1),dim3(1),0,stream,p.device,p.csr,
-        static_cast<std::uint32_t>(rows.size()));
-    check_hip(hipGetLastError(),"known-window routed rows gate/up status admission");
+    moe_q4k_a8::known_rows::enqueue_window(p.rows[0].quantized->request,
+        std::span<const moe_q4k_a8::Bindings>(p.quantized_bindings.data(), count), p.workspace, window, stream);
     const auto weights = reinterpret_cast<const void*>(p.rows[0].tensors.down.runtime->address);
-#define STRIX_KNOWN_MOE_DOWN(R) \
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(known_moe_q51_csr_down_kernel<R>), \
-        dim3((config.hidden_size+7U)/8U,static_cast<unsigned>(rows.size())*config.top_k),dim3(256),0,stream, \
-        p.device,p.csr,weights,config.intermediate_size,config.hidden_size)
-    if (rows.size()==2U) { STRIX_KNOWN_MOE_DOWN(2); }
-    else if (rows.size()==4U) { STRIX_KNOWN_MOE_DOWN(4); }
-    else { STRIX_KNOWN_MOE_DOWN(8); }
-#undef STRIX_KNOWN_MOE_DOWN
-    check_hip(hipGetLastError(),"known-window routed rows shared-decode Q5_1 down");
-    for (unsigned r = 0; r < rows.size(); ++r) {
-        hipLaunchKernelGGL(known_moe_rows_merge_kernel,dim3((config.hidden_size+255U)/256U),dim3(256),0,stream,
-            p.device,p.csr,r,config.hidden_size,config.expert_count,config.top_k);
-        check_hip(hipGetLastError(),"known-window routed rows ordered merge");
-        scan(r,p.device.accumulation[r],config.hidden_size,true);
-    }
-    hipLaunchKernelGGL(known_moe_rows_status_kernel,dim3(1),dim3(1),0,stream,p.device,p.csr,
-        static_cast<std::uint32_t>(rows.size()));
-    check_hip(hipGetLastError(),"known-window routed rows all-row commit admission");
-    for (unsigned r = 0; r < rows.size(); ++r) {
-        hipLaunchKernelGGL(known_moe_rows_commit_kernel,dim3((config.hidden_size+255U)/256U),dim3(256),0,stream,
-            p.device,p.csr,r,config.hidden_size);
-        check_hip(hipGetLastError(),"known-window routed rows output commit");
-        // Validation is phased: bad quantization/routes abort all projections.
-        // Preserve the first logical row among errors actually produced; do
-        // not claim to discover arithmetic errors in work that was skipped.
-        enqueue_deferred_moe_status(p.device.status[r],DeferredMoeDomain::q4k_a8);
-        if (config.q4k_a8_stats) {
-            config.q4k_a8_stats->quantized_submissions.fetch_add(1,std::memory_order_relaxed);
-            config.q4k_a8_stats->grouped_q51_submissions.fetch_add(1,std::memory_order_relaxed);
-            config.q4k_a8_stats->slot_parallel_q51_submissions.fetch_add(1,std::memory_order_relaxed);
+    constexpr unsigned down_group = 2U, down_outputs = 4U;
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(known_moe_q51_union_down_kernel<down_group, down_outputs>),
+        dim3(config.hidden_size / (8U * down_outputs) * (count / down_group), count * config.top_k), dim3(256), 0, stream,
+        p.device, p.csr, count, weights, config.intermediate_size, config.hidden_size);
+    check_hip(hipGetLastError(), "known-window routed rows shared-decode Q5_1 down");
+    hipLaunchKernelGGL(known_moe_rows_merge_kernel, dim3((config.hidden_size + 255U) / 256U, count), dim3(256), 0, stream,
+        p.device, p.csr, config.hidden_size, config.expert_count, config.top_k);
+    check_hip(hipGetLastError(), "known-window routed rows ordered merge");
+    hipLaunchKernelGGL(known_moe_rows_commit_kernel, dim3((config.hidden_size + 255U) / 256U, count), dim3(256), 0, stream,
+        p.device, p.csr, count, config.hidden_size, hip_deferred_moe_status());
+    check_hip(hipGetLastError(), "known-window routed rows output commit");
+    if (config.q4k_a8_stats) {
+        auto& stats = *config.q4k_a8_stats;
+        if (config.batched_slot_activation) {
+            stats.batched_activation_launches.fetch_add(count, std::memory_order_relaxed);
+            stats.batched_activation_slots.fetch_add(count * config.top_k, std::memory_order_relaxed);
         }
+        stats.quantized_submissions.fetch_add(count, std::memory_order_relaxed);
+        stats.grouped_q51_submissions.fetch_add(count, std::memory_order_relaxed);
+        stats.slot_parallel_q51_submissions.fetch_add(count, std::memory_order_relaxed);
     }
 }
 #endif

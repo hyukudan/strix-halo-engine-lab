@@ -1,6 +1,7 @@
 #pragma once
 #include "strix/hip_moe_q4k_a8_probe.hpp"
 #include "strix/q51_known_rows.hpp"
+#include <array>
 #include <span>
 #include <stdexcept>
 
@@ -26,4 +27,28 @@ void preflight(const Request&, std::span<const Bindings>,
 // exclusively leased until quiescence, including after any enqueue exception.
 void enqueue(const Request&, std::span<const Bindings>,
     const q51_known_rows::Workspace&, hipStream_t);
+// Device tables of the window prologue (probe TU, shares the quantizer body).
+struct CsrRows { unsigned *summary{}, *offsets{}, *touched{}, *rows{}, *slots{}, *experts{}, *begins{}; };
+struct PrologueRows {
+    const void* input[8]{}; const unsigned* routes[8]{}; const float* route_weights[8]{};
+    signed char* codes[8]{}; float* deltas[8]{}; int* sums[8]{}; unsigned* status[8]{}; float* clear[8]{};
+    CsrRows csr;
+};
+// One CTA per row zeroes clear[r][0..clear_words) and status, validates routes
+// and weights and quantizes (the bytes of the per-row clear/validate/quantize
+// sequence). A concurrent CTA builds the stable CSR from the routes alone; on
+// an invalid route it writes the fail-closed summary instead. Quantizer
+// failures are only in row status: consumers must check status as well.
+void enqueue_prologue(const Request&, const PrologueRows&, unsigned rows, unsigned clear_words, hipStream_t);
+// Window-owned rows: route weights and the per-row FP32 region zeroed by the prologue.
+struct WindowRows { std::array<DeviceBytes, 8> route_weights{}, clear{}; };
+// Complete window producer: one prologue launch (rows plus the device CSR
+// build into the workspace: complete stable (row,slot) grouping, so no
+// separate admission), then shared gate/up with the finite scans and SiLU
+// fused per element. Leaves each row's slot workspace exactly as quantize/
+// project/scan/SiLU/scan would on success; any failure sets the same local
+// status bits. After an early (route/quantizer) failure the caller restores
+// the fail-closed summary (touched, batches, histograms zero).
+void enqueue_window(const Request&, std::span<const Bindings>,
+    const q51_known_rows::Workspace&, const WindowRows&, hipStream_t);
 } // namespace strix::moe_q4k_a8::known_rows

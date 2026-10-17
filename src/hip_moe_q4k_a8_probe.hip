@@ -1,5 +1,6 @@
 #include "strix/hip_moe_q4k_a8_probe.hpp"
 #include "strix/hip_moe_a8_down.hpp"
+#include "strix/hip_moe_q4k_a8_known_rows.hpp"
 #include "strix/hip_launch_context.hpp"
 #if defined(__FAST_MATH__) || (defined(__FINITE_MATH_ONLY__) && __FINITE_MATH_ONLY__)
 #error "Q4K A8G32 requires nonfinite checks and strict floating-point semantics"
@@ -35,18 +36,19 @@ __device__ float half_float(unsigned bits) { return __half2float(__ushort_as_hal
 __global__ void validate_routes(const unsigned* routes, unsigned top_k, unsigned experts, unsigned* status) {
     if (threadIdx.x<top_k && routes[threadIdx.x]>=experts) atomicOr(status,invalid_route);
 }
+// One CTA quantizes one row; returns the CTA-uniform failure bits (0 when skipped).
 template<bool Bf16>
-__global__ void quantize(const void* input, unsigned hidden, signed char* codes, float* deltas,
-    int* sums, unsigned* status) {
+__device__ unsigned quantize_row(const void* input, unsigned hidden, signed char* codes, float* deltas,
+    int* sums, unsigned initial_status) {
     __shared__ __align__(16) signed char local_codes[max_hidden];
     __shared__ __align__(16) float local_deltas[max_hidden/32U];
     __shared__ __align__(16) int local_sums[max_hidden/32U];
-    __shared__ unsigned bad, initial_status;
-    if(threadIdx.x==0) {initial_status=*status;bad=0;}
+    __shared__ unsigned bad;
+    if(threadIdx.x==0) bad=0;
     __syncthreads();
-    if(initial_status!=0) return;
+    if(initial_status!=0) return 0;
     const unsigned lane=threadIdx.x&31U,wave=threadIdx.x/32U;
-    for(unsigned group=wave;group<hidden/32U;group+=8U) {
+    for(unsigned group=wave;group<hidden/32U;group+=blockDim.x/32U) {
         const unsigned i=group*32U+lane;
         float x;
         if constexpr(Bf16) x=__uint_as_float(static_cast<unsigned>(static_cast<const unsigned short*>(input)[i])<<16U);
@@ -64,9 +66,86 @@ __global__ void quantize(const void* input, unsigned hidden, signed char* codes,
         if(lane==0) {local_deltas[group]=delta;local_sums[group]=sum;}
     }
     __syncthreads();
-    if(bad!=0) {if(threadIdx.x==0) atomicOr(status,bad);return;}
-    for(unsigned i=threadIdx.x;i<hidden;i+=256U) codes[i]=local_codes[i];
-    for(unsigned i=threadIdx.x;i<hidden/32U;i+=256U) {deltas[i]=local_deltas[i];sums[i]=local_sums[i];}
+    if(bad!=0) return bad;
+    for(unsigned i=threadIdx.x;i<hidden;i+=blockDim.x) codes[i]=local_codes[i];
+    for(unsigned i=threadIdx.x;i<hidden/32U;i+=blockDim.x) {deltas[i]=local_deltas[i];sums[i]=local_sums[i];}
+    return 0;
+}
+template<bool Bf16>
+__global__ void quantize(const void* input, unsigned hidden, signed char* codes, float* deltas,
+    int* sums, unsigned* status) {
+    __shared__ unsigned initial_status;
+    if(threadIdx.x==0) initial_status=*status;
+    __syncthreads();
+    const unsigned bad=quantize_row<Bf16>(input,hidden,codes,deltas,sums,initial_status);
+    if(bad!=0 && threadIdx.x==0) atomicOr(status,bad);
+}
+// Parallel transcription of the stable CSR: assignment a=r*top_k+s is placed at
+// offsets[e]+#{a'<a with expert e}, i.e. rows then slots ascending per expert.
+// Only defined entries are written. Experts <= 512 <= blockDim.
+__device__ void build_csr(const known_rows::PrologueRows& v, unsigned rows, unsigned experts, unsigned top_k) {
+    const auto& csr=v.csr;
+    const unsigned t=threadIdx.x,count=rows*top_k;
+    __shared__ unsigned expert_of[80],first[80],start[512],scan[3][512],hist[16],failure,duplicates,maximum;
+    if(t==0){failure=0U;duplicates=0U;maximum=0U;}
+    if(t<16U)hist[t]=0U;
+    __syncthreads();
+    if(t<count) {
+        const unsigned e=v.routes[t/top_k][t%top_k];expert_of[t]=e;
+        if(e>=experts||!isfinite(v.route_weights[t/top_k][t%top_k]))atomicOr(&failure,invalid_route);
+    }
+    __syncthreads();
+    if(failure){if(t<32U)csr.summary[t]=t==0U?failure:t==3U?count:t==6U?rows:t==7U?1U:0U;return;}
+    if(t<count){unsigned f=1U;for(unsigned a=t-t%top_k;a<t;++a)f&=expert_of[a]!=expert_of[t];first[t]=f;}
+    __syncthreads();
+    unsigned n=0U,unique=0U;
+    if(t<experts)for(unsigned a=0;a<count;++a)if(expert_of[a]==t){++n;unique+=first[a];}
+    const unsigned nb=(n+rows-1U)/rows;
+    if(t<512U){scan[0][t]=n;scan[1][t]=n!=0U;scan[2][t]=nb;}
+    __syncthreads();
+    for(unsigned d=1U;d<512U;d<<=1U) {
+        unsigned x[3]={};
+        if(t>=d&&t<512U)for(unsigned k=0;k<3U;++k)x[k]=scan[k][t-d];
+        __syncthreads();
+        if(t>=d&&t<512U)for(unsigned k=0;k<3U;++k)scan[k][t]+=x[k];
+        __syncthreads();
+    }
+    if(t<experts) {
+        const unsigned off=scan[0][t]-n,touched=scan[1][t]-(n!=0U),batch=scan[2][t]-nb;
+        start[t]=off;csr.offsets[t]=off;
+        if(t==experts-1U)csr.offsets[experts]=off+n;
+        if(n) {
+            csr.touched[touched]=t;atomicAdd(&hist[unique-1U],1U);atomicAdd(&duplicates,n-unique);atomicMax(&maximum,n);
+            for(unsigned b=0;b<nb;++b){csr.experts[batch+b]=t;csr.begins[batch+b]=off+b*rows;atomicAdd(&hist[8U+min(rows,n-b*rows)-1U],1U);}
+        }
+    }
+    __syncthreads();
+    if(t<count) {
+        const unsigned e=expert_of[t];unsigned rank=0U;
+        for(unsigned a=0;a<t;++a)rank+=expert_of[a]==e;
+        csr.rows[start[e]+rank]=t/top_k;csr.slots[start[e]+rank]=t%top_k;
+    }
+    if(t==0U)csr.begins[scan[2][511]]=count;
+    if(t<32U)csr.summary[t]=t==1U?scan[1][511]:t==2U?scan[2][511]:t==3U?count:t==4U?duplicates:t==5U?maximum:
+        t==6U?rows:t==7U?1U:t>=8U&&t<24U?hist[t-8U]:0U;
+}
+// Window prologue, 1024-thread CTA per row: the incumbent clear, both route
+// validators and the quantizer in their original order; status is written
+// once by thread 0. CTA `rows` builds the CSR concurrently.
+template<bool Bf16>
+__global__ void window_prologue(known_rows::PrologueRows v, unsigned rows, unsigned hidden, unsigned top_k, unsigned experts,
+    unsigned clear_words) {
+    const unsigned row=blockIdx.x;
+    if(row==rows){build_csr(v,rows,experts,top_k);return;}
+    __shared__ unsigned route_bits;
+    if(threadIdx.x==0) route_bits=0;
+    for(unsigned i=threadIdx.x;i<clear_words;i+=blockDim.x) v.clear[row][i]=0.0F;
+    __syncthreads();
+    if(threadIdx.x<top_k && (v.routes[row][threadIdx.x]>=experts || !isfinite(v.route_weights[row][threadIdx.x])))
+        atomicOr(&route_bits,invalid_route);
+    __syncthreads();
+    const unsigned bad=quantize_row<Bf16>(v.input[row],hidden,v.codes[row],v.deltas[row],v.sums[row],route_bits);
+    if(threadIdx.x==0) *v.status[row]=route_bits|bad;
 }
 __global__ void project(const unsigned char* gate,const unsigned char* up,const unsigned* routes,
     const signed char* codes,const float* deltas,const int* sums,const unsigned* status,
@@ -303,6 +382,16 @@ void enqueue_quantize_only(const Request& request,const Bindings& b,hipStream_t 
     else quantize<false><<<1,256,0,stream>>>(input,request.shape.hidden,codes,deltas,sums,status);
     check(hipGetLastError(),"Q4K A8 quantizer enqueue");
 }
+namespace known_rows {
+void enqueue_prologue(const Request& request,const PrologueRows& rows,unsigned count,unsigned clear_words,hipStream_t stream) {
+    if(count==0U||count>8U||count*request.shape.top_k>80U||request.shape.experts>512U)
+        throw std::invalid_argument("A8 window prologue geometry is invalid");
+    check(hipPeekAtLastError(),"A8 window prologue stale error");
+    if(request.input==InputKind::bf16)window_prologue<true><<<count+1U,1024,0,stream>>>(rows,count,request.shape.hidden,request.shape.top_k,request.shape.experts,clear_words);
+    else window_prologue<false><<<count+1U,1024,0,stream>>>(rows,count,request.shape.hidden,request.shape.top_k,request.shape.experts,clear_words);
+    check(hipGetLastError(),"A8 window prologue enqueue");
+}
+} // namespace known_rows
 void enqueue_division_probe(const std::uint32_t* a,const std::uint32_t* b,std::uint32_t* output,unsigned count,hipStream_t stream) {
     if(!a || !b || !output || count==0) throw std::invalid_argument("invalid division receipt bindings");
     division_receipt<<<(count+255U)/256U,256,0,stream>>>(a,b,output,count);check(hipGetLastError(),"Q4K A8 division receipt enqueue");
