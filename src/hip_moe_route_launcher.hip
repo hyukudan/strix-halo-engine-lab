@@ -1073,6 +1073,48 @@ __global__ void __launch_bounds__(256) wave_rows_moe_route_logits_kernel(RouterR
     }
     if (lane < Rows) rows.workspace[lane][expert] = sum;
 }
+// F32 weights, every lane busy: a wave covers 32 / Rows experts x Rows rows and
+// lane (expert, row) runs that pair's serial chain (fused, ascending from
+// feature zero) on its own coefficients. The one-expert-per-wave form above
+// left 32 - Rows lanes idle and needed 8x more waves for the same chains.
+template <typename Activation, std::uint32_t Rows>
+__global__ void __launch_bounds__(256) lanes_rows_moe_route_logits_kernel(RouterRowsArgs rows,
+    const float* __restrict__ weights, std::uint32_t hidden_size, std::uint32_t expert_count) {
+    static_assert(Rows == 2U || Rows == 4U || Rows == 8U);
+    constexpr std::uint32_t per_vector = 16U / sizeof(Activation);
+    constexpr std::uint32_t experts_per_wave = 32U / Rows;
+    const auto lane = static_cast<std::uint32_t>(threadIdx.x % 32U);
+    const auto wave = static_cast<std::uint32_t>(blockIdx.x) * 8U + static_cast<std::uint32_t>(threadIdx.x / 32U);
+    const auto expert = wave * experts_per_wave + lane / Rows;
+    const auto row = lane % Rows;
+    if (expert >= expert_count) return;
+    const auto* __restrict__ coefficients = reinterpret_cast<const float4*>(weights + static_cast<std::uint64_t>(expert) * hidden_size);
+    const auto* hidden = static_cast<const Activation*>(rows.hidden[row]);
+    float sum = 0.0F;
+    for (std::uint32_t feature = 0; feature < hidden_size; feature += kWaveRowsChunk) {
+        float input[kWaveRowsChunk];
+        #pragma unroll
+        for (std::uint32_t v = 0; v < kWaveRowsChunk / per_vector; ++v) {
+            const auto packed = *reinterpret_cast<const uint4*>(hidden + feature + v * per_vector);
+            const std::uint32_t words[4] = {packed.x, packed.y, packed.z, packed.w};
+            #pragma unroll
+            for (std::uint32_t k = 0; k < per_vector; ++k) {
+                if constexpr (sizeof(Activation) == 2U)
+                    input[v * per_vector + k] = bf16_to_float(static_cast<std::uint16_t>(k % 2U ? words[k / 2U] >> 16U : words[k / 2U] & 0xffffU));
+                else input[v * per_vector + k] = __uint_as_float(words[k]);
+            }
+        }
+        #pragma unroll
+        for (std::uint32_t q = 0; q < kWaveRowsChunk / 4U; ++q) {
+            const auto c = coefficients[(feature >> 2U) + q];
+            sum = __builtin_fmaf(input[4U * q + 0U], c.x, sum);
+            sum = __builtin_fmaf(input[4U * q + 1U], c.y, sum);
+            sum = __builtin_fmaf(input[4U * q + 2U], c.z, sum);
+            sum = __builtin_fmaf(input[4U * q + 3U], c.w, sum);
+        }
+    }
+    rows.workspace[row][expert] = sum;
+}
 template <typename Activation, RouterWeightKind WeightKind, std::uint32_t Rows>
 __global__ void __launch_bounds__(256) rows_moe_route_logits_kernel(RouterRowsArgs rows, const void* weights,
     std::uint32_t hidden_size, std::uint32_t expert_count) {
@@ -1619,14 +1661,24 @@ void launch_router_rows_typed(const PreparedRouterRows& p, const HipMoeRouteLaun
     const auto* weights = reinterpret_cast<const void*>(p.tensor->address);
     const auto stream = hip_execution_stream();
     if (WeightKind == RouterWeightKind::f32 && p.wave_logits) {
-        const dim3 waves((config.expert_count + 7U) / 8U);
         const auto* f32 = static_cast<const float*>(weights);
-        if (p.rows == 2U) hipLaunchKernelGGL(HIP_KERNEL_NAME(wave_rows_moe_route_logits_kernel<Activation, 2U>),
-            waves, dim3(256U), 0, stream, p.args, f32, config.hidden_size, config.expert_count);
-        else if (p.rows == 4U) hipLaunchKernelGGL(HIP_KERNEL_NAME(wave_rows_moe_route_logits_kernel<Activation, 4U>),
-            waves, dim3(256U), 0, stream, p.args, f32, config.hidden_size, config.expert_count);
-        else hipLaunchKernelGGL(HIP_KERNEL_NAME(wave_rows_moe_route_logits_kernel<Activation, 8U>),
-            waves, dim3(256U), 0, stream, p.args, f32, config.hidden_size, config.expert_count);
+        // 8 waves per block; each wave holds 32 / rows experts.
+        const auto blocks = [&](std::uint32_t rows) { return dim3((config.expert_count * rows + 255U) / 256U); };
+        const bool aligned = config.hidden_size % kWaveRowsChunk == 0U;
+        if (!aligned) {
+            const dim3 waves((config.expert_count + 7U) / 8U);
+            if (p.rows == 2U) hipLaunchKernelGGL(HIP_KERNEL_NAME(wave_rows_moe_route_logits_kernel<Activation, 2U>),
+                waves, dim3(256U), 0, stream, p.args, f32, config.hidden_size, config.expert_count);
+            else if (p.rows == 4U) hipLaunchKernelGGL(HIP_KERNEL_NAME(wave_rows_moe_route_logits_kernel<Activation, 4U>),
+                waves, dim3(256U), 0, stream, p.args, f32, config.hidden_size, config.expert_count);
+            else hipLaunchKernelGGL(HIP_KERNEL_NAME(wave_rows_moe_route_logits_kernel<Activation, 8U>),
+                waves, dim3(256U), 0, stream, p.args, f32, config.hidden_size, config.expert_count);
+        } else if (p.rows == 2U) hipLaunchKernelGGL(HIP_KERNEL_NAME(lanes_rows_moe_route_logits_kernel<Activation, 2U>),
+            blocks(2U), dim3(256U), 0, stream, p.args, f32, config.hidden_size, config.expert_count);
+        else if (p.rows == 4U) hipLaunchKernelGGL(HIP_KERNEL_NAME(lanes_rows_moe_route_logits_kernel<Activation, 4U>),
+            blocks(4U), dim3(256U), 0, stream, p.args, f32, config.hidden_size, config.expert_count);
+        else hipLaunchKernelGGL(HIP_KERNEL_NAME(lanes_rows_moe_route_logits_kernel<Activation, 8U>),
+            blocks(8U), dim3(256U), 0, stream, p.args, f32, config.hidden_size, config.expert_count);
     } else if (p.rows == 2U) hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_moe_route_logits_kernel<Activation, WeightKind, 2U>),
         grid, dim3(256U), 0, stream, p.args, weights, config.hidden_size, config.expert_count);
     else if (p.rows == 4U) hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_moe_route_logits_kernel<Activation, WeightKind, 4U>),
