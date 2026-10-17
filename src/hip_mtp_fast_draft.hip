@@ -117,7 +117,18 @@ __global__ __launch_bounds__(256) void mtp_draft_q8_gemv(const void* input,const
     if constexpr(OutBf16) static_cast<std::uint16_t*>(output)[row]=to_bf16(sum);
     else static_cast<float*>(output)[row]=sum;
 }
+__global__ void mtp_dequantize_q8(const unsigned char* q8,std::uint64_t elements,float* output) {
+    const auto i=static_cast<std::uint64_t>(blockIdx.x)*blockDim.x+threadIdx.x;if(i>=elements) return;
+    const auto* block=q8+(i/32U)*34U;
+    output[i]=__half2float(*reinterpret_cast<const __half*>(block))*static_cast<float>(static_cast<signed char>(block[2U+i%32U]));
+}
 } // namespace
+void launch_hip_mtp_dequantize_q8(const void* q8,std::uint64_t elements,float* output,void* stream) {
+    if(!q8 || !output || !stream || !elements || elements%32U) throw std::invalid_argument("MTP Q8 dequantize views are invalid");
+    hipLaunchKernelGGL(mtp_dequantize_q8,dim3(static_cast<unsigned>((elements+255U)/256U)),dim3(256),0,static_cast<hipStream_t>(stream),
+        static_cast<const unsigned char*>(q8),elements,output);
+    check(hipGetLastError(),"MTP Q8 dequantize launch");
+}
 void launch_hip_mtp_draft_q8_gemv(const void* input,bool input_bf16,const void* q8,std::uint32_t width,
     std::uint32_t rows,void* output,bool output_bf16,void* stream) {
     if(!input || !q8 || !output || !stream || !rows || !width || width%32U ||

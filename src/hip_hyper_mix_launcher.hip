@@ -1,3 +1,4 @@
+#include "strix/hip_mtp_fast_draft.hpp"
 #include "strix/hip_lane_chain_hyper_output_tests.hpp"
 #include "strix/hip_lane_chain_hyper_projection_tests.hpp"
 #include "strix/hip_hc_deferred_norm_tests.hpp"
@@ -3439,7 +3440,7 @@ MtpHyperPrepared mtp_hyper_prepare(const MtpNativeContext& c,MtpHyperRole role) 
     if(!c.model || !c.plan || !c.tensors || !c.resources ||
        (role!=MtpHyperRole::attention && role!=MtpHyperRole::mlp && role!=MtpHyperRole::head))
         throw std::invalid_argument("MTP HC context or role is invalid");
-    c.resources->validate();
+    c.resources->validate_stage();
     if(c.model!=&c.resources->model() || c.plan!=&c.resources->plan() || c.tensors!=&c.resources->tensors() ||
        c.position>=c.resources->context_capacity() || c.model->hidden_size!=2560U || c.model->hc_count!=4U || c.model->hc_lowrank!=320U)
         throw std::invalid_argument("MTP HC context is not bound to its actual canonical owner");
@@ -3474,18 +3475,49 @@ void launch_hip_mtp_hyper_mix(const MtpNativeContext& c,MtpHyperRole role,void* 
     check_hip(hipStreamIsCapturing(stream,&capture),"MTP HC capture query");
     if(capture!=hipStreamCaptureStatusNone)throw std::invalid_argument("MTP HC is eager only");
     check_hip(hipPeekAtLastError(),"MTP HC prior HIP error");
-    auto* normalized=reinterpret_cast<float*>(p.workspace.address);auto* low=normalized+p.h*p.c;
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(prepare_hyper_norm_kernel<std::uint16_t>),dim3(p.c),dim3(kThreads),0,stream,
-        reinterpret_cast<const std::uint16_t*>(p.input.address),reinterpret_cast<const void*>(p.norm.runtime->address),0U,
-        p.h,p.c,c.model->rms_norm_epsilon,normalized);check_hip(hipGetLastError(),"MTP HC normalization");
-    const unsigned low_blocks=(p.rank+kStagedOutputs-1U)/kStagedOutputs;
     const bool inject=role!=MtpHyperRole::head;
+    enqueue_hip_mtp_hyper_mix_q8(reinterpret_cast<const std::uint16_t*>(p.input.address),reinterpret_cast<const float*>(p.norm.runtime->address),
+        reinterpret_cast<const void*>(p.down.runtime->address),inject?reinterpret_cast<const void*>(p.inject.runtime->address):nullptr,
+        reinterpret_cast<const void*>(p.up.runtime->address),reinterpret_cast<float*>(p.workspace.address),
+        inject?reinterpret_cast<float*>(p.injection.address):nullptr,reinterpret_cast<std::uint16_t*>(p.output.address),
+        c.model->rms_norm_epsilon,false,stream);
+}
+void launch_hip_mtp_hyper_mix_draft(const MtpNativeContext& c,MtpHyperRole role,const float* inject_f32,void* raw_stream) {
+    const auto p=mtp_hyper_prepare(c,role);
+    if(!raw_stream || raw_stream!=c.resources->stream())throw std::invalid_argument("MTP HC stream differs from retained owner");
+    const bool inject=role!=MtpHyperRole::head;
+    if(inject && !inject_f32)throw std::invalid_argument("MTP draft HC injection needs its F32 [4][10240] copy");
+    check_hip(hipPeekAtLastError(),"MTP draft HC prior HIP error");
+    enqueue_hip_mtp_hyper_mix_q8(reinterpret_cast<const std::uint16_t*>(p.input.address),reinterpret_cast<const float*>(p.norm.runtime->address),
+        reinterpret_cast<const void*>(p.down.runtime->address),inject?inject_f32:nullptr,reinterpret_cast<const void*>(p.up.runtime->address),
+        reinterpret_cast<float*>(p.workspace.address),inject?reinterpret_cast<float*>(p.injection.address):nullptr,
+        reinterpret_cast<std::uint16_t*>(p.output.address),c.model->rms_norm_epsilon,true,raw_stream);
+}
+void enqueue_hip_mtp_hyper_mix_q8(const std::uint16_t* input,const float* norm,const void* down,const void* inject,const void* up,
+    float* workspace,float* injection,std::uint16_t* output,float epsilon,bool draft,void* raw_stream) {
+    constexpr unsigned h=2560U,streams=4U,rank=320U;
+    if(!input || !norm || !down || !up || !workspace || !output || !raw_stream || (inject==nullptr)!=(injection==nullptr) ||
+       (draft && inject && reinterpret_cast<std::uintptr_t>(inject)%16U))
+        throw std::invalid_argument("MTP HC raw views are incomplete");
+    const auto stream=static_cast<hipStream_t>(raw_stream);
+    auto* normalized=workspace;auto* low=normalized+h*streams;
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(prepare_hyper_norm_kernel<std::uint16_t>),dim3(streams),dim3(kThreads),0,stream,
+        input,static_cast<const void*>(norm),0U,h,streams,epsilon,normalized);check_hip(hipGetLastError(),"MTP HC normalization");
+    if(draft) {
+        // Target decode's FP32 split-K projection and lane-chain output (Q8 down/up, F32 injection).
+        constexpr unsigned outputs=4U,blocks=rank/outputs;
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(splitk_hyper_projection_kernel<outputs,float>),dim3(blocks+(inject?1U:0U)),dim3(512U),0,stream,
+            normalized,down,h*streams,streams,rank,low,inject,injection,blocks);
+        check_hip(hipGetLastError(),"MTP draft HC split-K projection");
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(lane_chain_hyper_output_kernel<std::uint16_t>),dim3(h/32U),dim3(32U*streams),
+            static_cast<std::size_t>(lane_chain_hyper_output_lds(streams,rank)),stream,normalized,low,up,h,streams,rank,output);
+        check_hip(hipGetLastError(),"MTP draft HC lane-chain output");
+        return;
+    }
+    const unsigned low_blocks=(rank+kStagedOutputs-1U)/kStagedOutputs;
     hipLaunchKernelGGL(fused_staged_hyper_projection_kernel,dim3(low_blocks+(inject?1U:0U)),dim3(kStagedThreads),0,stream,
-        normalized,reinterpret_cast<const void*>(p.down.runtime->address),8U,p.h*p.c,p.c,p.rank,low,
-        inject?reinterpret_cast<const void*>(p.inject.runtime->address):nullptr,8U,
-        inject?reinterpret_cast<float*>(p.injection.address):nullptr,low_blocks);check_hip(hipGetLastError(),"MTP HC Q8 down/injection");
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(parallel_hyper_output_kernel<std::uint16_t>),dim3((p.h+255U)/256U),dim3(256U),0,stream,
-        normalized,low,reinterpret_cast<const void*>(p.up.runtime->address),8U,p.h,p.c,p.rank,
-        reinterpret_cast<std::uint16_t*>(p.output.address));check_hip(hipGetLastError(),"MTP HC Q8 output");
+        normalized,down,8U,h*streams,streams,rank,low,inject,8U,injection,low_blocks);check_hip(hipGetLastError(),"MTP HC Q8 down/injection");
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(parallel_hyper_output_kernel<std::uint16_t>),dim3((h+255U)/256U),dim3(256U),0,stream,
+        normalized,low,up,8U,h,streams,rank,output);check_hip(hipGetLastError(),"MTP HC Q8 output");
 }
 } // namespace strix

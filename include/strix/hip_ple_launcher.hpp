@@ -94,4 +94,10 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
+namespace testing {
+// Raw PLE Q8 projection (generic block-per-row or the wave8 kernel with the same
+// 256-leaf summation tree); width % 32 == 0 for wave8. Bit-exactness fixture only.
+void enqueue_ple_q8_projection(bool wave8,const std::uint16_t* input,const void* q8,std::uint32_t input_width,
+    std::uint32_t output_width,float* output,void* stream);
+}
 }  // namespace strix

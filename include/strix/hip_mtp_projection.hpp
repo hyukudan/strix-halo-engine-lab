@@ -11,6 +11,9 @@ enum class MtpHyperRole : unsigned { attention, mlp, head };
 // Pure all-view/tensor/alias admission, owner remains retained by caller.
 void preflight_hip_mtp_hyper_mix(const MtpNativeContext&,MtpHyperRole);
 void launch_hip_mtp_hyper_mix(const MtpNativeContext&,MtpHyperRole,void* stream);
+// Draft-only HC mix: prepare norm + FP32 split-K projection (injection from the F32
+// [4][10240] copy inject_f32; null for head) + lane-chain output, as in target decode.
+void launch_hip_mtp_hyper_mix_draft(const MtpNativeContext&,MtpHyperRole,const float* inject_f32,void* stream);
 void preflight_hip_mtp_routed_experts(const MtpNativeContext&);
 // All-Q8 gate/up/down, original ascending-slot FP32 accumulation, final BF16.
 // Uses owner's sticky status (never clears it); owner completes/checks before

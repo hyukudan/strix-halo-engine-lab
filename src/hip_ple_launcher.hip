@@ -445,6 +445,44 @@ __global__ void project_bf16_to_fp32_kernel(
     }
 }
 
+// Same 256-leaf DAG as project_bf16_to_fp32_kernel<q8_0> inside one wave per row:
+// leaf t=8*lane+local accumulates features t, t+256, ... in order, then the
+// LDS tree (strides 128..8 are lane shuffles 16..1, strides 4..1 are local).
+__global__ __launch_bounds__(256) void project_wave8_q8_bf16_to_fp32_kernel(
+    const std::uint16_t* input, const void* weights,
+    std::uint32_t input_width, std::uint32_t output_width, float* output) {
+    const auto row = static_cast<std::uint32_t>(blockIdx.x) * 8U + static_cast<std::uint32_t>(threadIdx.x) / 32U;
+    if (row >= output_width) return;
+    const auto lane = static_cast<std::uint32_t>(threadIdx.x) % 32U;
+    float partial[8]{};
+    const auto* blocks = static_cast<const Q8Block*>(weights) + static_cast<std::uint64_t>(row) * (input_width / 32U);
+    for (std::uint32_t chunk = 0; chunk < input_width; chunk += kThreads) {
+        const auto feature = chunk + 8U * lane;
+        if (feature < input_width) {
+            const auto& block = blocks[feature / 32U];
+#pragma unroll
+            for (unsigned local = 0; local < 8; ++local)
+                partial[local] += bf16_to_float(input[feature + local]) *
+                    (__half2float(block.scale) * static_cast<float>(block.values[feature % 32U + local]));
+        }
+    }
+#pragma unroll
+    for (unsigned distance = 16; distance > 0; distance /= 2) {
+#pragma unroll
+        for (unsigned local = 0; local < 8; ++local) {
+            const auto partner = __shfl_down(partial[local], distance, 32);
+            if (lane < distance) partial[local] += partner;
+        }
+    }
+    if (lane == 0) {
+        partial[0] += partial[4]; partial[1] += partial[5];
+        partial[2] += partial[6]; partial[3] += partial[7];
+        partial[0] += partial[2]; partial[1] += partial[3];
+        partial[0] += partial[1];
+        output[row] = partial[0];
+    }
+}
+
 __global__ void normalize_key_and_gate_kernel(
     float* key,
     const std::uint16_t* query,
@@ -835,6 +873,12 @@ void launch_projection_by_kind(
                 output);
         return;
     case WeightKind::q8_0:
+        if (input_width % 32U == 0U) {
+            hipLaunchKernelGGL(project_wave8_q8_bf16_to_fp32_kernel, dim3((output_width + 7U) / 8U), dim3(256), 0,
+                hip_execution_stream(), input, reinterpret_cast<const void*>(weights.address), input_width, output_width, output);
+            check_hip(hipGetLastError(), "HIP PLE wave8 Q8 projection launch");
+            return;
+        }
         launch_projection<
             WeightKind::q8_0>(
                 input,
@@ -1732,6 +1776,14 @@ std::uint64_t implementation_identity(
 }
 
 }  // namespace
+void testing::enqueue_ple_q8_projection(bool wave8,const std::uint16_t* input,const void* q8,std::uint32_t input_width,
+    std::uint32_t output_width,float* output,void* stream) {
+    const auto s=static_cast<hipStream_t>(stream);
+    if(wave8) hipLaunchKernelGGL(project_wave8_q8_bf16_to_fp32_kernel,dim3((output_width+7U)/8U),dim3(256),0,s,input,q8,input_width,output_width,output);
+    else hipLaunchKernelGGL(HIP_KERNEL_NAME(project_bf16_to_fp32_kernel<WeightKind::q8_0>),dim3(output_width),dim3(kThreads),0,s,
+        input,q8,input_width,output_width,output);
+    check_hip(hipGetLastError(),"PLE Q8 projection test launch");
+}
 
 struct HipPleLauncherBundle::OwnedUploads {
     AllocationGenerationSource generations;

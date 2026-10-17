@@ -81,6 +81,8 @@ struct HipMtpRuntime::Impl {
     std::unique_ptr<HipGreedyOutput> selector;
     std::unique_ptr<HipMtpDraftHead> draft;
     std::unique_ptr<float,void(*)(float*)> fast_workspace{nullptr,[](float* p){(void)hipFree(p);}};
+    // F32 copies of the attention/MLP HC injection matrices for the split-K draft mix.
+    std::unique_ptr<float,void(*)(float*)> hc_inject{nullptr,[](float* p){(void)hipFree(p);}};
     bool draft_exact=false;
     std::optional<HipMtpResources::NativeValidationScope> validation;
     std::optional<HipMtpTargetHiddenTicket> last_target,cycle_base,base_previous_target,reconcile_final;
@@ -344,17 +346,17 @@ struct HipMtpRuntime::Impl {
                 else launch_hip_mtp_embedding(c,pending_token,stream);
                 if(draft_exact) launch_hip_mtp_input_fusion(fusion(),stream);
                 else launch_hip_mtp_input_fusion_draft(fusion(),stream);
-                launch_hip_mtp_hyper_mix(c,MtpHyperRole::attention,stream);
+                hyper(c,MtpHyperRole::attention,stream);
                 launch_hip_mtp_indexer(c,stream);
                 if(draft_exact) launch_hip_mtp_sparse_attention(c,stream); else launch_hip_mtp_sparse_attention_draft(c,stream);
-                launch_hip_mtp_inject(c,MtpInjectRole::attention,stream);launch_hip_mtp_hyper_mix(c,MtpHyperRole::mlp,stream);
+                launch_hip_mtp_inject(c,MtpInjectRole::attention,stream);hyper(c,MtpHyperRole::mlp,stream);
                 launch_hip_mtp_route(c,stream);
                 if(draft_exact) {
                     launch_hip_mtp_shared_expert(c,stream);launch_hip_mtp_routed_experts(c,stream);launch_hip_mtp_moe_combine(c,stream);
                 } else launch_hip_mtp_fast_moe(fast_moe(),stream);
                 launch_hip_mtp_inject(c,MtpInjectRole::mlp,stream);
                 copy(owner->view(HipMtpBuffer::wide_current),owner->view(HipMtpBuffer::wide_next));
-                launch_hip_mtp_hyper_mix(c,MtpHyperRole::head,stream);
+                hyper(c,MtpHyperRole::head,stream);
                 draft->launch(hidden,k,stream);
             }
             owner->complete();
@@ -363,6 +365,12 @@ struct HipMtpRuntime::Impl {
             // Row zero is the pending cycle input at base_source, as in read_greedy_token.
             first_cache_reusable=true;candidates=tokens;return tokens;
         } catch(...) {failure();throw;}
+    }
+    void hyper(const MtpNativeContext& c,MtpHyperRole role,void* stream) const {
+        if(draft_exact) {launch_hip_mtp_hyper_mix(c,role,stream);return;}
+        constexpr std::uint64_t inject=4U*10240U;
+        launch_hip_mtp_hyper_mix_draft(c,role,role==MtpHyperRole::attention?hc_inject.get():
+            role==MtpHyperRole::mlp?hc_inject.get()+inject:nullptr,stream);
     }
     HipMtpFastMoeViews fast_moe() const {
         const auto& t=owner->tensors();const auto address=[](MtpTensorView v){return reinterpret_cast<const void*>(v.runtime->address);};
@@ -459,6 +467,13 @@ void HipMtpRuntime::enable_draft_chain(HipMtpDraftHeadConfig config,bool exact) 
         float* workspace=nullptr;
         check(hipMalloc(reinterpret_cast<void**>(&workspace),hip_mtp_fast_moe_workspace_floats*sizeof(float)),"MTP fast draft workspace");
         p.fast_workspace.reset(workspace);
+        require(m.hc_count==4U && m.hc_lowrank==320U,"MTP fast draft HC mix requires the canonical sidecar geometry");
+        constexpr std::uint64_t inject=4U*10240U;float* hc=nullptr;
+        check(hipMalloc(reinterpret_cast<void**>(&hc),2U*inject*sizeof(float)),"MTP draft HC injection copies");
+        p.hc_inject.reset(hc);
+        launch_hip_mtp_dequantize_q8(reinterpret_cast<const void*>(p.owner->tensors().attention_hc_inject.runtime->address),inject,hc,p.owner->stream());
+        launch_hip_mtp_dequantize_q8(reinterpret_cast<const void*>(p.owner->tensors().mlp_hc_inject.runtime->address),inject,hc+inject,p.owner->stream());
+        check(hipStreamSynchronize(static_cast<hipStream_t>(p.owner->stream())),"MTP draft HC injection copies");
     }
     p.draft=std::make_unique<HipMtpDraftHead>(reinterpret_cast<const void*>(head.runtime->address),std::move(config),p.owner->stream());
 }

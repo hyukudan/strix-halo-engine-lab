@@ -27,6 +27,14 @@ inline constexpr std::uint32_t hip_mtp_fast_moe_workspace_floats=11U*640U+1U;
 void launch_hip_mtp_draft_q8_gemv(const void* input,bool input_bf16,const void* q8,std::uint32_t width,
     std::uint32_t rows,void* output,bool output_bf16,void* stream);
 void launch_hip_mtp_fast_moe(const HipMtpFastMoeViews&,void* stream);
+// Raw MTP HC mix (hidden 2560, 4 streams, rank 320, Q8 down/up, F32 norm): exact
+// staged path (inject Q8 [4][10240]) or draft split-K/lane-chain path (inject F32
+// [4][10240], 16-aligned). Null inject/injection for the head role. Workspace
+// holds 10240+320 floats.
+void enqueue_hip_mtp_hyper_mix_q8(const std::uint16_t* input,const float* norm,const void* down,const void* inject,const void* up,
+    float* workspace,float* injection,std::uint16_t* output,float epsilon,bool draft,void* stream);
+// Flat Q8_0 -> F32 (elements % 32 == 0): out[i]=scale*code, the Q8 loader value.
+void launch_hip_mtp_dequantize_q8(const void* q8,std::uint64_t elements,float* output,void* stream);
 // Raw exact-path sequences behind the MTP routed/shared launchers (no owner
 // checks), shared with the draft benchmark/fixture. Routed temp needs 3840 floats,
 // shared workspace 1280 floats.

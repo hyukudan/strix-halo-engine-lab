@@ -4,6 +4,7 @@
 #include "strix/hip_mtp_fast_draft.hpp"
 #include "strix/hip_mtp_input_fusion.hpp"
 #include "strix/hip_mtp_attention.hpp"
+#include "strix/hip_ple_launcher.hpp"
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 #include <algorithm>
@@ -206,6 +207,66 @@ template<class F> double time_gpu(hipStream_t s,F&& body){
         float ms=0;check(hipEventElapsedTime(&ms,a,b));if(r>=3)t.push_back(ms);}
     check(hipEventDestroy(a));check(hipEventDestroy(b));return median(t);
 }
+// MTP HC mix: exact staged path vs draft split-K/lane-chain path vs a double reference.
+struct Hyper {
+    static constexpr std::uint32_t W=H*HC,R=320;
+    Device<std::uint16_t> input{W},exact{H},draft{H};Device<float> norm{W},ws{W+R},inj_exact{HC},inj_draft{HC},inject_f32{HC*W};
+    Device<std::uint8_t> down{static_cast<std::size_t>(R)*W/32*34},inject{static_cast<std::size_t>(HC)*W/32*34},up{static_cast<std::size_t>(W)*R/32*34};
+    hipStream_t s=nullptr;std::vector<std::uint16_t> x;std::vector<float> g;
+    explicit Hyper(std::uint32_t seed){
+        check(hipStreamCreateWithFlags(&s,hipStreamNonBlocking));
+        int k=0;for(auto* d:{&down,&inject,&up}){hipLaunchKernelGGL(fill_q8,dim3(512),dim3(256),0,s,d->p,static_cast<std::uint64_t>(d->n/34),seed+static_cast<std::uint32_t>(k),k==1?-12:-8);++k;}
+        strix::launch_hip_mtp_dequantize_q8(inject.p,HC*W,inject_f32.p,s);check(hipStreamSynchronize(s));
+        std::mt19937 r(seed);std::normal_distribution<float> n(0,1);x.resize(W);g.resize(W);
+        for(auto& v:x)v=bf16(3*n(r));for(auto& v:g)v=1+0.2F*n(r);input.write(x);norm.write(g);
+    }
+    ~Hyper(){static_cast<void>(hipStreamDestroy(s));}
+    void run(bool use_draft,bool with_inject,std::uint16_t* out,float* injection){
+        strix::enqueue_hip_mtp_hyper_mix_q8(input.p,norm.p,down.p,with_inject?(use_draft?static_cast<const void*>(inject_f32.p):inject.p):nullptr,up.p,ws.p,
+            with_inject?injection:nullptr,out,1e-6F,use_draft,s);
+    }
+    std::pair<std::vector<double>,std::vector<double>> reference(){
+        const auto d=host(down,0,down.n),i=host(inject,0,inject.n),u=host(up,0,up.n);
+        std::vector<double> nx(W);
+        for(std::uint32_t t=0;t<HC;++t){double ss=0;for(std::uint32_t f=0;f<H;++f){const double v=value(x[t*H+f]);ss+=v*v;}
+            const double inv=1/std::sqrt(ss/H+1e-6);for(std::uint32_t f=0;f<H;++f)nx[t*H+f]=value(x[t*H+f])*inv*g[t*H+f];}
+        auto sig=[](double v){return 1/(1+std::exp(-v));};
+        std::vector<double> low(R),inj(HC),out(H,0);
+        for(std::uint32_t o=0;o<R;++o){const double v=dot(d.data()+static_cast<std::size_t>(o)*(W/32*34),nx)/HC;low[o]=v*sig(v);}
+        for(std::uint32_t o=0;o<HC;++o)inj[o]=2*sig(dot(i.data()+static_cast<std::size_t>(o)*(W/32*34),nx)/HC);
+        for(std::uint32_t f=0;f<H;++f){for(std::uint32_t t=0;t<HC;++t){const double gate=dot(u.data()+static_cast<std::size_t>(t*H+f)*(R/32*34),low);out[f]+=nx[t*H+f]*sig(gate);}out[f]/=HC;}
+        return {out,inj};
+    }
+};
+void hyper_cases(){
+    for(const bool with_inject:{true,false}){
+        Hyper m(with_inject?31U:32U);
+        m.run(false,with_inject,m.exact.p,m.inj_exact.p);m.run(true,with_inject,m.draft.p,m.inj_draft.p);check(hipStreamSynchronize(m.s));
+        const auto [ref,inj]=m.reference();double scale=0;
+        const double ee=max_error(m.exact.read(),ref,scale),de=max_error(m.draft.read(),ref,scale);
+        double ie=0,id=0;if(with_inject){const auto a=m.inj_exact.read(),b=m.inj_draft.read();
+            for(std::uint32_t t=0;t<HC;++t){ie=std::max(ie,std::abs(a[t]-inj[t]));id=std::max(id,std::abs(b[t]-inj[t]));}}
+        std::printf("hc %s: |ref|max %.4g exact err %.3g draft err %.3g injection err exact %.3g draft %.3g\n",with_inject?"attn/mlp":"head",scale,ee,de,ie,id);
+        ok("draft HC output within exact-path error budget",de<=std::max(2*ee,scale*std::ldexp(1.0,-8)));
+        ok("draft HC injection within 1e-5",id<=std::max(2*ie,1e-5));
+    }
+}
+// PLE Q8 projection (target path): wave8 kernel must be bit-identical to the generic kernel.
+void ple_cases(){
+    hipStream_t s=nullptr;check(hipStreamCreateWithFlags(&s,hipStreamNonBlocking));
+    for(const auto [in,out]:{std::pair{2560U,10240U},std::pair{2560U,2560U},std::pair{96U,77U},std::pair{32U,9U},std::pair{288U,300U}}){
+        Device<std::uint8_t> w(static_cast<std::size_t>(out)*in/32*34);Device<std::uint16_t> x(in);Device<float> a(out),b(out);
+        hipLaunchKernelGGL(fill_q8,dim3(512),dim3(256),0,s,w.p,static_cast<std::uint64_t>(w.n/34),in*7U+out,-9);check(hipStreamSynchronize(s));
+        std::mt19937 r(in+out);std::normal_distribution<float> n(0,1);std::vector<std::uint16_t> v(in);
+        for(std::uint32_t i=0;i<in;++i)v[i]=i%17==3?static_cast<std::uint16_t>(0x0001U):bf16(n(r)*std::ldexp(1.0F,static_cast<int>(r()%40)-20));x.write(v);
+        strix::testing::enqueue_ple_q8_projection(false,x.p,w.p,in,out,a.p,s);strix::testing::enqueue_ple_q8_projection(true,x.p,w.p,in,out,b.p,s);
+        check(hipStreamSynchronize(s));
+        const auto ra=a.read(),rb=b.read();
+        char name[96];std::snprintf(name,sizeof(name),"PLE wave8 Q8 projection bit-exact %ux%u",out,in);
+        ok(name,std::memcmp(ra.data(),rb.data(),ra.size()*4)==0);
+    }
+    check(hipStreamDestroy(s));
+}
 void bench(){
     Moe m(9);
     // Rotate expert sets so successive runs do not hit the same 52 MB in the 32 MB cache.
@@ -223,7 +284,19 @@ void bench(){
     const double qf=time_gpu(q.s,[&]{strix::launch_hip_mtp_draft_q8_gemv(q.x.p,true,q.w.p,H,12288U,q.fast.p,false,q.s);
         strix::launch_hip_mtp_draft_q8_gemv(kv.x.p,true,kv.w.p,H,512U,kv.fast.p,false,q.s);strix::launch_hip_mtp_draft_q8_gemv(kv.x.p,true,kv.w.p,H,512U,kv.fast.p,false,q.s);
         strix::launch_hip_mtp_draft_q8_gemv(o.xf.p,false,o.w.p,6144U,H,o.fast_bf16.p,true,q.s);});
+    Hyper hc(5);
+    const double he=time_gpu(hc.s,[&]{hc.run(false,true,hc.exact.p,hc.inj_exact.p);}),hd=time_gpu(hc.s,[&]{hc.run(true,true,hc.draft.p,hc.inj_draft.p);});
+    Device<std::uint8_t> pk(static_cast<std::size_t>(10240)*2560/32*34),pv(static_cast<std::size_t>(2560)*2560/32*34);Device<std::uint16_t> px(2560);Device<float> po(10240);
+    hipLaunchKernelGGL(fill_q8,dim3(1024),dim3(256),0,hc.s,pk.p,static_cast<std::uint64_t>(pk.n/34),1U,-9);
+    hipLaunchKernelGGL(fill_q8,dim3(1024),dim3(256),0,hc.s,pv.p,static_cast<std::uint64_t>(pv.n/34),2U,-9);
+    const auto ple=[&](bool wave){strix::testing::enqueue_ple_q8_projection(wave,px.p,pk.p,2560,10240,po.p,hc.s);
+        strix::testing::enqueue_ple_q8_projection(wave,px.p,pv.p,2560,2560,po.p,hc.s);};
+    const double pg=time_gpu(hc.s,[&]{ple(false);}),pw=time_gpu(hc.s,[&]{ple(true);});
     std::printf("bench per draft, GPU median of 30 (ms)\n");
+    std::printf("  HC mix exact staged (per mix, x3 per draft)            %.4f\n",he);
+    std::printf("  HC mix draft split-K + lane-chain (per mix)            %.4f\n",hd);
+    std::printf("  PLE key+value Q8 generic (target, per row)             %.4f\n",pg);
+    std::printf("  PLE key+value Q8 wave8 bit-exact (target, per row)     %.4f\n",pw);
     std::printf("  attention Q8 q/k/v/out exact block-per-row kernel        %.4f\n",qe);
     std::printf("  attention Q8 q/k/v/out draft wave-per-row GEMV           %.4f\n",qf);
     std::printf("  MoE exact (shared 5 + routed 42 + combine 1 launches)  %.4f\n",exact);
@@ -236,6 +309,6 @@ int main(int argc,char** argv){
     try{
         int devices=0;if(hipGetDeviceCount(&devices)!=hipSuccess||!devices){std::cout<<"skip: no HIP device\n";return 77;}
         if(argc>1&&std::string(argv[1])=="--bench"){bench();return 0;}
-        fusion_cases();gemv_cases();moe_cases();std::cout<<"passed "<<passed<<"\n";return 0;
+        ple_cases();hyper_cases();fusion_cases();gemv_cases();moe_cases();std::cout<<"passed "<<passed<<"\n";return 0;
     }catch(const std::exception& e){std::cerr<<e.what()<<"\n";return 1;}
 }
