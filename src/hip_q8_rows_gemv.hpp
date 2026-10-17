@@ -26,14 +26,25 @@
 // including translation unit owns the arithmetic flags.
 
 #include <hip/hip_fp16.h>
+#include <hip/hip_ext.h>
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <initializer_list>
 #include <utility>
+
+namespace strix {
+// Launches that drop the AQL barrier bit for kernels proven independent of the one queued
+// just before them (default on; STRIX_ANYORDER=0 keeps every launch barrier-ordered).
+inline bool strix_any_order_enabled() {
+    static const bool enabled = [] { const char* v = std::getenv("STRIX_ANYORDER"); return !v || v[0] != '0'; }();
+    return enabled;
+}
+}  // namespace strix
 
 namespace strix::q8_rows {
 
@@ -346,24 +357,31 @@ template <auto Kernel, unsigned Threads> unsigned resident_blocks(std::uint32_t 
 }
 
 // The caller validated width % 32 == 0, 16-byte aligned rows and, for A8,
-// a8_bytes<rows>(width) <= kLdsBytes.
-template <class Site> void launch(const Site& site, bool a8, hipStream_t stream) {
+// a8_bytes<rows>(width) <= kLdsBytes. any_order drops the packet's barrier bit: the
+// caller guarantees the projection neither reads nor writes what the previously
+// queued kernel touches, so it may start while that kernel still runs.
+template <class Site> void launch(const Site& site, bool a8, hipStream_t stream, bool any_order = false) {
+    const auto start = [&](auto kernel, unsigned blocks, unsigned threads, std::uint32_t bytes) {
+        if (any_order)
+            hipExtLaunchKernelGGL(kernel, dim3(blocks), dim3(threads), bytes, stream, nullptr, nullptr, hipExtAnyOrderLaunch, site);
+        else hipLaunchKernelGGL(kernel, dim3(blocks), dim3(threads), bytes, stream, site);
+    };
     const auto groups_for = [&](unsigned outs, unsigned waves) { return ((site.outputs + outs - 1U) / outs + waves - 1U) / waves; };
     if (a8) {
         constexpr unsigned Outs = a8_outs_of<Site>();
         constexpr auto kernel = project_rows_a8_kernel<Site, Outs>;
         const auto bytes = static_cast<std::uint32_t>(a8_bytes<Site::rows>(site.width));
         const auto blocks = std::min(groups_for(Outs, kA8Waves), resident_blocks<kernel, kA8Threads>(bytes));
-        hipLaunchKernelGGL(kernel, dim3(blocks), dim3(kA8Threads), bytes, stream, site);
+        start(kernel, blocks, kA8Threads, bytes);
     } else if (const auto bytes = staged_bytes(site)) {
         constexpr unsigned Outs = outs_of<Site, true>();
         constexpr auto kernel = project_rows_kernel<Site, Outs, true>;
         const auto blocks = std::min(groups_for(Outs, kWaves), resident_blocks<kernel, kThreads>(bytes));
-        hipLaunchKernelGGL(kernel, dim3(blocks), dim3(kThreads), bytes, stream, site);
+        start(kernel, blocks, kThreads, bytes);
     } else {
         constexpr unsigned Outs = outs_of<Site, false>();
         constexpr auto kernel = project_rows_kernel<Site, Outs, false>;
-        hipLaunchKernelGGL(kernel, dim3(groups_for(Outs, kWaves)), dim3(kThreads), 0U, stream, site);
+        start(kernel, groups_for(Outs, kWaves), kThreads, 0U);
     }
 }
 

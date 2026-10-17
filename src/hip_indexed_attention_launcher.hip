@@ -17,7 +17,9 @@
 #include "strix/hip_qsa_gqa_reuse_diagnostic.hpp"
 #include "strix/execution_plan.hpp"
 
+#include <cstdlib>
 #include <hip/hip_fp16.h>
+#include <hip/hip_ext.h>
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
@@ -3632,7 +3634,8 @@ QsaKnownRows<Rows> prepare_qsa_known_rows(std::span<const ExecutionDispatchConte
 }
 
 template <WeightKind Kind, unsigned Rows>
-void launch_qsa_rows_input(bool prefetch, bool a8, const QsaRowsInputViews<Rows>& views, std::uint32_t hidden, hipStream_t stream) {
+void launch_qsa_rows_input(bool prefetch, bool a8, const QsaRowsInputViews<Rows>& views, std::uint32_t hidden, hipStream_t stream,
+    bool any_order = false) {
     if constexpr (Kind == WeightKind::q8_0) if (prefetch) {
         QsaInputRowsSite<Rows> site{};
         for (unsigned m = 0; m < views.count; ++m) {
@@ -3643,10 +3646,13 @@ void launch_qsa_rows_input(bool prefetch, bool a8, const QsaRowsInputViews<Rows>
         site.segments.count = views.count;
         for (unsigned r = 0; r < Rows; ++r) site.input[r] = views.input[r];
         site.width = hidden; site.outputs = views.first[views.count];
-        q8_rows::launch(site, a8, stream);
+        q8_rows::launch(site, a8, stream, any_order);
         return;
     }
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(linear_to_float_rows_kernel<Kind, Rows>), dim3(views.first[views.count]), dim3(kThreads), 0,
+    if (any_order)
+        hipExtLaunchKernelGGL(HIP_KERNEL_NAME(linear_to_float_rows_kernel<Kind, Rows>), dim3(views.first[views.count]), dim3(kThreads), 0,
+            stream, nullptr, nullptr, hipExtAnyOrderLaunch, views, hidden);
+    else hipLaunchKernelGGL(HIP_KERNEL_NAME(linear_to_float_rows_kernel<Kind, Rows>), dim3(views.first[views.count]), dim3(kThreads), 0,
         stream, views, hidden);
 }
 template <WeightKind Kind, unsigned Rows>
@@ -3696,6 +3702,10 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
     const std::array<float* WorkspacePointers::*, 5> targets{&WorkspacePointers::index_query, &WorkspacePointers::current_index_key,
         &WorkspacePointers::q_gate, &WorkspacePointers::current_k, &WorkspacePointers::current_v};
     std::array<bool, 5> done{};
+    // Any-order (STRIX_ANYORDER=0 disables): input groups after the first read the same rows and write other
+    // targets; the q and k norms follow a barrier-ordered index norm and touch only their own.
+    static const bool any_order = strix_any_order_enabled();
+    bool launched_group = false;
     for (unsigned lead = 0; lead < 5U; ++lead) {
         if (done[lead]) continue;
         // Group every matrix sharing the lead's serial organization (format + prefetch8).
@@ -3712,27 +3722,32 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
         }
         dispatch_weight_kind(matrices[lead]->manifest->ggml_type, [&](auto kind) {
             launch_qsa_rows_input<decltype(kind)::value, Rows>(prepared.prefetch[lead], config.known_window_a8_projections,
-                input, a.hidden, stream);
+                input, a.hidden, stream, any_order && launched_group);
         });
+        launched_group = true;
         check_hip(hipGetLastError(), "QSA known-window input projection launch");
         if (prepared.prefetch[lead] && config.prefetch_stats)
             config.prefetch_stats->dispatched_projections.fetch_add(input.count, std::memory_order_relaxed);
     }
 
     const auto norm = [&](const TensorPair& weights, float* WorkspacePointers::* target, std::uint32_t heads,
-                          std::uint32_t head_dim, std::uint32_t stride) {
+                          std::uint32_t head_dim, std::uint32_t stride, bool unordered) {
         QsaRowsNormViews<Rows> views{};
         for (unsigned r = 0; r < Rows; ++r) { views.values[r] = prepared.row[r].workspace.*target; views.position[r] = prepared.position[r]; }
         dispatch_small_kind(weights.manifest->ggml_type, [&](auto kind) {
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(norm_rope_rows_kernel<decltype(kind)::value, Rows>), dim3(heads, Rows), dim3(head_dim),
+            if (unordered)
+                hipExtLaunchKernelGGL(HIP_KERNEL_NAME(norm_rope_rows_kernel<decltype(kind)::value, Rows>), dim3(heads, Rows), dim3(head_dim),
+                    2ULL * head_dim * sizeof(float), stream, nullptr, nullptr, hipExtAnyOrderLaunch, views, heads, head_dim, stride,
+                    reinterpret_cast<const void*>(weights.runtime->address), model.rms_norm_epsilon, rotary, model.rope_theta);
+            else hipLaunchKernelGGL(HIP_KERNEL_NAME(norm_rope_rows_kernel<decltype(kind)::value, Rows>), dim3(heads, Rows), dim3(head_dim),
                 2ULL * head_dim * sizeof(float), stream, views, heads, head_dim, stride,
                 reinterpret_cast<const void*>(weights.runtime->address), model.rms_norm_epsilon, rotary, model.rope_theta);
         });
         check_hip(hipGetLastError(), "QSA known-window norm/rope launch");
     };
-    norm(tensors.index_q_norm, &WorkspacePointers::index_query, index_heads, a.index_dim, a.index_dim);
-    norm(tensors.q_norm, &WorkspacePointers::q_gate, a.attention_heads, a.head_dim, a.head_dim * 2U);
-    norm(tensors.k_norm, &WorkspacePointers::current_k, a.kv_heads, a.head_dim, a.head_dim);
+    norm(tensors.index_q_norm, &WorkspacePointers::index_query, index_heads, a.index_dim, a.index_dim, false);
+    norm(tensors.q_norm, &WorkspacePointers::q_gate, a.attention_heads, a.head_dim, a.head_dim * 2U, any_order);
+    norm(tensors.k_norm, &WorkspacePointers::current_k, a.kv_heads, a.head_dim, a.head_dim, any_order);
 
     QsaRowsStoreViews<Rows> store{};
     for (unsigned r = 0; r < Rows; ++r) {

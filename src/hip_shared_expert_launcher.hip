@@ -13,6 +13,7 @@
 #include "strix/dispatch_resources.hpp"
 #include "strix/prepared_tensor_views.hpp"
 
+#include <cstdlib>
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
@@ -1753,7 +1754,10 @@ void known_shared_engine_projection(bool down, const KnownSharedR2Views& views, 
             site.input[r] = reinterpret_cast<const void*>(row(views.input, s.input_stride_bytes, r));
             site.output[r] = reinterpret_cast<float*>(row(views.workspace, s.workspace_stride_bytes, r));
         }
-        q8_rows::launch(site, config.known_window_a8_projections, stream);
+        // Any-order (STRIX_ANYORDER=0 disables): gate/up reads only the MoE input and writes this expert's own
+        // workspace, independent of the router's top-k selection queued just before it.
+        static const bool any_order = strix_any_order_enabled();
+        q8_rows::launch(site, config.known_window_a8_projections, stream, any_order);
     }
     check_hip(hipGetLastError(), "known-window shared rows projection launch");
     if (config.prefetch_q8 && config.prefetch_stats)

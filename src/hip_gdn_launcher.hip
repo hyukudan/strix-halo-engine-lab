@@ -17,7 +17,9 @@
 #include "strix/hip_launch_context.hpp"
 #include "strix/graph_operator_control.hpp"
 
+#include <cstdlib>
 #include <hip/hip_fp16.h>
+#include <hip/hip_ext.h>
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
@@ -4125,7 +4127,15 @@ void enqueue_gdn_window(const GdnWindowLayer& layer, std::span<const GdnWindowRo
     q8_rows::launch(in, config.known_window_a8_projections, stream);
     check_hip(hipGetLastError(), "GDN window Q8 input projection launch");
     if (!q8_gates) {
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_window_f32_gates_kernel<Rows>), dim3(shape.value_heads * 2U),
+        // Any-order (STRIX_ANYORDER=0 disables): the F32 gates read the same inputs as the Q8 projection queued
+        // just before and write only beta/gate, so they may run alongside it.
+        static const bool any_order = strix_any_order_enabled();
+        if (any_order)
+            hipExtLaunchKernelGGL(HIP_KERNEL_NAME(gdn_window_f32_gates_kernel<Rows>), dim3(shape.value_heads * 2U),
+                dim3(kProjectionThreads), 0, stream, nullptr, nullptr, hipExtAnyOrderLaunch, x,
+                static_cast<const float*>(layer.beta), static_cast<const float*>(layer.alpha), rows, shape.hidden,
+                shape.value_heads);
+        else hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_window_f32_gates_kernel<Rows>), dim3(shape.value_heads * 2U),
             dim3(kProjectionThreads), 0, stream, x, static_cast<const float*>(layer.beta),
             static_cast<const float*>(layer.alpha), rows, shape.hidden, shape.value_heads);
         check_hip(hipGetLastError(), "GDN window F32 gate projection launch");
