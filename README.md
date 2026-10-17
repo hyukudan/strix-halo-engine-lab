@@ -1,5 +1,22 @@
 # Strix Halo engine lab
 
+**AMD-first · independent native inference engine.** This project develops
+its own C++/HIP model-execution kernels, scheduling and speculative decoding
+for AMD Strix Halo (`gfx1151`) rather than wrapping another inference
+engine. The single-node generation measurements below are produced by our
+`strix-hip-decode-token` executable, not by TensorMeld or an external
+inference runtime. ROCm/HIP, Linux, the GGUF model format and development
+tools remain platform or tooling dependencies; *independent engine* does not
+mean dependency-free software.
+
+The engine is intended to remain usable on one Strix Halo without depending
+on completion of the distributed orchestration work in
+[TensorMeld](https://github.com/hyukudan/tensormeld).
+Multi-node operation and alternative GPU support are separate, explicitly
+qualified stages; first priority is extracting the best correct end-to-end
+performance from AMD hardware. Third-party inference projects can inform
+independently tested kernel research without becoming runtime prerequisites.
+
 An LLM inference engine written for AMD Strix Halo (`gfx1151`, Ryzen AI Max+ 395, 128 GB unified memory) on
 Linux with ROCm/HIP. It targets one model, Qwen3.8-Flash-Next: a mixture-of-experts model with GDN recurrent
 layers, QSA indexed attention, a per-layer n-gram embedding table (PLE) and hyper-connections. The model is
