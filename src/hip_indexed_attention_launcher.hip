@@ -3470,7 +3470,9 @@ __global__ void attention_score_rows_kernel(QsaRowsAttentionViews<Rows> views, c
 // features l + 32j, so strides 128/64/32 of the block tree are lane-local adds
 // and 16..1 are shuffles. Same products, same pairings, same order as the LDS
 // tree in attention_score_body, without contraction, so the scores match it.
-template <unsigned Rows>
+// PerWave > 1: a wave runs PerWave consecutive slots of one (row, head) with q held in
+// registers; every slot keeps the exact single-slot products and tree.
+template <unsigned Rows, unsigned PerWave = 1U>
 __global__ __launch_bounds__(256) void attention_score_rows_wave_kernel(QsaRowsAttentionViews<Rows> views,
     const std::uint16_t* kv_state, std::uint32_t maximum_selected, std::uint32_t attention_heads, std::uint32_t kv_heads,
     std::uint32_t head_dim, std::uint32_t slots) {
@@ -3478,31 +3480,42 @@ __global__ __launch_bounds__(256) void attention_score_rows_wave_kernel(QsaRowsA
     static_assert(kThreads == 256U);
     const auto lane = threadIdx.x % 32U;
     const auto wave = blockIdx.x * 8U + threadIdx.x / 32U;
-    const auto r = wave / (attention_heads * slots);
+    const auto groups = (slots + PerWave - 1U) / PerWave;
+    const auto r = wave / (attention_heads * groups);
     if (r >= Rows) return;
-    const auto head = wave / slots % attention_heads, slot = wave % slots;
-    if (slot >= views.count[r]) return;
-    const auto token = views.selected[r][slot];
+    const auto head = wave / groups % attention_heads, first = wave % groups * PerWave;
+    if (first >= views.count[r]) return;
     const auto kv_head = head / (attention_heads / kv_heads);
     const auto* q = views.q_gate[r] + static_cast<std::uint64_t>(head) * head_dim * 2ULL;
-    const auto* k = kv_state + static_cast<std::uint64_t>(token) * kv_heads * head_dim * 2ULL +
-        static_cast<std::uint64_t>(kv_head) * head_dim;
-    float p[8];
+    float qv[8];
 #pragma unroll
-    for (unsigned j = 0; j < 8U; ++j) {
-        const auto feature = lane + 32U * j;
-        float product = 0.0F;
-        if (feature < head_dim) product = q[feature] * bf16_to_float(k[feature]);
-        p[j] = product;
+    for (unsigned j = 0; j < 8U; ++j) { const auto feature = lane + 32U * j; qv[j] = feature < head_dim ? q[feature] : 0.0F; }
+    float p[PerWave][8];
+#pragma unroll
+    for (unsigned i = 0; i < PerWave; ++i) {
+        const auto slot = first + i < views.count[r] ? first + i : first;
+        const auto token = views.selected[r][slot];
+        const auto* k = kv_state + static_cast<std::uint64_t>(token) * kv_heads * head_dim * 2ULL +
+            static_cast<std::uint64_t>(kv_head) * head_dim;
+#pragma unroll
+        for (unsigned j = 0; j < 8U; ++j) {
+            const auto feature = lane + 32U * j;
+            float product = 0.0F;
+            if (feature < head_dim) product = qv[j] * bf16_to_float(k[feature]);
+            p[i][j] = product;
+        }
     }
 #pragma unroll
-    for (unsigned j = 0; j < 4U; ++j) p[j] += p[j + 4U];
-    p[0] += p[2]; p[1] += p[3];
-    float sum = p[0] + p[1];
+    for (unsigned i = 0; i < PerWave; ++i) {
 #pragma unroll
-    for (unsigned stride = 16U; stride > 0U; stride >>= 1U) sum += __shfl_down(sum, stride, 32);
-    if (lane == 0U)
-        views.scores[r][static_cast<std::uint64_t>(head) * maximum_selected + slot] = sum / sqrtf(static_cast<float>(head_dim));
+        for (unsigned j = 0; j < 4U; ++j) p[i][j] += p[i][j + 4U];
+        p[i][0] += p[i][2]; p[i][1] += p[i][3];
+        float sum = p[i][0] + p[i][1];
+#pragma unroll
+        for (unsigned stride = 16U; stride > 0U; stride >>= 1U) sum += __shfl_down(sum, stride, 32);
+        if (lane == 0U && first + i < views.count[r])
+            views.scores[r][static_cast<std::uint64_t>(head) * maximum_selected + first + i] = sum / sqrtf(static_cast<float>(head_dim));
+    }
 }
 template <unsigned Rows>
 __global__ void attention_softmax_rows_kernel(QsaRowsAttentionViews<Rows> views, std::uint32_t maximum_selected) {
@@ -3819,10 +3832,23 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
     const auto* kv = reinterpret_cast<const std::uint16_t*>(a.kv_state.address);
     if (a.head_dim <= kThreads) {
         static_cast<void>(prepare_indexed_attention_score_grid(a.attention_heads, maximum_count));
-        const auto waves = static_cast<std::uint64_t>(Rows) * a.attention_heads * maximum_count;
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_score_rows_wave_kernel<Rows>),
-            dim3(static_cast<std::uint32_t>((waves + 7U) / 8U)), dim3(kThreads), 0, stream, attention, kv, maximum_selected,
-            a.attention_heads, a.kv_heads, a.head_dim, maximum_count);
+        // STRIX_QSA_SCORE_SLOTS=1|2|4|8: selected slots per wave (same per-slot arithmetic).
+        static const unsigned per_wave = [] {
+            const char* v = std::getenv("STRIX_QSA_SCORE_SLOTS");
+            const int n = v ? std::atoi(v) : 4;
+            return n == 2 || n == 4 || n == 8 ? static_cast<unsigned>(n) : 1U;
+        }();
+        const auto launch_score = [&]<unsigned PerWave>() {
+            const auto groups = (maximum_count + PerWave - 1U) / PerWave;
+            const auto waves = static_cast<std::uint64_t>(Rows) * a.attention_heads * groups;
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_score_rows_wave_kernel<Rows, PerWave>),
+                dim3(static_cast<std::uint32_t>((waves + 7U) / 8U)), dim3(kThreads), 0, stream, attention, kv, maximum_selected,
+                a.attention_heads, a.kv_heads, a.head_dim, maximum_count);
+        };
+        if (per_wave == 2U) launch_score.template operator()<2U>();
+        else if (per_wave == 4U) launch_score.template operator()<4U>();
+        else if (per_wave == 8U) launch_score.template operator()<8U>();
+        else launch_score.template operator()<1U>();
     } else hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_score_rows_kernel<Rows>),
         dim3(static_cast<std::uint32_t>(prepare_indexed_attention_score_grid(a.attention_heads, maximum_count)), Rows),
         dim3(kThreads), 0, stream, attention, kv, maximum_selected, a.attention_heads, a.kv_heads, a.head_dim);
