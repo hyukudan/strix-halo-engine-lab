@@ -56,14 +56,21 @@ inline Segments segments(std::initializer_list<std::pair<const void*, std::uint3
     return result;
 }
 
+// Measured defaults: two outputs per wave; direct T <= 2 takes four (FP32) or
+// one output with a one-chunk prefetch (BF16).
+template <class Site, bool Staged> constexpr bool narrow_bf16() {
+    return !Staged && Site::rows <= 2U && sizeof(typename Site::Input) == 2U;
+}
 template <class Site, bool Staged> constexpr unsigned outs_of() {
-    if constexpr (requires { Site::outs; }) return Site::outs; else return !Staged && Site::rows <= 2U ? 4U : 2U;
+    if constexpr (requires { Site::outs; }) return Site::outs;
+    else if constexpr (narrow_bf16<Site, Staged>()) return 1U;
+    else return !Staged && Site::rows <= 2U ? 4U : 2U;
 }
 template <class Site> constexpr unsigned a8_outs_of() {
     if constexpr (requires { Site::a8_outs; }) return Site::a8_outs; else return Site::rows > 1U ? 4U : 2U;
 }
-template <class Site> constexpr unsigned prefetch_of() {
-    if constexpr (requires { Site::prefetch; }) return Site::prefetch; else return 2U;
+template <class Site, bool Staged> constexpr unsigned prefetch_of() {
+    if constexpr (requires { Site::prefetch; }) return Site::prefetch; else return narrow_bf16<Site, Staged>() ? 1U : 2U;
 }
 constexpr unsigned log2u(unsigned v) { return v <= 1U ? 0U : 1U + log2u(v / 2U); }
 
@@ -189,7 +196,7 @@ template <unsigned Outs> struct Q8Fetch {
 template <class Site, unsigned Outs, bool Staged>
 __global__ __launch_bounds__(kThreads) void project_rows_kernel(Site site) {
     using Input = typename Site::Input;
-    constexpr unsigned Rows = Site::rows, N = Outs * Rows * 8U, Depth = prefetch_of<Site>();
+    constexpr unsigned Rows = Site::rows, N = Outs * Rows * 8U, Depth = prefetch_of<Site, Staged>();
     const unsigned lane = threadIdx.x & 31U;
     const std::uint32_t width = site.width, groups = (site.outputs + Outs - 1U) / Outs;
     if constexpr (Staged) {
