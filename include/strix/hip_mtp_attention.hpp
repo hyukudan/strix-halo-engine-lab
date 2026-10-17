@@ -12,4 +12,10 @@ void preflight_hip_mtp_cache_rows(const MtpNativeContext&);
 void launch_hip_mtp_cache_rows(const MtpNativeContext&,void* stream);
 void launch_hip_mtp_indexer(const MtpNativeContext&,void* stream);
 void launch_hip_mtp_sparse_attention(const MtpNativeContext&,void* stream);
+// Draft-only: same stages with the Q/K/V and output Q8 projections on the
+// wave-per-row draft GEMV (different summation order; drafts only).
+void launch_hip_mtp_sparse_attention_draft(const MtpNativeContext&,void* stream);
+// Raw exact Q8 projection used by the attention stages (benchmark reference).
+void enqueue_hip_mtp_attention_q8_linear(const std::uint16_t* input,const void* q8,std::uint32_t width,
+    std::uint32_t rows,float* output,void* stream);
 } // namespace strix

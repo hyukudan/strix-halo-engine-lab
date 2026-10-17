@@ -119,7 +119,7 @@ struct MtpCliOptions {
     // Longest-accepted-prefix windows: deferred GDN commit + per-row PLE snapshots, no checkpoint.
     bool window_prefix=false;
     // Draft-only head/chain controls: they change acceptance, never target output.
-    bool draft_chain=false;
+    bool draft_chain=false,draft_exact=false,draft_q4=false;
     std::string draft_vocab;
     std::uint32_t draft_context_vocab=0;
 };
@@ -743,8 +743,10 @@ inline void validate_mtp_cli(const Options& o,bool resolved=false) {
         throw std::invalid_argument("MTP window HC rows require an actual target window");
     if((m.window_qsa_rows || m.window_prefix) && (!m.window_rows || m.metadata_only))
         throw std::invalid_argument("MTP window QSA rows and prefix acceptance require an actual target window");
-    if((!m.draft_vocab.empty() || m.draft_context_vocab) && !m.draft_chain)
+    if((!m.draft_vocab.empty() || m.draft_context_vocab || m.draft_exact || m.draft_q4) && !m.draft_chain)
         throw std::invalid_argument("MTP draft vocabulary options require --mtp-draft-chain");
+    if(m.draft_q4 && m.draft_vocab.empty() && !m.draft_context_vocab)
+        throw std::invalid_argument("MTP draft Q4 head requires a draft vocabulary subset");
     if(m.window_rows && m.candidate_depth<m.window_rows-1U)
         throw std::invalid_argument("MTP target window requires candidate depth at least rows minus one");
     if(m.window_rows && (o.gdn_recurrent_layout!=HipGdnRecurrentLayout::baseline || o.gdn_recurrent_storage!=GdnRecurrentStorage::key_value ||
@@ -767,7 +769,7 @@ inline Options parse_options(
     if (argc < 2) {
         throw std::invalid_argument(
             "usage: strix-hip-decode-token MODEL.gguf [TOKEN_ID ...] "
-            "[--mtp --mtp-sidecar FILE --mtp-sidecar-sha256 HEX (--mtp-golden FILE --mtp-golden-sha256 HEX | --mtp-golden-dump FILE) [--mtp-window-expert-union --mtp-window-expert-union-bytes N] [--mtp-window-hyper-mix] [--mtp-window-qsa-rows] [--mtp-window-prefix] [--mtp-draft-chain [--mtp-draft-vocab FILE] [--mtp-draft-context-vocab N]] (explicit source/conversion/cast/budget options required)] "
+            "[--mtp --mtp-sidecar FILE --mtp-sidecar-sha256 HEX (--mtp-golden FILE --mtp-golden-sha256 HEX | --mtp-golden-dump FILE) [--mtp-window-expert-union --mtp-window-expert-union-bytes N] [--mtp-window-hyper-mix] [--mtp-window-qsa-rows] [--mtp-window-prefix] [--mtp-draft-chain [--mtp-draft-vocab FILE] [--mtp-draft-context-vocab N] [--mtp-draft-exact] [--mtp-draft-q4]] (explicit source/conversion/cast/budget options required)] "
             "[--optimization-profile auto|manual] [--execution-inventory] [--host-dispatch-telemetry] [--execution-telemetry-trace] [--device-queue-trace] "
             "[--numerical-profile exact-v5|hc-splitk-f32-v1|q51-a8-down-v1|hc-splitk-f32+q51-a8-down-v1|q51-q80-a8-down-v1|hc-splitk-f32+q51-q80-a8-down-v1|hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup-v1|hc-deferred-norm-f32+q51-q80-a8-down-v1|hc-deferred-norm-f32+q51-q80-a8-down+q5k-a8-gateup-v1] "
             "[--teacher-forced-score --generate 1 [--teacher-logits-file PATH]] "
@@ -875,6 +877,16 @@ inline Options parse_options(
             if(!mtp_option_names.insert(std::string(argument)).second)throw std::invalid_argument("duplicate MTP option");
             options.mtp.supplied=true;options.mtp.draft_chain=true;continue;
         }
+        if(argument=="--mtp-draft-q4") {
+            if(!mtp_option_names.insert(std::string(argument)).second)throw std::invalid_argument("duplicate MTP option");
+            options.mtp.supplied=true;options.mtp.draft_q4=true;continue;
+        }
+        if(argument=="--mtp-draft-exact") {
+            if(!mtp_option_names.insert(std::string(argument)).second)throw std::invalid_argument("duplicate MTP option");
+            options.mtp.supplied=true;options.mtp.draft_exact=true;continue;
+        }
+        if(argument.starts_with("--mtp-draft-exact="))
+            throw std::invalid_argument("MTP draft exact is a flag without a value");
         if(argument.starts_with("--mtp-draft-chain="))
             throw std::invalid_argument("MTP draft chain is a flag without a value");
         if(argument.starts_with("--mtp-window-expert-union="))

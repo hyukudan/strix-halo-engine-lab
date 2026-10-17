@@ -3,6 +3,7 @@
 #include "strix/hip_mtp_projection.hpp"
 #include "strix/hip_mtp_native_validation.hpp"
 #include "strix/hip_mtp_shared_expert.hpp"
+#include "strix/hip_mtp_fast_draft.hpp"
 #include "strix/hip_embedding_launcher.hpp"
 #include "strix/hip_moe_route_launcher.hpp"
 #include "strix/hip_shared_expert_launcher.hpp"
@@ -79,6 +80,8 @@ struct HipMtpRuntime::Impl {
     std::shared_ptr<HipMtpResources> owner;
     std::unique_ptr<HipGreedyOutput> selector;
     std::unique_ptr<HipMtpDraftHead> draft;
+    std::unique_ptr<float,void(*)(float*)> fast_workspace{nullptr,[](float* p){(void)hipFree(p);}};
+    bool draft_exact=false;
     std::optional<HipMtpResources::NativeValidationScope> validation;
     std::optional<HipMtpTargetHiddenTicket> last_target,cycle_base,base_previous_target,reconcile_final;
     std::optional<std::uint32_t> last_teacher_next_input,base_previous_input;
@@ -339,12 +342,17 @@ struct HipMtpRuntime::Impl {
                 const auto c=context(next_source+k);
                 if(k) launch_hip_mtp_embedding_device(c,draft->device_token(k-1U),stream);
                 else launch_hip_mtp_embedding(c,pending_token,stream);
-                launch_hip_mtp_input_fusion(fusion(),stream);
+                if(draft_exact) launch_hip_mtp_input_fusion(fusion(),stream);
+                else launch_hip_mtp_input_fusion_draft(fusion(),stream);
                 launch_hip_mtp_hyper_mix(c,MtpHyperRole::attention,stream);
-                launch_hip_mtp_indexer(c,stream);launch_hip_mtp_sparse_attention(c,stream);
+                launch_hip_mtp_indexer(c,stream);
+                if(draft_exact) launch_hip_mtp_sparse_attention(c,stream); else launch_hip_mtp_sparse_attention_draft(c,stream);
                 launch_hip_mtp_inject(c,MtpInjectRole::attention,stream);launch_hip_mtp_hyper_mix(c,MtpHyperRole::mlp,stream);
-                launch_hip_mtp_route(c,stream);launch_hip_mtp_shared_expert(c,stream);launch_hip_mtp_routed_experts(c,stream);
-                launch_hip_mtp_moe_combine(c,stream);launch_hip_mtp_inject(c,MtpInjectRole::mlp,stream);
+                launch_hip_mtp_route(c,stream);
+                if(draft_exact) {
+                    launch_hip_mtp_shared_expert(c,stream);launch_hip_mtp_routed_experts(c,stream);launch_hip_mtp_moe_combine(c,stream);
+                } else launch_hip_mtp_fast_moe(fast_moe(),stream);
+                launch_hip_mtp_inject(c,MtpInjectRole::mlp,stream);
                 copy(owner->view(HipMtpBuffer::wide_current),owner->view(HipMtpBuffer::wide_next));
                 launch_hip_mtp_hyper_mix(c,MtpHyperRole::head,stream);
                 draft->launch(hidden,k,stream);
@@ -355,6 +363,19 @@ struct HipMtpRuntime::Impl {
             // Row zero is the pending cycle input at base_source, as in read_greedy_token.
             first_cache_reusable=true;candidates=tokens;return tokens;
         } catch(...) {failure();throw;}
+    }
+    HipMtpFastMoeViews fast_moe() const {
+        const auto& t=owner->tensors();const auto address=[](MtpTensorView v){return reinterpret_cast<const void*>(v.runtime->address);};
+        HipMtpFastMoeViews v;
+        v.input=reinterpret_cast<const std::uint16_t*>(owner->view(HipMtpBuffer::hidden0).address);
+        v.routes=reinterpret_cast<const std::uint32_t*>(owner->view(HipMtpBuffer::routes).address);
+        v.route_weights=reinterpret_cast<const float*>(owner->view(HipMtpBuffer::route_weights).address);
+        v.gate=address(t.expert_gate);v.up=address(t.expert_up);v.down=address(t.expert_down);
+        v.shared_gate=address(t.shared_gate);v.shared_up=address(t.shared_up);v.shared_down=address(t.shared_down);
+        v.shared_scalar=static_cast<const float*>(address(t.shared_scalar_gate));v.workspace=fast_workspace.get();
+        v.output=reinterpret_cast<std::uint16_t*>(owner->view(HipMtpBuffer::hidden0).address);
+        v.status=reinterpret_cast<std::uint32_t*>(owner->view(HipMtpBuffer::status).address);
+        return v;
     }
     void qualification(const QualifiedMtpDraftPlan& plan,const ActivatedMtpDraftPlan& activated) const {
         require_qualified_mtp_draft_plan(plan);
@@ -423,13 +444,22 @@ void HipMtpRuntime::begin_cycle(std::uint32_t token,const HipMtpTargetHiddenTick
     p.replay.clear();p.reconcile_final.reset();p.have_replay=false;
     if(p.draft) p.draft->observe(std::span<const std::uint32_t>(&token,1));
 }
-void HipMtpRuntime::enable_draft_chain(HipMtpDraftHeadConfig config) {
+void HipMtpRuntime::enable_draft_chain(HipMtpDraftHeadConfig config,bool exact) {
     auto& p=*impl_;require(!p.draft && !p.cycle && !p.active && !p.broken,"MTP draft chain must be enabled once on an idle owner");
     const auto& m=p.owner->model();const auto& head=p.owner->tensors().lm_head;
     require(select_hip_mtp_lm_head_recipe(m,head)==HipMtpLmHeadRecipe::prefetch8_wave8_q8,
         "MTP draft chain requires the Q8_0 prefetch8 head recipe");
     config.hidden_size=static_cast<std::uint32_t>(m.hidden_size);config.vocab_size=static_cast<std::uint32_t>(m.vocab_size);
     config.max_depth=p.owner->budget().maximum_candidate_depth;
+    p.draft_exact=exact;
+    if(!exact) {
+        // The fast MoE is specialized to the canonical sidecar; preflight keeps the exact tensor checks.
+        require(m.hidden_size==2560U && m.moe_intermediate_size==640U && m.shared_expert_intermediate_size==640U &&
+            m.num_experts==512U && m.num_experts_per_token==10U,"MTP fast draft MoE requires the canonical sidecar geometry");
+        float* workspace=nullptr;
+        check(hipMalloc(reinterpret_cast<void**>(&workspace),hip_mtp_fast_moe_workspace_floats*sizeof(float)),"MTP fast draft workspace");
+        p.fast_workspace.reset(workspace);
+    }
     p.draft=std::make_unique<HipMtpDraftHead>(reinterpret_cast<const void*>(head.runtime->address),std::move(config),p.owner->stream());
 }
 const HipMtpDraftHead* HipMtpRuntime::draft_head() const noexcept {return impl_->draft.get();}

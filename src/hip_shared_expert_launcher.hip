@@ -1,3 +1,4 @@
+#include "strix/hip_mtp_fast_draft.hpp"
 #include "strix/hip_mtp_shared_expert.hpp"
 #include "strix/hip_mtp_native_validation.hpp"
 #include "strix/hip_launch_context.hpp"
@@ -2036,24 +2037,29 @@ void launch_hip_mtp_shared_expert(const MtpNativeContext& c,void* raw_stream){
     if(capture!=hipStreamCaptureStatusNone)throw std::invalid_argument("MTP shared expert is eager only");
     check_hip(hipPeekAtLastError(),"MTP shared prior HIP error");
     const auto& owner=*c.resources;const auto& t=*c.tensors;
-    const auto* input=reinterpret_cast<const std::uint16_t*>(owner.view(HipMtpBuffer::hidden0).address);
-    auto* workspace=reinterpret_cast<float*>(owner.view(HipMtpBuffer::moe_workspace).address);
-    auto* up=workspace+640U;
+    enqueue_hip_mtp_shared_expert_q8(reinterpret_cast<const std::uint16_t*>(owner.view(HipMtpBuffer::hidden0).address),
+        reinterpret_cast<const void*>(t.shared_gate.runtime->address),reinterpret_cast<const void*>(t.shared_up.runtime->address),
+        reinterpret_cast<const void*>(t.shared_down.runtime->address),reinterpret_cast<const void*>(t.shared_scalar_gate.runtime->address),
+        reinterpret_cast<float*>(owner.view(HipMtpBuffer::moe_workspace).address),
+        reinterpret_cast<std::uint16_t*>(owner.view(HipMtpBuffer::hidden1).address),stream);
+}
+void enqueue_hip_mtp_shared_expert_q8(const std::uint16_t* input,const void* gate,const void* up_weights,const void* down,
+    const void* scalar,float* workspace,std::uint16_t* output,void* raw_stream) {
+    const auto stream=static_cast<hipStream_t>(raw_stream);auto* up=workspace+640U;
     hipLaunchKernelGGL(HIP_KERNEL_NAME(projection_to_fp32_kernel<std::uint16_t,WeightKind::q8_0>),dim3(640U),dim3(kThreads),0,stream,
-        input,reinterpret_cast<const void*>(t.shared_gate.runtime->address),2560U,640U,workspace);
+        input,gate,2560U,640U,workspace);
     check_hip(hipGetLastError(),"MTP shared Q8 gate projection");
     hipLaunchKernelGGL(HIP_KERNEL_NAME(projection_to_fp32_kernel<std::uint16_t,WeightKind::q8_0>),dim3(640U),dim3(kThreads),0,stream,
-        input,reinterpret_cast<const void*>(t.shared_up.runtime->address),2560U,640U,up);
+        input,up_weights,2560U,640U,up);
     check_hip(hipGetLastError(),"MTP shared Q8 up projection");
     hipLaunchKernelGGL(gated_activation_kernel,dim3(3U),dim3(kThreads),0,stream,workspace,640U);
     check_hip(hipGetLastError(),"MTP shared activation");
     // Scalar replaces up[0] ONLY after activation consumed the complete up row.
     hipLaunchKernelGGL(HIP_KERNEL_NAME(scalar_projection_kernel<std::uint16_t,WeightKind::f32>),dim3(1U),dim3(kThreads),0,stream,
-        input,reinterpret_cast<const void*>(t.shared_scalar_gate.runtime->address),2560U,up);
+        input,scalar,2560U,up);
     check_hip(hipGetLastError(),"MTP shared F32 scalar gate");
     hipLaunchKernelGGL(HIP_KERNEL_NAME(down_projection_kernel<std::uint16_t,WeightKind::q8_0>),dim3(2560U),dim3(kThreads),0,stream,
-        workspace,up,reinterpret_cast<const void*>(t.shared_down.runtime->address),640U,2560U,
-        reinterpret_cast<std::uint16_t*>(owner.view(HipMtpBuffer::hidden1).address));
+        workspace,up,down,640U,2560U,output);
     check_hip(hipGetLastError(),"MTP shared Q8 down output");
 }
 } // namespace strix

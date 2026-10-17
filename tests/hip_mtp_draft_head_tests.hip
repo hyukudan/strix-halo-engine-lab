@@ -148,6 +148,43 @@ void ties_and_nonfinite() {
     case_named("token file roundtrip/reject",ids==std::vector<std::uint32_t>{0,5,4095} && threw);
     std::remove(path.c_str());
 }
+// Q4_0 subset: GPU logits against host Q4_0 requantization of the same Q8 rows
+// (nibble ties may differ by one code), plus top-1 agreement with the Q8 head.
+void q4_subset() {
+    constexpr std::uint32_t h=2560,v=248320,count=2000;Fixture f(h,v,21);
+    std::mt19937 g(4);std::vector<std::uint32_t> base(count);for(auto& x:base)x=g()%v;
+    std::sort(base.begin(),base.end());base.erase(std::unique(base.begin(),base.end()),base.end());std::shuffle(base.begin(),base.end(),g);
+    HipMtpDraftHeadConfig q8_config{h,v,1,false,base,0},q4_config{h,v,1,false,base,0,true};
+    HipMtpDraftHead q8(f.head.p,q8_config,f.stream.s),q4(f.head.p,q4_config,f.stream.s);
+    const auto rb=h/32U*34U;Device<std::uint16_t> hidden(h);
+    double worst=0;std::uint32_t agree=0;constexpr std::uint32_t trials=16;
+    for(std::uint32_t t=0;t<trials;++t) {
+        const auto x=hidden_values(h,100+t);check(hipMemcpy(hidden.p,x.data(),h*2U,hipMemcpyHostToDevice));
+        q8.begin_chain();q4.begin_chain();q8.launch(hidden.p,0,f.stream.s);q4.launch(hidden.p,0,f.stream.s);check(hipStreamSynchronize(f.stream.s));
+        agree+=q8.read(1)[0]==q4.read(1)[0];
+        if(t) continue;
+        std::vector<float> logits(base.size());check(hipMemcpy(logits.data(),q4.logits(),base.size()*4U,hipMemcpyDeviceToHost));
+        std::vector<std::uint8_t> row(rb);
+        for(std::size_t j=0;j<base.size();++j) {
+            check(hipMemcpy(row.data(),f.head.p+static_cast<std::size_t>(base[j])*rb,rb,hipMemcpyDeviceToHost));
+            double sum=0,magnitude=0;
+            for(std::uint32_t b=0;b<h/32U;++b) {
+                __half hs;std::memcpy(&hs,row.data()+b*34U,2);const float scale=__half2float(hs);
+                float values[32],max=0,amax=0;
+                for(unsigned i=0;i<32;++i){values[i]=scale*static_cast<float>(static_cast<std::int8_t>(row[b*34U+2U+i]));if(std::fabs(values[i])>amax){amax=std::fabs(values[i]);max=values[i];}}
+                const float d=max/-8.0F,inverse=d!=0.0F?1.0F/d:0.0F;const float dh=__half2float(__float2half(d));
+                for(unsigned i=0;i<32;++i){
+                    const int q=static_cast<int>(std::fmin(15.0F,values[i]*inverse+8.5F))-8;
+                    const double xv=std::bit_cast<float>(static_cast<std::uint32_t>(x[b*32U+i])<<16U);
+                    sum+=static_cast<double>(dh)*q*xv;magnitude+=std::fabs(static_cast<double>(values[i])*xv);
+                }
+            }
+            worst=std::max(worst,std::fabs(sum-logits[j])/std::max(magnitude,1e-30));
+        }
+    }
+    std::printf("q4 subset: max |gpu-host|/sum|w x| %.3g, top-1 agreement with Q8 %u/%u\n",worst,agree,trials);
+    case_named("Q4 subset logits match host Q4_0 requantization",worst<2e-3);
+}
 double median(std::vector<double> v){std::sort(v.begin(),v.end());return v[v.size()/2];}
 void bench(std::uint32_t base_rows,std::uint32_t context_rows) {
     constexpr std::uint32_t h=2560,v=248320,depth=3;constexpr int runs=30;
@@ -173,6 +210,9 @@ void bench(std::uint32_t base_rows,std::uint32_t context_rows) {
     const double head_full=gpu([&]{strix::launch_hip_q8_head_rows(hidden.p,f.head.p,h,v,logits.p,f.stream.s);});
     const double draft_full=gpu([&]{full.launch(hidden.p,0,f.stream.s);});
     const double draft_subset=gpu([&]{subset.launch(hidden.p,0,f.stream.s);});
+    HipMtpDraftHeadConfig q4_config{h,v,depth,false,base,context_rows,true};HipMtpDraftHead q4(f.head.p,q4_config,f.stream.s);
+    q4.observe(context);check(hipStreamSynchronize(f.stream.s));
+    const double draft_q4=gpu([&]{q4.launch(hidden.p,0,f.stream.s);});
     // Before: per draft, head on the MTP stream, completion, then the host selector (own stream + sync).
     const double before=wall([&]{for(std::uint32_t k=0;k<depth;++k){
         strix::launch_hip_q8_head_rows(hidden.p,f.head.p,h,v,logits.p,f.stream.s);check(hipStreamSynchronize(f.stream.s));
@@ -185,6 +225,7 @@ void bench(std::uint32_t base_rows,std::uint32_t context_rows) {
     std::printf("  gpu  full Q8 head kernel             %.4f\n",head_full);
     std::printf("  gpu  draft head full + device argmax %.4f\n",draft_full);
     std::printf("  gpu  draft head subset + argmax      %.4f\n",draft_subset);
+    std::printf("  gpu  draft head Q4 subset + argmax   %.4f\n",draft_q4);
     std::printf("  wall before: full head + sync + host selector  %.4f\n",before);
     std::printf("  wall chain full head, one sync               %.4f\n",chain_full);
     std::printf("  wall chain subset head, one sync             %.4f\n",chain_subset);
@@ -202,6 +243,7 @@ int main(int argc,char** argv) {
         exactness(64,5000,3,40,2,13);
         exactness(32,300,250,8,4,14);
         ties_and_nonfinite();
+        q4_subset();
         std::cout<<"passed "<<passed<<"\n";return 0;
     } catch(const std::exception& e) {std::cerr<<e.what()<<"\n";return 1;}
 }

@@ -30,6 +30,9 @@ struct HipMtpInputFusionRequest {
 [[nodiscard]] std::uint64_t hip_mtp_input_fusion_scratch_bytes(std::uint32_t hidden,std::uint32_t hc);
 // Metadata/extent/overflow/alignment/alias checks ONLY, no HIP calls or writes.
 void preflight_hip_mtp_input_fusion(const HipMtpInputFusionRequest&);
+// Draft-only variant: same norms, then one fused wave-per-row projection and
+// broadcast add (different summation order; replay/teacher rows keep the exact one).
+void launch_hip_mtp_input_fusion_draft(const HipMtpInputFusionRequest&,void* stream);
 // Includes geometry, norm encoding, reduction and all declared cast boundaries.
 // An identity is not readiness, checkpoint equivalence or native qualification.
 [[nodiscard]] std::uint64_t hip_mtp_input_fusion_profile_identity(const HipMtpInputFusionRequest&);

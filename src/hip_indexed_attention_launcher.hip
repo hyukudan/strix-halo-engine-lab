@@ -1,5 +1,6 @@
 #include "strix/hip_indexed_attention_launcher.hpp"
 #include "strix/hip_mtp_attention.hpp"
+#include "strix/hip_mtp_fast_draft.hpp"
 #include "strix/hip_mtp_native_validation.hpp"
 
 #include "strix/dispatch_resources.hpp"
@@ -4742,12 +4743,22 @@ void launch_hip_mtp_indexer(const MtpNativeContext& c,void* raw_stream) {
         check_hip(hipGetLastError(),"MTP compressed selection enqueue");
     }
 }
-void launch_hip_mtp_sparse_attention(const MtpNativeContext& c,void* raw_stream) {
+void enqueue_hip_mtp_attention_q8_linear(const std::uint16_t* input,const void* q8,std::uint32_t width,
+    std::uint32_t rows,float* output,void* stream) {
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(linear_to_float_kernel<WeightKind::q8_0>),dim3(rows),dim3(kThreads),0,static_cast<hipStream_t>(stream),
+        input,q8,width,rows,output);
+    check_hip(hipGetLastError(),"MTP attention projection enqueue");
+}
+namespace {
+void mtp_sparse_attention(const MtpNativeContext& c,void* raw_stream,bool draft) {
     const auto p=prepare_mtp_attention(c);require_mtp_attention_stream(c,raw_stream);
     const auto stream=static_cast<hipStream_t>(raw_stream);const auto& m=*c.model;const auto& w=p.workspace;
-    mtp_project<WeightKind::q8_0>(p.input,p.tensors.q,p.hidden,p.q_width,w.q_gate,stream);
-    mtp_project<WeightKind::q8_0>(p.input,p.tensors.k,p.hidden,p.kv_width,w.current_k,stream);
-    mtp_project<WeightKind::q8_0>(p.input,p.tensors.v,p.hidden,p.kv_width,w.current_v,stream);
+    const auto project=[&](const TensorPair& tensor,std::uint32_t outputs,float* output) {
+        if(draft) launch_hip_mtp_draft_q8_gemv(reinterpret_cast<const void*>(p.input.address),true,
+            reinterpret_cast<const void*>(tensor.runtime->address),p.hidden,outputs,output,false,stream);
+        else mtp_project<WeightKind::q8_0>(p.input,tensor,p.hidden,outputs,output,stream);
+    };
+    project(p.tensors.q,p.q_width,w.q_gate);project(p.tensors.k,p.kv_width,w.current_k);project(p.tensors.v,p.kv_width,w.current_v);
     launch_norm_rope_typed<SmallWeightKind::f32>(w.q_gate,p.heads,p.dim,p.dim*2U,*p.tensors.q_norm.runtime,m,c.position,{},stream);
     launch_norm_rope_typed<SmallWeightKind::f32>(w.current_k,p.kv_heads,p.dim,p.dim,*p.tensors.k_norm.runtime,m,c.position,{},stream);
     mtp_attention_finite(p,w.q_gate,p.q_width,stream);mtp_attention_finite(p,w.current_k,p.kv_width,stream);mtp_attention_finite(p,w.current_v,p.kv_width,stream);
@@ -4770,9 +4781,17 @@ void launch_hip_mtp_sparse_attention(const MtpNativeContext& c,void* raw_stream)
         w.selected_indices,w.attention_scores,p.selected,p.maximum_selected,p.heads,p.kv_heads,p.dim,w.attention_output,selection);
     check_hip(hipGetLastError(),"MTP attention value enqueue");
     mtp_attention_finite(p,w.attention_output,p.attention_width,stream);
+    if(draft) {
+        launch_hip_mtp_draft_q8_gemv(w.attention_output,false,reinterpret_cast<const void*>(p.tensors.out.runtime->address),
+            p.attention_width,p.hidden,reinterpret_cast<void*>(p.output.address),true,stream);
+        return;
+    }
     hipLaunchKernelGGL(HIP_KERNEL_NAME(linear_float_to_bf16_kernel<WeightKind::q8_0>),dim3(p.hidden),dim3(kThreads),0,stream,
         w.attention_output,reinterpret_cast<const void*>(p.tensors.out.runtime->address),p.attention_width,p.hidden,
         reinterpret_cast<std::uint16_t*>(p.output.address));
     check_hip(hipGetLastError(),"MTP attention output projection enqueue");
 }
+}
+void launch_hip_mtp_sparse_attention(const MtpNativeContext& c,void* stream) {mtp_sparse_attention(c,stream,false);}
+void launch_hip_mtp_sparse_attention_draft(const MtpNativeContext& c,void* stream) {mtp_sparse_attention(c,stream,true);}
 } // namespace strix
