@@ -109,6 +109,10 @@ struct MtpCliOptions {
     std::uint64_t golden_max_bytes=0,replay_host_bytes=0,runtime_bytes=0,target_capture_bytes=0;
     std::uint64_t policy_identity=0;
     std::uint32_t candidate_depth=0,window_rows=0;
+    // Adaptive verifier: several prefix owners (window_rows is the largest) and the
+    // draft early-stop probability (negative = unset: 0.5 with a row set, else 0).
+    std::vector<std::uint32_t> window_rows_set;
+    double spec_min_p=-1.0;
     std::uint64_t window_arena_bytes=0,window_capture_bytes=0,window_checkpoint_bytes=0,window_total_bytes=0,window_history_intervals=0;
     double max_hidden_error=0.0,max_logit_error=0.0;
     bool window_expert_union=false;
@@ -125,6 +129,9 @@ struct MtpCliOptions {
 };
 // This is execution evidence: a configured owner alone is not an attempted
 // native window (EOS, remaining budget/context and history can choose serial).
+inline float mtp_draft_min_probability(const MtpCliOptions& m) noexcept {
+    return static_cast<float>(m.spec_min_p>=0.0?m.spec_min_p:(m.window_rows_set.empty()?0.0:0.5));
+}
 inline std::string_view mtp_target_verification_name(std::uint64_t attempted_windows) noexcept {
     return attempted_windows ? "closed-known-window-attempted-with-serial-fallback" : "serial-target-fallback";
 }
@@ -730,6 +737,13 @@ inline void validate_mtp_cli(const Options& o,bool resolved=false) {
        m.candidate_depth<1U || m.candidate_depth>8U || !std::isfinite(m.max_hidden_error) || m.max_hidden_error<0.0 ||
        !std::isfinite(m.max_logit_error) || m.max_logit_error<0.0)
         throw std::invalid_argument("MTP requires positive explicit asset/replay/runtime/capture budgets, policy identity and depth1..8");
+    if(!m.window_rows_set.empty()) {
+        if(m.window_rows && m.window_rows!=m.window_rows_set.back())
+            throw std::invalid_argument("MTP target window rows must equal the largest row-set entry");
+        if(!m.window_prefix)throw std::invalid_argument("MTP window row sets require --mtp-window-prefix");
+    }
+    if(m.spec_min_p>=0.0 && (!(m.spec_min_p<=1.0) || !m.draft_chain))
+        throw std::invalid_argument("MTP draft minimum probability requires --mtp-draft-chain and a value in [0, 1]");
     const bool any_window=m.window_rows || m.window_arena_bytes || m.window_capture_bytes || m.window_checkpoint_bytes || m.window_total_bytes || m.window_history_intervals;
     if(any_window && ((m.window_rows!=2U && m.window_rows!=4U && m.window_rows!=8U) || !m.window_arena_bytes ||
        !m.window_capture_bytes || !m.window_checkpoint_bytes || !m.window_total_bytes || !m.window_history_intervals))
@@ -920,6 +934,17 @@ inline Options parse_options(
             else if(key=="--mtp-draft-vocab")m.draft_vocab=value;
             else if(key=="--mtp-max-hidden-error")m.max_hidden_error=parse_double(value,"MTP hidden policy");
             else if(key=="--mtp-max-logit-error")m.max_logit_error=parse_double(value,"MTP logit policy");
+            else if(key=="--mtp-spec-min-p")m.spec_min_p=parse_double(value,"MTP draft minimum probability");
+            else if(key=="--mtp-target-window-rows-set") {
+                for(std::size_t begin=0;begin<=value.size();) {
+                    const auto end=std::min(value.find(',',begin),value.size());
+                    const auto rows=parse_u64(value.substr(begin,end-begin),"MTP window row set");
+                    if((rows!=2U && rows!=4U && rows!=8U) || (!m.window_rows_set.empty() && rows<=m.window_rows_set.back()))
+                        throw std::invalid_argument("MTP window row set must list ascending distinct 2/4/8");
+                    m.window_rows_set.push_back(static_cast<std::uint32_t>(rows));begin=end+1U;
+                }
+                if(!m.window_rows)m.window_rows=m.window_rows_set.back();
+            }
             else {
                 const auto n=parse_u64(value,"MTP option");
                 if(key=="--mtp-metadata-only"){
