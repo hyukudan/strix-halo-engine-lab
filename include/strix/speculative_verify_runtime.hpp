@@ -21,6 +21,9 @@ struct CompiledLaunchPlan;
 // preflight_plan optionally adds owner policy. preflight_scope proves an owned eager stream and
 // deferred-status parity, and null graph-position arguments. complete drains/checks status before publication.
 struct KnownWindowExecutionHooks {
+    // Tiled prefill only: a block whose logits are never read (more prompt follows) skips the
+    // terminal head step entirely; the result then carries no logit rows.
+    bool skip_head = false;
     // Metadata/config/resource owners cannot change via aliases during a call.
     std::function<void()> preflight_plan;
     std::function<void()> preflight_scope;

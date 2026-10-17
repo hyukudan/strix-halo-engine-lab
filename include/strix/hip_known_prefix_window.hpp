@@ -65,6 +65,9 @@ public:
         std::array<std::uint32_t, 2> tokens);
     [[nodiscard]] KnownWindowResult execute(SerialSessionContext& session,
         std::span<const std::uint32_t> tokens);
+    // Tiled prefill block whose logits are not needed: runs every step but the terminal head.
+    [[nodiscard]] KnownWindowResult execute_without_head(SerialSessionContext& session,
+        std::span<const std::uint32_t> tokens);
     // Optional serving delivery validation AFTER producer/D1 completion but
     // BEFORE publishing any session state/generations. Callback is synchronous
     // on the owned eager scope; throws follow the existing poison/drain path.

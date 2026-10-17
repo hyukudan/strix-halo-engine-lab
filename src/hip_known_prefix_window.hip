@@ -859,8 +859,11 @@ struct HipKnownPrefixWindow::Impl {
     }
     KnownWindowResult execute(SerialSessionContext& session, std::span<const std::uint32_t> tokens,
         const std::function<void()>& before_publish = {},
-        const std::shared_ptr<HipMtpTargetWindowCapture>& capture = {},HipMtpTargetWindowBatch* batch=nullptr) {
+        const std::shared_ptr<HipMtpTargetWindowCapture>& capture = {},HipMtpTargetWindowBatch* batch=nullptr,
+        bool skip_head=false) {
         if (failed) throw std::logic_error("known-window native owner cannot be reused after an exception");
+        if (skip_head && (!prefill || capture || before_publish))
+            throw std::invalid_argument("known-window headless execution is a plain tiled prefill block only");
         if(executing)throw std::logic_error("known-window native owner cannot execute recursively");
         struct ExecutionLease {
             bool& active;
@@ -889,6 +892,7 @@ struct HipKnownPrefixWindow::Impl {
             hooks.quiesce_or_fail_stop = [&] { failed = true; guard.recover_or_fail_stop(); };
             hooks.position_reader_implementations = position_readers;
             hooks.record_actual_window_lineage=static_cast<bool>(capture);
+            hooks.skip_head=skip_head;
             hooks.preflight_memo=&preflight_memo;
             const auto first_position=session.next_position;
             auto result=prefill ? execute_known_prefix_prefill_eager(*prefill,serial,resources,scratch,session,tokens,
@@ -935,6 +939,9 @@ KnownWindowResult HipKnownPrefixWindow::execute(SerialSessionContext& session, s
 }
 KnownWindowResult HipKnownPrefixWindow::execute(SerialSessionContext& session, std::span<const std::uint32_t> tokens) {
     return impl_->execute(session,tokens);
+}
+KnownWindowResult HipKnownPrefixWindow::execute_without_head(SerialSessionContext& session, std::span<const std::uint32_t> tokens) {
+    return impl_->execute(session,tokens,{},{},nullptr,true);
 }
 KnownWindowResult HipKnownPrefixWindow::execute_validated(SerialSessionContext& session,
     std::span<const std::uint32_t> tokens,const std::function<void()>& before_publish) {

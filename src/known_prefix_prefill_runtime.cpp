@@ -137,11 +137,12 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
     require(steps&&serial.execution.steps.back().op==SerialOp::lm_head,"known prefill requires a complete terminal head");
     require(steps<=UINT32_MAX/rows,"known prefill logical work counter overflows");
     KnownWindowResult result;result.execution.state=session.state;
-    result.logit_row_indices=plan.logit_row_indices;result.logits.resize(plan.logit_row_indices.size());
-    result.omitted_lm_heads=rows-static_cast<std::uint32_t>(plan.logit_row_indices.size());
+    const bool headless=hooks.skip_head;
+    if(!headless) {result.logit_row_indices=plan.logit_row_indices;result.logits.resize(plan.logit_row_indices.size());}
+    result.omitted_lm_heads=rows-static_cast<std::uint32_t>(result.logit_row_indices.size());
     result.logical_row_steps=static_cast<std::uint32_t>(rows*steps)-result.omitted_lm_heads;
     result.execution.completion_order.reserve(rows*steps);
-    for(std::uint32_t row=0;row<rows;++row) {
+    for(std::uint32_t row=0;row<rows&&!headless;++row) {
         const auto c=context(steps-1U,row);require(c.writes.size()==1U,"known prefill head needs one output");
         const auto output=resolve_dispatch_write(c,0);
         require(serial.vocab_size<=UINT64_MAX/sizeof(float)&&output.bytes>=serial.vocab_size*sizeof(float),"known prefill logit row is undersized");
@@ -177,7 +178,7 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
         // (re-running those costs ~17 ms of idle GPU per 64-row block). Their launchers still admit
         // each context before enqueueing, so an out-of-capacity block fails during launch (session
         // poisoned) instead of before it; capacity and positions are checked above for every block.
-        if(preflight_known) continue;
+        if(preflight_known||(headless&&step+1U==steps)) continue;
         const auto step_begin=timing?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
         const auto step_done=[&]{
             if(timing) mode_ms[static_cast<std::size_t>(mode)%mode_ms.size()]+=
@@ -232,6 +233,7 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
             if(!result.execution.state.contains(source.reads_state)) throw std::logic_error("known prefill persistent state disappeared after admission");
             const auto mode=plan.tile8.mode[step];const auto id=static_cast<std::uint32_t>(plan.tile8.r2_variant[step]);
             const bool rows_entry=known_window_rows_mode(mode);
+            if(headless&&step+1U==steps) break;
             if(rows_entry&&full_by_id[id]&&rows%8U==0U) {
                 std::vector<ExecutionDispatchContext> all(rows);for(std::uint32_t r=0;r<rows;++r) all[r]=context(step,r);
                 auto correlation=current_execution_correlation();correlation.execution_identity=plan.prefill_execution_identity;

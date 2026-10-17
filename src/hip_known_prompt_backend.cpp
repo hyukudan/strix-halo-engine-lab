@@ -80,7 +80,10 @@ struct HipKnownPromptBackend::Impl {
             guard->require_original();
             const auto policy=window->output_policy();
             validate_known_window_output_policy(policy);
-            if((policy==KnownWindowOutputPolicy::state_only)!=state_only)
+            // A tiled prefill backend that produces logits may still run a block whose logits are never read
+            // (more prompt follows) without its head.
+            const bool headless=state_only&&policy!=KnownWindowOutputPolicy::state_only&&window->supports_tiled_prefill();
+            if((policy==KnownWindowOutputPolicy::state_only)!=state_only&&!headless)
                 throw std::invalid_argument("known prompt output method differs from native window policy");
             if (current_hip_launch_context() || session.health != SerialSessionHealth::ready ||
                 session.arithmetic_lineage.tainted || position != session.next_position ||
@@ -94,7 +97,7 @@ struct HipKnownPromptBackend::Impl {
             // Allocate host return storage before any model-state consumption.
             std::vector<float> logits(state_only?0U:static_cast<std::size_t>(vocab_size));
             window_attempted = true;
-            const auto result = window->execute(session, tokens);
+            const auto result = headless ? window->execute_without_head(session, tokens) : window->execute(session, tokens);
             // A window with deferred GDN or per-row PLE keeps every row of a known prompt: commit them all
             // and apply the pending GDN rows now (both are no-ops for windows without those operators).
             if (!window->supports_tiled_prefill()) { window->commit_prefix(rows); window->flush_deferred(); }
@@ -102,7 +105,7 @@ struct HipKnownPromptBackend::Impl {
                 session.committed_tokens != committed_before + rows || result.logits.size()!=result.logit_row_indices.size())
                 throw std::logic_error("known prompt native window did not commit its configured causal rows");
             std::size_t outputs=0U;
-            for(std::uint32_t r=0;r<rows;++r)if(known_window_produces_logits(policy,r,rows)) {
+            for(std::uint32_t r=0;r<rows&&!headless;++r)if(known_window_produces_logits(policy,r,rows)) {
                 if(outputs>=result.logit_row_indices.size()||result.logit_row_indices[outputs]!=r)
                     throw std::logic_error("known prompt native output mapping differs from its policy");
                 ++outputs;

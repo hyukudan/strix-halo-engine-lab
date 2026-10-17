@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 #include <utility>
@@ -50,8 +51,15 @@ bool KnownPromptChunkCursor::advance() {
     const bool state_only=request_.output_policy==KnownWindowOutputPolicy::state_only;
     const bool no_output=request_.max_new_tokens==0U;
     const bool window=remaining>=request_.logical_rows&&(!state_only||no_output||remaining>request_.logical_rows);
+    // Tiled prefill: a window with more prompt after it is never read, so it runs without its head.
+    // STRIX_PREFILL_HEADLESS=0 keeps the head on every block.
+    static const bool allow_headless=[]{const char* v=std::getenv("STRIX_PREFILL_HEADLESS");return !v||v[0]!='0';}();
+    const bool headless=allow_headless&&request_.tiled_prefill&&!state_only&&window&&remaining>request_.logical_rows;
     try {
-        if(state_only&&(no_output||window||remaining>1U)) {
+        if(headless) {
+            windows_.execute_state_rows(request_.prompt_tokens.subspan(consumed,request_.logical_rows),progress_.next_position);
+            has_logits_=false;selection_.reset();
+        } else if(state_only&&(no_output||window||remaining>1U)) {
             if(window) {
                 windows_.execute_state_rows(request_.prompt_tokens.subspan(consumed,request_.logical_rows),progress_.next_position);
                 ++progress_.state_only_windows;
