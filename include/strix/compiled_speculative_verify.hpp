@@ -48,8 +48,12 @@ enum class KnownWindowR2Variant : std::uint32_t {
     qsa_q8_rows2_r1_v1 = 11,
     qsa_q8_rows4_r1_v1 = 12,
     qsa_q8_rows8_r1_v1 = 13,
+    // Same with BF16 indexer q/k projections (Q8 attention projections).
+    qsa_q8_bf16idx_rows2_r1_v1 = 14,
+    qsa_q8_bf16idx_rows4_r1_v1 = 15,
+    qsa_q8_bf16idx_rows8_r1_v1 = 16,
 };
-inline constexpr std::uint32_t known_window_r2_variant_slots = 14;
+inline constexpr std::uint32_t known_window_r2_variant_slots = 17;
 
 struct KnownWindowRequest {
     bool r2_shared_expert = false;

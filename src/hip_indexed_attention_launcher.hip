@@ -3094,16 +3094,18 @@ void launch_indexed_attention(const ExecutionDispatchContext& context, void* use
 // ---- Known-prefix window rows (T = 2/4/8 consecutive positions of one step) ----
 // Each row keeps the C1 kernel's exact per-row arithmetic and summation order;
 // weights (and pooled indexer block keys) are read once for all rows.
+// One launch per serial load organization (prefetch8 Q8, or legacy256 per format).
 template <unsigned Rows> struct QsaRowsInputViews {
     const std::uint16_t* input[Rows];
     const void* weights[5];
-    std::uint32_t first[6]; // output-row prefix of index_q, index_k, q, k, v
+    std::uint32_t first[6]; // output-row prefix of the group's matrices
     float* output[5][Rows];
+    std::uint32_t count;
 };
 template <unsigned Rows>
 __device__ __forceinline__ unsigned qsa_rows_matrix(const QsaRowsInputViews<Rows>& views, std::uint32_t block, std::uint32_t& row) {
     unsigned m = 0;
-    while (m < 4U && block >= views.first[m + 1U]) ++m;
+    while (m + 1U < views.count && block >= views.first[m + 1U]) ++m;
     row = block - views.first[m];
     return m;
 }
@@ -3111,7 +3113,7 @@ __device__ __forceinline__ unsigned qsa_rows_matrix(const QsaRowsInputViews<Rows
 template <unsigned Rows>
 __global__ __launch_bounds__(32)
 void linear_prefetch8_q8_qsa_input_rows_kernel(QsaRowsInputViews<Rows> views, std::uint32_t input_width) {
-    if (blockIdx.x >= views.first[5]) return;
+    if (blockIdx.x >= views.first[views.count]) return;
     std::uint32_t row = 0;
     const auto m = qsa_rows_matrix(views, blockIdx.x, row);
     const auto lane = static_cast<std::uint32_t>(threadIdx.x);
@@ -3161,7 +3163,7 @@ void linear_prefetch8_q8_qsa_input_rows_kernel(QsaRowsInputViews<Rows> views, st
 
 template <WeightKind Kind, unsigned Rows>
 __global__ void linear_to_float_rows_kernel(QsaRowsInputViews<Rows> views, std::uint32_t input_width) {
-    if (blockIdx.x >= views.first[5]) return;
+    if (blockIdx.x >= views.first[views.count]) return;
     std::uint32_t row = 0;
     const auto m = qsa_rows_matrix(views, blockIdx.x, row);
     __shared__ float scratch[Rows][kThreads];
@@ -3429,7 +3431,7 @@ template <unsigned Rows> struct QsaKnownRows {
     std::array<PreparedIndexedLaunch, Rows> row;
     std::array<PreparedIndexedSelection, Rows> selection;
     std::array<std::uint64_t, Rows> position{};
-    bool prefetch_input = false;
+    std::array<bool, 5> prefetch{}; // index_q, index_k, q, k, v: serial prefetch8 choice
     std::uint16_t* journal = nullptr;
 };
 
@@ -3495,23 +3497,16 @@ QsaKnownRows<Rows> prepare_qsa_known_rows(std::span<const ExecutionDispatchConte
                 throw std::invalid_argument("QSA known-window writable/weight overlap");
         for (unsigned j = 0; j < i; ++j) if (overlap(writable[i], writable[j])) throw std::invalid_argument("QSA known-window writable owners overlap");
     }
-    // One uniform input organization, equal to the serial launcher's per-tensor choice.
+    // Each projection keeps the serial launcher's own per-tensor organization.
     const std::array<const TensorPair*, 5> projections{&a.tensors.index_q, &a.tensors.index_k, &a.tensors.q, &a.tensors.k, &a.tensors.v};
-    unsigned prefetch = 0;
-    for (const auto* tensor : projections) {
-        if (config.prefetch_q8_input && qsa_input_prefetch::eligible(*tensor->manifest)) {
-            if (tensor->runtime->address % 16U || tensor->manifest->absolute_offset % 16U ||
-                tensor->runtime->bytes < qsa_input_prefetch::required_weight_bytes(a.hidden, tensor->manifest->dimensions[1]))
-                throw std::invalid_argument("QSA known-window prefetch weight alignment/extent invalid");
-            ++prefetch;
-        }
-        if (tensor->manifest->ggml_type != projections[0]->manifest->ggml_type)
-            throw std::invalid_argument("QSA known-window input projections require one weight format");
+    for (unsigned m = 0; m < projections.size(); ++m) {
+        const auto* tensor = projections[m];
+        static_cast<void>(weight_kind(tensor->manifest->ggml_type));
+        result.prefetch[m] = config.prefetch_q8_input && qsa_input_prefetch::eligible(*tensor->manifest);
+        if (result.prefetch[m] && (tensor->runtime->address % 16U || tensor->manifest->absolute_offset % 16U ||
+            tensor->runtime->bytes < qsa_input_prefetch::required_weight_bytes(a.hidden, tensor->manifest->dimensions[1])))
+            throw std::invalid_argument("QSA known-window prefetch weight alignment/extent invalid");
     }
-    if (prefetch != 0U && prefetch != projections.size())
-        throw std::invalid_argument("QSA known-window input projections require one load organization");
-    result.prefetch_input = prefetch != 0U;
-    static_cast<void>(weight_kind(projections[0]->manifest->ggml_type));
     static_cast<void>(weight_kind(a.tensors.out.manifest->ggml_type));
     for (const auto* norm : {&a.tensors.q_norm, &a.tensors.k_norm, &a.tensors.index_q_norm, &a.tensors.index_k_norm})
         static_cast<void>(small_weight_kind(norm->manifest->ggml_type));
@@ -3536,11 +3531,11 @@ QsaKnownRows<Rows> prepare_qsa_known_rows(std::span<const ExecutionDispatchConte
 template <WeightKind Kind, unsigned Rows>
 void launch_qsa_rows_input(bool prefetch, const QsaRowsInputViews<Rows>& views, std::uint32_t hidden, hipStream_t stream) {
     if constexpr (Kind == WeightKind::q8_0) if (prefetch) {
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(linear_prefetch8_q8_qsa_input_rows_kernel<Rows>), dim3(views.first[5]), dim3(32), 0,
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(linear_prefetch8_q8_qsa_input_rows_kernel<Rows>), dim3(views.first[views.count]), dim3(32), 0,
             stream, views, hidden);
         return;
     }
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(linear_to_float_rows_kernel<Kind, Rows>), dim3(views.first[5]), dim3(kThreads), 0,
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(linear_to_float_rows_kernel<Kind, Rows>), dim3(views.first[views.count]), dim3(kThreads), 0,
         stream, views, hidden);
 }
 template <WeightKind Kind, unsigned Rows>
@@ -3582,23 +3577,32 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
     const auto rotary = checked_u32(model.rotary_dim(), "rotary_dim");
     const auto index_heads = checked_u32(model.indexer_n_heads, "indexer_n_heads");
 
-    QsaRowsInputViews<Rows> input{};
     const std::array<const TensorPair*, 5> matrices{&tensors.index_q, &tensors.index_k, &tensors.q, &tensors.k, &tensors.v};
     const std::array<std::uint32_t, 5> outputs{a.index_q_width, a.index_dim, a.q_gate_width, a.kv_width, a.kv_width};
     const std::array<float* WorkspacePointers::*, 5> targets{&WorkspacePointers::index_query, &WorkspacePointers::current_index_key,
         &WorkspacePointers::q_gate, &WorkspacePointers::current_k, &WorkspacePointers::current_v};
-    for (unsigned m = 0; m < 5U; ++m) {
-        input.weights[m] = reinterpret_cast<const void*>(matrices[m]->runtime->address);
-        input.first[m + 1U] = input.first[m] + outputs[m];
-        for (unsigned r = 0; r < Rows; ++r) input.output[m][r] = prepared.row[r].workspace.*targets[m];
+    std::array<bool, 5> done{};
+    for (unsigned lead = 0; lead < 5U; ++lead) {
+        if (done[lead]) continue;
+        // Group every matrix sharing the lead's serial organization (format + prefetch8).
+        QsaRowsInputViews<Rows> input{};
+        for (unsigned r = 0; r < Rows; ++r) input.input[r] = reinterpret_cast<const std::uint16_t*>(prepared.row[r].input.address);
+        for (unsigned m = lead; m < 5U; ++m) {
+            if (done[m] || prepared.prefetch[m] != prepared.prefetch[lead] ||
+                matrices[m]->manifest->ggml_type != matrices[lead]->manifest->ggml_type) continue;
+            done[m] = true;
+            const auto g = input.count++;
+            input.weights[g] = reinterpret_cast<const void*>(matrices[m]->runtime->address);
+            input.first[g + 1U] = input.first[g] + outputs[m];
+            for (unsigned r = 0; r < Rows; ++r) input.output[g][r] = prepared.row[r].workspace.*targets[m];
+        }
+        dispatch_weight_kind(matrices[lead]->manifest->ggml_type, [&](auto kind) {
+            launch_qsa_rows_input<decltype(kind)::value, Rows>(prepared.prefetch[lead], input, a.hidden, stream);
+        });
+        check_hip(hipGetLastError(), "QSA known-window input projection launch");
+        if (prepared.prefetch[lead] && config.prefetch_stats)
+            config.prefetch_stats->dispatched_projections.fetch_add(input.count, std::memory_order_relaxed);
     }
-    for (unsigned r = 0; r < Rows; ++r) input.input[r] = reinterpret_cast<const std::uint16_t*>(prepared.row[r].input.address);
-    dispatch_weight_kind(tensors.q.manifest->ggml_type, [&](auto kind) {
-        launch_qsa_rows_input<decltype(kind)::value, Rows>(prepared.prefetch_input, input, a.hidden, stream);
-    });
-    check_hip(hipGetLastError(), "QSA known-window input projection launch");
-    if (prepared.prefetch_input && config.prefetch_stats)
-        config.prefetch_stats->dispatched_projections.fetch_add(5U, std::memory_order_relaxed);
 
     const auto norm = [&](const TensorPair& weights, float* WorkspacePointers::* target, std::uint32_t heads,
                           std::uint32_t head_dim, std::uint32_t stride) {

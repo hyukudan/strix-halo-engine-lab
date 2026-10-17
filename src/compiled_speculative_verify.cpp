@@ -545,15 +545,29 @@ bool window_shared_types(const ModelManifest& manifest, const ExecutionTensorAcc
 constexpr std::array<std::pair<std::string_view, std::array<std::uint64_t, 2>>, 6> known_qsa_matrices{{
     {"attn_q.weight", {2560, 12288}}, {"attn_k.weight", {2560, 512}}, {"attn_v.weight", {2560, 512}},
     {"attn_output.weight", {6144, 2560}}, {"indexer.q_proj.weight", {2560, 512}}, {"indexer.k_proj.weight", {2560, 128}}}};
-bool window_qsa_types(const ModelManifest& manifest, const ExecutionTensorAccessPlan& access, const ExecutionStep& step) {
-    bool q8 = true;
+enum class WindowQsaFormat { unsupported, all_q8, q8_bf16_indexer };
+WindowQsaFormat window_qsa_format(const ModelManifest& manifest, const ExecutionTensorAccessPlan& access, const ExecutionStep& step) {
+    bool attention_q8 = true, indexer_q8 = true, indexer_bf16 = true;
     // Always resolve and shape-check all six operands, even for fallback.
-    for (const auto& item : known_qsa_matrices)
-        q8 = window_matrix(window_tensor(manifest, access, step.id, step.op, *step.layer, item.first),
-            item.second[0], item.second[1]) && q8;
-    return q8;
+    for (std::size_t i = 0; i < known_qsa_matrices.size(); ++i) {
+        const auto& item = known_qsa_matrices[i];
+        const auto& tensor = window_tensor(manifest, access, step.id, step.op, *step.layer, item.first);
+        const bool q8 = window_matrix(tensor, item.second[0], item.second[1]);
+        if (i < 4U) { attention_q8 = q8 && attention_q8; continue; }
+        indexer_q8 = q8 && indexer_q8;
+        const bool bf16 = tensor.ggml_type == 30U;
+        if (bf16) window_require(tensor.byte_size == item.second[0] * item.second[1] * 2U && tensor.absolute_offset % 16U == 0 &&
+            tensor.byte_size <= std::numeric_limits<std::uint64_t>::max() - tensor.absolute_offset,
+            "known window BF16 indexer extent/alignment is invalid");
+        indexer_bf16 = bf16 && indexer_bf16;
+    }
+    if (!attention_q8) return WindowQsaFormat::unsupported;
+    return indexer_q8 ? WindowQsaFormat::all_q8 : indexer_bf16 ? WindowQsaFormat::q8_bf16_indexer : WindowQsaFormat::unsupported;
 }
-KnownWindowR2Variant qsa_rows_variant(std::uint32_t rows) {
+KnownWindowR2Variant qsa_rows_variant(std::uint32_t rows, WindowQsaFormat format) {
+    if (format == WindowQsaFormat::q8_bf16_indexer)
+        return rows==2U?KnownWindowR2Variant::qsa_q8_bf16idx_rows2_r1_v1:
+            rows==4U?KnownWindowR2Variant::qsa_q8_bf16idx_rows4_r1_v1:KnownWindowR2Variant::qsa_q8_bf16idx_rows8_r1_v1;
     return rows==2U?KnownWindowR2Variant::qsa_q8_rows2_r1_v1:
         rows==4U?KnownWindowR2Variant::qsa_q8_rows4_r1_v1:KnownWindowR2Variant::qsa_q8_rows8_r1_v1;
 }
@@ -587,8 +601,10 @@ WindowGdnFormat window_gdn_format(const ModelManifest& manifest, const Execution
 constexpr std::uint64_t known_shared_projection_bytes = 3ULL * (2560ULL / 32ULL * 34ULL * 640ULL);
 constexpr std::uint64_t known_gdn_projection_bytes = 2560ULL / 32ULL * 34ULL *
     (10240ULL + 6144ULL + 48ULL + 48ULL) + 6144ULL / 32ULL * 34ULL * 2560ULL;
-constexpr std::uint64_t known_qsa_projection_bytes = 2560ULL / 32ULL * 34ULL *
-    (12288ULL + 512ULL + 512ULL + 512ULL + 128ULL) + 6144ULL / 32ULL * 34ULL * 2560ULL;
+constexpr std::uint64_t known_qsa_attention_bytes = 2560ULL / 32ULL * 34ULL * (12288ULL + 512ULL + 512ULL) +
+    6144ULL / 32ULL * 34ULL * 2560ULL;
+constexpr std::uint64_t known_qsa_projection_bytes = known_qsa_attention_bytes + 2560ULL / 32ULL * 34ULL * (512ULL + 128ULL);
+constexpr std::uint64_t known_qsa_bf16_indexer_projection_bytes = known_qsa_attention_bytes + 2560ULL * (512ULL + 128ULL) * 2ULL;
 // Serial: five input and one output projection launch per row; rows: one each.
 constexpr std::uint32_t known_qsa_launches_saved(std::uint32_t rows) { return 6U * rows - 2U; }
 constexpr std::uint64_t known_gdn_q8_large_projection_bytes = 2560ULL / 32ULL * 34ULL *
@@ -653,9 +669,11 @@ std::pair<std::uint64_t, std::uint64_t> known_window_identities(
             // Routes are device results. No static weight-byte or launch-saving
             // claim is inferred before the actual union has been constructed.
         } else if(mode==KnownWindowStepMode::qsa_rows) {
+            const bool bf16=variant==qsa_rows_variant(window.logical_rows,WindowQsaFormat::q8_bf16_indexer);
             window_require(step.op==SerialOp::indexed_attention && binding.kernel_id && known_qsa_id(*binding.kernel_id) &&
-                variant==qsa_rows_variant(window.logical_rows), "known window QSA rows variant/source ID mismatch");
-            ++qsa_rows; avoided+=known_qsa_projection_bytes*(window.logical_rows-1U);
+                (bf16 || variant==qsa_rows_variant(window.logical_rows,WindowQsaFormat::all_q8)),
+                "known window QSA rows variant/source ID mismatch");
+            ++qsa_rows; avoided+=(bf16?known_qsa_bf16_indexer_projection_bytes:known_qsa_projection_bytes)*(window.logical_rows-1U);
             launches+=known_qsa_launches_saved(window.logical_rows);
         } else if (mode == KnownWindowStepMode::r2_gdn_staged) {
             window_require(step.op == SerialOp::gated_delta_net &&
@@ -787,10 +805,11 @@ CompiledKnownPrefixWindow compile_known_prefix_window(
                 output.projection_launches_saved += (mixed ? 3U : 5U)*saved_copies;
             }
         }
-        if(request.qsa_rows && step.op==SerialOp::indexed_attention && binding.kernel_id &&
-            known_qsa_id(*binding.kernel_id) && window_qsa_types(manifest,tensor_access,step)) {
+        const auto qsa_format=request.qsa_rows && step.op==SerialOp::indexed_attention && binding.kernel_id &&
+            known_qsa_id(*binding.kernel_id) ? window_qsa_format(manifest,tensor_access,step) : WindowQsaFormat::unsupported;
+        if(qsa_format!=WindowQsaFormat::unsupported) {
             output.mode[i]=KnownWindowStepMode::qsa_rows;
-            output.r2_variant[i]=qsa_rows_variant(output.logical_rows);
+            output.r2_variant[i]=qsa_rows_variant(output.logical_rows,qsa_format);
             for(const auto& item:known_qsa_matrices)
                 output.logical_projection_weight_bytes_avoided+=
                     window_tensor(manifest,tensor_access,step.id,step.op,*step.layer,item.first).byte_size*(output.logical_rows-1U);
@@ -864,7 +883,8 @@ void validate_known_prefix_window_formats(
             window_require(window_shared_types(manifest, tensor_access, step),
                 "known window shared variant differs from the selected tensor formats");
         } else if(window.mode[i]==KnownWindowStepMode::qsa_rows) {
-            window_require(window_qsa_types(manifest,tensor_access,step),
+            const auto format=window_qsa_format(manifest,tensor_access,step);
+            window_require(format!=WindowQsaFormat::unsupported && window.r2_variant[i]==qsa_rows_variant(window.logical_rows,format),
                 "known window QSA rows differ from the selected tensor formats");
         } else if(window.mode[i]==KnownWindowStepMode::routed_expert_union) {
             window_require(window_routed_union_types(manifest,tensor_access,step),

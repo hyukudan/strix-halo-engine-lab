@@ -757,6 +757,12 @@ void family_gdn_f32_gates() {
 
 // Native component evidence for the exact closed projection tiles used by the
 // T runtime. This does not replace full-model T producer/continuation gates.
+std::vector<unsigned char> bf16_matrix(std::uint32_t width, std::uint32_t outputs, unsigned salt) {
+    std::vector<std::uint16_t> values(static_cast<std::size_t>(width) * outputs);
+    for (std::size_t i = 0; i < values.size(); ++i)
+        values[i] = bf16(static_cast<float>(static_cast<int>((i * 7U + (i >> 8U) * 5U + salt) % 29U) - 14) * 0.00041F);
+    return bytes_of(values);
+}
 // One real QSA step (canonical layer-3 geometry, Q8 projections, budget 2048,
 // 4-cell blocks), eight row views of one physical window arena.
 struct QsaFixture {
@@ -782,7 +788,8 @@ struct QsaFixture {
     std::string selected_id;
     ExecutionLauncher selected;
 
-    QsaFixture(bool prefetch, bool wave8, std::uint64_t context_tokens) {
+    const bool bf16_indexer;
+    QsaFixture(bool prefetch, bool wave8, bool bf16_index, std::uint64_t context_tokens) : bf16_indexer(bf16_index) {
         const auto found = std::find_if(execution.steps.begin(), execution.steps.end(),
             [](const auto& value) { return value.op == SerialOp::indexed_attention; });
         require(found != execution.steps.end(), "canonical QSA operator missing");
@@ -810,8 +817,14 @@ struct QsaFixture {
         add("blk." + layer + ".attn_output.weight", TensorRole::attention_projection, {6144, 2560}, q8(6144, 2560, 14));
         add("blk." + layer + ".attn_q_norm.weight", TensorRole::normalization, {256}, f32(256U, 1.0F, 0.03F), 0U);
         add("blk." + layer + ".attn_k_norm.weight", TensorRole::normalization, {256}, f32(256U, 0.9F, 0.02F), 0U);
-        add("blk." + layer + ".indexer.q_proj.weight", TensorRole::sparse_index, {2560, 512}, q8(2560, 512, 15));
-        add("blk." + layer + ".indexer.k_proj.weight", TensorRole::sparse_index, {2560, 128}, q8(2560, 128, 16));
+        // The real checkpoint keeps both indexer projections in BF16.
+        if (bf16_indexer) {
+            add("blk." + layer + ".indexer.q_proj.weight", TensorRole::sparse_index, {2560, 512}, bf16_matrix(2560, 512, 15), 30U);
+            add("blk." + layer + ".indexer.k_proj.weight", TensorRole::sparse_index, {2560, 128}, bf16_matrix(2560, 128, 16), 30U);
+        } else {
+            add("blk." + layer + ".indexer.q_proj.weight", TensorRole::sparse_index, {2560, 512}, q8(2560, 512, 15));
+            add("blk." + layer + ".indexer.k_proj.weight", TensorRole::sparse_index, {2560, 128}, q8(2560, 128, 16));
+        }
         add("blk." + layer + ".indexer.q_norm.weight", TensorRole::sparse_index, {128}, f32(128U, 1.1F, 0.02F), 0U);
         add("blk." + layer + ".indexer.k_norm.weight", TensorRole::sparse_index, {128}, f32(128U, 0.95F, 0.03F), 0U);
         manifest.layout_identity = model_manifest_layout_identity(manifest);
@@ -914,8 +927,9 @@ struct QsaFixture {
     }
 };
 
-void qsa_rows_family(bool prefetch, bool wave8) {
-    QsaFixture f(prefetch, wave8, 2304U);
+void qsa_rows_family(bool prefetch, bool wave8, bool bf16_indexer) {
+    QsaFixture f(prefetch, wave8, bf16_indexer, 2304U);
+    const std::uint64_t prefetched = bf16_indexer ? 3U : 5U; // BF16 indexer stays on the legacy256 tree
     unsigned compared = 0;
     // Positions cover p=0, partial-block tails, the full-visible/top-k boundary
     // (visible 2048..2053 straddles 512 complete blocks) and a pure top-k window.
@@ -925,7 +939,7 @@ void qsa_rows_family(bool prefetch, bool wave8) {
             const auto reference = f.run(count, position, false);
             const auto middle = prefetch ? f.config.prefetch_stats->dispatched_projections.load() : 0U;
             const auto candidate = f.run(count, position, true);
-            if (prefetch) require(middle - before == 5U * count && f.config.prefetch_stats->dispatched_projections.load() - middle == 5U,
+            if (prefetch) require(middle - before == prefetched * count && f.config.prefetch_stats->dispatched_projections.load() - middle == prefetched,
                 "QSA rows prefetch submission count differs");
             require(candidate.arena == reference.arena, "QSA rows output/workspace bytes differ from ascending serial calls");
             require(candidate.state == reference.state, "QSA rows KV/raw-index state differs from ascending serial calls");
@@ -1010,7 +1024,7 @@ void qsa_rows_family(bool prefetch, bool wave8) {
         try { indexed_attention_known_window_rows_preflight(f.group(3U), f.config); } catch (const std::invalid_argument&) { thrown = true; }
         require(thrown, "QSA rows admit only two, four or eight rows");
     }
-    std::cout << "QSA rows prefetch=" << prefetch << " wave8=" << wave8 << ": " << compared
+    std::cout << "QSA rows prefetch=" << prefetch << " wave8=" << wave8 << " bf16_indexer=" << bf16_indexer << ": " << compared
               << " bit-exact windows, " << commits << " tail commits\n";
 
     if (!std::getenv("STRIX_QSA_ROWS_BENCH")) return;
@@ -1165,8 +1179,10 @@ int main() try {
     family(true);
     family_gdn_f32_gates();
     for(auto rows:{16U,17U}) {family_prefill_tiles(false,rows);family_prefill_tiles(true,rows);}
-    qsa_rows_family(true, true);
-    qsa_rows_family(false, false);
+    qsa_rows_family(true, true, true); // real checkpoint formats
+    qsa_rows_family(true, true, false);
+    qsa_rows_family(false, false, true);
+    qsa_rows_family(false, false, false);
     std::cout << "known-window shared/GDN/QSA component fixtures passed\n";
     return 0;
 } catch (const std::exception& error) {

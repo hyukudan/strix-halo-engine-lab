@@ -312,9 +312,12 @@ struct HipKnownPrefixWindow::Impl {
         qsa_config.wave8_q8_output=config.wave8_q8_qsa_output;
         qsa_fallback=qsa_config;
         qsa_fallback.prefetch_q8_input=false; qsa_fallback.prefetch_eligible_layers.clear();
-        const auto variant=window.logical_rows==2U?KnownWindowR2Variant::qsa_q8_rows2_r1_v1:
-            window.logical_rows==4U?KnownWindowR2Variant::qsa_q8_rows4_r1_v1:KnownWindowR2Variant::qsa_q8_rows8_r1_v1;
-        rows_entries.push_back({variant,this,
+        // One entry per QSA variant actually selected (layers may differ in indexer format).
+        for(std::size_t i=0;i<window.mode.size();++i) {
+            if(window.mode[i]!=KnownWindowStepMode::qsa_rows) continue;
+            const auto variant=window.r2_variant[i];
+            if(std::any_of(rows_entries.begin(),rows_entries.end(),[&](const auto& e){return e.variant==variant;})) continue;
+            rows_entries.push_back({variant,this,
             [](std::span<const ExecutionDispatchContext> rows,void* object) {
                 const auto& self=*static_cast<Impl*>(object);
                 indexed_attention_known_window_rows_preflight(rows,self.qsa_for(rows));
@@ -323,6 +326,7 @@ struct HipKnownPrefixWindow::Impl {
                 const auto& self=*static_cast<Impl*>(object);
                 indexed_attention_known_window_rows_launch(rows,self.qsa_for(rows));
             }});
+        }
     }
     void setup_routed_union() {
         const auto& workspace=routed_workspace.memory;
@@ -424,6 +428,9 @@ struct HipKnownPrefixWindow::Impl {
         case KnownWindowR2Variant::qsa_q8_rows2_r1_v1:
         case KnownWindowR2Variant::qsa_q8_rows4_r1_v1:
         case KnownWindowR2Variant::qsa_q8_rows8_r1_v1: recipe="hip-qsa-known-wide-q8-append-all-r1-attend-v1";break;
+        case KnownWindowR2Variant::qsa_q8_bf16idx_rows2_r1_v1:
+        case KnownWindowR2Variant::qsa_q8_bf16idx_rows4_r1_v1:
+        case KnownWindowR2Variant::qsa_q8_bf16idx_rows8_r1_v1: recipe="hip-qsa-known-wide-q8-bf16idx-append-all-r1-attend-v1";break;
         default:throw std::invalid_argument("known-window capture has no closed native recipe");
         }
         return capture_identity(recipe,static_cast<std::uint32_t>(variant));

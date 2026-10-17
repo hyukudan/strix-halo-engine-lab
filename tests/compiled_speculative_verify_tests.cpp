@@ -127,7 +127,7 @@ struct KnownFixture {
     strix::ExecutionTensorAccessPlan access;
 };
 KnownFixture make_known_fixture(const strix::ModelContract& model, std::uint32_t gate_type = 8U,
-    bool routed_union = false, bool qsa = false) {
+    bool routed_union = false, bool qsa = false, std::uint32_t indexer_type = 8U) {
     KnownFixture fixture;
     fixture.serial.execution = strix::build_serial_decode_execution_plan(model);
     fixture.serial.io = strix::build_serial_execution_io_plan(fixture.serial.execution);
@@ -170,7 +170,7 @@ KnownFixture make_known_fixture(const strix::ModelContract& model, std::uint32_t
             std::uint64_t elements = 1;
             for (const auto extent : value.dimensions) elements *= extent;
             value.byte_size = type == 8 ? value.dimensions[0] / 32U * 34U * value.dimensions[1] :
-                type==12U ? elements/256U*144U : type==7U ? elements/32U*24U : elements * 4U;
+                type==12U ? elements/256U*144U : type==7U ? elements/32U*24U : type==30U ? elements * 2U : elements * 4U;
             offset += (value.byte_size + 255U) / 256U * 256U;
             tensors.tensor_indices.push_back(static_cast<std::uint32_t>(fixture.manifest.tensors.size()));
             fixture.manifest.tensors.push_back(std::move(value));
@@ -200,7 +200,7 @@ KnownFixture make_known_fixture(const strix::ModelContract& model, std::uint32_t
             tensor("attn_q.weight",{2560,12288},8); tensor("attn_k.weight",{2560,512},8);
             tensor("attn_v.weight",{2560,512},8); tensor("attn_output.weight",{6144,2560},8);
             tensor("attn_q_norm.weight",{256},0); tensor("attn_k_norm.weight",{256},0);
-            tensor("indexer.q_proj.weight",{2560,512},8); tensor("indexer.k_proj.weight",{2560,128},8);
+            tensor("indexer.q_proj.weight",{2560,512},indexer_type); tensor("indexer.k_proj.weight",{2560,128},indexer_type);
             tensor("indexer.q_norm.weight",{128},0); tensor("indexer.k_norm.weight",{128},0);
         } else if (step.op == strix::SerialOp::ple) {
             // Only metadata is retained. A start-fault backend below never
@@ -1115,6 +1115,36 @@ void known_window_routed_union_runtime_tests(const strix::ModelContract& model) 
     }
 }
 
+void known_window_qsa_bf16_indexer_tests(const strix::ModelContract& model) {
+    using V=strix::KnownWindowR2Variant;
+    const auto fixture=make_known_fixture(model,0U,false,true,30U);
+    constexpr std::uint64_t layer_bytes=80ULL*34ULL*(12288ULL+512ULL+512ULL)+192ULL*34ULL*2560ULL+2560ULL*640ULL*2ULL;
+    for(const std::uint32_t rows:{2U,4U,8U}) {
+        strix::KnownWindowRequest request{true,true,true,rows};
+        const auto off=strix::compile_known_prefix_window(model,fixture.serial,fixture.manifest,fixture.access,request);
+        request.qsa_rows=true;
+        const auto on=strix::compile_known_prefix_window(model,fixture.serial,fixture.manifest,fixture.access,request);
+        const auto expected=rows==2U?V::qsa_q8_bf16idx_rows2_r1_v1:rows==4U?V::qsa_q8_bf16idx_rows4_r1_v1:V::qsa_q8_bf16idx_rows8_r1_v1;
+        expect(on.qsa_rows_steps==12U && std::count(on.r2_variant.begin(),on.r2_variant.end(),expected)==12 &&
+            on.logical_projection_weight_bytes_avoided==off.logical_projection_weight_bytes_avoided+12U*layer_bytes*(rows-1U),
+            "real-checkpoint BF16 indexer projections promote every QSA step to its own variant");
+        strix::validate_known_prefix_window_formats(on,fixture.serial,fixture.manifest,fixture.access);
+        auto mixed=fixture; // A Q8/BF16 indexer pair matches neither closed variant.
+        for(auto& t:mixed.manifest.tensors) if(t.name=="blk.3.indexer.k_proj.weight") {t.ggml_type=8U;t.byte_size=80U*34U*128U;}
+        const auto fallback=strix::compile_known_prefix_window(model,mixed.serial,mixed.manifest,mixed.access,request);
+        expect(fallback.qsa_rows_steps==11U,"mixed Q8/BF16 indexer pair keeps its serial row loop");
+        bool rejected=false;
+        try{strix::validate_known_prefix_window_formats(on,mixed.serial,mixed.manifest,mixed.access);}catch(const std::invalid_argument&){rejected=true;}
+        expect(rejected,"a compiled BF16-indexer variant cannot inherit a changed indexer format");
+        auto short_bf16=fixture;
+        for(auto& t:short_bf16.manifest.tensors) if(t.name=="blk.7.indexer.q_proj.weight") --t.byte_size;
+        rejected=false;
+        try{(void)strix::compile_known_prefix_window(model,short_bf16.serial,short_bf16.manifest,short_bf16.access,request);}
+        catch(const std::invalid_argument&){rejected=true;}
+        expect(rejected,"short BF16 indexer weight rejects before callbacks");
+    }
+}
+
 void known_window_qsa_tests(const strix::ModelContract& model) {
     using V=strix::KnownWindowR2Variant;
     using M=strix::KnownWindowStepMode;
@@ -1155,7 +1185,8 @@ void known_window_qsa_tests(const strix::ModelContract& model) {
         --tensor->byte_size;
         reject([&]{(void)strix::compile_known_prefix_window(model,malformed.serial,malformed.manifest,malformed.access,request);},
             "short QSA projection weight rejects before callbacks");
-        tensor->ggml_type=30U; // A non-Q8 projection keeps that step on its serial row loop.
+        ++tensor->byte_size;
+        tensor->ggml_type=13U; // An unsupported indexer format keeps that step on its serial row loop.
         const auto fallback=strix::compile_known_prefix_window(model,malformed.serial,malformed.manifest,malformed.access,request);
         const auto layer3=std::find_if(fixture.serial.execution.steps.begin(),fixture.serial.execution.steps.end(),
             [](const auto& step){return step.op==strix::SerialOp::indexed_attention && step.layer==3U;})-fixture.serial.execution.steps.begin();
@@ -1761,6 +1792,7 @@ int main() {
     known_window_routed_union_compiler_tests(model);
     known_window_routed_union_runtime_tests(model);
     known_window_qsa_tests(model);
+    known_window_qsa_bf16_indexer_tests(model);
     known_window_tests(model);
     known_window_runtime_tests(model);
     actual_known_window_lineage_tests(model);
