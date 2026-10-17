@@ -774,7 +774,7 @@ struct HipKnownPrefixWindow::Impl {
             hooks.quiesce_or_fail_stop = [&] { failed = true; guard.recover_or_fail_stop(); };
             hooks.position_reader_implementations = position_readers;
             hooks.record_actual_window_lineage=static_cast<bool>(capture);
-            if(!prefill) hooks.preflight_memo=&preflight_memo;
+            hooks.preflight_memo=&preflight_memo;
             const auto first_position=session.next_position;
             auto result=prefill ? execute_known_prefix_prefill_eager(*prefill,serial,resources,scratch,session,tokens,
                 launch_plans.front(),r2_entries,rows_entries,hooks,prefill_entries) :

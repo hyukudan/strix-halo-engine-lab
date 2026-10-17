@@ -6,6 +6,9 @@
 #include "strix/runtime_launchers.hpp"
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <limits>
@@ -30,7 +33,22 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
     const CompiledLaunchPlan& launch,std::span<const KnownWindowR2Entry> pairs,
     std::span<const KnownWindowRowsEntry> wide,const KnownWindowExecutionHooks& hooks,
     std::span<const KnownWindowRowsEntry> full) {
-    validate_compiled_known_prefix_prefill(plan,serial);
+    // STRIX_PREFILL_TIMING=1: host milliseconds of each phase of every block on stderr.
+    static const bool timing=[]{const char* v=std::getenv("STRIX_PREFILL_TIMING");return v&&v[0]=='1';}();
+    auto mark=std::chrono::steady_clock::now();
+    const auto lap=[&](const char* name) {
+        if(!timing) return;
+        const auto now=std::chrono::steady_clock::now();
+        std::fprintf(stderr,"prefill host %-10s %8.2f ms\n",name,std::chrono::duration<double,std::milli>(now-mark).count());mark=now;
+    };
+    // A repeat block of the same owner and launch plan skips the static plan check and the
+    // per-row launcher preflight (about 120 ms at T=64); every launcher still validates its
+    // context before enqueueing, and tokens, positions, capacity and session are checked below.
+    const void* preflight_key=&launch;
+    const bool preflight_known=hooks.preflight_memo&&
+        std::find(hooks.preflight_memo->begin(),hooks.preflight_memo->end(),preflight_key)!=hooks.preflight_memo->end();
+    if(!preflight_known) validate_compiled_known_prefix_prefill(plan,serial);
+    lap("plan");
     const auto rows=plan.logical_rows;const auto steps=serial.execution.steps.size();
     require(tokens.size()==rows,"known prefill token count differs from compiled T");
     require(hooks.preflight_scope&&hooks.complete&&hooks.quiesce_or_fail_stop,"known prefill requires scope/completion/fail-stop hooks");
@@ -140,7 +158,9 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
         std::memcpy(reinterpret_cast<void*>(current.address),&value,sizeof(value));
     };
     std::array<std::uint64_t,6> writes{};
+    lap("admit");
     hooks.preflight_scope();
+    lap("scope");
     for(std::size_t step=0;step<steps;++step) {
         for(std::size_t f=0;f<flags.size();++f) if(
             (static_cast<std::uint32_t>(serial.execution.steps[step].writes_state)&static_cast<std::uint32_t>(flags[f])))
@@ -152,6 +172,7 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
         if(multi&&!((!reads_position(serial.execution.steps[step].reads_state)||mode==KnownWindowStepMode::qsa_rows)&&(rows_entry?wide_by_id[id]!=nullptr:pair_by_id[id]!=nullptr)))
             throw std::invalid_argument("known prefill selected closed implementation is missing (variant "+std::to_string(id)+
                 ", mode "+std::to_string(static_cast<unsigned>(mode))+")");
+        if(preflight_known) continue;
         if(rows_entry&&full_by_id[id]&&rows%8U==0U) {
             std::vector<ExecutionDispatchContext> all(rows);for(std::uint32_t r=0;r<rows;++r) all[r]=context(step,r);
             full_by_id[id]->preflight(all,full_by_id[id]->config);
@@ -168,7 +189,10 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
         }
     }
     for(std::size_t f=0;f<flags.size();++f) require(writes[f]<=UINT64_MAX-session.state.generations[f],"known prefill state generation overflow");
+    lap("preflight");
     if(hooks.preflight_plan) hooks.preflight_plan();
+    lap("metadata");
+    if(hooks.preflight_memo&&!preflight_known) hooks.preflight_memo->push_back(preflight_key);
     DirectLaunchDispatcher dispatcher(launch);
     const auto ple=std::find_if(serial.execution.steps.begin(),serial.execution.steps.end(),[](const auto& s){return s.op==SerialOp::ple;});
     if(resources.ple_lookup&&resources.ple_hash_contract&&resources.ple_prefetch) {
@@ -231,7 +255,8 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
             }
         }
         if(resources.ple_prefetch&&resources.ple_prefetch->active) throw std::logic_error("known prefill left PLE lookup unconsumed");
-        hooks.complete();materialize(context(steps-1U,rows-1U),post-1U);
+        lap("launch");
+        hooks.complete();lap("complete");materialize(context(steps-1U,rows-1U),post-1U);
         std::uint64_t final_position=0;std::memcpy(&final_position,reinterpret_cast<const void*>(position.address),sizeof(final_position));
         if(final_position!=post-1U) throw std::logic_error("known prefill final host position differs from completed row frontier");
     } catch(...) {
