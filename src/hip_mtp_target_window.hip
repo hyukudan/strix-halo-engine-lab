@@ -47,6 +47,9 @@ struct HipMtpTargetWindowCapture::Impl {
     HipMtpTargetWindowCapturePolicy policy;
     std::vector<ExecutionBufferAddress> source_views,logit_views;
     std::vector<std::unique_ptr<HipGreedyOutput>> selectors;
+    // Host-mapped per-row argmax written by the window stream after its head rows
+    // (same finite first-max rule as the selectors); null keeps the selectors.
+    const HipGreedyRowsReply* device_greedy=nullptr;
     std::vector<MtpDeviceView> snapshots;
     std::shared_ptr<HipMtpTargetWindowBatch::Lease> active;
     std::weak_ptr<const HipMtpTargetWindowBatch::Lease> previous;
@@ -160,11 +163,21 @@ void HipMtpTargetWindowCapture::record_row(const ExecutionDispatchContext& c){
     check(hipMemcpyAsync(reinterpret_cast<void*>(i.snapshots[row].address),reinterpret_cast<const void*>(i.source_views[row].address),
         static_cast<std::size_t>(i.row_bytes),hipMemcpyDeviceToDevice,i.scope.stream));i.active->recorded[row]=1U;
 }
+void HipMtpTargetWindowCapture::use_device_greedy(const HipGreedyRowsReply* replies) noexcept {impl_->device_greedy=replies;}
 void HipMtpTargetWindowCapture::completed_before_publish(){
     auto& i=*impl_;i.require_pool();require(i.active && std::all_of(i.active->recorded.begin(),i.active->recorded.end(),[](auto x){return x==1U;}),
         "MTP window completed without every wide snapshot");
     // The actual producer has completed. Queue independent reductions/readbacks
     // before waiting, then validate every result before the batch can publish.
+    if(i.device_greedy) {
+        // The window stream already completed (its synchronize precedes this call).
+        for(std::uint32_t row=0;row<i.rows;++row) {
+            const auto reply=i.device_greedy[row];
+            require(reply.status==0U && reply.token<i.vocab,"GPU greedy rows logits must all be finite and selection valid");
+            i.active->predictions[row]=reply.token;
+        }
+        i.active->completed=true;return;
+    }
     for(std::uint32_t row=0;row<i.rows;++row)
         i.selectors[row]->submit(i.logit_views[row],i.vocab,i.active->base.next_position+row,i.active->epoch);
     for(std::uint32_t row=0;row<i.rows;++row)i.active->predictions[row]=i.selectors[row]->complete();

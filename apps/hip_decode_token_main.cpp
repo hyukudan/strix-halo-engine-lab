@@ -37,6 +37,10 @@
 #include "strix/wave_router_contract.hpp"
 #include "strix/model_tensor_index.hpp"
 #include "strix/ple_lookup.hpp"
+#if defined(__linux__)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 #include "strix/runtime_allocator.hpp"
 #include "strix/raw_baseline_recording.hpp"
 #include "strix/final_generation_state_export.hpp"
@@ -99,6 +103,43 @@
 #include <vector>
 
 namespace {
+// File-backed tensors (the PLE n-gram table) are read row by row on the host during decode.
+// Another process can evict them, turning those reads into random disk I/O while the GPU waits
+// (and every fault pulls a whole readahead window for a ~100-byte row). Mark them random-access
+// and populate them once, after the model registration. STRIX_PLE_WARM=0 skips it.
+void warm_file_backed_tensors(const strix::MappedModelFile& mapped, const strix::ModelManifest& manifest) {
+#if defined(__linux__)
+    const char* v = std::getenv("STRIX_PLE_WARM");
+    if (v && v[0] == '0') return;
+    const auto page = static_cast<std::uintptr_t>(sysconf(_SC_PAGESIZE));
+    const auto t0 = std::chrono::steady_clock::now();
+    std::uint64_t bytes = 0;
+    for (const auto& tensor : manifest.tensors) {
+        if (tensor.residency != strix::ResidencyPolicy::file_backed_candidate || !tensor.byte_size) continue;
+        if (tensor.absolute_offset > mapped.bytes() || tensor.byte_size > mapped.bytes() - tensor.absolute_offset) continue;
+        const auto begin = (mapped.base_address() + tensor.absolute_offset) & ~(page - 1U);
+        const auto end = mapped.base_address() + tensor.absolute_offset + tensor.byte_size;
+        auto* address = reinterpret_cast<void*>(begin);
+        const auto length = static_cast<std::size_t>(end - begin);
+        (void)madvise(address, length, MADV_RANDOM);
+#if defined(MADV_POPULATE_READ)
+        if (madvise(address, length, MADV_POPULATE_READ) != 0)
+#endif
+        {
+            (void)madvise(address, length, MADV_WILLNEED);
+            volatile std::uint8_t sink = 0;
+            for (auto at = begin; at < end; at += page) sink = sink + *reinterpret_cast<const volatile std::uint8_t*>(at);
+            (void)sink;
+        }
+        bytes += tensor.byte_size;
+    }
+    if (bytes)
+        std::fprintf(stderr, "warmed %.1f GB of file-backed tensors in %.1f s\n", static_cast<double>(bytes) / 1e9,
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+#else
+    (void)mapped; (void)manifest;
+#endif
+}
 using strix::decode_cli::parse_options;
 
 // One optional stderr JSON record; stdout keeps its existing decoder receipt.
@@ -1639,6 +1680,8 @@ int STRIX_DECODE_ENTRY(
     auto model_owner = std::make_shared<strix::HipModelResidency>(
         strix::HipModelResidency::create(mapped_owner, manifest, generations, residency_policy));
     auto& model_residency = *model_owner;
+    // After registration: pinning the model may evict anything populated before it.
+    warm_file_backed_tensors(mapped, manifest);
     // Keep the actual registration/copy owner and its exact map control block
     // pinned in the optional inventory; this is virtual backing, not RSS/PFN evidence.
     std::optional<strix::UmaOwnerInventory> model_owner_inventory;
@@ -2178,38 +2221,60 @@ int STRIX_DECODE_ENTRY(
         if (options.mtp.window_rows) {
             // Prepare the real closed native owner BEFORE any prompt mutation.
             // It retains all serial parents and its separate D1/arena ownership.
+            // A row set builds one owner per size; owners share one deferred
+            // GDN record and the arena/total budgets cover all of them.
             make_window = [&, parents](std::shared_ptr<strix::HipMtpTargetHidden> target) {
+              const auto row_set = options.mtp.window_rows_set.empty()
+                  ? std::vector<std::uint32_t>{options.mtp.window_rows} : options.mtp.window_rows_set;
+              std::vector<std::shared_ptr<strix::HipKnownPrefixWindow>> owners;
+              std::uint64_t retained_total = 0, union_total = 0, union_steps = 0, union_generation = 0;
+              for (const auto window_rows : row_set) {
                 const auto plan = strix::compile_known_prefix_window(model, compiled, manifest, tensor_access,
-                    {true, true, true, options.mtp.window_rows, options.mtp.window_expert_union, strix::KnownWindowOutputPolicy::all_rows});
+                    {true, true, true, window_rows, options.mtp.window_expert_union, strix::KnownWindowOutputPolicy::all_rows,
+                     options.mtp.window_hyper_mix, options.mtp.window_qsa_rows, options.mtp.window_prefix, options.mtp.window_prefix,
+                     options.mtp.window_prefix, options.mtp.window_prefix || options.known_window_router_rows,
+                     options.mtp.window_prefix || options.known_window_router_rows});
                 if (!strix::known_window_has_promoted_steps(plan) ||
-                    (options.mtp.window_expert_union && !plan.routed_expert_union_steps))
-                    throw std::invalid_argument("MTP target window has no admitted requested operators");
+                    (options.mtp.window_expert_union && !plan.routed_expert_union_steps) ||
+                    (options.mtp.window_hyper_mix && !plan.hyper_mix_rows_steps) ||
+                    (options.mtp.window_qsa_rows && !plan.qsa_rows_steps) ||
+                    (options.mtp.window_prefix && (plan.gdn_deferred_rows_steps != model.gdn_layers || !plan.ple_rows_steps)))
+                    throw std::invalid_argument("MTP target window has no admitted requested operators: union " +
+                        std::to_string(plan.routed_expert_union_steps) + " hc " + std::to_string(plan.hyper_mix_rows_steps) +
+                        " qsa " + std::to_string(plan.qsa_rows_steps) + " gdn-deferred " + std::to_string(plan.gdn_deferred_rows_steps) +
+                        " ple " + std::to_string(plan.ple_rows_steps));
                 std::uint64_t union_bytes = 0;
                 if (options.mtp.window_expert_union) {
                     if (model.num_experts > UINT32_MAX || model.num_experts_per_token > UINT32_MAX)
                         throw std::invalid_argument("MTP window expert union geometry exceeds uint32");
-                    union_bytes = strix::q51_known_rows::required_scratch_bytes(options.mtp.window_rows,
+                    union_bytes = strix::q51_known_rows::required_scratch_bytes(window_rows,
                         static_cast<std::uint32_t>(model.num_experts), static_cast<std::uint32_t>(model.num_experts_per_token));
                     if (!union_bytes) throw std::logic_error("MTP expert union has no required scratch");
                 }
                 const auto reservation = strix::decode_cli::reserve_mtp_window_memory(plan.arena.physical.total_bytes,
-                    options.mtp.window_arena_bytes, options.mtp.window_total_bytes, union_bytes, options.mtp.window_expert_union_bytes);
+                    options.mtp.window_arena_bytes - std::min(retained_total, options.mtp.window_arena_bytes),
+                    options.mtp.window_total_bytes - std::min(retained_total, options.mtp.window_total_bytes),
+                    union_bytes, options.mtp.window_expert_union_bytes - std::min(union_total, options.mtp.window_expert_union_bytes));
                 auto window_memory = std::make_shared<KnownPromptMemory>(plan, generations.next(), generations.next(),
                     std::static_pointer_cast<const void>(parents), original_work_device, 0, 0,
                     union_bytes, union_bytes ? generations.next() : 0);
-                auto window_owner = std::make_shared<strix::HipKnownPrefixWindow>(plan, compiled, model, catalog_config,
+                owners.push_back(std::make_shared<strix::HipKnownPrefixWindow>(plan, compiled, model, catalog_config,
                     parents->resources, window_memory->scratch, window_memory->scope, std::static_pointer_cast<const void>(window_memory),
                     union_bytes ? strix::q51_known_rows::Workspace{window_memory->union_scratch,
-                        std::static_pointer_cast<const void>(window_memory)} : strix::q51_known_rows::Workspace{});
+                        std::static_pointer_cast<const void>(window_memory)} : strix::q51_known_rows::Workspace{}));
+                retained_total += reservation.retained_window_bytes; union_total += union_bytes;
+                union_steps += plan.routed_expert_union_steps;
+                if (union_bytes) union_generation = window_memory->union_scratch.allocation_generation;
+              }
                 strix::HipMtpWindowVerificationPolicy policy;
                 policy.bounded_window_rollback = true;
                 policy.capture = {options.mtp.window_capture_bytes, options.mtp.window_history_intervals};
                 policy.checkpoint_retained_byte_budget = options.mtp.window_checkpoint_bytes;
-                policy.total_retained_byte_budget = reservation.verifier_budget_bytes;
-                auto verifier = std::make_shared<strix::HipMtpWindowVerifier>(std::move(target), std::move(window_owner),
+                policy.total_retained_byte_budget = options.mtp.window_total_bytes - retained_total;
+                policy.min_probability = strix::decode_cli::mtp_draft_min_probability(options.mtp);
+                auto verifier = std::make_shared<strix::HipMtpWindowVerifier>(std::move(target), std::move(owners),
                     parents->resources, parents, policy, generations);
-                parents->window_setup = {plan.routed_expert_union_steps, union_bytes,
-                    window_memory->union_scratch.allocation_generation, reservation.retained_window_bytes};
+                parents->window_setup = {union_steps, union_total, union_generation, retained_total};
                 return verifier;
             };
         }
@@ -2867,11 +2932,12 @@ int STRIX_DECODE_ENTRY(
             if (options.known_prefix_prefill_rows) {
                 known_prefill_plan = std::make_shared<strix::CompiledKnownPrefixPrefill>(strix::compile_known_prefix_prefill(model, compiled, manifest, tensor_access,
                     {options.known_prefix_prefill_rows, true, true, true, options.known_prefix_expert_union,
-                     options.known_prefix_output_policy, options.known_prefill_workspace_budget, options.known_prefill_metadata_budget / 2U}));
+                     options.known_prefix_output_policy, options.known_prefill_workspace_budget, options.known_prefill_metadata_budget / 2U,
+                     options.known_window_router_rows, options.known_window_router_rows}));
                 known_prefix_plan = known_prefill_plan->tile8; // selection ledger, never a relabelled T forward
             } else known_prefix_plan = strix::compile_known_prefix_window(model, compiled, manifest, tensor_access,
                 {true, true, true, options.known_prefix_window ? options.known_prefix_rows : 2U, options.known_prefix_expert_union,
-                 options.known_prefix_output_policy});
+                 options.known_prefix_output_policy, options.known_window_router_rows, options.known_window_router_rows});
             if (!strix::known_window_has_promoted_steps(*known_prefix_plan))
                 throw std::invalid_argument("known prompt has no admitted known-window operators");
             if (model.vocab_size > std::numeric_limits<std::uint32_t>::max())

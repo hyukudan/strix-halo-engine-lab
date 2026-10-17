@@ -49,4 +49,11 @@ struct HipMtpNativeForwardReplayResult {
 [[nodiscard]] HipMtpNativeForwardReplayResult replay_hip_mtp_forward(
     HipMtpRuntime&,std::span<const HipMtpReplayRow>,const HipMtpForwardGolden&,
     const HipMtpForwardReplayRequest&);
+// Developer capture: the SAME native forward as replay over completed prompt
+// rows, recorded as a golden. Self-generated: it is no independent evidence;
+// the caller must pin an explicit self-generated source marker. Replaying the
+// result admits only drafting (acceptance), never target output.
+[[nodiscard]] HipMtpForwardGolden capture_hip_mtp_forward_golden(
+    HipMtpRuntime&,std::span<const HipMtpReplayRow>,const ModelContentIdentity& self_source_content,
+    std::uint64_t self_reference_identity);
 } // namespace strix

@@ -4,6 +4,7 @@
 #include <bit>
 #include <string>
 #include <chrono>
+#include <cstring>
 #include <fstream>
 #include <iostream>
 #include <limits>
@@ -115,6 +116,27 @@ int main() {
         auto inconsistent=golden; inconsistent.rows[1].next_hidden_bf16.pop_back();
         rejects([&] { (void)encode_mtp_forward_golden_file(inconsistent,1024); },"encoder rejects inconsistent later wide row");
         rejects([&] { (void)encode_mtp_forward_golden_file(golden,255); },"encoder validates total budget before allocating bytes");
+        // Self-generated dump route: writer -> strict reader round trip with its returned pin.
+        auto self=golden; self.independent_source_content=mtp_self_generated_golden_source();
+        self.independent_reference_identity=mtp_self_generated_golden_reference;
+        const auto dumped=file.directory/"dumped.bin";
+        const auto pin=write_mtp_forward_golden_file(dumped,self,1024);
+        const auto back=read_mtp_forward_golden_file(dumped,pin,1024);
+        expect(pin==sha256_bytes(encode_mtp_forward_golden_file(self,1024)),"writer returns the full-file SHA pin");
+        expect(back.independent_source_content==self.independent_source_content && back.independent_reference_identity==self.independent_reference_identity &&
+               back.target_content==self.target_content && back.sidecar_content==self.sidecar_content &&
+               back.structural_plan_identity==12 && back.semantic_identity==13 && back.numerical_profile_identity==14 &&
+               back.rows.size()==self.rows.size(),"writer->reader preserves self-generated marker and all bindings");
+        for(std::size_t i=0;i<self.rows.size();++i)
+            expect(back.rows[i].source_position==i && back.rows[i].source_input_token==self.rows[i].source_input_token &&
+                   back.rows[i].next_input_token==self.rows[i].next_input_token && back.rows[i].selected_token==self.rows[i].selected_token &&
+                   back.rows[i].target_hidden_bf16==self.rows[i].target_hidden_bf16 && back.rows[i].next_hidden_bf16==self.rows[i].next_hidden_bf16 &&
+                   std::memcmp(back.rows[i].full_logits.data(),self.rows[i].full_logits.data(),self.rows[i].full_logits.size()*4)==0,
+                   "writer->reader round trip is bitwise per row");
+        expect(mtp_self_generated_golden_source()!=golden.independent_source_content && mtp_self_generated_golden_source().valid(),
+               "self-generated marker is explicit and distinct");
+        rejects([&] { (void)write_mtp_forward_golden_file(dumped,self,1024); },"writer refuses to overwrite an existing golden");
+        std::error_code ignored; std::filesystem::remove(dumped,ignored);
         return failures?1:0;
     } catch(const std::exception& error) { std::cerr<<error.what()<<'\n'; return 1; }
 }

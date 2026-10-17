@@ -57,6 +57,11 @@ public:
     // input chain matches finite target predictions, EOS/budget permit all rows,
     // and the exact actual target state still equals the completed whole chunk.
     // Intermediate rows retain the REAL final chunk session, never fake prefixes.
+    // Rows [0, n_keep) of a deferred-state window whose session was already rewound to the
+    // accepted prefix (drafts 1..n_keep-1 matched their predecessors' predictions).
+    [[nodiscard]] std::vector<HipMtpTargetHiddenTicket> accept_verified_prefix(
+        std::shared_ptr<const HipMtpTargetWindowBatch> batch,const HipMtpTargetHiddenTicket& base,
+        const SerialSessionContext& target,std::uint32_t n_keep);
     [[nodiscard]] std::vector<HipMtpTargetHiddenTicket> accept_verified_window(
         std::shared_ptr<const HipMtpTargetWindowBatch>,const HipMtpTargetHiddenTicket& base,
         const SerialSessionContext& actual_target,std::span<const std::uint32_t> eos_tokens,

@@ -1,82 +1,85 @@
-# Presupuesto UMA/GTT — borrador operativo
+# UMA/GTT budget — working draft
 
-## Modelo correcto
+## Correct model
 
-En Strix Halo la RAM es físicamente compartida. GTT limita cuánto espacio puede
-mapear `amdgpu`; no es memoria física adicional. Aumentarlo permite que la GPU
-vea casi toda la RAM, pero no elimina la necesidad de reservar capacidad para
-kernel, servicios, page cache, recuperación y picos temporales.
+On Strix Halo the RAM is physically shared. GTT limits how much address space
+`amdgpu` can map; it is not additional physical memory. Raising it lets the GPU
+see almost all of the RAM, but it does not remove the need to reserve capacity
+for the kernel, services, page cache, recovery and transient peaks.
 
-## Política propuesta para 128 GB
+## Proposed policy for 128 GB
 
-- BIOS: carve-out gráfico mínimo que permita el firmware (objetivo 0,5–2 GiB,
-  nunca `Auto` sin comprobar el resultado).
-- GTT: calcular desde la RAM real y ofrecer un perfil máximo cercano a 124 GiB.
-  La cifra publicada por external runtime A para un equipo nominal de 128 GB es
-  `amdgpu.gttsize=126976` MiB y `ttm.pages_limit=32505856` páginas de 4 KiB.
-- Admisión: conservar 16–20 GiB de margen efectivo para host, page cache,
-  recuperación y picos, aunque el mapping limit sea mayor. El máximo mapeable
-  no es el máximo asignable.
-- Monitorizar `mem_info_gtt_used`, `MemAvailable`, memoria bloqueada/registrada,
-  RSS/PSS, page cache y categorías internas del motor.
-- Si un proceso muere sucio y quedan 35–45 GiB aparentes en GTT, impedir el
-  reinicio automático del modelo, drenar el servicio y recomendar reinicio del
-  host. La cifra es una observación publicada por external runtime A y deberá reproducirse.
+- BIOS: the minimum graphics carve-out the firmware allows (target 0.5–2 GiB,
+  never `Auto` without checking the result).
+- GTT: compute from the actual RAM and offer a maximum profile close to 124 GiB.
+  For a nominal 128 GB system the candidate values, still to be measured on our
+  hardware, are `amdgpu.gttsize=126976` MiB and `ttm.pages_limit=32505856`
+  4 KiB pages.
+- Admission: keep a 16–20 GiB effective margin for the host, page cache,
+  recovery and peaks, even if the mapping limit is higher. The maximum mappable
+  amount is not the maximum allocatable amount.
+- Monitor `mem_info_gtt_used`, `MemAvailable`, locked/registered memory,
+  RSS/PSS, page cache and the engine's internal categories.
+- If a process dies uncleanly and 35–45 GiB apparently remain in GTT, block
+  automatic model restart, drain the service and recommend a host reboot. This
+  range has not been reproduced locally and must be measured on our hardware.
 
-`amd_iommu=off` no será predeterminado: puede mejorar prefill en un host dedicado,
-pero reduce aislamiento DMA y desactiva el NPU. Solo podrá existir como perfil
-opt-in separado, con aviso y rollback. Tampoco se adoptarán sin medida
-`amdgpu.vm_update_mode=0`, `amdgpu.noretry=0` o `amdgpu.sg_display=0`.
+`amd_iommu=off` will not be a default: it can improve prefill on a dedicated
+host, but it reduces DMA isolation and disables the NPU. It may only exist as a
+separate opt-in profile, with a warning and rollback. Likewise,
+`amdgpu.vm_update_mode=0`, `amdgpu.noretry=0` and `amdgpu.sg_display=0` will not
+be adopted without measurement.
 
-## Categorías que debe calcular el admission controller
+## Categories the admission controller must compute
 
-1. pesos residentes y mappings;
-2. PLE/n-gram residente, caché de filas y buffers de lectura directa;
-3. KV por sesión;
-4. estado recurrente GDN;
-5. MTP, snapshots y rollback;
-6. scratch, grafos, inputs ring y caché BF16/dequant;
-7. runtime/librerías y margen del driver;
-8. SO, servicios, page cache y reserva de recuperación.
+1. resident weights and mappings;
+2. resident PLE/n-gram, row cache and direct-read buffers;
+3. KV per session;
+4. GDN recurrent state;
+5. MTP, snapshots and rollback;
+6. scratch, graphs, input rings and BF16/dequant cache;
+7. runtime/libraries and driver margin;
+8. OS, services, page cache and recovery reserve.
 
-El `config.json` oficial fijado declara 48 capas, una atención completa cada
-cuatro capas, 2 cabezas KV y `head_dim=256`. Para un KV convencional BF16:
+The pinned official `config.json` declares 48 layers, one full-attention layer
+every four layers, 2 KV heads and `head_dim=256`. For a conventional BF16 KV:
 
-`12 capas × 2 cabezas × 256 × (K+V) × 2 bytes = 24 KiB/token/sesión`.
+`12 layers × 2 heads × 256 × (K+V) × 2 bytes = 24 KiB/token/session`.
 
-Por tanto, 262.144 tokens consumen 6 GiB por sesión y C4 consumiría 24 GiB,
-antes de recurrencia, indexer, MTP, rollback y scratch. Es un límite inferior
-de planificación, no una promesa de implementación; el primer contexto se
-elegirá a partir de medidas C1/C2/C4.
+Therefore 262,144 tokens consume 6 GiB per session and C4 would consume 24 GiB,
+before recurrence, indexer, MTP, rollback and scratch. This is a planning lower
+bound, not an implementation promise; the first context length will be chosen
+from C1/C2/C4 measurements.
 
-La capa MTP de atención completa añade provisionalmente 2 KiB/token, dejando
-26 KiB/token: 6,5 GiB a 262.144. Además, el estado next-step del drafter ya
-tiene geometría fijada de `hc_count × hidden_size = 10.240` elementos por
-sesión. El planner lo contabiliza como categoría separada: el escenario por
-defecto usa 2 bytes/elemento (20.480 bytes/sesión), pero
-`--mtp-draft-state-bytes` permite cambiar la hipótesis. Ese tamaño de elemento
-es una **suposición de planificación**, no el dtype canónico del forward MTP. El indexer podría añadir ~768 B/token si la
-compresión del config se traduce directamente a cache; debe confirmarse contra
-el forward oficial. El estado GDN FP32 mínimo estimado es
-`36 × 48 × 128 × 128 × 4 = 108 MiB/sesión`, más conv/history. Siete snapshots
-completos serían ~756 MiB/sesión, de modo que se estudiará snapshot mínimo más
-recompute. Estas cifras son inferencias de planificación, no contratos cerrados.
+The full-attention MTP layer provisionally adds 2 KiB/token, giving
+26 KiB/token: 6.5 GiB at 262,144. In addition, the drafter's next-step state
+already has a pinned geometry of `hc_count × hidden_size = 10,240` elements per
+session. The planner accounts for it as a separate category: the default
+scenario uses 2 bytes/element (20,480 bytes/session), but
+`--mtp-draft-state-bytes` allows changing the assumption. That element size is
+a **planning assumption**, not the canonical dtype of the MTP forward. The
+indexer could add ~768 B/token if the config's compression translates directly
+into cache; this must be confirmed against the official forward. The estimated
+minimum FP32 GDN state is `36 × 48 × 128 × 128 × 4 = 108 MiB/session`, plus
+conv/history. Seven full snapshots would be ~756 MiB/session, so a minimal
+snapshot plus recompute will be studied. These figures are planning
+inferences, not closed contracts.
 
-El planner publicará dos escenarios: PLE residente y PLE directa/no residente.
-La caché de filas, page cache y cualquier caché BF16/dequant tienen tope duro y
-contabilidad propia; se compararán `O_DIRECT` y/o `posix_fadvise(DONTNEED)` para
-evitar que `pread` convierta la reserva del host en page cache invisible.
+The planner will publish two scenarios: resident PLE and direct/non-resident
+PLE. The row cache, page cache and any BF16/dequant cache have a hard cap and
+their own accounting; `O_DIRECT` and/or `posix_fadvise(DONTNEED)` will be
+compared to prevent `pread` from turning the host reserve into invisible page
+cache.
 
-El tamaño en disco no equivale al working set. Como referencia externa,
-external runtime A publica unos 118 GiB de ficheros para base+overlay pero unos 68 GiB
-residentes más una tabla n-gram mapeada; external platform study mantiene fuera del resident set
-una PLE de 27,5 GB mediante lectura directa. Ambos resultados requieren
-reproducción en nuestro hardware y modelo elegido.
+On-disk size is not the working set. Base and overlay files, resident weights
+and a mapped n-gram table must be accounted for separately, and keeping the PLE
+outside the resident set through direct reads must be measured on our hardware
+with the selected model.
 
-## UI administrativa
+## Administrative UI
 
-El panel podrá calcular y mostrar el perfil de arranque, comprobar RAM, BIOS,
-kernel y parámetros actuales, y generar/aplicar un cambio versionado. Aplicar
-se limita a GTT/TTM allowlisted y requiere arranque one-shot, confirmación,
-health check y retorno automático a la entrada anterior si el nuevo arranque no
-se confirma. IOMMU y parámetros experimentales solo se cambian por consola/SSH.
+The panel may compute and display the boot profile, check RAM, BIOS, kernel and
+current parameters, and generate/apply a versioned change. Applying is limited
+to allowlisted GTT/TTM parameters and requires a one-shot boot, confirmation, a
+health check and automatic return to the previous entry if the new boot is not
+confirmed. IOMMU and experimental parameters are changed only via console/SSH.

@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <string>
 #include <memory>
+#include <span>
 
 namespace strix {
 class WaveRouterManifestAdmission;
@@ -60,6 +61,17 @@ public:
 private:
     HipMoeRouteLauncherConfig config_;
 };
+
+// Known-prefix window rows: 2/4/8 C1 row views of one serial parallel router
+// step. Logits read each weight tile once for all rows; every row keeps the
+// serial ascending fused chain and the configured selection body, so each
+// row's logits/indices/weights equal its serial launch bit for bit. Each row
+// is admitted exactly as the serial launcher admits it; launch uses the
+// current HIP launch stream and is capture safe.
+void moe_route_known_window_rows_preflight(std::span<const ExecutionDispatchContext> rows,
+    const HipMoeRouteLauncherConfig& config);
+void moe_route_known_window_rows_launch(std::span<const ExecutionDispatchContext> rows,
+    const HipMoeRouteLauncherConfig& config);
 
 // Source-only native MTP entry points; qualification is separate.
 struct MtpNativeContext;

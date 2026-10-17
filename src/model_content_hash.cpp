@@ -1,13 +1,20 @@
 #include "strix/model_content_hash.hpp"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <array>
 #include <cstdint>
 #include <fstream>
 #include <limits>
+#include <optional>
+#include <string>
 #include <stdexcept>
 #include <system_error>
 #include <vector>
+#if defined(__linux__)
+#include <sys/stat.h>
+#endif
 #if defined(STRIX_USE_OPENSSL_SHA256)
 #include <openssl/evp.h>
 #include <memory>
@@ -324,7 +331,89 @@ private:
 using FileSha256 = Sha256;
 #endif
 
-FileDigest hash_file_stable(
+FileDigest hash_file_stable_uncached(const std::filesystem::path& path);
+
+#if defined(__linux__)
+// Verified-identity cache, like git's index: a full-file SHA-256 of a ~60 GB model costs ~48 s of one
+// core on every start. The digest is reused only while the file keeps its device, inode, size, mtime
+// and ctime (ctime cannot be set from user space; any write or metadata change moves it), so a changed
+// file is always re-hashed. STRIX_HASH_CACHE=0 disables it; STRIX_HASH_CACHE=DIR picks the directory
+// (default $XDG_CACHE_HOME/strix-engine/file-sha256, else ~/.cache/strix-engine/file-sha256).
+struct HashCacheKey {
+    std::string file;
+    std::string stamp;
+};
+std::optional<HashCacheKey> hash_cache_key(const std::filesystem::path& path) {
+    const char* setting = std::getenv("STRIX_HASH_CACHE");
+    if (setting && setting[0] == '0' && setting[1] == '\0') return std::nullopt;
+    std::filesystem::path dir;
+    if (setting && setting[0]) dir = setting;
+    else if (const char* xdg = std::getenv("XDG_CACHE_HOME"); xdg && xdg[0]) dir = std::filesystem::path(xdg) / "strix-engine/file-sha256";
+    else if (const char* home = std::getenv("HOME"); home && home[0]) dir = std::filesystem::path(home) / ".cache/strix-engine/file-sha256";
+    else return std::nullopt;
+    struct stat st {};
+    if (::stat(path.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) return std::nullopt;
+    char name[64], stamp[160];
+    std::snprintf(name, sizeof(name), "%llx-%llx", static_cast<unsigned long long>(st.st_dev),
+        static_cast<unsigned long long>(st.st_ino));
+    std::snprintf(stamp, sizeof(stamp), "v1 %lld %lld.%09ld %lld.%09ld", static_cast<long long>(st.st_size),
+        static_cast<long long>(st.st_mtim.tv_sec), st.st_mtim.tv_nsec, static_cast<long long>(st.st_ctim.tv_sec),
+        st.st_ctim.tv_nsec);
+    return HashCacheKey{(dir / name).string(), stamp};
+}
+std::optional<FileDigest> hash_cache_read(const HashCacheKey& key) {
+    std::ifstream in(key.file);
+    std::string stamp, hex;
+    if (!std::getline(in, stamp) || stamp != key.stamp || !std::getline(in, hex) || hex.size() != 64U) return std::nullopt;
+    FileDigest digest;
+    for (std::size_t i = 0; i < 32U; ++i) {
+        const auto nibble = [](char c) -> int {
+            return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : -1;
+        };
+        const int hi = nibble(hex[2U * i]), lo = nibble(hex[2U * i + 1U]);
+        if (hi < 0 || lo < 0) return std::nullopt;
+        digest.digest.bytes[i] = static_cast<std::uint8_t>(hi * 16 + lo);
+    }
+    digest.bytes = std::stoull(stamp.substr(3, stamp.find(' ', 3) - 3));
+    if (!digest.digest.valid()) return std::nullopt;
+    return digest;
+}
+void hash_cache_write(const HashCacheKey& key, const FileDigest& digest) {
+    std::error_code error;
+    std::filesystem::create_directories(std::filesystem::path(key.file).parent_path(), error);
+    const auto temporary = key.file + ".tmp";
+    {
+        std::ofstream out(temporary, std::ios::trunc);
+        if (!out) return;
+        constexpr char digits[] = "0123456789abcdef";
+        std::string hex(64U, '0');
+        for (std::size_t i = 0; i < 32U; ++i) {
+            hex[2U * i] = digits[digest.digest.bytes[i] >> 4U];
+            hex[2U * i + 1U] = digits[digest.digest.bytes[i] & 0x0fU];
+        }
+        out << key.stamp << '\n' << hex << '\n';
+        if (!out) return;
+    }
+    std::filesystem::rename(temporary, key.file, error);
+}
+#endif
+
+FileDigest hash_file_stable(const std::filesystem::path& path) {
+#if defined(__linux__)
+    const auto key = hash_cache_key(path);
+    if (key)
+        if (auto cached = hash_cache_read(*key)) return *cached;
+    const auto digest = hash_file_stable_uncached(path);
+    // Store only if the file still carries the stamp it had before hashing.
+    if (key)
+        if (const auto after = hash_cache_key(path); after && after->stamp == key->stamp) hash_cache_write(*key, digest);
+    return digest;
+#else
+    return hash_file_stable_uncached(path);
+#endif
+}
+
+FileDigest hash_file_stable_uncached(
     const std::filesystem::path& path) {
     std::error_code error;
     const auto before =

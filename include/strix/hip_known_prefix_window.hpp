@@ -14,6 +14,7 @@
 #include <span>
 
 namespace strix {
+struct HipGreedyRowsReply;
 class HipMtpTargetWindowCapture;
 struct HipMtpTargetWindowCapturePolicy;
 struct HipMtpTargetWindowExecution;
@@ -78,6 +79,12 @@ public:
     [[nodiscard]] HipMtpTargetWindowExecution execute_mtp_captured(SerialSessionContext&,
         std::span<const std::uint32_t>,std::shared_ptr<HipMtpTargetWindowCapture>,
         const std::function<void()>& before_publish = {});
+    // Opt-in device greedy selection enqueued right after the multi-row terminal
+    // head (KnownWindowRequest::lm_head_rows); logits stay materialised. After each
+    // successful execute, replies[r] (host-mapped coherent, logical_rows entries)
+    // holds row r's first-max finite token/status with no extra copy or sync.
+    // partials is retained device scratch of hip_greedy_rows_scratch_bytes(T, vocab).
+    void attach_greedy_rows(ExecutionBufferAddress partials, HipGreedyRowsReply* replies);
     [[nodiscard]] std::uint32_t logical_rows() const noexcept;
     [[nodiscard]] bool supports_tiled_prefill() const noexcept;
     // Immutable compiler-selected intent; verification consumers require all_rows.
@@ -85,6 +92,16 @@ public:
     // Last eligible layer in the last SUCCESSFULLY completed window only.
     // Not aggregate reuse, DRAM traffic, timing or model qualification.
     [[nodiscard]] std::optional<HipKnownPrefixUnionObservation> latest_routed_union_observation() const noexcept;
+    // Prefix acceptance (deferred GDN / PLE rows windows). The window executed all rows but only
+    // [0, n_keep) are committed; the caller rewinds its session frontier to match.
+    [[nodiscard]] bool defers_state() const noexcept;
+    void commit_prefix(std::uint32_t n_keep);
+    // Applies pending GDN rows before any ordinary serial token touches GDN state.
+    void flush_deferred();
+    // Before either owner executes: adopt primary's deferred GDN rows/control so
+    // windows of different sizes over one session continue one pending protocol.
+    // flush_deferred() must then run on an owner that has executed a window.
+    void share_deferred(const HipKnownPrefixWindow& primary);
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

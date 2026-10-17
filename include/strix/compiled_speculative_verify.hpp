@@ -26,6 +26,16 @@ enum class KnownWindowStepMode : std::uint8_t {
     shared_rows,
     gdn_rows,
     routed_expert_union,
+    hyper_mix_rows,
+    qsa_rows,
+    // GDN window without checkpoint: accepted rows are applied by the next window or a commit.
+    gdn_deferred_rows,
+    // PLE rows looked up on the host before the window; convolution kept per row.
+    ple_rows,
+    lm_head_rows,
+    moe_route_rows,
+    moe_combine_rows,
+    inject_rows,
 };
 
 // Closed implementation table. These values identify window entries; they do
@@ -43,8 +53,36 @@ enum class KnownWindowR2Variant : std::uint32_t {
     routed_q51_union_rows2_v1 = 8,
     routed_q51_union_rows4_v1 = 9,
     routed_q51_union_rows8_v1 = 10,
+    // attn/mlp/final HC: typed prefetched Q8 path, R1 order per row.
+    hyper_mix_rows2_v1 = 11,
+    hyper_mix_rows4_v1 = 12,
+    hyper_mix_rows8_v1 = 13,
+    // Q8 QSA projections read once per window; per-row selection/attention retain R1 math.
+    qsa_q8_rows2_r1_v1 = 14,
+    qsa_q8_rows4_r1_v1 = 15,
+    qsa_q8_rows8_r1_v1 = 16,
+    gdn_deferred_rows2_v1 = 17,
+    gdn_deferred_rows4_v1 = 18,
+    gdn_deferred_rows8_v1 = 19,
+    ple_rows_host_staged_v1 = 20,
+    // Q8 attention projections with BF16 indexer q/k projections.
+    qsa_q8_bf16idx_rows2_r1_v1 = 21,
+    qsa_q8_bf16idx_rows4_r1_v1 = 22,
+    qsa_q8_bf16idx_rows8_r1_v1 = 23,
+    // Terminal prefetch8 BF16/Q8_0 head, one weight read for all rows, R1 math per row.
+    lm_head_q8_prefetch8_rows2_v1 = 24,
+    lm_head_q8_prefetch8_rows4_v1 = 25,
+    lm_head_q8_prefetch8_rows8_v1 = 26,
+    // T-agnostic (2/4/8) entries; per-row bytes equal the serial launch.
+    moe_route_rows_v1 = 27,
+    moe_combine_rows_v1 = 28,
+    inject_rows_v1 = 29,
+    // A8 numerical profile union: Q4_K/Q5_K A8G32 gate/up, Q5_1/Q8_0 A8G32 down.
+    routed_a8_union_rows2_v1 = 30,
+    routed_a8_union_rows4_v1 = 31,
+    routed_a8_union_rows8_v1 = 32,
 };
-inline constexpr std::uint32_t known_window_r2_variant_slots = 11;
+inline constexpr std::uint32_t known_window_r2_variant_slots = 33;
 
 struct KnownWindowRequest {
     bool r2_shared_expert = false;
@@ -56,6 +94,20 @@ struct KnownWindowRequest {
     // Explicit grouped Q5_1 down candidate; unmatched formats retain R1.
     bool routed_expert_union = false;
     KnownWindowOutputPolicy output_policy = KnownWindowOutputPolicy::all_rows;
+    // Multi-row HC mixers for the typed prefetched Q8 serial selection; others retain R1.
+    bool rows_hyper_mix = false;
+    // All-Q8 QSA steps append every row's KV/index cells, then attend per row.
+    bool qsa_rows = false;
+    // Prefix-acceptance state handling: deferred GDN commit and per-row PLE snapshots.
+    bool deferred_gdn = false;
+    bool rows_ple = false;
+    // Multi-row terminal head for the prefetch Q8_0 incumbent; all-rows policy only.
+    bool lm_head_rows = false;
+    // Parallel router logits + selection for all rows in one entry.
+    bool router_rows = false;
+    // MoE combine and attn/mlp inject for all rows in one launch each. The
+    // last-layer MLP inject stays a row loop: MTP target capture observes it.
+    bool combine_inject_rows = false;
 };
 
 struct CompiledKnownPrefixWindow {
@@ -83,6 +135,13 @@ struct CompiledKnownPrefixWindow {
     std::uint32_t shared_rows_steps = 0;
     std::uint32_t gdn_rows_steps = 0;
     std::uint32_t routed_expert_union_steps = 0;
+    std::uint32_t hyper_mix_rows_steps = 0;
+    std::uint32_t qsa_rows_steps = 0;
+    std::uint32_t gdn_deferred_rows_steps = 0;
+    std::uint32_t ple_rows_steps = 0;
+    std::uint32_t lm_head_rows_steps = 0;
+    std::uint32_t router_rows_steps = 0;
+    std::uint32_t combine_inject_rows_steps = 0;
     KnownWindowOutputPolicy output_policy = KnownWindowOutputPolicy::all_rows;
     // Compact result.logits entries correspond to these original source rows.
     std::vector<std::uint32_t> logit_row_indices;
@@ -91,7 +150,19 @@ struct CompiledKnownPrefixWindow {
 // Complete wide entries do not contribute to the legacy paired-step counter.
 // Admission must cover every closed mode without adding counters that could overflow.
 [[nodiscard]] inline bool known_window_has_promoted_steps(const CompiledKnownPrefixWindow& window) noexcept {
-    return window.r2_steps || window.shared_rows_steps || window.gdn_rows_steps || window.routed_expert_union_steps;
+    return window.r2_steps || window.shared_rows_steps || window.gdn_rows_steps || window.routed_expert_union_steps ||
+        window.hyper_mix_rows_steps || window.qsa_rows_steps ||
+        window.gdn_deferred_rows_steps || window.ple_rows_steps || window.lm_head_rows_steps ||
+        window.router_rows_steps || window.combine_inject_rows_steps;
+}
+// Modes dispatched through one KnownWindowRowsEntry covering every row.
+[[nodiscard]] inline bool known_window_rows_mode(KnownWindowStepMode mode) noexcept {
+    return mode == KnownWindowStepMode::shared_rows || mode == KnownWindowStepMode::gdn_rows ||
+        mode == KnownWindowStepMode::routed_expert_union || mode == KnownWindowStepMode::moe_route_rows ||
+        mode == KnownWindowStepMode::moe_combine_rows || mode == KnownWindowStepMode::inject_rows ||
+        mode == KnownWindowStepMode::hyper_mix_rows || mode == KnownWindowStepMode::qsa_rows ||
+        mode == KnownWindowStepMode::gdn_deferred_rows || mode == KnownWindowStepMode::ple_rows ||
+        mode == KnownWindowStepMode::lm_head_rows;
 }
 
 [[nodiscard]] CompiledKnownPrefixWindow compile_known_prefix_window(

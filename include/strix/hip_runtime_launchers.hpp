@@ -4,6 +4,7 @@
 #include "strix/launch_dispatch.hpp"
 
 #include <cstdint>
+#include <span>
 #include <string>
 
 namespace strix {
@@ -47,6 +48,19 @@ make_hip_inject_launcher(
 make_hip_moe_combine_launcher(
     std::string kernel_id,
     HipElementwiseLauncherConfig* config);
+
+// Known-prefix window rows: 2/4/8 C1 row views of one serial inject
+// (attn/mlp) or MoE-combine step in one launch. Each row is admitted as the
+// serial launcher admits it and runs the same per-element arithmetic, so its
+// output equals the serial launch bit for bit. Uses the current HIP stream.
+void inject_known_window_rows_preflight(std::span<const ExecutionDispatchContext> rows,
+    const HipElementwiseLauncherConfig& config);
+void inject_known_window_rows_launch(std::span<const ExecutionDispatchContext> rows,
+    const HipElementwiseLauncherConfig& config);
+void moe_combine_known_window_rows_preflight(std::span<const ExecutionDispatchContext> rows,
+    const HipElementwiseLauncherConfig& config);
+void moe_combine_known_window_rows_launch(std::span<const ExecutionDispatchContext> rows,
+    const HipElementwiseLauncherConfig& config);
 
 class HipElementwiseLauncherBundle {
 public:

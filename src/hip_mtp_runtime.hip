@@ -1,8 +1,10 @@
+#include "strix/host_phase_timing.hpp"
 #include "strix/hip_mtp_runtime.hpp"
 #include "strix/hip_mtp_attention.hpp"
 #include "strix/hip_mtp_projection.hpp"
 #include "strix/hip_mtp_native_validation.hpp"
 #include "strix/hip_mtp_shared_expert.hpp"
+#include "strix/hip_mtp_fast_draft.hpp"
 #include "strix/hip_embedding_launcher.hpp"
 #include "strix/hip_moe_route_launcher.hpp"
 #include "strix/hip_shared_expert_launcher.hpp"
@@ -13,6 +15,7 @@
 #include "strix/mtp_sidecar_binding.hpp"
 #include <hip/hip_runtime.h>
 #include <algorithm>
+#include <cstdlib>
 #include <array>
 #include <limits>
 #include <optional>
@@ -78,11 +81,17 @@ void require_chain(const HipMtpTargetHiddenTicket& a,const HipMtpTargetHiddenTic
 struct HipMtpRuntime::Impl {
     std::shared_ptr<HipMtpResources> owner;
     std::unique_ptr<HipGreedyOutput> selector;
+    std::unique_ptr<HipMtpDraftHead> draft;
+    std::unique_ptr<float,void(*)(float*)> fast_workspace{nullptr,[](float* p){(void)hipFree(p);}};
+    // F32 copies of the attention/MLP HC injection matrices for the split-K draft mix.
+    std::unique_ptr<float,void(*)(float*)> hc_inject{nullptr,[](float* p){(void)hipFree(p);}};
+    bool draft_exact=false;
     std::optional<HipMtpResources::NativeValidationScope> validation;
     std::optional<HipMtpTargetHiddenTicket> last_target,cycle_base,base_previous_target,reconcile_final;
     std::optional<std::uint32_t> last_teacher_next_input,base_previous_input;
     std::vector<HipMtpReplayRow> replay;
     std::vector<std::uint32_t> candidates;
+    std::vector<float> probabilities;
     MtpDraftCycleInput current;
     HipMtpExecutionStats stats;
     std::uint64_t next_source=0,base_source=0,epoch=0,profile=0;
@@ -253,8 +262,7 @@ struct HipMtpRuntime::Impl {
         try {
             const auto c=context(current.hidden_source_position);void* stream=owner->stream();
             launch_hip_mtp_embedding(c,current.seed_token_id,stream);
-            launch_hip_mtp_input_fusion(fusion(),stream);
-            launch_hip_mtp_hyper_mix(c,MtpHyperRole::attention,stream);
+            cache_row_front(c,stream);
             launch_hip_mtp_cache_rows(c,stream);
             owner->complete();
             active=false;cache_only_active=false;++next_source;++stats.cache_only_rows;validation.reset();
@@ -279,6 +287,122 @@ struct HipMtpRuntime::Impl {
         require(stats.cache_reused_rows!=UINT64_MAX,"MTP reused cache row counter exhausted");
         ++next_source;++stats.cache_reused_rows;
         last_target=row.hidden;last_teacher_next_input=row.next_input_token;
+    }
+    // Batched teacher cache rows: same per-row launches as teacher_cache, one
+    // admission and one completion for the whole contiguous run.
+    void teacher_cache_rows(std::span<const HipMtpReplayRow> rows) {
+        if(rows.empty()) return;
+        require(!active && !validation && stats.cache_only_rows<=UINT64_MAX-rows.size(),"MTP batched cache rows require an idle owner");
+        validation.emplace(owner->admit_native_entry());
+        try {
+            for(std::size_t i=0;i<rows.size();++i) {
+                const auto& row=rows[i];validate_ticket(row.hidden);
+                require(row.hidden.source_position()==next_source+i,"MTP teacher cache row is not contiguous");
+                if(i) {
+                    require_chain(rows[i-1U].hidden,row.hidden);
+                    require(rows[i-1U].next_input_token==row.hidden.input_token(),"MTP prior cache teacher pair differs from the actual next target input");
+                } else if(last_target) {
+                    require_chain(*last_target,row.hidden);
+                    require(last_teacher_next_input && *last_teacher_next_input==row.hidden.input_token(),
+                        "MTP prior cache teacher pair differs from the actual next target input");
+                } else require(!next_source,"MTP initial cache history must start at source zero");
+                preflight(row.hidden.source_position(),row.next_input_token,true,true);
+            }
+            owner->mark_submitted();
+        } catch(...) {validation.reset();throw;}
+        active=true;cache_only_active=true;
+        try {
+            void* stream=owner->stream();
+            for(const auto& row:rows) {
+                const auto c=context(row.hidden.source_position());
+                copy(owner->view(HipMtpBuffer::wide_current),row.hidden.view());
+                launch_hip_mtp_embedding(c,row.next_input_token,stream);cache_row_front(c,stream);
+                launch_hip_mtp_cache_rows(c,stream);
+            }
+            owner->complete();
+            active=false;cache_only_active=false;next_source+=rows.size();stats.cache_only_rows+=rows.size();validation.reset();
+            last_target=rows.back().hidden;last_teacher_next_input=rows.back().next_input_token;
+        } catch(...) {failure();throw;}
+    }
+    // Sync-free proposal chain: identical stage launches to run_current per row,
+    // except the head/selector and the device-fed next input token.
+    std::vector<std::uint32_t> chain(std::uint32_t depth,float min_probability,
+        const std::function<bool(std::span<const float>)>& keep_drafting) {
+        require(draft && cycle && cycle_base && !active && !validation && candidates.empty() &&
+            depth<=owner->budget().maximum_candidate_depth,"MTP draft chain requires a fresh bounded proposal");
+        if(!depth) return {};
+        require(stats.full_forward_rows<=UINT64_MAX-depth && epoch!=UINT64_MAX,"MTP draft chain counters exhausted");
+        validation.emplace(owner->admit_native_entry());
+        try {
+            for(std::uint32_t k=0;k<depth;++k) preflight(next_source+k,k?0U:pending_token,true);
+            validate_ticket(*cycle_base);owner->mark_submitted();
+        } catch(...) {validation.reset();throw;}
+        ++epoch;active=true;
+        try {
+            void* stream=owner->stream();
+            const auto* hidden=reinterpret_cast<const std::uint16_t*>(owner->view(HipMtpBuffer::hidden0).address);
+            copy(owner->view(HipMtpBuffer::wide_current),cycle_base->view());
+            draft->begin_chain();
+            const auto requested=depth;
+            for(std::uint32_t k=0;k<requested;++k) {
+                const auto c=context(next_source+k);
+                if(k) launch_hip_mtp_embedding_device(c,draft->device_token(k-1U),stream);
+                else launch_hip_mtp_embedding(c,pending_token,stream);
+                if(draft_exact) launch_hip_mtp_input_fusion(fusion(),stream);
+                else launch_hip_mtp_input_fusion_draft(fusion(),stream);
+                hyper(c,MtpHyperRole::attention,stream);
+                launch_hip_mtp_indexer(c,stream);
+                if(draft_exact) launch_hip_mtp_sparse_attention(c,stream); else launch_hip_mtp_sparse_attention_draft(c,stream);
+                launch_hip_mtp_inject(c,MtpInjectRole::attention,stream);hyper(c,MtpHyperRole::mlp,stream);
+                launch_hip_mtp_route(c,stream);
+                if(draft_exact) {
+                    launch_hip_mtp_shared_expert(c,stream);launch_hip_mtp_routed_experts(c,stream);launch_hip_mtp_moe_combine(c,stream);
+                } else launch_hip_mtp_fast_moe(fast_moe(),stream);
+                launch_hip_mtp_inject(c,MtpInjectRole::mlp,stream);
+                copy(owner->view(HipMtpBuffer::wide_current),owner->view(HipMtpBuffer::wide_next));
+                hyper(c,MtpHyperRole::head,stream);
+                draft->launch(hidden,k,stream);
+                if(min_probability>0.0F && k+1U<requested) {
+                    check(hipStreamSynchronize(static_cast<hipStream_t>(stream)),"MTP draft early-stop step");
+                    if(draft->probability(k)<min_probability) {depth=k+1U;break;}
+                    if(keep_drafting) {
+                        probabilities.resize(k+1U);for(std::uint32_t j=0;j<=k;++j) probabilities[j]=draft->probability(j);
+                        if(!keep_drafting(probabilities)) {depth=k+1U;break;}
+                    }
+                }
+            }
+            owner->complete();
+            auto tokens=draft->read(depth);
+            probabilities.resize(depth);for(std::uint32_t k=0;k<depth;++k) probabilities[k]=draft->probability(k);
+            active=false;next_source+=depth;stats.full_forward_rows+=depth;validation.reset();
+            // Row zero is the pending cycle input at base_source, as in read_greedy_token.
+            first_cache_reusable=true;candidates=tokens;return tokens;
+        } catch(...) {failure();throw;}
+    }
+    // Teacher cache rows only feed the predictor's own attention cache, so a
+    // draft-only chain builds them with the same fast kernels as its proposals.
+    void cache_row_front(const MtpNativeContext& c,void* stream) const {
+        if(draft && !draft_exact) {launch_hip_mtp_input_fusion_draft(fusion(),stream);hyper(c,MtpHyperRole::attention,stream);return;}
+        launch_hip_mtp_input_fusion(fusion(),stream);launch_hip_mtp_hyper_mix(c,MtpHyperRole::attention,stream);
+    }
+    void hyper(const MtpNativeContext& c,MtpHyperRole role,void* stream) const {
+        if(draft_exact) {launch_hip_mtp_hyper_mix(c,role,stream);return;}
+        constexpr std::uint64_t inject=4U*10240U;
+        launch_hip_mtp_hyper_mix_draft(c,role,role==MtpHyperRole::attention?hc_inject.get():
+            role==MtpHyperRole::mlp?hc_inject.get()+inject:nullptr,stream);
+    }
+    HipMtpFastMoeViews fast_moe() const {
+        const auto& t=owner->tensors();const auto address=[](MtpTensorView v){return reinterpret_cast<const void*>(v.runtime->address);};
+        HipMtpFastMoeViews v;
+        v.input=reinterpret_cast<const std::uint16_t*>(owner->view(HipMtpBuffer::hidden0).address);
+        v.routes=reinterpret_cast<const std::uint32_t*>(owner->view(HipMtpBuffer::routes).address);
+        v.route_weights=reinterpret_cast<const float*>(owner->view(HipMtpBuffer::route_weights).address);
+        v.gate=address(t.expert_gate);v.up=address(t.expert_up);v.down=address(t.expert_down);
+        v.shared_gate=address(t.shared_gate);v.shared_up=address(t.shared_up);v.shared_down=address(t.shared_down);
+        v.shared_scalar=static_cast<const float*>(address(t.shared_scalar_gate));v.workspace=fast_workspace.get();
+        v.output=reinterpret_cast<std::uint16_t*>(owner->view(HipMtpBuffer::hidden0).address);
+        v.status=reinterpret_cast<std::uint32_t*>(owner->view(HipMtpBuffer::status).address);
+        return v;
     }
     void qualification(const QualifiedMtpDraftPlan& plan,const ActivatedMtpDraftPlan& activated) const {
         require_qualified_mtp_draft_plan(plan);
@@ -325,7 +449,8 @@ void HipMtpRuntime::prime_committed_rows(const QualifiedMtpDraftPlan& plan,const
         p.preflight(rows[i].hidden.source_position(),rows[i].next_input_token,true,true);
     }
     }
-    for(const auto& row:rows) p.teacher_cache(row.hidden,row.next_input_token);
+    if(p.draft) p.teacher_cache_rows(rows);
+    else for(const auto& row:rows) p.teacher_cache(row.hidden,row.next_input_token);
 }
 void HipMtpRuntime::begin_cycle(std::uint32_t token,const HipMtpTargetHiddenTicket& ticket) {
     auto& p=*impl_;p.validate_ticket(ticket);require(!p.cycle && !p.active && ticket.source_position()==p.next_source &&
@@ -342,9 +467,61 @@ void HipMtpRuntime::begin_cycle(std::uint32_t token,const HipMtpTargetHiddenTick
     // bounded by its current source position after that row was overwritten.
     // The first proposal input always copies the authoritative cycle ticket.
     p.base_previous_target=p.last_target;p.base_previous_input=p.last_teacher_next_input;
-    p.cycle_base=ticket;p.base_source=p.next_source;p.pending_token=token;p.candidates.clear();p.cycle=true;p.first_cache_reusable=false;
+    p.cycle_base=ticket;p.base_source=p.next_source;p.pending_token=token;p.candidates.clear();p.probabilities.clear();p.cycle=true;p.first_cache_reusable=false;
     p.replay.clear();p.reconcile_final.reset();p.have_replay=false;
+    if(p.draft) p.draft->observe(std::span<const std::uint32_t>(&token,1));
 }
+void HipMtpRuntime::enable_draft_chain(HipMtpDraftHeadConfig config,bool exact) {
+    auto& p=*impl_;require(!p.draft && !p.cycle && !p.active && !p.broken,"MTP draft chain must be enabled once on an idle owner");
+    const auto& m=p.owner->model();const auto& head=p.owner->tensors().lm_head;
+    require(select_hip_mtp_lm_head_recipe(m,head)==HipMtpLmHeadRecipe::prefetch8_wave8_q8,
+        "MTP draft chain requires the Q8_0 prefetch8 head recipe");
+    config.hidden_size=static_cast<std::uint32_t>(m.hidden_size);config.vocab_size=static_cast<std::uint32_t>(m.vocab_size);
+    config.max_depth=p.owner->budget().maximum_candidate_depth;
+    p.draft_exact=exact;
+    if(!exact) {
+        // The fast MoE is specialized to the canonical sidecar; preflight keeps the exact tensor checks.
+        require(m.hidden_size==2560U && m.moe_intermediate_size==640U && m.shared_expert_intermediate_size==640U &&
+            m.num_experts==512U && m.num_experts_per_token==10U,"MTP fast draft MoE requires the canonical sidecar geometry");
+        float* workspace=nullptr;
+        check(hipMalloc(reinterpret_cast<void**>(&workspace),hip_mtp_fast_moe_workspace_floats*sizeof(float)),"MTP fast draft workspace");
+        p.fast_workspace.reset(workspace);
+        require(m.hc_count==4U && m.hc_lowrank==320U,"MTP fast draft HC mix requires the canonical sidecar geometry");
+        constexpr std::uint64_t inject=4U*10240U;float* hc=nullptr;
+        check(hipMalloc(reinterpret_cast<void**>(&hc),2U*inject*sizeof(float)),"MTP draft HC injection copies");
+        p.hc_inject.reset(hc);
+        launch_hip_mtp_dequantize_q8(reinterpret_cast<const void*>(p.owner->tensors().attention_hc_inject.runtime->address),inject,hc,p.owner->stream());
+        launch_hip_mtp_dequantize_q8(reinterpret_cast<const void*>(p.owner->tensors().mlp_hc_inject.runtime->address),inject,hc+inject,p.owner->stream());
+        // The draft's dense and expert projections read Q4_0 copies (proposals only; verification
+        // is unchanged). With {2,4,8} windows the cheaper deep drafts win: 46.8 -> 47.9 tok/s.
+        // STRIX_MTP_DRAFT_Q4_ALL=0 keeps the Q8 sidecar.
+        const char* q4_all=std::getenv("STRIX_MTP_DRAFT_Q4_ALL");
+        if(!q4_all || q4_all[0]!='0') {
+            const auto& t=p.owner->tensors();
+            for(const auto* v:{&t.eh_projection,&t.query,&t.key,&t.value,&t.attention_output,&t.expert_gate,&t.expert_up,
+                    &t.expert_down,&t.shared_gate,&t.shared_up,&t.shared_down}) {
+                require(v->manifest && v->runtime && v->manifest->ggml_type==8U && v->runtime->bytes%34U==0U,
+                    "MTP draft Q4 copies require Q8_0 sidecar projections");
+                register_hip_mtp_draft_q4(reinterpret_cast<const void*>(v->runtime->address),v->runtime->bytes/34U*32U,p.owner->stream());
+            }
+        }
+        check(hipStreamSynchronize(static_cast<hipStream_t>(p.owner->stream())),"MTP draft HC injection copies");
+    }
+    p.draft=std::make_unique<HipMtpDraftHead>(reinterpret_cast<const void*>(head.runtime->address),std::move(config),p.owner->stream());
+}
+const HipMtpDraftHead* HipMtpRuntime::draft_head() const noexcept {return impl_->draft.get();}
+void HipMtpRuntime::observe_draft_context(std::span<const std::uint32_t> tokens) {
+    auto& p=*impl_;require(p.draft && !p.active && !p.broken,"MTP draft context requires an enabled idle chain");p.draft->observe(tokens);
+}
+std::vector<std::uint32_t> HipMtpRuntime::propose_chain(const QualifiedMtpDraftPlan& plan,const ActivatedMtpDraftPlan& activated,
+    const SerialSessionContext& target,const DraftProposalStateContext& proposal,std::uint32_t depth,float min_probability,
+    const std::function<bool(std::span<const float>)>& keep_drafting) {
+    auto& p=*impl_;p.qualification(plan,activated);
+    validate_mtp_draft_proposal_phase(p.owner->binding(),proposal,target,DraftProposalStatePhase::proposal_active);
+    require(p.cycle && p.cycle_base && same_session(target,p.cycle_base->committed_session()),"MTP draft chain does not match its native cycle");
+    return p.chain(depth,min_probability,keep_drafting);
+}
+std::span<const float> HipMtpRuntime::draft_probabilities() const noexcept {return impl_->probabilities;}
 void HipMtpRuntime::dispatch_mtp_step(const MtpForwardStepContext& call) {
     auto& p=*impl_;
     try {
@@ -421,10 +598,12 @@ void HipMtpRuntime::reconcile_after_target(const QualifiedMtpDraftPlan& plan,con
         emitted.size()<=p.owner->budget().maximum_candidate_depth+1U,"MTP reconciliation requires actual committed target rows and owner state");
     // Output tokens do not attest draft-cache correctness; real committed
     // tickets and complete teacher-pair coverage above are the authority.
+    host_phase_mark("9a reconcile validation");
     {
         const auto admission=p.owner->admit_native_entry();
         for(const auto& row:p.replay) p.preflight(row.hidden.source_position(),row.next_input_token,true,true);
     }
+    host_phase_mark("9b reconcile preflight");
     try {
         p.next_source=p.base_source;
         // Earlier occupied rows were never overwritten. The whole proposal
@@ -433,7 +612,18 @@ void HipMtpRuntime::reconcile_after_target(const QualifiedMtpDraftPlan& plan,con
         // they are not restored, compared as committed data or read by a later
         // attention row before that row has produced its own cache values.
         p.last_target=p.base_previous_target;p.last_teacher_next_input=p.base_previous_input;
-        for(std::size_t i=0;i<p.replay.size();++i) {
+        std::size_t first=0;
+        if(p.draft) {
+            if(!p.replay.empty() && p.first_cache_reusable && p.replay[0].hidden.same_commit(*p.cycle_base) &&
+               p.replay[0].hidden.source_position()==p.base_source && p.replay[0].hidden.view()==p.cycle_base->view() &&
+               p.replay[0].next_input_token==p.pending_token) {p.reuse_first_teacher_cache(p.replay[0]);first=1;}
+            host_phase_mark("9c reuse first cache");
+            p.teacher_cache_rows(std::span<const HipMtpReplayRow>(p.replay).subspan(first));
+            host_phase_mark("9d teacher cache rows (gpu+sync)");
+            p.draft->observe(emitted);first=p.replay.size();
+            host_phase_mark("9e draft observe");
+        }
+        for(std::size_t i=first;i<p.replay.size();++i) {
             const auto& row=p.replay[i];
             const bool reuse=i==0U && p.first_cache_reusable && p.cycle_base &&
                 row.hidden.same_commit(*p.cycle_base) && row.hidden.source_position()==p.base_source &&

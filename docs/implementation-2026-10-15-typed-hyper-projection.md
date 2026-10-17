@@ -13,7 +13,7 @@ This document makes no performance claim.
 `--staged-hyper-projections` and `--fused-staged-hyper-mix`. Duplicate options
 and incomplete combinations are rejected. The selected variant has a separate
 kernel ID, implementation identity and compiler revision
-`hip-gfx1151-hyper-mix-v6-typed-projection`. Existing v2â€“v5 identities remain
+`hip-gfx1151-hyper-mix-v6-typed-projection`. Existing v2–v5 identities remain
 unchanged and are pinned by fixture goldens.
 
 Registration requires the complete execution tensor access plan and manifest.

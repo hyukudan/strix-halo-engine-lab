@@ -1,7 +1,9 @@
 #pragma once
+#include "strix/hip_mtp_draft_head.hpp"
 #include "strix/hip_mtp_resources.hpp"
 #include "strix/hip_mtp_target_hidden.hpp"
 #include "strix/qualified_mtp_forward_runtime.hpp"
+#include <functional>
 #include <span>
 #include <vector>
 
@@ -64,6 +66,24 @@ public:
     // All source pairs after the logical cache frontier, plus the final committed target
     // ticket. Equality of predicted tokens is never cache authority.
     void set_reconciliation_rows(std::span<const HipMtpReplayRow>,const HipMtpTargetHiddenTicket& final_target);
+    // Opt-in sync-free draft chain (before the first cycle): every draft row is
+    // fed its token from device memory, the draft head (vocabulary subset or
+    // full) selects on device into mapped memory, and one completion ends the
+    // chain. Teacher cache rows of priming/reconciliation also complete once.
+    // Drafts only steer acceptance; target outputs are unchanged. Unless exact,
+    // draft rows use the fused input projection and the 2-launch Q8 MoE.
+    void enable_draft_chain(HipMtpDraftHeadConfig,bool exact=false);
+    [[nodiscard]] const HipMtpDraftHead* draft_head() const noexcept;
+    // Context ids for the draft vocabulary (prompt; cycles add their own tokens).
+    void observe_draft_context(std::span<const std::uint32_t>);
+    // min_probability > 0 completes each draft before the next and stops after
+    // the first draft whose max softmax probability is below it (that draft is
+    // kept). Returns 1..depth drafts; probabilities of the last chain below.
+    // keep_drafting (optional) sees the probabilities so far and may stop the chain earlier.
+    [[nodiscard]] std::vector<std::uint32_t> propose_chain(const QualifiedMtpDraftPlan&,const ActivatedMtpDraftPlan&,
+        const SerialSessionContext&,const DraftProposalStateContext&,std::uint32_t depth,float min_probability=0.0F,
+        const std::function<bool(std::span<const float>)>& keep_drafting={});
+    [[nodiscard]] std::span<const float> draft_probabilities() const noexcept;
     void dispatch_mtp_step(const MtpForwardStepContext&) override;
     [[nodiscard]] MtpDraftCycleInput make_cycle_input(const QualifiedMtpDraftPlan&,const ActivatedMtpDraftPlan&,
         const MtpDraftRuntimeBinding&,const MtpDraftStateMemoryBinding&,const SerialSessionContext&,

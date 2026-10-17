@@ -33,6 +33,11 @@ struct KnownWindowExecutionHooks {
     // Captured native windows opt in explicitly. Records one real whole chunk
     // only after complete succeeds; default legacy prefill labeling is intact.
     bool record_actual_window_lineage = false;
+    // Owner-held memo of the launch plan whose per-step metadata preflight already passed.
+    // Only positions and tokens change between windows of one owner, and every launcher
+    // still validates its own context before enqueueing, so repeat windows skip the
+    // ~1,750-context preflight (about 8 ms of host time before the first launch).
+    std::vector<const void*>* preflight_memo = nullptr;
 };
 
 struct KnownWindowR2Entry {
@@ -67,6 +72,9 @@ struct KnownWindowResult {
     std::uint32_t shared_rows_dispatches = 0;
     std::uint32_t gdn_rows_dispatches = 0;
     std::uint32_t routed_expert_union_dispatches = 0;
+    std::uint32_t hyper_mix_rows_dispatches = 0;
+    std::uint32_t qsa_rows_dispatches = 0;
+    std::uint32_t lm_head_rows_dispatches = 0;
     std::array<std::uint32_t, known_window_r2_variant_slots> r2_variant_dispatches{};
     std::vector<std::uint32_t> logit_row_indices;
     std::uint32_t omitted_lm_heads = 0;

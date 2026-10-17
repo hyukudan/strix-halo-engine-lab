@@ -63,5 +63,8 @@ private:
 struct MtpNativeContext;
 void preflight_hip_mtp_embedding(const MtpNativeContext&,std::uint32_t token);
 void launch_hip_mtp_embedding(const MtpNativeContext&,std::uint32_t token,void* stream);
+// Same row load/store as above with the token read on device (sync-free draft
+// chain); an out-of-vocabulary word reads row 0 and is rejected by its producer.
+void launch_hip_mtp_embedding_device(const MtpNativeContext&,const std::uint32_t* token,void* stream);
 
 }  // namespace strix

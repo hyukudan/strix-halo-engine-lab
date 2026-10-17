@@ -60,11 +60,19 @@ bool inject(model_residency_diagnostic::Fault fault, std::uint64_t occurrence) {
         model_residency_diagnostic::fault_plan.occurrence == occurrence;
 }
 #endif
+// Fine-grained (MTYPE UC) model ranges: streamed weights do not displace cached activations;
+// coarse-grained was measured slower on the decode window (44.3 vs 45.0 tok/s).
+// STRIX_WEIGHTS_COARSE_GRAINED=1 selects it for experiments.
+unsigned model_register_flags() {
+    static const unsigned flags = std::getenv("STRIX_WEIGHTS_COARSE_GRAINED") ?
+        hipHostRegisterMapped | hipExtHostRegisterCoarseGrained : hipHostRegisterMapped;
+    return flags;
+}
 hipError_t selective_register(void* address, std::size_t bytes) {
 #if defined(STRIX_BUILD_MODEL_RESIDENCY_DIAGNOSTIC)
     ++model_residency_diagnostic::counters.registrations;
 #endif
-    const auto error = hipHostRegister(address, bytes, hipHostRegisterMapped);
+    const auto error = hipHostRegister(address, bytes, model_register_flags());
 #if defined(STRIX_BUILD_MODEL_RESIDENCY_DIAGNOSTIC)
     if (error == hipSuccess) ++model_residency_diagnostic::counters.acquired_registrations;
 #endif
@@ -717,7 +725,7 @@ HipModelResidency HipModelResidency::create_impl(const MappedModelFile& mapped,
 
                 check_hip(
                     selective_enabled ? selective_register(reinterpret_cast<void*>(host), static_cast<std::size_t>(bytes)) :
-                    hipHostRegister(reinterpret_cast<void*>(host), static_cast<std::size_t>(bytes), hipHostRegisterMapped),
+                    hipHostRegister(reinterpret_cast<void*>(host), static_cast<std::size_t>(bytes), model_register_flags()),
                     "hipHostRegister(model range)");
 
                 // Track the registration immediately: a device-alias query

@@ -1,13 +1,21 @@
 #include "strix/hip_known_prefix_window.hpp"
 #include "strix/hip_mtp_target_window.hpp"
+#include "strix/hip_ple_launcher.hpp"
 
 #include "strix/deferred_moe_status.hpp"
+#include "strix/hip_hyper_mix_launcher.hpp"
+#include "strix/lane_chain_hyper_output.hpp"
+#include "strix/hip_indexed_attention_launcher.hpp"
+#include "strix/dispatch_resources.hpp"
+#include "strix/hip_generation_output.hpp"
+#include "strix/hip_moe_route_launcher.hpp"
 #include "strix/hip_setup_quiescence.hpp"
 #include "strix/prepared_tensor_views.hpp"
 
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <deque>
 #include <limits>
 #include <memory>
 #include <stdexcept>
@@ -62,6 +70,9 @@ ExecutionBindingRequest binding_request(const HipLauncherCatalogConfig& config) 
     request.batched_moe_activation = config.batched_moe_activation;
     request.grouped_exact_q51_down = config.grouped_exact_q51_down;
     request.q51_slot_parallel_down = config.q51_slot_parallel_down;
+    request.a8_down_q51 = config.a8_down_q51;
+    request.a8_down_q80 = config.a8_down_q80;
+    request.q5k_a8g32_gate_up = config.q5k_a8g32_gate_up;
     request.lane_chain_hyper_output = config.lane_chain_hyper_output;
     request.prefetch_hc_projection_next_tile = config.prefetch_hc_projection_next_tile;
     request.deferred_moe_status = config.deferred_moe_status;
@@ -95,13 +106,39 @@ struct HipKnownPrefixWindow::Impl {
     std::vector<std::uint64_t> position_readers;
     HipSharedExpertLauncherConfig shared_config, shared_fallback;
     HipGdnLauncherConfig gdn_config;
+    HipIndexedAttentionLauncherConfig qsa_config, qsa_fallback;
     HipMoeExpertsLauncherConfig routed_config;
+    HipHyperMixLauncherConfig hyper_config, hyper_fallback;
+    HipLmHeadLauncherConfig head_config;
+    ExecutionBufferAddress greedy_partials{};
+    HipGreedyRowsReply* greedy_replies = nullptr;
+    HipMoeRouteLauncherConfig route_config;
+    HipElementwiseLauncherConfig elementwise_config;
     q51_known_rows::Workspace routed_workspace;
     q51_known_rows::Summary pending_union_summary;
     std::uint32_t last_union_layer = 0;
     std::optional<HipKnownPrefixUnionObservation> last_union_observation;
     std::array<KnownWindowR2Entry, 3> r2_entries;
     std::vector<KnownWindowRowsEntry> rows_entries;
+    // Prefix acceptance: deferred GDN rows (control word in host-mapped coherent memory, so the
+    // host publishes {n_keep, slot} without a copy) and per-row PLE snapshots.
+    struct HipFree { void operator()(void* p) const noexcept { if (p) (void)hipFree(p); } };
+    struct HipHostFree { void operator()(void* p) const noexcept { if (p) (void)hipHostFree(p); } };
+    // Rows of any window size share the [2 slots][8 rows] layout, so owners of one
+    // session may share this record (share_deferred): pending rows of one owner are
+    // applied by the next window of any owner or by flush_deferred.
+    struct DeferredGdn {
+        std::unique_ptr<void, HipFree> retained;
+        std::unique_ptr<void, HipHostFree> control;
+        std::uint32_t slot = 0;
+        bool pending = false;
+    };
+    std::shared_ptr<DeferredGdn> gdn_deferred;
+    HipGdnWindowConfig gdn_window_config;
+    std::vector<ExecutionDispatchContext> gdn_commit_rows; // one row context per GDN layer (stable plan views)
+    std::deque<ExecutionRuntimeResources> gdn_commit_resources; // owned copies: the window's are call-local
+    std::unique_ptr<HipPleKnownWindow> ple_window;
+    std::vector<const void*> preflight_memo;
     DeferredMoeFirstError completion_status{};
     bool failed = false;
 
@@ -174,6 +211,10 @@ struct HipKnownPrefixWindow::Impl {
         setup_r2();
         setup_rows();
         setup_routed_union();
+        setup_hyper_rows();
+        setup_deferred();
+        setup_head_rows();
+        setup_router_elementwise_rows();
         // Setup only: no execution callback clears or reads this record before
         // all deep admission. Exclusive status ownership preserves zero across
         // successful calls; any exception disables the owner permanently.
@@ -237,6 +278,10 @@ struct HipKnownPrefixWindow::Impl {
         if (!rows[0].kernel_id) throw std::invalid_argument("known-window shared row has no serial kernel id");
         return rows[0].kernel_id->ends_with(shared_expert_prefetch::kernel_suffix) ? shared_config : shared_fallback;
     }
+    const HipIndexedAttentionLauncherConfig& qsa_for(std::span<const ExecutionDispatchContext> rows) const {
+        if (!rows[0].kernel_id) throw std::invalid_argument("known-window QSA row has no serial kernel id");
+        return rows[0].kernel_id->ends_with(qsa_input_prefetch::kernel_suffix) ? qsa_config : qsa_fallback;
+    }
     void setup_r2() {
         shared_config.hidden_size = u32(model.hidden_size);
         shared_config.intermediate_size = u32(model.shared_expert_intermediate_size);
@@ -298,6 +343,29 @@ struct HipKnownPrefixWindow::Impl {
                     gdn_known_window_rows_launch(rows,static_cast<Impl*>(object)->gdn_config);
                 }};
         }
+        if(!window.qsa_rows_steps) return;
+        qsa_config.model=model; qsa_config.activation=config.activation;
+        qsa_config.prefetch_q8_input=config.prefetch_q8_qsa_input;
+        qsa_config.prefetch_eligible_layers=config.qsa_input_prefetch_layers;
+        qsa_config.prefetch_stats=config.qsa_input_prefetch_stats;
+        qsa_config.wave8_q8_output=config.wave8_q8_qsa_output;
+        qsa_fallback=qsa_config;
+        qsa_fallback.prefetch_q8_input=false; qsa_fallback.prefetch_eligible_layers.clear();
+        // One entry per QSA variant actually selected (layers may differ in indexer format).
+        for(std::size_t i=0;i<window.mode.size();++i) {
+            if(window.mode[i]!=KnownWindowStepMode::qsa_rows) continue;
+            const auto variant=window.r2_variant[i];
+            if(std::any_of(rows_entries.begin(),rows_entries.end(),[&](const auto& e){return e.variant==variant;})) continue;
+            rows_entries.push_back({variant,this,
+            [](std::span<const ExecutionDispatchContext> rows,void* object) {
+                const auto& self=*static_cast<Impl*>(object);
+                indexed_attention_known_window_rows_preflight(rows,self.qsa_for(rows));
+            },
+            [](std::span<const ExecutionDispatchContext> rows,void* object) {
+                const auto& self=*static_cast<Impl*>(object);
+                indexed_attention_known_window_rows_launch(rows,self.qsa_for(rows));
+            }});
+        }
     }
     void setup_routed_union() {
         const auto& workspace=routed_workspace.memory;
@@ -325,12 +393,18 @@ struct HipKnownPrefixWindow::Impl {
         routed_config.grouped_exact_q51_down=config.grouped_exact_q51_down;
         routed_config.q51_slot_parallel_down=config.q51_slot_parallel_down;
         routed_config.deferred_moe_status=config.deferred_moe_status;
+        routed_config.a8_down_q51=config.a8_down_q51;
+        routed_config.a8_down_q80=config.a8_down_q80;
+        routed_config.q5k_a8g32_gate_up=config.q5k_a8g32_gate_up;
         routed_config.q4k_a8_stats=config.q4k_a8_stats;
         routed_config.q4k_a8_quiescence=std::make_shared<HipSetupQuiescenceGuard>();
         for(std::size_t i=0;i<window.mode.size();++i)
             if(window.mode[i]==KnownWindowStepMode::routed_expert_union)
                 last_union_layer=serial.execution.steps[i].layer.value();
-        const auto variant=window.logical_rows==2U?KnownWindowR2Variant::routed_q51_union_rows2_v1:
+        const bool a8=config.a8_down_q51 || config.a8_down_q80;
+        const auto variant=a8 ? (window.logical_rows==2U?KnownWindowR2Variant::routed_a8_union_rows2_v1:
+            window.logical_rows==4U?KnownWindowR2Variant::routed_a8_union_rows4_v1:KnownWindowR2Variant::routed_a8_union_rows8_v1) :
+            window.logical_rows==2U?KnownWindowR2Variant::routed_q51_union_rows2_v1:
             window.logical_rows==4U?KnownWindowR2Variant::routed_q51_union_rows4_v1:KnownWindowR2Variant::routed_q51_union_rows8_v1;
         rows_entries.push_back({variant,this,
             [](std::span<const ExecutionDispatchContext> rows,void* object) {
@@ -340,6 +414,180 @@ struct HipKnownPrefixWindow::Impl {
             [](std::span<const ExecutionDispatchContext> rows,void* object) {
                 const auto& self=*static_cast<Impl*>(object);
                 moe_experts_known_window_rows_launch(rows,self.routed_config,self.routed_workspace);
+            }});
+    }
+    const HipHyperMixLauncherConfig& hyper_for(std::span<const ExecutionDispatchContext> rows) const {
+        if (!rows[0].kernel_id) throw std::invalid_argument("known-window HC row has no serial kernel id");
+        return rows[0].kernel_id->ends_with(lane_chain_hyper_output_suffix) ? hyper_config : hyper_fallback;
+    }
+    void setup_hyper_rows() {
+        if(!window.hyper_mix_rows_steps) return;
+        hyper_config.hidden_size=u32(model.hidden_size); hyper_config.hc_count=u32(model.hc_count);
+        hyper_config.lowrank=u32(model.hc_lowrank); hyper_config.rms_epsilon=static_cast<float>(model.rms_norm_epsilon);
+        hyper_config.activation=config.activation; hyper_config.parallel=config.parallel_hyper_mix;
+        hyper_config.staged_projections=config.staged_hyper_projections; hyper_config.fused_injection=config.fused_staged_hyper_mix;
+        hyper_config.typed_projection=config.typed_hyper_projection; hyper_config.prefetch_rows=config.prefetch_typed_hyper_rows;
+        hyper_config.prefetch_q8_output=config.prefetch_q8_hyper_output; hyper_config.lane_chain_output=config.lane_chain_hyper_output;
+        hyper_config.splitk_projection=config.splitk_hyper_projection; hyper_config.splitk_projection_fp64=config.splitk_hyper_projection_fp64;
+        hyper_config.splitk_deferred_norm=config.splitk_deferred_norm;
+        hyper_config.prefetch_hc_projection_next_tile=config.prefetch_hc_projection_next_tile;
+        hyper_config.arithmetic_stats=config.arithmetic_stats;
+        hyper_fallback=hyper_config; hyper_fallback.lane_chain_output=false;
+        rows_entries.push_back({window.logical_rows==2U?KnownWindowR2Variant::hyper_mix_rows2_v1:
+            window.logical_rows==4U?KnownWindowR2Variant::hyper_mix_rows4_v1:KnownWindowR2Variant::hyper_mix_rows8_v1,this,
+            [](std::span<const ExecutionDispatchContext> rows,void* object) {
+                const auto& self=*static_cast<Impl*>(object);
+                hyper_mix_known_window_rows_preflight(rows,self.hyper_for(rows));
+            },
+            [](std::span<const ExecutionDispatchContext> rows,void* object) {
+                const auto& self=*static_cast<Impl*>(object);
+                hyper_mix_known_window_rows_launch(rows,self.hyper_for(rows));
+            }});
+    }
+    GdnWindowControl* gdn_control() const noexcept { return static_cast<GdnWindowControl*>(gdn_deferred->control.get()); }
+    void bind_deferred() {
+        void* device_control=nullptr;
+        check(hipHostGetDevicePointer(&device_control,gdn_deferred->control.get(),0),"deferred GDN control device view");
+        gdn_window_config.retained=gdn_deferred->retained.get();
+        gdn_window_config.control=static_cast<const GdnWindowControl*>(device_control);
+    }
+    void setup_deferred() {
+        if(window.gdn_deferred_rows_steps) {
+            const auto per_layer=gdn_window_retained_bytes(model);
+            const auto bytes=per_layer*static_cast<std::uint64_t>(model.gdn_layers);
+            gdn_deferred=std::make_shared<DeferredGdn>();
+            void* retained=nullptr; void* control=nullptr;
+            guard.run([&] {
+                check(hipMalloc(&retained,bytes),"allocate deferred GDN retained rows");
+                gdn_deferred->retained.reset(retained);
+                check(hipHostMalloc(&control,sizeof(GdnWindowControl),hipHostMallocMapped|hipHostMallocCoherent),
+                    "allocate deferred GDN control");
+                gdn_deferred->control.reset(control);
+            });
+            *gdn_control()=GdnWindowControl{};
+            gdn_window_config.gdn=gdn_config; gdn_window_config.retained_bytes=bytes;
+            bind_deferred();
+            const auto variant=window.logical_rows==2U?KnownWindowR2Variant::gdn_deferred_rows2_v1:
+                window.logical_rows==4U?KnownWindowR2Variant::gdn_deferred_rows4_v1:KnownWindowR2Variant::gdn_deferred_rows8_v1;
+            rows_entries.push_back({variant,this,
+                [](std::span<const ExecutionDispatchContext> rows,void* object) {
+                    gdn_window_rows_preflight(rows,static_cast<Impl*>(object)->gdn_window_config);
+                },
+                [](std::span<const ExecutionDispatchContext> rows,void* object) {
+                    auto& self=*static_cast<Impl*>(object);
+                    gdn_window_rows_launch(rows,self.gdn_window_config);
+                    self.remember_gdn_layer(rows[0]);
+                }});
+        }
+        if(window.ple_rows_steps) {
+            ple_window=std::make_unique<HipPleKnownWindow>(model,config.activation,window.logical_rows);
+            rows_entries.push_back({KnownWindowR2Variant::ple_rows_host_staged_v1,this,
+                [](std::span<const ExecutionDispatchContext> rows,void* object) {
+                    static_cast<Impl*>(object)->ple_window->preflight(rows);
+                },
+                [](std::span<const ExecutionDispatchContext> rows,void* object) {
+                    static_cast<Impl*>(object)->ple_window->launch(rows);
+                }});
+        }
+    }
+    void remember_gdn_layer(const ExecutionDispatchContext& row) {
+        for(const auto& known:gdn_commit_rows) if(known.layer==row.layer) return;
+        gdn_commit_resources.push_back(*row.resources);
+        auto copy=row; copy.resources=&gdn_commit_resources.back();
+        gdn_commit_rows.push_back(copy);
+    }
+    // After a deferred window the target keeps rows [0, n_keep): GDN applies them in the next
+    // window (or flush_deferred), PLE restores row n_keep-1. Host work only, no device sync.
+    void commit_prefix(std::uint32_t n_keep) {
+        if(!n_keep || n_keep>window.logical_rows) throw std::invalid_argument("known-window prefix commit outside the window");
+        if(window.gdn_deferred_rows_steps) {
+            auto& d=*gdn_deferred;
+            d.slot^=1U;
+            *gdn_control()=GdnWindowControl{n_keep,d.slot};
+            d.pending=true;
+        }
+        if(ple_window) ple_window->commit(n_keep,scope.stream);
+    }
+    // Applies pending GDN rows to the session state before any serial GDN token.
+    void flush_deferred() {
+        if(!gdn_deferred || !gdn_deferred->pending) return;
+        if(gdn_commit_rows.size()!=static_cast<std::size_t>(model.gdn_layers))
+            throw std::logic_error("deferred GDN flush has not observed every GDN layer");
+        {
+            const HipLaunchScope active(scope);
+            for(const auto& row:gdn_commit_rows) gdn_window_commit_launch(row,gdn_window_config);
+        }
+        check(hipStreamSynchronize(scope.stream),"complete deferred GDN commit");
+        gdn_control()->pending_rows=0; gdn_deferred->pending=false;
+    }
+    void share_deferred(const Impl& primary) {
+        if(!window.gdn_deferred_rows_steps || !primary.gdn_deferred || failed || primary.failed ||
+            !gdn_commit_rows.empty() || gdn_deferred->pending ||
+            gdn_window_config.retained_bytes!=primary.gdn_window_config.retained_bytes ||
+            primary.resources.session_state_memory!=resources.session_state_memory)
+            throw std::invalid_argument("known-window deferred sharing requires fresh deferred owners of one session");
+        if(primary.gdn_deferred==gdn_deferred) return;
+        gdn_deferred=primary.gdn_deferred;
+        bind_deferred();
+        preflight_memo.clear();
+    }
+    void setup_head_rows() {
+        if(!window.lm_head_rows_steps) return;
+        head_config.hidden_size=u32(model.hidden_size); head_config.vocab_size=u32(model.vocab_size);
+        head_config.input=config.activation; head_config.virtual_q8_wave=config.virtual_q8_lm_head;
+        head_config.prefetch_q8_wave=config.prefetch_q8_lm_head; head_config.wave8_q8_wave=config.wave8_q8_lm_head;
+        const auto variant=window.logical_rows==2U?KnownWindowR2Variant::lm_head_q8_prefetch8_rows2_v1:
+            window.logical_rows==4U?KnownWindowR2Variant::lm_head_q8_prefetch8_rows4_v1:KnownWindowR2Variant::lm_head_q8_prefetch8_rows8_v1;
+        rows_entries.push_back({variant,this,
+            [](std::span<const ExecutionDispatchContext> rows,void* object) {
+                lm_head_known_window_rows_preflight(rows,static_cast<Impl*>(object)->head_config);
+            },
+            [](std::span<const ExecutionDispatchContext> rows,void* object) {
+                const auto& self=*static_cast<Impl*>(object);
+                lm_head_known_window_rows_launch(rows,self.head_config);
+                if(!self.greedy_replies) return;
+                std::array<ExecutionBufferAddress,hip_greedy_rows_max> logits{};
+                for(std::size_t r=0;r<rows.size();++r) logits[r]=resolve_dispatch_write(rows[r],0);
+                enqueue_hip_greedy_rows(std::span<const ExecutionBufferAddress>(logits.data(),rows.size()),
+                    self.head_config.vocab_size,self.greedy_partials,self.greedy_replies,hip_execution_stream());
+            }});
+    }
+    void attach_greedy_rows(ExecutionBufferAddress partials,HipGreedyRowsReply* replies) {
+        if(executing || failed || prefill || !window.lm_head_rows_steps || !replies ||
+            partials.bytes<hip_greedy_rows_scratch_bytes(window.logical_rows,u32(model.vocab_size)))
+            throw std::invalid_argument("known-window greedy rows require an idle multi-row head window and sized scratch");
+        status_disjoint(partials.address,partials.bytes);
+        greedy_partials=partials; greedy_replies=replies;
+    }
+    void setup_router_elementwise_rows() {
+        route_config.hidden_size=u32(model.hidden_size); route_config.expert_count=u32(model.num_experts);
+        route_config.top_k=u32(model.num_experts_per_token); route_config.activation=config.activation;
+        route_config.normalize_selected=model.norm_topk_probability;
+        route_config.parallel_projection=config.parallel_moe_router; route_config.staged_logits=config.staged_moe_router_logits;
+        route_config.ranked_topk=config.ranked_moe_router_topk; route_config.wave_topk=config.wave_moe_router_topk;
+        route_config.wave_manifest_admission=config.wave_router_manifest_admission;
+        elementwise_config.hidden_size=u32(model.hidden_size); elementwise_config.hc_count=u32(model.hc_count);
+        elementwise_config.activation=config.activation;
+        rows_entries.push_back({KnownWindowR2Variant::moe_route_rows_v1,this,
+            [](std::span<const ExecutionDispatchContext> rows,void* object) {
+                moe_route_known_window_rows_preflight(rows,static_cast<Impl*>(object)->route_config);
+            },
+            [](std::span<const ExecutionDispatchContext> rows,void* object) {
+                moe_route_known_window_rows_launch(rows,static_cast<Impl*>(object)->route_config);
+            }});
+        rows_entries.push_back({KnownWindowR2Variant::moe_combine_rows_v1,this,
+            [](std::span<const ExecutionDispatchContext> rows,void* object) {
+                moe_combine_known_window_rows_preflight(rows,static_cast<Impl*>(object)->elementwise_config);
+            },
+            [](std::span<const ExecutionDispatchContext> rows,void* object) {
+                moe_combine_known_window_rows_launch(rows,static_cast<Impl*>(object)->elementwise_config);
+            }});
+        rows_entries.push_back({KnownWindowR2Variant::inject_rows_v1,this,
+            [](std::span<const ExecutionDispatchContext> rows,void* object) {
+                inject_known_window_rows_preflight(rows,static_cast<Impl*>(object)->elementwise_config);
+            },
+            [](std::span<const ExecutionDispatchContext> rows,void* object) {
+                inject_known_window_rows_launch(rows,static_cast<Impl*>(object)->elementwise_config);
             }});
     }
     void complete() {
@@ -396,6 +644,28 @@ struct HipKnownPrefixWindow::Impl {
         case KnownWindowR2Variant::routed_q51_union_rows2_v1:
         case KnownWindowR2Variant::routed_q51_union_rows4_v1:
         case KnownWindowR2Variant::routed_q51_union_rows8_v1: recipe="hip-routed-known-q4ka8-q51-union-dot-orderedslot-v1";break;
+        case KnownWindowR2Variant::routed_a8_union_rows2_v1:
+        case KnownWindowR2Variant::routed_a8_union_rows4_v1:
+        case KnownWindowR2Variant::routed_a8_union_rows8_v1: recipe="hip-routed-known-q4k-q5k-a8-q51-q80-a8down-union-orderedslot-v1";break;
+        case KnownWindowR2Variant::hyper_mix_rows2_v1:
+        case KnownWindowR2Variant::hyper_mix_rows4_v1:
+        case KnownWindowR2Variant::hyper_mix_rows8_v1: recipe="hip-hc-known-rows-typed-q8-r1-ordered-v1";break;
+        case KnownWindowR2Variant::qsa_q8_rows2_r1_v1:
+        case KnownWindowR2Variant::qsa_q8_rows4_r1_v1:
+        case KnownWindowR2Variant::qsa_q8_rows8_r1_v1: recipe="hip-qsa-known-wide-q8-append-all-r1-attend-v1";break;
+        case KnownWindowR2Variant::gdn_deferred_rows2_v1:
+        case KnownWindowR2Variant::gdn_deferred_rows4_v1:
+        case KnownWindowR2Variant::gdn_deferred_rows8_v1: recipe="hip-gdn-window-deferred-commit-r1-tree-v1";break;
+        case KnownWindowR2Variant::ple_rows_host_staged_v1: recipe="hip-ple-window-host-staged-conv-snapshots-v1";break;
+        case KnownWindowR2Variant::qsa_q8_bf16idx_rows2_r1_v1:
+        case KnownWindowR2Variant::qsa_q8_bf16idx_rows4_r1_v1:
+        case KnownWindowR2Variant::qsa_q8_bf16idx_rows8_r1_v1: recipe="hip-qsa-known-wide-q8-bf16idx-append-all-r1-attend-v1";break;
+        case KnownWindowR2Variant::lm_head_q8_prefetch8_rows2_v1:
+        case KnownWindowR2Variant::lm_head_q8_prefetch8_rows4_v1:
+        case KnownWindowR2Variant::lm_head_q8_prefetch8_rows8_v1: recipe="hip-lm-head-known-rows-q8prefetch8-r1tree-v1";break;
+        case KnownWindowR2Variant::moe_route_rows_v1: recipe="hip-route-known-rows-tiled-ascending-chain-r1select-v1";break;
+        case KnownWindowR2Variant::moe_combine_rows_v1: recipe="hip-moe-combine-known-rows-r1element-v1";break;
+        case KnownWindowR2Variant::inject_rows_v1: recipe="hip-inject-known-rows-r1element-v1";break;
         default:throw std::invalid_argument("known-window capture has no closed native recipe");
         }
         return capture_identity(recipe,static_cast<std::uint32_t>(variant));
@@ -441,6 +711,7 @@ struct HipKnownPrefixWindow::Impl {
         for(std::uint32_t row=0;row<logical_rows();++row){
             auto& plan=entry->plans[row];
             if(step>=plan.steps.size() || plan.steps[step].op!=SerialOp::mlp_inject ||
+               window.mode[step]!=KnownWindowStepMode::r1_row_loop ||
                !plan.steps[step].function || !plan.steps[step].preflight)
                 throw std::invalid_argument("MTP observed target launcher is not its actual last MLP injection");
             auto& wrapper=entry->launchers[row];wrapper.delegate=plan.steps[step];wrapper.capture=capture.get();
@@ -489,6 +760,7 @@ struct HipKnownPrefixWindow::Impl {
             hooks.quiesce_or_fail_stop = [&] { failed = true; guard.recover_or_fail_stop(); };
             hooks.position_reader_implementations = position_readers;
             hooks.record_actual_window_lineage=static_cast<bool>(capture);
+            if(!prefill) hooks.preflight_memo=&preflight_memo;
             const auto first_position=session.next_position;
             auto result=prefill ? execute_known_prefix_prefill_eager(*prefill,serial,resources,scratch,session,tokens,
                 launch_plans.front(),r2_entries,rows_entries,hooks) :
@@ -545,6 +817,7 @@ std::shared_ptr<HipMtpTargetWindowCapture> HipKnownPrefixWindow::prepare_mtp_tar
     auto capture=HipMtpTargetWindowCapture::create(impl_.get(),impl_->model,impl_->serial,impl_->window,impl_->resources,
         impl_->scratch,impl_->scope,impl_->actual_owner,policy);
     impl_->prepare_capture(capture);
+    capture->use_device_greedy(impl_->greedy_replies);
     return capture;
 }
 HipMtpTargetWindowExecution HipKnownPrefixWindow::execute_mtp_captured(SerialSessionContext& session,std::span<const std::uint32_t> tokens,
@@ -552,10 +825,20 @@ HipMtpTargetWindowExecution HipKnownPrefixWindow::execute_mtp_captured(SerialSes
     if(!capture)throw std::invalid_argument("MTP target capture owner is absent");
     HipMtpTargetWindowExecution out;out.execution=impl_->execute(session,tokens,before_publish,capture,&out.batch);return out;
 }
+void HipKnownPrefixWindow::attach_greedy_rows(ExecutionBufferAddress partials,HipGreedyRowsReply* replies) {
+    impl_->attach_greedy_rows(partials,replies);
+}
 std::uint32_t HipKnownPrefixWindow::logical_rows() const noexcept { return impl_->logical_rows(); }
 bool HipKnownPrefixWindow::supports_tiled_prefill() const noexcept {return impl_->prefill.has_value();}
 KnownWindowOutputPolicy HipKnownPrefixWindow::output_policy() const noexcept { return impl_->prefill?impl_->prefill->output_policy:impl_->window.output_policy; }
 std::optional<HipKnownPrefixUnionObservation> HipKnownPrefixWindow::latest_routed_union_observation() const noexcept {
     return impl_->failed?std::nullopt:impl_->last_union_observation;
 }
+bool HipKnownPrefixWindow::defers_state() const noexcept {
+    return impl_->window.gdn_deferred_rows_steps || impl_->window.ple_rows_steps;
+}
+void HipKnownPrefixWindow::commit_prefix(std::uint32_t n_keep) { impl_->commit_prefix(n_keep); }
+void HipKnownPrefixWindow::flush_deferred() { impl_->flush_deferred(); }
+void HipKnownPrefixWindow::share_deferred(const HipKnownPrefixWindow& primary) { impl_->share_deferred(*primary.impl_); }
+
 } // namespace strix

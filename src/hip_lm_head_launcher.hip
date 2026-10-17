@@ -8,9 +8,12 @@
 
 #include "strix/dispatch_resources.hpp"
 
+#include <cstdlib>
+#include <string_view>
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -514,6 +517,134 @@ void prefetch8_wave_q8_lm_head_kernel(
     }
 }
 
+struct LmHeadRowsViews {
+    const std::uint16_t* input[lm_head_window_max_rows];
+    float* output[lm_head_window_max_rows];
+};
+
+// Wave32 value of lane + Distance for the low lanes that consume it.
+template <unsigned Distance>
+__device__ float lane_down(float value) {
+    if constexpr (Distance == 16) {
+        const auto bits = __float_as_uint(value);
+        return __uint_as_float(__builtin_amdgcn_permlanex16(bits, bits, 0x76543210U, 0xfedcba98U, false, false));
+    }
+    const auto bits = __float_as_int(value);
+    if constexpr (Distance != 16)
+        return __int_as_float(__builtin_amdgcn_mov_dpp(bits, 0x100 + static_cast<int>(Distance), 0xf, 0xf, true));
+}
+
+// prefetch8 body with one accumulator set per window row: each Q8 block and
+// its scale*code products are read once, then every row repeats the exact
+// R1 leaf, lane-tree and local-tree DAG of prefetch8_wave_q8_lm_head_kernel.
+// Groups > 1 stages all rows' BF16 inputs in LDS once per block, which then
+// covers Groups consecutive Waves-row tiles; it changes no arithmetic.
+template <unsigned Waves, unsigned Rows, unsigned Groups>
+__global__ __launch_bounds__(32U * Waves)
+void prefetch8_wave_q8_lm_head_rows_kernel(LmHeadRowsViews views, const void* weights,
+    std::uint32_t input_width, std::uint32_t output_width) {
+    extern __shared__ uint4 staged[];
+    const auto* lds = reinterpret_cast<const std::uint16_t*>(staged);
+    if constexpr (Groups > 1) {
+        const auto words = input_width / 8U;
+        for (auto i = static_cast<std::uint32_t>(threadIdx.x); i < Rows * words; i += 32U * Waves)
+            staged[i] = reinterpret_cast<const uint4*>(views.input[i / words])[i % words];
+        __syncthreads();
+    }
+    const auto lane = static_cast<std::uint32_t>(threadIdx.x) % 32U;
+    for (unsigned group = 0; group < Groups; ++group) {
+    const auto row = (static_cast<std::uint32_t>(blockIdx.x) * Groups + group) * Waves +
+        static_cast<std::uint32_t>(threadIdx.x) / 32U;
+    if (row >= output_width) return;
+    float partial[Rows][8]{};
+    const auto* blocks = static_cast<const Q8Block*>(weights) +
+        static_cast<std::uint64_t>(row) * (input_width / 32U);
+    // One chunk of Q8 codes/scale is prefetched ahead; lanes past the width
+    // stop exactly where the R1 base < width guard stops accumulating.
+    std::uint64_t next_codes = 0;
+    __half next_scale{};
+    const auto fetch = [&](std::uint32_t feature) {
+        const auto& block = blocks[feature / 32U];
+        __builtin_memcpy(&next_codes, block.values + feature % 32U, 8U);
+        next_scale = block.scale;
+    };
+    if (8U * lane < input_width) fetch(8U * lane);
+    for (std::uint64_t chunk = 0; chunk < input_width; chunk += 256U) {
+        const auto base = chunk + 8U * lane;
+        if (base >= input_width) break;
+        const auto feature = static_cast<std::uint32_t>(base);
+        const auto packed = next_codes;
+        const float scale = __half2float(next_scale);
+        if (base + 256U < input_width) fetch(feature + 256U);
+        float weight[8];
+#pragma unroll
+        for (unsigned local = 0; local < 8; ++local)
+            weight[local] = scale * static_cast<float>(static_cast<std::int8_t>(packed >> (8U * local)));
+#pragma unroll
+        for (unsigned r = 0; r < Rows; ++r) {
+            const auto* input = Groups > 1 ? lds + static_cast<std::uint64_t>(r) * input_width : views.input[r];
+            std::uint16_t bits[8];
+#pragma unroll
+            for (unsigned local = 0; local < 8; ++local) bits[local] = input[feature + local];
+#pragma unroll
+            for (unsigned local = 0; local < 8; ++local)
+                partial[r][local] += load_activation(&bits[local]) * weight[local];
+        }
+    }
+    // Same lane tree as the R1 __shfl_down stages: lane i < d adds lane i + d.
+    // Lanes >= d are never read again, so they may add unconditionally.
+#pragma unroll
+    for (unsigned r = 0; r < Rows; ++r) {
+#pragma unroll
+        for (unsigned local = 0; local < 8; ++local) {
+            auto& v = partial[r][local];
+            v += lane_down<16>(v); v += lane_down<8>(v); v += lane_down<4>(v);
+            v += lane_down<2>(v); v += lane_down<1>(v);
+        }
+    }
+    if (lane == 0) {
+#pragma unroll
+        for (unsigned r = 0; r < Rows; ++r) {
+            auto* p = partial[r];
+            p[0] += p[4]; p[1] += p[5]; p[2] += p[6]; p[3] += p[7];
+            p[0] += p[2]; p[1] += p[3];
+            p[0] += p[1];
+            views.output[r][row] = p[0];
+        }
+    }
+    }
+}
+
+// Wide windows are VALU-heavy; staging their inputs in LDS also keeps the
+// direct per-wave input loads from overflowing the vector cache.
+constexpr unsigned lm_head_rows_groups = 16;
+constexpr std::uint64_t lm_head_rows_lds_limit = 48U * 1024U;
+template <unsigned Rows>
+void launch_lm_head_rows(const LmHeadRowsViews& views, const void* weights,
+    std::uint32_t hidden, std::uint32_t vocab, hipStream_t stream) {
+    const auto lds = static_cast<std::uint64_t>(Rows) * hidden * 2U;
+    // STRIX_LM_HEAD_ROWS_WIDE=w16|direct (wide windows): 16 waves share one staged copy
+    // (twice the resident waves per CU), or no staging; same per-row arithmetic.
+    static const int wide = [] {
+        const char* v = std::getenv("STRIX_LM_HEAD_ROWS_WIDE");
+        return !v ? 0 : std::string_view(v) == "w16" ? 1 : std::string_view(v) == "direct" ? 2 : 0;
+    }();
+    if (Rows > 4U && lds <= lm_head_rows_lds_limit && wide == 1) {
+        constexpr auto rows_per_block = 16U * (lm_head_rows_groups / 2U);
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(prefetch8_wave_q8_lm_head_rows_kernel<16, Rows, lm_head_rows_groups / 2U>),
+            dim3((vocab + rows_per_block - 1U) / rows_per_block), dim3(512), static_cast<std::uint32_t>(lds), stream,
+            views, weights, hidden, vocab);
+    } else if (Rows > 4U && lds <= lm_head_rows_lds_limit && wide == 0) {
+        constexpr auto rows_per_block = 8U * lm_head_rows_groups;
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(prefetch8_wave_q8_lm_head_rows_kernel<8, Rows, lm_head_rows_groups>),
+            dim3((vocab + rows_per_block - 1U) / rows_per_block), dim3(256), static_cast<std::uint32_t>(lds), stream,
+            views, weights, hidden, vocab);
+    } else {
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(prefetch8_wave_q8_lm_head_rows_kernel<8, Rows, 1>),
+            dim3((vocab + 7U) / 8U), dim3(256), 0, stream, views, weights, hidden, vocab);
+    }
+}
+
 template <
     typename Input,
     WeightKind Kind>
@@ -952,6 +1083,68 @@ make_hip_lm_head_launcher(
     };
 }
 
+namespace {
+struct PreparedLmHeadRows { LmHeadRowsViews views{}; const void* weights = nullptr; };
+PreparedLmHeadRows prepare_lm_head_rows(std::span<const ExecutionDispatchContext> rows,
+    const HipLmHeadLauncherConfig& config) {
+    if (rows.size() < 2U || rows.size() > lm_head_window_max_rows)
+        throw std::invalid_argument("known-window LM head supports two to eight rows");
+    validate_config(config);
+    if (!config.prefetch_q8_wave || config.input != HipActivationStorage::bf16)
+        throw std::invalid_argument("known-window LM head rows require the eager prefetch BF16/Q8_0 head");
+    const auto expected = kernel_id(ExecutionBindingRequest{}, config);
+    PreparedLmHeadRows out;
+    std::array<ExecutionBufferAddress, lm_head_window_max_rows> inputs{}, outputs{};
+    const RuntimeTensorBinding* tensor = nullptr;
+    for (std::size_t r = 0; r < rows.size(); ++r) {
+        if (!rows[r].kernel_id || *rows[r].kernel_id != expected)
+            throw std::invalid_argument("known-window LM head row kernel differs from its R1 source");
+        const auto p = prepare_lm_head(rows[r], const_cast<HipLmHeadLauncherConfig*>(&config));
+        if (p.kind != WeightKind::q8_0) throw std::invalid_argument("known-window LM head rows support Q8_0 only");
+        if (tensor && (p.runtime_tensor.address != tensor->address || p.runtime_tensor.bytes != tensor->bytes))
+            throw std::invalid_argument("known-window LM head rows must share one head tensor");
+        tensor = &p.runtime_tensor;
+        inputs[r] = p.hidden; outputs[r] = p.logits;
+        out.views.input[r] = reinterpret_cast<const std::uint16_t*>(p.hidden.address);
+        out.views.output[r] = reinterpret_cast<float*>(p.logits.address);
+    }
+    const auto overlap = [](const ExecutionBufferAddress& a, const ExecutionBufferAddress& b) {
+        return a.address < b.address + b.bytes && b.address < a.address + a.bytes;
+    };
+    for (std::size_t r = 0; r < rows.size(); ++r)
+        for (std::size_t q = 0; q < rows.size(); ++q)
+            if ((q != r && overlap(outputs[r], outputs[q])) || overlap(outputs[r], inputs[q]))
+                throw std::invalid_argument("known-window LM head row output aliases another row");
+    out.weights = reinterpret_cast<const void*>(tensor->address);
+    return out;
+}
+} // namespace
+
+void lm_head_known_window_rows_preflight(std::span<const ExecutionDispatchContext> rows,
+    const HipLmHeadLauncherConfig& config) {
+    if (const auto* scope = current_hip_launch_context(); scope && scope->graph_capture)
+        throw std::invalid_argument("known-window launcher preflight requires eager scope");
+    static_cast<void>(prepare_lm_head_rows(rows, config));
+}
+
+void lm_head_known_window_rows_launch(std::span<const ExecutionDispatchContext> rows,
+    const HipLmHeadLauncherConfig& config) {
+    const auto p = prepare_lm_head_rows(rows, config);
+    const auto stream = hip_execution_stream();
+    const auto h = config.hidden_size, v = config.vocab_size;
+    check_hip(hipPeekAtLastError(), "known-window LM head rows stale launch error");
+    switch (rows.size()) {
+    case 2: launch_lm_head_rows<2>(p.views, p.weights, h, v, stream); break;
+    case 3: launch_lm_head_rows<3>(p.views, p.weights, h, v, stream); break;
+    case 4: launch_lm_head_rows<4>(p.views, p.weights, h, v, stream); break;
+    case 5: launch_lm_head_rows<5>(p.views, p.weights, h, v, stream); break;
+    case 6: launch_lm_head_rows<6>(p.views, p.weights, h, v, stream); break;
+    case 7: launch_lm_head_rows<7>(p.views, p.weights, h, v, stream); break;
+    default: launch_lm_head_rows<8>(p.views, p.weights, h, v, stream); break;
+    }
+    check_hip(hipGetLastError(), "known-window LM head rows launch");
+}
+
 void HipLmHeadLauncherBundle::
 register_for_compiled_execution(
     const CompiledSerialExecution& compiled,
@@ -1111,6 +1304,16 @@ void launch_hip_mtp_lm_head(const MtpNativeContext& c,void* stream) {
     case WeightKind::iq4_xs:launch.template operator()<WeightKind::iq4_xs>();break;
     }
     check_hip(hipGetLastError(),"MTP native LM head launch");
+}
+void launch_hip_q8_head_rows(const std::uint16_t* hidden,const void* q8_rows,std::uint32_t hidden_size,
+    std::uint32_t rows,float* logits,void* stream) {
+    if(!hidden || !q8_rows || !logits || !stream || !rows || !hidden_size || hidden_size%32U || hidden_size>10240U ||
+       reinterpret_cast<std::uintptr_t>(q8_rows)%2U)
+        throw std::invalid_argument("Q8 draft head rows geometry/views invalid");
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(prefetch8_wave_q8_lm_head_kernel<std::uint16_t,8>),
+        dim3(rows/8U+static_cast<std::uint32_t>(rows%8U!=0U)),dim3(256U),0,reinterpret_cast<hipStream_t>(stream),
+        hidden,q8_rows,hidden_size,rows,logits);
+    check_hip(hipGetLastError(),"Q8 draft head rows launch");
 }
 
 }  // namespace strix

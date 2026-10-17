@@ -3,7 +3,17 @@
 #include "strix/execution_io.hpp"
 #include "strix/execution_plan.hpp"
 #include "strix/hip_gdn_launcher.hpp"
+#include "strix/hip_generation_output.hpp"
+#include "strix/hip_lm_head_launcher.hpp"
+#include "strix/hip_hyper_mix_launcher.hpp"
+#include "strix/hip_indexed_attention_launcher.hpp"
+#include "strix/indexed_attention_state.hpp"
+#include "strix/indexed_attention_workspace.hpp"
 #include "strix/hip_launch_context.hpp"
+#include "strix/execution_buffers.hpp"
+#include "strix/hip_moe_route_launcher.hpp"
+#include "strix/hip_runtime_launchers.hpp"
+#include "strix/wave_router_contract.hpp"
 #include "strix/hip_setup_quiescence.hpp"
 #include "strix/hip_shared_expert_launcher.hpp"
 #include "strix/session_state_layout.hpp"
@@ -27,6 +37,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -754,6 +765,338 @@ void family_gdn_f32_gates() {
 
 // Native component evidence for the exact closed projection tiles used by the
 // T runtime. This does not replace full-model T producer/continuation gates.
+std::vector<unsigned char> bf16_matrix(std::uint32_t width, std::uint32_t outputs, unsigned salt) {
+    std::vector<std::uint16_t> values(static_cast<std::size_t>(width) * outputs);
+    for (std::size_t i = 0; i < values.size(); ++i)
+        values[i] = bf16(static_cast<float>(static_cast<int>((i * 7U + (i >> 8U) * 5U + salt) % 29U) - 14) * 0.00041F);
+    return bytes_of(values);
+}
+// One real QSA step (canonical layer-3 geometry, Q8 projections, budget 2048,
+// 4-cell blocks), eight row views of one physical window arena.
+struct QsaFixture {
+    Owner owner;
+    ModelContract model = ModelContract::qwen38_flash_next();
+    SerialExecutionPlan execution = build_serial_decode_execution_plan(model);
+    SerialExecutionIoPlan io = build_serial_execution_io_plan(execution);
+    ExecutionStep step;
+    ExecutionArenaPlan serial;
+    KnownWindowArena window;
+    Span scratch, state, kv, raw;
+    ExecutionMemoryBinding memory;
+    ModelManifest manifest;
+    ModelRuntimeBinding runtime;
+    ExecutionTensorAccessPlan access;
+    std::vector<Weight> weights;
+    SerialSessionStateLayout state_layout;
+    SessionStateMemoryBinding state_memory;
+    std::vector<unsigned char> host_state, initial_state, seed;
+    ExecutionRuntimeResources resources;
+    std::array<ExecutionDispatchContext, 8> rows;
+    HipIndexedAttentionLauncherConfig config;
+    std::string selected_id;
+    ExecutionLauncher selected;
+
+    const bool bf16_indexer;
+    QsaFixture(bool prefetch, bool wave8, bool bf16_index, std::uint64_t context_tokens) : bf16_indexer(bf16_index) {
+        const auto found = std::find_if(execution.steps.begin(), execution.steps.end(),
+            [](const auto& value) { return value.op == SerialOp::indexed_attention; });
+        require(found != execution.steps.end(), "canonical QSA operator missing");
+        step = *found;
+        const auto& step_io = io.steps[step.id];
+        serial.alignment = 256U;
+        const auto allocation = [&](ExecutionBufferUse use, std::uint64_t bytes) {
+            const auto offset = (serial.total_bytes + 255U) / 256U * 256U;
+            serial.allocations.push_back({use, step.id, step.id, offset, bytes});
+            serial.total_bytes = offset + bytes;
+        };
+        allocation(step_io.reads[0], 2560U * 2U);
+        allocation(step_io.writes[0], 2560U * 2U);
+        allocation(step_io.temporaries[0], build_indexed_attention_workspace_layout(model).total_bytes);
+        serial.total_bytes = (serial.total_bytes + 255U) / 256U * 256U;
+        serial.naive_nonaliased_bytes = serial.total_bytes;
+        window = build_known_window_arena(serial, 256U, 8U);
+        scratch = owner.allocate(window.physical.total_bytes);
+        memory = {0x4b4e4f574e515341ULL, scratch.address, scratch.bytes, 43U};
+        manifest.architecture = "qwen4_exp";
+        const auto layer = std::to_string(*step.layer);
+        add("blk." + layer + ".attn_q.weight", TensorRole::attention_projection, {2560, 12288}, q8(2560, 12288, 11));
+        add("blk." + layer + ".attn_k.weight", TensorRole::attention_projection, {2560, 512}, q8(2560, 512, 12));
+        add("blk." + layer + ".attn_v.weight", TensorRole::attention_projection, {2560, 512}, q8(2560, 512, 13));
+        add("blk." + layer + ".attn_output.weight", TensorRole::attention_projection, {6144, 2560}, q8(6144, 2560, 14));
+        add("blk." + layer + ".attn_q_norm.weight", TensorRole::normalization, {256}, f32(256U, 1.0F, 0.03F), 0U);
+        add("blk." + layer + ".attn_k_norm.weight", TensorRole::normalization, {256}, f32(256U, 0.9F, 0.02F), 0U);
+        // The real checkpoint keeps both indexer projections in BF16.
+        if (bf16_indexer) {
+            add("blk." + layer + ".indexer.q_proj.weight", TensorRole::sparse_index, {2560, 512}, bf16_matrix(2560, 512, 15), 30U);
+            add("blk." + layer + ".indexer.k_proj.weight", TensorRole::sparse_index, {2560, 128}, bf16_matrix(2560, 128, 16), 30U);
+        } else {
+            add("blk." + layer + ".indexer.q_proj.weight", TensorRole::sparse_index, {2560, 512}, q8(2560, 512, 15));
+            add("blk." + layer + ".indexer.k_proj.weight", TensorRole::sparse_index, {2560, 128}, q8(2560, 128, 16));
+        }
+        add("blk." + layer + ".indexer.q_norm.weight", TensorRole::sparse_index, {128}, f32(128U, 1.1F, 0.02F), 0U);
+        add("blk." + layer + ".indexer.k_norm.weight", TensorRole::sparse_index, {128}, f32(128U, 0.95F, 0.03F), 0U);
+        manifest.layout_identity = model_manifest_layout_identity(manifest);
+        runtime.manifest_layout_identity = manifest.layout_identity;
+        runtime.model_content_identity.bytes[0] = 1U;
+        access.manifest_layout_identity = manifest.layout_identity;
+        access.plan_identity = 0x4b4e4f574e515342ULL;
+        access.accesses.push_back({step.id, step.op, 0U, {0, 1, 2, 3}});
+        access.accesses.push_back({step.id, step.op, 1U, {6, 7, 8, 9}});
+        access.accesses.push_back({step.id, step.op, 2U, {4, 5}});
+        SerialSessionStateLayoutRequest request; request.context_tokens = context_tokens;
+        state_layout = build_serial_session_state_layout(model, request);
+        state = owner.allocate(state_layout.device_total_bytes);
+        host_state.resize(static_cast<std::size_t>(state_layout.host_total_bytes));
+        state_memory = {state_layout.layout_identity, state.address, state.bytes, 47U,
+            reinterpret_cast<std::uintptr_t>(host_state.data()), state_layout.host_total_bytes, 53U};
+        const auto k = resolve_indexed_attention_layer_state(state_layout, state_memory, model, *step.layer, SessionStateComponent::attention_kv);
+        const auto r = resolve_indexed_attention_layer_state(state_layout, state_memory, model, *step.layer, SessionStateComponent::sparse_index);
+        kv = {k.address, k.bytes}; raw = {r.address, r.bytes};
+        // Finite BF16 history in every QSA cell of the tested layer.
+        initial_state.assign(static_cast<std::size_t>(state.bytes), 0U);
+        for (const auto view : {kv, raw}) {
+            std::vector<std::uint16_t> values(static_cast<std::size_t>(view.bytes / 2U));
+            for (std::size_t i = 0; i < values.size(); ++i) {
+                const auto mixed = (i * 2654435761ULL + (view.address == kv.address ? 17U : 91U)) >> 7U;
+                values[i] = bf16(static_cast<float>(static_cast<int>(mixed % 2001U) - 1000) * 0.001F);
+            }
+            std::memcpy(initial_state.data() + (view.address - state.address), values.data(), values.size() * 2U);
+        }
+        resources = {&memory, &manifest, &runtime, &access};
+        resources.session_state_layout = &state_layout; resources.session_state_memory = &state_memory;
+        config.model = model;
+        config.prefetch_q8_input = prefetch;
+        config.wave8_q8_output = wave8;
+        if (prefetch) {
+            config.prefetch_eligible_layers = {*step.layer};
+            config.prefetch_stats = std::make_shared<qsa_input_prefetch::RuntimeDispatchStats>();
+        }
+        ExecutionBindingRequest binding;
+        binding.prefetch_q8_qsa_input = prefetch; binding.qsa_input_prefetch_layers = config.prefetch_eligible_layers;
+        binding.wave8_q8_qsa_output = wave8;
+        kernels::KernelRegistry registry;
+        register_hip_indexed_attention_kernel_variant(model, binding, config, registry);
+        require(registry.variants().size() == 1U, "QSA serial selection is ambiguous");
+        selected_id = registry.variants().front().id;
+        selected = make_hip_indexed_attention_launcher(selected_id, &config);
+        seed.assign(static_cast<std::size_t>(scratch.bytes), 0xa5U);
+        for (unsigned row = 0; row < 8U; ++row) {
+            auto& context = rows[row];
+            context.execution_identity = memory.execution_identity;
+            context.step_id = step.id; context.op = step.op; context.layer = step.layer;
+            context.kernel_id = selected_id;
+            context.reads = step_io.reads; context.writes = step_io.writes; context.temporaries = step_io.temporaries;
+            context.arena = &window.row_view[row]; context.memory = &memory; context.resources = &resources;
+            context.session_state_layout = &state_layout; context.session_state_memory = &state_memory;
+            context.reads_state = step.reads_state; context.writes_state = step.writes_state;
+            context.input_token_id = 101U + row;
+            const auto input = resolve_dispatch_read(context, 0);
+            std::vector<std::uint16_t> values(2560U);
+            for (std::size_t i = 0; i < values.size(); ++i)
+                values[i] = bf16(static_cast<float>(static_cast<int>((i * 7U + row * 13U) % 41U) - 20) * (0.011F + 0.003F * static_cast<float>(row)));
+            std::memcpy(seed.data() + (input.address - scratch.address), values.data(), values.size() * 2U);
+        }
+    }
+    void add(std::string name, TensorRole role, std::vector<std::uint64_t> dimensions, std::vector<unsigned char> bytes,
+             std::uint32_t type = 8U) {
+        ManifestTensor tensor;
+        tensor.name = std::move(name); tensor.role = role; tensor.layer = step.layer;
+        tensor.ggml_type = type; tensor.dimensions = std::move(dimensions); tensor.byte_size = bytes.size();
+        tensor.absolute_offset = (manifest.total_tensor_bytes + 15U) / 16U * 16U;
+        manifest.total_tensor_bytes = tensor.absolute_offset + tensor.byte_size;
+        const auto device = owner.allocate(bytes.size());
+        write(device, bytes);
+        const auto index = static_cast<std::uint32_t>(weights.size());
+        weights.push_back({device, std::move(bytes)});
+        manifest.tensors.push_back(std::move(tensor));
+        runtime.tensors.push_back({index, RuntimeTensorStorage::resident, device.address, device.bytes, 7U, 0U});
+    }
+    HipLaunchContext scope() const { HipLaunchContext result; result.stream = owner.stream; return result; }
+    std::span<const ExecutionDispatchContext> group(std::uint32_t count) const { return {rows.data(), count}; }
+    void place(std::uint64_t position) { for (unsigned r = 0; r < 8U; ++r) rows[r].position = position + r; }
+    void reset() { write(scratch, seed); write(state, initial_state); }
+    void serial_rows(std::uint32_t count) { for (std::uint32_t r = 0; r < count; ++r) selected.function(rows[r], selected.user_data); }
+    struct Payload { std::vector<unsigned char> arena, state; };
+    Payload run(std::uint32_t count, std::uint64_t position, bool candidate) {
+        reset(); place(position);
+        {
+            const HipLaunchScope active(scope());
+            if (candidate) { indexed_attention_known_window_rows_preflight(group(count), config);
+                indexed_attention_known_window_rows_launch(group(count), config); }
+            else serial_rows(count);
+        }
+        owner.finish();
+        return {read(scratch), read(state)};
+    }
+    // Cells [0, cells) of the tested layer's K/V and raw index state.
+    std::vector<unsigned char> cells(const std::vector<unsigned char>& bytes, Span view, std::uint64_t row_bytes, std::uint64_t count) const {
+        const auto begin = bytes.begin() + static_cast<std::ptrdiff_t>(view.address - state.address);
+        return {begin, begin + static_cast<std::ptrdiff_t>(row_bytes * count)};
+    }
+};
+
+void qsa_rows_family(bool prefetch, bool wave8, bool bf16_indexer) {
+    QsaFixture f(prefetch, wave8, bf16_indexer, 2304U);
+    const std::uint64_t prefetched = bf16_indexer ? 3U : 5U; // BF16 indexer stays on the legacy256 tree
+    unsigned compared = 0;
+    // Positions cover p=0, partial-block tails, the full-visible/top-k boundary
+    // (visible 2048..2053 straddles 512 complete blocks) and a pure top-k window.
+    for (const std::uint32_t count : {2U, 4U, 8U})
+        for (const std::uint64_t position : {0ULL, 1ULL, 3ULL, 6ULL, 2042ULL, 2045ULL, 2047ULL, 2049ULL, 2201ULL}) {
+            const auto before = prefetch ? f.config.prefetch_stats->dispatched_projections.load() : 0U;
+            const auto reference = f.run(count, position, false);
+            const auto middle = prefetch ? f.config.prefetch_stats->dispatched_projections.load() : 0U;
+            const auto candidate = f.run(count, position, true);
+            if (prefetch) require(middle - before == prefetched * count && f.config.prefetch_stats->dispatched_projections.load() - middle == prefetched,
+                "QSA rows prefetch submission count differs");
+            require(candidate.arena == reference.arena, "QSA rows output/workspace bytes differ from ascending serial calls");
+            require(candidate.state == reference.state, "QSA rows KV/raw-index state differs from ascending serial calls");
+            std::vector<std::vector<unsigned char>> outputs;
+            for (std::uint32_t r = 0; r < count; ++r) {
+                const auto view = resolve_dispatch_write(f.rows[r], 0);
+                const auto begin = candidate.arena.begin() + static_cast<std::ptrdiff_t>(view.address - f.scratch.address);
+                outputs.emplace_back(begin, begin + 5120);
+                for (std::size_t i = 0; i < 5120U; i += 2U)
+                    require((outputs.back()[i + 1U] & 0x7fU) != 0x7fU || (outputs.back()[i] & 0x80U) == 0U, "QSA rows output is nonfinite");
+                require(r == 0U || outputs[r] != outputs[r - 1U], "QSA fixture rows are insensitive to their inputs");
+            }
+            ++compared;
+        }
+    guards(f.scratch); guards(f.state);
+    for (const auto& weight : f.weights) { require(read(weight.device) == weight.original, "QSA weights changed"); guards(weight.device); }
+
+    // Tail snapshot/commit for every n_keep, the commit replayed from one captured graph.
+    const auto journal = f.owner.allocate(qsa_index_journal_bytes(f.model));
+    const auto plan = prepare_qsa_index_tail(f.model, f.state_layout, f.state_memory, {journal.address, journal.bytes});
+    const auto words = f.owner.allocate(16U);
+    auto* device_position = reinterpret_cast<std::uint64_t*>(words.address);
+    auto* device_keep = reinterpret_cast<std::uint32_t*>(words.address + 8U);
+    hipGraph_t graph{}; hipGraphExec_t commit{};
+    check(hipStreamBeginCapture(f.owner.stream, hipStreamCaptureModeThreadLocal), "capture QSA tail commit");
+    try { enqueue_qsa_index_tail_commit(plan, device_position, device_keep, f.owner.stream); }
+    catch (...) { (void)hipStreamEndCapture(f.owner.stream, &graph); throw; }
+    check(hipStreamEndCapture(f.owner.stream, &graph), "finish QSA tail commit capture");
+    f.owner.graphs.push_back(graph);
+    check(hipGraphInstantiate(&commit, graph, nullptr, nullptr, 0), "instantiate QSA tail commit");
+    const auto state_contract = build_indexed_attention_state_layout(f.model);
+    unsigned commits = 0;
+    for (const std::uint32_t count : {2U, 4U, 8U})
+        for (const std::uint64_t position : {5ULL, 2046ULL, 2203ULL}) {
+            for (std::uint32_t keep = 0; keep <= count; ++keep) {
+                const auto golden = keep ? f.run(keep, position, false).state : f.initial_state;
+                const auto expected_cells = position + keep;
+                f.reset(); f.place(position);
+                check(hipMemcpy(device_position, &position, 8U, hipMemcpyHostToDevice), "QSA tail position");
+                check(hipMemcpy(device_keep, &keep, 4U, hipMemcpyHostToDevice), "QSA tail n_keep");
+                {
+                    const HipLaunchScope active(f.scope());
+                    enqueue_qsa_index_tail_snapshot(plan, device_position, f.owner.stream);
+                    indexed_attention_known_window_rows_launch(f.group(count), f.config, {journal.address, journal.bytes});
+                }
+                // Clobber the tail block and every window cell before committing.
+                const auto start = position - position % 4U;
+                check(hipMemsetAsync(reinterpret_cast<void*>(f.raw.address + start * state_contract.raw_index_row_bytes), 0xff,
+                    static_cast<std::size_t>((position + count - start) * state_contract.raw_index_row_bytes), f.owner.stream), "clobber QSA tail");
+                check(hipGraphLaunch(commit, f.owner.stream), "replay QSA tail commit");
+                f.owner.finish();
+                const auto actual = read(f.state);
+                require(f.cells(actual, f.raw, state_contract.raw_index_row_bytes, expected_cells) ==
+                        f.cells(golden, f.raw, state_contract.raw_index_row_bytes, expected_cells),
+                    "QSA tail commit raw index differs from serial accepted prefix");
+                require(f.cells(actual, f.kv, state_contract.kv_row_bytes, expected_cells) ==
+                        f.cells(golden, f.kv, state_contract.kv_row_bytes, expected_cells),
+                    "QSA accepted KV prefix differs from serial");
+                ++commits;
+            }
+        }
+    check(hipGraphExecDestroy(commit), "destroy QSA tail commit");
+
+    // Pure admission rejects before any enqueue.
+    f.reset(); f.place(64U);
+    const auto rejected = [&](auto&& mutate, const char* message) {
+        auto bad = f.rows; mutate(bad);
+        bool thrown = false;
+        { const HipLaunchScope active(f.scope());
+          try { indexed_attention_known_window_rows_launch(std::span<const ExecutionDispatchContext>(bad.data(), 4U), f.config); }
+          catch (const std::invalid_argument&) { thrown = true; } }
+        f.owner.finish();
+        require(thrown && read(f.scratch) == f.seed && read(f.state) == f.initial_state, message);
+    };
+    rejected([](auto& rows) { rows[2].position += 1U; }, "QSA rows require consecutive positions");
+    rejected([](auto& rows) { rows[1].arena = rows[0].arena; }, "QSA rows require disjoint row views");
+    rejected([](auto& rows) { rows[3].layer = 7U; }, "QSA rows require one layer");
+    const std::string foreign = f.selected_id + ".foreign";
+    rejected([&](auto& rows) { rows[0].kernel_id = foreign; }, "QSA rows require the row's serial kernel configuration");
+    {
+        bool thrown = false;
+        try { indexed_attention_known_window_rows_preflight(f.group(3U), f.config); } catch (const std::invalid_argument&) { thrown = true; }
+        require(thrown, "QSA rows admit only two, four or eight rows");
+    }
+    std::cout << "QSA rows prefetch=" << prefetch << " wave8=" << wave8 << " bf16_indexer=" << bf16_indexer << ": " << compared
+              << " bit-exact windows, " << commits << " tail commits\n";
+
+    if (!std::getenv("STRIX_QSA_ROWS_BENCH")) return;
+    hipEvent_t begin{}, end{};
+    check(hipEventCreate(&begin), "bench event"); check(hipEventCreate(&end), "bench event");
+    const auto time = [&](auto&& work) {
+        std::vector<float> samples;
+        for (unsigned i = 0; i < 28U; ++i) {
+            check(hipEventRecord(begin, f.owner.stream), "bench begin");
+            { const HipLaunchScope active(f.scope()); work(); }
+            check(hipEventRecord(end, f.owner.stream), "bench end");
+            check(hipEventSynchronize(end), "bench wait");
+            float ms = 0.0F; check(hipEventElapsedTime(&ms, begin, end), "bench elapsed");
+            if (i >= 3U) samples.push_back(ms);
+        }
+        std::sort(samples.begin(), samples.end());
+        return samples[samples.size() / 2U];
+    };
+    for (const std::uint64_t position : {256ULL, 2201ULL})
+        for (const std::uint32_t count : {2U, 4U, 8U}) {
+            f.reset(); f.place(position);
+            const auto serial_ms = time([&] { f.serial_rows(count); });
+            const auto rows_ms = time([&] { indexed_attention_known_window_rows_launch(f.group(count), f.config); });
+            const auto one_ms = time([&] { f.serial_rows(1U); });
+            std::cout << "QSA bench p=" << position << " T=" << count << " serial(Tx1)=" << serial_ms << "ms rows=" << rows_ms
+                      << "ms 1-row=" << one_ms << "ms speedup=" << serial_ms / rows_ms << "x rows/1-row=" << rows_ms / one_ms << "\n";
+        }
+    check(hipEventDestroy(begin), "bench event"); check(hipEventDestroy(end), "bench event");
+}
+
+// Whole QSA layer (synthetic weights, model shapes) at long context: the
+// 1-row launcher at visible = context and T-row windows ending there.
+void bench_qsa_long_context() {
+    hipEvent_t begin{}, end{};
+    check(hipEventCreate(&begin), "bench event"); check(hipEventCreate(&end), "bench event");
+    for (const std::uint64_t context : {2049ULL, 4096ULL, 32768ULL, 131072ULL, 262144ULL}) {
+        QsaFixture f(true, true, true, context);
+        f.reset();
+        const auto time = [&](auto&& work) {
+            std::vector<float> samples;
+            for (unsigned i = 0; i < 23U; ++i) {
+                check(hipEventRecord(begin, f.owner.stream), "bench begin");
+                { const HipLaunchScope active(f.scope()); work(); }
+                check(hipEventRecord(end, f.owner.stream), "bench end");
+                check(hipEventSynchronize(end), "bench wait");
+                float ms = 0.0F; check(hipEventElapsedTime(&ms, begin, end), "bench elapsed");
+                if (i >= 3U) samples.push_back(ms);
+            }
+            std::sort(samples.begin(), samples.end());
+            return samples[samples.size() / 2U];
+        };
+        f.place(context - 1U);
+        const auto one_ms = time([&] { f.serial_rows(1U); });
+        std::cout << "QSA layer context=" << context << " 1-row=" << one_ms << "ms";
+        for (const std::uint32_t count : {2U, 4U, 8U}) {
+            f.place(context - count);
+            const auto rows_ms = time([&] { indexed_attention_known_window_rows_launch(f.group(count), f.config); });
+            std::cout << " T" << count << "=" << rows_ms << "ms";
+        }
+        std::cout << '\n' << std::flush;
+    }
+    check(hipEventDestroy(begin), "bench event"); check(hipEventDestroy(end), "bench event");
+}
+
 void family_prefill_tiles(bool gdn,std::uint32_t count) {
     Fixture f(gdn,false,gdn,64U);
     const auto arena=build_known_prefill_arena(f.serial,256U,count);
@@ -870,15 +1213,602 @@ void family(bool gdn, bool prefetch = false) {
             });
     }
 }
+// HC rows: one canonical attn/mlp/final mixer, T row views of the window arena,
+// real HC shapes and formats (F32 norm, Q8 down/up, F32 injection).
+struct HyperFixture {
+    Owner owner;
+    ModelContract model = ModelContract::qwen38_flash_next();
+    SerialExecutionPlan execution = build_serial_decode_execution_plan(model);
+    SerialExecutionIoPlan io = build_serial_execution_io_plan(execution);
+    ExecutionStep step;
+    ExecutionArenaPlan serial;
+    KnownWindowArena window;
+    Span scratch;
+    ExecutionMemoryBinding memory;
+    ModelManifest manifest;
+    ModelRuntimeBinding runtime;
+    ExecutionTensorAccessPlan access;
+    std::vector<Weight> weights;
+    ExecutionRuntimeResources resources;
+    std::vector<ExecutionDispatchContext> rows;
+    std::vector<unsigned char> seed;
+    HipHyperMixLauncherConfig config;
+    std::string selected_id;
+    ExecutionLauncher selected;
+    bool final_mix;
+
+    HyperFixture(SerialOp op, bool splitk, bool lane, std::uint32_t count) : final_mix(op == SerialOp::final_hyper_mix) {
+        const auto found = std::find_if(execution.steps.begin(), execution.steps.end(),
+            [&](const auto& value) { return value.op == op && (final_mix || value.layer == 0U); });
+        require(found != execution.steps.end(), "canonical HC mixer missing");
+        step = *found;
+        const auto& step_io = io.steps[step.id];
+        require(step_io.reads.size() == 1U && step_io.writes.size() == (final_mix ? 1U : 2U) &&
+            step_io.temporaries.size() == 1U, "HC fixture IO contract differs");
+        serial.alignment = 256U;
+        const auto allocation = [&](ExecutionBufferUse use, std::uint64_t bytes) {
+            const auto offset = (serial.total_bytes + 255U) / 256U * 256U;
+            serial.allocations.push_back({use, step.id, step.id, offset, bytes});
+            serial.total_bytes = offset + bytes;
+        };
+        allocation(step_io.reads[0], 10240U * 2U);
+        allocation(step_io.writes[0], 2560U * 2U);
+        if (!final_mix) allocation(step_io.writes[1], 4U * 4U);
+        allocation(step_io.temporaries[0], (10240U + 320U) * 4U);
+        serial.total_bytes = (serial.total_bytes + 255U) / 256U * 256U;
+        serial.naive_nonaliased_bytes = serial.total_bytes;
+        window = build_known_window_arena(serial, 256U, count);
+        scratch = owner.allocate(window.physical.total_bytes);
+        memory = {0x4b4e4f574e484301ULL, scratch.address, scratch.bytes, 19U};
+        manifest.architecture = "qwen4_exp";
+        const auto salt = static_cast<unsigned>(op) * 7U;
+        add("hc_norm.weight", 0U, {10240}, f32(10240U, 1.0F, 0.04F));
+        add("hc_down.weight", 8U, {10240, 320}, q8(10240, 320, 11U + salt));
+        add("hc_up.weight", 8U, {320, 10240}, q8(320, 10240, 5U + salt));
+        if (!final_mix) add("hc_inject.weight", 0U, {10240, 4}, f32(40960U, 0.0004F, 0.0002F));
+        for (std::uint32_t slot = 0; slot < weights.size(); ++slot) access.accesses.push_back({step.id, step.op, slot, {slot}});
+        manifest.layout_identity = model_manifest_layout_identity(manifest);
+        runtime.manifest_layout_identity = manifest.layout_identity;
+        runtime.model_content_identity.bytes[0] = 1U;
+        access.manifest_layout_identity = manifest.layout_identity;
+        access.plan_identity = 0x4b4e4f574e484302ULL;
+        resources = {&memory, &manifest, &runtime, &access};
+        config.hidden_size = 2560U; config.hc_count = 4U; config.lowrank = 320U;
+        config.rms_epsilon = model.rms_norm_epsilon;
+        config.parallel = config.staged_projections = config.fused_injection = config.typed_projection = true;
+        config.prefetch_rows = config.prefetch_q8_output = true;
+        config.lane_chain_output = lane; config.splitk_projection = splitk;
+        ExecutionBindingRequest binding; binding.lane_chain_hyper_output = lane;
+        kernels::KernelRegistry registry;
+        register_hip_hyper_mix_kernel_variant(model, binding, config, registry);
+        require(registry.variants().size() == 1U, "HC serial selection is ambiguous");
+        selected_id = registry.variants().front().id;
+        selected = make_hip_hyper_mix_launcher(selected_id, &config);
+        rows.resize(count);
+        for (std::uint32_t r = 0; r < count; ++r) {
+            auto& context = rows[r];
+            context.execution_identity = memory.execution_identity;
+            context.step_id = step.id; context.op = step.op; context.layer = step.layer;
+            context.kernel_id = selected_id;
+            context.reads = step_io.reads; context.writes = step_io.writes; context.temporaries = step_io.temporaries;
+            context.arena = &window.row_view[r]; context.memory = &memory; context.resources = &resources;
+            context.position = r; context.input_token_id = 17U + r;
+        }
+    }
+    void add(std::string name, std::uint32_t type, std::vector<std::uint64_t> dimensions, std::vector<unsigned char> bytes) {
+        ManifestTensor tensor;
+        tensor.name = final_mix ? std::move(name) : "blk.0." + name; tensor.role = TensorRole::dense_projection;
+        tensor.layer = step.layer; tensor.ggml_type = type; tensor.dimensions = std::move(dimensions);
+        tensor.byte_size = bytes.size();
+        tensor.absolute_offset = (manifest.total_tensor_bytes + 15U) / 16U * 16U;
+        manifest.total_tensor_bytes = tensor.absolute_offset + tensor.byte_size;
+        const auto device = owner.allocate(bytes.size());
+        write(device, bytes);
+        const auto index = static_cast<std::uint32_t>(weights.size());
+        weights.push_back({device, std::move(bytes)});
+        manifest.tensors.push_back(std::move(tensor));
+        runtime.tensors.push_back({index, RuntimeTensorStorage::resident, device.address, device.bytes, 7U, 0U});
+    }
+    HipLaunchContext scope() const { HipLaunchContext result; result.stream = owner.stream; return result; }
+    void prepare(unsigned flavor) {
+        seed.assign(static_cast<std::size_t>(scratch.bytes), 0xa5);
+        constexpr std::array<std::uint16_t, 10> edge{0, 0x8000, 1, 0x8001, 0x007f, 0x807f, 0x0080, 0x4f00, 0xcf00, 0x3f80};
+        for (std::uint32_t r = 0; r < rows.size(); ++r) {
+            const auto source = flavor == 3U ? 0U : r;
+            std::vector<std::uint16_t> values(10240U);
+            for (std::size_t i = 0; i < values.size(); ++i) {
+                if (flavor == 1U) values[i] = edge[(i * 3U + source) % edge.size()];
+                else if (flavor == 2U) values[i] = bf16((i % 2U ? -1.0F : 1.0F) * std::ldexp(1.0F, static_cast<int>((i + source * 5U) % 41U) - 20));
+                else values[i] = bf16(static_cast<float>(static_cast<int>((i * 7U + source * 13U) % 37U) - 18) *
+                    (0.003F + static_cast<float>(source % 5U) * 0.002F));
+            }
+            const auto input = resolve_dispatch_read(rows[r], 0);
+            std::memcpy(seed.data() + (input.address - scratch.address), values.data(), values.size() * 2U);
+        }
+    }
+    void serial_rows() const { for (const auto& row : rows) selected.function(row, selected.user_data); }
+    void candidate_rows() const {
+        hyper_mix_known_window_rows_preflight(rows, config);
+        hyper_mix_known_window_rows_launch(rows, config);
+    }
+    std::vector<unsigned char> run(bool candidate) {
+        write(scratch, seed);
+        { const HipLaunchScope owned(scope()); if (candidate) candidate_rows(); else serial_rows(); }
+        owner.finish();
+        const auto result = read(scratch);
+        guards(scratch);
+        for (const auto& weight : weights) {
+            require(read(weight.device) == weight.original, "HC rows changed weights");
+            guards(weight.device);
+        }
+        auto unchanged = seed;
+        for (const auto& row : rows) {
+            std::vector<ExecutionBufferAddress> views{resolve_dispatch_write(row, 0), resolve_dispatch_temporary(row, 0)};
+            if (!final_mix) views.push_back(resolve_dispatch_write(row, 1));
+            for (const auto& view : views)
+                std::copy_n(result.begin() + static_cast<std::ptrdiff_t>(view.address - scratch.address),
+                    static_cast<std::size_t>(view.bytes), unchanged.begin() + static_cast<std::ptrdiff_t>(view.address - scratch.address));
+        }
+        require(result == unchanged, "HC rows modified a read-only input or interior canary");
+        return result;
+    }
+    std::vector<unsigned char> output(const std::vector<unsigned char>& arena, std::uint32_t r) const {
+        const auto view = resolve_dispatch_write(rows[r], 0);
+        const auto begin = arena.begin() + static_cast<std::ptrdiff_t>(view.address - scratch.address);
+        return {begin, begin + static_cast<std::ptrdiff_t>(view.bytes)};
+    }
+};
+
+void family_hyper_rows(SerialOp op, bool splitk, bool lane, std::uint32_t count) {
+    HyperFixture f(op, splitk, lane, count);
+    for (unsigned flavor = 0; flavor < 4U; ++flavor) {
+        f.prepare(flavor);
+        const auto serial = f.run(false);
+        const auto candidate = f.run(true);
+        require(candidate == serial, "HC rows output/injection/workspace differ bitwise from ascending R1 calls");
+        require(f.run(true) == candidate, "HC rows are not deterministic across repeats");
+        if (flavor == 0U) {
+            for (std::uint32_t r = 0; r < count; ++r) {
+                const auto bytes = f.output(candidate, r);
+                for (std::size_t offset = 0; offset < bytes.size(); offset += 2U) {
+                    std::uint16_t bits{}; std::memcpy(&bits, bytes.data() + offset, 2U);
+                    require((bits & 0x7f80U) != 0x7f80U, "finite HC fixture produced a nonfinite output");
+                }
+                if (r) require(bytes != f.output(candidate, 0U), "HC rows fixture is insensitive to the row input");
+            }
+        }
+        if (flavor == 3U)
+            for (std::uint32_t r = 1; r < count; ++r)
+                require(f.output(candidate, r) == f.output(candidate, 0U), "identical HC rows produce different bytes");
+    }
+    // Pure admission: every rejection precedes any enqueue.
+    f.prepare(0U); write(f.scratch, f.seed);
+    const auto reject = [&](auto&& work, const char* message) {
+        bool rejected = false;
+        { const HipLaunchScope owned(f.scope());
+          try { work(); } catch (const std::exception&) { rejected = true; } }
+        f.owner.finish();
+        require(rejected, message);
+        require(read(f.scratch) == f.seed, "rejected HC rows admission changed the arena");
+    };
+    reject([&] { hyper_mix_known_window_rows_preflight(std::span<const ExecutionDispatchContext>(f.rows.data(), 1U), f.config); },
+        "one-row HC rows entry was admitted");
+    auto other = f.config; other.lane_chain_output = !lane; other.prefetch_q8_output = true;
+    reject([&] { hyper_mix_known_window_rows_launch(f.rows, other); }, "HC rows accepted a different serial selection");
+    auto bad = f.rows; bad.back().arena = bad.front().arena;
+    reject([&] { hyper_mix_known_window_rows_launch(bad, f.config); }, "aliased HC row outputs were admitted");
+    bad = f.rows; bad.back().kernel_id = std::nullopt;
+    reject([&] { hyper_mix_known_window_rows_launch(bad, f.config); }, "HC row without serial id was admitted");
+    bad = f.rows; bad.back().resources = nullptr;
+    reject([&] { hyper_mix_known_window_rows_launch(bad, f.config); }, "late HC row without resources was admitted");
+    auto fp64 = f.config; fp64.splitk_projection = true; fp64.splitk_projection_fp64 = true;
+    reject([&] { hyper_mix_known_window_rows_preflight(f.rows, fp64); }, "FP64 HC oracle was admitted as a window entry");
+}
+
+// Median of warm hipEvent timings; MALL flushed before each sample when cold.
+void bench_hyper_rows(bool splitk, bool lane, std::uint32_t count, bool cold) {
+    HyperFixture f(SerialOp::attn_hyper_mix, splitk, lane, count);
+    f.prepare(0U); write(f.scratch, f.seed);
+    const auto flush = cold ? f.owner.allocate(96ULL << 20U) : Span{};
+    hipEvent_t start{}, stop{};
+    check(hipEventCreate(&start), "create HC bench event"); check(hipEventCreate(&stop), "create HC bench event");
+    const auto measure = [&](bool candidate) {
+        std::vector<float> samples;
+        const HipLaunchScope owned(f.scope());
+        for (unsigned i = 0; i < 28U; ++i) {
+            if (cold) check(hipMemsetAsync(reinterpret_cast<void*>(flush.address), static_cast<int>(i), flush.bytes, f.owner.stream), "flush MALL");
+            check(hipEventRecord(start, f.owner.stream), "record HC bench start");
+            if (candidate) hyper_mix_known_window_rows_launch(f.rows, f.config); else f.serial_rows();
+            check(hipEventRecord(stop, f.owner.stream), "record HC bench stop");
+            check(hipEventSynchronize(stop), "complete HC bench sample");
+            float ms = 0.0F; check(hipEventElapsedTime(&ms, start, stop), "HC bench elapsed");
+            if (i >= 3U) samples.push_back(ms * 1000.0F);
+        }
+        std::sort(samples.begin(), samples.end());
+        return samples[samples.size() / 2U];
+    };
+    const auto serial = measure(false), rows = measure(true);
+    f.owner.finish();
+    (void)hipEventDestroy(start); (void)hipEventDestroy(stop);
+    std::cout << "hc-rows-bench projection=" << (splitk ? "splitk-f32" : "batched-v8") << " output=" << (lane ? "lane-chain" : "q8-batched")
+        << " T=" << count << (cold ? " cold" : " warm") << " serial_us=" << serial << " rows_us=" << rows
+        << " speedup=" << serial / rows << '\n';
+}
+// Terminal head over real window row views: the configured prefetch R1 head
+// per row is the oracle; device greedy rows land in host-mapped memory.
+void family_lm_head_rows(std::uint32_t rows) {
+    Owner owner;
+    const auto model = ModelContract::qwen38_flash_next();
+    const auto plan = build_serial_decode_execution_plan(model);
+    const auto io = build_serial_execution_io_plan(plan);
+    const auto step = plan.steps.back();
+    require(step.op == SerialOp::lm_head, "canonical plan ends in its LM head");
+    constexpr std::uint32_t hidden = 2560U, vocab = 4099U;
+    const auto& step_io = io.steps[step.id];
+    ExecutionArenaPlan serial; serial.alignment = 256U;
+    serial.allocations.push_back({step_io.reads[0], step.id, step.id, 0, hidden * 2U});
+    serial.allocations.push_back({step_io.writes[0], step.id, step.id, 5120U, vocab * 4U + 64U});
+    serial.total_bytes = (5120U + vocab * 4U + 64U + 255U) / 256U * 256U;
+    serial.naive_nonaliased_bytes = serial.total_bytes;
+    const auto window = build_known_window_arena(serial, 256U, rows);
+    const auto scratch = owner.allocate(window.physical.total_bytes);
+    const ExecutionMemoryBinding memory{0x4b4e4f574e4c4d01ULL, scratch.address, scratch.bytes, 23U};
+    const auto weights = q8(hidden, vocab, 5U);
+    const auto device_weights = owner.allocate(weights.size());
+    write(device_weights, weights);
+    ModelManifest manifest; manifest.architecture = "qwen4_exp";
+    ManifestTensor tensor; tensor.name = "output.weight"; tensor.role = TensorRole::output_head;
+    tensor.dimensions = {hidden, vocab}; tensor.ggml_type = 8U; tensor.byte_size = weights.size();
+    manifest.tensors.push_back(tensor); manifest.total_tensor_bytes = tensor.byte_size;
+    manifest.layout_identity = model_manifest_layout_identity(manifest);
+    ModelRuntimeBinding runtime; runtime.manifest_layout_identity = manifest.layout_identity;
+    runtime.model_content_identity.bytes[0] = 1U;
+    runtime.tensors.push_back({0, RuntimeTensorStorage::resident, device_weights.address, device_weights.bytes, 1, 0});
+    ExecutionTensorAccessPlan access; access.manifest_layout_identity = manifest.layout_identity;
+    access.plan_identity = 0x4b4e4f574e4c4d02ULL; access.accesses.push_back({step.id, SerialOp::lm_head, 0, {0}});
+    const ExecutionRuntimeResources resources{&memory, &manifest, &runtime, &access};
+    HipLmHeadLauncherConfig config{hidden, vocab, HipActivationStorage::bf16, true, true, true};
+    const std::string id = "hip.lm_head.bf16.h2560.v4099.r1.c1.prefetch8-wave8-v1.virtual256.q8";
+    std::vector<ExecutionDispatchContext> contexts(rows);
+    std::vector<ExecutionBufferAddress> logits(rows);
+    for (std::uint32_t r = 0; r < rows; ++r) {
+        auto& c = contexts[r];
+        c.execution_identity = memory.execution_identity; c.step_id = step.id; c.op = step.op; c.kernel_id = id;
+        c.reads = step_io.reads; c.writes = step_io.writes; c.arena = &window.row_view[r]; c.memory = &memory;
+        c.resources = &resources; c.position = r;
+        const auto in = resolve_dispatch_read(c, 0);
+        std::vector<std::uint16_t> bits(hidden);
+        for (std::uint32_t i = 0; i < hidden; ++i)
+            bits[i] = bf16(static_cast<float>(static_cast<int>((i * (2U * r + 5U)) % 23U) - 11) / 17.0F);
+        write({in.address, hidden * 2U}, bytes_of(bits));
+        logits[r] = resolve_dispatch_write(c, 0);
+    }
+    HipLaunchContext scope; scope.stream = owner.stream;
+    const auto launcher = make_hip_lm_head_launcher(id, &config);
+    const auto run = [&](bool candidate) {
+        for (const auto& l : logits) check(hipMemset(reinterpret_cast<void*>(l.address), 0xff, l.bytes), "poison head rows");
+        {
+            const HipLaunchScope owned(scope);
+            if (candidate) { lm_head_known_window_rows_preflight(contexts, config); lm_head_known_window_rows_launch(contexts, config); }
+            else for (const auto& c : contexts) launcher.function(c, launcher.user_data);
+        }
+        owner.finish();
+        std::vector<std::vector<unsigned char>> out;
+        for (const auto& l : logits) out.push_back(read({l.address, l.bytes}));
+        return out;
+    };
+    const auto reference = run(false);
+    require(run(true) == reference && run(true) == reference, "window head rows differ from R1 head bytes or tails");
+    require(window.row_stride[1] != 0U, "window head rows use striped row views");
+    check(hipStreamBeginCapture(owner.stream, hipStreamCaptureModeThreadLocal), "begin head rows capture");
+    bool rejected = false;
+    { const HipLaunchScope owned(scope);
+      try { lm_head_known_window_rows_launch(contexts, config); } catch (const std::invalid_argument&) { rejected = true; } }
+    hipGraph_t graph{};
+    check(hipStreamEndCapture(owner.stream, &graph), "end head rows capture");
+    owner.graphs.push_back(graph);
+    std::size_t nodes = 0;
+    check(hipGraphGetNodes(graph, nullptr, &nodes), "count head rows capture nodes");
+    require(rejected && nodes == 0U, "eager-only head rows reject stream capture before any enqueue");
+    const auto partials = owner.allocate(hip_greedy_rows_scratch_bytes(rows, vocab));
+    HipGreedyRowsReply* replies = nullptr;
+    check(hipHostMalloc(reinterpret_cast<void**>(&replies), rows * sizeof(*replies), hipHostMallocMapped | hipHostMallocCoherent),
+        "allocate mapped head replies");
+    std::fill(replies, replies + rows, HipGreedyRowsReply{~0U, ~0U});
+    {
+        const HipLaunchScope owned(scope);
+        lm_head_known_window_rows_launch(contexts, config);
+        ExecutionBufferAddress p; p.address = partials.address; p.bytes = partials.bytes; p.allocation_generation = 1;
+        enqueue_hip_greedy_rows(logits, vocab, p, replies, owner.stream);
+    }
+    owner.finish();
+    for (std::uint32_t r = 0; r < rows; ++r) {
+        std::vector<float> values(vocab);
+        std::memcpy(values.data(), reference[r].data(), vocab * 4U);
+        std::uint32_t best = 0;
+        for (std::uint32_t i = 1; i < vocab; ++i) if (values[i] > values[best]) best = i;
+        require(replies[r].token == best && replies[r].status == 0U, "mapped greedy row differs from first-max R1 logits");
+    }
+    check(hipHostFree(replies), "free mapped head replies");
+}
+// Router/combine/inject rows on the real parallel-router serial arena: every
+// row of one rows launch must equal T serial launches byte for byte across the
+// complete window arena (outputs, router logits workspace, untouched bytes).
+struct RowsStepFixture {
+    Owner owner;
+    ModelContract model = ModelContract::qwen38_flash_next();
+    SerialExecutionPlan execution = build_serial_decode_execution_plan(model);
+    SerialExecutionIoPlan io = build_serial_execution_io_plan(execution, true);
+    ExecutionArenaPlan serial;
+    KnownWindowArena window;
+    Span scratch, router;
+    ExecutionMemoryBinding memory;
+    ModelManifest manifest;
+    ModelRuntimeBinding runtime;
+    ExecutionTensorAccessPlan access;
+    std::shared_ptr<const WaveRouterManifestAdmission> admission;
+    ExecutionRuntimeResources resources;
+    HipElementwiseLauncherConfig elementwise{2560U, 4U, HipActivationStorage::bf16};
+    std::vector<unsigned char> seed;
+    const std::uint32_t rows;
+    explicit RowsStepFixture(std::uint32_t row_count, std::uint32_t router_type = 0U) : rows(row_count) {
+        ExecutionBufferRequest request; request.parallel_moe_router = true;
+        serial = build_serial_execution_arena_plan(model, request, execution, io, 256U);
+        window = build_known_window_arena(serial, 256U, rows);
+        scratch = owner.allocate(window.physical.total_bytes);
+        memory = {0x4b4e4f574e523301ULL + rows, scratch.address, scratch.bytes, 31U};
+        manifest.architecture = "qwen4_exp";
+        const auto route = step(SerialOp::moe_route, 0U);
+        ManifestTensor tensor;
+        tensor.name = "blk.0.ffn_gate_inp.weight"; tensor.role = TensorRole::moe_router; tensor.layer = 0U;
+        tensor.ggml_type = router_type; tensor.dimensions = {2560U, 512U};
+        std::vector<unsigned char> bytes;
+        if (router_type == 8U) bytes = q8(2560U, 512U, 9U);
+        else {
+            // Experts 7/300 and 11/12 are identical: exact logit ties exercise index order.
+            std::vector<float> values(2560U * 512U);
+            for (std::size_t i = 0; i < values.size(); ++i) {
+                const auto expert = i / 2560U, feature = i % 2560U;
+                const auto source = expert == 300U ? 7U : expert == 12U ? 11U : expert;
+                values[i] = 0.0007F * static_cast<float>(static_cast<int>((feature * 13U + source * 29U) % 61U) - 30) *
+                    (1.0F + 0.01F * static_cast<float>(source % 17U));
+            }
+            if (router_type == 30U) {
+                std::vector<std::uint16_t> half(values.size());
+                for (std::size_t i = 0; i < values.size(); ++i) half[i] = bf16(values[i]);
+                bytes = bytes_of(half);
+            } else bytes = bytes_of(values);
+        }
+        tensor.byte_size = bytes.size();
+        router = owner.allocate(bytes.size()); write(router, bytes);
+        manifest.total_tensor_bytes = tensor.byte_size;
+        manifest.tensors.push_back(tensor);
+        manifest.layout_identity = model_manifest_layout_identity(manifest);
+        runtime.manifest_layout_identity = manifest.layout_identity;
+        runtime.model_content_identity.bytes[0] = 1U;
+        runtime.tensors.push_back({0U, RuntimeTensorStorage::resident, router.address, router.bytes, 7U, 0U});
+        access.manifest_layout_identity = manifest.layout_identity;
+        access.plan_identity = 0x4b4e4f574e523302ULL;
+        access.accesses.push_back({route.id, route.op, 0U, {0U}});
+        admission = WaveRouterManifestAdmission::create(manifest);
+        resources = {&memory, &admission->manifest(), &runtime, &access};
+        // Finite moderate BF16 everywhere (so every FP32 view is finite too),
+        // plus signed zeros, subnormals, infinities and NaNs at fixed strides.
+        seed.resize(static_cast<std::size_t>(scratch.bytes));
+        constexpr std::array<std::uint16_t, 8> edge{0x0000, 0x8000, 0x0001, 0x8001, 0x7f80, 0xff80, 0x7fc1, 0xffc3};
+        std::uint32_t state = 0x9e3779b9U ^ rows;
+        for (std::size_t i = 0; i + 1U < seed.size(); i += 2U) {
+            state = state * 1664525U + 1013904223U;
+            auto value = bf16(static_cast<float>(static_cast<int>(state >> 20U) - 2048) * 0.00061F);
+            if (i % 4093U == 0U) value = edge[(i / 4093U) % edge.size()];
+            std::memcpy(seed.data() + i, &value, sizeof(value));
+        }
+    }
+    const ExecutionStep& step(SerialOp op, std::uint32_t layer) const {
+        const auto found = std::find_if(execution.steps.begin(), execution.steps.end(),
+            [&](const auto& value) { return value.op == op && value.layer == layer; });
+        require(found != execution.steps.end(), "rows fixture operator missing");
+        return *found;
+    }
+    std::vector<ExecutionDispatchContext> contexts(const ExecutionStep& s, std::string_view id) const {
+        std::vector<ExecutionDispatchContext> out(rows);
+        for (std::uint32_t r = 0; r < rows; ++r) {
+            auto& c = out[r];
+            c.execution_identity = memory.execution_identity; c.step_id = s.id; c.op = s.op; c.layer = s.layer;
+            c.kernel_id = id; c.reads = io.steps[s.id].reads; c.writes = io.steps[s.id].writes;
+            c.temporaries = io.steps[s.id].temporaries; c.arena = &window.row_view[r]; c.memory = &memory;
+            c.resources = &resources; c.reads_state = s.reads_state; c.writes_state = s.writes_state;
+            c.position = 5U + r; c.input_token_id = 40U + r;
+        }
+        return out;
+    }
+    HipLaunchContext scope() const { HipLaunchContext result; result.stream = owner.stream; return result; }
+    template <class Work> std::vector<unsigned char> run(Work&& work, const std::vector<unsigned char>& input) {
+        write(scratch, input);
+        { const HipLaunchScope owned(scope()); work(); }
+        owner.finish();
+        guards(scratch); guards(router);
+        return read(scratch);
+    }
+};
+HipMoeRouteLauncherConfig router_config(const RowsStepFixture& f, bool staged, bool ranked, bool wave) {
+    HipMoeRouteLauncherConfig config;
+    config.hidden_size = 2560U; config.expert_count = 512U; config.top_k = 10U;
+    config.normalize_selected = f.model.norm_topk_probability; config.parallel_projection = true;
+    config.staged_logits = staged; config.ranked_topk = ranked; config.wave_topk = wave;
+    if (wave) config.wave_manifest_admission = f.admission;
+    return config;
+}
+template <class Serial, class Rows>
+void rows_equal_serial(RowsStepFixture& f, std::span<const ExecutionDispatchContext> contexts,
+    Serial&& serial, Rows&& rows, const char* what) {
+    // Two different inputs: the seed and the seed rotated by one row stride.
+    for (unsigned variant = 0; variant < 2U; ++variant) {
+        auto input = f.seed;
+        if (variant) std::rotate(input.begin(), input.begin() + static_cast<std::ptrdiff_t>(f.window.row_stride.front()), input.end());
+        const auto reference = f.run([&] { for (const auto& c : contexts) serial(c); }, input);
+        require(reference != input, "rows fixture serial launches wrote nothing");
+        const auto candidate = f.run([&] { rows(contexts); }, input);
+        if (candidate != reference) throw std::runtime_error(std::string(what) + ": rows launch differs from serial row launches");
+        require(f.run([&] { rows(contexts); }, input) == candidate, "rows launch is not deterministic");
+    }
+}
+template <class Preflight> void rows_rejections(RowsStepFixture& f, const std::vector<ExecutionDispatchContext>& contexts,
+    Preflight&& preflight) {
+    const auto bad = [&](auto mutate) {
+        auto copy = contexts; mutate(copy);
+        invalid([&] { preflight(std::span<const ExecutionDispatchContext>(copy)); });
+    };
+    invalid([&] { preflight(std::span<const ExecutionDispatchContext>(contexts.data(), 3U)); });
+    bad([](auto& c) { c.back().position += 1U; });
+    bad([](auto& c) { c.back().step_id += 1U; });
+    bad([](auto& c) { c.back().execution_identity ^= 1U; });
+    bad([](auto& c) { c.back().logical_rows = 2U; });
+    bad([](auto& c) { c.back().arena = c.front().arena; }); // cross-row output alias
+    bad([](auto& c) { c.back().kernel_id = "hip.other"; });
+    static_cast<void>(f);
+}
+void router_rows_family() {
+    for (const auto type : {0U, 30U, 8U}) for (const auto rows : {2U, 4U, 8U}) {
+        RowsStepFixture f(rows, type);
+        const auto& s = f.step(SerialOp::moe_route, 0U);
+        struct Mode { bool staged, ranked, wave; const char* name; };
+        for (const auto mode : {Mode{true, false, true, "staged+wave"}, Mode{false, false, true, "wave"},
+                                Mode{false, true, false, "ranked"}, Mode{false, false, false, "sorted"},
+                                Mode{true, false, false, "staged+sorted"}}) {
+            auto config = router_config(f, mode.staged, mode.ranked, mode.wave);
+            const auto launcher = make_hip_moe_route_launcher("hip.moe_route.test.parallel", &config);
+            const auto contexts = f.contexts(s, launcher.key);
+            rows_equal_serial(f, contexts, [&](const ExecutionDispatchContext& c) { launcher.function(c, launcher.user_data); },
+                [&](std::span<const ExecutionDispatchContext> c) {
+                    moe_route_known_window_rows_preflight(c, config); moe_route_known_window_rows_launch(c, config);
+                }, mode.name);
+            if (rows == 4U) rows_rejections(f, contexts, [&](std::span<const ExecutionDispatchContext> c) {
+                moe_route_known_window_rows_preflight(c, config); });
+        }
+        auto serial_only = router_config(f, false, false, false); serial_only.parallel_projection = false;
+        const auto contexts = f.contexts(s, "hip.moe_route.test");
+        invalid([&] { moe_route_known_window_rows_preflight(contexts, serial_only); });
+    }
+    std::cout << "router rows 2/4/8 x F32/BF16/Q8_0 x staged/wave/ranked/sorted equal serial bytes\n";
+}
+void elementwise_rows_family() {
+    for (const auto rows : {2U, 4U, 8U}) {
+        RowsStepFixture f(rows);
+        for (const auto op : {SerialOp::attn_inject, SerialOp::mlp_inject, SerialOp::moe_combine}) for (const auto layer : {0U, 47U}) {
+            const auto& s = f.step(op, layer);
+            const bool inject = op != SerialOp::moe_combine;
+            const auto launcher = inject ? make_hip_inject_launcher("hip.inject.test", &f.elementwise) :
+                make_hip_moe_combine_launcher("hip.moe_combine.test", &f.elementwise);
+            const auto contexts = f.contexts(s, launcher.key);
+            const auto preflight = [&](std::span<const ExecutionDispatchContext> c) {
+                if (inject) inject_known_window_rows_preflight(c, f.elementwise); else moe_combine_known_window_rows_preflight(c, f.elementwise);
+            };
+            rows_equal_serial(f, contexts, [&](const ExecutionDispatchContext& c) { launcher.function(c, launcher.user_data); },
+                [&](std::span<const ExecutionDispatchContext> c) {
+                    preflight(c);
+                    if (inject) inject_known_window_rows_launch(c, f.elementwise); else moe_combine_known_window_rows_launch(c, f.elementwise);
+                }, inject ? "inject" : "combine");
+            if (rows == 4U && layer == 0U) rows_rejections(f, contexts, preflight);
+        }
+    }
+    std::cout << "attn/mlp inject and MoE combine rows 2/4/8 equal serial bytes\n";
+}
+
+// hipEvent timing: median over 25 samples (after 5 warmups) of 20 back-to-back
+// repetitions, so the GPU stays clocked up as in decode. "cold" sweeps 96 MB
+// (read only: no dirty write-back inside the timed work) through the 32 MB
+// MALL before every repetition, as decode evicts each layer's router between
+// tokens, and subtracts the sweep-only median.
+__global__ void bench_sweep_kernel(const uint4* data, std::uint64_t count, unsigned* sink) {
+    unsigned accumulator = 0;
+    for (auto i = static_cast<std::uint64_t>(blockIdx.x) * 256U + threadIdx.x; i < count; i += 256ULL * gridDim.x) {
+        const auto v = data[i]; accumulator ^= v.x ^ v.y ^ v.z ^ v.w;
+    }
+    if (accumulator == 0x12345679U) *sink = accumulator;
+}
+template <class Work> float median_us(RowsStepFixture& f, Span flush, bool cold, Work&& work) {
+    hipEvent_t begin{}, end{};
+    check(hipEventCreate(&begin), "create bench event"); check(hipEventCreate(&end), "create bench event");
+    const auto measure = [&](bool with_work) {
+        std::vector<float> samples;
+        const HipLaunchScope owned(f.scope());
+        for (int i = 0; i < 30; ++i) {
+            check(hipEventRecord(begin, f.owner.stream), "record bench begin");
+            for (int repeat = 0; repeat < 20; ++repeat) {
+                if (cold) {
+                    hipLaunchKernelGGL(bench_sweep_kernel, dim3(640), dim3(256), 0, f.owner.stream,
+                        reinterpret_cast<const uint4*>(flush.address), flush.bytes / 16U, reinterpret_cast<unsigned*>(flush.address));
+                    check(hipGetLastError(), "sweep MALL");
+                }
+                if (with_work) work();
+            }
+            check(hipEventRecord(end, f.owner.stream), "record bench end");
+            check(hipEventSynchronize(end), "complete bench sample");
+            float ms = 0.0F; check(hipEventElapsedTime(&ms, begin, end), "bench elapsed");
+            if (i >= 5) samples.push_back(ms * 1000.0F / 20.0F);
+        }
+        std::sort(samples.begin(), samples.end());
+        return samples[samples.size() / 2U];
+    };
+    const auto result = measure(true) - (cold ? measure(false) : 0.0F);
+    check(hipEventDestroy(begin), "destroy bench event"); check(hipEventDestroy(end), "destroy bench event");
+    return result;
+}
+void rows_bench() {
+    for (const auto rows : {2U, 4U, 8U}) {
+        RowsStepFixture f(rows);
+        const auto flush = f.owner.allocate(96ULL << 20U);
+        write(f.scratch, f.seed);
+        auto config = router_config(f, true, false, true);
+        const auto launcher = make_hip_moe_route_launcher("hip.moe_route.test.parallel", &config);
+        const auto route = f.contexts(f.step(SerialOp::moe_route, 0U), launcher.key);
+        for (const bool cold : {false, true}) {
+            const auto serial = median_us(f, flush, cold, [&] { for (const auto& c : route) launcher.function(c, launcher.user_data); });
+            const auto multi = median_us(f, flush, cold, [&] { moe_route_known_window_rows_launch(route, config); });
+            std::cout << "bench router staged+wave T=" << rows << (cold ? " cold" : " warm") << ": " << rows << "x serial "
+                      << serial << " us, rows " << multi << " us\n";
+        }
+        for (const auto op : {SerialOp::attn_inject, SerialOp::moe_combine}) {
+            const bool inject = op == SerialOp::attn_inject;
+            const auto el = inject ? make_hip_inject_launcher("hip.inject.test", &f.elementwise) :
+                make_hip_moe_combine_launcher("hip.moe_combine.test", &f.elementwise);
+            const auto contexts = f.contexts(f.step(op, 0U), el.key);
+            const auto serial = median_us(f, flush, false, [&] { for (const auto& c : contexts) el.function(c, el.user_data); });
+            const auto multi = median_us(f, flush, false, [&] {
+                if (inject) inject_known_window_rows_launch(contexts, f.elementwise); else moe_combine_known_window_rows_launch(contexts, f.elementwise); });
+            std::cout << "bench " << (inject ? "inject" : "combine") << " T=" << rows << " warm: " << rows << "x serial "
+                      << serial << " us, rows " << multi << " us\n";
+        }
+    }
+}
 } // namespace
 
-int main() try {
+int main(int argc, char** argv) try {
+    if (std::getenv("STRIX_QSA_LONG_BENCH")) { bench_qsa_long_context(); return 0; }
+    if (argc > 1 && std::string_view(argv[1]) == "--rows-bench") { rows_bench(); return 0; }
+    router_rows_family();
+    elementwise_rows_family();
     family(false, false);
     family(false, true);
     family(true);
     family_gdn_f32_gates();
     for(auto rows:{16U,17U}) {family_prefill_tiles(false,rows);family_prefill_tiles(true,rows);}
-    std::cout << "known-window shared/GDN component fixtures passed\n";
+    std::uint32_t hc_cases = 0;
+    for (auto op : {SerialOp::attn_hyper_mix, SerialOp::mlp_hyper_mix, SerialOp::final_hyper_mix})
+        for (bool splitk : {false, true}) for (bool lane : {false, true}) for (std::uint32_t rows : {2U, 4U, 8U}) {
+            family_hyper_rows(op, splitk, lane, rows); ++hc_cases;
+        }
+    std::cout << "known-window HC rows bit-exact cases passed: " << hc_cases << '\n';
+    if (std::getenv("STRIX_HC_ROWS_BENCH"))
+        for (bool cold : {false, true}) for (bool splitk : {false, true}) for (bool lane : {false, true})
+            for (std::uint32_t rows : {2U, 4U, 8U}) bench_hyper_rows(splitk, lane, rows, cold);
+    qsa_rows_family(true, true, true); // real checkpoint formats
+    qsa_rows_family(true, true, false);
+    qsa_rows_family(false, false, true);
+    qsa_rows_family(false, false, false);
+    for(auto rows:{2U,4U,8U}) family_lm_head_rows(rows);
+    std::cout << "known-window shared/GDN/QSA/LM-head component fixtures passed\n";
     return 0;
 } catch (const std::exception& error) {
     std::cerr << "known-window component fixture failed: " << error.what() << '\n';

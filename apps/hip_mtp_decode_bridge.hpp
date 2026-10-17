@@ -122,9 +122,10 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
     const auto& m=options.mtp;const auto& r=parents->resources;const auto& actual=*parents->experiment;
     const auto width=mtp_cli_mul(model.hidden_size,model.hc_count);
     HipMtpForwardGolden golden;
-    if((m.metadata_only && (qualify || component_diagnostic)) || (qualify && component_diagnostic))
-        throw std::invalid_argument("MTP metadata, full fixture and component diagnostic routes are mutually exclusive");
-    if(!m.metadata_only){
+    const bool dump=!m.golden_dump.empty();
+    if(((m.metadata_only || dump) && (qualify || component_diagnostic)) || (qualify && component_diagnostic))
+        throw std::invalid_argument("MTP metadata, golden dump, full fixture and component diagnostic routes are mutually exclusive");
+    if(!m.metadata_only && !dump){
     golden=read_mtp_forward_golden_file(m.golden,mtp_cli_digest(m.golden_sha256),m.golden_max_bytes);
     if(golden.rows.size()+1U!=options.tokens.size())
         throw std::invalid_argument("MTP golden must cover every prompt predictor pair, leaving only its final pending target row");
@@ -169,11 +170,11 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
     }
     MtpForwardReplayPolicy policy{m.policy_identity,m.max_hidden_error,m.max_logit_error,2U,true};
     (void)assess_mtp_forward_replay(policy,{});
-    if(golden.target_content!=assets->shared_target().target_model_content_identity ||
+    if(!dump && (golden.target_content!=assets->shared_target().target_model_content_identity ||
        golden.sidecar_content!=assets->shared_target().sidecar_model_content_identity ||
        golden.structural_plan_identity!=assets->compiled().plan_identity ||
        golden.semantic_identity!=assets->compiled().forward_semantics.contract_identity ||
-       golden.numerical_profile_identity!=runtime->numerical_profile_identity())
+       golden.numerical_profile_identity!=runtime->numerical_profile_identity()))
         throw std::invalid_argument("MTP golden does not bind actual verified assets, semantics and native cast profile");
     if(component_diagnostic){
         // Independent component inputs are admitted against these actual assets.
@@ -189,7 +190,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
     replay_payload=mtp_cli_add(replay_payload,mtp_cli_mul(golden.rows.size(),sizeof(HipMtpForwardReplayRowReceipt)+2U*sizeof(std::uint32_t)));
     replay_payload=mtp_cli_add(replay_payload,mtp_cli_mul(golden.rows.size(),mtp_cli_add(mtp_cli_mul(width,4U),mtp_cli_mul(model.vocab_size,4U))));
     replay_payload=mtp_cli_add(replay_payload,mtp_cli_mul(golden.rows.size()+1U,192U));
-    if(replay_payload>m.replay_host_bytes)throw std::invalid_argument("MTP complete independent replay exceeds host payload budget before target mutation");
+    if(!dump && replay_payload>m.replay_host_bytes)throw std::invalid_argument("MTP complete independent replay exceeds host payload budget before target mutation");
     HipMtpForwardReplayRequest replay_request{policy,hip_mtp_forward_golden_payload_identity(golden),golden.rows.size(),m.replay_host_bytes};
     const auto retained_rows=static_cast<std::uint32_t>(std::max<std::size_t>(options.tokens.size(),static_cast<std::size_t>(m.candidate_depth)+3U));
     HipMtpTargetDeferredConfig d1;
@@ -197,7 +198,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
     auto target=HipMtpTargetHidden::create(model,compiled,actual.memory,actual.model,actual.allocator,
         retained_rows,m.target_capture_bytes,d1);
     std::shared_ptr<HipMtpWindowVerifier> window;
-    if(m.window_rows) {
+    if(m.window_rows && !dump) {
         if(!make_window)throw std::invalid_argument("MTP requested target window has no actual prepared native factory");
         window=make_window(target);
         if(!window || window->target_owner()!=target || window->logical_rows()!=m.window_rows)
@@ -207,6 +208,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
     std::vector<HipMtpReplayRow> replay_rows;replay_rows.reserve(golden.rows.size());
     std::vector<std::uint32_t> generated;generated.reserve(static_cast<std::size_t>(options.generate_tokens));
     std::uint64_t cycles=0,proposed=0,accepted=0,target_rows=0,window_attempts=0,window_accepts=0,window_restores=0,r2_dispatches=0;
+    std::array<std::uint64_t,9> chosen_rows{};
     HipMtpTargetHiddenTicket pending;
     HipMtpNativeForwardReplayResult replay;
     QualifiedMtpDraftPlan qualified;ActivatedMtpDraftPlan activated;
@@ -217,6 +219,22 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
             auto current=target->execute_serial(session,r,dispatcher,options.tokens[i]);
             if(pending.valid())replay_rows.push_back({pending,options.tokens[i]});
             pending=std::move(current);
+        }
+        if(dump){
+            // Same native forward as replay, recorded instead of compared. The
+            // explicit self-generated pins keep it distinguishable from an
+            // independent reference; nothing is qualified or generated here.
+            golden=capture_hip_mtp_forward_golden(*runtime,replay_rows,mtp_self_generated_golden_source(),mtp_self_generated_golden_reference);
+            const auto sha=write_mtp_forward_golden_file(m.golden_dump,golden,m.golden_max_bytes);
+            assets->validate_assets_unchanged();
+            output<<"{\"mode\":\"mtp-self-generated-golden-dump\",\"mtp_reference_independence\":\"self-generated-native-forward-not-independent\","
+                <<"\"mtp_golden_path\":\""<<decode_receipt::escape_json_string(m.golden_dump)<<"\",\"mtp_golden_sha256\":\""<<model_content_identity_hex(sha)
+                <<"\",\"mtp_golden_rows\":"<<golden.rows.size()<<",\"mtp_golden_payload_sha256\":\""<<model_content_identity_hex(hip_mtp_forward_golden_payload_identity(golden))
+                <<"\",\"mtp_independent_source_content\":\""<<model_content_identity_hex(golden.independent_source_content)
+                <<"\",\"mtp_independent_reference_identity\":"<<golden.independent_reference_identity
+                <<",\"mtp_structural_plan_identity\":"<<golden.structural_plan_identity<<",\"mtp_semantic_identity\":"<<golden.semantic_identity
+                <<",\"mtp_native_arithmetic_profile_identity\":"<<golden.numerical_profile_identity<<"}\n";
+            return;
         }
         // This call executes all eleven native stages for every independent
         // reference pair. The resulting real observation is the sole evidence.
@@ -244,8 +262,16 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
         if(runtime->next_source_position()+1U!=session.next_position)
             throw std::logic_error("MTP replay did not prime the actual final prompt frontier");
         replay_rows.clear(); // release prompt snapshots before bounded cycles
+        if(m.draft_chain){
+            // Drafts only: the subset (or full) head changes acceptance, never target output.
+            HipMtpDraftHeadConfig draft;draft.full=m.draft_vocab.empty() && !m.draft_context_vocab;
+            if(!m.draft_vocab.empty())draft.base_tokens=HipMtpDraftHead::read_token_file(m.draft_vocab,static_cast<std::uint32_t>(model.vocab_size));
+            draft.context_capacity=m.draft_context_vocab;draft.q4=m.draft_q4;
+            runtime->enable_draft_chain(std::move(draft),m.draft_exact);runtime->observe_draft_context(options.tokens);
+        }
         HipMtpGreedyRuntime greedy(runtime,qualified,activated,target,session,r,dispatcher,parents);
         if(window && !qualify)greedy.use_window_verifier(window);
+        if(m.draft_chain)greedy.set_draft_min_probability(mtp_draft_min_probability(m));
         if(qualify){
             MtpDecodeQualificationContext context{options,parents,native,target,std::move(window),session,dispatcher,generations,greedy,*runtime,std::move(pending)};
             qualify(context);
@@ -265,13 +291,16 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
             pending=result.final_target;++cycles;proposed+=result.proposed_candidates;accepted+=result.accepted_candidates;
             target_rows+=result.consumed_target_rows;window_attempts+=result.attempted_target_window;window_accepts+=result.accepted_target_window;
             window_restores+=result.target_checkpoint_restored;r2_dispatches+=result.target_r2_dispatches;
+            ++chosen_rows[std::min<std::uint32_t>(result.target_window_rows,8U)];
         }
         const auto elapsed=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count();
         if(generated.back()==eos.front())stop="eos";
         assets->validate_assets_unchanged();
         const auto native_stats=runtime->execution_stats();
+        const auto draft_stats=runtime->draft_head()?runtime->draft_head()->stats():HipMtpDraftHeadStats{};
         std::optional<HipKnownPrefixUnionObservation> union_observation;
-        if(window)union_observation=window->window_owner()->latest_routed_union_observation();
+        if(window)for(const auto& owner:window->window_owners())
+            if(auto observed=owner->latest_routed_union_observation())union_observation=observed;
         if(m.window_expert_union && window_attempts &&
             (!parents->window_setup.union_source_steps || !union_observation))
             throw std::logic_error("MTP expert union completed no actual native group for an attempted window");
@@ -297,7 +326,8 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
             <<"  \"mtp_target_verification\":\""<<mtp_target_verification_name(window_attempts)<<"\",\n"
             <<"  \"mtp_target_window_configured\":"<<(window?"true":"false")<<",\n"
             <<"  \"mtp_requested_target_window_rows\":"<<m.window_rows<<",\n"
-            <<"  \"mtp_reference_independence\":\"externally-supplied-provenance-pinned-not-inferred-from-digest\",\n"
+            <<"  \"mtp_reference_independence\":\""<<(golden.independent_source_content==mtp_self_generated_golden_source()?
+                "self-generated-native-forward-not-independent":"externally-supplied-provenance-pinned-not-inferred-from-digest")<<"\",\n"
             <<"  \"mtp_golden_file_sha256\":\""<<model_content_identity_hex(mtp_cli_digest(m.golden_sha256))<<"\",\n"
             <<"  \"mtp_golden_payload_sha256\":\""<<model_content_identity_hex(replay.golden_payload)<<"\",\n"
             <<"  \"mtp_independent_source_content\":\""<<model_content_identity_hex(golden.independent_source_content)<<"\",\n"
@@ -342,6 +372,21 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
             <<"  \"mtp_target_r2_dispatches_scope\":\"actual-pair-entry-dispatches-only-excludes-wide-R4-R8\",\n"
             <<"  \"mtp_target_wide_dispatches\":null,\n"
             <<"  \"mtp_target_wide_dispatches_scope\":\"not-exposed-by-current-verifier-result-not-inferred-from-geometry\",\n"
+            <<"  \"mtp_target_window_rows_set\":[";
+        if(window){const auto stats=window->owner_stats();for(std::size_t s=1;s<stats.size();++s)output<<(s>1?",":"")<<stats[s].rows;}
+        output<<"],\n  \"mtp_spec_min_p\":"<<mtp_draft_min_probability(m)<<",\n"
+            <<"  \"mtp_chosen_window_rows_histogram\":{";
+        for(std::size_t t=0,first=1;t<chosen_rows.size();++t)if(chosen_rows[t]){output<<(first?"":",")<<"\""<<t<<"\":"<<chosen_rows[t];first=0;}
+        output<<"},\n  \"mtp_chosen_window_rows_scope\":\"verifier-choice-per-cycle-1-is-serial-target-steps\",\n"
+            <<"  \"mtp_window_owner_cycle_ms_ema\":{";
+        if(window){const auto stats=window->owner_stats();
+            for(std::size_t s=0;s<stats.size();++s)output<<(s?",":"")<<"\""<<stats[s].rows<<"\":{\"cycles\":"<<stats[s].cycles<<",\"ema_ms\":"<<stats[s].cycle_ms_ema<<"}";}
+        output<<"},\n"
+            <<"  \"mtp_draft_chain\":"<<(m.draft_chain?"true":"false")<<",\n"
+            <<"  \"mtp_draft_exact_kernels\":"<<(m.draft_exact?"true":"false")<<",\n"
+            <<"  \"mtp_draft_q4_head\":"<<(m.draft_q4?"true":"false")<<",\n"
+            <<"  \"mtp_draft_head_rows\":"<<draft_stats.rows<<",\n  \"mtp_draft_base_rows\":"<<draft_stats.base_rows<<",\n"
+            <<"  \"mtp_draft_context_rows\":"<<draft_stats.context_rows<<",\n  \"mtp_draft_context_dropped\":"<<draft_stats.context_dropped<<",\n"
             <<"  \"mtp_generation_cycle_elapsed_ms\":"<<elapsed<<",\n"
             <<"  \"mtp_timing_scope\":\"post-prompt-and-independent-replay-cycles-only-host-completed-wall-not-GPU-kernel-time\",\n"
             <<"  \"prefix_tokens_consumed\":"<<options.tokens.size()<<",\n  \"final_position\":"<<session.next_position<<",\n"
