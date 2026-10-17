@@ -61,7 +61,7 @@ int run(const Options& options){
     // preflight/open/close. A build ID alone cannot prove gpu_direct selection.
     LinuxGpuQueue queue(open_linux_gpu_queue(o.device,preflight),GpuQueueExpected{bytes_uuid(o.local),bytes_uuid(o.peer),o.ring_frames,options.depth});
     AllocationGenerationSource generations;
-    auto allocator=std::make_shared<HipDirectGpuPoolAllocator>(device,HipDirectGpuPoolPolicy{true,128ULL*1024*1024,4096});
+    auto allocator=std::make_shared<HipDirectGpuPoolAllocator>(device,HipDirectGpuPoolPolicy{true,128ULL*1024*1024,4096,2ULL*1024*1024});
     const auto geometry=plan_multi_link_transport_pools(std::array{DirectFrameGeometry{4096,o.ring_frames,true}});
     auto exported=DirectGpuExportOwner::allocate_and_export(exporter,allocator,geometry,generations,device);auto lease=exported->retain_for_import();
     const auto binding=lease->binding();
