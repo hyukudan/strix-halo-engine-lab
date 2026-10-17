@@ -57,7 +57,58 @@ void gdn_known_window_rows_preflight(std::span<const ExecutionDispatchContext> r
 void gdn_known_window_rows_launch(std::span<const ExecutionDispatchContext> rows,
     const HipGdnLauncherConfig& config);
 
+// Deferred-commit GDN window: one GDN layer, T = 1..8 consecutive rows.
+// A window never commits its own rows. It first applies the `pending_rows`
+// accepted rows that the previous window saved in slot `pending_slot` to the
+// recurrent matrix and conv history (each read once, written once if any are
+// pending), then runs its T rows from that state in registers, producing each
+// row's output exactly as the serial R1 path would, and saves every row's
+// commit inputs (pre-conv BF16 qkv, normalized k, v, beta, gate) in the other
+// slot. The control word is device memory, so enqueues are graph-capturable.
+// After acceptance the caller stores {n_keep, pending_slot ^ 1}; the standalone
+// commit applies the pending rows and the caller then stores pending_rows = 0
+// before any serial GDN token. Every GDN layer of a round shares one control.
+inline constexpr std::uint32_t gdn_window_max_rows = 8;
+struct GdnWindowControl { std::uint32_t pending_rows = 0, pending_slot = 0; };
+struct GdnWindowLayer {
+    // Q8_0 qkv/z/out; beta/alpha both F32 or both Q8_0; conv/dt/a/norm F32/F16/BF16 (ggml types).
+    const void *qkv = nullptr, *z = nullptr, *beta = nullptr, *alpha = nullptr, *out = nullptr;
+    const void *conv = nullptr, *dt = nullptr, *a = nullptr, *norm = nullptr;
+    std::uint32_t gate_type = 0, conv_type = 0, dt_type = 0, a_type = 0, norm_type = 0;
+    float* matrix = nullptr;             // config.recurrent_storage order
+    std::uint16_t* conv_state = nullptr; // [conv channels][kernel] BF16 history
+    void* retained = nullptr;            // gdn_window_retained_bytes(): [2 slots][8 rows]
+};
+// `workspace` uses the R1 temporary layout: qkv | z | beta | gate | core (FP32).
+struct GdnWindowRow { const std::uint16_t* input = nullptr; std::uint16_t* output = nullptr; float* workspace = nullptr; };
+[[nodiscard]] std::uint64_t gdn_window_retained_row_bytes(const ModelContract& model);
+[[nodiscard]] std::uint64_t gdn_window_retained_bytes(const ModelContract& model);
+// Requires wave8 Q8 input and output projections, BF16 activations, kernel 4.
+// Any recurrent LDS layout (all share one reduction tree) and either storage.
+void gdn_window_enqueue(const GdnWindowLayer& layer, std::span<const GdnWindowRow> rows,
+    const GdnWindowControl* control, const HipGdnLauncherConfig& config, void* stream);
+// Applies the pending rows to matrix + conv history; a no-op when none are pending.
+void gdn_window_commit_enqueue(const GdnWindowLayer& layer, const GdnWindowControl* control,
+    const HipGdnLauncherConfig& config, void* stream);
+// Mode-table form: each context is one R1 GDN row of the same layer at
+// consecutive positions (R1 admission per row). Layer L uses the retained
+// block at GDN ordinal L - (L + 1) / full_attention_interval.
+struct HipGdnWindowConfig {
+    HipGdnLauncherConfig gdn;
+    void* retained = nullptr; // gdn_layers x gdn_window_retained_bytes(model)
+    std::uint64_t retained_bytes = 0;
+    const GdnWindowControl* control = nullptr;
+};
+void gdn_window_rows_preflight(std::span<const ExecutionDispatchContext> rows, const HipGdnWindowConfig& config);
+void gdn_window_rows_launch(std::span<const ExecutionDispatchContext> rows, const HipGdnWindowConfig& config);
+// Commit for the layer of `row` (any R1 GDN context of that layer) on the current stream.
+void gdn_window_commit_launch(const ExecutionDispatchContext& row, const HipGdnWindowConfig& config);
+
 #ifdef STRIX_BUILD_KNOWN_WINDOW_DIAGNOSTIC
+// Test-only incumbent R1 sequence (same kernels and dispatch as the serial
+// launcher, without graph validation) on the window's pointer views.
+void gdn_window_serial_row_probe(const GdnWindowLayer& layer, const GdnWindowRow& row,
+    const HipGdnLauncherConfig& config, void* stream);
 enum class GdnKnownWindowProjectionDirection { bf16_to_fp32, fp32_to_bf16 };
 enum class GdnKnownWindowProjectionMode { incumbent_row_loop, rows2 };
 enum class GdnKnownWindowFormat : std::uint32_t { q8_all5 = 2, q8_rows2_f32_gates = 3 };

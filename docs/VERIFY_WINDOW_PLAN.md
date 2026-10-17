@@ -38,10 +38,12 @@ so greedy acceptance is exact.
 3. QSA: append K/V and indexer keys for all T cells first; each row attends with n_kv = pos+1.
    No KV rollback (stale cells are overwritten later). Snapshot the indexer partial-block tail
    before the window; at commit restore it and re-append only the accepted keys.
-4. GDN: the window READS the recurrent + conv state, runs the T rows sequentially in registers and
-   writes outputs only; it saves per row pre-conv qkv, post-conv h, gate, beta (~23 MB total).
-   A commit step replays the first n_keep rows and writes state + conv history (one extra
-   read+write of the 113 MB state per round; no 113 MB-per-row snapshots, no checkpoint copy).
+4. GDN (implemented: `gdn_window_enqueue` / `gdn_window_commit_enqueue`): the window never commits
+   its own rows. It first applies the previous window's accepted rows (count and slot read from a
+   device `GdnWindowControl`) to the recurrent + conv state and writes it once, then runs its T rows
+   in registers from that state and saves per row pre-conv BF16 qkv, normalized k, v, beta, gate
+   (52.5 KiB/row/layer, two slots). The state is read once and written once per round; no
+   checkpoint copy. A standalone commit applies pending rows before a serial token.
 5. PLE history: per-row snapshot inside the window, commit selects row n_keep-1.
 6. Argmax for every row on the device into host-mapped memory; one stream sync per window;
    acceptance prefix computed on the host; commit launched async.
