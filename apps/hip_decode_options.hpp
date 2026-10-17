@@ -100,20 +100,38 @@ struct OptimizationProfileResolution {
 struct MtpCliOptions {
     bool enabled=false,supplied=false,metadata_only=false;
     std::string sidecar,sidecar_logical_name,sidecar_sha256,target_sha256,target_content,golden,golden_sha256;
+    // Developer route: write a SELF-generated (not independent) golden of the
+    // native forward over the prompt rows, then exit; never admits generation.
+    std::string golden_dump;
     std::string repository,revision,source_path,converter_sha256,norm_converter_sha256,converter_revision;
     std::string conversion,normalized_rounding,projection_rounding,sidecar_residency;
     std::uint64_t sidecar_bytes=0,header_bytes=0,sidecar_retained_bytes=0,sidecar_setup_bytes=0;
     std::uint64_t golden_max_bytes=0,replay_host_bytes=0,runtime_bytes=0,target_capture_bytes=0;
     std::uint64_t policy_identity=0;
     std::uint32_t candidate_depth=0,window_rows=0;
+    // Adaptive verifier: several prefix owners (window_rows is the largest) and the
+    // draft early-stop probability (negative = unset: 0.5 with a row set, else 0).
+    std::vector<std::uint32_t> window_rows_set;
+    double spec_min_p=-1.0;
     std::uint64_t window_arena_bytes=0,window_capture_bytes=0,window_checkpoint_bytes=0,window_total_bytes=0,window_history_intervals=0;
     double max_hidden_error=0.0,max_logit_error=0.0;
     bool window_expert_union=false;
     std::uint64_t window_expert_union_bytes=0;
     bool window_expert_union_bytes_explicit=false;
+    bool window_hyper_mix=false;
+    bool window_qsa_rows=false;
+    // Longest-accepted-prefix windows: deferred GDN commit + per-row PLE snapshots, no checkpoint.
+    bool window_prefix=false;
+    // Draft-only head/chain controls: they change acceptance, never target output.
+    bool draft_chain=false,draft_exact=false,draft_q4=false;
+    std::string draft_vocab;
+    std::uint32_t draft_context_vocab=0;
 };
 // This is execution evidence: a configured owner alone is not an attempted
 // native window (EOS, remaining budget/context and history can choose serial).
+inline float mtp_draft_min_probability(const MtpCliOptions& m) noexcept {
+    return static_cast<float>(m.spec_min_p>=0.0?m.spec_min_p:(m.window_rows_set.empty()?0.0:0.5));
+}
 inline std::string_view mtp_target_verification_name(std::uint64_t attempted_windows) noexcept {
     return attempted_windows ? "closed-known-window-attempted-with-serial-fallback" : "serial-target-fallback";
 }
@@ -222,6 +240,8 @@ struct Options {
     bool teacher_forced_score = false;
     std::string teacher_logits_path;
     bool known_prefix_expert_union = false;
+    // Router + combine/inject rows entries in the known-prefix or MTP window.
+    bool known_window_router_rows = false;
     std::string offline_tuning_cache_path;
     std::string offline_compile_provenance_path;
     strix::KnownWindowOutputPolicy known_prefix_output_policy = strix::KnownWindowOutputPolicy::all_rows;
@@ -363,7 +383,9 @@ inline void validate_numerical_profile_cli(const Options& options) {
     if (options.numerical_profile == DecodeNumericalProfile::exact_v5) return;
     if (options.execution.mode != DecodeExecutionMode::eager ||
         options.execution.integer_head != DecodeIntegerHead::none ||
-        options.mtp.enabled || options.mtp.supplied || options.known_prefix_window ||
+        // Prefix-accepting MTP windows reproduce each row's serial arithmetic (split-K HC rows are
+        // byte-exact), so they may run under an arithmetic profile.
+        ((options.mtp.enabled || options.mtp.supplied) && !options.mtp.window_prefix) || options.known_prefix_window ||
         options.known_prefix_rows_explicit || options.known_prefix_prefill_rows ||
         options.known_prefix_expert_union || options.prompt_lookup ||
         !options.serving_prefix_files.empty() || options.serving_concurrency != 1 ||
@@ -512,6 +534,8 @@ inline void validate_resolved_known_prefix_window(const Options& options) {
     if (!options.known_prefix_window) {
         if (options.known_prefix_expert_union)
             throw std::invalid_argument("known-prefix expert union requires --known-prefix-window");
+        if (options.known_window_router_rows && !options.mtp.window_rows)
+            throw std::invalid_argument("known-window router rows require --known-prefix-window or an MTP window");
         if (options.known_prefix_rows_explicit || options.known_prefix_rows != 2)
             throw std::invalid_argument("known-prefix rows require --known-prefix-window");
         return;
@@ -694,11 +718,14 @@ inline void validate_mtp_cli(const Options& o,bool resolved=false) {
        ((resolved || o.context_explicit) && (o.tokens.size()>o.context_tokens ||
         o.generate_tokens>o.context_tokens-o.tokens.size()+1U)))
         throw std::invalid_argument("MTP requires 3..4097 known prompt tokens, positive uint32 output budget and bounded target context");
-    if(m.metadata_only && (!m.golden.empty() || !m.golden_sha256.empty()))
+    if(m.metadata_only && (!m.golden.empty() || !m.golden_sha256.empty() || !m.golden_dump.empty()))
         throw std::invalid_argument("MTP metadata diagnostic does not accept unused golden options");
-    if(m.sidecar.empty() || m.sidecar_logical_name.empty() || (!m.metadata_only && m.golden.empty()) || m.repository.empty() || m.revision.empty() || m.source_path.empty() || m.converter_revision.empty() ||
+    if(!m.golden_dump.empty() && (!m.golden.empty() || !m.golden_sha256.empty()))
+        throw std::invalid_argument("MTP golden dump writes a golden and does not accept an input golden");
+    const bool needs_golden=!m.metadata_only && m.golden_dump.empty();
+    if(m.sidecar.empty() || m.sidecar_logical_name.empty() || (needs_golden && m.golden.empty()) || m.repository.empty() || m.revision.empty() || m.source_path.empty() || m.converter_revision.empty() ||
        !mtp_sha256_text(m.sidecar_sha256) || !mtp_sha256_text(m.target_sha256) || !mtp_sha256_text(m.target_content) ||
-       (!m.metadata_only && !mtp_sha256_text(m.golden_sha256)) || !mtp_sha256_text(m.converter_sha256) || !mtp_sha256_text(m.norm_converter_sha256))
+       (needs_golden && !mtp_sha256_text(m.golden_sha256)) || !mtp_sha256_text(m.converter_sha256) || !mtp_sha256_text(m.norm_converter_sha256))
         throw std::invalid_argument("MTP requires explicit local assets, full SHA256 pins and source/conversion provenance");
     if(m.conversion!="effective-norm-embedding-first-v1" ||
        (m.normalized_rounding!="fp32" && m.normalized_rounding!="bf16-rne") ||
@@ -710,6 +737,13 @@ inline void validate_mtp_cli(const Options& o,bool resolved=false) {
        m.candidate_depth<1U || m.candidate_depth>8U || !std::isfinite(m.max_hidden_error) || m.max_hidden_error<0.0 ||
        !std::isfinite(m.max_logit_error) || m.max_logit_error<0.0)
         throw std::invalid_argument("MTP requires positive explicit asset/replay/runtime/capture budgets, policy identity and depth1..8");
+    if(!m.window_rows_set.empty()) {
+        if(m.window_rows && m.window_rows!=m.window_rows_set.back())
+            throw std::invalid_argument("MTP target window rows must equal the largest row-set entry");
+        if(!m.window_prefix)throw std::invalid_argument("MTP window row sets require --mtp-window-prefix");
+    }
+    if(m.spec_min_p>=0.0 && (!(m.spec_min_p<=1.0) || !m.draft_chain))
+        throw std::invalid_argument("MTP draft minimum probability requires --mtp-draft-chain and a value in [0, 1]");
     const bool any_window=m.window_rows || m.window_arena_bytes || m.window_capture_bytes || m.window_checkpoint_bytes || m.window_total_bytes || m.window_history_intervals;
     if(any_window && ((m.window_rows!=2U && m.window_rows!=4U && m.window_rows!=8U) || !m.window_arena_bytes ||
        !m.window_capture_bytes || !m.window_checkpoint_bytes || !m.window_total_bytes || !m.window_history_intervals))
@@ -719,6 +753,14 @@ inline void validate_mtp_cli(const Options& o,bool resolved=false) {
         !m.window_rows || m.metadata_only || m.window_expert_union_bytes>m.window_arena_bytes ||
         m.window_expert_union_bytes>m.window_total_bytes))
         throw std::invalid_argument("MTP window expert union requires an actual target window and a positive explicit budget within arena and total window budgets");
+    if(m.window_hyper_mix && (!m.window_rows || m.metadata_only))
+        throw std::invalid_argument("MTP window HC rows require an actual target window");
+    if((m.window_qsa_rows || m.window_prefix) && (!m.window_rows || m.metadata_only))
+        throw std::invalid_argument("MTP window QSA rows and prefix acceptance require an actual target window");
+    if((!m.draft_vocab.empty() || m.draft_context_vocab || m.draft_exact || m.draft_q4) && !m.draft_chain)
+        throw std::invalid_argument("MTP draft vocabulary options require --mtp-draft-chain");
+    if(m.draft_q4 && m.draft_vocab.empty() && !m.draft_context_vocab)
+        throw std::invalid_argument("MTP draft Q4 head requires a draft vocabulary subset");
     if(m.window_rows && m.candidate_depth<m.window_rows-1U)
         throw std::invalid_argument("MTP target window requires candidate depth at least rows minus one");
     if(m.window_rows && (o.gdn_recurrent_layout!=HipGdnRecurrentLayout::baseline || o.gdn_recurrent_storage!=GdnRecurrentStorage::key_value ||
@@ -741,11 +783,11 @@ inline Options parse_options(
     if (argc < 2) {
         throw std::invalid_argument(
             "usage: strix-hip-decode-token MODEL.gguf [TOKEN_ID ...] "
-            "[--mtp --mtp-sidecar FILE --mtp-sidecar-sha256 HEX --mtp-golden FILE --mtp-golden-sha256 HEX [--mtp-window-expert-union --mtp-window-expert-union-bytes N] (explicit source/conversion/cast/budget options required)] "
+            "[--mtp --mtp-sidecar FILE --mtp-sidecar-sha256 HEX (--mtp-golden FILE --mtp-golden-sha256 HEX | --mtp-golden-dump FILE) [--mtp-window-expert-union --mtp-window-expert-union-bytes N] [--mtp-window-hyper-mix] [--mtp-window-qsa-rows] [--mtp-window-prefix] [--mtp-draft-chain [--mtp-draft-vocab FILE[,FILE...]] [--mtp-draft-context-vocab N] [--mtp-draft-exact] [--mtp-draft-q4]] (explicit source/conversion/cast/budget options required)] "
             "[--optimization-profile auto|manual] [--execution-inventory] [--host-dispatch-telemetry] [--execution-telemetry-trace] [--device-queue-trace] "
             "[--numerical-profile exact-v5|hc-splitk-f32-v1|q51-a8-down-v1|hc-splitk-f32+q51-a8-down-v1|q51-q80-a8-down-v1|hc-splitk-f32+q51-q80-a8-down-v1|hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup-v1|hc-deferred-norm-f32+q51-q80-a8-down-v1|hc-deferred-norm-f32+q51-q80-a8-down+q5k-a8-gateup-v1] "
             "[--teacher-forced-score --generate 1 [--teacher-logits-file PATH]] "
-            "[--gpu-greedy-token] [--logprob-token ID ...] [--offline-tuning-cache FILE [--offline-compile-provenance FILE]] [--gdn-recurrent-layout baseline|stride32|stride33|transposed] [--gdn-recurrent-storage key-value|value-key] [--known-prefix-window --known-prefix-rows 2|4|8 --known-prefix-expert-union] [--known-prefix-prefill-rows 16..2048 --known-prefix-workspace-budget-bytes N --known-prefix-host-metadata-budget-bytes N --known-prefix-uma-budget-bytes N --known-prefix-host-headroom-bytes N] [--prompt-lookup [--prompt-lookup-depth 0|1|2 | --prompt-lookup-adaptive] [--prompt-lookup-snapshot occupied-kv-v1 --prompt-lookup-snapshot-bytes N]] [--serve-prefix-u32le FILE ... --serve-concurrency 1|2|4 [--serve-tensor-cohort-rows 2|4 | --serve-prefill-rows 2|4|8|16..2048 --serve-prefill-workspace-budget-bytes N --serve-prefill-host-metadata-budget-bytes N] --serve-memory-budget-bytes N --serve-request-budget-bytes N --serve-headroom-bytes N] [--gdn-islands] [--qsa-hierarchical-selection] [--qsa-gqa-heads-per-block 1|2|4] [--prepared-eager] [--moe-shared-overlap [--moe-token-cost-policy]] [--moe-overlap-arena-budget-bytes N] [--batched-moe-activation] [--validation-final-state DIR] [--validation-final-state-max-bytes N] [--reference FILE] [--max-logit-error X] "
+            "[--gpu-greedy-token] [--logprob-token ID ...] [--offline-tuning-cache FILE [--offline-compile-provenance FILE]] [--gdn-recurrent-layout baseline|stride32|stride33|transposed] [--gdn-recurrent-storage key-value|value-key] [--known-prefix-window --known-prefix-rows 2|4|8 --known-prefix-expert-union] [--known-window-router-rows] [--known-prefix-prefill-rows 16..2048 --known-prefix-workspace-budget-bytes N --known-prefix-host-metadata-budget-bytes N --known-prefix-uma-budget-bytes N --known-prefix-host-headroom-bytes N] [--prompt-lookup [--prompt-lookup-depth 0|1|2 | --prompt-lookup-adaptive] [--prompt-lookup-snapshot occupied-kv-v1 --prompt-lookup-snapshot-bytes N]] [--serve-prefix-u32le FILE ... --serve-concurrency 1|2|4 [--serve-tensor-cohort-rows 2|4 | --serve-prefill-rows 2|4|8|16..2048 --serve-prefill-workspace-budget-bytes N --serve-prefill-host-metadata-budget-bytes N] --serve-memory-budget-bytes N --serve-request-budget-bytes N --serve-headroom-bytes N] [--gdn-islands] [--qsa-hierarchical-selection] [--qsa-gqa-heads-per-block 1|2|4] [--prepared-eager] [--moe-shared-overlap [--moe-token-cost-policy]] [--moe-overlap-arena-budget-bytes N] [--batched-moe-activation] [--validation-final-state DIR] [--validation-final-state-max-bytes N] [--reference FILE] [--max-logit-error X] "
             "[--context N] [--residency register|copy] [--coalesce-gap BYTES] [--model-copy-tier none|normalization|hot_nonexpert|experts --model-copy-payload-bytes N --model-retained-budget N --model-setup-peak-budget N] "
             "[--planned-ple-io] [--ple-cpu-helper-threads 1..8] [--ple-cache-rows N --ple-cache-budget-bytes N] [--ple-max-rows-per-io N] [--ple-max-inflight-ios N] "
             "[--generate N] [--eos-token TOKEN_ID] [--prefix-cache-roundtrip] "
@@ -836,6 +878,31 @@ inline Options parse_options(
             if(!mtp_option_names.insert(std::string(argument)).second)throw std::invalid_argument("duplicate MTP option");
             options.mtp.supplied=true;options.mtp.window_expert_union=true;continue;
         }
+        if(argument=="--mtp-window-hyper-mix") {
+            if(!mtp_option_names.insert(std::string(argument)).second)throw std::invalid_argument("duplicate MTP option");
+            options.mtp.supplied=true;options.mtp.window_hyper_mix=true;continue;
+        }
+        if(argument=="--mtp-window-qsa-rows" || argument=="--mtp-window-prefix") {
+            if(!mtp_option_names.insert(std::string(argument)).second)throw std::invalid_argument("duplicate MTP option");
+            options.mtp.supplied=true;
+            (argument=="--mtp-window-prefix" ? options.mtp.window_prefix : options.mtp.window_qsa_rows)=true;continue;
+        }
+        if(argument=="--mtp-draft-chain") {
+            if(!mtp_option_names.insert(std::string(argument)).second)throw std::invalid_argument("duplicate MTP option");
+            options.mtp.supplied=true;options.mtp.draft_chain=true;continue;
+        }
+        if(argument=="--mtp-draft-q4") {
+            if(!mtp_option_names.insert(std::string(argument)).second)throw std::invalid_argument("duplicate MTP option");
+            options.mtp.supplied=true;options.mtp.draft_q4=true;continue;
+        }
+        if(argument=="--mtp-draft-exact") {
+            if(!mtp_option_names.insert(std::string(argument)).second)throw std::invalid_argument("duplicate MTP option");
+            options.mtp.supplied=true;options.mtp.draft_exact=true;continue;
+        }
+        if(argument.starts_with("--mtp-draft-exact="))
+            throw std::invalid_argument("MTP draft exact is a flag without a value");
+        if(argument.starts_with("--mtp-draft-chain="))
+            throw std::invalid_argument("MTP draft chain is a flag without a value");
         if(argument.starts_with("--mtp-window-expert-union="))
             throw std::invalid_argument("MTP window expert union is a flag without a value");
         if(argument.starts_with("--mtp-")) {
@@ -853,6 +920,7 @@ inline Options parse_options(
             else if(key=="--mtp-target-content")m.target_content=value;
             else if(key=="--mtp-golden")m.golden=value;
             else if(key=="--mtp-golden-sha256")m.golden_sha256=value;
+            else if(key=="--mtp-golden-dump")m.golden_dump=value;
             else if(key=="--mtp-source-repository")m.repository=value;
             else if(key=="--mtp-source-revision")m.revision=value;
             else if(key=="--mtp-source-path")m.source_path=value;
@@ -863,8 +931,20 @@ inline Options parse_options(
             else if(key=="--mtp-normalized-rounding")m.normalized_rounding=value;
             else if(key=="--mtp-projection-rounding")m.projection_rounding=value;
             else if(key=="--mtp-sidecar-residency")m.sidecar_residency=value;
+            else if(key=="--mtp-draft-vocab")m.draft_vocab=value;
             else if(key=="--mtp-max-hidden-error")m.max_hidden_error=parse_double(value,"MTP hidden policy");
             else if(key=="--mtp-max-logit-error")m.max_logit_error=parse_double(value,"MTP logit policy");
+            else if(key=="--mtp-spec-min-p")m.spec_min_p=parse_double(value,"MTP draft minimum probability");
+            else if(key=="--mtp-target-window-rows-set") {
+                for(std::size_t begin=0;begin<=value.size();) {
+                    const auto end=std::min(value.find(',',begin),value.size());
+                    const auto rows=parse_u64(value.substr(begin,end-begin),"MTP window row set");
+                    if((rows!=2U && rows!=4U && rows!=8U) || (!m.window_rows_set.empty() && rows<=m.window_rows_set.back()))
+                        throw std::invalid_argument("MTP window row set must list ascending distinct 2/4/8");
+                    m.window_rows_set.push_back(static_cast<std::uint32_t>(rows));begin=end+1U;
+                }
+                if(!m.window_rows)m.window_rows=m.window_rows_set.back();
+            }
             else {
                 const auto n=parse_u64(value,"MTP option");
                 if(key=="--mtp-metadata-only"){
@@ -886,6 +966,10 @@ inline Options parse_options(
                 else if(key=="--mtp-window-total-bytes")m.window_total_bytes=n;
                 else if(key=="--mtp-window-history-intervals")m.window_history_intervals=n;
                 else if(key=="--mtp-window-expert-union-bytes"){m.window_expert_union_bytes=n;m.window_expert_union_bytes_explicit=true;}
+                else if(key=="--mtp-draft-context-vocab"){
+                    if(!n || n>UINT32_MAX)throw std::invalid_argument("MTP draft context vocabulary cap must be 1..uint32");
+                    m.draft_context_vocab=static_cast<std::uint32_t>(n);
+                }
                 else if(key=="--mtp-candidate-depth" || key=="--mtp-target-window-rows") {
                     if(n>UINT32_MAX)throw std::invalid_argument("MTP depth/rows exceeds uint32");
                     if(key=="--mtp-candidate-depth")m.candidate_depth=static_cast<std::uint32_t>(n);else m.window_rows=static_cast<std::uint32_t>(n);
@@ -1103,6 +1187,11 @@ inline Options parse_options(
             if (rows != 2 && rows != 4 && rows != 8) throw std::invalid_argument("known-prefix rows must be 2, 4 or 8");
             options.known_prefix_rows = static_cast<std::uint32_t>(rows);
             options.known_prefix_rows_explicit = true;
+            continue;
+        }
+        if (argument == "--known-window-router-rows") {
+            if (options.known_window_router_rows) throw std::invalid_argument("duplicate known-window router rows option");
+            options.known_window_router_rows = true;
             continue;
         }
         if (argument == "--known-prefix-expert-union") {
@@ -1877,7 +1966,7 @@ inline void apply_numerical_profile(
         !options.wave8_q8_gdn_input || !options.wave8_q8_gdn_output || !options.prefetch_q8_qsa_input ||
         !options.prefetch_q8_shared_expert || !options.virtual_q8_lm_head || !options.prefetch_q8_lm_head ||
         !options.wave8_q8_lm_head || !options.wave8_q8_qsa_output ||
-        !options.prepared_eager || !options.gdn_islands || !options.moe_shared_overlap)
+        (!options.mtp.window_prefix && (!options.prepared_eager || !options.gdn_islands || !options.moe_shared_overlap)))
         throw std::invalid_argument("numerical profile requires the resolved full v5 organization without implicit flag changes");
     resolution.selected += "+" + std::string(numerical_profile_name(options.numerical_profile));
 }

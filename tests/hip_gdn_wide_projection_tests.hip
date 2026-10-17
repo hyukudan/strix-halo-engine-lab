@@ -174,8 +174,8 @@ struct Fixture {
         if (mutation == 11U) outer = 0U;
         if (mutation == 12U) stream = nullptr;
         if (mutation == 13U) x.back().address = 0;
-        if (mutation == 14U) { x.resize(2U); y.resize(2U); }
-        if (mutation == 15U) { x.resize(3U); y.resize(3U); }
+        if (mutation == 14U) { x.clear(); y.clear(); }
+        if (mutation == 15U) { x.resize(3U); y.resize(2U); }
         if (mutation == 16U) y.back().address += 2U;
         if (mutation == 17U) w.address += 2U;
         bool invalid = false;

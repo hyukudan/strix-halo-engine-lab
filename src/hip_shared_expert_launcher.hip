@@ -1,7 +1,9 @@
+#include "strix/hip_mtp_fast_draft.hpp"
 #include "strix/hip_mtp_shared_expert.hpp"
 #include "strix/hip_mtp_native_validation.hpp"
 #include "strix/hip_launch_context.hpp"
 #include "strix/hip_shared_expert_launcher.hpp"
+#include "hip_q8_rows_gemv.hpp"
 #include "strix/hip_shared_serving_cohort.hpp"
 #include "strix/shared_expert_rows_diagnostic_contract.hpp"
 #if defined(STRIX_BUILD_SHARED_EXPERT_ROWS_DIAGNOSTIC)
@@ -11,6 +13,7 @@
 #include "strix/dispatch_resources.hpp"
 #include "strix/prepared_tensor_views.hpp"
 
+#include <cstdlib>
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
@@ -521,6 +524,35 @@ __global__ void scalar_projection_kernel(
             (1.0F +
              expf(-scratch[0]));
     }
+}
+
+// Window rows: activation and F32 scalar gate of every row in one launch
+// (blockIdx.y = row). Block 0 of a row writes the scalar into up[0] only after
+// its own activation consumed up[0]; both keep the per-row kernels' arithmetic.
+__global__ void __launch_bounds__(kThreads) rows_shared_activation_scalar_kernel(
+    std::uint64_t workspace_base, std::uint64_t workspace_stride, std::uint64_t input_base,
+    std::uint64_t input_stride, const void* scalar_weights, std::uint32_t intermediate_size,
+    std::uint32_t input_width) {
+    __shared__ float scratch[kThreads];
+    auto* workspace = reinterpret_cast<float*>(workspace_base + blockIdx.y * workspace_stride);
+    const auto index = static_cast<std::uint32_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index < intermediate_size) {
+        const float gate = workspace[index];
+        const float up = workspace[intermediate_size + index];
+        workspace[index] = (gate / (1.0F + expf(-gate))) * up;
+    }
+    if (blockIdx.x != 0) return;
+    const auto* input = reinterpret_cast<const std::uint16_t*>(input_base + blockIdx.y * input_stride);
+    float sum = 0.0F;
+    for (std::uint32_t feature = static_cast<std::uint32_t>(threadIdx.x); feature < input_width; feature += kThreads)
+        sum += load_activation(&input[feature]) * load_weight<WeightKind::f32>(scalar_weights, input_width, 0, feature);
+    scratch[threadIdx.x] = sum;
+    __syncthreads();
+    for (std::uint32_t stride = kThreads / 2U; stride > 0; stride >>= 1U) {
+        if (threadIdx.x < stride) scratch[threadIdx.x] += scratch[threadIdx.x + stride];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) workspace[intermediate_size] = 1.0F / (1.0F + expf(-scratch[0]));
 }
 
 template <
@@ -1390,6 +1422,46 @@ __global__ void shared_rows_q8_projection_kernel(
         }
     }
 }
+// q8_rows sites of the prefetch8 virtual256 gate/up and down kernels: same C++
+// coefficient/FMA expressions, upper-src0 tree and gate-src0 down multiply.
+__device__ __forceinline__ float shared_rows_tree_add(float lower, float upper) {
+    float result;
+    asm("v_add_f32 %0, %1, %2" : "=v"(result) : "v"(upper), "v"(lower));
+    return result;
+}
+__device__ __forceinline__ float shared_rows_coefficient(unsigned scale, std::int8_t code) {
+    return __half2float(__ushort_as_half(static_cast<unsigned short>(scale))) * static_cast<float>(code);
+}
+// gate then up (two segments) into each row's contiguous FP32 workspace.
+template <unsigned Rows> struct SharedGateUpRowsSite {
+    using Input = std::uint16_t;
+    static constexpr unsigned rows = Rows;
+    const void* input[Rows];
+    q8_rows::Segments segments;
+    std::uint32_t width, outputs;
+    float* output[Rows];
+    __device__ static float coefficient(unsigned scale, std::int8_t code) { return shared_rows_coefficient(scale, code); }
+    __device__ static void fma(float& acc, float c, float x) { acc += x * c; }
+    __device__ static float add(float lower, float upper) { return shared_rows_tree_add(lower, upper); }
+    __device__ void store(std::uint32_t out, unsigned r, float value) const { output[r][out] = value; }
+};
+template <unsigned Rows> struct SharedDownRowsSite {
+    using Input = float;
+    static constexpr unsigned rows = Rows;
+    const void* input[Rows];
+    q8_rows::Segments segments;
+    std::uint32_t width, outputs;
+    const float* gate[Rows];
+    std::uint16_t* output[Rows];
+    __device__ static float coefficient(unsigned scale, std::int8_t code) { return shared_rows_coefficient(scale, code); }
+    __device__ static void fma(float& acc, float c, float x) { acc += x * c; }
+    __device__ static float add(float lower, float upper) { return shared_rows_tree_add(lower, upper); }
+    __device__ void store(std::uint32_t out, unsigned r, float value) const {
+        float gated;
+        asm("v_mul_f32 %0, %1, %2" : "=v"(gated) : "v"(*gate[r]), "v"(value));
+        store_activation(output[r] + out, gated);
+    }
+};
 } // namespace
 } // namespace strix
 
@@ -1655,34 +1727,53 @@ KnownSharedR2Views known_shared_r2_views(std::span<const ExecutionDispatchContex
         result.workspace, result.output, shared_expert_rows_diagnostic::Arm::shared_q8_rows);
     return result;
 }
-void known_shared_r2_projection(bool down, const KnownSharedR2Views& views,
-    KnownSharedSpan weight, KnownSharedSpan target, hipStream_t stream,
+// Rows of one stripe: gate+up (two segments) into the workspaces, then down with
+// each row's shared gate into the outputs.
+template <unsigned Rows>
+void known_shared_engine_projection(bool down, const KnownSharedR2Views& views, hipStream_t stream,
     const HipSharedExpertLauncherConfig& config) {
-    const auto& shape = views.shape;
+    const auto& s = views.shape;
+    const auto row = [](KnownSharedSpan span, std::uint64_t stride, unsigned r) { return span.address + r * stride; };
     if (down) {
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(shared_rows_q8_projection_kernel<2U, true>),
-            dim3((shape.hidden + 7U) / 8U), dim3(256), 0, stream,
-            reinterpret_cast<const void*>(views.workspace.address), shape.workspace_stride_bytes,
-            reinterpret_cast<const void*>(weight.address), shape.intermediate, shape.hidden,
-            reinterpret_cast<void*>(target.address), shape.output_stride_bytes,
-            reinterpret_cast<const float*>(views.workspace.address) + shape.intermediate,
-            shape.workspace_stride_bytes / 4U);
+        SharedDownRowsSite<Rows> site{};
+        site.segments = q8_rows::segments({{reinterpret_cast<const void*>(views.weights.down_q8.address), s.hidden}});
+        site.width = s.intermediate; site.outputs = s.hidden;
+        for (unsigned r = 0; r < Rows; ++r) {
+            const auto workspace = row(views.workspace, s.workspace_stride_bytes, r);
+            site.input[r] = reinterpret_cast<const void*>(workspace);
+            site.gate[r] = reinterpret_cast<const float*>(workspace) + s.intermediate;
+            site.output[r] = reinterpret_cast<std::uint16_t*>(row(views.output, s.output_stride_bytes, r));
+        }
+        q8_rows::launch(site, config.known_window_a8_projections, stream);
     } else {
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(shared_rows_q8_projection_kernel<2U, false>),
-            dim3((shape.intermediate + 7U) / 8U), dim3(256), 0, stream,
-            reinterpret_cast<const void*>(views.input.address), shape.input_stride_bytes,
-            reinterpret_cast<const void*>(weight.address), shape.hidden, shape.intermediate,
-            reinterpret_cast<void*>(target.address), shape.workspace_stride_bytes, nullptr, 0ULL);
+        SharedGateUpRowsSite<Rows> site{};
+        site.segments = q8_rows::segments({{reinterpret_cast<const void*>(views.weights.gate_q8.address), s.intermediate},
+            {reinterpret_cast<const void*>(views.weights.up_q8.address), s.intermediate}});
+        site.width = s.hidden; site.outputs = 2U * s.intermediate;
+        for (unsigned r = 0; r < Rows; ++r) {
+            site.input[r] = reinterpret_cast<const void*>(row(views.input, s.input_stride_bytes, r));
+            site.output[r] = reinterpret_cast<float*>(row(views.workspace, s.workspace_stride_bytes, r));
+        }
+        // Any-order (STRIX_ANYORDER=0 disables): gate/up reads only the MoE input and writes this expert's own
+        // workspace, independent of the router's top-k selection queued just before it.
+        static const bool any_order = strix_any_order_enabled();
+        q8_rows::launch(site, config.known_window_a8_projections, stream, any_order);
     }
-    check_hip(hipGetLastError(), "known-window shared R2 projection launch");
+    check_hip(hipGetLastError(), "known-window shared rows projection launch");
     if (config.prefetch_q8 && config.prefetch_stats)
-        config.prefetch_stats->dispatched_projections.fetch_add(1, std::memory_order_relaxed);
+        config.prefetch_stats->dispatched_projections.fetch_add(down ? 1U : 2U, std::memory_order_relaxed);
+}
+void require_known_shared_a8(std::size_t rows, const HipSharedExpertLauncherConfig& config) {
+    if (config.known_window_a8_projections &&
+        rows * std::max(config.hidden_size, config.intermediate_size) / 32U * 36U > q8_rows::kLdsBytes)
+        throw std::invalid_argument("known-window shared A8 activations exceed one block's LDS");
 }
 } // namespace
 
 void shared_expert_known_window_r2_preflight(std::span<const ExecutionDispatchContext, 2> rows,
     const HipSharedExpertLauncherConfig& config) {
     (void)known_shared_r2_views(rows, config);
+    require_known_shared_a8(2U, config);
 }
 void shared_expert_known_window_r2_launch(std::span<const ExecutionDispatchContext, 2> rows,
     const HipSharedExpertLauncherConfig& config) {
@@ -1696,10 +1787,8 @@ void shared_expert_known_window_r2_launch(std::span<const ExecutionDispatchConte
     if (capture != hipStreamCaptureStatusNone)
         throw std::invalid_argument("known-window shared R2 cannot run during capture");
     check_hip(hipPeekAtLastError(), "known-window shared R2 stale launch error");
-    known_shared_r2_projection(false, views, views.weights.gate_q8, views.workspace, scope->stream, config);
-    auto up_target = views.workspace;
-    up_target.address += static_cast<std::uint64_t>(config.intermediate_size) * 4U;
-    known_shared_r2_projection(false, views, views.weights.up_q8, up_target, scope->stream, config);
+    require_known_shared_a8(2U, config);
+    known_shared_engine_projection<2U>(false, views, scope->stream, config);
     for (unsigned row = 0; row < 2U; ++row) {
         auto* workspace = reinterpret_cast<float*>(views.workspace.address + row * views.shape.workspace_stride_bytes);
         const auto* hidden = reinterpret_cast<const std::uint16_t*>(views.input.address + row * views.shape.input_stride_bytes);
@@ -1712,7 +1801,7 @@ void shared_expert_known_window_r2_launch(std::span<const ExecutionDispatchConte
             workspace + config.intermediate_size);
         check_hip(hipGetLastError(), "known-window shared R2 scalar launch");
     }
-    known_shared_r2_projection(true, views, views.weights.down_q8, views.output, scope->stream, config);
+    known_shared_engine_projection<2U>(true, views, scope->stream, config);
 }
 
 namespace {
@@ -1813,46 +1902,15 @@ hipStream_t known_shared_rows_stream() {
     return scope->stream;
 }
 template <unsigned Rows>
-void known_shared_rows_projection(bool down, const KnownSharedR2Views& views,
-    KnownSharedSpan weight, KnownSharedSpan target, hipStream_t stream,
-    const HipSharedExpertLauncherConfig& config) {
-    const auto& s = views.shape;
-    if (down) {
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(shared_rows_q8_projection_kernel<Rows, true>),
-            dim3((s.hidden + 7U) / 8U), dim3(256), 0, stream,
-            reinterpret_cast<const void*>(views.workspace.address), s.workspace_stride_bytes,
-            reinterpret_cast<const void*>(weight.address), s.intermediate, s.hidden,
-            reinterpret_cast<void*>(target.address), s.output_stride_bytes,
-            reinterpret_cast<const float*>(views.workspace.address) + s.intermediate, s.workspace_stride_bytes / 4U);
-    } else {
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(shared_rows_q8_projection_kernel<Rows, false>),
-            dim3((s.intermediate + 7U) / 8U), dim3(256), 0, stream,
-            reinterpret_cast<const void*>(views.input.address), s.input_stride_bytes,
-            reinterpret_cast<const void*>(weight.address), s.hidden, s.intermediate,
-            reinterpret_cast<void*>(target.address), s.workspace_stride_bytes, nullptr, 0ULL);
-    }
-    check_hip(hipGetLastError(), "known-window shared rows projection launch");
-    if (config.prefetch_q8 && config.prefetch_stats)
-        config.prefetch_stats->dispatched_projections.fetch_add(1, std::memory_order_relaxed);
-}
-template <unsigned Rows>
 void known_shared_rows_enqueue(const KnownSharedR2Views& views, hipStream_t stream,
     const HipSharedExpertLauncherConfig& config) {
-    known_shared_rows_projection<Rows>(false, views, views.weights.gate_q8, views.workspace, stream, config);
-    auto up = views.workspace; up.address += static_cast<std::uint64_t>(config.intermediate_size) * 4U;
-    known_shared_rows_projection<Rows>(false, views, views.weights.up_q8, up, stream, config);
-    for (unsigned row = 0; row < Rows; ++row) {
-        auto* workspace = reinterpret_cast<float*>(views.workspace.address + row * views.shape.workspace_stride_bytes);
-        const auto* input = reinterpret_cast<const std::uint16_t*>(views.input.address + row * views.shape.input_stride_bytes);
-        hipLaunchKernelGGL(gated_activation_kernel, dim3((config.intermediate_size + 255U) / 256U),
-            dim3(256), 0, stream, workspace, config.intermediate_size);
-        check_hip(hipGetLastError(), "known-window shared rows activation launch");
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(scalar_projection_kernel<std::uint16_t, WeightKind::f32>),
-            dim3(1), dim3(256), 0, stream, input, reinterpret_cast<const void*>(views.weights.shared_gate_f32.address),
-            config.hidden_size, workspace + config.intermediate_size);
-        check_hip(hipGetLastError(), "known-window shared rows scalar launch");
-    }
-    known_shared_rows_projection<Rows>(true, views, views.weights.down_q8, views.output, stream, config);
+    known_shared_engine_projection<Rows>(false, views, stream, config);
+    hipLaunchKernelGGL(rows_shared_activation_scalar_kernel, dim3((config.intermediate_size + kThreads - 1U) / kThreads, Rows),
+        dim3(kThreads), 0, stream, views.workspace.address, views.shape.workspace_stride_bytes, views.input.address,
+        views.shape.input_stride_bytes, reinterpret_cast<const void*>(views.weights.shared_gate_f32.address),
+        config.intermediate_size, config.hidden_size);
+    check_hip(hipGetLastError(), "known-window shared rows activation/scalar launch");
+    known_shared_engine_projection<Rows>(true, views, stream, config);
 }
 } // namespace
 
@@ -1864,6 +1922,7 @@ void shared_expert_known_window_rows_preflight(std::span<const ExecutionDispatch
     }
     static_cast<void>(known_shared_rows_views(rows, config));
     static_cast<void>(known_shared_rows_stream());
+    require_known_shared_a8(rows.size(), config);
 }
 void shared_expert_known_window_rows_launch(std::span<const ExecutionDispatchContext> rows,
     const HipSharedExpertLauncherConfig& config) {
@@ -1873,6 +1932,7 @@ void shared_expert_known_window_rows_launch(std::span<const ExecutionDispatchCon
     }
     const auto views = known_shared_rows_views(rows, config);
     const auto stream = known_shared_rows_stream();
+    require_known_shared_a8(rows.size(), config);
     check_hip(hipPeekAtLastError(), "known-window shared rows stale launch error");
     if (rows.size() == 4U) known_shared_rows_enqueue<4U>(views, stream, config);
     else known_shared_rows_enqueue<8U>(views, stream, config);
@@ -2036,24 +2096,114 @@ void launch_hip_mtp_shared_expert(const MtpNativeContext& c,void* raw_stream){
     if(capture!=hipStreamCaptureStatusNone)throw std::invalid_argument("MTP shared expert is eager only");
     check_hip(hipPeekAtLastError(),"MTP shared prior HIP error");
     const auto& owner=*c.resources;const auto& t=*c.tensors;
-    const auto* input=reinterpret_cast<const std::uint16_t*>(owner.view(HipMtpBuffer::hidden0).address);
-    auto* workspace=reinterpret_cast<float*>(owner.view(HipMtpBuffer::moe_workspace).address);
-    auto* up=workspace+640U;
+    enqueue_hip_mtp_shared_expert_q8(reinterpret_cast<const std::uint16_t*>(owner.view(HipMtpBuffer::hidden0).address),
+        reinterpret_cast<const void*>(t.shared_gate.runtime->address),reinterpret_cast<const void*>(t.shared_up.runtime->address),
+        reinterpret_cast<const void*>(t.shared_down.runtime->address),reinterpret_cast<const void*>(t.shared_scalar_gate.runtime->address),
+        reinterpret_cast<float*>(owner.view(HipMtpBuffer::moe_workspace).address),
+        reinterpret_cast<std::uint16_t*>(owner.view(HipMtpBuffer::hidden1).address),stream);
+}
+void enqueue_hip_mtp_shared_expert_q8(const std::uint16_t* input,const void* gate,const void* up_weights,const void* down,
+    const void* scalar,float* workspace,std::uint16_t* output,void* raw_stream) {
+    const auto stream=static_cast<hipStream_t>(raw_stream);auto* up=workspace+640U;
     hipLaunchKernelGGL(HIP_KERNEL_NAME(projection_to_fp32_kernel<std::uint16_t,WeightKind::q8_0>),dim3(640U),dim3(kThreads),0,stream,
-        input,reinterpret_cast<const void*>(t.shared_gate.runtime->address),2560U,640U,workspace);
+        input,gate,2560U,640U,workspace);
     check_hip(hipGetLastError(),"MTP shared Q8 gate projection");
     hipLaunchKernelGGL(HIP_KERNEL_NAME(projection_to_fp32_kernel<std::uint16_t,WeightKind::q8_0>),dim3(640U),dim3(kThreads),0,stream,
-        input,reinterpret_cast<const void*>(t.shared_up.runtime->address),2560U,640U,up);
+        input,up_weights,2560U,640U,up);
     check_hip(hipGetLastError(),"MTP shared Q8 up projection");
     hipLaunchKernelGGL(gated_activation_kernel,dim3(3U),dim3(kThreads),0,stream,workspace,640U);
     check_hip(hipGetLastError(),"MTP shared activation");
     // Scalar replaces up[0] ONLY after activation consumed the complete up row.
     hipLaunchKernelGGL(HIP_KERNEL_NAME(scalar_projection_kernel<std::uint16_t,WeightKind::f32>),dim3(1U),dim3(kThreads),0,stream,
-        input,reinterpret_cast<const void*>(t.shared_scalar_gate.runtime->address),2560U,up);
+        input,scalar,2560U,up);
     check_hip(hipGetLastError(),"MTP shared F32 scalar gate");
     hipLaunchKernelGGL(HIP_KERNEL_NAME(down_projection_kernel<std::uint16_t,WeightKind::q8_0>),dim3(2560U),dim3(kThreads),0,stream,
-        workspace,up,reinterpret_cast<const void*>(t.shared_down.runtime->address),640U,2560U,
-        reinterpret_cast<std::uint16_t*>(owner.view(HipMtpBuffer::hidden1).address));
+        workspace,up,down,640U,2560U,output);
     check_hip(hipGetLastError(),"MTP shared Q8 down output");
 }
 } // namespace strix
+
+#ifdef STRIX_BUILD_KNOWN_WINDOW_DIAGNOSTIC
+namespace strix {
+namespace {
+template <unsigned Rows>
+void enqueue_shared_rows_probe(bool down, bool a8, std::span<const HipSharedQ8ProjectionView> input,
+    HipSharedQ8ProjectionView weights, std::span<const HipSharedQ8ProjectionView> gate,
+    std::span<const HipSharedQ8ProjectionView> output, std::uint32_t width, std::uint32_t outputs, hipStream_t stream) {
+    const auto segments = q8_rows::segments({{reinterpret_cast<const void*>(weights.address), outputs}});
+    if (down) {
+        SharedDownRowsSite<Rows> site{};
+        site.segments = segments; site.width = width; site.outputs = outputs;
+        for (unsigned r = 0; r < Rows; ++r) {
+            site.input[r] = reinterpret_cast<const void*>(input[r].address);
+            site.gate[r] = reinterpret_cast<const float*>(gate[r].address);
+            site.output[r] = reinterpret_cast<std::uint16_t*>(output[r].address);
+        }
+        q8_rows::launch(site, a8, stream);
+    } else {
+        SharedGateUpRowsSite<Rows> site{};
+        site.segments = segments; site.width = width; site.outputs = outputs;
+        for (unsigned r = 0; r < Rows; ++r) {
+            site.input[r] = reinterpret_cast<const void*>(input[r].address);
+            site.output[r] = reinterpret_cast<float*>(output[r].address);
+        }
+        q8_rows::launch(site, a8, stream);
+    }
+}
+} // namespace
+void launch_hip_shared_rows_projection_probe(HipSharedQ8ProjectionRole role, HipSharedRowsProbeMode mode,
+    std::span<const HipSharedQ8ProjectionView> input, HipSharedQ8ProjectionView weights,
+    std::span<const HipSharedQ8ProjectionView> gate, std::span<const HipSharedQ8ProjectionView> output,
+    std::uint32_t width, std::uint32_t outputs, void* stream) {
+    const auto rows = static_cast<std::uint32_t>(input.size());
+    const bool down = role == HipSharedQ8ProjectionRole::down;
+    if ((rows != 1U && rows != 2U && rows != 4U && rows != 8U) || output.size() != rows || gate.size() != (down ? rows : 0U) ||
+        (!down && role != HipSharedQ8ProjectionRole::gate_up) ||
+        (mode != HipSharedRowsProbeMode::rows && mode != HipSharedRowsProbeMode::rows_a8 && mode != HipSharedRowsProbeMode::row_loop) ||
+        !stream || static_cast<hipStream_t>(stream) == hipStreamLegacy || static_cast<hipStream_t>(stream) == hipStreamPerThread ||
+        !width || width % 32U || !outputs)
+        throw std::invalid_argument("shared rows projection diagnostic requires 1/2/4/8 rows, a role, a mode and an owned stream");
+    const auto overlap = [](HipSharedQ8ProjectionView x, HipSharedQ8ProjectionView y) {
+        return x.address < y.address + y.bytes && y.address < x.address + x.bytes;
+    };
+    const auto exact = [](HipSharedQ8ProjectionView v, std::uint64_t bytes) {
+        if (!v.address || v.address % 16U || v.bytes != bytes || v.bytes > UINTPTR_MAX - v.address)
+            throw std::invalid_argument("shared rows projection diagnostic view has invalid alignment or extent");
+    };
+    exact(weights, static_cast<std::uint64_t>(width / 32U) * outputs * 34U);
+    for (unsigned r = 0; r < rows; ++r) {
+        exact(input[r], static_cast<std::uint64_t>(width) * (down ? 4U : 2U));
+        exact(output[r], static_cast<std::uint64_t>(outputs) * (down ? 2U : 4U));
+        if (down) exact(gate[r], 4U);
+        if (overlap(output[r], weights)) throw std::invalid_argument("shared rows projection output aliases weights");
+        for (unsigned other = 0; other < rows; ++other)
+            if (overlap(output[r], input[other]) || (down && overlap(output[r], gate[other])) ||
+                (other < r && overlap(output[r], output[other])))
+                throw std::invalid_argument("shared rows projection output aliases a row");
+    }
+    if (mode == HipSharedRowsProbeMode::rows_a8 && q8_rows::a8_bytes<8U>(width) / 8U * rows > q8_rows::kLdsBytes)
+        throw std::invalid_argument("shared rows A8 activations exceed one block's LDS");
+    const auto native = static_cast<hipStream_t>(stream);
+    check_hip(hipPeekAtLastError(), "shared rows projection diagnostic pre-enqueue stale error");
+    const auto* packed = reinterpret_cast<const void*>(weights.address);
+    if (mode == HipSharedRowsProbeMode::row_loop) {
+        for (unsigned r = 0; r < rows; ++r) {
+            if (down) hipLaunchKernelGGL(HIP_KERNEL_NAME(shared_q8_virtual_down_kernel<std::uint16_t, true, 8>), dim3((outputs + 7U) / 8U),
+                dim3(256), 0, native, reinterpret_cast<const float*>(input[r].address), reinterpret_cast<const float*>(gate[r].address),
+                packed, width, outputs, reinterpret_cast<std::uint16_t*>(output[r].address));
+            else hipLaunchKernelGGL(HIP_KERNEL_NAME(shared_q8_virtual_projection_kernel<std::uint16_t, true, 8>), dim3((outputs + 7U) / 8U),
+                dim3(256), 0, native, reinterpret_cast<const std::uint16_t*>(input[r].address), packed, width, outputs,
+                reinterpret_cast<float*>(output[r].address));
+            check_hip(hipGetLastError(), "shared rows projection diagnostic row-loop launch");
+        }
+        return;
+    }
+    const bool a8 = mode == HipSharedRowsProbeMode::rows_a8;
+    if (rows == 1U) enqueue_shared_rows_probe<1U>(down, a8, input, weights, gate, output, width, outputs, native);
+    else if (rows == 2U) enqueue_shared_rows_probe<2U>(down, a8, input, weights, gate, output, width, outputs, native);
+    else if (rows == 4U) enqueue_shared_rows_probe<4U>(down, a8, input, weights, gate, output, width, outputs, native);
+    else enqueue_shared_rows_probe<8U>(down, a8, input, weights, gate, output, width, outputs, native);
+    check_hip(hipGetLastError(), "shared rows projection diagnostic launch");
+}
+} // namespace strix
+#endif

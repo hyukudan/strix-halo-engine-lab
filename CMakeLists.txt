@@ -1351,6 +1351,8 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         src/hip_ple_launcher.hip
         src/hip_mtp_resources.hip
         src/hip_mtp_runtime.hip
+        src/hip_mtp_draft_head.hip
+        src/hip_mtp_fast_draft.hip
         src/hip_mtp_target_window.hip
         src/hip_mtp_target_checkpoint.hip
         src/hip_mtp_window_verifier.hip
@@ -1433,7 +1435,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         target_compile_definitions(strix_hip_runtime PRIVATE STRIX_BUILD_SHARED_EXPERT_ROWS_DIAGNOSTIC=1)
         target_compile_definitions(strix_hip_runtime PRIVATE STRIX_BUILD_QSA_GQA_REUSE_DIAGNOSTIC=1)
         target_compile_definitions(strix_hip_runtime PRIVATE STRIX_BUILD_MOE_BATCHED_ACTIVATION_DIAGNOSTIC=1)
-        foreach(mtp_fixture input-fusion forward-replay target-checkpoint)
+        foreach(mtp_fixture input-fusion forward-replay target-checkpoint draft-head fast-draft)
             string(REPLACE "-" "_" mtp_fixture_file "${mtp_fixture}")
             add_executable(strix-hip-mtp-${mtp_fixture}-tests tests/hip_mtp_${mtp_fixture_file}_tests.hip)
             target_link_libraries(strix-hip-mtp-${mtp_fixture}-tests PRIVATE strix_hip_runtime)
@@ -1831,6 +1833,16 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         strix_target_warnings(strix-hip-gdn-retained-window-tests)
         add_test(NAME strix-hip-gdn-retained-window-tests COMMAND strix-hip-gdn-retained-window-tests)
 
+        add_executable(strix-hip-gdn-deferred-window-tests tests/hip_gdn_deferred_window_tests.hip)
+        set_target_properties(strix-hip-gdn-deferred-window-tests PROPERTIES
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+        target_link_libraries(strix-hip-gdn-deferred-window-tests PRIVATE strix_hip_runtime)
+        target_compile_definitions(strix-hip-gdn-deferred-window-tests PRIVATE STRIX_BUILD_KNOWN_WINDOW_DIAGNOSTIC=1)
+        target_compile_options(strix-hip-gdn-deferred-window-tests PRIVATE
+            -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
+        strix_target_warnings(strix-hip-gdn-deferred-window-tests)
+        add_test(NAME strix-hip-gdn-deferred-window-tests COMMAND strix-hip-gdn-deferred-window-tests)
+
         add_executable(strix-hip-gdn-wide-projection-tests tests/hip_gdn_wide_projection_tests.hip)
         set_target_properties(strix-hip-gdn-wide-projection-tests PROPERTIES
             HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
@@ -1840,6 +1852,16 @@ if(STRIX_ENABLE_HIP_RUNTIME)
             -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
         strix_target_warnings(strix-hip-gdn-wide-projection-tests)
         add_test(NAME strix-hip-gdn-wide-projection-tests COMMAND strix-hip-gdn-wide-projection-tests)
+
+        add_executable(strix-hip-q8-rows-projection-tests tests/hip_q8_rows_projection_tests.hip)
+        set_target_properties(strix-hip-q8-rows-projection-tests PROPERTIES
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+        target_link_libraries(strix-hip-q8-rows-projection-tests PRIVATE strix_hip_runtime)
+        target_compile_definitions(strix-hip-q8-rows-projection-tests PRIVATE STRIX_BUILD_KNOWN_WINDOW_DIAGNOSTIC=1)
+        target_compile_options(strix-hip-q8-rows-projection-tests PRIVATE
+            -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
+        strix_target_warnings(strix-hip-q8-rows-projection-tests)
+        add_test(NAME strix-hip-q8-rows-projection-tests COMMAND strix-hip-q8-rows-projection-tests)
 
         if(STRIX_ENABLE_EXPERIMENTAL_Q4K_A8_RUNTIME)
             add_executable(strix-hip-moe-q4k-a8-known-rows-tests tests/hip_moe_q4k_a8_known_rows_tests.hip)
@@ -1865,6 +1887,11 @@ if(STRIX_ENABLE_HIP_RUNTIME)
                     add_test(NAME strix-hip-moe-known-rows-${rows}-batched-${batched}
                         COMMAND strix-hip-moe-known-rows-tests ${rows} ${batched})
                 endforeach()
+                # A8 profile at canonical geometry: Q5_1, Q8_0 (layer 4), Q5_K+Q8_0 (layer 2).
+                foreach(profile a8q51 a8q80 a8q5k)
+                    add_test(NAME strix-hip-moe-known-rows-${rows}-${profile}
+                        COMMAND strix-hip-moe-known-rows-tests ${rows} 1 ${profile})
+                endforeach()
             endforeach()
         endif()
 
@@ -1884,6 +1911,15 @@ if(STRIX_ENABLE_HIP_RUNTIME)
             -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
         strix_target_warnings(strix-hip-known-window-tests)
         add_test(NAME strix-hip-known-window-tests COMMAND strix-hip-known-window-tests)
+        add_executable(strix-hip-qsa-block-select-tests tests/hip_qsa_block_select_tests.hip)
+        set_target_properties(strix-hip-qsa-block-select-tests PROPERTIES
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+        target_link_libraries(strix-hip-qsa-block-select-tests PRIVATE strix_hip_runtime)
+        target_compile_definitions(strix-hip-qsa-block-select-tests PRIVATE STRIX_BUILD_KNOWN_WINDOW_DIAGNOSTIC=1)
+        target_compile_options(strix-hip-qsa-block-select-tests PRIVATE -mno-wavefrontsize64)
+        strix_target_warnings(strix-hip-qsa-block-select-tests)
+        add_test(NAME strix-hip-qsa-block-select-tests COMMAND strix-hip-qsa-block-select-tests)
+        set_tests_properties(strix-hip-qsa-block-select-tests PROPERTIES SKIP_RETURN_CODE 77)
 
         # Full-model qualification is explicit and requires a model and teacher;
         # it is intentionally absent from the automatic device regression.

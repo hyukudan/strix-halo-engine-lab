@@ -185,6 +185,31 @@ int main(){try{
     // Parsing precedes automatic context resolution. A normal512 output request
     // must remain admissible until the actual resolved context is known.
     good.context_tokens=8192;strix::decode_cli::validate_resolved_mtp_cli(good);
+    require(!good.mtp.draft_chain && good.mtp.draft_vocab.empty() && !good.mtp.draft_context_vocab,
+        "ordinary MTP keeps the full-head per-draft path");
+    auto chain=request();chain.push_back("--mtp-draft-chain");
+    const auto full_chain=parse(chain);
+    require(full_chain.mtp.draft_chain && full_chain.mtp.draft_vocab.empty() && !full_chain.mtp.draft_context_vocab,
+        "draft chain alone keeps the full draft head");
+    chain.insert(chain.end(),{"--mtp-draft-vocab","base.u32","--mtp-draft-context-vocab=4096"});
+    const auto subset=parse(chain);
+    require(subset.mtp.draft_vocab=="base.u32" && subset.mtp.draft_context_vocab==4096U,"draft subset options parse");
+    reject_as([]{auto a=request();a.insert(a.end(),{"--mtp-draft-vocab","base.u32"});return a;}(),
+        "MTP draft vocabulary options require --mtp-draft-chain","draft vocabulary requires the chain");
+    reject([]{auto a=request();a.insert(a.end(),{"--mtp-draft-chain","--mtp-draft-context-vocab","0"});return a;}(),
+        "zero draft context cap rejected");
+    reject([]{auto a=request();a.insert(a.end(),{"--mtp-draft-chain","--mtp-draft-chain"});return a;}(),"duplicate draft chain rejected");
+    reject([]{auto a=request();a.push_back("--mtp-draft-chain=1");return a;}(),"draft chain takes no value");
+    reject({"decoder","target.gguf","1","--mtp-draft-chain"},"draft chain cannot select MTP");
+    require(!subset.mtp.draft_exact && !subset.mtp.draft_q4,"draft chain defaults to fast kernels and the Q8 head");
+    chain.insert(chain.end(),{"--mtp-draft-exact","--mtp-draft-q4"});
+    const auto variants=parse(chain);
+    require(variants.mtp.draft_exact && variants.mtp.draft_q4,"draft exact/Q4 flags parse");
+    reject_as([]{auto a=request();a.push_back("--mtp-draft-exact");return a;}(),
+        "MTP draft vocabulary options require --mtp-draft-chain","draft exact requires the chain");
+    reject_as([]{auto a=request();a.insert(a.end(),{"--mtp-draft-chain","--mtp-draft-q4"});return a;}(),
+        "MTP draft Q4 head requires a draft vocabulary subset","Q4 head requires a subset");
+    reject([]{auto a=request();a.insert(a.end(),{"--mtp-draft-chain","--mtp-draft-exact","--mtp-draft-exact"});return a;}(),"duplicate draft exact rejected");
     auto metadata=request();
     for(const auto* key:{"--mtp-golden","--mtp-golden-sha256"}){
         for(auto it=metadata.begin();it!=metadata.end();++it)if(*it==key){metadata.erase(it,it+2);break;}
@@ -201,6 +226,19 @@ int main(){try{
         require(exact,"metadata diagnostic rejects unused golden parameters explicitly");
     }
     set(metadata,"--mtp-metadata-only","0");reject(metadata,"metadata diagnostic requires its explicit value");
+    auto dump=request();
+    for(const auto* key:{"--mtp-golden","--mtp-golden-sha256"}){
+        for(auto it=dump.begin();it!=dump.end();++it)if(*it==key){dump.erase(it,it+2);break;}
+    }
+    dump.insert(dump.end(),{"--mtp-golden-dump","self.golden"});
+    const auto dumped=parse(dump);
+    require(dumped.mtp.golden_dump=="self.golden" && dumped.mtp.golden.empty() && !dumped.mtp.metadata_only,
+        "golden dump replaces the input golden pins");
+    reject_as([&]{auto a=dump;a.insert(a.end(),{"--mtp-golden","in.bin"});return a;}(),
+        "MTP golden dump writes a golden and does not accept an input golden","golden dump rejects an input golden");
+    reject_as([&]{auto a=dump;a.insert(a.end(),{"--mtp-metadata-only","1"});return a;}(),
+        "MTP metadata diagnostic does not accept unused golden options","golden dump excludes metadata diagnostic");
+    reject([&]{auto a=request();a.insert(a.end(),{"--mtp-golden-dump","self.golden"});return a;}(),"dump with full golden pins rejected");
     for(const auto* flag:{"--prepared-eager","--moe-shared-overlap","--gdn-islands","--gpu-greedy-token","--prompt-lookup",
         "--prefix-cache-roundtrip","--device-queue-trace"}){
         auto bad=request();bad.push_back(flag);reject(bad,"incompatible MTP route rejects at parsing before native setup");

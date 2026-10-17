@@ -11,6 +11,7 @@ struct KnownPrefillRequest {
     // Explicit declared storage limits, not inferred free/physical memory.
     // The native allocation consumer separately admits full owner growth.
     std::uint64_t workspace_budget_bytes=0,host_metadata_payload_budget_bytes=0;
+    bool router_rows=false,combine_inject_rows=false;
 };
 struct CompiledKnownPrefixPrefill {
     std::uint32_t logical_rows=0;

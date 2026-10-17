@@ -21,6 +21,8 @@
 #include <optional>
 #include <span>
 #include <stdexcept>
+#include <type_traits>
+#include <vector>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -444,6 +446,91 @@ __global__ void project_bf16_to_fp32_kernel(
     }
 }
 
+// Same 256-leaf DAG as project_bf16_to_fp32_kernel<q8_0> inside one wave per row:
+// leaf t=8*lane+local accumulates features t, t+256, ... in order, then the
+// LDS tree (strides 128..8 are lane shuffles 16..1, strides 4..1 are local).
+__global__ __launch_bounds__(256) void project_wave8_q8_bf16_to_fp32_kernel(
+    const std::uint16_t* input, const void* weights,
+    std::uint32_t input_width, std::uint32_t output_width, float* output) {
+    const auto row = static_cast<std::uint32_t>(blockIdx.x) * 8U + static_cast<std::uint32_t>(threadIdx.x) / 32U;
+    if (row >= output_width) return;
+    const auto lane = static_cast<std::uint32_t>(threadIdx.x) % 32U;
+    float partial[8]{};
+    const auto* blocks = static_cast<const Q8Block*>(weights) + static_cast<std::uint64_t>(row) * (input_width / 32U);
+    for (std::uint32_t chunk = 0; chunk < input_width; chunk += kThreads) {
+        const auto feature = chunk + 8U * lane;
+        if (feature < input_width) {
+            const auto& block = blocks[feature / 32U];
+#pragma unroll
+            for (unsigned local = 0; local < 8; ++local)
+                partial[local] += bf16_to_float(input[feature + local]) *
+                    (__half2float(block.scale) * static_cast<float>(block.values[feature % 32U + local]));
+        }
+    }
+#pragma unroll
+    for (unsigned distance = 16; distance > 0; distance /= 2) {
+#pragma unroll
+        for (unsigned local = 0; local < 8; ++local) {
+            const auto partner = __shfl_down(partial[local], distance, 32);
+            if (lane < distance) partial[local] += partner;
+        }
+    }
+    if (lane == 0) {
+        partial[0] += partial[4]; partial[1] += partial[5];
+        partial[2] += partial[6]; partial[3] += partial[7];
+        partial[0] += partial[2]; partial[1] += partial[3];
+        partial[0] += partial[1];
+        output[row] = partial[0];
+    }
+}
+
+// project_wave8_q8_bf16_to_fp32_kernel for Rows inputs at once: each Q8 block is decoded once and
+// applied to every row with that row's own leaf accumulation and tree (bit-identical per row).
+template <unsigned Rows>
+__global__ __launch_bounds__(256) void project_wave8_q8_bf16_to_fp32_rows_kernel(
+    const std::uint16_t* input, std::uint32_t input_stride, const void* weights,
+    std::uint32_t input_width, std::uint32_t output_width, float* output, std::uint32_t output_stride) {
+    const auto row = static_cast<std::uint32_t>(blockIdx.x) * 8U + static_cast<std::uint32_t>(threadIdx.x) / 32U;
+    if (row >= output_width) return;
+    const auto lane = static_cast<std::uint32_t>(threadIdx.x) % 32U;
+    float partial[Rows][8]{};
+    const auto* blocks = static_cast<const Q8Block*>(weights) + static_cast<std::uint64_t>(row) * (input_width / 32U);
+    for (std::uint32_t chunk = 0; chunk < input_width; chunk += kThreads) {
+        const auto feature = chunk + 8U * lane;
+        if (feature < input_width) {
+            const auto& block = blocks[feature / 32U];
+            float weight[8];
+#pragma unroll
+            for (unsigned local = 0; local < 8; ++local)
+                weight[local] = __half2float(block.scale) * static_cast<float>(block.values[feature % 32U + local]);
+#pragma unroll
+            for (unsigned r = 0; r < Rows; ++r)
+#pragma unroll
+                for (unsigned local = 0; local < 8; ++local)
+                    partial[r][local] += bf16_to_float(input[r * input_stride + feature + local]) * weight[local];
+        }
+    }
+#pragma unroll
+    for (unsigned r = 0; r < Rows; ++r) {
+#pragma unroll
+        for (unsigned distance = 16; distance > 0; distance /= 2) {
+#pragma unroll
+            for (unsigned local = 0; local < 8; ++local) {
+                const auto partner = __shfl_down(partial[r][local], distance, 32);
+                if (lane < distance) partial[r][local] += partner;
+            }
+        }
+        if (lane == 0) {
+            auto* p = partial[r];
+            p[0] += p[4]; p[1] += p[5];
+            p[2] += p[6]; p[3] += p[7];
+            p[0] += p[2]; p[1] += p[3];
+            p[0] += p[1];
+            output[static_cast<std::uint64_t>(r) * output_stride + row] = p[0];
+        }
+    }
+}
+
 __global__ void normalize_key_and_gate_kernel(
     float* key,
     const std::uint16_t* query,
@@ -834,6 +921,12 @@ void launch_projection_by_kind(
                 output);
         return;
     case WeightKind::q8_0:
+        if (input_width % 32U == 0U) {
+            hipLaunchKernelGGL(project_wave8_q8_bf16_to_fp32_kernel, dim3((output_width + 7U) / 8U), dim3(256), 0,
+                hip_execution_stream(), input, reinterpret_cast<const void*>(weights.address), input_width, output_width, output);
+            check_hip(hipGetLastError(), "HIP PLE wave8 Q8 projection launch");
+            return;
+        }
         launch_projection<
             WeightKind::q8_0>(
                 input,
@@ -1284,8 +1377,9 @@ void preflight_ple(const ExecutionDispatchContext& context, void* user_data) {
         throw std::invalid_argument("PLE gathered upload does not match its exact workspace region");
 }
 
-void launch_ple(const ExecutionDispatchContext& context, void* user_data) {
-    const auto prepared = prepare_ple_launch(context, user_data);
+// key/value: the row's key and value projections when a window computed them already for all its rows.
+void enqueue_ple_device(const PreparedPleLaunch& prepared, std::uint16_t* gathered, float* key_rows = nullptr,
+    float* value_rows = nullptr) {
     const auto& config = *prepared.config;
     const auto& input = prepared.input;
     const auto& output = prepared.output;
@@ -1293,135 +1387,10 @@ void launch_ple(const ExecutionDispatchContext& context, void* user_data) {
     const auto& workspace_layout = prepared.workspace_layout;
     const auto expanded = prepared.expanded;
     const auto& tensors = prepared.tensors;
-    const auto& ngram_state = prepared.ngram_state;
     const auto& conv_state = prepared.conv_state;
-    const auto& hash_contract = prepared.hash_contract;
-
-    alignas(64)
-    std::array<
-        std::byte,
-        PleHashContract::maximum_heads * 512>
-        host_staging{};
-
-    PleHashResult hash;
-    const auto* graph = current_hip_launch_context();
-    if (graph && graph->graph_capture) {
-        if (!config.enable_resident_graph || config.upload_pool || config.enable_owned_event_upload ||
-            tensors.table.manifest->ggml_type != 30)
-            throw std::invalid_argument("captured PLE requires opt-in resident BF16 table without host upload");
-        hash.row_count = hash_contract.head_count;
-    } else {
-    auto& backend =
-        *context.resources->ple_lookup;
-
-    if (context.resources->ple_prefetch != nullptr &&
-        context.resources->ple_prefetch->active) {
-        const auto prefetched_bytes =
-            context.resources->ple_prefetch->
-                lookup_bytes;
-        if (prefetched_bytes >
-            host_staging.size()) {
-            throw std::overflow_error(
-                "PLE prefetched lookup exceeds fixed host staging");
-        }
-        hash =
-            finish_ple_lookup_prefetch(
-                context.input_token_id,
-                context.position,
-                backend,
-                *context.resources->ple_prefetch,
-                std::span<std::byte>(
-                    host_staging.data(),
-                    static_cast<std::size_t>(
-                        prefetched_bytes)));
-    } else {
-        std::array<
-            std::uint32_t,
-            PleHashContract::maximum_ngram - 1>
-            previous{};
-        const auto context_count =
-            static_cast<std::size_t>(
-                config.model.ngram_size - 1ULL);
-
-        if (context.position == 0) {
-            std::fill_n(
-                previous.begin(),
-                context_count,
-                static_cast<std::uint32_t>(
-                    config.model.ple_eos_token_id));
-        } else {
-            std::memcpy(
-                previous.data(),
-                reinterpret_cast<const void*>(
-                    ngram_state.address),
-                context_count *
-                    sizeof(std::uint32_t));
-        }
-
-        hash =
-            hash_ple_token(
-                hash_contract,
-                context.input_token_id,
-                std::span<const std::uint32_t>(
-                    previous.data(),
-                    context_count));
-
-        PleLookupRequest lookup;
-        lookup.row_ids =
-            std::span<const std::uint64_t>(
-                hash.row_ids.data(),
-                hash.row_count);
-        lookup.row_bytes =
-            hash_contract.row_bytes;
-        lookup.table_manifest =
-            tensors.table.manifest;
-        lookup.table_runtime =
-            tensors.table.runtime;
-
-        const auto sync_lookup_bytes =
-            static_cast<std::uint64_t>(
-                hash.row_count) *
-            hash_contract.row_bytes;
-        if (sync_lookup_bytes >
-            host_staging.size()) {
-            throw std::overflow_error(
-                "PLE lookup exceeds fixed host staging");
-        }
-
-        PleLookupHandle handle = 0;
-        try {
-            handle =
-                backend.start(
-                    lookup);
-            backend.finish(
-                handle,
-                std::span<std::byte>(
-                    host_staging.data(),
-                    static_cast<std::size_t>(
-                        sync_lookup_bytes)));
-            handle = 0;
-        } catch (...) {
-            if (handle != 0) {
-                backend.cancel(handle);
-            }
-            throw;
-        }
-    }
-
-    }
-
-    const auto lookup_bytes =
-        static_cast<std::uint64_t>(
-            hash.row_count) *
-        hash_contract.row_bytes;
-
     auto* workspace =
         reinterpret_cast<std::byte*>(
             temporary.address);
-    auto* gathered =
-        reinterpret_cast<std::uint16_t*>(
-            workspace +
-            workspace_layout.gathered_offset);
     auto* key =
         reinterpret_cast<float*>(
             workspace +
@@ -1443,49 +1412,9 @@ void launch_ple(const ExecutionDispatchContext& context, void* user_data) {
             workspace +
             workspace_layout.gate_offset);
 
-    if (lookup_bytes != workspace_layout.gathered_bytes || lookup_bytes > host_staging.size()) {
-        throw std::invalid_argument("PLE gathered upload does not match its exact workspace region");
-    }
-    if (graph && graph->graph_capture) {
-        auto gathered_view = temporary;
-        gathered_view.address = reinterpret_cast<std::uintptr_t>(gathered);
-        gathered_view.bytes = workspace_layout.gathered_bytes;
-        validate_graph_ple_bindings(hash_contract, graph->vocabulary_size, graph->context_tokens,
-            *tensors.table.runtime, graph->arguments, graph->status, gathered_view,
-            graph->ngram_input, graph->ngram_output);
-        DevicePleHash h{};
-        h.ngram = hash_contract.ngram_size; h.heads_per_ngram = hash_contract.heads_per_ngram;
-        h.heads = hash_contract.head_count; h.width = hash_contract.head_dim; h.eos = hash_contract.eos_token_id;
-        std::copy_n(hash_contract.multipliers.begin(), 8, h.multipliers);
-        std::copy_n(hash_contract.head_offsets.begin(), 32, h.offsets);
-        std::copy_n(hash_contract.head_vocab_sizes.begin(), 32, h.vocabularies);
-        hipLaunchKernelGGL(graph_ple_gather_kernel, dim3((h.heads * h.width + 255U) / 256U), dim3(256),
-            0, graph->stream, h, reinterpret_cast<const std::uint16_t*>(tensors.table.runtime->address),
-            reinterpret_cast<const std::uint32_t*>(graph->arguments.memory.arena_base + graph->arguments.token_offset),
-            hip_graph_position(), reinterpret_cast<const std::uint32_t*>(graph->ngram_input.arena_base),
-            gathered, graph->vocabulary_size, graph->context_tokens, hip_graph_status());
-        check_hip(hipGetLastError(), "resident PLE graph hash/gather");
+    if (key_rows) {
+        key = key_rows; value = value_rows;
     } else {
-    // The synchronous host upload uses the backend/default copy stream. An
-    // explicit nonblocking eager stream must first release reused arena views.
-    // This also keeps stack staging lifetime independent of async copy errors.
-    if (graph) check_hip(hipStreamSynchronize(graph->stream), "PLE eager upload arena fence");
-    if (config.upload_pool != nullptr) {
-        auto destination = temporary;
-        destination.address = reinterpret_cast<std::uintptr_t>(gathered);
-        destination.bytes = workspace_layout.gathered_bytes;
-        const auto ticket = config.upload_pool->start(
-            std::span<const std::byte>(host_staging.data(), static_cast<std::size_t>(lookup_bytes)),
-            destination);
-        // Preserve the eager synchronous boundary: dependent projections only
-        // start after the copy's event proves the retained host input released.
-        config.upload_pool->wait(ticket, destination);
-    } else {
-        check_hip(hipMemcpy(gathered, host_staging.data(), static_cast<std::size_t>(lookup_bytes),
-                            hipMemcpyHostToDevice), "copy PLE gathered embedding");
-    }
-    }
-
     launch_projection_by_kind(
         weight_kind(
             tensors.key.manifest->
@@ -1509,6 +1438,7 @@ void launch_ple(const ExecutionDispatchContext& context, void* user_data) {
         static_cast<std::uint32_t>(
             config.model.hidden_size),
         value);
+    }
 
     hipLaunchKernelGGL(
         normalize_key_and_gate_kernel,
@@ -1638,6 +1568,188 @@ void launch_ple(const ExecutionDispatchContext& context, void* user_data) {
         hipGetLastError(),
         "HIP PLE convolution launch");
 
+}
+
+void launch_ple(const ExecutionDispatchContext& context, void* user_data) {
+    const auto prepared = prepare_ple_launch(context, user_data);
+    const auto& config = *prepared.config;
+    const auto& temporary = prepared.temporary;
+    const auto& workspace_layout = prepared.workspace_layout;
+    const auto& tensors = prepared.tensors;
+    const auto& ngram_state = prepared.ngram_state;
+    const auto& hash_contract = prepared.hash_contract;
+
+    alignas(64)
+    std::array<
+        std::byte,
+        PleHashContract::maximum_heads * 512>
+        host_staging{};
+
+    PleHashResult hash;
+    const auto* graph = current_hip_launch_context();
+    if (graph && graph->graph_capture) {
+        if (!config.enable_resident_graph || config.upload_pool || config.enable_owned_event_upload ||
+            tensors.table.manifest->ggml_type != 30)
+            throw std::invalid_argument("captured PLE requires opt-in resident BF16 table without host upload");
+        hash.row_count = hash_contract.head_count;
+    } else {
+    auto& backend =
+        *context.resources->ple_lookup;
+
+    if (context.resources->ple_prefetch != nullptr &&
+        context.resources->ple_prefetch->active) {
+        const auto prefetched_bytes =
+            context.resources->ple_prefetch->
+                lookup_bytes;
+        if (prefetched_bytes >
+            host_staging.size()) {
+            throw std::overflow_error(
+                "PLE prefetched lookup exceeds fixed host staging");
+        }
+        hash =
+            finish_ple_lookup_prefetch(
+                context.input_token_id,
+                context.position,
+                backend,
+                *context.resources->ple_prefetch,
+                std::span<std::byte>(
+                    host_staging.data(),
+                    static_cast<std::size_t>(
+                        prefetched_bytes)));
+    } else {
+        std::array<
+            std::uint32_t,
+            PleHashContract::maximum_ngram - 1>
+            previous{};
+        const auto context_count =
+            static_cast<std::size_t>(
+                config.model.ngram_size - 1ULL);
+
+        if (context.position == 0) {
+            std::fill_n(
+                previous.begin(),
+                context_count,
+                static_cast<std::uint32_t>(
+                    config.model.ple_eos_token_id));
+        } else {
+            std::memcpy(
+                previous.data(),
+                reinterpret_cast<const void*>(
+                    ngram_state.address),
+                context_count *
+                    sizeof(std::uint32_t));
+        }
+
+        hash =
+            hash_ple_token(
+                hash_contract,
+                context.input_token_id,
+                std::span<const std::uint32_t>(
+                    previous.data(),
+                    context_count));
+
+        PleLookupRequest lookup;
+        lookup.row_ids =
+            std::span<const std::uint64_t>(
+                hash.row_ids.data(),
+                hash.row_count);
+        lookup.row_bytes =
+            hash_contract.row_bytes;
+        lookup.table_manifest =
+            tensors.table.manifest;
+        lookup.table_runtime =
+            tensors.table.runtime;
+
+        const auto sync_lookup_bytes =
+            static_cast<std::uint64_t>(
+                hash.row_count) *
+            hash_contract.row_bytes;
+        if (sync_lookup_bytes >
+            host_staging.size()) {
+            throw std::overflow_error(
+                "PLE lookup exceeds fixed host staging");
+        }
+
+        PleLookupHandle handle = 0;
+        try {
+            handle =
+                backend.start(
+                    lookup);
+            backend.finish(
+                handle,
+                std::span<std::byte>(
+                    host_staging.data(),
+                    static_cast<std::size_t>(
+                        sync_lookup_bytes)));
+            handle = 0;
+        } catch (...) {
+            if (handle != 0) {
+                backend.cancel(handle);
+            }
+            throw;
+        }
+    }
+
+    }
+
+    const auto lookup_bytes =
+        static_cast<std::uint64_t>(
+            hash.row_count) *
+        hash_contract.row_bytes;
+
+    auto* workspace =
+        reinterpret_cast<std::byte*>(
+            temporary.address);
+    auto* gathered =
+        reinterpret_cast<std::uint16_t*>(
+            workspace +
+            workspace_layout.gathered_offset);
+
+    if (lookup_bytes != workspace_layout.gathered_bytes || lookup_bytes > host_staging.size()) {
+        throw std::invalid_argument("PLE gathered upload does not match its exact workspace region");
+    }
+    if (graph && graph->graph_capture) {
+        auto gathered_view = temporary;
+        gathered_view.address = reinterpret_cast<std::uintptr_t>(gathered);
+        gathered_view.bytes = workspace_layout.gathered_bytes;
+        validate_graph_ple_bindings(hash_contract, graph->vocabulary_size, graph->context_tokens,
+            *tensors.table.runtime, graph->arguments, graph->status, gathered_view,
+            graph->ngram_input, graph->ngram_output);
+        DevicePleHash h{};
+        h.ngram = hash_contract.ngram_size; h.heads_per_ngram = hash_contract.heads_per_ngram;
+        h.heads = hash_contract.head_count; h.width = hash_contract.head_dim; h.eos = hash_contract.eos_token_id;
+        std::copy_n(hash_contract.multipliers.begin(), 8, h.multipliers);
+        std::copy_n(hash_contract.head_offsets.begin(), 32, h.offsets);
+        std::copy_n(hash_contract.head_vocab_sizes.begin(), 32, h.vocabularies);
+        hipLaunchKernelGGL(graph_ple_gather_kernel, dim3((h.heads * h.width + 255U) / 256U), dim3(256),
+            0, graph->stream, h, reinterpret_cast<const std::uint16_t*>(tensors.table.runtime->address),
+            reinterpret_cast<const std::uint32_t*>(graph->arguments.memory.arena_base + graph->arguments.token_offset),
+            hip_graph_position(), reinterpret_cast<const std::uint32_t*>(graph->ngram_input.arena_base),
+            gathered, graph->vocabulary_size, graph->context_tokens, hip_graph_status());
+        check_hip(hipGetLastError(), "resident PLE graph hash/gather");
+    } else {
+    // The synchronous host upload uses the backend/default copy stream. An
+    // explicit nonblocking eager stream must first release reused arena views.
+    // This also keeps stack staging lifetime independent of async copy errors.
+    if (graph) check_hip(hipStreamSynchronize(graph->stream), "PLE eager upload arena fence");
+    if (config.upload_pool != nullptr) {
+        auto destination = temporary;
+        destination.address = reinterpret_cast<std::uintptr_t>(gathered);
+        destination.bytes = workspace_layout.gathered_bytes;
+        const auto ticket = config.upload_pool->start(
+            std::span<const std::byte>(host_staging.data(), static_cast<std::size_t>(lookup_bytes)),
+            destination);
+        // Preserve the eager synchronous boundary: dependent projections only
+        // start after the copy's event proves the retained host input released.
+        config.upload_pool->wait(ticket, destination);
+    } else {
+        check_hip(hipMemcpy(gathered, host_staging.data(), static_cast<std::size_t>(lookup_bytes),
+                            hipMemcpyHostToDevice), "copy PLE gathered embedding");
+    }
+    }
+
+    enqueue_ple_device(prepared, gathered);
+
     if (graph && graph->graph_capture) {
         hipLaunchKernelGGL(graph_ple_history_kernel, dim3(1), dim3(1), 0, graph->stream,
             reinterpret_cast<const std::uint32_t*>(graph->arguments.memory.arena_base + graph->arguments.token_offset),
@@ -1718,6 +1830,14 @@ std::uint64_t implementation_identity(
 }
 
 }  // namespace
+void testing::enqueue_ple_q8_projection(bool wave8,const std::uint16_t* input,const void* q8,std::uint32_t input_width,
+    std::uint32_t output_width,float* output,void* stream) {
+    const auto s=static_cast<hipStream_t>(stream);
+    if(wave8) hipLaunchKernelGGL(project_wave8_q8_bf16_to_fp32_kernel,dim3((output_width+7U)/8U),dim3(256),0,s,input,q8,input_width,output_width,output);
+    else hipLaunchKernelGGL(HIP_KERNEL_NAME(project_bf16_to_fp32_kernel<WeightKind::q8_0>),dim3(output_width),dim3(kThreads),0,s,
+        input,q8,input_width,output_width,output);
+    check_hip(hipGetLastError(),"PLE Q8 projection test launch");
+}
 
 struct HipPleLauncherBundle::OwnedUploads {
     AllocationGenerationSource generations;
@@ -1886,6 +2006,197 @@ register_for_compiled_execution(
 
     throw std::invalid_argument(
         "compiled execution has no PLE step");
+}
+
+struct HipPleKnownWindow::Impl {
+    HipPleLauncherConfig config;
+    std::uint32_t max_rows = 0, rows = 0, slot = 0;
+    std::uint64_t stride = 0, conv_bytes = 0;
+    std::array<std::byte*, 2> staging{};
+    std::array<hipEvent_t, 2> released{};
+    std::array<bool, 2> recorded{};
+    std::byte* snapshots = nullptr;
+    float* projections = nullptr;   // every row's key, then every row's value
+    std::uintptr_t conv_address = 0, ngram_address = 0;
+    std::vector<PleHashResult> hashes;
+    ~Impl() {
+        for (auto* p : staging) if (p) (void)hipHostFree(p);
+        for (auto e : released) if (e) (void)hipEventDestroy(e);
+        if (snapshots) (void)hipFree(snapshots);
+        if (projections) (void)hipFree(projections);
+    }
+    // Key and value projections of all rows, each Q8 weight block read once (the per-row
+    // wave8 arithmetic). False when a projection is not wave8 Q8: rows project one by one.
+    bool project_rows(const PreparedPleLaunch& p, const std::uint16_t* gathered, std::uint32_t count) const {
+        const auto width = static_cast<std::uint32_t>(config.model.ple_embed_dim);
+        if (weight_kind(p.tensors.key.manifest->ggml_type) != WeightKind::q8_0 ||
+            weight_kind(p.tensors.value.manifest->ggml_type) != WeightKind::q8_0 || width % 32U) return false;
+        const auto expanded = static_cast<std::uint32_t>(p.expanded), hidden = static_cast<std::uint32_t>(config.model.hidden_size);
+        const auto in_stride = static_cast<std::uint32_t>(stride / sizeof(std::uint16_t));
+        float* keys = projections; float* values = projections + static_cast<std::uint64_t>(max_rows) * expanded;
+        const auto launch = [&](auto rows) {
+            constexpr unsigned R = decltype(rows)::value;
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(project_wave8_q8_bf16_to_fp32_rows_kernel<R>), dim3((expanded + 7U) / 8U), dim3(256), 0,
+                hip_execution_stream(), gathered, in_stride, reinterpret_cast<const void*>(p.tensors.key.runtime->address), width,
+                expanded, keys, expanded);
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(project_wave8_q8_bf16_to_fp32_rows_kernel<R>), dim3((hidden + 7U) / 8U), dim3(256), 0,
+                hip_execution_stream(), gathered, in_stride, reinterpret_cast<const void*>(p.tensors.value.runtime->address), width,
+                hidden, values, hidden);
+        };
+        switch (count) {
+        case 1: launch(std::integral_constant<unsigned, 1>{}); break;
+        case 2: launch(std::integral_constant<unsigned, 2>{}); break;
+        case 3: launch(std::integral_constant<unsigned, 3>{}); break;
+        case 4: launch(std::integral_constant<unsigned, 4>{}); break;
+        case 5: launch(std::integral_constant<unsigned, 5>{}); break;
+        case 6: launch(std::integral_constant<unsigned, 6>{}); break;
+        case 7: launch(std::integral_constant<unsigned, 7>{}); break;
+        case 8: {
+            // Eight register-resident rows run 3x slower than two four-row passes (same rows' arithmetic).
+            launch(std::integral_constant<unsigned, 4>{});
+            const auto* upper = gathered + 4U * in_stride;
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(project_wave8_q8_bf16_to_fp32_rows_kernel<4>), dim3((expanded + 7U) / 8U), dim3(256), 0,
+                hip_execution_stream(), upper, in_stride, reinterpret_cast<const void*>(p.tensors.key.runtime->address), width,
+                expanded, keys + 4ULL * expanded, expanded);
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(project_wave8_q8_bf16_to_fp32_rows_kernel<4>), dim3((hidden + 7U) / 8U), dim3(256), 0,
+                hip_execution_stream(), upper, in_stride, reinterpret_cast<const void*>(p.tensors.value.runtime->address), width,
+                hidden, values + 4ULL * hidden, hidden);
+            break;
+        }
+        default: return false;
+        }
+        check_hip(hipGetLastError(), "known-window PLE rows projection launch");
+        return true;
+    }
+    std::vector<PreparedPleLaunch> prepare(std::span<const ExecutionDispatchContext> spans) {
+        if (spans.empty() || spans.size() > max_rows)
+            throw std::invalid_argument("known-window PLE row count exceeds its staging");
+        if (!spans[0].resources || !spans[0].resources->ple_lookup)
+            throw std::invalid_argument("known-window PLE requires a host lookup backend");
+        std::vector<PreparedPleLaunch> out;
+        out.reserve(spans.size());
+        for (std::size_t r = 0; r < spans.size(); ++r) {
+            out.push_back(prepare_ple_launch(spans[r], &config));
+            const auto& a = out.front(); const auto& b = out.back();
+            if (spans[r].position != spans[0].position + r || b.conv_state.address != a.conv_state.address ||
+                b.conv_state.bytes != a.conv_state.bytes || b.ngram_state.address != a.ngram_state.address ||
+                b.tensors.table.runtime != a.tensors.table.runtime ||
+                spans[r].resources->ple_lookup != spans[0].resources->ple_lookup)
+                throw std::invalid_argument("known-window PLE rows do not share one ordered session");
+        }
+        if (out[0].conv_state.bytes < conv_bytes)
+            throw std::invalid_argument("known-window PLE convolution state is undersized");
+        return out;
+    }
+};
+
+HipPleKnownWindow::HipPleKnownWindow(const ModelContract& model, HipActivationStorage activation, std::uint32_t max_rows)
+    : impl_(std::make_unique<Impl>()) {
+    auto& w = *impl_;
+    if (!max_rows || max_rows > 8U) throw std::invalid_argument("known-window PLE supports one to eight rows");
+    w.config.model = model; w.config.activation = activation; validate_config(w.config);
+    w.max_rows = max_rows;
+    w.stride = PleHashContract::maximum_heads * 512ULL;
+    w.conv_bytes = static_cast<std::uint64_t>(model.hidden_size * model.hc_count) *
+        (model.ple_conv_kernel_size - 1ULL) * model.ngram_size * model.bytes_bf16;
+    for (std::size_t i = 0; i < 2; ++i) {
+        void* p = nullptr;
+        check_hip(hipHostMalloc(&p, w.stride * max_rows, hipHostMallocMapped | hipHostMallocCoherent), "known-window PLE staging");
+        w.staging[i] = static_cast<std::byte*>(p);
+        check_hip(hipEventCreateWithFlags(&w.released[i], hipEventDisableTiming), "known-window PLE staging event");
+    }
+    void* snap = nullptr;
+    check_hip(hipMalloc(&snap, w.conv_bytes * max_rows), "known-window PLE convolution snapshots");
+    w.snapshots = static_cast<std::byte*>(snap);
+    void* projections = nullptr;
+    check_hip(hipMalloc(&projections, sizeof(float) * max_rows * model.hidden_size * (model.hc_count + 1ULL)),
+        "known-window PLE row projections");
+    w.projections = static_cast<float*>(projections);
+    w.hashes.resize(max_rows);
+}
+HipPleKnownWindow::~HipPleKnownWindow() = default;
+std::uint32_t HipPleKnownWindow::last_rows() const noexcept { return impl_->rows; }
+
+void HipPleKnownWindow::preflight(std::span<const ExecutionDispatchContext> rows) const {
+    static_cast<void>(impl_->prepare(rows));
+}
+
+void HipPleKnownWindow::launch(std::span<const ExecutionDispatchContext> rows) {
+    auto& w = *impl_;
+    const auto prepared = w.prepare(rows);
+    const auto& contract = prepared[0].hash_contract;
+    auto& backend = *rows[0].resources->ple_lookup;
+    auto* prefetch = rows[0].resources->ple_prefetch;
+    const auto context_count = static_cast<std::size_t>(w.config.model.ngram_size - 1ULL);
+    std::array<std::uint32_t, PleHashContract::maximum_ngram - 1> previous{};
+    if (rows[0].position == 0)
+        std::fill_n(previous.begin(), context_count, static_cast<std::uint32_t>(w.config.model.ple_eos_token_id));
+    else
+        std::memcpy(previous.data(), reinterpret_cast<const void*>(prepared[0].ngram_state.address),
+            context_count * sizeof(std::uint32_t));
+    w.slot ^= 1U;
+    // The slot was last read by the window before the previous one.
+    if (w.recorded[w.slot]) check_hip(hipEventSynchronize(w.released[w.slot]), "known-window PLE staging reuse");
+    auto* staging = w.staging[w.slot];
+    for (std::size_t r = 0; r < rows.size(); ++r) {
+        auto* destination = staging + r * w.stride;
+        PleHashResult hash;
+        if (r == 0 && prefetch && prefetch->active) {
+            if (prefetch->lookup_bytes > w.stride) throw std::overflow_error("PLE prefetched lookup exceeds window staging");
+            hash = finish_ple_lookup_prefetch(rows[0].input_token_id, rows[0].position, backend, *prefetch,
+                std::span<std::byte>(destination, static_cast<std::size_t>(prefetch->lookup_bytes)));
+        } else {
+            hash = hash_ple_token(contract, rows[r].input_token_id,
+                std::span<const std::uint32_t>(previous.data(), context_count));
+            const auto bytes = static_cast<std::uint64_t>(hash.row_count) * contract.row_bytes;
+            if (bytes > w.stride) throw std::overflow_error("PLE lookup exceeds window staging");
+            PleLookupRequest lookup;
+            lookup.row_ids = std::span<const std::uint64_t>(hash.row_ids.data(), hash.row_count);
+            lookup.row_bytes = contract.row_bytes;
+            lookup.table_manifest = prepared[r].tensors.table.manifest;
+            lookup.table_runtime = prepared[r].tensors.table.runtime;
+            PleLookupHandle handle = 0;
+            try {
+                handle = backend.start(lookup);
+                backend.finish(handle, std::span<std::byte>(destination, static_cast<std::size_t>(bytes)));
+                handle = 0;
+            } catch (...) { if (handle) backend.cancel(handle); throw; }
+        }
+        if (static_cast<std::uint64_t>(hash.row_count) * contract.row_bytes != prepared[r].workspace_layout.gathered_bytes)
+            throw std::invalid_argument("PLE window lookup does not match its gathered extent");
+        std::copy_n(hash.next_context.begin(), context_count, previous.begin());
+        w.hashes[r] = hash;
+    }
+    void* device = nullptr;
+    check_hip(hipHostGetDevicePointer(&device, staging, 0), "known-window PLE staging device view");
+    const auto stream = hip_execution_stream();
+    const bool projected = w.project_rows(prepared[0], static_cast<const std::uint16_t*>(device), static_cast<std::uint32_t>(rows.size()));
+    const auto expanded = prepared[0].expanded, hidden = w.config.model.hidden_size;
+    for (std::size_t r = 0; r < rows.size(); ++r) {
+        auto* gathered = reinterpret_cast<std::uint16_t*>(static_cast<std::byte*>(device) + r * w.stride);
+        if (projected)
+            enqueue_ple_device(prepared[r], gathered, w.projections + r * expanded,
+                w.projections + w.max_rows * expanded + r * hidden);
+        else enqueue_ple_device(prepared[r], gathered);
+        check_hip(hipMemcpyAsync(w.snapshots + r * w.conv_bytes, reinterpret_cast<const void*>(prepared[r].conv_state.address),
+            w.conv_bytes, hipMemcpyDeviceToDevice, stream), "known-window PLE convolution snapshot");
+    }
+    check_hip(hipEventRecord(w.released[w.slot], stream), "known-window PLE staging release");
+    w.recorded[w.slot] = true;
+    w.rows = static_cast<std::uint32_t>(rows.size());
+    w.conv_address = prepared[0].conv_state.address; w.ngram_address = prepared[0].ngram_state.address;
+}
+
+void HipPleKnownWindow::commit(std::uint32_t n_keep, void* stream) {
+    auto& w = *impl_;
+    if (!w.rows || !n_keep || n_keep > w.rows) throw std::invalid_argument("known-window PLE commit outside the last window");
+    if (n_keep < w.rows)
+        check_hip(hipMemcpyAsync(reinterpret_cast<void*>(w.conv_address), w.snapshots + (n_keep - 1U) * w.conv_bytes,
+            w.conv_bytes, hipMemcpyDeviceToDevice, static_cast<hipStream_t>(stream)), "known-window PLE convolution commit");
+    const auto& hash = w.hashes[n_keep - 1U];
+    std::memcpy(reinterpret_cast<void*>(w.ngram_address), hash.next_context.data(),
+        static_cast<std::size_t>(hash.context_count) * sizeof(std::uint32_t));
+    w.rows = 0;
 }
 
 }  // namespace strix

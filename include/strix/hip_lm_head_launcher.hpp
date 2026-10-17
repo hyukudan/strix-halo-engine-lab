@@ -5,6 +5,7 @@
 #include "strix/launch_dispatch.hpp"
 
 #include <cstdint>
+#include <span>
 #include <string>
 
 namespace strix {
@@ -56,6 +57,16 @@ private:
     HipLmHeadLauncherConfig config_;
 };
 
+// Known-window terminal head for T=2..8 rows. Each context is the row's own R1
+// head dispatch; the configured eager prefetch BF16/Q8_0 head reads every weight
+// block once and keeps each row's R1 leaf/tree arithmetic, so every row's logits
+// equal its R1 launch bitwise. All rows share one head tensor; outputs are disjoint.
+inline constexpr std::uint32_t lm_head_window_max_rows = 8;
+void lm_head_known_window_rows_preflight(std::span<const ExecutionDispatchContext> rows,
+    const HipLmHeadLauncherConfig& config);
+void lm_head_known_window_rows_launch(std::span<const ExecutionDispatchContext> rows,
+    const HipLmHeadLauncherConfig& config);
+
 // Source-only native MTP entry points; qualification is separate.
 struct MtpNativeContext;
 struct MtpTensorView;
@@ -70,5 +81,9 @@ enum class HipMtpLmHeadRecipe : std::uint32_t {
 [[nodiscard]] std::uint64_t hip_mtp_lm_head_profile_identity(const ModelContract&,const MtpTensorView&);
 void preflight_hip_mtp_lm_head(const MtpNativeContext&);
 void launch_hip_mtp_lm_head(const MtpNativeContext&,void* stream);
+// Raw MTP draft head over Q8_0 rows [rows][hidden]: the prefetch8 wave8 recipe
+// above, so each row's logit is bit-identical to the same row of the full head.
+void launch_hip_q8_head_rows(const std::uint16_t* hidden,const void* q8_rows,std::uint32_t hidden_size,
+    std::uint32_t rows,float* logits,void* stream);
 
 }  // namespace strix

@@ -115,4 +115,43 @@ HipMtpNativeForwardReplayResult replay_hip_mtp_forward(HipMtpRuntime& runtime,st
         result.assessment=assess_mtp_forward_replay(request.policy,observation);return result;
     }catch(...){const_cast<HipMtpResources&>(owner).fail();throw;}
 }
+HipMtpForwardGolden capture_hip_mtp_forward_golden(HipMtpRuntime& runtime,std::span<const HipMtpReplayRow> inputs,
+    const ModelContentIdentity& source,std::uint64_t reference){
+    const auto& owner=runtime.resources();owner.validate();owner.require_idle();
+    require(current_hip_launch_context()==nullptr,"MTP golden capture must not borrow an active launch scope");
+    require(!runtime.failed() && runtime.next_source_position()==0U,"MTP golden capture requires a fresh native predictor");
+    require(source.valid() && reference && !inputs.empty() && inputs.size()<=reference_limit,"MTP golden capture pins or row count are invalid");
+    const auto width=mul(owner.model().hidden_size,owner.model().hc_count),vocabulary=owner.model().vocab_size;
+    require(width && width<=SIZE_MAX/2U && vocabulary && vocabulary<=UINT32_MAX && vocabulary<=SIZE_MAX/4U,
+        "MTP golden capture geometry is invalid");
+    HipMtpForwardGolden g;g.independent_source_content=source;g.independent_reference_identity=reference;
+    g.target_content=owner.shared_target().target_model_content_identity;g.sidecar_content=owner.shared_target().sidecar_model_content_identity;
+    g.structural_plan_identity=owner.plan().plan_identity;g.semantic_identity=owner.plan().forward_semantics.contract_identity;
+    g.numerical_profile_identity=runtime.numerical_profile_identity();g.rows.resize(inputs.size());
+    for(std::size_t i=0;i<inputs.size();++i){const auto& input=inputs[i];
+        require(input.hidden.valid() && input.hidden.same_producer(inputs[0].hidden) && input.hidden.source_position()==i &&
+            input.hidden.input_token()<vocabulary && input.next_input_token<vocabulary && i+1U<owner.context_capacity() &&
+            input.hidden.target_content_identity()==g.target_content && input.hidden.committed_session().next_position==i+1U &&
+            input.hidden.committed_session().health==SerialSessionHealth::ready && !input.hidden.committed_session().arithmetic_lineage.tainted,
+            "MTP golden capture target ticket is not its actual completed source row");}
+    const auto stream=static_cast<hipStream_t>(owner.stream());
+    try{
+        for(std::size_t i=0;i<inputs.size();++i){auto& row=g.rows[i];row.target_hidden_bf16.resize(static_cast<std::size_t>(width));
+            read(inputs[i].hidden.view(),row.target_hidden_bf16.data(),mul(width,2U),stream);}
+        check(hipStreamSynchronize(stream));
+        for(std::size_t i=0;i<inputs.size();++i){auto& row=g.rows[i];
+            const auto actual=runtime.execute_diagnostic(inputs[i].hidden,inputs[i].next_input_token);
+            require(actual.device_completed && actual.completed_steps==owner.plan().steps.size() && actual.source_position==i &&
+                actual.seed_position==i+1U && actual.numerical_profile_identity==g.numerical_profile_identity,
+                "MTP golden capture publication is not the complete native row");
+            row.source_position=i;row.source_input_token=inputs[i].hidden.input_token();row.next_input_token=inputs[i].next_input_token;
+            row.next_hidden_bf16.resize(static_cast<std::size_t>(width));row.full_logits.resize(static_cast<std::size_t>(vocabulary));
+            read(actual.wide_state,row.next_hidden_bf16.data(),mul(width,2U),stream);read(actual.logits,row.full_logits.data(),mul(vocabulary,4U),stream);
+            check(hipStreamSynchronize(stream));row.selected_token=firstmax(row.full_logits);
+            require(row.selected_token==actual.token,"MTP device first-max differs from full CPU first-max");
+            for(auto v:row.next_hidden_bf16)require(std::isfinite(decode(v)),"MTP native wide hidden is nonfinite");
+            for(auto v:row.target_hidden_bf16)require(std::isfinite(decode(v)),"MTP target hidden is nonfinite");}
+        return g;
+    }catch(...){const_cast<HipMtpResources&>(owner).fail();throw;}
+}
 } // namespace strix

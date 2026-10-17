@@ -96,5 +96,52 @@ void qualify() {
     strix::launch_hip_mtp_input_fusion(r,stream.value);check(hipMemcpyAsync(actual.data(),out.p,out.bytes,hipMemcpyDeviceToHost,stream.value));check(hipStreamSynchronize(stream.value));
     for(auto value:actual)require(value==bf16(0.5F),"embedding projection was not broadcast to each stream");
 }
+// Production geometry takes the staged kernel: its projection scratch must equal
+// host coefficient-first ascending fmaf chains over the device-normalized input.
+void qualify_staged() {
+    constexpr unsigned h=2560U,hc=4U,wide=h*hc,stride=2U*h/32U*34U;
+    Stream stream;Buffer e(h*4U),x(wide*4U),en(h*4U),hn(wide*4U),weights(static_cast<std::uint64_t>(h)*stride);
+    const auto scratch=strix::hip_mtp_input_fusion_scratch_bytes(h,hc);
+    Buffer n(scratch),p(scratch),out(wide*2U);
+    std::uint32_t seed=12345U;const auto next=[&]{seed=seed*1664525U+1013904223U;return seed;};
+    const auto uniform=[&]{return static_cast<float>(next()>>8U)/16777216.0F*2.0F-1.0F;};
+    std::vector<float> ev(h),hv(wide),ew(h),hw(wide);
+    for(auto& v:ev)v=uniform();
+    for(auto& v:hv)v=uniform();
+    for(auto& v:ew)v=uniform();
+    for(auto& v:hw)v=uniform();
+    std::vector<unsigned char> w(static_cast<std::size_t>(h)*stride);
+    for(unsigned row=0;row<h;++row)for(unsigned block=0;block<2U*h/32U;++block) {
+        auto* b=w.data()+static_cast<std::size_t>(row)*stride+block*34U;
+        const std::uint16_t scale=static_cast<std::uint16_t>(0x2000U+(next()%0x1000U));std::memcpy(b,&scale,2U);
+        for(unsigned k=0;k<32U;++k)b[2U+k]=static_cast<unsigned char>(next());
+    }
+    upload(e,ev,stream);upload(x,hv,stream);upload(en,ew,stream);upload(hn,hw,stream);upload(weights,w,stream);
+    for(const auto rounding:{strix::HipMtpInputRounding::fp32,strix::HipMtpInputRounding::bf16_rne}) {
+        strix::HipMtpInputFusionRequest r;r.hidden_size=h;r.hc_count=hc;r.epsilon=1e-6F;
+        r.embedding_storage=r.hidden_storage=strix::HipMtpInputStorage::fp32;r.output_storage=strix::HipMtpInputStorage::bf16;
+        r.normalized_rounding=strix::HipMtpInputRounding::fp32;r.projection_rounding=rounding;
+        r.norm_encoding_admitted=true;r.norm_weight_encoding=strix::MtpNormWeightEncoding::effective_scale;
+        r.embedding=e.view();r.wide_hidden=x.view();r.embedding_norm=en.view();r.hidden_norm=hn.view();
+        r.packed_projection=weights.view();r.projection_row_stride_bytes=stride;
+        r.normalized_scratch=n.view();r.projection_scratch=p.view();r.output=out.view();
+        strix::launch_hip_mtp_input_fusion(r,stream.value);
+        std::vector<float> normalized(scratch/4U),projected(scratch/4U);
+        check(hipMemcpyAsync(normalized.data(),n.p,scratch,hipMemcpyDeviceToHost,stream.value));
+        check(hipMemcpyAsync(projected.data(),p.p,scratch,hipMemcpyDeviceToHost,stream.value));check(hipStreamSynchronize(stream.value));
+        const auto coefficient=[&](unsigned row,unsigned column){
+            const auto* b=w.data()+static_cast<std::size_t>(row)*stride+(column/32U)*34U;std::uint16_t bits;std::memcpy(&bits,b,2U);
+            return static_cast<float>(std::bit_cast<_Float16>(bits))*static_cast<float>(static_cast<signed char>(b[2U+column%32U]));};
+        const auto round=[&](float v){return rounding==strix::HipMtpInputRounding::bf16_rne?std::bit_cast<float>(static_cast<std::uint32_t>(bf16(v))<<16U):v;};
+        for(unsigned row=0;row<h;++row) {
+            float embedding=0.0F,sums[hc]={};
+            for(unsigned col=0;col<h;++col)embedding=std::fma(coefficient(row,col),normalized[col],embedding);
+            for(unsigned col=0;col<h;++col){const float c=coefficient(row,h+col);for(unsigned s=0;s<hc;++s)sums[s]=std::fma(c,normalized[h+s*h+col],sums[s]);}
+            require(std::bit_cast<std::uint32_t>(projected[row])==std::bit_cast<std::uint32_t>(round(embedding)),"staged embedding chain differs");
+            for(unsigned s=0;s<hc;++s)
+                require(std::bit_cast<std::uint32_t>(projected[h+s*h+row])==std::bit_cast<std::uint32_t>(round(sums[s])),"staged HC chain differs");
+        }
+    }
 }
-int main(){try{qualify();std::cout<<"MTP input fusion component passed; checkpoint qualification separate\n";return 0;}catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}
+}
+int main(){try{qualify();qualify_staged();std::cout<<"MTP input fusion component passed; checkpoint qualification separate\n";return 0;}catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}

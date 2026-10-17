@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <atomic>
 #include <memory>
+#include <span>
 #include <string>
 #include <string_view>
 
@@ -73,6 +74,14 @@ void preflight_q8_hyper_output_model(const CompiledSerialExecution& compiled,
 
 void preflight_splitk_hyper_projection_model(const CompiledSerialExecution& compiled,
     const ExecutionRuntimeResources& resources, const HipHyperMixLauncherConfig& config);
+
+// Known-window rows (2..8 C1 contexts of one attn/mlp/final HC step). Each row
+// produces the bytes of its serial typed prefetched Q8 launch (split-K or v8
+// projection, lane-chain or Q8 batched output); HC weights are read once.
+void hyper_mix_known_window_rows_preflight(std::span<const ExecutionDispatchContext> rows,
+    const HipHyperMixLauncherConfig& config);
+void hyper_mix_known_window_rows_launch(std::span<const ExecutionDispatchContext> rows,
+    const HipHyperMixLauncherConfig& config);
 
 class HipHyperMixLauncherBundle {
 public:
