@@ -1,60 +1,106 @@
-# Estado de implementación
+# Implementation status
 
 Current cross-cutting summary: [qualification ledger](docs/qualification-ledger.md).
 The slices below are retained implementation history, not native qualification.
 
-## Slice A0.1 — núcleo portable
+## Current state (2026-10-17, f429bd6)
 
-Implementado:
+Speculative MTP decode path. Details: [README.md](README.md) and
+[DECISIONS.md](DECISIONS.md).
 
-- proyecto CMake C++20 sin dependencias externas;
-- contrato de shapes Qwen3.8-Flash-Next fijado desde el config oficial;
-- planificador de memoria con aritmética comprobada contra overflow;
-- desglose KV base, MTP, indexer provisional, GDN FP32, rollback, modelo y cachés;
-- decisión de admisión desde MemTotal, baseline y reserva explícita;
-- CLI JSON `strix-memory-plan`, preparada para alimentar la futura WebUI;
-- oráculo top-k candidato con empates deterministas y rechazo de NaN;
-- pruebas CTest en Linux/WSL con warnings-as-errors.
+- **Target:** AMD Strix Halo `gfx1151` (Ryzen AI Max+ 395, 128 GB UMA), ROCm
+  core-10.1. Model: Qwen3.8-Flash-Next (MoE, GDN recurrent layers, QSA indexed
+  attention, PLE n-gram table, hyper-connections) as a UD-Q4_K_XL GGUF plus a
+  Q8_0 MTP sidecar.
+- **Draft:** MTP draft chain over a draft vocabulary subset
+  (`--mtp-draft-vocab`, `--mtp-draft-context-vocab`). Q4_0 copies of the draft
+  projections are on by default (`STRIX_MTP_DRAFT_Q4_ALL=0` disables). The chain
+  stops early once the draft probability falls below `--mtp-spec-min-p` (0.85 in
+  the measurements below).
+- **Verification:** exact target verification in known-prefix windows of 2, 4 or
+  8 rows (`--mtp-target-window-rows-set 2,4,8`), chosen per cycle by an online
+  cost model (the first window per owner is not taken as a sample; samples are
+  capped at 2x the estimate). Longest-accepted-prefix acceptance with deferred
+  GDN state commit (no state checkpoint); routed experts are executed as a union
+  per window. Output is bit-identical to serial greedy decode.
+- **Measured** on one Bosgame M5 node (Ryzen AI Max+ 395, 128 GB), UD-Q4_K_XL,
+  256 generated tokens: Python code prompt 48.4 tok/s stable (49.5 tok/s with a
+  smaller draft vocabulary); prose ~34–37 tok/s; output identical across runs.
+  These are local workload measurements, not qualification evidence.
+- **Recent increments** (all bit-exact; `{2,4,8}` window-set measurements from
+  the commit log):
+  - any-order launches for kernels independent of the preceding one
+    (`STRIX_ANYORDER=0` disables): 45.3 -> 46.0 tok/s;
+  - PLE 8-row windows projected as two 4-row passes: 46.7 tok/s;
+  - QSA attention output with eight slots of loads issued ahead: 47.3 tok/s;
+  - robust window cost model plus Q4_0 draft copies by default: 47.9 tok/s;
+  - file-backed PLE n-gram table populated after model registration with
+    `MADV_RANDOM` + `MADV_POPULATE_READ` (`STRIX_PLE_WARM=0` skips), so decode
+    does not read from disk after another process evicted the pages;
+  - GDN rows use a fused FMA (neutral).
+- **Diagnostics:** `STRIX_CYCLE_TIMING=1` (host phase marks),
+  `STRIX_CYCLE_LOG=1` (per-cycle window rows and wall time).
 
-No implementado o deliberadamente bloqueado:
+## Slice A0.1 — portable core
 
-- semántica QSA canónica, n-gram/PLE, hyper-connections y GDN: esperan contratos
-  oficiales/oráculos antes de crear kernels;
-- allocator/residency HIP y kernels `gfx1151`;
-- MTP sampled;
-- servidor y panel administrativo.
+Implemented:
 
-## Reproducción
+- dependency-free C++20 CMake project;
+- Qwen3.8-Flash-Next shape contract pinned from the official config;
+- memory planner with overflow-checked arithmetic;
+- breakdown of base KV, MTP, provisional indexer, FP32 GDN, rollback, model and
+  caches;
+- admission decision from MemTotal, baseline and an explicit reserve;
+- JSON CLI `strix-memory-plan`, ready to feed the future WebUI;
+- candidate top-k oracle with deterministic ties and NaN rejection;
+- CTest tests on Linux/WSL with warnings-as-errors.
+
+Not implemented or deliberately blocked:
+
+- canonical QSA semantics, n-gram/PLE, hyper-connections and GDN: waiting for
+  official contracts/oracles before writing kernels;
+- HIP allocator/residency and `gfx1151` kernels;
+- sampled MTP;
+- server and administration panel.
+
+> Note (2026-10-17): the first two items above are superseded. Later slices
+> (A1.x) and the commit log through `f429bd6` add HIP residency and `gfx1151`
+> kernels for QSA, PLE/n-gram, hyper-connections and GDN, used by the greedy MTP
+> path described in "Current state". Sampled MTP decode is not part of that path.
+
+## Reproduction
 
 ```bash
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
 cmake --build build
 ctest --test-dir build --output-on-failure
-./build/strix-memory-plan --tokens 32768 --sessions 1 \
-  --resident-gib 68 --baseline-gib 2 --reserve-gib 18
+./build/strix-memory-plan --tokens 32768 --sessions 1   --resident-gib 68 --baseline-gib 2 --reserve-gib 18
 ./build/strix-platform-probe
 ./build/strix-model-manifest MODEL.gguf
 ```
 
-El indexer es una estimación provisional derivada del config. Se puede excluir
-con `--no-indexer`. `--rollback-full` permite cuantificar por qué copiar el
-estado GDN completo por borrador no escala; el camino objetivo será snapshot
-mínimo más recompute si el contrato lo permite.
+The indexer size is a provisional estimate derived from the config. It can be
+excluded with `--no-indexer`. `--rollback-full` quantifies why copying the full
+GDN state per draft does not scale; the target path will be a minimal snapshot
+plus recompute if the contract allows it.
 
-## Slice A0.2 — inspección GGUF
+> Note (2026-10-17): the current MTP path uses deferred GDN state commit with no
+> state checkpoint (commits `8793b4f`, `1212d3f`).
 
-Implementado en `include/strix/gguf_reader.hpp` y `src/gguf_reader.cpp`: lector
-GGUF v3 little-endian defensivo y CLI `strix-inspect-gguf`. Valida metadata,
-arrays, directorio tensorial, geometría de bloques, tamaños, alineación, rangos
-y solapamientos sin cargar los datos de pesos.
-Las limitaciones y la revisión canónica se documentan en `GGUF_READER.md`.
+## Slice A0.2 — GGUF inspection
 
-Validación actual:
+Implemented in `include/strix/gguf_reader.hpp` and `src/gguf_reader.cpp`: a
+defensive little-endian GGUF v3 reader and the `strix-inspect-gguf` CLI. It
+validates metadata, arrays, the tensor directory, block geometry, sizes,
+alignment, ranges and overlaps without loading weight data.
+Limitations and the canonical review are documented in `GGUF_READER.md`.
 
-- build `RelWithDebInfo` con `-Werror`;
-- fixtures válidos y corruptos en CTest;
-- build Debug con AddressSanitizer y UndefinedBehaviorSanitizer;
-- 100 % de las pruebas actuales superadas en ambos builds.
+Current validation:
+
+- `RelWithDebInfo` build with `-Werror`;
+- valid and corrupt fixtures in CTest;
+- Debug build with AddressSanitizer and UndefinedBehaviorSanitizer;
+- 100 % of the current tests pass in both builds.
 
 
 ## Slice A0.4 — model manifest
@@ -205,7 +251,9 @@ Standalone `lab/basic_kernels/` implemented for native ROCm:
 
 Still pending:
 
-- native M5/Strix Halo build and execution;
+- native M5/Strix Halo build and execution (2026-10-17: native `gfx1151`
+  kernels now build and run on an M5 node as part of the decode path, see
+  "Current state"; the remaining items are not closed by that);
 - Wave32 versus Wave64 measurements;
 - profiler-derived VGPR/LDS/spill confirmation;
 - graph-capture qualification;
@@ -224,11 +272,14 @@ Host-side planning implemented:
 - activation input/output byte accounting;
 - serial repeated-weight traffic versus ideal reused-weight lower bound;
 - overflow and quant-block divisibility checks;
-- CTest coverage including Q4_K, Q8_0 and IQ4_XS geometry;\n- independent IQ4_XS 136-byte block/dequant contract with nonlinear codebook and 6-bit local-scale extraction;\n- host IQ4_XS fixture compiled with strict warnings and passing.
+- CTest coverage including Q4_K, Q8_0 and IQ4_XS geometry;
+- independent IQ4_XS 136-byte block/dequant contract with nonlinear codebook and 6-bit local-scale extraction;
+- host IQ4_XS fixture compiled with strict warnings and passing.
 
 Standalone `lab/packed_projection/` implemented:
 
-- Q8_0 packed reference kernel for `gfx1151`;\n- IQ4_XS compact packed candidate for `gfx1151`;
+- Q8_0 packed reference kernel for `gfx1151`;
+- IQ4_XS compact packed candidate for `gfx1151`;
 - packed block is consumed directly inside compute; no full dequantized weight tensor;
 - compile-time C1/2/4/8 logical-row variants;
 - each decoded packed weight is reused across active logical rows;
@@ -244,7 +295,8 @@ Still pending:
 
 - native Strix Halo build/profile;
 - canonical compact checkpoint format selection;
-- native compile/profile of the IQ4_XS compact path and comparison against Q8_0;\n- canonical checkpoint-format decision after quality plus full memory/runtime qualification;
+- native compile/profile of the IQ4_XS compact path and comparison against Q8_0;
+- canonical checkpoint-format decision after quality plus full memory/runtime qualification;
 - BF16/mixed-precision activation variants;
 - profiler spill/LDS/VALU/WMMA analysis;
 - promotion into a target-qualified kernel plan.
@@ -382,7 +434,9 @@ Implemented through an experimental C1/BF16 HIP path:
 
 Still pending:
 
-- native Strix Halo build/run of the complete HIP path;
+- native Strix Halo build/run of the complete HIP path (2026-10-17: the HIP
+  path now builds and runs natively on a Strix Halo node, see "Current state";
+  qualification status is tracked in the qualification ledger);
 - execute the complete-request and prefix-cache round-trip gates on native Strix Halo against the canonical checkpoint/tokenizer contract;
 - asynchronous production PLE lookup/staging rather than the current file-backed seam;
 - promotion from experimental bindings only after native correctness and resource qualification.
@@ -438,7 +492,7 @@ Additional A1.6 runtime work now implemented:
 - next-step MTP draft state is pinned as the post-block wide residual before final head collapse, with width `hc_count * hidden_size = 10240` for the target model;
 - concrete move-only MTP draft-state memory ownership now allocates and validates a proposal-identity-bound device buffer with explicit row count, element size, alignment and allocation generation;
 - a composed MTP forward contract validates cross-stage geometry and checkpoint/tensor/output bindings across input fusion, attention, wide draft state and final output, producing a relocation-stable composition identity while leaving numerical execution gated on replay/kernels;
-- the current upstream Qwen4Exp NextN graph is now distilled into a versioned semantic contract: per-HC hidden RMS normalization, repeated normalized token embedding, embedding-before-hidden concat into the 2×hidden `eh_proj`, attention combine before FFN combine, publication of the wide next-state only after the FFN combine and before a no-injection head mix, then LM head; this semantic contract contributes to compiled MTP plan identity but does not bypass independent replay qualification;
+- the Qwen4Exp NextN graph semantics are now pinned in a versioned semantic contract: per-HC hidden RMS normalization, repeated normalized token embedding, embedding-before-hidden concat into the 2×hidden `eh_proj`, attention combine before FFN combine, publication of the wide next-state only after the FFN combine and before a no-injection head mix, then LM head; this semantic contract contributes to compiled MTP plan identity but does not bypass independent replay qualification;
 - a qualified MTP forward runtime adapter now connects the speculative drafter seam to the replay-qualified step runtime: each candidate obtains a validated cycle input (seed token/position/wide hidden), executes the qualified forward, reads a bounded vocabulary token and delegates post-target reconciliation without inventing native numerics;
 - a qualified MTP forward runtime walks the compiled 11-step predictor sequence through an explicit backend interface, validates plan/binding/proposal-state/draft-memory before dispatch, and stops immediately on backend failure; this creates the kernel integration seam without bypassing replay qualification;
 - the qualified MTP draft wrapper now requires that physical state binding and passes it to the forward/reconciliation backend, preventing model-backed proposal compute from running against absent or foreign draft-state storage;
@@ -460,6 +514,13 @@ Additional A1.6 runtime work now implemented:
 Sampled speculative mathematics, RNG stream identity/consumption and the portable acceptance/residual sampler are fixed and distribution-qualified. Host-side rollback/commit execution is explicit. A compiled sampled backend now joins the already-materialized serial base distribution with D verify-row distributions through a stable FP32 softmax collector, while a HIP logits reader provides the device-to-host materialization seam without leaking HIP into the speculation core; native end-to-end sampled qualification remains pending. The draft proposal seam is integrated, but concrete proposal-state
 MTP compute semantics/kernels and native proposal qualification remain
 open; host-side measured drafter selection is now wired through repeatable campaign aggregation.
+
+> Note (2026-10-17): superseded for greedy decode. The commit log through
+> `f429bd6` adds a native MTP draft head and draft chain (`f8a2d2e` onwards) and
+> verifies drafts in known-prefix windows with longest-prefix acceptance and
+> deferred GDN state commit, without a pre-window state snapshot (`8793b4f`,
+> `1212d3f`). See "Current state" at the top. Sampled speculative decode remains
+> as described above.
 
 
 ## Slice A1.5b — compiled eager serial runtime

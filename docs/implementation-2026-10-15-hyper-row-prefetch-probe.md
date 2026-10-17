@@ -25,8 +25,8 @@ pointers.
 
 Coefficient decoding calls the unchanged Q8_0/F32 helper. Consumer feature
 order, positive-zero accumulator, FP32 operations, epilogues, two uniform
-barriers per tile,128 threads,128 feature values and8Ã—129 coefficient pitch
-are copied unchanged. The4,640-byte shared allocation and existing4,864-byte
+barriers per tile, 128 threads, 128 feature values and 8×129 coefficient pitch
+are copied unchanged. The 4,640-byte shared allocation and existing 4,864-byte
 declaration, global workspace and type preflight are retained. There is no
 cross-tile prefetch, new launch bound, scheduler builtin, floating-point option
 or cache transformation.
@@ -45,11 +45,11 @@ be run. Current typed-projection qualification does not qualify this probe.
 
 The separate `prefetch` mode of the hyper-mix operator test now prepares
 144 finite geometry/storage/operation cases. It covers every partial-row count,
-hc2 through8, lowrank1 through the512 bound, widths below128 and with tile
-tails, and canonical width10240/lowrank320. Partial lowrank fixtures use F32
-up projections where Q8 up would require a multiple-of32 input width.
+hc 2 through 8, lowrank 1 through the 512 bound, widths below 128 and with tile
+tails, and canonical width 10240/lowrank 320. Partial lowrank fixtures use F32
+up projections where Q8 up would require a multiple-of-32 input width.
 The oracle compares normalized and low FP32 workspace as well as mixed and
-injection outputs against the current typed implementation. Row7/last-row
+injection outputs against the current typed implementation. Row 7/last-row
 down mutations and last-row/tail injection mutations must change that oracle,
 and the prefetch path must follow the changed values bitwise. Eager and three
 captured replays repeat full admitted-workspace/output poisoning with no-op
