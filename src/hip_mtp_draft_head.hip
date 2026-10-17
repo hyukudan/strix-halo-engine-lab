@@ -6,6 +6,7 @@
 #include <fstream>
 #include <limits>
 #include <stdexcept>
+#include <span>
 #include <string>
 
 namespace strix {
@@ -269,6 +270,28 @@ std::vector<std::uint32_t> read_one_token_file(const std::string& path,std::uint
 }
 } // namespace
 // A comma-separated list (a core subset plus language packs) is their union in file order, first occurrence kept.
+std::string HipMtpDraftHead::resolve_vocabulary_spec(const std::string& spec,std::span<const std::uint32_t> prompt,
+    std::uint32_t vocabulary,std::string& chosen) {
+    chosen=spec;
+    if(spec.rfind("auto:",0)!=0) return spec;
+    const auto dir=spec.substr(5);
+    require(!dir.empty(),"MTP draft vocabulary auto: needs a directory");
+    const auto core=dir+"/core32k.bin";
+    static constexpr const char* languages[]={"de","es","fr","it","pt","ru","ja","zh"};
+    std::string best;std::uint64_t best_count=0;
+    for(const auto* language:languages) {
+        const auto path=dir+"/pack-"+language+"16k.bin";
+        if(!std::ifstream(path,std::ios::binary)) continue;
+        std::vector<std::uint8_t> member(vocabulary,0U);
+        for(const auto id:read_one_token_file(path,vocabulary)) member[id]=1U;
+        std::uint64_t count=0;
+        for(const auto token:prompt) if(token<vocabulary&&member[token]) ++count;
+        if(count>best_count) {best_count=count;best=language;}
+    }
+    if(best.empty()||best_count<2U||best_count*20U<prompt.size()) {chosen="core32k";return core;}
+    chosen="core32k+"+best+"16k ("+std::to_string(best_count)+" prompt tokens)";
+    return core+","+dir+"/pack-"+best+"16k.bin";
+}
 std::vector<std::uint32_t> HipMtpDraftHead::read_token_file(const std::string& paths,std::uint32_t vocabulary) {
     std::vector<std::uint32_t> ids;std::vector<std::uint8_t> seen(vocabulary,0U);
     for(std::size_t begin=0;begin<=paths.size();) {

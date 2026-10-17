@@ -149,7 +149,7 @@ output, because every emitted token is verified by the target.
   --mtp-window-expert-union --mtp-window-expert-union-bytes 65536 \
   --mtp-window-prefix --mtp-window-hyper-mix --mtp-window-qsa-rows \
   --mtp-draft-chain --mtp-spec-min-p 0.85 --mtp-draft-q4 \
-  --mtp-draft-vocab draft.u32[,more.u32...] --mtp-draft-context-vocab 4096
+  --mtp-draft-vocab auto:data/draft-vocab --mtp-draft-context-vocab 4096
 ```
 
 | Option | Meaning |
@@ -161,7 +161,7 @@ output, because every emitted token is verified by the target.
 | `--mtp-draft-chain` | Chained MTP drafting on the device without per-draft host syncs. |
 | `--mtp-spec-min-p P` | Stop drafting after the first draft whose probability is below P; sets the window size. |
 | `--mtp-draft-q4` | Q4_0 copy of the draft head over the vocabulary subset (needs a subset). |
-| `--mtp-draft-vocab FILE[,FILE...]` | Draft vocabulary: little-endian `uint32` token IDs; several files are merged without duplicates. `tools/build_draft_vocab.py` builds one from the GGUF tokenizer and optional corpora. |
+| `--mtp-draft-vocab FILE[,FILE...]` or `auto:DIR` | Draft vocabulary: little-endian `uint32` token IDs; several files are merged without duplicates. `auto:DIR` loads `DIR/core32k.bin` plus the `DIR/pack-<lang>16k.bin` that holds the most prompt tokens (see [Draft vocabulary](#draft-vocabulary)). |
 | `--mtp-draft-context-vocab N` | Also admit up to N token IDs seen in the prompt and output into the draft vocabulary. |
 | `--mtp-candidate-depth D` | Maximum drafts per cycle; at least `rows - 1` of the largest window. |
 
@@ -172,17 +172,19 @@ about 0.65 ms per draft step at 106k rows and grows linearly with the row count.
 never be drafted, so the subset sets acceptance but never changes the output (the target verifies over the full
 vocabulary).
 
-The intended layout is a small common core (code, English, Markdown, numbers, chat control tokens) plus one
-language pack per language, combined on the command line:
+The repository ships the vocabularies in `data/draft-vocab/`: a 32k language-independent core (code, English,
+Markdown, numbers, chat control tokens) and 16k packs for `de`, `es`, `fr`, `it`, `pt`, `ru`, `ja` and `zh`.
+`--mtp-draft-vocab auto:data/draft-vocab` picks the core plus the pack holding the most prompt tokens (at least 2
+tokens and 5% of the prompt; otherwise the core alone) and prints the choice; explicit lists also work:
 
 ```
---mtp-draft-vocab core.u32,pack-es.u32 --mtp-draft-context-vocab 4096
+--mtp-draft-vocab data/draft-vocab/core32k.bin,data/draft-vocab/pack-es16k.bin --mtp-draft-context-vocab 4096
 ```
 
-Measured so far: a frequency-ranked 32k core keeps or improves acceptance on code against a 106k general subset
-and is about 5% faster; for Spanish prose, a 16k core plus a 16k Spanish pack reaches the acceptance of the full
-248k head with 7.5 times fewer rows (+16% tok/s over an English-centred subset). Below 16k rows acceptance drops.
-`tools/build_draft_vocab.py` builds the files from the GGUF tokenizer and text corpora.
+Measured against a 106k general subset: on a code prompt the core needs 86 verify cycles instead of 89 at the same
+speed within noise; on a Spanish chat prompt `auto` selects core + `es16k` and decodes at 38.9 tok/s instead of
+32.9 (+18%). Below 16k rows acceptance drops. `tools/build_draft_vocab.py` documents the file format and builds
+lists from the GGUF tokenizer and text corpora.
 
 Environment switches (defaults are the measured configuration):
 

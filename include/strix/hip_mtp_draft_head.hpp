@@ -54,6 +54,11 @@ public:
     [[nodiscard]] const std::uint32_t* ids() const noexcept;
     // Little-endian uint32 token ids; ids >= vocabulary are rejected.
     [[nodiscard]] static std::vector<std::uint32_t> read_token_file(const std::string& path,std::uint32_t vocabulary);
+    // "auto:DIR": DIR/core32k.bin plus the DIR/pack-<lang>16k.bin holding the most prompt tokens, when that is
+    // at least 2 tokens and 5 % of the prompt (otherwise the core alone). Any other spec is returned unchanged.
+    // `chosen` receives a short description of the selection.
+    [[nodiscard]] static std::string resolve_vocabulary_spec(const std::string& spec,
+        std::span<const std::uint32_t> prompt,std::uint32_t vocabulary,std::string& chosen);
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

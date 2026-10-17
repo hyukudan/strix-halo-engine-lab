@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <iostream>
 #include <memory>
 #include <optional>
 #include <string>
@@ -265,7 +266,13 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
         if(m.draft_chain){
             // Drafts only: the subset (or full) head changes acceptance, never target output.
             HipMtpDraftHeadConfig draft;draft.full=m.draft_vocab.empty() && !m.draft_context_vocab;
-            if(!m.draft_vocab.empty())draft.base_tokens=HipMtpDraftHead::read_token_file(m.draft_vocab,static_cast<std::uint32_t>(model.vocab_size));
+            if(!m.draft_vocab.empty()) {
+                std::string chosen;
+                const auto spec=HipMtpDraftHead::resolve_vocabulary_spec(m.draft_vocab,options.tokens,
+                    static_cast<std::uint32_t>(model.vocab_size),chosen);
+                if(spec!=m.draft_vocab) std::cerr<<"MTP draft vocabulary: "<<chosen<<'\n';
+                draft.base_tokens=HipMtpDraftHead::read_token_file(spec,static_cast<std::uint32_t>(model.vocab_size));
+            }
             draft.context_capacity=m.draft_context_vocab;draft.q4=m.draft_q4;
             runtime->enable_draft_chain(std::move(draft),m.draft_exact);runtime->observe_draft_context(options.tokens);
         }
