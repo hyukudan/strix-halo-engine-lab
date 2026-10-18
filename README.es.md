@@ -326,7 +326,8 @@ de lo que aparece aquí es una estimación teórica presentada como resultado.
 
 ## Licencia
 
-<!-- LICENSE: la licencia del código del motor aún no figura en el repositorio; añadirla aquí y como archivo LICENSE. -->
-El repositorio todavía no incluye un archivo de licencia para el código del motor. Los pesos del modelo se
-distribuyen con su propia licencia (Qwen Community License). Las referencias de terceros usadas para formatos y
-semántica del modelo figuran con sus licencias en [SOURCES_LEDGER.md](SOURCES_LEDGER.md).
+El código del motor se distribuye con la **[licencia Apache 2.0](LICENSE)**, salvo el módulo experimental del kernel
+de Linux en `lab/direct_gpu_stream/kernel/`, que es **GPL-2.0-only** como exige el código del kernel (sus textos de
+licencia están en ese directorio). El código adoptado de otros proyectos conserva su licencia y avisos originales.
+Los pesos del modelo se distribuyen con su propia licencia (Qwen Community License). Las referencias de terceros
+usadas para formatos y semántica del modelo figuran con sus licencias en [SOURCES_LEDGER.md](SOURCES_LEDGER.md).

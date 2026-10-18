@@ -310,7 +310,8 @@ theoretical estimate presented as a result.
 
 ## License
 
-<!-- LICENSE: the engine source license is not yet stated in the repository; add it here and as a LICENSE file. -->
-The repository does not yet include a license file for the engine source. The model weights are distributed
-under their own license (Qwen Community License). Third-party references used for formats and model semantics
-are listed with their licenses in [SOURCES_LEDGER.md](SOURCES_LEDGER.md).
+The engine source is licensed under the **[Apache License 2.0](LICENSE)**, except the experimental Linux kernel
+module under `lab/direct_gpu_stream/kernel/`, which is **GPL-2.0-only** as Linux kernel code must be (its license
+texts are kept in that directory). Code adopted from other projects keeps its original license and notices. The
+model weights are distributed under their own license (Qwen Community License). Third-party references used for
+formats and model semantics are listed with their licenses in [SOURCES_LEDGER.md](SOURCES_LEDGER.md).
