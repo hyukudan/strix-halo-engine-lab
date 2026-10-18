@@ -788,6 +788,196 @@ __global__ __launch_bounds__(32U * Waves) void project_wide_rows_vopd_bf16_kerne
     });
 }
 
+// Lane-output prompt kernel (16/32/64 rows, widths that are whole 256-feature chunks). The same
+// chains and tree as above, mapped differently: lane L of a wave owns outputs o0 = L, o1 = 32 + L of a
+// 64-output group and four rows, and runs every leaf of their 8 (output, row) pairs itself. The 256
+// leaves lambda = 8 L' + l (chain over features lambda + 256 k, k ascending) reduce in the fixed order of
+// lambda's bits 7 (lane tree level 16), 6, 5, 4, 3 (level 1), then 2, 1, 0 (leaf tree), each addition
+// Site::add(lower lambda, upper lambda). A wave takes the leaves in 16 subsets q = 0..15 of 16 chains
+// lambda = j + 16 m (j = bitrev4(q), m = 0..15): a subset's chains run over all chunks, then its four
+// first levels (lambda bits 7..4 = m bits 3..0) reduce in registers to one value, and the subsets'
+// values form the last four levels (lambda bits 3..0 = j bits = q bits 0..3 reversed): subset q is the
+// q-th leaf of that tree, so the tree streams with a binary-counter stack of four values per pair.
+// Every addition is a register addition with known operands; nothing crosses lanes.
+//
+// x(r, f) is the same in every lane: the rows are packed per call into an FP32 scratch in step order
+// (lane_pack_rows_kernel) and read as scalar operands, so each dual-issued pair is the two outputs of
+// one (row, chain) sharing an SGPR (hip_q8_rows_lane_vopd.inc). The coefficients of a step (64
+// outputs x 16 chains) are decoded with Site::coefficient once per block into LDS (double-buffered,
+// one barrier per step) from weights repacked in step order (lane_pack_weights_kernel; cached per site
+// type, see lane_weights). A block's W waves take the same outputs and consecutive row groups.
+constexpr unsigned kLaneOutputs = 64U, kLaneRows = 4U;
+__host__ __device__ constexpr unsigned bitrev4(unsigned q) {
+    return ((q & 1U) << 3U) | ((q & 2U) << 1U) | ((q & 4U) >> 1U) | ((q & 8U) >> 3U);
+}
+#include "hip_q8_rows_lane_vopd.inc"
+// Repacked weights of output group G (64 outputs; outputs past the last are zero): codes
+// [G][q][k][o][m] (feature bitrev4(q) + 16 m + 256 k of output 64 G + o) and FP16 scale bits
+// [G][k][o][b] (block 8 k + b, the block of chains m = 2 b, 2 b + 1).
+template <class Site>
+__global__ __launch_bounds__(256) void lane_pack_weights_kernel(Site site, unsigned char* codes, std::uint16_t* scales, std::uint32_t groups) {
+    const std::uint32_t width = site.width, chunks = width / 256U;
+    const std::uint64_t t = static_cast<std::uint64_t>(blockIdx.x) * 256U + threadIdx.x;
+    if (t >= static_cast<std::uint64_t>(groups) * chunks * kLaneOutputs * 16U) return;
+    const unsigned q = static_cast<unsigned>(t % 16U), o = static_cast<unsigned>(t / 16U % kLaneOutputs);
+    const std::uint32_t k = static_cast<std::uint32_t>(t / (16U * kLaneOutputs) % chunks), G = static_cast<std::uint32_t>(t / (16U * kLaneOutputs * chunks));
+    const std::uint32_t out = G * kLaneOutputs + o;
+    unsigned word[4]{};
+    std::uint16_t scale[8]{};
+    if (out < site.outputs) {
+        unsigned m; std::uint32_t row;
+        const unsigned char* w = segment_row(site.segments, out, width, m, row);
+        const unsigned j = bitrev4(q);
+#pragma unroll
+        for (unsigned c = 0; c < 16U; ++c) {
+            const std::uint32_t f = j + 16U * c + 256U * k;
+            word[c / 4U] |= static_cast<unsigned>(w[(f / 32U) * 34U + 2U + f % 32U]) << (8U * (c % 4U));
+        }
+        if (q == 0U)
+#pragma unroll
+            for (unsigned b = 0; b < 8U; ++b) scale[b] = *reinterpret_cast<const std::uint16_t*>(w + (8U * k + b) * 34U);
+    }
+    *reinterpret_cast<uint4*>(codes + ((static_cast<std::uint64_t>(G) * 16U + q) * chunks + k) * 1024U + o * 16U) =
+        make_uint4(word[0], word[1], word[2], word[3]);
+    if (q == 0U) {
+        auto* s = reinterpret_cast<uint4*>(scales + ((static_cast<std::uint64_t>(G) * chunks + k) * kLaneOutputs + o) * 8U);
+        *s = make_uint4(scale[0] | static_cast<unsigned>(scale[1]) << 16U, scale[2] | static_cast<unsigned>(scale[3]) << 16U,
+            scale[4] | static_cast<unsigned>(scale[5]) << 16U, scale[6] | static_cast<unsigned>(scale[7]) << 16U);
+    }
+}
+// Rows as FP32 in step order: x[g][q][k][h][r][mm] = row 4 g + r, feature bitrev4(q) + 16 (8 h + mm) + 256 k
+// (BF16 widened with the exact shift of load8).
+template <class Site>
+__global__ __launch_bounds__(256) void lane_pack_rows_kernel(Site site, float* x) {
+    using Input = typename Site::Input;
+    const std::uint32_t width = site.width, chunks = width / 256U;
+    const std::uint32_t t = blockIdx.x * 256U + threadIdx.x;
+    if (t >= Site::rows * width) return;
+    const unsigned mm = t % 8U, r = t / 8U % 4U, h = t / 32U % 2U;
+    const std::uint32_t k = t / 64U % chunks, q = t / (64U * chunks) % 16U, g = t / (1024U * chunks);
+    const std::uint32_t f = bitrev4(q) + 16U * (8U * h + mm) + 256U * k;
+    const Input value = row_input(site, 4U * g + r)[f];
+    if constexpr (sizeof(Input) == 2U) x[t] = __uint_as_float(static_cast<unsigned>(value) << 16U);
+    else x[t] = value;
+}
+// LDS stage of two steps: [t][h][quad][o][4] coefficients, so lane L reads c(o, 8 h + 4 quad .. + 3) of
+// o = L and o = 32 + L of step t with conflict-free ds_load_b128 (byte offsets 4096 t + 2048 h + 1024 quad
+// + 512 (o / 32)). The chunk count is even, so a stage's two steps belong to one subset.
+// Stage: steps per LDS stage (2, 4 or 8; one barrier per stage; 8 uses all 64 KB of LDS). Exp: 2 scalar-cache prefetch of the next pair's
+// x (the default), else timing ablations (wrong results): 1 every wave reads rows 0..3, 4 / 8 no scalar /
+// LDS operand loads, 16 no producer and barrier, 32 no producer, 64 no barrier.
+template <class Site, unsigned W, unsigned Stage, unsigned Exp>
+__global__ __launch_bounds__(32U * W) void project_wide_rows_lane_kernel(Site site, const unsigned char* __restrict__ codes,
+    const std::uint16_t* __restrict__ scales, const float* __restrict__ xs) {
+    constexpr unsigned Threads = 32U * W, Per = 16U * kLaneOutputs / Threads, Blocks = Site::rows / (kLaneRows * W);
+    static_assert(Site::rows % (kLaneRows * W) == 0U && (Per == 2U || Per == 4U || Per == 8U) && fused_fma_of<Site>());
+    static_assert(Stage == 2U || Stage == 4U || Stage == 8U);
+    __shared__ float4 coef[2][256U * Stage];
+    const unsigned lane = threadIdx.x & 31U, wave = uniform(threadIdx.x / 32U);
+    const std::uint32_t chunks = site.width / 256U, steps = 16U * chunks;
+    const std::uint32_t G = blockIdx.x / Blocks, g = blockIdx.x % Blocks * W + wave;
+    // Producer: thread t decodes chains pm .. pm + Per - 1 of output po in every step.
+    const unsigned po = threadIdx.x / (16U / Per), pm = threadIdx.x % (16U / Per) * Per;
+    const unsigned char* pcodes = codes + static_cast<std::uint64_t>(G) * 16U * chunks * 1024U + po * 16U + pm;
+    const std::uint16_t* pscales = scales + (static_cast<std::uint64_t>(G) * chunks * kLaneOutputs + po) * 8U + pm / 2U;
+    using Codes = std::conditional_t<Per == 2U, std::uint16_t, std::conditional_t<Per == 4U, std::uint32_t, std::uint64_t>>;
+    using Scales = std::conditional_t<Per == 2U, std::uint16_t, std::conditional_t<Per == 4U, std::uint32_t, std::uint64_t>>;
+    struct Fetch { Codes codes; Scales scales; };
+    const auto fetch = [&](std::uint32_t s) {
+        const std::uint32_t at = s < steps ? s : steps - 1U;
+        Fetch result;
+        result.codes = *reinterpret_cast<const Codes*>(pcodes + static_cast<std::uint64_t>(at) * 1024U);
+        result.scales = *reinterpret_cast<const Scales*>(pscales + static_cast<std::uint64_t>(at % chunks) * kLaneOutputs * 8U);
+        return result;
+    };
+    const auto produce = [&](const Fetch& in, unsigned buffer, unsigned t) {
+        float c[Per];
+#pragma unroll
+        for (unsigned i = 0; i < Per; ++i)
+            c[i] = Site::coefficient(static_cast<unsigned>(in.scales >> (16U * (i / 2U))) & 0xffffU,
+                static_cast<std::int8_t>(static_cast<std::uint64_t>(in.codes) >> (8U * i)));
+        float* target = reinterpret_cast<float*>(coef[buffer] + 256U * t);
+#pragma unroll
+        for (unsigned i = 0; i < Per; i += (Per < 4U ? Per : 4U)) {
+            const unsigned m = pm + i;
+            float* at = target + ((m / 8U * 2U + m % 8U / 4U) * kLaneOutputs + po) * 4U + m % 4U;
+            if constexpr (Per == 2U) *reinterpret_cast<float2*>(at) = make_float2(c[0], c[1]);
+            else *reinterpret_cast<float4*>(at) = make_float4(c[i], c[i + 1U], c[i + 2U], c[i + 3U]);
+        }
+    };
+    // Step s reads its rows' x values at xs + ((g * steps + s) * 2 + h) * 32 (scalar loads in the steps).
+    const float* xw = xs + static_cast<std::uint64_t>((Exp & 1U) ? 0U : g) * steps * 64U;
+    float acc[128];
+    float stack[8][4], result[8];
+    // Stage u (steps Stage u ..) is in buffer u % 2; the fetches of the next two stages are in flight.
+    Fetch ring[2U * Stage];
+#pragma unroll
+    for (unsigned t = 0; t < 2U * Stage; ++t) ring[t] = fetch(Stage + t);
+#pragma unroll
+    for (unsigned t = 0; t < Stage; ++t) produce(fetch(t), 0U, t);
+    lds_fence_barrier();
+    for (std::uint32_t s = 0, q = 0, k = 0; s < steps; s += 2U) {
+        // Steps s, s + 1 read stage buffer s / Stage % 2 (written before the last barrier); the next stage
+        // goes to the other buffer, whose readers (the previous stage) all passed that barrier.
+        const std::uint32_t u = s / Stage, t0 = s % Stage;
+        const auto* xp = static_cast<const void*>(xw + static_cast<std::uint64_t>(s) * 64U);
+        const auto lds = static_cast<unsigned>(reinterpret_cast<std::uintptr_t>(&coef[u & 1U][256U * t0 + lane]));
+        const auto* xn = static_cast<const void*>(xw + static_cast<std::uint64_t>(s + 2U < steps ? s + 2U : s) * 64U);
+        if constexpr ((Exp & 4U) != 0U) lane_steps_nox(acc, xp, xn, lds);
+        else if constexpr ((Exp & 8U) != 0U) lane_steps_noc(acc, xp, xn, lds);
+        else if constexpr ((Exp & 2U) != 0U) { if (k == 0U) lane_steps_first_prefetch(acc, xp, xn, lds); else lane_steps_prefetch(acc, xp, xn, lds); }
+        else if (k == 0U) lane_steps_first(acc, xp, xn, lds); else lane_steps(acc, xp, xn, lds);
+        if (t0 + 2U == Stage) {
+            if (s + 2U < steps && !(Exp & 48U))
+#pragma unroll
+                for (unsigned t = 0; t < Stage; ++t) produce(ring[t], (u + 1U) & 1U, t);
+#pragma unroll
+            for (unsigned t = 0; t < Stage; ++t) { ring[t] = ring[Stage + t]; ring[Stage + t] = fetch((u + 3U) * Stage + t); }
+            if constexpr (!(Exp & 80U)) lds_barrier();
+        }
+        k += 2U;
+        if (k == chunks) {
+            // Subset q: levels lambda bits 7..4 in registers, then leaf q of the bits 3..0 tree. Sites that
+            // declare their tree addition's operand order run the first levels as dual-issued additions.
+            if constexpr (requires { Site::tree_upper_src0; }) {
+#ifdef STRIX_Q8_ROWS_LANE_FLIP_TREE
+                // Negative control for the fixture: the opposite operand order.
+                if constexpr (!Site::tree_upper_src0) lane_tree_upper_first(acc); else lane_tree_lower_first(acc);
+#else
+                if constexpr (Site::tree_upper_src0) lane_tree_upper_first(acc); else lane_tree_lower_first(acc);
+#endif
+            } else {
+#pragma unroll
+                for (unsigned p = 0; p < 8U; ++p) {
+                    float* c = acc + 16U * p;
+#pragma unroll
+                    for (unsigned h = 8U; h > 0U; h /= 2U)
+#pragma unroll
+                        for (unsigned m = 0; m < h; ++m) c[m] = Site::add(c[m], c[m + h]);
+                }
+            }
+#pragma unroll
+            for (unsigned p = 0; p < 8U; ++p) {
+                float v = acc[16U * p];
+                bool carry = true;
+#pragma unroll
+                for (unsigned b = 0; b < 4U; ++b)
+                    if (carry) {
+                        if ((q >> b) & 1U) v = Site::add(stack[p][b], v);
+                        else { stack[p][b] = v; carry = false; }
+                    }
+                if (carry) result[p] = v;
+            }
+            k = 0U; ++q;
+        }
+    }
+#pragma unroll
+    for (unsigned p = 0; p < 8U; ++p) {
+        const std::uint32_t out = G * kLaneOutputs + (p / 4U) * 32U + lane;
+        if (out < site.outputs) site.store(out, kLaneRows * g + p % 4U, result[p]);
+    }
+}
+
 // Dense A8 (numerical profile dense-a8-v1): Q8_0 weights x per-32 int8 activations.
 //
 // Quantizer, row r, block b (x = the BF16/FP32 activations as FP32):
@@ -1467,6 +1657,116 @@ template <class Site> void launch_dense_a8_quantized(const Site& site, const Den
         stream, site, slot.codes, slot.deltas);
 }
 
+// Lane-output prompt kernel (project_wide_rows_lane_kernel): STRIX_Q8_ROWS_LANE=0 keeps the VOPD
+// kernels above. Its repacked weights are cached per site type in two slots keyed by the weight
+// pointers and shape: an engine's weights never change, and a prefill block runs a site's launches of
+// one layer back to back, so each matrix is repacked once per (layer, block). Code that rewrites weight
+// bytes in place (the projection probes) calls invalidate_lane_weights() first.
+inline bool lane_enabled() { static const bool on = env_unsigned("STRIX_Q8_ROWS_LANE", 1U) != 0U; return on; }
+inline std::atomic<unsigned>& lane_epoch() { static std::atomic<unsigned> epoch{0U}; return epoch; }
+inline void invalidate_lane_weights() { lane_epoch().fetch_add(1U, std::memory_order_relaxed); }
+template <class Site> constexpr bool lane_site() {
+    return Site::rows >= 16U && Site::rows % 16U == 0U && fused_fma_of<Site>();
+}
+// Even chunk counts (two steps per asm block) and at least 32 output groups (one block per group: the
+// 1280-output shared gate/up launch, 20 blocks, is slower than the VOPD kernel; STRIX_Q8_ROWS_LANE_MIN_OUTPUTS).
+template <class Site> bool lane_admits(const Site& site) {
+    static const unsigned min_outputs = env_unsigned("STRIX_Q8_ROWS_LANE_MIN_OUTPUTS", 2048U);
+    return lane_enabled() && site.width % 512U == 0U && site.outputs >= min_outputs;
+}
+struct LaneBuffer {
+    void* base = nullptr;
+    std::uint64_t bytes = 0;
+    // Grows to `need` bytes; the previous allocation may still be read by queued kernels.
+    void reserve(std::uint64_t need) {
+        if (need <= bytes) return;
+        if (base) { if (hipDeviceSynchronize() != hipSuccess || hipFree(base) != hipSuccess) throw std::runtime_error("q8_rows: lane scratch release"); }
+        base = nullptr; bytes = 0;
+        if (hipMalloc(&base, need) != hipSuccess) throw std::runtime_error("q8_rows: lane scratch allocation");
+        bytes = need;
+    }
+};
+struct LaneWeights { const unsigned char* codes; const std::uint16_t* scales; };
+template <class Site> LaneWeights lane_weights(const Site& site, hipStream_t stream) {
+    struct Slot {
+        LaneBuffer buffer;
+        const unsigned char* weights[kMaxSegments]{};
+        std::uint32_t first[kMaxSegments + 1U]{}, width = 0, outputs = 0;
+        unsigned count = 0, epoch = ~0U;
+        std::uint64_t used = 0;
+    };
+    static Slot slots[2];
+    static std::uint64_t clock = 0;
+    const std::uint32_t groups = (site.outputs + kLaneOutputs - 1U) / kLaneOutputs, chunks = site.width / 256U;
+    const std::uint64_t code_bytes = static_cast<std::uint64_t>(groups) * kLaneOutputs * site.width;
+    const auto split = [&](Slot& s) {
+        return LaneWeights{static_cast<const unsigned char*>(s.buffer.base),
+            reinterpret_cast<const std::uint16_t*>(static_cast<const unsigned char*>(s.buffer.base) + code_bytes)};
+    };
+    const unsigned epoch = lane_epoch().load(std::memory_order_relaxed);
+    for (auto& s : slots) {
+        bool same = s.buffer.base && s.epoch == epoch && s.width == site.width && s.outputs == site.outputs && s.count == site.segments.count;
+        for (unsigned m = 0; same && m < s.count; ++m)
+            same = s.weights[m] == site.segments.weights[m] && s.first[m + 1U] == site.segments.first[m + 1U];
+        if (same) { s.used = ++clock; return split(s); }
+    }
+    Slot& s = slots[0].used <= slots[1].used ? slots[0] : slots[1];
+    s.buffer.reserve(code_bytes + static_cast<std::uint64_t>(groups) * chunks * kLaneOutputs * 8U * 2U);
+    s.width = site.width; s.outputs = site.outputs; s.count = site.segments.count; s.epoch = epoch; s.used = ++clock;
+    for (unsigned m = 0; m < s.count; ++m) { s.weights[m] = site.segments.weights[m]; s.first[m + 1U] = site.segments.first[m + 1U]; }
+    const auto result = split(s);
+    const std::uint64_t threads = static_cast<std::uint64_t>(groups) * chunks * kLaneOutputs * 16U;
+    hipLaunchKernelGGL(lane_pack_weights_kernel<Site>, dim3(static_cast<unsigned>((threads + 255U) / 256U)), dim3(256U), 0, stream, site,
+        const_cast<unsigned char*>(result.codes), const_cast<std::uint16_t*>(result.scales), groups);
+    return result;
+}
+template <class Site, unsigned W> void launch_lane_waves(const Site& site, hipStream_t stream) {
+    static LaneBuffer rows;
+    const auto weights = lane_weights(site, stream);
+    rows.reserve(static_cast<std::uint64_t>(Site::rows) * site.width * 4U);
+    auto* x = static_cast<float*>(rows.base);
+    // Barrier-ordered: the packed rows are shared by every launch of this site type.
+    hipLaunchKernelGGL(lane_pack_rows_kernel<Site>, dim3((Site::rows * site.width + 255U) / 256U), dim3(256U), 0, stream, site, x);
+    const unsigned blocks = (site.outputs + kLaneOutputs - 1U) / kLaneOutputs * (Site::rows / (kLaneRows * W));
+    // STRIX_Q8_ROWS_LANE_STAGE = 2 | 4 | 8 (default) steps per barrier; STRIX_Q8_ROWS_LANE_PREFETCH=0 drops the
+    // scalar-cache prefetch; STRIX_Q8_ROWS_LANE_EXP: timing ablations of builds with -DSTRIX_Q8_ROWS_LANE_ABLATIONS.
+    static const unsigned stage = env_unsigned("STRIX_Q8_ROWS_LANE_STAGE", 8U), prefetch = env_unsigned("STRIX_Q8_ROWS_LANE_PREFETCH", 1U);
+    static const unsigned exp = env_unsigned("STRIX_Q8_ROWS_LANE_EXP", 0U);
+    const auto run = [&]<unsigned Exp>() {
+        if (stage == 2U)
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(project_wide_rows_lane_kernel<Site, W, 2U, Exp>), dim3(blocks), dim3(32U * W), 0, stream, site,
+                weights.codes, weights.scales, x);
+        else if (stage == 4U)
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(project_wide_rows_lane_kernel<Site, W, 4U, Exp>), dim3(blocks), dim3(32U * W), 0, stream, site,
+                weights.codes, weights.scales, x);
+        else hipLaunchKernelGGL(HIP_KERNEL_NAME(project_wide_rows_lane_kernel<Site, W, 8U, Exp>), dim3(blocks), dim3(32U * W), 0, stream, site,
+                weights.codes, weights.scales, x);
+    };
+#ifdef STRIX_Q8_ROWS_LANE_ABLATIONS
+    if constexpr (Site::rows == 64U) {
+        switch (exp) {
+        case 1U: run.template operator()<3U>(); return;
+        case 4U: run.template operator()<4U>(); return;
+        case 16U: run.template operator()<18U>(); return;
+        case 32U: run.template operator()<34U>(); return;
+        case 64U: run.template operator()<66U>(); return;
+        default: break;
+        }
+    }
+#else
+    static_cast<void>(exp);
+#endif
+    if (prefetch) run.template operator()<2U>(); else run.template operator()<0U>();
+}
+// STRIX_Q8_ROWS_LANE_WAVES = 8 | 16 (default): waves per block (4 rows each) when the launch has rows for them.
+template <class Site> void launch_lane(const Site& site, hipStream_t stream) {
+    static const unsigned waves = env_unsigned("STRIX_Q8_ROWS_LANE_WAVES", 16U);
+    if constexpr (Site::rows >= 64U) {
+        if (waves == 8U) { launch_lane_waves<Site, 8U>(site, stream); return; }
+    }
+    launch_lane_waves<Site, (Site::rows / kLaneRows < 16U ? Site::rows / kLaneRows : 16U)>(site, stream);
+}
+
 // The caller validated width % 32 == 0 and 16-byte aligned rows. any_order drops the
 // packet's barrier bit: the caller guarantees the projection neither reads nor writes what
 // the previously queued kernel touches, so it may start while that kernel still runs.
@@ -1503,6 +1803,9 @@ template <class Site> void launch(const Site& site, bool a8, hipStream_t stream,
         }
     }
     if constexpr (Site::rows > 8U) {
+        if constexpr (lane_site<Site>()) {
+            if (wide_kernel() == 2U && !wide_stage() && lane_admits(site)) { launch_lane(site, stream); return; }
+        }
         // Default: the VOPD kernels (4 outputs x 4 rows per wave, 4-wave blocks), FP32 inputs from
         // wide_fp32_min_width() up; narrower ones keep the per-wave kernel.
         if constexpr (fused_fma_of<Site>() && Site::rows % 16U == 0U) {

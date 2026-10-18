@@ -346,6 +346,55 @@ with the automatic organization, tiled route with the explicit v5 flag set; F = 
 | 16384 tokens (wiki), T=2048, F | Byte-identical (16.3 GB file), 16383 score rows equal; 1001 s serial vs 66 s tiled |
 | 16384 tokens, where the tiled time goes (per 2048-row block) | 7-8 s GPU against 5.4 s for the same prefill with only the terminal head (the eight-row heads add about 2.6 s), 31 ms download, 150 ms scoring; the 0.3-2.8 s spool overlaps the next block |
 
+## D-035: block-boundary prefix state cache
+
+`--prefix-cache-host-bytes N` (optional `--prefix-cache-dir DIR`, `--prefix-cache-disk-bytes N`,
+`--prefix-cache-every N`) keeps the complete session state at block boundaries P = k·T of the tiled
+known-prefix prefill and restores the longest cached boundary below the prompt length into a fresh session;
+only the rest of the prompt is prefilled. Per-position rows (KV and raw indexer keys of every attention layer)
+are stored once per block and shared by the checkpoints of a prompt; the in-place state (GDN matrices, GDN/PLE
+convolution histories, n-gram and position history: 111 MiB here) plus counters and arithmetic lineage is
+stored per checkpoint. Keys chain SHA-256 over T-token blocks from an identity that covers model content, state
+layout and context, runtime compatibility, decode, prefill-sibling and tiled-plan execution and kernel-plan
+identities, both numerical profiles and their pair, T, the tail sizes and (disk tier) the executable. Host
+tier: pinned memory with LRU in a byte budget; disk tier: checksummed segment/checkpoint files written behind
+the request. See [docs/prefix-state-cache.md](docs/prefix-state-cache.md).
+
+Two pieces were needed around it. `--known-prefix-tail-rows T2[,T3...]` runs the remainder after the last
+T-row block as complete blocks of the largest tail size that fits, before the serial rows: serial prompt rows
+cost about 50-70 ms each, so a warm request with an arbitrary suffix would otherwise spend seconds on up to T-1
+serial rows. Within one numerical profile tiled rows are serial rows bit for bit (D-034), so tail blocks do not
+change outputs; with a split pair they move rows from the decode to the prefill profile and are part of the
+key. And `--mtp` now composes with the tiled prefill: the golden covers only `--mtp-calibration-rows R`
+(default 8) prompt pairs, replayed serially to qualify the predictor; then target and predictor are reset,
+complete blocks run tiled while a step observer copies every row's wide hidden state out of the block arena to
+build the predictor's cache rows, and the remaining rows (at least the last, whose ticket starts the first
+draft cycle) run serially through the MTP target producer. On this route a checkpoint also holds the
+predictor's cache rows of pairs i < P-1 and h_{P-1}; the key adds the sidecar, MTP plan/profile and
+draft-kernel switches. Split pairs are rejected there.
+
+Why: agents resend a long, mostly identical prompt; a 16K-token prefill costs about 25 s (dense A8) to 45 s
+(FP32 dense) on one node. The state at a block boundary is exact and the suffix of a restored request keeps the
+full prompt's block alignment, so outputs cannot change; checkpoints at block boundaries only.
+
+Measured on one Strix Halo node (Qwen3.8-Flash-Next UD-Q4_K_XL), F = FP32-dense and A = dense-A8 profile, FA =
+decode F / prefill A. Identity checks compare against the same configuration without lookup (every request
+cold) or an uncached process; timings are single smoke runs on shared nodes, not a benchmark campaign:
+
+| Check | Result |
+| --- | --- |
+| 4K prompt, T=512, F, A and FA: full prompt, then in one process prompts of 3585, 3684, 2747 tokens (restored 3584, 3584, 2560), 2948 tokens diverging after 2048 (restored 2048) and the full prompt again (restored 3584) | 32 generated tokens identical to the uncached runs in all 18 requests |
+| Same with `--known-prefix-tail-rows 64` and `64,16` (A) | Identical to the runs without tail blocks; warm requests 3.4-4.7 s (64) and 2.2-3.8 s (64,16) instead of 6.3-20.9 s, including 31 generated tokens |
+| 16K prompt, T=1024, A and F: 15360-token request (cold, captures), then the 16384-token prompt (restored 15360, 1024-token suffix) and a 9692-token prompt diverging after 8192 (restored 8192) | Tokens identical; A 26.1 s cold vs 3.2 s warm, F 45.2 s vs 4.4 s (request time including 31 serial generated tokens, about 1.5 s) |
+| Disk tier, other process (A, T=512) | 3684-token prompt restored 3584 from disk (0.22 GB read in 42 ms), tokens identical |
+| Identity changes, disk tier | F instead of A, or T=256 instead of 512: miss (restored 0), no read failure |
+| Tiled MTP, 4K, T=512, tail 64, A and F, one process per request through the disk tier | Full prompt, 3684- and 2948-token variants: 128 tokens identical, calibration replay error 0 (hidden and logits), SHA-256 of the whole prompt state (target rows and in-place state, predictor rows, h_{n-1}) identical between cold and warm; T=256: miss |
+| Tiled MTP, 16K, T=1024, A and F (restored 15360) | 256 tokens identical, replay error 0, prompt-state digest identical cold vs warm. Prompt phase (restore, prefill, predictor rows): A 35.3 s cold vs 7.6 s warm with tail 64, 31.0 s vs 4.8 s with tails 64,16; F 54.4 s vs 8.3 s (tail 64); plus 0.5 s calibration replay |
+| Checkpoint size and cost | 27,648 B per position (29,952 with MTP) + 116.4 MB per checkpoint: 0.54 GB at P=15360; capture 25-35 ms per checkpoint; restore 3.3 ms (3584 positions) to 8-11 ms (15360 positions) from host memory, about 65 GB/s; disk read 0.12-0.16 s for 0.58 GB |
+
+MTP cycle counts can differ between identical runs (the window cost model is timing-driven); tokens, replay and
+state digests do not.
+
 ## Measured and rejected
 
 | ID | Alternative | Result | Reason |

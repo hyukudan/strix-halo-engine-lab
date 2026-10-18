@@ -61,6 +61,10 @@ struct KnownWindowExecutionHooks {
     // Called just before each step of a launched window is enqueued (never during admission), with all
     // row contexts. Returning true means the hook enqueued that step itself (the loop then only records it).
     std::function<bool(std::size_t, const std::vector<std::vector<ExecutionDispatchContext>>&)> before_step;
+    // Tiled prefill only: called after every row of a step has been enqueued (launch phase, never during
+    // admission), with the step index and a resolver of each row's dispatch context. The observer may
+    // enqueue copies of the step's outputs on the current stream before later steps reuse the arena.
+    std::function<void(std::size_t, const std::function<ExecutionDispatchContext(std::uint32_t)>&)> after_step;
 };
 
 struct KnownWindowR2Entry {

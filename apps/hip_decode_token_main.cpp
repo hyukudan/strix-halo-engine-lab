@@ -61,6 +61,7 @@
 #include "hip_decode_experiment.hpp"
 #include "hip_decode_options.hpp"
 #include "hip_mtp_decode_bridge.hpp"
+#include "hip_prefix_state_cache.hpp"
 #if defined(STRIX_MTP_MODEL_QUALIFICATION_RUNNER)
 #include "../tests/hip_mtp_model_qualification.hpp"
 #endif
@@ -993,6 +994,8 @@ int STRIX_DECODE_ENTRY(
             "  --lane-chain-hyper-output (requires --prefetch-q8-hyper-output)\n"
             "  --record-raw ABS_NEW_PRIVATE_DIRECTORY --record-max-bytes BYTES\n"
             "  --record-state-policy final|each --prefix-cache-roundtrip\n"
+            "  --prefix-cache-host-bytes N [--prefix-cache-dir DIR [--prefix-cache-disk-bytes N]] [--prefix-cache-every N]\n"
+            "      [--prefix-cache-then-prompt FILE ...] (block-boundary prefix state cache, tiled known-prefix prefill only)\n"
             "  --prefetch-q8-qsa-input (opt-in exact-tree Q8 input projections)\n"
             "  --prefetch-q8-shared-expert (opt-in exact-tree Q8 gate/up/down)\n"
             "  --execution-mode eager|graph (default eager)\n"
@@ -2352,6 +2355,218 @@ int STRIX_DECODE_ENTRY(
             "compiled execution does not end in one logits write");
     }
 
+    // Known-prefix windows and the tiled prefill (also the MTP prompt with --known-prefix-window):
+    // plans, arenas, native owners and backends, and the optional prefix state cache.
+    std::optional<strix::CompiledKnownPrefixWindow> known_prefix_plan;
+    std::shared_ptr<strix::CompiledKnownPrefixPrefill> known_prefill_plan;
+    // Optional smaller tiled block for the remainder (--known-prefix-tail-rows).
+    std::vector<std::shared_ptr<strix::CompiledKnownPrefixPrefill>> known_tail_plans;
+    std::vector<std::shared_ptr<KnownPromptMemory>> known_tail_memories;
+    std::vector<std::shared_ptr<strix::HipKnownPrefixWindow>> known_tail_owners;
+    std::vector<std::unique_ptr<strix::HipKnownPromptBackend>> known_tail_backends;
+    std::optional<strix::UmaReservationEstimate> known_prefill_reservation;
+    std::uint64_t known_prefill_runtime_payload = 0;
+    std::shared_ptr<KnownPromptMemory> known_prefix_memory;
+    std::shared_ptr<strix::HipKnownPrefixWindow> known_prefix_owner;
+    std::unique_ptr<strix::HipKnownPromptBackend> known_prefix_backend;
+    std::optional<strix::KnownPromptGreedyResult> known_prefix_result;
+    std::optional<strix::KnownPromptChunkProgress> known_prefix_progress;
+    // Block-boundary prefix state cache (--prefix-cache-host-bytes): store and live-session view.
+    std::shared_ptr<strix::PrefixStateCache> prefix_store;
+    std::unique_ptr<strix::decode_cli::HipPrefixStateCacheSession> prefix_state;
+    strix::ModelContentIdentity prefix_cache_identity;
+    std::uint64_t prefix_cache_every = 0;
+    if (options.known_prefix_window || options.prompt_lookup) {
+        if (options.known_prefix_prefill_rows) {
+            // The tiled prefill derives from the prefill serial execution (its dense projection
+            // kernel ids select the prefill verify ids and launchers).
+            known_prefill_plan = std::make_shared<strix::CompiledKnownPrefixPrefill>(strix::compile_known_prefix_prefill(model,
+                compiled_prefill ? *compiled_prefill : compiled, manifest, tensor_access,
+                {options.known_prefix_prefill_rows, true, true, true, options.known_prefix_expert_union,
+                 options.known_prefix_output_policy, options.known_prefill_workspace_budget, options.known_prefill_metadata_budget / 2U,
+                 options.known_window_router_rows || options.known_prefix_full_rows,
+                 options.known_window_router_rows || options.known_prefix_full_rows,
+                 options.known_prefix_full_rows, options.known_prefix_full_rows, options.known_prefix_full_rows,
+                 options.teacher_forced_score}));
+            for (const auto tail_rows : options.known_prefix_tail_rows)
+                known_tail_plans.push_back(std::make_shared<strix::CompiledKnownPrefixPrefill>(strix::compile_known_prefix_prefill(model,
+                    compiled_prefill ? *compiled_prefill : compiled, manifest, tensor_access,
+                    {tail_rows, true, true, true, options.known_prefix_expert_union,
+                     options.known_prefix_output_policy, options.known_prefill_workspace_budget, options.known_prefill_metadata_budget / 2U,
+                     true, true, true, true, true, false})));
+            known_prefix_plan = known_prefill_plan->tile8; // selection ledger, never a relabelled T forward
+        } else {
+            const bool full = options.known_prefix_full_rows;
+            const bool rows_ops = full || options.known_window_router_rows;
+            known_prefix_plan = strix::compile_known_prefix_window(model, compiled, manifest, tensor_access,
+                {true, true, true, options.known_prefix_window ? options.known_prefix_rows : 2U, options.known_prefix_expert_union,
+                 options.known_prefix_output_policy, rows_ops, rows_ops, full, full, false, full, full});
+            if (full && (known_prefix_plan->gdn_deferred_rows_steps != model.gdn_layers || !known_prefix_plan->ple_rows_steps))
+                throw std::invalid_argument("known-prefix full rows did not admit deferred GDN and PLE rows for every layer");
+        }
+        if (!strix::known_window_has_promoted_steps(*known_prefix_plan))
+            throw std::invalid_argument("known prompt has no admitted known-window operators");
+        if (model.vocab_size > std::numeric_limits<std::uint32_t>::max())
+            throw std::invalid_argument("known-prompt vocabulary exceeds uint32");
+        std::uint64_t union_bytes = 0;
+        if (options.known_prefix_expert_union && known_prefix_plan->routed_expert_union_steps) {
+            if (model.num_experts > UINT32_MAX || model.num_experts_per_token > UINT32_MAX)
+                throw std::invalid_argument("known-prefix expert union geometry exceeds uint32");
+            union_bytes = strix::q51_known_rows::required_scratch_bytes(known_prefill_plan ? 8U : known_prefix_plan->logical_rows,
+                static_cast<std::uint32_t>(model.num_experts), static_cast<std::uint32_t>(model.num_experts_per_token));
+            if (!union_bytes || union_bytes > 65536U)
+                throw std::invalid_argument("known-prefix expert union exceeds separate 64KiB setup budget");
+        }
+        const auto arena_generation = generations.next();
+        const auto status_generation = generations.next();
+        if (known_prefill_plan) {
+            const auto add = [](std::uint64_t a, std::uint64_t b) {
+                if (b > UINT64_MAX - a) throw std::overflow_error("known prefill reservation overflow");
+                return a + b;
+            };
+            if (!base_runtime_owner_inventory || !prefill_ple_owner || !retained_ple_source || (!deferred_moe && !options.mtp.enabled))
+                throw std::logic_error("known prefill lacks actual retained setup owners");
+            auto views = base_runtime_owner_inventory->pinned_views;
+            std::uint64_t view_id = 0;
+            for (const auto& view : views) view_id = std::max(view_id, view.view_identity);
+            const auto reserve = [&](std::string category, std::uint64_t bytes, std::shared_ptr<const void> owner) {
+                if (!bytes) return;
+                if (view_id == UINT64_MAX) throw std::overflow_error("known prefill inventory IDs exhausted");
+                // No allocator-issued backing key is exposed for these views.
+                // Count declared storage conservatively; do not invent alias/PFN proof.
+                strix::UmaOwnerView view;
+                view.view_identity = ++view_id; view.category = std::move(category);
+                view.allocation_bytes = bytes; view.view_bytes = bytes;
+                view.allocation_pin = std::move(owner); views.push_back(std::move(view));
+            };
+            const std::shared_ptr<const void> d1_owner = deferred_moe
+                ? std::static_pointer_cast<const void>(deferred_moe) : std::static_pointer_cast<const void>(experiment_owner);
+            reserve("D1-shadow-host-state", add(state_layout.host_total_bytes, state_layout.host_alignment - 1U), d1_owner);
+            reserve("serial-D1-record", 8U, d1_owner);
+            reserve("PLE-row-cache", requested_ple_cache_bytes, prefill_ple_owner);
+            const auto multiply = [](std::uint64_t a, std::uint64_t b) {
+                if (b && a > UINT64_MAX / b) throw std::overflow_error("known prefill runtime payload overflow");
+                return a * b;
+            };
+            const auto map_bytes = multiply(known_prefill_plan->logit_row_indices.size(), sizeof(std::uint32_t));
+            reserve("prefill-caller-plan-vector-payload", add(known_prefill_plan->host_metadata_payload_bytes, map_bytes), known_prefill_plan);
+            // Result payloads coexist with both plans and the full arena.
+            // Two terminal host rows cover a retained cursor frontier plus
+            // the next adapter return buffer; allocator capacity overhead is headroom.
+            known_prefill_runtime_payload = add(multiply(multiply(known_prefill_plan->logical_rows,
+                compiled.execution.steps.size()), sizeof(std::uint32_t)), map_bytes);
+            known_prefill_runtime_payload = add(known_prefill_runtime_payload,
+                multiply(known_prefill_plan->logit_row_indices.size(), sizeof(strix::ExecutionBufferAddress)));
+            if (known_prefill_plan->output_policy != strix::KnownWindowOutputPolicy::state_only)
+                known_prefill_runtime_payload = add(known_prefill_runtime_payload, multiply(model.vocab_size, 2U * sizeof(float)));
+            // Teacher-forced scoring: pinned staging of one block's T full rows (the spool streams them out).
+            if (options.teacher_forced_score)
+                known_prefill_runtime_payload = add(known_prefill_runtime_payload,
+                    multiply(multiply(known_prefill_plan->logical_rows, model.vocab_size), sizeof(float)));
+            auto growth = add(known_prefill_plan->arena.physical.total_bytes, add(8U, union_bytes));
+            growth = add(growth, add(known_prefill_plan->host_metadata_payload_bytes, map_bytes)); // native owner's second copy
+            growth = add(growth, options.known_prefill_host_headroom); // explicit allocator/driver/fixed-plan allowance
+            for (const auto& tail : known_tail_plans) { // arena, completion record and metadata copy of each tail owner
+                growth = add(growth, add(tail->arena.physical.total_bytes, add(8U, union_bytes)));
+                growth = add(growth, tail->host_metadata_payload_bytes);
+            }
+            known_prefill_reservation = strix::plan_uma_reservation_growth(
+                strix::build_uma_owner_inventory(views), growth, known_prefill_runtime_payload,
+                {options.known_prefill_uma_budget, options.known_prefill_uma_budget});
+            struct PrefillRetained {
+                std::shared_ptr<const void> original, d1, ple, source, plan;
+            };
+            const std::shared_ptr<const void> d1_pin = deferred_moe
+                ? std::static_pointer_cast<const void>(deferred_moe) : std::static_pointer_cast<const void>(experiment_owner);
+            const auto retained = std::make_shared<PrefillRetained>(PrefillRetained{
+                experiment_owner, d1_pin, prefill_ple_owner, retained_ple_source, known_prefill_plan});
+            known_prefix_memory = std::make_shared<KnownPromptMemory>(*known_prefill_plan, arena_generation,
+                status_generation, retained, original_work_device, union_bytes,
+                union_bytes ? generations.next() : 0);
+            known_prefix_owner = std::make_shared<strix::HipKnownPrefixWindow>(*known_prefill_plan,
+                compiled_prefill ? *compiled_prefill : compiled, model,
+                compiled_prefill ? prefill_catalog_config : catalog_config,
+                compiled_prefill ? prefill_resources : resources, known_prefix_memory->scratch, known_prefix_memory->scope,
+                std::static_pointer_cast<const void>(known_prefix_memory),
+                union_bytes ? strix::q51_known_rows::Workspace{known_prefix_memory->union_scratch,
+                    std::static_pointer_cast<const void>(known_prefix_memory)} : strix::q51_known_rows::Workspace{});
+            for (const auto& known_tail_plan : known_tail_plans) {
+                const auto tail_retained = std::make_shared<PrefillRetained>(PrefillRetained{
+                    experiment_owner, d1_pin, prefill_ple_owner, retained_ple_source, known_tail_plan});
+                const auto known_tail_memory = std::make_shared<KnownPromptMemory>(*known_tail_plan, generations.next(),
+                    generations.next(), tail_retained, original_work_device, union_bytes,
+                    union_bytes ? generations.next() : 0);
+                known_tail_memories.push_back(known_tail_memory);
+                known_tail_owners.push_back(std::make_shared<strix::HipKnownPrefixWindow>(*known_tail_plan,
+                    compiled_prefill ? *compiled_prefill : compiled, model,
+                    compiled_prefill ? prefill_catalog_config : catalog_config,
+                    compiled_prefill ? prefill_resources : resources, known_tail_memory->scratch, known_tail_memory->scope,
+                    std::static_pointer_cast<const void>(known_tail_memory),
+                    union_bytes ? strix::q51_known_rows::Workspace{known_tail_memory->union_scratch,
+                        std::static_pointer_cast<const void>(known_tail_memory)} : strix::q51_known_rows::Workspace{}));
+            }
+        } else {
+            known_prefix_memory = std::make_shared<KnownPromptMemory>(*known_prefix_plan, arena_generation,
+                status_generation,
+                std::static_pointer_cast<const void>(experiment_owner), original_work_device,
+                options.prompt_lookup ? compiled.execution_identity : 0,
+                options.prompt_lookup ? generations.next() : 0,
+                union_bytes, union_bytes ? generations.next() : 0);
+            known_prefix_owner = std::make_shared<strix::HipKnownPrefixWindow>(*known_prefix_plan, compiled, model,
+                catalog_config, resources, known_prefix_memory->scratch, known_prefix_memory->scope,
+                std::static_pointer_cast<const void>(known_prefix_memory),
+                union_bytes ? strix::q51_known_rows::Workspace{known_prefix_memory->union_scratch,
+                    std::static_pointer_cast<const void>(known_prefix_memory)} : strix::q51_known_rows::Workspace{});
+        }
+        if (options.known_prefix_window)
+            known_prefix_backend = std::make_unique<strix::HipKnownPromptBackend>(known_prefix_owner, session,
+                known_prefix_memory->scratch, model.vocab_size, original_work_device);
+        // Each tiled block runs on the prefill execution and hands the session back to decode.
+        if (compiled_prefill) {
+            if (!known_prefill_plan || !known_prefix_backend || options.prompt_lookup)
+                throw std::logic_error("split prefill profile reached a non-tiled known-prefix route");
+            known_prefix_backend->set_executor_handoff({&compiled, &resources}, {&*compiled_prefill, &prefill_resources});
+        }
+        for (std::size_t t = 0; t < known_tail_owners.size(); ++t) {
+            known_tail_backends.push_back(std::make_unique<strix::HipKnownPromptBackend>(known_tail_owners[t], session,
+                known_tail_memories[t]->scratch, model.vocab_size, original_work_device));
+            if (compiled_prefill)
+                known_tail_backends.back()->set_executor_handoff({&compiled, &resources}, {&*compiled_prefill, &prefill_resources});
+        }
+        if (strix::decode_cli::prefix_state_cache_requested(options)) {
+            if (!known_prefill_plan || !known_prefix_backend)
+                throw std::logic_error("prefix state cache reached a route other than the tiled known-prefix prefill");
+            const auto pair = strix::decode_cli::numerical_profile_pair(options);
+            strix::decode_cli::PrefixStateCacheIdentityInputs in;
+            in.model_content = model_residency.binding().model_content_identity;
+            if (!options.prefix_cache_dir.empty()) in.engine_build = strix::decode_cli::prefix_state_cache_engine_build();
+            in.state_layout_identity = state_layout.layout_identity;
+            in.runtime_compatibility_identity = identities.compatibility_identity;
+            in.decode_execution_identity = compiled.execution_identity;
+            in.decode_kernel_plan_identity = compiled.kernel_plan_identity;
+            in.prefill_execution_identity = compiled_prefill ? compiled_prefill->execution_identity : compiled.execution_identity;
+            in.prefill_kernel_plan_identity = compiled_prefill ? compiled_prefill->kernel_plan_identity : compiled.kernel_plan_identity;
+            in.tiled_execution_identity = known_prefill_plan->prefill_execution_identity;
+            in.tiled_kernel_plan_identity = known_prefill_plan->prefill_kernel_plan_identity;
+            in.prefill_profile_identity = strix::numerical_profile_identity(pair.prefill);
+            in.decode_profile_identity = strix::numerical_profile_identity(pair.decode);
+            in.profile_pair_identity = strix::numerical_profile_pair_identity(pair);
+            in.block_rows = options.known_prefix_prefill_rows;
+            in.tail_rows = options.known_prefix_tail_rows;
+            in.context_tokens = options.context_tokens;
+            prefix_cache_identity = strix::decode_cli::prefix_state_cache_identity(in);
+            const std::uint64_t rows = options.known_prefix_prefill_rows;
+            prefix_cache_every = options.prefix_cache_every ? options.prefix_cache_every
+                : std::max<std::uint64_t>(rows, (4096U + rows - 1U) / rows * rows);
+            prefix_store = std::make_shared<strix::PrefixStateCache>(strix::PrefixStateCachePolicy{
+                options.prefix_cache_host_bytes, options.prefix_cache_dir, options.prefix_cache_disk_bytes},
+                strix::decode_cli::hip_pinned_prefix_buffer);
+            prefix_state = std::make_unique<strix::decode_cli::HipPrefixStateCacheSession>(prefix_store,
+                prefix_cache_identity, options.known_prefix_prefill_rows, prefix_cache_every, model, state_layout,
+                memory.state());
+        }
+    }
+
 #if defined(STRIX_MTP_MODEL_QUALIFICATION_RUNNER)
     if(target_input_export){
         setup_phase.reset();
@@ -2372,6 +2587,22 @@ int STRIX_DECODE_ENTRY(
             parents->prompt.dispatcher = &*prefill_dispatcher;
             parents->prompt.resources = parents->resources;
             parents->prompt.resources.scratch = &*prefill_scratch;
+        }
+        if (strix::decode_cli::mtp_tiled_prompt(options)) {
+            // The prompt runs through the tiled prefill set up above (see run_tiled_mtp_prompt).
+            if (!known_prefix_backend || !known_prefix_owner || !known_prefill_plan)
+                throw std::logic_error("tiled MTP prompt lacks its tiled prefill owners");
+            auto& tiled = parents->tiled;
+            tiled.blocks = known_prefix_backend.get(); tiled.block_owner = known_prefix_owner;
+            for (std::size_t t = 0; t < known_tail_backends.size(); ++t)
+                tiled.tails.push_back({known_tail_backends[t].get(), known_tail_owners[t], options.known_prefix_tail_rows[t]});
+            tiled.rows = options.known_prefix_prefill_rows;
+            tiled.cache = prefix_state.get();
+            tiled.reset_state = [&] {
+                check_hip(hipDeviceSynchronize(), "tiled MTP prompt reset fence");
+                strix::initialize_hip_fresh_runtime_memory(memory.scratch(), memory.state());
+            };
+            tiled.fresh = session;
         }
         strix::decode_cli::MtpDecodeWindowFactory make_window;
         if (options.mtp.window_rows) {
@@ -2446,6 +2677,7 @@ int STRIX_DECODE_ENTRY(
                 : strix::decode_cli::MtpDecodeComponentDiagnostic{}
 #endif
             );
+        if (prefix_store) prefix_store->flush();
         return 0;
     }
 
@@ -3067,15 +3299,6 @@ int STRIX_DECODE_ENTRY(
                 }, [&](strix::MoeTokenSchedule mode) { moe_token_schedule = mode; });
             generation_backend = token_cost_backend.get();
         }
-        std::optional<strix::CompiledKnownPrefixWindow> known_prefix_plan;
-        std::shared_ptr<strix::CompiledKnownPrefixPrefill> known_prefill_plan;
-        std::optional<strix::UmaReservationEstimate> known_prefill_reservation;
-        std::uint64_t known_prefill_runtime_payload = 0;
-        std::shared_ptr<KnownPromptMemory> known_prefix_memory;
-        std::shared_ptr<strix::HipKnownPrefixWindow> known_prefix_owner;
-        std::unique_ptr<strix::HipKnownPromptBackend> known_prefix_backend;
-        std::optional<strix::KnownPromptGreedyResult> known_prefix_result;
-        std::optional<strix::KnownPromptChunkProgress> known_prefix_progress;
         std::unique_ptr<strix::HipPromptLookupRuntime> lookup_runtime;
         struct LookupStats {
             std::uint64_t cycles = 0, proposed = 0, accepted = 0, discarded = 0, replayed = 0;
@@ -3087,127 +3310,6 @@ int STRIX_DECODE_ENTRY(
             }
         } lookup_stats;
         if (options.known_prefix_window || options.prompt_lookup) {
-            if (options.known_prefix_prefill_rows) {
-                // The tiled prefill derives from the prefill serial execution (its dense projection
-                // kernel ids select the prefill verify ids and launchers).
-                known_prefill_plan = std::make_shared<strix::CompiledKnownPrefixPrefill>(strix::compile_known_prefix_prefill(model,
-                    compiled_prefill ? *compiled_prefill : compiled, manifest, tensor_access,
-                    {options.known_prefix_prefill_rows, true, true, true, options.known_prefix_expert_union,
-                     options.known_prefix_output_policy, options.known_prefill_workspace_budget, options.known_prefill_metadata_budget / 2U,
-                     options.known_window_router_rows || options.known_prefix_full_rows,
-                     options.known_window_router_rows || options.known_prefix_full_rows,
-                     options.known_prefix_full_rows, options.known_prefix_full_rows, options.known_prefix_full_rows,
-                     options.teacher_forced_score}));
-                known_prefix_plan = known_prefill_plan->tile8; // selection ledger, never a relabelled T forward
-            } else {
-                const bool full = options.known_prefix_full_rows;
-                const bool rows_ops = full || options.known_window_router_rows;
-                known_prefix_plan = strix::compile_known_prefix_window(model, compiled, manifest, tensor_access,
-                    {true, true, true, options.known_prefix_window ? options.known_prefix_rows : 2U, options.known_prefix_expert_union,
-                     options.known_prefix_output_policy, rows_ops, rows_ops, full, full, false, full, full});
-                if (full && (known_prefix_plan->gdn_deferred_rows_steps != model.gdn_layers || !known_prefix_plan->ple_rows_steps))
-                    throw std::invalid_argument("known-prefix full rows did not admit deferred GDN and PLE rows for every layer");
-            }
-            if (!strix::known_window_has_promoted_steps(*known_prefix_plan))
-                throw std::invalid_argument("known prompt has no admitted known-window operators");
-            if (model.vocab_size > std::numeric_limits<std::uint32_t>::max())
-                throw std::invalid_argument("known-prompt vocabulary exceeds uint32");
-            std::uint64_t union_bytes = 0;
-            if (options.known_prefix_expert_union && known_prefix_plan->routed_expert_union_steps) {
-                if (model.num_experts > UINT32_MAX || model.num_experts_per_token > UINT32_MAX)
-                    throw std::invalid_argument("known-prefix expert union geometry exceeds uint32");
-                union_bytes = strix::q51_known_rows::required_scratch_bytes(known_prefill_plan ? 8U : known_prefix_plan->logical_rows,
-                    static_cast<std::uint32_t>(model.num_experts), static_cast<std::uint32_t>(model.num_experts_per_token));
-                if (!union_bytes || union_bytes > 65536U)
-                    throw std::invalid_argument("known-prefix expert union exceeds separate 64KiB setup budget");
-            }
-            const auto arena_generation = generations.next();
-            const auto status_generation = generations.next();
-            if (known_prefill_plan) {
-                const auto add = [](std::uint64_t a, std::uint64_t b) {
-                    if (b > UINT64_MAX - a) throw std::overflow_error("known prefill reservation overflow");
-                    return a + b;
-                };
-                if (!base_runtime_owner_inventory || !prefill_ple_owner || !retained_ple_source || !deferred_moe)
-                    throw std::logic_error("known prefill lacks actual retained setup owners");
-                auto views = base_runtime_owner_inventory->pinned_views;
-                std::uint64_t view_id = 0;
-                for (const auto& view : views) view_id = std::max(view_id, view.view_identity);
-                const auto reserve = [&](std::string category, std::uint64_t bytes, std::shared_ptr<const void> owner) {
-                    if (!bytes) return;
-                    if (view_id == UINT64_MAX) throw std::overflow_error("known prefill inventory IDs exhausted");
-                    // No allocator-issued backing key is exposed for these views.
-                    // Count declared storage conservatively; do not invent alias/PFN proof.
-                    strix::UmaOwnerView view;
-                    view.view_identity = ++view_id; view.category = std::move(category);
-                    view.allocation_bytes = bytes; view.view_bytes = bytes;
-                    view.allocation_pin = std::move(owner); views.push_back(std::move(view));
-                };
-                reserve("D1-shadow-host-state", add(state_layout.host_total_bytes, state_layout.host_alignment - 1U), deferred_moe);
-                reserve("serial-D1-record", 8U, deferred_moe);
-                reserve("PLE-row-cache", requested_ple_cache_bytes, prefill_ple_owner);
-                const auto multiply = [](std::uint64_t a, std::uint64_t b) {
-                    if (b && a > UINT64_MAX / b) throw std::overflow_error("known prefill runtime payload overflow");
-                    return a * b;
-                };
-                const auto map_bytes = multiply(known_prefill_plan->logit_row_indices.size(), sizeof(std::uint32_t));
-                reserve("prefill-caller-plan-vector-payload", add(known_prefill_plan->host_metadata_payload_bytes, map_bytes), known_prefill_plan);
-                // Result payloads coexist with both plans and the full arena.
-                // Two terminal host rows cover a retained cursor frontier plus
-                // the next adapter return buffer; allocator capacity overhead is headroom.
-                known_prefill_runtime_payload = add(multiply(multiply(known_prefill_plan->logical_rows,
-                    compiled.execution.steps.size()), sizeof(std::uint32_t)), map_bytes);
-                known_prefill_runtime_payload = add(known_prefill_runtime_payload,
-                    multiply(known_prefill_plan->logit_row_indices.size(), sizeof(strix::ExecutionBufferAddress)));
-                if (known_prefill_plan->output_policy != strix::KnownWindowOutputPolicy::state_only)
-                    known_prefill_runtime_payload = add(known_prefill_runtime_payload, multiply(model.vocab_size, 2U * sizeof(float)));
-                // Teacher-forced scoring: pinned staging of one block's T full rows (the spool streams them out).
-                if (options.teacher_forced_score)
-                    known_prefill_runtime_payload = add(known_prefill_runtime_payload,
-                        multiply(multiply(known_prefill_plan->logical_rows, model.vocab_size), sizeof(float)));
-                auto growth = add(known_prefill_plan->arena.physical.total_bytes, add(8U, union_bytes));
-                growth = add(growth, add(known_prefill_plan->host_metadata_payload_bytes, map_bytes)); // native owner's second copy
-                growth = add(growth, options.known_prefill_host_headroom); // explicit allocator/driver/fixed-plan allowance
-                known_prefill_reservation = strix::plan_uma_reservation_growth(
-                    strix::build_uma_owner_inventory(views), growth, known_prefill_runtime_payload,
-                    {options.known_prefill_uma_budget, options.known_prefill_uma_budget});
-                struct PrefillRetained {
-                    std::shared_ptr<const void> original, d1, ple, source, plan;
-                };
-                const auto retained = std::make_shared<PrefillRetained>(PrefillRetained{
-                    experiment_owner, deferred_moe, prefill_ple_owner, retained_ple_source, known_prefill_plan});
-                known_prefix_memory = std::make_shared<KnownPromptMemory>(*known_prefill_plan, arena_generation,
-                    status_generation, retained, original_work_device, union_bytes,
-                    union_bytes ? generations.next() : 0);
-                known_prefix_owner = std::make_shared<strix::HipKnownPrefixWindow>(*known_prefill_plan,
-                    compiled_prefill ? *compiled_prefill : compiled, model,
-                    compiled_prefill ? prefill_catalog_config : catalog_config,
-                    compiled_prefill ? prefill_resources : resources, known_prefix_memory->scratch, known_prefix_memory->scope,
-                    std::static_pointer_cast<const void>(known_prefix_memory),
-                    union_bytes ? strix::q51_known_rows::Workspace{known_prefix_memory->union_scratch,
-                        std::static_pointer_cast<const void>(known_prefix_memory)} : strix::q51_known_rows::Workspace{});
-            } else {
-                known_prefix_memory = std::make_shared<KnownPromptMemory>(*known_prefix_plan, arena_generation,
-                    status_generation,
-                    std::static_pointer_cast<const void>(experiment_owner), original_work_device,
-                    options.prompt_lookup ? compiled.execution_identity : 0,
-                    options.prompt_lookup ? generations.next() : 0,
-                    union_bytes, union_bytes ? generations.next() : 0);
-                known_prefix_owner = std::make_shared<strix::HipKnownPrefixWindow>(*known_prefix_plan, compiled, model,
-                    catalog_config, resources, known_prefix_memory->scratch, known_prefix_memory->scope,
-                    std::static_pointer_cast<const void>(known_prefix_memory),
-                    union_bytes ? strix::q51_known_rows::Workspace{known_prefix_memory->union_scratch,
-                        std::static_pointer_cast<const void>(known_prefix_memory)} : strix::q51_known_rows::Workspace{});
-            }
-            if (options.known_prefix_window)
-                known_prefix_backend = std::make_unique<strix::HipKnownPromptBackend>(known_prefix_owner, session,
-                    known_prefix_memory->scratch, model.vocab_size, original_work_device);
-            // Each tiled block runs on the prefill execution and hands the session back to decode.
-            if (compiled_prefill) {
-                if (!known_prefill_plan || !known_prefix_backend || options.prompt_lookup)
-                    throw std::logic_error("split prefill profile reached a non-tiled known-prefix route");
-                known_prefix_backend->set_executor_handoff({&compiled, &resources}, {&*compiled_prefill, &prefill_resources});
-            }
             // Teacher-forced scoring: every row of every block is scored and spooled as it commits.
             if (options.teacher_forced_score) {
                 if (!known_prefill_plan || !known_prefix_backend || !requested_logprobs ||
@@ -3226,6 +3328,39 @@ int STRIX_DECODE_ENTRY(
                     strix::HipPromptLookupSnapshotPolicy{options.prompt_lookup_snapshot, options.prompt_lookup_snapshot_bytes});
         }
 
+        // One tiled known-prefix request: restore the longest cached block-boundary prefix (prefix
+        // state cache), prefill the rest in T-row blocks (capturing selected boundaries), generate.
+        const auto run_known_prompt = [&](std::span<const std::uint32_t> prompt) -> strix::SerialGreedyRequestResult {
+            const std::uint64_t restored = prefix_state ? prefix_state->begin_request(session, prompt) : 0U;
+            strix::KnownPromptChunkRequest paired;
+            paired.prompt_tokens = prompt.subspan(static_cast<std::size_t>(restored));
+            paired.start_position = session.next_position;
+            paired.vocab_size = request.vocab_size; paired.context_capacity = request.context_capacity;
+            paired.max_new_tokens = request.max_new_tokens; paired.eos_token_id = request.eos_token_id;
+            paired.logical_rows = options.known_prefix_prefill_rows ? options.known_prefix_prefill_rows : options.known_prefix_rows;
+            paired.tiled_prefill = static_cast<bool>(known_prefill_plan);
+            paired.output_policy = options.known_prefix_output_policy;
+            // Teacher-forced: no headless block, and the serial suffix rows are scored like serial rows.
+            paired.all_row_heads = options.teacher_forced_score;
+            strix::KnownPromptChunkCursor chunks(paired, *known_prefix_backend,
+                options.teacher_forced_score ? *generation_backend : static_cast<strix::SerialGreedyStepBackend&>(backend));
+            for (auto& tail : known_tail_backends) chunks.set_tail_backend(*tail);
+            // One complete configured window or one unpadded serial suffix row per call.
+            while (chunks.advance()) if (prefix_state) prefix_state->after_block(session, prompt);
+            const auto& generated = chunks.finish_greedy();
+            known_prefix_progress = chunks.progress();
+            known_prefix_result.emplace();
+            known_prefix_result->consumed_prompt_tokens = known_prefix_progress->consumed_prompt_tokens;
+            known_prefix_result->windows_executed = known_prefix_progress->windows_executed;
+            known_prefix_result->serial_prompt_steps = known_prefix_progress->serial_tail_steps;
+            known_prefix_result->generation = generated;
+            if (!known_prefix_result->generation) throw std::logic_error("known prompt unexpectedly stopped before generation");
+            auto total = *known_prefix_result->generation;
+            if (known_prefix_result->consumed_prompt_tokens > std::numeric_limits<std::uint64_t>::max() - total.steps_executed)
+                throw std::overflow_error("known-prompt total execution count overflow");
+            total.steps_executed += known_prefix_result->consumed_prompt_tokens;
+            return total;
+        };
         const bool generation_request_timing_enabled =
             !raw_recording && !final_state_metadata && !options.teacher_forced_score;
         const auto generation_request_start = generation_request_timing_enabled
@@ -3302,32 +3437,7 @@ int STRIX_DECODE_ENTRY(
             if (!known_prefix_backend) return options.gpu_greedy_token
                 ? strix::execute_serial_greedy_token_request(request, *generation_backend)
                 : strix::execute_serial_greedy_request(request, *generation_backend);
-            strix::KnownPromptChunkRequest paired;
-            paired.prompt_tokens = options.tokens;
-            paired.start_position = session.next_position;
-            paired.vocab_size = request.vocab_size; paired.context_capacity = request.context_capacity;
-            paired.max_new_tokens = request.max_new_tokens; paired.eos_token_id = request.eos_token_id;
-            paired.logical_rows = options.known_prefix_prefill_rows ? options.known_prefix_prefill_rows : options.known_prefix_rows;
-            paired.tiled_prefill = static_cast<bool>(known_prefill_plan);
-            paired.output_policy = options.known_prefix_output_policy;
-            // Teacher-forced: no headless block, and the serial suffix rows are scored like serial rows.
-            paired.all_row_heads = options.teacher_forced_score;
-            strix::KnownPromptChunkCursor chunks(paired, *known_prefix_backend,
-                options.teacher_forced_score ? *generation_backend : static_cast<strix::SerialGreedyStepBackend&>(backend));
-            while (chunks.advance()) { /* one complete configured window or one unpadded serial suffix row */ }
-            const auto& generated = chunks.finish_greedy();
-            known_prefix_progress = chunks.progress();
-            known_prefix_result.emplace();
-            known_prefix_result->consumed_prompt_tokens = known_prefix_progress->consumed_prompt_tokens;
-            known_prefix_result->windows_executed = known_prefix_progress->windows_executed;
-            known_prefix_result->serial_prompt_steps = known_prefix_progress->serial_tail_steps;
-            known_prefix_result->generation = generated;
-            if (!known_prefix_result->generation) throw std::logic_error("known prompt unexpectedly stopped before generation");
-            auto total = *known_prefix_result->generation;
-            if (known_prefix_result->consumed_prompt_tokens > std::numeric_limits<std::uint64_t>::max() - total.steps_executed)
-                throw std::overflow_error("known-prompt total execution count overflow");
-            total.steps_executed += known_prefix_result->consumed_prompt_tokens;
-            return total;
+            return run_known_prompt(options.tokens);
         }();
         // The spool of a final tiled block (with its footer) completes before anything is reported.
         if (requested_logprobs) requested_logprobs->drain_block_spool();
@@ -3346,10 +3456,93 @@ int STRIX_DECODE_ENTRY(
                 generation_request_stop - generation_request_start).count();
         finalize_raw(result.generated_tokens, std::string(stop_reason_name(result.stop_reason)));
 
+        std::string tail_rows_text;
+        for (const auto rows : options.known_prefix_tail_rows)
+            tail_rows_text += (tail_rows_text.empty() ? "" : ",") + std::to_string(rows);
         double elapsed_total = 0.0;
         for (const auto value :
              backend.elapsed_ms()) {
             elapsed_total += value;
+        }
+        // Prefix state cache: the main request's statistics, then the follow-up requests of
+        // --prefix-cache-then-prompt in this process (fresh session each, same cache).
+        std::string prefix_cache_receipt;
+        std::optional<strix::HipKnownPromptBackendStats> known_prefix_main_stats;
+        if (prefix_state) {
+            const auto request_json = [&](const strix::decode_cli::PrefixStateCacheRequestStats& r) {
+                std::ostringstream out;
+                out << "\"prompt_tokens\":" << r.prompt_tokens << ",\"restored_position\":" << r.restored_position
+                    << ",\"lookup_ms\":" << r.lookup_ms << ",\"restore_ms\":" << r.restore_ms
+                    << ",\"restored_bytes\":" << r.restored_bytes << ",\"captured_checkpoints\":" << r.captured_checkpoints
+                    << ",\"captured_segment_bytes\":" << r.captured_segment_bytes
+                    << ",\"captured_fixed_bytes\":" << r.captured_fixed_bytes << ",\"capture_ms\":" << r.capture_ms;
+                return out.str();
+            };
+            const auto main_stats = prefix_state->request();
+            known_prefix_main_stats = known_prefix_backend->stats();
+            const auto main_progress = known_prefix_progress;
+            const auto main_known_result = known_prefix_result;
+            std::ostringstream followups;
+            const auto initial_session = [&] {
+                strix::SerialSessionContext fresh;
+                fresh.execution_identity = compiled.execution_identity;
+                fresh.state_layout_identity = state_layout.layout_identity;
+                fresh.runtime_compatibility_identity = identities.compatibility_identity;
+                fresh.state.valid = all_persistent_state();
+                return fresh;
+            };
+            for (std::size_t i = 0; i < options.prefix_cache_then_prompts.size(); ++i) {
+                const auto prompt = strix::decode_cli::read_prefix_cache_prompt(options.prefix_cache_then_prompts[i]);
+                if (prompt.size() > options.context_tokens || options.generate_tokens > options.context_tokens - prompt.size())
+                    throw std::invalid_argument("prefix cache follow-up prompt and generation exceed the context");
+                for (const auto token : prompt)
+                    if (token >= model.vocab_size) throw std::invalid_argument("prefix cache follow-up token exceeds vocabulary");
+                // Fresh state, exactly as after setup.
+                check_hip(hipDeviceSynchronize(), "prefix cache follow-up fence");
+                strix::initialize_hip_fresh_runtime_memory(memory.scratch(), memory.state());
+                session = initial_session();
+                const auto serial_before = backend.elapsed_ms().size();
+                const auto start = std::chrono::steady_clock::now();
+                const auto followup = run_known_prompt(prompt);
+                const auto elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+                double serial_ms = 0.0; // serial suffix rows and generated tokens of this request
+                for (auto k = serial_before; k < backend.elapsed_ms().size(); ++k) serial_ms += backend.elapsed_ms()[k];
+                followups << (i ? "," : "") << "{\"file\":\"" << strix::decode_receipt::escape_json_string(options.prefix_cache_then_prompts[i])
+                    << "\"," << request_json(prefix_state->request()) << ",\"request_elapsed_ms\":" << elapsed << ",\"serial_steps_elapsed_ms\":" << serial_ms
+                    << ",\"consumed_prompt_tokens\":" << known_prefix_progress->consumed_prompt_tokens
+                    << ",\"windows_executed\":" << known_prefix_progress->windows_executed
+                    << ",\"serial_prompt_steps\":" << known_prefix_progress->serial_tail_steps
+                    << ",\"tail_windows\":" << known_prefix_progress->tail_windows
+                    << ",\"stop_reason\":\"" << stop_reason_name(followup.stop_reason) << "\",\"final_position\":" << followup.final_position
+                    << ",\"generated_tokens\":[";
+                for (std::size_t t = 0; t < followup.generated_tokens.size(); ++t) followups << (t ? "," : "") << followup.generated_tokens[t];
+                followups << "]}";
+            }
+            known_prefix_progress = main_progress;
+            known_prefix_result = main_known_result;
+            const auto flush_start = std::chrono::steady_clock::now();
+            prefix_store->flush();
+            const auto flush_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - flush_start).count();
+            const auto store = prefix_store->stats();
+            std::ostringstream out;
+            out << "  \"prefix_state_cache\":{\"identity\":\"" << strix::model_content_identity_hex(prefix_cache_identity)
+                << "\",\"block_rows\":" << options.known_prefix_prefill_rows << ",\"capture_every_tokens\":" << prefix_cache_every
+                << ",\"row_bytes_per_position\":" << prefix_state->row_bytes() << ",\"fixed_bytes_per_checkpoint\":" << prefix_state->fixed_bytes()
+                << ",\"host_byte_budget\":" << options.prefix_cache_host_bytes
+                << ",\"disk_directory\":\"" << strix::decode_receipt::escape_json_string(options.prefix_cache_dir)
+                << "\",\"disk_byte_budget\":" << options.prefix_cache_disk_bytes
+                << ",\"main_request\":{" << request_json(main_stats) << "},\"followups\":[" << followups.str() << "]"
+                << ",\"store\":{\"lookups\":" << store.lookups << ",\"host_hits\":" << store.host_hits
+                << ",\"disk_hits\":" << store.disk_hits << ",\"misses\":" << store.misses << ",\"inserted\":" << store.inserted
+                << ",\"evicted\":" << store.evicted << ",\"rejected_over_budget\":" << store.rejected_over_budget
+                << ",\"host_bytes\":" << store.host_bytes << ",\"host_checkpoints\":" << store.host_checkpoints
+                << ",\"host_segments\":" << store.host_segments << ",\"disk_writes\":" << store.disk_writes
+                << ",\"disk_write_bytes\":" << store.disk_write_bytes << ",\"disk_write_failures\":" << store.disk_write_failures
+                << ",\"disk_write_ms\":" << store.disk_write_ms << ",\"disk_evictions\":" << store.disk_evictions
+                << ",\"disk_reads\":" << store.disk_reads << ",\"disk_read_bytes\":" << store.disk_read_bytes
+                << ",\"disk_read_failures\":" << store.disk_read_failures << ",\"disk_read_ms\":" << store.disk_read_ms
+                << ",\"exit_flush_ms\":" << flush_ms << "}},\n";
+            prefix_cache_receipt = out.str();
         }
 
         // Validation-only export is after the request and its per-step timing
@@ -3534,7 +3727,8 @@ int STRIX_DECODE_ENTRY(
             // Native window omissions are reported separately by its owner.
             std::cout << "  \"known_prefix_serial_lm_heads_omitted\":" << (output_dispatcher ? output_dispatcher->omitted_heads() : 0U)
                 << ",\n  \"known_prefix_serial_state_only_steps\":" << backend.prefix_state_elapsed_ms().size() << ",\n";
-            const auto observed = known_prefix_backend->stats();
+            const auto observed = known_prefix_main_stats ? *known_prefix_main_stats : known_prefix_backend->stats();
+            std::cout << prefix_cache_receipt;
             std::cout << "  \"known_prefix_omitted_lm_heads\":" << observed.omitted_lm_heads
                 << ",\n  \"known_prefix_state_only_windows\":" << observed.state_only_windows << ",\n";
             std::array<std::uint64_t, strix::known_window_r2_variant_slots> compiled_variants{};
@@ -3594,6 +3788,8 @@ int STRIX_DECODE_ENTRY(
                 << "  \"known_prefix_consumed_prompt_tokens\":" << known_prefix_result->consumed_prompt_tokens << ",\n"
                 << "  \"known_prefix_windows_executed\":" << known_prefix_result->windows_executed << ",\n"
                 << "  \"known_prefix_serial_prompt_steps\":" << known_prefix_result->serial_prompt_steps << ",\n"
+                << "  \"known_prefix_tail_rows\":[" << tail_rows_text << "],\n"
+                << "  \"known_prefix_tail_windows\":" << known_prefix_progress->tail_windows << ",\n"
                 << "  \"known_prefix_window_execution_identity\":" << (known_prefill_plan ? known_prefill_plan->prefill_execution_identity : known_prefix_plan->window_execution_identity) << ",\n"
                 << "  \"known_prefix_window_kernel_plan_identity\":" << (known_prefill_plan ? known_prefill_plan->prefill_kernel_plan_identity : known_prefix_plan->window_kernel_plan_identity) << ",\n"
                 << "  \"known_prefix_source_r2_steps\":" << known_prefix_plan->r2_steps << ",\n"

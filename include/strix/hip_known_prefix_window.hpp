@@ -94,6 +94,10 @@ public:
     // holds row r's first-max finite token/status with no extra copy or sync.
     // partials is retained device scratch of hip_greedy_rows_scratch_bytes(T, vocab).
     void attach_greedy_rows(ExecutionBufferAddress partials, HipGreedyRowsReply* replies);
+    // Tiled prefill owners only: observer called after each step of every later block is enqueued
+    // (see KnownWindowExecutionHooks::after_step). Set while idle; an empty function removes it.
+    using PrefillStepObserver = std::function<void(std::size_t, const std::function<ExecutionDispatchContext(std::uint32_t)>&)>;
+    void set_prefill_step_observer(PrefillStepObserver observer);
     [[nodiscard]] std::uint32_t logical_rows() const noexcept;
     [[nodiscard]] bool supports_tiled_prefill() const noexcept;
     // Immutable compiler-selected intent; verification consumers require all_rows.

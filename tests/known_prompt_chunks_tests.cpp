@@ -1,5 +1,6 @@
 #include "strix/known_prompt_chunks.hpp"
 
+#include <cstdlib>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
@@ -20,7 +21,7 @@ public:
     strix::KnownWindowOutputPolicy output_policy() const noexcept override {return policy;}
     std::uint32_t logical_rows() const noexcept override {return width;}
     unsigned windows=0,serials=0;
-    unsigned state_windows=0,state_serials=0,headless_windows=0;
+    unsigned state_windows=0,state_serials=0;
     bool fail_partial_window=false,bad_extent=false,nonfinite=false,poisoned=false;
     std::vector<std::pair<std::uint64_t,std::uint32_t>> inputs;
     std::vector<float> values(std::uint32_t input) const {
@@ -49,17 +50,36 @@ public:
         inputs.emplace_back(position+1U,tokens[1]);return values(tokens[1]);
     }
     void execute_state_rows(std::span<const std::uint32_t> tokens,std::uint64_t position) override {
-        // State-only policy windows, and headless tiled-prefill blocks (a block followed by more prompt, whose head is
-        // never read) under any policy.
-        if(tokens.size()!=width)
-            throw std::invalid_argument("mock state-only window width differs");
-        ++windows;
-        if(policy==strix::KnownWindowOutputPolicy::state_only) ++state_windows; else ++headless_windows;
+        // A tiled backend also runs headless blocks (more prompt follows) under a head policy.
+        const bool state_policy=policy==strix::KnownWindowOutputPolicy::state_only;
+        if((!state_policy&&!tiled)||tokens.size()!=width)
+            throw std::invalid_argument("mock state-only window policy/width differs");
+        ++windows;if(state_policy) ++state_windows;
         for(std::size_t row=0;row<tokens.size();++row){inputs.emplace_back(position+row,tokens[row]);
             if(fail_partial_window&&row==1U){poisoned=true;throw std::runtime_error("partial state-only failure");}}
     }
     void execute_state(std::uint32_t token,std::uint64_t position) override {
         ++state_serials;inputs.emplace_back(position,token);
+    }
+};
+// Tiled mock: complete blocks with or without head, and serial rows, recorded in order.
+class Tiled final : public strix::KnownPromptWindowBackend {
+public:
+    Tiled(std::uint32_t rows,std::vector<std::pair<char,std::uint64_t>>& trace):width(rows),log(trace) {}
+    std::uint32_t width;
+    std::vector<std::pair<char,std::uint64_t>>& log;
+    bool supports_tiled_prefill() const noexcept override {return true;}
+    strix::KnownWindowOutputPolicy output_policy() const noexcept override {return strix::KnownWindowOutputPolicy::terminal_row;}
+    std::uint32_t logical_rows() const noexcept override {return width;}
+    std::vector<float> execute_window(std::array<std::uint32_t,2>,std::uint64_t) override {throw std::logic_error("no pairs");}
+    std::vector<float> execute_rows(std::span<const std::uint32_t> tokens,std::uint64_t position) override {
+        if(tokens.size()!=width) throw std::invalid_argument("tiled mock width mismatch");
+        log.emplace_back(width==32U?'H':'h',position);
+        std::vector<float> result(16,-1.0F);result[(tokens.back()+1U)%16U]=1;return result;
+    }
+    void execute_state_rows(std::span<const std::uint32_t> tokens,std::uint64_t position) override {
+        if(tokens.size()!=width) throw std::invalid_argument("tiled mock width mismatch");
+        log.emplace_back(width==32U?'S':'s',position);
     }
 };
 } // namespace
@@ -315,5 +335,51 @@ int main() {
             "unsupported/nonexplicit/oversized/state-only-generation T rejects before target work");
     }
     if(!failures) std::cout<<"known prompt chunk tests passed\n";
+    {
+        // Tail backend: complete T=32 blocks, then complete 16-row tail blocks, then serial rows.
+        std::vector<std::pair<char,std::uint64_t>> trace;
+        Tiled main_blocks(32,trace),tail_blocks(16,trace);Rows serial;
+        std::vector<std::uint32_t> prompt(55);for(std::uint32_t i=0;i<55U;++i) prompt[i]=i%15U;
+        strix::KnownPromptChunkRequest request{prompt,0,16,64,2,15};
+        request.logical_rows=32;request.tiled_prefill=true;request.output_policy=strix::KnownWindowOutputPolicy::terminal_row;
+        strix::KnownPromptChunkCursor cursor(request,main_blocks,serial);
+        cursor.set_tail_backend(tail_blocks);
+        while(cursor.advance()) {}
+        const bool headless=[]{const char* v=std::getenv("STRIX_PREFILL_HEADLESS");return !v||v[0]!='0';}();
+        const std::vector<std::pair<char,std::uint64_t>> expected{{headless?'S':'H',0},{headless?'s':'h',32}};
+        expect(trace==expected && serial.serials==7U && cursor.progress().windows_executed==2U &&
+            cursor.progress().tail_windows==1U && cursor.progress().serial_tail_steps==7U,
+            "tail backend runs complete tail blocks headless before the serial rows");
+        (void)cursor.finish_greedy();
+        // A prompt ending exactly on a tail block keeps that block's head as the terminal frontier.
+        trace.clear();
+        std::vector<std::uint32_t> exact(48,1U);
+        strix::KnownPromptChunkRequest second{exact,0,16,64,1,15};
+        second.logical_rows=32;second.tiled_prefill=true;second.output_policy=strix::KnownWindowOutputPolicy::terminal_row;
+        strix::KnownPromptChunkCursor ends(second,main_blocks,serial);ends.set_tail_backend(tail_blocks);
+        while(ends.advance()) {}
+        const std::vector<std::pair<char,std::uint64_t>> exact_trace{{headless?'S':'H',0},{'h',32}};
+        expect(trace==exact_trace && ends.frontier().unconsumed_selection.has_value(),"final tail block produces the terminal head");
+        // Two tail levels: the largest tail that fits, then the next.
+        trace.clear();
+        std::vector<std::uint32_t> two(109,2U);
+        strix::KnownPromptChunkRequest third{two,0,16,128,1,15};
+        third.logical_rows=64;third.tiled_prefill=true;third.output_policy=strix::KnownWindowOutputPolicy::terminal_row;
+        Tiled main64(64,trace),tail24(24,trace);Rows serial_two;
+        strix::KnownPromptChunkCursor levels(third,main64,serial_two);
+        levels.set_tail_backend(tail24);levels.set_tail_backend(tail_blocks);
+        while(levels.advance()) {}
+        const std::vector<std::pair<char,std::uint64_t>> two_trace{{headless?'s':'h',0},{headless?'s':'h',64},{headless?'s':'h',88}};
+        expect(trace==two_trace && serial_two.serials==5U && levels.progress().tail_windows==2U,"tails are tried largest first");
+        if(trace!=two_trace) for(const auto& [kind,position]:trace) std::cerr<<kind<<position<<' ';
+        bool order_rejected=false;
+        try {strix::KnownPromptChunkCursor bad_order(third,main64,serial_two);bad_order.set_tail_backend(tail_blocks);bad_order.set_tail_backend(tail24);}
+        catch(const std::invalid_argument&) {order_rejected=true;}
+        expect(order_rejected,"tails must be descending");
+        bool rejected=false;
+        try {Tiled wide(32,trace);strix::KnownPromptChunkCursor bad(second,main_blocks,serial);bad.set_tail_backend(wide);}
+        catch(const std::invalid_argument&) {rejected=true;}
+        expect(rejected,"a tail backend must be smaller than T");
+    }
     return failures?1:0;
 }

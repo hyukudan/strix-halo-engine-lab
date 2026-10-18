@@ -236,6 +236,11 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
             *resources.ple_lookup,*resources.ple_prefetch);
     }
     std::array<double,32> launch_ms{};std::array<std::uint32_t,32> launch_steps{};
+    const auto observe=[&](std::size_t step) {
+        if(!hooks.after_step) return;
+        hooks.after_step(step,[&](std::uint32_t row) {
+            require(row<rows,"known prefill observer row is outside the block");return context(step,row);});
+    };
     try {
         for(std::size_t step=0;step<steps;++step) {
             const auto& source=serial.execution.steps[step];
@@ -266,6 +271,7 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
                 if(launch.steps[step].runtime_step) ++result.execution.runtime_steps;else ++result.execution.kernel_steps;
                 ++result.execution.completed_steps;result.execution.completion_order.push_back(source.id);
                 for(std::uint32_t r=0;r<rows;++r) result.execution.state.publish_write(source.writes_state);
+                observe(step);
                 continue;
             }
             const auto width=mode==KnownWindowStepMode::r1_row_loop?1U:(rows_entry?8U:2U);
@@ -300,6 +306,7 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
                 for(std::uint32_t r=0;r<count;++r) result.execution.state.publish_write(source.writes_state);
                 first+=count;
             }
+            observe(step);
         }
         if(resources.ple_prefetch&&resources.ple_prefetch->active) throw std::logic_error("known prefill left PLE lookup unconsumed");
         if(timing)

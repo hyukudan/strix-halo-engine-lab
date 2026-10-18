@@ -45,6 +45,15 @@ KnownPromptChunkCursor::KnownPromptChunkCursor(KnownPromptChunkRequest request,
     progress_.next_position=request.start_position;
 }
 
+void KnownPromptChunkCursor::set_tail_backend(KnownPromptWindowBackend& tail) {
+    const auto limit=tails_.empty()?request_.logical_rows:tails_.back()->logical_rows();
+    if(progress_.consumed_prompt_tokens || progress_.failed || !request_.tiled_prefill || request_.all_row_heads ||
+       !tail.supports_tiled_prefill() || tail.logical_rows()<16U || tail.logical_rows()>=limit ||
+       tail.output_policy()!=request_.output_policy || request_.output_policy==KnownWindowOutputPolicy::state_only)
+        throw std::invalid_argument("known prompt tail backend must be a smaller tiled backend set before the first chunk");
+    tails_.push_back(&tail);
+}
+
 bool KnownPromptChunkCursor::advance() {
     if(progress_.failed) throw std::logic_error("failed known-prompt cursor cannot resume");
     if(progress_.cancelled || progress_.prefill_complete) return false;
@@ -52,14 +61,20 @@ bool KnownPromptChunkCursor::advance() {
     const auto remaining=request_.prompt_tokens.size()-consumed;
     const bool state_only=request_.output_policy==KnownWindowOutputPolicy::state_only;
     const bool no_output=request_.max_new_tokens==0U;
-    const bool window=remaining>=request_.logical_rows&&(!state_only||no_output||remaining>request_.logical_rows);
+    bool window=remaining>=request_.logical_rows&&(!state_only||no_output||remaining>request_.logical_rows);
+    KnownPromptWindowBackend* backend=&windows_;
+    std::uint32_t block=request_.logical_rows;
+    bool tail=false;
+    if(!window) for(auto* candidate:tails_) if(remaining>=candidate->logical_rows()) {
+        tail=window=true;backend=candidate;block=candidate->logical_rows();break;
+    }
     // Tiled prefill: a window with more prompt after it is never read, so it runs without its head.
     // STRIX_PREFILL_HEADLESS=0 keeps the head on every block.
     static const bool allow_headless=[]{const char* v=std::getenv("STRIX_PREFILL_HEADLESS");return !v||v[0]!='0';}();
-    const bool headless=allow_headless&&!request_.all_row_heads&&request_.tiled_prefill&&!state_only&&window&&remaining>request_.logical_rows;
+    const bool headless=allow_headless&&!request_.all_row_heads&&request_.tiled_prefill&&!state_only&&window&&remaining>block;
     try {
         if(headless) {
-            windows_.execute_state_rows(request_.prompt_tokens.subspan(consumed,request_.logical_rows),progress_.next_position);
+            backend->execute_state_rows(request_.prompt_tokens.subspan(consumed,block),progress_.next_position);
             has_logits_=false;selection_.reset();
         } else if(state_only&&(no_output||window||remaining>1U)) {
             if(window) {
@@ -68,17 +83,18 @@ bool KnownPromptChunkCursor::advance() {
             } else serial_.execute_state(request_.prompt_tokens[consumed],progress_.next_position);
             has_logits_=false;selection_.reset();
         } else {
-            auto values=window ? windows_.execute_rows(request_.prompt_tokens.subspan(consumed, request_.logical_rows),
+            auto values=window ? backend->execute_rows(request_.prompt_tokens.subspan(consumed, block),
                     progress_.next_position) : serial_.execute(request_.prompt_tokens[consumed],progress_.next_position);
             validate_serial_decode_engine_logits(values,request_.vocab_size);
             std::copy(values.begin(),values.end(),logits_.begin());
             has_logits_=true;
         }
-        const auto rows=window?request_.logical_rows:1U;
+        const auto rows=window?block:1U;
         progress_.consumed_prompt_tokens+=rows;
         progress_.next_position+=rows;
         if(window) ++progress_.windows_executed;
         else ++progress_.serial_tail_steps;
+        if(tail) ++progress_.tail_windows;
         progress_.prefill_complete=progress_.consumed_prompt_tokens==request_.prompt_tokens.size();
         if(progress_.prefill_complete && has_logits_) selection_=select_greedy_token(logits_,request_.vocab_size);
         return true;

@@ -63,6 +63,15 @@ public:
     // full diagnostic replay above always executes all eleven stages.
     void prime_committed_rows(const QualifiedMtpDraftPlan&,const ActivatedMtpDraftPlan&,
         std::span<const HipMtpReplayRow>);
+    // Tiled-prefill prompt rows: the same teacher cache rows built from committed wide hidden rows a
+    // tiled prefill block produced (device copies owned by the caller, contiguous source positions
+    // from next_source_position()); next_tokens[i] is the target input after hidden row i. No
+    // ticket chain exists for these rows: the next cycle starts without a primed predecessor ticket.
+    void prime_hidden_rows(const QualifiedMtpDraftPlan&,const ActivatedMtpDraftPlan&,
+        std::span<const MtpDeviceView> hidden,std::span<const std::uint32_t> next_tokens);
+    // Prefix state cache: the caller wrote durable cache rows [0, source) back into this fresh idle
+    // runtime's KV/raw-index backing; republish `source` as its frontier.
+    void restore_cache_frontier(const QualifiedMtpDraftPlan&,const ActivatedMtpDraftPlan&,std::uint64_t source);
     // All source pairs after the logical cache frontier, plus the final committed target
     // ticket. Equality of predicted tokens is never cache authority.
     void set_reconciliation_rows(std::span<const HipMtpReplayRow>,const HipMtpTargetHiddenTicket& final_target);

@@ -219,6 +219,7 @@ add_library(strix_core STATIC
     src/projection_reduction.cpp
     src/ple_lookup.cpp
     src/ple_workspace.cpp
+    src/prefix_state_cache.cpp
     src/transport.cpp
 )
 target_include_directories(strix_core PUBLIC include)
@@ -351,6 +352,11 @@ if(BUILD_TESTING)
     target_link_libraries(strix-serving-cohort-tests PRIVATE strix_core)
     strix_target_warnings(strix-serving-cohort-tests)
     add_test(NAME strix-serving-cohort-tests COMMAND strix-serving-cohort-tests)
+
+    add_executable(strix-prefix-state-cache-tests tests/prefix_state_cache_tests.cpp)
+    target_link_libraries(strix-prefix-state-cache-tests PRIVATE strix_core)
+    strix_target_warnings(strix-prefix-state-cache-tests)
+    add_test(NAME strix-prefix-state-cache-tests COMMAND strix-prefix-state-cache-tests)
 
     add_executable(strix-known-prompt-chunks-tests tests/known_prompt_chunks_tests.cpp)
     target_link_libraries(strix-known-prompt-chunks-tests PRIVATE strix_core)

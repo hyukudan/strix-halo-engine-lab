@@ -3,6 +3,11 @@
 #include "hip_decode_options.hpp"
 #include "hip_decode_receipt_json.hpp"
 #include "mtp_window_memory_reservation.hpp"
+#include "hip_prefix_state_cache.hpp"
+#include "strix/dispatch_resources.hpp"
+#include "strix/hip_known_prefix_window.hpp"
+#include "strix/hip_known_prompt_backend.hpp"
+#include "strix/hip_launch_context.hpp"
 #include "strix/hip_mtp_asset_loader.hpp"
 #include "strix/hip_launcher_catalog.hpp"
 #include "strix/hip_mtp_forward_replay.hpp"
@@ -50,6 +55,25 @@ struct MtpDecodeTargetParents final {
         DirectLaunchDispatcher* dispatcher = nullptr;
         ExecutionRuntimeResources resources;
     } prompt;
+    // Tiled MTP prompt: the prompt runs through the tiled known-prefix prefill (complete T-row
+    // blocks, optional smaller tail blocks, the rest serially through the MTP target producer) and
+    // the predictor cache is built from every block row's wide hidden state. Null blocks: the
+    // ordinary serial MTP prompt.
+    struct TiledPrompt {
+        HipKnownPromptBackend* blocks = nullptr;
+        std::shared_ptr<HipKnownPrefixWindow> block_owner;
+        struct Tail {
+            HipKnownPromptBackend* backend = nullptr;
+            std::shared_ptr<HipKnownPrefixWindow> owner;
+            std::uint32_t rows = 0;
+        };
+        std::vector<Tail> tails; // descending rows
+        std::uint32_t rows = 0;
+        HipPrefixStateCacheSession* cache = nullptr;
+        // Fresh target state and session, exactly as after setup (after the calibration replay).
+        std::function<void()> reset_state;
+        SerialSessionContext fresh;
+    } tiled;
     struct WindowSetupReceipt {
         std::uint64_t union_source_steps = 0;
         std::uint64_t union_reserved_bytes = 0;
@@ -116,6 +140,102 @@ struct MtpDecodeQualificationContext {
 using MtpDecodeQualification=std::function<void(MtpDecodeQualificationContext&)>;
 using MtpDecodeComponentDiagnostic=std::function<void(const std::shared_ptr<HipMtpResources>&,std::uint64_t)>;
 
+// Tiled MTP prompt after the calibration replay. Complete T-row blocks (then complete tail blocks)
+// run through the tiled prefill; a step observer copies every row's wide hidden state (the MTP
+// target tap) out of the block arena, and the predictor's cache rows are built from those copies
+// (pair (h_i, t_{i+1})). The remaining rows, at least the last prompt row, run serially through
+// the MTP target producer, whose last ticket is the pending row of the first cycle. With a prefix
+// state cache the longest cached block boundary P is restored first (target state, predictor
+// rows [0, P-1) and h_{P-1}), and selected block boundaries are captured.
+inline HipMtpTargetHiddenTicket run_tiled_mtp_prompt(const Options& options,const ModelContract& model,
+    const CompiledSerialExecution& compiled,MtpDecodeTargetParents::TiledPrompt& tiled,SerialSessionContext& session,
+    HipMtpTargetHidden& target,HipMtpRuntime& runtime,const QualifiedMtpDraftPlan& qualified,const ActivatedMtpDraftPlan& activated,
+    const ExecutionRuntimeResources& resources,DirectLaunchDispatcher& dispatcher,std::byte* held,std::string& receipt) {
+    const auto check=[](hipError_t e,const char* what){if(e!=hipSuccess)throw std::runtime_error(std::string(what)+": "+hipGetErrorString(e));};
+    const std::span<const std::uint32_t> tokens(options.tokens);
+    const auto n=static_cast<std::uint64_t>(tokens.size());
+    const auto width=mtp_cli_mul(mtp_cli_mul(model.hidden_size,model.hc_count),2U);
+    // The target tap: the last MLP injection before the final hyper mix (same step in every sibling).
+    std::size_t tap=SIZE_MAX;
+    for(std::size_t i=1;i<compiled.execution.steps.size();++i)
+        if(compiled.execution.steps[i].op==SerialOp::final_hyper_mix && compiled.execution.steps[i-1U].op==SerialOp::mlp_inject) tap=i-1U;
+    if(tap==SIZE_MAX)throw std::logic_error("tiled MTP prompt has no wide hidden tap step");
+    const auto max_rows=tiled.rows;
+    std::byte* block_hidden=nullptr;
+    check(hipMalloc(reinterpret_cast<void**>(&block_hidden),static_cast<std::size_t>(mtp_cli_mul(max_rows,width))),"tiled MTP hidden rows");
+    struct Free{std::byte* p;~Free(){if(p)(void)hipFree(p);}} free_rows{block_hidden};
+    const auto view=[&](const std::byte* p){return MtpDeviceView{reinterpret_cast<std::uintptr_t>(p),width,1U};};
+    std::uint32_t block_rows=0;
+    const HipKnownPrefixWindow::PrefillStepObserver observer=[&](std::size_t step,const std::function<ExecutionDispatchContext(std::uint32_t)>& row) {
+        if(step!=tap) return;
+        const auto stream=hip_execution_stream();
+        for(std::uint32_t r=0;r<block_rows;++r) {
+            const auto c=row(r);
+            const auto source=resolve_dispatch_write(c,0);
+            if(source.bytes<width)throw std::logic_error("tiled MTP tap row is undersized");
+            check(hipMemcpyAsync(block_hidden+static_cast<std::size_t>(r)*width,reinterpret_cast<const void*>(source.address),
+                static_cast<std::size_t>(width),hipMemcpyDeviceToDevice,stream),"tiled MTP tap copy");
+        }
+    };
+    std::uint64_t restored=0,blocks=0,tail_blocks=0,serial_rows=0;
+    const auto start=std::chrono::steady_clock::now();
+    if(tiled.cache) restored=tiled.cache->begin_request(session,tokens);
+    std::uint64_t pos=restored;
+    std::vector<MtpDeviceView> views;std::vector<std::uint32_t> next;
+    const auto run=[&](HipKnownPromptBackend& backend,HipKnownPrefixWindow& owner,std::uint32_t rows,bool capture) {
+        owner.set_prefill_step_observer(observer);block_rows=rows;
+        try {
+            while(pos+rows<=n-1U) {
+                backend.execute_state_rows(tokens.subspan(static_cast<std::size_t>(pos),rows),pos);
+                views.clear();next.clear();
+                if(pos){views.push_back(view(held));next.push_back(tokens[static_cast<std::size_t>(pos)]);}
+                for(std::uint32_t r=0;r+1U<rows;++r){views.push_back(view(block_hidden+static_cast<std::size_t>(r)*width));
+                    next.push_back(tokens[static_cast<std::size_t>(pos+r+1U)]);}
+                runtime.prime_hidden_rows(qualified,activated,views,next);
+                check(hipMemcpy(held,block_hidden+static_cast<std::size_t>(rows-1U)*width,static_cast<std::size_t>(width),hipMemcpyDeviceToDevice),
+                    "tiled MTP held copy");
+                pos+=rows;
+                if(capture && tiled.cache) tiled.cache->after_block(session,tokens,n-1U);
+                if(capture)++blocks;else ++tail_blocks;
+            }
+        } catch(...) {owner.set_prefill_step_observer({});throw;}
+        owner.set_prefill_step_observer({});
+    };
+    run(*tiled.blocks,*tiled.block_owner,tiled.rows,true);
+    for(const auto& tail:tiled.tails) run(*tail.backend,*tail.owner,tail.rows,false);
+    HipMtpTargetHiddenTicket pending;
+    while(pos<n) {
+        auto ticket=target.execute_serial(session,resources,dispatcher,tokens[static_cast<std::size_t>(pos)]);
+        if(pos) {
+            const std::array<MtpDeviceView,1> one{view(held)};const std::array<std::uint32_t,1> token{tokens[static_cast<std::size_t>(pos)]};
+            runtime.prime_hidden_rows(qualified,activated,one,token);
+        }
+        check(hipMemcpy(held,reinterpret_cast<const void*>(ticket.view().address),static_cast<std::size_t>(width),hipMemcpyDeviceToDevice),
+            "tiled MTP held ticket copy");
+        pending=std::move(ticket);++pos;++serial_rows;
+    }
+    if(runtime.next_source_position()+1U!=n || session.next_position!=n)
+        throw std::logic_error("tiled MTP prompt did not reach the final prompt frontier");
+    const auto prompt_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count();
+    std::ostringstream out;
+    out<<"\"rows\":"<<tiled.rows<<",\"tail_rows\":[";
+    for(std::size_t t=0;t<tiled.tails.size();++t)out<<(t?",":"")<<tiled.tails[t].rows;
+    out<<"],\"restored_position\":"<<restored
+       <<",\"blocks\":"<<blocks<<",\"tail_blocks\":"<<tail_blocks<<",\"serial_rows\":"<<serial_rows
+       <<",\"prompt_ms\":"<<prompt_ms;
+    if(tiled.cache) {
+        const auto& q=tiled.cache->request();
+        out<<",\"prefix_cache\":{\"lookup_ms\":"<<q.lookup_ms<<",\"restore_ms\":"<<q.restore_ms<<",\"restored_bytes\":"<<q.restored_bytes
+           <<",\"captured_checkpoints\":"<<q.captured_checkpoints<<",\"captured_segment_bytes\":"<<q.captured_segment_bytes
+           <<",\"captured_fixed_bytes\":"<<q.captured_fixed_bytes<<",\"capture_ms\":"<<q.capture_ms
+           <<",\"row_bytes_per_position\":"<<tiled.cache->row_bytes()<<",\"fixed_bytes_per_checkpoint\":"<<tiled.cache->fixed_bytes()<<'}';
+        static const bool digest=[]{const char* v=std::getenv("STRIX_PREFIX_CACHE_DIGEST");return v && v[0]=='1';}();
+        if(digest) out<<",\"state_digest\":\""<<model_content_identity_hex(tiled.cache->state_digest(n))<<'"';
+    }
+    receipt=out.str();
+    return pending;
+}
+
 // One synchronous CLI request with externally pinned evidence. Setup/loading,
 // independent replay, activation and generation have separate receipt scopes.
 // There is no path from command-line booleans to a qualified/activated plan.
@@ -139,6 +259,12 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
     const auto prefill_profile_identity=numerical_profile_identity(pair.prefill);
     const auto decode_profile_identity=numerical_profile_identity(pair.decode);
     const bool split=pair.split();
+    const bool tiled_prompt=parents && parents->tiled.blocks;
+    const std::size_t calibration_rows=tiled_prompt ? mtp_calibration_rows(options) : options.tokens.size()-1U;
+    if(tiled_prompt && (split || qualify || component_diagnostic || !parents->tiled.block_owner || !parents->tiled.reset_state ||
+       !parents->tiled.rows || std::any_of(parents->tiled.tails.begin(),parents->tiled.tails.end(),
+           [&](const auto& t){return !t.backend || !t.owner || t.rows>=parents->tiled.rows;})))
+        throw std::invalid_argument("tiled MTP prompt requires one numerical profile, its block owners and a state reset");
     if(split!=(parents && parents->prompt.compiled) ||
        (split && (!parents->prompt.dispatcher || parents->prompt.resources.session_state_memory!=parents->resources.session_state_memory)))
         throw std::invalid_argument("MTP split prefill profile requires its actual prompt execution and only then");
@@ -151,8 +277,10 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
            split)
         throw std::invalid_argument("MTP golden was dumped under another target prefill/decode numerical profile pair "
             "(a version-1 golden records none and requires one profile for both); dump a golden with this pair");
-    if(golden.rows.size()+1U!=options.tokens.size())
-        throw std::invalid_argument("MTP golden must cover every prompt predictor pair, leaving only its final pending target row");
+    if(tiled_prompt ? golden.rows.size()!=calibration_rows :
+       golden.rows.size()+1U!=options.tokens.size())
+        throw std::invalid_argument(tiled_prompt ? "MTP golden of a tiled prompt must cover exactly its calibration rows" :
+            "MTP golden must cover every prompt predictor pair, leaving only its final pending target row");
     for(std::size_t i=0;i<golden.rows.size();++i) {
         const auto& row=golden.rows[i];
         if(row.source_position!=i || row.source_input_token!=options.tokens[i] || row.next_input_token!=options.tokens[i+1U] ||
@@ -216,7 +344,11 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
     replay_payload=mtp_cli_add(replay_payload,mtp_cli_mul(golden.rows.size()+1U,192U));
     if(!dump && replay_payload>m.replay_host_bytes)throw std::invalid_argument("MTP complete independent replay exceeds host payload budget before target mutation");
     HipMtpForwardReplayRequest replay_request{policy,hip_mtp_forward_golden_payload_identity(golden),golden.rows.size(),m.replay_host_bytes};
-    const auto retained_rows=static_cast<std::uint32_t>(std::max<std::size_t>(options.tokens.size(),static_cast<std::size_t>(m.candidate_depth)+3U));
+    // Tiled prompt: only the calibration rows and the serial remainder take capture slots.
+    const auto retained_rows=static_cast<std::uint32_t>(tiled_prompt
+        ? std::max<std::size_t>({calibration_rows+1U,static_cast<std::size_t>(parents->tiled.tails.empty()?parents->tiled.rows:parents->tiled.tails.back().rows)+1U,
+            static_cast<std::size_t>(m.candidate_depth)+3U})
+        : std::max<std::size_t>(options.tokens.size(),static_cast<std::size_t>(m.candidate_depth)+3U));
     HipMtpTargetDeferredConfig d1;
     if(deferred_status)d1={r.session_state_layout,&generations};
     auto target=HipMtpTargetHidden::create(model,compiled,actual.memory,actual.model,actual.allocator,
@@ -239,11 +371,20 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
     QualifiedMtpDraftPlan qualified;ActivatedMtpDraftPlan activated;
     const std::array<std::uint32_t,1> eos{options.eos_token.value_or(static_cast<std::uint32_t>(model.ple_eos_token_id))};
     std::string stop="token-budget";
+    double calibration_ms=0.0;
+    std::string tiled_receipt;
+    // h_{P-1} of the tiled prompt (one wide row), retained through the request.
+    std::byte* tiled_held=nullptr;
+    if(tiled_prompt && hipMalloc(reinterpret_cast<void**>(&tiled_held),static_cast<std::size_t>(width*2U))!=hipSuccess)
+        throw std::runtime_error("tiled MTP held hidden allocation failed");
+    struct HeldFree{std::byte* p;~HeldFree(){if(p)(void)hipFree(p);}} held_free{tiled_held};
     try {
         // The prompt rows are the prefill: under a split pair they run the sibling prompt
         // execution, and the session moves to the decode execution only after the replay.
         if(split)hand_off_serial_session(session,{&compiled,&r},{parents->prompt.compiled,&parents->prompt.resources});
-        for(std::size_t i=0;i<options.tokens.size();++i) {
+        const auto prompt_rows=tiled_prompt ? calibration_rows+1U : options.tokens.size();
+        const auto calibration_start=std::chrono::steady_clock::now();
+        for(std::size_t i=0;i<prompt_rows;++i) {
             auto current=split ? target->execute_serial(session,parents->prompt.resources,*parents->prompt.dispatcher,options.tokens[i])
                                : target->execute_serial(session,r,dispatcher,options.tokens[i]);
             if(pending.valid())replay_rows.push_back({pending,options.tokens[i]});
@@ -297,11 +438,8 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
         if(runtime->next_source_position()+1U!=session.next_position)
             throw std::logic_error("MTP replay did not prime the actual final prompt frontier");
         replay_rows.clear(); // release prompt snapshots before bounded cycles
-        // Prefill handoff: every later target row, window and checkpoint runs the decode execution
-        // from the state this prefill produced. The pending prompt row is re-minted with the
-        // handed-off session; the lineage keeps the prefill identity of every prompt row.
-        if(split)pending=target->hand_off_prompt(session,pending,parents->prompt.resources,r);
-        if(m.draft_chain){
+        const auto enable_draft=[&] {
+            if(!m.draft_chain) return;
             // Drafts only: the subset (or full) head changes acceptance, never target output.
             HipMtpDraftHeadConfig draft;draft.full=m.draft_vocab.empty() && !m.draft_context_vocab;
             if(!m.draft_vocab.empty()) {
@@ -313,6 +451,44 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
             }
             draft.context_capacity=m.draft_context_vocab;draft.q4=m.draft_q4;
             runtime->enable_draft_chain(std::move(draft),m.draft_exact);runtime->observe_draft_context(options.tokens);
+        };
+        if(tiled_prompt) {
+            calibration_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-calibration_start).count();
+            // The calibration rows only qualified the predictor: start the real prompt from a fresh
+            // target and a fresh predictor (the qualified/activated plans bind assets, not an owner).
+            pending={};
+            runtime.reset();
+            runtime=std::make_shared<HipMtpRuntime>(native);
+            parents->tiled.reset_state();
+            session=parents->tiled.fresh;
+            enable_draft();
+            if(parents->tiled.cache) {
+                // The predictor's durable rows and the held h_{P-1} travel with each checkpoint; the
+                // identity gains everything that changes them (cache rows use the draft kernels
+                // when the draft chain is not exact).
+                auto& cache=*parents->tiled.cache;
+                const auto kv=native->view(HipMtpBuffer::kv),index=native->view(HipMtpBuffer::raw_index);
+                cache.add_rows(kv.address,mtp_cli_mul(mtp_cli_mul(model.kv_heads,model.head_dim),4U),1U);
+                cache.add_rows(index.address,mtp_cli_mul(model.indexer_head_dim,2U),1U);
+                cache.add_fixed_device(reinterpret_cast<std::uintptr_t>(tiled_held),width*2U);
+                std::vector<std::byte> frame;
+                const auto u64=[&](std::uint64_t v){for(unsigned b=0;b<64;b+=8)frame.push_back(static_cast<std::byte>((v>>b)&255U));};
+                for(const auto byte:assets->shared_target().sidecar_model_content_identity.bytes)frame.push_back(static_cast<std::byte>(byte));
+                u64(assets->compiled().plan_identity);u64(runtime->numerical_profile_identity());
+                u64(m.draft_chain);u64(m.draft_exact);u64(m.draft_q4);
+                const char* q4_all=std::getenv("STRIX_MTP_DRAFT_Q4_ALL");u64(!q4_all || q4_all[0]!='0');
+                cache.extend_identity(sha256_bytes(frame));
+                cache.set_restore_hook([&](std::uint64_t position){runtime->restore_cache_frontier(qualified,activated,position-1U);});
+            }
+            pending=run_tiled_mtp_prompt(options,model,compiled,parents->tiled,session,*target,*runtime,qualified,activated,
+                r,dispatcher,tiled_held,tiled_receipt);
+        } else
+        // Prefill handoff: every later target row, window and checkpoint runs the decode execution
+        // from the state this prefill produced. The pending prompt row is re-minted with the
+        // handed-off session; the lineage keeps the prefill identity of every prompt row.
+        {
+            if(split)pending=target->hand_off_prompt(session,pending,parents->prompt.resources,r);
+            enable_draft();
         }
         HipMtpGreedyRuntime greedy(runtime,qualified,activated,target,session,r,dispatcher,parents);
         if(window && !qualify)greedy.use_window_verifier(window);
@@ -438,10 +614,12 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
             <<"  \"mtp_draft_context_rows\":"<<draft_stats.context_rows<<",\n  \"mtp_draft_context_dropped\":"<<draft_stats.context_dropped<<",\n"
             <<"  \"mtp_generation_cycle_elapsed_ms\":"<<elapsed<<",\n"
             <<"  \"mtp_timing_scope\":\"post-prompt-and-independent-replay-cycles-only-host-completed-wall-not-GPU-kernel-time\",\n"
+            <<(tiled_prompt ? "  \"mtp_tiled_prompt\":{"+tiled_receipt+",\"calibration_rows\":"+std::to_string(calibration_rows)+
+                ",\"calibration_ms\":"+std::to_string(calibration_ms)+"},\n" : std::string{})
             <<"  \"prefix_tokens_consumed\":"<<options.tokens.size()<<",\n  \"final_position\":"<<session.next_position<<",\n"
             <<"  \"stop_reason\":\""<<stop<<"\",\n  \"generated_tokens\":[";
         for(std::size_t i=0;i<generated.size();++i){if(i)output<<',';output<<generated[i];}
         output<<"]\n}\n";
-    } catch(...) {runtime->cancel();throw;}
+    } catch(...) {if(runtime)runtime->cancel();throw;}
 }
 } // namespace strix::decode_cli

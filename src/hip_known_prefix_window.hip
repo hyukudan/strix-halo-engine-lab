@@ -169,6 +169,7 @@ struct HipKnownPrefixWindow::Impl {
     std::unique_ptr<SharedDetach> shared_detach;
     DeferredMoeFirstError completion_status{};
     bool failed = false;
+    HipKnownPrefixWindow::PrefillStepObserver prefill_observer;
 
     Impl(CompiledKnownPrefixWindow source, CompiledSerialExecution serial_source,
         ModelContract model_source, HipLauncherCatalogConfig config_source,
@@ -1025,6 +1026,7 @@ struct HipKnownPrefixWindow::Impl {
             hooks.skip_head=skip_head;
             hooks.preflight_memo=&preflight_memo;hooks.recipe_memo=&recipe_memo;hooks.preflight_slots=&preflight_slots;
             hooks.arena_index=&arena_index;
+            if(prefill) hooks.after_step=prefill_observer;
             const auto first_position=session.next_position;
             auto result=prefill ? execute_known_prefix_prefill_eager(*prefill,serial,resources,scratch,session,tokens,
                 launch_plans.front(),r2_entries,rows_entries,hooks,prefill_entries) :
@@ -1095,6 +1097,11 @@ HipMtpTargetWindowExecution HipKnownPrefixWindow::execute_mtp_captured(SerialSes
     std::shared_ptr<HipMtpTargetWindowCapture> capture,const std::function<void()>& before_publish){
     if(!capture)throw std::invalid_argument("MTP target capture owner is absent");
     HipMtpTargetWindowExecution out;out.execution=impl_->execute(session,tokens,before_publish,capture,&out.batch);return out;
+}
+void HipKnownPrefixWindow::set_prefill_step_observer(PrefillStepObserver observer) {
+    if(!impl_->prefill || impl_->executing || impl_->failed)
+        throw std::invalid_argument("prefill step observer requires an idle tiled prefill owner");
+    impl_->prefill_observer=std::move(observer);
 }
 void HipKnownPrefixWindow::attach_greedy_rows(ExecutionBufferAddress partials,HipGreedyRowsReply* replies) {
     impl_->attach_greedy_rows(partials,replies);

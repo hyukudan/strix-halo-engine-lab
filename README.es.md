@@ -289,7 +289,7 @@ El registro completo, con alternativas, evidencia y la condición para reabrir c
 
 En curso, sin un orden concreto y sin números prometidos:
 
-- **Caché de prefijos con estado GDN**: reutilizar un prefijo de prompt ya leído, incluido el estado recurrente.
+- **Caché de prefijos con estado GDN** *(ya integrada, D-035)*: una petición cuyo prompt empieza por un prefijo en caché restaura el estado completo del modelo en un límite de bloque del prefill por bloques y solo lee el resto, con salida idéntica bit a bit (`--prefix-cache-host-bytes N`, opcional `--prefix-cache-dir DIR`; ver [docs/prefix-state-cache.md](docs/prefix-state-cache.md)). Los tiempos llegarán con la próxima campaña de medidas.
 - **Panel de monitorización**: vista en vivo de peticiones, velocidad y memoria.
 - **Varias peticiones a la vez**.
 - **Caché KV en int8**.

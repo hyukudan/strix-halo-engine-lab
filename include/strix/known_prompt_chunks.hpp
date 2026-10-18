@@ -43,6 +43,8 @@ struct KnownPromptChunkProgress {
     bool cancelled = false;
     bool failed = false;
     std::uint64_t state_only_windows = 0;
+    // Tail blocks of the optional smaller tiled backend (counted in windows_executed too).
+    std::uint64_t tail_windows = 0;
 };
 struct KnownPromptChunkFrontier {
     // False before any completed chunk and after an opaque backend failure.
@@ -86,6 +88,11 @@ public:
     KnownPromptChunkCursor& operator=(const KnownPromptChunkCursor&) = delete;
     // True iff one complete configured window or serial suffix row completed. False after prefill/cancel.
     [[nodiscard]] bool advance();
+    // Optional smaller tiled backends for the remainder: after the last complete T-row block, the
+    // remaining rows run as complete blocks of the largest tail that fits, and only the rest serially.
+    // Same output policy, explicitly tiled, each smaller than T and than the previous tail. Called
+    // once per tail size, in descending order, before the first advance.
+    void set_tail_backend(KnownPromptWindowBackend& tail);
     void cancel() noexcept;
     // Explicit one-shot generation after complete prefill. Delegates the
     // existing greedy continuation's EOS/budget/capacity/bonus policy unchanged.
@@ -97,6 +104,7 @@ public:
 private:
     KnownPromptChunkRequest request_;
     KnownPromptWindowBackend& windows_;
+    std::vector<KnownPromptWindowBackend*> tails_;
     SerialGreedyStepBackend& serial_;
     KnownPromptChunkProgress progress_;
     std::vector<float> logits_;
