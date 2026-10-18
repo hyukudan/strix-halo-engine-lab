@@ -1258,6 +1258,17 @@ void inject_known_window_rows_preflight(std::span<const ExecutionDispatchContext
     const HipElementwiseLauncherConfig& config) {
     static_cast<void>(prepare_inject_rows(rows, config));
 }
+InjectRowsViews inject_known_window_rows_views(std::span<const ExecutionDispatchContext> rows,
+    const HipElementwiseLauncherConfig& config) {
+    const auto args = prepare_inject_rows(rows, config);
+    InjectRowsViews views;
+    views.count = static_cast<std::uint32_t>(rows.size());
+    for (std::uint32_t r = 0; r < views.count; ++r) {
+        views.hyper[r] = args.first[r]; views.hidden[r] = args.second[r];
+        views.weights[r] = args.weights[r]; views.output[r] = args.output[r];
+    }
+    return views;
+}
 void inject_known_window_rows_launch(std::span<const ExecutionDispatchContext> rows,
     const HipElementwiseLauncherConfig& config) {
     const auto args = prepare_inject_rows(rows, config);

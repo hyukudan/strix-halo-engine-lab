@@ -57,6 +57,17 @@ void inject_known_window_rows_preflight(std::span<const ExecutionDispatchContext
     const HipElementwiseLauncherConfig& config);
 void inject_known_window_rows_launch(std::span<const ExecutionDispatchContext> rows,
     const HipElementwiseLauncherConfig& config);
+// The resolved views of an admitted inject rows call (the same admission as the launch, nothing
+// enqueued), for a consumer that runs the inject inside its own kernel.
+struct InjectRowsViews {
+    const void* hyper[8];
+    const void* hidden[8];
+    const float* weights[8];
+    void* output[8];
+    std::uint32_t count = 0;
+};
+InjectRowsViews inject_known_window_rows_views(std::span<const ExecutionDispatchContext> rows,
+    const HipElementwiseLauncherConfig& config);
 void moe_combine_known_window_rows_preflight(std::span<const ExecutionDispatchContext> rows,
     const HipElementwiseLauncherConfig& config);
 void moe_combine_known_window_rows_launch(std::span<const ExecutionDispatchContext> rows,
