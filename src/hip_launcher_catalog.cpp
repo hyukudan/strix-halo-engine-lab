@@ -323,7 +323,7 @@ void validate_numerical_catalog_config(const ModelContract& model, const HipLaun
     if (config.dense_a8 != numerical_profile_dense_a8(config.numerical_profile))
         throw std::invalid_argument("HIP catalog dense A8 recipe differs from typed numerical profile");
     if ((config.fast_prefill_components != 0U) != numerical_profile_fast_prefill(config.numerical_profile) ||
-        (config.fast_prefill_components & ~kFastPrefillAll) != 0U)
+        (config.fast_prefill_components & ~kFastPrefillKnown) != 0U)
         throw std::invalid_argument("HIP catalog fast prefill components differ from typed numerical profile");
     if (config.dense_a8 && (!config.wave8_q8_gdn_input || !config.wave8_q8_gdn_output || !config.wave8_q8_qsa_output ||
                             !config.prefetch_q8_qsa_input || !config.prefetch_q8_shared_expert))

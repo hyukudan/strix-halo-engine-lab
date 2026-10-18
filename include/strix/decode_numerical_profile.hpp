@@ -138,6 +138,9 @@ inline constexpr std::optional<DecodeNumericalProfile> numerical_profile_dense_a
 // Components of a fast prefill profile (any non-empty subset; all by default).
 inline constexpr std::uint32_t kFastPrefillHc = 1U, kFastPrefillDense = 2U, kFastPrefillMoe = 4U,
     kFastPrefillAll = kFastPrefillHc | kFastPrefillDense | kFastPrefillMoe;
+// dense8: the dense projections as A8-G64 (int8 x int8, int32 over 64 features per scale step) instead of the FP16 form
+// of `dense`; opt-in (not part of the default set) and exclusive with `dense`.
+inline constexpr std::uint32_t kFastPrefillDense8 = 16U, kFastPrefillKnown = kFastPrefillAll | kFastPrefillDense8;
 
 // Prefill/decode arithmetic pair. The prompt prefill may run a different (prefill) profile from
 // the decode/MTP windows; decode always runs `decode`. A pair is admitted when both profiles are
@@ -156,7 +159,8 @@ inline constexpr bool numerical_profile_pair_admitted(NumericalProfilePair pair)
     if (numerical_profile_fast_prefill(pair.decode)) return false;
     if (numerical_profile_fast_prefill(pair.prefill))
         return numerical_profile_fast_prefill_decode(pair.prefill) == pair.decode && pair.fast_components != 0U &&
-            (pair.fast_components & ~kFastPrefillAll) == 0U;
+            (pair.fast_components & ~kFastPrefillKnown) == 0U &&
+            (pair.fast_components & (kFastPrefillDense | kFastPrefillDense8)) != (kFastPrefillDense | kFastPrefillDense8);
     return pair.fast_components == 0U && (!pair.split() || numerical_profile_dense_a8_sibling(pair.decode) == pair.prefill);
 }
 // Identity of a pair. A pure pair keeps the identity of its single profile, so records that

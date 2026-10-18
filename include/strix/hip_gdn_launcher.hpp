@@ -38,6 +38,8 @@ struct HipGdnLauncherConfig {
     bool dense_a8_projections = false;
     // fast-prefill-f16wmma-v1: prompt launches of 32..256 rows run q8_rows::launch_dense_f16 (prefill only).
     bool dense_f16_prefill = false;
+    // fast-prefill component dense8: prompt launches of 64..256 rows run q8_rows::launch_dense_g64 (prefill only).
+    bool dense_g64_prefill = false;
 };
 
 // Closed eager R2 window helper. Each context remains an R1 row view. Both

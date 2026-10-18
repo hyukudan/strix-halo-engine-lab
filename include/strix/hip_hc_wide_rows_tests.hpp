@@ -23,6 +23,7 @@ struct WideHyperRowsTestViews {
     // Optional FP16 copy of the normalized rows (row r at normalized16 + r * 10240 halves) for projection kernel 2.
     const void* normalized16 = nullptr;
     std::uint32_t normalized16_pitch = 0;  // halves; 0 = 10240
+    bool normalized16_only = false;        // the output's stream mix reads the FP16 rows too
 };
 void enqueue_wide_hyper_rows_test(const HipHyperMixLauncherConfig& config, const WideHyperRowsTestViews& views,
     unsigned projection_kernel, unsigned output_kernel, hipStream_t stream);

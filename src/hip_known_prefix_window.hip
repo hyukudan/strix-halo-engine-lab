@@ -389,6 +389,7 @@ struct HipKnownPrefixWindow::Impl {
         shared_config.dense_a8_projections = config.dense_a8;
         // Fast prefill profile (prefill catalog only): FP16 WMMA dense projections in 32..256-row prompt launches.
         shared_config.dense_f16_prefill = (config.fast_prefill_components & kFastPrefillDense) != 0U;
+        shared_config.dense_g64_prefill = (config.fast_prefill_components & kFastPrefillDense8) != 0U;
         shared_fallback = shared_config;
         shared_fallback.prefetch_q8 = false; shared_fallback.prefetch_eligible_layers.clear();
         gdn_config.model = model; gdn_config.activation = config.activation;
@@ -399,6 +400,7 @@ struct HipKnownPrefixWindow::Impl {
         gdn_config.wave8_q8_output_projection = config.wave8_q8_gdn_output;
         gdn_config.dense_a8_projections = config.dense_a8;
         gdn_config.dense_f16_prefill = (config.fast_prefill_components & kFastPrefillDense) != 0U;
+        gdn_config.dense_g64_prefill = (config.fast_prefill_components & kFastPrefillDense8) != 0U;
         r2_entries[0] = {KnownWindowR2Variant::shared_q8_virtual256_r2_v1, this,
             [](std::span<const ExecutionDispatchContext, 2> rows, void* object) {
                 const auto& self = *static_cast<Impl*>(object);
@@ -564,6 +566,7 @@ struct HipKnownPrefixWindow::Impl {
         qsa_config.wave8_q8_output=config.wave8_q8_qsa_output;
         qsa_config.dense_a8_projections=config.dense_a8;
         qsa_config.dense_f16_prefill=(config.fast_prefill_components & kFastPrefillDense) != 0U;
+        qsa_config.dense_g64_prefill=(config.fast_prefill_components & kFastPrefillDense8) != 0U;
         qsa_fallback=qsa_config;
         qsa_fallback.prefetch_q8_input=false; qsa_fallback.prefetch_eligible_layers.clear();
         // One entry per QSA variant actually selected (layers may differ in indexer format).

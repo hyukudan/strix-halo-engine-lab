@@ -189,7 +189,8 @@ __device__ __forceinline__ void hcw_projection_half(const HyperWideRows& rows, c
 
 // Fast-profile HC norm: rows_prepare_hyper_norm_kernel's values (same expression), plus their FP16 (RNE) copy for
 // the FP16-input projection at normalized16[(8 tile + row) * kHcwNorm16Pitch + feature]. Prefill tiles only.
-template <typename Storage>
+// WriteF32 = false (STRIX_HCW_NORM16=2): only the FP16 copy is written; the projection and the lane-chain output read it.
+template <typename Storage, bool WriteF32 = true>
 __global__ void rows_prepare_hyper_norm16_kernel(HyperTileRows rows, const void* norm, std::uint32_t norm_type,
     std::uint32_t hidden, float epsilon, _Float16* __restrict__ normalized16) {
     const auto stream = blockIdx.x;
@@ -215,7 +216,7 @@ __global__ void rows_prepare_hyper_norm16_kernel(HyperTileRows rows, const void*
     __syncthreads();
     for (std::uint32_t feature = lane; feature < hidden; feature += kThreads) {
         const float value = load_activation(input, base + feature) * inverse * load_norm_weight(norm, norm_type, stream * hidden + feature);
-        normalized[base + feature] = value;
+        if constexpr (WriteF32) normalized[base + feature] = value;
         half[base + feature] = static_cast<_Float16>(value);
     }
 }

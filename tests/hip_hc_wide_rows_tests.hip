@@ -223,6 +223,39 @@ void compare_half(std::uint32_t rows, bool bf16, unsigned flavor, hipStream_t st
     std::cout << "half rows " << rows << (bf16 ? " bf16" : " fp32") << " flavor " << flavor << ": low/output bytes differ " << differ
               << ", injection rel vs fp32-input " << rel << '\n';
     if (differ || !(rel < 1e-4)) throw std::runtime_error("FP16-input HC projection differs from the FP32-input form");
+    // FP16-only rows (STRIX_HCW_NORM16=2): the FP32 normalized values are NaN, so any read of them would show; low values and
+    // injection equal the FP16-input run, the output differs only by the FP16 rounding of the mix's normalized values.
+    {
+        std::vector<unsigned char> poisoned = f.normalized_host;
+        const float nan = std::bit_cast<float>(0x7fc00000U);
+        for (std::uint32_t r = 0; r < rows; ++r)
+            for (std::uint32_t i = 0; i < kWidth; ++i) std::memcpy(&poisoned[static_cast<std::size_t>(r) * kNormalizedStride + i * 4U], &nan, 4);
+        f.normalized.upload(poisoned);
+        check(hipMemset(f.injection.p, 0xa5, f.injection.n), "poison injection");
+        check(hipMemset(f.output.p, 0xa5, f.output.n), "poison output");
+        v.normalized16_only = true;
+        strix::testing::enqueue_wide_hyper_rows_test(c, v, 2U, 1U, stream);
+        check(hipStreamSynchronize(stream), "fp16-only form");
+        const auto bn = f.normalized.download(), bi = f.injection.download(), bo = f.output.download();
+        std::size_t low_differ = 0, injection_differ = 0, nonfinite = 0;
+        for (std::uint32_t r = 0; r < rows; ++r)
+            for (std::size_t b = static_cast<std::size_t>(r) * kNormalizedStride + kWidth * 4U; b < static_cast<std::size_t>(r) * kNormalizedStride + (kWidth + kRank) * 4U; ++b)
+                low_differ += bn[b] != an[b];
+        for (std::size_t b = 0; b < bi.size(); ++b) injection_differ += bi[b] != ai[b];
+        double osq = 0, oref = 0;
+        const std::size_t e = bf16 ? 2U : 4U;
+        for (std::uint32_t r = 0; r < rows; ++r)
+            for (std::uint32_t k = 0; k < kHidden; ++k) {
+                const float x = to_float(&ao[r * f.output_stride + k * e], bf16), y = to_float(&bo[r * f.output_stride + k * e], bf16);
+                if (!std::isfinite(y)) { ++nonfinite; continue; }
+                osq += (static_cast<double>(y) - x) * (static_cast<double>(y) - x); oref += static_cast<double>(x) * x;
+            }
+        const double orel = std::sqrt(osq / oref);
+        std::cout << "  fp16-only rows: low bytes differ " << low_differ << ", injection bytes differ " << injection_differ
+                  << ", nonfinite outputs " << nonfinite << ", output rel vs fp16-input " << orel << '\n';
+        if (low_differ || injection_differ || nonfinite || !(orel < 2e-3))
+            throw std::runtime_error("FP16-only HC rows differ from the FP16-input form beyond the mix rounding");
+    }
 }
 
 void bench(hipStream_t stream) {

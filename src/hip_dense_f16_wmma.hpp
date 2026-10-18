@@ -229,7 +229,12 @@ template <class Site> void launch_dense_f16(const Site& site, hipStream_t stream
 // Prompt launch of a dense site: with f16 (fast-prefill-f16wmma-v1 prefill launchers) 32..256-row launches
 // run launch_dense_f16; otherwise (and for other row counts) the dense A8 form over 64 rows and
 // launch(site, a8) up to 64 rows, as the prefill sites did before.
-template <class Site> void launch_prefill(const Site& site, bool a8, bool f16, hipStream_t stream, bool any_order = false) {
+// g64 (component dense8): 64..256-row launches (a multiple of 64) run launch_dense_g64 instead.
+template <class Site> void launch_prefill(const Site& site, bool a8, bool f16, hipStream_t stream, bool any_order = false, bool g64 = false) {
+    // Only where dense A8 takes its LDS-staged 4 x 2 form (>= 40 blocks of 8 waves): narrower launches (QSA output of
+    // 64 rows, shared gate/up) were slower in G64 than in the 4 x 1 A8 form and keep dense A8 (fixture, gfx1151).
+    if constexpr (Site::rows >= 64U && Site::rows % 64U == 0U && Site::rows <= kDenseA8WideRows)
+        if (g64 && Site::rows / 64U * ((site.outputs + 255U) / 256U) >= 40U) { launch_dense_g64(site, stream, any_order); return; }
     if constexpr (Site::rows >= 32U && Site::rows % 32U == 0U && Site::rows <= kDenseA8WideRows)
         if (f16) { launch_dense_f16(site, stream, any_order); return; }
     if constexpr (Site::rows > 64U) launch_dense_a8(site, stream, any_order);

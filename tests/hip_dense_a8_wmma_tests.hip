@@ -800,7 +800,7 @@ void f16_shape(const Shape& shape, hipStream_t stream, bool timing) {
     Activations a(Rows, shape.width, shape.bf16);
     a.upload(make_inputs(Rows, shape.width, shape.bf16, 0U, rng));
     const std::size_t n = static_cast<std::size_t>(Rows) * shape.outputs;
-    Buffer exact_out(n * 4U), a8_out(n * 4U), f16_out(n * 4U);
+    Buffer exact_out(n * 4U), a8_out(n * 4U), f16_out(n * 4U), g64_out(n * 4U);
     const auto site_for = [&](Buffer& out, bool fused) {
         (void)fused;
         FusedSite<In, Rows> site{};
@@ -810,7 +810,7 @@ void f16_shape(const Shape& shape, hipStream_t stream, bool timing) {
         site.width = a.width; site.outputs = shape.outputs; site.output = out.as<float>();
         return site;
     };
-    const auto s8 = site_for(a8_out, true), s16 = site_for(f16_out, true);
+    const auto s8 = site_for(a8_out, true), s16 = site_for(f16_out, true), s64 = site_for(g64_out, true);
     // Exact reference: the FP32 q8_rows forms in 64-row launches (the prompt sites' exact organization).
     for (unsigned g = 0; g < Rows / 64U; ++g) {
         FusedSite<In, 64U> se{};
@@ -822,8 +822,11 @@ void f16_shape(const Shape& shape, hipStream_t stream, bool timing) {
     }
     q8_rows::launch_dense_a8(s8, stream, false);
     q8_rows::launch_dense_f16(s16, stream, false);
+    q8_rows::dense_g64_invalidate();
+    q8_rows::launch_dense_g64(s64, stream, false);
     check(hipStreamSynchronize(stream), "f16 compare");
-    std::vector<float> e(n), x8(n), x16(n);
+    std::vector<float> e(n), x8(n), x16(n), x64(n);
+    check(hipMemcpy(x64.data(), g64_out.p, n * 4U, hipMemcpyDeviceToHost), "download");
     check(hipMemcpy(e.data(), exact_out.p, n * 4U, hipMemcpyDeviceToHost), "download");
     check(hipMemcpy(x8.data(), a8_out.p, n * 4U, hipMemcpyDeviceToHost), "download");
     check(hipMemcpy(x16.data(), f16_out.p, n * 4U, hipMemcpyDeviceToHost), "download");
@@ -835,20 +838,29 @@ void f16_shape(const Shape& shape, hipStream_t stream, bool timing) {
         }
         rel = std::sqrt(sq / ref); mx /= std::sqrt(ref / static_cast<double>(n));
     };
-    double r8, m8, r16, m16;
-    err(x8, r8, m8); err(x16, r16, m16);
+    double r8, m8, r16, m16, r64, m64;
+    err(x8, r8, m8); err(x16, r16, m16); err(x64, r64, m64);
     std::cout << std::defaultfloat;
     std::cout.precision(6);
     std::cout << "f16 " << shape.name << " " << shape.width << "->" << shape.outputs << " T=" << Rows << ": error vs exact A8 rel " << r8
-              << " max " << m8 << " | F16 rel " << r16 << " max " << m16;
+              << " max " << m8 << " | F16 rel " << r16 << " max " << m16 << " | G64 rel " << r64 << " max " << m64;
     require(r16 < 1e-2 && std::isfinite(r16), "dense FP16 outside the error bound");
+    require(r64 < 5e-2 && std::isfinite(r64), "dense A8-G64 outside the error bound");
     if (timing) {
         const double flop = 2.0 * Rows * shape.width * shape.outputs;
-        const float t8 = median_us([&] { q8_rows::launch_dense_a8(s8, stream, false); }, stream);
+        // A8 and G64 alternate three times (same process, same warm state); G64 runs on weights already requantized
+        // (the engine requantizes once per prefill step). Reported: the medians of the three rounds' medians.
+        float q8t[3], q64t[3];
+        for (unsigned round = 0; round < 3U; ++round) {
+            q8t[round] = median_us([&] { q8_rows::launch_dense_a8(s8, stream, false); }, stream);
+            q64t[round] = median_us([&] { q8_rows::launch_dense_g64(s64, stream, false); }, stream);
+        }
+        std::sort(q8t, q8t + 3); std::sort(q64t, q64t + 3);
+        const float t8 = q8t[1], t64 = q64t[1];
         const float t16 = median_us([&] { q8_rows::launch_dense_f16(s16, stream, false); }, stream);
         std::cout << std::fixed;
         std::cout.precision(1);
-        std::cout << " | A8 " << t8 << " us, F16 " << t16 << " us (" << flop / (t16 * 1e6) << " TFLOPS)";
+        std::cout << " | A8 " << t8 << " us, F16 " << t16 << " us (" << flop / (t16 * 1e6) << " TFLOPS), G64 " << t64 << " us";
     }
     std::cout << '\n';
 }

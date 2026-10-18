@@ -4712,13 +4712,13 @@ void enqueue_gdn_prefill_rows(const std::vector<std::array<GdnKnownWindowRow, 8U
             in.input[r] = reinterpret_cast<const void*>(row.input.address);
             in.output[0][r] = row.workspace.qkv; in.output[1][r] = row.workspace.z;
         }
-        q8_rows::launch_prefill(in, config.dense_a8_projections, config.dense_f16_prefill, stream);
+        q8_rows::launch_prefill(in, config.dense_a8_projections, config.dense_f16_prefill, stream, false, config.dense_g64_prefill);
         check_hip(hipGetLastError(), "GDN prefill Q8 input projection launch");
     };
     // Dense A8 with 256-row output launches over whole 256-row steps: the gated RMSNorm quantizes the out
     // projection's input (no quantizer launch). STRIX_GDN_FUSED_A8=0 keeps the quantizer launches.
     static const bool fused_env = [] { const char* v = std::getenv("STRIX_GDN_FUSED_A8"); return !v || v[0] != '0'; }();
-    const q8_rows::DenseA8Slot fused_slot = fused_env && !config.dense_f16_prefill && dense_wide >= q8_rows::kDenseA8WideRows && count % q8_rows::kDenseA8WideRows == 0U &&
+    const q8_rows::DenseA8Slot fused_slot = fused_env && !config.dense_f16_prefill && !config.dense_g64_prefill && dense_wide >= q8_rows::kDenseA8WideRows && count % q8_rows::kDenseA8WideRows == 0U &&
             count <= kGdnFusedA8Rows && q8_rows::dense_a8_width(first.value_width) &&
             reinterpret_cast<std::uintptr_t>(first.tensors.out.runtime->address) % 4U == 0U ? gdn_fused_a8_scratch() : q8_rows::DenseA8Slot{};
     const q8_rows::DenseA8Slot* fused_a8 = nullptr;
@@ -4761,7 +4761,7 @@ void enqueue_gdn_prefill_rows(const std::vector<std::array<GdnKnownWindowRow, 8U
                 return;
             }
         }
-        q8_rows::launch_prefill(out, config.dense_a8_projections, config.dense_f16_prefill, stream);
+        q8_rows::launch_prefill(out, config.dense_a8_projections, config.dense_f16_prefill, stream, false, config.dense_g64_prefill);
         check_hip(hipGetLastError(), "GDN prefill Q8 output projection launch");
     };
     // Largest width that divides what is left, so every row runs exactly once.
