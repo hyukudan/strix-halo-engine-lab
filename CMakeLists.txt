@@ -251,6 +251,24 @@ add_executable(strix-inspect-gguf apps/inspect_gguf_main.cpp)
 target_link_libraries(strix-inspect-gguf PRIVATE strix_core)
 strix_target_warnings(strix-inspect-gguf)
 
+# Host-only serving front end (no GPU): JSON, tokenizer, chat template, HTTP and the API mapping.
+add_library(strix_serve STATIC
+    src/serve/json.cpp
+    src/serve/bpe_tokenizer.cpp
+    src/serve/chat_template.cpp
+    src/serve/http_server.cpp
+    src/serve/engine.cpp
+    src/serve/api.cpp
+)
+target_include_directories(strix_serve PUBLIC include PRIVATE src/serve)
+target_compile_features(strix_serve PUBLIC cxx_std_20)
+target_link_libraries(strix_serve PUBLIC Threads::Threads)
+strix_target_warnings(strix_serve)
+
+add_executable(strix-tokenize apps/tokenize_main.cpp)
+target_link_libraries(strix-tokenize PRIVATE strix_serve)
+strix_target_warnings(strix-tokenize)
+
 add_executable(strix-mtp-manifest-audit apps/mtp_manifest_audit_main.cpp)
 target_link_libraries(strix-mtp-manifest-audit PRIVATE strix_core)
 strix_target_warnings(strix-mtp-manifest-audit)
@@ -291,6 +309,15 @@ if(BUILD_TESTING OR STRIX_BUILD_EXPERIMENTAL_Q4K_A8_PROBE OR STRIX_ENABLE_EXPERI
     endif()
 endif()
 if(BUILD_TESTING)
+    add_executable(strix-serve-frontend-tests tests/serve_frontend_tests.cpp)
+    target_link_libraries(strix-serve-frontend-tests PRIVATE strix_serve)
+    strix_target_warnings(strix-serve-frontend-tests)
+    add_test(NAME strix-serve-frontend-tests COMMAND strix-serve-frontend-tests
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/serve/chat_template_cases.json)
+    add_executable(strix-serve-api-tests tests/serve_api_tests.cpp)
+    target_link_libraries(strix-serve-api-tests PRIVATE strix_serve)
+    strix_target_warnings(strix-serve-api-tests)
+    add_test(NAME strix-serve-api-tests COMMAND strix-serve-api-tests)
     add_executable(strix-teacher-logit-spool-tests tests/teacher_logit_spool_tests.cpp)
     target_compile_features(strix-teacher-logit-spool-tests PRIVATE cxx_std_20)
     target_include_directories(strix-teacher-logit-spool-tests PRIVATE include)
@@ -1528,7 +1555,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
     target_include_directories(strix-hip-decode-token PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
     target_link_libraries(
         strix-hip-decode-token
-        PRIVATE strix_hip_runtime
+        PRIVATE strix_hip_runtime strix_serve
     )
     strix_target_warnings(
         strix-hip-decode-token
@@ -1544,13 +1571,13 @@ if(STRIX_ENABLE_HIP_RUNTIME)
             STRIX_DECODE_ENTRY=strix_hip_decode_token_entry STRIX_MTP_MODEL_QUALIFICATION_RUNNER=1)
         target_include_directories(strix-hip-mtp-model-qualification PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
         target_link_libraries(strix-hip-mtp-model-qualification PRIVATE
-            strix_hip_runtime strix_mtp_projection_component_fixtures)
+            strix_hip_runtime strix_mtp_projection_component_fixtures strix_serve)
         target_compile_options(strix-hip-mtp-model-qualification PRIVATE
             "SHELL:-include \"${CMAKE_CURRENT_SOURCE_DIR}/include/strix/hip_runtime_telemetry.hpp\"")
         strix_target_warnings(strix-hip-mtp-model-qualification)
         add_executable(strix-hip-mtp-qualification-reference-tests tests/hip_mtp_qualification_reference_tests.hip)
         target_link_libraries(strix-hip-mtp-qualification-reference-tests PRIVATE
-            strix_hip_runtime strix_mtp_projection_component_fixtures)
+            strix_hip_runtime strix_mtp_projection_component_fixtures strix_serve)
         set_target_properties(strix-hip-mtp-qualification-reference-tests PROPERTIES
             HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
         strix_target_warnings(strix-hip-mtp-qualification-reference-tests)

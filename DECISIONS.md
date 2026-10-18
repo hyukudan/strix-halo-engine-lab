@@ -657,6 +657,41 @@ rows:
 
 Status: opt-in until the timing campaign. Both rules are data only, and the language is still chosen with the
 `pack-` files.
+## D-044: verify-window step folds (opt-in)
+
+`STRIX_WINDOW_INJECT_NORM=1` folds the inject rows step into the next HC rows step's normalisation,
+`STRIX_WINDOW_COMMIT_COMBINE=1` folds the MoE combine into the routed rows commit, and
+`STRIX_WINDOW_COMBINE_INJECT=1` folds combine + inject + HC norm (almost always declined with the canonical arena,
+falling back to the inject fold). Each fold keeps the expressions of the separate launches and is declined, with
+nothing enqueued, when its views do not chain or alias; component fixtures (`strix-hip-known-window-tests
+--window-folds`, the union rows fixture) equal the separate launches over the whole arena, and complete MTP decode
+gives identical tokens with replay error 0 with each fold and with all. A kernel trace per window shows -138
+dispatches and about -0.5 ms (about 1 %), within the noise of single smoke runs, so all three stay off by default.
+The remaining dependent steps need grid-wide dependencies, so local folds cannot reach the 2-4 ms per window
+that was hoped for. See [docs/window-step-folds.md](docs/window-step-folds.md).
+
+## D-045: HTTP serving on the tiled MTP route
+
+`--http-serve` keeps one decoder process: model, MTP assets and the predictor qualification (calibration
+replay of the command-line prompt) are set up once, then OpenAI-compatible (`/v1/chat/completions`,
+`/v1/completions`) and Anthropic-compatible (`/v1/messages`) requests run one at a time, with streaming,
+health, Prometheus metrics and a JSON status (docs/serving.md). Each request starts exactly like the
+command-line request after calibration: fresh target state and session, fresh predictor, and the verify
+windows drop any deferred GDN rows of the previous request (`HipMtpWindowVerifier::begin_session`); the
+prefix state cache spans requests. The tokenizer (byte-level BPE with the model's split rule) and the chat
+template (thinking on/off, reasoning effort, tools and tool calls) are native host code read from the GGUF;
+the template is checked byte for byte against renders of the embedded template, the tokenizer against
+reference encodings of a multilingual corpus.
+
+Why: one load per process instead of per request, and a standard interface for chat clients and agents,
+without changing what is computed: a served request is the command-line request.
+
+Checked on one Strix Halo node (dense-A8 profile, T=16 blocks, prefix cache every 16 tokens, windows
+2/4/8): two chat prompts of 38 tokens served in one process give the command-line token IDs up to the stop
+token (63 and 88 tokens), also when repeated with 16 or 32 prompt tokens restored from the prefix cache and
+when two clients (one streamed) send at the same time. The command line stops only at `--eos-token`
+(default `<|endoftext|>`); the server also stops at `<|im_end|>`. No timing campaign was run; sampling and
+batched decode of concurrent requests are separate routes.
 
 ## Measured and rejected
 

@@ -61,6 +61,7 @@
 #include "hip_decode_experiment.hpp"
 #include "hip_decode_options.hpp"
 #include "hip_mtp_decode_bridge.hpp"
+#include "hip_http_serve.hpp"
 #include "hip_prefix_state_cache.hpp"
 #include "hip_mtp_cohort_bridge.hpp"
 #if defined(STRIX_MTP_MODEL_QUALIFICATION_RUNNER)
@@ -1012,6 +1013,9 @@ int STRIX_DECODE_ENTRY(
             "  --record-state-policy final|each --prefix-cache-roundtrip\n"
             "  --prefix-cache-host-bytes N [--prefix-cache-dir DIR [--prefix-cache-disk-bytes N]] [--prefix-cache-every N]\n"
             "      [--prefix-cache-then-prompt FILE ...] (block-boundary prefix state cache, tiled known-prefix prefill only)\n"
+            "  --http-serve [--http-bind ADDR] [--http-port N] [--http-model-id NAME] [--http-api-key-file FILE]\n"
+            "      [--http-sampling greedy|reject] [--http-default-max-tokens N] [--http-max-queue N] [--http-max-connections N]\n"
+            "      (OpenAI/Anthropic-compatible HTTP server on the tiled MTP route; the prompt is the calibration prompt)\n"
             "  --prefetch-q8-qsa-input (opt-in exact-tree Q8 input projections)\n"
             "  --prefetch-q8-shared-expert (opt-in exact-tree Q8 gate/up/down)\n"
             "  --execution-mode eager|graph (default eager)\n"
@@ -2752,6 +2756,9 @@ int STRIX_DECODE_ENTRY(
             return 0;
         }
         auto make_window = window_factory_for(parents, {});
+        if (options.http_serve)
+            parents->serve = strix::decode_cli::make_http_serve(options, "native MTP greedy decode, profile " +
+                std::string(optimization_profile.selected) + ", context " + std::to_string(options.context_tokens));
         setup_phase.reset();
         // --mtp-sample-repeats N: N independent requests (seeds seed..seed+N-1), each from a fresh
         // session over the same loaded model; one receipt per request.

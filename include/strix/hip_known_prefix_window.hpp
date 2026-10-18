@@ -123,6 +123,9 @@ public:
     void commit_prefix(std::uint32_t n_keep);
     // Applies pending GDN rows before any ordinary serial token touches GDN state.
     void flush_deferred();
+    // Drops pending GDN rows without applying them: the session state they belong to was
+    // replaced (a new request starts from a fresh state).
+    void discard_deferred();
     // Before either owner executes: adopt primary's deferred GDN rows/control so
     // windows of different sizes over one session continue one pending protocol.
     // flush_deferred() must then run on an owner that has executed a window.

@@ -26,6 +26,7 @@
 #include <iostream>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 #include <chrono>
@@ -37,6 +38,25 @@
 #include <utility>
 
 namespace strix::decode_cli {
+// Serving (--http-serve): after the calibration replay the bridge hands a request runner to the
+// serve hook, which calls it for one request at a time on the bridge's thread until it returns.
+// Each request starts from a fresh target state (restored from the prefix state cache when a
+// cached block boundary matches) and decodes greedily with MTP verification.
+struct MtpServeRequest {
+    std::span<const std::uint32_t> prompt;
+    std::uint64_t max_tokens = 0;
+    std::span<const std::uint32_t> stop_tokens;
+    // Newly verified tokens after each cycle (the first call carries the prompt's own prediction);
+    // false stops the request.
+    std::function<bool(std::span<const std::uint32_t>)> on_tokens;
+};
+struct MtpServeResult {
+    std::uint64_t restored_tokens = 0, generated_tokens = 0, cycles = 0, proposed = 0, accepted = 0;
+    double prompt_ms = 0.0, decode_ms = 0.0;
+    std::string finish = "length"; // stop|length|context|cancelled
+};
+using MtpServeRunner = std::function<MtpServeResult(const MtpServeRequest&)>;
+using MtpDecodeServe = std::function<void(const MtpServeRunner&)>;
 // These are the actual target parents. The PLE backend pins its source mapping;
 // the private hash/prefetch metadata remains stable until all native owners die.
 // No pointer to a caller's temporary PLE transaction is retained.
@@ -74,6 +94,8 @@ struct MtpDecodeTargetParents final {
         std::function<void()> reset_state;
         SerialSessionContext fresh;
     } tiled;
+    // Set: serve requests after the calibration replay instead of the command-line request.
+    MtpDecodeServe serve;
     struct WindowSetupReceipt {
         std::uint64_t union_source_steps = 0;
         std::uint64_t union_reserved_bytes = 0;
@@ -159,13 +181,13 @@ using MtpDecodeComponentDiagnostic=std::function<void(const std::shared_ptr<HipM
 // the MTP target producer, whose last ticket is the pending row of the first cycle. With a prefix
 // state cache the longest cached block boundary P is restored first (target state, predictor
 // rows [0, P-1) and h_{P-1}), and selected block boundaries are captured.
-inline HipMtpTargetHiddenTicket run_tiled_mtp_prompt(const Options& options,const ModelContract& model,
+inline HipMtpTargetHiddenTicket run_tiled_mtp_prompt(std::span<const std::uint32_t> tokens,const ModelContract& model,
     const CompiledSerialExecution& compiled,MtpDecodeTargetParents::TiledPrompt& tiled,SerialSessionContext& session,
     HipMtpTargetHidden& target,HipMtpRuntime& runtime,const QualifiedMtpDraftPlan& qualified,const ActivatedMtpDraftPlan& activated,
     const ExecutionRuntimeResources& resources,DirectLaunchDispatcher& dispatcher,std::byte* held,std::string& receipt) {
     const auto check=[](hipError_t e,const char* what){if(e!=hipSuccess)throw std::runtime_error(std::string(what)+": "+hipGetErrorString(e));};
-    const std::span<const std::uint32_t> tokens(options.tokens);
     const auto n=static_cast<std::uint64_t>(tokens.size());
+    if(!n)throw std::invalid_argument("tiled MTP prompt is empty");
     const auto width=mtp_cli_mul(mtp_cli_mul(model.hidden_size,model.hc_count),2U);
     // The target tap: the last MLP injection before the final hyper mix (same step in every sibling).
     std::size_t tap=SIZE_MAX;
@@ -468,13 +490,13 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
         if(runtime->next_source_position()+1U!=session.next_position)
             throw std::logic_error("MTP replay did not prime the actual final prompt frontier");
         replay_rows.clear(); // release prompt snapshots before bounded cycles
-        const auto enable_draft=[&] {
+        const auto enable_draft=[&](std::span<const std::uint32_t> prompt) {
             if(!m.draft_chain) return;
             // Drafts only: the subset (or full) head changes acceptance, never target output.
             HipMtpDraftHeadConfig draft;draft.full=m.draft_vocab.empty() && !m.draft_context_vocab;
             if(!m.draft_vocab.empty()) {
                 std::string chosen;
-                const auto spec=HipMtpDraftHead::resolve_vocabulary_spec(m.draft_vocab,options.tokens,
+                const auto spec=HipMtpDraftHead::resolve_vocabulary_spec(m.draft_vocab,prompt,
                     static_cast<std::uint32_t>(model.vocab_size),chosen);
                 if(spec!=m.draft_vocab) std::cerr<<"MTP draft vocabulary: "<<chosen<<'\n';
                 draft.base_tokens=HipMtpDraftHead::read_token_file(spec,static_cast<std::uint32_t>(model.vocab_size));
@@ -482,7 +504,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
             draft.context_capacity=m.draft_context_vocab;draft.q4=m.draft_q4;
             // Runner-up probabilities feed the survival controller; STRIX_MTP_DRAFT_TOP2=1 logs them (diagnostic).
             draft.runner_up=hip_mtp_survival_controller() || std::getenv("STRIX_MTP_DRAFT_TOP2")!=nullptr;
-            runtime->enable_draft_chain(std::move(draft),m.draft_exact);runtime->observe_draft_context(options.tokens);
+            runtime->enable_draft_chain(std::move(draft),m.draft_exact);runtime->observe_draft_context(prompt);
             if(sampler && m.sample_speculation)runtime->set_draft_sampler(sampler);
         };
         if(tiled_prompt) {
@@ -494,7 +516,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
             runtime=std::make_shared<HipMtpRuntime>(native);
             parents->tiled.reset_state();
             session=parents->tiled.fresh;
-            enable_draft();
+            enable_draft(options.tokens);
             if(parents->tiled.cache) {
                 // The predictor's durable rows and the held h_{P-1} travel with each checkpoint; the
                 // identity gains everything that changes them (cache rows use the draft kernels
@@ -513,7 +535,62 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
                 cache.extend_identity(sha256_bytes(frame));
                 cache.set_restore_hook([&](std::uint64_t position){runtime->restore_cache_frontier(qualified,activated,position-1U);});
             }
-            pending=run_tiled_mtp_prompt(options,model,compiled,parents->tiled,session,*target,*runtime,qualified,activated,
+            if(parents->serve) {
+                std::uint64_t served=0;
+                const MtpServeRunner run_request=[&](const MtpServeRequest& q) {
+                    const auto vocabulary=model.vocab_size;
+                    if(q.prompt.empty() || q.prompt.size()>=options.context_tokens || !q.max_tokens || !q.on_tokens)
+                        throw std::invalid_argument("served request needs a prompt shorter than the context, a token budget and a sink");
+                    for(const auto t:q.prompt)if(t>=vocabulary)throw std::invalid_argument("served prompt token outside the vocabulary");
+                    for(const auto t:q.stop_tokens)if(t>=vocabulary)throw std::invalid_argument("served stop token outside the vocabulary");
+                    MtpServeResult out;
+                    const auto request_start=std::chrono::steady_clock::now();
+                    // Every request starts exactly like the command-line request after calibration:
+                    // fresh target state and session, fresh predictor, no deferred window rows.
+                    pending={};
+                    ++served;
+                    runtime.reset();
+                    runtime=std::make_shared<HipMtpRuntime>(native);
+                    parents->tiled.reset_state();
+                    session=parents->tiled.fresh;
+                    if(window)window->begin_session();
+                    enable_draft(q.prompt);
+                    std::string request_receipt;
+                    pending=run_tiled_mtp_prompt(q.prompt,model,compiled,parents->tiled,session,*target,*runtime,qualified,activated,
+                        r,dispatcher,tiled_held,request_receipt);
+                    if(parents->tiled.cache)out.restored_tokens=parents->tiled.cache->request().restored_position;
+                    const auto decode_start=std::chrono::steady_clock::now();
+                    out.prompt_ms=std::chrono::duration<double,std::milli>(decode_start-request_start).count();
+                    HipMtpGreedyRuntime greedy(runtime,qualified,activated,target,session,r,dispatcher,parents);
+                    if(window)greedy.use_window_verifier(window);
+                    if(m.draft_chain)greedy.set_draft_min_probability(mtp_draft_min_probability(m));
+                    const auto is_stop=[&](std::uint32_t t){return std::find(q.stop_tokens.begin(),q.stop_tokens.end(),t)!=q.stop_tokens.end();};
+                    const std::array<std::uint32_t,1> first{pending.predicted_token()};
+                    out.generated_tokens=1;
+                    if(!q.on_tokens(first))out.finish="cancelled";
+                    else if(is_stop(first[0]))out.finish="stop";
+                    while(out.finish=="length" && out.generated_tokens<q.max_tokens) {
+                        if(session.next_position>=options.context_tokens){out.finish="context";break;}
+                        const auto budget=std::min<std::uint64_t>(q.max_tokens-out.generated_tokens,UINT32_MAX);
+                        const auto result=greedy.cycle(pending,m.candidate_depth,static_cast<std::uint32_t>(budget),q.stop_tokens);
+                        if(result.emitted_tokens.empty())throw std::runtime_error("MTP generation made no completed target progress");
+                        pending=result.final_target;++out.cycles;
+                        out.proposed+=result.proposed_candidates;out.accepted+=result.accepted_candidates;
+                        out.generated_tokens+=result.emitted_tokens.size();
+                        if(!q.on_tokens(result.emitted_tokens)){out.finish="cancelled";break;}
+                        if(is_stop(result.emitted_tokens.back()))out.finish="stop";
+                    }
+                    pending={};
+                    out.decode_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-decode_start).count();
+                    return out;
+                };
+                parents->serve(run_request);
+                assets->validate_assets_unchanged();
+                output<<"{\"mode\":\"native-mtp-http-serve\",\"served_requests\":"<<served
+                    <<",\"calibration_rows\":"<<calibration_rows<<",\"calibration_ms\":"<<calibration_ms<<"}\n";
+                return;
+            }
+            pending=run_tiled_mtp_prompt(options.tokens,model,compiled,parents->tiled,session,*target,*runtime,qualified,activated,
                 r,dispatcher,tiled_held,tiled_receipt);
         } else
         // Prefill handoff: every later target row, window and checkpoint runs the decode execution
@@ -521,7 +598,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
         // handed-off session; the lineage keeps the prefill identity of every prompt row.
         {
             if(split)pending=target->hand_off_prompt(session,pending,parents->prompt.resources,r);
-            enable_draft();
+            enable_draft(options.tokens);
         }
         HipMtpGreedyRuntime greedy(runtime,qualified,activated,target,session,r,dispatcher,parents);
         if(window && !qualify)greedy.use_window_verifier(window);
