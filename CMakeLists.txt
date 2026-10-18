@@ -254,6 +254,9 @@ add_library(strix_serve STATIC
     src/serve/json.cpp
     src/serve/bpe_tokenizer.cpp
     src/serve/chat_template.cpp
+    src/serve/http_server.cpp
+    src/serve/engine.cpp
+    src/serve/api.cpp
 )
 target_include_directories(strix_serve PUBLIC include PRIVATE src/serve)
 target_compile_features(strix_serve PUBLIC cxx_std_20)
@@ -309,6 +312,10 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-serve-frontend-tests)
     add_test(NAME strix-serve-frontend-tests COMMAND strix-serve-frontend-tests
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/serve/chat_template_cases.json)
+    add_executable(strix-serve-api-tests tests/serve_api_tests.cpp)
+    target_link_libraries(strix-serve-api-tests PRIVATE strix_serve)
+    strix_target_warnings(strix-serve-api-tests)
+    add_test(NAME strix-serve-api-tests COMMAND strix-serve-api-tests)
     add_executable(strix-teacher-logit-spool-tests tests/teacher_logit_spool_tests.cpp)
     target_compile_features(strix-teacher-logit-spool-tests PRIVATE cxx_std_20)
     target_include_directories(strix-teacher-logit-spool-tests PRIVATE include)
