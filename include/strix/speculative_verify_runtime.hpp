@@ -58,6 +58,9 @@ struct KnownWindowExecutionHooks {
     // Owner-held index of the compiled window's row arena views (alive and unmodified as long as
     // the owner): their buffer lookups are answered from it instead of being indexed per window.
     const ArenaLookupIndex* arena_index = nullptr;
+    // Called just before each step of a launched window is enqueued (never during admission), with all
+    // row contexts. Returning true means the hook enqueued that step itself (the loop then only records it).
+    std::function<bool(std::size_t, const std::vector<std::vector<ExecutionDispatchContext>>&)> before_step;
 };
 
 struct KnownWindowR2Entry {

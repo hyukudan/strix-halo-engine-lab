@@ -145,6 +145,28 @@ struct HipKnownPrefixWindow::Impl {
     std::vector<std::pair<const void*, std::array<std::uint64_t, 2>>> recipe_memo;
     std::vector<std::array<std::uintptr_t, 2>> preflight_slots;
     ArenaLookupIndex arena_index; // the immutable compiled window's arena views
+    // Verify windows run each layer's shared expert on a second stream next to the routed experts (see
+    // detach_shared). The shared expert reads only the MoE input and writes only its output,
+    // which the MoE combine reads; the owner's stream waits for it there. Its workspace is owned here,
+    // since the arena may give the step's workspace to the routed kernels that now run alongside it.
+    struct SharedDetach {
+        hipStream_t side = nullptr;
+        // Two event sets used by alternate windows: re-recording an event whose cross-stream wait of the
+        // previous window may still be queued can block the host.
+        std::vector<hipEvent_t> forked, joined;
+        std::vector<unsigned char> pending;
+        std::uint32_t parity = 0;
+        void* workspace = nullptr;
+        std::uint64_t workspace_bytes = 0;
+        ~SharedDetach() {
+            if (side) (void)hipStreamSynchronize(side);
+            for (auto e : forked) if (e) (void)hipEventDestroy(e);
+            for (auto e : joined) if (e) (void)hipEventDestroy(e);
+            if (workspace) (void)hipFree(workspace);
+            if (side) (void)hipStreamDestroy(side);
+        }
+    };
+    std::unique_ptr<SharedDetach> shared_detach;
     DeferredMoeFirstError completion_status{};
     bool failed = false;
 
@@ -287,6 +309,67 @@ struct HipKnownPrefixWindow::Impl {
             !same_layout(original_state_layout, *resources.session_state_layout))
             throw std::invalid_argument("known-window retained runtime bindings or state layout changed");
         validate_scope();
+    }
+    // STRIX_SHARED_DETACH=0: the shared expert stays on the owner's stream between router and routed experts.
+    static bool shared_detach_enabled() {
+        static const bool on = [] { const char* v = std::getenv("STRIX_SHARED_DETACH"); return !v || v[0] != '0'; }();
+        return on;
+    }
+    SharedDetach& detach_state() {
+        if (shared_detach) return *shared_detach;
+        auto d = std::make_unique<SharedDetach>();
+        const auto layers = static_cast<std::size_t>(model.hidden_layers);
+        d->forked.assign(2U * layers, nullptr); d->joined.assign(2U * layers, nullptr); d->pending.assign(layers, 0U);
+        check(hipStreamCreateWithFlags(&d->side, hipStreamNonBlocking), "create known-window shared stream");
+        for (auto* list : {&d->forked, &d->joined})
+            // Both streams are on this device: no system-scope fence (an L2 writeback per event otherwise).
+            for (auto& e : *list) check(hipEventCreateWithFlags(&e, hipEventDisableTiming | hipEventDisableSystemFence),
+                "create known-window shared event");
+        // Rows keep the arena's row stride (one row view apart), so this covers eight rows of any window.
+        d->workspace_bytes = 8ULL << 20U;
+        check(hipMalloc(&d->workspace, d->workspace_bytes), "allocate known-window shared workspace");
+        shared_detach = std::move(d);
+        return *shared_detach;
+    }
+    bool detachable_shared(std::size_t i) const {
+        const auto variant = window.r2_variant[i];
+        return serial.execution.steps[i].op == SerialOp::shared_expert &&
+            (variant == KnownWindowR2Variant::shared_q8_virtual256_r2_v1 ||
+             variant == KnownWindowR2Variant::shared_q8_virtual256_r4_v1 || variant == KnownWindowR2Variant::shared_q8_virtual256_r8_v1);
+    }
+    // Before step i of a launched verify window. A shared-expert rows step is enqueued on the side stream
+    // after everything queued so far on the owner's stream (the router included: forking before the router
+    // also overlapped it but measured slower, the staged router needs the bandwidth itself), and the
+    // layer's MoE combine waits for it. Returns true for the step this enqueued in place of the loop.
+    bool detach_shared(std::size_t i, const std::vector<std::vector<ExecutionDispatchContext>>& contexts) {
+        const auto& step = serial.execution.steps[i];
+        if (!step.layer || *step.layer >= model.hidden_layers) return false;
+        const auto layer = *step.layer;
+        if (detachable_shared(i)) {
+            auto& d = detach_state();
+            if (d.pending[layer]) throw std::logic_error("known-window shared expert detached twice before its combine");
+            const auto& rows = contexts[i];
+            const auto e = layer + d.parity * d.pending.size();
+            check(hipEventRecord(d.forked[e], scope.stream), "record known-window shared fork");
+            check(hipStreamWaitEvent(d.side, d.forked[e], 0), "order known-window shared stream");
+            shared_expert_known_window_rows_launch_detached(rows, shared_for(rows), d.side,
+                reinterpret_cast<std::uintptr_t>(d.workspace), d.workspace_bytes);
+            check(hipEventRecord(d.joined[e], d.side), "record known-window shared join");
+            d.pending[layer] = 1U;
+            return true;
+        }
+        if (step.op == SerialOp::moe_combine && shared_detach && shared_detach->pending[layer]) {
+            auto& d = *shared_detach;
+            check(hipStreamWaitEvent(scope.stream, d.joined[layer + d.parity * d.pending.size()], 0), "join known-window shared stream");
+            d.pending[layer] = 0U;
+        }
+        return false;
+    }
+    void require_shared_joined() {
+        if (!shared_detach) return;
+        if (std::any_of(shared_detach->pending.begin(), shared_detach->pending.end(), [](auto p) { return p != 0U; }))
+            throw std::logic_error("known-window shared expert was detached without its combine");
+        shared_detach->parity ^= 1U;
     }
     const HipSharedExpertLauncherConfig& shared_for(std::span<const ExecutionDispatchContext> rows) const {
         if (!rows[0].kernel_id) throw std::invalid_argument("known-window shared row has no serial kernel id");
@@ -928,9 +1011,17 @@ struct HipKnownPrefixWindow::Impl {
             hooks.preflight_scope = [&] { validate_scope(); };
             hooks.preflight_plan = [&] { validate_metadata(); };
             hooks.complete = [&] { complete(); if(capture) capture->completed_before_publish(); if(before_publish) before_publish(); };
-            hooks.quiesce_or_fail_stop = [&] { failed = true; guard.recover_or_fail_stop(); };
+            hooks.quiesce_or_fail_stop = [&] {
+                failed = true;
+                if (shared_detach && shared_detach->side) (void)hipStreamSynchronize(shared_detach->side);
+                guard.recover_or_fail_stop();
+            };
             hooks.position_reader_implementations = position_readers;
             hooks.record_actual_window_lineage=static_cast<bool>(capture);
+            if(!prefill && shared_detach_enabled())
+                hooks.before_step=[&](std::size_t i,const std::vector<std::vector<ExecutionDispatchContext>>& contexts) {
+                    return detach_shared(i,contexts);
+                };
             hooks.skip_head=skip_head;
             hooks.preflight_memo=&preflight_memo;hooks.recipe_memo=&recipe_memo;hooks.preflight_slots=&preflight_slots;
             hooks.arena_index=&arena_index;
@@ -942,6 +1033,7 @@ struct HipKnownPrefixWindow::Impl {
                     capture?std::span<const KnownWindowR2Entry>(observed->recorded_r2):std::span<const KnownWindowR2Entry>(r2_entries),
                     capture?std::span<const KnownWindowRowsEntry>(observed->recorded_rows):std::span<const KnownWindowRowsEntry>(rows_entries),hooks);
             actual_window_committed=true;
+            require_shared_joined();
             if(capture)*batch=capture->seal(session);
             if(window.routed_expert_union_steps)
                 last_union_observation=HipKnownPrefixUnionObservation{first_position+(prefill&&!full_prefill_union()?(prefill->logical_rows/8U-1U)*8U:0U),last_union_layer,pending_union_summary};

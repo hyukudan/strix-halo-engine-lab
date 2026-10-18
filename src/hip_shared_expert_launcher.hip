@@ -1788,7 +1788,7 @@ KnownSharedR2Views known_shared_r2_views(std::span<const ExecutionDispatchContex
 // each row's shared gate into the outputs.
 template <unsigned Rows>
 void known_shared_engine_projection(bool down, const KnownSharedR2Views& views, hipStream_t stream,
-    const HipSharedExpertLauncherConfig& config) {
+    const HipSharedExpertLauncherConfig& config, bool allow_any_order = true) {
     const auto& s = views.shape;
     const auto row = [](KnownSharedSpan span, std::uint64_t stride, unsigned r) { return span.address + r * stride; };
     if (down) {
@@ -1814,7 +1814,8 @@ void known_shared_engine_projection(bool down, const KnownSharedR2Views& views, 
         }
         // Any-order (STRIX_ANYORDER=0 disables): gate/up reads only the MoE input and writes this expert's own
         // workspace, independent of the router's top-k selection queued just before it.
-        static const bool any_order = strix_any_order_enabled();
+        static const bool any_order_enabled = strix_any_order_enabled();
+        const bool any_order = any_order_enabled && allow_any_order;
         if constexpr (Rows > 64U) q8_rows::launch_dense_a8(site, stream, any_order);
         else q8_rows::launch(site, config.dense_a8_projections, stream, any_order);
     }
@@ -1956,8 +1957,8 @@ hipStream_t known_shared_rows_stream() {
 }
 template <unsigned Rows>
 void known_shared_rows_enqueue(const KnownSharedR2Views& views, hipStream_t stream,
-    const HipSharedExpertLauncherConfig& config) {
-    known_shared_engine_projection<Rows>(false, views, stream, config);
+    const HipSharedExpertLauncherConfig& config, bool allow_any_order = true) {
+    known_shared_engine_projection<Rows>(false, views, stream, config, allow_any_order);
     hipLaunchKernelGGL(rows_shared_activation_scalar_kernel, dim3((config.intermediate_size + kThreads - 1U) / kThreads, Rows),
         dim3(kThreads), 0, stream, views.workspace.address, views.shape.workspace_stride_bytes, views.input.address,
         views.shape.input_stride_bytes, reinterpret_cast<const void*>(views.weights.shared_gate_f32.address),
@@ -2066,6 +2067,41 @@ void shared_expert_known_window_rows_launch(std::span<const ExecutionDispatchCon
     check_hip(hipPeekAtLastError(), "known-window shared rows stale launch error");
     if (rows.size() == 4U) known_shared_rows_enqueue<4U>(views, stream, config);
     else known_shared_rows_enqueue<8U>(views, stream, config);
+}
+void shared_expert_known_window_rows_launch_detached(std::span<const ExecutionDispatchContext> rows,
+    const HipSharedExpertLauncherConfig& config, hipStream_t stream, std::uintptr_t workspace, std::uint64_t workspace_bytes) {
+    if (rows.size() != 2U && rows.size() != 4U && rows.size() != 8U)
+        throw std::invalid_argument("detached known-window shared rows require 2, 4 or 8 rows");
+    auto views = rows.size() == 2U ?
+        known_shared_r2_views(std::span<const ExecutionDispatchContext, 2>(rows.data(), 2), config) :
+        known_shared_rows_views(rows, config);
+    require_known_shared_a8(rows.size(), config);
+    // The rows keep their arena layout (row r at r * stride) in the caller's own workspace: the arena may
+    // reuse the step's workspace for the steps that now run alongside it.
+    const auto stride = views.shape.workspace_stride_bytes;
+    if (!stream || !workspace || workspace % 256U || stride % 256U || !views.workspace.bytes ||
+        views.workspace.bytes > stride * rows.size() || workspace_bytes < views.workspace.bytes ||
+        workspace_bytes > UINTPTR_MAX - workspace)
+        throw std::invalid_argument("detached known-window shared rows workspace is invalid");
+    for (const auto& r : rows) {
+        const auto input = resolve_dispatch_read(r, 0), output = resolve_dispatch_write(r, 0);
+        for (const auto& owned : {input, output})
+            if (owned.address < workspace + workspace_bytes && workspace < owned.address + owned.bytes)
+                throw std::invalid_argument("detached known-window shared workspace aliases row storage");
+    }
+    views.workspace.address = workspace;
+    check_hip(hipPeekAtLastError(), "detached known-window shared rows stale launch error");
+    // The first kernel follows a cross-stream wait, so it keeps its barrier.
+    if (rows.size() == 2U) {
+        known_shared_engine_projection<2U>(false, views, stream, config, false);
+        const auto blocks = (config.intermediate_size + kThreads - 1U) / kThreads;
+        hipLaunchKernelGGL(rows_shared_activation_scalar_kernel, dim3(blocks, 2U), dim3(kThreads), 0, stream,
+            views.workspace.address, views.shape.workspace_stride_bytes, views.input.address, views.shape.input_stride_bytes,
+            reinterpret_cast<const void*>(views.weights.shared_gate_f32.address), config.intermediate_size, config.hidden_size);
+        check_hip(hipGetLastError(), "detached known-window shared R2 activation/scalar launch");
+        known_shared_engine_projection<2U>(true, views, stream, config);
+    } else if (rows.size() == 4U) known_shared_rows_enqueue<4U>(views, stream, config, false);
+    else known_shared_rows_enqueue<8U>(views, stream, config, false);
 }
 } // namespace strix
 

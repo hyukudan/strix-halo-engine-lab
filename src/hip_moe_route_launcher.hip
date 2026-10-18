@@ -1133,6 +1133,106 @@ __global__ void __launch_bounds__(256) lanes_rows_moe_route_logits_kernel(Args r
     }
     route_tiled(rows.workspace[row], rows.tile_workspace, rows)[expert] = sum;
 }
+// Staged form of lanes_rows_moe_route_logits_kernel (Chunk 128) for Steps x 128 features: the first Rows / 2
+// waves of a block (one for a single row) run the same lane (expert, row) chains for its 16 experts (fused,
+// ascending from feature zero, the same float4 order; for one row also the order of router_dot_ascending in
+// parallel_moe_route_logits_kernel), but read the coefficients from LDS; the Loaders waves after them stream the
+// block's coefficients chunk by chunk, depth chunks ahead in registers, into a two-slot LDS ring. The lanes form
+// keeps only one chunk per chain in flight, 512 x 512 B for the whole router, so every chunk waited a
+// DRAM round trip; here 64 KB per block (8 chunks of its 16 experts) are in flight.
+// The ring barrier orders LDS only: __syncthreads() would also wait for the loaders' outstanding loads.
+__device__ __forceinline__ void router_lds_barrier() {
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
+    __builtin_amdgcn_s_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
+}
+template <std::uint32_t Rows> constexpr std::uint32_t staged_router_chain_waves() { return Rows >= 2U ? Rows / 2U : 1U; }
+template <typename Activation, std::uint32_t Rows, std::uint32_t Steps, std::uint32_t Loaders>
+__global__ void __launch_bounds__(32U * (staged_router_chain_waves<Rows>() + Loaders)) staged_rows_moe_route_logits_kernel(
+    RouterRowsArgs rows, const float* __restrict__ weights, std::uint32_t expert_count) {
+    static_assert(Rows == 1U || Rows == 2U || Rows == 4U || Rows == 8U);
+    constexpr std::uint32_t chunk = 128U, hidden_size = Steps * chunk, experts = 16U, vectors = chunk / 4U;
+    constexpr std::uint32_t chains = staged_router_chain_waves<Rows>();
+    // 16 float4 of ring per loader thread (a deeper ring, 32, measured slower).
+    constexpr std::uint32_t per_loader = experts * vectors / (32U * Loaders), depth = 16U / per_loader, pitch = vectors + 1U;
+    static_assert(per_loader * 32U * Loaders == experts * vectors && depth * per_loader == 16U);
+    constexpr std::uint32_t per_vector = 16U / sizeof(Activation);
+    __shared__ float4 stage[2][experts * pitch];
+    const auto wave = threadIdx.x / 32U, lane = threadIdx.x % 32U;
+    const auto first_expert = static_cast<std::uint32_t>(blockIdx.x) * experts;
+    if (wave < chains) {
+        // One row: lanes 16-31 run a copy of lane 15's chain and store nothing.
+        const auto chain = (wave * 32U + lane) / Rows, local = chain < experts ? chain : experts - 1U;
+        const auto row = lane % Rows, expert = first_expert + local;
+        const auto* hidden = static_cast<const Activation*>(rows.hidden[row]);
+        float sum = 0.0F;
+        // The next chunk's activations are requested before this chunk's FMAs (L2 round trip per chunk).
+        constexpr std::uint32_t packs = chunk / per_vector;
+        uint4 next[packs];
+#pragma unroll
+        for (std::uint32_t v = 0; v < packs; ++v) next[v] = *reinterpret_cast<const uint4*>(hidden + v * per_vector);
+#pragma unroll 1
+        for (std::uint32_t step = 0; step < Steps; ++step) {
+            uint4 raw[packs];
+#pragma unroll
+            for (std::uint32_t v = 0; v < packs; ++v) raw[v] = next[v];
+            if (step + 1U < Steps)
+#pragma unroll
+                for (std::uint32_t v = 0; v < packs; ++v)
+                    next[v] = *reinterpret_cast<const uint4*>(hidden + (step + 1U) * chunk + v * per_vector);
+            router_lds_barrier();
+            const float4* coefficients = stage[step % 2U] + local * pitch;
+            // Activations decoded at their FMA (no 128-float staging array: register budget), same values and order.
+            const auto activation = [&](std::uint32_t k) {
+                const auto& packed = raw[k / per_vector];
+                const std::uint32_t words[4] = {packed.x, packed.y, packed.z, packed.w};
+                const auto i = k % per_vector;
+                if constexpr (sizeof(Activation) == 2U)
+                    return bf16_to_float(static_cast<std::uint16_t>(i % 2U ? words[i / 2U] >> 16U : words[i / 2U] & 0xffffU));
+                else return __uint_as_float(words[i]);
+            };
+#pragma unroll
+            for (std::uint32_t q = 0; q < vectors; ++q) {
+                const auto c = coefficients[q];
+                sum = __builtin_fmaf(activation(4U * q + 0U), c.x, sum);
+                sum = __builtin_fmaf(activation(4U * q + 1U), c.y, sum);
+                sum = __builtin_fmaf(activation(4U * q + 2U), c.z, sum);
+                sum = __builtin_fmaf(activation(4U * q + 3U), c.w, sum);
+            }
+        }
+        if (chain < experts && expert < expert_count) rows.workspace[row][expert] = sum;
+    } else {
+        // Loader thread t copies vectors t + 32 Loaders p (p < per_loader) of every chunk: expert j / vectors, vector j % vectors.
+        const auto t = threadIdx.x - 32U * chains;
+        const float4* source[per_loader];
+        std::uint32_t slot[per_loader];
+#pragma unroll
+        for (std::uint32_t p = 0; p < per_loader; ++p) {
+            const auto j = t + 32U * Loaders * p, e = j / vectors, q = j % vectors;
+            const auto expert = first_expert + e < expert_count ? first_expert + e : expert_count - 1U;
+            source[p] = reinterpret_cast<const float4*>(weights + static_cast<std::uint64_t>(expert) * hidden_size) + q;
+            slot[p] = e * pitch + q;
+        }
+        float4 ring[depth][per_loader];
+#pragma unroll
+        for (std::uint32_t d = 0; d < depth; ++d)
+#pragma unroll
+            for (std::uint32_t p = 0; p < per_loader; ++p) if (d < Steps) ring[d][p] = source[p][d * vectors];
+        // The ring shifts by one chunk per step (constant indices: an indexed ring would live in scratch).
+        for (std::uint32_t step = 0; step < Steps; ++step) {
+#pragma unroll
+            for (std::uint32_t p = 0; p < per_loader; ++p) stage[step % 2U][slot[p]] = ring[0][p];
+#pragma unroll
+            for (std::uint32_t d = 1; d < depth; ++d)
+#pragma unroll
+                for (std::uint32_t p = 0; p < per_loader; ++p) ring[d - 1U][p] = ring[d][p];
+            if (step + depth < Steps)
+#pragma unroll
+                for (std::uint32_t p = 0; p < per_loader; ++p) ring[depth - 1U][p] = source[p][(step + depth) * vectors];
+            router_lds_barrier();
+        }
+    }
+}
 // Prefill tiles: lanes_rows_moe_route_logits_kernel's lane (expert, row) chains for Tiles 8-row tiles
 // at once (blockIdx.y covers Tiles tiles). Each coefficient chunk is loaded once and used by the
 // lane's Tiles chains, each chain the same fused ascending FMA sequence over its own row.
@@ -1746,7 +1846,17 @@ void launch_router_rows_typed(const PreparedRouterRows& p, const HipMoeRouteLaun
             const auto n = v ? static_cast<std::uint32_t>(std::atoi(v)) : 128U;
             return n == 64U || n == 256U ? n : 128U;
         }();
+        // STRIX_ROUTER_STAGED=0: the lanes form below for the 2560-wide router as well (same chains).
+        static const bool staged = [] { const char* v = std::getenv("STRIX_ROUTER_STAGED"); return !v || v[0] != '0'; }();
         const auto lanes = [&]<std::uint32_t R>() {
+            if (staged && config.hidden_size == 20U * 128U) {
+                // 16 experts per block: R / 2 chain waves and 8 loader waves keeping 8 chunks in flight.
+                constexpr std::uint32_t experts = 16U, loaders = 8U;
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(staged_rows_moe_route_logits_kernel<Activation, R, 20U, loaders>),
+                    dim3((config.expert_count + experts - 1U) / experts), dim3(32U * (staged_router_chain_waves<R>() + loaders)),
+                    0, stream, p.args, f32, config.expert_count);
+                return;
+            }
             if (chunk == 256U && config.hidden_size % 256U == 0U)
                 hipLaunchKernelGGL(HIP_KERNEL_NAME(lanes_rows_moe_route_logits_kernel<Activation, R, 256U>),
                     blocks(R), dim3(256U), 0, stream, p.args, f32, config.hidden_size, config.expert_count);
@@ -2119,10 +2229,19 @@ void launch_hip_mtp_route(const MtpNativeContext& c,void* stream) {
     const auto e=static_cast<std::uint32_t>(c.model->num_experts);
     const auto k=static_cast<std::uint32_t>(c.model->num_experts_per_token);
     auto workspace=reinterpret_cast<float*>(c.resources->view(HipMtpBuffer::router_workspace).address);
+    const auto hidden0=c.resources->view(HipMtpBuffer::hidden0).address;
+    // The one-row staged chains (same bits as parallel_moe_route_logits_kernel); STRIX_ROUTER_STAGED=0: off.
+    static const bool staged=[]{const char* v=std::getenv("STRIX_ROUTER_STAGED");return !v||v[0]!='0';}();
+    if(staged && h==20U*128U && hidden0%16U==0U && c.tensors->router.runtime->address%16U==0U) {
+        RouterRowsArgs args{};args.hidden[0]=reinterpret_cast<const void*>(hidden0);args.workspace[0]=workspace;
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(staged_rows_moe_route_logits_kernel<std::uint16_t,1U,20U,8U>),dim3((e+15U)/16U),
+            dim3(32U*(staged_router_chain_waves<1U>()+8U)),0,reinterpret_cast<hipStream_t>(stream),args,
+            reinterpret_cast<const float*>(c.tensors->router.runtime->address),e);
+    } else
     hipLaunchKernelGGL(HIP_KERNEL_NAME(parallel_moe_route_logits_kernel<std::uint16_t,RouterWeightKind::f32>),
         dim3((e+kRouterExpertsPerBlock-1)/kRouterExpertsPerBlock),dim3(kRouterProjectionThreads),0,
         reinterpret_cast<hipStream_t>(stream),
-        reinterpret_cast<const std::uint16_t*>(c.resources->view(HipMtpBuffer::hidden0).address),
+        reinterpret_cast<const std::uint16_t*>(hidden0),
         reinterpret_cast<const void*>(c.tensors->router.runtime->address),h,e,workspace);
     check_hip(hipGetLastError(),"MTP native parallel route projection launch");
     hipLaunchKernelGGL(wave_parallel_moe_route_select_kernel,dim3(1),dim3(kThreads),0,

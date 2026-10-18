@@ -357,6 +357,32 @@ struct Fixture {
         readonly();
         return result;
     }
+    // Shared rows on a second stream with a private workspace (the window owner's detached form): the
+    // outputs and the workspace rows equal the arena run's; the arena workspace is not touched.
+    Result run_detached() {
+        reset();
+        const auto stride = temporary[1].address - temporary[0].address;
+        const auto workspace = owner.allocate(stride + temporary[1].bytes);
+        hipStream_t side = nullptr;
+        check(hipStreamCreateWithFlags(&side, hipStreamNonBlocking), "create detached shared stream");
+        try {
+            shared_expert_known_window_rows_launch_detached(rows, shared_config, side, workspace.address, workspace.bytes);
+            check(hipStreamSynchronize(side), "complete detached shared rows");
+        } catch (...) { (void)hipStreamSynchronize(side); (void)hipStreamDestroy(side); throw; }
+        check(hipStreamDestroy(side), "destroy detached shared stream");
+        Result result;
+        for (unsigned row = 0; row < 2U; ++row) {
+            result.output[row] = read({output[row].address, output[row].bytes});
+            result.temporary[row] = read({workspace.address + row * stride, temporary[row].bytes});
+            require(read({temporary[row].address, temporary[row].bytes}) ==
+                std::vector<unsigned char>(seed.begin() + static_cast<std::ptrdiff_t>(temporary[row].address - scratch.address),
+                    seed.begin() + static_cast<std::ptrdiff_t>(temporary[row].address - scratch.address + temporary[row].bytes)),
+                "detached shared rows wrote the arena workspace");
+        }
+        readonly();
+        guards(workspace);
+        return result;
+    }
 };
 void same(const Result& left, const Result& right) {
     require(left.output == right.output, "R2 output rows differ bitwise from two selected serial calls");
@@ -1190,6 +1216,7 @@ void family(bool gdn, bool prefetch = false) {
         const auto candidate = fixture.run(true);
         same(serial, candidate);
         same(candidate, fixture.run(true)); // reset, repeat, full-bit determinism
+        if (!gdn) same(serial, fixture.run_detached());
         if (flavor < 3U) finite(candidate);
         if (flavor == 0U) finite_reference = candidate;
     }

@@ -566,6 +566,19 @@ KnownWindowResult execute_known_prefix_window_eager(
             const auto& step = serial.execution.steps[i];
             if (!result.execution.state.contains(step.reads_state))
                 throw std::logic_error("known window persistent state disappeared after admission");
+            if (hooks.before_step && (selected[i] || selected_rows[i]) && hooks.before_step(i, contexts)) {
+                const auto width = selected_rows[i] ? rows : 2U;
+                for (std::uint32_t first = 0; first < rows; first += width) {
+                    if (selected_rows[i]) { if (window.mode[i] == KnownWindowStepMode::shared_rows) ++result.shared_rows_dispatches; }
+                    else ++result.r2_dispatches;
+                    ++result.execution.kernel_steps;
+                    ++result.r2_variant_dispatches[static_cast<std::uint32_t>(window.r2_variant[i])];
+                    ++result.execution.completed_steps; result.execution.completion_order.push_back(step.id);
+                    for (std::uint32_t r = 0; r < width; ++r) result.execution.state.publish_write(step.writes_state);
+                }
+                continue;
+            }
+            if (hooks.before_step && !selected[i] && !selected_rows[i]) (void)hooks.before_step(i, contexts);
             if (selected[i] || selected_rows[i]) {
                 const auto width=selected_rows[i] ? rows : 2U;
                 for(std::uint32_t first=0;first<rows;first+=width) {

@@ -93,6 +93,12 @@ void shared_expert_known_window_rows_preflight(
 void shared_expert_known_window_rows_launch(
     std::span<const ExecutionDispatchContext> rows,
     const HipSharedExpertLauncherConfig& config);
+// The same rows (R2/R4/R8, same admission, arithmetic and kernels), enqueued on `stream` with the
+// workspace rows at the arena's row stride in [workspace, workspace + workspace_bytes) instead of the
+// arena. The caller orders `stream` after the step's input and before its readers, and owns the
+// workspace and stream through quiescence (also after an exception).
+void shared_expert_known_window_rows_launch_detached(std::span<const ExecutionDispatchContext> rows,
+    const HipSharedExpertLauncherConfig& config, hipStream_t stream, std::uintptr_t workspace, std::uint64_t workspace_bytes);
 // Prefill: all T rows of a shared-expert step (8-row tiles of one strided view).
 void shared_expert_known_prefill_rows_preflight(std::span<const ExecutionDispatchContext> rows,
     const HipSharedExpertLauncherConfig& config);
