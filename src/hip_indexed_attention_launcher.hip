@@ -1365,12 +1365,14 @@ __device__ __forceinline__ void select_blocks_body(
     }
 }
 
+#ifdef STRIX_BUILD_KNOWN_WINDOW_DIAGNOSTIC // reference selection of the block-select probe only
 __global__ void select_blocks_serial_kernel(float* block_scores, std::uint32_t num_blocks,
     std::uint32_t select_blocks, std::uint32_t compress_ratio, std::uint32_t visible_tokens,
     std::uint32_t* selected, GraphSelectionArguments dynamic) {
     if (blockIdx.x != 0 || threadIdx.x != 0) return;
     select_blocks_body(block_scores, num_blocks, select_blocks, compress_ratio, visible_tokens, selected, dynamic);
 }
+#endif
 
 // Workgroup-parallel equivalent of select_blocks_body (every thread calls it).
 // The serial loop takes, slot by slot, the lowest-index maximal score > -inf
