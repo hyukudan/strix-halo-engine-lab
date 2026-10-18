@@ -1031,7 +1031,7 @@ __global__ __launch_bounds__(32U*Waves) void down_prefill_wmma(const unsigned ch
 // the whole K in FP32, with no per-group epilogue. Activations carry a power-of-two scale per
 // row that puts the row's largest magnitude in [2^13, 2^14): exact for every value that stays
 // normal (29 binades below the maximum) and undone exactly on the FP32 sums. Input x: one scale
-// per prompt row (f16_row_scales); h = silu(g)*u: gate/up writes it in FP32 and the largest |h|
+// per prompt row (f16_prefill_prologue); h = silu(g)*u: gate/up writes it in FP32 and the largest |h|
 // of each (row, slot), and down scales and rounds it while staging. A CSR batch holds at most 64
 // assignments of one expert (M tile 64; waves whose 16 rows are all past the batch skip their
 // WMMAs). Each (row, output) sums its K steps in the same order whatever batch it lands in, so
@@ -1077,22 +1077,31 @@ __device__ __forceinline__ uint2 f16_scaled_s8(unsigned w,float a) {
     const float v2=a*static_cast<float>((s<<8)>>24),v3=a*static_cast<float>(s>>24);
     return {f16_pair(v0,v1),f16_pair(v2,v3)};
 }
-// One CTA per prompt row: the x scale exponent of the row and zeroed max |h| words. Rows that
-// already failed (prologue status) are skipped by every later kernel through the summary.
-__global__ __launch_bounds__(256) void f16_row_scales(PrefillRows view,unsigned hidden,unsigned top_k) {
+// Prologue of the FP16 forms, one CTA per prompt row: the A8 prologue's clear, route checks and
+// row status, the row's input scale exponent and zeroed max |h| words. No A8 quantizer: a
+// non-finite input reaches g and u and fails the row in the gate/up epilogue (status 8).
+__global__ __launch_bounds__(256) void f16_prefill_prologue(PrefillRows v,unsigned hidden,unsigned top_k,unsigned experts,
+    unsigned clear_words) {
     const unsigned r=blockIdx.x,t=threadIdx.x;
-    const auto* x=reinterpret_cast<const unsigned short*>(at(view.input,r));
+    __shared__ unsigned route_bits;
+    __shared__ float wave_max[8];
+    if(t==0U)route_bits=0U;
+    float* clear=at(v.clear,r);
+    for(unsigned i=t;i<clear_words;i+=256U)clear[i]=0.0F;
+    __syncthreads();
+    if(t<top_k&&(at(v.routes,r)[t]>=experts||!isfinite(at(v.route_weights,r)[t])))atomicOr(&route_bits,invalid_route);
+    if(t<top_k)at(v.down_sums,r)[t]=0;
+    const auto* x=reinterpret_cast<const unsigned short*>(at(v.input,r));
     float m=0.0F;
     for(unsigned k=t;k<hidden;k+=256U)m=fmaxf(m,fabsf(__uint_as_float(static_cast<unsigned>(x[k])<<16U)));
     for(int stride=16;stride!=0;stride/=2)m=fmaxf(m,__shfl_xor(m,stride,32));
-    __shared__ float wave_max[8];
     if((t&31U)==0U)wave_max[t/32U]=m;
     __syncthreads();
     if(t==0U) {
         for(unsigned w=1;w<8U;++w)m=fmaxf(m,wave_max[w]);
-        at(view.sums,r)[0]=f16_exponent(m);
+        at(v.sums,r)[0]=f16_exponent(m);
+        *at(v.status,r)=route_bits;
     }
-    if(t<top_k)at(view.down_sums,r)[t]=0;
 }
 // LDS-only barrier: the staged tiles are complete (lgkmcnt) but the next step's global loads stay
 // in flight (__syncthreads would also wait for them, as its workgroup fence does).
@@ -1451,7 +1460,13 @@ void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned cou
     if(f16&&(request.shape.rows%128U||request.shape.hidden%256U))throw std::invalid_argument("A8 prefill FP16 WMMA geometry is invalid");
     const bool wmma=f16||(wmma_shape&&(form>=0?form>=1:wmma_env>=0?wmma_env==1:true));
     const unsigned cap=f16?f16_batch:wmma?wmma_batch:dot4_cap;
-    enqueue_prefill_prologue(request,rows,count,clear_words,stream);
+    if(f16) {
+        if(request.input!=InputKind::bf16)throw std::invalid_argument("A8 prefill FP16 WMMA requires BF16 input rows");
+        check(hipPeekAtLastError(),"FP16 prefill prologue stale error");
+        hipLaunchKernelGGL(f16_prefill_prologue,dim3(count),dim3(256),0,stream,rows,request.shape.hidden,request.shape.top_k,
+            request.shape.experts,clear_words);
+        check(hipGetLastError(),"FP16 prefill prologue");
+    } else enqueue_prefill_prologue(request,rows,count,clear_words,stream);
     const unsigned assignments=count*request.shape.top_k;
     // The WMMA forms (and every T above the serial builder's 2048 rows) build the identical CSR with
     // the parallel builder; form 2 keeps the serial one.
@@ -1476,8 +1491,6 @@ void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned cou
     }
     const unsigned batches=std::min(assignments,request.shape.experts+(assignments+cap-1U)/cap);
     if(f16) {
-        hipLaunchKernelGGL(f16_row_scales,dim3(count),dim3(256),0,stream,rows,request.shape.hidden,request.shape.top_k);
-        check(hipGetLastError(),"FP16 prefill row scales");
         const dim3 project_grid(request.shape.rows/128U,batches);
         if(q5k)hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill_f16<true>),project_grid,dim3(256),0,stream,
             gate,up,rows,request.shape.hidden,request.shape.rows);
