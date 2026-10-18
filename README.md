@@ -277,7 +277,7 @@ The full record, with alternatives, evidence and the condition for reopening eac
 
 In progress, in no particular order and without promised numbers:
 
-- **Prefix cache with GDN state**: reuse a previously read prompt prefix, including the recurrent state.
+- **Prefix cache with GDN state** *(landed, D-035)*: a request whose prompt starts with a cached prefix restores the complete model state at a tiled-prefill block boundary and reads only the rest, with bit-identical output (`--prefix-cache-host-bytes N`, optional `--prefix-cache-dir DIR`; see [docs/prefix-state-cache.md](docs/prefix-state-cache.md)). Timings follow the next benchmark campaign.
 - **Monitor panel**: live view of requests, speed and memory.
 - **Several requests at once**.
 - **KV cache in int8**.

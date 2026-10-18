@@ -104,6 +104,9 @@ struct HipMtpRuntime::Impl {
     MtpDraftCycleInput current;
     HipMtpExecutionStats stats;
     std::uint64_t next_source=0,base_source=0,epoch=0,profile=0;
+    // Rows [0, ticketless_frontier) were primed without target tickets (tiled prompt or restore):
+    // the first ticketed teacher row may start there instead of at source zero.
+    std::uint64_t ticketless_frontier=0;
     std::uint32_t step=0,pending_token=0;
     bool active=false,cycle=false,have_replay=false,broken=false,cache_only_active=false,first_cache_reusable=false;
     explicit Impl(std::shared_ptr<HipMtpResources> actual):owner(std::move(actual)) {
@@ -244,7 +247,7 @@ struct HipMtpRuntime::Impl {
         if(last_target) {
             require_chain(*last_target,ticket);
             require(last_teacher_next_input && *last_teacher_next_input==ticket.input_token(),"MTP prior teacher pair differs from the actual next target input");
-        } else require(!next_source,"MTP initial history must start at source zero");
+        } else require(next_source==ticketless_frontier,"MTP initial history must start at source zero");
         const auto v=owner->view(HipMtpBuffer::wide_current);
         MtpDraftCycleInput input{owner->plan().proposal_identity,0U,ticket.committed_session().runtime_compatibility_identity,
             token,next_source+1U,next_source,v.address,owner->plan().state.state_width,2U,v.allocation_generation};
@@ -261,7 +264,7 @@ struct HipMtpRuntime::Impl {
             require_chain(*last_target,ticket);
             require(last_teacher_next_input && *last_teacher_next_input==ticket.input_token(),
                 "MTP prior cache teacher pair differs from the actual next target input");
-        } else require(!next_source,"MTP initial cache history must start at source zero");
+        } else require(next_source==ticketless_frontier,"MTP initial cache history must start at source zero");
         const auto v=owner->view(HipMtpBuffer::wide_current);
         MtpDraftCycleInput input{owner->plan().proposal_identity,0U,ticket.committed_session().runtime_compatibility_identity,
             token,next_source+1U,next_source,v.address,owner->plan().state.state_width,2U,v.allocation_generation};
@@ -291,7 +294,7 @@ struct HipMtpRuntime::Impl {
             require_chain(*last_target,row.hidden);
             require(last_teacher_next_input && *last_teacher_next_input==row.hidden.input_token(),
                 "MTP reused cache teacher pair differs from the actual preceding input");
-        } else require(!next_source,"MTP reused initial cache history must start at source zero");
+        } else require(next_source==ticketless_frontier,"MTP reused initial cache history must start at source zero");
         owner->require_idle();
         require(stats.cache_reused_rows!=UINT64_MAX,"MTP reused cache row counter exhausted");
         ++next_source;++stats.cache_reused_rows;
@@ -314,7 +317,7 @@ struct HipMtpRuntime::Impl {
                     require_chain(*last_target,row.hidden);
                     require(last_teacher_next_input && *last_teacher_next_input==row.hidden.input_token(),
                         "MTP prior cache teacher pair differs from the actual next target input");
-                } else require(!next_source,"MTP initial cache history must start at source zero");
+                } else require(next_source==ticketless_frontier,"MTP initial cache history must start at source zero");
                 preflight(row.hidden.source_position(),row.next_input_token,true,true);
             }
             owner->mark_submitted();
@@ -466,6 +469,43 @@ void HipMtpRuntime::prime_committed_rows(const QualifiedMtpDraftPlan& plan,const
     }
     if(p.draft) p.teacher_cache_rows(rows);
     else for(const auto& row:rows) p.teacher_cache(row.hidden,row.next_input_token);
+}
+void HipMtpRuntime::prime_hidden_rows(const QualifiedMtpDraftPlan& plan,const ActivatedMtpDraftPlan& activated,
+    std::span<const MtpDeviceView> hidden,std::span<const std::uint32_t> next_tokens) {
+    auto& p=*impl_;p.qualification(plan,activated);
+    require(!p.cycle && !p.active && !p.validation && !p.broken && hidden.size()==next_tokens.size() &&
+        p.stats.cache_only_rows<=UINT64_MAX-hidden.size(),"MTP hidden-row priming requires an idle owner and one token per row");
+    if(hidden.empty()) return;
+    const auto wide=p.owner->view(HipMtpBuffer::wide_current);
+    p.validation.emplace(p.owner->admit_native_entry());
+    try {
+        for(std::size_t i=0;i<hidden.size();++i) {
+            require(hidden[i].address && hidden[i].bytes==wide.bytes && next_tokens[i]<p.owner->model().vocab_size &&
+                p.next_source+i+1U<p.owner->context_capacity(),"MTP hidden priming row is invalid");
+            p.preflight(p.next_source+i,next_tokens[i],true,true);
+        }
+        p.owner->mark_submitted();
+    } catch(...) {p.validation.reset();throw;}
+    p.active=true;p.cache_only_active=true;
+    try {
+        void* stream=p.owner->stream();
+        for(std::size_t i=0;i<hidden.size();++i) {
+            const auto c=p.context(p.next_source+i);
+            p.copy(wide,hidden[i]);
+            launch_hip_mtp_embedding(c,next_tokens[i],stream);p.cache_row_front(c,stream);
+            launch_hip_mtp_cache_rows(c,stream);
+        }
+        p.owner->complete();
+        p.active=false;p.cache_only_active=false;p.next_source+=hidden.size();p.stats.cache_only_rows+=hidden.size();p.validation.reset();
+        p.last_target.reset();p.last_teacher_next_input.reset();p.first_cache_reusable=false;p.ticketless_frontier=p.next_source;
+    } catch(...) {p.failure();throw;}
+}
+void HipMtpRuntime::restore_cache_frontier(const QualifiedMtpDraftPlan& plan,const ActivatedMtpDraftPlan& activated,std::uint64_t source) {
+    auto& p=*impl_;p.qualification(plan,activated);
+    require(!p.cycle && !p.active && !p.validation && !p.broken && p.next_source==0U && !p.last_target &&
+        source<p.owner->context_capacity(),"MTP cache frontier restore requires a fresh idle owner within capacity");
+    p.owner->require_idle();
+    p.next_source=source;p.ticketless_frontier=source;p.first_cache_reusable=false;
 }
 void HipMtpRuntime::begin_cycle(std::uint32_t token,const HipMtpTargetHiddenTicket& ticket) {
     auto& p=*impl_;p.validate_ticket(ticket);require(!p.cycle && !p.active && ticket.source_position()==p.next_source &&

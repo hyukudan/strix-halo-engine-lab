@@ -126,6 +126,9 @@ struct MtpCliOptions {
     bool draft_chain=false,draft_exact=false,draft_q4=false;
     std::string draft_vocab;
     std::uint32_t draft_context_vocab=0;
+    // Tiled MTP prompt (--known-prefix-window with the tiled prefill): the golden covers only the
+    // first calibration_rows prompt pairs, replayed serially before the tiled prefill (0: default 8).
+    std::uint32_t calibration_rows=0;
 };
 // This is execution evidence: a configured owner alone is not an attempted
 // native window (EOS, remaining budget/context and history can choose serial).
@@ -259,6 +262,8 @@ struct Options {
     bool prompt_lookup_snapshot_explicit = false, prompt_lookup_snapshot_bytes_explicit = false;
     bool device_queue_trace = false;
     std::uint32_t known_prefix_prefill_rows = 0;
+    // Optional smaller tiled block for the remainder after the last complete T-row block.
+    std::uint32_t known_prefix_tail_rows = 0;
     bool known_prefix_prefill_explicit = false;
     std::uint64_t known_prefill_workspace_budget = 0, known_prefill_metadata_budget = 0;
     std::uint64_t known_prefill_uma_budget = 0, known_prefill_host_headroom = 0;
@@ -273,6 +278,14 @@ struct Options {
     std::uint32_t serving_prefill_rows = 0;
     std::uint64_t serving_prefill_workspace_budget = 0, serving_prefill_metadata_budget = 0;
     bool serving_prefill_explicit = false, serving_prefill_workspace_explicit = false, serving_prefill_metadata_explicit = false;
+    // Block-boundary prefix state cache on the tiled known-prefix prefill (docs/prefix-state-cache.md).
+    // A positive host budget enables it; everything else is optional.
+    std::uint64_t prefix_cache_host_bytes = 0;
+    std::string prefix_cache_dir;
+    std::uint64_t prefix_cache_disk_bytes = 0;
+    std::uint64_t prefix_cache_every = 0;  // 0: every max(T, 4096) tokens, rounded to a multiple of T
+    std::vector<std::string> prefix_cache_then_prompts;
+    bool prefix_cache_disk_bytes_explicit = false, prefix_cache_every_explicit = false;
 };
 
 // The wrapper can omit a terminal stateless head without allocating a GPU
@@ -557,8 +570,46 @@ inline void validate_resolved_teacher_forced_score(const Options& options, std::
         if (token >= vocabulary) throw std::invalid_argument("teacher input exceeds model vocabulary");
 }
 
+// MTP decode after the tiled known-prefix prefill of the prompt (calibration replay on the prompt head).
+[[nodiscard]] inline bool mtp_tiled_prompt(const Options& o) noexcept {
+    return o.mtp.enabled && o.known_prefix_window && o.known_prefix_full_rows && o.known_prefix_prefill_rows;
+}
+[[nodiscard]] inline std::uint32_t mtp_calibration_rows(const Options& o) noexcept {
+    return o.mtp.calibration_rows ? o.mtp.calibration_rows : 8U;
+}
+
+[[nodiscard]] inline bool prefix_state_cache_requested(const Options& o) noexcept {
+    return o.prefix_cache_host_bytes || !o.prefix_cache_dir.empty() || o.prefix_cache_disk_bytes_explicit ||
+        o.prefix_cache_every_explicit || !o.prefix_cache_then_prompts.empty();
+}
+
+// The prefix state cache restores and captures whole tiled blocks: it runs only on the tiled
+// known-prefix prefill (full rows, a terminal head for generation) of an ordinary request.
+inline void validate_prefix_state_cache(const Options& o) {
+    if (!prefix_state_cache_requested(o)) return;
+    if (!o.prefix_cache_host_bytes)
+        throw std::invalid_argument("prefix state cache options require a positive --prefix-cache-host-bytes");
+    if (!o.known_prefix_window || !o.known_prefix_full_rows || !o.known_prefix_prefill_rows)
+        throw std::invalid_argument("prefix state cache requires the tiled known-prefix prefill "
+            "(--known-prefix-window --known-prefix-full-rows --known-prefix-prefill-rows T)");
+    if (!o.generate_tokens || o.known_prefix_output_policy == strix::KnownWindowOutputPolicy::state_only ||
+        o.teacher_forced_score || ((o.mtp.enabled || o.mtp.supplied) && !mtp_tiled_prompt(o)) || o.prompt_lookup || o.prefix_cache_roundtrip ||
+        !o.serving_prefix_files.empty() || !o.raw_recording_path.empty() || !o.validation_final_state_path.empty() ||
+        !o.reference_path.empty() || !o.logprob_token_ids.empty() || o.gpu_greedy_token)
+        throw std::invalid_argument("prefix state cache requires a generating tiled request without teacher forcing, MTP, "
+            "lookup, serving, recording, reference, logprob or scalar-output modes");
+    if (o.prefix_cache_disk_bytes_explicit && o.prefix_cache_dir.empty())
+        throw std::invalid_argument("--prefix-cache-disk-bytes requires --prefix-cache-dir");
+    if (o.prefix_cache_every_explicit && (!o.prefix_cache_every || o.prefix_cache_every % o.known_prefix_prefill_rows))
+        throw std::invalid_argument("--prefix-cache-every must be a positive multiple of --known-prefix-prefill-rows");
+    if (!o.prefix_cache_then_prompts.empty() && o.mtp.enabled)
+        throw std::invalid_argument("--prefix-cache-then-prompt runs on the serial-decode tiled route only");
+    if (o.prefix_cache_then_prompts.size() > 64U)
+        throw std::invalid_argument("at most 64 --prefix-cache-then-prompt requests");
+}
+
 inline void validate_known_prefill_options(const Options& options) {
-    const bool any = options.known_prefix_prefill_explicit || options.known_prefix_prefill_rows ||
+    const bool any = options.known_prefix_prefill_explicit || options.known_prefix_prefill_rows || options.known_prefix_tail_rows ||
         options.known_prefill_workspace_explicit || options.known_prefill_metadata_explicit ||
         options.known_prefill_uma_explicit || options.known_prefill_headroom_explicit;
     if (!any) return;
@@ -571,6 +622,10 @@ inline void validate_known_prefill_options(const Options& options) {
         throw std::invalid_argument("known prefill requires explicit T16..2048, window, all budgets/headroom and no small-row or lookup selector");
     if (options.known_prefix_output_policy == strix::KnownWindowOutputPolicy::state_only && options.generate_tokens)
         throw std::invalid_argument("tiled state-only prefill cannot generate without a terminal output frontier");
+    if (options.known_prefix_tail_rows && (options.known_prefix_tail_rows >= options.known_prefix_prefill_rows ||
+        !options.known_prefix_full_rows || options.teacher_forced_score ||
+        options.known_prefix_output_policy == strix::KnownWindowOutputPolicy::state_only))
+        throw std::invalid_argument("known prefill tail rows require full rows, fewer rows than T, an output head and no teacher forcing");
 }
 
 inline void validate_resolved_known_prefix_window(const Options& options) {
@@ -759,14 +814,19 @@ inline void validate_resolved_gdn_islands(const Options& options) {
 
 inline void validate_mtp_cli(const Options& o,bool resolved=false) {
     const auto& m=o.mtp;
+    const bool tiled=mtp_tiled_prompt(o);
     if(!m.enabled){if(m.supplied)throw std::invalid_argument("MTP parameters require --mtp");return;}
     if(o.execution.mode!=DecodeExecutionMode::eager || o.execution.integer_head!=DecodeIntegerHead::none ||
        o.prepared_eager || o.moe_shared_overlap || o.moe_token_cost_policy || o.gdn_islands || o.gpu_greedy_token ||
-       o.prefix_cache_roundtrip || o.prompt_lookup || o.known_prefix_window || !o.serving_prefix_files.empty() ||
+       o.prefix_cache_roundtrip || o.prompt_lookup || (o.known_prefix_window && !tiled) || !o.serving_prefix_files.empty() ||
        o.device_queue_trace || !o.reference_path.empty() || !o.raw_recording_path.empty() ||
        !o.validation_final_state_path.empty() || !o.logprob_token_ids.empty())
         throw std::invalid_argument("MTP requires its explicit raw eager target route without graph/prepared/overlap/islands/other controllers/recording");
-    if(o.tokens.size()<3U || o.tokens.size()>4097U || !o.generate_tokens || o.generate_tokens>UINT32_MAX ||
+    if(m.calibration_rows && !tiled)
+        throw std::invalid_argument("MTP calibration rows require the tiled MTP prompt (--known-prefix-window with the tiled prefill)");
+    if(tiled && (mtp_calibration_rows(o)+1U>o.tokens.size() || m.metadata_only))
+        throw std::invalid_argument("tiled MTP prompt needs more prompt tokens than calibration rows");
+    if(o.tokens.size()<3U || (!tiled && o.tokens.size()>4097U) || !o.generate_tokens || o.generate_tokens>UINT32_MAX ||
        ((resolved || o.context_explicit) && (o.tokens.size()>o.context_tokens ||
         o.generate_tokens>o.context_tokens-o.tokens.size()+1U)))
         throw std::invalid_argument("MTP requires 3..4097 known prompt tokens, positive uint32 output budget and bounded target context");
@@ -843,6 +903,7 @@ inline Options parse_options(
             "[--context N [--unqualified-context]] [--residency register|copy] [--coalesce-gap BYTES] [--model-copy-tier none|normalization|hot_nonexpert|experts --model-copy-payload-bytes N --model-retained-budget N --model-setup-peak-budget N] "
             "[--planned-ple-io] [--ple-cpu-helper-threads 1..8] [--ple-cache-rows N --ple-cache-budget-bytes N] [--ple-max-rows-per-io N] [--ple-max-inflight-ios N] "
             "[--generate N] [--eos-token TOKEN_ID] [--prefix-cache-roundtrip] "
+            "[--prefix-cache-host-bytes N [--prefix-cache-dir DIR [--prefix-cache-disk-bytes N]] [--prefix-cache-every N] [--prefix-cache-then-prompt FILE ...]] "
             "[--parallel-moe-router] [--ranked-moe-router-topk | --wave-moe-router-topk] "
             "[--prefetch-q8-qsa-input] [--prefetch-q8-shared-expert] [--prefetch-q8-lm-head [--wave8-q8-lm-head]] [--wave8-q8-gdn-input] [--wave8-q8-gdn-output] [--wave8-q8-qsa-output] [--virtual-q8-lm-head] [--virtual-q8-gdn-input [--prefetch-q8-gdn-input]] [--q4k-a8g32-gate-up [--grouped-exact-q51-down]] [--deferred-moe-status] "
             "[--parallel-hyper-mix [--staged-hyper-projections [--fused-staged-hyper-mix [--typed-fused-hyper-projections [--prefetch-typed-hyper-rows] [--prefetch-q8-hyper-output [--lane-chain-hyper-output]]]]]]");
@@ -1026,6 +1087,10 @@ inline Options parse_options(
                 else if(key=="--mtp-replay-host-bytes")m.replay_host_bytes=n;
                 else if(key=="--mtp-runtime-bytes")m.runtime_bytes=n;
                 else if(key=="--mtp-target-capture-bytes")m.target_capture_bytes=n;
+                else if(key=="--mtp-calibration-rows"){
+                    if(n<2U || n>4096U)throw std::invalid_argument("MTP calibration rows must be 2..4096");
+                    m.calibration_rows=static_cast<std::uint32_t>(n);
+                }
                 else if(key=="--mtp-policy-id")m.policy_identity=n;
                 else if(key=="--mtp-window-arena-bytes")m.window_arena_bytes=n;
                 else if(key=="--mtp-window-capture-bytes")m.window_capture_bytes=n;
@@ -1060,6 +1125,32 @@ inline Options parse_options(
                 : options.wave8_q8_qsa_output;
             if (enabled) throw std::invalid_argument("duplicate Q8 projection organization option");
             enabled = true;
+            continue;
+        }
+        if (argument == "--prefix-cache-host-bytes" || argument == "--prefix-cache-disk-bytes" ||
+            argument == "--prefix-cache-every" || argument == "--prefix-cache-dir" ||
+            argument == "--prefix-cache-then-prompt") {
+            if (index + 1 >= argc || std::string_view(argv[index + 1]).starts_with("--"))
+                throw std::invalid_argument(std::string(argument) + " requires a value");
+            const std::string_view value = argv[++index];
+            if (argument == "--prefix-cache-dir") {
+                if (!options.prefix_cache_dir.empty()) throw std::invalid_argument("duplicate --prefix-cache-dir");
+                options.prefix_cache_dir = value;
+            } else if (argument == "--prefix-cache-then-prompt") {
+                options.prefix_cache_then_prompts.emplace_back(value);
+            } else if (argument == "--prefix-cache-host-bytes") {
+                if (options.prefix_cache_host_bytes) throw std::invalid_argument("duplicate --prefix-cache-host-bytes");
+                options.prefix_cache_host_bytes = parse_u64(value, "prefix cache host bytes");
+                if (!options.prefix_cache_host_bytes) throw std::invalid_argument("--prefix-cache-host-bytes must be positive");
+            } else if (argument == "--prefix-cache-disk-bytes") {
+                if (options.prefix_cache_disk_bytes_explicit) throw std::invalid_argument("duplicate --prefix-cache-disk-bytes");
+                options.prefix_cache_disk_bytes_explicit = true;
+                options.prefix_cache_disk_bytes = parse_u64(value, "prefix cache disk bytes");
+            } else {
+                if (options.prefix_cache_every_explicit) throw std::invalid_argument("duplicate --prefix-cache-every");
+                options.prefix_cache_every_explicit = true;
+                options.prefix_cache_every = parse_u64(value, "prefix cache interval");
+            }
             continue;
         }
         if (argument == "--serve-prefix-u32le") {
@@ -1198,6 +1289,15 @@ inline Options parse_options(
             const auto id = parse_u64(argv[++index], "logprob token");
             if (id > std::numeric_limits<std::uint32_t>::max()) throw std::invalid_argument("logprob token exceeds uint32");
             options.logprob_token_ids.push_back(static_cast<std::uint32_t>(id));
+            continue;
+        }
+        if (argument == "--known-prefix-tail-rows") {
+            if (options.known_prefix_tail_rows || index + 1 >= argc)
+                throw std::invalid_argument("--known-prefix-tail-rows requires one value");
+            const auto rows = parse_u64(argv[++index], "known prefill tail rows");
+            if (rows < 16U || rows > 1024U || rows % 8U)
+                throw std::invalid_argument("known prefill tail rows must be a multiple of 8 from 16 through 1024");
+            options.known_prefix_tail_rows = static_cast<std::uint32_t>(rows);
             continue;
         }
         if (argument == "--known-prefix-prefill-rows" || argument.starts_with("--known-prefix-prefill-rows=")) {
@@ -1891,6 +1991,7 @@ inline Options parse_options(
     validate_numerical_profile_cli(options);
     validate_prefill_numerical_profile_cli(options);
     validate_mtp_cli(options);
+    validate_prefix_state_cache(options);
     return options;
 }
 
