@@ -163,6 +163,66 @@ __device__ __forceinline__ void reduce(float (&v)[N], unsigned lane) {
     scatter<Tree, N>(v, lane);
     leaves<Tree, N, L>(v);
 }
+// Reduction of the wide (Rows > 8) kernels: the same reduce-scatter and leaf tree, every
+// addition with the same operands in the same order. Only the data movement differs: the
+// distance-16 exchange is one VALU v_permlanex16_b32 (lane L reads lane L ^ 16) instead of
+// a ds_bpermute through LDS, and the two halves of a step are exec-masked blocks of adds
+// instead of per-element selects of operands.
+template <unsigned D> __device__ __forceinline__ float lane_xor_wide(float v) {
+    if constexpr (D == 16U)
+        return __uint_as_float(__builtin_amdgcn_permlanex16(__float_as_uint(v), __float_as_uint(v), 0x76543210U, 0xfedcba98U, false, false));
+    else return lane_xor<D>(v);
+}
+template <class Tree, unsigned N, unsigned Step = 0U, unsigned Count = N>
+__device__ __forceinline__ void scatter_wide(float (&v)[N], unsigned lane) {
+    if constexpr (Step < 5U) {
+        constexpr unsigned D = 16U >> Step;
+        if constexpr (Count > 1U) {
+            constexpr unsigned H = Count / 2U;
+            const bool upper = (lane & D) != 0U;
+            // Lower lanes: add(own v[j], partner's v[j]); upper lanes: add(partner's v[j + H],
+            // own v[j + H]). Both exchanges, then one exec-masked add per half (no selects).
+            constexpr unsigned B = H < 8U ? H : 8U;  // pairs per exec-masked group (register pressure)
+#pragma unroll
+            for (unsigned j0 = 0; j0 < H; j0 += B) {
+                float low[B], high[B];
+#pragma unroll
+                for (unsigned j = 0; j < B; ++j) { low[j] = lane_xor_wide<D>(v[j0 + j]); high[j] = lane_xor_wide<D>(v[j0 + j + H]); }
+                if (!upper) {
+#pragma unroll
+                    for (unsigned j = 0; j < B; ++j) v[j0 + j] = Tree::add(v[j0 + j], low[j]);
+                } else {
+#pragma unroll
+                    for (unsigned j = 0; j < B; ++j) v[j0 + j] = Tree::add(high[j], v[j0 + j + H]);
+                }
+            }
+        } else v[0] = Tree::add(v[0], lane_xor_wide<D>(v[0]));
+        scatter_wide<Tree, N, Step + 1U, (Count > 1U ? Count / 2U : 1U)>(v, lane);
+    }
+}
+template <class Tree, unsigned N, unsigned L, unsigned Bit = log2u(L)>
+__device__ __forceinline__ void leaves_wide(float (&v)[N]) {
+    if constexpr (Bit > 0U) {
+        constexpr unsigned b = Bit - 1U, pairs_bits = log2u(N / L), total = pairs_bits + log2u(L);
+        constexpr unsigned kept_bits = total > 5U ? total - 5U : 0U, step = pairs_bits + (log2u(L) - 1U - b);
+        if constexpr (b >= kept_bits) {
+            constexpr unsigned D = 16U >> step;
+#pragma unroll
+            for (unsigned j = 0; j < (1U << kept_bits); ++j) v[j] = Tree::add(v[j], lane_xor_wide<D>(v[j]));
+        } else {
+#pragma unroll
+            for (unsigned j = 0; j < (1U << kept_bits); ++j)
+                if (!(j & (1U << b))) v[j] = Tree::add(v[j], v[j + (1U << b)]);
+        }
+        leaves_wide<Tree, N, L, b>(v);
+    }
+}
+template <class Tree, unsigned N, unsigned L>
+__device__ __forceinline__ void reduce_wide(float (&v)[N], unsigned lane) {
+    static_assert(N / L <= 32U && (N & (N - 1U)) == 0U);
+    scatter_wide<Tree, N>(v, lane);
+    leaves_wide<Tree, N, L>(v);
+}
 template <unsigned Pairs, class Store>
 __device__ __forceinline__ void store_pairs(float value, unsigned lane, Store&& store) {
     constexpr unsigned bits = log2u(Pairs);
@@ -365,7 +425,7 @@ __global__ __launch_bounds__(kThreads) void project_wide_rows_kernel(Site site) 
                 for (unsigned l = 0; l < 8U; ++l) Site::fma(v[(o * Sub + r) * 8U + l], coefficient[o][l], x[l]);
         }
     }
-    reduce<Site, N, 8U>(v, lane);
+    reduce_wide<Site, N, 8U>(v, lane);
     store_pairs<pow2u(Pairs)>(v[0], lane, [&](unsigned pair, float value) {
         if (pair < Pairs && g * Outs + pair / Sub < site.outputs) site.store(g * Outs + pair / Sub, first + pair % Sub, value);
     });
@@ -479,7 +539,7 @@ __global__ __launch_bounds__(kThreads) void project_wide_rows_staged_kernel(Site
     for (std::uint32_t k = 0; k < full; ++k) step(k, std::false_type{});
     if (full < chunks) step(full, std::true_type{});
     if (g >= groups) return;
-    reduce<Site, N, 8U>(v, lane);
+    reduce_wide<Site, N, 8U>(v, lane);
     store_pairs<pow2u(Pairs)>(v[0], lane, [&](unsigned pair, float value) {
         if (pair < Pairs && g * Outs + pair / Sub < site.outputs) site.store(g * Outs + pair / Sub, first + pair % Sub, value);
     });
@@ -669,7 +729,7 @@ __global__ __launch_bounds__((32U * coef_waves<Site, Sub, W>())) void project_wi
     };
     for (std::uint32_t k = 0; k < full; ++k) step(k, std::false_type{});
     if (full < chunks) step(full, std::true_type{});
-    reduce<Site, N, 8U>(v, lane);
+    if constexpr (Rows > 8U) reduce_wide<Site, N, 8U>(v, lane); else reduce<Site, N, 8U>(v, lane);
     store_pairs<pow2u(Pairs)>(v[0], lane, [&](unsigned pair, float value) {
         if (pair < Pairs && g * Outs + pair / Sub < site.outputs) site.store(g * Outs + pair / Sub, first + pair % Sub, value);
     });
@@ -725,7 +785,7 @@ __global__ __launch_bounds__(32U * Waves) void project_wide_rows_vopd_bf16_kerne
     std::uint32_t k = 0;
     for (; k + 1U < chunks; k += 2U) { step(k, wa, wb, std::false_type{}); step(k + 1U, wb, wa, std::true_type{}); }
     if (k < chunks) step(k, wa, wb, std::false_type{});
-    reduce<Site, 128U, 8U>(v, lane);
+    if constexpr (Site::rows > 8U) reduce_wide<Site, 128U, 8U>(v, lane); else reduce<Site, 128U, 8U>(v, lane);
     store_pairs<16U>(v[0], lane, [&](unsigned pair, float value) {
         if (g * Outs + pair / Sub < site.outputs) site.store(g * Outs + pair / Sub, first + pair % Sub, value);
     });
