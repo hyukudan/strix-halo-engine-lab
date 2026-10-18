@@ -113,10 +113,13 @@ def main():
     ap.add_argument("pack")
     ap.add_argument("--source-content", default=ORIGINAL_CONTENT)
     ap.add_argument("--jobs", type=int, default=16)
+    ap.add_argument("--skip", help="regex of tensor names left out of the pack (their Q8_0 kernels stay)")
     a = ap.parse_args()
+    skip = re.compile(a.skip) if a.skip else None
     m, kv, tensors, order, data = gguf_open(a.emulated)
     todo = [(n, tensors[n][0], tensors[n][1], data + tensors[n][2]) for n in order
-            if (DENSE.search(n) and tensors[n][1] == Q8_0) or (ROUTER.search(n) and tensors[n][1] == F32)]
+            if ((DENSE.search(n) and tensors[n][1] == Q8_0) or (ROUTER.search(n) and tensors[n][1] == F32))
+            and not (skip and skip.search(n))]
     with ProcessPoolExecutor(1) as hx:
         sha_future = hx.submit(file_sha256, a.emulated)
         entries, skipped = [], []
