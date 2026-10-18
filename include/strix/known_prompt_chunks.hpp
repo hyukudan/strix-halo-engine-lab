@@ -88,9 +88,10 @@ public:
     KnownPromptChunkCursor& operator=(const KnownPromptChunkCursor&) = delete;
     // True iff one complete configured window or serial suffix row completed. False after prefill/cancel.
     [[nodiscard]] bool advance();
-    // Optional smaller tiled backend for the remainder: after the last complete T-row block, the
-    // remaining rows run as complete blocks of its rows, and only the rest serially. Same output
-    // policy, explicitly tiled, fewer rows than T. Set once, before the first advance.
+    // Optional smaller tiled backends for the remainder: after the last complete T-row block, the
+    // remaining rows run as complete blocks of the largest tail that fits, and only the rest serially.
+    // Same output policy, explicitly tiled, each smaller than T and than the previous tail. Called
+    // once per tail size, in descending order, before the first advance.
     void set_tail_backend(KnownPromptWindowBackend& tail);
     void cancel() noexcept;
     // Explicit one-shot generation after complete prefill. Delegates the
@@ -103,7 +104,7 @@ public:
 private:
     KnownPromptChunkRequest request_;
     KnownPromptWindowBackend& windows_;
-    KnownPromptWindowBackend* tail_ = nullptr;
+    std::vector<KnownPromptWindowBackend*> tails_;
     SerialGreedyStepBackend& serial_;
     KnownPromptChunkProgress progress_;
     std::vector<float> logits_;

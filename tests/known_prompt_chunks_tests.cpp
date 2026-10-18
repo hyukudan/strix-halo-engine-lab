@@ -360,6 +360,22 @@ int main() {
         while(ends.advance()) {}
         const std::vector<std::pair<char,std::uint64_t>> exact_trace{{headless?'S':'H',0},{'h',32}};
         expect(trace==exact_trace && ends.frontier().unconsumed_selection.has_value(),"final tail block produces the terminal head");
+        // Two tail levels: the largest tail that fits, then the next.
+        trace.clear();
+        std::vector<std::uint32_t> two(109,2U);
+        strix::KnownPromptChunkRequest third{two,0,16,128,1,15};
+        third.logical_rows=64;third.tiled_prefill=true;third.output_policy=strix::KnownWindowOutputPolicy::terminal_row;
+        Tiled main64(64,trace),tail24(24,trace);Rows serial_two;
+        strix::KnownPromptChunkCursor levels(third,main64,serial_two);
+        levels.set_tail_backend(tail24);levels.set_tail_backend(tail_blocks);
+        while(levels.advance()) {}
+        const std::vector<std::pair<char,std::uint64_t>> two_trace{{headless?'s':'h',0},{headless?'s':'h',64},{headless?'s':'h',88}};
+        expect(trace==two_trace && serial_two.serials==5U && levels.progress().tail_windows==2U,"tails are tried largest first");
+        if(trace!=two_trace) for(const auto& [kind,position]:trace) std::cerr<<kind<<position<<' ';
+        bool order_rejected=false;
+        try {strix::KnownPromptChunkCursor bad_order(third,main64,serial_two);bad_order.set_tail_backend(tail_blocks);bad_order.set_tail_backend(tail24);}
+        catch(const std::invalid_argument&) {order_rejected=true;}
+        expect(order_rejected,"tails must be descending");
         bool rejected=false;
         try {Tiled wide(32,trace);strix::KnownPromptChunkCursor bad(second,main_blocks,serial);bad.set_tail_backend(wide);}
         catch(const std::invalid_argument&) {rejected=true;}

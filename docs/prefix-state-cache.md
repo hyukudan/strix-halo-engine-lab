@@ -19,7 +19,7 @@ greedy decode or with MTP decode (see [MTP](#mtp)). Every other route rejects th
 | `--prefix-cache-disk-bytes N` | Optional disk budget (oldest checkpoints are deleted first; 0 = unbounded). |
 | `--prefix-cache-every N` | Capture interval in tokens, a multiple of T (default: 4096 rounded up to a multiple of T). The last block boundary of every prompt is always captured. |
 | `--prefix-cache-then-prompt FILE` | Repeatable. After the main request, run these prompts (token IDs separated by commas or whitespace) in the same process, each from a fresh session, through the same cache. Serial-decode route only. |
-| `--known-prefix-tail-rows T2` | Optional (independent of the cache): after the last complete T-row block, run the remainder as complete T2-row blocks (16..1024, multiple of 8, less than T) before the serial rows. |
+| `--known-prefix-tail-rows T2[,T3...]` | Optional (independent of the cache): after the last complete T-row block, run the remainder as complete blocks of the largest tail size that fits (descending sizes, 16..1024, multiples of 8, less than T), and only the rest as serial rows. |
 
 Diagnostics: `STRIX_PREFIX_CACHE_LOOKUP=0` captures without ever restoring (every request is cold);
 `STRIX_PREFIX_CACHE_DIGEST=1` adds a SHA-256 of the whole prompt state to the MTP receipt.
@@ -50,7 +50,7 @@ fixed state into the fresh session and republishes the recorded counters and lin
 `identity = SHA-256` of: model content identity, executable digest (disk tier only), state layout
 identity (includes the context), runtime compatibility identity, decode execution and kernel-plan
 identities, prefill (sibling) execution and kernel-plan identities, tiled prefill plan identities,
-prefill and decode numerical profile identities and their pair identity, T, T2 and the context size.
+prefill and decode numerical profile identities and their pair identity, T, the tail sizes and the context size.
 On the MTP route it also covers the sidecar content, the MTP plan and native profile identities and
 the draft-kernel switches (the predictor's cache rows are built with the draft kernels unless
 `--mtp-draft-exact`).
@@ -60,7 +60,7 @@ identity and one exact token prefix; the stored tokens are compared as well. Why
 
 - the tiled prefill reproduces serial rows bit for bit within one numerical profile (D-034), but with
   a split pair (D-033) complete blocks run the prefill profile and the unpadded remainder the decode
-  profile, so which rows run which arithmetic depends on T (and T2). Checkpoints are only taken at
+  profile, so which rows run which arithmetic depends on T (and the tail sizes). Checkpoints are only taken at
   block boundaries and the suffix of a restored request keeps the same block alignment as the full
   prompt, so the row-to-profile assignment is the same as without the cache;
 - the decode identities do not change the state at a block boundary, but are part of the key so that
@@ -87,7 +87,7 @@ With `--mtp` and the tiled prefill flags the prompt itself runs through the tile
    the MTP target producer and are replayed against a golden of exactly those pairs (dumped with
    `--mtp-golden-dump` under the same flags). This qualifies and activates the predictor as before.
 2. The target state and the predictor are reset; the longest cached prefix is restored.
-3. Complete T-row blocks (then complete T2-row tail blocks) run tiled. A step observer copies every
+3. Complete T-row blocks (then complete tail blocks) run tiled. A step observer copies every
    row's wide hidden state (the MTP target tap) out of the block arena, and the predictor's cache
    rows are built from those copies. Block boundaries are captured.
 4. The remaining rows, at least the last prompt row, run serially through the MTP target producer;

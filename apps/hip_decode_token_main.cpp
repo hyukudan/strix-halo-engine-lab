@@ -2360,10 +2360,10 @@ int STRIX_DECODE_ENTRY(
     std::optional<strix::CompiledKnownPrefixWindow> known_prefix_plan;
     std::shared_ptr<strix::CompiledKnownPrefixPrefill> known_prefill_plan;
     // Optional smaller tiled block for the remainder (--known-prefix-tail-rows).
-    std::shared_ptr<strix::CompiledKnownPrefixPrefill> known_tail_plan;
-    std::shared_ptr<KnownPromptMemory> known_tail_memory;
-    std::shared_ptr<strix::HipKnownPrefixWindow> known_tail_owner;
-    std::unique_ptr<strix::HipKnownPromptBackend> known_tail_backend;
+    std::vector<std::shared_ptr<strix::CompiledKnownPrefixPrefill>> known_tail_plans;
+    std::vector<std::shared_ptr<KnownPromptMemory>> known_tail_memories;
+    std::vector<std::shared_ptr<strix::HipKnownPrefixWindow>> known_tail_owners;
+    std::vector<std::unique_ptr<strix::HipKnownPromptBackend>> known_tail_backends;
     std::optional<strix::UmaReservationEstimate> known_prefill_reservation;
     std::uint64_t known_prefill_runtime_payload = 0;
     std::shared_ptr<KnownPromptMemory> known_prefix_memory;
@@ -2388,12 +2388,12 @@ int STRIX_DECODE_ENTRY(
                  options.known_window_router_rows || options.known_prefix_full_rows,
                  options.known_prefix_full_rows, options.known_prefix_full_rows, options.known_prefix_full_rows,
                  options.teacher_forced_score}));
-            if (options.known_prefix_tail_rows)
-                known_tail_plan = std::make_shared<strix::CompiledKnownPrefixPrefill>(strix::compile_known_prefix_prefill(model,
+            for (const auto tail_rows : options.known_prefix_tail_rows)
+                known_tail_plans.push_back(std::make_shared<strix::CompiledKnownPrefixPrefill>(strix::compile_known_prefix_prefill(model,
                     compiled_prefill ? *compiled_prefill : compiled, manifest, tensor_access,
-                    {options.known_prefix_tail_rows, true, true, true, options.known_prefix_expert_union,
+                    {tail_rows, true, true, true, options.known_prefix_expert_union,
                      options.known_prefix_output_policy, options.known_prefill_workspace_budget, options.known_prefill_metadata_budget / 2U,
-                     true, true, true, true, true, false}));
+                     true, true, true, true, true, false})));
             known_prefix_plan = known_prefill_plan->tile8; // selection ledger, never a relabelled T forward
         } else {
             const bool full = options.known_prefix_full_rows;
@@ -2466,9 +2466,9 @@ int STRIX_DECODE_ENTRY(
             auto growth = add(known_prefill_plan->arena.physical.total_bytes, add(8U, union_bytes));
             growth = add(growth, add(known_prefill_plan->host_metadata_payload_bytes, map_bytes)); // native owner's second copy
             growth = add(growth, options.known_prefill_host_headroom); // explicit allocator/driver/fixed-plan allowance
-            if (known_tail_plan) { // second arena, completion record and metadata copy of the tail owner
-                growth = add(growth, add(known_tail_plan->arena.physical.total_bytes, add(8U, union_bytes)));
-                growth = add(growth, known_tail_plan->host_metadata_payload_bytes);
+            for (const auto& tail : known_tail_plans) { // arena, completion record and metadata copy of each tail owner
+                growth = add(growth, add(tail->arena.physical.total_bytes, add(8U, union_bytes)));
+                growth = add(growth, tail->host_metadata_payload_bytes);
             }
             known_prefill_reservation = strix::plan_uma_reservation_growth(
                 strix::build_uma_owner_inventory(views), growth, known_prefill_runtime_payload,
@@ -2490,19 +2490,20 @@ int STRIX_DECODE_ENTRY(
                 std::static_pointer_cast<const void>(known_prefix_memory),
                 union_bytes ? strix::q51_known_rows::Workspace{known_prefix_memory->union_scratch,
                     std::static_pointer_cast<const void>(known_prefix_memory)} : strix::q51_known_rows::Workspace{});
-            if (known_tail_plan) {
+            for (const auto& known_tail_plan : known_tail_plans) {
                 const auto tail_retained = std::make_shared<PrefillRetained>(PrefillRetained{
                     experiment_owner, d1_pin, prefill_ple_owner, retained_ple_source, known_tail_plan});
-                known_tail_memory = std::make_shared<KnownPromptMemory>(*known_tail_plan, generations.next(),
+                const auto known_tail_memory = std::make_shared<KnownPromptMemory>(*known_tail_plan, generations.next(),
                     generations.next(), tail_retained, original_work_device, union_bytes,
                     union_bytes ? generations.next() : 0);
-                known_tail_owner = std::make_shared<strix::HipKnownPrefixWindow>(*known_tail_plan,
+                known_tail_memories.push_back(known_tail_memory);
+                known_tail_owners.push_back(std::make_shared<strix::HipKnownPrefixWindow>(*known_tail_plan,
                     compiled_prefill ? *compiled_prefill : compiled, model,
                     compiled_prefill ? prefill_catalog_config : catalog_config,
                     compiled_prefill ? prefill_resources : resources, known_tail_memory->scratch, known_tail_memory->scope,
                     std::static_pointer_cast<const void>(known_tail_memory),
                     union_bytes ? strix::q51_known_rows::Workspace{known_tail_memory->union_scratch,
-                        std::static_pointer_cast<const void>(known_tail_memory)} : strix::q51_known_rows::Workspace{});
+                        std::static_pointer_cast<const void>(known_tail_memory)} : strix::q51_known_rows::Workspace{}));
             }
         } else {
             known_prefix_memory = std::make_shared<KnownPromptMemory>(*known_prefix_plan, arena_generation,
@@ -2526,11 +2527,11 @@ int STRIX_DECODE_ENTRY(
                 throw std::logic_error("split prefill profile reached a non-tiled known-prefix route");
             known_prefix_backend->set_executor_handoff({&compiled, &resources}, {&*compiled_prefill, &prefill_resources});
         }
-        if (known_tail_owner) {
-            known_tail_backend = std::make_unique<strix::HipKnownPromptBackend>(known_tail_owner, session,
-                known_tail_memory->scratch, model.vocab_size, original_work_device);
+        for (std::size_t t = 0; t < known_tail_owners.size(); ++t) {
+            known_tail_backends.push_back(std::make_unique<strix::HipKnownPromptBackend>(known_tail_owners[t], session,
+                known_tail_memories[t]->scratch, model.vocab_size, original_work_device));
             if (compiled_prefill)
-                known_tail_backend->set_executor_handoff({&compiled, &resources}, {&*compiled_prefill, &prefill_resources});
+                known_tail_backends.back()->set_executor_handoff({&compiled, &resources}, {&*compiled_prefill, &prefill_resources});
         }
         if (strix::decode_cli::prefix_state_cache_requested(options)) {
             if (!known_prefill_plan || !known_prefix_backend)
@@ -2593,8 +2594,9 @@ int STRIX_DECODE_ENTRY(
                 throw std::logic_error("tiled MTP prompt lacks its tiled prefill owners");
             auto& tiled = parents->tiled;
             tiled.blocks = known_prefix_backend.get(); tiled.block_owner = known_prefix_owner;
-            tiled.tail = known_tail_backend.get(); tiled.tail_owner = known_tail_owner;
-            tiled.rows = options.known_prefix_prefill_rows; tiled.tail_rows = options.known_prefix_tail_rows;
+            for (std::size_t t = 0; t < known_tail_backends.size(); ++t)
+                tiled.tails.push_back({known_tail_backends[t].get(), known_tail_owners[t], options.known_prefix_tail_rows[t]});
+            tiled.rows = options.known_prefix_prefill_rows;
             tiled.cache = prefix_state.get();
             tiled.reset_state = [&] {
                 check_hip(hipDeviceSynchronize(), "tiled MTP prompt reset fence");
@@ -3342,7 +3344,7 @@ int STRIX_DECODE_ENTRY(
             paired.all_row_heads = options.teacher_forced_score;
             strix::KnownPromptChunkCursor chunks(paired, *known_prefix_backend,
                 options.teacher_forced_score ? *generation_backend : static_cast<strix::SerialGreedyStepBackend&>(backend));
-            if (known_tail_backend) chunks.set_tail_backend(*known_tail_backend);
+            for (auto& tail : known_tail_backends) chunks.set_tail_backend(*tail);
             // One complete configured window or one unpadded serial suffix row per call.
             while (chunks.advance()) if (prefix_state) prefix_state->after_block(session, prompt);
             const auto& generated = chunks.finish_greedy();
@@ -3454,6 +3456,9 @@ int STRIX_DECODE_ENTRY(
                 generation_request_stop - generation_request_start).count();
         finalize_raw(result.generated_tokens, std::string(stop_reason_name(result.stop_reason)));
 
+        std::string tail_rows_text;
+        for (const auto rows : options.known_prefix_tail_rows)
+            tail_rows_text += (tail_rows_text.empty() ? "" : ",") + std::to_string(rows);
         double elapsed_total = 0.0;
         for (const auto value :
              backend.elapsed_ms()) {
@@ -3783,7 +3788,7 @@ int STRIX_DECODE_ENTRY(
                 << "  \"known_prefix_consumed_prompt_tokens\":" << known_prefix_result->consumed_prompt_tokens << ",\n"
                 << "  \"known_prefix_windows_executed\":" << known_prefix_result->windows_executed << ",\n"
                 << "  \"known_prefix_serial_prompt_steps\":" << known_prefix_result->serial_prompt_steps << ",\n"
-                << "  \"known_prefix_tail_rows\":" << options.known_prefix_tail_rows << ",\n"
+                << "  \"known_prefix_tail_rows\":[" << tail_rows_text << "],\n"
                 << "  \"known_prefix_tail_windows\":" << known_prefix_progress->tail_windows << ",\n"
                 << "  \"known_prefix_window_execution_identity\":" << (known_prefill_plan ? known_prefill_plan->prefill_execution_identity : known_prefix_plan->window_execution_identity) << ",\n"
                 << "  \"known_prefix_window_kernel_plan_identity\":" << (known_prefill_plan ? known_prefill_plan->prefill_kernel_plan_identity : known_prefix_plan->window_kernel_plan_identity) << ",\n"

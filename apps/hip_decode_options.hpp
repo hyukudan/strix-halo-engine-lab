@@ -262,8 +262,8 @@ struct Options {
     bool prompt_lookup_snapshot_explicit = false, prompt_lookup_snapshot_bytes_explicit = false;
     bool device_queue_trace = false;
     std::uint32_t known_prefix_prefill_rows = 0;
-    // Optional smaller tiled block for the remainder after the last complete T-row block.
-    std::uint32_t known_prefix_tail_rows = 0;
+    // Optional smaller tiled blocks (descending) for the remainder after the last complete T-row block.
+    std::vector<std::uint32_t> known_prefix_tail_rows;
     bool known_prefix_prefill_explicit = false;
     std::uint64_t known_prefill_workspace_budget = 0, known_prefill_metadata_budget = 0;
     std::uint64_t known_prefill_uma_budget = 0, known_prefill_host_headroom = 0;
@@ -609,7 +609,7 @@ inline void validate_prefix_state_cache(const Options& o) {
 }
 
 inline void validate_known_prefill_options(const Options& options) {
-    const bool any = options.known_prefix_prefill_explicit || options.known_prefix_prefill_rows || options.known_prefix_tail_rows ||
+    const bool any = options.known_prefix_prefill_explicit || options.known_prefix_prefill_rows || !options.known_prefix_tail_rows.empty() ||
         options.known_prefill_workspace_explicit || options.known_prefill_metadata_explicit ||
         options.known_prefill_uma_explicit || options.known_prefill_headroom_explicit;
     if (!any) return;
@@ -622,7 +622,7 @@ inline void validate_known_prefill_options(const Options& options) {
         throw std::invalid_argument("known prefill requires explicit T16..2048, window, all budgets/headroom and no small-row or lookup selector");
     if (options.known_prefix_output_policy == strix::KnownWindowOutputPolicy::state_only && options.generate_tokens)
         throw std::invalid_argument("tiled state-only prefill cannot generate without a terminal output frontier");
-    if (options.known_prefix_tail_rows && (options.known_prefix_tail_rows >= options.known_prefix_prefill_rows ||
+    if (!options.known_prefix_tail_rows.empty() && (options.known_prefix_tail_rows.front() >= options.known_prefix_prefill_rows ||
         !options.known_prefix_full_rows || options.teacher_forced_score ||
         options.known_prefix_output_policy == strix::KnownWindowOutputPolicy::state_only))
         throw std::invalid_argument("known prefill tail rows require full rows, fewer rows than T, an output head and no teacher forcing");
@@ -1292,12 +1292,18 @@ inline Options parse_options(
             continue;
         }
         if (argument == "--known-prefix-tail-rows") {
-            if (options.known_prefix_tail_rows || index + 1 >= argc)
+            if (!options.known_prefix_tail_rows.empty() || index + 1 >= argc)
                 throw std::invalid_argument("--known-prefix-tail-rows requires one value");
-            const auto rows = parse_u64(argv[++index], "known prefill tail rows");
-            if (rows < 16U || rows > 1024U || rows % 8U)
-                throw std::invalid_argument("known prefill tail rows must be a multiple of 8 from 16 through 1024");
-            options.known_prefix_tail_rows = static_cast<std::uint32_t>(rows);
+            const std::string_view value = argv[++index];
+            for (std::size_t begin = 0; begin <= value.size();) {
+                const auto end = std::min(value.find(',', begin), value.size());
+                const auto rows = parse_u64(value.substr(begin, end - begin), "known prefill tail rows");
+                if (rows < 16U || rows > 1024U || rows % 8U ||
+                    (!options.known_prefix_tail_rows.empty() && rows >= options.known_prefix_tail_rows.back()))
+                    throw std::invalid_argument("known prefill tail rows must be descending multiples of 8 from 16 through 1024");
+                options.known_prefix_tail_rows.push_back(static_cast<std::uint32_t>(rows));
+                begin = end + 1U;
+            }
             continue;
         }
         if (argument == "--known-prefix-prefill-rows" || argument.starts_with("--known-prefix-prefill-rows=")) {

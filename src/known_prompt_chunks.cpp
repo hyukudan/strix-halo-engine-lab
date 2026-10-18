@@ -46,11 +46,12 @@ KnownPromptChunkCursor::KnownPromptChunkCursor(KnownPromptChunkRequest request,
 }
 
 void KnownPromptChunkCursor::set_tail_backend(KnownPromptWindowBackend& tail) {
-    if(tail_ || progress_.consumed_prompt_tokens || progress_.failed || !request_.tiled_prefill || request_.all_row_heads ||
-       !tail.supports_tiled_prefill() || tail.logical_rows()<16U || tail.logical_rows()>=request_.logical_rows ||
+    const auto limit=tails_.empty()?request_.logical_rows:tails_.back()->logical_rows();
+    if(progress_.consumed_prompt_tokens || progress_.failed || !request_.tiled_prefill || request_.all_row_heads ||
+       !tail.supports_tiled_prefill() || tail.logical_rows()<16U || tail.logical_rows()>=limit ||
        tail.output_policy()!=request_.output_policy || request_.output_policy==KnownWindowOutputPolicy::state_only)
         throw std::invalid_argument("known prompt tail backend must be a smaller tiled backend set before the first chunk");
-    tail_=&tail;
+    tails_.push_back(&tail);
 }
 
 bool KnownPromptChunkCursor::advance() {
@@ -63,8 +64,10 @@ bool KnownPromptChunkCursor::advance() {
     bool window=remaining>=request_.logical_rows&&(!state_only||no_output||remaining>request_.logical_rows);
     KnownPromptWindowBackend* backend=&windows_;
     std::uint32_t block=request_.logical_rows;
-    const bool tail=!window&&tail_&&remaining>=tail_->logical_rows();
-    if(tail) {window=true;backend=tail_;block=tail_->logical_rows();}
+    bool tail=false;
+    if(!window) for(auto* candidate:tails_) if(remaining>=candidate->logical_rows()) {
+        tail=window=true;backend=candidate;block=candidate->logical_rows();break;
+    }
     // Tiled prefill: a window with more prompt after it is never read, so it runs without its head.
     // STRIX_PREFILL_HEADLESS=0 keeps the head on every block.
     static const bool allow_headless=[]{const char* v=std::getenv("STRIX_PREFILL_HEADLESS");return !v||v[0]!='0';}();

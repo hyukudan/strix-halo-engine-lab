@@ -40,7 +40,8 @@ struct PrefixStateCacheIdentityInputs {
     std::uint64_t prefill_execution_identity = 0, prefill_kernel_plan_identity = 0;
     std::uint64_t tiled_execution_identity = 0, tiled_kernel_plan_identity = 0;
     std::uint64_t prefill_profile_identity = 0, decode_profile_identity = 0, profile_pair_identity = 0;
-    std::uint32_t block_rows = 0, tail_rows = 0;
+    std::uint32_t block_rows = 0;
+    std::vector<std::uint32_t> tail_rows;
     std::uint64_t context_tokens = 0;
 };
 
@@ -62,8 +63,9 @@ inline ModelContentIdentity prefix_state_cache_identity(const PrefixStateCacheId
              in.decode_kernel_plan_identity, in.prefill_execution_identity, in.prefill_kernel_plan_identity,
              in.tiled_execution_identity, in.tiled_kernel_plan_identity, in.prefill_profile_identity,
              in.decode_profile_identity, in.profile_pair_identity, static_cast<std::uint64_t>(in.block_rows),
-             static_cast<std::uint64_t>(in.tail_rows), in.context_tokens})
+             static_cast<std::uint64_t>(in.tail_rows.size()), in.context_tokens})
         u64(value);
+    for (const auto rows : in.tail_rows) u64(rows);
     return sha256_bytes(frame);
 }
 

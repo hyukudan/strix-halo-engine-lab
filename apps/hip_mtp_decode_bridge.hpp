@@ -62,9 +62,13 @@ struct MtpDecodeTargetParents final {
     struct TiledPrompt {
         HipKnownPromptBackend* blocks = nullptr;
         std::shared_ptr<HipKnownPrefixWindow> block_owner;
-        HipKnownPromptBackend* tail = nullptr;
-        std::shared_ptr<HipKnownPrefixWindow> tail_owner;
-        std::uint32_t rows = 0, tail_rows = 0;
+        struct Tail {
+            HipKnownPromptBackend* backend = nullptr;
+            std::shared_ptr<HipKnownPrefixWindow> owner;
+            std::uint32_t rows = 0;
+        };
+        std::vector<Tail> tails; // descending rows
+        std::uint32_t rows = 0;
         HipPrefixStateCacheSession* cache = nullptr;
         // Fresh target state and session, exactly as after setup (after the calibration replay).
         std::function<void()> reset_state;
@@ -156,7 +160,7 @@ inline HipMtpTargetHiddenTicket run_tiled_mtp_prompt(const Options& options,cons
     for(std::size_t i=1;i<compiled.execution.steps.size();++i)
         if(compiled.execution.steps[i].op==SerialOp::final_hyper_mix && compiled.execution.steps[i-1U].op==SerialOp::mlp_inject) tap=i-1U;
     if(tap==SIZE_MAX)throw std::logic_error("tiled MTP prompt has no wide hidden tap step");
-    const auto max_rows=std::max(tiled.rows,tiled.tail_rows);
+    const auto max_rows=tiled.rows;
     std::byte* block_hidden=nullptr;
     check(hipMalloc(reinterpret_cast<void**>(&block_hidden),static_cast<std::size_t>(mtp_cli_mul(max_rows,width))),"tiled MTP hidden rows");
     struct Free{std::byte* p;~Free(){if(p)(void)hipFree(p);}} free_rows{block_hidden};
@@ -198,7 +202,7 @@ inline HipMtpTargetHiddenTicket run_tiled_mtp_prompt(const Options& options,cons
         owner.set_prefill_step_observer({});
     };
     run(*tiled.blocks,*tiled.block_owner,tiled.rows,true);
-    if(tiled.tail) run(*tiled.tail,*tiled.tail_owner,tiled.tail_rows,false);
+    for(const auto& tail:tiled.tails) run(*tail.backend,*tail.owner,tail.rows,false);
     HipMtpTargetHiddenTicket pending;
     while(pos<n) {
         auto ticket=target.execute_serial(session,resources,dispatcher,tokens[static_cast<std::size_t>(pos)]);
@@ -214,7 +218,9 @@ inline HipMtpTargetHiddenTicket run_tiled_mtp_prompt(const Options& options,cons
         throw std::logic_error("tiled MTP prompt did not reach the final prompt frontier");
     const auto prompt_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count();
     std::ostringstream out;
-    out<<"\"rows\":"<<tiled.rows<<",\"tail_rows\":"<<tiled.tail_rows<<",\"restored_position\":"<<restored
+    out<<"\"rows\":"<<tiled.rows<<",\"tail_rows\":[";
+    for(std::size_t t=0;t<tiled.tails.size();++t)out<<(t?",":"")<<tiled.tails[t].rows;
+    out<<"],\"restored_position\":"<<restored
        <<",\"blocks\":"<<blocks<<",\"tail_blocks\":"<<tail_blocks<<",\"serial_rows\":"<<serial_rows
        <<",\"prompt_ms\":"<<prompt_ms;
     if(tiled.cache) {
@@ -256,7 +262,8 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
     const bool tiled_prompt=parents && parents->tiled.blocks;
     const std::size_t calibration_rows=tiled_prompt ? mtp_calibration_rows(options) : options.tokens.size()-1U;
     if(tiled_prompt && (split || qualify || component_diagnostic || !parents->tiled.block_owner || !parents->tiled.reset_state ||
-       !parents->tiled.rows || (parents->tiled.tail && !parents->tiled.tail_owner)))
+       !parents->tiled.rows || std::any_of(parents->tiled.tails.begin(),parents->tiled.tails.end(),
+           [&](const auto& t){return !t.backend || !t.owner || t.rows>=parents->tiled.rows;})))
         throw std::invalid_argument("tiled MTP prompt requires one numerical profile, its block owners and a state reset");
     if(split!=(parents && parents->prompt.compiled) ||
        (split && (!parents->prompt.dispatcher || parents->prompt.resources.session_state_memory!=parents->resources.session_state_memory)))
@@ -339,7 +346,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
     HipMtpForwardReplayRequest replay_request{policy,hip_mtp_forward_golden_payload_identity(golden),golden.rows.size(),m.replay_host_bytes};
     // Tiled prompt: only the calibration rows and the serial remainder take capture slots.
     const auto retained_rows=static_cast<std::uint32_t>(tiled_prompt
-        ? std::max<std::size_t>({calibration_rows+1U,static_cast<std::size_t>(parents->tiled.tail?parents->tiled.tail_rows:parents->tiled.rows)+1U,
+        ? std::max<std::size_t>({calibration_rows+1U,static_cast<std::size_t>(parents->tiled.tails.empty()?parents->tiled.rows:parents->tiled.tails.back().rows)+1U,
             static_cast<std::size_t>(m.candidate_depth)+3U})
         : std::max<std::size_t>(options.tokens.size(),static_cast<std::size_t>(m.candidate_depth)+3U));
     HipMtpTargetDeferredConfig d1;
