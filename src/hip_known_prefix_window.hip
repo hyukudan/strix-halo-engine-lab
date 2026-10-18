@@ -171,6 +171,7 @@ struct HipKnownPrefixWindow::Impl {
     std::unique_ptr<SharedDetach> shared_detach;
     DeferredMoeFirstError completion_status{};
     bool failed = false;
+    std::uint32_t active_rows = 0; // execute_mtp_captured: rows in the expert union (0 = every row)
     HipKnownPrefixWindow::PrefillStepObserver prefill_observer;
     // Set while a cohort executes this owner's window: its routed union ran on the cohort primary.
     bool cohort_member = false;
@@ -669,7 +670,7 @@ struct HipKnownPrefixWindow::Impl {
             },
             [](std::span<const ExecutionDispatchContext> rows,void* object) {
                 const auto& self=*static_cast<Impl*>(object);
-                moe_experts_known_window_rows_launch(rows,self.routed_config,self.routed_workspace);
+                moe_experts_known_window_rows_launch(rows,self.routed_config,self.routed_workspace,self.active_rows);
             }});
     }
     const HipHyperMixLauncherConfig& hyper_for(std::span<const ExecutionDispatchContext> rows) const {
@@ -877,7 +878,8 @@ struct HipKnownPrefixWindow::Impl {
                 throw std::runtime_error("routed expert union metadata disagrees with its completed prefill");
         } else if(window.routed_expert_union_steps && !cohort_member) {
             const auto& s=pending_union_summary;
-            const auto assignments=window.logical_rows*u32(model.num_experts_per_token);
+            const auto union_rows=active_rows?active_rows:window.logical_rows;
+            const auto assignments=union_rows*u32(model.num_experts_per_token);
             std::uint64_t experts=0,batches=0,batch_assignments=0,unique_row_assignments=0;
             for(std::uint32_t i=0;i<8U;++i) {
                 experts+=s.rows_per_expert_histogram[i];
@@ -887,7 +889,7 @@ struct HipKnownPrefixWindow::Impl {
                 if(i>=window.logical_rows && (s.rows_per_expert_histogram[i] || s.batch_size_histogram[i]))
                     throw std::runtime_error("routed expert union histogram exceeds its admitted row count");
             }
-            if(s.status || s.version!=1U || s.logical_rows!=window.logical_rows || s.assignments!=assignments ||
+            if(s.status || s.version!=1U || s.logical_rows!=union_rows || s.assignments!=assignments ||
                 !s.touched || s.touched>assignments || s.touched>model.num_experts ||
                 s.batches<s.touched || s.batches>assignments || !s.maximum_assignments ||
                 s.maximum_assignments>assignments || s.duplicate_assignments>assignments ||
@@ -1424,8 +1426,16 @@ std::shared_ptr<HipMtpTargetWindowCapture> HipKnownPrefixWindow::prepare_mtp_tar
     return capture;
 }
 HipMtpTargetWindowExecution HipKnownPrefixWindow::execute_mtp_captured(SerialSessionContext& session,std::span<const std::uint32_t> tokens,
-    std::shared_ptr<HipMtpTargetWindowCapture> capture,const std::function<void()>& before_publish){
+    std::shared_ptr<HipMtpTargetWindowCapture> capture,const std::function<void()>& before_publish,std::uint32_t active_rows){
     if(!capture)throw std::invalid_argument("MTP target capture owner is absent");
+    if(active_rows && (active_rows<2U || active_rows>logical_rows() || impl_->prefill))
+        throw std::invalid_argument("known-window active rows must be 2..rows of a closed window");
+    // Only the routed expert union reads it; without a union every row runs its experts (padding cost).
+    struct ActiveRows {
+        std::uint32_t& value;
+        ActiveRows(std::uint32_t& v,std::uint32_t a):value(v){value=a;}
+        ~ActiveRows(){value=0;}
+    } scoped(impl_->active_rows,active_rows==logical_rows()?0U:active_rows);
     HipMtpTargetWindowExecution out;out.execution=impl_->execute(session,tokens,before_publish,capture,&out.batch);return out;
 }
 void HipKnownPrefixWindow::set_prefill_step_observer(PrefillStepObserver observer) {

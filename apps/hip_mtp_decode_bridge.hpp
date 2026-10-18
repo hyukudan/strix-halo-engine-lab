@@ -480,6 +480,8 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
                 draft.base_tokens=HipMtpDraftHead::read_token_file(spec,static_cast<std::uint32_t>(model.vocab_size));
             }
             draft.context_capacity=m.draft_context_vocab;draft.q4=m.draft_q4;
+            // Runner-up probabilities feed the survival controller; STRIX_MTP_DRAFT_TOP2=1 logs them (diagnostic).
+            draft.runner_up=hip_mtp_survival_controller() || std::getenv("STRIX_MTP_DRAFT_TOP2")!=nullptr;
             runtime->enable_draft_chain(std::move(draft),m.draft_exact);runtime->observe_draft_context(options.tokens);
             if(sampler && m.sample_speculation)runtime->set_draft_sampler(sampler);
         };
@@ -631,13 +633,21 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
             <<"  \"mtp_target_window_rows_set\":[";
         if(window){const auto stats=window->owner_stats();for(std::size_t s=1;s<stats.size();++s)output<<(s>1?",":"")<<stats[s].rows;}
         output<<"],\n  \"mtp_spec_min_p\":"<<mtp_draft_min_probability(m)<<",\n"
+            <<"  \"mtp_window_controller\":\""<<(window && window->survival_controller()?"survival-v1":"min-p")<<"\",\n"
+            <<"  \"mtp_window_option_ms_ema\":[";
+        if(window){const auto stats=window->option_stats();
+            for(std::size_t s=0;s<stats.size();++s)output<<(s?",":"")<<"{\"rows\":"<<stats[s].rows<<",\"active\":"<<stats[s].active
+                <<",\"samples\":"<<stats[s].samples<<",\"ema_ms\":"<<stats[s].ms_ema<<"}";}
+        output<<"],\n"
             <<"  \"mtp_chosen_window_rows_histogram\":{";
         for(std::size_t t=0,first=1;t<chosen_rows.size();++t)if(chosen_rows[t]){output<<(first?"":",")<<"\""<<t<<"\":"<<chosen_rows[t];first=0;}
         output<<"},\n  \"mtp_chosen_window_rows_scope\":\"verifier-choice-per-cycle-1-is-serial-target-steps\",\n"
             <<"  \"mtp_window_owner_cycle_ms_ema\":{";
         if(window){const auto stats=window->owner_stats();
-            for(std::size_t s=0;s<stats.size();++s)output<<(s?",":"")<<"\""<<stats[s].rows<<"\":{\"cycles\":"<<stats[s].cycles<<",\"ema_ms\":"<<stats[s].cycle_ms_ema<<"}";}
+            for(std::size_t s=0;s<stats.size();++s)output<<(s?",":"")<<"\""<<stats[s].rows<<"\":{\"cycles\":"<<stats[s].cycles<<",\"ema_ms\":"<<stats[s].cycle_ms_ema
+                <<",\"probes\":"<<stats[s].probes<<"}";}
         output<<"},\n"
+            <<"  \"mtp_window_cost_model\":\""<<(window && !window->robust_cost_model()?"legacy-ema":"robust-median-reprobe-v1")<<"\",\n"
             <<"  \"mtp_draft_chain\":"<<(m.draft_chain?"true":"false")<<",\n"
             <<"  \"mtp_draft_exact_kernels\":"<<(m.draft_exact?"true":"false")<<",\n"
             <<"  \"mtp_draft_q4_head\":"<<(m.draft_q4?"true":"false")<<",\n"

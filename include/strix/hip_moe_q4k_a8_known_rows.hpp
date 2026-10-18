@@ -39,7 +39,9 @@ struct PrologueRows {
 // sequence). A concurrent CTA builds the stable CSR from the routes alone; on
 // an invalid route it writes the fail-closed summary instead. Quantizer
 // failures are only in row status: consumers must check status as well.
-void enqueue_prologue(const Request&, const PrologueRows&, unsigned rows, unsigned clear_words, hipStream_t);
+// active (0 = rows): only the first active rows enter the expert union (CSR); the rest are still cleared,
+// route-checked and quantized.
+void enqueue_prologue(const Request&, const PrologueRows&, unsigned rows, unsigned clear_words, hipStream_t, unsigned active = 0);
 // Window-owned rows: route weights and the per-row FP32 region zeroed by the
 // prologue. down_type 7/8 selects the A8 profile (Q5_1/Q8_0 A8G32 down) and
 // then needs each row's serial down image (codes/deltas/sums) and raw slot dots.
@@ -60,8 +62,9 @@ struct WindowRows {
 // activation quantizer, then the shared integer down writes each row's raw
 // slot dots exactly as down_activation_quantize/down_rawdots would; the
 // caller merges and commits.
+// active (0 = every row): the expert union covers the first active rows only.
 void enqueue_window(const Request&, std::span<const Bindings>,
-    const q51_known_rows::Workspace&, const WindowRows&, hipStream_t);
+    const q51_known_rows::Workspace&, const WindowRows&, hipStream_t, unsigned active = 0);
 
 // Known-prompt prefill over T rows (multiple of 8, A8 profile only). Every per-row
 // view is row 0 plus r times its own byte stride (the prefill arena stripes rows).

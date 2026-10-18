@@ -1361,7 +1361,7 @@ Prepared prepare(const Request& request,std::span<const Bindings> rows,const q51
 }
 } // namespace
 void enqueue_window(const Request& request,std::span<const Bindings> rows,const q51_known_rows::Workspace& workspace,
-    const WindowRows& window,hipStream_t stream) {
+    const WindowRows& window,hipStream_t stream,unsigned active) {
     auto p=prepare(request,rows,workspace,stream);
     const DeviceBytes csr{workspace.memory.arena_base,workspace.memory.arena_bytes};
     const bool a8=window.down_type!=0U,q5k=request.gate_type==13U;
@@ -1411,7 +1411,7 @@ void enqueue_window(const Request& request,std::span<const Bindings> rows,const 
             throw std::invalid_argument("A8 window down weights/geometry are invalid");
     }
     v.csr={p.csr.summary,p.csr.offsets,p.csr.touched,p.csr.rows,p.csr.slots,p.csr.experts,p.csr.begins};
-    enqueue_prologue(request,v,count,static_cast<unsigned>(window.clear[0].bytes/4U),stream);
+    enqueue_prologue(request,v,count,static_cast<unsigned>(window.clear[0].bytes/4U),stream,active);
     const auto* gate=reinterpret_cast<const unsigned char*>(rows.front().gate.address);
     const auto* up=reinterpret_cast<const unsigned char*>(rows.front().up.address);
     const dim3 project_grid(request.shape.rows/32U,count*request.shape.top_k);

@@ -3,6 +3,7 @@
 #include "strix/mtp_sidecar_binding.hpp"
 #include "strix/hip_mtp_window_verifier.hpp"
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
@@ -37,7 +38,7 @@ struct HipMtpGreedyRuntime::Impl {
     float min_probability=0.0F;
     // The drafts of the cycle in progress (between begin_cycle_draft and finish_cycle).
     std::vector<std::uint32_t> candidates;
-    std::vector<float> probabilities;
+    std::vector<float> probabilities,runner_ups;
     Impl(std::shared_ptr<HipMtpRuntime> m,QualifiedMtpDraftPlan q,ActivatedMtpDraftPlan a,
          std::shared_ptr<HipMtpTargetHidden> t,SerialSessionContext& s,const ExecutionRuntimeResources& r,
          DirectLaunchDispatcher& d,std::shared_ptr<const void> o)
@@ -144,14 +145,28 @@ std::uint32_t HipMtpGreedyRuntime::begin_cycle_draft(const HipMtpTargetHiddenTic
         host_phase_mark("1 begin cycle");
         // STRIX_MTP_DRAFT_WORTH=0: draft until min_probability only, without asking the window cost model.
         static const bool worth=[]{const char* v=std::getenv("STRIX_MTP_DRAFT_WORTH");return !v || v[0]!='0';}();
-        const std::function<bool(std::span<const float>)> keep=worth && cost_model && i.window?
-            std::function<bool(std::span<const float>)>([&](std::span<const float> p){return i.window->worth_drafting(p);}):
+        // The survival controller owns the chain cut (no min-p stop) and sees runner-up probabilities.
+        // STRIX_MTP_DIAG_FULL_CHAIN=1 drafts the full depth without any cut.
+        const bool full_chain=hip_mtp_full_chain_diagnostic();
+        const bool survival=cost_model && i.window && i.window->survival_controller() && !full_chain;
+        // Without a min-p cut (and without the survival controller) the chain runs sync-free: no keep test.
+        const std::function<bool(std::span<const float>)> keep=((worth && i.min_probability>0.0F) || survival) && cost_model && i.window && !full_chain?
+            std::function<bool(std::span<const float>)>([&](std::span<const float> p){
+                return i.window->worth_drafting(p,i.mtp->draft_runner_up_probabilities());}):
             std::function<bool(std::span<const float>)>{};
         const auto sampler=i.target->token_sampler();
         require(!sampler || !depth || i.mtp->draft_head(),"MTP speculative sampling requires the draft chain");
-        i.candidates=i.mtp->draft_head()?i.mtp->propose_chain(i.plan,i.activation,*i.session,i.draft,depth,i.min_probability,keep):
+        const auto chain_start=std::chrono::steady_clock::now();
+        i.candidates=i.mtp->draft_head()?i.mtp->propose_chain(i.plan,i.activation,*i.session,i.draft,depth,
+                full_chain || survival?0.0F:i.min_probability,keep):
             i.backend->propose_candidates(*i.session,i.draft,depth);
-        if(i.mtp->draft_head()){const auto p=i.mtp->draft_probabilities();i.probabilities.assign(p.begin(),p.end());}
+        if(survival) i.window->note_draft(static_cast<std::uint32_t>(i.candidates.size()),
+            std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-chain_start).count());
+        i.runner_ups.clear();
+        if(i.mtp->draft_head()){
+            const auto p=i.mtp->draft_probabilities();i.probabilities.assign(p.begin(),p.end());
+            const auto q=i.mtp->draft_runner_up_probabilities();i.runner_ups.assign(q.begin(),q.end());
+        }
         host_phase_mark("2 draft chain");
         finish_draft_proposal(i.draft);
         host_phase_mark("3 finish proposal");
@@ -223,7 +238,8 @@ HipMtpGreedyCycleResult HipMtpGreedyRuntime::cycle(const HipMtpTargetHiddenTicke
         try {
             verified=i.window->verify(*i.session,*i.dispatcher,initial,i.candidates,budget,eos,
                 i.mtp->draft_head()?std::span<const float>(i.probabilities):std::span<const float>{},
-                i.target->token_sampler()?i.mtp->sampled_drafts():std::span<const TokenDraft>{});
+                i.target->token_sampler()?i.mtp->sampled_drafts():std::span<const TokenDraft>{},
+                i.mtp->draft_head()?std::span<const float>(i.runner_ups):std::span<const float>{});
         } catch(...) {fail_cycle();throw;}
         return finish_cycle(initial,std::move(verified),budget,eos);
     }

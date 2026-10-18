@@ -11,14 +11,17 @@
 #include <stdexcept>
 #include <span>
 #include <string>
+#include <string_view>
 
 namespace strix {
 namespace {
 constexpr unsigned threads=256;
 constexpr std::uint32_t max_slots=16;
 // sum: sum of exp(logit - value) over the finite rows of the partial (softmax denominator at its max).
-struct Partial {float value;std::uint32_t token,bad,valid;float sum;};
-struct Reply {std::uint32_t tokens[max_slots];std::uint32_t status;float probabilities[max_slots];std::uint32_t completed;};
+// second: the largest finite logit after the selected row (-inf when none; runner-up kernels only).
+struct Partial {float value;std::uint32_t token,bad,valid;float sum,second;};
+struct Reply {std::uint32_t tokens[max_slots];std::uint32_t status;float probabilities[max_slots];std::uint32_t completed;
+    float runner_up[max_slots];};
 void require(bool ok,const char* message) {if(!ok) throw std::invalid_argument(message);}
 void check(hipError_t e,const char* message) {if(e!=hipSuccess) throw std::runtime_error(std::string(message)+": "+hipGetErrorString(e));}
 // Same monotone key and lowest-token tie rule as the full greedy selector.
@@ -41,6 +44,14 @@ __device__ Partial choose(Partial a,const Partial b) {
     if(b.valid && (!a.valid || numeric_key(b.value)>numeric_key(a.value) ||
         (numeric_key(b.value)==numeric_key(a.value) && b.token<a.token))) a=b;
     a.bad=bad;return a;
+}
+// choose() that also keeps the runner-up value: the other partial's best and both seconds compete.
+// Partials cover disjoint rows, so a valid winner's token tells which side it came from.
+__device__ Partial choose_second(Partial a,const Partial b) {
+    const auto best=choose(a,b);
+    const float loser=a.valid && b.valid?(best.token==a.token?b.value:a.value):-INFINITY;
+    const float second=fmaxf(fmaxf(a.second,b.second),loser);
+    a=best;a.second=second;return a;
 }
 __global__ __launch_bounds__(threads) void draft_gather_rows(const std::uint8_t* head,const std::uint32_t* ids,
     std::uint32_t first,std::uint32_t count,std::uint32_t row_bytes,std::uint8_t* compact) {
@@ -92,36 +103,36 @@ __global__ __launch_bounds__(256) void draft_q4_head(const std::uint16_t* hidden
     for(unsigned d=16;d;d>>=1U) sum+=__shfl_xor(sum,static_cast<int>(d),32);
     if(!lane) logits[row]=sum;
 }
-__global__ __launch_bounds__(threads) void draft_argmax_partials(const float* logits,const std::uint32_t* ids,
+template<bool Second> __global__ __launch_bounds__(threads) void draft_argmax_partials(const float* logits,const std::uint32_t* ids,
     std::uint32_t rows,Partial* partials) {
     __shared__ Partial values[threads];
     const auto lane=static_cast<unsigned>(threadIdx.x);
     const auto index=static_cast<std::uint64_t>(blockIdx.x)*threads+lane;
     __shared__ float sums[threads];
-    Partial value{0.0F,0,0,0,0.0F};
+    Partial value{0.0F,0,0,0,0.0F,-INFINITY};
     if(index<rows) {
         value.value=logits[index];value.token=ids?ids[index]:static_cast<std::uint32_t>(index);
         value.bad=(__float_as_uint(value.value)&0x7f800000U)==0x7f800000U?1U:0U;value.valid=value.bad==0?1U:0U;
     }
     values[lane]=value;__syncthreads();
     for(unsigned stride=threads/2;stride;stride>>=1U) {
-        if(lane<stride) values[lane]=choose(values[lane],values[lane+stride]);
+        if(lane<stride) values[lane]=Second?choose_second(values[lane],values[lane+stride]):choose(values[lane],values[lane+stride]);
         __syncthreads();
     }
     auto best=values[0];
     best.sum=block_sum(sums,value.valid && best.valid?expf(value.value-best.value):0.0F);
     if(!lane) partials[blockIdx.x]=best;
 }
-__global__ __launch_bounds__(threads) void draft_argmax_finish(const Partial* partials,std::uint32_t count,
+template<bool Second> __global__ __launch_bounds__(threads) void draft_argmax_finish(const Partial* partials,std::uint32_t count,
     std::uint32_t step,std::uint32_t* slots,Reply* reply) {
     __shared__ Partial values[threads];
     const auto lane=static_cast<unsigned>(threadIdx.x);
     __shared__ float sums[threads];
-    Partial value{0.0F,0,0,0,0.0F};
-    for(std::uint32_t i=lane;i<count;i+=threads) value=choose(value,partials[i]);
+    Partial value{0.0F,0,0,0,0.0F,-INFINITY};
+    for(std::uint32_t i=lane;i<count;i+=threads) value=Second?choose_second(value,partials[i]):choose(value,partials[i]);
     values[lane]=value;__syncthreads();
     for(unsigned stride=threads/2;stride;stride>>=1U) {
-        if(lane<stride) values[lane]=choose(values[lane],values[lane+stride]);
+        if(lane<stride) values[lane]=Second?choose_second(values[lane],values[lane+stride]):choose(values[lane],values[lane+stride]);
         __syncthreads();
     }
     const auto best=values[0];
@@ -135,6 +146,7 @@ __global__ __launch_bounds__(threads) void draft_argmax_finish(const Partial* pa
         // A failed row still feeds a valid id forward; the chain reader rejects it.
         const auto token=failed?0U:best.token;
         slots[step]=token;reply->tokens[step]=token;reply->probabilities[step]=failed?0.0F:1.0F/sum;
+        if constexpr(Second) reply->runner_up[step]=failed?0.0F:expf(best.second-best.value)/sum;
         if(failed) reply->status|=failed<<(2U*step);
         // Host pollers read the fields above once they observe this count (wait_step).
         __threadfence_system();
@@ -244,9 +256,15 @@ void HipMtpDraftHead::launch(const std::uint16_t* hidden,std::uint32_t step,void
             hipMemcpyDeviceToHost,p.stream),"MTP draft runner-up logits copy");
     }
     const auto blocks=(p.rows-1U)/threads+1U;
-    hipLaunchKernelGGL(draft_argmax_partials,dim3(blocks),dim3(threads),0,p.stream,p.logits,p.ids,p.rows,p.partials);
-    check(hipGetLastError(),"MTP draft argmax partials");
-    hipLaunchKernelGGL(draft_argmax_finish,dim3(1),dim3(threads),0,p.stream,p.partials,blocks,step,p.slots,p.device_reply);
+    if(p.config.runner_up) {
+        hipLaunchKernelGGL(draft_argmax_partials<true>,dim3(blocks),dim3(threads),0,p.stream,p.logits,p.ids,p.rows,p.partials);
+        check(hipGetLastError(),"MTP draft argmax partials");
+        hipLaunchKernelGGL(draft_argmax_finish<true>,dim3(1),dim3(threads),0,p.stream,p.partials,blocks,step,p.slots,p.device_reply);
+    } else {
+        hipLaunchKernelGGL(draft_argmax_partials<false>,dim3(blocks),dim3(threads),0,p.stream,p.logits,p.ids,p.rows,p.partials);
+        check(hipGetLastError(),"MTP draft argmax partials");
+        hipLaunchKernelGGL(draft_argmax_finish<false>,dim3(1),dim3(threads),0,p.stream,p.partials,blocks,step,p.slots,p.device_reply);
+    }
     check(hipGetLastError(),"MTP draft argmax finish");
 }
 const std::uint32_t* HipMtpDraftHead::device_token(std::uint32_t step) const {
@@ -311,6 +329,11 @@ bool HipMtpDraftHead::runner_up(std::uint32_t step,std::uint32_t& token,float& p
     double sum=0.0;for(std::uint32_t r=0;r<rows;++r) if(std::isfinite(l[r])) sum+=std::exp(static_cast<double>(l[r])-l[first]);
     token=id(second);probability=static_cast<float>(std::exp(static_cast<double>(l[second])-l[first])/sum);return true;
 }
+float HipMtpDraftHead::runner_up_probability(std::uint32_t step) const {
+    const auto& p=*impl_;require(step<p.config.max_depth,"MTP draft runner-up step is invalid");
+    if(!p.config.runner_up) return 0.0F;
+    const volatile float* mapped=p.reply->runner_up;return mapped[step];
+}
 bool HipMtpDraftHead::full() const noexcept {return impl_->config.full;}
 HipMtpDraftHeadStats HipMtpDraftHead::stats() const noexcept {
     const auto& p=*impl_;return {p.rows,p.base_rows,p.context_rows,p.context_dropped};
@@ -340,7 +363,18 @@ std::string HipMtpDraftHead::resolve_vocabulary_spec(const std::string& spec,std
     if(spec.rfind("auto:",0)!=0) return spec;
     const auto dir=spec.substr(5);
     require(!dir.empty(),"MTP draft vocabulary auto: needs a directory");
-    const auto core=dir+"/core32k.bin";
+    // STRIX_MTP_DRAFT_VOCAB=2 (vocabulary policy 2): a language pack comes from pack2-<lang>.bin (ranked against
+    // core32k, so no row repeats the core; zh holds 32k rows), and a prompt without a pack gets core64k (the rows a
+    // pack would have used go to English/code). The language is still chosen with the pack-<lang>16k.bin files.
+    // STRIX_MTP_DRAFT_CORE=48k|64k|... forces the core (core<N>.bin, a prefix of the same ranking) in both cases.
+    static const bool policy2=[]{const char* v=std::getenv("STRIX_MTP_DRAFT_VOCAB");return v && std::string_view(v)=="2";}();
+    static const std::string forced=[]{const char* v=std::getenv("STRIX_MTP_DRAFT_CORE");return std::string(v && *v?v:"");}();
+    require(forced.find('/')==std::string::npos,"STRIX_MTP_DRAFT_CORE names a core size, not a path");
+    const auto core_file=[&](const std::string& size) {
+        const auto path=dir+"/core"+size+".bin";
+        require(std::ifstream(path,std::ios::binary).good(),"MTP draft vocabulary core file is missing from the auto: directory");
+        return path;
+    };
     static constexpr const char* languages[]={"de","es","fr","it","pt","ru","ja","zh"};
     std::string best;std::uint64_t best_count=0;
     for(const auto* language:languages) {
@@ -352,8 +386,18 @@ std::string HipMtpDraftHead::resolve_vocabulary_spec(const std::string& spec,std
         for(const auto token:prompt) if(token<vocabulary&&member[token]) ++count;
         if(count>best_count) {best_count=count;best=language;}
     }
-    if(best.empty()||best_count<2U||best_count*20U<prompt.size()) {chosen="core32k";return core;}
-    chosen="core32k+"+best+"16k ("+std::to_string(best_count)+" prompt tokens)";
+    if(best.empty()||best_count<2U||best_count*20U<prompt.size()) {
+        const auto size=!forced.empty()?forced:policy2?std::string("64k"):std::string("32k");
+        chosen="core"+size;return core_file(size);
+    }
+    const auto size=forced.empty()?std::string("32k"):forced;
+    const auto core=core_file(size);
+    const auto pack2=dir+"/pack2-"+best+".bin";
+    if(policy2 && std::ifstream(pack2,std::ios::binary)) {
+        chosen="core"+size+"+"+best+" pack2 ("+std::to_string(best_count)+" prompt tokens)";
+        return core+","+pack2;
+    }
+    chosen="core"+size+"+"+best+"16k ("+std::to_string(best_count)+" prompt tokens)";
     return core+","+dir+"/pack-"+best+"16k.bin";
 }
 std::vector<std::uint32_t> HipMtpDraftHead::read_token_file(const std::string& paths,std::uint32_t vocabulary) {
