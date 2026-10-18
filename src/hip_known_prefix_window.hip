@@ -364,10 +364,82 @@ struct HipKnownPrefixWindow::Impl {
             d.pending[layer] = 1U;
             return true;
         }
-        if (step.op == SerialOp::moe_combine && shared_detach && shared_detach->pending[layer]) {
-            auto& d = *shared_detach;
-            check(hipStreamWaitEvent(scope.stream, d.joined[layer + d.parity * d.pending.size()], 0), "join known-window shared stream");
-            d.pending[layer] = 0U;
+        if (step.op == SerialOp::moe_combine) join_shared(layer);
+        return false;
+    }
+    // The owner's stream waits for the layer's detached shared expert (at its MoE combine, or before the
+    // routed commit when the combine is folded into it).
+    void join_shared(std::uint32_t layer) {
+        if (!shared_detach || !shared_detach->pending[layer]) return;
+        auto& d = *shared_detach;
+        check(hipStreamWaitEvent(scope.stream, d.joined[layer + d.parity * d.pending.size()], 0), "join known-window shared stream");
+        d.pending[layer] = 0U;
+    }
+    // Window HC folds (each opt-in; see hyper_mix_known_window_rows_launch_folded):
+    // STRIX_WINDOW_INJECT_NORM=1: an inject rows step followed by its HC rows step runs as inject+norm, split-K,
+    //   output; STRIX_WINDOW_COMBINE_INJECT=1: a MoE-combine rows step, the MLP inject and the next HC rows step
+    //   run as combine+inject+norm, split-K, output. The folded steps are recorded as completed without a launch.
+    static bool env_on(const char* name) { const char* v = std::getenv(name); return v && v[0] == '1'; }
+    static bool inject_norm_enabled() { static const bool on = env_on("STRIX_WINDOW_INJECT_NORM"); return on; }
+    static bool combine_inject_enabled() { static const bool on = env_on("STRIX_WINDOW_COMBINE_INJECT"); return on; }
+    static bool commit_combine_enabled() { static const bool on = env_on("STRIX_WINDOW_COMMIT_COMBINE"); return on; }
+    std::vector<std::size_t> folded_steps;
+    bool hc_rows_step(std::size_t i) const {
+        const auto op = serial.execution.steps[i].op;
+        const auto v = window.r2_variant[i];
+        return (op == SerialOp::attn_hyper_mix || op == SerialOp::mlp_hyper_mix || op == SerialOp::final_hyper_mix) &&
+            (v == KnownWindowR2Variant::hyper_mix_rows2_v1 || v == KnownWindowR2Variant::hyper_mix_rows4_v1 ||
+             v == KnownWindowR2Variant::hyper_mix_rows8_v1);
+    }
+    bool inject_rows_step(std::size_t i) const {
+        const auto op = serial.execution.steps[i].op;
+        return (op == SerialOp::attn_inject || op == SerialOp::mlp_inject) && window.r2_variant[i] == KnownWindowR2Variant::inject_rows_v1;
+    }
+    bool fold_window_steps(std::size_t i, const std::vector<std::vector<ExecutionDispatchContext>>& contexts) {
+        if (!folded_steps.empty() && folded_steps.front() == i) { folded_steps.erase(folded_steps.begin()); return true; }
+        if (!folded_steps.empty()) throw std::logic_error("known-window folded step was not reached in order");
+        const auto steps = serial.execution.steps.size();
+        const auto same_rows = [&](std::size_t a, std::size_t b) { return contexts[a].size() == contexts[b].size(); };
+        // STRIX_WINDOW_COMMIT_COMBINE=1: the routed rows step and the MoE combine after it; the shared stream is
+        // joined just before the commit.
+        if (commit_combine_enabled() && serial.execution.steps[i].op == SerialOp::moe_experts && i + 1U < steps &&
+            serial.execution.steps[i + 1U].op == SerialOp::moe_combine &&
+            window.r2_variant[i + 1U] == KnownWindowR2Variant::moe_combine_rows_v1 && same_rows(i, i + 1U) &&
+            serial.execution.steps[i].layer && (window.r2_variant[i] == KnownWindowR2Variant::routed_a8_union_rows2_v1 ||
+             window.r2_variant[i] == KnownWindowR2Variant::routed_a8_union_rows4_v1 ||
+             window.r2_variant[i] == KnownWindowR2Variant::routed_a8_union_rows8_v1 ||
+             window.r2_variant[i] == KnownWindowR2Variant::routed_q51_union_rows2_v1 ||
+             window.r2_variant[i] == KnownWindowR2Variant::routed_q51_union_rows4_v1 ||
+             window.r2_variant[i] == KnownWindowR2Variant::routed_q51_union_rows8_v1)) {
+            const auto combine = moe_combine_known_window_rows_views(contexts[i + 1U], elementwise_config);
+            const auto n = contexts[i].size();
+            const auto layer = *serial.execution.steps[i].layer;
+            if (elementwise_config.activation == HipActivationStorage::bf16 &&
+                moe_experts_known_window_rows_launch_combined(contexts[i], routed_config, routed_workspace,
+                    std::span<const void* const>(combine.first, n), std::span<const void* const>(combine.second, n),
+                    std::span<void* const>(combine.output, n), [&, layer] { join_shared(layer); }, active_rows)) {
+                folded_steps = {i + 1U};
+                return true;
+            }
+        }
+        if (combine_inject_enabled() && serial.execution.steps[i].op == SerialOp::moe_combine &&
+            window.r2_variant[i] == KnownWindowR2Variant::moe_combine_rows_v1 && i + 2U < steps &&
+            inject_rows_step(i + 1U) && hc_rows_step(i + 2U) && same_rows(i, i + 1U) && same_rows(i, i + 2U)) {
+            const auto combine = moe_combine_known_window_rows_views(contexts[i], elementwise_config);
+            const auto inject = inject_known_window_rows_views(contexts[i + 1U], elementwise_config);
+            if (hyper_mix_known_window_rows_launch_folded(&combine, inject, contexts[i + 2U], hyper_for(contexts[i + 2U]),
+                    elementwise_config)) {
+                folded_steps = {i + 1U, i + 2U};
+                return true;
+            }
+        }
+        if (inject_norm_enabled() && inject_rows_step(i) && i + 1U < steps && hc_rows_step(i + 1U) && same_rows(i, i + 1U)) {
+            const auto inject = inject_known_window_rows_views(contexts[i], elementwise_config);
+            if (hyper_mix_known_window_rows_launch_folded(nullptr, inject, contexts[i + 1U], hyper_for(contexts[i + 1U]),
+                    elementwise_config)) {
+                folded_steps = {i + 1U};
+                return true;
+            }
         }
         return false;
     }
@@ -1348,12 +1420,17 @@ struct HipKnownPrefixWindow::Impl {
             };
             hooks.position_reader_implementations = position_readers;
             hooks.record_actual_window_lineage=static_cast<bool>(capture);
-            fused_hc_step=SIZE_MAX;
-            const bool detach=!prefill && shared_detach_enabled(), fuse_hc=!prefill && hc_inject_fusion_enabled();
-            if(detach || fuse_hc)
-                hooks.before_step=[&,detach,fuse_hc](std::size_t i,const std::vector<std::vector<ExecutionDispatchContext>>& contexts) {
+            fused_hc_step=SIZE_MAX;folded_steps.clear();
+            const bool detach=!prefill && shared_detach_enabled(), fuse_hc=!prefill && hc_inject_fusion_enabled(),
+                fold=!prefill && (inject_norm_enabled() || combine_inject_enabled() || commit_combine_enabled());
+            if(detach || fuse_hc || fold)
+                hooks.before_step=[&,detach,fuse_hc,fold](std::size_t i,const std::vector<std::vector<ExecutionDispatchContext>>& contexts) {
+                    // Folded steps first; the shared-expert join (at the MoE combine) precedes a fold started there.
+                    // A window fold that already took an inject step leaves nothing for the persistent HC fusion.
+                    if(fold && !folded_steps.empty() && folded_steps.front()==i) return fold_window_steps(i,contexts);
                     if(fuse_hc && fuse_hc_inject(i,contexts)) return true;
-                    return detach && detach_shared(i,contexts);
+                    if(detach && detach_shared(i,contexts)) return true;
+                    return fold && fold_window_steps(i,contexts);
                 };
             hooks.skip_head=skip_head;
             hooks.preflight_memo=&preflight_memo;hooks.recipe_memo=&recipe_memo;hooks.preflight_slots=&preflight_slots;

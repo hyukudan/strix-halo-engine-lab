@@ -1719,6 +1719,68 @@ __global__ void rows_prepare_hyper_norm_kernel(Rows rows, const void* norm, std:
             load_norm_weight(norm, norm_type, stream * hidden + feature);
 }
 
+// Window rows: the inject step (and, with Combine, the MoE combine before it) folded into the HC
+// normalisation that reads its streams. With the combine one block per row, 256 threads per stream: stream 0's threads first
+// compute the combined hidden row (stored as the combine launch would; the arena may place it in place of
+// its shared input, which only these threads read), then every stream computes its injected slice (stored
+// in the activation format, as the inject launch would: it is this step's input) and normalises the stored
+// values with rows_prepare_hyper_norm_kernel's leaves, tree and product.
+struct InjectNormRows {
+    const void* hyper[kWindowRows];   // inject: current streams
+    const void* hidden[kWindowRows];  // inject: hidden row (combine: shared expert output)
+    const void* routed[kWindowRows];  // combine: routed experts output
+    const float* gates[kWindowRows];  // inject: per-stream gates
+    void* combined[kWindowRows];      // combine: output row
+};
+constexpr std::uint32_t kInjectNormHidden = 2560U, kInjectNormStreams = 4U;
+// Without the combine, block (stream, row) does one stream (the normalisation kernel's grid).
+template <typename Storage, bool Combine>
+__global__ __launch_bounds__(kThreads * kInjectNormStreams) void rows_inject_hyper_norm_kernel(HyperRows rows, InjectNormRows in,
+    const void* norm, std::uint32_t norm_type, float epsilon) {
+    constexpr std::uint32_t hidden = kInjectNormHidden;
+    const auto row = Combine ? blockIdx.x : blockIdx.y, stream = Combine ? threadIdx.x / kThreads : blockIdx.x;
+    const auto lane = threadIdx.x % kThreads, slot = Combine ? stream : 0U;
+    auto* streams = static_cast<Storage*>(const_cast<void*>(rows.input[row]));
+    auto* normalized = rows.normalized[row];
+    const auto* hyper = static_cast<const Storage*>(in.hyper[row]);
+    const float gate = in.gates[row][stream];
+    const auto base = static_cast<std::uint64_t>(stream) * hidden;
+    __shared__ float reduction[Combine ? kInjectNormStreams : 1U][kThreads];
+    __shared__ float inverse[Combine ? kInjectNormStreams : 1U];
+    __shared__ float combined[Combine ? hidden : 1U];
+    if constexpr (Combine) {
+        if (stream == 0U)
+            for (std::uint32_t feature = lane; feature < hidden; feature += kThreads) {
+                Storage value;
+                store_activation(&value, load_activation(static_cast<const Storage*>(in.hidden[row]), feature) +
+                    load_activation(static_cast<const Storage*>(in.routed[row]), feature));
+                combined[feature] = load_activation(&value, 0U);
+                static_cast<Storage*>(in.combined[row])[feature] = value;
+            }
+        __syncthreads();
+    }
+    float sum = 0.0F;
+    for (std::uint32_t feature = lane; feature < hidden; feature += kThreads) {
+        const float h = Combine ? combined[Combine ? feature : 0U] : load_activation(static_cast<const Storage*>(in.hidden[row]), feature);
+        Storage stored;
+        store_activation(&stored, load_activation(hyper, base + feature) + h * gate);
+        streams[base + feature] = stored;
+        const float value = load_activation(&stored, 0U);
+        sum += value * value;
+    }
+    reduction[slot][lane] = sum;
+    __syncthreads();
+    for (std::uint32_t stride = kThreads / 2U; stride > 0; stride >>= 1U) {
+        if (lane < stride) reduction[slot][lane] += reduction[slot][lane + stride];
+        __syncthreads();
+    }
+    if (lane == 0) inverse[slot] = rsqrtf(reduction[slot][0] / static_cast<float>(hidden) + epsilon);
+    __syncthreads();
+    for (std::uint32_t feature = lane; feature < hidden; feature += kThreads)
+        normalized[base + feature] = load_activation(streams, base + feature) * inverse[slot] *
+            load_norm_weight(norm, norm_type, stream * hidden + feature);
+}
+
 // Wave w lanes 0..7 own row w and lanes 8..15 row w+4 (output lane%8): each row's
 // ascending v8 chain runs on its own SIMD, reading one broadcast value row.
 __device__ __forceinline__ std::uint32_t rows_chain_row(std::uint32_t lane) {
@@ -3963,7 +4025,7 @@ bool persistent_hyper_rows_eligible(const PreparedHyperRows& prepared, const Hip
 
 template <class Rows>
 void launch_hyper_rows(const PreparedHyperRows& prepared, const Rows& rows, const HipHyperMixLauncherConfig& config,
-    std::uint32_t tiles) {
+    std::uint32_t tiles, bool normalized_ready = false) {
     const auto& p = prepared.first;
     const auto count = prepared.count;
     if constexpr (std::is_same_v<Rows, HyperRows>) {
@@ -3989,9 +4051,9 @@ void launch_hyper_rows(const PreparedHyperRows& prepared, const Rows& rows, cons
     const auto invoke = [&]<typename Storage>() {
         // STRIX_HC_ROWS_FUSED_NORM=1: the split-K projection also builds the normalisation.
         static const bool fused_norm = std::getenv("STRIX_HC_ROWS_FUSED_NORM") != nullptr;
-        const bool fused = fused_norm && config.splitk_projection && config.hc_count <= 8U && config.hidden_size % 4U == 0U &&
-            count * config.hc_count <= 64U;
-        if (!fused) {
+        const bool fused = !normalized_ready && fused_norm && config.splitk_projection && config.hc_count <= 8U &&
+            config.hidden_size % 4U == 0U && count * config.hc_count <= 64U;
+        if (!fused && !normalized_ready) {
             hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_prepare_hyper_norm_kernel<Storage, Rows>), dim3(config.hc_count, count, tiles),
                 dim3(kThreads), 0, hip_execution_stream(), rows, reinterpret_cast<const void*>(p.norm_runtime->address),
                 p.norm_manifest->ggml_type, config.hidden_size, config.rms_epsilon);
@@ -4109,7 +4171,7 @@ bool hyper_mix_known_window_rows_launch_injected(std::span<const ExecutionDispat
     for (std::uint32_t t = 0; t < count; ++t) {
         // The mix reads exactly the streams the inject writes.
         if (views.output[t] != r.input[t]) return persistent_decline("the HC step does not read the injected streams");
-        injected.hyper[t] = views.hyper[t]; injected.hidden[t] = views.hidden[t]; injected.weights[t] = views.weights[t];
+        injected.hyper[t] = views.first[t]; injected.hidden[t] = views.second[t]; injected.weights[t] = views.weights[t];
     }
     // Before the first grid barrier, block (row, stream) writes its slice of the injected streams and of the
     // normalised row while other blocks still read their inject inputs: no written stream may reach any
@@ -4121,13 +4183,13 @@ bool hyper_mix_known_window_rows_launch_injected(std::span<const ExecutionDispat
         const Extent written[] = {{at(r.input[t]), at(r.input[t]) + kPersistWidth * value},
             {at(r.normalized[t]), at(r.normalized[t]) + kPersistWidth * sizeof(float)}};
         for (std::uint32_t o = 0; o < count; ++o) {
-            const Extent hyper{at(views.hyper[o]), at(views.hyper[o]) + kPersistWidth * value};
-            const Extent read[] = {{at(views.hidden[o]), at(views.hidden[o]) + kPersistHidden * value},
+            const Extent hyper{at(views.first[o]), at(views.first[o]) + kPersistWidth * value};
+            const Extent read[] = {{at(views.second[o]), at(views.second[o]) + kPersistHidden * value},
                 {at(views.weights[o]), at(views.weights[o]) + kPersistStreams * sizeof(float)}};
             for (std::size_t w = 0; w < 2U; ++w) {
                 bool alias = false;
                 for (const auto& x : read) alias = alias || overlap(written[w], x);
-                alias = alias || (overlap(written[w], hyper) && !(w == 0U && o == t && views.hyper[t] == r.input[t]));
+                alias = alias || (overlap(written[w], hyper) && !(w == 0U && o == t && views.first[t] == r.input[t]));
                 if (alias && w == 0U) return persistent_decline("streams alias an inject input");
                 private_workspace = private_workspace || alias;
             }
@@ -4160,6 +4222,122 @@ void hyper_mix_known_window_rows_launch(std::span<const ExecutionDispatchContext
     const auto prepared = prepare_hyper_rows(rows, config);
     launch_hyper_rows(prepared, prepared.rows, config, 1U);
 }
+
+namespace {
+std::atomic<std::uint64_t> folded_launches{0};
+// Owner-held HC workspace per stream for folded launches whose arena workspace aliases a folded input.
+float* folded_hc_workspace(hipStream_t stream, std::uint64_t bytes) {
+    struct Buffer { void* memory = nullptr; std::uint64_t bytes = 0; };
+    static std::mutex mutex;
+    static std::map<hipStream_t, Buffer> buffers;
+    const std::lock_guard lock(mutex);
+    auto& b = buffers[stream];
+    if (b.bytes < bytes) {
+        // Launches on this stream are ordered: the previous buffer is only freed after the stream drains it.
+        if (b.memory) { check_hip(hipStreamSynchronize(stream), "drain folded HC workspace"); check_hip(hipFree(b.memory), "free folded HC workspace"); }
+        check_hip(hipMalloc(&b.memory, bytes), "folded HC workspace allocation");
+        b.bytes = bytes;
+    }
+    return static_cast<float*>(b.memory);
+}
+bool folded_decline(const char* why) {
+    if (std::getenv("STRIX_WINDOW_FOLD_VERBOSE")) std::fprintf(stderr, "window HC fold declined: %s\n", why);
+    return false;
+}
+} // namespace
+
+bool hyper_mix_known_window_rows_launch_folded(const ElementwiseRowsViews* combine, const ElementwiseRowsViews& inject,
+    std::span<const ExecutionDispatchContext> rows, const HipHyperMixLauncherConfig& config,
+    const HipElementwiseLauncherConfig& elementwise) {
+    const auto prepared = prepare_hyper_rows(rows, config);
+    const auto count = prepared.count;
+    const auto& r = prepared.rows;
+    if (inject.count != count || (combine && combine->count != count)) return folded_decline("row counts differ");
+    if (elementwise.activation != config.activation || elementwise.hidden_size != config.hidden_size ||
+        elementwise.hc_count != config.hc_count || config.hidden_size != kInjectNormHidden || config.hc_count != kInjectNormStreams)
+        return folded_decline("elementwise and HC configurations differ from the folded shape");
+    const std::uint64_t value = config.activation == HipActivationStorage::bf16 ? 2U : 4U;
+    const std::uint64_t hidden = config.hidden_size, width = hidden * config.hc_count;
+    const auto at = [](const void* pointer) { return reinterpret_cast<std::uintptr_t>(pointer); };
+    struct Extent { std::uintptr_t low, high; };
+    const auto extent = [&](const void* pointer, std::uint64_t bytes) { return Extent{at(pointer), at(pointer) + bytes}; };
+    const auto overlap = [](Extent a, Extent b) { return a.low < b.high && b.low < a.high; };
+    InjectNormRows in{};
+    for (std::uint32_t t = 0; t < count; ++t) {
+        // The HC step reads exactly the streams the inject writes; the inject reads the combine's output.
+        if (inject.output[t] != r.input[t]) return folded_decline("the HC step does not read the injected streams");
+        if (combine && combine->output[t] != inject.second[t]) return folded_decline("the inject does not read the combined row");
+        in.hyper[t] = inject.first[t];
+        in.hidden[t] = combine ? combine->first[t] : inject.second[t];
+        in.routed[t] = combine ? combine->second[t] : nullptr;
+        in.gates[t] = inject.weights[t];
+        in.combined[t] = combine ? combine->output[t] : nullptr;
+    }
+    // Blocks of every row run at once: no written view may reach a view another block still reads (a row's
+    // own streams updated in place excepted). An aliased HC workspace (dead after the step) moves to an
+    // owner-held buffer; any other alias declines the fold.
+    bool private_workspace = false;
+    for (std::uint32_t t = 0; t < count; ++t) {
+        const Extent streams = extent(r.input[t], width * value), workspace = extent(r.normalized[t], (width + config.lowrank) * 4U);
+        const Extent combined = combine ? extent(in.combined[t], hidden * value) : Extent{0U, 0U};
+        for (std::uint32_t o = 0; o < count; ++o) {
+            const Extent reads[] = {extent(in.hidden[o], hidden * value), in.routed[o] ? extent(in.routed[o], hidden * value) : Extent{0U, 0U},
+                extent(in.gates[o], config.hc_count * 4ULL)};
+            const Extent hyper = extent(in.hyper[o], width * value);
+            for (std::size_t k = 0; k < 3U; ++k) {
+                const auto& x = reads[k];
+                // With the combine, a row's shared and routed inputs are read (by stream 0) before the block
+                // barrier that precedes every stream store of that row.
+                if (overlap(streams, x) && !(combine && o == t && k < 2U)) {
+                    if (std::getenv("STRIX_WINDOW_FOLD_VERBOSE"))
+                        std::fprintf(stderr, "window HC fold: streams of row %u [%#lx, %#lx) overlap input %zu of row %u [%#lx, %#lx)\n",
+                            t, static_cast<unsigned long>(streams.low), static_cast<unsigned long>(streams.high), k, o,
+                            static_cast<unsigned long>(x.low), static_cast<unsigned long>(x.high));
+                    return folded_decline("streams alias a folded input");
+                }
+                // The combined row may replace its own row's shared or routed input exactly: only that row's
+                // stream-0 threads read them, each element before it is written.
+                if (overlap(combined, x) && !(o == t && k < 2U && x.low == combined.low && x.high == combined.high))
+                    return folded_decline("the combined row aliases a folded input");
+                private_workspace = private_workspace || overlap(workspace, x);
+            }
+            if (overlap(streams, hyper) && !(o == t && in.hyper[t] == r.input[t])) return folded_decline("streams alias another row's streams");
+            if (overlap(combined, hyper)) return folded_decline("the combined row aliases the streams");
+            private_workspace = private_workspace || overlap(workspace, hyper);
+            if (o != t && combine && overlap(combined, extent(in.combined[o], hidden * value)))
+                return folded_decline("combined rows overlap");
+            // A row's combined row is stored before its streams, as the combine launch precedes the inject.
+            if (combine && o != t && overlap(combined, extent(r.input[o], width * value)))
+                return folded_decline("combined row aliases another row's streams");
+        }
+    }
+    auto used = r;
+    if (private_workspace) {
+        auto* workspace = folded_hc_workspace(hip_execution_stream(), kWindowRows * (width + config.lowrank) * sizeof(float));
+        for (std::uint32_t t = 0; t < count; ++t) {
+            used.normalized[t] = workspace + t * (width + config.lowrank);
+            used.low[t] = used.normalized[t] + width;
+        }
+    }
+    const auto& p = prepared.first;
+    const auto launch = [&]<typename Storage>() {
+        if (combine)
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_inject_hyper_norm_kernel<Storage, true>), dim3(count), dim3(kThreads * kInjectNormStreams), 0,
+                hip_execution_stream(), used, in, reinterpret_cast<const void*>(p.norm_runtime->address), p.norm_manifest->ggml_type,
+                config.rms_epsilon);
+        else
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_inject_hyper_norm_kernel<Storage, false>), dim3(kInjectNormStreams, count), dim3(kThreads), 0,
+                hip_execution_stream(), used, in, reinterpret_cast<const void*>(p.norm_runtime->address), p.norm_manifest->ggml_type,
+                config.rms_epsilon);
+        check_hip(hipGetLastError(), "known-window folded inject + HC normalisation launch");
+    };
+    if (config.activation == HipActivationStorage::bf16) launch.template operator()<std::uint16_t>();
+    else launch.template operator()<float>();
+    launch_hyper_rows(prepared, used, config, 1U, true);
+    folded_launches.fetch_add(1U, std::memory_order_relaxed);
+    return true;
+}
+std::uint64_t hip_hyper_mix_testing_folded_launches() { return folded_launches.load(); }
 
 namespace {
 // All T rows of a prefill step as T/8 tiles of one launch. Each tile is admitted like an

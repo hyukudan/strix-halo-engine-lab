@@ -36,6 +36,7 @@
 #include <memory>
 #include <span>
 #include <stdexcept>
+#include <tuple>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -1520,6 +1521,144 @@ void family_hyper_rows(SerialOp op, bool splitk, bool lane, std::uint32_t count)
     reject([&] { hyper_mix_known_window_rows_preflight(f.rows, fp64); }, "FP64 HC oracle was admitted as a window entry");
 }
 
+// Folded window HC steps in the real window arena: the inject rows step (and, with `combine`, the MoE-combine
+// rows step before it) folded into the HC rows step equals the separate rows launches over the whole arena;
+// only the HC workspace (dead after its step) may differ, as the fold moves it when the arena aliases it.
+// Returns false when the fold declined (nothing enqueued).
+bool family_window_fold(SerialOp inject_op, std::uint32_t inject_layer, bool combine, std::uint32_t count) {
+    Owner owner;
+    const auto model = ModelContract::qwen38_flash_next();
+    const auto execution = build_serial_decode_execution_plan(model);
+    const auto io = build_serial_execution_io_plan(execution, true);
+    const auto inject_step = std::find_if(execution.steps.begin(), execution.steps.end(),
+        [&](const auto& s) { return s.op == inject_op && s.layer == inject_layer; });
+    require(inject_step != execution.steps.begin() && inject_step + 1 != execution.steps.end(), "inject step missing");
+    const auto mix_step = *(inject_step + 1);
+    const auto combine_step = *(inject_step - 1);
+    require(!combine || combine_step.op == SerialOp::moe_combine, "MLP inject is not preceded by its MoE combine");
+    const bool final_mix = mix_step.op == SerialOp::final_hyper_mix;
+    require(mix_step.op == SerialOp::attn_hyper_mix || mix_step.op == SerialOp::mlp_hyper_mix || final_mix,
+        "inject step is not followed by an HC step");
+    ExecutionBufferRequest request; request.parallel_moe_router = true;
+    const auto serial = build_serial_execution_arena_plan(model, request, execution, io, 256U);
+    const auto window = build_known_window_arena(serial, 256U, count);
+    const auto scratch = owner.allocate(window.physical.total_bytes);
+    const ExecutionMemoryBinding memory{0x4b4e4f574e464c01ULL + count, scratch.address, scratch.bytes, 41U};
+    ModelManifest manifest; manifest.architecture = "qwen4_exp";
+    ModelRuntimeBinding runtime;
+    ExecutionTensorAccessPlan access;
+    std::vector<Weight> weights;
+    const auto add = [&](std::string name, std::uint32_t type, std::vector<std::uint64_t> dimensions, std::vector<unsigned char> bytes) {
+        ManifestTensor tensor;
+        tensor.name = final_mix ? std::move(name) : "blk." + std::to_string(*mix_step.layer) + "." + name;
+        tensor.role = TensorRole::dense_projection; tensor.layer = mix_step.layer; tensor.ggml_type = type;
+        tensor.dimensions = std::move(dimensions); tensor.byte_size = bytes.size();
+        tensor.absolute_offset = (manifest.total_tensor_bytes + 15U) / 16U * 16U;
+        manifest.total_tensor_bytes = tensor.absolute_offset + tensor.byte_size;
+        const auto device = owner.allocate(bytes.size());
+        write(device, bytes);
+        const auto index = static_cast<std::uint32_t>(weights.size());
+        weights.push_back({device, std::move(bytes)});
+        manifest.tensors.push_back(std::move(tensor));
+        runtime.tensors.push_back({index, RuntimeTensorStorage::resident, device.address, device.bytes, 7U, 0U});
+    };
+    add("hc_norm.weight", 0U, {10240}, f32(10240U, 1.0F, 0.04F));
+    add("hc_down.weight", 8U, {10240, 320}, q8(10240, 320, 23U));
+    add("hc_up.weight", 8U, {320, 10240}, q8(320, 10240, 19U));
+    if (!final_mix) add("hc_inject.weight", 0U, {10240, 4}, f32(40960U, 0.0004F, 0.0002F));
+    for (std::uint32_t slot = 0; slot < weights.size(); ++slot) access.accesses.push_back({mix_step.id, mix_step.op, slot, {slot}});
+    manifest.layout_identity = model_manifest_layout_identity(manifest);
+    runtime.manifest_layout_identity = manifest.layout_identity;
+    runtime.model_content_identity.bytes[0] = 1U;
+    access.manifest_layout_identity = manifest.layout_identity;
+    access.plan_identity = 0x4b4e4f574e464c02ULL;
+    const ExecutionRuntimeResources resources{&memory, &manifest, &runtime, &access};
+    HipHyperMixLauncherConfig config;
+    config.hidden_size = 2560U; config.hc_count = 4U; config.lowrank = 320U; config.rms_epsilon = model.rms_norm_epsilon;
+    config.parallel = config.staged_projections = config.fused_injection = config.typed_projection = true;
+    config.prefetch_rows = config.prefetch_q8_output = true;
+    config.lane_chain_output = true; config.splitk_projection = true;
+    ExecutionBindingRequest binding; binding.lane_chain_hyper_output = true;
+    kernels::KernelRegistry registry;
+    register_hip_hyper_mix_kernel_variant(model, binding, config, registry);
+    require(registry.variants().size() == 1U, "HC serial selection is ambiguous");
+    const auto mix_id = registry.variants().front().id;
+    HipElementwiseLauncherConfig elementwise{2560U, 4U, HipActivationStorage::bf16};
+    const auto inject_launcher = make_hip_inject_launcher("hip.inject.test", &elementwise);
+    const auto combine_launcher = make_hip_moe_combine_launcher("hip.moe_combine.test", &elementwise);
+    const auto contexts = [&](const ExecutionStep& s, std::string_view id) {
+        std::vector<ExecutionDispatchContext> out(count);
+        for (std::uint32_t r = 0; r < count; ++r) {
+            auto& c = out[r];
+            c.execution_identity = memory.execution_identity; c.step_id = s.id; c.op = s.op; c.layer = s.layer;
+            c.kernel_id = id; c.reads = io.steps[s.id].reads; c.writes = io.steps[s.id].writes;
+            c.temporaries = io.steps[s.id].temporaries; c.arena = &window.row_view[r]; c.memory = &memory;
+            c.resources = &resources; c.reads_state = s.reads_state; c.writes_state = s.writes_state;
+            c.position = 5U + r; c.input_token_id = 40U + r;
+        }
+        return out;
+    };
+    const auto combine_rows = contexts(combine_step, combine_launcher.key);
+    const auto inject_rows = contexts(*inject_step, inject_launcher.key);
+    const auto mix_rows = contexts(mix_step, mix_id);
+    // Finite BF16 everywhere, then FP32 injection gates per row.
+    std::vector<unsigned char> seed(static_cast<std::size_t>(scratch.bytes));
+    std::uint32_t state = 0x2545f491U ^ count ^ (static_cast<std::uint32_t>(inject_op) << 8U) ^ (combine ? 0x10000U : 0U);
+    for (std::size_t i = 0; i + 1U < seed.size(); i += 2U) {
+        state = state * 1664525U + 1013904223U;
+        const auto value = bf16(static_cast<float>(static_cast<int>(state >> 20U) - 2048) * 0.0007F);
+        std::memcpy(seed.data() + i, &value, sizeof(value));
+    }
+    for (std::uint32_t r = 0; r < count; ++r) {
+        const auto gates = resolve_dispatch_read(inject_rows[r], 2);
+        const float values[4] = {0.75F + 0.01F * static_cast<float>(r), 1.25F, -0.5F, 1.0F / 3.0F};
+        std::memcpy(seed.data() + (gates.address - scratch.address), values, sizeof(values));
+    }
+    HipLaunchContext scope; scope.stream = owner.stream;
+    const auto run = [&](auto&& work) {
+        write(scratch, seed);
+        { const HipLaunchScope owned(scope); work(); }
+        owner.finish();
+        for (const auto& weight : weights) require(read(weight.device) == weight.original, "folded HC rows changed weights");
+        return read(scratch);
+    };
+    const auto reference = run([&] {
+        if (combine) moe_combine_known_window_rows_launch(combine_rows, elementwise);
+        inject_known_window_rows_launch(inject_rows, elementwise);
+        hyper_mix_known_window_rows_launch(mix_rows, config);
+    });
+    require(reference != seed, "separate rows launches wrote nothing");
+    const auto folded = [&] {
+        const auto combine_views = combine ? moe_combine_known_window_rows_views(combine_rows, elementwise) : ElementwiseRowsViews{};
+        return hyper_mix_known_window_rows_launch_folded(combine ? &combine_views : nullptr,
+            inject_known_window_rows_views(inject_rows, elementwise), mix_rows, config, elementwise);
+    };
+    bool launched = false;
+    auto candidate = run([&] { launched = folded(); });
+    if (!launched) require(candidate == seed, "declined folded HC rows enqueued work");
+    if (!launched && !combine) return false;
+    // A declined combine fold falls back, as in the window executor, to the combine launch and the inject fold.
+    if (!launched && combine) {
+        candidate = run([&] {
+            moe_combine_known_window_rows_launch(combine_rows, elementwise);
+            launched = hyper_mix_known_window_rows_launch_folded(nullptr, inject_known_window_rows_views(inject_rows, elementwise),
+                mix_rows, config, elementwise);
+        });
+        require(launched, "the inject fold after a declined combine fold was declined");
+        launched = false;
+    }
+    const auto masked = [&](std::vector<unsigned char> arena) {
+        for (const auto& row : mix_rows) {
+            const auto view = resolve_dispatch_temporary(row, 0);
+            const auto offset = static_cast<std::ptrdiff_t>(view.address - scratch.address);
+            std::copy_n(seed.begin() + offset, static_cast<std::size_t>(view.bytes), arena.begin() + offset);
+        }
+        return arena;
+    };
+    require(masked(candidate) == masked(reference), "folded HC rows differ from the separate rows launches");
+    if (launched) require(run([&] { (void)folded(); }) == candidate, "folded HC rows are not deterministic");
+    return launched;
+}
 // An inject rows step and the HC rows step that reads its streams, in the real window arena: the
 // persistent launch with the inject folded in equals the two launches byte for byte over the arena.
 // Returns false when the folded launch declined the pair (nothing enqueued).
@@ -2022,6 +2161,25 @@ void rows_bench() {
 int main(int argc, char** argv) try {
     if (std::getenv("STRIX_QSA_LONG_BENCH")) { bench_qsa_long_context(); return 0; }
     if (argc > 1 && std::string_view(argv[1]) == "--rows-bench") { rows_bench(); return 0; }
+    if (argc > 1 && std::string_view(argv[1]) == "--window-folds") {
+        // attn inject -> MLP mix, MLP inject -> next attention mix (layer 2: PLE follows layer 0's MLP inject),
+        // last MLP inject -> final mix; with combine, the MoE combine before each MLP inject as well.
+        const auto last = static_cast<std::uint32_t>(ModelContract::qwen38_flash_next().hidden_layers - 1U);
+        std::uint32_t folded = 0, cases = 0;
+        for (const auto& [op, layer, combine] : {std::tuple{SerialOp::attn_inject, 0U, false},
+                 std::tuple{SerialOp::mlp_inject, 2U, false}, std::tuple{SerialOp::mlp_inject, last, false},
+                 std::tuple{SerialOp::mlp_inject, 2U, true}, std::tuple{SerialOp::mlp_inject, last, true}})
+            for (std::uint32_t rows : {2U, 4U, 8U}) {
+                const bool f = family_window_fold(op, layer, combine, rows);
+                require(f || combine, "a window inject fold fixture case was declined");
+                folded += f ? 1U : 0U; ++cases;
+            }
+        std::cout << "window HC folds: " << folded << " of " << cases << " cases folded (declined combine folds checked through their fallback), all equal the separate launches\n";
+        // Inject folds always apply here; a combine fold declines when another row's streams overlap a row's
+        // shared-expert output (the fallback is checked above).
+        require(folded >= 9U, "a window inject fold fixture case was declined");
+        return 0;
+    }
     // HC rows only (the persistent ctest runs this with STRIX_HC_PERSISTENT=1 and requires its launches).
     if (argc > 1 && std::string_view(argv[1]) == "--hc-rows") {
         std::uint32_t cases = 0;
