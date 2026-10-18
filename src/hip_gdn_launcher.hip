@@ -2328,6 +2328,24 @@ void gdn_window_norm_kernel(GdnWindowRows<Rows> rows, const void* norm_weights, 
     const float gate_value = 1.0F / (1.0F + expf(-rows.z[row][index]));
     core[index] = value * inv * load_small(norm_weights, norm_kind, lane) * gate_value;
 }
+// Dense A8: gdn_window_norm_kernel whose waves also quantize the 32-feature block of the out
+// projection's input they just wrote (separate kernel so the default one compiles as before).
+template <unsigned Rows>
+__global__ __launch_bounds__(kRecurrentThreads)
+void gdn_window_norm_dense_a8_kernel(GdnWindowRows<Rows> rows, const void* norm_weights, SmallWeightKind norm_kind,
+    std::uint32_t head_dim, float epsilon, std::int8_t* a8_codes, float* a8_deltas, std::uint32_t a8_width) {
+    __shared__ float scratch[kRecurrentThreads];
+    const auto lane = static_cast<std::uint32_t>(threadIdx.x), row = static_cast<std::uint32_t>(blockIdx.y);
+    const auto index = static_cast<std::uint64_t>(blockIdx.x) * head_dim + lane;
+    float* core = rows.core[row];
+    const float value = core[index];
+    const float inv = rsqrtf(gdn_window_sum128(scratch, lane, value * value) / static_cast<float>(head_dim) + epsilon);
+    const float gate_value = 1.0F / (1.0F + expf(-rows.z[row][index]));
+    const float result = value * inv * load_small(norm_weights, norm_kind, lane) * gate_value;
+    core[index] = result;
+    q8_rows::dense_a8_quantize_lane(result, a8_codes + static_cast<std::uint64_t>(row) * a8_width + index,
+        a8_deltas + (index / 32U) * q8_rows::kDenseA8Rows + row);
+}
 // Batched F32 beta/alpha projections: per row the legacy 256-leaf chain and tree.
 template <unsigned Rows>
 __global__ __launch_bounds__(kProjectionThreads)
@@ -4849,7 +4867,17 @@ void enqueue_gdn_window(const GdnWindowLayer& layer, std::span<const GdnWindowRo
         hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_window_recurrent_kernel<Rows, GdnRecurrentStorage::key_value>), tiles,
             dim3(32), 0, stream, rows, layer.matrix, saved, control, shape.key_heads, shape.head_dim);
     check_hip(hipGetLastError(), "GDN window recurrence launch");
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_window_norm_kernel<Rows>), dim3(shape.value_heads, Rows),
+    // Dense A8: the gated norm (one wave per 32 features) also quantizes the out projection's
+    // rows into a scratch slot, so the projection needs no quantizer launch.
+    const bool dense = config.dense_a8_projections;
+    if (dense && (shape.head_dim != kRecurrentThreads || shape.head_dim % 32U))
+        throw std::invalid_argument("GDN window dense A8 norm quantizer requires one 128-feature head per block");
+    const auto slot = dense ? q8_rows::dense_a8_slot(0U) : q8_rows::DenseA8Slot{};
+    if (dense)
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_window_norm_dense_a8_kernel<Rows>), dim3(shape.value_heads, Rows),
+            dim3(kRecurrentThreads), 0, stream, rows, layer.norm, small_weight_kind(layer.norm_type), shape.head_dim,
+            config.model.rms_norm_epsilon, slot.codes, slot.deltas, shape.value_width);
+    else hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_window_norm_kernel<Rows>), dim3(shape.value_heads, Rows),
         dim3(kRecurrentThreads), 0, stream, rows, layer.norm, small_weight_kind(layer.norm_type), shape.head_dim,
         config.model.rms_norm_epsilon);
     check_hip(hipGetLastError(), "GDN window gated RMSNorm launch");
@@ -4857,7 +4885,8 @@ void enqueue_gdn_window(const GdnWindowLayer& layer, std::span<const GdnWindowRo
     out.segments = q8_rows::segments({{layer.out, shape.hidden}});
     out.width = shape.value_width; out.outputs = shape.hidden;
     for (unsigned r = 0; r < Rows; ++r) { out.input[r] = rows.core[r]; out.output[r] = static_cast<std::uint16_t*>(input[r].output); }
-    q8_rows::launch(out, config.dense_a8_projections, stream);
+    if (dense) q8_rows::launch_dense_a8_quantized(out, slot, stream);
+    else q8_rows::launch(out, false, stream);
     check_hip(hipGetLastError(), "GDN window Q8 output projection launch");
 }
 } // namespace

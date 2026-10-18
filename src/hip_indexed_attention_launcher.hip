@@ -3590,6 +3590,20 @@ __global__ void attention_output_rows_kernel(QsaRowsAttentionViews<Rows> views, 
     attention_output_body(views.q_gate[r], kv_state, views.selected[r], views.scores[r], views.count[r],
         maximum_selected, attention_heads, kv_heads, head_dim, views.output[r], GraphSelectionArguments{});
 }
+// Dense A8 (block = one head, thread = feature, every lane present): attention_output_rows_kernel
+// whose waves also quantize the 32 features they just wrote for the o projection (separate
+// kernel so the default one compiles as before).
+template <unsigned Rows>
+__global__ void attention_output_rows_dense_a8_kernel(QsaRowsAttentionViews<Rows> views, const std::uint16_t* kv_state,
+    std::uint32_t maximum_selected, std::uint32_t attention_heads, std::uint32_t kv_heads, std::uint32_t head_dim,
+    std::int8_t* a8_codes, float* a8_deltas) {
+    const auto r = blockIdx.y;
+    attention_output_body(views.q_gate[r], kv_state, views.selected[r], views.scores[r], views.count[r],
+        maximum_selected, attention_heads, kv_heads, head_dim, views.output[r], GraphSelectionArguments{});
+    const auto index = static_cast<std::uint64_t>(blockIdx.x) * head_dim + threadIdx.x;
+    q8_rows::dense_a8_quantize_lane(views.output[r][index], a8_codes + r * static_cast<std::uint64_t>(attention_heads) * head_dim + index,
+        a8_deltas + (index / 32U) * q8_rows::kDenseA8Rows + r);
+}
 
 
 // Prefill groups (Rows > 8): the G query heads that share a KV head read the same K / V
@@ -3955,6 +3969,7 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
     const std::array<float* WorkspacePointers::*, 5> targets{&WorkspacePointers::index_query, &WorkspacePointers::current_index_key,
         &WorkspacePointers::q_gate, &WorkspacePointers::current_k, &WorkspacePointers::current_v};
     std::array<bool, 5> done{};
+    q8_rows::DenseA8Slot output_slot{};
     // Any-order (STRIX_ANYORDER=0 disables): input groups after the first read the same rows and write other
     // targets; the q and k norms follow a barrier-ordered index norm and touch only their own.
     static const bool any_order = strix_any_order_enabled();
@@ -4125,6 +4140,12 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
     hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_softmax_rows_kernel<Rows>), dim3(a.attention_heads, Rows), dim3(kThreads), 0,
         stream, attention, maximum_selected);
     check_hip(hipGetLastError(), "QSA known-window softmax launch");
+    // Dense A8 window with the output projection in this call: the value/gate kernel writes its codes.
+    if constexpr (Rows <= 8U) if (config.dense_a8_projections && (parts & 4U) && tensors.out.manifest->ggml_type == 8U) {
+        if (a.head_dim % 32U || a.head_dim > 1024U || a.attention_width != a.attention_heads * a.head_dim)
+            throw std::invalid_argument("QSA rows dense A8 value/gate quantizer requires whole 32-feature head blocks");
+        output_slot = q8_rows::dense_a8_slot(0U);
+    }
     if (grouped) {
         if constexpr (Rows > 8U) {
             const auto output = [&]<unsigned G>() {
@@ -4139,7 +4160,11 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
             default: output.template operator()<6U>(); break;
             }
         }
-    } else hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_output_rows_kernel<Rows>), dim3(a.attention_heads, Rows), dim3(a.head_dim), 0,
+    } else if (output_slot.codes)
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_output_rows_dense_a8_kernel<Rows>), dim3(a.attention_heads, Rows),
+            dim3(a.head_dim), 0, stream, attention, kv, maximum_selected, a.attention_heads, a.kv_heads, a.head_dim,
+            output_slot.codes, output_slot.deltas);
+    else hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_output_rows_kernel<Rows>), dim3(a.attention_heads, Rows), dim3(a.head_dim), 0,
         stream, attention, kv, maximum_selected, a.attention_heads, a.kv_heads, a.head_dim);
     check_hip(hipGetLastError(), "QSA known-window value/gate launch");
     }
@@ -4149,6 +4174,15 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
     for (unsigned r = 0; r < Rows; ++r) {
         out.input[r] = prepared.row[r].workspace.attention_output;
         out.output[r] = reinterpret_cast<std::uint16_t*>(prepared.row[r].output.address);
+    }
+    if constexpr (Rows <= 8U) if (output_slot.codes) {
+        QsaOutputRowsSite<Rows> site{};
+        site.segments = q8_rows::segments({{reinterpret_cast<const void*>(tensors.out.runtime->address), a.hidden}});
+        for (unsigned r = 0; r < Rows; ++r) { site.input[r] = out.input[r]; site.output[r] = out.output[r]; }
+        site.width = a.attention_width; site.outputs = a.hidden;
+        q8_rows::launch_dense_a8_quantized(site, output_slot, stream);
+        check_hip(hipGetLastError(), "QSA known-window dense A8 output projection launch");
+        return;
     }
     dispatch_weight_kind(tensors.out.manifest->ggml_type, [&](auto kind) {
         launch_qsa_rows_output<decltype(kind)::value, Rows>(config.wave8_q8_output, config.dense_a8_projections, out,

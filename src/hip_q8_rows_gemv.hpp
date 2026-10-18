@@ -882,6 +882,22 @@ __global__ __launch_bounds__(kThreads) void dense_a8_quantize_kernel(Site site, 
     if (!(g & 3U)) deltas[(g / 4U) * kDenseA8Rows + r] = delta;
 }
 
+// Producer-side quantizer: the 32 lanes of a full wave hold one block's activations (lane =
+// feature). Same values as dense_a8_quantize8; `code` and `delta` point at the slot entries of
+// this lane's feature and of the block (only lane 0 writes the delta).
+__device__ __forceinline__ void dense_a8_quantize_lane(float x, std::int8_t* code, float* delta) {
+#pragma clang fp contract(off)
+    const bool bad = __ballot(!isfinite(x)) != 0;
+    float amax = fabsf(x);
+#pragma unroll
+    for (int d = 16; d != 0; d /= 2) amax = fmaxf(amax, __shfl_xor(amax, d, 32));
+    const bool tiny = amax > 0.0F && amax < 0x1p-119F;
+    const float scale = bad ? __uint_as_float(kDenseA8CanonicalNan) : amax == 0.0F || tiny ? 1.0F : __fdiv_rn(amax, 127.0F);
+    const float rounded = bad || tiny ? 0.0F : rintf(__fdiv_rn(x, scale));
+    *code = static_cast<std::int8_t>(static_cast<int>(fminf(127.0F, fmaxf(-127.0F, rounded))));
+    if ((threadIdx.x & 31U) == 0U) *delta = scale;
+}
+
 struct __attribute__((aligned(4))) DenseA8Dword4 { unsigned x, y, z, w; };
 // Nine dwords from the block's dword-aligned start: an even block starts at its scale and
 // its codes sit two bytes in; an odd block starts two bytes before its scale (the previous
@@ -914,9 +930,10 @@ __device__ __forceinline__ void wave_lds_order() {
 // ascending order. Weights stream two superchunks ahead through the wave's whole sequence
 // of (output group, superchunk) steps.
 //
-// Staged (small rows x width): a persistent grid; each block quantizes the rows into LDS
-// once (codes [row][feature], deltas [block * Rows + row]) and its waves loop over output
-// groups. Otherwise the rows come pre-quantized from the scratch slot (one group per wave).
+// The grid is persistent (no more blocks than are resident, waves loop over output groups),
+// so a kernel queued after it without a barrier can start alongside it. Staged (small rows x
+// width): each block quantizes the rows into LDS once (codes [row][feature], deltas
+// [block * Rows + row]); otherwise the rows come pre-quantized from the scratch slot.
 template <class Site> constexpr unsigned dense_a8_outs_of() {
     if constexpr (requires { Site::dense_a8_outs; }) return Site::dense_a8_outs;
     else return Site::rows <= 2U ? 1U : 2U;
@@ -931,7 +948,7 @@ __global__ __launch_bounds__(kThreads) void project_rows_dense_a8_kernel(Site si
     const unsigned lane = threadIdx.x & 31U, wave = threadIdx.x / 32U;
     const std::uint32_t width = site.width, blocks = width / 32U, supers = (blocks + 31U) / 32U;
     const std::uint32_t groups = (site.outputs + Outs - 1U) / Outs, first = blockIdx.x * kWaves + wave;
-    const std::uint32_t step = Staged ? gridDim.x * kWaves : groups;
+    const std::uint32_t step = gridDim.x * kWaves;
     const std::uint32_t steps = first < groups ? (groups - first + step - 1U) / step * supers : 0U;
     // Block 32s + l has the parity of l: byte selectors and scale half of the nine dwords.
     const unsigned odd = lane & 1U, select = odd ? 0x07060504U : 0x05040302U, shift = odd ? 16U : 0U;
@@ -1178,7 +1195,9 @@ template <class Site> void launch_dense_a8(const Site& site, hipStream_t stream,
     if constexpr (Site::rows <= 8U) {
         constexpr unsigned Outs = dense_a8_outs_of<Site>();
         const unsigned groups = (site.outputs + Outs - 1U) / Outs;
-        run(project_rows_dense_a8_kernel<Site, Outs, false>, (groups + kWaves - 1U) / kWaves, kThreads, 0U, false, slot.codes, slot.deltas);
+        constexpr auto kernel = project_rows_dense_a8_kernel<Site, Outs, false>;
+        run(kernel, std::min((groups + kWaves - 1U) / kWaves, resident_blocks<kernel, kThreads>(0U)), kThreads, 0U, false, slot.codes,
+            slot.deltas);
     } else {
         // Tiles measured on gfx1151: 4 row tiles for the wide input projections, 1 x 2 for the
         // 2560-output ones, 1 x 1 for the 640-wide shared down.
@@ -1192,6 +1211,22 @@ template <class Site> void launch_dense_a8(const Site& site, hipStream_t stream,
         else if (site.width > 640U) tiled.template operator()<1U, 2U>();
         else tiled.template operator()<1U, 1U>();
     }
+}
+
+// Projection only, from a slot its producer filled (dense_a8_quantize_lane): codes
+// [row][width], deltas [block * kDenseA8Rows + row] for rows 0..Site::rows-1.
+template <class Site> void launch_dense_a8_quantized(const Site& site, const DenseA8Slot& slot, hipStream_t stream) {
+    static_assert(Site::rows <= 8U);
+    if (!dense_a8_width(site.width))
+        throw std::invalid_argument("q8_rows: dense A8 requires a width that is a positive multiple of 64, at most 8192");
+    for (unsigned m = 0; m < site.segments.count; ++m)
+        if (reinterpret_cast<std::uintptr_t>(site.segments.weights[m]) % 4U)
+            throw std::invalid_argument("q8_rows: dense A8 requires dword-aligned Q8 weights");
+    constexpr unsigned Outs = dense_a8_outs_of<Site>();
+    constexpr auto kernel = project_rows_dense_a8_kernel<Site, Outs, false>;
+    const unsigned groups = (site.outputs + Outs - 1U) / Outs;
+    hipLaunchKernelGGL(kernel, dim3(std::min((groups + kWaves - 1U) / kWaves, resident_blocks<kernel, kThreads>(0U))), dim3(kThreads), 0,
+        stream, site, slot.codes, slot.deltas);
 }
 
 // The caller validated width % 32 == 0 and 16-byte aligned rows. any_order drops the
