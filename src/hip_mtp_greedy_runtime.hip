@@ -3,6 +3,7 @@
 #include "strix/mtp_sidecar_binding.hpp"
 #include "strix/hip_mtp_window_verifier.hpp"
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <functional>
 #include <stdexcept>
@@ -184,6 +185,14 @@ HipMtpGreedyCycleResult HipMtpGreedyRuntime::cycle(const HipMtpTargetHiddenTicke
             out.eos=is_eos(pending);out.terminal_budget=out.emitted_tokens.size()>=budget;
             if(out.eos || out.terminal_budget || !accepted)break;
         }
+        }
+        // STRIX_MTP_DRAFT_LOG=1: the cycle's outcome after its draft lines (source position, window rows, drafts, accepted, emitted ids).
+        static const bool log_cycles=std::getenv("STRIX_MTP_DRAFT_LOG")!=nullptr;
+        if(log_cycles) {
+            std::fprintf(stderr,"cycle at=%llu rows=%u proposed=%u accepted=%u emitted=",static_cast<unsigned long long>(initial.source_position()),
+                out.target_window_rows,out.proposed_candidates,out.accepted_candidates);
+            for(std::size_t e=0;e<out.emitted_tokens.size();++e) std::fprintf(stderr,e?",%u":"%u",out.emitted_tokens[e]);
+            std::fprintf(stderr,"\n");
         }
         host_phase_mark("9 cycle bookkeeping");
         i.mtp->set_reconciliation_rows(replay,out.final_target);

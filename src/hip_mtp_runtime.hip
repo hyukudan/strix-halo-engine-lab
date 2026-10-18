@@ -385,9 +385,13 @@ struct HipMtpRuntime::Impl {
             probabilities.resize(depth);for(std::uint32_t k=0;k<depth;++k) probabilities[k]=draft->probability(k);
             // STRIX_MTP_DRAFT_LOG=1: every proposal (chain start position, step, token, probability bits) on stderr.
             static const bool log_drafts=std::getenv("STRIX_MTP_DRAFT_LOG")!=nullptr;
+            // With STRIX_MTP_DRAFT_TOP2=1 each line also carries the step's runner-up token and probability.
             if(log_drafts) for(std::uint32_t k=0;k<depth;++k) {
                 std::uint32_t bits=0;std::memcpy(&bits,&probabilities[k],sizeof(bits));
-                std::fprintf(stderr,"draft at=%llu k=%u token=%u p=%08x\n",static_cast<unsigned long long>(next_source),k,tokens[k],bits);
+                std::uint32_t second=0;float q=0.0F;
+                if(draft->runner_up(k,second,q)) std::fprintf(stderr,"draft at=%llu k=%u token=%u p=%08x t2=%u p2=%.6f p1=%.6f\n",
+                    static_cast<unsigned long long>(next_source),k,tokens[k],bits,second,q,probabilities[k]);
+                else std::fprintf(stderr,"draft at=%llu k=%u token=%u p=%08x\n",static_cast<unsigned long long>(next_source),k,tokens[k],bits);
             }
             active=false;next_source+=depth;stats.full_forward_rows+=depth;validation.reset();
             // Row zero is the pending cycle input at base_source, as in read_greedy_token.

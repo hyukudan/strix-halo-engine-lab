@@ -52,6 +52,12 @@ public:
     // falls back to synchronising `stream` (and reports its errors) if the count does not
     // arrive. Equivalent to synchronising before reading probability(step).
     void wait_step(std::uint32_t step,void* stream) const;
+    // Diagnostic (STRIX_MTP_DRAFT_TOP2=1 at construction): every step's logits are also copied to pinned host
+    // memory, so the runner-up row of a completed step can be read. Off by default; never affects selection.
+    [[nodiscard]] bool records_runner_up() const noexcept;
+    // Runner-up of step (second in the selector's order) and its softmax probability over the active rows;
+    // false when not recorded or fewer than two finite rows. Valid after the caller completed the stream.
+    bool runner_up(std::uint32_t step,std::uint32_t& token,float& probability) const;
     [[nodiscard]] bool full() const noexcept;
     [[nodiscard]] HipMtpDraftHeadStats stats() const noexcept;
     // Device views for tests: compact logits [rows] and real ids [rows] (null in full mode).
