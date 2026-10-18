@@ -8,6 +8,7 @@ enum class SpeculationRandomDrawClass : std::uint8_t {
     serial_target = 0,
     draft_acceptance = 1,
     residual_fallback = 2,
+    draft_proposal = 3,
 };
 
 struct SpeculationRngIdentity {

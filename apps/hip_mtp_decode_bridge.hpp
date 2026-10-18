@@ -99,6 +99,18 @@ inline std::uint64_t mtp_cli_mul(std::uint64_t a,std::uint64_t b) {
     if(b && a>UINT64_MAX/b)throw std::overflow_error("MTP CLI payload budget overflow");
     return a*b;
 }
+// Sampling receipt: the policy, its identity and the decision counts of this request.
+inline std::string mtp_sampling_receipt(const MtpCliOptions& m,const TokenSampler* sampler) {
+    std::ostringstream out;out<<std::setprecision(9);
+    if(!sampler){out<<"{\"identity\":\"greedy-first-max\"}";return out.str();}
+    const auto& p=sampler->policy();const auto& s=sampler->stats();
+    out<<"{\"identity\":\"sampling-v1\",\"temperature\":"<<p.temperature<<",\"top_k\":"<<p.top_k<<",\"top_p\":"<<p.top_p
+       <<",\"min_p\":"<<p.min_p<<",\"seed\":"<<p.seed<<",\"policy_identity\":"<<token_sampling_policy_identity(p)
+       <<",\"speculation\":"<<(m.sample_speculation?"true":"false")<<",\"schedule\":\""<<(m.sample_timing_schedule?"adaptive-timed":"fixed")
+       <<"\",\"drafts\":"<<s.drafts<<",\"plain_decisions\":"<<s.plain<<",\"accepted_drafts\":"<<s.accepted
+       <<",\"rejected_drafts\":"<<s.rejected<<"}";
+    return out.str();
+}
 using MtpDecodeWindowFactory=std::function<std::shared_ptr<HipMtpWindowVerifier>(std::shared_ptr<HipMtpTargetHidden>)>;
 struct MtpDecodeQualificationContext {
     const Options& options;
@@ -222,6 +234,10 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
     auto target=HipMtpTargetHidden::create(model,compiled,actual.memory,actual.model,actual.allocator,
         retained_rows,m.target_capture_bytes,d1);
     if(split)target->set_prompt_execution(*parents->prompt.compiled);
+    // Sampled decoding: the final prompt row and every generated row select by the sampler;
+    // earlier prompt rows keep first-max selection (their predictions are never emitted).
+    const auto sampler=mtp_sampling(m) && !dump && !qualify ? std::make_shared<TokenSampler>(mtp_sampling_policy(m))
+                                                           : std::shared_ptr<TokenSampler>{};
     std::shared_ptr<HipMtpWindowVerifier> window;
     if(m.window_rows && !dump) {
         if(!make_window)throw std::invalid_argument("MTP requested target window has no actual prepared native factory");
@@ -244,6 +260,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
         // execution, and the session moves to the decode execution only after the replay.
         if(split)hand_off_serial_session(session,{&compiled,&r},{parents->prompt.compiled,&parents->prompt.resources});
         for(std::size_t i=0;i<options.tokens.size();++i) {
+            if(sampler && i+1U==options.tokens.size())target->set_token_sampler(sampler);
             auto current=split ? target->execute_serial(session,parents->prompt.resources,*parents->prompt.dispatcher,options.tokens[i])
                                : target->execute_serial(session,r,dispatcher,options.tokens[i]);
             if(pending.valid())replay_rows.push_back({pending,options.tokens[i]});
@@ -313,6 +330,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
             }
             draft.context_capacity=m.draft_context_vocab;draft.q4=m.draft_q4;
             runtime->enable_draft_chain(std::move(draft),m.draft_exact);runtime->observe_draft_context(options.tokens);
+            if(sampler && m.sample_speculation)runtime->set_draft_sampler(sampler);
         }
         HipMtpGreedyRuntime greedy(runtime,qualified,activated,target,session,r,dispatcher,parents);
         if(window && !qualify)greedy.use_window_verifier(window);
@@ -329,7 +347,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
         const auto start=std::chrono::steady_clock::now();
         while(generated.size()<options.generate_tokens && generated.back()!=eos.front()) {
             if(session.next_position>=options.context_tokens){stop="context-capacity";break;}
-            const auto result=greedy.cycle(pending,m.candidate_depth,
+            const auto result=greedy.cycle(pending,sampler && !m.sample_speculation?0U:m.candidate_depth,
                 static_cast<std::uint32_t>(options.generate_tokens-generated.size()),eos);
             if(result.emitted_tokens.empty())throw std::runtime_error("MTP generation made no completed target progress");
             generated.insert(generated.end(),result.emitted_tokens.begin(),result.emitted_tokens.end());
@@ -436,6 +454,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
             <<"  \"mtp_draft_q4_head\":"<<(m.draft_q4?"true":"false")<<",\n"
             <<"  \"mtp_draft_head_rows\":"<<draft_stats.rows<<",\n  \"mtp_draft_base_rows\":"<<draft_stats.base_rows<<",\n"
             <<"  \"mtp_draft_context_rows\":"<<draft_stats.context_rows<<",\n  \"mtp_draft_context_dropped\":"<<draft_stats.context_dropped<<",\n"
+            <<"  \"sampling\":"<<mtp_sampling_receipt(m,sampler.get())<<",\n"
             <<"  \"mtp_generation_cycle_elapsed_ms\":"<<elapsed<<",\n"
             <<"  \"mtp_timing_scope\":\"post-prompt-and-independent-replay-cycles-only-host-completed-wall-not-GPU-kernel-time\",\n"
             <<"  \"prefix_tokens_consumed\":"<<options.tokens.size()<<",\n  \"final_position\":"<<session.next_position<<",\n"

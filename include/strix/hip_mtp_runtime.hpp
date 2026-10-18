@@ -3,6 +3,7 @@
 #include "strix/hip_mtp_resources.hpp"
 #include "strix/hip_mtp_target_hidden.hpp"
 #include "strix/qualified_mtp_forward_runtime.hpp"
+#include "strix/token_sampling.hpp"
 #include <functional>
 #include <span>
 #include <vector>
@@ -84,6 +85,11 @@ public:
         const SerialSessionContext&,const DraftProposalStateContext&,std::uint32_t depth,float min_probability=0.0F,
         const std::function<bool(std::span<const float>)>& keep_drafting={});
     [[nodiscard]] std::span<const float> draft_probabilities() const noexcept;
+    // Sampled drafts (temperature > 0), set once on an enabled draft chain before cycles:
+    // every draft step completes, its token is drawn from the draft distribution and
+    // feeds the next step. sampled_drafts() holds the last chain's drafts in order.
+    void set_draft_sampler(std::shared_ptr<TokenSampler>);
+    [[nodiscard]] std::span<const TokenDraft> sampled_drafts() const noexcept;
     void dispatch_mtp_step(const MtpForwardStepContext&) override;
     [[nodiscard]] MtpDraftCycleInput make_cycle_input(const QualifiedMtpDraftPlan&,const ActivatedMtpDraftPlan&,
         const MtpDraftRuntimeBinding&,const MtpDraftStateMemoryBinding&,const SerialSessionContext&,

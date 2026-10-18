@@ -52,6 +52,12 @@ public:
     // falls back to synchronising `stream` (and reports its errors) if the count does not
     // arrive. Equivalent to synchronising before reading probability(step).
     void wait_step(std::uint32_t step,void* stream) const;
+    // Sampled drafts: after wait_step(step), copy the active rows' logits to the host,
+    // and replace the step's selection (device slot and mapped reply) before the
+    // next step reads it. host_ids() maps rows to token ids (empty in full mode).
+    void read_logits(std::vector<float>& out) const;
+    [[nodiscard]] std::span<const std::uint32_t> host_ids() const noexcept;
+    void set_token(std::uint32_t step,std::uint32_t token,void* stream);
     [[nodiscard]] bool full() const noexcept;
     [[nodiscard]] HipMtpDraftHeadStats stats() const noexcept;
     // Device views for tests: compact logits [rows] and real ids [rows] (null in full mode).

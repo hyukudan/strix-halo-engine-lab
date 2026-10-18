@@ -101,6 +101,10 @@ struct HipMtpRuntime::Impl {
     std::vector<HipMtpReplayRow> replay;
     std::vector<std::uint32_t> candidates;
     std::vector<float> probabilities;
+    // Sampled drafts (null: greedy drafts): one distribution per proposed draft of the last chain.
+    std::shared_ptr<TokenSampler> sampler;
+    std::vector<TokenDraft> sampled;
+    std::vector<float> draft_logits;
     MtpDraftCycleInput current;
     HipMtpExecutionStats stats;
     std::uint64_t next_source=0,base_source=0,epoch=0,profile=0;
@@ -339,6 +343,7 @@ struct HipMtpRuntime::Impl {
         const std::function<bool(std::span<const float>)>& keep_drafting) {
         require(draft && cycle && cycle_base && !active && !validation && candidates.empty() &&
             depth<=owner->budget().maximum_candidate_depth,"MTP draft chain requires a fresh bounded proposal");
+        sampled.clear();
         if(!depth) return {};
         require(stats.full_forward_rows<=UINT64_MAX-depth && epoch!=UINT64_MAX,"MTP draft chain counters exhausted");
         validation.emplace(owner->admit_native_entry());
@@ -371,8 +376,14 @@ struct HipMtpRuntime::Impl {
                 copy(owner->view(HipMtpBuffer::wide_current),owner->view(HipMtpBuffer::wide_next));
                 hyper(c,MtpHyperRole::head,stream);
                 draft->launch(hidden,k,stream);
+                if(sampler) {
+                    // Draft k proposes the token at next_source + k + 2 (row k's seed sits at next_source + k + 1).
+                    draft->read_logits(draft_logits);
+                    sampled.push_back(sampler->draft(draft_logits,draft->host_ids(),next_source+k+2U));
+                    draft->set_token(k,sampled.back().token,stream);
+                }
                 if(min_probability>0.0F && k+1U<requested) {
-                    draft->wait_step(k,stream);
+                    if(!sampler) draft->wait_step(k,stream);
                     if(draft->probability(k)<min_probability) {depth=k+1U;break;}
                     if(keep_drafting) {
                         probabilities.resize(k+1U);for(std::uint32_t j=0;j<=k;++j) probabilities[j]=draft->probability(j);
@@ -537,6 +548,12 @@ std::vector<std::uint32_t> HipMtpRuntime::propose_chain(const QualifiedMtpDraftP
     return p.chain(depth,min_probability,keep_drafting);
 }
 std::span<const float> HipMtpRuntime::draft_probabilities() const noexcept {return impl_->probabilities;}
+void HipMtpRuntime::set_draft_sampler(std::shared_ptr<TokenSampler> sampler) {
+    auto& p=*impl_;require(p.draft && sampler && !p.sampler && !p.cycle && !p.active && !p.broken,
+        "MTP sampled drafts need an enabled idle draft chain, once before cycles");
+    p.sampler=std::move(sampler);
+}
+std::span<const TokenDraft> HipMtpRuntime::sampled_drafts() const noexcept {return impl_->sampled;}
 void HipMtpRuntime::dispatch_mtp_step(const MtpForwardStepContext& call) {
     auto& p=*impl_;
     try {

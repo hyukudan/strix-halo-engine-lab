@@ -5,6 +5,7 @@
 #include "strix/arithmetic_lineage.hpp"
 #include "strix/session_state_memory.hpp"
 #include "strix/hip_generation_output.hpp"
+#include "strix/hip_token_sampling.hpp"
 #include <hip/hip_runtime.h>
 #include <algorithm>
 #include <array>
@@ -56,6 +57,8 @@ struct HipMtpWindowVerifier::Impl {
     bool busy=false,failed=false,bounded=false,prefix=false;
     // Adaptive choice: owner cost per cycle (draft included), serial cost per emitted token.
     float min_probability=0.0F;
+    bool timing_independent=false;
+    std::vector<float> sampled_logits;
     double serial_ms_ema=0.0;std::uint64_t serial_cycles=0;
     // Draft probabilities are not acceptance rates: per probability bin, verified
     // drafts (every draft up to the first rejection) and how many were accepted.
@@ -67,7 +70,7 @@ struct HipMtpWindowVerifier::Impl {
          HipMtpWindowVerificationPolicy policy,AllocationGenerationSource& generations)
         :target(std::move(t)),resources(r),resource_owner(std::move(owner)),
          maximum_history_intervals(policy.capture.maximum_history_intervals),bounded(policy.bounded_window_rollback),
-         min_probability(policy.min_probability) {
+         min_probability(policy.min_probability),timing_independent(policy.timing_independent_schedule) {
         require(target && resource_owner && resources.session_state_layout && !w.empty() &&
             resources.session_state_memory==&target->memory_owner()->state() &&
             resources.scratch==&target->memory_owner()->scratch() &&
@@ -143,7 +146,7 @@ struct HipMtpWindowVerifier::Impl {
         return expected;
     }
     bool worth_drafting(std::span<const float> p) const {
-        if(min_probability<=0.0F || p.empty()) return true;
+        if(timing_independent || min_probability<=0.0F || p.empty()) return true;
         const auto usable=p.size()+1U;
         double best=serial_cycles?1.0/serial_ms_ema:0.0;
         const Owner* next=nullptr;
@@ -165,6 +168,12 @@ struct HipMtpWindowVerifier::Impl {
         Owner* cap=&owners.back();
         for(auto& o:owners) if(o.rows>=want){cap=&o;break;}
         const bool serial=want==1U;
+        if(timing_independent) {
+            // The smallest owner covering the confident drafts, else the largest that fits.
+            if(serial) return nullptr;
+            for(auto& o:owners) if(o.rows>=want && fits(o)) return &o;
+            return largest();
+        }
         // Unmeasured options are tried once before the cost model ranks them.
         if(fits(*cap) && !cap->stats.cycles) return cap;
         if(serial && !serial_cycles) return nullptr;
@@ -238,8 +247,13 @@ bool HipMtpWindowVerifier::worth_drafting(std::span<const float> probabilities) 
 }
 HipMtpVerifiedTargetRows HipMtpWindowVerifier::verify(SerialSessionContext& session,DirectLaunchDispatcher& dispatcher,
     const HipMtpTargetHiddenTicket& initial,std::span<const std::uint32_t> candidates,
-    std::uint32_t budget,std::span<const std::uint32_t> eos,std::span<const float> probabilities) {
+    std::uint32_t budget,std::span<const std::uint32_t> eos,std::span<const float> probabilities,
+    std::span<const TokenDraft> drafts) {
     auto& i=*impl_;
+    const auto sampler=i.target->token_sampler();
+    require(sampler?drafts.size()==candidates.size():drafts.empty(),"MTP sampled verification needs one draft distribution per candidate");
+    for(std::size_t k=0;k<drafts.size();++k)
+        require(drafts[k].token==candidates[k] && drafts[k].position==session.next_position+1U+k,"MTP sampled draft does not match its candidate");
     require(!i.busy && !failed() && budget && initial.valid() &&
         initial.source_position()+1==session.next_position && session_equal(initial.committed_session(),session),
         "MTP window verifier requires exact idle committed target frontier");
@@ -269,7 +283,19 @@ HipMtpVerifiedTargetRows HipMtpWindowVerifier::verify(SerialSessionContext& sess
         for(const auto& pool:owner->captures)if(pool->ready_for_reuse()){capture=pool;break;}
         require(!!capture,"MTP window capture pools are retained by previous batch readers");
         i.target->validate_window_capture(*capture);
+        // Sampled rows: decided in order from row 0 (the token at next_position + 1) until the first
+        // row without a draft, a rejection, EOS or the budget; later rows are never accepted.
+        if(sampler) capture->set_row_selection([&,first=session.next_position+1U,stream=capture->source_stream()](
+            std::span<const ExecutionBufferAddress> logits,std::span<std::uint32_t> predictions) {
+            const auto decisions=sampler->decide_rows(std::min(rows,budget),first,drafts,eos,[&](std::uint32_t r) {
+                read_hip_logits_row(logits[r],static_cast<std::uint32_t>(vocabulary),stream,i.sampled_logits);
+                return std::span<const float>(i.sampled_logits);});
+            for(std::size_t r=0;r<decisions.size();++r) predictions[r]=decisions[r].token;
+        });
+        else capture->set_row_selection({});
     }
+    // The selection borrows this call's locals: never leave it attached past the call.
+    struct ClearSelection {HipMtpTargetWindowCapture* c;~ClearSelection(){if(c)c->set_row_selection({});}} clear_selection{sampler?capture.get():nullptr};
     i.busy=true;bool attempted_target=false;
     try {
         if(use_window && i.prefix) {
@@ -347,7 +373,8 @@ HipMtpVerifiedTargetRows HipMtpWindowVerifier::verify(SerialSessionContext& sess
             require(session_equal(initial.committed_session(),session),"MTP rejected window did not restore exact target frontier");
         }
         for(std::size_t index=0;out.emitted_tokens.size()<budget && session.next_position<capacity;++index) {
-            auto ticket=i.target->execute_serial(session,i.resources,dispatcher,pending);
+            auto ticket=i.target->execute_serial(session,i.resources,dispatcher,pending,
+                index<drafts.size()?&drafts[index]:nullptr);
             attempted_target=true;
             pending=ticket.predicted_token();out.committed_rows.push_back(std::move(ticket));out.emitted_tokens.push_back(pending);
             const bool accepted=index<candidates.size() && candidates[index]==pending;

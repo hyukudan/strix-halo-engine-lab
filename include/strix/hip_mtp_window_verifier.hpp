@@ -11,6 +11,9 @@ struct HipMtpWindowVerificationPolicy {
     bool bounded_window_rollback=false; // explicit candidate, full fallback remains default
     // Adaptive owner choice (prefix owners only): 0 keeps the largest fitting owner.
     float min_probability=0.0F;
+    // Owner choice and draft continuation from draft probabilities only (no measured
+    // cycle times), so a sampled run is reproducible from its seed.
+    bool timing_independent_schedule=false;
 };
 struct HipMtpVerifiedTargetRows {
     std::vector<HipMtpTargetHiddenTicket> committed_rows;
@@ -27,7 +30,8 @@ struct HipMtpWindowOwnerStats {std::uint32_t rows=0;std::uint64_t cycles=0;doubl
 // rounded up to an owner, then the owner (or serial at T = 1) with the best
 // expected tokens per ms under an EMA of measured cycle time.
 // Every speculative input except the pending seed must match the preceding
-// finite target prediction. A rejected/EOS-truncated window is restored before
+// finite target prediction (with the target's token sampler: the preceding
+// row's sampled decision, which uses that input's draft distribution). A rejected/EOS-truncated window is restored before
 // serial greedy replay; no provisional hidden row reaches MTP reconciliation.
 class HipMtpWindowVerifier final {
 public:
@@ -51,7 +55,7 @@ public:
     [[nodiscard]] HipMtpVerifiedTargetRows verify(SerialSessionContext&,DirectLaunchDispatcher&,
         const HipMtpTargetHiddenTicket& initial,std::span<const std::uint32_t> candidates,
         std::uint32_t output_budget,std::span<const std::uint32_t> eos_tokens,
-        std::span<const float> candidate_probabilities={});
+        std::span<const float> candidate_probabilities={},std::span<const TokenDraft> sampled_drafts={});
     // Whether one more draft can still pay off: the next larger window, with the remaining drafts assumed
     // as likely as the last one, beats the best window the current drafts already allow.
     [[nodiscard]] bool worth_drafting(std::span<const float> probabilities) const;

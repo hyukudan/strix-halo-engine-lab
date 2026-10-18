@@ -50,6 +50,7 @@ struct HipMtpTargetWindowCapture::Impl {
     // Host-mapped per-row argmax written by the window stream after its head rows
     // (same finite first-max rule as the selectors); null keeps the selectors.
     const HipGreedyRowsReply* device_greedy=nullptr;
+    HipMtpTargetWindowCapture::RowSelection row_selection;
     std::vector<MtpDeviceView> snapshots;
     std::shared_ptr<HipMtpTargetWindowBatch::Lease> active;
     std::weak_ptr<const HipMtpTargetWindowBatch::Lease> previous;
@@ -176,13 +177,19 @@ void HipMtpTargetWindowCapture::completed_before_publish(){
             require(reply.status==0U && reply.token<i.vocab,"GPU greedy rows logits must all be finite and selection valid");
             i.active->predictions[row]=reply.token;
         }
-        i.active->completed=true;return;
+    } else {
+        for(std::uint32_t row=0;row<i.rows;++row)
+            i.selectors[row]->submit(i.logit_views[row],i.vocab,i.active->base.next_position+row,i.active->epoch);
+        for(std::uint32_t row=0;row<i.rows;++row)i.active->predictions[row]=i.selectors[row]->complete();
     }
-    for(std::uint32_t row=0;row<i.rows;++row)
-        i.selectors[row]->submit(i.logit_views[row],i.vocab,i.active->base.next_position+row,i.active->epoch);
-    for(std::uint32_t row=0;row<i.rows;++row)i.active->predictions[row]=i.selectors[row]->complete();
+    // Sampled selection replaces the finite first-max tokens before any row is published.
+    if(i.row_selection) {
+        i.row_selection(i.logit_views,i.active->predictions);
+        for(const auto token:i.active->predictions) require(token<i.vocab,"MTP sampled window selection is outside the vocabulary");
+    }
     i.active->completed=true;
 }
+void HipMtpTargetWindowCapture::set_row_selection(RowSelection selection) {impl_->row_selection=std::move(selection);}
 HipMtpTargetWindowBatch HipMtpTargetWindowCapture::seal(const SerialSessionContext& session){
     auto& i=*impl_;require(i.active && i.active->completed && session.health==SerialSessionHealth::ready &&
         session.execution_identity==i.serial_id && session.runtime_compatibility_identity==i.active->base.runtime_compatibility_identity &&

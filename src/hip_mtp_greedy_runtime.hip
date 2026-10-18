@@ -148,6 +148,8 @@ HipMtpGreedyCycleResult HipMtpGreedyRuntime::cycle(const HipMtpTargetHiddenTicke
         const std::function<bool(std::span<const float>)> keep=worth && i.window?
             std::function<bool(std::span<const float>)>([&](std::span<const float> p){return i.window->worth_drafting(p);}):
             std::function<bool(std::span<const float>)>{};
+        const auto sampler=i.target->token_sampler();
+        require(!sampler || !depth || i.mtp->draft_head(),"MTP speculative sampling requires the draft chain");
         const auto candidates=i.mtp->draft_head()?i.mtp->propose_chain(i.plan,i.activation,*i.session,i.draft,depth,i.min_probability,keep):
             i.backend->propose_candidates(*i.session,i.draft,depth);
         host_phase_mark("2 draft chain");
@@ -156,7 +158,8 @@ HipMtpGreedyCycleResult HipMtpGreedyRuntime::cycle(const HipMtpTargetHiddenTicke
         host_phase_mark("3 finish proposal");
         if(i.window) {
             auto verified=i.window->verify(*i.session,*i.dispatcher,initial,candidates,budget,eos,
-                i.mtp->draft_head()?i.mtp->draft_probabilities():std::span<const float>{});
+                i.mtp->draft_head()?i.mtp->draft_probabilities():std::span<const float>{},
+                sampler?i.mtp->sampled_drafts():std::span<const TokenDraft>{});
             host_phase_mark("8 verify tail");
             require(!verified.committed_rows.empty() && verified.committed_rows.size()==verified.emitted_tokens.size(),
                 "MTP target verifier returned no actual aligned committed output rows");
@@ -175,7 +178,9 @@ HipMtpGreedyCycleResult HipMtpGreedyRuntime::cycle(const HipMtpTargetHiddenTicke
         } else {
         for(std::size_t index=0;;++index) {
             replay.push_back({out.final_target,pending});
-            auto completed=i.target->execute_serial(*i.session,i.resources,*i.dispatcher,pending);
+            const auto drafts=sampler?i.mtp->sampled_drafts():std::span<const TokenDraft>{};
+            auto completed=i.target->execute_serial(*i.session,i.resources,*i.dispatcher,pending,
+                index<drafts.size()?&drafts[index]:nullptr);
             ++out.consumed_target_rows;
             pending=completed.predicted_token();out.final_target=std::move(completed);
             out.emitted_tokens.push_back(pending);

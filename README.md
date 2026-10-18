@@ -91,7 +91,8 @@ CMake options:
 
 `strix-hip-decode-token` takes a GGUF model and the prompt as token IDs; it has no tokenizer. It writes a JSON
 receipt to stdout that includes `generated_tokens`, cycle counts and timings. `--help` lists the general options;
-the MTP options are documented in [docs/mtp-native-cli.md](docs/mtp-native-cli.md).
+the MTP options are documented in [docs/mtp-native-cli.md](docs/mtp-native-cli.md). Decoding is greedy unless
+`--mtp-sample-temperature` is above zero; see [docs/sampled-decoding.md](docs/sampled-decoding.md).
 
 A speculative run has four groups of options.
 
@@ -239,6 +240,8 @@ structure and storage), `strix-model-manifest` (tensor roles, bytes, residency a
 - [docs/VERIFY_WINDOW_PLAN.md](docs/VERIFY_WINDOW_PLAN.md): multi-row verify window design and status.
 - [docs/mtp-native-cli.md](docs/mtp-native-cli.md), [docs/mtp-native-runtime.md](docs/mtp-native-runtime.md): MTP
   command line and runtime contract.
+- [docs/sampled-decoding.md](docs/sampled-decoding.md): sampled decoding (temperature, top-k/top-p/min-p, seed)
+  with speculative drafts.
 - [docs/decode-optimization-profile.md](docs/decode-optimization-profile.md): automatic optimization profile.
 - [DECISIONS.md](DECISIONS.md): accepted, pending and rejected decisions with their reasons.
 - [IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md): implemented components and how to reproduce them.

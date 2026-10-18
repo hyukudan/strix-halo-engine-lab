@@ -328,6 +328,26 @@ of complete blocks carry the prefill profile, suffix rows the decode profile; th
 the row counts per route and both profiles (see
 [docs/teacher-forced-tiled-prefill.md](docs/teacher-forced-tiled-prefill.md)).
 
+## D-035: speculative sampling for temperature > 0
+
+`--mtp-sample-temperature T` (with optional top-k, top-p, min-p and a seed) samples instead of selecting the
+first-max token; temperature 0 is the unchanged greedy path, with no sampler object and no host copies. Each
+emitted position is one standard speculative decision: with a draft `d ~ q`, accept with probability
+`min(1, p(d)/q(d))`, otherwise sample `normalize(max(0, p - q))` over the full target support; without a draft,
+sample `p`. Drafts are drawn from the draft head's distribution under the same transform (`q` is zero outside a
+draft vocabulary subset) and fed to the next draft step. Uniforms are counter-based, keyed by seed, policy,
+absolute position and draw class, so a position draws the same values in a window row, a serial step or a
+replay. Window rows are decided in order before any row is published; prefix acceptance is unchanged (an input
+is kept only when the previous row's decision accepted it). With the default `fixed` schedule, window and draft
+lengths depend on draft probabilities only, so a run is reproducible from its seed; `adaptive` keeps the
+measured-cost choices. See [docs/sampled-decoding.md](docs/sampled-decoding.md).
+
+Why: greedy-only decoding excluded every temperature > 0 use. The rule keeps the output distribution exactly the
+target's for any draft. Alternative: drafter-invariant coupling (one shared noise for target and draft, so tokens
+do not depend on the drafting schedule). Not adopted: its acceptance is lower than `min(1, p/q)`, and the fixed
+schedule already gives reproducibility. Rows are transformed on the host (one FP32 vocabulary row per decided
+row); a device-side transform is open.
+
 Why: the serial route is the only way to score long documents, at about 13 minutes per 16K-token document and
 profile; the tiled prefill reproduces serial rows bit for bit within a profile, so the same files can come from
 it in a fraction of the time. The staging buffer bounds host memory by T rows; no device memory is added (the
