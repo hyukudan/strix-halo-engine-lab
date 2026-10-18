@@ -554,7 +554,9 @@ void launch_engine(const Activations& a, std::uint32_t base, const Buffer& weigh
     for (unsigned r = 0; r < Rows; ++r)
         site.input[r] = a.input.as<unsigned char>() + static_cast<std::uint64_t>(base + r) * a.width * sizeof(In);
     site.width = a.width; site.outputs = outputs; site.output = out.as<float>();
-    q8_rows::launch(site, true, stream);
+    // Over 64 rows only the dense A8 form exists (the prompt sites call it directly).
+    if constexpr (Rows > 64U) q8_rows::launch_dense_a8(site, stream, false);
+    else q8_rows::launch(site, true, stream);
     check(hipGetLastError(), "engine dense A8 launch");
 }
 template <unsigned Rows>
@@ -576,22 +578,27 @@ void launch_engine_any(unsigned rows, const Activations& a, std::uint32_t base, 
     case 8: launch_engine_rows<8U>(a, base, weights, outputs, out, stream); break;
     case 16: launch_engine_rows<16U>(a, base, weights, outputs, out, stream); break;
     case 32: launch_engine_rows<32U>(a, base, weights, outputs, out, stream); break;
+    case 128: launch_engine_rows<128U>(a, base, weights, outputs, out, stream); break;
+    case 256: launch_engine_rows<256U>(a, base, weights, outputs, out, stream); break;
     default: launch_engine_rows<64U>(a, base, weights, outputs, out, stream); break;
     }
 }
+// Total = 64: rows 1..8 (dot4 forms) and 16/32/64 (WMMA, pitch-64 slots); Total = 256: the prompt
+// sites of 128 and 256 rows (WMMA, pitch-256 slots).
+template <std::uint32_t Total = 64U>
 void engine_case(hipStream_t stream, const Shape& shape, unsigned flavor, std::uint32_t outputs, std::uint32_t& cases) {
-    constexpr std::uint32_t total = 64U;
+    constexpr std::uint32_t total = Total;
     std::mt19937 rng(4321U + flavor * 31U + shape.width + outputs);
     const auto weights_host = make_weights(shape.width, outputs, flavor, rng);
     const auto x = make_inputs(total, shape.width, shape.bf16, flavor, rng);
     Buffer weights(weights_host.size()); weights.upload(weights_host);
     Activations a(total, shape.width, shape.bf16); a.upload(x);
-    const auto q = quantize_reference(x, total, shape.width, 64U);
+    const auto q = quantize_reference(x, total, shape.width, total);
     const std::string tag = std::string("engine ") + shape.name + " " + std::to_string(shape.width) + "->" + std::to_string(outputs) +
         " flavor=" + std::to_string(flavor);
-    // Header quantizer against the reference (codes [row][feature], deltas [block * 64 + row]).
+    // Header quantizer against the reference (codes [row][feature], deltas [block * Total + row]).
     {
-        Buffer codes(static_cast<std::size_t>(total) * shape.width), deltas(static_cast<std::size_t>(shape.width / 32U) * 64U * 4U);
+        Buffer codes(static_cast<std::size_t>(total) * shape.width), deltas(static_cast<std::size_t>(shape.width / 32U) * total * 4U);
         const auto quantize = [&](auto site) {
             for (unsigned r = 0; r < total; ++r)
                 site.input[r] = a.input.as<unsigned char>() + static_cast<std::uint64_t>(r) * shape.width * (shape.bf16 ? 2U : 4U);
@@ -611,9 +618,11 @@ void engine_case(hipStream_t stream, const Shape& shape, unsigned flavor, std::u
     std::vector<float> reference(static_cast<std::size_t>(total) * outputs, 0.0F);
     for (std::uint32_t r = 0; r < total; ++r)
         for (std::uint32_t n = r % step_n; n < outputs; n += step_n)
-            reference[static_cast<std::size_t>(r) * outputs + n] = reference_output(q, 64U, weights_host, shape.width, r, n);
+            reference[static_cast<std::size_t>(r) * outputs + n] = reference_output(q, total, weights_host, shape.width, r, n);
     Buffer out(static_cast<std::size_t>(total) * outputs * 4U);
-    for (const unsigned rows : {1U, 2U, 3U, 4U, 5U, 6U, 7U, 8U, 16U, 32U, 64U}) {
+    const auto row_counts = Total == 64U ? std::vector<unsigned>{1U, 2U, 3U, 4U, 5U, 6U, 7U, 8U, 16U, 32U, 64U}
+                                         : std::vector<unsigned>{128U, 256U};
+    for (const unsigned rows : row_counts) {
         const std::uint32_t base = rows <= 8U ? (rows * 5U) % (total - rows + 1U) : 0U;
         out.poison(stream);
         launch_engine_any(rows, a, base, weights, outputs, out, stream);
@@ -767,9 +776,11 @@ int main() try {
         for (const auto& shape : shapes) {
             for (unsigned flavor = 0; flavor < 3U; ++flavor) engine_case(stream, shape, flavor, shape.outputs, engine_cases);
             for (const std::uint32_t outputs : {64U, 192U, 1000U}) engine_case(stream, shape, outputs % 3U, outputs, engine_cases);
+            for (unsigned flavor = 0; flavor < 3U; ++flavor) engine_case<256U>(stream, shape, flavor, shape.outputs, engine_cases);
+            engine_case<256U>(stream, shape, 1U, 1000U, engine_cases);
             std::cout << "engine " << shape.name << ": ok\n";
         }
-        std::cout << "dense A8 engine forms (rows 1..8, 16, 32, 64) == serial reference: " << engine_cases << " cases\n";
+        std::cout << "dense A8 engine forms (rows 1..8, 16, 32, 64, 128, 256) == serial reference: " << engine_cases << " cases\n";
     }
     if (!std::getenv("STRIX_DENSE_A8_BENCH_ONLY") && !std::getenv("STRIX_DENSE_A8_ENGINE_ONLY")) {
         std::uint32_t cases = 0;

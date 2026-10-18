@@ -4665,6 +4665,13 @@ void enqueue_gdn_prefill_rows(const std::vector<std::array<GdnKnownWindowRow, 8U
         return n == 8 || n == 16 || n == 32 ? static_cast<std::uint32_t>(n) : 64U;
     }();
     const auto wide = wide_env;
+    // STRIX_PREFILL_DENSE_A8_ROWS = 64 / 128 / 256 (default): rows per dense A8 projection launch.
+    static const std::uint32_t dense_env = [] {
+        const char* v = std::getenv("STRIX_PREFILL_DENSE_A8_ROWS");
+        const int n = v ? std::atoi(v) : 256;
+        return n == 64 || n == 128 ? static_cast<std::uint32_t>(n) : 256U;
+    }();
+    const std::uint32_t dense_wide = config.dense_a8_projections && wide >= 64U ? dense_env : 0U;
     const auto project_in = [&]<std::uint32_t W>(std::size_t first_tile) {
         GdnInputRowsSite<W> in{};
         in.segments = q8_rows::segments({{reinterpret_cast<const void*>(first.tensors.qkv.runtime->address), first.conv_width},
@@ -4675,7 +4682,8 @@ void enqueue_gdn_prefill_rows(const std::vector<std::array<GdnKnownWindowRow, 8U
             in.input[r] = reinterpret_cast<const void*>(row.input.address);
             in.output[0][r] = row.workspace.qkv; in.output[1][r] = row.workspace.z;
         }
-        q8_rows::launch(in, config.dense_a8_projections, stream);
+        if constexpr (W > 64U) q8_rows::launch_dense_a8(in, stream, false);
+        else q8_rows::launch(in, config.dense_a8_projections, stream);
         check_hip(hipGetLastError(), "GDN prefill Q8 input projection launch");
     };
     const auto project_out = [&]<std::uint32_t W>(std::size_t first_tile) {
@@ -4687,14 +4695,18 @@ void enqueue_gdn_prefill_rows(const std::vector<std::array<GdnKnownWindowRow, 8U
             out.input[r] = row.workspace.core;
             out.output[r] = reinterpret_cast<std::uint16_t*>(row.output.address);
         }
-        q8_rows::launch(out, config.dense_a8_projections, stream);
+        if constexpr (W > 64U) q8_rows::launch_dense_a8(out, stream, false);
+        else q8_rows::launch(out, config.dense_a8_projections, stream);
         check_hip(hipGetLastError(), "GDN prefill Q8 output projection launch");
     };
     // Largest width that divides what is left, so every row runs exactly once.
     const auto each_width = [&](auto&& project) {
         for (std::size_t t = 0; t < tiles.size();) {
             const auto left = (tiles.size() - t) * 8U;
-            if (wide >= 64U && left >= 64U) { project.template operator()<64U>(t); t += 8U; }
+            // Dense A8: one WMMA launch per 256 (128) rows, so each weight byte streams once per 256 rows.
+            if (dense_wide >= 256U && left >= 256U) { project.template operator()<256U>(t); t += 32U; }
+            else if (dense_wide >= 128U && left >= 128U) { project.template operator()<128U>(t); t += 16U; }
+            else if (wide >= 64U && left >= 64U) { project.template operator()<64U>(t); t += 8U; }
             else if (wide >= 32U && left >= 32U) { project.template operator()<32U>(t); t += 4U; }
             else if (wide >= 16U && left >= 16U) { project.template operator()<16U>(t); t += 2U; }
             else { project.template operator()<8U>(t); t += 1U; }

@@ -1801,7 +1801,8 @@ void known_shared_engine_projection(bool down, const KnownSharedR2Views& views, 
             site.gate[r] = reinterpret_cast<const float*>(workspace) + s.intermediate;
             site.output[r] = reinterpret_cast<std::uint16_t*>(row(views.output, s.output_stride_bytes, r));
         }
-        q8_rows::launch(site, config.dense_a8_projections, stream);
+        if constexpr (Rows > 64U) q8_rows::launch_dense_a8(site, stream, false);
+        else q8_rows::launch(site, config.dense_a8_projections, stream);
     } else {
         SharedGateUpRowsSite<Rows> site{};
         site.segments = q8_rows::segments({{reinterpret_cast<const void*>(views.weights.gate_q8.address), s.intermediate},
@@ -1814,7 +1815,8 @@ void known_shared_engine_projection(bool down, const KnownSharedR2Views& views, 
         // Any-order (STRIX_ANYORDER=0 disables): gate/up reads only the MoE input and writes this expert's own
         // workspace, independent of the router's top-k selection queued just before it.
         static const bool any_order = strix_any_order_enabled();
-        q8_rows::launch(site, config.dense_a8_projections, stream, any_order);
+        if constexpr (Rows > 64U) q8_rows::launch_dense_a8(site, stream, any_order);
+        else q8_rows::launch(site, config.dense_a8_projections, stream, any_order);
     }
     check_hip(hipGetLastError(), "known-window shared rows projection launch");
     if (config.prefetch_q8 && config.prefetch_stats)
@@ -2000,10 +2002,19 @@ void known_shared_prefill_enqueue(std::span<const ExecutionDispatchContext> rows
         v.workspace.address += r * s.workspace_stride_bytes;
         return v;
     };
+    // STRIX_PREFILL_DENSE_A8_ROWS=64 keeps the dense A8 projections at 64 rows per launch.
+    static const std::uint32_t dense_env = [] {
+        const char* v = std::getenv("STRIX_PREFILL_DENSE_A8_ROWS");
+        const int n = v ? std::atoi(v) : 256;
+        return n == 64 || n == 128 ? static_cast<std::uint32_t>(n) : 256U;
+    }();
+    const std::uint32_t dense_wide = config.dense_a8_projections ? dense_env : 0U;
     const auto each_width = [&](bool down) {
         for (std::uint64_t r = 0; r < rows.size();) {
             const auto left = rows.size() - r;
-            if (left >= 64U) { known_shared_engine_projection<64U>(down, at(r), stream, config); r += 64U; }
+            if (dense_wide >= 256U && left >= 256U) { known_shared_engine_projection<256U>(down, at(r), stream, config); r += 256U; }
+            else if (dense_wide >= 128U && left >= 128U) { known_shared_engine_projection<128U>(down, at(r), stream, config); r += 128U; }
+            else if (left >= 64U) { known_shared_engine_projection<64U>(down, at(r), stream, config); r += 64U; }
             else if (left >= 32U) { known_shared_engine_projection<32U>(down, at(r), stream, config); r += 32U; }
             else if (left >= 16U) { known_shared_engine_projection<16U>(down, at(r), stream, config); r += 16U; }
             else { known_shared_engine_projection<8U>(down, at(r), stream, config); r += 8U; }

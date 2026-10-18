@@ -4255,7 +4255,7 @@ struct QsaPrefillPool {
 // tile order (see enqueue_qsa_prefill_rows).
 template <unsigned Rows>
 void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexedAttentionLauncherConfig& config,
-    unsigned parts = 7U, QsaPrefillPool* pool = nullptr) {
+    unsigned parts = 7U, QsaPrefillPool* pool = nullptr, unsigned skip_inputs = 0U) {
     const auto& model = config.model;
     const auto& a = prepared.row[0];
     const auto& tensors = a.tensors;
@@ -4267,7 +4267,9 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
     const std::array<std::uint32_t, 5> outputs{a.index_q_width, a.index_dim, a.q_gate_width, a.kv_width, a.kv_width};
     const std::array<float* WorkspacePointers::*, 5> targets{&WorkspacePointers::index_query, &WorkspacePointers::current_index_key,
         &WorkspacePointers::q_gate, &WorkspacePointers::current_k, &WorkspacePointers::current_v};
+    // skip_inputs: input matrices (bit m = matrices[m]) already projected by the caller.
     std::array<bool, 5> done{};
+    for (unsigned m = 0; m < 5U; ++m) done[m] = (skip_inputs >> m) & 1U;
     q8_rows::DenseA8Slot output_slot{};
     // Any-order (STRIX_ANYORDER=0 disables): input groups after the first read the same rows and write other
     // targets; the q and k norms follow a barrier-ordered index norm and touch only their own.
@@ -4715,9 +4717,39 @@ std::vector<QsaKnownRows<8U>> prepare_qsa_prefill_rows(std::span<const Execution
             throw std::invalid_argument("QSA prefill rows share temporary or output storage");
     return tiles;
 }
+// Dense A8 input projections of W prefill rows (W / 8 tiles from `first`) in one WMMA launch, when
+// all five input matrices are Q8_0: the same QsaInputRowsSite rows contract as the 64-row group
+// (each row's outputs depend only on its own codes and deltas), so the rows get the same bits.
+template <unsigned W>
+unsigned enqueue_qsa_prefill_dense_inputs(const std::vector<QsaKnownRows<8U>>& tiles, std::size_t first,
+    const HipIndexedAttentionLauncherConfig& config) {
+    const auto& a = tiles[first].row[0];
+    const auto& tensors = a.tensors;
+    const std::array<const TensorPair*, 5> matrices{&tensors.index_q, &tensors.index_k, &tensors.q, &tensors.k, &tensors.v};
+    if (!config.dense_a8_projections) return 0U;
+    const std::array<std::uint32_t, 5> outputs{a.index_q_width, a.index_dim, a.q_gate_width, a.kv_width, a.kv_width};
+    const std::array<float* WorkspacePointers::*, 5> targets{&WorkspacePointers::index_query, &WorkspacePointers::current_index_key,
+        &WorkspacePointers::q_gate, &WorkspacePointers::current_k, &WorkspacePointers::current_v};
+    auto site = std::make_unique<QsaInputRowsSite<W>>();
+    unsigned mask = 0U;
+    for (unsigned m = 0; m < 5U; ++m) {
+        if (matrices[m]->manifest->ggml_type != 8U) continue;
+        const auto g = site->segments.count++;
+        site->segments.weights[g] = reinterpret_cast<const unsigned char*>(matrices[m]->runtime->address);
+        site->segments.first[g + 1U] = site->segments.first[g] + outputs[m];
+        for (unsigned r = 0; r < W; ++r) site->output[g][r] = tiles[first + r / 8U].row[r % 8U].workspace.*targets[m];
+        mask |= 1U << m;
+    }
+    if (!mask) return 0U;
+    for (unsigned r = 0; r < W; ++r) site->input[r] = reinterpret_cast<const void*>(tiles[first + r / 8U].row[r % 8U].input.address);
+    site->width = a.hidden; site->outputs = site->segments.first[site->segments.count];
+    q8_rows::launch_dense_a8(*site, hip_execution_stream(), false);
+    check_hip(hipGetLastError(), "QSA prefill dense A8 input projection launch");
+    return mask;
+}
 template <unsigned W>
 void enqueue_qsa_prefill_projection(const std::vector<QsaKnownRows<8U>>& tiles, std::size_t first,
-    const HipIndexedAttentionLauncherConfig& config, unsigned part, QsaPrefillPool* pool = nullptr) {
+    const HipIndexedAttentionLauncherConfig& config, unsigned part, QsaPrefillPool* pool = nullptr, unsigned skip_inputs = 0U) {
     auto combined = std::make_unique<QsaKnownRows<W>>();
     combined->prefetch = tiles[first].prefetch; combined->journal = tiles[first].journal;
     for (unsigned r = 0; r < W; ++r) {
@@ -4725,7 +4757,7 @@ void enqueue_qsa_prefill_projection(const std::vector<QsaKnownRows<8U>>& tiles, 
         combined->row[r] = tile.row[r % 8U]; combined->selection[r] = tile.selection[r % 8U];
         combined->position[r] = tile.position[r % 8U];
     }
-    enqueue_qsa_known_rows<W>(*combined, config, part, pool);
+    enqueue_qsa_known_rows<W>(*combined, config, part, pool, skip_inputs);
 }
 // Attention outputs of every prefill row (self-check).
 std::vector<std::uint8_t> qsa_prefill_attention_outputs(const std::vector<QsaKnownRows<8U>>& tiles) {
@@ -4788,6 +4820,20 @@ void enqueue_qsa_prefill_rows(const std::vector<QsaKnownRows<8U>>& tiles, const 
     const auto projections = [&](unsigned part) {
         for (std::size_t t = 0; t < tiles.size();) {
             const auto left = tiles.size() - t;
+            // STRIX_PREFILL_DENSE_A8_ROWS=64 keeps the dense A8 input projections at 64 rows per launch.
+            static const bool dense_wide = [] { const char* v = std::getenv("STRIX_PREFILL_DENSE_A8_ROWS"); return !v || std::atoi(v) != 64; }();
+            // The Q8_0 input matrices of 256 (128) rows in one launch; the others keep their 64-row groups.
+            // Part 1 only (the pool is part 2's).
+            const auto wide_inputs = [&]<unsigned W>() {
+                const auto mask = enqueue_qsa_prefill_dense_inputs<W>(tiles, t, config);
+                if (!mask) return false;
+                if (mask != 0x1fU)
+                    for (unsigned g = 0; g < W / 64U; ++g) enqueue_qsa_prefill_projection<64U>(tiles, t + 8U * g, config, part, nullptr, mask);
+                t += W / 8U;
+                return true;
+            };
+            if (part == 1U && dense_wide && left >= 32U && wide_inputs.template operator()<256U>()) continue;
+            if (part == 1U && dense_wide && left >= 16U && wide_inputs.template operator()<128U>()) continue;
             if (left >= 8U) { enqueue_qsa_prefill_projection<64U>(tiles, t, config, part, part == 2U ? pool : nullptr); t += 8U; }
             else if (left >= 4U) { enqueue_qsa_prefill_projection<32U>(tiles, t, config, part, part == 2U ? pool : nullptr); t += 4U; }
             else if (left >= 2U) { enqueue_qsa_prefill_projection<16U>(tiles, t, config, part, part == 2U ? pool : nullptr); t += 2U; }
