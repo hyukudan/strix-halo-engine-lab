@@ -3568,6 +3568,9 @@ int STRIX_DECODE_ENTRY(
               << "  \"context_tokens\": "
               << options.context_tokens
               << ',' << '\n'
+              << "  \"context_qualified\": "
+              << (options.context_tokens == 8192 ? "true" : "false")
+              << ',' << '\n'
               << "  \"residency\": \""
               << (options.residency ==
                           strix::HipModelResidencyMode::

@@ -159,6 +159,7 @@ struct Options {
     bool profile_explicit = false;
     bool any_low_level_flag = false;
     bool context_explicit = false;
+    bool unqualified_context = false; // lab: qualified profiles at a context other than 8192
     std::string model_path;
     std::vector<std::uint32_t> tokens;
     std::uint64_t context_tokens = 128;
@@ -799,7 +800,7 @@ inline Options parse_options(
             "[--numerical-profile exact-v5|hc-splitk-f32-v1|q51-a8-down-v1|hc-splitk-f32+q51-a8-down-v1|q51-q80-a8-down-v1|hc-splitk-f32+q51-q80-a8-down-v1|hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup-v1|hc-deferred-norm-f32+q51-q80-a8-down-v1|hc-deferred-norm-f32+q51-q80-a8-down+q5k-a8-gateup-v1|hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup+dense-a8-v1|hc-deferred-norm-f32+q51-q80-a8-down+q5k-a8-gateup+dense-a8-v1] "
             "[--teacher-forced-score --generate 1 [--teacher-logits-file PATH]] "
             "[--gpu-greedy-token] [--logprob-token ID ...] [--offline-tuning-cache FILE [--offline-compile-provenance FILE]] [--gdn-recurrent-layout baseline|stride32|stride33|transposed] [--gdn-recurrent-storage key-value|value-key] [--known-prefix-window --known-prefix-rows 2|4|8 --known-prefix-expert-union] [--known-window-router-rows] [--known-prefix-prefill-rows 16..2048 --known-prefix-workspace-budget-bytes N --known-prefix-host-metadata-budget-bytes N --known-prefix-uma-budget-bytes N --known-prefix-host-headroom-bytes N] [--prompt-lookup [--prompt-lookup-depth 0|1|2 | --prompt-lookup-adaptive] [--prompt-lookup-snapshot occupied-kv-v1 --prompt-lookup-snapshot-bytes N]] [--serve-prefix-u32le FILE ... --serve-concurrency 1|2|4 [--serve-tensor-cohort-rows 2|4 | --serve-prefill-rows 2|4|8|16..2048 --serve-prefill-workspace-budget-bytes N --serve-prefill-host-metadata-budget-bytes N] --serve-memory-budget-bytes N --serve-request-budget-bytes N --serve-headroom-bytes N] [--gdn-islands] [--qsa-hierarchical-selection] [--qsa-gqa-heads-per-block 1|2|4] [--prepared-eager] [--moe-shared-overlap [--moe-token-cost-policy]] [--moe-overlap-arena-budget-bytes N] [--batched-moe-activation] [--validation-final-state DIR] [--validation-final-state-max-bytes N] [--reference FILE] [--max-logit-error X] "
-            "[--context N] [--residency register|copy] [--coalesce-gap BYTES] [--model-copy-tier none|normalization|hot_nonexpert|experts --model-copy-payload-bytes N --model-retained-budget N --model-setup-peak-budget N] "
+            "[--context N [--unqualified-context]] [--residency register|copy] [--coalesce-gap BYTES] [--model-copy-tier none|normalization|hot_nonexpert|experts --model-copy-payload-bytes N --model-retained-budget N --model-setup-peak-budget N] "
             "[--planned-ple-io] [--ple-cpu-helper-threads 1..8] [--ple-cache-rows N --ple-cache-budget-bytes N] [--ple-max-rows-per-io N] [--ple-max-inflight-ios N] "
             "[--generate N] [--eos-token TOKEN_ID] [--prefix-cache-roundtrip] "
             "[--parallel-moe-router] [--ranked-moe-router-topk | --wave-moe-router-topk] "
@@ -1530,6 +1531,11 @@ inline Options parse_options(
             continue;
         }
 
+        if (argument == "--unqualified-context") {
+            if (options.unqualified_context) throw std::invalid_argument("duplicate unqualified context option");
+            options.unqualified_context = true;
+            continue;
+        }
         if (argument == "--context") {
             options.context_explicit = true;
             if (index + 1 >= argc) {
@@ -1783,6 +1789,8 @@ inline Options parse_options(
         throw std::invalid_argument(
             "context must be non-zero");
     }
+    if (options.unqualified_context && !options.context_explicit)
+        throw std::invalid_argument("--unqualified-context requires --context");
     if (!options.raw_recording_path.empty()) {
         strix::validate_raw_baseline_output_directory(options.raw_recording_path);
     }
@@ -1860,7 +1868,7 @@ inline OptimizationProfileResolution resolve_optimization_profile(
         return fallback("a8-runtime-not-built");
     if (content_identity != validated_model_content_identity)
         return fallback("checkpoint-content-not-qualified");
-    if (options.context_explicit && options.context_tokens != 8192)
+    if (options.context_explicit && options.context_tokens != 8192 && !options.unqualified_context)
         return fallback("context-not-qualified");
     if (options.planned_ple_io)
         return fallback("planned-ple-io-explicit");
@@ -1908,7 +1916,7 @@ inline OptimizationProfileResolution resolve_optimization_profile(
     // Explicit ranked routing keeps its requested algorithm. Otherwise the
     // exact wave replacement is the qualified faster selection.
     if (!options.ranked_moe_router_topk) options.wave_moe_router_topk = true;
-    options.context_tokens = 8192;
+    if (!options.unqualified_context || !options.context_explicit) options.context_tokens = 8192;
     result.automatic_applied = true;
     result.selected = options.ranked_moe_router_topk ? "canonical-a8-ranked-qsa-hc-shared-deferred-v3" :
                                                     "canonical-a8-wave-qsa-hc-shared-deferred-v3";
@@ -1970,7 +1978,7 @@ inline void apply_numerical_profile(
         model.hc_count != canonical.hc_count || model.hc_lowrank != canonical.hc_lowrank ||
         model.moe_intermediate_size != canonical.moe_intermediate_size ||
         model.num_experts != canonical.num_experts || model.num_experts_per_token != canonical.num_experts_per_token ||
-        options.context_tokens != 8192 || !manifest.layout_identity ||
+        (options.context_tokens != 8192 && !options.unqualified_context) || !manifest.layout_identity ||
         model_manifest_layout_identity(manifest) != manifest.layout_identity)
         throw std::invalid_argument("numerical profile requires the admitted canonical content, model and context");
     if (options.residency != HipModelResidencyMode::registered_file_mapping ||
