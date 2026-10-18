@@ -245,6 +245,8 @@ Defaults are the measured configuration.
 |---|---|
 | `STRIX_HASH_CACHE=0` / `=DIR` | Disable, or relocate, the verified SHA-256 cache of model files (default `~/.cache/strix-engine/file-sha256`). A cached digest is reused only while the file keeps its device, inode, size, mtime and ctime, and it is still checked against the expected SHA-256. |
 | `STRIX_MTP_WINDOW_COST=legacy` | Min-p window controller: EMA cost estimates without re-probes (the behaviour before D-039; default is median/minimum estimates with bounded re-probes). |
+| `STRIX_MTP_DRAFT_VOCAB=2` | Draft vocabulary policy 2 with `--mtp-draft-vocab auto:DIR` (opt-in, D-040): the chosen language pack comes from `pack2-<lang>.bin` (no rows repeated from the core; 32k rows for Chinese) and a prompt without a pack gets `core64k.bin`. Tokens are unchanged. |
+| `STRIX_MTP_DRAFT_CORE=<N>k` | With `auto:DIR`: use `core<N>k.bin` (32k, 48k, 64k ship) as the core. |
 | `STRIX_MTP_DRAFT_WORTH=0` | Draft up to `--mtp-spec-min-p` only, without asking the window cost model before each extra step. |
 | `STRIX_MTP_DRAFT_Q4_ALL=0` | Disable Q4_0 copies of the MTP draft projections. |
 | `STRIX_ANYORDER=0` | Disable any-order launches of independent kernels. |

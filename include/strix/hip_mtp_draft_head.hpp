@@ -67,7 +67,8 @@ public:
     [[nodiscard]] static std::vector<std::uint32_t> read_token_file(const std::string& path,std::uint32_t vocabulary);
     // "auto:DIR": DIR/core32k.bin plus the DIR/pack-<lang>16k.bin holding the most prompt tokens, when that is
     // at least 2 tokens and 5 % of the prompt (otherwise the core alone). Any other spec is returned unchanged.
-    // `chosen` receives a short description of the selection.
+    // `chosen` receives a short description of the selection. STRIX_MTP_DRAFT_VOCAB=2 uses pack2-<lang>.bin for the
+    // chosen pack and core64k.bin when no pack is chosen; STRIX_MTP_DRAFT_CORE=<N>k forces core<N>k.bin.
     [[nodiscard]] static std::string resolve_vocabulary_spec(const std::string& spec,
         std::span<const std::uint32_t> prompt,std::uint32_t vocabulary,std::string& chosen);
 private:

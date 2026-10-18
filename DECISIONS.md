@@ -478,6 +478,56 @@ sample, then a confident workload):
 
 Without the spike, both models settle on the same windows.
 
+## D-040: draft vocabulary policy 2 (opt-in, pending the timing campaign)
+
+The draft head proposes only from its rows: the core, the language pack chosen by the prompt, and every
+prompt or emitted token (the context rows). A full-chain diagnostic run per head variant (Q4 subset as
+deployed, Q8 subset, Q8 full head; 10 prompts: en, es, fr, de, ja x2, zh, two code, agent) measured what this
+costs.
+
+Findings:
+
+- Tokens outside the rows cost only their first appearance. Later appearances are already context rows.
+  - Generated positions whose token is outside the rows: 0.2-0.8 % with a Latin pack, 0.6-1.2 % in Japanese,
+    1-4.3 % in English and code (core only), and 6.1 % in Chinese (core32k + pack-zh16k).
+  - Share of draft misses with an out-of-rows target: 15 % (JS reasoning), 12 % (Chinese), 6.5 % (English
+    chat, agent), and at most 2.6 % elsewhere.
+- Normalising the draft probability over the subset barely moves it. On the first draft, where all head
+  variants see the same input, p(subset) / p(full head) has a median of 1.0000-1.0047 and a p90 of
+  1.003-1.085. A renormalisation or per-pack calibration has nothing to correct.
+- Pack selection by prompt picked the best pack on every prompt. Prompts without a pack (English, code, agent)
+  gain nothing from any pack.
+- Ceiling: the Q8 full head at today's draft cost would gain only +1.1 % (min-p) / +1.2 % (survival
+  controller), geometric mean. The largest gains are Chinese (+3.2 / +4.5 %), JS reasoning (+2.9 / +3.6 %) and
+  English chat (+1.3 / +1.6 %).
+- Simulation method. A subset head's argmax equals the full head's whenever the full argmax is one of its rows,
+  so any subset's chains follow from the full-head chains. They matched the real Q8 subset runs on every one
+  of 31,933 drafts.
+
+Policy 2 (`STRIX_MTP_DRAFT_VOCAB=2` with `auto:DIR`):
+
+- A chosen pack comes from `pack2-<lang>.bin`. This is the same ranking with core32k excluded: the shipped
+  packs were ranked against a 16k core, so 0.2-4.5k of their rows repeat the core. The Chinese pack doubles to
+  32k rows, which cuts its out-of-rows positions from 23 to 2 of 376.
+- A prompt without a pack gets `core64k.bin`, a longer prefix of the core32k ranking.
+
+Simulated gain against today's vocabulary, with the extra head rows priced at 0.1 ms per draft step per 16k
+rows:
+
+| | Min-p | Survival controller |
+| --- | --- | --- |
+| Geometric mean | +0.4 % | +0.6 % |
+| Chinese | +2.3 % | +3.0 % |
+| JS reasoning | +1.5 % | +1.6 % |
+| English chat | +0.4 % | +0.9 % |
+| Spanish | +0.7 % | +0.6 % |
+| Others | -0.4 to +0.4 % | |
+
+`STRIX_MTP_DRAFT_CORE=<N>k` forces the core. Tokens are unchanged: the draft only steers verification.
+
+Status: opt-in until the timing campaign. Both rules are data only, and the language is still chosen with the
+`pack-` files.
+
 ## Measured and rejected
 
 | ID | Alternative | Result | Reason |
