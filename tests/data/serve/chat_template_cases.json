@@ -1,0 +1,394 @@
+[
+ {
+  "name": "user-default",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Hello!"
+   }
+  ],
+  "expected": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nHello!<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "system-no-thinking",
+  "messages": [
+   {
+    "role": "system",
+    "content": "  You are terse.  "
+   },
+   {
+    "role": "user",
+    "content": "Hi\n"
+   }
+  ],
+  "enable_thinking": false,
+  "expected": "<|im_start|>system\nYou are terse.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+ },
+ {
+  "name": "merged-systems-low",
+  "messages": [
+   {
+    "role": "system",
+    "content": "Rule one."
+   },
+   {
+    "role": "developer",
+    "content": "Rule two."
+   },
+   {
+    "role": "user",
+    "content": "Go"
+   }
+  ],
+  "reasoning_effort": "low",
+  "expected": "<|im_start|>system\nReasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.\n\nRule one.\nRule two.<|im_end|>\n<|im_start|>user\nGo<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "effort-medium",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Q"
+   }
+  ],
+  "reasoning_effort": "medium",
+  "expected": "<|im_start|>user\nQ<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "effort-high",
+  "messages": [
+   {
+    "role": "system",
+    "content": "S"
+   },
+   {
+    "role": "user",
+    "content": "Q"
+   }
+  ],
+  "reasoning_effort": "high",
+  "expected": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.\n\nS<|im_end|>\n<|im_start|>user\nQ<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "parts",
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "text",
+      "text": "first part"
+     },
+     {
+      "type": "text",
+      "text": " second"
+     }
+    ]
+   }
+  ],
+  "expected": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nfirst part second<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "history",
+  "messages": [
+   {
+    "role": "user",
+    "content": "One?"
+   },
+   {
+    "role": "assistant",
+    "content": "Uno.",
+    "reasoning_content": "  translate  "
+   },
+   {
+    "role": "user",
+    "content": "Two?"
+   }
+  ],
+  "expected": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nOne?<|im_end|>\n<|im_start|>assistant\n<think>\ntranslate\n</think>\n\nUno.<|im_end|>\n<|im_start|>user\nTwo?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "history-no-preserve",
+  "preserve_thinking": false,
+  "messages": [
+   {
+    "role": "user",
+    "content": "One?"
+   },
+   {
+    "role": "assistant",
+    "content": "Uno.",
+    "reasoning_content": "translate"
+   },
+   {
+    "role": "user",
+    "content": "Two?"
+   },
+   {
+    "role": "assistant",
+    "content": "Dos.",
+    "reasoning_content": "again"
+   }
+  ],
+  "add_generation_prompt": false,
+  "expected": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nOne?<|im_end|>\n<|im_start|>assistant\nUno.<|im_end|>\n<|im_start|>user\nTwo?<|im_end|>\n<|im_start|>assistant\n<think>\nagain\n</think>\n\nDos.<|im_end|>\n"
+ },
+ {
+  "name": "tools-call",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Current weather in a city (°C).",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string",
+        "description": "City name, e.g. Málaga"
+       },
+       "days": {
+        "type": "integer"
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "search",
+     "description": "Search the web.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "query": {
+        "type": "string"
+       },
+       "filters": {
+        "type": "object"
+       }
+      },
+      "required": [
+       "query"
+      ]
+     }
+    }
+   }
+  ],
+  "messages": [
+   {
+    "role": "system",
+    "content": "Be helpful."
+   },
+   {
+    "role": "user",
+    "content": "Weather in Málaga for 3 days?"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "c1",
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": {
+        "city": "Málaga",
+        "days": 3
+       }
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "c1",
+    "content": "{\"temp\": 21}"
+   },
+   {
+    "role": "user",
+    "content": "And search for it."
+   }
+  ],
+  "expected": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.\n\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Current weather in a city (°C).\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. Málaga\"}, \"days\": {\"type\": \"integer\"}}, \"required\": [\"city\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"search\", \"description\": \"Search the web.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\"}, \"filters\": {\"type\": \"object\"}}, \"required\": [\"query\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nBe helpful.<|im_end|>\n<|im_start|>user\nWeather in Málaga for 3 days?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nMálaga\n</parameter>\n<parameter=days>\n3\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n{\"temp\": 21}\n</tool_response><|im_end|>\n<|im_start|>user\nAnd search for it.<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "tools-two-calls-two-results",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Current weather in a city (°C).",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string",
+        "description": "City name, e.g. Málaga"
+       },
+       "days": {
+        "type": "integer"
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "search",
+     "description": "Search the web.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "query": {
+        "type": "string"
+       },
+       "filters": {
+        "type": "object"
+       }
+      },
+      "required": [
+       "query"
+      ]
+     }
+    }
+   }
+  ],
+  "messages": [
+   {
+    "role": "user",
+    "content": "Do both"
+   },
+   {
+    "role": "assistant",
+    "content": "Calling tools now.",
+    "tool_calls": [
+     {
+      "function": {
+       "name": "search",
+       "arguments": {
+        "query": "a b",
+        "filters": {
+         "lang": "es",
+         "n": [
+          1,
+          2
+         ]
+        }
+       }
+      }
+     },
+     {
+      "function": {
+       "name": "get_weather",
+       "arguments": {
+        "city": "Oslo"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "content": "r1"
+   },
+   {
+    "role": "tool",
+    "content": "r2"
+   }
+  ],
+  "enable_thinking": false,
+  "expected": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Current weather in a city (°C).\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. Málaga\"}, \"days\": {\"type\": \"integer\"}}, \"required\": [\"city\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"search\", \"description\": \"Search the web.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\"}, \"filters\": {\"type\": \"object\"}}, \"required\": [\"query\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nDo both<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nCalling tools now.\n\n<tool_call>\n<function=search>\n<parameter=query>\na b\n</parameter>\n<parameter=filters>\n{\"lang\": \"es\", \"n\": [1, 2]}\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=get_weather>\n<parameter=city>\nOslo\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nr1\n</tool_response>\n<tool_response>\nr2\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+ },
+ {
+  "name": "tool-after-system",
+  "messages": [
+   {
+    "role": "system",
+    "content": "S"
+   },
+   {
+    "role": "tool",
+    "content": "orphan"
+   },
+   {
+    "role": "user",
+    "content": "U"
+   }
+  ],
+  "expected": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.\n\nS<|im_end|>\n<|im_start|>user\n<tool_response>\norphan\n</tool_response><|im_end|>\n<|im_start|>user\nU<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "tools-only-no-system",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "search",
+     "description": "Search the web.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "query": {
+        "type": "string"
+       },
+       "filters": {
+        "type": "object"
+       }
+      },
+      "required": [
+       "query"
+      ]
+     }
+    }
+   }
+  ],
+  "messages": [
+   {
+    "role": "user",
+    "content": "Find x"
+   }
+  ],
+  "enable_thinking": false,
+  "expected": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"search\", \"description\": \"Search the web.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\"}, \"filters\": {\"type\": \"object\"}}, \"required\": [\"query\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nFind x<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+ },
+ {
+  "name": "null-content",
+  "messages": [
+   {
+    "role": "user",
+    "content": null
+   },
+   {
+    "role": "assistant",
+    "content": null
+   },
+   {
+    "role": "user",
+    "content": "again"
+   }
+  ],
+  "expected": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\n<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n<|im_end|>\n<|im_start|>user\nagain<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "unicode-whitespace",
+  "messages": [
+   {
+    "role": "user",
+    "content": "　 leading ideographic space "
+   }
+  ],
+  "expected": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nleading ideographic space<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ }
+]

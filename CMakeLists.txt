@@ -249,6 +249,21 @@ add_executable(strix-inspect-gguf apps/inspect_gguf_main.cpp)
 target_link_libraries(strix-inspect-gguf PRIVATE strix_core)
 strix_target_warnings(strix-inspect-gguf)
 
+# Host-only serving front end (no GPU): JSON, tokenizer, chat template, HTTP and the API mapping.
+add_library(strix_serve STATIC
+    src/serve/json.cpp
+    src/serve/bpe_tokenizer.cpp
+    src/serve/chat_template.cpp
+)
+target_include_directories(strix_serve PUBLIC include PRIVATE src/serve)
+target_compile_features(strix_serve PUBLIC cxx_std_20)
+target_link_libraries(strix_serve PUBLIC Threads::Threads)
+strix_target_warnings(strix_serve)
+
+add_executable(strix-tokenize apps/tokenize_main.cpp)
+target_link_libraries(strix-tokenize PRIVATE strix_serve)
+strix_target_warnings(strix-tokenize)
+
 add_executable(strix-mtp-manifest-audit apps/mtp_manifest_audit_main.cpp)
 target_link_libraries(strix-mtp-manifest-audit PRIVATE strix_core)
 strix_target_warnings(strix-mtp-manifest-audit)
@@ -289,6 +304,11 @@ if(BUILD_TESTING OR STRIX_BUILD_EXPERIMENTAL_Q4K_A8_PROBE OR STRIX_ENABLE_EXPERI
     endif()
 endif()
 if(BUILD_TESTING)
+    add_executable(strix-serve-frontend-tests tests/serve_frontend_tests.cpp)
+    target_link_libraries(strix-serve-frontend-tests PRIVATE strix_serve)
+    strix_target_warnings(strix-serve-frontend-tests)
+    add_test(NAME strix-serve-frontend-tests COMMAND strix-serve-frontend-tests
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/serve/chat_template_cases.json)
     add_executable(strix-teacher-logit-spool-tests tests/teacher_logit_spool_tests.cpp)
     target_compile_features(strix-teacher-logit-spool-tests PRIVATE cxx_std_20)
     target_include_directories(strix-teacher-logit-spool-tests PRIVATE include)
