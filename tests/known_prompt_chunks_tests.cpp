@@ -20,7 +20,7 @@ public:
     strix::KnownWindowOutputPolicy output_policy() const noexcept override {return policy;}
     std::uint32_t logical_rows() const noexcept override {return width;}
     unsigned windows=0,serials=0;
-    unsigned state_windows=0,state_serials=0;
+    unsigned state_windows=0,state_serials=0,headless_windows=0;
     bool fail_partial_window=false,bad_extent=false,nonfinite=false,poisoned=false;
     std::vector<std::pair<std::uint64_t,std::uint32_t>> inputs;
     std::vector<float> values(std::uint32_t input) const {
@@ -49,9 +49,12 @@ public:
         inputs.emplace_back(position+1U,tokens[1]);return values(tokens[1]);
     }
     void execute_state_rows(std::span<const std::uint32_t> tokens,std::uint64_t position) override {
-        if(policy!=strix::KnownWindowOutputPolicy::state_only||tokens.size()!=width)
-            throw std::invalid_argument("mock state-only window policy/width differs");
-        ++windows;++state_windows;
+        // State-only policy windows, and headless tiled-prefill blocks (a block followed by more prompt, whose head is
+        // never read) under any policy.
+        if(tokens.size()!=width)
+            throw std::invalid_argument("mock state-only window width differs");
+        ++windows;
+        if(policy==strix::KnownWindowOutputPolicy::state_only) ++state_windows; else ++headless_windows;
         for(std::size_t row=0;row<tokens.size();++row){inputs.emplace_back(position+row,tokens[row]);
             if(fail_partial_window&&row==1U){poisoned=true;throw std::runtime_error("partial state-only failure");}}
     }
