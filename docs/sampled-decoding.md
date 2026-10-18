@@ -68,3 +68,15 @@ can differ.
 Each decided row copies one FP32 vocabulary row (about 1 MB) to the host and builds its distribution there; each
 draft step copies the draft head's rows and completes before the next step. Rows after the first rejection are not
 decided. A device-side transform is a possible follow-up.
+
+## Validation
+
+- `strix-token-sampling-tests` checks the transform, a single speculative decision (draft on a vocabulary subset)
+  and whole sequences generated in the shape of the engine cycle (sampled draft chain with early stop, windows with
+  fewer rows than drafts, ordered row decisions) against exact target probabilities with chi-square tests, for
+  temperature, top-k, top-p and min-p. Accepting every draft, or replacing the residual by `p`, fails them.
+- On hardware (Qwen3.8-Flash-Next, production MTP flags): temperature 0 output is identical to the previous greedy
+  binary with replay error 0; one seed reproduces its tokens; 300 speculative against 300 plain sampled requests
+  (T = 1, six tokens, 1,059 draft decisions) pass a two-sample chi-square test at every position.
+- Not yet measured: throughput. Single smoke runs at T = 0.6-0.7 produced 2-2.5 times the tokens per second of
+  plain sampling.
