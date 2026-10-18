@@ -395,7 +395,7 @@ cold) or an uncached process; timings are single smoke runs on shared nodes, not
 MTP cycle counts can differ between identical runs (the window cost model is timing-driven); tokens, replay and
 state digests do not.
 
-## D-036: survival window controller and active rows (opt-in, pending the timing campaign)
+## D-038: survival window controller and active rows (opt-in, pending the timing campaign)
 
 `STRIX_MTP_CONTROLLER=survival` replaces the D-022 cut (the chain stops at the first draft below
 `--mtp-spec-min-p`, and that cut also caps the window) by two separate decisions:

@@ -251,7 +251,7 @@ Defaults are the measured configuration.
 | `STRIX_MTP_GREEDY_ROWS=0` | Use per-row selectors instead of on-stream argmax of all window rows. |
 | `STRIX_CYCLE_TIMING=1` | Print host phase timings per MTP cycle. |
 | `STRIX_CYCLE_LOG=1` | Print each MTP cycle's window rows and wall time (with the survival controller also the draft chain's wall time and steps). |
-| `STRIX_MTP_CONTROLLER=survival` | Survival window controller (opt-in, D-036): the draft cut and the window choice come from a calibrated estimate of prefix survival against separated costs instead of the `--mtp-spec-min-p` cut. Tokens are unchanged. |
+| `STRIX_MTP_CONTROLLER=survival` | Survival window controller (opt-in, D-038): the draft cut and the window choice come from a calibrated estimate of prefix survival against separated costs instead of the `--mtp-spec-min-p` cut. Tokens are unchanged. |
 | `STRIX_MTP_ACTIVE_ROWS=1` | With the survival controller: the R4 owner may also verify 3 active rows and the R8 owner 6. The remaining rows are padding outside the routed expert union and acceptance. |
 | `STRIX_MTP_EXPLORE=P` | With the survival controller: one more draft after a first draft whose calibrated acceptance is below P (default 0, off). |
 | `STRIX_MTP_REPROBE=N` | With the survival controller: a window option unused for N cycles (default 64, 0 = never) is chosen once more and a lower cost sample replaces its estimate, so one slow sample cannot price it out for the rest of the run. |
