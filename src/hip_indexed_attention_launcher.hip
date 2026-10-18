@@ -4203,7 +4203,7 @@ void launch_qsa_rows_input(bool prefetch, bool a8, const QsaRowsInputViews<Rows>
 }
 template <WeightKind Kind, unsigned Rows>
 void launch_qsa_rows_output(bool wave8, bool a8, const QsaRowsOutputViews<Rows>& views, const void* weights,
-    std::uint32_t width, std::uint32_t hidden, hipStream_t stream) {
+    std::uint32_t width, std::uint32_t hidden, hipStream_t stream, bool f16 = false) {
     if constexpr (Rows > 8U) if (Kind != WeightKind::q8_0 || !(wave8 || a8)) {
         for (unsigned first = 0; first < Rows; first += 8U) {
             QsaRowsOutputViews<8U> slice{};
@@ -4217,7 +4217,7 @@ void launch_qsa_rows_output(bool wave8, bool a8, const QsaRowsOutputViews<Rows>&
         site.segments = q8_rows::segments({{weights, hidden}});
         for (unsigned r = 0; r < Rows; ++r) { site.input[r] = views.input[r]; site.output[r] = views.output[r]; }
         site.width = width; site.outputs = hidden;
-        q8_rows::launch(site, a8, stream);
+        q8_rows::launch_prefill(site, a8, f16, stream);
         return;
     }
     hipLaunchKernelGGL(HIP_KERNEL_NAME(linear_float_to_bf16_rows_kernel<Kind, Rows>), dim3(hidden), dim3(kThreads), 0,
@@ -4560,7 +4560,7 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
     }
     dispatch_weight_kind(tensors.out.manifest->ggml_type, [&](auto kind) {
         launch_qsa_rows_output<decltype(kind)::value, Rows>(config.wave8_q8_output, config.dense_a8_projections, out,
-            reinterpret_cast<const void*>(tensors.out.runtime->address), a.attention_width, a.hidden, stream);
+            reinterpret_cast<const void*>(tensors.out.runtime->address), a.attention_width, a.hidden, stream, config.dense_f16_prefill);
     });
     check_hip(hipGetLastError(), "QSA known-window output projection launch");
 }
@@ -4743,7 +4743,7 @@ unsigned enqueue_qsa_prefill_dense_inputs(const std::vector<QsaKnownRows<8U>>& t
     if (!mask) return 0U;
     for (unsigned r = 0; r < W; ++r) site->input[r] = reinterpret_cast<const void*>(tiles[first + r / 8U].row[r % 8U].input.address);
     site->width = a.hidden; site->outputs = site->segments.first[site->segments.count];
-    q8_rows::launch_dense_a8(*site, hip_execution_stream(), false);
+    q8_rows::launch_prefill(*site, true, config.dense_f16_prefill, hip_execution_stream());
     check_hip(hipGetLastError(), "QSA prefill dense A8 input projection launch");
     return mask;
 }

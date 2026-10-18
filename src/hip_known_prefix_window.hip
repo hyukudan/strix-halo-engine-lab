@@ -387,6 +387,8 @@ struct HipKnownPrefixWindow::Impl {
         shared_config.prefetch_eligible_layers = config.shared_expert_prefetch_layers;
         shared_config.prefetch_stats = config.shared_expert_prefetch_stats;
         shared_config.dense_a8_projections = config.dense_a8;
+        // Fast prefill profile (prefill catalog only): FP16 WMMA dense projections in 32..256-row prompt launches.
+        shared_config.dense_f16_prefill = (config.fast_prefill_components & kFastPrefillDense) != 0U;
         shared_fallback = shared_config;
         shared_fallback.prefetch_q8 = false; shared_fallback.prefetch_eligible_layers.clear();
         gdn_config.model = model; gdn_config.activation = config.activation;
@@ -396,6 +398,7 @@ struct HipKnownPrefixWindow::Impl {
         gdn_config.virtual_q8_output_projection = config.virtual_q8_gdn_output;
         gdn_config.wave8_q8_output_projection = config.wave8_q8_gdn_output;
         gdn_config.dense_a8_projections = config.dense_a8;
+        gdn_config.dense_f16_prefill = (config.fast_prefill_components & kFastPrefillDense) != 0U;
         r2_entries[0] = {KnownWindowR2Variant::shared_q8_virtual256_r2_v1, this,
             [](std::span<const ExecutionDispatchContext, 2> rows, void* object) {
                 const auto& self = *static_cast<Impl*>(object);
@@ -560,6 +563,7 @@ struct HipKnownPrefixWindow::Impl {
         qsa_config.prefetch_stats=config.qsa_input_prefetch_stats;
         qsa_config.wave8_q8_output=config.wave8_q8_qsa_output;
         qsa_config.dense_a8_projections=config.dense_a8;
+        qsa_config.dense_f16_prefill=(config.fast_prefill_components & kFastPrefillDense) != 0U;
         qsa_fallback=qsa_config;
         qsa_fallback.prefetch_q8_input=false; qsa_fallback.prefetch_eligible_layers.clear();
         // One entry per QSA variant actually selected (layers may differ in indexer format).
@@ -643,6 +647,7 @@ struct HipKnownPrefixWindow::Impl {
         hyper_config.splitk_deferred_norm=config.splitk_deferred_norm;
         hyper_config.prefetch_hc_projection_next_tile=config.prefetch_hc_projection_next_tile;
         hyper_config.arithmetic_stats=config.arithmetic_stats;
+        hyper_config.fast_prefill_wmma=(config.fast_prefill_components & kFastPrefillHc) != 0U;
         hyper_fallback=hyper_config; hyper_fallback.lane_chain_output=false;
         rows_entries.push_back({window.logical_rows==2U?KnownWindowR2Variant::hyper_mix_rows2_v1:
             window.logical_rows==4U?KnownWindowR2Variant::hyper_mix_rows4_v1:KnownWindowR2Variant::hyper_mix_rows8_v1,this,

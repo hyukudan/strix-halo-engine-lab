@@ -32,7 +32,7 @@ std::uint32_t checked_u32(
 HipGdnLauncherConfig make_gdn_config(const ModelContract& model,
     HipActivationStorage activation, bool graph, bool virtual_q8, bool prefetch_q8, bool virtual_output,
     bool wave8, bool wave8_output, HipGdnRecurrentLayout recurrent_layout = HipGdnRecurrentLayout::baseline,
-    GdnRecurrentStorage recurrent_storage = GdnRecurrentStorage::key_value, bool dense_a8 = false) {
+    GdnRecurrentStorage recurrent_storage = GdnRecurrentStorage::key_value, bool dense_a8 = false, bool dense_f16 = false) {
     HipGdnLauncherConfig config;
     config.model = model;
     config.activation = activation;
@@ -45,6 +45,7 @@ HipGdnLauncherConfig make_gdn_config(const ModelContract& model,
     config.recurrent_layout = recurrent_layout;
     config.recurrent_storage = recurrent_storage;
     config.dense_a8_projections = dense_a8;
+    config.dense_f16_prefill = dense_f16;
     return config;
 }
 
@@ -55,7 +56,8 @@ indexed_attention_config(
     std::vector<std::uint32_t> layers = {}, std::shared_ptr<qsa_input_prefetch::RuntimeDispatchStats> stats = {},
     bool wave8_output = false, bool hierarchical_selection = false,
     std::shared_ptr<QsaHierarchicalSelectionStats> selection_stats = {},
-    std::uint32_t gqa_heads = 1, std::shared_ptr<QsaHierarchicalSelectionStats> gqa_stats = {}, bool dense_a8 = false) {
+    std::uint32_t gqa_heads = 1, std::shared_ptr<QsaHierarchicalSelectionStats> gqa_stats = {}, bool dense_a8 = false,
+    bool dense_f16 = false) {
     HipIndexedAttentionLauncherConfig config;
     config.model = model;
     config.activation = activation;
@@ -69,6 +71,7 @@ indexed_attention_config(
     config.qsa_gqa_heads_per_block = gqa_heads;
     config.gqa_stats = std::move(gqa_stats);
     config.dense_a8_projections = dense_a8;
+    config.dense_f16_prefill = dense_f16;
     return config;
 }
 
@@ -122,7 +125,7 @@ hyper_mix_config(
     const ModelContract& model,
     HipActivationStorage activation, bool parallel, bool staged, bool fused, bool typed, bool prefetch_rows, bool prefetch_output, bool lane_chain,
     bool splitk, bool splitk_fp64, bool next_tile,
-    std::shared_ptr<HipHyperMixArithmeticStats> arithmetic_stats = {}, bool deferred_norm = false) {
+    std::shared_ptr<HipHyperMixArithmeticStats> arithmetic_stats = {}, bool deferred_norm = false, bool fast_prefill = false) {
     HipHyperMixLauncherConfig config;
     config.hidden_size =
         checked_u32(
@@ -153,6 +156,7 @@ hyper_mix_config(
     config.splitk_projection_fp64 = splitk_fp64;
     config.arithmetic_stats = std::move(arithmetic_stats);
     config.prefetch_hc_projection_next_tile = next_tile;
+    config.fast_prefill_wmma = fast_prefill;
     return config;
 }
 
@@ -183,7 +187,7 @@ HipSharedExpertLauncherConfig
 shared_expert_config(
     const ModelContract& model,
     HipActivationStorage activation, bool prefetch=false, std::vector<std::uint32_t> layers={}, std::shared_ptr<shared_expert_prefetch::RuntimeDispatchStats> stats={},
-    bool dense_a8=false) {
+    bool dense_a8=false, bool dense_f16=false) {
     HipSharedExpertLauncherConfig config;
     config.hidden_size =
         checked_u32(
@@ -197,6 +201,7 @@ shared_expert_config(
         activation;
     config.prefetch_q8=prefetch;config.prefetch_eligible_layers=std::move(layers);config.prefetch_stats=std::move(stats);
     config.dense_a8_projections = dense_a8;
+    config.dense_f16_prefill = dense_f16;
     return config;
 }
 
@@ -317,6 +322,9 @@ void validate_numerical_catalog_config(const ModelContract& model, const HipLaun
         throw std::invalid_argument("HIP catalog Q5K or HC deferred recipe differs from typed numerical profile");
     if (config.dense_a8 != numerical_profile_dense_a8(config.numerical_profile))
         throw std::invalid_argument("HIP catalog dense A8 recipe differs from typed numerical profile");
+    if ((config.fast_prefill_components != 0U) != numerical_profile_fast_prefill(config.numerical_profile) ||
+        (config.fast_prefill_components & ~kFastPrefillAll) != 0U)
+        throw std::invalid_argument("HIP catalog fast prefill components differ from typed numerical profile");
     if (config.dense_a8 && (!config.wave8_q8_gdn_input || !config.wave8_q8_gdn_output || !config.wave8_q8_qsa_output ||
                             !config.prefetch_q8_qsa_input || !config.prefetch_q8_shared_expert))
         throw std::invalid_argument("HIP catalog dense A8 requires the wave8/prefetch Q8 organizations it replaces");
@@ -595,12 +603,14 @@ HipLauncherCatalog::HipLauncherCatalog(
               config.activation, config.enable_device_graph_inputs)),
       gdn_config_(
           make_gdn_config(model, config.activation,
-              config.enable_device_graph_inputs, config.virtual_q8_gdn_input, config.prefetch_q8_gdn_input, config.virtual_q8_gdn_output, config.wave8_q8_gdn_input, config.wave8_q8_gdn_output, config.gdn_recurrent_layout, config.gdn_recurrent_storage, config.dense_a8)),
+              config.enable_device_graph_inputs, config.virtual_q8_gdn_input, config.prefetch_q8_gdn_input, config.virtual_q8_gdn_output, config.wave8_q8_gdn_input, config.wave8_q8_gdn_output, config.gdn_recurrent_layout, config.gdn_recurrent_storage, config.dense_a8,
+              (config.fast_prefill_components & kFastPrefillDense) != 0U)),
       gdn_(gdn_config_),
       indexed_attention_(
           indexed_attention_config(
               model,
-              config.activation, config.enable_device_graph_inputs, config.prefetch_q8_qsa_input, config.qsa_input_prefetch_layers, config.qsa_input_prefetch_stats, config.wave8_q8_qsa_output, config.qsa_hierarchical_selection, config.qsa_selection_stats, config.qsa_gqa_heads_per_block, config.qsa_gqa_stats, config.dense_a8)),
+              config.activation, config.enable_device_graph_inputs, config.prefetch_q8_qsa_input, config.qsa_input_prefetch_layers, config.qsa_input_prefetch_stats, config.wave8_q8_qsa_output, config.qsa_hierarchical_selection, config.qsa_selection_stats, config.qsa_gqa_heads_per_block, config.qsa_gqa_stats, config.dense_a8,
+              (config.fast_prefill_components & kFastPrefillDense) != 0U)),
       embedding_(
           embedding_config(
               model,
@@ -609,7 +619,8 @@ HipLauncherCatalog::HipLauncherCatalog(
           hyper_mix_config(
               model,
               config.activation, config.parallel_hyper_mix, config.staged_hyper_projections, config.fused_staged_hyper_mix, config.typed_hyper_projection, config.prefetch_typed_hyper_rows, config.prefetch_q8_hyper_output, config.lane_chain_hyper_output,
-              config.splitk_hyper_projection, config.splitk_hyper_projection_fp64, config.prefetch_hc_projection_next_tile, config.arithmetic_stats, config.splitk_deferred_norm)),
+              config.splitk_hyper_projection, config.splitk_hyper_projection_fp64, config.prefetch_hc_projection_next_tile, config.arithmetic_stats, config.splitk_deferred_norm,
+              (config.fast_prefill_components & kFastPrefillHc) != 0U)),
       moe_route_(
           moe_route_config(
               model,
@@ -626,7 +637,7 @@ HipLauncherCatalog::HipLauncherCatalog(
           shared_expert_config(
               model,
               config.activation,config.prefetch_q8_shared_expert,config.shared_expert_prefetch_layers,
-              config.shared_expert_prefetch_stats, config.dense_a8)) {
+              config.shared_expert_prefetch_stats, config.dense_a8, (config.fast_prefill_components & kFastPrefillDense) != 0U)) {
     validate_numerical_catalog_config(model, config);
     if (config.numerical_profile != DecodeNumericalProfile::exact_v5 && alternate_lm_head_)
         throw std::invalid_argument("HIP catalog numerical profile excludes alternate integer head");

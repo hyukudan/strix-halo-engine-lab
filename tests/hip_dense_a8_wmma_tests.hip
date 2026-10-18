@@ -788,6 +788,78 @@ void prompt_bench(hipStream_t stream) {
     }
 }
 
+// fast-prefill-f16wmma-v1 dense projections (q8_rows::launch_dense_f16) against the exact FP32 q8_rows
+// forms on the same inputs (flavor 0), next to dense A8: relative RMS / max error of each against
+// exact, and the times of the whole launches (convert + projection for FP16, quantize + projection
+// for A8). Rows 256 and 64 (the prompt launch sizes).
+template <class In, unsigned Rows>
+void f16_shape(const Shape& shape, hipStream_t stream, bool timing) {
+    std::mt19937 rng(99U + Rows);
+    const auto weights_host = make_weights(shape.width, shape.outputs, 0U, rng);
+    Buffer weights(weights_host.size()); weights.upload(weights_host);
+    Activations a(Rows, shape.width, shape.bf16);
+    a.upload(make_inputs(Rows, shape.width, shape.bf16, 0U, rng));
+    const std::size_t n = static_cast<std::size_t>(Rows) * shape.outputs;
+    Buffer exact_out(n * 4U), a8_out(n * 4U), f16_out(n * 4U);
+    const auto site_for = [&](Buffer& out, bool fused) {
+        (void)fused;
+        FusedSite<In, Rows> site{};
+        site.segments = q8_rows::segments({{weights.p, shape.outputs}});
+        for (unsigned r = 0; r < Rows; ++r)
+            site.input[r] = a.input.as<unsigned char>() + static_cast<std::uint64_t>(r) * a.width * sizeof(In);
+        site.width = a.width; site.outputs = shape.outputs; site.output = out.as<float>();
+        return site;
+    };
+    const auto s8 = site_for(a8_out, true), s16 = site_for(f16_out, true);
+    // Exact reference: the FP32 q8_rows forms in 64-row launches (the prompt sites' exact organization).
+    for (unsigned g = 0; g < Rows / 64U; ++g) {
+        FusedSite<In, 64U> se{};
+        se.segments = q8_rows::segments({{weights.p, shape.outputs}});
+        for (unsigned r = 0; r < 64U; ++r)
+            se.input[r] = a.input.as<unsigned char>() + static_cast<std::uint64_t>(64U * g + r) * a.width * sizeof(In);
+        se.width = a.width; se.outputs = shape.outputs; se.output = exact_out.as<float>() + static_cast<std::size_t>(64U * g) * shape.outputs;
+        q8_rows::launch(se, false, stream);
+    }
+    q8_rows::launch_dense_a8(s8, stream, false);
+    q8_rows::launch_dense_f16(s16, stream, false);
+    check(hipStreamSynchronize(stream), "f16 compare");
+    std::vector<float> e(n), x8(n), x16(n);
+    check(hipMemcpy(e.data(), exact_out.p, n * 4U, hipMemcpyDeviceToHost), "download");
+    check(hipMemcpy(x8.data(), a8_out.p, n * 4U, hipMemcpyDeviceToHost), "download");
+    check(hipMemcpy(x16.data(), f16_out.p, n * 4U, hipMemcpyDeviceToHost), "download");
+    const auto err = [&](const std::vector<float>& got, double& rel, double& mx) {
+        double sq = 0, ref = 0; mx = 0;
+        for (std::size_t i = 0; i < n; ++i) {
+            const double d = static_cast<double>(got[i]) - e[i];
+            sq += d * d; ref += static_cast<double>(e[i]) * e[i]; mx = std::max(mx, std::abs(d));
+        }
+        rel = std::sqrt(sq / ref); mx /= std::sqrt(ref / static_cast<double>(n));
+    };
+    double r8, m8, r16, m16;
+    err(x8, r8, m8); err(x16, r16, m16);
+    std::cout << std::defaultfloat;
+    std::cout.precision(6);
+    std::cout << "f16 " << shape.name << " " << shape.width << "->" << shape.outputs << " T=" << Rows << ": error vs exact A8 rel " << r8
+              << " max " << m8 << " | F16 rel " << r16 << " max " << m16;
+    require(r16 < 1e-2 && std::isfinite(r16), "dense FP16 outside the error bound");
+    if (timing) {
+        const double flop = 2.0 * Rows * shape.width * shape.outputs;
+        const float t8 = median_us([&] { q8_rows::launch_dense_a8(s8, stream, false); }, stream);
+        const float t16 = median_us([&] { q8_rows::launch_dense_f16(s16, stream, false); }, stream);
+        std::cout << std::fixed;
+        std::cout.precision(1);
+        std::cout << " | A8 " << t8 << " us, F16 " << t16 << " us (" << flop / (t16 * 1e6) << " TFLOPS)";
+    }
+    std::cout << '\n';
+}
+void f16_bench(hipStream_t stream, bool timing) {
+    for (const auto& shape : shapes) {
+        if (shape.bf16) { f16_shape<std::uint16_t, 256U>(shape, stream, timing); f16_shape<std::uint16_t, 64U>(shape, stream, timing); }
+        else { f16_shape<float, 256U>(shape, stream, timing); f16_shape<float, 64U>(shape, stream, timing); }
+    }
+    std::cout << "dense FP16 within the error bound: ok (overflows " << q8_rows::dense_f16_overflow_count() << ")\n";
+}
+
 void bench(hipStream_t stream) {
     std::cout.setf(std::ios::fixed); std::cout.precision(1);
     for (const auto& shape : shapes) {
@@ -873,6 +945,7 @@ int main() try {
         }
         std::cout << "dense A8: quantizer == reference, WMMA == dot4 == serial reference bitwise: " << cases << " cases\n";
     }
+    if (std::getenv("STRIX_DENSE_F16")) f16_bench(stream, std::getenv("STRIX_DENSE_F16")[0] == '2');
     if (std::getenv("STRIX_DENSE_A8_PROMPT_BENCH")) prompt_bench(stream);
     if (std::getenv("STRIX_DENSE_A8_EXACT_BENCH")) exact_bench(stream);
     if (std::getenv("STRIX_DENSE_A8_BENCH")) engine_bench(stream);

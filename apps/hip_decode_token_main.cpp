@@ -1598,18 +1598,24 @@ int STRIX_DECODE_ENTRY(
     auto prefill_catalog_config = catalog_config;
     if (profile_pair.split()) {
         const bool prefill_dense_a8 = strix::numerical_profile_dense_a8(profile_pair.prefill);
+        // A fast prefill profile keeps its decode sibling's kernel plan (dense A8 equal) and differs in the
+        // arithmetic of its prefill launchers; the dense A8 pairs differ in the dense projections' plan.
+        const bool fast = strix::numerical_profile_fast_prefill(profile_pair.prefill);
         if (strix::numerical_profile_hc_splitk(profile_pair.prefill) != hc_splitk_f32 ||
             strix::numerical_profile_hc_deferred_norm(profile_pair.prefill) != hc_deferred_norm ||
             strix::numerical_profile_q5k_a8_gateup(profile_pair.prefill) != q5k_a8_gateup ||
             strix::numerical_profile_q51_a8_down(profile_pair.prefill) != a8_down_q51 ||
-            strix::numerical_profile_q80_a8_down(profile_pair.prefill) != a8_down_q80 || prefill_dense_a8 == dense_a8 ||
-            integer_config)
-            throw std::invalid_argument("prefill numerical profile may differ from the decode profile only in dense A8");
+            strix::numerical_profile_q80_a8_down(profile_pair.prefill) != a8_down_q80 ||
+            (fast ? prefill_dense_a8 != dense_a8 : prefill_dense_a8 == dense_a8) || integer_config)
+            throw std::invalid_argument("prefill numerical profile may differ from the decode profile only in dense A8 "
+                "or in the prefill-only arithmetic of a fast prefill profile");
         auto prefill_binding_request = binding_request;
         auto prefill_buffer_request = buffer_request;
         prefill_binding_request.dense_a8 = prefill_buffer_request.dense_a8 = prefill_dense_a8;
+        if (fast) prefill_binding_request.prefill_arithmetic_identity = strix::numerical_profile_pair_identity(profile_pair);
         prefill_catalog_config.numerical_profile = profile_pair.prefill;
         prefill_catalog_config.dense_a8 = prefill_dense_a8;
+        prefill_catalog_config.fast_prefill_components = profile_pair.fast_components;
         strix::kernels::KernelRegistry prefill_kernel_registry;
         strix::register_complete_hip_kernel_catalog(model, prefill_binding_request, prefill_catalog_config,
             prefill_kernel_registry, nullptr);
@@ -1618,6 +1624,7 @@ int STRIX_DECODE_ENTRY(
         strix::validate_sibling_serial_executions(*compiled_prefill, compiled);
         optimization_profile_receipt +=
             "  \"prefill_dense_a8_configured\": " + std::string(prefill_dense_a8 ? "true" : "false") + ",\n" +
+            "  \"prefill_fast_components\": " + std::to_string(profile_pair.fast_components) + ",\n" +
             "  \"prefill_serial_execution_identity\": " + std::to_string(compiled_prefill->execution_identity) + ",\n" +
             "  \"prefill_serial_kernel_plan_identity\": " + std::to_string(compiled_prefill->kernel_plan_identity) + ",\n" +
             "  \"prefill_serial_scratch\": \"shared-sibling-view-of-decode-serial-arena\",\n";

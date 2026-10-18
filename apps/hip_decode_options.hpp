@@ -159,6 +159,8 @@ struct Options {
     // Prompt prefill arithmetic (--prefill-numerical-profile). Absent: the prefill uses
     // numerical_profile. Decode and MTP windows always use numerical_profile.
     std::optional<strix::DecodeNumericalProfile> prefill_numerical_profile;
+    // --prefill-fast-components hc,dense,moe: the components a fast prefill profile runs (all by default).
+    std::optional<std::uint32_t> prefill_fast_components;
     bool profile_explicit = false;
     bool any_low_level_flag = false;
     bool context_explicit = false;
@@ -416,7 +418,9 @@ inline void validate_numerical_profile_cli(const Options& options) {
 // The resolved prefill/decode arithmetic pair. Without --prefill-numerical-profile the prefill
 // runs the decode profile, so every existing route keeps its single-profile behaviour.
 inline strix::NumericalProfilePair numerical_profile_pair(const Options& options) noexcept {
-    return {options.prefill_numerical_profile.value_or(options.numerical_profile), options.numerical_profile};
+    const auto prefill = options.prefill_numerical_profile.value_or(options.numerical_profile);
+    return {prefill, options.numerical_profile,
+        strix::numerical_profile_fast_prefill(prefill) ? options.prefill_fast_components.value_or(strix::kFastPrefillAll) : 0U};
 }
 
 // A split pair is admitted only where the code runs it: the tiled known-prefix prefill
@@ -424,10 +428,15 @@ inline strix::NumericalProfilePair numerical_profile_pair(const Options& options
 // prefill profile. Everything else keeps one profile for both phases.
 inline void validate_prefill_numerical_profile_cli(const Options& options) {
     const auto pair = numerical_profile_pair(options);
+    if (strix::numerical_profile_fast_prefill(options.numerical_profile))
+        throw std::invalid_argument("fast prefill profiles are prefill-only (--prefill-numerical-profile)");
+    if (options.prefill_fast_components && !strix::numerical_profile_fast_prefill(pair.prefill))
+        throw std::invalid_argument("--prefill-fast-components requires a fast prefill numerical profile");
     if (!pair.split()) return;
     if (!options.numerical_profile_explicit || !strix::numerical_profile_pair_admitted(pair))
         throw std::invalid_argument("prefill numerical profile may differ from an explicit --numerical-profile only in "
-            "the dense A8 projections (q5k-a8-gateup profiles with and without +dense-a8)");
+            "the dense A8 projections (q5k-a8-gateup profiles with and without +dense-a8), or be "
+            "fast-prefill-f16wmma-v1 paired with hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup+dense-a8-v1");
     const bool tiled = options.known_prefix_window && options.known_prefix_prefill_rows && options.known_prefix_full_rows;
     if (tiled == options.mtp.enabled)
         throw std::invalid_argument("prefill numerical profile requires exactly one prefill route: the tiled known-prefix "
@@ -935,6 +944,24 @@ inline Options parse_options(
             if (!parsed)
                 throw std::invalid_argument("--prefill-numerical-profile requires a supported numerical recipe");
             options.prefill_numerical_profile = *parsed;
+            continue;
+        }
+        if (argument == "--prefill-fast-components") {
+            if (options.prefill_fast_components || index + 1 >= argc)
+                throw std::invalid_argument("--prefill-fast-components requires one list of hc, dense, moe");
+            std::string_view list = argv[++index];
+            std::uint32_t mask = 0;
+            while (!list.empty()) {
+                const auto comma = list.find(',');
+                const auto item = list.substr(0, comma);
+                const std::uint32_t bit = item == "hc" ? strix::kFastPrefillHc : item == "dense" ? strix::kFastPrefillDense
+                    : item == "moe" ? strix::kFastPrefillMoe : 0U;
+                if (!bit || (mask & bit)) throw std::invalid_argument("--prefill-fast-components accepts hc, dense, moe once each");
+                mask |= bit;
+                list = comma == std::string_view::npos ? std::string_view{} : list.substr(comma + 1U);
+            }
+            if (!mask) throw std::invalid_argument("--prefill-fast-components requires at least one component");
+            options.prefill_fast_components = mask;
             continue;
         }
         if(argument=="--mtp") {

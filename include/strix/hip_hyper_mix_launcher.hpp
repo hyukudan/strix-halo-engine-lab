@@ -47,6 +47,8 @@ struct HipHyperMixLauncherConfig {
     bool splitk_deferred_norm = false;
     // Exact current-weight, eager-only raw next-tile projection pipeline.
     bool prefetch_hc_projection_next_tile = false;
+    // fast-prefill-f16wmma-v1: the wide prefill rows run the FP16 WMMA projection/output kernels (prefill only).
+    bool fast_prefill_wmma = false;
     HipActivationStorage activation =
         HipActivationStorage::bf16;
     std::shared_ptr<HipHyperMixArithmeticStats> arithmetic_stats;

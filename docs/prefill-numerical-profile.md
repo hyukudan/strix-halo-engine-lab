@@ -70,3 +70,31 @@ a single-profile run from the start.
 - MTP goldens (version 2) record the prefill and decode profile identities; see
   [the golden format](mtp-forward-golden-file.md). A golden dumped under one pair is rejected under
   another before any target work; a version-1 golden is admitted only for a single-profile run.
+
+## Fast prefill profile (draft)
+
+`fast-prefill-f16wmma-v1` is a prefill-only profile (rejected as `--numerical-profile`). It is admitted
+only with the decode profile `hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup+dense-a8-v1`, on the same two
+routes and with the same rejections as the pairs above. Its prefill execution is compiled from the decode
+profile's binding and buffer requests (same kernel ids, steps, arena and state layout), so the handoff
+state is an ordinary decode input state; `prefill_arithmetic_identity` folds the pair identity into the
+prefill execution's kernel-plan and execution identities, so the two executions remain distinct siblings.
+The prefill launchers are configured with the profile's components, recorded as `prefill_fast_components`
+and selected by `--prefill-fast-components hc,dense,moe` (any non-empty subset, default all; a subset has
+its own pair identity):
+
+- `hc`: the wide prefill HC steps run FP16 WMMA projections: down (10240 -> 320) with the injection
+  sharing the input read, and up (320 -> 10240) with the sigmoid and four-stream mix in the epilogue.
+  Effective Q8_0 weights (scale x code, exact in FP32) are rounded to FP16 by a pack kernel per call;
+  the normalized rows and the low values are rounded to FP16 as operands; accumulation is FP32 over the
+  whole width. The FP32 low values, the injection (FP32 inputs and weights, FP32 FMA chains) and the mix
+  (stream order) keep FP32 arithmetic. Steps that do not take the wide path keep the decode profile's
+  kernels.
+- `dense`: GDN, QSA and shared-expert dense projections of prompt launches of 32..256 rows run
+  FP16 x FP16 -> FP32 WMMA: activations rounded to FP16 into a scratch slot (finite values beyond the
+  FP16 range are counted), Q8_0 blocks dequantized to FP16 in LDS by the projection. Launches of other
+  row counts keep dense A8. The GDN output projection does not use the fused A8 quantizer.
+- `moe`: routed MoE (separate branch). On this branch the bit is recorded but selects no kernel yet.
+
+Router, QSA indexer, attention, GDN recurrence, PLE and LM head keep the decode profile's arithmetic.
+Tokens differ from a dense-A8 run; exactness is defined from the handoff state as for every split pair.

@@ -3733,6 +3733,8 @@ bool wide_hyper_rows(const PreparedHyperRows& prepared, const HipHyperMixLaunche
     return true;
 }
 
+#include "hip_hc_fast_wmma.inc"
+
 constexpr unsigned kSkipKernel = 255U;  // test seam: launch only the other kernel
 // Transposed low values for the wide2 output kernel: 320 x up to kWide2LowRows rows (prefill steps).
 constexpr std::uint32_t kWide2LowRows = 4096U;
@@ -3755,7 +3757,7 @@ void launch_wide_hyper_kernels(const HyperWideRows& wide_in, const void* down, c
     // The wide2 output kernel reads the transposed low values the wide2 projection writes (rows padded
     // to whole 32-row groups).
     HyperWideRows wide = wide_in;
-    if (output_kernel == 1U && (projection_kernel == 1U || projection_kernel == kSkipKernel) &&
+    if (output_kernel == 1U && (projection_kernel == 1U || projection_kernel == 2U || projection_kernel == kSkipKernel) &&
         (wide.count + kWide2OutputRows - 1U) / kWide2OutputRows * kWide2OutputRows <= kWide2LowRows) {
         wide.low_t = wide2_low_scratch();
         wide.low_t_pitch = (wide.count + kWide2OutputRows - 1U) / kWide2OutputRows * kWide2OutputRows;
@@ -3767,6 +3769,60 @@ void launch_wide_hyper_kernels(const HyperWideRows& wide_in, const void* down, c
     static const unsigned output_rows = [] {
         const char* v = std::getenv("STRIX_HC_WIDE_OUTPUT_ROWS"); return v ? static_cast<unsigned>(std::atoi(v)) : 0U; }();
     const bool large = wide.count >= 128U;
+    // Kernels 2 (fast-prefill-f16wmma-v1): FP16 WMMA projection and output over per-call FP16 weight packs;
+    // output kernel 2 reads the FP16 low values projection kernel 2 writes; output kernel 1 (the FP32 lane-chain
+    // output) reads the transposed FP32 low values it also writes.
+    if (projection_kernel == 2U || output_kernel == 2U) {
+        if (wide.count > kHcwLowRows || config.hc_count != 4U)
+            throw std::invalid_argument("HC WMMA rows: row count or stream count unsupported");
+        const auto scratch = hcw_scratch();
+        if (projection_kernel == 2U) {
+            hipLaunchKernelGGL(hcw_pack_down_kernel, dim3((kHcwRank * kHcwStages + 255U) / 256U), dim3(256U), 0, stream,
+                static_cast<const unsigned char*>(down), scratch.down, scratch.overflow);
+            static const unsigned dbg = [] { const char* v = std::getenv("STRIX_HCW_DBG_PROJ"); return v ? static_cast<unsigned>(std::atoi(v)) : 0U; }();
+            const auto proj = [&]<unsigned D>() {
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(hcw_projection_kernel<D>), dim3(kHcwProjColBlocks, (wide.count + kHcwProjRows - 1U) / kHcwProjRows),
+                    dim3(256U), 0, stream, wide, scratch.down, static_cast<const float*>(inject), config.hc_count, scratch.low16);
+            };
+            switch (dbg) {
+            case 1U: proj.template operator()<1U>(); break;
+            case 2U: proj.template operator()<2U>(); break;
+            case 3U: proj.template operator()<3U>(); break;
+            case 4U: proj.template operator()<4U>(); break;
+            case 7U: proj.template operator()<7U>(); break;
+            default: proj.template operator()<0U>(); break;
+            }
+            check_hip(hipGetLastError(), "prefill HC WMMA projection launch");
+        } else if (projection_kernel != kSkipKernel) throw std::invalid_argument("HC WMMA output requires the WMMA projection");
+        if (output_kernel == kSkipKernel) return;
+        if (output_kernel == 1U && wide.low_t) {
+            projection_kernel = kSkipKernel;  // fall through to the lane-chain output below
+        } else {
+        if (output_kernel != 2U) throw std::invalid_argument("HC WMMA projection requires the WMMA or lane-chain output");
+        hipLaunchKernelGGL(hcw_pack_up_kernel, dim3((4U * config.hidden_size * (kHcwRank / 32U) + 255U) / 256U), dim3(256U), 0, stream,
+            static_cast<const unsigned char*>(up), scratch.up, config.hidden_size, scratch.overflow);
+        const dim3 grid((wide.count + kHcwOutRows - 1U) / kHcwOutRows, config.hidden_size / kHcwOutFeatures);
+        static const unsigned dbg_out = [] { const char* v = std::getenv("STRIX_HCW_DBG_OUT"); return v ? static_cast<unsigned>(std::atoi(v)) : 0U; }();
+        const auto out = [&]<typename Storage, unsigned D>() {
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(hcw_output_kernel<Storage, D>), grid, dim3(256U), 0, stream, wide, scratch.up,
+                scratch.low16, config.hidden_size);
+        };
+        const auto outd = [&]<typename Storage>() {
+            switch (dbg_out) {
+            case 1U: out.template operator()<Storage, 1U>(); break;
+            case 2U: out.template operator()<Storage, 2U>(); break;
+            case 4U: out.template operator()<Storage, 4U>(); break;
+            case 8U: out.template operator()<Storage, 8U>(); break;
+            case 15U: out.template operator()<Storage, 15U>(); break;
+            default: out.template operator()<Storage, 0U>(); break;
+            }
+        };
+        if (config.activation == HipActivationStorage::bf16) outd.template operator()<std::uint16_t>();
+        else outd.template operator()<float>();
+        check_hip(hipGetLastError(), "prefill HC WMMA output launch");
+        return;
+        }
+    }
     if (projection_kernel == kSkipKernel) {
     } else if (projection_kernel == 1U) {
         // STRIX_HC_WIDE2_WAVES (8 default, 4): waves per block. STRIX_HC_WIDE2_VOPD=0: the C++ FMA loop
@@ -3850,6 +3906,12 @@ unsigned wide_projection_kernel() {
     static const unsigned k = [] { const char* v = std::getenv("STRIX_HC_WIDE_PROJECTION_KERNEL"); return v ? static_cast<unsigned>(std::atoi(v)) : 1U; }();
     return k;
 }
+// Fast prefill profile HC output: 1 (default, the FP32 lane-chain output on the WMMA projection's FP32 low
+// values) or STRIX_HCW_OUTPUT=2 (the FP16 WMMA output).
+unsigned fast_output_kernel() {
+    static const unsigned k = [] { const char* v = std::getenv("STRIX_HCW_OUTPUT"); return v && std::atoi(v) == 2 ? 2U : 1U; }();
+    return k;
+}
 unsigned wide_output_kernel() {
     static const unsigned k = [] { const char* v = std::getenv("STRIX_HC_WIDE_OUTPUT_KERNEL"); return v ? static_cast<unsigned>(std::atoi(v)) : 1U; }();
     return k;
@@ -3871,8 +3933,10 @@ void launch_wide_hyper_rows(const PreparedHyperRows& prepared, const HyperTileRo
     case HipActivationStorage::bf16: invoke.template operator()<std::uint16_t>(); break;
     case HipActivationStorage::fp32: invoke.template operator()<float>(); break;
     }
+    // Fast prefill profile: the FP16 WMMA kernels (2, 2).
     launch_wide_hyper_kernels(wide, reinterpret_cast<const void*>(p.down_runtime->address), inject,
-        reinterpret_cast<const void*>(p.up_runtime->address), config, wide_projection_kernel(), wide_output_kernel(), hip_execution_stream());
+        reinterpret_cast<const void*>(p.up_runtime->address), config, config.fast_prefill_wmma ? 2U : wide_projection_kernel(),
+        config.fast_prefill_wmma ? fast_output_kernel() : wide_output_kernel(), hip_execution_stream());
     if (norm && config.arithmetic_stats) {
         config.arithmetic_stats->materialized_norm_submissions.fetch_add(tiles, std::memory_order_relaxed);
         config.arithmetic_stats->splitk_f32_submissions.fetch_add(tiles, std::memory_order_relaxed);
@@ -3927,7 +3991,7 @@ void hyper_mix_known_prefill_rows_launch(std::span<const ExecutionDispatchContex
     }
     // STRIX_HC_WIDE_CHECK=1: also run the 8-row tile kernels and compare every written value bitwise.
     static const bool check = [] { const char* v = std::getenv("STRIX_HC_WIDE_CHECK"); return v && v[0] == '1'; }();
-    if (!check) {
+    if (!check || config.fast_prefill_wmma) {
         launch_wide_hyper_rows(prepared, tile_rows, wide, config, tiles, true);
         return;
     }
@@ -3950,8 +4014,8 @@ void testing::enqueue_wide_hyper_rows_test(const HipHyperMixLauncherConfig& conf
     if (config.hidden_size * config.hc_count != 10240U || config.lowrank != 320U || config.hc_count != kWideStreams ||
         config.hidden_size % (32U * kWideOutputWaves) || !views.rows || !views.normalized || !views.output || !views.down ||
         !views.up || (views.inject && !views.injection) || views.normalized_stride % 16U || !aligned(views.normalized, 16U) ||
-        !aligned(views.up, 4U) || (projection_kernel > 1U && projection_kernel != kSkipKernel) ||
-        (output_kernel > 1U && output_kernel != kSkipKernel))
+        !aligned(views.up, 4U) || (projection_kernel > 2U && projection_kernel != kSkipKernel) ||
+        (output_kernel > 2U && output_kernel != kSkipKernel))
         throw std::invalid_argument("wide HC rows test views invalid");
     HyperWideRows wide{};
     wide.normalized = views.normalized; wide.normalized_stride = views.normalized_stride;

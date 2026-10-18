@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -134,6 +135,54 @@ void compare(std::uint32_t rows, bool bf16, unsigned flavor, unsigned projection
     if (differ) throw std::runtime_error("wide HC kernels differ from the reference forms at byte " + std::to_string(first));
 }
 
+// Fast profile kernels (2/2): not bitwise; error of the low values, injection and output against the
+// reference forms relative to the RMS of the reference values, and every padding byte untouched.
+float to_float(const unsigned char* p, bool bf16) {
+    if (!bf16) { float v; std::memcpy(&v, p, 4); return v; }
+    std::uint16_t b; std::memcpy(&b, p, 2);
+    return std::bit_cast<float>(static_cast<std::uint32_t>(b) << 16U);
+}
+void compare_fast(std::uint32_t rows, bool bf16, unsigned flavor, hipStream_t stream, unsigned output = 2U) {
+    Fixture f(rows, bf16, flavor, 1234U + rows + flavor * 17U + (bf16 ? 1U : 0U));
+    const auto c = config(bf16);
+    f.reset(0xa5);
+    strix::testing::enqueue_wide_hyper_rows_test(c, f.views(), 0U, 0U, stream);
+    check(hipStreamSynchronize(stream), "reference");
+    const auto en = f.normalized.download(), ei = f.injection.download(), eo = f.output.download();
+    f.reset(0xa5);
+    strix::testing::enqueue_wide_hyper_rows_test(c, f.views(), 2U, output, stream);
+    check(hipStreamSynchronize(stream), "candidate");
+    const auto an = f.normalized.download(), ai = f.injection.download(), ao = f.output.download();
+    struct Err { double sq = 0, ref = 0, max = 0; std::size_t n = 0, nonfinite = 0; };
+    const auto add = [](Err& e, float ref, float got) {
+        if (!std::isfinite(got) || !std::isfinite(ref)) { ++e.nonfinite; return; }
+        const double d = static_cast<double>(got) - ref;
+        e.sq += d * d; e.ref += static_cast<double>(ref) * ref; e.max = std::max(e.max, std::abs(d)); ++e.n;
+    };
+    Err low, inj, out;
+    std::size_t pad = 0;
+    for (std::uint32_t r = 0; r < rows; ++r) {
+        const std::size_t base = static_cast<std::size_t>(r) * kNormalizedStride;
+        for (std::uint32_t k = 0; k < kRank; ++k)
+            add(low, to_float(&en[base + (kWidth + k) * 4U], false), to_float(&an[base + (kWidth + k) * 4U], false));
+        for (std::size_t b = base + (kWidth + kRank) * 4U; b < base + kNormalizedStride; ++b) pad += an[b] != en[b];
+        for (std::uint32_t s = 0; s < kStreams; ++s)
+            add(inj, to_float(&ei[r * kInjectionStride + s * 4U], false), to_float(&ai[r * kInjectionStride + s * 4U], false));
+        for (std::size_t b = r * kInjectionStride + kStreams * 4U; b < (r + 1U) * kInjectionStride; ++b) pad += ai[b] != ei[b];
+        const std::size_t e = bf16 ? 2U : 4U;
+        for (std::uint32_t h = 0; h < kHidden; ++h)
+            add(out, to_float(&eo[r * f.output_stride + h * e], bf16), to_float(&ao[r * f.output_stride + h * e], bf16));
+        for (std::size_t b = r * f.output_stride + kHidden * e; b < (r + 1U) * f.output_stride; ++b) pad += ao[b] != eo[b];
+    }
+    const auto rel = [](const Err& e) { return e.ref > 0 ? std::sqrt(e.sq / e.ref) : std::sqrt(e.sq); };
+    const auto rms = [](const Err& e) { return e.n ? std::sqrt(e.ref / static_cast<double>(e.n)) : 0.0; };
+    std::cout << "fast rows " << rows << (bf16 ? " bf16" : " fp32") << " flavor " << flavor << " output " << output << ": low rel " << rel(low) << " max "
+              << low.max / rms(low) << " | injection rel " << rel(inj) << " max " << inj.max / rms(inj) << " | output rel " << rel(out)
+              << " max " << out.max / rms(out) << " | nonfinite " << low.nonfinite + inj.nonfinite + out.nonfinite << " padding " << pad << '\n';
+    if (pad || low.nonfinite + inj.nonfinite + out.nonfinite || rel(low) > 2e-2 || rel(inj) > 2e-2 || rel(out) > 2e-2)
+        throw std::runtime_error("fast HC kernels outside the error bound or touched padding");
+}
+
 void bench(hipStream_t stream) {
     Fixture f(2048U, true, 0U, 99U);
     const auto c = config(true);
@@ -157,9 +206,18 @@ void bench(hipStream_t stream) {
         const float us = time(projection, 255U);
         std::cout << "bench rows 2048 projection " << projection << ": " << us << " us (" << flop / us / 1e6 << " TFLOPS)\n";
     }
-    for (unsigned output = 0; output <= 1U; ++output) {
-        // The wide2 output kernel reads the transposed low values the wide2 projection writes.
-        strix::testing::enqueue_wide_hyper_rows_test(c, f.views(), 1U, 255U, stream);
+    {
+        const float us = time(2U, 1U);
+        std::cout << "bench rows 2048 projection 2 + output 1 (WMMA + lane chain, with pack): " << us << " us\n";
+    }
+    {
+        const float us = time(2U, 255U);
+        std::cout << "bench rows 2048 projection 2 (WMMA, with pack): " << us << " us (" << flop / us / 1e6 << " TFLOPS)\n";
+    }
+    for (unsigned output = 0; output <= 2U; ++output) {
+        // The wide2 output kernel reads the transposed low values the wide2 projection writes, the WMMA output kernel
+        // the FP16 low values of the WMMA projection.
+        strix::testing::enqueue_wide_hyper_rows_test(c, f.views(), output == 2U ? 2U : 1U, 255U, stream);
         const float us = time(255U, output);
         std::cout << "bench rows 2048 output " << output << ": " << us << " us (" << flop_out / us / 1e6 << " TFLOPS)\n";
     }
@@ -178,6 +236,14 @@ int main() try {
                 }
         compare(2048U, true, 0U, 1U, 1U, stream);
         std::cout << "wide HC kernels == reference forms: ok\n";
+    }
+    if (!std::getenv("STRIX_HC_WIDE_BENCH_ONLY")) {
+        // Flavor 1 has FP16-overflowing effective weights (scale 65504); the fast kernels run on flavors 0 and 2.
+        for (const bool bf16 : {true, false})
+            for (const std::uint32_t rows : {8U, 40U, 264U, 2048U})
+                for (const unsigned flavor : {0U, 2U})
+                    for (const unsigned output : {1U, 2U}) compare_fast(rows, bf16, flavor, stream, output);
+        std::cout << "fast HC kernels within the error bound: ok\n";
     }
     if (std::getenv("STRIX_HC_WIDE_BENCH") || std::getenv("STRIX_HC_WIDE_BENCH_ONLY")) bench(stream);
     check(hipStreamDestroy(stream), "stream");

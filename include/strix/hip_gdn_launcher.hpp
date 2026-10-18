@@ -36,6 +36,8 @@ struct HipGdnLauncherConfig {
     // step (R1, windows and prompt rows) runs Q8_0 x per-32 int8 activations
     // through q8_rows::launch_dense_a8. Different numerics from the exact path.
     bool dense_a8_projections = false;
+    // fast-prefill-f16wmma-v1: prompt launches of 32..256 rows run q8_rows::launch_dense_f16 (prefill only).
+    bool dense_f16_prefill = false;
 };
 
 // Closed eager R2 window helper. Each context remains an R1 row view. Both
