@@ -1,4 +1,5 @@
 #include "strix/execution_arena.hpp"
+#include "strix/known_prefill_limits.hpp"
 
 #include <algorithm>
 #include <limits>
@@ -390,8 +391,8 @@ KnownWindowArena build_known_window_arena(
 }
 KnownWindowArena build_known_prefill_arena(
     const ExecutionArenaPlan& serial,std::uint64_t alignment,std::uint32_t logical_rows) {
-    if(logical_rows<16U||logical_rows>2048U)
-        throw std::invalid_argument("known prefill rows must be within 16 and 2048");
+    if(logical_rows<16U||logical_rows>known_prefill_max_rows)
+        throw std::invalid_argument("known prefill rows must be within "+known_prefill_rows_range());
     return build_known_rows_arena(serial,alignment,logical_rows);
 }
 

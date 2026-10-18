@@ -1,6 +1,6 @@
 # Step-major tiled prefill
 
-The explicit `--known-prefix-prefill-rows T` route admits 16 through 2048 known
+The explicit `--known-prefix-prefill-rows T` route admits 16 through 8192 known
 inputs in one transaction. It preserves the existing closed two/four/eight-row
 window options and defaults. It is a separate compiled organization with its
 own arena, execution identity, producer lineage and output-row mapping.

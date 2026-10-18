@@ -1,5 +1,6 @@
 #pragma once
 #include "strix/decode_execution_options.hpp"
+#include "strix/known_prefill_limits.hpp"
 #include "strix/decode_numerical_profile.hpp"
 #include "strix/gdn_recurrent_layout.hpp"
 #include "strix/gdn_recurrent_storage.hpp"
@@ -572,7 +573,7 @@ inline void validate_known_prefill_options(const Options& options) {
         options.known_prefill_uma_explicit || options.known_prefill_headroom_explicit;
     if (!any) return;
     if (!options.known_prefix_window || !options.known_prefix_prefill_explicit ||
-        options.known_prefix_prefill_rows < 16U || options.known_prefix_prefill_rows > 2048U ||
+        options.known_prefix_prefill_rows < 16U || options.known_prefix_prefill_rows > strix::known_prefill_max_rows ||
         options.known_prefix_rows_explicit || options.prompt_lookup ||
         !options.known_prefill_workspace_explicit || !options.known_prefill_metadata_explicit ||
         !options.known_prefill_uma_explicit || !options.known_prefill_headroom_explicit ||
@@ -1235,7 +1236,8 @@ inline Options parse_options(
                 value = argv[++index];
             } else value = argument.substr(std::string_view("--known-prefix-prefill-rows=").size());
             const auto rows = parse_u64(value,"known prefill rows");
-            if (rows < 16U || rows > 2048U) throw std::invalid_argument("known prefill rows must be 16 through 2048");
+            if (rows < 16U || rows > strix::known_prefill_max_rows)
+                throw std::invalid_argument("known prefill rows must be 16 through " + std::to_string(strix::known_prefill_max_rows));
             options.known_prefix_prefill_rows = static_cast<std::uint32_t>(rows);
             options.known_prefix_prefill_explicit = true;
             continue;

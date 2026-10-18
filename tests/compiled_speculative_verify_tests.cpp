@@ -1,4 +1,5 @@
 #include "strix/compiled_speculative_verify.hpp"
+#include "strix/known_prefill_limits.hpp"
 
 #include "strix/execution_binding.hpp"
 #include "strix/arithmetic_lineage.hpp"
@@ -573,7 +574,7 @@ void known_prefix_prefill_tests(const strix::ModelContract& model) {
             bool rejected=false;try {strix::validate_compiled_known_prefix_prefill(bad,f.source.serial);} catch(const std::exception&) {rejected=true;}
             expect(rejected,"T prefill forged geometry/arena/map/budget rejected with unchanged identities");
         }
-        for(auto rows:{15U,2049U}) {
+        for(auto rows:{15U,strix::known_prefill_max_rows+1U}) {
             auto bad=request;bad.logical_rows=rows;bool rejected=false;
             try {(void)strix::compile_known_prefix_prefill(model,f.source.serial,f.source.manifest,f.source.access,bad);} catch(const std::invalid_argument&) {rejected=true;}
             expect(rejected,"T prefill closed range rejects out-of-bounds geometry");
@@ -585,10 +586,10 @@ void known_prefix_prefill_tests(const strix::ModelContract& model) {
         }
         // Maximum T is a planner-only fixture: never allocate its model-sized
         // scratch merely to inspect the bounded row-view/identity contract.
-        auto maximum=request;maximum.logical_rows=2048;
+        auto maximum=request;maximum.logical_rows=strix::known_prefill_max_rows;
         const auto maximum_plan=strix::compile_known_prefix_prefill(model,f.source.serial,f.source.manifest,f.source.access,maximum);
         strix::validate_compiled_known_prefix_prefill(maximum_plan,f.source.serial);
-        expect(maximum_plan.arena.row_view.size()==2048U,"maximum T owns bounded row metadata without T topology clones");
+        expect(maximum_plan.arena.row_view.size()==strix::known_prefill_max_rows,"maximum T owns bounded row metadata without T topology clones");
         for(unsigned fault=0;fault<4;++fault) {
             f.reset();std::vector<std::uint32_t> tokens(16U,7U);
             f.window_pool.resize(static_cast<std::size_t>((good.arena.physical.total_bytes+7U)/8U));

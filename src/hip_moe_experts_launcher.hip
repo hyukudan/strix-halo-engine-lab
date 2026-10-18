@@ -2656,7 +2656,8 @@ KnownMoePrefillPrepared prepare_known_moe_prefill(std::span<const ExecutionDispa
     const q51_known_rows::Workspace& prefill, bool shared_admission = true) {
     const auto count = static_cast<std::uint32_t>(rows.size());
     if (count < 16U || count % 8U || count > q51_known_rows::prefill_max_rows)
-        throw std::invalid_argument("known prefill routed rows require T in [16, 2048], a multiple of 8");
+        throw std::invalid_argument("known prefill routed rows require T in [16, " + std::to_string(q51_known_rows::prefill_max_rows) +
+            "], a multiple of 8");
     if (!config.a8_down_q51 && !config.a8_down_q80)
         throw std::invalid_argument("known prefill routed rows require the A8 down profile");
     // Every view a kernel touches, per row; checked to be row 0 plus r * stride.

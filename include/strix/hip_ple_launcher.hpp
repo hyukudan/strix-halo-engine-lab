@@ -80,7 +80,7 @@ private:
 // and commit(n_keep) restores row n_keep-1's convolution state and publishes its history.
 class HipPleKnownWindow {
 public:
-    // prefill: up to 2048 rows that are always all kept; launch() publishes the last row's
+    // prefill: up to known_prefill_max_rows (8192) rows that are always all kept; launch() publishes the last row's
     // history itself and keeps no convolution snapshots (commit() is not used).
     HipPleKnownWindow(const ModelContract& model, HipActivationStorage activation, std::uint32_t max_rows,
         bool prefill = false);

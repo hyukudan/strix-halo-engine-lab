@@ -20,7 +20,7 @@ struct KnownPromptChunkRequest {
     std::uint32_t eos_token_id = 0;
     std::uint32_t logical_rows = 2;
     KnownWindowOutputPolicy output_policy = KnownWindowOutputPolicy::all_rows;
-    // Explicit separate T16..2048 typed prefill capability. Default2/4/8
+    // Explicit separate T16..8192 typed prefill capability. Default2/4/8
     // window contracts and callbacks retain their existing closed widths.
     bool tiled_prefill = false;
     // Tiled all-rows prefill whose every row's logits are read (teacher-forced scoring): no block
@@ -62,7 +62,7 @@ struct KnownPromptChunkFrontier {
 // and unpadded serial R1 suffix rows. State-only windows are used only while
 // more than R inputs remain; the final <=R inputs use serial calls, preserving
 // a real full-output terminal frontier without replaying a consumed input.
-// Tiled T16..2048 requires an explicit capable backend; state-only T with
+// Tiled T16..8192 requires an explicit capable backend; state-only T with
 // positive generation budget is rejected, so its terminal frontier is never
 // synthesized or replayed. All-row/terminal-row T keeps an actual final head.
 // Explicit state-only with max_new_tokens==0 omits every head and consumes

@@ -1,4 +1,5 @@
 #include "strix/hip_launch_context.hpp"
+#include "strix/known_prefill_limits.hpp"
 #include "strix/hip_ple_launcher.hpp"
 
 #include "strix/dispatch_resources.hpp"
@@ -2178,8 +2179,9 @@ HipPleKnownWindow::HipPleKnownWindow(const ModelContract& model, HipActivationSt
     bool prefill)
     : impl_(std::make_unique<Impl>()) {
     auto& w = *impl_;
-    if (!max_rows || max_rows > (prefill ? 2048U : 8U))
-        throw std::invalid_argument("known-window PLE supports one to eight rows (prefill: up to 2048)");
+    if (!max_rows || max_rows > (prefill ? known_prefill_max_rows : 8U))
+        throw std::invalid_argument("known-window PLE supports one to eight rows (prefill: up to " +
+            std::to_string(known_prefill_max_rows) + ")");
     w.prefill = prefill;
     w.config.model = model; w.config.activation = activation; validate_config(w.config);
     w.max_rows = max_rows;

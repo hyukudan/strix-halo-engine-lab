@@ -394,10 +394,11 @@ template<class T> __device__ __forceinline__ T* at(StridedRows<T> v,unsigned r) 
 // each expert's rows (then slots) ascend. Batches are runs of at most `cap`
 // assignments of one expert. Runs after the prologue and folds every row
 // status into summary[0], so the projection kernels read one word.
+constexpr unsigned serial_csr_max_rows=2048U; // build_prefill_csr keeps the expert of every assignment in LDS
 __global__ __launch_bounds__(1024) void build_prefill_csr(PrefillRows v,unsigned rows,unsigned experts,unsigned top_k,unsigned cap) {
     const auto& csr=v.csr;
     const unsigned t=threadIdx.x,count=rows*top_k;
-    __shared__ unsigned short expert_of[q51_known_rows::prefill_max_rows*10U];
+    __shared__ unsigned short expert_of[serial_csr_max_rows*10U];
     __shared__ unsigned n_of[512],scan[3][512],hist[16],failure,status,duplicates,maximum;
     if(t==0){failure=0U;status=0U;duplicates=0U;maximum=0U;}
     if(t<16U)hist[t]=0U;
@@ -446,9 +447,11 @@ __global__ __launch_bounds__(1024) void build_prefill_csr(PrefillRows v,unsigned
 }
 // build_prefill_csr with the same outputs (every array and summary word) in parallel: wave w
 // owns the assignments [w*S, (w+1)*S) and counts its experts (two 16-bit counters per word);
-// exclusive prefixes over the waves plus the expert offsets give each wave's first position per
-// expert; then each wave walks its range in order, 32 assignments at a time, ranking lanes of one
-// expert by lane order, so each expert's assignments ascend exactly as in the serial scan.
+// exclusive prefixes over the waves (16-bit, relative to the expert's offset) plus the expert
+// offsets give each wave's first position per expert; then each wave walks its range in order,
+// 32 assignments at a time, ranking lanes of one expert by lane order, so each expert's
+// assignments ascend exactly as in the serial scan. An expert with 65536 or more assignments
+// (possible only with repeated routes, T * top_k > 65535) fails closed as an invalid route.
 __global__ __launch_bounds__(1024) void build_prefill_csr_waves(PrefillRows v,unsigned rows,unsigned experts,unsigned top_k,unsigned cap) {
     constexpr unsigned Waves=32U;
     const auto& csr=v.csr;
@@ -469,11 +472,13 @@ __global__ __launch_bounds__(1024) void build_prefill_csr_waves(PrefillRows v,un
     __syncthreads();
     if(failure){if(t<32U)csr.summary[t]=t==0U?failure|status:t==3U?count:t==6U?rows:t==7U?1U:0U;return;}
     if(t<256U) {
-        unsigned run=0U;
-        for(unsigned w=0;w<Waves;++w){const unsigned c=position[w][t];position[w][t]=run;run+=c;}
-        n_of[2U*t]=run&65535U;n_of[2U*t+1U]=run>>16U;
+        unsigned lo=0U,hi=0U;
+        for(unsigned w=0;w<Waves;++w){const unsigned c=position[w][t];position[w][t]=lo|hi<<16U;lo+=c&65535U;hi+=c>>16U;}
+        if(lo>65535U||hi>65535U)atomicOr(&failure,invalid_route);
+        n_of[2U*t]=lo;n_of[2U*t+1U]=hi;
     }
     __syncthreads();
+    if(failure){if(t<32U)csr.summary[t]=t==0U?failure|status:t==3U?count:t==6U?rows:t==7U?1U:0U;return;}
     const unsigned n=t<512U?n_of[t]:0U,nb=(n+cap-1U)/cap;
     if(t<512U){scan[0][t]=n;scan[1][t]=n!=0U;scan[2][t]=nb;}
     __syncthreads();
@@ -484,11 +489,6 @@ __global__ __launch_bounds__(1024) void build_prefill_csr_waves(PrefillRows v,un
         if(t>=d&&t<512U)for(unsigned k=0;k<3U;++k)scan[k][t]+=x[k];
         __syncthreads();
     }
-    if(t<256U) {
-        const unsigned base=(scan[0][2U*t]-n_of[2U*t])|(scan[0][2U*t+1U]-n_of[2U*t+1U])<<16U;
-        for(unsigned w=0;w<Waves;++w)position[w][t]+=base;
-    }
-    __syncthreads();
     for(unsigned step=first;step<last;step+=32U) {
         const unsigned a=step+lane;
         const bool valid=a<last;
@@ -501,7 +501,7 @@ __global__ __launch_bounds__(1024) void build_prefill_csr_waves(PrefillRows v,un
             active&=~same;
         }
         if(valid) {
-            const unsigned slot=(position[wave][e/2U]>>(16U*(e&1U)))&65535U;
+            const unsigned slot=scan[0][e]-n_of[e]+((position[wave][e/2U]>>(16U*(e&1U)))&65535U);
             const unsigned at_pos=slot+static_cast<unsigned>(__popc(peers&((1U<<lane)-1U)));
             csr.rows[at_pos]=a/top_k;csr.slots[at_pos]=a%top_k;
             if((peers&((1U<<lane)-1U))==0U)atomicAdd(&position[wave][e/2U],static_cast<unsigned>(__popc(peers))<<(16U*(e&1U)));
@@ -1453,8 +1453,11 @@ void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned cou
     const unsigned cap=f16?f16_batch:wmma?wmma_batch:dot4_cap;
     enqueue_prefill_prologue(request,rows,count,clear_words,stream);
     const unsigned assignments=count*request.shape.top_k;
-    // The WMMA form builds the (identical) CSR with the parallel builder; form 2 keeps the serial one.
-    if(wmma&&form!=2)hipLaunchKernelGGL(build_prefill_csr_waves,dim3(1),dim3(1024),0,stream,rows,count,request.shape.experts,request.shape.top_k,cap);
+    // The WMMA forms (and every T above the serial builder's 2048 rows) build the identical CSR with
+    // the parallel builder; form 2 keeps the serial one.
+    if(form==2&&count>serial_csr_max_rows)throw std::invalid_argument("A8 prefill serial CSR builder admits at most 2048 rows");
+    if((wmma&&form!=2)||count>serial_csr_max_rows)
+        hipLaunchKernelGGL(build_prefill_csr_waves,dim3(1),dim3(1024),0,stream,rows,count,request.shape.experts,request.shape.top_k,cap);
     else hipLaunchKernelGGL(build_prefill_csr,dim3(1),dim3(1024),0,stream,rows,count,request.shape.experts,request.shape.top_k,cap);
     check(hipGetLastError(),"A8 prefill CSR");
     // STRIX_PREFILL_MOE_CSR_DUMP=1 (diagnostic, synchronizes): rows-per-expert histogram of each call.
