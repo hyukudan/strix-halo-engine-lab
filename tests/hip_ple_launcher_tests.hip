@@ -387,9 +387,107 @@ void pure_preflight_cases(const strix::ExecutionDispatchContext& source,
     unchanged();
 }
 
+// PLE tail of prefill rows: the rows kernels must reproduce the per-row kernels bit for bit (every
+// output row and the convolution state) across blocks shorter than, equal to and longer than the
+// convolution history, chained blocks on one state, in-place outputs and F32/BF16 weights.
+template <class T> struct TailBuffer {
+    T* p = nullptr;
+    std::size_t n = 0;
+    explicit TailBuffer(std::size_t count) : n(count) {
+        check(hipMalloc(reinterpret_cast<void**>(&p), count * sizeof(T)), "hipMalloc PLE tail buffer");
+        check(hipMemset(p, 0, count * sizeof(T)), "hipMemset PLE tail buffer");
+    }
+    ~TailBuffer() { if (p) static_cast<void>(hipFree(p)); }
+    TailBuffer(const TailBuffer&) = delete;
+    TailBuffer& operator=(const TailBuffer&) = delete;
+    void put(const std::vector<T>& v) {
+        if (v.size() > n) throw std::invalid_argument("PLE tail upload extent");
+        check(hipMemcpy(p, v.data(), v.size() * sizeof(T), hipMemcpyHostToDevice), "upload PLE tail buffer");
+    }
+    std::vector<T> read() const {
+        std::vector<T> v(n);
+        check(hipMemcpy(v.data(), p, n * sizeof(T), hipMemcpyDeviceToHost), "read PLE tail buffer");
+        return v;
+    }
+};
+
+void ple_tail_rows_cases() {
+    constexpr std::uint32_t hidden = 2560, streams = 4, taps = 4, ngram = 3, expanded = hidden * streams,
+        history = (taps - 1U) * ngram, max_rows = 300;
+    std::uint64_t seed = 0x9e3779b97f4a7c15ULL;
+    const auto uniform = [&] {
+        seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
+        return static_cast<float>(static_cast<std::uint32_t>(seed >> 40U)) / 16777216.0F * 2.0F - 1.0F;
+    };
+    const auto f32 = [&](std::size_t count, float scale) {
+        std::vector<float> v(count);
+        for (auto& e : v) e = uniform() * scale;
+        return v;
+    };
+    const auto bf16 = [&](std::size_t count, float scale) {
+        std::vector<std::uint16_t> v(count);
+        for (auto& e : v) e = float_to_bf16(uniform() * scale);
+        return v;
+    };
+    hipStream_t stream = nullptr;
+    check(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), "create PLE tail stream");
+    for (const bool bf16_weights : {false, true}) {
+        for (const bool in_place : {false, true}) {
+            TailBuffer<std::uint16_t> nk_b(expanded), nq_b(expanded), nc_b(expanded), cv_b(expanded * taps);
+            TailBuffer<float> nk_f(expanded), nq_f(expanded), nc_f(expanded), cv_f(expanded * taps);
+            nk_b.put(bf16(expanded, 1.5F)); nq_b.put(bf16(expanded, 1.5F)); nc_b.put(bf16(expanded, 1.5F));
+            cv_b.put(bf16(expanded * taps, 1.2F));
+            nk_f.put(f32(expanded, 1.5F)); nq_f.put(f32(expanded, 1.5F)); nc_f.put(f32(expanded, 1.5F));
+            cv_f.put(f32(expanded * taps, 1.2F));
+            const void* nk = bf16_weights ? static_cast<const void*>(nk_b.p) : nk_f.p;
+            const void* nq = bf16_weights ? static_cast<const void*>(nq_b.p) : nq_f.p;
+            const void* nc = bf16_weights ? static_cast<const void*>(nc_b.p) : nc_f.p;
+            const void* cv = bf16_weights ? static_cast<const void*>(cv_b.p) : cv_f.p;
+            const std::uint32_t in_stride = expanded + 64U, out_stride = in_place ? in_stride : expanded + 32U;
+            TailBuffer<float> keys_a(std::size_t{max_rows} * expanded), keys_b(keys_a.n), values(std::size_t{max_rows} * hidden);
+            TailBuffer<float> scratch_a(std::size_t{max_rows} * streams + 2U * expanded), scratch_b(scratch_a.n);
+            TailBuffer<std::uint16_t> in_a(std::size_t{max_rows} * in_stride), in_b(in_a.n);
+            TailBuffer<std::uint16_t> out_a(std::size_t{max_rows} * out_stride), out_b(out_a.n);
+            TailBuffer<std::uint16_t> state_a(std::size_t{expanded} * history), state_b(state_a.n);
+            const auto state = bf16(state_a.n, 2.0F);
+            state_a.put(state); state_b.put(state);
+            bool same = true;
+            std::size_t compared = 0;
+            // Blocks of 1, 2, 9 (the history), 10 and 300 rows chained on the same state.
+            for (const std::uint32_t rows : {1U, 2U, 9U, 10U, 300U}) {
+                const auto keys = f32(std::size_t{rows} * expanded, 3.0F);
+                const auto input = bf16(std::size_t{rows} * in_stride, 4.0F);
+                keys_a.put(keys); keys_b.put(keys); values.put(f32(std::size_t{rows} * hidden, 3.0F));
+                in_a.put(input); in_b.put(input);
+                auto* oa = in_place ? in_a.p : out_a.p;
+                auto* ob = in_place ? in_b.p : out_b.p;
+                strix::testing::enqueue_ple_tail(false, keys_a.p, values.p, in_a.p, in_stride, oa, out_stride, state_a.p, nk, nq, nc,
+                    cv, bf16_weights, rows, hidden, streams, taps, ngram, 1e-6F, scratch_a.p, stream);
+                strix::testing::enqueue_ple_tail(true, keys_b.p, values.p, in_b.p, in_stride, ob, out_stride, state_b.p, nk, nq, nc,
+                    cv, bf16_weights, rows, hidden, streams, taps, ngram, 1e-6F, scratch_b.p, stream);
+                check(hipStreamSynchronize(stream), "PLE tail synchronize");
+                const auto ra = in_place ? in_a.read() : out_a.read();
+                const auto rb = in_place ? in_b.read() : out_b.read();
+                for (std::uint32_t row = 0; row < rows; ++row)
+                    same = same && std::memcmp(ra.data() + std::size_t{row} * out_stride,
+                        rb.data() + std::size_t{row} * out_stride, expanded * 2U) == 0;
+                const auto sa = state_a.read(), sb = state_b.read();
+                same = same && sa == sb;
+                compared += std::size_t{rows} * expanded + sa.size();
+            }
+            std::cout << "PLE tail rows " << (bf16_weights ? "BF16" : "F32") << " weights, "
+                      << (in_place ? "in place" : "separate output") << ": " << compared << " values "
+                      << (same ? "identical" : "DIFFER") << '\n';
+            expect(same, "PLE tail rows form is bit-exact against the per-row kernels");
+        }
+    }
+    check(hipStreamDestroy(stream), "destroy PLE tail stream");
+}
+
 }  // namespace
 
 int main() try {
+    ple_tail_rows_cases();
     const auto model =
         strix::ModelContract::qwen38_flash_next();
     const auto hash_contract =
