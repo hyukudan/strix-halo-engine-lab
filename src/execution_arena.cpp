@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <limits>
 #include <stdexcept>
+#include <unordered_map>
 #include <vector>
 
 namespace strix {
@@ -394,9 +395,63 @@ KnownWindowArena build_known_prefill_arena(
     return build_known_rows_arena(serial,alignment,logical_rows);
 }
 
+namespace {
+struct UseKey {
+    ExecutionBufferUse use;
+    friend bool operator==(const UseKey&, const UseKey&) = default;
+};
+struct UseHash {
+    std::size_t operator()(const UseKey& key) const noexcept {
+        auto h = key.use.generation * 0x9E3779B97F4A7C15ULL;
+        h ^= (static_cast<std::uint64_t>(key.use.buffer.slot) << 8U) ^ static_cast<std::uint64_t>(key.use.buffer.buffer_class);
+        return static_cast<std::size_t>(h ^ (h >> 29U));
+    }
+};
+struct PlanIndex {
+    const ExecutionArenaAllocation* data = nullptr;
+    std::size_t size = 0;
+    std::unordered_map<UseKey, std::size_t, UseHash> first;
+};
+using LookupCache = std::unordered_map<const ExecutionArenaPlan*, PlanIndex>;
+thread_local LookupCache* active_lookup = nullptr;
+
+const ExecutionArenaAllocation* indexed_allocation(
+    LookupCache& cache, const ExecutionArenaPlan& plan, ExecutionBufferUse use) {
+    auto& index = cache[&plan];
+    if (index.data != plan.allocations.data() || index.size != plan.allocations.size()) {
+        // First lookup of this plan (or another plan now at its address): index it.
+        index.first.clear();
+        for (std::size_t i = 0; i < plan.allocations.size(); ++i)
+            index.first.try_emplace(UseKey{plan.allocations[i].use}, i);
+        index.data = plan.allocations.data();
+        index.size = plan.allocations.size();
+    }
+    const auto found = index.first.find(UseKey{use});
+    if (found == index.first.end()) return nullptr;
+    const auto& allocation = plan.allocations[found->second];
+    if (!(allocation.use == use)) throw std::logic_error("arena lookup index is stale");
+    return &allocation;
+}
+}  // namespace
+
+ArenaLookupScope::ArenaLookupScope() : previous_(active_lookup) { active_lookup = new LookupCache; }
+
+ArenaLookupScope::~ArenaLookupScope() {
+    delete active_lookup;
+    active_lookup = static_cast<LookupCache*>(previous_);
+}
+
 const ExecutionArenaAllocation* find_arena_allocation(
     const ExecutionArenaPlan& plan,
     ExecutionBufferUse use) noexcept {
+    if (active_lookup) {
+        try {
+            return indexed_allocation(*active_lookup, plan, use);
+        } catch (...) {
+            // Out of memory while indexing, or a plan changed in place: drop its index and search.
+            active_lookup->erase(&plan);
+        }
+    }
     const auto found =
         std::find_if(
             plan.allocations.begin(),

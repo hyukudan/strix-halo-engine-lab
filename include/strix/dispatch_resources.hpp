@@ -1,6 +1,8 @@
 #pragma once
 
 #include "strix/execution_runtime.hpp"
+#include "strix/model_manifest.hpp"
+#include "strix/model_runtime_binding.hpp"
 
 #include <cstddef>
 #include <string_view>
@@ -48,5 +50,20 @@ namespace strix {
 [[nodiscard]] const RuntimeTensorBinding& resolve_dispatch_tensor(
     const ExecutionDispatchContext& context,
     std::string_view tensor_name);
+
+// Validates one manifest/binding pair on construction. Until destruction, resolve_dispatch_tensor
+// on this thread does not re-validate that same pair (other pairs still are). The owner must keep
+// both objects alive and unmodified for the scope's lifetime (one admitted prefill block's launch).
+class ValidatedModelBindingScope {
+public:
+    ValidatedModelBindingScope(const ModelManifest& manifest, const ModelRuntimeBinding& binding);
+    ~ValidatedModelBindingScope();
+    ValidatedModelBindingScope(const ValidatedModelBindingScope&) = delete;
+    ValidatedModelBindingScope& operator=(const ValidatedModelBindingScope&) = delete;
+
+private:
+    const ModelManifest* previous_manifest_;
+    const ModelRuntimeBinding* previous_binding_;
+};
 
 }  // namespace strix

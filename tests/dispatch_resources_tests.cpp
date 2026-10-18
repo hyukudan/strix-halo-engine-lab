@@ -346,6 +346,28 @@ int main() {
     expect(model_rejected,
            "dispatch tensor resolver requires model weights");
 
+    {
+        // The scope validates its pair once; other pairs and resolutions after it still validate.
+        context.resources = &resources;
+        auto invalid = weights; invalid.tensors[0].address = 0;
+        bool scope_rejected = false;
+        try { const strix::ValidatedModelBindingScope scope(manifest, invalid); }
+        catch (const std::invalid_argument&) { scope_rejected = true; }
+        auto other = resources; other.model_weights = &invalid;
+        bool inner_rejected = false, outer_rejected = false, inner_resolved = false;
+        {
+            const strix::ValidatedModelBindingScope scope(manifest, weights);
+            inner_resolved = strix::resolve_dispatch_tensor(context, 0).address == weights.tensors[0].address;
+            context.resources = &other;
+            try { static_cast<void>(strix::resolve_dispatch_tensor(context, 0)); }
+            catch (const std::invalid_argument&) { inner_rejected = true; }
+        }
+        try { static_cast<void>(strix::resolve_dispatch_tensor(context, 0)); }
+        catch (const std::invalid_argument&) { outer_rejected = true; }
+        expect(scope_rejected && inner_resolved && inner_rejected && outer_rejected,
+               "validated binding scope covers only its validated pair");
+    }
+
     unprepared_arena_fallback_contract();
 
     if (failures == 0) {

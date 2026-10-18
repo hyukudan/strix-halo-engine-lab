@@ -1,5 +1,6 @@
 #include "strix/known_prefix_prefill.hpp"
 #include "strix/dispatch_resources.hpp"
+#include "strix/execution_arena.hpp"
 #include "strix/execution_telemetry.hpp"
 #include "strix/launch_dispatch.hpp"
 #include "strix/ple_lookup.hpp"
@@ -12,6 +13,7 @@
 #include <cstring>
 #include <exception>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -55,6 +57,12 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
     if(session.health!=SerialSessionHealth::ready) throw std::logic_error("known prefill requires a ready serial session");
     require(session.execution_identity==serial.execution_identity&&session.execution_identity,"known prefill source session identity differs");
     validate_execution_runtime_resources(serial.execution_identity,serial.arena,serial_resources,session.next_position);
+    // Every row context binds these model objects: the launch's tensor lookups skip re-validating
+    // the whole binding (about 1000 lookups per row, 61 % of the host time of a 4K prompt).
+    std::optional<ValidatedModelBindingScope> binding_scope;
+    if(!serial_resources.distributed_stage) binding_scope.emplace(*serial_resources.model_manifest,*serial_resources.model_weights);
+    // Likewise each row's arena plan is indexed once instead of searched linearly per buffer.
+    const ArenaLookupScope arena_lookup;
     const auto identities=build_runtime_execution_identities(serial.execution_identity,serial.arena,serial_resources);
     require(session.runtime_compatibility_identity==identities.compatibility_identity&&
         session.state_layout_identity==serial_resources.session_state_layout->layout_identity&&

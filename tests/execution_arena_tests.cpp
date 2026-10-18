@@ -260,6 +260,26 @@ int main() {
     catch (const std::overflow_error&) { rejected_window = true; }
     expect(rejected_window, "known window rejects doubled row extent overflow");
 
+    {
+        // The scoped index answers every lookup as the linear search does: first allocation of a
+        // duplicated use, nullptr for an absent one, and a plan that grows inside the scope.
+        auto lookup = aligned; lookup.allocations.push_back(lookup.allocations.front());
+        auto absent = lookup.allocations.front().use; absent.generation = std::numeric_limits<std::uint64_t>::max();
+        std::vector<const strix::ExecutionArenaAllocation*> linear;
+        for (const auto& allocation : lookup.allocations) linear.push_back(strix::find_arena_allocation(lookup, allocation.use));
+        bool same = strix::find_arena_allocation(lookup, absent) == nullptr && linear.back() == &lookup.allocations.front();
+        {
+            const strix::ArenaLookupScope scope;
+            for (std::size_t i = 0; i < lookup.allocations.size(); ++i)
+                same = same && strix::find_arena_allocation(lookup, lookup.allocations[i].use) == linear[i];
+            same = same && strix::find_arena_allocation(lookup, absent) == nullptr;
+            auto grown = lookup.allocations.back(); grown.use = absent;
+            lookup.allocations.push_back(grown);
+            same = same && strix::find_arena_allocation(lookup, absent) == &lookup.allocations.back();
+        }
+        expect(same, "scoped arena lookup index matches the linear search");
+    }
+
     if (failures == 0) {
         std::cout << "execution arena tests passed\n";
     }

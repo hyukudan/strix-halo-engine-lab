@@ -9,6 +9,10 @@
 namespace strix {
 namespace {
 
+// Pair validated by the innermost ValidatedModelBindingScope of this thread.
+thread_local const ModelManifest* validated_manifest = nullptr;
+thread_local const ModelRuntimeBinding* validated_binding = nullptr;
+
 const ExecutionMemoryBinding& scratch_memory(
     const ExecutionDispatchContext& context) {
     if (context.resources != nullptr &&
@@ -234,7 +238,8 @@ const RuntimeTensorBinding& resolve_dispatch_tensor(
         if(context.execution_identity!=scope.execution_identity() || !scope.contains_step(context.step_id) || !scope.requires_tensor(tensor_index))
             throw std::invalid_argument("dispatch tensor is outside the local stage scope");
         validate_stage_model_runtime_binding(scope,manifest,weights);
-    } else validate_model_runtime_binding(manifest, weights);
+    } else if (&manifest != validated_manifest || &weights != validated_binding)
+        validate_model_runtime_binding(manifest, weights);
 
     const auto* tensor =
         find_runtime_tensor_binding(
@@ -268,6 +273,19 @@ const RuntimeTensorBinding& resolve_dispatch_tensor(
             "dispatch tensor name is not present in manifest");
     }
     return *tensor;
+}
+
+ValidatedModelBindingScope::ValidatedModelBindingScope(
+    const ModelManifest& manifest, const ModelRuntimeBinding& binding)
+    : previous_manifest_(validated_manifest), previous_binding_(validated_binding) {
+    validate_model_runtime_binding(manifest, binding);
+    validated_manifest = &manifest;
+    validated_binding = &binding;
+}
+
+ValidatedModelBindingScope::~ValidatedModelBindingScope() {
+    validated_manifest = previous_manifest_;
+    validated_binding = previous_binding_;
 }
 
 }  // namespace strix
