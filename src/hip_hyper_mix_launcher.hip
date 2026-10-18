@@ -11,6 +11,9 @@
 #include "strix/lane_chain_hyper_output.hpp"
 #include <cstdio>
 #include <cstdlib>
+#include <atomic>
+#include <map>
+#include <mutex>
 #include <set>
 
 #include "strix/dispatch_resources.hpp"
@@ -2128,6 +2131,308 @@ __global__ void rows_lane_chain_hyper_output_regs_kernel(Rows rows, const void* 
     }
 }
 
+// Persistent window HC mix (STRIX_HC_PERSISTENT=1; rank 320, 4 streams of 2560, Q8_0 down/up, F32 inject):
+// the normalisation, the split-K projection and the rank-320 lane-chain output of 2/4/8 rows in one launch
+// of kPersistBlocks co-resident blocks of 16 waves, the phases separated by two grid barriers instead of
+// two dependent dispatches. Every wave works in every phase: A) block g normalises (row, stream) pairs
+// 2g and 2g + 1, eight waves each; B) the blocks take split-K units (two low outputs or one inject output,
+// wave w = tile w) from a queue; C) waves 0..7 of block g run the up chains of features 64g..64g+63, their
+// up rows requested at the end of B. Every value keeps the expression of the three-kernel form: the
+// 256-leaf norm tree, the per-tile lane chain with its xor reduction and ascending 16-tile sum, the
+// per-lane up chain and the ascending stream mix.
+constexpr std::uint32_t kPersistBlocks = 40U, kPersistHidden = 2560U, kPersistStreams = 4U, kPersistRank = 320U;
+constexpr std::uint32_t kPersistWidth = kPersistHidden * kPersistStreams;
+constexpr std::uint32_t kPersistUnitOutputs = 2U; // low outputs per split-K work unit (4 spills at 8 rows)
+static_assert(kPersistHidden == kPersistBlocks * 64U && kPersistRank % kPersistUnitOutputs == 0U);
+
+// Orders LDS only: the waves keep their weight loads in flight across it.
+__device__ __forceinline__ void persist_lds_barrier() {
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
+    __builtin_amdgcn_s_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
+}
+// Scalar, L0/GL1-bypassing read of the arrival counter: a vector load would make its wave wait for every
+// vector load it still has in flight (vmcnt retires in order).
+__device__ __forceinline__ unsigned persist_poll(const unsigned* counter) {
+    unsigned value;
+    asm volatile("s_load_b32 %0, %1, 0x0 glc dlc\n\ts_waitcnt lgkmcnt(0)" : "=s"(value) : "s"(counter) : "memory");
+    return value;
+}
+// Every wave has waited for its own global stores (vscnt) before. Wave `poller` arrives and polls; the counter
+// only grows and the host hands each launch its base. The L0/GL1 invalidation makes the other blocks'
+// stores visible to the plain loads that follow.
+__device__ __forceinline__ void persist_grid_barrier(unsigned* counter, unsigned target, unsigned poller) {
+    persist_lds_barrier();
+    if (threadIdx.x / 32U == poller) {
+        if ((threadIdx.x & 31U) == 0U) __hip_atomic_fetch_add(counter, 1U, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        unsigned spins = 0;
+        while (static_cast<int>(persist_poll(counter) - target) < 0) {
+            __builtin_amdgcn_s_sleep(1);
+            if (++spins > (1U << 26U)) __builtin_trap(); // a block never arrived: fault instead of hanging
+        }
+    }
+    persist_lds_barrier();
+    asm volatile("buffer_gl0_inv\n\tbuffer_gl1_inv" ::: "memory");
+}
+__device__ __forceinline__ void persist_wait_stores() { asm volatile("s_waitcnt_vscnt null, 0x0" ::: "memory"); }
+
+// The preceding inject step folded into the normalisation (STRIX_HC_PERSISTENT_INJECT=1): the waves of
+// (row, stream) compute that slice of the injected streams with the inject kernel's expression and store
+// it as the inject would (it is this mix's input), then normalise the stored values.
+struct PersistInjectRows {
+    const void* hyper[kWindowRows];
+    const void* hidden[kWindowRows];
+    const float* weights[kWindowRows];
+};
+template <typename Storage, std::uint32_t Count, bool Inject = false>
+__global__ __launch_bounds__(512) __attribute__((amdgpu_waves_per_eu(8))) void rows_persistent_hyper_mix_kernel(HyperRows rows,
+    const void* __restrict__ norm, std::uint32_t norm_type, float epsilon, const unsigned char* __restrict__ down,
+    const float* __restrict__ inject, const unsigned char* __restrict__ up, unsigned* counter, unsigned base,
+    unsigned* queue, unsigned queue_base, PersistInjectRows injected, unsigned long long* trace, bool up_late) {
+    constexpr std::uint32_t kBlocks = 10U, kRowBytes = kBlocks * 34U, kWords = kRowBytes / 4U;
+    constexpr std::uint32_t kLeaves = kPersistHidden / kThreads; // features per leaf
+    __shared__ float leaf[2][kThreads];
+    __shared__ float inverse_lds[2];
+    __shared__ float red[Count][16][kPersistUnitOutputs];
+    __shared__ __align__(16) float low_lds[kPersistRank][Count]; // transposed: a coefficient's rows side by side
+    __shared__ float sig[Count][kPersistStreams][64];
+    __shared__ unsigned unit_lds;
+    const unsigned g = blockIdx.x, wave = threadIdx.x / 32U, lane = threadIdx.x & 31U;
+    // STRIX_HC_PERSISTENT_TRACE: per-block phase timestamps (wall_clock64, 100 MHz).
+    const auto mark = [&](unsigned k) { if (trace) trace[g * 8U + k] = static_cast<unsigned long long>(wall_clock64()); };
+    if (threadIdx.x == 0U) mark(0U);
+    // A: each leaf's ten inputs and norm weights are requested before any of them is used.
+    const unsigned half = wave / 8U, pair = 2U * g + half, at = pair / kPersistStreams, stream = pair % kPersistStreams;
+    const unsigned leaf_index = (wave % 8U) * 32U + lane;
+    const bool norm_wave = pair < Count * kPersistStreams;
+    const auto base_feature = static_cast<std::uint64_t>(stream) * kPersistHidden;
+    float value[kLeaves], norm_w[kLeaves];
+    if (norm_wave) {
+        const auto* input = static_cast<const Storage*>(rows.input[at]);
+#pragma unroll
+        for (std::uint32_t k = 0; k < kLeaves; ++k) {
+            const auto feature = leaf_index + k * kThreads;
+            if constexpr (Inject) {
+                const float result = load_activation(static_cast<const Storage*>(injected.hyper[at]), base_feature + feature) +
+                    load_activation(static_cast<const Storage*>(injected.hidden[at]), feature) * injected.weights[at][stream];
+                Storage stored;
+                store_activation(&stored, result);
+                const_cast<Storage*>(input)[base_feature + feature] = stored;
+                value[k] = load_activation(&stored, 0U);
+            } else value[k] = load_activation(input, base_feature + feature);
+            norm_w[k] = load_norm_weight(norm, norm_type, stream * kPersistHidden + feature);
+        }
+    }
+    // A: leaf l of a pair sums features l, l + 256, ... (the 256-thread kernel's leaves), the first wave
+    // of the pair runs the tree (strides 128..32 in registers, 16..1 across lanes).
+    if (norm_wave) {
+        float sum = 0.0F;
+#pragma unroll
+        for (std::uint32_t k = 0; k < kLeaves; ++k) sum += value[k] * value[k];
+        leaf[half][leaf_index] = sum;
+    }
+    persist_lds_barrier();
+    if (norm_wave && wave % 8U == 0U) {
+        float l[8];
+#pragma unroll
+        for (unsigned j = 0; j < 8U; ++j) l[j] = leaf[half][lane + 32U * j];
+#pragma unroll
+        for (unsigned j = 0; j < 4U; ++j) l[j] += l[j + 4U];
+#pragma unroll
+        for (unsigned j = 0; j < 2U; ++j) l[j] += l[j + 2U];
+        l[0] += l[1];
+        float v = l[0];
+#pragma unroll
+        for (unsigned d = 16U; d != 0U; d /= 2U) {
+            const float partner = __shfl_down(v, d, 32);
+            if (lane < d) v += partner;
+        }
+        if (lane == 0U) inverse_lds[half] = rsqrtf(v / static_cast<float>(kPersistHidden) + epsilon);
+    }
+    persist_lds_barrier();
+    if (norm_wave) {
+        const float inverse = inverse_lds[half];
+#pragma unroll
+        for (std::uint32_t k = 0; k < kLeaves; ++k)
+            rows.normalized[at][base_feature + leaf_index + k * kThreads] = value[k] * inverse * norm_w[k];
+    }
+    persist_wait_stores();
+    if (threadIdx.x == 0U) mark(1U);
+    persist_grid_barrier(counter, base + kPersistBlocks, 0U);
+    if (threadIdx.x == 0U) mark(2U);
+    // B: 160 units of two low outputs and, with an inject matrix, 4 units of one inject output, each over
+    // the 16 tiles (wave w = tile w), taken by the blocks from a launch-relative queue so that blocks whose
+    // weights arrive late take fewer units. Every (row, output) keeps the tile's split-K lane chain
+    // (s, then j ascending), its xor reduction and the ascending 16-tile sum; rows in groups of up to four
+    // share each decoded coefficient.
+    constexpr unsigned kUnitOutputs = kPersistUnitOutputs, kLowUnits = kPersistRank / kUnitOutputs;
+    constexpr unsigned kGroup = Count < 4U ? Count : 4U;
+    const unsigned units = kLowUnits + (inject != nullptr ? kPersistStreams : 0U);
+    const unsigned tile = wave;
+    for (;;) {
+        if (threadIdx.x == 0U)
+            unit_lds = __hip_atomic_fetch_add(queue, 1U, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) - queue_base;
+        persist_lds_barrier();
+        const unsigned unit = unit_lds;
+        persist_lds_barrier(); // every wave has read the unit (and the previous unit's reductions)
+        if (unit >= units) break;
+        if (unit < kLowUnits) {
+            const unsigned first = unit * kUnitOutputs;
+            unsigned codes[kUnitOutputs][5];
+            float scales[kUnitOutputs][5];
+#pragma unroll
+            for (unsigned r = 0; r < kUnitOutputs; ++r)
+#pragma unroll
+                for (unsigned s = 0; s < 5U; ++s) {
+                    const auto* block = down + static_cast<std::uint64_t>(first + r) * kPersistRank * 34U +
+                        static_cast<std::uint64_t>(tile * 20U + 4U * s + lane / 8U) * 34U;
+                    const auto bits = *reinterpret_cast<const unsigned short*>(block);
+                    const auto* words = reinterpret_cast<const unsigned short*>(block + 2U + 4U * (lane % 8U));
+                    scales[r][s] = __half2float(__ushort_as_half(bits));
+                    codes[r][s] = static_cast<unsigned>(words[0]) | (static_cast<unsigned>(words[1]) << 16U);
+                }
+#pragma unroll
+            for (unsigned t0 = 0; t0 < Count; t0 += kGroup) {
+                float sums[kGroup][kUnitOutputs];
+#pragma unroll
+                for (unsigned t = 0; t < kGroup; ++t)
+#pragma unroll
+                    for (unsigned r = 0; r < kUnitOutputs; ++r) sums[t][r] = 0.0F;
+#pragma unroll
+                for (unsigned s = 0; s < 5U; ++s) {
+                    float4 x[kGroup];
+#pragma unroll
+                    for (unsigned t = 0; t < kGroup; ++t)
+                        x[t] = *reinterpret_cast<const float4*>(rows.normalized[t0 + t] + tile * 640U + s * 128U + lane * 4U);
+#pragma unroll
+                    for (unsigned r = 0; r < kUnitOutputs; ++r)
+#pragma unroll
+                        for (unsigned j = 0; j < 4U; ++j) {
+                            const unsigned byte = (codes[r][s] >> (j * 8U)) & 255U;
+                            const int code = byte < 128U ? static_cast<int>(byte) : static_cast<int>(byte) - 256;
+                            const float coefficient = scales[r][s] * static_cast<float>(code);
+#pragma unroll
+                            for (unsigned t = 0; t < kGroup; ++t) {
+                                const float input = j == 0U ? x[t].x : j == 1U ? x[t].y : j == 2U ? x[t].z : x[t].w;
+                                sums[t][r] = fmaf(input, coefficient, sums[t][r]);
+                            }
+                        }
+                }
+#pragma unroll
+                for (unsigned t = 0; t < kGroup; ++t)
+#pragma unroll
+                    for (unsigned r = 0; r < kUnitOutputs; ++r) {
+#pragma unroll
+                        for (unsigned offset = 16U; offset != 0U; offset /= 2U)
+                            sums[t][r] = sums[t][r] + __shfl_xor(sums[t][r], static_cast<int>(offset), 32);
+                        if (lane == 0U) red[t0 + t][tile][r] = sums[t][r];
+                    }
+            }
+        } else {
+            const unsigned output = unit - kLowUnits;
+            float4 w[5];
+#pragma unroll
+            for (unsigned s = 0; s < 5U; ++s)
+                w[s] = *reinterpret_cast<const float4*>(inject + static_cast<std::uint64_t>(output) * kPersistWidth +
+                    tile * 640U + s * 128U + lane * 4U);
+            for (unsigned t = 0; t < Count; ++t) {
+                float4 x[5];
+#pragma unroll
+                for (unsigned s = 0; s < 5U; ++s)
+                    x[s] = *reinterpret_cast<const float4*>(rows.normalized[t] + tile * 640U + s * 128U + lane * 4U);
+                float sum = 0.0F;
+#pragma unroll
+                for (unsigned s = 0; s < 5U; ++s) {
+                    sum = fmaf(x[s].x, w[s].x, sum);
+                    sum = fmaf(x[s].y, w[s].y, sum);
+                    sum = fmaf(x[s].z, w[s].z, sum);
+                    sum = fmaf(x[s].w, w[s].w, sum);
+                }
+#pragma unroll
+                for (unsigned offset = 16U; offset != 0U; offset /= 2U) sum = sum + __shfl_xor(sum, static_cast<int>(offset), 32);
+                if (lane == 0U) red[t][tile][0] = sum;
+            }
+        }
+        persist_lds_barrier();
+        if (threadIdx.x < Count * kUnitOutputs) {
+            const unsigned t = threadIdx.x / kUnitOutputs, r = threadIdx.x % kUnitOutputs;
+            if (unit < kLowUnits || r == 0U) {
+                float total = 0.0F;
+#pragma unroll
+                for (unsigned k = 0; k < 16U; ++k) total = total + red[t][k][r];
+                const float scaled = total / static_cast<float>(kPersistStreams);
+                if (unit < kLowUnits) rows.low[t][unit * kUnitOutputs + r] = scaled * sigmoid(scaled);
+                else rows.injection[t][unit - kLowUnits] = 2.0F * sigmoid(scaled);
+            }
+        }
+    }
+    // C weights: lane's 340-byte up row (stream w % 4, feature 64 g + 32 (w / 4) + lane), requested now
+    // so it streams through the reductions and the second barrier.
+    const bool c_wave = wave < 8U;
+    const unsigned c_stream = wave % 4U, c_group = (wave / 4U) % 2U, feature = 64U * g + 32U * c_group + lane;
+    unsigned held[kWords];
+    const auto load_up = [&] {
+        const auto* row = up + (static_cast<std::uint64_t>(c_stream) * kPersistHidden + feature) * kRowBytes;
+#pragma unroll
+        for (std::uint32_t q = 0; q < kWords / 4U; ++q) {
+            const uint4 v = *reinterpret_cast<const uint4*>(row + 16U * q);
+            held[4U * q] = v.x; held[4U * q + 1U] = v.y; held[4U * q + 2U] = v.z; held[4U * q + 3U] = v.w;
+        }
+#pragma unroll
+        for (std::uint32_t w = (kWords / 4U) * 4U; w < kWords; ++w) held[w] = *reinterpret_cast<const unsigned*>(row + 4U * w);
+    };
+    // up_late (STRIX_HC_PERSISTENT_UP_LATE=1): request the up rows after the second barrier instead, so they
+    // do not compete with the split-K weights of slower blocks.
+    if (c_wave && !up_late) load_up();
+    if (threadIdx.x == 0U) mark(3U);
+    persist_lds_barrier();
+    persist_wait_stores();
+    persist_grid_barrier(counter, base + 2U * kPersistBlocks, 8U); // wave 8 has no up rows in flight
+    if (threadIdx.x == 0U) mark(4U);
+    if (c_wave && up_late) load_up();
+    // C: waves 8..15 (no loads in flight) stage the low rows; waves 0..7 run the up chains from LDS.
+    if (!c_wave) {
+        for (unsigned e = threadIdx.x - 256U; e < Count * kPersistRank; e += 256U)
+            low_lds[e % kPersistRank][e / kPersistRank] = rows.low[e / kPersistRank][e % kPersistRank];
+    }
+    persist_lds_barrier();
+    if (c_wave) {
+        const auto byte_at = [&](std::uint32_t i) -> unsigned { return (held[i / 4U] >> (8U * (i % 4U))) & 255U; };
+        float gate[Count];
+#pragma unroll
+        for (std::uint32_t t = 0; t < Count; ++t) gate[t] = 0.0F;
+#pragma unroll
+        for (std::uint32_t block = 0; block < kBlocks; ++block) {
+            const auto bits = static_cast<unsigned short>(byte_at(block * 34U) | (byte_at(block * 34U + 1U) << 8U));
+            const float scale = __half2float(__ushort_as_half(bits));
+#pragma unroll
+            for (std::uint32_t k = 0; k < 32U; ++k) {
+                const float coefficient = scale * static_cast<float>(static_cast<signed char>(byte_at(block * 34U + 2U + k)));
+#pragma unroll
+                for (std::uint32_t t = 0; t < Count; ++t) gate[t] += low_lds[block * 32U + k][t] * coefficient;
+            }
+        }
+#pragma unroll
+        for (std::uint32_t t = 0; t < Count; ++t) sig[t][c_stream][32U * c_group + lane] = sigmoid(gate[t]);
+    }
+    if (threadIdx.x == 0U) mark(5U);
+    persist_lds_barrier();
+    if (c_wave)
+        for (std::uint32_t t = c_stream; t < Count; t += kPersistStreams) {
+            float mixed = 0.0F;
+            for (std::uint32_t s2 = 0; s2 < kPersistStreams; ++s2)
+                mixed += rows.normalized[t][static_cast<std::uint64_t>(s2) * kPersistHidden + feature] * sig[t][s2][32U * c_group + lane];
+            store_activation(&static_cast<Storage*>(rows.output[t])[feature], mixed / static_cast<float>(kPersistStreams));
+        }
+    if (threadIdx.x == 0U) mark(6U);
+    // Block 0 also accumulates its phase spans per row count: [A + barrier, B + barrier, C, launches].
+    if (trace && g == 0U && threadIdx.x == 0U) {
+        auto* sums = trace + kPersistBlocks * 8U + (Count == 2U ? 0U : Count == 4U ? 4U : 8U);
+        sums[0] += trace[2] - trace[0]; sums[1] += trace[4] - trace[2]; sums[2] += trace[6] - trace[4]; sums[3] += 1U;
+    }
+}
+
+
 // Prefill wide rows: every row of a prefill step in one launch, row r of each view at
 // base + r * stride bytes. Blocks cover many rows per weight read; every (row, output)
 // keeps the window kernels' chains, lane tree and block order.
@@ -3533,11 +3838,139 @@ namespace {
 template <class Rows> std::uint32_t looped(const Rows& rows) {
     if constexpr (std::is_same_v<Rows, HyperTileRows>) return rows.tiles; else return 1U;
 }
+// Grid barrier state of the persistent HC mix, one per stream: the device arrival counter only grows, and
+// launches on one stream run in order, so the host knows each launch's base. Allocated on first use.
+std::atomic<std::uint64_t> persistent_hyper_launches{0};
+std::atomic<unsigned long long*> persistent_hyper_last_trace{nullptr};
+struct PersistentHyperBarrier {
+    unsigned* counter = nullptr;
+    float* partial = nullptr; // [8 rows][4 inject outputs][16 tiles]
+    unsigned long long* trace = nullptr; // [blocks][8] phase timestamps
+    float* workspace = nullptr; // folded inject: [8 rows][width + rank] when the arena workspace aliases its inputs
+    unsigned issued = 0;
+    unsigned queued = 0; // B work units handed out so far (queue at counter + 16)
+};
+PersistentHyperBarrier& persistent_hyper_barrier(hipStream_t stream) {
+    static std::mutex mutex;
+    static std::map<hipStream_t, PersistentHyperBarrier> barriers;
+    const std::lock_guard lock(mutex);
+    auto& b = barriers[stream];
+    if (!b.counter) {
+        void* memory = nullptr;
+        check_hip(hipMalloc(&memory, 256U + kWindowRows * kPersistStreams * 16U * sizeof(float) + kPersistBlocks * 8U * 8U + 16U * 8U +
+            kWindowRows * (kPersistWidth + kPersistRank) * sizeof(float)),
+            "persistent HC barrier allocation");
+        check_hip(hipMemsetAsync(memory, 0, 256U, stream), "persistent HC barrier reset");
+        b.counter = static_cast<unsigned*>(memory);
+        b.partial = reinterpret_cast<float*>(static_cast<unsigned char*>(memory) + 256U);
+        b.trace = reinterpret_cast<unsigned long long*>(b.partial + kWindowRows * kPersistStreams * 16U);
+        b.workspace = reinterpret_cast<float*>(b.trace + kPersistBlocks * 8U + 16U);
+    }
+    return b;
+}
+// STRIX_HC_PERSISTENT=1: window rows 2/4/8 of the split-K + rank-320 lane-chain form run as one persistent
+// launch when all kPersistBlocks blocks fit on the device at once; otherwise the three-kernel form runs.
+bool persistent_up_late() {
+    static const bool late = [] { const char* v = std::getenv("STRIX_HC_PERSISTENT_UP_LATE"); return v && v[0] == '1'; }();
+    return late;
+}
+template <typename Storage, std::uint32_t Count, bool Inject = false>
+bool launch_persistent_hyper_rows(const PreparedHyperMix& p, const HyperRows& rows, const HipHyperMixLauncherConfig& config,
+    const PersistInjectRows& injected = {}) {
+    const auto kernel = rows_persistent_hyper_mix_kernel<Storage, Count, Inject>;
+    static const bool resident = [&] {
+        int device = 0, per_cu = 0;
+        hipDeviceProp_t properties{};
+        if (hipGetDevice(&device) != hipSuccess || hipGetDeviceProperties(&properties, device) != hipSuccess ||
+            hipOccupancyMaxActiveBlocksPerMultiprocessor(&per_cu, kernel, 512, 0) != hipSuccess) return false;
+        hipFuncAttributes attributes{};
+        if (hipFuncGetAttributes(&attributes, reinterpret_cast<const void*>(kernel)) != hipSuccess) return false;
+        // The occupancy query counts one 16-wave block per WGP on gfx1151 (it reports WGPs as CUs); a WGP has
+        // 4 SIMDs of 1536 VGPRs and 128 KiB of LDS, so two blocks fit when each wave needs <= 192 VGPRs and no
+        // scratch. The fixtures and the decode runs have all 40 blocks resident at once (the barrier traps if not).
+        const bool wgp_pair = std::string_view(properties.gcnArchName).starts_with("gfx1151") && attributes.numRegs <= 192 &&
+            attributes.localSizeBytes == 0U && 2U * attributes.sharedSizeBytes <= 128U * 1024U;
+        const bool fits = static_cast<long>(per_cu) * properties.multiProcessorCount >= static_cast<long>(kPersistBlocks) ||
+            (wgp_pair && 2L * properties.multiProcessorCount >= static_cast<long>(kPersistBlocks));
+        if (std::getenv("STRIX_HC_PERSISTENT_VERBOSE"))
+            std::fprintf(stderr, "persistent HC rows=%u inject=%d: %d blocks/CU x %d CUs, %d VGPRs, %zu B LDS, %zu B scratch -> %s\n",
+                Count, Inject ? 1 : 0, per_cu, properties.multiProcessorCount, attributes.numRegs, attributes.sharedSizeBytes,
+                attributes.localSizeBytes, fits ? "persistent" : "three-kernel form");
+        return fits;
+    }();
+    if (!resident) return false;
+    const auto stream = hip_execution_stream();
+    auto& barrier = persistent_hyper_barrier(stream);
+    const auto* inject = p.inject_runtime ? reinterpret_cast<const float*>(p.inject_runtime->address) : nullptr;
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_persistent_hyper_mix_kernel<Storage, Count, Inject>), dim3(kPersistBlocks), dim3(512U), 0,
+        stream, rows, reinterpret_cast<const void*>(p.norm_runtime->address), p.norm_manifest->ggml_type, config.rms_epsilon,
+        reinterpret_cast<const unsigned char*>(p.down_runtime->address), inject,
+        reinterpret_cast<const unsigned char*>(p.up_runtime->address), barrier.counter, barrier.issued, barrier.counter + 16, barrier.queued, injected,
+        std::getenv("STRIX_HC_PERSISTENT_TRACE") ? barrier.trace : nullptr, persistent_up_late());
+    persistent_hyper_last_trace.store(barrier.trace);
+    if (std::getenv("STRIX_HC_PERSISTENT_TRACE")) {
+        static const bool registered = [] {
+            std::atexit([] {
+                const auto* trace = persistent_hyper_last_trace.load();
+                unsigned long long sums[12] = {};
+                if (!trace || hipMemcpy(sums, trace + kPersistBlocks * 8U, sizeof(sums), hipMemcpyDeviceToHost) != hipSuccess) return;
+                for (unsigned c = 0; c < 3U; ++c) if (sums[4U * c + 3U])
+                    std::fprintf(stderr, "persistent HC rows=%u: %llu launches, block 0 mean us: A+barrier %.2f, B+barrier %.2f, C %.2f\n",
+                        2U << c, sums[4U * c + 3U], static_cast<double>(sums[4U * c]) / 100.0 / static_cast<double>(sums[4U * c + 3U]),
+                        static_cast<double>(sums[4U * c + 1U]) / 100.0 / static_cast<double>(sums[4U * c + 3U]),
+                        static_cast<double>(sums[4U * c + 2U]) / 100.0 / static_cast<double>(sums[4U * c + 3U]));
+            });
+            return true;
+        }();
+        (void)registered;
+    }
+    check_hip(hipGetLastError(), "known-window persistent HC rows launch");
+    barrier.issued += 2U * kPersistBlocks;
+    // Every unit is taken once and every block takes one past the end before it leaves the loop.
+    barrier.queued += kPersistRank / kPersistUnitOutputs + (inject ? kPersistStreams : 0U) + kPersistBlocks;
+    persistent_hyper_launches.fetch_add(1U, std::memory_order_relaxed);
+    return true;
+}
+bool persistent_hyper_rows_enabled() {
+    static const bool enabled = [] { const char* v = std::getenv("STRIX_HC_PERSISTENT"); return v && v[0] == '1'; }();
+    return enabled;
+}
+bool persistent_decline(const char* why) {
+    if (std::getenv("STRIX_HC_PERSISTENT_VERBOSE")) std::fprintf(stderr, "persistent HC inject fold declined: %s\n", why);
+    return false;
+}
+bool persistent_hyper_rows_eligible(const PreparedHyperRows& prepared, const HipHyperMixLauncherConfig& config) {
+    const auto& p = prepared.first;
+    const auto count = prepared.count;
+    return persistent_hyper_rows_enabled() && !std::getenv("STRIX_HC_ROWS_FUSED_NORM") && config.splitk_projection &&
+        config.lane_chain_output && config.hidden_size == kPersistHidden && config.hc_count == kPersistStreams &&
+        config.lowrank == kPersistRank && p.down_manifest->ggml_type == 8U && p.up_manifest->ggml_type == 8U &&
+        (!p.inject_runtime || p.inject_manifest->ggml_type == 0U) && (count == 2U || count == 4U || count == 8U);
+}
+
 template <class Rows>
 void launch_hyper_rows(const PreparedHyperRows& prepared, const Rows& rows, const HipHyperMixLauncherConfig& config,
     std::uint32_t tiles) {
     const auto& p = prepared.first;
     const auto count = prepared.count;
+    if constexpr (std::is_same_v<Rows, HyperRows>) {
+        if (persistent_hyper_rows_eligible(prepared, config)) {
+            const auto run = [&]<typename Storage>() {
+                return count == 2U ? launch_persistent_hyper_rows<Storage, 2U>(p, rows, config) :
+                    count == 4U ? launch_persistent_hyper_rows<Storage, 4U>(p, rows, config) :
+                    launch_persistent_hyper_rows<Storage, 8U>(p, rows, config);
+            };
+            const bool launched = config.activation == HipActivationStorage::bf16 ? run.template operator()<std::uint16_t>() :
+                run.template operator()<float>();
+            if (launched) {
+                if (config.arithmetic_stats) {
+                    config.arithmetic_stats->materialized_norm_submissions.fetch_add(tiles, std::memory_order_relaxed);
+                    config.arithmetic_stats->splitk_f32_submissions.fetch_add(tiles, std::memory_order_relaxed);
+                }
+                return;
+            }
+        }
+    }
     const auto width = config.hidden_size * config.hc_count;
     const auto* inject = p.inject_runtime ? reinterpret_cast<const void*>(p.inject_runtime->address) : nullptr;
     const auto invoke = [&]<typename Storage>() {
@@ -3634,6 +4067,80 @@ void launch_hyper_rows(const PreparedHyperRows& prepared, const Rows& rows, cons
     }
 }
 }  // namespace
+
+std::uint64_t hip_hyper_mix_testing_persistent_launches() { return persistent_hyper_launches.load(); }
+std::vector<std::uint64_t> hip_hyper_mix_testing_persistent_trace() {
+    std::vector<std::uint64_t> out(kPersistBlocks * 8U);
+    if (const auto* trace = persistent_hyper_last_trace.load())
+        check_hip(hipMemcpy(out.data(), trace, out.size() * 8U, hipMemcpyDeviceToHost), "read persistent HC trace");
+    return out;
+}
+
+bool hyper_mix_known_window_rows_launch_injected(std::span<const ExecutionDispatchContext> inject_rows,
+    const HipElementwiseLauncherConfig& inject_config, std::span<const ExecutionDispatchContext> rows,
+    const HipHyperMixLauncherConfig& config) {
+    static const bool enabled = [] { const char* v = std::getenv("STRIX_HC_PERSISTENT_INJECT"); return v && v[0] == '1'; }();
+    if (!enabled || inject_rows.size() != rows.size()) return false;
+    const auto prepared = prepare_hyper_rows(rows, config);
+    if (!persistent_hyper_rows_eligible(prepared, config) || inject_config.activation != config.activation ||
+        inject_config.hidden_size != config.hidden_size || inject_config.hc_count != config.hc_count)
+        return persistent_decline("HC step or activation not eligible");
+    const auto views = inject_known_window_rows_views(inject_rows, inject_config);
+    const auto count = prepared.count;
+    const auto& r = prepared.rows;
+    const std::uint64_t value = config.activation == HipActivationStorage::bf16 ? 2U : 4U;
+    const auto at = [](const void* pointer) { return reinterpret_cast<std::uintptr_t>(pointer); };
+    struct Extent { std::uintptr_t low, high; };
+    const auto overlap = [](Extent a, Extent b) { return a.low < b.high && b.low < a.high; };
+    PersistInjectRows injected{};
+    for (std::uint32_t t = 0; t < count; ++t) {
+        // The mix reads exactly the streams the inject writes.
+        if (views.output[t] != r.input[t]) return persistent_decline("the HC step does not read the injected streams");
+        injected.hyper[t] = views.hyper[t]; injected.hidden[t] = views.hidden[t]; injected.weights[t] = views.weights[t];
+    }
+    // Before the first grid barrier, block (row, stream) writes its slice of the injected streams and of the
+    // normalised row while other blocks still read their inject inputs: no written stream may reach any
+    // row's inject inputs (a row's own streams updated in place excepted). The window arena may hand the HC
+    // workspace (normalised row and low values, dead after this step) the inject's input memory; the folded
+    // launch then works in an owner-held workspace and leaves the arena workspace unwritten.
+    bool private_workspace = false;
+    for (std::uint32_t t = 0; t < count; ++t) {
+        const Extent written[] = {{at(r.input[t]), at(r.input[t]) + kPersistWidth * value},
+            {at(r.normalized[t]), at(r.normalized[t]) + kPersistWidth * sizeof(float)}};
+        for (std::uint32_t o = 0; o < count; ++o) {
+            const Extent hyper{at(views.hyper[o]), at(views.hyper[o]) + kPersistWidth * value};
+            const Extent read[] = {{at(views.hidden[o]), at(views.hidden[o]) + kPersistHidden * value},
+                {at(views.weights[o]), at(views.weights[o]) + kPersistStreams * sizeof(float)}};
+            for (std::size_t w = 0; w < 2U; ++w) {
+                bool alias = false;
+                for (const auto& x : read) alias = alias || overlap(written[w], x);
+                alias = alias || (overlap(written[w], hyper) && !(w == 0U && o == t && views.hyper[t] == r.input[t]));
+                if (alias && w == 0U) return persistent_decline("streams alias an inject input");
+                private_workspace = private_workspace || alias;
+            }
+        }
+    }
+    auto used = r;
+    if (private_workspace) {
+        auto* workspace = persistent_hyper_barrier(hip_execution_stream()).workspace;
+        for (std::uint32_t t = 0; t < count; ++t) {
+            used.normalized[t] = workspace + static_cast<std::uint64_t>(t) * (kPersistWidth + kPersistRank);
+            used.low[t] = used.normalized[t] + kPersistWidth;
+        }
+    }
+    const auto run = [&]<typename Storage>() {
+        return count == 2U ? launch_persistent_hyper_rows<Storage, 2U, true>(prepared.first, used, config, injected) :
+            count == 4U ? launch_persistent_hyper_rows<Storage, 4U, true>(prepared.first, used, config, injected) :
+            launch_persistent_hyper_rows<Storage, 8U, true>(prepared.first, used, config, injected);
+    };
+    const bool launched = config.activation == HipActivationStorage::bf16 ? run.template operator()<std::uint16_t>() :
+        run.template operator()<float>();
+    if (launched && config.arithmetic_stats) {
+        config.arithmetic_stats->materialized_norm_submissions.fetch_add(1U, std::memory_order_relaxed);
+        config.arithmetic_stats->splitk_f32_submissions.fetch_add(1U, std::memory_order_relaxed);
+    }
+    return launched;
+}
 
 void hyper_mix_known_window_rows_launch(std::span<const ExecutionDispatchContext> rows,
     const HipHyperMixLauncherConfig& config) {

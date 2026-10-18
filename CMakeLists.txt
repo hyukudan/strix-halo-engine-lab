@@ -1941,6 +1941,8 @@ if(STRIX_ENABLE_HIP_RUNTIME)
             -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
         strix_target_warnings(strix-hip-known-window-tests)
         add_test(NAME strix-hip-known-window-tests COMMAND strix-hip-known-window-tests)
+        add_test(NAME strix-hip-known-window-hc-persistent-tests COMMAND strix-hip-known-window-tests --hc-rows)
+        set_tests_properties(strix-hip-known-window-hc-persistent-tests PROPERTIES ENVIRONMENT "STRIX_HC_PERSISTENT=1;STRIX_HC_PERSISTENT_INJECT=1")
         add_executable(strix-hip-qsa-block-select-tests tests/hip_qsa_block_select_tests.hip)
         set_target_properties(strix-hip-qsa-block-select-tests PROPERTIES
             HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)

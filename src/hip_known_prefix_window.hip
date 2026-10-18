@@ -365,6 +365,36 @@ struct HipKnownPrefixWindow::Impl {
         }
         return false;
     }
+    // STRIX_HC_PERSISTENT=1 STRIX_HC_PERSISTENT_INJECT=1: an inject rows step followed by its HC rows step
+    // (attn inject -> MLP mix, MLP inject -> next attention mix or the final mix) runs as one persistent HC
+    // launch at the inject step; the HC step is then recorded as completed without a launch.
+    static bool hc_inject_fusion_enabled() {
+        static const bool on = [] {
+            const char* p = std::getenv("STRIX_HC_PERSISTENT"); const char* i = std::getenv("STRIX_HC_PERSISTENT_INJECT");
+            return p && p[0] == '1' && i && i[0] == '1';
+        }();
+        return on;
+    }
+    std::size_t fused_hc_step = SIZE_MAX;
+    bool fuse_hc_inject(std::size_t i, const std::vector<std::vector<ExecutionDispatchContext>>& contexts) {
+        if (fused_hc_step == i) { fused_hc_step = SIZE_MAX; return true; }
+        if (fused_hc_step != SIZE_MAX) throw std::logic_error("known-window fused HC step was not reached");
+        const auto& step = serial.execution.steps[i];
+        if ((step.op != SerialOp::attn_inject && step.op != SerialOp::mlp_inject) ||
+            window.r2_variant[i] != KnownWindowR2Variant::inject_rows_v1 || i + 1U >= serial.execution.steps.size())
+            return false;
+        const auto next = serial.execution.steps[i + 1U].op;
+        const auto variant = window.r2_variant[i + 1U];
+        if ((next != SerialOp::attn_hyper_mix && next != SerialOp::mlp_hyper_mix && next != SerialOp::final_hyper_mix) ||
+            (variant != KnownWindowR2Variant::hyper_mix_rows2_v1 && variant != KnownWindowR2Variant::hyper_mix_rows4_v1 &&
+             variant != KnownWindowR2Variant::hyper_mix_rows8_v1) || contexts[i].size() != contexts[i + 1U].size())
+            return false;
+        if (!hyper_mix_known_window_rows_launch_injected(contexts[i], elementwise_config, contexts[i + 1U],
+                hyper_for(contexts[i + 1U])))
+            return false;
+        fused_hc_step = i + 1U;
+        return true;
+    }
     void require_shared_joined() {
         if (!shared_detach) return;
         if (std::any_of(shared_detach->pending.begin(), shared_detach->pending.end(), [](auto p) { return p != 0U; }))
@@ -1018,9 +1048,12 @@ struct HipKnownPrefixWindow::Impl {
             };
             hooks.position_reader_implementations = position_readers;
             hooks.record_actual_window_lineage=static_cast<bool>(capture);
-            if(!prefill && shared_detach_enabled())
-                hooks.before_step=[&](std::size_t i,const std::vector<std::vector<ExecutionDispatchContext>>& contexts) {
-                    return detach_shared(i,contexts);
+            fused_hc_step=SIZE_MAX;
+            const bool detach=!prefill && shared_detach_enabled(), fuse_hc=!prefill && hc_inject_fusion_enabled();
+            if(detach || fuse_hc)
+                hooks.before_step=[&,detach,fuse_hc](std::size_t i,const std::vector<std::vector<ExecutionDispatchContext>>& contexts) {
+                    if(fuse_hc && fuse_hc_inject(i,contexts)) return true;
+                    return detach && detach_shared(i,contexts);
                 };
             hooks.skip_head=skip_head;
             hooks.preflight_memo=&preflight_memo;hooks.recipe_memo=&recipe_memo;hooks.preflight_slots=&preflight_slots;
