@@ -66,6 +66,34 @@ void launch_hip_qsa_block_select_probe(bool reference, std::span<const HipQsaBlo
     void* stream);
 #endif
 
+#ifdef STRIX_BUILD_KNOWN_WINDOW_DIAGNOSTIC
+// Test-only kv-int8-tok-v1 writers and readers over caller-owned device memory; no
+// allocation/sync. Each of the 8 rows appends k[r] / v[r] (kv_heads x head_dim FP32) at
+// position[r]: the decode writer into decode_state, the 8-row window writer into rows_state
+// (int8 rows of 2 kv_width + 8 kv_heads bytes). The FP32 query q_gate (attention_heads x 2
+// head_dim) then attends the `count` tokens of `selected` in decode_state through the decode
+// score/softmax/value kernels (scores_decode, out_decode), every row of the 8-row window
+// kernels (scores_rows, out_rows: 8 x) and of the 16-row prefill group kernels (scores_group,
+// out_group: 16 x). Scores are heads x maximum_selected, outputs attention_heads x head_dim.
+struct HipKvInt8Probe {
+    std::uint32_t attention_heads = 24, kv_heads = 2, head_dim = 256, count = 0, maximum_selected = 0;
+    const float* k[8]{};
+    const float* v[8]{};
+    std::uint64_t position[8]{};
+    void* decode_state = nullptr;
+    void* rows_state = nullptr;
+    const float* q_gate = nullptr;
+    const std::uint32_t* selected = nullptr;
+    float* scores_decode = nullptr;
+    float* out_decode = nullptr;
+    float* scores_rows = nullptr;
+    float* out_rows = nullptr;
+    float* scores_group = nullptr;
+    float* out_group = nullptr;
+};
+void launch_hip_attention_kv_int8_probe(const HipKvInt8Probe& probe, void* stream);
+#endif
+
 #ifdef STRIX_BUILD_QSA_OUTPUT_PROJECTION_DIAGNOSTIC
 enum class HipQsaOutputProjectionMode { legacy256, wave8 };
 // Test-only explicit-stream entry. FP32 input and original Q8_0 weights produce

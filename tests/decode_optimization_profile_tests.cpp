@@ -822,6 +822,39 @@ int main() {
         rejects([&] { validate_resolved_gdn_recurrent_storage(bad); }, "GDN value-key storage requires eager C1 without graph/integer, islands or R2 routes");
     }
     rejects([] { (void)parse({"decoder", "m", "1", "--gdn-recurrent-storage", "unknown"}); }, "GDN recurrent storage must be key-value or value-key");
+    expect(defaults.attention_kv_storage == AttentionKvStorage::bf16 && !defaults.attention_kv_storage_explicit,
+        "the BF16 KV cache is the default");
+    auto int8_kv = parse({"decoder", "m", "1", "--attention-kv-storage", "kv-int8-tok-v1"});
+    expect(int8_kv.attention_kv_storage == AttentionKvStorage::int8_token && int8_kv.attention_kv_storage_explicit,
+        "kv-int8-tok-v1 has an explicit selector");
+    expect(parse({"decoder", "m", "1", "--attention-kv-storage=bf16"}).attention_kv_storage == AttentionKvStorage::bf16,
+        "explicit BF16 KV storage");
+    validate_resolved_attention_kv_storage(int8_kv);
+    for (unsigned mutation = 0; mutation < 4; ++mutation) {
+        auto admitted = int8_kv;
+        if (mutation == 0) admitted.known_prefix_window = true;
+        if (mutation == 1) admitted.gdn_islands = true;
+        if (mutation == 2) admitted.prepared_eager = true;
+        if (mutation == 3) admitted.moe_shared_overlap = true;
+        validate_resolved_attention_kv_storage(admitted);
+    }
+    for (unsigned mutation = 0; mutation < 8; ++mutation) {
+        auto bad = int8_kv;
+        if (mutation == 0) bad.execution.mode = DecodeExecutionMode::graph;
+        if (mutation == 1) bad.execution.integer_head = DecodeIntegerHead::a8_iu8;
+        if (mutation == 2) bad.prompt_lookup = true;
+        if (mutation == 3) bad.prefix_cache_roundtrip = true;
+        if (mutation == 4) bad.qsa_gqa_heads_per_block = 2;
+        if (mutation == 5) bad.qsa_hierarchical_selection = true;
+        if (mutation == 6) bad.serving_concurrency = 2;
+        if (mutation == 7) bad.gpu_greedy_token = true;
+        rejects([&] { validate_resolved_attention_kv_storage(bad); }, "kv-int8-tok-v1 requires eager C1 decode, known-prefix windows/prefill "
+            "or MTP windows without graph/integer head, GPU greedy, prefix cache, prompt lookup, serving, QSA GQA/hierarchical, "
+            "RAW/reference or offline tuning");
+    }
+    rejects([] { (void)parse({"decoder", "m", "1", "--attention-kv-storage", "int8"}); }, "attention KV storage must be bf16 or kv-int8-tok-v1");
+    rejects([] { (void)parse({"decoder", "m", "1", "--attention-kv-storage=bf16", "--attention-kv-storage=kv-int8-tok-v1"}); },
+        "duplicate attention KV storage option");
     auto instrumented = parse({"decoder", "fixture.gguf", "1", "--host-dispatch-telemetry"});
     const auto instrumented_profile = resolve_optimization_profile(instrumented, model, info, manifest,
         validated_model_content_identity, true);

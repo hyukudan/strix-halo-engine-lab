@@ -225,6 +225,11 @@ Teacher-forced scoring (`--teacher-forced-score`, `--teacher-logits-file`) also 
 all-rows output policy, producing byte-identical logits files to the serial route within a profile, several times
 faster. See [docs/teacher-forced-tiled-prefill.md](docs/teacher-forced-tiled-prefill.md) (D-034).
 
+`--attention-kv-storage kv-int8-tok-v1` stores the QSA attention KV cache in int8 with one FP32 scale per token,
+KV head and K/V half: 12480 instead of 24576 bytes per token. It is a separate, opt-in numerical identity bound into
+the execution, state-layout and MTP golden identities. See [docs/attention-kv-int8.md](docs/attention-kv-int8.md)
+(D-046).
+
 ## How it works
 
 **One decode cycle.** The predictor drafts until it is no longer confident; a cost model picks the window size;

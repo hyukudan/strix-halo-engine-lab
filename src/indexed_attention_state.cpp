@@ -47,18 +47,25 @@ build_indexed_attention_state_layout(
         checked_mul(
             model.kv_heads,
             model.head_dim);
+    const bool int8 = model.attention_kv_storage == AttentionKvStorage::int8_token;
     layout.kv_key_bytes =
-        checked_mul(
+        int8 ? kv_width : checked_mul(
             kv_width,
             model.bytes_bf16);
     layout.kv_value_offset =
         layout.kv_key_bytes;
     layout.kv_value_bytes =
         layout.kv_key_bytes;
-    layout.kv_row_bytes =
+    layout.kv_scale_offset =
         checked_add(
             layout.kv_key_bytes,
             layout.kv_value_bytes);
+    layout.kv_scale_bytes =
+        int8 ? checked_mul(checked_mul(model.kv_heads, 2ULL), model.bytes_fp32) : 0ULL;
+    layout.kv_row_bytes =
+        checked_add(
+            layout.kv_scale_offset,
+            layout.kv_scale_bytes);
     layout.raw_index_row_bytes =
         checked_mul(
             checked_mul(
