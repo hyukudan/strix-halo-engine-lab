@@ -1334,7 +1334,12 @@ int STRIX_DECODE_ENTRY(
                 << "  \"hc_deferred_norm_submissions\":"
                 << (hyper_arithmetic_stats ? hyper_arithmetic_stats->deferred_norm_submissions.load(std::memory_order_relaxed) : 0) << ",\n"
                 << "  \"q5k_a8_gate_up_submissions\":"
-                << (q4k_a8_stats ? q4k_a8_stats->q5k_a8_gate_up_submissions.load(std::memory_order_relaxed) : 0) << ",\n"
+                << (q4k_a8_stats ? q4k_a8_stats->q5k_a8_gate_up_submissions.load(std::memory_order_relaxed) : 0) << ",\n";
+        if (options.prefill_numerical_profile && *options.prefill_numerical_profile == strix::DecodeNumericalProfile::fast_prefill_f16wmma_v1)
+            std::cout << "  \"prefill_moe_f16wmma_rows\":"
+                << (q4k_a8_stats ? q4k_a8_stats->prefill_f16wmma_submissions.load(std::memory_order_relaxed) : 0) << ",\n";
+        if (options.numerical_profile != strix::DecodeNumericalProfile::exact_v5)
+            std::cout
                  << "  \"hc_splitk_f32_submissions\":"
                 << (hyper_arithmetic_stats ? hyper_arithmetic_stats->splitk_f32_submissions.load(std::memory_order_relaxed) : 0) << ",\n"
                 << "  \"q51_a8_down_submissions\":"

@@ -5,6 +5,8 @@
 #include <hip/hip_fp16.h>
 #include <algorithm>
 #include <array>
+#include <cstdio>
+#include <vector>
 #include <cstdlib>
 #include <limits>
 #include <stdexcept>
@@ -1023,6 +1025,293 @@ __global__ __launch_bounds__(32U*Waves) void down_prefill_wmma(const unsigned ch
         at(view.rawdots,row_of[a])[slot_of[a]*hidden+row]=result[e];
     }
 }
+// Fast prefill profile (fast-prefill-f16wmma-v1, form 3): not the A8 contract. Weights are
+// dequantized inside the kernels to FP16 (the FP32 value d*sc*q - dm*m, Q5_1 d*q + m, Q8_0 d*q,
+// rounded once to nearest), activations are FP16, and v_wmma_f32_16x16x16_f16 accumulates over
+// the whole K in FP32, with no per-group epilogue. Activations carry a power-of-two scale per
+// row that puts the row's largest magnitude in [2^13, 2^14): exact for every value that stays
+// normal (29 binades below the maximum) and undone exactly on the FP32 sums. Input x: one scale
+// per prompt row (f16_row_scales); h = silu(g)*u: gate/up writes it in FP32 and the largest |h|
+// of each (row, slot), and down scales and rounds it while staging. A CSR batch holds at most 64
+// assignments of one expert (M tile 64; waves whose 16 rows are all past the batch skip their
+// WMMAs). Each (row, output) sums its K steps in the same order whatever batch it lands in, so
+// results do not depend on the batch composition. A non-finite g, u or h fails the row closed
+// (status 8), as the A8 quantizer does; down writes the raw slot dots of the unchanged merge.
+// Scratch: the A8 views the profile does not use: sums[r][0] = the x scale exponent,
+// down_sums[r][slot] = bits of max |h|, intermediates[r][slot*2*outputs + o] = h.
+typedef _Float16 f16x16 __attribute__((ext_vector_type(16)));
+typedef float f32x8 __attribute__((ext_vector_type(8)));
+constexpr unsigned f16_batch=64U,f16_pitch=72U; // M tile rows; LDS row pitch in halves (K step 64 + 8)
+__device__ __forceinline__ unsigned f16_pair(float a,float b) {
+    const _Float16 x=static_cast<_Float16>(a),y=static_cast<_Float16>(b);
+    return static_cast<unsigned>(__builtin_bit_cast(unsigned short,x))|static_cast<unsigned>(__builtin_bit_cast(unsigned short,y))<<16U;
+}
+// Exponent s with peak * 2^s in [2^13, 2^14) (0 for a zero or non-finite max), clamped so 2^s and
+// 2^-s are normal FP32 values.
+__device__ __forceinline__ int f16_exponent(float peak) {
+    if(!(peak>0.0F)||!isfinite(peak))return 0;
+    int e;(void)frexpf(peak,&e); // peak in [2^(e-1), 2^e)
+    return min(120,max(-120,14-e));
+}
+// 8 BF16 (one uint4) times scale as 8 FP16.
+__device__ __forceinline__ uint4 f16_from_bf16(uint4 v,float scale) {
+    const auto lo=[&](unsigned w){return __uint_as_float(w<<16U)*scale;};
+    const auto hi=[&](unsigned w){return __uint_as_float(w&0xffff0000U)*scale;};
+    return {f16_pair(lo(v.x),hi(v.x)),f16_pair(lo(v.y),hi(v.y)),f16_pair(lo(v.z),hi(v.z)),f16_pair(lo(v.w),hi(v.w))};
+}
+// 8 FP32 (the bits in two uint4) times scale as 8 FP16.
+__device__ __forceinline__ uint4 f16_from_f32(uint4 a,uint4 b,float scale) {
+    const auto x=[&](unsigned w){return __uint_as_float(w)*scale;};
+    return {f16_pair(x(a.x),x(a.y)),f16_pair(x(a.z),x(a.w)),f16_pair(x(b.x),x(b.y)),f16_pair(x(b.z),x(b.w))};
+}
+// The four unsigned bytes of w as a*byte + b (one FP32 rounding), rounded to two FP16 pairs.
+__device__ __forceinline__ uint2 f16_affine_u8(unsigned w,float a,float b) {
+    const float v0=fmaf(a,static_cast<float>(w&255U),b),v1=fmaf(a,static_cast<float>((w>>8U)&255U),b);
+    const float v2=fmaf(a,static_cast<float>((w>>16U)&255U),b),v3=fmaf(a,static_cast<float>(w>>24U),b);
+    return {f16_pair(v0,v1),f16_pair(v2,v3)};
+}
+// The four signed bytes of w times a, as two FP16 pairs.
+__device__ __forceinline__ uint2 f16_scaled_s8(unsigned w,float a) {
+    const int s=static_cast<int>(w);
+    const float v0=a*static_cast<float>((s<<24)>>24),v1=a*static_cast<float>((s<<16)>>24);
+    const float v2=a*static_cast<float>((s<<8)>>24),v3=a*static_cast<float>(s>>24);
+    return {f16_pair(v0,v1),f16_pair(v2,v3)};
+}
+// One CTA per prompt row: the x scale exponent of the row and zeroed max |h| words. Rows that
+// already failed (prologue status) are skipped by every later kernel through the summary.
+__global__ __launch_bounds__(256) void f16_row_scales(PrefillRows view,unsigned hidden,unsigned top_k) {
+    const unsigned r=blockIdx.x,t=threadIdx.x;
+    const auto* x=reinterpret_cast<const unsigned short*>(at(view.input,r));
+    float m=0.0F;
+    for(unsigned k=t;k<hidden;k+=256U)m=fmaxf(m,fabsf(__uint_as_float(static_cast<unsigned>(x[k])<<16U)));
+    for(int stride=16;stride!=0;stride/=2)m=fmaxf(m,__shfl_xor(m,stride,32));
+    __shared__ float wave_max[8];
+    if((t&31U)==0U)wave_max[t/32U]=m;
+    __syncthreads();
+    if(t==0U) {
+        for(unsigned w=1;w<8U;++w)m=fmaxf(m,wave_max[w]);
+        at(view.sums,r)[0]=f16_exponent(m);
+    }
+    if(t<top_k)at(view.down_sums,r)[t]=0;
+}
+// LDS-only barrier: the staged tiles are complete (lgkmcnt) but the next step's global loads stay
+// in flight (__syncthreads would also wait for them, as its workgroup fence does).
+__device__ __forceinline__ void f16_barrier(){__asm__ volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory");}
+// 16-byte global (not flat) load: flat loads also count in lgkmcnt and would end at f16_barrier.
+typedef unsigned f16_u32x4 __attribute__((ext_vector_type(4)));
+__device__ __forceinline__ uint4 f16_load(const void* p) {
+    const f16_u32x4 v=*reinterpret_cast<const __attribute__((address_space(1))) f16_u32x4*>(reinterpret_cast<std::uintptr_t>(p));
+    return uint4{v.x,v.y,v.z,v.w};
+}
+// One K64 step of a CTA: s.a holds the batch rows (64 x K64), s.b 256 B columns (x K64). A wave
+// owns two B columns tiles (cols[0], cols[1]) and every 16-row tile below mb: the B fragments are
+// read once per K16 plane and reused by up to four row tiles. K16 planes ascend.
+struct F16Stage { _Float16 a[f16_batch][f16_pitch]; _Float16 b[256][f16_pitch]; };
+__device__ __forceinline__ void f16_step(const F16Stage& s,unsigned mb,const unsigned (&cols)[2],unsigned i,f32x8 (&acc)[4][2]) {
+#pragma unroll
+    for(unsigned kk=0;kk<4U;++kk) {
+        const f16x16 b0=*reinterpret_cast<const f16x16*>(&s.b[cols[0]+i][16U*kk]);
+        const f16x16 b1=*reinterpret_cast<const f16x16*>(&s.b[cols[1]+i][16U*kk]);
+#pragma unroll
+        for(unsigned mi=0;mi<4U;++mi)if(mi<mb) {
+            const f16x16 a=*reinterpret_cast<const f16x16*>(&s.a[16U*mi+i][16U*kk]);
+            acc[mi][0]=__builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a,b0,acc[mi][0]);
+            acc[mi][1]=__builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a,b1,acc[mi][1]);
+        }
+    }
+}
+// Batch rows of a CTA into LDS (row, slot, scale exponent).
+struct F16Rows { unsigned row[f16_batch],slot[f16_batch]; int exponent[f16_batch]; };
+// Gate/up of one CSR batch (<= 64 assignments) for 128 outputs of both matrices. Grid x = output
+// tile (the tiles of a batch run together and share its rows in L2), y = batch. B columns 0..127
+// are gate outputs, 128..255 the same up outputs; wave w owns gate and up columns 16w.. of every
+// row, so one lane holds g and u of the same (row, output) for the fused SwiGLU.
+template<bool Q5K>
+__global__ __launch_bounds__(256) void project_prefill_f16(const unsigned char* gate,const unsigned char* up,PrefillRows view,
+    unsigned hidden,unsigned outputs) {
+    const auto& csr=view.csr;
+    if(csr.summary[0]||blockIdx.y>=csr.summary[2])return;
+    const unsigned begin=csr.begins[blockIdx.y],count=csr.begins[blockIdx.y+1U]-begin,expert=csr.experts[blockIdx.y];
+    __shared__ __align__(16) F16Stage s;
+    __shared__ F16Rows rows;
+    const unsigned t=threadIdx.x;
+    if(t<f16_batch) {
+        const bool live=t<count;const unsigned r=live?csr.rows[begin+t]:0U;
+        rows.row[t]=r;rows.slot[t]=live?csr.slots[begin+t]:0U;rows.exponent[t]=live?at(view.sums,r)[0]:0;
+    }
+    __syncthreads();
+    constexpr unsigned block_bytes=Q5K?176U:144U,qs_at=Q5K?48U:16U,mask=0x0f0f0f0fU;
+    // Staging roles: A row t/4, K values 16(t%4)..; B column t: the 32 qs bytes of the step's pair.
+    const unsigned a_row=t/4U,a_part=t%4U;
+    const bool a_live=a_row<count;
+    const float a_scale=ldexpf(1.0F,rows.exponent[a_row]);
+    const auto* a_src=reinterpret_cast<const unsigned char*>(at(view.input,rows.row[a_row]))+32U*a_part;
+    const unsigned blocks=hidden/256U,steps=hidden/64U;
+    const unsigned char* b_src=(t<128U?gate:up)+
+        (static_cast<unsigned long long>(expert)*outputs+blockIdx.x*128U+(t&127U))*blocks*block_bytes;
+    struct Regs { uint4 a0{},a1{},h{},q0{},q1{},qh0{},qh1{}; };
+    const auto fetch=[&](unsigned step,Regs& r) {
+        if(a_live){r.a0=f16_load(a_src+128U*step);r.a1=f16_load(a_src+128U*step+16U);}
+        const unsigned char* blk=b_src+(step/4U)*block_bytes;
+        r.h=f16_load(blk);
+        r.q0=f16_load(blk+qs_at+32U*(step%4U));r.q1=f16_load(blk+qs_at+32U*(step%4U)+16U);
+        if constexpr(Q5K){r.qh0=f16_load(blk+16U);r.qh1=f16_load(blk+32U);}
+    };
+    const auto stage=[&](unsigned step,const Regs& r) {
+        const uint4 rh=r.h,rq0=r.q0,rq1=r.q1,rqh0=r.qh0,rqh1=r.qh1;
+        uint4* a_dst=reinterpret_cast<uint4*>(&s.a[a_row][16U*a_part]);
+        a_dst[0]=f16_from_bf16(r.a0,a_scale);a_dst[1]=f16_from_bf16(r.a1,a_scale);
+        const unsigned p=step%4U,g0=2U*p,g1=g0+1U;
+        const float d=__half2float(__ushort_as_half(static_cast<unsigned short>(rh.x&65535U)));
+        const float dm=__half2float(__ushort_as_half(static_cast<unsigned short>(rh.x>>16U)));
+        const float a0=d*static_cast<float>(factor(rh,g0,false)),b0=-(dm*static_cast<float>(factor(rh,g0,true)));
+        const float a1=d*static_cast<float>(factor(rh,g1,false)),b1=-(dm*static_cast<float>(factor(rh,g1,true)));
+        const unsigned q[8]{rq0.x,rq0.y,rq0.z,rq0.w,rq1.x,rq1.y,rq1.z,rq1.w};
+        uint4* b_lo=reinterpret_cast<uint4*>(&s.b[t][0]);
+        uint4* b_hi=reinterpret_cast<uint4*>(&s.b[t][32]);
+        const unsigned qh[8]{rqh0.x,rqh0.y,rqh0.z,rqh0.w,rqh1.x,rqh1.y,rqh1.z,rqh1.w};
+#pragma unroll
+        for(unsigned k=0;k<8U;k+=2U) {
+            unsigned l0=q[k]&mask,u0=(q[k]>>4U)&mask,l1=q[k+1U]&mask,u1=(q[k+1U]>>4U)&mask;
+            if constexpr(Q5K) {
+                l0|=((qh[k]>>g0)&0x01010101U)<<4U;u0|=((qh[k]>>g1)&0x01010101U)<<4U;
+                l1|=((qh[k+1U]>>g0)&0x01010101U)<<4U;u1|=((qh[k+1U]>>g1)&0x01010101U)<<4U;
+            }
+            const uint2 x0=f16_affine_u8(l0,a0,b0),x1=f16_affine_u8(l1,a0,b0),y0=f16_affine_u8(u0,a1,b1),y1=f16_affine_u8(u1,a1,b1);
+            b_lo[k/2U]={x0.x,x0.y,x1.x,x1.y};b_hi[k/2U]={y0.x,y0.y,y1.x,y1.y};
+        }
+    };
+    const unsigned lane=t&31U,wave=t/32U,i=lane&15U,h=lane>>4U,mb=(count+15U)/16U;
+    const unsigned cols[2]{16U*wave,128U+16U*wave};
+    f32x8 acc[4][2]={};
+    Regs r0,r1;
+    fetch(0U,r0);fetch(1U,r1); // steps = hidden/64 is even (hidden % 256 == 0)
+#pragma unroll 1
+    for(unsigned step=0;step<steps;step+=2U) {
+        if(step)f16_barrier();
+        stage(step,r0);
+        f16_barrier();
+        if(step+2U<steps)fetch(step+2U,r0);
+        f16_step(s,mb,cols,i,acc);
+        f16_barrier();
+        stage(step+1U,r1);
+        f16_barrier();
+        if(step+3U<steps)fetch(step+3U,r1);
+        f16_step(s,mb,cols,i,acc);
+    }
+    const unsigned out=blockIdx.x*128U+16U*wave+i;
+#pragma unroll
+    for(unsigned mi=0;mi<4U;++mi)if(mi<mb)
+#pragma unroll
+    for(unsigned e=0;e<8U;++e) {
+        const unsigned a=16U*mi+2U*e+h;
+        const bool live=a<count;
+        const unsigned r=rows.row[live?a:0U],slot=rows.slot[live?a:0U];
+        const float unscale=ldexpf(1.0F,-rows.exponent[live?a:0U]);
+        const float g=acc[mi][0][e]*unscale,u=acc[mi][1][e]*unscale;
+        const float hv=(g/(1.0F+expf(-g)))*u;
+        const bool bad=!isfinite(g)||!isfinite(u)||!isfinite(hv);
+        if(live)at(view.output,r)[slot*2U*outputs+out]=hv;
+        // Largest |h| of the wave's 16 outputs of this row (the lanes of one half hold one row).
+        float m=fabsf(hv);
+        for(int stride=8;stride!=0;stride/=2)m=fmaxf(m,__shfl_xor(m,stride,32));
+        if(live&&i==0U)atomicMax(reinterpret_cast<unsigned*>(at(view.down_sums,r))+slot,__float_as_uint(m));
+        if(live&&bad){atomicOr(at(view.status,r),8U);atomicOr(csr.summary,8U);}
+    }
+}
+// The 32 FP16 weights of a Q8_0 down block (down_operands' byte selection, written without arrays).
+__device__ __forceinline__ void f16_q80_block(const DownBlock<false>& x,unsigned group,uint4 (&out)[4]) {
+    const unsigned odd=group&1U,select=odd?0x07060504U:0x05040302U;
+    const float d=__half2float(__ushort_as_half(static_cast<unsigned short>((x.lo.x>>(odd?16U:0U))&65535U)));
+    const auto pair=[&](unsigned hi0,unsigned lo0,unsigned hi1,unsigned lo1) {
+        const uint2 a=f16_scaled_s8(__builtin_amdgcn_perm(hi0,lo0,select),d),b=f16_scaled_s8(__builtin_amdgcn_perm(hi1,lo1,select),d);
+        return uint4{a.x,a.y,b.x,b.y};
+    };
+    out[0]=pair(x.lo.y,x.lo.x,x.lo.z,x.lo.y);out[1]=pair(x.lo.w,x.lo.z,x.hi.x,x.lo.w);
+    out[2]=pair(x.hi.y,x.hi.x,x.hi.z,x.hi.y);out[3]=pair(x.hi.w,x.hi.z,x.last,x.hi.w);
+}
+// Down of one CSR batch (<= 64 assignments) for 256 hidden outputs, K = width (FP32 h of each
+// (row, slot), scaled and rounded to FP16 while staging). Grid x = output tile, y = batch. B
+// column t decodes K blocks 2*step, 2*step + 1 of its output row; wave w owns columns 32w..+32.
+template<bool Q51>
+__global__ __launch_bounds__(256) void down_prefill_f16(const unsigned char* weights,PrefillRows view,unsigned hidden,unsigned width) {
+    const auto& csr=view.csr;
+    if(csr.summary[0]||blockIdx.y>=csr.summary[2])return;
+    const unsigned begin=csr.begins[blockIdx.y],count=csr.begins[blockIdx.y+1U]-begin,expert=csr.experts[blockIdx.y];
+    __shared__ __align__(16) F16Stage s;
+    __shared__ F16Rows rows;
+    const unsigned t=threadIdx.x;
+    if(t<f16_batch) {
+        const bool live=t<count;const unsigned r=live?csr.rows[begin+t]:0U,slot=live?csr.slots[begin+t]:0U;
+        rows.row[t]=r;rows.slot[t]=slot;
+        rows.exponent[t]=live?f16_exponent(__uint_as_float(static_cast<unsigned>(at(view.down_sums,r)[slot]))):0;
+    }
+    __syncthreads();
+    constexpr unsigned block_bytes=Q51?24U:34U;
+    const unsigned a_row=t/4U,a_part=t%4U,groups=width/32U,steps=width/64U;
+    const bool a_live=a_row<count;
+    const float a_scale=ldexpf(1.0F,rows.exponent[a_row]);
+    const auto* a_src=at(view.output,rows.row[a_row])+2ULL*rows.slot[a_row]*width+16U*a_part;
+    const auto* b_src=weights+(static_cast<unsigned long long>(expert)*hidden+blockIdx.x*256U+t)*groups*block_bytes;
+    struct Regs { uint4 a0{},a1{},a2{},a3{}; DownBlock<Q51> b0,b1; };
+    const auto fetch=[&](unsigned step,Regs& r) {
+        if(a_live){r.a0=f16_load(a_src+64U*step);r.a1=f16_load(a_src+64U*step+4U);r.a2=f16_load(a_src+64U*step+8U);r.a3=f16_load(a_src+64U*step+12U);}
+        r.b0=down_block<Q51>(b_src,2U*step);r.b1=down_block<Q51>(b_src,2U*step+1U);
+    };
+    const auto stage=[&](unsigned step,const Regs& r) {
+        const uint4 ra[4]{r.a0,r.a1,r.a2,r.a3};const DownBlock<Q51>& rb0=r.b0;const DownBlock<Q51>& rb1=r.b1;
+        uint4* a_dst=reinterpret_cast<uint4*>(&s.a[a_row][16U*a_part]);
+        a_dst[0]=f16_from_f32(ra[0],ra[1],a_scale);a_dst[1]=f16_from_f32(ra[2],ra[3],a_scale);
+        uint4* b_dst=reinterpret_cast<uint4*>(&s.b[t][0]);
+#pragma unroll
+        for(unsigned half=0;half<2U;++half) {
+            if constexpr(Q51) {
+                wmma_v4i b0,b1;float d,m;
+                down_operands<true>(half?rb1:rb0,2U*step+half,b0,b1,d,m);
+                const unsigned c[8]{static_cast<unsigned>(b0.x),static_cast<unsigned>(b0.y),static_cast<unsigned>(b0.z),static_cast<unsigned>(b0.w),
+                    static_cast<unsigned>(b1.x),static_cast<unsigned>(b1.y),static_cast<unsigned>(b1.z),static_cast<unsigned>(b1.w)};
+#pragma unroll
+                for(unsigned k=0;k<8U;k+=2U) {
+                    const uint2 x=f16_affine_u8(c[k],d,m),y=f16_affine_u8(c[k+1U],d,m);
+                    b_dst[4U*half+k/2U]={x.x,x.y,y.x,y.y};
+                }
+            } else {
+                uint4 w[4];
+                f16_q80_block(half?rb1:rb0,2U*step+half,w);
+#pragma unroll
+                for(unsigned k=0;k<4U;++k)b_dst[4U*half+k]=w[k];
+            }
+        }
+    };
+    const unsigned lane=t&31U,wave=t/32U,i=lane&15U,h=lane>>4U,mb=(count+15U)/16U;
+    const unsigned cols[2]{32U*wave,32U*wave+16U};
+    f32x8 acc[4][2]={};
+    Regs r0,r1;
+    fetch(0U,r0);fetch(1U,r1); // steps = width/64 is even (width % 128 == 0)
+#pragma unroll 1
+    for(unsigned step=0;step<steps;step+=2U) {
+        if(step)f16_barrier();
+        stage(step,r0);
+        f16_barrier();
+        if(step+2U<steps)fetch(step+2U,r0);
+        f16_step(s,mb,cols,i,acc);
+        f16_barrier();
+        stage(step+1U,r1);
+        f16_barrier();
+        if(step+3U<steps)fetch(step+3U,r1);
+        f16_step(s,mb,cols,i,acc);
+    }
+#pragma unroll
+    for(unsigned mi=0;mi<4U;++mi)if(mi<mb)
+#pragma unroll
+    for(unsigned e=0;e<8U;++e) {
+        const unsigned a=16U*mi+2U*e+h;
+        if(a>=count)continue;
+        const float unscale=ldexpf(1.0F,-rows.exponent[a]);
+        float* out=at(view.rawdots,rows.row[a])+rows.slot[a]*hidden+blockIdx.x*256U+32U*wave+i;
+        out[0]=acc[mi][0][e]*unscale;out[16]=acc[mi][1][e]*unscale;
+    }
+}
 bool overlap(DeviceBytes a,DeviceBytes b){return a.address<b.address+b.bytes&&b.address<a.address+a.bytes;}
 void range(DeviceBytes v){if(!v.address||!v.bytes||v.bytes>UINTPTR_MAX-v.address)throw std::invalid_argument("A8 CSR gate/up owner range is invalid");}
 struct Prepared {DeviceRows rows;DeviceCsr csr;};
@@ -1158,15 +1447,48 @@ void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned cou
     static const int wmma_env=[]{const char* v=std::getenv("STRIX_PREFILL_MOE_WMMA");return v?std::atoi(v):-1;}();
     // Whole CTA tiles; the WMMA down is unrolled for width = max_rows.
     const bool wmma_shape=request.shape.rows==max_rows&&request.shape.hidden%256U==0U;
-    const bool wmma=wmma_shape&&(form>=0?form>=1:wmma_env>=0?wmma_env==1:true);
-    const unsigned cap=wmma?wmma_batch:dot4_cap;
+    const bool f16=form==3;
+    if(f16&&(request.shape.rows%128U||request.shape.hidden%256U))throw std::invalid_argument("A8 prefill FP16 WMMA geometry is invalid");
+    const bool wmma=f16||(wmma_shape&&(form>=0?form>=1:wmma_env>=0?wmma_env==1:true));
+    const unsigned cap=f16?f16_batch:wmma?wmma_batch:dot4_cap;
     enqueue_prefill_prologue(request,rows,count,clear_words,stream);
     const unsigned assignments=count*request.shape.top_k;
     // The WMMA form builds the (identical) CSR with the parallel builder; form 2 keeps the serial one.
     if(wmma&&form!=2)hipLaunchKernelGGL(build_prefill_csr_waves,dim3(1),dim3(1024),0,stream,rows,count,request.shape.experts,request.shape.top_k,cap);
     else hipLaunchKernelGGL(build_prefill_csr,dim3(1),dim3(1024),0,stream,rows,count,request.shape.experts,request.shape.top_k,cap);
     check(hipGetLastError(),"A8 prefill CSR");
+    // STRIX_PREFILL_MOE_CSR_DUMP=1 (diagnostic, synchronizes): rows-per-expert histogram of each call.
+    static const bool csr_dump=[]{const char* v=std::getenv("STRIX_PREFILL_MOE_CSR_DUMP");return v&&v[0]=='1';}();
+    if(csr_dump) {
+        std::vector<unsigned> offsets(request.shape.experts+1U);
+        check(hipMemcpyAsync(offsets.data(),rows.csr.offsets,4U*offsets.size(),hipMemcpyDeviceToHost,stream),"CSR dump");
+        check(hipStreamSynchronize(stream),"CSR dump");
+        std::array<unsigned,8> bucket{};unsigned largest=0;
+        for(unsigned e=0;e<request.shape.experts;++e) {
+            const unsigned n=offsets[e+1U]-offsets[e];largest=std::max(largest,n);
+            bucket[n==0U?0U:n<=16U?1U:n<=32U?2U:n<=64U?3U:n<=128U?4U:n<=256U?5U:n<=512U?6U:7U]++;
+        }
+        std::fprintf(stderr,"moe-csr T=%u experts n=0:%u 1-16:%u 17-32:%u 33-64:%u 65-128:%u 129-256:%u 257-512:%u >512:%u max %u\n",
+            count,bucket[0],bucket[1],bucket[2],bucket[3],bucket[4],bucket[5],bucket[6],bucket[7],largest);
+    }
     const unsigned batches=std::min(assignments,request.shape.experts+(assignments+cap-1U)/cap);
+    if(f16) {
+        hipLaunchKernelGGL(f16_row_scales,dim3(count),dim3(256),0,stream,rows,request.shape.hidden,request.shape.top_k);
+        check(hipGetLastError(),"FP16 prefill row scales");
+        const dim3 project_grid(request.shape.rows/128U,batches);
+        if(q5k)hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill_f16<true>),project_grid,dim3(256),0,stream,
+            gate,up,rows,request.shape.hidden,request.shape.rows);
+        else hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill_f16<false>),project_grid,dim3(256),0,stream,
+            gate,up,rows,request.shape.hidden,request.shape.rows);
+        check(hipGetLastError(),"FP16 prefill WMMA gate/up projection");
+        const dim3 down_grid(request.shape.hidden/256U,batches);
+        if(down_type==7U)hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_f16<true>),down_grid,dim3(256),0,
+            stream,down_weights,rows,request.shape.hidden,request.shape.rows);
+        else hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_f16<false>),down_grid,dim3(256),0,
+            stream,down_weights,rows,request.shape.hidden,request.shape.rows);
+        check(hipGetLastError(),"FP16 prefill WMMA down");
+        return;
+    }
     if(wmma) {
         // 16 waves per CTA (measured best against 8; down also against 4).
         constexpr unsigned project_waves=16U,down_waves=16U;

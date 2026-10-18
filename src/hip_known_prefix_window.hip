@@ -611,6 +611,8 @@ struct HipKnownPrefixWindow::Impl {
         routed_config.a8_down_q51=config.a8_down_q51;
         routed_config.a8_down_q80=config.a8_down_q80;
         routed_config.q5k_a8g32_gate_up=config.q5k_a8g32_gate_up;
+        // fast-prefill-f16wmma-v1 moe component: T-row prefill blocks run the routed MoE in FP16 WMMA.
+        routed_config.prefill_f16wmma=(config.fast_prefill_components & kFastPrefillMoe) != 0U;
         routed_config.q4k_a8_stats=config.q4k_a8_stats;
         routed_config.q4k_a8_quiescence=std::make_shared<HipSetupQuiescenceGuard>();
         for(std::size_t i=0;i<window.mode.size();++i)

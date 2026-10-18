@@ -4,7 +4,9 @@
 // summary word) must be identical. Default mode: the bitwise cases. "bench": timing per form.
 #include "strix/hip_moe_q4k_a8_known_rows.hpp"
 #include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
 #include <algorithm>
+#include <cmath>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -155,9 +157,19 @@ struct Fixture {
     }
     ~Fixture() { if (stream) (void)hipStreamDestroy(stream); }
     std::vector<const Buffer*> written() const { return {&codes, &deltas, &sums, &status, &output, &clear, &dcodes, &ddeltas, &dsums, &rawdots}; }
-    void enqueue(int form) {
-        kr::enqueue_prefill(request, view, c.rows, H, static_cast<const unsigned char*>(gate.base), static_cast<const unsigned char*>(up.base),
-            c.down_type, static_cast<const unsigned char*>(down.base), stream, form);
+    void enqueue(int form, unsigned rows = 0) {
+        kr::enqueue_prefill(request, view, rows ? rows : c.rows, H, static_cast<const unsigned char*>(gate.base),
+            static_cast<const unsigned char*>(up.base), c.down_type, static_cast<const unsigned char*>(down.base), stream, form);
+    }
+    // The first `rows` prompt rows only (a shorter prefill block over the same row views).
+    std::vector<unsigned char> run_rawdots(int form, unsigned rows) {
+        for (const auto* b : written()) b->poison(stream);
+        csr.poison(stream);
+        enqueue(form, rows);
+        check(hipStreamSynchronize(stream), "run prefill prefix");
+        auto out = rawdots.read();
+        out.resize(static_cast<std::size_t>(rows) * rawdots.stride);
+        return out;
     }
     std::vector<std::vector<unsigned char>> run(int form) {
         for (const auto* b : written()) b->poison(stream);
@@ -212,11 +224,124 @@ bool compare(const Case& c) {
         c.name, ok ? "PASS" : "FAIL", summary, bad_rows, c.rows, nonfinite, nan_words, nan_payload);
     return ok;
 }
+// FP32 reference of the routed MoE with unquantized activations: exact FP32 weight values, BF16
+// input as FP32, sequential FP32 sums, h = silu(g) * u in FP32 (accuracy mode only).
+__device__ float half_at(const unsigned char* p) { return __half2float(__ushort_as_half(static_cast<unsigned short>(p[0] | p[1] << 8))); }
+__device__ float weight_at(const unsigned char* row, unsigned k, unsigned kind) {
+    if (kind == 12U || kind == 13U) {
+        const unsigned char* b = row + (k / 256U) * (kind == 12U ? 144U : 176U);
+        const unsigned j = (k % 256U) / 32U, i = k % 32U;
+        const unsigned char* sc = b + 4;
+        unsigned s, m;
+        if (j < 4U) { s = sc[j] & 63U; m = sc[j + 4U] & 63U; }
+        else { s = (sc[j + 4U] & 15U) | (static_cast<unsigned>(sc[j - 4U] >> 6U) << 4U); m = static_cast<unsigned>(sc[j + 4U] >> 4U) | (static_cast<unsigned>(sc[j] >> 6U) << 4U); }
+        const unsigned char* qs = b + (kind == 12U ? 16U : 48U);
+        const unsigned byte = qs[32U * (j / 2U) + i];
+        unsigned q = j % 2U ? byte >> 4U : byte & 15U;
+        if (kind == 13U) q |= ((b[16U + i] >> j) & 1U) << 4U;
+        return half_at(b) * static_cast<float>(s) * static_cast<float>(q) - half_at(b + 2) * static_cast<float>(m);
+    }
+    if (kind == 7U) {
+        const unsigned char* b = row + (k / 32U) * 24U;
+        const unsigned i = k % 32U;
+        const unsigned qh = static_cast<unsigned>(b[4]) | static_cast<unsigned>(b[5]) << 8U | static_cast<unsigned>(b[6]) << 16U | static_cast<unsigned>(b[7]) << 24U;
+        const unsigned q = (i < 16U ? b[8U + i] & 15U : b[8U + i - 16U] >> 4U) | ((qh >> i) & 1U) << 4U;
+        return half_at(b) * static_cast<float>(q) + half_at(b + 2);
+    }
+    const unsigned char* b = row + (k / 32U) * 34U;
+    return half_at(b) * static_cast<float>(static_cast<signed char>(b[2U + k % 32U]));
+}
+__global__ void reference_gate_up(const unsigned char* gate, const unsigned char* up, unsigned kind, kr::StridedRows<const void> input,
+    kr::StridedRows<const unsigned> routes, unsigned T, unsigned H, unsigned I, unsigned K, float* h) {
+    const unsigned o = blockIdx.x * blockDim.x + threadIdx.x, a = blockIdx.y;
+    if (o >= I || a >= T * K) return;
+    const unsigned r = a / K, s = a % K;
+    const auto* x = reinterpret_cast<const unsigned short*>(static_cast<const unsigned char*>(input.base) + r * input.stride);
+    const unsigned e = *(reinterpret_cast<const unsigned*>(reinterpret_cast<const unsigned char*>(routes.base) + r * routes.stride) + s);
+    const std::uint64_t row_bytes = (H / 256U) * (kind == 12U ? 144U : 176U);
+    const unsigned char* gr = gate + (static_cast<std::uint64_t>(e) * I + o) * row_bytes;
+    const unsigned char* ur = up + (static_cast<std::uint64_t>(e) * I + o) * row_bytes;
+    float g = 0.0F, u = 0.0F;
+    for (unsigned k = 0; k < H; ++k) {
+        const float v = __uint_as_float(static_cast<unsigned>(x[k]) << 16U);
+        g = fmaf(v, weight_at(gr, k, kind), g); u = fmaf(v, weight_at(ur, k, kind), u);
+    }
+    h[static_cast<std::uint64_t>(a) * I + o] = (g / (1.0F + expf(-g))) * u;
+}
+__global__ void reference_down(const unsigned char* down, unsigned kind, kr::StridedRows<const unsigned> routes, const float* h,
+    unsigned T, unsigned H, unsigned I, unsigned K, float* raw) {
+    const unsigned n = blockIdx.x * blockDim.x + threadIdx.x, a = blockIdx.y;
+    if (n >= H || a >= T * K) return;
+    const unsigned r = a / K, s = a % K;
+    const unsigned e = *(reinterpret_cast<const unsigned*>(reinterpret_cast<const unsigned char*>(routes.base) + r * routes.stride) + s);
+    const unsigned char* row = down + (static_cast<std::uint64_t>(e) * H + n) * (I / 32U) * (kind == 7U ? 24U : 34U);
+    float acc = 0.0F;
+    for (unsigned k = 0; k < I; ++k) acc = fmaf(h[static_cast<std::uint64_t>(a) * I + k], weight_at(row, k, kind), acc);
+    raw[static_cast<std::uint64_t>(a) * H + n] = acc;
+}
+// Error of the raw slot dots and of the route-weighted per-row sums of forms 1 (A8) and 3 (FP16)
+// against the reference; form 3 must be deterministic and fail no row.
+bool accuracy(const Case& c) {
+    Fixture f(c);
+    const unsigned T = c.rows, H = Fixture::H, I = Fixture::I, K = Fixture::K;
+    float *h = nullptr, *raw = nullptr;
+    check(hipMalloc(&h, sizeof(float) * T * K * I), "reference h"); check(hipMalloc(&raw, sizeof(float) * T * K * H), "reference raw");
+    hipLaunchKernelGGL(reference_gate_up, dim3((I + 127U) / 128U, T * K), dim3(128), 0, f.stream, static_cast<const unsigned char*>(f.gate.base),
+        static_cast<const unsigned char*>(f.up.base), c.gate_type, f.view.input, f.view.routes, T, H, I, K, h);
+    hipLaunchKernelGGL(reference_down, dim3((H + 127U) / 128U, T * K), dim3(128), 0, f.stream, static_cast<const unsigned char*>(f.down.base),
+        c.down_type, f.view.routes, h, T, H, I, K, raw);
+    check(hipStreamSynchronize(f.stream), "reference");
+    std::vector<float> ref(static_cast<std::size_t>(T) * K * H);
+    check(hipMemcpy(ref.data(), raw, ref.size() * 4U, hipMemcpyDeviceToHost), "read reference");
+    (void)hipFree(h); (void)hipFree(raw);
+    std::vector<float> rw(f.weights.bytes / 4U);
+    check(hipMemcpy(rw.data(), f.weights.base, f.weights.bytes, hipMemcpyDeviceToHost), "read route weights");
+    bool ok = true;
+    std::vector<unsigned char> first3;
+    for (const int form : {1, 3, 3}) {
+        const auto out = f.run(form);
+        const auto& rd = out[9];
+        std::uint32_t summary; std::memcpy(&summary, out.back().data(), 4);
+        if (form == 3 && first3.empty()) first3 = rd;
+        else if (form == 3 && rd != first3) { std::printf("  form 3 is not deterministic\n"); ok = false; }
+        double e2 = 0, r2 = 0, emax = 0, m2 = 0, mr2 = 0;
+        for (unsigned t = 0; t < T; ++t) {
+            const float* got = reinterpret_cast<const float*>(rd.data() + static_cast<std::size_t>(t) * f.rawdots.stride);
+            const float* w = rw.data() + static_cast<std::size_t>(t) * (f.weights.stride / 4U);
+            for (unsigned n = 0; n < H; ++n) {
+                double mg = 0, mr = 0;
+                for (unsigned s = 0; s < K; ++s) {
+                    const double x = ref[(static_cast<std::size_t>(t) * K + s) * H + n], y = got[s * H + n];
+                    e2 += (y - x) * (y - x); r2 += x * x; emax = std::max(emax, std::abs(y - x));
+                    mg += w[s] * y; mr += w[s] * x;
+                }
+                m2 += (mg - mr) * (mg - mr); mr2 += mr * mr;
+            }
+        }
+        const double rms = std::sqrt(r2 / (static_cast<double>(T) * K * H));
+        std::printf("%-34s form %d: summary %#x, raw dots rel RMS error %.3e, max |error| %.3e (%.2f RMS), merged rel RMS error %.3e\n",
+            c.name, form, summary, std::sqrt(e2 / r2), emax, emax / rms, std::sqrt(m2 / mr2));
+        if (summary) ok = false;
+    }
+    // A shorter block (other CSR batches, other batch neighbours) gives each of its rows the same bytes.
+    if (c.rows >= 32U) {
+        const unsigned half = c.rows / 2U / 8U * 8U;
+        auto prefix = first3;
+        prefix.resize(static_cast<std::size_t>(half) * f.rawdots.stride);
+        const bool same = f.run_rawdots(3, half) == prefix;
+        std::printf("%-34s form 3: first %u rows as their own block %s\n", c.name, half, same ? "byte-identical" : "DIFFER");
+        ok = ok && same;
+    }
+    return ok;
+}
 void bench(const Case& c, int reps) {
     Fixture f(c);
     hipEvent_t start, stop;
     check(hipEventCreate(&start), "event"); check(hipEventCreate(&stop), "event");
-    for (int form = 0; form < 2; ++form) {
+    // BENCH_FORMS: digits of the forms to time (default 013: dot4, iu8 WMMA, FP16 WMMA).
+    const char* forms = std::getenv("BENCH_FORMS");
+    for (const char* fp = forms ? forms : "013"; *fp; ++fp) {
+        const int form = *fp - '0';
         f.enqueue(form);
         check(hipStreamSynchronize(f.stream), "warm");
         std::vector<float> ms;
@@ -229,7 +354,7 @@ void bench(const Case& c, int reps) {
         }
         std::sort(ms.begin(), ms.end());
         const double macs = static_cast<double>(c.rows) * Fixture::K * 3.0 * Fixture::H * Fixture::I;
-        std::printf("%-30s form %d (%s): median %.3f ms (min %.3f) per %u rows, %.2f effective TOPS\n", c.name, form, form ? "wmma" : "dot4",
+        std::printf("%-30s form %d (%s): median %.3f ms (min %.3f) per %u rows, %.2f effective TOPS\n", c.name, form, form == 3 ? "f16 wmma" : form ? "wmma" : "dot4",
             ms[ms.size() / 2], ms.front(), c.rows, 2.0 * macs / (ms[ms.size() / 2] * 1e9));
     }
     (void)hipEventDestroy(start); (void)hipEventDestroy(stop);
@@ -248,6 +373,21 @@ int main(int argc, char** argv) {
                 (argv[6][0] == '1' ? " skew" : "");
             bench({name.c_str(), 512U, T, g, d, 0U, false, argv[6][0] == '1', false}, std::atoi(argv[2]));
             return 0;
+        }
+        if (mode == "f16") {
+            // FP16 WMMA (form 3) and iu8 WMMA (form 1) against the FP32 reference.
+            unsigned failed = 0;
+            static std::vector<std::string> labels;
+            labels.reserve(16);
+            for (const unsigned g : {12U, 13U}) for (const unsigned d : {7U, 8U}) {
+                labels.push_back(std::string("E512 T256 ") + (g == 12U ? "q4k" : "q5k") + (d == 7U ? "/q51" : "/q80"));
+                failed += accuracy({labels.back().c_str(), 512U, 256U, g, d, 0U, false, false, false}) ? 0U : 1U;
+            }
+            failed += accuracy({"E64 T128 dup q4k/q51", 64U, 128U, 12U, 7U, 0U, true, false, false}) ? 0U : 1U;
+            failed += accuracy({"E40 T48 skew q5k/q80", 40U, 48U, 13U, 8U, 0U, false, true, false}) ? 0U : 1U;
+            failed += accuracy({"E512 T1024 q4k/q51 skew", 512U, 1024U, 12U, 7U, 0U, false, true, false}) ? 0U : 1U;
+            std::printf("f16: %u failed\n", failed);
+            return failed ? 1 : 0;
         }
         if (mode == "bench") {
             const int reps = argc > 2 ? std::atoi(argv[2]) : 10;
