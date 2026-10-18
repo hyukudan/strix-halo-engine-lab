@@ -1,6 +1,7 @@
 #pragma once
 
 #include "strix/compiled_speculative_verify.hpp"
+#include "strix/execution_arena.hpp"
 #include "strix/execution_resources.hpp"
 #include "strix/execution_runtime.hpp"
 #include "strix/serial_session.hpp"
@@ -54,6 +55,9 @@ struct KnownWindowExecutionHooks {
     // that wraps one step) re-runs only the slots whose launcher differs, plus its own
     // structural plan checks; the owner-level admission already passed with the first plan.
     std::vector<std::array<std::uintptr_t, 2>>* preflight_slots = nullptr;
+    // Owner-held index of the compiled window's row arena views (alive and unmodified as long as
+    // the owner): their buffer lookups are answered from it instead of being indexed per window.
+    const ArenaLookupIndex* arena_index = nullptr;
 };
 
 struct KnownWindowR2Entry {

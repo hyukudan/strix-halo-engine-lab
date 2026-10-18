@@ -52,8 +52,9 @@ namespace strix {
     std::string_view tensor_name);
 
 // Validates one manifest/binding pair on construction. Until destruction, resolve_dispatch_tensor
-// on this thread does not re-validate that same pair (other pairs still are). The owner must keep
-// both objects alive and unmodified for the scope's lifetime (one admitted prefill block's launch).
+// and validate_model_runtime_binding_unless_scoped on this thread do not re-validate that same pair
+// (other pairs still are). The owner must keep both objects alive and unmodified for the scope's
+// lifetime (one admitted prefill block's or known window's launch).
 class ValidatedModelBindingScope {
 public:
     ValidatedModelBindingScope(const ModelManifest& manifest, const ModelRuntimeBinding& binding);
@@ -65,5 +66,10 @@ private:
     const ModelManifest* previous_manifest_;
     const ModelRuntimeBinding* previous_binding_;
 };
+
+// validate_model_runtime_binding, except for the pair of this thread's innermost
+// ValidatedModelBindingScope, which was validated when the scope opened.
+void validate_model_runtime_binding_unless_scoped(
+    const ModelManifest& manifest, const ModelRuntimeBinding& binding);
 
 }  // namespace strix

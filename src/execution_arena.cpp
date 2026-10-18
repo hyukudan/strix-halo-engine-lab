@@ -413,43 +413,81 @@ struct PlanIndex {
     std::unordered_map<UseKey, std::size_t, UseHash> first;
 };
 using LookupCache = std::unordered_map<const ExecutionArenaPlan*, PlanIndex>;
-thread_local LookupCache* active_lookup = nullptr;
+struct ActiveLookup {
+    const LookupCache* persistent = nullptr;
+    LookupCache transient;
+};
+thread_local ActiveLookup* active_lookup = nullptr;
+
+void index_plan(PlanIndex& index, const ExecutionArenaPlan& plan) {
+    index.first.clear();
+    for (std::size_t i = 0; i < plan.allocations.size(); ++i)
+        index.first.try_emplace(UseKey{plan.allocations[i].use}, i);
+    index.data = plan.allocations.data();
+    index.size = plan.allocations.size();
+}
+
+bool index_matches(const PlanIndex& index, const ExecutionArenaPlan& plan) noexcept {
+    return index.data == plan.allocations.data() && index.size == plan.allocations.size();
+}
+
+// Answer of a matching index; false when its hit no longer holds that use (plan changed in place).
+bool indexed_answer(const PlanIndex& index, const ExecutionArenaPlan& plan, ExecutionBufferUse use,
+    const ExecutionArenaAllocation*& out) {
+    const auto found = index.first.find(UseKey{use});
+    if (found == index.first.end()) { out = nullptr; return true; }
+    out = &plan.allocations[found->second];
+    return out->use == use;
+}
 
 const ExecutionArenaAllocation* indexed_allocation(
     LookupCache& cache, const ExecutionArenaPlan& plan, ExecutionBufferUse use) {
     auto& index = cache[&plan];
-    if (index.data != plan.allocations.data() || index.size != plan.allocations.size()) {
-        // First lookup of this plan (or another plan now at its address): index it.
-        index.first.clear();
-        for (std::size_t i = 0; i < plan.allocations.size(); ++i)
-            index.first.try_emplace(UseKey{plan.allocations[i].use}, i);
-        index.data = plan.allocations.data();
-        index.size = plan.allocations.size();
-    }
-    const auto found = index.first.find(UseKey{use});
-    if (found == index.first.end()) return nullptr;
-    const auto& allocation = plan.allocations[found->second];
-    if (!(allocation.use == use)) throw std::logic_error("arena lookup index is stale");
-    return &allocation;
+    // First lookup of this plan (or another plan now at its address): index it.
+    if (!index_matches(index, plan)) index_plan(index, plan);
+    const ExecutionArenaAllocation* allocation = nullptr;
+    if (!indexed_answer(index, plan, use, allocation)) throw std::logic_error("arena lookup index is stale");
+    return allocation;
 }
 }  // namespace
 
-ArenaLookupScope::ArenaLookupScope() : previous_(active_lookup) { active_lookup = new LookupCache; }
+ArenaLookupIndex::ArenaLookupIndex(std::span<const ExecutionArenaPlan* const> plans) {
+    auto cache = std::make_shared<LookupCache>();
+    for (const auto* plan : plans)
+        if (plan) index_plan((*cache)[plan], *plan);
+    plans_ = std::move(cache);
+}
+
+ArenaLookupScope::ArenaLookupScope() : previous_(active_lookup) { active_lookup = new ActiveLookup; }
+
+ArenaLookupScope::ArenaLookupScope(const ArenaLookupIndex& persistent) : previous_(active_lookup) {
+    active_lookup = new ActiveLookup;
+    active_lookup->persistent = static_cast<const LookupCache*>(persistent.plans_.get());
+}
 
 ArenaLookupScope::~ArenaLookupScope() {
     delete active_lookup;
-    active_lookup = static_cast<LookupCache*>(previous_);
+    active_lookup = static_cast<ActiveLookup*>(previous_);
 }
 
 const ExecutionArenaAllocation* find_arena_allocation(
     const ExecutionArenaPlan& plan,
     ExecutionBufferUse use) noexcept {
     if (active_lookup) {
-        try {
-            return indexed_allocation(*active_lookup, plan, use);
-        } catch (...) {
-            // Out of memory while indexing, or a plan changed in place: drop its index and search.
-            active_lookup->erase(&plan);
+        const auto* persistent = active_lookup->persistent;
+        const auto fixed = persistent ? persistent->find(&plan) : LookupCache::const_iterator{};
+        if (persistent && fixed != persistent->end()) {
+            // An owner's plan: answered from its index while that still matches, else searched.
+            const ExecutionArenaAllocation* allocation = nullptr;
+            if (index_matches(fixed->second, plan) && indexed_answer(fixed->second, plan, use, allocation))
+                return allocation;
+        } else {
+            try {
+                return indexed_allocation(active_lookup->transient, plan, use);
+            } catch (...) {
+                // Out of memory while indexing, or a plan changed in place: drop its index and search.
+                active_lookup->transient.erase(&plan);
+            }
         }
     }
     const auto found =

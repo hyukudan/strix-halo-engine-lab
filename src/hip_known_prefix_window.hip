@@ -144,6 +144,7 @@ struct HipKnownPrefixWindow::Impl {
     std::vector<const void*> preflight_memo;
     std::vector<std::pair<const void*, std::array<std::uint64_t, 2>>> recipe_memo;
     std::vector<std::array<std::uintptr_t, 2>> preflight_slots;
+    ArenaLookupIndex arena_index; // the immutable compiled window's arena views
     DeferredMoeFirstError completion_status{};
     bool failed = false;
 
@@ -213,6 +214,12 @@ struct HipKnownPrefixWindow::Impl {
         }
         std::sort(position_readers.begin(), position_readers.end());
         position_readers.erase(std::unique(position_readers.begin(), position_readers.end()), position_readers.end());
+        if(!prefill) {
+            std::vector<const ExecutionArenaPlan*> plans{&window.arena.physical};
+            for(const auto& row:window.row_plan) plans.push_back(&row.arena);
+            for(const auto& view:window.arena.row_view) plans.push_back(&view);
+            arena_index=ArenaLookupIndex(plans);
+        }
         setup_r2();
         setup_rows();
         setup_routed_union();
@@ -882,6 +889,7 @@ struct HipKnownPrefixWindow::Impl {
             hooks.quiesce_or_fail_stop = [&] { failed = true; guard.recover_or_fail_stop(); };
             hooks.position_reader_implementations = position_readers;
             hooks.preflight_memo=&preflight_memo;hooks.recipe_memo=&recipe_memo;hooks.preflight_slots=&preflight_slots;
+            hooks.arena_index=&arena_index;
             hooks.preflight_only = true;
             (void)execute_known_prefix_window_eager(window, serial, resources, scratch, session, tokens,
                 std::span<const CompiledLaunchPlan* const>(launch_pointers), std::span<const KnownWindowR2Entry>(r2_entries),
@@ -925,6 +933,7 @@ struct HipKnownPrefixWindow::Impl {
             hooks.record_actual_window_lineage=static_cast<bool>(capture);
             hooks.skip_head=skip_head;
             hooks.preflight_memo=&preflight_memo;hooks.recipe_memo=&recipe_memo;hooks.preflight_slots=&preflight_slots;
+            hooks.arena_index=&arena_index;
             const auto first_position=session.next_position;
             auto result=prefill ? execute_known_prefix_prefill_eager(*prefill,serial,resources,scratch,session,tokens,
                 launch_plans.front(),r2_entries,rows_entries,hooks,prefill_entries) :

@@ -6,6 +6,7 @@
 #include "strix/speculative_verify_runtime.hpp"
 
 #include "strix/dispatch_resources.hpp"
+#include "strix/execution_arena.hpp"
 #include "strix/launch_dispatch.hpp"
 #include "strix/runtime_launchers.hpp"
 
@@ -14,6 +15,7 @@
 #include <cstring>
 #include <exception>
 #include <limits>
+#include <optional>
 #include <utility>
 #include <vector>
 #include <stdexcept>
@@ -348,6 +350,15 @@ KnownWindowResult execute_known_prefix_window_eager(
     }
     if (serial_resources.ple_prefetch && serial_resources.ple_prefetch->active)
         throw std::invalid_argument("known window cannot borrow an active PLE lookup");
+    // Every row context binds these model objects, unchanged until the window returns: its
+    // admission and launch lookups skip re-validating the whole binding (about 7 ms of host time
+    // per window before), and row arena plans are answered from an index instead of searched
+    // linearly per buffer (the owner's persistent index when it has one).
+    std::optional<ValidatedModelBindingScope> binding_scope;
+    if (!serial_resources.distributed_stage)
+        binding_scope.emplace(*serial_resources.model_manifest, *serial_resources.model_weights);
+    std::optional<ArenaLookupScope> arena_lookup;
+    if (hooks.arena_index) arena_lookup.emplace(*hooks.arena_index); else arena_lookup.emplace();
     std::vector<ExecutionRuntimeResources> resources(rows, serial_resources);
     std::vector<EagerExecutionRequest> requests(rows);
     for (std::size_t r = 0; r < rows; ++r) {

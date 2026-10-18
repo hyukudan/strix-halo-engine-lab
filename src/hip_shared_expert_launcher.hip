@@ -1700,7 +1700,7 @@ KnownSharedR2Views known_shared_r2_views(std::span<const ExecutionDispatchContex
         shared_memory = &memory;
         if (!row.resources->model_manifest || !row.resources->model_weights || !row.resources->tensor_access)
             throw std::invalid_argument("known-window shared R2 model resources are missing");
-        validate_model_runtime_binding(*row.resources->model_manifest, *row.resources->model_weights);
+        validate_model_runtime_binding_unless_scoped(*row.resources->model_manifest, *row.resources->model_weights);
         input[index] = resolve_dispatch_read(row, 0);
         output[index] = resolve_dispatch_write(row, 0);
         workspace[index] = resolve_dispatch_temporary(row, 0);

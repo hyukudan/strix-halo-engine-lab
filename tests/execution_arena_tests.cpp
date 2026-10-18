@@ -278,6 +278,37 @@ int main() {
             same = same && strix::find_arena_allocation(lookup, absent) == &lookup.allocations.back();
         }
         expect(same, "scoped arena lookup index matches the linear search");
+
+        // A persistent owner index answers its plans like the search in every scope opened with it;
+        // a plan whose storage, size or indexed hit changed falls back to the search, and plans
+        // outside the index are indexed per scope.
+        lookup.allocations.pop_back();
+        std::vector<const strix::ExecutionArenaAllocation*> expected;
+        for (const auto& allocation : lookup.allocations) expected.push_back(strix::find_arena_allocation(lookup, allocation.use));
+        auto other = aligned;
+        const strix::ExecutionArenaPlan* const owned[] = {&lookup};
+        const strix::ArenaLookupIndex index(owned);
+        bool persistent = expected.back() == &lookup.allocations.front();
+        for (int round = 0; round < 2; ++round) {
+            const strix::ArenaLookupScope scope(index);
+            for (std::size_t i = 0; i < lookup.allocations.size(); ++i)
+                persistent = persistent && strix::find_arena_allocation(lookup, lookup.allocations[i].use) == expected[i];
+            persistent = persistent && strix::find_arena_allocation(lookup, absent) == nullptr;
+            for (const auto& allocation : other.allocations)
+                persistent = persistent && strix::find_arena_allocation(other, allocation.use) == &allocation;
+        }
+        {
+            const strix::ArenaLookupScope scope(index);
+            const auto duplicated = lookup.allocations.front().use;
+            lookup.allocations.front().use = absent; // indexed hit no longer holds its use
+            persistent = persistent && strix::find_arena_allocation(lookup, duplicated) == &lookup.allocations.back();
+            lookup.allocations.front().use = duplicated;
+            auto grown = lookup.allocations.back(); grown.use = absent;
+            lookup.allocations.push_back(grown); // size (and maybe storage) changed
+            persistent = persistent && strix::find_arena_allocation(lookup, absent) == &lookup.allocations.back() &&
+                strix::find_arena_allocation(lookup, duplicated) == &lookup.allocations.front();
+        }
+        expect(persistent, "persistent arena lookup index matches the linear search");
     }
 
     if (failures == 0) {

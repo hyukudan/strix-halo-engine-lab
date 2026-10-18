@@ -2414,7 +2414,7 @@ KnownMoeRowsPrepared prepare_known_moe_rows(std::span<const ExecutionDispatchCon
         first.session_state_memory != first.resources->session_state_memory ||
         *first.kernel_id != kernel_id(ExecutionBindingRequest{}, config))
         throw std::invalid_argument("known-window routed rows selected serial kernel/IO differs");
-    validate_model_runtime_binding(*first.resources->model_manifest, *first.resources->model_weights);
+    validate_model_runtime_binding_unless_scoped(*first.resources->model_manifest, *first.resources->model_weights);
     if (a8) {
         // Same admission as the serial A8 launcher on every layer.
         if (*first.layer >= 48U || first.resources->distributed_stage)
