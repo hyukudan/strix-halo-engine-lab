@@ -215,11 +215,11 @@ Several requests (up to four) can decode together in one process: `--mtp-cohort-
 (repeatable) adds requests next to the positional prompt, each with its own state, MTP runtime and golden. Their
 drafts are verified in cohort windows that read the projection, expert, HC and head weights once for the rows of all
 requests, while every request produces exactly the tokens it produces alone. See [docs/multi-request-cohort.md](docs/multi-request-cohort.md)
-(D-035).
+(D-039).
 
 Decoding is greedy unless `--mtp-sample-temperature` is above zero: sampled decoding (top-k/top-p/min-p, seed)
 keeps the MTP drafts as speculative proposals and stays reproducible for a seed. See
-[docs/sampled-decoding.md](docs/sampled-decoding.md).
+[docs/sampled-decoding.md](docs/sampled-decoding.md) (D-040).
 
 Teacher-forced scoring (`--teacher-forced-score`, `--teacher-logits-file`) also runs over the tiled prefill with the
 all-rows output policy, producing byte-identical logits files to the serial route within a profile, several times

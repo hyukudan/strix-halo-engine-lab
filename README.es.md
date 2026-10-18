@@ -221,6 +221,16 @@ explicada, está en **[docs/ENGINE.md → Command line](docs/ENGINE.md#command-l
 Para usar el perfil exacto, pasa
 `--numerical-profile hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup-v1`.
 
+Varias peticiones (hasta cuatro) pueden decodificar juntas en un proceso: `--mtp-cohort-request TOKENS_FILE,GOLDEN,SHA256`
+(repetible) añade peticiones junto al prompt posicional, cada una con su estado, su runtime MTP y su golden. Sus
+borradores se verifican en ventanas de cohorte que leen una sola vez los pesos de proyección, expertos, HC y cabeza para
+las filas de todas las peticiones, y cada petición produce exactamente los tokens que produce sola. Ver
+[docs/multi-request-cohort.md](docs/multi-request-cohort.md) (D-039).
+
+La decodificación es greedy salvo que `--mtp-sample-temperature` sea mayor que cero: el muestreo (top-k/top-p/min-p,
+semilla) mantiene los borradores MTP como propuestas especulativas y es reproducible para una semilla. Ver
+[docs/sampled-decoding.md](docs/sampled-decoding.md) (D-040).
+
 ## Cómo funciona
 
 **Un ciclo de decodificación.** El predictor propone tokens hasta que deja de estar seguro; un modelo de coste
