@@ -2622,12 +2622,22 @@ __global__ void known_moe_prefill_merge_kernel(KnownMoePrefillDevice view, std::
 __global__ void known_moe_prefill_commit_kernel(KnownMoePrefillDevice view, std::uint32_t* header,
     std::uint32_t row_count, std::uint32_t hidden_size, std::uint32_t* record) {
     const std::uint32_t failure = header[0];
-    if (blockIdx.x == 0U && blockIdx.y == 0U && threadIdx.x == 0U) {
-        if (failure & 7U) for (const auto word : {1U, 2U, 4U, 5U}) header[word] = 0U;
-        if (failure & 7U) for (std::uint32_t word = 8U; word < 24U; ++word) header[word] = 0U;
-        for (std::uint32_t r = 0; r < row_count; ++r)
-            merge_deferred_moe_first_error(*reinterpret_cast<DeferredMoeFirstError*>(record),
-                *known_moe_prefill_row(view.status, r), DeferredMoeDomain::q4k_a8);
+    if (blockIdx.x == 0U && blockIdx.y == 0U) {
+        // The serial merge over rows 0..T-1 records only the first nonzero row status (a merge of
+        // a zero status changes nothing): the block finds that row in parallel, thread 0 merges it.
+        __shared__ std::uint32_t first_bad;
+        if (threadIdx.x == 0U) first_bad = row_count;
+        __syncthreads();
+        for (std::uint32_t r = threadIdx.x; r < row_count; r += blockDim.x)
+            if (*known_moe_prefill_row(view.status, r)) { atomicMin(&first_bad, r); break; }
+        __syncthreads();
+        if (threadIdx.x == 0U) {
+            if (failure & 7U) for (const auto word : {1U, 2U, 4U, 5U}) header[word] = 0U;
+            if (failure & 7U) for (std::uint32_t word = 8U; word < 24U; ++word) header[word] = 0U;
+            if (first_bad < row_count)
+                merge_deferred_moe_first_error(*reinterpret_cast<DeferredMoeFirstError*>(record),
+                    *known_moe_prefill_row(view.status, first_bad), DeferredMoeDomain::q4k_a8);
+        }
     }
     if (failure) return;
     const auto out = blockIdx.x * blockDim.x + threadIdx.x;
