@@ -21,7 +21,10 @@ constexpr unsigned kHcwPitch = 40U;  // halves per staged LDS row of 32 K values
 constexpr unsigned kHcwOutRows = 256U, kHcwOutFeatures = 16U, kHcwK16 = kHcwRank / 16U;
 constexpr std::uint64_t kHcwDownPackHalves = std::uint64_t{kHcwRank} * kHcwWidth;
 constexpr std::uint64_t kHcwUpPackHalves = std::uint64_t{4U} * 2560U * kHcwRank;
-constexpr std::uint32_t kHcwLowRows = 4096U;
+constexpr std::uint32_t kHcwLowRows = 8192U;
+// Row pitch (halves) of the FP16 normalized rows: 128 bytes of padding keep the rows of one load instruction off
+// one memory channel (an unpadded 20480-byte pitch made the projection 2.5x slower).
+constexpr std::uint32_t kHcwNorm16Pitch = kHcwWidth + 64U;  // rows per call (tiled prefill blocks of up to 8192 rows)
 
 __device__ __forceinline__ hcw_v8f hcw_wmma(const hcw_v16h& a, const hcw_v16h& b, const hcw_v8f& c) {
     return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c);
@@ -95,14 +98,142 @@ __device__ __forceinline__ hcw_v16h hcw_lds_fragment(const _Float16* p) {
     return v;
 }
 
-//// Low projection (+ injection): block (column block cb, 256-row block); wave w owns rows 32 w .. + 31.
+// FP16-input form of hcw_projection_kernel (see there).
+__device__ __forceinline__ void hcw_projection_half(const HyperWideRows& rows, const _Float16* __restrict__ pack,
+    const float* __restrict__ inject, unsigned streams, _Float16* __restrict__ low16) {
+    __shared__ __align__(16) _Float16 bs[2][kHcwProjCols * kHcwPitch];
+    __shared__ __align__(16) _Float16 as[8][32U * kHcwPitch];
+    const unsigned lane = threadIdx.x % 32U, wave = threadIdx.x / 32U, cb = blockIdx.x, sub = lane % 4U, rq = lane / 4U;
+    const unsigned row0 = blockIdx.y * kHcwProjRows + wave * 32U;
+    const std::uint64_t pitch = rows.normalized16_pitch;
+    const _Float16* x = rows.normalized16 + static_cast<std::uint64_t>(min(row0 + rq, rows.count - 1U)) * pitch + 8U * sub;
+    unsigned valid = 0U;
+#pragma unroll
+    for (unsigned q = 0; q < 4U; ++q) valid |= (row0 + 8U * q + rq < rows.count ? 1U : 0U) << q;
+    const bool injecting = inject && cb < streams;
+    const float* w = injecting ? inject + static_cast<std::uint64_t>(cb) * kHcwWidth + 8U * sub : nullptr;
+    const auto* bsrc = reinterpret_cast<const uint4*>(pack + static_cast<std::uint64_t>(cb) * kHcwStages * kHcwProjCols * 32U) + threadIdx.x;
+    const unsigned bdst = (threadIdx.x / 4U) * kHcwPitch + (threadIdx.x % 4U) * 8U;
+    uint4 xa[4];
+    uint4 bw;
+    const auto load = [&](unsigned stage) {
+        bw = bsrc[stage * (kHcwProjCols * 32U / 8U)];
+#pragma unroll
+        for (unsigned q = 0; q < 4U; ++q)
+            xa[q] = valid >> q & 1U ? *reinterpret_cast<const uint4*>(x + stage * 32U + 8U * q * pitch)
+                                    : make_uint4(0U, 0U, 0U, 0U);
+    };
+    hcw_v8f acc[2][4];
+#pragma unroll
+    for (unsigned t = 0; t < 2U; ++t)
+#pragma unroll
+        for (unsigned c = 0; c < 4U; ++c) acc[t][c] = hcw_v8f{};
+    float injection[4];
+#pragma unroll
+    for (unsigned q = 0; q < 4U; ++q) injection[q] = 0.0F;
+    load(0U);
+    for (unsigned stage = 0; stage < kHcwStages; ++stage) {
+        const unsigned buffer = stage & 1U;
+        *reinterpret_cast<uint4*>(&bs[buffer][bdst]) = bw;
+#pragma unroll
+        for (unsigned q = 0; q < 4U; ++q) *reinterpret_cast<uint4*>(as[wave] + (8U * q + rq) * kHcwPitch + 8U * sub) = xa[q];
+        if (injecting) {
+            const float4 c0 = *reinterpret_cast<const float4*>(w + stage * 32U), c1 = *reinterpret_cast<const float4*>(w + stage * 32U + 4U);
+            const float c[8] = {c0.x, c0.y, c0.z, c0.w, c1.x, c1.y, c1.z, c1.w};
+#pragma unroll
+            for (unsigned q = 0; q < 4U; ++q) {
+                _Float16 h[8];
+                __builtin_memcpy(h, &xa[q], 16U);
+#pragma unroll
+                for (unsigned j = 0; j < 8U; ++j) injection[q] = fmaf(static_cast<float>(h[j]), c[j], injection[q]);
+            }
+        }
+        __syncthreads();
+        if (stage + 1U < kHcwStages) load(stage + 1U);
+#pragma unroll
+        for (unsigned h = 0; h < 2U; ++h) {
+            const hcw_v16h a0 = hcw_lds_fragment(as[wave] + (lane % 16U) * kHcwPitch + 16U * h);
+            const hcw_v16h a1 = hcw_lds_fragment(as[wave] + (16U + lane % 16U) * kHcwPitch + 16U * h);
+#pragma unroll
+            for (unsigned c = 0; c < 4U; ++c) {
+                const hcw_v16h b = hcw_lds_fragment(&bs[buffer][(16U * c + lane % 16U) * kHcwPitch + 16U * h]);
+                acc[0][c] = hcw_wmma(a0, b, acc[0][c]);
+                acc[1][c] = hcw_wmma(a1, b, acc[1][c]);
+            }
+        }
+    }
+    const float divisor = static_cast<float>(streams);
+#pragma unroll
+    for (unsigned t = 0; t < 2U; ++t)
+#pragma unroll
+        for (unsigned c = 0; c < 4U; ++c)
+#pragma unroll
+            for (unsigned e = 0; e < 8U; ++e) {
+                const unsigned r = row0 + 16U * t + 2U * e + lane / 16U, col = cb * kHcwProjCols + 16U * c + lane % 16U;
+                if (r >= rows.count) continue;
+                const float scaled = acc[t][c][e] / divisor, low = scaled * sigmoid(scaled);
+                wide_row(rows.normalized, rows.normalized_stride, r)[kHcwWidth + col] = low;
+                low16[static_cast<std::uint64_t>(r) * kHcwRank + col] = static_cast<_Float16>(low);
+                if (rows.low_t) rows.low_t[static_cast<std::uint64_t>(col) * rows.low_t_pitch + r] = low;
+            }
+    if (!injecting) return;
+#pragma unroll
+    for (unsigned q = 0; q < 4U; ++q) {
+        float v = injection[q];
+        v = v + wide2_partner<1U>(v);
+        v = v + wide2_partner<2U>(v);
+        if (sub == 0U && (valid >> q & 1U))
+            wide_row(rows.injection, rows.injection_stride, row0 + 8U * q + rq)[cb] = 2.0F * sigmoid(v / divisor);
+    }
+}
+
+// Fast-profile HC norm: rows_prepare_hyper_norm_kernel's values (same expression), plus their FP16 (RNE) copy for
+// the FP16-input projection at normalized16[(8 tile + row) * kHcwNorm16Pitch + feature]. Prefill tiles only.
+template <typename Storage>
+__global__ void rows_prepare_hyper_norm16_kernel(HyperTileRows rows, const void* norm, std::uint32_t norm_type,
+    std::uint32_t hidden, float epsilon, _Float16* __restrict__ normalized16) {
+    const auto stream = blockIdx.x;
+    const auto* input = static_cast<const Storage*>(tiled(rows.input[blockIdx.y], rows.tile_input, rows));
+    auto* normalized = tiled(rows.normalized[blockIdx.y], rows.tile_normalized, rows);
+    auto* half = normalized16 + (static_cast<std::uint64_t>(blockIdx.z) * kWindowRows + blockIdx.y) * kHcwNorm16Pitch;
+    const auto lane = threadIdx.x;
+    const auto base = static_cast<std::uint64_t>(stream) * hidden;
+    __shared__ float reduction[kThreads];
+    __shared__ float inverse;
+    float sum = 0.0F;
+    for (std::uint32_t feature = lane; feature < hidden; feature += kThreads) {
+        const float value = load_activation(input, base + feature);
+        sum += value * value;
+    }
+    reduction[lane] = sum;
+    __syncthreads();
+    for (std::uint32_t stride = kThreads / 2U; stride > 0; stride >>= 1U) {
+        if (lane < stride) reduction[lane] += reduction[lane + stride];
+        __syncthreads();
+    }
+    if (lane == 0) inverse = rsqrtf(reduction[0] / static_cast<float>(hidden) + epsilon);
+    __syncthreads();
+    for (std::uint32_t feature = lane; feature < hidden; feature += kThreads) {
+        const float value = load_activation(input, base + feature) * inverse * load_norm_weight(norm, norm_type, stream * hidden + feature);
+        normalized[base + feature] = value;
+        half[base + feature] = static_cast<_Float16>(value);
+    }
+}
+
+// Low projection (+ injection): block (column block cb, 256-row block); wave w owns rows 32 w .. + 31.
 // Per stage (32 K values) load q = 0..7 of lane l reads row 4 q + l / 8, K values 4 (l % 8) .. + 3 (four
 // rows x 128 bytes per instruction), stores them as FP16 into the wave's LDS rows and, in column blocks
 // cb < streams, adds them into injection output cb's FP32 partial of that row (4 FMAs, k ascending).
 // The 8 partials of a row (lanes of one 8-lane group) are summed by a xor tree at the end.
 // The 64 x 32 FP16 weights of a stage are shared by the 8 waves through LDS (double-buffered).
+// Half: the rows come as the FP16 copy the fast-profile HC norm writes (rows.normalized16, the same RNE values
+// this kernel would round to, so the WMMA operands and low values are unchanged): load q = 0..3 of lane l reads
+// row 8 q + l / 4, K values 8 (l % 4) .. + 7 (eight rows x 64 bytes per instruction, half the bytes), and the
+// injection chains run on those FP16 values widened to FP32 (4 partials per row, xor tree over 4 lanes).
+template <bool Half>
 __global__ __launch_bounds__(256) void hcw_projection_kernel(HyperWideRows rows, const _Float16* __restrict__ pack,
     const float* __restrict__ inject, unsigned streams, _Float16* __restrict__ low16) {
+    if constexpr (Half) { hcw_projection_half(rows, pack, inject, streams, low16); return; } else {
     __shared__ __align__(16) _Float16 bs[2][kHcwProjCols * kHcwPitch];
     __shared__ __align__(16) _Float16 as[8][32U * kHcwPitch];
     const unsigned lane = threadIdx.x % 32U, wave = threadIdx.x / 32U, cb = blockIdx.x, sub = lane % 8U, rq = lane / 8U;
@@ -194,6 +325,7 @@ __global__ __launch_bounds__(256) void hcw_projection_kernel(HyperWideRows rows,
         if (sub == 0U && (valid >> q & 1U))
             wide_row(rows.injection, rows.injection_stride, row0 + 4U * q + rq)[cb] = 2.0F * sigmoid(v / divisor);
     }
+    }
 }
 
 // Up projection + stream mix: block (256-row block, feature block of 16); the block's FP16 weights
@@ -265,6 +397,17 @@ __global__ __launch_bounds__(256) void hcw_output_kernel(HyperWideRows rows, con
             for (unsigned s = 0; s < 4U; ++s) mixed += nv[t][e][s] * sigmoid(acc[t][s][e]);
             store_activation(&wide_row(static_cast<Storage*>(rows.output), rows.output_stride, r)[feature], mixed / 4.0F);
         }
+}
+
+// FP16 copy of the normalized rows (kHcwLowRows x kHcwNorm16Pitch halves), written by the fast-profile HC norm.
+_Float16* hcw_normalized16_scratch() {
+    static _Float16* const pool = [] {
+        void* p = nullptr;
+        if (hipMalloc(&p, std::uint64_t{kHcwLowRows} * kHcwNorm16Pitch * 2U) != hipSuccess)
+            throw std::runtime_error("HC WMMA rows: FP16 normalized-row scratch allocation failed");
+        return static_cast<_Float16*>(p);
+    }();
+    return pool;
 }
 
 struct HcwScratch {

@@ -2141,6 +2141,10 @@ struct HyperWideRows {
     // written by the wide2 projection when set.
     float* low_t = nullptr;
     std::uint32_t low_t_pitch = 0;
+    // Optional FP16 copy of the normalized rows (row r at normalized16 + r * normalized16_pitch halves), written by the
+    // fast-profile HC norm and read by the FP16-input WMMA projection.
+    const _Float16* normalized16 = nullptr;
+    std::uint32_t normalized16_pitch = 0;
 };
 template <typename T> __device__ __forceinline__ T* wide_row(T* base, std::uint64_t stride, std::uint32_t row) {
     return reinterpret_cast<T*>(reinterpret_cast<std::uintptr_t>(base) + static_cast<std::uint64_t>(row) * stride);
@@ -3737,7 +3741,7 @@ bool wide_hyper_rows(const PreparedHyperRows& prepared, const HipHyperMixLaunche
 
 constexpr unsigned kSkipKernel = 255U;  // test seam: launch only the other kernel
 // Transposed low values for the wide2 output kernel: 320 x up to kWide2LowRows rows (prefill steps).
-constexpr std::uint32_t kWide2LowRows = 4096U;
+constexpr std::uint32_t kWide2LowRows = 8192U;
 float* wide2_low_scratch() {
     static float* const pool = [] {
         void* p = nullptr;
@@ -3779,8 +3783,12 @@ void launch_wide_hyper_kernels(const HyperWideRows& wide_in, const void* down, c
         if (projection_kernel == 2U) {
             hipLaunchKernelGGL(hcw_pack_down_kernel, dim3((kHcwRank * kHcwStages + 255U) / 256U), dim3(256U), 0, stream,
                 static_cast<const unsigned char*>(down), scratch.down, scratch.overflow);
-            hipLaunchKernelGGL(hcw_projection_kernel, dim3(kHcwProjColBlocks, (wide.count + kHcwProjRows - 1U) / kHcwProjRows),
-                dim3(256U), 0, stream, wide, scratch.down, static_cast<const float*>(inject), config.hc_count, scratch.low16);
+            const dim3 grid(kHcwProjColBlocks, (wide.count + kHcwProjRows - 1U) / kHcwProjRows);
+            if (wide.normalized16)
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(hcw_projection_kernel<true>), grid, dim3(256U), 0, stream, wide, scratch.down,
+                    static_cast<const float*>(inject), config.hc_count, scratch.low16);
+            else hipLaunchKernelGGL(HIP_KERNEL_NAME(hcw_projection_kernel<false>), grid, dim3(256U), 0, stream, wide, scratch.down,
+                    static_cast<const float*>(inject), config.hc_count, scratch.low16);
             check_hip(hipGetLastError(), "prefill HC WMMA projection launch");
         } else if (projection_kernel != kSkipKernel) throw std::invalid_argument("HC WMMA output requires the WMMA projection");
         if (output_kernel == kSkipKernel) return;
@@ -3898,8 +3906,19 @@ void launch_wide_hyper_rows(const PreparedHyperRows& prepared, const HyperTileRo
     const HipHyperMixLauncherConfig& config, std::uint32_t tiles, bool norm) {
     const auto& p = prepared.first;
     const auto* inject = p.inject_runtime ? reinterpret_cast<const void*>(p.inject_runtime->address) : nullptr;
+    // Fast prefill profile: the norm also writes the FP16 rows the WMMA projection reads (STRIX_HCW_NORM16=0: the
+    // projection converts the FP32 rows itself).
+    static const bool norm16_env = [] { const char* v = std::getenv("STRIX_HCW_NORM16"); return !v || v[0] != '0'; }();
+    HyperWideRows rows = wide;
+    const bool norm16 = norm && config.fast_prefill_wmma && norm16_env && wide.count <= kHcwLowRows;
+    if (norm16) { rows.normalized16 = hcw_normalized16_scratch(); rows.normalized16_pitch = kHcwNorm16Pitch; }
     const auto invoke = [&]<typename Storage>() {
-        if (norm) {
+        if (norm16) {
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_prepare_hyper_norm16_kernel<Storage>), dim3(config.hc_count, kWindowRows, tiles),
+                dim3(kThreads), 0, hip_execution_stream(), tile_rows, reinterpret_cast<const void*>(p.norm_runtime->address),
+                p.norm_manifest->ggml_type, config.hidden_size, config.rms_epsilon, hcw_normalized16_scratch());
+            check_hip(hipGetLastError(), "prefill HC wide rows FP16 normalization launch");
+        } else if (norm) {
             hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_prepare_hyper_norm_kernel<Storage, HyperTileRows>), dim3(config.hc_count, kWindowRows, tiles),
                 dim3(kThreads), 0, hip_execution_stream(), tile_rows, reinterpret_cast<const void*>(p.norm_runtime->address),
                 p.norm_manifest->ggml_type, config.hidden_size, config.rms_epsilon);
@@ -3911,7 +3930,7 @@ void launch_wide_hyper_rows(const PreparedHyperRows& prepared, const HyperTileRo
     case HipActivationStorage::fp32: invoke.template operator()<float>(); break;
     }
     // Fast prefill profile: the FP16 WMMA kernels (2, 2).
-    launch_wide_hyper_kernels(wide, reinterpret_cast<const void*>(p.down_runtime->address), inject,
+    launch_wide_hyper_kernels(rows, reinterpret_cast<const void*>(p.down_runtime->address), inject,
         reinterpret_cast<const void*>(p.up_runtime->address), config, config.fast_prefill_wmma ? 2U : wide_projection_kernel(),
         config.fast_prefill_wmma ? fast_output_kernel() : wide_output_kernel(), hip_execution_stream());
     if (norm && config.arithmetic_stats) {
@@ -3999,6 +4018,8 @@ void testing::enqueue_wide_hyper_rows_test(const HipHyperMixLauncherConfig& conf
     wide.injection = views.injection; wide.injection_stride = views.injection_stride;
     wide.output = views.output; wide.output_stride = views.output_stride;
     wide.count = views.rows;
+    wide.normalized16 = static_cast<const _Float16*>(views.normalized16);
+    wide.normalized16_pitch = views.normalized16_pitch ? views.normalized16_pitch : 10240U;
     launch_wide_hyper_kernels(wide, views.down, views.inject, views.up, config, projection_kernel, output_kernel, stream);
 }
 
