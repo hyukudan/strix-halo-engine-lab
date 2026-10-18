@@ -176,7 +176,14 @@ const char* const names[] = {"codes", "deltas", "sums", "status", "intermediates
 bool compare(const Case& c) {
     Fixture f(c);
     const auto ref = f.run(0), got = f.run(1);
-    bool ok = true;
+    // The parallel CSR builder (form 1) against the serial one (form 2, same batch cap): the whole
+    // CSR allocation, summary words included, and every output byte.
+    const auto csr_parallel = f.csr.read();
+    const auto serial = f.run(2);
+    const auto csr_serial = f.csr.read();
+    bool ok = csr_parallel == csr_serial && serial == got;
+    if (!ok) std::printf("  parallel CSR builder differs from the serial one (csr %s, outputs %s)\n",
+        csr_parallel == csr_serial ? "same" : "differ", serial == got ? "same" : "differ");
     std::size_t nan_words = 0, nan_payload = 0, nonfinite = 0;
     for (std::size_t v = 0; v < ref.size(); ++v) {
         // FP32 views: a NaN's sign/payload is not part of the contract (both kernels write the raw
