@@ -246,6 +246,8 @@ void validate_config(
         config.model.attention_heads > 64 || config.model.hidden_layers > 48 ||
         config.model.indexer_budget != 2048 || config.model.indexer_compress_ratio != 4))
         throw std::invalid_argument("QSA GQA organization requires eager head256/budget2048/compression4");
+    if (config.qsa_gqa_heads_per_block != 1 && config.model.attention_kv_storage != AttentionKvStorage::bf16)
+        throw std::invalid_argument("QSA GQA organization reads the BF16 KV cache only");
     if (config.qsa_hierarchical_selection && (config.enable_device_graph_inputs ||
         config.model.indexer_budget != 2048 || config.model.indexer_compress_ratio != 4 ||
         config.model.hidden_layers > 48))
@@ -328,6 +330,47 @@ __device__ float round_bf16(
     float value) {
     return bf16_to_float(
         float_to_bf16(value));
+}
+
+// kv-int8-tok-v1 (AttentionKvStorage::int8_token). The KV row of one token and layer is
+// [K codes kv_width | V codes kv_width | FP32 scales: K heads, then V heads]. Per (token, KV
+// head, half) the codes are rint(x / s) clamped to [-127, 127] of the BF16-rounded values x,
+// with s = max|x| / 127 (s = 0 and codes 0 for an all-zero head). Every reader uses
+// float(code) * s exactly where the BF16 cache uses the BF16 value, so each product, tree and
+// chain keeps its order and all score/value kernel forms stay equal to one another.
+__host__ __device__ constexpr std::uint64_t kv_int8_row_bytes(std::uint32_t kv_width, std::uint32_t kv_heads) {
+    return 2ULL * kv_width + 8ULL * kv_heads;
+}
+
+__device__ __forceinline__ float kv_int8_load(const void* state, std::uint64_t token, std::uint32_t kv_width,
+    std::uint32_t kv_heads, std::uint32_t half, std::uint32_t kv_head, std::uint32_t head_dim, std::uint32_t feature) {
+    const auto* row = static_cast<const std::uint8_t*>(state) + token * kv_int8_row_bytes(kv_width, kv_heads);
+    const auto code = reinterpret_cast<const std::int8_t*>(row)[half * kv_width + kv_head * head_dim + feature];
+    const auto scale = reinterpret_cast<const float*>(row + 2ULL * kv_width)[half * kv_heads + kv_head];
+    return static_cast<float>(code) * scale;
+}
+
+// One block of kThreads threads (thread = feature, head_dim <= kThreads) quantizes one KV
+// head half of `source` (that half's kv_width FP32 values) into its token row. The maximum
+// is order-independent, so every writer (decode, rows, prefill) stores the same bytes.
+__device__ __forceinline__ void kv_int8_store_head(const float* source, void* state, std::uint64_t token,
+    std::uint32_t kv_width, std::uint32_t kv_heads, std::uint32_t half, std::uint32_t kv_head, std::uint32_t head_dim) {
+    __shared__ float maximum[kThreads];
+    const auto feature = static_cast<std::uint32_t>(threadIdx.x);
+    const float x = feature < head_dim ? round_bf16(source[kv_head * head_dim + feature]) : 0.0F;
+    maximum[feature] = fabsf(x);
+    __syncthreads();
+    for (std::uint32_t stride = kThreads / 2U; stride > 0U; stride >>= 1U) {
+        if (feature < stride) maximum[feature] = fmaxf(maximum[feature], maximum[feature + stride]);
+        __syncthreads();
+    }
+    const float scale = maximum[0] / 127.0F;
+    auto* row = static_cast<std::uint8_t*>(state) + token * kv_int8_row_bytes(kv_width, kv_heads);
+    if (feature < head_dim) {
+        const float code = scale > 0.0F ? fminf(fmaxf(rintf(x / scale), -127.0F), 127.0F) : 0.0F;
+        reinterpret_cast<std::int8_t*>(row)[half * kv_width + kv_head * head_dim + feature] = static_cast<std::int8_t>(code);
+    }
+    if (feature == 0U) reinterpret_cast<float*>(row + 2ULL * kv_width)[half * kv_heads + kv_head] = scale;
 }
 
 __device__ float load_activation(
@@ -1028,6 +1071,23 @@ __global__ void store_kv_kernel(
             current_v[feature]);
 }
 
+// Grid (kv_heads, 2): block (h, half) quantizes KV head h of K (half 0) or V (half 1).
+__global__ void store_kv_int8_kernel(
+    const float* current_k,
+    const float* current_v,
+    void* state,
+    std::uint32_t kv_width,
+    std::uint32_t kv_heads,
+    std::uint32_t head_dim,
+    std::uint64_t position,
+    GraphPositionKernelArguments dynamic) {
+    if (dynamic.position != nullptr) position = *dynamic.position;
+    if (dynamic.status != nullptr && (*dynamic.status != 0 || position >= dynamic.context_tokens)) return;
+    const auto half = static_cast<std::uint32_t>(blockIdx.y);
+    kv_int8_store_head(half ? current_v : current_k, state, position, kv_width, kv_heads, half,
+        static_cast<std::uint32_t>(blockIdx.x), head_dim);
+}
+
 template <SmallWeightKind Kind>
 __global__ void block_score_kernel(
     const float* index_query,
@@ -1490,6 +1550,7 @@ __global__ __launch_bounds__(kSelectThreads) void select_blocks_kernel(float* bl
     select_blocks_parallel_body(block_scores, num_blocks, select_blocks, compress_ratio, visible_tokens, selected, dynamic);
 }
 
+template <bool Int8 = false>
 __device__ __forceinline__ void attention_score_body(
     const float* q_gate,
     const std::uint16_t* kv_state,
@@ -1537,7 +1598,11 @@ __device__ __forceinline__ void attention_score_body(
         2ULL;
 
     float product = 0.0F;
-    if (feature < head_dim) {
+    if constexpr (Int8) {
+        if (feature < head_dim)
+            product = q_gate[static_cast<std::uint64_t>(head) * head_dim * 2ULL + feature] *
+                kv_int8_load(kv_state, token, kv_width, kv_heads, 0U, kv_head, head_dim, feature);
+    } else if (feature < head_dim) {
         product =
             q_gate[
                 static_cast<std::uint64_t>(
@@ -1589,6 +1654,14 @@ __global__ void attention_score_kernel(const float* q_gate, const std::uint16_t*
     std::uint32_t attention_heads, std::uint32_t kv_heads, std::uint32_t head_dim,
     float* scores, GraphSelectionArguments dynamic) {
     attention_score_body(q_gate, kv_state, selected, selected_count, maximum_selected,
+        attention_heads, kv_heads, head_dim, scores, dynamic);
+}
+
+__global__ void attention_score_int8_kernel(const float* q_gate, const std::uint16_t* kv_state,
+    const std::uint32_t* selected, std::uint32_t selected_count, std::uint32_t maximum_selected,
+    std::uint32_t attention_heads, std::uint32_t kv_heads, std::uint32_t head_dim,
+    float* scores, GraphSelectionArguments dynamic) {
+    attention_score_body<true>(q_gate, kv_state, selected, selected_count, maximum_selected,
         attention_heads, kv_heads, head_dim, scores, dynamic);
 }
 
@@ -1706,6 +1779,7 @@ __global__ void attention_softmax_kernel(float* scores, std::uint32_t selected_c
     attention_softmax_body(scores, selected_count, maximum_selected, dynamic);
 }
 
+template <bool Int8 = false>
 __device__ __forceinline__ void attention_output_body(
     const float* q_gate,
     const std::uint16_t* kv_state,
@@ -1744,7 +1818,8 @@ __device__ __forceinline__ void attention_output_body(
     const auto* head_scores = scores + static_cast<std::uint64_t>(head) * maximum_selected;
     const auto offset = static_cast<std::uint64_t>(kv_width) + static_cast<std::uint64_t>(kv_head) * head_dim + feature;
     const auto value_at = [&](std::uint32_t token) {
-        return bf16_to_float(kv_state[static_cast<std::uint64_t>(token) * kv_width * 2ULL + offset]);
+        if constexpr (Int8) return kv_int8_load(kv_state, token, kv_width, kv_heads, 1U, kv_head, head_dim, feature);
+        else return bf16_to_float(kv_state[static_cast<std::uint64_t>(token) * kv_width * 2ULL + offset]);
     };
     float sum = 0.0F;
     std::uint32_t slot = 0;
@@ -1794,6 +1869,14 @@ __global__ void attention_output_kernel(const float* q_gate, const std::uint16_t
     std::uint32_t maximum_selected, std::uint32_t attention_heads, std::uint32_t kv_heads,
     std::uint32_t head_dim, float* output, GraphSelectionArguments dynamic) {
     attention_output_body(q_gate, kv_state, selected, scores, selected_count, maximum_selected,
+        attention_heads, kv_heads, head_dim, output, dynamic);
+}
+
+__global__ void attention_output_int8_kernel(const float* q_gate, const std::uint16_t* kv_state,
+    const std::uint32_t* selected, const float* scores, std::uint32_t selected_count,
+    std::uint32_t maximum_selected, std::uint32_t attention_heads, std::uint32_t kv_heads,
+    std::uint32_t head_dim, float* output, GraphSelectionArguments dynamic) {
+    attention_output_body<true>(q_gate, kv_state, selected, scores, selected_count, maximum_selected,
         attention_heads, kv_heads, head_dim, output, dynamic);
 }
 
@@ -3173,7 +3256,11 @@ void launch_indexed_attention(const ExecutionDispatchContext& context, void* use
          kThreads - 1U) /
         kThreads;
     validate_graph_values(workspace.current_v, kv_width);
-    hipLaunchKernelGGL(
+    const bool kv_int8 = model.attention_kv_storage == AttentionKvStorage::int8_token;
+    if (kv_int8) hipLaunchKernelGGL(store_kv_int8_kernel, dim3(kv_heads, 2U), dim3(kThreads), 0, hip_execution_stream(),
+        workspace.current_k, workspace.current_v, reinterpret_cast<void*>(kv_state.address), kv_width, kv_heads, head_dim,
+        context.position, dynamic_position);
+    else hipLaunchKernelGGL(
         store_kv_kernel,
         dim3(kv_blocks),
         dim3(kThreads),
@@ -3216,7 +3303,11 @@ void launch_indexed_attention(const ExecutionDispatchContext& context, void* use
         }
     } else {
     const auto score_blocks64 = prepare_indexed_attention_score_grid(attention_heads, selected_count);
-    hipLaunchKernelGGL(
+    if (kv_int8) hipLaunchKernelGGL(attention_score_int8_kernel, dim3(static_cast<std::uint32_t>(score_blocks64)), dim3(kThreads), 0,
+        hip_execution_stream(), workspace.q_gate, reinterpret_cast<const std::uint16_t*>(kv_state.address), workspace.selected_indices,
+        selected_count, checked_u32(workspace_layout.maximum_selected_tokens, "maximum_selected_tokens"), attention_heads, kv_heads,
+        head_dim, workspace.attention_scores, dynamic_selection);
+    else hipLaunchKernelGGL(
         attention_score_kernel,
         dim3(
             static_cast<std::uint32_t>(
@@ -3256,7 +3347,11 @@ void launch_indexed_attention(const ExecutionDispatchContext& context, void* use
         hipGetLastError(),
         "HIP indexed-attention softmax launch");
 
-    hipLaunchKernelGGL(
+    if (kv_int8) hipLaunchKernelGGL(attention_output_int8_kernel, dim3(attention_heads), dim3(head_dim), 0, hip_execution_stream(),
+        workspace.q_gate, reinterpret_cast<const std::uint16_t*>(kv_state.address), workspace.selected_indices,
+        workspace.attention_scores, selected_count, checked_u32(workspace_layout.maximum_selected_tokens, "maximum_selected_tokens"),
+        attention_heads, kv_heads, head_dim, workspace.attention_output, dynamic_selection);
+    else hipLaunchKernelGGL(
         attention_output_kernel,
         dim3(attention_heads),
         dim3(head_dim),
@@ -3491,6 +3586,16 @@ __global__ void store_rows_kernel(QsaRowsStoreViews<Rows> views, std::uint16_t* 
     }
 }
 
+// kv-int8-tok-v1 rows append: grid (kv_heads, 2, Rows), block (h, half, r) quantizes KV head
+// h of row r's K (half 0) or V (half 1) with the decode writer's statements.
+template <unsigned Rows>
+__global__ void store_rows_kv_int8_kernel(QsaRowsStoreViews<Rows> views, void* kv_state, std::uint32_t kv_width,
+    std::uint32_t kv_heads, std::uint32_t head_dim) {
+    const auto r = blockIdx.z, half = static_cast<std::uint32_t>(blockIdx.y);
+    kv_int8_store_head(half ? views.v[r] : views.k[r], kv_state, views.position[r], kv_width, kv_heads, half,
+        static_cast<std::uint32_t>(blockIdx.x), head_dim);
+}
+
 // One pooled/normalised/rotated block key serves every row whose visible
 // prefix contains that complete block; each row's head reduction is unchanged.
 template <unsigned Rows> struct QsaRowsScoreViews {
@@ -3585,11 +3690,11 @@ template <unsigned Rows> struct QsaRowsAttentionViews {
     float* output[Rows];
     std::uint32_t count[Rows];
 };
-template <unsigned Rows>
+template <unsigned Rows, bool Int8 = false>
 __global__ void attention_score_rows_kernel(QsaRowsAttentionViews<Rows> views, const std::uint16_t* kv_state,
     std::uint32_t maximum_selected, std::uint32_t attention_heads, std::uint32_t kv_heads, std::uint32_t head_dim) {
     const auto r = blockIdx.y;
-    attention_score_body(views.q_gate[r], kv_state, views.selected[r], views.count[r], maximum_selected,
+    attention_score_body<Int8>(views.q_gate[r], kv_state, views.selected[r], views.count[r], maximum_selected,
         attention_heads, kv_heads, head_dim, views.scores[r], GraphSelectionArguments{});
 }
 // One wave per (row, head, slot) instead of one 256-thread block: lane l holds
@@ -3598,7 +3703,7 @@ __global__ void attention_score_rows_kernel(QsaRowsAttentionViews<Rows> views, c
 // tree in attention_score_body, without contraction, so the scores match it.
 // PerWave > 1: a wave runs PerWave consecutive slots of one (row, head) with q held in
 // registers; every slot keeps the exact single-slot products and tree.
-template <unsigned Rows, unsigned PerWave = 1U>
+template <unsigned Rows, unsigned PerWave = 1U, bool Int8 = false>
 __global__ __launch_bounds__(256) void attention_score_rows_wave_kernel(QsaRowsAttentionViews<Rows> views,
     const std::uint16_t* kv_state, std::uint32_t maximum_selected, std::uint32_t attention_heads, std::uint32_t kv_heads,
     std::uint32_t head_dim, std::uint32_t slots) {
@@ -3627,7 +3732,10 @@ __global__ __launch_bounds__(256) void attention_score_rows_wave_kernel(QsaRowsA
         for (unsigned j = 0; j < 8U; ++j) {
             const auto feature = lane + 32U * j;
             float product = 0.0F;
-            if (feature < head_dim) product = qv[j] * bf16_to_float(k[feature]);
+            if constexpr (Int8) {
+                if (feature < head_dim)
+                    product = qv[j] * kv_int8_load(kv_state, token, kv_heads * head_dim, kv_heads, 0U, kv_head, head_dim, feature);
+            } else if (feature < head_dim) product = qv[j] * bf16_to_float(k[feature]);
             p[i][j] = product;
         }
     }
@@ -3648,22 +3756,22 @@ __global__ void attention_softmax_rows_kernel(QsaRowsAttentionViews<Rows> views,
     const auto r = blockIdx.y;
     attention_softmax_body(views.scores[r], views.count[r], maximum_selected, GraphSelectionArguments{});
 }
-template <unsigned Rows>
+template <unsigned Rows, bool Int8 = false>
 __global__ void attention_output_rows_kernel(QsaRowsAttentionViews<Rows> views, const std::uint16_t* kv_state,
     std::uint32_t maximum_selected, std::uint32_t attention_heads, std::uint32_t kv_heads, std::uint32_t head_dim) {
     const auto r = blockIdx.y;
-    attention_output_body(views.q_gate[r], kv_state, views.selected[r], views.scores[r], views.count[r],
+    attention_output_body<Int8>(views.q_gate[r], kv_state, views.selected[r], views.scores[r], views.count[r],
         maximum_selected, attention_heads, kv_heads, head_dim, views.output[r], GraphSelectionArguments{});
 }
 // Dense A8 (block = one head, thread = feature, every lane present): attention_output_rows_kernel
 // whose waves also quantize the 32 features they just wrote for the o projection (separate
 // kernel so the default one compiles as before).
-template <unsigned Rows>
+template <unsigned Rows, bool Int8 = false>
 __global__ void attention_output_rows_dense_a8_kernel(QsaRowsAttentionViews<Rows> views, const std::uint16_t* kv_state,
     std::uint32_t maximum_selected, std::uint32_t attention_heads, std::uint32_t kv_heads, std::uint32_t head_dim,
     std::int8_t* a8_codes, float* a8_deltas) {
     const auto r = blockIdx.y;
-    attention_output_body(views.q_gate[r], kv_state, views.selected[r], views.scores[r], views.count[r],
+    attention_output_body<Int8>(views.q_gate[r], kv_state, views.selected[r], views.scores[r], views.count[r],
         maximum_selected, attention_heads, kv_heads, head_dim, views.output[r], GraphSelectionArguments{});
     const auto index = static_cast<std::uint64_t>(blockIdx.x) * head_dim + threadIdx.x;
     q8_rows::dense_a8_quantize_lane(views.output[r][index], a8_codes + r * static_cast<std::uint64_t>(attention_heads) * head_dim + index,
@@ -3712,7 +3820,7 @@ template <unsigned P, unsigned Step = 0U> __device__ __forceinline__ void qsa_sc
         qsa_scatter<P, Step + 1U>(v, lane);
     }
 }
-template <unsigned Rows, unsigned G, unsigned Slots, bool Scatter>
+template <unsigned Rows, unsigned G, unsigned Slots, bool Scatter, bool Int8 = false>
 __global__ __launch_bounds__(256) void attention_score_rows_group_kernel(QsaRowsAttentionViews<Rows> views,
     const std::uint16_t* kv_state, std::uint32_t maximum_selected, std::uint32_t attention_heads, std::uint32_t kv_heads,
     std::uint32_t head_dim, std::uint32_t slots) {
@@ -3739,7 +3847,12 @@ __global__ __launch_bounds__(256) void attention_score_rows_group_kernel(QsaRows
         const auto* k = kv_state + static_cast<std::uint64_t>(token) * kv_heads * head_dim * 2ULL + static_cast<std::uint64_t>(kv_head) * head_dim;
         float kf[8];
 #pragma unroll
-        for (unsigned j = 0; j < 8U; ++j) { const auto feature = lane + 32U * j; kf[j] = feature < head_dim ? bf16_to_float(k[feature]) : 0.0F; }
+        for (unsigned j = 0; j < 8U; ++j) {
+            const auto feature = lane + 32U * j;
+            if constexpr (Int8)
+                kf[j] = feature < head_dim ? kv_int8_load(kv_state, token, kv_heads * head_dim, kv_heads, 0U, kv_head, head_dim, feature) : 0.0F;
+            else kf[j] = feature < head_dim ? bf16_to_float(k[feature]) : 0.0F;
+        }
         constexpr unsigned P = G <= 2U ? 2U : G <= 4U ? 4U : G <= 8U ? 8U : 16U;
         float partial[P];
 #pragma unroll
@@ -3773,7 +3886,7 @@ __global__ __launch_bounds__(256) void attention_score_rows_group_kernel(QsaRows
 // guard is true, the wave's Slots token indices are loaded once (lane i holds slot first + i),
 // and the next slot's K row is requested before the current slot's products. Per slot the
 // statements are those of the generic kernel.
-template <unsigned Rows, unsigned G, unsigned Slots>
+template <unsigned Rows, unsigned G, unsigned Slots, bool Int8 = false>
 __global__ __launch_bounds__(256) void attention_score_rows_group256_kernel(QsaRowsAttentionViews<Rows> views,
     const std::uint16_t* kv_state, std::uint32_t maximum_selected, std::uint32_t attention_heads, std::uint32_t kv_heads,
     std::uint32_t head_dim, std::uint32_t slots) {
@@ -3801,20 +3914,30 @@ __global__ __launch_bounds__(256) void attention_score_rows_group256_kernel(QsaR
     float* const scores = views.scores[r]; // loaded once: a store could alias the argument block
     const auto* kbase = kv_state + static_cast<std::uint64_t>(kv_head) * Dim + lane;
     const auto row_elements = static_cast<std::uint64_t>(kv_heads) * Dim * 2ULL;
-    // Raw BF16 bits travel to the next slot; they become floats where the products use them.
-    std::uint16_t raw[8];
-    const auto load = [&](std::uint32_t index, std::uint16_t (&k)[8]) {
+    // Raw BF16 bits travel to the next slot; they become floats where the products use them
+    // (int8 KV: the dequantized values travel instead).
+    using Raw = std::conditional_t<Int8, float, std::uint16_t>;
+    Raw raw[8];
+    const auto load = [&](std::uint32_t index, Raw (&k)[8]) {
         const auto token = static_cast<std::uint32_t>(__builtin_amdgcn_readlane(static_cast<int>(tokens), static_cast<int>(index)));
-        const auto* row = kbase + static_cast<std::uint64_t>(token) * row_elements;
+        if constexpr (Int8) {
 #pragma unroll
-        for (unsigned j = 0; j < 8U; ++j) k[j] = row[32U * j];
+            for (unsigned j = 0; j < 8U; ++j) k[j] = kv_int8_load(kv_state, token, kv_heads * Dim, kv_heads, 0U, kv_head, Dim, lane + 32U * j);
+        } else {
+            const auto* row = kbase + static_cast<std::uint64_t>(token) * row_elements;
+#pragma unroll
+            for (unsigned j = 0; j < 8U; ++j) k[j] = row[32U * j];
+        }
     };
     load(0U, raw);
     constexpr unsigned P = G <= 2U ? 2U : G <= 4U ? 4U : G <= 8U ? 8U : 16U;
     for (auto slot = first; slot < last; ++slot) {
         float kf[8];
 #pragma unroll
-        for (unsigned j = 0; j < 8U; ++j) kf[j] = bf16_to_float(raw[j]);
+        for (unsigned j = 0; j < 8U; ++j) {
+            if constexpr (Int8) kf[j] = raw[j];
+            else kf[j] = bf16_to_float(raw[j]);
+        }
         if (slot + 1U < last) load(slot + 1U - first, raw);
         float partial[P];
 #pragma unroll
@@ -3834,7 +3957,7 @@ __global__ __launch_bounds__(256) void attention_score_rows_group256_kernel(QsaR
             scores[static_cast<std::uint64_t>(head0 + h) * maximum_selected + slot] = partial[0] / scale;
     }
 }
-template <unsigned Rows, unsigned G>
+template <unsigned Rows, unsigned G, bool Int8 = false>
 __global__ __launch_bounds__(256) void attention_output_rows_group_kernel(QsaRowsAttentionViews<Rows> views,
     const std::uint16_t* kv_state, std::uint32_t maximum_selected, std::uint32_t attention_heads, std::uint32_t kv_heads,
     std::uint32_t head_dim) {
@@ -3847,6 +3970,10 @@ __global__ __launch_bounds__(256) void attention_output_rows_group_kernel(QsaRow
     const auto offset = static_cast<std::uint64_t>(kv_width) + static_cast<std::uint64_t>(kv_head) * head_dim + feature;
     const auto* selected = views.selected[r];
     const float* scores = views.scores[r] + static_cast<std::uint64_t>(head0) * maximum_selected;
+    const auto value_at = [&](std::uint32_t token) {
+        if constexpr (Int8) return kv_int8_load(kv_state, token, kv_width, kv_heads, 1U, kv_head, head_dim, feature);
+        else return bf16_to_float(kv_state[static_cast<std::uint64_t>(token) * kv_width * 2ULL + offset]);
+    };
     float sum[G];
 #pragma unroll
     for (unsigned h = 0; h < G; ++h) sum[h] = 0.0F;
@@ -3855,7 +3982,7 @@ __global__ __launch_bounds__(256) void attention_output_rows_group_kernel(QsaRow
         float value[4];
 #pragma unroll
         for (unsigned i = 0; i < 4U; ++i)
-            value[i] = bf16_to_float(kv_state[static_cast<std::uint64_t>(selected[slot + i]) * kv_width * 2ULL + offset]);
+            value[i] = value_at(selected[slot + i]);
 #pragma unroll
         for (unsigned i = 0; i < 4U; ++i)
 #pragma unroll
@@ -3863,7 +3990,7 @@ __global__ __launch_bounds__(256) void attention_output_rows_group_kernel(QsaRow
                 sum[h] = __builtin_fmaf(scores[static_cast<std::uint64_t>(h) * maximum_selected + slot + i], value[i], sum[h]);
     }
     for (; slot < count; ++slot) {
-        const float value = bf16_to_float(kv_state[static_cast<std::uint64_t>(selected[slot]) * kv_width * 2ULL + offset]);
+        const float value = value_at(selected[slot]);
 #pragma unroll
         for (unsigned h = 0; h < G; ++h) sum[h] = __builtin_fmaf(scores[static_cast<std::uint64_t>(h) * maximum_selected + slot], value, sum[h]);
     }
@@ -3880,7 +4007,7 @@ __global__ __launch_bounds__(256) void attention_output_rows_group_kernel(QsaRow
 // the current 8 slots join the chains. Each head's chain is the same ascending-slot fma
 // sequence (its blocking into 4 or 8 slots does not enter the arithmetic), with the same
 // BF16 roundings and gate.
-template <unsigned Rows, unsigned G>
+template <unsigned Rows, unsigned G, bool Int8 = false>
 __global__ __launch_bounds__(256) void attention_output_rows_group_prefetch_kernel(QsaRowsAttentionViews<Rows> views,
     const std::uint16_t* kv_state, std::uint32_t maximum_selected, std::uint32_t attention_heads, std::uint32_t kv_heads,
     std::uint32_t head_dim) {
@@ -3900,19 +4027,28 @@ __global__ __launch_bounds__(256) void attention_output_rows_group_prefetch_kern
     for (unsigned h = 0; h < G; ++h) sum[h] = 0.0F;
     constexpr unsigned B = 8U;
     const auto full = count / B * B;
-    std::uint16_t raw[B];
+    using Raw = std::conditional_t<Int8, float, std::uint16_t>;
+    const auto raw_at = [&](std::uint32_t token) -> Raw {
+        if constexpr (Int8) return kv_int8_load(kv_state, token, kv_width, kv_heads, 1U, kv_head, head_dim, feature);
+        else return values[static_cast<std::uint64_t>(token) * row_elements];
+    };
+    const auto to_float = [](Raw bits) -> float {
+        if constexpr (Int8) return bits;
+        else return bf16_to_float(bits);
+    };
+    Raw raw[B];
     if (full) {
 #pragma unroll
-        for (unsigned i = 0; i < B; ++i) raw[i] = values[static_cast<std::uint64_t>(selected[i]) * row_elements];
+        for (unsigned i = 0; i < B; ++i) raw[i] = raw_at(selected[i]);
     }
     for (std::uint32_t slot = 0; slot < full; slot += B) {
         float value[B];
 #pragma unroll
-        for (unsigned i = 0; i < B; ++i) value[i] = bf16_to_float(raw[i]);
+        for (unsigned i = 0; i < B; ++i) value[i] = to_float(raw[i]);
         // Unconditional (the last block reloads itself), so the loads stay ahead of this block's chains.
         const auto next = slot + B < full ? slot + B : slot;
 #pragma unroll
-        for (unsigned i = 0; i < B; ++i) raw[i] = values[static_cast<std::uint64_t>(selected[next + i]) * row_elements];
+        for (unsigned i = 0; i < B; ++i) raw[i] = raw_at(selected[next + i]);
         __builtin_amdgcn_sched_barrier(0);
 #pragma unroll
         for (unsigned i = 0; i < B; ++i)
@@ -3921,7 +4057,7 @@ __global__ __launch_bounds__(256) void attention_output_rows_group_prefetch_kern
                 sum[h] = __builtin_fmaf(scores[static_cast<std::uint64_t>(h) * maximum_selected + slot + i], value[i], sum[h]);
     }
     for (auto slot = full; slot < count; ++slot) {
-        const float value = bf16_to_float(values[static_cast<std::uint64_t>(selected[slot]) * row_elements]);
+        const float value = to_float(raw_at(selected[slot]));
 #pragma unroll
         for (unsigned h = 0; h < G; ++h) sum[h] = __builtin_fmaf(scores[static_cast<std::uint64_t>(h) * maximum_selected + slot], value, sum[h]);
     }
@@ -4327,10 +4463,17 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
         store.position[r] = prepared.position[r];
     }
     store.journal = prepared.journal;
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(store_rows_kernel<Rows>), dim3((std::max(a.kv_width, a.index_dim) + kThreads - 1U) / kThreads, Rows),
+    const bool kv_int8 = model.attention_kv_storage == AttentionKvStorage::int8_token;
+    const auto bf16_kv_width = kv_int8 ? 0U : a.kv_width; // 0: store_rows_kernel writes only the raw index keys
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(store_rows_kernel<Rows>), dim3((std::max(bf16_kv_width, a.index_dim) + kThreads - 1U) / kThreads, Rows),
         dim3(kThreads), 0, stream, store, reinterpret_cast<std::uint16_t*>(a.raw_state.address),
-        reinterpret_cast<std::uint16_t*>(a.kv_state.address), a.index_dim, a.kv_width);
+        reinterpret_cast<std::uint16_t*>(a.kv_state.address), a.index_dim, bf16_kv_width);
     check_hip(hipGetLastError(), "QSA known-window raw-index/KV append");
+    if (kv_int8) {
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(store_rows_kv_int8_kernel<Rows>), dim3(a.kv_heads, 2U, Rows), dim3(kThreads), 0, stream,
+            store, reinterpret_cast<void*>(a.kv_state.address), a.kv_width, a.kv_heads, a.head_dim);
+        check_hip(hipGetLastError(), "QSA known-window int8 KV append");
+    }
 
     QsaRowsScoreViews<Rows> scores{};
     QsaRowsSelectViews<Rows> select{};
@@ -4431,116 +4574,121 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
         maximum_count = std::max(maximum_count, attention.count[r]);
     }
     const auto maximum_selected = checked_u32(a.workspace_layout.maximum_selected_tokens, "maximum_selected_tokens");
-    const auto* kv = reinterpret_cast<const std::uint16_t*>(a.kv_state.address);
-    // Prefill groups: KV-head-grouped score / output kernels. STRIX_QSA_PREFILL_GROUP=0 keeps the
-    // window kernels; =2|3|4|6|12 query heads per score wave (default 12) with
-    // STRIX_QSA_PREFILL_SLOTS=4|8|16 slots per wave (default 16); STRIX_QSA_PREFILL_OUT_GROUP=
-    // 2|3|4|6|12 heads per output block (default 12). Measured at T = 256 (1032-token prompt).
-    const auto env_choice = [](const char* name, int fallback) {
-        const char* v = std::getenv(name);
-        const int n = v ? std::atoi(v) : fallback;
-        return n == 0 || n == 2 || n == 3 || n == 4 || n == 6 || n == 12 ? static_cast<unsigned>(n) : static_cast<unsigned>(fallback);
-    };
-    static const unsigned head_group = env_choice("STRIX_QSA_PREFILL_GROUP", 12);
-    static const unsigned out_group = env_choice("STRIX_QSA_PREFILL_OUT_GROUP", 12);
-    static const unsigned group_slots = [] {
-        const char* v = std::getenv("STRIX_QSA_PREFILL_SLOTS");
-        const int n = v ? std::atoi(v) : 16;
-        return n == 4 || n == 8 ? static_cast<unsigned>(n) : 16U;
-    }();
-    bool grouped = false;
-    if constexpr (Rows > 8U) {
-        const auto per_kv = a.kv_heads && a.attention_heads % a.kv_heads == 0U ? a.attention_heads / a.kv_heads : 0U;
-        grouped = head_group != 0U && out_group != 0U && a.head_dim <= kThreads && per_kv &&
-            per_kv % head_group == 0U && per_kv % out_group == 0U;
-    }
-    if (grouped) {
-        if constexpr (Rows > 8U) {
-            static_cast<void>(prepare_indexed_attention_score_grid(a.attention_heads, maximum_count));
-            static const bool scatter = [] { const char* v = std::getenv("STRIX_QSA_PREFILL_SCATTER"); return !v || v[0] != '0'; }();
-            // STRIX_QSA_SCORE_PREFETCH=0 keeps the generic kernel for head_dim 256.
-            static const bool prefetch = [] { const char* v = std::getenv("STRIX_QSA_SCORE_PREFETCH"); return !v || v[0] != '0'; }();
-            const auto score = [&]<unsigned G, unsigned S>() {
-                const auto waves = static_cast<std::uint64_t>(Rows) * (a.attention_heads / G) * ((maximum_count + S - 1U) / S);
-                const auto blocks = dim3(static_cast<std::uint32_t>((waves + 7U) / 8U));
-                if (scatter && prefetch && a.head_dim == 256U) hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_score_rows_group256_kernel<Rows, G, S>),
-                    blocks, dim3(kThreads), 0, stream, attention, kv, maximum_selected, a.attention_heads, a.kv_heads, a.head_dim, maximum_count);
-                else if (scatter) hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_score_rows_group_kernel<Rows, G, S, true>), blocks, dim3(kThreads),
-                    0, stream, attention, kv, maximum_selected, a.attention_heads, a.kv_heads, a.head_dim, maximum_count);
-                else hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_score_rows_group_kernel<Rows, G, S, false>), blocks, dim3(kThreads),
-                    0, stream, attention, kv, maximum_selected, a.attention_heads, a.kv_heads, a.head_dim, maximum_count);
-            };
-            const auto by_group = [&]<unsigned G>() {
-                if (group_slots == 4U) score.template operator()<G, 4U>();
-                else if (group_slots == 16U) score.template operator()<G, 16U>();
-                else score.template operator()<G, 8U>();
-            };
-            switch (head_group) {
-            case 2U: by_group.template operator()<2U>(); break;
-            case 3U: by_group.template operator()<3U>(); break;
-            case 4U: by_group.template operator()<4U>(); break;
-            case 12U: by_group.template operator()<12U>(); break;
-            default: by_group.template operator()<6U>(); break;
-            }
-        }
-    } else if (a.head_dim <= kThreads) {
-        static_cast<void>(prepare_indexed_attention_score_grid(a.attention_heads, maximum_count));
-        // STRIX_QSA_SCORE_SLOTS=1|2|4|8: selected slots per wave (same per-slot arithmetic).
-        static const unsigned per_wave = [] {
-            const char* v = std::getenv("STRIX_QSA_SCORE_SLOTS");
-            const int n = v ? std::atoi(v) : 4;
-            return n == 2 || n == 4 || n == 8 ? static_cast<unsigned>(n) : 1U;
-        }();
-        const auto launch_score = [&]<unsigned PerWave>() {
-            const auto groups = (maximum_count + PerWave - 1U) / PerWave;
-            const auto waves = static_cast<std::uint64_t>(Rows) * a.attention_heads * groups;
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_score_rows_wave_kernel<Rows, PerWave>),
-                dim3(static_cast<std::uint32_t>((waves + 7U) / 8U)), dim3(kThreads), 0, stream, attention, kv, maximum_selected,
-                a.attention_heads, a.kv_heads, a.head_dim, maximum_count);
+    // kv-int8-tok-v1 reads the same kernels' int8 forms (same arithmetic order, dequantized values).
+    const auto attend = [&]<bool Int8>() {
+        const auto* kv = reinterpret_cast<const std::uint16_t*>(a.kv_state.address);
+        // Prefill groups: KV-head-grouped score / output kernels. STRIX_QSA_PREFILL_GROUP=0 keeps the
+        // window kernels; =2|3|4|6|12 query heads per score wave (default 12) with
+        // STRIX_QSA_PREFILL_SLOTS=4|8|16 slots per wave (default 16); STRIX_QSA_PREFILL_OUT_GROUP=
+        // 2|3|4|6|12 heads per output block (default 12). Measured at T = 256 (1032-token prompt).
+        const auto env_choice = [](const char* name, int fallback) {
+            const char* v = std::getenv(name);
+            const int n = v ? std::atoi(v) : fallback;
+            return n == 0 || n == 2 || n == 3 || n == 4 || n == 6 || n == 12 ? static_cast<unsigned>(n) : static_cast<unsigned>(fallback);
         };
-        if (per_wave == 2U) launch_score.template operator()<2U>();
-        else if (per_wave == 4U) launch_score.template operator()<4U>();
-        else if (per_wave == 8U) launch_score.template operator()<8U>();
-        else launch_score.template operator()<1U>();
-    } else hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_score_rows_kernel<Rows>),
-        dim3(static_cast<std::uint32_t>(prepare_indexed_attention_score_grid(a.attention_heads, maximum_count)), Rows),
-        dim3(kThreads), 0, stream, attention, kv, maximum_selected, a.attention_heads, a.kv_heads, a.head_dim);
-    check_hip(hipGetLastError(), "QSA known-window score launch");
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_softmax_rows_kernel<Rows>), dim3(a.attention_heads, Rows), dim3(kThreads), 0,
-        stream, attention, maximum_selected);
-    check_hip(hipGetLastError(), "QSA known-window softmax launch");
-    // Dense A8 window with the output projection in this call: the value/gate kernel writes its codes.
-    if constexpr (Rows <= 8U) if (config.dense_a8_projections && (parts & 4U) && tensors.out.manifest->ggml_type == 8U) {
-        if (a.head_dim % 32U || a.head_dim > 1024U || a.attention_width != a.attention_heads * a.head_dim)
-            throw std::invalid_argument("QSA rows dense A8 value/gate quantizer requires whole 32-feature head blocks");
-        output_slot = q8_rows::dense_a8_slot(0U);
-    }
-    if (grouped) {
+        static const unsigned head_group = env_choice("STRIX_QSA_PREFILL_GROUP", 12);
+        static const unsigned out_group = env_choice("STRIX_QSA_PREFILL_OUT_GROUP", 12);
+        static const unsigned group_slots = [] {
+            const char* v = std::getenv("STRIX_QSA_PREFILL_SLOTS");
+            const int n = v ? std::atoi(v) : 16;
+            return n == 4 || n == 8 ? static_cast<unsigned>(n) : 16U;
+        }();
+        bool grouped = false;
         if constexpr (Rows > 8U) {
-            // STRIX_QSA_OUTPUT_PREFETCH=0 keeps the 4-slot kernel without value prefetch.
-            static const bool output_prefetch = [] { const char* v = std::getenv("STRIX_QSA_OUTPUT_PREFETCH"); return !v || v[0] != '0'; }();
-            const auto output = [&]<unsigned G>() {
-                if (output_prefetch) hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_output_rows_group_prefetch_kernel<Rows, G>),
-                    dim3(a.attention_heads / G, Rows), dim3(a.head_dim), 0, stream, attention, kv, maximum_selected, a.attention_heads,
-                    a.kv_heads, a.head_dim);
-                else hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_output_rows_group_kernel<Rows, G>), dim3(a.attention_heads / G, Rows),
-                    dim3(a.head_dim), 0, stream, attention, kv, maximum_selected, a.attention_heads, a.kv_heads, a.head_dim);
-            };
-            switch (out_group) {
-            case 2U: output.template operator()<2U>(); break;
-            case 3U: output.template operator()<3U>(); break;
-            case 4U: output.template operator()<4U>(); break;
-            case 12U: output.template operator()<12U>(); break;
-            default: output.template operator()<6U>(); break;
-            }
+            const auto per_kv = a.kv_heads && a.attention_heads % a.kv_heads == 0U ? a.attention_heads / a.kv_heads : 0U;
+            grouped = head_group != 0U && out_group != 0U && a.head_dim <= kThreads && per_kv &&
+                per_kv % head_group == 0U && per_kv % out_group == 0U;
         }
-    } else if (output_slot.codes)
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_output_rows_dense_a8_kernel<Rows>), dim3(a.attention_heads, Rows),
-            dim3(a.head_dim), 0, stream, attention, kv, maximum_selected, a.attention_heads, a.kv_heads, a.head_dim,
-            output_slot.codes, output_slot.deltas);
-    else hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_output_rows_kernel<Rows>), dim3(a.attention_heads, Rows), dim3(a.head_dim), 0,
-        stream, attention, kv, maximum_selected, a.attention_heads, a.kv_heads, a.head_dim);
-    check_hip(hipGetLastError(), "QSA known-window value/gate launch");
+        if (grouped) {
+            if constexpr (Rows > 8U) {
+                static_cast<void>(prepare_indexed_attention_score_grid(a.attention_heads, maximum_count));
+                static const bool scatter = [] { const char* v = std::getenv("STRIX_QSA_PREFILL_SCATTER"); return !v || v[0] != '0'; }();
+                // STRIX_QSA_SCORE_PREFETCH=0 keeps the generic kernel for head_dim 256.
+                static const bool prefetch = [] { const char* v = std::getenv("STRIX_QSA_SCORE_PREFETCH"); return !v || v[0] != '0'; }();
+                const auto score = [&]<unsigned G, unsigned S>() {
+                    const auto waves = static_cast<std::uint64_t>(Rows) * (a.attention_heads / G) * ((maximum_count + S - 1U) / S);
+                    const auto blocks = dim3(static_cast<std::uint32_t>((waves + 7U) / 8U));
+                    if (scatter && prefetch && a.head_dim == 256U) hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_score_rows_group256_kernel<Rows, G, S, Int8>),
+                        blocks, dim3(kThreads), 0, stream, attention, kv, maximum_selected, a.attention_heads, a.kv_heads, a.head_dim, maximum_count);
+                    else if (scatter) hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_score_rows_group_kernel<Rows, G, S, true, Int8>), blocks, dim3(kThreads),
+                        0, stream, attention, kv, maximum_selected, a.attention_heads, a.kv_heads, a.head_dim, maximum_count);
+                    else hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_score_rows_group_kernel<Rows, G, S, false, Int8>), blocks, dim3(kThreads),
+                        0, stream, attention, kv, maximum_selected, a.attention_heads, a.kv_heads, a.head_dim, maximum_count);
+                };
+                const auto by_group = [&]<unsigned G>() {
+                    if (group_slots == 4U) score.template operator()<G, 4U>();
+                    else if (group_slots == 16U) score.template operator()<G, 16U>();
+                    else score.template operator()<G, 8U>();
+                };
+                switch (head_group) {
+                case 2U: by_group.template operator()<2U>(); break;
+                case 3U: by_group.template operator()<3U>(); break;
+                case 4U: by_group.template operator()<4U>(); break;
+                case 12U: by_group.template operator()<12U>(); break;
+                default: by_group.template operator()<6U>(); break;
+                }
+            }
+        } else if (a.head_dim <= kThreads) {
+            static_cast<void>(prepare_indexed_attention_score_grid(a.attention_heads, maximum_count));
+            // STRIX_QSA_SCORE_SLOTS=1|2|4|8: selected slots per wave (same per-slot arithmetic).
+            static const unsigned per_wave = [] {
+                const char* v = std::getenv("STRIX_QSA_SCORE_SLOTS");
+                const int n = v ? std::atoi(v) : 4;
+                return n == 2 || n == 4 || n == 8 ? static_cast<unsigned>(n) : 1U;
+            }();
+            const auto launch_score = [&]<unsigned PerWave>() {
+                const auto groups = (maximum_count + PerWave - 1U) / PerWave;
+                const auto waves = static_cast<std::uint64_t>(Rows) * a.attention_heads * groups;
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_score_rows_wave_kernel<Rows, PerWave, Int8>),
+                    dim3(static_cast<std::uint32_t>((waves + 7U) / 8U)), dim3(kThreads), 0, stream, attention, kv, maximum_selected,
+                    a.attention_heads, a.kv_heads, a.head_dim, maximum_count);
+            };
+            if (per_wave == 2U) launch_score.template operator()<2U>();
+            else if (per_wave == 4U) launch_score.template operator()<4U>();
+            else if (per_wave == 8U) launch_score.template operator()<8U>();
+            else launch_score.template operator()<1U>();
+        } else hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_score_rows_kernel<Rows, Int8>),
+            dim3(static_cast<std::uint32_t>(prepare_indexed_attention_score_grid(a.attention_heads, maximum_count)), Rows),
+            dim3(kThreads), 0, stream, attention, kv, maximum_selected, a.attention_heads, a.kv_heads, a.head_dim);
+        check_hip(hipGetLastError(), "QSA known-window score launch");
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_softmax_rows_kernel<Rows>), dim3(a.attention_heads, Rows), dim3(kThreads), 0,
+            stream, attention, maximum_selected);
+        check_hip(hipGetLastError(), "QSA known-window softmax launch");
+        // Dense A8 window with the output projection in this call: the value/gate kernel writes its codes.
+        if constexpr (Rows <= 8U) if (config.dense_a8_projections && (parts & 4U) && tensors.out.manifest->ggml_type == 8U) {
+            if (a.head_dim % 32U || a.head_dim > 1024U || a.attention_width != a.attention_heads * a.head_dim)
+                throw std::invalid_argument("QSA rows dense A8 value/gate quantizer requires whole 32-feature head blocks");
+            output_slot = q8_rows::dense_a8_slot(0U);
+        }
+        if (grouped) {
+            if constexpr (Rows > 8U) {
+                // STRIX_QSA_OUTPUT_PREFETCH=0 keeps the 4-slot kernel without value prefetch.
+                static const bool output_prefetch = [] { const char* v = std::getenv("STRIX_QSA_OUTPUT_PREFETCH"); return !v || v[0] != '0'; }();
+                const auto output = [&]<unsigned G>() {
+                    if (output_prefetch) hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_output_rows_group_prefetch_kernel<Rows, G, Int8>),
+                        dim3(a.attention_heads / G, Rows), dim3(a.head_dim), 0, stream, attention, kv, maximum_selected, a.attention_heads,
+                        a.kv_heads, a.head_dim);
+                    else hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_output_rows_group_kernel<Rows, G, Int8>), dim3(a.attention_heads / G, Rows),
+                        dim3(a.head_dim), 0, stream, attention, kv, maximum_selected, a.attention_heads, a.kv_heads, a.head_dim);
+                };
+                switch (out_group) {
+                case 2U: output.template operator()<2U>(); break;
+                case 3U: output.template operator()<3U>(); break;
+                case 4U: output.template operator()<4U>(); break;
+                case 12U: output.template operator()<12U>(); break;
+                default: output.template operator()<6U>(); break;
+                }
+            }
+        } else if (output_slot.codes)
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_output_rows_dense_a8_kernel<Rows, Int8>), dim3(a.attention_heads, Rows),
+                dim3(a.head_dim), 0, stream, attention, kv, maximum_selected, a.attention_heads, a.kv_heads, a.head_dim,
+                output_slot.codes, output_slot.deltas);
+        else hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_output_rows_kernel<Rows, Int8>), dim3(a.attention_heads, Rows), dim3(a.head_dim), 0,
+            stream, attention, kv, maximum_selected, a.attention_heads, a.kv_heads, a.head_dim);
+        check_hip(hipGetLastError(), "QSA known-window value/gate launch");
+    };
+    if (model.attention_kv_storage == AttentionKvStorage::int8_token) attend.template operator()<true>();
+    else attend.template operator()<false>();
     }
     if (!(parts & 4U)) return;
 
@@ -4681,6 +4829,9 @@ std::uint64_t implementation_identity(
     if(config.qsa_hierarchical_selection) hash_u64(hash, 0x515341544f503531ULL);
     if(config.qsa_gqa_heads_per_block != 1) {
         hash_u64(hash, 0x5153414751417631ULL); hash_u64(hash, config.qsa_gqa_heads_per_block);
+    }
+    if(config.model.attention_kv_storage != AttentionKvStorage::bf16) {
+        hash_u64(hash, 0x4b564938544f4b31ULL); hash_u64(hash, static_cast<std::uint32_t>(config.model.attention_kv_storage));
     }
     return hash;
 }
@@ -5009,6 +5160,66 @@ void launch_hip_qsa_block_select_probe(bool reference, std::span<const HipQsaBlo
         else throw std::invalid_argument("QSA block-select probe rows kernel takes 2, 4 or 8 rows");
     }
     check_hip(hipGetLastError(), "QSA block-select probe launch");
+}
+#endif
+
+#ifdef STRIX_BUILD_KNOWN_WINDOW_DIAGNOSTIC
+void launch_hip_attention_kv_int8_probe(const HipKvInt8Probe& p, void* stream) {
+    const auto owned = static_cast<hipStream_t>(stream);
+    if (!owned || owned == hipStreamPerThread || owned == hipStreamLegacy || p.head_dim != kThreads || !p.kv_heads ||
+        !p.attention_heads || p.attention_heads % p.kv_heads || (p.attention_heads / p.kv_heads) % 12U || !p.count ||
+        p.count > p.maximum_selected || !p.decode_state || !p.rows_state || !p.q_gate || !p.selected || !p.scores_decode ||
+        !p.out_decode || !p.scores_rows || !p.out_rows || !p.scores_group || !p.out_group)
+        throw std::invalid_argument("int8 KV probe requires an owned stream, head_dim 256, 12-head KV groups and all views");
+    check_hip(hipPeekAtLastError(), "int8 KV probe stale error");
+    const auto kv_width = p.kv_heads * p.head_dim, attention_width = p.attention_heads * p.head_dim;
+    const GraphPositionKernelArguments none{};
+    QsaRowsStoreViews<8U> store{};
+    for (unsigned r = 0; r < 8U; ++r) {
+        hipLaunchKernelGGL(store_kv_int8_kernel, dim3(p.kv_heads, 2U), dim3(kThreads), 0, owned, p.k[r], p.v[r], p.decode_state,
+            kv_width, p.kv_heads, p.head_dim, p.position[r], none);
+        store.k[r] = p.k[r]; store.v[r] = p.v[r]; store.position[r] = p.position[r];
+    }
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(store_rows_kv_int8_kernel<8U>), dim3(p.kv_heads, 2U, 8U), dim3(kThreads), 0, owned, store,
+        p.rows_state, kv_width, p.kv_heads, p.head_dim);
+    const auto* kv = static_cast<const std::uint16_t*>(p.decode_state);
+    const GraphSelectionArguments selection{};
+    hipLaunchKernelGGL(attention_score_int8_kernel, dim3(p.attention_heads * p.count), dim3(kThreads), 0, owned, p.q_gate, kv,
+        p.selected, p.count, p.maximum_selected, p.attention_heads, p.kv_heads, p.head_dim, p.scores_decode, selection);
+    hipLaunchKernelGGL(attention_softmax_kernel, dim3(p.attention_heads), dim3(kThreads), 0, owned, p.scores_decode, p.count,
+        p.maximum_selected, selection);
+    hipLaunchKernelGGL(attention_output_int8_kernel, dim3(p.attention_heads), dim3(p.head_dim), 0, owned, p.q_gate, kv, p.selected,
+        p.scores_decode, p.count, p.maximum_selected, p.attention_heads, p.kv_heads, p.head_dim, p.out_decode, selection);
+    // Every row of the window (8, wave score with 4 slots per wave) and prefill group (16 rows,
+    // 12 heads per score wave / output block, 16 slots per wave, prefetching forms) attends the
+    // same query and selection.
+    const auto views = [&]<unsigned Rows>(float* scores, float* output) {
+        QsaRowsAttentionViews<Rows> v{};
+        for (unsigned r = 0; r < Rows; ++r) {
+            v.q_gate[r] = p.q_gate; v.selected[r] = p.selected; v.count[r] = p.count;
+            v.scores[r] = scores + static_cast<std::uint64_t>(r) * p.attention_heads * p.maximum_selected;
+            v.output[r] = output + static_cast<std::uint64_t>(r) * attention_width;
+        }
+        return v;
+    };
+    const auto window = views.template operator()<8U>(p.scores_rows, p.out_rows);
+    const auto waves = 8ULL * p.attention_heads * ((p.count + 3U) / 4U);
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_score_rows_wave_kernel<8U, 4U, true>), dim3(static_cast<std::uint32_t>((waves + 7U) / 8U)),
+        dim3(kThreads), 0, owned, window, kv, p.maximum_selected, p.attention_heads, p.kv_heads, p.head_dim, p.count);
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_softmax_rows_kernel<8U>), dim3(p.attention_heads, 8U), dim3(kThreads), 0, owned,
+        window, p.maximum_selected);
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_output_rows_kernel<8U, true>), dim3(p.attention_heads, 8U), dim3(p.head_dim), 0, owned,
+        window, kv, p.maximum_selected, p.attention_heads, p.kv_heads, p.head_dim);
+    const auto group = views.template operator()<16U>(p.scores_group, p.out_group);
+    const auto group_waves = 16ULL * (p.attention_heads / 12U) * ((p.count + 15U) / 16U);
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_score_rows_group256_kernel<16U, 12U, 16U, true>),
+        dim3(static_cast<std::uint32_t>((group_waves + 7U) / 8U)), dim3(kThreads), 0, owned, group, kv, p.maximum_selected,
+        p.attention_heads, p.kv_heads, p.head_dim, p.count);
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_softmax_rows_kernel<16U>), dim3(p.attention_heads, 16U), dim3(kThreads), 0, owned,
+        group, p.maximum_selected);
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_output_rows_group_prefetch_kernel<16U, 12U, true>), dim3(p.attention_heads / 12U, 16U),
+        dim3(p.head_dim), 0, owned, group, kv, p.maximum_selected, p.attention_heads, p.kv_heads, p.head_dim);
+    check_hip(hipGetLastError(), "int8 KV probe launch");
 }
 #endif
 

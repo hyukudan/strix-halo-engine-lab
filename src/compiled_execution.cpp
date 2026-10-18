@@ -172,6 +172,11 @@ void hash_model(
 
     hash_u64(hash, model.bytes_bf16);
     hash_u64(hash, model.bytes_fp32);
+    // Canonical BF16 KV keeps the historical identity; other storage is bound.
+    if (model.attention_kv_storage != AttentionKvStorage::bf16) {
+        hash_u64(hash, 0x4b564938544f4b31ULL);
+        hash_u64(hash, static_cast<std::uint32_t>(model.attention_kv_storage));
+    }
 }
 
 std::uint64_t build_execution_identity(

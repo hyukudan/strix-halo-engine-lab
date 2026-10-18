@@ -135,6 +135,18 @@ int main() {
            "base KV is 24 KiB/token/session");
     expect(strix::mtp_kv_bytes_per_token(model) == 2ULL * 1024ULL,
            "MTP KV is 2 KiB/token/session");
+    {
+        auto int8 = model;
+        int8.attention_kv_storage = strix::AttentionKvStorage::int8_token;
+        expect(int8.validate().empty(), "kv-int8-tok-v1 contract validates");
+        expect(strix::base_kv_bytes_per_token(int8) == 12ULL * (2ULL * 512ULL + 16ULL),
+               "kv-int8-tok-v1 KV is 12 x (1024 code + 16 scale) bytes/token/session");
+        expect(strix::mtp_kv_bytes_per_token(int8) == 2ULL * 1024ULL,
+               "the MTP head KV stays BF16");
+        auto invalid = model;
+        invalid.attention_kv_storage = static_cast<strix::AttentionKvStorage>(7U);
+        expect(!invalid.validate().empty(), "unknown attention KV storage is rejected");
+    }
     expect(strix::indexer_bytes_per_token(model) == 3ULL * 1024ULL,
            "exact QSA raw-key cache is 3 KiB/token/session");
     expect(strix::provisional_indexer_bytes_per_token(model) ==

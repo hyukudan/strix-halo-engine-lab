@@ -168,6 +168,10 @@ std::uint64_t build_identity(
                 : 0ULL);
     }
 
+    if (model.attention_kv_storage != AttentionKvStorage::bf16) {
+        hash_u64(hash, 0x4b564938544f4b31ULL); // "KVI8TOK1"
+        hash_u64(hash, static_cast<std::uint32_t>(model.attention_kv_storage));
+    }
     if (layout.recurrent_storage != GdnRecurrentStorage::key_value) {
         hash_u64(hash, 0x47444e53544f5231ULL);
         hash_u64(hash, static_cast<std::uint32_t>(layout.recurrent_storage));

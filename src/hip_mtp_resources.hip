@@ -139,7 +139,9 @@ std::shared_ptr<HipMtpResources> HipMtpResources::create(const ModelContract& mo
     }
     const auto buffers=build_serial_execution_buffer_plan(model,{});
     const auto attention=build_indexed_attention_workspace_layout(model);
-    const auto state_layout=build_indexed_attention_state_layout(model);
+    // The MTP head's own KV cache stays BF16 whatever the target's KV storage.
+    auto mtp_model=model;mtp_model.attention_kv_storage=AttentionKvStorage::bf16;
+    const auto state_layout=build_indexed_attention_state_layout(mtp_model);
     const auto wide=mul(mul(model.hidden_size,model.hc_count),2U);
     const auto input_scratch=hip_mtp_input_fusion_scratch_bytes(static_cast<std::uint32_t>(model.hidden_size),static_cast<std::uint32_t>(model.hc_count));
     const std::array<std::uint64_t,buffer_count> sizes{wide,wide,0U,mul(model.hidden_size,2U),input_scratch,input_scratch,

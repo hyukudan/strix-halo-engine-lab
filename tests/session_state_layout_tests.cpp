@@ -22,6 +22,21 @@ void expect(bool condition, const char* message) {
 
 }  // namespace
 
+void attention_kv_storage_binds_layout() {
+    auto model = strix::ModelContract::qwen38_flash_next();
+    strix::SerialSessionStateLayoutRequest request;
+    request.context_tokens = 4096;
+    const auto bf16 = strix::build_serial_session_state_layout(model, request);
+    model.attention_kv_storage = strix::AttentionKvStorage::int8_token;
+    const auto int8 = strix::build_serial_session_state_layout(model, request);
+    const auto* bf16_kv = strix::find_session_state_allocation(bf16, strix::SessionStateComponent::attention_kv);
+    const auto* int8_kv = strix::find_session_state_allocation(int8, strix::SessionStateComponent::attention_kv);
+    expect(bf16_kv && int8_kv && bf16_kv->bytes == 4096ULL * 24576ULL && int8_kv->bytes == 4096ULL * 12480ULL,
+           "kv-int8-tok-v1 sizes the KV allocation");
+    expect(bf16.layout_identity != int8.layout_identity, "KV storage enters the session layout identity");
+    strix::validate_serial_session_state_layout_identity(model, int8);
+}
+
 int main() {
     const auto model =
         strix::ModelContract::qwen38_flash_next();
@@ -207,6 +222,7 @@ int main() {
             "conversion rejects malformed owner/extent/layout/alias or failed fence before modifying payload");
     }
 
+    attention_kv_storage_binds_layout();
     if (failures == 0) {
         std::cout << "session state layout tests passed\n";
     }

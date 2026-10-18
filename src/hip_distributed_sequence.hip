@@ -55,7 +55,7 @@ bool same_model(const ModelContract& a,const ModelContract& b) {
         a.heads_per_ngram==b.heads_per_ngram && a.ngram_vocab_size_base==b.ngram_vocab_size_base && a.ngram_vocab_divisor==b.ngram_vocab_divisor &&
         a.ngram_hash_seed==b.ngram_hash_seed && a.ple_eos_token_id==b.ple_eos_token_id && a.hc_count==b.hc_count &&
         a.hc_lowrank==b.hc_lowrank && a.full_attention_layers==b.full_attention_layers && a.gdn_layers==b.gdn_layers &&
-        a.attention_heads==b.attention_heads && a.kv_heads==b.kv_heads && a.head_dim==b.head_dim &&
+        a.attention_heads==b.attention_heads && a.kv_heads==b.kv_heads && a.head_dim==b.head_dim && a.attention_kv_storage==b.attention_kv_storage &&
         a.mtp_full_attention_layers==b.mtp_full_attention_layers && a.mtp_use_dedicated_embeddings==b.mtp_use_dedicated_embeddings && a.mtp_hidden_state_source_layer_explicit==b.mtp_hidden_state_source_layer_explicit &&
         a.gdn_key_heads==b.gdn_key_heads && a.gdn_key_head_dim==b.gdn_key_head_dim && a.gdn_value_heads==b.gdn_value_heads &&
         a.gdn_value_head_dim==b.gdn_value_head_dim && a.gdn_conv_kernel==b.gdn_conv_kernel && a.indexer_n_heads==b.indexer_n_heads &&

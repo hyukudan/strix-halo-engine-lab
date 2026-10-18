@@ -31,6 +31,7 @@
 #include "strix/hip_runtime_allocator.hpp"
 #include "strix/hip_session_snapshot_transfer.hpp"
 #include "strix/launch_dispatch.hpp"
+#include "strix/memory_plan.hpp"
 #include "strix/mapped_model_file.hpp"
 #include "strix/model_contract.hpp"
 #include "strix/model_content_hash.hpp"
@@ -1031,9 +1032,11 @@ int STRIX_DECODE_ENTRY(
     std::optional<strix::ExecutionPhaseScope> setup_phase;
     if (host_telemetry.enabled) setup_phase.emplace(strix::ExecutionPhase::admission);
 
-    const auto model =
+    auto model =
         strix::ModelContract::
             qwen38_flash_next();
+    // Opt-in KV identity: every state size, layout/execution identity and launcher derives from it.
+    model.attention_kv_storage = options.attention_kv_storage;
 
     const auto generation_eos =
         options.eos_token.value_or(
@@ -1152,6 +1155,7 @@ int STRIX_DECODE_ENTRY(
     strix::decode_cli::validate_resolved_gdn_islands(options);
     strix::decode_cli::validate_resolved_gdn_recurrent_layout(options);
     strix::decode_cli::validate_resolved_gdn_recurrent_storage(options);
+    strix::decode_cli::validate_resolved_attention_kv_storage(options);
     strix::decode_cli::validate_resolved_qsa_hierarchical_selection(options);
     strix::decode_cli::validate_resolved_qsa_gqa(options);
     strix::decode_cli::validate_resolved_known_prefix_window(options);
@@ -2463,8 +2467,12 @@ int STRIX_DECODE_ENTRY(
     }
     const auto gdn_recurrent_layout_receipt = [&]() -> std::string {
         std::string storage;
+        if (model.attention_kv_storage != strix::AttentionKvStorage::bf16)
+            storage = std::string("  \"attention_kv_storage\":\"") + strix::attention_kv_storage_name(model.attention_kv_storage) +
+                "\",\n  \"attention_kv_bytes_per_token\":" + std::to_string(strix::base_kv_bytes_per_token(model)) +
+                ",\n  \"attention_kv_storage_qualification\":\"not_assessed\",\n";
         if (options.gdn_recurrent_storage != strix::GdnRecurrentStorage::key_value)
-            storage = "  \"gdn_recurrent_storage\":\"value-key\",\n  \"gdn_recurrent_storage_qualification\":\"not_assessed\",\n";
+            storage += "  \"gdn_recurrent_storage\":\"value-key\",\n  \"gdn_recurrent_storage_qualification\":\"not_assessed\",\n";
         if (options.gdn_recurrent_layout == strix::HipGdnRecurrentLayout::baseline) return storage;
         return storage + "  \"gdn_recurrent_layout\": \"" +
             std::string(strix::gdn_recurrent_layout_marker(options.gdn_recurrent_layout)) + "\",\n"

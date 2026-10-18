@@ -136,8 +136,14 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
     if(((m.metadata_only || dump) && (qualify || component_diagnostic)) || (qualify && component_diagnostic))
         throw std::invalid_argument("MTP metadata, golden dump, full fixture and component diagnostic routes are mutually exclusive");
     const auto pair=numerical_profile_pair(options);
-    const auto prefill_profile_identity=numerical_profile_identity(pair.prefill);
-    const auto decode_profile_identity=numerical_profile_identity(pair.decode);
+    // The recorded target pair also binds the target KV identity (kv-int8-tok-v1 prompt rows differ
+    // from the BF16 cache's); the canonical BF16 KV keeps the historical pair identities.
+    const auto kv_bound=[&](std::uint64_t identity) {
+        return model.attention_kv_storage==AttentionKvStorage::bf16 ? identity :
+            (identity^0x4b564938544f4b31ULL)*0x100000001b3ULL+static_cast<std::uint32_t>(model.attention_kv_storage);
+    };
+    const auto prefill_profile_identity=kv_bound(numerical_profile_identity(pair.prefill));
+    const auto decode_profile_identity=kv_bound(numerical_profile_identity(pair.decode));
     const bool split=pair.split();
     if(split!=(parents && parents->prompt.compiled) ||
        (split && (!parents->prompt.dispatcher || parents->prompt.resources.session_state_memory!=parents->resources.session_state_memory)))
@@ -148,9 +154,9 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
     // version-1 golden records none and is admitted only for a single-profile run, as before.
     if(golden.target_decode_profile_identity ?
            golden.target_prefill_profile_identity!=prefill_profile_identity || golden.target_decode_profile_identity!=decode_profile_identity :
-           split)
+           split || model.attention_kv_storage!=AttentionKvStorage::bf16)
         throw std::invalid_argument("MTP golden was dumped under another target prefill/decode numerical profile pair "
-            "(a version-1 golden records none and requires one profile for both); dump a golden with this pair");
+            "or KV identity (a version-1 golden records none and requires one profile for both and the BF16 KV); dump a golden with this pair");
     if(golden.rows.size()+1U!=options.tokens.size())
         throw std::invalid_argument("MTP golden must cover every prompt predictor pair, leaving only its final pending target row");
     for(std::size_t i=0;i<golden.rows.size();++i) {

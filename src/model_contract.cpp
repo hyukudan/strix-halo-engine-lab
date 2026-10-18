@@ -54,6 +54,10 @@ std::string ModelContract::validate() const {
     if (gdn_value_heads % gdn_key_heads != 0) {
         return "GDN value heads must be divisible by key heads";
     }
+    if (attention_kv_storage != AttentionKvStorage::bf16 &&
+        attention_kv_storage != AttentionKvStorage::int8_token) {
+        return "attention KV storage must be bf16 or int8_token";
+    }
     if (indexer_n_heads == 0 ||
         indexer_kv_heads == 0 ||
         indexer_head_dim == 0 ||

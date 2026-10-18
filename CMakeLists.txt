@@ -1950,6 +1950,15 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         strix_target_warnings(strix-hip-qsa-block-select-tests)
         add_test(NAME strix-hip-qsa-block-select-tests COMMAND strix-hip-qsa-block-select-tests)
         set_tests_properties(strix-hip-qsa-block-select-tests PROPERTIES SKIP_RETURN_CODE 77)
+        add_executable(strix-hip-attention-kv-int8-tests tests/hip_attention_kv_int8_tests.hip)
+        set_target_properties(strix-hip-attention-kv-int8-tests PROPERTIES
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+        target_link_libraries(strix-hip-attention-kv-int8-tests PRIVATE strix_hip_runtime)
+        target_compile_definitions(strix-hip-attention-kv-int8-tests PRIVATE STRIX_BUILD_KNOWN_WINDOW_DIAGNOSTIC=1)
+        target_compile_options(strix-hip-attention-kv-int8-tests PRIVATE -mno-wavefrontsize64 -fno-fast-math)
+        strix_target_warnings(strix-hip-attention-kv-int8-tests)
+        add_test(NAME strix-hip-attention-kv-int8-tests COMMAND strix-hip-attention-kv-int8-tests)
+        set_tests_properties(strix-hip-attention-kv-int8-tests PROPERTIES SKIP_RETURN_CODE 77)
 
         # Full-model qualification is explicit and requires a model and teacher;
         # it is intentionally absent from the automatic device regression.
