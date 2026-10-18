@@ -146,24 +146,37 @@ struct ElementwiseRowsArgs {
     const void* second[kElementwiseMaxRows];
     const float* weights[kElementwiseMaxRows];
     void* output[kElementwiseMaxRows];
+    // Prefill tile strides (read only by ElementwiseTileRowsArgs kernels).
+    std::uint64_t tile_first, tile_second, tile_weights, tile_output;
 };
+// Prefill: blockIdx.z selects the 8-row tile; window kernels compile without tile arithmetic.
+struct ElementwiseTileRowsArgs : ElementwiseRowsArgs {};
+template <typename Pointer> __device__ __forceinline__ Pointer elementwise_tiled(Pointer p, std::uint64_t, const ElementwiseRowsArgs&) {
+    return p;
+}
+template <typename Pointer>
+__device__ __forceinline__ Pointer elementwise_tiled(Pointer p, std::uint64_t stride, const ElementwiseTileRowsArgs&) {
+    return reinterpret_cast<Pointer>(reinterpret_cast<std::uintptr_t>(p) + static_cast<std::uint64_t>(blockIdx.z) * stride);
+}
 // blockIdx.y selects the window row; each row uses its own resolved buffers.
-template <typename Storage>
-__global__ void inject_rows_kernel(ElementwiseRowsArgs rows, std::uint32_t hidden_size, std::uint32_t hc_count) {
+template <typename Storage, class Args = ElementwiseRowsArgs>
+__global__ void inject_rows_kernel(Args rows, std::uint32_t hidden_size, std::uint32_t hc_count) {
     const auto index = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (index >= static_cast<std::uint64_t>(hidden_size) * hc_count) return;
     const auto r = blockIdx.y;
-    inject_element(static_cast<const Storage*>(rows.first[r]) + index,
-        static_cast<const Storage*>(rows.second[r]) + index % hidden_size,
-        rows.weights[r][index / hidden_size], static_cast<Storage*>(rows.output[r]) + index);
+    inject_element(static_cast<const Storage*>(elementwise_tiled(rows.first[r], rows.tile_first, rows)) + index,
+        static_cast<const Storage*>(elementwise_tiled(rows.second[r], rows.tile_second, rows)) + index % hidden_size,
+        elementwise_tiled(rows.weights[r], rows.tile_weights, rows)[index / hidden_size],
+        static_cast<Storage*>(elementwise_tiled(rows.output[r], rows.tile_output, rows)) + index);
 }
-template <typename Storage>
-__global__ void combine_rows_kernel(ElementwiseRowsArgs rows, std::uint32_t hidden_size) {
+template <typename Storage, class Args = ElementwiseRowsArgs>
+__global__ void combine_rows_kernel(Args rows, std::uint32_t hidden_size) {
     const auto index = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (index >= hidden_size) return;
     const auto r = blockIdx.y;
-    combine_element(static_cast<const Storage*>(rows.first[r]) + index,
-        static_cast<const Storage*>(rows.second[r]) + index, static_cast<Storage*>(rows.output[r]) + index);
+    combine_element(static_cast<const Storage*>(elementwise_tiled(rows.first[r], rows.tile_first, rows)) + index,
+        static_cast<const Storage*>(elementwise_tiled(rows.second[r], rows.tile_second, rows)) + index,
+        static_cast<Storage*>(elementwise_tiled(rows.output[r], rows.tile_output, rows)) + index);
 }
 
 template <typename Storage>
@@ -1185,6 +1198,60 @@ ElementwiseRowsArgs prepare_combine_rows(std::span<const ExecutionDispatchContex
     });
 }
 hipStream_t elementwise_rows_stream() { return hip_execution_stream(); }
+// Prefill: every 8-row tile is admitted like a window call; tiles must be one stride apart in each view and,
+// since they run concurrently, no row may write what another row (of any tile) reads or writes. A row may
+// still update its own input in place, as in the serial launcher.
+template <typename Prepare>
+ElementwiseTileRowsArgs prepare_elementwise_prefill(std::span<const ExecutionDispatchContext> rows, Prepare&& prepare,
+    std::uint64_t first_bytes, std::uint64_t second_bytes, std::uint64_t weight_bytes, std::uint64_t output_bytes,
+    std::uint32_t& tiles) {
+    if (rows.size() < 16U || rows.size() % 8U || rows.size() / 8U > 65535U)
+        throw std::invalid_argument("elementwise prefill rows require 8-row tiles");
+    tiles = static_cast<std::uint32_t>(rows.size() / 8U);
+    const auto a = prepare(rows.first(8U)), b = prepare(rows.subspan(8U, 8U));
+    const auto at = [](const auto* p) { return reinterpret_cast<std::uintptr_t>(p); };
+    const auto stride = [&](const auto* x, const auto* y) -> std::uint64_t {
+        if (!x) return 0U;
+        if (at(y) <= at(x)) throw std::invalid_argument("elementwise prefill tiles are not strided");
+        return at(y) - at(x);
+    };
+    ElementwiseTileRowsArgs args;
+    static_cast<ElementwiseRowsArgs&>(args) = a;
+    args.tile_first = stride(a.first[0], b.first[0]); args.tile_second = stride(a.second[0], b.second[0]);
+    args.tile_weights = stride(a.weights[0], b.weights[0]); args.tile_output = stride(a.output[0], b.output[0]);
+    for (std::uint32_t t = 2; t < tiles; ++t) {
+        const auto c = prepare(rows.subspan(t * 8U, 8U));
+        const auto same = [&](const auto* x, const auto* y, std::uint64_t step) {
+            return x ? at(y) == at(x) + static_cast<std::uint64_t>(t) * step : y == nullptr;
+        };
+        for (std::uint32_t r = 0; r < 8U; ++r)
+            if (!same(a.first[r], c.first[r], args.tile_first) || !same(a.second[r], c.second[r], args.tile_second) ||
+                !same(a.weights[r], c.weights[r], args.tile_weights) || !same(a.output[r], c.output[r], args.tile_output))
+                throw std::invalid_argument("elementwise prefill tile views are not strided");
+    }
+    // Each tile's views must fit within one tile stride (tiles never overlap each other), and the output field
+    // must stay clear of every input field over all T rows, except an exact in-place first input (same address
+    // per row and same stride), which the window admission already allows within a tile.
+    const auto extent = [&](const auto* const* v, std::uint64_t bytes) {
+        std::uintptr_t low = UINTPTR_MAX, high = 0;
+        for (std::uint32_t r = 0; r < 8U; ++r) { low = std::min(low, at(v[r])); high = std::max(high, at(v[r]) + bytes); }
+        return std::pair<std::uintptr_t, std::uintptr_t>{low, high};
+    };
+    const auto whole = [&](std::pair<std::uintptr_t, std::uintptr_t> e, std::uint64_t step) {
+        if (e.second - e.first > step) throw std::invalid_argument("elementwise prefill tile views exceed their stride");
+        return std::pair<std::uintptr_t, std::uintptr_t>{e.first, e.second + static_cast<std::uint64_t>(tiles - 1U) * step};
+    };
+    const auto out = whole(extent(a.output, output_bytes), args.tile_output);
+    const auto clear = [&](std::pair<std::uintptr_t, std::uintptr_t> x) {
+        if (x.first < out.second && out.first < x.second) throw std::invalid_argument("elementwise prefill rows alias across tiles");
+    };
+    bool in_place = args.tile_first == args.tile_output;
+    for (std::uint32_t r = 0; r < 8U; ++r) in_place = in_place && at(a.first[r]) == at(a.output[r]);
+    if (!in_place) clear(whole(extent(a.first, first_bytes), args.tile_first));
+    clear(whole(extent(a.second, second_bytes), args.tile_second));
+    if (a.weights[0]) clear(whole(extent(a.weights, weight_bytes), args.tile_weights));
+    return args;
+}
 } // namespace
 
 void inject_known_window_rows_preflight(std::span<const ExecutionDispatchContext> rows,
@@ -1201,6 +1268,48 @@ void inject_known_window_rows_launch(std::span<const ExecutionDispatchContext> r
     else hipLaunchKernelGGL(HIP_KERNEL_NAME(inject_rows_kernel<float>), grid, dim3(256U), 0,
             elementwise_rows_stream(), args, config.hidden_size, config.hc_count);
     check_hip(hipGetLastError(), "known-window inject rows launch");
+}
+void inject_known_prefill_rows_preflight(std::span<const ExecutionDispatchContext> rows,
+    const HipElementwiseLauncherConfig& config) {
+    std::uint32_t tiles = 0;
+    const auto hidden = checked_mul(config.hidden_size, activation_bytes(config));
+    static_cast<void>(prepare_elementwise_prefill(rows, [&](auto tile) { return prepare_inject_rows(tile, config); },
+        checked_mul(hidden, config.hc_count), hidden, config.hc_count * 4ULL, checked_mul(hidden, config.hc_count), tiles));
+}
+void inject_known_prefill_rows_launch(std::span<const ExecutionDispatchContext> rows,
+    const HipElementwiseLauncherConfig& config) {
+    std::uint32_t tiles = 0;
+    const auto hidden = checked_mul(config.hidden_size, activation_bytes(config));
+    const auto args = prepare_elementwise_prefill(rows, [&](auto tile) { return prepare_inject_rows(tile, config); },
+        checked_mul(hidden, config.hc_count), hidden, config.hc_count * 4ULL, checked_mul(hidden, config.hc_count), tiles);
+    const dim3 grid(prepare_1d_blocks(checked_mul(config.hidden_size, config.hc_count)), 8U, tiles);
+    if (config.activation == HipActivationStorage::bf16)
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(inject_rows_kernel<std::uint16_t, ElementwiseTileRowsArgs>), grid, dim3(256U), 0,
+            elementwise_rows_stream(), args, config.hidden_size, config.hc_count);
+    else hipLaunchKernelGGL(HIP_KERNEL_NAME(inject_rows_kernel<float, ElementwiseTileRowsArgs>), grid, dim3(256U), 0,
+            elementwise_rows_stream(), args, config.hidden_size, config.hc_count);
+    check_hip(hipGetLastError(), "known prefill inject rows launch");
+}
+void moe_combine_known_prefill_rows_preflight(std::span<const ExecutionDispatchContext> rows,
+    const HipElementwiseLauncherConfig& config) {
+    std::uint32_t tiles = 0;
+    const auto hidden = checked_mul(config.hidden_size, activation_bytes(config));
+    static_cast<void>(prepare_elementwise_prefill(rows, [&](auto tile) { return prepare_combine_rows(tile, config); },
+        hidden, hidden, 0U, hidden, tiles));
+}
+void moe_combine_known_prefill_rows_launch(std::span<const ExecutionDispatchContext> rows,
+    const HipElementwiseLauncherConfig& config) {
+    std::uint32_t tiles = 0;
+    const auto hidden = checked_mul(config.hidden_size, activation_bytes(config));
+    const auto args = prepare_elementwise_prefill(rows, [&](auto tile) { return prepare_combine_rows(tile, config); },
+        hidden, hidden, 0U, hidden, tiles);
+    const dim3 grid(prepare_1d_blocks(config.hidden_size), 8U, tiles);
+    if (config.activation == HipActivationStorage::bf16)
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(combine_rows_kernel<std::uint16_t, ElementwiseTileRowsArgs>), grid, dim3(256U), 0,
+            elementwise_rows_stream(), args, config.hidden_size);
+    else hipLaunchKernelGGL(HIP_KERNEL_NAME(combine_rows_kernel<float, ElementwiseTileRowsArgs>), grid, dim3(256U), 0,
+            elementwise_rows_stream(), args, config.hidden_size);
+    check_hip(hipGetLastError(), "known prefill MoE-combine rows launch");
 }
 void moe_combine_known_window_rows_preflight(std::span<const ExecutionDispatchContext> rows,
     const HipElementwiseLauncherConfig& config) {

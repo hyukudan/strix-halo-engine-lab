@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 #include <utility>
@@ -25,6 +26,8 @@ KnownPromptChunkCursor::KnownPromptChunkCursor(KnownPromptChunkRequest request,
     } else if((request.logical_rows!=2U && request.logical_rows!=4U && request.logical_rows!=8U) ||
         windows.supports_tiled_prefill())
         throw std::invalid_argument("known prompt chunk rows must be closed2/4/8 or explicit tiled prefill");
+    if(request.all_row_heads&&(!request.tiled_prefill||request.output_policy!=KnownWindowOutputPolicy::all_rows))
+        throw std::invalid_argument("all-row heads require the tiled prefill with the all-rows output policy");
     if(windows.logical_rows()!=request.logical_rows)
         throw std::invalid_argument("known prompt chunk backend row width differs from the request");
     validate_known_window_output_policy(request.output_policy);
@@ -50,8 +53,15 @@ bool KnownPromptChunkCursor::advance() {
     const bool state_only=request_.output_policy==KnownWindowOutputPolicy::state_only;
     const bool no_output=request_.max_new_tokens==0U;
     const bool window=remaining>=request_.logical_rows&&(!state_only||no_output||remaining>request_.logical_rows);
+    // Tiled prefill: a window with more prompt after it is never read, so it runs without its head.
+    // STRIX_PREFILL_HEADLESS=0 keeps the head on every block.
+    static const bool allow_headless=[]{const char* v=std::getenv("STRIX_PREFILL_HEADLESS");return !v||v[0]!='0';}();
+    const bool headless=allow_headless&&!request_.all_row_heads&&request_.tiled_prefill&&!state_only&&window&&remaining>request_.logical_rows;
     try {
-        if(state_only&&(no_output||window||remaining>1U)) {
+        if(headless) {
+            windows_.execute_state_rows(request_.prompt_tokens.subspan(consumed,request_.logical_rows),progress_.next_position);
+            has_logits_=false;selection_.reset();
+        } else if(state_only&&(no_output||window||remaining>1U)) {
             if(window) {
                 windows_.execute_state_rows(request_.prompt_tokens.subspan(consumed,request_.logical_rows),progress_.next_position);
                 ++progress_.state_only_windows;

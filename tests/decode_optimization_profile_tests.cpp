@@ -136,7 +136,119 @@ void transposed_island_cli_contract(){
 
 #endif
 
+// --prefill-numerical-profile: parsing, the resolved pair, admission and identities.
+void prefill_profile_contract() {
+    constexpr std::string_view fp32 = "hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup-v1";
+    constexpr std::string_view a8 = "hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup+dense-a8-v1";
+    constexpr std::string_view deferred = "hc-deferred-norm-f32+q51-q80-a8-down+q5k-a8-gateup-v1";
+    constexpr std::string_view deferred_a8 = "hc-deferred-norm-f32+q51-q80-a8-down+q5k-a8-gateup+dense-a8-v1";
+    const auto profile = [](std::string_view name) { return *parse_decode_numerical_profile(name); };
+    const auto tiled = [](std::string decode, std::string prefill) {
+        std::vector<std::string> args{"decoder", "m", "1", "2", "--generate", "2", "--known-prefix-window",
+            "--known-prefix-full-rows", "--known-prefix-prefill-rows", "256", "--known-prefix-workspace-budget-bytes", "1",
+            "--known-prefix-host-metadata-budget-bytes", "2", "--known-prefix-uma-budget-bytes", "1",
+            "--known-prefix-host-headroom-bytes", "0", "--numerical-profile", decode};
+        if (!prefill.empty()) { args.push_back("--prefill-numerical-profile"); args.push_back(prefill); }
+        std::vector<char*> argv;
+        for (auto& arg : args) argv.push_back(arg.data());
+        return parse_options(static_cast<int>(argv.size()), argv.data());
+    };
+
+    // Absent flag: the prefill runs the decode profile; the pair keeps that profile's identity.
+    const auto absent = tiled(std::string(a8), "");
+    expect(!absent.prefill_numerical_profile && !numerical_profile_pair(absent).split() &&
+        numerical_profile_pair(absent).prefill == profile(a8) &&
+        numerical_profile_pair_identity(numerical_profile_pair(absent)) == numerical_profile_identity(profile(a8)),
+        "absent prefill profile resolves to the decode profile and its identity");
+    // Explicit and equal: the same pure pair.
+    const auto equal = tiled(std::string(a8), std::string(a8));
+    expect(equal.prefill_numerical_profile && numerical_profile_pair(equal) == numerical_profile_pair(absent),
+        "an explicit equal prefill profile is the pure pair");
+    // Both directions of the dense-A8 sibling, for both HC recipes.
+    for (const auto& [decode, prefill] : std::array<std::pair<std::string_view, std::string_view>, 4>{
+             {{fp32, a8}, {a8, fp32}, {deferred, deferred_a8}, {deferred_a8, deferred}}}) {
+        const auto split = tiled(std::string(decode), std::string(prefill));
+        const auto pair = numerical_profile_pair(split);
+        expect(pair.split() && pair.prefill == profile(prefill) && pair.decode == profile(decode) &&
+            split.numerical_profile == profile(decode) && numerical_profile_pair_admitted(pair),
+            "dense-A8 sibling pairs are admitted on the tiled prefill route");
+        const auto id = numerical_profile_pair_identity(pair);
+        expect(id != numerical_profile_identity(pair.prefill) && id != numerical_profile_identity(pair.decode) &&
+            id != numerical_profile_pair_identity({pair.decode, pair.prefill}),
+            "a split pair identity differs from both profiles and from the reversed pair");
+    }
+    expect(*parse({"decoder", "m", "1", "--numerical-profile", std::string(fp32).c_str(),
+               ("--prefill-numerical-profile=" + std::string(a8)).c_str(), "--known-prefix-window", "--known-prefix-full-rows",
+               "--known-prefix-prefill-rows", "256", "--known-prefix-workspace-budget-bytes", "1",
+               "--known-prefix-host-metadata-budget-bytes", "2", "--known-prefix-uma-budget-bytes", "1",
+               "--known-prefix-host-headroom-bytes", "0", "--generate", "2"}).prefill_numerical_profile == profile(a8),
+        "--prefill-numerical-profile=NAME form parses");
+    // Profile identities are distinct across every profile.
+    for (const auto x : {DecodeNumericalProfile::exact_v5, DecodeNumericalProfile::hc_splitk_f32_v1,
+             DecodeNumericalProfile::q51_a8_down_v1, DecodeNumericalProfile::hc_splitk_f32_q51_a8_down_v1,
+             DecodeNumericalProfile::q51_q80_a8_down_v1, DecodeNumericalProfile::hc_splitk_f32_q51_q80_a8_down_v1,
+             DecodeNumericalProfile::hc_splitk_f32_q51_q80_a8_down_q5k_a8_gateup_v1,
+             DecodeNumericalProfile::hc_deferred_norm_f32_q51_q80_a8_down_v1,
+             DecodeNumericalProfile::hc_deferred_norm_f32_q51_q80_a8_down_q5k_a8_gateup_v1,
+             DecodeNumericalProfile::hc_splitk_f32_q51_q80_a8_down_q5k_a8_gateup_dense_a8_v1,
+             DecodeNumericalProfile::hc_deferred_norm_f32_q51_q80_a8_down_q5k_a8_gateup_dense_a8_v1}) {
+        unsigned same = 0;
+        for (const auto name : {"exact-v5", "hc-splitk-f32-v1", "q51-a8-down-v1", "hc-splitk-f32+q51-a8-down-v1",
+                 "q51-q80-a8-down-v1", "hc-splitk-f32+q51-q80-a8-down-v1", fp32.data(), "hc-deferred-norm-f32+q51-q80-a8-down-v1",
+                 deferred.data(), a8.data(), deferred_a8.data()})
+            same += numerical_profile_identity(profile(name)) == numerical_profile_identity(x);
+        expect(same == 1U && numerical_profile_identity(x), "numerical profile identities are non-zero and distinct");
+        const auto sibling = numerical_profile_dense_a8_sibling(x);
+        expect(!sibling || (numerical_profile_dense_a8(*sibling) != numerical_profile_dense_a8(x) &&
+            numerical_profile_dense_a8_sibling(*sibling) == x && numerical_profile_hc_deferred_norm(*sibling) == numerical_profile_hc_deferred_norm(x)),
+            "the dense-A8 sibling relation is symmetric and changes only dense A8");
+    }
+
+    // Admission.
+    rejects([&] { (void)tiled(std::string(fp32), "unknown"); },
+        "--prefill-numerical-profile requires a supported numerical recipe");
+    rejects([] { (void)parse({"decoder", "m", "1", "--prefill-numerical-profile"}); },
+        "--prefill-numerical-profile requires a supported numerical recipe");
+    rejects([] { (void)parse({"decoder", "m", "1", "--prefill-numerical-profile=exact-v5", "--prefill-numerical-profile", "exact-v5"}); },
+        "duplicate prefill numerical profile option");
+    const std::string_view pair_message = "prefill numerical profile may differ from an explicit --numerical-profile only in "
+        "the dense A8 projections (q5k-a8-gateup profiles with and without +dense-a8)";
+    rejects([&] { (void)tiled(std::string(fp32), std::string(deferred_a8)); }, pair_message);
+    rejects([&] { (void)tiled(std::string(fp32), "hc-splitk-f32+q51-q80-a8-down-v1"); }, pair_message);
+    rejects([&] { (void)tiled(std::string(a8), std::string(deferred)); }, pair_message);
+    rejects([] { (void)parse({"decoder", "m", "1", "--prefill-numerical-profile", "hc-splitk-f32-v1"}); }, pair_message);
+    const std::string_view route_message = "prefill numerical profile requires exactly one prefill route: the tiled known-prefix "
+        "prefill (--known-prefix-prefill-rows with --known-prefix-full-rows) or the MTP prompt";
+    auto plain = absent; plain.prefill_numerical_profile = profile(fp32);
+    validate_prefill_numerical_profile_cli(plain); // tiled route admitted
+    auto serial = plain; serial.known_prefix_window = false; serial.known_prefix_prefill_rows = 0; serial.known_prefix_full_rows = false;
+    rejects([&] { validate_prefill_numerical_profile_cli(serial); }, route_message);
+    auto window_only = plain; window_only.known_prefix_prefill_rows = 0;
+    rejects([&] { validate_prefill_numerical_profile_cli(window_only); }, route_message);
+    auto partial_rows = plain; partial_rows.known_prefix_full_rows = false;
+    rejects([&] { validate_prefill_numerical_profile_cli(partial_rows); }, route_message);
+    auto mtp = serial; mtp.mtp.enabled = true;
+    validate_prefill_numerical_profile_cli(mtp); // MTP prompt route admitted
+    auto both = plain; both.mtp.enabled = true;
+    rejects([&] { validate_prefill_numerical_profile_cli(both); }, route_message);
+    const std::string_view exclusion_message = "prefill numerical profile excludes model copy tiers, final-state export, GDN islands, "
+        "prepared/overlapped serial execution and MTP metadata diagnostics";
+    for (int which = 0; which < 6; ++which) {
+        auto excluded = which < 5 ? plain : mtp;
+        if (which == 0) excluded.model_copy_tier = HipModelCopyTier::experts;
+        if (which == 1) excluded.validation_final_state_path = "state";
+        if (which == 2) excluded.gdn_islands = true;
+        if (which == 3) excluded.prepared_eager = true;
+        if (which == 4) excluded.moe_shared_overlap = true;
+        if (which == 5) excluded.mtp.metadata_only = true;
+        rejects([&] { validate_prefill_numerical_profile_cli(excluded); }, exclusion_message);
+    }
+    auto implicit = plain; implicit.numerical_profile_explicit = false;
+    rejects([&] { validate_prefill_numerical_profile_cli(implicit); }, pair_message);
+}
+
 int main() {
+    prefill_profile_contract();
 #ifdef STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME
     transposed_island_cli_contract();
 #endif
@@ -1021,20 +1133,24 @@ int main() {
            !manual_increments.lane_chain_hyper_output && !manual_increments.q4k_a8g32_gate_up &&
            manual_increments.context_tokens == 128,
            "manual increments preserve their flags without adding the automatic bundle");
-    const std::array<std::string_view, 9> numerical_names{
+    const std::array<std::string_view, 11> numerical_names{
         "exact-v5", "hc-splitk-f32-v1", "q51-a8-down-v1", "hc-splitk-f32+q51-a8-down-v1",
         "q51-q80-a8-down-v1", "hc-splitk-f32+q51-q80-a8-down-v1",
         "hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup-v1",
         "hc-deferred-norm-f32+q51-q80-a8-down-v1",
-        "hc-deferred-norm-f32+q51-q80-a8-down+q5k-a8-gateup-v1"};
+        "hc-deferred-norm-f32+q51-q80-a8-down+q5k-a8-gateup-v1",
+        "hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup+dense-a8-v1",
+        "hc-deferred-norm-f32+q51-q80-a8-down+q5k-a8-gateup+dense-a8-v1"};
     for (const auto name : numerical_names) {
         const std::string value(name);
         auto candidate = parse({"decoder", "fixture.gguf", "1", "--generate", "2", "--numerical-profile", value.c_str()});
         expect(candidate.numerical_profile_explicit && !candidate.any_low_level_flag &&
             numerical_profile_name(candidate.numerical_profile) == name,
             "typed numerical option is independent of low-level fallback selection");
+        const bool dense = name.ends_with("+dense-a8-v1");
         expect(numerical_profile_q5k_a8_gateup(candidate.numerical_profile) ==
-                (name.find("+q5k-a8-gateup-v1") != std::string_view::npos) &&
+                (name.find("+q5k-a8-gateup") != std::string_view::npos) &&
+            numerical_profile_dense_a8(candidate.numerical_profile) == dense &&
             numerical_profile_hc_deferred_norm(candidate.numerical_profile) == name.starts_with("hc-deferred-norm-f32") &&
             numerical_profile_hc_splitk(candidate.numerical_profile) == name.starts_with("hc-") &&
             numerical_profile_q51_a8_down(candidate.numerical_profile) == (name.find("q51") != std::string_view::npos) &&
@@ -1043,7 +1159,7 @@ int main() {
         auto base = resolve_optimization_profile(candidate, model, numerical_router_info, manifest, validated_model_content_identity, true);
         const auto numerical_base_selected = base.selected;
         expect(numerical_base_selected == "canonical-a8-wave-qsa-hc-shared-output-v5" && candidate.prepared_eager &&
-            candidate.moe_shared_overlap && candidate.gdn_islands && candidate.q51_slot_parallel_down &&
+            candidate.moe_shared_overlap && candidate.gdn_islands == !dense && candidate.q51_slot_parallel_down &&
             candidate.batched_moe_activation && candidate.wave8_q8_gdn_input && candidate.wave8_q8_gdn_output &&
             candidate.prefetch_q8_lm_head && candidate.wave8_q8_lm_head && candidate.wave8_q8_qsa_output,
             "numerical overlay retains every v5 organization prerequisite");
@@ -1082,6 +1198,10 @@ int main() {
             bad_mode = candidate; bad_mode.serving_concurrency = 2;
             rejects([&] { validate_numerical_profile_cli(bad_mode); },
                 "numerical profile requires ordinary eager floating C1 execution without alternate controllers or layouts");
+            if (dense) {
+                auto with_islands = candidate; with_islands.gdn_islands = true;
+                rejects([&] { validate_numerical_profile_cli(with_islands); }, "dense A8 numerical profile excludes GDN islands");
+            }
         }
     }
     expect(static_cast<int>(DecodeNumericalProfile::exact_v5) == 0 &&
@@ -1134,6 +1254,48 @@ int main() {
     incompatible_teacher = teacher; incompatible_teacher.mtp.enabled = true;
     rejects([&] { validate_teacher_forced_score(incompatible_teacher); },
         "teacher-forced score requires at least two teacher inputs and generate 1 in serial eager full-output diagnostic mode");
+    // Teacher forcing over the tiled known-prefix prefill: full rows, T rows and every row's head.
+    auto tiled_teacher = teacher;
+    tiled_teacher.known_prefix_window = true; tiled_teacher.known_prefix_full_rows = true;
+    tiled_teacher.known_prefix_prefill_rows = 256; tiled_teacher.known_prefix_expert_union = true;
+    expect(teacher_forced_tiled(tiled_teacher) && !teacher_forced_tiled(teacher), "tiled teacher route is selected by the tiled prefill flags");
+    validate_teacher_forced_score(tiled_teacher);
+    validate_resolved_teacher_forced_score(tiled_teacher, 4);
+    const auto tiled_message = "teacher-forced score over a known prefix requires the tiled prefill "
+        "(--known-prefix-window --known-prefix-full-rows --known-prefix-prefill-rows T) with the all-rows output policy";
+    for (const auto policy : {KnownWindowOutputPolicy::terminal_row, KnownWindowOutputPolicy::state_only}) {
+        auto invalid = tiled_teacher; invalid.known_prefix_output_policy = policy;
+        rejects([&] { validate_teacher_forced_score(invalid); }, tiled_message);
+    }
+    auto untiled = tiled_teacher; untiled.known_prefix_prefill_rows = 0;
+    rejects([&] { validate_teacher_forced_score(untiled); }, tiled_message);
+    untiled = tiled_teacher; untiled.known_prefix_full_rows = false;
+    rejects([&] { validate_teacher_forced_score(untiled); }, tiled_message);
+    untiled = tiled_teacher; untiled.known_prefix_window = false;
+    rejects([&] { validate_teacher_forced_score(untiled); }, tiled_message);
+    untiled = teacher; untiled.known_prefix_expert_union = true;
+    rejects([&] { validate_teacher_forced_score(untiled); }, tiled_message);
+    auto tiled_invalid = tiled_teacher; tiled_invalid.generate_tokens = 2;
+    rejects([&] { validate_teacher_forced_score(tiled_invalid); },
+        "teacher-forced score requires at least two teacher inputs and generate 1 in serial eager full-output diagnostic mode");
+    tiled_invalid = tiled_teacher; tiled_invalid.prompt_lookup = true;
+    rejects([&] { validate_teacher_forced_score(tiled_invalid); },
+        "teacher-forced score requires at least two teacher inputs and generate 1 in serial eager full-output diagnostic mode");
+    tiled_invalid = tiled_teacher; tiled_invalid.mtp.enabled = true;
+    rejects([&] { validate_teacher_forced_score(tiled_invalid); },
+        "teacher-forced score requires at least two teacher inputs and generate 1 in serial eager full-output diagnostic mode");
+    auto tiled_parsed = parse({"decoder", "m", "1", "2", "3", "--generate", "1", "--teacher-forced-score",
+        "--known-prefix-window", "--known-prefix-full-rows", "--known-prefix-prefill-rows", "16",
+        "--known-prefix-workspace-budget-bytes", "8589934592", "--known-prefix-host-metadata-budget-bytes", "67108864",
+        "--known-prefix-uma-budget-bytes", "128849018880", "--known-prefix-host-headroom-bytes", "4294967296"});
+    expect(teacher_forced_tiled(tiled_parsed) && tiled_parsed.known_prefix_output_policy == KnownWindowOutputPolicy::all_rows,
+        "tiled teacher forcing parses with the default all-rows policy");
+    rejects([] { (void)parse({"decoder", "m", "1", "2", "3", "--generate", "1", "--teacher-forced-score",
+        "--known-prefix-window", "--known-prefix-full-rows", "--known-prefix-prefill-rows", "16",
+        "--known-prefix-output-policy", "terminal-row",
+        "--known-prefix-workspace-budget-bytes", "8589934592", "--known-prefix-host-metadata-budget-bytes", "67108864",
+        "--known-prefix-uma-budget-bytes", "128849018880", "--known-prefix-host-headroom-bytes", "4294967296"}); },
+        tiled_message);
     // Stored-byte relocation has a separate closed admission contract and never
     // acts as a low-level organization flag.
     auto copy_options = parse({"decoder", "fixture.gguf", "1", "--generate", "2",

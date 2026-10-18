@@ -12,6 +12,13 @@ struct KnownPrefillRequest {
     // The native allocation consumer separately admits full owner growth.
     std::uint64_t workspace_budget_bytes=0,host_metadata_payload_budget_bytes=0;
     bool router_rows=false,combine_inject_rows=false;
+    // Rows HC mixers and QSA rows in 8-row tiles.
+    bool rows_hyper_mix=false,qsa_rows=false;
+    // PLE rows from host-staged lookups (all T rows chained, see HipPleKnownWindow prefill).
+    bool rows_ple=false;
+    // Multi-row LM head (packs of eight rows, the R1 head's leaf and reduction tree per row) for an
+    // all-rows request whose every row's logits are read (teacher-forced scoring over the prefill).
+    bool lm_head_rows=false;
 };
 struct CompiledKnownPrefixPrefill {
     std::uint32_t logical_rows=0;
@@ -40,5 +47,7 @@ void validate_compiled_known_prefix_prefill(const CompiledKnownPrefixPrefill&,
     const ExecutionRuntimeResources&,const ExecutionMemoryBinding&,SerialSessionContext&,
     std::span<const std::uint32_t>,const CompiledLaunchPlan&,
     std::span<const KnownWindowR2Entry>,std::span<const KnownWindowRowsEntry>,
-    const KnownWindowExecutionHooks&);
+    const KnownWindowExecutionHooks&,
+    // Optional entries that take all T rows of a step in one call (selected by the step's variant).
+    std::span<const KnownWindowRowsEntry> full={});
 } // namespace strix

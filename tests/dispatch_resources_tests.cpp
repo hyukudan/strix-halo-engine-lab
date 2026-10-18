@@ -346,6 +346,50 @@ int main() {
     expect(model_rejected,
            "dispatch tensor resolver requires model weights");
 
+    {
+        // The scope validates its pair once; other pairs and resolutions after it still validate.
+        context.resources = &resources;
+        auto invalid = weights; invalid.tensors[0].address = 0;
+        bool scope_rejected = false;
+        try { const strix::ValidatedModelBindingScope scope(manifest, invalid); }
+        catch (const std::invalid_argument&) { scope_rejected = true; }
+        auto other = resources; other.model_weights = &invalid;
+        bool inner_rejected = false, outer_rejected = false, inner_resolved = false;
+        {
+            const strix::ValidatedModelBindingScope scope(manifest, weights);
+            inner_resolved = strix::resolve_dispatch_tensor(context, 0).address == weights.tensors[0].address;
+            context.resources = &other;
+            try { static_cast<void>(strix::resolve_dispatch_tensor(context, 0)); }
+            catch (const std::invalid_argument&) { inner_rejected = true; }
+        }
+        try { static_cast<void>(strix::resolve_dispatch_tensor(context, 0)); }
+        catch (const std::invalid_argument&) { outer_rejected = true; }
+        expect(scope_rejected && inner_resolved && inner_rejected && outer_rejected,
+               "validated binding scope covers only its validated pair");
+
+        // Name lookups and direct admission checks honour the same scope, and only for its pair.
+        context.resources = &resources;
+        bool name_resolved = false, name_absent = false, name_rejected = false;
+        bool direct_passed = false, direct_rejected = false, direct_outer_rejected = false;
+        {
+            const strix::ValidatedModelBindingScope scope(manifest, weights);
+            name_resolved = &strix::resolve_dispatch_tensor(context, "token_embd.weight") == &weights.tensors[0];
+            try { static_cast<void>(strix::resolve_dispatch_tensor(context, "absent.weight")); }
+            catch (const std::invalid_argument&) { name_absent = true; }
+            strix::validate_model_runtime_binding_unless_scoped(manifest, weights);
+            direct_passed = true;
+            try { strix::validate_model_runtime_binding_unless_scoped(manifest, invalid); }
+            catch (const std::invalid_argument&) { direct_rejected = true; }
+            context.resources = &other;
+            try { static_cast<void>(strix::resolve_dispatch_tensor(context, "token_embd.weight")); }
+            catch (const std::invalid_argument&) { name_rejected = true; }
+        }
+        try { strix::validate_model_runtime_binding_unless_scoped(manifest, invalid); }
+        catch (const std::invalid_argument&) { direct_outer_rejected = true; }
+        expect(name_resolved && name_absent && name_rejected && direct_passed && direct_rejected && direct_outer_rejected,
+               "scoped name lookups and admission checks skip only the validated pair");
+    }
+
     unprepared_arena_fallback_contract();
 
     if (failures == 0) {

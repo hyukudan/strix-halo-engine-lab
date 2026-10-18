@@ -1,4 +1,5 @@
 #include "strix/hip_mtp_fast_draft.hpp"
+#include <cstdlib>
 #include <hip/hip_fp16.h>
 #include <hip/hip_ext.h>
 #include <hip/hip_runtime.h>
@@ -90,13 +91,14 @@ __global__ __launch_bounds__(256) void mtp_fast_gate_up(HipMtpFastMoeViews v) {
     gs=wave_sum(gs);us=wave_sum(us);
     if(!lane) v.workspace[slot*inter+row]=(gs/(1.0F+expf(-gs)))*us;
 }
-template<bool Q4>
-__global__ __launch_bounds__(256) void mtp_fast_down(HipMtpFastMoeViews v) {
+// W waves per block (one output row each, as before) share one LDS copy of the activations.
+template<bool Q4,unsigned W=waves>
+__global__ __launch_bounds__(32U*W) void mtp_fast_down(HipMtpFastMoeViews v) {
     __shared__ float act[slots*inter];
     __shared__ float weight[slots];
     __shared__ const unsigned char* rows[slots];
     if(*v.status) return;
-    for(unsigned i=threadIdx.x;i<slots*inter;i+=256U) act[i]=v.workspace[i];
+    for(unsigned i=threadIdx.x;i<slots*inter;i+=32U*W) act[i]=v.workspace[i];
     if(threadIdx.x<slots) {
         const unsigned s=threadIdx.x;
         weight[s]=s<routed?v.route_weights[s]:v.workspace[slots*inter];
@@ -104,7 +106,7 @@ __global__ __launch_bounds__(256) void mtp_fast_down(HipMtpFastMoeViews v) {
             static_cast<const unsigned char*>(v.shared_down);
     }
     __syncthreads();
-    const unsigned wave=threadIdx.x/32U,lane=threadIdx.x%32U,row=blockIdx.x*waves+wave;
+    const unsigned wave=threadIdx.x/32U,lane=threadIdx.x%32U,row=blockIdx.x*W+wave;
     float sum=0.0F;
     for(unsigned s=0;s<slots;++s) {
         const auto* r=rows[s]+static_cast<std::uint64_t>(row)*down_row_bytes<Q4>;
@@ -225,7 +227,12 @@ void launch_hip_mtp_fast_moe(const HipMtpFastMoeViews& v,void* stream) {
     if(q4.gate && q4.up && q4.down && q4.shared_gate && q4.shared_up && q4.shared_down) {
         hipLaunchKernelGGL(mtp_fast_gate_up<true>,dim3((inter+waves)/waves,slots),dim3(256),0,s,q4);
         check(hipGetLastError(),"MTP fast Q4 gate/up launch");
-        hipLaunchKernelGGL(mtp_fast_down<true>,dim3(hidden/waves),dim3(256),0,s,q4);
+        // STRIX_MTP_DOWN_WAVES=8|16|32: output rows (waves) per block sharing the activation copy.
+        static const unsigned down_waves=[]{const char* e=std::getenv("STRIX_MTP_DOWN_WAVES");
+            const unsigned n=e?static_cast<unsigned>(std::atoi(e)):16U;return n==8U||n==32U?n:16U;}();
+        if(down_waves==32U) hipLaunchKernelGGL(HIP_KERNEL_NAME(mtp_fast_down<true,32U>),dim3(hidden/32U),dim3(1024),0,s,q4);
+        else if(down_waves==16U) hipLaunchKernelGGL(HIP_KERNEL_NAME(mtp_fast_down<true,16U>),dim3(hidden/16U),dim3(512),0,s,q4);
+        else hipLaunchKernelGGL(mtp_fast_down<true>,dim3(hidden/waves),dim3(256),0,s,q4);
         check(hipGetLastError(),"MTP fast Q4 down launch");
         return;
     }

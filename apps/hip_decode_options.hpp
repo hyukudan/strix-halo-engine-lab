@@ -156,9 +156,13 @@ struct Options {
     OptimizationProfile optimization_profile = OptimizationProfile::automatic;
     strix::DecodeNumericalProfile numerical_profile = strix::DecodeNumericalProfile::exact_v5;
     bool numerical_profile_explicit = false;
+    // Prompt prefill arithmetic (--prefill-numerical-profile). Absent: the prefill uses
+    // numerical_profile. Decode and MTP windows always use numerical_profile.
+    std::optional<strix::DecodeNumericalProfile> prefill_numerical_profile;
     bool profile_explicit = false;
     bool any_low_level_flag = false;
     bool context_explicit = false;
+    bool unqualified_context = false; // lab: qualified profiles at a context other than 8192
     std::string model_path;
     std::vector<std::uint32_t> tokens;
     std::uint64_t context_tokens = 128;
@@ -242,6 +246,9 @@ struct Options {
     bool known_prefix_expert_union = false;
     // Router + combine/inject rows entries in the known-prefix or MTP window.
     bool known_window_router_rows = false;
+    // Known-prefix windows also use the verify window's deferred GDN, per-row PLE, router rows and
+    // combine/inject rows; each window commits all its rows and flushes before returning.
+    bool known_prefix_full_rows = false;
     std::string offline_tuning_cache_path;
     std::string offline_compile_provenance_path;
     strix::KnownWindowOutputPolicy known_prefix_output_policy = strix::KnownWindowOutputPolicy::all_rows;
@@ -385,9 +392,12 @@ inline void validate_numerical_profile_cli(const Options& options) {
         options.execution.integer_head != DecodeIntegerHead::none ||
         // Prefix-accepting MTP windows reproduce each row's serial arithmetic (split-K HC rows are
         // byte-exact), so they may run under an arithmetic profile.
-        ((options.mtp.enabled || options.mtp.supplied) && !options.mtp.window_prefix) || options.known_prefix_window ||
-        options.known_prefix_rows_explicit || options.known_prefix_prefill_rows ||
-        options.known_prefix_expert_union || options.prompt_lookup ||
+        ((options.mtp.enabled || options.mtp.supplied) && !options.mtp.window_prefix) ||
+        // Known-prefix windows with the full row set compile the same operators as the prefix-accepting
+        // MTP window, so they run under an arithmetic profile too; the older partial sets do not.
+        ((options.known_prefix_window || options.known_prefix_rows_explicit || options.known_prefix_expert_union) &&
+            !options.known_prefix_full_rows) || (options.known_prefix_prefill_rows && !options.known_prefix_full_rows) ||
+        options.prompt_lookup ||
         !options.serving_prefix_files.empty() || options.serving_concurrency != 1 ||
         options.serving_tensor_cohort_rows != 1 || options.serving_prefill_rows ||
         options.prefix_cache_roundtrip || options.gpu_greedy_token ||
@@ -398,6 +408,34 @@ inline void validate_numerical_profile_cli(const Options& options) {
         options.prefetch_hc_projection_next_tile || options.ranked_moe_router_topk ||
         !options.offline_tuning_cache_path.empty() || !options.offline_compile_provenance_path.empty())
         throw std::invalid_argument("numerical profile requires ordinary eager floating C1 execution without alternate controllers or layouts");
+    // GDN islands capture the incumbent R1 projection kernels; dense A8 replaces them.
+    if (numerical_profile_dense_a8(options.numerical_profile) && options.gdn_islands)
+        throw std::invalid_argument("dense A8 numerical profile excludes GDN islands");
+}
+
+// The resolved prefill/decode arithmetic pair. Without --prefill-numerical-profile the prefill
+// runs the decode profile, so every existing route keeps its single-profile behaviour.
+inline strix::NumericalProfilePair numerical_profile_pair(const Options& options) noexcept {
+    return {options.prefill_numerical_profile.value_or(options.numerical_profile), options.numerical_profile};
+}
+
+// A split pair is admitted only where the code runs it: the tiled known-prefix prefill
+// (full rows) or the MTP prompt route, with a decode profile whose dense-A8 sibling is the
+// prefill profile. Everything else keeps one profile for both phases.
+inline void validate_prefill_numerical_profile_cli(const Options& options) {
+    const auto pair = numerical_profile_pair(options);
+    if (!pair.split()) return;
+    if (!options.numerical_profile_explicit || !strix::numerical_profile_pair_admitted(pair))
+        throw std::invalid_argument("prefill numerical profile may differ from an explicit --numerical-profile only in "
+            "the dense A8 projections (q5k-a8-gateup profiles with and without +dense-a8)");
+    const bool tiled = options.known_prefix_window && options.known_prefix_prefill_rows && options.known_prefix_full_rows;
+    if (tiled == options.mtp.enabled)
+        throw std::invalid_argument("prefill numerical profile requires exactly one prefill route: the tiled known-prefix "
+            "prefill (--known-prefix-prefill-rows with --known-prefix-full-rows) or the MTP prompt");
+    if (options.model_copy_tier != strix::HipModelCopyTier::none || !options.validation_final_state_path.empty() ||
+        options.gdn_islands || options.prepared_eager || options.moe_shared_overlap || options.mtp.metadata_only)
+        throw std::invalid_argument("prefill numerical profile excludes model copy tiers, final-state export, GDN islands, "
+            "prepared/overlapped serial execution and MTP metadata diagnostics");
 }
 
 // Context can change only after immutable model/profile admission. Roundtrip
@@ -483,14 +521,26 @@ inline void validate_resolved_requested_logprobs(const Options& options, std::ui
         if (id >= vocabulary) throw std::invalid_argument("requested logprob token exceeds model vocabulary");
 }
 
+// Teacher-forced scoring runs on the serial eager route, or on the tiled known-prefix prefill with
+// every row's head (all-rows output policy): complete T-row blocks are scored as they commit and
+// the unpadded suffix rows serially.
+[[nodiscard]] inline bool teacher_forced_tiled(const Options& options) noexcept {
+    return options.teacher_forced_score && options.known_prefix_window && options.known_prefix_full_rows &&
+        options.known_prefix_prefill_rows;
+}
+
 inline void validate_teacher_forced_score(const Options& options) {
     if (!options.teacher_logits_path.empty() && !options.teacher_forced_score)
         throw std::invalid_argument("teacher logits file requires teacher-forced score");
     if (!options.teacher_forced_score) return;
+    if ((options.known_prefix_window || options.known_prefix_prefill_rows || options.known_prefix_expert_union ||
+         options.known_prefix_full_rows) &&
+        (!teacher_forced_tiled(options) || options.known_prefix_output_policy != strix::KnownWindowOutputPolicy::all_rows))
+        throw std::invalid_argument("teacher-forced score over a known prefix requires the tiled prefill "
+            "(--known-prefix-window --known-prefix-full-rows --known-prefix-prefill-rows T) with the all-rows output policy");
     if (options.generate_tokens != 1 || options.tokens.size() < 2 || options.tokens.size() > 262144U ||
         options.execution.mode != DecodeExecutionMode::eager || options.execution.integer_head != DecodeIntegerHead::none ||
         !options.logprob_token_ids.empty() || options.gpu_greedy_token || options.mtp.enabled || options.mtp.supplied ||
-        options.known_prefix_window || options.known_prefix_prefill_rows || options.known_prefix_expert_union ||
         options.prompt_lookup || !options.serving_prefix_files.empty() || options.prefix_cache_roundtrip ||
         !options.raw_recording_path.empty() || !options.validation_final_state_path.empty() ||
         !options.reference_path.empty() || options.moe_token_cost_policy)
@@ -534,6 +584,8 @@ inline void validate_resolved_known_prefix_window(const Options& options) {
     if (!options.known_prefix_window) {
         if (options.known_prefix_expert_union)
             throw std::invalid_argument("known-prefix expert union requires --known-prefix-window");
+        if (options.known_prefix_full_rows)
+            throw std::invalid_argument("known-prefix full rows require --known-prefix-window");
         if (options.known_window_router_rows && !options.mtp.window_rows)
             throw std::invalid_argument("known-window router rows require --known-prefix-window or an MTP window");
         if (options.known_prefix_rows_explicit || options.known_prefix_rows != 2)
@@ -783,12 +835,12 @@ inline Options parse_options(
     if (argc < 2) {
         throw std::invalid_argument(
             "usage: strix-hip-decode-token MODEL.gguf [TOKEN_ID ...] "
-            "[--mtp --mtp-sidecar FILE --mtp-sidecar-sha256 HEX (--mtp-golden FILE --mtp-golden-sha256 HEX | --mtp-golden-dump FILE) [--mtp-window-expert-union --mtp-window-expert-union-bytes N] [--mtp-window-hyper-mix] [--mtp-window-qsa-rows] [--mtp-window-prefix] [--mtp-draft-chain [--mtp-draft-vocab FILE[,FILE...]] [--mtp-draft-context-vocab N] [--mtp-draft-exact] [--mtp-draft-q4]] (explicit source/conversion/cast/budget options required)] "
+            "[--mtp --mtp-sidecar FILE --mtp-sidecar-sha256 HEX (--mtp-golden FILE --mtp-golden-sha256 HEX | --mtp-golden-dump FILE) [--mtp-window-expert-union --mtp-window-expert-union-bytes N] [--mtp-window-hyper-mix] [--mtp-window-qsa-rows] [--mtp-window-prefix] [--mtp-draft-chain [--mtp-draft-vocab FILE[,FILE...]|auto:DIR] [--mtp-draft-context-vocab N] [--mtp-draft-exact] [--mtp-draft-q4]] (explicit source/conversion/cast/budget options required)] "
             "[--optimization-profile auto|manual] [--execution-inventory] [--host-dispatch-telemetry] [--execution-telemetry-trace] [--device-queue-trace] "
-            "[--numerical-profile exact-v5|hc-splitk-f32-v1|q51-a8-down-v1|hc-splitk-f32+q51-a8-down-v1|q51-q80-a8-down-v1|hc-splitk-f32+q51-q80-a8-down-v1|hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup-v1|hc-deferred-norm-f32+q51-q80-a8-down-v1|hc-deferred-norm-f32+q51-q80-a8-down+q5k-a8-gateup-v1] "
+            "[--numerical-profile exact-v5|hc-splitk-f32-v1|q51-a8-down-v1|hc-splitk-f32+q51-a8-down-v1|q51-q80-a8-down-v1|hc-splitk-f32+q51-q80-a8-down-v1|hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup-v1|hc-deferred-norm-f32+q51-q80-a8-down-v1|hc-deferred-norm-f32+q51-q80-a8-down+q5k-a8-gateup-v1|hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup+dense-a8-v1|hc-deferred-norm-f32+q51-q80-a8-down+q5k-a8-gateup+dense-a8-v1] [--prefill-numerical-profile NAME] "
             "[--teacher-forced-score --generate 1 [--teacher-logits-file PATH]] "
             "[--gpu-greedy-token] [--logprob-token ID ...] [--offline-tuning-cache FILE [--offline-compile-provenance FILE]] [--gdn-recurrent-layout baseline|stride32|stride33|transposed] [--gdn-recurrent-storage key-value|value-key] [--known-prefix-window --known-prefix-rows 2|4|8 --known-prefix-expert-union] [--known-window-router-rows] [--known-prefix-prefill-rows 16..2048 --known-prefix-workspace-budget-bytes N --known-prefix-host-metadata-budget-bytes N --known-prefix-uma-budget-bytes N --known-prefix-host-headroom-bytes N] [--prompt-lookup [--prompt-lookup-depth 0|1|2 | --prompt-lookup-adaptive] [--prompt-lookup-snapshot occupied-kv-v1 --prompt-lookup-snapshot-bytes N]] [--serve-prefix-u32le FILE ... --serve-concurrency 1|2|4 [--serve-tensor-cohort-rows 2|4 | --serve-prefill-rows 2|4|8|16..2048 --serve-prefill-workspace-budget-bytes N --serve-prefill-host-metadata-budget-bytes N] --serve-memory-budget-bytes N --serve-request-budget-bytes N --serve-headroom-bytes N] [--gdn-islands] [--qsa-hierarchical-selection] [--qsa-gqa-heads-per-block 1|2|4] [--prepared-eager] [--moe-shared-overlap [--moe-token-cost-policy]] [--moe-overlap-arena-budget-bytes N] [--batched-moe-activation] [--validation-final-state DIR] [--validation-final-state-max-bytes N] [--reference FILE] [--max-logit-error X] "
-            "[--context N] [--residency register|copy] [--coalesce-gap BYTES] [--model-copy-tier none|normalization|hot_nonexpert|experts --model-copy-payload-bytes N --model-retained-budget N --model-setup-peak-budget N] "
+            "[--context N [--unqualified-context]] [--residency register|copy] [--coalesce-gap BYTES] [--model-copy-tier none|normalization|hot_nonexpert|experts --model-copy-payload-bytes N --model-retained-budget N --model-setup-peak-budget N] "
             "[--planned-ple-io] [--ple-cpu-helper-threads 1..8] [--ple-cache-rows N --ple-cache-budget-bytes N] [--ple-max-rows-per-io N] [--ple-max-inflight-ios N] "
             "[--generate N] [--eos-token TOKEN_ID] [--prefix-cache-roundtrip] "
             "[--parallel-moe-router] [--ranked-moe-router-topk | --wave-moe-router-topk] "
@@ -868,6 +920,21 @@ inline Options parse_options(
                 throw std::invalid_argument("--numerical-profile requires a supported numerical recipe");
             options.numerical_profile = *parsed;
             options.numerical_profile_explicit = true;
+            continue;
+        }
+        if (argument == "--prefill-numerical-profile" || argument.starts_with("--prefill-numerical-profile=")) {
+            if (options.prefill_numerical_profile)
+                throw std::invalid_argument("duplicate prefill numerical profile option");
+            std::string_view value;
+            if (argument == "--prefill-numerical-profile") {
+                if (index + 1 >= argc)
+                    throw std::invalid_argument("--prefill-numerical-profile requires a supported numerical recipe");
+                value = argv[++index];
+            } else value = argument.substr(std::string_view("--prefill-numerical-profile=").size());
+            const auto parsed = strix::parse_decode_numerical_profile(value);
+            if (!parsed)
+                throw std::invalid_argument("--prefill-numerical-profile requires a supported numerical recipe");
+            options.prefill_numerical_profile = *parsed;
             continue;
         }
         if(argument=="--mtp") {
@@ -1187,6 +1254,11 @@ inline Options parse_options(
             if (rows != 2 && rows != 4 && rows != 8) throw std::invalid_argument("known-prefix rows must be 2, 4 or 8");
             options.known_prefix_rows = static_cast<std::uint32_t>(rows);
             options.known_prefix_rows_explicit = true;
+            continue;
+        }
+        if (argument == "--known-prefix-full-rows") {
+            if (options.known_prefix_full_rows) throw std::invalid_argument("duplicate known-prefix full rows option");
+            options.known_prefix_full_rows = true;
             continue;
         }
         if (argument == "--known-window-router-rows") {
@@ -1514,6 +1586,11 @@ inline Options parse_options(
             continue;
         }
 
+        if (argument == "--unqualified-context") {
+            if (options.unqualified_context) throw std::invalid_argument("duplicate unqualified context option");
+            options.unqualified_context = true;
+            continue;
+        }
         if (argument == "--context") {
             options.context_explicit = true;
             if (index + 1 >= argc) {
@@ -1767,6 +1844,8 @@ inline Options parse_options(
         throw std::invalid_argument(
             "context must be non-zero");
     }
+    if (options.unqualified_context && !options.context_explicit)
+        throw std::invalid_argument("--unqualified-context requires --context");
     if (!options.raw_recording_path.empty()) {
         strix::validate_raw_baseline_output_directory(options.raw_recording_path);
     }
@@ -1810,6 +1889,7 @@ inline Options parse_options(
         throw std::invalid_argument("integer and virtual Q8 LM heads are mutually exclusive");
     validate_teacher_forced_score(options);
     validate_numerical_profile_cli(options);
+    validate_prefill_numerical_profile_cli(options);
     validate_mtp_cli(options);
     return options;
 }
@@ -1844,7 +1924,7 @@ inline OptimizationProfileResolution resolve_optimization_profile(
         return fallback("a8-runtime-not-built");
     if (content_identity != validated_model_content_identity)
         return fallback("checkpoint-content-not-qualified");
-    if (options.context_explicit && options.context_tokens != 8192)
+    if (options.context_explicit && options.context_tokens != 8192 && !options.unqualified_context)
         return fallback("context-not-qualified");
     if (options.planned_ple_io)
         return fallback("planned-ple-io-explicit");
@@ -1892,7 +1972,7 @@ inline OptimizationProfileResolution resolve_optimization_profile(
     // Explicit ranked routing keeps its requested algorithm. Otherwise the
     // exact wave replacement is the qualified faster selection.
     if (!options.ranked_moe_router_topk) options.wave_moe_router_topk = true;
-    options.context_tokens = 8192;
+    if (!options.unqualified_context || !options.context_explicit) options.context_tokens = 8192;
     result.automatic_applied = true;
     result.selected = options.ranked_moe_router_topk ? "canonical-a8-ranked-qsa-hc-shared-deferred-v3" :
                                                     "canonical-a8-wave-qsa-hc-shared-deferred-v3";
@@ -1916,7 +1996,8 @@ inline OptimizationProfileResolution resolve_optimization_profile(
         options.batched_moe_activation = true;
         options.wave8_q8_gdn_input = true;
         options.wave8_q8_gdn_output = true;
-        options.gdn_islands = true;
+        // GDN islands capture the incumbent projections; the dense A8 profile runs without them.
+        options.gdn_islands = !numerical_profile_dense_a8(options.numerical_profile);
         options.prepared_eager = true;
         options.moe_shared_overlap = true;
         options.prefetch_q8_lm_head = true;
@@ -1953,7 +2034,7 @@ inline void apply_numerical_profile(
         model.hc_count != canonical.hc_count || model.hc_lowrank != canonical.hc_lowrank ||
         model.moe_intermediate_size != canonical.moe_intermediate_size ||
         model.num_experts != canonical.num_experts || model.num_experts_per_token != canonical.num_experts_per_token ||
-        options.context_tokens != 8192 || !manifest.layout_identity ||
+        (options.context_tokens != 8192 && !options.unqualified_context) || !manifest.layout_identity ||
         model_manifest_layout_identity(manifest) != manifest.layout_identity)
         throw std::invalid_argument("numerical profile requires the admitted canonical content, model and context");
     if (options.residency != HipModelResidencyMode::registered_file_mapping ||
@@ -1966,9 +2047,14 @@ inline void apply_numerical_profile(
         !options.wave8_q8_gdn_input || !options.wave8_q8_gdn_output || !options.prefetch_q8_qsa_input ||
         !options.prefetch_q8_shared_expert || !options.virtual_q8_lm_head || !options.prefetch_q8_lm_head ||
         !options.wave8_q8_lm_head || !options.wave8_q8_qsa_output ||
-        (!options.mtp.window_prefix && (!options.prepared_eager || !options.gdn_islands || !options.moe_shared_overlap)))
+        (!options.mtp.window_prefix && !options.known_prefix_full_rows &&
+            (!options.prepared_eager || !options.moe_shared_overlap ||
+             options.gdn_islands == numerical_profile_dense_a8(options.numerical_profile))))
         throw std::invalid_argument("numerical profile requires the resolved full v5 organization without implicit flag changes");
     resolution.selected += "+" + std::string(numerical_profile_name(options.numerical_profile));
+    validate_prefill_numerical_profile_cli(options);
+    if (numerical_profile_pair(options).split())
+        resolution.selected += "+prefill:" + std::string(numerical_profile_name(*options.prefill_numerical_profile));
 }
 
 } // namespace strix::decode_cli

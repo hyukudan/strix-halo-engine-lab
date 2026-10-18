@@ -8,6 +8,7 @@
 #include "strix/hip_setup_quiescence.hpp"
 #include "strix/dispatch_resources.hpp"
 #include "strix/hip_mtp_native_validation.hpp"
+#include "strix/session_executor_handoff.hpp"
 #include <algorithm>
 #include <optional>
 #include <stdexcept>
@@ -52,6 +53,7 @@ struct HipMtpTargetHiddenTicket::Lease {
     std::shared_ptr<const HipMtpTargetWindowBatch> batch;
     std::uint32_t batch_row=0;
     ModelContentIdentity content;
+    std::uint64_t producer=0; // execution identity that produced a serial row
     // Set for rows promoted from a partially accepted window: the batch's committed session
     // covers every executed row, this one ends at the accepted prefix.
     std::optional<SerialSessionContext> prefix_committed;
@@ -79,6 +81,14 @@ struct HipMtpTargetHidden::Impl {
     ExecutionMemoryBinding deferred_status;
     std::uint64_t status_lease=0;
     bool busy=false,failed=false;
+    // Split prefill: sibling prompt execution on the same scratch arena, and the admitted handoff.
+    std::unique_ptr<const CompiledSerialExecution> prompt;
+    ExecutionMemoryBinding prompt_scratch;
+    struct Handoff {
+        std::uint64_t position=0,prompt_execution=0,prompt_compatibility=0,decode_execution=0,decode_compatibility=0;
+    };
+    std::optional<Handoff> handoff;
+    bool started=false;
     ~Impl() {
         if(guard) guard->recover_or_fail_stop();
         if(stream) (void)hipStreamDestroy(stream);
@@ -132,6 +142,21 @@ std::uint32_t HipMtpTargetHiddenTicket::input_token() const {if(!lease_)throw st
 std::uint32_t HipMtpTargetHiddenTicket::predicted_token() const {if(!lease_)throw std::invalid_argument("MTP target hidden ticket is empty");return lease_->predicted;}
 const SerialSessionContext& HipMtpTargetHiddenTicket::committed_session() const {if(!lease_)throw std::invalid_argument("MTP target hidden ticket is empty");return lease_->prefix_committed?*lease_->prefix_committed:lease_->batch?lease_->batch->committed_session():lease_->committed;}
 ModelContentIdentity HipMtpTargetHiddenTicket::target_content_identity() const {if(!lease_)throw std::invalid_argument("MTP target hidden ticket is empty");return lease_->content;}
+std::uint64_t HipMtpTargetHiddenTicket::producer_execution_identity() const {
+    if(!lease_)throw std::invalid_argument("MTP target hidden ticket is empty");
+    return lease_->batch || lease_->prefix_committed ? committed_session().execution_identity : lease_->producer;
+}
+bool HipMtpTargetHiddenTicket::admits_executor_change(const HipMtpTargetHiddenTicket& next) const noexcept {
+    if(!lease_ || !next.lease_ || lease_->owner!=next.lease_->owner || !lease_->owner || lease_->batch || next.lease_->batch ||
+       lease_->prefix_committed || next.lease_->prefix_committed) return false;
+    const auto& h=lease_->owner->impl_->handoff;
+    if(!h) return false;
+    const auto& a=lease_->committed;const auto& b=next.lease_->committed;
+    return a.execution_identity==h->prompt_execution && a.runtime_compatibility_identity==h->prompt_compatibility &&
+        b.execution_identity==h->decode_execution && b.runtime_compatibility_identity==h->decode_compatibility &&
+        lease_->producer==h->prompt_execution && next.lease_->producer==h->prompt_execution &&
+        next.lease_->position+1U==h->position && b.next_position==h->position;
+}
 std::shared_ptr<HipMtpTargetHidden> HipMtpTargetHidden::create(
     const ModelContract& m,const CompiledSerialExecution& c,
     std::shared_ptr<const RuntimeExecutionMemoryOwner> memory,
@@ -212,9 +237,17 @@ HipMtpTargetHiddenTicket HipMtpTargetHidden::execute_serial(
     SerialSessionContext& session,const ExecutionRuntimeResources& resources,
     DirectLaunchDispatcher& dispatcher,std::uint32_t token) {
     auto& i=*impl_;
+    // The prompt lane runs while the session is owned by the sibling prompt execution.
+    const bool prompt_lane=i.prompt && !i.handoff && session.execution_identity==i.prompt->execution_identity;
+    const auto& lane=prompt_lane?*i.prompt:*i.compiled;
+    const auto same_scratch=[&](const ExecutionMemoryBinding* b) {
+        if(!prompt_lane) return b==&i.memory->scratch();
+        return b && b->execution_identity==i.prompt_scratch.execution_identity && b->arena_base==i.prompt_scratch.arena_base &&
+            b->arena_bytes==i.prompt_scratch.arena_bytes && b->allocation_generation==i.prompt_scratch.allocation_generation;
+    };
     if(i.busy || i.failed || session.health!=SerialSessionHealth::ready ||
-       session.execution_identity!=i.compiled->execution_identity ||
-       resources.scratch!=&i.memory->scratch() || resources.session_state_memory!=&i.memory->state() ||
+       session.execution_identity!=lane.execution_identity ||
+       !same_scratch(resources.scratch) || resources.session_state_memory!=&i.memory->state() ||
        resources.model_weights!=&i.weights->binding() || !resources.model_manifest ||
        resources.model_manifest->layout_identity!=i.weights->binding().manifest_layout_identity ||
        token>=i.model->vocab_size || current_hip_launch_context())
@@ -229,16 +262,18 @@ HipMtpTargetHiddenTicket HipMtpTargetHidden::execute_serial(
     lease->owner=shared_from_this();lease->snapshot=slot->view;lease->allocation_lease=slot->lease;
     lease->position=session.next_position;lease->token=token;
     lease->content=i.weights->binding().model_content_identity;
+    lease->producer=lane.execution_identity;
     struct Tap final:EagerExecutionDispatcher {
         Impl& owner;DirectLaunchDispatcher& next;MtpDeviceView destination;
-        std::uint64_t position;bool captured=false;
-        Tap(Impl& o,DirectLaunchDispatcher& n,MtpDeviceView d,std::uint64_t p):owner(o),next(n),destination(d),position(p){}
+        std::uint64_t position,identity;const ExecutionMemoryBinding* memory;bool captured=false;
+        Tap(Impl& o,DirectLaunchDispatcher& n,MtpDeviceView d,std::uint64_t p,std::uint64_t e,const ExecutionMemoryBinding* m)
+            :owner(o),next(n),destination(d),position(p),identity(e),memory(m){}
         void after(const ExecutionDispatchContext& c) {
             if(c.step_id!=owner.tap_step) return;
-            if(captured || c.execution_identity!=owner.compiled->execution_identity ||
+            if(captured || c.execution_identity!=identity ||
                c.position!=position || c.logical_rows!=1 || c.op!=SerialOp::mlp_inject ||
                c.writes.size()!=1 || c.writes[0]!=owner.tap_use ||
-               c.memory!=&owner.memory->scratch())
+               c.memory!=memory)
                 throw std::invalid_argument("MTP target capture dispatch producer differs");
             auto source=resolve_dispatch_write(c,0);
             if(source.bytes!=destination.bytes || !source.allocation_generation)
@@ -249,16 +284,17 @@ HipMtpTargetHiddenTicket HipMtpTargetHidden::execute_serial(
         }
         void dispatch_kernel(const ExecutionDispatchContext& c) override {next.dispatch_kernel(c);after(c);}
         void dispatch_runtime_step(const ExecutionDispatchContext& c) override {next.dispatch_runtime_step(c);after(c);}
-    } tap(i,dispatcher,slot->view,session.next_position);
+    } tap(i,dispatcher,slot->view,session.next_position,lane.execution_identity,resources.scratch);
     if(i.deferred_status.arena_base && i.allocator->allocation_lease_identity(i.deferred_status.arena_base,8,false)!=i.status_lease)
         throw std::invalid_argument("MTP target D1 backing lease changed");
-    i.busy=true;
+    i.busy=true;i.started=true;
     try {
         auto launch_resources=resources;
         if(i.shadow){i.shadow->begin();launch_resources.session_state_memory=&i.shadow->binding();}
         HipLaunchContext context;context.stream=i.stream;context.deferred_moe_status=i.deferred_status;
+        if(context.deferred_moe_status.arena_base) context.deferred_moe_status.execution_identity=lane.execution_identity;
         HipLaunchScope scope(context);
-        (void)execute_serial_token(*i.compiled,session,launch_resources,token,tap,[&] {
+        (void)execute_serial_token(lane,session,launch_resources,token,tap,[&] {
             if(!tap.captured) throw std::runtime_error("MTP target hidden producer was not executed");
             DeferredMoeFirstError status{};
             if(i.deferred_status.arena_base)
@@ -282,6 +318,36 @@ HipMtpTargetHiddenTicket HipMtpTargetHidden::execute_serial(
         session.health=SerialSessionHealth::poisoned;session.arithmetic_lineage.tainted=true;
         throw;
     }
+}
+void HipMtpTargetHidden::set_prompt_execution(const CompiledSerialExecution& prompt) {
+    auto& i=*impl_;i.guard->require_original();i.memory->validate_inventory_ownership();
+    if(i.prompt || i.started || i.busy || i.failed)
+        throw std::invalid_argument("MTP prompt execution is set once, before any target row");
+    if(prompt.execution.steps.size()!=i.compiled->execution.steps.size() ||
+       prompt.execution.steps[i.tap_step].op!=SerialOp::mlp_inject)
+        throw std::invalid_argument("MTP prompt execution differs from the target tap geometry");
+    i.prompt_scratch=sibling_scratch_binding(prompt,*i.compiled,i.memory->scratch());
+    i.prompt=std::make_unique<const CompiledSerialExecution>(prompt);
+}
+HipMtpTargetHiddenTicket HipMtpTargetHidden::hand_off_prompt(SerialSessionContext& session,
+    const HipMtpTargetHiddenTicket& pending,const ExecutionRuntimeResources& prompt_resources,
+    const ExecutionRuntimeResources& decode_resources) {
+    auto& i=*impl_;i.guard->require_original();i.memory->validate_inventory_ownership();
+    if(!i.prompt || i.handoff || i.busy || i.failed || !pending.lease_ || pending.lease_->owner.get()!=this ||
+       pending.lease_->batch || pending.lease_->prefix_committed || pending.lease_->producer!=i.prompt->execution_identity ||
+       !same_target_session(pending.lease_->committed,session) || decode_resources.scratch!=&i.memory->scratch())
+        throw std::invalid_argument("MTP prompt handoff requires the actual pending prompt row of this producer");
+    auto slot=std::find_if(i.slots.begin(),i.slots.end(),[&](const auto& s){return s.view.address==pending.lease_->snapshot.address;});
+    if(slot==i.slots.end() || slot->reader.lock()!=pending.lease_)
+        throw std::invalid_argument("MTP prompt handoff pending row does not own its capture slot");
+    const auto prompt_compatibility=session.runtime_compatibility_identity;
+    hand_off_serial_session(session,{i.prompt.get(),&prompt_resources},{i.compiled.get(),&decode_resources});
+    auto lease=std::make_shared<HipMtpTargetHiddenTicket::Lease>(*pending.lease_);
+    lease->committed=session;
+    i.handoff=Impl::Handoff{session.next_position,i.prompt->execution_identity,prompt_compatibility,
+        session.execution_identity,session.runtime_compatibility_identity};
+    slot->reader=lease;
+    HipMtpTargetHiddenTicket ticket;ticket.lease_=std::move(lease);return ticket;
 }
 void HipMtpTargetHidden::validate_window_capture(const HipMtpTargetWindowCapture& capture) const {
     const auto& i=*impl_;i.guard->require_original();i.memory->validate_inventory_ownership();

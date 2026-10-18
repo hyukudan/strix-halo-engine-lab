@@ -14,9 +14,11 @@
 #include "strix/mtp_draft_qualification.hpp"
 #include "strix/model_content_hash.hpp"
 #include "strix/ple_lookup.hpp"
+#include "strix/session_executor_handoff.hpp"
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <iostream>
 #include <memory>
 #include <optional>
 #include <string>
@@ -40,6 +42,14 @@ struct MtpDecodeTargetParents final {
     PleHashContract hash;
     PleLookupPrefetchState prefetch;
     ExecutionRuntimeResources resources;
+    // Split prefill numerical profile: the sibling serial execution that runs the prompt rows,
+    // its launch dispatcher and `resources` with the sibling view of the target scratch. All are
+    // retained by the caller through the bridge call. Null compiled: one profile for every row.
+    struct PromptExecution {
+        const CompiledSerialExecution* compiled = nullptr;
+        DirectLaunchDispatcher* dispatcher = nullptr;
+        ExecutionRuntimeResources resources;
+    } prompt;
     struct WindowSetupReceipt {
         std::uint64_t union_source_steps = 0;
         std::uint64_t union_reserved_bytes = 0;
@@ -125,8 +135,22 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
     const bool dump=!m.golden_dump.empty();
     if(((m.metadata_only || dump) && (qualify || component_diagnostic)) || (qualify && component_diagnostic))
         throw std::invalid_argument("MTP metadata, golden dump, full fixture and component diagnostic routes are mutually exclusive");
+    const auto pair=numerical_profile_pair(options);
+    const auto prefill_profile_identity=numerical_profile_identity(pair.prefill);
+    const auto decode_profile_identity=numerical_profile_identity(pair.decode);
+    const bool split=pair.split();
+    if(split!=(parents && parents->prompt.compiled) ||
+       (split && (!parents->prompt.dispatcher || parents->prompt.resources.session_state_memory!=parents->resources.session_state_memory)))
+        throw std::invalid_argument("MTP split prefill profile requires its actual prompt execution and only then");
     if(!m.metadata_only && !dump){
     golden=read_mtp_forward_golden_file(m.golden,mtp_cli_digest(m.golden_sha256),m.golden_max_bytes);
+    // A golden records the target prefill/decode pair whose prefill produced its prompt rows. A
+    // version-1 golden records none and is admitted only for a single-profile run, as before.
+    if(golden.target_decode_profile_identity ?
+           golden.target_prefill_profile_identity!=prefill_profile_identity || golden.target_decode_profile_identity!=decode_profile_identity :
+           split)
+        throw std::invalid_argument("MTP golden was dumped under another target prefill/decode numerical profile pair "
+            "(a version-1 golden records none and requires one profile for both); dump a golden with this pair");
     if(golden.rows.size()+1U!=options.tokens.size())
         throw std::invalid_argument("MTP golden must cover every prompt predictor pair, leaving only its final pending target row");
     for(std::size_t i=0;i<golden.rows.size();++i) {
@@ -197,6 +221,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
     if(deferred_status)d1={r.session_state_layout,&generations};
     auto target=HipMtpTargetHidden::create(model,compiled,actual.memory,actual.model,actual.allocator,
         retained_rows,m.target_capture_bytes,d1);
+    if(split)target->set_prompt_execution(*parents->prompt.compiled);
     std::shared_ptr<HipMtpWindowVerifier> window;
     if(m.window_rows && !dump) {
         if(!make_window)throw std::invalid_argument("MTP requested target window has no actual prepared native factory");
@@ -215,8 +240,12 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
     const std::array<std::uint32_t,1> eos{options.eos_token.value_or(static_cast<std::uint32_t>(model.ple_eos_token_id))};
     std::string stop="token-budget";
     try {
+        // The prompt rows are the prefill: under a split pair they run the sibling prompt
+        // execution, and the session moves to the decode execution only after the replay.
+        if(split)hand_off_serial_session(session,{&compiled,&r},{parents->prompt.compiled,&parents->prompt.resources});
         for(std::size_t i=0;i<options.tokens.size();++i) {
-            auto current=target->execute_serial(session,r,dispatcher,options.tokens[i]);
+            auto current=split ? target->execute_serial(session,parents->prompt.resources,*parents->prompt.dispatcher,options.tokens[i])
+                               : target->execute_serial(session,r,dispatcher,options.tokens[i]);
             if(pending.valid())replay_rows.push_back({pending,options.tokens[i]});
             pending=std::move(current);
         }
@@ -225,6 +254,8 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
             // explicit self-generated pins keep it distinguishable from an
             // independent reference; nothing is qualified or generated here.
             golden=capture_hip_mtp_forward_golden(*runtime,replay_rows,mtp_self_generated_golden_source(),mtp_self_generated_golden_reference);
+            golden.target_prefill_profile_identity=prefill_profile_identity;
+            golden.target_decode_profile_identity=decode_profile_identity;
             const auto sha=write_mtp_forward_golden_file(m.golden_dump,golden,m.golden_max_bytes);
             assets->validate_assets_unchanged();
             output<<"{\"mode\":\"mtp-self-generated-golden-dump\",\"mtp_reference_independence\":\"self-generated-native-forward-not-independent\","
@@ -233,7 +264,11 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
                 <<"\",\"mtp_independent_source_content\":\""<<model_content_identity_hex(golden.independent_source_content)
                 <<"\",\"mtp_independent_reference_identity\":"<<golden.independent_reference_identity
                 <<",\"mtp_structural_plan_identity\":"<<golden.structural_plan_identity<<",\"mtp_semantic_identity\":"<<golden.semantic_identity
-                <<",\"mtp_native_arithmetic_profile_identity\":"<<golden.numerical_profile_identity<<"}\n";
+                <<",\"mtp_native_arithmetic_profile_identity\":"<<golden.numerical_profile_identity
+                <<",\"mtp_golden_target_prefill_numerical_profile\":\""<<numerical_profile_name(pair.prefill)
+                <<"\",\"mtp_golden_target_decode_numerical_profile\":\""<<numerical_profile_name(pair.decode)
+                <<"\",\"mtp_golden_target_prefill_profile_identity\":"<<golden.target_prefill_profile_identity
+                <<",\"mtp_golden_target_decode_profile_identity\":"<<golden.target_decode_profile_identity<<"}\n";
             return;
         }
         // This call executes all eleven native stages for every independent
@@ -262,10 +297,20 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
         if(runtime->next_source_position()+1U!=session.next_position)
             throw std::logic_error("MTP replay did not prime the actual final prompt frontier");
         replay_rows.clear(); // release prompt snapshots before bounded cycles
+        // Prefill handoff: every later target row, window and checkpoint runs the decode execution
+        // from the state this prefill produced. The pending prompt row is re-minted with the
+        // handed-off session; the lineage keeps the prefill identity of every prompt row.
+        if(split)pending=target->hand_off_prompt(session,pending,parents->prompt.resources,r);
         if(m.draft_chain){
             // Drafts only: the subset (or full) head changes acceptance, never target output.
             HipMtpDraftHeadConfig draft;draft.full=m.draft_vocab.empty() && !m.draft_context_vocab;
-            if(!m.draft_vocab.empty())draft.base_tokens=HipMtpDraftHead::read_token_file(m.draft_vocab,static_cast<std::uint32_t>(model.vocab_size));
+            if(!m.draft_vocab.empty()) {
+                std::string chosen;
+                const auto spec=HipMtpDraftHead::resolve_vocabulary_spec(m.draft_vocab,options.tokens,
+                    static_cast<std::uint32_t>(model.vocab_size),chosen);
+                if(spec!=m.draft_vocab) std::cerr<<"MTP draft vocabulary: "<<chosen<<'\n';
+                draft.base_tokens=HipMtpDraftHead::read_token_file(spec,static_cast<std::uint32_t>(model.vocab_size));
+            }
             draft.context_capacity=m.draft_context_vocab;draft.q4=m.draft_q4;
             runtime->enable_draft_chain(std::move(draft),m.draft_exact);runtime->observe_draft_context(options.tokens);
         }
@@ -342,6 +387,10 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
             <<"  \"mtp_source_path\":\""<<decode_receipt::escape_json_string(m.source_path)<<"\",\n"
             <<"  \"mtp_converter_reference_sha256\":\""<<model_content_identity_hex(evidence.converter_reference_sha256)<<"\",\n"
             <<"  \"mtp_norm_converter_reference_sha256\":\""<<model_content_identity_hex(evidence.norm_converter_reference_sha256)<<"\",\n"
+            <<"  \"target_prefill_numerical_profile\":\""<<numerical_profile_name(pair.prefill)<<"\",\n"
+            <<"  \"target_decode_numerical_profile\":\""<<numerical_profile_name(pair.decode)<<"\",\n"
+            <<"  \"target_prefill_execution_identity\":"<<(split?parents->prompt.compiled->execution_identity:compiled.execution_identity)<<",\n"
+            <<"  \"mtp_golden_target_profile_pair_recorded\":"<<(golden.target_decode_profile_identity?"true":"false")<<",\n"
             <<"  \"target_execution_identity\":"<<compiled.execution_identity<<",\n"
             <<"  \"target_kernel_plan_identity\":"<<compiled.kernel_plan_identity<<",\n"
             <<"  \"mtp_structural_plan_identity\":"<<assets->compiled().plan_identity<<",\n"

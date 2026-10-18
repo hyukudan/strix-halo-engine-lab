@@ -82,6 +82,7 @@ add_library(strix_core STATIC
     src/moe_q4k_a8_runtime.cpp
     src/gdn_output_admission.cpp
     src/arithmetic_lineage.cpp
+    src/session_executor_handoff.cpp
     src/graph_eligibility.cpp
     src/graph_inputs.cpp
     src/graph_attention_state.cpp
@@ -968,6 +969,11 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-serial-session-tests)
     add_test(NAME strix-serial-session-tests COMMAND strix-serial-session-tests)
 
+    add_executable(strix-session-executor-handoff-tests tests/session_executor_handoff_tests.cpp)
+    target_link_libraries(strix-session-executor-handoff-tests PRIVATE strix_core)
+    strix_target_warnings(strix-session-executor-handoff-tests)
+    add_test(NAME strix-session-executor-handoff-tests COMMAND strix-session-executor-handoff-tests)
+
     add_executable(strix-serial-request-tests tests/serial_request_tests.cpp)
     target_link_libraries(strix-serial-request-tests PRIVATE strix_core)
     strix_target_warnings(strix-serial-request-tests)
@@ -1298,6 +1304,10 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         PATH_SUFFIXES lib lib64
         REQUIRED
     )
+    # The HIP compiler treats the toolkit include directory as implicit and searches /usr/include first, so a
+    # distribution HIP development package there (another HIP version) silently wins over the toolkit headers
+    # the runtime library belongs to. Put the toolkit headers first for every HIP translation unit.
+    add_compile_options("$<$<COMPILE_LANGUAGE:HIP>:SHELL:-isystem ${STRIX_HIP_INCLUDE_DIR}>")
 
     if(STRIX_BUILD_EXPERIMENTAL_Q4K_A8_PROBE OR STRIX_ENABLE_EXPERIMENTAL_Q4K_A8_RUNTIME)
         # Only these isolated arithmetic TUs receive the strict experimental flags.
@@ -1323,6 +1333,12 @@ if(STRIX_ENABLE_HIP_RUNTIME)
             target_compile_options(strix-hip-moe-a8-down-tests PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
             strix_target_warnings(strix-hip-moe-a8-down-tests)
             add_test(NAME strix-hip-moe-a8-down-tests COMMAND strix-hip-moe-a8-down-tests)
+            add_executable(strix-hip-moe-wmma-prefill-tests tests/hip_moe_wmma_prefill_tests.hip)
+            target_link_libraries(strix-hip-moe-wmma-prefill-tests PRIVATE strix_q4k_a8_hip_probe strix_q4k_a8_contract strix_core)
+            set_target_properties(strix-hip-moe-wmma-prefill-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+            target_compile_options(strix-hip-moe-wmma-prefill-tests PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
+            strix_target_warnings(strix-hip-moe-wmma-prefill-tests)
+            add_test(NAME strix-hip-moe-wmma-prefill-tests COMMAND strix-hip-moe-wmma-prefill-tests)
             add_executable(strix-hip-q4k-a8-probe-tests tests/hip_moe_q4k_a8_probe_tests.hip $<TARGET_OBJECTS:strix_q4k_a8_dot4_compile_probe>)
             target_link_libraries(strix-hip-q4k-a8-probe-tests PRIVATE strix_q4k_a8_hip_probe strix_core)
             set_target_properties(strix-hip-q4k-a8-probe-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
@@ -1678,6 +1694,11 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         target_link_libraries(strix-hip-lane-chain-hyper-output-tests PRIVATE strix_hip_runtime)
         strix_target_warnings(strix-hip-lane-chain-hyper-output-tests)
         add_test(NAME strix-hip-lane-chain-hyper-output-tests COMMAND strix-hip-lane-chain-hyper-output-tests)
+        add_executable(strix-hip-hc-wide-rows-tests tests/hip_hc_wide_rows_tests.hip)
+        set_target_properties(strix-hip-hc-wide-rows-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+        target_link_libraries(strix-hip-hc-wide-rows-tests PRIVATE strix_hip_runtime)
+        strix_target_warnings(strix-hip-hc-wide-rows-tests)
+        add_test(NAME strix-hip-hc-wide-rows-tests COMMAND strix-hip-hc-wide-rows-tests)
         add_executable(strix-hip-parallel-hyper-projection-tests tests/hip_parallel_hyper_projection_tests.hip)
         set_target_properties(strix-hip-parallel-hyper-projection-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
         target_link_libraries(strix-hip-parallel-hyper-projection-tests PRIVATE strix_hip_runtime)
@@ -1862,6 +1883,15 @@ if(STRIX_ENABLE_HIP_RUNTIME)
             -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
         strix_target_warnings(strix-hip-q8-rows-projection-tests)
         add_test(NAME strix-hip-q8-rows-projection-tests COMMAND strix-hip-q8-rows-projection-tests)
+
+        # Dense A8 profile prototypes: dot4 decode form vs iu8 WMMA prefill form (header-only, standalone).
+        add_executable(strix-hip-dense-a8-wmma-tests tests/hip_dense_a8_wmma_tests.hip)
+        set_target_properties(strix-hip-dense-a8-wmma-tests PROPERTIES
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+        target_compile_options(strix-hip-dense-a8-wmma-tests PRIVATE
+            -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
+        strix_target_warnings(strix-hip-dense-a8-wmma-tests)
+        add_test(NAME strix-hip-dense-a8-wmma-tests COMMAND strix-hip-dense-a8-wmma-tests)
 
         if(STRIX_ENABLE_EXPERIMENTAL_Q4K_A8_RUNTIME)
             add_executable(strix-hip-moe-q4k-a8-known-rows-tests tests/hip_moe_q4k_a8_known_rows_tests.hip)

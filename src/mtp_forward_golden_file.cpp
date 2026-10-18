@@ -11,7 +11,8 @@
 namespace strix {
 namespace {
 constexpr std::array<unsigned char,8> magic={'S','T','R','M','T','P','G','1'};
-constexpr std::uint64_t header_bytes=168,row_header_bytes=24;
+// Version 1: 168-byte header. Version 2 appends the target prefill and decode profile identities.
+constexpr std::uint64_t header_bytes_v1=168,header_bytes_v2=184,row_header_bytes=24;
 constexpr std::uint32_t max_rows=4096,max_width=1U<<20,max_vocabulary=1U<<24;
 static_assert(sizeof(float)==4 && std::numeric_limits<float>::is_iec559);
 void require(bool value,const char* message) { if(!value) throw std::invalid_argument(message); }
@@ -23,7 +24,7 @@ std::uint64_t mul(std::uint64_t a,std::uint64_t b) {
     if(b && a>std::numeric_limits<std::uint64_t>::max()/b) throw std::overflow_error("MTP golden file size overflow");
     return a*b;
 }
-std::uint64_t geometry(std::uint64_t rows,std::uint64_t width,std::uint64_t vocabulary) {
+std::uint64_t geometry(std::uint64_t header_bytes,std::uint64_t rows,std::uint64_t width,std::uint64_t vocabulary) {
     require(rows && rows<=max_rows && width && width<=max_width && vocabulary && vocabulary<=max_vocabulary,
         "MTP golden dimensions exceed the closed file format");
     return add(header_bytes,mul(rows,add(row_header_bytes,add(mul(width,4),mul(vocabulary,4)))));
@@ -37,7 +38,10 @@ void pins(const HipMtpForwardGolden& golden) {
     require(golden.independent_source_content.valid() && golden.target_content.valid() && golden.sidecar_content.valid() &&
         golden.independent_reference_identity && golden.structural_plan_identity && golden.semantic_identity &&
         golden.numerical_profile_identity,"MTP golden source/model/plan/profile pins must be explicit");
+    require((golden.target_prefill_profile_identity==0)==(golden.target_decode_profile_identity==0),
+        "MTP golden records both target profile identities or neither");
 }
+std::uint32_t version_of(const HipMtpForwardGolden& golden) { return golden.target_decode_profile_identity ? 2U : 1U; }
 void finite_bf16(std::uint16_t value) {
     require((value&0x7f80U)!=0x7f80U,"MTP golden BF16 values must be finite");
 }
@@ -78,7 +82,10 @@ void validate_row(const HipMtpForwardGoldenRow& row,std::size_t index,std::size_
 HipMtpForwardGolden decode(std::span<const std::byte> bytes) {
     Reader reader{bytes};
     for(const auto value:magic) require(reader.integer(1)==value,"MTP golden file magic differs");
-    require(reader.integer(4)==1 && reader.integer(4)==header_bytes,"MTP golden file version or header size differs");
+    const auto version=reader.integer(4);
+    require((version==1 || version==2) && reader.integer(4)==(version==1?header_bytes_v1:header_bytes_v2),
+        "MTP golden file version or header size differs");
+    const auto header_bytes=version==1?header_bytes_v1:header_bytes_v2;
     require(reader.integer(8)==bytes.size(),"MTP golden file declared byte size differs");
     HipMtpForwardGolden golden;
     golden.independent_source_content=reader.digest(); golden.target_content=reader.digest(); golden.sidecar_content=reader.digest();
@@ -86,8 +93,13 @@ HipMtpForwardGolden decode(std::span<const std::byte> bytes) {
     golden.semantic_identity=reader.integer(8); golden.numerical_profile_identity=reader.integer(8);
     const auto rows=reader.integer(4),width=reader.integer(4),vocabulary=reader.integer(4);
     require(reader.integer(4)==0,"MTP golden reserved field is nonzero");
+    if(version==2) {
+        golden.target_prefill_profile_identity=reader.integer(8); golden.target_decode_profile_identity=reader.integer(8);
+        require(golden.target_prefill_profile_identity && golden.target_decode_profile_identity,
+            "MTP golden version 2 requires both target profile identities");
+    }
     pins(golden);
-    require(geometry(rows,width,vocabulary)==bytes.size(),"MTP golden dimensions, payload size or trailing bytes differ");
+    require(geometry(header_bytes,rows,width,vocabulary)==bytes.size(),"MTP golden dimensions, payload size or trailing bytes differ");
     // Pass one validates every row before allocating any decoded payload.
     const auto payload_offset=reader.offset;
     for(std::uint64_t row=0;row<rows;++row) {
@@ -123,15 +135,17 @@ HipMtpForwardGolden decode(std::span<const std::byte> bytes) {
 std::vector<std::byte> encode_mtp_forward_golden_file(const HipMtpForwardGolden& golden,std::uint64_t maximum) {
     pins(golden); require(!golden.rows.empty(),"MTP golden file has no rows");
     const auto width=golden.rows.front().target_hidden_bf16.size(),vocabulary=golden.rows.front().full_logits.size();
-    const auto bytes=geometry(golden.rows.size(),width,vocabulary); budget(bytes,maximum);
+    const auto version=version_of(golden);
+    const auto bytes=geometry(version==1?header_bytes_v1:header_bytes_v2,golden.rows.size(),width,vocabulary); budget(bytes,maximum);
     for(std::size_t i=0;i<golden.rows.size();++i) validate_row(golden.rows[i],i,width,vocabulary);
     std::vector<std::byte> result; result.reserve(static_cast<std::size_t>(bytes));
     for(const auto value:magic) append(result,value,1);
-    append(result,1,4); append(result,header_bytes,4); append(result,bytes,8);
+    append(result,version,4); append(result,version==1?header_bytes_v1:header_bytes_v2,4); append(result,bytes,8);
     append(result,golden.independent_source_content); append(result,golden.target_content); append(result,golden.sidecar_content);
     append(result,golden.independent_reference_identity,8); append(result,golden.structural_plan_identity,8);
     append(result,golden.semantic_identity,8); append(result,golden.numerical_profile_identity,8);
     append(result,golden.rows.size(),4); append(result,width,4); append(result,vocabulary,4); append(result,0,4);
+    if(version==2) { append(result,golden.target_prefill_profile_identity,8); append(result,golden.target_decode_profile_identity,8); }
     for(const auto& row:golden.rows) {
         append(result,row.source_position,8); append(result,row.source_input_token,4); append(result,row.next_input_token,4);
         append(result,row.selected_token,4); append(result,0,4);
@@ -150,7 +164,7 @@ HipMtpForwardGolden read_mtp_forward_golden_file(const std::filesystem::path& pa
     if(end<0) throw std::runtime_error("cannot size MTP independent golden file");
     const auto bytes=static_cast<std::uint64_t>(static_cast<std::streamoff>(end));
     budget(bytes,maximum);
-    require(bytes>=header_bytes,"MTP golden file is shorter than its header");
+    require(bytes>=header_bytes_v1,"MTP golden file is shorter than its header");
     std::vector<std::byte> contents(static_cast<std::size_t>(bytes));
     file.seekg(0,std::ios::beg);
     if(!file.read(reinterpret_cast<char*>(contents.data()),static_cast<std::streamsize>(bytes)) ||

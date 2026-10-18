@@ -12,6 +12,13 @@ inline constexpr std::string_view lm_prefetch_marker = ".prefetch8-load-v1";
 inline constexpr std::string_view lm_wave8_marker = ".prefetch8-wave8-v1";
 inline constexpr std::string_view gdn_output_wave8_marker = ".wave8-q8-output-v1";
 inline constexpr std::string_view qsa_output_wave8_marker = ".wave8-q8-qsa-output-v1";
+// Dense A8 numerical profile: every Q8_0 projection of a GDN, QSA or shared-expert
+// step quantizes its activations per 32 features to int8 (delta = amax / 127, RNE
+// division, codes clamped to +-127; a non-finite block gives a NaN delta) and runs
+// acc = fma(d_w * delta, int32 block dot, acc) over the blocks in ascending order.
+inline constexpr std::string_view dense_a8_marker = ".dense-a8-v1";
+inline constexpr std::string_view dense_a8_numerical_identity =
+    "dense-a8-q80-v1:per32-int8-amax127-rndiv-nan-poison:int32-block-dot:fp32-ascending-block-fma-chain:nan-canonical";
 
 // Bounded BF16/Q8_0 overlays. These contracts do not establish native fidelity
 // or performance qualification. The incumbent paths do not call these guards.

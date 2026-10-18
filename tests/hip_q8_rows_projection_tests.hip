@@ -17,9 +17,11 @@
 #include <string>
 #include <vector>
 
-// q8_rows engine sites against their R1 kernels, T = 1..8: bitwise payloads
+// q8_rows engine sites against their R1 kernels, T = 1..8 and 16/32/64: bitwise payloads
 // (real and edge shapes, edge values), A8 error against the exact path, and with
-// STRIX_Q8_ROWS_BENCH=1 warm/cold timings at the model shapes.
+// STRIX_Q8_ROWS_BENCH=1 warm/cold timings at the model shapes, plus weight GB/s of
+// T = 8/16/32/64 at the prefill shapes. STRIX_Q8_ROWS_WIDE_ONLY=1 runs only the
+// T = 16/32/64 checks (and, with STRIX_Q8_ROWS_BENCH_ONLY=1, only the benchmark).
 namespace {
 using namespace strix;
 void require(bool value, const std::string& message) { if (!value) throw std::runtime_error(message); }
@@ -238,10 +240,85 @@ float median_us(const Fixture& f, Mode mode, bool cold, const Buffer& flush, hip
 }
 } // namespace
 
+// Prefill shapes of the wide (T > 8) windows: GDN qkv+z 12288 + 6144, QSA q 12288 + 512 + 512.
+std::pair<std::uint32_t, std::uint32_t> prefill_shape(Site s) {
+    switch (s) {
+    case Site::gdn_input: return {2560U, 18432U};
+    case Site::qsa_input: return {2560U, 13312U};
+    default: return model_shape(s);
+    }
+}
+void wide_cases(hipStream_t stream, std::uint32_t& cases) {
+    for (const auto site : sites)
+        for (const unsigned rows : {16U, 32U, 64U}) {
+            const auto [width, outputs] = prefill_shape(site);
+            exact_case(stream, site, rows, width, outputs, rows == 64U ? 2U : 4U, cases);
+            // Both model widths, output counts that are not multiples of the per-wave outputs or
+            // of a block's output groups, and partial-chunk / sub-wave widths.
+            for (const std::uint32_t w : {2560U, 6144U}) for (const std::uint32_t o : {1U, 7U, 9U, 17U, 1001U})
+                exact_case(stream, site, rows, w, o, 2U, cases);
+            for (const std::uint32_t w : {32U, 96U, 288U, 640U}) for (const std::uint32_t o : {3U, 33U})
+                exact_case(stream, site, rows, w, o, 4U, cases);
+        }
+}
+void wide_bench(hipStream_t stream) {
+    Buffer flush(256ULL << 20U);
+    check(hipMemset(reinterpret_cast<void*>(flush.address), 1, flush.bytes), "init flush");
+    // STRIX_Q8_ROWS_BENCH_ROWS=64 restricts the row counts, STRIX_Q8_ROWS_BENCH_COLD=1 skips warm runs.
+    std::vector<unsigned> counts{8U, 16U, 32U, 64U};
+    if (const char* v = std::getenv("STRIX_Q8_ROWS_BENCH_ROWS")) counts = {static_cast<unsigned>(std::atoi(v))};
+    const bool cold_only = std::getenv("STRIX_Q8_ROWS_BENCH_COLD") != nullptr;
+    for (const bool cold : {false, true})
+        for (const auto site : sites) {
+            if (cold_only && !cold) continue;
+            const auto [width, outputs] = prefill_shape(site);
+            const double weight_bytes = static_cast<double>(width / 32U) * outputs * 34.0;
+            Fixture warmup(site, 1U, width, outputs); warmup.prepare(0);
+            static_cast<void>(median_us(warmup, Mode::rows, cold, flush, stream));
+            std::cout << (cold ? "cold " : "warm ") << name(site) << " " << width << "->" << outputs << " ("
+                      << weight_bytes / 1e6 << " MB of Q8 weights)\n";
+            for (const unsigned rows : counts) {
+                Fixture f(site, rows, width, outputs); f.prepare(0);
+                const auto us = median_us(f, Mode::rows, cold, flush, stream);
+                std::cout << "  T=" << rows << " " << us << " us  " << weight_bytes / (us * 1e3) << " GB/s weights  "
+                          << us / static_cast<float>(rows) << " us/row\n";
+            }
+        }
+}
+
 int main() try {
     hipStream_t stream = nullptr;
     check(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), "create stream");
     std::uint32_t cases = 0;
+    // STRIX_Q8_ROWS_WIDE_ONLY=1: only the T = 16/32/64 checks (and their benchmark).
+    if (std::getenv("STRIX_Q8_ROWS_WIDE_ONLY")) {
+        if (!std::getenv("STRIX_Q8_ROWS_BENCH_ONLY")) {
+            wide_cases(stream, cases);
+            std::cout << "q8_rows T=16/32/64 payloads equal the R1 kernels bitwise: " << cases << " cases\n";
+        }
+        if (std::getenv("STRIX_Q8_ROWS_BENCH")) wide_bench(stream);
+        check(hipStreamDestroy(stream), "destroy stream");
+        return 0;
+    }
+    // STRIX_Q8_ROWS_DECODE_BENCH=1: only cold/warm timings of the T = 1/2/4/8 window shapes.
+    if (std::getenv("STRIX_Q8_ROWS_DECODE_BENCH")) {
+        Buffer flush(256ULL << 20U);
+        check(hipMemset(reinterpret_cast<void*>(flush.address), 1, flush.bytes), "init flush");
+        for (const bool cold : {false, true})
+            for (const auto site : sites) {
+                const auto [width, outputs] = model_shape(site);
+                Fixture warmup(site, 1U, width, outputs); warmup.prepare(0);
+                static_cast<void>(median_us(warmup, Mode::rows, cold, flush, stream));
+                std::cout << (cold ? "cold " : "warm ") << name(site) << " " << width << "->" << outputs << ":";
+                for (const unsigned rows : {1U, 2U, 4U, 8U}) {
+                    Fixture f(site, rows, width, outputs); f.prepare(0);
+                    std::cout << "  T" << rows << " " << median_us(f, Mode::rows, cold, flush, stream);
+                }
+                std::cout << " us\n";
+            }
+        check(hipStreamDestroy(stream), "destroy stream");
+        return 0;
+    }
     for (const auto site : sites)
         for (const unsigned rows : {1U, 2U, 4U, 8U}) {
             const auto [width, outputs] = model_shape(site);
@@ -263,6 +340,9 @@ int main() try {
             for (const std::uint32_t w : {96U, 640U}) for (const std::uint32_t o : {7U, 33U}) exact_case(stream, site, rows, w, o, 2U, cases);
         }
     std::cout << "q8_rows exact payloads equal the R1 kernels bitwise: " << cases << " cases\n";
+    std::uint32_t wide = 0;
+    wide_cases(stream, wide);
+    std::cout << "q8_rows T=16/32/64 payloads equal the R1 kernels bitwise: " << wide << " cases\n";
     for (const auto site : sites)
         for (const unsigned rows : {1U, 2U, 4U, 8U}) {
             const auto [width, outputs] = model_shape(site);
@@ -288,6 +368,7 @@ int main() try {
                               << "  rows-A8 " << median_us(f, Mode::rows_a8, cold, flush, stream) << '\n';
                 }
             }
+        wide_bench(stream);
     }
     check(hipStreamDestroy(stream), "destroy stream");
     return 0;

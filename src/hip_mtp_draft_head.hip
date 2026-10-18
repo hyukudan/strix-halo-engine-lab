@@ -3,9 +3,12 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 #include <algorithm>
+#include <cstdlib>
+#include <chrono>
 #include <fstream>
 #include <limits>
 #include <stdexcept>
+#include <span>
 #include <string>
 
 namespace strix {
@@ -14,7 +17,7 @@ constexpr unsigned threads=256;
 constexpr std::uint32_t max_slots=16;
 // sum: sum of exp(logit - value) over the finite rows of the partial (softmax denominator at its max).
 struct Partial {float value;std::uint32_t token,bad,valid;float sum;};
-struct Reply {std::uint32_t tokens[max_slots];std::uint32_t status;float probabilities[max_slots];};
+struct Reply {std::uint32_t tokens[max_slots];std::uint32_t status;float probabilities[max_slots];std::uint32_t completed;};
 void require(bool ok,const char* message) {if(!ok) throw std::invalid_argument(message);}
 void check(hipError_t e,const char* message) {if(e!=hipSuccess) throw std::runtime_error(std::string(message)+": "+hipGetErrorString(e));}
 // Same monotone key and lowest-token tie rule as the full greedy selector.
@@ -132,6 +135,9 @@ __global__ __launch_bounds__(threads) void draft_argmax_finish(const Partial* pa
         const auto token=failed?0U:best.token;
         slots[step]=token;reply->tokens[step]=token;reply->probabilities[step]=failed?0.0F:1.0F/sum;
         if(failed) reply->status|=failed<<(2U*step);
+        // Host pollers read the fields above once they observe this count (wait_step).
+        __threadfence_system();
+        __hip_atomic_store(&reply->completed,step+1U,__ATOMIC_RELEASE,__HIP_MEMORY_SCOPE_SYSTEM);
     }
 }
 } // namespace
@@ -246,6 +252,23 @@ float HipMtpDraftHead::probability(std::uint32_t step) const {
     const auto& p=*impl_;require(step<p.config.max_depth,"MTP draft probability step is invalid");
     const volatile float* mapped=p.reply->probabilities;return mapped[step];
 }
+void HipMtpDraftHead::wait_step(std::uint32_t step,void* stream) const {
+    const auto& p=*impl_;require(step<p.config.max_depth && stream==p.stream,"MTP draft wait step/stream is invalid");
+    // STRIX_MTP_DRAFT_POLL=0 synchronises the stream as before.
+    static const bool poll=[]{const char* v=std::getenv("STRIX_MTP_DRAFT_POLL");return !v || v[0]!='0';}();
+    if(poll) {
+        const auto deadline=std::chrono::steady_clock::now()+std::chrono::milliseconds(50);
+        for(unsigned spin=0;;++spin) {
+            if(__atomic_load_n(&p.reply->completed,__ATOMIC_ACQUIRE)>step) return;
+            if((spin&1023U)==1023U) {
+                const auto state=hipStreamQuery(p.stream);
+                if(state!=hipErrorNotReady) break; // idle or failed: the synchronisation returns or reports it
+                if(std::chrono::steady_clock::now()>deadline) break;
+            }
+        }
+    }
+    check(hipStreamSynchronize(p.stream),"MTP draft early-stop step");
+}
 bool HipMtpDraftHead::full() const noexcept {return impl_->config.full;}
 HipMtpDraftHeadStats HipMtpDraftHead::stats() const noexcept {
     const auto& p=*impl_;return {p.rows,p.base_rows,p.context_rows,p.context_dropped};
@@ -269,6 +292,28 @@ std::vector<std::uint32_t> read_one_token_file(const std::string& path,std::uint
 }
 } // namespace
 // A comma-separated list (a core subset plus language packs) is their union in file order, first occurrence kept.
+std::string HipMtpDraftHead::resolve_vocabulary_spec(const std::string& spec,std::span<const std::uint32_t> prompt,
+    std::uint32_t vocabulary,std::string& chosen) {
+    chosen=spec;
+    if(spec.rfind("auto:",0)!=0) return spec;
+    const auto dir=spec.substr(5);
+    require(!dir.empty(),"MTP draft vocabulary auto: needs a directory");
+    const auto core=dir+"/core32k.bin";
+    static constexpr const char* languages[]={"de","es","fr","it","pt","ru","ja","zh"};
+    std::string best;std::uint64_t best_count=0;
+    for(const auto* language:languages) {
+        const auto path=dir+"/pack-"+language+"16k.bin";
+        if(!std::ifstream(path,std::ios::binary)) continue;
+        std::vector<std::uint8_t> member(vocabulary,0U);
+        for(const auto id:read_one_token_file(path,vocabulary)) member[id]=1U;
+        std::uint64_t count=0;
+        for(const auto token:prompt) if(token<vocabulary&&member[token]) ++count;
+        if(count>best_count) {best_count=count;best=language;}
+    }
+    if(best.empty()||best_count<2U||best_count*20U<prompt.size()) {chosen="core32k";return core;}
+    chosen="core32k+"+best+"16k ("+std::to_string(best_count)+" prompt tokens)";
+    return core+","+dir+"/pack-"+best+"16k.bin";
+}
 std::vector<std::uint32_t> HipMtpDraftHead::read_token_file(const std::string& paths,std::uint32_t vocabulary) {
     std::vector<std::uint32_t> ids;std::vector<std::uint8_t> seen(vocabulary,0U);
     for(std::size_t begin=0;begin<=paths.size();) {

@@ -65,6 +65,20 @@ void moe_experts_known_window_rows_launch(
     std::span<const ExecutionDispatchContext> rows,
     const HipMoeExpertsLauncherConfig& config,
     const q51_known_rows::Workspace& workspace);
+// Known-prompt prefill, A8 profile: all T rows (multiple of 8) of one routed step in one
+// call. Every 8-row chunk passes the window admission above (with the window's own
+// 8-row workspace); each per-row view must then be row 0 plus r times one stride.
+// One CSR over the T rows in `prefill` (q51_known_rows::prefill_scratch_bytes(T)), so
+// each touched expert's weights are read once per batch of its assignments. Each
+// (row, slot) and each row's slot merge keep the window arithmetic and order.
+void moe_experts_known_prefill_rows_preflight(
+    std::span<const ExecutionDispatchContext> rows,
+    const HipMoeExpertsLauncherConfig& config,
+    const q51_known_rows::Workspace& window, const q51_known_rows::Workspace& prefill);
+void moe_experts_known_prefill_rows_launch(
+    std::span<const ExecutionDispatchContext> rows,
+    const HipMoeExpertsLauncherConfig& config,
+    const q51_known_rows::Workspace& window, const q51_known_rows::Workspace& prefill);
 
 class HipMoeExpertsLauncherBundle {
 public:

@@ -62,4 +62,29 @@ struct WindowRows {
 // caller merges and commits.
 void enqueue_window(const Request&, std::span<const Bindings>,
     const q51_known_rows::Workspace&, const WindowRows&, hipStream_t);
+
+// Known-prompt prefill over T rows (multiple of 8, A8 profile only). Every per-row
+// view is row 0 plus r times its own byte stride (the prefill arena stripes rows).
+template <class T> struct StridedRows { T* base{}; std::uint64_t stride{}; };
+struct PrefillRows {
+    StridedRows<const void> input; StridedRows<const unsigned> routes; StridedRows<const float> route_weights;
+    StridedRows<signed char> codes; StridedRows<float> deltas; StridedRows<int> sums; StridedRows<unsigned> status;
+    StridedRows<float> output, clear;
+    StridedRows<signed char> down_codes; StridedRows<float> down_deltas; StridedRows<int> down_sums;
+    StridedRows<float> rawdots;
+    CsrRows csr; // q51_known_rows::scratch_layout(T, experts, top_k, true) in an exclusive allocation
+};
+// T CTAs: each row's clear, route checks and quantizer exactly as the window prologue.
+void enqueue_prefill_prologue(const Request&, const PrefillRows&, unsigned rows, unsigned clear_words, hipStream_t);
+// Prologue, GPU CSR over the T*top_k assignments (stable: rows then slots ascending per
+// expert, batches of consecutive assignments of one expert; row statuses folded into the
+// summary word), gate/up with the serial down activation quantizer and the integer down.
+// Each (row, slot) runs the window kernels' per-lane arithmetic; the caller merges and
+// commits. Summary histograms count n>=8 in their last bucket. form 1 runs gate/up and down
+// as iu8 WMMA kernels over batches of <= 16 assignments (CSR from a parallel builder), form 0
+// the dot4 kernels, -1 picks by STRIX_PREFILL_MOE_WMMA (default WMMA); form 2 (tests) is form 1
+// with the serial CSR builder. Every output byte is identical across forms.
+void enqueue_prefill(const Request&, const PrefillRows&, unsigned rows, unsigned clear_words,
+    const unsigned char* gate, const unsigned char* up, unsigned down_type, const unsigned char* down_weights, hipStream_t,
+    int form = -1);
 } // namespace strix::moe_q4k_a8::known_rows

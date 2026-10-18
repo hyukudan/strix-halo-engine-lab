@@ -13,6 +13,8 @@
 #include "strix/hip_generation_output.hpp"
 #include "strix/hip_launch_context.hpp"
 #include "strix/mtp_sidecar_binding.hpp"
+#include <cstring>
+#include <cstdio>
 #include <hip/hip_runtime.h>
 #include <algorithm>
 #include <cstdlib>
@@ -54,8 +56,12 @@ void require_chain(const HipMtpTargetHiddenTicket& a,const HipMtpTargetHiddenTic
             "MTP adjacent rows do not retain the same actual whole-window commit");
         return;
     }
+    // Consecutive rows keep one executor, except across the producer's admitted prompt handoff
+    // (split prefill profile), where the lineage below still proves the exact continuation.
+    const bool same_executor=previous.execution_identity==next.execution_identity &&
+        previous.runtime_compatibility_identity==next.runtime_compatibility_identity;
     require(a.source_position()+1U==a.chunk_end() && b.source_position()==b.chunk_begin() &&
-        previous.execution_identity==next.execution_identity && previous.runtime_compatibility_identity==next.runtime_compatibility_identity &&
+        (same_executor || a.admits_executor_change(b)) &&
         previous.state_layout_identity==next.state_layout_identity && previous.next_position==b.chunk_begin() &&
         b.chunk_end()>b.chunk_begin() && next.next_position==b.chunk_end() &&
         b.chunk_end()-b.chunk_begin()<=UINT64_MAX-previous.committed_tokens &&
@@ -71,7 +77,10 @@ void require_chain(const HipMtpTargetHiddenTicket& a,const HipMtpTargetHiddenTic
     } else {
         require(b.chunk_end()==b.chunk_begin()+1U && actual.producer==ArithmeticProducer::serial_row,
             "MTP target serial ticket is not one actual serial row");
-        history=prepare_serial_row_lineage(previous.arithmetic_lineage,b.source_position(),next.execution_identity,
+        const auto producer=b.producer_execution_identity();
+        require(producer==next.execution_identity || (!same_executor && a.admits_executor_change(b)),
+            "MTP target serial ticket producer differs from its session executor");
+        history=prepare_serial_row_lineage(previous.arithmetic_lineage,b.source_position(),producer,
             actual.reduction_plan_identity);
     }
     require(arithmetic_lineage_matches(history,next.arithmetic_lineage,next.next_position),
@@ -363,7 +372,7 @@ struct HipMtpRuntime::Impl {
                 hyper(c,MtpHyperRole::head,stream);
                 draft->launch(hidden,k,stream);
                 if(min_probability>0.0F && k+1U<requested) {
-                    check(hipStreamSynchronize(static_cast<hipStream_t>(stream)),"MTP draft early-stop step");
+                    draft->wait_step(k,stream);
                     if(draft->probability(k)<min_probability) {depth=k+1U;break;}
                     if(keep_drafting) {
                         probabilities.resize(k+1U);for(std::uint32_t j=0;j<=k;++j) probabilities[j]=draft->probability(j);
@@ -374,6 +383,12 @@ struct HipMtpRuntime::Impl {
             owner->complete();
             auto tokens=draft->read(depth);
             probabilities.resize(depth);for(std::uint32_t k=0;k<depth;++k) probabilities[k]=draft->probability(k);
+            // STRIX_MTP_DRAFT_LOG=1: every proposal (chain start position, step, token, probability bits) on stderr.
+            static const bool log_drafts=std::getenv("STRIX_MTP_DRAFT_LOG")!=nullptr;
+            if(log_drafts) for(std::uint32_t k=0;k<depth;++k) {
+                std::uint32_t bits=0;std::memcpy(&bits,&probabilities[k],sizeof(bits));
+                std::fprintf(stderr,"draft at=%llu k=%u token=%u p=%08x\n",static_cast<unsigned long long>(next_source),k,tokens[k],bits);
+            }
             active=false;next_source+=depth;stats.full_forward_rows+=depth;validation.reset();
             // Row zero is the pending cycle input at base_source, as in read_greedy_token.
             first_cache_reusable=true;candidates=tokens;return tokens;

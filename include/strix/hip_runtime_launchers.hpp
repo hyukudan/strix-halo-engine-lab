@@ -61,6 +61,15 @@ void moe_combine_known_window_rows_preflight(std::span<const ExecutionDispatchCo
     const HipElementwiseLauncherConfig& config);
 void moe_combine_known_window_rows_launch(std::span<const ExecutionDispatchContext> rows,
     const HipElementwiseLauncherConfig& config);
+// Prefill: all T rows of an inject / MoE-combine step (8-row tiles one stride apart) in one launch.
+void inject_known_prefill_rows_preflight(std::span<const ExecutionDispatchContext> rows,
+    const HipElementwiseLauncherConfig& config);
+void inject_known_prefill_rows_launch(std::span<const ExecutionDispatchContext> rows,
+    const HipElementwiseLauncherConfig& config);
+void moe_combine_known_prefill_rows_preflight(std::span<const ExecutionDispatchContext> rows,
+    const HipElementwiseLauncherConfig& config);
+void moe_combine_known_prefill_rows_launch(std::span<const ExecutionDispatchContext> rows,
+    const HipElementwiseLauncherConfig& config);
 
 class HipElementwiseLauncherBundle {
 public:

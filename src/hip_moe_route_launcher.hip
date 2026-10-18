@@ -18,6 +18,7 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace strix {
 namespace {
@@ -35,7 +36,18 @@ struct RouterRowsArgs {
     float* workspace[kRouterMaxRows];
     std::uint32_t* indices[kRouterMaxRows];
     float* weights[kRouterMaxRows];
+    // Prefill tile strides (read only by RouterTileRowsArgs kernels).
+    std::uint64_t tile_hidden, tile_workspace, tile_indices, tile_weights;
 };
+// Prefill tiles: blockIdx.y selects the 8-row tile, each view shifted by its own stride.
+// Window kernels take RouterRowsArgs and compile without tile arithmetic.
+struct RouterTileRowsArgs : RouterRowsArgs {};
+template <typename Pointer> __device__ __forceinline__ Pointer route_tiled(Pointer pointer, std::uint64_t, const RouterRowsArgs&) {
+    return pointer;
+}
+template <typename Pointer> __device__ __forceinline__ Pointer route_tiled(Pointer pointer, std::uint64_t stride, const RouterTileRowsArgs&) {
+    return reinterpret_cast<Pointer>(reinterpret_cast<std::uintptr_t>(pointer) + static_cast<std::uint64_t>(blockIdx.y) * stride);
+}
 constexpr std::uint64_t kLauncherTag =
     0x4d4f45524f555432ULL;
 constexpr std::uint64_t fnv_offset =
@@ -1009,16 +1021,16 @@ __global__ void wave_parallel_moe_route_select_kernel(const float* workspace, st
         selected_indices + row * top_k, selected_weights + row * top_k);
 }
 enum class RouterSelect { sorted, ranked, wave };
-template <RouterSelect Mode>
-__global__ void rows_moe_route_select_kernel(RouterRowsArgs rows, std::uint32_t expert_count,
+template <RouterSelect Mode, class Args = RouterRowsArgs>
+__global__ void rows_moe_route_select_kernel(Args rows, std::uint32_t expert_count,
     std::uint32_t top_k, bool normalize_selected) {
     const auto r = blockIdx.x;
     if constexpr (Mode == RouterSelect::wave)
-        wave_parallel_moe_route_select_row(rows.workspace[r], expert_count, top_k, normalize_selected, rows.indices[r], rows.weights[r]);
+        wave_parallel_moe_route_select_row(route_tiled(rows.workspace[r], rows.tile_workspace, rows), expert_count, top_k, normalize_selected, route_tiled(rows.indices[r], rows.tile_indices, rows), route_tiled(rows.weights[r], rows.tile_weights, rows));
     else if constexpr (Mode == RouterSelect::ranked)
-        ranked_parallel_moe_route_select_row(rows.workspace[r], expert_count, top_k, normalize_selected, rows.indices[r], rows.weights[r]);
+        ranked_parallel_moe_route_select_row(route_tiled(rows.workspace[r], rows.tile_workspace, rows), expert_count, top_k, normalize_selected, route_tiled(rows.indices[r], rows.tile_indices, rows), route_tiled(rows.weights[r], rows.tile_weights, rows));
     else
-        parallel_moe_route_select_row(rows.workspace[r], expert_count, top_k, normalize_selected, rows.indices[r], rows.weights[r]);
+        parallel_moe_route_select_row(route_tiled(rows.workspace[r], rows.tile_workspace, rows), expert_count, top_k, normalize_selected, route_tiled(rows.indices[r], rows.tile_indices, rows), route_tiled(rows.weights[r], rows.tile_weights, rows));
 }
 
 // Window rows share each staged weight tile; lane (expert, row) keeps the
@@ -1080,8 +1092,8 @@ __global__ void __launch_bounds__(256) wave_rows_moe_route_logits_kernel(RouterR
 // left 32 - Rows lanes idle and needed 8x more waves for the same chains.
 // Chunk = coefficients each lane has in flight per step: the 2048 chains of a 4-row window
 // are only 64 waves, so the stream is latency bound and a longer step overlaps more of it.
-template <typename Activation, std::uint32_t Rows, std::uint32_t Chunk = kWaveRowsChunk>
-__global__ void __launch_bounds__(256) lanes_rows_moe_route_logits_kernel(RouterRowsArgs rows,
+template <typename Activation, std::uint32_t Rows, std::uint32_t Chunk = kWaveRowsChunk, class Args = RouterRowsArgs>
+__global__ void __launch_bounds__(256) lanes_rows_moe_route_logits_kernel(Args rows,
     const float* __restrict__ weights, std::uint32_t hidden_size, std::uint32_t expert_count) {
     static_assert(Rows == 2U || Rows == 4U || Rows == 8U);
     constexpr std::uint32_t per_vector = 16U / sizeof(Activation);
@@ -1092,7 +1104,7 @@ __global__ void __launch_bounds__(256) lanes_rows_moe_route_logits_kernel(Router
     const auto row = lane % Rows;
     if (expert >= expert_count) return;
     const auto* __restrict__ coefficients = reinterpret_cast<const float4*>(weights + static_cast<std::uint64_t>(expert) * hidden_size);
-    const auto* hidden = static_cast<const Activation*>(rows.hidden[row]);
+    const auto* hidden = static_cast<const Activation*>(route_tiled(rows.hidden[row], rows.tile_hidden, rows));
     float sum = 0.0F;
     for (std::uint32_t feature = 0; feature < hidden_size; feature += Chunk) {
         float4 coefficient[Chunk / 4U];
@@ -1119,7 +1131,164 @@ __global__ void __launch_bounds__(256) lanes_rows_moe_route_logits_kernel(Router
             sum = __builtin_fmaf(input[4U * q + 3U], c.w, sum);
         }
     }
-    rows.workspace[row][expert] = sum;
+    route_tiled(rows.workspace[row], rows.tile_workspace, rows)[expert] = sum;
+}
+// Staged form of lanes_rows_moe_route_logits_kernel (Chunk 128) for Steps x 128 features: the first Rows / 2
+// waves of a block (one for a single row) run the same lane (expert, row) chains for its 16 experts (fused,
+// ascending from feature zero, the same float4 order; for one row also the order of router_dot_ascending in
+// parallel_moe_route_logits_kernel), but read the coefficients from LDS; the Loaders waves after them stream the
+// block's coefficients chunk by chunk, depth chunks ahead in registers, into a two-slot LDS ring. The lanes form
+// keeps only one chunk per chain in flight, 512 x 512 B for the whole router, so every chunk waited a
+// DRAM round trip; here 64 KB per block (8 chunks of its 16 experts) are in flight.
+// The ring barrier orders LDS only: __syncthreads() would also wait for the loaders' outstanding loads.
+__device__ __forceinline__ void router_lds_barrier() {
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
+    __builtin_amdgcn_s_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
+}
+template <std::uint32_t Rows> constexpr std::uint32_t staged_router_chain_waves() { return Rows >= 2U ? Rows / 2U : 1U; }
+template <typename Activation, std::uint32_t Rows, std::uint32_t Steps, std::uint32_t Loaders>
+__global__ void __launch_bounds__(32U * (staged_router_chain_waves<Rows>() + Loaders)) staged_rows_moe_route_logits_kernel(
+    RouterRowsArgs rows, const float* __restrict__ weights, std::uint32_t expert_count) {
+    static_assert(Rows == 1U || Rows == 2U || Rows == 4U || Rows == 8U);
+    constexpr std::uint32_t chunk = 128U, hidden_size = Steps * chunk, experts = 16U, vectors = chunk / 4U;
+    constexpr std::uint32_t chains = staged_router_chain_waves<Rows>();
+    // 16 float4 of ring per loader thread (a deeper ring, 32, measured slower).
+    constexpr std::uint32_t per_loader = experts * vectors / (32U * Loaders), depth = 16U / per_loader, pitch = vectors + 1U;
+    static_assert(per_loader * 32U * Loaders == experts * vectors && depth * per_loader == 16U);
+    constexpr std::uint32_t per_vector = 16U / sizeof(Activation);
+    __shared__ float4 stage[2][experts * pitch];
+    const auto wave = threadIdx.x / 32U, lane = threadIdx.x % 32U;
+    const auto first_expert = static_cast<std::uint32_t>(blockIdx.x) * experts;
+    if (wave < chains) {
+        // One row: lanes 16-31 run a copy of lane 15's chain and store nothing.
+        const auto chain = (wave * 32U + lane) / Rows, local = chain < experts ? chain : experts - 1U;
+        const auto row = lane % Rows, expert = first_expert + local;
+        const auto* hidden = static_cast<const Activation*>(rows.hidden[row]);
+        float sum = 0.0F;
+        // The next chunk's activations are requested before this chunk's FMAs (L2 round trip per chunk).
+        constexpr std::uint32_t packs = chunk / per_vector;
+        uint4 next[packs];
+#pragma unroll
+        for (std::uint32_t v = 0; v < packs; ++v) next[v] = *reinterpret_cast<const uint4*>(hidden + v * per_vector);
+#pragma unroll 1
+        for (std::uint32_t step = 0; step < Steps; ++step) {
+            uint4 raw[packs];
+#pragma unroll
+            for (std::uint32_t v = 0; v < packs; ++v) raw[v] = next[v];
+            if (step + 1U < Steps)
+#pragma unroll
+                for (std::uint32_t v = 0; v < packs; ++v)
+                    next[v] = *reinterpret_cast<const uint4*>(hidden + (step + 1U) * chunk + v * per_vector);
+            router_lds_barrier();
+            const float4* coefficients = stage[step % 2U] + local * pitch;
+            // Activations decoded at their FMA (no 128-float staging array: register budget), same values and order.
+            const auto activation = [&](std::uint32_t k) {
+                const auto& packed = raw[k / per_vector];
+                const std::uint32_t words[4] = {packed.x, packed.y, packed.z, packed.w};
+                const auto i = k % per_vector;
+                if constexpr (sizeof(Activation) == 2U)
+                    return bf16_to_float(static_cast<std::uint16_t>(i % 2U ? words[i / 2U] >> 16U : words[i / 2U] & 0xffffU));
+                else return __uint_as_float(words[i]);
+            };
+#pragma unroll
+            for (std::uint32_t q = 0; q < vectors; ++q) {
+                const auto c = coefficients[q];
+                sum = __builtin_fmaf(activation(4U * q + 0U), c.x, sum);
+                sum = __builtin_fmaf(activation(4U * q + 1U), c.y, sum);
+                sum = __builtin_fmaf(activation(4U * q + 2U), c.z, sum);
+                sum = __builtin_fmaf(activation(4U * q + 3U), c.w, sum);
+            }
+        }
+        if (chain < experts && expert < expert_count) rows.workspace[row][expert] = sum;
+    } else {
+        // Loader thread t copies vectors t + 32 Loaders p (p < per_loader) of every chunk: expert j / vectors, vector j % vectors.
+        const auto t = threadIdx.x - 32U * chains;
+        const float4* source[per_loader];
+        std::uint32_t slot[per_loader];
+#pragma unroll
+        for (std::uint32_t p = 0; p < per_loader; ++p) {
+            const auto j = t + 32U * Loaders * p, e = j / vectors, q = j % vectors;
+            const auto expert = first_expert + e < expert_count ? first_expert + e : expert_count - 1U;
+            source[p] = reinterpret_cast<const float4*>(weights + static_cast<std::uint64_t>(expert) * hidden_size) + q;
+            slot[p] = e * pitch + q;
+        }
+        float4 ring[depth][per_loader];
+#pragma unroll
+        for (std::uint32_t d = 0; d < depth; ++d)
+#pragma unroll
+            for (std::uint32_t p = 0; p < per_loader; ++p) if (d < Steps) ring[d][p] = source[p][d * vectors];
+        // The ring shifts by one chunk per step (constant indices: an indexed ring would live in scratch).
+        for (std::uint32_t step = 0; step < Steps; ++step) {
+#pragma unroll
+            for (std::uint32_t p = 0; p < per_loader; ++p) stage[step % 2U][slot[p]] = ring[0][p];
+#pragma unroll
+            for (std::uint32_t d = 1; d < depth; ++d)
+#pragma unroll
+                for (std::uint32_t p = 0; p < per_loader; ++p) ring[d - 1U][p] = ring[d][p];
+            if (step + depth < Steps)
+#pragma unroll
+                for (std::uint32_t p = 0; p < per_loader; ++p) ring[depth - 1U][p] = source[p][(step + depth) * vectors];
+            router_lds_barrier();
+        }
+    }
+}
+// Prefill tiles: lanes_rows_moe_route_logits_kernel's lane (expert, row) chains for Tiles 8-row tiles
+// at once (blockIdx.y covers Tiles tiles). Each coefficient chunk is loaded once and used by the
+// lane's Tiles chains, each chain the same fused ascending FMA sequence over its own row.
+template <typename Activation, std::uint32_t Tiles, std::uint32_t Chunk>
+__global__ void __launch_bounds__(256) lanes_tiles_moe_route_logits_kernel(RouterTileRowsArgs rows,
+    const float* __restrict__ weights, std::uint32_t hidden_size, std::uint32_t expert_count, std::uint32_t tiles) {
+    constexpr std::uint32_t Rows = 8U, per_vector = 16U / sizeof(Activation), experts_per_wave = 32U / Rows;
+    const auto lane = static_cast<std::uint32_t>(threadIdx.x % 32U);
+    const auto wave = static_cast<std::uint32_t>(blockIdx.x) * 8U + static_cast<std::uint32_t>(threadIdx.x / 32U);
+    const auto expert = wave * experts_per_wave + lane / Rows;
+    const auto row = lane % Rows;
+    if (expert >= expert_count) return;
+    const auto first_tile = static_cast<std::uint32_t>(blockIdx.y) * Tiles;
+    const auto* __restrict__ coefficients = reinterpret_cast<const float4*>(weights + static_cast<std::uint64_t>(expert) * hidden_size);
+    const Activation* hidden[Tiles];
+    float sum[Tiles];
+#pragma unroll
+    for (std::uint32_t t = 0; t < Tiles; ++t) {
+        const auto tile = first_tile + t < tiles ? first_tile + t : first_tile;
+        hidden[t] = reinterpret_cast<const Activation*>(reinterpret_cast<std::uintptr_t>(rows.hidden[row]) +
+            static_cast<std::uint64_t>(tile) * rows.tile_hidden);
+        sum[t] = 0.0F;
+    }
+    for (std::uint32_t feature = 0; feature < hidden_size; feature += Chunk) {
+        float4 coefficient[Chunk / 4U];
+#pragma unroll
+        for (std::uint32_t q = 0; q < Chunk / 4U; ++q) coefficient[q] = coefficients[(feature >> 2U) + q];
+#pragma unroll
+        for (std::uint32_t t = 0; t < Tiles; ++t) {
+            float input[Chunk];
+#pragma unroll
+            for (std::uint32_t v = 0; v < Chunk / per_vector; ++v) {
+                const auto packed = *reinterpret_cast<const uint4*>(hidden[t] + feature + v * per_vector);
+                const std::uint32_t words[4] = {packed.x, packed.y, packed.z, packed.w};
+#pragma unroll
+                for (std::uint32_t k = 0; k < per_vector; ++k) {
+                    if constexpr (sizeof(Activation) == 2U)
+                        input[v * per_vector + k] = bf16_to_float(static_cast<std::uint16_t>(k % 2U ? words[k / 2U] >> 16U : words[k / 2U] & 0xffffU));
+                    else input[v * per_vector + k] = __uint_as_float(words[k]);
+                }
+            }
+#pragma unroll
+            for (std::uint32_t q = 0; q < Chunk / 4U; ++q) {
+                const auto c = coefficient[q];
+                sum[t] = __builtin_fmaf(input[4U * q + 0U], c.x, sum[t]);
+                sum[t] = __builtin_fmaf(input[4U * q + 1U], c.y, sum[t]);
+                sum[t] = __builtin_fmaf(input[4U * q + 2U], c.z, sum[t]);
+                sum[t] = __builtin_fmaf(input[4U * q + 3U], c.w, sum[t]);
+            }
+        }
+    }
+#pragma unroll
+    for (std::uint32_t t = 0; t < Tiles; ++t)
+        if (first_tile + t < tiles)
+            reinterpret_cast<float*>(reinterpret_cast<std::uintptr_t>(rows.workspace[row]) +
+                static_cast<std::uint64_t>(first_tile + t) * rows.tile_workspace)[expert] = sum[t];
 }
 template <typename Activation, RouterWeightKind WeightKind, std::uint32_t Rows>
 __global__ void __launch_bounds__(256) rows_moe_route_logits_kernel(RouterRowsArgs rows, const void* weights,
@@ -1677,7 +1846,17 @@ void launch_router_rows_typed(const PreparedRouterRows& p, const HipMoeRouteLaun
             const auto n = v ? static_cast<std::uint32_t>(std::atoi(v)) : 128U;
             return n == 64U || n == 256U ? n : 128U;
         }();
+        // STRIX_ROUTER_STAGED=0: the lanes form below for the 2560-wide router as well (same chains).
+        static const bool staged = [] { const char* v = std::getenv("STRIX_ROUTER_STAGED"); return !v || v[0] != '0'; }();
         const auto lanes = [&]<std::uint32_t R>() {
+            if (staged && config.hidden_size == 20U * 128U) {
+                // 16 experts per block: R / 2 chain waves and 8 loader waves keeping 8 chunks in flight.
+                constexpr std::uint32_t experts = 16U, loaders = 8U;
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(staged_rows_moe_route_logits_kernel<Activation, R, 20U, loaders>),
+                    dim3((config.expert_count + experts - 1U) / experts), dim3(32U * (staged_router_chain_waves<R>() + loaders)),
+                    0, stream, p.args, f32, config.expert_count);
+                return;
+            }
             if (chunk == 256U && config.hidden_size % 256U == 0U)
                 hipLaunchKernelGGL(HIP_KERNEL_NAME(lanes_rows_moe_route_logits_kernel<Activation, R, 256U>),
                     blocks(R), dim3(256U), 0, stream, p.args, f32, config.hidden_size, config.expert_count);
@@ -1735,6 +1914,117 @@ void moe_route_known_window_rows_launch(std::span<const ExecutionDispatchContext
     const auto prepared = prepare_router_rows(rows, config);
     if (config.activation == HipActivationStorage::bf16) launch_router_rows_by_weight<std::uint16_t>(prepared, config);
     else launch_router_rows_by_weight<float>(prepared, config);
+}
+
+namespace {
+// All T rows of a router step: every 8-row tile is admitted like a window call and the tiles
+// must be one stride apart in each view. The f32 lanes logits and the wave top-k run all tiles
+// in one launch (the 5 MB router matrix is read from DRAM once per step instead of once per
+// tile); other router forms launch tile by tile.
+void route_prefill(std::span<const ExecutionDispatchContext> rows, const HipMoeRouteLauncherConfig& config, bool launch) {
+    if (rows.size() < 16U || rows.size() % 8U) throw std::invalid_argument("router prefill rows require 8-row tiles");
+    const auto tiles = static_cast<std::uint32_t>(rows.size() / 8U);
+    if (tiles > 65535U) throw std::invalid_argument("router prefill rows exceed the grid");
+    const auto first = prepare_router_rows(rows.first(8U), config);
+    const auto second = prepare_router_rows(rows.subspan(8U, 8U), config);
+    const auto at = [](const auto* pointer) { return reinterpret_cast<std::uintptr_t>(pointer); };
+    const auto stride = [&](const auto* a, const auto* b) -> std::uint64_t {
+        if (at(b) <= at(a) || (at(b) - at(a)) % 16U) throw std::invalid_argument("router prefill tiles are not strided");
+        return at(b) - at(a);
+    };
+    RouterTileRowsArgs args;
+    static_cast<RouterRowsArgs&>(args) = first.args;
+    args.tile_hidden = stride(first.args.hidden[0], second.args.hidden[0]);
+    args.tile_workspace = stride(first.args.workspace[0], second.args.workspace[0]);
+    args.tile_indices = stride(first.args.indices[0], second.args.indices[0]);
+    args.tile_weights = stride(first.args.weights[0], second.args.weights[0]);
+    bool together = first.kind == RouterWeightKind::f32 && first.wave_logits && config.wave_topk &&
+        config.hidden_size % 128U == 0U;
+    // Every tile is admitted (and the batched form decided) before anything is launched.
+    std::vector<PreparedRouterRows> prepared{first};
+    prepared.reserve(tiles);
+    for (std::uint32_t t = 1; t < tiles; ++t) {
+        prepared.push_back(t < 2U ? second : prepare_router_rows(rows.subspan(t * 8U, 8U), config));
+        const auto& tile = prepared.back();
+        together = together && tile.wave_logits;
+        const auto offset = static_cast<std::uint64_t>(t);
+        for (std::uint32_t r = 0; r < 8U; ++r)
+            if (at(tile.args.hidden[r]) != at(first.args.hidden[r]) + offset * args.tile_hidden ||
+                at(tile.args.workspace[r]) != at(first.args.workspace[r]) + offset * args.tile_workspace ||
+                at(tile.args.indices[r]) != at(first.args.indices[r]) + offset * args.tile_indices ||
+                at(tile.args.weights[r]) != at(first.args.weights[r]) + offset * args.tile_weights)
+                throw std::invalid_argument("router prefill tile views are not strided");
+    }
+    // Inputs of every row vs outputs of every row (tiles run concurrently in the batched form).
+    const auto span = [&](const auto* const* views, std::uint64_t stride, std::uint64_t bytes) {
+        std::uintptr_t low = UINTPTR_MAX, high = 0;
+        for (std::uint32_t r = 0; r < 8U; ++r) {
+            low = std::min(low, at(views[r]));
+            high = std::max(high, at(views[r]) + (tiles - 1U) * stride + bytes);
+        }
+        return std::pair<std::uintptr_t, std::uintptr_t>{low, high};
+    };
+    const auto hidden_bytes = static_cast<std::uint64_t>(config.hidden_size) *
+        (config.activation == HipActivationStorage::bf16 ? 2U : 4U);
+    const auto in = span(first.args.hidden, args.tile_hidden, hidden_bytes);
+    for (const auto& out : {span(first.args.workspace, args.tile_workspace, config.expert_count * 4ULL),
+             span(first.args.indices, args.tile_indices, config.top_k * 4ULL),
+             span(first.args.weights, args.tile_weights, config.top_k * 4ULL)})
+        if (out.first < in.second && in.first < out.second) throw std::invalid_argument("router prefill outputs alias the input rows");
+    if (launch && !together)
+        for (const auto& tile : prepared) {
+            if (config.activation == HipActivationStorage::bf16) launch_router_rows_by_weight<std::uint16_t>(tile, config);
+            else launch_router_rows_by_weight<float>(tile, config);
+        }
+    if (!launch || !together) return;
+    const auto stream = hip_execution_stream();
+    const auto* f32 = reinterpret_cast<const float*>(first.tensor->address);
+    const dim3 logits((config.expert_count * 8U + 255U) / 256U, tiles);
+    // STRIX_ROUTER_PREFILL_TILES=1|2|4|8: 8-row tiles per lane sharing each coefficient load
+    // (1: the window kernel per tile). STRIX_ROUTER_PREFILL_CHUNK=32|64: coefficients in flight.
+    // Measured at T = 256: 359 us per call (one tile per lane, 128 in flight), 323 us (2 tiles, 64);
+    // 4 or 8 tiles and an LDS-staged 32 x 32 block were slower (latency, not bandwidth, bound).
+    static const unsigned tiles_per_lane = [] { const char* v = std::getenv("STRIX_ROUTER_PREFILL_TILES");
+        const unsigned n = v ? static_cast<unsigned>(std::atoi(v)) : 2U; return n == 1U || n == 4U || n == 8U ? n : 2U; }();
+    static const unsigned chunk = [] { const char* v = std::getenv("STRIX_ROUTER_PREFILL_CHUNK");
+        const unsigned n = v ? static_cast<unsigned>(std::atoi(v)) : 64U; return n == 32U ? 32U : 64U; }();
+    const bool hidden_aligned = config.hidden_size % 64U == 0U;
+    const auto tiled = [&]<typename Activation, unsigned T, unsigned C>() {
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(lanes_tiles_moe_route_logits_kernel<Activation, T, C>),
+            dim3((config.expert_count * 8U + 255U) / 256U, (tiles + T - 1U) / T), dim3(256U), 0, stream, args, f32,
+            config.hidden_size, config.expert_count, tiles);
+    };
+    const auto by_tiles = [&]<typename Activation>() {
+        const auto by_chunk = [&]<unsigned T>() {
+            if (chunk == 64U) tiled.template operator()<Activation, T, 64U>(); else tiled.template operator()<Activation, T, 32U>();
+        };
+        if (tiles_per_lane == 2U) by_chunk.template operator()<2U>();
+        else if (tiles_per_lane == 8U) by_chunk.template operator()<8U>();
+        else by_chunk.template operator()<4U>();
+    };
+    if (tiles_per_lane > 1U && hidden_aligned) {
+        if (config.activation == HipActivationStorage::bf16) by_tiles.template operator()<std::uint16_t>();
+        else by_tiles.template operator()<float>();
+    } else if (config.activation == HipActivationStorage::bf16)
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(lanes_rows_moe_route_logits_kernel<std::uint16_t, 8U, 128U, RouterTileRowsArgs>),
+            logits, dim3(256U), 0, stream, args, f32, config.hidden_size, config.expert_count);
+    else
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(lanes_rows_moe_route_logits_kernel<float, 8U, 128U, RouterTileRowsArgs>),
+            logits, dim3(256U), 0, stream, args, f32, config.hidden_size, config.expert_count);
+    check_hip(hipGetLastError(), "router prefill rows logits launch");
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_moe_route_select_kernel<RouterSelect::wave, RouterTileRowsArgs>),
+        dim3(8U, tiles), dim3(kThreads), 0, stream, args, config.expert_count, config.top_k, config.normalize_selected);
+    check_hip(hipGetLastError(), "router prefill rows selection launch");
+}
+}  // namespace
+
+void moe_route_known_prefill_rows_preflight(std::span<const ExecutionDispatchContext> rows,
+    const HipMoeRouteLauncherConfig& config) {
+    route_prefill(rows, config, false);
+}
+void moe_route_known_prefill_rows_launch(std::span<const ExecutionDispatchContext> rows,
+    const HipMoeRouteLauncherConfig& config) {
+    route_prefill(rows, config, true);
 }
 
 void register_hip_moe_route_kernel_variant(
@@ -1939,10 +2229,19 @@ void launch_hip_mtp_route(const MtpNativeContext& c,void* stream) {
     const auto e=static_cast<std::uint32_t>(c.model->num_experts);
     const auto k=static_cast<std::uint32_t>(c.model->num_experts_per_token);
     auto workspace=reinterpret_cast<float*>(c.resources->view(HipMtpBuffer::router_workspace).address);
+    const auto hidden0=c.resources->view(HipMtpBuffer::hidden0).address;
+    // The one-row staged chains (same bits as parallel_moe_route_logits_kernel); STRIX_ROUTER_STAGED=0: off.
+    static const bool staged=[]{const char* v=std::getenv("STRIX_ROUTER_STAGED");return !v||v[0]!='0';}();
+    if(staged && h==20U*128U && hidden0%16U==0U && c.tensors->router.runtime->address%16U==0U) {
+        RouterRowsArgs args{};args.hidden[0]=reinterpret_cast<const void*>(hidden0);args.workspace[0]=workspace;
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(staged_rows_moe_route_logits_kernel<std::uint16_t,1U,20U,8U>),dim3((e+15U)/16U),
+            dim3(32U*(staged_router_chain_waves<1U>()+8U)),0,reinterpret_cast<hipStream_t>(stream),args,
+            reinterpret_cast<const float*>(c.tensors->router.runtime->address),e);
+    } else
     hipLaunchKernelGGL(HIP_KERNEL_NAME(parallel_moe_route_logits_kernel<std::uint16_t,RouterWeightKind::f32>),
         dim3((e+kRouterExpertsPerBlock-1)/kRouterExpertsPerBlock),dim3(kRouterProjectionThreads),0,
         reinterpret_cast<hipStream_t>(stream),
-        reinterpret_cast<const std::uint16_t*>(c.resources->view(HipMtpBuffer::hidden0).address),
+        reinterpret_cast<const std::uint16_t*>(hidden0),
         reinterpret_cast<const void*>(c.tensors->router.runtime->address),h,e,workspace);
     check_hip(hipGetLastError(),"MTP native parallel route projection launch");
     hipLaunchKernelGGL(wave_parallel_moe_route_select_kernel,dim3(1),dim3(kThreads),0,

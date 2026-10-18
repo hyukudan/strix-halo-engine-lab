@@ -475,7 +475,10 @@ struct KnownRuntimeFixture {
         for (const auto flag : mock_state_flags) session.state.valid = session.state.valid | flag;
     }
     strix::KnownWindowExecutionHooks hooks() {
-        return {[] {}, [] {}, [] {}, [this] { ++quiesces; }, allowed_readers};
+        strix::KnownWindowExecutionHooks h;
+        h.preflight_plan = [] {}; h.preflight_scope = [] {}; h.complete = [] {};
+        h.quiesce_or_fail_stop = [this] { ++quiesces; }; h.position_reader_implementations = allowed_readers;
+        return h;
     }
     strix::KnownWindowResult run(strix::KnownWindowExecutionHooks callbacks) {
         const std::array<strix::KnownWindowR2Entry, 2> entries{{

@@ -9,6 +9,10 @@
 namespace strix {
 namespace {
 
+// Pair validated by the innermost ValidatedModelBindingScope of this thread.
+thread_local const ModelManifest* validated_manifest = nullptr;
+thread_local const ModelRuntimeBinding* validated_binding = nullptr;
+
 const ExecutionMemoryBinding& scratch_memory(
     const ExecutionDispatchContext& context) {
     if (context.resources != nullptr &&
@@ -150,6 +154,27 @@ ExecutionBufferAddress resolve_dispatch_temporary(
         context.temporaries[index]);
 }
 
+namespace {
+ExecutionBufferAddress resolve_dispatch_hinted(const ExecutionDispatchContext& context, PreparedBufferKind kind,
+    std::span<const ExecutionBufferUse> uses, std::size_t index, std::size_t& hint) {
+    if (context.arena == nullptr) throw std::invalid_argument("dispatch context has no arena plan");
+    if (index >= uses.size()) throw std::out_of_range("dispatch buffer index is out of range");
+    const auto& memory = scratch_memory(context);
+    if (context.prepared_arena_views) return context.prepared_arena_views->resolve(context, kind, index, memory);
+    return resolve_execution_buffer_hinted(memory.execution_identity, *context.arena, memory, uses[index], hint);
+}
+}  // namespace
+
+ExecutionBufferAddress resolve_dispatch_read_hinted(const ExecutionDispatchContext& context, std::size_t index, std::size_t& hint) {
+    return resolve_dispatch_hinted(context, PreparedBufferKind::read, context.reads, index, hint);
+}
+ExecutionBufferAddress resolve_dispatch_write_hinted(const ExecutionDispatchContext& context, std::size_t index, std::size_t& hint) {
+    return resolve_dispatch_hinted(context, PreparedBufferKind::write, context.writes, index, hint);
+}
+ExecutionBufferAddress resolve_dispatch_temporary_hinted(const ExecutionDispatchContext& context, std::size_t index, std::size_t& hint) {
+    return resolve_dispatch_hinted(context, PreparedBufferKind::temporary, context.temporaries, index, hint);
+}
+
 SessionStateAddress resolve_dispatch_state(
     const ExecutionDispatchContext& context,
     SessionStateComponent component) {
@@ -213,7 +238,7 @@ const RuntimeTensorBinding& resolve_dispatch_tensor(
         if(context.execution_identity!=scope.execution_identity() || !scope.contains_step(context.step_id) || !scope.requires_tensor(tensor_index))
             throw std::invalid_argument("dispatch tensor is outside the local stage scope");
         validate_stage_model_runtime_binding(scope,manifest,weights);
-    } else validate_model_runtime_binding(manifest, weights);
+    } else validate_model_runtime_binding_unless_scoped(manifest, weights);
 
     const auto* tensor =
         find_runtime_tensor_binding(
@@ -241,12 +266,33 @@ const RuntimeTensorBinding& resolve_dispatch_tensor(
         if(found==manifest.tensors.end()) throw std::invalid_argument("dispatch stage tensor name is absent");
         return resolve_dispatch_tensor(context,static_cast<std::uint32_t>(found-manifest.tensors.begin()));
     }
-    tensor=find_runtime_tensor_binding(manifest,weights,tensor_name);
+    validate_model_runtime_binding_unless_scoped(manifest, weights);
+    for (std::size_t index = 0; index < manifest.tensors.size() && !tensor; ++index)
+        if (manifest.tensors[index].name == tensor_name) tensor = &weights.tensors[index];
     if (tensor == nullptr) {
         throw std::invalid_argument(
             "dispatch tensor name is not present in manifest");
     }
     return *tensor;
+}
+
+ValidatedModelBindingScope::ValidatedModelBindingScope(
+    const ModelManifest& manifest, const ModelRuntimeBinding& binding)
+    : previous_manifest_(validated_manifest), previous_binding_(validated_binding) {
+    validate_model_runtime_binding(manifest, binding);
+    validated_manifest = &manifest;
+    validated_binding = &binding;
+}
+
+ValidatedModelBindingScope::~ValidatedModelBindingScope() {
+    validated_manifest = previous_manifest_;
+    validated_binding = previous_binding_;
+}
+
+void validate_model_runtime_binding_unless_scoped(
+    const ModelManifest& manifest, const ModelRuntimeBinding& binding) {
+    if (&manifest != validated_manifest || &binding != validated_binding)
+        validate_model_runtime_binding(manifest, binding);
 }
 
 }  // namespace strix

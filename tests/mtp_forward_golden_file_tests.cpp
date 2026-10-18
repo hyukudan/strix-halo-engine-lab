@@ -137,6 +137,33 @@ int main() {
                "self-generated marker is explicit and distinct");
         rejects([&] { (void)write_mtp_forward_golden_file(dumped,self,1024); },"writer refuses to overwrite an existing golden");
         std::error_code ignored; std::filesystem::remove(dumped,ignored);
+
+        // Version 2: the header appends the target prefill and decode profile identities.
+        expect(!golden.target_prefill_profile_identity && !golden.target_decode_profile_identity,
+               "a version-1 golden records no target profile pair");
+        auto v2=manual;
+        patch(v2,8,2,4); patch(v2,12,184,4); patch(v2,16,manual.size()+16U,8);
+        std::vector<std::byte> ids; put(ids,0x1111222233334444ULL,8); put(ids,0x5555666677778888ULL,8);
+        v2.insert(v2.begin()+168,ids.begin(),ids.end());
+        file.write(v2);
+        const auto paired=read_mtp_forward_golden_file(file.path,sha256_bytes(v2),v2.size());
+        expect(paired.target_prefill_profile_identity==0x1111222233334444ULL &&
+               paired.target_decode_profile_identity==0x5555666677778888ULL && paired.rows.size()==2 &&
+               paired.rows[1].next_hidden_bf16==golden.rows[1].next_hidden_bf16,
+               "version 2 preserves both target profile identities and every row");
+        expect(encode_mtp_forward_golden_file(paired,v2.size())==v2,"version 2 encoding matches independent literal bytes");
+        bytes=v2; patch(bytes,168,0,8); malformed(bytes,"version 2 with an unrecorded prefill identity rejected");
+        bytes=v2; patch(bytes,176,0,8); malformed(bytes,"version 2 with an unrecorded decode identity rejected");
+        bytes=v2; patch(bytes,8,1,4); malformed(bytes,"version 1 with the version-2 header length rejected");
+        bytes=v2; patch(bytes,12,168,4); malformed(bytes,"version 2 with the version-1 header length rejected");
+        auto half=paired; half.target_prefill_profile_identity=0;
+        rejects([&] { (void)encode_mtp_forward_golden_file(half,4096); },"encoder rejects a half-recorded target profile pair");
+        auto pair_self=self; pair_self.target_prefill_profile_identity=7; pair_self.target_decode_profile_identity=9;
+        const auto pin2=write_mtp_forward_golden_file(dumped,pair_self,4096);
+        const auto back2=read_mtp_forward_golden_file(dumped,pin2,4096);
+        expect(back2.target_prefill_profile_identity==7 && back2.target_decode_profile_identity==9 && pin2!=pin,
+               "writer->reader round trip of a version-2 golden keeps the pair and changes the file pin");
+        std::filesystem::remove(dumped,ignored);
         return failures?1:0;
     } catch(const std::exception& error) { std::cerr<<error.what()<<'\n'; return 1; }
 }

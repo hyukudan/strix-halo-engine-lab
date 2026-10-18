@@ -47,6 +47,11 @@ public:
     // (1/sum exp(l - max), finite rows only; 0 for a failed step). Same mapped
     // reply and completion rule as read(); never affects the selected token.
     [[nodiscard]] float probability(std::uint32_t step) const;
+    // Waits until step's selection is published in the mapped reply (its last kernel stores a
+    // completion count after the reply fields), polling instead of a stream synchronisation;
+    // falls back to synchronising `stream` (and reports its errors) if the count does not
+    // arrive. Equivalent to synchronising before reading probability(step).
+    void wait_step(std::uint32_t step,void* stream) const;
     [[nodiscard]] bool full() const noexcept;
     [[nodiscard]] HipMtpDraftHeadStats stats() const noexcept;
     // Device views for tests: compact logits [rows] and real ids [rows] (null in full mode).
@@ -54,6 +59,11 @@ public:
     [[nodiscard]] const std::uint32_t* ids() const noexcept;
     // Little-endian uint32 token ids; ids >= vocabulary are rejected.
     [[nodiscard]] static std::vector<std::uint32_t> read_token_file(const std::string& path,std::uint32_t vocabulary);
+    // "auto:DIR": DIR/core32k.bin plus the DIR/pack-<lang>16k.bin holding the most prompt tokens, when that is
+    // at least 2 tokens and 5 % of the prompt (otherwise the core alone). Any other spec is returned unchanged.
+    // `chosen` receives a short description of the selection.
+    [[nodiscard]] static std::string resolve_vocabulary_spec(const std::string& spec,
+        std::span<const std::uint32_t> prompt,std::uint32_t vocabulary,std::string& chosen);
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

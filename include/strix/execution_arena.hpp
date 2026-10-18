@@ -6,6 +6,8 @@
 
 #include <array>
 #include <cstdint>
+#include <memory>
+#include <span>
 #include <vector>
 
 namespace strix {
@@ -50,5 +52,36 @@ struct KnownWindowArena {
 [[nodiscard]] const ExecutionArenaAllocation* find_arena_allocation(
     const ExecutionArenaPlan& plan,
     ExecutionBufferUse use) noexcept;
+
+// Index of plans an owner keeps alive and unmodified for the index's lifetime (a compiled known
+// window's row views). Built once; used by the ArenaLookupScopes opened with it.
+class ArenaLookupIndex {
+public:
+    ArenaLookupIndex() = default;
+    explicit ArenaLookupIndex(std::span<const ExecutionArenaPlan* const> plans);
+
+private:
+    friend class ArenaLookupScope;
+    std::shared_ptr<const void> plans_;
+};
+
+// While one is alive, find_arena_allocation on this thread indexes each plan it is asked about once
+// (first allocation of every use, as the linear search returns) and answers later lookups of that
+// plan from the index. The owner must keep the plans it looks up alive and unmodified for the
+// scope's lifetime (one admitted prefill block's launch: about 2000 lookups per row).
+// Opened with a persistent index, plans of that index are answered from it without re-indexing
+// (a plan whose allocation storage or size no longer matches is searched linearly); other plans
+// are indexed per scope as above.
+class ArenaLookupScope {
+public:
+    ArenaLookupScope();
+    explicit ArenaLookupScope(const ArenaLookupIndex& persistent);
+    ~ArenaLookupScope();
+    ArenaLookupScope(const ArenaLookupScope&) = delete;
+    ArenaLookupScope& operator=(const ArenaLookupScope&) = delete;
+
+private:
+    void* previous_;
+};
 
 }  // namespace strix

@@ -7,6 +7,7 @@
 #include "strix/iq4_nl.hpp"
 #include "strix/ple_workspace.hpp"
 #include "strix/graph_ple.hpp"
+#include "hip_q8_rows_gemv.hpp"
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -14,6 +15,9 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdlib>
+#include <cstdio>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -21,6 +25,7 @@
 #include <optional>
 #include <span>
 #include <stdexcept>
+#include <thread>
 #include <type_traits>
 #include <vector>
 #include <string>
@@ -2008,9 +2013,36 @@ register_for_compiled_execution(
         "compiled execution has no PLE step");
 }
 
+// Prefill key / value projections of 64 strided rows through the wide q8_rows kernels, with the
+// arithmetic of project_wave8_q8_bf16_to_fp32_rows_kernel per row: coefficient scale * code, chain
+// acc += x * c over features 8L + l + 256k, shuffle-down lane tree then the leaf tree.
+__device__ __forceinline__ float ple_rows_tree_add(float lower, float upper) {
+    float result;
+    asm("v_add_f32 %0, %1, %2" : "=v"(result) : "v"(upper), "v"(lower));
+    return result;
+}
+template <unsigned Rows> struct PleRowsSite {
+    using Input = std::uint16_t;
+    static constexpr unsigned rows = Rows;
+    static constexpr bool fused_fma = true;  // Site::fma compiles to v_fmac_f32 (wide VOPD rows)
+    q8_rows::Segments segments;
+    std::uint32_t width, outputs, in_stride, out_stride;
+    const std::uint16_t* base;
+    float* out;
+    __device__ const std::uint16_t* row_input(unsigned r) const { return base + static_cast<std::uint64_t>(r) * in_stride; }
+    __device__ static float coefficient(unsigned scale, std::int8_t code) {
+        return __half2float(__ushort_as_half(static_cast<unsigned short>(scale))) * static_cast<float>(code);
+    }
+    __device__ static void fma(float& acc, float c, float x) { acc += x * c; }
+    __device__ static float add(float lower, float upper) { return ple_rows_tree_add(lower, upper); }
+    __device__ void store(std::uint32_t o, unsigned r, float value) const { out[static_cast<std::uint64_t>(r) * out_stride + o] = value; }
+};
+constexpr std::uint32_t kPleWideRows = 64U;
+
 struct HipPleKnownWindow::Impl {
     HipPleLauncherConfig config;
     std::uint32_t max_rows = 0, rows = 0, slot = 0;
+    bool prefill = false;
     std::uint64_t stride = 0, conv_bytes = 0;
     std::array<std::byte*, 2> staging{};
     std::array<hipEvent_t, 2> released{};
@@ -2027,13 +2059,35 @@ struct HipPleKnownWindow::Impl {
     }
     // Key and value projections of all rows, each Q8 weight block read once (the per-row
     // wave8 arithmetic). False when a projection is not wave8 Q8: rows project one by one.
-    bool project_rows(const PreparedPleLaunch& p, const std::uint16_t* gathered, std::uint32_t count) const {
+    // project_rows for kPleWideRows rows at once (prefill); false when the shapes or alignment do not fit.
+    bool project_rows_wide(const PreparedPleLaunch& p, const std::uint16_t* gathered, std::uint32_t first) const {
+        const auto width = static_cast<std::uint32_t>(config.model.ple_embed_dim);
+        if (weight_kind(p.tensors.key.manifest->ggml_type) != WeightKind::q8_0 ||
+            weight_kind(p.tensors.value.manifest->ggml_type) != WeightKind::q8_0 || width % 32U ||
+            (reinterpret_cast<std::uintptr_t>(gathered) | stride) % 16U) return false;
+        const auto expanded = static_cast<std::uint32_t>(p.expanded), hidden = static_cast<std::uint32_t>(config.model.hidden_size);
+        const auto project = [&](const void* weights, std::uint32_t outputs, float* out) {
+            PleRowsSite<kPleWideRows> site{};
+            site.segments = q8_rows::segments({{weights, outputs}});
+            site.width = width; site.outputs = outputs;
+            site.in_stride = static_cast<std::uint32_t>(stride / sizeof(std::uint16_t)); site.out_stride = outputs;
+            site.base = gathered; site.out = out;
+            q8_rows::launch(site, false, hip_execution_stream());
+        };
+        project(reinterpret_cast<const void*>(p.tensors.key.runtime->address), expanded, projections + static_cast<std::uint64_t>(first) * expanded);
+        project(reinterpret_cast<const void*>(p.tensors.value.runtime->address), hidden,
+            projections + static_cast<std::uint64_t>(max_rows) * expanded + static_cast<std::uint64_t>(first) * hidden);
+        check_hip(hipGetLastError(), "prefill PLE wide rows projection launch");
+        return true;
+    }
+    bool project_rows(const PreparedPleLaunch& p, const std::uint16_t* gathered, std::uint32_t count, std::uint32_t first = 0U) const {
         const auto width = static_cast<std::uint32_t>(config.model.ple_embed_dim);
         if (weight_kind(p.tensors.key.manifest->ggml_type) != WeightKind::q8_0 ||
             weight_kind(p.tensors.value.manifest->ggml_type) != WeightKind::q8_0 || width % 32U) return false;
         const auto expanded = static_cast<std::uint32_t>(p.expanded), hidden = static_cast<std::uint32_t>(config.model.hidden_size);
         const auto in_stride = static_cast<std::uint32_t>(stride / sizeof(std::uint16_t));
-        float* keys = projections; float* values = projections + static_cast<std::uint64_t>(max_rows) * expanded;
+        float* keys = projections + static_cast<std::uint64_t>(first) * expanded;
+        float* values = projections + static_cast<std::uint64_t>(max_rows) * expanded + static_cast<std::uint64_t>(first) * hidden;
         const auto launch = [&](auto rows) {
             constexpr unsigned R = decltype(rows)::value;
             hipLaunchKernelGGL(HIP_KERNEL_NAME(project_wave8_q8_bf16_to_fp32_rows_kernel<R>), dim3((expanded + 7U) / 8U), dim3(256), 0,
@@ -2075,8 +2129,38 @@ struct HipPleKnownWindow::Impl {
             throw std::invalid_argument("known-window PLE requires a host lookup backend");
         std::vector<PreparedPleLaunch> out;
         out.reserve(spans.size());
+        // Window rows hold per-row copies of one resource set (only the scratch binding differs, and
+        // each row resolves its own arena views below): the same sources resolve the same tensors.
+        const auto same_sources = [](const ExecutionRuntimeResources* a, const ExecutionRuntimeResources* b) {
+            return a == b || (a && b && a->model_manifest == b->model_manifest && a->model_weights == b->model_weights &&
+                a->tensor_access == b->tensor_access && a->session_state_layout == b->session_state_layout &&
+                a->session_state_memory == b->session_state_memory && a->ple_lookup == b->ple_lookup &&
+                a->ple_hash_contract == b->ple_hash_contract && a->distributed_stage == b->distributed_stage);
+        };
         for (std::size_t r = 0; r < spans.size(); ++r) {
-            out.push_back(prepare_ple_launch(spans[r], &config));
+            const bool shared = r > 0U && (prefill || (same_sources(spans[r].resources, spans[0].resources) &&
+                spans[r].prepared_tensor_views == spans[0].prepared_tensor_views));
+            if (shared) {
+                // Rows of one step share config, tensors, layout, hash contract and session state with
+                // row 0 (checked below); only the row's own arena views differ, resolved and size-checked here.
+                const auto& row = spans[r];
+                const auto& head = spans[0];
+                if (row.op != head.op || row.step_id != head.step_id || row.layer != head.layer ||
+                    row.kernel_id != head.kernel_id || row.execution_identity != head.execution_identity ||
+                    !same_sources(row.resources, head.resources) || row.logical_rows != 1U || row.request_concurrency != 1U ||
+                    row.reads.size() != 1U || row.writes.size() != 1U || row.temporaries.size() != 1U)
+                    throw std::invalid_argument("prefill PLE rows differ from their first row");
+                auto copy = out.front();
+                copy.input = resolve_dispatch_read(row, 0);
+                copy.output = resolve_dispatch_write(row, 0);
+                copy.temporary = resolve_dispatch_temporary(row, 0);
+                copy.ngram_state = resolve_dispatch_state(row, SessionStateComponent::ngram_history);
+                copy.conv_state = resolve_dispatch_state(row, SessionStateComponent::ple_convolution);
+                if (copy.input.bytes < out.front().input.bytes || copy.output.bytes < out.front().output.bytes ||
+                    copy.temporary.bytes < out.front().temporary.bytes)
+                    throw std::invalid_argument("prefill PLE row buffers are undersized");
+                out.push_back(copy);
+            } else out.push_back(prepare_ple_launch(spans[r], &config));
             const auto& a = out.front(); const auto& b = out.back();
             if (spans[r].position != spans[0].position + r || b.conv_state.address != a.conv_state.address ||
                 b.conv_state.bytes != a.conv_state.bytes || b.ngram_state.address != a.ngram_state.address ||
@@ -2090,10 +2174,13 @@ struct HipPleKnownWindow::Impl {
     }
 };
 
-HipPleKnownWindow::HipPleKnownWindow(const ModelContract& model, HipActivationStorage activation, std::uint32_t max_rows)
+HipPleKnownWindow::HipPleKnownWindow(const ModelContract& model, HipActivationStorage activation, std::uint32_t max_rows,
+    bool prefill)
     : impl_(std::make_unique<Impl>()) {
     auto& w = *impl_;
-    if (!max_rows || max_rows > 8U) throw std::invalid_argument("known-window PLE supports one to eight rows");
+    if (!max_rows || max_rows > (prefill ? 2048U : 8U))
+        throw std::invalid_argument("known-window PLE supports one to eight rows (prefill: up to 2048)");
+    w.prefill = prefill;
     w.config.model = model; w.config.activation = activation; validate_config(w.config);
     w.max_rows = max_rows;
     w.stride = PleHashContract::maximum_heads * 512ULL;
@@ -2106,7 +2193,7 @@ HipPleKnownWindow::HipPleKnownWindow(const ModelContract& model, HipActivationSt
         check_hip(hipEventCreateWithFlags(&w.released[i], hipEventDisableTiming), "known-window PLE staging event");
     }
     void* snap = nullptr;
-    check_hip(hipMalloc(&snap, w.conv_bytes * max_rows), "known-window PLE convolution snapshots");
+    check_hip(hipMalloc(&snap, w.conv_bytes * (prefill ? 1U : max_rows)), "known-window PLE convolution snapshots");
     w.snapshots = static_cast<std::byte*>(snap);
     void* projections = nullptr;
     check_hip(hipMalloc(&projections, sizeof(float) * max_rows * model.hidden_size * (model.hc_count + 1ULL)),
@@ -2123,7 +2210,17 @@ void HipPleKnownWindow::preflight(std::span<const ExecutionDispatchContext> rows
 
 void HipPleKnownWindow::launch(std::span<const ExecutionDispatchContext> rows) {
     auto& w = *impl_;
+    static const bool timing = [] { const char* v = std::getenv("STRIX_PREFILL_TIMING"); return v && v[0] == '1'; }();
+    auto mark = std::chrono::steady_clock::now();
+    const auto lap = [&](const char* name) {
+        if (!timing || !w.prefill) return;
+        const auto now = std::chrono::steady_clock::now();
+        std::fprintf(stderr, "prefill ple %-8s %8.2f ms\n", name, std::chrono::duration<double, std::milli>(now - mark).count());
+        mark = now;
+    };
     const auto prepared = w.prepare(rows);
+    lap("prepare");
+    const auto prepared_at = std::chrono::steady_clock::now();
     const auto& contract = prepared[0].hash_contract;
     auto& backend = *rows[0].resources->ple_lookup;
     auto* prefetch = rows[0].resources->ple_prefetch;
@@ -2138,10 +2235,22 @@ void HipPleKnownWindow::launch(std::span<const ExecutionDispatchContext> rows) {
     // The slot was last read by the window before the previous one.
     if (w.recorded[w.slot]) check_hip(hipEventSynchronize(w.released[w.slot]), "known-window PLE staging reuse");
     auto* staging = w.staging[w.slot];
+    // Prefill blocks on the file-mapped backend: the n-gram hashes chain row to row, but each row's
+    // gather (IQ4_NL decode to BF16) is independent, so the rows are hashed in order on this thread and
+    // gathered by up to 8 threads, each with its own stateless file-mapped backend.
+    static const std::uint64_t mapped_identity = FileMappedPleLookupBackend{}.implementation_identity();
+    const bool parallel = w.prefill && rows.size() >= 32U && backend.implementation_identity() == mapped_identity;
+    std::vector<std::size_t> deferred;
     for (std::size_t r = 0; r < rows.size(); ++r) {
         auto* destination = staging + r * w.stride;
         PleHashResult hash;
-        if (r == 0 && prefetch && prefetch->active) {
+        if (parallel && !(r == 0 && prefetch && prefetch->active)) {
+            hash = hash_ple_token(contract, rows[r].input_token_id,
+                std::span<const std::uint32_t>(previous.data(), context_count));
+            if (static_cast<std::uint64_t>(hash.row_count) * contract.row_bytes > w.stride)
+                throw std::overflow_error("PLE lookup exceeds window staging");
+            deferred.push_back(r);
+        } else if (r == 0 && prefetch && prefetch->active) {
             if (prefetch->lookup_bytes > w.stride) throw std::overflow_error("PLE prefetched lookup exceeds window staging");
             hash = finish_ple_lookup_prefetch(rows[0].input_token_id, rows[0].position, backend, *prefetch,
                 std::span<std::byte>(destination, static_cast<std::size_t>(prefetch->lookup_bytes)));
@@ -2167,10 +2276,88 @@ void HipPleKnownWindow::launch(std::span<const ExecutionDispatchContext> rows) {
         std::copy_n(hash.next_context.begin(), context_count, previous.begin());
         w.hashes[r] = hash;
     }
+    lap("hash");
+    if (!deferred.empty()) {
+        const auto workers = static_cast<std::size_t>(std::min(8U, std::max(1U, std::thread::hardware_concurrency())));
+        std::vector<std::exception_ptr> errors(workers);
+        const auto gather = [&](std::size_t worker) {
+            try {
+                FileMappedPleLookupBackend local;
+                for (std::size_t i = worker; i < deferred.size(); i += workers) {
+                    const auto r = deferred[i];
+                    const auto& hash = w.hashes[r];
+                    PleLookupRequest lookup;
+                    lookup.row_ids = std::span<const std::uint64_t>(hash.row_ids.data(), hash.row_count);
+                    lookup.row_bytes = contract.row_bytes;
+                    lookup.table_manifest = prepared[r].tensors.table.manifest;
+                    lookup.table_runtime = prepared[r].tensors.table.runtime;
+                    const auto handle = local.start(lookup);
+                    try {
+                        local.finish(handle, std::span<std::byte>(staging + r * w.stride,
+                            static_cast<std::size_t>(static_cast<std::uint64_t>(hash.row_count) * contract.row_bytes)));
+                    } catch (...) { local.cancel(handle); throw; }
+                }
+            } catch (...) { errors[worker] = std::current_exception(); }
+        };
+        std::vector<std::thread> threads;
+        threads.reserve(workers - 1U);
+        for (std::size_t t = 1; t < workers; ++t) threads.emplace_back(gather, t);
+        gather(0);
+        for (auto& thread : threads) thread.join();
+        for (const auto& error : errors) if (error) std::rethrow_exception(error);
+    }
+    lap("gather");
+    if (!w.prefill) {
+        // STRIX_CYCLE_TIMING=1: host time of a window's PLE prepare + hash + gather, printed at exit.
+        struct Totals { double ms = 0, prep = 0; unsigned long long n = 0; bool on = std::getenv("STRIX_CYCLE_TIMING") != nullptr;
+            ~Totals() { if (on && n) std::fprintf(stderr, "window PLE host prepare+gather: %llu x %.4f ms (prepare %.4f ms)\n", n,
+                ms / static_cast<double>(n), prep / static_cast<double>(n)); } };
+        static Totals totals;
+        if (totals.on) {
+            totals.ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - mark).count();
+            totals.prep += std::chrono::duration<double, std::milli>(prepared_at - mark).count(); ++totals.n;
+        }
+    }
     void* device = nullptr;
     check_hip(hipHostGetDevicePointer(&device, staging, 0), "known-window PLE staging device view");
     const auto stream = hip_execution_stream();
-    const bool projected = w.project_rows(prepared[0], static_cast<const std::uint16_t*>(device), static_cast<std::uint32_t>(rows.size()));
+    bool projected = true;
+    if (w.prefill) {
+        // 64-row wide projections, then eight-row groups for the rest (the window path's arithmetic
+        // per row). STRIX_PREFILL_PLE_WIDE=0 keeps eight-row groups; STRIX_PREFILL_PLE_WIDE_CHECK=1
+        // also runs them over the wide rows and compares every projected value bitwise.
+        static const bool wide = [] { const char* v = std::getenv("STRIX_PREFILL_PLE_WIDE"); return !v || v[0] != '0'; }();
+        static const bool check = [] { const char* v = std::getenv("STRIX_PREFILL_PLE_WIDE_CHECK"); return v && v[0] == '1'; }();
+        const auto at = [&](std::uint32_t first) {
+            return reinterpret_cast<const std::uint16_t*>(static_cast<std::byte*>(device) + first * w.stride);
+        };
+        const auto total = static_cast<std::uint32_t>(rows.size());
+        std::uint32_t first = 0;
+        if (wide)
+            while (total - first >= kPleWideRows && w.project_rows_wide(prepared[first], at(first), first)) first += kPleWideRows;
+        if (check && first) {
+            const auto expanded = static_cast<std::uint64_t>(prepared[0].expanded), hidden = static_cast<std::uint64_t>(w.config.model.hidden_size);
+            const auto read = [&]() {
+                std::vector<float> keys(first * expanded), values(first * hidden);
+                check_hip(hipMemcpyAsync(keys.data(), w.projections, keys.size() * 4U, hipMemcpyDeviceToHost, stream), "PLE check keys");
+                check_hip(hipMemcpyAsync(values.data(), w.projections + w.max_rows * expanded, values.size() * 4U, hipMemcpyDeviceToHost, stream),
+                    "PLE check values");
+                check_hip(hipStreamSynchronize(stream), "PLE check synchronize");
+                return std::pair{keys, values};
+            };
+            const auto wide_values = read();
+            for (std::uint32_t r = 0; r < first; r += 8U) static_cast<void>(w.project_rows(prepared[r], at(r), 8U, r));
+            const auto rows_values = read();
+            std::size_t differ = 0;
+            for (std::size_t i = 0; i < wide_values.first.size(); ++i) differ += std::memcmp(&wide_values.first[i], &rows_values.first[i], 4U) != 0;
+            for (std::size_t i = 0; i < wide_values.second.size(); ++i) differ += std::memcmp(&wide_values.second[i], &rows_values.second[i], 4U) != 0;
+            std::fprintf(stderr, "PLE wide check: rows %u values %zu differ %zu\n", first, wide_values.first.size() + wide_values.second.size(), differ);
+        }
+        for (; first < total && projected; first += 8U) {
+            const auto count = std::min<std::uint32_t>(8U, total - first);
+            projected = w.project_rows(prepared[first], at(first), count, first);
+        }
+    } else projected = w.project_rows(prepared[0], static_cast<const std::uint16_t*>(device), static_cast<std::uint32_t>(rows.size()));
     const auto expanded = prepared[0].expanded, hidden = w.config.model.hidden_size;
     for (std::size_t r = 0; r < rows.size(); ++r) {
         auto* gathered = reinterpret_cast<std::uint16_t*>(static_cast<std::byte*>(device) + r * w.stride);
@@ -2178,6 +2365,7 @@ void HipPleKnownWindow::launch(std::span<const ExecutionDispatchContext> rows) {
             enqueue_ple_device(prepared[r], gathered, w.projections + r * expanded,
                 w.projections + w.max_rows * expanded + r * hidden);
         else enqueue_ple_device(prepared[r], gathered);
+        if (w.prefill) continue;
         check_hip(hipMemcpyAsync(w.snapshots + r * w.conv_bytes, reinterpret_cast<const void*>(prepared[r].conv_state.address),
             w.conv_bytes, hipMemcpyDeviceToDevice, stream), "known-window PLE convolution snapshot");
     }
@@ -2185,9 +2373,17 @@ void HipPleKnownWindow::launch(std::span<const ExecutionDispatchContext> rows) {
     w.recorded[w.slot] = true;
     w.rows = static_cast<std::uint32_t>(rows.size());
     w.conv_address = prepared[0].conv_state.address; w.ngram_address = prepared[0].ngram_state.address;
+    if (w.prefill) {
+        // Every prefill row is kept: the convolution state already is the last row's; publish its history.
+        const auto& hash = w.hashes[rows.size() - 1U];
+        std::memcpy(reinterpret_cast<void*>(w.ngram_address), hash.next_context.data(),
+            static_cast<std::size_t>(hash.context_count) * sizeof(std::uint32_t));
+        w.rows = 0;
+    }
 }
 
 void HipPleKnownWindow::commit(std::uint32_t n_keep, void* stream) {
+    if (impl_->prefill) throw std::logic_error("prefill PLE rows publish their history in launch()");
     auto& w = *impl_;
     if (!w.rows || !n_keep || n_keep > w.rows) throw std::invalid_argument("known-window PLE commit outside the last window");
     if (n_keep < w.rows)

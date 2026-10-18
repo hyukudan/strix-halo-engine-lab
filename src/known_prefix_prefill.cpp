@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <limits>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 #include <utility>
 
@@ -40,7 +41,11 @@ std::pair<std::uint64_t,std::uint64_t> identities(const CompiledKnownPrefixPrefi
     for(auto row:plan.logit_row_indices) hash(numerical,row);
     auto execution=numerical;hash(execution,plan.tile8.window_execution_identity);hash_arena(execution,plan.arena.physical);
     for(auto stride:plan.arena.row_stride) hash(execution,stride);
-    for(const auto& row:plan.arena.row_view) hash_arena(execution,row);
+    // Row r's view is row 0's plus r strides (validate_compiled_known_prefix_prefill checks every row before any
+    // block runs), so physical arena, strides, T and row 0 determine all T views. Hashing each of the T views
+    // byte-serially cost about 40 ms per evaluation at T = 1024 (three evaluations per prompt).
+    hash(execution,plan.arena.row_view.size());
+    if(!plan.arena.row_view.empty()) hash_arena(execution,plan.arena.row_view.front());
     require(execution&&numerical&&execution!=plan.tile8.window_execution_identity&&numerical!=plan.tile8.window_kernel_plan_identity,
         "known prefill identity is zero or collides with the closed window");return {execution,numerical};
 }
@@ -51,13 +56,20 @@ CompiledKnownPrefixPrefill compile_known_prefix_prefill(const ModelContract& mod
     require(request.workspace_budget_bytes&&request.host_metadata_payload_budget_bytes,"known prefill requires explicit workspace and host metadata budgets");
     validate_known_window_output_policy(request.output_policy);
     const auto payload=metadata_payload(request.logical_rows,serial.arena.allocations.size());
-    require(payload<=request.host_metadata_payload_budget_bytes,"known prefill host metadata payload exceeds its budget");
+    if(payload>request.host_metadata_payload_budget_bytes)
+        throw std::invalid_argument("known prefill host metadata payload exceeds its budget: T = "+std::to_string(request.logical_rows)+
+            " needs "+std::to_string(payload)+" bytes (--known-prefix-host-metadata-budget-bytes "+
+            std::to_string(request.host_metadata_payload_budget_bytes)+")");
     CompiledKnownPrefixPrefill plan;plan.logical_rows=request.logical_rows;plan.output_policy=request.output_policy;
     plan.workspace_budget_bytes=request.workspace_budget_bytes;plan.host_metadata_payload_budget_bytes=request.host_metadata_payload_budget_bytes;
     plan.host_metadata_payload_bytes=payload;
     KnownWindowRequest tile;tile.logical_rows=8;tile.r2_shared_expert=request.r2_shared_expert;
     tile.r2_gdn=request.r2_gdn;tile.r2_gdn_f32_gates=request.r2_gdn_f32_gates;tile.routed_expert_union=request.routed_expert_union;
     tile.router_rows=request.router_rows;tile.combine_inject_rows=request.combine_inject_rows;
+    tile.rows_hyper_mix=request.rows_hyper_mix;tile.qsa_rows=request.qsa_rows;tile.rows_ple=request.rows_ple;
+    require(!request.lm_head_rows||request.output_policy==KnownWindowOutputPolicy::all_rows,
+        "known prefill multi-row LM head requires the all-rows output policy");
+    tile.lm_head_rows=request.lm_head_rows;
     // Preserve complete tile admission even when this T request omits heads.
     plan.tile8=compile_known_prefix_window(model,serial,manifest,access,tile);
     require(known_window_has_promoted_steps(plan.tile8),"known prefill requires an actual admitted multi-row projection entry");
@@ -91,17 +103,22 @@ void validate_compiled_known_prefix_prefill(const CompiledKnownPrefixPrefill& pl
         plan.arena.physical.naive_nonaliased_bytes==multiply(tile.physical.naive_nonaliased_bytes/8U,plan.logical_rows)&&
         plan.arena.physical.allocations.size()==tile.physical.allocations.size()&&plan.arena.row_stride==tile.row_stride&&
         plan.arena.row_view.size()==plan.logical_rows,"known prefill physical arena or stripe differs");
-    for(std::size_t i=0;i<tile.physical.allocations.size();++i) {
+    const auto allocations=tile.physical.allocations.size();
+    require(!tile.row_view.empty()&&tile.row_view[0].allocations.size()==allocations,"known prefill selection row arena differs");
+    for(std::size_t i=0;i<allocations;++i) {
         const auto& old=tile.physical.allocations[i];const auto& actual=plan.arena.physical.allocations[i];
         require(old.offset%8U==0U&&actual.use==old.use&&actual.first_step==old.first_step&&actual.last_step==old.last_step&&
             actual.offset==multiply(old.offset/8U,plan.logical_rows)&&actual.bytes==multiply(tile.row_stride[i],plan.logical_rows),
             "known prefill physical allocation differs");
-        for(std::uint32_t row=0;row<plan.logical_rows;++row) {
-            const auto& view=plan.arena.row_view[row];
-            require(view.alignment==plan.arena.physical.alignment&&view.total_bytes==plan.arena.physical.total_bytes&&
-                view.naive_nonaliased_bytes==plan.arena.physical.naive_nonaliased_bytes&&view.allocations.size()==tile.physical.allocations.size(),
-                "known prefill row arena header differs");
-            const auto& a=view.allocations[i];
+    }
+    // Row-major walk (each row view is its own allocation vector): same checks as per allocation, sequential memory.
+    for(std::uint32_t row=0;row<plan.logical_rows;++row) {
+        const auto& view=plan.arena.row_view[row];
+        require(view.alignment==plan.arena.physical.alignment&&view.total_bytes==plan.arena.physical.total_bytes&&
+            view.naive_nonaliased_bytes==plan.arena.physical.naive_nonaliased_bytes&&view.allocations.size()==allocations,
+            "known prefill row arena header differs");
+        for(std::size_t i=0;i<allocations;++i) {
+            const auto& actual=plan.arena.physical.allocations[i];const auto& a=view.allocations[i];
             require(a.use==actual.use&&a.first_step==actual.first_step&&a.last_step==actual.last_step&&
                 a.offset==add(actual.offset,multiply(row,tile.row_stride[i]))&&a.bytes==tile.row_view[0].allocations[i].bytes,
                 "known prefill row arena differs");

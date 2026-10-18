@@ -3,6 +3,7 @@
 #error "A8 CSR gate/up requires strict floating-point semantics"
 #endif
 #include <hip/hip_fp16.h>
+#include <algorithm>
 #include <array>
 #include <cstdlib>
 #include <limits>
@@ -383,6 +384,645 @@ __global__ __launch_bounds__(256) void down_window(const unsigned char* weights,
         if(owner==0U)view.rawdots[csr.rows[begin+a]][csr.slots[begin+a]*hidden+row]=acc[a];
     }
 }
+template<class T> __device__ __forceinline__ T* at(StridedRows<T> v,unsigned r) {
+    return reinterpret_cast<T*>(reinterpret_cast<std::uintptr_t>(v.base)+static_cast<unsigned long long>(r)*v.stride);
+}
+// Prefill CSR over T*top_k assignments, one 1024-thread CTA: counting sort by
+// expert; assignment a=r*top_k+s goes to offsets[e]+#{a'<a with expert e}, so
+// each expert's rows (then slots) ascend. Batches are runs of at most `cap`
+// assignments of one expert. Runs after the prologue and folds every row
+// status into summary[0], so the projection kernels read one word.
+__global__ __launch_bounds__(1024) void build_prefill_csr(PrefillRows v,unsigned rows,unsigned experts,unsigned top_k,unsigned cap) {
+    const auto& csr=v.csr;
+    const unsigned t=threadIdx.x,count=rows*top_k;
+    __shared__ unsigned short expert_of[q51_known_rows::prefill_max_rows*10U];
+    __shared__ unsigned n_of[512],scan[3][512],hist[16],failure,status,duplicates,maximum;
+    if(t==0){failure=0U;status=0U;duplicates=0U;maximum=0U;}
+    if(t<16U)hist[t]=0U;
+    if(t<512U)n_of[t]=0U;
+    __syncthreads();
+    for(unsigned a=t;a<count;a+=1024U) {
+        const unsigned r=a/top_k,s=a%top_k,e=at(v.routes,r)[s];
+        if(e>=experts||!isfinite(at(v.route_weights,r)[s]))atomicOr(&failure,invalid_route);
+        expert_of[a]=static_cast<unsigned short>(e<experts?e:0U);
+    }
+    for(unsigned r=t;r<rows;r+=1024U){const unsigned s=*at(v.status,r);if(s)atomicOr(&status,s);}
+    __syncthreads();
+    if(failure){if(t<32U)csr.summary[t]=t==0U?failure|status:t==3U?count:t==6U?rows:t==7U?1U:0U;return;}
+    for(unsigned a=t;a<count;a+=1024U)atomicAdd(&n_of[expert_of[a]],1U);
+    __syncthreads();
+    const unsigned n=t<512U?n_of[t]:0U,nb=(n+cap-1U)/cap;
+    if(t<512U){scan[0][t]=n;scan[1][t]=n!=0U;scan[2][t]=nb;}
+    __syncthreads();
+    for(unsigned d=1U;d<512U;d<<=1U) {
+        unsigned x[3]={};
+        if(t>=d&&t<512U)for(unsigned k=0;k<3U;++k)x[k]=scan[k][t-d];
+        __syncthreads();
+        if(t>=d&&t<512U)for(unsigned k=0;k<3U;++k)scan[k][t]+=x[k];
+        __syncthreads();
+    }
+    if(t<experts) {
+        const unsigned off=scan[0][t]-n,touched=scan[1][t]-(n!=0U),batch=scan[2][t]-nb;
+        csr.offsets[t]=off;
+        if(t==experts-1U)csr.offsets[experts]=off+n;
+        if(n) {
+            csr.touched[touched]=t;atomicMax(&maximum,n);
+            for(unsigned b=0;b<nb;++b){csr.experts[batch+b]=t;csr.begins[batch+b]=off+b*cap;atomicAdd(&hist[8U+min(8U,min(cap,n-b*cap))-1U],1U);}
+            unsigned k=0U,unique=0U,last=UINT32_MAX;
+            for(unsigned a=0;a<count&&k<n;++a)if(expert_of[a]==t) {
+                const unsigned r=a/top_k;
+                csr.rows[off+k]=r;csr.slots[off+k]=a%top_k;++k;
+                unique+=r!=last;last=r;
+            }
+            atomicAdd(&hist[min(8U,unique)-1U],1U);atomicAdd(&duplicates,n-unique);
+        }
+    }
+    __syncthreads();
+    if(t==0U)csr.begins[scan[2][511]]=count;
+    if(t<32U)csr.summary[t]=t==0U?status:t==1U?scan[1][511]:t==2U?scan[2][511]:t==3U?count:t==4U?duplicates:t==5U?maximum:
+        t==6U?rows:t==7U?1U:t>=8U&&t<24U?hist[t-8U]:0U;
+}
+// build_prefill_csr with the same outputs (every array and summary word) in parallel: wave w
+// owns the assignments [w*S, (w+1)*S) and counts its experts (two 16-bit counters per word);
+// exclusive prefixes over the waves plus the expert offsets give each wave's first position per
+// expert; then each wave walks its range in order, 32 assignments at a time, ranking lanes of one
+// expert by lane order, so each expert's assignments ascend exactly as in the serial scan.
+__global__ __launch_bounds__(1024) void build_prefill_csr_waves(PrefillRows v,unsigned rows,unsigned experts,unsigned top_k,unsigned cap) {
+    constexpr unsigned Waves=32U;
+    const auto& csr=v.csr;
+    const unsigned t=threadIdx.x,lane=t&31U,wave=t/32U,count=rows*top_k,span=(count+Waves-1U)/Waves;
+    const unsigned first=wave*span,last=min(count,first+span);
+    __shared__ unsigned position[Waves][256],n_of[512],scan[3][512],hist[16],failure,status,duplicates,maximum;
+    if(t==0){failure=0U;status=0U;duplicates=0U;maximum=0U;}
+    if(t<16U)hist[t]=0U;
+    for(unsigned k=t;k<Waves*256U;k+=1024U)position[k/256U][k%256U]=0U;
+    __syncthreads();
+    const auto expert_at=[&](unsigned a){return at(v.routes,a/top_k)[a%top_k];};
+    for(unsigned a=first+lane;a<last;a+=32U) {
+        const unsigned e=expert_at(a);
+        if(e>=experts||!isfinite(at(v.route_weights,a/top_k)[a%top_k]))atomicOr(&failure,invalid_route);
+        else atomicAdd(&position[wave][e/2U],1U<<(16U*(e&1U)));
+    }
+    for(unsigned r=t;r<rows;r+=1024U){const unsigned s=*at(v.status,r);if(s)atomicOr(&status,s);}
+    __syncthreads();
+    if(failure){if(t<32U)csr.summary[t]=t==0U?failure|status:t==3U?count:t==6U?rows:t==7U?1U:0U;return;}
+    if(t<256U) {
+        unsigned run=0U;
+        for(unsigned w=0;w<Waves;++w){const unsigned c=position[w][t];position[w][t]=run;run+=c;}
+        n_of[2U*t]=run&65535U;n_of[2U*t+1U]=run>>16U;
+    }
+    __syncthreads();
+    const unsigned n=t<512U?n_of[t]:0U,nb=(n+cap-1U)/cap;
+    if(t<512U){scan[0][t]=n;scan[1][t]=n!=0U;scan[2][t]=nb;}
+    __syncthreads();
+    for(unsigned d=1U;d<512U;d<<=1U) {
+        unsigned x[3]={};
+        if(t>=d&&t<512U)for(unsigned k=0;k<3U;++k)x[k]=scan[k][t-d];
+        __syncthreads();
+        if(t>=d&&t<512U)for(unsigned k=0;k<3U;++k)scan[k][t]+=x[k];
+        __syncthreads();
+    }
+    if(t<256U) {
+        const unsigned base=(scan[0][2U*t]-n_of[2U*t])|(scan[0][2U*t+1U]-n_of[2U*t+1U])<<16U;
+        for(unsigned w=0;w<Waves;++w)position[w][t]+=base;
+    }
+    __syncthreads();
+    for(unsigned step=first;step<last;step+=32U) {
+        const unsigned a=step+lane;
+        const bool valid=a<last;
+        const unsigned e=valid?expert_at(a):0U;
+        unsigned active=static_cast<unsigned>(__ballot(valid)),peers=0U;
+        while(active) {
+            const unsigned leader_e=static_cast<unsigned>(__shfl(static_cast<int>(e),__ffs(active)-1,32));
+            const unsigned same=static_cast<unsigned>(__ballot(valid&&e==leader_e))&active;
+            if(valid&&e==leader_e)peers=same;
+            active&=~same;
+        }
+        if(valid) {
+            const unsigned slot=(position[wave][e/2U]>>(16U*(e&1U)))&65535U;
+            const unsigned at_pos=slot+static_cast<unsigned>(__popc(peers&((1U<<lane)-1U)));
+            csr.rows[at_pos]=a/top_k;csr.slots[at_pos]=a%top_k;
+            if((peers&((1U<<lane)-1U))==0U)atomicAdd(&position[wave][e/2U],static_cast<unsigned>(__popc(peers))<<(16U*(e&1U)));
+        }
+    }
+    __syncthreads();
+    if(t<experts) {
+        const unsigned off=scan[0][t]-n,touched=scan[1][t]-(n!=0U),batch=scan[2][t]-nb;
+        csr.offsets[t]=off;
+        if(t==experts-1U)csr.offsets[experts]=off+n;
+        if(n) {
+            csr.touched[touched]=t;atomicMax(&maximum,n);
+            for(unsigned b=0;b<nb;++b){csr.experts[batch+b]=t;csr.begins[batch+b]=off+b*cap;atomicAdd(&hist[8U+min(8U,min(cap,n-b*cap))-1U],1U);}
+            unsigned unique=0U,previous=UINT32_MAX;
+            for(unsigned k=0;k<n;++k){const unsigned r=csr.rows[off+k];unique+=r!=previous;previous=r;}
+            atomicAdd(&hist[min(8U,unique)-1U],1U);atomicAdd(&duplicates,n-unique);
+        }
+    }
+    __syncthreads();
+    if(t==0U)csr.begins[scan[2][511]]=count;
+    if(t<32U)csr.summary[t]=t==0U?status:t==1U?scan[1][511]:t==2U?scan[2][511]:t==3U?count:t==4U?duplicates:t==5U?maximum:
+        t==6U?rows:t==7U?1U:t>=8U&&t<24U?hist[t-8U]:0U;
+}
+// project_window over strided prefill rows: same per-(row,slot) lane arithmetic,
+// staging, chains and A8 down quantizer epilogue. Grid x = CSR batch (runs of one
+// expert are adjacent, so their weight slices hit L2), y = 32-output tile.
+template<unsigned G,bool Q5K,unsigned Chunk=max_hidden/256U>
+__global__ __launch_bounds__(256) void project_prefill(const unsigned char* gate,const unsigned char* up,PrefillRows view,
+    unsigned hidden,unsigned outputs) {
+    const auto& csr=view.csr;
+    if(csr.summary[0]||blockIdx.x>=csr.summary[2])return;
+    const unsigned tile_index=blockIdx.y;
+    const auto begin=csr.begins[blockIdx.x],count=csr.begins[blockIdx.x+1U]-begin,expert=csr.experts[blockIdx.x];
+    __shared__ __align__(16) signed char local_codes[G][max_hidden];
+    __shared__ __align__(16) float local_deltas[G][max_hidden/32U];
+    __shared__ __align__(16) int local_sums[G][max_hidden/32U];
+    __shared__ float tile[2][G][32];
+    const unsigned lane=threadIdx.x&31U,c=lane&7U,p=c/2U,h=c&1U,wave=threadIdx.x/32U;
+    const unsigned out=tile_index*32U+wave*4U+lane/8U,blocks=hidden/256U;
+    constexpr unsigned block_bytes=Q5K?176U:144U;
+    const auto offset=(static_cast<unsigned long long>(expert)*outputs+out)*blocks*block_bytes;
+    const unsigned g0=2U*p,g1=g0+1U;
+    constexpr unsigned max_blocks=max_hidden/256U;
+    for(unsigned group=0;group<count;group+=G) {
+        if(group)__syncthreads();
+#pragma unroll
+        for(unsigned a=0;a<G;++a)if(group+a<count) {
+            const auto r=csr.rows[begin+group+a];
+            const auto* codes=at(view.codes,r);const auto* deltas=at(view.deltas,r);const auto* sums=at(view.sums,r);
+            for(unsigned i=16U*threadIdx.x;i<hidden;i+=4096U)
+                *reinterpret_cast<int4*>(local_codes[a]+i)=*reinterpret_cast<const int4*>(codes+i);
+            for(unsigned i=threadIdx.x;i<hidden/32U;i+=256U){local_deltas[a][i]=deltas[i];local_sums[a][i]=sums[i];}
+        }
+        __syncthreads();
+        float acc[2][G]={};
+#pragma unroll
+        for(unsigned m=0;m<2U;++m) {
+            const unsigned char* w=(m==0U?gate:up)+offset;
+            if constexpr(Q5K) {
+#pragma unroll 1
+                for(unsigned b=0;b<blocks;++b) {
+                    const auto* packed=w+b*176U;
+                    const uint4 hd=*reinterpret_cast<const uint4*>(packed);
+                    const uint4 q=*reinterpret_cast<const uint4*>(packed+48U+c*16U);
+                    const uint4 qh=*reinterpret_cast<const uint4*>(packed+16U+h*16U);
+#pragma unroll
+                    for(unsigned a=0;a<G;++a)if(group+a<count) {
+                        const int4 a0=*reinterpret_cast<const int4*>(local_codes[a]+b*256U+p*64U+h*16U);
+                        const int4 a1=*reinterpret_cast<const int4*>(local_codes[a]+b*256U+p*64U+32U+h*16U);
+                        const float pair=paired_q5k(hd,q,qh,p,a0,a1,local_sums[a][b*8U+g0],local_sums[a][b*8U+g1],
+                            local_deltas[a][b*8U+g0],local_deltas[a][b*8U+g1]);
+                        acc[m][a]=acc[m][a]+pair;
+                    }
+                }
+            } else {
+#pragma unroll
+                for(unsigned first=0;first<max_blocks;first+=Chunk) {
+                uint4 hd[Chunk],q[Chunk];
+#pragma unroll
+                for(unsigned i=0;i<Chunk;++i)if(first+i<blocks) {
+                    const unsigned b=first+i;
+                    hd[i]=*reinterpret_cast<const uint4*>(w+b*144U);q[i]=*reinterpret_cast<const uint4*>(w+b*144U+16U+c*16U);
+                }
+#pragma unroll
+                for(unsigned i=0;i<Chunk;++i)if(first+i<blocks) {
+                    const unsigned b=first+i;
+                    const auto k=coefficient(hd[i],q[i],p);
+#pragma unroll
+                    for(unsigned a=0;a<G;++a)if(group+a<count) {
+                        const int4 a0=*reinterpret_cast<const int4*>(local_codes[a]+b*256U+p*64U+h*16U);
+                        const int4 a1=*reinterpret_cast<const int4*>(local_codes[a]+b*256U+p*64U+32U+h*16U);
+                        const float pair=paired(k,a0,a1,local_sums[a][b*8U+g0],local_sums[a][b*8U+g1],
+                            local_deltas[a][b*8U+g0],local_deltas[a][b*8U+g1]);
+                        acc[m][a]=acc[m][a]+pair;
+                    }
+                }
+                }
+            }
+        }
+#pragma unroll
+        for(unsigned a=0;a<G;++a)if(group+a<count) {
+#pragma unroll
+            for(unsigned m=0;m<2U;++m){acc[m][a]=acc[m][a]+__shfl_xor(acc[m][a],2,32);acc[m][a]=acc[m][a]+__shfl_xor(acc[m][a],4,32);}
+            if(c==0U){tile[0][a][out%32U]=acc[0][a];tile[1][a][out%32U]=acc[1][a];}
+        }
+        // Serial down_activation_quantize for group tile_index of each staged (row, slot).
+        __syncthreads();
+        for(unsigned a=wave;a<G;a+=8U)if(group+a<count) {
+            const auto r=csr.rows[begin+group+a],slot=csr.slots[begin+group+a];
+            float* output=at(view.output,r);
+            const unsigned feature=tile_index*32U+lane,at_slot=slot*2U*outputs+feature;
+            const float g=tile[0][a][lane],u=tile[1][a][lane];
+            const float hv=(g/(1.0F+expf(-g)))*u;
+            output[at_slot+outputs]=u;
+            const unsigned bad=static_cast<unsigned>(__ballot(!isfinite(g)||!isfinite(u)||!isfinite(hv)));
+            if(bad!=0){output[at_slot]=g;if(lane==0){atomicOr(at(view.status,r),8U);atomicOr(csr.summary,8U);}continue;}
+            float x=fabsf(hv);
+            for(int stride=16;stride!=0;stride/=2) x=fmaxf(x,__shfl_xor(x,stride,32));
+            const bool tiny=x>0.0F && x<0x1p-119F;
+            const float delta=x==0.0F || tiny?1.0F:divide_rne(x,127.0F);
+            const float rounded=tiny?0.0F:rintf(divide_rne(hv,delta));
+            const int code=static_cast<int>(fminf(127.0F,fmaxf(-127.0F,rounded)));
+            int sum=code;
+            for(int stride=16;stride!=0;stride/=2) sum+=__shfl_xor(sum,stride,32);
+            output[at_slot]=hv;
+            at(view.down_codes,r)[slot*outputs+feature]=static_cast<signed char>(code);
+            if(lane==0){at(view.down_deltas,r)[slot*(outputs/32U)+tile_index]=delta;at(view.down_sums,r)[slot*(outputs/32U)+tile_index]=sum;}
+        }
+    }
+}
+// down_window over strided prefill rows, Rows staged rows at a time: same lane
+// chains, block decode and reduction per (row, slot). Grid x = batch, y = 64-row tile.
+template<unsigned Rows,bool Q51>
+__global__ __launch_bounds__(256) void down_prefill(const unsigned char* weights,PrefillRows view,unsigned hidden,unsigned width) {
+    const auto& csr=view.csr;
+    if(csr.summary[0]||blockIdx.x>=csr.summary[2])return;
+    const auto begin=csr.begins[blockIdx.x],count=csr.begins[blockIdx.x+1U]-begin,expert=csr.experts[blockIdx.x];
+    __shared__ __align__(16) signed char codes[Rows][max_rows];
+    __shared__ float deltas[Rows][max_rows/32U];
+    __shared__ int sums[Rows][max_rows/32U];
+    const unsigned groups=width/32U;
+    const unsigned lane=threadIdx.x&31U,owner=lane&3U;
+    const unsigned row=blockIdx.y*64U+(threadIdx.x/32U)*8U+lane/4U;
+    constexpr unsigned block_bytes=Q51?24U:34U;
+    const auto* row_weights=weights+(static_cast<unsigned long long>(expert)*hidden+row)*groups*block_bytes;
+    for(unsigned first=0;first<count;first+=Rows) {
+        if(first)__syncthreads();
+#pragma unroll
+        for(unsigned a=0;a<Rows;++a)if(first+a<count) {
+            const auto r=csr.rows[begin+first+a],slot=csr.slots[begin+first+a];
+            const auto* down_codes=at(view.down_codes,r)+slot*width;
+            const auto* down_deltas=at(view.down_deltas,r)+slot*groups;const auto* down_sums=at(view.down_sums,r)+slot*groups;
+            for(unsigned i=16U*threadIdx.x;i<width;i+=4096U)
+                *reinterpret_cast<int4*>(codes[a]+i)=*reinterpret_cast<const int4*>(down_codes+i);
+            for(unsigned i=threadIdx.x;i<groups;i+=256U){deltas[a][i]=down_deltas[i];sums[a][i]=down_sums[i];}
+        }
+        __syncthreads();
+        float acc[Rows]={};
+#pragma unroll 1
+        for(unsigned group=owner;group<groups;group+=4U) {
+            const auto* packed=row_weights+group*block_bytes;
+            unsigned words[8];
+#pragma unroll
+            for(unsigned word=0;word<8U;++word)words[word]=Q51?down_q51_word(packed,word*4U):down_u32(packed+2U+word*4U);
+            const float d=__half2float(__ushort_as_half(static_cast<unsigned short>(down_u16(packed))));
+            const float m=Q51?__half2float(__ushort_as_half(static_cast<unsigned short>(down_u16(packed+2U)))):0.0F;
+#pragma unroll
+            for(unsigned a=0;a<Rows;++a)if(first+a<count) {
+                const auto* image=reinterpret_cast<const int*>(codes[a]+group*32U);
+                int integer=0;
+#pragma unroll
+                for(unsigned word=0;word<8U;++word) {
+                    if constexpr(Q51) integer=dot(image[word],words[word],integer);
+                    else integer=__builtin_amdgcn_sudot4(true,image[word],true,static_cast<int>(words[word]),integer,false);
+                }
+                const float first_term=d*static_cast<float>(integer);
+                float combined=first_term;
+                if constexpr(Q51) {
+                    const float correction=m*static_cast<float>(sums[a][group]);
+                    combined=first_term+correction;
+                }
+                const float contribution=deltas[a][group]*combined;
+                acc[a]=acc[a]+contribution;
+            }
+        }
+#pragma unroll
+        for(unsigned a=0;a<Rows;++a)if(first+a<count) {
+            acc[a]=acc[a]+__shfl_xor(acc[a],1,32);
+            acc[a]=acc[a]+__shfl_xor(acc[a],2,32);
+            if(owner==0U)at(view.rawdots,csr.rows[begin+first+a])[csr.slots[begin+first+a]*hidden+row]=acc[a];
+        }
+    }
+}
+// iu8 WMMA forms of project_prefill/down_prefill, bit-identical to them. A CSR batch holds at
+// most 16 assignments of one expert: the M = 16 rows of v_wmma_i32_16x16x16_iu8 (rows past the
+// batch are zero codes, their D elements are never stored and skip the epilogue in pairs). Per
+// 32-value group, two WMMAs (K = 16 + 16) on an accumulator of 0x4b400000 give the exact int32
+// group dot r of every (row, output) as the bits of 1.5*2^23 + r (|r| < 2^22), so one exact
+// FP32 subtraction yields float(r); the epilogue then runs the incumbent per-lane expressions
+// on (row, output) elements: gate/up u = d*float(sc*r) with float(sc*r) = float(sc)*float(r)
+// (exact, |sc*r| < 2^24), v = dm*float(m*s) likewise, (e0*(u0-v0) + e1*(u1-v1)) added to the
+// accumulator of pair p in ascending K blocks, and the lanes' tree (acc0+acc1)+(acc2+acc3);
+// down d*float(r) (+ m*float(sum)), times the delta, added to the accumulator of group%4 in
+// ascending groups, same tree. Q4_K/Q5_K nibbles (plus the Q5 high bit) and Q5_1 u5 codes are
+// unsigned 0..31, Q8_0 signed: all exact as signed int8 operands. Layouts (wave32): A lane
+// i%16 = row i, B lane i%16 = output i, D element e of lane l = (row 2e + l/16, output l%16);
+// the upper half wave repeats A/B. The epilogue quantizer and the stores are project_prefill's.
+typedef int wmma_v4i __attribute__((ext_vector_type(4)));
+typedef int wmma_v8i __attribute__((ext_vector_type(8)));
+struct __attribute__((aligned(4))) Dword4 { unsigned x,y,z,w; };
+constexpr unsigned wmma_batch=16U;
+constexpr int wmma_magic=0x4b400000;
+__device__ __forceinline__ wmma_v4i operand(uint4 v) {
+    return wmma_v4i{static_cast<int>(v.x),static_cast<int>(v.y),static_cast<int>(v.z),static_cast<int>(v.w)};
+}
+__device__ __forceinline__ wmma_v8i group_dot(wmma_v4i a0,wmma_v4i b0,wmma_v4i a1,wmma_v4i b1) {
+    const wmma_v8i magic{wmma_magic,wmma_magic,wmma_magic,wmma_magic,wmma_magic,wmma_magic,wmma_magic,wmma_magic};
+    const wmma_v8i c=__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true,a0,true,b0,magic,false);
+    return __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true,a1,true,b1,c,false);
+}
+__device__ __forceinline__ float group_float(int bits){return __int_as_float(bits)-0x1.8p23F;}
+// Row r of a batch at slot (r&1)*8 + r/2, so D element e of half h reads slot 8h + e.
+__device__ __forceinline__ unsigned wmma_row_slot(unsigned r){return (r&1U)<<3U|r>>1U;}
+template<unsigned Groups> struct WmmaRowsStage {
+    wmma_v4i a[2U*Groups][wmma_batch]; // 16-value plane k of every row: codes [16k, 16k+16)
+    float delta[Groups][wmma_batch];
+    float sum[Groups][wmma_batch];  // float(int sum), exact
+};
+// Batch rows (row, slot) and their codes/deltas/sums into a stage; rows >= count are zero.
+template<unsigned Groups,class Codes,class Deltas,class Sums>
+__device__ __forceinline__ void wmma_stage_rows(WmmaRowsStage<Groups>& s,unsigned count,unsigned width,unsigned threads,
+    const Codes& codes,const Deltas& deltas,const Sums& sums) {
+    const unsigned planes=width/16U,groups=width/32U;
+    for(unsigned item=threadIdx.x;item<wmma_batch*planes;item+=threads) {
+        const unsigned a=item/planes,k=item%planes;
+        wmma_v4i v{0,0,0,0};
+        if(a<count)v=*reinterpret_cast<const wmma_v4i*>(codes(a)+16U*k);
+        s.a[k][a]=v;
+    }
+    for(unsigned item=threadIdx.x;item<wmma_batch*groups;item+=threads) {
+        const unsigned a=item/groups,g=item%groups,slot=wmma_row_slot(a);
+        float e=0.0F,f=0.0F;
+        if(a<count){e=deltas(a)[g];f=static_cast<float>(sums(a)[g]);}
+        s.delta[g][slot]=e;s.sum[g][slot]=f;
+    }
+}
+// x[e] = p[e], e < V (two 16-byte reads for V = 8).
+template<unsigned V>
+__device__ __forceinline__ void row_values(const float* p,float (&x)[8]) {
+    const float4 lo=reinterpret_cast<const float4*>(p)[0];
+    x[0]=lo.x;x[1]=lo.y;
+    if constexpr(V>2U){x[2]=lo.z;x[3]=lo.w;}
+    if constexpr(V>4U){const float4 hi=reinterpret_cast<const float4*>(p)[1];x[4]=hi.x;x[5]=hi.y;x[6]=hi.z;x[7]=hi.w;}
+}
+// The (row, output) elements e < V of one wave: four chain accumulators, folded at the end as the
+// lanes' xor-2/xor-4 (gate/up) or xor-1/xor-2 (down) tree: (acc0+acc1)+(acc2+acc3).
+// FP32 value of an fp16 scale (exact) behind an empty asm, so its products stay v_mul_f32 (the
+// compiler would otherwise fold the conversion into every product as v_fma_mix_f32 with a -0
+// addend: the same value, but not dual-issuable).
+__device__ __forceinline__ float scale_f32(unsigned short bits) {
+    float x=__half2float(__ushort_as_half(bits));
+    __asm__("" : "+v"(x));
+    return x;
+}
+template<unsigned V> struct Chains {
+    float acc[4][8];
+    __device__ Chains(){
+#pragma unroll
+        for(unsigned c=0;c<4U;++c)
+#pragma unroll
+            for(unsigned e=0;e<8U;++e)acc[c][e]=0.0F;
+    }
+    __device__ void fold(float (&out)[8]) const {
+#pragma unroll
+        for(unsigned e=0;e<V;++e){const float s01=acc[0][e]+acc[1][e],s23=acc[2][e]+acc[3][e];out[e]=s01+s23;}
+    }
+};
+// One matrix (gate or up) of a wave: K blocks ascending, the four pairs p of a block in order,
+// two block buffers in turn (the next block loads while one computes). Elements e < V only
+// (rows 2e, 2e+1 of the batch); the WMMAs always cover all 16 rows.
+template<bool Q5K,unsigned V,unsigned Groups>
+__device__ __forceinline__ void gate_up_chains(const unsigned char* w,const WmmaRowsStage<Groups>& s,unsigned blocks,unsigned i,unsigned h,
+    float (&out)[8]) {
+    constexpr unsigned block_bytes=Q5K?176U:144U,qs_at=Q5K?48U:16U,mask=0x0f0f0f0fU;
+    struct Block { uint4 hd,q[8],qh[2]; };
+    const auto load=[&](unsigned b,Block& x) {
+        const auto* packed=w+b*block_bytes;
+        x.hd=*reinterpret_cast<const uint4*>(packed);
+#pragma unroll
+        for(unsigned k=0;k<8U;++k)x.q[k]=*reinterpret_cast<const uint4*>(packed+qs_at+16U*k);
+        if constexpr(Q5K){x.qh[0]=*reinterpret_cast<const uint4*>(packed+16U);x.qh[1]=*reinterpret_cast<const uint4*>(packed+32U);}
+    };
+    Chains<V> chains;
+    const auto step=[&](unsigned b,const Block& cur) {
+        const float d=scale_f32(static_cast<unsigned short>(cur.hd.x&65535U));
+        const float dm=scale_f32(static_cast<unsigned short>(cur.hd.x>>16U));
+#pragma unroll
+        for(unsigned p=0;p<4U;++p) {
+            const unsigned g0=2U*p,g1=g0+1U;
+            uint4 w0[2],w1[2];
+#pragma unroll
+            for(unsigned k=0;k<2U;++k) {
+                const uint4 q=cur.q[2U*p+k];
+                w0[k]={q.x&mask,q.y&mask,q.z&mask,q.w&mask};
+                w1[k]={(q.x>>4U)&mask,(q.y>>4U)&mask,(q.z>>4U)&mask,(q.w>>4U)&mask};
+                if constexpr(Q5K) {
+                    const uint4 qh=cur.qh[k];
+                    w0[k].x|=((qh.x>>g0)&0x01010101U)<<4U;w0[k].y|=((qh.y>>g0)&0x01010101U)<<4U;
+                    w0[k].z|=((qh.z>>g0)&0x01010101U)<<4U;w0[k].w|=((qh.w>>g0)&0x01010101U)<<4U;
+                    w1[k].x|=((qh.x>>g1)&0x01010101U)<<4U;w1[k].y|=((qh.y>>g1)&0x01010101U)<<4U;
+                    w1[k].z|=((qh.z>>g1)&0x01010101U)<<4U;w1[k].w|=((qh.w>>g1)&0x01010101U)<<4U;
+                }
+            }
+            const unsigned plane=16U*b+4U*p;
+            const wmma_v8i r0=group_dot(s.a[plane][i],operand(w0[0]),s.a[plane+1U][i],operand(w0[1]));
+            const wmma_v8i r1=group_dot(s.a[plane+2U][i],operand(w1[0]),s.a[plane+3U][i],operand(w1[1]));
+            float e0[8],e1[8],s0[8],s1[8];
+            row_values<V>(&s.delta[8U*b+g0][8U*h],e0);row_values<V>(&s.delta[8U*b+g1][8U*h],e1);
+            row_values<V>(&s.sum[8U*b+g0][8U*h],s0);row_values<V>(&s.sum[8U*b+g1][8U*h],s1);
+            const float sc0=static_cast<float>(factor(cur.hd,g0,false)),sc1=static_cast<float>(factor(cur.hd,g1,false));
+            const float mn0=static_cast<float>(factor(cur.hd,g0,true)),mn1=static_cast<float>(factor(cur.hd,g1,true));
+#pragma unroll
+            for(unsigned e=0;e<V;++e) {
+                const float i0=sc0*group_float(r0[e]),i1=sc1*group_float(r1[e]);
+                const float j0=mn0*s0[e],j1=mn1*s1[e];
+                const float u0=d*i0,v0=dm*j0,t0=u0-v0;
+                const float u1=d*i1,v1=dm*j1,t1=u1-v1;
+                const float c0=e0[e]*t0,c1=e1[e]*t1;
+                const float pair=c0+c1;
+                chains.acc[p][e]=chains.acc[p][e]+pair;
+            }
+        }
+    };
+    // Two block buffers in turn: block b + 1 loads while block b computes.
+    Block x[2];
+    load(0U,x[0]);
+#pragma unroll 1
+    for(unsigned b=0;b<blocks;b+=2U) {
+        if(b+1U<blocks)load(b+1U,x[1]);
+        step(b,x[0]);
+        if(b+1U<blocks) {
+            if(b+2U<blocks)load(b+2U,x[0]);
+            step(b+1U,x[1]);
+        }
+    }
+    chains.fold(out);
+}
+// Gate/up of one CSR batch (<= 16 assignments) for Waves/2 16-output tiles: wave w runs matrix
+// w%2 (gate, up) of tile w/2. Grid x = batch, y = output tile.
+template<bool Q5K,unsigned Waves>
+__global__ __launch_bounds__(32U*Waves) void project_prefill_wmma(const unsigned char* gate,const unsigned char* up,PrefillRows view,
+    unsigned hidden,unsigned outputs) {
+    constexpr unsigned Outs=8U*Waves,Groups=max_hidden/32U;
+    const auto& csr=view.csr;
+    if(csr.summary[0]||blockIdx.x>=csr.summary[2])return;
+    const auto begin=csr.begins[blockIdx.x],count=csr.begins[blockIdx.x+1U]-begin,expert=csr.experts[blockIdx.x];
+    __shared__ union { WmmaRowsStage<Groups> s; float tile[2][wmma_batch][Outs]; } lds;
+    __shared__ unsigned row_of[wmma_batch],slot_of[wmma_batch];
+    if(threadIdx.x<wmma_batch&&threadIdx.x<count){row_of[threadIdx.x]=csr.rows[begin+threadIdx.x];slot_of[threadIdx.x]=csr.slots[begin+threadIdx.x];}
+    __syncthreads();
+    wmma_stage_rows<Groups>(lds.s,count,hidden,32U*Waves,[&](unsigned a){return at(view.codes,row_of[a]);},
+        [&](unsigned a){return at(view.deltas,row_of[a]);},[&](unsigned a){return at(view.sums,row_of[a]);});
+    __syncthreads();
+    const unsigned lane=threadIdx.x&31U,wave=threadIdx.x/32U,i=lane&15U,h=lane>>4U,m=wave&1U,t=wave>>1U;
+    const unsigned tile_base=blockIdx.y*Outs,out=tile_base+16U*t+i,blocks=hidden/256U,valid=(count+1U)/2U;
+    constexpr unsigned block_bytes=Q5K?176U:144U;
+    const auto* w=(m==0U?gate:up)+(static_cast<unsigned long long>(expert)*outputs+out)*blocks*block_bytes;
+    float result[8]={};
+    if(valid<=2U)gate_up_chains<Q5K,2U>(w,lds.s,blocks,i,h,result);
+    else if(valid<=4U)gate_up_chains<Q5K,4U>(w,lds.s,blocks,i,h,result);
+    else gate_up_chains<Q5K,8U>(w,lds.s,blocks,i,h,result);
+    __syncthreads(); // every wave is done with the staged rows: the tile reuses them
+#pragma unroll
+    for(unsigned e=0;e<8U;++e)if(2U*e+h<count)lds.tile[m][2U*e+h][16U*t+i]=result[e];
+    __syncthreads();
+    // Serial down_activation_quantize (project_prefill's epilogue) for each staged (row, slot)
+    // and 32-output group of the CTA, one wave per pair.
+    constexpr unsigned Quads=Outs/32U;
+    for(unsigned job=wave;job<count*Quads;job+=Waves) {
+        const unsigned a=job/Quads,quad=job%Quads,tile_index=tile_base/32U+quad;
+        const auto r=row_of[a],slot=slot_of[a];
+        float* output=at(view.output,r);
+        const unsigned feature=tile_index*32U+lane,at_slot=slot*2U*outputs+feature;
+        const float g=lds.tile[0][a][32U*quad+lane],u=lds.tile[1][a][32U*quad+lane];
+        const float hv=(g/(1.0F+expf(-g)))*u;
+        output[at_slot+outputs]=u;
+        const unsigned bad=static_cast<unsigned>(__ballot(!isfinite(g)||!isfinite(u)||!isfinite(hv)));
+        if(bad!=0){output[at_slot]=g;if(lane==0){atomicOr(at(view.status,r),8U);atomicOr(csr.summary,8U);}continue;}
+        float x=fabsf(hv);
+        for(int stride=16;stride!=0;stride/=2) x=fmaxf(x,__shfl_xor(x,stride,32));
+        const bool tiny=x>0.0F && x<0x1p-119F;
+        const float delta=x==0.0F || tiny?1.0F:divide_rne(x,127.0F);
+        const float rounded=tiny?0.0F:rintf(divide_rne(hv,delta));
+        const int code=static_cast<int>(fminf(127.0F,fmaxf(-127.0F,rounded)));
+        int sum=code;
+        for(int stride=16;stride!=0;stride/=2) sum+=__shfl_xor(sum,stride,32);
+        output[at_slot]=hv;
+        at(view.down_codes,r)[slot*outputs+feature]=static_cast<signed char>(code);
+        if(lane==0){at(view.down_deltas,r)[slot*(outputs/32U)+tile_index]=delta;at(view.down_sums,r)[slot*(outputs/32U)+tile_index]=sum;}
+    }
+}
+// Raw bytes of one down block for this lane's output (Q5_1: d|m, qh, qs; Q8_0: nine dwords from
+// the block's dword-aligned start: rows hold an even block count, so an even block starts at its
+// scale and an odd one two bytes before it).
+template<bool Q51> struct DownBlock;
+template<> struct DownBlock<true> { uint2 head; Dword4 qs; };
+template<> struct DownBlock<false> { Dword4 lo,hi; unsigned last; };
+template<bool Q51> __device__ __forceinline__ DownBlock<Q51> down_block(const unsigned char* row_weights,unsigned group) {
+    if constexpr(Q51) {
+        const auto* block=row_weights+group*24U;
+        return {*reinterpret_cast<const uint2*>(block),*reinterpret_cast<const Dword4*>(block+8U)};
+    } else {
+        const auto* p=row_weights+((34U*group)&~3U);
+        return {reinterpret_cast<const Dword4*>(p)[0],reinterpret_cast<const Dword4*>(p)[1],reinterpret_cast<const unsigned*>(p)[8]};
+    }
+}
+// WMMA B operands (K halves) and scales of a down block; Q5_1 value k = nibble | qh bit k << 4.
+template<bool Q51>
+__device__ __forceinline__ void down_operands(const DownBlock<Q51>& x,unsigned group,wmma_v4i& b0,wmma_v4i& b1,float& d,float& m) {
+    if constexpr(Q51) {
+        const unsigned q[4]{x.qs.x,x.qs.y,x.qs.z,x.qs.w};
+        unsigned lo[4],hi[4];
+#pragma unroll
+        for(unsigned k=0;k<4U;++k) {
+            const unsigned l=(x.head.y>>(4U*k))&15U,u=(x.head.y>>(16U+4U*k))&15U;
+            lo[k]=(q[k]&0x0f0f0f0fU)|((l*0x00204081U)&0x01010101U)<<4U;
+            hi[k]=((q[k]>>4U)&0x0f0f0f0fU)|((u*0x00204081U)&0x01010101U)<<4U;
+        }
+        b0=wmma_v4i{static_cast<int>(lo[0]),static_cast<int>(lo[1]),static_cast<int>(lo[2]),static_cast<int>(lo[3])};
+        b1=wmma_v4i{static_cast<int>(hi[0]),static_cast<int>(hi[1]),static_cast<int>(hi[2]),static_cast<int>(hi[3])};
+        d=scale_f32(static_cast<unsigned short>(x.head.x&65535U));
+        m=scale_f32(static_cast<unsigned short>(x.head.x>>16U));
+    } else {
+        const unsigned odd=group&1U,select=odd?0x07060504U:0x05040302U;
+        const unsigned q[9]{x.lo.x,x.lo.y,x.lo.z,x.lo.w,x.hi.x,x.hi.y,x.hi.z,x.hi.w,x.last};
+        unsigned c[8];
+#pragma unroll
+        for(unsigned k=0;k<8U;++k)c[k]=__builtin_amdgcn_perm(q[k+1U],q[k],select);
+        b0=wmma_v4i{static_cast<int>(c[0]),static_cast<int>(c[1]),static_cast<int>(c[2]),static_cast<int>(c[3])};
+        b1=wmma_v4i{static_cast<int>(c[4]),static_cast<int>(c[5]),static_cast<int>(c[6]),static_cast<int>(c[7])};
+        d=scale_f32(static_cast<unsigned short>((q[0]>>(odd?16U:0U))&65535U));
+        m=0.0F;
+    }
+}
+// Down chains of one wave for width = max_rows: groups ascending in phases of four (group
+// 4k + j adds to chain j), two phase buffers in turn: the next phase loads while one computes.
+template<bool Q51,unsigned V>
+__device__ __forceinline__ void down_chains(const unsigned char* row_weights,const WmmaRowsStage<max_rows/32U>& s,unsigned i,unsigned h,
+    float (&out)[8]) {
+    constexpr unsigned Phases=max_rows/128U;
+    struct Phase { DownBlock<Q51> block[4]; };
+    const auto load=[&](unsigned phase,Phase& x) {
+#pragma unroll
+        for(unsigned j=0;j<4U;++j)x.block[j]=down_block<Q51>(row_weights,4U*phase+j);
+    };
+    Chains<V> chains;
+    const auto step=[&](unsigned phase,const Phase& cur) {
+#pragma unroll
+        for(unsigned j=0;j<4U;++j) {
+            const unsigned group=4U*phase+j;
+            wmma_v4i b0,b1;float d,m;
+            down_operands<Q51>(cur.block[j],j,b0,b1,d,m);
+            const wmma_v8i r=group_dot(s.a[2U*group][i],b0,s.a[2U*group+1U][i],b1);
+            float deltas[8],sums[8];
+            row_values<V>(&s.delta[group][8U*h],deltas);
+            if constexpr(Q51)row_values<V>(&s.sum[group][8U*h],sums);
+#pragma unroll
+            for(unsigned e=0;e<V;++e) {
+                const float first_term=d*group_float(r[e]);
+                float combined=first_term;
+                if constexpr(Q51) {
+                    const float correction=m*sums[e];
+                    combined=first_term+correction;
+                }
+                const float contribution=deltas[e]*combined;
+                chains.acc[j][e]=chains.acc[j][e]+contribution;
+            }
+        }
+    };
+    Phase x[2];
+    load(0U,x[0]);
+#pragma unroll 1
+    for(unsigned phase=0;phase<Phases;phase+=2U) {
+        if(phase+1U<Phases)load(phase+1U,x[1]);
+        step(phase,x[0]);
+        if(phase+1U<Phases) {
+            if(phase+2U<Phases)load(phase+2U,x[0]);
+            step(phase+1U,x[1]);
+        }
+    }
+    chains.fold(out);
+}
+// Down of one CSR batch (<= 16 assignments) for Waves 16-row tiles of the hidden output, width =
+// max_rows. Grid x = batch, y = row tile.
+template<bool Q51,unsigned Waves>
+__global__ __launch_bounds__(32U*Waves) void down_prefill_wmma(const unsigned char* weights,PrefillRows view,unsigned hidden,unsigned width) {
+    constexpr unsigned Outs=16U*Waves,Groups=max_rows/32U;
+    const auto& csr=view.csr;
+    if(csr.summary[0]||blockIdx.x>=csr.summary[2])return;
+    const auto begin=csr.begins[blockIdx.x],count=csr.begins[blockIdx.x+1U]-begin,expert=csr.experts[blockIdx.x];
+    __shared__ WmmaRowsStage<Groups> s;
+    __shared__ unsigned row_of[wmma_batch],slot_of[wmma_batch];
+    if(threadIdx.x<wmma_batch&&threadIdx.x<count){row_of[threadIdx.x]=csr.rows[begin+threadIdx.x];slot_of[threadIdx.x]=csr.slots[begin+threadIdx.x];}
+    __syncthreads();
+    const unsigned groups=width/32U;
+    wmma_stage_rows<Groups>(s,count,width,32U*Waves,[&](unsigned a){return at(view.down_codes,row_of[a])+slot_of[a]*width;},
+        [&](unsigned a){return at(view.down_deltas,row_of[a])+slot_of[a]*groups;},
+        [&](unsigned a){return at(view.down_sums,row_of[a])+slot_of[a]*groups;});
+    __syncthreads();
+    const unsigned lane=threadIdx.x&31U,wave=threadIdx.x/32U,i=lane&15U,h=lane>>4U,valid=(count+1U)/2U;
+    constexpr unsigned block_bytes=Q51?24U:34U;
+    const unsigned row=blockIdx.y*Outs+16U*wave+i;
+    const auto* row_weights=weights+(static_cast<unsigned long long>(expert)*hidden+row)*groups*block_bytes;
+    float result[8]={};
+    if(valid<=2U)down_chains<Q51,2U>(row_weights,s,i,h,result);
+    else if(valid<=4U)down_chains<Q51,4U>(row_weights,s,i,h,result);
+    else down_chains<Q51,8U>(row_weights,s,i,h,result);
+#pragma unroll
+    for(unsigned e=0;e<8U;++e)if(2U*e+h<count) {
+        const unsigned a=2U*e+h;
+        at(view.rawdots,row_of[a])[slot_of[a]*hidden+row]=result[e];
+    }
+}
 bool overlap(DeviceBytes a,DeviceBytes b){return a.address<b.address+b.bytes&&b.address<a.address+a.bytes;}
 void range(DeviceBytes v){if(!v.address||!v.bytes||v.bytes>UINTPTR_MAX-v.address)throw std::invalid_argument("A8 CSR gate/up owner range is invalid");}
 struct Prepared {DeviceRows rows;DeviceCsr csr;};
@@ -502,6 +1142,60 @@ void enqueue_window(const Request& request,std::span<const Bindings> rows,const 
     else {if(count==2U){STRIX_A8_WINDOW_DOWN(2U,false);}else if(count==4U){STRIX_A8_WINDOW_DOWN(4U,false);}else{STRIX_A8_WINDOW_DOWN(8U,false);}}
 #undef STRIX_A8_WINDOW_DOWN
     check(hipGetLastError(),"A8 window shared integer down");
+}
+void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned count,unsigned clear_words,
+    const unsigned char* gate,const unsigned char* up,unsigned down_type,const unsigned char* down_weights,hipStream_t stream,int form) {
+    const bool q5k=request.gate_type==13U;
+    if((down_type!=7U&&down_type!=8U)||(request.gate_type!=12U&&!q5k)||!gate||!up||!down_weights||
+       count<16U||count%8U||count>q51_known_rows::prefill_max_rows||request.shape.top_k>10U||request.shape.experts>512U||
+       request.shape.hidden>max_hidden||request.shape.hidden%256U||request.shape.rows>max_rows||request.shape.rows%128U||
+       request.shape.hidden%64U)
+        throw std::invalid_argument("A8 prefill geometry/format is invalid");
+    // STRIX_PREFILL_MOE_BATCH: assignments of one expert per CTA (default 8).
+    static const unsigned dot4_cap=[]{const char* v=std::getenv("STRIX_PREFILL_MOE_BATCH");const int n=v?std::atoi(v):8;
+        return n>=1&&n<=64?static_cast<unsigned>(n):8U;}();
+    // STRIX_PREFILL_MOE_WMMA=0/1: dot4 or iu8 WMMA kernels (bit-identical results; default WMMA).
+    static const int wmma_env=[]{const char* v=std::getenv("STRIX_PREFILL_MOE_WMMA");return v?std::atoi(v):-1;}();
+    // Whole CTA tiles; the WMMA down is unrolled for width = max_rows.
+    const bool wmma_shape=request.shape.rows==max_rows&&request.shape.hidden%256U==0U;
+    const bool wmma=wmma_shape&&(form>=0?form>=1:wmma_env>=0?wmma_env==1:true);
+    const unsigned cap=wmma?wmma_batch:dot4_cap;
+    enqueue_prefill_prologue(request,rows,count,clear_words,stream);
+    const unsigned assignments=count*request.shape.top_k;
+    // The WMMA form builds the (identical) CSR with the parallel builder; form 2 keeps the serial one.
+    if(wmma&&form!=2)hipLaunchKernelGGL(build_prefill_csr_waves,dim3(1),dim3(1024),0,stream,rows,count,request.shape.experts,request.shape.top_k,cap);
+    else hipLaunchKernelGGL(build_prefill_csr,dim3(1),dim3(1024),0,stream,rows,count,request.shape.experts,request.shape.top_k,cap);
+    check(hipGetLastError(),"A8 prefill CSR");
+    const unsigned batches=std::min(assignments,request.shape.experts+(assignments+cap-1U)/cap);
+    if(wmma) {
+        // 16 waves per CTA (measured best against 8; down also against 4).
+        constexpr unsigned project_waves=16U,down_waves=16U;
+        const dim3 project_grid(batches,request.shape.rows/(8U*project_waves));
+        if(q5k)hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill_wmma<true,project_waves>),project_grid,dim3(32U*project_waves),0,stream,
+            gate,up,rows,request.shape.hidden,request.shape.rows);
+        else hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill_wmma<false,project_waves>),project_grid,dim3(32U*project_waves),0,stream,
+            gate,up,rows,request.shape.hidden,request.shape.rows);
+        check(hipGetLastError(),"A8 prefill WMMA gate/up projection");
+        const dim3 down_grid(batches,request.shape.hidden/(16U*down_waves));
+        if(down_type==7U)hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_wmma<true,down_waves>),down_grid,dim3(32U*down_waves),0,
+            stream,down_weights,rows,request.shape.hidden,request.shape.rows);
+        else hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_wmma<false,down_waves>),down_grid,dim3(32U*down_waves),0,
+            stream,down_weights,rows,request.shape.hidden,request.shape.rows);
+        check(hipGetLastError(),"A8 prefill WMMA integer down");
+        return;
+    }
+    const dim3 project_grid(batches,request.shape.rows/32U);
+    if(q5k)hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill<4U,true>),project_grid,dim3(256),0,stream,gate,up,rows,
+        request.shape.hidden,request.shape.rows);
+    else hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill<4U,false>),project_grid,dim3(256),0,stream,gate,up,rows,
+        request.shape.hidden,request.shape.rows);
+    check(hipGetLastError(),"A8 prefill gate/up projection");
+    const dim3 down_grid(batches,request.shape.hidden/64U);
+    if(down_type==7U)hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill<8U,true>),down_grid,dim3(256),0,stream,down_weights,rows,
+        request.shape.hidden,request.shape.rows);
+    else hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill<8U,false>),down_grid,dim3(256),0,stream,down_weights,rows,
+        request.shape.hidden,request.shape.rows);
+    check(hipGetLastError(),"A8 prefill integer down");
 }
 void preflight(const Request& request,std::span<const Bindings> rows,const q51_known_rows::Workspace& workspace,hipStream_t stream) {
     (void)prepare(request,rows,workspace,stream);

@@ -73,6 +73,7 @@ ExecutionBindingRequest binding_request(const HipLauncherCatalogConfig& config) 
     request.a8_down_q51 = config.a8_down_q51;
     request.a8_down_q80 = config.a8_down_q80;
     request.q5k_a8g32_gate_up = config.q5k_a8g32_gate_up;
+    request.dense_a8 = config.dense_a8;
     request.lane_chain_hyper_output = config.lane_chain_hyper_output;
     request.prefetch_hc_projection_next_tile = config.prefetch_hc_projection_next_tile;
     request.deferred_moe_status = config.deferred_moe_status;
@@ -115,11 +116,13 @@ struct HipKnownPrefixWindow::Impl {
     HipMoeRouteLauncherConfig route_config;
     HipElementwiseLauncherConfig elementwise_config;
     q51_known_rows::Workspace routed_workspace;
+    q51_known_rows::Workspace prefill_routed_workspace; // all T rows of a prefill step (STRIX_PREFILL_FULL_MOE)
     q51_known_rows::Summary pending_union_summary;
     std::uint32_t last_union_layer = 0;
     std::optional<HipKnownPrefixUnionObservation> last_union_observation;
     std::array<KnownWindowR2Entry, 3> r2_entries;
     std::vector<KnownWindowRowsEntry> rows_entries;
+    std::vector<KnownWindowRowsEntry> prefill_entries;
     // Prefix acceptance: deferred GDN rows (control word in host-mapped coherent memory, so the
     // host publishes {n_keep, slot} without a copy) and per-row PLE snapshots.
     struct HipFree { void operator()(void* p) const noexcept { if (p) (void)hipFree(p); } };
@@ -139,6 +142,31 @@ struct HipKnownPrefixWindow::Impl {
     std::deque<ExecutionRuntimeResources> gdn_commit_resources; // owned copies: the window's are call-local
     std::unique_ptr<HipPleKnownWindow> ple_window;
     std::vector<const void*> preflight_memo;
+    std::vector<std::pair<const void*, std::array<std::uint64_t, 2>>> recipe_memo;
+    std::vector<std::array<std::uintptr_t, 2>> preflight_slots;
+    ArenaLookupIndex arena_index; // the immutable compiled window's arena views
+    // Verify windows run each layer's shared expert on a second stream next to the routed experts (see
+    // detach_shared). The shared expert reads only the MoE input and writes only its output,
+    // which the MoE combine reads; the owner's stream waits for it there. Its workspace is owned here,
+    // since the arena may give the step's workspace to the routed kernels that now run alongside it.
+    struct SharedDetach {
+        hipStream_t side = nullptr;
+        // Two event sets used by alternate windows: re-recording an event whose cross-stream wait of the
+        // previous window may still be queued can block the host.
+        std::vector<hipEvent_t> forked, joined;
+        std::vector<unsigned char> pending;
+        std::uint32_t parity = 0;
+        void* workspace = nullptr;
+        std::uint64_t workspace_bytes = 0;
+        ~SharedDetach() {
+            if (side) (void)hipStreamSynchronize(side);
+            for (auto e : forked) if (e) (void)hipEventDestroy(e);
+            for (auto e : joined) if (e) (void)hipEventDestroy(e);
+            if (workspace) (void)hipFree(workspace);
+            if (side) (void)hipStreamDestroy(side);
+        }
+    };
+    std::unique_ptr<SharedDetach> shared_detach;
     DeferredMoeFirstError completion_status{};
     bool failed = false;
 
@@ -208,9 +236,16 @@ struct HipKnownPrefixWindow::Impl {
         }
         std::sort(position_readers.begin(), position_readers.end());
         position_readers.erase(std::unique(position_readers.begin(), position_readers.end()), position_readers.end());
+        if(!prefill) {
+            std::vector<const ExecutionArenaPlan*> plans{&window.arena.physical};
+            for(const auto& row:window.row_plan) plans.push_back(&row.arena);
+            for(const auto& view:window.arena.row_view) plans.push_back(&view);
+            arena_index=ArenaLookupIndex(plans);
+        }
         setup_r2();
         setup_rows();
         setup_routed_union();
+        if(prefill) setup_prefill_entries();
         setup_hyper_rows();
         setup_deferred();
         setup_head_rows();
@@ -225,6 +260,7 @@ struct HipKnownPrefixWindow::Impl {
         });
     }
     ~Impl() { guard.recover_or_fail_stop(); }
+    bool full_prefill_union() const noexcept {return prefill&&prefill_routed_workspace.owner;}
     std::uint64_t execution_identity() const noexcept {return prefill?prefill->prefill_execution_identity:window.window_execution_identity;}
     const ExecutionArenaPlan& physical_arena() const noexcept {return prefill?prefill->arena.physical:window.arena.physical;}
     std::uint32_t logical_rows() const noexcept {return prefill?prefill->logical_rows:window.logical_rows;}
@@ -274,6 +310,67 @@ struct HipKnownPrefixWindow::Impl {
             throw std::invalid_argument("known-window retained runtime bindings or state layout changed");
         validate_scope();
     }
+    // STRIX_SHARED_DETACH=0: the shared expert stays on the owner's stream between router and routed experts.
+    static bool shared_detach_enabled() {
+        static const bool on = [] { const char* v = std::getenv("STRIX_SHARED_DETACH"); return !v || v[0] != '0'; }();
+        return on;
+    }
+    SharedDetach& detach_state() {
+        if (shared_detach) return *shared_detach;
+        auto d = std::make_unique<SharedDetach>();
+        const auto layers = static_cast<std::size_t>(model.hidden_layers);
+        d->forked.assign(2U * layers, nullptr); d->joined.assign(2U * layers, nullptr); d->pending.assign(layers, 0U);
+        check(hipStreamCreateWithFlags(&d->side, hipStreamNonBlocking), "create known-window shared stream");
+        for (auto* list : {&d->forked, &d->joined})
+            // Both streams are on this device: no system-scope fence (an L2 writeback per event otherwise).
+            for (auto& e : *list) check(hipEventCreateWithFlags(&e, hipEventDisableTiming | hipEventDisableSystemFence),
+                "create known-window shared event");
+        // Rows keep the arena's row stride (one row view apart), so this covers eight rows of any window.
+        d->workspace_bytes = 8ULL << 20U;
+        check(hipMalloc(&d->workspace, d->workspace_bytes), "allocate known-window shared workspace");
+        shared_detach = std::move(d);
+        return *shared_detach;
+    }
+    bool detachable_shared(std::size_t i) const {
+        const auto variant = window.r2_variant[i];
+        return serial.execution.steps[i].op == SerialOp::shared_expert &&
+            (variant == KnownWindowR2Variant::shared_q8_virtual256_r2_v1 ||
+             variant == KnownWindowR2Variant::shared_q8_virtual256_r4_v1 || variant == KnownWindowR2Variant::shared_q8_virtual256_r8_v1);
+    }
+    // Before step i of a launched verify window. A shared-expert rows step is enqueued on the side stream
+    // after everything queued so far on the owner's stream (the router included: forking before the router
+    // also overlapped it but measured slower, the staged router needs the bandwidth itself), and the
+    // layer's MoE combine waits for it. Returns true for the step this enqueued in place of the loop.
+    bool detach_shared(std::size_t i, const std::vector<std::vector<ExecutionDispatchContext>>& contexts) {
+        const auto& step = serial.execution.steps[i];
+        if (!step.layer || *step.layer >= model.hidden_layers) return false;
+        const auto layer = *step.layer;
+        if (detachable_shared(i)) {
+            auto& d = detach_state();
+            if (d.pending[layer]) throw std::logic_error("known-window shared expert detached twice before its combine");
+            const auto& rows = contexts[i];
+            const auto e = layer + d.parity * d.pending.size();
+            check(hipEventRecord(d.forked[e], scope.stream), "record known-window shared fork");
+            check(hipStreamWaitEvent(d.side, d.forked[e], 0), "order known-window shared stream");
+            shared_expert_known_window_rows_launch_detached(rows, shared_for(rows), d.side,
+                reinterpret_cast<std::uintptr_t>(d.workspace), d.workspace_bytes);
+            check(hipEventRecord(d.joined[e], d.side), "record known-window shared join");
+            d.pending[layer] = 1U;
+            return true;
+        }
+        if (step.op == SerialOp::moe_combine && shared_detach && shared_detach->pending[layer]) {
+            auto& d = *shared_detach;
+            check(hipStreamWaitEvent(scope.stream, d.joined[layer + d.parity * d.pending.size()], 0), "join known-window shared stream");
+            d.pending[layer] = 0U;
+        }
+        return false;
+    }
+    void require_shared_joined() {
+        if (!shared_detach) return;
+        if (std::any_of(shared_detach->pending.begin(), shared_detach->pending.end(), [](auto p) { return p != 0U; }))
+            throw std::logic_error("known-window shared expert was detached without its combine");
+        shared_detach->parity ^= 1U;
+    }
     const HipSharedExpertLauncherConfig& shared_for(std::span<const ExecutionDispatchContext> rows) const {
         if (!rows[0].kernel_id) throw std::invalid_argument("known-window shared row has no serial kernel id");
         return rows[0].kernel_id->ends_with(shared_expert_prefetch::kernel_suffix) ? shared_config : shared_fallback;
@@ -289,6 +386,7 @@ struct HipKnownPrefixWindow::Impl {
         shared_config.prefetch_q8 = config.prefetch_q8_shared_expert;
         shared_config.prefetch_eligible_layers = config.shared_expert_prefetch_layers;
         shared_config.prefetch_stats = config.shared_expert_prefetch_stats;
+        shared_config.dense_a8_projections = config.dense_a8;
         shared_fallback = shared_config;
         shared_fallback.prefetch_q8 = false; shared_fallback.prefetch_eligible_layers.clear();
         gdn_config.model = model; gdn_config.activation = config.activation;
@@ -297,6 +395,7 @@ struct HipKnownPrefixWindow::Impl {
         gdn_config.wave8_q8_input_projections = config.wave8_q8_gdn_input;
         gdn_config.virtual_q8_output_projection = config.virtual_q8_gdn_output;
         gdn_config.wave8_q8_output_projection = config.wave8_q8_gdn_output;
+        gdn_config.dense_a8_projections = config.dense_a8;
         r2_entries[0] = {KnownWindowR2Variant::shared_q8_virtual256_r2_v1, this,
             [](std::span<const ExecutionDispatchContext, 2> rows, void* object) {
                 const auto& self = *static_cast<Impl*>(object);
@@ -320,6 +419,117 @@ struct HipKnownPrefixWindow::Impl {
             [](std::span<const ExecutionDispatchContext, 2> rows, void* object) {
                 gdn_known_window_r2_f32_gates_launch(rows, static_cast<Impl*>(object)->gdn_config);
             }};
+    }
+    void setup_prefill_entries() {
+        // STRIX_PREFILL_FULL_HC=0: keep HC rows in separate 8-row launches.
+        static const bool hc=[]{const char* v=std::getenv("STRIX_PREFILL_FULL_HC");return !v||v[0]!='0';}();
+        if(hc&&window.hyper_mix_rows_steps)
+            prefill_entries.push_back({KnownWindowR2Variant::hyper_mix_rows8_v1,this,
+                [](std::span<const ExecutionDispatchContext> rows,void* object) {
+                    const auto& self=*static_cast<Impl*>(object);
+                    hyper_mix_known_prefill_rows_preflight(rows,self.hyper_for(rows));
+                },
+                [](std::span<const ExecutionDispatchContext> rows,void* object) {
+                    const auto& self=*static_cast<Impl*>(object);
+                    hyper_mix_known_prefill_rows_launch(rows,self.hyper_for(rows));
+                }});
+        // STRIX_PREFILL_FULL_PLE=0: PLE lookups and projections per 8-row tile (each tile still chains the history).
+        static const bool ple=[]{const char* v=std::getenv("STRIX_PREFILL_FULL_PLE");return !v||v[0]!='0';}();
+        if(ple&&window.ple_rows_steps)
+            prefill_entries.push_back({KnownWindowR2Variant::ple_rows_host_staged_v1,this,
+                [](std::span<const ExecutionDispatchContext> rows,void* object) {
+                    static_cast<Impl*>(object)->ple_window->preflight(rows);
+                },
+                [](std::span<const ExecutionDispatchContext> rows,void* object) {
+                    static_cast<Impl*>(object)->ple_window->launch(rows);
+                }});
+        // STRIX_PREFILL_FULL_QSA=0: keep QSA rows in 8-row tiles.
+        static const bool qsa=[]{const char* v=std::getenv("STRIX_PREFILL_FULL_QSA");return !v||v[0]!='0';}();
+        if(qsa&&window.qsa_rows_steps)
+            for(std::size_t i=0;i<window.mode.size();++i) {
+                if(window.mode[i]!=KnownWindowStepMode::qsa_rows) continue;
+                const auto variant=window.r2_variant[i];
+                if(std::any_of(prefill_entries.begin(),prefill_entries.end(),[&](const auto& e){return e.variant==variant;})) continue;
+                prefill_entries.push_back({variant,this,
+                    [](std::span<const ExecutionDispatchContext> rows,void* object) {
+                        const auto& self=*static_cast<Impl*>(object);
+                        indexed_attention_known_prefill_rows_preflight(rows,self.qsa_for(rows));
+                    },
+                    [](std::span<const ExecutionDispatchContext> rows,void* object) {
+                        const auto& self=*static_cast<Impl*>(object);
+                        indexed_attention_known_prefill_rows_launch(rows,self.qsa_for(rows));
+                    }});
+            }
+        // STRIX_PREFILL_FULL_SHARED=0: keep the shared expert in 8-row tiles.
+        static const bool shared=[]{const char* v=std::getenv("STRIX_PREFILL_FULL_SHARED");return !v||v[0]!='0';}();
+        if(shared)
+            prefill_entries.push_back({KnownWindowR2Variant::shared_q8_virtual256_r8_v1,this,
+                [](std::span<const ExecutionDispatchContext> rows,void* object) {
+                    const auto& self=*static_cast<Impl*>(object);
+                    shared_expert_known_prefill_rows_preflight(rows,self.shared_for(rows.first(8U)));
+                },
+                [](std::span<const ExecutionDispatchContext> rows,void* object) {
+                    const auto& self=*static_cast<Impl*>(object);
+                    shared_expert_known_prefill_rows_launch(rows,self.shared_for(rows.first(8U)));
+                }});
+        // STRIX_PREFILL_FULL_ELEMENTWISE=0: keep inject / MoE-combine rows in 8-row launches.
+        static const bool elementwise=[]{const char* v=std::getenv("STRIX_PREFILL_FULL_ELEMENTWISE");return !v||v[0]!='0';}();
+        if(elementwise) {
+            prefill_entries.push_back({KnownWindowR2Variant::inject_rows_v1,this,
+                [](std::span<const ExecutionDispatchContext> rows,void* object) {
+                    inject_known_prefill_rows_preflight(rows,static_cast<Impl*>(object)->elementwise_config);
+                },
+                [](std::span<const ExecutionDispatchContext> rows,void* object) {
+                    inject_known_prefill_rows_launch(rows,static_cast<Impl*>(object)->elementwise_config);
+                }});
+            prefill_entries.push_back({KnownWindowR2Variant::moe_combine_rows_v1,this,
+                [](std::span<const ExecutionDispatchContext> rows,void* object) {
+                    moe_combine_known_prefill_rows_preflight(rows,static_cast<Impl*>(object)->elementwise_config);
+                },
+                [](std::span<const ExecutionDispatchContext> rows,void* object) {
+                    moe_combine_known_prefill_rows_launch(rows,static_cast<Impl*>(object)->elementwise_config);
+                }});
+        }
+        // STRIX_PREFILL_FULL_ROUTER=0: keep router rows in separate 8-row launches.
+        static const bool router=[]{const char* v=std::getenv("STRIX_PREFILL_FULL_ROUTER");return !v||v[0]!='0';}();
+        if(router)
+            prefill_entries.push_back({KnownWindowR2Variant::moe_route_rows_v1,this,
+                [](std::span<const ExecutionDispatchContext> rows,void* object) {
+                    moe_route_known_prefill_rows_preflight(rows,static_cast<Impl*>(object)->route_config);
+                },
+                [](std::span<const ExecutionDispatchContext> rows,void* object) {
+                    moe_route_known_prefill_rows_launch(rows,static_cast<Impl*>(object)->route_config);
+                }});
+        // STRIX_PREFILL_FULL_GDN=0 / STRIX_PREFILL_FULL_MOE=0: keep that step in 8-row tiles.
+        static const bool gdn=[]{const char* v=std::getenv("STRIX_PREFILL_FULL_GDN");return !v||v[0]!='0';}();
+        static const bool moe=[]{const char* v=std::getenv("STRIX_PREFILL_FULL_MOE");return !v||v[0]!='0';}();
+        if(moe && window.routed_expert_union_steps && (config.a8_down_q51 || config.a8_down_q80) && prefill->logical_rows%8U==0U) {
+            const auto bytes=q51_known_rows::prefill_scratch_bytes(prefill->logical_rows,u32(model.num_experts),u32(model.num_experts_per_token));
+            void* memory=nullptr;
+            guard.run([&] { check(hipMalloc(&memory,bytes),"allocate known prefill routed CSR"); });
+            std::shared_ptr<void> owner(memory,[](void* p){ if(p) (void)hipFree(p); });
+            const auto base=reinterpret_cast<std::uintptr_t>(memory);
+            if(base%256U) throw std::runtime_error("known prefill routed CSR allocation is not 256-byte aligned");
+            status_disjoint(base,bytes);
+            prefill_routed_workspace={{execution_identity(),base,bytes,routed_workspace.memory.allocation_generation^(1ULL<<63U)},owner};
+            prefill_entries.push_back({KnownWindowR2Variant::routed_a8_union_rows8_v1,this,
+                [](std::span<const ExecutionDispatchContext> rows,void* object) {
+                    const auto& self=*static_cast<Impl*>(object);
+                    moe_experts_known_prefill_rows_preflight(rows,self.routed_config,self.routed_workspace,self.prefill_routed_workspace);
+                },
+                [](std::span<const ExecutionDispatchContext> rows,void* object) {
+                    const auto& self=*static_cast<Impl*>(object);
+                    moe_experts_known_prefill_rows_launch(rows,self.routed_config,self.routed_workspace,self.prefill_routed_workspace);
+                }});
+        }
+        if(!gdn) return;
+        prefill_entries.push_back({KnownWindowR2Variant::gdn_q8_rows8_f32_gates_r1_v1,this,
+            [](std::span<const ExecutionDispatchContext> rows,void* object) {
+                gdn_known_prefill_rows_preflight(rows,static_cast<Impl*>(object)->gdn_config);
+            },
+            [](std::span<const ExecutionDispatchContext> rows,void* object) {
+                gdn_known_prefill_rows_launch(rows,static_cast<Impl*>(object)->gdn_config);
+            }});
     }
     void setup_rows() {
         rows_entries.resize(4);
@@ -349,6 +559,7 @@ struct HipKnownPrefixWindow::Impl {
         qsa_config.prefetch_eligible_layers=config.qsa_input_prefetch_layers;
         qsa_config.prefetch_stats=config.qsa_input_prefetch_stats;
         qsa_config.wave8_q8_output=config.wave8_q8_qsa_output;
+        qsa_config.dense_a8_projections=config.dense_a8;
         qsa_fallback=qsa_config;
         qsa_fallback.prefetch_q8_input=false; qsa_fallback.prefetch_eligible_layers.clear();
         // One entry per QSA variant actually selected (layers may differ in indexer format).
@@ -480,7 +691,8 @@ struct HipKnownPrefixWindow::Impl {
                 }});
         }
         if(window.ple_rows_steps) {
-            ple_window=std::make_unique<HipPleKnownWindow>(model,config.activation,window.logical_rows);
+            ple_window=prefill ? std::make_unique<HipPleKnownWindow>(model,config.activation,prefill->logical_rows,true) :
+                std::make_unique<HipPleKnownWindow>(model,config.activation,window.logical_rows);
             rows_entries.push_back({KnownWindowR2Variant::ple_rows_host_staged_v1,this,
                 [](std::span<const ExecutionDispatchContext> rows,void* object) {
                     static_cast<Impl*>(object)->ple_window->preflight(rows);
@@ -529,7 +741,7 @@ struct HipKnownPrefixWindow::Impl {
         if(primary.gdn_deferred==gdn_deferred) return;
         gdn_deferred=primary.gdn_deferred;
         bind_deferred();
-        preflight_memo.clear();
+        preflight_memo.clear(); recipe_memo.clear(); preflight_slots.clear();
     }
     void setup_head_rows() {
         if(!window.lm_head_rows_steps) return;
@@ -594,8 +806,8 @@ struct HipKnownPrefixWindow::Impl {
         guard.require_original();
         if(window.routed_expert_union_steps)
             check(hipMemcpyAsync(&pending_union_summary,
-                reinterpret_cast<const void*>(routed_workspace.memory.arena_base),sizeof(pending_union_summary),
-                hipMemcpyDeviceToHost,scope.stream),"read latest routed expert union metadata");
+                reinterpret_cast<const void*>(full_prefill_union()?prefill_routed_workspace.memory.arena_base:routed_workspace.memory.arena_base),
+                sizeof(pending_union_summary),hipMemcpyDeviceToHost,scope.stream),"read latest routed expert union metadata");
         if (config.deferred_moe_status)
             check(hipMemcpyAsync(&completion_status,
                 reinterpret_cast<const void*>(scope.deferred_moe_status.arena_base), sizeof(completion_status),
@@ -603,7 +815,20 @@ struct HipKnownPrefixWindow::Impl {
         check(hipStreamSynchronize(scope.stream), "complete known-window native stream");
         guard.require_original();
         if (config.deferred_moe_status) check_deferred_moe_status(completion_status);
-        if(window.routed_expert_union_steps) {
+        if(full_prefill_union()) {
+            // One CSR over all T rows: histogram buckets saturate at 8, batches hold <= 64 assignments.
+            const auto& s=pending_union_summary;
+            const auto assignments=prefill->logical_rows*u32(model.num_experts_per_token);
+            std::uint64_t experts=0,batches=0;
+            for(std::uint32_t i=0;i<8U;++i){experts+=s.rows_per_expert_histogram[i];batches+=s.batch_size_histogram[i];}
+            if(s.status || s.version!=1U || s.logical_rows!=prefill->logical_rows || s.assignments!=assignments ||
+                !s.touched || s.touched>assignments || s.touched>model.num_experts ||
+                s.batches<s.touched || s.batches>assignments || !s.maximum_assignments ||
+                s.maximum_assignments>assignments || s.duplicate_assignments>assignments ||
+                experts!=s.touched || batches!=s.batches ||
+                std::any_of(s.reserved,s.reserved+8U,[](auto v){return v!=0U;}))
+                throw std::runtime_error("routed expert union metadata disagrees with its completed prefill");
+        } else if(window.routed_expert_union_steps) {
             const auto& s=pending_union_summary;
             const auto assignments=window.logical_rows*u32(model.num_experts_per_token);
             std::uint64_t experts=0,batches=0,batch_assignments=0,unique_row_assignments=0;
@@ -728,10 +953,39 @@ struct HipKnownPrefixWindow::Impl {
                !capture.owner_before(entry->key))return *entry;
         throw std::invalid_argument("MTP target capture has no prepared plans on this actual known-window owner");
     }
+    // Setup-time admission of the owner's own launch plans (see preflight_admission()).
+    void preflight_admission(SerialSessionContext session, std::span<const std::uint32_t> tokens) {
+        if (failed || prefill || executing || current_hip_launch_context() || tokens.size() != logical_rows())
+            throw std::invalid_argument("known-window setup admission requires an idle closed window owner");
+        struct ExecutionLease {
+            bool& active;
+            explicit ExecutionLease(bool& value):active(value){active=true;}
+            ~ExecutionLease(){active=false;}
+        } execution_lease(executing);
+        try {
+            validate_metadata();
+            const HipLaunchScope active(scope);
+            KnownWindowExecutionHooks hooks;
+            hooks.preflight_scope = [&] { validate_scope(); };
+            hooks.preflight_plan = [&] { validate_metadata(); };
+            hooks.complete = [] { throw std::logic_error("known-window setup admission never completes a window"); };
+            hooks.quiesce_or_fail_stop = [&] { failed = true; guard.recover_or_fail_stop(); };
+            hooks.position_reader_implementations = position_readers;
+            hooks.preflight_memo=&preflight_memo;hooks.recipe_memo=&recipe_memo;hooks.preflight_slots=&preflight_slots;
+            hooks.arena_index=&arena_index;
+            hooks.preflight_only = true;
+            (void)execute_known_prefix_window_eager(window, serial, resources, scratch, session, tokens,
+                std::span<const CompiledLaunchPlan* const>(launch_pointers), std::span<const KnownWindowR2Entry>(r2_entries),
+                std::span<const KnownWindowRowsEntry>(rows_entries), hooks);
+        } catch (...) { failed = true; throw; }
+    }
     KnownWindowResult execute(SerialSessionContext& session, std::span<const std::uint32_t> tokens,
         const std::function<void()>& before_publish = {},
-        const std::shared_ptr<HipMtpTargetWindowCapture>& capture = {},HipMtpTargetWindowBatch* batch=nullptr) {
+        const std::shared_ptr<HipMtpTargetWindowCapture>& capture = {},HipMtpTargetWindowBatch* batch=nullptr,
+        bool skip_head=false) {
         if (failed) throw std::logic_error("known-window native owner cannot be reused after an exception");
+        if (skip_head && (!prefill || capture || before_publish))
+            throw std::invalid_argument("known-window headless execution is a plain tiled prefill block only");
         if(executing)throw std::logic_error("known-window native owner cannot execute recursively");
         struct ExecutionLease {
             bool& active;
@@ -757,21 +1011,32 @@ struct HipKnownPrefixWindow::Impl {
             hooks.preflight_scope = [&] { validate_scope(); };
             hooks.preflight_plan = [&] { validate_metadata(); };
             hooks.complete = [&] { complete(); if(capture) capture->completed_before_publish(); if(before_publish) before_publish(); };
-            hooks.quiesce_or_fail_stop = [&] { failed = true; guard.recover_or_fail_stop(); };
+            hooks.quiesce_or_fail_stop = [&] {
+                failed = true;
+                if (shared_detach && shared_detach->side) (void)hipStreamSynchronize(shared_detach->side);
+                guard.recover_or_fail_stop();
+            };
             hooks.position_reader_implementations = position_readers;
             hooks.record_actual_window_lineage=static_cast<bool>(capture);
-            if(!prefill) hooks.preflight_memo=&preflight_memo;
+            if(!prefill && shared_detach_enabled())
+                hooks.before_step=[&](std::size_t i,const std::vector<std::vector<ExecutionDispatchContext>>& contexts) {
+                    return detach_shared(i,contexts);
+                };
+            hooks.skip_head=skip_head;
+            hooks.preflight_memo=&preflight_memo;hooks.recipe_memo=&recipe_memo;hooks.preflight_slots=&preflight_slots;
+            hooks.arena_index=&arena_index;
             const auto first_position=session.next_position;
             auto result=prefill ? execute_known_prefix_prefill_eager(*prefill,serial,resources,scratch,session,tokens,
-                launch_plans.front(),r2_entries,rows_entries,hooks) :
+                launch_plans.front(),r2_entries,rows_entries,hooks,prefill_entries) :
                 execute_known_prefix_window_eager(window, serial, resources, scratch, session, tokens,
                     capture?std::span<const CompiledLaunchPlan* const>(observed->pointers):std::span<const CompiledLaunchPlan* const>(launch_pointers),
                     capture?std::span<const KnownWindowR2Entry>(observed->recorded_r2):std::span<const KnownWindowR2Entry>(r2_entries),
                     capture?std::span<const KnownWindowRowsEntry>(observed->recorded_rows):std::span<const KnownWindowRowsEntry>(rows_entries),hooks);
             actual_window_committed=true;
+            require_shared_joined();
             if(capture)*batch=capture->seal(session);
             if(window.routed_expert_union_steps)
-                last_union_observation=HipKnownPrefixUnionObservation{first_position+(prefill?(prefill->logical_rows/8U-1U)*8U:0U),last_union_layer,pending_union_summary};
+                last_union_observation=HipKnownPrefixUnionObservation{first_position+(prefill&&!full_prefill_union()?(prefill->logical_rows/8U-1U)*8U:0U),last_union_layer,pending_union_summary};
             return result;
         } catch (...) {
             if(capture)capture->abort();
@@ -806,6 +1071,12 @@ KnownWindowResult HipKnownPrefixWindow::execute(SerialSessionContext& session, s
 }
 KnownWindowResult HipKnownPrefixWindow::execute(SerialSessionContext& session, std::span<const std::uint32_t> tokens) {
     return impl_->execute(session,tokens);
+}
+void HipKnownPrefixWindow::preflight_admission(const SerialSessionContext& session, std::span<const std::uint32_t> tokens) {
+    impl_->preflight_admission(session, tokens);
+}
+KnownWindowResult HipKnownPrefixWindow::execute_without_head(SerialSessionContext& session, std::span<const std::uint32_t> tokens) {
+    return impl_->execute(session,tokens,{},{},nullptr,true);
 }
 KnownWindowResult HipKnownPrefixWindow::execute_validated(SerialSessionContext& session,
     std::span<const std::uint32_t> tokens,const std::function<void()>& before_publish) {

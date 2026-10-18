@@ -32,7 +32,7 @@ std::uint32_t checked_u32(
 HipGdnLauncherConfig make_gdn_config(const ModelContract& model,
     HipActivationStorage activation, bool graph, bool virtual_q8, bool prefetch_q8, bool virtual_output,
     bool wave8, bool wave8_output, HipGdnRecurrentLayout recurrent_layout = HipGdnRecurrentLayout::baseline,
-    GdnRecurrentStorage recurrent_storage = GdnRecurrentStorage::key_value) {
+    GdnRecurrentStorage recurrent_storage = GdnRecurrentStorage::key_value, bool dense_a8 = false) {
     HipGdnLauncherConfig config;
     config.model = model;
     config.activation = activation;
@@ -44,6 +44,7 @@ HipGdnLauncherConfig make_gdn_config(const ModelContract& model,
     config.wave8_q8_output_projection = wave8_output;
     config.recurrent_layout = recurrent_layout;
     config.recurrent_storage = recurrent_storage;
+    config.dense_a8_projections = dense_a8;
     return config;
 }
 
@@ -54,7 +55,7 @@ indexed_attention_config(
     std::vector<std::uint32_t> layers = {}, std::shared_ptr<qsa_input_prefetch::RuntimeDispatchStats> stats = {},
     bool wave8_output = false, bool hierarchical_selection = false,
     std::shared_ptr<QsaHierarchicalSelectionStats> selection_stats = {},
-    std::uint32_t gqa_heads = 1, std::shared_ptr<QsaHierarchicalSelectionStats> gqa_stats = {}) {
+    std::uint32_t gqa_heads = 1, std::shared_ptr<QsaHierarchicalSelectionStats> gqa_stats = {}, bool dense_a8 = false) {
     HipIndexedAttentionLauncherConfig config;
     config.model = model;
     config.activation = activation;
@@ -67,6 +68,7 @@ indexed_attention_config(
     config.selection_stats = std::move(selection_stats);
     config.qsa_gqa_heads_per_block = gqa_heads;
     config.gqa_stats = std::move(gqa_stats);
+    config.dense_a8_projections = dense_a8;
     return config;
 }
 
@@ -180,7 +182,8 @@ lm_head_config(
 HipSharedExpertLauncherConfig
 shared_expert_config(
     const ModelContract& model,
-    HipActivationStorage activation, bool prefetch=false, std::vector<std::uint32_t> layers={}, std::shared_ptr<shared_expert_prefetch::RuntimeDispatchStats> stats={}) {
+    HipActivationStorage activation, bool prefetch=false, std::vector<std::uint32_t> layers={}, std::shared_ptr<shared_expert_prefetch::RuntimeDispatchStats> stats={},
+    bool dense_a8=false) {
     HipSharedExpertLauncherConfig config;
     config.hidden_size =
         checked_u32(
@@ -193,6 +196,7 @@ shared_expert_config(
     config.activation =
         activation;
     config.prefetch_q8=prefetch;config.prefetch_eligible_layers=std::move(layers);config.prefetch_stats=std::move(stats);
+    config.dense_a8_projections = dense_a8;
     return config;
 }
 
@@ -311,6 +315,11 @@ void validate_numerical_catalog_config(const ModelContract& model, const HipLaun
     if (config.q5k_a8g32_gate_up != numerical_profile_q5k_a8_gateup(config.numerical_profile) ||
         config.splitk_deferred_norm != numerical_profile_hc_deferred_norm(config.numerical_profile))
         throw std::invalid_argument("HIP catalog Q5K or HC deferred recipe differs from typed numerical profile");
+    if (config.dense_a8 != numerical_profile_dense_a8(config.numerical_profile))
+        throw std::invalid_argument("HIP catalog dense A8 recipe differs from typed numerical profile");
+    if (config.dense_a8 && (!config.wave8_q8_gdn_input || !config.wave8_q8_gdn_output || !config.wave8_q8_qsa_output ||
+                            !config.prefetch_q8_qsa_input || !config.prefetch_q8_shared_expert))
+        throw std::invalid_argument("HIP catalog dense A8 requires the wave8/prefetch Q8 organizations it replaces");
     if (config.splitk_deferred_norm && (!config.lane_chain_hyper_output || config.prefetch_hc_projection_next_tile))
         throw std::invalid_argument("HC deferred normalization requires all mixers on the lane-chain path");
     if (config.numerical_profile == DecodeNumericalProfile::exact_v5) return;
@@ -334,7 +343,7 @@ void register_complete_hip_kernel_catalog(
     const integer_projection::RuntimeConfig* alternate_lm_head) {
     validate_numerical_catalog_config(model, config);
     if (request.a8_down_q51 != config.a8_down_q51 || request.a8_down_q80 != config.a8_down_q80 ||
-        request.q5k_a8g32_gate_up != config.q5k_a8g32_gate_up ||
+        request.q5k_a8g32_gate_up != config.q5k_a8g32_gate_up || request.dense_a8 != config.dense_a8 ||
         (config.numerical_profile != DecodeNumericalProfile::exact_v5 &&
          (alternate_lm_head || request.device_graph_inputs || request.require_graph_safe ||
           request.logical_rows != 1 || request.request_concurrency != 1)))
@@ -479,7 +488,7 @@ void register_complete_hip_kernel_catalog(
         qualification);
 
     const auto gdn = make_gdn_config(model, config.activation,
-        config.enable_device_graph_inputs, config.virtual_q8_gdn_input, config.prefetch_q8_gdn_input, config.virtual_q8_gdn_output, config.wave8_q8_gdn_input, config.wave8_q8_gdn_output, config.gdn_recurrent_layout, config.gdn_recurrent_storage);
+        config.enable_device_graph_inputs, config.virtual_q8_gdn_input, config.prefetch_q8_gdn_input, config.virtual_q8_gdn_output, config.wave8_q8_gdn_input, config.wave8_q8_gdn_output, config.gdn_recurrent_layout, config.gdn_recurrent_storage, config.dense_a8);
     register_hip_gdn_kernel_variant(
         model,
         request,
@@ -490,7 +499,7 @@ void register_complete_hip_kernel_catalog(
     const auto indexed =
         indexed_attention_config(
             model,
-            config.activation, config.enable_device_graph_inputs, config.prefetch_q8_qsa_input, config.qsa_input_prefetch_layers, config.qsa_input_prefetch_stats, config.wave8_q8_qsa_output, config.qsa_hierarchical_selection, config.qsa_selection_stats, config.qsa_gqa_heads_per_block, config.qsa_gqa_stats);
+            config.activation, config.enable_device_graph_inputs, config.prefetch_q8_qsa_input, config.qsa_input_prefetch_layers, config.qsa_input_prefetch_stats, config.wave8_q8_qsa_output, config.qsa_hierarchical_selection, config.qsa_selection_stats, config.qsa_gqa_heads_per_block, config.qsa_gqa_stats, config.dense_a8);
     if(config.prefetch_q8_qsa_input){auto base=indexed;base.prefetch_q8_input=false;base.prefetch_eligible_layers.clear();auto base_request=request;base_request.prefetch_q8_qsa_input=false;base_request.qsa_input_prefetch_layers.clear();register_hip_indexed_attention_kernel_variant(model,base_request,base,registry,qualification);}
     register_hip_indexed_attention_kernel_variant(
         model,
@@ -562,7 +571,7 @@ void register_complete_hip_kernel_catalog(
     const auto shared =
         shared_expert_config(
             model,
-            config.activation,config.prefetch_q8_shared_expert,config.shared_expert_prefetch_layers);
+            config.activation,config.prefetch_q8_shared_expert,config.shared_expert_prefetch_layers,{},config.dense_a8);
     if(config.prefetch_q8_shared_expert){auto base=shared;base.prefetch_q8=false;base.prefetch_eligible_layers.clear();auto base_request=request;base_request.prefetch_q8_shared_expert=false;base_request.shared_expert_prefetch_layers.clear();register_hip_shared_expert_kernel_variant(model,base_request,base,registry,qualification);}
     register_hip_shared_expert_kernel_variant(
         model,
@@ -586,12 +595,12 @@ HipLauncherCatalog::HipLauncherCatalog(
               config.activation, config.enable_device_graph_inputs)),
       gdn_config_(
           make_gdn_config(model, config.activation,
-              config.enable_device_graph_inputs, config.virtual_q8_gdn_input, config.prefetch_q8_gdn_input, config.virtual_q8_gdn_output, config.wave8_q8_gdn_input, config.wave8_q8_gdn_output, config.gdn_recurrent_layout, config.gdn_recurrent_storage)),
+              config.enable_device_graph_inputs, config.virtual_q8_gdn_input, config.prefetch_q8_gdn_input, config.virtual_q8_gdn_output, config.wave8_q8_gdn_input, config.wave8_q8_gdn_output, config.gdn_recurrent_layout, config.gdn_recurrent_storage, config.dense_a8)),
       gdn_(gdn_config_),
       indexed_attention_(
           indexed_attention_config(
               model,
-              config.activation, config.enable_device_graph_inputs, config.prefetch_q8_qsa_input, config.qsa_input_prefetch_layers, config.qsa_input_prefetch_stats, config.wave8_q8_qsa_output, config.qsa_hierarchical_selection, config.qsa_selection_stats, config.qsa_gqa_heads_per_block, config.qsa_gqa_stats)),
+              config.activation, config.enable_device_graph_inputs, config.prefetch_q8_qsa_input, config.qsa_input_prefetch_layers, config.qsa_input_prefetch_stats, config.wave8_q8_qsa_output, config.qsa_hierarchical_selection, config.qsa_selection_stats, config.qsa_gqa_heads_per_block, config.qsa_gqa_stats, config.dense_a8)),
       embedding_(
           embedding_config(
               model,
@@ -617,7 +626,7 @@ HipLauncherCatalog::HipLauncherCatalog(
           shared_expert_config(
               model,
               config.activation,config.prefetch_q8_shared_expert,config.shared_expert_prefetch_layers,
-              config.shared_expert_prefetch_stats)) {
+              config.shared_expert_prefetch_stats, config.dense_a8)) {
     validate_numerical_catalog_config(model, config);
     if (config.numerical_profile != DecodeNumericalProfile::exact_v5 && alternate_lm_head_)
         throw std::invalid_argument("HIP catalog numerical profile excludes alternate integer head");

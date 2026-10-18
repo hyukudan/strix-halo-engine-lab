@@ -32,9 +32,10 @@ struct HipIndexedAttentionLauncherConfig {
     std::uint32_t qsa_gqa_heads_per_block = 1;
     std::shared_ptr<QsaHierarchicalSelectionStats> selection_stats;
     std::shared_ptr<QsaHierarchicalSelectionStats> gqa_stats;
-    // Opt-in known-window rows Q8 projections with per-32 int8 activations
-    // (dot4). Changes numerics: never bit-identical to the R1 row loop.
-    bool known_window_a8_projections = false;
+    // Dense A8 numerical profile (dense-a8-q80-v1): every Q8_0 projection of the
+    // step (R1, windows and prompt rows) runs Q8_0 x per-32 int8 activations
+    // through q8_rows::launch_dense_a8. Different numerics from the exact path.
+    bool dense_a8_projections = false;
 };
 
 enum class HipQsaInputProjectionMode {legacy256,virtual256,prefetch8};
@@ -70,7 +71,7 @@ void launch_hip_qsa_output_projection_probe(HipQsaOutputProjectionMode,
     HipQsaInputProjectionView output, std::uint32_t width, std::uint32_t outputs, void* stream);
 #endif
 #ifdef STRIX_BUILD_KNOWN_WINDOW_DIAGNOSTIC
-// Test-only T = 1/2/4/8 rows of the prefetch8 input (BF16 -> BF16-rounded FP32)
+// Test-only T = 1/2/4/8/16/32/64 rows of the prefetch8 input (BF16 -> BF16-rounded FP32)
 // or wave8 output (FP32 -> BF16) Q8_0 projection: the q8_rows engine (exact or
 // A8) or the C1 kernel once per row. Same ownership rules as the probes above.
 enum class HipQsaRowsProjection { input, output };
@@ -116,6 +117,11 @@ struct HipQsaIndexJournal { std::uintptr_t address = 0; std::uint64_t bytes = 0;
 void indexed_attention_known_window_rows_preflight(std::span<const ExecutionDispatchContext> rows,
     const HipIndexedAttentionLauncherConfig&, HipQsaIndexJournal journal = {});
 void indexed_attention_known_window_rows_launch(std::span<const ExecutionDispatchContext> rows,
+    const HipIndexedAttentionLauncherConfig&, HipQsaIndexJournal journal = {});
+// Prefill: all T rows of a QSA step (8-row tiles; projections 64 rows per launch).
+void indexed_attention_known_prefill_rows_preflight(std::span<const ExecutionDispatchContext> rows,
+    const HipIndexedAttentionLauncherConfig&, HipQsaIndexJournal journal = {});
+void indexed_attention_known_prefill_rows_launch(std::span<const ExecutionDispatchContext> rows,
     const HipIndexedAttentionLauncherConfig&, HipQsaIndexJournal journal = {});
 
 // Indexer partial-block tail around a window. Snapshot (before the window)

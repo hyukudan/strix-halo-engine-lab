@@ -3,10 +3,13 @@
 #include "strix/execution_memory.hpp"
 #include "strix/compiled_speculative_verify.hpp"
 #include "strix/serial_request.hpp"
+#include "strix/session_executor_handoff.hpp"
 
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <memory>
+#include <span>
 #include <vector>
 
 namespace strix {
@@ -71,6 +74,20 @@ public:
     // A failed output copy/validation does not publish new telemetry, even
     // though its session may already have consumed the configured native rows.
     [[nodiscard]] HipKnownPromptBackendStats stats() const noexcept;
+    // Split prefill numerical profile: the window owner runs the sibling `prefill` serial execution
+    // while the session belongs to `decode`. Each call hands the session to `prefill` before the
+    // native window and back to `decode` after it, so serial rows and generation keep `decode`.
+    // Set once, before any call. Executors and their resources are retained by the caller.
+    void set_executor_handoff(SessionExecutor decode, SessionExecutor prefill);
+    // Every row's logits of a tiled all-rows block (teacher-forced scoring). After a block commits,
+    // its T full FP32 rows are downloaded from the arena into one retained pinned host staging
+    // buffer (T x vocab floats, allocated here; no prompt-sized buffer) and handed to the sink in
+    // row order: tokens, first position, T*vocab values. The sink runs before execute_rows returns
+    // and may keep reading the staged values afterwards (a background spool) until `drain`, which is
+    // called before the next block's download overwrites them. A throw from either fails the call
+    // like any other post-commit error. Set once, before any call.
+    using AllRowsSink = std::function<void(std::span<const std::uint32_t>, std::uint64_t, std::span<const float>)>;
+    void set_all_rows_sink(AllRowsSink sink, std::function<void()> drain);
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

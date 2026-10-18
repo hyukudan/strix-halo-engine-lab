@@ -198,6 +198,31 @@ struct Fixture {
         }
         return result;
     }
+    // The window owner's detached form: a second stream and a private workspace at the arena's row
+    // stride. Returns the arena run's bytes with the workspace rows read from the private copy; the
+    // arena workspace keeps its seed.
+    std::vector<std::byte> run_detached() {
+        write(scratch, seed);
+        const auto stride = temporary[1].address - temporary[0].address;
+        const auto workspace = owner.allocate(stride * (contexts.size() - 1U) + temporary.back().bytes);
+        hipStream_t side = nullptr;
+        check(hipStreamCreateWithFlags(&side, hipStreamNonBlocking), "create detached shared stream");
+        try {
+            shared_expert_known_window_rows_launch_detached(contexts, config, side, workspace.address, workspace.bytes);
+            check(hipStreamSynchronize(side), "complete detached shared rows");
+        } catch (...) { static_cast<void>(hipStreamSynchronize(side)); static_cast<void>(hipStreamDestroy(side)); throw; }
+        check(hipStreamDestroy(side), "destroy detached shared stream");
+        auto result = read(scratch);
+        for (std::size_t r = 0; r < contexts.size(); ++r) {
+            const auto at = static_cast<std::ptrdiff_t>(temporary[r].address - scratch.address);
+            require(std::equal(seed.begin() + at, seed.begin() + at + static_cast<std::ptrdiff_t>(temporary[r].bytes), result.begin() + at),
+                "detached shared rows wrote the arena workspace");
+            const auto copied = read({workspace.address + r * stride, temporary[r].bytes});
+            std::copy(copied.begin(), copied.end(), result.begin() + at);
+        }
+        guards(scratch); guards(workspace);
+        return result;
+    }
     template<class Mutate, class Restore> void rejected(Mutate mutate, Restore restore, bool capture,
         std::string_view expected, bool expect_overflow = false) {
         write(scratch, seed); const auto prior_weights = original_weights;
@@ -241,6 +266,7 @@ int main(int argc, char** argv) {
             f.prepare(kind, reverse); const auto reference = f.run(false);
             for (unsigned repeat = 0; repeat < 3; ++repeat)
                 require(f.run(true) == reference, "wide shared result differs from complete incumbent arena bits");
+            require(f.run_detached() == reference, "detached wide shared result differs from complete incumbent arena bits");
         }
         f.prepare(0, false);
         for (const bool capture : {false, true}) {

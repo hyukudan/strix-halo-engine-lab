@@ -1,16 +1,22 @@
 #include "strix/known_prefix_prefill.hpp"
 #include "strix/dispatch_resources.hpp"
+#include "strix/execution_arena.hpp"
 #include "strix/execution_telemetry.hpp"
 #include "strix/launch_dispatch.hpp"
 #include "strix/ple_lookup.hpp"
 #include "strix/runtime_launchers.hpp"
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <utility>
+#include <vector>
 
 namespace strix {
 namespace {
@@ -27,14 +33,36 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
     const CompiledSerialExecution& serial,const ExecutionRuntimeResources& serial_resources,
     const ExecutionMemoryBinding& memory,SerialSessionContext& session,std::span<const std::uint32_t> tokens,
     const CompiledLaunchPlan& launch,std::span<const KnownWindowR2Entry> pairs,
-    std::span<const KnownWindowRowsEntry> wide,const KnownWindowExecutionHooks& hooks) {
-    validate_compiled_known_prefix_prefill(plan,serial);
+    std::span<const KnownWindowRowsEntry> wide,const KnownWindowExecutionHooks& hooks,
+    std::span<const KnownWindowRowsEntry> full) {
+    // STRIX_PREFILL_TIMING=1: host milliseconds of each phase of every block on stderr.
+    static const bool timing=[]{const char* v=std::getenv("STRIX_PREFILL_TIMING");return v&&v[0]=='1';}();
+    auto mark=std::chrono::steady_clock::now();
+    const auto lap=[&](const char* name) {
+        if(!timing) return;
+        const auto now=std::chrono::steady_clock::now();
+        std::fprintf(stderr,"prefill host %-10s %8.2f ms\n",name,std::chrono::duration<double,std::milli>(now-mark).count());mark=now;
+    };
+    // A repeat block of the same owner and launch plan skips the static plan check and the
+    // per-row launcher preflight (about 120 ms at T=64); every launcher still validates its
+    // context before enqueueing, and tokens, positions, capacity and session are checked below.
+    const void* preflight_key=&launch;
+    const bool preflight_known=hooks.preflight_memo&&
+        std::find(hooks.preflight_memo->begin(),hooks.preflight_memo->end(),preflight_key)!=hooks.preflight_memo->end();
+    if(!preflight_known) validate_compiled_known_prefix_prefill(plan,serial);
+    lap("plan");
     const auto rows=plan.logical_rows;const auto steps=serial.execution.steps.size();
     require(tokens.size()==rows,"known prefill token count differs from compiled T");
     require(hooks.preflight_scope&&hooks.complete&&hooks.quiesce_or_fail_stop,"known prefill requires scope/completion/fail-stop hooks");
     if(session.health!=SerialSessionHealth::ready) throw std::logic_error("known prefill requires a ready serial session");
     require(session.execution_identity==serial.execution_identity&&session.execution_identity,"known prefill source session identity differs");
     validate_execution_runtime_resources(serial.execution_identity,serial.arena,serial_resources,session.next_position);
+    // Every row context binds these model objects: the launch's tensor lookups skip re-validating
+    // the whole binding (about 1000 lookups per row, 61 % of the host time of a 4K prompt).
+    std::optional<ValidatedModelBindingScope> binding_scope;
+    if(!serial_resources.distributed_stage) binding_scope.emplace(*serial_resources.model_manifest,*serial_resources.model_weights);
+    // Likewise each row's arena plan is indexed once instead of searched linearly per buffer.
+    const ArenaLookupScope arena_lookup;
     const auto identities=build_runtime_execution_identities(serial.execution_identity,serial.arena,serial_resources);
     require(session.runtime_compatibility_identity==identities.compatibility_identity&&
         session.state_layout_identity==serial_resources.session_state_layout->layout_identity&&
@@ -87,6 +115,13 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
             "known prefill wide entry table is ambiguous or invalid");
         wide_by_id[id]=&entry;
     }
+    std::array<const KnownWindowRowsEntry*,known_window_r2_variant_slots> full_by_id{};
+    for(const auto& entry:full) {
+        const auto id=static_cast<std::uint32_t>(entry.variant);
+        require(id>=4U&&id<known_window_r2_variant_slots&&!full_by_id[id]&&entry.config&&entry.preflight&&entry.launch,
+            "known prefill full-T entry table is ambiguous or invalid");
+        full_by_id[id]=&entry;
+    }
     ExecutionRuntimeResources resources=serial_resources;resources.scratch=&memory;
     const auto context=[&](std::size_t step,std::uint32_t row) {
         const auto& s=serial.execution.steps[step];const auto& io=serial.io.steps[step];const auto& binding=serial.bindings.bindings[step];
@@ -110,11 +145,12 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
     require(steps&&serial.execution.steps.back().op==SerialOp::lm_head,"known prefill requires a complete terminal head");
     require(steps<=UINT32_MAX/rows,"known prefill logical work counter overflows");
     KnownWindowResult result;result.execution.state=session.state;
-    result.logit_row_indices=plan.logit_row_indices;result.logits.resize(plan.logit_row_indices.size());
-    result.omitted_lm_heads=rows-static_cast<std::uint32_t>(plan.logit_row_indices.size());
+    const bool headless=hooks.skip_head;
+    if(!headless) {result.logit_row_indices=plan.logit_row_indices;result.logits.resize(plan.logit_row_indices.size());}
+    result.omitted_lm_heads=rows-static_cast<std::uint32_t>(result.logit_row_indices.size());
     result.logical_row_steps=static_cast<std::uint32_t>(rows*steps)-result.omitted_lm_heads;
     result.execution.completion_order.reserve(rows*steps);
-    for(std::uint32_t row=0;row<rows;++row) {
+    for(std::uint32_t row=0;row<rows&&!headless;++row) {
         const auto c=context(steps-1U,row);require(c.writes.size()==1U,"known prefill head needs one output");
         const auto output=resolve_dispatch_write(c,0);
         require(serial.vocab_size<=UINT64_MAX/sizeof(float)&&output.bytes>=serial.vocab_size*sizeof(float),"known prefill logit row is undersized");
@@ -131,7 +167,10 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
         std::memcpy(reinterpret_cast<void*>(current.address),&value,sizeof(value));
     };
     std::array<std::uint64_t,6> writes{};
+    lap("admit");
     hooks.preflight_scope();
+    lap("scope");
+    std::array<double,32> mode_ms{};
     for(std::size_t step=0;step<steps;++step) {
         for(std::size_t f=0;f<flags.size();++f) if(
             (static_cast<std::uint32_t>(serial.execution.steps[step].writes_state)&static_cast<std::uint32_t>(flags[f])))
@@ -139,8 +178,36 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
         const auto mode=plan.tile8.mode[step];const auto id=static_cast<std::uint32_t>(plan.tile8.r2_variant[step]);
         const bool multi=mode!=KnownWindowStepMode::r1_row_loop;
         const bool rows_entry=known_window_rows_mode(mode);
-        if(multi) require(!reads_position(serial.execution.steps[step].reads_state)&&(rows_entry?wide_by_id[id]!=nullptr:pair_by_id[id]!=nullptr),
-            "known prefill selected closed implementation is missing");
+        // QSA rows read each row's own context position, never the host word.
+        if(multi&&!((!reads_position(serial.execution.steps[step].reads_state)||mode==KnownWindowStepMode::qsa_rows)&&(rows_entry?wide_by_id[id]!=nullptr:pair_by_id[id]!=nullptr)))
+            throw std::invalid_argument("known prefill selected closed implementation is missing (variant "+std::to_string(id)+
+                ", mode "+std::to_string(static_cast<unsigned>(mode))+")");
+        // Memoized blocks skip every step preflight, including the position-dependent QSA/PLE ones
+        // (re-running those costs ~17 ms of idle GPU per 64-row block). Their launchers still admit
+        // each context before enqueueing, so an out-of-capacity block fails during launch (session
+        // poisoned) instead of before it; capacity and positions are checked above for every block.
+        if(preflight_known||(headless&&step+1U==steps)) continue;
+        const auto step_begin=timing?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
+        const auto step_done=[&]{
+            if(timing) mode_ms[static_cast<std::size_t>(mode)%mode_ms.size()]+=
+                std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-step_begin).count();
+        };
+        if(rows_entry&&full_by_id[id]&&rows%8U==0U) {
+            std::vector<ExecutionDispatchContext> all(rows);for(std::uint32_t r=0;r<rows;++r) all[r]=context(step,r);
+            // Position-independent full-T entries: the compiled T arena (validated above for every row) makes tile t's
+            // views tile 0's plus t row strides, so the plan preflight admits the first and last two tiles; each
+            // launch still admits all of its tiles before enqueueing that step. QSA and PLE depend on positions, and the
+            // routed MoE workspace is sized for all T rows: those admit every tile here.
+            const bool edges=mode!=KnownWindowStepMode::qsa_rows&&mode!=KnownWindowStepMode::ple_rows&&
+                mode!=KnownWindowStepMode::routed_expert_union&&rows>32U;
+            if(edges) {
+                const std::span<const ExecutionDispatchContext> view(all);
+                full_by_id[id]->preflight(view.first(16U),full_by_id[id]->config);
+                full_by_id[id]->preflight(view.last(16U),full_by_id[id]->config);
+            } else full_by_id[id]->preflight(all,full_by_id[id]->config);
+            step_done();
+            continue;
+        }
         const auto width=multi?(rows_entry?8U:2U):1U;
         for(std::uint32_t first=0;first<rows;) {
             const auto count=rows-first>=width?width:1U;
@@ -150,9 +217,16 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
             else launch.steps[step].preflight(pack[0],launch.steps[step].user_data);
             first+=count;
         }
+        step_done();
     }
+    if(timing&&!preflight_known)
+        for(std::size_t m=0;m<mode_ms.size();++m) if(mode_ms[m]>0.5)
+            std::fprintf(stderr,"prefill preflight mode %2zu %8.2f ms\n",m,mode_ms[m]);
     for(std::size_t f=0;f<flags.size();++f) require(writes[f]<=UINT64_MAX-session.state.generations[f],"known prefill state generation overflow");
+    lap("preflight");
     if(hooks.preflight_plan) hooks.preflight_plan();
+    lap("metadata");
+    if(hooks.preflight_memo&&!preflight_known) hooks.preflight_memo->push_back(preflight_key);
     DirectLaunchDispatcher dispatcher(launch);
     const auto ple=std::find_if(serial.execution.steps.begin(),serial.execution.steps.end(),[](const auto& s){return s.op==SerialOp::ple;});
     if(resources.ple_lookup&&resources.ple_hash_contract&&resources.ple_prefetch) {
@@ -161,12 +235,39 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
             *resources.model_weights,*resources.tensor_access,*resources.session_state_layout,*resources.session_state_memory,
             *resources.ple_lookup,*resources.ple_prefetch);
     }
+    std::array<double,32> launch_ms{};std::array<std::uint32_t,32> launch_steps{};
     try {
         for(std::size_t step=0;step<steps;++step) {
             const auto& source=serial.execution.steps[step];
             if(!result.execution.state.contains(source.reads_state)) throw std::logic_error("known prefill persistent state disappeared after admission");
             const auto mode=plan.tile8.mode[step];const auto id=static_cast<std::uint32_t>(plan.tile8.r2_variant[step]);
+            // STRIX_PREFILL_TIMING=1: host enqueue time per step mode (admission inside each launch included).
+            const auto launch_begin=timing?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
+            struct LaunchLap {
+                bool on;std::chrono::steady_clock::time_point begin;double& total;std::uint32_t& count;
+                ~LaunchLap(){if(on){total+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin).count();++count;}}
+            } launch_lap{timing,launch_begin,launch_ms[static_cast<std::size_t>(mode)%launch_ms.size()],launch_steps[static_cast<std::size_t>(mode)%launch_steps.size()]};
             const bool rows_entry=known_window_rows_mode(mode);
+            if(headless&&step+1U==steps) break;
+            if(rows_entry&&full_by_id[id]&&rows%8U==0U) {
+                std::vector<ExecutionDispatchContext> all(rows);for(std::uint32_t r=0;r<rows;++r) all[r]=context(step,r);
+                auto correlation=current_execution_correlation();correlation.execution_identity=plan.prefill_execution_identity;
+                correlation.position=all[0].position;correlation.step_id=source.id;correlation.op=source.op;correlation.layer=source.layer.value_or(UINT32_MAX);
+                correlation.rows=rows;correlation.row=UINT32_MAX;correlation.phase=ExecutionPhase::operator_step;
+                ExecutionCorrelationScope observed(correlation);
+                full_by_id[id]->launch(all,full_by_id[id]->config);
+                // Counted per 8-row tile, like the tile path, so receipts compare across both.
+                const auto tiles=rows/8U;
+                if(mode==KnownWindowStepMode::shared_rows) result.shared_rows_dispatches+=tiles;
+                else if(mode==KnownWindowStepMode::gdn_rows) result.gdn_rows_dispatches+=tiles;
+                else if(mode==KnownWindowStepMode::hyper_mix_rows) result.hyper_mix_rows_dispatches+=tiles;
+                else if(mode==KnownWindowStepMode::routed_expert_union) result.routed_expert_union_dispatches+=tiles;
+                result.r2_variant_dispatches[id]+=tiles;
+                if(launch.steps[step].runtime_step) ++result.execution.runtime_steps;else ++result.execution.kernel_steps;
+                ++result.execution.completed_steps;result.execution.completion_order.push_back(source.id);
+                for(std::uint32_t r=0;r<rows;++r) result.execution.state.publish_write(source.writes_state);
+                continue;
+            }
             const auto width=mode==KnownWindowStepMode::r1_row_loop?1U:(rows_entry?8U:2U);
             // All tiles of this source step run before advancing to its next
             // consumer/layer. Recurrent/conv/PLE/QSA rows remain increasing.
@@ -201,7 +302,11 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
             }
         }
         if(resources.ple_prefetch&&resources.ple_prefetch->active) throw std::logic_error("known prefill left PLE lookup unconsumed");
-        hooks.complete();materialize(context(steps-1U,rows-1U),post-1U);
+        if(timing)
+            for(std::size_t m=0;m<launch_ms.size();++m) if(launch_ms[m]>0.5)
+                std::fprintf(stderr,"prefill launch mode %2zu %8.2f ms (%u steps)\n",m,launch_ms[m],launch_steps[m]);
+        lap("launch");
+        hooks.complete();lap("complete");materialize(context(steps-1U,rows-1U),post-1U);
         std::uint64_t final_position=0;std::memcpy(&final_position,reinterpret_cast<const void*>(position.address),sizeof(final_position));
         if(final_position!=post-1U) throw std::logic_error("known prefill final host position differs from completed row frontier");
     } catch(...) {

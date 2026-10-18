@@ -20,9 +20,10 @@ struct HipSharedExpertLauncherConfig {
     bool prefetch_q8 = false;
     std::vector<std::uint32_t> prefetch_eligible_layers;
     std::shared_ptr<shared_expert_prefetch::RuntimeDispatchStats> prefetch_stats;
-    // Opt-in known-window rows Q8 projections with per-32 int8 activations
-    // (dot4). Changes numerics: never bit-identical to the R1 row loop.
-    bool known_window_a8_projections = false;
+    // Dense A8 numerical profile (dense-a8-q80-v1): every Q8_0 projection of the
+    // step (R1, windows and prompt rows) runs Q8_0 x per-32 int8 activations
+    // through q8_rows::launch_dense_a8. Different numerics from the exact path.
+    bool dense_a8_projections = false;
 };
 
 enum class HipSharedQ8ProjectionMode {legacy256,virtual256,prefetch8};
@@ -37,7 +38,7 @@ void launch_hip_shared_q8_projection_probe(HipSharedQ8ProjectionRole,HipSharedQ8
     HipSharedQ8ProjectionView shared_gate,HipSharedQ8ProjectionView output,
     std::uint32_t width,std::uint32_t outputs,void* stream);
 #ifdef STRIX_BUILD_KNOWN_WINDOW_DIAGNOSTIC
-// Test-only T = 1/2/4/8 rows of the prefetch8 BF16 gate/up (FP32 out) or FP32 down
+// Test-only T = 1/2/4/8/16/32/64 rows of the prefetch8 BF16 gate/up (FP32 out) or FP32 down
 // (per-row FP32 gate, BF16 out) projection: the q8_rows engine (exact or A8) or
 // the R1 kernel once per row. Exact 16-byte aligned views; gate empty for gate/up.
 enum class HipSharedRowsProbeMode { rows, rows_a8, row_loop };
@@ -91,6 +92,17 @@ void shared_expert_known_window_rows_preflight(
     const HipSharedExpertLauncherConfig& config);
 void shared_expert_known_window_rows_launch(
     std::span<const ExecutionDispatchContext> rows,
+    const HipSharedExpertLauncherConfig& config);
+// The same rows (R2/R4/R8, same admission, arithmetic and kernels), enqueued on `stream` (a hipStream_t) with the
+// workspace rows at the arena's row stride in [workspace, workspace + workspace_bytes) instead of the
+// arena. The caller orders `stream` after the step's input and before its readers, and owns the
+// workspace and stream through quiescence (also after an exception).
+void shared_expert_known_window_rows_launch_detached(std::span<const ExecutionDispatchContext> rows,
+    const HipSharedExpertLauncherConfig& config, void* stream, std::uintptr_t workspace, std::uint64_t workspace_bytes);
+// Prefill: all T rows of a shared-expert step (8-row tiles of one strided view).
+void shared_expert_known_prefill_rows_preflight(std::span<const ExecutionDispatchContext> rows,
+    const HipSharedExpertLauncherConfig& config);
+void shared_expert_known_prefill_rows_launch(std::span<const ExecutionDispatchContext> rows,
     const HipSharedExpertLauncherConfig& config);
 
 class HipSharedExpertLauncherBundle {

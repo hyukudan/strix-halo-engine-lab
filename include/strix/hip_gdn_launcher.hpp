@@ -32,9 +32,10 @@ struct HipGdnLauncherConfig {
     HipGdnRecurrentLayout recurrent_layout = HipGdnRecurrentLayout::baseline;
     // Chosen with the session allocation/import; never converted per token.
     GdnRecurrentStorage recurrent_storage = GdnRecurrentStorage::key_value;
-    // Opt-in known-window rows Q8 projections with per-32 int8 activations
-    // (dot4). Changes numerics: never bit-identical to the R1 row loop.
-    bool known_window_a8_projections = false;
+    // Dense A8 numerical profile (dense-a8-q80-v1): every Q8_0 projection of the
+    // step (R1, windows and prompt rows) runs Q8_0 x per-32 int8 activations
+    // through q8_rows::launch_dense_a8. Different numerics from the exact path.
+    bool dense_a8_projections = false;
 };
 
 // Closed eager R2 window helper. Each context remains an R1 row view. Both
@@ -55,6 +56,10 @@ void gdn_known_window_r2_f32_gates_launch(std::span<const ExecutionDispatchConte
 // Closed R4/R8 mixed-format windows. Three large Q8 projections share weights
 // across every row; the small F32 gates and causal state transitions retain
 // ascending R1 order. No padding rows, capture, storage conversion or commit.
+// Known-prompt prefill: T rows (multiple of 8, >= 16) of one GDN layer at consecutive positions, committed in
+// order (no deferral). Same per-row arithmetic as the window kernels; conv history and state written once.
+void gdn_known_prefill_rows_preflight(std::span<const ExecutionDispatchContext> rows, const HipGdnLauncherConfig& config);
+void gdn_known_prefill_rows_launch(std::span<const ExecutionDispatchContext> rows, const HipGdnLauncherConfig& config);
 void gdn_known_window_rows_preflight(std::span<const ExecutionDispatchContext> rows,
     const HipGdnLauncherConfig& config);
 void gdn_known_window_rows_launch(std::span<const ExecutionDispatchContext> rows,
@@ -138,7 +143,7 @@ void gdn_known_window_r2_projection_probe(GdnKnownWindowProjectionDirection,
     GdnKnownWindowProjectionMode, std::span<const GdnKnownWindowProjectionView, 2> input,
     GdnKnownWindowProjectionView weights, std::span<const GdnKnownWindowProjectionView, 2> output,
     std::uint32_t width, std::uint32_t outputs, void* stream);
-// T = 1..8 rows: the q8_rows engine (exact or A8) or the R1 kernel per row.
+// T = 1..8, 16, 32 or 64 rows: the q8_rows engine (exact or A8) or the R1 kernel per row.
 enum class GdnKnownWindowRowsProbeMode { rows, rows_a8, row_loop };
 void gdn_known_window_rows_projection_probe(GdnKnownWindowProjectionDirection,
     std::span<const GdnKnownWindowProjectionView> input, GdnKnownWindowProjectionView weights,

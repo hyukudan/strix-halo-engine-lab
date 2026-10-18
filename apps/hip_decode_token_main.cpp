@@ -18,6 +18,7 @@
 #include "strix/hip_serving_prefix_cache.hpp"
 #include "strix/greedy_serving_scheduler.hpp"
 #include "strix/known_prompt_chunks.hpp"
+#include "strix/session_executor_handoff.hpp"
 #include "strix/known_prefix_prefill.hpp"
 #include "strix/generation_output.hpp"
 #include "strix/q51_known_rows.hpp"
@@ -92,6 +93,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <future>
 #include <iostream>
 #include <limits>
 #include <optional>
@@ -100,6 +102,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -718,6 +721,7 @@ public:
         }
     }
     std::vector<float> execute(std::uint32_t token, std::uint64_t position) override {
+        drain_block_spool();
         if (!teacher_inputs_.empty() && (position >= teacher_inputs_.size() ||
             teacher_inputs_[static_cast<std::size_t>(position)] != token || rows_.size() != position))
             throw std::invalid_argument("teacher-forced score input or position differs from its retained sequence");
@@ -753,6 +757,81 @@ public:
         if (!teacher_inputs_.empty()) static_cast<void>(execute(token, position));
         else target_.execute_state(token, position);
     }
+    // Teacher-forced rows of one committed tiled prefill block: `logits` holds tokens.size() full
+    // FP32 rows in row order, computed by the block (no target call here). Each row is scored with
+    // the same validation and requested-logprob arithmetic as execute() and appended to the score
+    // ledger in position order before this returns. Rows are scored in parallel (independent; each
+    // row's arithmetic is sequential and unchanged). The spool append of the block (and the footer
+    // when the final teacher input is in it) runs on a background thread while the next block
+    // computes: `logits` must stay valid until drain_block_spool(), which the window backend calls
+    // before overwriting its staging and every later consumer call makes before touching the spool.
+    void record_block(std::span<const std::uint32_t> tokens, std::uint64_t first_position, std::span<const float> logits) {
+        drain_block_spool();
+        const auto started_at = std::chrono::steady_clock::now();
+        const auto count = tokens.size();
+        if (teacher_inputs_.empty() || !count || logits.size() != count * vocabulary_ || rows_.size() != first_position ||
+            first_position > teacher_inputs_.size() || count > teacher_inputs_.size() - first_position)
+            throw std::invalid_argument("teacher-forced block differs from its retained sequence");
+        for (std::size_t r = 0; r < count; ++r)
+            if (teacher_inputs_[static_cast<std::size_t>(first_position) + r] != tokens[r])
+                throw std::invalid_argument("teacher-forced block input differs from its retained sequence");
+        const bool terminal = first_position + count == teacher_inputs_.size();
+        const auto scored = terminal ? count - 1U : count;
+        if (rows_.size() + scored > maximum_rows_) throw std::length_error("requested logprob ledger capacity exhausted");
+        const auto vocabulary = static_cast<std::size_t>(vocabulary_);
+        const auto row_logits = [logits, vocabulary](std::size_t r) { return logits.subspan(r * vocabulary, vocabulary); };
+        std::vector<std::array<strix::RequestedLogprob, 1>> values(count);
+        std::vector<std::exception_ptr> errors(count);
+        const auto score = [&](std::size_t r) {
+            try {
+                strix::validate_serial_decode_engine_logits(row_logits(r), vocabulary_);
+                if (r < scored) {
+                    const std::array<std::uint32_t, 1> next{teacher_inputs_[static_cast<std::size_t>(first_position) + r + 1U]};
+                    strix::compute_requested_logprobs(row_logits(r), next, values[r]);
+                }
+            } catch (...) { errors[r] = std::current_exception(); }
+        };
+        const auto workers = std::min<std::size_t>(count, std::min(16U, std::max(1U, std::thread::hardware_concurrency())));
+        {
+            std::vector<std::thread> threads;
+            threads.reserve(workers);
+            for (std::size_t w = 0; w < workers; ++w)
+                threads.emplace_back([&, w] { for (std::size_t r = w; r < count; r += workers) score(r); });
+            for (auto& thread : threads) thread.join();
+        }
+        for (const auto& error : errors) if (error) std::rethrow_exception(error);
+        for (std::size_t r = 0; r < scored; ++r)
+            rows_.push_back({tokens[r], first_position + r, {values[r].begin(), values[r].end()}});
+        tiled_rows_ += count;
+        // STRIX_PREFILL_TIMING=1: host milliseconds of scoring and spooling each block on stderr.
+        static const bool timing = [] { const char* v = std::getenv("STRIX_PREFILL_TIMING"); return v && v[0] == '1'; }();
+        if (timing)
+            std::fprintf(stderr, "teacher block %llu rows: score %.1f ms\n", static_cast<unsigned long long>(count),
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started_at).count());
+        if (!spool_) return;
+        std::vector<std::uint32_t> inputs(tokens.begin(), tokens.begin() + static_cast<std::ptrdiff_t>(scored));
+        pending_spool_ = std::async(std::launch::async, [this, inputs = std::move(inputs), first_position, row_logits, terminal] {
+            const auto spool_start = std::chrono::steady_clock::now();
+            for (std::size_t r = 0; r < inputs.size(); ++r) spool_->append(inputs[r], first_position + r, row_logits(r));
+            if (terminal) spool_->finish();
+            if (timing)
+                std::fprintf(stderr, "teacher block spool %.1f ms (overlapped)\n",
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - spool_start).count());
+        });
+    }
+    // Completes the background spool of the last block and reports its failure. A failed spool
+    // after committed rows poisons the session like a failed serial-row spool.
+    void drain_block_spool() {
+        if (!pending_spool_.valid()) return;
+        try { pending_spool_.get(); }
+        catch (...) {
+            session_.health = strix::SerialSessionHealth::poisoned;
+            session_.arithmetic_lineage.tainted = true;
+            guard_->recover_or_fail_stop();
+            throw;
+        }
+    }
+    std::uint64_t tiled_rows() const noexcept { return tiled_rows_; }
     const std::vector<Row>& rows() const noexcept { return rows_; }
 private:
     strix::SerialGreedyStepBackend& target_;
@@ -764,6 +843,8 @@ private:
     std::shared_ptr<const strix::HipSetupQuiescenceGuard> guard_;
     std::vector<Row> rows_;
     std::unique_ptr<strix::TeacherLogitSpool> spool_;
+    std::uint64_t tiled_rows_ = 0;
+    std::future<void> pending_spool_; // declared last: destroyed (joined) before the spool it writes
 };
 
 class ObservedServingBackend final : public strix::SerialGreedyStepBackend, public strix::ServingCohortObservation {
@@ -1059,6 +1140,7 @@ int STRIX_DECODE_ENTRY(
     const bool q5k_a8_gateup = strix::numerical_profile_q5k_a8_gateup(options.numerical_profile);
     const bool a8_down_q51 = strix::numerical_profile_q51_a8_down(options.numerical_profile);
     const bool a8_down_q80 = strix::numerical_profile_q80_a8_down(options.numerical_profile);
+    const bool dense_a8 = strix::numerical_profile_dense_a8(options.numerical_profile);
     strix::decode_cli::validate_resolved_mtp_cli(options);
 #if defined(STRIX_MTP_MODEL_QUALIFICATION_RUNNER)
     if(target_input_export)strix::tests::validate_mtp_target_input_export(options,true);
@@ -1119,6 +1201,12 @@ int STRIX_DECODE_ENTRY(
         "  \"numerical_profile\": \"" + std::string(strix::numerical_profile_name(options.numerical_profile)) + "\",\n" +
         "  \"numerical_profile_qualification\": \"" +
         (options.numerical_profile == strix::DecodeNumericalProfile::exact_v5 ? std::string("unchanged-base-status") : std::string("not_assessed")) + "\",\n" +
+        "  \"prefill_numerical_profile\": \"" +
+        std::string(strix::numerical_profile_name(strix::decode_cli::numerical_profile_pair(options).prefill)) + "\",\n" +
+        "  \"prefill_numerical_profile_source\": \"" +
+        (options.prefill_numerical_profile ? "explicit" : "numerical-profile") + "\",\n" +
+        "  \"numerical_profile_pair_identity\": " +
+        std::to_string(strix::numerical_profile_pair_identity(strix::decode_cli::numerical_profile_pair(options))) + ",\n" +
         "  \"optimization_profile_reason\": \"" + optimization_profile.reason + "\",\n" +
         "  \"optimization_profile_automatic_applied\": " +
         (optimization_profile.automatic_applied ? "true" : "false") + ",\n" + ple_cpu_helper_receipt;
@@ -1206,7 +1294,10 @@ int STRIX_DECODE_ENTRY(
                     hc_splitk_f32 ? strix::splitk_hc_fp32_numerical_identity : std::string_view{"incumbent"}) << "\",\n"
                 << "  \"q5k_a8g32_gate_up_configured\":" << (q5k_a8_gateup ? "true" : "false") << ",\n"
                 << "  \"q5k_a8g32_gate_up_layers\":" << (q5k_a8_gateup ? "[2]" : "[]") << ",\n"
-                << "  \"q5k_a8g32_numerical_identity\":\"" << (q5k_a8_gateup ? strix::moe_q4k_a8::q5k_numerical_identity : std::string_view{"none"}) << "\",\n";
+                << "  \"q5k_a8g32_numerical_identity\":\"" << (q5k_a8_gateup ? strix::moe_q4k_a8::q5k_numerical_identity : std::string_view{"none"}) << "\",\n"
+                << "  \"dense_a8_configured\":" << (dense_a8 ? "true" : "false") << ",\n"
+                << "  \"dense_a8_steps\":\"" << (dense_a8 ? "gated_delta_net,indexed_attention,shared_expert" : "") << "\",\n"
+                << "  \"dense_a8_numerical_identity\":\"" << (dense_a8 ? strix::q8_projection_organization::dense_a8_numerical_identity : std::string_view{"none"}) << "\",\n";
             std::cout << "  \"hc_splitk_f32_selected_model_steps\":" << hc_splitk_selected_steps << ",\n"
                 << "  \"a8_down_q51_configured\":" << (a8_down_q51 ? "true" : "false") << ",\n"
                 << "  \"a8_down_q80_configured\":" << (a8_down_q80 ? "true" : "false") << ",\n"
@@ -1415,6 +1506,7 @@ int STRIX_DECODE_ENTRY(
     catalog_config.a8_down_q51 = binding_request.a8_down_q51 = a8_down_q51;
     catalog_config.a8_down_q80 = binding_request.a8_down_q80 = a8_down_q80;
     catalog_config.q5k_a8g32_gate_up = binding_request.q5k_a8g32_gate_up = q5k_a8_gateup;
+    catalog_config.dense_a8 = binding_request.dense_a8 = dense_a8;
     catalog_config.deferred_moe_status = options.deferred_moe_status;
     binding_request.deferred_moe_status = options.deferred_moe_status;
     catalog_config.ranked_moe_router_topk = options.ranked_moe_router_topk;
@@ -1463,6 +1555,7 @@ int STRIX_DECODE_ENTRY(
     buffer_request.a8_down_q51 = a8_down_q51;
     buffer_request.a8_down_q80 = a8_down_q80;
     buffer_request.q5k_a8g32_gate_up = q5k_a8_gateup;
+    buffer_request.dense_a8 = dense_a8;
     buffer_request.qsa_hierarchical_selection = options.qsa_hierarchical_selection;
     buffer_request.qsa_gqa_heads_per_block = options.qsa_gqa_heads_per_block;
     buffer_request.activation_element_bytes =
@@ -1496,6 +1589,38 @@ int STRIX_DECODE_ENTRY(
         }
         if (hc_splitk_selected_steps != 97)
             throw std::invalid_argument("HC numerical profile requires all 97 compiled splitk FP32 mixer steps");
+    }
+    // Split prefill numerical profile: the prompt prefill runs a sibling serial execution whose
+    // dense Q8_0 projections follow the prefill profile (kernel ids, binding/buffer identities and,
+    // through them, the known-prefix prefill ids and launcher configs); decode keeps `compiled`.
+    const auto profile_pair = strix::decode_cli::numerical_profile_pair(options);
+    std::optional<strix::CompiledSerialExecution> compiled_prefill;
+    auto prefill_catalog_config = catalog_config;
+    if (profile_pair.split()) {
+        const bool prefill_dense_a8 = strix::numerical_profile_dense_a8(profile_pair.prefill);
+        if (strix::numerical_profile_hc_splitk(profile_pair.prefill) != hc_splitk_f32 ||
+            strix::numerical_profile_hc_deferred_norm(profile_pair.prefill) != hc_deferred_norm ||
+            strix::numerical_profile_q5k_a8_gateup(profile_pair.prefill) != q5k_a8_gateup ||
+            strix::numerical_profile_q51_a8_down(profile_pair.prefill) != a8_down_q51 ||
+            strix::numerical_profile_q80_a8_down(profile_pair.prefill) != a8_down_q80 || prefill_dense_a8 == dense_a8 ||
+            integer_config)
+            throw std::invalid_argument("prefill numerical profile may differ from the decode profile only in dense A8");
+        auto prefill_binding_request = binding_request;
+        auto prefill_buffer_request = buffer_request;
+        prefill_binding_request.dense_a8 = prefill_buffer_request.dense_a8 = prefill_dense_a8;
+        prefill_catalog_config.numerical_profile = profile_pair.prefill;
+        prefill_catalog_config.dense_a8 = prefill_dense_a8;
+        strix::kernels::KernelRegistry prefill_kernel_registry;
+        strix::register_complete_hip_kernel_catalog(model, prefill_binding_request, prefill_catalog_config,
+            prefill_kernel_registry, nullptr);
+        compiled_prefill = strix::compile_serial_execution(model, prefill_kernel_registry,
+            prefill_binding_request, prefill_buffer_request, 256);
+        strix::validate_sibling_serial_executions(*compiled_prefill, compiled);
+        optimization_profile_receipt +=
+            "  \"prefill_dense_a8_configured\": " + std::string(prefill_dense_a8 ? "true" : "false") + ",\n" +
+            "  \"prefill_serial_execution_identity\": " + std::to_string(compiled_prefill->execution_identity) + ",\n" +
+            "  \"prefill_serial_kernel_plan_identity\": " + std::to_string(compiled_prefill->kernel_plan_identity) + ",\n" +
+            "  \"prefill_serial_scratch\": \"shared-sibling-view-of-decode-serial-arena\",\n";
     }
     std::optional<strix::PreparedOfflineTuning> offline_tuning_owner;
     std::optional<strix::kernels::OfflineTuningPlan> offline_tuning_plan;
@@ -2068,6 +2193,17 @@ int STRIX_DECODE_ENTRY(
         resources.model_manifest = &wave_router_admission->manifest();
         experiment_owner->resources.model_manifest = &wave_router_admission->manifest();
     }
+    // Split prefill: the sibling prefill execution runs on the decode serial arena (identical
+    // layout, never concurrent) under its own execution identity, with the same model, state
+    // and PLE bindings. No additional device memory.
+    std::optional<strix::ExecutionMemoryBinding> prefill_scratch;
+    strix::ExecutionRuntimeResources prefill_resources;
+    if (compiled_prefill) {
+        if (graph_mode) throw std::logic_error("split prefill profile reached graph execution");
+        prefill_scratch = strix::sibling_scratch_binding(*compiled_prefill, compiled, memory.scratch());
+        prefill_resources = resources;
+        prefill_resources.scratch = &*prefill_scratch;
+    }
     std::shared_ptr<strix::integer_projection::HipIntegerRuntimeAllocationOwner> arena_pin, weight_pin;
     std::shared_ptr<strix::integer_projection::HipIntegerProjectionRuntimeBundle> integer_bundle;
     if (integer_config) {
@@ -2149,6 +2285,19 @@ int STRIX_DECODE_ENTRY(
         device_queue_trace->require_healthy_before_commit();
     };
     strix::DirectLaunchDispatcher direct_dispatcher(launch_plan, active_observer);
+    // MTP prompt rows under a split prefill profile: launchers of the sibling prefill execution.
+    std::shared_ptr<strix::HipLauncherCatalog> prefill_launcher_catalog;
+    strix::ExecutionLauncherRegistry prefill_launchers;
+    std::optional<strix::CompiledLaunchPlan> prefill_launch_plan;
+    std::optional<strix::DirectLaunchDispatcher> prefill_dispatcher;
+    if (compiled_prefill && options.mtp.enabled) {
+        prefill_launcher_catalog = std::make_shared<strix::HipLauncherCatalog>(model, prefill_catalog_config);
+        prefill_launcher_catalog->register_for_compiled_execution(*compiled_prefill, prefill_launchers, &prefill_resources);
+        if (prefill_launcher_catalog->audit(*compiled_prefill, prefill_launchers).missing_steps)
+            throw std::logic_error("HIP launcher catalog is incomplete for the prefill serial execution");
+        prefill_launch_plan.emplace(strix::compile_launch_plan(*compiled_prefill, prefill_launchers));
+        prefill_dispatcher.emplace(*prefill_launch_plan, active_observer);
+    }
     std::unique_ptr<strix::HipMoeOverlapDispatcher> moe_overlap;
     if (overlap_arena) {
         if (!deferred_moe) throw std::logic_error("MoE overlap is missing its main stream owner");
@@ -2217,6 +2366,13 @@ int STRIX_DECODE_ENTRY(
             : std::static_pointer_cast<strix::PleLookupBackend>(mtp_mapped_ple_owner);
         auto parents = std::make_shared<strix::decode_cli::MtpDecodeTargetParents>(
             experiment_owner, launcher_catalog, std::move(owned_ple), ple_hash_contract);
+        if (compiled_prefill) {
+            if (!prefill_dispatcher || !prefill_scratch) throw std::logic_error("MTP split prefill lacks its prompt launchers");
+            parents->prompt.compiled = &*compiled_prefill;
+            parents->prompt.dispatcher = &*prefill_dispatcher;
+            parents->prompt.resources = parents->resources;
+            parents->prompt.resources.scratch = &*prefill_scratch;
+        }
         strix::decode_cli::MtpDecodeWindowFactory make_window;
         if (options.mtp.window_rows) {
             // Prepare the real closed native owner BEFORE any prompt mutation.
@@ -2509,6 +2665,8 @@ int STRIX_DECODE_ENTRY(
             metadata.numerical_identity += ";" + std::string(strix::moe_q4k_a8::q80_a8_down_raw_identity);
         if (q5k_a8_gateup)
             metadata.numerical_identity += ";" + std::string(strix::moe_q4k_a8::q5k_gate_up_raw_identity);
+        if (dense_a8)
+            metadata.numerical_identity += ";dense-a8-q80-v1";
         if (catalog_config.splitk_hyper_projection)
             metadata.numerical_identity += ";" + std::string(hc_deferred_norm ? strix::deferred_hc_numerical_identity :
                 catalog_config.splitk_hyper_projection_fp64 ? strix::splitk_hc_fp64_numerical_identity : strix::splitk_hc_fp32_numerical_identity);
@@ -2930,14 +3088,26 @@ int STRIX_DECODE_ENTRY(
         } lookup_stats;
         if (options.known_prefix_window || options.prompt_lookup) {
             if (options.known_prefix_prefill_rows) {
-                known_prefill_plan = std::make_shared<strix::CompiledKnownPrefixPrefill>(strix::compile_known_prefix_prefill(model, compiled, manifest, tensor_access,
+                // The tiled prefill derives from the prefill serial execution (its dense projection
+                // kernel ids select the prefill verify ids and launchers).
+                known_prefill_plan = std::make_shared<strix::CompiledKnownPrefixPrefill>(strix::compile_known_prefix_prefill(model,
+                    compiled_prefill ? *compiled_prefill : compiled, manifest, tensor_access,
                     {options.known_prefix_prefill_rows, true, true, true, options.known_prefix_expert_union,
                      options.known_prefix_output_policy, options.known_prefill_workspace_budget, options.known_prefill_metadata_budget / 2U,
-                     options.known_window_router_rows, options.known_window_router_rows}));
+                     options.known_window_router_rows || options.known_prefix_full_rows,
+                     options.known_window_router_rows || options.known_prefix_full_rows,
+                     options.known_prefix_full_rows, options.known_prefix_full_rows, options.known_prefix_full_rows,
+                     options.teacher_forced_score}));
                 known_prefix_plan = known_prefill_plan->tile8; // selection ledger, never a relabelled T forward
-            } else known_prefix_plan = strix::compile_known_prefix_window(model, compiled, manifest, tensor_access,
-                {true, true, true, options.known_prefix_window ? options.known_prefix_rows : 2U, options.known_prefix_expert_union,
-                 options.known_prefix_output_policy, options.known_window_router_rows, options.known_window_router_rows});
+            } else {
+                const bool full = options.known_prefix_full_rows;
+                const bool rows_ops = full || options.known_window_router_rows;
+                known_prefix_plan = strix::compile_known_prefix_window(model, compiled, manifest, tensor_access,
+                    {true, true, true, options.known_prefix_window ? options.known_prefix_rows : 2U, options.known_prefix_expert_union,
+                     options.known_prefix_output_policy, rows_ops, rows_ops, full, full, false, full, full});
+                if (full && (known_prefix_plan->gdn_deferred_rows_steps != model.gdn_layers || !known_prefix_plan->ple_rows_steps))
+                    throw std::invalid_argument("known-prefix full rows did not admit deferred GDN and PLE rows for every layer");
+            }
             if (!strix::known_window_has_promoted_steps(*known_prefix_plan))
                 throw std::invalid_argument("known prompt has no admitted known-window operators");
             if (model.vocab_size > std::numeric_limits<std::uint32_t>::max())
@@ -2991,6 +3161,10 @@ int STRIX_DECODE_ENTRY(
                     multiply(known_prefill_plan->logit_row_indices.size(), sizeof(strix::ExecutionBufferAddress)));
                 if (known_prefill_plan->output_policy != strix::KnownWindowOutputPolicy::state_only)
                     known_prefill_runtime_payload = add(known_prefill_runtime_payload, multiply(model.vocab_size, 2U * sizeof(float)));
+                // Teacher-forced scoring: pinned staging of one block's T full rows (the spool streams them out).
+                if (options.teacher_forced_score)
+                    known_prefill_runtime_payload = add(known_prefill_runtime_payload,
+                        multiply(multiply(known_prefill_plan->logical_rows, model.vocab_size), sizeof(float)));
                 auto growth = add(known_prefill_plan->arena.physical.total_bytes, add(8U, union_bytes));
                 growth = add(growth, add(known_prefill_plan->host_metadata_payload_bytes, map_bytes)); // native owner's second copy
                 growth = add(growth, options.known_prefill_host_headroom); // explicit allocator/driver/fixed-plan allowance
@@ -3005,8 +3179,10 @@ int STRIX_DECODE_ENTRY(
                 known_prefix_memory = std::make_shared<KnownPromptMemory>(*known_prefill_plan, arena_generation,
                     status_generation, retained, original_work_device, union_bytes,
                     union_bytes ? generations.next() : 0);
-                known_prefix_owner = std::make_shared<strix::HipKnownPrefixWindow>(*known_prefill_plan, compiled, model,
-                    catalog_config, resources, known_prefix_memory->scratch, known_prefix_memory->scope,
+                known_prefix_owner = std::make_shared<strix::HipKnownPrefixWindow>(*known_prefill_plan,
+                    compiled_prefill ? *compiled_prefill : compiled, model,
+                    compiled_prefill ? prefill_catalog_config : catalog_config,
+                    compiled_prefill ? prefill_resources : resources, known_prefix_memory->scratch, known_prefix_memory->scope,
                     std::static_pointer_cast<const void>(known_prefix_memory),
                     union_bytes ? strix::q51_known_rows::Workspace{known_prefix_memory->union_scratch,
                         std::static_pointer_cast<const void>(known_prefix_memory)} : strix::q51_known_rows::Workspace{});
@@ -3026,6 +3202,21 @@ int STRIX_DECODE_ENTRY(
             if (options.known_prefix_window)
                 known_prefix_backend = std::make_unique<strix::HipKnownPromptBackend>(known_prefix_owner, session,
                     known_prefix_memory->scratch, model.vocab_size, original_work_device);
+            // Each tiled block runs on the prefill execution and hands the session back to decode.
+            if (compiled_prefill) {
+                if (!known_prefill_plan || !known_prefix_backend || options.prompt_lookup)
+                    throw std::logic_error("split prefill profile reached a non-tiled known-prefix route");
+                known_prefix_backend->set_executor_handoff({&compiled, &resources}, {&*compiled_prefill, &prefill_resources});
+            }
+            // Teacher-forced scoring: every row of every block is scored and spooled as it commits.
+            if (options.teacher_forced_score) {
+                if (!known_prefill_plan || !known_prefix_backend || !requested_logprobs ||
+                    known_prefill_plan->output_policy != strix::KnownWindowOutputPolicy::all_rows)
+                    throw std::logic_error("teacher-forced score reached a known-prefix route other than the tiled all-rows prefill");
+                known_prefix_backend->set_all_rows_sink([target = requested_logprobs.get()](std::span<const std::uint32_t> tokens,
+                    std::uint64_t position, std::span<const float> logits) { target->record_block(tokens, position, logits); },
+                    [target = requested_logprobs.get()] { target->drain_block_spool(); });
+            }
             if (options.prompt_lookup)
                 lookup_runtime = std::make_unique<strix::HipPromptLookupRuntime>(compiled, model, catalog_config,
                     resources, *known_prefix_plan, known_prefix_owner, known_prefix_memory->scratch,
@@ -3119,7 +3310,10 @@ int STRIX_DECODE_ENTRY(
             paired.logical_rows = options.known_prefix_prefill_rows ? options.known_prefix_prefill_rows : options.known_prefix_rows;
             paired.tiled_prefill = static_cast<bool>(known_prefill_plan);
             paired.output_policy = options.known_prefix_output_policy;
-            strix::KnownPromptChunkCursor chunks(paired, *known_prefix_backend, backend);
+            // Teacher-forced: no headless block, and the serial suffix rows are scored like serial rows.
+            paired.all_row_heads = options.teacher_forced_score;
+            strix::KnownPromptChunkCursor chunks(paired, *known_prefix_backend,
+                options.teacher_forced_score ? *generation_backend : static_cast<strix::SerialGreedyStepBackend&>(backend));
             while (chunks.advance()) { /* one complete configured window or one unpadded serial suffix row */ }
             const auto& generated = chunks.finish_greedy();
             known_prefix_progress = chunks.progress();
@@ -3135,6 +3329,8 @@ int STRIX_DECODE_ENTRY(
             total.steps_executed += known_prefix_result->consumed_prompt_tokens;
             return total;
         }();
+        // The spool of a final tiled block (with its footer) completes before anything is reported.
+        if (requested_logprobs) requested_logprobs->drain_block_spool();
         if (options.teacher_forced_score && (!requested_logprobs ||
             requested_logprobs->rows().size() != options.tokens.size() - 1U)) {
             session.health = strix::SerialSessionHealth::poisoned;
@@ -3257,6 +3453,23 @@ int STRIX_DECODE_ENTRY(
                 << "  \"prompt_lookup_serial_status_execution_identity\":" << known_prefix_memory->serial_scope.deferred_moe_status.execution_identity << ",\n"
                 << "  \"prompt_lookup_window_status_execution_identity\":" << known_prefix_memory->scope.deferred_moe_status.execution_identity << ",\n";
         }
+        if (requested_logprobs && options.teacher_forced_score) {
+            // Route of the scored rows: rows of complete tiled blocks carry the prefill profile's
+            // arithmetic, serial rows (all of them on the serial route, the unpadded suffix on the
+            // tiled one) the decode profile's; both identities are in this receipt.
+            const auto pair = strix::decode_cli::numerical_profile_pair(options);
+            const auto tiled_rows = requested_logprobs->tiled_rows();
+            std::cout << "  \"teacher_forced_route\":\"" << (known_prefill_plan ? "tiled-known-prefix-prefill" : "serial-eager") << "\",\n"
+                << "  \"teacher_forced_tiled_input_rows\":" << tiled_rows << ",\n"
+                << "  \"teacher_forced_serial_input_rows\":" << options.tokens.size() - tiled_rows << ",\n"
+                << "  \"teacher_forced_tiled_rows_numerical_profile\":\""
+                << (tiled_rows ? strix::numerical_profile_name(pair.prefill) : std::string_view("none")) << "\",\n"
+                << "  \"teacher_forced_serial_rows_numerical_profile\":\""
+                << (options.tokens.size() > tiled_rows ? strix::numerical_profile_name(pair.decode) : std::string_view("none")) << "\",\n";
+            if (known_prefill_plan)
+                std::cout << "  \"teacher_forced_tiled_lm_head\":\""
+                    << (known_prefill_plan->tile8.lm_head_rows_steps ? "rows8-r1-reduction-tree" : "r1-row-loop") << "\",\n";
+        }
         if (requested_logprobs) {
             if (!options.teacher_logits_path.empty())
                 std::cout << "  \"teacher_logits_file\":\"" << strix::decode_receipt::escape_json_string(options.teacher_logits_path)
@@ -3301,7 +3514,8 @@ int STRIX_DECODE_ENTRY(
             if (const auto latest = known_prefix_owner->latest_routed_union_observation()) {
                 const auto& group = latest->group;
                 std::cout << "  \"known_prefix_expert_union_latest_group\":{\"scope\":\""
-                    << (known_prefill_plan ? "latest-completed-prefill-last-internal-tile-last-eligible-layer" : "latest-completed-window-last-eligible-layer")
+                    << (known_prefill_plan ? (group.logical_rows == 8U ? "latest-completed-prefill-last-internal-tile-last-eligible-layer" :
+                        "latest-completed-prefill-all-rows-last-eligible-layer") : "latest-completed-window-last-eligible-layer")
                     << "\","
                     << "\"first_position\":" << latest->first_position << ",\"layer\":" << latest->layer
                     << ",\"status\":" << group.status << ",\"version\":" << group.version
@@ -3357,10 +3571,18 @@ int STRIX_DECODE_ENTRY(
             for (std::size_t i = 0; i < observed.r2_variant_dispatches.size(); ++i)
                 std::cout << (i ? "," : "") << observed.r2_variant_dispatches[i];
             std::cout << "],\n  \"known_prefix_variant_names\":[";
-            constexpr std::array<std::string_view, 11> variant_names{
+            // One name per KnownWindowR2Variant, in enum order.
+            constexpr std::array<std::string_view, strix::known_window_r2_variant_slots> variant_names{
                 "none", "shared-q8-rows2", "gdn-all-q8-pair-tiles", "gdn-q8-rows2-f32-gates-r1",
                 "shared-q8-rows4", "shared-q8-rows8", "gdn-q8-rows4-f32-gates-r1", "gdn-q8-rows8-f32-gates-r1",
-                "routed-q51-union-rows2", "routed-q51-union-rows4", "routed-q51-union-rows8"};
+                "routed-q51-union-rows2", "routed-q51-union-rows4", "routed-q51-union-rows8",
+                "hyper-mix-rows2", "hyper-mix-rows4", "hyper-mix-rows8",
+                "qsa-q8-rows2-r1", "qsa-q8-rows4-r1", "qsa-q8-rows8-r1",
+                "gdn-deferred-rows2", "gdn-deferred-rows4", "gdn-deferred-rows8", "ple-rows-host-staged",
+                "qsa-q8-bf16idx-rows2-r1", "qsa-q8-bf16idx-rows4-r1", "qsa-q8-bf16idx-rows8-r1",
+                "lm-head-q8-prefetch8-rows2", "lm-head-q8-prefetch8-rows4", "lm-head-q8-prefetch8-rows8",
+                "moe-route-rows", "moe-combine-rows", "inject-rows",
+                "routed-a8-union-rows2", "routed-a8-union-rows4", "routed-a8-union-rows8"};
             for (std::size_t i = 0; i < compiled_variants.size(); ++i) {
                 if (i >= variant_names.size()) throw std::logic_error("unknown known-prefix variant name");
                 std::cout << (i ? "," : "") << '"' << variant_names[i] << '"';
@@ -3542,6 +3764,9 @@ int STRIX_DECODE_ENTRY(
               << ',' << '\n'
               << "  \"context_tokens\": "
               << options.context_tokens
+              << ',' << '\n'
+              << "  \"context_qualified\": "
+              << (options.context_tokens == 8192 ? "true" : "false")
               << ',' << '\n'
               << "  \"residency\": \""
               << (options.residency ==

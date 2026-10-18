@@ -1,6 +1,7 @@
 #include "strix/execution_resources.hpp"
 #include "strix/distributed_stage_resources.hpp"
 #include "strix/distributed_stage_state.hpp"
+#include "strix/dispatch_resources.hpp"
 
 #include <stdexcept>
 
@@ -70,7 +71,7 @@ static void validate_resources_impl(
         validate_stage_model_runtime_binding(*resources.distributed_stage,*resources.model_manifest,*resources.model_weights);
     } else {
         if(resources.distributed_stage) throw std::invalid_argument("ordinary execution cannot consume stage-local resources");
-        validate_model_runtime_binding(*resources.model_manifest,*resources.model_weights);
+        validate_model_runtime_binding_unless_scoped(*resources.model_manifest,*resources.model_weights);
     }
     if (resources.tensor_access->manifest_layout_identity !=
             resources.model_manifest->layout_identity ||
