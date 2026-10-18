@@ -53,7 +53,7 @@ every launcher on its original kernel, for A/B on one file.
 |---|---|
 | q8_rows windows (GDN qkv+z / out, QSA q+k+v / out, shared gate+up / down) | `project_rows_kernel<..., Q6=true>`; wider than 4 direct rows take one output per wave |
 | R1 GDN / QSA / shared prefetch8 projections | one-row q8_rows sites (bitwise the R1 kernels); GDN islands keep their recorded kernel |
-| LM head rows and R1 (also the MTP head) | `prefetch8_wave_q8_lm_head_rows_kernel<..., Q6=true>` (R1 = one row) |
+| LM head rows up to 4 and R1 (also the MTP head) | `prefetch8_wave_q8_lm_head_rows_kernel<..., Q6=true>` (R1 = one row); wider staged windows are VALU bound and keep the Q8_0 head |
 | HC split-K down (rows, R1) and lane-chain up (rows, R1, register form) | `Q6` template variants |
 | router logits (rows, R1) | BF16 copy of the BF16-exact F32 weights |
 

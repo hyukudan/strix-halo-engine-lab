@@ -1556,21 +1556,25 @@ void family_lm_head_rows(std::uint32_t rows) {
     const auto reference = run(false);
     require(run(true) == reference && run(true) == reference, "window head rows differ from R1 head bytes or tails");
     {
-        // Q6P32 copy of the (six-bit) head: the same bytes, with the Q8_0 head poisoned.
+        // Q6P32 copy of the (six-bit) head: the same bytes. Windows of up to 4 rows and the R1 head read
+        // the copy (the Q8_0 head is poisoned for them); wider windows keep the Q8_0 head.
         std::vector<unsigned char> packed(q6p::q6p32_bytes(vocab, hidden));
         require(q6p::to_q6p32(weights.data(), vocab, hidden, packed.data()), "head fixture is not six-bit");
         const auto device_q6 = owner.allocate(packed.size());
         write(device_q6, packed);
-        check(hipMemset(reinterpret_cast<void*>(device_weights.address), 0xa5, device_weights.bytes), "poison Q8 head");
+        if (rows <= 4U) check(hipMemset(reinterpret_cast<void*>(device_weights.address), 0xa5, device_weights.bytes), "poison Q8 head");
         q6p::register_tensor(reinterpret_cast<const void*>(device_weights.address),
             {reinterpret_cast<const unsigned char*>(device_q6.address), vocab, hidden, q6p::Kind::q6p32});
+        auto hits = q6p::hits();
         const auto q6_rows = run(true);
-        const auto hits = q6p::hits();
+        const auto window_hits = q6p::hits() - hits;
+        check(hipMemset(reinterpret_cast<void*>(device_weights.address), 0xa5, device_weights.bytes), "poison Q8 head");
+        hits = q6p::hits();
         const auto q6_serial = run(false);
         const auto serial_hits = q6p::hits() - hits;
         q6p::clear();
         write(device_weights, weights);
-        require(q6_rows == reference, "Q6P32 window head rows differ from the Q8_0 head");
+        require(q6_rows == reference && window_hits == (rows <= 4U ? 1U : 0U), "Q6P32 window head rows differ from the Q8_0 head");
         require(q6_serial == reference && serial_hits == rows, "Q6P32 R1 head differs from the Q8_0 head or skipped the copy");
     }
     require(window.row_stride[1] != 0U, "window head rows use striped row views");
