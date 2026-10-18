@@ -28,6 +28,14 @@ segundo**, y el texto que escribe es **exactamente** el que escribiría la decod
 token a token. La velocidad sale de adivinar varios tokens por adelantado y comprobarlos todos a la vez, nunca de
 cambiar la respuesta.
 
+**AMD primero e independiente.** Los kernels de ejecución del modelo, la planificación y el decode especulativo son
+código propio en C++/HIP para Strix Halo (`gfx1151`); el motor no envuelve otro runtime de inferencia y todos los
+números de este README salen de nuestro ejecutable `strix-hip-decode-token`. ROCm/HIP, Linux, el formato GGUF y las
+herramientas de compilación habituales siguen siendo dependencias: *independiente* no significa sin dependencias. El
+motor está pensado para funcionar por completo en una sola Strix Halo sin el trabajo de orquestación distribuida de
+[TensorMeld](https://github.com/hyukudan/tensormeld); el funcionamiento multinodo y otras GPUs son etapas aparte,
+cualificadas explícitamente. Primera prioridad: el mejor rendimiento correcto de extremo a extremo en hardware AMD.
+
 > **Estado: motor de investigación.** Funciona de principio a fin y los números de abajo son medidos, pero la
 > interfaz es una herramienta de línea de comandos que recibe IDs de token e imprime un recibo JSON. Todavía no
 > hay servidor de chat; ver la [hoja de ruta](#hoja-de-ruta).

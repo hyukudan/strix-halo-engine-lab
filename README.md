@@ -25,6 +25,14 @@ second**, and the text it writes is **exactly** the text plain one-token-at-a-ti
 The speed comes from guessing several tokens ahead and checking all the guesses at once, never from changing
 the answer.
 
+**AMD-first and independent.** The model-execution kernels, scheduling and speculative decoding are our own C++/HIP
+code for Strix Halo (`gfx1151`); the engine does not wrap another inference runtime, and every number in this README
+comes from our `strix-hip-decode-token` executable. ROCm/HIP, Linux, the GGUF format and the usual build tools remain
+dependencies: *independent* does not mean dependency-free. The engine is meant to stay fully usable on a single Strix
+Halo without the distributed orchestration work in [TensorMeld](https://github.com/hyukudan/tensormeld); multi-node
+operation and other GPUs are separate, explicitly qualified stages. First priority: the best correct end-to-end
+performance from AMD hardware.
+
 > **Status: research engine.** It works end to end and the numbers below are measured, but the interface is a
 > command-line tool that takes token IDs and prints a JSON receipt. There is no chat server yet; see the
 > [roadmap](#roadmap).
