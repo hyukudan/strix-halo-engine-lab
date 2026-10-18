@@ -19,8 +19,8 @@
 #include <vector>
 
 // q8_rows engine sites against their R1 kernels, T = 1..8 and 16/32/64: bitwise payloads
-// (real and edge shapes, edge values), Q6P32 copies against their Q8_0 tensors
-// (exact form), A8 error against the exact path, and with STRIX_Q8_ROWS_BENCH=1
+// (real and edge shapes, edge values), Q6P32 copies against their Q8_0 tensors (exact and
+// dense A8 forms), A8 error against the exact path, and with STRIX_Q8_ROWS_BENCH=1
 // warm/cold timings at the model shapes, plus weight GB/s of T = 8/16/32/64 at the
 // prefill shapes. STRIX_Q8_ROWS_WIDE_ONLY=1 runs only the T = 16/32/64 checks (and, with
 // STRIX_Q8_ROWS_BENCH_ONLY=1, only the benchmark).
@@ -386,7 +386,7 @@ int main() try {
     std::uint32_t wide = 0;
     wide_cases(stream, wide);
     std::cout << "q8_rows T=16/32/64 payloads equal the R1 kernels bitwise: " << wide << " cases\n";
-    std::uint32_t q6_cases = 0, q6_kept = 0;
+    std::uint32_t q6_cases = 0, q6_kept = 0, q6_a8 = 0;
     for (const auto site : sites)
         for (const unsigned rows : {1U, 2U, 3U, 4U, 8U}) {
             if (rows == 3U && site != Site::gdn_input && site != Site::gdn_output) continue;
@@ -395,9 +395,15 @@ int main() try {
             for (const std::uint32_t w : {32U, 96U, 288U, 640U}) for (const std::uint32_t o : {1U, 7U, 33U})
                 q6_case(stream, site, rows, w, o, 3U, q6_cases, Mode::rows, &q6_kept);
             if (bf16_input(site) && rows >= 4U) q6_case(stream, site, rows, 2400U, 5003U, 2U, q6_cases, Mode::rows, &q6_kept);
+            if (rows == 3U) continue;
+            // Dense A8 (widths of whole 64-feature block pairs): LDS-staged and slot forms.
+            q6_case(stream, site, rows, width, outputs, 3U, q6_a8, Mode::rows_a8);
+            for (const std::uint32_t w : {64U, 320U, 640U}) for (const std::uint32_t o : {1U, 7U, 33U})
+                q6_case(stream, site, rows, w, o, 2U, q6_a8, Mode::rows_a8);
+            if (bf16_input(site)) q6_case(stream, site, rows, 2432U, 5003U, 2U, q6_a8, Mode::rows_a8);
         }
     std::cout << "q8_rows Q6P32 payloads equal their Q8_0 tensors bitwise: " << q6_cases << " exact cases (" << q6_kept
-              << " launches kept the Q8_0 tensor)\n";
+              << " launches kept the Q8_0 tensor), " << q6_a8 << " dense A8 cases\n";
     for (const auto site : sites)
         for (const unsigned rows : {1U, 2U, 4U, 8U}) {
             const auto [width, outputs] = model_shape(site);

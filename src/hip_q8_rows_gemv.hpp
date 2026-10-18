@@ -23,7 +23,8 @@
 // multiple of the wide batch (16, 32, 64) above 8.
 //
 // Q6P32: when every segment's Q8_0 tensor has a registered Q6P32 copy (see
-// strix/q6p_registry.hpp), the exact rows <= 8 kernel reads that copy instead. It decodes the same int8 codes and scales, so the arithmetic and the
+// strix/q6p_registry.hpp), the rows <= 8 kernels (exact and dense A8) read that copy
+// instead. It decodes the same int8 codes and scales, so the arithmetic and the
 // output bits are unchanged.
 // A Site supplies Input (uint16_t BF16 or float), rows, input[] (or
 // row_input(r)), segments, width, outputs, the coefficient/fma/add arithmetic of
@@ -982,6 +983,34 @@ template <unsigned Outs> struct DenseA8Weights {
         }
     }
 };
+// Q6P32 form of one block per lane: the block's 16 low-nibble bytes, 8 high-pair bytes and
+// scale (q6p chunk layout; Q6P32 rows of dense A8 widths are dword aligned). codes() gives
+// the dwords of the block's 32 int8 codes, the same values DenseA8Weights selects.
+struct __attribute__((aligned(4))) DenseA8Dword2 { unsigned x, y; };
+template <unsigned Outs> struct DenseA8Q6Weights {
+    unsigned qs[Outs][4], qh[Outs][2], d[Outs];
+    __device__ __forceinline__ void load(const q6p::Row (&w)[Outs], std::uint32_t b) {
+#pragma unroll
+        for (unsigned o = 0; o < Outs; ++o) {
+            const auto c = q6p::chunk_offsets(w[o].cols, b / 8U);
+            const std::uint32_t j = b % 8U;
+            const unsigned char* row = w[o].tensor + w[o].offset;
+            const auto lo = *reinterpret_cast<const DenseA8Dword4*>(row + c.qs + 16U * j);
+            const auto hi = *reinterpret_cast<const DenseA8Dword2*>(row + c.qh + 8U * j);
+            qs[o][0] = lo.x; qs[o][1] = lo.y; qs[o][2] = lo.z; qs[o][3] = lo.w;
+            qh[o][0] = hi.x; qh[o][1] = hi.y;
+            d[o] = *reinterpret_cast<const std::uint16_t*>(row + c.d + 2U * j);
+        }
+    }
+    __device__ __forceinline__ void codes(unsigned o, int (&q)[8]) const {
+#pragma unroll
+        for (unsigned g = 0; g < 4U; ++g) {
+            const std::uint64_t c = q6p::codes8(qs[o][g], qh[o][g / 2U], 4U * (g & 1U));
+            q[2U * g] = static_cast<int>(static_cast<std::uint32_t>(c));
+            q[2U * g + 1U] = static_cast<int>(static_cast<std::uint32_t>(c >> 32U));
+        }
+    }
+};
 // Program order of one wave's LDS accesses (the chain slots are wave-private).
 __device__ __forceinline__ void wave_lds_order() {
     __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
@@ -1000,12 +1029,13 @@ __device__ __forceinline__ void wave_lds_order() {
 // so a kernel queued after it without a barrier can start alongside it. Staged (small rows x
 // width): each block quantizes the rows into LDS once (codes [row][feature], deltas
 // [block * Rows + row]); otherwise the rows come pre-quantized from the scratch slot.
+// Q6: the segments hold Q6P32 copies (q6_site); the same codes and scales, so the same bits.
 template <class Site> constexpr unsigned dense_a8_outs_of() {
     if constexpr (requires { Site::dense_a8_outs; }) return Site::dense_a8_outs;
     else return Site::rows <= 2U ? 1U : 2U;
 }
 template <unsigned Rows> constexpr std::uint64_t dense_a8_stage_bytes(std::uint64_t width) { return Rows * width + Rows * (width / 32U) * 4U; }
-template <class Site, unsigned Outs, bool Staged>
+template <class Site, unsigned Outs, bool Staged, bool Q6 = false>
 __global__ __launch_bounds__(kThreads) void project_rows_dense_a8_kernel(Site site, const std::int8_t* codes, const float* deltas) {
 #pragma clang fp contract(off)
     constexpr unsigned Rows = Site::rows, Pairs = Outs * Rows, Depth = 2U;
@@ -1019,12 +1049,18 @@ __global__ __launch_bounds__(kThreads) void project_rows_dense_a8_kernel(Site si
     // Block 32s + l has the parity of l: byte selectors and scale half of the nine dwords.
     const unsigned odd = lane & 1U, select = odd ? 0x07060504U : 0x05040302U, shift = odd ? 16U : 0U;
     // Lanes past the last block repeat it; the chain never reads their slots.
-    const auto fetch = [&](std::uint32_t t, DenseA8Weights<Outs>& into) {
-        const unsigned char* w[Outs];
-        group_rows(site.segments, first + t / supers * step, site.outputs, width, w);
+    using Weights = std::conditional_t<Q6, DenseA8Q6Weights<Outs>, DenseA8Weights<Outs>>;
+    const auto fetch = [&](std::uint32_t t, Weights& into) {
+        const std::uint32_t g = first + t / supers * step;
+        typename RowsFormat<Q6>::Row w[Outs];
+        if constexpr (Q6) {
+            // Rows straight from the kernel argument (global pointers; each lane reads its own block).
+#pragma unroll
+            for (unsigned o = 0; o < Outs; ++o) w[o] = segment_row_q6(site.segments, std::min<std::uint32_t>(g * Outs + o, site.outputs - 1U), width);
+        } else group_rows(site.segments, g, site.outputs, width, w);
         into.load(w, std::min<std::uint32_t>(32U * (t % supers) + lane, blocks - 1U));
     };
-    DenseA8Weights<Outs> next[Depth];
+    Weights next[Depth];
 #pragma unroll
     for (unsigned d = 0; d < Depth; ++d) if (d < steps) fetch(d, next[d]);
     auto* stage = reinterpret_cast<std::int8_t*>(q8_rows_lds);
@@ -1063,9 +1099,15 @@ __global__ __launch_bounds__(kThreads) void project_rows_dense_a8_kernel(Site si
 #pragma unroll
         for (unsigned o = 0; o < Outs; ++o) {
             int q[8];
+            float dw;
+            if constexpr (Q6) {
+                current.codes(o, q);
+                dw = __half2float(__ushort_as_half(static_cast<unsigned short>(current.d[o])));
+            } else {
 #pragma unroll
-            for (unsigned k = 0; k < 8U; ++k) q[k] = static_cast<int>(__builtin_amdgcn_perm(current.d[o][k + 1U], current.d[o][k], select));
-            const float dw = __half2float(__ushort_as_half(static_cast<unsigned short>((current.d[o][0] >> shift) & 0xffffU)));
+                for (unsigned k = 0; k < 8U; ++k) q[k] = static_cast<int>(__builtin_amdgcn_perm(current.d[o][k + 1U], current.d[o][k], select));
+                dw = __half2float(__ushort_as_half(static_cast<unsigned short>((current.d[o][0] >> shift) & 0xffffU)));
+            }
 #pragma unroll
             for (unsigned r = 0; r < Rows; ++r) {
                 const int a[8]{x[r][0].x, x[r][0].y, x[r][0].z, x[r][0].w, x[r][1].x, x[r][1].y, x[r][1].z, x[r][1].w};
@@ -1477,12 +1519,15 @@ template <class Site> void launch_dense_a8(const Site& site, hipStream_t stream,
         if (reinterpret_cast<std::uintptr_t>(site.segments.weights[m]) % 4U)
             throw std::invalid_argument("q8_rows: dense A8 requires dword-aligned Q8 weights");
     const auto run = [&](auto kernel, unsigned blocks, unsigned threads, std::uint32_t bytes, bool unordered, const std::int8_t* codes,
-                         const float* deltas) {
+                         const float* deltas, const Site& args) {
         if (unordered)
-            hipExtLaunchKernelGGL(kernel, dim3(blocks), dim3(threads), bytes, stream, nullptr, nullptr, hipExtAnyOrderLaunch, site,
+            hipExtLaunchKernelGGL(kernel, dim3(blocks), dim3(threads), bytes, stream, nullptr, nullptr, hipExtAnyOrderLaunch, args,
                 codes, deltas);
-        else hipLaunchKernelGGL(kernel, dim3(blocks), dim3(threads), bytes, stream, site, codes, deltas);
+        else hipLaunchKernelGGL(kernel, dim3(blocks), dim3(threads), bytes, stream, args, codes, deltas);
     };
+    // Rows <= 8 read the segments' Q6P32 copies when every one has a copy (same bits).
+    Site q6 = site;
+    const bool use_q6 = Site::rows <= 8U && q6_site(site, q6);
     if constexpr (Site::rows <= 8U) {
         constexpr unsigned Outs = dense_a8_outs_of<Site>();
         const unsigned groups = (site.outputs + Outs - 1U) / Outs;
@@ -1490,10 +1535,13 @@ template <class Site> void launch_dense_a8(const Site& site, hipStream_t stream,
         const auto chain = static_cast<std::uint64_t>(kWaves) * Outs * Site::rows * 33U * 8U;
         const unsigned mode = dense_a8_stage_mode();
         if (mode && stage + chain <= (mode == 2U ? kLdsBytes : kDenseA8StageBytes)) {
-            constexpr auto kernel = project_rows_dense_a8_kernel<Site, Outs, true>;
             const auto bytes = static_cast<std::uint32_t>(stage);
-            run(kernel, std::min((groups + kWaves - 1U) / kWaves, resident_blocks<kernel, kThreads>(bytes)), kThreads, bytes, any_order,
-                nullptr, nullptr);
+            const auto staged = [&]<bool Q6>() {
+                constexpr auto kernel = project_rows_dense_a8_kernel<Site, Outs, true, Q6>;
+                run(kernel, std::min((groups + kWaves - 1U) / kWaves, resident_blocks<kernel, kThreads>(bytes)), kThreads, bytes, any_order,
+                    nullptr, nullptr, Q6 ? q6 : site);
+            };
+            if (use_q6) staged.template operator()<true>(); else staged.template operator()<false>();
             return;
         }
     }
@@ -1507,9 +1555,12 @@ template <class Site> void launch_dense_a8(const Site& site, hipStream_t stream,
     if constexpr (Site::rows <= 8U) {
         constexpr unsigned Outs = dense_a8_outs_of<Site>();
         const unsigned groups = (site.outputs + Outs - 1U) / Outs;
-        constexpr auto kernel = project_rows_dense_a8_kernel<Site, Outs, false>;
-        run(kernel, std::min((groups + kWaves - 1U) / kWaves, resident_blocks<kernel, kThreads>(0U)), kThreads, 0U, false, slot.codes,
-            slot.deltas);
+        const auto direct = [&]<bool Q6>() {
+            constexpr auto kernel = project_rows_dense_a8_kernel<Site, Outs, false, Q6>;
+            run(kernel, std::min((groups + kWaves - 1U) / kWaves, resident_blocks<kernel, kThreads>(0U)), kThreads, 0U, false, slot.codes,
+                slot.deltas, Q6 ? q6 : site);
+        };
+        if (use_q6) direct.template operator()<true>(); else direct.template operator()<false>();
     } else launch_dense_a8_projection(site, slot, stream);
 }
 
@@ -1523,10 +1574,14 @@ template <class Site> void launch_dense_a8_quantized(const Site& site, const Den
         if (reinterpret_cast<std::uintptr_t>(site.segments.weights[m]) % 4U)
             throw std::invalid_argument("q8_rows: dense A8 requires dword-aligned Q8 weights");
     constexpr unsigned Outs = dense_a8_outs_of<Site>();
-    constexpr auto kernel = project_rows_dense_a8_kernel<Site, Outs, false>;
     const unsigned groups = (site.outputs + Outs - 1U) / Outs;
-    hipLaunchKernelGGL(kernel, dim3(std::min((groups + kWaves - 1U) / kWaves, resident_blocks<kernel, kThreads>(0U))), dim3(kThreads), 0,
-        stream, site, slot.codes, slot.deltas);
+    const auto project = [&]<bool Q6>(const Site& args) {
+        constexpr auto kernel = project_rows_dense_a8_kernel<Site, Outs, false, Q6>;
+        hipLaunchKernelGGL(kernel, dim3(std::min((groups + kWaves - 1U) / kWaves, resident_blocks<kernel, kThreads>(0U))), dim3(kThreads), 0,
+            stream, args, slot.codes, slot.deltas);
+    };
+    Site q6;
+    if (q6_site(site, q6)) project.template operator()<true>(q6); else project.template operator()<false>(site);
 }
 
 // The caller validated width % 32 == 0 and 16-byte aligned rows. any_order drops the

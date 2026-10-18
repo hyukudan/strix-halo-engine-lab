@@ -51,11 +51,13 @@ every launcher on its original kernel, for A/B on one file.
 
 | path | Q6P32 form |
 |---|---|
-| q8_rows windows (GDN qkv+z / out, QSA q+k+v / out, shared gate+up / down) | `project_rows_kernel<..., Q6=true>`; wider than 4 direct rows take one output per wave |
+| q8_rows windows, dense A8 profile (GDN qkv+z / out, QSA q+k+v / out, shared gate+up / down; T = 1..8, LDS-staged, slot and producer-quantized forms) | `project_rows_dense_a8_kernel<..., Q6=true>`: each lane fetches its block's 16 qs, 8 qh and 2 scale bytes and builds the same eight code dwords for the `dot4` chain |
+| q8_rows windows, FP32 dense profile | `project_rows_kernel<..., Q6=true>`; wider than 4 direct rows take one output per wave. The 4/8-row VOPD forms (FP32 inputs of width >= 1024) keep the Q8_0 tensor |
+| prompt windows (T >= 16: wide and WMMA forms) | none; prefill keeps the Q8_0 tensors |
 | R1 GDN / QSA / shared prefetch8 projections | one-row q8_rows sites (bitwise the R1 kernels); GDN islands keep their recorded kernel |
 | LM head rows up to 4 and R1 (also the MTP head) | `prefetch8_wave_q8_lm_head_rows_kernel<..., Q6=true>` (R1 = one row); wider staged windows are VALU bound and keep the Q8_0 head |
 | HC split-K down (rows, R1) and lane-chain up (rows, R1, register form) | `Q6` template variants |
-| router logits (rows, R1) | BF16 copy of the BF16-exact F32 weights |
+| router logits (rows: staged and lanes forms; R1 parallel form) | BF16 copy of the BF16-exact F32 weights; the staged loaders widen it to the same F32 coefficients in LDS |
 
 A pack built from the admitted checkpoint also admits its emulated derivative wherever the
 admitted content identity is required (numerical profile, A8 down).
@@ -63,7 +65,9 @@ admitted content identity is required (numerical profile, A8 down).
 ## Tests
 
 - `strix-hip-q8-rows-projection-tests`: six-bit Q8_0 weights through their Q6P32 copy equal the
-  Q8_0 rows kernel bitwise for every site, T = 1..8 (3 for GDN), real and tail shapes; the Q8_0
-  tensor is poisoned first. `STRIX_Q8_ROWS_BENCH=1` adds cold/warm timings.
+  Q8_0 rows kernels bitwise for every site, T = 1..8 (3 for GDN), real and tail shapes, in the
+  exact and the dense A8 forms; the Q8_0 tensor is poisoned first and a registry hit proves the
+  copy was read (exact launches that keep the Q8_0 tensor are counted apart).
+  `STRIX_Q8_ROWS_BENCH=1` adds cold/warm timings.
 - `strix-hip-known-window-tests`: LM head rows and R1, HC rows (split-K and lane chain) and router
   rows with registered copies equal the Q8_0/F32 bytes and read the copies (`q6p::hits()`).
